@@ -58,7 +58,10 @@ import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy }
 import {
   buildCapabilities,
   handleAgentArtifactUpload,
+  handleArtifactGetRequest,
+  hydrateReplyBodiesFromR2,
   MAX_ARTIFACT_CONTENT_BYTES,
+  readArtifactPage,
   type ArtifactRetention,
   type OptionalStorageBindings,
 } from './storage';
@@ -535,7 +538,8 @@ export default {
       body: string,
       site?: string,
       source = 'rest',
-      artifactRetention?: ArtifactRetention,
+      artifactRetention?: ArtifactRetention | 'off',
+      hydrateInline = true,
     ) =>
       (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
         'edgefetch.dispatch',
@@ -555,9 +559,13 @@ export default {
           } catch {
             wantsIncludeBody = false;
           }
+          const resolvedRetention: ArtifactRetention | undefined =
+            artifactRetention === 'off'
+              ? undefined
+              : artifactRetention ?? (env.ARTIFACTS && wantsIncludeBody ? 'transient' : undefined);
           const artifactPolicy: ArtifactDispatchPolicy | undefined =
-            env.ARTIFACTS && wantsIncludeBody && artifactRetention
-              ? { mode: 'r2', retention: artifactRetention, maxContentBytes: MAX_ARTIFACT_CONTENT_BYTES }
+            env.ARTIFACTS && wantsIncludeBody && resolvedRetention
+              ? { mode: 'r2', retention: resolvedRetention, maxContentBytes: MAX_ARTIFACT_CONTENT_BYTES }
               : undefined;
 
           const trace = { 'x-request-id': request.headers.get('cf-ray') ?? '' };
@@ -594,7 +602,10 @@ export default {
           });
           const via = res.headers.get('x-crawler-via') ?? target;
           const retryAfter = res.headers.get('retry-after');
-          const bodyText = await res.text();
+          let bodyText = await res.text();
+          if (res.status === 200 && env.ARTIFACTS && wantsIncludeBody && hydrateInline) {
+            bodyText = await hydrateReplyBodiesFromR2(bodyText, env.ARTIFACTS);
+          }
           pendingEvents.push(...buildCrawlActivityEvents({ source, target, via, httpStatus: res.status, replyText: bodyText }));
           await hub()
             .recordHubEvents(pendingEvents)
@@ -677,6 +688,22 @@ export default {
           },
           executeFetch: ({ target, site, body, principal }) =>
             executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`),
+          ...(env.ARTIFACTS
+            ? {
+                readArtifact: async ({ blobSha256, retention, offset, limit }) => {
+                  const res = await readArtifactPage({
+                    bucket: env.ARTIFACTS!,
+                    blobSha256,
+                    ...(retention ? { retention } : {}),
+                    offset,
+                    limit,
+                  });
+                  return res.ok
+                    ? { ok: true as const, page: res.page as unknown as Record<string, unknown> }
+                    : { ok: false as const, status: res.status, error: res.error };
+                },
+              }
+            : {}),
         });
       }
 
@@ -726,6 +753,28 @@ export default {
         });
       }
 
+      if (request.method === 'GET' && url.pathname.startsWith('/v1/artifacts/')) {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        const blobSha256 = url.pathname.slice('/v1/artifacts/'.length).trim().toLowerCase();
+        return await handleArtifactGetRequest({
+          request,
+          url,
+          blobSha256,
+          bucket: env.ARTIFACTS,
+        });
+      }
+
       if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
         return Response.json({ error: 'unauthorized' }, { status: 401 });
       }
@@ -740,9 +789,16 @@ export default {
           return Response.json({ error: 'too_large' }, { status: 413 });
         }
         const rawRetention = url.searchParams.get('artifacts');
-        const artifactRetention: ArtifactRetention | undefined =
-          rawRetention === 'stored' ? 'stored' : rawRetention === 'transient' ? 'transient' : undefined;
-        const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention);
+        const artifactRetention: ArtifactRetention | 'off' | undefined =
+          rawRetention === 'stored'
+            ? 'stored'
+            : rawRetention === 'transient'
+              ? 'transient'
+              : rawRetention === 'off'
+                ? 'off'
+                : undefined;
+        const hydrateInline = url.searchParams.get('hydrate') !== 'false' && url.searchParams.get('hydrate') !== '0';
+        const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention, hydrateInline);
         return new Response(out.bodyText, {
           status: out.status,
           headers: {

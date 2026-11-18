@@ -51,6 +51,12 @@ export interface McpServerDeps {
     body: string;
     principal?: string;
   }) => Promise<McpExecuteFetchResult>;
+  readArtifact?: (params: {
+    blobSha256: string;
+    retention?: 'transient' | 'stored';
+    offset?: number;
+    limit?: number;
+  }) => Promise<{ ok: true; page: Record<string, unknown> } | { ok: false; status: number; error: string }>;
 }
 
 function isAllowedMcpOrigin(originHeader: string | null, selfOrigin: string): boolean {
@@ -198,9 +204,32 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
           pauseMs: { type: 'integer', minimum: 0, maximum: 30000, default: 1000, description: 'Minimum per-host pause in ms.' },
           pauseJitterMs: { type: 'integer', minimum: 0, maximum: 15000, default: 500, description: 'Random positive jitter added to pauseMs.' },
-          includeBody: { type: 'boolean', default: false, description: 'Set true to include truncated body previews per URL.' },
+          includeBody: { type: 'boolean', default: false, description: 'Set true to include paged body previews + artifactId per URL.' },
         },
         required: ['urls'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'read_artifact',
+      description:
+        'Read a slice of a stored R2 crawl artifact by artifactId (blobSha256) using character offset + limit paging, avoiding 64K truncation on large documents.',
+      annotations: {
+        title: 'Read Paged Crawl Artifact',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          artifactId: { type: 'string', description: '64-character lowercase hex blobSha256 returned in a crawl result.' },
+          retention: { type: 'string', enum: ['transient', 'stored'], description: 'Optional retention tier hint.' },
+          offset: { type: 'integer', minimum: 0, default: 0, description: 'Character offset to start reading from.' },
+          limit: { type: 'integer', minimum: 1, maximum: 262144, default: 65536, description: 'Max characters to return in this page.' },
+        },
+        required: ['artifactId'],
         additionalProperties: false,
       },
     },
@@ -212,10 +241,22 @@ function truncateResultBodies(parsed: Record<string, unknown>): Record<string, u
   const results = parsed.results.map((item) => {
     if (!item || typeof item !== 'object') return item;
     const copy = { ...(item as Record<string, unknown>) };
+    const art = copy.artifact as { blobSha256?: string; retention?: string } | undefined;
+    if (art?.blobSha256) {
+      copy.artifactId = art.blobSha256;
+    }
     if (typeof copy.body === 'string' && copy.body.length > MAX_BODY_PREVIEW_CHARS) {
-      copy.bodyPreviewTruncated = true;
-      copy.bodyOriginalChars = copy.body.length;
+      const totalChars = copy.body.length;
       copy.body = copy.body.slice(0, MAX_BODY_PREVIEW_CHARS);
+      copy.offset = 0;
+      copy.nextOffset = MAX_BODY_PREVIEW_CHARS;
+      copy.hasMore = true;
+      copy.bodyOriginalChars = totalChars;
+      copy.bodyPreviewTruncated = true;
+    } else if (copy.bodyOmitted === true && art?.blobSha256) {
+      copy.offset = 0;
+      copy.nextOffset = 0;
+      copy.hasMore = true;
     }
     return copy;
   });
@@ -353,6 +394,24 @@ async function handleToolCall(
       content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
       ...(res.status >= 400 ? { isError: true } : {}),
     };
+  }
+
+  if (name === 'read_artifact') {
+    if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
+    }
+    if (!deps.readArtifact) {
+      return { content: [{ type: 'text', text: 'R2 artifact storage is not configured on this hub.' }], isError: true };
+    }
+    const blobSha256 = typeof args.artifactId === 'string' ? args.artifactId.trim().toLowerCase() : '';
+    const retention = args.retention === 'stored' ? 'stored' : args.retention === 'transient' ? 'transient' : undefined;
+    const offset = typeof args.offset === 'number' ? Math.max(0, Math.floor(args.offset)) : 0;
+    const limit = typeof args.limit === 'number' ? Math.min(262_144, Math.max(1, Math.floor(args.limit))) : MAX_BODY_PREVIEW_CHARS;
+    const out = await deps.readArtifact({ blobSha256, ...(retention ? { retention } : {}), offset, limit });
+    if (!out.ok) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: out.error, status: out.status }) }], isError: true };
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(out.page, null, 2) }] };
   }
 
   return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };

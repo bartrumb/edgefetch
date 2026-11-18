@@ -507,7 +507,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         assert.equal(repRes.status, 200);
       });
 
-      const batchRes = await mf.dispatchFetch(`${ORIGIN}/fetch?target=agent&artifacts=transient`, {
+      const batchRes = await mf.dispatchFetch(`${ORIGIN}/fetch?target=agent`, {
         method: 'POST',
         headers: authz,
         body: JSON.stringify({
@@ -520,7 +520,56 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(gateChecksDone, true);
       const batchJson = await batchRes.json();
       assert.equal(batchJson.results.length, 5);
+      // S3: First two 8 MiB pages (16 MiB <= 18 MiB hydration budget) are hydrated inline; pages 3..5 set bodyOmitted:true + artifact!
+      assert.equal(batchJson.results[0]?.body?.length, 8 << 20);
+      assert.equal(batchJson.results[1]?.body?.length, 8 << 20);
+      assert.equal(batchJson.results[2]?.body, undefined);
+      assert.equal(batchJson.results[2]?.bodyOmitted, true);
       assert.equal(batchJson.results[4]?.artifact?.contentBytes, 8 << 20);
+
+      // S3: Authenticated GET /v1/artifacts/<blobSha256> serves text/plain + nosniff + CSP sandbox + attachment (never active HTML)!
+      const rawSliceRes = await mf.dispatchFetch(`${ORIGIN}/v1/artifacts/${blobSha}?offset=0&limit=32`, {
+        headers: { authorization: `Bearer ${CALLER}` },
+      });
+      assert.equal(rawSliceRes.status, 200);
+      assert.equal(rawSliceRes.headers.get('content-type'), 'text/plain; charset=utf-8');
+      assert.equal(rawSliceRes.headers.get('x-content-type-options'), 'nosniff');
+      assert.equal(rawSliceRes.headers.get('content-security-policy'), 'sandbox');
+      assert.match(rawSliceRes.headers.get('content-disposition') ?? '', /^attachment;/);
+      assert.equal(rawSliceRes.headers.get('x-artifact-has-more'), 'true');
+      assert.equal(rawSliceRes.headers.get('x-artifact-next-offset'), '32');
+      const sliceText = await rawSliceRes.text();
+      assert.equal(sliceText.length, 32);
+      assert.equal(sliceText.startsWith('<html>R2BatchData!'), true);
+
+      // Expired / missing artifact returns 404 artifact_expired.
+      const missingRes = await mf.dispatchFetch(`${ORIGIN}/v1/artifacts/${'dd'.repeat(32)}`, {
+        headers: { authorization: `Bearer ${CALLER}` },
+      });
+      assert.equal(missingRes.status, 404);
+      assert.equal((await missingRes.json()).error, 'artifact_expired');
+
+      // S3: MCP read_artifact tool pages stored content by artifactId + offset!
+      const mcpPageRes = await mf.dispatchFetch(`${ORIGIN}/mcp`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 99,
+          method: 'tools/call',
+          params: {
+            name: 'read_artifact',
+            arguments: { artifactId: blobSha, offset: 6, limit: 12 },
+          },
+        }),
+      });
+      assert.equal(mcpPageRes.status, 200);
+      const mcpPageJson = await mcpPageRes.json();
+      assert.equal(mcpPageJson.result?.isError, undefined);
+      const parsedPage = JSON.parse(mcpPageJson.result.content[0].text);
+      assert.equal(parsedPage.content, 'R2BatchData!');
+      assert.equal(parsedPage.nextOffset, 18);
+
       wsCap.close(1000, 'done');
     }
   } finally {

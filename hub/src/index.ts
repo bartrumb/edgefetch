@@ -24,6 +24,7 @@ import {
 import { handleAdminRoute } from './admin';
 import {
   AgentHubEngine,
+  MAX_CALL_UTF8_BYTES,
   parseFetchTarget,
   readAgentReplyBody,
   routeFetchWithFailover,
@@ -61,7 +62,6 @@ interface Env {
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const MAX_CALL_BYTES = 1 << 20;
 const DEFAULT_UA = 'EdgeFetch/1.0 (+https://github.com/bartrumb/edgefetch)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 
@@ -261,6 +261,14 @@ export class AgentHubDO extends DurableObject<Env> {
 
   async hasPendingJob(jobId: string, siteId: string): Promise<boolean> {
     return this.engine.hasPendingJob(jobId, siteId);
+  }
+
+  async verifyPendingJob(jobId: string, jobNonce: string, siteId: string): Promise<boolean> {
+    return this.engine.verifyPendingJob(jobId, jobNonce, siteId);
+  }
+
+  async failJob(jobId: string, jobNonce: string, siteId: string, reason: string, permanent = true): Promise<CompleteJobResult> {
+    return this.engine.failJob(jobId, jobNonce, siteId, reason, permanent);
   }
 
   async completeJob(jobId: string, jobNonce: string, siteId: string, bodyText: string): Promise<CompleteJobResult> {
@@ -486,9 +494,14 @@ export default {
       const jobId = (request.headers.get('x-job-id') ?? '').trim();
       const jobNonce = (request.headers.get('x-job-nonce') ?? '').trim();
       if (!JOB_ID_RE.test(jobId) || !JOB_ID_RE.test(jobNonce)) return Response.json({ error: 'bad_job_headers' }, { status: 400 });
-      if (!(await hub().hasPendingJob(jobId, auth.siteId))) return Response.json({ error: 'unknown_job' }, { status: 404 });
+      if (!(await hub().verifyPendingJob(jobId, jobNonce, auth.siteId))) {
+        return Response.json({ error: 'unknown_job' }, { status: 404 });
+      }
       const payload = await readAgentReplyBody(request);
-      if (!payload.ok) return Response.json({ error: payload.error }, { status: payload.status });
+      if (!payload.ok) {
+        await hub().failJob(jobId, jobNonce, auth.siteId, payload.error, payload.error === 'too_large');
+        return Response.json({ error: payload.error }, { status: payload.status });
+      }
       const done = await hub().completeJob(jobId, jobNonce, auth.siteId, payload.text);
       return Response.json({ ok: done.ok }, { status: done.status });
     }
@@ -559,7 +572,9 @@ export default {
       const parsedTarget = parseFetchTarget(url);
       if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
       const body = await request.text();
-      if (body.length > MAX_CALL_BYTES) return Response.json({ error: 'too_large' }, { status: 413 });
+      if (new TextEncoder().encode(body).byteLength > MAX_CALL_UTF8_BYTES) {
+        return Response.json({ error: 'too_large' }, { status: 413 });
+      }
       const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest');
       return new Response(out.bodyText, {
         status: out.status,

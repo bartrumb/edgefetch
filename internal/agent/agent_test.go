@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -366,4 +367,41 @@ func TestReconnectWatchdogClosesPreviousSocketImmediately(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+func TestNormalUploadExceedsLegacyTenSecondCapWithoutLosingReply(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		time.Sleep(10200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logBuf, nil))
+	cr := crawl.NewCrawler(http.DefaultTransport, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	client := &http.Client{Timeout: 45 * time.Second}
+
+	handleDispatch(
+		context.Background(),
+		Config{HubURL: srv.URL, AgentToken: "agent-secret-token-0123456789-abcdef", SiteID: "s1", UserAgent: "EdgeFetch/1.0"},
+		cr,
+		crawl.PublicHTTPS,
+		client,
+		log,
+		time.Second,
+		controlMessage{
+			Type:     "dispatch",
+			JobID:    "j-slow-upload",
+			JobNonce: "n-slow-upload",
+			Call: crawl.FetchCall{
+				Requests: []crawl.Request{{ID: "1", URL: "http://bad.example.com/", Kind: classify.KindPage}},
+			},
+		},
+	)
+
+	if strings.Contains(logBuf.String(), "agent_reply_failed") {
+		t.Fatalf("A2 BUG: normal (non-shutdown) reply upload failed at >10s even within 45s client budget: %s", logBuf.String())
+	}
 }

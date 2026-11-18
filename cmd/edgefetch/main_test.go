@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+	"time"
+)
 
 func TestValidateServerSecurity(t *testing.T) {
 	// Non-loopback without token or explicit opt-in must fail closed.
@@ -28,5 +32,18 @@ func TestValidateServerSecurity(t *testing.T) {
 	// Explicit isolated-bridge opt-in (--allow-unauthenticated) is allowed.
 	if err := validateServerSecurity(":8080", "", true); err != nil {
 		t.Fatalf("expected explicit allowUnauthenticated accepted: %v", err)
+	}
+}
+
+func TestNewHTTPServerTimeouts(t *testing.T) {
+	srv := newHTTPServer("127.0.0.1:8080", http.NotFoundHandler())
+	if srv.ReadHeaderTimeout != 10*time.Second {
+		t.Fatalf("expected ReadHeaderTimeout=10s, got %s", srv.ReadHeaderTimeout)
+	}
+	if srv.ReadTimeout != 30*time.Second {
+		t.Fatalf("expected ReadTimeout=30s, got %s", srv.ReadTimeout)
+	}
+	if srv.IdleTimeout != 120*time.Second {
+		t.Fatalf("expected IdleTimeout=120s, got %s", srv.IdleTimeout)
 	}
 }

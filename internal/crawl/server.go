@@ -20,10 +20,11 @@ import (
 )
 
 const (
-	MaxRequestsPerCall = 400
-	MaxCallBodyBytes   = 1 << 20 // 1 MiB request payload ceiling
-	DefaultMaxSeconds  = 600
-	MaxMaxSeconds      = 1800
+	MaxRequestsPerCall       = 400
+	MaxCallBodyBytes         = 1 << 20 // 1 MiB request payload ceiling
+	DefaultMaxSeconds        = 600
+	MaxMaxSeconds            = 1800
+	MaxConcurrentServerCalls = 4
 )
 
 // FetchCall is the wire payload accepted by `POST /fetch` and WebSocket `dispatch`.
@@ -185,6 +186,7 @@ func NewAuthenticatedHandler(c *Crawler, allow func(*url.URL) error, bearerToken
 	mux := http.NewServeMux()
 	wantAuth := strings.TrimSpace(bearerToken) != ""
 	wantDigest := sha256.Sum256([]byte(strings.TrimSpace(bearerToken)))
+	callSem := make(chan struct{}, MaxConcurrentServerCalls)
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -207,6 +209,14 @@ func NewAuthenticatedHandler(c *Crawler, allow func(*url.URL) error, bearerToken
 				writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "valid Bearer token required")
 				return
 			}
+		}
+		select {
+		case callSem <- struct{}{}:
+			defer func() { <-callSem }()
+		default:
+			w.Header().Set("Retry-After", "2")
+			writeHTTPError(w, http.StatusServiceUnavailable, "server_busy", fmt.Sprintf("at most %d concurrent /fetch calls allowed", MaxConcurrentServerCalls))
+			return
 		}
 		var call FetchCall
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxCallBodyBytes))

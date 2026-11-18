@@ -3,7 +3,9 @@ package crawl
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -303,6 +306,20 @@ func TestSharedWireContractFixture(t *testing.T) {
 	for name, payload := range fixtures {
 		dec := json.NewDecoder(bytes.NewReader(payload))
 		dec.DisallowUnknownFields()
+		if strings.HasSuffix(name, "Reply") {
+			var reply FetchReply
+			if err := dec.Decode(&reply); err != nil {
+				t.Fatalf("reply fixture %s rejected by strict Go decoder: %v", name, err)
+			}
+			if len(reply.Results) < 2 {
+				t.Fatalf("reply fixture %s expected >= 2 results", name)
+			}
+			rawLatin1, err := reply.Results[1].DecodeBody()
+			if err != nil || !bytes.Equal(rawLatin1, []byte("caf\xe9")) {
+				t.Fatalf("reply fixture %s base64 DecodeBody mismatch: got %x err=%v", name, rawLatin1, err)
+			}
+			continue
+		}
 		var call FetchCall
 		if err := dec.Decode(&call); err != nil {
 			t.Fatalf("fixture %s rejected by strict Go decoder: %v", name, err)
@@ -311,5 +328,132 @@ func TestSharedWireContractFixture(t *testing.T) {
 		if !norm.RobotsEnabled() {
 			t.Fatalf("fixture %s expected Normalize().RobotsEnabled() == true, got %+v", name, norm)
 		}
+	}
+}
+
+func TestNonUTF8BodyPreservesExactBytesAcrossJSONWire(t *testing.T) {
+	rawLatin1 := []byte("<html>caf\xe9</html>")
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("content-type", "text/html; charset=iso-8859-1")
+		_, _ = w.Write(rawLatin1)
+	}))
+
+	res := c.Run(context.Background(), []Request{
+		{ID: "latin1", URL: "http://latin1.test/menu", Kind: classify.KindPage},
+	}, Options{IncludeBody: true})
+	if len(res) != 1 || res[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected ok result, got %+v", res)
+	}
+
+	wireJSON, err := json.Marshal(res[0])
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	var wireMap map[string]any
+	if err := json.Unmarshal(wireJSON, &wireMap); err != nil {
+		t.Fatalf("unmarshal map: %v", err)
+	}
+	enc, _ := wireMap["bodyEncoding"].(string)
+	bodyStr, _ := wireMap["body"].(string)
+	var gotBytes []byte
+	if enc == "base64" {
+		gotBytes, err = base64.StdEncoding.DecodeString(bodyStr)
+		if err != nil {
+			t.Fatalf("decode base64 body: %v", err)
+		}
+	} else {
+		gotBytes = []byte(bodyStr)
+	}
+	if !bytes.Equal(gotBytes, rawLatin1) {
+		t.Fatalf("A6 BUG: non-UTF-8 body corrupted across JSON wire: want %x, got %x (bodyEncoding=%q)", rawLatin1, gotBytes, enc)
+	}
+}
+
+func TestBatchTotalBodyBudgetAndServerConcurrencyLimit(t *testing.T) {
+	// Three 7 MiB pages = 21 MiB total > 20 MiB Hub reply cap unless bounded by total batch body budget (A9 / H2)!
+	sevenMiB := "<html>" + strings.Repeat("A", (7<<20)-13) + "</html>"
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte(sevenMiB))
+	}))
+
+	res := c.Run(context.Background(), []Request{
+		{ID: "p1", URL: "http://a.budget.test/1", Kind: classify.KindPage},
+		{ID: "p2", URL: "http://b.budget.test/2", Kind: classify.KindPage},
+		{ID: "p3", URL: "http://c.budget.test/3", Kind: classify.KindPage},
+	}, Options{IncludeBody: true, MaxBytes: 8 << 20, Concurrency: 1})
+
+	totalRetained := len(res[0].Body) + len(res[1].Body) + len(res[2].Body)
+	if totalRetained > 18<<20 {
+		t.Fatalf("A9 BUG: batch retained %d bytes in memory (> 18 MiB budget), risking OOM and Hub 413", totalRetained)
+	}
+	if !res[2].Truncated || !res[2].BodyOmitted || res[2].Body != "" {
+		t.Fatalf("expected 3rd 7 MiB page marked Truncated+BodyOmitted with empty Body, got truncated=%v omitted=%v len=%d",
+			res[2].Truncated, res[2].BodyOmitted, len(res[2].Body))
+	}
+
+	// Verify HTTP server caps concurrent /fetch calls at MaxConcurrentServerCalls (503 server_busy on overflow).
+	gate := make(chan struct{})
+	var entered atomic.Int32
+	allEntered := make(chan struct{})
+	originSlow := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if entered.Add(1) == MaxConcurrentServerCalls {
+			close(allEntered)
+		}
+		<-gate
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte("<html>ok</html>"))
+	}))
+	defer originSlow.Close()
+	slowAddr := originSlow.Listener.Addr().String()
+	slowTLS := originSlow.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	slowTLS.InsecureSkipVerify = true
+	slowTr := &http.Transport{
+		TLSClientConfig: slowTLS,
+		DialContext: func(ctx context.Context, n, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, n, slowAddr)
+		},
+	}
+	slowCrawler := NewCrawler(slowTr, PublicHTTPS, DefaultUserAgent, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	slowCrawler.Sleep = func(context.Context, time.Duration) error { return nil }
+	apiSrv := httptest.NewServer(NewAuthenticatedHandler(slowCrawler, PublicHTTPS, ""))
+	defer apiSrv.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < MaxConcurrentServerCalls; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			payload := fmt.Sprintf(`{"requests":[{"id":"%d","url":"https://s%d.example.com/","kind":"page"}]}`, n, n)
+			resp, err := http.Post(apiSrv.URL+"/fetch", "application/json", strings.NewReader(payload))
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}(i)
+	}
+	<-allEntered
+
+	overflowResp, err := http.Post(apiSrv.URL+"/fetch", "application/json", strings.NewReader(`{"requests":[{"id":"over","url":"https://over.example.com/","kind":"page"}]}`))
+	if err != nil {
+		t.Fatalf("overflow POST /fetch: %v", err)
+	}
+	_ = overflowResp.Body.Close()
+	close(gate)
+	wg.Wait()
+
+	if overflowResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 server_busy when >%d concurrent /fetch calls arrive, got %d", MaxConcurrentServerCalls, overflowResp.StatusCode)
 	}
 }

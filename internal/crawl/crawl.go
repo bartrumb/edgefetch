@@ -5,6 +5,7 @@ package crawl
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,7 +15,9 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bartrumb/edgefetch/internal/classify"
 	"github.com/bartrumb/edgefetch/internal/politeness"
@@ -61,10 +64,24 @@ type Result struct {
 	RetryAfterMs int64            `json:"retryAfterMs,omitempty"`
 	Bytes        int              `json:"bytes"`
 	Truncated    bool             `json:"truncated,omitempty"`
+	BodyOmitted  bool             `json:"bodyOmitted,omitempty"`
 	Attempts     int              `json:"attempts"`
 	DurationMs   int64            `json:"durationMs"`
 	Timing       Timing           `json:"timing"`
 	Body         string           `json:"body,omitempty"`
+	BodyEncoding string           `json:"bodyEncoding,omitempty"`
+}
+
+// DecodeBody returns the exact raw response bytes for `r.Body`, decoding `"base64"` payloads losslessly when the origin
+// response contained non-UTF-8 bytes.
+func (r Result) DecodeBody() ([]byte, error) {
+	if r.Body == "" {
+		return nil, nil
+	}
+	if r.BodyEncoding == "base64" {
+		return base64.StdEncoding.DecodeString(r.Body)
+	}
+	return []byte(r.Body), nil
 }
 
 // Bool returns a pointer to v for configuring optional tri-state boolean fields on Options.
@@ -78,6 +95,7 @@ type Options struct {
 	Concurrency   int   `json:"concurrency"`
 	TimeoutMs     int   `json:"timeoutMs"`
 	MaxBytes      int   `json:"maxBytes"`
+	MaxTotalBytes int   `json:"maxTotalBytes,omitempty"`
 	Retries       int   `json:"retries"`
 	IncludeBody   bool  `json:"includeBody"`
 	RespectRobots *bool `json:"respectRobots,omitempty"`
@@ -86,14 +104,16 @@ type Options struct {
 }
 
 const (
-	DefaultPauseMs   = 2000
-	MaxPauseJitterMs = 30_000
-	DefaultTimeoutMs = 30_000
-	DefaultMaxBytes  = 8 << 20
-	MaxMaxBytes      = 16 << 20
-	MaxConcurrency   = 4
-	MaxRetries       = 3
-	MaxRedirects     = 5
+	DefaultPauseMs       = 2000
+	MaxPauseJitterMs     = 30_000
+	DefaultTimeoutMs     = 30_000
+	DefaultMaxBytes      = 8 << 20
+	MaxMaxBytes          = 16 << 20
+	DefaultMaxTotalBytes = 16 << 20 // 16 MiB batch body ceiling stays safely below Hub's 20 MiB reply cap & 128 MiB GOMEMLIMIT
+	MaxMaxTotalBytes     = 18 << 20
+	MaxConcurrency       = 4
+	MaxRetries           = 3
+	MaxRedirects         = 5
 )
 
 // RobotsEnabled reports whether /robots.txt enforcement is active (defaulting to true when unset).
@@ -138,6 +158,12 @@ func (o Options) Normalize() Options {
 	}
 	if o.MaxBytes > MaxMaxBytes {
 		o.MaxBytes = MaxMaxBytes
+	}
+	if o.MaxTotalBytes <= 0 {
+		o.MaxTotalBytes = DefaultMaxTotalBytes
+	}
+	if o.MaxTotalBytes > MaxMaxTotalBytes {
+		o.MaxTotalBytes = MaxMaxTotalBytes
 	}
 	if o.Retries < 0 {
 		o.Retries = 0
@@ -340,6 +366,7 @@ func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, l
 	minPause := time.Duration(opts.PauseMs) * time.Millisecond
 	maxJitter := time.Duration(opts.PauseJitterMs) * time.Millisecond
 	sem := make(chan struct{}, opts.Concurrency)
+	var retainedBodyBytes atomic.Int64
 	var wg sync.WaitGroup
 
 	for _, h := range order {
@@ -366,6 +393,25 @@ func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, l
 					continue
 				}
 				res, cancelled := c.runRequestWithRedirects(ctx, r, opts, n > 0, minPause, maxJitter, gap, log)
+				if opts.IncludeBody && len(res.Body) > 0 {
+					encodedLen := int64(len(res.Body))
+					for {
+						cur := retainedBodyBytes.Load()
+						if cur+encodedLen > int64(opts.MaxTotalBytes) {
+							res.Body = ""
+							res.BodyEncoding = ""
+							res.Truncated = true
+							res.BodyOmitted = true
+							if res.Problem == "" {
+								res.Problem = fmt.Sprintf("batch total body budget (%d bytes) exceeded", opts.MaxTotalBytes)
+							}
+							break
+						}
+						if retainedBodyBytes.CompareAndSwap(cur, cur+encodedLen) {
+							break
+						}
+					}
+				}
 				results[i] = res
 				if cancelled {
 					stopped = "crawl cancelled"
@@ -611,7 +657,13 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 			res.Outcome, res.Problem = classify.Classify(r.Kind, status, header, body)
 		}
 		if opts.IncludeBody {
-			res.Body = string(body)
+			if utf8.Valid(body) {
+				res.Body = string(body)
+				res.BodyEncoding = "utf-8"
+			} else {
+				res.Body = base64.StdEncoding.EncodeToString(body)
+				res.BodyEncoding = "base64"
+			}
 		}
 		break
 	}

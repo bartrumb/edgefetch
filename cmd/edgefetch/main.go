@@ -29,6 +29,17 @@ import (
 
 const maxResponseHeaderBytes = 64 << 10 // 64 KiB cap prevents giant origin response headers from exhausting memory.
 
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    maxResponseHeaderBytes,
+	}
+}
+
 func newCrawlTransport(idleTimeout time.Duration, maxIdlePerHost int) *http.Transport {
 	return &http.Transport{
 		Proxy: nil, // Never inherit ambient HTTP_PROXY / HTTPS_PROXY environment variables.
@@ -222,12 +233,7 @@ func main() {
 
 	crawler := crawl.NewCrawler(newCrawlTransport(60*time.Second, 2), crawl.PublicHTTPS, ua, log)
 	crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           crawl.NewAuthenticatedHandler(crawler, crawl.PublicHTTPS, serverToken),
-		ReadHeaderTimeout: 10 * time.Second,
-		MaxHeaderBytes:    maxResponseHeaderBytes,
-	}
+	srv := newHTTPServer(addr, crawl.NewAuthenticatedHandler(crawler, crawl.PublicHTTPS, serverToken))
 
 	go func() {
 		log.Info("listening", slog.String("addr", srv.Addr), slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)), slog.String("go", runtime.Version()))

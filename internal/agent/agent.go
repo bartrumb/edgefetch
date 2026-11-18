@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,12 +70,19 @@ func (o RuntimeOpts) withDefaults() RuntimeOpts {
 	return o
 }
 
+type artifactDispatchPolicy struct {
+	Mode            string `json:"mode"`
+	Retention       string `json:"retention"`
+	MaxContentBytes int    `json:"maxContentBytes"`
+}
+
 type controlMessage struct {
-	Type     string            `json:"type"`
-	JobID    string            `json:"jobId"`
-	JobNonce string            `json:"jobNonce"`
-	Trace    map[string]string `json:"trace,omitempty"`
-	Call     crawl.FetchCall   `json:"call"`
+	Type      string                  `json:"type"`
+	JobID     string                  `json:"jobId"`
+	JobNonce  string                  `json:"jobNonce"`
+	Trace     map[string]string       `json:"trace,omitempty"`
+	Artifacts *artifactDispatchPolicy `json:"artifacts,omitempty"`
+	Call      crawl.FetchCall         `json:"call"`
 }
 
 // Run maintains a persistent outbound WebSocket session to `cfg.HubURL/agent/ws`, automatically reconnecting with
@@ -141,10 +151,11 @@ func runSession(
 	lastError string,
 ) error {
 	conn, err := ws.Dial(ctx, cfg.HubURL+"/agent/ws", cfg.UserAgent, map[string]string{
-		"Authorization":   "Bearer " + cfg.AgentToken,
-		"X-Agent-Site":    cfg.SiteID,
-		"X-Agent-Arch":    runtime.GOARCH,
-		"X-Agent-Version": Version,
+		"Authorization":        "Bearer " + cfg.AgentToken,
+		"X-Agent-Site":         cfg.SiteID,
+		"X-Agent-Arch":         runtime.GOARCH,
+		"X-Agent-Version":      Version,
+		"X-Agent-Capabilities": "artifacts-v1",
 	})
 	if err != nil {
 		return err
@@ -157,6 +168,7 @@ func runSession(
 		"version":          Version,
 		"arch":             runtime.GOARCH,
 		"goVersion":        runtime.Version(),
+		"capabilities":     []string{"artifacts-v1"},
 		"reconnectAttempt": reconnectAttempt,
 		"lastError":        lastError,
 	})
@@ -287,7 +299,49 @@ func handleDispatchWithOpts(
 		}
 		reply = crawl.FetchReply{Results: results, Summary: crawl.Summarize(results)}
 	} else {
-		reply = crawl.ExecuteCall(jobBaseCtx, crawler, call, jobLog)
+		var sink crawl.ResultSink
+		if msg.Artifacts != nil && msg.Artifacts.Mode == "r2" && call.Options.IncludeBody {
+			retention := msg.Artifacts.Retention
+			if retention != "stored" {
+				retention = "transient"
+			}
+			maxContent := msg.Artifacts.MaxContentBytes
+			if maxContent <= 0 || maxContent > crawl.MaxMaxBytes {
+				maxContent = crawl.MaxMaxBytes
+			}
+			sink = func(_ int, res crawl.Result) crawl.Result {
+				if res.Body == "" {
+					return res
+				}
+				rawBytes, decErr := res.DecodeBody()
+				// Always clear inline Body immediately so bodies never pass through AgentHubDO or accumulate in RAM.
+				res.Body = ""
+				res.BodyEncoding = ""
+				if decErr != nil {
+					res.BodyOmitted = true
+					res.ArtifactError = "decode body: " + decErr.Error()
+					return res
+				}
+				if len(rawBytes) > maxContent {
+					res.BodyOmitted = true
+					res.Truncated = true
+					res.ArtifactError = fmt.Sprintf("body (%d bytes) exceeds artifact maxContentBytes (%d)", len(rawBytes), maxContent)
+					return res
+				}
+				artCtx, cancelArt := context.WithTimeout(context.Background(), rtOpts.UploadTimeout)
+				artRef, upErr := uploadArtifact(artCtx, replyClient, cfg, msg.JobID, msg.JobNonce, res.ID, retention, rawBytes)
+				cancelArt()
+				if upErr != nil {
+					res.BodyOmitted = true
+					res.ArtifactError = upErr.Error()
+					jobLog.Warn("agent_artifact_upload_failed", slog.String("request_id", res.ID), slog.String("error", upErr.Error()))
+					return res
+				}
+				res.Artifact = artRef
+				return res
+			}
+		}
+		reply = crawl.ExecuteCallWithSink(jobBaseCtx, crawler, call, jobLog, sink)
 	}
 
 	// Normal uploads get the full UploadTimeout (default 45s) across retries; only active SIGTERM shutdown drains
@@ -301,6 +355,79 @@ func handleDispatchWithOpts(
 	if err := uploadReply(uploadCtx, replyClient, cfg, msg.JobID, msg.JobNonce, reply); err != nil {
 		jobLog.Error("agent_reply_failed", slog.String("error", err.Error()))
 	}
+}
+
+func uploadArtifact(
+	ctx context.Context,
+	client *http.Client,
+	cfg Config,
+	jobID, jobNonce, requestID, retention string,
+	rawBytes []byte,
+) (*crawl.ArtifactRef, error) {
+	contentDigest := sha256.Sum256(rawBytes)
+	contentSHA := hex.EncodeToString(contentDigest[:])
+
+	var gzBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzBuf)
+	if _, err := gz.Write(rawBytes); err != nil {
+		_ = gz.Close()
+		return nil, fmt.Errorf("gzip artifact: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return nil, fmt.Errorf("gzip close: %w", err)
+	}
+	gzBytes := gzBuf.Bytes()
+	blobDigest := sha256.Sum256(gzBytes)
+	blobSHA := hex.EncodeToString(blobDigest[:])
+
+	endpoint := cfg.HubURL + "/agent/artifacts/" + blobSHA
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			if err := crawl.SleepCtx(ctx, time.Duration(attempt)*400*time.Millisecond); err != nil {
+				return nil, err
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(gzBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.ContentLength = int64(len(gzBytes))
+		req.Header.Set("Authorization", "Bearer "+cfg.AgentToken)
+		req.Header.Set("User-Agent", cfg.UserAgent)
+		req.Header.Set("Content-Type", "application/gzip")
+		req.Header.Set("X-Agent-Site", cfg.SiteID)
+		req.Header.Set("X-Job-Id", jobID)
+		req.Header.Set("X-Job-Nonce", jobNonce)
+		req.Header.Set("X-Request-Id", requestID)
+		req.Header.Set("X-Content-Sha256", contentSHA)
+		req.Header.Set("X-Content-Bytes", strconv.Itoa(len(rawBytes)))
+		req.Header.Set("X-Artifact-Retention", retention)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_ = resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return &crawl.ArtifactRef{
+				BlobSHA256:    blobSHA,
+				ContentSHA256: contentSHA,
+				ContentBytes:  len(rawBytes),
+				StoredBytes:   len(gzBytes),
+				Encoding:      "gzip",
+				Retention:     retention,
+			}, nil
+		}
+		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		if resp.StatusCode != http.StatusBadGateway && resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusGatewayTimeout && resp.StatusCode != http.StatusConflict {
+			return nil, lastErr
+		}
+	}
+	return nil, lastErr
 }
 
 func uploadReply(

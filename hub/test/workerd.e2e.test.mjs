@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { gzipSync } from 'node:zlib';
@@ -371,6 +371,158 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       pageCount: 1,
       ftsHitCount: 1,
     });
+
+    // S2: Verify capability negotiation (old agent vs artifacts-v1 agent), upload security gates, and 40 MiB logical batch!
+    const sha256Hex = (buf) => createHash('sha256').update(buf).digest('hex');
+
+    // 1. Old agent (no X-Agent-Capabilities) dispatched WITHOUT `artifacts` envelope -> inline reply still works!
+    {
+      const rWs = await mf.dispatchFetch(`${ORIGIN}/agent/ws`, {
+        headers: { upgrade: 'websocket', authorization: `Bearer ${S1}`, 'x-agent-site': 'site-1', 'x-agent-arch': 'amd64' },
+      });
+      const wsOld = rWs.webSocket;
+      wsOld.accept();
+      let sawArtifactsField = false;
+      wsOld.addEventListener('message', async (e) => {
+        const d = String(e.data);
+        if (!d.includes('"dispatch"')) return;
+        const msg = JSON.parse(d);
+        sawArtifactsField = Boolean(msg.artifacts);
+        await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${S1}`,
+            'x-agent-site': 'site-1',
+            'x-job-id': msg.jobId,
+            'x-job-nonce': msg.jobNonce,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ results: [{ id: '1', status: 200, outcome: 'ok', body: 'inline-ok', bodyEncoding: 'utf-8' }] }),
+        });
+      });
+      const oldFetch = await mf.dispatchFetch(`${ORIGIN}/fetch?target=agent&artifacts=transient`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          maxSeconds: 10,
+          options: { includeBody: true },
+          requests: [{ id: '1', url: 'https://legacy.example.com/', kind: 'page' }],
+        }),
+      });
+      assert.equal(oldFetch.status, 200);
+      assert.equal(sawArtifactsField, false, 'legacy agent without artifacts-v1 must not receive artifacts policy');
+      wsOld.close(1000, 'done');
+      await sleep(40);
+    }
+
+    // 2. Capable agent (X-Agent-Capabilities: artifacts-v1): upload auth/nonce/hash/Content-Length gates + 40 MiB logical batch!
+    {
+      const rWs = await mf.dispatchFetch(`${ORIGIN}/agent/ws`, {
+        headers: {
+          upgrade: 'websocket',
+          authorization: `Bearer ${S1}`,
+          'x-agent-site': 'site-1',
+          'x-agent-arch': 'amd64',
+          'x-agent-capabilities': 'artifacts-v1',
+        },
+      });
+      const wsCap = rWs.webSocket;
+      wsCap.accept();
+
+      const eightMiB = Buffer.from('<html>' + 'R2BatchData!'.repeat(700_000).slice(0, (8 << 20) - 13) + '</html>');
+      const contentSha = sha256Hex(eightMiB);
+      const gzBytes = gzipSync(eightMiB);
+      const blobSha = sha256Hex(gzBytes);
+
+      let gateChecksDone = false;
+      wsCap.addEventListener('message', async (e) => {
+        const d = String(e.data);
+        if (!d.includes('"dispatch"')) return;
+        const msg = JSON.parse(d);
+        assert.deepEqual(msg.artifacts, { mode: 'r2', retention: 'transient', maxContentBytes: 16 << 20 });
+
+        const putArt = (sha, bodyBuf, hdrOverrides = {}) =>
+          mf.dispatchFetch(`${ORIGIN}/agent/artifacts/${sha}`, {
+            method: 'PUT',
+            headers: {
+              authorization: `Bearer ${S1}`,
+              'x-agent-site': 'site-1',
+              'x-job-id': msg.jobId,
+              'x-job-nonce': msg.jobNonce,
+              'x-request-id': 'r1',
+              'x-content-sha256': contentSha,
+              'x-content-bytes': String(eightMiB.byteLength),
+              'x-artifact-retention': 'transient',
+              'content-type': 'application/gzip',
+              'content-length': String(bodyBuf.byteLength),
+              ...hdrOverrides,
+            },
+            body: bodyBuf,
+          });
+
+        // Wrong nonce -> 403
+        assert.equal((await putArt(blobSha, gzBytes, { 'x-job-nonce': 'wrong-nonce' })).status, 403);
+        // Unknown requestId -> 400
+        assert.equal((await putArt(blobSha, gzBytes, { 'x-request-id': 'not-in-job' })).status, 400);
+        // Unexpected Content-Encoding -> 400
+        assert.equal((await putArt(blobSha, gzBytes, { 'content-encoding': 'gzip' })).status, 400);
+        // Wrong blobSha256 -> 400
+        assert.equal((await putArt('ff'.repeat(32), gzBytes)).status, 400);
+        gateChecksDone = true;
+
+        // Upload 5 x 8 MiB = 40 MiB logical batch (1st stores, 2..5 deduplicate in R2!)
+        const results = [];
+        for (let i = 1; i <= 5; i++) {
+          const upRes = await putArt(blobSha, gzBytes, { 'x-request-id': `r${i}` });
+          assert.equal(upRes.status, 200);
+          results.push({
+            id: `r${i}`,
+            url: `https://b${i}.example.com/`,
+            kind: 'page',
+            status: 200,
+            outcome: 'ok',
+            bytes: eightMiB.byteLength,
+            artifact: {
+              blobSha256: blobSha,
+              contentSha256: contentSha,
+              contentBytes: eightMiB.byteLength,
+              storedBytes: gzBytes.byteLength,
+              encoding: 'gzip',
+              retention: 'transient',
+            },
+          });
+        }
+
+        const repRes = await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${S1}`,
+            'x-agent-site': 'site-1',
+            'x-job-id': msg.jobId,
+            'x-job-nonce': msg.jobNonce,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ results }),
+        });
+        assert.equal(repRes.status, 200);
+      });
+
+      const batchRes = await mf.dispatchFetch(`${ORIGIN}/fetch?target=agent&artifacts=transient`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          maxSeconds: 30,
+          options: { includeBody: true },
+          requests: [1, 2, 3, 4, 5].map((i) => ({ id: `r${i}`, url: `https://b${i}.example.com/`, kind: 'page' })),
+        }),
+      });
+      assert.equal(batchRes.status, 200);
+      assert.equal(gateChecksDone, true);
+      const batchJson = await batchRes.json();
+      assert.equal(batchJson.results.length, 5);
+      assert.equal(batchJson.results[4]?.artifact?.contentBytes, 8 << 20);
+      wsCap.close(1000, 'done');
+    }
   } finally {
     await mf.dispose();
   }

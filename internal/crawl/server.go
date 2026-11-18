@@ -152,6 +152,11 @@ func ValidateCallWithCrawler(c *Crawler, call FetchCall, allow func(*url.URL) er
 
 // ExecuteCall enforces `MaxSeconds`, runs `c.RunLogged`, and logs batch summary metrics.
 func ExecuteCall(ctx context.Context, c *Crawler, call FetchCall, log *slog.Logger) FetchReply {
+	return ExecuteCallWithSink(ctx, c, call, log, nil)
+}
+
+// ExecuteCallWithSink enforces `MaxSeconds`, runs `c.RunWithSink`, and logs batch summary metrics.
+func ExecuteCallWithSink(ctx context.Context, c *Crawler, call FetchCall, log *slog.Logger, sink ResultSink) FetchReply {
 	secs := call.MaxSeconds
 	if secs <= 0 {
 		secs = DefaultMaxSeconds
@@ -163,7 +168,7 @@ func ExecuteCall(ctx context.Context, c *Crawler, call FetchCall, log *slog.Logg
 	defer cancel()
 
 	started := time.Now()
-	results := c.RunLogged(cctx, call.Requests, call.Options, log)
+	results := c.RunWithSink(cctx, call.Requests, call.Options, log, sink)
 	reply := FetchReply{
 		Results:    results,
 		Summary:    Summarize(results),

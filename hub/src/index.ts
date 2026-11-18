@@ -1,16 +1,33 @@
 /**
  * Reference Cloudflare Hub Worker + Hibernating WebSocket Durable Object (`AgentHubDO`) for EdgeFetch.
  *
- * Architectural boundary:
- *  - ONLY this Cloudflare Hub hosts inbound HTTP routes (`/admin`, `/mcp`, `/oauth/*`, `/fetch`, `/agents`).
- *  - Edge nodes (Home Assistant OS / Docker Go binaries) host ZERO inbound endpoints; they strictly dial outbound
- *    `wss://` to `/agent/ws`, sleep via Cloudflare edge auto-pong (`0` idle DO wakeups), and upload gzipped replies
- *    to `/agent/reply`.
+ * Routing & security boundary:
+ *  - Tier 1 (Primary): Load-balances requests across all connected remote edge nodes (`amd64` / `aarch64` Go binaries)
+ *    via Least-Recently-Used (`lastJobAt` ascending), sharding multi-URL batches across healthy nodes and cooling down
+ *    any `(host, siteId)` that receives HTTP `429` while failing over to remaining healthy remote nodes.
+ *  - Tier 2 (Cloudflare Overflow): Reaches out directly from Cloudflare (`cloudflareFallbackFetch` — or an optional
+ *    Cloudflare Container) ONLY when remote nodes get HTTP `429` (or when zero remote nodes are connected).
+ *  - ONLY this Cloudflare Hub hosts inbound HTTP routes (`/admin`, `/mcp`, `/oauth/*`, `/fetch`, `/agents`). Edge nodes
+ *    host ZERO inbound endpoints.
  */
 import { DurableObject, tracing } from 'cloudflare:workers';
 import { handleAdminRoute } from './admin';
-import type { AffinityPin, AgentAttachment } from './agent-hub';
-import { authorizeAgent, isCallerAuthorized, sameBytes } from './auth';
+import {
+  AgentHubEngine,
+  parseFetchTarget,
+  readAgentReplyBody,
+  recomputeSummary,
+  routeFetchWithFailover,
+  type AffinityPin,
+  type AgentAttachment,
+  type AgentDispatchResult,
+  type CompleteJobResult,
+  type CooldownStore,
+  type CrawlResultItem,
+  type FetchTarget,
+  type HubSocketLike,
+} from './agent-hub';
+import { authorizeAgent, isCallerAuthorized } from './auth';
 import { handleMcpRequest } from './mcp';
 import {
   OAUTH_SQLITE_SCHEMA,
@@ -29,24 +46,16 @@ interface Env {
   CALLER_TOKEN?: string;
   AGENT_TOKEN?: string;
   AGENT_TOKENS?: string;
-}
-
-interface PendingJob {
-  jobNonce: string;
-  siteId: string;
-  ws: WebSocket;
-  timer: ReturnType<typeof setTimeout>;
-  resolve: (bodyText: string) => void;
-  reject: (err: Error) => void;
+  USER_AGENT?: string;
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const AFFINITY_TTL_MS = 15 * 60_000;
 const MAX_CALL_BYTES = 1 << 20;
-const MAX_REPLY_BYTES = 20 << 20;
+const DEFAULT_UA = 'EdgeFetch/1.0 (+https://github.com/bartrumb/edgefetch)';
+const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 
 export class AgentHubDO extends DurableObject<Env> {
-  private readonly pending = new Map<string, PendingJob>();
+  private readonly engine: AgentHubEngine;
   private readonly oauth: OAuthStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -54,13 +63,61 @@ export class AgentHubDO extends DurableObject<Env> {
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
     this.ctx.blockConcurrencyWhile(async () => {
       this.ctx.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS host_affinity (
-          host TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS site_cooldowns (
+          host TEXT NOT NULL,
           site_id TEXT NOT NULL,
-          expires_at INTEGER NOT NULL
+          expires_at INTEGER NOT NULL,
+          PRIMARY KEY (host, site_id)
         );
         ${OAUTH_SQLITE_SCHEMA}
       `);
+    });
+
+    const cooldowns: CooldownStore = {
+      isCooledDown: (host, siteId, now) => {
+        const rows = this.ctx.storage.sql
+          .exec<{ expires_at: number }>(
+            'SELECT expires_at FROM site_cooldowns WHERE host = ? AND site_id = ?',
+            host.toLowerCase(),
+            siteId.toLowerCase(),
+          )
+          .toArray();
+        const row = rows[0];
+        if (!row) return false;
+        if (row.expires_at <= now) {
+          this.ctx.storage.sql.exec('DELETE FROM site_cooldowns WHERE host = ? AND site_id = ?', host.toLowerCase(), siteId.toLowerCase());
+          return false;
+        }
+        return true;
+      },
+      setCooldown: (host, siteId, expiresAt) => {
+        this.ctx.storage.sql.exec(
+          'INSERT OR REPLACE INTO site_cooldowns (host, site_id, expires_at) VALUES (?, ?, ?)',
+          host.toLowerCase(),
+          siteId.toLowerCase(),
+          expiresAt,
+        );
+      },
+      clearSite: (siteId) => {
+        this.ctx.storage.sql.exec('DELETE FROM site_cooldowns WHERE site_id = ?', siteId.toLowerCase());
+      },
+      listPins: (now) => {
+        this.ctx.storage.sql.exec('DELETE FROM site_cooldowns WHERE expires_at <= ?', now);
+        return this.ctx.storage.sql
+          .exec<{ host: string; site_id: string; expires_at: number }>(
+            'SELECT host, site_id, expires_at FROM site_cooldowns ORDER BY host ASC, site_id ASC',
+          )
+          .toArray()
+          .map((r) => ({ host: r.host, siteId: r.site_id, expiresAt: r.expires_at }));
+      },
+      clearAll: () => {
+        this.ctx.storage.sql.exec('DELETE FROM site_cooldowns');
+      },
+    };
+
+    this.engine = new AgentHubEngine({
+      getSockets: (tag) => this.ctx.getWebSockets(tag) as unknown as HubSocketLike[],
+      cooldowns,
     });
     this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
   }
@@ -70,82 +127,26 @@ export class AgentHubDO extends DurableObject<Env> {
       return Response.json({ error: 'upgrade_required' }, { status: 426 });
     }
     const siteId = (request.headers.get('x-verified-site') ?? '').trim().toLowerCase();
-    const archRaw = (request.headers.get('x-agent-arch') ?? '').trim().toLowerCase();
-    const arch = /^[a-z0-9_-]{1,24}$/.test(archRaw) ? archRaw : 'unknown';
-
-    for (const old of this.ctx.getWebSockets(`site:${siteId}`)) {
-      this.abortSocketJobs(old, 'replaced');
-      const prev = old.deserializeAttachment() as AgentAttachment | null;
-      if (prev && typeof prev === 'object') {
-        old.serializeAttachment({ ...prev, replaced: true });
-      }
-      try {
-        old.close(1000, 'replaced');
-      } catch {
-        // ignore
-      }
-    }
+    const arch = request.headers.get('x-agent-arch');
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server, [`site:${siteId}`]);
-    const att: AgentAttachment = { siteId, arch, connectedAt: Date.now(), lastJobAt: 0, jobsOk: 0, jobsErr: 0 };
-    server.serializeAttachment(att);
-    server.send(JSON.stringify({ type: 'hello', siteId }));
+    const att = this.engine.registerAgent(server as unknown as HubSocketLike, siteId, arch);
+    server.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private activeEntries(): Array<{ ws: WebSocket; att: AgentAttachment }> {
-    const bySite = new Map<string, { ws: WebSocket; att: AgentAttachment }>();
-    for (const ws of this.ctx.getWebSockets()) {
-      const state = (ws as unknown as { readyState?: number }).readyState;
-      if (typeof state === 'number' && state !== 1) continue;
-      const att = ws.deserializeAttachment() as AgentAttachment | null;
-      if (!att?.siteId || att.replaced) continue;
-      const prev = bySite.get(att.siteId);
-      if (!prev) {
-        bySite.set(att.siteId, { ws, att: { ...att } });
-      } else if (att.connectedAt >= prev.att.connectedAt) {
-        prev.ws.serializeAttachment({ ...prev.att, replaced: true });
-        try {
-          prev.ws.close(1000, 'replaced');
-        } catch {
-          // ignore
-        }
-        bySite.set(att.siteId, { ws, att: { ...att } });
-      } else {
-        ws.serializeAttachment({ ...att, replaced: true });
-        try {
-          ws.close(1000, 'replaced');
-        } catch {
-          // ignore
-        }
-      }
-    }
-    return [...bySite.values()];
-  }
-
   async listAgents(): Promise<{ connected: number; agents: AgentAttachment[] }> {
-    const agents = this.activeEntries()
-      .map(({ att }) => att)
-      .sort((a, b) => a.siteId.localeCompare(b.siteId));
-    return { connected: agents.length, agents };
+    return this.engine.listAgents();
   }
 
-  async listAffinities(now = Date.now()): Promise<AffinityPin[]> {
-    this.ctx.storage.sql.exec('DELETE FROM host_affinity WHERE expires_at <= ?', now);
-    return this.ctx.storage.sql
-      .exec<{ host: string; site_id: string; expires_at: number }>('SELECT host, site_id, expires_at FROM host_affinity ORDER BY host ASC')
-      .toArray()
-      .map((r) => ({ host: r.host, siteId: r.site_id, expiresAt: r.expires_at }));
+  async listAffinities(): Promise<AffinityPin[]> {
+    return this.engine.listAffinities();
   }
 
   async clearAffinities(siteId?: string): Promise<void> {
-    if (siteId?.trim()) {
-      this.ctx.storage.sql.exec('DELETE FROM host_affinity WHERE site_id = ?', siteId.trim().toLowerCase());
-    } else {
-      this.ctx.storage.sql.exec('DELETE FROM host_affinity');
-    }
+    this.engine.clearAffinities(siteId);
   }
 
   async getPortalState(now: number): Promise<{
@@ -154,103 +155,24 @@ export class AgentHubDO extends DurableObject<Env> {
     affinities: AffinityPin[];
     grants: OAuthGrantSummary[];
   }> {
-    const fleet = await this.listAgents();
+    const fleet = this.engine.listAgents();
     return {
       ...fleet,
-      affinities: await this.listAffinities(now),
+      affinities: this.engine.listAffinities(),
       grants: await this.oauth.listGrants(now),
     };
   }
 
+  async dispatchFetch(rawCallBody: string, trace: Record<string, string>, preferredSite?: string): Promise<AgentDispatchResult> {
+    return this.engine.dispatchFetch(rawCallBody, trace, { preferredSite });
+  }
+
   async hasPendingJob(jobId: string, siteId: string): Promise<boolean> {
-    const job = this.pending.get(jobId);
-    return Boolean(job && job.siteId === siteId);
+    return this.engine.hasPendingJob(jobId, siteId);
   }
 
-  async completeJob(jobId: string, jobNonce: string, siteId: string, bodyText: string): Promise<{ ok: boolean; status: number }> {
-    const job = this.pending.get(jobId);
-    if (!job) return { ok: false, status: 404 };
-    if (!jobNonce || !sameBytes(jobNonce, job.jobNonce) || job.siteId !== siteId) {
-      return { ok: false, status: 403 };
-    }
-    clearTimeout(job.timer);
-    this.pending.delete(jobId);
-    job.resolve(bodyText);
-    return { ok: true, status: 200 };
-  }
-
-  async dispatchFetch(
-    rawCallBody: string,
-    trace: Record<string, string>,
-    preferredSite?: string,
-  ): Promise<{ ok: true; siteId: string; bodyText: string } | { ok: false; status: number; error: string }> {
-    let call: { requests?: Array<{ url?: string }>; maxSeconds?: number };
-    try {
-      call = JSON.parse(rawCallBody) as { requests?: Array<{ url?: string }>; maxSeconds?: number };
-    } catch {
-      return { ok: false, status: 400, error: 'bad_json' };
-    }
-    if (!Array.isArray(call.requests) || call.requests.length === 0) {
-      return { ok: false, status: 400, error: 'bad_requests' };
-    }
-
-    let host: string | null = null;
-    try {
-      host = call.requests[0]?.url ? new URL(call.requests[0].url).hostname.toLowerCase() : null;
-    } catch {
-      host = null;
-    }
-
-    const entries = this.activeEntries();
-    const candidates = preferredSite
-      ? entries.filter((e) => e.att.siteId === preferredSite)
-      : entries.sort((a, b) => a.att.lastJobAt - b.att.lastJobAt || a.att.connectedAt - b.att.connectedAt);
-
-    if (!preferredSite && host) {
-      const rows = this.ctx.storage.sql
-        .exec<{ site_id: string; expires_at: number }>('SELECT site_id, expires_at FROM host_affinity WHERE host = ?', host)
-        .toArray();
-      if (rows[0] && rows[0].expires_at > Date.now()) {
-        const idx = candidates.findIndex((c) => c.att.siteId === rows[0]!.site_id);
-        if (idx > 0) candidates.unshift(...candidates.splice(idx, 1));
-      }
-    }
-
-    if (candidates.length === 0) return { ok: false, status: 503, error: 'no_agents_connected' };
-    const timeoutMs = Math.min(300_000, Math.max(10_000, ((call.maxSeconds ?? 60) + 5) * 1_000));
-
-    for (const { ws, att } of candidates.slice(0, 3)) {
-      const jobId = crypto.randomUUID();
-      const jobNonce = crypto.randomUUID();
-      att.lastJobAt = Date.now();
-      ws.serializeAttachment(att);
-      try {
-        const bodyText = await new Promise<string>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            this.pending.delete(jobId);
-            reject(new Error('timeout'));
-          }, timeoutMs);
-          this.pending.set(jobId, { jobNonce, siteId: att.siteId, ws, timer, resolve, reject });
-          ws.send(JSON.stringify({ type: 'dispatch', jobId, jobNonce, trace, call }));
-        });
-        att.jobsOk++;
-        ws.serializeAttachment(att);
-        if (host && !preferredSite) {
-          this.ctx.storage.sql.exec(
-            'INSERT OR REPLACE INTO host_affinity (host, site_id, expires_at) VALUES (?, ?, ?)',
-            host,
-            att.siteId,
-            Date.now() + AFFINITY_TTL_MS,
-          );
-        }
-        return { ok: true, siteId: att.siteId, bodyText };
-      } catch {
-        att.jobsErr++;
-        ws.serializeAttachment(att);
-        this.ctx.storage.sql.exec('DELETE FROM host_affinity WHERE site_id = ?', att.siteId);
-      }
-    }
-    return { ok: false, status: 502, error: 'agent_dispatch_failed' };
+  async completeJob(jobId: string, jobNonce: string, siteId: string, bodyText: string): Promise<CompleteJobResult> {
+    return this.engine.completeJob(jobId, jobNonce, siteId, bodyText);
   }
 
   // OAuth 2.1 SQLite RPC methods
@@ -307,20 +229,10 @@ export class AgentHubDO extends DurableObject<Env> {
     await this.oauth.clearAuthFailures(bucket);
   }
 
-  private abortSocketJobs(ws: WebSocket, reason: string): void {
-    for (const [id, job] of this.pending.entries()) {
-      if (job.ws === ws) {
-        clearTimeout(job.timer);
-        this.pending.delete(id);
-        job.reject(new Error(reason));
-      }
-    }
-  }
-
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string' || message === 'ping' || message.length > 2048) return;
     try {
-      const msg = JSON.parse(message) as { type?: string; arch?: string; goVersion?: string; reconnectAttempt?: number };
+      const msg = JSON.parse(message) as { type?: string; reconnectAttempt?: number };
       if (msg.type === 'agent_hello') {
         const att = ws.deserializeAttachment() as AgentAttachment | null;
         console.info(JSON.stringify({ event: (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready', siteId: att?.siteId, ...msg }));
@@ -330,41 +242,137 @@ export class AgentHubDO extends DurableObject<Env> {
     }
   }
 
-  override async webSocketClose(ws: WebSocket, code: number): Promise<void> {
-    this.abortSocketJobs(ws, `closed_${code}`);
+  override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    this.engine.handleDisconnect(ws as unknown as HubSocketLike, reason || `closed_${code}`);
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
-    this.abortSocketJobs(ws, 'ws_error');
+    this.engine.handleDisconnect(ws as unknown as HubSocketLike, 'ws_error');
   }
 }
 
-async function readCappedStream(req: Request, maxBytes: number): Promise<string | null> {
-  if (!req.body) return null;
-  const enc = (req.headers.get('content-encoding') ?? '').toLowerCase();
-  const stream = enc === 'gzip' ? req.body.pipeThrough(new DecompressionStream('gzip')) : req.body;
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      total += value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel().catch(() => undefined);
-        return null;
+/**
+ * Direct Cloudflare edge overflow fetcher invoked in `target=auto` ONLY when remote nodes hit HTTP `429`
+ * (or when zero remote nodes are connected). Enforces public `https://:443` DNS-only URLs and streaming body caps.
+ */
+async function cloudflareOverflowFetch(rawBody: string, userAgent: string, selfHost: string): Promise<Response> {
+  const started = Date.now();
+  let call: {
+    requests?: Array<{ id?: string; url?: string; kind?: string; ifNoneMatch?: string; ifModifiedSince?: string }>;
+    options?: { includeBody?: boolean; maxBytes?: number };
+  };
+  try {
+    call = JSON.parse(rawBody) as typeof call;
+  } catch {
+    return Response.json({ error: 'bad_json' }, { status: 400 });
+  }
+  const reqs = Array.isArray(call.requests) ? call.requests : [];
+  const maxBytes = Math.min(16 << 20, Math.max(1024, call.options?.maxBytes ?? 8 << 20));
+  const includeBody = Boolean(call.options?.includeBody);
+  const results: CrawlResultItem[] = [];
+
+  for (const r of reqs) {
+    const reqStart = Date.now();
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(r.url ?? '');
+    } catch {
+      results.push({ id: r.id, url: r.url, kind: r.kind, status: 0, outcome: 'error', problem: 'bad_url' });
+      continue;
+    }
+    const host = parsedUrl.hostname.toLowerCase();
+    if (
+      parsedUrl.protocol !== 'https:' ||
+      (parsedUrl.port && parsedUrl.port !== '443') ||
+      !host.includes('.') ||
+      host === 'localhost' ||
+      host === selfHost.toLowerCase()
+    ) {
+      results.push({ id: r.id, url: r.url, kind: r.kind, status: 0, outcome: 'error', problem: 'disallowed_url' });
+      continue;
+    }
+
+    const headers = new Headers({
+      'user-agent': userAgent,
+      accept: r.kind === 'feed' ? 'application/json' : 'text/html,application/xhtml+xml',
+    });
+    if (r.ifNoneMatch) headers.set('if-none-match', r.ifNoneMatch);
+    if (r.ifModifiedSince) headers.set('if-modified-since', r.ifModifiedSince);
+
+    try {
+      const resp = await fetch(parsedUrl.toString(), { method: 'GET', headers, redirect: 'follow' });
+      const reader = resp.body?.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      let truncated = false;
+      if (reader) {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            if (total + value.byteLength > maxBytes) {
+              truncated = true;
+              await reader.cancel().catch(() => undefined);
+              break;
+            }
+            total += value.byteLength;
+            if (includeBody) chunks.push(value);
+          }
+        }
       }
-      chunks.push(value);
+      let bodyStr: string | undefined;
+      if (includeBody && !truncated) {
+        const buf = new Uint8Array(total);
+        let off = 0;
+        for (const c of chunks) {
+          buf.set(c, off);
+          off += c.byteLength;
+        }
+        bodyStr = new TextDecoder().decode(buf);
+      }
+      const cfMitigated = resp.headers.get('cf-mitigated') ?? undefined;
+      const outcome = truncated
+        ? 'error'
+        : cfMitigated
+          ? 'challenge'
+          : resp.status >= 200 && resp.status < 400
+            ? 'ok'
+            : resp.status === 404 || resp.status === 410
+              ? 'gone'
+              : 'error';
+      results.push({
+        id: r.id,
+        url: r.url,
+        kind: r.kind,
+        status: resp.status,
+        outcome,
+        bytes: total,
+        truncated,
+        durationMs: Date.now() - reqStart,
+        contentType: resp.headers.get('content-type') ?? undefined,
+        etag: resp.headers.get('etag') ?? undefined,
+        retryAfter: resp.headers.get('retry-after') ?? undefined,
+        ...(cfMitigated ? { cfMitigated } : {}),
+        ...(bodyStr !== undefined ? { body: bodyStr } : {}),
+      });
+    } catch (e) {
+      results.push({
+        id: r.id,
+        url: r.url,
+        kind: r.kind,
+        status: 0,
+        outcome: 'error',
+        problem: e instanceof Error ? e.message : String(e),
+        durationMs: Date.now() - reqStart,
+      });
     }
   }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return new TextDecoder().decode(out);
+
+  return Response.json({
+    results,
+    summary: recomputeSummary(results),
+    durationMs: Date.now() - started,
+  });
 }
 
 function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
@@ -388,16 +396,24 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const hub = () => env.AGENT_HUB.get(env.AGENT_HUB.idFromName('global'));
-    const executeHubFetch = async (body: string, site?: string) =>
+    const ua = env.USER_AGENT?.trim() || DEFAULT_UA;
+
+    const executeHubFetch = async (target: FetchTarget, body: string, site?: string) =>
       (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
         'edgefetch.dispatch',
         async (span) => {
-          const res = await hub().dispatchFetch(body, { 'x-request-id': request.headers.get('cf-ray') ?? '' }, site);
-          if (!res.ok) {
-            return { status: res.status, via: 'none', bodyText: JSON.stringify({ error: res.error }) };
-          }
-          span.setAttribute('edgefetch.site', res.siteId);
-          return { status: 200, via: `agent:${res.siteId}`, bodyText: res.bodyText };
+          const trace = { 'x-request-id': request.headers.get('cf-ray') ?? '' };
+          const res = await routeFetchWithFailover({
+            target,
+            site,
+            body,
+            trace,
+            callAgent: (b, t, s) => hub().dispatchFetch(b, t, s),
+            callContainer: (b) => cloudflareOverflowFetch(b, ua, url.hostname),
+          });
+          const via = res.headers.get('x-crawler-via') ?? target;
+          span.setAttribute('edgefetch.via', via);
+          return { status: res.status, via, bodyText: await res.text() };
         },
       );
 
@@ -418,15 +434,14 @@ export default {
       const jobNonce = (request.headers.get('x-job-nonce') ?? '').trim();
       if (!JOB_ID_RE.test(jobId) || !JOB_ID_RE.test(jobNonce)) return Response.json({ error: 'bad_job_headers' }, { status: 400 });
       if (!(await hub().hasPendingJob(jobId, auth.siteId))) return Response.json({ error: 'unknown_job' }, { status: 404 });
-      const text = await readCappedStream(request, MAX_REPLY_BYTES);
-      if (text === null) return Response.json({ error: 'too_large_or_invalid' }, { status: 413 });
-      const done = await hub().completeJob(jobId, jobNonce, auth.siteId, text);
+      const payload = await readAgentReplyBody(request);
+      if (!payload.ok) return Response.json({ error: payload.error }, { status: payload.status });
+      const done = await hub().completeJob(jobId, jobNonce, auth.siteId, payload.text);
       return Response.json({ ok: done.ok }, { status: done.status });
     }
 
     const oauthStore = hubOAuthStore(hub);
 
-    // Self-hosted OAuth 2.1 + RFC 9728 / RFC 8414 discovery
     const oauthRes = await handleOAuthRoute(request, url, {
       store: oauthStore,
       ownerSecret: env.CALLER_TOKEN,
@@ -434,35 +449,33 @@ export default {
     });
     if (oauthRes) return oauthRes;
 
-    // Stateless Streamable HTTP MCP Server (`/mcp`)
     if (url.pathname === '/mcp') {
       return handleMcpRequest(request, url, {
         serverName: 'edgefetch-hub',
-        serverVersion: '1.1.0',
+        serverVersion: '1.2.0',
         ownerSecret: env.CALLER_TOKEN,
         oauthStore,
-        allowedTargets: ['agent'],
-        defaultTarget: 'agent',
+        allowedTargets: ALLOWED_TARGETS,
+        defaultTarget: 'auto',
         listFleet: async () => {
           const state = await hub().getPortalState(Date.now());
           return { connected: state.connected, agents: state.agents, affinities: state.affinities };
         },
-        executeFetch: ({ site, body }) => executeHubFetch(body, site),
+        executeFetch: ({ target, site, body }) => executeHubFetch(target, body, site),
       });
     }
 
-    // Built-in Web Control Center (`/admin` & `/admin/*`)
     const adminRes = await handleAdminRoute(request, url, {
       serviceName: 'EdgeFetch Hub',
       mcpSlug: 'edgefetch',
       ownerSecret: env.CALLER_TOKEN,
       oauthStore,
-      allowedTargets: ['agent'],
-      defaultTarget: 'agent',
+      allowedTargets: ALLOWED_TARGETS,
+      defaultTarget: 'auto',
       getState: () => hub().getPortalState(Date.now()),
       clearAffinities: (siteId) => hub().clearAffinities(siteId),
       revokeGrant: (grantId) => hub().oauthRevokeGrant(grantId),
-      executeFetch: ({ site, body }) => executeHubFetch(body, site),
+      executeFetch: ({ target, site, body }) => executeHubFetch(target, body, site),
     });
     if (adminRes) return adminRes;
 
@@ -473,10 +486,11 @@ export default {
       return Response.json(await hub().listAgents());
     }
     if (request.method === 'POST' && url.pathname === '/fetch') {
+      const parsedTarget = parseFetchTarget(url);
+      if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
       const body = await request.text();
       if (body.length > MAX_CALL_BYTES) return Response.json({ error: 'too_large' }, { status: 413 });
-      const site = url.searchParams.get('site')?.trim().toLowerCase();
-      const out = await executeHubFetch(body, site);
+      const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site);
       return new Response(out.bodyText, {
         status: out.status,
         headers: { 'content-type': 'application/json', 'x-crawler-via': out.via, 'cache-control': 'no-store' },

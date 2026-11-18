@@ -107,10 +107,10 @@ function renderDashboardHtml(params: {
     .map((t) => {
       const label =
         t === 'auto'
-          ? 'auto (Container primary -> HAOS standby failover)'
+          ? 'auto (Load-balance remote HAOS pool -> Cloudflare on 429)'
           : t === 'container'
             ? 'container (Cloudflare Go container only)'
-            : 'agent (Home Assistant OS standby pool)';
+            : 'agent (Remote HAOS pool only — LRU load-balanced)';
       return `<option value="${escapeHtml(t)}"${t === params.defaultTarget ? ' selected' : ''}>${escapeHtml(label)}</option>`;
     })
     .join('');
@@ -215,8 +215,8 @@ function renderDashboardHtml(params: {
             <select id="f-target">${targetOptions}</select>
           </div>
           <div>
-            <label for="f-site">Pin Standby Site (optional)</label>
-            <select id="f-site"><option value="">Auto (15m sticky + LRU)</option></select>
+            <label for="f-site">Pin Remote Site (optional)</label>
+            <select id="f-site"><option value="">Load-Balance All Remote Sites (LRU)</option></select>
           </div>
           <div>
             <label for="f-pause">pauseMs / pauseJitterMs</label>
@@ -242,12 +242,12 @@ function renderDashboardHtml(params: {
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:20px">
       <section class="card">
         <h2>
-          <span>15-Minute Host-Sticky Affinity Pins</span>
-          <button type="button" id="clear-affinity-btn" style="padding:4px 10px;font-size:0.78rem">Clear All Pins</button>
+          <span>Remote Site 429 Cooldowns</span>
+          <button type="button" id="clear-affinity-btn" style="padding:4px 10px;font-size:0.78rem">Clear Cooldowns</button>
         </h2>
         <table>
-          <thead><tr><th>Origin Host</th><th>Pinned Site</th><th>TTL Left</th></tr></thead>
-          <tbody id="affinity-tbody"><tr><td colspan="3" class="muted">No active domain pins</td></tr></tbody>
+          <thead><tr><th>Origin Host</th><th>Cooled-Down Site</th><th>Cooldown Left</th></tr></thead>
+          <tbody id="affinity-tbody"><tr><td colspan="3" class="muted">No active 429 site cooldowns</td></tr></tbody>
         </table>
       </section>
 
@@ -298,7 +298,7 @@ function renderDashboardHtml(params: {
       const grid = el('fleet-grid');
       const siteSelect = el('f-site');
       const prevSelected = siteSelect.value;
-      siteSelect.innerHTML = '<option value="">Auto (15m sticky + LRU)</option>' +
+      siteSelect.innerHTML = '<option value="">Load-Balance All Remote Sites (LRU)</option>' +
         data.agents.map((a) => '<option value="' + esc(a.siteId) + '">' + esc(a.siteId) + ' (' + esc(a.arch) + ')</option>').join('');
       siteSelect.value = prevSelected;
 
@@ -318,7 +318,7 @@ function renderDashboardHtml(params: {
       const affBody = el('affinity-tbody');
       affBody.innerHTML = data.affinities.length
         ? data.affinities.map((p) => '<tr><td><code>' + esc(p.host) + '</code></td><td>' + esc(p.siteId) + '</td><td>' + esc(relTime(p.expiresAt)) + '</td></tr>').join('')
-        : '<tr><td colspan="3" class="muted">No active domain pins</td></tr>';
+        : '<tr><td colspan="3" class="muted">No active 429 site cooldowns</td></tr>';
 
       const grantsBody = el('grants-tbody');
       grantsBody.innerHTML = data.grants.length

@@ -32,10 +32,10 @@ flowchart TD
     Admin["Browser (/admin Control Center)"] -->|"HMAC Session + CSRF"| HubW["Cloudflare Hub Worker + AgentHubDO (SQLite)"]
     Claude["Claude Code (/mcp)"] -->|"Self-Hosted OAuth 2.1 + PKCE S256"| HubW
     Caller["Upstream Workflow / Cron"] -->|"POST /fetch (Bearer CALLER_TOKEN)"| HubW
-    HubW -->|"1. Primary (optional)"| CloudGo["Cloud Container (edgefetch --mode=server)"]
-    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S1["Site 1 HAOS / Docker (amd64 — outbound only)"]
-    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S2["Site 2 HAOS / ARM64 (aarch64 — outbound only)"]
-    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S3["Site 3 HAOS / Baremetal (amd64 — outbound only)"]
+    HubW -->|"1. Primary: LRU Load-Balanced Dispatch"| S1["Site 1 HAOS / Docker (amd64 — outbound only)"]
+    HubW -->|"1. Primary: LRU Load-Balanced Dispatch"| S2["Site 2 HAOS / ARM64 (aarch64 — outbound only)"]
+    HubW -->|"1. Primary: LRU Load-Balanced Dispatch"| S3["Site 3 HAOS / Baremetal (amd64 — outbound only)"]
+    HubW -.->|"2. Overflow ONLY if Remote Nodes hit HTTP 429"| CloudGo["Cloudflare Egress / Container"]
     S1 -.->|"POST /agent/reply (gzip FetchReply)"| HubW
     S2 -.->|"POST /agent/reply (gzip FetchReply)"| HubW
     S3 -.->|"POST /agent/reply (gzip FetchReply)"| HubW

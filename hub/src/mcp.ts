@@ -151,7 +151,8 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
             type: 'string',
             enum: allowedTargets,
             default: defaultTarget,
-            description: 'Execution tier ("auto" = primary container with standby failover, "container", or "agent").',
+            description:
+              'Execution tier ("auto" = load-balance across remote HAOS nodes and reach out via Cloudflare only on 429, "agent", or "container").',
           },
           site: {
             type: 'string',

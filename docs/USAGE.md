@@ -26,8 +26,8 @@ sequenceDiagram
         Note over Hub: Cloudflare Edge Auto-Response ("pong") — 0 DO wakeups!
         Hub-->>Edge: "pong"
     end
-    Caller->>Hub: 2. POST /fetch or MCP fetch_url
-    Note over Hub: Check 15m SQLite host_affinity pin -> fallback to LRU site
+    Caller->>Hub: 2. POST /fetch or MCP fetch_url (target=auto)
+    Note over Hub: Load-balance across healthy remote nodes by LRU (skipping any 429-cooled-down site)
     Hub->>Edge: {"type":"dispatch","jobId":"...","jobNonce":"...","call":{...}}
     Edge->>Origin: 3. Polite HTTP/2 GET (robots.txt + RejectNonPublicPeer SSRF guard)
     Origin-->>Edge: 200 OK + httptrace (dnsMs, connectMs, tlsMs, ttfbMs)
@@ -35,10 +35,10 @@ sequenceDiagram
     Hub-->>Caller: 200 OK (x-crawler-via: agent:site-arm64) + OTel Span & Logs
 ```
 
-### Host-Sticky Affinity + LRU Site Rotation
-- **Same origin domain within 15 minutes:** `AgentHubDO` pins `hostname -> siteId` in SQLite (`host_affinity`) for 15 minutes so multi-page crawls against one origin keep **1 residential IP** and reuse **1 warm HTTP/2 TLS socket** (`reused: true`).
-- **Different origin domains:** `AgentHubDO` orders connected sites by `lastJobAt` ascending (least-recently-used), spreading crawls evenly across all connected sites (`site-arm64`, `site-x86`, `site-win-vm`).
-- **Mid-job disconnect failover:** If a chosen site's WebSocket drops mid-job, `AgentHubDO` clears its affinity pin and immediately retries on the next healthy site.
+### LRU Load-Balancing + 429-Only Cloudflare Overflow
+- **Even Load-Balancing Across Remote Nodes (Tier 1 Primary):** `AgentHubDO` orders connected remote nodes (`site-arm64`, `site-win-vm`, `site-x86`) by `lastJobAt` ascending (Least-Recently-Used), rotating sequential requests evenly across all sites and sharding multi-URL batches in parallel across all healthy sites.
+- **Per-Site `429` Cooldowns + Peer Failover:** If one remote node receives HTTP `429`, `AgentHubDO` places `(host, siteId)` into cooldown in SQLite (`site_cooldowns`, honoring `Retry-After` or defaulting to 5 minutes) and retries across remaining non-429 remote nodes first.
+- **Cloudflare Overflow ONLY on `429` (Tier 2 Fallback):** Cloudflare egress (`CrawlerContainer` or Worker `fetch`) stays asleep during normal operation and is invoked in `target=auto` **only** if remote nodes hit HTTP `429` (or if zero remote nodes are connected). Responses like `200`, `304`, `403`, `404`, `503`, and `cf-mitigated` challenges never wake Cloudflare.
 
 ---
 

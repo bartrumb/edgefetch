@@ -1,5 +1,8 @@
-import prodWorker, { AgentHubDO as ProdAgentHubDO } from '../src/index.ts';
-import { r2ArtifactKey, sanitizeFtsQuery } from '../src/storage.ts';
+import prodWorker, { AgentHubDO as ProdAgentHubDO, IngestWorkflow } from '../src/index.ts';
+import { executeIngestPipeline, pruneExpiredFetchHistory, writeJobManifestToR2 } from '../src/ingest.ts';
+import { r2ArtifactKey, sanitizeFtsQuery, type OptionalStorageBindings } from '../src/storage.ts';
+
+export { IngestWorkflow };
 
 export class AgentHubDO extends ProdAgentHubDO {
   async __testSql(query: string): Promise<unknown[]> {
@@ -36,6 +39,77 @@ export default {
       const stub = ns.get(ns.idFromName('global'));
       await stub.__testAbort().catch(() => undefined);
       return Response.json({ aborted: true });
+    }
+    if (url.pathname === '/__test_s4_idempotency' && request.method === 'POST') {
+      const storageEnv = env as unknown as OptionalStorageBindings;
+      const sampleReply = JSON.stringify({
+        results: [
+          {
+            id: 'req-1',
+            url: 'https://shop.example.com/item?secret=DO_NOT_LEAK_IN_FETCHES',
+            kind: 'page',
+            status: 200,
+            outcome: 'ok',
+            problem: 'note on https://shop.example.com/item?secret=DO_NOT_LEAK',
+            attempts: 1,
+            durationMs: 45,
+            timing: { ttfbMs: 12 },
+          },
+          {
+            id: 'req-2',
+            url: 'https://shop.example.com/private',
+            kind: 'page',
+            status: 0,
+            outcome: 'skip',
+            problem: 'robots.txt disallowed /private',
+            attempts: 0,
+            durationMs: 2,
+          },
+        ],
+      });
+      const written = await writeJobManifestToR2({
+        bucket: storageEnv.ARTIFACTS!,
+        jobId: 'job_idem_1',
+        via: 'agent:site-1',
+        siteId: 'site-1',
+        rawReplyText: sampleReply,
+      });
+      if (!written.ok) return Response.json(written, { status: 500 });
+
+      // Run the exact same job TWICE to prove step retry / workflow replay idempotency!
+      const stepNames: string[] = [];
+      await executeIngestPipeline(storageEnv, { manifestKey: written.manifestKey, jobId: 'job_idem_1', siteId: 'site-1', via: 'agent:site-1' }, async (n, fn) => {
+        stepNames.push(n);
+        return await fn();
+      });
+      await executeIngestPipeline(storageEnv, { manifestKey: written.manifestKey, jobId: 'job_idem_1', siteId: 'site-1', via: 'agent:site-1' });
+
+      const meta = storageEnv.META!;
+      const fetchRows = (await meta.prepare("SELECT id, robots_decision, problem FROM fetches WHERE job_id = 'job_idem_1' ORDER BY request_id ASC").all()).results;
+      const pageCountForJob =
+        (await meta.prepare("SELECT COUNT(*) AS c FROM pages WHERE host = 'shop.example.com'").first<{ c: number }>())?.c ?? 0;
+
+      // Insert a 95-day-old fetch row and verify pruneExpiredFetchHistory removes it while keeping fresh rows!
+      await meta
+        .prepare(
+          `INSERT INTO fetches (id, job_id, request_id, page_id, via, status, outcome, robots_decision, attempts, duration_ms, fetched_at)
+           VALUES ('ft_old_95d', 'job_old', 'r0', (SELECT id FROM pages WHERE host = 'shop.example.com' LIMIT 1), 'agent:s1', 200, 'ok', 'allowed', 1, 10, ?)`,
+        )
+        .bind(Date.now() - 95 * 24 * 60 * 60_000)
+        .run();
+      const pruned = await pruneExpiredFetchHistory(meta);
+      const oldStillExists =
+        ((await meta.prepare("SELECT COUNT(*) AS c FROM fetches WHERE id = 'ft_old_95d'").first<{ c: number }>())?.c ?? 0) > 0;
+
+      return Response.json({
+        stepNames,
+        fetchCount: fetchRows.length,
+        pageCountForJob,
+        robotsDecisions: fetchRows.map((r) => r.robots_decision),
+        leakedSecretInFetches: JSON.stringify(fetchRows).includes('DO_NOT_LEAK'),
+        pruned,
+        oldStillExists,
+      });
     }
     if (url.pathname === '/__test_storage_verify' && request.method === 'POST') {
       const { metaSql, searchSql } = (await request.json()) as { metaSql: string; searchSql: string };

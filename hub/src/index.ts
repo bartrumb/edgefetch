@@ -56,6 +56,12 @@ import type {
 } from './oauth';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
 import {
+  executeIngestPipeline,
+  IngestWorkflow,
+  pruneExpiredFetchHistory,
+  writeJobManifestToR2,
+} from './ingest';
+import {
   buildCapabilities,
   handleAgentArtifactUpload,
   handleArtifactGetRequest,
@@ -81,6 +87,8 @@ const DEFAULT_UA = 'EdgeFetch/1.0 (+https://github.com/bartrumb/edgefetch)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;
+
+export { IngestWorkflow };
 
 export class AgentHubDO extends DurableObject<Env> {
   private readonly engine: AgentHubEngine;
@@ -602,9 +610,59 @@ export default {
           });
           const via = res.headers.get('x-crawler-via') ?? target;
           const retryAfter = res.headers.get('retry-after');
-          let bodyText = await res.text();
+          const rawCompletedBody = await res.text();
+          let bodyText = rawCompletedBody;
           if (res.status === 200 && env.ARTIFACTS && wantsIncludeBody && hydrateInline) {
-            bodyText = await hydrateReplyBodiesFromR2(bodyText, env.ARTIFACTS);
+            bodyText = await hydrateReplyBodiesFromR2(rawCompletedBody, env.ARTIFACTS);
+          }
+
+          // S4: When ARTIFACTS + META are bound, write R2 manifest and trigger idempotent IngestWorkflow (never failing crawl response).
+          if (res.status === 200 && env.ARTIFACTS && env.META) {
+            const ingestJobId = `job_${crypto.randomUUID().replace(/-/g, '')}`;
+            const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(via);
+            try {
+              const written = await writeJobManifestToR2({
+                bucket: env.ARTIFACTS,
+                jobId: ingestJobId,
+                via,
+                ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
+                rawReplyText: rawCompletedBody,
+              });
+              if (written.ok) {
+                const wfParams = {
+                  manifestKey: written.manifestKey,
+                  jobId: ingestJobId,
+                  ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
+                  via,
+                };
+                if (env.INGEST) {
+                  try {
+                    await env.INGEST.create({ id: `ingest-${ingestJobId}`, params: wfParams });
+                  } catch (wfErr) {
+                    const wfMsg = wfErr instanceof Error ? wfErr.message : String(wfErr);
+                    if (!/already exists|duplicate/i.test(wfMsg)) {
+                      pendingEvents.push({
+                        level: 'warn',
+                        category: 'crawl',
+                        event: 'ingest_workflow_error',
+                        summary: `Failed to enqueue IngestWorkflow for ${ingestJobId}: ${wfMsg.slice(0, 140)}`,
+                        details: { jobId: ingestJobId, manifestKey: written.manifestKey },
+                      });
+                    }
+                  }
+                } else {
+                  await executeIngestPipeline(env, wfParams);
+                }
+              }
+            } catch (manifestErr) {
+              const mMsg = manifestErr instanceof Error ? manifestErr.message : String(manifestErr);
+              pendingEvents.push({
+                level: 'warn',
+                category: 'crawl',
+                event: 'ingest_manifest_error',
+                summary: `Failed to write R2 ingest manifest: ${mMsg.slice(0, 140)}`,
+              });
+            }
           }
           pendingEvents.push(...buildCrawlActivityEvents({ source, target, via, httpStatus: res.status, replyText: bodyText }));
           await hub()
@@ -818,6 +876,12 @@ export default {
         },
         { status: 503, headers: { 'cache-control': 'no-store' } },
       );
+    }
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    if (env.META) {
+      await pruneExpiredFetchHistory(env.META).catch(() => undefined);
     }
   },
 };

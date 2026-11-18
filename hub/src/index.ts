@@ -40,22 +40,21 @@ import {
 } from './agent-hub';
 import { authorizeAgent, isCallerAuthorized } from './auth';
 import { handleMcpRequest } from './mcp';
-import {
-  OAUTH_SQLITE_SCHEMA,
-  createSqliteOAuthStore,
-  handleOAuthRoute,
-  type OAuthClientRecord,
-  type OAuthCodeRecord,
-  type OAuthGrantSummary,
-  type OAuthStore,
-  type OAuthTokenRecord,
-  type RotateRefreshParams,
-  type RotateRefreshResult,
-  type SqlStorageLike,
+import { authorizeMcpRequest, createSqliteOAuthStore, handleOAuthRoute, OAUTH_SQLITE_SCHEMA } from './oauth';
+import type {
+  OAuthClientRecord,
+  OAuthCodeRecord,
+  OAuthGrantSummary,
+  OAuthStore,
+  OAuthTokenRecord,
+  RotateRefreshParams,
+  RotateRefreshResult,
+  SqlStorageLike,
 } from './oauth';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
+import { buildCapabilities, type OptionalStorageBindings } from './storage';
 
-interface Env {
+interface Env extends OptionalStorageBindings {
   AGENT_HUB: DurableObjectNamespace<AgentHubDO>;
   CALLER_TOKEN?: string;
   AGENT_TOKEN?: string;
@@ -651,6 +650,25 @@ export default {
         executeFetch: ({ target, site, body }) => executeHubFetch(target, body, site, 'admin'),
       });
       if (adminRes) return adminRes;
+
+      if (request.method === 'GET' && url.pathname === '/v1/capabilities') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        return Response.json(buildCapabilities(env, '1.2.0'), {
+          status: 200,
+          headers: { 'cache-control': 'no-store' },
+        });
+      }
 
       if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
         return Response.json({ error: 'unauthorized' }, { status: 401 });

@@ -304,7 +304,73 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
 
       const rows = await sql('SELECT COUNT(*) AS c FROM host_windows');
       assert.ok(rows[0].c <= 512, `host_windows grew to ${rows[0].c} rows, expected <= 512`);
+
+      // 9. S1: Hub WITHOUT storage bindings reports capabilities disabled and still operates cleanly.
+      const capsOffRes = await f('/v1/capabilities', { headers: authz });
+      assert.equal(capsOffRes.status, 200);
+      const capsOff = await capsOffRes.json();
+      assert.deepEqual(capsOff.capabilities, {
+        fetch: true,
+        mcp: true,
+        oauth: true,
+        artifacts: false,
+        tracking: false,
+        ingestWorkflow: false,
+        search: false,
+      });
     }
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5 migrations & conditional uploads', async () => {
+  const metaSql = readFileSync(new URL('../migrations/meta/0001_tracking.sql', import.meta.url), 'utf8');
+  const searchSql = readFileSync(new URL('../migrations/search/0001_fts.sql', import.meta.url), 'utf8');
+
+  const mf = new Miniflare(
+    convertV4MiniflareOptions({
+      workers: [
+        {
+          name: 'hub-storage',
+          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          compatibilityDate: '2026-10-01',
+          durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
+          r2Buckets: ['ARTIFACTS'],
+          d1Databases: ['META', 'SEARCH'],
+          bindings: {
+            CALLER_TOKEN: CALLER,
+            AGENT_TOKENS: JSON.stringify({ 'site-1': S1 }),
+          },
+        },
+      ],
+    }),
+  );
+
+  try {
+    const authz = { authorization: `Bearer ${CALLER}`, 'content-type': 'application/json' };
+    const capsRes = await mf.dispatchFetch(`${ORIGIN}/v1/capabilities`, { headers: authz });
+    assert.equal(capsRes.status, 200);
+    const caps = await capsRes.json();
+    assert.equal(caps.capabilities.artifacts, true);
+    assert.equal(caps.capabilities.tracking, true);
+    assert.equal(caps.capabilities.search, true);
+
+    const verifyRes = await mf.dispatchFetch(`${ORIGIN}/__test_storage_verify`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ metaSql, searchSql }),
+    });
+    assert.equal(verifyRes.status, 200);
+    const out = await verifyRes.json();
+    assert.deepEqual(out, {
+      firstStored: true,
+      dupReturnedNull: true,
+      badHashFailed: true,
+      streamedHashMatches: true,
+      pageCount: 1,
+      ftsHitCount: 1,
+    });
   } finally {
     await mf.dispose();
   }

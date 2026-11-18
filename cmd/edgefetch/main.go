@@ -1,4 +1,5 @@
-// Command edgefetch is a zero-dependency HTTP/2 crawler that runs in two modes from one static binary:
+// Command edgefetch is a minimal-supply-chain HTTP/2 crawler (one Go dependency, with no transitive dependencies)
+// that runs in two modes from one static binary:
 //   - server mode (default): listens on $EDGEFETCH_BIND_ADDR or :$PORT (GET /healthz, POST /fetch) authenticated via
 //     EDGEFETCH_SERVER_TOKEN (unless bound strictly to loopback or EDGEFETCH_ALLOW_UNAUTHENTICATED=1).
 //   - agent mode (--mode=agent, EDGEFETCH_MODE=agent, or /data/options.json on Home Assistant OS): opens zero inbound
@@ -14,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -175,6 +177,7 @@ func main() {
 		}
 		allow := crawl.WithBlockedHost(crawl.WithAllowedHosts(crawl.PublicHTTPS, cfg.AllowedHosts), hubHost)
 		siteLog := log.With(slog.String("site", cfg.SiteID))
+		siteLog.Info("agent_startup", slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)), slog.String("go", runtime.Version()))
 		crawler := crawl.NewCrawler(newCrawlTransport(90*time.Second, 4), allow, cfg.UserAgent, siteLog)
 
 		if err := agent.Run(ctx, cfg, crawler, allow, newHubTransport(), siteLog, agent.RuntimeOpts{}); err != nil {
@@ -211,7 +214,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info("listening", slog.String("addr", srv.Addr))
+		log.Info("listening", slog.String("addr", srv.Addr), slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)), slog.String("go", runtime.Version()))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server", slog.String("error", err.Error()))
 			os.Exit(1)

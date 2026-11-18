@@ -10,20 +10,23 @@ permissions:
 
 jobs:
   go:
-    name: Go Vet, Race Detector & Benchmarks
+    name: Go Vet, Staticcheck, Govulncheck, Race Detector & Benchmarks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
-          cache: false
+          go-version: '1.27.x'
+          cache: true
 
-      - name: Verify zero external Go dependencies (stdlib-only invariant)
+      - name: Verify minimal dependency graph (only coder/websocket, zero transitive deps)
         run: |
-          if grep -q '^require' go.mod || [ -f go.sum ]; then
-            echo "ERROR: go.mod must remain 100% standard-library only"
+          go mod verify
+          extra=$(go mod graph | awk '$2 !~ /^github\.com\/coder\/websocket@v/ && $2 !~ /^go@/ && $2 !~ /^toolchain@/ { print $0 }')
+          if [ -n "$extra" ]; then
+            echo "ERROR: unexpected Go dependencies in module graph:"
+            echo "$extra"
             exit 1
           fi
 
@@ -38,6 +41,13 @@ jobs:
 
       - name: Run go vet
         run: go vet ./...
+
+      - name: Run staticcheck & govulncheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+          "$(go env GOPATH)/bin/govulncheck" ./...
 
       - name: Run tests with ThreadSanitizer race detector (-race)
         run: go test -v -race -count=1 ./...

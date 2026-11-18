@@ -1,6 +1,6 @@
 # EdgeFetch Cold-Standby Worker (Home Assistant OS Add-on)
 
-An **outbound-only, zero-dependency Go HTTP/2 fetcher** that connects to your Cloudflare Hibernating WebSocket Durable Object (`AgentHubDO`).
+An **outbound-only Go HTTP/2 fetcher** (one Go dependency, with no transitive dependencies) that connects to your Cloudflare Hibernating WebSocket Durable Object (`AgentHubDO`).
 
 ## Security Highlights
 

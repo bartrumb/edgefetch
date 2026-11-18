@@ -27,3 +27,27 @@ new_sqlite_classes = ["AgentHubDO"]
 # Configure separate least-privilege secrets via Wrangler (never commit values):
 #   npx wrangler secret put CALLER_TOKEN   # >= 24 random chars (used by upstream callers on POST /fetch & GET /agents)
 #   npx wrangler secret put AGENT_TOKENS   # JSON map {"site-1":"<24+ random chars>","site-2":"..."} for outbound agents
+#
+# Optional v2 storage, tracking & FTS5 search bindings (keep commented until resources & migrations are approved):
+# [[r2_buckets]]
+# binding = "ARTIFACTS"
+# bucket_name = "edgefetch-artifacts"
+#
+# [[d1_databases]]
+# binding = "META"
+# database_name = "edgefetch-meta"
+# database_id = "<created-meta-d1-id>"
+# migrations_dir = "migrations/meta"
+#
+# [[d1_databases]]
+# binding = "SEARCH"
+# database_name = "edgefetch-search"
+# database_id = "<created-search-d1-id>"
+# migrations_dir = "migrations/search"
+#
+# [[workflows]]
+# name = "edgefetch-ingest"
+# binding = "INGEST"
+# class_name = "IngestWorkflow"
+# [workflows.concurrency]
+# limit = 10

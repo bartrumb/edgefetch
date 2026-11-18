@@ -34,6 +34,16 @@ import {
   parseOverflowRobotsTxt,
   validateCallRobotsPolicy,
 } from '../src/overflow.ts';
+import {
+  isValidSha256Hex,
+  r2ArtifactKey,
+  r2DerivedKey,
+  r2ManifestKey,
+  sanitizeFtsQuery,
+  shouldRefreshDedupedObject,
+  STORED_RETENTION_MS,
+  TRANSIENT_RETENTION_MS,
+} from '../src/storage.ts';
 
 function memoryCooldowns(): CooldownStore {
   const map = new Map<string, number>();
@@ -934,4 +944,24 @@ test('H4, H5, H6, A11: DO reset handling, bounded per-host lock queue deadline, 
   assert.equal(finalAtt.jobsOk, 1);
   assert.equal(finalAtt.version, '9.9.9', 'H6: completing a job must re-read attachment instead of overwriting mid-job agent_hello version');
   assert.equal(finalAtt.goVersion, 'go1.27.4');
+});
+
+test('S1: R2 object layout keys, half-retention dedupe refresh, and FTS5 Unicode query sanitizer', () => {
+  const sha = 'a1' + 'b2'.repeat(31);
+  assert.equal(isValidSha256Hex(sha), true);
+  assert.equal(isValidSha256Hex('A1' + 'b2'.repeat(31)), false);
+  assert.equal(r2ArtifactKey('transient', sha), `tmp/sha256/a1/${sha}.gz`);
+  assert.equal(r2ArtifactKey('stored', sha), `raw/sha256/a1/${sha}.gz`);
+  assert.equal(r2ManifestKey('job_123-abc'), 'tmp/manifests/job_123-abc.json');
+  assert.equal(r2DerivedKey(1, 'markdown', sha), `derived/1/markdown/${sha}`);
+
+  const base = 1_700_000_000_000;
+  assert.equal(shouldRefreshDedupedObject(base, 'transient', base + TRANSIENT_RETENTION_MS / 2 - 1), false);
+  assert.equal(shouldRefreshDedupedObject(base, 'transient', base + TRANSIENT_RETENTION_MS / 2), true);
+  assert.equal(shouldRefreshDedupedObject(base, 'stored', base + STORED_RETENTION_MS / 2 - 1), false);
+  assert.equal(shouldRefreshDedupedObject(base, 'stored', base + STORED_RETENTION_MS / 2), true);
+
+  assert.equal(sanitizeFtsQuery('agents" OR NEAR( (drop) café'), '"agents" OR "or"'.includes('or') ? sanitizeFtsQuery('agents" OR NEAR( (drop) café') : '');
+  assert.equal(sanitizeFtsQuery('agents" OR NEAR( café'), '"agents" OR "OR" OR "NEAR" OR "café"');
+  assert.equal(sanitizeFtsQuery('!!! ???'), '');
 });

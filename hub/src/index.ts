@@ -26,14 +26,12 @@ import {
   AgentHubEngine,
   parseFetchTarget,
   readAgentReplyBody,
-  recomputeSummary,
   routeFetchWithFailover,
   type AffinityPin,
   type AgentAttachment,
   type AgentDispatchResult,
   type CompleteJobResult,
   type CooldownStore,
-  type CrawlResultItem,
   type FetchTarget,
   type HostWindowStore,
   type HubSocketLike,
@@ -51,6 +49,7 @@ import {
   type OAuthTokenRecord,
   type SqlStorageLike,
 } from './oauth';
+import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
 
 interface Env {
   AGENT_HUB: DurableObjectNamespace<AgentHubDO>;
@@ -58,6 +57,7 @@ interface Env {
   AGENT_TOKEN?: string;
   AGENT_TOKENS?: string;
   USER_AGENT?: string;
+  ROBOTS_BYPASS_HOSTS?: string;
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -368,313 +368,6 @@ export class AgentHubDO extends DurableObject<Env> {
   }
 }
 
-interface ParsedRobots {
-  unreachable: boolean;
-  reason?: string;
-  crawlDelayMs: number;
-  rules: Array<{ pattern: string; allow: boolean }>;
-}
-
-function matchRobotsPattern(pattern: string, target: string): boolean {
-  const anchored = pattern.endsWith('$');
-  const clean = anchored ? pattern.slice(0, -1) : pattern;
-  const escaped = clean.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  return new RegExp(`^${escaped}${anchored ? '$' : ''}`).test(target);
-}
-
-function parseOverflowRobotsTxt(body: string, userAgent: string): ParsedRobots {
-  const uaToken = (userAgent.split('/')[0] ?? '').trim().toLowerCase();
-  const groups: Array<{ agents: string[]; rules: Array<{ pattern: string; allow: boolean }>; crawlDelayMs: number }> = [];
-  let cur = { agents: [] as string[], rules: [] as Array<{ pattern: string; allow: boolean }>, crawlDelayMs: 0 };
-  let seenDirective = false;
-
-  for (const rawLine of body.split('\n')) {
-    const noComment = rawLine.includes('#') ? rawLine.slice(0, rawLine.indexOf('#')) : rawLine;
-    const line = noComment.trim();
-    if (!line) {
-      if (seenDirective && cur.agents.length > 0) {
-        groups.push(cur);
-        cur = { agents: [], rules: [], crawlDelayMs: 0 };
-        seenDirective = false;
-      }
-      continue;
-    }
-    const colon = line.indexOf(':');
-    if (colon <= 0) continue;
-    const field = line.slice(0, colon).trim().toLowerCase();
-    const val = line.slice(colon + 1).trim();
-    if (field === 'user-agent') {
-      if (seenDirective && cur.agents.length > 0) {
-        groups.push(cur);
-        cur = { agents: [], rules: [], crawlDelayMs: 0 };
-        seenDirective = false;
-      }
-      cur.agents.push(val.toLowerCase());
-    } else if (field === 'allow' && cur.agents.length > 0) {
-      seenDirective = true;
-      cur.rules.push({ pattern: val, allow: true });
-    } else if (field === 'disallow' && cur.agents.length > 0) {
-      seenDirective = true;
-      cur.rules.push(val === '' ? { pattern: '/', allow: true } : { pattern: val, allow: false });
-    } else if (field === 'crawl-delay' && cur.agents.length > 0) {
-      seenDirective = true;
-      const secs = Number(val);
-      if (Number.isFinite(secs) && secs > 0) {
-        cur.crawlDelayMs = Math.min(30_000, Math.round(secs * 1000));
-      }
-    }
-  }
-  if (cur.agents.length > 0) groups.push(cur);
-
-  const specific: Array<{ pattern: string; allow: boolean }> = [];
-  const wildcard: Array<{ pattern: string; allow: boolean }> = [];
-  let specificDelay = 0;
-  let wildcardDelay = 0;
-  let hasSpecific = false;
-
-  for (const g of groups) {
-    for (const ua of g.agents) {
-      if (uaToken && ua.includes(uaToken)) {
-        hasSpecific = true;
-        specific.push(...g.rules);
-        specificDelay = Math.max(specificDelay, g.crawlDelayMs);
-      } else if (ua === '*') {
-        wildcard.push(...g.rules);
-        wildcardDelay = Math.max(wildcardDelay, g.crawlDelayMs);
-      }
-    }
-  }
-  return {
-    unreachable: false,
-    crawlDelayMs: hasSpecific ? specificDelay : wildcardDelay,
-    rules: hasSpecific ? specific : wildcard,
-  };
-}
-
-function isRobotsAllowed(entry: ParsedRobots, pathAndQuery: string): boolean {
-  if (entry.unreachable) return false;
-  if (entry.rules.length === 0) return true;
-  const target = pathAndQuery || '/';
-  let bestLen = -1;
-  let bestAllow = true;
-  for (const r of entry.rules) {
-    if (!r.pattern) continue;
-    if (matchRobotsPattern(r.pattern, target)) {
-      if (r.pattern.length > bestLen || (r.pattern.length === bestLen && r.allow)) {
-        bestLen = r.pattern.length;
-        bestAllow = r.allow;
-      }
-    }
-  }
-  return bestAllow;
-}
-
-async function fetchOverflowRobots(origin: string, userAgent: string): Promise<ParsedRobots> {
-  try {
-    const resp = await fetch(`${origin}/robots.txt`, {
-      method: 'GET',
-      headers: { 'user-agent': userAgent, accept: 'text/plain,*/*;q=0.8' },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (resp.status === 429 || resp.status >= 500) {
-      await resp.body?.cancel().catch(() => undefined);
-      return {
-        unreachable: true,
-        reason: `robots.txt returned HTTP ${resp.status} (disallow assumed per RFC 9309)`,
-        crawlDelayMs: 15_000,
-        rules: [],
-      };
-    }
-    if (resp.status >= 400 && resp.status < 500) {
-      await resp.body?.cancel().catch(() => undefined);
-      return { unreachable: false, crawlDelayMs: 0, rules: [] };
-    }
-    if (!resp.ok) {
-      await resp.body?.cancel().catch(() => undefined);
-      return {
-        unreachable: true,
-        reason: `robots.txt returned HTTP ${resp.status}`,
-        crawlDelayMs: 15_000,
-        rules: [],
-      };
-    }
-    const text = (await resp.text()).slice(0, 65_536);
-    return parseOverflowRobotsTxt(text, userAgent);
-  } catch (e) {
-    return {
-      unreachable: true,
-      reason: `robots.txt unreachable (disallow assumed per RFC 9309): ${e instanceof Error ? e.message : String(e)}`,
-      crawlDelayMs: 15_000,
-      rules: [],
-    };
-  }
-}
-
-async function cloudflareOverflowFetch(rawBody: string, userAgent: string, selfHost: string): Promise<Response> {
-  const started = Date.now();
-  let call: {
-    requests?: Array<{ id?: string; url?: string; kind?: string; accept?: string; ifNoneMatch?: string; ifModifiedSince?: string }>;
-    options?: { includeBody?: boolean; maxBytes?: number; pauseMs?: number; respectRobots?: boolean; robots?: boolean };
-  };
-  try {
-    call = JSON.parse(rawBody) as typeof call;
-  } catch {
-    return Response.json({ error: 'bad_json' }, { status: 400 });
-  }
-  const reqs = Array.isArray(call.requests) ? call.requests : [];
-  const maxBytes = Math.min(16 << 20, Math.max(1024, call.options?.maxBytes ?? 8 << 20));
-  const includeBody = Boolean(call.options?.includeBody);
-  const pauseMs = Math.min(30_000, Math.max(0, Math.floor(call.options?.pauseMs ?? 2000)));
-  const respectRobots = call.options?.respectRobots ?? call.options?.robots ?? true;
-  const canonicalSelf = selfHost.toLowerCase().replace(/\.+$/, '');
-  const results: CrawlResultItem[] = [];
-  const hostLastDone = new Map<string, number>();
-  const robotsCache = new Map<string, ParsedRobots>();
-
-  for (const r of reqs) {
-    const reqStart = Date.now();
-    let parsedUrl: URL;
-    try {
-      parsedUrl = new URL(r.url ?? '');
-    } catch {
-      results.push({ id: r.id, url: r.url, kind: r.kind, status: 0, outcome: 'error', problem: 'bad_url' });
-      continue;
-    }
-    const host = parsedUrl.hostname.toLowerCase().replace(/\.+$/, '');
-    if (
-      parsedUrl.protocol !== 'https:' ||
-      (parsedUrl.port && parsedUrl.port !== '443') ||
-      !host.includes('.') ||
-      host === 'localhost' ||
-      host.endsWith('.localhost') ||
-      host === canonicalSelf
-    ) {
-      results.push({ id: r.id, url: r.url, kind: r.kind, status: 0, outcome: 'error', problem: 'disallowed_url' });
-      continue;
-    }
-
-    let robotsEntry: ParsedRobots | undefined;
-    if (respectRobots) {
-      robotsEntry = robotsCache.get(host);
-      if (!robotsEntry) {
-        robotsEntry = await fetchOverflowRobots(parsedUrl.origin, userAgent);
-        robotsCache.set(host, robotsEntry);
-      }
-      const pathAndQuery = `${parsedUrl.pathname || '/'}${parsedUrl.search || ''}`;
-      if (!isRobotsAllowed(robotsEntry, pathAndQuery)) {
-        const outcome = robotsEntry.unreachable ? 'stop' : r.kind === 'page' || r.kind === 'text' ? 'skip' : 'error';
-        results.push({
-          id: r.id,
-          url: r.url,
-          kind: r.kind,
-          status: 0,
-          outcome,
-          problem: robotsEntry.reason ?? `robots.txt disallowed ${parsedUrl.pathname || '/'}`,
-        });
-        continue;
-      }
-    }
-
-    const effectivePause = Math.max(pauseMs, robotsEntry?.crawlDelayMs ?? 0);
-    const prevDone = hostLastDone.get(host);
-    if (prevDone !== undefined && effectivePause > 0) {
-      const wait = prevDone + effectivePause - Date.now();
-      if (wait > 0) {
-        await new Promise<void>((resolve) => setTimeout(resolve, wait));
-      }
-    }
-
-    const acceptHeader =
-      r.kind === 'feed' || r.kind === 'json'
-        ? 'application/json'
-        : r.kind === 'text' && r.accept
-          ? r.accept
-          : 'text/html,application/xhtml+xml';
-    const headers = new Headers({
-      'user-agent': userAgent,
-      accept: acceptHeader,
-    });
-    if (r.ifNoneMatch) headers.set('if-none-match', r.ifNoneMatch);
-    if (r.ifModifiedSince) headers.set('if-modified-since', r.ifModifiedSince);
-
-    try {
-      const resp = await fetch(parsedUrl.toString(), { method: 'GET', headers, redirect: 'follow' });
-      const reader = resp.body?.getReader();
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      let truncated = false;
-      if (reader) {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            if (total + value.byteLength > maxBytes) {
-              truncated = true;
-              await reader.cancel().catch(() => undefined);
-              break;
-            }
-            total += value.byteLength;
-            if (includeBody) chunks.push(value);
-          }
-        }
-      }
-      let bodyStr: string | undefined;
-      if (includeBody && !truncated) {
-        const buf = new Uint8Array(total);
-        let off = 0;
-        for (const c of chunks) {
-          buf.set(c, off);
-          off += c.byteLength;
-        }
-        bodyStr = new TextDecoder().decode(buf);
-      }
-      const cfMitigated = resp.headers.get('cf-mitigated') ?? undefined;
-      const outcome = truncated
-        ? 'error'
-        : cfMitigated
-          ? 'challenge'
-          : resp.status >= 200 && resp.status < 400
-            ? 'ok'
-            : resp.status === 404 || resp.status === 410
-              ? 'gone'
-              : 'error';
-      results.push({
-        id: r.id,
-        url: r.url,
-        kind: r.kind,
-        status: resp.status,
-        outcome,
-        bytes: total,
-        truncated,
-        durationMs: Date.now() - reqStart,
-        contentType: resp.headers.get('content-type') ?? undefined,
-        etag: resp.headers.get('etag') ?? undefined,
-        retryAfter: resp.headers.get('retry-after') ?? undefined,
-        ...(cfMitigated ? { cfMitigated } : {}),
-        ...(bodyStr !== undefined ? { body: bodyStr } : {}),
-      });
-      hostLastDone.set(host, Date.now());
-    } catch (e) {
-      hostLastDone.set(host, Date.now());
-      results.push({
-        id: r.id,
-        url: r.url,
-        kind: r.kind,
-        status: 0,
-        outcome: 'error',
-        problem: e instanceof Error ? e.message : String(e),
-        durationMs: Date.now() - reqStart,
-      });
-    }
-  }
-
-  return Response.json({
-    results,
-    summary: recomputeSummary(results),
-    durationMs: Date.now() - started,
-  });
-}
-
 function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
   return {
     putClient: (c) => hub().oauthPutClient(c),
@@ -717,19 +410,38 @@ export default {
     const hub = () => env.AGENT_HUB.get(env.AGENT_HUB.idFromName('global'));
     const ua = env.USER_AGENT?.trim() || DEFAULT_UA;
 
+    const bypassAllowlist = parseHostAllowlist(env.ROBOTS_BYPASS_HOSTS);
+
     const executeHubFetch = async (target: FetchTarget, body: string, site?: string, source = 'rest') =>
       (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
         'edgefetch.dispatch',
         async (span) => {
+          const robotsCheck = validateCallRobotsPolicy(body, bypassAllowlist);
+          if (!robotsCheck.ok) {
+            return {
+              status: 400,
+              via: 'hub',
+              bodyText: JSON.stringify({ error: robotsCheck.error, message: robotsCheck.message }),
+            };
+          }
           const trace = { 'x-request-id': request.headers.get('cf-ray') ?? '' };
           const pendingEvents: HubEventInput[] = [];
+          if (robotsCheck.bypassedHosts.length > 0) {
+            pendingEvents.push({
+              level: 'warn',
+              category: 'crawl',
+              event: 'robots_bypass_used',
+              summary: `Owner-allowlisted robots.txt bypass used for ${robotsCheck.bypassedHosts.join(', ')}`,
+              details: { hosts: robotsCheck.bypassedHosts.join(','), source },
+            });
+          }
           const res = await routeFetchWithFailover({
             target,
             site,
             body,
             trace,
             callAgent: (b, t, s) => hub().dispatchFetch(b, t, s),
-            callContainer: (b) => cloudflareOverflowFetch(b, ua, url.hostname),
+            callContainer: (b) => cloudflareOverflowFetch(b, ua, url.hostname, { bypassAllowlist }),
             waitForHostWindow: (hosts, p, dl) =>
               hub()
                 .waitForHostWindow(hosts, p, dl)

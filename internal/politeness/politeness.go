@@ -26,7 +26,7 @@ const (
 	CircuitOpenCooldown     = 30 * time.Second
 	RobotsCacheTTL          = 24 * time.Hour
 	RobotsDistressTTL       = 5 * time.Minute
-	RobotsMaxBytes          = 64 << 10 // 64 KiB ceiling prevents an oversized /robots.txt from exhausting heap RAM.
+	RobotsMaxBytes          = 512 << 10 // 512 KiB (>= 500 KiB minimum required by RFC 9309 §2.5).
 	RobotsTimeout           = 10 * time.Second
 	MaxCrawlDelay           = 30 * time.Second
 )
@@ -274,6 +274,7 @@ func (e *RobotsEntry) Allowed(pathAndQuery string) bool {
 	if pathAndQuery == "" {
 		pathAndQuery = "/"
 	}
+	pathAndQuery = NormalizeRobotsURI(pathAndQuery)
 	bestLen := -1
 	bestAllow := true
 	for _, r := range e.Rules {
@@ -289,6 +290,75 @@ func (e *RobotsEntry) Allowed(pathAndQuery string) bool {
 		}
 	}
 	return bestAllow
+}
+
+// NormalizeRobotsURI normalizes percent-encoding in `/robots.txt` patterns and target paths per RFC 9309 §2.2.2:
+//   - Unreserved ASCII octets (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`) encoded as `%XX` decode to literal ASCII.
+//   - Valid `%xx` sequences for reserved or non-ASCII octets uppercase to `%XX` (`%c3%a9` -> `%C3%A9`).
+//   - Raw non-ASCII UTF-8 bytes (`>= 0x80`) encode to uppercase `%XX`.
+//   - Pure ASCII strings without `%` return `s` directly with zero allocations (`0 B/op`).
+func NormalizeRobotsURI(s string) string {
+	needsWork := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' || s[i] >= 0x80 {
+			needsWork = true
+			break
+		}
+	}
+	if !needsWork {
+		return s
+	}
+
+	const upperHex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '%' && i+2 < len(s) {
+			hi, ok1 := fromHex(s[i+1])
+			lo, ok2 := fromHex(s[i+2])
+			if ok1 && ok2 {
+				decoded := (hi << 4) | lo
+				if isUnreservedURIByte(decoded) {
+					b.WriteByte(decoded)
+				} else {
+					b.WriteByte('%')
+					b.WriteByte(upperHex[hi])
+					b.WriteByte(upperHex[lo])
+				}
+				i += 2
+				continue
+			}
+		}
+		if ch >= 0x80 {
+			b.WriteByte('%')
+			b.WriteByte(upperHex[ch>>4])
+			b.WriteByte(upperHex[ch&0x0F])
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
+}
+
+func fromHex(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func isUnreservedURIByte(c byte) bool {
+	return (c >= 'A' && c <= 'Z') ||
+		(c >= 'a' && c <= 'z') ||
+		(c >= '0' && c <= '9') ||
+		c == '-' || c == '.' || c == '_' || c == '~'
 }
 
 // robotsMatch evaluates `/robots.txt` `*` wildcards and trailing `$` anchors in guaranteed O(P * T) time with zero
@@ -348,7 +418,9 @@ func robotsMatch(pattern, target string) bool {
 // ParseRobotsTxt extracts directives matching `agentToken` (lowercase product token, preferred per RFC 9309 specificity)
 // or fallback `*`, plus `Crawl-delay` clamped to `MaxCrawlDelay`.
 func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
-	agentToken = strings.ToLower(strings.TrimSpace(agentToken))
+	// RFC 9309 §2.1: strip optional leading UTF-8 BOM so the first User-agent line is never corrupted.
+	body = strings.TrimPrefix(body, "\xef\xbb\xbf")
+	agentToken = canonicalProductToken(agentToken)
 	type group struct {
 		agents     []string
 		rules      []RobotsRule
@@ -384,11 +456,11 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 				cur = group{}
 				seenDirective = false
 			}
-			cur.agents = append(cur.agents, strings.ToLower(val))
+			cur.agents = append(cur.agents, canonicalProductToken(val))
 		case "allow":
-			if len(cur.agents) > 0 {
+			if len(cur.agents) > 0 && val != "" {
 				seenDirective = true
-				cur.rules = append(cur.rules, RobotsRule{Pattern: val, Allow: true})
+				cur.rules = append(cur.rules, RobotsRule{Pattern: NormalizeRobotsURI(val), Allow: true})
 			}
 		case "disallow":
 			if len(cur.agents) > 0 {
@@ -396,7 +468,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 				if val == "" {
 					cur.rules = append(cur.rules, RobotsRule{Pattern: "/", Allow: true})
 				} else {
-					cur.rules = append(cur.rules, RobotsRule{Pattern: val, Allow: false})
+					cur.rules = append(cur.rules, RobotsRule{Pattern: NormalizeRobotsURI(val), Allow: false})
 				}
 			}
 		case "crawl-delay":
@@ -422,7 +494,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 
 	for _, g := range groups {
 		for _, ua := range g.agents {
-			if agentToken != "" && strings.Contains(ua, agentToken) {
+			if agentToken != "" && ua == agentToken {
 				matchedSpecific = true
 				specificRules = append(specificRules, g.rules...)
 				if g.crawlDelay > specificDelay {
@@ -447,6 +519,20 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 		out.CrawlDelay = wildcardDelay
 	}
 	return out
+}
+
+func canonicalProductToken(raw string) string {
+	tok := strings.ToLower(strings.TrimSpace(raw))
+	if tok == "*" {
+		return "*"
+	}
+	if slash := strings.IndexByte(tok, '/'); slash >= 0 {
+		tok = strings.TrimSpace(tok[:slash])
+	}
+	if sp := strings.IndexAny(tok, " \t"); sp >= 0 {
+		tok = strings.TrimSpace(tok[:sp])
+	}
+	return tok
 }
 
 // ── Dial-time DNS-rebinding & special-purpose IP SSRF guard (net.Dialer.Control) ─────────────────────────────────

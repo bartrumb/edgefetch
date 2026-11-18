@@ -119,11 +119,18 @@ func normalizeHostRule(raw string) string {
 	return h
 }
 
-// ValidateCall checks batch bounds, `Accept` kinds, and URL rules before starting any network IO.
+// ValidateCall checks batch bounds, `Accept` kinds, URL rules, and default `robots.txt` enforcement before network IO.
 func ValidateCall(call FetchCall, allow func(*url.URL) error) (code, msg string, ok bool) {
+	return ValidateCallWithCrawler(nil, call, allow)
+}
+
+// ValidateCallWithCrawler validates `call`, rejecting `respectRobots: false` unless every target host is explicitly
+// allowlisted on `c` via `SetRobotsBypassHosts` (off by default).
+func ValidateCallWithCrawler(c *Crawler, call FetchCall, allow func(*url.URL) error) (code, msg string, ok bool) {
 	if len(call.Requests) == 0 || len(call.Requests) > MaxRequestsPerCall {
 		return "bad_requests", fmt.Sprintf("send 1 to %d requests", MaxRequestsPerCall), false
 	}
+	robotsDisabled := !call.Options.RobotsEnabled()
 	for i, req := range call.Requests {
 		if _, err := classify.AcceptFor(req.Kind, req.Accept); err != nil {
 			return "bad_kind", fmt.Sprintf("request %d: %v", i, err), false
@@ -134,6 +141,9 @@ func ValidateCall(call FetchCall, allow func(*url.URL) error) (code, msg string,
 		}
 		if err != nil {
 			return "bad_url", fmt.Sprintf("request %d: %v", i, err), false
+		}
+		if robotsDisabled && !c.AllowsRobotsBypass(u.Hostname()) {
+			return "robots_required", fmt.Sprintf("request %d: disabling robots.txt is not permitted for host %q", i, politeness.CanonicalHost(u.Hostname())), false
 		}
 	}
 	return "", "", true
@@ -205,7 +215,7 @@ func NewAuthenticatedHandler(c *Crawler, allow func(*url.URL) error, bearerToken
 			writeHTTPError(w, http.StatusBadRequest, "bad_json", err.Error())
 			return
 		}
-		if code, msg, ok := ValidateCall(call, allow); !ok {
+		if code, msg, ok := ValidateCallWithCrawler(c, call, allow); !ok {
 			writeHTTPError(w, http.StatusBadRequest, code, msg)
 			return
 		}

@@ -249,7 +249,7 @@ func handleDispatch(
 	}
 
 	var reply crawl.FetchReply
-	if code, problem, ok := crawl.ValidateCall(call, allow); !ok {
+	if code, problem, ok := crawl.ValidateCallWithCrawler(crawler, call, allow); !ok {
 		results := make([]crawl.Result, len(call.Requests))
 		for i, r := range call.Requests {
 			results[i] = crawl.Result{

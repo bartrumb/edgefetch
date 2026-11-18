@@ -152,6 +152,20 @@ func validateServerSecurity(addr, serverToken string, allowUnauthenticated bool)
 	return errors.New("refusing unauthenticated non-loopback bind: set EDGEFETCH_SERVER_TOKEN (>= 24 chars), bind --addr=127.0.0.1:8080, or pass --allow-unauthenticated inside an isolated container bridge")
 }
 
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if clean := strings.TrimSpace(p); clean != "" {
+			out = append(out, clean)
+		}
+	}
+	return out
+}
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -179,6 +193,7 @@ func main() {
 		siteLog := log.With(slog.String("site", cfg.SiteID))
 		siteLog.Info("agent_startup", slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)), slog.String("go", runtime.Version()))
 		crawler := crawl.NewCrawler(newCrawlTransport(90*time.Second, 4), allow, cfg.UserAgent, siteLog)
+		crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
 
 		if err := agent.Run(ctx, cfg, crawler, allow, newHubTransport(), siteLog, agent.RuntimeOpts{}); err != nil {
 			log.Error("agent_stopped", slog.String("error", err.Error()))
@@ -206,6 +221,7 @@ func main() {
 	}
 
 	crawler := crawl.NewCrawler(newCrawlTransport(60*time.Second, 2), crawl.PublicHTTPS, ua, log)
+	crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           crawl.NewAuthenticatedHandler(crawler, crawl.PublicHTTPS, serverToken),

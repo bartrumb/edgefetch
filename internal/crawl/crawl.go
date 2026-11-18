@@ -5,7 +5,6 @@ package crawl
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -94,6 +93,7 @@ const (
 	MaxMaxBytes      = 16 << 20
 	MaxConcurrency   = 4
 	MaxRetries       = 3
+	MaxRedirects     = 5
 )
 
 // RobotsEnabled reports whether /robots.txt enforcement is active (defaulting to true when unset).
@@ -167,6 +167,7 @@ func ValidateUserAgent(ua string) error {
 // Never copy a `Crawler` value after creation (`sync.Mutex` fields must stay at a fixed address).
 type Crawler struct {
 	client    *http.Client
+	allow     func(*url.URL) error
 	userAgent string
 	log       *slog.Logger
 
@@ -175,30 +176,33 @@ type Crawler struct {
 	Now    func() time.Time
 	Jitter func(d time.Duration) time.Duration
 
-	hostsMu    sync.Mutex
-	hosts      *politeness.Registry
-	globalMu   sync.Mutex
-	globalNext time.Time
+	hostsMu           sync.Mutex
+	hosts             *politeness.Registry
+	robotsBypassHosts []string
+	globalMu          sync.Mutex
+	globalNext        time.Time
 }
 
-// NewCrawler constructs a `Crawler` whose HTTP redirects are validated against the same `allow` rule as initial URLs.
+// NewCrawler constructs a `Crawler` whose HTTP redirects are handled hop-by-hop (re-checking URL rules, per-host locks,
+// pacing, and `/robots.txt` on every redirect hop).
 func NewCrawler(transport http.RoundTripper, allow func(*url.URL) error, userAgent string, log *slog.Logger) *Crawler {
 	if strings.TrimSpace(userAgent) == "" {
 		userAgent = DefaultUserAgent
 	}
+	if allow == nil {
+		allow = PublicHTTPS
+	}
 	client := &http.Client{
 		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("more than 5 redirects")
-			}
-			return allow(req.URL)
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	var rngMu sync.Mutex
 	return &Crawler{
 		client:    client,
+		allow:     allow,
 		userAgent: userAgent,
 		log:       log,
 		Sleep:     SleepCtx,
@@ -213,6 +217,47 @@ func NewCrawler(transport http.RoundTripper, allow func(*url.URL) error, userAge
 			return time.Duration(rng.Int63n(int64(d) + 1))
 		},
 	}
+}
+
+// SetRobotsBypassHosts configures the owner-controlled host allowlist permitted to set `respectRobots: false`.
+// By default this list is empty, meaning `/robots.txt` is always enforced even if a caller sends `respectRobots: false`.
+func (c *Crawler) SetRobotsBypassHosts(hosts []string) {
+	clean := make([]string, 0, len(hosts))
+	for _, raw := range hosts {
+		if h := normalizeHostRule(raw); h != "" {
+			clean = append(clean, h)
+		}
+	}
+	c.hostsMu.Lock()
+	c.robotsBypassHosts = clean
+	c.hostsMu.Unlock()
+}
+
+// AllowsRobotsBypass reports whether `host` matches the owner's explicit `robots_bypass_hosts` allowlist.
+func (c *Crawler) AllowsRobotsBypass(host string) bool {
+	if c == nil {
+		return false
+	}
+	h := politeness.CanonicalHost(host)
+	if h == "" {
+		return false
+	}
+	c.hostsMu.Lock()
+	allowedList := c.robotsBypassHosts
+	c.hostsMu.Unlock()
+	for _, allowed := range allowedList {
+		if h == allowed || strings.HasSuffix(h, "."+allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Crawler) shouldCheckRobots(host string, opts Options) bool {
+	if opts.RobotsEnabled() {
+		return true
+	}
+	return !c.AllowsRobotsBypass(host)
 }
 
 // Logger exposes the crawler's base structured logger.
@@ -313,15 +358,6 @@ func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, l
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			hs := c.hostStateFor(host)
-			if err := hs.Acquire(ctx); err != nil {
-				for _, i := range idx {
-					results[i] = notTried(reqs[i], "crawl cancelled")
-				}
-				return
-			}
-			defer hs.Release()
-
 			stopped := ""
 			for n, i := range idx {
 				r := reqs[i]
@@ -329,78 +365,11 @@ func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, l
 					results[i] = notTried(r, stopped)
 					continue
 				}
-				if why := hs.CheckCircuit(c.Now(), host); why != "" {
-					res := Result{ID: r.ID, URL: r.URL, Kind: r.Kind, Outcome: classify.OutcomeError, Problem: why}
-					results[i] = res
-					if classify.StopsHost(r.Kind, res.Outcome) {
-						stopped = fmt.Sprintf("host stopped after %s on %s", res.Outcome, r.URL)
-					}
-					continue
-				}
-
-				if n == 0 {
-					if d := hs.WaitDelay(c.Now()); d > 0 {
-						if err := c.Sleep(ctx, d); err != nil {
-							results[i] = notTried(r, "crawl cancelled")
-							stopped = "crawl cancelled"
-							continue
-						}
-					}
-				} else {
-					pause := minPause
-					if cd := hs.CrawlDelay(c.Now()); cd > pause {
-						pause = cd
-					}
-					if maxJitter > 0 {
-						pause += c.Jitter(maxJitter)
-					}
-					if err := c.Sleep(ctx, pause); err != nil {
-						results[i] = notTried(r, "crawl cancelled")
-						stopped = "crawl cancelled"
-						continue
-					}
-				}
-
-				if err := c.waitGlobalGap(ctx, gap); err != nil {
-					results[i] = notTried(r, "crawl cancelled")
+				res, cancelled := c.runRequestWithRedirects(ctx, r, opts, n > 0, minPause, maxJitter, gap, log)
+				results[i] = res
+				if cancelled {
 					stopped = "crawl cancelled"
 					continue
-				}
-
-				if opts.RobotsEnabled() {
-					if allowed, distressed, reason := c.checkRobots(ctx, hs, r.URL); !allowed {
-						outcome := classify.OutcomeError
-						if distressed {
-							outcome = classify.OutcomeStop
-						} else if r.Kind == classify.KindPage || r.Kind == classify.KindText {
-							outcome = classify.OutcomeSkip
-						}
-						res := Result{ID: r.ID, URL: r.URL, Kind: r.Kind, Outcome: outcome, Problem: reason}
-						results[i] = res
-						if classify.StopsHost(r.Kind, res.Outcome) {
-							stopped = fmt.Sprintf("host stopped after %s on %s", res.Outcome, r.URL)
-						}
-						continue
-					}
-				}
-
-				res := c.fetch(ctx, r, opts, log)
-				results[i] = res
-				retryAfter := time.Duration(res.RetryAfterMs) * time.Millisecond
-				nextFloor := minPause
-				if maxJitter > 0 {
-					nextFloor += c.Jitter(maxJitter)
-				}
-				throttled := res.Status == http.StatusTooManyRequests || res.Status == http.StatusServiceUnavailable || res.Outcome == classify.OutcomeChallenge
-				transientDead := (res.Status == 0 && res.Outcome == classify.OutcomeError) || retriableStatus(res.Status)
-				hs.RecordOutcome(c.Now(), nextFloor, retryAfter, res.Status, throttled, transientDead)
-
-				if gap > 0 && (res.Outcome == classify.OutcomeChallenge || res.Status == http.StatusTooManyRequests) {
-					cool := politeness.DefaultThrottlePause
-					if retryAfter > cool {
-						cool = retryAfter
-					}
-					c.bumpGlobalThrottle(cool)
 				}
 				if classify.StopsHost(r.Kind, res.Outcome) {
 					stopped = fmt.Sprintf("host stopped after %s on %s", res.Outcome, r.URL)
@@ -410,6 +379,159 @@ func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, l
 	}
 	wg.Wait()
 	return results
+}
+
+func isRedirectStatus(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Crawler) runRequestWithRedirects(
+	ctx context.Context,
+	origReq Request,
+	opts Options,
+	paceInitialHop bool,
+	minPause, maxJitter, gap time.Duration,
+	log *slog.Logger,
+) (Result, bool) {
+	started := c.Now()
+	curURLStr := origReq.URL
+	prevHost := ""
+	totalAttempts := 0
+
+	for hop := 0; hop <= MaxRedirects; hop++ {
+		parsedCur, err := url.Parse(curURLStr)
+		if err != nil {
+			return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: err.Error()}, false
+		}
+		if hop > 0 && c.allow != nil {
+			if err := c.allow(parsedCur); err != nil {
+				return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: err.Error()}, false
+			}
+		}
+
+		curHost := hostOf(curURLStr)
+		hs := c.hostStateFor(curHost)
+		if err := hs.Acquire(ctx); err != nil {
+			return notTried(origReq, "crawl cancelled"), true
+		}
+
+		if why := hs.CheckCircuit(c.Now(), curHost); why != "" {
+			hs.Release()
+			return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: why}, false
+		}
+
+		var waitDur time.Duration
+		if (hop == 0 && paceInitialHop) || (hop > 0 && curHost == prevHost) {
+			waitDur = minPause
+			if cd := hs.CrawlDelay(c.Now()); cd > waitDur {
+				waitDur = cd
+			}
+			if maxJitter > 0 {
+				waitDur += c.Jitter(maxJitter)
+			}
+			if rem := hs.WaitDelay(c.Now()); rem > waitDur {
+				waitDur = rem
+			}
+		} else {
+			waitDur = hs.WaitDelay(c.Now())
+		}
+		if waitDur > 0 {
+			if err := c.Sleep(ctx, waitDur); err != nil {
+				hs.Release()
+				return notTried(origReq, "crawl cancelled"), true
+			}
+		}
+		prevHost = curHost
+
+		if err := c.waitGlobalGap(ctx, gap); err != nil {
+			hs.Release()
+			return notTried(origReq, "crawl cancelled"), true
+		}
+
+		if c.shouldCheckRobots(curHost, opts) {
+			if allowed, distressed, reason := c.checkRobots(ctx, hs, curURLStr); !allowed {
+				hs.Release()
+				outcome := classify.OutcomeError
+				if distressed {
+					outcome = classify.OutcomeStop
+				} else if origReq.Kind == classify.KindPage || origReq.Kind == classify.KindText {
+					outcome = classify.OutcomeSkip
+				}
+				return Result{
+					ID:         origReq.ID,
+					URL:        origReq.URL,
+					Kind:       origReq.Kind,
+					Outcome:    outcome,
+					Problem:    reason,
+					Attempts:   totalAttempts,
+					DurationMs: c.Now().Sub(started).Milliseconds(),
+				}, false
+			}
+		}
+
+		hopReq := origReq
+		hopReq.URL = curURLStr
+		if hop > 0 {
+			hopReq.IfNoneMatch = ""
+			hopReq.IfModifiedSince = ""
+		}
+		res, loc := c.fetchSingleHop(ctx, hopReq, opts)
+		totalAttempts += res.Attempts
+		res.ID = origReq.ID
+		res.URL = origReq.URL
+		res.Attempts = totalAttempts
+
+		retryAfter := time.Duration(res.RetryAfterMs) * time.Millisecond
+		nextFloor := minPause
+		if maxJitter > 0 {
+			nextFloor += c.Jitter(maxJitter)
+		}
+		throttled := res.Status == http.StatusTooManyRequests || res.Status == http.StatusServiceUnavailable || res.Outcome == classify.OutcomeChallenge
+		transientDead := (res.Status == 0 && res.Outcome == classify.OutcomeError) || retriableStatus(res.Status)
+		hs.RecordOutcome(c.Now(), nextFloor, retryAfter, res.Status, throttled, transientDead)
+		hs.Release()
+
+		if gap > 0 && (res.Outcome == classify.OutcomeChallenge || res.Status == http.StatusTooManyRequests) {
+			cool := politeness.DefaultThrottlePause
+			if retryAfter > cool {
+				cool = retryAfter
+			}
+			c.bumpGlobalThrottle(cool)
+		}
+
+		if isRedirectStatus(res.Status) && loc != "" && res.CfMitigated == "" {
+			if hop == MaxRedirects {
+				res.Outcome = classify.OutcomeError
+				res.Problem = fmt.Sprintf("more than %d redirects", MaxRedirects)
+				res.Body = ""
+				res.DurationMs = c.Now().Sub(started).Milliseconds()
+				c.logResult(ctx, log, origReq, res)
+				return res, false
+			}
+			locURL, lErr := url.Parse(loc)
+			if lErr != nil {
+				res.Outcome = classify.OutcomeError
+				res.Problem = "invalid redirect Location: " + lErr.Error()
+				res.Body = ""
+				res.DurationMs = c.Now().Sub(started).Milliseconds()
+				c.logResult(ctx, log, origReq, res)
+				return res, false
+			}
+			curURLStr = parsedCur.ResolveReference(locURL).String()
+			continue
+		}
+
+		res.DurationMs = c.Now().Sub(started).Milliseconds()
+		c.logResult(ctx, log, origReq, res)
+		return res, false
+	}
+
+	return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: "redirect loop"}, false
 }
 
 func notTried(r Request, why string) Result {
@@ -431,15 +553,15 @@ func retriableStatus(status int) bool {
 	return status == 500 || status == 502 || status == 504
 }
 
-func (c *Crawler) fetch(ctx context.Context, r Request, opts Options, log *slog.Logger) Result {
-	started := c.Now()
+func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (Result, string) {
 	res := Result{ID: r.ID, URL: r.URL, Kind: r.Kind}
 	accept, err := classify.AcceptFor(r.Kind, r.Accept)
 	if err != nil {
 		res.Outcome, res.Problem = classify.OutcomeError, err.Error()
-		return res
+		return res, ""
 	}
 
+	var redirectLoc string
 	for attempt := 1; ; attempt++ {
 		res.Attempts = attempt
 		status, header, body, truncated, timing, fetchErr := c.once(ctx, r, accept, opts)
@@ -469,8 +591,13 @@ func (c *Crawler) fetch(ctx context.Context, r Request, opts Options, log *slog.
 		res.ETag = header.Get("etag")
 		res.LastModified = header.Get("last-modified")
 		res.RetryAfter = header.Get("retry-after")
+		redirectLoc = strings.TrimSpace(header.Get("location"))
 		if ra := politeness.ParseRetryAfter(res.RetryAfter, c.Now()); ra > 0 {
 			res.RetryAfterMs = ra.Milliseconds()
+		}
+
+		if isRedirectStatus(status) && redirectLoc != "" && res.CfMitigated == "" {
+			break
 		}
 
 		if truncated {
@@ -488,8 +615,10 @@ func (c *Crawler) fetch(ctx context.Context, r Request, opts Options, log *slog.
 		}
 		break
 	}
-	res.DurationMs = c.Now().Sub(started).Milliseconds()
+	return res, redirectLoc
+}
 
+func (c *Crawler) logResult(ctx context.Context, log *slog.Logger, r Request, res Result) {
 	level := slog.LevelInfo
 	switch res.Outcome {
 	case classify.OutcomeChallenge, classify.OutcomeStop:
@@ -505,7 +634,6 @@ func (c *Crawler) fetch(ctx context.Context, r Request, opts Options, log *slog.
 		slog.Int64("dns_ms", res.Timing.DNSMs), slog.Int64("connect_ms", res.Timing.ConnectMs), slog.Int64("tls_ms", res.Timing.TLSMs),
 		slog.Int64("ttfb_ms", res.Timing.TTFBMs), slog.Bool("conn_reused", res.Timing.Reused),
 		slog.String("remote_addr", res.Timing.RemoteAddr), slog.String("proto", res.Timing.Proto))
-	return res
 }
 
 func (c *Crawler) backoff(ctx context.Context, attempt int) {

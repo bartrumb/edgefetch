@@ -160,7 +160,7 @@ function sanitizeArch(raw: string | null | undefined): string {
 export function extractPrimaryHost(rawUrl: unknown): string | null {
   if (typeof rawUrl !== 'string' || !rawUrl) return null;
   try {
-    return new URL(rawUrl).hostname.toLowerCase() || null;
+    return new URL(rawUrl).hostname.toLowerCase().replace(/\.+$/, '') || null;
   } catch {
     return null;
   }
@@ -200,20 +200,45 @@ export interface AgentHubDeps {
   cooldowns: CooldownStore;
   now?: () => number;
   uuid?: () => string;
+  sleep?: (ms: number) => Promise<void>;
 }
+
+const DEFAULT_CROSS_NODE_PAUSE_MS = 2_000;
+const MAX_TRACKED_HOST_PACING = 512;
 
 export class AgentHubEngine {
   private readonly getSockets: (tag?: string) => HubSocketLike[];
   private readonly cooldowns: CooldownStore;
   private readonly now: () => number;
   private readonly uuid: () => string;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly pending = new Map<string, PendingJob>();
+  private readonly hostNextAllowed = new Map<string, number>();
 
   constructor(deps: AgentHubDeps) {
     this.getSockets = deps.getSockets;
     this.cooldowns = deps.cooldowns;
     this.now = deps.now ?? Date.now;
     this.uuid = deps.uuid ?? (() => crypto.randomUUID());
+    this.sleep =
+      deps.sleep ??
+      (deps.now
+        ? async () => undefined
+        : (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  }
+
+  private recordHostPacing(host: string | null, nextAllowedAt: number): void {
+    if (!host) return;
+    const prev = this.hostNextAllowed.get(host) ?? 0;
+    if (nextAllowedAt > prev) {
+      this.hostNextAllowed.delete(host);
+      this.hostNextAllowed.set(host, nextAllowedAt);
+    }
+    while (this.hostNextAllowed.size > MAX_TRACKED_HOST_PACING) {
+      const oldest = this.hostNextAllowed.keys().next().value;
+      if (oldest === undefined) break;
+      this.hostNextAllowed.delete(oldest);
+    }
   }
 
   /** Attaches metadata onto a newly accepted HAOS site WebSocket, retiring any stale duplicate socket for that siteId. */
@@ -351,8 +376,14 @@ export class AgentHubEngine {
       return { ok: false, status: 503, error: 'no_agents', message: msg };
     }
 
+    const rawPauseMs =
+      call.options && typeof call.options === 'object' && typeof (call.options as { pauseMs?: unknown }).pauseMs === 'number'
+        ? Math.min(30_000, Math.max(0, Math.floor((call.options as { pauseMs: number }).pauseMs)))
+        : DEFAULT_CROSS_NODE_PAUSE_MS;
+    const crossNodePauseMs = rawPauseMs > 0 ? rawPauseMs : DEFAULT_CROSS_NODE_PAUSE_MS;
+
     const startedAt = this.now();
-    const finalResults = new Array<CrawlResultItem | undefined>(total);
+    const finalResults: Array<CrawlResultItem | undefined> = Array.from({ length: total }, () => undefined);
     const triedSites = Array.from({ length: total }, () => new Set<string>());
     const sitesUsed: string[] = [];
     let pendingIndices = Array.from({ length: total }, (_, i) => i);
@@ -370,6 +401,7 @@ export class AgentHubEngine {
       if (lruCandidates.length === 0) break;
 
       const bySiteBatch = new Map<string, { candidate: { ws: HubSocketLike; att: AgentAttachment }; reqIndices: number[] }>();
+      const chosenByHost = new Map<string, { ws: HubSocketLike; att: AgentAttachment }>();
       let cursor = 0;
 
       for (const reqIdx of pendingIndices) {
@@ -381,8 +413,15 @@ export class AgentHubEngine {
         });
         if (eligible.length === 0) continue;
 
-        const chosen = eligible[cursor % eligible.length]!;
-        cursor++;
+        // Group same-host URLs within a batch onto a single node so per-host PauseMs + PauseJitterMs holds across nodes,
+        // while distinct hosts in the batch shard evenly across all healthy nodes.
+        let chosen = host ? chosenByHost.get(host) : undefined;
+        if (!chosen || !eligible.some((c) => c.att.siteId === chosen!.att.siteId)) {
+          chosen = eligible[cursor % eligible.length]!;
+          cursor++;
+          if (host) chosenByHost.set(host, chosen);
+        }
+
         let bucket = bySiteBatch.get(chosen.att.siteId);
         if (!bucket) {
           bucket = { candidate: chosen, reqIndices: [] };
@@ -402,6 +441,23 @@ export class AgentHubEngine {
           };
         }
         break;
+      }
+
+      // Enforce cluster-wide per-host pauseMs across back-to-back calls routed to different LRU nodes.
+      let maxWaitMs = 0;
+      const preDispatchNow = this.now();
+      for (const host of chosenByHost.keys()) {
+        const nextAt = this.hostNextAllowed.get(host) ?? 0;
+        if (nextAt > preDispatchNow) {
+          maxWaitMs = Math.max(maxWaitMs, nextAt - preDispatchNow);
+        }
+      }
+      if (maxWaitMs > 0) {
+        await this.sleep(Math.min(maxWaitMs, 30_000));
+      }
+      const dispatchStamp = this.now();
+      for (const host of chosenByHost.keys()) {
+        this.recordHostPacing(host, dispatchStamp + crossNodePauseMs);
       }
 
       const nextPending: number[] = [];
@@ -455,12 +511,16 @@ export class AgentHubEngine {
               const origIdx = reqIndices[j]!;
               const item = parsed.results[j]!;
               finalResults[origIdx] = item;
+              const itemHost = extractPrimaryHost(call.requests![origIdx]?.url);
+              this.recordHostPacing(itemHost, this.now() + crossNodePauseMs);
 
               if (item.status === 429 && item.outcome !== 'challenge') {
-                const host = extractPrimaryHost(call.requests![origIdx]?.url);
-                if (host) {
+                if (itemHost) {
                   const cdMs = parseRetryAfterCooldownMs(item.retryAfter, this.now());
-                  this.cooldowns.setCooldown(host, att.siteId, this.now() + cdMs);
+                  this.cooldowns.setCooldown(itemHost, att.siteId, this.now() + cdMs);
+                  if (item.retryAfter) {
+                    this.recordHostPacing(itemHost, this.now() + Math.min(cdMs, 30_000));
+                  }
                 }
                 if (!wantSite) {
                   nextPending.push(origIdx);

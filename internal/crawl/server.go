@@ -2,6 +2,8 @@ package crawl
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bartrumb/edgefetch/internal/classify"
+	"github.com/bartrumb/edgefetch/internal/politeness"
 )
 
 const (
@@ -37,8 +40,8 @@ type FetchReply struct {
 	DurationMs int64    `json:"durationMs"`
 }
 
-// PublicHTTPS enforces the baseline SSRF URL invariant: `https` on port 443 with a multi-label DNS hostname (never an
-// IP literal, `localhost`, or credentialed `user:pass@` URL). Paired with `politeness.RejectNonPublicPeer` at dial time.
+// PublicHTTPS enforces the baseline SSRF URL invariant: https on port 443 with a multi-label DNS hostname (never an
+// IP literal, localhost, or credentialed user:pass@ URL). Paired with politeness.RejectNonPublicPeer at dial time.
 func PublicHTTPS(u *url.URL) error {
 	if u.Scheme != "https" {
 		return fmt.Errorf("only https URLs: %s", u.Redacted())
@@ -49,14 +52,14 @@ func PublicHTTPS(u *url.URL) error {
 	if p := u.Port(); p != "" && p != "443" {
 		return fmt.Errorf("port %s not allowed", p)
 	}
-	host := strings.ToLower(u.Hostname())
+	host := politeness.CanonicalHost(u.Hostname())
 	if host == "" || net.ParseIP(host) != nil || host == "localhost" || strings.HasSuffix(host, ".localhost") || !strings.Contains(host, ".") {
 		return fmt.Errorf("host %q not allowed", host)
 	}
 	return nil
 }
 
-// WithAllowedHosts restricts `base` to exact or subdomain matches of `hosts` when `hosts` contains non-empty entries.
+// WithAllowedHosts restricts base to exact or subdomain matches of hosts when hosts contains non-empty entries.
 func WithAllowedHosts(base func(*url.URL) error, hosts []string) func(*url.URL) error {
 	clean := make([]string, 0, len(hosts))
 	for _, raw := range hosts {
@@ -72,7 +75,7 @@ func WithAllowedHosts(base func(*url.URL) error, hosts []string) func(*url.URL) 
 		if err := base(u); err != nil {
 			return err
 		}
-		host := strings.ToLower(u.Hostname())
+		host := politeness.CanonicalHost(u.Hostname())
 		for _, allowed := range clean {
 			if host == allowed || strings.HasSuffix(host, "."+allowed) {
 				return nil
@@ -82,7 +85,7 @@ func WithAllowedHosts(base func(*url.URL) error, hosts []string) func(*url.URL) 
 	}
 }
 
-// WithBlockedHost wraps `base` so an outbound agent can never be instructed to recursively fetch its own coordination hub.
+// WithBlockedHost wraps base so an outbound agent can never be instructed to recursively fetch its own coordination hub.
 func WithBlockedHost(base func(*url.URL) error, blockedHost string) func(*url.URL) error {
 	blocked := normalizeHostRule(blockedHost)
 	if blocked == "" {
@@ -92,7 +95,7 @@ func WithBlockedHost(base func(*url.URL) error, blockedHost string) func(*url.UR
 		if err := base(u); err != nil {
 			return err
 		}
-		if strings.EqualFold(u.Hostname(), blocked) {
+		if politeness.CanonicalHost(u.Hostname()) == blocked {
 			return fmt.Errorf("refusing recursive fetch of coordination hub %q", blocked)
 		}
 		return nil
@@ -161,9 +164,17 @@ func ExecuteCall(ctx context.Context, c *Crawler, call FetchCall, log *slog.Logg
 	return reply
 }
 
-// NewHandler constructs the HTTP router (`/healthz`, `/fetch`) for `server` mode.
+// NewHandler constructs an unauthenticated HTTP router (/healthz, /fetch) for loopback or isolated container bridges.
 func NewHandler(c *Crawler, allow func(*url.URL) error) http.Handler {
+	return NewAuthenticatedHandler(c, allow, "")
+}
+
+// NewAuthenticatedHandler constructs the HTTP router (/healthz, /fetch) for server mode.
+// When bearerToken is non-empty, POST /fetch requires a constant-time verified Authorization: Bearer <token> header.
+func NewAuthenticatedHandler(c *Crawler, allow func(*url.URL) error, bearerToken string) http.Handler {
 	mux := http.NewServeMux()
+	wantAuth := strings.TrimSpace(bearerToken) != ""
+	wantDigest := sha256.Sum256([]byte(strings.TrimSpace(bearerToken)))
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -177,6 +188,15 @@ func NewHandler(c *Crawler, allow func(*url.URL) error) http.Handler {
 		if r.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method", "POST only")
 			return
+		}
+		if wantAuth {
+			got, ok := parseBearerHeader(r.Header.Get("Authorization"))
+			gotDigest := sha256.Sum256([]byte(got))
+			if !ok || subtle.ConstantTimeCompare(gotDigest[:], wantDigest[:]) != 1 {
+				w.Header().Set("WWW-Authenticate", "Bearer")
+				writeHTTPError(w, http.StatusUnauthorized, "unauthorized", "valid Bearer token required")
+				return
+			}
 		}
 		var call FetchCall
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxCallBodyBytes))
@@ -193,6 +213,17 @@ func NewHandler(c *Crawler, allow func(*url.URL) error) http.Handler {
 		writeJSON(w, http.StatusOK, reply)
 	})
 	return mux
+}
+
+func parseBearerHeader(val string) (string, bool) {
+	if len(val) < 8 || !strings.EqualFold(val[:7], "Bearer ") {
+		return "", false
+	}
+	tok := strings.TrimSpace(val[7:])
+	if tok == "" {
+		return "", false
+	}
+	return tok, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

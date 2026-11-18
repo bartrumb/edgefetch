@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -98,6 +99,16 @@ func TestURLGuardsAndUserAgentValidation(t *testing.T) {
 		t.Fatal("expected recursive hub URL rejected")
 	}
 
+	trailingDotHub, _ := url.Parse("https://hub.example.com./fetch")
+	if err := rule(trailingDotHub); err == nil {
+		t.Fatal("SECURITY: expected trailing-dot hub.example.com. URL rejected")
+	}
+
+	trailingDotCatalog, _ := url.Parse("https://sub.catalog.example.com./products.json")
+	if err := rule(trailingDotCatalog); err != nil {
+		t.Fatalf("expected trailing-dot allowed subdomain accepted: %v", err)
+	}
+
 	if err := ValidateUserAgent("EdgeFetch/1.0\r\nX-Injected: bad"); err == nil {
 		t.Fatal("SECURITY: expected CRLF in User-Agent to be rejected")
 	}
@@ -123,5 +134,120 @@ func TestHTTPHandlerValidation(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &errBody)
 	if errBody["error"] != "bad_url" {
 		t.Fatalf("unexpected error body: %v", errBody)
+	}
+}
+
+func TestAuthenticatedHandlerBearerProtection(t *testing.T) {
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"products":[]}`))
+	}))
+	const secret = "server-secret-token-0123456789abcdef"
+	h := NewAuthenticatedHandler(c, func(*url.URL) error { return nil }, secret)
+
+	// /healthz remains unauthenticated for container probes.
+	healthRec := httptest.NewRecorder()
+	h.ServeHTTP(healthRec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if healthRec.Code != http.StatusOK {
+		t.Fatalf("/healthz status = %d, want 200", healthRec.Code)
+	}
+
+	// Missing Bearer -> 401.
+	unauthRec := httptest.NewRecorder()
+	h.ServeHTTP(unauthRec, httptest.NewRequest(http.MethodPost, "/fetch", bytes.NewBufferString(`{"requests":[{"id":"1","url":"http://store.test/products.json","kind":"feed"}]}`)))
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /fetch = %d, want 401", unauthRec.Code)
+	}
+
+	// Wrong Bearer -> 401.
+	badRec := httptest.NewRecorder()
+	badReq := httptest.NewRequest(http.MethodPost, "/fetch", bytes.NewBufferString(`{"requests":[{"id":"1","url":"http://store.test/products.json","kind":"feed"}]}`))
+	badReq.Header.Set("Authorization", "Bearer wrong-token-0123456789abcdef")
+	h.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong bearer /fetch = %d, want 401", badRec.Code)
+	}
+
+	// Valid Bearer -> 200.
+	okRec := httptest.NewRecorder()
+	okReq := httptest.NewRequest(http.MethodPost, "/fetch", bytes.NewBufferString(`{"requests":[{"id":"1","url":"http://store.test/products.json","kind":"feed"}]}`))
+	okReq.Header.Set("Authorization", "Bearer "+secret)
+	h.ServeHTTP(okRec, okReq)
+	if okRec.Code != http.StatusOK {
+		t.Fatalf("authorized /fetch = %d, want 200 (%s)", okRec.Code, okRec.Body.String())
+	}
+}
+
+func TestRobotsRFC9309Unreachable4295xxAnd404(t *testing.T) {
+	// 1. robots.txt returning 429 must assume disallow (OutcomeStop), never fetch target page.
+	hitPage := false
+	c429, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		hitPage = true
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte("<html>should not be fetched</html>"))
+	}))
+	res429 := c429.Run(context.Background(), []Request{
+		{ID: "r1", URL: "http://rate-limited.test/secret", Kind: classify.KindPage},
+	}, Options{RespectRobots: true})
+	if hitPage || res429[0].Outcome != classify.OutcomeStop {
+		t.Fatalf("RFC 9309: 429 on /robots.txt must disallow crawl (hitPage=%v, res=%+v)", hitPage, res429[0])
+	}
+
+	// 2. robots.txt failing with a transport error must assume disallow (OutcomeStop).
+	deadTr := &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, io.ErrUnexpectedEOF
+		},
+	}
+	cDead := NewCrawler(deadTr, func(*url.URL) error { return nil }, DefaultUserAgent, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	cDead.Sleep = func(context.Context, time.Duration) error { return nil }
+	resDead := cDead.Run(context.Background(), []Request{
+		{ID: "r2", URL: "https://unreachable.test/page", Kind: classify.KindPage},
+	}, Options{RespectRobots: true})
+	if resDead[0].Outcome != classify.OutcomeStop || !strings.Contains(resDead[0].Problem, "robots.txt unreachable") {
+		t.Fatalf("RFC 9309: unreachable /robots.txt must stop host, got %+v", resDead[0])
+	}
+
+	// 3. robots.txt returning 404 means unavailable -> allow crawl (OutcomeOK).
+	c404, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte("<html>ok</html>"))
+	}))
+	res404 := c404.Run(context.Background(), []Request{
+		{ID: "r3", URL: "http://no-robots.test/public", Kind: classify.KindPage},
+	}, Options{Robots: true}) // Also exercises legacy `Robots: true` alias -> RespectRobots!
+	if res404[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("404 /robots.txt should allow crawl, got %+v", res404[0])
+	}
+}
+
+func TestSharedWireContractFixture(t *testing.T) {
+	raw, err := os.ReadFile("../../testdata/wire-contract.json")
+	if err != nil {
+		t.Fatalf("read wire-contract.json: %v", err)
+	}
+	var fixtures map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fixtures); err != nil {
+		t.Fatalf("parse fixture map: %v", err)
+	}
+	for name, payload := range fixtures {
+		dec := json.NewDecoder(bytes.NewReader(payload))
+		dec.DisallowUnknownFields()
+		var call FetchCall
+		if err := dec.Decode(&call); err != nil {
+			t.Fatalf("fixture %s rejected by strict Go decoder: %v", name, err)
+		}
+		norm := call.Options.Normalize()
+		if !norm.RespectRobots {
+			t.Fatalf("fixture %s expected Normalize().RespectRobots == true, got %+v", name, norm)
+		}
 	}
 }

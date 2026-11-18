@@ -1,0 +1,38 @@
+{
+  "canonicalCall": {
+    "maxSeconds": 60,
+    "options": {
+      "includeBody": true,
+      "respectRobots": true,
+      "pauseMs": 1500,
+      "pauseJitterMs": 750,
+      "gapMs": 1500,
+      "timeoutMs": 30000,
+      "maxBytes": 8388608,
+      "retries": 1
+    },
+    "requests": [
+      {
+        "id": "contract-1",
+        "url": "https://example.com/feed.json",
+        "kind": "json",
+        "ifNoneMatch": "\"etag-1\""
+      }
+    ]
+  },
+  "legacyRobotsAliasCall": {
+    "maxSeconds": 60,
+    "options": {
+      "includeBody": false,
+      "robots": true,
+      "pauseMs": 2000
+    },
+    "requests": [
+      {
+        "id": "contract-2",
+        "url": "https://example.com/",
+        "kind": "page"
+      }
+    ]
+  }
+}

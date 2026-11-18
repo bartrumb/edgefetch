@@ -550,7 +550,7 @@ function renderDashboardHtml(params: {
             site: el('f-site').value || undefined,
             pauseMs: Number(el('f-pause').value || 1500),
             pauseJitterMs: Number(el('f-jitter').value || 750),
-            robots: el('f-robots').checked,
+            respectRobots: el('f-robots').checked,
             includeBody: el('f-body').checked,
           }),
         });
@@ -692,6 +692,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         site?: string;
         pauseMs?: number;
         pauseJitterMs?: number;
+        respectRobots?: boolean;
         robots?: boolean;
         includeBody?: boolean;
       };
@@ -707,11 +708,14 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         return Response.json({ error: 'invalid_site' }, { status: 400 });
       }
 
+      const respectRobots =
+        typeof body.respectRobots === 'boolean' ? body.respectRobots : body.robots !== false;
+
       const callPayload = JSON.stringify({
         maxSeconds: 60,
         options: {
           includeBody: Boolean(body.includeBody),
-          robots: body.robots !== false,
+          respectRobots,
           pauseMs: Math.min(30_000, Math.max(0, Math.floor(Number(body.pauseMs ?? 1500)))),
           pauseJitterMs: Math.min(15_000, Math.max(0, Math.floor(Number(body.pauseJitterMs ?? 750)))),
         },

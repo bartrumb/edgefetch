@@ -1,13 +1,5 @@
 // Package politeness enforces per-origin serialization, Retry-After cooldowns, three-state circuit breaking,
-// RFC 9309 robots.txt caching, and kernel-level DNS-rebinding SSRF protection (`net.Dialer.Control`).
-//
-// For Go learners reading this package:
-//   - Notice how Go separates **concurrency coordination** (`chan struct{}` buffered channels that work with `select`
-//     and `context.Context` deadlines) from **short critical-section locking** (`sync.Mutex` protecting struct fields
-//     and `map` access for nanoseconds).
-//   - Every exported identifier starts with an uppercase letter (`Registry`, `HostState`, `RejectNonPublicPeer`);
-//     unexported helpers (`robotsMatch`, `nonPublicCIDRs`) stay private to this package while remaining directly
-//     testable by `politeness_test.go` in the same folder.
+// RFC 9309 robots.txt caching, and dial-time DNS-rebinding SSRF protection (net.Dialer.Control).
 package politeness
 
 import (
@@ -15,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,8 +16,6 @@ import (
 )
 
 // Tuning bounds for per-host politeness, circuit breaking, and `/robots.txt` caching.
-// In Go, `time.Duration` is a typed `int64` nanosecond count, so expressions like `5 * time.Minute` fold to constants
-// at compile time with zero runtime overhead.
 const (
 	MaxTrackedHosts         = 512
 	HostIdleTTL             = 24 * time.Hour
@@ -41,14 +32,7 @@ const (
 )
 
 // HostState coordinates concurrent callers targeting the same hostname across independent crawl invocations.
-//
-// Why combine `inFlight chan struct{}` AND `mu sync.Mutex`?
-//   - `sync.Mutex.Lock()` cannot be interrupted by a `context.Context` cancellation! If goroutine A is mid-way through
-//     a 20 s download on a slow host and goroutine B arrives with a 2 s deadline, `mu.Lock()` would block B for all 20 s.
-//   - A 1-element buffered channel (`make(chan struct{}, 1)`) acts as a **context-cancellable mutex**: `Acquire(ctx)`
-//     uses `select` to wait for EITHER the single token (`h.inFlight <- struct{}{}`) OR `<-ctx.Done()`.
-//     (`struct{}` occupies 0 bytes of memory in Go.)
-//   - `mu sync.Mutex` guards fast, non-blocking reads/writes to timestamps, counters, and cached `robots.txt` rules.
+// `inFlight` (capacity 1) provides context-cancellable per-host serialization, while `mu` guards non-blocking metadata updates.
 type HostState struct {
 	inFlight chan struct{}
 
@@ -189,12 +173,8 @@ func (h *HostState) RecordOutcome(now time.Time, minPause, retryAfter time.Durat
 	h.circuitOpenUntil = time.Time{}
 }
 
-// Registry tracks `HostState` entries across domains with bounded memory eviction.
-//
-// Go Concurrency Note — Two-Tier Map Locking:
-// Built-in Go `map` values are NOT safe for concurrent read + write (`fatal error: concurrent map read and map write`).
-// `r.mu` is held only for sub-microsecond map lookup/insertion, while each `*HostState` carries its own mutex so
-// rate-limit updates on `alpha.example.com` never contend with `beta.example.com`.
+// Registry tracks HostState entries across domains with bounded memory eviction.
+// Two-tier locking keeps map lookups sub-microsecond while per-host updates run under each HostState's own mutex.
 type Registry struct {
 	mu    sync.Mutex
 	hosts map[string]*HostState
@@ -205,9 +185,14 @@ func NewRegistry() *Registry {
 	return &Registry{hosts: make(map[string]*HostState)}
 }
 
+// CanonicalHost normalizes a hostname to lowercase ASCII with any trailing FQDN dot stripped.
+func CanonicalHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+}
+
 // Get returns the persistent `HostState` for `host`, evicting idle (>24 h) entries when capacity exceeds `MaxTrackedHosts`.
 func (r *Registry) Get(host string, now time.Time) *HostState {
-	key := strings.ToLower(host)
+	key := CanonicalHost(host)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if st, ok := r.hosts[key]; ok {
@@ -219,7 +204,6 @@ func (r *Registry) Get(host string, now time.Time) *HostState {
 			idle := now.Sub(v.lastSeen) > HostIdleTTL && len(v.inFlight) == 0
 			v.mu.Unlock()
 			if idle {
-				// Deleting from a Go `map` while iterating it with `range` is explicitly defined and safe in the Go spec.
 				delete(r.hosts, k)
 			}
 		}
@@ -266,17 +250,25 @@ type RobotsRule struct {
 }
 
 // RobotsEntry caches parsed `/robots.txt` rules and `Crawl-delay` for one origin.
+// When `Distressed` is true (RFC 9309 §2.3.1.4 unreachable: network error, 429, or 5xx), all paths are treated as disallowed.
 type RobotsEntry struct {
 	Rules      []RobotsRule
 	CrawlDelay time.Duration
 	Distressed bool
+	Reason     string
 	ExpiresAt  time.Time
 }
 
 // Allowed evaluates RFC 9309 longest-match precedence: whichever matching `Allow` or `Disallow` rule has the longest
-// pattern wins; ties break in favor of `Allow`.
+// pattern wins; ties break in favor of `Allow`. If `/robots.txt` was unreachable (`Distressed`), returns false per RFC 9309 §2.3.1.4.
 func (e *RobotsEntry) Allowed(pathAndQuery string) bool {
-	if e == nil || len(e.Rules) == 0 {
+	if e == nil {
+		return true
+	}
+	if e.Distressed {
+		return false
+	}
+	if len(e.Rules) == 0 {
 		return true
 	}
 	if pathAndQuery == "" {
@@ -457,37 +449,35 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 	return out
 }
 
-// ── Kernel-level DNS-rebinding & IPv6-transition SSRF guard (`net.Dialer.Control`) ─────────────────────────────
+// ── Dial-time DNS-rebinding & special-purpose IP SSRF guard (net.Dialer.Control) ─────────────────────────────────
 
-// nonPublicCIDRs pre-parses special-use IPv4 and IPv6 blocks at package initialization so `IsPublicIP` performs pure
-// byte-slice comparisons on every socket dial without re-parsing CIDR strings.
-//
-// Security Note — IPv6-to-IPv4 Transition Ranges:
-// Go's `ip.To4()` unwraps IPv4-mapped IPv6 (`::ffff:192.168.1.1`), whereas NAT64 (`64:ff9b::c0a8:0101`), RFC 8215
-// local-use NAT64 (`64:ff9b:1::/48`), 6to4 (`2002::/16`), and Teredo (`2001::/32`) appear to `ip.IsGlobalUnicast()` as
-// normal global IPv6 addresses! Explicitly blocking these transition prefixes prevents DNS AAAA records from reaching
-// private LAN devices through dual-stack or NAT64 home routers.
-var nonPublicCIDRs = func() []*net.IPNet {
+// nonPublicPrefixes pre-parses IANA special-purpose IPv4 and IPv6 blocks (RFC 6890 / RFC 3879 / RFC 4291 / RFC 6052) at
+// package initialization using netip.Prefix (which strictly separates IPv4 from IPv6 without net.IP's To16 coercion).
+var nonPublicPrefixes = func() []netip.Prefix {
 	cidrs := []string{
-		"100.64.0.0/10",   // RFC 6598 Carrier-Grade NAT & Tailscale mesh IPs
-		"192.0.0.0/24",    // RFC 6890 IETF Protocol Assignments
-		"192.0.2.0/24",    // RFC 5737 TEST-NET-1
-		"198.18.0.0/15",   // RFC 2544 Benchmarking
-		"198.51.100.0/24", // RFC 5737 TEST-NET-2
-		"203.0.113.0/24",  // RFC 5737 TEST-NET-3
-		"240.0.0.0/4",     // RFC 1112 Reserved
-		"100::/64",        // RFC 6666 Discard-Only Prefix
-		"64:ff9b::/96",    // RFC 6052 IPv4-IPv6 NAT64 Well-Known Prefix
-		"64:ff9b:1::/48",  // RFC 8215 Local-Use IPv4/IPv6 Translation Prefix
-		"2001::/32",       // RFC 4380 Teredo Tunneling
-		"2001:2::/48",     // RFC 5180 Benchmarking
-		"2001:db8::/32",   // RFC 3849 Documentation
-		"2002::/16",       // RFC 3056 6to4 Transition Anycast
+		"0.0.0.0/8",           // RFC 1122 "This host on this network" (e.g. 0.1.2.3 -> local stack on Linux)
+		"100.64.0.0/10",       // RFC 6598 Carrier-Grade NAT & Tailscale mesh IPs
+		"192.0.0.0/24",        // RFC 6890 IETF Protocol Assignments
+		"192.0.2.0/24",        // RFC 5737 TEST-NET-1
+		"198.18.0.0/15",       // RFC 2544 Benchmarking
+		"198.51.100.0/24",     // RFC 5737 TEST-NET-2
+		"203.0.113.0/24",      // RFC 5737 TEST-NET-3
+		"240.0.0.0/4",         // RFC 1112 Reserved
+		"::/96",               // RFC 4291 §2.5.5.1 Deprecated IPv4-Compatible IPv6 (e.g. ::7f00:1)
+		"0:0:0:0:ffff:0::/96", // RFC 2765 SIIT IPv4-Translated IPv6 (e.g. ::ffff:0:127.0.0.1)
+		"100::/64",            // RFC 6666 Discard-Only Prefix
+		"64:ff9b::/96",        // RFC 6052 IPv4-IPv6 NAT64 Well-Known Prefix
+		"64:ff9b:1::/48",      // RFC 8215 Local-Use IPv4/IPv6 Translation Prefix
+		"2001::/32",           // RFC 4380 Teredo Tunneling
+		"2001:2::/48",         // RFC 5180 Benchmarking
+		"2001:db8::/32",       // RFC 3849 Documentation
+		"2002::/16",           // RFC 3056 6to4 Transition Anycast
+		"fec0::/10",           // RFC 3879 Deprecated Site-Local IPv6 (e.g. fec0::1)
 	}
-	out := make([]*net.IPNet, 0, len(cidrs))
+	out := make([]netip.Prefix, 0, len(cidrs))
 	for _, s := range cidrs {
-		if _, n, err := net.ParseCIDR(s); err == nil {
-			out = append(out, n)
+		if p, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, p)
 		}
 	}
 	return out
@@ -495,32 +485,39 @@ var nonPublicCIDRs = func() []*net.IPNet {
 
 // IsPublicIP returns true ONLY for globally routable public unicast IPv4/IPv6 addresses.
 func IsPublicIP(ip net.IP) bool {
-	if ip == nil {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return false
 	}
-	// Normalize IPv4-mapped IPv6 (`::ffff:127.0.0.1`) to 4-byte IPv4 so IPv4 checks cannot be bypassed.
-	if ip4 := ip.To4(); ip4 != nil {
-		ip = ip4
-	}
-	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+	return IsPublicAddr(addr)
+}
+
+// IsPublicAddr evaluates a value-typed netip.Addr with zero heap allocations.
+func IsPublicAddr(addr netip.Addr) bool {
+	if !addr.IsValid() || addr.Zone() != "" {
 		return false
 	}
-	for _, n := range nonPublicCIDRs {
-		if n.Contains(ip) {
+	// Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1 -> 127.0.0.1) so IPv4 prefixes apply uniformly.
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() {
+		return false
+	}
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(addr) {
 			return false
 		}
 	}
 	return true
 }
 
-// CheckPublicPeerAddress validates the resolved `IP:port` string right before the OS `connect()` syscall fires.
+// CheckPublicPeerAddress validates the resolved IP:port string right before the OS connect() syscall fires.
 func CheckPublicPeerAddress(address string) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return fmt.Errorf("invalid dial address %q: %w", address, err)
 	}
-	ip := net.ParseIP(host)
-	if !IsPublicIP(ip) {
+	addr, err := netip.ParseAddr(host)
+	if err != nil || !IsPublicAddr(addr) {
 		return fmt.Errorf("refusing connection to non-public IP %s", host)
 	}
 	return nil

@@ -1,12 +1,5 @@
-// Package classify categorizes HTTP responses into deterministic crawl outcomes (`ok`, `challenge`, `stop`, `gone`,
-// `skip`, `error`, `not_tried`) before upstream parsers inspect response bodies.
-//
-// For Go learners reading this package:
-//   - Notice `type Kind string` and `type Outcome string`: Go replaces `enum` keywords with distinct defined types
-//     backed by primitive values (`string`). They have zero runtime boxing overhead and serialize as plain JSON strings
-//     automatically, while preventing accidental mixing of arbitrary `string` values at compile time.
-//   - Notice Go's two-value type assertion (`obj, ok := parsed.(map[string]any)`): unlike single-value assertions
-//     which panic on type mismatch, the comma-ok form never panics on untrusted JSON input.
+// Package classify categorizes HTTP responses into deterministic crawl outcomes (ok, challenge, stop, gone,
+// skip, error, not_tried) before upstream parsers inspect response bodies.
 package classify
 
 import (
@@ -140,10 +133,10 @@ func AcceptFor(kind Kind, requested string) (string, error) {
 		return "text/html", nil
 	case KindText:
 		switch requested {
-		case "text/html", "application/xml":
+		case "text/html", "application/xml", "text/xml", "application/rss+xml", "application/atom+xml", "application/json", "text/calendar", "text/plain":
 			return requested, nil
 		}
-		return "", fmt.Errorf("a text request needs accept text/html or application/xml, not %q", requested)
+		return "", fmt.Errorf("unsupported KindText accept %q", requested)
 	case "":
 		return "", errors.New("missing kind")
 	}

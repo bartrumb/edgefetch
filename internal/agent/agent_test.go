@@ -253,3 +253,86 @@ func TestAgentSessionReconnectHelloPingAndGzipReply(t *testing.T) {
 		t.Fatalf("unexpected reply: %+v", got)
 	}
 }
+
+func TestShutdownDrainStillUploadsPartialResults(t *testing.T) {
+	// First request succeeds immediately; second blocks until ShutdownDrain expires.
+	// Verify that handleDispatch STILL uploads the completed first result + not_tried second result via uploadCtx!
+	var calls atomic.Int32
+	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("content-type", "text/html")
+			_, _ = w.Write([]byte("<html>done-1</html>"))
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer originSrv.Close()
+	originAddr := originSrv.Listener.Addr().String()
+
+	tr := &http.Transport{
+		TLSClientConfig: originSrv.Client().Transport.(*http.Transport).TLSClientConfig,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
+		},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	crawler := crawl.NewCrawler(tr, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	crawler.Sleep = crawl.SleepCtx
+
+	replyCh := make(chan crawl.FetchReply, 1)
+	hubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer gz.Close()
+		var rep crawl.FetchReply
+		if err := json.NewDecoder(gz).Decode(&rep); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		replyCh <- rep
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer hubSrv.Close()
+
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	// Trigger shutdown right away with a short 80ms drain window while request #2 hangs.
+	time.AfterFunc(30*time.Millisecond, cancelParent)
+
+	cfg := Config{
+		HubURL:        hubSrv.URL,
+		AgentToken:    "agent-secret-token-0123456789-abcdef",
+		SiteID:        "site-x86",
+		UserAgent:     crawl.DefaultUserAgent,
+		PauseMs:       10,
+		PauseJitterMs: 0,
+	}
+
+	handleDispatch(parentCtx, cfg, crawler, crawl.PublicHTTPS, hubSrv.Client(), log, 60*time.Millisecond, controlMessage{
+		Type:     "dispatch",
+		JobID:    "job-drain",
+		JobNonce: "nonce-drain",
+		Call: crawl.FetchCall{
+			Requests: []crawl.Request{
+				{ID: "1", URL: "https://alpha.example.com/1", Kind: classify.KindPage},
+				{ID: "2", URL: "https://beta.example.com/2", Kind: classify.KindPage},
+			},
+			Options: crawl.Options{IncludeBody: true, PauseMs: 10},
+		},
+	})
+
+	select {
+	case rep := <-replyCh:
+		if len(rep.Results) != 2 {
+			t.Fatalf("expected 2 results uploaded after shutdown drain, got %d", len(rep.Results))
+		}
+		if rep.Results[0].Outcome != classify.OutcomeOK {
+			t.Fatalf("expected first completed result preserved, got %+v", rep.Results[0])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lost results on shutdown: /agent/reply was never uploaded after ShutdownDrain expired")
+	}
+}

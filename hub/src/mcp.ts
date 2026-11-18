@@ -104,7 +104,8 @@ function validatePublicHttpsUrl(raw: unknown): { ok: true; url: string } | { ok:
   if (u.protocol !== 'https:') return { ok: false, error: 'only https:// URLs are permitted' };
   if (u.username || u.password) return { ok: false, error: 'URLs with embedded credentials are not permitted' };
   if (u.port && u.port !== '443') return { ok: false, error: 'only port 443 is permitted' };
-  if (!u.hostname.includes('.') || u.hostname.toLowerCase() === 'localhost') {
+  const host = u.hostname.toLowerCase().replace(/\.+$/, '');
+  if (!host.includes('.') || host === 'localhost' || host.endsWith('.localhost')) {
     return { ok: false, error: `disallowed hostname: ${u.hostname}` };
   }
   return { ok: true, url: u.toString() };
@@ -161,7 +162,8 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
             type: 'string',
             description: 'Optional standby site ID to pin (e.g. "site-arm64", "site-x86", "site-win-vm").',
           },
-          robots: { type: 'boolean', default: true, description: 'Respect /robots.txt Allow/Disallow and Crawl-delay.' },
+          respectRobots: { type: 'boolean', default: true, description: 'Respect /robots.txt Allow/Disallow and Crawl-delay.' },
+          robots: { type: 'boolean', description: 'Deprecated alias for respectRobots.' },
           includeBody: { type: 'boolean', default: true, description: 'Include response body preview in tool output.' },
           maxBytes: { type: 'integer', minimum: 1024, maximum: 16777216, description: 'Maximum response body bytes (up to 16 MiB).' },
           ifNoneMatch: { type: 'string', description: 'Optional ETag for conditional 304 Not Modified checks.' },
@@ -197,7 +199,8 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
           pauseMs: { type: 'integer', minimum: 0, maximum: 30000, default: 1000, description: 'Minimum per-host pause in ms.' },
           pauseJitterMs: { type: 'integer', minimum: 0, maximum: 15000, default: 500, description: 'Random positive jitter added to pauseMs.' },
-          robots: { type: 'boolean', default: true },
+          respectRobots: { type: 'boolean', default: true },
+          robots: { type: 'boolean', description: 'Deprecated alias for respectRobots.' },
           includeBody: { type: 'boolean', default: false, description: 'Set true to include truncated body previews per URL.' },
         },
         required: ['urls'],
@@ -258,7 +261,12 @@ async function handleToolCall(
     }
 
     const kind = args.kind === 'feed' ? 'feed' : 'page';
-    const robots = typeof args.robots === 'boolean' ? args.robots : true;
+    const respectRobots =
+      typeof args.respectRobots === 'boolean'
+        ? args.respectRobots
+        : typeof args.robots === 'boolean'
+          ? args.robots
+          : true;
     const includeBody = typeof args.includeBody === 'boolean' ? args.includeBody : name === 'fetch_url';
 
     let requests: Array<Record<string, unknown>>;
@@ -290,7 +298,7 @@ async function handleToolCall(
       maxSeconds: 60,
       options: {
         includeBody,
-        robots,
+        respectRobots,
         ...(typeof args.maxBytes === 'number' ? { maxBytes: Math.min(16 << 20, Math.max(1024, Math.floor(args.maxBytes))) } : {}),
         ...(typeof args.pauseMs === 'number' ? { pauseMs: Math.min(30_000, Math.max(0, Math.floor(args.pauseMs))) } : {}),
         ...(typeof args.pauseJitterMs === 'number'

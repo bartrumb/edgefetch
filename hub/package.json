@@ -5,6 +5,7 @@
   "description": "Cloudflare Hibernating WebSocket Durable Object coordinator, /admin Control Center, and Self-Hosted OAuth 2.1 /mcp server for EdgeFetch.",
   "scripts": {
     "type-check": "tsc --noEmit -p tsconfig.json",
+    "test": "node scripts/run-tests.mjs",
     "deploy:dry": "wrangler deploy --dry-run -c wrangler.toml",
     "deploy": "wrangler deploy -c wrangler.toml"
   },

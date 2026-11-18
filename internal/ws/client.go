@@ -1,12 +1,5 @@
-// Package ws implements a minimal, zero-dependency RFC 6455 client WebSocket over `crypto/tls` and `net`.
-//
-// For Go learners reading this package:
-//   - Keeping WebSocket framing in ~180 lines of standard-library Go eliminates external third-party dependencies
-//     (`go.sum` stays absent) while giving explicit control over TLS ALPN (`NextProtos: ["http/1.1"]`), buffer reuse,
-//     and incoming message size limits (`MaxMessageBytes = 1 MiB`).
-//   - Notice `br *bufio.Reader` on `Conn`: `http.ReadResponse` reads ahead on the socket when parsing `101 Switching
-//     Protocols` headers. Retaining that exact `*bufio.Reader` ensures any WebSocket frame arriving in the same TCP
-//     segment right after `\r\n\r\n` is never lost!
+// Package ws implements a zero-dependency RFC 6455 client WebSocket over crypto/tls and net, retaining the
+// post-handshake bufio.Reader across HTTP/1.1 101 Switching Protocols upgrades and enforcing a 1 MiB frame ceiling.
 package ws
 
 import (

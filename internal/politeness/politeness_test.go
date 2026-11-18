@@ -137,8 +137,14 @@ func TestSSRFGuardBlocksPrivateLoopbackCGNATAndIPv6TransitionRanges(t *testing.T
 		"[fd00::1234]:443",          // IPv6 Unique Local Address (ULA)
 		"[64:ff9b::c0a8:101]:443",   // NAT64 well-known prefix wrapping 192.168.1.1!
 		"[64:ff9b:1::7f00:1]:443",   // Local-use NAT64 wrapping 127.0.0.1!
-		"[2002:c0a8:101::1]:443",    // 6to4 wrapping 192.168.1.1!
+		"[2002:c0a8:101::1]:443",    // 6to4 wrapping 192.168.1.1
 		"[2001:0000:4136:e378:8000:63bf:3fff:fdd2]:443", // Teredo tunnel
+		"0.1.2.3:443",              // RFC 1122 0.0.0.0/8 "this network"
+		"[fec0::1]:443",            // RFC 3879 deprecated site-local IPv6
+		"[::7f00:1]:443",           // RFC 4291 deprecated IPv4-compatible IPv6 (127.0.0.1)
+		"[::ffff:0:127.0.0.1]:443", // RFC 2765 SIIT IPv4-translated IPv6
+		"[100::1]:443",             // RFC 6666 discard prefix
+		"[2001:db8::1]:443",        // RFC 3849 documentation prefix
 	}
 	for _, addr := range blocked {
 		if err := CheckPublicPeerAddress(addr); err == nil {
@@ -149,12 +155,21 @@ func TestSSRFGuardBlocksPrivateLoopbackCGNATAndIPv6TransitionRanges(t *testing.T
 	allowed := []string{
 		"1.1.1.1:443",
 		"93.184.216.34:443",
+		"[::ffff:93.184.216.34]:443",
 		"[2606:4700:4700::1111]:443",
 	}
 	for _, addr := range allowed {
 		if err := CheckPublicPeerAddress(addr); err != nil {
 			t.Errorf("expected public peer %s allowed, got %v", addr, err)
 		}
+	}
+
+	if got := CanonicalHost("HUB.Example.COM."); got != "hub.example.com" {
+		t.Fatalf("CanonicalHost trailing dot = %q, want hub.example.com", got)
+	}
+	distressed := &RobotsEntry{Distressed: true}
+	if distressed.Allowed("/public") {
+		t.Fatal("RFC 9309: distressed/unreachable RobotsEntry must disallow all paths")
 	}
 }
 

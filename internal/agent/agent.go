@@ -258,7 +258,11 @@ func handleDispatch(
 		reply = crawl.ExecuteCall(jobBaseCtx, crawler, call, jobLog)
 	}
 
-	if err := uploadReply(jobBaseCtx, replyClient, cfg, msg.JobID, msg.JobNonce, reply); err != nil {
+	// Always upload completed/partial results using a fresh bounded context so an expired shutdownDrain deadline on
+	// jobBaseCtx never drops already-finished fetch results before POST /agent/reply completes.
+	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelUpload()
+	if err := uploadReply(uploadCtx, replyClient, cfg, msg.JobID, msg.JobNonce, reply); err != nil {
 		jobLog.Error("agent_reply_failed", slog.String("error", err.Error()))
 	}
 }

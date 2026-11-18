@@ -8,8 +8,9 @@ EdgeFetch is designed to run safely inside private networks (such as Home Assist
 - **Outbound-only sockets in `agent` mode:** `edgefetch --mode=agent` never calls `net.Listen`. Router port-forwarding, UPnP, and VPN/tunnel daemons are unnecessary.
 - **No generic proxy protocol:** EdgeFetch is **not** an HTTP `CONNECT` or SOCKS5 relay. It accepts structured JSON `FetchCall` dispatches over a single authenticated TLS 1.2/1.3 WebSocket and executes bounded HTTP `GET` requests only.
 
-### 2. Least-Privilege Token Separation (`CALLER_TOKEN` vs. `AGENT_TOKENS`)
-- **Caller Token (`CALLER_TOKEN`):** Authorizes upstream workflows to submit `POST /fetch` batches and view `GET /agents`. Never place `CALLER_TOKEN` on standby nodes.
+### 2. Least-Privilege Token Separation (`CALLER_TOKEN`, `AGENT_TOKENS`, & `EDGEFETCH_SERVER_TOKEN`)
+- **Caller Token (`CALLER_TOKEN`):** Authorizes upstream workflows to submit `POST /fetch` batches and view `GET /agents` on the Hub. Never place `CALLER_TOKEN` on standby nodes.
+- **Standalone Server Token (`EDGEFETCH_SERVER_TOKEN`):** In `--mode=server`, `edgefetch` refuses to bind non-loopback addresses (`:8080`, `0.0.0.0:8080`) unless `EDGEFETCH_SERVER_TOKEN` (`>= 24` random chars, verified in constant time via SHA-256 + `subtle.ConstantTimeCompare` on `POST /fetch`) is configured, or `--allow-unauthenticated` (`EDGEFETCH_ALLOW_UNAUTHENTICATED=1`) is explicitly passed inside an isolated container bridge.
 - **Per-Site Agent Tokens (`AGENT_TOKENS`):** Standby nodes hold site-scoped tokens (`{"site-1":"...","site-2":"..."}`) accepted **only** on `GET /agent/ws` and `POST /agent/reply`.
   - Comparisons use length-independent constant-time byte XOR (`sameBytes`), failing closed whenever a token is unset or `< 24` characters.
   - `siteId` is bound to the matched token key on the server so `site-1` cannot spoof `site-2`.
@@ -20,10 +21,10 @@ EdgeFetch is designed to run safely inside private networks (such as Home Assist
 Even if a caller token were compromised, an agent cannot be used to probe local LAN devices, Home Assistant APIs, Tailscale peers, or cloud metadata endpoints:
 1. **Pre-Request URL Validation (`crawl.PublicHTTPS` + `WithBlockedHost` + `WithAllowedHosts`):**
    - Requires `https://` on port `443` with a multi-label DNS name (rejecting IP literals, `localhost`, `.localhost`, and `user:pass@` URLs) on the initial URL **and** every HTTP `3xx` redirect (max 5).
-   - Automatically blocks the agent's own `hub_url` hostname to prevent recursive fetch loops, and supports an explicit `allowed_hosts` domain allowlist.
-2. **Kernel-Time Socket Peer Inspection (`politeness.RejectNonPublicPeer` via `net.Dialer.Control`):**
-   - Runs *after* DNS resolution creates the OS socket and *immediately before* the `connect()` syscall fires — eliminating DNS-rebinding TOCTOU races.
-   - Blocks loopback (`127.0.0.0/8`, `::1`), RFC 1918 private LANs (`10.0.0.0/8`, `172.16.0.0/12` including Home Assistant OS's `172.30.32.0/23` internal network, `192.168.0.0/16`), RFC 6598 CGNAT / Tailscale (`100.64.0.0/10`), link-local / cloud metadata (`169.254.0.0/16`, `fe80::/10`), IPv6 Unique Local (`fc00::/7`), and **IPv6-to-IPv4 transition prefixes** (`64:ff9b::/96` NAT64, `64:ff9b:1::/48`, `2002::/16` 6to4, `2001::/32` Teredo, `100::/64`).
+   - Canonicalizes hostnames (lowercasing + stripping trailing FQDN dots like `hub.example.com.`) before blocking the agent's own `hub_url` hostname and evaluating `allowed_hosts`.
+2. **Dial-Time Socket Peer Inspection (`politeness.RejectNonPublicPeer` via `net.Dialer.Control` & `net/netip`):**
+   - Runs inside Go's dialer *after* DNS resolution creates the OS socket and *immediately before* the `connect()` syscall fires — eliminating DNS-rebinding TOCTOU races.
+   - Blocks `0.0.0.0/8` (RFC 1122 "this network"), loopback (`127.0.0.0/8`, `::1`), RFC 1918 private LANs (`10.0.0.0/8`, `172.16.0.0/12` including Home Assistant OS's `172.30.32.0/23` internal network, `192.168.0.0/16`), RFC 6598 CGNAT / Tailscale (`100.64.0.0/10`), link-local / cloud metadata (`169.254.0.0/16`, `fe80::/10`), IPv6 Unique Local (`fc00::/7`), deprecated site-local (`fec0::/10`), documentation/benchmarking/reserved blocks, and **IPv6-to-IPv4 transition prefixes** (`::/96`, `0:0:0:0:ffff:0::/96`, `64:ff9b::/96` NAT64, `64:ff9b:1::/48`, `2002::/16` 6to4, `2001::/32` Teredo, `100::/64`).
 
 ### 4. Container Hardening & Irreversible Privilege Drop
 - **Distroless Runtime:** Production images use `gcr.io/distroless/static-debian12` (~9 MB total) containing **no `/bin/sh`, no package manager, and no dynamic libc**.

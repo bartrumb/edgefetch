@@ -57,6 +57,7 @@ jobs:
         with:
           node-version: '22'
       - run: npm install --no-audit --no-fund
+      - run: npm test
       - run: npm run type-check
       - run: npm run deploy:dry
 

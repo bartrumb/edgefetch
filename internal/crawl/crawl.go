@@ -1,13 +1,5 @@
-// Package crawl implements a bounded-concurrency, polite HTTP/2 fetcher with `net/http/httptrace` phase telemetry,
-// positive dwell jitter, conditional GETs (`ETag` / `If-Modified-Since`), and strict memory/SSRF guardrails.
-//
-// For Go learners reading this package:
-//   - Compare `func (o Options) Normalize() Options` (a VALUE receiver that sanitizes a local struct copy without
-//     mutating the caller) vs. `func (c *Crawler) Run(...)` (a POINTER receiver required whenever a struct embeds
-//     `sync.Mutex` or shares mutable state across goroutines).
-//   - Notice how `RunLogged` writes concurrently into `results := make([]Result, len(reqs))` WITHOUT a mutex on
-//     `results`: because requests are partitioned by hostname and each index `i` belongs to exactly one goroutine,
-//     disjoint index writes (`results[i] = res`) are 100% data-race free under `go test -race`.
+// Package crawl implements a bounded-concurrency, polite HTTP/2 fetcher with net/http/httptrace phase telemetry,
+// positive dwell jitter, conditional GETs (ETag / If-Modified-Since), and strict memory/SSRF guardrails.
 package crawl
 
 import (
@@ -76,7 +68,7 @@ type Result struct {
 	Body         string           `json:"body,omitempty"`
 }
 
-// Options bounds a crawl batch. Zero values take safe defaults in `Normalize()`.
+// Options bounds a crawl batch. Zero values take safe defaults in Normalize().
 type Options struct {
 	PauseMs       int  `json:"pauseMs"`
 	PauseJitterMs int  `json:"pauseJitterMs,omitempty"`
@@ -87,6 +79,8 @@ type Options struct {
 	Retries       int  `json:"retries"`
 	IncludeBody   bool `json:"includeBody"`
 	RespectRobots bool `json:"respectRobots,omitempty"`
+	// Robots is accepted as a wire alias for RespectRobots so callers sending either field name enforce RFC 9309 rules.
+	Robots bool `json:"robots,omitempty"`
 }
 
 const (
@@ -101,6 +95,10 @@ const (
 
 // Normalize clamps out-of-range or zero fields on a value copy of `Options`.
 func (o Options) Normalize() Options {
+	if o.Robots {
+		o.RespectRobots = true
+		o.Robots = false
+	}
 	if o.PauseMs <= 0 {
 		o.PauseMs = DefaultPauseMs
 	}
@@ -357,9 +355,9 @@ func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, l
 				}
 
 				if opts.RespectRobots {
-					if allowed, reason := c.checkRobots(ctx, hs, r.URL); !allowed {
+					if allowed, distressed, reason := c.checkRobots(ctx, hs, r.URL); !allowed {
 						outcome := classify.OutcomeError
-						if strings.HasPrefix(reason, "robots.txt returned") {
+						if distressed {
 							outcome = classify.OutcomeStop
 						} else if r.Kind == classify.KindPage || r.Kind == classify.KindText {
 							outcome = classify.OutcomeSkip
@@ -408,9 +406,12 @@ func notTried(r Request, why string) Result {
 func hostOf(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return raw
+		return politeness.CanonicalHost(raw)
 	}
-	return u.Host
+	if h := politeness.CanonicalHost(u.Hostname()); h != "" {
+		return h
+	}
+	return politeness.CanonicalHost(u.Host)
 }
 
 func retriableStatus(status int) bool {
@@ -583,66 +584,97 @@ func (c *Crawler) once(ctx context.Context, r Request, accept string, opts Optio
 	return resp.StatusCode, resp.Header, limited, truncated, tm, nil
 }
 
-func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, rawURL string) (bool, string) {
+func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, rawURL string) (allowed, distressed bool, reason string) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return false, err.Error()
+		return false, false, err.Error()
 	}
 	now := c.Now()
 	entry := hs.CachedRobots(now)
 	if entry == nil {
-		entry = c.fetchRobots(ctx, u)
-		distress := time.Duration(0)
-		if entry.Distressed {
-			distress = politeness.DefaultThrottlePause
-		}
-		hs.SetRobots(c.Now(), entry, distress)
+		var pause time.Duration
+		entry, pause = c.fetchRobots(ctx, u)
+		hs.SetRobots(c.Now(), entry, pause)
 	}
 	if entry.Distressed {
-		return false, "robots.txt returned 5xx (host paused)"
+		msg := entry.Reason
+		if msg == "" {
+			msg = "robots.txt unreachable (disallow assumed per RFC 9309)"
+		}
+		return false, true, msg
 	}
 	if !entry.Allowed(u.RequestURI()) {
-		return false, "robots.txt disallowed " + u.Path
+		return false, false, "robots.txt disallowed " + u.Path
 	}
-	return true, ""
+	return true, false, ""
 }
 
-func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) *politeness.RobotsEntry {
+// fetchRobots implements RFC 9309 §2.3.1:
+//   - 2xx: parse rules and cache for RobotsCacheTTL (24 h).
+//   - 4xx except 429 (e.g. 404, 403, 410): "unavailable" -> allow all for RobotsCacheTTL (24 h).
+//   - Network/timeout error, body read error, 429, or 5xx: "unreachable" -> disallow all for RobotsDistressTTL (5 m).
+func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness.RobotsEntry, time.Duration) {
 	robotsURL := (&url.URL{Scheme: target.Scheme, Host: target.Host, Path: "/robots.txt"}).String()
 	rctx, cancel := context.WithTimeout(ctx, politeness.RobotsTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(rctx, http.MethodGet, robotsURL, nil)
 	if err != nil {
-		return &politeness.RobotsEntry{ExpiresAt: c.Now().Add(politeness.RobotsDistressTTL)}
+		return &politeness.RobotsEntry{
+			Distressed: true,
+			Reason:     "robots.txt request invalid: " + err.Error(),
+			ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
+		}, politeness.DefaultThrottlePause
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", "text/plain,*/*;q=0.8")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return &politeness.RobotsEntry{ExpiresAt: c.Now().Add(politeness.RobotsDistressTTL)}
+		return &politeness.RobotsEntry{
+			Distressed: true,
+			Reason:     "robots.txt unreachable (disallow assumed per RFC 9309): " + err.Error(),
+			ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
+		}, politeness.DefaultThrottlePause
 	}
 	defer resp.Body.Close()
 
 	now := c.Now()
-	if resp.StatusCode >= 500 {
-		return &politeness.RobotsEntry{Distressed: true, ExpiresAt: now.Add(politeness.RobotsDistressTTL)}
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		pause := politeness.ParseRetryAfter(resp.Header.Get("Retry-After"), now)
+		if pause < politeness.DefaultThrottlePause {
+			pause = politeness.DefaultThrottlePause
+		}
+		return &politeness.RobotsEntry{
+			Distressed: true,
+			Reason:     fmt.Sprintf("robots.txt returned HTTP %d (disallow assumed per RFC 9309)", resp.StatusCode),
+			ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+		}, pause
 	}
-	if resp.StatusCode != http.StatusOK {
-		return &politeness.RobotsEntry{ExpiresAt: now.Add(politeness.RobotsCacheTTL)}
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		return &politeness.RobotsEntry{ExpiresAt: now.Add(politeness.RobotsCacheTTL)}, 0
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &politeness.RobotsEntry{
+			Distressed: true,
+			Reason:     fmt.Sprintf("robots.txt returned unexpected HTTP %d", resp.StatusCode),
+			ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+		}, politeness.DefaultThrottlePause
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, politeness.RobotsMaxBytes))
 	if err != nil {
-		return &politeness.RobotsEntry{ExpiresAt: now.Add(politeness.RobotsDistressTTL)}
+		return &politeness.RobotsEntry{
+			Distressed: true,
+			Reason:     "robots.txt read failed (disallow assumed per RFC 9309): " + err.Error(),
+			ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+		}, politeness.DefaultThrottlePause
 	}
 
-	// Extract the primary User-Agent product token (e.g. `"EdgeFetch/1.0 ..."` -> `"edgefetch"`) for RFC 9309 matching.
 	uaProduct := strings.ToLower(c.userAgent)
 	if slash := strings.IndexByte(uaProduct, '/'); slash > 0 {
 		uaProduct = uaProduct[:slash]
 	}
-	return politeness.ParseRobotsTxt(string(raw), uaProduct, now.Add(politeness.RobotsCacheTTL))
+	return politeness.ParseRobotsTxt(string(raw), uaProduct, now.Add(politeness.RobotsCacheTTL)), 0
 }
 
 // Summary aggregates outcome and status-code histograms across a `FetchReply`.

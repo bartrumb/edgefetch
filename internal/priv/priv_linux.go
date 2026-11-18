@@ -1,15 +1,9 @@
 //go:build linux
 
 // Package priv implements irreversible root privilege dropping on Linux containers.
-//
-// For Go learners reading this package:
-//   - Notice the `//go:build linux` build constraint on line 1 (paired with `//go:build !linux` in `priv_other.go`).
-//     Go's build system selects OS-specific files at compile time cleanly without C preprocessor `#ifdef` blocks.
-//   - Why drop root in Go rather than setting `USER 65532` in the Home Assistant Add-on Dockerfile?
-//     Home Assistant OS Supervisor mounts `/data/options.json` owned by `root:root` (`0600`). Reading the config file
-//     into memory first, zeroing the raw buffer, and immediately invoking `PR_SET_NO_NEW_PRIVS` + `Setgroups([])` +
-//     `Setgid(65532)` + `Setuid(65532)` drops root across EVERY Go runtime OS thread (`AllThreadsSyscall`) BEFORE any
-//     network socket is opened — allowing a shell-free `distroless` image with zero `su-exec` or `/bin/sh` surface.
+// Home Assistant OS Supervisor mounts /data/options.json as 0600 root:root; reading config first, zeroing the raw
+// buffer, and invoking PR_SET_NO_NEW_PRIVS + Setgroups([]) + Setgid(65532) + Setuid(65532) drops root across all Go
+// runtime OS threads (AllThreadsSyscall) before any network socket opens, keeping the runtime image distroless.
 package priv
 
 import (

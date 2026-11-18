@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml/badge.svg)](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml)
 [![Go 1.22+](https://img.shields.io/badge/Go-1.22%2B%20(stdlib%20only)-00ADD8?logo=go)](go.mod)
-[![License: MIT](https://github.com/bartrumb/edgefetch/blob/main/LICENSE)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 <p>
   <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub">
@@ -26,15 +26,15 @@ It solves a practical distributed-systems problem: keeping scheduled public feed
 
 ## Why EdgeFetch?
 
-- **100% Go Standard Library (`go.sum`-free):** HTTP/2 connection pooling, `net/http/httptrace` phase telemetry, RFC 6455 TLS WebSocket framing, RFC 9309 `robots.txt` longest-match evaluation, RFC 9110 `Retry-After` parsing, three-state circuit breaking, and Linux `prctl` + `setuid` privilege dropping are implemented cleanly in ~1,400 lines of idiomatic Go with **zero external supply-chain dependencies**.
+- **100% Go Standard Library (`go.sum`-free):** HTTP/2 connection pooling, `net/http/httptrace` phase telemetry, RFC 6455 TLS WebSocket framing, RFC 9309 `robots.txt` longest-match + unreachable-disallow evaluation, RFC 9110 `Retry-After` parsing, three-state circuit breaking, and Linux `prctl` + `setuid` privilege dropping are implemented in ~2,300 lines of idiomatic Go with **zero external supply-chain dependencies**.
 - **Strict Hub / Edge Security Split (~$0 Idle Cloud Cost):**
   - **Edge Nodes (`amd64` / `aarch64`)** host **zero** inbound HTTP, `/admin`, or `/mcp` endpoints. They dial outbound `wss://` to `/agent/ws`, where Cloudflare's `WebSocketRequestResponsePair("ping", "pong")` answers 30-second keepalives at the edge **without waking the Durable Object from hibernation**.
   - **Cloudflare Hub (`hub/`)** is the sole public control plane — hosting `POST /fetch`, `GET /agents`, the `/admin` Web Control Center, and the OAuth 2.1 `/mcp` server for Claude Code.
-- **Split Control / Data Plane for Asymmetric Links:** Small JSON dispatch commands arrive over the hibernated WebSocket (`< 1 MiB`), while `0.4–16 MiB` HTML/JSON responses stream back via `gzip`-compressed HTTP/2 `POST /agent/reply` (~8–10x smaller over residential upload pipes, never stalling WebSocket heartbeats).
+- **Split Control / Data Plane for Asymmetric Links:** Small JSON dispatch commands arrive over the hibernated WebSocket (`< 1 MiB`), while `0.4–16 MiB` HTML/JSON responses stream back via `gzip`-compressed HTTP/2 `POST /agent/reply` (~8–10x smaller over residential upload pipes, never stalling WebSocket heartbeats, with independent shutdown-drain upload contexts so completed results are never lost on `SIGTERM`).
 - **Defense-in-Depth Security ([SECURITY.md](SECURITY.md)):**
-  - Kernel-level `net.Dialer.Control` SSRF guard (`RejectNonPublicPeer`) inspects the exact resolved IP right before `connect()` — eliminating DNS-rebinding TOCTOU races and blocking RFC 1918 LANs (including Home Assistant's `172.30.32.0/23` bridge), loopback, Tailscale/CGNAT (`100.64.0.0/10`), cloud metadata (`169.254.169.254`), and IPv6-embedded IPv4 transition prefixes (`64:ff9b::/96` NAT64, `2002::/16` 6to4, `2001::/32` Teredo).
+  - Dial-time `net.Dialer.Control` SSRF guard (`RejectNonPublicPeer` backed by `net/netip`) inspects the exact resolved IP right before `connect()` — eliminating DNS-rebinding TOCTOU races and blocking `0.0.0.0/8`, RFC 1918 LANs (including Home Assistant's `172.30.32.0/23` bridge), loopback, Tailscale/CGNAT (`100.64.0.0/10`), cloud metadata (`169.254.169.254`), site-local (`fec0::/10`), and IPv6-embedded IPv4 transition prefixes (`::/96`, `0:0:0:0:ffff:0::/96`, `64:ff9b::/96` NAT64, `2002::/16` 6to4, `2001::/32` Teredo).
   - Irreversible Linux privilege drop (`PR_SET_NO_NEW_PRIVS` -> `Setgroups([])` -> `Setgid(65532)` -> `Setuid(65532)` via `AllThreadsSyscall`) inside a **~9 MB shell-free `distroless`** image confined by a custom Home Assistant AppArmor profile.
-  - Strictly separated least-privilege tokens (`CALLER_TOKEN` vs. per-site `AGENT_TOKENS`) verified in length-independent constant time, plus per-job `jobNonce` binding.
+  - Strictly separated least-privilege tokens (`CALLER_TOKEN`, per-site `AGENT_TOKENS`, and mandatory `EDGEFETCH_SERVER_TOKEN` on non-loopback `--mode=server` binds) verified in constant time, plus per-job `jobNonce` binding.
 
 ---
 
@@ -83,7 +83,7 @@ Measured on Linux `amd64` (12th Gen Intel Core i9-12900K, Go stdlib only):
 |---|---:|---:|---:|
 | `BenchmarkParseRetryAfter` | `4.45 ns/op` | — | **`0 B/op` (`0 allocs/op`)** |
 | `BenchmarkRobotsMatch` (`*` wildcards + `$` anchor) | `52.17 ns/op` | — | **`0 B/op` (`0 allocs/op`)** |
-| `BenchmarkIsPublicIP` (IPv4 + NAT64 IPv6 check) | `229.60 ns/op` | — | **`0 B/op` (`0 allocs/op`)** |
+| `BenchmarkIsPublicIP` (IPv4 + NAT64 IPv6 check) | `155.50 ns/op` | — | **`0 B/op` (`0 allocs/op`)** |
 | `BenchmarkMaskBytes1KiB` (RFC 6455 XOR masking) | `415.10 ns/op` | `2,467 MB/s` | **`0 B/op` (`0 allocs/op`)** |
 | `BenchmarkClassifyFeedJSON` | `1,229 ns/op` | — | `1,416 B/op` (`28 allocs/op`) |
 
@@ -128,18 +128,20 @@ npx wrangler secret put AGENT_TOKENS -c wrangler.toml
   curl -X POST "https://<your-hub>.workers.dev/fetch?site=site-1" \
     -H "Authorization: Bearer $CALLER_TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"options":{"includeBody":true,"robots":true,"pauseMs":1500},"requests":[{"id":"1","url":"https://example.com/","kind":"page"}]}'
+    -d '{"options":{"includeBody":true,"respectRobots":true,"pauseMs":1500},"requests":[{"id":"1","url":"https://example.com/","kind":"page"}]}'
   ```
 - **Single-Pane-of-Glass Logs & Traces:** Open **Cloudflare Dashboard -> Workers & Pages -> `edgefetch-hub` -> Observability** to query OpenTelemetry traces and structured JSON logs across every site.
 
 ---
 
-## Ethical & Polite Crawling Principles
+## Ethical Crawling, Cluster-Wide Pacing & `429` Reliability Failover
 
-EdgeFetch is strictly an **honest, rate-limited HTTP fetcher** — never a stealth scraper or anti-bot bypass tool:
-- Always sends a transparent, configurable `User-Agent` (validated printable ASCII) and standard Go `net/http` TLS/HTTP2 stacks.
-- Enforces per-host `Burst = 1` serialization, `/robots.txt` `Allow`/`Disallow` + `Crawl-delay` caching, conditional `If-None-Match` / `If-Modified-Since` (`304 Not Modified`), and `Retry-After` cooldowns.
-- Never retries `403`, `429`, `503`, or `cf-mitigated` challenges.
+EdgeFetch is an **honest, rate-limited HTTP fetcher** — never a stealth scraper or anti-bot bypass tool:
+- **Honest Identity & Standard TLS:** Always sends a transparent, configurable `User-Agent` (validated printable ASCII) and standard Go `net/http` TLS/HTTP2 stacks; never solves CAPTCHAs or spoofs browser fingerprints.
+- **Cluster-Wide Per-Host Serialization & RFC 9309 `robots.txt`:** `AgentHubDO` groups same-host URLs within a batch onto a single node and enforces `pauseMs` across sequential dispatches so multiple nodes never burst the same origin concurrently. Both Go nodes and the Cloudflare overflow tier enforce `/robots.txt` (`Allow`/`Disallow` longest-match, `Crawl-delay`, and RFC 9309 §2.3.1.4 complete-disallow when `/robots.txt` is unreachable or returns `429`/`5xx`).
+- **Refusals vs. Shared-Egress `429` Reliability Buffer:**
+  - `403`, `503`, and anti-bot challenges (`cf-mitigated`) **stop immediately** with zero retries on the node or across the cluster.
+  - Individual Go nodes never retry `429` locally. In `target=auto` mode, if an egress IP receives HTTP `429` (common on shared CGNAT/ISP or multi-tenant CDN edges), `AgentHubDO` places `(host, siteId)` into SQLite cooldown (honoring `Retry-After`) and fails over across remaining healthy nodes — and finally to Cloudflare overflow (while still honoring per-host `pauseMs` and `robots.txt`) — as an explicit reliability buffer for scheduled feed syncs. Pin `?target=agent&site=<id>` whenever single-IP non-failover behavior is desired.
 
 ## License
 

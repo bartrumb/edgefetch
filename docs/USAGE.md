@@ -45,10 +45,10 @@ sequenceDiagram
     Hub-->>Caller: 200 OK (x-crawler-via: agent:site-arm64) + OTel Span & Logs
 ```
 
-### LRU Load-Balancing + 429-Only Cloudflare Overflow
-- **Even Load-Balancing Across Remote Nodes (Tier 1 Primary):** `AgentHubDO` orders connected remote nodes (`site-arm64`, `site-win-vm`, `site-x86`) by `lastJobAt` ascending (Least-Recently-Used), rotating sequential requests evenly across all sites and sharding multi-URL batches in parallel across all healthy sites.
-- **Per-Site `429` Cooldowns + Peer Failover:** If one remote node receives HTTP `429`, `AgentHubDO` places `(host, siteId)` into cooldown in SQLite (`site_cooldowns`, honoring `Retry-After` or defaulting to 5 minutes) and retries across remaining non-429 remote nodes first.
-- **Cloudflare Overflow ONLY on `429` (Tier 2 Fallback):** Cloudflare egress (`CrawlerContainer` or Worker `fetch`) stays asleep during normal operation and is invoked in `target=auto` **only** if remote nodes hit HTTP `429` (or if zero remote nodes are connected). Responses like `200`, `304`, `403`, `404`, `503`, and `cf-mitigated` challenges never wake Cloudflare.
+### LRU Load-Balancing, Cluster-Wide Pacing & `429`-Only Cloudflare Overflow
+- **Same-Host Grouping + Multi-Host Sharding (Tier 1 Primary):** `AgentHubDO` orders connected remote nodes (`site-arm64`, `site-win-vm`, `site-x86`) by `lastJobAt` ascending (Least-Recently-Used). Within a batch, all URLs for the **same origin host** stay on a single node (preserving per-host `PauseMs + PauseJitterMs`), while distinct hosts shard in parallel across nodes and back-to-back calls to the same host honor `pauseMs` across nodes.
+- **Per-Site `429` Cooldowns + Peer Failover:** Each Go node never retries `429` locally. At the Hub coordinator, if a remote node receives HTTP `429` (`outcome !== "challenge"`), `AgentHubDO` places `(host, siteId)` into cooldown in SQLite (`site_cooldowns`, honoring `Retry-After` or defaulting to 5 minutes) and fails over across remaining non-429 remote nodes as a reliability buffer against shared ISP/CDN rate limits.
+- **Cloudflare Overflow ONLY on `429` (Tier 2 Fallback):** Cloudflare egress (`CrawlerContainer` or Worker `cloudflareOverflowFetch`, enforcing `pauseMs` and `/robots.txt`) stays asleep during normal operation and is invoked in `target=auto` **only** if remote nodes hit HTTP `429` (or if zero remote nodes are connected). Responses like `200`, `304`, `403`, `404`, `503`, and `cf-mitigated` challenges never wake Cloudflare or retry across nodes.
 
 ---
 
@@ -78,7 +78,7 @@ curl -X POST "https://<your-hub>.workers.dev/fetch?site=site-arm64" \
     "maxSeconds": 60,
     "options": {
       "includeBody": true,
-      "robots": true,
+      "respectRobots": true,
       "pauseMs": 2000,
       "pauseJitterMs": 1000,
       "gapMs": 2000,
@@ -102,9 +102,9 @@ curl -X POST "https://<your-hub>.workers.dev/fetch?site=site-arm64" \
 | `requests[].kind` | `"feed"` \| `"page"` | `"feed"` sends `Accept: application/json` and validates JSON structure; `"page"` sends `Accept: text/html,application/xhtml+xml`. |
 | `requests[].ifNoneMatch` / `ifModifiedSince` | optional | Conditional `304 Not Modified` headers — saves bandwidth when upstream content hasn't changed. |
 | `options.includeBody` | `false` | Set `true` to return the response UTF-8 body string alongside status/headers/timing. |
-| `options.robots` | `false` (`true` via MCP/Admin) | Fetches & caches `/robots.txt` per host for 24h (`Allow`/`Disallow` longest-match + `Crawl-delay`). |
+| `options.respectRobots` | `false` (`true` via MCP/Admin; alias `robots` also accepted) | Fetches & caches `/robots.txt` per host for 24h (`Allow`/`Disallow` longest-match + `Crawl-delay`, assuming complete disallow per RFC 9309 §2.3.1.4 if `/robots.txt` is unreachable or returns `429`/`5xx`). |
 | `options.maxBytes` | `8 MiB` (max `16 MiB`) | Streaming body cap via `io.LimitReader(maxBytes + 1)`. Oversized responses stop immediately with `truncated: true`. |
-| `options.retries` | `0` (max `3`) | Retries **only** transport/500/502/504 errors with exponential jitter. `403`, `429`, `503`, and challenges are **never** retried. |
+| `options.retries` | `0` (max `3`) | Retries **only** transport/500/502/504 errors on the active node with exponential jitter. `403`, `429`, `503`, and challenges are **never** retried on the node (in `target=auto`, HTTP `429` triggers Hub-level site cooldown + peer/Cloudflare failover). |
 
 ---
 

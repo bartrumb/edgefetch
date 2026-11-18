@@ -110,14 +110,18 @@ curl -X POST "https://<your-hub>.workers.dev/fetch?site=site-arm64" \
 
 ## 4. Built-in Web Control Center (`/admin`)
 
+<p align="center">
+  <img src="assets/admin-console.jpg" alt="EdgeFetch /admin Control Center" width="880">
+</p>
+
 Open `https://<your-hub>.workers.dev/admin` in any browser and sign in with your `CALLER_TOKEN`:
 
 - **Session Security:** Uses an 8-hour HMAC-SHA256 `HttpOnly; Secure; SameSite=Lax` cookie, per-session CSRF token (`x-csrf-token`), strict CSP (`frame-ancestors 'none'`), and SQLite brute-force rate limiting (`5` failures / `5m` -> `429`).
 - **Capabilities:**
-  1. **Live Standby Fleet Cards:** Real-time connected sites, CPU architecture (`amd64` / `arm64`), uptime, last job time, and `jobsOk` / `jobsErr` counters (auto-refreshing every 10s).
-  2. **Interactive Crawl & Tuning Runner:** Test any `https://` URL across `feed`/`page`, pin a specific site, tune `pauseMs` / `pauseJitterMs` / `robots`, and inspect a visual **DNS / TCP / TLS / TTFB** waterfall bar + JSON reply.
-  3. **15-Minute Host-Sticky Affinity Table:** View every currently pinned origin domain (`host -> siteId`, remaining TTL) and clear pins with one click.
-  4. **Active OAuth 2.1 MCP Grants:** Inspect connected Claude Code / MCP clients and revoke any session immediately.
+  1. **KPI Strip & Live System Activity / Crawl Log:** 300-event SQLite ring buffer filterable by `Crawls`, `MCP`, `Agents`, `OAuth`, and `Warn / Err`, plus avg TTFB and HTTP/2 connection-reuse telemetry (hibernation-friendly 15s polling).
+  2. **Connected Remote Fleet Cards:** Real-time connected sites, CPU architecture (`amd64` / `arm64`), uptime, last job time, `jobsOk` / `jobsErr` counters, and 1-click `+ Add HAOS Node` / `Deploy Hub on Cloudflare` buttons.
+  3. **Interactive Crawl & Tuning Runner:** Test any `https://` URL across `feed`/`page`, pin a specific site, tune `pauseMs` / `pauseJitterMs` / `robots`, and inspect a visual **DNS / TCP / TLS / TTFB** waterfall bar + JSON reply.
+  4. **Remote Site 429 Cooldowns & Active OAuth 2.1 MCP Grants:** Inspect any per-site `429` cooldowns (`host -> siteId`, remaining TTL) alongside active MCP clients (`owner_token` and OAuth 2.1 grants) with 1-click session revocation.
 
 ---
 

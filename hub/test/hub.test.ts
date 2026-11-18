@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { ACTIVITY_SQLITE_SCHEMA, buildCrawlActivityEvents, createSqliteActivityStore } from '../src/activity-log.ts';
+import { handleAdminRoute } from '../src/admin.ts';
 import {
   AgentHubEngine,
   DEFAULT_429_NO_HEADER_WAIT_MS,
@@ -11,8 +14,19 @@ import {
   type CooldownStore,
   type HubSocketLike,
 } from '../src/agent-hub.ts';
+import { authorizeAgent } from '../src/auth.ts';
 import { handleMcpRequest, type McpServerDeps } from '../src/mcp.ts';
-import type { OAuthStore } from '../src/oauth.ts';
+import {
+  ADMIN_COOKIE_NAME,
+  OAUTH_SQLITE_SCHEMA,
+  createAdminSessionValue,
+  createSqliteOAuthStore,
+  handleOAuthRoute,
+  normalizeScopes,
+  sha256Base64Url,
+  type OAuthStore,
+  type SqlStorageLike,
+} from '../src/oauth.ts';
 import {
   cloudflareOverflowFetch,
   encodeBodyForWire,
@@ -576,4 +590,271 @@ test('H1, H2, H3: serial 1-job-per-socket queue + synced deadlines, fast failJob
   if (!nearOut.ok) {
     assert.equal(nearOut.status, 413);
   }
+});
+
+test('H-S1, H-S2, H-S3, H-S5: OAuth registration/redirect/scope/replay/lockout security + AGENT_TOKEN site isolation + query redaction', async () => {
+  const OWNER = 'test-owner-secret-0123456789abcdef';
+  const db = new DatabaseSync(':memory:');
+  db.exec(OAUTH_SQLITE_SCHEMA + ACTIVITY_SQLITE_SCHEMA);
+  const sql: SqlStorageLike = {
+    exec<T = Record<string, unknown>>(q: string, ...b: unknown[]) {
+      const s = db.prepare(q);
+      const isSel = /^\s*select/i.test(q);
+      const rows = isSel ? s.all(...(b as never[])) : (s.run(...(b as never[])), []);
+      return { toArray: () => rows as T[] };
+    },
+  };
+  const store = createSqliteOAuthStore(sql);
+  const activity = createSqliteActivityStore(sql);
+  const origin = 'https://hub.example.com';
+
+  const callOAuth = (path: string, init: RequestInit = {}, allowlist?: string[]) => {
+    const req = new Request(origin + path, { redirect: 'manual', ...init });
+    return handleOAuthRoute(req, new URL(req.url), {
+      store,
+      ownerSecret: OWNER,
+      serviceName: 'Hub',
+      ...(allowlist ? { redirectAllowlist: allowlist } : {}),
+      onEvent: (e) => activity.recordEvent(e as never),
+    }) as Promise<Response>;
+  };
+  const form = (o: Record<string, string>, ip = '9.9.9.9', extraHeaders: Record<string, string> = {}) => ({
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', 'cf-connecting-ip': ip, ...extraHeaders },
+    body: new URLSearchParams(o).toString(),
+  });
+
+  // ── H-S1: Sentinel security event & granted client survive 600 anonymous registrations + IP rate limiting ──
+  activity.recordEvent({ level: 'warn', category: 'oauth', event: 'SENTINEL', summary: 'incident evidence' });
+
+  const legitRes = await callOAuth('/oauth/register', {
+    method: 'POST',
+    headers: { 'cf-connecting-ip': '198.51.100.1' },
+    body: JSON.stringify({ client_name: 'Legit CLI', redirect_uris: ['http://localhost/cb'] }),
+  });
+  assert.equal(legitRes.status, 201);
+  const legit = (await legitRes.json()) as { client_id: string };
+
+  // Issue an active grant to `legit` so it is a granted client.
+  await store.putTokenPair({
+    grantId: 'grant_legit_1',
+    accessHash: await sha256Base64Url('efa_legit_access'),
+    refreshHash: await sha256Base64Url('efr_legit_refresh'),
+    clientId: legit.client_id,
+    clientName: 'Legit CLI',
+    scopes: ['crawl:read'],
+    resource: `${origin}/mcp`,
+    createdAt: Date.now(),
+    accessExpiresAt: Date.now() + 3_600_000,
+    refreshExpiresAt: Date.now() + 86_400_000,
+  });
+
+  // Same IP flooding /oauth/register hits 429 rate limit.
+  let sawReg429 = false;
+  for (let i = 0; i < 30; i++) {
+    const r = await callOAuth('/oauth/register', {
+      method: 'POST',
+      headers: { 'cf-connecting-ip': '203.0.113.99' },
+      body: JSON.stringify({ client_name: `flood-${i}`, redirect_uris: ['http://localhost/cb'] }),
+    });
+    if (r.status === 429) sawReg429 = true;
+  }
+  assert.equal(sawReg429, true, 'H-S1: anonymous /oauth/register flood from one IP must be rate-limited');
+
+  // Even across 600 distinct source IPs, SENTINEL event and granted `legit` client remain intact!
+  for (let i = 0; i < 600; i++) {
+    await callOAuth('/oauth/register', {
+      method: 'POST',
+      headers: { 'cf-connecting-ip': `10.99.${Math.floor(i / 250)}.${(i % 250) + 1}` },
+      body: JSON.stringify({ client_name: `anon-${i}`, redirect_uris: ['http://127.0.0.1/cb'] }),
+    });
+  }
+  const sentinelRow = db.prepare("SELECT COUNT(*) AS c FROM hub_events WHERE event = 'SENTINEL'").get() as { c: number };
+  assert.equal(sentinelRow.c, 1, 'H-S1: SENTINEL warn event must survive 600 anonymous client registrations');
+  assert.notEqual(await store.getClient(legit.client_id), null, 'H-S1: client with active grant must never be evicted');
+
+  // ── H-S2: Non-loopback redirects blocked unless allowlisted; external consent requires CALLER_TOKEN; bogus scope -> invalid_scope ──
+  const unallowlistedExt = await callOAuth('/oauth/register', {
+    method: 'POST',
+    headers: { 'cf-connecting-ip': '198.51.100.2' },
+    body: JSON.stringify({ client_name: 'Claude Code', redirect_uris: ['https://evil.example/cb'] }),
+  });
+  assert.equal(unallowlistedExt.status, 400, 'H-S2: non-loopback redirect_uri must be rejected when not in allowlist');
+
+  assert.deepEqual(normalizeScopes('bogus'), [], 'H-S2: unknown scope must not silently grant all scopes');
+
+  const extRegRes = await callOAuth(
+    '/oauth/register',
+    {
+      method: 'POST',
+      headers: { 'cf-connecting-ip': '198.51.100.3' },
+      body: JSON.stringify({ client_name: 'Claude Code', redirect_uris: ['https://partner.example/cb'] }),
+    },
+    ['partner.example'],
+  );
+  assert.equal(extRegRes.status, 201);
+  const extClient = (await extRegRes.json()) as { client_id: string };
+
+  const verifier = 'v'.repeat(50);
+  const challenge = await sha256Base64Url(verifier);
+
+  // Unknown scope on /oauth/authorize returns invalid_scope redirect.
+  const badScopeRes = await callOAuth(
+    `/oauth/authorize?response_type=code&client_id=${extClient.client_id}&redirect_uri=${encodeURIComponent('https://partner.example/cb')}&code_challenge=${challenge}&code_challenge_method=S256&scope=bogus`,
+    {},
+    ['partner.example'],
+  );
+  assert.equal(badScopeRes.status, 302);
+  assert.equal(new URL(badScopeRes.headers.get('location')!).searchParams.get('error'), 'invalid_scope');
+
+  const adm = await createAdminSessionValue(OWNER);
+  const page = await callOAuth(
+    `/oauth/authorize?response_type=code&client_id=${extClient.client_id}&redirect_uri=${encodeURIComponent('https://partner.example/cb')}&code_challenge=${challenge}&code_challenge_method=S256&scope=crawl:read`,
+    { headers: { cookie: `${ADMIN_COOKIE_NAME}=${adm.value}` } },
+    ['partner.example'],
+  );
+  const html = await page.text();
+  assert.match(html, /self-reported/i, 'H-S2: consent screen must mark client_name as unverified/self-reported');
+  const sealed = /name="sealed" value="([^"]+)"/.exec(html)![1]!;
+  const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1]!;
+
+  // Approving external redirect with ONLY admin session cookie (no owner_token) MUST fail 401!
+  const cookieOnlyApprove = await callOAuth(
+    '/oauth/authorize',
+    form({ sealed, csrf, decision: 'approve' }, '198.51.100.4', {
+      cookie: `ef_oauth_csrf=${csrf}; ${ADMIN_COOKIE_NAME}=${adm.value}`,
+    }),
+    ['partner.example'],
+  );
+  assert.equal(cookieOnlyApprove.status, 401, 'H-S2: external redirect consent must require explicit CALLER_TOKEN even with admin cookie');
+
+  // Approving with explicit owner_token succeeds!
+  const validApprove = await callOAuth(
+    '/oauth/authorize',
+    form({ sealed, csrf, decision: 'approve', owner_token: OWNER }, '198.51.100.4', {
+      cookie: `ef_oauth_csrf=${csrf}; ${ADMIN_COOKIE_NAME}=${adm.value}`,
+    }),
+    ['partner.example'],
+  );
+  assert.equal(validApprove.status, 302);
+  const authCode = new URL(validApprove.headers.get('location')!).searchParams.get('code')!;
+
+  // ── H-S3: client_id + redirect_uri required; refresh reuse revokes entire grant; wrong client_id doesn't burn grant; atomic rotation ──
+  const missingClientToken = await callOAuth('/oauth/token', form({ grant_type: 'authorization_code', code: authCode, code_verifier: verifier }));
+  assert.equal(missingClientToken.status, 400, 'H-S3: authorization_code exchange without client_id + redirect_uri must fail');
+
+  // Mint fresh code since authorization codes are single-use or unconsumed on missing params.
+  const validApprove2 = await callOAuth(
+    '/oauth/authorize',
+    form({ sealed, csrf, decision: 'approve', owner_token: OWNER }, '198.51.100.4', {
+      cookie: `ef_oauth_csrf=${csrf}; ${ADMIN_COOKIE_NAME}=${adm.value}`,
+    }),
+    ['partner.example'],
+  );
+  const code2 = new URL(validApprove2.headers.get('location')!).searchParams.get('code')!;
+  const tokRes = await callOAuth(
+    '/oauth/token',
+    form({
+      grant_type: 'authorization_code',
+      code: code2,
+      code_verifier: verifier,
+      client_id: extClient.client_id,
+      redirect_uri: 'https://partner.example/cb',
+    }),
+  );
+  assert.equal(tokRes.status, 200);
+  const tokJson = (await tokRes.json()) as { access_token: string; refresh_token: string };
+
+  // Refresh without client_id must be rejected without burning the grant.
+  const noCidRefresh = await callOAuth('/oauth/token', form({ grant_type: 'refresh_token', refresh_token: tokJson.refresh_token }));
+  assert.equal(noCidRefresh.status, 400);
+
+  // Refresh with wrong client_id must be rejected WITHOUT burning the grant!
+  const wrongCidRefresh = await callOAuth(
+    '/oauth/token',
+    form({ grant_type: 'refresh_token', refresh_token: tokJson.refresh_token, client_id: 'mcp_wrong_client' }),
+  );
+  assert.equal(wrongCidRefresh.status, 400);
+  assert.equal(
+    (await store.listGrants(Date.now())).filter((g) => g.clientId === extClient.client_id).length,
+    1,
+    'H-S3: wrong client_id must not burn legitimate grant',
+  );
+
+  // Thief rotates stolen refresh token first; victim replays old refresh token -> ENTIRE grant is revoked immediately!
+  const thiefRes = await callOAuth(
+    '/oauth/token',
+    form({ grant_type: 'refresh_token', refresh_token: tokJson.refresh_token, client_id: extClient.client_id }),
+  );
+  assert.equal(thiefRes.status, 200);
+  const thiefJson = (await thiefRes.json()) as { access_token: string; refresh_token: string };
+
+  const replayRes = await callOAuth(
+    '/oauth/token',
+    form({ grant_type: 'refresh_token', refresh_token: tokJson.refresh_token, client_id: extClient.client_id }),
+  );
+  assert.equal(replayRes.status, 400);
+  assert.equal(
+    await store.getAccessToken(await sha256Base64Url(thiefJson.access_token), Date.now()),
+    null,
+    'H-S3: replay of consumed refresh token must immediately revoke thief access token too',
+  );
+  const thiefAgain = await callOAuth(
+    '/oauth/token',
+    form({ grant_type: 'refresh_token', refresh_token: thiefJson.refresh_token, client_id: extClient.client_id }),
+  );
+  assert.equal(thiefAgain.status, 400, 'H-S3: thief refresh token must also be revoked after replay detection');
+
+  // ── H-S5: Lockout checked BEFORE owner token; auth_failures bounded; AGENT_TOKEN cannot claim mapped site; query strings stripped ──
+  const adminDeps = {
+    serviceName: 'Hub',
+    mcpSlug: 'edgefetch',
+    ownerSecret: OWNER,
+    oauthStore: store,
+    allowedTargets: ['auto' as const],
+    defaultTarget: 'auto' as const,
+    getState: async () => ({ connected: 0, distinctPublicIps: 0, agents: [], affinities: [], grants: [], mcpClients: [], events: [] }),
+    clearAffinities: async () => undefined,
+    revokeGrant: async () => false,
+    executeFetch: async () => ({ status: 200, via: 'agent:s1', bodyText: '{}' }),
+  };
+  const login = async (tok: string, ip = '7.7.7.7') => {
+    const r = new Request(origin + '/admin/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'cf-connecting-ip': ip },
+      body: 'token=' + encodeURIComponent(tok),
+    });
+    return (await handleAdminRoute(r, new URL(r.url), adminDeps))!.status;
+  };
+  for (let i = 0; i < 6; i++) await login(`wrong-${i}`);
+  assert.equal(await login(OWNER), 429, 'H-S5: locked-out IP must receive 429 BEFORE checking owner token');
+
+  for (let i = 0; i < 200; i++) await login('wrong', `2001:db8::${i.toString(16)}`);
+  const failureRows = (db.prepare('SELECT COUNT(*) AS c FROM auth_failures').get() as { c: number }).c;
+  assert.ok(failureRows <= 128, `H-S5: auth_failures table must be bounded, got ${failureRows} rows`);
+
+  // Shared AGENT_TOKEN cannot claim a siteId mapped in AGENT_TOKENS.
+  const site1Tok = 's1-token-0123456789abcdefghij';
+  const sharedTok = 'shared-token-0123456789abcdefg';
+  const spoofReq = new Request('https://hub.example.com/agent/ws', {
+    headers: { authorization: `Bearer ${sharedTok}`, 'x-agent-site': 'site-1' },
+  });
+  assert.deepEqual(
+    authorizeAgent(spoofReq, { AGENT_TOKENS: JSON.stringify({ 'site-1': site1Tok }), AGENT_TOKEN: sharedTok }),
+    { ok: false },
+    'H-S5: shared AGENT_TOKEN must not claim a siteId configured in AGENT_TOKENS',
+  );
+
+  // Query strings stripped from crawl activity events & MCP tool call logs.
+  const crawlEvs = buildCrawlActivityEvents({
+    source: 'rest',
+    target: 'auto',
+    via: 'agent:s1',
+    httpStatus: 200,
+    replyText: JSON.stringify({
+      results: [{ id: '1', url: 'https://store.example.com/products?api_key=TOP_SECRET_123#frag', status: 200, outcome: 'ok' }],
+    }),
+  });
+  assert.equal(crawlEvs[0]?.summary.includes('TOP_SECRET_123'), false, 'H-S5: activity summary must strip URL query string');
+  assert.equal(String(crawlEvs[0]?.details?.url ?? '').includes('TOP_SECRET_123'), false, 'H-S5: activity details.url must strip query string');
 });

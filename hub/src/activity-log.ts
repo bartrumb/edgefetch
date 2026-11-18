@@ -11,6 +11,18 @@ export type ActivityLevel = 'info' | 'warn' | 'error';
 export type ActivityCategory = 'crawl' | 'mcp' | 'agent' | 'oauth' | 'failover';
 export type EventDetailMap = Record<string, string | number | boolean | null>;
 
+export function redactUrlForLog(rawUrl: string | undefined | null): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  try {
+    const u = new URL(trimmed);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return trimmed.split(/[?#]/)[0]?.slice(0, 200) ?? '';
+  }
+}
+
 export function sanitizeDetails(raw?: Record<string, unknown>): EventDetailMap {
   const out: EventDetailMap = {};
   if (!raw) return out;
@@ -68,6 +80,8 @@ export interface ActivityStore {
 }
 
 const MAX_RING_EVENTS = 300;
+const MAX_INFO_RING_EVENTS = 200;
+const MAX_SECURITY_RING_EVENTS = 150;
 
 export const ACTIVITY_SQLITE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS hub_events (
@@ -105,7 +119,26 @@ export function createMemoryActivityStore(): ActivityStore {
         summary: input.summary.slice(0, 320),
         details: { ...(input.details ?? {}) },
       });
-      if (events.length > MAX_RING_EVENTS) events.length = MAX_RING_EVENTS;
+      // Partition pruning so high-volume info events never evict warn/error security events (H-S1).
+      let infoCount = 0;
+      let secCount = 0;
+      for (let i = 0; i < events.length; ) {
+        const isSec = events[i]!.level === 'warn' || events[i]!.level === 'error';
+        if (isSec) {
+          secCount++;
+          if (secCount > MAX_SECURITY_RING_EVENTS) {
+            events.splice(i, 1);
+            continue;
+          }
+        } else {
+          infoCount++;
+          if (infoCount > MAX_INFO_RING_EVENTS) {
+            events.splice(i, 1);
+            continue;
+          }
+        }
+        i++;
+      }
     },
     listEvents(limit = 120) {
       return events.slice(0, Math.min(MAX_RING_EVENTS, Math.max(1, limit)));
@@ -144,11 +177,21 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
         input.summary.slice(0, 320),
         JSON.stringify(input.details ?? {}).slice(0, 4096),
       );
-      sql.exec(
-        `DELETE FROM hub_events
-         WHERE id NOT IN (SELECT id FROM hub_events ORDER BY id DESC LIMIT ?)`,
-        MAX_RING_EVENTS,
-      );
+      if (input.level === 'warn' || input.level === 'error') {
+        sql.exec(
+          `DELETE FROM hub_events
+           WHERE level IN ('warn', 'error')
+             AND id NOT IN (SELECT id FROM hub_events WHERE level IN ('warn', 'error') ORDER BY id DESC LIMIT ?)`,
+          MAX_SECURITY_RING_EVENTS,
+        );
+      } else {
+        sql.exec(
+          `DELETE FROM hub_events
+           WHERE level = 'info'
+             AND id NOT IN (SELECT id FROM hub_events WHERE level = 'info' ORDER BY id DESC LIMIT ?)`,
+          MAX_INFO_RING_EVENTS,
+        );
+      }
     },
     listEvents(limit = 120) {
       const safeLimit = Math.min(MAX_RING_EVENTS, Math.max(1, Math.floor(limit)));
@@ -290,7 +333,8 @@ export function buildCrawlActivityEvents(params: {
           ? 'error'
           : 'info';
     const tm = r.timing ?? {};
-    const urlShort = (r.url ?? '').slice(0, 140);
+    const safeUrl = redactUrlForLog(r.url);
+    const urlShort = safeUrl.slice(0, 140);
     return {
       ts,
       level,
@@ -302,7 +346,7 @@ export function buildCrawlActivityEvents(params: {
         target: params.target,
         via: params.via,
         id: r.id,
-        url: r.url,
+        url: safeUrl,
         kind: r.kind,
         status,
         outcome,

@@ -8,7 +8,7 @@
  * - Enforces `Origin` validation against DNS-rebinding / cross-origin attacks and per-tool OAuth scopes
  *   (`crawl:read` vs `crawl:fetch`).
  */
-import { sanitizeDetails, type ActivityStore } from './activity-log';
+import { redactUrlForLog, sanitizeDetails, type ActivityStore } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { SITE_ID_PATTERN } from './auth';
 import { authorizeMcpRequest, type OAuthStore } from './oauth';
@@ -400,12 +400,21 @@ async function dispatchRpcMessage(
           : {};
       if (!toolName) return jsonRpcError(id, -32602, 'Missing tool name');
       const out = await handleToolCall(toolName, rawArgs, scopes, principal, deps);
+      const safeLogArgs: Record<string, unknown> = {};
+      if (typeof rawArgs.url === 'string') safeLogArgs.url = redactUrlForLog(rawArgs.url);
+      if (Array.isArray(rawArgs.urls)) {
+        safeLogArgs.urlCount = rawArgs.urls.length;
+        safeLogArgs.urls = rawArgs.urls.slice(0, 5).map((u) => (typeof u === 'string' ? redactUrlForLog(u) : ''));
+      }
+      if (typeof rawArgs.kind === 'string') safeLogArgs.kind = rawArgs.kind;
+      if (typeof rawArgs.target === 'string') safeLogArgs.target = rawArgs.target;
+      if (typeof rawArgs.site === 'string') safeLogArgs.site = rawArgs.site;
       await deps.activity?.recordEvent({
         level: out.isError ? 'warn' : 'info',
         category: 'mcp',
         event: 'mcp_tool_call',
         summary: `MCP ${toolName} called by ${principal} (${Date.now() - startedAt}ms)`,
-        details: sanitizeDetails({ principal, authType, toolName, args: rawArgs, durationMs: Date.now() - startedAt, isError: Boolean(out.isError) }),
+        details: sanitizeDetails({ principal, authType, toolName, args: safeLogArgs, durationMs: Date.now() - startedAt, isError: Boolean(out.isError) }),
       });
       return jsonRpcResult(id, out);
     }

@@ -48,6 +48,8 @@ import {
   type OAuthGrantSummary,
   type OAuthStore,
   type OAuthTokenRecord,
+  type RotateRefreshParams,
+  type RotateRefreshResult,
   type SqlStorageLike,
 } from './oauth';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
@@ -59,6 +61,7 @@ interface Env {
   AGENT_TOKENS?: string;
   USER_AGENT?: string;
   ROBOTS_BYPASS_HOSTS?: string;
+  OAUTH_REDIRECT_ALLOWLIST?: string;
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -308,6 +311,9 @@ export class AgentHubDO extends DurableObject<Env> {
   async oauthConsumeRefreshToken(h: string, now: number): Promise<OAuthTokenRecord | null> {
     return await this.oauth.consumeRefreshToken(h, now);
   }
+  async oauthRotateRefreshToken(params: RotateRefreshParams): Promise<RotateRefreshResult> {
+    return await this.oauth.rotateRefreshToken(params);
+  }
   async oauthListGrants(now: number): Promise<OAuthGrantSummary[]> {
     return await this.oauth.listGrants(now);
   }
@@ -316,6 +322,13 @@ export class AgentHubDO extends DurableObject<Env> {
   }
   async oauthRevokeByTokenHash(h: string): Promise<void> {
     await this.oauth.revokeByTokenHash(h);
+  }
+  async oauthCheckAuthLockout(
+    bucket: string,
+    now: number,
+    maxFailures?: number,
+  ): Promise<{ allowed: boolean; retryAfterSec: number }> {
+    return await this.oauth.checkAuthLockout(bucket, now, maxFailures);
   }
   async oauthRecordAuthFailure(
     bucket: string,
@@ -385,9 +398,11 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
     putTokenPair: (p) => hub().oauthPutTokenPair(p),
     getAccessToken: (h, now) => hub().oauthGetAccessToken(h, now),
     consumeRefreshToken: (h, now) => hub().oauthConsumeRefreshToken(h, now),
+    rotateRefreshToken: (p) => hub().oauthRotateRefreshToken(p),
     listGrants: (now) => hub().oauthListGrants(now),
     revokeGrant: (id) => hub().oauthRevokeGrant(id),
     revokeByTokenHash: (h) => hub().oauthRevokeByTokenHash(h),
+    checkAuthLockout: (b, now, m) => hub().oauthCheckAuthLockout(b, now, m),
     recordAuthFailure: (b, now, w, m) => hub().oauthRecordAuthFailure(b, now, w, m),
     clearAuthFailures: (b) => hub().oauthClearAuthFailures(b),
   };
@@ -513,6 +528,7 @@ export default {
       store: oauthStore,
       ownerSecret: env.CALLER_TOKEN,
       serviceName: 'EdgeFetch Hub',
+      redirectAllowlist: parseHostAllowlist(env.OAUTH_REDIRECT_ALLOWLIST),
       onEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
     });
     if (oauthRes) return oauthRes;

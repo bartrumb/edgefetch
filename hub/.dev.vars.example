@@ -1,0 +1,4 @@
+# Required secrets prompted interactively by the "Deploy to Cloudflare" wizard (never commit real values):
+# Generate 32-byte hex tokens with: openssl rand -hex 32
+CALLER_TOKEN=
+AGENT_TOKENS={"site-1":"replace-with-32-char-random-secret"}

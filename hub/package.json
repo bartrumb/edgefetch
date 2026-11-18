@@ -1,11 +1,22 @@
 {
   "name": "edgefetch-hub",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
+  "description": "Cloudflare Hibernating WebSocket Durable Object coordinator, /admin Control Center, and Self-Hosted OAuth 2.1 /mcp server for EdgeFetch.",
   "scripts": {
     "type-check": "tsc --noEmit -p tsconfig.json",
     "deploy:dry": "wrangler deploy --dry-run -c wrangler.toml",
     "deploy": "wrangler deploy -c wrangler.toml"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CALLER_TOKEN": {
+        "description": "Owner/API secret (>= 24 random chars, e.g. `openssl rand -hex 32`) used to sign into /admin, authorize OAuth 2.1 /mcp grants, and authenticate POST /fetch."
+      },
+      "AGENT_TOKENS": {
+        "description": "JSON map of per-site edge worker secrets (>= 24 random chars each), e.g. {\"site-1\":\"<secret-1>\",\"site-2\":\"<secret-2>\"}."
+      }
+    }
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260804.1",

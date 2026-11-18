@@ -158,6 +158,10 @@ function renderDashboardHtml(params: {
     button.primary { background: #2563eb; border-color: #3b82f6; color: #fff; }
     button.primary:hover { background: #1d4ed8; }
     button.danger { background: #7f1d1d; border-color: #b91c1c; color: #fecaca; padding: 4px 10px; font-size: 0.76rem; }
+    a.btn-link { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; font-size: 0.78rem; font-weight: 600; padding: 5px 11px; border-radius: 7px; border: 1px solid #0284c7; background: #0369a1; color: #f0f9ff; }
+    a.btn-link:hover { background: #0284c7; }
+    a.btn-cf { border-color: #ea580c; background: #9a3412; color: #ffedd5; }
+    a.btn-cf:hover { background: #c2410c; }
     .tab-bar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .tab { padding: 4px 10px; font-size: 0.78rem; border-radius: 999px; background: #0f172a; border: 1px solid #334155; color: #94a3b8; cursor: pointer; }
     .tab.active { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
@@ -244,7 +248,14 @@ function renderDashboardHtml(params: {
     </section>
 
     <section class="card">
-      <h2><span>Connected Remote Fleet (<span id="site-count">0</span>)</span><span class="muted">Hibernation-friendly 15s poll</span></h2>
+      <h2>
+        <span>Connected Remote Fleet (<span id="site-count">0</span>)</span>
+        <span style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="muted">Hibernation-friendly 15s poll</span>
+          <a class="btn-link" href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch" target="_blank" rel="noopener noreferrer" title="1-click add EdgeFetch repository to your Home Assistant OS instance">+ Add HAOS Node</a>
+          <a class="btn-link btn-cf" href="https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub" target="_blank" rel="noopener noreferrer" title="1-click deploy an EdgeFetch Hub on Cloudflare Workers">Deploy Hub on Cloudflare</a>
+        </span>
+      </h2>
       <div id="fleet-grid" class="grid-3"><div class="muted">Loading connected agents...</div></div>
     </section>
 

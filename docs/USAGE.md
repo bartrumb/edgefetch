@@ -1,5 +1,15 @@
 # EdgeFetch Operations, C&C Protocol, Tuning, `/admin` & MCP Guide
 
+<p>
+  <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub">
+    <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" height="34">
+  </a>
+  &nbsp;
+  <a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch">
+    <img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" alt="Add EdgeFetch Repository to Home Assistant" height="34">
+  </a>
+</p>
+
 ## 1. Security Boundary: Hub vs. Edge Nodes
 
 EdgeFetch strictly separates **coordination/control** from **edge execution**:

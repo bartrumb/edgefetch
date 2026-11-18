@@ -3,7 +3,16 @@
 [![CI](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml/badge.svg)](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml)
 [![Go 1.22+](https://img.shields.io/badge/Go-1.22%2B%20(stdlib%20only)-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://github.com/bartrumb/edgefetch/blob/main/LICENSE)](LICENSE)
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub)
+
+<p>
+  <a href="https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub">
+    <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare" height="36">
+  </a>
+  &nbsp;
+  <a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch">
+    <img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" alt="Open your Home Assistant instance and show the add app repository dialog with EdgeFetch pre-filled." height="36">
+  </a>
+</p>
 
 **EdgeFetch** is a security-hardened, **zero-dependency Go HTTP/2 fetcher** and **outbound-only distributed standby worker** paired with a **Cloudflare Hibernating WebSocket Durable Object** coordinator (`hub/` — complete with a built-in `/admin` Control Center and self-hosted OAuth 2.1 `/mcp` server) and a **1-click Home Assistant OS Add-on**.
 
@@ -76,11 +85,15 @@ Measured on Linux `amd64` (12th Gen Intel Core i9-12900K, Go stdlib only):
 
 ---
 
-## Quickstart
+## Quickstart (1-Click Easy Buttons)
 
-### 1. Deploy the Cloudflare Hub (`hub/`)
+### 1. 1-Click Deploy the Cloudflare Hub (`hub/`)
 
-Deploy via the **[Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub)** button (or `.github/workflows/deploy-hub.yml` with `CLOUDFLARE_API_TOKEN`), or from your terminal:
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub)
+
+Clicking **Deploy to Cloudflare** clones `hub/`, provisions `AgentHubDO` (SQLite), and interactively prompts you in the Cloudflare dashboard for `CALLER_TOKEN` and `AGENT_TOKENS` (defined in [`hub/.dev.vars.example`](hub/.dev.vars.example) and [`hub/package.json`](hub/package.json)).
+
+Or deploy from your terminal (or `.github/workflows/deploy-hub.yml` with `CLOUDFLARE_API_TOKEN`):
 
 ```bash
 cd hub
@@ -93,7 +106,9 @@ npx wrangler secret put AGENT_TOKENS -c wrangler.toml
 
 ### 2. 1-Click Install on Home Assistant OS (`amd64` & `aarch64`)
 
-1. Open **Settings -> Add-ons -> Add-on Store -> `⋮` -> Repositories** and add `https://github.com/bartrumb/edgefetch`.
+[![Open your Home Assistant instance and show the add app repository dialog with EdgeFetch pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch)
+
+1. Click **Add Repository to My Home Assistant** above (or manually open **Settings -> Add-ons -> Add-on Store -> `⋮` -> Repositories** and add `https://github.com/bartrumb/edgefetch`).
 2. Install **EdgeFetch Cold-Standby Worker**, open **Configuration**, set `hub_url`, `agent_token`, `site_id`, and `user_agent`, and click **Start**.
 
 ### 3. Drive, Monitor & Tune After Setup (Full Reference in [`docs/USAGE.md`](docs/USAGE.md))

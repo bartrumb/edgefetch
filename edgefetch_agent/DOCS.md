@@ -11,9 +11,10 @@ An **outbound-only, zero-dependency Go HTTP/2 fetcher** that connects to your Cl
 
 ## 1-Click Installation in Home Assistant
 
-1. Go to **Settings -> Add-ons -> Add-on Store -> ⋮ (top right) -> Repositories**.
-2. Add `https://github.com/bartrumb/edgefetch`.
-3. Click **EdgeFetch Cold-Standby Worker -> Install**.
+[![Open your Home Assistant instance and show the add app repository dialog with EdgeFetch pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch)
+
+1. Click the **My Home Assistant** button above (or go to **Settings -> Add-ons -> Add-on Store -> ⋮ (top right) -> Repositories** and add `https://github.com/bartrumb/edgefetch`).
+2. Click **EdgeFetch Cold-Standby Worker -> Install**.
 4. Open **Configuration** and fill in:
    - `hub_url`: Your Cloudflare Worker URL (e.g., `https://your-edgefetch-hub.workers.dev`)
    - `agent_token`: Your per-site secret token (`>= 24` random characters)

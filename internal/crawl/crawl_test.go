@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/bartrumb/edgefetch/internal/classify"
+	"github.com/bartrumb/edgefetch/internal/politeness"
 )
 
 type recordedSleeps struct {
@@ -455,5 +456,40 @@ func TestBatchTotalBodyBudgetAndServerConcurrencyLimit(t *testing.T) {
 
 	if overflowResp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected HTTP 503 server_busy when >%d concurrent /fetch calls arrive, got %d", MaxConcurrentServerCalls, overflowResp.StatusCode)
+	}
+}
+
+func TestPermanentSSRFErrorNotRetriedAndBackoffHasQuarterFloor(t *testing.T) {
+	var dials atomic.Int32
+	tr := &http.Transport{
+		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			dials.Add(1)
+			return nil, politeness.CheckPublicPeerAddress("127.0.0.1:443")
+		},
+	}
+	c := NewCrawler(tr, PublicHTTPS, DefaultUserAgent, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.Sleep = func(context.Context, time.Duration) error { return nil }
+	c.SetRobotsBypassHosts([]string{"rebind.example.com"})
+	res := c.Run(context.Background(), []Request{
+		{ID: "ssrf", URL: "https://rebind.example.com/", Kind: classify.KindPage},
+	}, Options{Retries: 3, RespectRobots: Bool(false)})
+	if dials.Load() != 1 || res[0].Attempts != 1 {
+		t.Fatalf("A11 BUG: permanent SSRF refusal was retried %d times (attempts=%d), want 1", dials.Load(), res[0].Attempts)
+	}
+
+	// Verify backoff has a >= 25% floor even when Jitter returns 0.
+	c502, sleeps := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	c502.Jitter = func(time.Duration) time.Duration { return 0 }
+	_ = c502.Run(context.Background(), []Request{
+		{ID: "b1", URL: "http://backoff.test/", Kind: classify.KindPage},
+	}, Options{Retries: 1})
+	if len(sleeps.all) == 0 || sleeps.all[0] < 250*time.Millisecond {
+		t.Fatalf("A11 BUG: zero-jitter retry backoff slept %v, want >= 250ms floor", sleeps.all)
 	}
 }

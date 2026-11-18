@@ -29,6 +29,7 @@ import {
   readAgentReplyBody,
   routeFetchWithFailover,
   type AffinityPin,
+  type AffinityStore,
   type AgentAttachment,
   type AgentDispatchResult,
   type CompleteJobResult,
@@ -67,11 +68,14 @@ interface Env {
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const DEFAULT_UA = 'EdgeFetch/1.0 (+https://github.com/bartrumb/edgefetch)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
+const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
+const MAX_SQLITE_TRACKED_HOSTS = 512;
 
 export class AgentHubDO extends DurableObject<Env> {
   private readonly engine: AgentHubEngine;
   private readonly oauth: OAuthStore;
   private readonly activity: ActivityStore;
+  private alarmScheduled = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -88,9 +92,19 @@ export class AgentHubDO extends DurableObject<Env> {
           host TEXT PRIMARY KEY,
           next_allowed_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS host_affinities (
+          host TEXT PRIMARY KEY,
+          site_id TEXT NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
         ${OAUTH_SQLITE_SCHEMA}
         ${ACTIVITY_SQLITE_SCHEMA}
       `);
+      const existingAlarm = await this.ctx.storage.getAlarm();
+      if (existingAlarm === null) {
+        await this.ctx.storage.setAlarm(Date.now() + DAILY_CLEANUP_INTERVAL_MS);
+      }
+      this.alarmScheduled = true;
     });
 
     const cooldowns: CooldownStore = {
@@ -151,6 +165,8 @@ export class AgentHubDO extends DurableObject<Env> {
       },
       setNextAllowed: (host, nextAllowedAt) => {
         const key = host.toLowerCase();
+        const now = Date.now();
+        this.ctx.storage.sql.exec('DELETE FROM host_windows WHERE next_allowed_at <= ?', now);
         const rows = this.ctx.storage.sql
           .exec<{ next_allowed_at: number }>('SELECT next_allowed_at FROM host_windows WHERE host = ?', key)
           .toArray();
@@ -160,9 +176,53 @@ export class AgentHubDO extends DurableObject<Env> {
           key,
           nextAllowedAt,
         );
+        this.ctx.storage.sql.exec(
+          `DELETE FROM host_windows
+           WHERE host IN (SELECT host FROM host_windows ORDER BY next_allowed_at DESC LIMIT -1 OFFSET ?)`,
+          MAX_SQLITE_TRACKED_HOSTS,
+        );
       },
       clearAll: () => {
         this.ctx.storage.sql.exec('DELETE FROM host_windows');
+      },
+    };
+
+    const affinities: AffinityStore = {
+      getStickySite: (host, now) => {
+        const key = host.toLowerCase();
+        const row = this.ctx.storage.sql
+          .exec<{ site_id: string; expires_at: number }>('SELECT site_id, expires_at FROM host_affinities WHERE host = ?', key)
+          .toArray()[0];
+        if (!row) return null;
+        if (row.expires_at <= now) {
+          this.ctx.storage.sql.exec('DELETE FROM host_affinities WHERE host = ?', key);
+          return null;
+        }
+        return row.site_id;
+      },
+      setStickyHost: (host, siteId, expiresAt) => {
+        const key = host.toLowerCase();
+        this.ctx.storage.sql.exec('DELETE FROM host_affinities WHERE expires_at <= ?', Date.now());
+        this.ctx.storage.sql.exec(
+          'INSERT OR REPLACE INTO host_affinities (host, site_id, expires_at) VALUES (?, ?, ?)',
+          key,
+          siteId.toLowerCase(),
+          expiresAt,
+        );
+        this.ctx.storage.sql.exec(
+          `DELETE FROM host_affinities
+           WHERE host IN (SELECT host FROM host_affinities ORDER BY expires_at DESC LIMIT -1 OFFSET ?)`,
+          MAX_SQLITE_TRACKED_HOSTS,
+        );
+      },
+      deleteStickyHost: (host) => {
+        this.ctx.storage.sql.exec('DELETE FROM host_affinities WHERE host = ?', host.toLowerCase());
+      },
+      clearSite: (siteId) => {
+        this.ctx.storage.sql.exec('DELETE FROM host_affinities WHERE site_id = ?', siteId.toLowerCase());
+      },
+      clearAll: () => {
+        this.ctx.storage.sql.exec('DELETE FROM host_affinities');
       },
     };
 
@@ -170,9 +230,22 @@ export class AgentHubDO extends DurableObject<Env> {
       getSockets: (tag) => this.ctx.getWebSockets(tag) as unknown as HubSocketLike[],
       cooldowns,
       hostWindows,
+      affinities,
     });
     this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.activity = createSqliteActivityStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+  }
+
+  override async alarm(): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.sql.exec('DELETE FROM site_cooldowns WHERE expires_at <= ?', now);
+    this.ctx.storage.sql.exec('DELETE FROM host_windows WHERE next_allowed_at <= ?', now);
+    this.ctx.storage.sql.exec('DELETE FROM host_affinities WHERE expires_at <= ?', now);
+    this.ctx.storage.sql.exec('DELETE FROM oauth_codes WHERE expires_at <= ?', now);
+    this.ctx.storage.sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', now);
+    this.ctx.storage.sql.exec('DELETE FROM auth_failures WHERE reset_at <= ?', now);
+    await this.ctx.storage.setAlarm(now + DAILY_CLEANUP_INTERVAL_MS);
+    this.alarmScheduled = true;
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -491,117 +564,127 @@ export default {
         },
       );
 
-    if (request.method === 'GET' && url.pathname === '/health') {
-      return Response.json({ ok: true });
-    }
-    if (url.pathname === '/agent/ws') {
-      const auth = authorizeAgent(request, env);
-      if (!auth.ok) return Response.json({ error: 'unauthorized' }, { status: 401 });
-      const headers = new Headers(request.headers);
-      headers.set('x-verified-site', auth.siteId);
-      const clientIp = request.headers.get('cf-connecting-ip') ?? request.headers.get('x-forwarded-for');
-      if (clientIp) headers.set('x-verified-ip', clientIp);
-      return hub().fetch(new Request(request.url, { method: 'GET', headers }));
-    }
-    if (request.method === 'POST' && url.pathname === '/agent/reply') {
-      const auth = authorizeAgent(request, env);
-      if (!auth.ok) return Response.json({ error: 'unauthorized' }, { status: 401 });
-      const jobId = (request.headers.get('x-job-id') ?? '').trim();
-      const jobNonce = (request.headers.get('x-job-nonce') ?? '').trim();
-      if (!JOB_ID_RE.test(jobId) || !JOB_ID_RE.test(jobNonce)) return Response.json({ error: 'bad_job_headers' }, { status: 400 });
-      if (!(await hub().verifyPendingJob(jobId, jobNonce, auth.siteId))) {
-        return Response.json({ error: 'unknown_job' }, { status: 404 });
+    try {
+      if (request.method === 'GET' && url.pathname === '/health') {
+        return Response.json({ ok: true });
       }
-      const payload = await readAgentReplyBody(request);
-      if (!payload.ok) {
-        await hub().failJob(jobId, jobNonce, auth.siteId, payload.error, payload.error === 'too_large');
-        return Response.json({ error: payload.error }, { status: payload.status });
+      if (url.pathname === '/agent/ws') {
+        const auth = authorizeAgent(request, env);
+        if (!auth.ok) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        const headers = new Headers(request.headers);
+        headers.set('x-verified-site', auth.siteId);
+        const clientIp = request.headers.get('cf-connecting-ip') ?? request.headers.get('x-forwarded-for');
+        if (clientIp) headers.set('x-verified-ip', clientIp);
+        return await hub().fetch(new Request(request.url, { method: 'GET', headers }));
       }
-      const done = await hub().completeJob(jobId, jobNonce, auth.siteId, payload.text);
-      return Response.json({ ok: done.ok }, { status: done.status });
-    }
+      if (request.method === 'POST' && url.pathname === '/agent/reply') {
+        const auth = authorizeAgent(request, env);
+        if (!auth.ok) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        const jobId = (request.headers.get('x-job-id') ?? '').trim();
+        const jobNonce = (request.headers.get('x-job-nonce') ?? '').trim();
+        if (!JOB_ID_RE.test(jobId) || !JOB_ID_RE.test(jobNonce)) return Response.json({ error: 'bad_job_headers' }, { status: 400 });
+        if (!(await hub().verifyPendingJob(jobId, jobNonce, auth.siteId))) {
+          return Response.json({ error: 'unknown_job' }, { status: 404 });
+        }
+        const payload = await readAgentReplyBody(request);
+        if (!payload.ok) {
+          await hub().failJob(jobId, jobNonce, auth.siteId, payload.error, payload.error === 'too_large');
+          return Response.json({ error: payload.error }, { status: payload.status });
+        }
+        const done = await hub().completeJob(jobId, jobNonce, auth.siteId, payload.text);
+        return Response.json({ ok: done.ok }, { status: done.status });
+      }
 
-    const oauthStore = hubOAuthStore(hub);
-    const activity = hubActivityProxy(hub);
+      const oauthStore = hubOAuthStore(hub);
+      const activity = hubActivityProxy(hub);
 
-    const oauthRes = await handleOAuthRoute(request, url, {
-      store: oauthStore,
-      ownerSecret: env.CALLER_TOKEN,
-      serviceName: 'EdgeFetch Hub',
-      redirectAllowlist: parseHostAllowlist(env.OAUTH_REDIRECT_ALLOWLIST),
-      onEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
-    });
-    if (oauthRes) return oauthRes;
+      const oauthRes = await handleOAuthRoute(request, url, {
+        store: oauthStore,
+        ownerSecret: env.CALLER_TOKEN,
+        serviceName: 'EdgeFetch Hub',
+        redirectAllowlist: parseHostAllowlist(env.OAUTH_REDIRECT_ALLOWLIST),
+        onEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
+      });
+      if (oauthRes) return oauthRes;
 
-    if (url.pathname === '/mcp') {
-      return handleMcpRequest(request, url, {
-        serverName: 'edgefetch-hub',
-        serverVersion: '1.2.0',
+      if (url.pathname === '/mcp') {
+        return await handleMcpRequest(request, url, {
+          serverName: 'edgefetch-hub',
+          serverVersion: '1.2.0',
+          ownerSecret: env.CALLER_TOKEN,
+          oauthStore,
+          activity,
+          allowedTargets: ALLOWED_TARGETS,
+          defaultTarget: 'auto',
+          listFleet: async () => {
+            const state = await hub().getPortalState(Date.now());
+            return { connected: state.connected, agents: state.agents, affinities: state.affinities };
+          },
+          executeFetch: ({ target, site, body, principal }) =>
+            executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`),
+        });
+      }
+
+      const adminRes = await handleAdminRoute(request, url, {
+        serviceName: 'EdgeFetch Hub',
+        mcpSlug: 'edgefetch',
         ownerSecret: env.CALLER_TOKEN,
         oauthStore,
-        activity,
         allowedTargets: ALLOWED_TARGETS,
         defaultTarget: 'auto',
-        listFleet: async () => {
-          const state = await hub().getPortalState(Date.now());
-          return { connected: state.connected, agents: state.agents, affinities: state.affinities };
+        getState: () => hub().getPortalState(Date.now()),
+        clearAffinities: (siteId) => hub().clearAffinities(siteId),
+        clearEvents: () => hub().clearHubEvents(),
+        revokeGrant: async (grantId) => {
+          const revoked = await hub().oauthRevokeGrant(grantId);
+          if (revoked) {
+            await activity.recordEvent({
+              level: 'warn',
+              category: 'oauth',
+              event: 'oauth_grant_revoked',
+              summary: `Revoked OAuth 2.1 grant ${grantId} from /admin`,
+              details: { grantId },
+            });
+          }
+          return revoked;
         },
-        executeFetch: ({ target, site, body, principal }) =>
-          executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`),
+        executeFetch: ({ target, site, body }) => executeHubFetch(target, body, site, 'admin'),
       });
-    }
+      if (adminRes) return adminRes;
 
-    const adminRes = await handleAdminRoute(request, url, {
-      serviceName: 'EdgeFetch Hub',
-      mcpSlug: 'edgefetch',
-      ownerSecret: env.CALLER_TOKEN,
-      oauthStore,
-      allowedTargets: ALLOWED_TARGETS,
-      defaultTarget: 'auto',
-      getState: () => hub().getPortalState(Date.now()),
-      clearAffinities: (siteId) => hub().clearAffinities(siteId),
-      clearEvents: () => hub().clearHubEvents(),
-      revokeGrant: async (grantId) => {
-        const revoked = await hub().oauthRevokeGrant(grantId);
-        if (revoked) {
-          await activity.recordEvent({
-            level: 'warn',
-            category: 'oauth',
-            event: 'oauth_grant_revoked',
-            summary: `Revoked OAuth 2.1 grant ${grantId} from /admin`,
-            details: { grantId },
-          });
-        }
-        return revoked;
-      },
-      executeFetch: ({ target, site, body }) => executeHubFetch(target, body, site, 'admin'),
-    });
-    if (adminRes) return adminRes;
-
-    if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
-      return Response.json({ error: 'unauthorized' }, { status: 401 });
-    }
-    if (request.method === 'GET' && url.pathname === '/agents') {
-      return Response.json(await hub().listAgents());
-    }
-    if (request.method === 'POST' && url.pathname === '/fetch') {
-      const parsedTarget = parseFetchTarget(url);
-      if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
-      const body = await request.text();
-      if (new TextEncoder().encode(body).byteLength > MAX_CALL_UTF8_BYTES) {
-        return Response.json({ error: 'too_large' }, { status: 413 });
+      if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
+        return Response.json({ error: 'unauthorized' }, { status: 401 });
       }
-      const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest');
-      return new Response(out.bodyText, {
-        status: out.status,
-        headers: {
-          'content-type': 'application/json',
-          'x-crawler-via': out.via,
-          'cache-control': 'no-store',
-          ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+      if (request.method === 'GET' && url.pathname === '/agents') {
+        return Response.json(await hub().listAgents());
+      }
+      if (request.method === 'POST' && url.pathname === '/fetch') {
+        const parsedTarget = parseFetchTarget(url);
+        if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
+        const body = await request.text();
+        if (new TextEncoder().encode(body).byteLength > MAX_CALL_UTF8_BYTES) {
+          return Response.json({ error: 'too_large' }, { status: 413 });
+        }
+        const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest');
+        return new Response(out.bodyText, {
+          status: out.status,
+          headers: {
+            'content-type': 'application/json',
+            'x-crawler-via': out.via,
+            'cache-control': 'no-store',
+            ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+          },
+        });
+      }
+      return Response.json({ error: 'not_found' }, { status: 404 });
+    } catch (e) {
+      return Response.json(
+        {
+          error: 'hub_unavailable',
+          message: e instanceof Error ? e.message : 'Coordinator temporarily unavailable; please retry',
         },
-      });
+        { status: 503, headers: { 'cache-control': 'no-store' } },
+      );
     }
-    return Response.json({ error: 'not_found' }, { status: 404 });
   },
 };

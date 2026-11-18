@@ -2,6 +2,7 @@ package politeness
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -228,6 +229,31 @@ func TestSSRFGuardBlocksPrivateLoopbackCGNATAndIPv6TransitionRanges(t *testing.T
 	distressed := &RobotsEntry{Distressed: true}
 	if distressed.Allowed("/public") {
 		t.Fatal("RFC 9309: distressed/unreachable RobotsEntry must disallow all paths")
+	}
+}
+
+func TestRegistryBoundsTrackedHostsWithLRUEviction(t *testing.T) {
+	r := NewRegistry()
+	now := time.Unix(1_700_000_000, 0)
+	hotHost := "hot.example.com"
+	hotState := r.Get(hotHost, now)
+
+	for i := 0; i < 5000; i++ {
+		now = now.Add(time.Millisecond)
+		if i%100 == 0 {
+			// Refresh `hotHost` via Get so its lastSeen stays recent and survives LRU eviction!
+			if got := r.Get(hotHost, now); got != hotState {
+				t.Fatalf("A8 BUG: frequently accessed hot host was evicted at iteration %d", i)
+			}
+		}
+		r.Get(fmt.Sprintf("h%d.example.com", i), now)
+	}
+
+	if len(r.hosts) > MaxTrackedHosts {
+		t.Fatalf("A8 BUG: Registry grew to %d hosts, want <= %d (MaxTrackedHosts)", len(r.hosts), MaxTrackedHosts)
+	}
+	if got := r.Get(hotHost, now); got != hotState {
+		t.Fatal("A8 BUG: hot host did not survive LRU eviction")
 	}
 }
 

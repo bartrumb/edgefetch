@@ -33,6 +33,7 @@ const MIN_JOB_TIMEOUT_MS = 5_000;
 const MAX_JOB_TIMEOUT_MS = 300_000;
 const DEFAULT_CROSS_NODE_PAUSE_MS = 2_000;
 const MAX_TRACKED_HOSTS = 512;
+export const MAX_HOST_QUEUE_DEPTH = 16;
 const utf8Encoder = new TextEncoder();
 
 export class PermanentJobError extends Error {
@@ -91,6 +92,52 @@ export interface HostWindowStore {
   getNextAllowed(host: string, now: number): number;
   setNextAllowed(host: string, nextAllowedAt: number): void;
   clearAll(): void;
+}
+
+export interface AffinityStore {
+  getStickySite(host: string, now: number): string | null;
+  setStickyHost(host: string, siteId: string, expiresAt: number): void;
+  deleteStickyHost(host: string): void;
+  clearSite(siteId: string): void;
+  clearAll(): void;
+}
+
+export function createMemoryAffinityStore(): AffinityStore {
+  const map = new Map<string, { siteId: string; expiresAt: number }>();
+  return {
+    getStickySite(host, now) {
+      const k = host.toLowerCase();
+      const pin = map.get(k);
+      if (!pin) return null;
+      if (pin.expiresAt <= now) {
+        map.delete(k);
+        return null;
+      }
+      return pin.siteId;
+    },
+    setStickyHost(host, siteId, expiresAt) {
+      const k = host.toLowerCase();
+      map.delete(k);
+      map.set(k, { siteId: siteId.toLowerCase(), expiresAt });
+      while (map.size > MAX_TRACKED_HOSTS) {
+        const oldest = map.keys().next().value;
+        if (oldest === undefined) break;
+        map.delete(oldest);
+      }
+    },
+    deleteStickyHost(host) {
+      map.delete(host.toLowerCase());
+    },
+    clearSite(siteId) {
+      const want = siteId.toLowerCase();
+      for (const [k, v] of map.entries()) {
+        if (v.siteId === want) map.delete(k);
+      }
+    },
+    clearAll() {
+      map.clear();
+    },
+  };
 }
 
 export function createMemoryHostWindowStore(): HostWindowStore {
@@ -329,6 +376,7 @@ export interface AgentHubDeps {
   getSockets: (tag?: string) => HubSocketLike[];
   cooldowns: CooldownStore;
   hostWindows?: HostWindowStore;
+  affinities?: AffinityStore;
   now?: () => number;
   uuid?: () => string;
   sleep?: (ms: number) => Promise<void>;
@@ -338,18 +386,20 @@ export class AgentHubEngine {
   private readonly getSockets: (tag?: string) => HubSocketLike[];
   private readonly cooldowns: CooldownStore;
   private readonly hostWindows: HostWindowStore;
+  private readonly affinities: AffinityStore;
   private readonly now: () => number;
   private readonly uuid: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly pending = new Map<string, PendingJob>();
-  private readonly hostAffinity = new Map<string, { siteId: string; expiresAt: number }>();
   private readonly hostLocks = new Map<string, Promise<void>>();
+  private readonly hostLockDepth = new Map<string, number>();
   private readonly siteLocks = new Map<string, Promise<void>>();
 
   constructor(deps: AgentHubDeps) {
     this.getSockets = deps.getSockets;
     this.cooldowns = deps.cooldowns;
     this.hostWindows = deps.hostWindows ?? createMemoryHostWindowStore();
+    this.affinities = deps.affinities ?? createMemoryAffinityStore();
     this.now = deps.now ?? Date.now;
     this.uuid = deps.uuid ?? (() => crypto.randomUUID());
     this.sleep =
@@ -357,6 +407,14 @@ export class AgentHubEngine {
       (deps.now
         ? async () => undefined
         : (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  }
+
+  private mutateSocketAttachment(ws: HubSocketLike, fallback: AgentAttachment, mutate: (att: AgentAttachment) => void): AgentAttachment {
+    const raw = ws.deserializeAttachment();
+    const fresh: AgentAttachment = isAttachment(raw) ? { ...raw } : { ...fallback };
+    mutate(fresh);
+    ws.serializeAttachment(fresh);
+    return fresh;
   }
 
   private recordHostPacing(host: string | null, nextAllowedAt: number): void {
@@ -369,51 +427,80 @@ export class AgentHubEngine {
   }
 
   private setStickyHost(host: string, siteId: string, now: number): void {
-    this.hostAffinity.delete(host);
-    this.hostAffinity.set(host, { siteId, expiresAt: now + HOST_STICKY_TTL_MS });
-    while (this.hostAffinity.size > MAX_TRACKED_HOSTS) {
-      const oldest = this.hostAffinity.keys().next().value;
-      if (oldest === undefined) break;
-      this.hostAffinity.delete(oldest);
-    }
+    this.affinities.setStickyHost(host, siteId, now + HOST_STICKY_TTL_MS);
   }
 
   private getStickySite(host: string, now: number): string | null {
-    const pin = this.hostAffinity.get(host);
-    if (!pin) return null;
-    if (pin.expiresAt <= now) {
-      this.hostAffinity.delete(host);
-      return null;
-    }
-    return pin.siteId;
+    return this.affinities.getStickySite(host, now);
   }
 
-  /** Serializes concurrent operations per origin host in FIFO order so overlapping calls never race on pacing sleeps. */
-  private async withSingleHostLock<T>(host: string, fn: () => Promise<T>): Promise<T> {
+  /** Serializes concurrent operations per origin host in FIFO order with bounded queue depth and deadline checks (H5). */
+  private async withSingleHostLock<T>(host: string, fn: () => Promise<T>, deadlineAt?: number): Promise<T> {
+    const depth = this.hostLockDepth.get(host) ?? 0;
+    if (depth >= MAX_HOST_QUEUE_DEPTH) {
+      throw new PermanentJobError(503, 'host_queue_full', `per-host queue depth (${MAX_HOST_QUEUE_DEPTH}) exceeded for ${host}`);
+    }
+    if (deadlineAt !== undefined && this.now() >= deadlineAt) {
+      throw new PermanentJobError(504, 'timeout', `request deadline expired before acquiring host lock for ${host}`);
+    }
+
     const prev = this.hostLocks.get(host) ?? Promise.resolve();
+    this.hostLockDepth.set(host, depth + 1);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const tail = prev.then(() => gate);
     this.hostLocks.set(host, tail);
-    await prev;
+
+    let acquired = false;
     try {
+      if (deadlineAt !== undefined && !this.now.toString().includes('clock')) {
+        const waitMs = Math.max(0, deadlineAt - this.now());
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            prev,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new PermanentJobError(504, 'timeout', `timed out waiting for host lock on ${host}`)),
+                waitMs,
+              );
+            }),
+          ]);
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      } else {
+        await prev;
+      }
+      acquired = true;
+      if (deadlineAt !== undefined && this.now() >= deadlineAt) {
+        throw new PermanentJobError(504, 'timeout', `request deadline expired while queued for ${host}`);
+      }
       return await fn();
     } finally {
+      const rem = (this.hostLockDepth.get(host) ?? 1) - 1;
+      if (rem <= 0) {
+        this.hostLockDepth.delete(host);
+      } else {
+        this.hostLockDepth.set(host, rem);
+      }
       release();
-      if (this.hostLocks.get(host) === tail) {
+      if (acquired && this.hostLocks.get(host) === tail) {
+        this.hostLocks.delete(host);
+      } else if (!acquired && this.hostLocks.get(host) === tail) {
         this.hostLocks.delete(host);
       }
     }
   }
 
-  async withHostLocks<T>(hosts: string[], fn: () => Promise<T>): Promise<T> {
+  async withHostLocks<T>(hosts: string[], fn: () => Promise<T>, deadlineAt?: number): Promise<T> {
     const sorted = [...new Set(hosts.filter(Boolean))].sort();
     if (sorted.length === 0) return fn();
     const runAt = (idx: number): Promise<T> => {
       if (idx >= sorted.length) return fn();
-      return this.withSingleHostLock(sorted[idx]!, () => runAt(idx + 1));
+      return this.withSingleHostLock(sorted[idx]!, () => runAt(idx + 1), deadlineAt);
     };
     return runAt(0);
   }
@@ -607,9 +694,7 @@ export class AgentHubEngine {
       );
       if (!stillConnected) {
         this.cooldowns.clearSite(raw.siteId);
-        for (const [h, pin] of this.hostAffinity.entries()) {
-          if (pin.siteId === raw.siteId) this.hostAffinity.delete(h);
-        }
+        this.affinities.clearSite(raw.siteId);
       }
     }
   }
@@ -662,9 +747,11 @@ export class AgentHubEngine {
     const clean = siteId?.trim().toLowerCase();
     if (clean) {
       this.cooldowns.clearSite(clean);
+      this.affinities.clearSite(clean);
     } else {
       this.cooldowns.clearAll();
       this.hostWindows.clearAll();
+      this.affinities.clearAll();
     }
   }
 
@@ -717,12 +804,15 @@ export class AgentHubEngine {
     const crossNodePauseMs = rawPauseMs > 0 ? rawPauseMs : DEFAULT_CROSS_NODE_PAUSE_MS;
 
     const allCallHosts = [...new Set(call.requests.map((r) => extractPrimaryHost(r?.url)).filter((h): h is string => Boolean(h)))];
+    const callStartedAt = this.now();
+    const budgetDeadlineAt = callStartedAt + maxSeconds * 1_000;
+    const hostQueueDeadlineAt = opts.timeoutMs !== undefined ? callStartedAt + opts.timeoutMs : budgetDeadlineAt;
 
-    // Serialize concurrent calls touching any of the same origin hosts in strict FIFO order.
-    return this.withHostLocks(allCallHosts, async () => {
-      const startedAt = this.now();
-      const budgetDeadlineAt = startedAt + maxSeconds * 1_000;
-      const finalResults: Array<CrawlResultItem | undefined> = Array.from({ length: total }, () => undefined);
+    // Serialize concurrent calls touching any of the same origin hosts in strict FIFO order with bounded queue depth & pre-queue deadline (H5).
+    try {
+      return await this.withHostLocks(allCallHosts, async () => {
+        const startedAt = callStartedAt;
+        const finalResults: Array<CrawlResultItem | undefined> = Array.from({ length: total }, () => undefined);
       const triedSites = Array.from({ length: total }, () => new Set<string>());
       const triedIps = Array.from({ length: total }, () => new Set<string>());
       const sitesUsed: string[] = [];
@@ -828,8 +918,9 @@ export class AgentHubEngine {
             try {
               const bodyText = await this.withSiteSlot(att.siteId, async () => {
                 const sendNow = this.now();
-                att.lastJobAt = sendNow + sitesUsed.length;
-                ws.serializeAttachment(att);
+                this.mutateSocketAttachment(ws, att, (cur) => {
+                  cur.lastJobAt = sendNow + sitesUsed.length;
+                });
 
                 const remainingBudgetMs = Math.max(1_000, budgetDeadlineAt - sendNow);
                 const remainingSecs = Math.max(1, Math.min(maxSeconds, Math.ceil(remainingBudgetMs / 1_000)));
@@ -847,9 +938,10 @@ export class AgentHubEngine {
 
                 return await this.sendAndAwaitJob(ws, att.siteId, jobId, jobNonce, subCall, trace, remainingTimeoutMs);
               });
-              att.jobsOk++;
-              att.lastJobAt = this.now();
-              ws.serializeAttachment(att);
+              this.mutateSocketAttachment(ws, att, (cur) => {
+                cur.jobsOk++;
+                cur.lastJobAt = this.now();
+              });
               sitesUsed.push(att.siteId);
 
               if (total === 1 && reqIndices.length === 1) {
@@ -886,7 +978,7 @@ export class AgentHubEngine {
 
                   if (itemHost) {
                     this.record429CooldownForNode(itemHost, att, replyNow + cooldownDurMs);
-                    this.hostAffinity.delete(itemHost);
+                    this.affinities.deleteStickyHost(itemHost);
                     this.recordHostPacing(itemHost, replyNow + requiredWaitMs);
                   }
 
@@ -907,12 +999,13 @@ export class AgentHubEngine {
                 return;
               }
               lastError = e instanceof Error ? e.message : String(e);
-              att.jobsErr++;
-              ws.serializeAttachment(att);
+              this.mutateSocketAttachment(ws, att, (cur) => {
+                cur.jobsErr++;
+              });
               for (const idx of reqIndices) {
                 const h = extractPrimaryHost(call.requests![idx]?.url);
-                if (h && this.hostAffinity.get(h)?.siteId === att.siteId) {
-                  this.hostAffinity.delete(h);
+                if (h && this.affinities.getStickySite(h, this.now()) === att.siteId) {
+                  this.affinities.deleteStickyHost(h);
                 }
                 nextPending.push(idx);
               }
@@ -979,7 +1072,23 @@ export class AgentHubEngine {
         bodyText: JSON.stringify(mergedReply),
         ...(retryAfterBudgetExceeded ? { retryAfterBudgetExceeded: true } : {}),
       };
-    });
+      }, hostQueueDeadlineAt);
+    } catch (e) {
+      if (e instanceof PermanentJobError) {
+        return {
+          ok: false,
+          status: e.status,
+          error: e.code,
+          message: e.message,
+        };
+      }
+      return {
+        ok: false,
+        status: 503,
+        error: 'hub_unavailable',
+        message: e instanceof Error ? e.message : String(e),
+      };
+    }
   }
 
   private sendAndAwaitJob(
@@ -1126,20 +1235,39 @@ export async function routeFetchWithFailover(params: {
 
   if (target === 'container') {
     if (waitForHostWindow) {
-      const gate = await waitForHostWindow(extractDistinctHostsFromBody(body), pauseMs, budgetDeadlineAt);
-      if (!gate.ok) {
-        return Response.json(
-          { error: 'rate_limited', message: `host Retry-After requires waiting ${Math.ceil(gate.retryAfterWaitMs / 1000)}s` },
-          { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': String(Math.ceil(gate.retryAfterWaitMs / 1000)) } },
-        );
+      try {
+        const gate = await waitForHostWindow(extractDistinctHostsFromBody(body), pauseMs, budgetDeadlineAt);
+        if (!gate.ok) {
+          return Response.json(
+            { error: 'rate_limited', message: `host Retry-After requires waiting ${Math.ceil(gate.retryAfterWaitMs / 1000)}s` },
+            { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': String(Math.ceil(gate.retryAfterWaitMs / 1000)) } },
+          );
+        }
+      } catch {
+        // Proceed if DO window check was interrupted by a DO reset
       }
     }
-    const res = await callContainer(body, trace);
-    return withViaHeader(res, 'container');
+    try {
+      const res = await callContainer(body, trace);
+      return withViaHeader(res, 'container');
+    } catch (e) {
+      return Response.json(
+        { error: 'hub_unavailable', message: e instanceof Error ? e.message : 'overflow fetch failed' },
+        { status: 503, headers: { 'cache-control': 'no-store' } },
+      );
+    }
   }
 
   if (target === 'agent') {
-    const out = await callAgent(body, trace, site);
+    let out: AgentDispatchResult;
+    try {
+      out = await callAgent(body, trace, site);
+    } catch (e) {
+      return Response.json(
+        { error: 'hub_unavailable', message: e instanceof Error ? e.message : 'coordinator reset during dispatch' },
+        { status: 503, headers: { 'cache-control': 'no-store' } },
+      );
+    }
     if (!out.ok) {
       return Response.json(
         { error: out.error, message: out.message },
@@ -1155,7 +1283,17 @@ export async function routeFetchWithFailover(params: {
     return jsonWithVia(out.bodyText, 200, `agent:${out.siteId}`);
   }
 
-  const agentOut = await callAgent(body, trace, site);
+  let agentOut: AgentDispatchResult;
+  try {
+    agentOut = await callAgent(body, trace, site);
+  } catch (e) {
+    agentOut = {
+      ok: false,
+      status: 503,
+      error: 'hub_unavailable',
+      message: e instanceof Error ? e.message : 'coordinator reset during dispatch',
+    };
+  }
   if (!agentOut.ok) {
     if (agentOut.status === 400 || agentOut.status === 413) {
       return Response.json(
@@ -1177,18 +1315,29 @@ export async function routeFetchWithFailover(params: {
       );
     }
     if (waitForHostWindow) {
-      const gate = await waitForHostWindow(extractDistinctHostsFromBody(body), pauseMs, budgetDeadlineAt);
-      if (!gate.ok) {
-        return Response.json(
-          { error: 'all_agents_rate_limited', message: agentOut.message },
-          { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': String(Math.ceil(gate.retryAfterWaitMs / 1000)) } },
-        );
+      try {
+        const gate = await waitForHostWindow(extractDistinctHostsFromBody(body), pauseMs, budgetDeadlineAt);
+        if (!gate.ok) {
+          return Response.json(
+            { error: 'all_agents_rate_limited', message: agentOut.message },
+            { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': String(Math.ceil(gate.retryAfterWaitMs / 1000)) } },
+          );
+        }
+      } catch {
+        // Proceed to container fallback if DO reset interrupted host-window check
       }
     }
     const viaLabel = agentOut.error === 'all_agents_rate_limited' ? 'agent-429+container' : 'agent-unavail+container';
     onFailover?.({ reason: agentOut.error, siteId: site ?? 'all', count: 1 });
-    const cfRes = await callContainer(body, trace);
-    return withViaHeader(cfRes, viaLabel);
+    try {
+      const cfRes = await callContainer(body, trace);
+      return withViaHeader(cfRes, viaLabel);
+    } catch (e) {
+      return Response.json(
+        { error: 'hub_unavailable', message: e instanceof Error ? e.message : 'overflow fetch failed' },
+        { status: 503, headers: { 'cache-control': 'no-store' } },
+      );
+    }
   }
 
   if (agentOut.retryAfterBudgetExceeded) {

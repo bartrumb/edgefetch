@@ -8,7 +8,7 @@
  * - Enforces `Origin` validation against DNS-rebinding / cross-origin attacks and per-tool OAuth scopes
  *   (`crawl:read` vs `crawl:fetch`).
  */
-import type { ActivityStore } from './activity-log';
+import { sanitizeDetails, type ActivityStore } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { SITE_ID_PATTERN } from './auth';
 import { authorizeMcpRequest, type OAuthStore } from './oauth';
@@ -369,7 +369,7 @@ async function dispatchRpcMessage(
         category: 'mcp',
         event: 'mcp_initialize',
         summary: `MCP initialize from ${principal} (${clientInfo.name ?? userAgent}, proto ${protocolVersion})`,
-        details: { principal, authType, clientInfo, protocolVersion, userAgent },
+        details: sanitizeDetails({ principal, authType, clientName: clientInfo.name ?? '', protocolVersion, userAgent }),
       });
       return jsonRpcResult(id, {
         protocolVersion,
@@ -403,7 +403,7 @@ async function dispatchRpcMessage(
         category: 'mcp',
         event: 'mcp_tool_call',
         summary: `MCP ${toolName} called by ${principal} (${Date.now() - startedAt}ms)`,
-        details: { principal, authType, toolName, args: rawArgs, durationMs: Date.now() - startedAt, isError: Boolean(out.isError) },
+        details: sanitizeDetails({ principal, authType, toolName, args: rawArgs, durationMs: Date.now() - startedAt, isError: Boolean(out.isError) }),
       });
       return jsonRpcResult(id, out);
     }

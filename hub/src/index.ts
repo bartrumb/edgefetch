@@ -15,6 +15,7 @@ import {
   ACTIVITY_SQLITE_SCHEMA,
   buildCrawlActivityEvents,
   createSqliteActivityStore,
+  sanitizeDetails,
   type ActivityStore,
   type HubEventInput,
   type HubEventRecord,
@@ -285,7 +286,7 @@ export class AgentHubDO extends DurableObject<Env> {
           category: 'agent',
           event: evName,
           summary: `Remote node "${att?.siteId ?? 'unknown'}" reported ${evName} (${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
-          details: { siteId: att?.siteId, ...msg },
+          details: sanitizeDetails({ siteId: att?.siteId, ...msg }),
         });
       }
     } catch {
@@ -529,7 +530,7 @@ export default {
       store: oauthStore,
       ownerSecret: env.CALLER_TOKEN,
       serviceName: 'EdgeFetch Hub',
-      onEvent: (ev) => activity.recordEvent(ev),
+      onEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
     });
     if (oauthRes) return oauthRes;
 

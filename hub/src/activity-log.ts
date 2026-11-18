@@ -9,6 +9,21 @@ import type { SqlStorageLike } from './oauth';
 
 export type ActivityLevel = 'info' | 'warn' | 'error';
 export type ActivityCategory = 'crawl' | 'mcp' | 'agent' | 'oauth' | 'failover';
+export type EventDetailMap = Record<string, string | number | boolean | null>;
+
+export function sanitizeDetails(raw?: Record<string, unknown>): EventDetailMap {
+  const out: EventDetailMap = {};
+  if (!raw) return out;
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === undefined) continue;
+    if (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+      out[k] = v;
+    } else {
+      out[k] = JSON.stringify(v).slice(0, 512);
+    }
+  }
+  return out;
+}
 
 export interface HubEventInput {
   ts?: number;
@@ -16,7 +31,7 @@ export interface HubEventInput {
   category: ActivityCategory;
   event: string;
   summary: string;
-  details?: Record<string, unknown>;
+  details?: EventDetailMap;
 }
 
 export interface HubEventRecord {
@@ -26,7 +41,7 @@ export interface HubEventRecord {
   category: ActivityCategory;
   event: string;
   summary: string;
-  details: Record<string, unknown>;
+  details: EventDetailMap;
 }
 
 export interface McpClientActivity {
@@ -149,9 +164,9 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
         }>('SELECT id, ts, level, category, event, summary, details_json FROM hub_events ORDER BY id DESC LIMIT ?', safeLimit)
         .toArray()
         .map((r) => {
-          let details: Record<string, unknown> = {};
+          let details: EventDetailMap = {};
           try {
-            details = JSON.parse(r.details_json) as Record<string, unknown>;
+            details = sanitizeDetails(JSON.parse(r.details_json) as Record<string, unknown>);
           } catch {
             details = {};
           }
@@ -282,7 +297,7 @@ export function buildCrawlActivityEvents(params: {
       category: 'crawl',
       event: 'fetch_url',
       summary: `[${params.source}] ${status} ${outcome} via ${params.via} — ${urlShort} (${r.durationMs ?? 0}ms, ttfb=${tm.ttfbMs ?? 0}ms${tm.reused ? ', H2-reused' : ''})`,
-      details: {
+      details: sanitizeDetails({
         source: params.source,
         target: params.target,
         via: params.via,
@@ -301,7 +316,7 @@ export function buildCrawlActivityEvents(params: {
         reused: Boolean(tm.reused),
         proto: tm.proto ?? '',
         remoteAddr: tm.remoteAddr ?? '',
-      },
+      }),
     };
   });
 }

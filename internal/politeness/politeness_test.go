@@ -123,6 +123,56 @@ Crawl-delay: 2
 	}
 }
 
+func TestRobotsRFC9309EdgeCasesBOMPercentEncodingProductTokenAnd500KiB(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+
+	// 1. UTF-8 BOM at byte 0 must NOT swallow the first User-agent group.
+	bomRobots := "\xef\xbb\xbfUser-agent: *\nDisallow: /\n"
+	if ParseRobotsTxt(bomRobots, "edgefetch", exp).Allowed("/anything") {
+		t.Fatal("A4 BUG: UTF-8 BOM caused Disallow: / group to be ignored")
+	}
+
+	// 2. Percent-encoding case & unreserved normalization per RFC 9309 §2.2.2.
+	pctRobots := "User-agent: *\nDisallow: /caf%C3%A9\nDisallow: /~admin\n"
+	pctEntry := ParseRobotsTxt(pctRobots, "edgefetch", exp)
+	if pctEntry.Allowed("/caf%c3%a9/menu") {
+		t.Fatalf("%s", "A4 BUG: lowercase /caf%c3%a9 bypassed /caf%C3%A9 rule")
+	}
+	if pctEntry.Allowed("/café/menu") {
+		t.Fatalf("%s", "A4 BUG: raw UTF-8 /café bypassed /caf%C3%A9 rule")
+	}
+	if pctEntry.Allowed("/%7eadmin/panel") {
+		t.Fatalf("%s", "A4 BUG: encoded unreserved /%7eadmin bypassed /~admin rule")
+	}
+
+	// 3. Substring User-agent (`notedgefetchbot`) must NOT match `edgefetch`.
+	subRobots := "User-agent: notedgefetchbot\nDisallow: /\n\nUser-agent: *\nDisallow: /secret\n"
+	subEntry := ParseRobotsTxt(subRobots, "edgefetch", exp)
+	if !subEntry.Allowed("/public") {
+		t.Fatal("A4 BUG: User-agent: notedgefetchbot falsely matched edgefetch")
+	}
+	if subEntry.Allowed("/secret") {
+		t.Fatal("expected wildcard Disallow: /secret to apply")
+	}
+
+	// 4. RFC 9309 §2.5 requires parsing at least 500 KiB of robots.txt.
+	if RobotsMaxBytes < 500*1024 {
+		t.Fatalf("A4 BUG: RobotsMaxBytes = %d, RFC 9309 requires >= 512000", RobotsMaxBytes)
+	}
+}
+
+func FuzzParseRobotsTxt(f *testing.F) {
+	f.Add("User-agent: *\nDisallow: /admin\nAllow: /admin/public\n")
+	f.Add("\xef\xbb\xbfUser-agent: EdgeFetch/1.0\r\nDisallow: /*.json$\r\nCrawl-delay: 1.5\r\n")
+	f.Add("User-agent: *\nDisallow: /caf%C3%A9/*\nAllow: /%7Euser/\n")
+	f.Fuzz(func(t *testing.T, body string) {
+		entry := ParseRobotsTxt(body, "edgefetch", time.Unix(1_800_000_000, 0))
+		_ = entry.Allowed("/")
+		_ = entry.Allowed("/caf%c3%a9/items.json?page=1")
+		_ = entry.Allowed("/%7euser/profile")
+	})
+}
+
 func TestSSRFGuardBlocksPrivateLoopbackCGNATAndIPv6TransitionRanges(t *testing.T) {
 	blocked := []string{
 		"127.0.0.1:443",

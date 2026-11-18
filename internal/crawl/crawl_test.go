@@ -228,19 +228,66 @@ func TestRobotsRFC9309Unreachable4295xxAnd404(t *testing.T) {
 		t.Fatalf("404 /robots.txt should allow crawl, got %+v", res404[0])
 	}
 
-	// 4. Explicit opt-out (`RespectRobots: Bool(false)`) skips /robots.txt when caller asks.
-	cOptOut, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/robots.txt" {
-			t.Error("expected /robots.txt skipped when RespectRobots is explicitly false")
+	// 4. Redirect to a robots-disallowed path (/public -> /private) MUST be blocked on the redirect hop (A3)!
+	hitPrivate := false
+	cRedir, redirSleeps := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("User-agent: *\nDisallow: /private\nCrawl-delay: 3\n"))
+		case "/public":
+			http.Redirect(w, r, "/private", http.StatusFound)
+		case "/private":
+			hitPrivate = true
+			w.Header().Set("content-type", "text/html")
+			_, _ = w.Write([]byte("<html>secret</html>"))
 		}
+	}))
+	resRedir := cRedir.Run(context.Background(), []Request{
+		{ID: "redir", URL: "http://redir.test/public", Kind: classify.KindPage},
+	}, Options{PauseMs: 1000})
+	if hitPrivate || resRedir[0].Outcome == classify.OutcomeOK {
+		t.Fatalf("A3 BUG: redirect from /public to /private bypassed robots.txt (hitPrivate=%v, res=%+v)", hitPrivate, resRedir[0])
+	}
+	if len(redirSleeps.all) == 0 || redirSleeps.all[0] < 3*time.Second {
+		t.Fatalf("A3 BUG: redirect hop skipped per-host Crawl-delay pacing (sleeps=%v)", redirSleeps.all)
+	}
+
+	// 5. Caller-supplied RespectRobots=false MUST be rejected unless host is in owner RobotsBypassHosts allowlist (A5)!
+	cNoBypass, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "text/html")
 		_, _ = w.Write([]byte("<html>ok</html>"))
 	}))
-	resOptOut := cOptOut.Run(context.Background(), []Request{
-		{ID: "r4", URL: "http://optout.test/public", Kind: classify.KindPage},
-	}, Options{RespectRobots: Bool(false)})
-	if resOptOut[0].Outcome != classify.OutcomeOK {
-		t.Fatalf("explicit RespectRobots=false failed: %+v", resOptOut[0])
+	if code, _, ok := ValidateCallWithCrawler(cNoBypass, FetchCall{
+		Requests: []Request{{ID: "r4", URL: "https://example.com/public", Kind: classify.KindPage}},
+		Options:  Options{RespectRobots: Bool(false)},
+	}, PublicHTTPS); ok || code != "robots_required" {
+		t.Fatalf("A5 BUG: expected RespectRobots=false rejected for unallowlisted host, got ok=%v code=%q", ok, code)
+	}
+	cNoBypass.SetRobotsBypassHosts([]string{"example.com"})
+	if _, _, ok := ValidateCallWithCrawler(cNoBypass, FetchCall{
+		Requests: []Request{{ID: "r4", URL: "https://sub.example.com/public", Kind: classify.KindPage}},
+		Options:  Options{RespectRobots: Bool(false)},
+	}, PublicHTTPS); !ok {
+		t.Fatal("expected owner-allowlisted host to pass ValidateCallWithCrawler")
+	}
+
+	// 6. 78 KiB /robots.txt with Disallow rule at the end MUST still be parsed and enforced per RFC 9309 §2.5 (A4)!
+	hitSecret78K := false
+	c78k, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			_, _ = w.Write([]byte("User-agent: *\n" + strings.Repeat("# pad pad pad pad pad pad\n", 3200) + "Disallow: /secret\n"))
+			return
+		}
+		hitSecret78K = true
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte("<html>secret</html>"))
+	}))
+	res78k := c78k.Run(context.Background(), []Request{
+		{ID: "r78k", URL: "http://large-robots.test/secret", Kind: classify.KindPage},
+	}, Options{})
+	if hitSecret78K || res78k[0].Outcome != classify.OutcomeSkip {
+		t.Fatalf("expected 78 KiB /robots.txt trailing rule enforced (hit=%v, res=%+v)", hitSecret78K, res78k[0])
 	}
 }
 

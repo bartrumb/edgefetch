@@ -162,8 +162,6 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
             type: 'string',
             description: 'Optional standby site ID to pin (e.g. "site-arm64", "site-x86", "site-win-vm").',
           },
-          respectRobots: { type: 'boolean', default: true, description: 'Respect /robots.txt Allow/Disallow and Crawl-delay.' },
-          robots: { type: 'boolean', description: 'Deprecated alias for respectRobots.' },
           includeBody: { type: 'boolean', default: true, description: 'Include response body preview in tool output.' },
           maxBytes: { type: 'integer', minimum: 1024, maximum: 16777216, description: 'Maximum response body bytes (up to 16 MiB).' },
           ifNoneMatch: { type: 'string', description: 'Optional ETag for conditional 304 Not Modified checks.' },
@@ -199,8 +197,6 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
           pauseMs: { type: 'integer', minimum: 0, maximum: 30000, default: 1000, description: 'Minimum per-host pause in ms.' },
           pauseJitterMs: { type: 'integer', minimum: 0, maximum: 15000, default: 500, description: 'Random positive jitter added to pauseMs.' },
-          respectRobots: { type: 'boolean', default: true },
-          robots: { type: 'boolean', description: 'Deprecated alias for respectRobots.' },
           includeBody: { type: 'boolean', default: false, description: 'Set true to include truncated body previews per URL.' },
         },
         required: ['urls'],
@@ -260,13 +256,11 @@ async function handleToolCall(
       return { content: [{ type: 'text', text: `Invalid site ID '${rawSite}'` }], isError: true };
     }
 
+    if (args.respectRobots === false || args.robots === false) {
+      return { content: [{ type: 'text', text: 'Disabling robots.txt via MCP is not permitted.' }], isError: true };
+    }
     const kind = args.kind === 'feed' ? 'feed' : 'page';
-    const respectRobots =
-      typeof args.respectRobots === 'boolean'
-        ? args.respectRobots
-        : typeof args.robots === 'boolean'
-          ? args.robots
-          : true;
+    const respectRobots = true;
     const includeBody = typeof args.includeBody === 'boolean' ? args.includeBody : name === 'fetch_url';
 
     let requests: Array<Record<string, unknown>>;

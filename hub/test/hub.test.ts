@@ -13,6 +13,12 @@ import {
 } from '../src/agent-hub.ts';
 import { handleMcpRequest, type McpServerDeps } from '../src/mcp.ts';
 import type { OAuthStore } from '../src/oauth.ts';
+import {
+  cloudflareOverflowFetch,
+  isRobotsAllowed,
+  parseOverflowRobotsTxt,
+  validateCallRobotsPolicy,
+} from '../src/overflow.ts';
 
 function memoryCooldowns(): CooldownStore {
   const map = new Map<string, number>();
@@ -408,4 +414,68 @@ test('MCP cross-language contract emits respectRobots matching Go FetchCall wire
   const sent = JSON.parse(capturedBody) as { options: Record<string, unknown> };
   assert.equal(sent.options.respectRobots, true);
   assert.equal('robots' in sent.options, false);
+});
+
+test('H-S4 & A4/A5: cloudflareOverflowFetch enforces manual redirects + per-hop robots + URL policy + BOM/percent-encoding + robots_required', async () => {
+  // 1. BOM + percent-encoding + exact product token in overflow robots parser.
+  const bomEntry = parseOverflowRobotsTxt('\uFEFFUser-agent: *\nDisallow: /\n', 'EdgeFetch/1.0');
+  assert.equal(isRobotsAllowed(bomEntry, '/x'), false);
+
+  const pctEntry = parseOverflowRobotsTxt('User-agent: *\nDisallow: /caf%C3%A9\n', 'EdgeFetch/1.0');
+  assert.equal(isRobotsAllowed(pctEntry, '/caf%c3%a9/menu'), false);
+
+  const tokenEntry = parseOverflowRobotsTxt('User-agent: notedgefetchbot\nDisallow: /\n\nUser-agent: *\nAllow: /\n', 'EdgeFetch/1.0');
+  assert.equal(isRobotsAllowed(tokenEntry, '/public'), true);
+
+  // 2. Disabling robots.txt is rejected unless allowlisted.
+  const denied = validateCallRobotsPolicy(
+    JSON.stringify({ options: { respectRobots: false }, requests: [{ url: 'https://store.example.com/' }] }),
+    [],
+  );
+  assert.equal(denied.ok, false);
+
+  // 3. Redirect hop to a robots-disallowed path OR to an http:// / self-hub target is blocked BEFORE fetching!
+  let hitPrivate = false;
+  let hitLoopback = false;
+  const mockFetch: typeof fetch = async (input) => {
+    const u = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+    if (u.hostname === '127.0.0.1') {
+      hitLoopback = true;
+      return new Response('loopback');
+    }
+    if (u.pathname === '/robots.txt') {
+      return new Response('User-agent: *\nDisallow: /private\n', { status: 200 });
+    }
+    if (u.pathname === '/public') {
+      return new Response(null, { status: 302, headers: { location: '/private' } });
+    }
+    if (u.pathname === '/ssrf') {
+      return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:8080/admin' } });
+    }
+    if (u.pathname === '/private') {
+      hitPrivate = true;
+      return new Response('secret', { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    return new Response('ok', { status: 200, headers: { 'content-type': 'text/html' } });
+  };
+
+  const res = await cloudflareOverflowFetch(
+    JSON.stringify({
+      maxSeconds: 10,
+      options: { includeBody: true, pauseMs: 1 },
+      requests: [
+        { id: '1', url: 'https://store.example.com/public', kind: 'page' },
+        { id: '2', url: 'https://store.example.com/ssrf', kind: 'page' },
+      ],
+    }),
+    'EdgeFetch/1.0',
+    'hub.example.com',
+    { fetchFn: mockFetch, sleepFn: async () => undefined },
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { results: Array<{ id: string; outcome: string; problem?: string }> };
+  assert.equal(hitPrivate, false, 'overflow redirect to disallowed /private must never fetch /private');
+  assert.equal(hitLoopback, false, 'overflow redirect to loopback http:// must never fetch target');
+  assert.equal(body.results[0]?.outcome, 'skip');
+  assert.equal(body.results[1]?.outcome, 'error');
 });

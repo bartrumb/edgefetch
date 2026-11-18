@@ -134,14 +134,15 @@ npx wrangler secret put AGENT_TOKENS -c wrangler.toml
 
 ---
 
-## Ethical Crawling, Cluster-Wide Pacing & `429` Reliability Failover
+## Ethical Crawling, Public-IP Host Affinity & Polite `429` Failover
 
 EdgeFetch is an **honest, rate-limited HTTP fetcher** — never a stealth scraper or anti-bot bypass tool:
 - **Honest Identity & Standard TLS:** Always sends a transparent, configurable `User-Agent` (validated printable ASCII) and standard Go `net/http` TLS/HTTP2 stacks; never solves CAPTCHAs or spoofs browser fingerprints.
-- **Cluster-Wide Per-Host Serialization & RFC 9309 `robots.txt`:** `AgentHubDO` groups same-host URLs within a batch onto a single node and enforces `pauseMs` across sequential dispatches so multiple nodes never burst the same origin concurrently. Both Go nodes and the Cloudflare overflow tier enforce `/robots.txt` (`Allow`/`Disallow` longest-match, `Crawl-delay`, and RFC 9309 §2.3.1.4 complete-disallow when `/robots.txt` is unreachable or returns `429`/`5xx`).
-- **Refusals vs. Shared-Egress `429` Reliability Buffer:**
-  - `403`, `503`, and anti-bot challenges (`cf-mitigated`) **stop immediately** with zero retries on the node or across the cluster.
-  - Individual Go nodes never retry `429` locally. In `target=auto` mode, if an egress IP receives HTTP `429` (common on shared CGNAT/ISP or multi-tenant CDN edges), `AgentHubDO` places `(host, siteId)` into SQLite cooldown (honoring `Retry-After`) and fails over across remaining healthy nodes — and finally to Cloudflare overflow (while still honoring per-host `pauseMs` and `robots.txt`) — as an explicit reliability buffer for scheduled feed syncs. Pin `?target=agent&site=<id>` whenever single-IP non-failover behavior is desired.
+- **`/robots.txt` On by Default (RFC 9309):** Both Go (`--mode=server` / `--mode=agent`) and the Cloudflare Hub overflow enforce `/robots.txt` **by default** (`options.respectRobots = true` unless explicitly set `false`), including `Allow`/`Disallow` longest-match, `Crawl-delay`, and RFC 9309 §2.3.1.4 complete-disallow when `/robots.txt` is unreachable or returns `429`/`5xx`.
+- **Public-IP Load Splitting + 30-Minute Host-Sticky Affinity:** `AgentHubDO` groups connected edge nodes by verified public egress IP (`cf-connecting-ip`), assigns each origin host to the Least-Recently-Used public IP group, and pins that host for 30 minutes so **requests to a single origin never rotate addresses** (preserving warm HTTP/2 connections), while distinct origins split evenly across distinct public IPs. Concurrent requests to the same host serialize through a race-free in-DO FIFO lock (`withHostLocks`).
+- **Refusals vs. Polite `429` Cooldown & Wait:**
+  - `403`, `503`, and anti-bot challenges (`cf-mitigated`) **stop immediately** with zero retries anywhere.
+  - On HTTP `429`, `AgentHubDO` cools down both `siteId` and `ip:<publicIp>` in SQLite (`site_cooldowns`) so sibling nodes behind the same WAN IP are skipped, and **waits out the origin's full `Retry-After` window** (or a `15 s` default throttle pause when `Retry-After` is absent) inside the host lock **before** any failover node or Cloudflare overflow re-attempts that host. If `Retry-After` exceeds the request's `maxSeconds` budget, the `429` is returned directly to the caller without failing over. Pin `?target=agent&site=<id>` whenever single-IP non-failover behavior is desired.
 
 ## License
 

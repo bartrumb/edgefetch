@@ -192,9 +192,9 @@ func TestRobotsRFC9309Unreachable4295xxAnd404(t *testing.T) {
 	}))
 	res429 := c429.Run(context.Background(), []Request{
 		{ID: "r1", URL: "http://rate-limited.test/secret", Kind: classify.KindPage},
-	}, Options{RespectRobots: true})
+	}, Options{}) // Default Options{} now enables RespectRobots automatically!
 	if hitPage || res429[0].Outcome != classify.OutcomeStop {
-		t.Fatalf("RFC 9309: 429 on /robots.txt must disallow crawl (hitPage=%v, res=%+v)", hitPage, res429[0])
+		t.Fatalf("RFC 9309: 429 on /robots.txt must disallow crawl by default (hitPage=%v, res=%+v)", hitPage, res429[0])
 	}
 
 	// 2. robots.txt failing with a transport error must assume disallow (OutcomeStop).
@@ -207,7 +207,7 @@ func TestRobotsRFC9309Unreachable4295xxAnd404(t *testing.T) {
 	cDead.Sleep = func(context.Context, time.Duration) error { return nil }
 	resDead := cDead.Run(context.Background(), []Request{
 		{ID: "r2", URL: "https://unreachable.test/page", Kind: classify.KindPage},
-	}, Options{RespectRobots: true})
+	}, Options{RespectRobots: Bool(true)})
 	if resDead[0].Outcome != classify.OutcomeStop || !strings.Contains(resDead[0].Problem, "robots.txt unreachable") {
 		t.Fatalf("RFC 9309: unreachable /robots.txt must stop host, got %+v", resDead[0])
 	}
@@ -223,9 +223,24 @@ func TestRobotsRFC9309Unreachable4295xxAnd404(t *testing.T) {
 	}))
 	res404 := c404.Run(context.Background(), []Request{
 		{ID: "r3", URL: "http://no-robots.test/public", Kind: classify.KindPage},
-	}, Options{Robots: true}) // Also exercises legacy `Robots: true` alias -> RespectRobots!
+	}, Options{Robots: Bool(true)}) // Also exercises legacy `Robots` alias -> RespectRobots!
 	if res404[0].Outcome != classify.OutcomeOK {
 		t.Fatalf("404 /robots.txt should allow crawl, got %+v", res404[0])
+	}
+
+	// 4. Explicit opt-out (`RespectRobots: Bool(false)`) skips /robots.txt when caller asks.
+	cOptOut, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			t.Error("expected /robots.txt skipped when RespectRobots is explicitly false")
+		}
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte("<html>ok</html>"))
+	}))
+	resOptOut := cOptOut.Run(context.Background(), []Request{
+		{ID: "r4", URL: "http://optout.test/public", Kind: classify.KindPage},
+	}, Options{RespectRobots: Bool(false)})
+	if resOptOut[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("explicit RespectRobots=false failed: %+v", resOptOut[0])
 	}
 }
 
@@ -246,8 +261,8 @@ func TestSharedWireContractFixture(t *testing.T) {
 			t.Fatalf("fixture %s rejected by strict Go decoder: %v", name, err)
 		}
 		norm := call.Options.Normalize()
-		if !norm.RespectRobots {
-			t.Fatalf("fixture %s expected Normalize().RespectRobots == true, got %+v", name, norm)
+		if !norm.RobotsEnabled() {
+			t.Fatalf("fixture %s expected Normalize().RobotsEnabled() == true, got %+v", name, norm)
 		}
 	}
 }

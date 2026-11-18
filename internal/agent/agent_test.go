@@ -128,7 +128,11 @@ func TestConfigSecurityGuards(t *testing.T) {
 }
 
 func TestAgentSessionReconnectHelloPingAndGzipReply(t *testing.T) {
-	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("content-type", "application/json")
 		_, _ = w.Write([]byte(`{"products":[{"id":42}]}`))
 	}))
@@ -259,6 +263,10 @@ func TestShutdownDrainStillUploadsPartialResults(t *testing.T) {
 	// Verify that handleDispatch STILL uploads the completed first result + not_tried second result via uploadCtx!
 	var calls atomic.Int32
 	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if calls.Add(1) == 1 {
 			w.Header().Set("content-type", "text/html")
 			_, _ = w.Write([]byte("<html>done-1</html>"))

@@ -47,6 +47,7 @@ export interface AdminPortalDeps {
   defaultTarget: FetchTarget;
   getState: () => Promise<{
     connected: number;
+    distinctPublicIps?: number;
     agents: AgentAttachment[];
     affinities: AffinityPin[];
     grants: OAuthGrantSummary[];
@@ -147,7 +148,9 @@ function renderDashboardHtml(params: {
     .site-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 14px; }
     .site-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     .site-name { font-weight: 700; font-size: 0.95rem; color: #38bdf8; }
-    .arch { font-size: 0.75rem; background: #1e293b; border: 1px solid #475569; padding: 1px 7px; border-radius: 6px; color: #cbd5e1; }
+    .arch { font-size: 0.74rem; background: #1e293b; border: 1px solid #475569; padding: 1px 7px; border-radius: 6px; color: #cbd5e1; }
+    .ver { font-size: 0.74rem; background: #064e3b; border: 1px solid #059669; padding: 1px 7px; border-radius: 6px; color: #6ee7b7; font-weight: 600; }
+    .ver-legacy { background: #78350f; border-color: #d97706; color: #fde68a; }
     .kv { display: flex; justify-content: space-between; font-size: 0.82rem; color: #94a3b8; margin-top: 4px; }
     .kv strong { color: #e2e8f0; }
     code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.82rem; }
@@ -251,7 +254,8 @@ function renderDashboardHtml(params: {
       <h2>
         <span>Connected Remote Fleet (<span id="site-count">0</span>)</span>
         <span style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <span class="muted">Hibernation-friendly 15s poll</span>
+          <span class="muted" id="fleet-ip-summary">Public-IP load balanced</span>
+          <button type="button" id="toggle-ip-btn" style="padding:4px 10px;font-size:0.76rem">Show Full IPs</button>
           <a class="btn-link" href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch" target="_blank" rel="noopener noreferrer" title="1-click add EdgeFetch repository to your Home Assistant OS instance">+ Add HAOS Node</a>
           <a class="btn-link btn-cf" href="https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub" target="_blank" rel="noopener noreferrer" title="1-click deploy an EdgeFetch Hub on Cloudflare Workers">Deploy Hub on Cloudflare</a>
         </span>
@@ -359,6 +363,8 @@ function renderDashboardHtml(params: {
     const el = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
     let latestEvents = [];
+    let lastStateData = null;
+    let showFullIps = false;
     let activeCat = 'all';
     const openEventIds = new Set();
 
@@ -409,10 +415,8 @@ function renderDashboardHtml(params: {
       }).join('');
     }
 
-    async function loadState() {
-      const res = await fetch('/admin/api/state', { headers: { 'accept': 'application/json' } });
-      if (res.status === 401) { location.reload(); return; }
-      const data = await res.json();
+    function renderState(data) {
+      lastStateData = data;
       const agents = data.agents || [];
       const affinities = data.affinities || [];
       const grants = data.grants || [];
@@ -425,8 +429,18 @@ function renderDashboardHtml(params: {
 
       const totalOk = agents.reduce((s, a) => s + Number(a.jobsOk || 0), 0);
       const totalErr = agents.reduce((s, a) => s + Number(a.jobsErr || 0), 0);
+      const ipCounts = {};
+      agents.forEach((a) => {
+        if (a.publicIp) ipCounts[a.publicIp] = (ipCounts[a.publicIp] || 0) + 1;
+      });
+      const distinctIps = data.distinctPublicIps ?? (Object.keys(ipCounts).length || agents.length);
       el('kpi-sites').textContent = data.connected + ' online';
-      el('kpi-sites-sub').textContent = agents.map((a) => a.siteId).join(', ') || 'Waiting for HAOS check-in';
+      el('kpi-sites-sub').textContent = agents.length
+        ? distinctIps + ' egress IP' + (distinctIps === 1 ? '' : 's') + ' · ' + agents.map((a) => a.siteId + (a.version ? ' v' + a.version : '')).join(', ')
+        : 'Waiting for HAOS check-in';
+      el('fleet-ip-summary').textContent = agents.length
+        ? distinctIps + ' distinct public IP' + (distinctIps === 1 ? '' : 's') + ' · 15s poll'
+        : 'Hibernation-friendly 15s poll';
       el('kpi-jobs').textContent = totalOk + ' / ' + totalErr;
       el('kpi-cooldowns').textContent = affinities.length + ' active 429 cooldown' + (affinities.length === 1 ? '' : 's');
 
@@ -445,19 +459,38 @@ function renderDashboardHtml(params: {
       const grid = el('fleet-grid');
       const siteSelect = el('f-site');
       const prevSelected = siteSelect.value;
-      siteSelect.innerHTML = '<option value="">Load-Balance All Remote Sites (LRU)</option>' +
-        agents.map((a) => '<option value="' + esc(a.siteId) + '">' + esc(a.siteId) + ' (' + esc(a.arch) + ')</option>').join('');
+      siteSelect.innerHTML = '<option value="">Auto (Public-IP split + 30m host-sticky)</option>' +
+        agents.map((a) => '<option value="' + esc(a.siteId) + '">' + esc(a.siteId) + ' (' + esc(a.version ? 'v' + a.version + ', ' : '') + esc(a.arch) + ')</option>').join('');
       siteSelect.value = prevSelected;
 
+      const fmtIp = (ip) => {
+        if (!ip) return 'pending reconnect';
+        if (showFullIps) return ip;
+        if (ip.includes('.')) {
+          const p = ip.split('.');
+          return p.length === 4 ? p[0] + '.' + p[1] + '.xxx.' + p[3] : ip;
+        }
+        const h = ip.split(':');
+        return h.slice(0, 2).join(':') + ':xxxx::';
+      };
+
       grid.innerHTML = agents.length
-        ? agents.map((a) =>
-            '<div class="site-card">' +
-              '<div class="site-top"><span class="site-name">' + esc(a.siteId) + '</span><span class="arch">' + esc(a.arch) + '</span></div>' +
+        ? agents.map((a) => {
+            const verBadge = a.version
+              ? '<span class="ver">v' + esc(a.version) + '</span>'
+              : '<span class="ver ver-legacy" title="Update add-on to report release version">pre-1.0.5</span>';
+            const verDetail = (a.version ? 'v' + a.version : 'legacy') + (a.goVersion ? ' · ' + a.goVersion : '');
+            const sharedCount = a.publicIp ? (ipCounts[a.publicIp] || 1) : 1;
+            const ipNote = sharedCount > 1 ? ' (shared x' + sharedCount + ')' : '';
+            return '<div class="site-card">' +
+              '<div class="site-top"><span class="site-name">' + esc(a.siteId) + '</span><span style="display:inline-flex;gap:5px;align-items:center">' + verBadge + '<span class="arch">' + esc(a.arch) + '</span></span></div>' +
+              '<div class="kv"><span>Version</span><strong>' + esc(verDetail) + '</strong></div>' +
+              '<div class="kv"><span>Public IP</span><strong><code>' + esc(fmtIp(a.publicIp)) + '</code>' + esc(ipNote) + '</strong></div>' +
               '<div class="kv"><span>Connected</span><strong>' + esc(relTime(a.connectedAt)) + '</strong></div>' +
               '<div class="kv"><span>Last Job</span><strong>' + esc(relTime(a.lastJobAt)) + '</strong></div>' +
               '<div class="kv"><span>Jobs OK / Err</span><strong>' + Number(a.jobsOk) + ' / ' + Number(a.jobsErr) + '</strong></div>' +
-            '</div>'
-          ).join('')
+            '</div>';
+          }).join('')
         : '<div class="muted">No remote agents currently connected over WebSocket.</div>';
 
       el('affinity-tbody').innerHTML = affinities.length
@@ -483,6 +516,18 @@ function renderDashboardHtml(params: {
 
       renderLogs();
     }
+
+    async function loadState() {
+      const res = await fetch('/admin/api/state', { headers: { 'accept': 'application/json' } });
+      if (res.status === 401) { location.reload(); return; }
+      renderState(await res.json());
+    }
+
+    el('toggle-ip-btn').addEventListener('click', () => {
+      showFullIps = !showFullIps;
+      el('toggle-ip-btn').textContent = showFullIps ? 'Mask IPs' : 'Show Full IPs';
+      if (lastStateData) renderState(lastStateData);
+    });
 
     document.querySelectorAll('.tab[data-cat]').forEach((btn) => {
       btn.addEventListener('click', () => {

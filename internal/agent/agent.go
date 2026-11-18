@@ -20,6 +20,10 @@ import (
 	"github.com/bartrumb/edgefetch/internal/ws"
 )
 
+// Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
+// Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/internal/agent.Version=...".
+var Version = "1.0.5"
+
 const (
 	DefaultPingInterval    = 30 * time.Second
 	DefaultReadWatchdog    = 50 * time.Second
@@ -128,17 +132,19 @@ func runSession(
 	lastError string,
 ) error {
 	conn, err := ws.Dial(ctx, cfg.HubURL+"/agent/ws", cfg.UserAgent, map[string]string{
-		"Authorization": "Bearer " + cfg.AgentToken,
-		"X-Agent-Site":  cfg.SiteID,
-		"X-Agent-Arch":  runtime.GOARCH,
+		"Authorization":   "Bearer " + cfg.AgentToken,
+		"X-Agent-Site":    cfg.SiteID,
+		"X-Agent-Arch":    runtime.GOARCH,
+		"X-Agent-Version": Version,
 	})
 	if err != nil {
 		return err
 	}
-	log.Info("agent_connected", slog.String("hub", cfg.HubURL), slog.String("arch", runtime.GOARCH))
+	log.Info("agent_connected", slog.String("hub", cfg.HubURL), slog.String("arch", runtime.GOARCH), slog.String("version", Version))
 
 	helloPayload, _ := json.Marshal(map[string]any{
 		"type":             "agent_hello",
+		"version":          Version,
 		"arch":             runtime.GOARCH,
 		"goVersion":        runtime.Version(),
 		"reconnectAttempt": reconnectAttempt,

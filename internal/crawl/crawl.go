@@ -68,19 +68,22 @@ type Result struct {
 	Body         string           `json:"body,omitempty"`
 }
 
-// Options bounds a crawl batch. Zero values take safe defaults in Normalize().
+// Bool returns a pointer to v for configuring optional tri-state boolean fields on Options.
+func Bool(v bool) *bool { return &v }
+
+// Options bounds a crawl batch. Zero values take safe defaults in Normalize() (including RespectRobots = true).
 type Options struct {
-	PauseMs       int  `json:"pauseMs"`
-	PauseJitterMs int  `json:"pauseJitterMs,omitempty"`
-	GapMs         int  `json:"gapMs"`
-	Concurrency   int  `json:"concurrency"`
-	TimeoutMs     int  `json:"timeoutMs"`
-	MaxBytes      int  `json:"maxBytes"`
-	Retries       int  `json:"retries"`
-	IncludeBody   bool `json:"includeBody"`
-	RespectRobots bool `json:"respectRobots,omitempty"`
-	// Robots is accepted as a wire alias for RespectRobots so callers sending either field name enforce RFC 9309 rules.
-	Robots bool `json:"robots,omitempty"`
+	PauseMs       int   `json:"pauseMs"`
+	PauseJitterMs int   `json:"pauseJitterMs,omitempty"`
+	GapMs         int   `json:"gapMs"`
+	Concurrency   int   `json:"concurrency"`
+	TimeoutMs     int   `json:"timeoutMs"`
+	MaxBytes      int   `json:"maxBytes"`
+	Retries       int   `json:"retries"`
+	IncludeBody   bool  `json:"includeBody"`
+	RespectRobots *bool `json:"respectRobots,omitempty"`
+	// Robots is accepted as a wire alias for RespectRobots. When both are omitted, Normalize() defaults to true.
+	Robots *bool `json:"robots,omitempty"`
 }
 
 const (
@@ -93,12 +96,22 @@ const (
 	MaxRetries       = 3
 )
 
-// Normalize clamps out-of-range or zero fields on a value copy of `Options`.
-func (o Options) Normalize() Options {
-	if o.Robots {
-		o.RespectRobots = true
-		o.Robots = false
+// RobotsEnabled reports whether /robots.txt enforcement is active (defaulting to true when unset).
+func (o Options) RobotsEnabled() bool {
+	if o.RespectRobots != nil {
+		return *o.RespectRobots
 	}
+	if o.Robots != nil {
+		return *o.Robots
+	}
+	return true
+}
+
+// Normalize clamps out-of-range or zero fields on a value copy of Options.
+func (o Options) Normalize() Options {
+	enabled := o.RobotsEnabled()
+	o.RespectRobots = Bool(enabled)
+	o.Robots = nil
 	if o.PauseMs <= 0 {
 		o.PauseMs = DefaultPauseMs
 	}
@@ -354,7 +367,7 @@ func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, l
 					continue
 				}
 
-				if opts.RespectRobots {
+				if opts.RobotsEnabled() {
 					if allowed, distressed, reason := c.checkRobots(ctx, hs, r.URL); !allowed {
 						outcome := classify.OutcomeError
 						if distressed {

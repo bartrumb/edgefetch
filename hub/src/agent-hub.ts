@@ -2,27 +2,42 @@
  * Pure coordination engine for outbound Home Assistant OS remote crawler nodes (`AgentHubEngine`) and the remote-first
  * failover router (`routeFetchWithFailover`).
  *
- * Routing & load-balancing model:
- *  - Tier 1 (Primary): Load-balances requests across all connected remote HAOS nodes (`site-arm64`, `site-win-vm`,
- *    `site-x86`) via Least-Recently-Used (`lastJobAt` ascending) — sharding multi-URL batches across healthy nodes in
- *    parallel and placing any `(host, siteId)` that receives HTTP `429` into temporary cooldown (`Retry-After` or 5m)
- *    while failing over to remaining healthy remote nodes.
- *  - Tier 2 (Cloudflare Overflow): `CrawlerContainer` stays asleep ($0) during normal operation and is invoked in
- *    `target=auto` ONLY when all remote nodes hit HTTP `429` (or if zero remote nodes are reachable). Store `403`,
- *    `404`, `503`, and `cf-mitigated` challenges are never re-fired to Cloudflare.
+ * Routing, Public-IP Load Splitting, Sticky Host Affinity & Polite 429 Failover:
+ *  - Public-IP-Aware Load Splitting + Host-Sticky Affinity (Tier 1 Primary):
+ *    Connected nodes report CPU architecture, EdgeFetch/Go version, and verified public egress IP (`cf-connecting-ip`).
+ *    New origin hosts are assigned to the Least-Recently-Used `publicIp` egress group first (and LRU node within that IP
+ *    group), then pinned to that node for 30 minutes (`HOST_STICKY_TTL_MS`) so requests to a single origin reuse one
+ *    consistent IP + warm HTTP/2 connection instead of rotating addresses across sequential calls.
+ *  - Race-Free Per-Host Serialization Queue:
+ *    Concurrent calls touching the same origin host queue through an in-DO FIFO mutex (`withHostLocks`) that reserves
+ *    and awaits `hostNextAllowed` (`pauseMs` or `Retry-After`) atomically — preventing overlapping calls from sleeping
+ *    together and bursting the host simultaneously.
+ *  - Polite HTTP `429` Cooldown + Wait Before Failover (Peer & Cloudflare Overflow):
+ *    When an origin returns HTTP `429` (`outcome !== 'challenge'`), `AgentHubEngine` cools down both `siteId` and
+ *    `ip:<publicIp>` in SQLite (`site_cooldowns`). Before any failover node or Cloudflare overflow (`callContainer`)
+ *    re-attempts that host, the coordinator waits out the origin's full `Retry-After` header (or `15s` default throttle
+ *    pause when `Retry-After` is absent). If `Retry-After` exceeds the caller's remaining `maxSeconds` budget, the `429`
+ *    is returned directly to the caller without failing over to another IP.
  */
 import { sameBytes, SITE_ID_PATTERN } from './auth';
 
-export const DEFAULT_429_COOLDOWN_MS = 5 * 60_000; // 5m per-site 429 cooldown when Retry-After is absent
+export const DEFAULT_429_COOLDOWN_MS = 5 * 60_000; // 5m per-site/IP 429 cooldown when Retry-After is shorter/absent
+export const DEFAULT_429_NO_HEADER_WAIT_MS = 15_000; // 15s shared host wait before failover when 429 lacks Retry-After
+export const HOST_STICKY_TTL_MS = 30 * 60_000; // 30m sliding host -> site affinity (prevents single-store IP rotation)
 const MIN_COOLDOWN_MS = 10_000;
-const MAX_COOLDOWN_MS = 30 * 60_000;
+const MAX_COOLDOWN_MS = 60 * 60_000;
 export const MAX_REPLY_BYTES = 20 << 20; // 20 MiB decompressed cap
 const MIN_JOB_TIMEOUT_MS = 5_000;
 const MAX_JOB_TIMEOUT_MS = 300_000;
+const DEFAULT_CROSS_NODE_PAUSE_MS = 2_000;
+const MAX_TRACKED_HOSTS = 512;
 
 export interface AgentAttachment {
   siteId: string;
   arch: string;
+  version?: string;
+  goVersion?: string;
+  publicIp?: string;
   connectedAt: number;
   lastJobAt: number;
   jobsOk: number;
@@ -38,7 +53,7 @@ export interface HubSocketLike {
   deserializeAttachment(): unknown;
 }
 
-/** Represents a temporary per-host `429` cooldown on a specific remote `siteId` (aliased as `AffinityPin` for UI/MCP compatibility). */
+/** Represents a temporary per-host `429` cooldown on a specific remote `siteId` or `ip:<publicIp>`. */
 export interface AffinityPin {
   host: string;
   siteId: string;
@@ -95,17 +110,25 @@ export function createMemoryCooldownStore(): CooldownStore {
   };
 }
 
+/** Parses an RFC 9110 `Retry-After` header into exact uncapped milliseconds (`null` when absent or invalid). */
+export function parseExactRetryAfterMs(rawRetryAfter: unknown, now: number): number | null {
+  if (typeof rawRetryAfter !== 'string' || !rawRetryAfter.trim()) return null;
+  const trimmed = rawRetryAfter.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const secs = Number(trimmed);
+    return Number.isFinite(secs) && secs >= 0 ? secs * 1_000 : null;
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (Number.isFinite(parsedDate)) {
+    return Math.max(0, parsedDate - now);
+  }
+  return null;
+}
+
 export function parseRetryAfterCooldownMs(rawRetryAfter: unknown, now: number): number {
-  if (typeof rawRetryAfter === 'string' && rawRetryAfter.trim()) {
-    const trimmed = rawRetryAfter.trim();
-    if (/^\d+$/.test(trimmed)) {
-      const ms = Number(trimmed) * 1_000;
-      return Math.min(MAX_COOLDOWN_MS, Math.max(MIN_COOLDOWN_MS, ms));
-    }
-    const parsedDate = Date.parse(trimmed);
-    if (Number.isFinite(parsedDate)) {
-      return Math.min(MAX_COOLDOWN_MS, Math.max(MIN_COOLDOWN_MS, parsedDate - now));
-    }
+  const exact = parseExactRetryAfterMs(rawRetryAfter, now);
+  if (exact !== null) {
+    return Math.min(MAX_COOLDOWN_MS, Math.max(MIN_COOLDOWN_MS, exact));
   }
   return DEFAULT_429_COOLDOWN_MS;
 }
@@ -121,8 +144,19 @@ interface PendingJob {
 }
 
 export type AgentDispatchResult =
-  | { ok: true; siteId: string; bodyText: string }
-  | { ok: false; status: number; error: string; message: string };
+  | {
+      ok: true;
+      siteId: string;
+      bodyText: string;
+      retryAfterBudgetExceeded?: boolean;
+    }
+  | {
+      ok: false;
+      status: number;
+      error: string;
+      message: string;
+      retryAfterBudgetExceeded?: boolean;
+    };
 
 export interface CompleteJobResult {
   ok: boolean;
@@ -157,12 +191,46 @@ function sanitizeArch(raw: string | null | undefined): string {
   return /^[a-z0-9_-]{1,24}$/.test(clean) ? clean : 'unknown';
 }
 
+function sanitizeVersion(raw: string | null | undefined): string | undefined {
+  const clean = (raw ?? '').trim().replace(/^v/i, '');
+  return /^[0-9A-Za-z._+-]{1,32}$/.test(clean) ? clean : undefined;
+}
+
+function sanitizeGoVersion(raw: string | null | undefined): string | undefined {
+  const clean = (raw ?? '').trim();
+  return /^go[0-9A-Za-z._+-]{1,28}$/i.test(clean) ? clean : undefined;
+}
+
+export function sanitizePublicIp(raw: string | null | undefined): string | undefined {
+  const first = (raw ?? '').split(',')[0]?.trim() ?? '';
+  if (!first || first.length > 45) return undefined;
+  if (/^[0-9]{1,3}(\.[0-9]{1,3}){3}$/.test(first) || /^[0-9a-fA-F:]+$/.test(first)) {
+    return first.toLowerCase();
+  }
+  return undefined;
+}
+
 export function extractPrimaryHost(rawUrl: unknown): string | null {
   if (typeof rawUrl !== 'string' || !rawUrl) return null;
   try {
     return new URL(rawUrl).hostname.toLowerCase().replace(/\.+$/, '') || null;
   } catch {
     return null;
+  }
+}
+
+export function extractDistinctHostsFromBody(rawBody: string): string[] {
+  try {
+    const parsed = JSON.parse(rawBody) as { requests?: Array<{ url?: unknown }> };
+    if (!Array.isArray(parsed.requests)) return [];
+    const set = new Set<string>();
+    for (const r of parsed.requests) {
+      const h = extractPrimaryHost(r?.url);
+      if (h) set.add(h);
+    }
+    return [...set].sort();
+  } catch {
+    return [];
   }
 }
 
@@ -203,9 +271,6 @@ export interface AgentHubDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
-const DEFAULT_CROSS_NODE_PAUSE_MS = 2_000;
-const MAX_TRACKED_HOST_PACING = 512;
-
 export class AgentHubEngine {
   private readonly getSockets: (tag?: string) => HubSocketLike[];
   private readonly cooldowns: CooldownStore;
@@ -214,6 +279,8 @@ export class AgentHubEngine {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly pending = new Map<string, PendingJob>();
   private readonly hostNextAllowed = new Map<string, number>();
+  private readonly hostAffinity = new Map<string, { siteId: string; expiresAt: number }>();
+  private readonly hostLocks = new Map<string, Promise<void>>();
 
   constructor(deps: AgentHubDeps) {
     this.getSockets = deps.getSockets;
@@ -234,24 +301,192 @@ export class AgentHubEngine {
       this.hostNextAllowed.delete(host);
       this.hostNextAllowed.set(host, nextAllowedAt);
     }
-    while (this.hostNextAllowed.size > MAX_TRACKED_HOST_PACING) {
+    while (this.hostNextAllowed.size > MAX_TRACKED_HOSTS) {
       const oldest = this.hostNextAllowed.keys().next().value;
       if (oldest === undefined) break;
       this.hostNextAllowed.delete(oldest);
     }
   }
 
+  private setStickyHost(host: string, siteId: string, now: number): void {
+    this.hostAffinity.delete(host);
+    this.hostAffinity.set(host, { siteId, expiresAt: now + HOST_STICKY_TTL_MS });
+    while (this.hostAffinity.size > MAX_TRACKED_HOSTS) {
+      const oldest = this.hostAffinity.keys().next().value;
+      if (oldest === undefined) break;
+      this.hostAffinity.delete(oldest);
+    }
+  }
+
+  private getStickySite(host: string, now: number): string | null {
+    const pin = this.hostAffinity.get(host);
+    if (!pin) return null;
+    if (pin.expiresAt <= now) {
+      this.hostAffinity.delete(host);
+      return null;
+    }
+    return pin.siteId;
+  }
+
+  /** Serializes concurrent operations per origin host in FIFO order so overlapping calls never race on pacing sleeps. */
+  private async withSingleHostLock<T>(host: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.hostLocks.get(host) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = prev.then(() => gate);
+    this.hostLocks.set(host, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.hostLocks.get(host) === tail) {
+        this.hostLocks.delete(host);
+      }
+    }
+  }
+
+  async withHostLocks<T>(hosts: string[], fn: () => Promise<T>): Promise<T> {
+    const sorted = [...new Set(hosts.filter(Boolean))].sort();
+    if (sorted.length === 0) return fn();
+    const runAt = (idx: number): Promise<T> => {
+      if (idx >= sorted.length) return fn();
+      return this.withSingleHostLock(sorted[idx]!, () => runAt(idx + 1));
+    };
+    return runAt(0);
+  }
+
+  /**
+   * Waits inside the FIFO per-host lock until `hostNextAllowed` is reached and stamps `pauseMs` for the upcoming call.
+   * Used by both remote dispatches AND Cloudflare overflow (`callContainer`) so Retry-After / pauseMs is never bypassed.
+   */
+  async waitForHostWindow(
+    hosts: string[],
+    pauseMs = DEFAULT_CROSS_NODE_PAUSE_MS,
+    budgetDeadlineAt?: number,
+  ): Promise<{ ok: true } | { ok: false; retryAfterWaitMs: number }> {
+    if (hosts.length === 0) return { ok: true };
+    return this.withHostLocks(hosts, async () => {
+      const now = this.now();
+      let maxWaitMs = 0;
+      for (const host of hosts) {
+        const nextAt = this.hostNextAllowed.get(host) ?? 0;
+        if (nextAt > now) {
+          maxWaitMs = Math.max(maxWaitMs, nextAt - now);
+        }
+      }
+      if (budgetDeadlineAt !== undefined && now + maxWaitMs > budgetDeadlineAt) {
+        return { ok: false, retryAfterWaitMs: maxWaitMs };
+      }
+      if (maxWaitMs > 0) {
+        await this.sleep(maxWaitMs);
+      }
+      const afterSleep = this.now();
+      for (const host of hosts) {
+        this.recordHostPacing(host, afterSleep + Math.max(0, pauseMs));
+      }
+      return { ok: true };
+    });
+  }
+
+  private isNodeCooledDownForHost(host: string | null, att: AgentAttachment, now: number): boolean {
+    if (!host) return false;
+    if (this.cooldowns.isCooledDown(host, att.siteId, now)) return true;
+    if (att.publicIp && this.cooldowns.isCooledDown(host, `ip:${att.publicIp}`, now)) return true;
+    return false;
+  }
+
+  private record429CooldownForNode(host: string, att: AgentAttachment, expiresAt: number): void {
+    this.cooldowns.setCooldown(host, att.siteId, expiresAt);
+    if (att.publicIp) {
+      this.cooldowns.setCooldown(host, `ip:${att.publicIp}`, expiresAt);
+    }
+  }
+
+  /**
+   * Picks an eligible node for `host`:
+   *  1. Honors existing 30m sticky `host -> siteId` affinity so one origin never rotates IPs across sequential calls.
+   *  2. For unpinned hosts, groups eligible nodes by `publicIp` (falling back to `siteId` when IP is unknown), picks
+   *     the Least-Recently-Used `publicIp` egress group first, and picks the LRU node within that group.
+   */
+  private chooseCandidateForHost(
+    host: string | null,
+    eligible: Array<{ ws: HubSocketLike; att: AgentAttachment }>,
+    virtualLastJobAt: Map<string, number>,
+    now: number,
+    wantSite?: string,
+  ): { ws: HubSocketLike; att: AgentAttachment } {
+    if (!wantSite && host) {
+      const stickySite = this.getStickySite(host, now);
+      if (stickySite) {
+        const match = eligible.find((c) => c.att.siteId === stickySite);
+        if (match) {
+          this.setStickyHost(host, match.att.siteId, now);
+          return match;
+        }
+      }
+    }
+
+    const effectiveStamp = (att: AgentAttachment) => Math.max(att.lastJobAt, virtualLastJobAt.get(att.siteId) ?? 0);
+
+    // Group candidates by verified publicIp so multi-VM hosts sharing one WAN router split 1 share, not N shares!
+    const groups = new Map<
+      string,
+      { groupLastUsed: number; groupConnectedAt: number; members: Array<{ ws: HubSocketLike; att: AgentAttachment }> }
+    >();
+    for (const c of eligible) {
+      const key = c.att.publicIp ? `ip:${c.att.publicIp}` : `site:${c.att.siteId}`;
+      const stamp = effectiveStamp(c.att);
+      let g = groups.get(key);
+      if (!g) {
+        g = { groupLastUsed: stamp, groupConnectedAt: c.att.connectedAt, members: [] };
+        groups.set(key, g);
+      } else {
+        g.groupLastUsed = Math.max(g.groupLastUsed, stamp);
+        g.groupConnectedAt = Math.min(g.groupConnectedAt, c.att.connectedAt);
+      }
+      g.members.push(c);
+    }
+
+    const orderedGroups = [...groups.values()].sort(
+      (a, b) => a.groupLastUsed - b.groupLastUsed || a.groupConnectedAt - b.groupConnectedAt,
+    );
+    const winningGroup = orderedGroups[0]!;
+    winningGroup.members.sort(
+      (a, b) => effectiveStamp(a.att) - effectiveStamp(b.att) || a.att.connectedAt - b.att.connectedAt,
+    );
+    const chosen = winningGroup.members[0]!;
+
+    if (!wantSite && host) {
+      this.setStickyHost(host, chosen.att.siteId, now);
+    }
+    return chosen;
+  }
+
   /** Attaches metadata onto a newly accepted HAOS site WebSocket, retiring any stale duplicate socket for that siteId. */
-  registerAgent(ws: HubSocketLike, siteId: string, arch?: string | null): AgentAttachment {
+  registerAgent(
+    ws: HubSocketLike,
+    siteId: string,
+    arch?: string | null,
+    meta?: { version?: string | null; goVersion?: string | null; publicIp?: string | null },
+  ): AgentAttachment {
     const normalized = siteId.trim().toLowerCase();
     for (const old of this.getSockets(`site:${normalized}`)) {
       if (old === ws) continue;
       this.abortJobsForSocket(old, `site ${normalized} reconnected`);
       retireSocket(old, 'replaced');
     }
+    const version = sanitizeVersion(meta?.version);
+    const goVersion = sanitizeGoVersion(meta?.goVersion);
+    const publicIp = sanitizePublicIp(meta?.publicIp);
     const att: AgentAttachment = {
       siteId: normalized,
       arch: sanitizeArch(arch),
+      ...(version ? { version } : {}),
+      ...(goVersion ? { goVersion } : {}),
+      ...(publicIp ? { publicIp } : {}),
       connectedAt: this.now(),
       lastJobAt: 0,
       jobsOk: 0,
@@ -259,6 +494,26 @@ export class AgentHubEngine {
     };
     ws.serializeAttachment(att);
     return att;
+  }
+
+  /** Updates version / goVersion / arch metadata on an active socket when `agent_hello` arrives. */
+  updateAgentHello(
+    ws: HubSocketLike,
+    hello: { version?: string | null; goVersion?: string | null; arch?: string | null },
+  ): AgentAttachment | null {
+    const raw = ws.deserializeAttachment();
+    if (!isAttachment(raw)) return null;
+    const version = sanitizeVersion(hello.version) ?? raw.version;
+    const goVersion = sanitizeGoVersion(hello.goVersion) ?? raw.goVersion;
+    const arch = hello.arch ? sanitizeArch(hello.arch) : raw.arch;
+    const updated: AgentAttachment = {
+      ...raw,
+      arch,
+      ...(version ? { version } : {}),
+      ...(goVersion ? { goVersion } : {}),
+    };
+    ws.serializeAttachment(updated);
+    return updated;
   }
 
   /** Called from `webSocketClose` / `webSocketError` so in-flight jobs fail over immediately to another HAOS site. */
@@ -271,6 +526,9 @@ export class AgentHubEngine {
       );
       if (!stillConnected) {
         this.cooldowns.clearSite(raw.siteId);
+        for (const [h, pin] of this.hostAffinity.entries()) {
+          if (pin.siteId === raw.siteId) this.hostAffinity.delete(h);
+        }
       }
     }
   }
@@ -285,10 +543,6 @@ export class AgentHubEngine {
     }
   }
 
-  /**
-   * Returns at most one active OPEN socket per `siteId` (the newest `connectedAt`), retiring any older half-open
-   * TCP ghost sockets still lingering in `CLOSING` state inside Hibernating Durable Objects.
-   */
   private activeSocketsBySite(): Array<{ ws: HubSocketLike; att: AgentAttachment }> {
     const bySite = new Map<string, { ws: HubSocketLike; att: AgentAttachment }>();
     for (const ws of this.getSockets()) {
@@ -310,20 +564,19 @@ export class AgentHubEngine {
     return [...bySite.values()];
   }
 
-  /** Lists all currently connected HAOS remote agents and their health counters. */
-  listAgents(): { connected: number; agents: AgentAttachment[] } {
+  /** Lists all currently connected HAOS remote agents and their health, version, and publicIp metadata. */
+  listAgents(): { connected: number; distinctPublicIps: number; agents: AgentAttachment[] } {
     const agents = this.activeSocketsBySite()
       .map(({ att }) => ({ ...att }))
       .sort((a, b) => a.siteId.localeCompare(b.siteId));
-    return { connected: agents.length, agents };
+    const distinctIps = new Set(agents.map((a) => a.publicIp ?? `site:${a.siteId}`)).size;
+    return { connected: agents.length, distinctPublicIps: distinctIps, agents };
   }
 
-  /** Lists active per-host `429` remote site cooldowns (`(host, siteId) -> expiresAt`). */
   listAffinities(): AffinityPin[] {
     return this.cooldowns.listPins(this.now());
   }
 
-  /** Clears `429` remote site cooldowns globally or for a single `siteId`. */
   clearAffinities(siteId?: string): void {
     const clean = siteId?.trim().toLowerCase();
     if (clean) {
@@ -333,14 +586,6 @@ export class AgentHubEngine {
     }
   }
 
-  /**
-   * Load-balances a `FetchCall` across connected remote HAOS nodes:
-   *  - Orders healthy remote nodes by Least-Recently-Used (`lastJobAt` ascending, tie-broken by `connectedAt` ascending)
-   *    so sequential requests and multi-URL batches spread evenly across all connected remote sites.
-   *  - If a remote site returns HTTP `429` (`outcome !== 'challenge'`), places `(host, siteId)` into cooldown and
-   *    automatically retries that item across remaining non-429 remote sites before returning `429` to the caller
-   *    (allowing `routeFetchWithFailover` to reach out via Cloudflare ONLY after remote nodes get `429`).
-   */
   async dispatchFetch(
     rawCallBody: string,
     trace: Record<string, string> = {},
@@ -361,10 +606,8 @@ export class AgentHubEngine {
     }
 
     const total = call.requests.length;
-    const defaultTimeout = Math.min(
-      MAX_JOB_TIMEOUT_MS,
-      Math.max(MIN_JOB_TIMEOUT_MS, ((call.maxSeconds && call.maxSeconds > 0 ? call.maxSeconds : 60) + 5) * 1_000),
-    );
+    const maxSeconds = call.maxSeconds && call.maxSeconds > 0 ? call.maxSeconds : 60;
+    const defaultTimeout = Math.min(MAX_JOB_TIMEOUT_MS, Math.max(MIN_JOB_TIMEOUT_MS, (maxSeconds + 5) * 1_000));
     const timeoutMs = opts.timeoutMs ?? defaultTimeout;
     const wantSite = opts.preferredSite?.trim().toLowerCase();
 
@@ -382,183 +625,232 @@ export class AgentHubEngine {
         : DEFAULT_CROSS_NODE_PAUSE_MS;
     const crossNodePauseMs = rawPauseMs > 0 ? rawPauseMs : DEFAULT_CROSS_NODE_PAUSE_MS;
 
-    const startedAt = this.now();
-    const finalResults: Array<CrawlResultItem | undefined> = Array.from({ length: total }, () => undefined);
-    const triedSites = Array.from({ length: total }, () => new Set<string>());
-    const sitesUsed: string[] = [];
-    let pendingIndices = Array.from({ length: total }, (_, i) => i);
-    let lastError = 'dispatch failed';
-    let lastRawSingleBody: string | null = null;
-    let round = 0;
+    const allCallHosts = [...new Set(call.requests.map((r) => extractPrimaryHost(r?.url)).filter((h): h is string => Boolean(h)))];
 
-    while (pendingIndices.length > 0 && round < 4) {
-      round++;
-      const now = this.now();
-      const lruCandidates = this.activeSocketsBySite()
-        .filter((e) => !wantSite || e.att.siteId === wantSite)
-        .sort((a, b) => a.att.lastJobAt - b.att.lastJobAt || a.att.connectedAt - b.att.connectedAt);
+    // Serialize concurrent calls touching any of the same origin hosts in strict FIFO order.
+    return this.withHostLocks(allCallHosts, async () => {
+      const startedAt = this.now();
+      const budgetDeadlineAt = startedAt + maxSeconds * 1_000;
+      const finalResults: Array<CrawlResultItem | undefined> = Array.from({ length: total }, () => undefined);
+      const triedSites = Array.from({ length: total }, () => new Set<string>());
+      const triedIps = Array.from({ length: total }, () => new Set<string>());
+      const sitesUsed: string[] = [];
+      let pendingIndices = Array.from({ length: total }, (_, i) => i);
+      let lastError = 'dispatch failed';
+      let lastRawSingleBody: string | null = null;
+      let retryAfterBudgetExceeded = false;
+      let round = 0;
 
-      if (lruCandidates.length === 0) break;
+      while (pendingIndices.length > 0 && round < 4) {
+        round++;
+        const roundLookupNow = this.now();
+        const activeCandidates = this.activeSocketsBySite().filter((e) => !wantSite || e.att.siteId === wantSite);
+        if (activeCandidates.length === 0) break;
 
-      const bySiteBatch = new Map<string, { candidate: { ws: HubSocketLike; att: AgentAttachment }; reqIndices: number[] }>();
-      const chosenByHost = new Map<string, { ws: HubSocketLike; att: AgentAttachment }>();
-      let cursor = 0;
+        const bySiteBatch = new Map<string, { candidate: { ws: HubSocketLike; att: AgentAttachment }; reqIndices: number[] }>();
+        const chosenByHost = new Map<string, { ws: HubSocketLike; att: AgentAttachment }>();
+        const virtualLastJobAt = new Map<string, number>();
+        let virtualTick = 0;
 
-      for (const reqIdx of pendingIndices) {
-        const host = extractPrimaryHost(call.requests[reqIdx]?.url);
-        const eligible = lruCandidates.filter((c) => {
-          if (triedSites[reqIdx]!.has(c.att.siteId)) return false;
-          if (!wantSite && host && this.cooldowns.isCooledDown(host, c.att.siteId, now)) return false;
-          return true;
-        });
-        if (eligible.length === 0) continue;
+        for (const reqIdx of pendingIndices) {
+          const host = extractPrimaryHost(call.requests![reqIdx]?.url);
+          const eligible = activeCandidates.filter((c) => {
+            if (triedSites[reqIdx]!.has(c.att.siteId)) return false;
+            if (c.att.publicIp && triedIps[reqIdx]!.has(c.att.publicIp)) return false;
+            if (!wantSite && this.isNodeCooledDownForHost(host, c.att, roundLookupNow)) return false;
+            return true;
+          });
+          if (eligible.length === 0) continue;
 
-        // Group same-host URLs within a batch onto a single node so per-host PauseMs + PauseJitterMs holds across nodes,
-        // while distinct hosts in the batch shard evenly across all healthy nodes.
-        let chosen = host ? chosenByHost.get(host) : undefined;
-        if (!chosen || !eligible.some((c) => c.att.siteId === chosen!.att.siteId)) {
-          chosen = eligible[cursor % eligible.length]!;
-          cursor++;
-          if (host) chosenByHost.set(host, chosen);
+          let chosen = host ? chosenByHost.get(host) : undefined;
+          if (!chosen || !eligible.some((c) => c.att.siteId === chosen!.att.siteId)) {
+            chosen = this.chooseCandidateForHost(host, eligible, virtualLastJobAt, roundLookupNow, wantSite);
+            virtualTick++;
+            virtualLastJobAt.set(chosen.att.siteId, roundLookupNow + virtualTick);
+            if (host) chosenByHost.set(host, chosen);
+          }
+
+          let bucket = bySiteBatch.get(chosen.att.siteId);
+          if (!bucket) {
+            bucket = { candidate: chosen, reqIndices: [] };
+            bySiteBatch.set(chosen.att.siteId, bucket);
+          }
+          bucket.reqIndices.push(reqIdx);
         }
 
-        let bucket = bySiteBatch.get(chosen.att.siteId);
-        if (!bucket) {
-          bucket = { candidate: chosen, reqIndices: [] };
-          bySiteBatch.set(chosen.att.siteId, bucket);
+        if (bySiteBatch.size === 0) {
+          if (finalResults.every((r) => r === undefined) && triedSites.every((s) => s.size === 0)) {
+            // Check whether an origin's Retry-After window exceeds the caller's maxSeconds budget.
+            const nowCheck = this.now();
+            const maxHostWait = Math.max(0, ...allCallHosts.map((h) => (this.hostNextAllowed.get(h) ?? 0) - nowCheck));
+            return {
+              ok: false,
+              status: 429,
+              error: 'all_agents_rate_limited',
+              message: 'all connected remote sites are currently in 429 cooldown for this host',
+              retryAfterBudgetExceeded: nowCheck + maxHostWait > budgetDeadlineAt,
+            };
+          }
+          break;
         }
-        bucket.reqIndices.push(reqIdx);
-      }
 
-      if (bySiteBatch.size === 0) {
-        // Every remaining request has either exhausted all connected remote sites or all remote sites are in 429 cooldown.
-        if (finalResults.every((r) => r === undefined) && triedSites.every((s) => s.size === 0)) {
-          return {
-            ok: false,
-            status: 429,
-            error: 'all_agents_rate_limited',
-            message: 'all connected remote sites are currently in 429 cooldown for this host',
-          };
+        // Wait out any active per-host pauseMs or Retry-After window inside the FIFO host lock BEFORE dispatching!
+        const preDispatchNow = this.now();
+        let maxWaitMs = 0;
+        for (const host of chosenByHost.keys()) {
+          const nextAt = this.hostNextAllowed.get(host) ?? 0;
+          if (nextAt > preDispatchNow) {
+            maxWaitMs = Math.max(maxWaitMs, nextAt - preDispatchNow);
+          }
         }
-        break;
-      }
-
-      // Enforce cluster-wide per-host pauseMs across back-to-back calls routed to different LRU nodes.
-      let maxWaitMs = 0;
-      const preDispatchNow = this.now();
-      for (const host of chosenByHost.keys()) {
-        const nextAt = this.hostNextAllowed.get(host) ?? 0;
-        if (nextAt > preDispatchNow) {
-          maxWaitMs = Math.max(maxWaitMs, nextAt - preDispatchNow);
+        if (maxWaitMs > 0) {
+          if (preDispatchNow + maxWaitMs > budgetDeadlineAt) {
+            retryAfterBudgetExceeded = true;
+            break;
+          }
+          await this.sleep(maxWaitMs);
         }
-      }
-      if (maxWaitMs > 0) {
-        await this.sleep(Math.min(maxWaitMs, 30_000));
-      }
-      const dispatchStamp = this.now();
-      for (const host of chosenByHost.keys()) {
-        this.recordHostPacing(host, dispatchStamp + crossNodePauseMs);
-      }
 
-      const nextPending: number[] = [];
+        const dispatchStamp = this.now();
+        for (const host of chosenByHost.keys()) {
+          this.recordHostPacing(host, dispatchStamp + crossNodePauseMs);
+        }
 
-      await Promise.all(
-        [...bySiteBatch.values()].map(async ({ candidate, reqIndices }) => {
-          const { ws, att } = candidate;
-          for (const idx of reqIndices) triedSites[idx]!.add(att.siteId);
+        const nextPending: number[] = [];
 
-          const jobId = this.uuid();
-          const jobNonce = this.uuid();
-          // Stamp monotonic LRU ordering across simultaneously dispatched shards so subsequent calls keep rotating cleanly.
-          att.lastJobAt = this.now() + sitesUsed.length;
-          ws.serializeAttachment(att);
+        await Promise.all(
+          [...bySiteBatch.values()].map(async ({ candidate, reqIndices }) => {
+            const { ws, att } = candidate;
+            for (const idx of reqIndices) {
+              triedSites[idx]!.add(att.siteId);
+              if (att.publicIp) triedIps[idx]!.add(att.publicIp);
+            }
 
-          const subCall =
-            reqIndices.length === total && round === 1
-              ? call
-              : {
-                  ...call,
-                  requests: reqIndices.map((idx) => call.requests![idx]),
-                };
-
-          try {
-            const bodyText = await this.sendAndAwaitJob(ws, att.siteId, jobId, jobNonce, subCall, trace, timeoutMs);
-            att.jobsOk++;
-            att.lastJobAt = this.now();
+            const jobId = this.uuid();
+            const jobNonce = this.uuid();
+            att.lastJobAt = this.now() + sitesUsed.length;
             ws.serializeAttachment(att);
-            sitesUsed.push(att.siteId);
 
-            if (total === 1 && reqIndices.length === 1) {
-              lastRawSingleBody = bodyText;
-            }
+            const subCall =
+              reqIndices.length === total && round === 1
+                ? call
+                : {
+                    ...call,
+                    requests: reqIndices.map((idx) => call.requests![idx]),
+                  };
 
-            let parsed: CrawlReplyShape;
+            const remainingTimeoutMs =
+              opts.timeoutMs ?? Math.max(MIN_JOB_TIMEOUT_MS, Math.min(timeoutMs, budgetDeadlineAt - this.now() + 5_000));
+
             try {
-              parsed = JSON.parse(bodyText) as CrawlReplyShape;
-            } catch {
-              lastError = `invalid JSON reply from ${att.siteId}`;
-              for (const idx of reqIndices) nextPending.push(idx);
-              return;
-            }
+              const bodyText = await this.sendAndAwaitJob(ws, att.siteId, jobId, jobNonce, subCall, trace, remainingTimeoutMs);
+              att.jobsOk++;
+              att.lastJobAt = this.now();
+              ws.serializeAttachment(att);
+              sitesUsed.push(att.siteId);
 
-            if (!Array.isArray(parsed.results) || parsed.results.length !== reqIndices.length) {
-              lastError = `mismatched result count from ${att.siteId}`;
-              for (const idx of reqIndices) nextPending.push(idx);
-              return;
-            }
+              if (total === 1 && reqIndices.length === 1) {
+                lastRawSingleBody = bodyText;
+              }
 
-            for (let j = 0; j < reqIndices.length; j++) {
-              const origIdx = reqIndices[j]!;
-              const item = parsed.results[j]!;
-              finalResults[origIdx] = item;
-              const itemHost = extractPrimaryHost(call.requests![origIdx]?.url);
-              this.recordHostPacing(itemHost, this.now() + crossNodePauseMs);
+              let parsed: CrawlReplyShape;
+              try {
+                parsed = JSON.parse(bodyText) as CrawlReplyShape;
+              } catch {
+                lastError = `invalid JSON reply from ${att.siteId}`;
+                for (const idx of reqIndices) nextPending.push(idx);
+                return;
+              }
 
-              if (item.status === 429 && item.outcome !== 'challenge') {
-                if (itemHost) {
-                  const cdMs = parseRetryAfterCooldownMs(item.retryAfter, this.now());
-                  this.cooldowns.setCooldown(itemHost, att.siteId, this.now() + cdMs);
-                  if (item.retryAfter) {
-                    this.recordHostPacing(itemHost, this.now() + Math.min(cdMs, 30_000));
+              if (!Array.isArray(parsed.results) || parsed.results.length !== reqIndices.length) {
+                lastError = `mismatched result count from ${att.siteId}`;
+                for (const idx of reqIndices) nextPending.push(idx);
+                return;
+              }
+
+              const replyNow = this.now();
+              for (let j = 0; j < reqIndices.length; j++) {
+                const origIdx = reqIndices[j]!;
+                const item = parsed.results[j]!;
+                finalResults[origIdx] = item;
+                const itemHost = extractPrimaryHost(call.requests![origIdx]?.url);
+                this.recordHostPacing(itemHost, replyNow + crossNodePauseMs);
+
+                if (item.status === 429 && item.outcome !== 'challenge') {
+                  const exactRetryMs = parseExactRetryAfterMs(item.retryAfter, replyNow);
+                  const requiredWaitMs = exactRetryMs !== null ? exactRetryMs : DEFAULT_429_NO_HEADER_WAIT_MS;
+                  const cooldownDurMs = Math.max(parseRetryAfterCooldownMs(item.retryAfter, replyNow), requiredWaitMs);
+
+                  if (itemHost) {
+                    this.record429CooldownForNode(itemHost, att, replyNow + cooldownDurMs);
+                    this.hostAffinity.delete(itemHost);
+                    this.recordHostPacing(itemHost, replyNow + requiredWaitMs);
+                  }
+
+                  // Only attempt failover if we can honestly wait out the full Retry-After / 15s window within budget!
+                  if (!wantSite) {
+                    if (replyNow + requiredWaitMs <= budgetDeadlineAt) {
+                      nextPending.push(origIdx);
+                    } else {
+                      retryAfterBudgetExceeded = true;
+                    }
                   }
                 }
-                if (!wantSite) {
-                  nextPending.push(origIdx);
+              }
+            } catch (e) {
+              lastError = e instanceof Error ? e.message : String(e);
+              att.jobsErr++;
+              ws.serializeAttachment(att);
+              for (const idx of reqIndices) {
+                const h = extractPrimaryHost(call.requests![idx]?.url);
+                if (h && this.hostAffinity.get(h)?.siteId === att.siteId) {
+                  this.hostAffinity.delete(h);
                 }
+                nextPending.push(idx);
               }
             }
-          } catch (e) {
-            lastError = e instanceof Error ? e.message : String(e);
-            att.jobsErr++;
-            ws.serializeAttachment(att);
-            for (const idx of reqIndices) nextPending.push(idx);
-          }
-        }),
-      );
+          }),
+        );
 
-      nextPending.sort((a, b) => a - b);
-      pendingIndices = nextPending;
-    }
+        nextPending.sort((a, b) => a - b);
+        pendingIndices = nextPending;
+      }
 
-    if (finalResults.some((r) => r === undefined)) {
-      return { ok: false, status: 502, error: 'agent_failed', message: lastError };
-    }
+      if (finalResults.some((r) => r === undefined)) {
+        return {
+          ok: false,
+          status: 502,
+          error: 'agent_failed',
+          message: lastError,
+          ...(retryAfterBudgetExceeded ? { retryAfterBudgetExceeded: true } : {}),
+        };
+      }
 
-    const uniqueSites = [...new Set(sitesUsed)];
-    const siteLabel = uniqueSites.join('+') || wantSite || 'agent';
+      const uniqueSites = [...new Set(sitesUsed)];
+      const siteLabel = uniqueSites.join('+') || wantSite || 'agent';
 
-    // Preserve exact byte-for-byte Go JSON reply in the common 1-request, single-try case.
-    if (total === 1 && sitesUsed.length === 1 && lastRawSingleBody !== null) {
-      return { ok: true, siteId: siteLabel, bodyText: lastRawSingleBody };
-    }
+      if (total === 1 && sitesUsed.length === 1 && lastRawSingleBody !== null) {
+        return {
+          ok: true,
+          siteId: siteLabel,
+          bodyText: lastRawSingleBody,
+          ...(retryAfterBudgetExceeded ? { retryAfterBudgetExceeded: true } : {}),
+        };
+      }
 
-    const assembled = finalResults as CrawlResultItem[];
-    const mergedReply: CrawlReplyShape = {
-      results: assembled,
-      summary: recomputeSummary(assembled),
-      durationMs: Math.max(0, this.now() - startedAt),
-    };
-    return { ok: true, siteId: siteLabel, bodyText: JSON.stringify(mergedReply) };
+      const assembled = finalResults as CrawlResultItem[];
+      const mergedReply: CrawlReplyShape = {
+        results: assembled,
+        summary: recomputeSummary(assembled),
+        durationMs: Math.max(0, this.now() - startedAt),
+      };
+      return {
+        ok: true,
+        siteId: siteLabel,
+        bodyText: JSON.stringify(mergedReply),
+        ...(retryAfterBudgetExceeded ? { retryAfterBudgetExceeded: true } : {}),
+      };
+    });
   }
 
   private sendAndAwaitJob(
@@ -588,13 +880,11 @@ export class AgentHubEngine {
     });
   }
 
-  /** Pre-checks whether `jobId` is actively pending for `siteId` before streaming/decompressing `/agent/reply`. */
   hasPendingJob(jobId: string, siteId: string): boolean {
     const job = this.pending.get(jobId);
     return Boolean(job && job.siteId === siteId.trim().toLowerCase());
   }
 
-  /** Verifies `jobNonce` + `siteId` in constant time and resolves the pending `dispatchFetch` call. */
   completeJob(jobId: string, jobNonce: string, siteId: string, bodyText: string): CompleteJobResult {
     const job = this.pending.get(jobId);
     if (!job) return { ok: false, status: 404, error: 'unknown_or_expired_job' };
@@ -642,17 +932,6 @@ function jsonWithVia(bodyText: string, status: number, via: string): Response {
   });
 }
 
-/**
- * Remote-first load-balanced execution router for `POST /fetch`:
- *  - `container`: Cloudflare Go container only (`x-crawler-via: container`).
- *  - `agent`: Remote HAOS node pool only (`x-crawler-via: agent:<siteId>`).
- *  - `auto` (default):
- *     1. Dispatches to the load-balanced remote HAOS pool (`AgentHubDO`) FIRST (`CrawlerContainer` stays asleep).
- *     2. Reaches out via Cloudflare (`callContainer`) ONLY if the remote pool gets HTTP `429` (`all_agents_rate_limited`
- *        or surviving `status === 429` results after trying remote nodes) — or if zero remote nodes are reachable.
- *     3. Store `200`, `304`, `403`, `404`, `503`, and `cf-mitigated` challenges stay strictly on the remote nodes and
- *        NEVER wake Cloudflare.
- */
 export async function routeFetchWithFailover(params: {
   target: FetchTarget;
   site?: string;
@@ -660,11 +939,39 @@ export async function routeFetchWithFailover(params: {
   trace: Record<string, string>;
   callContainer: (body: string, trace: Record<string, string>) => Promise<Response>;
   callAgent: (body: string, trace: Record<string, string>, site?: string) => Promise<AgentDispatchResult>;
+  waitForHostWindow?: (
+    hosts: string[],
+    pauseMs?: number,
+    budgetDeadlineAt?: number,
+  ) => Promise<{ ok: true } | { ok: false; retryAfterWaitMs: number }>;
+  now?: () => number;
   onFailover?: (info: { reason: string; siteId: string; count: number }) => void;
 }): Promise<Response> {
-  const { target, site, body, trace, callContainer, callAgent, onFailover } = params;
+  const { target, site, body, trace, callContainer, callAgent, waitForHostWindow, now = Date.now, onFailover } = params;
+
+  let parsedMeta: { requests?: Array<{ url?: unknown }>; options?: { pauseMs?: number }; maxSeconds?: number } = {};
+  try {
+    parsedMeta = JSON.parse(body) as typeof parsedMeta;
+  } catch {
+    // handled downstream
+  }
+  const maxSeconds = parsedMeta.maxSeconds && parsedMeta.maxSeconds > 0 ? parsedMeta.maxSeconds : 60;
+  const budgetDeadlineAt = now() + maxSeconds * 1_000;
+  const pauseMs =
+    typeof parsedMeta.options?.pauseMs === 'number' && parsedMeta.options.pauseMs > 0
+      ? Math.min(30_000, Math.floor(parsedMeta.options.pauseMs))
+      : DEFAULT_CROSS_NODE_PAUSE_MS;
 
   if (target === 'container') {
+    if (waitForHostWindow) {
+      const gate = await waitForHostWindow(extractDistinctHostsFromBody(body), pauseMs, budgetDeadlineAt);
+      if (!gate.ok) {
+        return Response.json(
+          { error: 'rate_limited', message: `host Retry-After requires waiting ${Math.ceil(gate.retryAfterWaitMs / 1000)}s` },
+          { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': String(Math.ceil(gate.retryAfterWaitMs / 1000)) } },
+        );
+      }
+    }
     const res = await callContainer(body, trace);
     return withViaHeader(res, 'container');
   }
@@ -680,7 +987,6 @@ export async function routeFetchWithFailover(params: {
     return jsonWithVia(out.bodyText, 200, `agent:${out.siteId}`);
   }
 
-  // `target === 'auto'`: Load-balance across remote HAOS nodes first; reach out via Cloudflare ONLY on 429 (or 0 agents online).
   const agentOut = await callAgent(body, trace, site);
   if (!agentOut.ok) {
     if (agentOut.status === 400) {
@@ -689,17 +995,37 @@ export async function routeFetchWithFailover(params: {
         { status: 400, headers: { 'cache-control': 'no-store' } },
       );
     }
+    // Never bypass an origin Retry-After window that exceeds the caller's maxSeconds budget.
+    if (agentOut.status === 429 && agentOut.retryAfterBudgetExceeded) {
+      return Response.json(
+        { error: agentOut.error, message: agentOut.message },
+        { status: 429, headers: { 'cache-control': 'no-store' } },
+      );
+    }
+    if (waitForHostWindow) {
+      const gate = await waitForHostWindow(extractDistinctHostsFromBody(body), pauseMs, budgetDeadlineAt);
+      if (!gate.ok) {
+        return Response.json(
+          { error: 'all_agents_rate_limited', message: agentOut.message },
+          { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': String(Math.ceil(gate.retryAfterWaitMs / 1000)) } },
+        );
+      }
+    }
     const viaLabel = agentOut.error === 'all_agents_rate_limited' ? 'agent-429+container' : 'agent-unavail+container';
     onFailover?.({ reason: agentOut.error, siteId: site ?? 'all', count: 1 });
     const cfRes = await callContainer(body, trace);
     return withViaHeader(cfRes, viaLabel);
   }
 
+  if (agentOut.retryAfterBudgetExceeded) {
+    return jsonWithVia(agentOut.bodyText, 200, `agent:${agentOut.siteId}`);
+  }
+
   let reply: CrawlReplyShape;
-  let parsedCall: { requests?: unknown[]; options?: unknown; maxSeconds?: number };
+  let parsedCall: { requests?: Array<{ url?: unknown }>; options?: unknown; maxSeconds?: number };
   try {
     reply = JSON.parse(agentOut.bodyText) as CrawlReplyShape;
-    parsedCall = JSON.parse(body) as { requests?: unknown[]; options?: unknown; maxSeconds?: number };
+    parsedCall = JSON.parse(body) as typeof parsedCall;
   } catch {
     return jsonWithVia(agentOut.bodyText, 200, `agent:${agentOut.siteId}`);
   }
@@ -710,18 +1036,43 @@ export async function routeFetchWithFailover(params: {
     return jsonWithVia(agentOut.bodyText, 200, `agent:${agentOut.siteId}`);
   }
 
-  // ONLY reach out via Cloudflare for requests that still returned HTTP 429 after exhausting remote nodes.
-  // Never re-fire 403, 404, 503, status=0 origin errors, or anti-bot challenges (`outcome === 'challenge'`).
   const rateLimitedIndices: number[] = [];
+  let maxOverflowWaitMs = 0;
+  const postAgentNow = now();
   for (let i = 0; i < results.length; i++) {
     const r = results[i]!;
     if (r.status === 429 && r.outcome !== 'challenge') {
+      const exactMs = parseExactRetryAfterMs(r.retryAfter, postAgentNow);
+      const waitNeeded = exactMs !== null ? exactMs : DEFAULT_429_NO_HEADER_WAIT_MS;
+      if (postAgentNow + waitNeeded > budgetDeadlineAt) {
+        // Origin Retry-After exceeds budget — return the 429 honestly without sneaking around via Cloudflare!
+        continue;
+      }
+      maxOverflowWaitMs = Math.max(maxOverflowWaitMs, waitNeeded);
       rateLimitedIndices.push(i);
     }
   }
 
   if (rateLimitedIndices.length === 0) {
     return jsonWithVia(agentOut.bodyText, 200, `agent:${agentOut.siteId}`);
+  }
+
+  const overflowHosts = [
+    ...new Set(
+      rateLimitedIndices
+        .map((idx) => extractPrimaryHost(requests[idx]?.url))
+        .filter((h): h is string => Boolean(h)),
+    ),
+  ];
+
+  // Wait out the full Retry-After (or 15s default 429 pause) BEFORE Cloudflare overflow touches the origin!
+  if (waitForHostWindow) {
+    const gate = await waitForHostWindow(overflowHosts, pauseMs, budgetDeadlineAt);
+    if (!gate.ok) {
+      return jsonWithVia(agentOut.bodyText, 200, `agent:${agentOut.siteId}`);
+    }
+  } else if (maxOverflowWaitMs > 0) {
+    await new Promise<void>((resolve) => setTimeout(resolve, maxOverflowWaitMs));
   }
 
   const subCall = JSON.stringify({
@@ -762,10 +1113,6 @@ export async function routeFetchWithFailover(params: {
   return jsonWithVia(JSON.stringify(mergedReply), 200, `agent:${agentOut.siteId}+container`);
 }
 
-/**
- * Streams and optionally gunzips an `POST /agent/reply` payload with a hard byte ceiling (`maxBytes`) so a malformed
- * or oversized stream aborts immediately with `413` before exhausting isolate memory.
- */
 export async function readAgentReplyBody(
   request: Request,
   maxBytes = MAX_REPLY_BYTES,
@@ -789,21 +1136,21 @@ export async function readAgentReplyBody(
       if (value) {
         total += value.byteLength;
         if (total > maxBytes) {
-          await reader.cancel().catch(() => undefined);
-          return { ok: false, status: 413, error: 'too_large' };
+          await reader.cancel('reply exceeded maxBytes').catch(() => undefined);
+          return { ok: false, status: 413, error: 'reply_too_large' };
         }
         chunks.push(value);
       }
     }
   } catch {
-    return { ok: false, status: 400, error: 'bad_gzip_or_stream' };
+    return { ok: false, status: 400, error: 'invalid_compressed_body' };
   }
 
-  const combined = new Uint8Array(total);
+  const joined = new Uint8Array(total);
   let offset = 0;
   for (const c of chunks) {
-    combined.set(c, offset);
+    joined.set(c, offset);
     offset += c.byteLength;
   }
-  return { ok: true, text: new TextDecoder().decode(combined) };
+  return { ok: true, text: new TextDecoder().decode(joined) };
 }

@@ -141,23 +141,25 @@ export class AgentHubDO extends DurableObject<Env> {
     }
     const siteId = (request.headers.get('x-verified-site') ?? '').trim().toLowerCase();
     const arch = request.headers.get('x-agent-arch');
+    const version = request.headers.get('x-agent-version');
+    const publicIp = request.headers.get('x-verified-ip') ?? request.headers.get('cf-connecting-ip');
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server, [`site:${siteId}`]);
-    const att = this.engine.registerAgent(server as unknown as HubSocketLike, siteId, arch);
+    const att = this.engine.registerAgent(server as unknown as HubSocketLike, siteId, arch, { version, publicIp });
     server.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
     await this.activity.recordEvent({
       level: 'info',
       category: 'agent',
       event: 'agent_ws_connected',
-      summary: `Remote node "${att.siteId}" (${att.arch}) connected over WebSocket`,
-      details: { siteId: att.siteId, arch: att.arch },
+      summary: `Remote node "${att.siteId}" (${att.version ? `v${att.version}, ` : ''}${att.arch}) connected over WebSocket`,
+      details: sanitizeDetails({ siteId: att.siteId, arch: att.arch, version: att.version ?? null }),
     });
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async listAgents(): Promise<{ connected: number; agents: AgentAttachment[] }> {
+  async listAgents(): Promise<{ connected: number; distinctPublicIps: number; agents: AgentAttachment[] }> {
     return this.engine.listAgents();
   }
 
@@ -191,6 +193,7 @@ export class AgentHubDO extends DurableObject<Env> {
 
   async getPortalState(now: number): Promise<{
     connected: number;
+    distinctPublicIps: number;
     agents: AgentAttachment[];
     affinities: AffinityPin[];
     grants: OAuthGrantSummary[];
@@ -205,6 +208,14 @@ export class AgentHubDO extends DurableObject<Env> {
       mcpClients: await this.activity.listMcpClients(),
       events: await this.activity.listEvents(150),
     };
+  }
+
+  async waitForHostWindow(
+    hosts: string[],
+    pauseMs?: number,
+    budgetDeadlineAt?: number,
+  ): Promise<{ ok: true } | { ok: false; retryAfterWaitMs: number }> {
+    return this.engine.waitForHostWindow(hosts, pauseMs, budgetDeadlineAt);
   }
 
   async dispatchFetch(rawCallBody: string, trace: Record<string, string>, preferredSite?: string): Promise<AgentDispatchResult> {
@@ -276,16 +287,23 @@ export class AgentHubDO extends DurableObject<Env> {
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string' || message === 'ping' || message.length > 2048) return;
     try {
-      const msg = JSON.parse(message) as { type?: string; arch?: string; goVersion?: string; reconnectAttempt?: number };
+      const msg = JSON.parse(message) as {
+        type?: string;
+        version?: string;
+        arch?: string;
+        goVersion?: string;
+        reconnectAttempt?: number;
+      };
       if (msg.type === 'agent_hello') {
-        const att = ws.deserializeAttachment() as AgentAttachment | null;
+        const updated = this.engine.updateAgentHello(ws as unknown as HubSocketLike, msg);
+        const att = updated ?? (ws.deserializeAttachment() as AgentAttachment | null);
         const evName = (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready';
         console.info(JSON.stringify({ event: evName, siteId: att?.siteId, ...msg }));
         await this.activity.recordEvent({
           level: (msg.reconnectAttempt ?? 0) > 0 ? 'warn' : 'info',
           category: 'agent',
           event: evName,
-          summary: `Remote node "${att?.siteId ?? 'unknown'}" reported ${evName} (${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
+          summary: `Remote node "${att?.siteId ?? 'unknown'}" reported ${evName} (${att?.version ? `v${att.version}, ` : ''}${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
           details: sanitizeDetails({ siteId: att?.siteId, ...msg }),
         });
       }
@@ -470,7 +488,7 @@ async function cloudflareOverflowFetch(rawBody: string, userAgent: string, selfH
   const maxBytes = Math.min(16 << 20, Math.max(1024, call.options?.maxBytes ?? 8 << 20));
   const includeBody = Boolean(call.options?.includeBody);
   const pauseMs = Math.min(30_000, Math.max(0, Math.floor(call.options?.pauseMs ?? 2000)));
-  const respectRobots = Boolean(call.options?.respectRobots ?? call.options?.robots);
+  const respectRobots = call.options?.respectRobots ?? call.options?.robots ?? true;
   const canonicalSelf = selfHost.toLowerCase().replace(/\.+$/, '');
   const results: CrawlResultItem[] = [];
   const hostLastDone = new Map<string, number>();
@@ -675,6 +693,10 @@ export default {
             trace,
             callAgent: (b, t, s) => hub().dispatchFetch(b, t, s),
             callContainer: (b) => cloudflareOverflowFetch(b, ua, url.hostname),
+            waitForHostWindow: (hosts, p, dl) =>
+              hub()
+                .waitForHostWindow(hosts, p, dl)
+                .catch(() => ({ ok: true as const })),
             onFailover: ({ reason, siteId, count }) => {
               pendingEvents.push({
                 level: 'warn',
@@ -704,6 +726,8 @@ export default {
       if (!auth.ok) return Response.json({ error: 'unauthorized' }, { status: 401 });
       const headers = new Headers(request.headers);
       headers.set('x-verified-site', auth.siteId);
+      const clientIp = request.headers.get('cf-connecting-ip') ?? request.headers.get('x-forwarded-for');
+      if (clientIp) headers.set('x-verified-ip', clientIp);
       return hub().fetch(new Request(request.url, { method: 'GET', headers }));
     }
     if (request.method === 'POST' && url.pathname === '/agent/reply') {

@@ -59,6 +59,8 @@ jobs:
           context: .
           file: edgefetch_agent/Dockerfile
           platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
           push: true
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}

@@ -537,14 +537,17 @@ func canonicalProductToken(raw string) string {
 
 // ── Dial-time DNS-rebinding & special-purpose IP SSRF guard (net.Dialer.Control) ─────────────────────────────────
 
-// nonPublicPrefixes pre-parses IANA special-purpose IPv4 and IPv6 blocks (RFC 6890 / RFC 3879 / RFC 4291 / RFC 6052) at
-// package initialization using netip.Prefix (which strictly separates IPv4 from IPv6 without net.IP's To16 coercion).
+var ipv6GlobalUnicastPrefix = netip.MustParsePrefix("2000::/3")
+
+// nonPublicPrefixes pre-parses IANA special-purpose IPv4 and IPv6 blocks (RFC 6890 / RFC 3879 / RFC 4291 / RFC 6052 /
+// RFC 7526 / RFC 9637 / RFC 4843 / RFC 7343 / RFC 9602) at package initialization using netip.Prefix.
 var nonPublicPrefixes = func() []netip.Prefix {
 	cidrs := []string{
 		"0.0.0.0/8",           // RFC 1122 "This host on this network" (e.g. 0.1.2.3 -> local stack on Linux)
 		"100.64.0.0/10",       // RFC 6598 Carrier-Grade NAT & Tailscale mesh IPs
 		"192.0.0.0/24",        // RFC 6890 IETF Protocol Assignments
 		"192.0.2.0/24",        // RFC 5737 TEST-NET-1
+		"192.88.99.0/24",      // RFC 7526 Deprecated 6to4 Relay Anycast
 		"198.18.0.0/15",       // RFC 2544 Benchmarking
 		"198.51.100.0/24",     // RFC 5737 TEST-NET-2
 		"203.0.113.0/24",      // RFC 5737 TEST-NET-3
@@ -556,8 +559,12 @@ var nonPublicPrefixes = func() []netip.Prefix {
 		"64:ff9b:1::/48",      // RFC 8215 Local-Use IPv4/IPv6 Translation Prefix
 		"2001::/32",           // RFC 4380 Teredo Tunneling
 		"2001:2::/48",         // RFC 5180 Benchmarking
+		"2001:10::/28",        // RFC 4843 ORCHID
+		"2001:20::/28",        // RFC 7343 ORCHIDv2
 		"2001:db8::/32",       // RFC 3849 Documentation
 		"2002::/16",           // RFC 3056 6to4 Transition Anycast
+		"3fff::/20",           // RFC 9637 IPv6 Documentation Prefix
+		"5f00::/16",           // RFC 9602 Segment Routing over IPv6 (SRv6) SIDs
 		"fec0::/10",           // RFC 3879 Deprecated Site-Local IPv6 (e.g. fec0::1)
 	}
 	out := make([]netip.Prefix, 0, len(cidrs))
@@ -585,6 +592,9 @@ func IsPublicAddr(addr netip.Addr) bool {
 	}
 	// Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1 -> 127.0.0.1) so IPv4 prefixes apply uniformly.
 	addr = addr.Unmap()
+	if addr.Is6() && !ipv6GlobalUnicastPrefix.Contains(addr) {
+		return false
+	}
 	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() {
 		return false
 	}

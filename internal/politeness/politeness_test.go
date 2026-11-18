@@ -195,6 +195,12 @@ func TestSSRFGuardBlocksPrivateLoopbackCGNATAndIPv6TransitionRanges(t *testing.T
 		"[::ffff:0:127.0.0.1]:443", // RFC 2765 SIIT IPv4-translated IPv6
 		"[100::1]:443",             // RFC 6666 discard prefix
 		"[2001:db8::1]:443",        // RFC 3849 documentation prefix
+		"192.88.99.1:443",          // RFC 7526 deprecated 6to4 relay anycast (A7)
+		"[3fff::1]:443",            // RFC 9637 IPv6 documentation prefix (A7)
+		"[2001:10::1]:443",         // RFC 4843 ORCHID (A7)
+		"[2001:20::1]:443",         // RFC 7343 ORCHIDv2 (A7)
+		"[5f00::1]:443",            // RFC 9602 SRv6 SIDs / outside 2000::/3 (A7)
+		"[4000::1]:443",            // IANA reserved IPv6 outside 2000::/3 global unicast (A7)
 	}
 	for _, addr := range blocked {
 		if err := CheckPublicPeerAddress(addr); err == nil {
@@ -204,8 +210,10 @@ func TestSSRFGuardBlocksPrivateLoopbackCGNATAndIPv6TransitionRanges(t *testing.T
 
 	allowed := []string{
 		"1.1.1.1:443",
+		"8.8.8.8:443",
 		"93.184.216.34:443",
 		"[::ffff:93.184.216.34]:443",
+		"[2001:4860:4860::8888]:443",
 		"[2606:4700:4700::1111]:443",
 	}
 	for _, addr := range allowed {

@@ -18,6 +18,8 @@ const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60_000; // 30d rotating refresh toke
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60_000; // 8h admin browser session
 const RATE_LIMIT_WINDOW_MS = 5 * 60_000; // 5m brute-force window
 const RATE_LIMIT_MAX_FAILURES = 5;
+const REGISTER_RATE_LIMIT_MAX = 20; // Max 20 anonymous client registrations per 5m per IP (H-S1)
+const MAX_AUTH_FAILURE_BUCKETS = 100; // Bounds SQLite auth_failures against spoofed IPv6 sprays (H-S5)
 
 export const ADMIN_COOKIE_NAME = 'ef_admin_session';
 const CONSENT_CSRF_COOKIE = 'ef_oauth_csrf';
@@ -60,6 +62,33 @@ export interface OAuthGrantSummary {
   expiresAt: number;
 }
 
+export interface RotateRefreshParams {
+  refreshHash: string;
+  clientId: string;
+  nextAccessHash: string;
+  nextRefreshHash: string;
+  now: number;
+  accessExpiresAt: number;
+  refreshExpiresAt: number;
+}
+
+export type RotateRefreshResult =
+  | {
+      ok: true;
+      grantId: string;
+      clientId: string;
+      clientName: string;
+      scopes: string[];
+      resource: string;
+    }
+  | {
+      ok: false;
+      error: 'invalid_grant';
+      replayDetected?: boolean;
+      grantId?: string;
+      clientId?: string;
+    };
+
 export interface OAuthStore {
   putClient(client: OAuthClientRecord): Promise<void> | void;
   getClient(clientId: string): Promise<OAuthClientRecord | null> | OAuthClientRecord | null;
@@ -79,9 +108,15 @@ export interface OAuthStore {
   }): Promise<void> | void;
   getAccessToken(tokenHash: string, now: number): Promise<OAuthTokenRecord | null> | OAuthTokenRecord | null;
   consumeRefreshToken(tokenHash: string, now: number): Promise<OAuthTokenRecord | null> | OAuthTokenRecord | null;
+  rotateRefreshToken(params: RotateRefreshParams): Promise<RotateRefreshResult> | RotateRefreshResult;
   listGrants(now: number): Promise<OAuthGrantSummary[]> | OAuthGrantSummary[];
   revokeGrant(grantId: string): Promise<boolean> | boolean;
   revokeByTokenHash(tokenHash: string): Promise<void> | void;
+  checkAuthLockout(
+    bucket: string,
+    now: number,
+    maxFailures?: number,
+  ): Promise<{ allowed: boolean; retryAfterSec: number }> | { allowed: boolean; retryAfterSec: number };
   recordAuthFailure(
     bucket: string,
     now: number,
@@ -134,8 +169,19 @@ export const OAUTH_SQLITE_SCHEMA = `
 export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
   return {
     putClient(c) {
+      // Evict only clients that have NO active grants or pending authorization codes (H-S1).
       sql.exec(
-        'DELETE FROM oauth_clients WHERE client_id IN (SELECT client_id FROM oauth_clients ORDER BY created_at DESC LIMIT -1 OFFSET 499)',
+        `DELETE FROM oauth_clients
+         WHERE client_id IN (
+           SELECT oc.client_id
+           FROM oauth_clients oc
+           WHERE NOT EXISTS (SELECT 1 FROM oauth_tokens ot WHERE ot.client_id = oc.client_id AND ot.expires_at > ?)
+             AND NOT EXISTS (SELECT 1 FROM oauth_codes cd WHERE cd.client_id = oc.client_id AND cd.expires_at > ?)
+           ORDER BY oc.created_at DESC
+           LIMIT -1 OFFSET 499
+         )`,
+        c.createdAt,
+        c.createdAt,
       );
       sql.exec(
         'INSERT OR REPLACE INTO oauth_clients (client_id, client_name, redirect_uris_json, created_at) VALUES (?, ?, ?, ?)',
@@ -293,6 +339,83 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         expiresAt: r.expires_at,
       };
     },
+    rotateRefreshToken(params) {
+      const rows = sql
+        .exec<{
+          grant_id: string;
+          kind: string;
+          client_id: string;
+          client_name: string;
+          scopes_json: string;
+          resource: string;
+          created_at: number;
+          expires_at: number;
+        }>("SELECT * FROM oauth_tokens WHERE token_hash = ? AND kind IN ('refresh', 'refresh_used')", params.refreshHash)
+        .toArray();
+      const r = rows[0];
+      if (!r) return { ok: false, error: 'invalid_grant' };
+      if (r.expires_at <= params.now) {
+        sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
+        return { ok: false, error: 'invalid_grant' };
+      }
+      // Replay of an already-rotated refresh token immediately revokes the ENTIRE grant (H-S3)!
+      if (r.kind === 'refresh_used') {
+        sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
+        return {
+          ok: false,
+          error: 'invalid_grant',
+          replayDetected: true,
+          grantId: r.grant_id,
+          clientId: r.client_id,
+        };
+      }
+      // Verify client_id BEFORE mutating the grant so a wrong client_id cannot burn a valid grant (H-S3)!
+      if (!params.clientId || r.client_id !== params.clientId) {
+        return { ok: false, error: 'invalid_grant' };
+      }
+
+      sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', params.now);
+      sql.exec("DELETE FROM oauth_tokens WHERE grant_id = ? AND kind = 'access'", r.grant_id);
+      sql.exec(
+        "UPDATE oauth_tokens SET kind = 'refresh_used', expires_at = ? WHERE token_hash = ?",
+        Math.max(r.expires_at, params.refreshExpiresAt),
+        params.refreshHash,
+      );
+      sql.exec(
+        `INSERT OR REPLACE INTO oauth_tokens
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, created_at, expires_at)
+         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?)`,
+        params.nextAccessHash,
+        r.grant_id,
+        r.client_id,
+        r.client_name,
+        r.scopes_json,
+        r.resource,
+        r.created_at,
+        params.accessExpiresAt,
+      );
+      sql.exec(
+        `INSERT OR REPLACE INTO oauth_tokens
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, created_at, expires_at)
+         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?)`,
+        params.nextRefreshHash,
+        r.grant_id,
+        r.client_id,
+        r.client_name,
+        r.scopes_json,
+        r.resource,
+        r.created_at,
+        params.refreshExpiresAt,
+      );
+      return {
+        ok: true,
+        grantId: r.grant_id,
+        clientId: r.client_id,
+        clientName: r.client_name,
+        scopes: JSON.parse(r.scopes_json) as string[],
+        resource: r.resource,
+      };
+    },
     listGrants(now) {
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', now);
       const rows = sql
@@ -306,6 +429,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         }>(
           `SELECT grant_id, client_id, client_name, scopes_json, MIN(created_at) AS created_at, MAX(expires_at) AS max_exp
            FROM oauth_tokens
+           WHERE kind IN ('access', 'refresh')
            GROUP BY grant_id
            ORDER BY created_at DESC`,
         )
@@ -334,11 +458,36 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', row.grant_id);
       }
     },
-    recordAuthFailure(bucket, now, windowMs, maxFailures) {
+    checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
       const row = sql
         .exec<{ count: number; reset_at: number }>('SELECT count, reset_at FROM auth_failures WHERE bucket = ?', bucket)
         .toArray()[0];
       if (!row || row.reset_at <= now) {
+        if (row) sql.exec('DELETE FROM auth_failures WHERE bucket = ?', bucket);
+        return { allowed: true, retryAfterSec: 0 };
+      }
+      if (row.count >= maxFailures) {
+        return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((row.reset_at - now) / 1_000)) };
+      }
+      return { allowed: true, retryAfterSec: 0 };
+    },
+    recordAuthFailure(bucket, now, windowMs, maxFailures) {
+      sql.exec('DELETE FROM auth_failures WHERE reset_at <= ?', now);
+      const row = sql
+        .exec<{ count: number; reset_at: number }>('SELECT count, reset_at FROM auth_failures WHERE bucket = ?', bucket)
+        .toArray()[0];
+      if (!row) {
+        // Evict non-locked single-attempt buckets first so IPv6 sprays cannot displace active lockouts (H-S5).
+        sql.exec(
+          `DELETE FROM auth_failures
+           WHERE bucket IN (
+             SELECT bucket FROM auth_failures
+             ORDER BY (count >= ?) DESC, reset_at DESC
+             LIMIT -1 OFFSET ?
+           )`,
+          maxFailures,
+          MAX_AUTH_FAILURE_BUCKETS - 1,
+        );
         sql.exec('INSERT OR REPLACE INTO auth_failures (bucket, count, reset_at) VALUES (?, 1, ?)', bucket, now + windowMs);
         return { allowed: true, retryAfterSec: 0 };
       }
@@ -358,14 +507,20 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
 export function createMemoryOAuthStore(): OAuthStore {
   const clients = new Map<string, OAuthClientRecord>();
   const codes = new Map<string, OAuthCodeRecord>();
-  const tokens = new Map<string, OAuthTokenRecord>();
+  const tokens = new Map<string, OAuthTokenRecord & { used?: boolean }>();
   const failures = new Map<string, { count: number; resetAt: number }>();
 
   return {
     putClient(c) {
       if (clients.size >= 500) {
-        const oldest = clients.keys().next().value;
-        if (oldest) clients.delete(oldest);
+        for (const id of clients.keys()) {
+          const hasGrant = [...tokens.values()].some((t) => t.clientId === id && t.expiresAt > c.createdAt);
+          const hasCode = [...codes.values()].some((cd) => cd.clientId === id && cd.expiresAt > c.createdAt);
+          if (!hasGrant && !hasCode) {
+            clients.delete(id);
+            break;
+          }
+        }
       }
       clients.set(c.clientId, { ...c, redirectUris: [...c.redirectUris] });
     },
@@ -415,10 +570,58 @@ export function createMemoryOAuthStore(): OAuthStore {
     },
     consumeRefreshToken(tokenHash, now) {
       const t = tokens.get(tokenHash);
-      if (!t || t.kind !== 'refresh') return null;
+      if (!t || t.kind !== 'refresh' || t.used) return null;
       tokens.delete(tokenHash);
       if (t.expiresAt <= now) return null;
       return { ...t, scopes: [...t.scopes] };
+    },
+    rotateRefreshToken(params) {
+      const t = tokens.get(params.refreshHash);
+      if (!t || t.kind !== 'refresh') return { ok: false, error: 'invalid_grant' };
+      if (t.expiresAt <= params.now) {
+        for (const [h, row] of tokens.entries()) if (row.grantId === t.grantId) tokens.delete(h);
+        return { ok: false, error: 'invalid_grant' };
+      }
+      if (t.used) {
+        for (const [h, row] of tokens.entries()) if (row.grantId === t.grantId) tokens.delete(h);
+        return { ok: false, error: 'invalid_grant', replayDetected: true, grantId: t.grantId, clientId: t.clientId };
+      }
+      if (!params.clientId || t.clientId !== params.clientId) {
+        return { ok: false, error: 'invalid_grant' };
+      }
+      for (const [h, row] of tokens.entries()) {
+        if (row.grantId === t.grantId && row.kind === 'access') tokens.delete(h);
+      }
+      t.used = true;
+      t.expiresAt = Math.max(t.expiresAt, params.refreshExpiresAt);
+      tokens.set(params.nextAccessHash, {
+        grantId: t.grantId,
+        kind: 'access',
+        clientId: t.clientId,
+        clientName: t.clientName,
+        scopes: [...t.scopes],
+        resource: t.resource,
+        createdAt: t.createdAt,
+        expiresAt: params.accessExpiresAt,
+      });
+      tokens.set(params.nextRefreshHash, {
+        grantId: t.grantId,
+        kind: 'refresh',
+        clientId: t.clientId,
+        clientName: t.clientName,
+        scopes: [...t.scopes],
+        resource: t.resource,
+        createdAt: t.createdAt,
+        expiresAt: params.refreshExpiresAt,
+      });
+      return {
+        ok: true,
+        grantId: t.grantId,
+        clientId: t.clientId,
+        clientName: t.clientName,
+        scopes: [...t.scopes],
+        resource: t.resource,
+      };
     },
     listGrants(now) {
       const byGrant = new Map<string, OAuthGrantSummary>();
@@ -427,6 +630,7 @@ export function createMemoryOAuthStore(): OAuthStore {
           tokens.delete(hash);
           continue;
         }
+        if (t.used) continue;
         const prev = byGrant.get(t.grantId);
         if (!prev || t.expiresAt > prev.expiresAt) {
           byGrant.set(t.grantId, {
@@ -458,9 +662,31 @@ export function createMemoryOAuthStore(): OAuthStore {
         if (row.grantId === t.grantId) tokens.delete(hash);
       }
     },
-    recordAuthFailure(bucket, now, windowMs, maxFailures) {
+    checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
       const cur = failures.get(bucket);
       if (!cur || cur.resetAt <= now) {
+        if (cur) failures.delete(bucket);
+        return { allowed: true, retryAfterSec: 0 };
+      }
+      if (cur.count >= maxFailures) {
+        return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((cur.resetAt - now) / 1_000)) };
+      }
+      return { allowed: true, retryAfterSec: 0 };
+    },
+    recordAuthFailure(bucket, now, windowMs, maxFailures) {
+      for (const [b, v] of failures.entries()) {
+        if (v.resetAt <= now) failures.delete(b);
+      }
+      const cur = failures.get(bucket);
+      if (!cur) {
+        if (failures.size >= MAX_AUTH_FAILURE_BUCKETS) {
+          for (const [b, v] of failures.entries()) {
+            if (v.count < maxFailures) {
+              failures.delete(b);
+              break;
+            }
+          }
+        }
         failures.set(bucket, { count: 1, resetAt: now + windowMs });
         return { allowed: true, retryAfterSec: 0 };
       }
@@ -578,12 +804,32 @@ function isLoopbackHost(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
 }
 
+function isLoopbackRedirectUri(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'http:' && isLoopbackHost(u.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function isRedirectHostAllowlisted(hostname: string, allowlist: readonly string[]): boolean {
+  const host = hostname.toLowerCase().replace(/\.+$/, '');
+  if (!host) return false;
+  for (const raw of allowlist) {
+    const rule = raw.trim().toLowerCase().replace(/^\*\./, '').replace(/^\./, '').replace(/\.+$/, '');
+    if (!rule) continue;
+    if (host === rule || host.endsWith(`.${rule}`)) return true;
+  }
+  return false;
+}
+
 /**
  * Validates OAuth 2.1 redirect URIs for Dynamic Client Registration (RFC 7591 + RFC 8252):
- *  - Loopback native CLI callbacks (`http://localhost(:port)/...` or `http://127.0.0.1(:port)/...`), OR
- *  - External `https://` callbacks (never our own hub origin, no `#fragment`, no embedded userinfo).
+ *  - Loopback native CLI callbacks (`http://localhost(:port)/...`, `http://127.0.0.1(:port)/...`, `http://[::1](:port)/...`), OR
+ *  - External `https://` callbacks ONLY when explicitly allowlisted in `redirectAllowlist` (off by default, H-S2).
  */
-export function isValidRedirectUri(raw: string, selfOrigin: string): boolean {
+export function isValidRedirectUri(raw: string, selfOrigin: string, redirectAllowlist: readonly string[] = []): boolean {
   if (typeof raw !== 'string' || raw.length > 512) return false;
   let u: URL;
   try {
@@ -596,7 +842,8 @@ export function isValidRedirectUri(raw: string, selfOrigin: string): boolean {
     return isLoopbackHost(u.hostname.toLowerCase());
   }
   if (u.protocol === 'https:') {
-    return u.origin.toLowerCase() !== selfOrigin.toLowerCase();
+    if (u.origin.toLowerCase() === selfOrigin.toLowerCase()) return false;
+    return isRedirectHostAllowlisted(u.hostname, redirectAllowlist);
   }
   return false;
 }
@@ -632,13 +879,24 @@ export function matchesRegisteredRedirectUri(requested: string, registeredList: 
   return false;
 }
 
-export function normalizeScopes(rawScope: string | null | undefined): string[] {
-  if (!rawScope || !rawScope.trim()) return [...MCP_SCOPES];
-  const requested = rawScope
+export function parseRequestedScopes(
+  rawScope: string | null | undefined,
+): { ok: true; scopes: McpScope[] } | { ok: false; invalid: string[] } {
+  if (!rawScope || !rawScope.trim()) return { ok: true, scopes: [...MCP_SCOPES] };
+  const tokens = rawScope
     .split(/\s+/)
     .map((s) => s.trim())
-    .filter((s): s is McpScope => (MCP_SCOPES as readonly string[]).includes(s));
-  return requested.length > 0 ? [...new Set(requested)] : [...MCP_SCOPES];
+    .filter(Boolean);
+  const invalid = tokens.filter((s) => !(MCP_SCOPES as readonly string[]).includes(s));
+  if (invalid.length > 0) {
+    return { ok: false, invalid };
+  }
+  return { ok: true, scopes: [...new Set(tokens as McpScope[])] };
+}
+
+export function normalizeScopes(rawScope: string | null | undefined): string[] {
+  const parsed = parseRequestedScopes(rawScope);
+  return parsed.ok ? parsed.scopes : [];
 }
 
 function normalizeResource(rawResource: string | null | undefined, origin: string): { ok: true; resource: string } | { ok: false } {
@@ -767,11 +1025,12 @@ function renderAuthorizePage(params: {
 </head>
 <body>
   <main>
-    <h1>Connect &ldquo;${escapeHtml(params.clientName)}&rdquo; to ${escapeHtml(params.serviceName)}?</h1>
+    <h1>Connect MCP client to ${escapeHtml(params.serviceName)}?</h1>
     ${errHtml}
     <p>An MCP client is requesting scoped OAuth 2.1 access. Verify the callback destination before approving:</p>
     <div class="meta">
-      <div><strong>Callback Host:</strong> <code>${escapeHtml(redirectHost)}</code></div>
+      <div><strong>Self-reported Client Name (unverified):</strong> <code>${escapeHtml(params.clientName)}</code></div>
+      <div style="margin-top:4px"><strong>Callback Host:</strong> <code>${escapeHtml(redirectHost)}</code></div>
       <div style="margin-top:4px"><strong>Redirect URI:</strong> <code>${escapeHtml(params.redirectUri)}</code></div>
     </div>
     <p><strong>Requested permissions:</strong></p>
@@ -848,6 +1107,7 @@ export interface OAuthHandlerDeps {
   store: OAuthStore;
   ownerSecret?: string;
   serviceName: string;
+  redirectAllowlist?: readonly string[];
   now?: () => number;
   onEvent?: (ev: {
     level: 'info' | 'warn' | 'error';
@@ -926,6 +1186,23 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   // 3. RFC 7591 Dynamic Client Registration (`POST /oauth/register`)
   if (path === '/oauth/register') {
     if (request.method !== 'POST') return oauthJson({ error: 'method_not_allowed' }, 405, cors);
+    const clientIp = request.headers.get('cf-connecting-ip') ?? 'local';
+    const regLock = await deps.store.checkAuthLockout(`reg:${clientIp}`, now, REGISTER_RATE_LIMIT_MAX);
+    if (!regLock.allowed) {
+      return oauthJson(
+        { error: 'too_many_requests', error_description: 'Too many client registrations from this IP' },
+        429,
+        { ...cors, 'retry-after': String(regLock.retryAfterSec) },
+      );
+    }
+    const regCount = await deps.store.recordAuthFailure(`reg:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, REGISTER_RATE_LIMIT_MAX);
+    if (!regCount.allowed) {
+      return oauthJson(
+        { error: 'too_many_requests', error_description: 'Too many client registrations from this IP' },
+        429,
+        { ...cors, 'retry-after': String(regCount.retryAfterSec) },
+      );
+    }
     const bodyText = await request.text();
     if (bodyText.length > 16_384) return oauthJson({ error: 'invalid_client_metadata' }, 400, cors);
     let body: { client_name?: unknown; redirect_uris?: unknown };
@@ -939,9 +1216,12 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
     }
     const redirectUris: string[] = [];
     for (const u of body.redirect_uris) {
-      if (typeof u !== 'string' || !isValidRedirectUri(u, origin)) {
+      if (typeof u !== 'string' || !isValidRedirectUri(u, origin, deps.redirectAllowlist)) {
         return oauthJson(
-          { error: 'invalid_redirect_uri', error_description: 'Only loopback http:// or external https:// redirect URIs are allowed' },
+          {
+            error: 'invalid_redirect_uri',
+            error_description: 'Only loopback http:// or owner-allowlisted external https:// redirect URIs are allowed',
+          },
           400,
           cors,
         );
@@ -953,14 +1233,8 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         ? body.client_name.trim().slice(0, 80)
         : 'MCP Client';
     const clientId = `mcp_${randomUrlToken(18)}`;
+    // Do NOT write an info ring event on anonymous /oauth/register so attackers cannot flush hub_events (H-S1).
     await deps.store.putClient({ clientId, clientName, redirectUris, createdAt: now });
-    await deps.onEvent?.({
-      level: 'info',
-      category: 'oauth',
-      event: 'oauth_client_registered',
-      summary: `Registered OAuth 2.1 client "${clientName}" (${clientId})`,
-      details: { clientId, clientName, redirectUris },
-    });
     return oauthJson(
       {
         client_id: clientId,
@@ -988,15 +1262,19 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       const state = url.searchParams.get('state') ?? '';
       const codeChallenge = (url.searchParams.get('code_challenge') ?? '').trim();
       const codeChallengeMethod = (url.searchParams.get('code_challenge_method') ?? '').trim();
-      const scopes = normalizeScopes(url.searchParams.get('scope'));
+      const scopeCheck = parseRequestedScopes(url.searchParams.get('scope'));
       const resCheck = normalizeResource(url.searchParams.get('resource'), origin);
 
       const client = clientId ? await deps.store.getClient(clientId) : null;
       if (!client) {
         return new Response('Unknown client_id. Register via POST /oauth/register first.', { status: 400, headers: CONSENT_PAGE_HEADERS });
       }
-      if (!redirectUri || !matchesRegisteredRedirectUri(redirectUri, client.redirectUris)) {
-        return new Response('Unregistered redirect_uri for this client_id.', { status: 400, headers: CONSENT_PAGE_HEADERS });
+      if (
+        !redirectUri ||
+        !isValidRedirectUri(redirectUri, origin, deps.redirectAllowlist) ||
+        !matchesRegisteredRedirectUri(redirectUri, client.redirectUris)
+      ) {
+        return new Response('Unregistered or disallowed redirect_uri for this client_id.', { status: 400, headers: CONSENT_PAGE_HEADERS });
       }
       if (responseType !== 'code') {
         const errUrl = new URL(redirectUri);
@@ -1004,6 +1282,13 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         if (state) errUrl.searchParams.set('state', state);
         return Response.redirect(errUrl.toString(), 302);
       }
+      if (!scopeCheck.ok) {
+        const errUrl = new URL(redirectUri);
+        errUrl.searchParams.set('error', 'invalid_scope');
+        if (state) errUrl.searchParams.set('state', state);
+        return Response.redirect(errUrl.toString(), 302);
+      }
+      const scopes = scopeCheck.scopes;
       if (codeChallengeMethod !== 'S256' || !/^[A-Za-z0-9_-]{43,128}$/.test(codeChallenge)) {
         const errUrl = new URL(redirectUri);
         errUrl.searchParams.set('error', 'invalid_request');
@@ -1018,6 +1303,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         return Response.redirect(errUrl.toString(), 302);
       }
 
+      const isExternalRedirect = !isLoopbackRedirectUri(redirectUri);
       const csrf = randomUrlToken(24);
       const sealedState = await sealConsent(deps.ownerSecret, {
         clientId: client.clientId,
@@ -1041,7 +1327,8 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           scopes,
           sealedState,
           csrf,
-          alreadySignedIn: adminSession.ok,
+          // Non-loopback external redirects ALWAYS require explicit CALLER_TOKEN entry even if signed into /admin (H-S2).
+          alreadySignedIn: adminSession.ok && !isExternalRedirect,
         }),
         { status: 200, headers },
       );
@@ -1057,6 +1344,9 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           headers: CONSENT_PAGE_HEADERS,
         });
       }
+      if (!isValidRedirectUri(sealed.redirectUri, origin, deps.redirectAllowlist)) {
+        return new Response('Disallowed redirect_uri.', { status: 400, headers: CONSENT_PAGE_HEADERS });
+      }
 
       if (form.decision !== 'approve') {
         const denyUrl = new URL(sealed.redirectUri);
@@ -1066,7 +1356,16 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       }
 
       const clientIp = request.headers.get('cf-connecting-ip') ?? 'local';
-      if (!adminSession.ok) {
+      const isExternalRedirect = !isLoopbackRedirectUri(sealed.redirectUri);
+      if (!adminSession.ok || isExternalRedirect) {
+        // Check lockout BEFORE checking supplied token (H-S5).
+        const preLock = await deps.store.checkAuthLockout(`oauth:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
+        if (!preLock.allowed) {
+          return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
+            status: 429,
+            headers: { ...CONSENT_PAGE_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+          });
+        }
         const supplied = (form.owner_token ?? '').trim();
         if (!supplied || !sameBytes(supplied, deps.ownerSecret)) {
           const rl = await deps.store.recordAuthFailure(`oauth:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
@@ -1127,10 +1426,14 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
     if (grantType === 'authorization_code') {
       const code = params.code ?? '';
       const verifier = params.code_verifier ?? '';
-      const clientId = params.client_id ?? '';
-      const redirectUri = params.redirect_uri ?? '';
-      if (!code || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) {
-        return oauthJson({ error: 'invalid_request', error_description: 'Missing code or valid PKCE code_verifier' }, 400, cors);
+      const clientId = (params.client_id ?? '').trim();
+      const redirectUri = (params.redirect_uri ?? '').trim();
+      if (!code || !clientId || !redirectUri || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) {
+        return oauthJson(
+          { error: 'invalid_request', error_description: 'code, client_id, redirect_uri, and PKCE code_verifier are required' },
+          400,
+          cors,
+        );
       }
 
       const codeHash = await sha256Base64Url(code);
@@ -1138,7 +1441,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       if (!record) {
         return oauthJson({ error: 'invalid_grant', error_description: 'Authorization code is invalid, expired, or already used' }, 400, cors);
       }
-      if ((clientId && clientId !== record.clientId) || (redirectUri && redirectUri !== record.redirectUri)) {
+      if (clientId !== record.clientId || redirectUri !== record.redirectUri) {
         return oauthJson({ error: 'invalid_grant', error_description: 'client_id or redirect_uri mismatch' }, 400, cors);
       }
       const computedChallenge = await sha256Base64Url(verifier);
@@ -1190,29 +1493,34 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
 
     if (grantType === 'refresh_token') {
       const refreshToken = params.refresh_token ?? '';
-      if (!refreshToken) return oauthJson({ error: 'invalid_request' }, 400, cors);
-      const prev = await deps.store.consumeRefreshToken(await sha256Base64Url(refreshToken), now);
-      if (!prev) {
-        return oauthJson({ error: 'invalid_grant', error_description: 'Refresh token is invalid, expired, or revoked' }, 400, cors);
-      }
-      if (params.client_id && params.client_id !== prev.clientId) {
-        return oauthJson({ error: 'invalid_grant' }, 400, cors);
+      const clientId = (params.client_id ?? '').trim();
+      if (!refreshToken || !clientId) {
+        return oauthJson({ error: 'invalid_request', error_description: 'refresh_token and client_id are required' }, 400, cors);
       }
 
       const nextAccess = `efa_${randomUrlToken(32)}`;
       const nextRefresh = `efr_${randomUrlToken(32)}`;
-      await deps.store.putTokenPair({
-        grantId: prev.grantId,
-        accessHash: await sha256Base64Url(nextAccess),
-        refreshHash: await sha256Base64Url(nextRefresh),
-        clientId: prev.clientId,
-        clientName: prev.clientName,
-        scopes: prev.scopes,
-        resource: prev.resource,
-        createdAt: prev.createdAt,
+      const rotated = await deps.store.rotateRefreshToken({
+        refreshHash: await sha256Base64Url(refreshToken),
+        clientId,
+        nextAccessHash: await sha256Base64Url(nextAccess),
+        nextRefreshHash: await sha256Base64Url(nextRefresh),
+        now,
         accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
         refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
       });
+      if (!rotated.ok) {
+        if (rotated.replayDetected) {
+          await deps.onEvent?.({
+            level: 'warn',
+            category: 'oauth',
+            event: 'oauth_refresh_replay_revoked',
+            summary: `Detected replay of rotated refresh token; revoked entire grant ${rotated.grantId ?? ''}`,
+            details: { grantId: rotated.grantId ?? '', clientId: rotated.clientId ?? clientId },
+          });
+        }
+        return oauthJson({ error: 'invalid_grant', error_description: 'Refresh token is invalid, expired, or revoked' }, 400, cors);
+      }
 
       return oauthJson(
         {
@@ -1220,7 +1528,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           token_type: 'Bearer',
           expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1_000),
           refresh_token: nextRefresh,
-          scope: prev.scopes.join(' '),
+          scope: rotated.scopes.join(' '),
         },
         200,
         cors,

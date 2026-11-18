@@ -30,6 +30,7 @@ export function authorizeAgent(
   const tok = bearer(req);
   if (!tok) return { ok: false };
   const hdrSite = (req.headers.get('x-agent-site') ?? '').trim().toLowerCase();
+  const mappedSites = new Set<string>();
 
   if (env.AGENT_TOKENS?.trim()) {
     try {
@@ -37,18 +38,25 @@ export function authorizeAgent(
       let matched: string | null = null;
       for (const [k, v] of Object.entries(map)) {
         const s = k.trim().toLowerCase();
-        if (SITE_ID_PATTERN.test(s) && typeof v === 'string' && v.length >= MIN_TOKEN_LENGTH && sameBytes(tok, v)) {
-          matched = s;
+        if (SITE_ID_PATTERN.test(s)) {
+          mappedSites.add(s);
+          if (typeof v === 'string' && v.length >= MIN_TOKEN_LENGTH && sameBytes(tok, v)) {
+            matched = s;
+          }
         }
       }
       if (matched && (!hdrSite || hdrSite === matched)) return { ok: true, siteId: matched };
     } catch {
-      // malformed JSON fails closed
+      // Malformed AGENT_TOKENS JSON fails closed (do not allow fallback impersonation).
+      return { ok: false };
     }
   }
   if (env.AGENT_TOKEN && env.AGENT_TOKEN.length >= MIN_TOKEN_LENGTH) {
     const valid = sameBytes(tok, env.AGENT_TOKEN);
-    if (valid && SITE_ID_RE_CHECK(hdrSite)) return { ok: true, siteId: hdrSite };
+    // Shared AGENT_TOKEN may never claim a siteId that has a dedicated token in AGENT_TOKENS (H-S5).
+    if (valid && SITE_ID_RE_CHECK(hdrSite) && !mappedSites.has(hdrSite)) {
+      return { ok: true, siteId: hdrSite };
+    }
   }
   return { ok: false };
 }

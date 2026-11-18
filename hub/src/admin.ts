@@ -660,11 +660,20 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   }
 
   if (path === '/admin/login' && request.method === 'POST') {
+    const now = Date.now();
+    const clientIp = request.headers.get('cf-connecting-ip') ?? 'local';
+    // Check lockout BEFORE checking supplied token so locked-out callers always receive 429 (H-S5).
+    const preLock = await deps.oauthStore.checkAuthLockout(`admin:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
+    if (!preLock.allowed) {
+      return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
+        status: 429,
+        headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+      });
+    }
     const formText = await request.text();
     const supplied = (new URLSearchParams(formText).get('token') ?? '').trim();
-    const clientIp = request.headers.get('cf-connecting-ip') ?? 'local';
     if (!supplied || !sameBytes(supplied, deps.ownerSecret)) {
-      const rl = await deps.oauthStore.recordAuthFailure(`admin:${clientIp}`, Date.now(), RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
+      const rl = await deps.oauthStore.recordAuthFailure(`admin:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
       if (!rl.allowed) {
         return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
           status: 429,

@@ -6,6 +6,8 @@
  * operating unchanged when `ARTIFACTS` / `META` / `SEARCH` / `INGEST` are unconfigured.
  */
 
+import { encodeBodyForWire } from './overflow';
+
 export type ArtifactRetention = 'transient' | 'stored';
 
 export interface IngestWorkflowParams {
@@ -29,7 +31,19 @@ export const TRANSIENT_RETENTION_MS = 24 * 60 * 60_000; // 1 day (`tmp/` prefix 
 export const STORED_RETENTION_MS = 30 * 24 * 60 * 60_000; // 30 days (`raw/` prefix lifecycle)
 export const MAX_ARTIFACT_CONTENT_BYTES = 16 << 20; // 16 MiB uncompressed ceiling
 export const MAX_ARTIFACT_STORED_BYTES = 18 << 20; // 18 MiB gzip upload ceiling
+export const INLINE_HYDRATION_BUDGET_BYTES = 18 << 20; // 18 MiB inline body hydration budget (stays under 20 MiB reply cap)
+export const DEFAULT_ARTIFACT_PAGE_LIMIT = 65_536;
+export const MAX_ARTIFACT_PAGE_LIMIT = 1 << 20; // 1 MiB per paged read
 const UPLOAD_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+function bytesToHex(buf: ArrayBuffer | Uint8Array): string {
+  const view = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let out = '';
+  for (let i = 0; i < view.length; i++) {
+    out += view[i]!.toString(16).padStart(2, '0');
+  }
+  return out;
+}
 
 export function isValidSha256Hex(raw: unknown): raw is string {
   return typeof raw === 'string' && SHA256_HEX_RE.test(raw);
@@ -260,4 +274,272 @@ export async function handleAgentArtifactUpload(params: {
       { status: isBadDigest ? 400 : 409 },
     );
   }
+}
+
+export type ReadArtifactResult =
+  | {
+      ok: true;
+      bytes: Uint8Array;
+      contentSha256: string;
+      retention: ArtifactRetention;
+    }
+  | {
+      ok: false;
+      status: number;
+      error: 'artifact_expired' | 'decompression_limit_exceeded' | 'content_hash_mismatch' | 'corrupt_gzip';
+    };
+
+/**
+ * Streams and decompresses an R2 gzip artifact with a hard byte ceiling (`maxContentBytes`, defending against gzip
+ * bombs) and verifies `SHA-256(uncompressed)` against `expectedContentSha256` / `customMetadata.contentSha256`.
+ */
+export async function readVerifiedArtifactFromR2(params: {
+  bucket: R2Bucket;
+  blobSha256: string;
+  preferredRetention?: ArtifactRetention;
+  expectedContentSha256?: string;
+  maxContentBytes?: number;
+}): Promise<ReadArtifactResult> {
+  const { bucket, blobSha256, preferredRetention, expectedContentSha256, maxContentBytes = MAX_ARTIFACT_CONTENT_BYTES } = params;
+  if (!isValidSha256Hex(blobSha256)) {
+    return { ok: false, status: 400, error: 'artifact_expired' };
+  }
+
+  const order: ArtifactRetention[] = preferredRetention
+    ? preferredRetention === 'stored'
+      ? ['stored', 'transient']
+      : ['transient', 'stored']
+    : ['transient', 'stored'];
+
+  let obj: R2ObjectBody | null = null;
+  let foundRetention: ArtifactRetention = order[0]!;
+  for (const ret of order) {
+    const candidate = await bucket.get(r2ArtifactKey(ret, blobSha256));
+    if (candidate) {
+      obj = candidate;
+      foundRetention = ret;
+      break;
+    }
+  }
+  if (!obj) {
+    return { ok: false, status: 404, error: 'artifact_expired' };
+  }
+
+  const stream = obj.body.pipeThrough(new DecompressionStream('gzip') as unknown as TransformStream<Uint8Array, Uint8Array>);
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxContentBytes) {
+          await reader.cancel('decompression bomb cap exceeded').catch(() => undefined);
+          return { ok: false, status: 413, error: 'decompression_limit_exceeded' };
+        }
+        chunks.push(value);
+      }
+    }
+  } catch {
+    return { ok: false, status: 422, error: 'corrupt_gzip' };
+  }
+
+  const bytes = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    bytes.set(c, off);
+    off += c.byteLength;
+  }
+
+  const actualSha = bytesToHex(await crypto.subtle.digest('SHA-256', bytes));
+  const metaSha = expectedContentSha256 ?? obj.customMetadata?.contentSha256;
+  if (metaSha && isValidSha256Hex(metaSha) && actualSha !== metaSha) {
+    return { ok: false, status: 422, error: 'content_hash_mismatch' };
+  }
+
+  return { ok: true, bytes, contentSha256: actualSha, retention: foundRetention };
+}
+
+/**
+ * Hydrates inline `body` + `bodyEncoding` fields on a `FetchReply` JSON string from R2 up to `budgetBytes` (default
+ * 18 MiB so total serialized JSON stays under the 20 MiB caller contract). Beyond the budget, sets `bodyOmitted: true`
+ * while keeping `artifact` so callers can page remaining bodies via `GET /v1/artifacts/<blobSha256>`.
+ */
+export async function hydrateReplyBodiesFromR2(
+  replyText: string,
+  bucket: R2Bucket,
+  budgetBytes = INLINE_HYDRATION_BUDGET_BYTES,
+): Promise<string> {
+  let parsed: {
+    results?: Array<{
+      body?: string;
+      bodyEncoding?: 'utf-8' | 'base64';
+      bodyOmitted?: boolean;
+      artifactError?: string;
+      artifact?: {
+        blobSha256?: string;
+        contentSha256?: string;
+        retention?: string;
+      };
+      [k: string]: unknown;
+    }>;
+    [k: string]: unknown;
+  };
+  try {
+    parsed = JSON.parse(replyText) as typeof parsed;
+  } catch {
+    return replyText;
+  }
+  if (!Array.isArray(parsed.results) || !parsed.results.some((r) => r?.artifact?.blobSha256 && r.body === undefined)) {
+    return replyText;
+  }
+
+  let usedInlineBytes = 0;
+  for (const r of parsed.results) {
+    if (typeof r?.body === 'string') {
+      usedInlineBytes += r.body.length;
+    }
+  }
+
+  for (const r of parsed.results) {
+    const art = r?.artifact;
+    if (!art?.blobSha256 || typeof r.body === 'string') continue;
+    const prefRet: ArtifactRetention = art.retention === 'stored' ? 'stored' : 'transient';
+    const loaded = await readVerifiedArtifactFromR2({
+      bucket,
+      blobSha256: art.blobSha256,
+      preferredRetention: prefRet,
+      expectedContentSha256: art.contentSha256,
+    });
+    if (!loaded.ok) {
+      r.bodyOmitted = true;
+      r.artifactError = loaded.error;
+      continue;
+    }
+    const encoded = encodeBodyForWire(loaded.bytes);
+    if (usedInlineBytes + encoded.body.length > budgetBytes) {
+      r.bodyOmitted = true;
+      continue;
+    }
+    r.body = encoded.body;
+    r.bodyEncoding = encoded.bodyEncoding;
+    usedInlineBytes += encoded.body.length;
+  }
+
+  return JSON.stringify(parsed);
+}
+
+export interface ArtifactPageSlice {
+  blobSha256: string;
+  contentSha256: string;
+  retention: ArtifactRetention;
+  totalChars: number;
+  totalBytes: number;
+  offset: number;
+  limit: number;
+  nextOffset: number | null;
+  hasMore: boolean;
+  bodyEncoding: 'utf-8' | 'base64';
+  content: string;
+}
+
+export async function readArtifactPage(params: {
+  bucket: R2Bucket;
+  blobSha256: string;
+  retention?: ArtifactRetention;
+  offset?: number;
+  limit?: number;
+}): Promise<{ ok: true; page: ArtifactPageSlice } | { ok: false; status: number; error: string }> {
+  const loaded = await readVerifiedArtifactFromR2({
+    bucket: params.bucket,
+    blobSha256: params.blobSha256,
+    preferredRetention: params.retention,
+  });
+  if (!loaded.ok) {
+    return { ok: false, status: loaded.status, error: loaded.error };
+  }
+
+  const encoded = encodeBodyForWire(loaded.bytes);
+  const totalChars = encoded.body.length;
+  const safeOffset = Math.min(totalChars, Math.max(0, Math.floor(params.offset ?? 0)));
+  const safeLimit = Math.min(MAX_ARTIFACT_PAGE_LIMIT, Math.max(1, Math.floor(params.limit ?? DEFAULT_ARTIFACT_PAGE_LIMIT)));
+  const end = Math.min(totalChars, safeOffset + safeLimit);
+  const slice = encoded.body.slice(safeOffset, end);
+  const hasMore = end < totalChars;
+
+  return {
+    ok: true,
+    page: {
+      blobSha256: params.blobSha256,
+      contentSha256: loaded.contentSha256,
+      retention: loaded.retention,
+      totalChars,
+      totalBytes: loaded.bytes.byteLength,
+      offset: safeOffset,
+      limit: safeLimit,
+      nextOffset: hasMore ? end : null,
+      hasMore,
+      bodyEncoding: encoded.bodyEncoding,
+      content: slice,
+    },
+  };
+}
+
+/**
+ * Authenticated `GET /v1/artifacts/<blobSha256>?offset=&limit=&format=text|json` handler.
+ * Serves raw crawled content strictly as `text/plain; charset=utf-8` with `nosniff`, `CSP: sandbox`, and
+ * `Content-Disposition: attachment` (never active HTML) unless JSON envelope format is requested.
+ */
+export async function handleArtifactGetRequest(params: {
+  request: Request;
+  url: URL;
+  blobSha256: string;
+  bucket?: R2Bucket;
+}): Promise<Response> {
+  const { request, url, blobSha256, bucket } = params;
+  if (!bucket) {
+    return Response.json({ error: 'artifacts_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
+  }
+  if (!isValidSha256Hex(blobSha256)) {
+    return Response.json({ error: 'invalid_blob_sha256' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+  }
+
+  const rawRet = url.searchParams.get('retention');
+  const retention: ArtifactRetention | undefined = rawRet === 'stored' ? 'stored' : rawRet === 'transient' ? 'transient' : undefined;
+  const offset = url.searchParams.has('offset') ? Number(url.searchParams.get('offset')) : 0;
+  const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : DEFAULT_ARTIFACT_PAGE_LIMIT;
+
+  const out = await readArtifactPage({
+    bucket,
+    blobSha256,
+    ...(retention ? { retention } : {}),
+    offset: Number.isFinite(offset) ? offset : 0,
+    limit: Number.isFinite(limit) ? limit : DEFAULT_ARTIFACT_PAGE_LIMIT,
+  });
+  if (!out.ok) {
+    return Response.json({ error: out.error }, { status: out.status, headers: { 'cache-control': 'no-store' } });
+  }
+
+  const wantsJson =
+    url.searchParams.get('format') === 'json' || (request.headers.get('accept') ?? '').toLowerCase().includes('application/json');
+  if (wantsJson) {
+    return Response.json(out.page, { status: 200, headers: { 'cache-control': 'no-store' } });
+  }
+
+  return new Response(out.page.content, {
+    status: 200,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'content-security-policy': 'sandbox',
+      'content-disposition': `attachment; filename="${blobSha256.slice(0, 16)}.txt"`,
+      'x-artifact-total-bytes': String(out.page.totalBytes),
+      'x-artifact-total-chars': String(out.page.totalChars),
+      'x-artifact-has-more': String(out.page.hasMore),
+      ...(out.page.nextOffset !== null ? { 'x-artifact-next-offset': String(out.page.nextOffset) } : {}),
+    },
+  });
 }

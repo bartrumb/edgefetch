@@ -9,6 +9,7 @@
  */
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import {
+  MAX_ARTIFACT_CONTENT_BYTES,
   isValidRetention,
   isValidSha256Hex,
   r2ArtifactKey,
@@ -304,24 +305,273 @@ export async function trackManifestChunkInMetaD1(
   return { tracked: items.length, rowsWritten };
 }
 
+export type ArtifactRejectionReason =
+  | 'decompression_limit_exceeded'
+  | 'content_hash_mismatch'
+  | 'content_bytes_mismatch'
+  | 'corrupt_gzip';
+
+export type ArtifactVerificationResult =
+  | {
+      status: 'verified';
+      blobSha256: string;
+      contentSha256: string;
+      contentBytes: number;
+      alreadyVerified: boolean;
+    }
+  | {
+      status: 'expired';
+      blobSha256: string;
+      error: 'artifact_expired';
+    }
+  | {
+      status: 'rejected';
+      blobSha256: string;
+      reason: ArtifactRejectionReason;
+    };
+
+export interface IngestPipelineOptions {
+  maxContentBytes?: number;
+  now?: number;
+  onArtifactRejected?: (info: {
+    jobId: string;
+    siteId?: string;
+    blobSha256: string;
+    claimedContentSha256: string;
+    reason: ArtifactRejectionReason;
+  }) => Promise<void> | void;
+}
+
 /**
- * Executes the full deterministic ingest pipeline (`load-manifest` -> `track-<n>` chunks), runnable both inside
- * `IngestWorkflow.run()` (wrapping each phase in `step.do`) and directly in local `workerd` tests!
+ * Checks whether at least one stored artifact in `META` D1 with `content_sha256` has passed streaming decompression
+ * and SHA-256 verification (`verified_at IS NOT NULL`). Extraction (`S6`) and `SEARCH` indexing (`S7`) MUST check this
+ * before reusing cached/stored content so unverified agent claims are never trusted.
+ */
+export async function isContentVerifiedInMetaD1(metaDb: D1Database, contentSha256: string): Promise<boolean> {
+  if (!isValidSha256Hex(contentSha256)) return false;
+  const row = await metaDb
+    .prepare('SELECT 1 AS ok FROM artifacts WHERE content_sha256 = ? AND verified_at IS NOT NULL LIMIT 1')
+    .bind(contentSha256)
+    .first<{ ok: number }>();
+  return row?.ok === 1;
+}
+
+async function rejectPoisonedArtifact(params: {
+  bucket: R2Bucket;
+  metaDb: D1Database;
+  blobSha256: string;
+  claimedContentSha256: string;
+  reason: ArtifactRejectionReason;
+}): Promise<void> {
+  const { bucket, metaDb, blobSha256, claimedContentSha256, reason } = params;
+  // Delete both raw/ and tmp/ keys from R2 so a poisoned or gzip-bomb payload can never be hydrated or reused.
+  await Promise.all([
+    bucket.delete(r2ArtifactKey('stored', blobSha256)).catch(() => undefined),
+    bucket.delete(r2ArtifactKey('transient', blobSha256)).catch(() => undefined),
+  ]);
+
+  // Scrub FK references in `fetches`, clear unbacked `pages.latest_content_sha256`, and remove the bad `artifacts` row.
+  await metaDb.batch([
+    metaDb
+      .prepare(
+        `UPDATE fetches
+         SET blob_sha256 = NULL,
+             content_sha256 = NULL,
+             outcome = 'error',
+             problem = ?
+         WHERE blob_sha256 = ?`,
+      )
+      .bind(`artifact verification failed: ${reason}`, blobSha256),
+    metaDb
+      .prepare(
+        `UPDATE pages
+         SET latest_content_sha256 = NULL
+         WHERE latest_content_sha256 = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM artifacts
+             WHERE content_sha256 = ? AND blob_sha256 != ? AND verified_at IS NOT NULL
+           )`,
+      )
+      .bind(claimedContentSha256, claimedContentSha256, blobSha256),
+    metaDb.prepare('DELETE FROM artifacts WHERE blob_sha256 = ?').bind(blobSha256),
+  ]);
+}
+
+/**
+ * Streams a `stored` R2 gzip artifact through `DecompressionStream('gzip')` -> bounded byte cap -> `crypto.DigestStream('SHA-256')`
+ * in O(chunk) memory without buffering 16 MiB in the Worker isolate.
+ *  - Sets `artifacts.verified_at` in `META` D1 when `SHA-256(uncompressed)` and `contentBytes` match the agent's claim.
+ *  - Deletes the R2 object and scrubs `META` D1 if decompression exceeds `maxContentBytes`, gzip is corrupt, or hashes mismatch.
+ *  - Returns `{ status: 'expired', error: 'artifact_expired' }` cleanly if the R2 object is missing/expired.
+ */
+export async function verifyStoredArtifact(params: {
+  bucket: R2Bucket;
+  metaDb: D1Database;
+  blobSha256: string;
+  expectedContentSha256: string;
+  expectedContentBytes?: number;
+  maxContentBytes?: number;
+  now?: number;
+}): Promise<ArtifactVerificationResult> {
+  const {
+    bucket,
+    metaDb,
+    blobSha256,
+    expectedContentSha256,
+    expectedContentBytes,
+    maxContentBytes = MAX_ARTIFACT_CONTENT_BYTES,
+    now = Date.now(),
+  } = params;
+
+  const existingRow = await metaDb
+    .prepare('SELECT content_sha256, content_bytes, verified_at FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
+    .bind(blobSha256)
+    .first<{ content_sha256: string; content_bytes: number; verified_at: number | null }>();
+
+  if (existingRow && existingRow.verified_at !== null && existingRow.content_sha256 === expectedContentSha256) {
+    return {
+      status: 'verified',
+      blobSha256,
+      contentSha256: existingRow.content_sha256,
+      contentBytes: existingRow.content_bytes,
+      alreadyVerified: true,
+    };
+  }
+
+  let obj = await bucket.get(r2ArtifactKey('stored', blobSha256));
+  if (!obj) {
+    obj = await bucket.get(r2ArtifactKey('transient', blobSha256));
+  }
+  if (!obj) {
+    return { status: 'expired', blobSha256, error: 'artifact_expired' };
+  }
+
+  const DigestStreamCtor = (
+    crypto as unknown as {
+      DigestStream: new (algo: string) => WritableStream<Uint8Array> & { readonly digest: Promise<ArrayBuffer> };
+    }
+  ).DigestStream;
+  const digestStream = new DigestStreamCtor('SHA-256');
+  const digestWriter = digestStream.getWriter();
+  const decompressed = obj.body.pipeThrough(new DecompressionStream('gzip') as unknown as TransformStream<Uint8Array, Uint8Array>);
+  const reader = decompressed.getReader();
+
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxContentBytes) {
+          await reader.cancel('decompression bomb cap exceeded').catch(() => undefined);
+          await digestWriter.abort('decompression bomb cap exceeded').catch(() => undefined);
+          await rejectPoisonedArtifact({
+            bucket,
+            metaDb,
+            blobSha256,
+            claimedContentSha256: expectedContentSha256,
+            reason: 'decompression_limit_exceeded',
+          });
+          return { status: 'rejected', blobSha256, reason: 'decompression_limit_exceeded' };
+        }
+        await digestWriter.write(value);
+      }
+    }
+    await digestWriter.close();
+  } catch {
+    await reader.cancel('corrupt gzip').catch(() => undefined);
+    await digestWriter.abort('corrupt gzip').catch(() => undefined);
+    await rejectPoisonedArtifact({
+      bucket,
+      metaDb,
+      blobSha256,
+      claimedContentSha256: expectedContentSha256,
+      reason: 'corrupt_gzip',
+    });
+    return { status: 'rejected', blobSha256, reason: 'corrupt_gzip' };
+  }
+
+  const actualSha256 = bytesToHex(await digestStream.digest);
+  if (actualSha256 !== expectedContentSha256) {
+    await rejectPoisonedArtifact({
+      bucket,
+      metaDb,
+      blobSha256,
+      claimedContentSha256: expectedContentSha256,
+      reason: 'content_hash_mismatch',
+    });
+    return { status: 'rejected', blobSha256, reason: 'content_hash_mismatch' };
+  }
+  if (typeof expectedContentBytes === 'number' && totalBytes !== expectedContentBytes) {
+    await rejectPoisonedArtifact({
+      bucket,
+      metaDb,
+      blobSha256,
+      claimedContentSha256: expectedContentSha256,
+      reason: 'content_bytes_mismatch',
+    });
+    return { status: 'rejected', blobSha256, reason: 'content_bytes_mismatch' };
+  }
+
+  await metaDb
+    .prepare(
+      `UPDATE artifacts
+       SET verified_at = COALESCE(verified_at, ?),
+           content_bytes = ?,
+           last_seen_at = MAX(last_seen_at, ?)
+       WHERE blob_sha256 = ?`,
+    )
+    .bind(now, totalBytes, now, blobSha256)
+    .run();
+
+  return {
+    status: 'verified',
+    blobSha256,
+    contentSha256: actualSha256,
+    contentBytes: totalBytes,
+    alreadyVerified: false,
+  };
+}
+
+/**
+ * Executes the full deterministic ingest pipeline (`load-manifest` -> `track-<n>` chunks -> `verify-<blobSha>`),
+ * runnable both inside `IngestWorkflow.run()` (wrapping each phase in `step.do`) and directly in local `workerd` tests!
  */
 export async function executeIngestPipeline(
   env: OptionalStorageBindings,
   params: IngestWorkflowParams,
   runStep: <T>(name: string, fn: () => Promise<T>) => Promise<T> = (_n, fn) => fn(),
-): Promise<{ jobId: string; totalItems: number; chunks: number }> {
+  options: IngestPipelineOptions = {},
+): Promise<{
+  jobId: string;
+  totalItems: number;
+  chunks: number;
+  verifiedCount: number;
+  rejectedCount: number;
+  expiredCount: number;
+}> {
   if (!env.ARTIFACTS || !env.META) {
-    return { jobId: params.jobId, totalItems: 0, chunks: 0 };
+    return { jobId: params.jobId, totalItems: 0, chunks: 0, verifiedCount: 0, rejectedCount: 0, expiredCount: 0 };
   }
 
   const summary = await runStep('load-manifest', async () => {
     const manifest = await loadManifestFromR2(env.ARTIFACTS!, params.manifestKey);
+    const storedMap = new Map<string, { blobSha256: string; contentSha256: string; contentBytes: number }>();
+    for (const item of manifest.results) {
+      if (item.artifact && item.artifact.retention === 'stored') {
+        storedMap.set(item.artifact.blobSha256, {
+          blobSha256: item.artifact.blobSha256,
+          contentSha256: item.artifact.contentSha256,
+          contentBytes: item.artifact.contentBytes,
+        });
+      }
+    }
+    const storedArtifacts = [...storedMap.values()].sort((a, b) => a.blobSha256.localeCompare(b.blobSha256));
     return {
       totalItems: manifest.results.length,
       chunks: Math.ceil(manifest.results.length / TRACK_BATCH_CHUNK),
+      storedArtifacts,
     };
   });
 
@@ -333,7 +583,49 @@ export async function executeIngestPipeline(
     });
   }
 
-  return { jobId: params.jobId, totalItems: summary.totalItems, chunks: summary.chunks };
+  let verifiedCount = 0;
+  let rejectedCount = 0;
+  let expiredCount = 0;
+
+  for (const art of summary.storedArtifacts) {
+    const verifyRes = await runStep(`verify-${art.blobSha256}`, async () => {
+      return await verifyStoredArtifact({
+        bucket: env.ARTIFACTS!,
+        metaDb: env.META!,
+        blobSha256: art.blobSha256,
+        expectedContentSha256: art.contentSha256,
+        expectedContentBytes: art.contentBytes,
+        ...(options.maxContentBytes !== undefined ? { maxContentBytes: options.maxContentBytes } : {}),
+        ...(options.now !== undefined ? { now: options.now } : {}),
+      });
+    });
+
+    if (verifyRes.status === 'verified') {
+      verifiedCount++;
+    } else if (verifyRes.status === 'rejected') {
+      rejectedCount++;
+      if (options.onArtifactRejected) {
+        await options.onArtifactRejected({
+          jobId: params.jobId,
+          ...(params.siteId ? { siteId: params.siteId } : {}),
+          blobSha256: art.blobSha256,
+          claimedContentSha256: art.contentSha256,
+          reason: verifyRes.reason,
+        });
+      }
+    } else {
+      expiredCount++;
+    }
+  }
+
+  return {
+    jobId: params.jobId,
+    totalItems: summary.totalItems,
+    chunks: summary.chunks,
+    verifiedCount,
+    rejectedCount,
+    expiredCount,
+  };
 }
 
 /** Deletes `fetches` history older than `retentionMs` (default 90 days) in bounded batches of `limit`. */

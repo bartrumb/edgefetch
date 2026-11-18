@@ -584,6 +584,35 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         oldStillExists: false,
       });
 
+      // S5: Verify stored artifact SHA-256 verification, gzip bomb cutoff + R2/D1 quarantine, and 410 Gone on expired R2 objects!
+      const s5VerifyRes = await mf.dispatchFetch(`${ORIGIN}/__test_s5_verification`, { method: 'POST' });
+      assert.equal(s5VerifyRes.status, 200);
+      const s5Out = await s5VerifyRes.json();
+      assert.deepEqual(s5Out, {
+        verifiedCount: 1,
+        rejectedCount: 2,
+        expiredCount: 1,
+        rejectedReasons: ['content_hash_mismatch', 'decompression_limit_exceeded'],
+        goodVerified: true,
+        liedVerified: false,
+        bombVerified: false,
+        expiredVerified: false,
+        liedR2Remaining: false,
+        bombR2Remaining: false,
+        liedRowCount: 0,
+        bombRowCount: 0,
+        expiredBlobSha: 'ee'.repeat(32),
+      });
+
+      // Known META D1 artifact whose R2 object expired returns 410 Gone with clear `artifact_expired` error + message!
+      const expiredGetRes = await mf.dispatchFetch(`${ORIGIN}/v1/artifacts/${s5Out.expiredBlobSha}`, {
+        headers: { authorization: `Bearer ${CALLER}` },
+      });
+      assert.equal(expiredGetRes.status, 410);
+      const expiredGetJson = await expiredGetRes.json();
+      assert.equal(expiredGetJson.error, 'artifact_expired');
+      assert.match(expiredGetJson.message ?? '', /expired/i);
+
       wsCap.close(1000, 'done');
     }
   } finally {

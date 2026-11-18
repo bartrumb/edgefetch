@@ -447,18 +447,47 @@ export interface ArtifactPageSlice {
 
 export async function readArtifactPage(params: {
   bucket: R2Bucket;
+  metaDb?: D1Database;
   blobSha256: string;
   retention?: ArtifactRetention;
   offset?: number;
   limit?: number;
-}): Promise<{ ok: true; page: ArtifactPageSlice } | { ok: false; status: number; error: string }> {
+}): Promise<{ ok: true; page: ArtifactPageSlice } | { ok: false; status: number; error: string; message?: string }> {
+  let expectedContentSha256: string | undefined;
+  if (params.metaDb && isValidSha256Hex(params.blobSha256)) {
+    const row = await params.metaDb
+      .prepare('SELECT content_sha256 FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
+      .bind(params.blobSha256)
+      .first<{ content_sha256: string }>()
+      .catch(() => null);
+    if (row?.content_sha256 && isValidSha256Hex(row.content_sha256)) {
+      expectedContentSha256 = row.content_sha256;
+    }
+  }
+
   const loaded = await readVerifiedArtifactFromR2({
     bucket: params.bucket,
     blobSha256: params.blobSha256,
     preferredRetention: params.retention,
+    ...(expectedContentSha256 ? { expectedContentSha256 } : {}),
   });
   if (!loaded.ok) {
-    return { ok: false, status: loaded.status, error: loaded.error };
+    if (loaded.error === 'artifact_expired' && expectedContentSha256) {
+      return {
+        ok: false,
+        status: 410,
+        error: 'artifact_expired',
+        message: 'Artifact retention window has expired in R2; re-fetch the target URL to regenerate it.',
+      };
+    }
+    return {
+      ok: false,
+      status: loaded.status,
+      error: loaded.error,
+      ...(loaded.error === 'artifact_expired'
+        ? { message: 'Artifact not found or expired in R2.' }
+        : {}),
+    };
   }
 
   const encoded = encodeBodyForWire(loaded.bytes);
@@ -497,8 +526,9 @@ export async function handleArtifactGetRequest(params: {
   url: URL;
   blobSha256: string;
   bucket?: R2Bucket;
+  metaDb?: D1Database;
 }): Promise<Response> {
-  const { request, url, blobSha256, bucket } = params;
+  const { request, url, blobSha256, bucket, metaDb } = params;
   if (!bucket) {
     return Response.json({ error: 'artifacts_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
   }
@@ -513,13 +543,17 @@ export async function handleArtifactGetRequest(params: {
 
   const out = await readArtifactPage({
     bucket,
+    ...(metaDb ? { metaDb } : {}),
     blobSha256,
     ...(retention ? { retention } : {}),
     offset: Number.isFinite(offset) ? offset : 0,
     limit: Number.isFinite(limit) ? limit : DEFAULT_ARTIFACT_PAGE_LIMIT,
   });
   if (!out.ok) {
-    return Response.json({ error: out.error }, { status: out.status, headers: { 'cache-control': 'no-store' } });
+    return Response.json(
+      { error: out.error, ...(out.message ? { message: out.message } : {}) },
+      { status: out.status, headers: { 'cache-control': 'no-store' } },
+    );
   }
 
   const wantsJson =

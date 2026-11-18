@@ -1,5 +1,5 @@
 import prodWorker, { AgentHubDO as ProdAgentHubDO, IngestWorkflow } from '../src/index.ts';
-import { executeIngestPipeline, pruneExpiredFetchHistory, writeJobManifestToR2 } from '../src/ingest.ts';
+import { executeIngestPipeline, isContentVerifiedInMetaD1, pruneExpiredFetchHistory, writeJobManifestToR2 } from '../src/ingest.ts';
 import { r2ArtifactKey, sanitizeFtsQuery, type OptionalStorageBindings } from '../src/storage.ts';
 
 export { IngestWorkflow };
@@ -109,6 +109,150 @@ export default {
         leakedSecretInFetches: JSON.stringify(fetchRows).includes('DO_NOT_LEAK'),
         pruned,
         oldStillExists,
+      });
+    }
+    if (url.pathname === '/__test_s5_verification' && request.method === 'POST') {
+      const storageEnv = env as unknown as OptionalStorageBindings;
+      const bucket = storageEnv.ARTIFACTS!;
+      const meta = storageEnv.META!;
+      const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
+      const gzipBytes = async (raw: Uint8Array) =>
+        new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+
+      // 1) Valid stored artifact
+      const goodRaw = new TextEncoder().encode('<html><body>Verified stored article payload!</body></html>');
+      const goodGz = await gzipBytes(goodRaw);
+      const goodBlobSha = hex(await crypto.subtle.digest('SHA-256', goodGz));
+      const goodContentSha = hex(await crypto.subtle.digest('SHA-256', goodRaw));
+      await bucket.put(r2ArtifactKey('stored', goodBlobSha), goodGz, { sha256: goodBlobSha });
+
+      // 2) Poisoned contentSha256 claim (valid gzip blob in R2, lied about uncompressed SHA-256)
+      const liedRaw = new TextEncoder().encode('<html><body>Tampered agent claim</body></html>');
+      const liedGz = await gzipBytes(liedRaw);
+      const liedBlobSha = hex(await crypto.subtle.digest('SHA-256', liedGz));
+      const fakeContentSha = 'aa'.repeat(32);
+      await bucket.put(r2ArtifactKey('stored', liedBlobSha), liedGz, { sha256: liedBlobSha });
+
+      // 3) Gzip decompression bomb (~260 bytes compressed -> 200 KiB uncompressed zeros, tested against 32 KiB cap)
+      const bombRaw = new Uint8Array(200 * 1024);
+      const bombGz = await gzipBytes(bombRaw);
+      const bombBlobSha = hex(await crypto.subtle.digest('SHA-256', bombGz));
+      const bombContentSha = hex(await crypto.subtle.digest('SHA-256', bombRaw));
+      await bucket.put(r2ArtifactKey('stored', bombBlobSha), bombGz, { sha256: bombBlobSha });
+
+      // 4) Expired / missing R2 object
+      const expiredBlobSha = 'ee'.repeat(32);
+      const expiredContentSha = 'cc'.repeat(32);
+
+      const manifestReply = JSON.stringify({
+        results: [
+          {
+            id: 'v-good',
+            url: 'https://verify.example.com/good',
+            status: 200,
+            outcome: 'ok',
+            artifact: {
+              blobSha256: goodBlobSha,
+              contentSha256: goodContentSha,
+              contentBytes: goodRaw.byteLength,
+              storedBytes: goodGz.byteLength,
+              encoding: 'gzip',
+              retention: 'stored',
+            },
+          },
+          {
+            id: 'v-lied',
+            url: 'https://verify.example.com/lied',
+            status: 200,
+            outcome: 'ok',
+            artifact: {
+              blobSha256: liedBlobSha,
+              contentSha256: fakeContentSha,
+              contentBytes: liedRaw.byteLength,
+              storedBytes: liedGz.byteLength,
+              encoding: 'gzip',
+              retention: 'stored',
+            },
+          },
+          {
+            id: 'v-bomb',
+            url: 'https://verify.example.com/bomb',
+            status: 200,
+            outcome: 'ok',
+            artifact: {
+              blobSha256: bombBlobSha,
+              contentSha256: bombContentSha,
+              contentBytes: 1024, // agent lied about size too
+              storedBytes: bombGz.byteLength,
+              encoding: 'gzip',
+              retention: 'stored',
+            },
+          },
+          {
+            id: 'v-expired',
+            url: 'https://verify.example.com/expired',
+            status: 200,
+            outcome: 'ok',
+            artifact: {
+              blobSha256: expiredBlobSha,
+              contentSha256: expiredContentSha,
+              contentBytes: 512,
+              storedBytes: 128,
+              encoding: 'gzip',
+              retention: 'stored',
+            },
+          },
+        ],
+      });
+
+      const written = await writeJobManifestToR2({
+        bucket,
+        jobId: 'job_s5_verify',
+        via: 'agent:site-1',
+        siteId: 'site-1',
+        rawReplyText: manifestReply,
+      });
+      if (!written.ok) return Response.json(written, { status: 500 });
+
+      const rejectedReasons: Array<{ blobSha256: string; reason: string }> = [];
+      const pipelineOut = await executeIngestPipeline(
+        storageEnv,
+        { manifestKey: written.manifestKey, jobId: 'job_s5_verify', siteId: 'site-1', via: 'agent:site-1' },
+        undefined,
+        {
+          maxContentBytes: 32_768,
+          onArtifactRejected: ({ blobSha256, reason }) => {
+            rejectedReasons.push({ blobSha256, reason });
+          },
+        },
+      );
+
+      const goodVerified = await isContentVerifiedInMetaD1(meta, goodContentSha);
+      const liedVerified = await isContentVerifiedInMetaD1(meta, fakeContentSha);
+      const bombVerified = await isContentVerifiedInMetaD1(meta, bombContentSha);
+      const expiredVerified = await isContentVerifiedInMetaD1(meta, expiredContentSha);
+
+      const liedR2Remaining = (await bucket.head(r2ArtifactKey('stored', liedBlobSha))) !== null;
+      const bombR2Remaining = (await bucket.head(r2ArtifactKey('stored', bombBlobSha))) !== null;
+      const liedRowCount =
+        (await meta.prepare('SELECT COUNT(*) AS c FROM artifacts WHERE blob_sha256 = ?').bind(liedBlobSha).first<{ c: number }>())?.c ?? 0;
+      const bombRowCount =
+        (await meta.prepare('SELECT COUNT(*) AS c FROM artifacts WHERE blob_sha256 = ?').bind(bombBlobSha).first<{ c: number }>())?.c ?? 0;
+
+      return Response.json({
+        verifiedCount: pipelineOut.verifiedCount,
+        rejectedCount: pipelineOut.rejectedCount,
+        expiredCount: pipelineOut.expiredCount,
+        rejectedReasons: rejectedReasons.map((r) => r.reason).sort(),
+        goodVerified,
+        liedVerified,
+        bombVerified,
+        expiredVerified,
+        liedR2Remaining,
+        bombR2Remaining,
+        liedRowCount,
+        bombRowCount,
+        expiredBlobSha,
       });
     }
     if (url.pathname === '/__test_storage_verify' && request.method === 'POST') {

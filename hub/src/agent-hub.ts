@@ -779,7 +779,7 @@ export class AgentHubEngine {
                 if (item.status === 429 && item.outcome !== 'challenge') {
                   const exactRetryMs = parseExactRetryAfterMs(item.retryAfter, replyNow);
                   const requiredWaitMs = exactRetryMs !== null ? exactRetryMs : DEFAULT_429_NO_HEADER_WAIT_MS;
-                  const cooldownDurMs = Math.max(parseRetryAfterCooldownMs(item.retryAfter, replyNow), requiredWaitMs);
+                  const cooldownDurMs = Math.min(MAX_COOLDOWN_MS, requiredWaitMs + DEFAULT_429_COOLDOWN_MS);
 
                   if (itemHost) {
                     this.record429CooldownForNode(itemHost, att, replyNow + cooldownDurMs);
@@ -1137,7 +1137,7 @@ export async function readAgentReplyBody(
         total += value.byteLength;
         if (total > maxBytes) {
           await reader.cancel('reply exceeded maxBytes').catch(() => undefined);
-          return { ok: false, status: 413, error: 'reply_too_large' };
+          return { ok: false, status: 413, error: 'too_large' };
         }
         chunks.push(value);
       }

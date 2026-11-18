@@ -561,18 +561,26 @@ export default {
             };
           }
           let wantsIncludeBody = false;
+          let bodyRetentionOpt: ArtifactRetention | 'off' | undefined;
           try {
-            const parsedOpts = (JSON.parse(body) as { options?: { includeBody?: boolean } }).options;
-            wantsIncludeBody = Boolean(parsedOpts?.includeBody);
+            const parsedCall = JSON.parse(body) as {
+              options?: { includeBody?: boolean; artifactRetention?: string };
+            };
+            wantsIncludeBody = Boolean(parsedCall.options?.includeBody);
+            const rawOptRet = parsedCall.options?.artifactRetention;
+            if (rawOptRet === 'stored' || rawOptRet === 'transient' || rawOptRet === 'off') {
+              bodyRetentionOpt = rawOptRet;
+            }
           } catch {
             wantsIncludeBody = false;
           }
+          const effectiveRetentionPref = artifactRetention ?? bodyRetentionOpt;
           const resolvedRetention: ArtifactRetention | undefined =
-            artifactRetention === 'off'
+            effectiveRetentionPref === 'off'
               ? undefined
-              : artifactRetention ?? (env.ARTIFACTS && wantsIncludeBody ? 'transient' : undefined);
+              : effectiveRetentionPref ?? (env.ARTIFACTS && wantsIncludeBody ? 'transient' : undefined);
           const artifactPolicy: ArtifactDispatchPolicy | undefined =
-            env.ARTIFACTS && wantsIncludeBody && resolvedRetention
+            env.ARTIFACTS && (wantsIncludeBody || effectiveRetentionPref === 'stored') && resolvedRetention
               ? { mode: 'r2', retention: resolvedRetention, maxContentBytes: MAX_ARTIFACT_CONTENT_BYTES }
               : undefined;
 
@@ -651,7 +659,17 @@ export default {
                     }
                   }
                 } else {
-                  await executeIngestPipeline(env, wfParams);
+                  await executeIngestPipeline(env, wfParams, undefined, {
+                    onArtifactRejected: ({ blobSha256, reason, siteId }) => {
+                      pendingEvents.push({
+                        level: 'warn',
+                        category: 'crawl',
+                        event: 'artifact_verification_failed',
+                        summary: `Rejected unverified artifact ${blobSha256.slice(0, 12)} (${reason})`,
+                        details: { jobId: ingestJobId, blobSha256, reason, siteId: siteId ?? null },
+                      });
+                    },
+                  });
                 }
               }
             } catch (manifestErr) {
@@ -751,6 +769,7 @@ export default {
                 readArtifact: async ({ blobSha256, retention, offset, limit }) => {
                   const res = await readArtifactPage({
                     bucket: env.ARTIFACTS!,
+                    ...(env.META ? { metaDb: env.META } : {}),
                     blobSha256,
                     ...(retention ? { retention } : {}),
                     offset,
@@ -830,6 +849,7 @@ export default {
           url,
           blobSha256,
           bucket: env.ARTIFACTS,
+          metaDb: env.META,
         });
       }
 

@@ -27,10 +27,25 @@ export const HOST_STICKY_TTL_MS = 30 * 60_000; // 30m sliding host -> site affin
 const MIN_COOLDOWN_MS = 10_000;
 const MAX_COOLDOWN_MS = 60 * 60_000;
 export const MAX_REPLY_BYTES = 20 << 20; // 20 MiB decompressed cap
+export const MAX_WS_FRAME_BYTES = 1 << 20; // 1 MiB Go WebSocket control-frame cap
+export const MAX_CALL_UTF8_BYTES = MAX_WS_FRAME_BYTES - 8_192; // Leaves 8 KiB headroom for dispatch JSON envelope
 const MIN_JOB_TIMEOUT_MS = 5_000;
 const MAX_JOB_TIMEOUT_MS = 300_000;
 const DEFAULT_CROSS_NODE_PAUSE_MS = 2_000;
 const MAX_TRACKED_HOSTS = 512;
+const utf8Encoder = new TextEncoder();
+
+export class PermanentJobError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = 'PermanentJobError';
+    this.status = status;
+    this.code = code;
+  }
+}
 
 export interface AgentAttachment {
   siteId: string;
@@ -281,6 +296,10 @@ export interface CrawlResultItem {
   status?: number;
   outcome?: string;
   retryAfter?: string;
+  truncated?: boolean;
+  bodyOmitted?: boolean;
+  body?: string;
+  bodyEncoding?: 'utf-8' | 'base64';
   [k: string]: unknown;
 }
 
@@ -325,6 +344,7 @@ export class AgentHubEngine {
   private readonly pending = new Map<string, PendingJob>();
   private readonly hostAffinity = new Map<string, { siteId: string; expiresAt: number }>();
   private readonly hostLocks = new Map<string, Promise<void>>();
+  private readonly siteLocks = new Map<string, Promise<void>>();
 
   constructor(deps: AgentHubDeps) {
     this.getSockets = deps.getSockets;
@@ -396,6 +416,27 @@ export class AgentHubEngine {
       return this.withSingleHostLock(sorted[idx]!, () => runAt(idx + 1));
     };
     return runAt(0);
+  }
+
+  /** Serializes dispatches per remote agent socket (`H1`: one in-flight job per serial Go agent, timer starts at send). */
+  private async withSiteSlot<T>(siteId: string, fn: () => Promise<T>): Promise<T> {
+    const key = siteId.toLowerCase();
+    const prev = this.siteLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = prev.then(() => gate);
+    this.siteLocks.set(key, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.siteLocks.get(key) === tail) {
+        this.siteLocks.delete(key);
+      }
+    }
   }
 
   /**
@@ -632,6 +673,15 @@ export class AgentHubEngine {
     trace: Record<string, string> = {},
     opts: { preferredSite?: string; timeoutMs?: number } = {},
   ): Promise<AgentDispatchResult> {
+    if (utf8Encoder.encode(rawCallBody).byteLength > MAX_CALL_UTF8_BYTES) {
+      return {
+        ok: false,
+        status: 413,
+        error: 'call_too_large',
+        message: `call body exceeds ${MAX_CALL_UTF8_BYTES} UTF-8 bytes`,
+      };
+    }
+
     let call: { requests?: Array<{ url?: unknown; [k: string]: unknown }>; options?: unknown; maxSeconds?: number };
     try {
       call = JSON.parse(rawCallBody) as {
@@ -678,12 +728,13 @@ export class AgentHubEngine {
       const sitesUsed: string[] = [];
       let pendingIndices = Array.from({ length: total }, (_, i) => i);
       let lastError = 'dispatch failed';
+      let permanentFailure: PermanentJobError | null = null;
       let lastRawSingleBody: string | null = null;
       let retryAfterBudgetExceeded = false;
       let maxBlockedWaitMs = 0;
       let round = 0;
 
-      while (pendingIndices.length > 0 && round < 4) {
+      while (pendingIndices.length > 0 && round < 4 && !permanentFailure) {
         round++;
         const roundLookupNow = this.now();
         const activeCandidates = this.activeSocketsBySite().filter((e) => !wantSite || e.att.siteId === wantSite);
@@ -773,22 +824,29 @@ export class AgentHubEngine {
 
             const jobId = this.uuid();
             const jobNonce = this.uuid();
-            att.lastJobAt = this.now() + sitesUsed.length;
-            ws.serializeAttachment(att);
-
-            const subCall =
-              reqIndices.length === total && round === 1
-                ? call
-                : {
-                    ...call,
-                    requests: reqIndices.map((idx) => call.requests![idx]),
-                  };
-
-            const remainingTimeoutMs =
-              opts.timeoutMs ?? Math.max(MIN_JOB_TIMEOUT_MS, Math.min(timeoutMs, budgetDeadlineAt - this.now() + 5_000));
 
             try {
-              const bodyText = await this.sendAndAwaitJob(ws, att.siteId, jobId, jobNonce, subCall, trace, remainingTimeoutMs);
+              const bodyText = await this.withSiteSlot(att.siteId, async () => {
+                const sendNow = this.now();
+                att.lastJobAt = sendNow + sitesUsed.length;
+                ws.serializeAttachment(att);
+
+                const remainingBudgetMs = Math.max(1_000, budgetDeadlineAt - sendNow);
+                const remainingSecs = Math.max(1, Math.min(maxSeconds, Math.ceil(remainingBudgetMs / 1_000)));
+                const subCall = {
+                  ...call,
+                  maxSeconds: remainingSecs,
+                  requests:
+                    reqIndices.length === total && round === 1
+                      ? call.requests
+                      : reqIndices.map((idx) => call.requests![idx]),
+                };
+                const remainingTimeoutMs =
+                  opts.timeoutMs ??
+                  Math.max(MIN_JOB_TIMEOUT_MS, Math.min(MAX_JOB_TIMEOUT_MS, remainingSecs * 1_000 + 10_000));
+
+                return await this.sendAndAwaitJob(ws, att.siteId, jobId, jobNonce, subCall, trace, remainingTimeoutMs);
+              });
               att.jobsOk++;
               att.lastJobAt = this.now();
               ws.serializeAttachment(att);
@@ -843,6 +901,11 @@ export class AgentHubEngine {
                 }
               }
             } catch (e) {
+              if (e instanceof PermanentJobError) {
+                permanentFailure = e;
+                lastError = e.message;
+                return;
+              }
               lastError = e instanceof Error ? e.message : String(e);
               att.jobsErr++;
               ws.serializeAttachment(att);
@@ -859,6 +922,16 @@ export class AgentHubEngine {
 
         nextPending.sort((a, b) => a - b);
         pendingIndices = nextPending;
+      }
+
+      if (permanentFailure) {
+        const pf = permanentFailure as PermanentJobError;
+        return {
+          ok: false,
+          status: pf.status,
+          error: pf.code,
+          message: pf.message,
+        };
       }
 
       if (finalResults.some((r) => r === undefined)) {
@@ -918,6 +991,14 @@ export class AgentHubEngine {
     trace: Record<string, string>,
     timeoutMs: number,
   ): Promise<string> {
+    const frameText = JSON.stringify({ type: 'dispatch', jobId, jobNonce, trace, call });
+    const frameBytes = utf8Encoder.encode(frameText).byteLength;
+    if (frameBytes > MAX_WS_FRAME_BYTES) {
+      return Promise.reject(
+        new PermanentJobError(413, 'call_too_large', `serialized dispatch frame (${frameBytes} bytes) exceeds 1 MiB limit`),
+      );
+    }
+
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(jobId);
@@ -927,7 +1008,7 @@ export class AgentHubEngine {
       this.pending.set(jobId, { jobId, jobNonce, siteId, ws, timer, resolve, reject });
 
       try {
-        ws.send(JSON.stringify({ type: 'dispatch', jobId, jobNonce, trace, call }));
+        ws.send(frameText);
       } catch (e) {
         clearTimeout(timer);
         this.pending.delete(jobId);
@@ -939,6 +1020,31 @@ export class AgentHubEngine {
   hasPendingJob(jobId: string, siteId: string): boolean {
     const job = this.pending.get(jobId);
     return Boolean(job && job.siteId === siteId.trim().toLowerCase());
+  }
+
+  verifyPendingJob(jobId: string, jobNonce: string, siteId: string): boolean {
+    const job = this.pending.get(jobId);
+    if (!job) return false;
+    return jobNonce.length > 0 && sameBytes(jobNonce, job.jobNonce) && job.siteId === siteId.trim().toLowerCase();
+  }
+
+  failJob(jobId: string, jobNonce: string, siteId: string, reason: string, permanent = true): CompleteJobResult {
+    const job = this.pending.get(jobId);
+    if (!job) return { ok: false, status: 404, error: 'unknown_or_expired_job' };
+    const nonceOk = jobNonce.length > 0 && sameBytes(jobNonce, job.jobNonce);
+    const siteOk = siteId.trim().toLowerCase() === job.siteId;
+    if (!nonceOk || !siteOk) {
+      return { ok: false, status: 403, error: 'invalid_job_credentials' };
+    }
+    clearTimeout(job.timer);
+    this.pending.delete(jobId);
+    if (permanent) {
+      const status = reason === 'too_large' ? 413 : 502;
+      job.reject(new PermanentJobError(status, reason, `agent ${job.siteId} reply failed permanently: ${reason}`));
+    } else {
+      job.reject(new Error(`agent ${job.siteId} reply failed: ${reason}`));
+    }
+    return { ok: true, status: 200 };
   }
 
   completeJob(jobId: string, jobNonce: string, siteId: string, bodyText: string): CompleteJobResult {
@@ -1051,10 +1157,10 @@ export async function routeFetchWithFailover(params: {
 
   const agentOut = await callAgent(body, trace, site);
   if (!agentOut.ok) {
-    if (agentOut.status === 400) {
+    if (agentOut.status === 400 || agentOut.status === 413) {
       return Response.json(
         { error: agentOut.error, message: agentOut.message },
-        { status: 400, headers: { 'cache-control': 'no-store' } },
+        { status: agentOut.status, headers: { 'cache-control': 'no-store' } },
       );
     }
     // Never bypass an origin Retry-After window that exceeds the caller's maxSeconds budget.

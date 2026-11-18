@@ -15,6 +15,7 @@ import { handleMcpRequest, type McpServerDeps } from '../src/mcp.ts';
 import type { OAuthStore } from '../src/oauth.ts';
 import {
   cloudflareOverflowFetch,
+  encodeBodyForWire,
   isRobotsAllowed,
   parseOverflowRobotsTxt,
   validateCallRobotsPolicy,
@@ -372,8 +373,17 @@ test('MCP cross-language contract emits respectRobots matching Go FetchCall wire
   const fixturePath = resolve(process.cwd(), '../testdata/wire-contract.json');
   const fixture = JSON.parse(readFileSync(fixturePath, 'utf8')) as {
     canonicalCall: { options: Record<string, unknown> };
+    canonicalReply: { results: Array<{ body?: string; bodyEncoding?: string; bodyOmitted?: boolean }> };
   };
   assert.equal(fixture.canonicalCall.options.respectRobots, true);
+  assert.equal(fixture.canonicalReply.results[0]?.bodyEncoding, 'utf-8');
+  assert.equal(fixture.canonicalReply.results[1]?.bodyEncoding, 'base64');
+  assert.equal(fixture.canonicalReply.results[1]?.body, 'Y2Fm6Q==');
+  assert.equal(fixture.canonicalReply.results[2]?.bodyOmitted, true);
+
+  // Verify TS overflow helper produces identical base64 wire encoding for non-UTF-8 bytes (caf\xe9 -> Y2Fm6Q==).
+  const latin1Encoded = encodeBodyForWire(new Uint8Array([0x63, 0x61, 0x66, 0xe9]));
+  assert.deepEqual(latin1Encoded, { body: 'Y2Fm6Q==', bodyEncoding: 'base64' });
 
   let capturedBody = '';
   const secret = 'owner-secret-token-0123456789abcdef';
@@ -478,4 +488,92 @@ test('H-S4 & A4/A5: cloudflareOverflowFetch enforces manual redirects + per-hop 
   assert.equal(hitLoopback, false, 'overflow redirect to loopback http:// must never fetch target');
   assert.equal(body.results[0]?.outcome, 'skip');
   assert.equal(body.results[1]?.outcome, 'error');
+});
+
+test('H1, H2, H3: serial 1-job-per-socket queue + synced deadlines, fast failJob on 413 without re-crawl, and UTF-8 byte frame check', async () => {
+  // 1. H1: Two concurrent different-host calls to ONE serial agent (150ms per job, timeoutMs=220ms) both succeed!
+  const serialSockets: Array<HubSocketLike & { tags: string[]; sent: string[] }> = [];
+  let serialEngine!: AgentHubEngine;
+  const agentQueue: Array<{ jobId: string; jobNonce: string; call: { maxSeconds?: number; requests: Array<{ id: string; url: string }> } }> = [];
+  let agentBusy = false;
+  const replyStatuses: number[] = [];
+
+  const pumpSerialAgent = async () => {
+    if (agentBusy) return;
+    agentBusy = true;
+    while (agentQueue.length > 0) {
+      const msg = agentQueue.shift()!;
+      await new Promise<void>((r) => setTimeout(r, 150));
+      const rep = JSON.stringify({ results: msg.call.requests.map((req) => ({ id: req.id, url: req.url, status: 200, outcome: 'ok' })) });
+      replyStatuses.push(serialEngine.completeJob(msg.jobId, msg.jobNonce, 's1', rep).status);
+    }
+    agentBusy = false;
+  };
+
+  const wsSerial = makeFakeSocket(['site:s1'], (raw) => {
+    const parsed = JSON.parse(raw) as (typeof agentQueue)[number];
+    assert.ok(typeof parsed.call.maxSeconds === 'number' && parsed.call.maxSeconds > 0, 'dispatched call must stamp explicit maxSeconds');
+    agentQueue.push(parsed);
+    void pumpSerialAgent();
+  });
+  serialSockets.push(wsSerial);
+  serialEngine = new AgentHubEngine({
+    getSockets: (tag) => (tag ? serialSockets.filter((s) => s.tags.includes(tag)) : serialSockets),
+    cooldowns: memoryCooldowns(),
+    hostWindows: createMemoryHostWindowStore(),
+  });
+  serialEngine.registerAgent(wsSerial, 's1', 'amd64', {});
+
+  const [outA, outB] = await Promise.all([
+    serialEngine.dispatchFetch(JSON.stringify({ options: { pauseMs: 1 }, requests: [{ id: '1', url: 'https://a.example.com/', kind: 'page' }] }), {}, { timeoutMs: 220 }),
+    serialEngine.dispatchFetch(JSON.stringify({ options: { pauseMs: 1 }, requests: [{ id: '2', url: 'https://b.example.com/', kind: 'page' }] }), {}, { timeoutMs: 220 }),
+  ]);
+  assert.equal(outA.ok, true, `expected first job ok, got ${JSON.stringify(outA)}`);
+  assert.equal(outB.ok, true, `expected queued second job ok (timer starts at send!), got ${JSON.stringify(outB)}`);
+  assert.deepEqual(replyStatuses, [200, 200]);
+
+  // 2. H2: failJob(too_large) rejects immediately without waiting for job timer and WITHOUT repeating crawl on site-2!
+  const failSockets: Array<HubSocketLike & { tags: string[]; sent: string[] }> = [];
+  let failEngine!: AgentHubEngine;
+  const wsFail1 = makeFakeSocket(['site:s1'], (raw) => {
+    const msg = JSON.parse(raw) as { jobId: string; jobNonce: string };
+    queueMicrotask(() => {
+      failEngine.failJob(msg.jobId, msg.jobNonce, 's1', 'too_large', true);
+    });
+  });
+  const wsFail2 = makeFakeSocket(['site:s2']);
+  failSockets.push(wsFail1, wsFail2);
+  failEngine = new AgentHubEngine({
+    getSockets: (tag) => (tag ? failSockets.filter((s) => s.tags.includes(tag)) : failSockets),
+    cooldowns: memoryCooldowns(),
+    hostWindows: createMemoryHostWindowStore(),
+  });
+  failEngine.registerAgent(wsFail1, 's1', 'amd64', { publicIp: '1.1.1.1' });
+  failEngine.registerAgent(wsFail2, 's2', 'arm64', { publicIp: '2.2.2.2' });
+
+  const t0 = Date.now();
+  const tooLargeOut = await failEngine.dispatchFetch(
+    JSON.stringify({ maxSeconds: 30, requests: [{ id: '1', url: 'https://giant.example.com/', kind: 'page' }] }),
+  );
+  const elapsedMs = Date.now() - t0;
+  assert.equal(tooLargeOut.ok, false);
+  if (!tooLargeOut.ok) {
+    assert.equal(tooLargeOut.status, 413);
+  }
+  assert.ok(elapsedMs < 500, `failJob should resolve immediately, took ${elapsedMs}ms`);
+  assert.equal(wsFail2.sent.length, 0, 'oversized reply must NEVER trigger duplicate crawl on peer node');
+
+  // 3. H3: UTF-8 byte frame size check catches both near-1MiB ASCII envelope overflow AND multi-byte UTF-8 CJK!
+  const cjkBody = JSON.stringify({ requests: [{ id: '1', url: `https://cjk.example.com/${'漢'.repeat(400_000)}`, kind: 'page' }] });
+  const cjkOut = await failEngine.dispatchFetch(cjkBody);
+  assert.equal(cjkOut.ok, false);
+  if (!cjkOut.ok) {
+    assert.equal(cjkOut.status, 413);
+  }
+  const nearLimitAscii = JSON.stringify({ requests: [{ id: '1', url: `https://big.example.com/?${'x'.repeat((1 << 20) - 80)}`, kind: 'page' }] });
+  const nearOut = await failEngine.dispatchFetch(nearLimitAscii, { 'x-request-id': 'ray-1234567890' });
+  assert.equal(nearOut.ok, false);
+  if (!nearOut.ok) {
+    assert.equal(nearOut.status, 413);
+  }
 });

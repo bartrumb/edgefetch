@@ -25,20 +25,24 @@ import (
 var Version = "1.0.6"
 
 const (
-	DefaultPingInterval    = 30 * time.Second
-	DefaultReadWatchdog    = 50 * time.Second
-	DefaultHealthyResetDur = 30 * time.Second
-	DefaultShutdownDrain   = 25 * time.Second
-	maxReconnectBackoff    = 30 * time.Second
+	DefaultPingInterval          = 30 * time.Second
+	DefaultReadWatchdog          = 50 * time.Second
+	DefaultHealthyResetDur       = 30 * time.Second
+	DefaultShutdownDrain         = 25 * time.Second
+	DefaultUploadTimeout         = 45 * time.Second
+	DefaultShutdownUploadTimeout = 10 * time.Second
+	maxReconnectBackoff          = 30 * time.Second
 )
 
 // RuntimeOpts allows integration tests to shorten keepalive/drain timers without altering production defaults.
 type RuntimeOpts struct {
-	PingInterval    time.Duration
-	ReadWatchdog    time.Duration
-	HealthyResetDur time.Duration
-	ShutdownDrain   time.Duration
-	OnConnected     func()
+	PingInterval          time.Duration
+	ReadWatchdog          time.Duration
+	HealthyResetDur       time.Duration
+	ShutdownDrain         time.Duration
+	UploadTimeout         time.Duration
+	ShutdownUploadTimeout time.Duration
+	OnConnected           func()
 }
 
 func (o RuntimeOpts) withDefaults() RuntimeOpts {
@@ -53,6 +57,12 @@ func (o RuntimeOpts) withDefaults() RuntimeOpts {
 	}
 	if o.ShutdownDrain <= 0 {
 		o.ShutdownDrain = DefaultShutdownDrain
+	}
+	if o.UploadTimeout <= 0 {
+		o.UploadTimeout = DefaultUploadTimeout
+	}
+	if o.ShutdownUploadTimeout <= 0 {
+		o.ShutdownUploadTimeout = DefaultShutdownUploadTimeout
 	}
 	return o
 }
@@ -79,7 +89,6 @@ func Run(
 	rtOpts = rtOpts.withDefaults()
 	replyClient := &http.Client{
 		Transport: hubTransport,
-		Timeout:   45 * time.Second,
 	}
 
 	attempt := 0
@@ -204,7 +213,7 @@ func runSession(
 				log.Warn("agent_missing_job_id")
 				continue
 			}
-			handleDispatch(ctx, cfg, crawler, allow, replyClient, log, rtOpts.ShutdownDrain, msg)
+			handleDispatchWithOpts(ctx, cfg, crawler, allow, replyClient, log, rtOpts, msg)
 		default:
 			log.Warn("agent_unknown_type", slog.String("type", msg.Type))
 		}
@@ -221,9 +230,25 @@ func handleDispatch(
 	shutdownDrain time.Duration,
 	msg controlMessage,
 ) {
+	handleDispatchWithOpts(parentCtx, cfg, crawler, allow, replyClient, baseLog, RuntimeOpts{
+		ShutdownDrain: shutdownDrain,
+	}.withDefaults(), msg)
+}
+
+func handleDispatchWithOpts(
+	parentCtx context.Context,
+	cfg Config,
+	crawler *crawl.Crawler,
+	allow func(*url.URL) error,
+	replyClient *http.Client,
+	baseLog *slog.Logger,
+	rtOpts RuntimeOpts,
+	msg controlMessage,
+) {
+	rtOpts = rtOpts.withDefaults()
 	jobBaseCtx, cancelDrain := context.WithCancel(context.Background())
 	stopForward := context.AfterFunc(parentCtx, func() {
-		time.AfterFunc(shutdownDrain, cancelDrain)
+		time.AfterFunc(rtOpts.ShutdownDrain, cancelDrain)
 	})
 	defer func() {
 		stopForward()
@@ -265,9 +290,13 @@ func handleDispatch(
 		reply = crawl.ExecuteCall(jobBaseCtx, crawler, call, jobLog)
 	}
 
-	// Always upload completed/partial results using a fresh bounded context so an expired shutdownDrain deadline on
-	// jobBaseCtx never drops already-finished fetch results before POST /agent/reply completes.
-	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), 10*time.Second)
+	// Normal uploads get the full UploadTimeout (default 45s) across retries; only active SIGTERM shutdown drains
+	// clamp the upload window to ShutdownUploadTimeout (default 10s) so container stop deadlines are respected.
+	uploadLimit := rtOpts.UploadTimeout
+	if parentCtx.Err() != nil {
+		uploadLimit = rtOpts.ShutdownUploadTimeout
+	}
+	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), uploadLimit)
 	defer cancelUpload()
 	if err := uploadReply(uploadCtx, replyClient, cfg, msg.JobID, msg.JobNonce, reply); err != nil {
 		jobLog.Error("agent_reply_failed", slog.String("error", err.Error()))

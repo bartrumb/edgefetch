@@ -262,6 +262,25 @@ function isDisallowedOverflowUrl(u: URL, canonicalSelf: string): boolean {
   );
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  const chunkSize = 0x8000;
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.byteLength; i += chunkSize) {
+    const slice = bytes.subarray(i, Math.min(bytes.byteLength, i + chunkSize));
+    parts.push(String.fromCharCode(...slice));
+  }
+  return btoa(parts.join(''));
+}
+
+export function encodeBodyForWire(bytes: Uint8Array): { body: string; bodyEncoding: 'utf-8' | 'base64' } {
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return { body: text, bodyEncoding: 'utf-8' };
+  } catch {
+    return { body: bytesToBase64(bytes), bodyEncoding: 'base64' };
+  }
+}
+
 async function readBoundedBytes(
   body: ReadableStream<Uint8Array> | null,
   maxBytes: number,
@@ -555,7 +574,7 @@ export async function cloudflareOverflowFetch(
         }
 
         const { bytes, truncated } = await readBoundedBytes(resp.body, maxBytes, hopSignal);
-        const bodyStr = includeBody && !truncated ? new TextDecoder().decode(bytes) : undefined;
+        const encodedBody = includeBody && !truncated ? encodeBodyForWire(bytes) : undefined;
         const outcome = truncated
           ? 'error'
           : cfMitigated
@@ -580,7 +599,7 @@ export async function cloudflareOverflowFetch(
           etag: resp.headers.get('etag') ?? undefined,
           retryAfter: resp.headers.get('retry-after') ?? undefined,
           ...(cfMitigated ? { cfMitigated } : {}),
-          ...(bodyStr !== undefined ? { body: bodyStr } : {}),
+          ...(encodedBody ? { body: encodedBody.body, bodyEncoding: encodedBody.bodyEncoding } : {}),
         });
         finished = true;
         break;

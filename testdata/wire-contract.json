@@ -9,6 +9,7 @@
       "gapMs": 1500,
       "timeoutMs": 30000,
       "maxBytes": 8388608,
+      "maxTotalBytes": 16777216,
       "retries": 1
     },
     "requests": [
@@ -32,6 +33,83 @@
         "id": "contract-2",
         "url": "https://example.com/",
         "kind": "page"
+      }
+    ]
+  },
+  "canonicalReply": {
+    "durationMs": 42,
+    "summary": {
+      "total": 3,
+      "byOutcome": {
+        "ok": 3
+      },
+      "byStatus": {
+        "200": 3
+      }
+    },
+    "results": [
+      {
+        "id": "contract-utf8",
+        "url": "https://example.com/utf8",
+        "kind": "page",
+        "outcome": "ok",
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "bytes": 16,
+        "attempts": 1,
+        "durationMs": 12,
+        "timing": {
+          "dnsMs": 1,
+          "connectMs": 2,
+          "tlsMs": 3,
+          "ttfbMs": 6,
+          "reused": false,
+          "proto": "HTTP/2.0"
+        },
+        "body": "<html>ok</html>\n",
+        "bodyEncoding": "utf-8"
+      },
+      {
+        "id": "contract-latin1",
+        "url": "https://example.com/latin1",
+        "kind": "page",
+        "outcome": "ok",
+        "status": 200,
+        "contentType": "text/html; charset=iso-8859-1",
+        "bytes": 4,
+        "attempts": 1,
+        "durationMs": 10,
+        "timing": {
+          "dnsMs": 0,
+          "connectMs": 0,
+          "tlsMs": 0,
+          "ttfbMs": 4,
+          "reused": true,
+          "proto": "HTTP/2.0"
+        },
+        "body": "Y2Fm6Q==",
+        "bodyEncoding": "base64"
+      },
+      {
+        "id": "contract-budget-omitted",
+        "url": "https://example.com/large",
+        "kind": "page",
+        "outcome": "ok",
+        "problem": "batch total body budget (16777216 bytes) exceeded",
+        "status": 200,
+        "bytes": 7340032,
+        "truncated": true,
+        "bodyOmitted": true,
+        "attempts": 1,
+        "durationMs": 20,
+        "timing": {
+          "dnsMs": 0,
+          "connectMs": 0,
+          "tlsMs": 0,
+          "ttfbMs": 10,
+          "reused": true,
+          "proto": "HTTP/2.0"
+        }
       }
     ]
   }

@@ -1,10 +1,8 @@
 package agent
 
 import (
-	"bufio"
 	"compress/gzip"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -19,56 +17,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/bartrumb/edgefetch/internal/classify"
 	"github.com/bartrumb/edgefetch/internal/crawl"
-	"github.com/bartrumb/edgefetch/internal/ws"
 )
-
-func writeServerFrame(w io.Writer, opcode byte, payload []byte) error {
-	n := len(payload)
-	hdr := make([]byte, 0, 10+n)
-	hdr = append(hdr, 0x80|(opcode&0x0F))
-	if n < 126 {
-		hdr = append(hdr, byte(n))
-	} else {
-		hdr = append(hdr, 126, 0, 0)
-		binary.BigEndian.PutUint16(hdr[len(hdr)-2:], uint16(n))
-	}
-	hdr = append(hdr, payload...)
-	_, err := w.Write(hdr)
-	return err
-}
-
-func readClientFrame(br *bufio.Reader) (byte, []byte, error) {
-	var hdr [2]byte
-	if _, err := io.ReadFull(br, hdr[:]); err != nil {
-		return 0, nil, err
-	}
-	opcode := hdr[0] & 0x0F
-	masked := (hdr[1] & 0x80) != 0
-	length := uint64(hdr[1] & 0x7F)
-	if length == 126 {
-		var ext [2]byte
-		if _, err := io.ReadFull(br, ext[:]); err != nil {
-			return 0, nil, err
-		}
-		length = uint64(binary.BigEndian.Uint16(ext[:]))
-	}
-	var mask [4]byte
-	if masked {
-		if _, err := io.ReadFull(br, mask[:]); err != nil {
-			return 0, nil, err
-		}
-	}
-	payload := make([]byte, int(length))
-	if _, err := io.ReadFull(br, payload); err != nil {
-		return 0, nil, err
-	}
-	if masked {
-		ws.MaskBytes(payload, mask)
-	}
-	return opcode, payload, nil
-}
 
 func TestConfigSecurityGuards(t *testing.T) {
 	dir := t.TempDir()
@@ -158,32 +111,34 @@ func TestAgentSessionReconnectHelloPingAndGzipReply(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/agent/ws", func(w http.ResponseWriter, r *http.Request) {
-		hj := w.(http.Hijacker)
-		conn, rw, _ := hj.Hijack()
-		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws.ComputeAccept(r.Header.Get("Sec-WebSocket-Key")) + "\r\n\r\n")
-		_ = rw.Flush()
-
-		if connects.Add(1) == 1 {
-			_ = conn.Close()
+		sc, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("websocket.Accept: %v", err)
 			return
 		}
-		defer conn.Close()
+		if connects.Add(1) == 1 {
+			_ = sc.CloseNow()
+			return
+		}
+		defer sc.CloseNow()
 
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		rctx, rcancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer rcancel()
+
 		sawHello, sawPing := false, false
 		for !sawHello || !sawPing {
-			op, payload, err := readClientFrame(rw.Reader)
+			typ, payload, err := sc.Read(rctx)
 			if err != nil {
-				t.Errorf("readClientFrame: %v", err)
+				t.Errorf("server Read: %v", err)
 				return
 			}
-			if op != ws.OpText {
+			if typ != websocket.MessageText {
 				continue
 			}
 			s := string(payload)
 			if s == "ping" {
 				sawPing = true
-				_ = writeServerFrame(conn, ws.OpText, []byte("pong"))
+				_ = sc.Write(rctx, websocket.MessageText, []byte("pong"))
 			} else if strings.Contains(s, `"agent_hello"`) {
 				sawHello = true
 			}
@@ -198,8 +153,8 @@ func TestAgentSessionReconnectHelloPingAndGzipReply(t *testing.T) {
 				Options:  crawl.Options{IncludeBody: true},
 			},
 		})
-		_ = writeServerFrame(conn, ws.OpText, rawDispatch)
-		<-time.After(2 * time.Second)
+		_ = sc.Write(rctx, websocket.MessageText, rawDispatch)
+		<-rctx.Done()
 	})
 
 	mux.HandleFunc("/agent/reply", func(w http.ResponseWriter, r *http.Request) {
@@ -259,8 +214,6 @@ func TestAgentSessionReconnectHelloPingAndGzipReply(t *testing.T) {
 }
 
 func TestShutdownDrainStillUploadsPartialResults(t *testing.T) {
-	// First request succeeds immediately; second blocks until ShutdownDrain expires.
-	// Verify that handleDispatch STILL uploads the completed first result + not_tried second result via uploadCtx!
 	var calls atomic.Int32
 	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/robots.txt" {
@@ -307,7 +260,6 @@ func TestShutdownDrainStillUploadsPartialResults(t *testing.T) {
 	defer hubSrv.Close()
 
 	parentCtx, cancelParent := context.WithCancel(context.Background())
-	// Trigger shutdown right away with a short 80ms drain window while request #2 hangs.
 	time.AfterFunc(30*time.Millisecond, cancelParent)
 
 	cfg := Config{
@@ -343,4 +295,75 @@ func TestShutdownDrainStillUploadsPartialResults(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("lost results on shutdown: /agent/reply was never uploaded after ShutdownDrain expired")
 	}
+}
+
+func TestReconnectWatchdogClosesPreviousSocketImmediately(t *testing.T) {
+	firstSocketClosed := make(chan struct{})
+	secondConnected := make(chan struct{})
+	var connCount atomic.Int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/agent/ws", func(w http.ResponseWriter, r *http.Request) {
+		sc, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		n := connCount.Add(1)
+		if n == 1 {
+			go func() {
+				defer close(firstSocketClosed)
+				defer sc.CloseNow()
+				for {
+					if _, _, err := sc.Read(context.Background()); err != nil {
+						return
+					}
+				}
+			}()
+			return
+		}
+		if n == 2 {
+			close(secondConnected)
+		}
+		_ = sc.CloseNow()
+	})
+
+	hubSrv := httptest.NewServer(mux)
+	defer hubSrv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	crawler := crawl.NewCrawler(http.DefaultTransport, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	cfg := Config{
+		HubURL:     hubSrv.URL,
+		AgentToken: "agent-secret-token-0123456789-abcdef",
+		SiteID:     "site-1",
+		UserAgent:  crawl.DefaultUserAgent,
+		PauseMs:    100,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, cfg, crawler, crawl.PublicHTTPS, http.DefaultTransport, log, RuntimeOpts{
+			PingInterval:  time.Second,
+			ReadWatchdog:  40 * time.Millisecond,
+			ShutdownDrain: 50 * time.Millisecond,
+		})
+	}()
+
+	select {
+	case <-secondConnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for second WebSocket connection after watchdog")
+	}
+
+	select {
+	case <-firstSocketClosed:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("first WebSocket remained open after watchdog session exit and reconnect")
+	}
+
+	cancel()
+	<-done
 }

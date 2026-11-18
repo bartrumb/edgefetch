@@ -1,6 +1,6 @@
 # EdgeFetch Go Internals & Concurrency Guide
 
-This guide walks through how EdgeFetch works under the hood — written both as an architectural reference and as a practical tour of idiomatic Go systems patterns (goroutines, channel locks, zero-allocation string scanning, `net/http/httptrace`, RFC 6455 framing, and Linux syscalls).
+This guide walks through how EdgeFetch works under the hood — written both as an architectural reference and as a practical tour of idiomatic Go systems patterns (goroutines, channel locks, zero-allocation string scanning, `net/http/httptrace`, WebSocket transport hardening, and Linux syscalls).
 
 ---
 
@@ -65,7 +65,7 @@ Hooking `net.Dialer.Control` (`RejectNonPublicPeer`) runs inside Go's dialer *af
 
 ---
 
-## 6. Stdlib RFC 6455 WebSocket & Linux `AllThreadsSyscall` Privilege Drop
+## 6. Hardened `coder/websocket` Client & Linux Privilege Drop
 
 - **TLS ALPN Pinning ([`internal/ws/client.go`](../internal/ws/client.go)):** `tlsCfg.NextProtos = []string{"http/1.1"}` ensures Cloudflare's edge negotiates HTTP/1.1 for the `101 Switching Protocols` upgrade (whereas `newHubTransport()` negotiates `h2` for multiplexed `POST /agent/reply` gzip uploads).
 - **Classic ECDHE Curves (`X25519`, `P-256`, `P-384`):** Go 1.23+ enables `X25519MLKEM768` post-quantum hybrid key shares by default, enlarging TLS `ClientHello` beyond single-packet PPPoE / VM bridge MTUs where middleboxes can stall handshakes. Pinning classic curves keeps handshakes single-packet and fast across residential links.

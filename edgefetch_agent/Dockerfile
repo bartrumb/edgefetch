@@ -1,10 +1,10 @@
 # Multi-arch (`linux/amd64` + `linux/arm64`) Home Assistant OS Add-on Dockerfile (~9 MB distroless, zero shell).
 # Home Assistant Supervisor passes `--build-arg BUILD_VERSION=<config.yaml version>` automatically on every install/update;
 # referencing `BUILD_VERSION` before `git clone` invalidates Docker's layer cache whenever a new version ships.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETARCH
 RUN apk add --no-cache git
-ARG BUILD_VERSION=1.0.5
+ARG BUILD_VERSION=1.0.6
 RUN echo "Building EdgeFetch ${BUILD_VERSION}" && \
     git clone --depth 1 https://github.com/bartrumb/edgefetch.git /src && \
     cd /src && \

@@ -1,7 +1,7 @@
 # EdgeFetch
 
 [![CI](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml/badge.svg)](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml)
-[![Go 1.22+](https://img.shields.io/badge/Go-1.22%2B%20(stdlib%20only)-00ADD8?logo=go)](go.mod)
+[![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 <p>
@@ -14,9 +14,9 @@
   </a>
 </p>
 
-**EdgeFetch** is a security-hardened, **zero-dependency Go HTTP/2 fetcher** and **outbound-only distributed standby worker** paired with a **Cloudflare Hibernating WebSocket Durable Object** coordinator (`hub/` — complete with a built-in `/admin` Control Center and self-hosted OAuth 2.1 `/mcp` server) and a **1-click Home Assistant OS Add-on**.
+**EdgeFetch** is a security-hardened **Go HTTP/2 fetcher** and **outbound-only distributed standby worker** (one Go dependency, with no transitive dependencies) paired with a **Cloudflare Hibernating WebSocket Durable Object** coordinator (`hub/` — complete with a built-in `/admin` Control Center and self-hosted OAuth 2.1 `/mcp` server) and a **1-click Home Assistant OS Add-on**.
 
-It solves a practical distributed-systems problem: keeping scheduled public feed/document syncs resilient across primary cloud containers (`--mode=server`) and geo-distributed standby hardware (`--mode=agent`) **without** opening inbound router ports, running forward HTTP/SOCKS proxies, installing VPN/tunnel daemons, or pulling in third-party Go packages.
+It solves a practical distributed-systems problem: keeping scheduled public feed/document syncs resilient across primary cloud containers (`--mode=server`) and geo-distributed standby hardware (`--mode=agent`) **without** opening inbound router ports, running forward HTTP/SOCKS proxies, or installing VPN/tunnel daemons.
 
 <p align="center">
   <img src="docs/assets/admin-console.jpg" alt="EdgeFetch Built-in /admin Web Control Center — Live Crawl Log, Multi-Arch Fleet, Interactive Waterfall Tester, 429 Cooldowns & OAuth 2.1 MCP Grants" width="900">
@@ -26,7 +26,7 @@ It solves a practical distributed-systems problem: keeping scheduled public feed
 
 ## Why EdgeFetch?
 
-- **100% Go Standard Library (`go.sum`-free):** HTTP/2 connection pooling, `net/http/httptrace` phase telemetry, RFC 6455 TLS WebSocket framing, RFC 9309 `robots.txt` longest-match + unreachable-disallow evaluation, RFC 9110 `Retry-After` parsing, three-state circuit breaking, and Linux `prctl` + `setuid` privilege dropping are implemented in ~2,300 lines of idiomatic Go with **zero external supply-chain dependencies**.
+- **Minimal Go Supply Chain (One Dependency, Zero Transitive Dependencies):** HTTP/2 connection pooling, `net/http/httptrace` phase telemetry, RFC 9309 `robots.txt` longest-match + unreachable-disallow evaluation, RFC 9110 `Retry-After` parsing, three-state circuit breaking, and Linux `prctl` + `setuid` privilege dropping use the Go standard library plus `github.com/coder/websocket` (zero transitive dependencies).
 - **Strict Hub / Edge Security Split (~$0 Idle Cloud Cost):**
   - **Edge Nodes (`amd64` / `aarch64`)** host **zero** inbound HTTP, `/admin`, or `/mcp` endpoints. They dial outbound `wss://` to `/agent/ws`, where Cloudflare's `WebSocketRequestResponsePair("ping", "pong")` answers 30-second keepalives at the edge **without waking the Durable Object from hibernation**.
   - **Cloudflare Hub (`hub/`)** is the sole public control plane — hosting `POST /fetch`, `GET /agents`, the `/admin` Web Control Center, and the OAuth 2.1 `/mcp` server for Claude Code.
@@ -64,7 +64,7 @@ flowchart TD
 | [`internal/politeness`](internal/politeness/politeness.go) | Context-cancellable `chan struct{}` per-host locks, `robots.txt` cache, 3-state circuit breaker, `RejectNonPublicPeer` SSRF hook |
 | [`internal/classify`](internal/classify/classify.go) | Defined string enums (`Kind`, `Outcome`) and panic-free JSON/HTML response classification |
 | [`internal/crawl`](internal/crawl/crawl.go) | Bounded worker pool, positive dwell jitter (`PauseJitterMs`), `httptrace` phase timing, `io.LimitReader(max+1)`, `/fetch` handler |
-| [`internal/ws`](internal/ws/client.go) | Zero-dependency stdlib RFC 6455 TLS WebSocket client (`http/1.1` ALPN, frame masking, fragmented-frame assembly) |
+| [`internal/ws`](internal/ws/client.go) | Hardened `coder/websocket` client (`http/1.1` ALPN, classic ECDHE TLS curves, no redirect token leakage, 1 MiB ceiling) |
 | [`internal/priv`](internal/priv/priv_linux.go) | Linux `prctl(PR_SET_NO_NEW_PRIVS)` + `AllThreadsSyscall` irreversible root drop (`65532:65532`) |
 | [`internal/agent`](internal/agent/agent.go) | `/data/options.json` + env loader, jittered reconnect supervisor, `agent_hello` OTel telemetry, gzipped reply uploader |
 | [`edgefetch_agent/`](edgefetch_agent/config.yaml) | Multi-arch (`amd64` + `aarch64`) Home Assistant OS Add-on manifest, `apparmor.txt`, and `distroless` Dockerfile |
@@ -77,15 +77,14 @@ flowchart TD
 
 ## Benchmarks (`go test -bench=. -benchmem ./...`)
 
-Measured on Linux `amd64` (12th Gen Intel Core i9-12900K, Go stdlib only):
+Measured on Linux `amd64` (12th Gen Intel Core i9-12900K, Go 1.27):
 
-| Benchmark | Latency | Throughput | Heap Allocations |
-|---|---:|---:|---:|
-| `BenchmarkParseRetryAfter` | `4.45 ns/op` | — | **`0 B/op` (`0 allocs/op`)** |
-| `BenchmarkRobotsMatch` (`*` wildcards + `$` anchor) | `52.17 ns/op` | — | **`0 B/op` (`0 allocs/op`)** |
-| `BenchmarkIsPublicIP` (IPv4 + NAT64 IPv6 check) | `155.50 ns/op` | — | **`0 B/op` (`0 allocs/op`)** |
-| `BenchmarkMaskBytes1KiB` (RFC 6455 XOR masking) | `415.10 ns/op` | `2,467 MB/s` | **`0 B/op` (`0 allocs/op`)** |
-| `BenchmarkClassifyFeedJSON` | `1,229 ns/op` | — | `1,416 B/op` (`28 allocs/op`) |
+| Benchmark | Latency | Heap Allocations |
+|---|---:|---:|
+| `BenchmarkParseRetryAfter` | `4.45 ns/op` | **`0 B/op` (`0 allocs/op`)** |
+| `BenchmarkRobotsMatch` (`*` wildcards + `$` anchor) | `52.17 ns/op` | **`0 B/op` (`0 allocs/op`)** |
+| `BenchmarkIsPublicIP` (IPv4 + NAT64 IPv6 check) | `155.50 ns/op` | **`0 B/op` (`0 allocs/op`)** |
+| `BenchmarkClassifyFeedJSON` | `1,229 ns/op` | `1,416 B/op` (`28 allocs/op`) |
 
 ---
 

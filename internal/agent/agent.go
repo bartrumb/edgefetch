@@ -140,6 +140,7 @@ func runSession(
 	if err != nil {
 		return err
 	}
+	defer func() { _ = conn.CloseNow() }()
 	log.Info("agent_connected", slog.String("hub", cfg.HubURL), slog.String("arch", runtime.GOARCH), slog.String("version", Version))
 
 	helloPayload, _ := json.Marshal(map[string]any{

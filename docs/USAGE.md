@@ -30,7 +30,7 @@ sequenceDiagram
 
     Edge->>Hub: 1. Outbound WSS Upgrade GET /agent/ws (Bearer AGENT_TOKEN)
     Hub-->>Edge: 101 Switching Protocols + {"type":"hello","siteId":"site-arm64"}
-    Edge->>Hub: {"type":"agent_hello","arch":"arm64","goVersion":"go1.25"}
+    Edge->>Hub: {"type":"agent_hello","version":"1.1.0","arch":"arm64","goVersion":"go1.27.4"}
     loop Every 30s while idle (~$0 DO cost)
         Edge->>Hub: "ping"
         Note over Hub: Cloudflare Edge Auto-Response ("pong") — 0 DO wakeups!
@@ -60,8 +60,8 @@ EdgeFetch uses a **two-tier tuning model** so upstream callers can tune crawls p
 
 | Option / Env | Default | Behavior |
 |---|---|---|
-| `pause_ms` (`EDGEFETCH_PAUSE_MS`) | `1500` | **Hard minimum** per-host delay in ms. Upstream calls requesting a smaller `pauseMs` are clamped up to this floor. |
-| `pause_jitter_ms` (`EDGEFETCH_PAUSE_JITTER_MS`) | `750` | **Hard minimum** random positive jitter (`[0, jitter)`) added to `pause_ms` on every fetch. |
+| `pause_ms` (`EDGEFETCH_PAUSE_MS`) | `3000` (add-on) / `1500` (env default) | **Hard minimum** per-host delay in ms. Upstream calls requesting a smaller `pauseMs` are clamped up to this floor. |
+| `pause_jitter_ms` (`EDGEFETCH_PAUSE_JITTER_MS`) | `1500` (add-on) / `750` (env default) | **Hard minimum** random positive jitter (`[0, jitter)`) added to `pause_ms` on every fetch. |
 | `allowed_hosts` (`EDGEFETCH_ALLOWED_HOSTS`) | `[]` (all public HTTPS) | Optional domain suffix allowlist (e.g. `example.com` permits `example.com` and `*.example.com`). Regardless of this list, `RejectNonPublicPeer` **always** blocks RFC 1918 LANs, loopback, Tailscale `100.64/10`, cloud metadata, and NAT64/6to4/Teredo IPv6 ranges at dial time. |
 | `Concurrency` | Fixed `1` on agents | Edge nodes always serialize outbound jobs (`Concurrency = 1`) to protect residential upload bandwidth. |
 
@@ -99,12 +99,12 @@ curl -X POST "https://<your-hub>.workers.dev/fetch?site=site-arm64" \
 
 | Field | Default / Max | Description |
 |---|---|---|
-| `requests[].kind` | `"feed"` \| `"page"` | `"feed"` sends `Accept: application/json` and validates JSON structure; `"page"` sends `Accept: text/html,application/xhtml+xml`. |
+| `requests[].kind` | `"page"` \| `"json"` \| `"text"` \| `"feed"` | `"page"` for HTML documents (`text/html`), `"json"` for any valid 2xx JSON API, `"text"` for plain text/XML/sitemaps, or `"feed"` for product feeds requiring a top-level `"products"` array. |
 | `requests[].ifNoneMatch` / `ifModifiedSince` | optional | Conditional `304 Not Modified` headers — saves bandwidth when upstream content hasn't changed. |
-| `options.includeBody` | `false` | Set `true` to return the response UTF-8 body string alongside status/headers/timing. |
-| `options.respectRobots` | **`true` by default** (alias `robots` also accepted; pass `false` to opt out) | Fetches & caches `/robots.txt` per host for 24h (`Allow`/`Disallow` longest-match + `Crawl-delay`, assuming complete disallow per RFC 9309 §2.3.1.4 if `/robots.txt` is unreachable or returns `429`/`5xx`). |
-| `options.maxBytes` | `8 MiB` (max `16 MiB`) | Streaming body cap via `io.LimitReader(maxBytes + 1)`. Oversized responses stop immediately with `truncated: true`. |
-| `options.retries` | `0` (max `3`) | Retries **only** transport/500/502/504 errors on the active node with exponential jitter. `403`, `429`, `503`, and challenges are **never** retried on the node (in `target=auto`, HTTP `429` triggers Hub-level site cooldown + peer/Cloudflare failover). |
+| `options.includeBody` | `false` | Set `true` to return response bodies alongside `bodyEncoding` (`"utf-8"` or lossless `"base64"` for non-UTF-8 responses). |
+| `options.respectRobots` | **`true` (locked on by default)** | Fetches & caches `/robots.txt` (`512 KiB` cap) per host for 24h and enforces it on the initial URL **and every redirect hop** (up to 5). Passing `false` is rejected (`400 robots_required`) unless the target host is in the owner's `ROBOTS_BYPASS_HOSTS` / `EDGEFETCH_ROBOTS_BYPASS_HOSTS` allowlist. |
+| `options.maxBytes` / `maxTotalBytes` | `8 MiB` (`16 MiB` max) / `16 MiB` (`18 MiB` max) | Per-URL streaming cap (`io.LimitReader(maxBytes + 1)`) plus per-batch retained body budget (`bodyOmitted: true` + `truncated: true` beyond budget). |
+| `options.retries` | `0` (max `3`) | Retries **only** transient transport/`500`/`502`/`504` errors (`>= 25%` jitter floor). Permanent SSRF/TLS refusals, `403`, `429`, `503`, and challenges are **never** retried on the node. |
 
 ---
 
@@ -131,9 +131,9 @@ Open `https://<your-hub>.workers.dev/admin` in any browser and sign in with your
 
 - `GET /.well-known/oauth-protected-resource` (RFC 9728 Protected Resource Metadata)
 - `GET /.well-known/oauth-authorization-server` (RFC 8414 Authorization Server Metadata)
-- `POST /oauth/register` (RFC 7591 Dynamic Client Registration — strictly restricted to loopback `http://localhost` / `127.0.0.1` or external `https://` callbacks)
-- `GET` / `POST /oauth/authorize` (Confused-deputy-safe consent screen displaying exact callback host + requested scopes)
-- `POST /oauth/token` & `POST /oauth/revoke` (Single-use 90s auth codes, constant-time PKCE `S256`, 1h access tokens, rotating 30d refresh tokens)
+- `POST /oauth/register` (RFC 7591 Dynamic Client Registration — IP rate-limited; restricted to loopback `http://localhost` / `127.0.0.1` / `[::1]` callbacks by default, or external `https://` hosts listed in `OAUTH_REDIRECT_ALLOWLIST`)
+- `GET` / `POST /oauth/authorize` (Confused-deputy-safe consent screen labeling self-reported client names, rejecting unknown scopes with `invalid_scope`, and requiring explicit `CALLER_TOKEN` entry for any non-loopback redirect)
+- `POST /oauth/token` & `POST /oauth/revoke` (Single-use 90s auth codes requiring `client_id` + `redirect_uri`, constant-time PKCE `S256`, 1h access tokens, atomic 30d refresh-token rotation with immediate full-grant revocation on replay)
 
 ### Add Directly to Claude Code
 
@@ -147,9 +147,9 @@ When Claude Code connects for the first time, it discovers `/.well-known/oauth-p
 
 | Tool | Required Scope | Description |
 |---|---|---|
-| `list_agents` | `crawl:read` | Lists connected standby agents (`siteId`, `arch`, `jobsOk`, `jobsErr`) and active 15m domain-affinity pins. |
-| `fetch_url` | `crawl:fetch` | Politely fetches a single public `https://` URL (`feed` or `page`, optional `site` pin, `robots`, `ifNoneMatch`) with full phase timing + body preview. |
-| `fetch_batch` | `crawl:fetch` | Politely fetches up to 25 public `https://` URLs with configurable `pauseMs` and `pauseJitterMs`. |
+| `list_agents` | `crawl:read` | Lists connected standby agents (`siteId`, `version`, `arch`, `jobsOk`, `jobsErr`) and active `429` site/IP cooldowns. |
+| `fetch_url` | `crawl:fetch` | Politely fetches a single public `https://` URL (`page`, `json`, `text`, or `feed`, optional `site` pin, `ifNoneMatch`, `robots.txt` enforced) with full phase timing + body preview. |
+| `fetch_batch` | `crawl:fetch` | Politely fetches up to 25 public `https://` URLs with configurable `pauseMs`, `pauseJitterMs`, and `kind` (`page`/`json`/`text`/`feed`). |
 
 *(Direct machine-to-machine MCP clients may also pass `Authorization: Bearer $CALLER_TOKEN` on `POST /mcp`.)*
 

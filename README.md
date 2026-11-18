@@ -30,11 +30,11 @@ It solves a practical distributed-systems problem: keeping scheduled public feed
 - **Strict Hub / Edge Security Split (~$0 Idle Cloud Cost):**
   - **Edge Nodes (`amd64` / `aarch64`)** host **zero** inbound HTTP, `/admin`, or `/mcp` endpoints. They dial outbound `wss://` to `/agent/ws`, where Cloudflare's `WebSocketRequestResponsePair("ping", "pong")` answers 30-second keepalives at the edge **without waking the Durable Object from hibernation**.
   - **Cloudflare Hub (`hub/`)** is the sole public control plane — hosting `POST /fetch`, `GET /agents`, the `/admin` Web Control Center, and the OAuth 2.1 `/mcp` server for Claude Code.
-- **Split Control / Data Plane for Asymmetric Links:** Small JSON dispatch commands arrive over the hibernated WebSocket (`< 1 MiB`), while `0.4–16 MiB` HTML/JSON responses stream back via `gzip`-compressed HTTP/2 `POST /agent/reply` (~8–10x smaller over residential upload pipes, never stalling WebSocket heartbeats, with independent shutdown-drain upload contexts so completed results are never lost on `SIGTERM`).
+- **Split Control / Data Plane for Asymmetric Links:** Small JSON dispatch commands arrive over the hibernated WebSocket (`< 1 MiB` UTF-8 verified before send), while `0.4–16 MiB` HTML/JSON responses (`16 MiB` default per-batch body budget, lossless `bodyEncoding: "utf-8" | "base64"`) stream back via `gzip`-compressed HTTP/2 `POST /agent/reply` (`45 s` normal upload budget, `10 s` shutdown-drain cap so completed results are never lost on `SIGTERM`).
 - **Defense-in-Depth Security ([SECURITY.md](SECURITY.md)):**
-  - Dial-time `net.Dialer.Control` SSRF guard (`RejectNonPublicPeer` backed by `net/netip`) inspects the exact resolved IP right before `connect()` — eliminating DNS-rebinding TOCTOU races and blocking `0.0.0.0/8`, RFC 1918 LANs (including Home Assistant's `172.30.32.0/23` bridge), loopback, Tailscale/CGNAT (`100.64.0.0/10`), cloud metadata (`169.254.169.254`), site-local (`fec0::/10`), and IPv6-embedded IPv4 transition prefixes (`::/96`, `0:0:0:0:ffff:0::/96`, `64:ff9b::/96` NAT64, `2002::/16` 6to4, `2001::/32` Teredo).
-  - Irreversible Linux privilege drop (`PR_SET_NO_NEW_PRIVS` -> `Setgroups([])` -> `Setgid(65532)` -> `Setuid(65532)` via `AllThreadsSyscall`) inside a **~9 MB shell-free `distroless`** image confined by a custom Home Assistant AppArmor profile.
-  - Strictly separated least-privilege tokens (`CALLER_TOKEN`, per-site `AGENT_TOKENS`, and mandatory `EDGEFETCH_SERVER_TOKEN` on non-loopback `--mode=server` binds) verified in constant time, plus per-job `jobNonce` binding.
+  - Dial-time `net.Dialer.Control` SSRF guard (`RejectNonPublicPeer` backed by `net/netip`) inspects the exact resolved IP right before `connect()` — eliminating DNS-rebinding TOCTOU races, restricting IPv6 strictly to `2000::/3` global unicast, and blocking `0.0.0.0/8`, RFC 1918 LANs (including Home Assistant's `172.30.32.0/23` bridge), loopback, Tailscale/CGNAT (`100.64.0.0/10`), cloud metadata (`169.254.169.254`), 6to4 relay (`192.88.99.0/24`), site-local (`fec0::/10`), ORCHID/ORCHIDv2 (`2001:10::/28`, `2001:20::/28`), documentation (`2001:db8::/32`, `3fff::/20`), SRv6 (`5f00::/16`), and IPv6-embedded IPv4 transition prefixes (`::/96`, `0:0:0:0:ffff:0::/96`, `64:ff9b::/96` NAT64, `2002::/16` 6to4, `2001::/32` Teredo).
+  - Irreversible Linux privilege drop (`PR_SET_NO_NEW_PRIVS` -> `Setgroups([])` -> `Setgid(65532)` -> `Setuid(65532)` via `AllThreadsSyscall6`) inside a **~9 MB shell-free `distroless`** image built reproducibly from the checked-out commit and confined by a custom Home Assistant AppArmor profile.
+  - Strictly separated least-privilege tokens (`CALLER_TOKEN`, per-site `AGENT_TOKENS`, and mandatory `EDGEFETCH_SERVER_TOKEN` on non-loopback `--mode=server` binds) verified in constant time, plus pre-verified `jobId` + `jobNonce` binding.
 
 ---
 
@@ -100,7 +100,7 @@ Or deploy from your terminal (or `.github/workflows/deploy-hub.yml` with `CLOUDF
 
 ```bash
 cd hub
-npm install
+npm ci
 npx wrangler deploy -c wrangler.toml
 npx wrangler secret put CALLER_TOKEN -c wrangler.toml
 npx wrangler secret put AGENT_TOKENS -c wrangler.toml
@@ -116,7 +116,7 @@ npx wrangler secret put AGENT_TOKENS -c wrangler.toml
 
 ### 3. Drive, Monitor & Tune After Setup (Full Reference in [`docs/USAGE.md`](docs/USAGE.md))
 
-- **Web Control Center (`/admin`):** Open `https://<your-hub>.workers.dev/admin` and sign in with `CALLER_TOKEN` to view live connected edge nodes, 15-minute domain-affinity pins, active OAuth grants, and an interactive URL Crawl Tester with a visual **DNS / TCP / TLS / TTFB** waterfall bar.
+- **Web Control Center (`/admin`):** Open `https://<your-hub>.workers.dev/admin` and sign in with `CALLER_TOKEN` to view live connected edge nodes, 30-minute SQLite host-sticky affinity pins, per-site/IP `429` cooldowns, active OAuth grants, and an interactive URL Crawl Tester with a visual **DNS / TCP / TLS / TTFB** waterfall bar.
 - **Connect Directly to Claude Code (`/mcp` with Self-Hosted OAuth 2.1 + PKCE):**
   ```bash
   claude mcp add --transport http edgefetch https://<your-hub>.workers.dev/mcp
@@ -137,7 +137,7 @@ npx wrangler secret put AGENT_TOKENS -c wrangler.toml
 
 EdgeFetch is an **honest, rate-limited HTTP fetcher** — never a stealth scraper or anti-bot bypass tool:
 - **Honest Identity & Standard TLS:** Always sends a transparent, configurable `User-Agent` (validated printable ASCII) and standard Go `net/http` TLS/HTTP2 stacks; never solves CAPTCHAs or spoofs browser fingerprints.
-- **`/robots.txt` On by Default (RFC 9309):** Both Go (`--mode=server` / `--mode=agent`) and the Cloudflare Hub overflow enforce `/robots.txt` **by default** (`options.respectRobots = true` unless explicitly set `false`), including `Allow`/`Disallow` longest-match, `Crawl-delay`, and RFC 9309 §2.3.1.4 complete-disallow when `/robots.txt` is unreachable or returns `429`/`5xx`.
+- **`/robots.txt` Enforced on Every Hop (RFC 9309):** Both Go (`--mode=server` / `--mode=agent`) and the Cloudflare Hub overflow enforce `/robots.txt` (`512 KiB` parse cap, UTF-8 BOM stripping, RFC 9309 §2.2.2 percent-encoding normalization, exact `User-agent` product-token matching, `Allow`/`Disallow` longest-match, `Crawl-delay`, and §2.3.1.4 complete-disallow on `429`/`5xx`/unreachable) on the initial request **and every redirect hop** (up to 5). Callers cannot disable `robots.txt` unless the owner explicitly configures `ROBOTS_BYPASS_HOSTS` / `EDGEFETCH_ROBOTS_BYPASS_HOSTS` (empty by default, audited in `hub_events`).
 - **Public-IP Load Splitting + 30-Minute Host-Sticky Affinity:** `AgentHubDO` groups connected edge nodes by verified public egress IP (`cf-connecting-ip`), assigns each origin host to the Least-Recently-Used public IP group, and pins that host for 30 minutes so **requests to a single origin never rotate addresses** (preserving warm HTTP/2 connections), while distinct origins split evenly across distinct public IPs. Concurrent requests to the same host serialize through a race-free in-DO FIFO lock (`withHostLocks`).
 - **Refusals vs. Polite `429` Cooldown & Wait:**
   - `403`, `503`, and anti-bot challenges (`cf-mitigated`) **stop immediately** with zero retries anywhere.

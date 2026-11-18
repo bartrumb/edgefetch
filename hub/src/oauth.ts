@@ -849,6 +849,13 @@ export interface OAuthHandlerDeps {
   ownerSecret?: string;
   serviceName: string;
   now?: () => number;
+  onEvent?: (ev: {
+    level: 'info' | 'warn' | 'error';
+    category: 'oauth';
+    event: string;
+    summary: string;
+    details?: Record<string, unknown>;
+  }) => Promise<void> | void;
 }
 
 /**
@@ -947,6 +954,13 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         : 'MCP Client';
     const clientId = `mcp_${randomUrlToken(18)}`;
     await deps.store.putClient({ clientId, clientName, redirectUris, createdAt: now });
+    await deps.onEvent?.({
+      level: 'info',
+      category: 'oauth',
+      event: 'oauth_client_registered',
+      summary: `Registered OAuth 2.1 client "${clientName}" (${clientId})`,
+      details: { clientId, clientName, redirectUris },
+    });
     return oauthJson(
       {
         client_id: clientId,
@@ -1152,6 +1166,13 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         createdAt: now,
         accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
         refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
+      });
+      await deps.onEvent?.({
+        level: 'info',
+        category: 'oauth',
+        event: 'oauth_token_issued',
+        summary: `Issued OAuth 2.1 access + refresh tokens for "${record.clientName}" (${grantId})`,
+        details: { grantId, clientId: record.clientId, clientName: record.clientName, scopes: record.scopes },
       });
 
       return oauthJson(

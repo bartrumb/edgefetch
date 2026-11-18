@@ -8,6 +8,7 @@
  * - Enforces `Origin` validation against DNS-rebinding / cross-origin attacks and per-tool OAuth scopes
  *   (`crawl:read` vs `crawl:fetch`).
  */
+import type { ActivityStore } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { SITE_ID_PATTERN } from './auth';
 import { authorizeMcpRequest, type OAuthStore } from './oauth';
@@ -36,6 +37,7 @@ export interface McpServerDeps {
   serverVersion: string;
   ownerSecret?: string;
   oauthStore: OAuthStore;
+  activity?: ActivityStore;
   allowedTargets: FetchTarget[];
   defaultTarget: FetchTarget;
   listFleet: () => Promise<{
@@ -47,6 +49,7 @@ export interface McpServerDeps {
     target: FetchTarget;
     site?: string;
     body: string;
+    principal?: string;
   }) => Promise<McpExecuteFetchResult>;
 }
 
@@ -223,6 +226,7 @@ async function handleToolCall(
   name: string,
   args: Record<string, unknown>,
   scopes: string[],
+  principal: string,
   deps: McpServerDeps,
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   if (name === 'list_agents') {
@@ -300,6 +304,7 @@ async function handleToolCall(
       target: rawTarget,
       ...(rawSite ? { site: rawSite } : {}),
       body: JSON.stringify(callPayload),
+      principal,
     });
 
     let formatted: unknown = res.bodyText;
@@ -322,6 +327,8 @@ async function handleToolCall(
 async function dispatchRpcMessage(
   msg: JsonRpcRequest,
   scopes: string[],
+  principal: string,
+  userAgent: string,
   deps: McpServerDeps,
 ): Promise<Record<string, unknown> | null> {
   const isNotification = msg.id === undefined;
@@ -335,23 +342,53 @@ async function dispatchRpcMessage(
     return null;
   }
 
+  const startedAt = Date.now();
+  const authType = principal === 'owner_token' ? ('bearer_token' as const) : ('oauth' as const);
+  const methodLabel =
+    msg.method === 'tools/call' && typeof msg.params?.name === 'string'
+      ? `tools/call:${msg.params.name}`
+      : msg.method;
+
+  await deps.activity?.recordMcpCall({
+    principal,
+    authType,
+    userAgent,
+    method: methodLabel,
+    now: startedAt,
+  });
+
   switch (msg.method) {
     case 'initialize': {
       const clientProto = typeof msg.params?.protocolVersion === 'string' ? msg.params.protocolVersion : '';
+      const clientInfo = (msg.params?.clientInfo ?? {}) as { name?: string; version?: string };
       const protocolVersion = (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(clientProto)
         ? clientProto
         : DEFAULT_PROTOCOL_VERSION;
+      await deps.activity?.recordEvent({
+        level: 'info',
+        category: 'mcp',
+        event: 'mcp_initialize',
+        summary: `MCP initialize from ${principal} (${clientInfo.name ?? userAgent}, proto ${protocolVersion})`,
+        details: { principal, authType, clientInfo, protocolVersion, userAgent },
+      });
       return jsonRpcResult(id, {
         protocolVersion,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: deps.serverName, version: deps.serverVersion },
         instructions:
-          'Use list_agents to inspect connected Home Assistant OS standby crawlers and domain-affinity pins, and fetch_url / fetch_batch to fetch public HTTPS feeds or pages politely.',
+          'Use list_agents to inspect connected Home Assistant OS standby crawlers and 429 cooldowns, and fetch_url / fetch_batch to fetch public HTTPS feeds or pages politely.',
       });
     }
     case 'ping':
       return jsonRpcResult(id, {});
     case 'tools/list':
+      await deps.activity?.recordEvent({
+        level: 'info',
+        category: 'mcp',
+        event: 'mcp_tools_list',
+        summary: `MCP tools/list queried by ${principal}`,
+        details: { principal, authType, userAgent },
+      });
       return jsonRpcResult(id, { tools: buildToolDefinitions(deps.allowedTargets, deps.defaultTarget) });
     case 'tools/call': {
       const toolName = typeof msg.params?.name === 'string' ? msg.params.name : '';
@@ -360,7 +397,14 @@ async function dispatchRpcMessage(
           ? (msg.params.arguments as Record<string, unknown>)
           : {};
       if (!toolName) return jsonRpcError(id, -32602, 'Missing tool name');
-      const out = await handleToolCall(toolName, rawArgs, scopes, deps);
+      const out = await handleToolCall(toolName, rawArgs, scopes, principal, deps);
+      await deps.activity?.recordEvent({
+        level: out.isError ? 'warn' : 'info',
+        category: 'mcp',
+        event: 'mcp_tool_call',
+        summary: `MCP ${toolName} called by ${principal} (${Date.now() - startedAt}ms)`,
+        details: { principal, authType, toolName, args: rawArgs, durationMs: Date.now() - startedAt, isError: Boolean(out.isError) },
+      });
       return jsonRpcResult(id, out);
     }
     default:
@@ -422,13 +466,15 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
     return Response.json(jsonRpcError(null, -32700, 'Parse error'), { status: 400, headers: cors });
   }
 
+  const userAgent = request.headers.get('user-agent') ?? 'mcp-client';
+
   if (Array.isArray(parsed)) {
     if (parsed.length === 0 || parsed.length > 20) {
       return Response.json(jsonRpcError(null, -32600, 'Invalid batch length'), { status: 400, headers: cors });
     }
     const replies: Array<Record<string, unknown>> = [];
     for (const item of parsed) {
-      const out = await dispatchRpcMessage((item ?? {}) as JsonRpcRequest, auth.scopes, deps);
+      const out = await dispatchRpcMessage((item ?? {}) as JsonRpcRequest, auth.scopes, auth.principal, userAgent, deps);
       if (out) replies.push(out);
     }
     if (replies.length === 0) return new Response(null, { status: 202, headers: cors });
@@ -438,7 +484,7 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
     });
   }
 
-  const single = await dispatchRpcMessage((parsed ?? {}) as JsonRpcRequest, auth.scopes, deps);
+  const single = await dispatchRpcMessage((parsed ?? {}) as JsonRpcRequest, auth.scopes, auth.principal, userAgent, deps);
   if (!single) {
     return new Response(null, { status: 202, headers: cors });
   }

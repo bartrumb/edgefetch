@@ -1,15 +1,18 @@
 /**
  * Built-in Zero-Dependency `/admin` Web Control Center (`GET /admin`, `POST /admin/login`, `POST /admin/logout`,
- * `GET /admin/api/state`, `POST /admin/api/fetch`, `POST /admin/api/affinity/clear`, `POST /admin/api/grants/revoke`).
+ * `GET /admin/api/state`, `POST /admin/api/fetch`, `POST /admin/api/affinity/clear`, `POST /admin/api/grants/revoke`,
+ * `POST /admin/api/events/clear`).
  *
- * Protected by an 8-hour HMAC-SHA256 `HttpOnly; Secure; SameSite=Strict` cookie + per-session CSRF token + SQLite
- * brute-force rate limiting. Gives operators a single browser dashboard for:
- *  1. Live Home Assistant OS fleet cards (`site-arm64`, `site-x86`, `site-win-vm`, CPU arch, uptime, job counters).
- *  2. Active 15-minute SQLite domain-affinity pins (`host -> siteId`) + 1-click pin reset.
- *  3. Interactive URL Crawl Runner (`auto` / `container` / `agent`, site pinning, politeness tuning, visual DNS/TCP/TLS/TTFB bar).
- *  4. Self-hosted OAuth 2.1 MCP grants (`Claude Code`, scopes, expiry) + 1-click session revocation + copyable CLI command.
- *  5. Cloudflare Workers Observability (`Traces` & `Logs`) filter cheat sheet.
+ * Protected by an 8-hour HMAC-SHA256 `HttpOnly; Secure; SameSite=Lax` cookie + per-session CSRF token + SQLite
+ * brute-force rate limiting. Gives operators a single real-time browser dashboard for:
+ *  1. KPI Telemetry Strip (connected remote nodes, total remote jobs OK/Err, avg TTFB / H2 reuse, MCP calls & sessions).
+ *  2. Live System Activity & Crawl Telemetry Stream (300-event SQLite ring buffer, filterable by Crawl / MCP / Agent /
+ *     OAuth / Warn+Err, expandable JSON payloads, auto-refreshing every 5s).
+ *  3. Connected Remote Fleet cards (`site-arm64`, `site-x86`, `site-win-vm`, CPU arch, uptime, job counters).
+ *  4. Interactive URL Crawl & Tuning Runner with visual DNS / TCP / TLS / TTFB waterfall bar.
+ *  5. Remote Site 429 Cooldowns + Active MCP Client Connections (both OAuth 2.1 grants and Bearer clients).
  */
+import type { HubEventRecord, McpClientActivity } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { MIN_TOKEN_LENGTH, SITE_ID_PATTERN, sameBytes } from './auth';
 import {
@@ -47,8 +50,11 @@ export interface AdminPortalDeps {
     agents: AgentAttachment[];
     affinities: AffinityPin[];
     grants: OAuthGrantSummary[];
+    mcpClients?: McpClientActivity[];
+    events?: HubEventRecord[];
   }>;
   clearAffinities: (siteId?: string) => Promise<void>;
+  clearEvents?: () => Promise<void>;
   revokeGrant: (grantId: string) => Promise<boolean>;
   executeFetch: (params: {
     target: FetchTarget;
@@ -81,7 +87,7 @@ function renderLoginHtml(serviceName: string, errorMsg?: string): string {
 <body>
   <main>
     <h1>${escapeHtml(serviceName)}</h1>
-    <p>Sign in with your hub caller token (<code>CALLER_TOKEN</code>) to inspect standby sites, test fetches, and manage MCP OAuth grants.</p>
+    <p>Sign in with your hub caller token (<code>CALLER_TOKEN</code>) to view live crawl &amp; MCP logs, inspect remote sites, and manage OAuth grants.</p>
     ${err}
     <form method="post" action="/admin/login">
       <label for="token">Caller Token</label>
@@ -128,10 +134,15 @@ function renderDashboardHtml(params: {
     header { background: #111827; border-bottom: 1px solid #1f2937; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     header h1 { font-size: 1.1rem; margin: 0; display: flex; align-items: center; gap: 10px; color: #f8fafc; }
     .pill { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #064e3b; color: #6ee7b7; border: 1px solid #059669; font-weight: 600; }
-    .wrap { max-width: 1180px; margin: 0 auto; padding: 22px; display: grid; gap: 20px; }
+    .wrap { max-width: 1240px; margin: 0 auto; padding: 20px; display: grid; gap: 18px; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+    .kpi { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px 16px; }
+    .kpi .k-label { font-size: 0.76rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+    .kpi .k-val { font-size: 1.35rem; font-weight: 700; color: #f8fafc; margin-top: 4px; }
+    .kpi .k-sub { font-size: 0.78rem; color: #64748b; margin-top: 2px; }
     .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 18px 20px; }
-    .card h2 { margin: 0 0 12px; font-size: 0.98rem; color: #f8fafc; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-    .muted { color: #94a3b8; font-size: 0.85rem; }
+    .card h2 { margin: 0 0 12px; font-size: 0.98rem; color: #f8fafc; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .muted { color: #94a3b8; font-size: 0.84rem; }
     .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
     .site-card { background: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 14px; }
     .site-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
@@ -139,26 +150,41 @@ function renderDashboardHtml(params: {
     .arch { font-size: 0.75rem; background: #1e293b; border: 1px solid #475569; padding: 1px 7px; border-radius: 6px; color: #cbd5e1; }
     .kv { display: flex; justify-content: space-between; font-size: 0.82rem; color: #94a3b8; margin-top: 4px; }
     .kv strong { color: #e2e8f0; }
-    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.83rem; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.82rem; }
     .cmd-bar { display: flex; gap: 8px; align-items: center; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; overflow-x: auto; }
     .cmd-bar code { color: #38bdf8; white-space: nowrap; flex: 1; }
-    button { font: inherit; font-size: 0.84rem; font-weight: 600; padding: 7px 13px; border-radius: 7px; border: 1px solid #475569; background: #334155; color: #f8fafc; cursor: pointer; }
+    button { font: inherit; font-size: 0.82rem; font-weight: 600; padding: 6px 12px; border-radius: 7px; border: 1px solid #475569; background: #334155; color: #f8fafc; cursor: pointer; }
     button:hover { background: #475569; }
     button.primary { background: #2563eb; border-color: #3b82f6; color: #fff; }
     button.primary:hover { background: #1d4ed8; }
-    button.danger { background: #7f1d1d; border-color: #b91c1c; color: #fecaca; padding: 4px 10px; font-size: 0.78rem; }
+    button.danger { background: #7f1d1d; border-color: #b91c1c; color: #fecaca; padding: 4px 10px; font-size: 0.76rem; }
+    .tab-bar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .tab { padding: 4px 10px; font-size: 0.78rem; border-radius: 999px; background: #0f172a; border: 1px solid #334155; color: #94a3b8; cursor: pointer; }
+    .tab.active { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
+    .log-box { background: #090d16; border: 1px solid #334155; border-radius: 9px; max-height: 360px; overflow-y: auto; margin-top: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.79rem; }
+    .log-row { padding: 7px 12px; border-bottom: 1px solid #1e293b; cursor: pointer; }
+    .log-row:hover { background: #111827; }
+    .log-line { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .log-ts { color: #64748b; white-space: nowrap; }
+    .badge { font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase; }
+    .lvl-info { background: #0c4a6e; color: #7dd3fc; }
+    .lvl-warn { background: #78350f; color: #fcd34d; }
+    .lvl-error { background: #7f1d1d; color: #fca5a5; }
+    .cat { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; }
+    .log-detail { display: none; margin: 6px 0 2px; padding: 8px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #93c5fd; white-space: pre-wrap; word-break: break-all; }
+    .log-row.open .log-detail { display: block; }
     .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 10px; }
     label { display: block; font-size: 0.78rem; font-weight: 600; color: #cbd5e1; margin-bottom: 4px; }
     input[type="text"], input[type="url"], input[type="number"], select { width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
-    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #334155; }
-    th { color: #94a3b8; font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: .03em; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid #334155; }
+    th { color: #94a3b8; font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .03em; }
     .timing-bar { display: flex; height: 10px; border-radius: 6px; overflow: hidden; background: #0f172a; margin: 10px 0 6px; }
     .seg-dns { background: #a855f7; }
     .seg-tcp { background: #f59e0b; }
     .seg-tls { background: #ec4899; }
     .seg-ttfb { background: #22c55e; }
-    pre.out { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px; max-height: 360px; overflow: auto; margin: 10px 0 0; color: #cbd5e1; }
+    pre.out { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px; max-height: 320px; overflow: auto; margin: 10px 0 0; color: #cbd5e1; }
     .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
     .chip { background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 4px 9px; color: #93c5fd; }
   </style>
@@ -167,6 +193,7 @@ function renderDashboardHtml(params: {
   <header>
     <h1>${escapeHtml(params.serviceName)} <span class="pill" id="conn-pill">Loading...</span></h1>
     <div style="display:flex;gap:8px;align-items:center">
+      <span class="muted" id="last-poll">Live (5s)</span>
       <button type="button" id="refresh-btn">Refresh</button>
       <form method="post" action="/admin/logout" style="margin:0">
         <input type="hidden" name="csrf" value="${escapeHtml(params.csrf)}">
@@ -176,22 +203,53 @@ function renderDashboardHtml(params: {
   </header>
 
   <div class="wrap">
-    <section class="card">
-      <h2>Connect Claude Code via Self-Hosted OAuth 2.1 MCP</h2>
-      <p class="muted" style="margin:0 0 10px">Run once in your terminal — Claude Code auto-discovers RFC 9728 / RFC 8414 metadata, registers via PKCE S256, and opens a browser consent prompt (zero raw tokens stored in config files):</p>
-      <div class="cmd-bar">
-        <code id="mcp-cmd">${escapeHtml(mcpCmd)}</code>
-        <button type="button" id="copy-mcp-btn">Copy</button>
+    <div class="kpi-grid">
+      <div class="kpi">
+        <div class="k-label">Remote Fleet Online</div>
+        <div class="k-val" id="kpi-sites">0</div>
+        <div class="k-sub" id="kpi-sites-sub">LRU load-balanced primary</div>
       </div>
+      <div class="kpi">
+        <div class="k-label">Remote Jobs (OK / Err)</div>
+        <div class="k-val" id="kpi-jobs">0 / 0</div>
+        <div class="k-sub" id="kpi-cooldowns">0 active 429 cooldowns</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">Recent Crawl Latency</div>
+        <div class="k-val" id="kpi-ttfb">—</div>
+        <div class="k-sub" id="kpi-reuse">Click any log row for phase timing</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">MCP Clients &amp; Calls</div>
+        <div class="k-val" id="kpi-mcp">0 clients</div>
+        <div class="k-sub" id="kpi-grants">0 OAuth 2.1 grants</div>
+      </div>
+    </div>
+
+    <section class="card">
+      <h2>
+        <span>Live System Activity &amp; Crawl Log (<span id="event-count">0</span>)</span>
+        <div class="tab-bar">
+          <button type="button" class="tab active" data-cat="all">All</button>
+          <button type="button" class="tab" data-cat="crawl">Crawls</button>
+          <button type="button" class="tab" data-cat="mcp">MCP</button>
+          <button type="button" class="tab" data-cat="agent">Agents</button>
+          <button type="button" class="tab" data-cat="oauth">OAuth</button>
+          <button type="button" class="tab" data-cat="warn">Warn / Err</button>
+          <input id="log-search" type="text" placeholder="Filter URL, site, client..." style="width:185px;padding:4px 9px;font-size:0.78rem">
+          <button type="button" id="clear-events-btn" style="padding:4px 10px;font-size:0.76rem">Clear Log</button>
+        </div>
+      </h2>
+      <div class="log-box" id="log-box"><div class="log-row muted">Waiting for crawl, MCP, or agent events...</div></div>
     </section>
 
     <section class="card">
-      <h2>Connected Standby Fleet (<span id="site-count">0</span>) <span class="muted">Auto-refreshes every 10s</span></h2>
+      <h2><span>Connected Remote Fleet (<span id="site-count">0</span>)</span><span class="muted">Auto-refreshes every 5s</span></h2>
       <div id="fleet-grid" class="grid-3"><div class="muted">Loading connected agents...</div></div>
     </section>
 
     <section class="card">
-      <h2>Interactive Crawl &amp; Tuning Tester</h2>
+      <h2><span>Interactive Crawl &amp; Tuning Tester</span></h2>
       <form id="fetch-form">
         <div style="display:grid;grid-template-columns:1fr auto;gap:10px">
           <div>
@@ -239,11 +297,11 @@ function renderDashboardHtml(params: {
       </div>
     </section>
 
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:20px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:18px">
       <section class="card">
         <h2>
           <span>Remote Site 429 Cooldowns</span>
-          <button type="button" id="clear-affinity-btn" style="padding:4px 10px;font-size:0.78rem">Clear Cooldowns</button>
+          <button type="button" id="clear-affinity-btn" style="padding:4px 10px;font-size:0.76rem">Clear Cooldowns</button>
         </h2>
         <table>
           <thead><tr><th>Origin Host</th><th>Cooled-Down Site</th><th>Cooldown Left</th></tr></thead>
@@ -252,21 +310,32 @@ function renderDashboardHtml(params: {
       </section>
 
       <section class="card">
-        <h2>Active OAuth 2.1 MCP Sessions</h2>
+        <h2><span>MCP Clients &amp; OAuth 2.1 Grants</span></h2>
+        <div style="margin-bottom:10px">
+          <div class="cmd-bar">
+            <code id="mcp-cmd">${escapeHtml(mcpCmd)}</code>
+            <button type="button" id="copy-mcp-btn">Copy</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>Active MCP Client</th><th>Auth</th><th>Calls</th><th>Last Method</th><th>Seen</th></tr></thead>
+          <tbody id="mcp-clients-tbody"><tr><td colspan="5" class="muted">No MCP calls recorded yet</td></tr></tbody>
+        </table>
+        <h2 style="margin-top:14px;font-size:0.86rem;color:#cbd5e1"><span>Issued OAuth 2.1 Grants</span></h2>
         <table>
           <thead><tr><th>Client</th><th>Scopes</th><th>Expires</th><th></th></tr></thead>
-          <tbody id="grants-tbody"><tr><td colspan="4" class="muted">No OAuth grants issued yet</td></tr></tbody>
+          <tbody id="grants-tbody"><tr><td colspan="4" class="muted">No OAuth 2.1 grants issued yet</td></tr></tbody>
         </table>
       </section>
     </div>
 
     <section class="card">
-      <h2>Cloudflare Workers Observability — Single Pane of Glass Filters</h2>
-      <p class="muted" style="margin:0">Open <strong>Cloudflare Dashboard -&gt; Workers &amp; Pages -&gt; Observability (Traces &amp; Logs)</strong> and filter with:</p>
+      <h2><span>Cloudflare Workers Observability — Single Pane of Glass Filters</span></h2>
+      <p class="muted" style="margin:0">Open <strong>Cloudflare Dashboard -&gt; Workers &amp; Pages -&gt; Observability (Traces &amp; Logs)</strong> for long-term retention &amp; OTel waterfall traces:</p>
       <div class="chips">
         <code class="chip">crawler.via</code>
-        <code class="chip">net.timing.ttfb_ms &gt; 500</code>
-        <code class="chip">net.timing.conn_reused = true</code>
+        <code class="chip">net.ttfb_ms &gt; 500</code>
+        <code class="chip">net.conn_reused = true</code>
         <code class="chip">event = "agent_ready"</code>
         <code class="chip">event = "agent_failover"</code>
         <code class="chip">crawler.outcome = "ok"</code>
@@ -278,56 +347,157 @@ function renderDashboardHtml(params: {
     const CSRF = ${JSON.stringify(params.csrf)};
     const el = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+    let latestEvents = [];
+    let activeCat = 'all';
+    const openEventIds = new Set();
+
     const relTime = (ts) => {
       if (!ts) return 'never';
       const sec = Math.round((Date.now() - ts) / 1000);
       if (sec < 0) {
         const rem = Math.abs(sec);
-        return rem < 60 ? rem + 's' : Math.round(rem / 60) + 'm';
+        return rem < 60 ? rem + 's' : rem < 3600 ? Math.round(rem / 60) + 'm' : Math.round(rem / 3600) + 'd';
       }
       return sec < 60 ? sec + 's ago' : sec < 3600 ? Math.round(sec / 60) + 'm ago' : Math.round(sec / 3600) + 'h ago';
     };
+
+    const fmtClock = (ts) => {
+      const d = new Date(ts);
+      return d.toLocaleTimeString([], { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+    };
+
+    function renderLogs() {
+      const q = (el('log-search').value || '').trim().toLowerCase();
+      const filtered = latestEvents.filter((ev) => {
+        if (activeCat === 'warn' && ev.level === 'info') return false;
+        if (activeCat !== 'all' && activeCat !== 'warn' && ev.category !== activeCat) return false;
+        if (q) {
+          const hay = (ev.summary + ' ' + ev.event + ' ' + JSON.stringify(ev.details || {})).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+
+      el('event-count').textContent = filtered.length;
+      const box = el('log-box');
+      if (!filtered.length) {
+        box.innerHTML = '<div class="log-row muted">No matching events in buffer. Trigger a fetch or MCP tool call to watch live telemetry.</div>';
+        return;
+      }
+      box.innerHTML = filtered.map((ev) => {
+        const isOpen = openEventIds.has(ev.id) ? ' open' : '';
+        return '<div class="log-row' + isOpen + '" data-ev-id="' + Number(ev.id) + '">' +
+          '<div class="log-line">' +
+            '<span class="log-ts">' + esc(fmtClock(ev.ts)) + '</span>' +
+            '<span class="badge lvl-' + esc(ev.level) + '">' + esc(ev.level) + '</span>' +
+            '<span class="badge cat">' + esc(ev.category) + '</span>' +
+            '<span>' + esc(ev.summary) + '</span>' +
+          '</div>' +
+          '<div class="log-detail">' + esc(JSON.stringify(ev.details || {}, null, 2)) + '</div>' +
+        '</div>';
+      }).join('');
+    }
 
     async function loadState() {
       const res = await fetch('/admin/api/state', { headers: { 'accept': 'application/json' } });
       if (res.status === 401) { location.reload(); return; }
       const data = await res.json();
+      const agents = data.agents || [];
+      const affinities = data.affinities || [];
+      const grants = data.grants || [];
+      const mcpClients = data.mcpClients || [];
+      latestEvents = data.events || [];
+
+      el('last-poll').textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour12: false });
       el('site-count').textContent = data.connected;
       el('conn-pill').textContent = data.connected + ' site' + (data.connected === 1 ? '' : 's') + ' online';
+
+      const totalOk = agents.reduce((s, a) => s + Number(a.jobsOk || 0), 0);
+      const totalErr = agents.reduce((s, a) => s + Number(a.jobsErr || 0), 0);
+      el('kpi-sites').textContent = data.connected + ' online';
+      el('kpi-sites-sub').textContent = agents.map((a) => a.siteId).join(', ') || 'Waiting for HAOS check-in';
+      el('kpi-jobs').textContent = totalOk + ' / ' + totalErr;
+      el('kpi-cooldowns').textContent = affinities.length + ' active 429 cooldown' + (affinities.length === 1 ? '' : 's');
+
+      const crawlEvs = latestEvents.filter((e) => e.category === 'crawl' && e.details && typeof e.details.ttfbMs === 'number' && e.details.ttfbMs > 0);
+      if (crawlEvs.length) {
+        const avgTtfb = Math.round(crawlEvs.reduce((s, e) => s + Number(e.details.ttfbMs || 0), 0) / crawlEvs.length);
+        const reusedCount = crawlEvs.filter((e) => e.details.reused).length;
+        el('kpi-ttfb').textContent = avgTtfb + ' ms avg TTFB';
+        el('kpi-reuse').textContent = reusedCount + '/' + crawlEvs.length + ' recent fetches reused HTTP/2';
+      }
+
+      const totalMcpCalls = mcpClients.reduce((s, c) => s + Number(c.calls || 0), 0);
+      el('kpi-mcp').textContent = mcpClients.length + ' client' + (mcpClients.length === 1 ? '' : 's') + ' (' + totalMcpCalls + ' calls)';
+      el('kpi-grants').textContent = grants.length + ' active OAuth 2.1 grant' + (grants.length === 1 ? '' : 's');
 
       const grid = el('fleet-grid');
       const siteSelect = el('f-site');
       const prevSelected = siteSelect.value;
       siteSelect.innerHTML = '<option value="">Load-Balance All Remote Sites (LRU)</option>' +
-        data.agents.map((a) => '<option value="' + esc(a.siteId) + '">' + esc(a.siteId) + ' (' + esc(a.arch) + ')</option>').join('');
+        agents.map((a) => '<option value="' + esc(a.siteId) + '">' + esc(a.siteId) + ' (' + esc(a.arch) + ')</option>').join('');
       siteSelect.value = prevSelected;
 
-      if (!data.agents.length) {
-        grid.innerHTML = '<div class="muted">No standby agents currently connected over WebSocket.</div>';
-      } else {
-        grid.innerHTML = data.agents.map((a) =>
-          '<div class="site-card">' +
-            '<div class="site-top"><span class="site-name">' + esc(a.siteId) + '</span><span class="arch">' + esc(a.arch) + '</span></div>' +
-            '<div class="kv"><span>Connected</span><strong>' + esc(relTime(a.connectedAt)) + '</strong></div>' +
-            '<div class="kv"><span>Last Job</span><strong>' + esc(relTime(a.lastJobAt)) + '</strong></div>' +
-            '<div class="kv"><span>Jobs OK / Err</span><strong>' + Number(a.jobsOk) + ' / ' + Number(a.jobsErr) + '</strong></div>' +
-          '</div>'
-        ).join('');
-      }
+      grid.innerHTML = agents.length
+        ? agents.map((a) =>
+            '<div class="site-card">' +
+              '<div class="site-top"><span class="site-name">' + esc(a.siteId) + '</span><span class="arch">' + esc(a.arch) + '</span></div>' +
+              '<div class="kv"><span>Connected</span><strong>' + esc(relTime(a.connectedAt)) + '</strong></div>' +
+              '<div class="kv"><span>Last Job</span><strong>' + esc(relTime(a.lastJobAt)) + '</strong></div>' +
+              '<div class="kv"><span>Jobs OK / Err</span><strong>' + Number(a.jobsOk) + ' / ' + Number(a.jobsErr) + '</strong></div>' +
+            '</div>'
+          ).join('')
+        : '<div class="muted">No remote agents currently connected over WebSocket.</div>';
 
-      const affBody = el('affinity-tbody');
-      affBody.innerHTML = data.affinities.length
-        ? data.affinities.map((p) => '<tr><td><code>' + esc(p.host) + '</code></td><td>' + esc(p.siteId) + '</td><td>' + esc(relTime(p.expiresAt)) + '</td></tr>').join('')
+      el('affinity-tbody').innerHTML = affinities.length
+        ? affinities.map((p) => '<tr><td><code>' + esc(p.host) + '</code></td><td>' + esc(p.siteId) + '</td><td>' + esc(relTime(p.expiresAt)) + '</td></tr>').join('')
         : '<tr><td colspan="3" class="muted">No active 429 site cooldowns</td></tr>';
 
-      const grantsBody = el('grants-tbody');
-      grantsBody.innerHTML = data.grants.length
-        ? data.grants.map((g) =>
+      el('mcp-clients-tbody').innerHTML = mcpClients.length
+        ? mcpClients.map((c) =>
+            '<tr><td><strong>' + esc(c.principal) + '</strong></td>' +
+            '<td><span class="badge ' + (c.authType === 'oauth' ? 'lvl-info' : 'cat') + '">' + esc(c.authType === 'oauth' ? 'OAuth 2.1' : 'Owner Token') + '</span></td>' +
+            '<td>' + Number(c.calls) + '</td>' +
+            '<td><code>' + esc(c.lastMethod) + '</code></td>' +
+            '<td>' + esc(relTime(c.lastSeenAt)) + '</td></tr>'
+          ).join('')
+        : '<tr><td colspan="5" class="muted">No MCP calls recorded yet</td></tr>';
+
+      el('grants-tbody').innerHTML = grants.length
+        ? grants.map((g) =>
             '<tr><td><strong>' + esc(g.clientName) + '</strong></td><td><code>' + esc(g.scopes.join(' ')) + '</code></td><td>' + esc(relTime(g.expiresAt)) + '</td>' +
             '<td><button type="button" class="danger" data-revoke="' + esc(g.grantId) + '">Revoke</button></td></tr>'
           ).join('')
-        : '<tr><td colspan="4" class="muted">No active OAuth grants</td></tr>';
+        : '<tr><td colspan="4" class="muted">No OAuth 2.1 grants issued yet</td></tr>';
+
+      renderLogs();
     }
+
+    document.querySelectorAll('.tab[data-cat]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab[data-cat]').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        activeCat = btn.getAttribute('data-cat');
+        renderLogs();
+      });
+    });
+
+    el('log-search').addEventListener('input', renderLogs);
+
+    el('log-box').addEventListener('click', (ev) => {
+      const row = ev.target.closest('.log-row[data-ev-id]');
+      if (!row) return;
+      const id = Number(row.getAttribute('data-ev-id'));
+      if (openEventIds.has(id)) openEventIds.delete(id);
+      else openEventIds.add(id);
+      row.classList.toggle('open');
+    });
+
+    el('clear-events-btn').addEventListener('click', async () => {
+      await fetch('/admin/api/events/clear', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF }, body: '{}' });
+      openEventIds.clear();
+      await loadState();
+    });
 
     el('copy-mcp-btn').addEventListener('click', async () => {
       await navigator.clipboard.writeText(el('mcp-cmd').textContent);
@@ -396,7 +566,7 @@ function renderDashboardHtml(params: {
     });
 
     loadState();
-    setInterval(loadState, 10000);
+    setInterval(loadState, 5000);
   </script>
 </body>
 </html>`;
@@ -452,7 +622,6 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     await deps.oauthStore.clearAuthFailures(`admin:${clientIp}`);
     const minted = await createAdminSessionValue(deps.ownerSecret);
     const headers = new Headers({ location: '/admin', 'cache-control': 'no-store' });
-    // Path='/' allows `/oauth/authorize` on the same origin to detect an active owner session seamlessly.
     headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, minted.value, { maxAge: minted.maxAgeSec, path: '/', sameSite: 'Lax', secure: isSecure }));
     return new Response(null, { status: 302, headers });
   }
@@ -467,7 +636,6 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     return new Response(null, { status: 302, headers });
   }
 
-  // Protected JSON API routes under `/admin/api/*`
   if (!session.ok) {
     return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
   }
@@ -481,6 +649,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     const hdrCsrf = request.headers.get('x-csrf-token') ?? '';
     if (!hdrCsrf || !sameBytes(hdrCsrf, session.csrf)) {
       return Response.json({ error: 'invalid_csrf' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+    }
+
+    if (path === '/admin/api/events/clear') {
+      await deps.clearEvents?.();
+      return Response.json({ ok: true }, { status: 200, headers: { 'cache-control': 'no-store' } });
     }
 
     if (path === '/admin/api/affinity/clear') {

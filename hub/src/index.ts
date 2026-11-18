@@ -5,12 +5,21 @@
  *  - Tier 1 (Primary): Load-balances requests across all connected remote edge nodes (`amd64` / `aarch64` Go binaries)
  *    via Least-Recently-Used (`lastJobAt` ascending), sharding multi-URL batches across healthy nodes and cooling down
  *    any `(host, siteId)` that receives HTTP `429` while failing over to remaining healthy remote nodes.
- *  - Tier 2 (Cloudflare Overflow): Reaches out directly from Cloudflare (`cloudflareFallbackFetch` — or an optional
- *    Cloudflare Container) ONLY when remote nodes get HTTP `429` (or when zero remote nodes are connected).
+ *  - Tier 2 (Cloudflare Overflow): Reaches out directly from Cloudflare (`cloudflareOverflowFetch`) ONLY when remote
+ *    nodes hit HTTP `429` (or when zero remote nodes are connected).
  *  - ONLY this Cloudflare Hub hosts inbound HTTP routes (`/admin`, `/mcp`, `/oauth/*`, `/fetch`, `/agents`). Edge nodes
  *    host ZERO inbound endpoints.
  */
 import { DurableObject, tracing } from 'cloudflare:workers';
+import {
+  ACTIVITY_SQLITE_SCHEMA,
+  buildCrawlActivityEvents,
+  createSqliteActivityStore,
+  type ActivityStore,
+  type HubEventInput,
+  type HubEventRecord,
+  type McpClientActivity,
+} from './activity-log';
 import { handleAdminRoute } from './admin';
 import {
   AgentHubEngine,
@@ -57,6 +66,7 @@ const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 export class AgentHubDO extends DurableObject<Env> {
   private readonly engine: AgentHubEngine;
   private readonly oauth: OAuthStore;
+  private readonly activity: ActivityStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -70,6 +80,7 @@ export class AgentHubDO extends DurableObject<Env> {
           PRIMARY KEY (host, site_id)
         );
         ${OAUTH_SQLITE_SCHEMA}
+        ${ACTIVITY_SQLITE_SCHEMA}
       `);
     });
 
@@ -120,6 +131,7 @@ export class AgentHubDO extends DurableObject<Env> {
       cooldowns,
     });
     this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+    this.activity = createSqliteActivityStore(this.ctx.storage.sql as unknown as SqlStorageLike);
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -134,6 +146,13 @@ export class AgentHubDO extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server, [`site:${siteId}`]);
     const att = this.engine.registerAgent(server as unknown as HubSocketLike, siteId, arch);
     server.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
+    await this.activity.recordEvent({
+      level: 'info',
+      category: 'agent',
+      event: 'agent_ws_connected',
+      summary: `Remote node "${att.siteId}" (${att.arch}) connected over WebSocket`,
+      details: { siteId: att.siteId, arch: att.arch },
+    });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -149,17 +168,41 @@ export class AgentHubDO extends DurableObject<Env> {
     this.engine.clearAffinities(siteId);
   }
 
+  async recordHubEvents(events: HubEventInput[]): Promise<void> {
+    for (const ev of events) {
+      await this.activity.recordEvent(ev);
+    }
+  }
+
+  async clearHubEvents(): Promise<void> {
+    await this.activity.clearEvents();
+  }
+
+  async recordMcpCall(params: {
+    principal: string;
+    authType: 'oauth' | 'bearer_token';
+    userAgent: string;
+    method: string;
+    now?: number;
+  }): Promise<void> {
+    await this.activity.recordMcpCall(params);
+  }
+
   async getPortalState(now: number): Promise<{
     connected: number;
     agents: AgentAttachment[];
     affinities: AffinityPin[];
     grants: OAuthGrantSummary[];
+    mcpClients: McpClientActivity[];
+    events: HubEventRecord[];
   }> {
     const fleet = this.engine.listAgents();
     return {
       ...fleet,
       affinities: this.engine.listAffinities(),
       grants: await this.oauth.listGrants(now),
+      mcpClients: await this.activity.listMcpClients(),
+      events: await this.activity.listEvents(150),
     };
   }
 
@@ -232,10 +275,18 @@ export class AgentHubDO extends DurableObject<Env> {
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string' || message === 'ping' || message.length > 2048) return;
     try {
-      const msg = JSON.parse(message) as { type?: string; reconnectAttempt?: number };
+      const msg = JSON.parse(message) as { type?: string; arch?: string; goVersion?: string; reconnectAttempt?: number };
       if (msg.type === 'agent_hello') {
         const att = ws.deserializeAttachment() as AgentAttachment | null;
-        console.info(JSON.stringify({ event: (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready', siteId: att?.siteId, ...msg }));
+        const evName = (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready';
+        console.info(JSON.stringify({ event: evName, siteId: att?.siteId, ...msg }));
+        await this.activity.recordEvent({
+          level: (msg.reconnectAttempt ?? 0) > 0 ? 'warn' : 'info',
+          category: 'agent',
+          event: evName,
+          summary: `Remote node "${att?.siteId ?? 'unknown'}" reported ${evName} (${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
+          details: { siteId: att?.siteId, ...msg },
+        });
       }
     } catch {
       // ignore malformed frames
@@ -243,7 +294,17 @@ export class AgentHubDO extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    const att = ws.deserializeAttachment() as AgentAttachment | null;
     this.engine.handleDisconnect(ws as unknown as HubSocketLike, reason || `closed_${code}`);
+    if (att?.siteId && !att.replaced) {
+      await this.activity.recordEvent({
+        level: 'warn',
+        category: 'agent',
+        event: 'agent_ws_closed',
+        summary: `Remote node "${att.siteId}" WebSocket closed (code ${code})`,
+        details: { siteId: att.siteId, code, reason },
+      });
+    }
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
@@ -251,10 +312,6 @@ export class AgentHubDO extends DurableObject<Env> {
   }
 }
 
-/**
- * Direct Cloudflare edge overflow fetcher invoked in `target=auto` ONLY when remote nodes hit HTTP `429`
- * (or when zero remote nodes are connected). Enforces public `https://:443` DNS-only URLs and streaming body caps.
- */
 async function cloudflareOverflowFetch(rawBody: string, userAgent: string, selfHost: string): Promise<Response> {
   const started = Date.now();
   let call: {
@@ -392,17 +449,28 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
   };
 }
 
+function hubActivityProxy(hub: () => DurableObjectStub<AgentHubDO>): ActivityStore {
+  return {
+    recordEvent: (ev) => hub().recordHubEvents([ev]),
+    listEvents: async () => (await hub().getPortalState(Date.now())).events,
+    clearEvents: () => hub().clearHubEvents(),
+    recordMcpCall: (p) => hub().recordMcpCall(p),
+    listMcpClients: async () => (await hub().getPortalState(Date.now())).mcpClients,
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const hub = () => env.AGENT_HUB.get(env.AGENT_HUB.idFromName('global'));
     const ua = env.USER_AGENT?.trim() || DEFAULT_UA;
 
-    const executeHubFetch = async (target: FetchTarget, body: string, site?: string) =>
+    const executeHubFetch = async (target: FetchTarget, body: string, site?: string, source = 'rest') =>
       (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
         'edgefetch.dispatch',
         async (span) => {
           const trace = { 'x-request-id': request.headers.get('cf-ray') ?? '' };
+          const pendingEvents: HubEventInput[] = [];
           const res = await routeFetchWithFailover({
             target,
             site,
@@ -410,10 +478,24 @@ export default {
             trace,
             callAgent: (b, t, s) => hub().dispatchFetch(b, t, s),
             callContainer: (b) => cloudflareOverflowFetch(b, ua, url.hostname),
+            onFailover: ({ reason, siteId, count }) => {
+              pendingEvents.push({
+                level: 'warn',
+                category: 'failover',
+                event: 'cloudflare_overflow',
+                summary: `Cloudflare overflow triggered (${reason}, site=${siteId}, urls=${count})`,
+                details: { reason, siteId, count, source },
+              });
+            },
           });
           const via = res.headers.get('x-crawler-via') ?? target;
+          const bodyText = await res.text();
+          pendingEvents.push(...buildCrawlActivityEvents({ source, target, via, httpStatus: res.status, replyText: bodyText }));
+          await hub()
+            .recordHubEvents(pendingEvents)
+            .catch(() => undefined);
           span.setAttribute('edgefetch.via', via);
-          return { status: res.status, via, bodyText: await res.text() };
+          return { status: res.status, via, bodyText };
         },
       );
 
@@ -441,11 +523,13 @@ export default {
     }
 
     const oauthStore = hubOAuthStore(hub);
+    const activity = hubActivityProxy(hub);
 
     const oauthRes = await handleOAuthRoute(request, url, {
       store: oauthStore,
       ownerSecret: env.CALLER_TOKEN,
       serviceName: 'EdgeFetch Hub',
+      onEvent: (ev) => activity.recordEvent(ev),
     });
     if (oauthRes) return oauthRes;
 
@@ -455,13 +539,15 @@ export default {
         serverVersion: '1.2.0',
         ownerSecret: env.CALLER_TOKEN,
         oauthStore,
+        activity,
         allowedTargets: ALLOWED_TARGETS,
         defaultTarget: 'auto',
         listFleet: async () => {
           const state = await hub().getPortalState(Date.now());
           return { connected: state.connected, agents: state.agents, affinities: state.affinities };
         },
-        executeFetch: ({ target, site, body }) => executeHubFetch(target, body, site),
+        executeFetch: ({ target, site, body, principal }) =>
+          executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`),
       });
     }
 
@@ -474,8 +560,21 @@ export default {
       defaultTarget: 'auto',
       getState: () => hub().getPortalState(Date.now()),
       clearAffinities: (siteId) => hub().clearAffinities(siteId),
-      revokeGrant: (grantId) => hub().oauthRevokeGrant(grantId),
-      executeFetch: ({ target, site, body }) => executeHubFetch(target, body, site),
+      clearEvents: () => hub().clearHubEvents(),
+      revokeGrant: async (grantId) => {
+        const revoked = await hub().oauthRevokeGrant(grantId);
+        if (revoked) {
+          await activity.recordEvent({
+            level: 'warn',
+            category: 'oauth',
+            event: 'oauth_grant_revoked',
+            summary: `Revoked OAuth 2.1 grant ${grantId} from /admin`,
+            details: { grantId },
+          });
+        }
+        return revoked;
+      },
+      executeFetch: ({ target, site, body }) => executeHubFetch(target, body, site, 'admin'),
     });
     if (adminRes) return adminRes;
 
@@ -490,7 +589,7 @@ export default {
       if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
       const body = await request.text();
       if (body.length > MAX_CALL_BYTES) return Response.json({ error: 'too_large' }, { status: 413 });
-      const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site);
+      const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest');
       return new Response(out.bodyText, {
         status: out.status,
         headers: { 'content-type': 'application/json', 'x-crawler-via': out.via, 'cache-control': 'no-store' },

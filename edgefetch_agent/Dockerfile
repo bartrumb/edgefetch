@@ -1,10 +1,12 @@
 # Multi-arch (`linux/amd64` + `linux/arm64`) Home Assistant OS Add-on Dockerfile (~9 MB distroless, zero shell).
-# Works both when Home Assistant Supervisor builds `/addons/edgefetch_agent` directly from GitHub Add-on Store
-# (build context = `edgefetch_agent/`) AND when GitHub Actions builds from the repository root!
+# Home Assistant Supervisor passes `--build-arg BUILD_VERSION=<config.yaml version>` automatically on every install/update;
+# referencing `BUILD_VERSION` before `git clone` invalidates Docker's layer cache whenever a new version ships.
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 ARG TARGETARCH
 RUN apk add --no-cache git
-RUN git clone --depth 1 https://github.com/bartrumb/edgefetch.git /src && \
+ARG BUILD_VERSION=1.0.2
+RUN echo "Building EdgeFetch ${BUILD_VERSION}" && \
+    git clone --depth 1 https://github.com/bartrumb/edgefetch.git /src && \
     cd /src && \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(go env GOARCH)} go build -trimpath -ldflags="-s -w" -o /out/edgefetch ./cmd/edgefetch
 

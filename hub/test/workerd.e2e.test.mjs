@@ -570,6 +570,20 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(parsedPage.content, 'R2BatchData!');
       assert.equal(parsedPage.nextOffset, 18);
 
+      // S4: Verify /fetch automatically tracked all 5 fetched pages in META D1 AND re-running a manifest creates zero duplicate rows!
+      const trackedBatchFetches = await mf.dispatchFetch(`${ORIGIN}/__test_s4_idempotency`, { method: 'POST' });
+      assert.equal(trackedBatchFetches.status, 200);
+      const s4Out = await trackedBatchFetches.json();
+      assert.deepEqual(s4Out, {
+        stepNames: ['load-manifest', 'track-0'],
+        fetchCount: 2,
+        pageCountForJob: 2,
+        robotsDecisions: ['allowed', 'disallowed'],
+        leakedSecretInFetches: false,
+        pruned: 1,
+        oldStillExists: false,
+      });
+
       wsCap.close(1000, 'done');
     }
   } finally {

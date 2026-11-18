@@ -67,7 +67,8 @@ func LoadConfigFrom(optionsPath string, getenv func(string) string) (Config, err
 			return Config{}, fmt.Errorf("read %s: %w", optionsPath, err)
 		}
 		if err == nil {
-			// Zero the raw config buffer on return so plaintext token bytes from `/data/options.json` do not linger.
+			// Best-effort zeroing of the raw read slice on return (note: json.Unmarshal still allocates immutable Go
+			// string copies for parsed fields on the heap).
 			defer func() {
 				for i := range raw {
 					raw[i] = 0

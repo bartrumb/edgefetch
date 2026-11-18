@@ -5,7 +5,9 @@ package crawl
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -599,6 +601,24 @@ func retriableStatus(status int) bool {
 	return status == 500 || status == 502 || status == 504
 }
 
+func isPermanentFetchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, politeness.ErrNonPublicPeer) {
+		return true
+	}
+	var certVerErr *tls.CertificateVerificationError
+	var unknownAuth x509.UnknownAuthorityError
+	var hostErr x509.HostnameError
+	var certInv x509.CertificateInvalidError
+	if errors.As(err, &certVerErr) || errors.As(err, &unknownAuth) || errors.As(err, &hostErr) || errors.As(err, &certInv) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "refusing connection to non-public IP") || strings.Contains(msg, "unsupported protocol scheme")
+}
+
 func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (Result, string) {
 	res := Result{ID: r.ID, URL: r.URL, Kind: r.Kind}
 	accept, err := classify.AcceptFor(r.Kind, r.Accept)
@@ -617,7 +637,7 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 				res.Outcome, res.Problem = classify.OutcomeError, ctx.Err().Error()
 				break
 			}
-			if attempt <= opts.Retries {
+			if !isPermanentFetchError(fetchErr) && attempt <= opts.Retries {
 				c.backoff(ctx, attempt)
 				continue
 			}
@@ -693,7 +713,8 @@ func (c *Crawler) backoff(ctx context.Context, attempt int) {
 	if d > 10*time.Second {
 		d = 10 * time.Second
 	}
-	_ = c.Sleep(ctx, c.Jitter(d))
+	floor := d / 4
+	_ = c.Sleep(ctx, floor+c.Jitter(d-floor))
 }
 
 func ms(from, to time.Time) int64 {

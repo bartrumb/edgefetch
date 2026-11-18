@@ -147,9 +147,10 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           url: { type: 'string', description: 'Public https:// URL to fetch (port 443).' },
           kind: {
             type: 'string',
-            enum: ['feed', 'page'],
+            enum: ['page', 'json', 'text', 'feed'],
             default: 'page',
-            description: '"feed" for JSON APIs/feeds (Accept: application/json) or "page" for HTML documents.',
+            description:
+              '"page" for HTML documents, "json" for general JSON APIs, "text" for plain text/XML/sitemaps, or "feed" for product feeds containing a top-level "products" array.',
           },
           target: {
             type: 'string',
@@ -192,7 +193,7 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
             maxItems: MAX_BATCH_URLS,
             description: '1 to 25 public https:// URLs to fetch.',
           },
-          kind: { type: 'string', enum: ['feed', 'page'], default: 'page' },
+          kind: { type: 'string', enum: ['page', 'json', 'text', 'feed'], default: 'page' },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
           pauseMs: { type: 'integer', minimum: 0, maximum: 30000, default: 1000, description: 'Minimum per-host pause in ms.' },
@@ -232,10 +233,17 @@ async function handleToolCall(
     if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
       return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
     }
-    const fleet = await deps.listFleet();
-    return {
-      content: [{ type: 'text', text: JSON.stringify(fleet, null, 2) }],
-    };
+    try {
+      const fleet = await deps.listFleet();
+      return {
+        content: [{ type: 'text', text: JSON.stringify(fleet, null, 2) }],
+      };
+    } catch (e) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'hub_unavailable', message: e instanceof Error ? e.message : 'Coordinator temporarily unavailable' }) }],
+        isError: true,
+      };
+    }
   }
 
   if (name === 'fetch_url' || name === 'fetch_batch') {
@@ -259,9 +267,17 @@ async function handleToolCall(
     if (args.respectRobots === false || args.robots === false) {
       return { content: [{ type: 'text', text: 'Disabling robots.txt via MCP is not permitted.' }], isError: true };
     }
-    const kind = args.kind === 'feed' ? 'feed' : 'page';
+    const kind =
+      args.kind === 'feed' || args.kind === 'json' || args.kind === 'text' ? args.kind : 'page';
     const respectRobots = true;
     const includeBody = typeof args.includeBody === 'boolean' ? args.includeBody : name === 'fetch_url';
+
+    if (
+      (typeof args.ifNoneMatch === 'string' && /[\r\n\0]/.test(args.ifNoneMatch)) ||
+      (typeof args.ifModifiedSince === 'string' && /[\r\n\0]/.test(args.ifModifiedSince))
+    ) {
+      return { content: [{ type: 'text', text: 'Invalid control characters in conditional header.' }], isError: true };
+    }
 
     let requests: Array<Record<string, unknown>>;
     if (name === 'fetch_url') {
@@ -302,12 +318,28 @@ async function handleToolCall(
       requests,
     };
 
-    const res = await deps.executeFetch({
-      target: rawTarget,
-      ...(rawSite ? { site: rawSite } : {}),
-      body: JSON.stringify(callPayload),
-      principal,
-    });
+    let res: McpExecuteFetchResult;
+    try {
+      res = await deps.executeFetch({
+        target: rawTarget,
+        ...(rawSite ? { site: rawSite } : {}),
+        body: JSON.stringify(callPayload),
+        principal,
+      });
+    } catch (e) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: 'hub_unavailable',
+              message: e instanceof Error ? e.message : 'Coordinator temporarily unavailable',
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
 
     let formatted: unknown = res.bodyText;
     try {

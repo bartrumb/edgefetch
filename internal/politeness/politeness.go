@@ -4,6 +4,7 @@ package politeness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -190,12 +191,16 @@ func CanonicalHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
 
-// Get returns the persistent `HostState` for `host`, evicting idle (>24 h) entries when capacity exceeds `MaxTrackedHosts`.
+// Get returns the persistent `HostState` for `host`, updating `lastSeen` and evicting idle / LRU unlocked entries
+// whenever capacity reaches `MaxTrackedHosts`.
 func (r *Registry) Get(host string, now time.Time) *HostState {
 	key := CanonicalHost(host)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if st, ok := r.hosts[key]; ok {
+		st.mu.Lock()
+		st.lastSeen = now
+		st.mu.Unlock()
 		return st
 	}
 	if len(r.hosts) >= MaxTrackedHosts {
@@ -206,6 +211,27 @@ func (r *Registry) Get(host string, now time.Time) *HostState {
 			if idle {
 				delete(r.hosts, k)
 			}
+		}
+		for len(r.hosts) >= MaxTrackedHosts {
+			oldestKey := ""
+			var oldestTime time.Time
+			for k, v := range r.hosts {
+				v.mu.Lock()
+				unlocked := len(v.inFlight) == 0
+				seen := v.lastSeen
+				v.mu.Unlock()
+				if !unlocked {
+					continue
+				}
+				if oldestKey == "" || seen.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = seen
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(r.hosts, oldestKey)
 		}
 	}
 	st := newHostState(now)
@@ -606,6 +632,9 @@ func IsPublicAddr(addr netip.Addr) bool {
 	return true
 }
 
+// ErrNonPublicPeer is returned when dial-time resolution maps a hostname onto a non-public IP address.
+var ErrNonPublicPeer = errors.New("non-public peer IP")
+
 // CheckPublicPeerAddress validates the resolved IP:port string right before the OS connect() syscall fires.
 func CheckPublicPeerAddress(address string) error {
 	host, _, err := net.SplitHostPort(address)
@@ -614,7 +643,7 @@ func CheckPublicPeerAddress(address string) error {
 	}
 	addr, err := netip.ParseAddr(host)
 	if err != nil || !IsPublicAddr(addr) {
-		return fmt.Errorf("refusing connection to non-public IP %s", host)
+		return fmt.Errorf("%w: refusing connection to non-public IP %s", ErrNonPublicPeer, host)
 	}
 	return nil
 }

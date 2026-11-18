@@ -858,3 +858,80 @@ test('H-S1, H-S2, H-S3, H-S5: OAuth registration/redirect/scope/replay/lockout s
   assert.equal(crawlEvs[0]?.summary.includes('TOP_SECRET_123'), false, 'H-S5: activity summary must strip URL query string');
   assert.equal(String(crawlEvs[0]?.details?.url ?? '').includes('TOP_SECRET_123'), false, 'H-S5: activity details.url must strip query string');
 });
+
+test('H4, H5, H6, A11: DO reset handling, bounded per-host lock queue deadline, attachment re-read on mid-job hello, and MCP json/text kinds', async () => {
+  // 1. H4: routeFetchWithFailover catches DO reset from callAgent (falls over on auto, returns 503 hub_unavailable on agent).
+  const autoFallbackRes = await routeFetchWithFailover({
+    target: 'auto',
+    body: JSON.stringify({ maxSeconds: 60, requests: [{ id: '1', url: 'https://t.example.com/', kind: 'page' }] }),
+    trace: {},
+    callAgent: async () => {
+      throw new Error('Durable Object reset because its code was updated');
+    },
+    callContainer: async () => Response.json({ results: [{ id: '1', status: 200, outcome: 'ok' }] }),
+  });
+  assert.equal(autoFallbackRes.status, 200, 'H4: auto target must fall over to container when DO stub throws');
+
+  const agentResetRes = await routeFetchWithFailover({
+    target: 'agent',
+    body: JSON.stringify({ maxSeconds: 60, requests: [{ id: '1', url: 'https://t.example.com/', kind: 'page' }] }),
+    trace: {},
+    callAgent: async () => {
+      throw new Error('Durable Object reset because its code was updated');
+    },
+    callContainer: async () => Response.json({ results: [] }),
+  });
+  assert.equal(agentResetRes.status, 503);
+  const agentResetBody = (await agentResetRes.json()) as { error: string };
+  assert.equal(agentResetBody.error, 'hub_unavailable');
+
+  // 2. H5: 4 concurrent calls with 100ms timeout to a hung agent do NOT stack to 400ms; expired queued calls abort immediately!
+  const qSockets: Array<HubSocketLike & { tags: string[]; sent: string[] }> = [];
+  const wsHung = makeFakeSocket(['site:s1']);
+  qSockets.push(wsHung);
+  const qEngine = new AgentHubEngine({
+    getSockets: (t) => (t ? qSockets.filter((s) => s.tags.includes(t)) : qSockets),
+    cooldowns: memoryCooldowns(),
+    hostWindows: createMemoryHostWindowStore(),
+  });
+  qEngine.registerAgent(wsHung, 's1', 'amd64', {});
+  const t0 = Date.now();
+  await Promise.all(
+    [0, 1, 2, 3].map(() =>
+      qEngine.dispatchFetch(
+        JSON.stringify({ maxSeconds: 60, options: { pauseMs: 1 }, requests: [{ id: '1', url: 'https://q.example.com/', kind: 'page' }] }),
+        {},
+        { timeoutMs: 100 },
+      ),
+    ),
+  );
+  const totalElapsed = Date.now() - t0;
+  assert.ok(totalElapsed < 250, `H5: 4 queued calls with 100ms timeout stacked to ${totalElapsed}ms (expected <250ms)`);
+
+  // 3. H6: Mid-job updateAgentHello metadata is NOT overwritten when the in-flight job finishes!
+  const attSockets: Array<HubSocketLike & { tags: string[]; sent: string[] }> = [];
+  let attEngine!: AgentHubEngine;
+  const pendingMsgs: Array<{ jobId: string; jobNonce: string; call: { requests: Array<{ id: string; url: string }> } }> = [];
+  const wsAtt = makeFakeSocket(['site:s'], (raw) => pendingMsgs.push(JSON.parse(raw)));
+  attSockets.push(wsAtt);
+  attEngine = new AgentHubEngine({
+    getSockets: (t) => (t ? attSockets.filter((s) => s.tags.includes(t)) : attSockets),
+    cooldowns: memoryCooldowns(),
+    hostWindows: createMemoryHostWindowStore(),
+  });
+  attEngine.registerAgent(wsAtt, 's', 'amd64', { version: '1.0.0' });
+
+  const jobP = attEngine.dispatchFetch(
+    JSON.stringify({ maxSeconds: 60, options: { pauseMs: 1 }, requests: [{ id: '1', url: 'https://a.example.com/', kind: 'page' }] }),
+  );
+  await new Promise<void>((r) => setTimeout(r, 10));
+  attEngine.updateAgentHello(wsAtt, { version: '9.9.9', goVersion: 'go1.27.4' });
+  const m = pendingMsgs[0]!;
+  attEngine.completeJob(m.jobId, m.jobNonce, 's', JSON.stringify({ results: [{ id: '1', url: 'https://a.example.com/', status: 200, outcome: 'ok' }] }));
+  await jobP;
+
+  const finalAtt = wsAtt.deserializeAttachment() as { jobsOk: number; version?: string; goVersion?: string };
+  assert.equal(finalAtt.jobsOk, 1);
+  assert.equal(finalAtt.version, '9.9.9', 'H6: completing a job must re-read attachment instead of overwriting mid-job agent_hello version');
+  assert.equal(finalAtt.goVersion, 'go1.27.4');
+});

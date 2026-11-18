@@ -101,6 +101,10 @@ func WithBlockedHost(base func(*url.URL) error, blockedHost string) func(*url.UR
 
 func normalizeHostRule(raw string) string {
 	h := strings.ToLower(strings.TrimSpace(raw))
+	// Ignore empty placeholders like `[]` or `*` entered into Home Assistant UI list fields.
+	if h == "" || h == "[]" || h == "*" || h == "none" {
+		return ""
+	}
 	if strings.Contains(h, "://") {
 		if u, err := url.Parse(h); err == nil {
 			h = strings.ToLower(u.Hostname())

@@ -1,5 +1,5 @@
 name: "EdgeFetch Cold-Standby Worker"
-version: "1.0.0"
+version: "1.0.1"
 slug: "edgefetch_agent"
 description: "Zero-dependency, outbound-only Go HTTP/2 worker for Cloudflare Hibernating WebSocket Durable Objects (zero inbound ports, AppArmor confined, LAN/RFC1918/NAT64 SSRF blocked)."
 url: "https://github.com/bartrumb/edgefetch"

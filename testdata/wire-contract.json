@@ -110,6 +110,33 @@
           "reused": true,
           "proto": "HTTP/2.0"
         }
+      },
+      {
+        "id": "contract-r2-artifact",
+        "url": "https://example.com/r2-page",
+        "kind": "page",
+        "outcome": "ok",
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "bytes": 80026,
+        "attempts": 1,
+        "durationMs": 15,
+        "timing": {
+          "dnsMs": 0,
+          "connectMs": 0,
+          "tlsMs": 0,
+          "ttfbMs": 7,
+          "reused": true,
+          "proto": "HTTP/2.0"
+        },
+        "artifact": {
+          "blobSha256": "a1b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+          "contentSha256": "c3d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+          "contentBytes": 80026,
+          "storedBytes": 228,
+          "encoding": "gzip",
+          "retention": "transient"
+        }
       }
     ]
   }

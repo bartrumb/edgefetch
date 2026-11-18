@@ -50,28 +50,41 @@ type Timing struct {
 	Proto      string `json:"proto,omitempty"`
 }
 
-// Result reports the outcome, headers of interest, phase timings, and optional body of one `Request`.
+// ArtifactRef references a gzipped response body uploaded directly to R2 (`PUT /agent/artifacts/<blobSha256>`) so
+// large page bodies never pass through the `AgentHubDO` Durable Object or accumulate in batch RAM.
+type ArtifactRef struct {
+	BlobSHA256    string `json:"blobSha256"`
+	ContentSHA256 string `json:"contentSha256"`
+	ContentBytes  int    `json:"contentBytes"`
+	StoredBytes   int    `json:"storedBytes"`
+	Encoding      string `json:"encoding"`
+	Retention     string `json:"retention"`
+}
+
+// Result reports the outcome, headers of interest, phase timings, and optional body or R2 artifact of one `Request`.
 type Result struct {
-	ID           string           `json:"id"`
-	URL          string           `json:"url"`
-	Kind         classify.Kind    `json:"kind"`
-	Outcome      classify.Outcome `json:"outcome"`
-	Problem      string           `json:"problem,omitempty"`
-	Status       int              `json:"status"`
-	ContentType  string           `json:"contentType,omitempty"`
-	CfMitigated  string           `json:"cfMitigated,omitempty"`
-	ETag         string           `json:"etag,omitempty"`
-	LastModified string           `json:"lastModified,omitempty"`
-	RetryAfter   string           `json:"retryAfter,omitempty"`
-	RetryAfterMs int64            `json:"retryAfterMs,omitempty"`
-	Bytes        int              `json:"bytes"`
-	Truncated    bool             `json:"truncated,omitempty"`
-	BodyOmitted  bool             `json:"bodyOmitted,omitempty"`
-	Attempts     int              `json:"attempts"`
-	DurationMs   int64            `json:"durationMs"`
-	Timing       Timing           `json:"timing"`
-	Body         string           `json:"body,omitempty"`
-	BodyEncoding string           `json:"bodyEncoding,omitempty"`
+	ID            string           `json:"id"`
+	URL           string           `json:"url"`
+	Kind          classify.Kind    `json:"kind"`
+	Outcome       classify.Outcome `json:"outcome"`
+	Problem       string           `json:"problem,omitempty"`
+	Status        int              `json:"status"`
+	ContentType   string           `json:"contentType,omitempty"`
+	CfMitigated   string           `json:"cfMitigated,omitempty"`
+	ETag          string           `json:"etag,omitempty"`
+	LastModified  string           `json:"lastModified,omitempty"`
+	RetryAfter    string           `json:"retryAfter,omitempty"`
+	RetryAfterMs  int64            `json:"retryAfterMs,omitempty"`
+	Bytes         int              `json:"bytes"`
+	Truncated     bool             `json:"truncated,omitempty"`
+	BodyOmitted   bool             `json:"bodyOmitted,omitempty"`
+	Attempts      int              `json:"attempts"`
+	DurationMs    int64            `json:"durationMs"`
+	Timing        Timing           `json:"timing"`
+	Body          string           `json:"body,omitempty"`
+	BodyEncoding  string           `json:"bodyEncoding,omitempty"`
+	Artifact      *ArtifactRef     `json:"artifact,omitempty"`
+	ArtifactError string           `json:"artifactError,omitempty"`
 }
 
 // DecodeBody returns the exact raw response bytes for `r.Body`, decoding `"base64"` payloads losslessly when the origin
@@ -344,6 +357,10 @@ func SleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// ResultSink transforms an individual `Result` as soon as its fetch completes (for example, uploading its body to R2
+// and releasing `res.Body` from memory before the next URL in the batch runs).
+type ResultSink func(idx int, res Result) Result
+
 // Run executes `reqs` with `c.log` and returns results in exact input order.
 func (c *Crawler) Run(ctx context.Context, reqs []Request, opts Options) []Result {
 	return c.RunLogged(ctx, reqs, opts, c.log)
@@ -351,6 +368,12 @@ func (c *Crawler) Run(ctx context.Context, reqs []Request, opts Options) []Resul
 
 // RunLogged executes `reqs` using a request-scoped structured logger (carrying distributed trace IDs).
 func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, log *slog.Logger) []Result {
+	return c.RunWithSink(ctx, reqs, opts, log, nil)
+}
+
+// RunWithSink executes `reqs` and invokes optional `sink(i, res)` immediately as each fetch finishes so streaming
+// artifact uploaders can free `res.Body` before subsequent URLs execute.
+func (c *Crawler) RunWithSink(ctx context.Context, reqs []Request, opts Options, log *slog.Logger, sink ResultSink) []Result {
 	opts = opts.Normalize()
 	results := make([]Result, len(reqs))
 
@@ -395,6 +418,9 @@ func (c *Crawler) RunLogged(ctx context.Context, reqs []Request, opts Options, l
 					continue
 				}
 				res, cancelled := c.runRequestWithRedirects(ctx, r, opts, n > 0, minPause, maxJitter, gap, log)
+				if sink != nil {
+					res = sink(i, res)
+				}
 				if opts.IncludeBody && len(res.Body) > 0 {
 					encodedLen := int64(len(res.Body))
 					for {

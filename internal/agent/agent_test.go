@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -403,5 +405,155 @@ func TestNormalUploadExceedsLegacyTenSecondCapWithoutLosingReply(t *testing.T) {
 
 	if strings.Contains(logBuf.String(), "agent_reply_failed") {
 		t.Fatalf("A2 BUG: normal (non-shutdown) reply upload failed at >10s even within 45s client budget: %s", logBuf.String())
+	}
+}
+
+func TestArtifactModeStreams40MiBLogicalBatchWithoutBodiesInReply(t *testing.T) {
+	eightMiBBody := "<html><body>" + strings.Repeat("EdgeFetchR2-", 700_000)[:(8<<20)-26] + "</body></html>"
+	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("content-type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(eightMiBBody))
+	}))
+	defer originSrv.Close()
+	originAddr := originSrv.Listener.Addr().String()
+	tlsCfg := originSrv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	tlsCfg.InsecureSkipVerify = true
+	tr := &http.Transport{
+		TLSClientConfig: tlsCfg,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
+		},
+	}
+
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	crawler := crawl.NewCrawler(tr, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	crawler.Sleep = func(context.Context, time.Duration) error { return nil }
+
+	var (
+		uploadedMu      sync.Mutex
+		uploadedObjects = map[string]int{}
+		replyRawBytes   atomic.Int64
+		gotReply        crawl.FetchReply
+	)
+
+	hubMux := http.NewServeMux()
+	hubMux.HandleFunc("/agent/artifacts/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.Header.Get("Content-Encoding") != "" {
+			http.Error(w, "unexpected Content-Encoding", http.StatusBadRequest)
+			return
+		}
+		if r.ContentLength <= 0 {
+			http.Error(w, "missing Content-Length", http.StatusLengthRequired)
+			return
+		}
+		if r.Header.Get("X-Request-Id") == "fail-up" {
+			_, _ = io.Copy(io.Discard, r.Body)
+			http.Error(w, `{"error":"simulated_r2_reject"}`, http.StatusForbidden)
+			return
+		}
+		gzData, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		wantBlobSHA := strings.TrimPrefix(r.URL.Path, "/agent/artifacts/")
+		gotDigest := sha256.Sum256(gzData)
+		if hex.EncodeToString(gotDigest[:]) != wantBlobSHA {
+			http.Error(w, "blob sha mismatch", http.StatusBadRequest)
+			return
+		}
+		uploadedMu.Lock()
+		uploadedObjects[r.Header.Get("X-Request-Id")] = len(gzData)
+		uploadedMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true,"stored":true}`))
+	})
+	hubMux.HandleFunc("/agent/reply", func(w http.ResponseWriter, r *http.Request) {
+		gzRaw, _ := io.ReadAll(r.Body)
+		gz, err := gzip.NewReader(bytes.NewReader(gzRaw))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer gz.Close()
+		plainJSON, err := io.ReadAll(gz)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		replyRawBytes.Store(int64(len(plainJSON)))
+		_ = json.Unmarshal(plainJSON, &gotReply)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hubSrv := httptest.NewServer(hubMux)
+	defer hubSrv.Close()
+
+	cfg := Config{
+		HubURL:     hubSrv.URL,
+		AgentToken: "agent-secret-token-0123456789-abcdef",
+		SiteID:     "site-1",
+		UserAgent:  crawl.DefaultUserAgent,
+		PauseMs:    1,
+	}
+
+	// 5 x 8 MiB = 40 MiB logical uncompressed batch (+ 1 simulated upload failure to verify body is omitted, not inline).
+	reqs := []crawl.Request{
+		{ID: "p1", URL: "https://h1.example.com/1", Kind: classify.KindPage},
+		{ID: "p2", URL: "https://h2.example.com/2", Kind: classify.KindPage},
+		{ID: "p3", URL: "https://h3.example.com/3", Kind: classify.KindPage},
+		{ID: "p4", URL: "https://h4.example.com/4", Kind: classify.KindPage},
+		{ID: "p5", URL: "https://h5.example.com/5", Kind: classify.KindPage},
+		{ID: "fail-up", URL: "https://h6.example.com/6", Kind: classify.KindPage},
+	}
+
+	handleDispatchWithOpts(
+		context.Background(),
+		cfg,
+		crawler,
+		crawl.PublicHTTPS,
+		hubSrv.Client(),
+		log,
+		RuntimeOpts{},
+		controlMessage{
+			Type:     "dispatch",
+			JobID:    "job-40mib",
+			JobNonce: "nonce-40mib",
+			Artifacts: &artifactDispatchPolicy{
+				Mode:            "r2",
+				Retention:       "transient",
+				MaxContentBytes: 16 << 20,
+			},
+			Call: crawl.FetchCall{
+				MaxSeconds: 60,
+				Options:    crawl.Options{IncludeBody: true, MaxBytes: 16 << 20, PauseMs: 1},
+				Requests:   reqs,
+			},
+		},
+	)
+
+	if len(gotReply.Results) != 6 {
+		t.Fatalf("expected 6 results in manifest reply, got %d", len(gotReply.Results))
+	}
+	if replyRawBytes.Load() > 16_384 {
+		t.Fatalf("expected tiny manifest reply (<16 KiB) with zero inline bodies, got %d bytes", replyRawBytes.Load())
+	}
+	for i := 0; i < 5; i++ {
+		r := gotReply.Results[i]
+		if r.Outcome != classify.OutcomeOK || r.Body != "" || r.Artifact == nil || r.Artifact.ContentBytes != len(eightMiBBody) {
+			t.Fatalf("result %d expected ok R2 artifact ref with empty inline Body, got %+v (artifact=%+v)", i, r, r.Artifact)
+		}
+	}
+	failedArt := gotReply.Results[5]
+	if failedArt.Outcome != classify.OutcomeOK || failedArt.Body != "" || !failedArt.BodyOmitted || failedArt.ArtifactError == "" {
+		t.Fatalf("failed upload must keep OutcomeOK, omit inline Body, and set ArtifactError; got %+v", failedArt)
 	}
 }

@@ -54,12 +54,37 @@ export interface AgentAttachment {
   version?: string;
   goVersion?: string;
   publicIp?: string;
+  capabilities?: string[];
   connectedAt: number;
   lastJobAt: number;
   jobsOk: number;
   jobsErr: number;
   replaced?: boolean;
 }
+
+export interface ArtifactDispatchPolicy {
+  mode: 'r2';
+  retention: 'transient' | 'stored';
+  maxContentBytes: number;
+}
+
+export interface AuthorizeArtifactUploadParams {
+  jobId: string;
+  jobNonce: string;
+  siteId: string;
+  requestId: string;
+  retention: string;
+  storedBytes: number;
+  contentBytes: number;
+}
+
+export type AuthorizeArtifactUploadResult =
+  | { ok: true }
+  | { ok: false; status: number; error: string };
+
+const MAX_JOB_ARTIFACT_OBJECTS = 400;
+const MAX_JOB_STORED_BYTES = 128 << 20; // 128 MiB gzipped per job
+const MAX_JOB_CONTENT_BYTES = 512 << 20; // 512 MiB logical uncompressed per job
 
 export interface HubSocketLike {
   readyState?: number;
@@ -243,6 +268,11 @@ interface PendingJob {
   siteId: string;
   ws: HubSocketLike;
   timer: ReturnType<typeof setTimeout>;
+  requestIds: Set<string>;
+  artifactPolicy?: ArtifactDispatchPolicy;
+  uploadedObjects: number;
+  uploadedStoredBytes: number;
+  uploadedContentBytes: number;
   resolve: (bodyText: string) => void;
   reject: (err: Error) => void;
 }
@@ -304,6 +334,19 @@ function sanitizeVersion(raw: string | null | undefined): string | undefined {
 function sanitizeGoVersion(raw: string | null | undefined): string | undefined {
   const clean = (raw ?? '').trim();
   return /^go[0-9A-Za-z._+-]{1,28}$/i.test(clean) ? clean : undefined;
+}
+
+function sanitizeCapabilities(raw?: string | string[] | null): string[] | undefined {
+  if (!raw) return undefined;
+  const items = Array.isArray(raw) ? raw : raw.split(',');
+  const clean = [
+    ...new Set(
+      items
+        .map((s) => (typeof s === 'string' ? s.trim().toLowerCase() : ''))
+        .filter((s) => /^[a-z0-9_-]{1,32}$/.test(s)),
+    ),
+  ];
+  return clean.length > 0 ? clean : undefined;
 }
 
 export function sanitizePublicIp(raw: string | null | undefined): string | undefined {
@@ -638,7 +681,7 @@ export class AgentHubEngine {
     ws: HubSocketLike,
     siteId: string,
     arch?: string | null,
-    meta?: { version?: string | null; goVersion?: string | null; publicIp?: string | null },
+    meta?: { version?: string | null; goVersion?: string | null; publicIp?: string | null; capabilities?: string | string[] | null },
   ): AgentAttachment {
     const normalized = siteId.trim().toLowerCase();
     for (const old of this.getSockets(`site:${normalized}`)) {
@@ -649,12 +692,14 @@ export class AgentHubEngine {
     const version = sanitizeVersion(meta?.version);
     const goVersion = sanitizeGoVersion(meta?.goVersion);
     const publicIp = sanitizePublicIp(meta?.publicIp);
+    const capabilities = sanitizeCapabilities(meta?.capabilities);
     const att: AgentAttachment = {
       siteId: normalized,
       arch: sanitizeArch(arch),
       ...(version ? { version } : {}),
       ...(goVersion ? { goVersion } : {}),
       ...(publicIp ? { publicIp } : {}),
+      ...(capabilities ? { capabilities } : {}),
       connectedAt: this.now(),
       lastJobAt: 0,
       jobsOk: 0,
@@ -664,21 +709,23 @@ export class AgentHubEngine {
     return att;
   }
 
-  /** Updates version / goVersion / arch metadata on an active socket when `agent_hello` arrives. */
+  /** Updates version / goVersion / arch / capabilities metadata on an active socket when `agent_hello` arrives. */
   updateAgentHello(
     ws: HubSocketLike,
-    hello: { version?: string | null; goVersion?: string | null; arch?: string | null },
+    hello: { version?: string | null; goVersion?: string | null; arch?: string | null; capabilities?: string[] | null },
   ): AgentAttachment | null {
     const raw = ws.deserializeAttachment();
     if (!isAttachment(raw)) return null;
     const version = sanitizeVersion(hello.version) ?? raw.version;
     const goVersion = sanitizeGoVersion(hello.goVersion) ?? raw.goVersion;
     const arch = hello.arch ? sanitizeArch(hello.arch) : raw.arch;
+    const capabilities = sanitizeCapabilities(hello.capabilities) ?? raw.capabilities;
     const updated: AgentAttachment = {
       ...raw,
       arch,
       ...(version ? { version } : {}),
       ...(goVersion ? { goVersion } : {}),
+      ...(capabilities ? { capabilities } : {}),
     };
     ws.serializeAttachment(updated);
     return updated;
@@ -758,7 +805,7 @@ export class AgentHubEngine {
   async dispatchFetch(
     rawCallBody: string,
     trace: Record<string, string> = {},
-    opts: { preferredSite?: string; timeoutMs?: number } = {},
+    opts: { preferredSite?: string; timeoutMs?: number; artifactPolicy?: ArtifactDispatchPolicy } = {},
   ): Promise<AgentDispatchResult> {
     if (utf8Encoder.encode(rawCallBody).byteLength > MAX_CALL_UTF8_BYTES) {
       return {
@@ -918,25 +965,45 @@ export class AgentHubEngine {
             try {
               const bodyText = await this.withSiteSlot(att.siteId, async () => {
                 const sendNow = this.now();
-                this.mutateSocketAttachment(ws, att, (cur) => {
+                let currentAtt!: AgentAttachment;
+                currentAtt = this.mutateSocketAttachment(ws, att, (cur) => {
                   cur.lastJobAt = sendNow + sitesUsed.length;
                 });
 
                 const remainingBudgetMs = Math.max(1_000, budgetDeadlineAt - sendNow);
                 const remainingSecs = Math.max(1, Math.min(maxSeconds, Math.ceil(remainingBudgetMs / 1_000)));
+                const subRequests =
+                  reqIndices.length === total && round === 1
+                    ? call.requests!
+                    : reqIndices.map((idx) => call.requests![idx]!);
                 const subCall = {
                   ...call,
                   maxSeconds: remainingSecs,
-                  requests:
-                    reqIndices.length === total && round === 1
-                      ? call.requests
-                      : reqIndices.map((idx) => call.requests![idx]),
+                  requests: subRequests,
                 };
                 const remainingTimeoutMs =
                   opts.timeoutMs ??
                   Math.max(MIN_JOB_TIMEOUT_MS, Math.min(MAX_JOB_TIMEOUT_MS, remainingSecs * 1_000 + 10_000));
 
-                return await this.sendAndAwaitJob(ws, att.siteId, jobId, jobNonce, subCall, trace, remainingTimeoutMs);
+                const agentSupportsArtifacts = Boolean(currentAtt.capabilities?.includes('artifacts-v1'));
+                const effectiveArtifactPolicy = agentSupportsArtifacts ? opts.artifactPolicy : undefined;
+                const reqIds = new Set(
+                  subRequests
+                    .map((r) => (typeof (r as { id?: unknown })?.id === 'string' ? (r as { id: string }).id : ''))
+                    .filter(Boolean),
+                );
+
+                return await this.sendAndAwaitJob(
+                  ws,
+                  att.siteId,
+                  jobId,
+                  jobNonce,
+                  subCall,
+                  trace,
+                  remainingTimeoutMs,
+                  reqIds,
+                  effectiveArtifactPolicy,
+                );
               });
               this.mutateSocketAttachment(ws, att, (cur) => {
                 cur.jobsOk++;
@@ -1099,8 +1166,17 @@ export class AgentHubEngine {
     call: unknown,
     trace: Record<string, string>,
     timeoutMs: number,
+    requestIds: Set<string> = new Set(),
+    artifactPolicy?: ArtifactDispatchPolicy,
   ): Promise<string> {
-    const frameText = JSON.stringify({ type: 'dispatch', jobId, jobNonce, trace, call });
+    const frameText = JSON.stringify({
+      type: 'dispatch',
+      jobId,
+      jobNonce,
+      trace,
+      ...(artifactPolicy ? { artifacts: artifactPolicy } : {}),
+      call,
+    });
     const frameBytes = utf8Encoder.encode(frameText).byteLength;
     if (frameBytes > MAX_WS_FRAME_BYTES) {
       return Promise.reject(
@@ -1114,7 +1190,20 @@ export class AgentHubEngine {
         reject(new Error(`agent ${siteId} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      this.pending.set(jobId, { jobId, jobNonce, siteId, ws, timer, resolve, reject });
+      this.pending.set(jobId, {
+        jobId,
+        jobNonce,
+        siteId,
+        ws,
+        timer,
+        requestIds,
+        ...(artifactPolicy ? { artifactPolicy } : {}),
+        uploadedObjects: 0,
+        uploadedStoredBytes: 0,
+        uploadedContentBytes: 0,
+        resolve,
+        reject,
+      });
 
       try {
         ws.send(frameText);
@@ -1135,6 +1224,39 @@ export class AgentHubEngine {
     const job = this.pending.get(jobId);
     if (!job) return false;
     return jobNonce.length > 0 && sameBytes(jobNonce, job.jobNonce) && job.siteId === siteId.trim().toLowerCase();
+  }
+
+  authorizeArtifactUpload(params: AuthorizeArtifactUploadParams): AuthorizeArtifactUploadResult {
+    const job = this.pending.get(params.jobId);
+    if (!job) return { ok: false, status: 404, error: 'unknown_or_expired_job' };
+    const nonceOk = params.jobNonce.length > 0 && sameBytes(params.jobNonce, job.jobNonce);
+    const siteOk = params.siteId.trim().toLowerCase() === job.siteId;
+    if (!nonceOk || !siteOk) {
+      return { ok: false, status: 403, error: 'invalid_job_credentials' };
+    }
+    if (!job.artifactPolicy || job.artifactPolicy.mode !== 'r2') {
+      return { ok: false, status: 400, error: 'artifacts_not_enabled_for_job' };
+    }
+    if (params.retention !== job.artifactPolicy.retention) {
+      return { ok: false, status: 400, error: 'retention_mismatch' };
+    }
+    if (!params.requestId || !job.requestIds.has(params.requestId)) {
+      return { ok: false, status: 400, error: 'unknown_request_id' };
+    }
+    if (params.contentBytes < 0 || params.contentBytes > job.artifactPolicy.maxContentBytes) {
+      return { ok: false, status: 413, error: 'content_bytes_exceeds_limit' };
+    }
+    if (
+      job.uploadedObjects + 1 > MAX_JOB_ARTIFACT_OBJECTS ||
+      job.uploadedStoredBytes + params.storedBytes > MAX_JOB_STORED_BYTES ||
+      job.uploadedContentBytes + params.contentBytes > MAX_JOB_CONTENT_BYTES
+    ) {
+      return { ok: false, status: 413, error: 'job_artifact_quota_exceeded' };
+    }
+    job.uploadedObjects += 1;
+    job.uploadedStoredBytes += params.storedBytes;
+    job.uploadedContentBytes += params.contentBytes;
+    return { ok: true };
   }
 
   failJob(jobId: string, jobNonce: string, siteId: string, reason: string, permanent = true): CompleteJobResult {

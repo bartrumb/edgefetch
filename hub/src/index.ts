@@ -32,6 +32,9 @@ import {
   type AffinityStore,
   type AgentAttachment,
   type AgentDispatchResult,
+  type ArtifactDispatchPolicy,
+  type AuthorizeArtifactUploadParams,
+  type AuthorizeArtifactUploadResult,
   type CompleteJobResult,
   type CooldownStore,
   type FetchTarget,
@@ -52,7 +55,13 @@ import type {
   SqlStorageLike,
 } from './oauth';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
-import { buildCapabilities, type OptionalStorageBindings } from './storage';
+import {
+  buildCapabilities,
+  handleAgentArtifactUpload,
+  MAX_ARTIFACT_CONTENT_BYTES,
+  type ArtifactRetention,
+  type OptionalStorageBindings,
+} from './storage';
 
 interface Env extends OptionalStorageBindings {
   AGENT_HUB: DurableObjectNamespace<AgentHubDO>;
@@ -254,12 +263,13 @@ export class AgentHubDO extends DurableObject<Env> {
     const siteId = (request.headers.get('x-verified-site') ?? '').trim().toLowerCase();
     const arch = request.headers.get('x-agent-arch');
     const version = request.headers.get('x-agent-version');
+    const capabilities = request.headers.get('x-agent-capabilities');
     const publicIp = request.headers.get('x-verified-ip') ?? request.headers.get('cf-connecting-ip');
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server, [`site:${siteId}`]);
-    const att = this.engine.registerAgent(server as unknown as HubSocketLike, siteId, arch, { version, publicIp });
+    const att = this.engine.registerAgent(server as unknown as HubSocketLike, siteId, arch, { version, publicIp, capabilities });
     server.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
     await this.activity.recordEvent({
       level: 'info',
@@ -330,8 +340,16 @@ export class AgentHubDO extends DurableObject<Env> {
     return this.engine.waitForHostWindow(hosts, pauseMs, budgetDeadlineAt);
   }
 
-  async dispatchFetch(rawCallBody: string, trace: Record<string, string>, preferredSite?: string): Promise<AgentDispatchResult> {
-    return this.engine.dispatchFetch(rawCallBody, trace, { preferredSite });
+  async dispatchFetch(
+    rawCallBody: string,
+    trace: Record<string, string>,
+    preferredSite?: string,
+    artifactPolicy?: ArtifactDispatchPolicy,
+  ): Promise<AgentDispatchResult> {
+    return this.engine.dispatchFetch(rawCallBody, trace, {
+      preferredSite,
+      ...(artifactPolicy ? { artifactPolicy } : {}),
+    });
   }
 
   async hasPendingJob(jobId: string, siteId: string): Promise<boolean> {
@@ -340,6 +358,10 @@ export class AgentHubDO extends DurableObject<Env> {
 
   async verifyPendingJob(jobId: string, jobNonce: string, siteId: string): Promise<boolean> {
     return this.engine.verifyPendingJob(jobId, jobNonce, siteId);
+  }
+
+  async authorizeArtifactUpload(params: AuthorizeArtifactUploadParams): Promise<AuthorizeArtifactUploadResult> {
+    return this.engine.authorizeArtifactUpload(params);
   }
 
   async failJob(jobId: string, jobNonce: string, siteId: string, reason: string, permanent = true): Promise<CompleteJobResult> {
@@ -422,6 +444,7 @@ export class AgentHubDO extends DurableObject<Env> {
         version?: string;
         arch?: string;
         goVersion?: string;
+        capabilities?: string[];
         reconnectAttempt?: number;
       };
       if (msg.type === 'agent_hello') {
@@ -507,7 +530,13 @@ export default {
 
     const bypassAllowlist = parseHostAllowlist(env.ROBOTS_BYPASS_HOSTS);
 
-    const executeHubFetch = async (target: FetchTarget, body: string, site?: string, source = 'rest') =>
+    const executeHubFetch = async (
+      target: FetchTarget,
+      body: string,
+      site?: string,
+      source = 'rest',
+      artifactRetention?: ArtifactRetention,
+    ) =>
       (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
         'edgefetch.dispatch',
         async (span) => {
@@ -519,6 +548,18 @@ export default {
               bodyText: JSON.stringify({ error: robotsCheck.error, message: robotsCheck.message }),
             };
           }
+          let wantsIncludeBody = false;
+          try {
+            const parsedOpts = (JSON.parse(body) as { options?: { includeBody?: boolean } }).options;
+            wantsIncludeBody = Boolean(parsedOpts?.includeBody);
+          } catch {
+            wantsIncludeBody = false;
+          }
+          const artifactPolicy: ArtifactDispatchPolicy | undefined =
+            env.ARTIFACTS && wantsIncludeBody && artifactRetention
+              ? { mode: 'r2', retention: artifactRetention, maxContentBytes: MAX_ARTIFACT_CONTENT_BYTES }
+              : undefined;
+
           const trace = { 'x-request-id': request.headers.get('cf-ray') ?? '' };
           const pendingEvents: HubEventInput[] = [];
           if (robotsCheck.bypassedHosts.length > 0) {
@@ -535,7 +576,7 @@ export default {
             site,
             body,
             trace,
-            callAgent: (b, t, s) => hub().dispatchFetch(b, t, s),
+            callAgent: (b, t, s) => hub().dispatchFetch(b, t, s, artifactPolicy),
             callContainer: (b) => cloudflareOverflowFetch(b, ua, url.hostname, { bypassAllowlist }),
             waitForHostWindow: (hosts, p, dl) =>
               hub()
@@ -575,6 +616,21 @@ export default {
         const clientIp = request.headers.get('cf-connecting-ip') ?? request.headers.get('x-forwarded-for');
         if (clientIp) headers.set('x-verified-ip', clientIp);
         return await hub().fetch(new Request(request.url, { method: 'GET', headers }));
+      }
+      if (request.method === 'PUT' && url.pathname.startsWith('/agent/artifacts/')) {
+        const auth = authorizeAgent(request, env);
+        if (!auth.ok) {
+          await request.body?.cancel().catch(() => undefined);
+          return Response.json({ error: 'unauthorized' }, { status: 401 });
+        }
+        const blobSha256 = url.pathname.slice('/agent/artifacts/'.length).trim();
+        return await handleAgentArtifactUpload({
+          request,
+          blobSha256,
+          siteId: auth.siteId,
+          bucket: env.ARTIFACTS,
+          authorizeJobUpload: (p) => hub().authorizeArtifactUpload(p),
+        });
       }
       if (request.method === 'POST' && url.pathname === '/agent/reply') {
         const auth = authorizeAgent(request, env);
@@ -683,7 +739,10 @@ export default {
         if (new TextEncoder().encode(body).byteLength > MAX_CALL_UTF8_BYTES) {
           return Response.json({ error: 'too_large' }, { status: 413 });
         }
-        const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest');
+        const rawRetention = url.searchParams.get('artifacts');
+        const artifactRetention: ArtifactRetention | undefined =
+          rawRetention === 'stored' ? 'stored' : rawRetention === 'transient' ? 'transient' : undefined;
+        const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention);
         return new Response(out.bodyText, {
           status: out.status,
           headers: {

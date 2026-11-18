@@ -193,7 +193,7 @@ function renderDashboardHtml(params: {
   <header>
     <h1>${escapeHtml(params.serviceName)} <span class="pill" id="conn-pill">Loading...</span></h1>
     <div style="display:flex;gap:8px;align-items:center">
-      <span class="muted" id="last-poll">Live (5s)</span>
+      <span class="muted" id="last-poll">Live (15s)</span>
       <button type="button" id="refresh-btn">Refresh</button>
       <form method="post" action="/admin/logout" style="margin:0">
         <input type="hidden" name="csrf" value="${escapeHtml(params.csrf)}">
@@ -244,7 +244,7 @@ function renderDashboardHtml(params: {
     </section>
 
     <section class="card">
-      <h2><span>Connected Remote Fleet (<span id="site-count">0</span>)</span><span class="muted">Auto-refreshes every 5s</span></h2>
+      <h2><span>Connected Remote Fleet (<span id="site-count">0</span>)</span><span class="muted">Hibernation-friendly 15s poll</span></h2>
       <div id="fleet-grid" class="grid-3"><div class="muted">Loading connected agents...</div></div>
     </section>
 
@@ -566,7 +566,9 @@ function renderDashboardHtml(params: {
     });
 
     loadState();
-    setInterval(loadState, 5000);
+    setInterval(() => {
+      if (!document.hidden) loadState();
+    }, 15000);
   </script>
 </body>
 </html>`;

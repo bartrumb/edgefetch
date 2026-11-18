@@ -452,11 +452,20 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
 
 function hubActivityProxy(hub: () => DurableObjectStub<AgentHubDO>): ActivityStore {
   return {
-    recordEvent: (ev) => hub().recordHubEvents([ev]),
-    listEvents: async () => (await hub().getPortalState(Date.now())).events,
-    clearEvents: () => hub().clearHubEvents(),
-    recordMcpCall: (p) => hub().recordMcpCall(p),
-    listMcpClients: async () => (await hub().getPortalState(Date.now())).mcpClients,
+    recordEvent: (ev) =>
+      hub()
+        .recordHubEvents([ev])
+        .catch(() => undefined),
+    listEvents: async () => (await hub().getPortalState(Date.now())).events ?? [],
+    clearEvents: () =>
+      hub()
+        .clearHubEvents()
+        .catch(() => undefined),
+    recordMcpCall: (p) =>
+      hub()
+        .recordMcpCall(p)
+        .catch(() => undefined),
+    listMcpClients: async () => (await hub().getPortalState(Date.now())).mcpClients ?? [],
   };
 }
 

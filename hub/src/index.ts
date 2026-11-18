@@ -24,6 +24,7 @@ interface AgentAttachment {
   lastJobAt: number;
   jobsOk: number;
   jobsErr: number;
+  replaced?: boolean;
 }
 
 interface PendingJob {
@@ -113,6 +114,10 @@ export class AgentHubDO extends DurableObject<Env> {
 
     for (const old of this.ctx.getWebSockets(`site:${siteId}`)) {
       this.abortSocketJobs(old, 'replaced');
+      const prev = old.deserializeAttachment() as AgentAttachment | null;
+      if (prev && typeof prev === 'object') {
+        old.serializeAttachment({ ...prev, replaced: true });
+      }
       try {
         old.close(1000, 'replaced');
       } catch {
@@ -129,11 +134,39 @@ export class AgentHubDO extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  private activeEntries(): Array<{ ws: WebSocket; att: AgentAttachment }> {
+    const bySite = new Map<string, { ws: WebSocket; att: AgentAttachment }>();
+    for (const ws of this.ctx.getWebSockets()) {
+      const state = (ws as unknown as { readyState?: number }).readyState;
+      if (typeof state === 'number' && state !== 1) continue;
+      const att = ws.deserializeAttachment() as AgentAttachment | null;
+      if (!att?.siteId || att.replaced) continue;
+      const prev = bySite.get(att.siteId);
+      if (!prev) {
+        bySite.set(att.siteId, { ws, att: { ...att } });
+      } else if (att.connectedAt >= prev.att.connectedAt) {
+        prev.ws.serializeAttachment({ ...prev.att, replaced: true });
+        try {
+          prev.ws.close(1000, 'replaced');
+        } catch {
+          // ignore
+        }
+        bySite.set(att.siteId, { ws, att: { ...att } });
+      } else {
+        ws.serializeAttachment({ ...att, replaced: true });
+        try {
+          ws.close(1000, 'replaced');
+        } catch {
+          // ignore
+        }
+      }
+    }
+    return [...bySite.values()];
+  }
+
   async listAgents(): Promise<{ connected: number; agents: AgentAttachment[] }> {
-    const agents = this.ctx
-      .getWebSockets()
-      .map((ws) => ws.deserializeAttachment() as AgentAttachment | null)
-      .filter((a): a is AgentAttachment => Boolean(a?.siteId))
+    const agents = this.activeEntries()
+      .map(({ att }) => att)
       .sort((a, b) => a.siteId.localeCompare(b.siteId));
     return { connected: agents.length, agents };
   }
@@ -178,10 +211,7 @@ export class AgentHubDO extends DurableObject<Env> {
       host = null;
     }
 
-    const entries = this.ctx
-      .getWebSockets()
-      .map((ws) => ({ ws, att: ws.deserializeAttachment() as AgentAttachment | null }))
-      .filter((e): e is { ws: WebSocket; att: AgentAttachment } => Boolean(e.att?.siteId));
+    const entries = this.activeEntries();
 
     const candidates = preferredSite
       ? entries.filter((e) => e.att.siteId === preferredSite)

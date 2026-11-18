@@ -6,6 +6,7 @@ coverage.html
 
 # Node / Wrangler local state for companion hub/
 node_modules/
+package-lock.json
 .wrangler/
 .dev.vars
 dist/

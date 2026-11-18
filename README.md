@@ -2,9 +2,10 @@
 
 [![CI](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml/badge.svg)](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml)
 [![Go 1.22+](https://img.shields.io/badge/Go-1.22%2B%20(stdlib%20only)-00ADD8?logo=go)](go.mod)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://github.com/bartrumb/edgefetch/blob/main/LICENSE)](LICENSE)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub)
 
-**EdgeFetch** is a security-hardened, **zero-dependency Go HTTP/2 fetcher** and **outbound-only distributed standby worker** paired with a **Cloudflare Hibernating WebSocket Durable Object** coordinator and a **1-click Home Assistant OS Add-on**.
+**EdgeFetch** is a security-hardened, **zero-dependency Go HTTP/2 fetcher** and **outbound-only distributed standby worker** paired with a **Cloudflare Hibernating WebSocket Durable Object** coordinator (`hub/` — complete with a built-in `/admin` Control Center and self-hosted OAuth 2.1 `/mcp` server) and a **1-click Home Assistant OS Add-on**.
 
 It solves a practical distributed-systems problem: keeping scheduled public feed/document syncs resilient across primary cloud containers (`--mode=server`) and geo-distributed standby hardware (`--mode=agent`) **without** opening inbound router ports, running forward HTTP/SOCKS proxies, installing VPN/tunnel daemons, or pulling in third-party Go packages.
 
@@ -13,7 +14,9 @@ It solves a practical distributed-systems problem: keeping scheduled public feed
 ## Why EdgeFetch?
 
 - **100% Go Standard Library (`go.sum`-free):** HTTP/2 connection pooling, `net/http/httptrace` phase telemetry, RFC 6455 TLS WebSocket framing, RFC 9309 `robots.txt` longest-match evaluation, RFC 9110 `Retry-After` parsing, three-state circuit breaking, and Linux `prctl` + `setuid` privilege dropping are implemented cleanly in ~1,400 lines of idiomatic Go with **zero external supply-chain dependencies**.
-- **Outbound-Only Standby Architecture (~$0 Idle Cloud Cost):** Standby nodes (`amd64` / `aarch64`) dial outbound `wss://` to a Cloudflare Hibernating WebSocket Durable Object (`AgentHubDO`). Cloudflare's `WebSocketRequestResponsePair("ping", "pong")` answers 30-second keepalives at the edge **without waking the Durable Object from hibernation**.
+- **Strict Hub / Edge Security Split (~$0 Idle Cloud Cost):**
+  - **Edge Nodes (`amd64` / `aarch64`)** host **zero** inbound HTTP, `/admin`, or `/mcp` endpoints. They dial outbound `wss://` to `/agent/ws`, where Cloudflare's `WebSocketRequestResponsePair("ping", "pong")` answers 30-second keepalives at the edge **without waking the Durable Object from hibernation**.
+  - **Cloudflare Hub (`hub/`)** is the sole public control plane — hosting `POST /fetch`, `GET /agents`, the `/admin` Web Control Center, and the OAuth 2.1 `/mcp` server for Claude Code.
 - **Split Control / Data Plane for Asymmetric Links:** Small JSON dispatch commands arrive over the hibernated WebSocket (`< 1 MiB`), while `0.4–16 MiB` HTML/JSON responses stream back via `gzip`-compressed HTTP/2 `POST /agent/reply` (~8–10x smaller over residential upload pipes, never stalling WebSocket heartbeats).
 - **Defense-in-Depth Security ([SECURITY.md](SECURITY.md)):**
   - Kernel-level `net.Dialer.Control` SSRF guard (`RejectNonPublicPeer`) inspects the exact resolved IP right before `connect()` — eliminating DNS-rebinding TOCTOU races and blocking RFC 1918 LANs (including Home Assistant's `172.30.32.0/23` bridge), loopback, Tailscale/CGNAT (`100.64.0.0/10`), cloud metadata (`169.254.169.254`), and IPv6-embedded IPv4 transition prefixes (`64:ff9b::/96` NAT64, `2002::/16` 6to4, `2001::/32` Teredo).
@@ -26,11 +29,13 @@ It solves a practical distributed-systems problem: keeping scheduled public feed
 
 ```mermaid
 flowchart TD
-    Caller["Upstream Workflow / Cron"] -->|"POST /fetch (Bearer CALLER_TOKEN)"| HubW["Cloudflare Worker + AgentHubDO"]
+    Admin["Browser (/admin Control Center)"] -->|"HMAC Session + CSRF"| HubW["Cloudflare Hub Worker + AgentHubDO (SQLite)"]
+    Claude["Claude Code (/mcp)"] -->|"Self-Hosted OAuth 2.1 + PKCE S256"| HubW
+    Caller["Upstream Workflow / Cron"] -->|"POST /fetch (Bearer CALLER_TOKEN)"| HubW
     HubW -->|"1. Primary (optional)"| CloudGo["Cloud Container (edgefetch --mode=server)"]
-    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S1["Site 1 HAOS / Docker (amd64)"]
-    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S2["Site 2 HAOS / Pi (aarch64)"]
-    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S3["Site 3 HAOS / Baremetal (amd64)"]
+    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S1["Site 1 HAOS / Docker (amd64 — outbound only)"]
+    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S2["Site 2 HAOS / ARM64 (aarch64 — outbound only)"]
+    HubW -.->|"2. Host-Sticky Standby Dispatch (15m SQLite Pin)"| S3["Site 3 HAOS / Baremetal (amd64 — outbound only)"]
     S1 -.->|"POST /agent/reply (gzip FetchReply)"| HubW
     S2 -.->|"POST /agent/reply (gzip FetchReply)"| HubW
     S3 -.->|"POST /agent/reply (gzip FetchReply)"| HubW
@@ -42,7 +47,7 @@ flowchart TD
 
 | Package | Responsibility |
 |---|---|
-| [`cmd/edgefetch`](cmd/edgefetch/main.go) | Dual-mode binary entrypoint (`server` vs `agent`), HTTP/2 transport tuning, `SIGTERM` graceful drain |
+| [`cmd/edgefetch`](cmd/edgefetch/main.go) | Dual-mode binary entrypoint (`server` vs outbound-only `agent`), HTTP/2 transport tuning, `SIGTERM` graceful drain |
 | [`internal/politeness`](internal/politeness/politeness.go) | Context-cancellable `chan struct{}` per-host locks, `robots.txt` cache, 3-state circuit breaker, `RejectNonPublicPeer` SSRF hook |
 | [`internal/classify`](internal/classify/classify.go) | Defined string enums (`Kind`, `Outcome`) and panic-free JSON/HTML response classification |
 | [`internal/crawl`](internal/crawl/crawl.go) | Bounded worker pool, positive dwell jitter (`PauseJitterMs`), `httptrace` phase timing, `io.LimitReader(max+1)`, `/fetch` handler |
@@ -50,9 +55,10 @@ flowchart TD
 | [`internal/priv`](internal/priv/priv_linux.go) | Linux `prctl(PR_SET_NO_NEW_PRIVS)` + `AllThreadsSyscall` irreversible root drop (`65532:65532`) |
 | [`internal/agent`](internal/agent/agent.go) | `/data/options.json` + env loader, jittered reconnect supervisor, `agent_hello` OTel telemetry, gzipped reply uploader |
 | [`edgefetch_agent/`](edgefetch_agent/config.yaml) | Multi-arch (`amd64` + `aarch64`) Home Assistant OS Add-on manifest, `apparmor.txt`, and `distroless` Dockerfile |
-| [`hub/`](hub/src/index.ts) | Reference Cloudflare Worker + SQLite-backed Hibernating WebSocket Durable Object (`AgentHubDO`) |
+| [`hub/`](hub/src/index.ts) | Cloudflare Hub Worker + `AgentHubDO` SQLite coordinator + `/admin` Web UI + Self-Hosted OAuth 2.1 `/mcp` server |
 
-Deep-dive systems & Go concurrency walkthrough: **[docs/INTERNALS.md](docs/INTERNALS.md)**.
+- Operations, C&C protocol, tuning, `/admin`, & Claude Code MCP guide: **[docs/USAGE.md](docs/USAGE.md)**
+- Deep-dive systems & Go concurrency walkthrough: **[docs/INTERNALS.md](docs/INTERNALS.md)**
 
 ---
 
@@ -72,18 +78,9 @@ Measured on Linux `amd64` (12th Gen Intel Core i9-12900K, Go stdlib only):
 
 ## Quickstart
 
-### 1. Run Locally & Test with the Race Detector
+### 1. Deploy the Cloudflare Hub (`hub/`)
 
-```bash
-go vet ./...
-go test -race -count=1 ./...
-go test -bench=. -benchmem ./...
-
-# Start in HTTP server mode on :8080
-go run ./cmd/edgefetch --mode=server
-```
-
-### 2. Deploy the Companion Cloudflare Hub (`hub/`)
+Deploy via the **[Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub)** button (or `.github/workflows/deploy-hub.yml` with `CLOUDFLARE_API_TOKEN`), or from your terminal:
 
 ```bash
 cd hub
@@ -94,17 +91,27 @@ npx wrangler secret put AGENT_TOKENS -c wrangler.toml
 # Example AGENT_TOKENS JSON: {"site-1":"<32-char-random>","site-2":"<32-char-random>"}
 ```
 
-### 3. 1-Click Install on Home Assistant OS (`amd64` & `aarch64`)
+### 2. 1-Click Install on Home Assistant OS (`amd64` & `aarch64`)
 
-1. Open **Settings -> Add-ons -> Add-on Store -> ⋮ -> Repositories** and add:
-   ```text
-   https://github.com/bartrumb/edgefetch
-   ```
+1. Open **Settings -> Add-ons -> Add-on Store -> `⋮` -> Repositories** and add `https://github.com/bartrumb/edgefetch`.
 2. Install **EdgeFetch Cold-Standby Worker**, open **Configuration**, set `hub_url`, `agent_token`, `site_id`, and `user_agent`, and click **Start**.
-3. Check live connected standby nodes from anywhere:
-   ```bash
-   curl -H "Authorization: Bearer $CALLER_TOKEN" https://your-hub.workers.dev/agents
-   ```
+
+### 3. Drive, Monitor & Tune After Setup (Full Reference in [`docs/USAGE.md`](docs/USAGE.md))
+
+- **Web Control Center (`/admin`):** Open `https://<your-hub>.workers.dev/admin` and sign in with `CALLER_TOKEN` to view live connected edge nodes, 15-minute domain-affinity pins, active OAuth grants, and an interactive URL Crawl Tester with a visual **DNS / TCP / TLS / TTFB** waterfall bar.
+- **Connect Directly to Claude Code (`/mcp` with Self-Hosted OAuth 2.1 + PKCE):**
+  ```bash
+  claude mcp add --transport http edgefetch https://<your-hub>.workers.dev/mcp
+  ```
+  Claude Code auto-discovers RFC 9728 / RFC 8414 metadata, dynamically registers (`POST /oauth/register`), and opens `/oauth/authorize` in your browser to grant `list_agents`, `fetch_url`, and `fetch_batch` tools — zero external IdP, zero separate KV namespace, and zero raw tokens stored in config files.
+- **Trigger Polite Crawls via REST (`POST /fetch`):**
+  ```bash
+  curl -X POST "https://<your-hub>.workers.dev/fetch?site=site-1" \
+    -H "Authorization: Bearer $CALLER_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"options":{"includeBody":true,"robots":true,"pauseMs":1500},"requests":[{"id":"1","url":"https://example.com/","kind":"page"}]}'
+  ```
+- **Single-Pane-of-Glass Logs & Traces:** Open **Cloudflare Dashboard -> Workers & Pages -> `edgefetch-hub` -> Observability** to query OpenTelemetry traces and structured JSON logs across every site.
 
 ---
 

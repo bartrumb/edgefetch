@@ -1,30 +1,34 @@
 /**
- * Reference Cloudflare Worker + Hibernating WebSocket Durable Object (`AgentHubDO`) for EdgeFetch.
+ * Reference Cloudflare Hub Worker + Hibernating WebSocket Durable Object (`AgentHubDO`) for EdgeFetch.
  *
- * - Zero-cost idle standby: `WebSocketRequestResponsePair('ping', 'pong')` answers 30 s keepalives at Cloudflare's edge
- *   without waking the Durable Object from hibernation.
- * - Host-sticky session affinity: SQLite `host_affinity` pins each origin domain to one connected site for 15 minutes
- *   so sequential requests reuse one warm HTTP/2 TLS socket, while rotating distinct domains by least-recently-used.
- * - Single-pane-of-glass observability: Attaches Go `httptrace` timings (`dns_ms`, `tls_ms`, `ttfb_ms`, `conn_reused`)
- *   to active OpenTelemetry spans (`tracing.enterSpan`) and structured JSON Workers Logs.
+ * Architectural boundary:
+ *  - ONLY this Cloudflare Hub hosts inbound HTTP routes (`/admin`, `/mcp`, `/oauth/*`, `/fetch`, `/agents`).
+ *  - Edge nodes (Home Assistant OS / Docker Go binaries) host ZERO inbound endpoints; they strictly dial outbound
+ *    `wss://` to `/agent/ws`, sleep via Cloudflare edge auto-pong (`0` idle DO wakeups), and upload gzipped replies
+ *    to `/agent/reply`.
  */
 import { DurableObject, tracing } from 'cloudflare:workers';
+import { handleAdminRoute } from './admin';
+import type { AffinityPin, AgentAttachment } from './agent-hub';
+import { authorizeAgent, isCallerAuthorized, sameBytes } from './auth';
+import { handleMcpRequest } from './mcp';
+import {
+  OAUTH_SQLITE_SCHEMA,
+  createSqliteOAuthStore,
+  handleOAuthRoute,
+  type OAuthClientRecord,
+  type OAuthCodeRecord,
+  type OAuthGrantSummary,
+  type OAuthStore,
+  type OAuthTokenRecord,
+  type SqlStorageLike,
+} from './oauth';
 
 interface Env {
   AGENT_HUB: DurableObjectNamespace<AgentHubDO>;
   CALLER_TOKEN?: string;
   AGENT_TOKEN?: string;
   AGENT_TOKENS?: string;
-}
-
-interface AgentAttachment {
-  siteId: string;
-  arch: string;
-  connectedAt: number;
-  lastJobAt: number;
-  jobsOk: number;
-  jobsErr: number;
-  replaced?: boolean;
 }
 
 interface PendingJob {
@@ -36,72 +40,29 @@ interface PendingJob {
   reject: (err: Error) => void;
 }
 
-const MIN_TOKEN_LENGTH = 24;
-const SITE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const AFFINITY_TTL_MS = 15 * 60_000;
 const MAX_CALL_BYTES = 1 << 20;
 const MAX_REPLY_BYTES = 20 << 20;
 
-function sameBytes(a: string, b: string): boolean {
-  const enc = new TextEncoder();
-  const x = enc.encode(a);
-  const y = enc.encode(b);
-  let diff = x.length ^ y.length;
-  const n = Math.max(x.length, y.length);
-  for (let i = 0; i < n; i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
-  return diff === 0;
-}
-
-function bearer(req: Request): string | null {
-  const m = /^bearer\s+(\S+)$/i.exec(req.headers.get('authorization') ?? '');
-  return m ? (m[1] as string) : null;
-}
-
-function isCallerAuthorized(req: Request, token?: string): boolean {
-  if (!token || token.length < MIN_TOKEN_LENGTH) return false;
-  const tok = bearer(req);
-  return tok !== null && sameBytes(tok, token);
-}
-
-function authorizeAgent(req: Request, env: Env): { ok: true; siteId: string } | { ok: false } {
-  const tok = bearer(req);
-  if (!tok) return { ok: false };
-  const hdrSite = (req.headers.get('x-agent-site') ?? '').trim().toLowerCase();
-
-  if (env.AGENT_TOKENS?.trim()) {
-    try {
-      const map = JSON.parse(env.AGENT_TOKENS) as Record<string, unknown>;
-      let matched: string | null = null;
-      for (const [k, v] of Object.entries(map)) {
-        const s = k.trim().toLowerCase();
-        if (SITE_ID_RE.test(s) && typeof v === 'string' && v.length >= MIN_TOKEN_LENGTH && sameBytes(tok, v)) {
-          matched = s;
-        }
-      }
-      if (matched && (!hdrSite || hdrSite === matched)) return { ok: true, siteId: matched };
-    } catch {
-      // malformed JSON fails closed
-    }
-  }
-  if (env.AGENT_TOKEN && env.AGENT_TOKEN.length >= MIN_TOKEN_LENGTH) {
-    const valid = sameBytes(tok, env.AGENT_TOKEN);
-    if (valid && SITE_ID_RE.test(hdrSite)) return { ok: true, siteId: hdrSite };
-  }
-  return { ok: false };
-}
-
 export class AgentHubDO extends DurableObject<Env> {
   private readonly pending = new Map<string, PendingJob>();
+  private readonly oauth: OAuthStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
     this.ctx.blockConcurrencyWhile(async () => {
-      this.ctx.storage.sql.exec(
-        'CREATE TABLE IF NOT EXISTS host_affinity (host TEXT PRIMARY KEY, site_id TEXT NOT NULL, expires_at INTEGER NOT NULL)',
-      );
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS host_affinity (
+          host TEXT PRIMARY KEY,
+          site_id TEXT NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+        ${OAUTH_SQLITE_SCHEMA}
+      `);
     });
+    this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -171,7 +132,36 @@ export class AgentHubDO extends DurableObject<Env> {
     return { connected: agents.length, agents };
   }
 
-  /** Pre-checks whether `jobId` is actively awaited from `siteId` BEFORE streaming/decompressing `/agent/reply`. */
+  async listAffinities(now = Date.now()): Promise<AffinityPin[]> {
+    this.ctx.storage.sql.exec('DELETE FROM host_affinity WHERE expires_at <= ?', now);
+    return this.ctx.storage.sql
+      .exec<{ host: string; site_id: string; expires_at: number }>('SELECT host, site_id, expires_at FROM host_affinity ORDER BY host ASC')
+      .toArray()
+      .map((r) => ({ host: r.host, siteId: r.site_id, expiresAt: r.expires_at }));
+  }
+
+  async clearAffinities(siteId?: string): Promise<void> {
+    if (siteId?.trim()) {
+      this.ctx.storage.sql.exec('DELETE FROM host_affinity WHERE site_id = ?', siteId.trim().toLowerCase());
+    } else {
+      this.ctx.storage.sql.exec('DELETE FROM host_affinity');
+    }
+  }
+
+  async getPortalState(now: number): Promise<{
+    connected: number;
+    agents: AgentAttachment[];
+    affinities: AffinityPin[];
+    grants: OAuthGrantSummary[];
+  }> {
+    const fleet = await this.listAgents();
+    return {
+      ...fleet,
+      affinities: await this.listAffinities(now),
+      grants: await this.oauth.listGrants(now),
+    };
+  }
+
   async hasPendingJob(jobId: string, siteId: string): Promise<boolean> {
     const job = this.pending.get(jobId);
     return Boolean(job && job.siteId === siteId);
@@ -212,7 +202,6 @@ export class AgentHubDO extends DurableObject<Env> {
     }
 
     const entries = this.activeEntries();
-
     const candidates = preferredSite
       ? entries.filter((e) => e.att.siteId === preferredSite)
       : entries.sort((a, b) => a.att.lastJobAt - b.att.lastJobAt || a.att.connectedAt - b.att.connectedAt);
@@ -262,6 +251,60 @@ export class AgentHubDO extends DurableObject<Env> {
       }
     }
     return { ok: false, status: 502, error: 'agent_dispatch_failed' };
+  }
+
+  // OAuth 2.1 SQLite RPC methods
+  async oauthPutClient(c: OAuthClientRecord): Promise<void> {
+    await this.oauth.putClient(c);
+  }
+  async oauthGetClient(id: string): Promise<OAuthClientRecord | null> {
+    return await this.oauth.getClient(id);
+  }
+  async oauthPutCode(c: OAuthCodeRecord): Promise<void> {
+    await this.oauth.putCode(c);
+  }
+  async oauthConsumeCode(h: string, now: number): Promise<OAuthCodeRecord | null> {
+    return await this.oauth.consumeCode(h, now);
+  }
+  async oauthPutTokenPair(p: {
+    grantId: string;
+    accessHash: string;
+    refreshHash: string;
+    clientId: string;
+    clientName: string;
+    scopes: string[];
+    resource: string;
+    createdAt: number;
+    accessExpiresAt: number;
+    refreshExpiresAt: number;
+  }): Promise<void> {
+    await this.oauth.putTokenPair(p);
+  }
+  async oauthGetAccessToken(h: string, now: number): Promise<OAuthTokenRecord | null> {
+    return await this.oauth.getAccessToken(h, now);
+  }
+  async oauthConsumeRefreshToken(h: string, now: number): Promise<OAuthTokenRecord | null> {
+    return await this.oauth.consumeRefreshToken(h, now);
+  }
+  async oauthListGrants(now: number): Promise<OAuthGrantSummary[]> {
+    return await this.oauth.listGrants(now);
+  }
+  async oauthRevokeGrant(id: string): Promise<boolean> {
+    return await this.oauth.revokeGrant(id);
+  }
+  async oauthRevokeByTokenHash(h: string): Promise<void> {
+    await this.oauth.revokeByTokenHash(h);
+  }
+  async oauthRecordAuthFailure(
+    bucket: string,
+    now: number,
+    windowMs: number,
+    maxFailures: number,
+  ): Promise<{ allowed: boolean; retryAfterSec: number }> {
+    return await this.oauth.recordAuthFailure(bucket, now, windowMs, maxFailures);
+  }
+  async oauthClearAuthFailures(bucket: string): Promise<void> {
+    await this.oauth.clearAuthFailures(bucket);
   }
 
   private abortSocketJobs(ws: WebSocket, reason: string): void {
@@ -324,10 +367,39 @@ async function readCappedStream(req: Request, maxBytes: number): Promise<string 
   return new TextDecoder().decode(out);
 }
 
+function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
+  return {
+    putClient: (c) => hub().oauthPutClient(c),
+    getClient: (id) => hub().oauthGetClient(id),
+    putCode: (c) => hub().oauthPutCode(c),
+    consumeCode: (h, now) => hub().oauthConsumeCode(h, now),
+    putTokenPair: (p) => hub().oauthPutTokenPair(p),
+    getAccessToken: (h, now) => hub().oauthGetAccessToken(h, now),
+    consumeRefreshToken: (h, now) => hub().oauthConsumeRefreshToken(h, now),
+    listGrants: (now) => hub().oauthListGrants(now),
+    revokeGrant: (id) => hub().oauthRevokeGrant(id),
+    revokeByTokenHash: (h) => hub().oauthRevokeByTokenHash(h),
+    recordAuthFailure: (b, now, w, m) => hub().oauthRecordAuthFailure(b, now, w, m),
+    clearAuthFailures: (b) => hub().oauthClearAuthFailures(b),
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const hub = () => env.AGENT_HUB.get(env.AGENT_HUB.idFromName('global'));
+    const executeHubFetch = async (body: string, site?: string) =>
+      (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
+        'edgefetch.dispatch',
+        async (span) => {
+          const res = await hub().dispatchFetch(body, { 'x-request-id': request.headers.get('cf-ray') ?? '' }, site);
+          if (!res.ok) {
+            return { status: res.status, via: 'none', bodyText: JSON.stringify({ error: res.error }) };
+          }
+          span.setAttribute('edgefetch.site', res.siteId);
+          return { status: 200, via: `agent:${res.siteId}`, bodyText: res.bodyText };
+        },
+      );
 
     if (request.method === 'GET' && url.pathname === '/health') {
       return Response.json({ ok: true });
@@ -352,6 +424,48 @@ export default {
       return Response.json({ ok: done.ok }, { status: done.status });
     }
 
+    const oauthStore = hubOAuthStore(hub);
+
+    // Self-hosted OAuth 2.1 + RFC 9728 / RFC 8414 discovery
+    const oauthRes = await handleOAuthRoute(request, url, {
+      store: oauthStore,
+      ownerSecret: env.CALLER_TOKEN,
+      serviceName: 'EdgeFetch Hub',
+    });
+    if (oauthRes) return oauthRes;
+
+    // Stateless Streamable HTTP MCP Server (`/mcp`)
+    if (url.pathname === '/mcp') {
+      return handleMcpRequest(request, url, {
+        serverName: 'edgefetch-hub',
+        serverVersion: '1.1.0',
+        ownerSecret: env.CALLER_TOKEN,
+        oauthStore,
+        allowedTargets: ['agent'],
+        defaultTarget: 'agent',
+        listFleet: async () => {
+          const state = await hub().getPortalState(Date.now());
+          return { connected: state.connected, agents: state.agents, affinities: state.affinities };
+        },
+        executeFetch: ({ site, body }) => executeHubFetch(body, site),
+      });
+    }
+
+    // Built-in Web Control Center (`/admin` & `/admin/*`)
+    const adminRes = await handleAdminRoute(request, url, {
+      serviceName: 'EdgeFetch Hub',
+      mcpSlug: 'edgefetch',
+      ownerSecret: env.CALLER_TOKEN,
+      oauthStore,
+      allowedTargets: ['agent'],
+      defaultTarget: 'agent',
+      getState: () => hub().getPortalState(Date.now()),
+      clearAffinities: (siteId) => hub().clearAffinities(siteId),
+      revokeGrant: (grantId) => hub().oauthRevokeGrant(grantId),
+      executeFetch: ({ site, body }) => executeHubFetch(body, site),
+    });
+    if (adminRes) return adminRes;
+
     if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
       return Response.json({ error: 'unauthorized' }, { status: 401 });
     }
@@ -362,18 +476,11 @@ export default {
       const body = await request.text();
       if (body.length > MAX_CALL_BYTES) return Response.json({ error: 'too_large' }, { status: 413 });
       const site = url.searchParams.get('site')?.trim().toLowerCase();
-      return (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
-        'edgefetch.dispatch',
-        async (span) => {
-          const res = await hub().dispatchFetch(body, { 'x-request-id': request.headers.get('cf-ray') ?? '' }, site);
-          if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
-          span.setAttribute('edgefetch.site', res.siteId);
-          return new Response(res.bodyText, {
-            status: 200,
-            headers: { 'content-type': 'application/json', 'x-crawler-via': `agent:${res.siteId}` },
-          });
-        },
-      );
+      const out = await executeHubFetch(body, site);
+      return new Response(out.bodyText, {
+        status: out.status,
+        headers: { 'content-type': 'application/json', 'x-crawler-via': out.via, 'cache-control': 'no-store' },
+      });
     }
     return Response.json({ error: 'not_found' }, { status: 404 });
   },

@@ -45,6 +45,21 @@ jobs:
       - name: Run allocation microbenchmarks
         run: go test -bench=. -benchmem ./...
 
+  hub:
+    name: Cloudflare Hub Type-Check & Bundle Dry-Run
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+      - run: npm run type-check
+      - run: npm run deploy:dry
+
   docker-multiarch:
     name: Verify Multi-Arch Distroless Builds (amd64 & arm64)
     runs-on: ubuntu-latest

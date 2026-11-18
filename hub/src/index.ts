@@ -35,6 +35,7 @@ import {
   type CooldownStore,
   type CrawlResultItem,
   type FetchTarget,
+  type HostWindowStore,
   type HubSocketLike,
 } from './agent-hub';
 import { authorizeAgent, isCallerAuthorized } from './auth';
@@ -79,6 +80,10 @@ export class AgentHubDO extends DurableObject<Env> {
           site_id TEXT NOT NULL,
           expires_at INTEGER NOT NULL,
           PRIMARY KEY (host, site_id)
+        );
+        CREATE TABLE IF NOT EXISTS host_windows (
+          host TEXT PRIMARY KEY,
+          next_allowed_at INTEGER NOT NULL
         );
         ${OAUTH_SQLITE_SCHEMA}
         ${ACTIVITY_SQLITE_SCHEMA}
@@ -127,9 +132,41 @@ export class AgentHubDO extends DurableObject<Env> {
       },
     };
 
+    const hostWindows: HostWindowStore = {
+      getNextAllowed: (host, now) => {
+        const key = host.toLowerCase();
+        const rows = this.ctx.storage.sql
+          .exec<{ next_allowed_at: number }>('SELECT next_allowed_at FROM host_windows WHERE host = ?', key)
+          .toArray();
+        const row = rows[0];
+        if (!row) return 0;
+        if (row.next_allowed_at <= now) {
+          this.ctx.storage.sql.exec('DELETE FROM host_windows WHERE host = ?', key);
+          return 0;
+        }
+        return row.next_allowed_at;
+      },
+      setNextAllowed: (host, nextAllowedAt) => {
+        const key = host.toLowerCase();
+        const rows = this.ctx.storage.sql
+          .exec<{ next_allowed_at: number }>('SELECT next_allowed_at FROM host_windows WHERE host = ?', key)
+          .toArray();
+        if ((rows[0]?.next_allowed_at ?? 0) >= nextAllowedAt) return;
+        this.ctx.storage.sql.exec(
+          'INSERT OR REPLACE INTO host_windows (host, next_allowed_at) VALUES (?, ?)',
+          key,
+          nextAllowedAt,
+        );
+      },
+      clearAll: () => {
+        this.ctx.storage.sql.exec('DELETE FROM host_windows');
+      },
+    };
+
     this.engine = new AgentHubEngine({
       getSockets: (tag) => this.ctx.getWebSockets(tag) as unknown as HubSocketLike[],
       cooldowns,
+      hostWindows,
     });
     this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.activity = createSqliteActivityStore(this.ctx.storage.sql as unknown as SqlStorageLike);
@@ -708,13 +745,14 @@ export default {
             },
           });
           const via = res.headers.get('x-crawler-via') ?? target;
+          const retryAfter = res.headers.get('retry-after');
           const bodyText = await res.text();
           pendingEvents.push(...buildCrawlActivityEvents({ source, target, via, httpStatus: res.status, replyText: bodyText }));
           await hub()
             .recordHubEvents(pendingEvents)
             .catch(() => undefined);
           span.setAttribute('edgefetch.via', via);
-          return { status: res.status, via, bodyText };
+          return { status: res.status, via, bodyText, ...(retryAfter ? { retryAfter } : {}) };
         },
       );
 
@@ -813,7 +851,12 @@ export default {
       const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest');
       return new Response(out.bodyText, {
         status: out.status,
-        headers: { 'content-type': 'application/json', 'x-crawler-via': out.via, 'cache-control': 'no-store' },
+        headers: {
+          'content-type': 'application/json',
+          'x-crawler-via': out.via,
+          'cache-control': 'no-store',
+          ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+        },
       });
     }
     return Response.json({ error: 'not_found' }, { status: 404 });

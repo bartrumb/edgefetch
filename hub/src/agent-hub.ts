@@ -68,6 +68,48 @@ export interface CooldownStore {
   clearAll(): void;
 }
 
+/**
+ * Persists per-host pacing / `Retry-After` windows (`nextAllowedAt` epoch ms) in Durable Object SQLite so a DO
+ * hibernation wakeup or restart never forgets an origin's active `Retry-After` window.
+ */
+export interface HostWindowStore {
+  getNextAllowed(host: string, now: number): number;
+  setNextAllowed(host: string, nextAllowedAt: number): void;
+  clearAll(): void;
+}
+
+export function createMemoryHostWindowStore(): HostWindowStore {
+  const map = new Map<string, number>();
+  return {
+    getNextAllowed(host, now) {
+      const k = host.toLowerCase();
+      const nextAt = map.get(k);
+      if (nextAt === undefined) return 0;
+      if (nextAt <= now) {
+        map.delete(k);
+        return 0;
+      }
+      return nextAt;
+    },
+    setNextAllowed(host, nextAllowedAt) {
+      const k = host.toLowerCase();
+      const prev = map.get(k) ?? 0;
+      if (nextAllowedAt > prev) {
+        map.delete(k);
+        map.set(k, nextAllowedAt);
+      }
+      while (map.size > MAX_TRACKED_HOSTS) {
+        const oldest = map.keys().next().value;
+        if (oldest === undefined) break;
+        map.delete(oldest);
+      }
+    },
+    clearAll() {
+      map.clear();
+    },
+  };
+}
+
 export function createMemoryCooldownStore(): CooldownStore {
   const map = new Map<string, { host: string; siteId: string; expiresAt: number }>();
   const keyOf = (host: string, siteId: string) => `${host.toLowerCase()}|${siteId.toLowerCase()}`;
@@ -156,6 +198,7 @@ export type AgentDispatchResult =
       error: string;
       message: string;
       retryAfterBudgetExceeded?: boolean;
+      retryAfterSec?: number;
     };
 
 export interface CompleteJobResult {
@@ -266,6 +309,7 @@ export function recomputeSummary(results: CrawlResultItem[]) {
 export interface AgentHubDeps {
   getSockets: (tag?: string) => HubSocketLike[];
   cooldowns: CooldownStore;
+  hostWindows?: HostWindowStore;
   now?: () => number;
   uuid?: () => string;
   sleep?: (ms: number) => Promise<void>;
@@ -274,17 +318,18 @@ export interface AgentHubDeps {
 export class AgentHubEngine {
   private readonly getSockets: (tag?: string) => HubSocketLike[];
   private readonly cooldowns: CooldownStore;
+  private readonly hostWindows: HostWindowStore;
   private readonly now: () => number;
   private readonly uuid: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly pending = new Map<string, PendingJob>();
-  private readonly hostNextAllowed = new Map<string, number>();
   private readonly hostAffinity = new Map<string, { siteId: string; expiresAt: number }>();
   private readonly hostLocks = new Map<string, Promise<void>>();
 
   constructor(deps: AgentHubDeps) {
     this.getSockets = deps.getSockets;
     this.cooldowns = deps.cooldowns;
+    this.hostWindows = deps.hostWindows ?? createMemoryHostWindowStore();
     this.now = deps.now ?? Date.now;
     this.uuid = deps.uuid ?? (() => crypto.randomUUID());
     this.sleep =
@@ -296,16 +341,11 @@ export class AgentHubEngine {
 
   private recordHostPacing(host: string | null, nextAllowedAt: number): void {
     if (!host) return;
-    const prev = this.hostNextAllowed.get(host) ?? 0;
-    if (nextAllowedAt > prev) {
-      this.hostNextAllowed.delete(host);
-      this.hostNextAllowed.set(host, nextAllowedAt);
-    }
-    while (this.hostNextAllowed.size > MAX_TRACKED_HOSTS) {
-      const oldest = this.hostNextAllowed.keys().next().value;
-      if (oldest === undefined) break;
-      this.hostNextAllowed.delete(oldest);
-    }
+    this.hostWindows.setNextAllowed(host, nextAllowedAt);
+  }
+
+  private getHostNextAllowed(host: string, now: number): number {
+    return this.hostWindows.getNextAllowed(host, now);
   }
 
   private setStickyHost(host: string, siteId: string, now: number): void {
@@ -372,7 +412,7 @@ export class AgentHubEngine {
       const now = this.now();
       let maxWaitMs = 0;
       for (const host of hosts) {
-        const nextAt = this.hostNextAllowed.get(host) ?? 0;
+        const nextAt = this.getHostNextAllowed(host, now);
         if (nextAt > now) {
           maxWaitMs = Math.max(maxWaitMs, nextAt - now);
         }
@@ -583,6 +623,7 @@ export class AgentHubEngine {
       this.cooldowns.clearSite(clean);
     } else {
       this.cooldowns.clearAll();
+      this.hostWindows.clearAll();
     }
   }
 
@@ -639,6 +680,7 @@ export class AgentHubEngine {
       let lastError = 'dispatch failed';
       let lastRawSingleBody: string | null = null;
       let retryAfterBudgetExceeded = false;
+      let maxBlockedWaitMs = 0;
       let round = 0;
 
       while (pendingIndices.length > 0 && round < 4) {
@@ -682,13 +724,15 @@ export class AgentHubEngine {
           if (finalResults.every((r) => r === undefined) && triedSites.every((s) => s.size === 0)) {
             // Check whether an origin's Retry-After window exceeds the caller's maxSeconds budget.
             const nowCheck = this.now();
-            const maxHostWait = Math.max(0, ...allCallHosts.map((h) => (this.hostNextAllowed.get(h) ?? 0) - nowCheck));
+            const maxHostWait = Math.max(0, ...allCallHosts.map((h) => this.getHostNextAllowed(h, nowCheck) - nowCheck));
+            const retryAfterSec = maxHostWait > 0 ? Math.max(1, Math.ceil(maxHostWait / 1_000)) : undefined;
             return {
               ok: false,
               status: 429,
               error: 'all_agents_rate_limited',
               message: 'all connected remote sites are currently in 429 cooldown for this host',
               retryAfterBudgetExceeded: nowCheck + maxHostWait > budgetDeadlineAt,
+              ...(retryAfterSec !== undefined ? { retryAfterSec } : {}),
             };
           }
           break;
@@ -698,7 +742,7 @@ export class AgentHubEngine {
         const preDispatchNow = this.now();
         let maxWaitMs = 0;
         for (const host of chosenByHost.keys()) {
-          const nextAt = this.hostNextAllowed.get(host) ?? 0;
+          const nextAt = this.getHostNextAllowed(host, preDispatchNow);
           if (nextAt > preDispatchNow) {
             maxWaitMs = Math.max(maxWaitMs, nextAt - preDispatchNow);
           }
@@ -706,6 +750,7 @@ export class AgentHubEngine {
         if (maxWaitMs > 0) {
           if (preDispatchNow + maxWaitMs > budgetDeadlineAt) {
             retryAfterBudgetExceeded = true;
+            maxBlockedWaitMs = Math.max(maxBlockedWaitMs, maxWaitMs);
             break;
           }
           await this.sleep(maxWaitMs);
@@ -817,6 +862,17 @@ export class AgentHubEngine {
       }
 
       if (finalResults.some((r) => r === undefined)) {
+        if (retryAfterBudgetExceeded && maxBlockedWaitMs > 0) {
+          const retryAfterSec = Math.max(1, Math.ceil(maxBlockedWaitMs / 1_000));
+          return {
+            ok: false,
+            status: 429,
+            error: 'rate_limited',
+            message: `origin Retry-After requires waiting ${retryAfterSec}s (exceeds ${maxSeconds}s request budget)`,
+            retryAfterBudgetExceeded: true,
+            retryAfterSec,
+          };
+        }
         return {
           ok: false,
           status: 502,
@@ -981,7 +1037,13 @@ export async function routeFetchWithFailover(params: {
     if (!out.ok) {
       return Response.json(
         { error: out.error, message: out.message },
-        { status: out.status, headers: { 'cache-control': 'no-store' } },
+        {
+          status: out.status,
+          headers: {
+            'cache-control': 'no-store',
+            ...(out.status === 429 && out.retryAfterSec ? { 'retry-after': String(out.retryAfterSec) } : {}),
+          },
+        },
       );
     }
     return jsonWithVia(out.bodyText, 200, `agent:${out.siteId}`);
@@ -999,7 +1061,13 @@ export async function routeFetchWithFailover(params: {
     if (agentOut.status === 429 && agentOut.retryAfterBudgetExceeded) {
       return Response.json(
         { error: agentOut.error, message: agentOut.message },
-        { status: 429, headers: { 'cache-control': 'no-store' } },
+        {
+          status: 429,
+          headers: {
+            'cache-control': 'no-store',
+            ...(agentOut.retryAfterSec ? { 'retry-after': String(agentOut.retryAfterSec) } : {}),
+          },
+        },
       );
     }
     if (waitForHostWindow) {

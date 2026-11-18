@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   AgentHubEngine,
   DEFAULT_429_NO_HEADER_WAIT_MS,
+  createMemoryHostWindowStore,
   extractPrimaryHost,
   routeFetchWithFailover,
   type CooldownStore,
@@ -235,9 +236,13 @@ test('429 failover waits full Retry-After (uncapped >30s) or 15s default before 
     return ws;
   };
 
+  const cooldowns = memoryCooldowns();
+  const hostWindows = createMemoryHostWindowStore();
+
   engine = new AgentHubEngine({
     getSockets: (tag) => (tag ? sockets.filter((s) => s.tags.includes(tag)) : sockets),
-    cooldowns: memoryCooldowns(),
+    cooldowns,
+    hostWindows,
     now: () => clock,
     sleep: async (ms) => {
       slept.push(ms);
@@ -306,6 +311,55 @@ test('429 failover waits full Retry-After (uncapped >30s) or 15s default before 
   const bodyC = (await resC.json()) as { results: Array<{ status: number; retryAfter: string }> };
   assert.equal(bodyC.results[0]?.status, 429);
   assert.equal(bodyC.results[0]?.retryAfter, '300');
+
+  // Case D: Follow-up calls 10s into that 300s Retry-After window (even after a Hub DO restart!) return 429 + Retry-After: 290
+  // on BOTH unpinned target='auto' AND pinned target='agent' (never 502, never dispatching to idle site-2 or Cloudflare).
+  clock += 10_000;
+  const restartedEngine = new AgentHubEngine({
+    getSockets: (tag) => (tag ? sockets.filter((s) => s.tags.includes(tag)) : sockets),
+    cooldowns,
+    hostWindows,
+    now: () => clock,
+    sleep: async (ms) => {
+      slept.push(ms);
+      clock += ms;
+    },
+  });
+  const ws2SentBefore = ws2.sent.length;
+
+  const pinnedRes = await routeFetchWithFailover({
+    target: 'agent',
+    site: 'site-2',
+    body: JSON.stringify({ maxSeconds: 60, requests: [{ id: '2', url: 'https://throttled-c.example.com/page-2', kind: 'page' }] }),
+    trace: {},
+    now: () => clock,
+    callAgent: (body, trace, site) => restartedEngine.dispatchFetch(body, trace, { preferredSite: site }),
+    waitForHostWindow: (hosts, p, dl) => restartedEngine.waitForHostWindow(hosts, p, dl),
+    callContainer: async () => {
+      cfSneak = true;
+      return Response.json({ results: [{ id: '2', status: 200, outcome: 'ok' }] });
+    },
+  });
+  assert.equal(pinnedRes.status, 429, 'pinned target=agent must return 429 instead of 502 when Retry-After exceeds budget');
+  assert.equal(pinnedRes.headers.get('retry-after'), '290');
+  assert.equal(ws2.sent.length, ws2SentBefore, 'idle peer must not be dispatched during active Retry-After');
+
+  const autoRes = await routeFetchWithFailover({
+    target: 'auto',
+    body: JSON.stringify({ maxSeconds: 60, requests: [{ id: '3', url: 'https://throttled-c.example.com/page-3', kind: 'page' }] }),
+    trace: {},
+    now: () => clock,
+    callAgent: (body, trace, site) => restartedEngine.dispatchFetch(body, trace, { preferredSite: site }),
+    waitForHostWindow: (hosts, p, dl) => restartedEngine.waitForHostWindow(hosts, p, dl),
+    callContainer: async () => {
+      cfSneak = true;
+      return Response.json({ results: [{ id: '3', status: 200, outcome: 'ok' }] });
+    },
+  });
+  assert.equal(autoRes.status, 429);
+  assert.equal(autoRes.headers.get('retry-after'), '290');
+  assert.equal(cfSneak, false);
+  assert.equal(ws2.sent.length, ws2SentBefore);
 });
 
 test('MCP cross-language contract emits respectRobots matching Go FetchCall wire fixture', async () => {

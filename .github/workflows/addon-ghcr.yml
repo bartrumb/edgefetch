@@ -1,0 +1,77 @@
+name: Publish Home Assistant Add-on Images (GHCR)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'edgefetch_agent/**'
+      - 'go.mod'
+      - '.github/workflows/addon-ghcr.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  publish:
+    name: Build & Push ghcr.io/bartrumb/edgefetch-addon-${{ matrix.ha_arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            ha_arch: amd64
+          - platform: linux/arm64
+            ha_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract Add-on Version from edgefetch_agent/config.yaml
+        id: meta
+        run: |
+          ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_agent/config.yaml)
+          if [ -z "$ver" ]; then
+            echo "Failed to read version from edgefetch_agent/config.yaml"
+            exit 1
+          fi
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${owner}/edgefetch-addon-${{ matrix.ha_arch }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push distroless image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: edgefetch_agent/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            io.hass.version=${{ steps.meta.outputs.version }}
+            io.hass.type=addon
+            io.hass.arch=${{ matrix.ha_arch }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Generate SLSA build provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

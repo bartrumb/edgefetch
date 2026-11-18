@@ -1,0 +1,9 @@
+# Keep LF line endings across container builds, shell scripts, YAML manifests, and AppArmor profiles
+# so cross-platform checkouts on Windows/WSL/Linux build reproducibly without CRLF parser failures.
+* text=auto eol=lf
+*.go text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
+apparmor.txt text eol=lf

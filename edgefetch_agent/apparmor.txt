@@ -1,0 +1,45 @@
+#include <tunables/global>
+
+profile edgefetch_agent flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/ssl_certs>
+
+  # Only outbound TCP/UDP (DNS + HTTPS/WSS); explicitly deny raw/packet sockets.
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  deny network raw,
+  deny network packet,
+
+  # Needed once at startup before permanent privilege drop (`internal/priv/priv_linux.go`)
+  capability setuid,
+  capability setgid,
+
+  # Explicitly deny dangerous container-escape capabilities and kernel interfaces
+  deny capability sys_admin,
+  deny capability sys_ptrace,
+  deny capability sys_module,
+  deny capability sys_rawio,
+  deny capability net_admin,
+  deny mount,
+  deny remount,
+  deny umount,
+  deny ptrace,
+
+  # Binary & read-only config access
+  /edgefetch ixr,
+  /data/ r,
+  /data/options.json r,
+  /etc/ssl/certs/** r,
+  /usr/share/zoneinfo/** r,
+  /proc/sys/net/core/somaxconn r,
+  /sys/fs/cgroup/** r,
+
+  # Block sensitive kernel / hardware paths
+  deny /proc/kcore rwklx,
+  deny /proc/kmem rwklx,
+  deny /proc/mem rwklx,
+  deny /sys/firmware/** rwklx,
+}

@@ -1,0 +1,29 @@
+name = "edgefetch-hub"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+workers_dev = true
+preview_urls = false
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+
+[[durable_objects.bindings]]
+name = "AGENT_HUB"
+class_name = "AgentHubDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentHubDO"]
+
+# Configure separate least-privilege secrets via Wrangler (never commit values):
+#   npx wrangler secret put CALLER_TOKEN   # >= 24 random chars (used by upstream callers on POST /fetch & GET /agents)
+#   npx wrangler secret put AGENT_TOKENS   # JSON map {"site-1":"<24+ random chars>","site-2":"..."} for outbound agents

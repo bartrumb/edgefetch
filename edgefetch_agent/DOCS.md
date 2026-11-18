@@ -1,0 +1,24 @@
+# EdgeFetch Cold-Standby Worker (Home Assistant OS Add-on)
+
+An **outbound-only, zero-dependency Go HTTP/2 fetcher** that connects to your Cloudflare Hibernating WebSocket Durable Object (`AgentHubDO`).
+
+## Security Highlights
+
+- **Zero Inbound Ports & Zero Proxy Surface:** Nothing listens on TCP/UDP. The worker dials outbound `wss://` (TLS 1.2/1.3) to your Cloudflare Worker hub and only executes signed jobs issued over that authenticated socket.
+- **Least-Privilege Authentication:** Uses a dedicated `agent_token` (`AGENT_TOKENS` / `AGENT_TOKEN`), never your caller API token.
+- **Irreversible Root Drop + AppArmor Confinement:** Reads Home Assistant Supervisor's `0600 root:root` `/data/options.json` into memory, scrubs the buffer, sets `PR_SET_NO_NEW_PRIVS`, clears supplementary groups, and drops all OS threads to UID/GID `65532:65532` inside a shell-free ~9 MB `distroless` container confined by a custom AppArmor profile (`deny network raw`, `deny mount`, `deny ptrace`).
+- **Kernel-Level LAN & IPv6-Transition SSRF Guard:** `net.Dialer.Control` (`RejectNonPublicPeer`) inspects the resolved peer IP right before `connect()`, blocking loopback (`127.0.0.0/8`, `::1`), RFC 1918 LANs (`10/8`, `172.16/12` including Home Assistant's `172.30.32.0/23` internal bridge, `192.168/16`), Tailscale/CGNAT (`100.64/10`), cloud metadata (`169.254/16`), and NAT64/6to4/Teredo IPv6 transition prefixes (`64:ff9b::/96`, `2002::/16`, `2001::/32`).
+
+## 1-Click Installation in Home Assistant
+
+1. Go to **Settings -> Add-ons -> Add-on Store -> ⋮ (top right) -> Repositories**.
+2. Add `https://github.com/bartrumb/edgefetch`.
+3. Click **EdgeFetch Cold-Standby Worker -> Install**.
+4. Open **Configuration** and fill in:
+   - `hub_url`: Your Cloudflare Worker URL (e.g., `https://your-edgefetch-hub.workers.dev`)
+   - `agent_token`: Your per-site secret token (`>= 24` random characters)
+   - `site_id`: Unique slug per server (`site-1`, `site-arm64`, `site-x86`)
+   - `user_agent`: Honest bot identifier for your application
+   - `pause_ms` (`3000`) & `pause_jitter_ms` (`1500`): Polite `3.0–4.5 s` randomized pacing
+   - `allowed_hosts`: Optional domain allowlist (leave empty to allow any public HTTPS host)
+5. Enable **Start on boot** and **Watchdog**, then click **Start**.

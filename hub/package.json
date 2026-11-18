@@ -1,0 +1,13 @@
+{
+  "name": "edgefetch-hub",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy:dry": "wrangler deploy --dry-run -c wrangler.toml",
+    "deploy": "wrangler deploy -c wrangler.toml"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20261001.0",
+    "wrangler": "^4.45.0"
+  }
+}

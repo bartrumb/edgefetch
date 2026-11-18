@@ -1,0 +1,11 @@
+# Compiled binaries & test artifacts
+/edgefetch
+/edgefetch.exe
+*.out
+coverage.html
+
+# Node / Wrangler local state for companion hub/
+node_modules/
+.wrangler/
+.dev.vars
+dist/

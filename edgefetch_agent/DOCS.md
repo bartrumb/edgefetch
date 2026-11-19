@@ -1,6 +1,8 @@
-# EdgeFetch Cold-Standby Worker (Home Assistant OS Add-on)
+# EdgeFetch Cold-Standby Worker — Lite (`edgefetch_agent`)
 
 An **outbound-only Go HTTP/2 fetcher** (one Go dependency, with no transitive dependencies) that connects to your Cloudflare Hibernating WebSocket Durable Object (`AgentHubDO`).
+
+> Need Headless Chromium JS rendering (`browser-v1` / `interact`) or Poppler layout PDF extraction (`pdf-v1`)? Install the sibling **EdgeFetch Fat Worker (`edgefetch_fat`)** add-on from this same repository!
 
 ## Security Highlights
 

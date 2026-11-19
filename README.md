@@ -14,9 +14,9 @@
   </a>
 </p>
 
-**EdgeFetch** is a security-hardened **Go HTTP/2 fetcher** and **outbound-only distributed standby worker** (one Go dependency, with no transitive dependencies) paired with a **Cloudflare Hibernating WebSocket Durable Object** coordinator (`hub/` — complete with a built-in `/admin` Control Center and self-hosted OAuth 2.1 `/mcp` server) and a **1-click Home Assistant OS Add-on**.
+**EdgeFetch** is a self-hosted **scrape, map, crawl, extract, interact, and search** platform for AI agents — running on **your Cloudflare account** (`hub/`) and **your own outbound-only hardware** (`edgefetch_agent` ~9 MB distroless Lite or `edgefetch_fat` Headless Chromium + Poppler PDF on Home Assistant OS / Docker, `amd64` & `aarch64`).
 
-It solves a practical distributed-systems problem: keeping scheduled public feed/document syncs resilient across primary cloud containers (`--mode=server`) and geo-distributed standby hardware (`--mode=agent`) **without** opening inbound router ports, running forward HTTP/SOCKS proxies, or installing VPN/tunnel daemons.
+Unlike self-hosted Firecrawl (which requires Redis, PostgreSQL, RabbitMQ, and a separate Playwright cluster under AGPL-3.0), EdgeFetch is **MIT-licensed**, uses a **single Go dependency (`coder/websocket`, zero transitive dependencies)**, opens **zero inbound router ports**, and idles near **$0/month** on Cloudflare Hibernating WebSocket Durable Objects — scaling up seamlessly with optional **R2 content-addressed artifacts**, **D1 crawl tracking**, and **D1 FTS5 full-text search**.
 
 <p align="center">
   <img src="docs/assets/admin-console.jpg" alt="EdgeFetch Built-in /admin Web Control Center — Live Crawl Log, Multi-Arch Fleet, Interactive Waterfall Tester, 429 Cooldowns & OAuth 2.1 MCP Grants" width="900">
@@ -30,7 +30,15 @@ It solves a practical distributed-systems problem: keeping scheduled public feed
 - **Strict Hub / Edge Security Split (~$0 Idle Cloud Cost):**
   - **Edge Nodes (`amd64` / `aarch64`)** host **zero** inbound HTTP, `/admin`, or `/mcp` endpoints. They dial outbound `wss://` to `/agent/ws`, where Cloudflare's `WebSocketRequestResponsePair("ping", "pong")` answers 30-second keepalives at the edge **without waking the Durable Object from hibernation**.
   - **Cloudflare Hub (`hub/`)** is the sole public control plane — hosting `POST /fetch`, `GET /agents`, the `/admin` Web Control Center, and the OAuth 2.1 `/mcp` server for Claude Code.
-- **Split Control / Data Plane for Asymmetric Links:** Small JSON dispatch commands arrive over the hibernated WebSocket (`< 1 MiB` UTF-8 verified before send), while `0.4–16 MiB` HTML/JSON responses (`16 MiB` default per-batch body budget, lossless `bodyEncoding: "utf-8" | "base64"`) stream back via `gzip`-compressed HTTP/2 `POST /agent/reply` (`45 s` normal upload budget, `10 s` shutdown-drain cap so completed results are never lost on `SIGTERM`).
+- **Two Home Assistant OS Add-on Variants (Same Static Go Binary):**
+  - **`edgefetch_agent` (`LITE`, ~9 MB distroless):** Ultra-lean HTTP/2 + `llms.txt` / companion `.md` + HTML-to-Markdown + pure-Go PDF fallback.
+  - **`edgefetch_fat` (`FAT`, Alpine + Chromium + Poppler `pdftotext`):** Adds `browser-v1` (CDP JS rendering for SPAs + stateful multi-turn `interact` sessions forced through an in-process loopback `SSRFProxy` `CONNECT` tunnel) and `pdf-v1` (layout-preserving `pdftotext` over `stdin`/`stdout`).
+- **Three-Layer Optional Storage (`ARTIFACTS` R2 + `META` D1 + `SEARCH` D1 FTS5):**
+  - Agents stream gzipped page bodies directly to R2 (`PUT /agent/artifacts/<blobSha256>`) with `If-None-Match: *` deduplication so large batches (`40+ MiB`) never pass through `AgentHubDO` memory.
+  - `IngestWorkflow` verifies `SHA-256(uncompressed)` with a hard `16 MiB` decompression-bomb cap before setting `verified_at`, derives versioned GFM Markdown (`derived/1/markdown/<contentSha256>`), and indexes ~1,500-char chunks into `SEARCH` D1 FTS5.
+- **Full v2 REST, MCP & Drop-In Firecrawl / Tavily Compatibility:**
+  - Native endpoints: `POST /v1/scrape` (`llms.txt`, JSON-LD/schema, branding, `changes` diff, `maxAgeMs` verified cache), `POST /v1/extract`, `POST /v1/map`, `POST|GET|DELETE /v1/crawl/:id` (with HMAC-SHA256 signed webhooks), `POST /v1/search` (Brave Search API + SearXNG JSON + private D1 FTS5 fused via Reciprocal Rank Fusion), `POST /v1/interact`, `GET /v1/artifacts/:sha`, and `GET /v1/capabilities`.
+  - Drop-in compatibility routes: `/compat/firecrawl/v2/*` and `/compat/tavily/*`, plus a zero-dependency TypeScript client ([`sdk/ts/edgefetch-client.ts`](sdk/ts/edgefetch-client.ts)) and streamlined 8-tool OAuth 2.1 `/mcp` server (`list_agents`, `scrape`, `extract`, `map`, `crawl`, `search`, `interact`, `read_artifact`).
 - **Defense-in-Depth Security ([SECURITY.md](SECURITY.md)):**
   - Dial-time `net.Dialer.Control` SSRF guard (`RejectNonPublicPeer` backed by `net/netip`) inspects the exact resolved IP right before `connect()` — eliminating DNS-rebinding TOCTOU races, restricting IPv6 strictly to `2000::/3` global unicast, and blocking `0.0.0.0/8`, RFC 1918 LANs (including Home Assistant's `172.30.32.0/23` bridge), loopback, Tailscale/CGNAT (`100.64.0.0/10`), cloud metadata (`169.254.169.254`), 6to4 relay (`192.88.99.0/24`), site-local (`fec0::/10`), ORCHID/ORCHIDv2 (`2001:10::/28`, `2001:20::/28`), documentation (`2001:db8::/32`, `3fff::/20`), SRv6 (`5f00::/16`), and IPv6-embedded IPv4 transition prefixes (`::/96`, `0:0:0:0:ffff:0::/96`, `64:ff9b::/96` NAT64, `2002::/16` 6to4, `2001::/32` Teredo).
   - Irreversible Linux privilege drop (`PR_SET_NO_NEW_PRIVS` -> `Setgroups([])` -> `Setgid(65532)` -> `Setuid(65532)` via `AllThreadsSyscall6`) inside a **~9 MB shell-free `distroless`** image built reproducibly from the checked-out commit and confined by a custom Home Assistant AppArmor profile.
@@ -64,11 +72,15 @@ flowchart TD
 | [`internal/politeness`](internal/politeness/politeness.go) | Context-cancellable `chan struct{}` per-host locks, `robots.txt` cache, 3-state circuit breaker, `RejectNonPublicPeer` SSRF hook |
 | [`internal/classify`](internal/classify/classify.go) | Defined string enums (`Kind`, `Outcome`) and panic-free JSON/HTML response classification |
 | [`internal/crawl`](internal/crawl/crawl.go) | Bounded worker pool, positive dwell jitter (`PauseJitterMs`), `httptrace` phase timing, `io.LimitReader(max+1)`, `/fetch` handler |
+| [`internal/extract`](internal/extract/extract.go) | Pure-stdlib HTML -> GFM Markdown, main-content filter, branding, BM25 reranker, `llms.txt` + `.md` matcher, Poppler/pure-Go PDF |
+| [`internal/browser`](internal/browser/renderer.go) | Loopback `SSRFProxy` (`CONNECT` + `MAP * ~NOTFOUND`), CDP client over `internal/ws`, SPA `renderMode: "auto"`, stateful `interact` |
 | [`internal/ws`](internal/ws/client.go) | Hardened `coder/websocket` client (`http/1.1` ALPN, classic ECDHE TLS curves, no redirect token leakage, 1 MiB ceiling) |
-| [`internal/priv`](internal/priv/priv_linux.go) | Linux `prctl(PR_SET_NO_NEW_PRIVS)` + `AllThreadsSyscall` irreversible root drop (`65532:65532`) |
-| [`internal/agent`](internal/agent/agent.go) | `/data/options.json` + env loader, jittered reconnect supervisor, `agent_hello` OTel telemetry, gzipped reply uploader |
-| [`edgefetch_agent/`](edgefetch_agent/config.yaml) | Multi-arch (`amd64` + `aarch64`) Home Assistant OS Add-on manifest, `apparmor.txt`, and `distroless` Dockerfile |
-| [`hub/`](hub/src/index.ts) | Cloudflare Hub Worker + `AgentHubDO` SQLite coordinator + `/admin` Web UI + Self-Hosted OAuth 2.1 `/mcp` server |
+| [`internal/priv`](internal/priv/priv_linux.go) | Linux `prctl(PR_SET_NO_NEW_PRIVS)` + `AllThreadsSyscall6` irreversible root drop (`65532:65532`) |
+| [`internal/agent`](internal/agent/agent.go) | `/data/options.json` + env loader, jittered reconnect supervisor, streaming R2 `PUT /agent/artifacts` sink, gzipped reply uploader |
+| [`edgefetch_agent/`](edgefetch_agent/config.yaml) | **Lite** Home Assistant OS Add-on (`amd64` + `aarch64`, ~9 MB `distroless`, `apparmor.txt`) |
+| [`edgefetch_fat/`](edgefetch_fat/config.yaml) | **Fat** Home Assistant OS Add-on (`amd64` + `aarch64`, Alpine 3.21 + Headless Chromium + Poppler `pdftotext`, `apparmor.txt`) |
+| [`sdk/ts/`](sdk/ts/edgefetch-client.ts) | Zero-dependency TypeScript client SDK (`EdgeFetchClient`) for Workers, Node.js, Deno, Bun, and browsers |
+| [`hub/`](hub/src/index.ts) | Cloudflare Hub Worker + `AgentHubDO` + `IngestWorkflow`/`CrawlWorkflow` + `/admin` UI + 8-tool OAuth 2.1 `/mcp` + Firecrawl/Tavily compat |
 
 - Operations, C&C protocol, tuning, `/admin`, & Claude Code MCP guide: **[docs/USAGE.md](docs/USAGE.md)**
 - Deep-dive systems & Go concurrency walkthrough: **[docs/INTERNALS.md](docs/INTERNALS.md)**
@@ -112,7 +124,7 @@ npx wrangler secret put AGENT_TOKENS -c wrangler.toml
 [![Open your Home Assistant instance and show the add app repository dialog with EdgeFetch pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch)
 
 1. Click **Add Repository to My Home Assistant** above (or manually open **Settings -> Add-ons -> Add-on Store -> `⋮` -> Repositories** and add `https://github.com/bartrumb/edgefetch`).
-2. Install **EdgeFetch Cold-Standby Worker**, open **Configuration**, set `hub_url`, `agent_token`, `site_id`, and `user_agent`, and click **Start**.
+2. Install **EdgeFetch Cold-Standby Worker (Lite)** (~9 MB distroless) or **EdgeFetch Fat Worker (Browser + PDF)** (Headless Chromium + Poppler PDF), open **Configuration**, set `hub_url`, `agent_token`, `site_id`, and `user_agent`, and click **Start**.
 
 ### 3. Drive, Monitor & Tune After Setup (Full Reference in [`docs/USAGE.md`](docs/USAGE.md))
 
@@ -121,7 +133,7 @@ npx wrangler secret put AGENT_TOKENS -c wrangler.toml
   ```bash
   claude mcp add --transport http edgefetch https://<your-hub>.workers.dev/mcp
   ```
-  Claude Code auto-discovers RFC 9728 / RFC 8414 metadata, dynamically registers (`POST /oauth/register`), and opens `/oauth/authorize` in your browser to grant `list_agents`, `fetch_url`, and `fetch_batch` tools — zero external IdP, zero separate KV namespace, and zero raw tokens stored in config files.
+  Claude Code auto-discovers RFC 9728 / RFC 8414 metadata, dynamically registers (`POST /oauth/register`), and opens `/oauth/authorize` in your browser to grant the 8-tool v2 surface (`list_agents`, `scrape`, `extract`, `map`, `crawl`, `search`, `interact`, `read_artifact`) — zero external IdP, zero separate KV namespace, and zero raw tokens stored in config files.
 - **Trigger Polite Crawls via REST (`POST /fetch`):**
   ```bash
   curl -X POST "https://<your-hub>.workers.dev/fetch?site=site-1" \

@@ -3,12 +3,15 @@
 # (or EDGEFETCH_ALLOW_UNAUTHENTICATED=1) is explicitly set inside an isolated VPC / Cloudflare Container bridge.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETARCH
+ARG BUILD_VERSION=2.0.0
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download && go mod verify
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -trimpath -ldflags="-s -w" -o /out/edgefetch ./cmd/edgefetch
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -trimpath \
+      -ldflags="-s -w -X github.com/bartrumb/edgefetch/internal/agent.Version=${BUILD_VERSION}" \
+      -o /out/edgefetch ./cmd/edgefetch
 
 FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \

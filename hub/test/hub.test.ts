@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { EdgeFetchClient, EdgeFetchError } from '../../sdk/ts/edgefetch-client.ts';
 import { ACTIVITY_SQLITE_SCHEMA, buildCrawlActivityEvents, createSqliteActivityStore } from '../src/activity-log.ts';
 import { handleAdminRoute } from '../src/admin.ts';
 import {
@@ -964,4 +965,33 @@ test('S1: R2 object layout keys, half-retention dedupe refresh, and FTS5 Unicode
   assert.equal(sanitizeFtsQuery('agents" OR NEAR( (drop) café'), '"agents" OR "or"'.includes('or') ? sanitizeFtsQuery('agents" OR NEAR( (drop) café') : '');
   assert.equal(sanitizeFtsQuery('agents" OR NEAR( café'), '"agents" OR "OR" OR "NEAR" OR "café"');
   assert.equal(sanitizeFtsQuery('!!! ???'), '');
+});
+
+test('V2-3: EdgeFetchClient TypeScript SDK formats requests and surfaces typed EdgeFetchError', async () => {
+  const seen: Array<{ method: string; url: string; auth: string }> = [];
+  const client = new EdgeFetchClient({
+    baseUrl: 'https://hub.example.com/',
+    token: 'caller-token-0123456789abcdef',
+    fetchFn: async (input, init) => {
+      const hdrs = new Headers(init?.headers);
+      seen.push({ method: init?.method ?? 'GET', url: String(input), auth: hdrs.get('authorization') ?? '' });
+      if (String(input).endsWith('/v1/interact')) {
+        return Response.json({ error: 'fat_agent_required', message: 'Deploy edgefetch_fat' }, { status: 503 });
+      }
+      return Response.json({ ok: true, markdown: '# Hello SDK' }, { status: 200 });
+    },
+  });
+
+  const scrapeOut = await client.scrape({ url: 'https://docs.example.com/', formats: ['markdown'] });
+  assert.equal(scrapeOut.markdown, '# Hello SDK');
+  assert.deepEqual(seen[0], {
+    method: 'POST',
+    url: 'https://hub.example.com/v1/scrape',
+    auth: 'Bearer caller-token-0123456789abcdef',
+  });
+
+  await assert.rejects(
+    () => client.interact({ url: 'https://docs.example.com/' }),
+    (err: unknown) => err instanceof EdgeFetchError && err.status === 503 && err.code === 'fat_agent_required',
+  );
 });

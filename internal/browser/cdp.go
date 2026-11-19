@@ -50,6 +50,29 @@ type cdpConn struct {
 	nextSub int
 	closed  bool
 	closeCh chan struct{}
+
+	crashMu  sync.Mutex
+	crashMsg string
+}
+
+func (c *cdpConn) setCrashReason(line string) {
+	c.crashMu.Lock()
+	c.crashMsg = startupReason(c.crashMsg, line)
+	c.crashMu.Unlock()
+}
+
+func (c *cdpConn) crashError(suffix string) error {
+	c.crashMu.Lock()
+	msg := c.crashMsg
+	c.crashMu.Unlock()
+	base := "cdp connection closed"
+	if suffix != "" {
+		base += " " + suffix
+	}
+	if msg != "" {
+		base += ": " + msg
+	}
+	return errors.New(base)
 }
 
 func dialCDP(ctx context.Context, wsURL string) (*cdpConn, error) {
@@ -135,7 +158,7 @@ func (c *cdpConn) call(ctx context.Context, sessionID, method string, params any
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return errors.New("cdp connection closed")
+		return c.crashError("")
 	}
 	c.pending[id] = replyCh
 	c.mu.Unlock()
@@ -163,7 +186,7 @@ func (c *cdpConn) call(ctx context.Context, sessionID, method string, params any
 	select {
 	case env, ok := <-replyCh:
 		if !ok {
-			return errors.New("cdp connection closed while awaiting " + method)
+			return c.crashError("while awaiting " + method)
 		}
 		if env.Error != nil {
 			return fmt.Errorf("cdp %s error %d: %s", method, env.Error.Code, env.Error.Message)

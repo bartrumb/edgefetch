@@ -14,7 +14,7 @@
   </a>
 </p>
 
-**EdgeFetch** is a self-hosted **scrape, map, crawl, extract, interact, and search** platform for AI agents — running on **your Cloudflare account** (`hub/`) and **your own outbound-only hardware** (`edgefetch_agent` ~9 MB distroless Lite or `edgefetch_fat` Headless Chromium + Poppler PDF on Home Assistant OS / Docker, `amd64` & `aarch64`).
+**EdgeFetch** is a self-hosted **scrape, map, crawl, extract, interact, and search** platform for AI agents — running on **your Cloudflare account** (`hub/`) and **your own outbound-only hardware** (unified Home Assistant OS add-on / Docker worker with HTTP/2, on-demand Headless Chromium, and streaming Poppler PDF on `amd64` & `aarch64`).
 
 Unlike self-hosted Firecrawl (which requires Redis, PostgreSQL, RabbitMQ, and a separate Playwright cluster under AGPL-3.0), EdgeFetch is **MIT-licensed**, uses a **single Go dependency (`coder/websocket`, zero transitive dependencies)**, opens **zero inbound router ports**, and idles near **$0/month** on Cloudflare Hibernating WebSocket Durable Objects — scaling up seamlessly with optional **R2 content-addressed artifacts**, **D1 crawl tracking**, and **D1 FTS5 full-text search**.
 
@@ -30,9 +30,8 @@ Unlike self-hosted Firecrawl (which requires Redis, PostgreSQL, RabbitMQ, and a 
 - **Strict Hub / Edge Security Split (~$0 Idle Cloud Cost):**
   - **Edge Nodes (`amd64` / `aarch64`)** host **zero** inbound HTTP, `/admin`, or `/mcp` endpoints. They dial outbound `wss://` to `/agent/ws`, where Cloudflare's `WebSocketRequestResponsePair("ping", "pong")` answers 30-second keepalives at the edge **without waking the Durable Object from hibernation**.
   - **Cloudflare Hub (`hub/`)** is the sole public control plane — hosting `POST /fetch`, `GET /agents`, the `/admin` Web Control Center, and the OAuth 2.1 `/mcp` server for Claude Code.
-- **Two Home Assistant OS Add-on Variants (Same Static Go Binary):**
-  - **`edgefetch_agent` (`LITE`, ~9 MB distroless):** Ultra-lean HTTP/2 + `llms.txt` / companion `.md` + HTML-to-Markdown + pure-Go PDF fallback.
-  - **`edgefetch_fat` (`FAT`, Alpine + Chromium + Poppler `pdftotext`):** Adds `browser-v1` (CDP JS rendering for SPAs + stateful multi-turn `interact` sessions forced through an in-process loopback `SSRFProxy` `CONNECT` tunnel) and `pdf-v1` (layout-preserving `pdftotext` over `stdin`/`stdout`).
+- **Unified Home Assistant OS Add-on (On-Demand Browser, ~15 MB Idle RAM):**
+  - Combines ultra-lean Go HTTP/2 + `llms.txt` / companion `.md` + HTML-to-Markdown with `browser-v1` (CDP JS rendering for SPAs + stateful multi-turn `interact` sessions forced through an in-process loopback `SSRFProxy` `CONNECT` tunnel, automatically reaping Chromium after 3 minutes idle) and `pdf-v1` (streaming `pdftotext -layout` up to `256 MiB`).
 - **Three-Layer Optional Storage (`ARTIFACTS` R2 + `META` D1 + `SEARCH` D1 FTS5):**
   - Agents stream gzipped page bodies directly to R2 (`PUT /agent/artifacts/<blobSha256>`) with `If-None-Match: *` deduplication so large batches (`40+ MiB`) never pass through `AgentHubDO` memory.
   - `IngestWorkflow` verifies `SHA-256(uncompressed)` with a hard `16 MiB` decompression-bomb cap before setting `verified_at`, derives versioned GFM Markdown (`derived/1/markdown/<contentSha256>`), and indexes ~1,500-char chunks into `SEARCH` D1 FTS5.
@@ -77,8 +76,7 @@ flowchart TD
 | [`internal/ws`](internal/ws/client.go) | Hardened `coder/websocket` client (`http/1.1` ALPN, classic ECDHE TLS curves, no redirect token leakage, 1 MiB ceiling) |
 | [`internal/priv`](internal/priv/priv_linux.go) | Linux `prctl(PR_SET_NO_NEW_PRIVS)` + `AllThreadsSyscall6` irreversible root drop (`65532:65532`) |
 | [`internal/agent`](internal/agent/agent.go) | `/data/options.json` + env loader, jittered reconnect supervisor, streaming R2 `PUT /agent/artifacts` sink, gzipped reply uploader |
-| [`edgefetch_agent/`](edgefetch_agent/config.yaml) | **Lite** Home Assistant OS Add-on (`amd64` + `aarch64`, ~9 MB `distroless`, `apparmor.txt`) |
-| [`edgefetch_fat/`](edgefetch_fat/config.yaml) | **Fat** Home Assistant OS Add-on (`amd64` + `aarch64`, Alpine 3.21 + Headless Chromium + Poppler `pdftotext`, `apparmor.txt`) |
+| [`edgefetch_fat/`](edgefetch_fat/config.yaml) | Home Assistant OS Add-on (`amd64` + `aarch64`, Alpine 3.21 + on-demand Headless Chromium + Poppler `pdftotext`, `apparmor.txt`) |
 | [`sdk/ts/`](sdk/ts/edgefetch-client.ts) | Zero-dependency TypeScript client SDK (`EdgeFetchClient`) for Workers, Node.js, Deno, Bun, and browsers |
 | [`hub/`](hub/src/index.ts) | Cloudflare Hub Worker + `AgentHubDO` + `IngestWorkflow`/`CrawlWorkflow` + `/admin` UI + 8-tool OAuth 2.1 `/mcp` + Firecrawl/Tavily compat |
 

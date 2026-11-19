@@ -1163,7 +1163,7 @@ export async function executeInteractCall(params: {
     };
   }
 
-  const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(fetchRes.via);
+  const siteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
   const actualSite = siteMatch?.[1] ?? pinnedSite;
   const returnedAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
   const publicSessionId = returnedAgentSid && actualSite ? `${actualSite}.${returnedAgentSid}` : returnedAgentSid;

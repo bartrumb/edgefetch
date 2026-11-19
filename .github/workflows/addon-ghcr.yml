@@ -6,7 +6,6 @@ on:
     paths:
       - 'cmd/**'
       - 'internal/**'
-      - 'edgefetch_agent/**'
       - 'edgefetch_fat/**'
       - 'go.mod'
       - 'go.sum'
@@ -27,16 +26,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - addon_dir: edgefetch_agent
-            image_prefix: edgefetch-addon
-            platform: linux/amd64
-            ha_arch: amd64
-            runner: ubuntu-latest
-          - addon_dir: edgefetch_agent
-            image_prefix: edgefetch-addon
-            platform: linux/arm64
-            ha_arch: aarch64
-            runner: ubuntu-24.04-arm
           - addon_dir: edgefetch_fat
             image_prefix: edgefetch-fat-addon
             platform: linux/amd64

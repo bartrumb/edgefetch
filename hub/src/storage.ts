@@ -133,12 +133,28 @@ export interface HubCapabilities {
     search: boolean;
     webSearch: boolean;
   };
+  searchProviders: string[];
 }
 
 export function buildCapabilities(
-  env: OptionalStorageBindings & { BRAVE_API_KEY?: string; SEARXNG_URL?: string },
+  env: OptionalStorageBindings & {
+    SERPER_API_KEY?: string;
+    BRAVE_API_KEY?: string;
+    TAVILY_API_KEY?: string;
+    SEARXNG_URL?: string;
+  },
   version = '2.0.0',
 ): HubCapabilities {
+  const searchProviders: string[] = ['edge-map'];
+  if (env.SEARCH) searchProviders.push('d1-fts5');
+  if (env.SERPER_API_KEY?.trim()) searchProviders.push('serper');
+  if (env.BRAVE_API_KEY?.trim()) searchProviders.push('brave');
+  if (env.TAVILY_API_KEY?.trim()) searchProviders.push('tavily');
+  if (env.SEARXNG_URL?.trim()) searchProviders.push('searxng');
+
+  const hasWebProvider = Boolean(
+    env.SERPER_API_KEY?.trim() || env.BRAVE_API_KEY?.trim() || env.TAVILY_API_KEY?.trim() || env.SEARXNG_URL?.trim(),
+  );
   return {
     version,
     capabilities: {
@@ -153,9 +169,10 @@ export function buildCapabilities(
       artifacts: Boolean(env.ARTIFACTS),
       tracking: Boolean(env.META),
       ingestWorkflow: Boolean(env.INGEST),
-      search: Boolean(env.SEARCH || env.BRAVE_API_KEY || env.SEARXNG_URL),
-      webSearch: Boolean(env.BRAVE_API_KEY || env.SEARXNG_URL),
+      search: Boolean(env.SEARCH || hasWebProvider),
+      webSearch: hasWebProvider,
     },
+    searchProviders,
   };
 }
 

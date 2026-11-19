@@ -787,7 +787,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.0.3',
+          serverVersion: '2.0.4',
           ownerSecret: env.CALLER_TOKEN,
           oauthStore,
           activity,
@@ -960,7 +960,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.0.3'), {
+        return Response.json(buildCapabilities(env, '2.0.4'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });

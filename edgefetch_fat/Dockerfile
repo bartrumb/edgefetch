@@ -3,7 +3,7 @@
 # Every Chromium subresource socket is forced through EdgeFetch's in-process loopback `SSRFProxy` (`MAP * ~NOTFOUND`).
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.0.1
+ARG BUILD_VERSION=2.0.2
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify

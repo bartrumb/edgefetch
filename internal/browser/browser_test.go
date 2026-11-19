@@ -206,3 +206,21 @@ func TestRendererExecuteInteractAndChallengeStopOverCDP(t *testing.T) {
 		t.Fatalf("expected ErrChallengeDetected on anti-bot challenge DOM, got: %v", chErr)
 	}
 }
+
+func TestStartupReasonKeepsTheFatalLine(t *testing.T) {
+	reason := ""
+	for _, line := range []string{
+		"[8:26:1119/061255.270716:ERROR:dbus/bus.cc:408] Failed to connect to the bus",
+		"[8:25:1119/061428.993984:FATAL:components/bookmarks/browser/titled_url_index.cc:176] failed to create a normalizer: U_FILE_ACCESS_ERROR",
+		"Aborted (core dumped)",
+		"",
+	} {
+		reason = startupReason(reason, line)
+	}
+	if !strings.Contains(reason, "U_FILE_ACCESS_ERROR") {
+		t.Fatalf("reason = %q, want the FATAL line", reason)
+	}
+	if got := startupReason("", "only line"); got != "only line" {
+		t.Fatalf("reason = %q", got)
+	}
+}

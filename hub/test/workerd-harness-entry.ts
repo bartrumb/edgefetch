@@ -1,6 +1,7 @@
 import prodWorker, { AgentHubDO as ProdAgentHubDO, IngestWorkflow } from '../src/index.ts';
 import { executeIngestPipeline, isContentVerifiedInMetaD1, pruneExpiredFetchHistory, writeJobManifestToR2 } from '../src/ingest.ts';
 import { deriveMarkdownDocument } from '../src/scrape.ts';
+import { D1FtsSearchIndex } from '../src/search-index.ts';
 import { r2ArtifactKey, sanitizeFtsQuery, type OptionalStorageBindings } from '../src/storage.ts';
 
 export { IngestWorkflow };
@@ -253,6 +254,22 @@ export default {
         contentSha256: expiredContentSha,
       });
 
+      // S7: Verify 9 GB capacity ceiling halts new FTS5 indexing cleanly with `search_capacity_reached`!
+      const cappedIdx = new D1FtsSearchIndex(env.SEARCH as D1Database, {
+        warnBytes: 512,
+        maxBytes: 1024,
+        initialSizeBytes: 2048,
+      });
+      const capStop = await cappedIdx.replacePageChunks({
+        collectionId: 'capped',
+        documentId: 'd_cap',
+        pageId: 'p_cap',
+        url: 'https://example.com/cap',
+        title: 'Cap',
+        markdown: 'Blocked by 9 GB ceiling',
+        fetchedAt: Date.now(),
+      });
+
       return Response.json({
         verifiedCount: pipelineOut.verifiedCount,
         rejectedCount: pipelineOut.rejectedCount,
@@ -271,6 +288,7 @@ export default {
         derivedPipelineVersion: derivedDocRow?.pipeline_version ?? 0,
         derivedR2Text,
         unverifiedDeriveStatus: unverifiedDeriveAttempt.status,
+        capacityStopStatus: capStop.status,
       });
     }
     if (url.pathname === '/__test_storage_verify' && request.method === 'POST') {

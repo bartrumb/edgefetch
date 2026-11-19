@@ -9,11 +9,13 @@
  */
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { deriveMarkdownDocument, SCRAPE_PIPELINE_VERSION } from './scrape';
+import { COLLECTION_ID_RE, D1FtsSearchIndex } from './search-index';
 import {
   MAX_ARTIFACT_CONTENT_BYTES,
   isValidRetention,
   isValidSha256Hex,
   r2ArtifactKey,
+  r2DerivedKey,
   r2ManifestKey,
   type ArtifactRetention,
   type IngestWorkflowParams,
@@ -53,6 +55,7 @@ export interface JobManifest {
   via: string;
   siteId?: string;
   crawlId?: string;
+  collectionId?: string;
   fetchedAt: number;
   results: ManifestResultItem[];
 }
@@ -86,6 +89,7 @@ export async function writeJobManifestToR2(params: {
   via: string;
   siteId?: string;
   crawlId?: string;
+  collectionId?: string;
   rawReplyText: string;
   now?: number;
 }): Promise<{ ok: true; manifestKey: string; itemCount: number } | { ok: false; error: string }> {
@@ -152,6 +156,7 @@ export async function writeJobManifestToR2(params: {
     via: params.via,
     ...(params.siteId ? { siteId: params.siteId } : {}),
     ...(params.crawlId ? { crawlId: params.crawlId } : {}),
+    ...(params.collectionId && COLLECTION_ID_RE.test(params.collectionId) ? { collectionId: params.collectionId } : {}),
     fetchedAt: params.now ?? Date.now(),
     results: cleanItems,
   };
@@ -334,6 +339,10 @@ export type ArtifactVerificationResult =
 export interface IngestPipelineOptions {
   maxContentBytes?: number;
   now?: number;
+  searchWarnBytes?: number;
+  searchMaxBytes?: number;
+  searchInitialSizeBytes?: number;
+  onSearchCapacityWarning?: (sizeBytes: number) => Promise<void> | void;
   onArtifactRejected?: (info: {
     jobId: string;
     siteId?: string;
@@ -552,9 +561,21 @@ export async function executeIngestPipeline(
   rejectedCount: number;
   expiredCount: number;
   derivedCount: number;
+  indexedCount: number;
+  capacityStoppedCount: number;
 }> {
   if (!env.ARTIFACTS || !env.META) {
-    return { jobId: params.jobId, totalItems: 0, chunks: 0, verifiedCount: 0, rejectedCount: 0, expiredCount: 0, derivedCount: 0 };
+    return {
+      jobId: params.jobId,
+      totalItems: 0,
+      chunks: 0,
+      verifiedCount: 0,
+      rejectedCount: 0,
+      expiredCount: 0,
+      derivedCount: 0,
+      indexedCount: 0,
+      capacityStoppedCount: 0,
+    };
   }
 
   const summary = await runStep('load-manifest', async () => {
@@ -563,6 +584,7 @@ export async function executeIngestPipeline(
       string,
       { blobSha256: string; contentSha256: string; contentBytes: number; contentType?: string; url?: string }
     >();
+    const pageMap = new Map<string, { pageId: string; url: string; contentSha256: string; fetchedAt: number }>();
     for (const item of manifest.results) {
       if (item.artifact && item.artifact.retention === 'stored') {
         storedMap.set(item.artifact.blobSha256, {
@@ -572,13 +594,25 @@ export async function executeIngestPipeline(
           ...(item.contentType ? { contentType: item.contentType } : {}),
           ...(item.url ? { url: item.url } : {}),
         });
+        if (item.url && item.outcome === 'ok') {
+          const pageId = `pg_${(await sha256HexString(item.url)).slice(0, 32)}`;
+          pageMap.set(pageId, {
+            pageId,
+            url: item.url,
+            contentSha256: item.artifact.contentSha256,
+            fetchedAt: manifest.fetchedAt,
+          });
+        }
       }
     }
     const storedArtifacts = [...storedMap.values()].sort((a, b) => a.blobSha256.localeCompare(b.blobSha256));
+    const indexPages = [...pageMap.values()].sort((a, b) => a.pageId.localeCompare(b.pageId));
     return {
       totalItems: manifest.results.length,
       chunks: Math.ceil(manifest.results.length / TRACK_BATCH_CHUNK),
+      collectionId: params.collectionId ?? manifest.collectionId,
       storedArtifacts,
+      indexPages,
     };
   });
 
@@ -594,7 +628,7 @@ export async function executeIngestPipeline(
   let rejectedCount = 0;
   let expiredCount = 0;
   let derivedCount = 0;
-  const derivedContentShas = new Set<string>();
+  const derivedDocsBySha = new Map<string, { documentId: string; title: string }>();
 
   for (const art of summary.storedArtifacts) {
     const verifyRes = await runStep(`verify-${art.blobSha256}`, async () => {
@@ -611,8 +645,7 @@ export async function executeIngestPipeline(
 
     if (verifyRes.status === 'verified') {
       verifiedCount++;
-      if (!derivedContentShas.has(verifyRes.contentSha256)) {
-        derivedContentShas.add(verifyRes.contentSha256);
+      if (!derivedDocsBySha.has(verifyRes.contentSha256)) {
         const deriveRes = await runStep(`derive-${verifyRes.contentSha256}-v${SCRAPE_PIPELINE_VERSION}`, async () => {
           return await deriveMarkdownDocument({
             bucket: env.ARTIFACTS!,
@@ -627,6 +660,10 @@ export async function executeIngestPipeline(
         });
         if (deriveRes.status === 'derived' || deriveRes.status === 'cached') {
           derivedCount++;
+          derivedDocsBySha.set(verifyRes.contentSha256, {
+            documentId: deriveRes.documentId,
+            title: deriveRes.title ?? '',
+          });
         }
       }
     } else if (verifyRes.status === 'rejected') {
@@ -645,6 +682,48 @@ export async function executeIngestPipeline(
     }
   }
 
+  let indexedCount = 0;
+  let capacityStoppedCount = 0;
+  const activeCollection = summary.collectionId && COLLECTION_ID_RE.test(summary.collectionId) ? summary.collectionId : undefined;
+
+  if (env.SEARCH && activeCollection && derivedDocsBySha.size > 0) {
+    const searchIndex = new D1FtsSearchIndex(env.SEARCH, {
+      ...(options.searchWarnBytes !== undefined ? { warnBytes: options.searchWarnBytes } : {}),
+      ...(options.searchMaxBytes !== undefined ? { maxBytes: options.searchMaxBytes } : {}),
+      ...(options.searchInitialSizeBytes !== undefined ? { initialSizeBytes: options.searchInitialSizeBytes } : {}),
+      ...(options.onSearchCapacityWarning ? { onCapacityWarning: options.onSearchCapacityWarning } : {}),
+    });
+
+    for (const pg of summary.indexPages) {
+      const docInfo = derivedDocsBySha.get(pg.contentSha256);
+      if (!docInfo) continue;
+      const idxRes = await runStep(`index-${activeCollection}-${pg.pageId}`, async () => {
+        const mdKey = r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', pg.contentSha256);
+        const mdObj = await env.ARTIFACTS!.get(mdKey);
+        if (!mdObj) {
+          return { status: 'missing_derived' as const };
+        }
+        const mdText = await mdObj.text();
+        return await searchIndex.replacePageChunks({
+          collectionId: activeCollection,
+          documentId: docInfo.documentId,
+          pageId: pg.pageId,
+          url: pg.url,
+          title: docInfo.title,
+          markdown: mdText,
+          fetchedAt: pg.fetchedAt,
+        });
+      });
+
+      if (idxRes.status === 'indexed') {
+        indexedCount++;
+      } else if (idxRes.status === 'capacity_reached') {
+        capacityStoppedCount++;
+        break;
+      }
+    }
+  }
+
   return {
     jobId: params.jobId,
     totalItems: summary.totalItems,
@@ -653,6 +732,8 @@ export async function executeIngestPipeline(
     rejectedCount,
     expiredCount,
     derivedCount,
+    indexedCount,
+    capacityStoppedCount,
   };
 }
 

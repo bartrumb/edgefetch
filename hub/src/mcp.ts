@@ -61,6 +61,15 @@ export interface McpServerDeps {
     args: Record<string, unknown>;
     principal?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeExtract?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  searchCollection?: (params: {
+    collectionId: string;
+    query: string;
+    limit?: number;
+  }) => Promise<{ ok: true; hits: Array<Record<string, unknown>> } | { ok: false; status: number; error: string }>;
 }
 
 function isAllowedMcpOrigin(originHeader: string | null, selfOrigin: string): boolean {
@@ -240,10 +249,66 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
           redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
           query: { type: 'string', description: 'Optional focus query to rerank relevant passages.' },
+          collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index the verified Markdown into.' },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
         },
         required: ['url'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'extract',
+      description:
+        'Extract clean Markdown and BM25 query-ranked chunks across 1..20 public HTTPS URLs in one polite batch (with optional verified maxAgeMs cache and FTS5 collection indexing).',
+      annotations: {
+        title: 'Extract Focused Passages from URLs',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          urls: {
+            type: 'array',
+            items: { type: 'string' },
+            minItems: 1,
+            maxItems: 20,
+            description: '1..20 public https:// URLs to extract from.',
+          },
+          query: { type: 'string', description: 'Focus query used to BM25-rank the top chunks per source.' },
+          chunksPerSource: { type: 'integer', minimum: 1, maximum: 10, default: 3, description: 'Max chunks returned per URL.' },
+          maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
+          redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
+          collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index extracted pages into.' },
+          target: { type: 'string', enum: allowedTargets, default: defaultTarget },
+          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+        },
+        required: ['urls'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'search_collection',
+      description:
+        'Search a private crawled collection in EdgeFetch SEARCH D1 FTS5 using sanitized Unicode full-text ranking (BM25 + contextual snippets).',
+      annotations: {
+        title: 'Search Crawled FTS5 Collection',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          collectionId: { type: 'string', default: 'default', description: 'Collection ID to query.' },
+          query: { type: 'string', description: 'Natural-language search query.' },
+          limit: { type: 'integer', minimum: 1, maximum: 50, default: 10, description: 'Max matching chunks to return.' },
+        },
+        required: ['query'],
         additionalProperties: false,
       },
     },
@@ -462,6 +527,39 @@ async function handleToolCall(
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'extract') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    if (!deps.executeExtract) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'extract_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeExtract({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status !== 200 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'search_collection') {
+    if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
+    }
+    if (!deps.searchCollection) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'search_not_configured' }) }], isError: true };
+    }
+    const collectionId = typeof args.collectionId === 'string' && args.collectionId.trim() ? args.collectionId.trim() : 'default';
+    const query = typeof args.query === 'string' ? args.query : '';
+    const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : 10;
+    const res = await deps.searchCollection({ collectionId, query, limit });
+    if (!res.ok) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: res.error }) }], isError: true };
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ collectionId, query, hits: res.hits }, null, 2) }],
     };
   }
 

@@ -8,6 +8,7 @@
  *  - `fetches` never stores URL query strings or bodies (linking to `pages.id`).
  */
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
+import { deriveMarkdownDocument, SCRAPE_PIPELINE_VERSION } from './scrape';
 import {
   MAX_ARTIFACT_CONTENT_BYTES,
   isValidRetention,
@@ -550,20 +551,26 @@ export async function executeIngestPipeline(
   verifiedCount: number;
   rejectedCount: number;
   expiredCount: number;
+  derivedCount: number;
 }> {
   if (!env.ARTIFACTS || !env.META) {
-    return { jobId: params.jobId, totalItems: 0, chunks: 0, verifiedCount: 0, rejectedCount: 0, expiredCount: 0 };
+    return { jobId: params.jobId, totalItems: 0, chunks: 0, verifiedCount: 0, rejectedCount: 0, expiredCount: 0, derivedCount: 0 };
   }
 
   const summary = await runStep('load-manifest', async () => {
     const manifest = await loadManifestFromR2(env.ARTIFACTS!, params.manifestKey);
-    const storedMap = new Map<string, { blobSha256: string; contentSha256: string; contentBytes: number }>();
+    const storedMap = new Map<
+      string,
+      { blobSha256: string; contentSha256: string; contentBytes: number; contentType?: string; url?: string }
+    >();
     for (const item of manifest.results) {
       if (item.artifact && item.artifact.retention === 'stored') {
         storedMap.set(item.artifact.blobSha256, {
           blobSha256: item.artifact.blobSha256,
           contentSha256: item.artifact.contentSha256,
           contentBytes: item.artifact.contentBytes,
+          ...(item.contentType ? { contentType: item.contentType } : {}),
+          ...(item.url ? { url: item.url } : {}),
         });
       }
     }
@@ -586,6 +593,8 @@ export async function executeIngestPipeline(
   let verifiedCount = 0;
   let rejectedCount = 0;
   let expiredCount = 0;
+  let derivedCount = 0;
+  const derivedContentShas = new Set<string>();
 
   for (const art of summary.storedArtifacts) {
     const verifyRes = await runStep(`verify-${art.blobSha256}`, async () => {
@@ -602,6 +611,24 @@ export async function executeIngestPipeline(
 
     if (verifyRes.status === 'verified') {
       verifiedCount++;
+      if (!derivedContentShas.has(verifyRes.contentSha256)) {
+        derivedContentShas.add(verifyRes.contentSha256);
+        const deriveRes = await runStep(`derive-${verifyRes.contentSha256}-v${SCRAPE_PIPELINE_VERSION}`, async () => {
+          return await deriveMarkdownDocument({
+            bucket: env.ARTIFACTS!,
+            metaDb: env.META!,
+            blobSha256: art.blobSha256,
+            contentSha256: verifyRes.contentSha256,
+            ...(art.contentType ? { contentType: art.contentType } : {}),
+            ...(art.url ? { baseUrl: art.url } : {}),
+            pipelineVersion: SCRAPE_PIPELINE_VERSION,
+            ...(options.now !== undefined ? { now: options.now } : {}),
+          });
+        });
+        if (deriveRes.status === 'derived' || deriveRes.status === 'cached') {
+          derivedCount++;
+        }
+      }
     } else if (verifyRes.status === 'rejected') {
       rejectedCount++;
       if (options.onArtifactRejected) {
@@ -625,6 +652,7 @@ export async function executeIngestPipeline(
     verifiedCount,
     rejectedCount,
     expiredCount,
+    derivedCount,
   };
 }
 

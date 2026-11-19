@@ -22,6 +22,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bartrumb/edgefetch/internal/classify"
+	"github.com/bartrumb/edgefetch/internal/extract"
 	"github.com/bartrumb/edgefetch/internal/politeness"
 )
 
@@ -30,12 +31,19 @@ const DefaultUserAgent = "EdgeFetch/1.0 (+https://github.com/bartrumb/edgefetch)
 
 // Request describes a single URL to fetch within a batch.
 type Request struct {
-	ID              string        `json:"id"`
-	URL             string        `json:"url"`
-	Kind            classify.Kind `json:"kind"`
-	Accept          string        `json:"accept,omitempty"`
-	IfNoneMatch     string        `json:"ifNoneMatch,omitempty"`
-	IfModifiedSince string        `json:"ifModifiedSince,omitempty"`
+	ID                 string            `json:"id"`
+	URL                string            `json:"url"`
+	Kind               classify.Kind     `json:"kind"`
+	Accept             string            `json:"accept,omitempty"`
+	IfNoneMatch        string            `json:"ifNoneMatch,omitempty"`
+	IfModifiedSince    string            `json:"ifModifiedSince,omitempty"`
+	Formats            []string          `json:"formats,omitempty"`
+	OnlyMainContent    *bool             `json:"onlyMainContent,omitempty"`
+	DiscoverLlms       *bool             `json:"discoverLlms,omitempty"`
+	PreferLlmsMarkdown *bool             `json:"preferLlmsMarkdown,omitempty"`
+	RedactPII          bool              `json:"redactPii,omitempty"`
+	Query              string            `json:"query,omitempty"`
+	Headers            map[string]string `json:"headers,omitempty"`
 }
 
 // Timing records where a single HTTP attempt spent wall-clock milliseconds via Go's `net/http/httptrace` hooks.
@@ -63,28 +71,38 @@ type ArtifactRef struct {
 
 // Result reports the outcome, headers of interest, phase timings, and optional body or R2 artifact of one `Request`.
 type Result struct {
-	ID            string           `json:"id"`
-	URL           string           `json:"url"`
-	Kind          classify.Kind    `json:"kind"`
-	Outcome       classify.Outcome `json:"outcome"`
-	Problem       string           `json:"problem,omitempty"`
-	Status        int              `json:"status"`
-	ContentType   string           `json:"contentType,omitempty"`
-	CfMitigated   string           `json:"cfMitigated,omitempty"`
-	ETag          string           `json:"etag,omitempty"`
-	LastModified  string           `json:"lastModified,omitempty"`
-	RetryAfter    string           `json:"retryAfter,omitempty"`
-	RetryAfterMs  int64            `json:"retryAfterMs,omitempty"`
-	Bytes         int              `json:"bytes"`
-	Truncated     bool             `json:"truncated,omitempty"`
-	BodyOmitted   bool             `json:"bodyOmitted,omitempty"`
-	Attempts      int              `json:"attempts"`
-	DurationMs    int64            `json:"durationMs"`
-	Timing        Timing           `json:"timing"`
-	Body          string           `json:"body,omitempty"`
-	BodyEncoding  string           `json:"bodyEncoding,omitempty"`
-	Artifact      *ArtifactRef     `json:"artifact,omitempty"`
-	ArtifactError string           `json:"artifactError,omitempty"`
+	ID            string                   `json:"id"`
+	URL           string                   `json:"url"`
+	Kind          classify.Kind            `json:"kind"`
+	Outcome       classify.Outcome         `json:"outcome"`
+	Problem       string                   `json:"problem,omitempty"`
+	Status        int                      `json:"status"`
+	ContentType   string                   `json:"contentType,omitempty"`
+	CfMitigated   string                   `json:"cfMitigated,omitempty"`
+	ETag          string                   `json:"etag,omitempty"`
+	LastModified  string                   `json:"lastModified,omitempty"`
+	RetryAfter    string                   `json:"retryAfter,omitempty"`
+	RetryAfterMs  int64                    `json:"retryAfterMs,omitempty"`
+	Bytes         int                      `json:"bytes"`
+	Truncated     bool                     `json:"truncated,omitempty"`
+	BodyOmitted   bool                     `json:"bodyOmitted,omitempty"`
+	Attempts      int                      `json:"attempts"`
+	DurationMs    int64                    `json:"durationMs"`
+	Timing        Timing                   `json:"timing"`
+	Body          string                   `json:"body,omitempty"`
+	BodyEncoding  string                   `json:"bodyEncoding,omitempty"`
+	Artifact      *ArtifactRef             `json:"artifact,omitempty"`
+	ArtifactError string                   `json:"artifactError,omitempty"`
+	FinalURL      string                   `json:"finalUrl,omitempty"`
+	Title         string                   `json:"title,omitempty"`
+	Description   string                   `json:"description,omitempty"`
+	Favicon       string                   `json:"favicon,omitempty"`
+	Markdown      string                   `json:"markdown,omitempty"`
+	Text          string                   `json:"text,omitempty"`
+	Links         []string                 `json:"links,omitempty"`
+	Images        []extract.ImageInfo      `json:"images,omitempty"`
+	Branding      *extract.BrandingProfile `json:"branding,omitempty"`
+	Llms          *extract.LlmsDiscovery   `json:"llms,omitempty"`
 }
 
 // DecodeBody returns the exact raw response bytes for `r.Body`, decoding `"base64"` payloads losslessly when the origin
@@ -113,6 +131,7 @@ type Options struct {
 	MaxTotalBytes int   `json:"maxTotalBytes,omitempty"`
 	Retries       int   `json:"retries"`
 	IncludeBody   bool  `json:"includeBody"`
+	DiscoverLlms  *bool `json:"discoverLlms,omitempty"`
 	RespectRobots *bool `json:"respectRobots,omitempty"`
 	// Robots is accepted as a wire alias for RespectRobots. When both are omitted, Normalize() defaults to true.
 	Robots *bool `json:"robots,omitempty"`
@@ -219,6 +238,7 @@ type Crawler struct {
 
 	hostsMu           sync.Mutex
 	hosts             *politeness.Registry
+	llms              *llmsCache
 	robotsBypassHosts []string
 	globalMu          sync.Mutex
 	globalNext        time.Time
@@ -472,6 +492,9 @@ func (c *Crawler) runRequestWithRedirects(
 	minPause, maxJitter, gap time.Duration,
 	log *slog.Logger,
 ) (Result, bool) {
+	if err := ValidateCustomHeaders(origReq.Headers); err != nil {
+		return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: err.Error()}, false
+	}
 	started := c.Now()
 	curURLStr := origReq.URL
 	prevHost := ""
@@ -554,10 +577,13 @@ func (c *Crawler) runRequestWithRedirects(
 			hopReq.IfNoneMatch = ""
 			hopReq.IfModifiedSince = ""
 		}
-		res, loc := c.fetchSingleHop(ctx, hopReq, opts)
+		res, loc, rawBody := c.fetchSingleHop(ctx, hopReq, opts)
 		totalAttempts += res.Attempts
 		res.ID = origReq.ID
 		res.URL = origReq.URL
+		if hop > 0 && !isRedirectStatus(res.Status) {
+			res.FinalURL = curURLStr
+		}
 		res.Attempts = totalAttempts
 
 		retryAfter := time.Duration(res.RetryAfterMs) * time.Millisecond
@@ -600,6 +626,7 @@ func (c *Crawler) runRequestWithRedirects(
 			continue
 		}
 
+		c.enrichResult(ctx, origReq, opts, rawBody, &res)
 		res.DurationMs = c.Now().Sub(started).Milliseconds()
 		c.logResult(ctx, log, origReq, res)
 		return res, false
@@ -645,15 +672,16 @@ func isPermanentFetchError(err error) bool {
 	return strings.Contains(msg, "refusing connection to non-public IP") || strings.Contains(msg, "unsupported protocol scheme")
 }
 
-func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (Result, string) {
+func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (Result, string, []byte) {
 	res := Result{ID: r.ID, URL: r.URL, Kind: r.Kind}
 	accept, err := classify.AcceptFor(r.Kind, r.Accept)
 	if err != nil {
 		res.Outcome, res.Problem = classify.OutcomeError, err.Error()
-		return res, ""
+		return res, "", nil
 	}
 
 	var redirectLoc string
+	var finalBody []byte
 	for attempt := 1; ; attempt++ {
 		res.Attempts = attempt
 		status, header, body, truncated, timing, fetchErr := c.once(ctx, r, accept, opts)
@@ -702,6 +730,7 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 		} else {
 			res.Outcome, res.Problem = classify.Classify(r.Kind, status, header, body)
 		}
+		finalBody = body
 		if opts.IncludeBody {
 			if utf8.Valid(body) {
 				res.Body = string(body)
@@ -713,7 +742,7 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 		}
 		break
 	}
-	return res, redirectLoc
+	return res, redirectLoc, finalBody
 }
 
 func (c *Crawler) logResult(ctx context.Context, log *slog.Logger, r Request, res Result) {
@@ -795,6 +824,9 @@ func (c *Crawler) once(ctx context.Context, r Request, accept string, opts Optio
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", accept)
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	for k, v := range r.Headers {
+		req.Header.Set(strings.TrimSpace(k), v)
+	}
 	if r.IfNoneMatch != "" {
 		req.Header.Set("If-None-Match", r.IfNoneMatch)
 	}

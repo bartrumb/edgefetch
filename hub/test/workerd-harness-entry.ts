@@ -1,5 +1,6 @@
 import prodWorker, { AgentHubDO as ProdAgentHubDO, IngestWorkflow } from '../src/index.ts';
 import { executeIngestPipeline, isContentVerifiedInMetaD1, pruneExpiredFetchHistory, writeJobManifestToR2 } from '../src/ingest.ts';
+import { deriveMarkdownDocument } from '../src/scrape.ts';
 import { r2ArtifactKey, sanitizeFtsQuery, type OptionalStorageBindings } from '../src/storage.ts';
 
 export { IngestWorkflow };
@@ -239,10 +240,24 @@ export default {
       const bombRowCount =
         (await meta.prepare('SELECT COUNT(*) AS c FROM artifacts WHERE blob_sha256 = ?').bind(bombBlobSha).first<{ c: number }>())?.c ?? 0;
 
+      // S6: Verify `derive-<contentSha>-v1` recorded `pipeline_version = 1` + derived Markdown in R2 ONLY for the verified artifact!
+      const derivedDocRow = await meta
+        .prepare('SELECT pipeline_version, r2_key, bytes FROM documents WHERE content_sha256 = ? LIMIT 1')
+        .bind(goodContentSha)
+        .first<{ pipeline_version: number; r2_key: string; bytes: number }>();
+      const derivedR2Text = derivedDocRow ? await (await bucket.get(derivedDocRow.r2_key))?.text() : null;
+      const unverifiedDeriveAttempt = await deriveMarkdownDocument({
+        bucket,
+        metaDb: meta,
+        blobSha256: expiredBlobSha,
+        contentSha256: expiredContentSha,
+      });
+
       return Response.json({
         verifiedCount: pipelineOut.verifiedCount,
         rejectedCount: pipelineOut.rejectedCount,
         expiredCount: pipelineOut.expiredCount,
+        derivedCount: pipelineOut.derivedCount,
         rejectedReasons: rejectedReasons.map((r) => r.reason).sort(),
         goodVerified,
         liedVerified,
@@ -253,6 +268,9 @@ export default {
         liedRowCount,
         bombRowCount,
         expiredBlobSha,
+        derivedPipelineVersion: derivedDocRow?.pipeline_version ?? 0,
+        derivedR2Text,
+        unverifiedDeriveStatus: unverifiedDeriveAttempt.status,
       });
     }
     if (url.pathname === '/__test_storage_verify' && request.method === 'POST') {

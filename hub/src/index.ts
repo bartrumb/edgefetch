@@ -61,6 +61,7 @@ import {
   pruneExpiredFetchHistory,
   writeJobManifestToR2,
 } from './ingest';
+import { executeScrapeCall, type ScrapeRequestPayload } from './scrape';
 import {
   buildCapabilities,
   handleAgentArtifactUpload,
@@ -764,6 +765,15 @@ export default {
           },
           executeFetch: ({ target, site, body, principal }) =>
             executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`),
+          executeScrape: async ({ args, principal }) => {
+            const out = await executeScrapeCall({
+              payload: args as ScrapeRequestPayload,
+              env,
+              executeHubFetch,
+              source: `mcp-scrape:${principal ?? 'client'}`,
+            });
+            return { status: out.status, body: out.body };
+          },
           ...(env.ARTIFACTS
             ? {
                 readArtifact: async ({ blobSha256, retention, offset, limit }) => {
@@ -850,6 +860,48 @@ export default {
           blobSha256,
           bucket: env.ARTIFACTS,
           metaDb: env.META,
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/scrape') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const rawScrapeText = await request.text();
+        if (new TextEncoder().encode(rawScrapeText).byteLength > MAX_CALL_UTF8_BYTES) {
+          return Response.json({ error: 'too_large' }, { status: 413 });
+        }
+        let payload: ScrapeRequestPayload;
+        try {
+          payload = JSON.parse(rawScrapeText) as ScrapeRequestPayload;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const out = await executeScrapeCall({
+          payload,
+          env,
+          executeHubFetch,
+          source: `scrape:${auth.principal}`,
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: {
+            'cache-control': 'no-store',
+            'x-crawler-via': out.via,
+            ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+          },
         });
       }
 

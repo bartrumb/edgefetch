@@ -493,3 +493,65 @@ func TestPermanentSSRFErrorNotRetriedAndBackoffHasQuarterFloor(t *testing.T) {
 		t.Fatalf("A11 BUG: zero-jitter retry backoff slept %v, want >= 250ms floor", sleeps.all)
 	}
 }
+
+func TestScrapeLlmsTxtCompanionMarkdownAndRobotsGuard(t *testing.T) {
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			w.Header().Set("Content-Type", "text/plain")
+			if r.Host == "blocked-llms.test" {
+				_, _ = w.Write([]byte("User-agent: *\nDisallow: /llms.txt\nDisallow: /.well-known/llms.txt\n"))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		case "/llms.txt":
+			w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+			_, _ = w.Write([]byte("# Docs Portal\n> Fast technical reference.\n\n## Guides\n- [Install Guide](/guide/install.md): CLI setup\n- [Full Reference](/llms-full.txt): Everything\n"))
+		case "/guide/install.md":
+			w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+			_, _ = w.Write([]byte("# Install Guide\n\nRun `edgefetch --version` to verify the static Go binary.\n"))
+		case "/guide/install":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte("<html><head><title>Install</title></head><body><nav>noisy chrome</nav><main><h1>HTML Fallback</h1><p>Browser copy.</p></main></body></html>"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+
+	results := c.Run(context.Background(), []Request{
+		{
+			ID:      "s1",
+			URL:     "http://docs.test/guide/install",
+			Kind:    classify.KindScrape,
+			Formats: []string{"markdown", "links"},
+		},
+		{
+			ID:      "s2",
+			URL:     "http://blocked-llms.test/guide/install",
+			Kind:    classify.KindScrape,
+			Formats: []string{"markdown"},
+		},
+		{
+			ID:      "bad-hdr",
+			URL:     "http://docs.test/guide/install",
+			Kind:    classify.KindScrape,
+			Headers: map[string]string{"Cookie": "session=secret"},
+		},
+	}, Options{PauseMs: 5})
+
+	if results[0].Outcome != classify.OutcomeOK || results[0].Llms == nil || !results[0].Llms.Found || !results[0].Llms.UsedCompanionMd {
+		t.Fatalf("expected llms.txt discovery + companion .md upgrade, got: %+v (llms=%+v)", results[0], results[0].Llms)
+	}
+	if !strings.Contains(results[0].Markdown, "edgefetch --version") {
+		t.Fatalf("expected companion markdown content, got: %q", results[0].Markdown)
+	}
+	if results[1].Outcome != classify.OutcomeOK || results[1].Llms == nil || results[1].Llms.Found {
+		t.Fatalf("robots.txt Disallow:/llms.txt must block llms.txt fetch cleanly while still scraping allowed HTML page: %+v", results[1].Llms)
+	}
+	if !strings.Contains(results[1].Markdown, "HTML Fallback") || strings.Contains(results[1].Markdown, "noisy chrome") {
+		t.Fatalf("expected clean main-content HTML->Markdown fallback when llms.txt is disallowed, got: %q", results[1].Markdown)
+	}
+	if results[2].Outcome != classify.OutcomeError || !strings.Contains(results[2].Problem, "not permitted") {
+		t.Fatalf("expected forbidden Cookie header to be rejected, got: %+v", results[2])
+	}
+}

@@ -1,0 +1,896 @@
+// Package extract converts raw HTML and PDF payloads into clean Markdown, plain text, links, images, branding
+// metadata, query-reranked passages, and `llms.txt` structured context using only the Go standard library.
+package extract
+
+import (
+	"html"
+	"math"
+	"net/url"
+	"regexp"
+	"sort"
+	"strings"
+	"unicode"
+)
+
+// ImageInfo describes an image discovered on a page.
+type ImageInfo struct {
+	URL string `json:"url"`
+	Alt string `json:"alt,omitempty"`
+}
+
+// BrandingProfile summarizes visual brand identity signals extracted from HTML/CSS (`formats: ["branding"]`).
+type BrandingProfile struct {
+	Title        string   `json:"title,omitempty"`
+	Description  string   `json:"description,omitempty"`
+	CanonicalURL string   `json:"canonicalUrl,omitempty"`
+	Favicon      string   `json:"favicon,omitempty"`
+	Logo         string   `json:"logo,omitempty"`
+	OGImage      string   `json:"ogImage,omitempty"`
+	ThemeColor   string   `json:"themeColor,omitempty"`
+	Colors       []string `json:"colors,omitempty"`
+	Fonts        []string `json:"fonts,omitempty"`
+}
+
+// PageExtraction holds the structured outputs extracted from an HTML document.
+type PageExtraction struct {
+	Title       string           `json:"title,omitempty"`
+	Description string           `json:"description,omitempty"`
+	Favicon     string           `json:"favicon,omitempty"`
+	Markdown    string           `json:"markdown,omitempty"`
+	Text        string           `json:"text,omitempty"`
+	Links       []string         `json:"links,omitempty"`
+	Images      []ImageInfo      `json:"images,omitempty"`
+	Branding    *BrandingProfile `json:"branding,omitempty"`
+}
+
+// ExtractOptions configures HTML extraction.
+type ExtractOptions struct {
+	BaseURL         string
+	OnlyMainContent bool
+	IncludeLinks    bool
+	IncludeImages   bool
+	IncludeBranding bool
+	RedactPII       bool
+	Query           string
+	MaxChars        int
+}
+
+var (
+	reHTMLComment = regexp.MustCompile(`(?is)<!--.*?-->`)
+	reDropBlocks  = []*regexp.Regexp{
+		regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`),
+		regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`),
+		regexp.MustCompile(`(?is)<noscript\b[^>]*>.*?</noscript>`),
+		regexp.MustCompile(`(?is)<template\b[^>]*>.*?</template>`),
+		regexp.MustCompile(`(?is)<svg\b[^>]*>.*?</svg>`),
+		regexp.MustCompile(`(?is)<canvas\b[^>]*>.*?</canvas>`),
+		regexp.MustCompile(`(?is)<iframe\b[^>]*>.*?</iframe>`),
+	}
+	reChromeBlocks = []*regexp.Regexp{
+		regexp.MustCompile(`(?is)<nav\b[^>]*>.*?</nav>`),
+		regexp.MustCompile(`(?is)<footer\b[^>]*>.*?</footer>`),
+		regexp.MustCompile(`(?is)<aside\b[^>]*>.*?</aside>`),
+	}
+	reHeaderBlock  = regexp.MustCompile(`(?is)<header\b[^>]*>.*?</header>`)
+	reMainBlock    = regexp.MustCompile(`(?is)<main\b[^>]*>(.*?)</main>`)
+	reArticleBlock = regexp.MustCompile(`(?is)<article\b[^>]*>(.*?)</article>`)
+	reTitleTag     = regexp.MustCompile(`(?is)<title\b[^>]*>(.*?)</title>`)
+	reMetaTag      = regexp.MustCompile(`(?is)<meta\b[^>]*>`)
+	reLinkTag      = regexp.MustCompile(`(?is)<link\b[^>]*>`)
+	reStyleContent = regexp.MustCompile(`(?is)<style\b[^>]*>(.*?)</style>`)
+	reAttrPair     = regexp.MustCompile(`(?is)([a-zA-Z0-9_:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>` + "`" + `]+))`)
+
+	reAnchor    = regexp.MustCompile(`(?is)<a\b([^>]*)>(.*?)</a>`)
+	reImgTag    = regexp.MustCompile(`(?is)<img\b([^>]*)>`)
+	rePreCode   = regexp.MustCompile(`(?is)<pre\b[^>]*>\s*(?:<code\b[^>]*>)?(.*?)(?:</code>)?\s*</pre>`)
+	reInlineCd  = regexp.MustCompile(`(?is)<code\b[^>]*>(.*?)</code>`)
+	reHeading   = regexp.MustCompile(`(?is)<h([1-6])\b[^>]*>(.*?)</h[1-6]>`)
+	reStrong    = regexp.MustCompile(`(?is)<strong\b[^>]*>(.*?)</strong>|<b\b[^>]*>(.*?)</b>`)
+	reEm        = regexp.MustCompile(`(?is)<em\b[^>]*>(.*?)</em>|<i\b[^>]*>(.*?)</i>`)
+	reListItem  = regexp.MustCompile(`(?is)<li\b[^>]*>(.*?)</li>`)
+	reBlockquot = regexp.MustCompile(`(?is)<blockquote\b[^>]*>(.*?)</blockquote>`)
+	reTable     = regexp.MustCompile(`(?is)<table\b[^>]*>(.*?)</table>`)
+	reTableRow  = regexp.MustCompile(`(?is)<tr\b[^>]*>(.*?)</tr>`)
+	reTableCell = regexp.MustCompile(`(?is)<t([hd])\b[^>]*>(.*?)</t[hd]>`)
+	reBlockEnd  = regexp.MustCompile(`(?is)</(p|div|section|article|main|ul|ol|dl|dd|dt|figure|figcaption|tr|header)>`)
+	reBrHr      = regexp.MustCompile(`(?is)<(br|hr)\b[^>]*/?>`)
+	reAnyTag    = regexp.MustCompile(`(?s)<[^>]+>`)
+	reMultiLine = regexp.MustCompile(`\n{3,}`)
+	reSpaceRun  = regexp.MustCompile(`[ \t]{2,}`)
+
+	reHexColor   = regexp.MustCompile(`#[0-9a-fA-F]{6}\b`)
+	reFontFamily = regexp.MustCompile(`(?i)font-family\s*:\s*([^;}{]+)`)
+	reGoogleFont = regexp.MustCompile(`(?i)fonts\.googleapis\.com/css2?\?family=([^&"'\s>]+)`)
+
+	reEmail = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
+	reSSN   = regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`)
+	rePhone = regexp.MustCompile(`(?:\+?1[-.\s]?)?\(\d{3}\)[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{1,3}[-.\s]\d{2,4}[-.\s]\d{3,4}[-.\s]\d{3,4}\b`)
+	reCard  = regexp.MustCompile(`\b(?:\d[ -]*?){13,19}\b`)
+
+	reChallengeTitle = regexp.MustCompile(`(?i)\b(just a moment|attention required|verify you are human|security check|ddos-guard|checking your browser)\b`)
+	reChallengeDOM   = regexp.MustCompile(`(?i)(cf-turnstile|challenges\.cloudflare\.com|g-recaptcha|h-captcha|_cf_chl_opt)`)
+	reSPAShell       = regexp.MustCompile(`(?i)<div[^>]+id=["']?(root|app|__next|__nuxt)["']?[^>]*>\s*</div>`)
+)
+
+// DetectRenderedChallenge checks whether an HTML payload (HTTP or headless browser) is gated by a bot/CAPTCHA challenge.
+// EdgeFetch never attempts to solve, click through, or wait out anti-bot challenges.
+func DetectRenderedChallenge(rawHTML string) string {
+	title := extractTitle(rawHTML)
+	if reChallengeTitle.MatchString(title) {
+		return "anti-bot challenge page (" + title + ")"
+	}
+	if len(rawHTML) < 32_768 && reChallengeDOM.MatchString(rawHTML) && len(PlainText(rawHTML)) < 400 {
+		return "anti-bot challenge widget detected"
+	}
+	return ""
+}
+
+// NeedsBrowserRender heuristics detect empty client-side SPA shells (`<div id="root"></div>` + script bundles with
+// almost zero SSR body text) so `renderMode: "auto"` only launches Chromium when static HTTP/2 lacks content.
+func NeedsBrowserRender(rawHTML string) bool {
+	if strings.TrimSpace(rawHTML) == "" {
+		return false
+	}
+	text := PlainText(rawHTML)
+	if len(text) >= 240 {
+		return false
+	}
+	lower := strings.ToLower(rawHTML)
+	hasScript := strings.Contains(lower, "<script")
+	if !hasScript {
+		return false
+	}
+	if reSPAShell.MatchString(rawHTML) {
+		return true
+	}
+	return len(text) < 80 && (strings.Contains(lower, "type=\"module\"") || strings.Contains(lower, "/_next/static/") || strings.Contains(lower, "vite"))
+}
+
+// ExtractHTML parses rawHTML into clean Markdown, plain text, links, images, and optional branding profile.
+func ExtractHTML(rawHTML string, opts ExtractOptions) PageExtraction {
+	var base *url.URL
+	if opts.BaseURL != "" {
+		base, _ = url.Parse(opts.BaseURL)
+	}
+
+	meta := scanHeadMetadata(rawHTML, base)
+	out := PageExtraction{
+		Title:       meta.Title,
+		Description: meta.Description,
+		Favicon:     meta.Favicon,
+	}
+
+	if opts.IncludeBranding {
+		b := meta
+		b.Colors, b.Fonts = extractStyleSignals(rawHTML)
+		out.Branding = &b
+	}
+
+	work := reHTMLComment.ReplaceAllString(rawHTML, "")
+	if opts.OnlyMainContent {
+		if m := reMainBlock.FindStringSubmatch(work); len(m) == 2 && len(PlainText(m[1])) >= 32 {
+			work = m[1]
+		} else if m := reArticleBlock.FindStringSubmatch(work); len(m) == 2 && len(PlainText(m[1])) >= 32 {
+			work = m[1]
+		} else {
+			for _, rx := range reChromeBlocks {
+				work = rx.ReplaceAllString(work, "")
+			}
+			work = reHeaderBlock.ReplaceAllString(work, "")
+		}
+	}
+	for _, rx := range reDropBlocks {
+		work = rx.ReplaceAllString(work, "")
+	}
+
+	if opts.IncludeLinks {
+		out.Links = extractLinks(work, base)
+	}
+	if opts.IncludeImages {
+		out.Images = extractImages(work, base)
+	}
+
+	md := htmlFragmentToMarkdown(work, base)
+	if out.Title != "" && !strings.HasPrefix(md, "# ") {
+		md = "# " + out.Title + "\n\n" + md
+	}
+	md = strings.TrimSpace(md)
+	txt := markdownToPlainText(md)
+
+	if strings.TrimSpace(opts.Query) != "" {
+		limit := opts.MaxChars
+		if limit <= 0 {
+			limit = 16_000
+		}
+		md = RerankPassages(md, opts.Query, limit)
+		txt = markdownToPlainText(md)
+	}
+
+	if opts.RedactPII {
+		md = RedactPII(md)
+		txt = RedactPII(txt)
+	}
+	if opts.MaxChars > 0 {
+		if len(md) > opts.MaxChars {
+			md = md[:opts.MaxChars]
+		}
+		if len(txt) > opts.MaxChars {
+			txt = txt[:opts.MaxChars]
+		}
+	}
+
+	out.Markdown = md
+	out.Text = txt
+	return out
+}
+
+// PlainText strips scripts/styles/tags from HTML and collapses whitespace.
+func PlainText(rawHTML string) string {
+	clean := reHTMLComment.ReplaceAllString(rawHTML, " ")
+	for _, rx := range reDropBlocks {
+		clean = rx.ReplaceAllString(clean, " ")
+	}
+	clean = reAnyTag.ReplaceAllString(clean, " ")
+	clean = html.UnescapeString(clean)
+	return strings.Join(strings.Fields(clean), " ")
+}
+
+func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
+	s := fragment
+
+	// 1. Convert fenced <pre><code> blocks first so inner tags/newlines stay intact.
+	type placeholder struct {
+		token string
+		value string
+	}
+	var stash []placeholder
+	s = rePreCode.ReplaceAllStringFunc(s, func(match string) string {
+		sub := rePreCode.FindStringSubmatch(match)
+		inner := ""
+		if len(sub) >= 2 {
+			inner = sub[1]
+		}
+		inner = reAnyTag.ReplaceAllString(inner, "")
+		inner = strings.Trim(html.UnescapeString(inner), "\r\n")
+		tok := "\x00CODEBLOCK_" + itoa(len(stash)) + "\x00"
+		stash = append(stash, placeholder{token: tok, value: "\n\n```\n" + inner + "\n```\n\n"})
+		return tok
+	})
+
+	// 2. Convert HTML <table> blocks into GFM Markdown tables (`| Col | Col |`).
+	s = reTable.ReplaceAllStringFunc(s, func(tbl string) string {
+		rows := reTableRow.FindAllStringSubmatch(tbl, -1)
+		if len(rows) == 0 {
+			return tbl
+		}
+		var grid [][]string
+		maxCols := 0
+		for _, r := range rows {
+			cells := reTableCell.FindAllStringSubmatch(r[1], -1)
+			if len(cells) == 0 {
+				continue
+			}
+			row := make([]string, 0, len(cells))
+			for _, c := range cells {
+				txt := cleanInline(c[2])
+				txt = strings.ReplaceAll(txt, "|", `\|`)
+				row = append(row, txt)
+			}
+			if len(row) > maxCols {
+				maxCols = len(row)
+			}
+			grid = append(grid, row)
+		}
+		if len(grid) == 0 || maxCols == 0 {
+			return ""
+		}
+		var b strings.Builder
+		b.WriteString("\n\n")
+		for rIdx, row := range grid {
+			for len(row) < maxCols {
+				row = append(row, "")
+			}
+			b.WriteString("| ")
+			b.WriteString(strings.Join(row, " | "))
+			b.WriteString(" |\n")
+			if rIdx == 0 {
+				sep := make([]string, maxCols)
+				for i := range sep {
+					sep[i] = "---"
+				}
+				b.WriteString("| ")
+				b.WriteString(strings.Join(sep, " | "))
+				b.WriteString(" |\n")
+			}
+		}
+		b.WriteString("\n")
+		tok := "\x00TABLE_" + itoa(len(stash)) + "\x00"
+		stash = append(stash, placeholder{token: tok, value: b.String()})
+		return tok
+	})
+
+	// 3. Inline code, images, links, headings, emphasis, lists, blockquotes.
+	s = reInlineCd.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reInlineCd.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return ""
+		}
+		txt := cleanInline(sub[1])
+		if txt == "" {
+			return ""
+		}
+		return "`" + txt + "`"
+	})
+
+	s = reImgTag.ReplaceAllStringFunc(s, func(m string) string {
+		attrs := parseAttrs(m)
+		src := resolveHref(firstAttr(attrs, "src", "data-src"), base)
+		if src == "" || strings.HasPrefix(src, "data:") {
+			return ""
+		}
+		alt := strings.TrimSpace(html.UnescapeString(attrs["alt"]))
+		return "![" + alt + "](" + src + ")"
+	})
+
+	s = reAnchor.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reAnchor.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return ""
+		}
+		attrs := parseAttrs(sub[1])
+		href := resolveHref(attrs["href"], base)
+		label := cleanInline(sub[2])
+		if label == "" {
+			return ""
+		}
+		if href == "" || strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "#") {
+			return label
+		}
+		return "[" + label + "](" + href + ")"
+	})
+
+	s = reHeading.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reHeading.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return ""
+		}
+		level := int(sub[1][0] - '0')
+		txt := cleanInline(sub[2])
+		if txt == "" {
+			return ""
+		}
+		return "\n\n" + strings.Repeat("#", level) + " " + txt + "\n\n"
+	})
+
+	s = reStrong.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reStrong.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return ""
+		}
+		inner := sub[1]
+		if inner == "" {
+			inner = sub[2]
+		}
+		txt := cleanInline(inner)
+		if txt == "" {
+			return ""
+		}
+		return "**" + txt + "**"
+	})
+
+	s = reEm.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reEm.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return ""
+		}
+		inner := sub[1]
+		if inner == "" {
+			inner = sub[2]
+		}
+		txt := cleanInline(inner)
+		if txt == "" {
+			return ""
+		}
+		return "*" + txt + "*"
+	})
+
+	s = reBlockquot.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reBlockquot.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return ""
+		}
+		txt := cleanInline(sub[1])
+		if txt == "" {
+			return ""
+		}
+		return "\n\n> " + txt + "\n\n"
+	})
+
+	s = reListItem.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reListItem.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return ""
+		}
+		txt := cleanInline(sub[1])
+		if txt == "" {
+			return ""
+		}
+		return "\n- " + txt
+	})
+
+	s = reBrHr.ReplaceAllStringFunc(s, func(m string) string {
+		if strings.HasPrefix(strings.ToLower(m), "<hr") {
+			return "\n\n---\n\n"
+		}
+		return "\n"
+	})
+	s = reBlockEnd.ReplaceAllString(s, "\n\n")
+	s = reAnyTag.ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		line = strings.ReplaceAll(line, "\r", "")
+		line = reSpaceRun.ReplaceAllString(strings.TrimSpace(line), " ")
+		lines[i] = line
+	}
+	s = strings.Join(lines, "\n")
+	for _, p := range stash {
+		s = strings.ReplaceAll(s, p.token, p.value)
+	}
+	s = reMultiLine.ReplaceAllString(s, "\n\n")
+	return strings.TrimSpace(s)
+}
+
+func markdownToPlainText(md string) string {
+	var out []string
+	for _, line := range strings.Split(md, "\n") {
+		l := strings.TrimSpace(line)
+		if l == "" || l == "```" || l == "---" {
+			continue
+		}
+		l = strings.TrimLeft(l, "#>- ")
+		out = append(out, l)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+// RerankPassages splits long Markdown or PDF text into semantic paragraphs/sections and selects the top chunks matching
+// `query` via BM25-style term scoring + exact-phrase boost while preserving original document reading order.
+func RerankPassages(doc, query string, maxChars int) string {
+	query = strings.TrimSpace(query)
+	if query == "" || len(doc) == 0 {
+		return doc
+	}
+	if maxChars <= 0 {
+		maxChars = 12_000
+	}
+	terms := tokenize(query)
+	if len(terms) == 0 {
+		if len(doc) > maxChars {
+			return doc[:maxChars]
+		}
+		return doc
+	}
+
+	rawBlocks := strings.Split(doc, "\n\n")
+	type chunk struct {
+		idx   int
+		text  string
+		score float64
+	}
+	var chunks []chunk
+	currentHeading := ""
+	for _, b := range rawBlocks {
+		b = strings.TrimSpace(b)
+		if b == "" {
+			continue
+		}
+		if strings.HasPrefix(b, "#") && !strings.Contains(b, "\n") {
+			currentHeading = b
+			continue
+		}
+		full := b
+		if currentHeading != "" {
+			full = currentHeading + "\n" + b
+			currentHeading = ""
+		}
+		chunks = append(chunks, chunk{idx: len(chunks), text: full})
+	}
+	if len(chunks) <= 1 {
+		if len(doc) > maxChars {
+			return doc[:maxChars]
+		}
+		return doc
+	}
+
+	df := make(map[string]int, len(terms))
+	chunkFreqs := make([]map[string]int, len(chunks))
+	totalWords := 0
+	for i, c := range chunks {
+		words := tokenize(c.text)
+		totalWords += len(words)
+		freq := make(map[string]int)
+		for _, w := range words {
+			freq[w]++
+		}
+		chunkFreqs[i] = freq
+		for _, t := range terms {
+			if freq[t] > 0 {
+				df[t]++
+			}
+		}
+	}
+	avgLen := math.Max(1.0, float64(totalWords)/float64(len(chunks)))
+	nDocs := float64(len(chunks))
+	lowerQuery := strings.ToLower(query)
+
+	for i := range chunks {
+		freq := chunkFreqs[i]
+		docLen := 0
+		for _, c := range freq {
+			docLen += c
+		}
+		var score float64
+		for _, t := range terms {
+			tf := float64(freq[t])
+			if tf == 0 {
+				continue
+			}
+			idf := math.Log(1.0 + (nDocs-float64(df[t])+0.5)/(float64(df[t])+0.5))
+			num := tf * 2.2
+			den := tf + 1.2*(1.0-0.75+0.75*(float64(docLen)/avgLen))
+			score += idf * (num / den)
+		}
+		if len(lowerQuery) >= 4 && strings.Contains(strings.ToLower(chunks[i].text), lowerQuery) {
+			score += 3.0
+		}
+		chunks[i].score = score
+	}
+
+	sorted := append([]chunk(nil), chunks...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].score != sorted[j].score {
+			return sorted[i].score > sorted[j].score
+		}
+		return sorted[i].idx < sorted[j].idx
+	})
+
+	var selected []chunk
+	used := 0
+	for _, c := range sorted {
+		if c.score <= 0 && len(selected) > 0 {
+			break
+		}
+		if used+len(c.text)+2 > maxChars && len(selected) > 0 {
+			continue
+		}
+		selected = append(selected, c)
+		used += len(c.text) + 2
+		if used >= maxChars {
+			break
+		}
+	}
+	sort.Slice(selected, func(i, j int) bool { return selected[i].idx < selected[j].idx })
+
+	parts := make([]string, len(selected))
+	for i, c := range selected {
+		parts[i] = c.text
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// RedactPII replaces email addresses, SSNs, phone numbers, and Luhn-valid payment card numbers with `[REDACTED_*]`.
+func RedactPII(s string) string {
+	s = reEmail.ReplaceAllString(s, "[REDACTED_EMAIL]")
+	s = reSSN.ReplaceAllString(s, "[REDACTED_SSN]")
+	s = reCard.ReplaceAllStringFunc(s, func(candidate string) string {
+		if isLuhnCard(candidate) {
+			return "[REDACTED_CARD]"
+		}
+		return candidate
+	})
+	s = rePhone.ReplaceAllString(s, "[REDACTED_PHONE]")
+	return s
+}
+
+func isLuhnCard(raw string) bool {
+	var digits []int
+	for i := 0; i < len(raw); i++ {
+		if raw[i] >= '0' && raw[i] <= '9' {
+			digits = append(digits, int(raw[i]-'0'))
+		}
+	}
+	if len(digits) < 13 || len(digits) > 19 {
+		return false
+	}
+	sum := 0
+	alt := false
+	for i := len(digits) - 1; i >= 0; i-- {
+		d := digits[i]
+		if alt {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		alt = !alt
+	}
+	return sum%10 == 0
+}
+
+func tokenize(s string) []string {
+	var out []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() >= 2 {
+			w := cur.String()
+			if !isStopWord(w) {
+				out = append(out, w)
+			}
+		}
+		cur.Reset()
+	}
+	for _, r := range strings.ToLower(s) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			cur.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return out
+}
+
+func isStopWord(w string) bool {
+	switch w {
+	case "the", "and", "for", "with", "that", "this", "from", "are", "was", "were", "have", "has", "had", "not", "but", "what", "how", "when", "where", "who", "which", "into", "your", "about":
+		return true
+	}
+	return false
+}
+
+func extractTitle(rawHTML string) string {
+	m := reTitleTag.FindStringSubmatch(rawHTML)
+	if len(m) < 2 {
+		return ""
+	}
+	return cleanInline(m[1])
+}
+
+func scanHeadMetadata(rawHTML string, base *url.URL) BrandingProfile {
+	var p BrandingProfile
+	p.Title = extractTitle(rawHTML)
+
+	for _, tag := range reMetaTag.FindAllString(rawHTML, 80) {
+		attrs := parseAttrs(tag)
+		name := strings.ToLower(firstAttr(attrs, "name", "property"))
+		content := strings.TrimSpace(html.UnescapeString(attrs["content"]))
+		if content == "" {
+			continue
+		}
+		switch name {
+		case "description":
+			if p.Description == "" {
+				p.Description = content
+			}
+		case "og:description":
+			if p.Description == "" {
+				p.Description = content
+			}
+		case "og:title":
+			if p.Title == "" {
+				p.Title = content
+			}
+		case "og:image", "twitter:image":
+			if p.OGImage == "" {
+				p.OGImage = resolveHref(content, base)
+			}
+		case "theme-color":
+			if p.ThemeColor == "" {
+				p.ThemeColor = content
+			}
+		}
+	}
+
+	for _, tag := range reLinkTag.FindAllString(rawHTML, 60) {
+		attrs := parseAttrs(tag)
+		rel := strings.ToLower(attrs["rel"])
+		href := resolveHref(attrs["href"], base)
+		if href == "" {
+			continue
+		}
+		if strings.Contains(rel, "canonical") && p.CanonicalURL == "" {
+			p.CanonicalURL = href
+		}
+		if strings.Contains(rel, "icon") && p.Favicon == "" {
+			p.Favicon = href
+		}
+	}
+	if p.Favicon == "" && base != nil && base.Scheme == "https" && base.Host != "" {
+		p.Favicon = (&url.URL{Scheme: "https", Host: base.Host, Path: "/favicon.ico"}).String()
+	}
+
+	for _, img := range reImgTag.FindAllString(rawHTML, 40) {
+		attrs := parseAttrs(img)
+		combined := strings.ToLower(attrs["alt"] + " " + attrs["class"] + " " + attrs["id"] + " " + attrs["src"])
+		if strings.Contains(combined, "logo") {
+			if src := resolveHref(firstAttr(attrs, "src", "data-src"), base); src != "" && !strings.HasPrefix(src, "data:") {
+				p.Logo = src
+				break
+			}
+		}
+	}
+	return p
+}
+
+func extractStyleSignals(rawHTML string) (colors, fonts []string) {
+	seenColor := make(map[string]bool)
+	var styleBuf strings.Builder
+	for _, m := range reStyleContent.FindAllStringSubmatch(rawHTML, 25) {
+		if len(m) >= 2 {
+			styleBuf.WriteString(m[1])
+			styleBuf.WriteByte('\n')
+		}
+	}
+	styleText := styleBuf.String()
+	for _, c := range reHexColor.FindAllString(styleText, 60) {
+		lc := strings.ToLower(c)
+		if lc == "#ffffff" || lc == "#000000" {
+			continue
+		}
+		if !seenColor[lc] {
+			seenColor[lc] = true
+			colors = append(colors, lc)
+			if len(colors) >= 8 {
+				break
+			}
+		}
+	}
+
+	seenFont := make(map[string]bool)
+	addFont := func(raw string) {
+		f := strings.Trim(strings.TrimSpace(raw), `"'`)
+		if f == "" || len(f) > 48 {
+			return
+		}
+		lf := strings.ToLower(f)
+		switch lf {
+		case "sans-serif", "serif", "monospace", "inherit", "initial", "system-ui", "-apple-system", "blinkmacsystemfont":
+			return
+		}
+		if !seenFont[lf] && len(fonts) < 6 {
+			seenFont[lf] = true
+			fonts = append(fonts, f)
+		}
+	}
+	for _, gm := range reGoogleFont.FindAllStringSubmatch(rawHTML, 10) {
+		if len(gm) >= 2 {
+			name := strings.Split(gm[1], ":")[0]
+			addFont(strings.ReplaceAll(name, "+", " "))
+		}
+	}
+	for _, fm := range reFontFamily.FindAllStringSubmatch(styleText, 25) {
+		if len(fm) >= 2 {
+			for _, part := range strings.Split(fm[1], ",") {
+				addFont(part)
+			}
+		}
+	}
+	return colors, fonts
+}
+
+func extractLinks(work string, base *url.URL) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range reAnchor.FindAllStringSubmatch(work, 500) {
+		if len(m) < 2 {
+			continue
+		}
+		attrs := parseAttrs(m[1])
+		u := resolveHTTPSLink(attrs["href"], base)
+		if u != "" && !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+			if len(out) >= 250 {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func extractImages(work string, base *url.URL) []ImageInfo {
+	seen := make(map[string]bool)
+	var out []ImageInfo
+	for _, m := range reImgTag.FindAllString(work, 150) {
+		attrs := parseAttrs(m)
+		src := resolveHTTPSLink(firstAttr(attrs, "src", "data-src"), base)
+		if src == "" || seen[src] {
+			continue
+		}
+		seen[src] = true
+		alt := strings.TrimSpace(html.UnescapeString(attrs["alt"]))
+		out = append(out, ImageInfo{URL: src, Alt: alt})
+		if len(out) >= 60 {
+			break
+		}
+	}
+	return out
+}
+
+func cleanInline(s string) string {
+	s = reAnyTag.ReplaceAllString(s, " ")
+	s = html.UnescapeString(s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func parseAttrs(tag string) map[string]string {
+	out := make(map[string]string)
+	for _, m := range reAttrPair.FindAllStringSubmatch(tag, 20) {
+		key := strings.ToLower(m[1])
+		val := m[2]
+		if val == "" {
+			val = m[3]
+		}
+		if val == "" {
+			val = m[4]
+		}
+		if _, exists := out[key]; !exists {
+			out[key] = val
+		}
+	}
+	return out
+}
+
+func firstAttr(attrs map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(attrs[k]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func resolveHref(raw string, base *url.URL) string {
+	raw = strings.TrimSpace(html.UnescapeString(raw))
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if base != nil {
+		u = base.ResolveReference(u)
+	}
+	return u.String()
+}
+
+func resolveHTTPSLink(raw string, base *url.URL) string {
+	resolved := resolveHref(raw, base)
+	if resolved == "" {
+		return ""
+	}
+	u, err := url.Parse(resolved)
+	if err != nil || (u.Scheme != "https" && (base == nil || u.Scheme != base.Scheme)) || u.Host == "" {
+		return ""
+	}
+	u.Fragment = ""
+	return u.String()
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}

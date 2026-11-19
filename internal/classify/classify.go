@@ -17,8 +17,9 @@ const (
 	KindFeed    Kind = "feed"    // Structured JSON product feed (`{"products": [...]}`)
 	KindJSON    Kind = "json"    // Any valid 2xx JSON document
 	KindPage    Kind = "page"    // Individual HTML document (`text/html`, 404/410 -> `gone`)
-	KindText    Kind = "text"    // Auxiliary HTML or XML document (e.g., sitemap or collection)
+	KindText    Kind = "text"    // Auxiliary HTML, Markdown, or XML document (e.g., sitemap or llms.txt)
 	KindCatalog Kind = "catalog" // Full-catalog HTML page where non-2xx fails the host batch
+	KindScrape  Kind = "scrape"  // Universal smart scrape (HTML, Markdown, JSON, or XML -> Markdown + metadata)
 )
 
 // Outcome describes how the crawler and caller should act on an HTTP response.
@@ -81,6 +82,18 @@ func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, 
 			return OutcomeError, invalidJSONMessage(header)
 		}
 		return OutcomeOK, ""
+
+	case KindScrape:
+		switch status {
+		case 403, 429, 503:
+			return OutcomeStop, fmt.Sprintf("HTTP %d", status)
+		case 404, 410:
+			return OutcomeGone, fmt.Sprintf("HTTP %d", status)
+		}
+		if !ok {
+			return OutcomeError, fmt.Sprintf("HTTP %d", status)
+		}
+		return OutcomeOK, ""
 	}
 
 	// Default (`KindFeed`): HTTP 2xx JSON object containing a top-level `"products"` array.
@@ -131,9 +144,14 @@ func AcceptFor(kind Kind, requested string) (string, error) {
 		return "application/json", nil
 	case KindPage, KindCatalog:
 		return "text/html", nil
+	case KindScrape:
+		if requested != "" {
+			return requested, nil
+		}
+		return "text/markdown,text/html;q=0.95,application/xhtml+xml;q=0.9,application/json;q=0.8,*/*;q=0.7", nil
 	case KindText:
 		switch requested {
-		case "text/html", "application/xml", "text/xml", "application/rss+xml", "application/atom+xml", "application/json", "text/calendar", "text/plain":
+		case "text/html", "text/markdown", "application/xml", "text/xml", "application/rss+xml", "application/atom+xml", "application/json", "text/calendar", "text/plain":
 			return requested, nil
 		}
 		return "", fmt.Errorf("unsupported KindText accept %q", requested)

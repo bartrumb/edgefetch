@@ -119,6 +119,7 @@ export interface HubCapabilities {
   version: string;
   capabilities: {
     fetch: boolean;
+    scrape: boolean;
     mcp: boolean;
     oauth: boolean;
     artifacts: boolean;
@@ -133,6 +134,7 @@ export function buildCapabilities(env: OptionalStorageBindings, version = '1.2.0
     version,
     capabilities: {
       fetch: true,
+      scrape: true,
       mcp: true,
       oauth: true,
       artifacts: Boolean(env.ARTIFACTS),

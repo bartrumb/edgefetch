@@ -57,6 +57,10 @@ export interface McpServerDeps {
     offset?: number;
     limit?: number;
   }) => Promise<{ ok: true; page: Record<string, unknown> } | { ok: false; status: number; error: string }>;
+  executeScrape?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
 function isAllowedMcpOrigin(originHeader: string | null, selfOrigin: string): boolean {
@@ -207,6 +211,39 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           includeBody: { type: 'boolean', default: false, description: 'Set true to include paged body previews + artifactId per URL.' },
         },
         required: ['urls'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'scrape',
+      description:
+        'Scrape a public HTTPS URL into clean main-content Markdown, metadata, links, images, branding, and /llms.txt + companion .md discovery (with verified META D1 + R2 maxAgeMs caching).',
+      annotations: {
+        title: 'Scrape URL to Markdown & Metadata',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Public https:// URL to scrape.' },
+          formats: {
+            type: 'array',
+            items: { type: 'string', enum: ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding', 'llmsTxt'] },
+            default: ['markdown'],
+            description: 'Desired output formats.',
+          },
+          onlyMainContent: { type: 'boolean', default: true, description: 'Strip nav/footer/aside chrome and isolate main/article content.' },
+          discoverLlmsTxt: { type: 'boolean', default: true, description: 'Check /llms.txt and upgrade to companion .md when available.' },
+          maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
+          redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
+          query: { type: 'string', description: 'Optional focus query to rerank relevant passages.' },
+          target: { type: 'string', enum: allowedTargets, default: defaultTarget },
+          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+        },
+        required: ['url'],
         additionalProperties: false,
       },
     },
@@ -412,6 +449,20 @@ async function handleToolCall(
       return { content: [{ type: 'text', text: JSON.stringify({ error: out.error, status: out.status }) }], isError: true };
     }
     return { content: [{ type: 'text', text: JSON.stringify(out.page, null, 2) }] };
+  }
+
+  if (name === 'scrape') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    if (!deps.executeScrape) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'scrape_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeScrape({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status !== 200 ? { isError: true } : {}),
+    };
   }
 
   return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };

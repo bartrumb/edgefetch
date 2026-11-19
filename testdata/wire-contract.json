@@ -136,6 +136,13 @@
           "storedBytes": 228,
           "encoding": "gzip",
           "retention": "transient"
+        },
+        "title": "EdgeFetch Docs",
+        "markdown": "# EdgeFetch Docs\n\nPolite distributed crawler.",
+        "llms": {
+          "found": true,
+          "llmsTxtUrl": "https://example.com/llms.txt",
+          "usedCompanionMd": true
         }
       }
     ]

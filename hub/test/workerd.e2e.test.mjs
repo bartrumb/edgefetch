@@ -311,6 +311,7 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
       const capsOff = await capsOffRes.json();
       assert.deepEqual(capsOff.capabilities, {
         fetch: true,
+        scrape: true,
         mcp: true,
         oauth: true,
         artifacts: false,
@@ -584,7 +585,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         oldStillExists: false,
       });
 
-      // S5: Verify stored artifact SHA-256 verification, gzip bomb cutoff + R2/D1 quarantine, and 410 Gone on expired R2 objects!
+      // S5 + S6: Verify stored artifact SHA-256 verification, gzip bomb quarantine, 410 expiry, and v1 Markdown derivation!
       const s5VerifyRes = await mf.dispatchFetch(`${ORIGIN}/__test_s5_verification`, { method: 'POST' });
       assert.equal(s5VerifyRes.status, 200);
       const s5Out = await s5VerifyRes.json();
@@ -592,6 +593,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         verifiedCount: 1,
         rejectedCount: 2,
         expiredCount: 1,
+        derivedCount: 1,
         rejectedReasons: ['content_hash_mismatch', 'decompression_limit_exceeded'],
         goodVerified: true,
         liedVerified: false,
@@ -602,6 +604,9 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         liedRowCount: 0,
         bombRowCount: 0,
         expiredBlobSha: 'ee'.repeat(32),
+        derivedPipelineVersion: 1,
+        derivedR2Text: 'Verified stored article payload!',
+        unverifiedDeriveStatus: 'unverified',
       });
 
       // Known META D1 artifact whose R2 object expired returns 410 Gone with clear `artifact_expired` error + message!
@@ -613,7 +618,137 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(expiredGetJson.error, 'artifact_expired');
       assert.match(expiredGetJson.message ?? '', /expired/i);
 
-      wsCap.close(1000, 'done');
+      // S6: End-to-end POST /v1/scrape (live scrape + JSON-LD schema + llms discovery -> stored & derived -> maxAgeMs cache hit!)
+      let scrapeAgentDispatches = 0;
+      const scrapeHtml = new TextEncoder().encode(
+        `<html lang="en"><head><title>Torque Guide</title><script type="application/ld+json">{"name":"Rear Axle","torqueNm":35}</script></head>` +
+          `<body><nav>menu</nav><main><h1>Torque Guide</h1><p>Tighten rear axle to 35 Nm.</p><a href="https://docs.example.com/safety">Safety</a></main></body></html>`,
+      );
+      const scrapeGz = gzipSync(scrapeHtml);
+      const scrapeBlobSha = sha256Hex(scrapeGz);
+      const scrapeContentSha = sha256Hex(scrapeHtml);
+
+      wsCap.close(1000, 'switch-to-scrape-handler');
+      await sleep(30);
+      const rWsScrape = await mf.dispatchFetch(`${ORIGIN}/agent/ws`, {
+        headers: {
+          upgrade: 'websocket',
+          authorization: `Bearer ${S1}`,
+          'x-agent-site': 'site-1',
+          'x-agent-arch': 'amd64',
+          'x-agent-capabilities': 'artifacts-v1',
+        },
+      });
+      const wsScrape = rWsScrape.webSocket;
+      wsScrape.accept();
+      wsScrape.addEventListener('message', async (e) => {
+        const d = String(e.data);
+        if (!d.includes('"dispatch"')) return;
+        scrapeAgentDispatches++;
+        const msg = JSON.parse(d);
+        assert.equal(msg.artifacts?.retention, 'stored');
+        const upRes = await mf.dispatchFetch(`${ORIGIN}/agent/artifacts/${scrapeBlobSha}`, {
+          method: 'PUT',
+          headers: {
+            authorization: `Bearer ${S1}`,
+            'x-agent-site': 'site-1',
+            'x-job-id': msg.jobId,
+            'x-job-nonce': msg.jobNonce,
+            'x-request-id': 'scrape-1',
+            'x-content-sha256': scrapeContentSha,
+            'x-content-bytes': String(scrapeHtml.byteLength),
+            'x-artifact-retention': 'stored',
+            'content-type': 'application/gzip',
+            'content-length': String(scrapeGz.byteLength),
+          },
+          body: scrapeGz,
+        });
+        assert.equal(upRes.status, 200);
+        await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${S1}`,
+            'x-agent-site': 'site-1',
+            'x-job-id': msg.jobId,
+            'x-job-nonce': msg.jobNonce,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            results: [
+              {
+                id: 'scrape-1',
+                url: 'https://docs.example.com/torque',
+                kind: 'scrape',
+                status: 200,
+                outcome: 'ok',
+                contentType: 'text/html; charset=utf-8',
+                bytes: scrapeHtml.byteLength,
+                llms: { found: true, llmsTxtUrl: 'https://docs.example.com/llms.txt', usedCompanionMd: false },
+                artifact: {
+                  blobSha256: scrapeBlobSha,
+                  contentSha256: scrapeContentSha,
+                  contentBytes: scrapeHtml.byteLength,
+                  storedBytes: scrapeGz.byteLength,
+                  encoding: 'gzip',
+                  retention: 'stored',
+                },
+              },
+            ],
+          }),
+        });
+      });
+
+      const liveScrapeRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          url: 'https://docs.example.com/torque',
+          target: 'agent',
+          formats: [
+            'markdown',
+            'links',
+            {
+              type: 'json',
+              schema: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  torqueNm: { type: 'number' },
+                },
+              },
+            },
+          ],
+        }),
+      });
+      assert.equal(liveScrapeRes.status, 200);
+      const liveScrapeJson = await liveScrapeRes.json();
+      assert.equal(liveScrapeJson.ok, true);
+      assert.equal(liveScrapeJson.cached, false);
+      assert.equal(liveScrapeJson.pipelineVersion, 1);
+      assert.equal(liveScrapeJson.llms?.found, true);
+      assert.deepEqual(liveScrapeJson.json, { name: 'Rear Axle', torqueNm: 35 });
+      assert.match(liveScrapeJson.markdown, /# Torque Guide/);
+      assert.equal(liveScrapeJson.markdown.includes('menu'), false);
+
+      // Second call with maxAgeMs=60000 hits verified META D1 + ARTIFACTS R2 cache without dispatching to agent!
+      const cachedScrapeRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          url: 'https://docs.example.com/torque',
+          formats: ['markdown'],
+          maxAgeMs: 60_000,
+        }),
+      });
+      assert.equal(cachedScrapeRes.status, 200);
+      assert.equal(cachedScrapeRes.headers.get('x-crawler-via'), 'cache:r2-d1');
+      const cachedScrapeJson = await cachedScrapeRes.json();
+      assert.equal(cachedScrapeJson.cached, true);
+      assert.equal(cachedScrapeJson.pipelineVersion, 1);
+      assert.match(cachedScrapeJson.markdown, /35 Nm/);
+      assert.equal(scrapeAgentDispatches, 1);
+
+      wsScrape.close(1000, 'done');
     }
   } finally {
     await mf.dispose();

@@ -38,6 +38,9 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   # Chromium's binary and its helpers (chrome_crashpad_handler) live here, not in /usr/bin. No shell is allowed.
   /usr/lib/chromium/** mrix,
   /lib/** mr,
+  # Read-only package data. Chromium aborts at start without ICU's data in /usr/share/icu (U_FILE_ACCESS_ERROR, 2.0.1).
+  /usr/share/** r,
+  /var/cache/fontconfig/** rwk,
   /etc/** r,
   /data/ r,
   /data/options.json r,

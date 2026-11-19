@@ -739,6 +739,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	errCh := make(chan error, 1)
 	go func() {
 		sc := bufio.NewScanner(stderr)
+		reason := ""
 		for sc.Scan() {
 			line := sc.Text()
 			if idx := strings.Index(line, "ws://127.0.0.1:"); idx >= 0 {
@@ -748,8 +749,13 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 				}
 				return
 			}
+			reason = startupReason(reason, line)
 		}
-		errCh <- errors.New("chromium exited before advertising DevTools ws://127.0.0.1 endpoint")
+		msg := "chromium exited before advertising DevTools ws://127.0.0.1 endpoint"
+		if reason != "" {
+			msg += ": " + reason
+		}
+		errCh <- errors.New(msg)
 	}()
 
 	var wsURL string
@@ -870,4 +876,23 @@ func randomSessionID() string {
 	var b [12]byte
 	_, _ = rand.Read(b[:])
 	return "efsess_" + hex.EncodeToString(b[:])
+}
+
+// startupReason keeps the most useful stderr line from a Chromium that failed to start: its last FATAL line, else its
+// last line. Chromium logs many harmless errors (no D-Bus, no Vulkan) first, so a FATAL line wins once seen.
+func startupReason(current, line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return current
+	}
+	if len(line) > 300 {
+		line = line[:300]
+	}
+	if strings.Contains(line, ":FATAL:") {
+		return line
+	}
+	if strings.Contains(current, ":FATAL:") {
+		return current
+	}
+	return line
 }

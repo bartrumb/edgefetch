@@ -45,6 +45,7 @@ import {
   STORED_RETENTION_MS,
   TRANSIENT_RETENTION_MS,
 } from '../src/storage.ts';
+import { executeInteractCall, extractYouTubeTranscriptFromHtml } from '../src/scrape.ts';
 
 function memoryCooldowns(): CooldownStore {
   const map = new Map<string, number>();
@@ -994,4 +995,55 @@ test('V2-3: EdgeFetchClient TypeScript SDK formats requests and surfaces typed E
     () => client.interact({ url: 'https://docs.example.com/' }),
     (err: unknown) => err instanceof EdgeFetchError && err.status === 503 && err.code === 'fat_agent_required',
   );
+});
+
+test('V2-4: executeInteractCall extracts YouTube transcript-segment-view-model without timestamp pollution', async () => {
+  const ytHtml = `<!doctype html><html><head><title>Amflow UE Carbon Review - YouTube</title></head><body><main><h1>Amflow UE Carbon Review</h1>
+    <transcript-segment-view-model class="ytwTranscriptSegmentViewModelHost">
+      <div aria-hidden="true" class="ytwTranscriptSegmentViewModelTimestamp">0:00</div>
+      <div class="ytwTranscriptSegmentViewModelTimestampA11yLabel">0 seconds</div>
+      <span class="ytAttributedStringHost" role="text">This bike is the Amflow UE Carbon &amp; it&#39;s [music] fast.</span>
+    </transcript-segment-view-model>
+    <transcript-segment-view-model class="ytwTranscriptSegmentViewModelHost">
+      <div aria-hidden="true" class="ytwTranscriptSegmentViewModelTimestamp">0:06</div>
+      <div class="ytwTranscriptSegmentViewModelTimestampA11yLabel">6 seconds</div>
+      <span class="ytAttributedStringHost" role="text">Electronic shifting comes standard.</span>
+    </transcript-segment-view-model>
+  </main></body></html>`;
+
+  assert.equal(
+    extractYouTubeTranscriptFromHtml(ytHtml),
+    "This bike is the Amflow UE Carbon & it's fast. Electronic shifting comes standard.",
+  );
+
+  let sentCall: Record<string, unknown> | undefined;
+  const out = await executeInteractCall({
+    payload: {
+      url: 'https://www.youtube.com/watch?v=VfXogERtsHs',
+      formats: ['transcript'],
+      actions: [{ type: 'click', selector: '#expand' }],
+    },
+    env: {},
+    executeHubFetch: async (_target, body) => {
+      sentCall = JSON.parse(body) as Record<string, unknown>;
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [{ outcome: 'ok', status: 200, body: ytHtml, bodyEncoding: 'utf-8' }],
+        }),
+      };
+    },
+  });
+
+  assert.equal(out.status, 200);
+  assert.equal(out.body.transcript, "This bike is the Amflow UE Carbon & it's fast. Electronic shifting comes standard.");
+  assert.equal(out.body.markdown, undefined, 'markdown must not be generated or sent when formats: ["transcript"]');
+  assert.equal((out.body.metadata as { title?: string })?.title, 'Amflow UE Carbon Review - YouTube');
+  assert.deepEqual((sentCall?.options as Record<string, unknown>), {
+    includeBody: true,
+    respectRobots: true,
+    maxBytes: 16 * 1024 * 1024,
+    timeoutMs: 45_000,
+  });
 });

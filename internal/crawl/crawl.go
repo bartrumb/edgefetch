@@ -4,9 +4,11 @@ package crawl
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -161,9 +164,11 @@ const (
 	DefaultPauseMs       = 2000
 	MaxPauseJitterMs     = 30_000
 	DefaultTimeoutMs     = 30_000
+	MaxTimeoutMs         = 120_000
 	DefaultMaxBytes      = 8 << 20
 	MaxMaxBytes          = 16 << 20
-	DefaultMaxTotalBytes = 16 << 20 // 16 MiB batch body ceiling stays safely below Hub's 20 MiB reply cap & 128 MiB GOMEMLIMIT
+	MaxStreamingPDFBytes = 256 << 20 // 256 MiB disk-streamed PDF ceiling on Fat nodes (zero 100 MiB heap spike)
+	DefaultMaxTotalBytes = 16 << 20  // 16 MiB batch body ceiling stays safely below Hub's 20 MiB reply cap & 128 MiB GOMEMLIMIT
 	MaxMaxTotalBytes     = 18 << 20
 	MaxConcurrency       = 4
 	MaxRetries           = 3
@@ -206,6 +211,9 @@ func (o Options) Normalize() Options {
 	}
 	if o.TimeoutMs <= 0 {
 		o.TimeoutMs = DefaultTimeoutMs
+	}
+	if o.TimeoutMs > MaxTimeoutMs {
+		o.TimeoutMs = MaxTimeoutMs
 	}
 	if o.MaxBytes <= 0 {
 		o.MaxBytes = DefaultMaxBytes
@@ -831,6 +839,14 @@ func isPermanentFetchError(err error) bool {
 	return strings.Contains(msg, "refusing connection to non-public IP") || strings.Contains(msg, "unsupported protocol scheme")
 }
 
+type streamedPDFResult struct {
+	rawBytes    int
+	sha256Hex   string
+	text        string
+	usedPoppler bool
+	err         error
+}
+
 func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (Result, string, []byte) {
 	res := Result{ID: r.ID, URL: r.URL, Kind: r.Kind}
 	accept, err := classify.AcceptFor(r.Kind, r.Accept)
@@ -843,7 +859,7 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	var finalBody []byte
 	for attempt := 1; ; attempt++ {
 		res.Attempts = attempt
-		status, header, body, truncated, timing, fetchErr := c.once(ctx, r, accept, opts)
+		status, header, body, truncated, maxLimitUsed, pdfStream, timing, fetchErr := c.onceWithPDFStream(ctx, r, accept, opts)
 		res.Timing = timing
 		if fetchErr != nil {
 			if ctx.Err() != nil {
@@ -880,9 +896,41 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 		}
 
 		if truncated {
-			res.Outcome, res.Problem = classify.OutcomeError, fmt.Sprintf("body over %d bytes", opts.MaxBytes)
+			res.Outcome, res.Problem = classify.OutcomeError, fmt.Sprintf("body over %d bytes", maxLimitUsed)
 			if header.Get("cf-mitigated") != "" {
 				res.Outcome, res.Problem = classify.Classify(r.Kind, status, header, nil)
+			}
+		} else if pdfStream != nil {
+			res.Bytes = pdfStream.rawBytes
+			res.SHA256 = pdfStream.sha256Hex
+			if pdfStream.err != nil {
+				if r.Kind == classify.KindScrape {
+					res.Outcome, res.Problem = classify.OutcomeError, pdfStream.err.Error()
+				} else {
+					res.Outcome, res.Problem = classify.OutcomeOK, pdfStream.err.Error()
+				}
+			} else {
+				pdfTxt := pdfStream.text
+				if r.Query != "" {
+					pdfTxt = extract.RerankPassages(pdfTxt, r.Query, 24_000)
+				}
+				if r.RedactPII {
+					pdfTxt = extract.RedactPII(pdfTxt)
+				}
+				res.Outcome, res.Problem = classify.OutcomeOK, ""
+				res.Markdown = pdfTxt
+				if hasFormat(r.Formats, "text") {
+					res.Text = pdfTxt
+				}
+				res.PDFEngine = "pure-go"
+				if pdfStream.usedPoppler {
+					res.PDFEngine = "poppler-pdftotext"
+				}
+				if opts.IncludeBody {
+					res.Body = pdfTxt
+					res.BodyEncoding = "utf-8"
+					res.ContentType = "text/markdown; charset=utf-8"
+				}
 			}
 		} else if status == http.StatusNotModified && (r.IfNoneMatch != "" || r.IfModifiedSince != "") && res.CfMitigated == "" {
 			res.Outcome, res.Problem = classify.OutcomeOK, ""
@@ -890,7 +938,7 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 			res.Outcome, res.Problem = classify.Classify(r.Kind, status, header, body)
 		}
 		finalBody = body
-		if opts.IncludeBody {
+		if pdfStream == nil && opts.IncludeBody {
 			if utf8.Valid(body) {
 				res.Body = string(body)
 				res.BodyEncoding = "utf-8"
@@ -938,7 +986,7 @@ func ms(from, to time.Time) int64 {
 	return to.Sub(from).Milliseconds()
 }
 
-func (c *Crawler) once(ctx context.Context, r Request, accept string, opts Options) (int, http.Header, []byte, bool, Timing, error) {
+func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept string, opts Options) (int, http.Header, []byte, bool, int, *streamedPDFResult, Timing, error) {
 	var tm Timing
 	var dnsStart, dnsDone, connStart, connDone, tlsStart, tlsDone, wrote, firstByte time.Time
 	var mu sync.Mutex
@@ -973,12 +1021,18 @@ func (c *Crawler) once(ctx context.Context, r Request, accept string, opts Optio
 		tm.DNSMs, tm.ConnectMs, tm.TLSMs, tm.TTFBMs = ms(dnsStart, dnsDone), ms(connStart, connDone), ms(tlsStart, tlsDone), ms(wrote, firstByte)
 	}
 
-	actx, cancel := context.WithTimeout(httptrace.WithClientTrace(ctx, trace), time.Duration(opts.TimeoutMs)*time.Millisecond)
+	timeoutDur := time.Duration(opts.TimeoutMs) * time.Millisecond
+	if (r.Kind == classify.KindScrape || r.Kind == classify.KindPDF) && timeoutDur < 95*time.Second {
+		if u, uErr := url.Parse(r.URL); uErr == nil && strings.HasSuffix(strings.ToLower(u.Path), ".pdf") {
+			timeoutDur = 95 * time.Second
+		}
+	}
+	actx, cancel := context.WithTimeout(httptrace.WithClientTrace(ctx, trace), timeoutDur)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(actx, http.MethodGet, r.URL, nil)
 	if err != nil {
-		return 0, nil, nil, false, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", accept)
@@ -996,23 +1050,92 @@ func (c *Crawler) once(ctx context.Context, r Request, accept string, opts Optio
 	resp, err := c.client.Do(req)
 	if err != nil {
 		phases()
-		return 0, nil, nil, false, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
 	}
 	defer resp.Body.Close()
 	tm.Proto = resp.Proto
 
+	// Stream PDFs up to 256 MiB directly to an ephemeral `/tmp` file when extracting Markdown/text (`KindScrape` / `KindPDF`),
+	// avoiding 100+ MiB heap spikes on service manuals while seeking the PDF `xref` trailer on disk via Poppler `pdftotext`.
+	canStreamPDF := (r.Kind == classify.KindScrape || r.Kind == classify.KindPDF) &&
+		!hasFormat(r.Formats, "base64") &&
+		resp.StatusCode >= 200 && resp.StatusCode <= 299 &&
+		resp.Header.Get("cf-mitigated") == ""
+
+	var prefix []byte
+	if canStreamPDF {
+		var pErr error
+		prefix, pErr = io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if pErr != nil {
+			phases()
+			return 0, nil, nil, false, opts.MaxBytes, nil, tm, pErr
+		}
+		ctLower := strings.ToLower(resp.Header.Get("content-type"))
+		if strings.Contains(ctLower, "application/pdf") || extract.IsPDFBytes(prefix) {
+			if tmpFile, tmpErr := os.CreateTemp("", "edgefetch-pdf-*.pdf"); tmpErr == nil {
+				tmpPath := tmpFile.Name()
+				defer func() {
+					_ = tmpFile.Close()
+					_ = os.Remove(tmpPath)
+				}()
+				hasher := sha256.New()
+				mw := io.MultiWriter(tmpFile, hasher)
+				var totalWritten int64
+				if len(prefix) > 0 {
+					n, wErr := mw.Write(prefix)
+					totalWritten += int64(n)
+					if wErr != nil {
+						phases()
+						return 0, nil, nil, false, MaxStreamingPDFBytes, nil, tm, wErr
+					}
+				}
+				remLimit := int64(MaxStreamingPDFBytes) - totalWritten + 1
+				copyBuf := make([]byte, 32*1024)
+				copied, cErr := io.CopyBuffer(mw, io.LimitReader(resp.Body, remLimit), copyBuf)
+				totalWritten += copied
+				phases()
+				if cErr != nil {
+					return 0, nil, nil, false, MaxStreamingPDFBytes, nil, tm, cErr
+				}
+				if totalWritten > MaxStreamingPDFBytes {
+					return resp.StatusCode, resp.Header, nil, true, MaxStreamingPDFBytes, nil, tm, nil
+				}
+				_ = tmpFile.Close()
+				sum := hasher.Sum(nil)
+				txt, usedPoppler, extErr := extract.ExtractPDFFileText(actx, tmpPath, r.MaxPages)
+				return resp.StatusCode, resp.Header, nil, false, MaxStreamingPDFBytes, &streamedPDFResult{
+					rawBytes:    int(totalWritten),
+					sha256Hex:   hex.EncodeToString(sum),
+					text:        txt,
+					usedPoppler: usedPoppler,
+					err:         extErr,
+				}, tm, nil
+			}
+		}
+	}
+
 	// Read `MaxBytes + 1` bytes so normal responses hit `EOF` cleanly (returning the HTTP/2 or keep-alive socket to the
 	// pool for reuse) while oversized streams are detected and cut off without unbounded memory allocation.
-	limited, err := io.ReadAll(io.LimitReader(resp.Body, int64(opts.MaxBytes)+1))
+	remBytes := int64(opts.MaxBytes) - int64(len(prefix)) + 1
+	if remBytes < 1 {
+		remBytes = 1
+	}
+	tail, err := io.ReadAll(io.LimitReader(resp.Body, remBytes))
 	phases()
 	if err != nil {
-		return 0, nil, nil, false, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
+	}
+	limited := tail
+	if len(prefix) > 0 {
+		limited = make([]byte, 0, len(prefix)+len(tail))
+		limited = append(limited, prefix...)
+		limited = append(limited, tail...)
 	}
 	truncated := len(limited) > opts.MaxBytes
 	if truncated {
 		limited = limited[:opts.MaxBytes]
 	}
-	return resp.StatusCode, resp.Header, limited, truncated, tm, nil
+	return resp.StatusCode, resp.Header, limited, truncated, opts.MaxBytes, nil, tm, nil
 }
 
 func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, rawURL string) (allowed, distressed bool, reason string) {
@@ -1040,72 +1163,124 @@ func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, raw
 	return true, false, ""
 }
 
-// fetchRobots implements RFC 9309 §2.3.1:
+// fetchRobots implements RFC 9309 §2.3.1 (following up to MaxRedirects validated redirects, e.g. apex -> www):
+//   - 3xx (up to MaxRedirects hops): validate Location via `c.allow` and follow.
 //   - 2xx: parse rules and cache for RobotsCacheTTL (24 h).
 //   - 4xx except 429 (e.g. 404, 403, 410): "unavailable" -> allow all for RobotsCacheTTL (24 h).
 //   - Network/timeout error, body read error, 429, or 5xx: "unreachable" -> disallow all for RobotsDistressTTL (5 m).
 func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness.RobotsEntry, time.Duration) {
-	robotsURL := (&url.URL{Scheme: target.Scheme, Host: target.Host, Path: "/robots.txt"}).String()
+	curURL := &url.URL{Scheme: target.Scheme, Host: target.Host, Path: "/robots.txt"}
 	rctx, cancel := context.WithTimeout(ctx, politeness.RobotsTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(rctx, http.MethodGet, robotsURL, nil)
-	if err != nil {
-		return &politeness.RobotsEntry{
-			Distressed: true,
-			Reason:     "robots.txt request invalid: " + err.Error(),
-			ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
-		}, politeness.DefaultThrottlePause
-	}
-	req.Header.Set("User-Agent", c.userAgent)
-	req.Header.Set("Accept", "text/plain,*/*;q=0.8")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return &politeness.RobotsEntry{
-			Distressed: true,
-			Reason:     "robots.txt unreachable (disallow assumed per RFC 9309): " + err.Error(),
-			ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
-		}, politeness.DefaultThrottlePause
-	}
-	defer resp.Body.Close()
-
-	now := c.Now()
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		pause := politeness.ParseRetryAfter(resp.Header.Get("Retry-After"), now)
-		if pause < politeness.DefaultThrottlePause {
-			pause = politeness.DefaultThrottlePause
+	for hop := 0; hop <= MaxRedirects; hop++ {
+		if c.allow != nil {
+			if err := c.allow(curURL); err != nil {
+				return &politeness.RobotsEntry{
+					Distressed: true,
+					Reason:     "robots.txt disallowed redirect target: " + err.Error(),
+					ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
+				}, politeness.DefaultThrottlePause
+			}
 		}
-		return &politeness.RobotsEntry{
-			Distressed: true,
-			Reason:     fmt.Sprintf("robots.txt returned HTTP %d (disallow assumed per RFC 9309)", resp.StatusCode),
-			ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
-		}, pause
-	}
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		return &politeness.RobotsEntry{ExpiresAt: now.Add(politeness.RobotsCacheTTL)}, 0
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &politeness.RobotsEntry{
-			Distressed: true,
-			Reason:     fmt.Sprintf("robots.txt returned unexpected HTTP %d", resp.StatusCode),
-			ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
-		}, politeness.DefaultThrottlePause
-	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, politeness.RobotsMaxBytes))
-	if err != nil {
-		return &politeness.RobotsEntry{
-			Distressed: true,
-			Reason:     "robots.txt read failed (disallow assumed per RFC 9309): " + err.Error(),
-			ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
-		}, politeness.DefaultThrottlePause
+
+		req, err := http.NewRequestWithContext(rctx, http.MethodGet, curURL.String(), nil)
+		if err != nil {
+			return &politeness.RobotsEntry{
+				Distressed: true,
+				Reason:     "robots.txt request invalid: " + err.Error(),
+				ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
+			}, politeness.DefaultThrottlePause
+		}
+		req.Header.Set("User-Agent", c.userAgent)
+		req.Header.Set("Accept", "text/plain,*/*;q=0.8")
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return &politeness.RobotsEntry{
+				Distressed: true,
+				Reason:     "robots.txt unreachable (disallow assumed per RFC 9309): " + err.Error(),
+				ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
+			}, politeness.DefaultThrottlePause
+		}
+
+		now := c.Now()
+		if isRedirectStatus(resp.StatusCode) {
+			loc := strings.TrimSpace(resp.Header.Get("Location"))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			if loc == "" {
+				return &politeness.RobotsEntry{
+					Distressed: true,
+					Reason:     fmt.Sprintf("robots.txt redirect HTTP %d missing Location", resp.StatusCode),
+					ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+				}, politeness.DefaultThrottlePause
+			}
+			if hop == MaxRedirects {
+				return &politeness.RobotsEntry{
+					Distressed: true,
+					Reason:     fmt.Sprintf("robots.txt exceeded %d redirects", MaxRedirects),
+					ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+				}, politeness.DefaultThrottlePause
+			}
+			locURL, parseErr := url.Parse(loc)
+			if parseErr != nil {
+				return &politeness.RobotsEntry{
+					Distressed: true,
+					Reason:     "robots.txt invalid redirect Location: " + parseErr.Error(),
+					ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+				}, politeness.DefaultThrottlePause
+			}
+			curURL = curURL.ResolveReference(locURL)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			pause := politeness.ParseRetryAfter(resp.Header.Get("Retry-After"), now)
+			if pause < politeness.DefaultThrottlePause {
+				pause = politeness.DefaultThrottlePause
+			}
+			_ = resp.Body.Close()
+			return &politeness.RobotsEntry{
+				Distressed: true,
+				Reason:     fmt.Sprintf("robots.txt returned HTTP %d (disallow assumed per RFC 9309)", resp.StatusCode),
+				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+			}, pause
+		}
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			_ = resp.Body.Close()
+			return &politeness.RobotsEntry{ExpiresAt: now.Add(politeness.RobotsCacheTTL)}, 0
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			return &politeness.RobotsEntry{
+				Distressed: true,
+				Reason:     fmt.Sprintf("robots.txt returned unexpected HTTP %d", resp.StatusCode),
+				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+			}, politeness.DefaultThrottlePause
+		}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, politeness.RobotsMaxBytes))
+		_ = resp.Body.Close()
+		if err != nil {
+			return &politeness.RobotsEntry{
+				Distressed: true,
+				Reason:     "robots.txt read failed (disallow assumed per RFC 9309): " + err.Error(),
+				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+			}, politeness.DefaultThrottlePause
+		}
+
+		uaProduct := strings.ToLower(c.userAgent)
+		if slash := strings.IndexByte(uaProduct, '/'); slash > 0 {
+			uaProduct = uaProduct[:slash]
+		}
+		return politeness.ParseRobotsTxt(string(raw), uaProduct, now.Add(politeness.RobotsCacheTTL)), 0
 	}
 
-	uaProduct := strings.ToLower(c.userAgent)
-	if slash := strings.IndexByte(uaProduct, '/'); slash > 0 {
-		uaProduct = uaProduct[:slash]
-	}
-	return politeness.ParseRobotsTxt(string(raw), uaProduct, now.Add(politeness.RobotsCacheTTL)), 0
+	return &politeness.RobotsEntry{
+		Distressed: true,
+		Reason:     fmt.Sprintf("robots.txt exceeded %d redirects", MaxRedirects),
+		ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
+	}, politeness.DefaultThrottlePause
 }
 
 // Summary aggregates outcome and status-code histograms across a `FetchReply`.

@@ -293,7 +293,7 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 		}
 	}
 
-	if shouldDiscoverLlms(r, opts) && res.Outcome == classify.OutcomeOK && r.URL != "" {
+	if res.PDFEngine == "" && shouldDiscoverLlms(r, opts) && res.Outcome == classify.OutcomeOK && r.URL != "" {
 		targetForLlms := res.FinalURL
 		if targetForLlms == "" {
 			targetForLlms = r.URL

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -20,6 +21,56 @@ const maxPDFTextOutputBytes = 8 << 20 // 8 MiB extracted text ceiling
 func HasPDFToText() bool {
 	_, err := exec.LookPath("pdftotext")
 	return err == nil
+}
+
+// ExtractPDFFileText extracts UTF-8 text from an on-disk PDF file up to `maxPages` (default 60) using `pdftotext`
+// (`poppler-utils`), falling back to a bounded pure-Go FlateDecode stream reader when `pdftotext` is absent.
+// Reading from a seekable file path allows Poppler to seek directly to the PDF `xref` trailer at EOF without buffering
+// 100+ MiB manuals in RAM.
+func ExtractPDFFileText(ctx context.Context, pdfPath string, maxPages int) (text string, usedPoppler bool, err error) {
+	if maxPages <= 0 {
+		maxPages = 60
+	}
+	if maxPages > 500 {
+		maxPages = 500
+	}
+	if bin, lookErr := exec.LookPath("pdftotext"); lookErr == nil {
+		pctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(pctx, bin, "-layout", "-enc", "UTF-8", "-nopgbrk", "-l", strconv.Itoa(maxPages), pdfPath, "-")
+		stdout, pipeErr := cmd.StdoutPipe()
+		if pipeErr == nil {
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if startErr := cmd.Start(); startErr == nil {
+				out, readErr := io.ReadAll(io.LimitReader(stdout, maxPDFTextOutputBytes))
+				waitErr := cmd.Wait()
+				if readErr == nil && waitErr == nil {
+					cleaned := cleanPDFText(string(out))
+					if cleaned == "" {
+						return "", true, errors.New("PDF contains no extractable text (scanned image PDF)")
+					}
+					return cleaned, true, nil
+				}
+			}
+		}
+	}
+
+	f, openErr := os.Open(pdfPath)
+	if openErr != nil {
+		return "", false, openErr
+	}
+	defer f.Close()
+	buf, readErr := io.ReadAll(io.LimitReader(f, 32<<20))
+	if readErr != nil {
+		return "", false, readErr
+	}
+	fallback := extractPDFTextPureGo(buf, maxPages)
+	if fallback == "" {
+		return "", false, fmt.Errorf("PDF contains no extractable text streams (install edgefetch_fat for poppler pdftotext layout extraction)")
+	}
+	return fallback, false, nil
 }
 
 // ExtractPDFText extracts UTF-8 text from `pdfBytes` up to `maxPages` (default 60).

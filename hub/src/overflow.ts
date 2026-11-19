@@ -332,6 +332,7 @@ async function fetchOverflowRobots(
   userAgent: string,
   fetchFn: typeof fetch,
   budgetDeadlineAt: number,
+  canonicalSelf = '',
 ): Promise<ParsedRobots> {
   const remMs = budgetDeadlineAt - Date.now();
   if (remMs <= 0) {
@@ -339,58 +340,59 @@ async function fetchOverflowRobots(
   }
   const signal = AbortSignal.timeout(Math.min(ROBOTS_TIMEOUT_MS, remMs));
   try {
-    const resp = await fetchFn(`${origin}/robots.txt`, {
-      method: 'GET',
-      headers: { 'user-agent': userAgent, accept: 'text/plain,*/*;q=0.8' },
-      redirect: 'manual',
-      signal,
-    });
-    if (resp.status >= 300 && resp.status < 400) {
-      await resp.body?.cancel().catch(() => undefined);
-      // Follow at most 1 same-https robots.txt redirect if valid, otherwise treat 4xx unavailable / 5xx unreachable.
-      const loc = resp.headers.get('location');
-      if (loc) {
-        const next = new URL(loc, `${origin}/robots.txt`);
-        if (next.protocol === 'https:' && (!next.port || next.port === '443')) {
-          const resp2 = await fetchFn(next.toString(), {
-            method: 'GET',
-            headers: { 'user-agent': userAgent, accept: 'text/plain,*/*;q=0.8' },
-            redirect: 'manual',
-            signal,
-          });
-          if (resp2.ok) {
-            const { bytes } = await readBoundedBytes(resp2.body, ROBOTS_MAX_BYTES, signal);
-            const rawText = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-            return parseOverflowRobotsTxt(rawText.replace(/^\xef\xbb\xbf/, ''), userAgent);
-          }
-          await resp2.body?.cancel().catch(() => undefined);
-          if (resp2.status >= 400 && resp2.status < 500 && resp2.status !== 429) {
-            return { unreachable: false, crawlDelayMs: 0, rules: [] };
-          }
-        }
+    let curUrl = `${origin}/robots.txt`;
+    for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+      const parsedCur = new URL(curUrl);
+      if (isDisallowedOverflowUrl(parsedCur, canonicalSelf)) {
+        return { unreachable: true, reason: 'robots.txt disallowed redirect target', crawlDelayMs: 15_000, rules: [] };
       }
-      return { unreachable: true, reason: `robots.txt redirect failed (HTTP ${resp.status})`, crawlDelayMs: 15_000, rules: [] };
-    }
-    if (resp.status === 429 || resp.status >= 500) {
+      const resp = await fetchFn(curUrl, {
+        method: 'GET',
+        headers: { 'user-agent': userAgent, accept: 'text/plain,*/*;q=0.8' },
+        redirect: 'manual',
+        signal,
+      });
+      if (resp.status >= 300 && resp.status < 400) {
+        await resp.body?.cancel().catch(() => undefined);
+        const loc = resp.headers.get('location')?.trim();
+        if (!loc || hop === MAX_REDIRECT_HOPS) {
+          return {
+            unreachable: true,
+            reason: `robots.txt redirect failed (HTTP ${resp.status})`,
+            crawlDelayMs: 15_000,
+            rules: [],
+          };
+        }
+        curUrl = new URL(loc, curUrl).toString();
+        continue;
+      }
+      if (resp.status === 429 || resp.status >= 500) {
+        await resp.body?.cancel().catch(() => undefined);
+        return {
+          unreachable: true,
+          reason: `robots.txt returned HTTP ${resp.status} (disallow assumed per RFC 9309)`,
+          crawlDelayMs: 15_000,
+          rules: [],
+        };
+      }
+      if (resp.status >= 400 && resp.status < 500) {
+        await resp.body?.cancel().catch(() => undefined);
+        return { unreachable: false, crawlDelayMs: 0, rules: [] };
+      }
+      if (resp.ok) {
+        const { bytes } = await readBoundedBytes(resp.body, ROBOTS_MAX_BYTES, signal);
+        const rawText = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+        return parseOverflowRobotsTxt(rawText.replace(/^\xef\xbb\xbf/, ''), userAgent);
+      }
       await resp.body?.cancel().catch(() => undefined);
       return {
         unreachable: true,
-        reason: `robots.txt returned HTTP ${resp.status} (disallow assumed per RFC 9309)`,
+        reason: `robots.txt returned unexpected HTTP ${resp.status}`,
         crawlDelayMs: 15_000,
         rules: [],
       };
     }
-    if (resp.status >= 400 && resp.status < 500) {
-      await resp.body?.cancel().catch(() => undefined);
-      return { unreachable: false, crawlDelayMs: 0, rules: [] };
-    }
-    if (!resp.ok) {
-      await resp.body?.cancel().catch(() => undefined);
-      return { unreachable: true, reason: `robots.txt returned HTTP ${resp.status}`, crawlDelayMs: 15_000, rules: [] };
-    }
-    const { bytes } = await readBoundedBytes(resp.body, ROBOTS_MAX_BYTES, signal);
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-    return parseOverflowRobotsTxt(text, userAgent);
+    return { unreachable: true, reason: `robots.txt exceeded ${MAX_REDIRECT_HOPS} redirects`, crawlDelayMs: 15_000, rules: [] };
   } catch (e) {
     return {
       unreachable: true,
@@ -482,7 +484,7 @@ export async function cloudflareOverflowFetch(
       if (enforceRobotsOnHop) {
         robotsEntry = robotsCache.get(host);
         if (!robotsEntry) {
-          robotsEntry = await fetchOverflowRobots(parsedUrl.origin, userAgent, fetchFn, budgetDeadlineAt);
+          robotsEntry = await fetchOverflowRobots(parsedUrl.origin, userAgent, fetchFn, budgetDeadlineAt, canonicalSelf);
           robotsCache.set(host, robotsEntry);
         }
         const pathAndQuery = `${parsedUrl.pathname || '/'}${parsedUrl.search || ''}`;

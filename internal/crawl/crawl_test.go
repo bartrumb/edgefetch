@@ -646,3 +646,103 @@ func TestRenderModeAutoPreChecksRobotsAndPDFExtraction(t *testing.T) {
 		t.Fatalf("expected PDF extraction in KindPDF, got: %+v", out[2])
 	}
 }
+
+func TestRobotsFollowsMultiHopRedirectsAndBlocksSSRFRedirect(t *testing.T) {
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Host {
+		case "aventon.test":
+			if r.URL.Path == "/robots.txt" {
+				w.Header().Set("Location", "http://www.aventon.test/robots.txt")
+				w.WriteHeader(http.StatusMovedPermanently)
+				return
+			}
+			if r.URL.Path == "/products.json" {
+				w.Header().Set("Location", "http://www.aventon.test/products.json")
+				w.WriteHeader(http.StatusMovedPermanently)
+				return
+			}
+		case "www.aventon.test":
+			if r.URL.Path == "/robots.txt" {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("User-agent: *\nDisallow: /checkout\n"))
+				return
+			}
+			if r.URL.Path == "/products.json" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"products":[{"id":1,"title":"Aventure.2"}]}`))
+				return
+			}
+		case "ssrf-robots.test":
+			if r.URL.Path == "/robots.txt" {
+				w.Header().Set("Location", "http://127.0.0.1/robots.txt")
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	c.allow = func(u *url.URL) error {
+		if u.Hostname() == "127.0.0.1" {
+			return fmt.Errorf("refusing connection to non-public IP 127.0.0.1")
+		}
+		return nil
+	}
+
+	out := c.Run(context.Background(), []Request{
+		{ID: "aventon", URL: "http://aventon.test/products.json", Kind: classify.KindFeed},
+		{ID: "blocked-path", URL: "http://aventon.test/checkout", Kind: classify.KindPage},
+		{ID: "ssrf", URL: "http://ssrf-robots.test/products.json", Kind: classify.KindFeed},
+	}, Options{PauseMs: 1, IncludeBody: true})
+
+	if out[0].Outcome != classify.OutcomeOK || !strings.Contains(out[0].Body, "Aventure.2") {
+		t.Fatalf("expected apex -> www robots.txt 301 redirect to succeed and fetch products.json, got: %+v", out[0])
+	}
+	if out[1].Outcome != classify.OutcomeSkip || !strings.Contains(out[1].Problem, "robots.txt disallowed /checkout") {
+		t.Fatalf("expected redirected robots.txt rules to block /checkout, got: %+v", out[1])
+	}
+	if out[2].Outcome != classify.OutcomeStop || !strings.Contains(out[2].Problem, "robots.txt disallowed redirect target") {
+		t.Fatalf("expected SSRF robots.txt redirect to fail closed, got: %+v", out[2])
+	}
+}
+
+func TestStreamingLargePDFExceedingMaxBytesExtractsMarkdownWithoutTruncation(t *testing.T) {
+	// Build a valid ~1.5 MiB PDF while setting Options.MaxBytes = 64 KiB so in-memory buffering would fail with "body over 65536 bytes".
+	var pdfBuf strings.Builder
+	pdfBuf.WriteString("%PDF-1.7\n1 0 obj << /Length 64 >>\nstream\nBT /F1 12 Tf 72 712 Td (GOTRAX Porter Torque Spec 45 Nm) Tj ET\nendstream\nendobj\n")
+	pdfBuf.WriteString("%DiagramPadding ")
+	pdfBuf.WriteString(strings.Repeat("0123456789ABCDEF", 96*1024)) // +1.5 MiB binary diagram padding
+	pdfBuf.WriteString("\n%%EOF\n")
+	largePDF := []byte(pdfBuf.String())
+
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			w.WriteHeader(http.StatusNotFound)
+		case "/GOTRAX_Porter_User_Manual.pdf":
+			w.Header().Set("Content-Type", "application/pdf")
+			_, _ = w.Write(largePDF)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+
+	out := c.Run(context.Background(), []Request{
+		{ID: "manual", URL: "http://manuals.test/GOTRAX_Porter_User_Manual.pdf", Kind: classify.KindScrape, Formats: []string{"markdown"}},
+	}, Options{PauseMs: 1, MaxBytes: 64 * 1024, IncludeBody: true})
+
+	if out[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected 1.5 MiB PDF with 64 KiB MaxBytes to stream to /tmp without truncation, got: %+v", out[0])
+	}
+	if out[0].Bytes != len(largePDF) {
+		t.Fatalf("expected raw PDF byte count %d, got %d", len(largePDF), out[0].Bytes)
+	}
+	if out[0].SHA256 == "" {
+		t.Fatalf("expected raw PDF SHA256 to be populated")
+	}
+	if !strings.Contains(out[0].Markdown, "GOTRAX Porter Torque Spec 45 Nm") {
+		t.Fatalf("expected extracted PDF markdown, got %q", out[0].Markdown)
+	}
+	if len(out[0].Body) >= 4096 || !strings.HasPrefix(out[0].ContentType, "text/markdown") {
+		t.Fatalf("expected compact text/markdown Body for R2 upload (len=%d, ct=%q)", len(out[0].Body), out[0].ContentType)
+	}
+}

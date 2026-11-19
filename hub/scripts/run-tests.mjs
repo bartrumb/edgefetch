@@ -29,7 +29,7 @@ try {
     outfile: workerOutfile,
   });
 
-  execFileSync(process.execPath, ['--test', unitOutfile, e2eTestFile], {
+  execFileSync(process.execPath, ['--test', '--test-force-exit', unitOutfile, e2eTestFile], {
     stdio: 'inherit',
     env: { ...process.env, EDGEFETCH_WORKERD_BUNDLE: workerOutfile },
   });

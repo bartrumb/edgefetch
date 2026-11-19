@@ -312,6 +312,7 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
       assert.deepEqual(capsOff.capabilities, {
         fetch: true,
         scrape: true,
+        extract: true,
         mcp: true,
         oauth: true,
         artifacts: false,
@@ -348,6 +349,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
     }),
   );
 
+  const openSockets = [];
   try {
     const authz = { authorization: `Bearer ${CALLER}`, 'content-type': 'application/json' };
     const capsRes = await mf.dispatchFetch(`${ORIGIN}/v1/capabilities`, { headers: authz });
@@ -429,6 +431,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       });
       const wsCap = rWs.webSocket;
       wsCap.accept();
+      openSockets.push(wsCap);
 
       const eightMiB = Buffer.from('<html>' + 'R2BatchData!'.repeat(700_000).slice(0, (8 << 20) - 13) + '</html>');
       const contentSha = sha256Hex(eightMiB);
@@ -607,6 +610,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         derivedPipelineVersion: 1,
         derivedR2Text: 'Verified stored article payload!',
         unverifiedDeriveStatus: 'unverified',
+        capacityStopStatus: 'capacity_reached',
       });
 
       // Known META D1 artifact whose R2 object expired returns 410 Gone with clear `artifact_expired` error + message!
@@ -618,15 +622,12 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(expiredGetJson.error, 'artifact_expired');
       assert.match(expiredGetJson.message ?? '', /expired/i);
 
-      // S6: End-to-end POST /v1/scrape (live scrape + JSON-LD schema + llms discovery -> stored & derived -> maxAgeMs cache hit!)
+      // S6 + S7: End-to-end POST /v1/scrape + FTS5 collection indexing + atomic page replacement + POST /v1/extract!
       let scrapeAgentDispatches = 0;
-      const scrapeHtml = new TextEncoder().encode(
+      let currentScrapeHtml = new TextEncoder().encode(
         `<html lang="en"><head><title>Torque Guide</title><script type="application/ld+json">{"name":"Rear Axle","torqueNm":35}</script></head>` +
-          `<body><nav>menu</nav><main><h1>Torque Guide</h1><p>Tighten rear axle to 35 Nm.</p><a href="https://docs.example.com/safety">Safety</a></main></body></html>`,
+          `<body><nav>menu</nav><main><h1>Torque Guide</h1><p>Tighten rear axle cadmium nut to 35 Nm.</p><a href="https://docs.example.com/safety">Safety</a></main></body></html>`,
       );
-      const scrapeGz = gzipSync(scrapeHtml);
-      const scrapeBlobSha = sha256Hex(scrapeGz);
-      const scrapeContentSha = sha256Hex(scrapeHtml);
 
       wsCap.close(1000, 'switch-to-scrape-handler');
       await sleep(30);
@@ -641,27 +642,34 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       });
       const wsScrape = rWsScrape.webSocket;
       wsScrape.accept();
+      openSockets.push(wsScrape);
       wsScrape.addEventListener('message', async (e) => {
         const d = String(e.data);
         if (!d.includes('"dispatch"')) return;
         scrapeAgentDispatches++;
         const msg = JSON.parse(d);
         assert.equal(msg.artifacts?.retention, 'stored');
-        const upRes = await mf.dispatchFetch(`${ORIGIN}/agent/artifacts/${scrapeBlobSha}`, {
+        const curGz = gzipSync(currentScrapeHtml);
+        const curBlobSha = sha256Hex(curGz);
+        const curContentSha = sha256Hex(currentScrapeHtml);
+        const parsedCall = typeof msg.call === 'string' ? JSON.parse(msg.call) : (msg.call ?? {});
+        const reqId = parsedCall.requests?.[0]?.id ?? 'scrape-1';
+        const reqUrl = parsedCall.requests?.[0]?.url ?? 'https://docs.example.com/torque';
+        const upRes = await mf.dispatchFetch(`${ORIGIN}/agent/artifacts/${curBlobSha}`, {
           method: 'PUT',
           headers: {
             authorization: `Bearer ${S1}`,
             'x-agent-site': 'site-1',
             'x-job-id': msg.jobId,
             'x-job-nonce': msg.jobNonce,
-            'x-request-id': 'scrape-1',
-            'x-content-sha256': scrapeContentSha,
-            'x-content-bytes': String(scrapeHtml.byteLength),
+            'x-request-id': reqId,
+            'x-content-sha256': curContentSha,
+            'x-content-bytes': String(currentScrapeHtml.byteLength),
             'x-artifact-retention': 'stored',
             'content-type': 'application/gzip',
-            'content-length': String(scrapeGz.byteLength),
+            'content-length': String(curGz.byteLength),
           },
-          body: scrapeGz,
+          body: curGz,
         });
         assert.equal(upRes.status, 200);
         await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
@@ -676,19 +684,19 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
           body: JSON.stringify({
             results: [
               {
-                id: 'scrape-1',
-                url: 'https://docs.example.com/torque',
+                id: reqId,
+                url: reqUrl,
                 kind: 'scrape',
                 status: 200,
                 outcome: 'ok',
                 contentType: 'text/html; charset=utf-8',
-                bytes: scrapeHtml.byteLength,
+                bytes: currentScrapeHtml.byteLength,
                 llms: { found: true, llmsTxtUrl: 'https://docs.example.com/llms.txt', usedCompanionMd: false },
                 artifact: {
-                  blobSha256: scrapeBlobSha,
-                  contentSha256: scrapeContentSha,
-                  contentBytes: scrapeHtml.byteLength,
-                  storedBytes: scrapeGz.byteLength,
+                  blobSha256: curBlobSha,
+                  contentSha256: curContentSha,
+                  contentBytes: currentScrapeHtml.byteLength,
+                  storedBytes: curGz.byteLength,
                   encoding: 'gzip',
                   retention: 'stored',
                 },
@@ -704,6 +712,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         body: JSON.stringify({
           url: 'https://docs.example.com/torque',
           target: 'agent',
+          collectionId: 'ebike-kb',
           formats: [
             'markdown',
             'links',
@@ -748,9 +757,88 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.match(cachedScrapeJson.markdown, /35 Nm/);
       assert.equal(scrapeAgentDispatches, 1);
 
+      // S7: Collection search finds v1 ("cadmium"), and malformed/operator/Unicode/empty user queries NEVER break FTS5!
+      const v1SearchRes = await mf.dispatchFetch(`${ORIGIN}/v1/collections/ebike-kb/search`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({ query: 'cadmium axle' }),
+      });
+      assert.equal(v1SearchRes.status, 200);
+      const v1SearchJson = await v1SearchRes.json();
+      assert.equal(v1SearchJson.hits.length, 1);
+      assert.ok(v1SearchJson.hits[0].score > 0);
+      assert.match(v1SearchJson.hits[0].snippet, /\[cadmium\]|\[axle\]/i);
+
+      for (const hostileQuery of ['NEAR/3 "unclosed (OR AND NOT * ^ : --- ???', '🚀🔥!!!', '', '日本語 cadmium 48V']) {
+        const qRes = await mf.dispatchFetch(`${ORIGIN}/v1/collections/ebike-kb/search`, {
+          method: 'POST',
+          headers: authz,
+          body: JSON.stringify({ query: hostileQuery }),
+        });
+        assert.equal(qRes.status, 200, `hostile FTS query ${JSON.stringify(hostileQuery)} must never fail`);
+      }
+
+      // S7: Re-crawl the SAME page URL with updated content ("titanium stem 6 Nm") -> atomic batch deletes old "cadmium" hits!
+      currentScrapeHtml = new TextEncoder().encode(
+        `<html lang="en"><head><title>Torque Guide v2</title></head><body><main><h1>Stem Bolts</h1><p>Tighten titanium stem bolts to 6 Nm.</p></main></body></html>`,
+      );
+      const updateScrapeRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          url: 'https://docs.example.com/torque',
+          target: 'agent',
+          collectionId: 'ebike-kb',
+          formats: ['markdown'],
+          maxAgeMs: 0,
+        }),
+      });
+      assert.equal(updateScrapeRes.status, 200);
+
+      const staleSearchRes = await mf.dispatchFetch(`${ORIGIN}/v1/collections/ebike-kb/search`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({ query: 'cadmium' }),
+      });
+      assert.equal((await staleSearchRes.json()).hits.length, 0, 'replacing a page must purge old FTS5 hits');
+
+      const freshSearchRes = await mf.dispatchFetch(`${ORIGIN}/v1/collections/ebike-kb/search`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({ query: 'titanium stem' }),
+      });
+      const freshHits = (await freshSearchRes.json()).hits;
+      assert.equal(freshHits.length, 1);
+      assert.match(freshHits[0].text, /titanium stem bolts to 6 Nm/);
+
+      // S7: POST /v1/extract returns BM25-ranked chunks from cached/fetched URLs!
+      const extractRes = await mf.dispatchFetch(`${ORIGIN}/v1/extract`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          urls: ['https://docs.example.com/torque'],
+          query: 'titanium 6 Nm',
+          chunksPerSource: 2,
+          maxAgeMs: 60_000,
+        }),
+      });
+      assert.equal(extractRes.status, 200);
+      const extractJson = await extractRes.json();
+      assert.equal(extractJson.ok, true);
+      assert.equal(extractJson.results.length, 1);
+      assert.equal(extractJson.results[0].cached, true);
+      assert.match(extractJson.results[0].rawContent, /titanium stem bolts to 6 Nm/);
+
       wsScrape.close(1000, 'done');
     }
   } finally {
+    for (const s of openSockets) {
+      try {
+        s.close(1000, 'cleanup');
+      } catch {
+        // ignore
+      }
+    }
     await mf.dispose();
   }
 });

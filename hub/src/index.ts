@@ -63,6 +63,12 @@ import {
 } from './ingest';
 import { executeScrapeCall, type ScrapeRequestPayload } from './scrape';
 import {
+  COLLECTION_ID_RE,
+  D1FtsSearchIndex,
+  executeExtractCall,
+  type ExtractRequestPayload,
+} from './search-index';
+import {
   buildCapabilities,
   handleAgentArtifactUpload,
   handleArtifactGetRequest,
@@ -549,6 +555,7 @@ export default {
       source = 'rest',
       artifactRetention?: ArtifactRetention | 'off',
       hydrateInline = true,
+      collectionId?: string,
     ) =>
       (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
         'edgefetch.dispatch',
@@ -563,19 +570,25 @@ export default {
           }
           let wantsIncludeBody = false;
           let bodyRetentionOpt: ArtifactRetention | 'off' | undefined;
+          let bodyCollectionId: string | undefined;
           try {
             const parsedCall = JSON.parse(body) as {
-              options?: { includeBody?: boolean; artifactRetention?: string };
+              options?: { includeBody?: boolean; artifactRetention?: string; collectionId?: string };
             };
             wantsIncludeBody = Boolean(parsedCall.options?.includeBody);
             const rawOptRet = parsedCall.options?.artifactRetention;
             if (rawOptRet === 'stored' || rawOptRet === 'transient' || rawOptRet === 'off') {
               bodyRetentionOpt = rawOptRet;
             }
+            const rawColl = parsedCall.options?.collectionId;
+            if (typeof rawColl === 'string' && COLLECTION_ID_RE.test(rawColl.trim())) {
+              bodyCollectionId = rawColl.trim();
+            }
           } catch {
             wantsIncludeBody = false;
           }
-          const effectiveRetentionPref = artifactRetention ?? bodyRetentionOpt;
+          const resolvedCollectionId = collectionId ?? bodyCollectionId;
+          const effectiveRetentionPref = artifactRetention ?? bodyRetentionOpt ?? (resolvedCollectionId && env.ARTIFACTS && env.META ? 'stored' : undefined);
           const resolvedRetention: ArtifactRetention | undefined =
             effectiveRetentionPref === 'off'
               ? undefined
@@ -635,6 +648,7 @@ export default {
                 jobId: ingestJobId,
                 via,
                 ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
+                ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
                 rawReplyText: rawCompletedBody,
               });
               if (written.ok) {
@@ -642,6 +656,7 @@ export default {
                   manifestKey: written.manifestKey,
                   jobId: ingestJobId,
                   ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
+                  ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
                   via,
                 };
                 if (env.INGEST) {
@@ -774,6 +789,27 @@ export default {
             });
             return { status: out.status, body: out.body };
           },
+          executeExtract: async ({ args, principal }) => {
+            const out = await executeExtractCall({
+              payload: args as ExtractRequestPayload,
+              env,
+              executeHubFetch,
+              source: `mcp-extract:${principal ?? 'client'}`,
+            });
+            return { status: out.status, body: out.body };
+          },
+          ...(env.SEARCH
+            ? {
+                searchCollection: async ({ collectionId, query, limit }) => {
+                  if (!COLLECTION_ID_RE.test(collectionId)) {
+                    return { ok: false as const, status: 400, error: 'invalid_collection_id' };
+                  }
+                  const idx = new D1FtsSearchIndex(env.SEARCH!);
+                  const hits = await idx.searchCollection({ collectionId, query, limit });
+                  return { ok: true as const, hits: hits as unknown as Array<Record<string, unknown>> };
+                },
+              }
+            : {}),
           ...(env.ARTIFACTS
             ? {
                 readArtifact: async ({ blobSha256, retention, offset, limit }) => {
@@ -903,6 +939,92 @@ export default {
             ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
           },
         });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/extract') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const rawExtractText = await request.text();
+        if (new TextEncoder().encode(rawExtractText).byteLength > MAX_CALL_UTF8_BYTES) {
+          return Response.json({ error: 'too_large' }, { status: 413 });
+        }
+        let payload: ExtractRequestPayload;
+        try {
+          payload = JSON.parse(rawExtractText) as ExtractRequestPayload;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const out = await executeExtractCall({
+          payload,
+          env,
+          executeHubFetch,
+          source: `extract:${auth.principal}`,
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+        });
+      }
+
+      const collectionSearchMatch = /^\/v1\/collections\/([^/]+)\/search$/.exec(url.pathname);
+      if (collectionSearchMatch && (request.method === 'POST' || request.method === 'GET')) {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        if (!env.SEARCH) {
+          return Response.json({ error: 'search_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
+        }
+        const collectionId = decodeURIComponent(collectionSearchMatch[1] ?? '').trim();
+        if (!COLLECTION_ID_RE.test(collectionId)) {
+          return Response.json({ error: 'invalid_collection_id' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+        }
+        let query = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
+        let limit = Number(url.searchParams.get('limit') ?? 10);
+        if (request.method === 'POST') {
+          try {
+            const bodyJson = (await request.json()) as { query?: unknown; q?: unknown; limit?: unknown };
+            if (typeof bodyJson.query === 'string') query = bodyJson.query;
+            else if (typeof bodyJson.q === 'string') query = bodyJson.q;
+            if (typeof bodyJson.limit === 'number' && Number.isFinite(bodyJson.limit)) limit = bodyJson.limit;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+          }
+        }
+        const idx = new D1FtsSearchIndex(env.SEARCH);
+        const hits = await idx.searchCollection({
+          collectionId,
+          query,
+          limit: Number.isFinite(limit) ? limit : 10,
+        });
+        return Response.json(
+          { ok: true, collectionId, query, hits },
+          { status: 200, headers: { 'cache-control': 'no-store' } },
+        );
       }
 
       if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {

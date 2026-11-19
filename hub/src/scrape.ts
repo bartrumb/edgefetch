@@ -709,6 +709,7 @@ export interface ScrapeRequestPayload {
   redactPii?: unknown;
   query?: unknown;
   headers?: unknown;
+  collectionId?: unknown;
   target?: unknown;
   site?: unknown;
 }
@@ -723,6 +724,7 @@ export async function executeScrapeCall(params: {
     source?: string,
     artifactRetention?: ArtifactRetention | 'off',
     hydrateInline?: boolean,
+    collectionId?: string,
   ) => Promise<{ status: number; via: string; bodyText: string; retryAfter?: string }>;
   source?: string;
   now?: number;
@@ -830,8 +832,12 @@ export async function executeScrapeCall(params: {
     ],
   };
 
+  const collectionId =
+    typeof payload.collectionId === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(payload.collectionId.trim())
+      ? payload.collectionId.trim()
+      : undefined;
   const retentionMode: ArtifactRetention | undefined = env.ARTIFACTS && env.META ? 'stored' : env.ARTIFACTS ? 'transient' : undefined;
-  const fetchRes = await executeHubFetch(target, JSON.stringify(fetchCall), site, source, retentionMode, true);
+  const fetchRes = await executeHubFetch(target, JSON.stringify(fetchCall), site, source, retentionMode, true, collectionId);
   if (fetchRes.status !== 200) {
     let errJson: Record<string, unknown> = { ok: false, error: 'scrape_failed' };
     try {

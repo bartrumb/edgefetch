@@ -14,6 +14,7 @@ export interface IngestWorkflowParams {
   manifestKey: string;
   jobId: string;
   siteId?: string;
+  collectionId?: string;
   via: string;
 }
 
@@ -120,6 +121,7 @@ export interface HubCapabilities {
   capabilities: {
     fetch: boolean;
     scrape: boolean;
+    extract: boolean;
     mcp: boolean;
     oauth: boolean;
     artifacts: boolean;
@@ -135,6 +137,7 @@ export function buildCapabilities(env: OptionalStorageBindings, version = '1.2.0
     capabilities: {
       fetch: true,
       scrape: true,
+      extract: true,
       mcp: true,
       oauth: true,
       artifacts: Boolean(env.ARTIFACTS),

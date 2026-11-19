@@ -25,7 +25,7 @@ import (
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
 // Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/internal/agent.Version=...".
-var Version = "2.0.0"
+var Version = "2.0.3"
 
 const (
 	DefaultPingInterval          = 30 * time.Second

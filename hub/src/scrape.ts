@@ -839,10 +839,12 @@ export async function executeScrapeCall(params: {
         : undefined;
 
   const fetchCall = {
-    maxSeconds: 45,
+    maxSeconds: 110,
     options: {
       includeBody: true,
       respectRobots: true,
+      maxBytes: 16 * 1024 * 1024,
+      timeoutMs: 95_000,
       discoverLlms: discoverLlmsTxt || stringFormats.has('llmsTxt'),
     },
     requests: [

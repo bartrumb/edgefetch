@@ -986,11 +986,6 @@ func ms(from, to time.Time) int64 {
 	return to.Sub(from).Milliseconds()
 }
 
-func (c *Crawler) once(ctx context.Context, r Request, accept string, opts Options) (int, http.Header, []byte, bool, Timing, error) {
-	status, header, body, truncated, _, _, tm, err := c.onceWithPDFStream(ctx, r, accept, opts)
-	return status, header, body, truncated, tm, err
-}
-
 func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept string, opts Options) (int, http.Header, []byte, bool, int, *streamedPDFResult, Timing, error) {
 	var tm Timing
 	var dnsStart, dnsDone, connStart, connDone, tlsStart, tlsDone, wrote, firstByte time.Time

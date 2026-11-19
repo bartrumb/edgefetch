@@ -60,3 +60,38 @@ new_sqlite_classes = ["AgentHubDO"]
 # #   BRAVE_API_KEY   — Brave Search API subscription token for POST /v1/search
 # #   SEARXNG_URL     — Optional self-hosted SearXNG JSON endpoint (e.g. https://searx.example.org)
 # #   WEBHOOK_SECRET  — Default HMAC-SHA256 signing secret for async /v1/crawl webhooks
+
+# Owner production environment with full three-layer storage (R2 + META D1 + SEARCH D1 FTS5 + IngestWorkflow).
+# Top-level config remains storage-optional so public 1-Click Deploy users succeed without foreign D1 database IDs.
+[env.production]
+name = "edgefetch-hub"
+workers_dev = true
+preview_urls = false
+
+[env.production.triggers]
+crons = ["0 4 * * *"]
+
+[[env.production.durable_objects.bindings]]
+name = "AGENT_HUB"
+class_name = "AgentHubDO"
+
+[[env.production.r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "edgefetch-artifacts"
+
+[[env.production.d1_databases]]
+binding = "META"
+database_name = "edgefetch-meta"
+database_id = "2e7a973c-2a1b-4164-a370-7bc0240266ff"
+migrations_dir = "migrations/meta"
+
+[[env.production.d1_databases]]
+binding = "SEARCH"
+database_name = "edgefetch-search"
+database_id = "ea98eec0-9d67-41e9-b86b-d11b134f5728"
+migrations_dir = "migrations/search"
+
+[[env.production.workflows]]
+name = "edgefetch-ingest"
+binding = "INGEST"
+class_name = "IngestWorkflow"

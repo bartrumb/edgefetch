@@ -6,8 +6,8 @@
   "scripts": {
     "type-check": "tsc --noEmit -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
-    "deploy:dry": "wrangler deploy --dry-run -c wrangler.toml",
-    "deploy": "wrangler deploy -c wrangler.toml"
+    "deploy:dry": "wrangler deploy --dry-run -c wrangler.toml --env=\"\" && wrangler deploy --dry-run -c wrangler.toml -e production",
+    "deploy": "wrangler deploy -c wrangler.toml -e production"
   },
   "cloudflare": {
     "bindings": {

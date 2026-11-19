@@ -313,6 +313,7 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
         fetch: true,
         scrape: true,
         extract: true,
+        interact: true,
         mcp: true,
         oauth: true,
         artifacts: false,
@@ -829,7 +830,95 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(extractJson.results[0].cached, true);
       assert.match(extractJson.results[0].rawContent, /titanium stem bolts to 6 Nm/);
 
-      wsScrape.close(1000, 'done');
+      // V2-1: POST /v1/interact returns 503 fat_agent_required when only a Lite (non-browser-v1) node is connected!
+      const noFatRes = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          url: 'https://spa.example.com/dashboard',
+          keepSession: true,
+        }),
+      });
+      assert.equal(noFatRes.status, 503);
+      assert.equal((await noFatRes.json()).error, 'fat_agent_required');
+
+      // Connect a FAT node (`browser-v1,pdf-v1`) on site-1 -> interact routes to it and composite sessionId pins follow-up turns!
+      wsScrape.close(1000, 'upgrade-to-fat');
+      await sleep(30);
+      const rWsFat = await mf.dispatchFetch(`${ORIGIN}/agent/ws`, {
+        headers: {
+          upgrade: 'websocket',
+          authorization: `Bearer ${S1}`,
+          'x-agent-site': 'site-1',
+          'x-agent-arch': 'amd64',
+          'x-agent-version': '2.0.0',
+          'x-agent-capabilities': 'artifacts-v1,browser-v1,pdf-v1',
+        },
+      });
+      const wsFat = rWsFat.webSocket;
+      wsFat.accept();
+      openSockets.push(wsFat);
+      let fatClicks = 0;
+      wsFat.addEventListener('message', async (e) => {
+        const d = String(e.data);
+        if (!d.includes('"dispatch"')) return;
+        const msg = JSON.parse(d);
+        const callObj = typeof msg.call === 'string' ? JSON.parse(msg.call) : msg.call;
+        const req0 = callObj.requests[0];
+        if (req0.interact?.actions?.some((a) => a.type === 'click')) fatClicks++;
+        await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${S1}`,
+            'x-agent-site': 'site-1',
+            'x-job-id': msg.jobId,
+            'x-job-nonce': msg.jobNonce,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            results: [
+              {
+                id: req0.id,
+                url: req0.url,
+                kind: 'render',
+                status: 200,
+                outcome: 'ok',
+                rendered: true,
+                sessionId: req0.interact?.closeSession ? '' : 'efsess_9988',
+                markdown: `# Dashboard (clicks=${fatClicks})`,
+                body: `<html><body><h1>Dashboard (clicks=${fatClicks})</h1></body></html>`,
+                bodyEncoding: 'utf-8',
+              },
+            ],
+          }),
+        });
+      });
+
+      const int1 = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({ url: 'https://spa.example.com/dashboard', keepSession: true }),
+      });
+      assert.equal(int1.status, 200);
+      const int1Json = await int1.json();
+      assert.equal(int1Json.sessionId, 'site-1.efsess_9988');
+      assert.match(int1Json.markdown, /clicks=0/);
+
+      const int2 = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          sessionId: int1Json.sessionId,
+          actions: [{ type: 'click', selector: '#load-more' }],
+          closeSession: true,
+        }),
+      });
+      assert.equal(int2.status, 200);
+      const int2Json = await int2.json();
+      assert.equal(int2Json.closed, true);
+      assert.match(int2Json.markdown, /clicks=1/);
+
+      wsFat.close(1000, 'done');
     }
   } finally {
     for (const s of openSockets) {

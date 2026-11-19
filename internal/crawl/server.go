@@ -136,15 +136,35 @@ func ValidateCallWithCrawler(c *Crawler, call FetchCall, allow func(*url.URL) er
 		if _, err := classify.AcceptFor(req.Kind, req.Accept); err != nil {
 			return "bad_kind", fmt.Sprintf("request %d: %v", i, err), false
 		}
-		u, err := url.Parse(req.URL)
-		if err == nil {
-			err = allow(u)
+		isResumedInteract := req.Interact != nil && strings.TrimSpace(req.Interact.SessionID) != "" && strings.TrimSpace(req.URL) == ""
+		if isResumedInteract {
+			if robotsDisabled {
+				return "robots_required", fmt.Sprintf("request %d: disabling robots.txt is not permitted on interact sessions", i), false
+			}
+		} else {
+			u, err := url.Parse(req.URL)
+			if err == nil {
+				err = allow(u)
+			}
+			if err != nil {
+				return "bad_url", fmt.Sprintf("request %d: %v", i, err), false
+			}
+			if robotsDisabled && !c.AllowsRobotsBypass(u.Hostname()) {
+				return "robots_required", fmt.Sprintf("request %d: disabling robots.txt is not permitted for host %q", i, politeness.CanonicalHost(u.Hostname())), false
+			}
 		}
-		if err != nil {
-			return "bad_url", fmt.Sprintf("request %d: %v", i, err), false
-		}
-		if robotsDisabled && !c.AllowsRobotsBypass(u.Hostname()) {
-			return "robots_required", fmt.Sprintf("request %d: disabling robots.txt is not permitted for host %q", i, politeness.CanonicalHost(u.Hostname())), false
+		if req.Interact != nil {
+			for aIdx, act := range req.Interact.Actions {
+				if strings.EqualFold(strings.TrimSpace(act.Type), "navigate") {
+					nu, nErr := url.Parse(strings.TrimSpace(act.URL))
+					if nErr == nil {
+						nErr = allow(nu)
+					}
+					if nErr != nil {
+						return "bad_url", fmt.Sprintf("request %d action %d: %v", i, aIdx, nErr), false
+					}
+				}
+			}
 		}
 	}
 	return "", "", true

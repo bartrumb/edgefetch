@@ -204,6 +204,7 @@ func main() {
 		siteLog := log.With(slog.String("site", cfg.SiteID))
 		siteLog.Info("agent_startup", slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)), slog.String("go", runtime.Version()))
 		crawler := crawl.NewCrawler(newCrawlTransport(90*time.Second, 4), allow, cfg.UserAgent, siteLog)
+		defer func() { _ = crawler.Close() }()
 		crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
 
 		if err := agent.Run(ctx, cfg, crawler, allow, newHubTransport(), siteLog, agent.RuntimeOpts{}); err != nil {
@@ -232,6 +233,7 @@ func main() {
 	}
 
 	crawler := crawl.NewCrawler(newCrawlTransport(60*time.Second, 2), crawl.PublicHTTPS, ua, log)
+	defer func() { _ = crawler.Close() }()
 	crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
 	srv := newHTTPServer(addr, crawl.NewAuthenticatedHandler(crawler, crawl.PublicHTTPS, serverToken))
 

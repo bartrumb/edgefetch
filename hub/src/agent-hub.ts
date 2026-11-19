@@ -836,8 +836,35 @@ export class AgentHubEngine {
     const timeoutMs = opts.timeoutMs ?? defaultTimeout;
     const wantSite = opts.preferredSite?.trim().toLowerCase();
 
-    const initialActive = this.activeSocketsBySite().filter((e) => !wantSite || e.att.siteId === wantSite);
+    const requiresBrowser = call.requests.some(
+      (r) =>
+        r?.kind === 'render' ||
+        (typeof r?.renderMode === 'string' && r.renderMode.toLowerCase() === 'always') ||
+        r?.interact !== undefined,
+    );
+    const prefersFat =
+      requiresBrowser ||
+      call.requests.some(
+        (r) =>
+          r?.kind === 'pdf' ||
+          (typeof r?.renderMode === 'string' && r.renderMode.toLowerCase() === 'auto'),
+      );
+
+    const initialActiveAll = this.activeSocketsBySite().filter((e) => !wantSite || e.att.siteId === wantSite);
+    const initialActive = requiresBrowser
+      ? initialActiveAll.filter((e) => e.att.capabilities?.includes('browser-v1'))
+      : initialActiveAll;
     if (initialActive.length === 0) {
+      if (requiresBrowser) {
+        return {
+          ok: false,
+          status: 503,
+          error: 'fat_agent_required',
+          message: wantSite
+            ? `HAOS site '${wantSite}' is offline or does not advertise browser-v1 (deploy edgefetch_fat)`
+            : 'Headless browser rendering / interact requires at least one connected edgefetch_fat (browser-v1) node',
+        };
+      }
       const msg = wantSite
         ? `HAOS agent site '${wantSite}' is not connected`
         : 'no HAOS remote agents are currently connected';
@@ -874,7 +901,10 @@ export class AgentHubEngine {
       while (pendingIndices.length > 0 && round < 4 && !permanentFailure) {
         round++;
         const roundLookupNow = this.now();
-        const activeCandidates = this.activeSocketsBySite().filter((e) => !wantSite || e.att.siteId === wantSite);
+        const activeCandidatesAll = this.activeSocketsBySite().filter((e) => !wantSite || e.att.siteId === wantSite);
+        const activeCandidates = requiresBrowser
+          ? activeCandidatesAll.filter((e) => e.att.capabilities?.includes('browser-v1'))
+          : activeCandidatesAll;
         if (activeCandidates.length === 0) break;
 
         const bySiteBatch = new Map<string, { candidate: { ws: HubSocketLike; att: AgentAttachment }; reqIndices: number[] }>();
@@ -884,13 +914,17 @@ export class AgentHubEngine {
 
         for (const reqIdx of pendingIndices) {
           const host = extractPrimaryHost(call.requests![reqIdx]?.url);
-          const eligible = activeCandidates.filter((c) => {
+          const eligibleAll = activeCandidates.filter((c) => {
             if (triedSites[reqIdx]!.has(c.att.siteId)) return false;
             if (c.att.publicIp && triedIps[reqIdx]!.has(c.att.publicIp)) return false;
             if (!wantSite && this.isNodeCooledDownForHost(host, c.att, roundLookupNow)) return false;
             return true;
           });
-          if (eligible.length === 0) continue;
+          if (eligibleAll.length === 0) continue;
+          const fatSubset = prefersFat
+            ? eligibleAll.filter((c) => c.att.capabilities?.includes('browser-v1') || c.att.capabilities?.includes('pdf-v1'))
+            : [];
+          const eligible = fatSubset.length > 0 ? fatSubset : eligibleAll;
 
           let chosen = host ? chosenByHost.get(host) : undefined;
           if (!chosen || !eligible.some((c) => c.att.siteId === chosen!.att.siteId)) {
@@ -1417,7 +1451,7 @@ export async function routeFetchWithFailover(params: {
     };
   }
   if (!agentOut.ok) {
-    if (agentOut.status === 400 || agentOut.status === 413) {
+    if (agentOut.status === 400 || agentOut.status === 413 || agentOut.error === 'fat_agent_required') {
       return Response.json(
         { error: agentOut.error, message: agentOut.message },
         { status: agentOut.status, headers: { 'cache-control': 'no-store' } },

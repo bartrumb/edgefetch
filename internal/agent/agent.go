@@ -150,25 +150,30 @@ func runSession(
 	reconnectAttempt int,
 	lastError string,
 ) error {
+	caps := crawler.Capabilities()
 	conn, err := ws.Dial(ctx, cfg.HubURL+"/agent/ws", cfg.UserAgent, map[string]string{
 		"Authorization":        "Bearer " + cfg.AgentToken,
 		"X-Agent-Site":         cfg.SiteID,
 		"X-Agent-Arch":         runtime.GOARCH,
 		"X-Agent-Version":      Version,
-		"X-Agent-Capabilities": "artifacts-v1",
+		"X-Agent-Capabilities": strings.Join(caps, ","),
 	})
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.CloseNow() }()
-	log.Info("agent_connected", slog.String("hub", cfg.HubURL), slog.String("arch", runtime.GOARCH), slog.String("version", Version))
+	log.Info("agent_connected",
+		slog.String("hub", cfg.HubURL),
+		slog.String("arch", runtime.GOARCH),
+		slog.String("version", Version),
+		slog.String("capabilities", strings.Join(caps, ",")))
 
 	helloPayload, _ := json.Marshal(map[string]any{
 		"type":             "agent_hello",
 		"version":          Version,
 		"arch":             runtime.GOARCH,
 		"goVersion":        runtime.Version(),
-		"capabilities":     []string{"artifacts-v1"},
+		"capabilities":     caps,
 		"reconnectAttempt": reconnectAttempt,
 		"lastError":        lastError,
 	})

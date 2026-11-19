@@ -61,7 +61,12 @@ import {
   pruneExpiredFetchHistory,
   writeJobManifestToR2,
 } from './ingest';
-import { executeScrapeCall, type ScrapeRequestPayload } from './scrape';
+import {
+  executeInteractCall,
+  executeScrapeCall,
+  type InteractRequestPayload,
+  type ScrapeRequestPayload,
+} from './scrape';
 import {
   COLLECTION_ID_RE,
   D1FtsSearchIndex,
@@ -798,6 +803,15 @@ export default {
             });
             return { status: out.status, body: out.body };
           },
+          executeInteract: async ({ args, principal }) => {
+            const out = await executeInteractCall({
+              payload: args as InteractRequestPayload,
+              env,
+              executeHubFetch,
+              source: `mcp-interact:${principal ?? 'client'}`,
+            });
+            return { status: out.status, body: out.body };
+          },
           ...(env.SEARCH
             ? {
                 searchCollection: async ({ collectionId, query, limit }) => {
@@ -972,6 +986,44 @@ export default {
           env,
           executeHubFetch,
           source: `extract:${auth.principal}`,
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/interact') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const rawInteractText = await request.text();
+        if (new TextEncoder().encode(rawInteractText).byteLength > MAX_CALL_UTF8_BYTES) {
+          return Response.json({ error: 'too_large' }, { status: 413 });
+        }
+        let payload: InteractRequestPayload;
+        try {
+          payload = JSON.parse(rawInteractText) as InteractRequestPayload;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const out = await executeInteractCall({
+          payload,
+          env,
+          executeHubFetch,
+          source: `interact:${auth.principal}`,
         });
         return Response.json(out.body, {
           status: out.status,

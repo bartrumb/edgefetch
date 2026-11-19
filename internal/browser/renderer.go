@@ -723,7 +723,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		"--headless=new",
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
-		"--disable-gpu",
+		"--disable-gpu-sandbox",
 		"--disable-dev-shm-usage",
 		"--disable-crash-reporter",
 		"--disable-breakpad",
@@ -748,9 +748,12 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	if runtime.GOOS == "linux" {
 		args = append(args,
 			"--use-gl=angle",
-			"--use-angle=swiftshader-webgl",
+			"--use-angle=swiftshader",
 			"--enable-unsafe-swiftshader",
+			"--ignore-gpu-blocklist",
 		)
+	} else {
+		args = append(args, "--disable-gpu")
 	}
 	args = append(args, "about:blank")
 

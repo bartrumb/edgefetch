@@ -42,6 +42,16 @@ import {
   type HubSocketLike,
 } from './agent-hub';
 import { authorizeAgent, isCallerAuthorized } from './auth';
+import { handleCompatRoutes } from './compat';
+import {
+  cancelCrawlJob,
+  CrawlWorkflow,
+  createCrawlJob,
+  executeCrawlJob,
+  executeMapCall,
+  getCrawlJobStatus,
+  type MapRequestPayload,
+} from './map-crawl';
 import { handleMcpRequest } from './mcp';
 import { authorizeMcpRequest, createSqliteOAuthStore, handleOAuthRoute, OAUTH_SQLITE_SCHEMA } from './oauth';
 import type {
@@ -73,6 +83,7 @@ import {
   executeExtractCall,
   type ExtractRequestPayload,
 } from './search-index';
+import { executeSearchCall, type SearchRequestPayload } from './web-search';
 import {
   buildCapabilities,
   handleAgentArtifactUpload,
@@ -92,15 +103,18 @@ interface Env extends OptionalStorageBindings {
   USER_AGENT?: string;
   ROBOTS_BYPASS_HOSTS?: string;
   OAUTH_REDIRECT_ALLOWLIST?: string;
+  BRAVE_API_KEY?: string;
+  SEARXNG_URL?: string;
+  WEBHOOK_SECRET?: string;
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const DEFAULT_UA = 'EdgeFetch/1.0 (+https://github.com/bartrumb/edgefetch)';
+const DEFAULT_UA = 'EdgeFetch/2.0 (+https://github.com/bartrumb/edgefetch)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;
 
-export { IngestWorkflow };
+export { CrawlWorkflow, IngestWorkflow };
 
 export class AgentHubDO extends DurableObject<Env> {
   private readonly engine: AgentHubEngine;
@@ -546,7 +560,7 @@ function hubActivityProxy(hub: () => DurableObjectStub<AgentHubDO>): ActivitySto
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const hub = () => env.AGENT_HUB.get(env.AGENT_HUB.idFromName('global'));
     const ua = env.USER_AGENT?.trim() || DEFAULT_UA;
@@ -812,6 +826,68 @@ export default {
             });
             return { status: out.status, body: out.body };
           },
+          executeMap: async ({ args, principal }) => {
+            const out = await executeMapCall({
+              payload: args as MapRequestPayload,
+              executeHubFetch,
+              selfHost: url.hostname,
+              source: `mcp-map:${principal ?? 'client'}`,
+            });
+            return { status: out.status, body: out.body };
+          },
+          executeCrawl: async ({ args, principal }) => {
+            const existingId = typeof args.crawlId === 'string' ? args.crawlId.trim() : '';
+            if (existingId) {
+              if (args.cancel === true) {
+                const cRes = await cancelCrawlJob(existingId, env.META);
+                return { status: cRes.status, body: { ok: cRes.ok, crawlId: existingId, status: 'cancelled' } };
+              }
+              const st = await getCrawlJobStatus({
+                crawlId: existingId,
+                metaDb: env.META,
+                bucket: env.ARTIFACTS,
+                offset: typeof args.offset === 'number' ? args.offset : 0,
+              });
+              return st.ok ? { status: 200, body: st.crawl } : { status: st.status, body: { ok: false, error: st.error } };
+            }
+            const created = await createCrawlJob({ payload: args, metaDb: env.META, selfHost: url.hostname });
+            if (!created.ok) {
+              return { status: created.status, body: { ok: false, error: created.error, message: created.message } };
+            }
+            const jobPromise = executeCrawlJob({
+              crawlId: created.crawlId,
+              rootUrl: created.rootUrl,
+              options: created.options,
+              env,
+              executeHubFetch,
+              selfHost: url.hostname,
+            });
+            if (ctx?.waitUntil) {
+              ctx.waitUntil(jobPromise);
+            } else {
+              await jobPromise;
+            }
+            return {
+              status: 202,
+              body: {
+                ok: true,
+                crawlId: created.crawlId,
+                status: 'queued',
+                collectionId: created.options.collectionId,
+                pollUrl: `${url.origin}/v1/crawl/${created.crawlId}`,
+                principal: principal ?? 'client',
+              },
+            };
+          },
+          executeSearch: async ({ args, principal }) => {
+            const out = await executeSearchCall({
+              payload: args as SearchRequestPayload,
+              env,
+              executeHubFetch,
+              source: `mcp-search:${principal ?? 'client'}`,
+            });
+            return { status: out.status, body: out.body };
+          },
           ...(env.SEARCH
             ? {
                 searchCollection: async ({ collectionId, query, limit }) => {
@@ -884,11 +960,21 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '1.2.0'), {
+        return Response.json(buildCapabilities(env, '2.0.0'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
       }
+
+      const compatRes = await handleCompatRoutes({
+        request,
+        url,
+        env,
+        oauthStore,
+        executeHubFetch,
+        ...(ctx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
+      });
+      if (compatRes) return compatRes;
 
       if (request.method === 'GET' && url.pathname.startsWith('/v1/artifacts/')) {
         const auth = await authorizeMcpRequest({
@@ -1029,6 +1115,168 @@ export default {
           status: out.status,
           headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
         });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/map') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        let payload: MapRequestPayload;
+        try {
+          payload = (await request.json()) as MapRequestPayload;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const out = await executeMapCall({
+          payload,
+          executeHubFetch,
+          selfHost: url.hostname,
+          source: `map:${auth.principal}`,
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/search') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        let payload: SearchRequestPayload;
+        try {
+          payload = (await request.json()) as SearchRequestPayload;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const out = await executeSearchCall({
+          payload,
+          env,
+          executeHubFetch,
+          source: `search:${auth.principal}`,
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/crawl') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        let payload: Record<string, unknown>;
+        try {
+          payload = (await request.json()) as Record<string, unknown>;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const created = await createCrawlJob({ payload, metaDb: env.META, selfHost: url.hostname });
+        if (!created.ok) {
+          return Response.json(
+            { ok: false, error: created.error, message: created.message },
+            { status: created.status, headers: { 'cache-control': 'no-store' } },
+          );
+        }
+        const jobPromise = executeCrawlJob({
+          crawlId: created.crawlId,
+          rootUrl: created.rootUrl,
+          options: created.options,
+          env,
+          executeHubFetch,
+          selfHost: url.hostname,
+        });
+        if (payload.sync === true) {
+          await jobPromise;
+        } else if (ctx?.waitUntil) {
+          ctx.waitUntil(jobPromise);
+        } else {
+          await jobPromise;
+        }
+        return Response.json(
+          {
+            ok: true,
+            id: created.crawlId,
+            status: payload.sync === true ? 'completed' : 'queued',
+            collectionId: created.options.collectionId,
+            url: `${url.origin}/v1/crawl/${created.crawlId}`,
+          },
+          { status: payload.sync === true ? 200 : 202, headers: { 'cache-control': 'no-store' } },
+        );
+      }
+
+      const crawlRouteMatch = /^\/v1\/crawl\/([^/]+)$/.exec(url.pathname);
+      if (crawlRouteMatch) {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        const crawlId = decodeURIComponent(crawlRouteMatch[1] ?? '').trim();
+        if (request.method === 'GET') {
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+          }
+          const st = await getCrawlJobStatus({
+            crawlId,
+            metaDb: env.META,
+            bucket: env.ARTIFACTS,
+            offset: Number(url.searchParams.get('offset') ?? 0),
+            limit: Number(url.searchParams.get('limit') ?? 25),
+          });
+          if (!st.ok) return Response.json({ ok: false, error: st.error }, { status: st.status });
+          return Response.json({ ok: true, ...st.crawl }, { status: 200, headers: { 'cache-control': 'no-store' } });
+        }
+        if (request.method === 'DELETE') {
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+          }
+          const cRes = await cancelCrawlJob(crawlId, env.META);
+          return Response.json({ ok: cRes.ok, id: crawlId, status: 'cancelled' }, { status: cRes.status });
+        }
       }
 
       const collectionSearchMatch = /^\/v1\/collections\/([^/]+)\/search$/.exec(url.pathname);

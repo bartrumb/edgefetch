@@ -313,6 +313,8 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
         fetch: true,
         scrape: true,
         extract: true,
+        map: true,
+        crawl: false,
         interact: true,
         mcp: true,
         oauth: true,
@@ -320,6 +322,7 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
         tracking: false,
         ingestWorkflow: false,
         search: false,
+        webSearch: false,
       });
     }
   } finally {
@@ -918,7 +921,210 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(int2Json.closed, true);
       assert.match(int2Json.markdown, /clicks=1/);
 
-      wsFat.close(1000, 'done');
+      // V2-2: Verify streamlined 8-tool MCP surface (`list_agents`, `scrape`, `extract`, `map`, `crawl`, `search`, `interact`, `read_artifact`)!
+      const toolsRes = await mf.dispatchFetch(`${ORIGIN}/mcp`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 201, method: 'tools/list' }),
+      });
+      const toolsJson = await toolsRes.json();
+      const toolNames = toolsJson.result.tools.map((t) => t.name);
+      assert.deepEqual(toolNames, ['list_agents', 'scrape', 'extract', 'map', 'crawl', 'search', 'interact', 'read_artifact']);
+
+      // V2-2: Verify RRF multi-provider search (Brave + SearXNG + FTS5) + HMAC-SHA256 webhook signing + SSRF webhook block!
+      const v2HarnessRes = await mf.dispatchFetch(`${ORIGIN}/__test_v2_search_and_webhook`, { method: 'POST' });
+      assert.equal(v2HarnessRes.status, 200);
+      const v2HarnessJson = await v2HarnessRes.json();
+      assert.equal(v2HarnessJson.webhookDelivered, true);
+      assert.equal(v2HarnessJson.signatureValid, true);
+      assert.equal(v2HarnessJson.ssrfWebhookBlocked, true);
+      assert.equal(v2HarnessJson.searchStatus, 200);
+      assert.deepEqual(v2HarnessJson.unhonoredOptions, ['include_answer']);
+      assert.equal(v2HarnessJson.searchResults.length, 2);
+      assert.equal(v2HarnessJson.searchResults[0].url, 'https://docs.example.com/torque');
+      assert.deepEqual(v2HarnessJson.searchResults[0].providers, ['brave', 'searxng', 'collection:ebike-kb']);
+
+      // V2-2: Switch mock agent to handle `/v1/map`, `/v1/crawl` (sync + GET/DELETE), `formats: ["changes"]`, and `/compat/*` routes!
+      wsFat.close(1000, 'switch-to-map-crawl');
+      await sleep(30);
+      const rWsMap = await mf.dispatchFetch(`${ORIGIN}/agent/ws`, {
+        headers: {
+          upgrade: 'websocket',
+          authorization: `Bearer ${S1}`,
+          'x-agent-site': 'site-1',
+          'x-agent-arch': 'amd64',
+          'x-agent-version': '2.0.0',
+          'x-agent-capabilities': 'artifacts-v1,browser-v1,pdf-v1',
+        },
+      });
+      const wsMap = rWsMap.webSocket;
+      wsMap.accept();
+      openSockets.push(wsMap);
+
+      wsMap.addEventListener('message', async (e) => {
+        const d = String(e.data);
+        if (!d.includes('"dispatch"')) return;
+        const msg = JSON.parse(d);
+        const callObj = typeof msg.call === 'string' ? JSON.parse(msg.call) : msg.call;
+        const results = [];
+        for (const reqItem of callObj.requests ?? []) {
+          let bodyStr = '';
+          let ct = 'text/html; charset=utf-8';
+          if (reqItem.url.endsWith('/robots.txt')) {
+            ct = 'text/plain';
+            bodyStr = 'User-agent: *\nSitemap: https://map.example.com/sitemap-docs.xml\n';
+          } else if (reqItem.url.endsWith('/sitemap.xml')) {
+            ct = 'application/xml';
+            bodyStr = '<urlset><url><loc>https://map.example.com/guide/setup</loc></url></urlset>';
+          } else if (reqItem.url.endsWith('/sitemap-docs.xml')) {
+            ct = 'application/xml';
+            bodyStr = '<urlset><url><loc>https://map.example.com/guide/api</loc></url></urlset>';
+          } else if (reqItem.url.endsWith('/llms.txt')) {
+            ct = 'text/markdown';
+            bodyStr = '# Map Docs\n- [FAQ](https://map.example.com/faq): Common questions\n';
+          } else if (reqItem.url === 'https://docs.example.com/torque') {
+            bodyStr = '<html><head><title>Torque Guide v3</title></head><body><main><h1>Stem Bolts</h1><p>Tighten carbon stem bolts to 5 Nm.</p></main></body></html>';
+          } else if (reqItem.url === 'https://crawl.example.com/') {
+            bodyStr = '<html><head><title>Crawl Home</title></head><body><main><h1>Welcome</h1><a href="https://crawl.example.com/docs/a">Doc A</a><a href="https://crawl.example.com/admin/skip">Skip</a></main></body></html>';
+          } else {
+            bodyStr = `<html><head><title>Page</title></head><body><main><p>Content for ${reqItem.url}</p><a href="https://map.example.com/about">About</a></main></body></html>`;
+          }
+
+          if (msg.artifacts?.mode === 'r2') {
+            const rawBytes = new TextEncoder().encode(bodyStr);
+            const gz = gzipSync(rawBytes);
+            const bSha = sha256Hex(gz);
+            const cSha = sha256Hex(rawBytes);
+            await mf.dispatchFetch(`${ORIGIN}/agent/artifacts/${bSha}`, {
+              method: 'PUT',
+              headers: {
+                authorization: `Bearer ${S1}`,
+                'x-agent-site': 'site-1',
+                'x-job-id': msg.jobId,
+                'x-job-nonce': msg.jobNonce,
+                'x-request-id': reqItem.id,
+                'x-content-sha256': cSha,
+                'x-content-bytes': String(rawBytes.byteLength),
+                'x-artifact-retention': msg.artifacts.retention,
+                'content-type': 'application/gzip',
+                'content-length': String(gz.byteLength),
+              },
+              body: gz,
+            });
+            results.push({
+              id: reqItem.id,
+              url: reqItem.url,
+              kind: reqItem.kind,
+              status: 200,
+              outcome: 'ok',
+              contentType: ct,
+              bytes: rawBytes.byteLength,
+              artifact: {
+                blobSha256: bSha,
+                contentSha256: cSha,
+                contentBytes: rawBytes.byteLength,
+                storedBytes: gz.byteLength,
+                encoding: 'gzip',
+                retention: msg.artifacts.retention,
+              },
+            });
+          } else {
+            results.push({ id: reqItem.id, url: reqItem.url, kind: reqItem.kind, status: 200, outcome: 'ok', contentType: ct, body: bodyStr, bodyEncoding: 'utf-8' });
+          }
+        }
+        await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${S1}`,
+            'x-agent-site': 'site-1',
+            'x-job-id': msg.jobId,
+            'x-job-nonce': msg.jobNonce,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ results }),
+        });
+      });
+
+      // 1) POST /v1/map discovers robots Sitemap:, sitemap.xml, llms.txt, and homepage links!
+      const mapRes = await mf.dispatchFetch(`${ORIGIN}/v1/map`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({ url: 'https://map.example.com/' }),
+      });
+      assert.equal(mapRes.status, 200);
+      const mapJson = await mapRes.json();
+      assert.deepEqual(mapJson.links, [
+        'https://map.example.com/',
+        'https://map.example.com/about',
+        'https://map.example.com/faq',
+        'https://map.example.com/guide/api',
+        'https://map.example.com/guide/setup',
+      ]);
+
+      // 2) POST /v1/scrape with formats:["markdown","changes"] computes line diff against previous verified v2!
+      const diffRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          url: 'https://docs.example.com/torque',
+          target: 'agent',
+          formats: ['markdown', 'changes'],
+        }),
+      });
+      assert.equal(diffRes.status, 200);
+      const diffJson = await diffRes.json();
+      assert.equal(diffJson.changes?.status, 'changed');
+      assert.match(diffJson.changes?.diffPreview ?? '', /- Tighten titanium stem bolts to 6 Nm\./);
+      assert.match(diffJson.changes?.diffPreview ?? '', /\+ Tighten carbon stem bolts to 5 Nm\./);
+
+      // 3) POST /v1/crawl (excludePaths: ['/admin']) + GET /v1/crawl/:id + DELETE /v1/crawl/:id!
+      const crawlRes = await mf.dispatchFetch(`${ORIGIN}/v1/crawl`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({
+          url: 'https://crawl.example.com/',
+          maxDepth: 1,
+          limit: 5,
+          excludePaths: ['/admin'],
+          sync: true,
+        }),
+      });
+      assert.equal(crawlRes.status, 200);
+      const crawlCreated = await crawlRes.json();
+      assert.ok(crawlCreated.id.startsWith('crw_'));
+
+      const crawlStatusRes = await mf.dispatchFetch(`${ORIGIN}/v1/crawl/${crawlCreated.id}`, { headers: authz });
+      assert.equal(crawlStatusRes.status, 200);
+      const crawlStatus = await crawlStatusRes.json();
+      assert.equal(crawlStatus.status, 'completed');
+      assert.equal(crawlStatus.fetchedCount, 2);
+      assert.deepEqual(
+        crawlStatus.data.map((d) => d.url),
+        ['https://crawl.example.com/', 'https://crawl.example.com/docs/a'],
+      );
+
+      // 4) Compatibility routes: Firecrawl v2 (`/compat/firecrawl/v2/map`) & Tavily (`/compat/tavily/search` with body api_key)!
+      const fcCompatRes = await mf.dispatchFetch(`${ORIGIN}/compat/firecrawl/v2/map`, {
+        method: 'POST',
+        headers: authz,
+        body: JSON.stringify({ url: 'https://map.example.com/', search: 'guide' }),
+      });
+      assert.equal(fcCompatRes.status, 200);
+      const fcCompatJson = await fcCompatRes.json();
+      assert.equal(fcCompatJson.success, true);
+      assert.deepEqual(fcCompatJson.links, ['https://map.example.com/guide/api', 'https://map.example.com/guide/setup']);
+
+      const tvCompatRes = await mf.dispatchFetch(`${ORIGIN}/compat/tavily/search`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ api_key: CALLER, query: 'titanium stem', collections: ['ebike-kb'] }),
+      });
+      assert.equal(tvCompatRes.status, 200);
+      const tvCompatJson = await tvCompatRes.json();
+      assert.equal(tvCompatJson.ok, true);
+      assert.equal(tvCompatJson.results.length, 1);
+
+      wsMap.close(1000, 'done');
     }
   } finally {
     for (const s of openSockets) {

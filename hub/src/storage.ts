@@ -122,6 +122,8 @@ export interface HubCapabilities {
     fetch: boolean;
     scrape: boolean;
     extract: boolean;
+    map: boolean;
+    crawl: boolean;
     interact: boolean;
     mcp: boolean;
     oauth: boolean;
@@ -129,23 +131,30 @@ export interface HubCapabilities {
     tracking: boolean;
     ingestWorkflow: boolean;
     search: boolean;
+    webSearch: boolean;
   };
 }
 
-export function buildCapabilities(env: OptionalStorageBindings, version = '2.0.0'): HubCapabilities {
+export function buildCapabilities(
+  env: OptionalStorageBindings & { BRAVE_API_KEY?: string; SEARXNG_URL?: string },
+  version = '2.0.0',
+): HubCapabilities {
   return {
     version,
     capabilities: {
       fetch: true,
       scrape: true,
       extract: true,
+      map: true,
+      crawl: Boolean(env.META),
       interact: true,
       mcp: true,
       oauth: true,
       artifacts: Boolean(env.ARTIFACTS),
       tracking: Boolean(env.META),
       ingestWorkflow: Boolean(env.INGEST),
-      search: Boolean(env.SEARCH),
+      search: Boolean(env.SEARCH || env.BRAVE_API_KEY || env.SEARXNG_URL),
+      webSearch: Boolean(env.BRAVE_API_KEY || env.SEARXNG_URL),
     },
   };
 }

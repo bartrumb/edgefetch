@@ -787,7 +787,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '1.2.0',
+          serverVersion: '2.0.0',
           ownerSecret: env.CALLER_TOKEN,
           oauthStore,
           activity,

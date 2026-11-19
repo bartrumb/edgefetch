@@ -28,7 +28,7 @@ import (
 )
 
 // DefaultUserAgent is sent when no custom User-Agent is configured. Always identify crawlers honestly.
-const DefaultUserAgent = "EdgeFetch/1.0 (+https://github.com/bartrumb/edgefetch)"
+const DefaultUserAgent = "EdgeFetch/2.0 (+https://github.com/bartrumb/edgefetch)"
 
 // InteractSpec configures stateful or single-turn headless Chromium interaction (`firecrawl_interact` parity).
 type InteractSpec struct {

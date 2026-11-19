@@ -51,3 +51,12 @@ new_sqlite_classes = ["AgentHubDO"]
 # class_name = "IngestWorkflow"
 # [workflows.concurrency]
 # limit = 10
+#
+# # Optional 90-day fetch history retention cron (`scheduled()` in `src/index.ts`):
+# # [triggers]
+# # crons = ["0 4 * * *"]
+#
+# # Optional open-web search & signed webhook secrets (`npx wrangler secret put ...`):
+# #   BRAVE_API_KEY   — Brave Search API subscription token for POST /v1/search
+# #   SEARXNG_URL     — Optional self-hosted SearXNG JSON endpoint (e.g. https://searx.example.org)
+# #   WEBHOOK_SECRET  — Default HMAC-SHA256 signing secret for async /v1/crawl webhooks

@@ -143,19 +143,46 @@ claude mcp add --transport http edgefetch https://<your-hub>.workers.dev/mcp
 
 When Claude Code connects for the first time, it discovers `/.well-known/oauth-protected-resource`, registers dynamically, and opens your browser to `/oauth/authorize`. Paste your `CALLER_TOKEN` once (or click **Approve** immediately if already signed into `/admin`) — **no raw bearer tokens are ever saved in `.claude.json` or shell history**.
 
-### Exposed MCP Tools
+### Exposed MCP Tools (8-Tool v2 Surface)
 
 | Tool | Required Scope | Description |
 |---|---|---|
-| `list_agents` | `crawl:read` | Lists connected standby agents (`siteId`, `version`, `arch`, `jobsOk`, `jobsErr`) and active `429` site/IP cooldowns. |
-| `fetch_url` | `crawl:fetch` | Politely fetches a single public `https://` URL (`page`, `json`, `text`, or `feed`, optional `site` pin, `ifNoneMatch`, `robots.txt` enforced) with full phase timing + body preview. |
-| `fetch_batch` | `crawl:fetch` | Politely fetches up to 25 public `https://` URLs with configurable `pauseMs`, `pauseJitterMs`, and `kind` (`page`/`json`/`text`/`feed`). |
+| `list_agents` | `crawl:read` | Lists connected standby agents (`siteId`, `LITE`/`FAT` tier, `capabilities`, `version`, `arch`) and active `429` cooldowns. |
+| `scrape` | `crawl:fetch` | Scrapes a public `https://` URL to clean GFM Markdown, metadata, links, images, branding, `changes` diff, and `/llms.txt` + companion `.md` (`maxAgeMs` verified cache, `renderMode: "off"\|"auto"\|"always"`). |
+| `extract` | `crawl:fetch` | Fetches 1..20 URLs politely and returns BM25 query-ranked ~1,500-char chunks (`chunksPerSource`). |
+| `map` | `crawl:fetch` | Discovers site URLs across `robots.txt` `Sitemap:`, `sitemap.xml` / `.xml.gz`, `/llms.txt`, and homepage links. |
+| `crawl` | `crawl:fetch` | Starts an async breadth-first site crawl (`includePaths`/`excludePaths`, D1 FTS5 indexing, HMAC webhooks), or polls/cancels `crawlId`. |
+| `search` | `crawl:read` | Searches Brave Search API, SearXNG JSON API, and/or private `SEARCH` D1 FTS5 `collections` fused via Reciprocal Rank Fusion (`RRF`). |
+| `interact` | `crawl:fetch` | Drives a sandboxed headless Chromium session on an `edgefetch_fat` (`browser-v1`) node (`click`, `fill`, `press`, `scroll`, `wait`, PNG screenshots) with composite `<siteId>.<sessionId>` pinning. |
+| `read_artifact` | `crawl:read` | Pages stored R2 artifacts by `artifactId` (`blobSha256`) + `offset` + `limit` without 64K truncation. |
 
-*(Direct machine-to-machine MCP clients may also pass `Authorization: Bearer $CALLER_TOKEN` on `POST /mcp`.)*
+*(Legacy `fetch_url`, `fetch_batch`, and `search_collection` tool calls remain supported for existing MCP callers, and direct machine-to-machine clients may pass `Authorization: Bearer $CALLER_TOKEN` on `POST /mcp`.)*
 
 ---
 
-## 6. Single-Pane-of-Glass Observability (Cloudflare Logs & Traces)
+## 6. v2 REST Endpoints, Storage Layers & Compatibility Routes
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/capabilities` | Reports active bindings (`artifacts`, `tracking`, `ingestWorkflow`, `search`, `webSearch`, `crawl`, `interact`). |
+| `POST /v1/scrape` | Clean Markdown, `/llms.txt` + `.md` upgrade, `{type:"json",schema}`, `branding`, `changes` diff, `maxAgeMs` verified cache, `renderMode`. |
+| `POST /v1/extract` | Multi-URL polite batch extraction + BM25 query-ranked chunks (`urls`, `query`, `chunksPerSource`). |
+| `POST /v1/map` | Rapid polite URL discovery (`robots.txt`, sitemaps, `/llms.txt`, homepage links, `search` filter). |
+| `POST /v1/crawl`, `GET\|DELETE /v1/crawl/:id` | Async site crawl tracked in `META` D1 `crawls` + indexed in `SEARCH` D1 FTS5 + HMAC-SHA256 webhooks (`X-EdgeFetch-Signature`). |
+| `POST /v1/search` & `POST /v1/collections/:id/search` | RRF web + private D1 FTS5 search (`BRAVE_API_KEY`, `SEARXNG_URL`, `collections`, `include_raw_content`). |
+| `POST /v1/interact` | Stateful headless browser interaction routed to `edgefetch_fat` (`browser-v1`) nodes. |
+| `GET /v1/artifacts/:blobSha256` | Authenticated offset-paged artifact reader (`text/plain; charset=utf-8`, `nosniff`, `CSP: sandbox`, `410 Gone` when expired). |
+| `/compat/firecrawl/v2/*` & `/compat/tavily/*` | Drop-in compatibility routes for existing Firecrawl v2 and Tavily SDK clients. |
+
+### Optional Three-Layer Cloudflare Storage (`ARTIFACTS` R2 + `META` D1 + `SEARCH` D1 FTS5)
+All storage bindings in [`hub/wrangler.toml`](../hub/wrangler.toml) are optional. When enabled:
+- **`ARTIFACTS` R2 Bucket:** Configure two prefix lifecycle expiration rules: `tmp/` -> **1 day**, `raw/` -> **30 days**. Derived Markdown lives under `derived/<pipelineVersion>/markdown/<contentSha256>`.
+- **`META` D1 (`hub/migrations/meta/0001_tracking.sql`):** Tracks `artifacts` (`verified_at`), `pages`, `fetches` (90-day scheduled prune), `documents`, and `crawls`.
+- **`SEARCH` D1 (`hub/migrations/search/0001_fts.sql`):** External-content `FTS5` (`porter unicode61 remove_diacritics 2`) with atomic `DELETE` + `INSERT` page replacement and a 7 GB warn / 9 GB stop capacity guard.
+
+---
+
+## 7. Single-Pane-of-Glass Observability (Cloudflare Logs & Traces)
 
 `hub/wrangler.toml` enables both `[observability.logs]` and `[observability.traces]` at `100%` sampling:
 

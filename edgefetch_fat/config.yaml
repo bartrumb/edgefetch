@@ -1,0 +1,35 @@
+name: "EdgeFetch Fat Worker (Browser + PDF)"
+version: "2.0.0"
+slug: "edgefetch_fat"
+image: "ghcr.io/bartrumb/edgefetch-fat-addon-{arch}"
+description: "Outbound-only Go HTTP/2 + Headless Chromium JS rendering + Poppler PDF extraction worker for Cloudflare Hibernating WebSocket Durable Objects (zero inbound ports, loopback SSRF CONNECT proxy, AppArmor confined)."
+url: "https://github.com/bartrumb/edgefetch"
+arch:
+  - aarch64
+  - amd64
+init: false
+apparmor: true
+startup: services
+boot: auto
+hassio_api: false
+homeassistant_api: false
+host_network: false
+
+options:
+  hub_url: ""
+  agent_token: ""
+  site_id: "site-fat-1"
+  user_agent: "EdgeFetch/2.0 (+https://github.com/bartrumb/edgefetch)"
+  pause_ms: 3000
+  pause_jitter_ms: 1500
+  allowed_hosts: []
+
+schema:
+  hub_url: url
+  agent_token: password
+  site_id: "match(^[a-z0-9][a-z0-9_-]{0,31}$)"
+  user_agent: str
+  pause_ms: "int(1000,60000)"
+  pause_jitter_ms: "int(0,30000)"
+  allowed_hosts:
+    - str

@@ -65,6 +65,10 @@ export interface McpServerDeps {
     args: Record<string, unknown>;
     principal?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeInteract?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
   searchCollection?: (params: {
     collectionId: string;
     query: string;
@@ -240,10 +244,22 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           url: { type: 'string', description: 'Public https:// URL to scrape.' },
           formats: {
             type: 'array',
-            items: { type: 'string', enum: ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding', 'llmsTxt'] },
+            items: {
+              type: 'string',
+              enum: ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding', 'llmsTxt', 'screenshot'],
+            },
             default: ['markdown'],
             description: 'Desired output formats.',
           },
+          renderMode: {
+            type: 'string',
+            enum: ['off', 'auto', 'always'],
+            default: 'off',
+            description: '"auto" upgrades SPA shells to headless Chromium on edgefetch_fat nodes; "always" forces Chromium.',
+          },
+          waitForMs: { type: 'integer', minimum: 0, maximum: 15000, description: 'Extra JS settle wait in ms when rendering.' },
+          waitSelector: { type: 'string', description: 'Optional CSS selector to wait for when rendering.' },
+          maxPages: { type: 'integer', minimum: 1, maximum: 500, description: 'Max PDF pages to extract via Poppler pdftotext.' },
           onlyMainContent: { type: 'boolean', default: true, description: 'Strip nav/footer/aside chrome and isolate main/article content.' },
           discoverLlmsTxt: { type: 'boolean', default: true, description: 'Check /llms.txt and upgrade to companion .md when available.' },
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
@@ -309,6 +325,53 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           limit: { type: 'integer', minimum: 1, maximum: 50, default: 10, description: 'Max matching chunks to return.' },
         },
         required: ['query'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'interact',
+      description:
+        'Drive a sandboxed headless Chromium session on an edgefetch_fat (browser-v1) node (click, fill, press, scroll, wait, PNG screenshots) with SSRF CONNECT isolation, robots.txt pre-checks, and automatic stop on anti-bot challenges.',
+      annotations: {
+        title: 'Interact with Page in Sandboxed Headless Browser',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Initial public https:// URL (omit when resuming/closing sessionId).' },
+          sessionId: { type: 'string', description: 'Composite sessionId returned from a prior interact call with keepSession=true.' },
+          keepSession: { type: 'boolean', default: false, description: 'Keep the incognito browser tab open for follow-up interact calls.' },
+          closeSession: { type: 'boolean', default: false, description: 'Close the retained browser session after this turn.' },
+          actions: {
+            type: 'array',
+            maxItems: 25,
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', enum: ['click', 'fill', 'type', 'press', 'wait', 'scroll', 'select', 'navigate'] },
+                selector: { type: 'string' },
+                value: { type: 'string' },
+                key: { type: 'string' },
+                url: { type: 'string' },
+                waitMs: { type: 'integer', minimum: 0, maximum: 15000 },
+              },
+              required: ['type'],
+              additionalProperties: false,
+            },
+          },
+          formats: {
+            type: 'array',
+            items: { type: 'string', enum: ['markdown', 'html', 'screenshot'] },
+            default: ['markdown'],
+          },
+          waitForMs: { type: 'integer', minimum: 0, maximum: 15000 },
+          waitSelector: { type: 'string' },
+          site: { type: 'string', description: 'Optional specific edgefetch_fat site ID.' },
+        },
         additionalProperties: false,
       },
     },
@@ -560,6 +623,20 @@ async function handleToolCall(
     }
     return {
       content: [{ type: 'text', text: JSON.stringify({ collectionId, query, hits: res.hits }, null, 2) }],
+    };
+  }
+
+  if (name === 'interact') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    if (!deps.executeInteract) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'interact_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeInteract({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status !== 200 ? { isError: true } : {}),
     };
   }
 

@@ -178,6 +178,8 @@ function renderDashboardHtml(params: {
     .lvl-warn { background: #78350f; color: #fcd34d; }
     .lvl-error { background: #7f1d1d; color: #fca5a5; }
     .cat { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; }
+    .tier-fat { font-size: 0.68rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; background: #14532d; color: #86efac; border: 1px solid #166534; }
+    .tier-lite { font-size: 0.68rem; padding: 1px 6px; border-radius: 4px; font-weight: 700; background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
     .log-detail { display: none; margin: 6px 0 2px; padding: 8px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #93c5fd; white-space: pre-wrap; word-break: break-all; }
     .log-row.open .log-detail { display: block; }
     .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 10px; }
@@ -479,12 +481,19 @@ function renderDashboardHtml(params: {
             const verBadge = a.version
               ? '<span class="ver">v' + esc(a.version) + '</span>'
               : '<span class="ver ver-legacy" title="Update add-on to report release version">pre-1.0.5</span>';
+            const caps = Array.isArray(a.capabilities) ? a.capabilities : [];
+            const isFat = caps.includes('browser-v1');
+            const tierBadge = isFat
+              ? '<span class="tier-fat" title="Headless Chromium + Poppler PDF">FAT</span>'
+              : '<span class="tier-lite" title="Distroless HTTP/2 Lite">LITE</span>';
             const verDetail = (a.version ? 'v' + a.version : 'legacy') + (a.goVersion ? ' · ' + a.goVersion : '');
+            const capsDetail = caps.length ? caps.join(', ') : 'http2-lite';
             const sharedCount = a.publicIp ? (ipCounts[a.publicIp] || 1) : 1;
             const ipNote = sharedCount > 1 ? ' (shared x' + sharedCount + ')' : '';
             return '<div class="site-card">' +
-              '<div class="site-top"><span class="site-name">' + esc(a.siteId) + '</span><span style="display:inline-flex;gap:5px;align-items:center">' + verBadge + '<span class="arch">' + esc(a.arch) + '</span></span></div>' +
+              '<div class="site-top"><span class="site-name">' + esc(a.siteId) + '</span><span style="display:inline-flex;gap:5px;align-items:center">' + tierBadge + verBadge + '<span class="arch">' + esc(a.arch) + '</span></span></div>' +
               '<div class="kv"><span>Version</span><strong>' + esc(verDetail) + '</strong></div>' +
+              '<div class="kv"><span>Capabilities</span><strong><code>' + esc(capsDetail) + '</code></strong></div>' +
               '<div class="kv"><span>Public IP</span><strong><code>' + esc(fmtIp(a.publicIp)) + '</code>' + esc(ipNote) + '</strong></div>' +
               '<div class="kv"><span>Connected</span><strong>' + esc(relTime(a.connectedAt)) + '</strong></div>' +
               '<div class="kv"><span>Last Job</span><strong>' + esc(relTime(a.lastJobAt)) + '</strong></div>' +

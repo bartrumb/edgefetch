@@ -1,6 +1,9 @@
 package extract
 
 import (
+	"bytes"
+	"compress/zlib"
+	"context"
 	"strings"
 	"testing"
 )
@@ -108,5 +111,25 @@ func TestNeedsBrowserRenderAndChallengeDetection(t *testing.T) {
 	challenge := `<!doctype html><html><head><title>Just a moment...</title></head><body><div class="cf-turnstile"></div></body></html>`
 	if why := DetectRenderedChallenge(challenge); why == "" {
 		t.Fatal("expected anti-bot challenge detection")
+	}
+}
+
+func TestPureGoCompressedPDFExtraction(t *testing.T) {
+	var zbuf bytes.Buffer
+	zw := zlib.NewWriter(&zbuf)
+	_, _ = zw.Write([]byte("BT /F1 12 Tf 72 712 Td (Shimano EP801 Torque Table: 50 Nm) Tj ET"))
+	_ = zw.Close()
+
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.7\n1 0 obj << /Length 100 /Filter /FlateDecode >>\nstream\n")
+	pdf.Write(zbuf.Bytes())
+	pdf.WriteString("\nendstream\nendobj\n%%EOF")
+
+	text, _, err := ExtractPDFText(context.Background(), pdf.Bytes(), 10)
+	if err != nil {
+		t.Fatalf("ExtractPDFText failed: %v", err)
+	}
+	if !strings.Contains(text, "Shimano EP801 Torque Table: 50 Nm") {
+		t.Fatalf("unexpected PDF extracted text: %q", text)
 	}
 }

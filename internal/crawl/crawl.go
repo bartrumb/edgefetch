@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/bartrumb/edgefetch/internal/browser"
 	"github.com/bartrumb/edgefetch/internal/classify"
 	"github.com/bartrumb/edgefetch/internal/extract"
 	"github.com/bartrumb/edgefetch/internal/politeness"
@@ -28,6 +29,14 @@ import (
 
 // DefaultUserAgent is sent when no custom User-Agent is configured. Always identify crawlers honestly.
 const DefaultUserAgent = "EdgeFetch/1.0 (+https://github.com/bartrumb/edgefetch)"
+
+// InteractSpec configures stateful or single-turn headless Chromium interaction (`firecrawl_interact` parity).
+type InteractSpec struct {
+	SessionID    string                   `json:"sessionId,omitempty"`
+	KeepSession  bool                     `json:"keepSession,omitempty"`
+	CloseSession bool                     `json:"closeSession,omitempty"`
+	Actions      []browser.InteractAction `json:"actions,omitempty"`
+}
 
 // Request describes a single URL to fetch within a batch.
 type Request struct {
@@ -44,6 +53,11 @@ type Request struct {
 	RedactPII          bool              `json:"redactPii,omitempty"`
 	Query              string            `json:"query,omitempty"`
 	Headers            map[string]string `json:"headers,omitempty"`
+	RenderMode         string            `json:"renderMode,omitempty"` // "off" (default), "auto", "always"
+	WaitForMs          int               `json:"waitForMs,omitempty"`
+	WaitSelector       string            `json:"waitSelector,omitempty"`
+	MaxPages           int               `json:"maxPages,omitempty"`
+	Interact           *InteractSpec     `json:"interact,omitempty"`
 }
 
 // Timing records where a single HTTP attempt spent wall-clock milliseconds via Go's `net/http/httptrace` hooks.
@@ -71,38 +85,44 @@ type ArtifactRef struct {
 
 // Result reports the outcome, headers of interest, phase timings, and optional body or R2 artifact of one `Request`.
 type Result struct {
-	ID            string                   `json:"id"`
-	URL           string                   `json:"url"`
-	Kind          classify.Kind            `json:"kind"`
-	Outcome       classify.Outcome         `json:"outcome"`
-	Problem       string                   `json:"problem,omitempty"`
-	Status        int                      `json:"status"`
-	ContentType   string                   `json:"contentType,omitempty"`
-	CfMitigated   string                   `json:"cfMitigated,omitempty"`
-	ETag          string                   `json:"etag,omitempty"`
-	LastModified  string                   `json:"lastModified,omitempty"`
-	RetryAfter    string                   `json:"retryAfter,omitempty"`
-	RetryAfterMs  int64                    `json:"retryAfterMs,omitempty"`
-	Bytes         int                      `json:"bytes"`
-	Truncated     bool                     `json:"truncated,omitempty"`
-	BodyOmitted   bool                     `json:"bodyOmitted,omitempty"`
-	Attempts      int                      `json:"attempts"`
-	DurationMs    int64                    `json:"durationMs"`
-	Timing        Timing                   `json:"timing"`
-	Body          string                   `json:"body,omitempty"`
-	BodyEncoding  string                   `json:"bodyEncoding,omitempty"`
-	Artifact      *ArtifactRef             `json:"artifact,omitempty"`
-	ArtifactError string                   `json:"artifactError,omitempty"`
-	FinalURL      string                   `json:"finalUrl,omitempty"`
-	Title         string                   `json:"title,omitempty"`
-	Description   string                   `json:"description,omitempty"`
-	Favicon       string                   `json:"favicon,omitempty"`
-	Markdown      string                   `json:"markdown,omitempty"`
-	Text          string                   `json:"text,omitempty"`
-	Links         []string                 `json:"links,omitempty"`
-	Images        []extract.ImageInfo      `json:"images,omitempty"`
-	Branding      *extract.BrandingProfile `json:"branding,omitempty"`
-	Llms          *extract.LlmsDiscovery   `json:"llms,omitempty"`
+	ID               string                   `json:"id"`
+	URL              string                   `json:"url"`
+	Kind             classify.Kind            `json:"kind"`
+	Outcome          classify.Outcome         `json:"outcome"`
+	Problem          string                   `json:"problem,omitempty"`
+	Status           int                      `json:"status"`
+	ContentType      string                   `json:"contentType,omitempty"`
+	CfMitigated      string                   `json:"cfMitigated,omitempty"`
+	ETag             string                   `json:"etag,omitempty"`
+	LastModified     string                   `json:"lastModified,omitempty"`
+	RetryAfter       string                   `json:"retryAfter,omitempty"`
+	RetryAfterMs     int64                    `json:"retryAfterMs,omitempty"`
+	Bytes            int                      `json:"bytes"`
+	Truncated        bool                     `json:"truncated,omitempty"`
+	BodyOmitted      bool                     `json:"bodyOmitted,omitempty"`
+	Attempts         int                      `json:"attempts"`
+	DurationMs       int64                    `json:"durationMs"`
+	Timing           Timing                   `json:"timing"`
+	Body             string                   `json:"body,omitempty"`
+	BodyEncoding     string                   `json:"bodyEncoding,omitempty"`
+	Artifact         *ArtifactRef             `json:"artifact,omitempty"`
+	ArtifactError    string                   `json:"artifactError,omitempty"`
+	FinalURL         string                   `json:"finalUrl,omitempty"`
+	Title            string                   `json:"title,omitempty"`
+	Description      string                   `json:"description,omitempty"`
+	Favicon          string                   `json:"favicon,omitempty"`
+	Markdown         string                   `json:"markdown,omitempty"`
+	Text             string                   `json:"text,omitempty"`
+	Links            []string                 `json:"links,omitempty"`
+	Images           []extract.ImageInfo      `json:"images,omitempty"`
+	Branding         *extract.BrandingProfile `json:"branding,omitempty"`
+	Llms             *extract.LlmsDiscovery   `json:"llms,omitempty"`
+	Rendered         bool                     `json:"rendered,omitempty"`
+	SessionID        string                   `json:"sessionId,omitempty"`
+	ScreenshotBase64 string                   `json:"screenshotBase64,omitempty"`
+	PDFEngine        string                   `json:"pdfEngine,omitempty"`
+	SHA256           string                   `json:"sha256,omitempty"`
+	BodyBase64       string                   `json:"bodyBase64,omitempty"`
 }
 
 // DecodeBody returns the exact raw response bytes for `r.Body`, decoding `"base64"` payloads losslessly when the origin
@@ -239,6 +259,7 @@ type Crawler struct {
 	hostsMu           sync.Mutex
 	hosts             *politeness.Registry
 	llms              *llmsCache
+	renderer          *browser.Renderer
 	robotsBypassHosts []string
 	globalMu          sync.Mutex
 	globalNext        time.Time
@@ -261,7 +282,7 @@ func NewCrawler(transport http.RoundTripper, allow func(*url.URL) error, userAge
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	var rngMu sync.Mutex
-	return &Crawler{
+	c := &Crawler{
 		client:    client,
 		allow:     allow,
 		userAgent: userAgent,
@@ -278,6 +299,51 @@ func NewCrawler(transport http.RoundTripper, allow func(*url.URL) error, userAge
 			return time.Duration(rng.Int63n(int64(d) + 1))
 		},
 	}
+	r := browser.NewRenderer("", allow, userAgent, 2, log)
+	r.CheckRobots = func(ctx context.Context, rawURL string) error {
+		host := hostOf(rawURL)
+		if !c.shouldCheckRobots(host, Options{}) {
+			return nil
+		}
+		hs := c.hostStateFor(host)
+		if err := hs.Acquire(ctx); err != nil {
+			return err
+		}
+		defer hs.Release()
+		allowed, _, reason := c.checkRobots(ctx, hs, rawURL)
+		if !allowed {
+			return errors.New(reason)
+		}
+		return nil
+	}
+	c.renderer = r
+	return c
+}
+
+// SetRenderer replaces the browser renderer (used by unit tests with mock CDP WebSockets).
+func (c *Crawler) SetRenderer(r *browser.Renderer) {
+	c.renderer = r
+}
+
+// Close shuts down any running headless Chromium subprocess and loopback SSRF proxy.
+func (c *Crawler) Close() error {
+	if c == nil || c.renderer == nil {
+		return nil
+	}
+	return c.renderer.Close()
+}
+
+// Capabilities returns the runtime feature tokens advertised in `X-Agent-Capabilities` (`artifacts-v1`, plus
+// `browser-v1` when Chromium is present and `pdf-v1` when Poppler `pdftotext` is installed).
+func (c *Crawler) Capabilities() []string {
+	caps := []string{"artifacts-v1"}
+	if c != nil && c.renderer != nil && c.renderer.Available() {
+		caps = append(caps, "browser-v1")
+	}
+	if extract.HasPDFToText() {
+		caps = append(caps, "pdf-v1")
+	}
+	return caps
 }
 
 // SetRobotsBypassHosts configures the owner-controlled host allowlist permitted to set `respectRobots: false`.
@@ -496,6 +562,79 @@ func (c *Crawler) runRequestWithRedirects(
 		return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: err.Error()}, false
 	}
 	started := c.Now()
+
+	// Resumed or session-closing `interact` turn (`origReq.URL == ""` with `origReq.Interact.SessionID != ""`).
+	if origReq.Interact != nil && strings.TrimSpace(origReq.URL) == "" {
+		res := c.runBrowserStep(ctx, origReq, opts, started)
+		c.logResult(ctx, log, origReq, res)
+		return res, false
+	}
+
+	// Explicit headless browser render (`KindRender`, `renderMode: "always"`, or `Interact != nil`):
+	// Enforce per-host pacing AND check `/robots.txt` BEFORE launching/navigating Chromium!
+	if origReq.Kind == classify.KindRender || strings.EqualFold(origReq.RenderMode, "always") || origReq.Interact != nil {
+		curHost := hostOf(origReq.URL)
+		hs := c.hostStateFor(curHost)
+		if err := hs.Acquire(ctx); err != nil {
+			return notTried(origReq, "crawl cancelled"), true
+		}
+		if why := hs.CheckCircuit(c.Now(), curHost); why != "" {
+			hs.Release()
+			return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: why}, false
+		}
+		var waitDur time.Duration
+		if paceInitialHop {
+			waitDur = minPause
+			if cd := hs.CrawlDelay(c.Now()); cd > waitDur {
+				waitDur = cd
+			}
+			if maxJitter > 0 {
+				waitDur += c.Jitter(maxJitter)
+			}
+			if rem := hs.WaitDelay(c.Now()); rem > waitDur {
+				waitDur = rem
+			}
+		} else {
+			waitDur = hs.WaitDelay(c.Now())
+		}
+		if waitDur > 0 {
+			if err := c.Sleep(ctx, waitDur); err != nil {
+				hs.Release()
+				return notTried(origReq, "crawl cancelled"), true
+			}
+		}
+		if err := c.waitGlobalGap(ctx, gap); err != nil {
+			hs.Release()
+			return notTried(origReq, "crawl cancelled"), true
+		}
+		if c.shouldCheckRobots(curHost, opts) {
+			if allowed, distressed, reason := c.checkRobots(ctx, hs, origReq.URL); !allowed {
+				hs.Release()
+				outcome := classify.OutcomeError
+				if distressed {
+					outcome = classify.OutcomeStop
+				}
+				return Result{
+					ID:         origReq.ID,
+					URL:        origReq.URL,
+					Kind:       origReq.Kind,
+					Outcome:    outcome,
+					Problem:    reason,
+					DurationMs: c.Now().Sub(started).Milliseconds(),
+				}, false
+			}
+		}
+		nextFloor := minPause
+		if maxJitter > 0 {
+			nextFloor += c.Jitter(maxJitter)
+		}
+		hs.RecordOutcome(c.Now(), nextFloor, 0, http.StatusOK, false, false)
+		hs.Release()
+
+		res := c.runBrowserStep(ctx, origReq, opts, started)
+		c.logResult(ctx, log, origReq, res)
+		return res, false
+	}
 	curURLStr := origReq.URL
 	prevHost := ""
 	totalAttempts := 0
@@ -624,6 +763,26 @@ func (c *Crawler) runRequestWithRedirects(
 			}
 			curURLStr = parsedCur.ResolveReference(locURL).String()
 			continue
+		}
+
+		if strings.EqualFold(origReq.RenderMode, "auto") &&
+			res.Outcome == classify.OutcomeOK &&
+			c.renderer != nil &&
+			c.renderer.Available() &&
+			extract.NeedsBrowserRender(string(rawBody)) {
+			targetForRender := res.FinalURL
+			if targetForRender == "" {
+				targetForRender = origReq.URL
+			}
+			upReq := origReq
+			upReq.URL = targetForRender
+			renderedRes := c.runBrowserStep(ctx, upReq, opts, started)
+			if renderedRes.Outcome == classify.OutcomeOK || renderedRes.Outcome == classify.OutcomeChallenge {
+				renderedRes.ID = origReq.ID
+				renderedRes.URL = origReq.URL
+				c.logResult(ctx, log, origReq, renderedRes)
+				return renderedRes, false
+			}
 		}
 
 		c.enrichResult(ctx, origReq, opts, rawBody, &res)

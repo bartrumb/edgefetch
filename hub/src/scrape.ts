@@ -709,6 +709,10 @@ export interface ScrapeRequestPayload {
   redactPii?: unknown;
   query?: unknown;
   headers?: unknown;
+  renderMode?: unknown;
+  waitForMs?: unknown;
+  waitSelector?: unknown;
+  maxPages?: unknown;
   collectionId?: unknown;
   target?: unknown;
   site?: unknown;
@@ -806,9 +810,16 @@ export async function executeScrapeCall(params: {
   }
 
   const agentFormats = [...stringFormats].filter((f) =>
-    ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding'].includes(f),
+    ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding', 'screenshot'].includes(f),
   );
   if (agentFormats.length === 0) agentFormats.push('markdown');
+
+  const renderMode =
+    payload.renderMode === 'always' || payload.renderMode === 'auto' || payload.renderMode === 'off'
+      ? payload.renderMode
+      : stringFormats.has('screenshot')
+        ? 'always'
+        : undefined;
 
   const fetchCall = {
     maxSeconds: 45,
@@ -821,11 +832,21 @@ export async function executeScrapeCall(params: {
       {
         id: 'scrape-1',
         url: normalizedUrl,
-        kind: 'scrape',
+        kind: renderMode === 'always' ? 'render' : 'scrape',
         formats: agentFormats,
         onlyMainContent,
         discoverLlms: discoverLlmsTxt || stringFormats.has('llmsTxt'),
         redactPii,
+        ...(renderMode ? { renderMode } : {}),
+        ...(typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
+          ? { waitForMs: Math.min(15_000, Math.max(0, Math.floor(payload.waitForMs))) }
+          : {}),
+        ...(typeof payload.waitSelector === 'string' && payload.waitSelector.trim()
+          ? { waitSelector: payload.waitSelector.trim().slice(0, 200) }
+          : {}),
+        ...(typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages)
+          ? { maxPages: Math.min(500, Math.max(1, Math.floor(payload.maxPages))) }
+          : {}),
         ...(typeof payload.query === 'string' && payload.query.trim() ? { query: payload.query.trim() } : {}),
         ...(payload.headers && typeof payload.headers === 'object' ? { headers: payload.headers } : {}),
       },
@@ -912,6 +933,9 @@ export async function executeScrapeCall(params: {
     ...(jsonSchemaSpec && extracted
       ? { json: extractStructuredJsonFromPage(rawBodyStr, extracted, jsonSchemaSpec.schema) }
       : {}),
+    ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64 ? { screenshotBase64: item.screenshotBase64 } : {}),
+    ...(item.rendered === true ? { rendered: true } : {}),
+    ...(typeof item.pdfEngine === 'string' ? { pdfEngine: item.pdfEngine } : {}),
     ...(item.llms ? { llms: item.llms } : {}),
     metadata: {
       title: (typeof item.title === 'string' && item.title) || extracted?.title,
@@ -924,4 +948,204 @@ export async function executeScrapeCall(params: {
   };
 
   return { status: 200, via: fetchRes.via, body: out };
+}
+
+export interface InteractRequestPayload {
+  url?: unknown;
+  sessionId?: unknown;
+  keepSession?: unknown;
+  closeSession?: unknown;
+  actions?: unknown;
+  formats?: unknown;
+  waitForMs?: unknown;
+  waitSelector?: unknown;
+  site?: unknown;
+}
+
+function splitCompositeSessionId(raw: unknown): { siteId?: string; agentSessionId?: string } {
+  if (typeof raw !== 'string' || !raw.trim()) return {};
+  const clean = raw.trim();
+  const dot = clean.indexOf('.');
+  if (dot > 0 && dot < clean.length - 1) {
+    const sitePart = clean.slice(0, dot).toLowerCase();
+    const sessPart = clean.slice(dot + 1);
+    if (/^[a-z0-9][a-z0-9_-]{0,31}$/.test(sitePart) && /^[A-Za-z0-9_-]{4,80}$/.test(sessPart)) {
+      return { siteId: sitePart, agentSessionId: sessPart };
+    }
+  }
+  if (/^[A-Za-z0-9_-]{4,80}$/.test(clean)) {
+    return { agentSessionId: clean };
+  }
+  return {};
+}
+
+/**
+ * Executes `POST /v1/interact` + MCP `interact` (`firecrawl_interact` parity) against a `browser-v1` (`edgefetch_fat`)
+ * node. Composite `<siteId>.<efsess_id>` tokens ensure follow-up turns route back to the exact node holding the tab.
+ */
+export async function executeInteractCall(params: {
+  payload: InteractRequestPayload;
+  env: OptionalStorageBindings;
+  executeHubFetch: (
+    target: 'auto' | 'agent' | 'container',
+    body: string,
+    site?: string,
+    source?: string,
+    artifactRetention?: ArtifactRetention | 'off',
+    hydrateInline?: boolean,
+  ) => Promise<{ status: number; via: string; bodyText: string; retryAfter?: string }>;
+  source?: string;
+}): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
+  const { payload, env, executeHubFetch, source = 'interact' } = params;
+  const parsedSession = splitCompositeSessionId(payload.sessionId);
+  const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
+
+  let normalizedUrl = '';
+  if (rawUrl) {
+    let u: URL;
+    try {
+      u = new URL(rawUrl);
+    } catch {
+      return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: 'url must be a valid https:// URL' } };
+    }
+    if (u.protocol !== 'https:' || (u.port && u.port !== '443') || u.username || u.password) {
+      return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: 'only https:// URLs on port 443 are permitted' } };
+    }
+    normalizedUrl = u.toString();
+  } else if (!parsedSession.agentSessionId) {
+    return {
+      status: 400,
+      via: 'hub',
+      body: { ok: false, error: 'missing_url_or_session', message: 'provide url (new session) or sessionId (resume/close session)' },
+    };
+  }
+
+  const actions: Array<Record<string, unknown>> = [];
+  if (Array.isArray(payload.actions)) {
+    if (payload.actions.length > 25) {
+      return { status: 400, via: 'hub', body: { ok: false, error: 'too_many_actions', message: 'maximum 25 actions per interact turn' } };
+    }
+    for (const rawAct of payload.actions) {
+      if (!rawAct || typeof rawAct !== 'object') continue;
+      const a = rawAct as Record<string, unknown>;
+      const type = typeof a.type === 'string' ? a.type.trim().toLowerCase() : '';
+      if (!['click', 'fill', 'type', 'press', 'wait', 'scroll', 'select', 'navigate'].includes(type)) {
+        return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_action', message: `unsupported action type: ${String(a.type)}` } };
+      }
+      if (type === 'navigate') {
+        let nu: URL;
+        try {
+          nu = new URL(typeof a.url === 'string' ? a.url.trim() : '');
+        } catch {
+          return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: 'navigate action requires a valid https:// URL' } };
+        }
+        if (nu.protocol !== 'https:' || (nu.port && nu.port !== '443') || nu.username || nu.password) {
+          return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: 'navigate action only permits https:// on port 443' } };
+        }
+      }
+      actions.push({
+        type,
+        ...(typeof a.selector === 'string' ? { selector: a.selector.slice(0, 240) } : {}),
+        ...(typeof a.value === 'string' ? { value: a.value.slice(0, 4096) } : {}),
+        ...(typeof a.key === 'string' ? { key: a.key.slice(0, 40) } : {}),
+        ...(typeof a.url === 'string' ? { url: a.url.trim() } : {}),
+        ...(typeof a.waitMs === 'number' && Number.isFinite(a.waitMs)
+          ? { waitMs: Math.min(15_000, Math.max(0, Math.floor(a.waitMs))) }
+          : {}),
+      });
+    }
+  }
+
+  const formats = Array.isArray(payload.formats)
+    ? payload.formats.filter((f): f is string => typeof f === 'string')
+    : ['markdown'];
+  const keepSession = Boolean(payload.keepSession);
+  const closeSession = Boolean(payload.closeSession);
+  const explicitSite = typeof payload.site === 'string' && payload.site.trim() ? payload.site.trim().toLowerCase() : undefined;
+  const pinnedSite = parsedSession.siteId ?? explicitSite;
+
+  const call = {
+    maxSeconds: 60,
+    options: {
+      includeBody: true,
+      respectRobots: true,
+    },
+    requests: [
+      {
+        id: 'interact-1',
+        url: normalizedUrl,
+        kind: 'render',
+        renderMode: 'always',
+        formats: formats.length > 0 ? formats : ['markdown'],
+        ...(typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
+          ? { waitForMs: Math.min(15_000, Math.max(0, Math.floor(payload.waitForMs))) }
+          : {}),
+        ...(typeof payload.waitSelector === 'string' && payload.waitSelector.trim()
+          ? { waitSelector: payload.waitSelector.trim().slice(0, 200) }
+          : {}),
+        interact: {
+          ...(parsedSession.agentSessionId ? { sessionId: parsedSession.agentSessionId } : {}),
+          keepSession,
+          closeSession,
+          actions,
+        },
+      },
+    ],
+  };
+
+  const fetchRes = await executeHubFetch('agent', JSON.stringify(call), pinnedSite, source, env.ARTIFACTS ? 'transient' : undefined, true);
+  if (fetchRes.status !== 200) {
+    let errJson: Record<string, unknown> = { ok: false, error: 'interact_failed' };
+    try {
+      errJson = { ok: false, ...(JSON.parse(fetchRes.bodyText) as Record<string, unknown>) };
+    } catch {
+      // ignore
+    }
+    return { status: fetchRes.status, via: fetchRes.via, body: errJson };
+  }
+
+  const parsed = JSON.parse(fetchRes.bodyText) as { results?: Array<Record<string, unknown>> };
+  const item = parsed.results?.[0] ?? {};
+  if (item.outcome !== 'ok') {
+    return {
+      status: item.outcome === 'challenge' ? 403 : 422,
+      via: fetchRes.via,
+      body: {
+        ok: false,
+        outcome: item.outcome ?? 'error',
+        status: item.status ?? 0,
+        problem: item.problem ?? 'Browser interact step failed',
+      },
+    };
+  }
+
+  const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(fetchRes.via);
+  const actualSite = siteMatch?.[1] ?? pinnedSite;
+  const returnedAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
+  const publicSessionId = returnedAgentSid && actualSite ? `${actualSite}.${returnedAgentSid}` : returnedAgentSid;
+
+  const rawHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
+  const finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+  const extracted = rawHtml ? extractHtmlDocument(rawHtml, { baseUrl: finalUrl || undefined, onlyMainContent: true }) : undefined;
+  const markdown = (typeof item.markdown === 'string' && item.markdown) || extracted?.markdown || '';
+
+  return {
+    status: 200,
+    via: fetchRes.via,
+    body: {
+      ok: true,
+      via: fetchRes.via,
+      ...(finalUrl ? { finalUrl } : {}),
+      status: item.status ?? 200,
+      rendered: true,
+      ...(publicSessionId ? { sessionId: publicSessionId } : {}),
+      ...(closeSession ? { closed: true } : {}),
+      ...(formats.includes('markdown') ? { markdown } : {}),
+      ...(formats.includes('html') || formats.includes('rawHtml') ? { html: rawHtml } : {}),
+      ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64 ? { screenshotBase64: item.screenshotBase64 } : {}),
+      metadata: {
+        title: (typeof item.title === 'string' && item.title) || extracted?.title,
+      },
+    },
+  };
 }

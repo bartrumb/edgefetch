@@ -19,8 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bartrumb/edgefetch/internal/browser"
 	"github.com/bartrumb/edgefetch/internal/classify"
 	"github.com/bartrumb/edgefetch/internal/politeness"
+	"github.com/coder/websocket"
 )
 
 type recordedSleeps struct {
@@ -553,5 +555,94 @@ func TestScrapeLlmsTxtCompanionMarkdownAndRobotsGuard(t *testing.T) {
 	}
 	if results[2].Outcome != classify.OutcomeError || !strings.Contains(results[2].Problem, "not permitted") {
 		t.Fatalf("expected forbidden Cookie header to be rejected, got: %+v", results[2])
+	}
+}
+
+func TestRenderModeAutoPreChecksRobotsAndPDFExtraction(t *testing.T) {
+	var cdpNavigations atomic.Int32
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				continue
+			}
+			send := func(v any) {
+				b, _ := json.Marshal(v)
+				_ = conn.Write(r.Context(), websocket.MessageText, b)
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-1"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-1"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "s-1"}})
+			case "Page.navigate":
+				cdpNavigations.Add(1)
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "f-1"}})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Page.loadEventFired", "params": map[string]any{}})
+			case "Runtime.evaluate":
+				docJSON, _ := json.Marshal(map[string]string{
+					"url":  "http://spa.test/app",
+					"html": "<html><head><title>Hydrated SPA</title></head><body><main><h1>Client Rendered Inventory</h1></main></body></html>",
+				})
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}}})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("User-agent: *\nDisallow: /blocked-render\n"))
+		case "/app":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<!doctype html><html><head><script type="module" src="/main.js"></script></head><body><div id="root"></div></body></html>`))
+		case "/manual.pdf":
+			w.Header().Set("Content-Type", "application/pdf")
+			_, _ = w.Write([]byte("%PDF-1.7\n1 0 obj << /Length 48 >>\nstream\nBT /F1 12 Tf 72 712 Td (Battery Spec 720Wh) Tj ET\nendstream\nendobj\n%%EOF"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	mockR := browser.NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), nil, DefaultUserAgent)
+	c.SetRenderer(mockR)
+	defer c.Close()
+
+	out := c.Run(context.Background(), []Request{
+		{ID: "blocked", URL: "http://spa.test/blocked-render", Kind: classify.KindRender, WaitForMs: 10},
+		{ID: "spa", URL: "http://spa.test/app", Kind: classify.KindScrape, RenderMode: "auto", WaitForMs: 10, DiscoverLlms: Bool(false)},
+		{ID: "pdf", URL: "http://spa.test/manual.pdf", Kind: classify.KindPDF},
+	}, Options{PauseMs: 5})
+
+	if out[0].Outcome != classify.OutcomeError || !strings.Contains(out[0].Problem, "robots.txt disallowed") {
+		t.Fatalf("expected robots.txt to block KindRender before launching browser, got: %+v", out[0])
+	}
+	if !out[1].Rendered || !strings.Contains(out[1].Markdown, "Client Rendered Inventory") {
+		t.Fatalf("expected RenderMode=auto to upgrade SPA shell to hydrated Markdown, got: %+v", out[1])
+	}
+	if cdpNavigations.Load() != 1 {
+		t.Fatalf("expected exactly 1 CDP navigation (blocked-render must never reach CDP), got %d", cdpNavigations.Load())
+	}
+	if out[2].Outcome != classify.OutcomeOK || !strings.Contains(out[2].Markdown, "Battery Spec 720Wh") {
+		t.Fatalf("expected PDF extraction in KindPDF, got: %+v", out[2])
 	}
 }

@@ -2,15 +2,22 @@ package crawl
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/bartrumb/edgefetch/internal/browser"
 	"github.com/bartrumb/edgefetch/internal/classify"
 	"github.com/bartrumb/edgefetch/internal/extract"
 	"github.com/bartrumb/edgefetch/internal/politeness"
@@ -128,7 +135,7 @@ func shouldDiscoverLlms(r Request, opts Options) bool {
 	if opts.DiscoverLlms != nil {
 		return *opts.DiscoverLlms
 	}
-	return r.Kind == classify.KindScrape
+	return r.Kind == classify.KindScrape || r.Kind == classify.KindRender
 }
 
 // runAuxiliaryFetch executes a polite secondary GET (`/llms.txt` or `<url>.md`) through `runRequestWithRedirects` so
@@ -264,18 +271,29 @@ func (c *Crawler) tryFetchCompanionMarkdown(ctx context.Context, mdURL string, o
 }
 
 func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, rawBody []byte, res *Result) {
-	wantMarkdown := hasFormat(r.Formats, "markdown") || r.Kind == classify.KindScrape
+	wantMarkdown := hasFormat(r.Formats, "markdown") || r.Kind == classify.KindScrape || r.Kind == classify.KindRender || r.Kind == classify.KindPDF
 	wantText := hasFormat(r.Formats, "text")
 	wantLinks := hasFormat(r.Formats, "links")
 	wantImages := hasFormat(r.Formats, "images")
 	wantBranding := hasFormat(r.Formats, "branding")
+	wantBase64 := hasFormat(r.Formats, "base64") || r.Kind == classify.KindBinary
 	wantRawHTML := hasFormat(r.Formats, "rawHtml") || hasFormat(r.Formats, "html")
 	onlyMain := true
 	if r.OnlyMainContent != nil {
 		onlyMain = *r.OnlyMainContent
 	}
 
-	if shouldDiscoverLlms(r, opts) && res.Outcome == classify.OutcomeOK {
+	if res.Outcome == classify.OutcomeOK && len(rawBody) > 0 {
+		sum := sha256.Sum256(rawBody)
+		if wantBase64 || r.Kind == classify.KindPDF {
+			res.SHA256 = hex.EncodeToString(sum[:])
+		}
+		if wantBase64 {
+			res.BodyBase64 = base64.StdEncoding.EncodeToString(rawBody)
+		}
+	}
+
+	if shouldDiscoverLlms(r, opts) && res.Outcome == classify.OutcomeOK && r.URL != "" {
 		targetForLlms := res.FinalURL
 		if targetForLlms == "" {
 			targetForLlms = r.URL
@@ -309,6 +327,36 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 	}
 
 	ct := strings.ToLower(res.ContentType)
+	isPDF := r.Kind == classify.KindPDF || strings.Contains(ct, "application/pdf") || extract.IsPDFBytes(rawBody)
+	if isPDF && (wantMarkdown || wantText) {
+		pdfTxt, usedPoppler, err := extract.ExtractPDFText(ctx, rawBody, r.MaxPages)
+		if err == nil {
+			if r.Query != "" {
+				pdfTxt = extract.RerankPassages(pdfTxt, r.Query, 24_000)
+			}
+			if r.RedactPII {
+				pdfTxt = extract.RedactPII(pdfTxt)
+			}
+			if wantMarkdown {
+				res.Markdown = pdfTxt
+			}
+			if wantText {
+				res.Text = pdfTxt
+			}
+			res.PDFEngine = "pure-go"
+			if usedPoppler {
+				res.PDFEngine = "poppler-pdftotext"
+			}
+		} else if r.Kind == classify.KindPDF {
+			res.Problem = err.Error()
+		}
+		if !opts.IncludeBody && !wantRawHTML {
+			res.Body = ""
+			res.BodyEncoding = ""
+		}
+		return
+	}
+
 	isMarkdownOrPlain := strings.Contains(ct, "text/markdown") || strings.Contains(ct, "text/plain")
 	if isMarkdownOrPlain && (wantMarkdown || wantText) {
 		txt := string(rawBody)
@@ -331,7 +379,7 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 		return
 	}
 
-	isHTML := strings.Contains(ct, "html") || r.Kind == classify.KindPage || r.Kind == classify.KindScrape || r.Kind == classify.KindCatalog
+	isHTML := strings.Contains(ct, "html") || r.Kind == classify.KindPage || r.Kind == classify.KindRender || r.Kind == classify.KindScrape || r.Kind == classify.KindCatalog
 	if isHTML && (wantMarkdown || wantText || wantLinks || wantImages || wantBranding) {
 		baseURL := res.FinalURL
 		if baseURL == "" {
@@ -369,4 +417,90 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 			res.BodyEncoding = ""
 		}
 	}
+}
+
+func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, started time.Time) Result {
+	res := Result{
+		ID:       r.ID,
+		URL:      r.URL,
+		Kind:     r.Kind,
+		Attempts: 1,
+	}
+	if c.renderer == nil || !c.renderer.Available() {
+		res.Outcome = classify.OutcomeError
+		res.Problem = browser.ErrBrowserUnavailable.Error()
+		res.DurationMs = c.Now().Sub(started).Milliseconds()
+		return res
+	}
+
+	rctx, cancel := context.WithTimeout(ctx, time.Duration(opts.TimeoutMs)*time.Millisecond)
+	defer cancel()
+
+	task := browser.Task{
+		URL:          r.URL,
+		UserAgent:    c.userAgent,
+		Headers:      r.Headers,
+		WaitForMs:    r.WaitForMs,
+		WaitSelector: r.WaitSelector,
+		Screenshot:   hasFormat(r.Formats, "screenshot"),
+	}
+	if r.Interact != nil {
+		task.SessionID = r.Interact.SessionID
+		task.KeepSession = r.Interact.KeepSession
+		task.CloseSession = r.Interact.CloseSession
+		task.Actions = r.Interact.Actions
+	}
+
+	out, err := c.renderer.Execute(rctx, task)
+	if err != nil {
+		res.Status = out.Status
+		res.FinalURL = out.FinalURL
+		if errors.Is(err, browser.ErrChallengeDetected) {
+			res.Outcome = classify.OutcomeChallenge
+		} else {
+			res.Outcome = classify.OutcomeError
+		}
+		res.Problem = err.Error()
+		res.DurationMs = c.Now().Sub(started).Milliseconds()
+		return res
+	}
+
+	rawBody := []byte(out.HTML)
+	if len(rawBody) > opts.MaxBytes {
+		res.Status = out.Status
+		res.Bytes = opts.MaxBytes
+		res.Truncated = true
+		res.Outcome = classify.OutcomeError
+		res.Problem = fmt.Sprintf("rendered DOM over %d bytes", opts.MaxBytes)
+		res.DurationMs = c.Now().Sub(started).Milliseconds()
+		return res
+	}
+
+	res.Status = out.Status
+	if res.Status == 0 {
+		res.Status = http.StatusOK
+	}
+	res.Bytes = len(rawBody)
+	res.ContentType = out.Headers.Get("content-type")
+	if res.ContentType == "" {
+		res.ContentType = "text/html; charset=utf-8"
+	}
+	res.FinalURL = out.FinalURL
+	res.Rendered = true
+	res.SessionID = out.SessionID
+	res.ScreenshotBase64 = out.ScreenshotBase64
+	res.Outcome, res.Problem = classify.Classify(classify.KindRender, res.Status, out.Headers, rawBody)
+
+	if opts.IncludeBody && len(rawBody) > 0 {
+		if utf8.Valid(rawBody) {
+			res.Body = string(rawBody)
+			res.BodyEncoding = "utf-8"
+		} else {
+			res.Body = base64.StdEncoding.EncodeToString(rawBody)
+			res.BodyEncoding = "base64"
+		}
+	}
+	c.enrichResult(ctx, r, opts, rawBody, &res)
+	res.DurationMs = c.Now().Sub(started).Milliseconds()
+	return res
 }

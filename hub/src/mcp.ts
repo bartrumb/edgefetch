@@ -69,6 +69,18 @@ export interface McpServerDeps {
     args: Record<string, unknown>;
     principal?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeMap?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeCrawl?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeSearch?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
   searchCollection?: (params: {
     collectionId: string;
     query: string;
@@ -139,7 +151,7 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
     {
       name: 'list_agents',
       description:
-        'List connected Home Assistant OS / EdgeFetch standby crawler agents, CPU architectures (amd64/arm64), job counters, and active 15-minute SQLite domain-affinity pins.',
+        'List connected Home Assistant OS / EdgeFetch standby crawler agents (LITE vs FAT browser/PDF tiers), CPU architectures, job counters, and active host-affinity pins.',
       annotations: {
         title: 'List Connected Crawler Agents',
         readOnlyHint: true,
@@ -154,83 +166,9 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
       },
     },
     {
-      name: 'fetch_url',
-      description:
-        'Fetch a public HTTPS URL politely through the EdgeFetch coordinator (enforcing robots.txt, per-host rate limits, SSRF blocks, and returning DNS/TLS/TTFB phase timings plus response content).',
-      annotations: {
-        title: 'Fetch Public HTTPS URL',
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
-      inputSchema: {
-        type: 'object',
-        properties: {
-          url: { type: 'string', description: 'Public https:// URL to fetch (port 443).' },
-          kind: {
-            type: 'string',
-            enum: ['page', 'json', 'text', 'feed'],
-            default: 'page',
-            description:
-              '"page" for HTML documents, "json" for general JSON APIs, "text" for plain text/XML/sitemaps, or "feed" for product feeds containing a top-level "products" array.',
-          },
-          target: {
-            type: 'string',
-            enum: allowedTargets,
-            default: defaultTarget,
-            description:
-              'Execution tier ("auto" = load-balance across remote HAOS nodes and reach out via Cloudflare only on 429, "agent", or "container").',
-          },
-          site: {
-            type: 'string',
-            description: 'Optional standby site ID to pin (e.g. "site-arm64", "site-x86", "site-win-vm").',
-          },
-          includeBody: { type: 'boolean', default: true, description: 'Include response body preview in tool output.' },
-          maxBytes: { type: 'integer', minimum: 1024, maximum: 16777216, description: 'Maximum response body bytes (up to 16 MiB).' },
-          ifNoneMatch: { type: 'string', description: 'Optional ETag for conditional 304 Not Modified checks.' },
-          ifModifiedSince: { type: 'string', description: 'Optional Last-Modified timestamp for conditional 304 checks.' },
-        },
-        required: ['url'],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: 'fetch_batch',
-      description:
-        'Politely fetch up to 25 public HTTPS URLs in one coordinated batch with per-host serialization, positive dwell jitter, robots.txt checks, and phase timing.',
-      annotations: {
-        title: 'Batch Fetch Public HTTPS URLs',
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
-      },
-      inputSchema: {
-        type: 'object',
-        properties: {
-          urls: {
-            type: 'array',
-            items: { type: 'string' },
-            minItems: 1,
-            maxItems: MAX_BATCH_URLS,
-            description: '1 to 25 public https:// URLs to fetch.',
-          },
-          kind: { type: 'string', enum: ['page', 'json', 'text', 'feed'], default: 'page' },
-          target: { type: 'string', enum: allowedTargets, default: defaultTarget },
-          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
-          pauseMs: { type: 'integer', minimum: 0, maximum: 30000, default: 1000, description: 'Minimum per-host pause in ms.' },
-          pauseJitterMs: { type: 'integer', minimum: 0, maximum: 15000, default: 500, description: 'Random positive jitter added to pauseMs.' },
-          includeBody: { type: 'boolean', default: false, description: 'Set true to include paged body previews + artifactId per URL.' },
-        },
-        required: ['urls'],
-        additionalProperties: false,
-      },
-    },
-    {
       name: 'scrape',
       description:
-        'Scrape a public HTTPS URL into clean main-content Markdown, metadata, links, images, branding, and /llms.txt + companion .md discovery (with verified META D1 + R2 maxAgeMs caching).',
+        'Scrape a public HTTPS URL into clean main-content Markdown, metadata, links, images, branding, changes diff, and /llms.txt + companion .md discovery (with verified META D1 + R2 maxAgeMs caching and optional Chromium rendering).',
       annotations: {
         title: 'Scrape URL to Markdown & Metadata',
         readOnlyHint: true,
@@ -246,7 +184,7 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
             type: 'array',
             items: {
               type: 'string',
-              enum: ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding', 'llmsTxt', 'screenshot'],
+              enum: ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding', 'llmsTxt', 'screenshot', 'changes'],
             },
             default: ['markdown'],
             description: 'Desired output formats.',
@@ -307,22 +245,79 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
       },
     },
     {
-      name: 'search_collection',
+      name: 'map',
       description:
-        'Search a private crawled collection in EdgeFetch SEARCH D1 FTS5 using sanitized Unicode full-text ranking (BM25 + contextual snippets).',
+        'Discover URLs on a site rapidly and politely via robots.txt Sitemap:, sitemap.xml / .xml.gz, /llms.txt, and homepage links, with optional search filter.',
       annotations: {
-        title: 'Search Crawled FTS5 Collection',
+        title: 'Map Site URLs',
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
-        openWorldHint: false,
+        openWorldHint: true,
       },
       inputSchema: {
         type: 'object',
         properties: {
-          collectionId: { type: 'string', default: 'default', description: 'Collection ID to query.' },
-          query: { type: 'string', description: 'Natural-language search query.' },
-          limit: { type: 'integer', minimum: 1, maximum: 50, default: 10, description: 'Max matching chunks to return.' },
+          url: { type: 'string', description: 'Root public https:// URL of the site.' },
+          search: { type: 'string', description: 'Optional keyword filter to rank/filter matching URLs.' },
+          limit: { type: 'integer', minimum: 1, maximum: 5000, default: 500 },
+          includeSubdomains: { type: 'boolean', default: false },
+          ignoreSitemap: { type: 'boolean', default: false },
+        },
+        required: ['url'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'crawl',
+      description:
+        'Start an async multi-page breadth-first site crawl (with robots.txt, includePaths/excludePaths, SEARCH D1 FTS5 indexing, and HMAC webhooks), OR pass crawlId to poll status / cancel.',
+      annotations: {
+        title: 'Async Site Crawl (Start / Status / Cancel)',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Root public https:// URL to start crawling (omit when checking/cancelling crawlId).' },
+          crawlId: { type: 'string', description: 'Existing crawl ID (`crw_...`) to check status or cancel.' },
+          cancel: { type: 'boolean', default: false, description: 'Set true with crawlId to cancel a running crawl.' },
+          limit: { type: 'integer', minimum: 1, maximum: 200, default: 25 },
+          maxDepth: { type: 'integer', minimum: 0, maximum: 5, default: 2 },
+          allowSubdomains: { type: 'boolean', default: false },
+          includePaths: { type: 'array', items: { type: 'string' } },
+          excludePaths: { type: 'array', items: { type: 'string' } },
+          collectionId: { type: 'string', description: 'Optional SEARCH D1 collection ID to index crawled pages into.' },
+          offset: { type: 'integer', minimum: 0, default: 0, description: 'Result offset when polling crawlId.' },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'search',
+      description:
+        'Search across Brave Search API, SearXNG JSON API, and/or private EdgeFetch SEARCH D1 FTS5 collections with Reciprocal Rank Fusion (RRF) and optional live agent page extraction.',
+      annotations: {
+        title: 'Search Web & Crawled Collections',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query (1..500 chars).' },
+          max_results: { type: 'integer', minimum: 1, maximum: 20, default: 5 },
+          include_domains: { type: 'array', items: { type: 'string' } },
+          exclude_domains: { type: 'array', items: { type: 'string' } },
+          time_range: { type: 'string', enum: ['day', 'week', 'month', 'year'] },
+          include_raw_content: { type: 'boolean', default: false, description: 'Fetch & chunk top results politely via EdgeFetch agents.' },
+          chunks_per_source: { type: 'integer', minimum: 1, maximum: 10, default: 3 },
+          collections: { type: 'array', items: { type: 'string' }, description: 'Optional private SEARCH D1 collection IDs to fuse.' },
         },
         required: ['query'],
         additionalProperties: false,
@@ -634,6 +629,48 @@ async function handleToolCall(
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'interact_not_configured' }) }], isError: true };
     }
     const res = await deps.executeInteract({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status !== 200 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'map') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    if (!deps.executeMap) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'map_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeMap({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status !== 200 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'crawl') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    if (!deps.executeCrawl) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'crawl_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeCrawl({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status >= 400 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'search') {
+    if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
+    }
+    if (!deps.executeSearch) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'search_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeSearch({ args, principal });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),

@@ -9,6 +9,7 @@
  */
 
 import { isContentVerifiedInMetaD1, sha256HexString } from './ingest';
+import { computeMarkdownChanges } from './map-crawl';
 import {
   isValidSha256Hex,
   r2DerivedKey,
@@ -775,7 +776,23 @@ export async function executeScrapeCall(params: {
     stringFormats.has('links') ||
     stringFormats.has('images') ||
     stringFormats.has('branding') ||
+    stringFormats.has('changes') ||
     Boolean(jsonSchemaSpec);
+
+  let prevMarkdownForChanges: string | null = null;
+  if (stringFormats.has('changes') && env.ARTIFACTS && env.META) {
+    const prevHit = await lookupCachedScrape({
+      bucket: env.ARTIFACTS,
+      metaDb: env.META,
+      url: normalizedUrl,
+      maxAgeMs: 365 * 24 * 60 * 60_000,
+      pipelineVersion: SCRAPE_PIPELINE_VERSION,
+      now,
+    });
+    if (prevHit) {
+      prevMarkdownForChanges = prevHit.markdown;
+    }
+  }
 
   if (!needsLiveHtml && maxAgeMs > 0 && env.ARTIFACTS && env.META) {
     const hit = await lookupCachedScrape({
@@ -936,6 +953,7 @@ export async function executeScrapeCall(params: {
     ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64 ? { screenshotBase64: item.screenshotBase64 } : {}),
     ...(item.rendered === true ? { rendered: true } : {}),
     ...(typeof item.pdfEngine === 'string' ? { pdfEngine: item.pdfEngine } : {}),
+    ...(stringFormats.has('changes') ? { changes: computeMarkdownChanges(prevMarkdownForChanges, markdown) } : {}),
     ...(item.llms ? { llms: item.llms } : {}),
     metadata: {
       title: (typeof item.title === 'string' && item.title) || extracted?.title,

@@ -1,10 +1,12 @@
-import prodWorker, { AgentHubDO as ProdAgentHubDO, IngestWorkflow } from '../src/index.ts';
+import prodWorker, { AgentHubDO as ProdAgentHubDO, CrawlWorkflow, IngestWorkflow } from '../src/index.ts';
 import { executeIngestPipeline, isContentVerifiedInMetaD1, pruneExpiredFetchHistory, writeJobManifestToR2 } from '../src/ingest.ts';
+import { deliverSignedWebhook, signWebhookPayload } from '../src/map-crawl.ts';
 import { deriveMarkdownDocument } from '../src/scrape.ts';
 import { D1FtsSearchIndex } from '../src/search-index.ts';
 import { r2ArtifactKey, sanitizeFtsQuery, type OptionalStorageBindings } from '../src/storage.ts';
+import { executeSearchCall } from '../src/web-search.ts';
 
-export { IngestWorkflow };
+export { CrawlWorkflow, IngestWorkflow };
 
 export class AgentHubDO extends ProdAgentHubDO {
   async __testSql(query: string): Promise<unknown[]> {
@@ -289,6 +291,78 @@ export default {
         derivedR2Text,
         unverifiedDeriveStatus: unverifiedDeriveAttempt.status,
         capacityStopStatus: capStop.status,
+      });
+    }
+    if (url.pathname === '/__test_v2_search_and_webhook' && request.method === 'POST') {
+      const storageEnv = env as unknown as OptionalStorageBindings;
+      let capturedSig = '';
+      let capturedTs = 0;
+      let capturedBody = '';
+      const whRes = await deliverSignedWebhook({
+        webhook: { url: 'https://hooks.example.com/edgefetch', secret: 'whsec_test_123' },
+        event: 'crawl.completed',
+        crawlId: 'crw_test_1',
+        data: { fetchedCount: 2 },
+        selfHost: 'hub.local',
+        fetchFn: async (_u, init) => {
+          const hdrs = new Headers(init?.headers);
+          capturedSig = hdrs.get('x-edgefetch-signature') ?? '';
+          capturedTs = Number(hdrs.get('x-edgefetch-timestamp') ?? 0);
+          capturedBody = String(init?.body ?? '');
+          return new Response('ok', { status: 200 });
+        },
+      });
+      const expectedSig = `sha256=${await signWebhookPayload('whsec_test_123', capturedTs, capturedBody)}`;
+      const ssrfBlocked = await deliverSignedWebhook({
+        webhook: { url: 'https://127.0.0.1/hook', secret: 'whsec_test_123' },
+        event: 'crawl.completed',
+        crawlId: 'crw_test_1',
+        data: {},
+      });
+
+      // Test RRF fusion across Brave API + SearXNG JSON API + Private SEARCH D1 FTS5 collection!
+      const searchOut = await executeSearchCall({
+        payload: {
+          query: 'titanium stem',
+          max_results: 5,
+          include_answer: true,
+          exclude_domains: ['spam.example.com'],
+          collections: ['ebike-kb'],
+        },
+        env: {
+          ...storageEnv,
+          BRAVE_API_KEY: 'brave_mock_key',
+          SEARXNG_URL: 'https://searx.example.org',
+        },
+        executeHubFetch: async () => ({ status: 200, via: 'noop', bodyText: '{"results":[]}' }),
+        providerFetchFn: async (reqUrl) => {
+          const u = String(reqUrl);
+          if (u.includes('api.search.brave.com')) {
+            return Response.json({
+              web: {
+                results: [
+                  { url: 'https://docs.example.com/torque', title: 'Torque Guide (Brave)', description: 'Titanium stem 6 Nm' },
+                  { url: 'https://spam.example.com/ad', title: 'Spam', description: 'Excluded domain' },
+                ],
+              },
+            });
+          }
+          return Response.json({
+            results: [
+              { url: 'https://docs.example.com/torque', title: 'Torque Guide (SearXNG)', content: 'Titanium stem bolts' },
+              { url: 'https://parktool.example.com/stem', title: 'Stem Guide', content: 'Use a torque wrench' },
+            ],
+          });
+        },
+      });
+
+      return Response.json({
+        webhookDelivered: whRes.delivered,
+        signatureValid: capturedSig === expectedSig && capturedSig.startsWith('sha256='),
+        ssrfWebhookBlocked: ssrfBlocked.delivered === false,
+        searchStatus: searchOut.status,
+        searchResults: searchOut.body.results,
+        unhonoredOptions: searchOut.body.unhonoredOptions,
       });
     }
     if (url.pathname === '/__test_storage_verify' && request.method === 'POST') {

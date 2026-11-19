@@ -15,6 +15,7 @@ try {
     bundle: true,
     platform: 'node',
     format: 'esm',
+    alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
     outfile: unitOutfile,
   });
 

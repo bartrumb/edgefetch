@@ -970,6 +970,28 @@ export async function executeScrapeCall(params: {
   return { status: 200, via: fetchRes.via, body: out };
 }
 
+export function extractYouTubeTranscriptFromHtml(rawHtml: string): string {
+  if (!rawHtml) return '';
+  const segments: string[] = [];
+  for (const m of rawHtml.matchAll(/<transcript-segment-view-model\b[^>]*>([\s\S]*?)<\/transcript-segment-view-model>/gi)) {
+    const span = /<span\b[^>]*role="text"[^>]*>([\s\S]*?)<\/span>/i.exec(m[1]!);
+    const cleaned = cleanInlineHtml(span ? span[1]! : m[1]!);
+    if (cleaned) segments.push(cleaned);
+  }
+  if (segments.length === 0) {
+    for (const m of rawHtml.matchAll(/<yt-formatted-string\b[^>]*class="[^"]*\bsegment-text\b[^"]*"[^>]*>([\s\S]*?)<\/yt-formatted-string>/gi)) {
+      const cleaned = cleanInlineHtml(m[1]!);
+      if (cleaned) segments.push(cleaned);
+    }
+  }
+  if (segments.length === 0) return '';
+  return segments
+    .join(' ')
+    .replace(/\[(?:music|applause|laughter)\]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export interface InteractRequestPayload {
   url?: unknown;
   sessionId?: unknown;
@@ -1089,6 +1111,8 @@ export async function executeInteractCall(params: {
     options: {
       includeBody: true,
       respectRobots: true,
+      maxBytes: 16 * 1024 * 1024,
+      timeoutMs: 45_000,
     },
     requests: [
       {
@@ -1146,8 +1170,21 @@ export async function executeInteractCall(params: {
 
   const rawHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
   const finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
-  const extracted = rawHtml ? extractHtmlDocument(rawHtml, { baseUrl: finalUrl || undefined, onlyMainContent: true }) : undefined;
-  const markdown = (typeof item.markdown === 'string' && item.markdown) || extracted?.markdown || '';
+  const wantMarkdown = formats.includes('markdown');
+  const wantTranscript = formats.includes('transcript') || wantMarkdown;
+  const extracted = wantMarkdown && rawHtml ? extractHtmlDocument(rawHtml, { baseUrl: finalUrl || undefined, onlyMainContent: true }) : undefined;
+  const transcript = wantTranscript && rawHtml ? extractYouTubeTranscriptFromHtml(rawHtml) : '';
+  let markdown = (typeof item.markdown === 'string' && item.markdown) || extracted?.markdown || '';
+  if (wantMarkdown && transcript && !/^#{2,3}\s*Transcript\b/im.test(markdown)) {
+    markdown = markdown ? `${markdown}\n\n## Transcript\n\n${transcript}` : `## Transcript\n\n${transcript}`;
+  }
+  const fallbackTitle =
+    !extracted && rawHtml
+      ? (() => {
+          const tm = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(rawHtml);
+          return tm ? cleanInlineHtml(tm[1]!) : undefined;
+        })()
+      : undefined;
 
   return {
     status: 200,
@@ -1160,11 +1197,12 @@ export async function executeInteractCall(params: {
       rendered: true,
       ...(publicSessionId ? { sessionId: publicSessionId } : {}),
       ...(closeSession ? { closed: true } : {}),
-      ...(formats.includes('markdown') ? { markdown } : {}),
+      ...(wantMarkdown ? { markdown } : {}),
+      ...(transcript ? { transcript } : {}),
       ...(formats.includes('html') || formats.includes('rawHtml') ? { html: rawHtml } : {}),
       ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64 ? { screenshotBase64: item.screenshotBase64 } : {}),
       metadata: {
-        title: (typeof item.title === 'string' && item.title) || extracted?.title,
+        title: (typeof item.title === 'string' && item.title) || extracted?.title || fallbackTitle,
       },
     },
   };

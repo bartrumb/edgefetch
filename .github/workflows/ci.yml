@@ -79,7 +79,25 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Build server & HAOS add-on images
+      - name: Build server & HAOS add-on images + live Alpine Chromium render smoke test
         run: |
           docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile .
-          docker buildx build --platform linux/amd64 -f edgefetch_fat/Dockerfile .
+          docker buildx build --load --platform linux/amd64 -t edgefetch-ci:smoke -f edgefetch_fat/Dockerfile .
+          docker run -d --rm --name ef-smoke -u 65532:65532 \
+            --security-opt no-new-privileges:true \
+            -e EDGEFETCH_SERVER_TOKEN=ci-smoke-token-0123456789abcdef \
+            -p 127.0.0.1:18080:8080 \
+            --entrypoint /edgefetch \
+            edgefetch-ci:smoke --mode=server --addr=0.0.0.0:8080
+          trap 'docker logs ef-smoke || true; docker stop ef-smoke || true' EXIT
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
+            sleep 0.5
+          done
+          resp=$(curl -fsS -H "Authorization: Bearer ci-smoke-token-0123456789abcdef" \
+            -H "Content-Type: application/json" \
+            -d '{"maxSeconds":30,"options":{"includeBody":false,"timeoutMs":25000},"requests":[{"id":"smoke","url":"https://example.com/","kind":"render","formats":["markdown"],"interact":{"actions":[{"type":"wait","selector":"h1","waitMs":3000}]}}]}' \
+            http://127.0.0.1:18080/fetch)
+          echo "$resp"
+          echo "$resp" | grep -q '"outcome":"ok"'
+          echo "$resp" | grep -q 'Example Domain'

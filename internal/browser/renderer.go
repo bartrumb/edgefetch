@@ -724,7 +724,6 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
 		"--disable-gpu",
-		"--disable-software-rasterizer",
 		"--disable-dev-shm-usage",
 		"--disable-crash-reporter",
 		"--disable-breakpad",
@@ -734,7 +733,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		"--disable-translate",
 		"--disable-default-apps",
 		"--disable-quic",
-		"--disable-features=VizDisplayCompositor,IsolateOrigins,site-per-process,TranslateUI",
+		"--disable-features=IsolateOrigins,site-per-process,TranslateUI",
 		"--autoplay-policy=user-gesture-required",
 		"--mute-audio",
 		"--no-first-run",
@@ -747,7 +746,11 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		"--user-data-dir=" + userDir,
 	}
 	if runtime.GOOS == "linux" {
-		args = append(args, "--no-zygote")
+		args = append(args,
+			"--use-gl=angle",
+			"--use-angle=swiftshader-webgl",
+			"--enable-unsafe-swiftshader",
+		)
 	}
 	args = append(args, "about:blank")
 

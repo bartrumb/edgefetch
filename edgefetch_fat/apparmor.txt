@@ -35,6 +35,8 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   /edgefetch ixr,
   /usr/bin/** ixr,
   /usr/lib/** mr,
+  # Chromium's binary and its helpers (chrome_crashpad_handler) live here, not in /usr/bin. No shell is allowed.
+  /usr/lib/chromium/** mrix,
   /lib/** mr,
   /etc/** r,
   /data/ r,

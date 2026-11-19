@@ -3,7 +3,7 @@
 # Every Chromium subresource socket is forced through EdgeFetch's in-process loopback `SSRFProxy` (`MAP * ~NOTFOUND`).
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.0.0
+ARG BUILD_VERSION=2.0.1
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -30,7 +30,9 @@ RUN apk add --no-cache \
     && chmod 1777 /tmp /var/cache/fontconfig
 
 COPY --from=build /out/edgefetch /edgefetch
-ENV EDGEFETCH_CHROME_BIN=/usr/bin/chromium-browser \
+# The real binary, not /usr/bin/chromium-browser: on Alpine that is a /bin/sh launcher script, and the AppArmor
+# profile lets no shell run, so every launch failed with "permission denied" (2.0.0).
+ENV EDGEFETCH_CHROME_BIN=/usr/lib/chromium/chromium \
     GOMEMLIMIT=384MiB \
     HOME=/tmp
 ENTRYPOINT ["/edgefetch", "--mode=agent"]

@@ -46,6 +46,12 @@ import {
   TRANSIENT_RETENTION_MS,
 } from '../src/storage.ts';
 import { executeInteractCall, extractYouTubeTranscriptFromHtml } from '../src/scrape.ts';
+import {
+  canonicalizeSearchResultUrl,
+  executeSearchCall,
+  extractEdgeMapDomains,
+  resetSearchProviderPacingForTests,
+} from '../src/web-search.ts';
 
 function memoryCooldowns(): CooldownStore {
   const map = new Map<string, number>();
@@ -1121,4 +1127,135 @@ test('V2-5: status=0 local browser/transport error clears sticky host affinity a
     assert.equal(parsed.results[0]?.status, 200);
     assert.equal(parsed.results[0]?.outcome, 'ok');
   }
+});
+
+test('V2-6: executeSearchCall prioritizes edge-map on site: domains, fuses Serper (num:10) + Brave via RRF with URL dedupe, and falls back to Tavily basic only when needed', async () => {
+  resetSearchProviderPacingForTests();
+
+  assert.equal(
+    canonicalizeSearchResultUrl('https://Docs.Example.com/manuals/m620/?utm_source=google&gclid=123&rev=2#page=4'),
+    'https://docs.example.com/manuals/m620?rev=2',
+  );
+  assert.deepEqual(extractEdgeMapDomains('site:velotricbike.com Discover 2 manual', []), {
+    domains: ['velotricbike.com'],
+    filterTerms: 'Discover 2 manual',
+  });
+
+  // 1. Federated Serper + Brave + Edge-Map RRF fusion -> Tavily is NOT called when primary providers succeed!
+  const apiCalls: Array<{ url: string; body?: unknown }> = [];
+  let edgeMapDispatches = 0;
+
+  const fedOut = await executeSearchCall({
+    payload: {
+      query: 'site:velotricbike.com Discover 2 manual',
+      max_results: 5,
+      time_range: 'month',
+    },
+    env: {
+      SERPER_API_KEY: 'serper_test_key',
+      BRAVE_API_KEY: 'brave_test_key',
+      TAVILY_API_KEY: 'tavily_should_not_be_called',
+    },
+    executeHubFetch: async (target, body) => {
+      edgeMapDispatches++;
+      assert.equal(target, 'auto', 'edge-map must prioritize HAOS edge nodes via target=auto');
+      const parsed = JSON.parse(body) as { requests: Array<{ id: string; url: string }> };
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: parsed.requests.map((r) => {
+            if (r.id === 'llms') {
+              return {
+                id: 'llms',
+                url: r.url,
+                status: 200,
+                outcome: 'ok',
+                body: '# Velotric Docs\n- [Discover 2 Manual](https://www.velotricbike.com/manuals/discover-2.pdf)\n',
+              };
+            }
+            return { id: r.id, url: r.url, status: 404, outcome: 'gone', body: '' };
+          }),
+        }),
+      };
+    },
+    providerFetchFn: async (input, init) => {
+      const u = String(input);
+      const parsedBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+      apiCalls.push({ url: u, body: parsedBody });
+      if (u === 'https://google.serper.dev/search') {
+        assert.equal((parsedBody as { num?: number })?.num, 10, 'Serper must cap num:10 so each query costs 1 credit');
+        assert.equal((parsedBody as { tbs?: string })?.tbs, 'qdr:m');
+        return Response.json({
+          organic: [
+            {
+              link: 'https://www.velotricbike.com/manuals/discover-2.pdf?utm_source=google',
+              title: 'Velotric Discover 2 User Manual (PDF)',
+              snippet: 'Official torque and wiring specs.',
+            },
+            {
+              link: 'https://www.velotricbike.com/products/discover-2',
+              title: 'Discover 2 Commuter E-Bike',
+              snippet: '750W motor, 705.6Wh battery.',
+            },
+          ],
+        });
+      }
+      if (u.startsWith('https://api.search.brave.com/')) {
+        return Response.json({
+          web: {
+            results: [
+              {
+                url: 'https://www.velotricbike.com/manuals/discover-2.pdf?fbclid=xyz',
+                title: 'Discover 2 Manual',
+                description: 'PDF manual.',
+              },
+              {
+                url: 'https://www.velotricbike.com/pages/support',
+                title: 'Velotric Support',
+                description: 'Manuals & firmware.',
+              },
+            ],
+          },
+        });
+      }
+      throw new Error(`unexpected provider call: ${u}`);
+    },
+  });
+
+  assert.equal(fedOut.status, 200);
+  assert.equal(edgeMapDispatches, 1);
+  assert.equal(apiCalls.some((c) => c.url.includes('tavily.com')), false, 'Tavily must stay idle when Serper+Brave return >=3 results');
+  const results = fedOut.body.results as Array<{ url: string; providers: string[] }>;
+  assert.equal(results[0]?.url, 'https://www.velotricbike.com/manuals/discover-2.pdf');
+  assert.deepEqual(
+    results[0]?.providers.sort(),
+    ['brave', 'edge-map:agent:site-x86', 'serper'],
+    'URL canonicalization must fuse Edge-Map + Serper + Brave hits into Rank #1',
+  );
+
+  // 2. When Serper 429s, Tavily (`search_depth: "basic"`) steps in automatically!
+  let tavilyCalledWithBasic = false;
+  const fallbackOut = await executeSearchCall({
+    payload: { query: 'Bafang M620 CAN bus pinout', max_results: 4 },
+    env: { SERPER_API_KEY: 'serper_test_key', TAVILY_API_KEY: 'tavily_test_key' },
+    executeHubFetch: async () => ({ status: 200, via: 'noop', bodyText: '{"results":[]}' }),
+    providerFetchFn: async (input, init) => {
+      const u = String(input);
+      if (u === 'https://google.serper.dev/search') {
+        return new Response('rate limited', { status: 429, headers: { 'retry-after': '30' } });
+      }
+      if (u === 'https://api.tavily.com/search') {
+        const b = JSON.parse(String(init?.body)) as { search_depth?: string };
+        tavilyCalledWithBasic = b.search_depth === 'basic';
+        return Response.json({
+          results: [{ url: 'https://www.bafang-e.com/manuals/m620.pdf', title: 'M620 OEM Manual', content: 'CAN bus pinout' }],
+        });
+      }
+      throw new Error(`unexpected: ${u}`);
+    },
+  });
+  assert.equal(fallbackOut.status, 200);
+  assert.equal(tavilyCalledWithBasic, true);
+  assert.equal((fallbackOut.body.results as Array<{ url: string }>)[0]?.url, 'https://www.bafang-e.com/manuals/m620.pdf');
 });

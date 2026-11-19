@@ -103,7 +103,9 @@ interface Env extends OptionalStorageBindings {
   USER_AGENT?: string;
   ROBOTS_BYPASS_HOSTS?: string;
   OAUTH_REDIRECT_ALLOWLIST?: string;
+  SERPER_API_KEY?: string;
   BRAVE_API_KEY?: string;
+  TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
   WEBHOOK_SECRET?: string;
 }

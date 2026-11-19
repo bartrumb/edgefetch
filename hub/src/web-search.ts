@@ -1,23 +1,58 @@
 /**
- * Unified Web & Private Collection Search (`POST /v1/search` + MCP `search`, `PR V2-2`).
+ * Unified Edge-First & Multi-Provider Web Search (`POST /v1/search` + MCP `search`).
  *
- * Provider Policy (strictly enforced):
- *  1. Open-web search uses official/JSON APIs ONLY: Brave Search API (`BRAVE_API_KEY`) and/or bring-your-own SearXNG
- *     JSON endpoint (`SEARXNG_URL`). Search-engine result scraping is NEVER routed through HAOS residential agents.
- *  2. Private search queries `SEARCH` D1 FTS5 collections (`collections: ["default", ...]`).
- *  3. Results across active providers are merged with Reciprocal Rank Fusion (RRF, `k = 60`), filtered by
- *     `include_domains` / `exclude_domains`, and optionally enriched with live page content (`include_raw_content`)
- *     fetched politely through EdgeFetch agents (`executeExtractCall`).
+ * Politeness & Edge-First Priority Policy (strictly enforced):
+ *  1. Search-engine HTML SERP scraping is NEVER routed through HAOS residential agents (preserving residential IP
+ *     reputation and respecting search-engine ToS). Open-web discovery uses official JSON APIs ONLY:
+ *     - Serper.dev Google SERP API (`SERPER_API_KEY`, capped at `num: 10` = 1 credit)
+ *     - Brave Search API (`BRAVE_API_KEY`, politely paced + Retry-After aware)
+ *     - Tavily Search API (`TAVILY_API_KEY`, `search_depth: "basic"` = 1 credit automatic fallback)
+ *     - Optional self-hosted SearXNG JSON endpoint (`SEARXNG_URL`)
+ *  2. Edge & Local Zero-Cost Priority Tiers ALWAYS run first when applicable:
+ *     - Private `SEARCH` D1 FTS5 corpus (`collection:default` + requested collections) indexed from pages/PDFs crawled
+ *       by EdgeFetch HAOS nodes ($0).
+ *     - Direct HAOS Edge-Node Domain Map (`edge-map` via `executeMapCall` over `/llms.txt` + `/sitemap.xml`, $0) when
+ *       a query scopes to 1-2 specific domains (`site:example.com` or `include_domains`).
+ *     - 24-hour `META` D1 external SERP cache (`search_cache`, $0) so repeated queries never burn duplicate API credits.
+ *  3. Results across active sources are canonicalized (`utm_*`/`gclid`/`fbclid` stripped), merged with Reciprocal Rank
+ *     Fusion (RRF, `k = 60`), filtered by `include_domains` / `exclude_domains`, and optionally enriched with live page
+ *     & PDF content (`include_raw_content`) fetched politely through HAOS EdgeFetch nodes first (`target: "auto"`).
  */
 
-import type { HubFetchExecutor } from './map-crawl';
+import { sha256HexString } from './ingest';
+import { executeMapCall, type HubFetchExecutor } from './map-crawl';
 import { COLLECTION_ID_RE, D1FtsSearchIndex, executeExtractCall } from './search-index';
 import type { OptionalStorageBindings } from './storage';
 
 const RRF_K = 60;
+const DEFAULT_SEARCH_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000; // 24h SERP cache
+const BRAVE_MIN_GAP_MS = 1_050; // Polite 1 req/s pacing for Brave Search API
+const DEFAULT_PROVIDER_GAP_MS = 50;
+const DEFAULT_429_COOLDOWN_MS = 15_000;
+const MAX_429_COOLDOWN_MS = 300_000;
+
+const TRACKING_QUERY_PARAMS = new Set([
+  'utm_source',
+  'utm_medium',
+  'utm_campaign',
+  'utm_term',
+  'utm_content',
+  'utm_id',
+  'gclid',
+  'fbclid',
+  'msclkid',
+  'mc_cid',
+  'mc_eid',
+  '_hsenc',
+  '_hsmi',
+]);
+
+const SAFE_DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
 
 export interface SearchBindings extends OptionalStorageBindings {
+  SERPER_API_KEY?: string;
   BRAVE_API_KEY?: string;
+  TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
 }
 
@@ -38,6 +73,11 @@ export interface SearchRequestPayload {
   max_results?: unknown;
   maxResults?: unknown;
   limit?: unknown;
+  mode?: unknown;
+  federate?: unknown;
+  max_age_ms?: unknown;
+  maxAgeMs?: unknown;
+  noCache?: unknown;
   include_domains?: unknown;
   includeDomains?: unknown;
   exclude_domains?: unknown;
@@ -56,17 +96,150 @@ export interface SearchRequestPayload {
   site?: unknown;
 }
 
+interface RawSearchHit {
+  url: string;
+  title: string;
+  snippet: string;
+}
+
+class SearchProviderRateLimitError extends Error {
+  readonly retryAfterMs: number;
+  constructor(provider: string, retryAfterMs: number) {
+    super(`${provider}_http_429`);
+    this.name = 'SearchProviderRateLimitError';
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+const providerLocks = new Map<string, Promise<void>>();
+const providerNextAllowedAt = new Map<string, number>();
+
+export function resetSearchProviderPacingForTests(): void {
+  providerLocks.clear();
+  providerNextAllowedAt.clear();
+}
+
+function parseRetryAfterHeaderMs(raw: string | null): number {
+  if (!raw) return DEFAULT_429_COOLDOWN_MS;
+  const trimmed = raw.trim();
+  const secs = Number(trimmed);
+  if (Number.isFinite(secs) && secs > 0) {
+    return Math.min(MAX_429_COOLDOWN_MS, Math.max(2_000, Math.ceil(secs * 1_000)));
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (Number.isFinite(parsedDate)) {
+    const delta = parsedDate - Date.now();
+    if (delta > 0) return Math.min(MAX_429_COOLDOWN_MS, Math.max(2_000, delta));
+  }
+  return DEFAULT_429_COOLDOWN_MS;
+}
+
+async function runWithProviderPoliteness<T>(
+  provider: string,
+  minGapMs: number,
+  enforcePacing: boolean,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!enforcePacing) {
+    return fn();
+  }
+  const nowCheck = Date.now();
+  const cooldownUntil = providerNextAllowedAt.get(`${provider}:cooldown`) ?? 0;
+  if (cooldownUntil > nowCheck) {
+    throw new Error(`${provider}_cooldown_${Math.ceil((cooldownUntil - nowCheck) / 1_000)}s`);
+  }
+
+  const prev = providerLocks.get(provider) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const tail = prev.then(() => gate);
+  providerLocks.set(provider, tail);
+
+  await prev;
+  try {
+    const now = Date.now();
+    const cd = providerNextAllowedAt.get(`${provider}:cooldown`) ?? 0;
+    if (cd > now) {
+      throw new Error(`${provider}_cooldown_${Math.ceil((cd - now) / 1_000)}s`);
+    }
+    const nextAt = providerNextAllowedAt.get(provider) ?? 0;
+    if (nextAt > now) {
+      await new Promise((r) => setTimeout(r, nextAt - now));
+    }
+    providerNextAllowedAt.set(provider, Date.now() + minGapMs);
+    try {
+      return await fn();
+    } catch (e) {
+      if (e instanceof SearchProviderRateLimitError) {
+        providerNextAllowedAt.set(`${provider}:cooldown`, Date.now() + e.retryAfterMs);
+      }
+      throw e;
+    }
+  } finally {
+    release();
+    if (providerLocks.get(provider) === tail) {
+      providerLocks.delete(provider);
+    }
+  }
+}
+
+export function canonicalizeSearchResultUrl(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (parsed.protocol !== 'https:') return null;
+    if (parsed.username || parsed.password) return null;
+    parsed.hash = '';
+    parsed.hostname = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (TRACKING_QUERY_PARAMS.has(key.toLowerCase()) || key.toLowerCase().startsWith('utm_')) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    if (parsed.pathname.length > 1 && parsed.pathname.endsWith('/')) {
+      parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
 function normalizeDomainList(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   return raw
     .map((d) => (typeof d === 'string' ? d.trim().toLowerCase().replace(/^\*\./, '').replace(/\.+$/, '') : ''))
-    .filter((d) => d.includes('.'))
+    .filter((d) => SAFE_DOMAIN_RE.test(d))
     .slice(0, 30);
 }
 
 function hostMatchesDomainRule(hostname: string, domains: string[]): boolean {
   const h = hostname.toLowerCase().replace(/\.+$/, '');
   return domains.some((d) => h === d || h.endsWith(`.${d}`));
+}
+
+export function extractEdgeMapDomains(
+  query: string,
+  includeDomains: string[],
+): { domains: string[]; filterTerms: string } {
+  const siteMatches: string[] = [];
+  const stripped = query
+    .replace(/\bsite:([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/gi, (_m, dom: string) => {
+      const clean = dom.toLowerCase().replace(/^\*\./, '').replace(/\.+$/, '');
+      if (SAFE_DOMAIN_RE.test(clean) && !siteMatches.includes(clean)) {
+        siteMatches.push(clean);
+      }
+      return ' ';
+    })
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const combined = [...new Set([...siteMatches, ...includeDomains])];
+  if (combined.length === 0 || combined.length > 2) {
+    return { domains: [], filterTerms: stripped };
+  }
+  return { domains: combined, filterTerms: stripped };
 }
 
 function mapBraveFreshness(timeRange: string): string | undefined {
@@ -88,7 +261,26 @@ function mapBraveFreshness(timeRange: string): string | undefined {
   }
 }
 
-function mapSearxngTimeRange(timeRange: string): string | undefined {
+function mapSerperTbs(timeRange: string): string | undefined {
+  switch (timeRange) {
+    case 'day':
+    case 'd':
+      return 'qdr:d';
+    case 'week':
+    case 'w':
+      return 'qdr:w';
+    case 'month':
+    case 'm':
+      return 'qdr:m';
+    case 'year':
+    case 'y':
+      return 'qdr:y';
+    default:
+      return undefined;
+  }
+}
+
+function mapStandardTimeRange(timeRange: string): 'day' | 'week' | 'month' | 'year' | undefined {
   switch (timeRange) {
     case 'day':
     case 'd':
@@ -107,13 +299,79 @@ function mapSearxngTimeRange(timeRange: string): string | undefined {
   }
 }
 
+async function querySerperWebSearch(params: {
+  apiKey: string;
+  query: string;
+  includeDomains: string[];
+  timeRange: string;
+  fetchFn: typeof fetch;
+}): Promise<RawSearchHit[]> {
+  const { apiKey, query, includeDomains, timeRange, fetchFn } = params;
+  const hasInlineSite = /\bsite:/i.test(query);
+  const effectiveQuery =
+    !hasInlineSite && includeDomains.length === 1 ? `site:${includeDomains[0]} ${query}` : query;
+  const tbs = mapSerperTbs(timeRange);
+
+  const resp = await fetchFn('https://google.serper.dev/search', {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+    },
+    // Strictly cap `num: 10` so every Serper query consumes 1 credit ($0.001) instead of 2 credits!
+    body: JSON.stringify({
+      q: effectiveQuery,
+      num: 10,
+      ...(tbs ? { tbs } : {}),
+    }),
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (resp.status === 429) {
+    const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+    await resp.body?.cancel().catch(() => undefined);
+    throw new SearchProviderRateLimitError('serper', retryMs);
+  }
+  if (!resp.ok) {
+    await resp.body?.cancel().catch(() => undefined);
+    throw new Error(`serper_http_${resp.status}`);
+  }
+
+  const json = (await resp.json()) as {
+    knowledgeGraph?: { title?: string; website?: string; description?: string };
+    organic?: Array<{ link?: string; title?: string; snippet?: string }>;
+  };
+  const out: RawSearchHit[] = [];
+  if (typeof json.knowledgeGraph?.website === 'string') {
+    const canon = canonicalizeSearchResultUrl(json.knowledgeGraph.website);
+    if (canon) {
+      out.push({
+        url: canon,
+        title: (json.knowledgeGraph.title ?? '').trim() || new URL(canon).hostname,
+        snippet: (json.knowledgeGraph.description ?? '').replace(/<[^>]+>/g, '').trim(),
+      });
+    }
+  }
+  for (const r of json.organic ?? []) {
+    if (typeof r.link !== 'string') continue;
+    const canon = canonicalizeSearchResultUrl(r.link);
+    if (!canon) continue;
+    out.push({
+      url: canon,
+      title: (r.title ?? '').trim() || new URL(canon).hostname,
+      snippet: (r.snippet ?? '').replace(/<[^>]+>/g, '').trim(),
+    });
+  }
+  return out;
+}
+
 async function queryBraveWebSearch(params: {
   apiKey: string;
   query: string;
   count: number;
   timeRange: string;
   fetchFn: typeof fetch;
-}): Promise<Array<{ url: string; title: string; snippet: string }>> {
+}): Promise<RawSearchHit[]> {
   const { apiKey, query, count, timeRange, fetchFn } = params;
   const u = new URL('https://api.search.brave.com/res/v1/web/search');
   u.searchParams.set('q', query);
@@ -129,6 +387,11 @@ async function queryBraveWebSearch(params: {
     },
     signal: AbortSignal.timeout(12_000),
   });
+  if (resp.status === 429) {
+    const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+    await resp.body?.cancel().catch(() => undefined);
+    throw new SearchProviderRateLimitError('brave', retryMs);
+  }
   if (!resp.ok) {
     await resp.body?.cancel().catch(() => undefined);
     throw new Error(`brave_http_${resp.status}`);
@@ -136,21 +399,71 @@ async function queryBraveWebSearch(params: {
   const json = (await resp.json()) as {
     web?: { results?: Array<{ url?: string; title?: string; description?: string }> };
   };
-  const out: Array<{ url: string; title: string; snippet: string }> = [];
+  const out: RawSearchHit[] = [];
   for (const r of json.web?.results ?? []) {
     if (typeof r.url !== 'string') continue;
-    try {
-      const parsed = new URL(r.url);
-      if (parsed.protocol !== 'https:') continue;
-      parsed.hash = '';
-      out.push({
-        url: parsed.toString(),
-        title: (r.title ?? '').trim() || parsed.hostname,
-        snippet: (r.description ?? '').replace(/<[^>]+>/g, '').trim(),
-      });
-    } catch {
-      // ignore
-    }
+    const canon = canonicalizeSearchResultUrl(r.url);
+    if (!canon) continue;
+    out.push({
+      url: canon,
+      title: (r.title ?? '').trim() || new URL(canon).hostname,
+      snippet: (r.description ?? '').replace(/<[^>]+>/g, '').trim(),
+    });
+  }
+  return out;
+}
+
+async function queryTavilyWebSearch(params: {
+  apiKey: string;
+  query: string;
+  count: number;
+  includeDomains: string[];
+  excludeDomains: string[];
+  timeRange: string;
+  fetchFn: typeof fetch;
+}): Promise<RawSearchHit[]> {
+  const { apiKey, query, count, includeDomains, excludeDomains, timeRange, fetchFn } = params;
+  const tr = mapStandardTimeRange(timeRange);
+  const resp = await fetchFn('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      authorization: `Bearer ${apiKey}`,
+      'content-type': 'application/json',
+    },
+    // Strictly `search_depth: "basic"` (1 credit) so fallback queries cost half of `advanced` (2 credits).
+    body: JSON.stringify({
+      query,
+      max_results: Math.min(10, Math.max(1, count)),
+      search_depth: 'basic',
+      ...(includeDomains.length > 0 ? { include_domains: includeDomains } : {}),
+      ...(excludeDomains.length > 0 ? { exclude_domains: excludeDomains } : {}),
+      ...(tr ? { time_range: tr } : {}),
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (resp.status === 429) {
+    const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+    await resp.body?.cancel().catch(() => undefined);
+    throw new SearchProviderRateLimitError('tavily', retryMs);
+  }
+  if (!resp.ok) {
+    await resp.body?.cancel().catch(() => undefined);
+    throw new Error(`tavily_http_${resp.status}`);
+  }
+  const json = (await resp.json()) as {
+    results?: Array<{ url?: string; title?: string; content?: string }>;
+  };
+  const out: RawSearchHit[] = [];
+  for (const r of json.results ?? []) {
+    if (typeof r.url !== 'string') continue;
+    const canon = canonicalizeSearchResultUrl(r.url);
+    if (!canon) continue;
+    out.push({
+      url: canon,
+      title: (r.title ?? '').trim() || new URL(canon).hostname,
+      snippet: (r.content ?? '').replace(/<[^>]+>/g, '').trim(),
+    });
   }
   return out;
 }
@@ -161,7 +474,7 @@ async function querySearxngSearch(params: {
   count: number;
   timeRange: string;
   fetchFn: typeof fetch;
-}): Promise<Array<{ url: string; title: string; snippet: string }>> {
+}): Promise<RawSearchHit[]> {
   const { searxngBaseUrl, query, count, timeRange, fetchFn } = params;
   const base = new URL(searxngBaseUrl);
   if (base.protocol !== 'https:' && base.protocol !== 'http:') {
@@ -170,7 +483,7 @@ async function querySearxngSearch(params: {
   const searchUrl = new URL('/search', base);
   searchUrl.searchParams.set('q', query);
   searchUrl.searchParams.set('format', 'json');
-  const tr = mapSearxngTimeRange(timeRange);
+  const tr = mapStandardTimeRange(timeRange);
   if (tr) searchUrl.searchParams.set('time_range', tr);
 
   const resp = await fetchFn(searchUrl.toString(), {
@@ -178,6 +491,11 @@ async function querySearxngSearch(params: {
     headers: { accept: 'application/json' },
     signal: AbortSignal.timeout(12_000),
   });
+  if (resp.status === 429) {
+    const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+    await resp.body?.cancel().catch(() => undefined);
+    throw new SearchProviderRateLimitError('searxng', retryMs);
+  }
   if (!resp.ok) {
     await resp.body?.cancel().catch(() => undefined);
     throw new Error(`searxng_http_${resp.status}`);
@@ -185,23 +503,91 @@ async function querySearxngSearch(params: {
   const json = (await resp.json()) as {
     results?: Array<{ url?: string; title?: string; content?: string }>;
   };
-  const out: Array<{ url: string; title: string; snippet: string }> = [];
+  const out: RawSearchHit[] = [];
   for (const r of (json.results ?? []).slice(0, count * 2)) {
     if (typeof r.url !== 'string') continue;
-    try {
-      const parsed = new URL(r.url);
-      if (parsed.protocol !== 'https:') continue;
-      parsed.hash = '';
-      out.push({
-        url: parsed.toString(),
-        title: (r.title ?? '').trim() || parsed.hostname,
-        snippet: (r.content ?? '').replace(/<[^>]+>/g, '').trim(),
-      });
-    } catch {
-      // ignore
-    }
+    const canon = canonicalizeSearchResultUrl(r.url);
+    if (!canon) continue;
+    out.push({
+      url: canon,
+      title: (r.title ?? '').trim() || new URL(canon).hostname,
+      snippet: (r.content ?? '').replace(/<[^>]+>/g, '').trim(),
+    });
   }
   return out;
+}
+
+async function readCachedExternalLists(
+  metaDb: D1Database,
+  cacheKey: string,
+  now: number,
+): Promise<Array<{ provider: string; items: RawSearchHit[] }> | null> {
+  try {
+    const row = await metaDb
+      .prepare('SELECT payload_json FROM search_cache WHERE cache_key = ? AND expires_at > ? LIMIT 1')
+      .bind(cacheKey, now)
+      .first<{ payload_json: string }>();
+    if (!row?.payload_json) return null;
+    const parsed = JSON.parse(row.payload_json) as unknown;
+    return Array.isArray(parsed) ? (parsed as Array<{ provider: string; items: RawSearchHit[] }>) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCachedExternalLists(
+  metaDb: D1Database,
+  cacheKey: string,
+  lists: Array<{ provider: string; items: RawSearchHit[] }>,
+  now: number,
+  ttlMs: number,
+): Promise<void> {
+  try {
+    await metaDb.batch([
+      metaDb.prepare(
+        `CREATE TABLE IF NOT EXISTS search_cache (
+          cache_key TEXT PRIMARY KEY,
+          payload_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        )`,
+      ),
+      metaDb.prepare('DELETE FROM search_cache WHERE expires_at <= ?').bind(now),
+      metaDb
+        .prepare(
+          `INSERT INTO search_cache (cache_key, payload_json, created_at, expires_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(cache_key) DO UPDATE SET
+             payload_json = excluded.payload_json,
+             created_at = excluded.created_at,
+             expires_at = excluded.expires_at`,
+        )
+        .bind(cacheKey, JSON.stringify(lists), now, now + ttlMs),
+    ]);
+  } catch {
+    // Cache persistence is best-effort and never fails a search call.
+  }
+}
+
+function countDomainFilteredHits(
+  lists: Array<{ provider: string; items: RawSearchHit[] }>,
+  includeDomains: string[],
+  excludeDomains: string[],
+): number {
+  const seen = new Set<string>();
+  for (const { items } of lists) {
+    for (const item of items) {
+      try {
+        const host = new URL(item.url).hostname;
+        if (includeDomains.length > 0 && !hostMatchesDomainRule(host, includeDomains)) continue;
+        if (excludeDomains.length > 0 && hostMatchesDomainRule(host, excludeDomains)) continue;
+        seen.add(item.url);
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return seen.size;
 }
 
 export async function executeSearchCall(params: {
@@ -211,7 +597,10 @@ export async function executeSearchCall(params: {
   providerFetchFn?: typeof fetch;
   source?: string;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
-  const { payload, env, executeHubFetch, providerFetchFn = fetch, source = 'search' } = params;
+  const { payload, env, executeHubFetch, source = 'search' } = params;
+  const providerFetchFn = params.providerFetchFn ?? fetch;
+  const enforcePacing = params.providerFetchFn === undefined;
+
   const rawQuery = typeof payload.query === 'string' ? payload.query : typeof payload.q === 'string' ? payload.q : '';
   const query = rawQuery.trim();
   if (!query || query.length > 500) {
@@ -230,6 +619,18 @@ export async function executeSearchCall(params: {
     typeof rawChunksPer === 'number' && Number.isFinite(rawChunksPer) ? Math.min(10, Math.max(1, Math.floor(rawChunksPer))) : 3;
   const wantsAnswer = Boolean(payload.include_answer ?? payload.includeAnswer);
 
+  const rawMode = typeof payload.mode === 'string' ? payload.mode.trim().toLowerCase() : '';
+  const waterfallMode = rawMode === 'waterfall' && payload.federate !== true;
+
+  const rawMaxAge = payload.max_age_ms ?? payload.maxAgeMs;
+  const cacheMaxAgeMs =
+    payload.noCache === true
+      ? 0
+      : typeof rawMaxAge === 'number' && Number.isFinite(rawMaxAge)
+        ? Math.max(0, Math.floor(rawMaxAge))
+        : DEFAULT_SEARCH_CACHE_MAX_AGE_MS;
+
+  const explicitCollectionsPassed = payload.collectionId !== undefined || Array.isArray(payload.collections) || payload.collections === false;
   const requestedCollections: string[] = [];
   if (typeof payload.collectionId === 'string' && COLLECTION_ID_RE.test(payload.collectionId.trim())) {
     requestedCollections.push(payload.collectionId.trim());
@@ -242,81 +643,248 @@ export async function executeSearchCall(params: {
     }
   }
 
+  const hasSerper = Boolean(env.SERPER_API_KEY?.trim());
+  const hasBrave = Boolean(env.BRAVE_API_KEY?.trim());
+  const hasTavily = Boolean(env.TAVILY_API_KEY?.trim());
+  const hasSearxng = Boolean(env.SEARXNG_URL?.trim());
+  const hasExternalProvider = hasSerper || hasBrave || hasTavily || hasSearxng;
+  const hasD1Search = Boolean(env.SEARCH);
+
+  // Always consult the Edge-crawled default D1 FTS5 collection at $0 when SEARCH D1 is bound unless disabled/overridden.
+  if (hasD1Search && !explicitCollectionsPassed) {
+    requestedCollections.push('default');
+  }
+
+  const edgeMapSpec = extractEdgeMapDomains(query, includeDomains);
+  const canEdgeMap = edgeMapSpec.domains.length > 0;
+
   const unhonoredOptions: string[] = [];
   if (wantsAnswer) {
     unhonoredOptions.push('include_answer');
   }
-  if (timeRange && requestedCollections.length > 0 && !env.BRAVE_API_KEY && !env.SEARXNG_URL) {
+  if (timeRange && requestedCollections.length > 0 && !hasExternalProvider) {
     unhonoredOptions.push('time_range');
   }
 
-  const hasBrave = Boolean(env.BRAVE_API_KEY?.trim());
-  const hasSearxng = Boolean(env.SEARXNG_URL?.trim());
-  const hasD1Search = Boolean(env.SEARCH);
-
-  if (!hasBrave && !hasSearxng && (!hasD1Search || requestedCollections.length === 0)) {
-    // If SEARCH D1 is bound and no collections were specified, default to searching the 'default' collection!
-    if (hasD1Search) {
-      requestedCollections.push('default');
-    } else {
-      return {
-        status: 503,
-        via: 'hub',
-        body: {
-          ok: false,
-          error: 'search_providers_not_configured',
-          message: 'Configure BRAVE_API_KEY, SEARXNG_URL, or bind SEARCH D1 to enable /v1/search.',
-        },
-      };
-    }
+  if (!hasExternalProvider && !canEdgeMap && (!hasD1Search || requestedCollections.length === 0)) {
+    return {
+      status: 503,
+      via: 'hub',
+      body: {
+        ok: false,
+        error: 'search_providers_not_configured',
+        message: 'Configure SERPER_API_KEY, BRAVE_API_KEY, TAVILY_API_KEY, SEARXNG_URL, or bind SEARCH D1 to enable /v1/search.',
+      },
+    };
   }
 
-  const providerLists: Array<{ provider: string; items: Array<{ url: string; title: string; snippet: string }> }> = [];
+  const providerLists: Array<{ provider: string; items: RawSearchHit[] }> = [];
+  const collectionLists: Array<{ provider: string; items: RawSearchHit[] }> = [];
   const providerErrors: Array<{ provider: string; error: string }> = [];
+  const viaParts: string[] = [];
 
-  if (hasBrave) {
-    try {
-      const items = await queryBraveWebSearch({
-        apiKey: env.BRAVE_API_KEY!.trim(),
-        query,
-        count: maxResults * 2,
-        timeRange,
-        fetchFn: providerFetchFn,
-      });
-      providerLists.push({ provider: 'brave', items });
-    } catch (e) {
-      providerErrors.push({ provider: 'brave', error: e instanceof Error ? e.message : String(e) });
-    }
-  }
-
-  if (hasSearxng) {
-    try {
-      const items = await querySearxngSearch({
-        searxngBaseUrl: env.SEARXNG_URL!.trim(),
-        query,
-        count: maxResults * 2,
-        timeRange,
-        fetchFn: providerFetchFn,
-      });
-      providerLists.push({ provider: 'searxng', items });
-    } catch (e) {
-      providerErrors.push({ provider: 'searxng', error: e instanceof Error ? e.message : String(e) });
-    }
-  }
-
+  // Tier 0a ($0): Private SEARCH D1 FTS5 corpus populated by EdgeFetch HAOS nodes.
   if (hasD1Search && requestedCollections.length > 0) {
     const idx = new D1FtsSearchIndex(env.SEARCH!);
     for (const coll of requestedCollections.slice(0, 5)) {
-      const hits = await idx.searchCollection({ collectionId: coll, query, limit: maxResults * 2 });
-      providerLists.push({
-        provider: `collection:${coll}`,
-        items: hits.map((h) => ({
-          url: h.url,
-          title: h.title || h.heading || h.url,
-          snippet: h.snippet || h.text.slice(0, 320),
-        })),
-      });
+      try {
+        const hits = await idx.searchCollection({ collectionId: coll, query, limit: maxResults * 2 });
+        if (hits.length > 0 || explicitCollectionsPassed) {
+          collectionLists.push({
+            provider: `collection:${coll}`,
+            items: hits
+              .map((h) => {
+                const canon = canonicalizeSearchResultUrl(h.url);
+                if (!canon) return null;
+                return {
+                  url: canon,
+                  title: h.title || h.heading || canon,
+                  snippet: h.snippet || h.text.slice(0, 320),
+                };
+              })
+              .filter((x): x is RawSearchHit => x !== null),
+          });
+        }
+      } catch {
+        // Ignore empty/uninitialized collection tables
+      }
     }
+  }
+
+  // Tier 0b ($0): Direct HAOS Edge-Node Domain Map (`/llms.txt` + `/sitemap.xml`) when 1-2 domains are targeted!
+  if (canEdgeMap) {
+    for (const domain of edgeMapSpec.domains) {
+      try {
+        const mapOut = await executeMapCall({
+          payload: {
+            url: `https://${domain}/`,
+            ...(edgeMapSpec.filterTerms ? { search: edgeMapSpec.filterTerms } : {}),
+            limit: Math.max(10, maxResults * 2),
+            target: payload.target ?? 'auto',
+            ...(payload.site !== undefined ? { site: payload.site } : {}),
+          },
+          executeHubFetch,
+          source: `${source}:edge-map`,
+        });
+        if (mapOut.status === 200 && Array.isArray(mapOut.body.entries) && mapOut.body.entries.length > 0) {
+          const mappedItems: RawSearchHit[] = [];
+          for (const rawEntry of mapOut.body.entries as Array<{ url?: string; title?: string; source?: string }>) {
+            if (typeof rawEntry.url !== 'string') continue;
+            const canon = canonicalizeSearchResultUrl(rawEntry.url);
+            if (!canon) continue;
+            mappedItems.push({
+              url: canon,
+              title: (rawEntry.title ?? '').trim() || canon,
+              snippet: `Discovered on ${domain} via EdgeFetch (${rawEntry.source ?? 'sitemap'})`,
+            });
+          }
+          if (mappedItems.length > 0) {
+            providerLists.push({ provider: `edge-map:${mapOut.via}`, items: mappedItems });
+            viaParts.push(`edge-map:${mapOut.via}`);
+          }
+        }
+      } catch (e) {
+        providerErrors.push({ provider: `edge-map:${domain}`, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  }
+
+  // Tier 1+: External JSON Search APIs (with 24h META D1 cache + polite QPS pacing + Tavily basic fallback).
+  if (hasExternalProvider) {
+    const now = Date.now();
+    const activeProviderSig = [
+      hasSerper ? 'serper' : '',
+      hasBrave ? 'brave' : '',
+      hasSearxng ? 'searxng' : '',
+      hasTavily ? 'tavily' : '',
+      waterfallMode ? 'wf' : 'fed',
+    ]
+      .filter(Boolean)
+      .join(',');
+    const cacheKey =
+      env.META && cacheMaxAgeMs > 0 && enforcePacing
+        ? await sha256HexString(
+            JSON.stringify({
+              v: 1,
+              p: activeProviderSig,
+              q: query.toLowerCase(),
+              tr: timeRange,
+              inc: includeDomains,
+              exc: excludeDomains,
+            }),
+          )
+        : '';
+
+    const cachedExternal = cacheKey && env.META ? await readCachedExternalLists(env.META, cacheKey, now) : null;
+    if (cachedExternal && cachedExternal.length > 0) {
+      for (const list of cachedExternal) {
+        providerLists.push(list);
+      }
+      viaParts.push(`cache:d1(${cachedExternal.map((c) => c.provider).join('+')})`);
+    } else {
+      const freshExternal: Array<{ provider: string; items: RawSearchHit[] }> = [];
+      const minSatisfiedHits = Math.min(3, maxResults);
+
+      const callSerper = async () => {
+        if (!hasSerper) return;
+        try {
+          const items = await runWithProviderPoliteness('serper', DEFAULT_PROVIDER_GAP_MS, enforcePacing, () =>
+            querySerperWebSearch({
+              apiKey: env.SERPER_API_KEY!.trim(),
+              query,
+              includeDomains,
+              timeRange,
+              fetchFn: providerFetchFn,
+            }),
+          );
+          freshExternal.push({ provider: 'serper', items });
+        } catch (e) {
+          providerErrors.push({ provider: 'serper', error: e instanceof Error ? e.message : String(e) });
+        }
+      };
+
+      const callBrave = async () => {
+        if (!hasBrave) return;
+        try {
+          const items = await runWithProviderPoliteness('brave', BRAVE_MIN_GAP_MS, enforcePacing, () =>
+            queryBraveWebSearch({
+              apiKey: env.BRAVE_API_KEY!.trim(),
+              query,
+              count: maxResults * 2,
+              timeRange,
+              fetchFn: providerFetchFn,
+            }),
+          );
+          freshExternal.push({ provider: 'brave', items });
+        } catch (e) {
+          providerErrors.push({ provider: 'brave', error: e instanceof Error ? e.message : String(e) });
+        }
+      };
+
+      const callSearxng = async () => {
+        if (!hasSearxng) return;
+        try {
+          const items = await runWithProviderPoliteness('searxng', DEFAULT_PROVIDER_GAP_MS, enforcePacing, () =>
+            querySearxngSearch({
+              searxngBaseUrl: env.SEARXNG_URL!.trim(),
+              query,
+              count: maxResults * 2,
+              timeRange,
+              fetchFn: providerFetchFn,
+            }),
+          );
+          freshExternal.push({ provider: 'searxng', items });
+        } catch (e) {
+          providerErrors.push({ provider: 'searxng', error: e instanceof Error ? e.message : String(e) });
+        }
+      };
+
+      if (waterfallMode) {
+        await callSerper();
+        if (countDomainFilteredHits(freshExternal, includeDomains, excludeDomains) < minSatisfiedHits) {
+          await callBrave();
+        }
+        if (countDomainFilteredHits(freshExternal, includeDomains, excludeDomains) < minSatisfiedHits) {
+          await callSearxng();
+        }
+      } else {
+        await Promise.all([callSerper(), callBrave(), callSearxng()]);
+      }
+
+      // Tavily (`basic` = 1 credit) acts as automatic fallback when primary APIs are unconfigured or return thin/failed hits!
+      if (hasTavily && countDomainFilteredHits(freshExternal, includeDomains, excludeDomains) < minSatisfiedHits) {
+        try {
+          const items = await runWithProviderPoliteness('tavily', DEFAULT_PROVIDER_GAP_MS, enforcePacing, () =>
+            queryTavilyWebSearch({
+              apiKey: env.TAVILY_API_KEY!.trim(),
+              query,
+              count: maxResults * 2,
+              includeDomains,
+              excludeDomains,
+              timeRange,
+              fetchFn: providerFetchFn,
+            }),
+          );
+          freshExternal.push({ provider: 'tavily', items });
+        } catch (e) {
+          providerErrors.push({ provider: 'tavily', error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
+      for (const list of freshExternal) {
+        providerLists.push(list);
+        viaParts.push(list.provider);
+      }
+
+      if (cacheKey && env.META && countDomainFilteredHits(freshExternal, includeDomains, excludeDomains) > 0) {
+        await writeCachedExternalLists(env.META, cacheKey, freshExternal, now, cacheMaxAgeMs);
+      }
+    }
+  }
+
+  for (const cl of collectionLists) {
+    providerLists.push(cl);
+    if (cl.items.length > 0) viaParts.push(cl.provider);
   }
 
   // Reciprocal Rank Fusion (RRF, k = 60) across all active providers + domain allow/block filtering.
@@ -375,9 +943,9 @@ export async function executeSearchCall(params: {
     providers: r.providers,
   }));
 
-  let via = providerLists.map((p) => p.provider).join('+') || 'search';
+  let via = viaParts.join('+') || providerLists.map((p) => p.provider).join('+') || 'search';
 
-  // Optional live page fetch + BM25 chunk reranking through EdgeFetch agents (never storing Brave snippets!).
+  // Optional live page fetch + BM25 chunk reranking — ALWAYS prioritizing HAOS EdgeFetch nodes (`target: "auto"` -> `agent:site-*` first!).
   if (includeRawContent && results.length > 0) {
     const extractOut = await executeExtractCall({
       payload: {
@@ -385,7 +953,7 @@ export async function executeSearchCall(params: {
         query,
         chunksPerSource,
         maxAgeMs: 300_000,
-        target: payload.target,
+        target: payload.target ?? 'auto',
         site: payload.site,
       },
       env,
@@ -414,6 +982,7 @@ export async function executeSearchCall(params: {
     body: {
       ok: true,
       query,
+      cached: Boolean(viaParts.some((v) => v.startsWith('cache:d1'))),
       results,
       ...(unhonoredOptions.length > 0 ? { unhonoredOptions } : {}),
       ...(providerErrors.length > 0 ? { providerErrors } : {}),

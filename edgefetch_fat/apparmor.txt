@@ -48,6 +48,9 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   /data/options.json r,
   /tmp/** rwklm,
   /dev/shm/** rwklm,
+  /memfd:* rwklm,
+  /memfd:** rwklm,
+  /SYSV* rwklm,
   /dev/null rw,
   /dev/zero rw,
   /dev/urandom rw,
@@ -58,7 +61,9 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   /proc/@{pid}/task/*/comm rw,
   /proc/@{pid}/fd/ r,
   /sys/fs/cgroup/** r,
-  /sys/devices/system/cpu/** r,
+  /sys/bus/** r,
+  /sys/class/** r,
+  /sys/devices/** r,
 
   # Block sensitive kernel / hardware paths
   deny /proc/kcore rwklx,

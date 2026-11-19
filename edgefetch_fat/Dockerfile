@@ -3,7 +3,7 @@
 # Every Chromium subresource socket is forced through EdgeFetch's in-process loopback `SSRFProxy` (`MAP * ~NOTFOUND`).
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.0.4
+ARG BUILD_VERSION=2.0.5
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -22,6 +22,7 @@ LABEL org.opencontainers.image.title="EdgeFetch" \
 RUN apk add --no-cache \
       ca-certificates \
       chromium \
+      chromium-swiftshader \
       font-noto \
       poppler-utils \
       ttf-freefont \

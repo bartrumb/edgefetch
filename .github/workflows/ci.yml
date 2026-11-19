@@ -96,8 +96,8 @@ jobs:
           done
           resp=$(curl -fsS -H "Authorization: Bearer ci-smoke-token-0123456789abcdef" \
             -H "Content-Type: application/json" \
-            -d '{"maxSeconds":30,"options":{"includeBody":false,"timeoutMs":25000},"requests":[{"id":"smoke","url":"https://example.com/","kind":"render","formats":["markdown"],"interact":{"actions":[{"type":"wait","selector":"h1","waitMs":3000}]}}]}' \
+            -d '{"maxSeconds":30,"options":{"includeBody":false,"timeoutMs":25000},"requests":[{"id":"smoke","url":"https://example.com/","kind":"render","formats":["markdown"],"interact":{"actions":[{"type":"wait","selector":"p","waitMs":5000}]}}]}' \
             http://127.0.0.1:18080/fetch)
           echo "$resp"
           echo "$resp" | grep -q '"outcome":"ok"'
-          echo "$resp" | grep -q 'Example Domain'
+          echo "$resp" | grep -q 'documentation examples'

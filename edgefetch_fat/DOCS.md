@@ -1,6 +1,6 @@
-# EdgeFetch Fat Worker (`edgefetch_fat`)
+# EdgeFetch Home Assistant Add-on
 
-`edgefetch_fat` is the full-featured Home Assistant OS Add-on sibling to `edgefetch_agent` (Lite). It runs the exact same static Go binary plus **Headless Chromium** (`browser-v1`) and **Poppler `pdftotext`** (`pdf-v1`) inside an AppArmor-confined Alpine container with **zero inbound ports**.
+`EdgeFetch` runs a single static Go HTTP/2 worker plus **on-demand Headless Chromium** (`browser-v1`, automatically shut down after 3 minutes idle so steady-state RAM stays ~15 MB) and **streaming Poppler `pdftotext`** (`pdf-v1`, up to 256 MiB PDFs) inside an AppArmor-confined Alpine container with **zero inbound ports**.
 
 ## Capabilities Advertised to Hub
 

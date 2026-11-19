@@ -1047,3 +1047,78 @@ test('V2-4: executeInteractCall extracts YouTube transcript-segment-view-model w
     timeoutMs: 45_000,
   });
 });
+
+test('V2-5: status=0 local browser/transport error clears sticky host affinity and fails over to peer node on same WAN IP', async () => {
+  const sockets: HubSocketLike[] = [];
+  const makeNode = (siteId: string, onJob: (jobId: string, jobNonce: string, engine: AgentHubEngine) => void) => {
+    let att: unknown = {
+      siteId,
+      publicIp: '198.51.100.42',
+      connectedAt: 1000,
+      lastJobAt: 0,
+      jobsOk: 0,
+      jobsErr: 0,
+      capabilities: ['artifacts-v1', 'browser-v1', 'pdf-v1'],
+    };
+    const ws: HubSocketLike = {
+      readyState: 1,
+      send: (msg: string) => {
+        const parsed = JSON.parse(msg) as { jobId: string; jobNonce: string };
+        queueMicrotask(() => onJob(parsed.jobId, parsed.jobNonce, engine));
+      },
+      close: () => {},
+      serializeAttachment: (v: unknown) => {
+        att = v;
+      },
+      deserializeAttachment: () => att,
+    };
+    sockets.push(ws);
+    return ws;
+  };
+
+  let now = 10_000;
+  const engine = new AgentHubEngine({
+    getSockets: () => sockets,
+    cooldowns: memoryCooldowns(),
+    hostWindows: createMemoryHostWindowStore(),
+    now: () => now,
+    sleep: async (ms) => {
+      now += ms;
+    },
+  });
+
+  makeNode('site-arm64', (jobId, jobNonce, eng) => {
+    eng.completeJob(
+      jobId,
+      jobNonce,
+      'site-arm64',
+      JSON.stringify({
+        results: [{ id: 'interact-1', url: 'https://www.youtube.com/watch?v=test', status: 0, outcome: 'error', problem: 'cdp connection closed' }],
+      }),
+    );
+  });
+  makeNode('site-x86', (jobId, jobNonce, eng) => {
+    eng.completeJob(
+      jobId,
+      jobNonce,
+      'site-x86',
+      JSON.stringify({
+        results: [{ id: 'interact-1', url: 'https://www.youtube.com/watch?v=test', status: 200, outcome: 'ok', body: '<html>ok</html>' }],
+      }),
+    );
+  });
+
+  const res = await engine.dispatchFetch(
+    JSON.stringify({
+      maxSeconds: 60,
+      requests: [{ id: 'interact-1', url: 'https://www.youtube.com/watch?v=test', kind: 'render', interact: { actions: [] } }],
+    }),
+  );
+  assert.equal(res.ok, true);
+  if (res.ok) {
+    assert.equal(res.siteId, 'site-arm64+site-x86');
+    const parsed = JSON.parse(res.bodyText) as { results: Array<{ status: number; outcome: string }> };
+    assert.equal(parsed.results[0]?.status, 200);
+    assert.equal(parsed.results[0]?.outcome, 'ok');
+  }
+});

@@ -13,8 +13,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bartrumb/edgefetch/internal/extract"
@@ -28,6 +30,7 @@ const (
 	defaultRenderSettleMs = 900
 	maxRenderSettleMs     = 15_000
 	sessionIdleTTL        = 3 * time.Minute
+	browserIdleTTL        = 3 * time.Minute
 	maxActiveSessions     = 8
 )
 
@@ -113,6 +116,8 @@ type Renderer struct {
 	userDataDir string
 	cdp         *cdpConn
 	sessions    map[string]*retainedSession
+	activeRuns  int
+	lastUsedAt  time.Time
 	closed      bool
 }
 
@@ -191,6 +196,19 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 	case <-ctx.Done():
 		return Output{}, ctx.Err()
 	}
+
+	r.mu.Lock()
+	r.activeRuns++
+	r.lastUsedAt = time.Now()
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		if r.activeRuns > 0 {
+			r.activeRuns--
+		}
+		r.lastUsedAt = time.Now()
+		r.mu.Unlock()
+	}()
 
 	cdp, err := r.ensureBrowser(ctx)
 	if err != nil {
@@ -428,6 +446,8 @@ func navigateAndWait(
 			case "Page.loadEventFired":
 				loaded = true
 			}
+		case <-cdp.closeCh:
+			return 0, nil, cdp.crashError("during Page.navigate")
 		case <-loadWait.C:
 			loaded = true
 		case <-ctx.Done():
@@ -702,14 +722,20 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	args := []string{
 		"--headless=new",
 		"--no-sandbox",
+		"--disable-setuid-sandbox",
 		"--disable-gpu",
+		"--disable-software-rasterizer",
 		"--disable-dev-shm-usage",
+		"--disable-crash-reporter",
+		"--disable-breakpad",
 		"--disable-extensions",
 		"--disable-background-networking",
 		"--disable-sync",
 		"--disable-translate",
 		"--disable-default-apps",
 		"--disable-quic",
+		"--disable-features=VizDisplayCompositor,IsolateOrigins,site-per-process,TranslateUI",
+		"--autoplay-policy=user-gesture-required",
 		"--mute-audio",
 		"--no-first-run",
 		"--no-default-browser-check",
@@ -719,8 +745,11 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		"--proxy-server=http://" + proxy.Addr(),
 		"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
 		"--user-data-dir=" + userDir,
-		"about:blank",
 	}
+	if runtime.GOOS == "linux" {
+		args = append(args, "--no-zygote")
+	}
+	args = append(args, "about:blank")
 
 	cmd := exec.Command(r.chromeBin, args...)
 	stderr, err := cmd.StderrPipe()
@@ -735,6 +764,11 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		return nil, fmt.Errorf("start chromium: %w", err)
 	}
 
+	var (
+		connHolder   atomic.Pointer[cdpConn]
+		earlyCrashMu sync.Mutex
+		earlyCrash   string
+	)
 	wsCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -744,8 +778,16 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 			line := sc.Text()
 			if idx := strings.Index(line, "ws://127.0.0.1:"); idx >= 0 {
 				wsCh <- strings.TrimSpace(line[idx:])
-				// Continue draining stderr so Chromium never blocks on pipe buffer.
+				// Continue draining stderr and capture any post-startup FATAL/crash line for CDP error reporting.
 				for sc.Scan() {
+					txt := sc.Text()
+					if c := connHolder.Load(); c != nil {
+						c.setCrashReason(txt)
+					} else {
+						earlyCrashMu.Lock()
+						earlyCrash = startupReason(earlyCrash, txt)
+						earlyCrashMu.Unlock()
+					}
 				}
 				return
 			}
@@ -791,15 +833,55 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		_ = os.RemoveAll(userDir)
 		return nil, fmt.Errorf("dial chromium cdp: %w", err)
 	}
+	earlyCrashMu.Lock()
+	if earlyCrash != "" {
+		conn.setCrashReason(earlyCrash)
+	}
+	earlyCrashMu.Unlock()
+	connHolder.Store(conn)
 
 	r.proxy = proxy
 	r.cmd = cmd
 	r.userDataDir = userDir
 	r.cdp = conn
+	r.lastUsedAt = time.Now()
 	if r.log != nil {
 		r.log.Info("browser_started", slog.String("bin", r.chromeBin), slog.String("proxy", proxy.Addr()))
 	}
+	go r.idleReaperLoop(conn)
 	return conn, nil
+}
+
+func (r *Renderer) idleReaperLoop(target *cdpConn) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-target.closeCh:
+			return
+		case <-ticker.C:
+			r.mu.Lock()
+			if r.closed || r.cdp != target {
+				r.mu.Unlock()
+				return
+			}
+			now := time.Now()
+			for id, s := range r.sessions {
+				if now.Sub(s.lastUsed) > sessionIdleTTL {
+					delete(r.sessions, id)
+				}
+			}
+			if r.activeRuns == 0 && len(r.sessions) == 0 && now.Sub(r.lastUsedAt) >= browserIdleTTL {
+				if r.log != nil {
+					r.log.Info("browser_idle_shutdown", slog.Duration("idle", now.Sub(r.lastUsedAt)))
+				}
+				r.shutdownLocked()
+				r.mu.Unlock()
+				return
+			}
+			r.mu.Unlock()
+		}
+	}
 }
 
 func (r *Renderer) reapExpiredSessions(ctx context.Context, cdp *cdpConn) {

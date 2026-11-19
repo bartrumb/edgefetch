@@ -3,7 +3,7 @@
 # Every Chromium subresource socket is forced through EdgeFetch's in-process loopback `SSRFProxy` (`MAP * ~NOTFOUND`).
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.0.3
+ARG BUILD_VERSION=2.0.4
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(go env GOARCH)} go build -tr
       -o /out/edgefetch ./cmd/edgefetch
 
 FROM alpine:3.21
-LABEL org.opencontainers.image.title="EdgeFetch Fat Worker (Browser + PDF)" \
+LABEL org.opencontainers.image.title="EdgeFetch" \
       org.opencontainers.image.description="Outbound-only Go HTTP/2 + SSRF-proxied Headless Chromium + Poppler PDF worker for Cloudflare Hibernating WebSockets" \
       org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
       org.opencontainers.image.licenses="MIT"

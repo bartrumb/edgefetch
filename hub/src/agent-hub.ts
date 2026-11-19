@@ -990,7 +990,6 @@ export class AgentHubEngine {
             const { ws, att } = candidate;
             for (const idx of reqIndices) {
               triedSites[idx]!.add(att.siteId);
-              if (att.publicIp) triedIps[idx]!.add(att.publicIp);
             }
 
             const jobId = this.uuid();
@@ -1073,6 +1072,7 @@ export class AgentHubEngine {
                 this.recordHostPacing(itemHost, replyNow + crossNodePauseMs);
 
                 if (item.status === 429 && item.outcome !== 'challenge') {
+                  if (att.publicIp) triedIps[origIdx]!.add(att.publicIp);
                   const exactRetryMs = parseExactRetryAfterMs(item.retryAfter, replyNow);
                   const requiredWaitMs = exactRetryMs !== null ? exactRetryMs : DEFAULT_429_NO_HEADER_WAIT_MS;
                   const cooldownDurMs = Math.min(MAX_COOLDOWN_MS, requiredWaitMs + DEFAULT_429_COOLDOWN_MS);
@@ -1090,6 +1090,18 @@ export class AgentHubEngine {
                     } else {
                       retryAfterBudgetExceeded = true;
                     }
+                  }
+                } else if (
+                  !item.status &&
+                  item.outcome === 'error' &&
+                  !/robots\.txt disallowed/i.test(String((item as { problem?: unknown }).problem ?? '')) &&
+                  !Boolean((call.requests![origIdx] as { interact?: { sessionId?: unknown } } | undefined)?.interact?.sessionId)
+                ) {
+                  if (itemHost && this.affinities.getStickySite(itemHost, replyNow) === att.siteId) {
+                    this.affinities.deleteStickyHost(itemHost);
+                  }
+                  if (!wantSite && replyNow + crossNodePauseMs <= budgetDeadlineAt) {
+                    nextPending.push(origIdx);
                   }
                 }
               }

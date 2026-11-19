@@ -299,7 +299,7 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
     {
       name: 'search',
       description:
-        'Search across Brave Search API, SearXNG JSON API, and/or private EdgeFetch SEARCH D1 FTS5 collections with Reciprocal Rank Fusion (RRF) and optional live agent page extraction.',
+        'Edge-first web & collection search: queries private SEARCH D1 FTS5 + HAOS edge-map (/llms.txt & sitemap.xml on site: queries) + 24h SERP cache + Serper (Google) & Brave Search RRF/waterfall, with optional live HAOS page extraction.',
       annotations: {
         title: 'Search Web & Crawled Collections',
         readOnlyHint: true,
@@ -310,12 +310,14 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
       inputSchema: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Search query (1..500 chars).' },
+          query: { type: 'string', description: 'Search query (1..500 chars). Supports site:domain.com for $0 HAOS edge-map discovery.' },
           max_results: { type: 'integer', minimum: 1, maximum: 20, default: 5 },
+          mode: { type: 'string', enum: ['rrf', 'waterfall'], default: 'rrf', description: '"rrf" fuses Serper + Brave; "waterfall" calls Brave only if Serper returns <3 hits.' },
           include_domains: { type: 'array', items: { type: 'string' } },
           exclude_domains: { type: 'array', items: { type: 'string' } },
           time_range: { type: 'string', enum: ['day', 'week', 'month', 'year'] },
-          include_raw_content: { type: 'boolean', default: false, description: 'Fetch & chunk top results politely via EdgeFetch agents.' },
+          max_age_ms: { type: 'integer', minimum: 0, description: 'SERP cache max age in ms (default 86400000 = 24h; 0 bypasses cache).' },
+          include_raw_content: { type: 'boolean', default: false, description: 'Fetch & chunk top results politely via EdgeFetch HAOS agents.' },
           chunks_per_source: { type: 'integer', minimum: 1, maximum: 10, default: 3 },
           collections: { type: 'array', items: { type: 'string' }, description: 'Optional private SEARCH D1 collection IDs to fuse.' },
         },
@@ -360,7 +362,7 @@ function buildToolDefinitions(allowedTargets: FetchTarget[], defaultTarget: Fetc
           },
           formats: {
             type: 'array',
-            items: { type: 'string', enum: ['markdown', 'html', 'screenshot'] },
+            items: { type: 'string', enum: ['markdown', 'html', 'screenshot', 'transcript'] },
             default: ['markdown'],
           },
           waitForMs: { type: 'integer', minimum: 0, maximum: 15000 },
@@ -732,7 +734,7 @@ async function dispatchRpcMessage(
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: deps.serverName, version: deps.serverVersion },
         instructions:
-          'Use list_agents to inspect connected Home Assistant OS standby crawlers and 429 cooldowns, and fetch_url / fetch_batch to fetch public HTTPS feeds or pages politely.',
+          'Use search for web & crawled-collection discovery (Serper + Brave + HAOS edge-map + SEARCH D1), scrape / extract for clean Markdown & PDFs, map / crawl for site discovery, interact for headless Chromium sessions & YouTube transcripts, read_artifact for large stored docs, and list_agents for HAOS node status.',
       });
     }
     case 'ping':

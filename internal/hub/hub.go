@@ -28,6 +28,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/bartrumb/edgefetch/v2/internal/agent"
+	"github.com/bartrumb/edgefetch/v2/internal/botauth"
 	"github.com/bartrumb/edgefetch/v2/internal/browser"
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
@@ -58,6 +59,10 @@ type Config struct {
 	PeerToken         string
 	PeerHTTPClient    *http.Client
 	FallbackCrawler   *crawl.Crawler
+	BotSigner         *botauth.Signer
+	BotPublicJWKs     []botauth.PublicJWK
+	BotContactURL     string
+	UserAgent         string
 	Allow             func(*url.URL) error
 	Logger            *slog.Logger
 	DispatchTimeout   time.Duration
@@ -220,6 +225,88 @@ func (s *Server) Close() error {
 	return nil
 }
 
+func (s *Server) resolvedBotJWKs() []botauth.PublicJWK {
+	seen := make(map[string]struct{})
+	out := make([]botauth.PublicJWK, 0, 2)
+	if s.cfg.BotSigner != nil {
+		j := s.cfg.BotSigner.PublicJWK()
+		seen[j.Kid] = struct{}{}
+		out = append(out, j)
+	}
+	for _, j := range s.cfg.BotPublicJWKs {
+		if j.Kid == "" {
+			continue
+		}
+		if _, dup := seen[j.Kid]; dup {
+			continue
+		}
+		seen[j.Kid] = struct{}{}
+		out = append(out, j)
+	}
+	return out
+}
+
+func (s *Server) handleBotTransparencyRoutes(w http.ResponseWriter, r *http.Request) {
+	keys := s.resolvedBotJWKs()
+	if r.URL.Path == "/.well-known/http-message-signatures-directory" {
+		body, _ := json.MarshalIndent(botauth.DirectoryDocument{Keys: keys}, "", "  ")
+		w.Header().Set("Content-Type", "application/http-message-signatures-directory+json; charset=utf-8")
+		if s.cfg.BotSigner != nil {
+			w.Header().Set("Cache-Control", "public, max-age=240")
+			_ = s.cfg.BotSigner.SignDirectoryResponse(w.Header(), r, body, time.Now())
+		} else {
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+		}
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(body)
+		}
+		return
+	}
+
+	ua := strings.TrimSpace(s.cfg.UserAgent)
+	if ua == "" {
+		ua = crawl.DefaultUserAgent
+	}
+	contact := strings.TrimSpace(s.cfg.BotContactURL)
+	if contact == "" {
+		contact = "https://github.com/bartrumb/edgefetch"
+	}
+	scheme := "https"
+	if r.TLS == nil && !strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "http"
+	}
+	host := r.Host
+	if host == "" && r.URL != nil {
+		host = r.URL.Host
+	}
+	kids := make([]string, 0, len(keys))
+	for _, k := range keys {
+		kids = append(kids, k.Kid)
+	}
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"bot":             "EdgeFetch",
+		"version":         agent.Version,
+		"category":        "user-triggered-agent-retrieval",
+		"userAgent":       ua,
+		"operatorContact": contact,
+		"policies": map[string]any{
+			"robotsTxt":         "strict-rfc9309",
+			"crawlDelay":        "honored",
+			"retryAfter":        "honored",
+			"antiBotChallenges": "halt-immediately-never-bypass",
+			"aiModelTraining":   false,
+		},
+		"webBotAuth": map[string]any{
+			"rfc9421Supported":    true,
+			"directorySelfSigned": s.cfg.BotSigner != nil,
+			"directoryUrl":        scheme + "://" + host + "/.well-known/http-message-signatures-directory",
+			"activeKeyIds":        kids,
+		},
+	})
+}
+
 // ServeHTTP routes control-plane (`/agent/*`) and caller-plane (`/health`, `/agents`, `/fetch`, `/v1/*`, `/mcp`) requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
@@ -228,6 +315,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n := len(s.agents)
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": "hub", "version": agent.Version, "connectedAgents": n})
+		return
+
+	case (r.URL.Path == "/.well-known/http-message-signatures-directory" || r.URL.Path == "/.well-known/edgefetch-bot.json") &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead):
+		s.handleBotTransparencyRoutes(w, r)
 		return
 
 	case r.URL.Path == "/agent/ws":

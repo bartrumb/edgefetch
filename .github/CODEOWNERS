@@ -1,0 +1,5 @@
+# Global repository code ownership — required review on protected branches (`main`)
+* @bartrumb
+/.github/ @bartrumb
+/keys/ @bartrumb
+/SECURITY.md @bartrumb

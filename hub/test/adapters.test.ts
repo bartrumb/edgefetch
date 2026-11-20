@@ -64,6 +64,15 @@ test('ADAPTER-1: Registry catalog integrity, unique IDs, categories & SSRF https
   // Non-HTTPS URLs must never resolve a twin
   assert.equal(resolveSiteExtractorTwin('http://www.npmjs.com/package/esbuild'), null);
   assert.equal(getRawRegisteredSiteAdapters().length >= 40, true);
+
+  // JSR top-bar nav (`Skip to main content`) and duplicate tab links are stripped cleanly in `extractHtmlDocument`
+  const jsrDoc = extractHtmlDocument(
+    '<!doctype html><html><head><title>@std/path - JSR</title></head><body><div>Skip to main content <a href="/packages">Packages Browse packages</a><h1><a href="/@std">@std</a>/<a href="/@std/path">path</a></h1><p><a href="/@std/path">Overview</a> <a href="/@std/path/doc">Docs</a> <a href="/@std/path/versions">Versions</a> <a href="/@std/path/score">Score</a></p><p>Cross-platform file path manipulation utilities for Deno and Node.js.</p></div></body></html>',
+    { baseUrl: 'https://jsr.io/@std/path', onlyMainContent: true },
+  );
+  assert.equal(jsrDoc.markdown.includes('Skip to main content'), false);
+  assert.equal(jsrDoc.markdown.includes('Packages Browse packages'), false);
+  assert.equal(jsrDoc.markdown.includes('Cross-platform file path manipulation utilities'), true);
 });
 
 test('ADAPTER-2: Auto-discovered contributor JSON fixtures in test/fixtures/adapters/*.json', () => {

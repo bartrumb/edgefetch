@@ -60,4 +60,28 @@ func TestGenerateSignAndVerifyRFC9421(t *testing.T) {
 	if err := VerifyRequest(tampered, pub, now); err == nil {
 		t.Fatal("expected tampered @target-uri to fail verification")
 	}
+
+	// Self-signed Cloudflare Verified Bots directory response (`draft-meunier-http-message-signatures-directory`)
+	dirBody, err := signer.DirectoryJSON()
+	if err != nil {
+		t.Fatalf("DirectoryJSON: %v", err)
+	}
+	if !strings.Contains(string(dirBody), `"nbf":`) {
+		t.Fatalf("expected nbf in DirectoryJSON: %s", string(dirBody))
+	}
+	dirReq, _ := http.NewRequest(http.MethodGet, dirURL, nil)
+	respHdr := make(http.Header)
+	if err := signer.SignDirectoryResponse(respHdr, dirReq, dirBody, now); err != nil {
+		t.Fatalf("SignDirectoryResponse: %v", err)
+	}
+	if err := VerifyDirectoryResponse(dirReq, respHdr, dirBody, pub, now.Add(30*time.Second)); err != nil {
+		t.Fatalf("VerifyDirectoryResponse valid failed: %v", err)
+	}
+	if err := VerifyDirectoryResponse(dirReq, respHdr, append([]byte(nil), append(dirBody, ' ')...), pub, now); err == nil {
+		t.Fatal("expected tampered directory body to fail Content-Digest verification")
+	}
+	wrongHostReq, _ := http.NewRequest(http.MethodGet, "https://evil.example.com/.well-known/http-message-signatures-directory", nil)
+	if err := VerifyDirectoryResponse(wrongHostReq, respHdr, dirBody, pub, now); err == nil {
+		t.Fatal("expected wrong @authority;req to fail directory signature verification")
+	}
 }

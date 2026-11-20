@@ -97,8 +97,9 @@ var (
 	reBlockEnd  = regexp.MustCompile(`(?is)</(p|div|section|article|main|ul|ol|dl|dd|dt|figure|figcaption|tr|header)>`)
 	reBrHr      = regexp.MustCompile(`(?is)<(br|hr)\b[^>]*/?>`)
 	reAnyTag    = regexp.MustCompile(`(?s)<[^>]+>`)
-	reMultiLine = regexp.MustCompile(`\n{3,}`)
-	reSpaceRun  = regexp.MustCompile(`[ \t]{2,}`)
+	reMultiLine    = regexp.MustCompile(`\n{3,}`)
+	reSpaceRun     = regexp.MustCompile(`[ \t]{2,}`)
+	rePrintLinkDup = regexp.MustCompile(`(\[[^\]]+\]\((https?://[^)\s]+)\))[ \t]*\((https?://[^)\s]+)\)`)
 
 	reHexColor   = regexp.MustCompile(`#[0-9a-fA-F]{6}\b`)
 	reFontFamily = regexp.MustCompile(`(?i)font-family\s*:\s*([^;}{]+)`)
@@ -453,6 +454,13 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 	for i := len(stash) - 1; i >= 0; i-- {
 		s = strings.ReplaceAll(s, stash[i].token, stash[i].value)
 	}
+	s = rePrintLinkDup.ReplaceAllStringFunc(s, func(m string) string {
+		sub := rePrintLinkDup.FindStringSubmatch(m)
+		if len(sub) == 4 && sub[2] == sub[3] {
+			return sub[1]
+		}
+		return m
+	})
 	s = reMultiLine.ReplaceAllString(s, "\n\n")
 	s = reInvisibleSmuggling.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)

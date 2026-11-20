@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    allow:
+      - dependency-name: "github.com/coder/websocket"
+
+  - package-ecosystem: "npm"
+    directory: "/hub"
+    schedule:
+      interval: "weekly"
+    groups:
+      hub-dev-deps:
+        dependency-type: "development"

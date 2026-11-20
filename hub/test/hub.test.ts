@@ -27,6 +27,7 @@ import {
   handleBotTransparencyRoutes,
   signOutboundBotHeaders,
   verifyBotRequestSignature,
+  verifyDirectoryResponseSignature,
 } from '../src/bot-auth.ts';
 import { executeIngestPipeline, sha256HexString, writeJobManifestToR2 } from '../src/ingest.ts';
 import { defaultTextAccept, handleMcpRequest, inferKindForUrl, type McpServerDeps } from '../src/mcp.ts';
@@ -1566,14 +1567,14 @@ test('V2-10: Modular Site Extractor Registry (18+ platforms: npm, crates.io, HF,
   assert.match(hfCard.markdown, /\|\s*\*\*license\*\*\s*\|\s*apache-2\.0\s*\|/);
   assert.match(hfCard.markdown, /Vec<u8>/);
 
-  // 7–8. GitLab & Codeberg raw + commit patch upgrades
+  // 7–8. GitLab robots.txt-compliant ?format=json&viewer=simple blob + repo root README upgrades
   assert.equal(
     resolveSiteExtractorTwin('https://gitlab.com/inkscape/inkscape/-/blob/master/CMakeLists.txt')?.fetchUrl,
-    'https://gitlab.com/inkscape/inkscape/-/raw/master/CMakeLists.txt',
+    'https://gitlab.com/inkscape/inkscape/-/blob/master/CMakeLists.txt?format=json&viewer=simple',
   );
   assert.equal(
-    resolveSiteExtractorTwin('https://codeberg.org/forgejo/forgejo/commit/abcdef1234567')?.fetchUrl,
-    'https://codeberg.org/forgejo/forgejo/commit/abcdef1234567.patch',
+    resolveSiteExtractorTwin('https://gitlab.com/gitlab-org/cli')?.fetchUrl,
+    'https://gitlab.com/gitlab-org/cli/-/blob/HEAD/README.md?format=json&viewer=simple',
   );
 
   // 9. Universal Discourse `/t/<slug>/<id>` -> `.json` with `accepted_answer`
@@ -2540,10 +2541,26 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
   assert.ok(jwksRes);
   assert.equal(jwksRes.status, 200);
   assert.match(jwksRes.headers.get('content-type') ?? '', /application\/http-message-signatures-directory\+json/);
-  const jwksBody = (await jwksRes.json()) as { keys: Array<{ kid: string; x: string; kty: string; crv: string }> };
+  assert.match(jwksRes.headers.get('content-digest') ?? '', /^sha-256=:[A-Za-z0-9+/=]+:$/);
+  assert.match(jwksRes.headers.get('signature-input') ?? '', /^directory=\("@authority";req "content-digest"\);.*tag="http-message-signatures-directory"/);
+  const dirVerify = await verifyDirectoryResponseSignature({
+    requestUrl: dirUrl,
+    response: jwksRes.clone(),
+    publicKeyB64Url: kp.publicKey,
+  });
+  assert.equal(dirVerify.ok, true);
+  assert.equal(dirVerify.kid, kp.kid);
+  const wrongHostDirVerify = await verifyDirectoryResponseSignature({
+    requestUrl: 'https://spoofed.example.com/.well-known/http-message-signatures-directory',
+    response: jwksRes.clone(),
+    publicKeyB64Url: kp.publicKey,
+  });
+  assert.equal(wrongHostDirVerify.ok, false);
+  const jwksBody = (await jwksRes.json()) as { keys: Array<{ kid: string; x: string; kty: string; crv: string; nbf: number }> };
   assert.equal(jwksBody.keys.length, 1);
   assert.equal(jwksBody.keys[0]?.kid, kp.kid);
   assert.equal(jwksBody.keys[0]?.x, kp.publicKey);
+  assert.equal(typeof jwksBody.keys[0]?.nbf, 'number');
 
   const botDocUrl = 'https://hub.example.com/.well-known/edgefetch-bot.json';
   const botDocRes = await handleBotTransparencyRoutes(
@@ -3049,7 +3066,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.5.1');
+    assert.equal(caps.version, '2.5.2');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);

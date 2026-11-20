@@ -1,0 +1,12 @@
+{
+  "adapterId": "gitlab-readme-json",
+  "mode": "twin",
+  "inputUrl": "https://gitlab.com/gitlab-org/cli",
+  "expectedFetchUrl": "https://gitlab.com/gitlab-org/cli/-/blob/HEAD/README.md?format=json&viewer=simple",
+  "mockPayload": "{\"html\":\"<div class=\\\"blob-viewer\\\" data-path=\\\"README.md\\\" data-type=\\\"simple\\\"><pre class=\\\"code highlight\\\"><code><span id=\\\"LC1\\\" class=\\\"line\\\"># GLab</span>\\n<span id=\\\"LC2\\\" class=\\\"line\\\"></span>\\n<span id=\\\"LC3\\\" class=\\\"line\\\">GLab is an open source GitLab CLI tool bringing GitLab to your terminal.</span></code></pre></div>\"}",
+  "expectTitleIncludes": "gitlab-org/cli",
+  "expectMarkdownIncludes": [
+    "# GLab",
+    "open source GitLab CLI tool"
+  ]
+}

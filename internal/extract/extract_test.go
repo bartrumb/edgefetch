@@ -177,4 +177,11 @@ func TestResolveHrefPreservesSemicolonlessQueryParams(t *testing.T) {
 	if gotClean.Markdown != "Clean text" {
 		t.Fatalf("expected invisible smuggling codepoints stripped, got %q", gotClean.Markdown)
 	}
+
+	// Print-stylesheet duplicate URLs immediately following links (`[label](url)(url)`) must collapse to `[label](url)`.
+	printDup := `<html><body><main><p>Read our <a href="https://clinicaltrials.gov/about-site/disclaimer">disclaimer</a>(https://clinicaltrials.gov/about-site/disclaimer) before continuing.</p></main></body></html>`
+	gotDup := ExtractHTML(printDup, ExtractOptions{OnlyMainContent: true})
+	if strings.Contains(gotDup.Markdown, ")(https://clinicaltrials.gov/about-site/disclaimer)") {
+		t.Fatalf("expected duplicate print-stylesheet URL collapsed, got: %s", gotDup.Markdown)
+	}
 }

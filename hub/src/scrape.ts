@@ -3318,7 +3318,9 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string): stri
             : /$^/,
           '',
         );
-      return resolveMarkdownRelativeLinksInProse(cleanedProse, baseUrl).replace(/\n{3,}/g, '\n\n');
+      return resolveMarkdownRelativeLinksInProse(cleanedProse, baseUrl)
+        .replace(/(\[[^\]]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1')
+        .replace(/\n{3,}/g, '\n\n');
     })
     .map((part, idx) => (idx % 2 === 1 ? part : dedupeConsecutiveStandaloneLinkParagraphs(part)))
     .join('');

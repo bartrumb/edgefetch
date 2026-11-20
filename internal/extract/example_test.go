@@ -3,7 +3,7 @@ package extract_test
 import (
 	"fmt"
 
-	"github.com/bartrumb/edgefetch/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/extract"
 )
 
 func ExampleExtractHTML() {

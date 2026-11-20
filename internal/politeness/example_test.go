@@ -5,7 +5,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/politeness"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 func ExampleParseRobotsTxt() {

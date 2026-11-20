@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/bartrumb/edgefetch/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
 )
 
 // ImageInfo describes an image discovered on a page.

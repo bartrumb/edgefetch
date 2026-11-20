@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/extract"
 )
 
 // ErrChallengeDetected is returned when a rendered DOM contains a CAPTCHA or anti-bot challenge;

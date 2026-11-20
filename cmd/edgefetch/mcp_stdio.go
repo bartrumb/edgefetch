@@ -17,11 +17,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/agent"
-	"github.com/bartrumb/edgefetch/internal/browser"
-	"github.com/bartrumb/edgefetch/internal/classify"
-	"github.com/bartrumb/edgefetch/internal/crawl"
-	"github.com/bartrumb/edgefetch/internal/hub"
+	"github.com/bartrumb/edgefetch/v2/internal/agent"
+	"github.com/bartrumb/edgefetch/v2/internal/browser"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/hub"
 )
 
 // runMCPStdio implements a zero-daemon, zero-port, zero-token Model Context Protocol (MCP) server over stdin/stdout

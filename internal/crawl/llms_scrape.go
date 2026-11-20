@@ -17,10 +17,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/bartrumb/edgefetch/internal/browser"
-	"github.com/bartrumb/edgefetch/internal/classify"
-	"github.com/bartrumb/edgefetch/internal/extract"
-	"github.com/bartrumb/edgefetch/internal/politeness"
+	"github.com/bartrumb/edgefetch/v2/internal/browser"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 const (

@@ -300,7 +300,9 @@ Reproduce locally in <2 seconds with zero external network calls:
 node bench/run-bench.mjs
 \`\`\`
 
-## Corpus Results (8 Multi-Platform Developer Fixtures × 50 Iterations)
+## Synthetic Regression Corpus Results (8 Multi-Platform Developer Fixtures × 50 Iterations)
+
+> **Scope note:** These fixtures are deterministic offline synthetic pages modeled on real developer/documentation DOM layouts so CI can gate extraction fidelity and boilerplate stripping in <2 seconds with zero network flakiness.
 
 | Fixture | Raw Input Tokens | Naive Tag-Strip Tokens | **EdgeFetch \`v${SCRAPE_PIPELINE_VERSION}\` Tokens** | **LLM Token Reduction** | Fidelity & Boilerplate Gate |
 |---|---:|---:|---:|---:|:---:|

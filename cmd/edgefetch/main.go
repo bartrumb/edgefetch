@@ -22,14 +22,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/agent"
-	"github.com/bartrumb/edgefetch/internal/botauth"
-	"github.com/bartrumb/edgefetch/internal/crawl"
-	"github.com/bartrumb/edgefetch/internal/hub"
-	"github.com/bartrumb/edgefetch/internal/otel"
-	"github.com/bartrumb/edgefetch/internal/politeness"
-	"github.com/bartrumb/edgefetch/internal/priv"
-	"github.com/bartrumb/edgefetch/internal/ws"
+	"github.com/bartrumb/edgefetch/v2/internal/agent"
+	"github.com/bartrumb/edgefetch/v2/internal/botauth"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/hub"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
+	"github.com/bartrumb/edgefetch/v2/internal/priv"
+	"github.com/bartrumb/edgefetch/v2/internal/ws"
 )
 
 const maxResponseHeaderBytes = 64 << 10 // 64 KiB cap prevents giant origin response headers from exhausting memory.

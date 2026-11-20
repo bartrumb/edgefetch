@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bartrumb/edgefetch/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/extract"
 )
 
 func main() {

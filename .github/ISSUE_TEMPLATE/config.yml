@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security Vulnerability Report
+    url: https://github.com/bartrumb/edgefetch/security/advisories/new
+    about: Please report SSRF, auth, or sandbox security vulnerabilities privately here.
+  - name: Launch & Architecture FAQ
+    url: https://github.com/bartrumb/edgefetch/blob/main/docs/LAUNCH-FAQ.md
+    about: Answers to common questions about Firecrawl/Crawl4AI differences, politeness, and costs.

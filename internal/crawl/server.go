@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/classify"
-	"github.com/bartrumb/edgefetch/internal/otel"
-	"github.com/bartrumb/edgefetch/internal/politeness"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 const (

@@ -687,7 +687,7 @@ function renderDashboardHtml(params: {
           '  docker compose -f compose.agent.yaml up -d',
         ].join('\n'),
         go: [
-          'go install github.com/bartrumb/edgefetch/cmd/edgefetch@latest',
+          'go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest',
           'EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' EDGEFETCH_SITE_ID=' + site + ' EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
           '  edgefetch --mode=agent',
         ].join('\n'),

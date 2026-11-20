@@ -1,0 +1,98 @@
+name: Release Binaries & Multi-Arch Container Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  goreleaser:
+    name: Build & Publish Release Archives (GoReleaser)
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@9c156ee8a17a598857849441385a2041ef570552 # v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  ghcr-release:
+    name: Publish GHCR Images (agent:latest, agent:lite & all-in-one)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Determine Version & Registry Owner
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF#refs/tags/v}"
+          else
+            ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+          fi
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push Fat Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:latest)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.agent
+          platforms: linux/amd64,linux/arm64
+          build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:${{ steps.meta.outputs.version }}
+
+      - name: Build & Push Distroless Lite Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:lite)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:lite
+            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:${{ steps.meta.outputs.version }}-lite
+
+      - name: Build & Push All-in-One Container (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch:latest)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.all-in-one
+          platforms: linux/amd64,linux/arm64
+          build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch:${{ steps.meta.outputs.version }}

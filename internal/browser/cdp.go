@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/ws"
+	"github.com/bartrumb/edgefetch/v2/internal/ws"
 )
 
 const maxCDPFrameBytes = 24 << 20 // 24 MiB ceiling for hydrated DOM + base64 PNG screenshots

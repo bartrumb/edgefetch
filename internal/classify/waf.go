@@ -264,7 +264,7 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 
 	// 7. Fastly WAF 403 block page
 	if status == 403 && (strings.Contains(serverHdr, "fastly") || (header != nil && header.Get("x-served-by") != "")) &&
-		strings.Contains(scrubbedLower, "fastly error: unknown domain") == false &&
+		!strings.Contains(scrubbedLower, "fastly error: unknown domain") &&
 		strings.Contains(scrubbedLower, "request blocked") && visibleWords < 80 {
 		return &WAFMatch{
 			Vendor:     "fastly",

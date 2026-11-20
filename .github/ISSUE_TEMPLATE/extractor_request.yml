@@ -1,0 +1,23 @@
+name: Site / ATS Extractor Request
+description: Propose a clean 1-hop API/JSON/DOM extractor for a public documentation site or job board
+title: "[Extractor]: "
+labels: ["enhancement", "good first issue"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        EdgeFetch never bypasses `robots.txt` or CAPTCHAs — the best extractors upgrade noisy HTML pages to a site's clean public JSON API, RSS feed, `.md` twin, or structured DOM landmark.
+  - type: input
+    id: sample_url
+    attributes:
+      label: Sample Public URL(s)
+      placeholder: "https://..."
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Current Output vs. Ideal Markdown / Structured Fields
+      placeholder: "What noise or missing content happens today, and is there an official public JSON/API/feed endpoint?"
+    validations:
+      required: true

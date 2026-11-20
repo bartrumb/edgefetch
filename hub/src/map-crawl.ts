@@ -544,11 +544,38 @@ export async function executeMapCall(params: {
     }
   }
 
+  const includeOutsidePath = Boolean((payload as { includeOutsidePath?: unknown }).includeOutsidePath);
   const subpathPrefix = trimmedSubpath ? `${origin}${trimmedSubpath}`.toLowerCase() : '';
   const isUnderSubpath = (urlStr: string): boolean => {
-    if (!subpathPrefix) return false;
+    if (!subpathPrefix) return true;
     const lower = urlStr.toLowerCase();
     return lower === subpathPrefix || lower.startsWith(`${subpathPrefix}/`);
+  };
+
+  // Tokenize URL paths and page titles on `/ - _ .` and camelCase boundaries so `search=voice` matches `voice` / `voice-agent`
+  // and NEVER matches inside unrelated words like `/billing/manage/invoices/` ("invoices" -> token "invoices", not "voice").
+  const tokenizeMapSegment = (raw: string): string[] => {
+    const dec = (() => {
+      try {
+        return decodeURIComponent(raw);
+      } catch {
+        return raw;
+      }
+    })();
+    const camelSplit = dec.replace(/([a-z\d])([A-Z])/g, '$1 $2');
+    return (camelSplit.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(Boolean);
+  };
+
+  const matchesWholeMapToken = (tokens: string[], queryTerm: string): { matched: boolean; exact: boolean } => {
+    const q = queryTerm.toLowerCase();
+    for (const tok of tokens) {
+      if (tok === q) return { matched: true, exact: true };
+      // Allow plural/stem suffix (`voice` -> `voices`, `agent` -> `agents`) ONLY at the start of the token, never mid-word (`invoices`).
+      if (q.length >= 4 && tok.startsWith(q) && tok.length <= q.length + 3) {
+        return { matched: true, exact: false };
+      }
+    }
+    return { matched: false, exact: false };
   };
 
   const extractUrlLocalePrefix = (pathname: string): string | null => {
@@ -582,35 +609,47 @@ export async function executeMapCall(params: {
   };
 
   let items = [...discovered.values()];
+  if (subpathPrefix && !includeOutsidePath) {
+    items = items.filter((entry) => isUnderSubpath(entry.url));
+  }
   if (searchFilter) {
-    const terms = searchFilter.split(/\s+/).filter(Boolean);
+    const terms = (searchFilter.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(Boolean);
     items = items
       .map((entry) => {
         const urlLower = entry.url.toLowerCase();
-        const titleLower = (entry.title ?? '').toLowerCase();
-        const hay = `${urlLower} ${titleLower}`;
+        let pathAndQuery = entry.url;
+        try {
+          const pu = new URL(entry.url);
+          pathAndQuery = `${pu.pathname} ${pu.search}`;
+        } catch {
+          // ignore
+        }
+        const urlTokens = tokenizeMapSegment(pathAndQuery);
+        const titleTokens = tokenizeMapSegment(entry.title ?? '');
         let hits = 0;
-        let segmentBonus = 0;
+        let exactBonus = 0;
         for (const t of terms) {
-          if (hay.includes(t)) {
+          const uMatch = matchesWholeMapToken(urlTokens, t);
+          const tMatch = matchesWholeMapToken(titleTokens, t);
+          if (uMatch.matched || tMatch.matched) {
             hits++;
-            const segRe = new RegExp(`(?:^|[/._\\s-])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/._\\s-])`, 'i');
-            if (segRe.test(urlLower) || segRe.test(titleLower)) segmentBonus += 3;
+            if (uMatch.exact) exactBonus += 6;
+            else if (tMatch.exact) exactBonus += 3;
           }
         }
-        const underSubpath = isUnderSubpath(entry.url);
+        const underSubpath = subpathPrefix ? isUnderSubpath(entry.url) : false;
         const exactSubpathRoot =
           terms.length === 1 && (urlLower.endsWith(`/${terms[0]}/`) || urlLower.endsWith(`/${terms[0]}`)) ? 5 : 0;
         const score =
           (underSubpath ? 100 : 0) +
           hits * 20 +
-          segmentBonus +
+          exactBonus +
           exactSubpathRoot +
           (entry.title ? 2 : 0) +
           scoreMapUrlQuality(entry.url);
         return { entry, hits, score };
       })
-      .filter((x) => x.hits > 0)
+      .filter((x) => x.hits > 0 && (terms.length <= 1 || x.hits === terms.length || x.hits >= 2))
       .sort((a, b) => b.score - a.score || a.entry.url.length - b.entry.url.length || a.entry.url.localeCompare(b.entry.url))
       .map((x) => x.entry);
   } else if (subpathPrefix) {

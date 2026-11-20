@@ -26,7 +26,7 @@ import (
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
 // Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/internal/agent.Version=...".
-var Version = "2.2.0"
+var Version = "2.3.0"
 
 const (
 	DefaultPingInterval          = 30 * time.Second
@@ -382,9 +382,11 @@ func handleDispatchWithOpts(
 					res.ArtifactError = fmt.Sprintf("body (%d bytes) exceeds artifact maxContentBytes (%d)", len(rawBytes), maxContent)
 					return res
 				}
+				upStart := time.Now()
 				artCtx, cancelArt := context.WithTimeout(context.Background(), rtOpts.UploadTimeout)
 				artRef, upErr := uploadArtifact(artCtx, replyClient, cfg, msg.JobID, msg.JobNonce, res.ID, retention, rawBytes)
 				cancelArt()
+				res.Timing.ArtifactUploadMs = time.Since(upStart).Milliseconds()
 				if upErr != nil {
 					res.BodyOmitted = true
 					res.ArtifactError = upErr.Error()

@@ -571,7 +571,17 @@ export async function cloudflareOverflowFetch(
   const started = Date.now();
   let call: {
     maxSeconds?: number;
-    requests?: Array<{ id?: string; url?: string; kind?: string; accept?: string; ifNoneMatch?: string; ifModifiedSince?: string }>;
+    requests?: Array<{
+      id?: string;
+      url?: string;
+      method?: string;
+      requestBody?: string;
+      contentType?: string;
+      kind?: string;
+      accept?: string;
+      ifNoneMatch?: string;
+      ifModifiedSince?: string;
+    }>;
     options?: { includeBody?: boolean; maxBytes?: number; pauseMs?: number; timeoutMs?: number; respectRobots?: boolean; robots?: boolean };
   };
   try {
@@ -686,14 +696,22 @@ export async function cloudflareOverflowFetch(
           'user-agent': userAgent,
           accept: acceptHeader,
         });
+        let reqMethod = 'GET';
+        let reqBody: string | undefined;
         if (hop === 0) {
           if (r.ifNoneMatch) headers.set('if-none-match', r.ifNoneMatch);
           if (r.ifModifiedSince) headers.set('if-modified-since', r.ifModifiedSince);
+          if (typeof r.method === 'string' && r.method.trim().toUpperCase() === 'POST') {
+            reqMethod = 'POST';
+            reqBody = typeof r.requestBody === 'string' ? r.requestBody : '';
+            headers.set('content-type', r.contentType?.trim() || 'application/json');
+          }
         }
 
         const resp = await fetchFn(parsedUrl.toString(), {
-          method: 'GET',
+          method: reqMethod,
           headers,
+          ...(reqBody !== undefined ? { body: reqBody } : {}),
           redirect: 'manual',
           signal: hopSignal,
         });

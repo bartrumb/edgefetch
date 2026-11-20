@@ -43,6 +43,7 @@ import {
 } from './agent-hub';
 import { authorizeAgent, isCallerAuthorized } from './auth';
 import { handleCompatRoutes } from './compat';
+import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
   cancelCrawlJob,
   CrawlWorkflow,
@@ -629,6 +630,8 @@ export default {
               status: 400,
               via: 'hub',
               bodyText: JSON.stringify({ error: robotsCheck.error, message: robotsCheck.message }),
+              retryAfter: undefined as string | undefined,
+              stageTimingsMs: undefined as { dispatchMs: number; hydrateR2Ms: number; totalHubMs: number } | undefined,
             };
           }
           let wantsIncludeBody = false;
@@ -674,6 +677,7 @@ export default {
               details: { hosts: robotsCheck.bypassedHosts.join(','), source },
             });
           }
+          const dispatchStartMs = Date.now();
           const res = await routeFetchWithFailover({
             target,
             site,
@@ -695,79 +699,92 @@ export default {
               });
             },
           });
+          const dispatchMs = Date.now() - dispatchStartMs;
           const via = res.headers.get('x-crawler-via') ?? target;
           const retryAfter = res.headers.get('retry-after');
           const rawCompletedBody = await res.text();
           let bodyText = rawCompletedBody;
+          let hydrateR2Ms = 0;
           if (res.status === 200 && env.ARTIFACTS && wantsIncludeBody && hydrateInline) {
+            const hydStart = Date.now();
             bodyText = await hydrateReplyBodiesFromR2(rawCompletedBody, env.ARTIFACTS);
+            hydrateR2Ms = Date.now() - hydStart;
           }
 
-          // S4: When ARTIFACTS + META are bound (and caller did not set ephemeral / artifactRetention='off'), write R2 manifest and trigger idempotent IngestWorkflow.
-          if (res.status === 200 && effectiveRetentionPref !== 'off' && env.ARTIFACTS && env.META) {
-            const ingestJobId = `job_${crypto.randomUUID().replace(/-/g, '')}`;
-            const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(via);
-            try {
-              const written = await writeJobManifestToR2({
-                bucket: env.ARTIFACTS,
-                jobId: ingestJobId,
-                via,
-                ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
-                ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
-                ...(crawlId ? { crawlId } : {}),
-                rawReplyText: rawCompletedBody,
-              });
-              if (written.ok) {
-                const wfParams = {
-                  manifestKey: written.manifestKey,
+          // P12 & S4: Move R2 manifest write + Cloudflare Workflows `INGEST.create(...)` + activity-log RPC off the
+          // synchronous HTTP response path into `ctx.waitUntil(...)` whenever `env.INGEST` and `ctx.waitUntil` are bound!
+          const runPostFetchPersistence = async () => {
+            if (res.status === 200 && effectiveRetentionPref !== 'off' && env.ARTIFACTS && env.META) {
+              const ingestJobId = `job_${crypto.randomUUID().replace(/-/g, '')}`;
+              const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(via);
+              try {
+                const written = await writeJobManifestToR2({
+                  bucket: env.ARTIFACTS,
                   jobId: ingestJobId,
+                  via,
                   ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
                   ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
-                  via,
-                };
-                if (env.INGEST && !crawlId) {
-                  try {
-                    await env.INGEST.create({ id: `ingest-${ingestJobId}`, params: wfParams });
-                  } catch (wfErr) {
-                    const wfMsg = wfErr instanceof Error ? wfErr.message : String(wfErr);
-                    if (!/already exists|duplicate/i.test(wfMsg)) {
-                      pendingEvents.push({
-                        level: 'warn',
-                        category: 'crawl',
-                        event: 'ingest_workflow_error',
-                        summary: `Failed to enqueue IngestWorkflow for ${ingestJobId}: ${wfMsg.slice(0, 140)}`,
-                        details: { jobId: ingestJobId, manifestKey: written.manifestKey },
-                      });
+                  ...(crawlId ? { crawlId } : {}),
+                  rawReplyText: rawCompletedBody,
+                });
+                if (written.ok) {
+                  const wfParams = {
+                    manifestKey: written.manifestKey,
+                    jobId: ingestJobId,
+                    ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
+                    ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
+                    via,
+                  };
+                  if (env.INGEST && !crawlId) {
+                    try {
+                      await env.INGEST.create({ id: `ingest-${ingestJobId}`, params: wfParams });
+                    } catch (wfErr) {
+                      const wfMsg = wfErr instanceof Error ? wfErr.message : String(wfErr);
+                      if (!/already exists|duplicate/i.test(wfMsg)) {
+                        pendingEvents.push({
+                          level: 'warn',
+                          category: 'crawl',
+                          event: 'ingest_workflow_error',
+                          summary: `Failed to enqueue IngestWorkflow for ${ingestJobId}: ${wfMsg.slice(0, 140)}`,
+                          details: { jobId: ingestJobId, manifestKey: written.manifestKey },
+                        });
+                      }
                     }
+                  } else {
+                    await executeIngestPipeline(env, wfParams, undefined, {
+                      onArtifactRejected: ({ blobSha256, reason, siteId }) => {
+                        pendingEvents.push({
+                          level: 'warn',
+                          category: 'crawl',
+                          event: 'artifact_verification_failed',
+                          summary: `Rejected unverified artifact ${blobSha256.slice(0, 12)} (${reason})`,
+                          details: { jobId: ingestJobId, blobSha256, reason, siteId: siteId ?? null },
+                        });
+                      },
+                    });
                   }
-                } else {
-                  await executeIngestPipeline(env, wfParams, undefined, {
-                    onArtifactRejected: ({ blobSha256, reason, siteId }) => {
-                      pendingEvents.push({
-                        level: 'warn',
-                        category: 'crawl',
-                        event: 'artifact_verification_failed',
-                        summary: `Rejected unverified artifact ${blobSha256.slice(0, 12)} (${reason})`,
-                        details: { jobId: ingestJobId, blobSha256, reason, siteId: siteId ?? null },
-                      });
-                    },
-                  });
                 }
+              } catch (manifestErr) {
+                const mMsg = manifestErr instanceof Error ? manifestErr.message : String(manifestErr);
+                pendingEvents.push({
+                  level: 'warn',
+                  category: 'crawl',
+                  event: 'ingest_manifest_error',
+                  summary: `Failed to write R2 ingest manifest: ${mMsg.slice(0, 140)}`,
+                });
               }
-            } catch (manifestErr) {
-              const mMsg = manifestErr instanceof Error ? manifestErr.message : String(manifestErr);
-              pendingEvents.push({
-                level: 'warn',
-                category: 'crawl',
-                event: 'ingest_manifest_error',
-                summary: `Failed to write R2 ingest manifest: ${mMsg.slice(0, 140)}`,
-              });
             }
+            pendingEvents.push(...buildCrawlActivityEvents({ source, target, via, httpStatus: res.status, replyText: bodyText }));
+            await hub()
+              .recordHubEvents(pendingEvents)
+              .catch(() => undefined);
+          };
+
+          if (env.INGEST && !crawlId && !resolvedCollectionId && ctx?.waitUntil) {
+            ctx.waitUntil(runPostFetchPersistence());
+          } else {
+            await runPostFetchPersistence();
           }
-          pendingEvents.push(...buildCrawlActivityEvents({ source, target, via, httpStatus: res.status, replyText: bodyText }));
-          await hub()
-            .recordHubEvents(pendingEvents)
-            .catch(() => undefined);
 
           if (env.OTEL_EXPORTER_OTLP_ENDPOINT && reqTrace.context.sampled) {
             const endedAtMs = Date.now();
@@ -804,8 +821,10 @@ export default {
             }
           }
 
+          const totalHubMs = Date.now() - startedAtMs;
+          const stageTimingsMs = { dispatchMs, hydrateR2Ms, totalHubMs };
           span.setAttribute('edgefetch.via', via);
-          return { status: res.status, via, bodyText, ...(retryAfter ? { retryAfter } : {}) };
+          return { status: res.status, via, bodyText, stageTimingsMs, ...(retryAfter ? { retryAfter } : {}) };
         },
       );
 
@@ -888,7 +907,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.2.0',
+          serverVersion: '2.3.0',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -997,6 +1016,31 @@ export default {
             });
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
+          executeJobs: async ({ args, principal }) => {
+            return await executeJobsCall({
+              payload: args as JobsToolPayload,
+              env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+              executeSearch: async (sArgs) => {
+                const sOut = await executeSearchCall({
+                  payload: sArgs as SearchRequestPayload,
+                  env,
+                  executeHubFetch,
+                  source: `mcp-jobs-search:${principal ?? 'client'}`,
+                });
+                return { status: sOut.status, body: sOut.body };
+              },
+              executeScrape: async (scArgs) => {
+                const scOut = await executeScrapeCall({
+                  payload: scArgs as ScrapeRequestPayload,
+                  env,
+                  executeHubFetch,
+                  selfHost: url.hostname,
+                  source: `mcp-jobs-scrape:${principal ?? 'client'}`,
+                });
+                return { status: scOut.status, body: scOut.body };
+              },
+            });
+          },
           ...(env.SEARCH
             ? {
                 searchCollection: async ({ collectionId, query, limit }) => {
@@ -1070,7 +1114,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.2.0'), {
+        return Response.json(buildCapabilities(env, '2.3.0'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -1555,6 +1599,61 @@ export default {
           { ok: true, collectionId, query, hits },
           { status: 200, headers: { 'cache-control': 'no-store' } },
         );
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/jobs') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const rawJobsText = await request.text();
+        if (new TextEncoder().encode(rawJobsText).byteLength > MAX_CALL_UTF8_BYTES) {
+          return Response.json({ error: 'too_large' }, { status: 413 });
+        }
+        let payload: JobsToolPayload;
+        try {
+          payload = JSON.parse(rawJobsText) as JobsToolPayload;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const out = await executeJobsCall({
+          payload,
+          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+          executeSearch: async (sArgs) => {
+            const sOut = await executeSearchCall({
+              payload: sArgs as SearchRequestPayload,
+              env,
+              executeHubFetch,
+              source: `jobs-search:${auth.principal}`,
+            });
+            return { status: sOut.status, body: sOut.body };
+          },
+          executeScrape: async (scArgs) => {
+            const scOut = await executeScrapeCall({
+              payload: scArgs as ScrapeRequestPayload,
+              env,
+              executeHubFetch,
+              selfHost: url.hostname,
+              source: `jobs-scrape:${auth.principal}`,
+            });
+            return { status: scOut.status, body: scOut.body };
+          },
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: { 'cache-control': 'no-store' },
+        });
       }
 
       if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {

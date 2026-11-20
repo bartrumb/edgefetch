@@ -126,6 +126,12 @@ class EdgeFetchClient:
     def search(self, query: str, **options: Any) -> Dict[str, Any]:
         return self._request_json("POST", "/v1/search", {"query": query, **options})
 
+    def jobs(self, query: Optional[str] = None, **options: Any) -> Dict[str, Any]:
+        body: Dict[str, Any] = dict(options)
+        if query is not None:
+            body["query"] = query
+        return self._request_json("POST", "/v1/jobs", body)
+
     def interact(self, **options: Any) -> Dict[str, Any]:
         return self._request_json("POST", "/v1/interact", dict(options))
 

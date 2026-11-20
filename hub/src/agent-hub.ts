@@ -1094,7 +1094,9 @@ export class AgentHubEngine {
                 } else if (
                   !item.status &&
                   item.outcome === 'error' &&
-                  !/robots\.txt disallowed/i.test(String((item as { problem?: unknown }).problem ?? '')) &&
+                  !/robots\.txt|interact action \d+|selector_not_found|\bselector\b[\s\S]{0,120}\bnot found\b|invalid_|validation|unsupported protocol|refusing connection to non-public ip/i.test(
+                    String((item as { problem?: unknown }).problem ?? ''),
+                  ) &&
                   !Boolean((call.requests![origIdx] as { interact?: { sessionId?: unknown } } | undefined)?.interact?.sessionId)
                 ) {
                   if (itemHost && this.affinities.getStickySite(itemHost, replyNow) === att.siteId) {

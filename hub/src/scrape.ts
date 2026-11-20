@@ -10,6 +10,17 @@
 
 import { applyPostFetchSiteExtractor, resolveSiteExtractorTwin } from './extractors/registry';
 import { isContentVerifiedInMetaD1, sha256HexString } from './ingest';
+import {
+  analyzeUrlRedirect,
+  buildBlockedInfo,
+  chunkJsonRecords,
+  detectWorkdayRedirectStub,
+  extractJobPostingJsonLd,
+  formatJobPostingHeaderMarkdown,
+  isThinScriptedPage,
+  resolveAtsPreFetchSpec,
+  type StructuredJobPosting,
+} from './jobs';
 import { computeMarkdownChanges } from './map-crawl';
 import { validatePublicHttpsTargetUrl } from './overflow';
 import { chunkMarkdownForSearch, rankChunksInMemory } from './search-index';
@@ -21,7 +32,7 @@ import {
   type OptionalStorageBindings,
 } from './storage';
 
-export const SCRAPE_PIPELINE_VERSION = 20;
+export const SCRAPE_PIPELINE_VERSION = 21;
 
 export interface ScrapedImage {
   url: string;
@@ -2954,6 +2965,7 @@ export interface ScrapeRequestPayload {
   discoverLlmsTxt?: unknown;
   redactPii?: unknown;
   query?: unknown;
+  jsonFilter?: unknown;
   headers?: unknown;
   renderMode?: unknown;
   waitForMs?: unknown;
@@ -5025,12 +5037,17 @@ export async function executeScrapeCall(params: {
   );
   if (agentFormats.length === 0) agentFormats.push('markdown');
 
-  const renderMode =
-    payload.renderMode === 'always' || payload.renderMode === 'auto' || payload.renderMode === 'off'
-      ? payload.renderMode
-      : stringFormats.has('screenshot')
-        ? 'always'
-        : undefined;
+  const rawRenderModeStr = typeof payload.renderMode === 'string' ? payload.renderMode.trim().toLowerCase() : '';
+  const renderMode: 'always' | 'auto' | 'off' | undefined =
+    rawRenderModeStr === 'always' || rawRenderModeStr === 'browser'
+      ? 'always'
+      : rawRenderModeStr === 'auto' || rawRenderModeStr === 'off'
+        ? rawRenderModeStr
+        : stringFormats.has('screenshot')
+          ? 'always'
+          : undefined;
+  const effectiveRenderMode: 'always' | 'auto' | 'off' = renderMode ?? 'auto';
+  const jsonFilterStr = typeof payload.jsonFilter === 'string' ? payload.jsonFilter.trim() : '';
 
   const fetchCall = {
     maxSeconds: 110,
@@ -5070,6 +5087,146 @@ export async function executeScrapeCall(params: {
       ? payload.collectionId.trim()
       : undefined;
   const retentionMode: ArtifactRetention | undefined = env.ARTIFACTS && env.META ? 'stored' : env.ARTIFACTS ? 'transient' : undefined;
+
+  const htmlFragToMd = (frag: string, fragBase?: string) => {
+    const sub = extractHtmlDocument(frag, {
+      baseUrl: fragBase,
+      onlyMainContent: false,
+      includeImages,
+    });
+    return { markdown: sub.markdown, links: sub.links };
+  };
+
+  // Pre-fetch ATS API adapters (`P1` Ashby, `P2` Workday CXS `GET`/`POST`, Greenhouse, Lever) — runs even when
+  // `renderMode: "browser"` / `"always"` is passed so client-hydrated ATS boards always resolve cleanly via their official APIs.
+  const canUseAtsAdapter =
+    !stringFormats.has('html') &&
+    !stringFormats.has('rawHtml') &&
+    !stringFormats.has('screenshot') &&
+    !stringFormats.has('branding') &&
+    !jsonSchemaSpec;
+  const atsSpec = canUseAtsAdapter ? resolveAtsPreFetchSpec(normalizedUrl) : null;
+  if (atsSpec) {
+    try {
+      const atsRes = await executeHubFetch(
+        target,
+        JSON.stringify({
+          maxSeconds: 30,
+          options: { includeBody: true, respectRobots: true },
+          requests: [
+            {
+              id: `ats-${atsSpec.id}`,
+              url: atsSpec.fetchUrl,
+              method: atsSpec.method,
+              ...(atsSpec.requestBody ? { requestBody: atsSpec.requestBody } : {}),
+              ...(atsSpec.contentType ? { contentType: atsSpec.contentType } : {}),
+              kind: atsSpec.kind,
+              accept: atsSpec.accept,
+            },
+          ],
+        }),
+        site,
+        `${source}:ats:${atsSpec.id}`,
+        retentionMode,
+        true,
+        collectionId,
+      );
+      if (atsRes.status === 200) {
+        const atsParsed = JSON.parse(atsRes.bodyText) as { results?: Array<Record<string, unknown>> };
+        const atsItem = atsParsed.results?.[0];
+        const atsBody = typeof atsItem?.body === 'string' && atsItem.bodyEncoding !== 'base64' ? atsItem.body : '';
+        if (atsItem?.outcome === 'ok' && atsBody.trim().length > 0) {
+          const filteredBoard =
+            jsonFilterStr && atsSpec.id.endsWith('-board')
+              ? chunkJsonRecords({
+                  rawBody: atsBody,
+                  contentType: 'application/json',
+                  url: normalizedUrl,
+                  jsonFilter: jsonFilterStr,
+                  htmlToMd: htmlFragToMd,
+                })
+              : null;
+          const formatted = atsSpec.format(atsBody, normalizedUrl, htmlFragToMd);
+          if (filteredBoard || (formatted && formatted.markdown.trim().length > 0)) {
+            const rawAtsMd = filteredBoard ? filteredBoard.markdown : formatted!.markdown;
+            const cleanAtsMd = redactPii ? redactPiiText(rawAtsMd) : rawAtsMd;
+            const atsShapedFull = finalizeScrapedMarkdown(cleanAtsMd, {
+              isPdf: false,
+              includeImages,
+              baseUrl: normalizedUrl,
+            });
+            const atsFocused = applyQueryFocus(atsShapedFull.markdown);
+            const atsShaped =
+              atsFocused.queryFiltered || maxChars !== undefined
+                ? finalizeScrapedMarkdown(atsFocused.markdown, {
+                    isPdf: false,
+                    includeImages,
+                    maxChars,
+                    baseUrl: normalizedUrl,
+                  })
+                : atsShapedFull;
+            const atsArt = atsItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+            let atsMdArtifactId: string | undefined;
+            if (atsShaped.truncated && env.ARTIFACTS && atsShapedFull.markdown) {
+              const mdSha = await sha256HexString(atsShapedFull.markdown);
+              await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), atsShapedFull.markdown, {
+                httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+              }).catch(() => undefined);
+              atsMdArtifactId = `md:${mdSha}`;
+            }
+            const atsTitle = filteredBoard ? filteredBoard.title : formatted!.title;
+            return {
+              status: 200,
+              via: atsRes.via,
+              body: {
+                ok: true,
+                cached: false,
+                pipelineVersion: SCRAPE_PIPELINE_VERSION,
+                url: normalizedUrl,
+                finalUrl: normalizedUrl,
+                status: atsItem.status ?? 200,
+                via: atsRes.via,
+                extractorId: atsSpec.id,
+                ...(atsArt?.contentSha256 ? { contentSha256: atsArt.contentSha256 } : {}),
+                ...(atsArt?.blobSha256 ? { artifactId: atsArt.blobSha256 } : {}),
+                ...(atsMdArtifactId ? { markdownArtifactId: atsMdArtifactId } : {}),
+                ...(formatted?.jobPosting ? { jobPosting: formatted.jobPosting } : {}),
+                ...(formatted?.jobs && !filteredBoard ? { jobs: formatted.jobs } : {}),
+                ...(filteredBoard
+                  ? {
+                      chunks: filteredBoard.chunks,
+                      recordCount: filteredBoard.matchedRecords,
+                      totalRecords: filteredBoard.totalRecords,
+                    }
+                  : {}),
+                ...(stringFormats.has('markdown') ? { markdown: atsShaped.markdown } : {}),
+                ...(stringFormats.has('text') ? { text: atsShaped.markdown } : {}),
+                ...(stringFormats.has('links') && formatted?.links ? { links: formatted.links } : {}),
+                ...(atsFocused.queryFiltered ? { queryFiltered: true, chunks: atsFocused.chunks } : {}),
+                ...(atsShaped.truncated
+                  ? {
+                      truncated: true,
+                      totalChars: atsShaped.totalChars,
+                      nextOffset: atsShaped.nextOffset ?? atsShaped.markdown.length,
+                    }
+                  : {}),
+                metadata: {
+                  title: atsTitle,
+                  ...(formatted?.description ? { description: formatted.description } : {}),
+                  ...(formatted?.publishedTime ? { publishedTime: formatted.publishedTime } : {}),
+                  wordCount: countTextWords(atsShapedFull.markdown),
+                  alternateMarkdownUrl: atsSpec.fetchUrl,
+                  contentType: atsItem.contentType ?? atsSpec.accept,
+                },
+              },
+            };
+          }
+        }
+      }
+    } catch {
+      // Fall through cleanly if the ATS API endpoint fails or is unreachable.
+    }
+  }
 
   // Single-hop GitHub `/blob/<ref>/<path>` raw upgrade: fetch `raw.githubusercontent.com` directly (~2 KB) instead of
   // downloading 350 KB `github.com` HTML first (and avoiding `github.com` `/*/blob/` non-default branch robots blocks).
@@ -5497,10 +5654,11 @@ export async function executeScrapeCall(params: {
     };
   }
 
-  const parsedReply = JSON.parse(fetchRes.bodyText) as {
+  let fetchResUsed = fetchRes;
+  const parsedReply = JSON.parse(fetchResUsed.bodyText) as {
     results?: Array<Record<string, unknown>>;
   };
-  const item = parsedReply.results?.[0] ?? {};
+  let item: Record<string, unknown> = parsedReply.results?.[0] ?? {};
   const isPdfResponse =
     typeof item.pdfEngine === 'string' ||
     (typeof item.contentType === 'string' && item.contentType.toLowerCase().includes('application/pdf')) ||
@@ -5559,9 +5717,10 @@ export async function executeScrapeCall(params: {
     }
     const problemText = String(item.problem ?? 'Origin scrape did not return HTTP 2xx');
     const robotsHint = /robots\.txt disallowed/i.test(problemText) ? buildRobotsAlternativeHint(normalizedUrl) : undefined;
+    const blockedInfo = buildBlockedInfo(normalizedUrl, item.outcome, problemText, item.status);
     return {
-      status: item.status === 429 ? 429 : 422,
-      via: fetchRes.via,
+      status: item.status === 429 ? 429 : item.outcome === 'challenge' ? 403 : 422,
+      via: fetchResUsed.via,
       body: {
         ok: false,
         url: normalizedUrl,
@@ -5569,12 +5728,131 @@ export async function executeScrapeCall(params: {
         status: item.status ?? 0,
         problem: problemText,
         ...(robotsHint ? { hint: robotsHint } : {}),
+        ...(blockedInfo ? { blocked: blockedInfo } : {}),
       },
     };
   }
 
-  const rawBodyStr = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
-  const finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+  let rawBodyStr = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
+  let finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+  let renderedViaOut: 'browser' | 'browser-auto' | undefined =
+    renderMode === 'always' ? 'browser' : item.rendered === true ? 'browser-auto' : undefined;
+
+  // P2: Workday `{"widget":"redirect","url":"/Workday","externalSpa":true}` stub rescue -> CXS API or browser follow.
+  const wdStub = !isPdfResponse && rawBodyStr ? detectWorkdayRedirectStub(rawBodyStr, finalUrl) : null;
+  if (wdStub) {
+    const stubAts = canUseAtsAdapter ? resolveAtsPreFetchSpec(wdStub.redirectUrl) : null;
+    if (stubAts) {
+      try {
+        const stubRes = await executeHubFetch(
+          target,
+          JSON.stringify({
+            maxSeconds: 30,
+            options: { includeBody: true, respectRobots: true },
+            requests: [
+              {
+                id: `ats-${stubAts.id}`,
+                url: stubAts.fetchUrl,
+                method: stubAts.method,
+                ...(stubAts.requestBody ? { requestBody: stubAts.requestBody } : {}),
+                ...(stubAts.contentType ? { contentType: stubAts.contentType } : {}),
+                kind: stubAts.kind,
+                accept: stubAts.accept,
+              },
+            ],
+          }),
+          site,
+          `${source}:workday-stub:${stubAts.id}`,
+          retentionMode,
+          true,
+          collectionId,
+        );
+        if (stubRes.status === 200) {
+          const stubParsed = JSON.parse(stubRes.bodyText) as { results?: Array<Record<string, unknown>> };
+          const stubItem = stubParsed.results?.[0];
+          const stubBody = typeof stubItem?.body === 'string' && stubItem.bodyEncoding !== 'base64' ? stubItem.body : '';
+          const stubFormatted = stubItem?.outcome === 'ok' && stubBody ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd) : null;
+          if (stubFormatted && stubFormatted.markdown.trim().length > 0) {
+            const stubRedirect = analyzeUrlRedirect(normalizedUrl, wdStub.redirectUrl);
+            const cleanStubMd = redactPii ? redactPiiText(stubFormatted.markdown) : stubFormatted.markdown;
+            const stubShaped = finalizeScrapedMarkdown(cleanStubMd, { isPdf: false, includeImages, maxChars, baseUrl: wdStub.redirectUrl });
+            return {
+              status: 200,
+              via: stubRes.via,
+              body: {
+                ok: true,
+                cached: false,
+                pipelineVersion: SCRAPE_PIPELINE_VERSION,
+                url: normalizedUrl,
+                finalUrl: wdStub.redirectUrl,
+                ...(stubRedirect.redirected ? stubRedirect : {}),
+                status: stubItem?.status ?? 200,
+                via: stubRes.via,
+                extractorId: stubAts.id,
+                ...(stubFormatted.jobPosting ? { jobPosting: stubFormatted.jobPosting } : {}),
+                ...(stubFormatted.jobs ? { jobs: stubFormatted.jobs } : {}),
+                ...(stringFormats.has('markdown') ? { markdown: stubShaped.markdown } : {}),
+                ...(stringFormats.has('text') ? { text: stubShaped.markdown } : {}),
+                ...(stringFormats.has('links') && stubFormatted.links ? { links: stubFormatted.links } : {}),
+                metadata: {
+                  title: stubFormatted.title,
+                  wordCount: countTextWords(stubShaped.markdown),
+                  alternateMarkdownUrl: stubAts.fetchUrl,
+                  contentType: 'application/json',
+                },
+              },
+            };
+          }
+        }
+      } catch {
+        // Fall back to browser follow below if CXS stub resolution fails.
+      }
+    }
+    if (effectiveRenderMode !== 'off' && target !== 'container') {
+      try {
+        const wdBrowserRes = await executeHubFetch(
+          'agent',
+          JSON.stringify({
+            maxSeconds: 45,
+            options: { includeBody: true, respectRobots: true, maxBytes: 16 * 1024 * 1024, timeoutMs: 40_000 },
+            requests: [
+              {
+                id: 'wd-stub-render-1',
+                url: wdStub.redirectUrl,
+                kind: 'render',
+                renderMode: 'always',
+                formats: agentFormats,
+                onlyMainContent,
+                waitSelector: '[data-automation-id="jobTitle"], [data-automation-id="jobFoundText"]',
+                waitForMs: 2_200,
+              },
+            ],
+          }),
+          site,
+          `${source}:workday-stub-render`,
+          retentionMode,
+          true,
+          collectionId,
+        );
+        if (wdBrowserRes.status === 200) {
+          const wdBrowserParsed = JSON.parse(wdBrowserRes.bodyText) as { results?: Array<Record<string, unknown>> };
+          const wdBrowserItem = wdBrowserParsed.results?.[0];
+          const wdBrowserBody =
+            typeof wdBrowserItem?.body === 'string' && wdBrowserItem.bodyEncoding !== 'base64' ? wdBrowserItem.body : '';
+          if (wdBrowserItem?.outcome === 'ok' && wdBrowserBody) {
+            fetchResUsed = wdBrowserRes;
+            item = wdBrowserItem;
+            rawBodyStr = wdBrowserBody;
+            finalUrl = typeof wdBrowserItem.finalUrl === 'string' && wdBrowserItem.finalUrl ? wdBrowserItem.finalUrl : wdStub.redirectUrl;
+            renderedViaOut = 'browser-auto';
+          }
+        }
+      } catch {
+        // Keep original payload if no browser agent is available.
+      }
+    }
+  }
+
   const binaryScrapeProblem = detectUnsupportedBinaryPayload({
     rawBody: rawBodyStr,
     contentType: item.contentType,
@@ -5585,7 +5863,7 @@ export async function executeScrapeCall(params: {
   if (binaryScrapeProblem) {
     return {
       status: 422,
-      via: fetchRes.via,
+      via: fetchResUsed.via,
       body: {
         ok: false,
         url: normalizedUrl,
@@ -5596,13 +5874,13 @@ export async function executeScrapeCall(params: {
       },
     };
   }
-  const isHtmlBody = Boolean(
+  let isHtmlBody = Boolean(
     rawBodyStr &&
       !isPdfResponse &&
       ((typeof item.contentType === 'string' && item.contentType.toLowerCase().includes('html')) ||
         /^\s*<!doctype\s+html|^\s*<html|<(head|body|main|article)\b/i.test(rawBodyStr)),
   );
-  const extracted = isHtmlBody
+  let extracted = isHtmlBody
     ? extractHtmlDocument(rawBodyStr, {
         baseUrl: finalUrl,
         onlyMainContent,
@@ -5612,6 +5890,75 @@ export async function executeScrapeCall(params: {
         ...(excludeTags.length > 0 ? { excludeTags } : {}),
       })
     : undefined;
+
+  // P3: Automatic browser switch when a `<script>`-bearing HTML page yields < 80 words or > 60% nav/filter-only lines.
+  if (
+    isHtmlBody &&
+    effectiveRenderMode === 'auto' &&
+    item.rendered !== true &&
+    target !== 'container' &&
+    isThinScriptedPage(rawBodyStr, extracted?.markdown ?? '')
+  ) {
+    try {
+      const autoBrowserRes = await executeHubFetch(
+        'agent',
+        JSON.stringify({
+          maxSeconds: 45,
+          options: { includeBody: true, respectRobots: true, maxBytes: 16 * 1024 * 1024, timeoutMs: 40_000 },
+          requests: [
+            {
+              id: 'auto-render-1',
+              url: finalUrl,
+              kind: 'render',
+              renderMode: 'always',
+              formats: agentFormats,
+              onlyMainContent,
+              redactPii,
+              waitForMs:
+                typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
+                  ? Math.min(15_000, Math.max(0, Math.floor(payload.waitForMs)))
+                  : 1_800,
+              ...(typeof payload.waitSelector === 'string' && payload.waitSelector.trim()
+                ? { waitSelector: payload.waitSelector.trim().slice(0, 200) }
+                : {}),
+            },
+          ],
+        }),
+        site,
+        `${source}:browser-auto`,
+        retentionMode,
+        true,
+        collectionId,
+      );
+      if (autoBrowserRes.status === 200) {
+        const autoParsed = JSON.parse(autoBrowserRes.bodyText) as { results?: Array<Record<string, unknown>> };
+        const autoItem = autoParsed.results?.[0];
+        const autoHtml = typeof autoItem?.body === 'string' && autoItem.bodyEncoding !== 'base64' ? autoItem.body : '';
+        if (autoItem?.outcome === 'ok' && autoHtml) {
+          const autoFinalUrl = typeof autoItem.finalUrl === 'string' && autoItem.finalUrl ? autoItem.finalUrl : finalUrl;
+          const autoExtracted = extractHtmlDocument(autoHtml, {
+            baseUrl: autoFinalUrl,
+            onlyMainContent,
+            redactPii,
+            includeImages,
+            ...(includeTags.length > 0 ? { includeTags } : {}),
+            ...(excludeTags.length > 0 ? { excludeTags } : {}),
+          });
+          if (countTextWords(autoExtracted.markdown) > countTextWords(extracted?.markdown ?? '')) {
+            fetchResUsed = autoBrowserRes;
+            item = autoItem;
+            rawBodyStr = autoHtml;
+            finalUrl = autoFinalUrl;
+            isHtmlBody = true;
+            extracted = autoExtracted;
+            renderedViaOut = 'browser-auto';
+          }
+        }
+      }
+    } catch {
+      // Gracefully keep static HTML extraction when no `browser-v1` agent is connected.
+    }
+  }
 
   let alternateMarkdownUrl: string | undefined;
   let alternateMarkdownBody: string | undefined;
@@ -5720,6 +6067,30 @@ export async function executeScrapeCall(params: {
     !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted && !icsFormatted && !feedFormatted
       ? tryParseJsonPayloadForScrape(rawBodyStr, item.contentType, finalUrl)
       : null;
+  const isNotebookOrOpenApiJson = Boolean(
+    jsonFormatted?.parsed &&
+      typeof jsonFormatted.parsed === 'object' &&
+      !Array.isArray(jsonFormatted.parsed) &&
+      ('openapi' in (jsonFormatted.parsed as Record<string, unknown>) ||
+        'swagger' in (jsonFormatted.parsed as Record<string, unknown>) ||
+        'nbformat' in (jsonFormatted.parsed as Record<string, unknown>)),
+  );
+  const jsonRecordsFormatted =
+    !isHtmlBody &&
+    !isPdfResponse &&
+    !alternateMarkdownBody &&
+    !vcardFormatted &&
+    !icsFormatted &&
+    !feedFormatted &&
+    !isNotebookOrOpenApiJson
+      ? chunkJsonRecords({
+          rawBody: rawBodyStr,
+          contentType: item.contentType,
+          url: finalUrl,
+          ...(jsonFilterStr ? { jsonFilter: jsonFilterStr } : {}),
+          htmlToMd: htmlFragToMd,
+        })
+      : null;
   const csvFormatted =
     !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted && !icsFormatted && !feedFormatted && !jsonFormatted
       ? formatDelimitedTableToMarkdown(rawBodyStr, item.contentType, finalUrl)
@@ -5749,7 +6120,19 @@ export async function executeScrapeCall(params: {
       : null;
 
   const structuredTextFormatted =
-    vcardFormatted || icsFormatted || feedFormatted || jsonFormatted || csvFormatted || patchFormatted || sourceCodeFormatted;
+    vcardFormatted ||
+    icsFormatted ||
+    feedFormatted ||
+    jsonRecordsFormatted ||
+    jsonFormatted ||
+    csvFormatted ||
+    patchFormatted ||
+    sourceCodeFormatted;
+
+  // P4: Extract structured schema.org `JobPosting` JSON-LD on HTML pages and surface key facts (pay, workplace, location) at the top.
+  const htmlJobPosting: StructuredJobPosting | null = isHtmlBody
+    ? extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '')
+    : null;
 
   let markdown =
     alternateMarkdownBody ||
@@ -5758,19 +6141,30 @@ export async function executeScrapeCall(params: {
     (typeof item.markdown === 'string' && item.markdown) ||
     extracted?.markdown ||
     rawBodyStr;
+  if (htmlJobPosting && isHtmlBody && !alternateMarkdownBody) {
+    const jpHeader = formatJobPostingHeaderMarkdown(htmlJobPosting);
+    if (jpHeader && !/\*\*Compensation\*\*:/.test(markdown.slice(0, 400))) {
+      const topHeadingMatch = /^(#\s+[^\n]+)\n+([\s\S]*)$/.exec(markdown.trim());
+      markdown = topHeadingMatch
+        ? `${topHeadingMatch[1]}\n\n${jpHeader}\n\n${topHeadingMatch[2]}`
+        : `# ${htmlJobPosting.title}\n\n${jpHeader}\n\n${markdown}`;
+    }
+  }
   let textOut =
     alternateMarkdownBody ||
     feedFormatted?.markdown ||
     vcardFormatted?.markdown ||
     icsFormatted?.markdown ||
+    jsonRecordsFormatted?.markdown ||
     (jsonFormatted || csvFormatted || patchFormatted || sourceCodeFormatted ? rawBodyStr : undefined) ||
     (isHtmlBody ? extracted?.text : undefined) ||
     (typeof item.text === 'string' && item.text) ||
     extracted?.text ||
     '';
-  let viaOut = fetchRes.via;
+  let viaOut = fetchResUsed.via;
   let pdfEngineOut = typeof item.pdfEngine === 'string' ? item.pdfEngine : undefined;
   let ocrReportOut: PdfOcrContainerReply['ocr'] | undefined;
+  let contentSourceOut: 'meta-description' | undefined;
 
   // Automatic PDF OCR fallback when Poppler `pdftotext` returns empty / scanned-image output (<100 non-whitespace chars).
   if (ocrMode === 'auto' && hasPdfOcr && isPdfResponse && markdown.replace(/\s+/g, '').length < 100) {
@@ -5799,15 +6193,59 @@ export async function executeScrapeCall(params: {
     markdown = redactPiiText(markdown);
     textOut = redactPiiText(textOut);
   }
-  const fullShaped = finalizeScrapedMarkdown(markdown, {
+  let fullShaped = finalizeScrapedMarkdown(markdown, {
     isPdf: isPdfResponse,
     includeImages,
     maxChars: undefined,
     baseUrl: finalUrl,
   });
-  const rawCleanMarkdown = fullShaped.markdown;
+  let rawCleanMarkdown = fullShaped.markdown;
   const mdAssets = !isHtmlBody && !isPdfResponse ? extractMarkdownLinksAndImages(rawCleanMarkdown, finalUrl, includeImages) : undefined;
-  const focused = applyQueryFocus(rawCleanMarkdown);
+
+  // P1: Short-term / general fallback — when extracted HTML Markdown has < 50 words and `<meta name="description">` / `og:description`
+  // holds substantive text (>= 40 words and > 2x the extracted body), rescue `metadata.description` with `contentSource: "meta-description"`.
+  const prelimDescription = extracted?.description || (typeof item.description === 'string' && item.description ? decodeHtmlEntities(item.description) : undefined);
+  const prelimTitle = extracted?.title || (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined);
+  const bodyWordsBeforeRescue = countTextWords(rawCleanMarkdown);
+  const metaDescWords = prelimDescription ? countTextWords(prelimDescription) : 0;
+  if (
+    isHtmlBody &&
+    !isPdfResponse &&
+    bodyWordsBeforeRescue < 50 &&
+    prelimDescription &&
+    metaDescWords >= 18 &&
+    metaDescWords > bodyWordsBeforeRescue * 2
+  ) {
+    const cleanDesc = redactPii ? redactPiiText(prelimDescription) : prelimDescription;
+    const cleanTitle = prelimTitle ? (redactPii ? redactPiiText(prelimTitle) : prelimTitle) : '';
+    const rescuedMd = [cleanTitle ? `# ${cleanTitle}` : '', cleanDesc].filter(Boolean).join('\n\n');
+    fullShaped = finalizeScrapedMarkdown(rescuedMd, {
+      isPdf: false,
+      includeImages,
+      maxChars: undefined,
+      baseUrl: finalUrl,
+    });
+    rawCleanMarkdown = fullShaped.markdown;
+    textOut = cleanDesc;
+    contentSourceOut = 'meta-description';
+  }
+
+  // P5: When `query` is combined with a JSON record array, rank across the per-record chunks directly so fields never bleed across records!
+  const focused =
+    jsonRecordsFormatted && focusQuery
+      ? (() => {
+          const ranked = rankChunksInMemory(jsonRecordsFormatted.chunks, focusQuery, 5);
+          if (ranked.length === 0) return { markdown: rawCleanMarkdown, chunks: [], queryFiltered: false };
+          return {
+            markdown: [...ranked]
+              .sort((a, b) => a.ordinal - b.ordinal)
+              .map((c) => c.text)
+              .join('\n\n---\n\n'),
+            chunks: ranked,
+            queryFiltered: true,
+          };
+        })()
+      : applyQueryFocus(rawCleanMarkdown);
   const shaped =
     focused.queryFiltered || maxChars !== undefined
       ? finalizeScrapedMarkdown(focused.markdown, {
@@ -5942,7 +6380,7 @@ export async function executeScrapeCall(params: {
   const art = item.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
   let markdownArtifactId: string | undefined;
   if (shaped.truncated && env.ARTIFACTS && rawCleanMarkdown) {
-    const usesUpgradedBody = Boolean(alternateMarkdownBody || ocrReportOut || structuredTextFormatted);
+    const usesUpgradedBody = Boolean(alternateMarkdownBody || ocrReportOut || structuredTextFormatted || contentSourceOut || htmlJobPosting);
     const mdContentSha =
       !usesUpgradedBody && art?.contentSha256 && isValidSha256Hex(art.contentSha256)
         ? art.contentSha256
@@ -5957,20 +6395,34 @@ export async function executeScrapeCall(params: {
     }
   }
 
+  const redirectAnalysis = analyzeUrlRedirect(normalizedUrl, finalUrl);
+
   const out: Record<string, unknown> = {
     ok: true,
     cached: false,
     pipelineVersion: SCRAPE_PIPELINE_VERSION,
     url: normalizedUrl,
     finalUrl,
+    ...(redirectAnalysis.redirected ? redirectAnalysis : {}),
     status: item.status ?? 200,
     via: viaOut,
+    ...(contentSourceOut ? { contentSource: contentSourceOut } : {}),
+    ...(renderedViaOut ? { renderedVia: renderedViaOut } : {}),
+    ...(htmlJobPosting ? { jobPosting: htmlJobPosting } : {}),
     ...(art?.contentSha256 ? { contentSha256: art.contentSha256 } : {}),
     ...(art?.blobSha256 ? { artifactId: art.blobSha256 } : {}),
     ...(markdownArtifactId ? { markdownArtifactId } : {}),
     ...(stringFormats.has('markdown') ? { markdown } : {}),
     ...(stringFormats.has('text') ? { text: textOut } : {}),
-    ...(focused.queryFiltered ? { queryFiltered: true, chunks: focused.chunks } : {}),
+    ...(focused.queryFiltered
+      ? { queryFiltered: true, chunks: focused.chunks }
+      : jsonRecordsFormatted
+        ? {
+            chunks: jsonRecordsFormatted.chunks,
+            recordCount: jsonRecordsFormatted.matchedRecords,
+            totalRecords: jsonRecordsFormatted.totalRecords,
+          }
+        : {}),
     ...(shaped.truncated
       ? {
           truncated: true,
@@ -6009,7 +6461,7 @@ export async function executeScrapeCall(params: {
       : {}),
     ...(structuredJsonOut ? { json: structuredJsonOut } : {}),
     ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64 ? { screenshotBase64: item.screenshotBase64 } : {}),
-    ...(item.rendered === true ? { rendered: true } : {}),
+    ...(item.rendered === true || renderedViaOut !== undefined ? { rendered: true } : {}),
     ...(pdfEngineOut ? { pdfEngine: pdfEngineOut } : {}),
     ...(ocrReportOut ? { ocr: ocrReportOut } : {}),
     ...(stringFormats.has('changes') ? { changes: computeMarkdownChanges(prevMarkdownForChanges, rawCleanMarkdown) } : {}),
@@ -6018,9 +6470,13 @@ export async function executeScrapeCall(params: {
       title: resolvedTitle,
       description: resolvedDescription,
       ...(extracted?.author ? { author: extracted.author } : {}),
-      ...(extracted?.publishedTime ? { publishedTime: extracted.publishedTime } : {}),
+      ...(extracted?.publishedTime || htmlJobPosting?.datePosted
+        ? { publishedTime: extracted?.publishedTime ?? htmlJobPosting?.datePosted }
+        : {}),
       ...(extracted?.modifiedTime ? { modifiedTime: extracted.modifiedTime } : {}),
-      ...(extracted?.siteName ? { siteName: extracted.siteName } : {}),
+      ...(extracted?.siteName || htmlJobPosting?.hiringOrganization
+        ? { siteName: extracted?.siteName ?? htmlJobPosting?.hiringOrganization }
+        : {}),
       ...(rawCleanMarkdown ? { wordCount: countTextWords(rawCleanMarkdown) } : {}),
       language: extracted?.language,
       favicon: (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon,
@@ -6322,6 +6778,19 @@ export async function executeInteractCall(params: {
                 : describeAction(a, idx, 'skipped'),
           )
         : undefined;
+
+    // P8 & P10: Surface any partial rendered DOM/Markdown/transcript captured before the failed action + structured `blocked` guidance!
+    const partialHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
+    const partialFinalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+    const partialDoc = partialHtml ? extractHtmlDocument(partialHtml, { baseUrl: partialFinalUrl || undefined, onlyMainContent: true }) : undefined;
+    const partialTranscript = partialHtml ? extractYouTubeTranscriptFromHtml(partialHtml) : '';
+    const partialMd = partialDoc?.markdown ? decodeMarkdownEntities(partialDoc.markdown).trim() : '';
+    const errSiteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
+    const errActualSite = errSiteMatch?.[1] ?? pinnedSite;
+    const errAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
+    const errPublicSid = errAgentSid && errActualSite ? `${errActualSite}.${errAgentSid}` : errAgentSid;
+    const blockedInfo = buildBlockedInfo(partialFinalUrl || normalizedUrl, item.outcome, prob, item.status);
+
     return {
       status: item.outcome === 'challenge' ? 403 : 422,
       via: fetchRes.via,
@@ -6330,7 +6799,14 @@ export async function executeInteractCall(params: {
         outcome: item.outcome ?? 'error',
         status: item.status ?? 0,
         problem: prob,
+        ...(partialFinalUrl ? { finalUrl: partialFinalUrl } : {}),
+        ...(errPublicSid ? { sessionId: errPublicSid } : {}),
         ...(actionResults ? { actions: actionResults } : {}),
+        ...(partialMd && formats.includes('markdown') ? { markdown: partialMd, partial: true } : {}),
+        ...(partialTranscript && formats.includes('transcript') ? { transcript: partialTranscript, partial: true } : {}),
+        ...(partialHtml && (formats.includes('html') || formats.includes('rawHtml')) ? { html: partialHtml } : {}),
+        ...(partialDoc?.title ? { metadata: { title: partialDoc.title } } : {}),
+        ...(blockedInfo ? { blocked: blockedInfo } : {}),
       },
     };
   }
@@ -6342,6 +6818,7 @@ export async function executeInteractCall(params: {
 
   const rawHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
   const finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
+  const interactRedirect = normalizedUrl ? analyzeUrlRedirect(normalizedUrl, finalUrl) : { redirected: false };
   const wantMarkdown = formats.includes('markdown');
   const requestedTranscript = formats.includes('transcript');
   const extracted = rawHtml ? extractHtmlDocument(rawHtml, { baseUrl: finalUrl || undefined, onlyMainContent: true }) : undefined;
@@ -6370,6 +6847,7 @@ export async function executeInteractCall(params: {
       ok: true,
       via: fetchRes.via,
       ...(finalUrl ? { finalUrl } : {}),
+      ...(interactRedirect.redirected ? interactRedirect : {}),
       status: item.status ?? 200,
       rendered: true,
       ...(publicSessionId ? { sessionId: publicSessionId } : {}),

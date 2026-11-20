@@ -12,7 +12,7 @@ metadata:
   namespace: edgefetch
   labels:
     app.kubernetes.io/name: edgefetch-agent
-    app.kubernetes.io/version: "2.2.0"
+    app.kubernetes.io/version: "2.3.0"
 spec:
   replicas: 2
   selector:

@@ -6,7 +6,7 @@
     "url": "https://github.com/bartrumb/edgefetch",
     "source": "github"
   },
-  "version": "2.2.0",
+  "version": "2.3.0",
   "packages": [
     {
       "registryType": "oci",

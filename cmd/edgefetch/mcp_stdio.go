@@ -452,37 +452,90 @@ func stdioToolResult(id any, text string, isErr bool) map[string]any {
 	}
 }
 
-// defaultMCPConfigPaths returns standard Claude Desktop and Cursor MCP config file locations for the current OS.
-func defaultMCPConfigPaths(goos, homeDir, appData string) []struct {
+type mcpClientTarget struct {
+	slug   string
 	client string
 	path   string
-} {
-	var out []struct {
-		client string
-		path   string
-	}
+	format string // "json" or "toml"
+}
+
+// allMCPClientTargets returns the 6 major AI coding/desktop harness config locations (`edgefetch init` / `install-mcp`).
+func allMCPClientTargets(goos, homeDir, appData string) []mcpClientTarget {
+	var out []mcpClientTarget
 	switch goos {
 	case "windows":
 		if appData != "" {
-			out = append(out, struct{ client, path string }{"Claude Desktop", filepath.Join(appData, "Claude", "claude_desktop_config.json")})
+			out = append(out, mcpClientTarget{"claude-desktop", "Claude Desktop", filepath.Join(appData, "Claude", "claude_desktop_config.json"), "json"})
 		}
 	case "darwin":
 		if homeDir != "" {
-			out = append(out, struct{ client, path string }{"Claude Desktop", filepath.Join(homeDir, "Library", "Application Support", "Claude", "claude_desktop_config.json")})
+			out = append(out, mcpClientTarget{"claude-desktop", "Claude Desktop", filepath.Join(homeDir, "Library", "Application Support", "Claude", "claude_desktop_config.json"), "json"})
 		}
 	default:
 		if homeDir != "" {
-			out = append(out, struct{ client, path string }{"Claude Desktop", filepath.Join(homeDir, ".config", "Claude", "claude_desktop_config.json")})
+			out = append(out, mcpClientTarget{"claude-desktop", "Claude Desktop", filepath.Join(homeDir, ".config", "Claude", "claude_desktop_config.json"), "json"})
 		}
 	}
 	if homeDir != "" {
-		out = append(out, struct{ client, path string }{"Cursor", filepath.Join(homeDir, ".cursor", "mcp.json")})
+		out = append(out,
+			mcpClientTarget{"cursor", "Cursor", filepath.Join(homeDir, ".cursor", "mcp.json"), "json"},
+			mcpClientTarget{"claude-code", "Claude Code", filepath.Join(homeDir, ".claude.json"), "json"},
+			mcpClientTarget{"windsurf", "Windsurf", filepath.Join(homeDir, ".codeium", "windsurf", "mcp_config.json"), "json"},
+			mcpClientTarget{"gemini", "Gemini CLI", filepath.Join(homeDir, ".gemini", "settings.json"), "json"},
+			mcpClientTarget{"codex", "Codex", filepath.Join(homeDir, ".codex", "config.toml"), "toml"},
+		)
 	}
 	return out
 }
 
+// defaultMCPConfigPaths preserves test compatibility while returning the primary JSON MCP targets.
+func defaultMCPConfigPaths(goos, homeDir, appData string) []struct {
+	client string
+	path   string
+} {
+	all := allMCPClientTargets(goos, homeDir, appData)
+	var out []struct {
+		client string
+		path   string
+	}
+	for _, t := range all {
+		if t.slug == "claude-desktop" || t.slug == "cursor" {
+			out = append(out, struct{ client, path string }{t.client, t.path})
+		}
+	}
+	return out
+}
+
+func upsertCodexTomlMCP(existing string, exePath string) string {
+	escapedExe := strings.ReplaceAll(exePath, `\`, `\\`)
+	block := fmt.Sprintf("[mcp_servers.edgefetch]\ncommand = %q\nargs = [\"mcp\"]\n", escapedExe)
+	// Strip any prior [mcp_servers.edgefetch] section cleanly before appending updated block
+	lines := strings.Split(strings.ReplaceAll(existing, "\r\n", "\n"), "\n")
+	var kept []string
+	skipping := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			if trimmed == "[mcp_servers.edgefetch]" {
+				skipping = true
+				continue
+			}
+			skipping = false
+		}
+		if !skipping {
+			kept = append(kept, line)
+		}
+	}
+	cleaned := strings.TrimRight(strings.Join(kept, "\n"), "\n")
+	if cleaned == "" {
+		return block
+	}
+	return cleaned + "\n\n" + block
+}
+
 func runInstallMCP(args []string, stdout, stderr io.Writer) int {
 	dryRun := hasFlag(args, "--dry-run")
+	agentFilter := strings.ToLower(strings.TrimSpace(flagValue(args, "--agent=")))
 	exePath := flagValue(args, "--exe=")
 	if exePath == "" {
 		resolved, err := os.Executable()
@@ -494,9 +547,34 @@ func runInstallMCP(args []string, stdout, stderr io.Writer) int {
 	}
 
 	homeDir, _ := os.UserHomeDir()
-	targets := defaultMCPConfigPaths(runtime.GOOS, homeDir, os.Getenv("APPDATA"))
+	allCandidates := allMCPClientTargets(runtime.GOOS, homeDir, os.Getenv("APPDATA"))
+	var targets []mcpClientTarget
+
 	if customTarget := flagValue(args, "--config="); customTarget != "" {
-		targets = []struct{ client, path string }{{"Custom", customTarget}}
+		fmtType := "json"
+		if strings.HasSuffix(strings.ToLower(customTarget), ".toml") {
+			fmtType = "toml"
+		}
+		targets = []mcpClientTarget{{"custom", "Custom", customTarget, fmtType}}
+	} else {
+		for _, c := range allCandidates {
+			if agentFilter == "all" {
+				targets = append(targets, c)
+				continue
+			}
+			if agentFilter != "" {
+				if c.slug == agentFilter || strings.Contains(strings.ToLower(c.client), agentFilter) {
+					targets = append(targets, c)
+				}
+				continue
+			}
+			// Auto-detect installed AI harnesses (parent dir or config file exists), plus always include Claude Desktop & Cursor
+			_, fileErr := os.Stat(c.path)
+			_, dirErr := os.Stat(filepath.Dir(c.path))
+			if c.slug == "claude-desktop" || c.slug == "cursor" || fileErr == nil || (c.slug != "claude-code" && dirErr == nil) {
+				targets = append(targets, c)
+			}
+		}
 	}
 
 	entry := map[string]any{
@@ -505,38 +583,111 @@ func runInstallMCP(args []string, stdout, stderr io.Writer) int {
 	}
 
 	for _, t := range targets {
-		root := map[string]any{}
-		if raw, err := os.ReadFile(t.path); err == nil && len(bytes.TrimSpace(raw)) > 0 {
-			if jErr := json.Unmarshal(raw, &root); jErr != nil {
-				_, _ = fmt.Fprintf(stderr, "skipping %s (%s has invalid JSON: %v)\n", t.client, t.path, jErr)
-				continue
-			}
-		}
-		servers, ok := root["mcpServers"].(map[string]any)
-		if !ok || servers == nil {
-			servers = map[string]any{}
-		}
-		servers["edgefetch"] = entry
-		root["mcpServers"] = servers
+		var outBytes []byte
+		existingBytes, readErr := os.ReadFile(t.path)
 
-		formatted, _ := json.MarshalIndent(root, "", "  ")
-		formatted = append(formatted, '\n')
+		if t.format == "toml" {
+			updated := upsertCodexTomlMCP(string(existingBytes), exePath)
+			outBytes = []byte(updated)
+		} else {
+			root := map[string]any{}
+			if readErr == nil && len(bytes.TrimSpace(existingBytes)) > 0 {
+				if jErr := json.Unmarshal(existingBytes, &root); jErr != nil {
+					_, _ = fmt.Fprintf(stderr, "skipping %s (%s has invalid JSON: %v)\n", t.client, t.path, jErr)
+					continue
+				}
+			}
+			servers, ok := root["mcpServers"].(map[string]any)
+			if !ok || servers == nil {
+				servers = map[string]any{}
+			}
+			servers["edgefetch"] = entry
+			root["mcpServers"] = servers
+
+			formatted, _ := json.MarshalIndent(root, "", "  ")
+			outBytes = append(formatted, '\n')
+		}
 
 		if dryRun {
-			_, _ = fmt.Fprintf(stdout, "# %s (%s)\n%s", t.client, t.path, string(formatted))
+			_, _ = fmt.Fprintf(stdout, "# %s (%s)\n%s", t.client, t.path, string(outBytes))
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(t.path), 0o755); err != nil {
 			_, _ = fmt.Fprintf(stderr, "mkdir %s: %v\n", filepath.Dir(t.path), err)
 			continue
 		}
-		if err := os.WriteFile(t.path, formatted, 0o600); err != nil {
+		// Save a .bak backup before modifying an existing harness config file
+		if readErr == nil && len(existingBytes) > 0 {
+			_ = os.WriteFile(t.path+".bak", existingBytes, 0o600)
+		}
+		if err := os.WriteFile(t.path, outBytes, 0o600); err != nil {
 			_, _ = fmt.Fprintf(stderr, "write %s: %v\n", t.path, err)
 			continue
 		}
 		_, _ = fmt.Fprintf(stdout, "[OK] Configured %s -> %s\n", t.client, t.path)
 	}
 	return 0
+}
+
+// runServeMode starts a local loopback Firecrawl-compatible + EdgeFetch HTTP server (`edgefetch serve [--port=3002]`).
+// Unlike `firecrawl-local` (which disables private-network SSRF protection by default in local MCP mode), EdgeFetch
+// enforces public-only dial-time SSRF protection by default unless `--allow-private` is explicitly passed.
+func runServeMode(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	port := flagValue(args, "--port=")
+	if port == "" {
+		port = "3002"
+	}
+	allowPrivate := hasFlag(args, "--allow-private")
+	addr := "127.0.0.1:" + port
+	urlStr := "http://" + addr
+
+	allowFn := crawl.PublicHTTPS
+	transport := newCrawlTransport(60*time.Second, 2)
+	if allowPrivate {
+		allowFn = func(u *url.URL) error {
+			if u.Scheme != "https" && u.Scheme != "http" {
+				return fmt.Errorf("only http/https URLs permitted: %s", u.Redacted())
+			}
+			if u.User != nil {
+				return errors.New("URL with user info")
+			}
+			return nil
+		}
+		transport = newHubTransport()
+	}
+
+	log := slog.New(slog.NewJSONHandler(stdout, nil))
+	crawler := crawl.NewCrawler(transport, allowFn, crawl.DefaultUserAgent, log)
+	defer func() { _ = crawler.Close() }()
+
+	goHub := hub.NewServer(hub.Config{
+		FallbackCrawler: crawler,
+		Allow:           allowFn,
+		Logger:          log,
+	})
+	defer func() { _ = goHub.Close() }()
+
+	srv := newHTTPServer(addr, goHub)
+	srv.ReadTimeout = 0
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, _ = fmt.Fprintf(stdout, "EdgeFetch local API server listening on %s (/v1/scrape, /v2/scrape, /v2/map, /mcp; public-only SSRF=%v)\n", urlStr, !allowPrivate)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		_, _ = fmt.Fprintf(stderr, "serve failed: %v\n", err)
+		return 1
+	case <-ctx.Done():
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+		return 0
+	}
 }
 
 func runDesktopMode(ctx context.Context, args []string, stdout, stderr io.Writer) int {

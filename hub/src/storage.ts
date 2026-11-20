@@ -6,6 +6,7 @@
  * operating unchanged when `ARTIFACTS` / `META` / `SEARCH` / `INGEST` are unconfigured.
  */
 
+import type { LlmEnvBindings } from './llm';
 import { encodeBodyForWire } from './overflow';
 import { listConfiguredSpaFallbacks, type SpaFallbackEnv, type SpaFallbackProvider } from './spa-fallback';
 
@@ -19,7 +20,7 @@ export interface IngestWorkflowParams {
   via: string;
 }
 
-export interface OptionalStorageBindings extends SpaFallbackEnv {
+export interface OptionalStorageBindings extends SpaFallbackEnv, LlmEnvBindings {
   ARTIFACTS?: R2Bucket;
   META?: D1Database;
   SEARCH?: D1Database;

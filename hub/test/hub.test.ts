@@ -1506,7 +1506,7 @@ test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1
     });
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
-    assert.equal(mcpJson.result.tools.length, 12);
+    assert.equal(mcpJson.result.tools.length, 14);
   } finally {
     await started.close();
     rmSync(dataDir, { recursive: true, force: true });

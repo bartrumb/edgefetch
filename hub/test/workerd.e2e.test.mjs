@@ -945,6 +945,8 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         'interact',
         'read_artifact',
         'jobs',
+        'find_extractors',
+        'agent',
       ]);
 
       // V2-2: Verify RRF multi-provider search (Brave + SearXNG + FTS5) + HMAC-SHA256 webhook signing + SSRF webhook block!

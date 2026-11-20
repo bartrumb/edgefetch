@@ -60,6 +60,12 @@ type Request struct {
 	Query              string            `json:"query,omitempty"`
 	Headers            map[string]string `json:"headers,omitempty"`
 	RenderMode         string            `json:"renderMode,omitempty"` // "off" (default), "auto", "always"
+	Mobile             bool              `json:"mobile,omitempty"`
+	ViewportWidth      int               `json:"viewportWidth,omitempty"`
+	ViewportHeight     int               `json:"viewportHeight,omitempty"`
+	ScreenshotFullPage bool              `json:"screenshotFullPage,omitempty"`
+	ScreenshotQuality  int               `json:"screenshotQuality,omitempty"`
+	AcceptLanguage     string            `json:"acceptLanguage,omitempty"`
 	WaitForMs          int               `json:"waitForMs,omitempty"`
 	WaitSelector       string            `json:"waitSelector,omitempty"`
 	MaxPages           int               `json:"maxPages,omitempty"`
@@ -93,45 +99,49 @@ type ArtifactRef struct {
 
 // Result reports the outcome, headers of interest, phase timings, and optional body or R2 artifact of one `Request`.
 type Result struct {
-	ID               string                   `json:"id"`
-	URL              string                   `json:"url"`
-	Kind             classify.Kind            `json:"kind"`
-	Outcome          classify.Outcome         `json:"outcome"`
-	Problem          string                   `json:"problem,omitempty"`
-	Status           int                      `json:"status"`
-	ContentType      string                   `json:"contentType,omitempty"`
-	CfMitigated      string                   `json:"cfMitigated,omitempty"`
-	WAF              *classify.WAFMatch       `json:"waf,omitempty"`
-	ETag             string                   `json:"etag,omitempty"`
-	LastModified     string                   `json:"lastModified,omitempty"`
-	RetryAfter       string                   `json:"retryAfter,omitempty"`
-	RetryAfterMs     int64                    `json:"retryAfterMs,omitempty"`
-	Bytes            int                      `json:"bytes"`
-	Truncated        bool                     `json:"truncated,omitempty"`
-	BodyOmitted      bool                     `json:"bodyOmitted,omitempty"`
-	Attempts         int                      `json:"attempts"`
-	DurationMs       int64                    `json:"durationMs"`
-	Timing           Timing                   `json:"timing"`
-	Body             string                   `json:"body,omitempty"`
-	BodyEncoding     string                   `json:"bodyEncoding,omitempty"`
-	Artifact         *ArtifactRef             `json:"artifact,omitempty"`
-	ArtifactError    string                   `json:"artifactError,omitempty"`
-	FinalURL         string                   `json:"finalUrl,omitempty"`
-	Title            string                   `json:"title,omitempty"`
-	Description      string                   `json:"description,omitempty"`
-	Favicon          string                   `json:"favicon,omitempty"`
-	Markdown         string                   `json:"markdown,omitempty"`
-	Text             string                   `json:"text,omitempty"`
-	Links            []string                 `json:"links,omitempty"`
-	Images           []extract.ImageInfo      `json:"images,omitempty"`
-	Branding         *extract.BrandingProfile `json:"branding,omitempty"`
-	Llms             *extract.LlmsDiscovery   `json:"llms,omitempty"`
-	Rendered         bool                     `json:"rendered,omitempty"`
-	SessionID        string                   `json:"sessionId,omitempty"`
-	ScreenshotBase64 string                   `json:"screenshotBase64,omitempty"`
-	PDFEngine        string                   `json:"pdfEngine,omitempty"`
-	SHA256           string                   `json:"sha256,omitempty"`
-	BodyBase64       string                   `json:"bodyBase64,omitempty"`
+	ID                string                         `json:"id"`
+	URL               string                         `json:"url"`
+	Kind              classify.Kind                  `json:"kind"`
+	Outcome           classify.Outcome               `json:"outcome"`
+	Problem           string                         `json:"problem,omitempty"`
+	Status            int                            `json:"status"`
+	ContentType       string                         `json:"contentType,omitempty"`
+	CfMitigated       string                         `json:"cfMitigated,omitempty"`
+	WAF               *classify.WAFMatch             `json:"waf,omitempty"`
+	ETag              string                         `json:"etag,omitempty"`
+	LastModified      string                         `json:"lastModified,omitempty"`
+	RetryAfter        string                         `json:"retryAfter,omitempty"`
+	RetryAfterMs      int64                          `json:"retryAfterMs,omitempty"`
+	Bytes             int                            `json:"bytes"`
+	Truncated         bool                           `json:"truncated,omitempty"`
+	BodyOmitted       bool                           `json:"bodyOmitted,omitempty"`
+	Attempts          int                            `json:"attempts"`
+	DurationMs        int64                          `json:"durationMs"`
+	Timing            Timing                         `json:"timing"`
+	Body              string                         `json:"body,omitempty"`
+	BodyEncoding      string                         `json:"bodyEncoding,omitempty"`
+	Artifact          *ArtifactRef                   `json:"artifact,omitempty"`
+	ArtifactError     string                         `json:"artifactError,omitempty"`
+	FinalURL          string                         `json:"finalUrl,omitempty"`
+	Title             string                         `json:"title,omitempty"`
+	Description       string                         `json:"description,omitempty"`
+	Favicon           string                         `json:"favicon,omitempty"`
+	Markdown          string                         `json:"markdown,omitempty"`
+	Text              string                         `json:"text,omitempty"`
+	Links             []string                       `json:"links,omitempty"`
+	Images            []extract.ImageInfo            `json:"images,omitempty"`
+	Branding          *extract.BrandingProfile       `json:"branding,omitempty"`
+	Llms              *extract.LlmsDiscovery         `json:"llms,omitempty"`
+	Rendered          bool                           `json:"rendered,omitempty"`
+	SessionID         string                         `json:"sessionId,omitempty"`
+	ScreenshotBase64  string                         `json:"screenshotBase64,omitempty"`
+	ActionScreenshots []string                       `json:"actionScreenshots,omitempty"`
+	ActionScrapes     []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
+	JavascriptReturns []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
+	PDFBase64         string                         `json:"pdfBase64,omitempty"`
+	PDFEngine         string                         `json:"pdfEngine,omitempty"`
+	SHA256            string                         `json:"sha256,omitempty"`
+	BodyBase64        string                         `json:"bodyBase64,omitempty"`
 }
 
 // DecodeBody returns the exact raw response bytes for `r.Body`, decoding `"base64"` payloads losslessly when the origin

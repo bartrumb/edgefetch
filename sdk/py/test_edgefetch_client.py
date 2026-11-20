@@ -92,6 +92,23 @@ class TestEdgeFetchPythonSDK(unittest.TestCase):
         self.assertEqual(captured["url"], "https://hub.example.com/v1/hosts?limit=25")
         self.assertEqual(out["hosts"][0]["host"], "example.com")
 
+    def test_agent_and_batch_scrape_endpoints(self) -> None:
+        calls = []
+
+        def fake_opener(req: urllib.request.Request, _timeout: float) -> _FakeResp:
+            calls.append((req.get_method(), req.full_url, json.loads(req.data.decode("utf-8")) if req.data else None))
+            return _FakeResp({"ok": True, "id": "agt_123", "status": "completed", "creditsUsed": 0})
+
+        client = EdgeFetchClient(token="tok-123", base_url="https://hub.example.com", opener=fake_opener)
+        res = client.agent("Find open roles and SEC filings", zeroDataRetention=True, llm={"provider": "ollama"})
+        self.assertEqual(res["id"], "agt_123")
+        _ = client.get_agent_trace("agt_123")
+        _ = client.batch_scrape(["https://example.com/1", "https://example.com/2"], sync=True)
+        self.assertEqual(calls[0][1], "https://hub.example.com/v1/agent")
+        self.assertEqual(calls[0][2]["zeroDataRetention"], True)
+        self.assertEqual(calls[1][1], "https://hub.example.com/v1/agent/agt_123/trace")
+        self.assertEqual(calls[2][1], "https://hub.example.com/v1/batch/scrape")
+
 
 if __name__ == "__main__":
     unittest.main()

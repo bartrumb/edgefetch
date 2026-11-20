@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -40,10 +41,14 @@ func isOneShotCLI(args []string) bool {
 	case "version", "--version", "-v",
 		"doctor", "--doctor",
 		"scrape",
+		"map",
+		"crawl",
 		"mcp",
+		"init",
 		"install-mcp",
 		"install-service",
 		"keygen-bot-auth",
+		"serve",
 		"desktop",
 		"help", "--help", "-h":
 		return true
@@ -76,14 +81,20 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 		return runDoctor(args[1:], stdout, stderr, deps)
 	case "scrape":
 		return runScrapeCLI(ctx, args[1:], stdout, stderr, deps)
+	case "map":
+		return runMapCLI(ctx, args[1:], stdout, stderr, deps)
+	case "crawl":
+		return runCrawlCLI(ctx, args[1:], stdout, stderr, deps)
 	case "mcp":
 		return runMCPStdio(ctx, os.Stdin, stdout, stderr, deps)
-	case "install-mcp":
+	case "init", "install-mcp":
 		return runInstallMCP(args[1:], stdout, stderr)
 	case "install-service":
 		return runInstallService(args[1:], stdout, stderr)
 	case "keygen-bot-auth":
 		return runKeygenBotAuth(args[1:], stdout, stderr)
+	case "serve":
+		return runServeMode(ctx, args[1:], stdout, stderr)
 	case "desktop":
 		return runDesktopMode(ctx, args[1:], stdout, stderr)
 	default:
@@ -100,10 +111,13 @@ Usage:
   edgefetch --mode=agent                         Start outbound WebSocket worker (supports EDGEFETCH_HUB_URLS HA)
   edgefetch --mode=hub                           Start self-hosted Go WebSocket Hub + /v1/scrape + /mcp controller
   edgefetch --mode=hub,agent                     Hybrid mesh node: local standby Hub + outbound upstream Agent
+  edgefetch serve [--port=3002]                  Start local loopback /v1/* + /v2/* Firecrawl-compatible API server
   edgefetch desktop [--port=8787]                Start loopback Desktop MCP Launchpad & open browser (Win/macOS/Linux)
-  edgefetch mcp                                  Run local stdio MCP server (zero ports/tokens — Claude Desktop/Cursor)
-  edgefetch install-mcp [--dry-run]              Auto-configure EdgeFetch stdio MCP in Claude Desktop & Cursor
+  edgefetch mcp                                  Run local stdio MCP server (zero ports/tokens — Claude/Cursor/Codex)
+  edgefetch init [--agent=all] [--dry-run]       Auto-configure MCP in Claude Code, Claude Desktop, Cursor, Windsurf, Gemini & Codex
   edgefetch scrape [flags] <https://url>         Scrape one public HTTPS URL to clean Markdown (or --json)
+  edgefetch map [flags] <https://url>            Discover URLs across /llms.txt, /sitemap.xml & homepage links
+  edgefetch crawl [flags] <https://url>          Breadth-first polite site crawl (supports --out=./pages Markdown export)
   edgefetch doctor [--json]                      Verify SSRF guard, loopback proxy, Chromium, pdftotext & config
   edgefetch version [--json]                     Print binary version, Go toolchain, and host capabilities
   edgefetch help                                 Show this help text
@@ -447,5 +461,296 @@ func runKeygenBotAuth(args []string, stdout, stderr io.Writer) int {
 	_, _ = fmt.Fprintf(stdout, "EDGEFETCH_BOT_SIGNING_KEY=%s\n", kp.PrivateKeySeedB64URL)
 	_, _ = fmt.Fprintf(stdout, "BOT_SIGNING_PUBLIC_KEY=%s\n", kp.PublicKeyB64URL)
 	_, _ = fmt.Fprintf(stdout, "BOT_KEY_ID=%s\n", kp.KeyID)
+	return 0
+}
+
+func runMapCLI(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	var (
+		jsonOut   bool
+		search    string
+		limit     = 100
+		targetURL string
+	)
+	for _, a := range args {
+		switch {
+		case a == "--json":
+			jsonOut = true
+		case strings.HasPrefix(a, "--search="):
+			search = strings.TrimSpace(strings.TrimPrefix(a, "--search="))
+		case strings.HasPrefix(a, "--limit="):
+			v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(a, "--limit=")))
+			if err != nil || v <= 0 {
+				_, _ = fmt.Fprintf(stderr, "invalid --limit value %q\n", a)
+				return 2
+			}
+			limit = v
+		case strings.HasPrefix(a, "-"):
+			_, _ = fmt.Fprintf(stderr, "unknown map flag %q\n", a)
+			return 2
+		default:
+			if targetURL != "" {
+				_, _ = fmt.Fprintln(stderr, "map accepts exactly one URL")
+				return 2
+			}
+			targetURL = strings.TrimSpace(a)
+		}
+	}
+	if targetURL == "" {
+		_, _ = fmt.Fprintln(stderr, "usage: edgefetch map [--json] [--search=...] [--limit=100] <https://url>")
+		return 2
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	parsedU, err := url.Parse(targetURL)
+	if err != nil || deps.allow(parsedU) != nil {
+		_, _ = fmt.Fprintf(stderr, "invalid_url: %s\n", targetURL)
+		return 2
+	}
+
+	ua := firstNonEmpty(deps.getenv("EDGEFETCH_USER_AGENT"), deps.getenv("CRAWLER_USER_AGENT"), crawl.DefaultUserAgent)
+	if err := crawl.ValidateUserAgent(ua); err != nil {
+		ua = crawl.DefaultUserAgent
+	}
+	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	crawler := crawl.NewCrawler(deps.transport, deps.allow, ua, silentLog)
+	defer func() { _ = crawler.Close() }()
+
+	origin := parsedU.Scheme + "://" + parsedU.Host
+	call := crawl.FetchCall{
+		MaxSeconds: 30,
+		Options:    crawl.Options{Concurrency: 2, IncludeBody: true, RespectRobots: crawl.Bool(true)},
+		Requests: []crawl.Request{
+			{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText},
+			{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText},
+			{ID: "home", URL: targetURL, Kind: classify.KindScrape, Formats: []string{"links"}},
+		},
+	}
+	if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
+		_, _ = fmt.Fprintf(stderr, "%s: %s\n", code, msg)
+		return 2
+	}
+	rep := crawl.ExecuteCall(ctx, crawler, call, silentLog)
+	seen := map[string]struct{}{}
+	var links []string
+	filterLower := strings.ToLower(search)
+	addCand := func(cand string) {
+		cand = strings.TrimSpace(cand)
+		if !strings.HasPrefix(cand, "https://") || len(links) >= limit {
+			return
+		}
+		if filterLower != "" && !strings.Contains(strings.ToLower(cand), filterLower) {
+			return
+		}
+		if _, exists := seen[cand]; !exists {
+			seen[cand] = struct{}{}
+			links = append(links, cand)
+		}
+	}
+	for _, r := range rep.Results {
+		for _, l := range r.Links {
+			addCand(l)
+		}
+		for _, m := range reSitemapLocURL.FindAllStringSubmatch(r.Body, 1000) {
+			if len(m) > 1 {
+				addCand(m[1])
+			}
+		}
+		for _, m := range reMarkdownHTTPURL.FindAllStringSubmatch(r.Body, 1000) {
+			if len(m) > 1 {
+				addCand(m[1])
+			}
+		}
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]any{"ok": true, "url": origin, "total": len(links), "links": links})
+		return 0
+	}
+	for _, l := range links {
+		_, _ = fmt.Fprintln(stdout, l)
+	}
+	return 0
+}
+
+func slugifyURLForFilename(rawURL string, idx int) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Sprintf("page-%03d.md", idx)
+	}
+	clean := strings.Trim(u.Path, "/")
+	if clean == "" {
+		clean = "index"
+	}
+	var b strings.Builder
+	for _, r := range clean {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	slug := strings.Trim(b.String(), "-")
+	if len(slug) > 80 {
+		slug = slug[:80]
+	}
+	if slug == "" {
+		slug = fmt.Sprintf("page-%03d", idx)
+	}
+	return fmt.Sprintf("%03d-%s.md", idx, slug)
+}
+
+func runCrawlCLI(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	var (
+		jsonOut   bool
+		render    bool
+		limit     = 20
+		maxDepth  = 2
+		outDir    string
+		targetURL string
+	)
+	for _, a := range args {
+		switch {
+		case a == "--json":
+			jsonOut = true
+		case a == "--render":
+			render = true
+		case strings.HasPrefix(a, "--limit="):
+			v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(a, "--limit=")))
+			if err != nil || v <= 0 {
+				_, _ = fmt.Fprintf(stderr, "invalid --limit value %q\n", a)
+				return 2
+			}
+			limit = v
+		case strings.HasPrefix(a, "--max-depth="):
+			v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(a, "--max-depth=")))
+			if err != nil || v < 0 {
+				_, _ = fmt.Fprintf(stderr, "invalid --max-depth value %q\n", a)
+				return 2
+			}
+			maxDepth = v
+		case strings.HasPrefix(a, "--out="):
+			outDir = strings.TrimSpace(strings.TrimPrefix(a, "--out="))
+		case strings.HasPrefix(a, "-"):
+			_, _ = fmt.Fprintf(stderr, "unknown crawl flag %q\n", a)
+			return 2
+		default:
+			if targetURL != "" {
+				_, _ = fmt.Fprintln(stderr, "crawl accepts exactly one root URL")
+				return 2
+			}
+			targetURL = strings.TrimSpace(a)
+		}
+	}
+	if targetURL == "" {
+		_, _ = fmt.Fprintln(stderr, "usage: edgefetch crawl [--json] [--limit=20] [--max-depth=2] [--out=./pages] [--render] <https://url>")
+		return 2
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if maxDepth > 5 {
+		maxDepth = 5
+	}
+	rootParsed, err := url.Parse(targetURL)
+	if err != nil || deps.allow(rootParsed) != nil {
+		_, _ = fmt.Fprintf(stderr, "invalid_url: %s\n", targetURL)
+		return 2
+	}
+	if outDir != "" {
+		if mkErr := os.MkdirAll(outDir, 0o755); mkErr != nil {
+			_, _ = fmt.Fprintf(stderr, "mkdir %s: %v\n", outDir, mkErr)
+			return 1
+		}
+	}
+
+	ua := firstNonEmpty(deps.getenv("EDGEFETCH_USER_AGENT"), deps.getenv("CRAWLER_USER_AGENT"), crawl.DefaultUserAgent)
+	if err := crawl.ValidateUserAgent(ua); err != nil {
+		ua = crawl.DefaultUserAgent
+	}
+	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	crawler := crawl.NewCrawler(deps.transport, deps.allow, ua, silentLog)
+	defer func() { _ = crawler.Close() }()
+
+	kind := classify.KindScrape
+	renderMode := "off"
+	if render {
+		kind = classify.KindRender
+		renderMode = "always"
+	}
+
+	visited := map[string]bool{rootParsed.String(): true}
+	frontier := []string{rootParsed.String()}
+	var pages []crawl.Result
+
+	for depth := 0; depth <= maxDepth && len(frontier) > 0 && len(pages) < limit; depth++ {
+		rem := limit - len(pages)
+		wave := frontier
+		if len(wave) > rem {
+			wave = wave[:rem]
+		}
+		if len(wave) > 10 {
+			wave = wave[:10]
+		}
+		var nextFrontier []string
+		reqs := make([]crawl.Request, 0, len(wave))
+		for i, u := range wave {
+			reqs = append(reqs, crawl.Request{
+				ID:              fmt.Sprintf("c-%d-%d", depth, i),
+				URL:             u,
+				Kind:            kind,
+				Formats:         []string{"markdown", "links"},
+				OnlyMainContent: crawl.Bool(true),
+				RenderMode:      renderMode,
+			})
+		}
+		call := crawl.FetchCall{
+			MaxSeconds: 60,
+			Options:    crawl.Options{Concurrency: 2, RespectRobots: crawl.Bool(true), PauseMs: 800, PauseJitterMs: 200},
+			Requests:   reqs,
+		}
+		if _, _, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
+			break
+		}
+		rep := crawl.ExecuteCall(ctx, crawler, call, silentLog)
+		for _, r := range rep.Results {
+			pages = append(pages, r)
+			if r.Outcome == classify.OutcomeOK && outDir != "" && r.Markdown != "" {
+				fname := filepath.Join(outDir, slugifyURLForFilename(r.URL, len(pages)))
+				doc := fmt.Sprintf("---\nurl: %q\ntitle: %q\nstatus: %d\n---\n\n%s\n", r.URL, r.Title, r.Status, strings.TrimSpace(r.Markdown))
+				_ = os.WriteFile(fname, []byte(doc), 0o644)
+			}
+			if depth < maxDepth && r.Outcome == classify.OutcomeOK {
+				for _, lnk := range r.Links {
+					lu, lErr := url.Parse(lnk)
+					if lErr != nil || lu.Scheme != "https" || !strings.EqualFold(lu.Hostname(), rootParsed.Hostname()) {
+						continue
+					}
+					lu.Fragment = ""
+					clean := lu.String()
+					if !visited[clean] && len(visited) < limit*3 {
+						visited[clean] = true
+						nextFrontier = append(nextFrontier, clean)
+					}
+				}
+			}
+		}
+		frontier = nextFrontier
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]any{"ok": true, "rootUrl": rootParsed.String(), "fetched": len(pages), "pages": pages})
+		return 0
+	}
+	for _, p := range pages {
+		_, _ = fmt.Fprintf(stdout, "[%s %d] %s (%d chars)\n", p.Outcome, p.Status, p.URL, len(p.Markdown))
+	}
+	if outDir != "" {
+		_, _ = fmt.Fprintf(stdout, "Saved Markdown pages to %s\n", outDir)
+	}
 	return 0
 }

@@ -7427,26 +7427,65 @@ export interface InteractRequestPayload {
   site?: unknown;
 }
 
-function splitCompositeSessionId(raw: unknown): { siteId?: string; agentSessionId?: string } {
+function splitCompositeSessionId(raw: unknown): { siteId?: string; agentSessionId?: string; sigHex?: string; malformed?: boolean } {
   if (typeof raw !== 'string' || !raw.trim()) return {};
   const clean = raw.trim();
-  const dot = clean.indexOf('.');
-  if (dot > 0 && dot < clean.length - 1) {
-    const sitePart = clean.slice(0, dot).toLowerCase();
-    const sessPart = clean.slice(dot + 1);
-    if (/^[a-z0-9][a-z0-9_-]{0,31}$/.test(sitePart) && /^[A-Za-z0-9_-]{4,80}$/.test(sessPart)) {
-      return { siteId: sitePart, agentSessionId: sessPart };
+  const parts = clean.split('.');
+  if (parts.length === 3) {
+    const [sitePartRaw, sessPart, sigPart] = parts;
+    const sitePart = sitePartRaw!.toLowerCase();
+    if (
+      /^[a-z0-9][a-z0-9_-]{0,31}$/.test(sitePart) &&
+      /^[A-Za-z0-9_-]{4,80}$/.test(sessPart!) &&
+      /^[0-9a-f]{24,64}$/i.test(sigPart!)
+    ) {
+      return { siteId: sitePart, agentSessionId: sessPart!, sigHex: sigPart!.toLowerCase() };
     }
+    return { malformed: true };
+  }
+  if (parts.length === 2) {
+    const [sitePartRaw, sessPart] = parts;
+    const sitePart = sitePartRaw!.toLowerCase();
+    if (/^[a-z0-9][a-z0-9_-]{0,31}$/.test(sitePart) && /^[A-Za-z0-9_-]{4,80}$/.test(sessPart!)) {
+      return { siteId: sitePart, agentSessionId: sessPart! };
+    }
+    return { malformed: true };
   }
   if (/^[A-Za-z0-9_-]{4,80}$/.test(clean)) {
     return { agentSessionId: clean };
   }
-  return {};
+  return { malformed: true };
+}
+
+function normalizeInteractPrincipal(principal?: string, source?: string): string {
+  if (typeof principal === 'string' && principal.trim()) {
+    return principal.trim();
+  }
+  const raw = (source ?? 'default').trim();
+  const stripped = raw.replace(/^(?:mcp-interact|interact|mcp|compat|agent):/i, '').replace(/:interact$/i, '');
+  return stripped || 'default';
+}
+
+async function computeInteractSessionMacHex(secret: string, principal: string, siteId: string, agentSessionId: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const macBuf = await crypto.subtle.sign('HMAC', key, enc.encode(`ef-interact-v1|${principal}|${siteId}|${agentSessionId}`));
+  return Array.from(new Uint8Array(macBuf).subarray(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function constantTimeHexEqual(a: string, b: string): boolean {
+  if (a.length !== b.length || a.length === 0) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 /**
  * Executes `POST /v1/interact` + MCP `interact` (`firecrawl_interact` parity) against a `browser-v1` (`edgefetch_fat`)
- * node. Composite `<siteId>.<efsess_id>` tokens ensure follow-up turns route back to the exact node holding the tab.
+ * node. Composite `<siteId>.<efsess_id>[.<hmac32>]` tokens ensure follow-up turns route back to the exact node holding
+ * the tab AND prevent cross-caller session hijacking on multi-client OAuth Hubs.
  */
 export async function executeInteractCall(params: {
   payload: InteractRequestPayload;
@@ -7461,9 +7500,38 @@ export async function executeInteractCall(params: {
   ) => Promise<{ status: number; via: string; bodyText: string; retryAfter?: string }>;
   source?: string;
   selfHost?: string;
+  principal?: string;
+  sessionSigningSecret?: string;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
-  const { payload, env, executeHubFetch, source = 'interact', selfHost } = params;
+  const { payload, env, executeHubFetch, source = 'interact', selfHost, principal, sessionSigningSecret } = params;
+  const effectivePrincipal = normalizeInteractPrincipal(principal, source);
+  const signingSecret = typeof sessionSigningSecret === 'string' && sessionSigningSecret.trim().length >= 16 ? sessionSigningSecret.trim() : '';
   const parsedSession = splitCompositeSessionId(payload.sessionId);
+  if (parsedSession.malformed) {
+    return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_session_id', message: 'malformed interact sessionId' } };
+  }
+  if (parsedSession.agentSessionId && signingSecret) {
+    if (!parsedSession.siteId || !parsedSession.sigHex) {
+      return {
+        status: 403,
+        via: 'hub',
+        body: { ok: false, error: 'session_principal_mismatch', message: 'interact sessionId is missing caller ownership signature' },
+      };
+    }
+    const expectedSig = await computeInteractSessionMacHex(
+      signingSecret,
+      effectivePrincipal,
+      parsedSession.siteId,
+      parsedSession.agentSessionId,
+    );
+    if (!constantTimeHexEqual(parsedSession.sigHex, expectedSig)) {
+      return {
+        status: 403,
+        via: 'hub',
+        body: { ok: false, error: 'session_principal_mismatch', message: 'interact sessionId belongs to a different caller principal' },
+      };
+    }
+  }
   const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
 
   let normalizedUrl = '';
@@ -7651,9 +7719,18 @@ export async function executeInteractCall(params: {
     const partialTranscript = partialHtml ? extractYouTubeTranscriptFromHtml(partialHtml) : '';
     const partialMd = partialDoc?.markdown ? decodeMarkdownEntities(partialDoc.markdown).trim() : '';
     const errSiteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
-    const errActualSite = errSiteMatch?.[1] ?? pinnedSite;
+    const errActualSite = (errSiteMatch?.[1] ?? pinnedSite)?.toLowerCase();
     const errAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
-    const errPublicSid = errAgentSid && errActualSite ? `${errActualSite}.${errAgentSid}` : errAgentSid;
+    const errSig =
+      errAgentSid && errActualSite && signingSecret
+        ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, errActualSite, errAgentSid)
+        : undefined;
+    const errPublicSid =
+      errAgentSid && errActualSite
+        ? errSig
+          ? `${errActualSite}.${errAgentSid}.${errSig}`
+          : `${errActualSite}.${errAgentSid}`
+        : errAgentSid;
     const blockedInfo = buildBlockedInfo(partialFinalUrl || normalizedUrl, item.outcome, prob, item.status);
 
     return {
@@ -7677,9 +7754,18 @@ export async function executeInteractCall(params: {
   }
 
   const siteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
-  const actualSite = siteMatch?.[1] ?? pinnedSite;
+  const actualSite = (siteMatch?.[1] ?? pinnedSite)?.toLowerCase();
   const returnedAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
-  const publicSessionId = returnedAgentSid && actualSite ? `${actualSite}.${returnedAgentSid}` : returnedAgentSid;
+  const sessionSig =
+    returnedAgentSid && actualSite && signingSecret
+      ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, actualSite, returnedAgentSid)
+      : undefined;
+  const publicSessionId =
+    returnedAgentSid && actualSite
+      ? sessionSig
+        ? `${actualSite}.${returnedAgentSid}.${sessionSig}`
+        : `${actualSite}.${returnedAgentSid}`
+      : returnedAgentSid;
 
   const rawHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
   const finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;

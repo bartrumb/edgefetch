@@ -14,15 +14,23 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   network unix stream,
   network unix dgram,
   unix (create, bind, listen, accept, connect, send, receive, getattr, setattr, setopt, getopt, shutdown),
+  # Unrestricted peer label so signals continue working after Home Assistant Supervisor rewrites
+  # `profile edgefetch_fat` -> `profile <repo_slug>_edgefetch_fat` via `adjust_profile()`.
   signal (send, receive),
   deny network raw,
   deny network packet,
 
-  # Needed once at startup before permanent privilege drop (`internal/priv/priv_linux.go`)
+  # Needed once at millisecond 0 (while UID == 0) so `priv.LockDownSecretPaths` enforces `0700 /data` +
+  # `0600 /data/options.json` (`root:root`) right before `priv.DropRoot()` permanently drops all threads
+  # to `65532:65532` and clears all capabilities (`PR_SET_NO_NEW_PRIVS=1`).
   capability setuid,
   capability setgid,
+  capability chown,
+  capability fowner,
 
   # Explicitly deny dangerous container-escape capabilities and kernel interfaces
+  deny capability dac_override,
+  deny capability dac_read_search,
   deny capability sys_admin,
   deny capability sys_ptrace,
   deny capability sys_module,
@@ -33,7 +41,8 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   deny umount,
   deny ptrace,
 
-  # Binary, Poppler pdftotext & read-only config access
+  # Binary, Chromium (`mrix` compatible with AppArmor 3.x on Home Assistant OS + `PR_SET_NO_NEW_PRIVS`),
+  # Poppler `pdftotext`, and pre-drop `/data/options.json` lockdown access
   / r,
   /edgefetch ixr,
   /usr/ r,
@@ -41,12 +50,8 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   /usr/bin/** ixr,
   /usr/lib/ r,
   /usr/lib/** mr,
-  # Stack Chromium onto child subprofile (`Cx -> &chromium` => `edgefetch_fat//&edgefetch_fat//chromium`)
-  # so the transition satisfies Linux `PR_SET_NO_NEW_PRIVS` (`aa_label_is_subset`) while denying `/data/**`!
   /usr/lib/chromium/ r,
-  /usr/lib/chromium/chromium mrCx -> &chromium,
-  /usr/lib/chromium/chrome_crashpad_handler mrix,
-  /usr/lib/chromium/** mr,
+  /usr/lib/chromium/** mrix,
   /lib/ r,
   /lib/** mr,
   /usr/share/ r,
@@ -55,8 +60,8 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   /var/cache/fontconfig/** rwkl,
   /etc/ r,
   /etc/** r,
-  /data/ r,
-  /data/options.json r,
+  /data/ rw,
+  /data/options.json rw,
   /tmp/ rw,
   /tmp/** rwklm,
   /dev/ r,
@@ -90,85 +95,4 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   deny /proc/kmem rwklx,
   deny /proc/mem rwklx,
   deny /sys/firmware/** rwklx,
-
-  profile chromium flags=(attach_disconnected,mediate_deleted) {
-    #include <abstractions/base>
-    #include <abstractions/nameservice>
-    #include <abstractions/ssl_certs>
-    #include <abstractions/fonts>
-
-    network inet stream,
-    network inet6 stream,
-    network inet dgram,
-    network inet6 dgram,
-    network unix stream,
-    network unix dgram,
-    unix (create, bind, listen, accept, connect, send, receive, getattr, setattr, setopt, getopt, shutdown),
-    signal (send, receive),
-    deny network raw,
-    deny network packet,
-
-    deny capability setuid,
-    deny capability setgid,
-    deny capability sys_admin,
-    deny capability sys_ptrace,
-    deny capability sys_module,
-    deny capability sys_rawio,
-    deny capability net_admin,
-    deny mount,
-    deny remount,
-    deny umount,
-    deny ptrace,
-
-    # Hard kernel block preventing Chromium or any renderer child from reading Home Assistant `/data/options.json`!
-    deny /data/ r,
-    deny /data/** rwklmx,
-
-    / r,
-    /usr/ r,
-    /usr/lib/ r,
-    /usr/lib/** mr,
-    /usr/lib/chromium/ r,
-    /usr/lib/chromium/** mrix,
-    /lib/ r,
-    /lib/** mr,
-    /usr/share/ r,
-    /usr/share/** r,
-    /var/cache/fontconfig/ rw,
-    /var/cache/fontconfig/** rwkl,
-    /etc/ r,
-    /etc/** r,
-    /tmp/ rw,
-    /tmp/** rwklm,
-    /dev/ r,
-    /dev/shm/ rw,
-    /dev/shm/** rwklm,
-    /memfd:* rwklm,
-    /memfd:** rwklm,
-    /SYSV* rwklm,
-    /dev/null rw,
-    /dev/zero rw,
-    /dev/urandom rw,
-    /dev/random r,
-    /proc/ r,
-    /proc/** r,
-    /proc/@{pid}/oom_score_adj rw,
-    /proc/@{pid}/clear_refs w,
-    /proc/@{pid}/task/*/comm rw,
-    /proc/@{pid}/fd/ r,
-    /sys/ r,
-    /sys/fs/cgroup/ r,
-    /sys/fs/cgroup/** r,
-    /sys/bus/ r,
-    /sys/bus/** r,
-    /sys/class/ r,
-    /sys/class/** r,
-    /sys/devices/ r,
-    /sys/devices/** r,
-
-    deny /proc/kcore rwklx,
-    deny /proc/kmem rwklx,
-    deny /proc/mem rwklx,
-    deny /sys/firmware/** rwklx,
-  }
 }

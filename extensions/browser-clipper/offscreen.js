@@ -241,7 +241,7 @@ function connect(cfg) {
       ws.send(
         JSON.stringify({
           type: 'agent_hello',
-          version: '2.5.3',
+          version: '2.5.4',
           arch: 'browser-mv3',
           goVersion: 'mv3-extension',
           capabilities: [],

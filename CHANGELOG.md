@@ -2,6 +2,16 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.5.4] - 2026-11-20
+
+### Fixed
+- **Home Assistant OS Headless Chromium launch under AppArmor 3.x (`edgefetch_fat/apparmor.txt`, `internal/priv`):** Replaced the AppArmor 4.0-specific `mrCx -> &chromium` stacked subprofile transition (which returned `fork/exec /usr/lib/chromium/chromium: permission denied` on Home Assistant OS Buildroot AppArmor 3.1 after Supervisor `adjust_profile` slug rewriting) with portable VFS DAC lockdown (`priv.LockDownSecretPaths` enforcing `0700 /data` and `0600 /data/options.json` owned by `0:0` right before `priv.DropRoot()` drops all threads to `65532:65532`) paired with `/usr/lib/chromium/** mrix` and explicit `deny capability dac_override` / `dac_read_search`.
+- **CI HAOS AppArmor slug simulation (`.github/workflows/ci.yml`):** Updated the live container smoke test to rewrite `profile edgefetch_fat` -> `profile c3b8e9a1_edgefetch_fat` (matching Home Assistant Supervisor `adjust_profile`) and verify both Chromium rendering and `UID 65532` `EACCES` denial on `/data/options.json`.
+
+### Security
+- **Resumed `interact` session `robots.txt` check (`internal/browser/renderer.go`):** Track `lastCheckedURL` per retained browser session so follow-up `interact` turns (`task.URL == ""`) that navigate via `click` or `executeJavascript` still enforce `CheckRobots` on the resulting `finalURL`.
+- **Caller-bound `interact` session tokens (`hub/src/scrape.ts`, `hub/src/index.ts`):** Added HMAC-SHA256 principal binding (`<siteId>.<efsess_id>.<hmac32>`) on retained `interact` session IDs so one OAuth client cannot resume or close another caller's browser session on a shared Hub.
+
 ## [2.5.3] - 2026-11-20
 
 ### Security

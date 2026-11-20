@@ -993,7 +993,7 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.3');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.4');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1070,7 +1070,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.5.3',
+          serverVersion: '2.5.4',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1112,6 +1112,8 @@ export default {
               executeHubFetch,
               selfHost: url.hostname,
               source: `mcp-interact:${principal ?? 'client'}`,
+              principal: principal ?? 'client',
+              sessionSigningSecret: env.CALLER_TOKEN,
             });
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
@@ -1307,7 +1309,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.5.3'), {
+        return Response.json(buildCapabilities(env, '2.5.4'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -1624,6 +1626,8 @@ export default {
           executeHubFetch,
           selfHost: url.hostname,
           source: `interact:${auth.principal}`,
+          principal: auth.principal,
+          sessionSigningSecret: env.CALLER_TOKEN,
         });
         return Response.json(out.body, {
           status: out.status,

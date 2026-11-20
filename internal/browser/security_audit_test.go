@@ -81,3 +81,32 @@ func TestRendererLoopbackProxyBypassBlockedLiveIfChromeInstalled(t *testing.T) {
 		t.Fatalf("SECURITY (H1): loopback response body leaked into rendered output")
 	}
 }
+
+func TestValidateFinalURLChecksRobotsEvenOnResumedInteractSession(t *testing.T) {
+	var checked []string
+	r := NewRenderer("", func(u *url.URL) error {
+		if u.Scheme != "https" {
+			return errors.New("https required")
+		}
+		return nil
+	}, "EdgeFetchTest/2.5.4", 1, nil)
+	r.CheckRobots = func(_ context.Context, rawURL string) error {
+		checked = append(checked, rawURL)
+		if strings.Contains(rawURL, "/private-admin") {
+			return errors.New("disallowed by /robots.txt")
+		}
+		return nil
+	}
+
+	sess := &retainedSession{id: "efsess_test123"}
+	sess.setLastCheckedURL("https://example.com/public")
+
+	// Resumed interact turn has initialURL == ""; clicking a link to /private-admin MUST invoke CheckRobots and block!
+	err := r.validateFinalURL(context.Background(), sess, "https://example.com/private-admin", "")
+	if err == nil || !strings.Contains(err.Error(), "robots.txt") {
+		t.Fatalf("H8: expected resumed interact cross-URL navigation to be blocked by CheckRobots, got err=%v", err)
+	}
+	if len(checked) != 1 || checked[0] != "https://example.com/private-admin" {
+		t.Fatalf("H8: expected CheckRobots called once on finalURL, got %v", checked)
+	}
+}

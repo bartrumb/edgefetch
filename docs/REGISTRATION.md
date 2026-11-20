@@ -82,7 +82,7 @@ EdgeFetch's keyless open-data adapters (`sec-edgar`, `openalex`, `crossref-doi`,
 
 ### 1. Official MCP Registry (`registry.modelcontextprotocol.io`)
 
-EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`, schema `2025-12-11`) pinned to `ghcr.io/bartrumb/edgefetch-agent:2.5.3` with the required `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"` OCI image label.
+EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`, schema `2025-12-11`) pinned to `ghcr.io/bartrumb/edgefetch-agent:2.5.4` with the required `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"` OCI image label.
 
 To validate and publish `io.github.bartrumb/edgefetch` in the Official MCP Registry:
 
@@ -125,7 +125,7 @@ Every official `v*` release of EdgeFetch is protected by **two independent crypt
 
 ```bash
 # 1. Verify SLSA Build Provenance via GitHub CLI
-gh attestation verify edgefetch_2.5.3_linux_amd64.tar.gz --owner bartrumb
+gh attestation verify edgefetch_2.5.4_linux_amd64.tar.gz --owner bartrumb
 
 # 2. Verify the Owner Ed25519 Signature on checksums.txt
 openssl pkeyutl -verify -pubin \

@@ -1,15 +1,17 @@
 //go:build linux
 
-// Package priv implements irreversible root privilege dropping on Linux containers.
-// Home Assistant OS Supervisor mounts /data/options.json as 0600 root:root; reading config first, zeroing the raw
-// buffer, and invoking PR_SET_NO_NEW_PRIVS + Setgroups([]) + Setgid(65532) + Setuid(65532) drops root across all Go
-// runtime OS threads (AllThreadsSyscall) before any network socket opens, keeping the runtime image distroless.
+// Package priv implements irreversible root privilege dropping and pre-drop secret file lockdown on Linux containers.
+// At startup (while still UID 0), LockDownSecretPaths enforces 0600 root:root on /data/options.json and 0700 root:root
+// on /data; then DropRoot invokes PR_SET_NO_NEW_PRIVS + Setgroups([]) + Setgid(65532) + Setuid(65532) across all Go
+// runtime OS threads (AllThreadsSyscall6) before any network socket opens or Chromium subprocess spawns, guaranteeing
+// VFS DAC blocks UID 65532 (and all child processes) from reading /data/options.json on every Linux kernel.
 package priv
 
 import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -17,6 +19,39 @@ const (
 	nonrootUID     = 65532
 	prSetNoNewPriv = 38 // Linux <sys/prctl.h> PR_SET_NO_NEW_PRIVS
 )
+
+// LockDownSecretPaths restricts secret configuration files (such as Home Assistant `/data/options.json`) to `0600`
+// owned by `0:0` (`root:root`) and locks `/data` to `0700` while the process is still UID 0, right before DropRoot().
+// Once DropRoot() transitions the process to UID/GID 65532, Linux VFS DAC unconditionally denies access to `/data`
+// and `/data/options.json` for both `/edgefetch` and any spawned Chromium / helper child processes.
+func LockDownSecretPaths(paths ...string) {
+	if os.Geteuid() != 0 {
+		return
+	}
+	for _, raw := range paths {
+		if raw == "" {
+			continue
+		}
+		clean := filepath.Clean(raw)
+		st, err := os.Lstat(clean)
+		if err != nil || st.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		_ = os.Chown(clean, 0, 0)
+		if st.IsDir() {
+			_ = os.Chmod(clean, 0o700)
+			continue
+		}
+		_ = os.Chmod(clean, 0o600)
+		dir := filepath.Dir(clean)
+		if dir == "/data" {
+			if dst, dErr := os.Lstat(dir); dErr == nil && dst.IsDir() && dst.Mode()&os.ModeSymlink == 0 {
+				_ = os.Chown(dir, 0, 0)
+				_ = os.Chmod(dir, 0o700)
+			}
+		}
+	}
+}
 
 // DropRoot permanently transitions UID/GID 0 down to unprivileged `65532:65532` (`nonroot`) and sets `NO_NEW_PRIVS`.
 func DropRoot() error {

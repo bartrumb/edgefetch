@@ -454,6 +454,12 @@ test('SEC-AUDIT-5 (M4, M5, M8 & Low): Linear O(N) HTML scanners, safe user regex
 
   const priceHtml = '<main><h1>Pricing</h1><p>price($)+[usd]: $49/mo</p></main>';
   const priceDoc = extractHtmlDocument(priceHtml, { baseUrl: 'https://example.com/pricing' });
+  // Astro Starlight / Expressive Code `<div class="ec-line">` multi-line `<pre data-language="bash">` preservation:
+  const starlightHtml =
+    '<main><figure><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span>line1 \\</span></div></div><div class="ec-line"><div class="code"><span>  --flag value</span></div></div><div class="ec-line"><div class="code"><span># comment</span></div></div></code></pre></figure></main>';
+  const starlightDoc = extractHtmlDocument(starlightHtml, { baseUrl: 'https://edgefetch.dev/guides/verify-release/' });
+  assert.match(starlightDoc.markdown, /```bash\nline1 \\\n  --flag value\n# comment\n```/);
+  assert.equal(starlightDoc.markdown.includes('Terminal window'), false);
   const schemaExtract = extractStructuredJsonFromPage(priceHtml, priceDoc, {
     type: 'object',
     properties: {

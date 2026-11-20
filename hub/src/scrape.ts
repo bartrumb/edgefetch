@@ -2015,11 +2015,17 @@ export function extractHtmlDocument(
     .replace(/<\/a>(?=<a\b)/gi, '</a> ')
     .replace(/<\/code>(?=<code\b)/gi, '</code> ')
     .replace(/([A-Za-z0-9])(?=<a\b)/g, '$1 ')
+    .replace(/<figcaption\b[^>]*\bheader\b[^>]*>\s*<span\b[^>]*\btitle\b[^>]*>\s*<\/span>\s*<span\b[^>]*\bsr-only\b[^>]*>[\s\S]{0,120}?<\/span>\s*<\/figcaption>/gi, '')
     .replace(
       /<pre\b((?:"[^"]*"|'[^']*'|[^>"'])*)>\s*(?:<code\b((?:"[^"]*"|'[^']*'|[^>"'])*)>)?([\s\S]*?)(?:<\/code>)?\s*<\/pre>/gi,
       (_m, preAttrs, codeAttrs, code) => {
         const lang = inferCodeFenceLang(String(preAttrs ?? ''), String(codeAttrs ?? ''));
-        const decodedCode = decodeHtmlEntities(String(code).replace(HTML_TAG_QUOTE_AWARE_RE, '')).trim();
+        const rawCodeHtml = String(code);
+        const withEcLines =
+          !rawCodeHtml.includes('\n') && rawCodeHtml.includes('ec-line')
+            ? rawCodeHtml.replace(/<div\b[^>]*\bec-line\b[^>]*>/gi, '\n')
+            : rawCodeHtml;
+        const decodedCode = decodeHtmlEntities(withEcLines.replace(HTML_TAG_QUOTE_AWARE_RE, '')).trim();
         return stashFence(makeSafeCodeFence(decodedCode, lang));
       },
     )

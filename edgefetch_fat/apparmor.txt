@@ -14,7 +14,7 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   network unix stream,
   network unix dgram,
   unix (create, bind, listen, accept, connect, send, receive, getattr, setattr, setopt, getopt, shutdown),
-  signal (send, receive) peer=edgefetch_fat*,
+  signal (send, receive),
   deny network raw,
   deny network packet,
 
@@ -104,7 +104,7 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
     network unix stream,
     network unix dgram,
     unix (create, bind, listen, accept, connect, send, receive, getattr, setattr, setopt, getopt, shutdown),
-    signal (send, receive) peer=edgefetch_fat*,
+    signal (send, receive),
     deny network raw,
     deny network packet,
 

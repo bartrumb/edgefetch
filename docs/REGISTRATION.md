@@ -25,7 +25,7 @@ An open-source binary **must never** ship a shared bot-signing key inside the re
 EdgeFetch (`v2.5.2+`) natively implements **100% of Cloudflare's Web Bot Auth specification** (`RFC 9421` + `draft-meunier-http-message-signatures-directory`), including:
 - Outbound `Signature-Input`, `Signature`, and `Signature-Agent` headers (`alg="ed25519"`, `tag="web-bot-auth"`).
 - `GET /.well-known/http-message-signatures-directory` returning `application/http-message-signatures-directory+json` with RFC 7638 `kid` thumbprints, `"nbf"` validity timestamps, `Content-Digest: sha-256=:...:`, and RFC 9421 self-signature headers (`Signature-Input: directory=("@authority";req "content-digest");...;tag="http-message-signatures-directory"`).
-- `GET /.well-known/edgefetch-bot.json` declaring `category: "user-triggered-agent-retrieval"`, `robotsTxt: "strict-rfc9309"`, and `aiModelTraining: false`.
+- `GET /.well-known/edgefetch-bot.json` declaring `category: "user-triggered-agent-retrieval"`, `robotsTxt: "strict-rfc9309"`, `contentSignals: "honored (ai-input)"`, and `aiModelTraining: false`.
 
 #### Step-by-Step Setup (< 3 Minutes)
 
@@ -82,7 +82,7 @@ EdgeFetch's keyless open-data adapters (`sec-edgar`, `openalex`, `crossref-doi`,
 
 ### 1. Official MCP Registry (`registry.modelcontextprotocol.io`)
 
-EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`, schema `2025-12-11`) pinned to `ghcr.io/bartrumb/edgefetch-agent:2.5.4` with the required `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"` OCI image label.
+EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`, schema `2025-12-11`) pinned to `ghcr.io/bartrumb/edgefetch-agent:2.5.5` with the required `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"` OCI image label.
 
 To validate and publish `io.github.bartrumb/edgefetch` in the Official MCP Registry:
 
@@ -125,7 +125,7 @@ Every official `v*` release of EdgeFetch is protected by **two independent crypt
 
 ```bash
 # 1. Verify SLSA Build Provenance via GitHub CLI
-gh attestation verify edgefetch_2.5.4_linux_amd64.tar.gz --owner bartrumb
+gh attestation verify edgefetch_2.5.5_linux_amd64.tar.gz --owner bartrumb
 
 # 2. Verify the Owner Ed25519 Signature on checksums.txt
 openssl pkeyutl -verify -pubin \

@@ -455,7 +455,7 @@ function sanitizeVersion(raw: string | null | undefined): string | undefined {
 
 function sanitizeGoVersion(raw: string | null | undefined): string | undefined {
   const clean = (raw ?? '').trim();
-  return /^go[0-9A-Za-z._+-]{1,28}$/i.test(clean) ? clean : undefined;
+  return /^(?:go|mv3-)[0-9A-Za-z._+-]{1,28}$/i.test(clean) ? clean : undefined;
 }
 
 function sanitizeCapabilities(raw?: string | string[] | null): string[] | undefined {

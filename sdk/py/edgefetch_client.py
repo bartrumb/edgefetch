@@ -45,6 +45,20 @@ class _CrossOriginAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
 _DEFAULT_SAFE_OPENER = urllib.request.build_opener(_CrossOriginAuthStripRedirectHandler())
 
 
+def _validate_hub_origin(raw: str, allow_insecure_http: bool) -> str:
+    parsed = urllib.parse.urlsplit(raw)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").strip().lower().strip("[]")
+    if scheme not in ("https", "http") or not host:
+        raise ValueError(f"Invalid EdgeFetch Hub base URL {raw!r}: expected https:// origin")
+    if scheme == "http" and not allow_insecure_http and host not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError(
+            f"Refusing cleartext http:// Hub URL {raw!r} for non-loopback host {host!r} "
+            "(use https:// or pass allow_insecure_http=True)"
+        )
+    return raw
+
+
 class EdgeFetchClient:
     """Minimal, zero-dependency Python client for EdgeFetch v2.1."""
 
@@ -54,6 +68,7 @@ class EdgeFetchClient:
         base_url: Optional[str] = None,
         base_urls: Optional[Sequence[str]] = None,
         timeout: float = 45.0,
+        allow_insecure_http: bool = False,
         opener: Optional[Callable[[urllib.request.Request, float], Any]] = None,
     ) -> None:
         urls: List[str] = []
@@ -65,7 +80,7 @@ class EdgeFetchClient:
                 urls.append(clean)
         if not urls:
             raise ValueError("EdgeFetchClient requires base_url or non-empty base_urls")
-        self.base_urls = urls
+        self.base_urls = [_validate_hub_origin(u, allow_insecure_http) for u in urls]
         self.token = token
         self.timeout = timeout
         self._opener = opener or (lambda req, t: _DEFAULT_SAFE_OPENER.open(req, timeout=t))

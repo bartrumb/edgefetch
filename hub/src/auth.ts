@@ -53,13 +53,66 @@ export const isAuthorized = isCallerAuthorized;
 
 export type AgentAuthResult = { ok: true; siteId: string } | { ok: false };
 
+function decodeBase64UrlUtf8(raw: string): string | null {
+  if (!raw || !/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+  try {
+    const b64 = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    const bin = atob(padded);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function extractAgentCredentials(request: Request): { token: string | null; siteHint: string } {
+  const isWsUpgrade = (request.headers.get('upgrade') ?? '').toLowerCase() === 'websocket';
+  let token: string | null = bearerToken(request) ?? (request.headers.get('x-agent-token') ?? '').trim();
+  if (token === '') token = null;
+
+  if (!token && isWsUpgrade) {
+    const protoHdr = request.headers.get('sec-websocket-protocol') ?? '';
+    for (const part of protoHdr.split(',')) {
+      const p = part.trim();
+      if (p.startsWith('edgefetch-auth.')) {
+        const decoded = decodeBase64UrlUtf8(p.slice('edgefetch-auth.'.length));
+        if (decoded) {
+          token = decoded;
+          break;
+        }
+      } else if (p.startsWith('bearer.')) {
+        token = p.slice('bearer.'.length);
+        break;
+      }
+    }
+  }
+
+  let siteHint = (request.headers.get('x-agent-site') ?? '').trim().toLowerCase();
+  if (isWsUpgrade && (!token || !siteHint)) {
+    try {
+      const u = new URL(request.url);
+      if (!siteHint) {
+        siteHint = (u.searchParams.get('site') ?? '').trim().toLowerCase();
+      }
+      if (!token) {
+        const qTok = (u.searchParams.get('token') ?? '').trim();
+        if (qTok) token = qTok;
+      }
+    } catch {
+      // ignore malformed request URL
+    }
+  }
+  return { token, siteHint };
+}
+
 export function authorizeAgent(
   request: Request,
   env: { AGENT_TOKEN?: string; AGENT_TOKENS?: string },
 ): AgentAuthResult {
-  const presented = bearerToken(request);
+  const { token: presented, siteHint: hdrSite } = extractAgentCredentials(request);
   if (!presented) return { ok: false };
-  const hdrSite = (request.headers.get('x-agent-site') ?? '').trim().toLowerCase();
   const mappedSites = new Set<string>();
 
   if (env.AGENT_TOKENS?.trim()) {

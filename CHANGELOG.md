@@ -2,6 +2,19 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.5.5] - 2026-11-20
+
+### Added
+- **Agentic Web Standards (`G1`–`G3`):**
+  - **Markdown for Agents (`G1`):** Page and default scrape requests negotiate `Accept: text/markdown, text/html;q=0.9, application/xhtml+xml;q=0.8, */*;q=0.7` so origins with Cloudflare Markdown for Agents enabled return Markdown directly (`contentSource: "origin-markdown"`), skipping HTML tag stripping while preserving BM25 passage reranking and optional PII redaction.
+  - **Cloudflare Content Signals in `/robots.txt` (`G2`):** `politeness.ParseRobotsTxt` and Hub overflow honor `Content-Signal: ai-input=yes|no` per RFC 9309 `User-agent` group specificity (`edgefetch` overrides `*`), halting retrieval with `disallowed by /robots.txt Content-Signal: ai-input=no` and advertising `"contentSignals": "honored (ai-input)"` in `/.well-known/edgefetch-bot.json`.
+  - **HTTP `402 Payment Required` / `x402` (`G3`):** Classifies HTTP `402` responses as `outcome: "payment_required"` (`StopsHost == true`, never retried and never auto-paid) and surfaces parsed x402 payment requirements cleanly to calling agents.
+
+### Security
+- **Chromium WebRTC STUN UDP, session & custom-header hardening (`M2`, `Low`):** Added `--webrtc-ip-handling-policy=disable_non_proxied_udp` and `--enforce-webrtc-ip-permission-check` alongside `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` (verified by a live loopback UDP listener check), disposed `keepSession` browser contexts when initial navigation/actions fail, and cleared `Network.setExtraHTTPHeaders` immediately after initial-host navigation completes so cross-origin JS requests never inherit caller headers.
+- **Linux `PR_SET_DUMPABLE=0`, AppArmor `/proc` rules & All-in-One UID isolation (`H2`, `H3`, `M7`):** Applied `prctl(PR_SET_DUMPABLE, 0)` across all OS threads in `priv.DropRoot`, added `deny /proc/*/mem` and `deny /proc/*/environ` to `edgefetch_fat/apparmor.txt`, separated `Dockerfile.all-in-one` into `node:node` (`1000:1000`, `0700 /data/hub`) for the Hub and `65532:65532` (`su-exec` + `env -i` forwarding worker-scoped `EDGEFETCH_*` / `TZ` / `SSL_CERT_FILE`) for the Go worker + Chromium, and verified AppArmor/UID/`Dumpable: 0` invariants in `docker-multiarch` CI.
+- **Embedded error URL scrubbing, PDF `maxBytes`, SDK TLS & supply-chain pins (`M2`, `M10`, `M11`):** Scrubbed query strings, `#fragments`, and `user:pass@` from embedded URLs inside `Result.Problem`, crawl logs, OTLP spans, and `edgefetch bug-report`; honored explicit `Options.MaxBytes` in streaming PDF fetches; rejected non-loopback cleartext `http://` Hub URLs by default in the Python and TypeScript SDKs; scoped `release.yml` job permissions with `needs: [release]` on `ghcr-release`; pinned Go 1.27-compatible `staticcheck@v0.8.2` / `govulncheck@v1.10.0` in CI and `:2.5.5` image tags across deployment manifests; and added an explicit 32-bit ARM source-build message in `install-termux-agent.sh`.
+
 ## [2.5.4] - 2026-11-20
 
 ### Fixed

@@ -302,7 +302,7 @@ func (r *Renderer) CloseSession(ctx context.Context, sessionID string) bool {
 }
 
 // Execute runs a stateless page render or stateful multi-step `interact` turn inside an isolated incognito context.
-func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
+func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr error) {
 	if task.CloseSession && task.URL == "" && len(task.Actions) == 0 {
 		_ = r.CloseSession(ctx, task.SessionID)
 		return Output{SessionID: task.SessionID, Status: http.StatusOK}, nil
@@ -464,6 +464,9 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 
 	cleanupOnExit := !task.KeepSession || task.CloseSession
 	defer func() {
+		if retErr != nil && !resumed {
+			cleanupOnExit = true
+		}
 		if cleanupOnExit {
 			r.mu.Lock()
 			delete(r.sessions, sess.id)
@@ -502,7 +505,8 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 			}
 		}
 		sess.setLastCheckedURL(u.String())
-		status, hdrs, err := navigateAndWait(ctx, cdp, sess.cdpSessionID, events, task.URL, task.WaitForMs, task.WaitSelector)
+		status, hdrs, err := navigateAndWait(ctx, cdp, sess, events, task.URL, task.WaitForMs, task.WaitSelector)
+		clearExtraHTTPHeaders(ctx, cdp, sess)
 		if err != nil {
 			return Output{}, err
 		}
@@ -566,7 +570,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 		}
 	}
 
-	out := Output{
+	out = Output{
 		Status:            st,
 		Headers:           hClone,
 		FinalURL:          finalURL,
@@ -583,15 +587,41 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 	return out, nil
 }
 
+func clearExtraHTTPHeaders(ctx context.Context, cdp *cdpConn, sess *retainedSession) {
+	if sess == nil {
+		return
+	}
+	sess.mu.Lock()
+	if !sess.hasExtraHeaders {
+		sess.mu.Unlock()
+		return
+	}
+	sess.hasExtraHeaders = false
+	cdpSID := sess.cdpSessionID
+	sess.mu.Unlock()
+
+	cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if ctx != nil && ctx.Err() == nil {
+		cancel()
+		cctx, cancel = context.WithTimeout(ctx, 2*time.Second)
+	}
+	_ = cdp.call(cctx, cdpSID, "Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{}}, nil)
+	cancel()
+}
+
 func navigateAndWait(
 	ctx context.Context,
 	cdp *cdpConn,
-	sessionID string,
+	sess *retainedSession,
 	events <-chan cdpEvent,
 	targetURL string,
 	waitForMs int,
 	waitSelector string,
 ) (int, http.Header, error) {
+	sessionID := ""
+	if sess != nil {
+		sessionID = sess.cdpSessionID
+	}
 	var navOut struct {
 		FrameID   string `json:"frameId"`
 		ErrorText string `json:"errorText,omitempty"`
@@ -617,12 +647,22 @@ func navigateAndWait(
 			var rw struct {
 				RequestID string `json:"requestId"`
 				Type      string `json:"type"`
+				Request   struct {
+					URL string `json:"url"`
+				} `json:"request"`
 			}
-			if json.Unmarshal(ev.Params, &rw) == nil && rw.RequestID != "" {
-				// Track SPA data & code requests; ignore long-lived streaming/beacon types (WebSocket, EventSource, Media, Ping).
-				switch rw.Type {
-				case "Document", "XHR", "Fetch", "Script":
-					inFlight[rw.RequestID] = time.Now()
+			if json.Unmarshal(ev.Params, &rw) == nil {
+				if sess != nil && sess.initialHost != "" && rw.Request.URL != "" {
+					if reqU, uErr := url.Parse(rw.Request.URL); uErr == nil && reqU.Hostname() != "" && !strings.EqualFold(reqU.Hostname(), sess.initialHost) {
+						clearExtraHTTPHeaders(ctx, cdp, sess)
+					}
+				}
+				if rw.RequestID != "" {
+					// Track SPA data & code requests; ignore long-lived streaming/beacon types (WebSocket, EventSource, Media, Ping).
+					switch rw.Type {
+					case "Document", "XHR", "Fetch", "Script":
+						inFlight[rw.RequestID] = time.Now()
+					}
 				}
 			}
 		case "Network.loadingFinished", "Network.loadingFailed":
@@ -840,11 +880,11 @@ func (r *Renderer) runAction(
 			}
 		}
 		sess.setLastCheckedURL(u.String())
-		if sess.hasExtraHeaders && sess.initialHost != "" && !strings.EqualFold(u.Hostname(), sess.initialHost) {
-			_ = cdp.call(ctx, sess.cdpSessionID, "Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{}}, nil)
-			sess.hasExtraHeaders = false
+		if sess.initialHost == "" || !strings.EqualFold(u.Hostname(), sess.initialHost) {
+			clearExtraHTTPHeaders(ctx, cdp, sess)
 		}
-		st, hdrs, err := navigateAndWait(ctx, cdp, sess.cdpSessionID, events, u.String(), effectiveWaitMs, act.Selector)
+		st, hdrs, err := navigateAndWait(ctx, cdp, sess, events, u.String(), effectiveWaitMs, act.Selector)
+		clearExtraHTTPHeaders(ctx, cdp, sess)
 		if err != nil {
 			return err
 		}
@@ -1275,7 +1315,9 @@ func buildChromiumLaunchArgs(proxyAddr, userDir string) []string {
 		"--disable-default-apps",
 		"--disable-quic",
 		"--disable-features=TranslateUI",
+		"--webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--enforce-webrtc-ip-permission-check",
 		"--autoplay-policy=user-gesture-required",
 		"--mute-audio",
 		"--no-first-run",

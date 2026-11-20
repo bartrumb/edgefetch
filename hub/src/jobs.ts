@@ -14,7 +14,7 @@
  *  - `Section 4`: First-class `executeJobsCall` (`POST /v1/jobs` & MCP `jobs` tool).
  */
 
-import { compileSafeUserRegex } from './safe-input';
+import { compileSafeUserRegex, replaceHtmlTagBlocksLinear, stripHtmlTagsQuoteAwareLinear } from './safe-input';
 import type { ArtifactRetention, OptionalStorageBindings } from './storage';
 
 export type PayPeriod = 'year' | 'month' | 'week' | 'day' | 'hour';
@@ -55,9 +55,29 @@ export interface StructuredJobPosting {
   source?: string;
 }
 
+export interface X402PaymentTerms {
+  x402Version?: number;
+  scheme?: string;
+  price?: string;
+  amount?: string;
+  maxAmountRequired?: string;
+  asset?: string;
+  currency?: string;
+  network?: string;
+  payTo?: string;
+  resource?: string;
+  description?: string;
+  invoice?: string;
+  macaroon?: string;
+  [k: string]: unknown;
+}
+
 export interface BlockedSuggestion {
-  reason: 'robots' | 'challenge';
+  reason: 'robots' | 'challenge' | 'content-signal' | 'payment_required';
   host?: string;
+  signal?: string;
+  price?: string;
+  terms?: X402PaymentTerms;
   suggestion: string;
 }
 
@@ -127,7 +147,7 @@ function decodeEntitiesBasic(s: string): string {
 }
 
 function stripTagsPlain(s: string): string {
-  return decodeEntitiesBasic(s.replace(/<[^>]+>/g, ' '))
+  return decodeEntitiesBasic(stripHtmlTagsQuoteAwareLinear(s, ' '))
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -251,7 +271,6 @@ export function inferWorkplaceType(text: string): WorkplaceType {
  * `P4`: Parses `<script type="application/ld+json">` blocks (including `@graph` arrays) for `@type: JobPosting`.
  */
 export function extractJobPostingJsonLd(rawHtml: string, baseUrl?: string, fallbackProse = ''): StructuredJobPosting | null {
-  const scriptRe = /<script\b[^>]*\btype\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
   const candidates: Array<Record<string, unknown>> = [];
 
   const collectEntities = (node: unknown) => {
@@ -271,13 +290,14 @@ export function extractJobPostingJsonLd(rawHtml: string, baseUrl?: string, fallb
     }
   };
 
-  let sm: RegExpExecArray | null;
-  while ((sm = scriptRe.exec(rawHtml)) !== null) {
-    const rawJson = sm[1]!.trim();
-    if (!rawJson) continue;
+  replaceHtmlTagBlocksLinear(rawHtml, 'script', (_full, attrStr, inner) => {
+    if (!/\btype[ \t\r\n]*=[ \t\r\n]*["']application\/ld\+json["']/i.test(attrStr)) return '';
+    const rawJson = inner.trim();
+    if (!rawJson) return '';
     const parsed = safeJsonParse(rawJson) ?? safeJsonParse(decodeEntitiesBasic(rawJson));
     collectEntities(parsed);
-  }
+    return '';
+  });
 
   const jp = candidates[0];
   if (!jp) return null;
@@ -1254,10 +1274,10 @@ export function isThinScriptedPage(rawHtml: string, extractedMarkdown: string): 
 function parseJsonFilterClauses(filterStr: string): Array<{ field: string; op: '=' | '!=' | '~'; value: string }> {
   const clauses: Array<{ field: string; op: '=' | '!=' | '~'; value: string }> = [];
   for (const rawPart of filterStr.split(/\s*(?:&&|,)\s*/)) {
-    const m = /^([A-Za-z0-9_.-]+)\s*(!=|~|=)\s*(.+)$/.exec(rawPart.trim());
+    const m = /^([A-Za-z0-9_.-]+)\s*(!=|~=|~|=)\s*(.+)$/.exec(rawPart.trim());
     if (!m) continue;
     const field = m[1]!;
-    const op = m[2] as '=' | '!=' | '~';
+    const op: '=' | '!=' | '~' = m[2] === '~=' ? '~' : (m[2] as '=' | '!=' | '~');
     const value = m[3]!.trim().replace(/^(['"])([\s\S]*)\1$/, '$2');
     clauses.push({ field, op, value });
   }
@@ -1336,7 +1356,7 @@ export function chunkJsonRecords(params: {
             if (!safeRe) {
               return val.toLowerCase().includes(c.value.toLowerCase());
             }
-            return safeRe.test(val);
+            return safeRe.test(val.length > 2048 ? val.slice(0, 2048) : val);
           }),
         );
 
@@ -1499,20 +1519,212 @@ export function analyzeUrlRedirect(requestedUrl: string, finalUrl?: string): Red
   }
 }
 
+function readPaymentHeader(
+  headers: Headers | Record<string, string | undefined> | undefined,
+  name: string,
+): string {
+  if (!headers) return '';
+  if (typeof (headers as Headers).get === 'function') {
+    return ((headers as Headers).get(name) ?? '').trim();
+  }
+  const lower = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers as Record<string, string | undefined>)) {
+    if (k.toLowerCase() === lower && typeof v === 'string') return v.trim();
+  }
+  return '';
+}
+
+function tryDecodePaymentHeaderJson(raw: string): Record<string, unknown> | null {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 65_536) return null;
+  if (trimmed.startsWith('{')) {
+    const parsed = safeJsonParse(trimmed);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  }
+  // Try base64 / base64url JSON (standard x402 `PAYMENT-REQUIRED` header encoding)
+  if (/^[A-Za-z0-9+/_=-]{8,}$/.test(trimmed)) {
+    try {
+      const normalized = trimmed.replace(/-/g, '+').replace(/_/g, '/');
+      const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+      const bin = atob(padded);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+      const parsed = safeJsonParse(decoded);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // ignore invalid base64
+    }
+  }
+  return null;
+}
+
+const KNOWN_USDC_CONTRACTS = new Set([
+  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // Base mainnet USDC
+  '0x036cbd53842c5426634e7929541ec2318f3dcf7e', // Base Sepolia USDC
+  '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', // Ethereum mainnet USDC
+  '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', // Polygon USDC
+]);
+
+function formatX402PriceString(terms: X402PaymentTerms): string | undefined {
+  if (typeof terms.price === 'string' && terms.price.trim()) {
+    const p = terms.price.trim();
+    if (p.startsWith('$') || /[A-Za-z]/.test(p)) return p;
+    const cur = (terms.currency || terms.asset || 'USD').toUpperCase();
+    return cur === 'USD' ? `$${p}` : `$${p} ${cur}`;
+  }
+  const rawAmt = terms.maxAmountRequired ?? terms.amount;
+  if (!rawAmt) return undefined;
+  const assetRaw = String(terms.asset ?? terms.currency ?? '').trim();
+  const assetLower = assetRaw.toLowerCase();
+  const isUsdc =
+    assetLower === 'usdc' ||
+    assetLower === 'usd' ||
+    KNOWN_USDC_CONTRACTS.has(assetLower) ||
+    (typeof terms.extra === 'object' &&
+      terms.extra !== null &&
+      /usdc|usd coin/i.test(String((terms.extra as Record<string, unknown>).name ?? '')));
+  const assetLabel = KNOWN_USDC_CONTRACTS.has(assetLower) ? 'USDC' : assetRaw || 'USDC';
+
+  if (/^\d+\.\d+$/.test(rawAmt)) {
+    return isUsdc ? `$${rawAmt}${assetLabel.toUpperCase() === 'USD' ? '' : ` ${assetLabel}`}` : `${rawAmt} ${assetLabel}`;
+  }
+  if (/^\d+$/.test(rawAmt) && isUsdc) {
+    const decimals =
+      typeof terms.extra === 'object' &&
+      terms.extra !== null &&
+      typeof (terms.extra as Record<string, unknown>).decimals === 'number'
+        ? ((terms.extra as Record<string, unknown>).decimals as number)
+        : 6;
+    const scaled = Number(rawAmt) / 10 ** decimals;
+    if (Number.isFinite(scaled) && scaled > 0) {
+      const decStr = scaled.toFixed(decimals).replace(/\.?0+$/, '');
+      return `$${decStr} USDC`;
+    }
+  }
+  return assetLabel ? `${rawAmt} ${assetLabel}` : rawAmt;
+}
+
 /**
- * `P10`: Builds a structured, ethical `blocked: { reason, host, suggestion }` hint when a request is refused by
- * `robots.txt` or a bot challenge — never bypassing blocks, always guiding the agent to clean public sources.
+ * `G3`: Parses HTTP `402 Payment Required` (`x402` v1/v2 `PAYMENT-REQUIRED` / `X-Payment-Required` JSON or base64 headers,
+ * `WWW-Authenticate: x402` / `L402`, and JSON `402` response bodies) into structured `{ price, terms }` — NEVER paying automatically.
  */
-export function buildBlockedInfo(urlStr: string, outcome?: unknown, problem?: unknown, status?: unknown): BlockedSuggestion | null {
+export function parseX402PaymentTerms(
+  status: unknown,
+  headers?: Headers | Record<string, string | undefined>,
+  rawBody?: string,
+): { price?: string; terms: X402PaymentTerms } | null {
+  if (status !== 402) return null;
+
+  const terms: X402PaymentTerms = {};
+  const payHdr =
+    readPaymentHeader(headers, 'payment-required') || readPaymentHeader(headers, 'x-payment-required');
+  const wwwAuth = readPaymentHeader(headers, 'www-authenticate');
+
+  const applyRequirementObj = (root: Record<string, unknown>) => {
+    if (typeof root.x402Version === 'number') terms.x402Version = root.x402Version;
+    const accepts = Array.isArray(root.accepts) ? root.accepts : [];
+    const primary =
+      accepts.length > 0 && accepts[0] && typeof accepts[0] === 'object' && !Array.isArray(accepts[0])
+        ? (accepts[0] as Record<string, unknown>)
+        : root;
+
+    const strField = (k: string): string | undefined => {
+      const v = primary[k] ?? root[k];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+      if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+      return undefined;
+    };
+
+    const scheme = strField('scheme');
+    const price = strField('price');
+    const amount = strField('amount');
+    const maxAmountRequired = strField('maxAmountRequired');
+    const asset = strField('asset');
+    const currency = strField('currency');
+    const network = strField('network');
+    const payTo = strField('payTo') ?? strField('recipient');
+    const resource = strField('resource');
+    const description = strField('description');
+
+    if (scheme) terms.scheme = scheme;
+    if (price) terms.price = price;
+    if (amount) terms.amount = amount;
+    if (maxAmountRequired) terms.maxAmountRequired = maxAmountRequired;
+    if (asset) terms.asset = KNOWN_USDC_CONTRACTS.has(asset.toLowerCase()) ? 'USDC' : asset;
+    if (currency) terms.currency = currency;
+    if (network) terms.network = network;
+    if (payTo) terms.payTo = payTo;
+    if (resource) terms.resource = resource;
+    if (description) terms.description = description;
+    if (primary.extra && typeof primary.extra === 'object' && !Array.isArray(primary.extra)) {
+      terms.extra = primary.extra as Record<string, unknown>;
+    }
+  };
+
+  if (payHdr) {
+    const hdrObj = tryDecodePaymentHeaderJson(payHdr);
+    if (hdrObj) applyRequirementObj(hdrObj);
+  }
+
+  if (rawBody && rawBody.trim().startsWith('{') && rawBody.length <= 65_536) {
+    const bodyObj = safeJsonParse(rawBody);
+    if (bodyObj && typeof bodyObj === 'object' && !Array.isArray(bodyObj)) {
+      applyRequirementObj(bodyObj as Record<string, unknown>);
+    }
+  }
+
+  if (wwwAuth) {
+    const schemeMatch = /^(x402|l402|lsat)\b/i.exec(wwwAuth);
+    if (schemeMatch && !terms.scheme) {
+      terms.scheme = schemeMatch[1]!.toLowerCase() === 'lsat' ? 'L402' : schemeMatch[1]!;
+    }
+    const kvRe = /([a-zA-Z0-9_-]+)[ \t]*=[ \t]*(?:"([^"]*)"|'([^']*)'|([^\s,]+))/g;
+    let m: RegExpExecArray | null;
+    while ((m = kvRe.exec(wwwAuth)) !== null) {
+      const k = m[1]!.toLowerCase();
+      const v = (m[2] ?? m[3] ?? m[4] ?? '').trim();
+      if (!v) continue;
+      if (k === 'price' && !terms.price) terms.price = v;
+      else if (k === 'amount' && !terms.amount) terms.amount = v;
+      else if (k === 'maxamountrequired' && !terms.maxAmountRequired) terms.maxAmountRequired = v;
+      else if (k === 'asset' && !terms.asset) terms.asset = v;
+      else if (k === 'currency' && !terms.currency) terms.currency = v;
+      else if (k === 'network' && !terms.network) terms.network = v;
+      else if ((k === 'payto' || k === 'recipient') && !terms.payTo) terms.payTo = v;
+      else if (k === 'invoice') terms.invoice = v;
+      else if (k === 'macaroon') terms.macaroon = v;
+    }
+  }
+
+  const formattedPrice = formatX402PriceString(terms);
+  if (formattedPrice && !terms.price) {
+    terms.price = formattedPrice;
+  }
+  return {
+    ...(formattedPrice ? { price: formattedPrice } : {}),
+    terms,
+  };
+}
+
+/**
+ * `P10` + `G2` + `G3`: Builds a structured, ethical `blocked: { reason, host, ... }` hint when a request is refused by
+ * `robots.txt`, Cloudflare `Content-Signal: ai-input=no`, HTTP `402 Payment Required` (`x402`), or a bot challenge —
+ * never bypassing blocks and never paying automatically.
+ */
+export function buildBlockedInfo(
+  urlStr: string,
+  outcome?: unknown,
+  problem?: unknown,
+  status?: unknown,
+  paymentContext?: { headers?: Headers | Record<string, string | undefined>; rawBody?: string },
+): BlockedSuggestion | null {
   const outStr = typeof outcome === 'string' ? outcome.toLowerCase() : '';
   const probStr = typeof problem === 'string' ? problem : '';
-  const isRobots = /robots\.txt/i.test(probStr) || outStr === 'robots_disallowed';
-  const isChallenge =
-    outStr === 'challenge' ||
-    /challenge|cf-mitigated|turnstile|captcha|verify you are human/i.test(probStr) ||
-    (status === 403 && /cloudflare|bot|forbidden/i.test(probStr));
-
-  if (!isRobots && !isChallenge) return null;
 
   let host = '';
   let pathname = '';
@@ -1523,6 +1735,42 @@ export function buildBlockedInfo(urlStr: string, outcome?: unknown, problem?: un
   } catch {
     // ignore
   }
+
+  // G3: HTTP 402 Payment Required / x402
+  if (status === 402 || outStr === 'payment_required') {
+    const parsedPayment = parseX402PaymentTerms(402, paymentContext?.headers, paymentContext?.rawBody);
+    const price = parsedPayment?.price;
+    const terms = parsedPayment?.terms;
+    return {
+      reason: 'payment_required',
+      ...(host ? { host } : {}),
+      ...(price ? { price } : {}),
+      ...(terms && Object.keys(terms).length > 0 ? { terms } : {}),
+      suggestion: price
+        ? `${host || 'This origin'} requires payment (${price}) via HTTP 402 / x402 for this resource. EdgeFetch never pays automatically; surface the price to the user or select a free public source.`
+        : `${host || 'This origin'} returned HTTP 402 Payment Required. EdgeFetch never pays automatically; inform the user or select a free public source.`,
+    };
+  }
+
+  // G2: Cloudflare Content Signals (`Content-Signal: ai-input=no`)
+  const isContentSignal =
+    outStr === 'content_signal_disallowed' || /content-signal|ai-input\s*=\s*no/i.test(probStr);
+  if (isContentSignal) {
+    return {
+      reason: 'content-signal',
+      signal: 'ai-input=no',
+      ...(host ? { host } : {}),
+      suggestion: `${host || 'This host'} declares \`Content-Signal: ai-input=no\` in robots.txt, opting out of agent input retrieval. Respect the publisher's preference and use an official API or opted-in source instead.`,
+    };
+  }
+
+  const isRobots = /robots\.txt/i.test(probStr) || outStr === 'robots_disallowed';
+  const isChallenge =
+    outStr === 'challenge' ||
+    /challenge|cf-mitigated|turnstile|captcha|verify you are human/i.test(probStr) ||
+    (status === 403 && /cloudflare|bot|forbidden/i.test(probStr));
+
+  if (!isRobots && !isChallenge) return null;
 
   const reason: 'robots' | 'challenge' = isRobots ? 'robots' : 'challenge';
 
@@ -1978,7 +2226,7 @@ export async function executeJobsCall(params: {
     const biMd = typeof biRes?.body?.markdown === 'string' ? biRes.body.markdown : '';
     if (biRes?.status === 200 && biMd) {
       // Extract Built In job links (`https://builtin.com/job/...`) + inline card compensation if present
-      const cardRe = /\[([^\]]{4,120})\]\((https:\/\/(?:www\.)?builtin\.com\/job\/[^)\s]+)\)([\s\S]{0,260}?)(?=\[[^\]]+\]\(https:\/\/(?:www\.)?builtin\.com\/job\/|$)/gi;
+      const cardRe = /\[([^\[\]\n]{4,120})\]\((https:\/\/(?:www\.)?builtin\.com\/job\/[^)\s]+)\)([\s\S]{0,260}?)(?=\[[^\[\]\n]+\]\(https:\/\/(?:www\.)?builtin\.com\/job\/|$)/gi;
       let bm: RegExpExecArray | null;
       while ((bm = cardRe.exec(biMd)) !== null && collected.length < limit * 2) {
         const cardTitle = bm[1]!.trim();

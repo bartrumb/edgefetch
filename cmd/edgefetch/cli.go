@@ -827,11 +827,11 @@ func runBugReportCLI(ctx context.Context, args []string, stdout, stderr io.Write
 	if targetURL != "" {
 		parsed, pErr := url.Parse(targetURL)
 		if pErr != nil {
-			_, _ = fmt.Fprintf(stderr, "invalid URL: %v\n", pErr)
+			_, _ = fmt.Fprintf(stderr, "invalid URL: %s\n", crawl.RedactEmbeddedURLs(pErr.Error()))
 			return 2
 		}
 		if aErr := deps.allow(parsed); aErr != nil {
-			_, _ = fmt.Fprintf(stderr, "URL rejected by SSRF guard: %v\n", aErr)
+			_, _ = fmt.Fprintf(stderr, "URL rejected by SSRF guard: %s\n", crawl.RedactEmbeddedURLs(aErr.Error()))
 			return 2
 		}
 		safeTarget = sanitizeURLForBugReport(targetURL)
@@ -889,6 +889,7 @@ func runBugReportCLI(ctx context.Context, args []string, stdout, stderr io.Write
 			if wafVendor != "" {
 				attrs["edgefetch.waf.vendor"] = wafVendor
 			}
+			safeProblem := crawl.RedactEmbeddedURLs(r.Problem)
 			spans = append(spans, otel.Span{
 				TraceID:      tc.TraceID,
 				SpanID:       tc.SpanID,
@@ -897,7 +898,7 @@ func runBugReportCLI(ctx context.Context, args []string, stdout, stderr io.Write
 				Start:        spanStart,
 				End:          spanEnd,
 				StatusOK:     r.Outcome == classify.OutcomeOK,
-				ErrorMessage: r.Problem,
+				ErrorMessage: safeProblem,
 				Attributes:   attrs,
 			})
 			probeSummary = map[string]any{
@@ -909,7 +910,7 @@ func runBugReportCLI(ctx context.Context, args []string, stdout, stderr io.Write
 				"bytes":         r.Bytes,
 				"markdownChars": len(r.Markdown),
 				"wafVendor":     wafVendor,
-				"problem":       r.Problem,
+				"problem":       safeProblem,
 				"timing": map[string]any{
 					"dnsMs":      r.Timing.DNSMs,
 					"connectMs":  r.Timing.ConnectMs,

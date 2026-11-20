@@ -16,6 +16,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,6 +109,7 @@ type Result struct {
 	Problem           string                         `json:"problem,omitempty"`
 	Status            int                            `json:"status"`
 	ContentType       string                         `json:"contentType,omitempty"`
+	ContentSource     string                         `json:"contentSource,omitempty"`
 	CfMitigated       string                         `json:"cfMitigated,omitempty"`
 	WAF               *classify.WAFMatch             `json:"waf,omitempty"`
 	ETag              string                         `json:"etag,omitempty"`
@@ -581,7 +583,7 @@ func (c *Crawler) RunWithSink(ctx context.Context, reqs []Request, opts Options,
 					continue
 				}
 				if classify.StopsHost(r.Kind, res.Outcome) {
-					stopped = fmt.Sprintf("host stopped after %s on %s", res.Outcome, r.URL)
+					stopped = fmt.Sprintf("host stopped after %s on %s", res.Outcome, redactURLForLog(r.URL))
 				}
 			}
 		}(h, idx)
@@ -1011,13 +1013,50 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	return res, redirectLoc, finalBody
 }
 
+var reEmbeddedHTTPURL = regexp.MustCompile(`(?i)https?://[^\s"'<>` + "`" + `)\]]+`)
+
+func scrubSingleURLToken(raw string) string {
+	if idx := strings.IndexByte(raw, '#'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	if schemeEnd := strings.Index(raw, "://"); schemeEnd >= 0 {
+		rest := raw[schemeEnd+3:]
+		slash := strings.IndexByte(rest, '/')
+		auth := rest
+		pathPart := ""
+		if slash >= 0 {
+			auth = rest[:slash]
+			pathPart = rest[slash:]
+		}
+		if at := strings.LastIndexByte(auth, '@'); at >= 0 {
+			auth = auth[at+1:]
+			raw = raw[:schemeEnd+3] + auth + pathPart
+		}
+	}
+	return raw
+}
+
+// RedactEmbeddedURLs scrubs query strings (`?...`), `#fragments`, and `user:pass@` credentials from any `http://` or
+// `https://` URL embedded inside an error or `Result.Problem` string (e.g. `Get "https://host/p?api_key=secret": timeout`
+// -> `Get "https://host/p": timeout`).
+func RedactEmbeddedURLs(s string) string {
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if !strings.Contains(lower, "http://") && !strings.Contains(lower, "https://") {
+		return s
+	}
+	return reEmbeddedHTTPURL.ReplaceAllStringFunc(s, scrubSingleURLToken)
+}
+
 func redactURLForLog(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		if idx := strings.IndexAny(raw, "?#"); idx >= 0 {
-			return raw[:idx]
-		}
-		return raw
+		return scrubSingleURLToken(raw)
 	}
 	u.RawQuery = ""
 	u.Fragment = ""
@@ -1025,27 +1064,38 @@ func redactURLForLog(raw string) string {
 	return u.String()
 }
 
-func resolveMaxStreamingPDFBytes(_ Options) int {
-	limit := MaxStreamingPDFBytes
+func resolveMaxStreamingPDFBytes(opts Options) int {
 	if envRaw := strings.TrimSpace(os.Getenv("EDGEFETCH_MAX_PDF_BYTES")); envRaw != "" {
-		if n, err := strconv.Atoi(envRaw); err == nil && n >= 1024 && n <= 256<<20 {
-			limit = n
+		if n, err := strconv.Atoi(envRaw); err == nil {
+			if n < 1024 {
+				return 1024
+			}
+			if n > 256<<20 {
+				return 256 << 20
+			}
+			return n
 		}
 	}
-	return limit
+	if opts.MaxBytes > 0 && opts.MaxBytes != DefaultMaxBytes {
+		if int64(opts.MaxBytes) < int64(MaxStreamingPDFBytes) {
+			return opts.MaxBytes
+		}
+		return MaxStreamingPDFBytes
+	}
+	return MaxStreamingPDFBytes
 }
 
 func (c *Crawler) logResult(ctx context.Context, log *slog.Logger, r Request, res Result) {
 	level := slog.LevelInfo
 	switch res.Outcome {
-	case classify.OutcomeChallenge, classify.OutcomeStop:
+	case classify.OutcomeChallenge, classify.OutcomeStop, classify.OutcomePaymentRequired:
 		level = slog.LevelWarn
 	case classify.OutcomeError:
 		level = slog.LevelError
 	}
 	log.Log(ctx, level, "fetch",
 		slog.String("store", r.ID), slog.String("url", redactURLForLog(r.URL)), slog.String("kind", string(r.Kind)),
-		slog.Int("status", res.Status), slog.String("outcome", string(res.Outcome)), slog.String("problem", res.Problem),
+		slog.Int("status", res.Status), slog.String("outcome", string(res.Outcome)), slog.String("problem", RedactEmbeddedURLs(res.Problem)),
 		slog.Int("attempts", res.Attempts), slog.Int64("duration_ms", res.DurationMs), slog.Int("bytes", res.Bytes),
 		slog.Bool("truncated", res.Truncated),
 		slog.Int64("dns_ms", res.Timing.DNSMs), slog.Int64("connect_ms", res.Timing.ConnectMs), slog.Int64("tls_ms", res.Timing.TLSMs),
@@ -1265,6 +1315,9 @@ func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, raw
 		return false, true, msg
 	}
 	if !entry.Allowed(u.RequestURI()) {
+		if entry.ContentSignalBlocked() {
+			return false, false, "disallowed by /robots.txt Content-Signal: ai-input=no"
+		}
 		return false, false, "robots.txt disallowed " + u.Path
 	}
 	return true, false, ""

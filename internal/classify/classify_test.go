@@ -30,7 +30,10 @@ func TestClassifyOutcomes(t *testing.T) {
 		{"generic json invalid", KindJSON, 200, "text/plain", "", `nope`, OutcomeError, "not JSON (text/plain)"},
 		{"generic json 404", KindJSON, 404, "application/json", "", `{}`, OutcomeError, "HTTP 404"},
 		{"page 200 html", KindPage, 200, "text/html; charset=utf-8", "", "<html>ok</html>", OutcomeOK, ""},
+		{"page 200 markdown for agents", KindPage, 200, "text/markdown; charset=utf-8", "", "# Origin Markdown\n", OutcomeOK, ""},
+		{"page 200 x-markdown", KindPage, 200, "text/x-markdown", "", "# Origin Markdown\n", OutcomeOK, ""},
 		{"page 200 non-html skipped", KindPage, 200, "image/png", "", "\x89PNG", OutcomeSkip, ""},
+		{"page 402 payment required", KindPage, 402, "application/json", "", `{"x402Version":1}`, OutcomePaymentRequired, "http 402 payment required"},
 		{"page 404 gone", KindPage, 404, "text/html", "", "not found", OutcomeGone, ""},
 		{"page 410 gone", KindPage, 410, "text/html", "", "gone", OutcomeGone, ""},
 		{"page 429 stops host", KindPage, 429, "text/plain", "", "slow down", OutcomeStop, "HTTP 429"},
@@ -41,6 +44,7 @@ func TestClassifyOutcomes(t *testing.T) {
 		{"catalog 200 ok", KindCatalog, 200, "text/html", "", "<html></html>", OutcomeOK, ""},
 		{"catalog 503 errors", KindCatalog, 503, "text/html", "", "down", OutcomeError, "HTTP 503"},
 		{"scrape 200 ok", KindScrape, 200, "text/html", "", "<main>hi</main>", OutcomeOK, ""},
+		{"scrape 402 x402 payment required", KindScrape, 402, "application/json", "", `{"accepts":[{"maxAmountRequired":"2000"}]}`, OutcomePaymentRequired, "http 402 payment required"},
 		{"scrape 429 stop", KindScrape, 429, "text/plain", "", "rate limited", OutcomeStop, "HTTP 429"},
 		{"scrape 404 gone", KindScrape, 404, "text/html", "", "missing", OutcomeGone, "HTTP 404"},
 		{"scrape 500 error", KindScrape, 500, "text/html", "", "err", OutcomeError, "HTTP 500"},
@@ -86,14 +90,15 @@ func TestAcceptForAndStopsHost(t *testing.T) {
 	}{
 		{KindFeed, "", "application/json", false},
 		{KindJSON, "", "application/json", false},
-		{KindPage, "", "text/html", false},
+		{KindPage, "", DefaultAgentPageAccept, false},
 		{KindCatalog, "", "text/html", false},
 		{KindRender, "", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", false},
-		{KindScrape, "", "text/markdown,text/html;q=0.95,application/xhtml+xml;q=0.9,application/pdf;q=0.85,application/json;q=0.8,*/*;q=0.7", false},
+		{KindScrape, "", DefaultAgentPageAccept, false},
 		{KindScrape, "text/markdown", "text/markdown", false},
 		{KindPDF, "", "application/pdf,*/*;q=0.8", false},
 		{KindBinary, "", "*/*", false},
 		{KindBinary, "image/webp", "image/webp", false},
+		{KindText, "text/markdown", "text/markdown", false},
 		{KindText, "application/xml", "application/xml", false},
 		{KindText, "text/plain", "text/plain", false},
 		{KindText, "*/*", "", true},
@@ -113,8 +118,8 @@ func TestAcceptForAndStopsHost(t *testing.T) {
 		}
 	}
 
-	if !StopsHost(KindScrape, OutcomeChallenge) || !StopsHost(KindScrape, OutcomeStop) {
-		t.Fatal("Challenge and Stop must always stop host")
+	if !StopsHost(KindScrape, OutcomeChallenge) || !StopsHost(KindScrape, OutcomeStop) || !StopsHost(KindPage, OutcomePaymentRequired) {
+		t.Fatal("Challenge, Stop, and PaymentRequired must always stop host")
 	}
 	if !StopsHost(KindFeed, OutcomeError) || !StopsHost(KindJSON, OutcomeError) || !StopsHost(KindCatalog, OutcomeError) {
 		t.Fatal("OutcomeError on Feed/JSON/Catalog must stop host")

@@ -9,68 +9,191 @@
 
 import { extractJsonLdObjects } from './extractors/utils';
 import { validatePublicHttpsTargetUrl } from './overflow';
+import {
+  asciiLower,
+  isTagNameBoundary,
+  MAX_HTML_SCAN_CHARS,
+  replacePairedHtmlElementsLinear,
+  scanHtmlTagsLinear,
+  stripHtmlCommentsLinear,
+  stripHtmlTagsLinear,
+  stripHtmlTagsQuoteAwareLinear,
+} from './safe-input';
 
 const INJECTION_PATTERNS: Array<{ id: string; re: RegExp; weight: number }> = [
   {
     id: 'ignore_previous_instructions',
-    re: /\b(?:ignore|disregard|forget|override)\s+(?:all\s+)?(?:previous|prior|above|earlier|system|developer)\s+(?:instructions?|prompts?|rules?|directives?|guidelines?)\b/i,
+    re: /\b(?:ignore|disregard|forget|override)[ \t\r\n]{1,20}(?:all[ \t\r\n]{1,20})?(?:previous|prior|above|earlier|system|developer)[ \t\r\n]{1,20}(?:instructions?|prompts?|rules?|directives?|guidelines?)\b/i,
     weight: 3,
   },
   {
     id: 'new_system_role_override',
-    re: /(?:^|\n)\s*(?:\[?\s*system\s*(?:prompt|override|instruction)\s*\]?|<\s*system\s*>|###\s*system\s*instruction)\s*:/i,
+    re: /(?:^|\n)[ \t]{0,20}(?:\[?[ \t]{0,10}system[ \t]{0,10}(?:prompt|override|instruction)[ \t]{0,10}\]?|<[ \t]{0,10}system[ \t]{0,10}>|###[ \t]{0,10}system[ \t]{1,10}instruction)[ \t]{0,10}:/i,
     weight: 3,
   },
   {
     id: 'exfiltrate_secrets_or_tools',
-    re: /\b(?:send|post|upload|exfiltrate|transmit|forward)\s+(?:the\s+)?(?:api[_\s-]?key|token|secret|password|conversation|system\s+prompt|ssh|env)\s+(?:to|via)\s+https?:\/\//i,
+    re: /\b(?:send|post|upload|exfiltrate|transmit|forward)[ \t\r\n]{1,20}(?:the[ \t\r\n]{1,20})?(?:api[_\s-]?key|token|secret|password|conversation|system[ \t\r\n]{1,10}prompt|ssh|env)[ \t\r\n]{1,20}(?:to|via)[ \t\r\n]{1,20}https?:\/\//i,
     weight: 4,
   },
   {
     id: 'tool_invocation_hijack',
-    re: /\b(?:immediately\s+call|you\s+must\s+now\s+execute|invoke\s+the\s+tool|execute\s+bash\s+command)\b[^.\n]{0,80}\b(?:curl|wget|fetch_url|bash|rm\s+-rf)\b/i,
+    re: /\b(?:immediately[ \t\r\n]{1,20}call|you[ \t\r\n]{1,20}must[ \t\r\n]{1,20}now[ \t\r\n]{1,20}execute|invoke[ \t\r\n]{1,20}the[ \t\r\n]{1,20}tool|execute[ \t\r\n]{1,20}bash[ \t\r\n]{1,20}command)\b[^.\n]{0,80}\b(?:curl|wget|fetch_url|bash|rm[ \t]{1,10}-rf)\b/i,
     weight: 4,
   },
 ];
 
+const HIDDEN_STYLE_TOKEN_RE = /(?:display[ \t]*:[ \t]*none|visibility[ \t]*:[ \t]*hidden|opacity[ \t]*:[ \t]*0(?![0-9.])|font-size[ \t]*:[ \t]*0(?![0-9.]))/i;
+const HIDDEN_OVERRIDE_KEYWORD_RE = /\b(?:ignore|disregard|system[ \t\r\n]{1,10}prompt|assistant|tool|execute|instructions?)\b/i;
+
+/**
+ * Strips fenced code blocks (supporting 3+ backticks or tildes per CommonMark so 4-backtick fences cannot be broken out
+ * of by inner 3-backtick lines!) and inline code spans in linear O(N) time (`H1`).
+ */
+function stripMarkdownCodeBlocksAndSpansLinear(md: string): string {
+  const lines = md.split('\n');
+  const proseLines: string[] = [];
+  let openFenceChar = '';
+  let openFenceLen = 0;
+
+  for (const line of lines) {
+    if (!openFenceChar) {
+      const m = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(line);
+      if (m) {
+        const fence = m[1]!;
+        const ch = fence[0]!;
+        // Info string for backtick fences cannot contain backticks in CommonMark
+        if (ch !== '`' || !line.slice(m[0].length).includes('`')) {
+          openFenceChar = ch;
+          openFenceLen = fence.length;
+          continue;
+        }
+      }
+      proseLines.push(line);
+    } else {
+      const closeRe = openFenceChar === '`' ? /^[ \t]{0,3}(`{3,})[ \t\r]*$/ : /^[ \t]{0,3}(~{3,})[ \t\r]*$/;
+      const cm = closeRe.exec(line);
+      if (cm && cm[1]!.length >= openFenceLen) {
+        openFenceChar = '';
+        openFenceLen = 0;
+      }
+    }
+  }
+
+  // Strip inline code spans line-by-line (linear scan matching equal-length backtick runs)
+  return proseLines
+    .map((ln) => {
+      if (ln.indexOf('`') < 0) return ln;
+      let out = '';
+      let i = 0;
+      while (i < ln.length) {
+        const tick = ln.indexOf('`', i);
+        if (tick < 0) {
+          out += ln.slice(i);
+          break;
+        }
+        out += ln.slice(i, tick);
+        let runEnd = tick + 1;
+        while (runEnd < ln.length && ln.charCodeAt(runEnd) === 96) runEnd++;
+        const runLen = runEnd - tick;
+        // Find matching run of exact `runLen` backticks on this line
+        let search = runEnd;
+        let matchedEnd = -1;
+        while (search < ln.length) {
+          const nextTick = ln.indexOf('`', search);
+          if (nextTick < 0) break;
+          let nextEnd = nextTick + 1;
+          while (nextEnd < ln.length && ln.charCodeAt(nextEnd) === 96) nextEnd++;
+          if (nextEnd - nextTick === runLen) {
+            matchedEnd = nextEnd;
+            break;
+          }
+          search = nextEnd;
+        }
+        if (matchedEnd >= 0) {
+          out += ' ';
+          i = matchedEnd;
+        } else {
+          out += ln.slice(tick, runEnd);
+          i = runEnd;
+        }
+      }
+      return out;
+    })
+    .join('\n');
+}
+
 /**
  * Scans extracted prose and raw HTML for indirect prompt-injection payloads while stripping fenced code blocks and
- * `<code>`/`<pre>` elements so security documentation discussing prompt injection does not false-positive.
+ * `<code>`/`<pre>` elements so security documentation discussing prompt injection does not false-positive (`H1`).
  */
 export function detectPromptInjection(params: {
   markdown: string;
   rawHtml?: string;
 }): { detected: boolean; triggers: string[] } {
-  const { markdown, rawHtml = '' } = params;
+  const boundedHtml = (params.rawHtml ?? '').slice(0, 250_000);
+  const boundedMd = params.markdown.slice(0, 250_000);
   const triggers: string[] = [];
   let totalScore = 0;
 
   // 1. Invisible Unicode Tag ASCII smuggling (`U+E0000`–`U+E007F`) in raw source
-  if (/[\u{E0000}-\u{E007F}]{4,}/u.test(rawHtml)) {
+  if (/[\u{E0000}-\u{E007F}]{4,}/u.test(boundedHtml)) {
     triggers.push('unicode_tag_ascii_smuggling');
     totalScore += 4;
   }
 
-  // 2. Hidden CSS / DOM subtree containing imperative LLM override phrases
-  const rawWithoutCode = rawHtml
-    .replace(/<(?:pre|code)\b[^>]*>[\s\S]*?<\/(?:pre|code)>/gi, ' ')
-    .slice(0, 250_000);
-  for (const hiddenMatch of rawWithoutCode.matchAll(
-    /<([a-z0-9]+)\b[^>]*style\s*=\s*(?:"[^"]*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0|font-size\s*:\s*0)[^"]*"|'[^']*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0|font-size\s*:\s*0)[^']*')[^>]*>([\s\S]{1,1200}?)<\/\1>/gi,
-  )) {
-    const innerTxt = hiddenMatch[2]!.replace(/<[^>]+>/g, ' ');
-    if (/\b(?:ignore|disregard|system\s+prompt|assistant|tool|execute|instructions?)\b/i.test(innerTxt)) {
-      triggers.push('hidden_css_instruction_injection');
-      totalScore += 5;
-      break;
-    }
-  }
+  // 2. Hidden CSS / DOM subtree containing imperative LLM override phrases (strictly linear O(N) scan with monotonic close-tag & window cursors)
+  const rawWithoutCode = stripHtmlTagsLinear(boundedHtml, ['pre', 'code'], ' ', 250_000);
+  const lowerWithoutCode = asciiLower(rawWithoutCode);
+  const nextCloseByTag = new Map<string, number>();
+  let scannedHiddenUpTo = 0;
+  scanHtmlTagsLinear(
+    rawWithoutCode,
+    (tag) => {
+      if (tag.isClosing || tag.isSelfClosing || tag.isDeclaration) return;
+      if (tag.attrs.indexOf('style') < 0 && tag.attrs.indexOf('STYLE') < 0 && !/style/i.test(tag.attrs)) return;
+      const attrs = parseOpenTagAttributes(tag.attrs);
+      const styleVal = attrs.style ?? '';
+      if (!styleVal || !HIDDEN_STYLE_TOKEN_RE.test(styleVal)) return;
+
+      const closeNeedle = `</${tag.tagNameLower}`;
+      let closeIdx = nextCloseByTag.get(tag.tagNameLower);
+      if (closeIdx === undefined || (closeIdx >= 0 && closeIdx < tag.end)) {
+        let searchFrom = closeIdx !== undefined && closeIdx >= 0 ? Math.max(tag.end, closeIdx) : tag.end;
+        let found = -1;
+        while (searchFrom < rawWithoutCode.length) {
+          const cand = lowerWithoutCode.indexOf(closeNeedle, searchFrom);
+          if (cand < 0) break;
+          const afterIdx = cand + closeNeedle.length;
+          if (afterIdx < rawWithoutCode.length && isTagNameBoundary(rawWithoutCode.charCodeAt(afterIdx))) {
+            found = cand;
+            break;
+          }
+          searchFrom = afterIdx;
+        }
+        closeIdx = found;
+        nextCloseByTag.set(tag.tagNameLower, closeIdx);
+      }
+
+      const maxSearchEnd = Math.min(rawWithoutCode.length, tag.end + 1400);
+      const sliceEnd = closeIdx >= 0 && closeIdx <= maxSearchEnd ? closeIdx : Math.min(rawWithoutCode.length, tag.end + 1200);
+      const sliceStart = Math.max(tag.end, scannedHiddenUpTo - 64);
+      if (sliceEnd <= sliceStart) return;
+      scannedHiddenUpTo = Math.max(scannedHiddenUpTo, sliceEnd);
+      const innerTxt = stripHtmlTagsQuoteAwareLinear(rawWithoutCode.slice(sliceStart, sliceEnd), ' ', 2000);
+      if (HIDDEN_OVERRIDE_KEYWORD_RE.test(innerTxt)) {
+        triggers.push('hidden_css_instruction_injection');
+        totalScore += 5;
+        return false;
+      }
+      return undefined;
+    },
+    250_000,
+    false,
+  );
 
   // 3. Prose scan (excluding fenced code blocks and inline code spans)
-  const proseWithoutCode = markdown
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/~~~[\s\S]*?~~~/g, ' ')
-    .replace(/`[^`\n]+`/g, ' ');
+  const proseWithoutCode = stripMarkdownCodeBlocksAndSpansLinear(boundedMd);
 
   for (const pat of INJECTION_PATTERNS) {
     if (pat.re.test(proseWithoutCode)) {
@@ -127,15 +250,31 @@ function parseOpenTagAttributes(attrChunk: string): Record<string, string> {
 }
 
 /**
- * Extracts HTML attribute values for `{ type: "attributes", selectors: [{ selector, attribute }] }` without DOM bloat.
+ * Extracts HTML attribute values for `{ type: "attributes", selectors: [{ selector, attribute }] }` without DOM bloat (`H1`).
  */
 export function extractHtmlAttributesBySelectors(
   rawHtml: string,
   selectors: Array<{ selector: string; attribute: string }>,
 ): Record<string, unknown> {
-  const cleanedHtml = rawHtml
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<(?:script|style|template)\b[^>]*>[\s\S]*?<\/(?:script|style|template)>/gi, '');
+  const cleanedHtml = stripHtmlTagsLinear(
+    stripHtmlCommentsLinear(rawHtml, MAX_HTML_SCAN_CHARS),
+    ['script', 'style', 'template'],
+    '',
+    MAX_HTML_SCAN_CHARS,
+  );
+
+  // Scan open tags ONCE linearly across all requested selectors
+  const openTags: Array<{ tag: string; attrs: Record<string, string> }> = [];
+  scanHtmlTagsLinear(
+    cleanedHtml,
+    (t) => {
+      if (t.isClosing || t.isDeclaration) return;
+      openTags.push({ tag: t.tagNameLower, attrs: parseOpenTagAttributes(t.attrs) });
+      return openTags.length < 25_000 ? undefined : false;
+    },
+    MAX_HTML_SCAN_CHARS,
+    false,
+  );
 
   const results: Array<{ selector: string; attribute: string; values: string[] }> = [];
   for (const spec of selectors.slice(0, 25)) {
@@ -149,11 +288,10 @@ export function extractHtmlAttributesBySelectors(
     }
 
     const values: string[] = [];
-    const tagPattern = parsed.tag ? parsed.tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : '[a-zA-Z][a-zA-Z0-9-]*';
-    const openRe = new RegExp(`<(${tagPattern})\\b((?:"[^"]*"|'[^']*'|[^>"'])*)>`, 'gi');
-    let m: RegExpExecArray | null;
-    while ((m = openRe.exec(cleanedHtml)) !== null && values.length < 200) {
-      const attrs = parseOpenTagAttributes(m[2] ?? '');
+    for (const item of openTags) {
+      if (values.length >= 200) break;
+      if (parsed.tag && item.tag !== parsed.tag) continue;
+      const attrs = item.attrs;
       if (parsed.id && attrs.id !== parsed.id) continue;
       if (parsed.classes.length > 0) {
         const clsTokens = (attrs.class ?? '').split(/\s+/).filter(Boolean);
@@ -174,20 +312,47 @@ export function extractHtmlAttributesBySelectors(
 }
 
 function matchMetaContent(rawHtml: string, names: readonly string[]): string | undefined {
-  for (const name of names) {
-    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const m =
-      new RegExp(`<meta\\b[^>]*(?:property|name|itemprop)\\s*=\\s*["']${escaped}["'][^>]*content\\s*=\\s*["']([^"']+)["']`, 'i').exec(
-        rawHtml,
-      ) ??
-      new RegExp(`<meta\\b[^>]*content\\s*=\\s*["']([^"']+)["'][^>]*(?:property|name|itemprop)\\s*=\\s*["']${escaped}["']`, 'i').exec(
-        rawHtml,
-      );
-    if (m?.[1]?.trim()) {
-      return m[1].trim().replace(/&amp;/g, '&').replace(/&quot;/g, '"');
-    }
+  const wanted = new Map<string, number>();
+  names.forEach((n, idx) => wanted.set(n.toLowerCase(), idx));
+  const hits = new Map<number, string>();
+  scanHtmlTagsLinear(
+    rawHtml,
+    (tag) => {
+      if (tag.isClosing || tag.tagNameLower !== 'meta') return;
+      const attrs = parseOpenTagAttributes(tag.attrs);
+      const key = (attrs.property ?? attrs.name ?? attrs.itemprop ?? '').toLowerCase();
+      const orderIdx = wanted.get(key);
+      if (orderIdx !== undefined && !hits.has(orderIdx) && attrs.content?.trim()) {
+        hits.set(orderIdx, attrs.content.trim());
+        if (orderIdx === 0) return false;
+      }
+      return undefined;
+    },
+    160_000,
+    false,
+  );
+  for (let i = 0; i < names.length; i++) {
+    const val = hits.get(i);
+    if (val) return val;
   }
   return undefined;
+}
+
+function extractFirstHeadingTextLinear(rawBody: string, tagNameLower: string): string | undefined {
+  let heading: string | undefined;
+  replacePairedHtmlElementsLinear(
+    rawBody,
+    [tagNameLower],
+    (_full, _t, _attrs, inner) => {
+      if (heading === undefined) {
+        const clean = stripHtmlTagsQuoteAwareLinear(inner, ' ', 8000).replace(/\s+/g, ' ').trim();
+        if (clean) heading = clean;
+      }
+      return '';
+    },
+    { maxChars: 200_000, maxInnerChars: 8000 },
+  );
+  return heading;
 }
 
 /**
@@ -302,7 +467,7 @@ export function extractStructuredProduct(params: {
   if (ogType === 'product' || ogType === 'og:product' || ogType?.includes('food') || barcodeMatch) {
     const titleCandidate =
       matchMetaContent(rawBody, ['og:title', 'twitter:title']) ??
-      /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(rawBody)?.[1]?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() ??
+      extractFirstHeadingTextLinear(rawBody, 'h1') ??
       fallbackTitle;
     if (titleCandidate) {
       const brandFromTitle = titleCandidate.includes('–')

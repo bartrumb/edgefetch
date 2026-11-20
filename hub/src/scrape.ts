@@ -10,11 +10,17 @@
 
 import { applyPostFetchSiteExtractor, resolveSiteExtractorTwin } from './extractors/registry';
 import {
-  MAX_HTML_SCAN_CHARS,
+  asciiLower,
   escapeRegexLiteral,
+  MAX_HTML_SCAN_CHARS,
+  replaceHtmlOpenTagsLinear,
   replaceHtmlTagBlocksLinear,
+  replaceHtmlTagsQuoteAwareLinear,
+  replacePairedHtmlElementsLinear,
+  scanHtmlTagsLinear,
   stripHtmlCommentsLinear,
   stripHtmlTagsLinear,
+  stripHtmlTagsQuoteAwareLinear,
 } from './safe-input';
 import { isContentVerifiedInMetaD1, sha256HexString } from './ingest';
 import {
@@ -29,7 +35,7 @@ import {
   type StructuredJobPosting,
 } from './jobs';
 import { computeMarkdownChanges } from './map-crawl';
-import { validatePublicHttpsTargetUrl } from './overflow';
+import { MARKDOWN_FOR_AGENTS_ACCEPT, validatePublicHttpsTargetUrl } from './overflow';
 import { chunkMarkdownForSearch, rankChunksInMemory } from './search-index';
 import {
   isValidSha256Hex,
@@ -70,7 +76,7 @@ import {
   splitPdfPagesAndMarkers,
 } from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 23;
+export const SCRAPE_PIPELINE_VERSION = 24;
 
 export interface ScrapedImage {
   url: string;
@@ -395,8 +401,6 @@ function resolveHttpsHref(rawHref: string | undefined, baseUrl?: string, preserv
   }
 }
 
-const HTML_TAG_QUOTE_AWARE_RE = /<\/?[A-Za-z!][A-Za-z0-9:-]*(?:"[^"]*"|'[^']*'|[^>"'])*\/?>/g;
-
 function collapseTagBoundaryPunctuation(s: string): string {
   return s
     .replace(/(?<!\[) +([,.;:!?)\]}])(?=\s|$|[,.;:!?)\]}])/g, '$1')
@@ -406,8 +410,9 @@ function collapseTagBoundaryPunctuation(s: string): string {
 }
 
 function cleanInlineHtml(fragment: string): string {
+  const stripped = replaceHtmlTagsQuoteAwareLinear(fragment, (t) => (!t.isClosing && t.tagNameLower === 'wbr' ? '' : ' '));
   return collapseTagBoundaryPunctuation(
-    decodeHtmlEntities(fragment.replace(/<wbr\b[^>]*\/?>/gi, '').replace(HTML_TAG_QUOTE_AWARE_RE, ' '))
+    decodeHtmlEntities(stripped)
       .replace(/\s+/g, ' ')
       .trim(),
   );
@@ -540,31 +545,44 @@ const ALWAYS_HIDDEN_OR_CHROME_CLASSES = new Set([
   'hljs-ln-numbers',
 ]);
 
-/** Extracts the inner HTML of a balanced `<div|section ... role="main">` landmark when `<main>` and `<article>` are absent. */
+/** Extracts the inner HTML of a balanced `<div|section ... role="main">` landmark in guaranteed O(N) time (`H1`). */
 function extractBalancedRoleMainHtml(html: string): string | null {
-  const openMatch =
-    /<(div|section)\b(?:"[^"]*"|'[^']*'|[^>"'])*\brole\s*=\s*(?:"main"|'main'|main)(?=[\s/>])(?:"[^"]*"|'[^']*'|[^>"'])*>/i.exec(
-      html,
-    );
-  if (!openMatch || openMatch.index === undefined) return null;
-  const tagName = openMatch[1]!.toLowerCase();
-  const contentStart = openMatch.index + openMatch[0].length;
-  const tagRe = new RegExp(`<\\/?${tagName}\\b(?:"[^"]*"|'[^']*'|[^>"'])*\\/?>`, 'gi');
-  tagRe.lastIndex = contentStart;
-  let depth = 1;
-  let m: RegExpExecArray | null;
-  while ((m = tagRe.exec(html)) !== null) {
-    const rawTag = m[0];
-    if (rawTag.startsWith('</')) {
-      depth--;
-      if (depth === 0) {
-        return html.slice(contentStart, m.index);
+  let targetTag = '';
+  let contentStart = -1;
+  let depth = 0;
+  let matchedInner: string | null = null;
+
+  scanHtmlTagsLinear(
+    html,
+    (tag) => {
+      if (tag.tagNameLower !== 'div' && tag.tagNameLower !== 'section') return;
+      if (!targetTag) {
+        if (tag.isClosing || tag.isSelfClosing) return;
+        const attrs = parseTagAttrs(tag.attrs);
+        if ((attrs.role ?? '').trim().toLowerCase() === 'main') {
+          targetTag = tag.tagNameLower;
+          contentStart = tag.end;
+          depth = 1;
+        }
+        return undefined;
       }
-    } else if (!rawTag.endsWith('/>')) {
-      depth++;
-    }
-  }
-  return null;
+      if (tag.tagNameLower !== targetTag) return;
+      if (tag.isClosing) {
+        depth--;
+        if (depth === 0) {
+          matchedInner = html.slice(contentStart, tag.index);
+          return false;
+        }
+      } else if (!tag.isSelfClosing) {
+        depth++;
+      }
+      return undefined;
+    },
+    MAX_HTML_SCAN_CHARS,
+    false,
+  );
+
+  return matchedInner;
 }
 
 function shouldStripSubtreeOpenTag(tagLower: string, attrStr: string): boolean {
@@ -624,53 +642,57 @@ function shouldStripSubtreeOpenTag(tagLower: string, attrStr: string): boolean {
   return false;
 }
 
-/** O(N) quote-aware balanced tag scanner that removes hidden (`.d-none`, `[hidden]`, `display:none`) and WAI-ARIA nav/chrome subtrees. */
+/** O(N) quote-aware balanced tag scanner that removes hidden (`.d-none`, `[hidden]`, `display:none`) and WAI-ARIA nav/chrome subtrees (`H1`). */
 function stripHiddenAndChromeSubtrees(html: string): string {
-  const tagScanRe = /<\/?([A-Za-z][A-Za-z0-9:-]*)\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/g;
+  const src = html.length > MAX_HTML_SCAN_CHARS ? html.slice(0, MAX_HTML_SCAN_CHARS) : html;
   const chunks: string[] = [];
   let lastKeepIdx = 0;
   let skipTag = '';
   let skipDepth = 0;
   let skipStartIdx = 0;
-  let m: RegExpExecArray | null;
-  while ((m = tagScanRe.exec(html)) !== null) {
-    const fullTag = m[0];
-    const tagLower = m[1]!.toLowerCase();
-    const isClosing = fullTag.charCodeAt(1) === 0x2f; // '/'
-    const isSelfClosing = !isClosing && (VOID_HTML_TAGS.has(tagLower) || fullTag.endsWith('/>'));
 
-    if (skipDepth > 0) {
-      if (tagLower === skipTag) {
-        if (isClosing) {
-          skipDepth--;
-          if (skipDepth === 0) {
-            lastKeepIdx = m.index + fullTag.length;
+  scanHtmlTagsLinear(
+    src,
+    (tag) => {
+      const tagLower = tag.tagNameLower;
+      const isClosing = tag.isClosing;
+      const isSelfClosing = !isClosing && (VOID_HTML_TAGS.has(tagLower) || tag.isSelfClosing);
+
+      if (skipDepth > 0) {
+        if (tagLower === skipTag) {
+          if (isClosing) {
+            skipDepth--;
+            if (skipDepth === 0) {
+              lastKeepIdx = tag.end;
+            }
+          } else if (!isSelfClosing) {
+            skipDepth++;
           }
-        } else if (!isSelfClosing) {
-          skipDepth++;
+        }
+        return;
+      }
+
+      if (!isClosing && shouldStripSubtreeOpenTag(tagLower, tag.attrs)) {
+        chunks.push(src.slice(lastKeepIdx, tag.index));
+        if (isSelfClosing) {
+          lastKeepIdx = tag.end;
+        } else {
+          skipTag = tagLower;
+          skipDepth = 1;
+          skipStartIdx = tag.index;
         }
       }
-      continue;
-    }
+    },
+    MAX_HTML_SCAN_CHARS,
+    false,
+  );
 
-    if (!isClosing && shouldStripSubtreeOpenTag(tagLower, m[2] ?? '')) {
-      chunks.push(html.slice(lastKeepIdx, m.index));
-      if (isSelfClosing) {
-        lastKeepIdx = m.index + fullTag.length;
-      } else {
-        skipTag = tagLower;
-        skipDepth = 1;
-        skipStartIdx = m.index;
-      }
-    }
-  }
-
-  if (chunks.length === 0 && skipDepth === 0) return html;
+  if (chunks.length === 0 && skipDepth === 0) return src;
   if (skipDepth > 0) {
     // Unclosed malformed tag: preserve tail from `skipStartIdx` so broken HTML never truncates prose.
-    chunks.push(html.slice(skipStartIdx));
-  } else if (lastKeepIdx < html.length) {
-    chunks.push(html.slice(lastKeepIdx));
+    chunks.push(src.slice(skipStartIdx));
+  } else if (lastKeepIdx < src.length) {
+    chunks.push(src.slice(lastKeepIdx));
   }
   return chunks.join('');
 }
@@ -874,50 +896,53 @@ function tagMatchesSimpleSelectors(tagLower: string, attrStr: string, selectors:
   return false;
 }
 
-/** Applies Firecrawl-compatible `includeTags` and `excludeTags` (`tag`, `#id`, `.class`) using O(N) balanced subtree scanning. */
+/** Applies Firecrawl-compatible `includeTags` and `excludeTags` (`tag`, `#id`, `.class`) using O(N) balanced subtree scanning (`H1`). */
 function applyIncludeAndExcludeTagSelectors(
   html: string,
   includeTags?: readonly string[],
   excludeTags?: readonly string[],
 ): string {
-  let out = html;
+  let out = html.length > MAX_HTML_SCAN_CHARS ? html.slice(0, MAX_HTML_SCAN_CHARS) : html;
   const parsedInclude = parseSimpleSelectorList(includeTags);
   if (parsedInclude.length > 0) {
-    const tagScanRe = /<\/?([A-Za-z][A-Za-z0-9:-]*)\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/g;
     const kept: string[] = [];
     let matchTag = '';
     let matchDepth = 0;
     let matchStart = 0;
-    let m: RegExpExecArray | null;
-    while ((m = tagScanRe.exec(out)) !== null) {
-      const fullTag = m[0];
-      const tagLower = m[1]!.toLowerCase();
-      const isClosing = fullTag.charCodeAt(1) === 0x2f;
-      const isSelfClosing = !isClosing && (VOID_HTML_TAGS.has(tagLower) || fullTag.endsWith('/>'));
-      if (matchDepth > 0) {
-        if (tagLower === matchTag) {
-          if (isClosing) {
-            matchDepth--;
-            if (matchDepth === 0) {
-              kept.push(out.slice(matchStart, m.index + fullTag.length));
+    const src = out;
+    scanHtmlTagsLinear(
+      src,
+      (tag) => {
+        const tagLower = tag.tagNameLower;
+        const isClosing = tag.isClosing;
+        const isSelfClosing = !isClosing && (VOID_HTML_TAGS.has(tagLower) || tag.isSelfClosing);
+        if (matchDepth > 0) {
+          if (tagLower === matchTag) {
+            if (isClosing) {
+              matchDepth--;
+              if (matchDepth === 0) {
+                kept.push(src.slice(matchStart, tag.end));
+              }
+            } else if (!isSelfClosing) {
+              matchDepth++;
             }
-          } else if (!isSelfClosing) {
-            matchDepth++;
+          }
+          return;
+        }
+        if (!isClosing && tagMatchesSimpleSelectors(tagLower, tag.attrs, parsedInclude)) {
+          if (isSelfClosing) {
+            kept.push(tag.rawTag);
+          } else {
+            matchTag = tagLower;
+            matchDepth = 1;
+            matchStart = tag.index;
           }
         }
-        continue;
-      }
-      if (!isClosing && tagMatchesSimpleSelectors(tagLower, m[2] ?? '', parsedInclude)) {
-        if (isSelfClosing) {
-          kept.push(fullTag);
-        } else {
-          matchTag = tagLower;
-          matchDepth = 1;
-          matchStart = m.index;
-        }
-      }
-    }
-    if (matchDepth > 0) kept.push(out.slice(matchStart));
+      },
+      MAX_HTML_SCAN_CHARS,
+      false,
+    );
+    if (matchDepth > 0) kept.push(src.slice(matchStart));
     if (kept.length > 0) {
       out = kept.join('\n\n');
     }
@@ -925,43 +950,46 @@ function applyIncludeAndExcludeTagSelectors(
 
   const parsedExclude = parseSimpleSelectorList(excludeTags);
   if (parsedExclude.length > 0) {
-    const tagScanRe = /<\/?([A-Za-z][A-Za-z0-9:-]*)\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/g;
     const chunks: string[] = [];
     let lastKeepIdx = 0;
     let skipTag = '';
     let skipDepth = 0;
     let skipStartIdx = 0;
-    let m: RegExpExecArray | null;
-    while ((m = tagScanRe.exec(out)) !== null) {
-      const fullTag = m[0];
-      const tagLower = m[1]!.toLowerCase();
-      const isClosing = fullTag.charCodeAt(1) === 0x2f;
-      const isSelfClosing = !isClosing && (VOID_HTML_TAGS.has(tagLower) || fullTag.endsWith('/>'));
-      if (skipDepth > 0) {
-        if (tagLower === skipTag) {
-          if (isClosing) {
-            skipDepth--;
-            if (skipDepth === 0) lastKeepIdx = m.index + fullTag.length;
-          } else if (!isSelfClosing) {
-            skipDepth++;
+    const src = out;
+    scanHtmlTagsLinear(
+      src,
+      (tag) => {
+        const tagLower = tag.tagNameLower;
+        const isClosing = tag.isClosing;
+        const isSelfClosing = !isClosing && (VOID_HTML_TAGS.has(tagLower) || tag.isSelfClosing);
+        if (skipDepth > 0) {
+          if (tagLower === skipTag) {
+            if (isClosing) {
+              skipDepth--;
+              if (skipDepth === 0) lastKeepIdx = tag.end;
+            } else if (!isSelfClosing) {
+              skipDepth++;
+            }
+          }
+          return;
+        }
+        if (!isClosing && tagMatchesSimpleSelectors(tagLower, tag.attrs, parsedExclude)) {
+          chunks.push(src.slice(lastKeepIdx, tag.index));
+          if (isSelfClosing) {
+            lastKeepIdx = tag.end;
+          } else {
+            skipTag = tagLower;
+            skipDepth = 1;
+            skipStartIdx = tag.index;
           }
         }
-        continue;
-      }
-      if (!isClosing && tagMatchesSimpleSelectors(tagLower, m[2] ?? '', parsedExclude)) {
-        chunks.push(out.slice(lastKeepIdx, m.index));
-        if (isSelfClosing) {
-          lastKeepIdx = m.index + fullTag.length;
-        } else {
-          skipTag = tagLower;
-          skipDepth = 1;
-          skipStartIdx = m.index;
-        }
-      }
-    }
+      },
+      MAX_HTML_SCAN_CHARS,
+      false,
+    );
     if (chunks.length > 0 || skipDepth > 0) {
-      if (skipDepth > 0) chunks.push(out.slice(skipStartIdx));
-      else if (lastKeepIdx < out.length) chunks.push(out.slice(lastKeepIdx));
+      if (skipDepth > 0) chunks.push(src.slice(skipStartIdx));
+      else if (lastKeepIdx < src.length) chunks.push(src.slice(lastKeepIdx));
       out = chunks.join('');
     }
   }
@@ -1059,34 +1087,31 @@ function extractSubstackPreloadData(rawHtml: string): SubstackPreloadExtracted |
 
 function hnFragmentToMarkdown(fragHtml: string, baseUrl: string): string {
   const codeBlocks: string[] = [];
-  let s = fragHtml
-    .replace(/<div\b[^>]*\breply\b[^>]*>[\s\S]*?<\/div>/gi, '')
-    .replace(/<pre\b[^>]*>\s*(?:<code\b[^>]*>)?([\s\S]*?)(?:<\/code>)?\s*<\/pre>/gi, (_m, code: string) => {
-      const clean = decodeHtmlEntities(code.replace(HTML_TAG_QUOTE_AWARE_RE, '')).trimEnd();
-      const idx = codeBlocks.push(`\n\n${makeSafeCodeFence(clean)}\n\n`) - 1;
-      return `\u0000HNCODE${idx}\u0000`;
-    })
-    .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_m, c: string) => {
-      const span = formatInlineCodeSpan(cleanInlineHtml(c));
-      if (!span) return '';
-      const idx = codeBlocks.push(span) - 1;
-      return `\u0000HNCODE${idx}\u0000`;
-    })
-    .replace(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/gi, (_m, attrStr: string, inner: string) => {
-      const attrs = parseTagAttrs(attrStr);
-      const href = resolveHttpsHref(attrs.href, baseUrl, true);
-      const label = cleanInlineHtml(inner);
-      if (!label) return href ?? '';
-      return href ? `[${label}](${href})` : label;
-    })
-    .replace(/<(?:i|em)\b[^>]*>([\s\S]*?)<\/(?:i|em)>/gi, (_m, inner: string) => {
-      const t = cleanInlineHtml(inner);
-      return t ? `*${t}*` : '';
-    })
-    .replace(/<p\b[^>]*>/gi, '\n\n')
-    .replace(/<\/p>/gi, '')
-    .replace(/<br\b[^>]*\/?>/gi, '\n')
-    .replace(HTML_TAG_QUOTE_AWARE_RE, '');
+  let s = fragHtml.replace(/<div\b[^>]*\breply\b[^>]*>[\s\S]*?<\/div>/gi, '');
+  s = replacePairedHtmlElementsLinear(s, ['pre'], (_full, _t, _attrs, inner) => {
+    const clean = decodeHtmlEntities(stripHtmlTagsQuoteAwareLinear(inner, '')).trimEnd();
+    const idx = codeBlocks.push(`\n\n${makeSafeCodeFence(clean)}\n\n`) - 1;
+    return `\u0000HNCODE${idx}\u0000`;
+  });
+  s = replacePairedHtmlElementsLinear(s, ['code'], (_full, _t, _attrs, c) => {
+    const span = formatInlineCodeSpan(cleanInlineHtml(c));
+    if (!span) return '';
+    const idx = codeBlocks.push(span) - 1;
+    return `\u0000HNCODE${idx}\u0000`;
+  });
+  s = replacePairedHtmlElementsLinear(s, ['a'], (_full, _t, attrStr, inner) => {
+    const attrs = parseTagAttrs(attrStr);
+    const href = resolveHttpsHref(attrs.href, baseUrl, true);
+    const label = cleanInlineHtml(inner);
+    if (!label) return href ?? '';
+    return href ? `[${label}](${href})` : label;
+  });
+  s = replacePairedHtmlElementsLinear(s, ['i', 'em'], (_full, _t, _attrs, inner) => {
+    const t = cleanInlineHtml(inner);
+    return t ? `*${t}*` : '';
+  });
+  s = replaceHtmlOpenTagsLinear(s, ['p', 'br'], (t) => (t.tagNameLower === 'p' ? '\n\n' : '\n'));
+  s = stripHtmlTagsQuoteAwareLinear(s, '');
 
   s = decodeHtmlEntities(s)
     .split('\n')
@@ -1300,7 +1325,7 @@ function standardizeElementsInHtml(html: string, stashCode?: (mdBlock: string) =
   if (/(?:lntd|gutter|hljs-ln-numbers|blob-num)/i.test(out)) {
     out = out
       .replace(/<td\b[^>]*\b(?:lntd|gutter|hljs-ln-numbers|blob-num)\b[^>]*>([\s\S]{0,8000}?)<\/td>/gi, (full, inner: string) => {
-        const plain = inner.replace(HTML_TAG_QUOTE_AWARE_RE, '').trim();
+        const plain = stripHtmlTagsQuoteAwareLinear(inner, '').trim();
         return /^[\d\s]+$/.test(plain) ? '' : full;
       })
       .replace(
@@ -1338,18 +1363,21 @@ function standardizeElementsInHtml(html: string, stashCode?: (mdBlock: string) =
         const codeText =
           rawClip && rawClip.trim().length > 0
             ? rawClip
-            : decodeHtmlEntities(preInner.replace(HTML_TAG_QUOTE_AWARE_RE, ''));
+            : decodeHtmlEntities(stripHtmlTagsQuoteAwareLinear(preInner, ''));
         const block = `\n\n${makeSafeCodeFence(codeText.trim(), lang)}\n\n`;
         return stashCode ? stashCode(block) : block;
       },
     );
   }
 
-  // Convert GFM / HTML task-list checkboxes (`<input type="checkbox" checked>`) before generic void tags are stripped.
-  if (/<input\b/i.test(out)) {
-    out = out.replace(/<input\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/gi, (full, attrStr: string) => {
-      if (!/\btype\s*=\s*(?:"checkbox"|'checkbox'|checkbox\b)/i.test(attrStr)) return full;
-      const isChecked = /\bchecked\b/i.test(attrStr.replace(/"[^"]*"|'[^']*'/g, '""')) || /\bchecked\s*=\s*(?:"(?:checked|true)"|'(?:checked|true)')/i.test(attrStr);
+  // Convert GFM / HTML task-list checkboxes (`<input type="checkbox" checked>`) before generic void tags are stripped (`H1` linear O(N)).
+  if (/<input/i.test(out)) {
+    out = replaceHtmlOpenTagsLinear(out, ['input'], (tag) => {
+      const attrStr = tag.attrs;
+      if (!/\btype\s*=\s*(?:"checkbox"|'checkbox'|checkbox\b)/i.test(attrStr)) return tag.rawTag;
+      const isChecked =
+        /\bchecked\b/i.test(attrStr.replace(/"[^"]*"|'[^']*'/g, '""')) ||
+        /\bchecked\s*=\s*(?:"(?:checked|true)"|'(?:checked|true)')/i.test(attrStr);
       return isChecked ? '\u0000EFTASKX\u0000 ' : '\u0000EFTASKO\u0000 ';
     });
   }
@@ -1410,53 +1438,74 @@ function standardizeElementsInHtml(html: string, stashCode?: (mdBlock: string) =
 
   // Strip MediaWiki visual math fallback `<img>` tags (the sibling `<math alttext="...">` carries clean LaTeX).
   if (out.includes('mwe-math-fallback-image')) {
-    out = out.replace(/<img\b[^>]*\bmwe-math-fallback-image\b[^>]*>/gi, '');
+    out = replaceHtmlOpenTagsLinear(out, ['img'], (tag) =>
+      /\bmwe-math-fallback-image\b/i.test(tag.attrs) ? '' : tag.rawTag,
+    );
   }
 
   // Mark `<math>` inside `.katex-display` or `.MathJax_Display` so `<math>` emits display `$$...$$` blocks.
   if (/(?:katex-display|MathJax_Display)/i.test(out)) {
     out = out.replace(
-      /<(span|div)\b[^>]*\b(?:katex-display|MathJax_Display)\b[^>]*>((?:(?!<\/math>)[\s\S]){0,12000}?)<\/math>/gi,
+      /<(span|div)\b[^>]{0,600}\b(?:katex-display|MathJax_Display)\b[^>]{0,600}>((?:(?!<\/math>)[\s\S]){0,12000}?)<\/math>/gi,
       (full) => full.replace(/<math\b/i, '<math data-ef-display="block"'),
     );
   }
 
-  // Convert `<math>` (KaTeX `<annotation encoding="application/x-tex">` or Wikipedia/MathML `alttext`) to LaTeX.
-  if (/<math\b/i.test(out)) {
-    out = out.replace(/<math\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]{0,24000}?)<\/math>/gi, (full, attrStr: string, inner: string) => {
-      const attrs = parseTagAttrs(attrStr);
-      const annotMatch = /<annotation\b[^>]*encoding=(?:"application\/x-tex"|'application\/x-tex')[^>]*>([\s\S]*?)<\/annotation>/i.exec(
-        inner,
-      );
-      let mwExtSrc: string | undefined;
-      if (attrs['data-mw'] && attrs['data-mw'].includes('extsrc')) {
-        try {
-          const parsedMw = JSON.parse(attrs['data-mw']) as { body?: { extsrc?: string } };
-          if (typeof parsedMw?.body?.extsrc === 'string') mwExtSrc = parsedMw.body.extsrc;
-        } catch {
-          // ignore malformed Parsoid data-mw JSON
+  // Convert `<math>` (KaTeX `<annotation encoding="application/x-tex">` or Wikipedia/MathML `alttext`) to LaTeX (`H1` linear O(N)).
+  if (/<math/i.test(out)) {
+    out = replacePairedHtmlElementsLinear(
+      out,
+      ['math'],
+      (full, _t, attrStr, inner) => {
+        const attrs = parseTagAttrs(attrStr);
+        let annotTex: string | undefined;
+        replacePairedHtmlElementsLinear(
+          inner,
+          ['annotation'],
+          (_af, _at, aAttr, aInner) => {
+            if (annotTex === undefined && /encoding\s*=\s*(?:"application\/x-tex"|'application\/x-tex')/i.test(aAttr)) {
+              annotTex = aInner;
+            }
+            return '';
+          },
+          { maxChars: 24_000, maxInnerChars: 24_000 },
+        );
+        let mwExtSrc: string | undefined;
+        if (attrs['data-mw'] && attrs['data-mw'].includes('extsrc')) {
+          try {
+            const parsedMw = JSON.parse(attrs['data-mw']) as { body?: { extsrc?: string } };
+            if (typeof parsedMw?.body?.extsrc === 'string') mwExtSrc = parsedMw.body.extsrc;
+          } catch {
+            // ignore malformed Parsoid data-mw JSON
+          }
         }
-      }
-      const rawTex = annotMatch?.[1] ?? attrs.alttext ?? attrs['data-latex'] ?? mwExtSrc;
-      if (!rawTex) return full;
-      const tex = normalizeLatexSource(rawTex);
-      if (!tex) return full;
-      const isBlock = attrs.display === 'block' || attrs['data-ef-display'] === 'block' || tex.includes('\n');
-      return isBlock ? `\n\n$$\n${tex}\n$$\n\n` : `$${tex.replace(/\s+/g, ' ')}$`;
-    });
+        const rawTex = annotTex ?? attrs.alttext ?? attrs['data-latex'] ?? mwExtSrc;
+        if (!rawTex) return full;
+        const tex = normalizeLatexSource(rawTex);
+        if (!tex) return full;
+        const isBlock = attrs.display === 'block' || attrs['data-ef-display'] === 'block' || tex.includes('\n');
+        return isBlock ? `\n\n$$\n${tex}\n$$\n\n` : `$${tex.replace(/\s+/g, ' ')}$`;
+      },
+      { maxInnerChars: 24_000 },
+    );
   }
 
-  // Convert MathJax `<mjx-container data-latex="...">` when assistive `<math>` was absent.
-  if (/<mjx-container\b/i.test(out)) {
-    out = out.replace(/<mjx-container\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]{0,12000}?)<\/mjx-container>/gi, (full, attrStr: string) => {
-      const attrs = parseTagAttrs(attrStr);
-      const rawTex = attrs['data-latex'] ?? attrs['data-math'];
-      if (!rawTex) return full;
-      const tex = normalizeLatexSource(rawTex);
-      if (!tex) return full;
-      const isBlock = attrs.display === 'true' || attrs.display === 'block';
-      return isBlock ? `\n\n$$\n${tex}\n$$\n\n` : `$${tex.replace(/\s+/g, ' ')}$`;
-    });
+  // Convert MathJax `<mjx-container data-latex="...">` when assistive `<math>` was absent (`H1` linear O(N)).
+  if (/<mjx-container/i.test(out)) {
+    out = replacePairedHtmlElementsLinear(
+      out,
+      ['mjx-container'],
+      (full, _t, attrStr) => {
+        const attrs = parseTagAttrs(attrStr);
+        const rawTex = attrs['data-latex'] ?? attrs['data-math'];
+        if (!rawTex) return full;
+        const tex = normalizeLatexSource(rawTex);
+        if (!tex) return full;
+        const isBlock = attrs.display === 'true' || attrs.display === 'block';
+        return isBlock ? `\n\n$$\n${tex}\n$$\n\n` : `$${tex.replace(/\s+/g, ' ')}$`;
+      },
+      { maxInnerChars: 12_000 },
+    );
   }
 
   // Convert GitHub `.markdown-alert`, Docusaurus/MkDocs `.admonition`, Starlight `.starlight-aside`, and Obsidian `[data-callout]` blocks.
@@ -1483,7 +1532,7 @@ function standardizeElementsInHtml(html: string, stashCode?: (mdBlock: string) =
         const gfmType = mapCalloutTypeToGfm(rawType);
         let customTitle = '';
         const bodyWithoutTitle = inner.replace(
-          /<(?:p|div)\b[^>]*\b(?:markdown-alert-title|admonition-title|callout-title|starlight-aside__title)\b[^>]*>([\s\S]*?)<\/(?:p|div)>/i,
+          /<(?:p|div)\b[^>]{0,600}\b(?:markdown-alert-title|admonition-title|callout-title|starlight-aside__title)\b[^>]{0,600}>([\s\S]*?)<\/(?:p|div)>/i,
           (_tm, tInner: string) => {
             const candidate = cleanInlineHtml(tInner);
             if (candidate && candidate.toLowerCase() !== rawType.toLowerCase() && candidate.toLowerCase() !== gfmType.toLowerCase()) {
@@ -1499,37 +1548,50 @@ function standardizeElementsInHtml(html: string, stashCode?: (mdBlock: string) =
     );
   }
 
-  // Upgrade `<picture><source srcset="..."><img></picture>` to highest-resolution image candidate.
-  if (/<picture\b/i.test(out)) {
-    out = out.replace(/<picture\b[^>]*>([\s\S]{0,8000}?)<\/picture>/gi, (full, inner: string) => {
-      let bestSrc: string | undefined;
-      for (const sm of inner.matchAll(/<source\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/?>/gi)) {
-        const sAttrs = parseTagAttrs(sm[1]!);
-        const cand = extractLargestUrlFromSrcset(sAttrs.srcset ?? sAttrs['data-srcset']);
-        if (cand) {
-          bestSrc = cand;
-          break;
-        }
-      }
-      if (!bestSrc) return full;
-      return inner.replace(/<img\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/i, (imgFull, imgAttrStr: string) => {
-        const imgAttrs = parseTagAttrs(imgAttrStr);
-        if (imgAttrs.src && !isLazyPlaceholderImageUrl(imgAttrs.src)) return imgFull;
-        return `<img src="${bestSrc}" ${imgAttrStr}>`;
-      });
-    });
+  // Upgrade `<picture><source srcset="..."><img></picture>` to highest-resolution image candidate (`H1` linear O(N)).
+  if (/<picture/i.test(out)) {
+    out = replacePairedHtmlElementsLinear(
+      out,
+      ['picture'],
+      (full, _t, _attrs, inner) => {
+        let bestSrc: string | undefined;
+        scanHtmlTagsLinear(
+          inner,
+          (tag) => {
+            if (!tag.isClosing && tag.tagNameLower === 'source') {
+              const sAttrs = parseTagAttrs(tag.attrs);
+              const cand = extractLargestUrlFromSrcset(sAttrs.srcset ?? sAttrs['data-srcset']);
+              if (cand) {
+                bestSrc = cand;
+                return false;
+              }
+            }
+            return undefined;
+          },
+          8000,
+        );
+        if (!bestSrc) return full;
+        let replacedImg = false;
+        return replaceHtmlOpenTagsLinear(inner, ['img'], (imgTag) => {
+          if (replacedImg) return imgTag.rawTag;
+          replacedImg = true;
+          const imgAttrs = parseTagAttrs(imgTag.attrs);
+          if (imgAttrs.src && !isLazyPlaceholderImageUrl(imgAttrs.src)) return imgTag.rawTag;
+          return `<img src="${bestSrc}" ${imgTag.attrs}>`;
+        });
+      },
+      { maxInnerChars: 8000 },
+    );
   }
 
   return out;
 }
 
 /**
- * Crawl4AI + Defuddle link-density boilerplate filter:
- * Prunes non-content sidebar/TOC/related/tag-cloud blocks (`>= 5` links, `>80%` anchor-text ratio, `< 90` words)
- * ONLY when total page word count survives with `>= 55%` of words intact (protecting curated directory/index pages).
+ * Crawl4AI + Defuddle link-density boilerplate filter (`H1` linear O(N) tag & anchor scanning).
  */
 function pruneHighLinkDensityBlocks(html: string): string {
-  const beforeWords = countTextWords(html.replace(HTML_TAG_QUOTE_AWARE_RE, ' '));
+  const beforeWords = countTextWords(stripHtmlTagsQuoteAwareLinear(html, ' '));
   if (beforeWords < 140) return html;
 
   const clutterAttrRe =
@@ -1539,8 +1601,17 @@ function pruneHighLinkDensityBlocks(html: string): string {
     /<(div|section|ul)\b([^>]{0,500})>((?:(?!<\1\b)[\s\S]){0,12000}?)<\/\1>/gi,
     (full, tag: string, attrStr: string, inner: string) => {
       if (/<(?:pre|code|table|h1|article|figure|math)\b/i.test(inner)) return full;
-      const anchorMatches = [...inner.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/gi)];
-      if (anchorMatches.length < 5) return full;
+      const anchorPairs: Array<{ attrs: string; inner: string }> = [];
+      replacePairedHtmlElementsLinear(
+        inner,
+        ['a'],
+        (_af, _at, aAttrs, aInner) => {
+          anchorPairs.push({ attrs: aAttrs, inner: aInner });
+          return '';
+        },
+        { maxChars: 12_000 },
+      );
+      if (anchorPairs.length < 5) return full;
 
       const totalText = cleanInlineHtml(inner);
       const words = countTextWords(totalText);
@@ -1548,15 +1619,15 @@ function pruneHighLinkDensityBlocks(html: string): string {
 
       let anchorTextLen = 0;
       let hashOnlyAnchors = 0;
-      for (const am of anchorMatches) {
-        const aAttrs = parseTagAttrs(am[1]!);
+      for (const am of anchorPairs) {
+        const aAttrs = parseTagAttrs(am.attrs);
         if ((aAttrs.href ?? '').trim().startsWith('#')) hashOnlyAnchors++;
-        anchorTextLen += cleanInlineHtml(am[2]!).length;
+        anchorTextLen += cleanInlineHtml(am.inner).length;
       }
       const linkRatio = anchorTextLen / Math.max(1, totalText.length);
       if (linkRatio < 0.8) return full;
 
-      const isSamePageToc = hashOnlyAnchors >= 4 && hashOnlyAnchors === anchorMatches.length;
+      const isSamePageToc = hashOnlyAnchors >= 4 && hashOnlyAnchors === anchorPairs.length;
       const attrs = parseTagAttrs(attrStr);
       const hasClutterAttr = clutterAttrRe.test(`${attrs.class ?? ''} ${attrs.id ?? ''}`);
       if (isSamePageToc || (hasClutterAttr && tag.toLowerCase() !== 'article')) {
@@ -1567,7 +1638,7 @@ function pruneHighLinkDensityBlocks(html: string): string {
   );
 
   if (candidate === html) return html;
-  const afterWords = countTextWords(candidate.replace(HTML_TAG_QUOTE_AWARE_RE, ' '));
+  const afterWords = countTextWords(stripHtmlTagsQuoteAwareLinear(candidate, ' '));
   return afterWords >= beforeWords * 0.55 ? candidate : html;
 }
 
@@ -1584,17 +1655,23 @@ export function extractHtmlDocument(
   } = {},
 ): ExtractedDocument {
   const { baseUrl, onlyMainContent = true, redactPii = false, includeImages = true, includeTags, excludeTags } = options;
+  const boundedRawHtml = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
 
-  const htmlTagMatch = /<html\b[^>]*>/i.exec(rawHtml);
-  const htmlAttrs = htmlTagMatch ? parseTagAttrs(htmlTagMatch[0]) : {};
-  const language = htmlAttrs.lang?.trim() || undefined;
-
-  const jsonLdEntities = flattenJsonLdEntities(rawHtml);
+  const jsonLdEntities = flattenJsonLdEntities(boundedRawHtml);
   const schemaMeta = extractSchemaMetadataAndBody(jsonLdEntities);
 
-  const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(rawHtml);
-  const rawDocTitle = titleMatch ? cleanInlineHtml(titleMatch[1]!) : undefined;
+  let rawDocTitle: string | undefined;
+  replacePairedHtmlElementsLinear(
+    boundedRawHtml,
+    ['title'],
+    (_full, _t, _a, inner) => {
+      if (rawDocTitle === undefined) rawDocTitle = cleanInlineHtml(inner);
+      return '';
+    },
+    { maxChars: MAX_HTML_SCAN_CHARS, maxInnerChars: 4096 },
+  );
   let title = rawDocTitle && !isPlaceholderMetaValue(rawDocTitle) ? rawDocTitle : undefined;
+  let language: string | undefined;
   let description: string | undefined;
   let author: string | undefined;
   let publishedTime: string | undefined;
@@ -1602,80 +1679,109 @@ export function extractHtmlDocument(
   let siteName: string | undefined;
   let ogImage: string | undefined;
   let themeColor: string | undefined;
+  let firstDatetimeAttr: string | undefined;
+  let canonicalUrl: string | undefined;
+  let markdownAlternateUrl: string | undefined;
+  let favicon: string | undefined;
+  let logo: string | undefined;
   const citationAuthors: string[] = [];
 
-  const metaRe = /<meta\b[^>]*>/gi;
-  let metaMatch: RegExpExecArray | null;
-  while ((metaMatch = metaRe.exec(rawHtml)) !== null) {
-    const attrs = parseTagAttrs(metaMatch[0]);
-    const key = (attrs.name ?? attrs.property ?? '').toLowerCase();
-    const content = (attrs.content ?? '').trim();
-    if (!content || isPlaceholderMetaValue(content)) continue;
-    if ((key === 'description' || key === 'og:description') && !description) description = content;
-    if (key === 'og:title' && !title) title = content;
-    if ((key === 'og:image' || key === 'twitter:image') && !ogImage) ogImage = resolveHttpsHref(content, baseUrl);
-    if (key === 'theme-color' && !themeColor) themeColor = content;
-    if ((key === 'og:site_name' || key === 'application-name') && !siteName) siteName = content;
-    if (
-      (key === 'author' || key === 'article:author' || key === 'sailthru.author' || key === 'byl') &&
-      !author &&
-      !/^https?:\/\//i.test(content)
-    ) {
-      const cleaned = cleanAuthorMetaString(content);
-      if (cleaned && !isPlaceholderMetaValue(cleaned)) author = cleaned;
-    }
-    if ((key === 'citation_author' || key === 'dc.creator') && citationAuthors.length < 10) {
-      citationAuthors.push(cleanAuthorMetaString(content));
-    }
-    if (
-      (key === 'article:published_time' ||
-        key === 'date' ||
-        key === 'pubdate' ||
-        key === 'publishdate' ||
-        key === 'citation_publication_date' ||
-        key === 'citation_date' ||
-        key === 'citation_online_date' ||
-        key === 'dc.date' ||
-        key === 'dc.date.issued' ||
-        key === 'dcterms.created' ||
-        key === 'dcterms.issued') &&
-      !publishedTime
-    ) {
-      publishedTime = content;
-    }
-    if ((key === 'article:modified_time' || key === 'og:updated_time') && !modifiedTime) {
-      modifiedTime = content;
-    }
-  }
+  // Single linear O(N) open-tag pass across `<html>`, `<meta>`, `<link>`, `<time>`, `<relative-time>`, and `<img logo>` (`H1`)
+  scanHtmlTagsLinear(
+    boundedRawHtml,
+    (tag) => {
+      if (tag.isClosing || tag.isDeclaration) return;
+      const tName = tag.tagNameLower;
+      if (tName === 'html') {
+        if (!language) {
+          const htmlAttrs = parseTagAttrs(tag.attrs);
+          language = htmlAttrs.lang?.trim() || undefined;
+        }
+        return;
+      }
+      if (tName === 'meta') {
+        const attrs = parseTagAttrs(tag.attrs);
+        const key = (attrs.name ?? attrs.property ?? '').toLowerCase();
+        const content = (attrs.content ?? '').trim();
+        if (!content || isPlaceholderMetaValue(content)) return;
+        if ((key === 'description' || key === 'og:description') && !description) description = content;
+        if (key === 'og:title' && !title) title = content;
+        if ((key === 'og:image' || key === 'twitter:image') && !ogImage) ogImage = resolveHttpsHref(content, baseUrl);
+        if (key === 'theme-color' && !themeColor) themeColor = content;
+        if ((key === 'og:site_name' || key === 'application-name') && !siteName) siteName = content;
+        if (
+          (key === 'author' || key === 'article:author' || key === 'sailthru.author' || key === 'byl') &&
+          !author &&
+          !/^https?:\/\//i.test(content)
+        ) {
+          const cleaned = cleanAuthorMetaString(content);
+          if (cleaned && !isPlaceholderMetaValue(cleaned)) author = cleaned;
+        }
+        if ((key === 'citation_author' || key === 'dc.creator') && citationAuthors.length < 10) {
+          citationAuthors.push(cleanAuthorMetaString(content));
+        }
+        if (
+          (key === 'article:published_time' ||
+            key === 'date' ||
+            key === 'pubdate' ||
+            key === 'publishdate' ||
+            key === 'citation_publication_date' ||
+            key === 'citation_date' ||
+            key === 'citation_online_date' ||
+            key === 'dc.date' ||
+            key === 'dc.date.issued' ||
+            key === 'dcterms.created' ||
+            key === 'dcterms.issued') &&
+          !publishedTime
+        ) {
+          publishedTime = content;
+        }
+        if ((key === 'article:modified_time' || key === 'og:updated_time') && !modifiedTime) {
+          modifiedTime = content;
+        }
+        return;
+      }
+      if (tName === 'link') {
+        const attrs = parseTagAttrs(tag.attrs);
+        const rel = (attrs.rel ?? '').toLowerCase();
+        const mimeType = (attrs.type ?? '').toLowerCase();
+        const href = resolveHttpsHref(attrs.href, baseUrl);
+        if (!href) return;
+        if (rel.includes('canonical') && !canonicalUrl) canonicalUrl = href;
+        if (rel.includes('icon') && !favicon) favicon = href;
+        if (
+          rel.includes('alternate') &&
+          (mimeType.includes('text/markdown') || mimeType.includes('application/markdown')) &&
+          !markdownAlternateUrl
+        ) {
+          markdownAlternateUrl = href;
+        }
+        return;
+      }
+      if ((tName === 'time' || tName === 'relative-time') && !firstDatetimeAttr) {
+        const attrs = parseTagAttrs(tag.attrs);
+        if (attrs.datetime?.trim()) firstDatetimeAttr = attrs.datetime.trim();
+        return;
+      }
+      if (tName === 'img' && !logo) {
+        const attrs = parseTagAttrs(tag.attrs);
+        const hay = `${attrs.alt ?? ''} ${attrs.class ?? ''} ${attrs.id ?? ''} ${attrs.src ?? ''}`.toLowerCase();
+        if (hay.includes('logo')) {
+          logo = resolveHttpsHref(attrs.src ?? attrs['data-src'], baseUrl);
+        }
+      }
+    },
+    MAX_HTML_SCAN_CHARS,
+    false,
+  );
+
   if (!author && citationAuthors.length > 0) {
     author = [...new Set(citationAuthors.filter(Boolean))].join(', ');
   }
   author = author || schemaMeta.author;
-  publishedTime =
-    publishedTime ||
-    schemaMeta.publishedTime ||
-    /<(?:time|relative-time)\b[^>]*\bdatetime=(?:"([^"]+)"|'([^']+)')/i.exec(rawHtml)?.[1]?.trim() ||
-    /<(?:time|relative-time)\b[^>]*\bdatetime=(?:"([^"]+)"|'([^']+)')/i.exec(rawHtml)?.[2]?.trim();
+  publishedTime = publishedTime || schemaMeta.publishedTime || firstDatetimeAttr;
   modifiedTime = modifiedTime || schemaMeta.modifiedTime;
   siteName = siteName || schemaMeta.siteName;
-
-  let canonicalUrl: string | undefined;
-  let markdownAlternateUrl: string | undefined;
-  let favicon: string | undefined;
-  const linkRe = /<link\b[^>]*>/gi;
-  let linkMatch: RegExpExecArray | null;
-  while ((linkMatch = linkRe.exec(rawHtml)) !== null) {
-    const attrs = parseTagAttrs(linkMatch[0]);
-    const rel = (attrs.rel ?? '').toLowerCase();
-    const mimeType = (attrs.type ?? '').toLowerCase();
-    const href = resolveHttpsHref(attrs.href, baseUrl);
-    if (!href) continue;
-    if (rel.includes('canonical') && !canonicalUrl) canonicalUrl = href;
-    if (rel.includes('icon') && !favicon) favicon = href;
-    if (rel.includes('alternate') && (mimeType.includes('text/markdown') || mimeType.includes('application/markdown')) && !markdownAlternateUrl) {
-      markdownAlternateUrl = href;
-    }
-  }
   if (!favicon && baseUrl) {
     try {
       const bu = new URL(baseUrl);
@@ -1687,9 +1793,9 @@ export function extractHtmlDocument(
 
   // Extract colors and fonts from <style> tags before stripping them.
   const styleChunks: string[] = [];
-  if (rawHtml.includes('<style') || rawHtml.includes('<STYLE')) {
+  if (boundedRawHtml.includes('<style') || boundedRawHtml.includes('<STYLE')) {
     replaceHtmlTagBlocksLinear(
-      rawHtml,
+      boundedRawHtml,
       'style',
       (_full, _attr, inner) => {
         styleChunks.push(inner);
@@ -1717,16 +1823,6 @@ export function extractHtmlDocument(
         ),
     ),
   ].slice(0, 6);
-
-  let logo: string | undefined;
-  for (const imgTag of rawHtml.match(/<img\b[^>]*>/gi) ?? []) {
-    const attrs = parseTagAttrs(imgTag);
-    const hay = `${attrs.alt ?? ''} ${attrs.class ?? ''} ${attrs.id ?? ''} ${attrs.src ?? ''}`.toLowerCase();
-    if (hay.includes('logo')) {
-      logo = resolveHttpsHref(attrs.src ?? attrs['data-src'], baseUrl);
-      if (logo) break;
-    }
-  }
 
   // Discover Mintlify / docs HTML comment companion Markdown hints before stripping HTML comments:
   // e.g. `<!-- AI agents: this page is available as Markdown at /docs/.../intro.md. -->`
@@ -1759,17 +1855,27 @@ export function extractHtmlDocument(
 
   // Capture `<noscript>` prose fallback (e.g. Discourse / Ghost SSR crawler fallback) before stripping `<noscript>`,
   // while promoting `<noscript><img ...></noscript>` lazy-load fallbacks inline (`M4` linear O(N) scanner, 2 MiB cap).
-  const boundedRawHtml = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
   const noscriptChunks: string[] = [];
   const withPromotedNoscriptImgs = replaceHtmlTagBlocksLinear(
     boundedRawHtml,
     'noscript',
     (_full, _attrStr, inner) => {
       const trimmedInner = inner.trim();
-      if (/^<img\b(?:"[^"]*"|'[^']*'|[^>"'])*\/?>$/i.test(trimmedInner)) {
+      let singleImg = false;
+      scanHtmlTagsLinear(
+        trimmedInner,
+        (tag) => {
+          if (tag.index === 0 && tag.end === trimmedInner.length && !tag.isClosing && tag.tagNameLower === 'img') {
+            singleImg = true;
+          }
+          return false;
+        },
+        4096,
+      );
+      if (singleImg) {
         return trimmedInner;
       }
-      if (countTextWords(trimmedInner.replace(HTML_TAG_QUOTE_AWARE_RE, ' ')) >= 35) {
+      if (countTextWords(stripHtmlTagsQuoteAwareLinear(trimmedInner, ' ')) >= 35) {
         noscriptChunks.push(trimmedInner);
       }
       return '';
@@ -1819,8 +1925,6 @@ export function extractHtmlDocument(
     withoutSvg,
     [
       'head',
-      'script',
-      'style',
       'noscript',
       'template',
       'canvas',
@@ -1830,6 +1934,8 @@ export function extractHtmlDocument(
       'details-menu',
       'tool-tip',
       'clipboard-copy',
+      'script',
+      'style',
     ],
     '',
     MAX_HTML_SCAN_CHARS,
@@ -1844,14 +1950,36 @@ export function extractHtmlDocument(
     // Substack rendered post body (`<div class="body markup">`) or `window._preloads` `body_html`
     const substackMarkup = applyIncludeAndExcludeTagSelectors(work, ['.markup'], undefined);
     // GitHub / GFM pages wrap repo chrome + duplicate file tables inside `<main>` around `<article class="markdown-body">`
-    // (or `.markdown-body` comment blocks on Issues/PRs).
-    const mdBodyMatches = [
-      ...work.matchAll(
-        /<article\b(?:"[^"]*"|'[^']*'|[^>"'])*\bclass=(?:"[^"]*\bmarkdown-body\b[^"]*"|'[^']*\bmarkdown-body\b[^']*')(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/article>/gi,
-      ),
-    ];
-    const joinedMdBody = mdBodyMatches.map((m) => m[1]!).join('\n\n<hr/>\n\n');
-    const mainMatch = /<main\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*)<\/main>/i.exec(work);
+    const mdBodyParts: string[] = [];
+    const articleParts: string[] = [];
+    replacePairedHtmlElementsLinear(work, ['article'], (_af, _at, aAttrs, aInner) => {
+      articleParts.push(aInner);
+      const cls = parseTagAttrs(aAttrs).class ?? '';
+      if (/\bmarkdown-body\b/i.test(cls)) {
+        mdBodyParts.push(aInner);
+      }
+      return '';
+    });
+    const joinedMdBody = mdBodyParts.join('\n\n<hr/>\n\n');
+
+    let firstMainEnd = -1;
+    let lastMainCloseIdx = -1;
+    scanHtmlTagsLinear(
+      work,
+      (tag) => {
+        if (tag.tagNameLower !== 'main') return;
+        if (!tag.isClosing && !tag.isSelfClosing && firstMainEnd < 0) {
+          firstMainEnd = tag.end;
+        } else if (tag.isClosing && firstMainEnd >= 0) {
+          lastMainCloseIdx = tag.index;
+        }
+      },
+      MAX_HTML_SCAN_CHARS,
+      false,
+    );
+    const mainInner =
+      firstMainEnd >= 0 && lastMainCloseIdx > firstMainEnd ? work.slice(firstMainEnd, lastMainCloseIdx) : undefined;
+
     const isGitHubIssueOrPr = Boolean(baseUrl && /^https?:\/\/github\.com\/[^/]+\/[^/]+\/(?:issues|pull)\/\d+/i.test(baseUrl));
     if (!isGitHubIssueOrPr && joinedMdBody.trim().length >= 32) {
       work = joinedMdBody;
@@ -1859,14 +1987,13 @@ export function extractHtmlDocument(
     } else if (/\bbody\s+markup\b|\bmarkup\s+body\b/i.test(work) && substackMarkup.trim().length >= 64) {
       work = substackMarkup;
       extractedMarkdownBodyOnly = true;
-    } else if (substackPreload?.bodyHtml && (!mainMatch || countTextWords(mainMatch[1]!.replace(HTML_TAG_QUOTE_AWARE_RE, ' ')) < 40)) {
+    } else if (substackPreload?.bodyHtml && (!mainInner || countTextWords(stripHtmlTagsQuoteAwareLinear(mainInner, ' ')) < 40)) {
       work = substackPreload.bodyHtml;
       extractedMarkdownBodyOnly = true;
-    } else if (mainMatch && mainMatch[1]!.trim().length >= 32) {
-      work = mainMatch[1]!;
+    } else if (mainInner && mainInner.trim().length >= 32) {
+      work = mainInner;
     } else {
-      const articleMatches = [...work.matchAll(/<article\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/article>/gi)];
-      const joinedArticles = articleMatches.map((m) => m[1]!).join('\n\n');
+      const joinedArticles = articleParts.join('\n\n');
       if (joinedArticles.trim().length >= 32) {
         work = joinedArticles;
       } else {
@@ -1874,42 +2001,60 @@ export function extractHtmlDocument(
         if (roleMain && roleMain.trim().length >= 32) {
           work = roleMain;
         } else {
-          work = work.replace(/<header\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/header>/gi, '');
+          work = stripHtmlTagsLinear(work, ['header'], '', MAX_HTML_SCAN_CHARS);
         }
       }
     }
     if (excludeTags && excludeTags.length > 0) {
       work = applyIncludeAndExcludeTagSelectors(work, undefined, excludeTags);
     }
-    // Strip hidden DOM subtrees (`[hidden]`, `.d-none`, `style="display:none"`), WAI-ARIA non-content landmarks
-    // (`role="navigation|search|banner|contentinfo|dialog|menu|toolbar"`), screen-reader-only duplicate labels,
-    // Sphinx/rustdoc/pkg.go.dev permalink anchors, MediaWiki edit/interlanguage chrome, copy-page buttons, and feedback forms.
-    work = stripHiddenAndChromeSubtrees(work)
-      .replace(/<(nav|footer|aside)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/\1>/gi, '')
-      .replace(/<span\b[^>]*\bmw-editsection-bracket\b[^>]*>[\s\S]*?<\/span>/gi, '')
-      .replace(/<a\b[^>]*(?:[?&]action=edit\b|href=(?:"https:\/\/www\.wikidata\.org\/wiki\/Special:EntityPage\/[^"]*"|'https:\/\/www\.wikidata\.org\/wiki\/Special:EntityPage\/[^']*'))[^>]*>[\s\S]*?<\/a>/gi, '')
-      .replace(/<span\b[^>]*\bmw-editsection\b[^>]*>\s*<\/span>/gi, '')
-      .replace(/<label\b[^>]*\bp-lang-btn-label\b[^>]*>[\s\S]*?<\/label>/gi, '')
-      .replace(/<ul\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/ul>/gi, (full, inner: string) =>
-        (inner.match(/\binterlanguage-link\b/gi) ?? []).length >= 3 ? '' : full,
-      )
-      .replace(/<form\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/form>/gi, (full, inner: string) =>
-        /was this (page )?helpful|did this help|page feedback/i.test(inner) ? '' : full,
-      )
-      .replace(/<button\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/button>/gi, (full, inner: string) => {
+    // Strip hidden DOM subtrees (`[hidden]`, `.d-none`, `style="display:none"`), WAI-ARIA non-content landmarks,
+    // MediaWiki edit/interlanguage chrome, copy-page buttons, and feedback forms in linear O(N) time (`H1`).
+    work = stripHtmlTagsLinear(stripHiddenAndChromeSubtrees(work), ['nav', 'footer', 'aside'], '', MAX_HTML_SCAN_CHARS);
+    work = replacePairedHtmlElementsLinear(work, ['span', 'a', 'label', 'ul', 'form', 'button', 'details'], (full, tag, attrStr, inner) => {
+      if (tag === 'span') {
+        if (/\bmw-editsection-bracket\b/i.test(attrStr)) return '';
+        if (/\bmw-editsection\b/i.test(attrStr) && !inner.trim()) return '';
+        return full;
+      }
+      if (tag === 'a') {
+        if (
+          /[?&]action=edit\b/i.test(attrStr) ||
+          /href=(?:"https:\/\/www\.wikidata\.org\/wiki\/Special:EntityPage\/[^"]*"|'https:\/\/www\.wikidata\.org\/wiki\/Special:EntityPage\/[^']*')/i.test(
+            attrStr,
+          )
+        ) {
+          return '';
+        }
+        return full;
+      }
+      if (tag === 'label') {
+        return /\bp-lang-btn-label\b/i.test(attrStr) ? '' : full;
+      }
+      if (tag === 'ul') {
+        return (inner.match(/\binterlanguage-link\b/gi) ?? []).length >= 3 ? '' : full;
+      }
+      if (tag === 'form') {
+        return /was this (page )?helpful|did this help|page feedback/i.test(inner) ? '' : full;
+      }
+      if (tag === 'button') {
         const btnTxt = cleanInlineHtml(inner);
         return /^(?:copy(?:\s+(?:page|code|link|markdown|item path|path|url|to clipboard|head branch name to clipboard))?|copied!?|yes|no|skip|submit feedback|back to top|ask ai|dark mode|light mode|toggle theme|see all|hide|hide comment|show more|show less|share|format|run)$/i.test(
           btnTxt,
         )
           ? ''
           : full;
-      })
-      .replace(/<details\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/details>/gi, (full, inner: string) => {
+      }
+      if (tag === 'details') {
         const linkCount = (inner.match(/<a\b/gi) ?? []).length;
-        const proseWithoutLinks = cleanInlineHtml(inner.replace(/<a\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/a>/gi, ' '));
+        const proseWithoutLinks = cleanInlineHtml(
+          replacePairedHtmlElementsLinear(inner, ['a'], () => ' '),
+        );
         if (linkCount >= 4 && proseWithoutLinks.length < 120) return '';
         return full;
-      });
+      }
+      return full;
+    });
     work = pruneHighLinkDensityBlocks(work);
   } else if (excludeTags && excludeTags.length > 0) {
     work = applyIncludeAndExcludeTagSelectors(work, undefined, excludeTags);
@@ -1923,15 +2068,16 @@ export function extractHtmlDocument(
   const collectAnchorLinks = (htmlSource: string): string[] => {
     const outLinks: string[] = [];
     const seen = new Set<string>();
-    for (const m of htmlSource.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/gi)) {
-      const attrs = parseTagAttrs(m[1]!);
+    replacePairedHtmlElementsLinear(htmlSource, ['a'], (_full, _t, attrStr) => {
+      if (outLinks.length >= 250) return '';
+      const attrs = parseTagAttrs(attrStr);
       const resolved = resolveHttpsHref(attrs.href, baseUrl);
       if (resolved && !seen.has(resolved)) {
         seen.add(resolved);
         outLinks.push(resolved);
-        if (outLinks.length >= 250) break;
       }
-    }
+      return '';
+    });
     return outLinks;
   };
   let links = collectAnchorLinks(work);
@@ -1961,99 +2107,171 @@ export function extractHtmlDocument(
   const images: ScrapedImage[] = [];
   const seenImages = new Set<string>();
   if (includeImages) {
-    for (const m of work.matchAll(/<img\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/gi)) {
-      const attrs = parseTagAttrs(m[1]!);
-      const primarySrc = attrs.src && !isLazyPlaceholderImageUrl(attrs.src) ? attrs.src : undefined;
-      const bestCandidate =
-        primarySrc ??
-        attrs['data-src'] ??
-        attrs['data-lazy-src'] ??
-        attrs['data-original'] ??
-        extractLargestUrlFromSrcset(attrs.srcset ?? attrs['data-srcset'] ?? attrs['data-lazy-srcset']) ??
-        attrs.src;
-      const src = resolveHttpsHref(bestCandidate, baseUrl);
-      if (src && !seenImages.has(src) && !isDecorativeOrTinyImage(attrs, src)) {
-        seenImages.add(src);
-        const alt = attrs.alt?.trim();
-        images.push({ url: src, ...(alt ? { alt } : {}) });
-        if (images.length >= 60) break;
-      }
-    }
+    scanHtmlTagsLinear(
+      work,
+      (tag) => {
+        if (tag.isClosing || tag.tagNameLower !== 'img') return;
+        const attrs = parseTagAttrs(tag.attrs);
+        const primarySrc = attrs.src && !isLazyPlaceholderImageUrl(attrs.src) ? attrs.src : undefined;
+        const bestCandidate =
+          primarySrc ??
+          attrs['data-src'] ??
+          attrs['data-lazy-src'] ??
+          attrs['data-original'] ??
+          extractLargestUrlFromSrcset(attrs.srcset ?? attrs['data-srcset'] ?? attrs['data-lazy-srcset']) ??
+          attrs.src;
+        const src = resolveHttpsHref(bestCandidate, baseUrl);
+        if (src && !seenImages.has(src) && !isDecorativeOrTinyImage(attrs, src)) {
+          seenImages.add(src);
+          const alt = attrs.alt?.trim();
+          images.push({ url: src, ...(alt ? { alt } : {}) });
+          if (images.length >= 60) return false;
+        }
+        return undefined;
+      },
+      MAX_HTML_SCAN_CHARS,
+      false,
+    );
   }
 
   const stashFence = (fenceMd: string): string => `\n\n\u0000EFFENCE${codeStash.push(fenceMd.trim()) - 1}\u0000\n\n`;
   const stashInline = (spanMd: string): string => (spanMd ? `\`\u0000EFINLINE${codeStash.push(spanMd) - 1}\u0000\`` : '');
 
   const formatTableCellMarkdown = (cellHtml: string): string => {
-    const withInline = cellHtml
-      .replace(/<\/a>(?=<a\b)/gi, '</a> ')
-      .replace(/<code\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/code>/gi, (_m, c) =>
-        stashInline(formatInlineCodeSpan(cleanInlineHtml(String(c)))),
-      )
-      .replace(/<(strong|b)\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/\1>/gi, (_m, _t, inner) => {
-        const txt = cleanInlineHtml(String(inner));
-        return txt ? `**${txt}**` : ' ';
-      })
-      .replace(/<(em|i)\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/\1>/gi, (_m, _t, inner) => {
-        const txt = cleanInlineHtml(String(inner));
-        return txt ? `*${txt}*` : ' ';
-      })
-      .replace(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/gi, (_m, attrStr, inner) => {
-        const attrs = parseTagAttrs(String(attrStr));
-        const href = resolveHttpsHref(attrs.href, baseUrl, true);
-        const label = cleanInlineHtml(String(inner));
-        if (!label) return ' ';
-        return href ? `[${label}](${href})` : label;
-      });
+    let withInline = cellHtml.replace(/<\/a>(?=<a\b)/gi, '</a> ');
+    withInline = replacePairedHtmlElementsLinear(withInline, ['code'], (_f, _t, _a, c) =>
+      stashInline(formatInlineCodeSpan(cleanInlineHtml(c))),
+    );
+    withInline = replacePairedHtmlElementsLinear(withInline, ['strong', 'b'], (_f, _t, _a, inner) => {
+      const txt = cleanInlineHtml(inner);
+      return txt ? `**${txt}**` : ' ';
+    });
+    withInline = replacePairedHtmlElementsLinear(withInline, ['em', 'i'], (_f, _t, _a, inner) => {
+      const txt = cleanInlineHtml(inner);
+      return txt ? `*${txt}*` : ' ';
+    });
+    withInline = replacePairedHtmlElementsLinear(withInline, ['a'], (_f, _t, attrStr, inner) => {
+      const attrs = parseTagAttrs(attrStr);
+      const href = resolveHttpsHref(attrs.href, baseUrl, true);
+      const label = cleanInlineHtml(inner);
+      if (!label) return ' ';
+      return href ? `[${label}](${href})` : label;
+    });
     return cleanInlineHtml(withInline).replace(/\|/g, '\\|');
   };
 
-  // Convert structural HTML to Markdown (quote-aware attribute matching prevents `class="[&>span]"` truncation).
-  // Match leaf `<table>` elements (`(?!<table\b)`) so outer 1990s layout tables unwrap cleanly while preserving inner data tables.
-  let md = work
-    .replace(/<wbr\b[^>]*\/?>/gi, '')
+  // Convert structural HTML to Markdown in strictly O(N) linear passes (`H1`).
+  let md = replaceHtmlOpenTagsLinear(work, ['wbr'], () => '')
     .replace(/<\/a>(?=<a\b)/gi, '</a> ')
     .replace(/<\/code>(?=<code\b)/gi, '</code> ')
-    .replace(/([A-Za-z0-9])(?=<a\b)/g, '$1 ')
-    .replace(/<figcaption\b[^>]*\bheader\b[^>]*>\s*<span\b[^>]*\btitle\b[^>]*>\s*<\/span>\s*<span\b[^>]*\bsr-only\b[^>]*>[\s\S]{0,120}?<\/span>\s*<\/figcaption>/gi, '')
-    .replace(
-      /<pre\b((?:"[^"]*"|'[^']*'|[^>"'])*)>\s*(?:<code\b((?:"[^"]*"|'[^']*'|[^>"'])*)>)?([\s\S]*?)(?:<\/code>)?\s*<\/pre>/gi,
-      (_m, preAttrs, codeAttrs, code) => {
-        const lang = inferCodeFenceLang(String(preAttrs ?? ''), String(codeAttrs ?? ''));
-        const rawCodeHtml = String(code);
-        const withEcLines =
-          !rawCodeHtml.includes('\n') && rawCodeHtml.includes('ec-line')
-            ? rawCodeHtml.replace(/<div\b[^>]*\bec-line\b[^>]*>/gi, '\n')
-            : rawCodeHtml;
-        const decodedCode = decodeHtmlEntities(withEcLines.replace(HTML_TAG_QUOTE_AWARE_RE, '')).trim();
-        return stashFence(makeSafeCodeFence(decodedCode, lang));
+    .replace(/([A-Za-z0-9])(?=<a\b)/g, '$1 ');
+
+  // Strip Expressive Code empty header figcaptions (`<figcaption class="header"><span class="title"></span><span class="sr-only">...</span></figcaption>`) linearly!
+  if (/<figcaption/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(
+      md,
+      ['figcaption'],
+      (full, _t, attrStr, inner) => {
+        if (!/\bheader\b/i.test(attrStr)) return full;
+        if (inner.length > 600) return full;
+        if (/\btitle\b/i.test(inner) && /\bsr-only\b/i.test(inner)) {
+          const withoutSrOnly = replacePairedHtmlElementsLinear(inner, ['span'], (sf, _st, sAttr) =>
+            /\bsr-only\b/i.test(sAttr) ? '' : sf,
+          );
+          if (!cleanInlineHtml(withoutSrOnly)) return '';
+        }
+        return full;
       },
-    )
-    .replace(/<figure\b(?:"[^"]*"|'[^']*'|[^>"'])*>((?:(?!<figure\b)[\s\S]){1,8000}?)<\/figure>/gi, (full, figInner: string) => {
-      if (/<(?:pre|table|p)\b/i.test(figInner.replace(/<figcaption\b[\s\S]*?<\/figcaption>/gi, ''))) return full;
-      const imgMatch = /<img\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/i.exec(figInner);
-      if (!imgMatch) return full;
-      const imgAttrs = parseTagAttrs(imgMatch[1]!);
-      const bestSrc =
-        (imgAttrs.src && !isLazyPlaceholderImageUrl(imgAttrs.src) ? imgAttrs.src : undefined) ??
-        imgAttrs['data-src'] ??
-        extractLargestUrlFromSrcset(imgAttrs.srcset ?? imgAttrs['data-srcset']) ??
-        imgAttrs.src;
-      const resolvedSrc = resolveHttpsHref(bestSrc, baseUrl);
-      if (!resolvedSrc || isDecorativeOrTinyImage(imgAttrs, resolvedSrc)) return full;
-      const alt = cleanInlineHtml(imgAttrs.alt ?? '');
-      const capMatch = /<figcaption\b[^>]*>([\s\S]{1,1200}?)<\/figcaption>/i.exec(figInner);
-      const capText = capMatch ? cleanInlineHtml(capMatch[1]!) : '';
-      return capText && capText !== alt
-        ? `\n\n![${alt}](${resolvedSrc})\n\n*${capText}*\n\n`
-        : `\n\n![${alt}](${resolvedSrc})\n\n`;
-    })
-    .replace(/<table\b(?:"[^"]*"|'[^']*'|[^>"'])*>((?:(?!<table\b)[\s\S])*?)<\/table>/gi, (_m, tbl) => {
-      const rows = [...String(tbl).matchAll(/<tr\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/tr>/gi)].map((rm) =>
-        [...rm[1]!.matchAll(/<t[hd]\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/t[hd]>/gi)].map((cm) =>
-          formatTableCellMarkdown(cm[1]!),
-        ),
-      );
+      { maxInnerChars: 600 },
+    );
+  }
+
+  // `<pre>` blocks (optionally wrapping `<code ...>...</code>`)
+  if (/<pre/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['pre'], (_full, _t, preAttrs, preInner) => {
+      let codeAttrs = '';
+      let rawCodeHtml = preInner;
+      const trimmedPre = preInner.trim();
+      if (/^<code\b/i.test(trimmedPre) && /<\/code>$/i.test(trimmedPre)) {
+        replacePairedHtmlElementsLinear(trimmedPre, ['code'], (_cf, _ct, cAttrs, cInner) => {
+          if (!codeAttrs) {
+            codeAttrs = cAttrs;
+            rawCodeHtml = cInner;
+          }
+          return '';
+        });
+      }
+      const lang = inferCodeFenceLang(preAttrs, codeAttrs);
+      const withEcLines =
+        !rawCodeHtml.includes('\n') && rawCodeHtml.includes('ec-line')
+          ? replaceHtmlOpenTagsLinear(rawCodeHtml, ['div'], (t) => (/\bec-line\b/i.test(t.attrs) ? '\n' : t.rawTag))
+          : rawCodeHtml;
+      const decodedCode = decodeHtmlEntities(stripHtmlTagsQuoteAwareLinear(withEcLines, '')).trim();
+      return stashFence(makeSafeCodeFence(decodedCode, lang));
+    });
+  }
+
+  if (/<figure/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(
+      md,
+      ['figure'],
+      (full, _t, _attrs, figInner) => {
+        if (/<figure\b/i.test(figInner)) return full;
+        const withoutCap = stripHtmlTagsLinear(figInner, ['figcaption'], '', 8000);
+        if (/<(?:pre|table|p)\b/i.test(withoutCap)) return full;
+        let imgAttrs: Record<string, string> | null = null;
+        scanHtmlTagsLinear(
+          figInner,
+          (t) => {
+            if (!t.isClosing && t.tagNameLower === 'img') {
+              imgAttrs = parseTagAttrs(t.attrs);
+              return false;
+            }
+            return undefined;
+          },
+          8000,
+        );
+        if (!imgAttrs) return full;
+        const ia = imgAttrs as Record<string, string>;
+        const bestSrc =
+          (ia.src && !isLazyPlaceholderImageUrl(ia.src) ? ia.src : undefined) ??
+          ia['data-src'] ??
+          extractLargestUrlFromSrcset(ia.srcset ?? ia['data-srcset']) ??
+          ia.src;
+        const resolvedSrc = resolveHttpsHref(bestSrc, baseUrl);
+        if (!resolvedSrc || isDecorativeOrTinyImage(ia, resolvedSrc)) return full;
+        const alt = cleanInlineHtml(ia.alt ?? '');
+        let capText = '';
+        replacePairedHtmlElementsLinear(
+          figInner,
+          ['figcaption'],
+          (_cf, _ct, _ca, cInner) => {
+            if (!capText) capText = cleanInlineHtml(cInner);
+            return '';
+          },
+          { maxChars: 8000, maxInnerChars: 1200 },
+        );
+        return capText && capText !== alt
+          ? `\n\n![${alt}](${resolvedSrc})\n\n*${capText}*\n\n`
+          : `\n\n![${alt}](${resolvedSrc})\n\n`;
+      },
+      { maxInnerChars: 8000 },
+    );
+  }
+
+  if (/<table/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['table'], (full, _t, _attrs, tbl) => {
+      if (/<table\b/i.test(tbl)) return full;
+      const rows: string[][] = [];
+      replacePairedHtmlElementsLinear(tbl, ['tr'], (_rf, _rt, _ra, rInner) => {
+        const cells: string[] = [];
+        replacePairedHtmlElementsLinear(rInner, ['th', 'td'], (_cf, _ct, _ca, cInner) => {
+          cells.push(formatTableCellMarkdown(cInner));
+          return '';
+        });
+        rows.push(cells);
+        return '';
+      });
       const nonEmpty = rows.filter((r) => r.some((cell) => cell.length > 0));
       if (nonEmpty.length === 0) return '';
       const cols = Math.max(...nonEmpty.map((r) => r.length));
@@ -2062,82 +2280,114 @@ export function extractHtmlDocument(
       const sep = `| ${Array.from({ length: cols }, () => '---').join(' | ')} |`;
       const bodyRows = nonEmpty.slice(1).map((r) => `| ${pad(r).join(' | ')} |`);
       return `\n\n${[header, sep, ...bodyRows].join('\n')}\n\n`;
-    })
-    .replace(/<(?:code|kbd)\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/(?:code|kbd)>/gi, (_m, c) =>
-      stashInline(formatInlineCodeSpan(cleanInlineHtml(String(c)))),
-    )
-    // Convert links wrapping headings (`<a href="..."><h2>Title</h2></a>`) into `## [Title](url)` before generic `<h1>` / `<a>` rules.
-    .replace(
-      /<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>\s*<h([1-6])\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/h\2>\s*<\/a>/gi,
-      (_m, attrStr, lvl, inner) => {
-        const attrs = parseTagAttrs(String(attrStr));
-        const href = resolveHttpsHref(attrs.href, baseUrl, true);
-        const txt = cleanHeadingPermalinks(cleanInlineHtml(String(inner)));
-        if (!txt) return '';
-        const hashes = '#'.repeat(Number(lvl));
-        return href ? `\n\n${hashes} [${txt}](${href})\n\n` : `\n\n${hashes} ${txt}\n\n`;
-      },
-    )
-    .replace(/<h([1-6])\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/h\1>/gi, (_m, lvl, inner) => {
-      const txt = cleanHeadingPermalinks(cleanInlineHtml(String(inner)));
-      return txt ? `\n\n${'#'.repeat(Number(lvl))} ${txt}\n\n` : '';
-    })
-    .replace(/<summary\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/summary>/gi, (_m, inner) => {
+    });
+  }
+
+  if (/<(?:code|kbd)/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['code', 'kbd'], (_f, _t, _a, c) =>
+      stashInline(formatInlineCodeSpan(cleanInlineHtml(c))),
+    );
+  }
+
+  // Convert links wrapping headings (`<a href="..."><h2>Title</h2></a>`) into `## [Title](url)` before generic `<h1>` / `<a>` rules.
+  if (/<a/i.test(md) && /<h[1-6]/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['a'], (full, _t, attrStr, inner) => {
+      const trimmed = inner.trim();
+      if (!/^<h[1-6]\b/i.test(trimmed)) return full;
+      let matchedHeading: { lvl: number; inner: string } | null = null;
+      replacePairedHtmlElementsLinear(trimmed, ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], (hf, ht, _ha, hInner) => {
+        if (!matchedHeading && hf.length === trimmed.length) {
+          matchedHeading = { lvl: Number(ht.slice(1)), inner: hInner };
+        }
+        return '';
+      });
+      if (!matchedHeading) return full;
+      const mh = matchedHeading as { lvl: number; inner: string };
+      const attrs = parseTagAttrs(attrStr);
+      const href = resolveHttpsHref(attrs.href, baseUrl, true);
+      const txt = cleanHeadingPermalinks(cleanInlineHtml(mh.inner));
+      if (!txt) return '';
+      const hashes = '#'.repeat(mh.lvl);
+      return href ? `\n\n${hashes} [${txt}](${href})\n\n` : `\n\n${hashes} ${txt}\n\n`;
+    });
+  }
+
+  if (/<h[1-6]/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], (_f, tag, _a, inner) => {
+      const txt = cleanHeadingPermalinks(cleanInlineHtml(inner));
+      return txt ? `\n\n${'#'.repeat(Number(tag.slice(1)))} ${txt}\n\n` : '';
+    });
+  }
+
+  if (/<summary/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['summary'], (_f, _t, _a, inner) => {
       const txt = cleanHeadingPermalinks(
-        cleanInlineHtml(String(inner)).replace(/\s+(?:see all(?:\s+hide)?|show more(?:\s+show less)?)$/i, ''),
+        cleanInlineHtml(inner).replace(/\s+(?:see all(?:\s+hide)?|show more(?:\s+show less)?)$/i, ''),
       );
       if (!txt) return '';
       return /^#{1,6}\s/.test(txt) ? `\n\n${txt}\n\n` : `\n\n**${txt}**\n\n`;
-    })
-    .replace(/<(del|s|strike)\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/\1>/gi, (full, _t, inner) => {
-      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(String(inner))) return full;
-      const txt = cleanInlineHtml(String(inner));
+    });
+  }
+
+  if (/<(?:del|s|strike|mark|strong|b|em|i|a|dt|blockquote)/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['del', 's', 'strike'], (full, _t, _a, inner) => {
+      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
+      const txt = cleanInlineHtml(inner);
       return txt ? `~~${txt}~~` : '';
-    })
-    .replace(/<mark\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/mark>/gi, (full, inner) => {
-      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(String(inner))) return full;
-      const txt = cleanInlineHtml(String(inner));
+    });
+    md = replacePairedHtmlElementsLinear(md, ['mark'], (full, _t, _a, inner) => {
+      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
+      const txt = cleanInlineHtml(inner);
       return txt ? `==${txt}==` : '';
-    })
-    .replace(/<(strong|b)\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/\1>/gi, (full, _t, inner) => {
-      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(String(inner))) return full;
-      const txt = cleanInlineHtml(String(inner));
+    });
+    md = replacePairedHtmlElementsLinear(md, ['strong', 'b'], (full, _t, _a, inner) => {
+      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
+      const txt = cleanInlineHtml(inner);
       return txt ? `**${txt}**` : ' ';
-    })
-    .replace(/<(em|i)\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/\1>/gi, (full, _t, inner) => {
-      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(String(inner))) return full;
-      const txt = cleanInlineHtml(String(inner));
+    });
+    md = replacePairedHtmlElementsLinear(md, ['em', 'i'], (full, _t, _a, inner) => {
+      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
+      const txt = cleanInlineHtml(inner);
       return txt ? `*${txt}*` : ' ';
-    })
-    .replace(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/gi, (full, attrStr, inner) => {
-      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(String(inner))) return full;
-      const attrs = parseTagAttrs(String(attrStr));
+    });
+    md = replacePairedHtmlElementsLinear(md, ['a'], (full, _t, attrStr, inner) => {
+      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
+      const attrs = parseTagAttrs(attrStr);
       const href = resolveHttpsHref(attrs.href, baseUrl, true);
-      const label = cleanInlineHtml(String(inner));
+      const label = cleanInlineHtml(inner);
       if (!label) return ' ';
       return href ? `[${label}](${href})` : label;
-    })
-    .replace(/<dt\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]{1,1800}?)<\/dt>/gi, (_m, inner: string) => {
-      const compactSpans = inner
-        .replace(/<\/?span\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi, '')
-        .replace(/\*([^*\n]+)\*(?=[A-Za-z0-9_`])/g, '$1 ')
-        .replace(/\*([^*\n]+)\*/g, '$1');
-      const term = cleanHeadingPermalinks(cleanInlineHtml(compactSpans));
-      if (!term) return '';
-      if (/^\*\*[\s\S]+\*\*$/.test(term) || /^`[^`]+`$/.test(term)) {
-        return `\n\n**${term.replace(/^\*\*|\*\*$/g, '')}**\n\n`;
-      }
-      return `\n\n**${term}**\n\n`;
-    })
-    .replace(/<blockquote\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/blockquote>/gi, (_m, inner) => {
-      const txt = cleanInlineHtml(String(inner));
+    });
+    md = replacePairedHtmlElementsLinear(
+      md,
+      ['dt'],
+      (_f, _t, _a, inner) => {
+        const compactSpans = replaceHtmlTagsQuoteAwareLinear(
+          inner,
+          (t) => (t.tagNameLower === 'span' ? '' : t.rawTag),
+          2000,
+          false,
+        )
+          .replace(/\*([^*\n]+)\*(?=[A-Za-z0-9_`])/g, '$1 ')
+          .replace(/\*([^*\n]+)\*/g, '$1');
+        const term = cleanHeadingPermalinks(cleanInlineHtml(compactSpans));
+        if (!term) return '';
+        if (/^\*\*[\s\S]+\*\*$/.test(term) || /^`[^`]+`$/.test(term)) {
+          return `\n\n**${term.replace(/^\*\*|\*\*$/g, '')}**\n\n`;
+        }
+        return `\n\n**${term}**\n\n`;
+      },
+      { maxInnerChars: 1800 },
+    );
+    md = replacePairedHtmlElementsLinear(md, ['blockquote'], (_f, _t, _a, inner) => {
+      const txt = cleanInlineHtml(inner);
       return txt ? `\n\n> ${txt}\n\n` : '';
     });
+  }
 
-  // Convert `<ul>`/`<ol>`/`<li>` in a single O(N) stack pass so nested sublists emit indented `  - ` child bullets
-  // AND HTML5 optional-end-tag `<li>` siblings (`<li>A\n<li>B</li>`) never merge or drop their `- ` marker.
-  if (/<li\b/i.test(md)) {
-    const listTagRe = /<\/?(?:ul|ol|li)\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
+  // Convert `<ul>`/`<ol>`/`<li>` in a single O(N) stack pass (`H1`).
+  if (/<li/i.test(md)) {
+    const listSrc = md;
     const listOut: string[] = [];
     let listDepth = 0;
     const liStack: Array<{ depth: number; emitted: boolean }> = [];
@@ -2153,7 +2403,7 @@ export function extractHtmlDocument(
       const indent = '  '.repeat(Math.min(3, Math.max(0, activeLi.depth - 1)));
       if (/```|~~~|\u0000(?:EFFENCE|EFCODE)\d+\u0000|^\s*(?:#{1,6}\s|\|\s|>\s)/m.test(seg)) {
         const cleanedBlock = splitMarkdownByCodeFences(seg)
-          .map((p, idx) => (idx % 2 === 1 ? p : p.replace(HTML_TAG_QUOTE_AWARE_RE, ' ')))
+          .map((p, idx) => (idx % 2 === 1 ? p : stripHtmlTagsQuoteAwareLinear(p, ' ')))
           .join('')
           .trim();
         if (!cleanedBlock) return;
@@ -2175,46 +2425,79 @@ export function extractHtmlDocument(
       }
     };
 
-    let lm: RegExpExecArray | null;
-    while ((lm = listTagRe.exec(md)) !== null) {
-      flushListSeg(md.slice(lastListIdx, lm.index));
-      lastListIdx = lm.index + lm[0].length;
-      const head = lm[0].slice(0, 5).toLowerCase();
-      if (head.startsWith('<ul') || head.startsWith('<ol')) {
-        listDepth++;
-      } else if (head.startsWith('</ul') || head.startsWith('</ol')) {
-        while (liStack.length > 0 && liStack[liStack.length - 1]!.depth >= listDepth) {
-          liStack.pop();
+    scanHtmlTagsLinear(
+      listSrc,
+      (tag) => {
+        const t = tag.tagNameLower;
+        if (t !== 'ul' && t !== 'ol' && t !== 'li') return;
+        flushListSeg(listSrc.slice(lastListIdx, tag.index));
+        lastListIdx = tag.end;
+        if (!tag.isClosing && (t === 'ul' || t === 'ol')) {
+          listDepth++;
+        } else if (tag.isClosing && (t === 'ul' || t === 'ol')) {
+          while (liStack.length > 0 && liStack[liStack.length - 1]!.depth >= listDepth) {
+            liStack.pop();
+          }
+          listDepth = Math.max(0, listDepth - 1);
+          if (listDepth === 0) listOut.push('\n\n');
+        } else if (!tag.isClosing && t === 'li') {
+          const targetDepth = Math.max(1, listDepth);
+          while (liStack.length > 0 && liStack[liStack.length - 1]!.depth >= targetDepth) {
+            liStack.pop();
+          }
+          liStack.push({ depth: targetDepth, emitted: false });
+        } else if (tag.isClosing && t === 'li') {
+          if (liStack.length > 0) liStack.pop();
         }
-        listDepth = Math.max(0, listDepth - 1);
-        if (listDepth === 0) listOut.push('\n\n');
-      } else if (head.startsWith('<li')) {
-        const targetDepth = Math.max(1, listDepth);
-        while (liStack.length > 0 && liStack[liStack.length - 1]!.depth >= targetDepth) {
-          liStack.pop();
-        }
-        liStack.push({ depth: targetDepth, emitted: false });
-      } else if (head.startsWith('</li')) {
-        if (liStack.length > 0) liStack.pop();
-      }
-    }
-    flushListSeg(md.slice(lastListIdx));
+      },
+      MAX_HTML_SCAN_CHARS,
+      false,
+    );
+    flushListSeg(listSrc.slice(lastListIdx));
     md = listOut.join('');
   }
-  md = md
-    .replace(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/gi, (_m, attrStr, inner) => {
-      const attrs = parseTagAttrs(String(attrStr));
+
+  if (/<a/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['a'], (_f, _t, attrStr, inner) => {
+      const attrs = parseTagAttrs(attrStr);
       const href = resolveHttpsHref(attrs.href, baseUrl, true);
-      const label = cleanInlineHtml(String(inner));
+      const label = cleanInlineHtml(inner);
       if (!label) return '';
       return href ? `[${label}](${href})` : label;
-    })
-    .replace(/<(br|hr)\b(?:"[^"]*"|'[^']*'|[^>"'])*\/?>/gi, (_m, tag) =>
-      String(tag).toLowerCase() === 'hr' ? '\n\n---\n\n' : '\n',
-    )
-    .replace(/<\/(p|div|section|article|main|ul|ol|dl|dd|dt|figure|figcaption|tr|header|details)>/gi, '\n\n')
-    .replace(/<\/(span|button|label|time|td|th)>/gi, ' ')
-    .replace(HTML_TAG_QUOTE_AWARE_RE, '')
+    });
+  }
+
+  const blockCloseTags = new Set([
+    'p',
+    'div',
+    'section',
+    'article',
+    'main',
+    'ul',
+    'ol',
+    'dl',
+    'dd',
+    'dt',
+    'figure',
+    'figcaption',
+    'tr',
+    'header',
+    'details',
+  ]);
+  const spaceCloseTags = new Set(['span', 'button', 'label', 'time', 'td', 'th']);
+
+  md = replaceHtmlTagsQuoteAwareLinear(
+    md,
+    (tag) => {
+      if (!tag.isClosing && tag.tagNameLower === 'hr') return '\n\n---\n\n';
+      if (!tag.isClosing && tag.tagNameLower === 'br') return '\n';
+      if (tag.isClosing && blockCloseTags.has(tag.tagNameLower)) return '\n\n';
+      if (tag.isClosing && spaceCloseTags.has(tag.tagNameLower)) return ' ';
+      return '';
+    },
+    MAX_HTML_SCAN_CHARS,
+    true,
+  )
     .replace(/\u0000EFTASKX\u0000/g, '[x]')
     .replace(/\u0000EFTASKO\u0000/g, '[ ]')
     .replace(/\u0000EFFENCE(\d+)\u0000/g, (_m, idx: string) => codeStash[Number(idx)] ?? '')
@@ -2225,8 +2508,9 @@ export function extractHtmlDocument(
       if (idx % 2 === 1) return part;
       return part
         .replace(/`([^`\n]+)`(?=`[^`\n]+`)/g, '`$1` ')
-        .replace(/([A-Za-z0-9])(\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g, '$1 $2')
-        .replace(/(\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))([A-Za-z0-9])/g, '$1 $2')
+        .replace(/(\[[^\[\]\n]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1')
+        .replace(/([A-Za-z0-9])(\[[^\[\]\n]+\]\(https?:\/\/[^)\s]+\))/g, '$1 $2')
+        .replace(/(\[[^\[\]\n]+\]\(https?:\/\/[^)\s]+\))([A-Za-z0-9])/g, '$1 $2')
         .split('\n')
         .map((line) => {
           const normalizedTask = line.replace(/^(\s*-\s+)\[\s*([xX])\s*\]/, '$1[x]');
@@ -3219,7 +3503,7 @@ function dedupeConsecutiveStandaloneLinkParagraphs(prose: string): string {
 
 function resolveMarkdownRelativeLinksInProse(prose: string, baseUrl?: string): string {
   if (!baseUrl) return prose;
-  return prose.replace(/(`+[^`\n]*`+)|(!?\[[^\]\n]*\])\(([^)\s]+)(\s+"[^"]*")?\)/g, (full, codeSpan, labelPart, rawHref, titleSuffix) => {
+  return prose.replace(/(`+[^`\n]*`+)|(!?\[(?:!\[[^\[\]\n]*\]\([^)\n]*\)|[^\[\]\n])*\])\(([^)\s]+)(\s+"[^"\n]*")?\)/g, (full, codeSpan, labelPart, rawHref, titleSuffix) => {
     if (codeSpan) return String(codeSpan);
     const href = String(rawHref ?? '');
     if (!/^(?:\/(?!\/)|\.{1,2}\/)/.test(href)) return full;
@@ -3284,9 +3568,28 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string): stri
       if (idx % 2 === 1) {
         return cleanCodeFenceSegment(part);
       }
-      const cleanedProse = part
-        // Strip JSX / MDX inline comments (`{/*reference*/}`, `{/* ... */}`) outside code fences.
-        .replace(/\{\/\*[\s\S]*?\*\/\}/g, '')
+      let proseWork = part;
+      // Strip JSX / MDX inline comments (`{/*reference*/}`, `{/* ... */}`) outside code fences in linear O(N) time.
+      if (proseWork.includes('{/*')) {
+        let outJsx = '';
+        let cur = 0;
+        while (cur < proseWork.length) {
+          const start = proseWork.indexOf('{/*', cur);
+          if (start < 0) {
+            outJsx += proseWork.slice(cur);
+            break;
+          }
+          outJsx += proseWork.slice(cur, start);
+          const end = proseWork.indexOf('*/}', start + 3);
+          if (end < 0) {
+            outJsx += proseWork.slice(start);
+            break;
+          }
+          cur = end + 3;
+        }
+        proseWork = outJsx;
+      }
+      proseWork = proseWork
         // Convert VitePress / Docusaurus `:::` / `::::` admonition containers into clean bold callout headers and strip layout containers.
         .replace(
           /^[ \t]*:{3,}[ \t]*(info|tip|note|warning|caution|danger|important|details)(?:[ \t]+([^\r\n]+))?[ \t]*$/gim,
@@ -3301,83 +3604,98 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string): stri
         )
         .replace(/^[ \t]*:{3,}(?:[ \t]*(?:code-group|tabs|tab(?:\s+[^\r\n]*)?|raw|v-pre))?[ \t]*$/gim, '')
         // Unwrap standalone MDX PascalCase component wrapper / self-closing lines (`<Intro>`, `</Intro>`, `<InlineToc />`, `<DeepDive title="...">`)
-        // as well as inline MDX components (`<CodeStep step={1}>current state</CodeStep>`).
-        .replace(/^[ \t]*<([A-Z][A-Za-z0-9._]*)\b((?:"[^"]*"|'[^']*'|[^>"'])*)\s*(\/?)>[ \t]*$/gm, (_m, _tag, attrStr: string, selfClose: string) => {
+        .replace(/^[ \t]*<([A-Z][A-Za-z0-9._]*)\b((?:"[^"\n]*"|'[^'\n]*'|[^>"'\n])*)\s*(\/?)>[ \t]*$/gm, (_m, _tag, attrStr: string, selfClose: string) => {
           if (selfClose === '/') return '';
           const attrs = parseTagAttrs(String(attrStr ?? ''));
           const headingTitle = (attrs.title ?? attrs.titletext ?? '').trim();
           return headingTitle ? `\n\n**${headingTitle}**\n\n` : '';
         })
         .replace(/^[ \t]*<\/[A-Z][A-Za-z0-9._]*>[ \t]*$/gm, '')
-        .replace(/`+[^`\n]*`+|<([A-Z][A-Za-z0-9._]*)\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/\1>/g, (full, _tag, inner?: string) =>
-          inner !== undefined ? inner : full,
+        // Unwrap inline MDX PascalCase components (`<CodeStep step={1}>current state</CodeStep>`) outside inline code spans.
+        .replace(/`+[^`\n]*`+|<\/?[A-Z][A-Za-z0-9._]*\b(?:"[^"\n]*"|'[^'\n]*'|[^>"'\n])*>/g, (full) =>
+          full.charCodeAt(0) === 96 ? full : '',
         )
-        .replace(/\[\s*<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>\s*\]\(([^)]+)\)/gi, (_m, lvl, inner, href) => {
+        .replace(/\[\s*<h([1-6])\b[^>\"\n]*>([^<\n]{1,400})<\/h\1>\s*\]\(([^)\n]+)\)/gi, (_m, lvl, inner, href) => {
           const label = cleanInlineHtml(String(inner));
           return label ? `\n\n${'#'.repeat(Number(lvl))} [${label}](${String(href).trim()})\n\n` : '';
-        })
-        .replace(/<a\b([^>]*)>\s*<h([1-6])\b[^>]*>([\s\S]*?)<\/h\2>\s*<\/a>/gi, (_m, attrStr, lvl, inner) => {
-          const attrs = parseTagAttrs(String(attrStr));
+        });
+
+      proseWork = replacePairedHtmlElementsLinear(
+        proseWork,
+        ['a'],
+        (full, _tag, attrStr, inner) => {
+          const trimmedInner = inner.trim();
+          const hMatch = /^<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>$/i.exec(trimmedInner);
+          if (hMatch) {
+            const attrs = parseTagAttrs(attrStr);
+            const href = resolveHttpsHref(attrs.href, baseUrl);
+            const label = cleanInlineHtml(hMatch[2] ?? '');
+            if (!label) return '';
+            return href ? `\n\n${'#'.repeat(Number(hMatch[1]))} [${label}](${href})\n\n` : `\n\n${'#'.repeat(Number(hMatch[1]))} ${label}\n\n`;
+          }
+          const attrs = parseTagAttrs(attrStr);
           const href = resolveHttpsHref(attrs.href, baseUrl);
-          const label = cleanInlineHtml(String(inner));
-          if (!label) return '';
-          return href ? `\n\n${'#'.repeat(Number(lvl))} [${label}](${href})\n\n` : `\n\n${'#'.repeat(Number(lvl))} ${label}\n\n`;
-        })
-        .replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_m, lvl, inner) => {
-          const label = cleanInlineHtml(String(inner));
-          return label ? `\n\n${'#'.repeat(Number(lvl))} ${label}\n\n` : '';
-        })
-        .replace(/<summary\b[^>]*>([\s\S]*?)<\/summary>/gi, (_m, inner) => {
-          const label = cleanInlineHtml(String(inner));
-          return label ? `\n\n**${label}**\n\n` : '';
-        })
-        .replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (_m, attrStr, inner) => {
-          const attrs = parseTagAttrs(String(attrStr));
-          const href = resolveHttpsHref(attrs.href, baseUrl);
-          const label = cleanInlineHtml(String(inner));
+          const label = cleanInlineHtml(inner);
           if (!label) return '';
           return href ? `[${label}](${href})` : label;
-        })
-        .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_m, inner) => {
-          const txt = cleanInlineHtml(String(inner));
-          return txt ? `\`${txt}\`` : '';
-        })
-        .replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1>/gi, (_m, _t, inner) => {
-          const txt = cleanInlineHtml(String(inner));
-          return txt ? `**${txt}**` : '';
-        })
-        .replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1>/gi, (_m, _t, inner) => {
-          const txt = cleanInlineHtml(String(inner));
-          return txt ? `*${txt}*` : '';
-        })
-        .replace(/<sup\b[^>]*>([\s\S]*?)<\/sup>/gi, (_m, inner) => {
-          const txt = cleanInlineHtml(String(inner));
+        },
+        { maxChars: MAX_HTML_SCAN_CHARS },
+      );
+
+      proseWork = replacePairedHtmlElementsLinear(
+        proseWork,
+        ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'summary', 'code', 'strong', 'b', 'em', 'i', 'sup'],
+        (_full, tag, _attrStr, inner) => {
+          const txt = cleanInlineHtml(inner);
           if (!txt) return '';
+          if (tag.length === 2 && tag.charCodeAt(0) === 104) {
+            const lvl = tag.charCodeAt(1) - 48;
+            return `\n\n${'#'.repeat(lvl)} ${txt}\n\n`;
+          }
+          if (tag === 'summary') return `\n\n**${txt}**\n\n`;
+          if (tag === 'code') return `\`${txt}\``;
+          if (tag === 'strong' || tag === 'b') return `**${txt}**`;
+          if (tag === 'em' || tag === 'i') return `*${txt}*`;
           return /^[\d,\s-]+$/.test(txt) ? ` [${txt}]` : `^${txt}`;
-        })
-        .split('\n')
-        .map((line) =>
-          line.trimStart().startsWith('|')
-            ? line.replace(/<br\b[^>]*\/?>/gi, ' / ')
-            : line.replace(/<br\b[^>]*\/?>/gi, '\n'),
-        )
-        .join('\n')
-        .replace(/<\/?(?:u|details|span|div|p|button)\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi, '')
+        },
+        { maxChars: MAX_HTML_SCAN_CHARS },
+      );
+
+      const cleanedProse = replaceHtmlTagsQuoteAwareLinear(
+        proseWork
+          .split('\n')
+          .map((line) =>
+            line.trimStart().startsWith('|')
+              ? line.replace(/<br\b[^>]*\/?>/gi, ' / ')
+              : line.replace(/<br\b[^>]*\/?>/gi, '\n'),
+          )
+          .join('\n'),
+        (tag) =>
+          tag.tagNameLower === 'u' ||
+          tag.tagNameLower === 'details' ||
+          tag.tagNameLower === 'span' ||
+          tag.tagNameLower === 'div' ||
+          tag.tagNameLower === 'p' ||
+          tag.tagNameLower === 'button'
+            ? ''
+            : tag.rawTag,
+        MAX_HTML_SCAN_CHARS,
+      )
         .replace(/\[Skip to content\]\(#[^)]*\)\s*/gi, '')
         .replace(/(?:^|\n)Was this (?:page )?helpful\?[ \t]*(?:\n+(?:Yes\s*No|Yes[ \t]*\/[ \t]*No))?[ \t]*(?=\n|$)/gi, '\n')
         .replace(/!\[\s*\]\(\s*(?:""|'')?\s*\)/g, '')
-        .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (full, alt: string, rawUrl: string) =>
+        .replace(/!\[([^\[\]\n]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (full, alt: string, rawUrl: string) =>
           isTinyOrAvatarImageUrl(rawUrl, alt) ? '' : full,
         )
-        .replace(/(!\[[^\]]*\]\([^)\s]+(?:\s+"[^"]*")?\))[ \t]*(?=!\[)/g, '$1\n\n')
+        .replace(/(!\[[^\[\]\n]*\]\([^)\s]+(?:\s+"[^"]*")?\))[ \t]*(?=!\[)/g, '$1\n\n')
         .replace(
           idx === parts.length - 1
-            ? /\n##+\s+On this page[ \t]*(?:\n+(?:[-*]\s+\[[^\]]+\]\(#[^)]+\)[ \t]*)+)?(?:\n+\[!\[[^\]]*\]\([^)]+\)[^\]]*\]\([^)]+\)[ \t]*)?\s*$/i
+            ? /\n##+\s+On this page[ \t]*(?:\n+(?:[-*]\s+\[[^\[\]\n]+\]\(#[^)\n]+\)[ \t]*)+)?(?:\n+\[!\[[^\[\]\n]*\]\([^)\n]+\)[^\[\]\n]*\]\([^)\n]+\)[ \t]*)?\s*$/i
             : /$^/,
           '',
         );
       return resolveMarkdownRelativeLinksInProse(cleanedProse, baseUrl)
-        .replace(/(\[[^\]]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1')
+        .replace(/(\[[^\[\]\n]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1')
         .replace(/\n{3,}/g, '\n\n');
     })
     .map((part, idx) => (idx % 2 === 1 ? part : dedupeConsecutiveStandaloneLinkParagraphs(part)))
@@ -3442,10 +3760,10 @@ export function extractMarkdownLinksAndImages(
     }
   }
 
-  const withoutImages = proseOnly.replace(/!\[[^\]]*\]\([^)]+\)/g, ' ');
+  const withoutImages = proseOnly.replace(/!\[[^\[\]\n]*\]\([^)\n]+\)/g, ' ');
   const links: string[] = [];
   const seenLinks = new Set<string>();
-  for (const lm of withoutImages.matchAll(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)) {
+  for (const lm of withoutImages.matchAll(/\[([^\[\]\n]+)\]\(([^)\s]+)(?:\s+"[^"\n]*")?\)/g)) {
     const rawHref = lm[2]?.trim() ?? '';
     if (!rawHref || rawHref.startsWith('#')) continue;
     const resolved = resolveHttpsHref(rawHref, baseUrl);
@@ -3471,7 +3789,7 @@ export function stripInvisibleSmugglingChars(s: string): string {
 
 function finalizeScrapedMarkdown(
   rawMd: string,
-  opts: { isPdf: boolean; includeImages: boolean; maxChars?: number; baseUrl?: string },
+  opts: { isPdf: boolean; includeImages: boolean; maxChars?: number; baseUrl?: string; preserveOriginMarkdown?: boolean },
 ): {
   markdown: string;
   truncated?: boolean;
@@ -3481,13 +3799,15 @@ function finalizeScrapedMarkdown(
   frontmatterDescription?: string;
 } {
   const fm = opts.isPdf ? { body: rawMd } : parseMarkdownFrontmatter(rawMd);
-  let md = stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), opts.baseUrl));
+  let md = opts.preserveOriginMarkdown
+    ? stripInvisibleSmugglingChars(fm.body)
+    : stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), opts.baseUrl));
   if (opts.isPdf) {
     md = cleanPdfMarkdown(md);
   }
   if (!opts.includeImages) {
     md = md
-      .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+      .replace(/!\[[^\[\]\n]*\]\([^)\n]+\)/g, '')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   } else {
@@ -5417,6 +5737,9 @@ export async function executeScrapeCall(params: {
         id: 'scrape-1',
         url: normalizedUrl,
         kind: pdfParserOpts.skipPdfParsing ? 'binary' : renderMode === 'always' ? 'render' : 'scrape',
+        ...(!pdfParserOpts.skipPdfParsing && !Object.keys(mergedHeaders).some((k) => k.toLowerCase() === 'accept')
+          ? { accept: MARKDOWN_FOR_AGENTS_ACCEPT }
+          : {}),
         formats: agentFormats,
         onlyMainContent,
         discoverLlms: goDiscoverLlms,
@@ -6220,9 +6543,11 @@ export async function executeScrapeCall(params: {
     }
     const problemText = String(item.problem ?? 'Origin scrape did not return HTTP 2xx');
     const rawErrBody = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
-    const errWaf =
-      (item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
-      classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 0, rawBody: rawErrBody });
+    const isPaymentRequiredErr = item.status === 402 || item.outcome === 'payment_required';
+    const errWaf = isPaymentRequiredErr
+      ? null
+      : ((item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
+        classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 0, rawBody: rawErrBody }));
 
     // Ethical External Heavy-SPA Fallback (`Crawl4AI` / `Firecrawl`) on local browser/transport failure (NEVER on robots.txt, 403, 429, or challenges!)
     if (
@@ -6315,18 +6640,35 @@ export async function executeScrapeCall(params: {
       }
     }
 
-    const effectiveOutcome = errWaf ? 'challenge' : (item.outcome ?? 'error');
+    const effectiveOutcome = isPaymentRequiredErr
+      ? 'payment_required'
+      : errWaf
+        ? 'challenge'
+        : (item.outcome ?? 'error');
     const effectiveProb = errWaf ? errWaf.summary : problemText;
     const robotsHint = /robots\.txt disallowed/i.test(effectiveProb) ? buildRobotsAlternativeHint(normalizedUrl) : undefined;
-    const blockedInfo = buildBlockedInfo(normalizedUrl, effectiveOutcome, effectiveProb, item.status);
+    const itemPaymentHeaders =
+      item.paymentHeaders && typeof item.paymentHeaders === 'object' && !Array.isArray(item.paymentHeaders)
+        ? (item.paymentHeaders as Record<string, string | undefined>)
+        : undefined;
+    const blockedInfo = buildBlockedInfo(normalizedUrl, effectiveOutcome, effectiveProb, item.status, {
+      headers: itemPaymentHeaders,
+      rawBody: rawErrBody,
+    });
     return {
-      status: item.status === 429 ? 429 : effectiveOutcome === 'challenge' ? 403 : 422,
+      status: isPaymentRequiredErr
+        ? 402
+        : item.status === 429
+          ? 429
+          : effectiveOutcome === 'challenge'
+            ? 403
+            : 422,
       via: fetchResUsed.via,
       body: {
         ok: false,
         url: normalizedUrl,
         outcome: effectiveOutcome,
-        status: item.status ?? 0,
+        status: item.status ?? (isPaymentRequiredErr ? 402 : 0),
         problem: effectiveProb,
         ...(errWaf ? { waf: errWaf } : {}),
         ...(robotsHint ? { hint: robotsHint } : {}),
@@ -6385,10 +6727,17 @@ export async function executeScrapeCall(params: {
   let renderedViaOut: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
     renderMode === 'always' ? 'browser' : item.rendered === true ? 'browser-auto' : undefined;
 
+  const isOriginMarkdown = Boolean(
+    rawBodyStr &&
+      !isPdfResponse &&
+      typeof item.contentType === 'string' &&
+      /^text\/x?-?markdown\b/i.test(item.contentType.trim()),
+  );
+
   // R2 & R3: Guard against HTTP 200 WAF/CAPTCHA interstitials (e.g. Imperva / PerimeterX / DataDome 200 shells) using all 4 anti-FP layers!
   const okWafMatch =
     (item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
-    (!isPdfResponse && rawBodyStr
+    (!isPdfResponse && !isOriginMarkdown && rawBodyStr
       ? classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 200, rawBody: rawBodyStr })
       : null);
   if (okWafMatch) {
@@ -6546,7 +6895,7 @@ export async function executeScrapeCall(params: {
     };
   }
 
-  if (rawBodyStr && /^\s*(?:<!doctype\s+html|<html\b)/i.test(rawBodyStr)) {
+  if (!isOriginMarkdown && rawBodyStr && /^\s*(?:<!doctype\s+html|<html\b)/i.test(rawBodyStr)) {
     item.contentType = 'text/html; charset=utf-8';
   }
   const binaryScrapeProblem = rawBase64Requested
@@ -6573,7 +6922,8 @@ export async function executeScrapeCall(params: {
     };
   }
   let isHtmlBody = Boolean(
-    rawBodyStr &&
+    !isOriginMarkdown &&
+      rawBodyStr &&
       !isPdfResponse &&
       ((typeof item.contentType === 'string' && item.contentType.toLowerCase().includes('html')) ||
         /^\s*<!doctype\s+html|^\s*<html|<(head|body|main|article)\b/i.test(rawBodyStr)),
@@ -6757,6 +7107,7 @@ export async function executeScrapeCall(params: {
   }
 
   const vcardFormatted =
+    !isOriginMarkdown &&
     !isHtmlBody &&
     !isPdfResponse &&
     !alternateMarkdownBody &&
@@ -6765,15 +7116,15 @@ export async function executeScrapeCall(params: {
       ? formatVcardToMarkdown(rawBodyStr)
       : null;
   const icsFormatted =
-    !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted
+    !isOriginMarkdown && !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted
       ? formatIcalendarToMarkdown(rawBodyStr)
       : null;
   const feedFormatted =
-    !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted && !icsFormatted
+    !isOriginMarkdown && !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted && !icsFormatted
       ? formatFeedXmlToMarkdown(rawBodyStr, finalUrl)
       : null;
   const jsonFormatted =
-    !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted && !icsFormatted && !feedFormatted
+    !isOriginMarkdown && !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted && !icsFormatted && !feedFormatted
       ? tryParseJsonPayloadForScrape(rawBodyStr, item.contentType, finalUrl)
       : null;
   const isNotebookOrOpenApiJson = Boolean(
@@ -6785,6 +7136,7 @@ export async function executeScrapeCall(params: {
         'nbformat' in (jsonFormatted.parsed as Record<string, unknown>)),
   );
   const jsonRecordsFormatted =
+    !isOriginMarkdown &&
     !isHtmlBody &&
     !isPdfResponse &&
     !alternateMarkdownBody &&
@@ -6801,10 +7153,11 @@ export async function executeScrapeCall(params: {
         })
       : null;
   const csvFormatted =
-    !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted && !icsFormatted && !feedFormatted && !jsonFormatted
+    !isOriginMarkdown && !isHtmlBody && !isPdfResponse && !alternateMarkdownBody && !vcardFormatted && !icsFormatted && !feedFormatted && !jsonFormatted
       ? formatDelimitedTableToMarkdown(rawBodyStr, item.contentType, finalUrl)
       : null;
   const patchFormatted =
+    !isOriginMarkdown &&
     !isHtmlBody &&
     !isPdfResponse &&
     !alternateMarkdownBody &&
@@ -6816,6 +7169,7 @@ export async function executeScrapeCall(params: {
       ? formatGitPatchToMarkdown(rawBodyStr, item.contentType, finalUrl)
       : null;
   const sourceCodeFormatted =
+    !isOriginMarkdown &&
     !isHtmlBody &&
     !isPdfResponse &&
     !alternateMarkdownBody &&
@@ -6843,14 +7197,15 @@ export async function executeScrapeCall(params: {
     ? extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '')
     : null;
 
-  let markdown =
-    alternateMarkdownBody ||
-    ssrHydrated?.markdown ||
-    structuredTextFormatted?.markdown ||
-    (isHtmlBody ? extracted?.markdown : undefined) ||
-    (typeof item.markdown === 'string' && item.markdown) ||
-    extracted?.markdown ||
-    (isHtmlBody ? '' : rawBodyStr);
+  let markdown = isOriginMarkdown
+    ? rawBodyStr
+    : alternateMarkdownBody ||
+      ssrHydrated?.markdown ||
+      structuredTextFormatted?.markdown ||
+      (isHtmlBody ? extracted?.markdown : undefined) ||
+      (typeof item.markdown === 'string' && item.markdown) ||
+      extracted?.markdown ||
+      (isHtmlBody ? '' : rawBodyStr);
   if (htmlJobPosting && isHtmlBody && !alternateMarkdownBody) {
     const jpHeader = formatJobPostingHeaderMarkdown(htmlJobPosting);
     if (jpHeader && !/\*\*Compensation\*\*:/.test(markdown.slice(0, 400))) {
@@ -6860,22 +7215,27 @@ export async function executeScrapeCall(params: {
         : `# ${htmlJobPosting.title}\n\n${jpHeader}\n\n${markdown}`;
     }
   }
-  let textOut =
-    alternateMarkdownBody ||
-    ssrHydrated?.markdown ||
-    feedFormatted?.markdown ||
-    vcardFormatted?.markdown ||
-    icsFormatted?.markdown ||
-    jsonRecordsFormatted?.markdown ||
-    (jsonFormatted || csvFormatted || patchFormatted || sourceCodeFormatted ? rawBodyStr : undefined) ||
-    (isHtmlBody ? extracted?.text : undefined) ||
-    (typeof item.text === 'string' && item.text) ||
-    extracted?.text ||
-    '';
+  let textOut = isOriginMarkdown
+    ? rawBodyStr
+    : alternateMarkdownBody ||
+      ssrHydrated?.markdown ||
+      feedFormatted?.markdown ||
+      vcardFormatted?.markdown ||
+      icsFormatted?.markdown ||
+      jsonRecordsFormatted?.markdown ||
+      (jsonFormatted || csvFormatted || patchFormatted || sourceCodeFormatted ? rawBodyStr : undefined) ||
+      (isHtmlBody ? extracted?.text : undefined) ||
+      (typeof item.text === 'string' && item.text) ||
+      extracted?.text ||
+      '';
   let viaOut = fetchResUsed.via;
   let pdfEngineOut = typeof item.pdfEngine === 'string' ? item.pdfEngine : undefined;
   let ocrReportOut: PdfOcrContainerReply['ocr'] | undefined;
-  let contentSourceOut: 'meta-description' | 'ssr-hydration' | undefined = ssrHydrated ? 'ssr-hydration' : undefined;
+  let contentSourceOut: 'origin-markdown' | 'meta-description' | 'ssr-hydration' | undefined = isOriginMarkdown
+    ? 'origin-markdown'
+    : ssrHydrated
+      ? 'ssr-hydration'
+      : undefined;
 
   // Automatic PDF OCR fallback when Poppler `pdftotext` returns empty / scanned-image output (<100 non-whitespace chars).
   if (ocrMode === 'auto' && hasPdfOcr && isPdfResponse && markdown.replace(/\s+/g, '').length < 100) {
@@ -6909,6 +7269,7 @@ export async function executeScrapeCall(params: {
     includeImages,
     maxChars: undefined,
     baseUrl: finalUrl,
+    preserveOriginMarkdown: isOriginMarkdown,
   });
   let rawCleanMarkdown = fullShaped.markdown;
   const mdAssets = !isHtmlBody && !isPdfResponse ? extractMarkdownLinksAndImages(rawCleanMarkdown, finalUrl, includeImages) : undefined;
@@ -7018,10 +7379,11 @@ export async function executeScrapeCall(params: {
           includeImages,
           maxChars,
           baseUrl: finalUrl,
+          preserveOriginMarkdown: isOriginMarkdown,
         })
       : fullShaped;
   markdown = shaped.markdown;
-  textOut = decodeHtmlEntities(textOut);
+  textOut = isOriginMarkdown ? stripInvisibleSmugglingChars(textOut) : decodeHtmlEntities(textOut);
 
   let llmsPayload: unknown = item.llms;
   if (llmsPayload && typeof llmsPayload === 'object') {
@@ -7386,6 +7748,7 @@ export async function executeScrapeCall(params: {
       favicon: (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon,
       canonicalUrl: extracted?.canonicalUrl,
       ...(alternateMarkdownUrl ? { alternateMarkdownUrl } : {}),
+      ...(contentSourceOut ? { contentSource: contentSourceOut } : {}),
       contentType: isPdfResponse ? 'application/pdf' : item.contentType,
     },
   };

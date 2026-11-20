@@ -2,9 +2,10 @@
 
 // Package priv implements irreversible root privilege dropping and pre-drop secret file lockdown on Linux containers.
 // At startup (while still UID 0), LockDownSecretPaths enforces 0600 root:root on /data/options.json and 0700 root:root
-// on /data; then DropRoot invokes PR_SET_NO_NEW_PRIVS + Setgroups([]) + Setgid(65532) + Setuid(65532) across all Go
-// runtime OS threads (AllThreadsSyscall6) before any network socket opens or Chromium subprocess spawns, guaranteeing
-// VFS DAC blocks UID 65532 (and all child processes) from reading /data/options.json on every Linux kernel.
+// on /data; then DropRoot invokes PR_SET_NO_NEW_PRIVS + Setgroups([]) + Setgid(65532) + Setuid(65532) + PR_SET_DUMPABLE(0)
+// across all Go runtime OS threads (AllThreadsSyscall6) before any network socket opens or Chromium subprocess spawns,
+// guaranteeing VFS DAC blocks UID 65532 (and all child processes) from reading /data/options.json and marking
+// /proc/<pid>/environ + /proc/<pid>/mem non-dumpable (`Dumpable: 0`) on every Linux kernel.
 package priv
 
 import (
@@ -17,6 +18,7 @@ import (
 
 const (
 	nonrootUID     = 65532
+	prSetDumpable  = 4  // Linux <sys/prctl.h> PR_SET_DUMPABLE
 	prSetNoNewPriv = 38 // Linux <sys/prctl.h> PR_SET_NO_NEW_PRIVS
 )
 
@@ -53,9 +55,14 @@ func LockDownSecretPaths(paths ...string) {
 	}
 }
 
-// DropRoot permanently transitions UID/GID 0 down to unprivileged `65532:65532` (`nonroot`) and sets `NO_NEW_PRIVS`.
+// DropRoot permanently transitions UID/GID 0 down to unprivileged `65532:65532` (`nonroot`), sets `NO_NEW_PRIVS`,
+// and marks the process non-dumpable (`PR_SET_DUMPABLE=0`).
 func DropRoot() error {
 	if os.Geteuid() != 0 {
+		// Best-effort hardening when started directly as unprivileged UID (e.g. USER 65532 or su-exec 65532:65532);
+		// ignores ENOTSUP when running under `go test -race` (CGO_ENABLED=1).
+		_, _, _ = syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetNoNewPriv, 1, 0, 0, 0, 0)
+		_, _, _ = syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0)
 		return nil
 	}
 	// Prevent any future `execve` across ALL Go runtime OS threads from gaining privileges via setuid/file-cap bits.
@@ -72,6 +79,11 @@ func DropRoot() error {
 	}
 	if err := syscall.Setuid(nonrootUID); err != nil {
 		return fmt.Errorf("setuid(%d): %w", nonrootUID, err)
+	}
+	// Apply PR_SET_DUMPABLE=0 AFTER setgid/setuid because Linux commit_creds resets mm->dumpable to fs.suid_dumpable
+	// during UID/GID transitions (which may be 2 on hosts with apport/coredumpd).
+	if _, _, errno := syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0); errno != 0 {
+		return fmt.Errorf("prctl(PR_SET_DUMPABLE): %w", errno)
 	}
 	if os.Geteuid() != nonrootUID || os.Getuid() != nonrootUID || os.Getegid() != nonrootUID || os.Getgid() != nonrootUID {
 		return errors.New("privilege drop verification failed: uid/euid/gid/egid did not transition to 65532")

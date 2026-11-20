@@ -15,6 +15,7 @@ import { SITE_ID_PATTERN } from './auth';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
 import { validatePublicHttpsTargetUrl } from './overflow';
+import { readBodyTextCapped } from './safe-input';
 import { classifyWafAndChallenge } from './waf';
 
 const SUPPORTED_PROTOCOL_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
@@ -1099,14 +1100,20 @@ export function truncateResultBodies(
       }
     }
     if (copy.outcome !== 'ok' && typeof copy.url === 'string') {
-      if (!copy.waf && typeof copy.status === 'number') {
+      if (!copy.waf && typeof copy.status === 'number' && copy.status !== 402 && copy.outcome !== 'payment_required') {
         const inferredWaf = classifyWafAndChallenge({
           status: copy.status,
           ...(typeof copy.body === 'string' && (!copy.bodyEncoding || copy.bodyEncoding === 'utf-8') ? { rawBody: copy.body } : {}),
         });
         if (inferredWaf) copy.waf = inferredWaf;
       }
-      const blocked = buildBlockedInfo(copy.url, copy.outcome, copy.problem, copy.status);
+      const blocked = buildBlockedInfo(copy.url, copy.outcome, copy.problem, copy.status, {
+        headers:
+          copy.paymentHeaders && typeof copy.paymentHeaders === 'object' && !Array.isArray(copy.paymentHeaders)
+            ? (copy.paymentHeaders as Record<string, string | undefined>)
+            : undefined,
+        rawBody: typeof copy.body === 'string' && (!copy.bodyEncoding || copy.bodyEncoding === 'utf-8') ? copy.body : undefined,
+      });
       if (blocked) copy.blocked = blocked;
     }
 
@@ -1840,10 +1847,14 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
     return Response.json({ error: 'method_not_allowed' }, { status: 405, headers: cors });
   }
 
-  const rawText = await request.text();
-  if (rawText.length > MAX_MCP_REQUEST_BYTES) {
-    return Response.json(jsonRpcError(null, -32600, 'MCP payload exceeds 256 KiB'), { status: 413, headers: cors });
+  const cappedBody = await readBodyTextCapped(request, Math.min(MAX_MCP_REQUEST_BYTES, MAX_MCP_REQUEST_BYTES));
+  if (!cappedBody.ok) {
+    if (cappedBody.error === 'too_large') {
+      return Response.json(jsonRpcError(null, -32600, 'MCP payload exceeds 256 KiB'), { status: 413, headers: cors });
+    }
+    return Response.json(jsonRpcError(null, -32700, 'Parse error'), { status: 400, headers: cors });
   }
+  const rawText = cappedBody.text;
 
   let parsed: unknown;
   try {

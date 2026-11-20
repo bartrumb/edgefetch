@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -366,5 +367,36 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	}
 	if !strings.Contains(reportText, `"resourceSpans"`) || !strings.Contains(reportText, "W3C Traceparent") {
 		t.Fatalf("expected sanitized OTLP resourceSpans and W3C Traceparent in bug-report output:\n%s", reportText)
+	}
+}
+
+func TestBugReportUnreachableURLScrubsEmbeddedQueryAndFragment(t *testing.T) {
+	failTransport := &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dial tcp: simulated unreachable host timeout")
+		},
+	}
+	deps := cliDeps{
+		getenv:    func(string) string { return "" },
+		transport: failTransport,
+	}
+
+	target := "https://unreachable.example.com/api/v1/items?api_key=TOP_SECRET_12345#frag"
+	for _, args := range [][]string{
+		{"bug-report", target},
+		{"bug-report", "--json", target},
+	} {
+		var out, errBuf bytes.Buffer
+		rc := runOneShotCLI(context.Background(), args, &out, &errBuf, deps)
+		if rc != 0 {
+			t.Fatalf("runBugReportCLI(%v) returned %d: stderr=%s", args, rc, errBuf.String())
+		}
+		combined := out.String() + "\n" + errBuf.String()
+		if strings.Contains(combined, "TOP_SECRET_12345") || strings.Contains(combined, "frag") {
+			t.Fatalf("SECURITY (M11): bug-report leaked embedded error URL query/fragment for %v:\n%s", args, combined)
+		}
+		if !strings.Contains(out.String(), "https://unreachable.example.com/api/v1/items") {
+			t.Fatalf("expected scrubbed origin+path preserved in bug-report output:\n%s", out.String())
+		}
 	}
 }

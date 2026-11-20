@@ -12,6 +12,7 @@
  */
 
 import { validatePublicHttpsTargetUrl } from './overflow';
+import { asciiLower } from './safe-input';
 
 const MAX_LLM_RESPONSE_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on LLM API JSON responses (H5)
 
@@ -55,13 +56,74 @@ async function readResponseJsonCapped(res: Response, maxBytes = MAX_LLM_RESPONSE
   }
 }
 
-function safeOriginOf(rawUrl: string | undefined): string {
-  if (!rawUrl?.trim()) return '';
-  try {
-    return new URL(rawUrl.trim()).origin.toLowerCase();
-  } catch {
-    return '';
+function trimTrailingSlashes(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47 /* '/' */) end--;
+  return s.slice(0, end);
+}
+
+const OFFICIAL_PROVIDER_TRUSTED_PREFIXES: Partial<Record<LlmProvider, string>> = {
+  openai: 'https://api.openai.com/v1',
+  anthropic: 'https://api.anthropic.com',
+  gemini: 'https://generativelanguage.googleapis.com',
+  openrouter: 'https://openrouter.ai/api/v1',
+};
+
+function validateCleanHttpBaseUrl(rawUrl: string): { ok: true; url: URL; normalized: string } | { ok: false; message: string } {
+  if (!rawUrl || rawUrl.length > 2048) {
+    return { ok: false, message: 'baseUrl must be a non-empty URL <= 2048 chars' };
   }
+  // Block raw control chars, whitespace, backslashes, query strings, fragments, and dot-segment traversal before URL normalization!
+  if (/[\x00-\x20\x7f\\?#]/.test(rawUrl)) {
+    return { ok: false, message: 'baseUrl must not contain query strings, fragments, backslashes, or control/whitespace characters' };
+  }
+  if (/%2e|%2f|%5c/i.test(rawUrl)) {
+    return { ok: false, message: 'baseUrl must not contain percent-encoded path separators or dot segments' };
+  }
+  const trimmed = trimTrailingSlashes(rawUrl);
+  let u: URL;
+  try {
+    u = new URL(trimmed);
+  } catch {
+    return { ok: false, message: 'malformed URL' };
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    return { ok: false, message: 'baseUrl must use https:// or http://' };
+  }
+  if (u.username || u.password) {
+    return { ok: false, message: 'baseUrl must not contain embedded credentials' };
+  }
+  if (u.search || u.hash) {
+    return { ok: false, message: 'baseUrl must not contain query parameters or fragments' };
+  }
+  if (u.hostname.endsWith('.')) {
+    return { ok: false, message: 'baseUrl hostname must not have a trailing dot' };
+  }
+  // Inspect raw path portion before `new URL()` collapses `/../../`!
+  const schemeEnd = trimmed.indexOf('://');
+  const pathSlash = schemeEnd >= 0 ? trimmed.indexOf('/', schemeEnd + 3) : -1;
+  const rawPath = pathSlash >= 0 ? trimmed.slice(pathSlash) : '/';
+  const rawSegs = rawPath.split('/');
+  if (rawSegs.some((seg) => seg === '.' || seg === '..')) {
+    return { ok: false, message: 'baseUrl must not contain "." or ".." path traversal segments' };
+  }
+  const cleanPathname = trimTrailingSlashes(u.pathname) || '';
+  return { ok: true, url: u, normalized: `${u.origin}${cleanPathname}` };
+}
+
+function matchesTrustedBaseUrlPrefix(candidateUrlStr: string | undefined, trustedUrlStr: string | undefined): boolean {
+  if (!candidateUrlStr || !trustedUrlStr) return false;
+  if (candidateUrlStr.startsWith('workers-ai://') || trustedUrlStr.startsWith('workers-ai://')) {
+    return candidateUrlStr === trustedUrlStr;
+  }
+  const cand = validateCleanHttpBaseUrl(candidateUrlStr);
+  const trust = validateCleanHttpBaseUrl(trustedUrlStr);
+  if (!cand.ok || !trust.ok) return false;
+  if (cand.url.origin.toLowerCase() !== trust.url.origin.toLowerCase()) return false;
+  const candPath = trimTrailingSlashes(cand.url.pathname) || '/';
+  const trustPath = trimTrailingSlashes(trust.url.pathname) || '/';
+  if (trustPath === '/') return true;
+  return candPath === trustPath || candPath.startsWith(`${trustPath}/`);
 }
 
 export type LlmProvider =
@@ -209,85 +271,104 @@ export function resolveLlmConfig(params: {
   selfHost?: string;
 }): { ok: true; config: ResolvedLlmConfig | null } | { ok: false; error: string; message: string } {
   const { env, requestLlm, selfHost } = params;
+  if (requestLlm !== undefined && requestLlm !== null && (typeof requestLlm !== 'object' || Array.isArray(requestLlm))) {
+    return { ok: false, error: 'invalid_llm_config', message: 'llm must be a JSON object' };
+  }
   const reqObj =
     requestLlm && typeof requestLlm === 'object' && !Array.isArray(requestLlm)
       ? (requestLlm as Record<string, unknown>)
       : null;
 
-  const envProvider = normalizeProvider(env.EDGEFETCH_LLM_PROVIDER);
-  const reqProvider = normalizeProvider(reqObj?.provider);
-
-  let inferredProvider: LlmProvider | undefined = reqProvider ?? envProvider;
-  if (!inferredProvider) {
-    if (env.EDGEFETCH_LLM_BASE_URL?.trim()) {
-      const lowerBase = env.EDGEFETCH_LLM_BASE_URL.toLowerCase();
-      if (lowerBase.includes('11434') || lowerBase.includes('ollama')) inferredProvider = 'ollama';
-      else if (lowerBase.includes('1234')) inferredProvider = 'lmstudio';
-      else if (lowerBase.includes('anthropic.com')) inferredProvider = 'anthropic';
-      else if (lowerBase.includes('googleapis.com')) inferredProvider = 'gemini';
-      else if (lowerBase.includes('openrouter.ai')) inferredProvider = 'openrouter';
-      else inferredProvider = 'openai';
-    } else if (env.OLLAMA_HOST?.trim()) {
-      inferredProvider = 'ollama';
-    } else if (env.OPENAI_API_KEY?.trim() || env.EDGEFETCH_LLM_API_KEY?.trim()) {
-      inferredProvider = 'openai';
-    } else if (env.ANTHROPIC_API_KEY?.trim()) {
-      inferredProvider = 'anthropic';
-    } else if (env.GEMINI_API_KEY?.trim()) {
-      inferredProvider = 'gemini';
-    } else if (env.OPENROUTER_API_KEY?.trim()) {
-      inferredProvider = 'openrouter';
-    } else if (env.AI) {
-      inferredProvider = 'workers-ai';
+  if (reqObj && 'provider' in reqObj && reqObj.provider !== undefined) {
+    if (typeof reqObj.provider !== 'string' || !normalizeProvider(reqObj.provider)) {
+      return { ok: false, error: 'invalid_llm_provider', message: 'Unsupported llm.provider value' };
     }
   }
+  if (reqObj && 'baseUrl' in reqObj && reqObj.baseUrl !== undefined) {
+    if (typeof reqObj.baseUrl !== 'string' || !reqObj.baseUrl.trim()) {
+      return { ok: false, error: 'invalid_llm_base_url', message: 'llm.baseUrl must be a non-empty URL string' };
+    }
+  }
+  if (reqObj && 'model' in reqObj && reqObj.model !== undefined) {
+    if (typeof reqObj.model !== 'string' || !reqObj.model.trim()) {
+      return { ok: false, error: 'invalid_llm_model', message: 'llm.model must be a non-empty string' };
+    }
+  }
+
+  const inferOperatorDefaultProvider = (): LlmProvider | undefined => {
+    const explicit = normalizeProvider(env.EDGEFETCH_LLM_PROVIDER);
+    if (explicit) return explicit;
+    if (env.EDGEFETCH_LLM_BASE_URL?.trim()) {
+      const lowerBase = env.EDGEFETCH_LLM_BASE_URL.toLowerCase();
+      if (lowerBase.includes('11434') || lowerBase.includes('ollama')) return 'ollama';
+      if (lowerBase.includes('1234')) return 'lmstudio';
+      if (lowerBase.includes('anthropic.com')) return 'anthropic';
+      if (lowerBase.includes('googleapis.com')) return 'gemini';
+      if (lowerBase.includes('openrouter.ai')) return 'openrouter';
+      return 'openai';
+    }
+    if (env.OLLAMA_HOST?.trim()) return 'ollama';
+    if (env.OPENAI_API_KEY?.trim() || env.EDGEFETCH_LLM_API_KEY?.trim()) return 'openai';
+    if (env.ANTHROPIC_API_KEY?.trim()) return 'anthropic';
+    if (env.GEMINI_API_KEY?.trim()) return 'gemini';
+    if (env.OPENROUTER_API_KEY?.trim()) return 'openrouter';
+    if (env.AI) return 'workers-ai';
+    return undefined;
+  };
+
+  const envProvider = normalizeProvider(env.EDGEFETCH_LLM_PROVIDER);
+  const operatorDefaultProvider = inferOperatorDefaultProvider();
+  const reqProvider = normalizeProvider(reqObj?.provider);
+  const inferredProvider: LlmProvider | undefined = reqProvider ?? operatorDefaultProvider;
 
   if (!inferredProvider) {
     return { ok: true, config: null };
   }
 
-  const operatorBaseUrl =
-    env.EDGEFETCH_LLM_BASE_URL?.trim().replace(/\/+$/, '') ||
-    (inferredProvider === 'ollama' && env.OLLAMA_HOST?.trim()
-      ? `${env.OLLAMA_HOST.trim().replace(/\/+$/, '').replace(/\/v1$/, '')}/v1`
-      : '');
+  const rawEnvBase = env.EDGEFETCH_LLM_BASE_URL?.trim() ?? '';
+  const rawOllamaHost = env.OLLAMA_HOST?.trim() ?? '';
+  const normalizedOllamaBase = rawOllamaHost
+    ? `${trimTrailingSlashes(rawOllamaHost).replace(/\/v1$/, '')}/v1`
+    : '';
+  const operatorBaseUrl = rawEnvBase
+    ? trimTrailingSlashes(rawEnvBase)
+    : operatorDefaultProvider === 'ollama' && normalizedOllamaBase
+      ? normalizedOllamaBase
+      : '';
+  const operatorDefaultBaseUrl =
+    operatorBaseUrl || (operatorDefaultProvider ? DEFAULT_BASE_URLS[operatorDefaultProvider] : '');
 
-  let baseUrl = operatorBaseUrl || DEFAULT_BASE_URLS[inferredProvider];
-  if (reqProvider && reqProvider !== envProvider && !reqObj?.baseUrl) {
-    baseUrl =
-      reqProvider === 'ollama' && env.OLLAMA_HOST?.trim()
-        ? `${env.OLLAMA_HOST.trim().replace(/\/+$/, '').replace(/\/v1$/, '')}/v1`
-        : DEFAULT_BASE_URLS[reqProvider];
-  }
+  let baseUrl =
+    inferredProvider === operatorDefaultProvider && operatorBaseUrl
+      ? operatorBaseUrl
+      : inferredProvider === 'ollama' && normalizedOllamaBase
+        ? normalizedOllamaBase
+        : DEFAULT_BASE_URLS[inferredProvider];
 
-  if (typeof reqObj?.baseUrl === 'string' && reqObj.baseUrl.trim()) {
-    const candidate = reqObj.baseUrl.trim().replace(/\/+$/, '');
-    let allowedOverride = false;
-    if (operatorBaseUrl) {
-      try {
-        allowedOverride = new URL(candidate).origin === new URL(operatorBaseUrl).origin;
-      } catch {
-        allowedOverride = false;
-      }
+  const hasCallerBaseUrl = Boolean(reqObj && typeof reqObj.baseUrl === 'string');
+  if (hasCallerBaseUrl) {
+    const rawCandidate = (reqObj!.baseUrl as string).trim();
+    const cleanedCandidate = validateCleanHttpBaseUrl(rawCandidate);
+    if (!cleanedCandidate.ok) {
+      return {
+        ok: false,
+        error: 'invalid_llm_base_url',
+        message: `Invalid llm.baseUrl: ${cleanedCandidate.message}`,
+      };
     }
-    if (!allowedOverride) {
-      const allowLocalOverride =
-        env.EDGEFETCH_ALLOW_LOCAL_LLM_OVERRIDE === 'true' ||
-        selfHost === '127.0.0.1' ||
-        selfHost === 'localhost';
-      if (allowLocalOverride) {
-        try {
-          const parsedLocal = new URL(candidate);
-          if (
-            (parsedLocal.protocol === 'http:' || parsedLocal.protocol === 'https:') &&
-            (parsedLocal.hostname === '127.0.0.1' || parsedLocal.hostname === 'localhost') &&
-            LOCAL_LOOPBACK_INFERENCE_PORTS.has(parsedLocal.port || (parsedLocal.protocol === 'https:' ? '443' : '80'))
-          ) {
-            allowedOverride = true;
-          }
-        } catch {
-          allowedOverride = false;
-        }
+    const candidate = cleanedCandidate.normalized;
+    let allowedOverride = false;
+    if (operatorBaseUrl && matchesTrustedBaseUrlPrefix(candidate, operatorBaseUrl)) {
+      allowedOverride = true;
+    }
+    if (!allowedOverride && env.EDGEFETCH_ALLOW_LOCAL_LLM_OVERRIDE === 'true') {
+      const parsedLocal = cleanedCandidate.url;
+      if (
+        (parsedLocal.protocol === 'http:' || parsedLocal.protocol === 'https:') &&
+        (parsedLocal.hostname === '127.0.0.1' || parsedLocal.hostname === 'localhost') &&
+        LOCAL_LOOPBACK_INFERENCE_PORTS.has(parsedLocal.port || (parsedLocal.protocol === 'https:' ? '443' : '80'))
+      ) {
+        allowedOverride = true;
       }
     }
     if (!allowedOverride) {
@@ -296,58 +377,38 @@ export function resolveLlmConfig(params: {
         return {
           ok: false,
           error: 'invalid_llm_base_url',
-          message: `Per-request llm.baseUrl must be a public https:// URL on port 443 (or configure EDGEFETCH_LLM_BASE_URL on the Hub): ${pubCheck.message}`,
+          message: `Per-request llm.baseUrl must be a public https:// URL on port 443 (or match EDGEFETCH_LLM_BASE_URL prefix): ${pubCheck.message}`,
         };
       }
-      baseUrl = candidate;
-    } else {
-      baseUrl = candidate;
     }
+    baseUrl = candidate;
   } else if (
     (inferredProvider === 'ollama' || inferredProvider === 'lmstudio' || inferredProvider === 'vllm') &&
-    !operatorBaseUrl &&
-    !(inferredProvider === 'ollama' && env.OLLAMA_HOST?.trim()) &&
-    selfHost !== '127.0.0.1' &&
-    selfHost !== 'localhost' &&
+    !(inferredProvider === operatorDefaultProvider && Boolean(operatorBaseUrl)) &&
+    !(inferredProvider === 'ollama' && Boolean(normalizedOllamaBase)) &&
     env.EDGEFETCH_ALLOW_LOCAL_LLM_OVERRIDE !== 'true'
   ) {
     return {
       ok: false,
       error: 'local_llm_not_configured',
-      message: `Configure EDGEFETCH_LLM_BASE_URL on the Hub to enable ${inferredProvider} on non-loopback deployments.`,
+      message: `Configure EDGEFETCH_LLM_BASE_URL or OLLAMA_HOST (or set EDGEFETCH_ALLOW_LOCAL_LLM_OVERRIDE=true) to enable ${inferredProvider}.`,
     };
   }
 
-  // C1 Security Invariant: NEVER transmit operator env API keys to a caller-chosen `llm.baseUrl` unless its
-  // origin strictly matches the operator's `EDGEFETCH_LLM_BASE_URL` origin or the provider's official default origin!
-  const reqApiKey = typeof reqObj?.apiKey === 'string' && reqObj.apiKey.trim() ? reqObj.apiKey.trim() : undefined;
-  const resolvedOrigin = safeOriginOf(baseUrl);
-  const operatorOrigin = safeOriginOf(operatorBaseUrl);
-  const defaultProviderOrigin = safeOriginOf(DEFAULT_BASE_URLS[inferredProvider]);
-  const matchesOperatorOrigin = Boolean(operatorOrigin && resolvedOrigin === operatorOrigin);
-  const matchesDefaultProviderOrigin = Boolean(defaultProviderOrigin && resolvedOrigin === defaultProviderOrigin);
-
-  const envKeyForProvider = matchesDefaultProviderOrigin || matchesOperatorOrigin
-    ? inferredProvider === 'anthropic'
-      ? env.ANTHROPIC_API_KEY?.trim()
-      : inferredProvider === 'gemini'
-        ? env.GEMINI_API_KEY?.trim()
-        : inferredProvider === 'openrouter'
-          ? env.OPENROUTER_API_KEY?.trim()
-          : inferredProvider === 'openai'
-            ? env.OPENAI_API_KEY?.trim()
-            : undefined
-    : undefined;
-  const genericEnvKey =
-    matchesOperatorOrigin || (matchesDefaultProviderOrigin && (!envProvider || inferredProvider === envProvider))
-      ? env.EDGEFETCH_LLM_API_KEY?.trim()
-      : undefined;
-  const apiKey = reqApiKey ?? envKeyForProvider ?? genericEnvKey ?? undefined;
-
   const model =
     (typeof reqObj?.model === 'string' && reqObj.model.trim()) ||
-    ((!reqProvider || reqProvider === envProvider) && env.EDGEFETCH_LLM_MODEL?.trim() ? env.EDGEFETCH_LLM_MODEL.trim() : '') ||
+    ((!reqProvider || reqProvider === (envProvider ?? operatorDefaultProvider)) && env.EDGEFETCH_LLM_MODEL?.trim()
+      ? env.EDGEFETCH_LLM_MODEL.trim()
+      : '') ||
     DEFAULT_MODELS[inferredProvider];
+
+  if (!/^[A-Za-z0-9._:@/-]{1,160}$/.test(model) || model.includes('..')) {
+    return {
+      ok: false,
+      error: 'invalid_llm_model',
+      message: 'llm.model must match /^[A-Za-z0-9._:@/-]{1,160}$/ and must not contain ".."',
+    };
+  }
 
   if (inferredProvider === 'workers-ai' && !env.AI) {
     return {
@@ -357,8 +418,54 @@ export function resolveLlmConfig(params: {
     };
   }
 
-  const callerOverrodeBaseUrl = Boolean(typeof reqObj?.baseUrl === 'string' && reqObj.baseUrl.trim() && !matchesOperatorOrigin);
-  const resolvedSafeFetch = callerOverrodeBaseUrl ? (env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH) : env.SAFE_FETCH;
+  // M1 Strict Key Isolation:
+  // 1. Provider-specific keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`) are released
+  //    ONLY when `inferredProvider` matches that provider AND `baseUrl` matches the official provider URL prefix (or the
+  //    operator's `EDGEFETCH_LLM_BASE_URL` prefix when the operator configured that exact provider).
+  // 2. Generic `EDGEFETCH_LLM_API_KEY` is released ONLY when the caller overrode NEITHER `provider` NOR `baseUrl` (or passed
+  //    values identical to the operator's default `provider` and `baseUrl`).
+  const reqApiKey = typeof reqObj?.apiKey === 'string' && reqObj.apiKey.trim() ? reqObj.apiKey.trim() : undefined;
+  const officialPrefix = OFFICIAL_PROVIDER_TRUSTED_PREFIXES[inferredProvider];
+  const matchesOfficialProviderPrefix = Boolean(officialPrefix && matchesTrustedBaseUrlPrefix(baseUrl, officialPrefix));
+  const matchesOperatorConfiguredProviderPrefix = Boolean(
+    operatorBaseUrl &&
+      operatorDefaultProvider === inferredProvider &&
+      matchesTrustedBaseUrlPrefix(baseUrl, operatorBaseUrl),
+  );
+
+  const envKeyForProvider =
+    matchesOfficialProviderPrefix || matchesOperatorConfiguredProviderPrefix
+      ? inferredProvider === 'anthropic'
+        ? env.ANTHROPIC_API_KEY?.trim()
+        : inferredProvider === 'gemini'
+          ? env.GEMINI_API_KEY?.trim()
+          : inferredProvider === 'openrouter'
+            ? env.OPENROUTER_API_KEY?.trim()
+            : inferredProvider === 'openai'
+              ? env.OPENAI_API_KEY?.trim()
+              : undefined
+      : undefined;
+
+  const providerMatchesOperatorDefault = Boolean(operatorDefaultProvider && inferredProvider === operatorDefaultProvider);
+  const baseUrlMatchesOperatorDefault = Boolean(
+    !hasCallerBaseUrl ||
+      (operatorDefaultBaseUrl &&
+        validateCleanHttpBaseUrl(baseUrl).ok &&
+        validateCleanHttpBaseUrl(operatorDefaultBaseUrl).ok &&
+        (validateCleanHttpBaseUrl(baseUrl) as { normalized: string }).normalized.toLowerCase() ===
+          (validateCleanHttpBaseUrl(operatorDefaultBaseUrl) as { normalized: string }).normalized.toLowerCase()),
+  );
+  const genericEnvKey =
+    providerMatchesOperatorDefault && baseUrlMatchesOperatorDefault ? env.EDGEFETCH_LLM_API_KEY?.trim() : undefined;
+
+  const apiKey = reqApiKey ?? envKeyForProvider ?? genericEnvKey ?? undefined;
+
+  const matchesOperatorPrefix = Boolean(operatorBaseUrl && matchesTrustedBaseUrlPrefix(baseUrl, operatorBaseUrl));
+  const callerOverrodeBaseUrl = Boolean(hasCallerBaseUrl && !matchesOperatorPrefix);
+  const resolvedSafeFetch =
+    callerOverrodeBaseUrl && !isOfflineHost(baseUrl)
+      ? (env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH)
+      : env.SAFE_FETCH;
 
   return {
     ok: true,
@@ -378,10 +485,43 @@ export function resolveLlmConfig(params: {
   };
 }
 
-/** Extracts JSON from raw LLM text, stripping optional `<think>...</think>` reasoning blocks and Markdown code fences. */
+function stripThinkBlocksLinear(raw: string): string {
+  const lower = asciiLower(raw);
+  let hit = lower.indexOf('<think>');
+  if (hit < 0) return raw;
+  const out: string[] = [];
+  let cursor = 0;
+  while (hit >= 0) {
+    const closeIdx = lower.indexOf('</think>', hit + 7);
+    if (closeIdx < 0) {
+      // Zero `</think>` tokens exist in the remainder of `raw` -> break in O(1)! (`M12`)
+      break;
+    }
+    if (hit > cursor) out.push(raw.slice(cursor, hit));
+    cursor = closeIdx + 8;
+    hit = lower.indexOf('<think>', cursor);
+  }
+  if (cursor === 0) return raw;
+  if (cursor < raw.length) out.push(raw.slice(cursor));
+  return out.join('');
+}
+
+function extractFirstCodeFenceBodyLinear(s: string): string | null {
+  const openIdx = s.indexOf('```');
+  if (openIdx < 0) return null;
+  const closeIdx = s.indexOf('```', openIdx + 3);
+  if (closeIdx < 0) return null;
+  let inner = s.slice(openIdx + 3, closeIdx);
+  if (/^json\b/i.test(inner)) {
+    inner = inner.slice(4);
+  }
+  return inner.trim();
+}
+
+/** Extracts JSON from raw LLM text, stripping optional `<think>...</think>` reasoning blocks and Markdown code fences in O(N) (`M12`). */
 export function parseLooseJsonObject(raw: string): Record<string, unknown> | null {
   if (!raw) return null;
-  const stripped = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  const stripped = stripThinkBlocksLinear(raw).trim();
   if (!stripped) return null;
 
   const tryParse = (s: string): Record<string, unknown> | null => {
@@ -396,9 +536,9 @@ export function parseLooseJsonObject(raw: string): Record<string, unknown> | nul
   const direct = tryParse(stripped);
   if (direct) return direct;
 
-  const fenceMatch = /```(?:json)?\s*([\s\S]*?)```/i.exec(stripped);
-  if (fenceMatch?.[1]) {
-    const fromFence = tryParse(fenceMatch[1].trim());
+  const fenceBody = extractFirstCodeFenceBodyLinear(stripped);
+  if (fenceBody) {
+    const fromFence = tryParse(fenceBody);
     if (fromFence) return fromFence;
   }
 
@@ -413,12 +553,20 @@ export function parseLooseJsonObject(raw: string): Record<string, unknown> | nul
 
 /**
  * Fallback parser for local quantized Ollama / llama.cpp models (`Qwen2.5`, `Llama-3`, `Mistral`) that emit
- * `<tool_call>{"name":...,"arguments":...}</tool_call>` or `{"tool_calls":[...]}` in plain content.
+ * `<tool_call>{"name":...,"arguments":...}</tool_call>` or `{"tool_calls":[...]}` in plain content (`M12` linear O(N)).
  */
 function parseFallbackTextToolCalls(content: string, allowedToolNames: Set<string>): LlmToolCall[] {
   const calls: LlmToolCall[] = [];
-  for (const m of content.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)) {
-    const obj = parseLooseJsonObject(m[1] ?? '');
+  const lower = asciiLower(content);
+  let openIdx = lower.indexOf('<tool_call>');
+  while (openIdx >= 0) {
+    const closeIdx = lower.indexOf('</tool_call>', openIdx + 11);
+    if (closeIdx < 0) {
+      // Zero `</tool_call>` tokens remain anywhere in `content` -> break immediately in O(1)! (`M12`)
+      break;
+    }
+    const rawInner = content.slice(openIdx + 11, closeIdx).trim();
+    const obj = parseLooseJsonObject(rawInner);
     if (obj && typeof obj.name === 'string' && allowedToolNames.has(obj.name)) {
       const args =
         obj.arguments && typeof obj.arguments === 'object' && !Array.isArray(obj.arguments)
@@ -426,6 +574,7 @@ function parseFallbackTextToolCalls(content: string, allowedToolNames: Set<strin
           : {};
       calls.push({ id: `call_${calls.length + 1}`, name: obj.name, arguments: args });
     }
+    openIdx = lower.indexOf('<tool_call>', closeIdx + 12);
   }
   if (calls.length > 0) return calls;
 
@@ -806,7 +955,7 @@ export async function completeLlmTurn(params: {
 
     const choice = Array.isArray(json.choices) ? (json.choices[0] as Record<string, unknown> | undefined) : undefined;
     const msg = choice?.message && typeof choice.message === 'object' ? (choice.message as Record<string, unknown>) : {};
-    const content = typeof msg.content === 'string' ? msg.content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim() : '';
+    const content = typeof msg.content === 'string' ? stripThinkBlocksLinear(msg.content).trim() : '';
     const rawToolCalls = Array.isArray(msg.tool_calls) ? (msg.tool_calls as Array<Record<string, unknown>>) : [];
     const toolCalls: LlmToolCall[] = [];
     for (const tc of rawToolCalls) {
@@ -852,9 +1001,27 @@ export async function completeLlmTurn(params: {
  * Deterministic zero-LLM extractive summary fallback: extracts lead paragraph + key headings/bullets
  * when no LLM provider is configured or offline inference is unreachable.
  */
+function stripDelimitedMarkerLinear(src: string, marker: string): string {
+  let openIdx = src.indexOf(marker);
+  if (openIdx < 0) return src;
+  const out: string[] = [];
+  let cursor = 0;
+  while (openIdx >= 0) {
+    const closeIdx = src.indexOf(marker, openIdx + marker.length);
+    if (closeIdx < 0) break;
+    if (openIdx > cursor) out.push(src.slice(cursor, openIdx));
+    out.push(' ');
+    cursor = closeIdx + marker.length;
+    openIdx = src.indexOf(marker, cursor);
+  }
+  if (cursor === 0) return src;
+  if (cursor < src.length) out.push(src.slice(cursor));
+  return out.join('');
+}
+
 export function buildDeterministicSummary(markdown: string, title?: string): string {
   if (!markdown.trim()) return title ? `${title}.` : '';
-  const withoutFences = markdown.replace(/```[\s\S]*?```/g, ' ').replace(/~~~[\s\S]*?~~~/g, ' ');
+  const withoutFences = stripDelimitedMarkerLinear(stripDelimitedMarkerLinear(markdown, '```'), '~~~');
   const lines = withoutFences
     .split(/\r?\n/)
     .map((l) => l.trim())

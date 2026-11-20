@@ -5,7 +5,14 @@
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { isSafePublicHostname } from './overflow';
-import { compileSafeUserRegex } from './safe-input';
+import {
+  compileSafeUserRegex,
+  MAX_HTML_SCAN_CHARS,
+  replacePairedHtmlElementsLinear,
+  stripHtmlCommentsLinear,
+  stripHtmlTagsLinear,
+  stripHtmlTagsQuoteAwareLinear,
+} from './safe-input';
 import {
   cleanPdfMarkdown,
   decodeHtmlEntities,
@@ -161,36 +168,45 @@ export interface MapRequestPayload {
 
 function extractAnchorTitlesFromHtml(html: string, baseUrl: string): Map<string, string> {
   const titles = new Map<string, string>();
-  const cleanedHtml = html
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<(?:script|style|svg|noscript|template)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/(?:script|style|svg|noscript|template)>/gi, ' ');
-  for (const m of cleanedHtml.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]{1,600}?)<\/a>/gi)) {
-    const hrefMatch = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))/i.exec(m[1]!);
-    const rawHref = (hrefMatch?.[1] ?? hrefMatch?.[2] ?? hrefMatch?.[3] ?? '').trim();
-    if (!rawHref || rawHref.startsWith('#') || /^(?:javascript|mailto|tel|data):/i.test(rawHref)) continue;
-    let resolved: string;
-    try {
-      const u = new URL(decodeHtmlEntities(rawHref), baseUrl);
-      if (u.protocol !== 'https:' && u.protocol !== 'http:') continue;
-      u.hash = '';
-      resolved = u.toString();
-    } catch {
-      continue;
-    }
-    if (titles.has(resolved)) continue;
-    const label = decodeHtmlEntities(m[2]!.replace(/<(?:"[^"]*"|'[^']*'|[^>"'])*>/g, ' '))
-      .replace(/[#¶§🔗]+$/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    if (
-      label.length >= 3 &&
-      label.length <= 140 &&
-      !/^https?:\/\//i.test(label) &&
-      !/^(?:read more|learn more|click here|see more|more|link|here|view|open|next|prev|previous|\d+)$/i.test(label)
-    ) {
-      titles.set(resolved, label);
-    }
-  }
+  const cleanedHtml = stripHtmlTagsLinear(
+    stripHtmlCommentsLinear(html, MAX_HTML_SCAN_CHARS),
+    ['script', 'style', 'svg', 'noscript', 'template'],
+    ' ',
+    MAX_HTML_SCAN_CHARS,
+  );
+  replacePairedHtmlElementsLinear(
+    cleanedHtml,
+    ['a'],
+    (_full, _t, attrStr, inner) => {
+      const hrefMatch = /\bhref[ \t\r\n]*=[ \t\r\n]*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))/i.exec(attrStr);
+      const rawHref = (hrefMatch?.[1] ?? hrefMatch?.[2] ?? hrefMatch?.[3] ?? '').trim();
+      if (!rawHref || rawHref.startsWith('#') || /^(?:javascript|mailto|tel|data):/i.test(rawHref)) return '';
+      let resolved: string;
+      try {
+        const u = new URL(decodeHtmlEntities(rawHref), baseUrl);
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+        u.hash = '';
+        resolved = u.toString();
+      } catch {
+        return '';
+      }
+      if (titles.has(resolved)) return '';
+      const label = decodeHtmlEntities(stripHtmlTagsQuoteAwareLinear(inner, ' ', 1200))
+        .replace(/[#¶§🔗]+$/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (
+        label.length >= 3 &&
+        label.length <= 140 &&
+        !/^https?:\/\//i.test(label) &&
+        !/^(?:read more|learn more|click here|see more|more|link|here|view|open|next|prev|previous|\d+)$/i.test(label)
+      ) {
+        titles.set(resolved, label);
+      }
+      return '';
+    },
+    { maxChars: MAX_HTML_SCAN_CHARS, maxInnerChars: 600 },
+  );
   return titles;
 }
 
@@ -850,14 +866,15 @@ export interface CrawlWorkflowParams {
 
 export function matchesSafeCrawlPattern(target: string, pattern: string): boolean {
   if (!pattern || pattern.length > 160) return false;
+  const boundedTarget = target.length > 2048 ? target.slice(0, 2048) : target;
   if (pattern.startsWith('/') && !/[\\^$*+?()[\]{}|]/.test(pattern)) {
-    return target.startsWith(pattern);
+    return boundedTarget.startsWith(pattern);
   }
   const safeRe = compileSafeUserRegex(pattern);
   if (!safeRe) {
-    return target.includes(pattern);
+    return boundedTarget.includes(pattern);
   }
-  return safeRe.test(target);
+  return safeRe.test(boundedTarget);
 }
 
 function pathAllowed(

@@ -15,15 +15,26 @@ import { signOutboundBotHeaders } from './bot-auth';
 import { classifyWafAndChallenge } from './waf';
 
 export const ROBOTS_MAX_BYTES = 512 * 1024; // 512 KiB >= RFC 9309 500 KiB minimum
+export const MAX_OVERFLOW_BATCH_BYTES = 18 * 1024 * 1024; // 18 MiB aggregate batch cap across all requests (`Low`)
 const ROBOTS_TIMEOUT_MS = 10_000;
 const PER_REQ_TIMEOUT_MS = 30_000;
 const MAX_REDIRECT_HOPS = 5;
+export const MARKDOWN_FOR_AGENTS_ACCEPT =
+  'text/markdown, text/html;q=0.9, application/xhtml+xml;q=0.8, */*;q=0.7';
+
+export interface ContentSignals {
+  search?: boolean;
+  aiInput?: boolean;
+  aiTrain?: boolean;
+}
 
 export interface ParsedRobots {
   unreachable: boolean;
   reason?: string;
   crawlDelayMs: number;
   rules: Array<{ pattern: string; allow: boolean }>;
+  contentSignals?: ContentSignals;
+  disallowAiInput?: boolean;
 }
 
 function isUnreservedAsciiByte(b: number): boolean {
@@ -104,11 +115,44 @@ export function matchRobotsPattern(rawPattern: string, target: string): boolean 
   return true;
 }
 
-export function parseOverflowRobotsTxt(rawBody: string, userAgent: string): ParsedRobots {
+function parseContentSignalLine(rawVal: string, target: ContentSignals): void {
+  for (const part of rawVal.split(',')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const k = part.slice(0, eq).trim().toLowerCase();
+    const v = part.slice(eq + 1).trim().toLowerCase();
+    if (v !== 'yes' && v !== 'no') continue;
+    const allowed = v === 'yes';
+    if (k === 'search') target.search = allowed;
+    else if (k === 'ai-input') target.aiInput = allowed;
+    else if (k === 'ai-train') target.aiTrain = allowed;
+  }
+}
+
+function mergeGroupSignals(into: ContentSignals, from: ContentSignals): void {
+  for (const key of ['search', 'aiInput', 'aiTrain'] as const) {
+    if (from[key] !== undefined) {
+      // Within multiple groups for the same User-agent token, explicit `no` (`false`) takes restrictive precedence
+      into[key] = into[key] === false ? false : from[key];
+    }
+  }
+}
+
+export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2.5.5'): ParsedRobots {
   const body = rawBody.replace(/^\uFEFF/, '');
   const uaToken = canonicalProductToken(userAgent);
-  const groups: Array<{ agents: string[]; rules: Array<{ pattern: string; allow: boolean }>; crawlDelayMs: number }> = [];
-  let cur = { agents: [] as string[], rules: [] as Array<{ pattern: string; allow: boolean }>, crawlDelayMs: 0 };
+  const groups: Array<{
+    agents: string[];
+    rules: Array<{ pattern: string; allow: boolean }>;
+    crawlDelayMs: number;
+    signals: ContentSignals;
+  }> = [];
+  let cur = {
+    agents: [] as string[],
+    rules: [] as Array<{ pattern: string; allow: boolean }>,
+    crawlDelayMs: 0,
+    signals: {} as ContentSignals,
+  };
   let seenDirective = false;
 
   for (const rawLine of body.split(/\r\n|\r|\n/)) {
@@ -125,7 +169,7 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent: string): Pars
     if (field === 'user-agent') {
       if (seenDirective && cur.agents.length > 0) {
         groups.push(cur);
-        cur = { agents: [], rules: [], crawlDelayMs: 0 };
+        cur = { agents: [], rules: [], crawlDelayMs: 0, signals: {} };
         seenDirective = false;
       }
       cur.agents.push(canonicalProductToken(val));
@@ -141,12 +185,17 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent: string): Pars
       if (Number.isFinite(secs) && secs > 0) {
         cur.crawlDelayMs = Math.min(30_000, Math.round(secs * 1000));
       }
+    } else if (field === 'content-signal' && cur.agents.length > 0 && val) {
+      seenDirective = true;
+      parseContentSignalLine(val, cur.signals);
     }
   }
   if (cur.agents.length > 0) groups.push(cur);
 
   const specific: Array<{ pattern: string; allow: boolean }> = [];
   const wildcard: Array<{ pattern: string; allow: boolean }> = [];
+  const specificSignals: ContentSignals = {};
+  const wildcardSignals: ContentSignals = {};
   let specificDelay = 0;
   let wildcardDelay = 0;
   let hasSpecific = false;
@@ -157,21 +206,31 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent: string): Pars
         hasSpecific = true;
         specific.push(...g.rules);
         specificDelay = Math.max(specificDelay, g.crawlDelayMs);
+        mergeGroupSignals(specificSignals, g.signals);
       } else if (ua === '*') {
         wildcard.push(...g.rules);
         wildcardDelay = Math.max(wildcardDelay, g.crawlDelayMs);
+        mergeGroupSignals(wildcardSignals, g.signals);
       }
     }
   }
+
+  const winningSignals = hasSpecific ? specificSignals : wildcardSignals;
+  const hasAnySignal =
+    winningSignals.search !== undefined || winningSignals.aiInput !== undefined || winningSignals.aiTrain !== undefined;
+  const disallowAiInput = winningSignals.aiInput === false;
+
   return {
     unreachable: false,
+    ...(disallowAiInput ? { reason: 'content-signal: ai-input=no in robots.txt', disallowAiInput: true } : {}),
+    ...(hasAnySignal ? { contentSignals: winningSignals } : {}),
     crawlDelayMs: hasSpecific ? specificDelay : wildcardDelay,
     rules: hasSpecific ? specific : wildcard,
   };
 }
 
 export function isRobotsAllowed(entry: ParsedRobots, rawPathAndQuery: string): boolean {
-  if (entry.unreachable) return false;
+  if (entry.unreachable || entry.disallowAiInput) return false;
   if (entry.rules.length === 0) return true;
   const target = normalizeRobotsURI(rawPathAndQuery || '/');
   let bestLen = -1;
@@ -612,10 +671,22 @@ export async function cloudflareOverflowFetch(
   const hostLastDone = new Map<string, number>();
   const robotsCache = new Map<string, ParsedRobots>();
 
+  let aggregateBatchBytes = 0;
   for (const r of reqs) {
     const reqStart = Date.now();
     if (Date.now() >= budgetDeadlineAt) {
       results.push({ id: r.id, url: r.url, kind: r.kind, status: 0, outcome: 'not_tried', problem: 'maxSeconds budget exhausted' });
+      continue;
+    }
+    if (aggregateBatchBytes >= MAX_OVERFLOW_BATCH_BYTES) {
+      results.push({
+        id: r.id,
+        url: r.url,
+        kind: r.kind,
+        status: 0,
+        outcome: 'not_tried',
+        problem: 'batch byte budget (18 MiB) exhausted',
+      });
       continue;
     }
 
@@ -650,7 +721,13 @@ export async function cloudflareOverflowFetch(
         }
         const pathAndQuery = `${parsedUrl.pathname || '/'}${parsedUrl.search || ''}`;
         if (!isRobotsAllowed(robotsEntry, pathAndQuery)) {
-          const outcome = robotsEntry.unreachable ? 'stop' : r.kind === 'page' || r.kind === 'text' ? 'skip' : 'error';
+          const outcome = robotsEntry.unreachable
+            ? 'stop'
+            : robotsEntry.disallowAiInput
+              ? 'content_signal_disallowed'
+              : r.kind === 'page' || r.kind === 'text'
+                ? 'skip'
+                : 'error';
           results.push({
             id: r.id,
             url: r.url,
@@ -688,12 +765,11 @@ export async function cloudflareOverflowFetch(
 
       const hopSignal = AbortSignal.timeout(Math.min(perReqCapMs, remainingBudget));
       try {
-        const acceptHeader =
-          r.kind === 'feed' || r.kind === 'json'
+        const acceptHeader = r.accept
+          ? r.accept
+          : r.kind === 'feed' || r.kind === 'json'
             ? 'application/json'
-            : r.kind === 'text' && r.accept
-              ? r.accept
-              : 'text/html,application/xhtml+xml';
+            : MARKDOWN_FOR_AGENTS_ACCEPT;
         const headers = new Headers({
           'user-agent': userAgent,
           accept: acceptHeader,
@@ -758,24 +834,43 @@ export async function cloudflareOverflowFetch(
           continue;
         }
 
-        const { bytes, truncated } = await readBoundedBytes(resp.body, maxBytes, hopSignal);
-        const decodedPreview = !truncated && bytes.byteLength <= 98_304 ? new TextDecoder('utf-8', { fatal: false }).decode(bytes) : '';
-        const wafMatch = !truncated
-          ? classifyWafAndChallenge({ status: resp.status, headers: resp.headers, rawBody: decodedPreview })
-          : null;
-        const encodedBody = includeBody && !truncated ? encodeBodyForWire(bytes) : undefined;
+        const remainingBatchBytes = Math.max(0, MAX_OVERFLOW_BATCH_BYTES - aggregateBatchBytes);
+        const perItemMaxBytes = Math.min(maxBytes, remainingBatchBytes);
+        const { bytes, truncated } = await readBoundedBytes(resp.body, perItemMaxBytes, hopSignal);
+        aggregateBatchBytes += bytes.byteLength;
+
+        const isPaymentRequired = resp.status === 402;
+        const decodedPreview =
+          !truncated && bytes.byteLength <= 98_304 ? new TextDecoder('utf-8', { fatal: false }).decode(bytes) : '';
+        const wafMatch =
+          !truncated && !isPaymentRequired
+            ? classifyWafAndChallenge({ status: resp.status, headers: resp.headers, rawBody: decodedPreview })
+            : null;
+        const encodedBody =
+          (includeBody || (isPaymentRequired && bytes.byteLength <= 65_536)) && !truncated
+            ? encodeBodyForWire(bytes)
+            : undefined;
         const isNotModified = resp.status === 304 && Boolean(r.ifNoneMatch || r.ifModifiedSince);
         const outcome = truncated
           ? 'error'
-          : wafMatch || cfMitigated
-            ? 'challenge'
-            : (resp.status >= 200 && resp.status < 300) || isNotModified
-              ? 'ok'
-              : resp.status === 404 || resp.status === 410
-                ? 'gone'
-                : resp.status === 403 || resp.status === 429 || resp.status === 503
-                  ? 'stop'
-                  : 'error';
+          : isPaymentRequired
+            ? 'payment_required'
+            : wafMatch || cfMitigated
+              ? 'challenge'
+              : (resp.status >= 200 && resp.status < 300) || isNotModified
+                ? 'ok'
+                : resp.status === 404 || resp.status === 410
+                  ? 'gone'
+                  : resp.status === 403 || resp.status === 429 || resp.status === 503
+                    ? 'stop'
+                    : 'error';
+        const paymentHeaders: Record<string, string> = {};
+        if (isPaymentRequired) {
+          for (const hName of ['payment-required', 'x-payment-required', 'www-authenticate']) {
+            const hv = resp.headers.get(hName);
+            if (hv) paymentHeaders[hName] = hv;
+          }
+        }
         results.push({
           id: r.id,
           url: r.url,
@@ -784,6 +879,8 @@ export async function cloudflareOverflowFetch(
           status: resp.status,
           outcome,
           ...(wafMatch ? { problem: wafMatch.summary, waf: wafMatch } : {}),
+          ...(isPaymentRequired && !wafMatch ? { problem: 'HTTP 402 Payment Required' } : {}),
+          ...(Object.keys(paymentHeaders).length > 0 ? { paymentHeaders } : {}),
           bytes: bytes.byteLength,
           truncated,
           durationMs: Date.now() - reqStart,

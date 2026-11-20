@@ -7,6 +7,8 @@
 
 **EdgeFetch** is a self-hosted, MIT-licensed web scraping and search server for AI agents. You run one ~8 MB Go binary on any box you own (a Raspberry Pi, your Home Assistant, a spare laptop), and your agents get clean Markdown and structured data through MCP — with **zero open ports**, **zero Redis or Postgres**, and **no per-page bill**.
 
+> Built for the agent web: user-triggered, never trains, signs its requests with Web Bot Auth, asks for Markdown first, honours `robots.txt` and Content Signals, and treats `402` as a price, not an error.
+
 <p align="center">
   <img src="docs/assets/admin-console.jpg" alt="EdgeFetch Built-in /admin Web Control Center — Live Crawl Log, Multi-Arch Fleet, Interactive Waterfall Tester, 429 Cooldowns & OAuth 2.1 MCP Grants" width="900">
 </p>
@@ -15,8 +17,10 @@
 
 ```bash
 # Option 1 — Full 14-Tool Hub + BYO-LLM /v1/agent + 49+ Site/ATS Adapters + /admin UI + FTS5 in Docker (zero cloud account):
-git clone https://github.com/bartrumb/edgefetch.git && cd edgefetch && docker compose up --build -d
-# Open http://localhost:8787/admin (dev token: local-dev-caller-token-0123456789)
+git clone https://github.com/bartrumb/edgefetch.git && cd edgefetch
+export CALLER_TOKEN="$(openssl rand -hex 24)" AGENT_TOKEN="$(openssl rand -hex 24)"
+docker compose up --build -d
+# Open http://127.0.0.1:8787/admin and sign in with $CALLER_TOKEN
 
 # Option 2 — Standalone ~8 MB Local Go Binary for Claude Code, Claude Desktop, Cursor, Windsurf, Gemini CLI & Codex (zero containers/ports):
 go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest
@@ -49,7 +53,7 @@ edgefetch init && edgefetch doctor
 
 - **Outbound-only workers with zero open ports:** Workers on a Raspberry Pi, NAS, or Home Assistant box behind CGNAT/Starlink dial *out* over TLS WebSockets (`WSS /agent/ws`) to your Hub. Nothing at home is exposed to the internet.
 - **Dial-time SSRF protection (including the browser):** `politeness.RejectNonPublicPeer` checks resolved peer IPs inside Go's `net.Dialer.Control` right before `connect()` (blocking DNS-rebinding TOCTOU), and headless Chromium subresources are forced through an in-process loopback `CONNECT` proxy (`--host-resolver-rules=MAP * ~NOTFOUND`).
-- **Polite by design — never bypasses `robots.txt` or CAPTCHAs:** `robots.txt` is enforced on every hop (including `30x` redirects), `Retry-After` is honored per host, anti-bot challenges (Cloudflare, Akamai, DataDome, PerimeterX, AWS WAF, Imperva) halt on the first attempt, and IETF RFC 9421 Web Bot Auth (`Ed25519` HTTP Message Signatures) is built in.
+- **Polite by design — never bypasses `robots.txt`, Content Signals, or CAPTCHAs:** `robots.txt` and `Content-Signal: ai-input` are enforced on every hop (including `30x` redirects), `Retry-After` is honored per host, HTTP `402` (`x402`) halts immediately as `payment_required` without auto-paying, anti-bot challenges (Cloudflare, Akamai, DataDome, PerimeterX, AWS WAF, Imperva) halt on the first attempt, and IETF RFC 9421 Web Bot Auth (`Ed25519` HTTP Message Signatures) is built in.
 - **One external Go dependency (`github.com/coder/websocket`, 0 transitive dependencies):** Enforced in CI on every PR alongside `-race`, native Go fuzzing (`Fuzz*`), `staticcheck`, and `govulncheck`.
 - **MIT licensed & lightweight:** No Redis, no PostgreSQL, no RabbitMQ. Idles at `$0` on Cloudflare Hibernating WebSocket Durable Objects or runs in one container with `node:sqlite` FTS5.
 - **49+ keyless site, open-data & ATS adapters + Autonomous BYO-LLM `/v1/agent`:** 14 MCP tools (`agent`, `find_extractors`, `scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`), drop-in Firecrawl `/v2/*` compatibility, and Claude-style dynamic adapter routing across **Workable**, **Greenhouse (US/EU)**, **Ashby**, **Lever (US/EU)**, **Workday CXS**, **Rippling**, **Gem**, **Pinpoint**, **Teamtailor**, **BambooHR**, **Oracle HCM**, **SmartRecruiters**, **SEC EDGAR**, **Y Combinator**, **Socrata / CKAN / ArcGIS / Legistar Open Data**, **DOI/Crossref**, **OpenAlex**, **arXiv**, **ClinicalTrials.gov**, **PubMed**, **NIST NVD**, **Shopify**, **GitHub**, **Stack Overflow**, **npm**, **crates.io**, **Hugging Face**, **OpenRouter**, and **256 MiB streaming PDFs** — supporting offline local LLMs (**Ollama**, **LM Studio**, **vLLM**) or online BYO-LLM (**OpenAI**, **Anthropic**, **Gemini**, **OpenRouter**, **Workers AI**) with live SSE streaming and `$0` Zero Data Retention. Add a new adapter in one file via `npm run adapter:new` (**[docs/ADAPTERS.md](docs/ADAPTERS.md)**).
@@ -150,7 +154,7 @@ EDGEFETCH_CALLER_TOKEN="<32-char-secret>" EDGEFETCH_AGENT_TOKEN="<32-char-secret
 
 ---
 
-## Feature & Extraction Highlights (`v2.4`, `SCRAPE_PIPELINE_VERSION = 22`)
+## Feature & Extraction Highlights (`v2.5`, `SCRAPE_PIPELINE_VERSION = 22`)
 
 - **25+ Site & ATS Job-Board Extractors ([`hub/src/extractors/registry.ts`](hub/src/extractors/registry.ts), [`hub/src/jobs.ts`](hub/src/jobs.ts)):**
   - **ATS Job Boards & Structured `jobs` Tool:** One-call job search & extraction across **Greenhouse**, **Ashby** (`?includeCompensation=true`), **Lever**, **Workday CXS** (`GET` & `POST`), and **SmartRecruiters / Schema.org `JobPosting` JSON-LD**, normalizing pay (`{ min, max, currency, period, basis: "base"|"ote"|"total" }`) and filtering out closed postings (`contentState: "closed_posting"`).

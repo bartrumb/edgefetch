@@ -2,6 +2,14 @@
  * Zero-dependency parsing, HTML-stripping, JSON-LD, and Markdown table utilities for Site Adapters.
  */
 
+import {
+  findTagOpenEndQuoteAware,
+  replaceHtmlTagBlocksLinear,
+  scanHtmlTagsLinear,
+  stripHtmlTagsLinear,
+  stripHtmlTagsQuoteAwareLinear,
+} from '../safe-input';
+
 export const CODE_EXT_FENCE_MAP: Record<string, string> = {
   ts: 'ts',
   tsx: 'tsx',
@@ -75,7 +83,7 @@ export function decodeBasicEntities(s: string): string {
 }
 
 export function stripTagsInline(html: string): string {
-  return decodeBasicEntities(html.replace(/<[^>]+>/g, ' '))
+  return decodeBasicEntities(stripHtmlTagsQuoteAwareLinear(html, ' '))
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -90,7 +98,7 @@ export function unescapeHrefUrl(rawHref: string): string {
 }
 
 export function stripScriptsAndStyles(rawHtml: string): string {
-  return rawHtml.replace(/<(script|style|svg)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/\1>/gi, '');
+  return stripHtmlTagsLinear(rawHtml, ['script', 'style', 'svg'], '');
 }
 
 export function detectFenceLang(filePath: string): { lang: string; isMarkdown: boolean } {
@@ -139,56 +147,76 @@ export function formatGfmTable(headers: string[], rows: Array<Array<unknown>>): 
   return [headLine, sepLine, ...bodyLines].join('\n');
 }
 
-/** Extracts `<meta name="..." content="...">` or `<meta property="..." content="...">` values from HTML. */
-export function extractMetaContent(rawHtml: string, key: string): string {
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const head = rawHtml.slice(0, 80000);
-  const re1 = new RegExp(
-    `<meta\\b[^>]*(?:name|property)=["']${escaped}["'][^>]*content=["']([^"']*)["'][^>]*>`,
-    'i',
-  );
-  const m1 = re1.exec(head);
-  if (m1?.[1]) return decodeBasicEntities(m1[1]).trim();
-  const re2 = new RegExp(
-    `<meta\\b[^>]*content=["']([^"']*)["'][^>]*(?:name|property)=["']${escaped}["'][^>]*>`,
-    'i',
-  );
-  const m2 = re2.exec(head);
-  return m2?.[1] ? decodeBasicEntities(m2[1]).trim() : '';
+function parseMetaTagAttrsLinear(attrChunk: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const re = /([a-zA-Z_:][a-zA-Z0-9_.:-]*)[ \t\r\n]*(?:=[ \t\r\n]*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(attrChunk)) !== null) {
+    const k = m[1]!.toLowerCase();
+    attrs[k] = m[2] ?? m[3] ?? m[4] ?? '';
+  }
+  return attrs;
 }
 
-/** Extracts all `<meta name="key" content="...">` values (e.g. multiple `citation_author` tags). */
+/** Extracts `<meta name="..." content="...">` or `<meta property="..." content="...">` values from HTML in linear O(N) time (`H1`). */
+export function extractMetaContent(rawHtml: string, key: string): string {
+  const targetKey = key.toLowerCase();
+  let found = '';
+  scanHtmlTagsLinear(
+    rawHtml,
+    (tag) => {
+      if (tag.isClosing || tag.tagNameLower !== 'meta') return;
+      const attrs = parseMetaTagAttrsLinear(tag.attrs);
+      const nameVal = (attrs.name ?? attrs.property ?? attrs.itemprop ?? '').toLowerCase();
+      if (nameVal === targetKey && attrs.content) {
+        const clean = decodeBasicEntities(attrs.content).trim();
+        if (clean) {
+          found = clean;
+          return false;
+        }
+      }
+      return undefined;
+    },
+    80_000,
+    false,
+  );
+  return found;
+}
+
+/** Extracts all `<meta name="key" content="...">` values (e.g. multiple `citation_author` tags) in linear O(N) time (`H1`). */
 export function extractAllMetaContents(rawHtml: string, key: string): string[] {
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const head = rawHtml.slice(0, 120000);
+  const targetKey = key.toLowerCase();
   const out: string[] = [];
-  const tagRe = /<meta\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
-  const keyRe = new RegExp(`\\b(?:name|property)=["']${escaped}["']`, 'i');
-  const valRe = /\bcontent=["']([^"']*)["']/i;
-  let m: RegExpExecArray | null;
-  while ((m = tagRe.exec(head)) !== null) {
-    if (keyRe.test(m[0])) {
-      const val = valRe.exec(m[0])?.[1];
-      if (val) {
-        const clean = decodeBasicEntities(val).trim();
+  scanHtmlTagsLinear(
+    rawHtml,
+    (tag) => {
+      if (tag.isClosing || tag.tagNameLower !== 'meta') return;
+      const attrs = parseMetaTagAttrsLinear(tag.attrs);
+      const nameVal = (attrs.name ?? attrs.property ?? '').toLowerCase();
+      if (nameVal === targetKey && attrs.content) {
+        const clean = decodeBasicEntities(attrs.content).trim();
         if (clean && !out.includes(clean)) out.push(clean);
       }
-    }
-  }
+    },
+    120_000,
+    false,
+  );
   return out;
 }
 
-/** Extracts flattened JSON-LD objects from `<script type="application/ld+json">` blocks (quoted or unquoted `type`). */
+/** Extracts flattened JSON-LD objects from `<script type="application/ld+json">` blocks in linear O(N) time (`H1`). */
 export function extractJsonLdObjects(rawHtml: string): Array<Record<string, unknown>> {
   const results: Array<Record<string, unknown>> = [];
-  const re = /<script\b[^>]*type\s*=\s*(?:["']application\/ld\+json[^"']*["']|application\/ld\+json\b)[^>]*>([\s\S]*?)<\/script>/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(rawHtml)) !== null && results.length < 30) {
-    const raw = m[1]?.trim();
-    if (!raw) continue;
+  replaceHtmlTagBlocksLinear(rawHtml, 'script', (_full, attrStr, inner) => {
+    if (results.length >= 30) return '';
+    if (!/\btype[ \t\r\n]*=[ \t\r\n]*(?:["']application\/ld\+json[^"']*["']|application\/ld\+json\b)/i.test(attrStr)) {
+      return '';
+    }
+    const raw = inner.trim();
+    if (!raw) return '';
     const parsed = parseJsonValue(raw);
     const pushItem = (item: unknown) => {
-      if (!item || typeof item !== 'object') return;
+      if (!item || typeof item !== 'object' || results.length >= 30) return;
       if (Array.isArray(item)) {
         for (const el of item) pushItem(el);
         return;
@@ -200,31 +228,38 @@ export function extractJsonLdObjects(rawHtml: string): Array<Record<string, unkn
       }
     };
     pushItem(parsed);
-  }
+    return '';
+  });
   return results;
 }
 
-/** Extracts balanced `<div ...>...</div>` inner HTML starting right at the matched opening `<div ...>` index. */
+/** Extracts balanced `<div ...>...</div>` inner HTML starting right at the matched opening `<div ...>` index (`H1`). */
 export function extractBalancedDivAt(html: string, openTagIndex: number): string | null {
-  const openTagEnd = html.indexOf('>', openTagIndex);
+  const deadRef: { mask?: Uint8Array } = {};
+  const openTagEnd = findTagOpenEndQuoteAware(html, openTagIndex + 4, deadRef);
   if (openTagEnd < 0) return null;
   if (html[openTagEnd - 1] === '/') return '';
   let depth = 1;
-  const tagRe = /<\/?div\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi;
-  tagRe.lastIndex = openTagEnd + 1;
-  let m: RegExpExecArray | null;
-  while ((m = tagRe.exec(html)) !== null) {
-    const tok = m[0];
-    if (tok.startsWith('</')) {
-      depth--;
-      if (depth === 0) {
-        return html.slice(openTagEnd + 1, m.index);
+  let result: string | null = null;
+  scanHtmlTagsLinear(
+    html.slice(openTagEnd + 1),
+    (tag) => {
+      if (tag.tagNameLower !== 'div') return;
+      if (tag.isClosing) {
+        depth--;
+        if (depth === 0) {
+          result = html.slice(openTagEnd + 1, openTagEnd + 1 + tag.index);
+          return false;
+        }
+      } else if (!tag.isSelfClosing) {
+        depth++;
       }
-    } else if (!tok.endsWith('/>')) {
-      depth++;
-    }
-  }
-  return null;
+      return undefined;
+    },
+    undefined,
+    false,
+  );
+  return result;
 }
 
 export function formatUsdCompact(n: unknown): string {

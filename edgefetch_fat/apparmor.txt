@@ -22,7 +22,7 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
 
   # Needed once at millisecond 0 (while UID == 0) so `priv.LockDownSecretPaths` enforces `0700 /data` +
   # `0600 /data/options.json` (`root:root`) right before `priv.DropRoot()` permanently drops all threads
-  # to `65532:65532` and clears all capabilities (`PR_SET_NO_NEW_PRIVS=1`).
+  # to `65532:65532`, sets `PR_SET_NO_NEW_PRIVS=1` + `PR_SET_DUMPABLE=0`, and clears all capabilities.
   capability setuid,
   capability setgid,
   capability chown,
@@ -42,7 +42,7 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   deny ptrace,
 
   # Binary, Chromium (`mrix` compatible with AppArmor 3.x on Home Assistant OS + `PR_SET_NO_NEW_PRIVS`),
-  # Poppler `pdftotext`, and pre-drop `/data/options.json` lockdown access
+  # and Poppler `pdftotext`
   / r,
   /edgefetch ixr,
   /usr/ r,
@@ -60,10 +60,16 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   /var/cache/fontconfig/** rwkl,
   /etc/ r,
   /etc/** r,
+
+  # `/data` holds Home Assistant Supervisor's `/data/options.json` (read once as UID 0, locked to `0700 /data` +
+  # `0600 /data/options.json` owned by `0:0`, and thereafter denied by VFS DAC + `deny capability dac_override` /
+  # `dac_read_search` once `DropRoot` switches all threads to `65532:65532`).
+  # `/tmp` holds ephemeral per-render Chromium profiles and streamed PDF scratch files (`1777`).
   /data/ rw,
   /data/options.json rw,
   /tmp/ rw,
   /tmp/** rwklm,
+
   /dev/ r,
   /dev/shm/ rw,
   /dev/shm/** rwklm,
@@ -90,9 +96,11 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   /sys/devices/ r,
   /sys/devices/** r,
 
-  # Block sensitive kernel / hardware paths
+  # Block sensitive kernel, process-memory / environment, and hardware paths
   deny /proc/kcore rwklx,
   deny /proc/kmem rwklx,
   deny /proc/mem rwklx,
+  deny /proc/*/mem rwklx,
+  deny /proc/*/environ r,
   deny /sys/firmware/** rwklx,
 }

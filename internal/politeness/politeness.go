@@ -276,23 +276,31 @@ type RobotsRule struct {
 	Allow   bool
 }
 
-// RobotsEntry caches parsed `/robots.txt` rules and `Crawl-delay` for one origin.
+// RobotsEntry caches parsed `/robots.txt` rules, Content Signals, and `Crawl-delay` for one origin.
 // When `Distressed` is true (RFC 9309 §2.3.1.4 unreachable: network error, 429, or 5xx), all paths are treated as disallowed.
+// When `DisallowAIInput` is true (`Content-Signal: ai-input=no`), all paths are disallowed for user-triggered agent retrieval.
 type RobotsEntry struct {
-	Rules      []RobotsRule
-	CrawlDelay time.Duration
-	Distressed bool
-	Reason     string
-	ExpiresAt  time.Time
+	Rules           []RobotsRule
+	CrawlDelay      time.Duration
+	DisallowAIInput bool
+	Distressed      bool
+	Reason          string
+	ExpiresAt       time.Time
+}
+
+// ContentSignalBlocked reports whether `/robots.txt` disallowed agent retrieval via `Content-Signal: ai-input=no`.
+func (e *RobotsEntry) ContentSignalBlocked() bool {
+	return e != nil && !e.Distressed && e.DisallowAIInput
 }
 
 // Allowed evaluates RFC 9309 longest-match precedence: whichever matching `Allow` or `Disallow` rule has the longest
-// pattern wins; ties break in favor of `Allow`. If `/robots.txt` was unreachable (`Distressed`), returns false per RFC 9309 §2.3.1.4.
+// pattern wins; ties break in favor of `Allow`. If `/robots.txt` was unreachable (`Distressed`) or opted out of agent
+// retrieval via `Content-Signal: ai-input=no` (`DisallowAIInput`), returns false.
 func (e *RobotsEntry) Allowed(pathAndQuery string) bool {
 	if e == nil {
 		return true
 	}
-	if e.Distressed {
+	if e.Distressed || e.DisallowAIInput {
 		return false
 	}
 	if len(e.Rules) == 0 {
@@ -452,6 +460,8 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 		agents     []string
 		rules      []RobotsRule
 		crawlDelay time.Duration
+		aiInputYes bool
+		aiInputNo  bool
 	}
 	var groups []group
 	var cur group
@@ -507,6 +517,17 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 					cur.crawlDelay = d
 				}
 			}
+		case "content-signal":
+			if len(cur.agents) > 0 {
+				seenDirective = true
+				if disallow, found := parseContentSignalAIInput(val); found {
+					if disallow {
+						cur.aiInputNo = true
+					} else {
+						cur.aiInputYes = true
+					}
+				}
+			}
 		}
 	}
 	if len(cur.agents) > 0 {
@@ -515,6 +536,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 
 	var specificRules, wildcardRules []RobotsRule
 	var specificDelay, wildcardDelay time.Duration
+	var specificAIYes, specificAINo, wildcardAIYes, wildcardAINo bool
 	matchedSpecific, matchedWildcard := false, false
 
 	for _, g := range groups {
@@ -525,11 +547,23 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 				if g.crawlDelay > specificDelay {
 					specificDelay = g.crawlDelay
 				}
+				if g.aiInputYes {
+					specificAIYes = true
+				}
+				if g.aiInputNo {
+					specificAINo = true
+				}
 			} else if ua == "*" {
 				matchedWildcard = true
 				wildcardRules = append(wildcardRules, g.rules...)
 				if g.crawlDelay > wildcardDelay {
 					wildcardDelay = g.crawlDelay
+				}
+				if g.aiInputYes {
+					wildcardAIYes = true
+				}
+				if g.aiInputNo {
+					wildcardAINo = true
 				}
 			}
 		}
@@ -539,11 +573,35 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 	if matchedSpecific {
 		out.Rules = specificRules
 		out.CrawlDelay = specificDelay
+		out.DisallowAIInput = specificAINo && !specificAIYes
 	} else if matchedWildcard {
 		out.Rules = wildcardRules
 		out.CrawlDelay = wildcardDelay
+		out.DisallowAIInput = wildcardAINo && !wildcardAIYes
 	}
 	return out
+}
+
+func parseContentSignalAIInput(val string) (disallow, found bool) {
+	for _, item := range strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == ';' }) {
+		k, v, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(k), "ai-input") {
+			continue
+		}
+		cleanV := strings.ToLower(strings.TrimSpace(v))
+		switch cleanV {
+		case "no":
+			disallow = true
+			found = true
+		case "yes":
+			disallow = false
+			found = true
+		}
+	}
+	return disallow, found
 }
 
 func canonicalProductToken(raw string) string {

@@ -489,8 +489,7 @@ func allMCPClientTargets(goos, homeDir, appData string) []mcpClientTarget {
 }
 
 func upsertCodexTomlMCP(existing string, exePath string) string {
-	escapedExe := strings.ReplaceAll(exePath, `\`, `\\`)
-	block := fmt.Sprintf("[mcp_servers.edgefetch]\ncommand = %q\nargs = [\"mcp\"]\n", escapedExe)
+	block := fmt.Sprintf("[mcp_servers.edgefetch]\ncommand = %q\nargs = [\"mcp\"]\n", exePath)
 	// Strip any prior [mcp_servers.edgefetch] section cleanly before appending updated block
 	lines := strings.Split(strings.ReplaceAll(existing, "\r\n", "\n"), "\n")
 	var kept []string

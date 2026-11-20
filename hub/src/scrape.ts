@@ -5160,6 +5160,20 @@ export async function executeScrapeCall(params: {
     Boolean(jsonSchemaSpec) ||
     Boolean(attributesSpec);
 
+  const needsDomForTwin =
+    stringFormats.has('html') ||
+    stringFormats.has('rawHtml') ||
+    stringFormats.has('images') ||
+    stringFormats.has('branding') ||
+    stringFormats.has('screenshot') ||
+    stringFormats.has('llmsTxt') ||
+    stringFormats.has('changes') ||
+    inlineActions.length > 0 ||
+    pdfParserOpts.skipPdfParsing ||
+    includeTags.length > 0 ||
+    excludeTags.length > 0 ||
+    Boolean(attributesSpec);
+
   let prevMarkdownForChanges: string | null = null;
   if (stringFormats.has('changes') && env.ARTIFACTS && env.META) {
     const prevHit = await lookupCachedScrape({
@@ -5715,7 +5729,7 @@ export async function executeScrapeCall(params: {
 
   // Modular Site Extractor Registry 1-hop JSON / raw / patch twin upgrade (`npm`, `crates.io`, `huggingface.co`,
   // `gitlab.com`, `codeberg.org`, Discourse `/t/<slug>/<id>.json`, `lobste.rs`, Bluesky ATProto, Mastodon, `dev.to`, etc.).
-  const registryTwin = !needsLiveHtml && renderMode !== 'always' ? resolveSiteExtractorTwin(normalizedUrl) : null;
+  const registryTwin = !needsDomForTwin && renderMode !== 'always' ? resolveSiteExtractorTwin(normalizedUrl) : null;
   if (registryTwin) {
     try {
       const twinRes = await executeHubFetch(
@@ -5770,6 +5784,79 @@ export async function executeScrapeCall(params: {
               }).catch(() => undefined);
               twinMdArtifactId = `md:${mdSha}`;
             }
+            if (checkPromptInjection) {
+              const piTwin = detectPromptInjection({ markdown: `${formatted.title ?? ''}\n${twinShapedFull.markdown}` });
+              if (piTwin.detected) {
+                return {
+                  status: 403,
+                  via: twinRes.via,
+                  body: {
+                    ok: false,
+                    success: false,
+                    code: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+                    error: 'prompt_injection_detected',
+                    message: `Prompt injection guard triggered (${piTwin.triggers.join(', ')})`,
+                    triggers: piTwin.triggers,
+                    url: normalizedUrl,
+                  },
+                };
+              }
+            }
+            const twinLlmResolved =
+              stringFormats.has('summary') || Boolean(jsonSchemaSpec)
+                ? resolveLlmConfig({
+                    env: env as OptionalStorageBindings & LlmEnvBindings,
+                    requestLlm: payload.llm,
+                    selfHost,
+                  })
+                : { ok: true as const, config: null };
+            const twinLlmCfg = twinLlmResolved.ok ? twinLlmResolved.config : null;
+            let twinSummaryOut: string | undefined;
+            if (stringFormats.has('summary')) {
+              const sumRes = await summarizeMarkdownWithOptionalLlm({
+                markdown: twinShapedFull.markdown,
+                title: formatted.title,
+                llmConfig: twinLlmCfg,
+              });
+              twinSummaryOut = sumRes.summary;
+            }
+            let twinJsonOut: Record<string, unknown> | undefined;
+            if (jsonSchemaSpec) {
+              const twinDoc: ExtractedDocument = {
+                markdown: twinShapedFull.markdown,
+                text: twinShapedFull.markdown,
+                title: formatted.title,
+                description: formatted.description,
+                canonicalUrl: normalizedUrl,
+                links: formatted.links ?? [],
+                images: [],
+                branding: { title: formatted.title, description: formatted.description, canonicalUrl: normalizedUrl },
+              };
+              const heuristic = extractStructuredJsonFromPage(twinBody, twinDoc, jsonSchemaSpec.schema);
+              if (twinLlmCfg && (jsonSchemaSpec.prompt || jsonSchemaSpec.schema)) {
+                const llmJ = await extractJsonWithOptionalLlm({
+                  markdown: twinShapedFull.markdown,
+                  title: formatted.title,
+                  url: normalizedUrl,
+                  prompt: jsonSchemaSpec.prompt,
+                  schema: jsonSchemaSpec.schema,
+                  llmConfig: twinLlmCfg,
+                  heuristicFallback: heuristic,
+                });
+                twinJsonOut = llmJ.data;
+              } else {
+                twinJsonOut = heuristic;
+              }
+            }
+            const twinProductOut = stringFormats.has('product')
+              ? extractStructuredProduct({
+                  rawBody: twinBody,
+                  finalUrl: normalizedUrl,
+                  fallbackTitle: formatted.title,
+                  fallbackDescription: formatted.description,
+                })
+              : null;
+            const twinRawBase64Out = stringFormats.has('rawBase64') ? encodeBodyToRawBase64(twinItem) : undefined;
             return {
               status: 200,
               via: twinRes.via,
@@ -5787,6 +5874,10 @@ export async function executeScrapeCall(params: {
                 ...(twinMdArtifactId ? { markdownArtifactId: twinMdArtifactId } : {}),
                 ...(stringFormats.has('markdown') ? { markdown: twinShaped.markdown } : {}),
                 ...(stringFormats.has('text') ? { text: twinShaped.markdown } : {}),
+                ...(twinSummaryOut !== undefined ? { summary: twinSummaryOut } : {}),
+                ...(twinProductOut ? { product: twinProductOut } : {}),
+                ...(twinRawBase64Out ? { rawBase64: twinRawBase64Out } : {}),
+                ...(twinJsonOut ? { json: twinJsonOut } : {}),
                 ...(stringFormats.has('links') && formatted.links ? { links: formatted.links } : {}),
                 ...(twinFocused.queryFiltered ? { queryFiltered: true, chunks: twinFocused.chunks } : {}),
                 ...(twinShaped.truncated
@@ -6395,6 +6486,9 @@ export async function executeScrapeCall(params: {
     };
   }
 
+  if (rawBodyStr && /^\s*(?:<!doctype\s+html|<html\b)/i.test(rawBodyStr)) {
+    item.contentType = 'text/html; charset=utf-8';
+  }
   const binaryScrapeProblem = rawBase64Requested
     ? null
     : detectUnsupportedBinaryPayload({
@@ -6501,7 +6595,7 @@ export async function executeScrapeCall(params: {
           });
           if (countTextWords(autoExtracted.markdown) > countTextWords(extracted?.markdown ?? '')) {
             fetchResUsed = autoBrowserRes;
-            item = autoItem;
+            item = { ...autoItem, contentType: 'text/html; charset=utf-8' };
             rawBodyStr = autoHtml;
             finalUrl = autoFinalUrl;
             isHtmlBody = true;
@@ -6696,7 +6790,7 @@ export async function executeScrapeCall(params: {
     (isHtmlBody ? extracted?.markdown : undefined) ||
     (typeof item.markdown === 'string' && item.markdown) ||
     extracted?.markdown ||
-    rawBodyStr;
+    (isHtmlBody ? '' : rawBodyStr);
   if (htmlJobPosting && isHtmlBody && !alternateMarkdownBody) {
     const jpHeader = formatJobPostingHeaderMarkdown(htmlJobPosting);
     if (jpHeader && !/\*\*Compensation\*\*:/.test(markdown.slice(0, 400))) {

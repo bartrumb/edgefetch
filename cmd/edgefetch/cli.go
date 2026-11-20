@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bartrumb/edgefetch/v2/internal/agent"
 	"github.com/bartrumb/edgefetch/v2/internal/botauth"
@@ -412,7 +413,11 @@ func runScrapeCLI(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	}
 	res := reply.Results[0]
 	if maxChars > 0 && len(res.Markdown) > maxChars {
-		res.Markdown = res.Markdown[:maxChars]
+		cut := maxChars
+		for cut > 0 && !utf8.RuneStart(res.Markdown[cut]) {
+			cut--
+		}
+		res.Markdown = res.Markdown[:cut]
 	}
 
 	if jsonOut {

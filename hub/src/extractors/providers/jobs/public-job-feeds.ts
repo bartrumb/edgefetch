@@ -48,11 +48,19 @@ export default defineAdapter({
       };
     }
 
-    // 2. Jobicy (`jobicy.com/api/v2/remote-jobs`)
-    if (host === 'jobicy.com' && url.pathname.startsWith('/api/v2/remote-jobs')) {
+    // 2. Jobicy (`jobicy.com/api/v2/remote-jobs` or `jobicy.com/jobs-rss-feed` / `/remote-*`)
+    if (
+      host === 'jobicy.com' &&
+      (url.pathname.startsWith('/api/v2/remote-jobs') ||
+        url.pathname === '/jobs-rss-feed' ||
+        url.pathname.startsWith('/remote-'))
+    ) {
+      const fetchTarget = url.pathname.startsWith('/api/v2/remote-jobs')
+        ? urlStr
+        : 'https://jobicy.com/api/v2/remote-jobs?count=30';
       return {
         id: 'jobicy-feed',
-        fetchUrl: urlStr,
+        fetchUrl: fetchTarget,
         kind: 'json',
         accept: 'application/json',
         formatTwin: (rawBody) => {
@@ -79,11 +87,17 @@ export default defineAdapter({
       };
     }
 
-    // 3. Arbeitnow (`arbeitnow.com/api/job-board-api`)
-    if ((host === 'www.arbeitnow.com' || host === 'arbeitnow.com') && url.pathname.startsWith('/api/job-board-api')) {
+    // 3. Arbeitnow (`arbeitnow.com/api/job-board-api` or `/jobs`)
+    if (
+      (host === 'www.arbeitnow.com' || host === 'arbeitnow.com') &&
+      (url.pathname.startsWith('/api/job-board-api') || url.pathname === '/jobs' || url.pathname === '/jobs/')
+    ) {
+      const fetchTarget = url.pathname.startsWith('/api/job-board-api')
+        ? urlStr
+        : 'https://www.arbeitnow.com/api/job-board-api';
       return {
         id: 'arbeitnow-feed',
-        fetchUrl: urlStr,
+        fetchUrl: fetchTarget,
         kind: 'json',
         accept: 'application/json',
         formatTwin: (rawBody) => {
@@ -107,19 +121,30 @@ export default defineAdapter({
       };
     }
 
-    // 4. RemoteOK (`remoteok.com/api` — element 0 is a legal notice object without `position`/`company`, skip it!)
-    if (host === 'remoteok.com' && url.pathname === '/api') {
+    // 4. RemoteOK (`remoteok.com/api` or `remoteok.com/remote-*-jobs` — element 0 is a legal notice object without `position`/`company`, skip it!)
+    if (
+      host === 'remoteok.com' &&
+      (url.pathname === '/api' || url.pathname === '/' || /^\/remote-[a-z0-9-]+-jobs\/?$/i.test(url.pathname))
+    ) {
+      const catTag = /^\/remote-([a-z0-9-]+)-jobs\/?$/i.exec(url.pathname)?.[1]?.toLowerCase();
+      // Note: `remoteok.com/api?tag=...` 302-redirects to `/`; always fetch `https://remoteok.com/api` and filter `tags` in memory!
       return {
         id: 'remoteok-feed',
-        fetchUrl: urlStr,
+        fetchUrl: 'https://remoteok.com/api',
         kind: 'json',
         accept: 'application/json',
         formatTwin: (rawBody) => {
           const parsed = parseJsonValue(rawBody);
           if (!Array.isArray(parsed)) return null;
-          const jobs = (parsed as Array<Record<string, unknown>>).filter(
+          let jobs = (parsed as Array<Record<string, unknown>>).filter(
             (item) => item && typeof item === 'object' && typeof item.position === 'string' && item.position.trim() !== '',
           );
+          if (catTag && catTag !== 'dev') {
+            const filtered = jobs.filter((j) =>
+              Array.isArray(j.tags) && j.tags.some((t) => String(t).toLowerCase().includes(catTag)),
+            );
+            if (filtered.length > 0) jobs = filtered;
+          }
           const title = `RemoteOK Remote Jobs (${jobs.length})`;
           const links: string[] = [];
           const rows = jobs.slice(0, 50).map((j) => {

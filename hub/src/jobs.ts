@@ -1687,7 +1687,7 @@ export function discoverAtsBoardsFromHtml(params: {
     }
   };
 
-  // 1. Greenhouse (US & EU, including `?for=<slug>` embed scripts!)
+  // 1. Greenhouse (US & EU, including `?for=<slug>` embed scripts & `boards-api.greenhouse.io/v1/boards/<slug>`!)
   for (const m of corpus.matchAll(
     /https?:\/\/((?:job-boards|boards|eu-boards|job-boards\.eu)\.greenhouse\.io)\/(?:embed\/job_board(?:\/js)?\?for=([A-Za-z0-9_-]+)|([A-Za-z0-9_-]+))/gi,
   )) {
@@ -1695,6 +1695,10 @@ export function discoverAtsBoardsFromHtml(params: {
     const slug = m[2] || m[3] || '';
     const canonicalHost = ghHost.includes('eu') ? 'job-boards.eu.greenhouse.io' : 'job-boards.greenhouse.io';
     addBoard('greenhouse', slug, `https://${canonicalHost}/${slug}`);
+  }
+  for (const m of corpus.matchAll(/https?:\/\/(boards-api(?:\.eu)?\.greenhouse\.io)\/v1\/boards\/([A-Za-z0-9_-]+)/gi)) {
+    const canonicalHost = m[1]!.toLowerCase().includes('.eu.') ? 'job-boards.eu.greenhouse.io' : 'job-boards.greenhouse.io';
+    addBoard('greenhouse', m[2]!, `https://${canonicalHost}/${m[2]!}`);
   }
 
   // 2. Ashby (`jobs.ashbyhq.com/<org>` or `api.ashbyhq.com/posting-api/job-board/<org>`)
@@ -1889,7 +1893,40 @@ export async function executeJobsCall(params: {
               discoveredBoards.push(b);
               candidateUrls.add(b.boardUrl);
             }
-            break;
+            return;
+          }
+        }
+        // Fallback when company uses a custom SPA careers portal: probe canonical domain slug across Greenhouse, Ashby & Lever JSON boards
+        const baseSlug = dom.split('.')[0]?.toLowerCase() ?? '';
+        if (isValidAtsSlug(baseSlug)) {
+          const slugProbes: Array<{ platform: string; boardUrl: string }> = [
+            { platform: 'greenhouse', boardUrl: `https://boards.greenhouse.io/${baseSlug}` },
+            { platform: 'ashby', boardUrl: `https://jobs.ashbyhq.com/${baseSlug}` },
+            { platform: 'lever', boardUrl: `https://jobs.lever.co/${baseSlug}` },
+          ];
+          const probeResults = await Promise.all(
+            slugProbes.map(async (sp) => {
+              const r = await executeScrape({
+                url: sp.boardUrl,
+                formats: ['markdown', 'links'],
+                ...(payload.target ? { target: payload.target } : {}),
+                ...(payload.site ? { site: payload.site } : {}),
+              }).catch(() => null);
+              return { sp, r };
+            }),
+          );
+          for (const { sp, r } of probeResults) {
+            const links = Array.isArray(r?.body?.links) ? (r!.body.links as string[]) : [];
+            if (r?.status === 200 && r.body?.ok === true && links.length > 0) {
+              discoveredBoards.push({
+                platform: sp.platform,
+                slug: baseSlug,
+                boardUrl: sp.boardUrl,
+                discoveredFrom: `slug-probe:${dom}`,
+                boardStatus: 'ok',
+              });
+              candidateUrls.add(sp.boardUrl);
+            }
           }
         }
       }),

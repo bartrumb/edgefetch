@@ -23,10 +23,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 
 	"github.com/bartrumb/edgefetch/v2/internal/agent"
+	"github.com/bartrumb/edgefetch/v2/internal/browser"
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 	"github.com/bartrumb/edgefetch/v2/internal/otel"
@@ -1011,14 +1013,18 @@ func (s *Server) handleCallerFetch(w http.ResponseWriter, r *http.Request) {
 }
 
 type scrapePayload struct {
-	URL             string   `json:"url"`
-	Formats         []string `json:"formats,omitempty"`
-	OnlyMainContent *bool    `json:"onlyMainContent,omitempty"`
-	RenderMode      string   `json:"renderMode,omitempty"`
-	Query           string   `json:"query,omitempty"`
-	MaxChars        int      `json:"maxChars,omitempty"`
-	Target          string   `json:"target,omitempty"`
-	Site            string   `json:"site,omitempty"`
+	URL             string                   `json:"url"`
+	Formats         []any                    `json:"formats,omitempty"`
+	OnlyMainContent *bool                    `json:"onlyMainContent,omitempty"`
+	RenderMode      string                   `json:"renderMode,omitempty"`
+	WaitFor         int                      `json:"waitFor,omitempty"`
+	WaitForMs       int                      `json:"waitForMs,omitempty"`
+	Mobile          bool                     `json:"mobile,omitempty"`
+	Actions         []browser.InteractAction `json:"actions,omitempty"`
+	Query           string                   `json:"query,omitempty"`
+	MaxChars        int                      `json:"maxChars,omitempty"`
+	Target          string                   `json:"target,omitempty"`
+	Site            string                   `json:"site,omitempty"`
 }
 
 func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.Header) (map[string]any, string, int) {
@@ -1030,13 +1036,38 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 	if uErr != nil || s.allow(parsedURL) != nil {
 		return map[string]any{"ok": false, "error": "bad_url", "message": "only public https:// URLs are permitted"}, "hub", http.StatusBadRequest
 	}
-	formats := p.Formats
+	var formats []string
+	wantScreenshot := false
+	for _, rawFmt := range p.Formats {
+		switch v := rawFmt.(type) {
+		case string:
+			if v == "screenshot" {
+				wantScreenshot = true
+			}
+			formats = append(formats, v)
+		case map[string]any:
+			if tStr, ok := v["type"].(string); ok && tStr != "" {
+				if tStr == "screenshot" {
+					wantScreenshot = true
+				}
+				formats = append(formats, tStr)
+			}
+		}
+	}
 	if len(formats) == 0 {
 		formats = []string{"markdown", "links"}
 	}
 	kind := classify.KindScrape
-	if p.RenderMode == "always" {
+	var interactSpec *crawl.InteractSpec
+	if len(p.Actions) > 0 {
+		kind = classify.KindInteract
+		interactSpec = &crawl.InteractSpec{Actions: p.Actions}
+	} else if p.RenderMode == "always" || wantScreenshot || p.Mobile {
 		kind = classify.KindRender
+	}
+	waitMs := p.WaitForMs
+	if waitMs <= 0 && p.WaitFor > 0 {
+		waitMs = p.WaitFor
 	}
 	onlyMain := true
 	if p.OnlyMainContent != nil {
@@ -1059,6 +1090,9 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 				DiscoverLlms:    crawl.Bool(true),
 				Query:           p.Query,
 				RenderMode:      p.RenderMode,
+				WaitForMs:       waitMs,
+				Mobile:          p.Mobile,
+				Interact:        interactSpec,
 			},
 		},
 	}
@@ -1073,7 +1107,11 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 	res := reply.Results[0]
 	md := res.Markdown
 	if p.MaxChars > 0 && len(md) > p.MaxChars {
-		md = md[:p.MaxChars]
+		cut := p.MaxChars
+		for cut > 0 && !utf8.RuneStart(md[cut]) {
+			cut--
+		}
+		md = md[:cut]
 	}
 	return map[string]any{
 		"ok":          res.Outcome == classify.OutcomeOK,

@@ -178,10 +178,10 @@ export function extractAllMetaContents(rawHtml: string, key: string): string[] {
   return out;
 }
 
-/** Extracts flattened JSON-LD objects from `<script type="application/ld+json">` blocks. */
+/** Extracts flattened JSON-LD objects from `<script type="application/ld+json">` blocks (quoted or unquoted `type`). */
 export function extractJsonLdObjects(rawHtml: string): Array<Record<string, unknown>> {
   const results: Array<Record<string, unknown>> = [];
-  const re = /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  const re = /<script\b[^>]*type\s*=\s*(?:["']application\/ld\+json[^"']*["']|application\/ld\+json\b)[^>]*>([\s\S]*?)<\/script>/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(rawHtml)) !== null && results.length < 30) {
     const raw = m[1]?.trim();

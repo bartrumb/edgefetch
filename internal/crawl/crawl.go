@@ -30,8 +30,9 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
-// DefaultUserAgent is sent when no custom User-Agent is configured. Always identify crawlers honestly.
-const DefaultUserAgent = "EdgeFetch/2.0 (+https://github.com/bartrumb/edgefetch)"
+// DefaultUserAgent is sent when no custom User-Agent is configured. Always identify crawlers honestly
+// (includes contact mailto for SEC EDGAR Fair Access & OpenAlex/Crossref/NCBI Polite Pools).
+const DefaultUserAgent = "EdgeFetch/2.5 (bot@edgefetch.dev)"
 
 // InteractSpec configures stateful or single-turn headless Chromium interaction (`firecrawl_interact` parity).
 type InteractSpec struct {

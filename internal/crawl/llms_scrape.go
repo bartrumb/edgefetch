@@ -505,9 +505,13 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 		res.Status = http.StatusOK
 	}
 	res.Bytes = len(rawBody)
-	res.ContentType = out.Headers.Get("content-type")
-	if res.ContentType == "" {
+	if len(rawBody) > 0 {
 		res.ContentType = "text/html; charset=utf-8"
+	} else {
+		res.ContentType = out.Headers.Get("content-type")
+		if res.ContentType == "" {
+			res.ContentType = "text/html; charset=utf-8"
+		}
 	}
 	res.FinalURL = out.FinalURL
 	res.Rendered = true

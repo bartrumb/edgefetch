@@ -33,7 +33,7 @@ export default defineAdapter({
   id: 'clinicaltrials',
   name: 'ClinicalTrials.gov Studies',
   category: 'research-health',
-  description: 'Extracts clinical trial NCT ID, recruitment status, phase, conditions, interventions, sponsor, and summary from clinicaltrials.gov/study/NCT... (strictly respecting robots.txt).',
+  description: 'Extracts clinical trial NCT ID, recruitment status, phase, conditions, interventions, sponsor, and summary from rendered clinicaltrials.gov/study/NCT... pages (strictly respecting robots.txt).',
   domains: ['clinicaltrials.gov', 'www.clinicaltrials.gov'],
   exampleUrls: ['https://clinicaltrials.gov/study/NCT04280705'],
   extractHtml({ path, rawHtml, currentMd }) {

@@ -1,13 +1,77 @@
 import { defineAdapter } from '../../types';
-import { extractJsonLdObjects, extractMetaContent } from '../../utils';
+import { extractJsonLdObjects, extractMetaContent, parseJsonObject } from '../../utils';
 
 export default defineAdapter({
   id: 'pubchem',
   name: 'PubChem Chemical Compounds (NCBI)',
   category: 'research-health',
-  description: 'Extracts PubChem compound formula, molecular weight, IUPAC name, InChIKey, SMILES, and summary from pubchem.ncbi.nlm.nih.gov/compound/... (strictly respecting robots.txt).',
+  description: 'Upgrades pubchem.ncbi.nlm.nih.gov/compound/<cid|name> to NCBI PUG-REST compound properties + pharmacological descriptions (with HTML JSON-LD fallback).',
   domains: ['pubchem.ncbi.nlm.nih.gov'],
   exampleUrls: ['https://pubchem.ncbi.nlm.nih.gov/compound/2244'],
+  resolveTwin({ parts }) {
+    if (parts[0]?.toLowerCase() !== 'compound' || !parts[1]) return null;
+    const rawId = decodeURIComponent(parts[1]).trim();
+    if (!/^\d{1,12}$/.test(rawId)) return null;
+    // Note: PubChem robots.txt explicitly keeps `/rest/pug_view` crawlable ("Keep /rest/pug/ scoped so /rest/pug_view remains crawlable").
+    return {
+      id: 'pubchem',
+      fetchUrl: `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${rawId}/JSON/?heading=Names+and+Identifiers`,
+      kind: 'json',
+      accept: 'application/json',
+      formatTwin: (rawBody) => {
+        const data = parseJsonObject(rawBody);
+        const rec = data?.Record as Record<string, unknown> | undefined;
+        if (!rec || typeof rec.RecordTitle !== 'string') return null;
+
+        const cid = rec.RecordNumber !== undefined ? String(rec.RecordNumber) : rawId;
+        const title = rec.RecordTitle.trim() || `Compound ${cid}`;
+        const fields = new Map<string, string>();
+        const walk = (secs: unknown) => {
+          if (!Array.isArray(secs)) return;
+          for (const rawS of secs) {
+            if (!rawS || typeof rawS !== 'object') continue;
+            const s = rawS as Record<string, unknown>;
+            const heading = typeof s.TOCHeading === 'string' ? s.TOCHeading : '';
+            const infoArr = Array.isArray(s.Information) ? (s.Information as Array<Record<string, unknown>>) : [];
+            const valObj = infoArr[0]?.Value as Record<string, unknown> | undefined;
+            const strArr = Array.isArray(valObj?.StringWithMarkup)
+              ? (valObj.StringWithMarkup as Array<Record<string, unknown>>)
+              : [];
+            const firstStr = typeof strArr[0]?.String === 'string' ? strArr[0].String.trim() : '';
+            if (heading && firstStr && !fields.has(heading)) {
+              fields.set(heading, firstStr);
+            }
+            if (s.Section) walk(s.Section);
+          }
+        };
+        walk(rec.Section);
+
+        const formula = fields.get('Molecular Formula') ?? '';
+        const iupac = fields.get('IUPAC Name') ?? '';
+        const inchiKey = fields.get('InChIKey') ?? '';
+        const smiles = fields.get('SMILES') ?? fields.get('Canonical SMILES') ?? '';
+        const cas = fields.get('CAS') ?? '';
+        const desc = fields.get('Record Description') ?? '';
+
+        const bullets: string[] = [`- **PubChem CID**: \`${cid}\``];
+        if (formula) bullets.push(`- **Molecular Formula**: \`${formula}\``);
+        if (cas) bullets.push(`- **CAS Number**: \`${cas}\``);
+        if (iupac) bullets.push(`- **IUPAC Name**: \`${iupac}\``);
+        if (inchiKey) bullets.push(`- **InChIKey**: \`${inchiKey}\``);
+        if (smiles) bullets.push(`- **SMILES**: \`${smiles}\``);
+
+        const sections = [`# ${title} (PubChem CID ${cid})`, bullets.join('\n')];
+        if (desc) sections.push(`## Summary\n\n${desc}`);
+
+        return {
+          title: `${title} (PubChem CID ${cid})`,
+          ...(desc ? { description: desc.slice(0, 260) } : {}),
+          markdown: sections.join('\n\n'),
+          links: [`https://pubchem.ncbi.nlm.nih.gov/compound/${cid}`],
+        };
+      },
+    };
+  },
   extractHtml({ path, rawHtml, currentMd }) {
     if (!/^\/compound\/[^/]+/i.test(path)) return null;
     const ldObjects = extractJsonLdObjects(rawHtml);

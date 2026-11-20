@@ -279,15 +279,28 @@ func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 		}
 	}
 
-	// 8. Generic interstitial shell (`<title>Verify you are human</title>` + widget on a tiny < 80-word shell)
-	if reGenericTitle.MatchString(title) && visibleWords < 80 &&
-		(strings.Contains(scrubbedLower, "g-recaptcha") || strings.Contains(scrubbedLower, "h-captcha") || strings.Contains(scrubbedLower, "cf-turnstile")) {
-		return &WAFMatch{
-			Vendor:     "generic",
-			Category:   "challenge",
-			Confidence: 0.88,
-			Signals:    []string{"title:" + title},
-			Summary:    "anti-bot challenge page (" + title + ")",
+	// 8. Generic interstitial shell (`<title>Verify you are human</title>`, NCBI JS check, or Anubis PoW gate on < 80-word shell)
+	if visibleWords < 80 {
+		if reGenericTitle.MatchString(title) &&
+			(strings.Contains(scrubbedLower, "g-recaptcha") || strings.Contains(scrubbedLower, "h-captcha") || strings.Contains(scrubbedLower, "cf-turnstile")) {
+			return &WAFMatch{
+				Vendor:     "generic",
+				Category:   "challenge",
+				Confidence: 0.88,
+				Signals:    []string{"title:" + title},
+				Summary:    "anti-bot challenge page (" + title + ")",
+			}
+		}
+		if strings.Contains(scrubbedLower, "checking your browser before accessing ") ||
+			strings.Contains(scrubbedLower, "please wait while we check your browser") ||
+			(strings.Contains(scrubbedLower, "making sure you're not a bot") && strings.Contains(scrubbedLower, "anubis")) {
+			return &WAFMatch{
+				Vendor:     "generic",
+				Category:   "challenge",
+				Confidence: 0.90,
+				Signals:    []string{"dom:js-pow-interstitial"},
+				Summary:    "JavaScript / proof-of-work anti-bot interstitial",
+			}
 		}
 	}
 

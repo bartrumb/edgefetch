@@ -308,11 +308,13 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	}
 	out.Reset()
 	errBuf.Reset()
-	if rc := runOneShotCLI(context.Background(), []string{"init", "--config=" + codexToml, "--exe=/usr/local/bin/edgefetch"}, &out, &errBuf, deps); rc != 0 {
+	if rc := runOneShotCLI(context.Background(), []string{"init", "--config=" + codexToml, `--exe=C:\Users\Dev\bin\edgefetch.exe`}, &out, &errBuf, deps); rc != 0 {
 		t.Fatalf("edgefetch init codex toml failed: rc=%d stderr=%s", rc, errBuf.String())
 	}
 	tomlBytes, _ := os.ReadFile(codexToml)
-	if !strings.Contains(string(tomlBytes), "[mcp_servers.edgefetch]") || !strings.Contains(string(tomlBytes), `model = "gpt-5"`) {
+	if !strings.Contains(string(tomlBytes), "[mcp_servers.edgefetch]") ||
+		!strings.Contains(string(tomlBytes), `model = "gpt-5"`) ||
+		!strings.Contains(string(tomlBytes), `command = "C:\\Users\\Dev\\bin\\edgefetch.exe"`) {
 		t.Fatalf("unexpected codex config.toml output: %s", string(tomlBytes))
 	}
 

@@ -7,6 +7,7 @@ import {
   startOrExecuteAgentCall,
 } from '../src/agent-runner';
 import { handleCompatRoutes } from '../src/compat';
+import { resolveSiteExtractorTwin } from '../src/extractors/registry';
 import {
   completeLlmTurn,
   redactLlmConfigForLog,
@@ -16,6 +17,7 @@ import {
 import { previewCrawlParams, startOrExecuteBatchScrape } from '../src/map-crawl';
 import { createSqliteOAuthStore, OAUTH_SQLITE_SCHEMA } from '../src/oauth';
 import { executeScrapeCall } from '../src/scrape';
+import { classifyWafAndChallenge } from '../src/waf';
 
 function createMockOAuthStore() {
   return {
@@ -506,4 +508,137 @@ test('ADVANCED-SCRAPE-1: checkPromptInjection (403), product, summary, attribute
   const v2Json = (await v2Res.json()) as { success: boolean; data: { product: { sku: string } } };
   assert.equal(v2Json.success, true);
   assert.equal(v2Json.data.product.sku, 'EW-99');
+});
+
+test('QA-LIVE-HARDENING-1: Rendered subresource image/png guard, empty SPA <!doctype> prevention, twin summary/json enrichment, JS PoW WAF guard & live API twins', async () => {
+  // 1. Rendered DOM HTML with bogus subresource `contentType: "image/png"` succeeds (`200 OK` Markdown) instead of 422 binary skip!
+  const mockHubFetch = async (_target: string, body: string) => {
+    const parsed = JSON.parse(body) as { requests: Array<{ url: string; kind: string }> };
+    const u = parsed.requests[0]?.url ?? '';
+    if (u.includes('registry.npmjs.org/esbuild')) {
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'twin-npm',
+              url: u,
+              outcome: 'ok',
+              status: 200,
+              contentType: 'application/json',
+              body: JSON.stringify({
+                name: 'esbuild',
+                description: 'An extremely fast JavaScript bundler and minifier.',
+                'dist-tags': { latest: '0.28.2' },
+                license: 'MIT',
+                readme: '# esbuild\n\nFast bundler written for modern web builds.',
+              }),
+            },
+          ],
+        }),
+      };
+    }
+    if (u.includes('/empty-spa-shell')) {
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: u,
+              finalUrl: u,
+              outcome: 'ok',
+              status: 200,
+              contentType: 'text/html; charset=utf-8',
+              body: '<!doctype html><html lang="en"><head><meta charset="utf-8"></head><body><div id="app"></div><script src="/bundle.js"></script></body></html>',
+            },
+          ],
+        }),
+      };
+    }
+    return {
+      status: 200,
+      via: 'agent:site-arm64',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: u,
+            finalUrl: u,
+            outcome: 'ok',
+            status: 200,
+            rendered: true,
+            contentType: 'image/png',
+            body: '<!doctype html><html><body><main><h1>Cloudflare Agents SDK</h1><p>Build stateful AI agents on Durable Objects.</p></main></body></html>',
+          },
+        ],
+      }),
+    };
+  };
+
+  const renderedOut = await executeScrapeCall({
+    payload: { url: 'https://developers.cloudflare.com/agents/', renderMode: 'always', formats: ['markdown'] },
+    env: {},
+    executeHubFetch: mockHubFetch,
+    selfHost: 'hub.example.com',
+  });
+  assert.equal(renderedOut.status, 200);
+  assert.match(String(renderedOut.body.markdown), /Cloudflare Agents SDK/);
+
+  // 2. Empty HTML SPA shell NEVER leaks raw `<!doctype html>` into `markdown`!
+  const emptySpaOut = await executeScrapeCall({
+    payload: { url: 'https://spa.example.com/empty-spa-shell', renderMode: 'off', formats: ['markdown'] },
+    env: {},
+    executeHubFetch: mockHubFetch,
+    selfHost: 'hub.example.com',
+  });
+  assert.equal(emptySpaOut.status, 200);
+  assert.doesNotMatch(String(emptySpaOut.body.markdown ?? ''), /<!doctype html/i);
+
+  // 3. Pre-fetch `registryTwin` (`npmjs.com/package/esbuild`) enriches `summary`, `json`, and `rawBase64`!
+  const twinAdvOut = await executeScrapeCall({
+    payload: {
+      url: 'https://www.npmjs.com/package/esbuild',
+      formats: [
+        'markdown',
+        'summary',
+        'rawBase64',
+        { type: 'json', schema: { type: 'object', properties: { title: { type: 'string' } } } },
+      ],
+    },
+    env: {},
+    executeHubFetch: mockHubFetch,
+    selfHost: 'hub.example.com',
+  });
+  assert.equal(twinAdvOut.status, 200);
+  assert.ok(typeof twinAdvOut.body.summary === 'string' && twinAdvOut.body.summary.length > 10);
+  assert.ok(typeof twinAdvOut.body.rawBase64 === 'string' && twinAdvOut.body.rawBase64.length > 10);
+  assert.ok(twinAdvOut.body.json && typeof (twinAdvOut.body.json as { title?: string }).title === 'string');
+
+  // 4. Verify live-hardened API twins (`StackExchange`, `PubChem /rest/pug_view`, `PubMed EuropePMC`, `RemoteOK /api`)
+  const seTwin = resolveSiteExtractorTwin('https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster');
+  assert.ok(seTwin?.fetchUrl.startsWith('https://api.stackexchange.com/2.3/questions/11227809'));
+  const pcTwin = resolveSiteExtractorTwin('https://pubchem.ncbi.nlm.nih.gov/compound/2244');
+  assert.ok(pcTwin?.fetchUrl.includes('/rest/pug_view/data/compound/2244/JSON/'));
+  const pmTwin = resolveSiteExtractorTwin('https://pubmed.ncbi.nlm.nih.gov/31452104/');
+  assert.ok(pmTwin?.fetchUrl.includes('ebi.ac.uk/europepmc/webservices/rest/search'));
+  const rokTwin = resolveSiteExtractorTwin('https://remoteok.com/remote-dev-jobs');
+  assert.equal(rokTwin?.fetchUrl, 'https://remoteok.com/api');
+
+  // 5. Verify JS / PoW interstitial WAF classification + `<pre><code>` immunity!
+  const ncbiGate = classifyWafAndChallenge({
+    status: 200,
+    headers: new Headers({ 'content-type': 'text/html' }),
+    rawBody: '<html><head><title>NCBI</title></head><body><p>Checking your browser before accessing pubchem.ncbi.nlm.nih.gov...</p></body></html>',
+  });
+  assert.equal(ncbiGate?.category, 'challenge');
+
+  const docDiscussingGate = classifyWafAndChallenge({
+    status: 200,
+    headers: new Headers({ 'content-type': 'text/html' }),
+    rawBody: '<html><body><main><h1>Bot Docs</h1><code>Checking your browser before accessing example.gov</code></main></body></html>',
+  });
+  assert.equal(docDiscussingGate, null);
 });

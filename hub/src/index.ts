@@ -141,7 +141,7 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv {
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const DEFAULT_UA = 'EdgeFetch/2.4 (+https://github.com/bartrumb/edgefetch)';
+const DEFAULT_UA = 'EdgeFetch/2.5 (bot@edgefetch.dev)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;
@@ -982,7 +982,7 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.0');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.1');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1059,7 +1059,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.5.0',
+          serverVersion: '2.5.1',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1296,7 +1296,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.5.0'), {
+        return Response.json(buildCapabilities(env, '2.5.1'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -1849,7 +1849,17 @@ export default {
         const rec = await loadAgentRun(agentId, env.META);
         if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
         return Response.json(
-          { ok: true, id: rec.id, threadId: rec.threadId, status: rec.status, spans: rec.trace },
+          {
+            ok: true,
+            success: true,
+            id: rec.id,
+            threadId: rec.threadId,
+            status: rec.status,
+            count: rec.trace.length,
+            spans: rec.trace,
+            trace: rec.trace,
+            events: rec.trace,
+          },
           { status: 200, headers: { 'cache-control': 'no-store' } },
         );
       }

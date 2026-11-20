@@ -1,5 +1,3 @@
-// Package crawl implements a bounded-concurrency, polite HTTP/2 fetcher with net/http/httptrace phase telemetry,
-// positive dwell jitter, conditional GETs (ETag / If-Modified-Since), and strict memory/SSRF guardrails.
 package crawl
 
 import (
@@ -27,6 +25,7 @@ import (
 	"github.com/bartrumb/edgefetch/internal/browser"
 	"github.com/bartrumb/edgefetch/internal/classify"
 	"github.com/bartrumb/edgefetch/internal/extract"
+	"github.com/bartrumb/edgefetch/internal/otel"
 	"github.com/bartrumb/edgefetch/internal/politeness"
 )
 
@@ -268,6 +267,7 @@ type Crawler struct {
 	hosts             *politeness.Registry
 	llms              *llmsCache
 	renderer          *browser.Renderer
+	otelExp           *otel.Exporter
 	robotsBypassHosts []string
 	globalMu          sync.Mutex
 	globalNext        time.Time
@@ -333,9 +333,22 @@ func (c *Crawler) SetRenderer(r *browser.Renderer) {
 	c.renderer = r
 }
 
-// Close shuts down any running headless Chromium subprocess and loopback SSRF proxy.
+// SetOtelExporter attaches an optional non-blocking OpenTelemetry OTLP/HTTP span exporter.
+func (c *Crawler) SetOtelExporter(exp *otel.Exporter) {
+	c.otelExp = exp
+}
+
+// Close shuts down any running headless Chromium subprocess, loopback SSRF proxy, and OTLP exporter.
 func (c *Crawler) Close() error {
-	if c == nil || c.renderer == nil {
+	if c == nil {
+		return nil
+	}
+	if c.otelExp != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		c.otelExp.Shutdown(ctx)
+		cancel()
+	}
+	if c.renderer == nil {
 		return nil
 	}
 	return c.renderer.Close()

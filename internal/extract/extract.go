@@ -1,5 +1,3 @@
-// Package extract converts raw HTML and PDF payloads into clean Markdown, plain text, links, images, branding
-// metadata, query-reranked passages, and `llms.txt` structured context using only the Go standard library.
 package extract
 
 import (
@@ -58,6 +56,7 @@ type ExtractOptions struct {
 var (
 	reHTMLComment = regexp.MustCompile(`(?is)<!--.*?-->`)
 	reDropBlocks  = []*regexp.Regexp{
+		regexp.MustCompile(`(?is)<head\b[^>]*>.*?</head>`),
 		regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script>`),
 		regexp.MustCompile(`(?is)<style\b[^>]*>.*?</style>`),
 		regexp.MustCompile(`(?is)<noscript\b[^>]*>.*?</noscript>`),
@@ -82,7 +81,8 @@ var (
 
 	reAnchor    = regexp.MustCompile(`(?is)<a\b([^>]*)>(.*?)</a>`)
 	reImgTag    = regexp.MustCompile(`(?is)<img\b([^>]*)>`)
-	rePreCode   = regexp.MustCompile(`(?is)<pre\b[^>]*>\s*(?:<code\b[^>]*>)?(.*?)(?:</code>)?\s*</pre>`)
+	rePreCode   = regexp.MustCompile(`(?is)<pre\b([^>]*)>\s*(?:<code\b([^>]*)>)?(.*?)(?:</code>)?\s*</pre>`)
+	reCodeLang  = regexp.MustCompile(`(?i)\b(?:language|lang)-([a-z0-9_+#-]+)\b`)
 	reInlineCd  = regexp.MustCompile(`(?is)<code\b[^>]*>(.*?)</code>`)
 	reHeading   = regexp.MustCompile(`(?is)<h([1-6])\b[^>]*>(.*?)</h[1-6]>`)
 	reStrong    = regexp.MustCompile(`(?is)<strong\b[^>]*>(.*?)</strong>|<b\b[^>]*>(.*?)</b>`)
@@ -238,7 +238,8 @@ func PlainText(rawHTML string) string {
 func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 	s := fragment
 
-	// 1. Convert fenced <pre><code> blocks first so inner tags/newlines stay intact.
+	// 1. Convert fenced <pre><code> and inline <code> blocks first so inner generics (`Promise<void>`, `#include <stdio.h>`)
+	// and newlines are never stripped as HTML tags during subsequent passes.
 	type placeholder struct {
 		token string
 		value string
@@ -246,14 +247,36 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 	var stash []placeholder
 	s = rePreCode.ReplaceAllStringFunc(s, func(match string) string {
 		sub := rePreCode.FindStringSubmatch(match)
+		lang := ""
 		inner := ""
-		if len(sub) >= 2 {
-			inner = sub[1]
+		if len(sub) >= 4 {
+			if lm := reCodeLang.FindStringSubmatch(sub[2] + " " + sub[1]); len(lm) == 2 {
+				lang = strings.ToLower(lm[1])
+			}
+			inner = sub[3]
 		}
 		inner = reAnyTag.ReplaceAllString(inner, "")
 		inner = strings.Trim(html.UnescapeString(inner), "\r\n")
+		fence := "```"
+		for strings.Contains(inner, fence) {
+			fence += "`"
+		}
 		tok := "\x00CODEBLOCK_" + itoa(len(stash)) + "\x00"
-		stash = append(stash, placeholder{token: tok, value: "\n\n```\n" + inner + "\n```\n\n"})
+		stash = append(stash, placeholder{token: tok, value: "\n\n" + fence + lang + "\n" + inner + "\n" + fence + "\n\n"})
+		return tok
+	})
+
+	s = reInlineCd.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reInlineCd.FindStringSubmatch(m)
+		if len(sub) < 2 {
+			return ""
+		}
+		txt := cleanInline(sub[1])
+		if txt == "" {
+			return ""
+		}
+		tok := "\x00INLINECODE_" + itoa(len(stash)) + "\x00"
+		stash = append(stash, placeholder{token: tok, value: formatInlineCodeSpan(txt)})
 		return tok
 	})
 
@@ -309,18 +332,7 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 		return tok
 	})
 
-	// 3. Inline code, images, links, headings, emphasis, lists, blockquotes.
-	s = reInlineCd.ReplaceAllStringFunc(s, func(m string) string {
-		sub := reInlineCd.FindStringSubmatch(m)
-		if len(sub) < 2 {
-			return ""
-		}
-		txt := cleanInline(sub[1])
-		if txt == "" {
-			return ""
-		}
-		return "`" + txt + "`"
-	})
+	// 3. Images, links, headings, emphasis, lists, blockquotes.
 
 	s = reImgTag.ReplaceAllStringFunc(s, func(m string) string {
 		attrs := parseAttrs(m)
@@ -435,18 +447,38 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 		lines[i] = line
 	}
 	s = strings.Join(lines, "\n")
-	for _, p := range stash {
-		s = strings.ReplaceAll(s, p.token, p.value)
+	for i := len(stash) - 1; i >= 0; i-- {
+		s = strings.ReplaceAll(s, stash[i].token, stash[i].value)
 	}
 	s = reMultiLine.ReplaceAllString(s, "\n\n")
 	return strings.TrimSpace(s)
+}
+
+func formatInlineCodeSpan(txt string) string {
+	maxRun := 0
+	cur := 0
+	for i := 0; i < len(txt); i++ {
+		if txt[i] == '`' {
+			cur++
+			if cur > maxRun {
+				maxRun = cur
+			}
+		} else {
+			cur = 0
+		}
+	}
+	delim := strings.Repeat("`", maxRun+1)
+	if strings.HasPrefix(txt, "`") || strings.HasSuffix(txt, "`") {
+		return delim + " " + txt + " " + delim
+	}
+	return delim + txt + delim
 }
 
 func markdownToPlainText(md string) string {
 	var out []string
 	for _, line := range strings.Split(md, "\n") {
 		l := strings.TrimSpace(line)
-		if l == "" || l == "```" || l == "---" {
+		if l == "" || strings.HasPrefix(l, "```") || l == "---" {
 			continue
 		}
 		l = strings.TrimLeft(l, "#>- ")

@@ -1,5 +1,3 @@
-// Package classify categorizes HTTP responses into deterministic crawl outcomes (ok, challenge, stop, gone,
-// skip, error, not_tried) before upstream parsers inspect response bodies.
 package classify
 
 import (

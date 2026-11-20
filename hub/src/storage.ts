@@ -25,6 +25,13 @@ export interface OptionalStorageBindings {
   INGEST?: {
     create(options?: { id?: string; params?: IngestWorkflowParams }): Promise<{ id: string }>;
   };
+  /** Optional Service Binding (`PdfOcrService` for optional external worker) for PyMuPDF + Tesseract 5.5.0 PDF OCR. */
+  PDF_OCR?: {
+    fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+  };
+  /** Optional HTTP URL + token fallback for PDF OCR when running outside Service Bindings. */
+  PDF_OCR_URL?: string;
+  PDF_OCR_TOKEN?: string;
 }
 
 export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
@@ -132,6 +139,7 @@ export interface HubCapabilities {
     ingestWorkflow: boolean;
     search: boolean;
     webSearch: boolean;
+    pdfOcr: boolean;
   };
   searchProviders: string[];
 }
@@ -171,6 +179,7 @@ export function buildCapabilities(
       ingestWorkflow: Boolean(env.INGEST),
       search: Boolean(env.SEARCH || hasWebProvider),
       webSearch: hasWebProvider,
+      pdfOcr: Boolean(env.PDF_OCR || (env.PDF_OCR_URL?.trim() && env.PDF_OCR_TOKEN?.trim())),
     },
     searchProviders,
   };
@@ -188,19 +197,34 @@ export interface AuthorizeArtifactUploadCallback {
   }): Promise<{ ok: true } | { ok: false; status: number; error: string }>;
 }
 
+const MAX_RECENT_UPLOAD_CACHE = 1_024;
+const recentArtifactUploads = new Map<string, number>();
+
+function rememberUploadedArtifact(key: string, uploadedAtMs: number): void {
+  recentArtifactUploads.delete(key);
+  recentArtifactUploads.set(key, uploadedAtMs);
+  while (recentArtifactUploads.size > MAX_RECENT_UPLOAD_CACHE) {
+    const oldest = recentArtifactUploads.keys().next().value;
+    if (oldest === undefined) break;
+    recentArtifactUploads.delete(oldest);
+  }
+}
+
 /**
  * Handles `PUT /agent/artifacts/<blobSha256>` streaming agent-compressed gzip artifacts directly into R2 with
- * atomic `sha256` + `If-None-Match: *` create-once verification and half-retention deduplication refresh.
+ * atomic `sha256` verification and half-retention deduplication refresh (avoiding 404 `r2_head` OTEL error spans
+ * on brand-new uploads when `metaDb` is bound).
  */
 export async function handleAgentArtifactUpload(params: {
   request: Request;
   blobSha256: string;
   siteId: string;
   bucket?: R2Bucket;
+  metaDb?: D1Database;
   authorizeJobUpload: AuthorizeArtifactUploadCallback;
   now?: number;
 }): Promise<Response> {
-  const { request, blobSha256, siteId, bucket, authorizeJobUpload, now = Date.now() } = params;
+  const { request, blobSha256, siteId, bucket, metaDb, authorizeJobUpload, now = Date.now() } = params;
   if (!bucket) {
     await request.body?.cancel().catch(() => undefined);
     return Response.json({ error: 'artifacts_not_configured' }, { status: 503 });
@@ -275,16 +299,45 @@ export async function handleAgentArtifactUpload(params: {
   }
 
   const key = r2ArtifactKey(rawRetention, blobSha256);
-  const existing = await bucket.head(key);
-  if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
+  const cachedUploadAt = recentArtifactUploads.get(key);
+  if (cachedUploadAt !== undefined && !shouldRefreshDedupedObject(cachedUploadAt, rawRetention, now)) {
     await request.body.cancel().catch(() => undefined);
     return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
+  }
+
+  let existing: R2Object | null = null;
+  let knownNewInMeta = false;
+  if (metaDb) {
+    const metaRow = await metaDb
+      .prepare('SELECT last_seen_at FROM artifacts WHERE blob_sha256 = ? AND retention = ? LIMIT 1')
+      .bind(blobSha256, rawRetention)
+      .first<{ last_seen_at: number | null }>()
+      .catch(() => null);
+    if (metaRow?.last_seen_at && !shouldRefreshDedupedObject(metaRow.last_seen_at, rawRetention, now)) {
+      existing = await bucket.head(key);
+      if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
+        rememberUploadedArtifact(key, existing.uploaded.getTime());
+        await request.body.cancel().catch(() => undefined);
+        return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
+      }
+    } else {
+      // Brand-new or due-for-refresh content-addressed upload: skip `bucket.head(key)` so Cloudflare OTEL never
+      // emits `r2_head ERROR: The specified key does not exist.` on every new page crawl.
+      knownNewInMeta = true;
+    }
+  } else {
+    existing = await bucket.head(key);
+    if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
+      rememberUploadedArtifact(key, existing.uploaded.getTime());
+      await request.body.cancel().catch(() => undefined);
+      return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
+    }
   }
 
   try {
     const putOpts: R2PutOptions = {
       sha256: blobSha256,
-      ...(existing ? {} : { onlyIf: new Headers({ 'if-none-match': '*' }) }),
+      ...(existing || knownNewInMeta ? {} : { onlyIf: new Headers({ 'if-none-match': '*' }) }),
       httpMetadata: { contentType: 'application/gzip' },
       customMetadata: {
         contentSha256,
@@ -293,15 +346,21 @@ export async function handleAgentArtifactUpload(params: {
       },
     };
     const stored = await bucket.put(key, request.body, putOpts);
+    if (stored !== null) {
+      rememberUploadedArtifact(key, now);
+    }
     return Response.json({ ok: true, stored: stored !== null, deduplicated: stored === null, key }, { status: 200 });
   } catch (e) {
-    // On a concurrent same-key write collision, check head() to see if another writer succeeded; otherwise let agent retry.
-    const afterErr = await bucket.head(key).catch(() => null);
-    if (afterErr) {
-      return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
-    }
     const msg = e instanceof Error ? e.message : String(e);
     const isBadDigest = /sha-?256|checksum|digest/i.test(msg);
+    if (!isBadDigest) {
+      // On a concurrent same-key write collision, check head() to see if another writer succeeded; otherwise let agent retry.
+      const afterErr = await bucket.head(key).catch(() => null);
+      if (afterErr) {
+        rememberUploadedArtifact(key, afterErr.uploaded.getTime());
+        return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
+      }
+    }
     return Response.json(
       { error: isBadDigest ? 'blob_sha256_mismatch' : 'r2_upload_failed', message: msg.slice(0, 180) },
       { status: isBadDigest ? 400 : 409 },
@@ -396,6 +455,19 @@ export async function readVerifiedArtifactFromR2(params: {
 }
 
 /**
+ * Whether a finished fetch goes to the ingest pipeline. `off` is the caller saying this response is throwaway, so it
+ * writes no manifest and starts no Workflow.
+ */
+export function shouldIngestFetchReply(params: {
+  status: number;
+  retention: ArtifactRetention | 'off' | undefined;
+  hasArtifacts: boolean;
+  hasMeta: boolean;
+}): boolean {
+  return params.status === 200 && params.hasArtifacts && params.hasMeta && params.retention !== 'off';
+}
+
+/**
  * Hydrates inline `body` + `bodyEncoding` fields on a `FetchReply` JSON string from R2 up to `budgetBytes` (default
  * 18 MiB so total serialized JSON stays under the 20 MiB caller contract). Beyond the budget, sets `bodyOmitted: true`
  * while keeping `artifact` so callers can page remaining bodies via `GET /v1/artifacts/<blobSha256>`.
@@ -468,6 +540,7 @@ export interface ArtifactPageSlice {
   blobSha256: string;
   contentSha256: string;
   retention: ArtifactRetention;
+  format?: 'raw' | 'markdown';
   totalChars: number;
   totalBytes: number;
   offset: number;
@@ -478,30 +551,185 @@ export interface ArtifactPageSlice {
   content: string;
 }
 
+const MAX_KNOWN_PIPELINE_VERSION = 25;
+
 export async function readArtifactPage(params: {
   bucket: R2Bucket;
   metaDb?: D1Database;
   blobSha256: string;
   retention?: ArtifactRetention;
+  format?: 'raw' | 'markdown';
+  pipelineVersion?: number;
   offset?: number;
   limit?: number;
+  deriveMarkdownFromRaw?: (bytes: Uint8Array) => string | null;
 }): Promise<{ ok: true; page: ArtifactPageSlice } | { ok: false; status: number; error: string; message?: string }> {
+  const rawId = params.blobSha256.trim().toLowerCase();
+  const isMdPrefixed = rawId.startsWith('md:');
+  const cleanHex = isMdPrefixed ? rawId.slice(3) : rawId;
+  if (!isValidSha256Hex(cleanHex)) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'invalid_artifact_id',
+      message: 'artifactId must be a 64-character lowercase hex SHA-256 (or md:<sha256> for derived Markdown).',
+    };
+  }
+
+  const sliceMarkdownPage = (mdText: string, contentSha: string, retention: ArtifactRetention = 'stored'): { ok: true; page: ArtifactPageSlice } => {
+    const byteLen = new TextEncoder().encode(mdText).byteLength;
+    const totalChars = mdText.length;
+    const safeOffset = Math.min(totalChars, Math.max(0, Math.floor(params.offset ?? 0)));
+    const safeLimit = Math.min(
+      MAX_ARTIFACT_PAGE_LIMIT,
+      Math.max(1, Math.floor(params.limit ?? DEFAULT_ARTIFACT_PAGE_LIMIT)),
+    );
+    const end = Math.min(totalChars, safeOffset + safeLimit);
+    const slice = mdText.slice(safeOffset, end);
+    const hasMore = end < totalChars;
+    return {
+      ok: true,
+      page: {
+        blobSha256: rawId,
+        contentSha256: contentSha,
+        retention,
+        format: 'markdown',
+        totalChars,
+        totalBytes: byteLen,
+        offset: safeOffset,
+        limit: safeLimit,
+        nextOffset: hasMore ? end : null,
+        hasMore,
+        bodyEncoding: 'utf-8',
+        content: slice,
+      },
+    };
+  };
+
+  const wantsMarkdown = isMdPrefixed || params.format === 'markdown';
+  if (wantsMarkdown) {
+    const topVer = params.pipelineVersion ?? 11;
+    const candidateShas: string[] = [];
+    if (isMdPrefixed) candidateShas.push(cleanHex);
+    if (params.metaDb) {
+      const row = await params.metaDb
+        .prepare('SELECT content_sha256 FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
+        .bind(cleanHex)
+        .first<{ content_sha256: string }>()
+        .catch(() => null);
+      if (row?.content_sha256 && isValidSha256Hex(row.content_sha256) && !candidateShas.includes(row.content_sha256)) {
+        candidateShas.push(row.content_sha256);
+      }
+    }
+
+    let rawLoadedCache: ReadArtifactResult | undefined;
+    const loadRawOnce = async (): Promise<ReadArtifactResult> => {
+      if (rawLoadedCache) return rawLoadedCache;
+      rawLoadedCache = await readVerifiedArtifactFromR2({
+        bucket: params.bucket,
+        blobSha256: cleanHex,
+        preferredRetention: params.retention,
+      });
+      return rawLoadedCache;
+    };
+
+    if (candidateShas.length === 0) {
+      const rawLoaded = await loadRawOnce();
+      if (rawLoaded.ok) {
+        candidateShas.push(rawLoaded.contentSha256);
+      }
+    }
+
+    const versionsToTry = params.metaDb
+      ? [...new Set([topVer, Math.max(1, topVer - 1)])]
+      : [
+          topVer,
+          ...Array.from({ length: MAX_KNOWN_PIPELINE_VERSION }, (_, idx) => MAX_KNOWN_PIPELINE_VERSION - idx).filter(
+            (v) => v !== topVer,
+          ),
+        ];
+
+    const checkCachedMarkdownForSha = async (sha: string): Promise<string | null> => {
+      if (params.metaDb) {
+        const docRow = await params.metaDb
+          .prepare(
+            `SELECT r2_key FROM documents WHERE content_sha256 = ? AND format = 'markdown' ORDER BY pipeline_version DESC LIMIT 1`,
+          )
+          .bind(sha)
+          .first<{ r2_key: string }>()
+          .catch(() => null);
+        if (docRow?.r2_key) {
+          const obj = await params.bucket.get(docRow.r2_key);
+          if (obj) return await obj.text();
+        }
+      }
+      for (const ver of versionsToTry) {
+        const mdObj = await params.bucket.get(r2DerivedKey(ver, 'markdown', sha));
+        if (mdObj) return await mdObj.text();
+      }
+      return null;
+    };
+
+    for (const sha of candidateShas) {
+      const foundMd = await checkCachedMarkdownForSha(sha);
+      if (foundMd !== null) {
+        return sliceMarkdownPage(foundMd, sha, 'stored');
+      }
+    }
+
+    // If caller passed `md:<blobSha256>` (the scrape `artifactId`) or `format="markdown"` on a non-truncated scrape
+    // whose derived Markdown wasn't materialized yet, load the raw R2 artifact and derive clean Markdown on demand.
+    const rawFallback = await loadRawOnce();
+    if (rawFallback.ok) {
+      if (!candidateShas.includes(rawFallback.contentSha256)) {
+        const foundByRawContentSha = await checkCachedMarkdownForSha(rawFallback.contentSha256);
+        if (foundByRawContentSha !== null) {
+          return sliceMarkdownPage(foundByRawContentSha, rawFallback.contentSha256, rawFallback.retention);
+        }
+      }
+      if (params.deriveMarkdownFromRaw) {
+        const derivedMd = params.deriveMarkdownFromRaw(rawFallback.bytes);
+        if (derivedMd !== null) {
+          await params.bucket
+            .put(r2DerivedKey(topVer, 'markdown', rawFallback.contentSha256), derivedMd, {
+              httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+            })
+            .catch(() => undefined);
+          return sliceMarkdownPage(derivedMd, rawFallback.contentSha256, rawFallback.retention);
+        }
+      }
+    }
+
+    if (isMdPrefixed) {
+      return {
+        ok: false,
+        status: 404,
+        error: 'artifact_expired',
+        message: 'Derived Markdown artifact not found or expired in R2; re-scrape the URL to regenerate it.',
+      };
+    }
+  }
+
   let expectedContentSha256: string | undefined;
-  if (params.metaDb && isValidSha256Hex(params.blobSha256)) {
+  let dbRetention: ArtifactRetention | undefined;
+  if (params.metaDb) {
     const row = await params.metaDb
-      .prepare('SELECT content_sha256 FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
-      .bind(params.blobSha256)
-      .first<{ content_sha256: string }>()
+      .prepare('SELECT content_sha256, retention FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
+      .bind(cleanHex)
+      .first<{ content_sha256: string; retention?: string }>()
       .catch(() => null);
     if (row?.content_sha256 && isValidSha256Hex(row.content_sha256)) {
       expectedContentSha256 = row.content_sha256;
+    }
+    if (isValidRetention(row?.retention)) {
+      dbRetention = row.retention;
     }
   }
 
   const loaded = await readVerifiedArtifactFromR2({
     bucket: params.bucket,
-    blobSha256: params.blobSha256,
-    preferredRetention: params.retention,
+    blobSha256: cleanHex,
+    preferredRetention: params.retention ?? dbRetention,
     ...(expectedContentSha256 ? { expectedContentSha256 } : {}),
   });
   if (!loaded.ok) {
@@ -534,9 +762,10 @@ export async function readArtifactPage(params: {
   return {
     ok: true,
     page: {
-      blobSha256: params.blobSha256,
+      blobSha256: cleanHex,
       contentSha256: loaded.contentSha256,
       retention: loaded.retention,
+      format: 'raw',
       totalChars,
       totalBytes: loaded.bytes.byteLength,
       offset: safeOffset,
@@ -560,17 +789,22 @@ export async function handleArtifactGetRequest(params: {
   blobSha256: string;
   bucket?: R2Bucket;
   metaDb?: D1Database;
+  pipelineVersion?: number;
+  deriveMarkdownFromRaw?: (bytes: Uint8Array) => string | null;
 }): Promise<Response> {
-  const { request, url, blobSha256, bucket, metaDb } = params;
+  const { request, url, blobSha256, bucket, metaDb, pipelineVersion, deriveMarkdownFromRaw } = params;
   if (!bucket) {
     return Response.json({ error: 'artifacts_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
   }
-  if (!isValidSha256Hex(blobSha256)) {
+  const cleanParamId = blobSha256.startsWith('md:') ? blobSha256.slice(3) : blobSha256;
+  if (!isValidSha256Hex(cleanParamId)) {
     return Response.json({ error: 'invalid_blob_sha256' }, { status: 400, headers: { 'cache-control': 'no-store' } });
   }
 
   const rawRet = url.searchParams.get('retention');
   const retention: ArtifactRetention | undefined = rawRet === 'stored' ? 'stored' : rawRet === 'transient' ? 'transient' : undefined;
+  const contentFormat: 'raw' | 'markdown' | undefined =
+    url.searchParams.get('content') === 'markdown' || url.searchParams.get('format') === 'markdown' ? 'markdown' : undefined;
   const offset = url.searchParams.has('offset') ? Number(url.searchParams.get('offset')) : 0;
   const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : DEFAULT_ARTIFACT_PAGE_LIMIT;
 
@@ -579,6 +813,9 @@ export async function handleArtifactGetRequest(params: {
     ...(metaDb ? { metaDb } : {}),
     blobSha256,
     ...(retention ? { retention } : {}),
+    ...(contentFormat ? { format: contentFormat } : {}),
+    ...(pipelineVersion !== undefined ? { pipelineVersion } : {}),
+    ...(deriveMarkdownFromRaw ? { deriveMarkdownFromRaw } : {}),
     offset: Number.isFinite(offset) ? offset : 0,
     limit: Number.isFinite(limit) ? limit : DEFAULT_ARTIFACT_PAGE_LIMIT,
   });

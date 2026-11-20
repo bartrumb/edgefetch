@@ -65,8 +65,18 @@ export interface McpClientActivity {
   lastSeenAt: number;
 }
 
+export interface McpTurnRecordInput {
+  principal: string;
+  authType: 'oauth' | 'bearer_token';
+  userAgent: string;
+  method: string;
+  now?: number;
+  event?: HubEventInput;
+}
+
 export interface ActivityStore {
   recordEvent(input: HubEventInput): Promise<void> | void;
+  recordEvents?(inputs: HubEventInput[]): Promise<void> | void;
   listEvents(limit?: number): Promise<HubEventRecord[]> | HubEventRecord[];
   clearEvents(): Promise<void> | void;
   recordMcpCall(params: {
@@ -76,6 +86,7 @@ export interface ActivityStore {
     method: string;
     now?: number;
   }): Promise<void> | void;
+  recordMcpTurn?(params: McpTurnRecordInput): Promise<void> | void;
   listMcpClients(): Promise<McpClientActivity[]> | McpClientActivity[];
 }
 
@@ -108,7 +119,7 @@ export function createMemoryActivityStore(): ActivityStore {
   const events: HubEventRecord[] = [];
   const mcpMap = new Map<string, McpClientActivity>();
 
-  return {
+  const store: ActivityStore = {
     recordEvent(input) {
       events.unshift({
         id: ++seq,
@@ -140,6 +151,11 @@ export function createMemoryActivityStore(): ActivityStore {
         i++;
       }
     },
+    recordEvents(inputs) {
+      for (const ev of inputs) {
+        store.recordEvent(ev);
+      }
+    },
     listEvents(limit = 120) {
       return events.slice(0, Math.min(MAX_RING_EVENTS, Math.max(1, limit)));
     },
@@ -157,14 +173,50 @@ export function createMemoryActivityStore(): ActivityStore {
         lastSeenAt: now,
       });
     },
+    recordMcpTurn(params) {
+      store.recordMcpCall(params);
+      if (params.event) {
+        store.recordEvent(params.event);
+      }
+    },
     listMcpClients() {
       return [...mcpMap.values()].sort((a, b) => b.lastSeenAt - a.lastSeenAt);
     },
   };
+  return store;
 }
 
 export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
-  return {
+  let infoInsertOps = 0;
+  let secInsertOps = 0;
+  const pruneIfCrossed = (addedInfo: number, addedSec: number) => {
+    if (addedSec > 0) {
+      const prevSec = secInsertOps;
+      secInsertOps += addedSec;
+      if (Math.floor(prevSec / 16) !== Math.floor(secInsertOps / 16)) {
+        sql.exec(
+          `DELETE FROM hub_events
+           WHERE level IN ('warn', 'error')
+             AND id NOT IN (SELECT id FROM hub_events WHERE level IN ('warn', 'error') ORDER BY id DESC LIMIT ?)`,
+          MAX_SECURITY_RING_EVENTS + 16,
+        );
+      }
+    }
+    if (addedInfo > 0) {
+      const prevInfo = infoInsertOps;
+      infoInsertOps += addedInfo;
+      if (Math.floor(prevInfo / 16) !== Math.floor(infoInsertOps / 16)) {
+        sql.exec(
+          `DELETE FROM hub_events
+           WHERE level = 'info'
+             AND id NOT IN (SELECT id FROM hub_events WHERE level = 'info' ORDER BY id DESC LIMIT ?)`,
+          MAX_INFO_RING_EVENTS + 16,
+        );
+      }
+    }
+  };
+
+  const store: ActivityStore = {
     recordEvent(input) {
       const ts = input.ts ?? Date.now();
       sql.exec(
@@ -177,21 +229,40 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
         input.summary.slice(0, 320),
         JSON.stringify(input.details ?? {}).slice(0, 4096),
       );
-      if (input.level === 'warn' || input.level === 'error') {
-        sql.exec(
-          `DELETE FROM hub_events
-           WHERE level IN ('warn', 'error')
-             AND id NOT IN (SELECT id FROM hub_events WHERE level IN ('warn', 'error') ORDER BY id DESC LIMIT ?)`,
-          MAX_SECURITY_RING_EVENTS,
-        );
-      } else {
-        sql.exec(
-          `DELETE FROM hub_events
-           WHERE level = 'info'
-             AND id NOT IN (SELECT id FROM hub_events WHERE level = 'info' ORDER BY id DESC LIMIT ?)`,
-          MAX_INFO_RING_EVENTS,
-        );
+      const isSec = input.level === 'warn' || input.level === 'error';
+      pruneIfCrossed(isSec ? 0 : 1, isSec ? 1 : 0);
+    },
+    recordEvents(inputs) {
+      if (inputs.length === 0) return;
+      if (inputs.length === 1) {
+        store.recordEvent(inputs[0]!);
+        return;
       }
+      const defaultNow = Date.now();
+      const batch = inputs.slice(0, 25);
+      const placeholders: string[] = [];
+      const bindArgs: Array<string | number> = [];
+      let addedInfo = 0;
+      let addedSec = 0;
+      for (const input of batch) {
+        placeholders.push('(?, ?, ?, ?, ?, ?)');
+        bindArgs.push(
+          input.ts ?? defaultNow,
+          input.level,
+          input.category,
+          input.event.slice(0, 64),
+          input.summary.slice(0, 320),
+          JSON.stringify(input.details ?? {}).slice(0, 4096),
+        );
+        if (input.level === 'warn' || input.level === 'error') addedSec++;
+        else addedInfo++;
+      }
+      sql.exec(
+        `INSERT INTO hub_events (ts, level, category, event, summary, details_json)
+         VALUES ${placeholders.join(', ')}`,
+        ...bindArgs,
+      );
+      pruneIfCrossed(addedInfo, addedSec);
     },
     listEvents(limit = 120) {
       const safeLimit = Math.min(MAX_RING_EVENTS, Math.max(1, Math.floor(limit)));
@@ -246,6 +317,12 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
         now,
       );
     },
+    recordMcpTurn(params) {
+      store.recordMcpCall(params);
+      if (params.event) {
+        store.recordEvent(params.event);
+      }
+    },
     listMcpClients() {
       return sql
         .exec<{
@@ -267,6 +344,7 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
         }));
     },
   };
+  return store;
 }
 
 interface CrawlReplyLogShape {

@@ -49,8 +49,17 @@ jobs:
           "$(go env GOPATH)/bin/staticcheck" ./...
           "$(go env GOPATH)/bin/govulncheck" ./...
 
-      - name: Run tests with ThreadSanitizer race detector (-race)
-        run: go test -v -race -count=1 ./...
+      - name: Run tests with ThreadSanitizer race detector (-race) & coverage
+        run: go test -v -race -count=1 -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -n 15
+
+      - name: Run native Go fuzzing smoke suite
+        run: |
+          go test -fuzz=FuzzRobotsParseAndMatch -fuzztime=2s ./internal/politeness
+          go test -fuzz=FuzzParseRetryAfter -fuzztime=2s ./internal/politeness
+          go test -fuzz=FuzzIsPublicIP -fuzztime=2s ./internal/politeness
+          go test -fuzz=FuzzClassify -fuzztime=2s ./internal/classify
+          go test -fuzz=FuzzExtractHTML -fuzztime=2s ./internal/extract
+          go test -fuzz=FuzzParseLlmsTxt -fuzztime=2s ./internal/extract
 
       - name: Run allocation microbenchmarks
         run: go test -bench=. -benchmem ./...
@@ -69,9 +78,13 @@ jobs:
           cache: 'npm'
           cache-dependency-path: hub/package-lock.json
       - run: npm ci --no-audit --no-fund
+      - run: npm run build:portable
       - run: npm test
       - run: npm run type-check
       - run: npm run deploy:dry
+      - name: Run Python SDK unit tests
+        working-directory: sdk/py
+        run: python3 test_edgefetch_client.py
 
   docker-multiarch:
     name: Verify Multi-Arch Distroless Builds (amd64 & arm64)
@@ -82,6 +95,8 @@ jobs:
       - name: Build server & HAOS add-on images + live AppArmor & WebGL Alpine Chromium smoke test
         run: |
           docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile .
+          docker buildx build --platform linux/amd64 -f Dockerfile.agent .
+          docker buildx build --platform linux/amd64 -f Dockerfile.all-in-one .
           docker buildx build --load --platform linux/amd64 -t edgefetch-ci:smoke -f edgefetch_fat/Dockerfile .
           sudo apparmor_parser -r edgefetch_fat/apparmor.txt
           docker run -d --rm --name ef-smoke -u 65532:65532 \

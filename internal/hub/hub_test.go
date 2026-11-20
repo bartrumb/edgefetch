@@ -1,0 +1,210 @@
+package hub
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/bartrumb/edgefetch/internal/agent"
+	"github.com/bartrumb/edgefetch/internal/crawl"
+)
+
+func TestGoHubAgentDispatchMultiControllerHAAndLocalFallback(t *testing.T) {
+	// 1. Mock HTTPS origin server
+	var hits atomic.Int32
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/llms.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><html><head><title>Self-Hosted Go Hub</title></head><body><main><h1>Self-Hosted Go Hub</h1><p>Dispatched over <code>/agent/ws</code> with zero cloud dependencies.</p></main></body></html>`))
+	}))
+	defer origin.Close()
+
+	originAddr := origin.Listener.Addr().String()
+	originTr := &http.Transport{
+		TLSClientConfig: origin.Client().Transport.(*http.Transport).TLSClientConfig,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
+		},
+	}
+	allowAllHTTPS := func(u *url.URL) error {
+		if u.Scheme != "https" {
+			return io.ErrUnexpectedEOF
+		}
+		return nil
+	}
+	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	fallbackCrawler := crawl.NewCrawler(originTr, allowAllHTTPS, crawl.DefaultUserAgent, silentLog)
+	fallbackCrawler.Sleep = func(context.Context, time.Duration) error { return nil }
+	defer fallbackCrawler.Close()
+
+	const callerTok = "caller-secret-token-0123456789ab"
+	const agentTok = "agent-shared-token-0123456789abc"
+
+	// 2. Spin up TWO independent Go Hub controllers (Primary + Standby) to prove EDGEFETCH_HUB_URLS Active-Active HA!
+	hubPrimary := NewServer(Config{
+		CallerToken:     callerTok,
+		AgentToken:      agentTok,
+		FallbackCrawler: fallbackCrawler,
+		Allow:           allowAllHTTPS,
+		Logger:          silentLog,
+	})
+	defer hubPrimary.Close()
+	srvPrimary := httptest.NewServer(hubPrimary)
+	defer srvPrimary.Close()
+
+	hubStandby := NewServer(Config{
+		CallerToken:     callerTok,
+		AgentToken:      agentTok,
+		FallbackCrawler: fallbackCrawler,
+		Allow:           allowAllHTTPS,
+		Logger:          silentLog,
+	})
+	defer hubStandby.Close()
+	srvStandby := httptest.NewServer(hubStandby)
+	defer srvStandby.Close()
+
+	// 3. Before any agent connects, Primary Go Hub automatically falls back to its local in-process Crawler (`via: "local-hub"`)!
+	reqFallback, _ := http.NewRequest(http.MethodPost, srvPrimary.URL+"/v1/scrape", strings.NewReader(`{"url":"https://docs.example.com/intro"}`))
+	reqFallback.Header.Set("Authorization", "Bearer "+callerTok)
+	reqFallback.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	respFallback, err := http.DefaultClient.Do(reqFallback)
+	if err != nil {
+		t.Fatalf("fallback scrape failed: %v", err)
+	}
+	var fbBody map[string]any
+	_ = json.NewDecoder(respFallback.Body).Decode(&fbBody)
+	_ = respFallback.Body.Close()
+	if respFallback.StatusCode != 200 || fbBody["via"] != "local-hub" || !strings.Contains(fbBody["markdown"].(string), "`/agent/ws`") {
+		t.Fatalf("unexpected local fallback response: status=%d body=%+v", respFallback.StatusCode, fbBody)
+	}
+
+	// 4. Start ONE Go Agent connected simultaneously to BOTH controllers via `HubURLs` (`agent.RunAll` Active-Active HA)!
+	agentCrawler := crawl.NewCrawler(originTr, allowAllHTTPS, crawl.DefaultUserAgent, silentLog)
+	agentCrawler.Sleep = func(context.Context, time.Duration) error { return nil }
+	defer agentCrawler.Close()
+
+	cfg, err := agent.LoadConfigFrom("", func(k string) string {
+		switch k {
+		case "EDGEFETCH_ALLOW_INSECURE_HUB":
+			return "1"
+		case "EDGEFETCH_HUB_URLS":
+			return srvPrimary.URL + "," + srvStandby.URL
+		case "EDGEFETCH_AGENT_TOKEN":
+			return agentTok
+		case "EDGEFETCH_SITE_ID":
+			return "mesh-node-1"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("LoadConfigFrom HubURLs: %v", err)
+	}
+	if len(cfg.HubURLs) != 2 {
+		t.Fatalf("expected 2 HubURLs, got %+v", cfg.HubURLs)
+	}
+
+	var connectedCount atomic.Int32
+	agentCtx, cancelAgent := context.WithCancel(context.Background())
+	defer cancelAgent()
+
+	go func() {
+		_ = agent.RunAll(agentCtx, cfg, agentCrawler, allowAllHTTPS, http.DefaultTransport, silentLog, agent.RuntimeOpts{
+			PingInterval: 2 * time.Second,
+			ReadWatchdog: 5 * time.Second,
+			OnConnected:  func() { connectedCount.Add(1) },
+		})
+	}()
+
+	deadline := time.Now().Add(4 * time.Second)
+	for connectedCount.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if connectedCount.Load() < 2 {
+		t.Fatalf("expected agent connected to both controllers, got %d", connectedCount.Load())
+	}
+
+	// 5. Verify BOTH Primary and Standby Go Hubs dispatch over WebSocket + R2-mode artifact upload (`via: "agent:mesh-node-1"`)!
+	for idx, hubURL := range []string{srvPrimary.URL, srvStandby.URL} {
+		fetchBody := `{"maxSeconds":20,"options":{"includeBody":true,"pauseMs":1},"requests":[{"id":"r1","url":"https://docs.example.com/page","kind":"scrape","formats":["markdown"]}]}`
+		req, _ := http.NewRequest(http.MethodPost, hubURL+"/fetch?target=agent", strings.NewReader(fetchBody))
+		req.Header.Set("Authorization", "Bearer "+callerTok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("controller %d /fetch failed: %v", idx, err)
+		}
+		via := resp.Header.Get("X-Crawler-Via")
+		var reply crawl.FetchReply
+		_ = json.NewDecoder(resp.Body).Decode(&reply)
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 || via != "agent:mesh-node-1" || len(reply.Results) != 1 || !strings.Contains(reply.Results[0].Body, "Self-Hosted Go Hub") {
+			t.Fatalf("controller %d unexpected reply: status=%d via=%q results=%+v", idx, resp.StatusCode, via, reply.Results)
+		}
+	}
+
+	// 6. Verify Go Hub's built-in Streamable HTTP `/mcp` server (`initialize`, `tools/list`, `tools/call` -> `scrape` & `list_agents`)!
+	initReq, _ := http.NewRequest(http.MethodPost, srvPrimary.URL+"/mcp", bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+	initReq.Header.Set("Authorization", "Bearer "+callerTok)
+	initResp, err := http.DefaultClient.Do(initReq)
+	if err != nil || initResp.StatusCode != 200 {
+		t.Fatalf("MCP initialize failed: resp=%v err=%v", initResp, err)
+	}
+	_ = initResp.Body.Close()
+
+	toolsReq, _ := http.NewRequest(http.MethodPost, srvPrimary.URL+"/mcp", bytes.NewBufferString(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`))
+	toolsReq.Header.Set("Authorization", "Bearer "+callerTok)
+	toolsResp, err := http.DefaultClient.Do(toolsReq)
+	if err != nil || toolsResp.StatusCode != 200 {
+		t.Fatalf("MCP tools/list failed: resp=%v err=%v", toolsResp, err)
+	}
+	_ = toolsResp.Body.Close()
+
+	agentsReq, _ := http.NewRequest(http.MethodGet, srvPrimary.URL+"/agents", nil)
+	agentsReq.Header.Set("Authorization", "Bearer "+callerTok)
+	agentsResp, err := http.DefaultClient.Do(agentsReq)
+	if err != nil || agentsResp.StatusCode != 200 {
+		t.Fatalf("GET /agents failed: resp=%v err=%v", agentsResp, err)
+	}
+	_ = agentsResp.Body.Close()
+
+	mcpCall := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"scrape","arguments":{"url":"https://docs.example.com/mcp-test","target":"agent"}}}`
+	mcpReq, _ := http.NewRequest(http.MethodPost, srvPrimary.URL+"/mcp", bytes.NewBufferString(mcpCall))
+	mcpReq.Header.Set("Authorization", "Bearer "+callerTok)
+	mcpResp, err := http.DefaultClient.Do(mcpReq)
+	if err != nil {
+		t.Fatalf("Go Hub /mcp failed: %v", err)
+	}
+	rawMcp, _ := io.ReadAll(mcpResp.Body)
+	_ = mcpResp.Body.Close()
+	if mcpResp.StatusCode != 200 || !strings.Contains(string(rawMcp), "agent:mesh-node-1") || !strings.Contains(string(rawMcp), "Self-Hosted Go Hub") {
+		t.Fatalf("unexpected Go Hub /mcp response: %s", string(rawMcp))
+	}
+
+	// 7. Verify ParseAgentTokensJSON validation and H-S5 site-isolation security invariant
+	tokMap, err := ParseAgentTokensJSON(`{"site-alpha":"0123456789abcdef0123456789abcdef"}`)
+	if err != nil || tokMap["site-alpha"] == "" {
+		t.Fatalf("ParseAgentTokensJSON failed: %v", err)
+	}
+	if _, err := ParseAgentTokensJSON(`{"site-alpha":"short"}`); err == nil {
+		t.Fatal("expected short per-site token rejected")
+	}
+}

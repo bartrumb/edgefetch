@@ -48,7 +48,7 @@ sequenceDiagram
 ### Public-IP Load Splitting, Host-Sticky Affinity & Polite `429` Failover
 - **Public-IP Egress Grouping + 30m Host-Sticky Affinity (Tier 1 Primary):** `AgentHubDO` captures each node's verified public IP (`cf-connecting-ip`) and EdgeFetch/Go version on connect. Unpinned origin hosts are assigned to the Least-Recently-Used `publicIp` group (so two VMs sharing one WAN router receive 1 combined share, not 2) and stay **sticky to that node for 30 minutes** (`HOST_STICKY_TTL_MS`) so single origins never rotate IPs across sequential calls. Concurrent calls to the same host queue through a race-free FIFO lock (`withHostLocks`).
 - **Polite `429` Cooldown + Full `Retry-After` Wait:** On HTTP `429` (`outcome !== "challenge"`), `AgentHubDO` cools down both `siteId` and `ip:<publicIp>` in SQLite (`site_cooldowns`) and **waits out the full `Retry-After` duration** (`15 s` default when `Retry-After` is absent) inside the FIFO host lock **before** dispatching failover to a healthy distinct-IP node or Cloudflare overflow. If `Retry-After` exceeds the remaining `maxSeconds` budget, the `429` is returned directly without failing over.
-- **Cloudflare Overflow ONLY on `429` (Tier 2 Fallback):** Cloudflare egress (`CrawlerContainer` or Worker `cloudflareOverflowFetch`, enforcing `pauseMs` and `/robots.txt` by default) stays asleep during normal operation and runs **only** after waiting out `Retry-After` / `15 s` when remote nodes hit `429` (or when zero remote nodes are connected). Responses like `200`, `304`, `403`, `404`, `503`, and `cf-mitigated` challenges never wake Cloudflare.
+- **Cloudflare Overflow ONLY on `429` (Tier 2 Fallback):** Cloudflare egress (`cloudflareOverflowFetch`, enforcing `pauseMs` and `/robots.txt` by default) stays asleep during normal operation and runs **only** after waiting out `Retry-After` / `15 s` when remote nodes hit `429` (or when zero remote nodes are connected). Responses like `200`, `304`, `403`, `404`, `503`, and `cf-mitigated` challenges never wake Cloudflare.
 
 ---
 
@@ -143,20 +143,21 @@ claude mcp add --transport http edgefetch https://<your-hub>.workers.dev/mcp
 
 When Claude Code connects for the first time, it discovers `/.well-known/oauth-protected-resource`, registers dynamically, and opens your browser to `/oauth/authorize`. Paste your `CALLER_TOKEN` once (or click **Approve** immediately if already signed into `/admin`) — **no raw bearer tokens are ever saved in `.claude.json` or shell history**.
 
-### Exposed MCP Tools (8-Tool v2 Surface)
+### Exposed MCP Tools (11-Tool v2.1 Surface)
 
 | Tool | Required Scope | Description |
 |---|---|---|
 | `list_agents` | `crawl:read` | Lists connected standby agents (`siteId`, `LITE`/`FAT` tier, `capabilities`, `version`, `arch`) and active `429` cooldowns. |
-| `scrape` | `crawl:fetch` | Scrapes a public `https://` URL to clean GFM Markdown, metadata, links, images, branding, `changes` diff, and `/llms.txt` + companion `.md` (`maxAgeMs` verified cache, `renderMode: "off"\|"auto"\|"always"`). |
-| `extract` | `crawl:fetch` | Fetches 1..20 URLs politely and returns BM25 query-ranked ~1,500-char chunks (`chunksPerSource`). |
-| `map` | `crawl:fetch` | Discovers site URLs across `robots.txt` `Sitemap:`, `sitemap.xml` / `.xml.gz`, `/llms.txt`, and homepage links. |
+| `scrape` | `crawl:fetch` | Scrapes a public `https://` URL to clean GFM Markdown, Jupyter `.ipynb`, OpenAPI 3.x, CSV, `.ics`, metadata, links, images, branding, `changes` diff, and `/llms.txt` + companion `.md` (`maxAgeMs` verified cache, `renderMode: "off"\|"auto"\|"always"`). |
+| `extract` | `crawl:fetch` | Fetches 1..20 URLs politely and returns BM25 query-ranked ~1,500-char chunks (`chunksPerSource`) or full documents (`mode: "full"`). |
+| `map` | `crawl:fetch` | Discovers site URLs across `robots.txt` `Sitemap:`, `sitemap.xml` / `.xml.gz`, `/llms.txt`, and homepage links with anchor titles. |
 | `crawl` | `crawl:fetch` | Starts an async breadth-first site crawl (`includePaths`/`excludePaths`, D1 FTS5 indexing, HMAC webhooks), or polls/cancels `crawlId`. |
-| `search` | `crawl:read` | Searches Brave Search API, SearXNG JSON API, and/or private `SEARCH` D1 FTS5 `collections` fused via Reciprocal Rank Fusion (`RRF`). |
-| `interact` | `crawl:fetch` | Drives a sandboxed headless Chromium session on an `edgefetch_fat` (`browser-v1`) node (`click`, `fill`, `press`, `scroll`, `wait`, PNG screenshots) with composite `<siteId>.<sessionId>` pinning. |
-| `read_artifact` | `crawl:read` | Pages stored R2 artifacts by `artifactId` (`blobSha256`) + `offset` + `limit` without 64K truncation. |
-
-*(Legacy `fetch_url`, `fetch_batch`, and `search_collection` tool calls remain supported for existing MCP callers, and direct machine-to-machine clients may pass `Authorization: Bearer $CALLER_TOKEN` on `POST /mcp`.)*
+| `search` | `crawl:read` | Searches Serper, Brave, Tavily, SearXNG JSON, `edge-map`, and/or private `SEARCH` D1 FTS5 `collections` fused via Reciprocal Rank Fusion (`RRF`). |
+| `search_collection` | `crawl:read` | Queries a specific crawled `SEARCH` D1 FTS5 collection directly via BM25 ranking. |
+| `interact` | `crawl:fetch` | Drives a sandboxed headless Chromium session on a `browser-v1` node (`click`, `fill`, `press`, `scroll`, `wait`, PNG screenshots, YouTube transcripts). |
+| `read_artifact` | `crawl:read` | Pages stored artifacts by `artifactId` (`blobSha256`) + `offset` + `limit` (`format: "raw"\|"markdown"`). |
+| `fetch_url` | `crawl:fetch` | Low-level single-URL fetch returning status, `httptrace` phase timing, headers, and outcome. |
+| `fetch_batch` | `crawl:fetch` | Low-level multi-URL batch fetch across `page` / `json` / `text` / `feed` / `pdf` kinds. |
 
 ---
 
@@ -182,10 +183,71 @@ All storage bindings in [`hub/wrangler.toml`](../hub/wrangler.toml) are optional
 
 ---
 
-## 7. Single-Pane-of-Glass Observability (Cloudflare Logs & Traces)
+## 7. Single-Pane-of-Glass Observability (Cloudflare & Vendor-Agnostic OpenTelemetry OTLP)
 
-`hub/wrangler.toml` enables both `[observability.logs]` and `[observability.traces]` at `100%` sampling:
+### A. Vendor-Agnostic OpenTelemetry Collector (`OTLP/HTTP` + W3C `traceparent`)
+
+Both the Hub (`hub/src/otel.ts`) and the Go binary (`internal/otel/otlp.go`) natively export OpenTelemetry `ExportTraceServiceRequest` JSON batches (`POST <endpoint>/v1/traces`) and propagate standard W3C `traceparent` (`00-<traceId>-<spanId>-01`) headers across `/agent/ws` and `POST /fetch` so Hub dispatch and remote Go `httptrace` (`net.dns_ms`, `net.connect_ms`, `net.tls_ms`, `net.ttfb_ms`, `net.conn_reused`) appear as parent/child spans in **one unified trace waterfall**!
+
+Configure on Cloudflare (`wrangler secret put`), Docker, Fly.io, Railway, Render, or Go CLI using standard OTel variables:
+
+```bash
+# Examples: Honeycomb, Grafana Cloud Tempo, Axiom, SigNoz, or self-hosted Jaeger (:4318)
+OTEL_EXPORTER_OTLP_ENDPOINT="https://api.honeycomb.io"
+OTEL_EXPORTER_OTLP_HEADERS="x-honeycomb-team=<YOUR_API_KEY>"
+OTEL_SERVICE_NAME="edgefetch-hub"
+```
+
+Spans flush via `ctx.waitUntil(...)` on Edge runtimes and a bounded non-blocking background channel in Go, adding **0 ms** to caller response latency.
+
+### B. Cloudflare Native Logs & Traces
+
+`hub/wrangler.toml` also enables native `[observability.logs]` and `[observability.traces]` at `100%` sampling:
 
 1. Open **Cloudflare Dashboard -> Workers & Pages -> `edgefetch-hub` -> Observability**.
-2. **Traces tab:** Inspect end-to-end `edgefetch.dispatch` / `crawler.fetch` spans tagged with `edgefetch.site` / `crawler.via` and HTTP status codes.
+2. **Traces tab:** Inspect end-to-end `edgefetch.dispatch` spans tagged with `edgefetch.via` and HTTP status codes.
 3. **Logs tab:** Query structured JSON events (`agent_ready`, `agent_reconnected`, `fetch_forwarded`, `agent_failover`) across every connected edge site in one place.
+
+---
+
+## 8. High Availability (HA), Multi-Controller Fan-Out & Self-Hosted Go Mesh
+
+EdgeFetch supports four composable HA layers with zero external consensus brokers:
+
+1. **Multi-Controller Active-Active Fan-Out (`EDGEFETCH_HUB_URLS`):**
+   - Pass a comma-separated list of controllers to any Go agent:
+     ```bash
+     EDGEFETCH_HUB_URLS="wss://cf-hub.example.com,wss://standby-hub.fly.dev"
+     ```
+   - `agent.RunAll` maintains simultaneous outbound WebSocket sessions to every controller sharing one in-process `*crawl.Crawler` and `*politeness.Registry`. Even if two controllers dispatch jobs for the same domain simultaneously, `politeness.HostState` serializes per-host traffic locally.
+2. **Cloudflare Durable Object Shard Ring (`HUB_SHARDS`):**
+   - Set `HUB_SHARDS="global,standby"` on the Cloudflare Hub Worker and connect agents to `?shard=global` / `?shard=standby` so single-isolate DO maintenance or evictions fail over in `<10ms`.
+3. **Self-Hosted Go Controller & Hybrid Mesh (`--mode=hub` & `--mode=hub,agent`):**
+   - Run `edgefetch --mode=hub` on a VPS or `edgefetch --mode=hub,agent` on a Tailscale/LAN box so local nodes connect to a local standby Go controller (`/agent/ws`, `/v1/scrape`, `/fetch`, `/mcp`) while simultaneously serving the upstream cloud Hub.
+4. **SDK Multi-Controller Automatic Failover (`baseUrls`):**
+   ```ts
+   import { EdgeFetchClient } from './sdk/ts/edgefetch-client';
+
+   const client = new EdgeFetchClient({
+     baseUrls: ['https://edgefetch.example.com', 'https://standby-go-hub.tailnet.ts.net'],
+     token: process.env.CALLER_TOKEN!,
+   });
+   ```
+   `EdgeFetchClient` automatically retries the next controller in `baseUrls` on network errors or `502`/`503`/`504` gateway responses.
+
+---
+
+## 9. Desktop (`stdio` MCP), Kubernetes, Homelab NAS, Routers & Mobile Egress
+
+- **Zero-Daemon Local `stdio` MCP (`Claude Desktop` / `Cursor` / `VS Code` / `Windsurf`):**
+  - Run `edgefetch install-mcp` (or add `{"command": "edgefetch", "args": ["mcp"]}`). Auto-discovers pre-installed Windows Edge/Chrome/Brave and macOS Chrome/Edge/Brave via `browser.FindChromeBinary()` — zero background port, zero bearer token.
+- **Kubernetes (`deploy/k8s/agent-deployment.yaml`):**
+  - Turnkey `Deployment` (`runAsNonRoot: true`, `65532:65532`, `capabilities.drop: ["ALL"]`) paired with a CNI `NetworkPolicy` blocking all ingress and blocking RFC 1918 / CGNAT / link-local egress at the cluster network layer.
+- **Homelab & NAS App Templates:**
+  - **Unraid:** [`deploy/unraid/edgefetch-agent.xml`](../deploy/unraid/edgefetch-agent.xml)
+  - **CasaOS / Portainer / Coolify:** [`deploy/casaos/docker-compose.yml`](../deploy/casaos/docker-compose.yml)
+- **Routers, Firewalls & Mobile Standby Nodes (`CGO_ENABLED=0`):**
+  - **MikroTik RouterOS v7:** Pull `ghcr.io/bartrumb/edgefetch-agent:lite` (~9 MB distroless `arm64`/`amd64`).
+  - **OpenWrt / GL.iNet Travel Routers:** Cross-compiled via `.goreleaser.yaml` (`linux/mipsle` `softfloat`, `linux/arm` `v7`, `linux/arm64`).
+  - **OPNsense / pfSense:** Cross-compiled `freebsd/amd64` & `freebsd/arm64` static binaries.
+  - **Android (Termux):** Build `GOOS=linux GOARCH=arm64` + `termux-wake-lock` on spare Wi-Fi / 5G phones (~15 MB RAM).

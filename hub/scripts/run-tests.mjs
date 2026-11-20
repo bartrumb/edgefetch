@@ -16,6 +16,7 @@ try {
     platform: 'node',
     format: 'esm',
     alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
+    loader: { '.sql': 'text' },
     outfile: unitOutfile,
   });
 

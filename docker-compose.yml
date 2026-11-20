@@ -1,0 +1,52 @@
+# Zero-Cloud Local Stack (`docker compose up --build`)
+# Launches the full EdgeFetch Hub (`/admin`, OAuth 2.1, 11-tool `/mcp`, SQLite FTS5, `/data` artifacts) on
+# http://localhost:8787 plus 2 multi-node Go worker containers (`node-1`, `node-2`) — zero cloud account needed!
+services:
+  hub:
+    build:
+      context: .
+      dockerfile: Dockerfile.all-in-one
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: "8787"
+      EDGEFETCH_DISABLE_LOCAL_AGENT: "1"
+      CALLER_TOKEN: ${CALLER_TOKEN:-local-dev-caller-token-0123456789}
+      AGENT_TOKEN: ${AGENT_TOKEN:-local-dev-agent-token-0123456789}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+    volumes:
+      - edgefetch-hub-data:/data
+
+  agent-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    depends_on:
+      - hub
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      EDGEFETCH_ALLOW_INSECURE_DOCKER_HUB: "1"
+      EDGEFETCH_HUB_URL: ws://hub:8787/agent/ws
+      EDGEFETCH_AGENT_TOKEN: ${AGENT_TOKEN:-local-dev-agent-token-0123456789}
+      EDGEFETCH_SITE_ID: local-node-1
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
+  agent-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    depends_on:
+      - hub
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      EDGEFETCH_ALLOW_INSECURE_DOCKER_HUB: "1"
+      EDGEFETCH_HUB_URL: ws://hub:8787/agent/ws
+      EDGEFETCH_AGENT_TOKEN: ${AGENT_TOKEN:-local-dev-agent-token-0123456789}
+      EDGEFETCH_SITE_ID: local-node-2
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
+volumes:
+  edgefetch-hub-data:

@@ -8,4 +8,9 @@ coverage.html
 node_modules/
 .wrangler/
 .dev.vars
+.edgefetch-data/
 dist/
+
+# Python bytecode
+__pycache__/
+*.py[cod]

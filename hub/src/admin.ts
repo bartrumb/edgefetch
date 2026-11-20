@@ -258,10 +258,31 @@ function renderDashboardHtml(params: {
         <span style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
           <span class="muted" id="fleet-ip-summary">Public-IP load balanced</span>
           <button type="button" id="toggle-ip-btn" style="padding:4px 10px;font-size:0.76rem">Show Full IPs</button>
-          <a class="btn-link" href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch" target="_blank" rel="noopener noreferrer" title="1-click add EdgeFetch repository to your Home Assistant OS instance">+ Add HAOS Node</a>
+          <button type="button" class="primary" id="toggle-wizard-btn" style="padding:4px 11px;font-size:0.78rem">+ Connect Edge Node</button>
+          <a class="btn-link" href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch" target="_blank" rel="noopener noreferrer" title="1-click add EdgeFetch repository to your Home Assistant OS instance">+ Add HAOS Add-on</a>
           <a class="btn-link btn-cf" href="https://deploy.workers.cloudflare.com/?url=https://github.com/bartrumb/edgefetch/tree/main/hub" target="_blank" rel="noopener noreferrer" title="1-click deploy an EdgeFetch Hub on Cloudflare Workers">Deploy Hub on Cloudflare</a>
         </span>
       </h2>
+      <div id="node-wizard" style="display:none;margin-bottom:14px;padding:14px;background:#0f172a;border:1px solid #3b82f6;border-radius:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+          <div>
+            <strong style="color:#f8fafc">Connect Any Machine (Zero Inbound Ports)</strong>
+            <div class="muted">Multi-arch <code>amd64</code> + <code>arm64</code> images work on Linux, macOS, Windows, NAS, Raspberry Pi, or VPS.</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <label for="wiz-site" style="margin:0">Site ID:</label>
+            <input id="wiz-site" type="text" value="node-1" style="width:140px;padding:5px 8px;font-size:0.8rem">
+            <div class="tab-bar" id="wiz-tabs">
+              <button type="button" class="tab active" data-wiz="docker">Docker (Fat)</button>
+              <button type="button" class="tab" data-wiz="lite">Docker (Lite 9MB)</button>
+              <button type="button" class="tab" data-wiz="compose">Compose</button>
+              <button type="button" class="tab" data-wiz="go">Go CLI</button>
+            </div>
+            <button type="button" class="primary" id="copy-wiz-btn" style="padding:5px 11px;font-size:0.78rem">Copy Command</button>
+          </div>
+        </div>
+        <pre class="out" id="wiz-code" style="margin:0;color:#7dd3fc"></pre>
+      </div>
       <div id="fleet-grid" class="grid-3"><div class="muted">Loading connected agents...</div></div>
     </section>
 
@@ -281,8 +302,11 @@ function renderDashboardHtml(params: {
           <div>
             <label for="f-kind">Kind</label>
             <select id="f-kind">
-              <option value="feed" selected>feed (JSON)</option>
-              <option value="page">page (HTML)</option>
+              <option value="scrape" selected>scrape (Markdown + llms.txt)</option>
+              <option value="render">render (Headless Chromium)</option>
+              <option value="pdf">pdf (Poppler / Pure-Go)</option>
+              <option value="page">page (Raw HTML)</option>
+              <option value="feed">feed (JSON Products)</option>
             </select>
           </div>
           <div>
@@ -327,7 +351,13 @@ function renderDashboardHtml(params: {
       </section>
 
       <section class="card">
-        <h2><span>MCP Clients &amp; OAuth 2.1 Grants</span></h2>
+        <h2>
+          <span>MCP Clients &amp; OAuth 2.1 Grants</span>
+          <span style="display:inline-flex;gap:6px;flex-wrap:wrap">
+            <a class="btn-link" id="cursor-mcp-btn" href="#">+ Cursor MCP</a>
+            <a class="btn-link" id="vscode-mcp-btn" href="#">+ VS Code MCP</a>
+          </span>
+        </h2>
         <div style="margin-bottom:10px">
           <div class="cmd-bar">
             <code id="mcp-cmd">${escapeHtml(mcpCmd)}</code>
@@ -362,6 +392,7 @@ function renderDashboardHtml(params: {
 
   <script>
     const CSRF = ${JSON.stringify(params.csrf)};
+    const HUB_ORIGIN = ${JSON.stringify(params.origin)};
     const el = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
     let latestEvents = [];
@@ -630,6 +661,62 @@ function renderDashboardHtml(params: {
       }
     });
 
+    let activeWiz = 'docker';
+    function renderWizardSnippet() {
+      const site = (el('wiz-site').value || 'node-1').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'node-1';
+      const snippets = {
+        docker: [
+          'docker run -d --name edgefetch-agent --restart=unless-stopped \\',
+          '  --security-opt no-new-privileges:true \\',
+          '  -e EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' \\',
+          '  -e EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
+          '  -e EDGEFETCH_SITE_ID="' + site + '" \\',
+          '  ghcr.io/bartrumb/edgefetch-agent:latest',
+        ].join('\n'),
+        lite: [
+          'docker run -d --name edgefetch-lite --restart=unless-stopped --read-only \\',
+          '  -e EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' \\',
+          '  -e EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
+          '  -e EDGEFETCH_SITE_ID="' + site + '" \\',
+          '  ghcr.io/bartrumb/edgefetch-agent:lite --mode=agent',
+        ].join('\n'),
+        compose: [
+          '# Save .env with EDGEFETCH_HUB_URL, EDGEFETCH_AGENT_TOKEN, EDGEFETCH_SITE_ID=' + site,
+          'curl -fsSLO https://raw.githubusercontent.com/bartrumb/edgefetch/main/compose.agent.yaml',
+          'EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' EDGEFETCH_SITE_ID=' + site + ' EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
+          '  docker compose -f compose.agent.yaml up -d',
+        ].join('\n'),
+        go: [
+          'go install github.com/bartrumb/edgefetch/cmd/edgefetch@latest',
+          'EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' EDGEFETCH_SITE_ID=' + site + ' EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
+          '  edgefetch --mode=agent',
+        ].join('\n'),
+      };
+      el('wiz-code').textContent = snippets[activeWiz] || snippets.docker;
+    }
+    el('toggle-wizard-btn').addEventListener('click', () => {
+      const box = el('node-wizard');
+      box.style.display = box.style.display === 'none' ? 'block' : 'none';
+      renderWizardSnippet();
+    });
+    el('wiz-site').addEventListener('input', renderWizardSnippet);
+    el('wiz-tabs').addEventListener('click', (ev) => {
+      const tab = ev.target.closest('[data-wiz]');
+      if (!tab) return;
+      activeWiz = tab.getAttribute('data-wiz');
+      for (const b of el('wiz-tabs').querySelectorAll('.tab')) b.classList.toggle('active', b === tab);
+      renderWizardSnippet();
+    });
+    el('copy-wiz-btn').addEventListener('click', async () => {
+      await navigator.clipboard.writeText(el('wiz-code').textContent || '');
+      const b = el('copy-wiz-btn');
+      b.textContent = 'Copied!';
+      setTimeout(() => { b.textContent = 'Copy Command'; }, 1500);
+    });
+    const mcpEndpoint = HUB_ORIGIN + '/mcp';
+    el('cursor-mcp-btn').href = 'cursor://anysphere.cursor-deeplink/mcp/install?name=${encodeURIComponent(params.mcpSlug)}&config=' + encodeURIComponent(btoa(JSON.stringify({ url: mcpEndpoint })));
+    el('vscode-mcp-btn').href = 'vscode:mcp/install?' + encodeURIComponent(JSON.stringify({ name: ${JSON.stringify(params.mcpSlug)}, type: 'http', url: mcpEndpoint }));
+
     loadState();
     setInterval(() => {
       if (!document.hidden) loadState();
@@ -774,6 +861,8 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       const respectRobots =
         typeof body.respectRobots === 'boolean' ? body.respectRobots : body.robots !== false;
 
+      const allowedAdminKinds = new Set(['feed', 'page', 'scrape', 'render', 'pdf', 'json']);
+      const adminKind = typeof body.kind === 'string' && allowedAdminKinds.has(body.kind) ? body.kind : 'scrape';
       const callPayload = JSON.stringify({
         maxSeconds: 60,
         options: {
@@ -782,7 +871,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           pauseMs: Math.min(30_000, Math.max(0, Math.floor(Number(body.pauseMs ?? 1500)))),
           pauseJitterMs: Math.min(15_000, Math.max(0, Math.floor(Number(body.pauseJitterMs ?? 750)))),
         },
-        requests: [{ id: 'admin-1', url: body.url.trim(), kind: body.kind === 'feed' ? 'feed' : 'page' }],
+        requests: [{ id: 'admin-1', url: body.url.trim(), kind: adminKind }],
       });
 
       const out = await deps.executeFetch({ target, ...(site ? { site } : {}), body: callPayload });

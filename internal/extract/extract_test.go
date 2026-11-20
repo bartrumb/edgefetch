@@ -133,3 +133,29 @@ func TestPureGoCompressedPDFExtraction(t *testing.T) {
 		t.Fatalf("unexpected PDF extracted text: %q", text)
 	}
 }
+
+func TestCodeStashPreservesGenericsHeadersAndMultiBackticks(t *testing.T) {
+	raw := `<html><body><main>
+		<h1>Type Signatures</h1>
+		<p>Async hook returns <code>Promise&lt;Array&lt;string&gt;&gt;</code> and supports <code>use ` + "`" + `tick` + "`" + ` literals</code>.</p>
+		<pre><code class="language-c">#include &lt;stdio.h&gt;
+int main(void) { return 0; }</code></pre>
+	</main></body></html>`
+	got := ExtractHTML(raw, ExtractOptions{OnlyMainContent: true})
+	if !strings.Contains(got.Markdown, "`Promise<Array<string>>`") {
+		t.Fatalf("generic angle brackets stripped from inline code: %s", got.Markdown)
+	}
+	if !strings.Contains(got.Markdown, "``use `tick` literals``") {
+		t.Fatalf("multi-backtick inline code span broken: %s", got.Markdown)
+	}
+	if !strings.Contains(got.Markdown, "```c\n#include <stdio.h>") {
+		t.Fatalf("language-tagged C include stripped from fenced block: %s", got.Markdown)
+	}
+
+	// Pages without <main>/<article> (like https://example.com) must never leak <head><title> into body Markdown!
+	noMain := `<!doctype html><html><head><title>Example Domain</title></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples.</p></div></body></html>`
+	gotNoMain := ExtractHTML(noMain, ExtractOptions{OnlyMainContent: true})
+	if strings.Contains(gotNoMain.Markdown, "Example DomainThis") || strings.Count(gotNoMain.Markdown, "Example Domain") != 1 {
+		t.Fatalf("unexpected <head><title> duplication in <main>-less page:\n%s", gotNoMain.Markdown)
+	}
+}

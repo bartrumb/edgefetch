@@ -247,18 +247,167 @@ export function validateCallRobotsPolicy(
   return { ok: true, bypassedHosts: [...bypassedHosts] };
 }
 
+const DISALLOWED_HOST_SUFFIXES = [
+  '.localhost',
+  '.local',
+  '.internal',
+  '.arpa',
+  '.intranet',
+  '.corp',
+  '.lan',
+  '.nip.io',
+  '.sslip.io',
+  '.xip.io',
+  '.localtest.me',
+  '.lvh.me',
+  '.vcap.me',
+  '.traefik.me',
+  '.1u.ms',
+  '.rebind.network',
+];
+
+const DISALLOWED_EXACT_HOSTS = new Set([
+  'localhost',
+  'nip.io',
+  'sslip.io',
+  'xip.io',
+  'localtest.me',
+  'lvh.me',
+  'vcap.me',
+  'traefik.me',
+  '1u.ms',
+  'rebind.network',
+  'metadata.goog',
+  'metadata.google.internal',
+  'instance-data.ec2.internal',
+]);
+
+/**
+ * Validates that a hostname is a public internet DNS name and NOT an IP literal, numeric/hex IPv4 obfuscation,
+ * loopback/LAN/metadata name, wildcard DNS-rebinding domain, or recursive self-hub hostname.
+ */
+export function isSafePublicHostname(rawHost: string, selfHost?: string): boolean {
+  const host = rawHost.trim().toLowerCase().replace(/\.+$/, '');
+  if (!host || host.length > 253 || !host.includes('.') || /[\s\0-\x1f]/.test(host)) {
+    return false;
+  }
+  if (host.includes(':') || host.startsWith('[') || host.endsWith(']')) {
+    return false;
+  }
+  if (DISALLOWED_EXACT_HOSTS.has(host)) {
+    return false;
+  }
+  for (const suffix of DISALLOWED_HOST_SUFFIXES) {
+    if (host.endsWith(suffix)) return false;
+  }
+  const canonicalSelf = selfHost?.trim().toLowerCase().replace(/\.+$/, '') ?? '';
+  if (canonicalSelf && host === canonicalSelf) {
+    return false;
+  }
+  const labels = host.split('.');
+  if (labels.some((lbl) => !lbl || lbl.startsWith('-') || lbl.endsWith('-'))) {
+    return false;
+  }
+  // ICANN TLDs are never purely numeric or hex; rejecting numeric/hex final labels blocks dotted IPv4,
+  // 2/3-part IPv4 (`127.1`), octal (`0177.0.0.1`), hex (`0x7f.0.0.1`), and integer IPv4s (`2130706433`).
+  const tld = labels[labels.length - 1]!;
+  if (/^(?:\d+|0x[0-9a-f]+)$/i.test(tld)) {
+    return false;
+  }
+  return true;
+}
+
+/** Validates a public `https://` target URL on port 443 against SSRF, DNS-rebinding, and recursive self-hub fetching. */
+export function validatePublicHttpsTargetUrl(
+  raw: unknown,
+  selfHost?: string,
+): { ok: true; url: URL; normalized: string } | { ok: false; error: 'invalid_url'; message: string } {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { ok: false, error: 'invalid_url', message: 'url must be a non-empty https:// string' };
+  }
+  let u: URL;
+  try {
+    u = new URL(raw.trim());
+  } catch {
+    return { ok: false, error: 'invalid_url', message: `invalid URL: ${raw}` };
+  }
+  if (u.protocol !== 'https:') {
+    return { ok: false, error: 'invalid_url', message: 'only https:// URLs are permitted' };
+  }
+  if (u.username || u.password) {
+    return { ok: false, error: 'invalid_url', message: 'URLs with embedded credentials are not permitted' };
+  }
+  if (u.port && u.port !== '443') {
+    return { ok: false, error: 'invalid_url', message: 'only port 443 is permitted' };
+  }
+  if (!isSafePublicHostname(u.hostname, selfHost)) {
+    return { ok: false, error: 'invalid_url', message: `disallowed hostname: ${u.hostname}` };
+  }
+  return { ok: true, url: u, normalized: u.toString() };
+}
+
+/** Validates all target URLs inside a serialized Hub fetch call payload before dispatching to any agent or container. */
+export function validateCallTargetUrls(
+  rawBody: string,
+  selfHost?: string,
+): { ok: true } | { ok: false; error: 'invalid_url'; message: string } {
+  let parsed: {
+    requests?: Array<{
+      url?: unknown;
+      sessionId?: unknown;
+      actions?: Array<{ type?: unknown; url?: unknown }>;
+      interact?: {
+        sessionId?: unknown;
+        actions?: Array<{ type?: unknown; url?: unknown }>;
+      };
+    }>;
+  };
+  try {
+    parsed = JSON.parse(rawBody) as typeof parsed;
+  } catch {
+    return { ok: true }; // downstream handles malformed JSON
+  }
+  const reqs = Array.isArray(parsed.requests) ? parsed.requests : [];
+  for (let i = 0; i < reqs.length; i++) {
+    const req = reqs[i];
+    if (!req || typeof req !== 'object') continue;
+    const rawUrl = req.url;
+    const resumeSessionId =
+      (typeof req.sessionId === 'string' && req.sessionId.trim()) ||
+      (req.interact && typeof req.interact === 'object' && typeof req.interact.sessionId === 'string' && req.interact.sessionId.trim()) ||
+      '';
+    const hasSessionResume = resumeSessionId.length > 0;
+    if ((rawUrl === undefined || (typeof rawUrl === 'string' && rawUrl.trim() === '')) && hasSessionResume) {
+      // Allowed for `interact` session resume / close turns where `url` is omitted.
+    } else if (rawUrl !== undefined) {
+      const check = validatePublicHttpsTargetUrl(rawUrl, selfHost);
+      if (!check.ok) {
+        return { ok: false, error: 'invalid_url', message: `request ${i}: ${check.message}` };
+      }
+    }
+    const allActions = [
+      ...(Array.isArray(req.actions) ? req.actions : []),
+      ...(req.interact && typeof req.interact === 'object' && Array.isArray(req.interact.actions) ? req.interact.actions : []),
+    ];
+    for (let j = 0; j < allActions.length; j++) {
+      const act = allActions[j];
+      if (act && typeof act === 'object' && String(act.type ?? '').toLowerCase() === 'navigate') {
+        const navCheck = validatePublicHttpsTargetUrl(act.url, selfHost);
+        if (!navCheck.ok) {
+          return { ok: false, error: 'invalid_url', message: `request ${i} action ${j}: ${navCheck.message}` };
+        }
+      }
+    }
+  }
+  return { ok: true };
+}
+
 function isDisallowedOverflowUrl(u: URL, canonicalSelf: string): boolean {
-  const host = u.hostname.toLowerCase().replace(/\.+$/, '');
-  const isIpLiteral = /^(\d{1,3}\.){3}\d{1,3}$/.test(host) || host.includes(':') || host.startsWith('[');
   return (
     u.protocol !== 'https:' ||
     Boolean(u.username || u.password) ||
     Boolean(u.port && u.port !== '443') ||
-    !host.includes('.') ||
-    isIpLiteral ||
-    host === 'localhost' ||
-    host.endsWith('.localhost') ||
-    host === canonicalSelf
+    !isSafePublicHostname(u.hostname, canonicalSelf)
   );
 }
 

@@ -64,6 +64,13 @@ import type {
   RotateRefreshResult,
   SqlStorageLike,
 } from './oauth';
+import {
+  buildCrawlChildSpans,
+  createRequestTraceContext,
+  flushOtlpSpans,
+  type OtelEnvConfig,
+  type OtlpSpanInput,
+} from './otel';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
 import {
   executeIngestPipeline,
@@ -95,9 +102,11 @@ import {
   type OptionalStorageBindings,
 } from './storage';
 
-interface Env extends OptionalStorageBindings {
+interface Env extends OptionalStorageBindings, OtelEnvConfig {
   AGENT_HUB: DurableObjectNamespace<AgentHubDO>;
+  HUB_SHARDS?: string;
   CALLER_TOKEN?: string;
+  MCP_TOKEN?: string;
   AGENT_TOKEN?: string;
   AGENT_TOKENS?: string;
   USER_AGENT?: string;
@@ -111,7 +120,7 @@ interface Env extends OptionalStorageBindings {
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const DEFAULT_UA = 'EdgeFetch/2.0 (+https://github.com/bartrumb/edgefetch)';
+const DEFAULT_UA = 'EdgeFetch/2.1 (+https://github.com/bartrumb/edgefetch)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;
@@ -564,7 +573,35 @@ function hubActivityProxy(hub: () => DurableObjectStub<AgentHubDO>): ActivitySto
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    const hub = () => env.AGENT_HUB.get(env.AGENT_HUB.idFromName('global'));
+    const shardNames = (env.HUB_SHARDS ?? 'global')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => /^[a-z0-9_-]{1,32}$/i.test(s));
+    if (shardNames.length === 0) shardNames.push('global');
+    const hubShard = (name = shardNames[0]!) => env.AGENT_HUB.get(env.AGENT_HUB.idFromName(name));
+    const hub = () => hubShard(shardNames[0]!);
+    const dispatchAcrossShards = async (
+      rawBody: string,
+      traceMap: Record<string, string>,
+      preferredSite?: string,
+      policy?: ArtifactDispatchPolicy,
+    ): Promise<AgentDispatchResult> => {
+      let lastRes: AgentDispatchResult | undefined;
+      let lastErr: unknown;
+      for (const sName of shardNames) {
+        try {
+          const out = await hubShard(sName).dispatchFetch(rawBody, traceMap, preferredSite, policy);
+          if (out.ok || shardNames.length === 1 || out.error === 'bad_request' || out.error === 'too_large') {
+            return out;
+          }
+          lastRes = out;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      if (lastRes) return lastRes;
+      throw lastErr instanceof Error ? lastErr : new Error('hub_shard_unavailable');
+    };
     const ua = env.USER_AGENT?.trim() || DEFAULT_UA;
 
     const bypassAllowlist = parseHostAllowlist(env.ROBOTS_BYPASS_HOSTS);
@@ -577,6 +614,7 @@ export default {
       artifactRetention?: ArtifactRetention | 'off',
       hydrateInline = true,
       collectionId?: string,
+      crawlId?: string,
     ) =>
       (tracing as unknown as { enterSpan<T>(n: string, fn: (s: { setAttribute(k: string, v: unknown): void }) => T): T }).enterSpan(
         'edgefetch.dispatch',
@@ -619,7 +657,9 @@ export default {
               ? { mode: 'r2', retention: resolvedRetention, maxContentBytes: MAX_ARTIFACT_CONTENT_BYTES }
               : undefined;
 
-          const trace = { 'x-request-id': request.headers.get('cf-ray') ?? '' };
+          const startedAtMs = Date.now();
+          const reqTrace = createRequestTraceContext(request);
+          const trace = reqTrace.headers;
           const pendingEvents: HubEventInput[] = [];
           if (robotsCheck.bypassedHosts.length > 0) {
             pendingEvents.push({
@@ -635,7 +675,7 @@ export default {
             site,
             body,
             trace,
-            callAgent: (b, t, s) => hub().dispatchFetch(b, t, s, artifactPolicy),
+            callAgent: (b, t, s) => dispatchAcrossShards(b, t, s, artifactPolicy),
             callContainer: (b) => cloudflareOverflowFetch(b, ua, url.hostname, { bypassAllowlist }),
             waitForHostWindow: (hosts, p, dl) =>
               hub()
@@ -659,8 +699,8 @@ export default {
             bodyText = await hydrateReplyBodiesFromR2(rawCompletedBody, env.ARTIFACTS);
           }
 
-          // S4: When ARTIFACTS + META are bound, write R2 manifest and trigger idempotent IngestWorkflow (never failing crawl response).
-          if (res.status === 200 && env.ARTIFACTS && env.META) {
+          // S4: When ARTIFACTS + META are bound (and caller did not set ephemeral / artifactRetention='off'), write R2 manifest and trigger idempotent IngestWorkflow.
+          if (res.status === 200 && effectiveRetentionPref !== 'off' && env.ARTIFACTS && env.META) {
             const ingestJobId = `job_${crypto.randomUUID().replace(/-/g, '')}`;
             const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(via);
             try {
@@ -670,6 +710,7 @@ export default {
                 via,
                 ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
                 ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
+                ...(crawlId ? { crawlId } : {}),
                 rawReplyText: rawCompletedBody,
               });
               if (written.ok) {
@@ -680,7 +721,7 @@ export default {
                   ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
                   via,
                 };
-                if (env.INGEST) {
+                if (env.INGEST && !crawlId) {
                   try {
                     await env.INGEST.create({ id: `ingest-${ingestJobId}`, params: wfParams });
                   } catch (wfErr) {
@@ -723,6 +764,42 @@ export default {
           await hub()
             .recordHubEvents(pendingEvents)
             .catch(() => undefined);
+
+          if (env.OTEL_EXPORTER_OTLP_ENDPOINT && reqTrace.context.sampled) {
+            const endedAtMs = Date.now();
+            const otlpSpans: OtlpSpanInput[] = [
+              {
+                traceId: reqTrace.context.traceId,
+                spanId: reqTrace.context.spanId,
+                ...(reqTrace.context.parentSpanId ? { parentSpanId: reqTrace.context.parentSpanId } : {}),
+                name: 'edgefetch.dispatch',
+                kind: 2,
+                startTimeMs: startedAtMs,
+                endTimeMs: endedAtMs,
+                statusOk: res.status >= 200 && res.status < 400,
+                attributes: {
+                  'crawler.via': via,
+                  'crawler.target': target,
+                  'crawler.source': source,
+                  'http.response.status_code': res.status,
+                },
+              },
+              ...buildCrawlChildSpans({
+                traceId: reqTrace.context.traceId,
+                parentSpanId: reqTrace.context.spanId,
+                via,
+                endTimeMs: endedAtMs,
+                replyText: bodyText,
+              }),
+            ];
+            const flushPromise = flushOtlpSpans({ env, spans: otlpSpans });
+            if (ctx?.waitUntil) {
+              ctx.waitUntil(flushPromise);
+            } else {
+              await flushPromise;
+            }
+          }
+
           span.setAttribute('edgefetch.via', via);
           return { status: res.status, via, bodyText, ...(retryAfter ? { retryAfter } : {}) };
         },
@@ -739,7 +816,9 @@ export default {
         headers.set('x-verified-site', auth.siteId);
         const clientIp = request.headers.get('cf-connecting-ip') ?? request.headers.get('x-forwarded-for');
         if (clientIp) headers.set('x-verified-ip', clientIp);
-        return await hub().fetch(new Request(request.url, { method: 'GET', headers }));
+        const reqShard = (url.searchParams.get('shard') ?? '').trim();
+        const targetShard = reqShard && shardNames.includes(reqShard) ? reqShard : shardNames[0]!;
+        return await hubShard(targetShard).fetch(new Request(request.url, { method: 'GET', headers }));
       }
       if (request.method === 'PUT' && url.pathname.startsWith('/agent/artifacts/')) {
         const auth = authorizeAgent(request, env);
@@ -753,7 +832,15 @@ export default {
           blobSha256,
           siteId: auth.siteId,
           bucket: env.ARTIFACTS,
-          authorizeJobUpload: (p) => hub().authorizeArtifactUpload(p),
+          authorizeJobUpload: async (p) => {
+            let lastAuth: AuthorizeArtifactUploadResult | undefined;
+            for (const sName of shardNames) {
+              const res = await hubShard(sName).authorizeArtifactUpload(p);
+              if (res.ok || shardNames.length === 1) return res;
+              lastAuth = res;
+            }
+            return lastAuth!;
+          },
         });
       }
       if (request.method === 'POST' && url.pathname === '/agent/reply') {
@@ -762,15 +849,23 @@ export default {
         const jobId = (request.headers.get('x-job-id') ?? '').trim();
         const jobNonce = (request.headers.get('x-job-nonce') ?? '').trim();
         if (!JOB_ID_RE.test(jobId) || !JOB_ID_RE.test(jobNonce)) return Response.json({ error: 'bad_job_headers' }, { status: 400 });
-        if (!(await hub().verifyPendingJob(jobId, jobNonce, auth.siteId))) {
+        let matchedShard: DurableObjectStub<AgentHubDO> | null = null;
+        for (const sName of shardNames) {
+          const cand = hubShard(sName);
+          if (await cand.verifyPendingJob(jobId, jobNonce, auth.siteId)) {
+            matchedShard = cand;
+            break;
+          }
+        }
+        if (!matchedShard) {
           return Response.json({ error: 'unknown_job' }, { status: 404 });
         }
         const payload = await readAgentReplyBody(request);
         if (!payload.ok) {
-          await hub().failJob(jobId, jobNonce, auth.siteId, payload.error, payload.error === 'too_large');
+          await matchedShard.failJob(jobId, jobNonce, auth.siteId, payload.error, payload.error === 'too_large');
           return Response.json({ error: payload.error }, { status: payload.status });
         }
-        const done = await hub().completeJob(jobId, jobNonce, auth.siteId, payload.text);
+        const done = await matchedShard.completeJob(jobId, jobNonce, auth.siteId, payload.text);
         return Response.json({ ok: done.ok }, { status: done.status });
       }
 
@@ -789,10 +884,13 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.0.6',
+          serverVersion: '2.1.0',
           ownerSecret: env.CALLER_TOKEN,
+          ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
           activity,
+          selfHost: url.hostname,
+          ...(ctx?.waitUntil ? { scheduleBackground: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
           allowedTargets: ALLOWED_TARGETS,
           defaultTarget: 'auto',
           listFleet: async () => {
@@ -806,27 +904,30 @@ export default {
               payload: args as ScrapeRequestPayload,
               env,
               executeHubFetch,
+              selfHost: url.hostname,
               source: `mcp-scrape:${principal ?? 'client'}`,
             });
-            return { status: out.status, body: out.body };
+            return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeExtract: async ({ args, principal }) => {
             const out = await executeExtractCall({
               payload: args as ExtractRequestPayload,
               env,
               executeHubFetch,
+              selfHost: url.hostname,
               source: `mcp-extract:${principal ?? 'client'}`,
             });
-            return { status: out.status, body: out.body };
+            return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeInteract: async ({ args, principal }) => {
             const out = await executeInteractCall({
               payload: args as InteractRequestPayload,
               env,
               executeHubFetch,
+              selfHost: url.hostname,
               source: `mcp-interact:${principal ?? 'client'}`,
             });
-            return { status: out.status, body: out.body };
+            return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeMap: async ({ args, principal }) => {
             const out = await executeMapCall({
@@ -835,7 +936,7 @@ export default {
               selfHost: url.hostname,
               source: `mcp-map:${principal ?? 'client'}`,
             });
-            return { status: out.status, body: out.body };
+            return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeCrawl: async ({ args, principal }) => {
             const existingId = typeof args.crawlId === 'string' ? args.crawlId.trim() : '';
@@ -849,6 +950,7 @@ export default {
                 metaDb: env.META,
                 bucket: env.ARTIFACTS,
                 offset: typeof args.offset === 'number' ? args.offset : 0,
+                ...(typeof args.limit === 'number' && Number.isFinite(args.limit) ? { limit: args.limit } : {}),
               });
               return st.ok ? { status: 200, body: st.crawl } : { status: st.status, body: { ok: false, error: st.error } };
             }
@@ -863,6 +965,7 @@ export default {
               env,
               executeHubFetch,
               selfHost: url.hostname,
+              waitUntilBounded: Boolean(ctx?.waitUntil),
             });
             if (ctx?.waitUntil) {
               ctx.waitUntil(jobPromise);
@@ -888,7 +991,7 @@ export default {
               executeHubFetch,
               source: `mcp-search:${principal ?? 'client'}`,
             });
-            return { status: out.status, body: out.body };
+            return { status: out.status, body: { via: out.via, ...out.body } };
           },
           ...(env.SEARCH
             ? {
@@ -904,12 +1007,13 @@ export default {
             : {}),
           ...(env.ARTIFACTS
             ? {
-                readArtifact: async ({ blobSha256, retention, offset, limit }) => {
+                readArtifact: async ({ blobSha256, retention, format, offset, limit }) => {
                   const res = await readArtifactPage({
                     bucket: env.ARTIFACTS!,
                     ...(env.META ? { metaDb: env.META } : {}),
                     blobSha256,
                     ...(retention ? { retention } : {}),
+                    ...(format ? { format } : {}),
                     offset,
                     limit,
                   });
@@ -962,7 +1066,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.0.6'), {
+        return Response.json(buildCapabilities(env, '2.1.0'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -1031,6 +1135,7 @@ export default {
           payload,
           env,
           executeHubFetch,
+          selfHost: url.hostname,
           source: `scrape:${auth.principal}`,
         });
         return Response.json(out.body, {
@@ -1073,6 +1178,7 @@ export default {
           payload,
           env,
           executeHubFetch,
+          selfHost: url.hostname,
           source: `extract:${auth.principal}`,
         });
         return Response.json(out.body, {
@@ -1111,6 +1217,7 @@ export default {
           payload,
           env,
           executeHubFetch,
+          selfHost: url.hostname,
           source: `interact:${auth.principal}`,
         });
         return Response.json(out.body, {

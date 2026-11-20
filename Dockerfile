@@ -1,9 +1,9 @@
-# Server-mode Dockerfile (Cloudflare Containers, Cloud Run, Fly.io, or standalone Docker).
-# Requires EDGEFETCH_SERVER_TOKEN (>= 24 random chars) on non-loopback binds unless --allow-unauthenticated
-# (or EDGEFETCH_ALLOW_UNAUTHENTICATED=1) is explicitly set inside an isolated VPC / Cloudflare Container bridge.
+# Minimal Distroless Dockerfile (~9 MB, `linux/amd64` + `linux/arm64`, zero OS shell).
+# Supports `--mode=server` (default), `--mode=agent` (`ghcr.io/bartrumb/edgefetch-agent:lite`), `--mode=hub`,
+# and one-shot CLI (`docker run --rm ghcr.io/bartrumb/edgefetch-agent:lite scrape https://example.com`).
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.0.0
+ARG BUILD_VERSION=2.1.0
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -14,10 +14,13 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -trimpath \
       -o /out/edgefetch ./cmd/edgefetch
 
 FROM gcr.io/distroless/static-debian12:nonroot
-LABEL org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
+LABEL org.opencontainers.image.title="EdgeFetch Lite" \
+      org.opencontainers.image.description="Minimal 9 MB distroless Go HTTP/2 crawler, agent, and self-hosted WebSocket Hub" \
+      org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=build /out/edgefetch /edgefetch
 USER nonroot:nonroot
 ENV GOMEMLIMIT=200MiB
 EXPOSE 8080
-ENTRYPOINT ["/edgefetch", "--mode=server"]
+ENTRYPOINT ["/edgefetch"]
+CMD ["--mode=server"]

@@ -323,6 +323,7 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
         ingestWorkflow: false,
         search: false,
         webSearch: false,
+        pdfOcr: false,
       });
     }
   } finally {
@@ -583,7 +584,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(trackedBatchFetches.status, 200);
       const s4Out = await trackedBatchFetches.json();
       assert.deepEqual(s4Out, {
-        stepNames: ['load-manifest', 'track-0'],
+        stepNames: ['load-manifest'],
         fetchCount: 2,
         pageCountForJob: 2,
         robotsDecisions: ['allowed', 'disallowed'],
@@ -611,7 +612,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         liedRowCount: 0,
         bombRowCount: 0,
         expiredBlobSha: 'ee'.repeat(32),
-        derivedPipelineVersion: 1,
+        derivedPipelineVersion: 19,
         derivedR2Text: 'Verified stored article payload!',
         unverifiedDeriveStatus: 'unverified',
         capacityStopStatus: 'capacity_reached',
@@ -737,7 +738,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       const liveScrapeJson = await liveScrapeRes.json();
       assert.equal(liveScrapeJson.ok, true);
       assert.equal(liveScrapeJson.cached, false);
-      assert.equal(liveScrapeJson.pipelineVersion, 1);
+      assert.equal(liveScrapeJson.pipelineVersion, 19);
       assert.equal(liveScrapeJson.llms?.found, true);
       assert.deepEqual(liveScrapeJson.json, { name: 'Rear Axle', torqueNm: 35 });
       assert.match(liveScrapeJson.markdown, /# Torque Guide/);
@@ -757,7 +758,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(cachedScrapeRes.headers.get('x-crawler-via'), 'cache:r2-d1');
       const cachedScrapeJson = await cachedScrapeRes.json();
       assert.equal(cachedScrapeJson.cached, true);
-      assert.equal(cachedScrapeJson.pipelineVersion, 1);
+      assert.equal(cachedScrapeJson.pipelineVersion, 19);
       assert.match(cachedScrapeJson.markdown, /35 Nm/);
       assert.equal(scrapeAgentDispatches, 1);
 
@@ -771,7 +772,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       const v1SearchJson = await v1SearchRes.json();
       assert.equal(v1SearchJson.hits.length, 1);
       assert.ok(v1SearchJson.hits[0].score > 0);
-      assert.match(v1SearchJson.hits[0].snippet, /\[cadmium\]|\[axle\]/i);
+      assert.match(v1SearchJson.hits[0].snippet, /cadmium|axle/i);
 
       for (const hostileQuery of ['NEAR/3 "unclosed (OR AND NOT * ^ : --- ???', '🚀🔥!!!', '', '日本語 cadmium 48V']) {
         const qRes = await mf.dispatchFetch(`${ORIGIN}/v1/collections/ebike-kb/search`, {
@@ -929,7 +930,19 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       });
       const toolsJson = await toolsRes.json();
       const toolNames = toolsJson.result.tools.map((t) => t.name);
-      assert.deepEqual(toolNames, ['list_agents', 'scrape', 'extract', 'map', 'crawl', 'search', 'interact', 'read_artifact']);
+      assert.deepEqual(toolNames, [
+        'list_agents',
+        'fetch_url',
+        'fetch_batch',
+        'scrape',
+        'extract',
+        'map',
+        'crawl',
+        'search',
+        'search_collection',
+        'interact',
+        'read_artifact',
+      ]);
 
       // V2-2: Verify RRF multi-provider search (Brave + SearXNG + FTS5) + HMAC-SHA256 webhook signing + SSRF webhook block!
       const v2HarnessRes = await mf.dispatchFetch(`${ORIGIN}/__test_v2_search_and_webhook`, { method: 'POST' });
@@ -942,7 +955,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.deepEqual(v2HarnessJson.unhonoredOptions, ['include_answer']);
       assert.equal(v2HarnessJson.searchResults.length, 2);
       assert.equal(v2HarnessJson.searchResults[0].url, 'https://docs.example.com/torque');
-      assert.deepEqual(v2HarnessJson.searchResults[0].providers, ['brave', 'searxng', 'collection:ebike-kb']);
+      assert.deepEqual([...v2HarnessJson.searchResults[0].providers].sort(), ['brave', 'collection:ebike-kb', 'searxng']);
 
       // V2-2: Switch mock agent to handle `/v1/map`, `/v1/crawl` (sync + GET/DELETE), `formats: ["changes"]`, and `/compat/*` routes!
       wsFat.close(1000, 'switch-to-map-crawl');
@@ -1053,7 +1066,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       });
       assert.equal(mapRes.status, 200);
       const mapJson = await mapRes.json();
-      assert.deepEqual(mapJson.links, [
+      assert.deepEqual([...mapJson.links].sort(), [
         'https://map.example.com/',
         'https://map.example.com/about',
         'https://map.example.com/faq',

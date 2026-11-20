@@ -555,12 +555,17 @@ function shouldStripSubtreeOpenTag(tagLower: string, attrStr: string): boolean {
     const hv = (hm?.[1] ?? hm?.[2] ?? hm?.[3] ?? '').trim().toLowerCase();
     if (hv !== 'false' && hv !== '0') return true;
   }
-  if (
-    /\bstyle\s*=/i.test(strippedQuotes) &&
-    /\bstyle\s*=\s*(?:"(?:[^"]*;)?\s*display\s*:\s*none\b[^"]*"|'(?:[^']*;)?\s*display\s*:\s*none\b[^']*')/i.test(attrStr) &&
-    !/\b(?:mwe-math|katex-mathml|mjx-assistive)\b/i.test(attrStr)
-  ) {
-    return true;
+  if (/\bstyle\s*=/i.test(strippedQuotes) && !/\b(?:mwe-math|katex-mathml|mjx-assistive)\b/i.test(attrStr)) {
+    const sm = /\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(attrStr);
+    const styleVal = sm?.[1] ?? sm?.[2] ?? '';
+    if (
+      styleVal &&
+      /(?:^|;)\s*(?:display\s*:\s*none\b|visibility\s*:\s*hidden\b|opacity\s*:\s*0(?:\.0+)?(?=\s*(?:;|$))|font-size\s*:\s*0(?:px|em|rem|%|pt)?(?=\s*(?:;|$)))/i.test(
+        styleVal,
+      )
+    ) {
+      return true;
+    }
   }
   if (
     /\brole\s*=/i.test(strippedQuotes) &&
@@ -2198,8 +2203,6 @@ export function extractHtmlDocument(
   } else if (onlyMainContent && (!includeTags || includeTags.length === 0)) {
     if (baseUrl && /^https?:\/\/github\.com\/[^/]+\/[^/]+\/(?:issues|pull)\/\d+/i.test(baseUrl)) {
       md = cleanGitHubIssueOrPrMarkdown(md);
-    } else if (baseUrl && /^https?:\/\/(?:export\.)?arxiv\.org\/abs\//i.test(baseUrl)) {
-      md = cleanArxivAbstractMarkdown(md);
     } else {
       const siteExtracted = applyPostFetchSiteExtractor(rawHtml, baseUrl, md, (frag, fragBase) => {
         const sub = extractHtmlDocument(frag, {
@@ -2225,6 +2228,8 @@ export function extractHtmlDocument(
           }
           links = siteExtracted.links;
         }
+      } else if (baseUrl && /^https?:\/\/(?:export\.)?arxiv\.org\/abs\//i.test(baseUrl)) {
+        md = cleanArxivAbstractMarkdown(md);
       }
     }
 
@@ -2258,6 +2263,8 @@ export function extractHtmlDocument(
     md = redactPiiText(md);
     plainText = redactPiiText(plainText);
   }
+  md = stripInvisibleSmugglingChars(md);
+  plainText = stripInvisibleSmugglingChars(plainText);
   const wordCount = countTextWords(md);
 
   return {
@@ -3364,6 +3371,11 @@ export function extractMarkdownLinksAndImages(
   };
 }
 
+/** Strips invisible Unicode Tag ASCII-smuggling (`U+E0000`–`U+E007F`) and Bidi spoofing override codepoints used in indirect prompt injection. */
+export function stripInvisibleSmugglingChars(s: string): string {
+  return s.replace(/[\u{E0000}-\u{E007F}\u202A-\u202E\u2066-\u2069]/gu, '');
+}
+
 function finalizeScrapedMarkdown(
   rawMd: string,
   opts: { isPdf: boolean; includeImages: boolean; maxChars?: number; baseUrl?: string },
@@ -3376,7 +3388,7 @@ function finalizeScrapedMarkdown(
   frontmatterDescription?: string;
 } {
   const fm = opts.isPdf ? { body: rawMd } : parseMarkdownFrontmatter(rawMd);
-  let md = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), opts.baseUrl);
+  let md = stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), opts.baseUrl));
   if (opts.isPdf) {
     md = cleanPdfMarkdown(md);
   }

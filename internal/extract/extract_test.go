@@ -170,4 +170,11 @@ func TestResolveHrefPreservesSemicolonlessQueryParams(t *testing.T) {
 	if !strings.Contains(got.Markdown, want) {
 		t.Fatalf("expected Markdown to preserve %q, got: %s", want, got.Markdown)
 	}
+
+	// Invisible Unicode Tag ASCII smuggling (U+E0000..U+E007F) and Bidi overrides must be stripped.
+	smuggled := "<html><body><main><p>Clean\U000E0049\U000E0047\u202E text</p></main></body></html>"
+	gotClean := ExtractHTML(smuggled, ExtractOptions{OnlyMainContent: true})
+	if gotClean.Markdown != "Clean text" {
+		t.Fatalf("expected invisible smuggling codepoints stripped, got %q", gotClean.Markdown)
+	}
 }

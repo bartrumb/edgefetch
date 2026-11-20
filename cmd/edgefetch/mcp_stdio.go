@@ -10,12 +10,15 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bartrumb/edgefetch/v2/internal/agent"
 	"github.com/bartrumb/edgefetch/v2/internal/browser"
@@ -145,6 +148,32 @@ func runMCPStdio(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer,
 							},
 						},
 						{
+							"name":        "fetch_batch",
+							"description": "Politely fetch up to 25 public HTTPS URLs with per-host serialization, positive jitter, and robots.txt checks.",
+							"inputSchema": map[string]any{
+								"type":     "object",
+								"required": []string{"urls"},
+								"properties": map[string]any{
+									"urls":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "maxItems": 25},
+									"includeBody": map[string]any{"type": "boolean", "default": false},
+									"kind":        map[string]any{"type": "string", "enum": []string{"scrape", "json", "page", "text"}},
+								},
+							},
+						},
+						{
+							"name":        "map",
+							"description": "Zero-cost site URL discovery across /llms.txt, /robots.txt Sitemap directives, /sitemap.xml, and homepage links.",
+							"inputSchema": map[string]any{
+								"type":     "object",
+								"required": []string{"url"},
+								"properties": map[string]any{
+									"url":    map[string]any{"type": "string", "description": "Origin or page https:// URL to map"},
+									"search": map[string]any{"type": "string", "description": "Optional substring filter on discovered URLs"},
+									"limit":  map[string]any{"type": "integer", "default": 100},
+								},
+							},
+						},
+						{
 							"name":        "doctor",
 							"description": "Verify local SSRF guard, loopback CONNECT proxy, OS Chrome/Edge/Chromium binary, and pdftotext.",
 							"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
@@ -218,8 +247,8 @@ func runMCPStdio(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer,
 					continue
 				}
 				res := rep.Results[0]
-				if sp.MaxChars > 0 && len(res.Markdown) > sp.MaxChars {
-					res.Markdown = res.Markdown[:sp.MaxChars]
+				if sp.MaxChars > 0 {
+					res.Markdown = truncateUTF8Safe(res.Markdown, sp.MaxChars)
 				}
 				txt := marshalJSONNoEscapeHTML(res, "  ")
 				writeRPC(stdioToolResult(req.ID, txt, res.Outcome != classify.OutcomeOK))
@@ -247,6 +276,116 @@ func runMCPStdio(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer,
 				txt := marshalJSONNoEscapeHTML(rep, "  ")
 				writeRPC(stdioToolResult(req.ID, txt, false))
 
+			case "fetch_batch":
+				var bp struct {
+					URLs        []string `json:"urls"`
+					IncludeBody bool     `json:"includeBody"`
+					Kind        string   `json:"kind"`
+				}
+				_ = json.Unmarshal(cp.Arguments, &bp)
+				if len(bp.URLs) == 0 || len(bp.URLs) > 25 {
+					writeRPC(stdioToolResult(req.ID, "invalid_urls: provide 1 to 25 https:// URLs", true))
+					continue
+				}
+				k := classify.Kind(bp.Kind)
+				if k == "" {
+					k = classify.KindPage
+				}
+				reqs := make([]crawl.Request, 0, len(bp.URLs))
+				for i, rawU := range bp.URLs {
+					reqs = append(reqs, crawl.Request{
+						ID:   fmt.Sprintf("batch-%d", i+1),
+						URL:  strings.TrimSpace(rawU),
+						Kind: k,
+					})
+				}
+				call := crawl.FetchCall{
+					MaxSeconds: 60,
+					Options:    crawl.Options{Concurrency: 2, IncludeBody: bp.IncludeBody, RespectRobots: crawl.Bool(true)},
+					Requests:   reqs,
+				}
+				if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
+					writeRPC(stdioToolResult(req.ID, code+": "+msg, true))
+					continue
+				}
+				rep := crawl.ExecuteCall(ctx, crawler, call, silentLog)
+				if bp.IncludeBody {
+					for i := range rep.Results {
+						rep.Results[i].Body = truncateUTF8Safe(rep.Results[i].Body, 3072)
+					}
+				}
+				txt := marshalJSONNoEscapeHTML(rep, "  ")
+				writeRPC(stdioToolResult(req.ID, txt, false))
+
+			case "map":
+				var mp struct {
+					URL    string `json:"url"`
+					Search string `json:"search"`
+					Limit  int    `json:"limit"`
+				}
+				_ = json.Unmarshal(cp.Arguments, &mp)
+				uParsed, err := url.Parse(strings.TrimSpace(mp.URL))
+				if err != nil || uParsed.Scheme != "https" || uParsed.Host == "" {
+					writeRPC(stdioToolResult(req.ID, "invalid_url: provide a valid https:// URL", true))
+					continue
+				}
+				if mp.Limit <= 0 || mp.Limit > 500 {
+					mp.Limit = 100
+				}
+				origin := "https://" + uParsed.Host
+				call := crawl.FetchCall{
+					MaxSeconds: 30,
+					Options:    crawl.Options{Concurrency: 2, IncludeBody: true, RespectRobots: crawl.Bool(true)},
+					Requests: []crawl.Request{
+						{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText},
+						{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText},
+						{ID: "home", URL: strings.TrimSpace(mp.URL), Kind: classify.KindScrape, Formats: []string{"links"}},
+					},
+				}
+				if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
+					writeRPC(stdioToolResult(req.ID, code+": "+msg, true))
+					continue
+				}
+				rep := crawl.ExecuteCall(ctx, crawler, call, silentLog)
+				seen := map[string]struct{}{}
+				var links []string
+				filterLower := strings.ToLower(strings.TrimSpace(mp.Search))
+				addCandidate := func(cand string) {
+					cand = strings.TrimSpace(cand)
+					if !strings.HasPrefix(cand, "https://") || len(links) >= mp.Limit {
+						return
+					}
+					if filterLower != "" && !strings.Contains(strings.ToLower(cand), filterLower) {
+						return
+					}
+					if _, exists := seen[cand]; !exists {
+						seen[cand] = struct{}{}
+						links = append(links, cand)
+					}
+				}
+				for _, r := range rep.Results {
+					for _, l := range r.Links {
+						addCandidate(l)
+					}
+					for _, m := range reSitemapLocURL.FindAllStringSubmatch(r.Body, 500) {
+						if len(m) > 1 {
+							addCandidate(m[1])
+						}
+					}
+					for _, m := range reMarkdownHTTPURL.FindAllStringSubmatch(r.Body, 500) {
+						if len(m) > 1 {
+							addCandidate(m[1])
+						}
+					}
+				}
+				out := map[string]any{
+					"ok":    true,
+					"url":   origin,
+					"total": len(links),
+					"links": links,
+				}
+				writeRPC(stdioToolResult(req.ID, marshalJSONNoEscapeHTML(out, "  "), false))
+
 			default:
 				writeRPC(map[string]any{
 					"jsonrpc": "2.0",
@@ -265,6 +404,26 @@ func runMCPStdio(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer,
 	}
 	_ = stderr
 	return 0
+}
+
+var (
+	reSitemapLocURL   = regexp.MustCompile(`(?i)<loc>\s*(https://[^<\s]+)\s*</loc>`)
+	reMarkdownHTTPURL = regexp.MustCompile(`\]\((https://[^)\s]+)\)`)
+)
+
+// truncateUTF8Safe slices a UTF-8 string cleanly at `maxRunes` characters without ever splitting a multi-byte UTF-8 rune.
+func truncateUTF8Safe(s string, maxRunes int) string {
+	if maxRunes <= 0 || utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	count := 0
+	for idx := range s {
+		if count == maxRunes {
+			return s[:idx]
+		}
+		count++
+	}
+	return s
 }
 
 func marshalJSONNoEscapeHTML(v any, indent string) string {

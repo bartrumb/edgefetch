@@ -4,6 +4,10 @@ EdgeFetch ships a modular, zero-dependency **Site & ATS Adapter Library** (`hub/
 
 Every adapter lives in **one self-contained file** + **one JSON test fixture**, so contributors and coding agents can add a new site or job board in ~5 minutes with **zero merge conflicts** on core engine code.
 
+> **Architecture Note (Zero Edge-Node Redeploys & Automatic Fail-Open):**
+> - **0% of site/ATS adapters are compiled into the Go edge worker binary.** Go edge nodes (`edgefetch`) are stateless HTTP/2, CDP, and PDF engines; all 49+ adapters live on the TypeScript Hub (`hub/src/extractors/providers/` and `hub/src/jobs.ts`). Updating or adding an adapter is a 3-second Hub deploy with **zero binary updates** across your Raspberry Pi / Home Assistant / VM fleet.
+> - **Fault-isolated fail-open fallback:** Every `resolveTwin()`, `formatTwin()`, and `extractHtml()` call runs inside an isolated `try / catch` bulkhead. If an upstream site changes a JSON key or DOM selector tomorrow, the adapter returns `null` and EdgeFetch **automatically falls back** to generic HTML / Schema.org JSON-LD / SSR Hydration / Headless CDP extraction instead of failing the request.
+
 ---
 
 ## 1. Ground Rules (Enforced by CI & Registry Guards)

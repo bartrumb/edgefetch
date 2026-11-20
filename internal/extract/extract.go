@@ -454,6 +454,7 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 		s = strings.ReplaceAll(s, stash[i].token, stash[i].value)
 	}
 	s = reMultiLine.ReplaceAllString(s, "\n\n")
+	s = reInvisibleSmuggling.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
 }
 
@@ -889,6 +890,7 @@ func firstAttr(attrs map[string]string, keys ...string) string {
 }
 
 var reHrefAmpEntity = regexp.MustCompile(`(?i)&(?:amp|#0*38|#x0*26);`)
+var reInvisibleSmuggling = regexp.MustCompile(`[\x{E0000}-\x{E007F}\x{202A}-\x{202E}\x{2066}-\x{2069}]`)
 
 // unescapeHrefAmpOnly safely replaces only `&amp;` / `&#38;` / `&#x26;` inside URLs.
 // Calling `html.UnescapeString` on raw hrefs corrupts semicolon-less query params like

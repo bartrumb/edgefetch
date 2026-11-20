@@ -142,9 +142,26 @@ export function resolveSiteExtractorTwin(urlStr: string): SiteExtractorTwin | nu
 
   for (const adapter of DEFAULT_INDEX.candidatesForHost(host)) {
     if (!adapter.resolveTwin) continue;
-    const twin = adapter.resolveTwin(ctx);
-    if (twin && isSafePublicTwinUrl(twin.fetchUrl)) {
-      return twin;
+    try {
+      const twin = adapter.resolveTwin(ctx);
+      if (twin && isSafePublicTwinUrl(twin.fetchUrl)) {
+        const rawFormat = twin.formatTwin;
+        return {
+          ...twin,
+          formatTwin: (rawBody, originalUrl, htmlToMd) => {
+            try {
+              return rawFormat(rawBody, originalUrl, htmlToMd);
+            } catch {
+              // Fault-isolated bulkhead: if an upstream JSON schema changes, return null so EdgeFetch
+              // automatically falls back to standard HTML / JSON-LD / SSR / CDP extraction without failing!
+              return null;
+            }
+          },
+        };
+      }
+    } catch {
+      // Fault-isolated bulkhead: skip throwing adapter and continue
+      continue;
     }
   }
   return null;
@@ -173,9 +190,14 @@ export function applyPostFetchSiteExtractor(
 
   for (const adapter of DEFAULT_INDEX.candidatesForHost(host)) {
     if (!adapter.extractHtml) continue;
-    const res = adapter.extractHtml(ctx);
-    if (res && res.markdown.trim()) {
-      return res;
+    try {
+      const res = adapter.extractHtml(ctx);
+      if (res && res.markdown.trim()) {
+        return res;
+      }
+    } catch {
+      // Fault-isolated bulkhead: never let a DOM change or buggy community adapter fail a scrape!
+      continue;
     }
   }
   return null;

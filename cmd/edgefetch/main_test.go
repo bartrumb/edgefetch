@@ -269,8 +269,14 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("expected 4 JSON-RPC lines, got %d:\n%s", len(lines), stdioOut.String())
 	}
+	if !strings.Contains(lines[1], `"fetch_batch"`) || !strings.Contains(lines[1], `"map"`) {
+		t.Fatalf("expected fetch_batch and map in stdio tools/list: %s", lines[1])
+	}
 	if !strings.Contains(lines[2], "Promise<void>") || !strings.Contains(lines[3], "ssrf_guard") {
 		t.Fatalf("unexpected stdio tool results:\nscrape=%s\ndoctor=%s", lines[2], lines[3])
+	}
+	if got := truncateUTF8Safe("Hello 世界🚀", 7); got != "Hello 世" {
+		t.Fatalf("truncateUTF8Safe split UTF-8 rune: got %q", got)
 	}
 
 	// Test `edgefetch install-mcp --config=...` safely preserves existing MCP servers!

@@ -14,11 +14,11 @@
 ## Try It in 60 Seconds
 
 ```bash
-# Option 1 — Full local Hub + 2 Go Chromium workers in Docker (zero cloud account):
+# Option 1 — Full 12-Tool Hub + 49+ Site/ATS Adapters + /admin UI + FTS5 in Docker (zero cloud account):
 git clone https://github.com/bartrumb/edgefetch.git && cd edgefetch && docker compose up --build -d
 # Open http://localhost:8787/admin (dev token: local-dev-caller-token-0123456789)
 
-# Option 2 — Single ~8 MB Go binary for local Claude Code / Cursor / Claude Desktop stdio MCP (zero ports):
+# Option 2 — Standalone ~8 MB Local Go Binary for Claude Code / Cursor stdio MCP (5 local tools, zero containers/ports):
 go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest
 edgefetch install-mcp && edgefetch doctor
 ```

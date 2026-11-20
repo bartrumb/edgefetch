@@ -29,11 +29,11 @@ Unthrottled, stealth-bypass scraping from residential proxy botnets is abusive �
 
 ---
 
-## 3. Why direct CDP + OS Chrome instead of bundling Playwright?
+## 3. Why direct CDP + OS Chrome on desktop, and does it touch my personal browser profile?
 
-- **On desktops (`Windows` & `macOS`):** Your machine almost certainly already has Microsoft Edge, Google Chrome, or Brave installed. Speaking the Chrome DevTools Protocol (CDP) directly over a local WebSocket lets `edgefetch` ship as a **single ~8 MB binary** with zero Node/Python runtime and zero duplicate 300 MB browser download.
-- **In containers (`Dockerfile.agent`, `Dockerfile.all-in-one`, Home Assistant OS):** Alpine's system `chromium` + `poppler-utils` (`pdftotext`) are pre-installed and locked behind an in-process loopback `CONNECT` proxy (`--host-resolver-rules=MAP * ~NOTFOUND`) so every browser subresource (`fetch()`, `<img>`, `<script>`, redirects) passes through Go's dial-time SSRF IP check (`RejectNonPublicPeer`).
-- **Avoiding unnecessary browser launches:** Most documentation pages, APIs, Next.js `__NEXT_DATA__` SSR pages, and ATS job boards (Greenhouse, Ashby, Lever, Workday CXS) don't need a browser at all. EdgeFetch fetches them over pooled HTTP/2 first and only launches Chromium when visible HTML is genuinely thin (`renderMode: "auto"`).
+- **Complete profile isolation on desktop (`Windows` & `macOS`):** When the standalone `~8 MB` binary (`edgefetch mcp`) renders JS via pre-installed Microsoft Edge, Chrome, or Brave, it launches a headless process with `--user-data-dir=<ephemeral-temp-dir> --disable-extensions --disable-sync` and creates a disposable incognito `Target.createBrowserContext` per request. **It never reads your personal cookies, saved logins, browsing history, or extensions**, and deletes the temporary directory on exit.
+- **Pinned Chromium bundled in containers (`Dockerfile.agent`, `Dockerfile.all-in-one`, Home Assistant OS):** You do **not** rely on host browsers on servers — Fat containers bundle pinned Alpine `chromium` + `chromium-swiftshader` + `poppler-utils` (`pdftotext`) inside the image, locked behind an in-process loopback `CONNECT` proxy (`--host-resolver-rules=MAP * ~NOTFOUND`) so every browser subresource (`fetch()`, `<img>`, `<script>`, redirects) passes through Go's dial-time SSRF IP check (`RejectNonPublicPeer`).
+- **Modern SPA & heavy-JS support (`v2.4.1+`):** Native CDP rendering tracks in-flight `XHR`/`Fetch` requests to true network-idle, runs lazy-scroll + `MutationObserver` quiescence, flattens open Web Component `shadowRoot` trees, recovers Next.js App Router RSC (`self.__next_f.push`) & `__NEXT_DATA__` payloads without launching a browser, and supports optional `CRAWL4AI_API_URL` / `FIRECRAWL_API_KEY` fallback for extreme SPAs.
 
 ---
 
@@ -41,8 +41,8 @@ Unthrottled, stealth-bypass scraping from residential proxy botnets is abusive �
 
 **You run your own Hub — there is no shared vendor cloud, and Cloudflare is completely optional.** Pick whichever fits your setup:
 
-1. **Zero-daemon Desktop `stdio` MCP (`edgefetch mcp`):** No Hub at all! Claude Code, Claude Desktop, Cursor, or VS Code spawns `edgefetch mcp` locally over `stdio` (`0` open ports).
-2. **Single Docker Container (`docker compose up -d` or Fly.io / Railway / Render):** Runs the TypeScript Hub (`node:sqlite` FTS5 + local `/data` disk artifacts) + Go worker in one container with zero external cloud accounts.
+1. **Zero-daemon Desktop `stdio` MCP (`edgefetch mcp`):** No Hub or Docker needed — Claude Code, Claude Desktop, Cursor, or VS Code spawns `edgefetch mcp` locally over `stdio` (`0` open ports), exposing 5 local tools (`scrape`, `fetch_url`, `fetch_batch`, `map`, `doctor`).
+2. **Single Docker Container (`docker compose up -d` or Fly.io / Railway / Render):** Runs the full **12-tool Hub** (`scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`), **49+ site/ATS adapters**, `/admin` UI, and `node:sqlite` FTS5 + `/data` disk artifacts with zero external cloud accounts.
 3. **Single Go Binary Hub (`edgefetch --mode=hub` or `--mode=hub,agent`):** Runs on any `$4` Linux/BSD VPS or Tailscale node.
 4. **Cloudflare Workers (`hub/`):** Uses a Hibernating WebSocket Durable Object (`AgentHubDO`) that sleeps at `$0` idle while keeping outbound home worker WebSockets connected via edge auto-ping/pong, with optional R2 + D1 FTS5 storage.
 
@@ -61,3 +61,29 @@ Unthrottled, stealth-bypass scraping from residential proxy botnets is abusive �
 EdgeFetch is a **young personal open-source project** (started in November 2026) built to replace paid per-page scraping APIs in daily AI-agent workflows.
 - It runs daily on the author's 3-node personal fleet (`arm64`, Home Assistant OS `x86_64`, and a Windows VM) and is gated by Go `-race`, fuzzing, `staticcheck`, `govulncheck`, and `workerd` E2E tests in CI.
 - **Support expectation:** MIT-licensed personal project; issues and pull requests are **triaged weekly**. Reproducible bug reports and new site extractor PRs are very welcome — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+---
+
+## 7. Aren't 49+ site adapters brittle whack-a-mole, and do I have to recompile Go nodes when a site changes?
+
+No on both counts:
+1. **Zero adapters compiled into Go workers:** Go edge nodes (`edgefetch`) contain **0% of site or ATS adapters** — they are pure transport, SSRF, CDP, and PDF engines. All 49+ adapters live on the Hub (`hub/src/extractors/providers/`), so updating an adapter is a 3-second Hub deploy with **zero redeploys** on your Raspberry Pi, Home Assistant, or VM nodes.
+2. **Fault-isolated fail-open fallback:** Every adapter runs inside an isolated `try / catch` bulkhead. If a site renames a JSON field or DOM class tomorrow, `formatTwin()` / `extractHtml()` returns `null` and EdgeFetch **automatically falls back** to standard HTML / Schema.org JSON-LD / SSR Hydration / Headless CDP extraction instead of failing the call.
+3. **Public APIs over brittle DOM selectors:** Most adapters upgrade noisy web URLs to stable, official keyless APIs (`data.sec.gov`, `registry.npmjs.org`, `crates.io/api/v1`, `api.crossref.org`, `api.openalex.org`, Socrata SODA, CKAN, Workable, Greenhouse, Ashby, Lever) rather than scraping fragile CSS classes.
+
+---
+
+## 8. How does EdgeFetch defend against Indirect Prompt Injection from untrusted web pages?
+
+Any tool that feeds live web content into an LLM must treat web pages as untrusted input. EdgeFetch strips common hidden-instruction smuggling vectors before returning Markdown:
+- Drops HTML comments (`<!-- ... -->`), `<script>`, `<style>`, `<template>`, and `<noscript>` blocks.
+- Strips hidden DOM subtrees (`[hidden]`, `.d-none`, `display: none`, `visibility: hidden`, `opacity: 0`, `font-size: 0px`) while preserving legitimate KaTeX/MathML formulas.
+- Strips invisible **Unicode Tag ASCII-smuggling characters (`U+E0000`–`U+E007F`)** and **Bidi directional override controls (`U+202A`–`U+202E`, `U+2066`–`U+2069`)** in both the Go worker and TypeScript Hub.
+- Agent harnesses should still keep human-in-the-loop approval on destructive local tool calls when browsing untrusted URLs.
+
+---
+
+## 9. Why a zero-dependency HTML-to-Markdown parser instead of JSDOM + Readability + Turndown?
+
+- **WinterCG Isolate Portability & Zero Supply-Chain Bloat:** `hub/` runs identically on Cloudflare Workers (`workerd`), Deno, and Node.js with **0 runtime `npm` dependencies** (no JSDOM memory overhead or transitive vulnerability churn).
+- **Code & Technical Fidelity:** Naive HTML sanitizers strip `<T>` or `<Array<string>>` inside TypeScript, Rust, Go, and C++ prose/code blocks as "unknown HTML tags". EdgeFetch stashes code spans/fences first, preserves variable-length CommonMark fences, converts KaTeX/MathML to LaTeX, and runs in `<2 ms` per document (`node bench/run-bench.mjs`).

@@ -8,6 +8,7 @@
  *    and tracked in `META` D1 `documents` with `(content_sha256, format, pipeline_version)` uniqueness.
  */
 
+import { applyPostFetchSiteExtractor, resolveSiteExtractorTwin } from './extractors/registry';
 import { isContentVerifiedInMetaD1, sha256HexString } from './ingest';
 import { computeMarkdownChanges } from './map-crawl';
 import { validatePublicHttpsTargetUrl } from './overflow';
@@ -20,7 +21,7 @@ import {
   type OptionalStorageBindings,
 } from './storage';
 
-export const SCRAPE_PIPELINE_VERSION = 19;
+export const SCRAPE_PIPELINE_VERSION = 20;
 
 export interface ScrapedImage {
   url: string;
@@ -2165,6 +2166,32 @@ export function extractHtmlDocument(
       md = cleanGitHubIssueOrPrMarkdown(md);
     } else if (baseUrl && /^https?:\/\/(?:export\.)?arxiv\.org\/abs\//i.test(baseUrl)) {
       md = cleanArxivAbstractMarkdown(md);
+    } else {
+      const siteExtracted = applyPostFetchSiteExtractor(rawHtml, baseUrl, md, (frag, fragBase) => {
+        const sub = extractHtmlDocument(frag, {
+          baseUrl: fragBase,
+          onlyMainContent: false,
+          includeImages,
+        });
+        return { markdown: sub.markdown, links: sub.links };
+      });
+      if (siteExtracted) {
+        md = siteExtracted.markdown;
+        if (siteExtracted.title) title = siteExtracted.title;
+        if (siteExtracted.description && !description) description = siteExtracted.description;
+        if (siteExtracted.author && !author) author = siteExtracted.author;
+        if (siteExtracted.publishedTime && !publishedTime) publishedTime = siteExtracted.publishedTime;
+        if (siteExtracted.links && siteExtracted.links.length > 0) {
+          const seen = new Set(siteExtracted.links);
+          for (const l of links) {
+            if (!seen.has(l) && siteExtracted.links.length < 250) {
+              seen.add(l);
+              siteExtracted.links.push(l);
+            }
+          }
+          links = siteExtracted.links;
+        }
+      }
     }
 
     // Defuddle schema.org `articleBody` & `<noscript>` SSR rescue: if DOM extraction yielded <30 words on a client-hydrated shell.
@@ -3801,13 +3828,44 @@ export function formatFeedXmlToMarkdown(
 
 const SKIP_SPECULATIVE_LLMS_HOSTS = new Set([
   'news.ycombinator.com',
+  'npmjs.com',
+  'www.npmjs.com',
   'registry.npmjs.org',
+  'crates.io',
+  'www.crates.io',
+  'rubygems.org',
+  'www.rubygems.org',
+  'packagist.org',
+  'www.packagist.org',
+  'hex.pm',
+  'www.hex.pm',
   'pypi.org',
+  'www.pypi.org',
+  'huggingface.co',
+  'www.huggingface.co',
   'arxiv.org',
   'export.arxiv.org',
   'github.com',
   'gist.github.com',
   'raw.githubusercontent.com',
+  'gitlab.com',
+  'codeberg.org',
+  'gitea.com',
+  'lobste.rs',
+  'bsky.app',
+  'public.api.bsky.app',
+  'stackoverflow.com',
+  'www.stackoverflow.com',
+  'serverfault.com',
+  'superuser.com',
+  'askubuntu.com',
+  'datatracker.ietf.org',
+  'rfc-editor.org',
+  'www.rfc-editor.org',
+  'pubmed.ncbi.nlm.nih.gov',
+  'pmc.ncbi.nlm.nih.gov',
+  'dev.to',
+  'www.dev.to',
   'youtube.com',
   'www.youtube.com',
   'm.youtube.com',
@@ -5215,6 +5273,107 @@ export async function executeScrapeCall(params: {
       }
     } catch {
       // Fall through to standard HTML fetch if `.patch` fetch fails.
+    }
+  }
+
+  // Modular Site Extractor Registry 1-hop JSON / raw / patch twin upgrade (`npm`, `crates.io`, `huggingface.co`,
+  // `gitlab.com`, `codeberg.org`, Discourse `/t/<slug>/<id>.json`, `lobste.rs`, Bluesky ATProto, Mastodon, `dev.to`, etc.).
+  const registryTwin = !needsLiveHtml && renderMode !== 'always' ? resolveSiteExtractorTwin(normalizedUrl) : null;
+  if (registryTwin) {
+    try {
+      const twinRes = await executeHubFetch(
+        target,
+        JSON.stringify({
+          maxSeconds: 30,
+          options: { includeBody: true, respectRobots: true },
+          requests: [{ id: `twin-${registryTwin.id}`, url: registryTwin.fetchUrl, kind: registryTwin.kind, accept: registryTwin.accept }],
+        }),
+        site,
+        `${source}:extractor:${registryTwin.id}`,
+        retentionMode,
+        true,
+        collectionId,
+      );
+      if (twinRes.status === 200) {
+        const twinParsed = JSON.parse(twinRes.bodyText) as { results?: Array<Record<string, unknown>> };
+        const twinItem = twinParsed.results?.[0];
+        const twinBody = typeof twinItem?.body === 'string' && twinItem.bodyEncoding !== 'base64' ? twinItem.body : '';
+        if (twinItem?.outcome === 'ok' && twinBody.trim().length > 0) {
+          const formatted = registryTwin.formatTwin(twinBody, normalizedUrl, (frag, fragBase) => {
+            const sub = extractHtmlDocument(frag, {
+              baseUrl: fragBase,
+              onlyMainContent: false,
+              includeImages,
+            });
+            return { markdown: sub.markdown, links: sub.links };
+          });
+          if (formatted && formatted.markdown.trim().length > 0) {
+            const rawMd = redactPii ? redactPiiText(formatted.markdown) : formatted.markdown;
+            const twinShapedFull = finalizeScrapedMarkdown(rawMd, {
+              isPdf: false,
+              includeImages,
+              baseUrl: normalizedUrl,
+            });
+            const twinFocused = applyQueryFocus(twinShapedFull.markdown);
+            const twinShaped =
+              twinFocused.queryFiltered || maxChars !== undefined
+                ? finalizeScrapedMarkdown(twinFocused.markdown, {
+                    isPdf: false,
+                    includeImages,
+                    maxChars,
+                    baseUrl: normalizedUrl,
+                  })
+                : twinShapedFull;
+            const twinArt = twinItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+            let twinMdArtifactId: string | undefined;
+            if (twinShaped.truncated && env.ARTIFACTS && twinShapedFull.markdown) {
+              const mdSha = await sha256HexString(twinShapedFull.markdown);
+              await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), twinShapedFull.markdown, {
+                httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+              }).catch(() => undefined);
+              twinMdArtifactId = `md:${mdSha}`;
+            }
+            return {
+              status: 200,
+              via: twinRes.via,
+              body: {
+                ok: true,
+                cached: false,
+                pipelineVersion: SCRAPE_PIPELINE_VERSION,
+                url: normalizedUrl,
+                finalUrl: normalizedUrl,
+                status: twinItem.status ?? 200,
+                via: twinRes.via,
+                extractorId: registryTwin.id,
+                ...(twinArt?.contentSha256 ? { contentSha256: twinArt.contentSha256 } : {}),
+                ...(twinArt?.blobSha256 ? { artifactId: twinArt.blobSha256 } : {}),
+                ...(twinMdArtifactId ? { markdownArtifactId: twinMdArtifactId } : {}),
+                ...(stringFormats.has('markdown') ? { markdown: twinShaped.markdown } : {}),
+                ...(stringFormats.has('text') ? { text: twinShaped.markdown } : {}),
+                ...(stringFormats.has('links') && formatted.links ? { links: formatted.links } : {}),
+                ...(twinFocused.queryFiltered ? { queryFiltered: true, chunks: twinFocused.chunks } : {}),
+                ...(twinShaped.truncated
+                  ? {
+                      truncated: true,
+                      totalChars: twinShaped.totalChars,
+                      nextOffset: twinShaped.nextOffset ?? twinShaped.markdown.length,
+                    }
+                  : {}),
+                metadata: {
+                  title: formatted.title,
+                  ...(formatted.description ? { description: formatted.description } : {}),
+                  ...(formatted.author ? { author: formatted.author } : {}),
+                  ...(formatted.publishedTime ? { publishedTime: formatted.publishedTime } : {}),
+                  alternateMarkdownUrl: registryTwin.fetchUrl,
+                  contentType: twinItem.contentType ?? registryTwin.accept,
+                },
+              },
+            };
+          }
+        }
+      }
+    } catch {
+      // Fall through cleanly to standard HTML fetch when twin endpoint is absent or fails.
     }
   }
 

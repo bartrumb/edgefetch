@@ -1,4 +1,4 @@
-.PHONY: build test race fuzz bench doctor hub-test up down fmt vet
+.PHONY: build test race fuzz bench bench-extract doctor hub-test up down fmt vet
 
 VERSION ?= 2.1.0
 LDFLAGS := -s -w -X github.com/bartrumb/edgefetch/internal/agent.Version=$(VERSION)
@@ -25,6 +25,9 @@ fuzz:
 
 bench:
 	go test -bench=. -benchmem ./...
+
+bench-extract:
+	node bench/run-bench.mjs
 
 doctor: build
 	./edgefetch doctor

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -288,5 +289,108 @@ func TestStartupReasonKeepsTheFatalLine(t *testing.T) {
 	}
 	if got := startupReason("", "only line"); got != "only line" {
 		t.Fatalf("reason = %q", got)
+	}
+}
+
+func TestRendererWaitsForAsyncXHRNetworkIdleOverCDP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		xhrDone := make(chan struct{})
+		hydrated := false
+		var writeMu sync.Mutex
+		for {
+			_, rawMsg, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(rawMsg, &req) != nil {
+				continue
+			}
+			send := func(obj any) {
+				b, _ := json.Marshal(obj)
+				writeMu.Lock()
+				_ = conn.Write(r.Context(), websocket.MessageText, b)
+				writeMu.Unlock()
+			}
+
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-spa"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-spa"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "sess-spa"}})
+			case "Page.navigate":
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "f1"}})
+				// Fire async SPA Fetch BEFORE loadEventFired, completing 150ms AFTER loadEventFired!
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Network.requestWillBeSent",
+					"params":    map[string]any{"requestId": "xhr-api-1", "type": "Fetch"},
+				})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Page.loadEventFired", "params": map[string]any{}})
+				go func(sid string) {
+					time.Sleep(150 * time.Millisecond)
+					send(map[string]any{
+						"sessionId": sid,
+						"method":    "Network.loadingFinished",
+						"params":    map[string]any{"requestId": "xhr-api-1"},
+					})
+					close(xhrDone)
+				}(req.SessionID)
+			case "Runtime.evaluate":
+				var p struct {
+					Expression string `json:"expression"`
+				}
+				_ = json.Unmarshal(req.Params, &p)
+				select {
+				case <-xhrDone:
+					hydrated = true
+				default:
+				}
+				if strings.Contains(p.Expression, "outerHTML") {
+					bodyText := `<div id="root">Loading...</div>`
+					if hydrated {
+						bodyText = `<main><h1>Async SPA Hydrated</h1><p>Loaded after XHR network-idle quiescence.</p></main>`
+					}
+					docJSON, _ := json.Marshal(map[string]string{
+						"url":  "https://spa.example.com/app",
+						"html": "<html><body>" + bodyText + "</body></html>",
+					})
+					send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}}})
+				} else {
+					send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"result": map[string]any{"type": "boolean", "value": true}}})
+				}
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	r := NewRenderer("", nil, "EdgeFetch/2.4", 2, nil)
+	r.dialOverrideWS = "ws://" + strings.TrimPrefix(srv.URL, "http://")
+	defer r.Close()
+
+	out, err := r.Execute(context.Background(), Task{
+		URL:       "https://spa.example.com/app",
+		WaitForMs: 80, // Shorter than the 150ms XHR — proves inFlight XHR tracking holds until loadingFinished!
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if !strings.Contains(out.HTML, "Async SPA Hydrated") {
+		t.Fatalf("expected SPA XHR network-idle wait to capture hydrated DOM, got: %s", out.HTML)
 	}
 }

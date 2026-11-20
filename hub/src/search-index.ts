@@ -55,6 +55,13 @@ import {
   type ContentState,
   type WafClassification,
 } from './waf';
+import {
+  isEligibleForExternalSpaFallback,
+  listConfiguredSpaFallbacks,
+  normalizeSpaFallbackMode,
+  tryExternalSpaFallback,
+  type SpaFallbackProvider,
+} from './spa-fallback';
 
 export const DEFAULT_CHUNK_CHARS = 1_500;
 export const DEFAULT_CHUNK_OVERLAP = 150;
@@ -866,6 +873,8 @@ export interface ExtractRequestPayload {
   maxAgeMs?: unknown;
   redactPii?: unknown;
   waybackFallback?: unknown;
+  spaFallback?: unknown;
+  noCache?: unknown;
   collectionId?: unknown;
   ephemeral?: boolean;
   target?: unknown;
@@ -932,6 +941,7 @@ export async function executeExtractCall(params: {
     typeof payload.maxAgeMs === 'number' && Number.isFinite(payload.maxAgeMs) ? Math.max(0, Math.floor(payload.maxAgeMs)) : 0;
   const redactPii = Boolean(payload.redactPii);
   const waybackFallback = Boolean(payload.waybackFallback);
+  const spaFallbackMode = normalizeSpaFallbackMode(payload.spaFallback);
   const collectionId =
     typeof payload.collectionId === 'string' && COLLECTION_ID_RE.test(payload.collectionId.trim())
       ? payload.collectionId.trim()
@@ -960,7 +970,7 @@ export async function executeExtractCall(params: {
       contentSource?: 'meta-description' | 'ssr-hydration' | 'wayback';
       waybackSnapshotUrl?: string;
       waybackTimestamp?: string;
-      renderedVia?: 'browser' | 'browser-auto';
+      renderedVia?: 'browser' | 'browser-auto' | SpaFallbackProvider;
       preChunkedRecords?: MarkdownChunk[];
       recordCount?: number;
       totalRecords?: number;
@@ -1070,6 +1080,8 @@ export async function executeExtractCall(params: {
     };
     const fetchOut = await executeHubFetch(target, JSON.stringify(call), site, source, retentionMode, !isEphemeral, collectionId);
     via = fetchOut.via;
+    let batchHubErrCode: unknown;
+    const resMap = new Map<string, Record<string, unknown>>();
     if (fetchOut.status !== 200) {
       let errBody: Record<string, unknown> = { ok: false, error: 'extract_failed' };
       try {
@@ -1077,13 +1089,23 @@ export async function executeExtractCall(params: {
       } catch {
         // ignore
       }
-      return { status: fetchOut.status, via, body: errBody };
-    }
-
-    const parsed = JSON.parse(fetchOut.bodyText) as { results?: Array<Record<string, unknown>> };
-    const resMap = new Map<string, Record<string, unknown>>();
-    for (const r of parsed.results ?? []) {
-      if (typeof r.id === 'string') resMap.set(r.id, r);
+      batchHubErrCode = errBody.error;
+      const canSpaRescue =
+        listConfiguredSpaFallbacks(env).length > 0 &&
+        isEligibleForExternalSpaFallback({
+          mode: spaFallbackMode,
+          status: fetchOut.status,
+          errorCode: batchHubErrCode,
+          problem: typeof errBody.message === 'string' ? errBody.message : '',
+        });
+      if (!canSpaRescue) {
+        return { status: fetchOut.status, via, body: errBody };
+      }
+    } else {
+      const parsed = JSON.parse(fetchOut.bodyText) as { results?: Array<Record<string, unknown>> };
+      for (const r of parsed.results ?? []) {
+        if (typeof r.id === 'string') resMap.set(r.id, r);
+      }
     }
 
     const fallbackHtmlItems = toFetch.filter((item) => {
@@ -1138,6 +1160,41 @@ export async function executeExtractCall(params: {
           classifyWafAndChallenge({ status: typeof r?.status === 'number' ? r.status : 0, rawBody: rawErrBody });
 
         if (
+          isEligibleForExternalSpaFallback({
+            mode: spaFallbackMode,
+            outcome: r?.outcome ?? 'error',
+            status: r?.status ?? (batchHubErrCode === 'fat_agent_required' ? 503 : 0),
+            errorCode: batchHubErrCode,
+            problem: prob,
+            waf: errWaf,
+          })
+        ) {
+          const spaOut = await tryExternalSpaFallback({
+            url: item.url,
+            env,
+            mode: spaFallbackMode,
+            robotsAlreadyVerified: false,
+            onlyMainContent: true,
+            noCache: Boolean(payload.noCache),
+          });
+          if (spaOut) {
+            via = spaOut.via;
+            byUrl.set(item.url, {
+              url: item.url,
+              finalUrl: spaOut.finalUrl,
+              redirectInfo: analyzeUrlRedirect(item.url, spaOut.finalUrl),
+              status: spaOut.status,
+              cached: false,
+              ...(spaOut.title ? { title: spaOut.title } : {}),
+              contentState: 'active',
+              renderedVia: spaOut.provider,
+              markdown: redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown,
+            });
+            continue;
+          }
+        }
+
+        if (
           waybackFallback &&
           isEligibleForWaybackFallback({
             outcome: r?.outcome,
@@ -1186,7 +1243,7 @@ export async function executeExtractCall(params: {
 
       let rawBodyStr = typeof r.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
       let finalUrl = typeof r.finalUrl === 'string' && r.finalUrl ? r.finalUrl : item.url;
-      let renderedVia: 'browser' | 'browser-auto' | undefined =
+      let renderedVia: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
         explicitRenderMode === 'always' ? 'browser' : r.rendered === true ? 'browser-auto' : undefined;
 
       // R2 & R3: Guard against HTTP 200 WAF/CAPTCHA interstitials with all 4 anti-false-positive layers!
@@ -1528,7 +1585,7 @@ export async function executeExtractCall(params: {
         }
       }
 
-      const stateRes = classifyContentState({
+      let stateRes = classifyContentState({
         status: typeof r.status === 'number' ? r.status : 200,
         title,
         markdown: md,
@@ -1536,6 +1593,40 @@ export async function executeExtractCall(params: {
         ...(jobPosting?.validThrough ? { validThrough: jobPosting.validThrough } : {}),
         nowMs: now,
       });
+
+      if (
+        isHtml &&
+        !isPdf &&
+        effectiveRenderMode !== 'off' &&
+        countExtractWords(md) < 50 &&
+        isThinScriptedPage(rawBodyStr, md) &&
+        isEligibleForExternalSpaFallback({
+          mode: spaFallbackMode,
+          outcome: 'ok',
+          status: r.status ?? 200,
+          waf: okWaf,
+          contentState: stateRes.state,
+          isThinSpa200: true,
+        })
+      ) {
+        const spaOut = await tryExternalSpaFallback({
+          url: finalUrl,
+          env,
+          mode: spaFallbackMode,
+          robotsAlreadyVerified: true,
+          onlyMainContent: true,
+          noCache: Boolean(payload.noCache),
+        });
+        if (spaOut && countExtractWords(spaOut.markdown) > countExtractWords(md)) {
+          md = redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown;
+          finalUrl = spaOut.finalUrl;
+          if (spaOut.title) title = spaOut.title;
+          via = spaOut.via;
+          renderedVia = spaOut.provider;
+          contentSource = undefined;
+          stateRes = { state: 'active' };
+        }
+      }
 
       byUrl.set(item.url, {
         url: item.url,

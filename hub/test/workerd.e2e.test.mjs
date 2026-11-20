@@ -325,6 +325,7 @@ test('H7 workerd integration suite: AgentHubDO WebSockets, 413 fast-fail, 20 MiB
         webSearch: false,
         pdfOcr: false,
         webBotAuth: false,
+        spaFallback: false,
       });
     }
   } finally {

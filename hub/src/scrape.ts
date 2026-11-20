@@ -40,6 +40,13 @@ import {
   type ContentState,
   type WafClassification,
 } from './waf';
+import {
+  isEligibleForExternalSpaFallback,
+  normalizeSpaFallbackMode,
+  tryExternalSpaFallback,
+  type SpaFallbackProvider,
+  type SpaFallbackSuccess,
+} from './spa-fallback';
 
 export const SCRAPE_PIPELINE_VERSION = 22;
 
@@ -3064,6 +3071,8 @@ export interface ScrapeRequestPayload {
   maxPages?: unknown;
   ocr?: unknown;
   waybackFallback?: unknown;
+  spaFallback?: unknown;
+  noCache?: unknown;
   collectionId?: unknown;
   target?: unknown;
   site?: unknown;
@@ -4953,6 +4962,15 @@ export async function executeScrapeCall(params: {
     stringFormats.has('llmsTxt') ||
     (explicitDiscoverLlms !== false && shouldAutoProbeOriginLlms(parsedUrl, now));
   const redactPii = Boolean(payload.redactPii);
+  const spaFallbackMode = normalizeSpaFallbackMode(payload.spaFallback);
+  const waitForMsOpt =
+    typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
+      ? Math.min(15_000, Math.max(0, Math.floor(payload.waitForMs)))
+      : undefined;
+  const waitSelectorOpt =
+    typeof payload.waitSelector === 'string' && payload.waitSelector.trim()
+      ? payload.waitSelector.trim().slice(0, 200)
+      : undefined;
   const maxAgeMs = typeof payload.maxAgeMs === 'number' && Number.isFinite(payload.maxAgeMs) ? Math.max(0, Math.floor(payload.maxAgeMs)) : 0;
   const maxPagesCap =
     typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages)
@@ -5743,6 +5761,56 @@ export async function executeScrapeCall(params: {
     }
   }
 
+  const formatExternalSpaResponse = (spa: SpaFallbackSuccess): { status: number; via: string; body: Record<string, unknown> } => {
+    const cleanRaw = redactPii ? redactPiiText(spa.markdown) : spa.markdown;
+    const spaFull = finalizeScrapedMarkdown(cleanRaw, {
+      isPdf: false,
+      includeImages,
+      baseUrl: spa.finalUrl,
+    });
+    const spaFocused = applyQueryFocus(spaFull.markdown);
+    const spaShaped =
+      spaFocused.queryFiltered || maxChars !== undefined
+        ? finalizeScrapedMarkdown(spaFocused.markdown, { isPdf: false, includeImages, maxChars, baseUrl: spa.finalUrl })
+        : spaFull;
+    const redir = analyzeUrlRedirect(normalizedUrl, spa.finalUrl);
+    return {
+      status: 200,
+      via: spa.via,
+      body: {
+        ok: true,
+        cached: false,
+        pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        url: normalizedUrl,
+        finalUrl: spa.finalUrl,
+        ...(redir.redirected
+          ? {
+              redirected: true,
+              ...(redir.redirectNote ? { redirectNote: redir.redirectNote } : {}),
+              ...(redir.filtersMayBeLost ? { filtersMayBeLost: true } : {}),
+            }
+          : {}),
+        status: spa.status,
+        via: spa.via,
+        renderedVia: spa.provider,
+        contentState: 'active' as const,
+        ...(stringFormats.has('markdown') ? { markdown: spaShaped.markdown } : {}),
+        ...(stringFormats.has('text') ? { text: spaShaped.markdown } : {}),
+        ...(stringFormats.has('links') && spa.links ? { links: spa.links } : {}),
+        ...(spaFocused.queryFiltered ? { queryFiltered: true, chunks: spaFocused.chunks } : {}),
+        ...(spaShaped.truncated
+          ? { truncated: true, totalChars: spaShaped.totalChars, nextOffset: spaShaped.nextOffset ?? spaShaped.markdown.length }
+          : {}),
+        metadata: {
+          ...(spa.title ? { title: spa.title } : {}),
+          ...(spa.description ? { description: spa.description } : {}),
+          wordCount: countTextWords(spaFull.markdown),
+          contentType: 'text/html; charset=utf-8',
+        },
+      },
+    };
+  };
+
   const fetchRes = await executeHubFetch(target, JSON.stringify(fetchCall), site, source, retentionMode, true, collectionId);
   if (fetchRes.status !== 200) {
     let errJson: Record<string, unknown> = { ok: false, error: 'scrape_failed' };
@@ -5750,6 +5818,28 @@ export async function executeScrapeCall(params: {
       errJson = { ok: false, ...(JSON.parse(fetchRes.bodyText) as Record<string, unknown>) };
     } catch {
       // ignore
+    }
+    if (
+      isEligibleForExternalSpaFallback({
+        mode: spaFallbackMode,
+        status: fetchRes.status,
+        errorCode: errJson.error,
+        problem: typeof errJson.message === 'string' ? errJson.message : '',
+      })
+    ) {
+      const spaOut = await tryExternalSpaFallback({
+        url: normalizedUrl,
+        env,
+        mode: spaFallbackMode,
+        robotsAlreadyVerified: false,
+        onlyMainContent,
+        waitForMs: waitForMsOpt,
+        waitSelector: waitSelectorOpt,
+        noCache: Boolean(payload.noCache),
+      });
+      if (spaOut) {
+        return formatExternalSpaResponse(spaOut);
+      }
     }
     return {
       status: fetchRes.status,
@@ -5825,6 +5915,31 @@ export async function executeScrapeCall(params: {
     const errWaf =
       (item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
       classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 0, rawBody: rawErrBody });
+
+    // Ethical External Heavy-SPA Fallback (`Crawl4AI` / `Firecrawl`) on local browser/transport failure (NEVER on robots.txt, 403, 429, or challenges!)
+    if (
+      isEligibleForExternalSpaFallback({
+        mode: spaFallbackMode,
+        outcome: item.outcome,
+        status: item.status,
+        problem: problemText,
+        waf: errWaf,
+      })
+    ) {
+      const spaOut = await tryExternalSpaFallback({
+        url: normalizedUrl,
+        env,
+        mode: spaFallbackMode,
+        robotsAlreadyVerified: false,
+        onlyMainContent,
+        waitForMs: waitForMsOpt,
+        waitSelector: waitSelectorOpt,
+        noCache: Boolean(payload.noCache),
+      });
+      if (spaOut) {
+        return formatExternalSpaResponse(spaOut);
+      }
+    }
 
     // R8: Opt-in Internet Archive (`Wayback CDX`) link-rot fallback — strictly ONLY on 5xx / DNS-dead failures, NEVER on robots/403/429/challenges!
     if (
@@ -5959,7 +6074,7 @@ export async function executeScrapeCall(params: {
 
   let rawBodyStr = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
   let finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
-  let renderedViaOut: 'browser' | 'browser-auto' | undefined =
+  let renderedViaOut: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
     renderMode === 'always' ? 'browser' : item.rendered === true ? 'browser-auto' : undefined;
 
   // R2 & R3: Guard against HTTP 200 WAF/CAPTCHA interstitials (e.g. Imperva / PerimeterX / DataDome 200 shells) using all 4 anti-FP layers!
@@ -6489,6 +6604,60 @@ export async function executeScrapeCall(params: {
     rawCleanMarkdown = fullShaped.markdown;
     textOut = cleanDesc;
     contentSourceOut = 'meta-description';
+  }
+
+  // Ethical Heavy-SPA Fallback (`Crawl4AI` / `Firecrawl`) when a `200 OK` `<script>` SPA shell remained thin (`< 50` words)
+  // even after SSR hydration + local browser attempt, provided there is NO WAF challenge, login wall, soft-404, or closed posting!
+  if (
+    isHtmlBody &&
+    !isPdfResponse &&
+    effectiveRenderMode !== 'off' &&
+    countTextWords(rawCleanMarkdown) < 50 &&
+    isThinScriptedPage(rawBodyStr, rawCleanMarkdown)
+  ) {
+    const preState = classifyContentState({
+      status: typeof item.status === 'number' ? item.status : 200,
+      title: prelimTitle,
+      markdown: rawCleanMarkdown,
+      rawHtml: rawBodyStr,
+      nowMs: now,
+    });
+    if (
+      isEligibleForExternalSpaFallback({
+        mode: spaFallbackMode,
+        outcome: 'ok',
+        status: item.status ?? 200,
+        waf: okWafMatch,
+        contentState: preState.state,
+        isThinSpa200: true,
+      })
+    ) {
+      const spaOut = await tryExternalSpaFallback({
+        url: finalUrl,
+        env,
+        mode: spaFallbackMode,
+        robotsAlreadyVerified: true,
+        onlyMainContent,
+        waitForMs: waitForMsOpt,
+        waitSelector: waitSelectorOpt,
+        noCache: Boolean(payload.noCache),
+      });
+      if (spaOut && countTextWords(spaOut.markdown) > countTextWords(rawCleanMarkdown)) {
+        const cleanSpaMd = redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown;
+        fullShaped = finalizeScrapedMarkdown(cleanSpaMd, {
+          isPdf: false,
+          includeImages,
+          maxChars: undefined,
+          baseUrl: spaOut.finalUrl,
+        });
+        rawCleanMarkdown = fullShaped.markdown;
+        textOut = rawCleanMarkdown;
+        finalUrl = spaOut.finalUrl;
+        viaOut = spaOut.via;
+        renderedViaOut = spaOut.provider;
+        contentSourceOut = undefined;
+      }
+    }
   }
 
   // P5: When `query` is combined with a JSON record array, rank across the per-record chunks directly so fields never bleed across records!

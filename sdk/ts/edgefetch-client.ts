@@ -46,6 +46,7 @@ export interface ScrapeParams {
   jsonFilter?: string;
   collectionId?: string;
   waybackFallback?: boolean;
+  spaFallback?: 'auto' | 'off' | 'crawl4ai' | 'firecrawl';
   target?: 'auto' | 'agent' | 'container';
   site?: string;
 }
@@ -65,6 +66,7 @@ export interface ExtractParams {
   redactPii?: boolean;
   collectionId?: string;
   waybackFallback?: boolean;
+  spaFallback?: 'auto' | 'off' | 'crawl4ai' | 'firecrawl';
   target?: 'auto' | 'agent' | 'container';
   site?: string;
 }

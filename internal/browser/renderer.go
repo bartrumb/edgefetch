@@ -477,6 +477,55 @@ func navigateAndWait(
 	status := 0
 	hdrs := make(http.Header)
 	hdrs.Set("Content-Type", "text/html; charset=utf-8")
+	inFlight := make(map[string]time.Time)
+
+	handleNetEvent := func(ev cdpEvent) (loadFired bool) {
+		if ev.SessionID != sessionID {
+			return false
+		}
+		switch ev.Method {
+		case "Network.requestWillBeSent":
+			var rw struct {
+				RequestID string `json:"requestId"`
+				Type      string `json:"type"`
+			}
+			if json.Unmarshal(ev.Params, &rw) == nil && rw.RequestID != "" {
+				// Track SPA data & code requests; ignore long-lived streaming/beacon types (WebSocket, EventSource, Media, Ping).
+				switch rw.Type {
+				case "Document", "XHR", "Fetch", "Script":
+					inFlight[rw.RequestID] = time.Now()
+				}
+			}
+		case "Network.loadingFinished", "Network.loadingFailed":
+			var lf struct {
+				RequestID string `json:"requestId"`
+			}
+			if json.Unmarshal(ev.Params, &lf) == nil && lf.RequestID != "" {
+				delete(inFlight, lf.RequestID)
+			}
+		case "Network.responseReceived":
+			var rr struct {
+				RequestID string `json:"requestId"`
+				Type      string `json:"type"`
+				FrameID   string `json:"frameId"`
+				Response  struct {
+					Status  int               `json:"status"`
+					Headers map[string]string `json:"headers"`
+				} `json:"response"`
+			}
+			if json.Unmarshal(ev.Params, &rr) == nil {
+				if (rr.Type == "Document" || rr.FrameID == navOut.FrameID) && rr.Response.Status > 0 {
+					status = rr.Response.Status
+					for k, v := range rr.Response.Headers {
+						hdrs.Set(k, v)
+					}
+				}
+			}
+		case "Page.loadEventFired":
+			return true
+		}
+		return false
+	}
 
 	loadWait := time.NewTimer(15 * time.Second)
 	defer loadWait.Stop()
@@ -484,28 +533,7 @@ func navigateAndWait(
 	for !loaded {
 		select {
 		case ev := <-events:
-			if ev.SessionID != sessionID {
-				continue
-			}
-			switch ev.Method {
-			case "Network.responseReceived":
-				var rr struct {
-					Type     string `json:"type"`
-					FrameID  string `json:"frameId"`
-					Response struct {
-						Status  int               `json:"status"`
-						Headers map[string]string `json:"headers"`
-					} `json:"response"`
-				}
-				if json.Unmarshal(ev.Params, &rr) == nil {
-					if (rr.Type == "Document" || rr.FrameID == navOut.FrameID) && rr.Response.Status > 0 {
-						status = rr.Response.Status
-						for k, v := range rr.Response.Headers {
-							hdrs.Set(k, v)
-						}
-					}
-				}
-			case "Page.loadEventFired":
+			if handleNetEvent(ev) {
 				loaded = true
 			}
 		case <-cdp.closeCh:
@@ -521,6 +549,9 @@ func navigateAndWait(
 		_ = waitForCSSSelector(ctx, cdp, sessionID, waitSelector, 8*time.Second)
 	}
 
+	// SPA Network-Idle + Lazy-Scroll + DOM Mutation Quiescence:
+	// Trigger IntersectionObserver / lazy-loaded SPA sections and wait for active XHR/Fetch calls to drain.
+	explicitWait := waitForMs > 0
 	settle := waitForMs
 	if settle <= 0 {
 		settle = defaultRenderSettleMs
@@ -528,12 +559,67 @@ func navigateAndWait(
 	if settle > maxRenderSettleMs {
 		settle = maxRenderSettleMs
 	}
-	t := time.NewTimer(time.Duration(settle) * time.Millisecond)
-	defer t.Stop()
-	select {
-	case <-t.C:
-	case <-ctx.Done():
-		return 0, nil, ctx.Err()
+
+	maxIdleBudget := time.Duration(settle) * time.Millisecond
+	if maxIdleBudget < 3500*time.Millisecond {
+		maxIdleBudget = 3500 * time.Millisecond
+	}
+	quietWindow := 400 * time.Millisecond
+	if explicitWait && time.Duration(settle)*time.Millisecond < quietWindow {
+		quietWindow = time.Duration(settle) * time.Millisecond
+	}
+
+	idleDeadline := time.Now().Add(maxIdleBudget)
+	minFloor := time.Now().Add(time.Duration(settle) * time.Millisecond)
+	if !explicitWait {
+		minFloor = time.Now().Add(350 * time.Millisecond)
+	}
+	idleSince := time.Time{}
+	if len(inFlight) == 0 {
+		idleSince = time.Now()
+	}
+
+	pollTick := time.NewTicker(50 * time.Millisecond)
+	for {
+		now := time.Now()
+		for id, started := range inFlight {
+			if now.Sub(started) > 8*time.Second {
+				delete(inFlight, id)
+			}
+		}
+		if len(inFlight) == 0 {
+			if idleSince.IsZero() {
+				idleSince = now
+			}
+			if !now.Before(minFloor) && now.Sub(idleSince) >= quietWindow {
+				break
+			}
+		} else {
+			idleSince = time.Time{}
+		}
+		if !now.Before(idleDeadline) {
+			break
+		}
+		select {
+		case ev := <-events:
+			_ = handleNetEvent(ev)
+			if len(inFlight) > 0 {
+				idleSince = time.Time{}
+			}
+		case <-pollTick.C:
+		case <-cdp.closeCh:
+			pollTick.Stop()
+			return 0, nil, cdp.crashError("during SPA network-idle wait")
+		case <-ctx.Done():
+			pollTick.Stop()
+			return 0, nil, ctx.Err()
+		}
+	}
+	pollTick.Stop()
+
+	// Trigger lazy IntersectionObserver cards and wait briefly for client-side DOM hydration mutations to settle.
+	if !explicitWait || waitForMs >= 250 {
+		_ = waitForSPADOMQuiescence(ctx, cdp, sessionID)
 	}
 
 	if status == 0 {
@@ -694,8 +780,101 @@ func (r *Renderer) runAction(ctx context.Context, cdp *cdpConn, sess *retainedSe
 	}
 }
 
+func waitForSPADOMQuiescence(ctx context.Context, cdp *cdpConn, sessionID string) error {
+	js := `new Promise((resolve) => {
+		try {
+			const h = window.innerHeight || 800;
+			window.scrollTo(0, h);
+			setTimeout(() => { try { window.scrollTo(0, h * 2); } catch {} }, 80);
+			setTimeout(() => { try { window.scrollTo(0, 0); } catch {} }, 160);
+			const wordCount = () => ((document.body && document.body.innerText) || "").trim().split(/\s+/).filter(Boolean).length;
+			const isPlaceholder = () => /^(loading|please wait|just a moment)\b/i.test(((document.body && document.body.innerText) || "").trim());
+			let lastMut = Date.now();
+			const start = lastMut;
+			const obs = new MutationObserver(() => { lastMut = Date.now(); });
+			if (document.documentElement) {
+				obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+			}
+			const check = () => {
+				const now = Date.now();
+				const elapsed = now - start;
+				const quiet = now - lastMut;
+				const words = wordCount();
+				if (elapsed >= 2400 || (words >= 45 && !isPlaceholder() && quiet >= 260 && elapsed >= 180) || (quiet >= 600 && elapsed >= 220)) {
+					obs.disconnect();
+					resolve(true);
+					return;
+				}
+				setTimeout(check, 90);
+			};
+			setTimeout(check, 180);
+		} catch {
+			resolve(true);
+		}
+	})`
+	var res struct {
+		Result struct {
+			Value bool `json:"value"`
+		} `json:"result"`
+	}
+	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return cdp.call(qctx, sessionID, "Runtime.evaluate", map[string]any{
+		"expression":    js,
+		"returnByValue": true,
+		"awaitPromise":  true,
+	}, &res)
+}
+
 func readDocumentHTML(ctx context.Context, cdp *cdpConn, sessionID string) (htmlStr, finalURL string, err error) {
-	raw, err := evalString(ctx, cdp, sessionID, `JSON.stringify({ url: String(location.href || ""), html: document.documentElement ? document.documentElement.outerHTML : "" })`)
+	// Serialize full DOM including open Web Component shadowRoot trees (`getHTML({ serializableShadowRoots: true })`
+	// or light-DOM shadow flattening fallback) so Shadow-DOM SPAs (Lit, Stencil, LWC, Shoelace) extract cleanly.
+	expr := `(() => {
+		const root = document.documentElement;
+		if (!root) return JSON.stringify({ url: String(location.href || ""), html: "" });
+		let html = "";
+		try {
+			let hasShadow = false;
+			const walkCheck = (el) => {
+				if (hasShadow || !el) return;
+				if (el.shadowRoot) { hasShadow = true; return; }
+				for (let c = el.firstElementChild; c; c = c.nextElementSibling) walkCheck(c);
+			};
+			walkCheck(root);
+			if (!hasShadow) {
+				html = root.outerHTML;
+			} else {
+				const cloneWithShadow = (node) => {
+					if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.nodeValue || "");
+					if (node.nodeType !== Node.ELEMENT_NODE) return null;
+					const tag = node.tagName.toLowerCase();
+					if (tag === "script" || tag === "style") return node.cloneNode(true);
+					const copy = node.cloneNode(false);
+					if (tag === "details") copy.setAttribute("open", "");
+					if (node.shadowRoot) {
+						const wrapper = document.createElement("div");
+						wrapper.setAttribute("data-shadow-root", "open");
+						for (const sc of node.shadowRoot.childNodes) {
+							const c = cloneWithShadow(sc);
+							if (c) wrapper.appendChild(c);
+						}
+						copy.appendChild(wrapper);
+					}
+					for (const ch of node.childNodes) {
+						const c = cloneWithShadow(ch);
+						if (c) copy.appendChild(c);
+					}
+					return copy;
+				};
+				const cloned = cloneWithShadow(root);
+				html = cloned ? cloned.outerHTML : root.outerHTML;
+			}
+		} catch {
+			html = root.outerHTML;
+		}
+		return JSON.stringify({ url: String(location.href || ""), html });
+	})()`
+	raw, err := evalString(ctx, cdp, sessionID, expr)
 	if err != nil {
 		return "", "", err
 	}

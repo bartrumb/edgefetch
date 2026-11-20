@@ -106,10 +106,29 @@ type retainedSession struct {
 	targetID         string
 	cdpSessionID     string
 	initialHost      string
+	lastCheckedURL   string
 	hasExtraHeaders  bool
 	lastUsed         time.Time
 	lastStatus       int
 	lastHeaders      http.Header
+}
+
+func (s *retainedSession) getLastCheckedURL() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastCheckedURL
+}
+
+func (s *retainedSession) setLastCheckedURL(u string) {
+	if s == nil || u == "" {
+		return
+	}
+	s.mu.Lock()
+	s.lastCheckedURL = u
+	s.mu.Unlock()
 }
 
 func (s *retainedSession) setResponseMeta(status int, hdrs http.Header) {
@@ -482,13 +501,14 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 				return Output{}, err
 			}
 		}
+		sess.setLastCheckedURL(u.String())
 		status, hdrs, err := navigateAndWait(ctx, cdp, sess.cdpSessionID, events, task.URL, task.WaitForMs, task.WaitSelector)
 		if err != nil {
 			return Output{}, err
 		}
 		sess.setResponseMeta(status, hdrs)
 		if preHTML, preURL, rErr := readDocumentHTML(ctx, cdp, sess.cdpSessionID); rErr == nil {
-			if vErr := r.validateFinalURL(ctx, preURL, task.URL); vErr != nil {
+			if vErr := r.validateFinalURL(ctx, sess, preURL, task.URL); vErr != nil {
 				return Output{}, vErr
 			}
 			if why := extract.DetectRenderedChallenge(preHTML); why != "" {
@@ -514,11 +534,11 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 	if err != nil {
 		return Output{}, err
 	}
-	if vErr := r.validateFinalURL(ctx, finalURL, task.URL); vErr != nil {
+	if vErr := r.validateFinalURL(ctx, sess, finalURL, task.URL); vErr != nil {
 		return Output{}, vErr
 	}
 	for i := range actionScrapes {
-		if vErr := r.validateFinalURL(ctx, actionScrapes[i].URL, task.URL); vErr != nil {
+		if vErr := r.validateFinalURL(ctx, sess, actionScrapes[i].URL, task.URL); vErr != nil {
 			return Output{}, vErr
 		}
 	}
@@ -819,6 +839,7 @@ func (r *Renderer) runAction(
 				return err
 			}
 		}
+		sess.setLastCheckedURL(u.String())
 		if sess.hasExtraHeaders && sess.initialHost != "" && !strings.EqualFold(u.Hostname(), sess.initialHost) {
 			_ = cdp.call(ctx, sess.cdpSessionID, "Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{}}, nil)
 			sess.hasExtraHeaders = false
@@ -1110,7 +1131,7 @@ func readDocumentHTML(ctx context.Context, cdp *cdpConn, sessionID string) (html
 	return payload.HTML, payload.URL, nil
 }
 
-func (r *Renderer) validateFinalURL(ctx context.Context, finalURL, initialURL string) error {
+func (r *Renderer) validateFinalURL(ctx context.Context, sess *retainedSession, finalURL, initialURL string) error {
 	trimmed := strings.TrimSpace(finalURL)
 	if trimmed == "" {
 		return nil
@@ -1133,10 +1154,12 @@ func (r *Renderer) validateFinalURL(ctx context.Context, finalURL, initialURL st
 			return fmt.Errorf("rendered final URL blocked by SSRF policy (%s): %w", u.Redacted(), err)
 		}
 	}
-	if r.CheckRobots != nil && initialURL != "" && trimmed != initialURL {
+	prevChecked := sess.getLastCheckedURL()
+	if r.CheckRobots != nil && trimmed != initialURL && trimmed != prevChecked {
 		if err := r.CheckRobots(ctx, u.String()); err != nil {
 			return fmt.Errorf("rendered final URL disallowed by robots.txt: %w", err)
 		}
+		sess.setLastCheckedURL(u.String())
 	}
 	return nil
 }

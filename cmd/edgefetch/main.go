@@ -256,6 +256,7 @@ func main() {
 			log.Error("agent_config", slog.String("error", err.Error()))
 			os.Exit(2)
 		}
+		priv.LockDownSecretPaths(agent.DefaultHAOptionsPath)
 		if err := priv.DropRoot(); err != nil {
 			log.Error("agent_drop_privileges", slog.String("error", err.Error()))
 			os.Exit(2)
@@ -367,8 +368,9 @@ func main() {
 		log.Error("listen", slog.String("addr", addr), slog.String("error", listenErr.Error()))
 		os.Exit(1)
 	}
-	// Drop root privileges after reading /data/options.json and binding the TCP listener so hybrid/server/hub modes
-	// run unprivileged (65532:65532) just like pure agent mode!
+	// Drop root privileges after reading /data/options.json, locking down /data, and binding the TCP listener so
+	// hybrid/server/hub modes run unprivileged (65532:65532) just like pure agent mode!
+	priv.LockDownSecretPaths(agent.DefaultHAOptionsPath)
 	if err := priv.DropRoot(); err != nil {
 		log.Error("drop_privileges", slog.String("error", err.Error()))
 		_ = ln.Close()

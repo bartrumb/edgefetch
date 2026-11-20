@@ -108,10 +108,16 @@ jobs:
           docker buildx build --platform linux/amd64 -f Dockerfile.agent .
           docker buildx build --platform linux/amd64 -f Dockerfile.all-in-one .
           docker buildx build --load --platform linux/amd64 -t edgefetch-ci:smoke -f edgefetch_fat/Dockerfile .
-          sudo apparmor_parser -r edgefetch_fat/apparmor.txt
-          docker run -d --rm --name ef-smoke -u 65532:65532 \
-            --security-opt apparmor=edgefetch_fat \
-            --security-opt no-new-privileges:true \
+          sed 's/^profile edgefetch_fat/profile c3b8e9a1_edgefetch_fat/' edgefetch_fat/apparmor.txt > /tmp/haos_edgefetch_fat.apparmor
+          sudo apparmor_parser -r /tmp/haos_edgefetch_fat.apparmor
+          mkdir -p /tmp/ef-ha-data
+          chmod 0755 /tmp/ef-ha-data
+          printf '{"hub_url":"https://example.com","agent_token":"0123456789abcdef0123456789abcdef","site_id":"ci-node"}' > /tmp/ef-ha-data/options.json
+          chmod 0644 /tmp/ef-ha-data/options.json
+          docker run -d --rm --name ef-smoke \
+            --security-opt apparmor=c3b8e9a1_edgefetch_fat \
+            --security-opt no-new-privileges:false \
+            -v /tmp/ef-ha-data:/data \
             -e EDGEFETCH_SERVER_TOKEN=ci-smoke-token-0123456789abcdef \
             -p 127.0.0.1:18080:8080 \
             --entrypoint /edgefetch \
@@ -121,6 +127,11 @@ jobs:
             curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
             sleep 0.5
           done
+          # Verify LockDownSecretPaths locked /data (0700) and /data/options.json (0600) so UID 65532 cannot read it!
+          if docker exec -u 65532:65532 ef-smoke /usr/bin/pdftotext /data/options.json - 2>/dev/null; then
+            echo "SECURITY FAILURE: UID 65532 was able to access /data/options.json!"
+            exit 1
+          fi
           resp=$(curl -fsS -H "Authorization: Bearer ci-smoke-token-0123456789abcdef" \
             -H "Content-Type: application/json" \
             -d '{"maxSeconds":45,"options":{"includeBody":false,"timeoutMs":35000},"requests":[{"id":"smoke","url":"https://example.com/","kind":"render","formats":["markdown"],"interact":{"actions":[{"type":"wait","selector":"p","waitMs":5000}]}},{"id":"webgl","url":"https://get.webgl.org/","kind":"render","formats":["markdown"],"waitForMs":2500}]}' \

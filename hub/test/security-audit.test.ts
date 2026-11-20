@@ -19,7 +19,7 @@ import { completeLlmTurn, resolveLlmConfig } from '../src/llm.ts';
 import { matchesSafeCrawlPattern } from '../src/map-crawl.ts';
 import { isRobotsAllowed, parseOverflowRobotsTxt } from '../src/overflow.ts';
 import { compileSafeUserRegex, normalizeClientRateLimitIp } from '../src/safe-input.ts';
-import { extractHtmlDocument, extractStructuredJsonFromPage } from '../src/scrape.ts';
+import { executeInteractCall, extractHtmlDocument, extractStructuredJsonFromPage } from '../src/scrape.ts';
 import { r2ArtifactKey } from '../src/storage.ts';
 import { classifyContentState, recoverSsrHydrationContent } from '../src/waf.ts';
 
@@ -561,4 +561,67 @@ test('SEC-AUDIT-5 (M4, M5, M8 & Low): Linear O(N) HTML scanners, safe user regex
   const serializedDispatches = JSON.stringify(dispatchedPayloads);
   assert.equal(serializedDispatches.includes('executeJavascript'), false, 'M8: executeJavascript leaked into /v1/agent browser dispatch!');
   assert.equal(serializedDispatches.includes('evil-exfil.example'), false, 'M8: navigate URL leaked into /v1/agent browser dispatch!');
+});
+
+test('Multi-tenant interact sessionId: HMAC-SHA256 caller principal binding blocks cross-caller session hijacking', async () => {
+  const signingSecret = 'caller-token-signing-secret-0123456789';
+  const mockExecuteHubFetch = async () => ({
+    status: 200,
+    via: 'agent:site-x86',
+    bodyText: JSON.stringify({
+      results: [
+        {
+          id: 'interact-1',
+          url: 'https://example.com/',
+          finalUrl: 'https://example.com/',
+          outcome: 'ok',
+          status: 200,
+          sessionId: 'efsess_abcdef0123456789abcdef01',
+          body: '<html><head><title>Example</title></head><body><main><p>Session content</p></main></body></html>',
+        },
+      ],
+    }),
+  });
+
+  const turn1 = await executeInteractCall({
+    payload: { url: 'https://example.com/', keepSession: true },
+    env: {},
+    executeHubFetch: mockExecuteHubFetch,
+    principal: 'oauth:client-alpha',
+    sessionSigningSecret: signingSecret,
+  });
+  assert.equal(turn1.status, 200);
+  const sid = String(turn1.body.sessionId ?? '');
+  assert.match(sid, /^site-x86\.efsess_abcdef0123456789abcdef01\.[0-9a-f]{32}$/);
+
+  // Same principal (even via MCP surface) can resume its own session cleanly.
+  const turn2Same = await executeInteractCall({
+    payload: { sessionId: sid, closeSession: true },
+    env: {},
+    executeHubFetch: mockExecuteHubFetch,
+    source: 'mcp-interact:oauth:client-alpha',
+    sessionSigningSecret: signingSecret,
+  });
+  assert.equal(turn2Same.status, 200);
+
+  // Different OAuth client principal attempting to resume or close Client Alpha's session is rejected 403!
+  const turn2Hijack = await executeInteractCall({
+    payload: { sessionId: sid, closeSession: true },
+    env: {},
+    executeHubFetch: mockExecuteHubFetch,
+    principal: 'oauth:client-bravo',
+    sessionSigningSecret: signingSecret,
+  });
+  assert.equal(turn2Hijack.status, 403);
+  assert.equal(turn2Hijack.body.error, 'session_principal_mismatch');
+
+  // Unsigned sessionId when signingSecret is active is also rejected 403!
+  const turn2Unsigned = await executeInteractCall({
+    payload: { sessionId: 'site-x86.efsess_abcdef0123456789abcdef01', closeSession: true },
+    env: {},
+    executeHubFetch: mockExecuteHubFetch,
+    principal: 'oauth:client-alpha',
+    sessionSigningSecret: signingSecret,
+  });
+  assert.equal(turn2Unsigned.status, 403);
 });

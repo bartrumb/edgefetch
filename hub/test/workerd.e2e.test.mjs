@@ -907,7 +907,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       });
       assert.equal(int1.status, 200);
       const int1Json = await int1.json();
-      assert.equal(int1Json.sessionId, 'site-1.efsess_9988');
+      assert.match(int1Json.sessionId, /^site-1\.efsess_9988\.[0-9a-f]{32}$/);
       assert.match(int1Json.markdown, /clicks=0/);
 
       const int2 = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {

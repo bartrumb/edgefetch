@@ -838,10 +838,7 @@ func runBugReportCLI(ctx context.Context, args []string, stdout, stderr io.Write
 
 		silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
 		crawler := crawl.NewCrawler(deps.transport, deps.allow, crawl.DefaultUserAgent, silentLog)
-		if chromeBin != "" {
-			crawler.Renderer = browser.NewRenderer(chromeBin, deps.allow, crawl.DefaultUserAgent, 1, silentLog)
-		}
-		defer crawler.Close()
+		defer func() { _ = crawler.Close() }()
 
 		kind := classify.KindScrape
 		renderMode := "auto"

@@ -7,7 +7,6 @@
  */
 import { createServer, type IncomingMessage } from 'node:http';
 import { join, resolve } from 'node:path';
-import { Readable } from 'node:stream';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
 import { authorizeAgent } from '../src/auth';
@@ -47,6 +46,60 @@ function resolveTrustedClientIp(req: IncomingMessage, trustProxy: boolean): stri
     if (xff) return normalizeSocketIp(xff);
   }
   return normalizeSocketIp(req.socket?.remoteAddress);
+}
+
+function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array> {
+  let closed = false;
+  let ctrl!: ReadableStreamDefaultController<Uint8Array>;
+  const cleanup = () => {
+    req.removeListener('data', onData);
+    req.removeListener('end', onEnd);
+    req.removeListener('close', onEnd);
+    req.removeListener('error', onErr);
+  };
+  const onData = (chunk: Buffer | Uint8Array) => {
+    if (closed) return;
+    try {
+      ctrl.enqueue(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
+    } catch {
+      closed = true;
+      cleanup();
+    }
+  };
+  const onEnd = () => {
+    if (closed) return;
+    closed = true;
+    cleanup();
+    try {
+      ctrl.close();
+    } catch {
+      // ignore if already closed
+    }
+  };
+  const onErr = (err: Error) => {
+    if (closed) return;
+    closed = true;
+    cleanup();
+    try {
+      ctrl.error(err);
+    } catch {
+      // ignore
+    }
+  };
+  return new ReadableStream<Uint8Array>({
+    start(c) {
+      ctrl = c;
+      req.on('data', onData);
+      req.once('end', onEnd);
+      req.once('close', onEnd);
+      req.once('error', onErr);
+    },
+    cancel() {
+      closed = true;
+      cleanup();
+      req.resume();
+    },
+  });
 }
 
 function incomingToWebRequest(req: IncomingMessage, canonicalOrigin: string, trustProxy: boolean): Request {
@@ -97,7 +150,7 @@ function incomingToWebRequest(req: IncomingMessage, canonicalOrigin: string, tru
   return new Request(fullUrl, {
     method: req.method ?? 'GET',
     headers,
-    ...(hasBody ? { body: Readable.toWeb(req) as unknown as ReadableStream<Uint8Array>, duplex: 'half' } : {}),
+    ...(hasBody ? { body: safeNodeReqToWebStream(req), duplex: 'half' } : {}),
   } as RequestInit);
 }
 

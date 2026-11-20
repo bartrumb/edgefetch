@@ -88,7 +88,11 @@ func hasStructuralContentVeto(status int, rawHTML string) (veto bool, visibleWor
 func ClassifyWAF(status int, header http.Header, body []byte) *WAFMatch {
 	// --- Layer 1: Authoritative HTTP Response Headers (100% confidence regardless of body length) ---
 	if header != nil {
-		if cfMit := strings.ToLower(strings.TrimSpace(header.Get("cf-mitigated"))); cfMit != "" {
+		if rawCf := header.Get("cf-mitigated"); rawCf != "" {
+			cfMit := strings.ToLower(strings.TrimSpace(rawCf))
+			if cfMit == "" {
+				cfMit = "challenge"
+			}
 			cat := "challenge"
 			if cfMit == "block" {
 				cat = "waf_block"

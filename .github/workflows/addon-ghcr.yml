@@ -99,6 +99,7 @@ jobs:
           ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
           owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${owner}/edgefetch-agent" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
@@ -111,6 +112,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & Push Multi-Arch Fat Agent (amd64 + arm64)
+        id: push-fat
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -122,7 +124,15 @@ jobs:
             ${{ steps.meta.outputs.image }}:latest
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
 
+      - name: Attest Multi-Arch Fat Agent
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push-fat.outputs.digest }}
+          push-to-registry: true
+
       - name: Build & Push Multi-Arch Distroless Lite Agent (amd64 + arm64)
+        id: push-lite
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -134,7 +144,15 @@ jobs:
             ${{ steps.meta.outputs.image }}:lite
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-lite
 
+      - name: Attest Multi-Arch Distroless Lite Agent
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push-lite.outputs.digest }}
+          push-to-registry: true
+
       - name: Build & Push Multi-Arch All-in-One Hub + Agent Container (amd64 + arm64)
+        id: push-aio
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -143,5 +161,12 @@ jobs:
           build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/edgefetch:latest
-            ghcr.io/${{ github.repository_owner }}/edgefetch:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch:${{ steps.meta.outputs.version }}
+
+      - name: Attest Multi-Arch All-in-One Container
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch
+          subject-digest: ${{ steps.push-aio.outputs.digest }}
+          push-to-registry: true

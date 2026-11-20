@@ -328,7 +328,7 @@ func main() {
 	defer func() { _ = crawler.Close() }()
 	crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
 	crawler.SetOtelExporter(otel.NewExporterFromEnv(os.Getenv, defaultOtelSvc, agent.Version, hubTr))
-	configureCrawlerBotAuth(crawler, agentCfg.HubURLs, log)
+	botSigner := configureCrawlerBotAuth(crawler, agentCfg.HubURLs, log)
 
 	var handler http.Handler
 	var goHub *hub.Server
@@ -350,6 +350,9 @@ func main() {
 			PeerURLs:        splitCSV(os.Getenv("EDGEFETCH_PEERS")),
 			PeerToken:       firstNonEmpty(os.Getenv("EDGEFETCH_PEER_TOKEN"), serverToken),
 			FallbackCrawler: crawler,
+			BotSigner:       botSigner,
+			BotContactURL:   os.Getenv("BOT_CONTACT_URL"),
+			UserAgent:       ua,
 			Allow:           allow,
 			Logger:          log,
 		})
@@ -397,10 +400,10 @@ func main() {
 	}
 }
 
-func configureCrawlerBotAuth(c *crawl.Crawler, hubURLs []string, log *slog.Logger) {
+func configureCrawlerBotAuth(c *crawl.Crawler, hubURLs []string, log *slog.Logger) *botauth.Signer {
 	privKey := firstNonEmpty(os.Getenv("EDGEFETCH_BOT_SIGNING_KEY"), os.Getenv("BOT_SIGNING_PRIVATE_KEY"))
 	if privKey == "" {
-		return
+		return nil
 	}
 	dirURL := firstNonEmpty(os.Getenv("EDGEFETCH_BOT_DIRECTORY_URL"), os.Getenv("BOT_DIRECTORY_URL"))
 	if dirURL == "" && len(hubURLs) > 0 {
@@ -419,4 +422,5 @@ func configureCrawlerBotAuth(c *crawl.Crawler, hubURLs []string, log *slog.Logge
 	}
 	c.SetBotSigner(signer)
 	log.Info("bot_auth_enabled", slog.String("kid", signer.KeyID()), slog.String("directory", dirURL))
+	return signer
 }

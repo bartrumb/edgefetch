@@ -3,7 +3,7 @@
 # and one-shot CLI (`docker run --rm ghcr.io/bartrumb/edgefetch-agent:lite scrape https://example.com`).
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.5.1
+ARG BUILD_VERSION=2.5.2
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify

@@ -215,8 +215,9 @@ Run `go test -bench=. -benchmem ./...` locally:
 - **Operations, OTLP Tracing, HA Mesh & MCP Guide:** **[docs/USAGE.md](docs/USAGE.md)**
 - **Hub ↔ Go Agent Wire Protocol Spec:** **[docs/PROTOCOL.md](docs/PROTOCOL.md)**
 - **Systems & Go Concurrency Internals:** **[docs/INTERNALS.md](docs/INTERNALS.md)**
-- **Security Threat Model & SSRF Controls:** **[SECURITY.md](SECURITY.md)**
-- **Contributing Guide:** **[CONTRIBUTING.md](CONTRIBUTING.md)**
+- **Security Threat Model, Signed Releases & SSRF Controls:** **[SECURITY.md](SECURITY.md)**
+- **Bot, WAF & MCP Registry Certification Guide:** **[docs/REGISTRATION.md](docs/REGISTRATION.md)**
+- **Contributing Rules & Code of Conduct:** **[CONTRIBUTING.md](CONTRIBUTING.md)** · **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**
 
 ## License
 

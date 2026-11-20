@@ -1,0 +1,12 @@
+{
+  "adapterId": "gitlab-forgejo",
+  "mode": "html",
+  "inputUrl": "https://codeberg.org/forgejo/forgejo",
+  "mockPayload": "<!doctype html><html><head><title>forgejo/forgejo - Codeberg.org</title><meta property=\"og:description\" content=\"Beyond coding. We forge.\"></head><body><div class=\"markup markdown\"><h1>Welcome to Forgejo</h1><p>Forgejo is a self-hosted lightweight software forge built for community governance.</p></div></body></html>",
+  "expectTitleIncludes": "forgejo/forgejo",
+  "expectMarkdownIncludes": [
+    "Beyond coding. We forge.",
+    "# Welcome to Forgejo",
+    "self-hosted lightweight software forge"
+  ]
+}

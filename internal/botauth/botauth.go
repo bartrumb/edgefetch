@@ -1,4 +1,5 @@
-// Package botauth implements IETF RFC 9421 HTTP Message Signatures (`web-bot-auth`) and RFC 7638 Ed25519 JWK
+// Package botauth implements IETF RFC 9421 HTTP Message Signatures (`web-bot-auth`),
+// `draft-meunier-http-message-signatures-directory` self-signed JWKS responses, and RFC 7638 Ed25519 JWK
 // Thumbprints using only the Go standard library (`crypto/ed25519`, `crypto/sha256`, `encoding/base64`).
 //
 // When configured via `EDGEFETCH_BOT_SIGNING_KEY` (base64url 32-byte Ed25519 seed or 64-byte private key) and optional
@@ -25,6 +26,9 @@ import (
 // DefaultSignatureTTL is the validity window (`expires - created`) stamped on outbound RFC 9421 signatures.
 const DefaultSignatureTTL = 5 * time.Minute
 
+// DefaultKeyNotBefore (`2026-01-01T00:00:00Z`) is the deterministic default `nbf` (Unix seconds) on published JWKs.
+const DefaultKeyNotBefore int64 = 1_767_225_600
+
 // KeyPair bundles a freshly generated Ed25519 keypair, its RFC 7638 JWK thumbprint (`kid`), and ready-to-serve JWK.
 type KeyPair struct {
 	PrivateKeySeedB64URL string    `json:"privateKeySeed"`
@@ -39,6 +43,8 @@ type PublicJWK struct {
 	Crv string `json:"crv"`
 	Kid string `json:"kid,omitempty"`
 	X   string `json:"x"`
+	Nbf int64  `json:"nbf,omitempty"`
+	Exp int64  `json:"exp,omitempty"`
 }
 
 // DirectoryDocument is the JSON body served at `/.well-known/http-message-signatures-directory`.
@@ -48,7 +54,8 @@ type DirectoryDocument struct {
 }
 
 // ComputeJWKThumbprint computes the RFC 7638 SHA-256 thumbprint (`base64url`, unpadded) of an Ed25519 public key.
-// Per RFC 7638 Section 3.2, members of an OKP JWK are ordered lexicographically: `{"crv":"Ed25519","kty":"OKP","x":"..."}`.
+// Per RFC 7638 Section 3.2, members of an OKP JWK are ordered lexicographically: `{"crv":"Ed25519","kty":"OKP","x":"..."}`
+// (optional metadata fields such as `nbf` and `exp` are never included in the canonical thumbprint input).
 func ComputeJWKThumbprint(pub ed25519.PublicKey) (string, error) {
 	if len(pub) != ed25519.PublicKeySize {
 		return "", fmt.Errorf("botauth: invalid Ed25519 public key length %d", len(pub))
@@ -80,6 +87,7 @@ func GenerateKeyPair() (KeyPair, error) {
 			Crv: "Ed25519",
 			Kid: kid,
 			X:   pubB64,
+			Nbf: time.Now().UTC().Unix(),
 		},
 	}, nil
 }
@@ -127,13 +135,16 @@ func decodeFlexibleBase64(s string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(trimmed)
 }
 
-// Signer signs outbound HTTP requests per IETF RFC 9421 (`tag="web-bot-auth"`).
+// Signer signs outbound HTTP requests per IETF RFC 9421 (`tag="web-bot-auth"`) and signs directory responses
+// per `draft-meunier-http-message-signatures-directory` (`tag="http-message-signatures-directory"`).
 type Signer struct {
 	priv         ed25519.PrivateKey
 	pub          ed25519.PublicKey
 	keyID        string
 	directoryURL string
 	ttl          time.Duration
+	nbf          int64
+	exp          int64
 }
 
 // NewSigner constructs an RFC 9421 Ed25519 request signer from an encoded seed/key and optional directory URL.
@@ -154,7 +165,21 @@ func NewSigner(encodedPrivKey, directoryURL string) (*Signer, error) {
 		keyID:        kid,
 		directoryURL: dir,
 		ttl:          DefaultSignatureTTL,
+		nbf:          DefaultKeyNotBefore,
 	}, nil
+}
+
+// SetKeyValidity configures the JWK `nbf` (not-before) and optional `exp` (expiration) Unix timestamps.
+func (s *Signer) SetKeyValidity(nbf, exp int64) {
+	if s == nil {
+		return
+	}
+	if nbf > 0 {
+		s.nbf = nbf
+	}
+	if exp > s.nbf {
+		s.exp = exp
+	}
 }
 
 // KeyID returns the RFC 7638 JWK thumbprint identifying this signer's public key.
@@ -162,19 +187,25 @@ func (s *Signer) KeyID() string { return s.keyID }
 
 // PublicJWK returns the public OKP JWK for publishing at `/.well-known/http-message-signatures-directory`.
 func (s *Signer) PublicJWK() PublicJWK {
+	nbf := s.nbf
+	if nbf <= 0 {
+		nbf = DefaultKeyNotBefore
+	}
 	return PublicJWK{
 		Kty: "OKP",
 		Crv: "Ed25519",
 		Kid: s.keyID,
 		X:   base64.RawURLEncoding.EncodeToString(s.pub),
+		Nbf: nbf,
+		Exp: s.exp,
 	}
 }
 
 // DirectoryJSON serializes the `/.well-known/http-message-signatures-directory` JSON document for this signer.
 func (s *Signer) DirectoryJSON() ([]byte, error) {
-	return json.Marshal(DirectoryDocument{
+	return json.MarshalIndent(DirectoryDocument{
 		Keys: []PublicJWK{s.PublicJWK()},
-	})
+	}, "", "  ")
 }
 
 func authorityForRequest(req *http.Request) string {
@@ -185,6 +216,43 @@ func authorityForRequest(req *http.Request) string {
 		return strings.ToLower(req.URL.Host)
 	}
 	return ""
+}
+
+// SignDirectoryResponse attaches RFC 9530 `Content-Digest` and RFC 9421 `directory` self-signature headers
+// (`tag="http-message-signatures-directory"`) to an HTTP response writer per Cloudflare Verified Bots requirements.
+func (s *Signer) SignDirectoryResponse(hdr http.Header, req *http.Request, body []byte, now time.Time) error {
+	if s == nil || hdr == nil || req == nil {
+		return nil
+	}
+	authority := authorityForRequest(req)
+	if authority == "" {
+		return errors.New("botauth: directory request missing @authority")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	sum := sha256.Sum256(body)
+	contentDigest := "sha-256=:" + base64.StdEncoding.EncodeToString(sum[:]) + ":"
+	created := now.Unix()
+	expires := now.Add(s.ttl).Unix()
+
+	sigParams := fmt.Sprintf(
+		`("@authority";req "content-digest");created=%d;expires=%d;keyid="%s";alg="ed25519";tag="http-message-signatures-directory"`,
+		created,
+		expires,
+		s.keyID,
+	)
+	sigBase := strings.Join([]string{
+		fmt.Sprintf(`"@authority";req: %s`, authority),
+		fmt.Sprintf(`"content-digest": %s`, contentDigest),
+		fmt.Sprintf(`"@signature-params": %s`, sigParams),
+	}, "\n")
+
+	sigBytes := ed25519.Sign(s.priv, []byte(sigBase))
+	hdr.Set("Content-Digest", contentDigest)
+	hdr.Set("Signature-Input", "directory="+sigParams)
+	hdr.Set("Signature", "directory=:"+base64.StdEncoding.EncodeToString(sigBytes)+":")
+	return nil
 }
 
 // SignRequest attaches RFC 9421 `Signature-Input`, `Signature`, and (when DirectoryURL is set) `Signature-Agent` headers.
@@ -240,11 +308,66 @@ func (s *Signer) SignRequest(req *http.Request, now time.Time) error {
 }
 
 var (
-	reSigInput = regexp.MustCompile(`^sig1=(\(([^)]*)\)(?:;.*)?)$`)
-	reSigValue = regexp.MustCompile(`^sig1=:([A-Za-z0-9+/=]+):$`)
-	reCreated  = regexp.MustCompile(`;created=(\d+)`)
-	reExpires  = regexp.MustCompile(`;expires=(\d+)`)
+	reSigInput    = regexp.MustCompile(`^sig1=(\(([^)]*)\)(?:;.*)?)$`)
+	reSigValue    = regexp.MustCompile(`^sig1=:([A-Za-z0-9+/=]+):$`)
+	reDirSigInput = regexp.MustCompile(`^directory=(\(([^)]*)\)(?:;.*)?)$`)
+	reDirSigValue = regexp.MustCompile(`^directory=:([A-Za-z0-9+/=]+):$`)
+	reCreated     = regexp.MustCompile(`;created=(\d+)`)
+	reExpires     = regexp.MustCompile(`;expires=(\d+)`)
 )
+
+// VerifyDirectoryResponse verifies a `draft-meunier-http-message-signatures-directory` response (`Content-Digest` + `directory` signature).
+func VerifyDirectoryResponse(req *http.Request, respHdr http.Header, body []byte, pub ed25519.PublicKey, now time.Time) error {
+	if len(pub) != ed25519.PublicKeySize {
+		return errors.New("botauth: invalid public key")
+	}
+	digestHdr := strings.TrimSpace(respHdr.Get("Content-Digest"))
+	inHdr := strings.TrimSpace(respHdr.Get("Signature-Input"))
+	sigHdr := strings.TrimSpace(respHdr.Get("Signature"))
+	im := reDirSigInput.FindStringSubmatch(inHdr)
+	sm := reDirSigValue.FindStringSubmatch(sigHdr)
+	if digestHdr == "" || len(im) != 3 || len(sm) != 2 {
+		return errors.New("botauth: missing or malformed directory signature headers")
+	}
+	sigParams := im[1]
+	if !strings.Contains(sigParams, `tag="http-message-signatures-directory"`) {
+		return errors.New("botauth: missing http-message-signatures-directory tag")
+	}
+	if !now.IsZero() {
+		nowUnix := now.Unix()
+		if cm := reCreated.FindStringSubmatch(sigParams); len(cm) == 2 {
+			created, _ := strconv.ParseInt(cm[1], 10, 64)
+			if created > nowUnix+60 {
+				return errors.New("botauth: directory signature created timestamp is in the future")
+			}
+		}
+		if em := reExpires.FindStringSubmatch(sigParams); len(em) == 2 {
+			expires, _ := strconv.ParseInt(em[1], 10, 64)
+			if nowUnix > expires {
+				return errors.New("botauth: directory signature has expired")
+			}
+		}
+	}
+	sum := sha256.Sum256(body)
+	expectedDigest := "sha-256=:" + base64.StdEncoding.EncodeToString(sum[:]) + ":"
+	if digestHdr != expectedDigest {
+		return errors.New("botauth: Content-Digest mismatch")
+	}
+	authority := authorityForRequest(req)
+	sigBase := strings.Join([]string{
+		fmt.Sprintf(`"@authority";req: %s`, authority),
+		fmt.Sprintf(`"content-digest": %s`, digestHdr),
+		fmt.Sprintf(`"@signature-params": %s`, sigParams),
+	}, "\n")
+	sigBytes, err := base64.StdEncoding.DecodeString(sm[1])
+	if err != nil || len(sigBytes) != ed25519.SignatureSize {
+		return errors.New("botauth: invalid Ed25519 directory signature bytes")
+	}
+	if !ed25519.Verify(pub, []byte(sigBase), sigBytes) {
+		return errors.New("botauth: Ed25519 directory signature verification failed")
+	}
+	return nil
+}
 
 // VerifyRequest verifies an RFC 9421 `sig1` Ed25519 signature on `req` against `pub` at timestamp `now`.
 func VerifyRequest(req *http.Request, pub ed25519.PublicKey, now time.Time) error {

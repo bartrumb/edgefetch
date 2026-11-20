@@ -12,6 +12,7 @@
 import { redactUrlForLog, sanitizeDetails, type ActivityStore, type HubEventInput } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { SITE_ID_PATTERN } from './auth';
+import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
 import { validatePublicHttpsTargetUrl } from './overflow';
 
@@ -19,7 +20,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '
 const LEGACY_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
 const DEFAULT_PROTOCOL_VERSION = '2025-03-26';
 const MCP_INSTRUCTIONS =
-  'Use search for web & crawled-collection discovery (Serper/Tavily/Brave/SearXNG waterfall + edge-map + SEARCH D1), scrape / extract for clean Markdown, Jupyter .ipynb, OpenAPI, & PDFs (with optional PDF OCR and companion .md discovery), map / crawl for site discovery, interact for headless Chromium sessions & YouTube transcripts, read_artifact for large stored docs, and list_agents for fleet status.';
+  'Use search for web & crawled-collection discovery (Serper/Tavily/Brave/SearXNG waterfall + edge-map + SEARCH D1), jobs for one-call structured ATS job search across Greenhouse/Ashby/Lever/Workday/SmartRecruiters/Built In, scrape / extract for clean Markdown, Jupyter .ipynb, OpenAPI, & PDFs (with optional PDF OCR and companion .md discovery), map / crawl for site discovery, interact for headless Chromium sessions & YouTube transcripts, read_artifact for large stored docs, and list_agents for fleet status.';
 const MAX_MCP_REQUEST_BYTES = 256 * 1024;
 const MAX_BODY_PREVIEW_CHARS = 64 * 1024;
 const DEFAULT_MCP_SCRAPE_MAX_CHARS = 100_000;
@@ -126,6 +127,7 @@ export interface McpExecuteFetchResult {
   status: number;
   via: string;
   bodyText: string;
+  stageTimingsMs?: Record<string, number>;
 }
 
 export interface McpServerDeps {
@@ -176,6 +178,10 @@ export interface McpServerDeps {
     principal?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeSearch?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeJobs?: (params: {
     args: Record<string, unknown>;
     principal?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
@@ -474,9 +480,9 @@ function buildToolDefinitions(deps: McpServerDeps) {
           },
           renderMode: {
             type: 'string',
-            enum: ['off', 'auto', 'always'],
-            default: 'off',
-            description: '"auto" upgrades SPA shells to headless Chromium on edgefetch_fat nodes; "always" forces Chromium.',
+            enum: ['off', 'auto', 'always', 'browser'],
+            default: 'auto',
+            description: '"auto" (default) automatically switches thin/SPA pages to headless Chromium on edgefetch_fat nodes; "always" or "browser" forces Chromium.',
           },
           waitForMs: { type: 'integer', minimum: 0, maximum: 15000, description: 'Extra JS settle wait in ms when rendering.' },
           waitSelector: { type: 'string', description: 'Optional CSS selector to wait for when rendering.' },
@@ -514,6 +520,10 @@ function buildToolDefinitions(deps: McpServerDeps) {
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
           redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
           query: { type: 'string', description: 'Optional focus query to rerank relevant passages.' },
+          jsonFilter: {
+            type: 'string',
+            description: 'Optional record filter for JSON array responses (e.g. `title~"Forward Deployed"` or `id=abc123`), emitting 1 chunk per record.',
+          },
           collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index the verified Markdown into.' },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
@@ -544,6 +554,16 @@ function buildToolDefinitions(deps: McpServerDeps) {
             description: '1..20 public https:// URLs to extract from.',
           },
           query: { type: 'string', description: 'Focus query used to BM25-rank the top chunks per source.' },
+          jsonFilter: {
+            type: 'string',
+            description: 'Optional record filter for JSON array responses (e.g. `title~"Forward Deployed"` or `id=abc123`), emitting 1 chunk per record.',
+          },
+          renderMode: {
+            type: 'string',
+            enum: ['off', 'auto', 'always', 'browser'],
+            default: 'auto',
+            description: '"auto" (default) upgrades thin scripted pages to headless Chromium; "always" or "browser" forces Chromium.',
+          },
           chunksPerSource: { type: 'integer', minimum: 1, maximum: 10, default: 3, description: 'Max chunks returned per URL.' },
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
           redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
@@ -573,6 +593,11 @@ function buildToolDefinitions(deps: McpServerDeps) {
           search: { type: 'string', description: 'Optional keyword filter to rank/filter matching URLs.' },
           limit: { type: 'integer', minimum: 1, maximum: 5000, default: 500 },
           includeSubdomains: { type: 'boolean', default: false },
+          includeOutsidePath: {
+            type: 'boolean',
+            default: false,
+            description: 'When false (default), restricts discovered URLs to the root URL path prefix when url has a subpath.',
+          },
           ignoreSitemap: { type: 'boolean', default: false },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
@@ -761,6 +786,55 @@ function buildToolDefinitions(deps: McpServerDeps) {
         additionalProperties: false,
       },
     },
+    {
+      name: 'jobs',
+      description:
+        'One-call structured job search across official ATS boards (Greenhouse, Ashby, Lever, Workday CXS, SmartRecruiters, and optional Built In): standardizes pay ({ min, max, currency, period, basis: "base"|"ote"|"total" }), workplaceType, and locations, deduplicates by (company, title), and filters by remote, locations, minBase, postedWithinDays, and exclude.',
+      annotations: {
+        title: 'Search & Extract Structured Job Postings',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Role or keyword query (e.g. "Forward Deployed Engineer", "Solutions Architect").' },
+          company: { type: 'string', description: 'Optional company name or ATS org filter.' },
+          remote: { type: 'boolean', description: 'When true, keep only remote-eligible roles.' },
+          locations: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional location substrings to match (e.g. ["United States", "Remote", "New York"]).',
+          },
+          minBase: {
+            type: 'number',
+            minimum: 0,
+            description: 'Minimum annual base salary floor (ignores total-target-cash / OTE unless basis === "base").',
+          },
+          postedWithinDays: { type: 'integer', minimum: 1, maximum: 365, description: 'Filter postings published within N days.' },
+          limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+          includeBuiltIn: { type: 'boolean', default: true, description: 'Also check Built In remote job search.' },
+          exclude: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                company: { type: 'string' },
+                title: { type: 'string' },
+                url: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+            description: 'Optional list of already-applied roles to exclude.',
+          },
+          target: { type: 'string', enum: allowedTargets, default: defaultTarget },
+          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+        },
+        additionalProperties: false,
+      },
+    },
   ];
   return allTools
     .filter((t) => {
@@ -772,6 +846,7 @@ function buildToolDefinitions(deps: McpServerDeps) {
       if (t.name === 'search_collection') return Boolean(deps.searchCollection);
       if (t.name === 'interact') return Boolean(deps.executeInteract);
       if (t.name === 'read_artifact') return Boolean(deps.readArtifact);
+      if (t.name === 'jobs') return Boolean(deps.executeJobs);
       return true;
     })
     .map((t) => ({ ...t, title: t.annotations.title }));
@@ -832,6 +907,20 @@ export function truncateResultBodies(
       } else {
         copy.problem = `HTTP ${String(copy.status ?? 0)} skipped`;
       }
+    }
+
+    // P9 & P10: Flag material URL redirects (`redirected`, `filtersMayBeLost`) and attach structured `blocked` hints!
+    if (typeof copy.url === 'string' && typeof copy.finalUrl === 'string' && copy.finalUrl) {
+      const redir = analyzeUrlRedirect(copy.url, copy.finalUrl);
+      if (redir.redirected) {
+        copy.redirected = true;
+        if (redir.redirectNote) copy.redirectNote = redir.redirectNote;
+        if (redir.filtersMayBeLost) copy.filtersMayBeLost = true;
+      }
+    }
+    if (copy.outcome !== 'ok' && typeof copy.url === 'string') {
+      const blocked = buildBlockedInfo(copy.url, copy.outcome, copy.problem, copy.status);
+      if (blocked) copy.blocked = blocked;
     }
 
     if (typeof copy.body === 'string' && copy.body.length > inlineMaxChars) {
@@ -979,6 +1068,7 @@ async function handleToolCallInner(
       options: {
         includeBody,
         respectRobots,
+        ...(name === 'fetch_batch' ? { concurrency: 4 } : {}),
         ...(requestedMaxBytes !== undefined && requestedMaxBytes > 8 * 1024 * 1024
           ? { maxBytes: Math.min(16 << 20, requestedMaxBytes) }
           : {}),
@@ -1016,9 +1106,19 @@ async function handleToolCallInner(
     let formatted: unknown = res.bodyText;
     try {
       const parsed = JSON.parse(res.bodyText) as Record<string, unknown>;
-      formatted = { via: res.via, httpStatus: res.status, ...truncateResultBodies(parsed, inlineMaxChars, explicitKind === undefined) };
+      formatted = {
+        via: res.via,
+        httpStatus: res.status,
+        ...(res.stageTimingsMs ? { stageTimingsMs: res.stageTimingsMs } : {}),
+        ...truncateResultBodies(parsed, inlineMaxChars, explicitKind === undefined),
+      };
     } catch {
-      formatted = { via: res.via, httpStatus: res.status, raw: res.bodyText.slice(0, inlineMaxChars) };
+      formatted = {
+        via: res.via,
+        httpStatus: res.status,
+        ...(res.stageTimingsMs ? { stageTimingsMs: res.stageTimingsMs } : {}),
+        raw: res.bodyText.slice(0, inlineMaxChars),
+      };
     }
 
     return {
@@ -1159,6 +1259,20 @@ async function handleToolCallInner(
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'search_not_configured' }) }], isError: true };
     }
     const res = await deps.executeSearch({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status !== 200 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'jobs') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    if (!deps.executeJobs) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'jobs_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeJobs({ args, principal });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),

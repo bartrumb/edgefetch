@@ -44,6 +44,9 @@ type InteractSpec struct {
 type Request struct {
 	ID                 string            `json:"id"`
 	URL                string            `json:"url"`
+	Method             string            `json:"method,omitempty"`      // "GET" (default) or "POST" (e.g. Workday CXS JSON search)
+	RequestBody        string            `json:"requestBody,omitempty"` // Optional UTF-8 POST body when Method == "POST"
+	ContentType        string            `json:"contentType,omitempty"` // Optional Content-Type header when Method == "POST"
 	Kind               classify.Kind     `json:"kind"`
 	Accept             string            `json:"accept,omitempty"`
 	IfNoneMatch        string            `json:"ifNoneMatch,omitempty"`
@@ -65,13 +68,15 @@ type Request struct {
 // Timing records where a single HTTP attempt spent wall-clock milliseconds via Go's `net/http/httptrace` hooks.
 // When `Reused == true` (warm HTTP/2 or keep-alive socket), `DNSMs`, `ConnectMs`, and `TLSMs` are `0`.
 type Timing struct {
-	DNSMs      int64  `json:"dnsMs"`
-	ConnectMs  int64  `json:"connectMs"`
-	TLSMs      int64  `json:"tlsMs"`
-	TTFBMs     int64  `json:"ttfbMs"`
-	Reused     bool   `json:"reused"`
-	RemoteAddr string `json:"remoteAddr,omitempty"`
-	Proto      string `json:"proto,omitempty"`
+	DNSMs            int64  `json:"dnsMs"`
+	ConnectMs        int64  `json:"connectMs"`
+	TLSMs            int64  `json:"tlsMs"`
+	TTFBMs           int64  `json:"ttfbMs"`
+	RobotsMs         int64  `json:"robotsMs,omitempty"`
+	ArtifactUploadMs int64  `json:"artifactUploadMs,omitempty"`
+	Reused           bool   `json:"reused"`
+	RemoteAddr       string `json:"remoteAddr,omitempty"`
+	Proto            string `json:"proto,omitempty"`
 }
 
 // ArtifactRef references a gzipped response body uploaded directly to R2 (`PUT /agent/artifacts/<blobSha256>`) so
@@ -710,8 +715,12 @@ func (c *Crawler) runRequestWithRedirects(
 			return notTried(origReq, "crawl cancelled"), true
 		}
 
+		var robotsElapsedMs int64
 		if c.shouldCheckRobots(curHost, opts) {
-			if allowed, distressed, reason := c.checkRobots(ctx, hs, curURLStr); !allowed {
+			robStart := c.Now()
+			allowed, distressed, reason := c.checkRobots(ctx, hs, curURLStr)
+			robotsElapsedMs = c.Now().Sub(robStart).Milliseconds()
+			if !allowed {
 				hs.Release()
 				outcome := classify.OutcomeError
 				if distressed {
@@ -727,6 +736,7 @@ func (c *Crawler) runRequestWithRedirects(
 					Problem:    reason,
 					Attempts:   totalAttempts,
 					DurationMs: c.Now().Sub(started).Milliseconds(),
+					Timing:     Timing{RobotsMs: robotsElapsedMs},
 				}, false
 			}
 		}
@@ -734,10 +744,14 @@ func (c *Crawler) runRequestWithRedirects(
 		hopReq := origReq
 		hopReq.URL = curURLStr
 		if hop > 0 {
+			hopReq.Method = http.MethodGet
+			hopReq.RequestBody = ""
+			hopReq.ContentType = ""
 			hopReq.IfNoneMatch = ""
 			hopReq.IfModifiedSince = ""
 		}
 		res, loc, rawBody := c.fetchSingleHop(ctx, hopReq, opts)
+		res.Timing.RobotsMs += robotsElapsedMs
 		totalAttempts += res.Attempts
 		res.ID = origReq.ID
 		res.URL = origReq.URL
@@ -1043,13 +1057,26 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	actx, cancel := context.WithTimeout(httptrace.WithClientTrace(ctx, trace), timeoutDur)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(actx, http.MethodGet, r.URL, nil)
+	method := http.MethodGet
+	var reqBodyReader io.Reader
+	if strings.EqualFold(strings.TrimSpace(r.Method), http.MethodPost) {
+		method = http.MethodPost
+		reqBodyReader = strings.NewReader(r.RequestBody)
+	}
+	req, err := http.NewRequestWithContext(actx, method, r.URL, reqBodyReader)
 	if err != nil {
 		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", accept)
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	if method == http.MethodPost {
+		ct := strings.TrimSpace(r.ContentType)
+		if ct == "" {
+			ct = "application/json"
+		}
+		req.Header.Set("Content-Type", ct)
+	}
 	for k, v := range r.Headers {
 		req.Header.Set(strings.TrimSpace(k), v)
 	}
@@ -1183,8 +1210,6 @@ func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, raw
 //   - Network/timeout error, body read error, 429, or 5xx: "unreachable" -> disallow all for RobotsDistressTTL (5 m).
 func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness.RobotsEntry, time.Duration) {
 	curURL := &url.URL{Scheme: target.Scheme, Host: target.Host, Path: "/robots.txt"}
-	rctx, cancel := context.WithTimeout(ctx, politeness.RobotsTimeout)
-	defer cancel()
 
 	for hop := 0; hop <= MaxRedirects; hop++ {
 		if c.allow != nil {
@@ -1197,22 +1222,45 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			}
 		}
 
-		req, err := http.NewRequestWithContext(rctx, http.MethodGet, curURL.String(), nil)
-		if err != nil {
-			return &politeness.RobotsEntry{
-				Distressed: true,
-				Reason:     "robots.txt request invalid: " + err.Error(),
-				ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
-			}, politeness.DefaultThrottlePause
-		}
-		req.Header.Set("User-Agent", c.userAgent)
-		req.Header.Set("Accept", "text/plain,*/*;q=0.8")
+		var resp *http.Response
+		var err error
+		for robAttempt := 0; robAttempt < 2; robAttempt++ {
+			attemptTimeout := politeness.RobotsTimeout
+			if robAttempt == 1 {
+				attemptTimeout = politeness.RobotsTimeout + 3*time.Second
+			}
+			rctxAttempt, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
+			req, reqErr := http.NewRequestWithContext(rctxAttempt, http.MethodGet, curURL.String(), nil)
+			if reqErr != nil {
+				cancelAttempt()
+				return &politeness.RobotsEntry{
+					Distressed: true,
+					Reason:     "robots.txt request invalid: " + reqErr.Error(),
+					ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
+				}, politeness.DefaultThrottlePause
+			}
+			req.Header.Set("User-Agent", c.userAgent)
+			req.Header.Set("Accept", "text/plain,*/*;q=0.8")
 
-		resp, err := c.client.Do(req)
+			resp, err = c.client.Do(req)
+			if err == nil {
+				// Keep rctxAttempt alive until body read completes below!
+				defer cancelAttempt()
+				break
+			}
+			cancelAttempt()
+			if ctx.Err() != nil || isPermanentFetchError(err) {
+				break
+			}
+		}
 		if err != nil {
+			prefixMsg := "robots.txt unreachable (disallow assumed per RFC 9309): "
+			if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
+				prefixMsg = "robots.txt timed out after retry (disallow assumed per RFC 9309): "
+			}
 			return &politeness.RobotsEntry{
 				Distressed: true,
-				Reason:     "robots.txt unreachable (disallow assumed per RFC 9309): " + err.Error(),
+				Reason:     prefixMsg + err.Error(),
 				ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 			}, politeness.DefaultThrottlePause
 		}

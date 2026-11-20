@@ -66,6 +66,20 @@ class TestEdgeFetchPythonSDK(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 401)
         self.assertEqual(ctx.exception.code, "unauthorized")
 
+    def test_jobs_endpoint(self) -> None:
+        captured = {}
+
+        def fake_opener(req: urllib.request.Request, _timeout: float) -> _FakeResp:
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode("utf-8")) if req.data else {}
+            return _FakeResp({"ok": True, "count": 1, "jobs": [{"title": "Forward Deployed Engineer"}]})
+
+        client = EdgeFetchClient(token="tok-123", base_url="https://hub.example.com", opener=fake_opener)
+        out = client.jobs("Forward Deployed Engineer", remote=True, minBase=200000)
+        self.assertEqual(captured["url"], "https://hub.example.com/v1/jobs")
+        self.assertEqual(captured["body"], {"query": "Forward Deployed Engineer", "remote": True, "minBase": 200000})
+        self.assertEqual(out["count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

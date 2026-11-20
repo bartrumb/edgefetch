@@ -49,10 +49,16 @@ import {
   validateCallRobotsPolicy,
 } from '../src/overflow.ts';
 import {
+  executeInteractCall,
+  executeScrapeCall,
   extractHtmlDocument,
+  extractYouTubeTranscriptFromHtml,
   formatJupyterNotebookToMarkdown,
   formatOpenApiSpecToMarkdown,
 } from '../src/scrape.ts';
+import { executeJobsCall } from '../src/jobs.ts';
+import { executeMapCall } from '../src/map-crawl.ts';
+import { chunkMarkdownForSearch, executeExtractCall } from '../src/search-index.ts';
 import {
   isValidSha256Hex,
   r2ArtifactKey,
@@ -63,7 +69,6 @@ import {
   STORED_RETENTION_MS,
   TRANSIENT_RETENTION_MS,
 } from '../src/storage.ts';
-import { executeInteractCall, extractYouTubeTranscriptFromHtml } from '../src/scrape.ts';
 import {
   canonicalizeSearchResultUrl,
   executeSearchCall,
@@ -1481,7 +1486,7 @@ test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1
     });
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
-    assert.equal(mcpJson.result.tools.length, 11);
+    assert.equal(mcpJson.result.tools.length, 12);
   } finally {
     await started.close();
     rmSync(dataDir, { recursive: true, force: true });
@@ -1777,4 +1782,692 @@ test('V2-11: WebCrypto AWS SigV4 S3ArtifactBucket, TursoHttpD1Database /v2/pipel
     await started.close();
     rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+test('V2-12: v2.3.0 Handoff Regression Suite (P1-P12 + structured jobs tool)', async () => {
+  // --- P1 & P11: Ashby single job (even with renderMode="browser") + shorthand annual pay scaling ($230 -> $230,000) ---
+  const ashbyBoardPayload = JSON.stringify({
+    organizationName: 'ElevenLabs',
+    jobs: [
+      {
+        id: '43f91b57-5c4e-4d4a-9450-3591f2a79923',
+        title: 'Forward Deployed Engineer',
+        location: 'United States',
+        isRemote: true,
+        workplaceType: 'Remote',
+        employmentType: 'FullTime',
+        publishedAt: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+        jobUrl: 'https://jobs.ashbyhq.com/elevenlabs/43f91b57-5c4e-4d4a-9450-3591f2a79923',
+        applyUrl: 'https://jobs.ashbyhq.com/elevenlabs/43f91b57-5c4e-4d4a-9450-3591f2a79923/application',
+        descriptionHtml:
+          '<h2>About the Role</h2><p>Partner directly with enterprise engineering teams to deploy real-time conversational AI voice agents in production environments across North America and Europe.</p>' +
+          '<ul><li>Design low-latency WebSocket &amp; SIP integrations with customer backends.</li><li>Own end-to-end technical architecture, evaluation harnesses, and production reliability.</li></ul>',
+        descriptionPlain:
+          'Partner directly with enterprise engineering teams to deploy real-time conversational AI voice agents in production environments across North America and Europe.',
+        compensation: {
+          compensationTierSummary: '$230K – $350K • Offers Equity',
+          summaryComponents: [
+            {
+              compensationType: 'Salary',
+              interval: '1 YEAR',
+              currencyCode: 'USD',
+              minValue: 230,
+              maxValue: 350,
+            },
+          ],
+        },
+      },
+    ],
+  });
+
+  let ashbyFetchedUrl = '';
+  const ashbyScrape = await executeScrapeCall({
+    payload: {
+      url: 'https://jobs.ashbyhq.com/elevenlabs/43f91b57-5c4e-4d4a-9450-3591f2a79923',
+      renderMode: 'browser', // P1: Must resolve cleanly via Ashby API even when renderMode="browser" is passed!
+    },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const call = JSON.parse(rawBody) as { requests: Array<{ url: string }> };
+      ashbyFetchedUrl = call.requests[0]!.url;
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [{ id: 'ats-ashby-job', url: ashbyFetchedUrl, status: 200, outcome: 'ok', contentType: 'application/json', body: ashbyBoardPayload }],
+        }),
+      };
+    },
+  });
+  assert.equal(ashbyScrape.status, 200);
+  assert.equal(ashbyFetchedUrl, 'https://api.ashbyhq.com/posting-api/job-board/elevenlabs?includeCompensation=true');
+  const ashbyJp = ashbyScrape.body.jobPosting as { workplaceType: string; pay: { min: number; max: number; basis: string; period: string } };
+  assert.equal(ashbyJp.workplaceType, 'remote');
+  assert.deepEqual(
+    { min: ashbyJp.pay.min, max: ashbyJp.pay.max, basis: ashbyJp.pay.basis, period: ashbyJp.pay.period },
+    { min: 230_000, max: 350_000, basis: 'base', period: 'year' },
+  );
+  assert.match(String(ashbyScrape.body.markdown), /\$230,000–\$350,000 USD\/year \(base\)/);
+  assert.doesNotMatch(String(ashbyScrape.body.markdown), /<p>|<li>|&amp;/);
+
+  // P1 also works identically through `extract`!
+  const ashbyExtract = await executeExtractCall({
+    payload: {
+      urls: ['https://jobs.ashbyhq.com/elevenlabs/43f91b57-5c4e-4d4a-9450-3591f2a79923'],
+      query: 'compensation WebSocket voice agents',
+    },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [{ id: 'ext-1', url: ashbyFetchedUrl, status: 200, outcome: 'ok', contentType: 'application/json', body: ashbyBoardPayload }],
+      }),
+    }),
+  });
+  assert.equal(ashbyExtract.status, 200);
+  const ashbyExtHit = (ashbyExtract.body.results as Array<Record<string, unknown>>)[0]!;
+  assert.match(String(ashbyExtHit.rawContent), /\$230,000–\$350,000/);
+
+  // P1 fallback: Thin HTML page (< 50 words) with rich `<meta name="description">` (>= 40 words) sets `contentSource: "meta-description"`
+  const metaDescHtml =
+    '<!doctype html><html><head><title>Staff Systems Engineer</title>' +
+    '<meta name="description" content="Join our distributed systems team to architect multi-region storage engines, Raft consensus replication, deterministic simulation testing, and low-latency Rust networking services for mission-critical cloud workloads across global availability zones with competitive base salary and equity." />' +
+    '</head><body><main><p>Apply now</p></main></body></html>';
+  const metaRescue = await executeScrapeCall({
+    payload: { url: 'https://careers.example.com/jobs/staff-systems', renderMode: 'off' },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-arm64',
+      bodyText: JSON.stringify({
+        results: [{ id: 'scrape-1', url: 'https://careers.example.com/jobs/staff-systems', status: 200, outcome: 'ok', contentType: 'text/html', body: metaDescHtml }],
+      }),
+    }),
+  });
+  assert.equal(metaRescue.body.contentSource, 'meta-description');
+  assert.match(String(metaRescue.body.markdown), /Raft consensus replication/);
+
+  // --- P2: Workday CXS POST search + GET single job + `{"widget":"redirect"}` stub rescue ---
+  let wdSearchMethod = '';
+  let wdSearchBody = '';
+  const wdBoardScrape = await executeScrapeCall({
+    payload: { url: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite?q=Solutions+Architect' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const req = (JSON.parse(rawBody) as { requests: Array<{ method?: string; requestBody?: string; url: string }> }).requests[0]!;
+      wdSearchMethod = req.method ?? 'GET';
+      wdSearchBody = req.requestBody ?? '';
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'ats-workday-board',
+              url: req.url,
+              status: 200,
+              outcome: 'ok',
+              contentType: 'application/json',
+              body: JSON.stringify({
+                total: 1,
+                jobPostings: [
+                  {
+                    title: 'Senior Solutions Architect, AI Infrastructure',
+                    externalPath: '/job/US-CA-Santa-Clara/Senior-Solutions-Architect_JR1099',
+                    locationsText: 'US, CA, Remote',
+                    postedOn: 'Posted Today',
+                  },
+                ],
+              }),
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(wdSearchMethod, 'POST');
+  assert.deepEqual(JSON.parse(wdSearchBody), { appliedFacets: {}, limit: 20, offset: 0, searchText: 'Solutions Architect' });
+  assert.match(String(wdBoardScrape.body.markdown), /Senior Solutions Architect, AI Infrastructure/);
+
+  // Workday `{"widget":"redirect","url":"/Workday","externalSpa":true}` stub auto-resolves via CXS!
+  const wdStubCalls: string[] = [];
+  const wdStubScrape = await executeScrapeCall({
+    payload: { url: 'https://workday.wd5.myworkdayjobs.com/wday/custom-entry' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const req = (JSON.parse(rawBody) as { requests: Array<{ url: string; method?: string }> }).requests[0]!;
+      wdStubCalls.push(`${req.method ?? 'GET'} ${req.url}`);
+      if (wdStubCalls.length === 1) {
+        return {
+          status: 200,
+          via: 'agent:site-x86',
+          bodyText: JSON.stringify({
+            results: [
+              {
+                id: 'scrape-1',
+                url: req.url,
+                status: 200,
+                outcome: 'ok',
+                contentType: 'application/json',
+                body: JSON.stringify({ widget: 'redirect', url: '/Workday', externalSpa: true }),
+              },
+            ],
+          }),
+        };
+      }
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'ats-workday-board',
+              url: req.url,
+              status: 200,
+              outcome: 'ok',
+              contentType: 'application/json',
+              body: JSON.stringify({
+                total: 1,
+                jobPostings: [{ title: 'Principal Distributed Systems Engineer', externalPath: '/job/Remote/Principal-Eng_JR1', locationsText: 'Remote' }],
+              }),
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(wdStubCalls.length, 2);
+  assert.equal(wdStubCalls[1], 'POST https://workday.wd5.myworkdayjobs.com/wday/cxs/workday/Workday/jobs');
+  assert.equal(wdStubScrape.body.redirected, true);
+  assert.match(String(wdStubScrape.body.markdown), /Principal Distributed Systems Engineer/);
+
+  // --- P3: Automatic browser switch (`renderedVia: "browser-auto"`) on thin / filter-only scripted pages ---
+  const thinBuiltInShell =
+    '<!doctype html><html><head><title>Remote Jobs | Built In</title><script src="/app.js"></script></head>' +
+    '<body><main><h1>Remote Jobs</h1><ul><li><a href="/jobs/dev">Engineering</a></li><li><a href="/jobs/data">Data</a></li><li><a href="/jobs/ml">AI</a></li></ul></main></body></html>';
+  const hydratedBuiltInDom =
+    '<!doctype html><html><head><title>Remote Jobs | Built In</title></head><body><main><h1>Remote Forward Deployed Jobs</h1>' +
+    '<article><h2><a href="https://builtin.com/job/fde-1">Forward Deployed Engineer</a></h2><p>Remote · $185K-$240K · Build production LLM agents for enterprise customers across healthcare and fintech.</p></article>' +
+    '<article><h2><a href="https://builtin.com/job/fde-2">Staff Applied AI Engineer</a></h2><p>Remote · $200K-$260K · Architect retrieval pipelines, evaluation frameworks, and multi-agent orchestration.</p></article>' +
+    '</main></body></html>';
+  const autoKinds: string[] = [];
+  const autoSwitched = await executeScrapeCall({
+    payload: { url: 'https://builtin.com/jobs/remote?search=Forward+Deployed+Engineer' }, // omitted renderMode -> defaults to "auto"!
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const req = (JSON.parse(rawBody) as { requests: Array<{ kind: string; url: string }> }).requests[0]!;
+      autoKinds.push(req.kind);
+      const isRender = req.kind === 'render';
+      return {
+        status: 200,
+        via: 'agent:site-win-vm',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'r1',
+              url: req.url,
+              status: 200,
+              outcome: 'ok',
+              rendered: isRender,
+              contentType: 'text/html',
+              body: isRender ? hydratedBuiltInDom : thinBuiltInShell,
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.deepEqual(autoKinds, ['scrape', 'render']);
+  assert.equal(autoSwitched.body.rendered, true);
+  assert.equal(autoSwitched.body.renderedVia, 'browser-auto');
+  assert.match(String(autoSwitched.body.markdown), /Forward Deployed Engineer/);
+
+  // --- P4 & P11: Schema.org `JobPosting` JSON-LD + EEO Boilerplate Down-Weighting + Total Target Cash Basis ---
+  const camundaHtml =
+    '<!doctype html><html><head><title>Senior Solutions Engineer</title>' +
+    '<script type="application/ld+json">' +
+    JSON.stringify({
+      '@context': 'https://schema.org',
+      '@type': 'JobPosting',
+      title: 'Senior Solutions Engineer',
+      datePosted: '2026-11-18',
+      employmentType: 'FULL_TIME',
+      hiringOrganization: { '@type': 'Organization', name: 'Camunda' },
+      jobLocationType: 'TELECOMMUTE',
+      applicantLocationRequirements: { '@type': 'Country', name: 'United States' },
+      baseSalary: {
+        '@type': 'MonetaryAmount',
+        currency: 'USD',
+        value: { '@type': 'QuantitativeValue', minValue: 157300, maxValue: 253600, unitText: 'YEAR' },
+      },
+    }) +
+    '</script></head><body><main>' +
+    '<h1>Senior Solutions Engineer</h1>' +
+    '<p>Guide enterprise architects adopting distributed workflow orchestration across microservices.</p>' +
+    '<h2>Compensation</h2><p>Annual Total Target Cash: $157,300 - $253,600 USD based on location and experience.</p>' +
+    '<h2>Equal Employment Opportunity &amp; AI in Hiring</h2>' +
+    '<p>Camunda is proud to be an equal opportunity employer without regard to race, color, religion, national origin, sex, age, or disability. ' +
+    'Reasonable accommodations are available for qualified individuals with disabilities throughout the remote application process and compensation review. ' +
+    'We may use artificial intelligence and automated employment decision tools during recruitment screening in compliance with candidate privacy notices.</p>' +
+    '</main></body></html>';
+
+  const camundaExtract = await executeExtractCall({
+    payload: {
+      urls: ['https://jobs.smartrecruiters.com/Camunda/744000099999999-senior-solutions-engineer'],
+      query: 'remote compensation salary location',
+      chunksPerSource: 1,
+    },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'ext-1',
+            url: 'https://jobs.smartrecruiters.com/Camunda/744000099999999-senior-solutions-engineer',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html',
+            body: camundaHtml,
+          },
+        ],
+      }),
+    }),
+  });
+  const camundaHit = (camundaExtract.body.results as Array<Record<string, unknown>>)[0]!;
+  const camundaJp = camundaHit.jobPosting as { workplaceType: string; pay: { min: number; max: number; basis: string } };
+  assert.equal(camundaJp.workplaceType, 'remote');
+  assert.equal(camundaJp.pay.basis, 'total'); // P11: Distinguished "Annual Total Target Cash" from pure base salary!
+  // P4: Top-ranked chunk MUST be the role/compensation section, NEVER the EEO / AI-in-hiring legal footer!
+  const topChunkText = ((camundaHit.chunks as Array<{ text: string }>)[0]?.text ?? '');
+  assert.match(topChunkText, /\$157,300–\$253,600/);
+  assert.doesNotMatch(topChunkText, /without regard to race, color, religion/i);
+
+  // --- P5: Per-record JSON chunking (`1 chunk = 1 record`, zero salary bleed, HTML -> Markdown, `jsonFilter`) ---
+  const leverPostingsJson = JSON.stringify([
+    {
+      id: 'job-111',
+      text: 'Backend Infrastructure Engineer',
+      hostedUrl: 'https://jobs.lever.co/acme/job-111',
+      categories: { location: 'San Francisco, CA', commitment: 'Full-time' },
+      salaryRange: { min: 145000, max: 175000, currency: 'USD', interval: 'per-year-salary' },
+      description: '<p>Scale multi-tenant Postgres &amp; Kafka clusters.</p>',
+    },
+    {
+      id: 'job-222',
+      text: 'Forward Deployed AI Engineer',
+      hostedUrl: 'https://jobs.lever.co/acme/job-222',
+      categories: { location: 'Remote - US', commitment: 'Full-time' },
+      salaryRange: { min: 215000, max: 275000, currency: 'USD', interval: 'per-year-salary' },
+      description: '<p>Embed with Fortune 500 engineering leaders to ship autonomous workflows.</p>',
+      lists: [{ text: 'Requirements', content: '<li>5+ years production Go or TypeScript</li><li>Strong customer architecture leadership</li>' }],
+    },
+  ]);
+
+  const jsonAllExtract = await executeExtractCall({
+    payload: { urls: ['https://api.lever.co/v0/postings/acme?mode=json'], chunksPerSource: 5 },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [{ id: 'ext-1', url: 'https://api.lever.co/v0/postings/acme?mode=json', status: 200, outcome: 'ok', contentType: 'application/json', body: leverPostingsJson }],
+      }),
+    }),
+  });
+  const jsonAllHit = (jsonAllExtract.body.results as Array<{ chunks: Array<{ text: string }> }>)[0]!;
+  assert.equal(jsonAllHit.chunks.length, 2);
+  assert.match(jsonAllHit.chunks[0]!.text, /\$145,000–\$175,000/);
+  assert.doesNotMatch(jsonAllHit.chunks[0]!.text, /215,000/); // Zero bleed from Job 2!
+  assert.match(jsonAllHit.chunks[1]!.text, /\$215,000–\$275,000/);
+  assert.doesNotMatch(jsonAllHit.chunks[1]!.text, /145,000/); // Zero bleed from Job 1!
+  assert.doesNotMatch(jsonAllHit.chunks[1]!.text, /<p>|<li>|&amp;/);
+
+  const jsonFilteredExtract = await executeExtractCall({
+    payload: {
+      urls: ['https://api.lever.co/v0/postings/acme?mode=json'],
+      jsonFilter: 'text~"Forward Deployed"',
+    },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [{ id: 'ext-1', url: 'https://api.lever.co/v0/postings/acme?mode=json', status: 200, outcome: 'ok', contentType: 'application/json', body: leverPostingsJson }],
+      }),
+    }),
+  });
+  const filteredHit = (jsonFilteredExtract.body.results as Array<{ recordCount: number; totalRecords: number; chunks: Array<{ text: string }> }>)[0]!;
+  assert.equal(filteredHit.recordCount, 1);
+  assert.equal(filteredHit.totalRecords, 2);
+  assert.equal(filteredHit.chunks.length, 1);
+  assert.match(filteredHit.chunks[0]!.text, /Forward Deployed AI Engineer/);
+
+  // --- P6: Block-boundary & link/sentence-safe chunking (`chunkMarkdownForSearch`) ---
+  const linkHeavyMd = [
+    '# Cloudflare Agents Architecture',
+    'Durable Objects provide single-threaded coordination with WebSocket hibernation. Read the [Model Context Protocol Guide](https://developers.cloudflare.com/agents/model-context-protocol/) to expose tools cleanly. Every Worker isolate validates incoming bearer tokens before routing requests to stateful actors.',
+    'State persistence combines SQLite storage inside [Durable Objects](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/) with zero-egress object blobs in [Cloudflare R2](https://developers.cloudflare.com/r2/api/workers/workers-api-usage/). Outbound crawlers honor [RFC 9309 robots.txt](https://www.rfc-editor.org/rfc/rfc9309) on every hop.',
+    '- First bullet with [Transport Spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports) and complete context.',
+    '- Second bullet with [OAuth 2.1 PKCE](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-12) and token rotation.',
+  ].join('\n\n');
+  const p6Chunks = chunkMarkdownForSearch(linkHeavyMd, 260, 80);
+  assert.equal(p6Chunks.length >= 3, true);
+  for (const ch of p6Chunks) {
+    assert.doesNotMatch(ch.text, /^\]\(/, `chunk must never start with dangling link tail: ${ch.text}`);
+    assert.doesNotMatch(ch.text, /^[a-z]/, `chunk must never start mid-sentence with lowercase word: ${ch.text}`);
+    // Every `[` link opener in the chunk must have its matching `)` closer intact in the same chunk!
+    const openLinks = (ch.text.match(/\[[^\]]+\]\(/g) ?? []).length;
+    const fullLinks = (ch.text.match(/\[[^\]]+\]\(https:\/\/[^)]+\)/g) ?? []).length;
+    assert.equal(openLinks, fullLinks, `every Markdown link must remain intact in chunk: ${ch.text}`);
+  }
+
+  // --- P7: `map` whole-token `search` (`voice` never matches `invoices`) + path prefix scoping ---
+  const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url><loc>https://developers.cloudflare.com/agents/guides/voice-agents/</loc></url>
+      <url><loc>https://developers.cloudflare.com/agents/api-reference/realtime-voice/</loc></url>
+      <url><loc>https://developers.cloudflare.com/agents/concepts/billing-invoices/</loc></url>
+      <url><loc>https://developers.cloudflare.com/billing/invoices/voice-memo/</loc></url>
+    </urlset>`;
+  const mapScoped = await executeMapCall({
+    payload: { url: 'https://developers.cloudflare.com/agents/', search: 'voice' },
+    executeHubFetch: async (_target, rawBody) => {
+      const reqs = (JSON.parse(rawBody) as { requests: Array<{ id: string; url: string }> }).requests;
+      return {
+        status: 200,
+        via: 'agent:site-arm64',
+        bodyText: JSON.stringify({
+          results: reqs.map((rq) =>
+            rq.url.endsWith('/sitemap.xml')
+              ? { id: rq.id, url: rq.url, status: 200, outcome: 'ok', body: sitemapXml }
+              : { id: rq.id, url: rq.url, status: 404, outcome: 'error' },
+          ),
+        }),
+      };
+    },
+  });
+  const scopedLinks = mapScoped.body.links as string[];
+  assert.deepEqual(scopedLinks, [
+    'https://developers.cloudflare.com/agents/guides/voice-agents/',
+    'https://developers.cloudflare.com/agents/api-reference/realtime-voice/',
+  ]); // Excludes `billing-invoices` (`voice` != `invoices`) AND excludes `/billing/...` outside `/agents/`!
+
+  const mapSiteWide = await executeMapCall({
+    payload: { url: 'https://developers.cloudflare.com/agents/', search: 'voice', includeOutsidePath: true },
+    executeHubFetch: async (_target, rawBody) => {
+      const reqs = (JSON.parse(rawBody) as { requests: Array<{ id: string; url: string }> }).requests;
+      return {
+        status: 200,
+        via: 'agent:site-arm64',
+        bodyText: JSON.stringify({
+          results: reqs.map((rq) =>
+            rq.url.endsWith('/sitemap.xml')
+              ? { id: rq.id, url: rq.url, status: 200, outcome: 'ok', body: sitemapXml }
+              : { id: rq.id, url: rq.url, status: 404, outcome: 'error' },
+          ),
+        }),
+      };
+    },
+  });
+  assert.equal((mapSiteWide.body.links as string[]).includes('https://developers.cloudflare.com/billing/invoices/voice-memo/'), true);
+
+  // --- P8: `interact` does NOT retry `selector_not_found` across 3 agents + returns partial rendered Markdown! ---
+  const p8DispatchedSites: string[] = [];
+  const p8Sockets: Array<HubSocketLike & { tags: string[] }> = [];
+  const p8Engine = new AgentHubEngine({
+    getSockets: (tag) => (tag ? p8Sockets.filter((s) => s.tags.includes(tag)) : p8Sockets),
+    cooldowns: memoryCooldowns(),
+    hostWindows: createMemoryHostWindowStore(),
+  });
+  for (const [siteId, ip] of [
+    ['site-win-vm', '198.51.100.10'],
+    ['site-x86', '198.51.100.11'],
+    ['site-arm64', '198.51.100.12'],
+  ] as const) {
+    const sock = makeFakeSocket([`site:${siteId}`], (msg) => {
+      const parsed = JSON.parse(msg) as { type?: string; jobId?: string; jobNonce?: string };
+      if (parsed.type === 'dispatch' && parsed.jobId && parsed.jobNonce) {
+        p8DispatchedSites.push(siteId);
+        queueMicrotask(() => {
+          p8Engine.completeJob(
+            parsed.jobId!,
+            parsed.jobNonce!,
+            siteId,
+            JSON.stringify({
+              results: [
+                {
+                  id: 'interact-1',
+                  url: 'https://app.example.com/jobs',
+                  finalUrl: 'https://app.example.com/jobs',
+                  status: 200,
+                  outcome: 'error',
+                  rendered: true,
+                  sessionId: 'efsess_partial1',
+                  problem: 'interact action 0 (click): selector "#does-not-exist" not found within 15s',
+                  body: '<!doctype html><html><head><title>Loaded Board</title></head><body><main><h1>Loaded Board</h1><p>Initial postings already rendered before click failed.</p></main></body></html>',
+                },
+              ],
+            }),
+          );
+        });
+      }
+    });
+    p8Sockets.push(sock);
+    p8Engine.registerAgent(sock, siteId, 'amd64', { version: '2.3.0', publicIp: ip, capabilities: ['browser-v1', 'artifacts-v1'] });
+  }
+
+  const p8Interact = await executeInteractCall({
+    payload: {
+      url: 'https://app.example.com/jobs',
+      actions: [{ type: 'click', selector: '#does-not-exist' }],
+      formats: ['markdown'],
+    },
+    env: {},
+    executeHubFetch: async (_target, rawBody, site) => {
+      const d = await p8Engine.dispatchFetch(rawBody, {}, site ? { preferredSite: site } : {});
+      return { status: d.ok ? 200 : d.status, via: d.ok ? `agent:${d.siteId}` : 'hub', bodyText: d.ok ? d.bodyText : JSON.stringify({ error: d.error }) };
+    },
+  });
+  assert.equal(p8DispatchedSites.length, 1, `selector_not_found must run on 1 agent only, got: ${p8DispatchedSites.join(',')}`);
+  assert.equal(p8Interact.status, 422);
+  assert.equal(p8Interact.body.partial, true);
+  assert.match(String(p8Interact.body.markdown), /Initial postings already rendered before click failed/);
+  assert.equal((p8Interact.body.actions as Array<{ status: string }>)[0]?.status, 'error');
+
+  // --- P9: Flag material page redirects (`redirected: true`, `filtersMayBeLost: true`) ---
+  const wellfoundScrape = await executeScrapeCall({
+    payload: { url: 'https://wellfound.com/role/r/forward-deployed-engineer', renderMode: 'off' },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: 'https://wellfound.com/role/r/forward-deployed-engineer',
+            finalUrl: 'https://wellfound.com/remote',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html',
+            body: '<!doctype html><html><head><title>Remote Startup Jobs</title></head><body><main><h1>Generic Remote Feed</h1><p>' + 'word '.repeat(60) + '</p></main></body></html>',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(wellfoundScrape.body.redirected, true);
+  assert.equal(wellfoundScrape.body.filtersMayBeLost, true);
+  assert.match(String(wellfoundScrape.body.redirectNote), /filters.*lost/i);
+
+  // --- P10: Ethical `blocked` reason + actionable suggestion on robots.txt & bot challenges ---
+  const liBlocked = await executeScrapeCall({
+    payload: { url: 'https://www.linkedin.com/jobs/view/123456789' },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-arm64',
+      bodyText: JSON.stringify({
+        results: [{ id: 'scrape-1', url: 'https://www.linkedin.com/jobs/view/123456789', status: 0, outcome: 'skip', problem: 'robots.txt disallowed /jobs/view/123456789' }],
+      }),
+    }),
+  });
+  assert.equal(liBlocked.status, 422);
+  assert.equal((liBlocked.body.blocked as { reason: string }).reason, 'robots');
+  assert.match((liBlocked.body.blocked as { suggestion: string }).suggestion, /site:job-boards\.greenhouse\.io/);
+
+  const indeedChallenge = await executeScrapeCall({
+    payload: { url: 'https://www.indeed.com/viewjob?jk=abcd1234' },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [{ id: 'scrape-1', url: 'https://www.indeed.com/viewjob?jk=abcd1234', status: 403, outcome: 'challenge', problem: 'Cloudflare challenge (cf-mitigated)' }],
+      }),
+    }),
+  });
+  assert.equal(indeedChallenge.status, 403);
+  assert.equal((indeedChallenge.body.blocked as { reason: string }).reason, 'challenge');
+
+  // --- P12: MCP `fetch_batch` sends `concurrency: 4` and surfaces `stageTimingsMs` ---
+  let capturedBatchConcurrency = 0;
+  const p12Db = new DatabaseSync(':memory:');
+  p12Db.exec(OAUTH_SQLITE_SCHEMA);
+  const p12Sql: SqlStorageLike = {
+    exec<T = Record<string, unknown>>(q: string, ...b: unknown[]) {
+      const s = p12Db.prepare(q);
+      const rows = /^\s*select/i.test(q) ? s.all(...(b as never[])) : (s.run(...(b as never[])), []);
+      return { toArray: () => rows as T[] };
+    },
+  };
+  const mcpBatchDeps: McpServerDeps = {
+    serverName: 'edgefetch-hub',
+    serverVersion: '2.3.0',
+    ownerSecret: 'p12-secret-token-0123456789abcdef',
+    oauthStore: createSqliteOAuthStore(p12Sql),
+    allowedTargets: ['auto', 'agent', 'container'],
+    defaultTarget: 'auto',
+    listFleet: async () => ({ connected: 1, agents: [], affinities: [] }),
+    executeFetch: async ({ body }) => {
+      const parsed = JSON.parse(body) as { options?: { concurrency?: number }; requests: Array<{ id: string; url: string }> };
+      capturedBatchConcurrency = parsed.options?.concurrency ?? 1;
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        stageTimingsMs: { dispatchMs: 42, hydrateR2Ms: 3, totalHubMs: 46 },
+        bodyText: JSON.stringify({
+          results: parsed.requests.map((r) => ({ id: r.id, url: r.url, finalUrl: r.url, status: 200, outcome: 'ok' })),
+        }),
+      };
+    },
+  };
+  const mcpBatchRes = await handleMcpRequest(
+    new Request('https://hub.example.com/mcp', {
+      method: 'POST',
+      headers: { authorization: 'Bearer p12-secret-token-0123456789abcdef', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 12,
+        method: 'tools/call',
+        params: {
+          name: 'fetch_batch',
+          arguments: {
+            urls: [
+              'https://one.example.com/a',
+              'https://two.example.com/b',
+              'https://three.example.com/c',
+              'https://four.example.com/d',
+            ],
+          },
+        },
+      }),
+    }),
+    new URL('https://hub.example.com/mcp'),
+    mcpBatchDeps,
+  );
+  assert.equal(mcpBatchRes.status, 200);
+  assert.equal(capturedBatchConcurrency, 4);
+  const mcpBatchJson = (await mcpBatchRes.json()) as { result: { content: Array<{ text: string }> } };
+  const mcpBatchParsed = JSON.parse(mcpBatchJson.result.content[0]!.text) as { stageTimingsMs?: { totalHubMs: number } };
+  assert.equal(mcpBatchParsed.stageTimingsMs?.totalHubMs, 46);
+
+  // --- Section 4: `jobs` tool (`executeJobsCall`) deduplicates, respects `exclude`, and enforces `minBase` (`basis === "base"`) ---
+  const jobsSweep = await executeJobsCall({
+    payload: {
+      query: 'Forward Deployed Engineer',
+      remote: true,
+      minBase: 200_000,
+      includeBuiltIn: false,
+      exclude: [{ company: 'AlreadyAppliedCorp', title: 'Forward Deployed Engineer' }],
+    },
+    env: {},
+    executeSearch: async ({ query: q }) => {
+      if (String(q).includes('jobs.ashbyhq.com')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { url: 'https://jobs.ashbyhq.com/elevenlabs/43f91b57-5c4e-4d4a-9450-3591f2a79923' },
+              { url: 'https://jobs.ashbyhq.com/elevenlabs/dup-mirror' },
+              { url: 'https://jobs.ashbyhq.com/alreadyappliedcorp/999' },
+            ],
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          results: [{ url: 'https://jobs.smartrecruiters.com/Camunda/744000099999999-forward-deployed-engineer' }],
+        },
+      };
+    },
+    executeScrape: async ({ url: u }) => {
+      if (String(u).includes('elevenlabs')) {
+        return { status: 200, body: ashbyScrape.body };
+      }
+      if (String(u).includes('alreadyappliedcorp')) {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            jobPosting: {
+              title: 'Forward Deployed Engineer',
+              hiringOrganization: 'AlreadyAppliedCorp',
+              workplaceType: 'remote',
+              jobLocation: ['Remote'],
+              pay: { min: 240_000, max: 300_000, currency: 'USD', period: 'year', basis: 'base' },
+              source: 'ashby',
+            },
+            markdown: '# Forward Deployed Engineer',
+          },
+        };
+      }
+      // Camunda role has $253.6K max, but basis === "total" (Total Target Cash), so `minBase: 200000` must filter it out!
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          jobPosting: {
+            title: 'Forward Deployed Engineer',
+            hiringOrganization: 'Camunda',
+            workplaceType: 'remote',
+            jobLocation: ['Remote'],
+            pay: { min: 157_300, max: 253_600, currency: 'USD', period: 'year', basis: 'total' },
+            source: 'json-ld',
+          },
+          markdown: '# Forward Deployed Engineer',
+        },
+      };
+    },
+  });
+  assert.equal(jobsSweep.status, 200);
+  const finalJobs = jobsSweep.body.jobs as Array<{ company: string; title: string; pay: { min: number; max: number; basis: string } }>;
+  assert.equal(finalJobs.length, 1);
+  assert.equal(finalJobs[0]?.company, 'ElevenLabs');
+  assert.equal(finalJobs[0]?.pay.min, 230_000);
+  assert.equal(finalJobs[0]?.pay.basis, 'base');
 });

@@ -9,6 +9,21 @@
  *  - Only verified documents (`isContentVerifiedInMetaD1 === true`) are indexed into `SEARCH` D1.
  */
 
+import { resolveSiteExtractorTwin } from './extractors/registry';
+import {
+  analyzeUrlRedirect,
+  buildBlockedInfo,
+  chunkJsonRecords,
+  detectWorkdayRedirectStub,
+  extractJobPostingJsonLd,
+  formatJobPostingHeaderMarkdown,
+  isJobLegalBoilerplateChunk,
+  isThinScriptedPage,
+  resolveAtsPreFetchSpec,
+  type BlockedSuggestion,
+  type RedirectAnalysis,
+  type StructuredJobPosting,
+} from './jobs';
 import { validatePublicHttpsTargetUrl } from './overflow';
 import {
   cleanPdfMarkdown,
@@ -115,8 +130,335 @@ export function stripYamlFrontmatter(md: string): { title?: string; body: string
 }
 
 /**
- * Splits extracted Markdown or text into ~1,500-character chunks with a 150-character overlap while preserving
- * Markdown `#`..`######` section headings on every chunk.
+ * Splits an oversized prose paragraph or list item into link-safe, inline-code-safe sentence units (`<= maxLen`)
+ * so `chunkMarkdownForSearch` (`P6`) NEVER cuts inside `[anchor](https://...)` or `` `code` `` and never starts a
+ * chunk mid-sentence with a lowercase continuation word or a dangling `](...)` tail.
+ */
+function splitOversizedBlockIntoSafeUnits(block: string, maxLen: number): Array<{ text: string; allowOverlap: boolean }> {
+  const trimmed = block.trim();
+  if (!trimmed) return [];
+  if (trimmed.length <= maxLen) return [{ text: trimmed, allowOverlap: true }];
+
+  // Step 1: Extract natural sentence spans while respecting inline `` `...` `` and `[...](...)` Markdown links.
+  const sentences: string[] = [];
+  let inCodeTicks = 0;
+  let bracketDepth = 0;
+  let linkParenDepth = 0;
+  let sentStart = 0;
+  const len = trimmed.length;
+
+  for (let i = 0; i < len; i++) {
+    const ch = trimmed[i]!;
+    if (ch === '`') {
+      let run = 1;
+      while (i + run < len && trimmed[i + run] === '`') run++;
+      if (inCodeTicks === 0) inCodeTicks = run;
+      else if (run === inCodeTicks) inCodeTicks = 0;
+      i += run - 1;
+      continue;
+    }
+    if (inCodeTicks > 0) continue;
+
+    if (linkParenDepth > 0) {
+      if (ch === '(') linkParenDepth++;
+      else if (ch === ')') linkParenDepth = Math.max(0, linkParenDepth - 1);
+      continue;
+    }
+    if (ch === '[') {
+      bracketDepth++;
+      continue;
+    }
+    if (ch === ']' && bracketDepth > 0) {
+      bracketDepth--;
+      if (i + 1 < len && trimmed[i + 1] === '(') {
+        linkParenDepth = 1;
+        i++;
+      }
+      continue;
+    }
+
+    if (bracketDepth === 0 && (ch === '.' || ch === '!' || ch === '?')) {
+      // Skip common abbreviations ("e.g.", "i.e.", "vs.", "Mr.", "Dr.", "St.", "U.S.") and decimal numbers ("3.14")
+      if (ch === '.' && i > 0 && i + 1 < len && /\d/.test(trimmed[i - 1]!) && /\d/.test(trimmed[i + 1]!)) {
+        continue;
+      }
+      const prevWord = trimmed.slice(Math.max(0, i - 5), i);
+      if (ch === '.' && /(?:^|\s)(?:e\.g|i\.e|vs|mr|mrs|ms|dr|jr|sr|st|inc|ltd|co|corp|fig|no)$/i.test(prevWord)) {
+        continue;
+      }
+
+      let after = i + 1;
+      while (after < len && (trimmed[after] === '"' || trimmed[after] === "'" || trimmed[after] === '\u201d' || trimmed[after] === ')' || trimmed[after] === ']')) {
+        after++;
+      }
+      if (after < len && /\s/.test(trimmed[after]!)) {
+        let nextNonWs = after;
+        while (nextNonWs < len && /\s/.test(trimmed[nextNonWs]!)) nextNonWs++;
+        if (nextNonWs < len && /[\p{Lu}0-9#*`\[>-]/u.test(trimmed[nextNonWs]!)) {
+          const piece = trimmed.slice(sentStart, after).trim();
+          if (piece) sentences.push(piece);
+          sentStart = nextNonWs;
+          i = nextNonWs - 1;
+        }
+      }
+    }
+  }
+  const tail = trimmed.slice(sentStart).trim();
+  if (tail) sentences.push(tail);
+
+  // Step 2: Pack sentences up to `maxLen`; if a single mega-sentence still exceeds `maxLen`, split at link-safe whitespace with `allowOverlap: false`.
+  const units: Array<{ text: string; allowOverlap: boolean }> = [];
+  for (const sent of sentences) {
+    if (sent.length <= maxLen) {
+      units.push({ text: sent, allowOverlap: true });
+      continue;
+    }
+    // Split oversized single sentence only at whitespace outside `[...](...)` and `` `...` ``
+    let pos = 0;
+    while (pos < sent.length) {
+      if (sent.length - pos <= maxLen) {
+        const rem = sent.slice(pos).trim();
+        if (rem) units.push({ text: rem, allowOverlap: false });
+        break;
+      }
+      let bestWs = -1;
+      let firstSafeWsAfter = -1;
+      let cTicks = 0;
+      let bDepth = 0;
+      let pDepth = 0;
+      const scanLimit = Math.min(sent.length, pos + maxLen + 240);
+      for (let j = pos; j < scanLimit; j++) {
+        const c = sent[j]!;
+        if (c === '`') {
+          let r = 1;
+          while (j + r < scanLimit && sent[j + r] === '`') r++;
+          if (cTicks === 0) cTicks = r;
+          else if (r === cTicks) cTicks = 0;
+          j += r - 1;
+          continue;
+        }
+        if (cTicks > 0) continue;
+        if (pDepth > 0) {
+          if (c === '(') pDepth++;
+          else if (c === ')') pDepth = Math.max(0, pDepth - 1);
+          continue;
+        }
+        if (c === '[') {
+          bDepth++;
+          continue;
+        }
+        if (c === ']' && bDepth > 0) {
+          bDepth--;
+          if (j + 1 < scanLimit && sent[j + 1] === '(') {
+            pDepth = 1;
+            j++;
+          }
+          continue;
+        }
+        if (bDepth === 0 && pDepth === 0 && /\s/.test(c)) {
+          if (j - pos <= maxLen) {
+            bestWs = j;
+          } else if (firstSafeWsAfter === -1) {
+            firstSafeWsAfter = j;
+            break;
+          }
+        }
+      }
+      const cut = bestWs > pos + Math.floor(maxLen * 0.25) ? bestWs : firstSafeWsAfter > pos ? firstSafeWsAfter : Math.min(sent.length, pos + maxLen);
+      const sub = sent.slice(pos, cut).trim();
+      if (sub) units.push({ text: sub, allowOverlap: false });
+      pos = cut;
+      while (pos < sent.length && /\s/.test(sent[pos]!)) pos++;
+    }
+  }
+  return units;
+}
+
+interface AtomicMdUnit {
+  text: string;
+  sepBefore: ' ' | '\n' | '\n\n';
+  allowOverlap: boolean;
+}
+
+function parseSectionIntoAtomicUnits(sectionBody: string, safeTarget: number): AtomicMdUnit[] {
+  const lines = sectionBody.split('\n');
+  const rawBlocks: Array<{ kind: 'heading' | 'fence' | 'table' | 'list' | 'quote' | 'para'; text: string; fenceHeader?: string; fenceClose?: string }> = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const trimmed = line.trim();
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+
+    // 1. Fenced code block
+    const fm = /^(`{3,}|~{3,})(.*)$/.exec(trimmed);
+    if (fm?.[1] && !(fm[1][0] === '`' && fm[2]!.includes('`'))) {
+      const fChar = fm[1][0]!;
+      const fLen = fm[1].length;
+      const fLines = [line];
+      i++;
+      let closed = false;
+      while (i < lines.length) {
+        const cl = lines[i]!;
+        fLines.push(cl);
+        i++;
+        const ct = cl.trim();
+        const cm = /^(`{3,}|~{3,})\s*$/.exec(ct);
+        if (cm?.[1] && cm[1][0] === fChar && cm[1].length >= fLen) {
+          closed = true;
+          break;
+        }
+      }
+      const closeFence = fChar.repeat(fLen);
+      if (!closed) fLines.push(closeFence);
+      rawBlocks.push({ kind: 'fence', text: fLines.join('\n'), fenceHeader: trimmed, fenceClose: closeFence });
+      continue;
+    }
+
+    // 2. Heading
+    if (/^#{1,6}\s+/.test(trimmed)) {
+      rawBlocks.push({ kind: 'heading', text: trimmed });
+      i++;
+      continue;
+    }
+
+    // 3. Markdown Table
+    if (trimmed.startsWith('|')) {
+      const tLines: string[] = [];
+      while (i < lines.length && lines[i]!.trim().startsWith('|')) {
+        tLines.push(lines[i]!);
+        i++;
+      }
+      rawBlocks.push({ kind: 'table', text: tLines.join('\n') });
+      continue;
+    }
+
+    // 4. List item (`- `, `* `, `+ `, `1. ` + indented continuation lines)
+    if (/^(?:[-*+]|\d+[.)])\s+/.test(trimmed)) {
+      const itemLines = [line];
+      i++;
+      while (i < lines.length) {
+        const nl = lines[i]!;
+        const nt = nl.trim();
+        if (!nt) break;
+        if (/^(?:[-*+]|\d+[.)])\s+/.test(nt) && !/^\s{2,}/.test(nl)) break;
+        if (/^(?:#{1,6}\s+|`{3,}|~{3,}|\|)/.test(nt)) break;
+        itemLines.push(nl);
+        i++;
+      }
+      rawBlocks.push({ kind: 'list', text: itemLines.join('\n') });
+      continue;
+    }
+
+    // 5. Blockquote
+    if (trimmed.startsWith('>')) {
+      const qLines: string[] = [];
+      while (i < lines.length && lines[i]!.trim().startsWith('>')) {
+        qLines.push(lines[i]!);
+        i++;
+      }
+      rawBlocks.push({ kind: 'quote', text: qLines.join('\n') });
+      continue;
+    }
+
+    // 6. Prose paragraph
+    const pLines: string[] = [];
+    while (i < lines.length) {
+      const pl = lines[i]!;
+      const pt = pl.trim();
+      if (!pt) break;
+      if (/^(?:#{1,6}\s+|`{3,}|~{3,}|\||>|(?:[-*+]|\d+[.)])\s+)/.test(pt)) break;
+      pLines.push(pl);
+      i++;
+    }
+    if (pLines.length > 0) {
+      rawBlocks.push({ kind: 'para', text: pLines.join('\n') });
+    } else {
+      i++;
+    }
+  }
+
+  const units: AtomicMdUnit[] = [];
+  let prevKind: string | null = null;
+
+  for (const b of rawBlocks) {
+    const sepBefore: '\n' | '\n\n' = prevKind === 'list' && b.kind === 'list' ? '\n' : '\n\n';
+    prevKind = b.kind;
+
+    if (b.text.length <= safeTarget) {
+      units.push({
+        text: b.text,
+        sepBefore,
+        allowOverlap: b.kind === 'para' || b.kind === 'list' || b.kind === 'quote',
+      });
+      continue;
+    }
+
+    if (b.kind === 'fence') {
+      const innerLines = b.text.split('\n');
+      const openHdr = b.fenceHeader ?? '```';
+      const closeHdr = b.fenceClose ?? '```';
+      const bodyLines = innerLines.slice(1, innerLines.length - 1);
+      const maxInner = Math.max(80, safeTarget - openHdr.length - closeHdr.length - 4);
+      let curLines: string[] = [];
+      let curLen = 0;
+      for (const cl of bodyLines) {
+        if (curLines.length > 0 && curLen + cl.length + 1 > maxInner) {
+          units.push({ text: `${openHdr}\n${curLines.join('\n')}\n${closeHdr}`, sepBefore: '\n\n', allowOverlap: false });
+          curLines = [];
+          curLen = 0;
+        }
+        curLines.push(cl);
+        curLen += cl.length + 1;
+      }
+      if (curLines.length > 0) {
+        units.push({ text: `${openHdr}\n${curLines.join('\n')}\n${closeHdr}`, sepBefore: '\n\n', allowOverlap: false });
+      }
+      continue;
+    }
+
+    if (b.kind === 'table') {
+      const tRows = b.text.split('\n');
+      const hasHeader = tRows.length >= 2 && /^\|\s*[-:]+/.test(tRows[1]!.trim());
+      const headerPrefix = hasHeader ? `${tRows[0]}\n${tRows[1]}` : '';
+      const dataRows = hasHeader ? tRows.slice(2) : tRows;
+      let curRows: string[] = headerPrefix ? [headerPrefix] : [];
+      let curLen = headerPrefix.length;
+      for (const r of dataRows) {
+        if (curRows.length > (headerPrefix ? 1 : 0) && curLen + r.length + 1 > safeTarget) {
+          units.push({ text: curRows.join('\n'), sepBefore: '\n\n', allowOverlap: false });
+          curRows = headerPrefix ? [headerPrefix] : [];
+          curLen = headerPrefix.length;
+        }
+        curRows.push(r);
+        curLen += r.length + 1;
+      }
+      if (curRows.length > (headerPrefix ? 1 : 0)) {
+        units.push({ text: curRows.join('\n'), sepBefore: '\n\n', allowOverlap: false });
+      }
+      continue;
+    }
+
+    const subUnits = splitOversizedBlockIntoSafeUnits(b.text, safeTarget);
+    subUnits.forEach((su, idx) => {
+      units.push({
+        text: su.text,
+        sepBefore: idx === 0 ? sepBefore : ' ',
+        allowOverlap: su.allowOverlap,
+      });
+    });
+  }
+
+  return units;
+}
+
+/**
+ * Splits extracted Markdown or text into ~1,500-character chunks on clean block & sentence boundaries (`P6`),
+ * preserving Markdown `#`..`######` section headings on every chunk while guaranteeing that NO chunk ever cuts
+ * inside `[anchor](url)` links or starts mid-sentence with a lowercase fragment or dangling `](...)` link tail.
  */
 export function chunkMarkdownForSearch(
   markdown: string,
@@ -139,8 +481,8 @@ export function chunkMarkdownForSearch(
 
   for (const line of lines) {
     const trimmedLine = line.trim();
-    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmedLine);
-    if (fenceMatch?.[1]) {
+    const fenceMatch = /^(`{3,}|~{3,})(.*)$/.exec(trimmedLine);
+    if (fenceMatch?.[1] && !(!secFenceChar && fenceMatch[1][0] === '`' && fenceMatch[2]!.includes('`'))) {
       const ch = fenceMatch[1][0]!;
       const len = fenceMatch[1].length;
       if (!secFenceChar) {
@@ -174,42 +516,6 @@ export function chunkMarkdownForSearch(
     if (body) sections.push({ heading: currentHeading, body });
   }
 
-  const scanFenceState = (
-    segment: string,
-    initialHeader: string,
-  ): { openHeader: string; openChar: string; openLen: number; lastOpenOffsetInSegment: number } => {
-    let openHeader = initialHeader;
-    let openChar = initialHeader ? initialHeader[0]! : '';
-    let openLen = 0;
-    if (initialHeader) {
-      const im = /^(`{3,}|~{3,})/.exec(initialHeader);
-      openLen = im?.[1]?.length ?? 3;
-    }
-    let lastOpenOffsetInSegment = -1;
-    let offset = 0;
-    for (const rawLine of segment.split('\n')) {
-      const trimmed = rawLine.trim();
-      const fm = /^(`{3,}|~{3,})/.exec(trimmed);
-      if (fm?.[1]) {
-        const ch = fm[1][0]!;
-        const len = fm[1].length;
-        if (!openChar) {
-          openChar = ch;
-          openLen = len;
-          openHeader = trimmed;
-          lastOpenOffsetInSegment = offset;
-        } else if (ch === openChar && len >= openLen && /^[`~]+\s*$/.test(trimmed)) {
-          openChar = '';
-          openLen = 0;
-          openHeader = '';
-          lastOpenOffsetInSegment = -1;
-        }
-      }
-      offset += rawLine.length + 1;
-    }
-    return { openHeader, openChar, openLen, lastOpenOffsetInSegment };
-  };
-
   const chunks: MarkdownChunk[] = [];
   for (const sec of sections) {
     const text = sec.body;
@@ -218,99 +524,61 @@ export function chunkMarkdownForSearch(
       continue;
     }
 
-    let start = 0;
-    let reopenFenceHeader = '';
-    while (start < text.length) {
-      let end = Math.min(text.length, start + safeTarget);
-      if (end < text.length) {
-        const paraBreak = text.lastIndexOf('\n\n', end);
-        const lineBreak = text.lastIndexOf('\n', end);
-        const sentenceBreak = text.lastIndexOf('. ', end);
-        const spaceBreak = text.lastIndexOf(' ', end);
-        const minSplit = start + Math.floor(safeTarget * 0.5);
-        const isMidTableLineBreak =
-          lineBreak > start &&
-          text.slice(text.lastIndexOf('\n', lineBreak - 1) + 1, lineBreak).trimStart().startsWith('|') &&
-          text.slice(lineBreak + 1, text.indexOf('\n', lineBreak + 1) === -1 ? text.length : text.indexOf('\n', lineBreak + 1)).trimStart().startsWith('|');
-        const tableSafeMinSplit = start + Math.floor(safeTarget * 0.25);
-        if (paraBreak >= minSplit || (isMidTableLineBreak && paraBreak >= tableSafeMinSplit)) end = paraBreak;
-        else if (lineBreak >= minSplit) end = lineBreak;
-        else if (sentenceBreak >= minSplit) end = sentenceBreak + 1;
-        else if (spaceBreak >= minSplit) end = spaceBreak;
-        else {
-          // Avoid splitting a long token/URL mid-character if whitespace follows shortly after `end`.
-          const fwdSpace = text.slice(end, Math.min(text.length, end + 120)).search(/\s/);
-          if (fwdSpace >= 0) end += fwdSpace;
+    const units = parseSectionIntoAtomicUnits(text, safeTarget);
+    if (units.length === 0) continue;
+
+    let curUnits: AtomicMdUnit[] = [];
+    let curLen = 0;
+
+    const renderUnits = (arr: AtomicMdUnit[]): string => {
+      if (arr.length === 0) return '';
+      let out = arr[0]!.text;
+      for (let k = 1; k < arr.length; k++) {
+        out += arr[k]!.sepBefore + arr[k]!.text;
+      }
+      return out.trim();
+    };
+
+    for (let uIdx = 0; uIdx < units.length; uIdx++) {
+      const u = units[uIdx]!;
+      const addedLen = curUnits.length === 0 ? u.text.length : u.sepBefore.length + u.text.length;
+
+      // Never strand a lone section heading in its own tiny chunk before the first content block.
+      const onlyHeadingSoFar = curUnits.length === 1 && /^#{1,6}\s+/.test(curUnits[0]!.text);
+
+      if (curUnits.length > 0 && !onlyHeadingSoFar && curLen + addedLen > safeTarget) {
+        const rendered = renderUnits(curUnits);
+        if (rendered) {
+          chunks.push({ ordinal: chunks.length, heading: sec.heading, text: rendered });
         }
-      }
 
-      let forcedNextStart: number | undefined;
-      let fenceState = scanFenceState(text.slice(start, end), reopenFenceHeader);
-      if (
-        end < text.length &&
-        !reopenFenceHeader &&
-        fenceState.openChar &&
-        fenceState.lastOpenOffsetInSegment >= Math.floor(safeTarget * 0.2)
-      ) {
-        // Back up right before the opening code fence so normal-sized code blocks stay intact in the next chunk.
-        end = start + fenceState.lastOpenOffsetInSegment;
-        forcedNextStart = end;
-        fenceState = { openHeader: '', openChar: '', openLen: 0, lastOpenOffsetInSegment: -1 };
-      }
-
-      let rawSlice = text.slice(start, end);
-      if (reopenFenceHeader) {
-        rawSlice = `${reopenFenceHeader}\n${rawSlice.replace(/^\n+/, '')}`;
-      }
-      let slice = rawSlice.trim();
-      if (fenceState.openChar) {
-        // Oversized code block that must span multiple chunks: close fence cleanly here and reopen on next chunk.
-        slice = `${slice}\n${fenceState.openChar.repeat(fenceState.openLen)}`;
-        reopenFenceHeader = fenceState.openHeader;
-        forcedNextStart = end;
-      } else {
-        reopenFenceHeader = '';
-      }
-
-      if (slice) {
-        chunks.push({ ordinal: chunks.length, heading: sec.heading, text: slice });
-      }
-      if (end >= text.length) break;
-
-      let nextStart: number;
-      if (forcedNextStart !== undefined) {
-        nextStart = forcedNextStart;
-        while (nextStart < text.length && (text[nextStart] === '\n' || text[nextStart] === '\r')) {
-          nextStart++;
-        }
-      } else {
-        nextStart = Math.max(start + 1, end - safeOverlap);
-        if (nextStart > 0 && nextStart < end) {
-          const nearLine = text.indexOf('\n', nextStart);
-          if (nearLine !== -1 && nearLine < end && nearLine - nextStart <= Math.max(24, Math.floor(safeOverlap * 0.6))) {
-            nextStart = nearLine + 1;
-          } else if (!/\s/.test(text[nextStart - 1]!)) {
-            while (nextStart < end && !/\s/.test(text[nextStart]!)) {
-              nextStart++;
-            }
+        // Carry over trailing complete sentence/list/paragraph units (`allowOverlap === true`) up to `safeOverlap` chars!
+        const overlapSeed: AtomicMdUnit[] = [];
+        if (safeOverlap > 0) {
+          let ovLen = 0;
+          for (let back = curUnits.length - 1; back >= 0; back--) {
+            const cand = curUnits[back]!;
+            if (!cand.allowOverlap) break;
+            const candCost = overlapSeed.length === 0 ? cand.text.length : cand.sepBefore.length + cand.text.length;
+            if (ovLen + candCost > safeOverlap) break;
+            overlapSeed.unshift(cand);
+            ovLen += candCost;
           }
         }
-        while (nextStart < text.length && /\s/.test(text[nextStart]!)) {
-          nextStart++;
-        }
-        // Never overlap mid-table rows (`| ... |`) without their table header: advance past headless table continuation rows.
-        if (nextStart < end && text[nextStart] === '|') {
-          const prevNl = text.lastIndexOf('\n', nextStart - 2);
-          const prevLine = text.slice(prevNl + 1, nextStart).trimStart();
-          if (prevLine.startsWith('|')) {
-            nextStart = end;
-            while (nextStart < text.length && (text[nextStart] === '\n' || text[nextStart] === '\r')) {
-              nextStart++;
-            }
-          }
-        }
+        curUnits = [...overlapSeed];
+        curLen = renderUnits(curUnits).length;
       }
-      start = nextStart > start ? nextStart : end;
+
+      const nextAdded = curUnits.length === 0 ? u.text.length : u.sepBefore.length + u.text.length;
+      curUnits.push(u);
+      curLen += nextAdded;
+    }
+
+    if (curUnits.length > 0) {
+      const rendered = renderUnits(curUnits);
+      if (rendered) {
+        chunks.push({ ordinal: chunks.length, heading: sec.heading, text: rendered });
+      }
     }
   }
 
@@ -511,6 +779,10 @@ export class D1FtsSearchIndex implements SearchIndex {
 function chunkBoilerplateMultiplier(text: string, heading = ''): number {
   const trimmed = text.trim();
   if (!trimmed) return 0.1;
+  // P4: Down-weight EEO, disability accommodations, AI-in-hiring, and applicant privacy notices so they never outrank pay/role facts.
+  if (isJobLegalBoilerplateChunk(trimmed, heading)) {
+    return 0.18;
+  }
   if (/was this (page )?helpful|all rights reserved|cookie preferences|privacy policy\s*\|\s*terms/i.test(trimmed)) {
     return 0.25;
   }
@@ -579,6 +851,8 @@ export function rankChunksInMemory(
 export interface ExtractRequestPayload {
   urls?: unknown;
   query?: unknown;
+  jsonFilter?: unknown;
+  renderMode?: unknown;
   chunksPerSource?: unknown;
   maxAgeMs?: unknown;
   redactPii?: unknown;
@@ -586,6 +860,10 @@ export interface ExtractRequestPayload {
   ephemeral?: boolean;
   target?: unknown;
   site?: unknown;
+}
+
+function countExtractWords(s: string): number {
+  return (s.trim().match(/[\p{L}\p{N}_'-]+/gu) ?? []).length;
 }
 
 export async function executeExtractCall(params: {
@@ -627,6 +905,15 @@ export async function executeExtractCall(params: {
   }
 
   const query = typeof payload.query === 'string' ? payload.query.trim() : '';
+  const jsonFilterStr = typeof payload.jsonFilter === 'string' ? payload.jsonFilter.trim() : '';
+  const rawRenderModeStr = typeof payload.renderMode === 'string' ? payload.renderMode.trim().toLowerCase() : '';
+  const explicitRenderMode: 'always' | 'auto' | 'off' | undefined =
+    rawRenderModeStr === 'always' || rawRenderModeStr === 'browser'
+      ? 'always'
+      : rawRenderModeStr === 'auto' || rawRenderModeStr === 'off'
+        ? rawRenderModeStr
+        : undefined;
+  const effectiveRenderMode: 'always' | 'auto' | 'off' = explicitRenderMode ?? 'auto';
   const chunksPerSource =
     typeof payload.chunksPerSource === 'number' && Number.isFinite(payload.chunksPerSource)
       ? Math.min(10, Math.max(1, Math.floor(payload.chunksPerSource)))
@@ -642,22 +929,36 @@ export async function executeExtractCall(params: {
     payload.target === 'agent' || payload.target === 'container' ? payload.target : 'auto';
   const site = typeof payload.site === 'string' && payload.site.trim() ? payload.site.trim() : undefined;
 
+  const htmlFragToMd = (frag: string, fragBase?: string) => {
+    const sub = extractHtmlDocument(frag, { baseUrl: fragBase, onlyMainContent: false, redactPii });
+    return { markdown: sub.markdown, links: sub.links };
+  };
+
   const byUrl = new Map<
     string,
     {
       url: string;
+      finalUrl?: string;
+      redirectInfo?: RedirectAnalysis;
       status: number;
       cached: boolean;
       title?: string;
       markdown?: string;
+      jobPosting?: StructuredJobPosting;
+      contentSource?: 'meta-description';
+      renderedVia?: 'browser' | 'browser-auto';
+      preChunkedRecords?: MarkdownChunk[];
+      recordCount?: number;
+      totalRecords?: number;
       failedReason?: string;
+      blocked?: BlockedSuggestion;
     }
   >();
 
   const toFetch: Array<{ idx: number; url: string }> = [];
   for (let i = 0; i < normalizedUrls.length; i++) {
     const u = normalizedUrls[i]!;
-    if (maxAgeMs > 0 && env.ARTIFACTS && env.META) {
+    if (maxAgeMs > 0 && env.ARTIFACTS && env.META && !jsonFilterStr) {
       const hit = await lookupCachedScrape({
         bucket: env.ARTIFACTS,
         metaDb: env.META,
@@ -692,6 +993,10 @@ export async function executeExtractCall(params: {
         : env.ARTIFACTS
           ? 'transient'
           : undefined;
+
+    const atsByIdx = new Map<number, NonNullable<ReturnType<typeof resolveAtsPreFetchSpec>>>();
+    const twinByIdx = new Map<number, NonNullable<ReturnType<typeof resolveSiteExtractorTwin>>>();
+
     const call = {
       maxSeconds: isEphemeral ? 35 : 60,
       options: {
@@ -703,7 +1008,31 @@ export async function executeExtractCall(params: {
         pauseJitterMs: isEphemeral ? 150 : 200,
       },
       requests: toFetch.map((item) => {
-        const companionMd = lookupCompanionMdUrl(item.url, now);
+        // P1 & P2: Route Ashby, Workday CXS (`GET` & `POST`), Greenhouse, and Lever URLs directly to their structured APIs!
+        const ats = resolveAtsPreFetchSpec(item.url);
+        if (ats) {
+          atsByIdx.set(item.idx, ats);
+          return {
+            id: `ext-${item.idx + 1}`,
+            url: ats.fetchUrl,
+            method: ats.method,
+            ...(ats.requestBody ? { requestBody: ats.requestBody } : {}),
+            ...(ats.contentType ? { contentType: ats.contentType } : {}),
+            kind: ats.kind,
+            accept: ats.accept,
+          };
+        }
+        const twin = effectiveRenderMode !== 'always' ? resolveSiteExtractorTwin(item.url) : null;
+        if (twin) {
+          twinByIdx.set(item.idx, twin);
+          return {
+            id: `ext-${item.idx + 1}`,
+            url: twin.fetchUrl,
+            kind: twin.kind,
+            accept: twin.accept,
+          };
+        }
+        const companionMd = effectiveRenderMode !== 'always' ? lookupCompanionMdUrl(item.url, now) : undefined;
         if (companionMd) {
           return {
             id: `ext-${item.idx + 1}`,
@@ -715,7 +1044,8 @@ export async function executeExtractCall(params: {
         return {
           id: `ext-${item.idx + 1}`,
           url: item.url,
-          kind: 'scrape',
+          kind: explicitRenderMode === 'always' ? 'render' : 'scrape',
+          ...(explicitRenderMode ? { renderMode: explicitRenderMode } : {}),
           formats: ['markdown'],
           onlyMainContent: true,
           discoverLlms: false,
@@ -741,12 +1071,18 @@ export async function executeExtractCall(params: {
       if (typeof r.id === 'string') resMap.set(r.id, r);
     }
 
-    const missedCompanionItems = toFetch.filter((item) => {
-      if (!lookupCompanionMdUrl(item.url, now)) return false;
+    const fallbackHtmlItems = toFetch.filter((item) => {
+      const hadTwinOrComp =
+        atsByIdx.has(item.idx) || twinByIdx.has(item.idx) || Boolean(lookupCompanionMdUrl(item.url, now));
+      if (!hadTwinOrComp) return false;
       const r = resMap.get(`ext-${item.idx + 1}`);
       return !r || r.outcome !== 'ok';
     });
-    if (missedCompanionItems.length > 0) {
+    if (fallbackHtmlItems.length > 0) {
+      for (const fItem of fallbackHtmlItems) {
+        atsByIdx.delete(fItem.idx);
+        twinByIdx.delete(fItem.idx);
+      }
       const retryCall = {
         maxSeconds: isEphemeral ? 25 : 45,
         options: {
@@ -757,10 +1093,11 @@ export async function executeExtractCall(params: {
           pauseMs: isEphemeral ? 500 : 800,
           pauseJitterMs: isEphemeral ? 150 : 200,
         },
-        requests: missedCompanionItems.map((item) => ({
+        requests: fallbackHtmlItems.map((item) => ({
           id: `ext-${item.idx + 1}`,
           url: item.url,
-          kind: 'scrape',
+          kind: explicitRenderMode === 'always' ? 'render' : 'scrape',
+          ...(explicitRenderMode ? { renderMode: explicitRenderMode } : {}),
           formats: ['markdown'],
           onlyMainContent: true,
           discoverLlms: false,
@@ -777,17 +1114,133 @@ export async function executeExtractCall(params: {
     }
 
     for (const item of toFetch) {
-      const r = resMap.get(`ext-${item.idx + 1}`);
+      let r = resMap.get(`ext-${item.idx + 1}`);
       if (!r || r.outcome !== 'ok') {
+        const prob = typeof r?.problem === 'string' && r.problem ? r.problem : String(r?.outcome ?? 'error');
+        const blocked = buildBlockedInfo(item.url, r?.outcome, prob, r?.status);
         byUrl.set(item.url, {
           url: item.url,
           status: typeof r?.status === 'number' ? r.status : 0,
           cached: false,
-          failedReason: typeof r?.problem === 'string' && r.problem ? r.problem : String(r?.outcome ?? 'error'),
+          failedReason: prob,
+          ...(blocked ? { blocked } : {}),
         });
         continue;
       }
-      const rawBodyStr = typeof r.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
+
+      let rawBodyStr = typeof r.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
+      let finalUrl = typeof r.finalUrl === 'string' && r.finalUrl ? r.finalUrl : item.url;
+      let renderedVia: 'browser' | 'browser-auto' | undefined =
+        explicitRenderMode === 'always' ? 'browser' : r.rendered === true ? 'browser-auto' : undefined;
+
+      // Handle ATS pre-fetch adapter response (`P1` Ashby, `P2` Workday CXS, Greenhouse, Lever)
+      const atsSpec = atsByIdx.get(item.idx);
+      if (atsSpec && rawBodyStr) {
+        const filteredBoard =
+          jsonFilterStr || atsSpec.id.endsWith('-board')
+            ? chunkJsonRecords({
+                rawBody: rawBodyStr,
+                contentType: 'application/json',
+                url: item.url,
+                ...(jsonFilterStr ? { jsonFilter: jsonFilterStr } : {}),
+                htmlToMd: htmlFragToMd,
+              })
+            : null;
+        const formatted = atsSpec.format(rawBodyStr, item.url, htmlFragToMd);
+        if ((jsonFilterStr && filteredBoard) || (formatted && formatted.markdown.trim())) {
+          const mdRaw = jsonFilterStr && filteredBoard ? filteredBoard.markdown : formatted!.markdown;
+          const cleanMd = redactPii ? redactPiiText(mdRaw) : mdRaw;
+          byUrl.set(item.url, {
+            url: item.url,
+            finalUrl: item.url,
+            status: typeof r.status === 'number' ? r.status : 200,
+            cached: false,
+            title: (jsonFilterStr && filteredBoard ? filteredBoard.title : formatted?.title) || undefined,
+            markdown: cleanMd,
+            ...(formatted?.jobPosting ? { jobPosting: formatted.jobPosting } : {}),
+            ...(filteredBoard && (jsonFilterStr || atsSpec.id.endsWith('-board'))
+              ? {
+                  preChunkedRecords: filteredBoard.chunks,
+                  recordCount: filteredBoard.matchedRecords,
+                  totalRecords: filteredBoard.totalRecords,
+                }
+              : {}),
+          });
+          continue;
+        }
+      }
+
+      // Handle Site Extractor Twin response
+      const twinSpec = twinByIdx.get(item.idx);
+      if (twinSpec && rawBodyStr) {
+        const twinOut = twinSpec.formatTwin(rawBodyStr, item.url, htmlFragToMd);
+        if (twinOut && twinOut.markdown.trim()) {
+          byUrl.set(item.url, {
+            url: item.url,
+            finalUrl: item.url,
+            status: typeof r.status === 'number' ? r.status : 200,
+            cached: false,
+            title: twinOut.title,
+            markdown: redactPii ? redactPiiText(twinOut.markdown) : twinOut.markdown,
+          });
+          continue;
+        }
+      }
+
+      // P2: Workday Redirect Stub Rescue (`{"widget":"redirect","url":"/Workday","externalSpa":true}`)
+      const wdStub = rawBodyStr ? detectWorkdayRedirectStub(rawBodyStr, finalUrl) : null;
+      if (wdStub) {
+        const stubAts = resolveAtsPreFetchSpec(wdStub.redirectUrl);
+        if (stubAts) {
+          try {
+            const stubOut = await executeHubFetch(
+              target,
+              JSON.stringify({
+                maxSeconds: 25,
+                options: { includeBody: true, respectRobots: true },
+                requests: [
+                  {
+                    id: 'wd-stub-1',
+                    url: stubAts.fetchUrl,
+                    method: stubAts.method,
+                    ...(stubAts.requestBody ? { requestBody: stubAts.requestBody } : {}),
+                    ...(stubAts.contentType ? { contentType: stubAts.contentType } : {}),
+                    kind: stubAts.kind,
+                    accept: stubAts.accept,
+                  },
+                ],
+              }),
+              site,
+              `${source}:workday-stub`,
+              retentionMode,
+              !isEphemeral,
+              collectionId,
+            );
+            if (stubOut.status === 200) {
+              const stubParsed = JSON.parse(stubOut.bodyText) as { results?: Array<Record<string, unknown>> };
+              const stubItem = stubParsed.results?.[0];
+              const stubBody = typeof stubItem?.body === 'string' && stubItem.bodyEncoding !== 'base64' ? stubItem.body : '';
+              const stubFmt = stubItem?.outcome === 'ok' && stubBody ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd) : null;
+              if (stubFmt && stubFmt.markdown.trim()) {
+                byUrl.set(item.url, {
+                  url: item.url,
+                  finalUrl: wdStub.redirectUrl,
+                  redirectInfo: analyzeUrlRedirect(item.url, wdStub.redirectUrl),
+                  status: typeof stubItem?.status === 'number' ? stubItem.status : 200,
+                  cached: false,
+                  title: stubFmt.title,
+                  markdown: redactPii ? redactPiiText(stubFmt.markdown) : stubFmt.markdown,
+                  ...(stubFmt.jobPosting ? { jobPosting: stubFmt.jobPosting } : {}),
+                });
+                continue;
+              }
+            }
+          } catch {
+            // Fall through if stub resolution fails.
+          }
+        }
+      }
+
       const ctLower = typeof r.contentType === 'string' ? r.contentType.toLowerCase() : '';
       const isPdf = Boolean(
         (typeof r.pdfEngine === 'string' && r.pdfEngine) ||
@@ -812,50 +1265,151 @@ export async function executeExtractCall(params: {
         continue;
       }
       const isVcard = Boolean(!isPdf && (ctLower.includes('vcard') || /^BEGIN:VCARD\b/im.test(rawBodyStr.trim())));
-      const isHtml = Boolean(
+      let isHtml = Boolean(
         !isPdf &&
           !isVcard &&
           rawBodyStr &&
           (ctLower.includes('html') || /^\s*<!doctype\s+html|^\s*<html|<(head|body|main|article)\b/i.test(rawBodyStr)),
       );
+
+      // P5: Per-record JSON array chunking (`1 chunk = 1 record`, HTML converted to Markdown, `jsonFilter` applied)
       const icsDoc = !isPdf && !isVcard && !isHtml && rawBodyStr ? formatIcalendarToMarkdown(rawBodyStr) : null;
-      const feedDoc = !isPdf && !isVcard && !isHtml && !icsDoc && rawBodyStr ? formatFeedXmlToMarkdown(rawBodyStr, item.url) : null;
+      const feedDoc = !isPdf && !isVcard && !isHtml && !icsDoc && rawBodyStr ? formatFeedXmlToMarkdown(rawBodyStr, finalUrl) : null;
       const jsonDoc =
         !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && rawBodyStr
-          ? tryParseJsonPayloadForScrape(rawBodyStr, r.contentType, item.url)
+          ? tryParseJsonPayloadForScrape(rawBodyStr, r.contentType, finalUrl)
           : null;
+      const isNotebookOrOpenApi = Boolean(
+        jsonDoc?.parsed &&
+          typeof jsonDoc.parsed === 'object' &&
+          !Array.isArray(jsonDoc.parsed) &&
+          ('openapi' in (jsonDoc.parsed as Record<string, unknown>) ||
+            'swagger' in (jsonDoc.parsed as Record<string, unknown>) ||
+            'nbformat' in (jsonDoc.parsed as Record<string, unknown>)),
+      );
+      const jsonRecordsDoc =
+        !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && !isNotebookOrOpenApi && rawBodyStr
+          ? chunkJsonRecords({
+              rawBody: rawBodyStr,
+              contentType: r.contentType,
+              url: finalUrl,
+              ...(jsonFilterStr ? { jsonFilter: jsonFilterStr } : {}),
+              htmlToMd: htmlFragToMd,
+            })
+          : null;
+      if (jsonRecordsDoc) {
+        const cleanJsonMd = redactPii ? redactPiiText(jsonRecordsDoc.markdown) : jsonRecordsDoc.markdown;
+        byUrl.set(item.url, {
+          url: item.url,
+          finalUrl,
+          redirectInfo: analyzeUrlRedirect(item.url, finalUrl),
+          status: typeof r.status === 'number' ? r.status : 200,
+          cached: false,
+          title: jsonRecordsDoc.title,
+          markdown: cleanJsonMd,
+          preChunkedRecords: redactPii
+            ? jsonRecordsDoc.chunks.map((c) => ({ ...c, text: redactPiiText(c.text) }))
+            : jsonRecordsDoc.chunks,
+          recordCount: jsonRecordsDoc.matchedRecords,
+          totalRecords: jsonRecordsDoc.totalRecords,
+        });
+        continue;
+      }
+
       const csvDoc =
         !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && !jsonDoc && rawBodyStr
-          ? formatDelimitedTableToMarkdown(rawBodyStr, r.contentType, item.url)
+          ? formatDelimitedTableToMarkdown(rawBodyStr, r.contentType, finalUrl)
           : null;
       const patchDoc =
         !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && !jsonDoc && !csvDoc && rawBodyStr
-          ? formatGitPatchToMarkdown(rawBodyStr, r.contentType, item.url)
+          ? formatGitPatchToMarkdown(rawBodyStr, r.contentType, finalUrl)
           : null;
       const srcDoc =
         !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && !jsonDoc && !csvDoc && !patchDoc && rawBodyStr
-          ? formatSourceCodeUrlToMarkdown(rawBodyStr, r.contentType, item.url)
+          ? formatSourceCodeUrlToMarkdown(rawBodyStr, r.contentType, finalUrl)
           : null;
       const structuredDoc = icsDoc || feedDoc || jsonDoc || csvDoc || patchDoc || srcDoc;
       let md: string;
       let title: string | undefined;
+      let jobPosting: StructuredJobPosting | undefined;
+      let contentSource: 'meta-description' | undefined;
+
       if (isVcard) {
         const vc = formatVcardToMarkdown(rawBodyStr);
         md = redactPii ? redactPiiText(vc.markdown) : vc.markdown;
         title = vc.title;
       } else if (structuredDoc) {
-        const cleanStructured = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(structuredDoc.markdown), item.url).trim();
+        const cleanStructured = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(structuredDoc.markdown), finalUrl).trim();
         md = redactPii ? redactPiiText(cleanStructured) : cleanStructured;
         title = structuredDoc.title;
       } else {
-        const extracted = isHtml ? extractHtmlDocument(rawBodyStr, { baseUrl: item.url, onlyMainContent: true, redactPii }) : undefined;
+        let extracted = isHtml ? extractHtmlDocument(rawBodyStr, { baseUrl: finalUrl, onlyMainContent: true, redactPii }) : undefined;
+
+        // P3: Automatic browser switch on thin / filter-only scripted HTML pages (`renderedVia: "browser-auto"`).
+        if (
+          isHtml &&
+          effectiveRenderMode === 'auto' &&
+          r.rendered !== true &&
+          target !== 'container' &&
+          isThinScriptedPage(rawBodyStr, extracted?.markdown ?? '')
+        ) {
+          try {
+            const autoRes = await executeHubFetch(
+              'agent',
+              JSON.stringify({
+                maxSeconds: 40,
+                options: { includeBody: true, respectRobots: true, maxBytes: 16 * 1024 * 1024, timeoutMs: 35_000 },
+                requests: [
+                  {
+                    id: `ext-auto-${item.idx + 1}`,
+                    url: finalUrl,
+                    kind: 'render',
+                    renderMode: 'always',
+                    formats: ['markdown'],
+                    onlyMainContent: true,
+                    redactPii,
+                    waitForMs: 1_800,
+                  },
+                ],
+              }),
+              site,
+              `${source}:browser-auto`,
+              retentionMode,
+              !isEphemeral,
+              collectionId,
+            );
+            if (autoRes.status === 200) {
+              const autoParsed = JSON.parse(autoRes.bodyText) as { results?: Array<Record<string, unknown>> };
+              const autoItem = autoParsed.results?.[0];
+              const autoHtml = typeof autoItem?.body === 'string' && autoItem.bodyEncoding !== 'base64' ? autoItem.body : '';
+              if (autoItem?.outcome === 'ok' && autoHtml) {
+                const autoFinal = typeof autoItem.finalUrl === 'string' && autoItem.finalUrl ? autoItem.finalUrl : finalUrl;
+                const autoExt = extractHtmlDocument(autoHtml, { baseUrl: autoFinal, onlyMainContent: true, redactPii });
+                if (countExtractWords(autoExt.markdown) > countExtractWords(extracted?.markdown ?? '')) {
+                  r = autoItem;
+                  rawBodyStr = autoHtml;
+                  finalUrl = autoFinal;
+                  isHtml = true;
+                  extracted = autoExt;
+                  renderedVia = 'browser-auto';
+                }
+              }
+            }
+          } catch {
+            // Keep static extraction when no browser-v1 node is connected.
+          }
+        }
+
+        const jp = isHtml ? extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '') : null;
+        if (jp) jobPosting = jp;
+
         const rawCandidateMd =
           (isHtml ? extracted?.markdown : undefined) ||
           (typeof r.markdown === 'string' && r.markdown ? r.markdown : '') ||
           extracted?.markdown ||
           rawBodyStr;
         const stripped = stripYamlFrontmatter(rawCandidateMd);
-        let cleaned = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(stripped.body), item.url);
+        let cleaned = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(stripped.body), finalUrl);
         if (isPdf) {
           cleaned = cleanPdfMarkdown(cleaned);
         }
@@ -867,13 +1421,38 @@ export async function executeExtractCall(params: {
           extracted?.title ||
           stripped.title ||
           (typeof r.title === 'string' && r.title ? decodeHtmlEntities(r.title) : undefined) ||
-          (isPdf && md ? extractPdfTitle(md, item.url) : undefined);
+          (isPdf && md ? extractPdfTitle(md, finalUrl) : undefined);
+
+        // P4: Prepend structured JobPosting facts header so pay/workplace/location rank #1 during passage selection!
+        if (jobPosting) {
+          const jpHdr = formatJobPostingHeaderMarkdown(jobPosting);
+          if (jpHdr && !/\*\*Compensation\*\*:/.test(md.slice(0, 400))) {
+            const topH = /^(#\s+[^\n]+)\n+([\s\S]*)$/.exec(md);
+            md = topH ? `${topH[1]}\n\n${jpHdr}\n\n${topH[2]}` : `# ${jobPosting.title}\n\n${jpHdr}\n\n${md}`;
+          }
+        }
+
+        // P1: Meta-description rescue when extracted HTML body has < 50 words and `metadata.description` has >= 18 words.
+        const desc = extracted?.description;
+        const mdWords = countExtractWords(md);
+        const descWords = desc ? countExtractWords(desc) : 0;
+        if (isHtml && !isPdf && mdWords < 50 && desc && descWords >= 18 && descWords > mdWords * 2) {
+          const cleanDesc = redactPii ? redactPiiText(desc) : desc;
+          md = [title ? `# ${title}` : '', cleanDesc].filter(Boolean).join('\n\n');
+          contentSource = 'meta-description';
+        }
       }
+
       byUrl.set(item.url, {
         url: item.url,
+        finalUrl,
+        redirectInfo: analyzeUrlRedirect(item.url, finalUrl),
         status: typeof r.status === 'number' ? r.status : 200,
         cached: false,
         ...(title ? { title } : {}),
+        ...(jobPosting ? { jobPosting } : {}),
+        ...(contentSource ? { contentSource } : {}),
+        ...(renderedVia ? { renderedVia } : {}),
         markdown: md,
       });
     }
@@ -888,16 +1467,25 @@ export async function executeExtractCall(params: {
         url: u,
         status: entry?.status ?? 0,
         error: entry?.failedReason ?? 'not_fetched',
+        ...(entry?.blocked ? { blocked: entry.blocked } : {}),
       });
       continue;
     }
-    const allChunks = chunkMarkdownForSearch(entry.markdown ?? '');
-    const selectedChunks = query ? rankChunksInMemory(allChunks, query, chunksPerSource) : allChunks.slice(0, chunksPerSource).map((c) => ({ ...c, score: 1 }));
+    const allChunks = entry.preChunkedRecords ?? chunkMarkdownForSearch(entry.markdown ?? '');
+    const selectedChunks = query
+      ? rankChunksInMemory(allChunks, query, chunksPerSource)
+      : allChunks.slice(0, chunksPerSource).map((c) => ({ ...c, score: 1 }));
     results.push({
       url: u,
+      ...(entry.finalUrl && entry.finalUrl !== u ? { finalUrl: entry.finalUrl } : {}),
+      ...(entry.redirectInfo?.redirected ? entry.redirectInfo : {}),
       status: entry.status,
       cached: entry.cached,
       ...(entry.title ? { title: entry.title } : {}),
+      ...(entry.contentSource ? { contentSource: entry.contentSource } : {}),
+      ...(entry.renderedVia ? { renderedVia: entry.renderedVia } : {}),
+      ...(entry.jobPosting ? { jobPosting: entry.jobPosting } : {}),
+      ...(entry.recordCount !== undefined ? { recordCount: entry.recordCount, totalRecords: entry.totalRecords } : {}),
       rawContent: query
         ? [...selectedChunks]
             .sort((a, b) => a.ordinal - b.ordinal)
@@ -914,6 +1502,7 @@ export async function executeExtractCall(params: {
     body: {
       ok: true,
       ...(query ? { query } : {}),
+      ...(jsonFilterStr ? { jsonFilter: jsonFilterStr } : {}),
       ...(collectionId ? { collectionId } : {}),
       results,
       failedResults,

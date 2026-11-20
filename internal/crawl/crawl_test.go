@@ -746,3 +746,62 @@ func TestStreamingLargePDFExceedingMaxBytesExtractsMarkdownWithoutTruncation(t *
 		t.Fatalf("expected compact text/markdown Body for R2 upload (len=%d, ct=%q)", len(out[0].Body), out[0].ContentType)
 	}
 }
+
+func TestPostJsonAndTransientRobotsRetry(t *testing.T) {
+	var robotsCalls atomic.Int32
+	var receivedMethod string
+	var receivedCT string
+	var receivedBody string
+
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			attempt := robotsCalls.Add(1)
+			if attempt == 1 {
+				// Simulate a transient TCP reset / EOF on the first /robots.txt probe (P12).
+				if hj, ok := w.(http.Hijacker); ok {
+					conn, _, err := hj.Hijack()
+					if err == nil {
+						_ = conn.Close()
+						return
+					}
+				}
+			}
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("User-agent: *\nAllow: /\n"))
+		case "/wday/cxs/acme/Careers/jobs":
+			receivedMethod = r.Method
+			receivedCT = r.Header.Get("Content-Type")
+			b, _ := io.ReadAll(r.Body)
+			receivedBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"total":1,"jobPostings":[{"title":"Solutions Architect"}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+
+	out := c.Run(context.Background(), []Request{
+		{
+			ID:          "wday-post",
+			URL:         "http://workday.test/wday/cxs/acme/Careers/jobs",
+			Method:      "POST",
+			RequestBody: `{"appliedFacets":{},"limit":20,"offset":0,"searchText":"Architect"}`,
+			ContentType: "application/json",
+			Kind:        classify.KindJSON,
+		},
+	}, Options{PauseMs: 1, IncludeBody: true})
+
+	if robotsCalls.Load() != 2 {
+		t.Fatalf("expected transient /robots.txt failure to retry once (2 calls), got %d", robotsCalls.Load())
+	}
+	if out[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected POST CXS request to succeed after /robots.txt retry, got: %+v", out[0])
+	}
+	if receivedMethod != "POST" || receivedCT != "application/json" || !strings.Contains(receivedBody, `"searchText":"Architect"`) {
+		t.Fatalf("unexpected POST payload: method=%q ct=%q body=%q", receivedMethod, receivedCT, receivedBody)
+	}
+	if out[0].Timing.RobotsMs < 0 {
+		t.Fatalf("expected Timing.RobotsMs to be recorded, got: %+v", out[0].Timing)
+	}
+}

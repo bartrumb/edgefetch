@@ -455,10 +455,22 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	if err != nil {
 		res.Status = out.Status
 		res.FinalURL = out.FinalURL
+		res.SessionID = out.SessionID
 		if errors.Is(err, browser.ErrChallengeDetected) {
 			res.Outcome = classify.OutcomeChallenge
 		} else {
 			res.Outcome = classify.OutcomeError
+			if len(out.HTML) > 0 && len(out.HTML) <= opts.MaxBytes {
+				if res.Status == 0 {
+					res.Status = http.StatusOK
+				}
+				res.Rendered = true
+				res.Bytes = len(out.HTML)
+				res.ContentType = "text/html; charset=utf-8"
+				res.Body = out.HTML
+				res.BodyEncoding = "utf-8"
+				c.enrichResult(rctx, r, opts, []byte(out.HTML), &res)
+			}
 		}
 		res.Problem = err.Error()
 		res.DurationMs = c.Now().Sub(started).Milliseconds()

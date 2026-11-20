@@ -37,12 +37,13 @@ export interface ScrapeParams {
   ephemeral?: boolean;
   maxChars?: number;
   ocr?: boolean;
-  renderMode?: 'off' | 'auto' | 'always';
+  renderMode?: 'off' | 'auto' | 'always' | 'browser';
   waitForMs?: number;
   waitSelector?: string;
   maxPages?: number;
   redactPii?: boolean;
   query?: string;
+  jsonFilter?: string;
   collectionId?: string;
   target?: 'auto' | 'agent' | 'container';
   site?: string;
@@ -51,6 +52,8 @@ export interface ScrapeParams {
 export interface ExtractParams {
   urls: string[];
   query?: string;
+  jsonFilter?: string;
+  renderMode?: 'off' | 'auto' | 'always' | 'browser';
   mode?: 'chunks' | 'full';
   chunksPerSource?: number;
   maxChars?: number;
@@ -69,6 +72,7 @@ export interface MapParams {
   search?: string;
   limit?: number;
   includeSubdomains?: boolean;
+  includeOutsidePath?: boolean;
   ignoreSitemap?: boolean;
 }
 
@@ -229,6 +233,20 @@ export class EdgeFetchClient {
 
   search(params: SearchParams): Promise<{ ok: boolean; query: string; results: Array<Record<string, unknown>> }> {
     return this.requestJson('POST', '/v1/search', params);
+  }
+
+  jobs(params: {
+    query?: string;
+    company?: string;
+    remote?: boolean;
+    locations?: string[];
+    minBase?: number;
+    postedWithinDays?: number;
+    limit?: number;
+    includeBuiltIn?: boolean;
+    exclude?: Array<{ company?: string; title?: string; url?: string }>;
+  }): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/jobs', params);
   }
 
   interact(params: InteractParams): Promise<Record<string, unknown>> {

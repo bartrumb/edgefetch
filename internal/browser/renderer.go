@@ -409,7 +409,17 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 
 	for i, act := range task.Actions {
 		if err := r.runAction(ctx, cdp, sess, events, act); err != nil {
-			return Output{}, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
+			partialHTML, partialURL, _ := readDocumentHTML(ctx, cdp, sess.cdpSessionID)
+			partialOut := Output{
+				Status:   sess.lastStatus,
+				Headers:  sess.lastHeaders.Clone(),
+				FinalURL: partialURL,
+				HTML:     partialHTML,
+			}
+			if task.KeepSession && !task.CloseSession {
+				partialOut.SessionID = sess.id
+			}
+			return partialOut, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
 		}
 	}
 

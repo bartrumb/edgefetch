@@ -251,3 +251,27 @@ EdgeFetch supports four composable HA layers with zero external consensus broker
   - **OpenWrt / GL.iNet Travel Routers:** Cross-compiled via `.goreleaser.yaml` (`linux/mipsle` `softfloat`, `linux/arm` `v7`, `linux/arm64`).
   - **OPNsense / pfSense:** Cross-compiled `freebsd/amd64` & `freebsd/arm64` static binaries.
   - **Android (Termux):** Build `GOOS=linux GOARCH=arm64` + `termux-wake-lock` on spare Wi-Fi / 5G phones (~15 MB RAM).
+
+---
+
+## 10. Structured Job Search & ATS Intelligence (`POST /v1/jobs` & MCP `jobs`)
+
+EdgeFetch includes built-in adapters for major Applicant Tracking Systems (**Ashby**, **Workday CXS `GET` & `POST`**, **Greenhouse**, **Lever**, and **SmartRecruiters / Schema.org `JobPosting` JSON-LD**) alongside per-record JSON array chunking (`jsonFilter`), automatic thin-page browser upgrades (`renderMode: "auto"`), and standardized compensation parsing:
+
+```bash
+curl -sS https://<your-hub>/v1/jobs \
+  -H "Authorization: Bearer $CALLER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Forward Deployed Engineer",
+    "remote": true,
+    "minBase": 200000,
+    "postedWithinDays": 14,
+    "limit": 20,
+    "exclude": [{ "company": "ExampleCorp", "title": "Forward Deployed Engineer" }]
+  }'
+```
+
+- **Standardized Compensation (`pay`):** Every parsed posting normalizes `{ min, max, currency, period, basis: "base" | "ote" | "total" }`, scaling shorthand annual thousands (e.g., Ashby `230`–`350` → `230000`–`350000`) and keeping `total` target cash / `ote` distinct from `base` salary.
+- **Per-Record JSON Array Chunking (`jsonFilter`):** Passing `jsonFilter` (e.g., `title~"Forward Deployed"`) to `scrape` or `extract` on JSON array endpoints emits **1 chunk = 1 record** and converts embedded HTML fields into clean Markdown so attributes never bleed across records.
+- **Ethical Block Handling (`blocked`):** EdgeFetch strictly honors `robots.txt` and anti-bot challenges, returning `blocked: { reason: "robots" | "challenge", host, suggestion }` to guide agents toward clean official ATS boards.

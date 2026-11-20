@@ -81,6 +81,59 @@ func TestConfigSecurityGuards(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("expected loopback http://127.0.0.1 allowed in test mode: %v", err)
 	}
+
+	// wss://<hub>/agent/ws normalizes cleanly to https://<hub> so docker run snippets work with either form!
+	wssCfg, err := LoadConfigFrom("", func(k string) string {
+		switch k {
+		case "EDGEFETCH_HUB_URL":
+			return "wss://edgefetch.example.com/agent/ws/"
+		case "EDGEFETCH_AGENT_TOKEN":
+			return "secret-agent-token-0123456789"
+		case "EDGEFETCH_SITE_ID":
+			return "vps-1"
+		default:
+			return ""
+		}
+	})
+	if err != nil || wssCfg.HubURL != "https://edgefetch.example.com" {
+		t.Fatalf("expected wss://.../agent/ws normalized to https://edgefetch.example.com, got %+v (err=%v)", wssCfg, err)
+	}
+
+	// Docker bridge single-label service name ("ws://hub:8787/agent/ws") works ONLY with EDGEFETCH_ALLOW_INSECURE_DOCKER_HUB=1,
+	// while public multi-label domains remain strictly blocked.
+	dockerCfg, err := LoadConfigFrom("", func(k string) string {
+		switch k {
+		case "EDGEFETCH_ALLOW_INSECURE_DOCKER_HUB":
+			return "1"
+		case "EDGEFETCH_HUB_URL":
+			return "ws://hub:8787/agent/ws"
+		case "EDGEFETCH_AGENT_TOKEN":
+			return "secret-agent-token-0123456789"
+		case "EDGEFETCH_SITE_ID":
+			return "compose-1"
+		default:
+			return ""
+		}
+	})
+	if err != nil || dockerCfg.HubURL != "http://hub:8787" {
+		t.Fatalf("expected ws://hub:8787/agent/ws normalized to http://hub:8787, got %+v (err=%v)", dockerCfg, err)
+	}
+	if _, err := LoadConfigFrom("", func(k string) string {
+		switch k {
+		case "EDGEFETCH_ALLOW_INSECURE_DOCKER_HUB":
+			return "1"
+		case "EDGEFETCH_HUB_URL":
+			return "ws://hub.example.com:8787/agent/ws"
+		case "EDGEFETCH_AGENT_TOKEN":
+			return "secret-agent-token-0123456789"
+		case "EDGEFETCH_SITE_ID":
+			return "compose-1"
+		default:
+			return ""
+		}
+	}); err == nil {
+		t.Fatal("SECURITY: expected multi-label FQDN cleartext ws:// rejected even with EDGEFETCH_ALLOW_INSECURE_DOCKER_HUB=1")
+	}
 }
 
 func TestAgentSessionReconnectHelloPingAndGzipReply(t *testing.T) {

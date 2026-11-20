@@ -1,9 +1,11 @@
 // Command edgefetch is a minimal-supply-chain HTTP/2 crawler (one Go dependency, with no transitive dependencies)
-// that runs in two modes from one static binary:
+// that runs in three modes from one static binary:
 //   - server mode (default): listens on $EDGEFETCH_BIND_ADDR or :$PORT (GET /healthz, POST /fetch) authenticated via
 //     EDGEFETCH_SERVER_TOKEN (unless bound strictly to loopback or EDGEFETCH_ALLOW_UNAUTHENTICATED=1).
 //   - agent mode (--mode=agent, EDGEFETCH_MODE=agent, or /data/options.json on Home Assistant OS): opens zero inbound
 //     ports; drops root privileges (65532:65532), dials outbound wss:// to AgentHubDO, and executes pull jobs on demand.
+//   - one-shot CLI mode (edgefetch scrape <url>, edgefetch doctor, edgefetch version): polite terminal scraper and
+//     self-diagnostics tool.
 package main
 
 import (
@@ -22,6 +24,8 @@ import (
 
 	"github.com/bartrumb/edgefetch/internal/agent"
 	"github.com/bartrumb/edgefetch/internal/crawl"
+	"github.com/bartrumb/edgefetch/internal/hub"
+	"github.com/bartrumb/edgefetch/internal/otel"
 	"github.com/bartrumb/edgefetch/internal/politeness"
 	"github.com/bartrumb/edgefetch/internal/priv"
 	"github.com/bartrumb/edgefetch/internal/ws"
@@ -79,27 +83,54 @@ func newHubTransport() *http.Transport {
 	}
 }
 
-func shouldRunAgent(args []string, envMode, haOptionsPath string) bool {
+type runtimeModes struct {
+	server bool
+	agent  bool
+	hub    bool
+}
+
+func resolveRuntimeModes(args []string, envMode, haOptionsPath string) runtimeModes {
+	rawMode := ""
 	for _, a := range args {
-		switch a {
-		case "--mode=agent", "-mode=agent", "agent":
-			return true
-		case "--mode=server", "-mode=server", "server":
-			return false
+		switch {
+		case strings.HasPrefix(a, "--mode="):
+			rawMode = strings.TrimPrefix(a, "--mode=")
+		case strings.HasPrefix(a, "-mode="):
+			rawMode = strings.TrimPrefix(a, "-mode=")
+		case a == "agent" || a == "server" || a == "hub" || a == "controller":
+			rawMode = a
 		}
 	}
-	switch strings.ToLower(strings.TrimSpace(envMode)) {
-	case "agent":
-		return true
-	case "server":
-		return false
+	if rawMode == "" {
+		rawMode = strings.TrimSpace(envMode)
+	}
+	if rawMode != "" {
+		var m runtimeModes
+		for _, part := range strings.Split(strings.ToLower(rawMode), ",") {
+			switch strings.TrimSpace(part) {
+			case "agent":
+				m.agent = true
+			case "hub", "controller":
+				m.hub = true
+			case "server":
+				m.server = true
+			}
+		}
+		if m.agent || m.hub || m.server {
+			return m
+		}
 	}
 	if haOptionsPath != "" {
 		if _, err := os.Stat(haOptionsPath); err == nil {
-			return true
+			return runtimeModes{agent: true}
 		}
 	}
-	return false
+	return runtimeModes{server: true}
+}
+
+func shouldRunAgent(args []string, envMode, haOptionsPath string) bool {
+	m := resolveRuntimeModes(args, envMode, haOptionsPath)
+	return m.agent && !m.hub && !m.server
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -178,13 +209,27 @@ func splitCSV(raw string) []string {
 }
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	if isOneShotCLI(os.Args[1:]) {
+		code := runOneShotCLI(ctx, os.Args[1:], os.Stdout, os.Stderr, cliDeps{
+			getenv: os.Getenv,
+			haPath: agent.DefaultHAOptionsPath,
+		})
+		if code != 0 {
+			os.Exit(code)
+		}
+		return
+	}
+
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	envMode := firstNonEmpty(os.Getenv("EDGEFETCH_MODE"), os.Getenv("CRAWLER_MODE"))
-	if shouldRunAgent(os.Args[1:], envMode, agent.DefaultHAOptionsPath) {
+	modes := resolveRuntimeModes(os.Args[1:], envMode, agent.DefaultHAOptionsPath)
+	hubTr := newHubTransport()
+
+	if modes.agent && !modes.hub && !modes.server {
 		cfg, err := agent.LoadConfig(agent.DefaultHAOptionsPath)
 		if err != nil {
 			log.Error("agent_config", slog.String("error", err.Error()))
@@ -195,19 +240,23 @@ func main() {
 			os.Exit(2)
 		}
 
-		hubParsed, _ := url.Parse(cfg.HubURL)
-		hubHost := ""
-		if hubParsed != nil {
-			hubHost = hubParsed.Hostname()
+		allow := crawl.WithAllowedHosts(crawl.PublicHTTPS, cfg.AllowedHosts)
+		for _, hURL := range cfg.HubURLs {
+			if hubParsed, pErr := url.Parse(hURL); pErr == nil && hubParsed.Hostname() != "" {
+				allow = crawl.WithBlockedHost(allow, hubParsed.Hostname())
+			}
 		}
-		allow := crawl.WithBlockedHost(crawl.WithAllowedHosts(crawl.PublicHTTPS, cfg.AllowedHosts), hubHost)
 		siteLog := log.With(slog.String("site", cfg.SiteID))
-		siteLog.Info("agent_startup", slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)), slog.String("go", runtime.Version()))
+		siteLog.Info("agent_startup",
+			slog.Int("controllers", len(cfg.HubURLs)),
+			slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)),
+			slog.String("go", runtime.Version()))
 		crawler := crawl.NewCrawler(newCrawlTransport(90*time.Second, 4), allow, cfg.UserAgent, siteLog)
 		defer func() { _ = crawler.Close() }()
 		crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
+		crawler.SetOtelExporter(otel.NewExporterFromEnv(os.Getenv, "edgefetch-agent-"+cfg.SiteID, agent.Version, hubTr))
 
-		if err := agent.Run(ctx, cfg, crawler, allow, newHubTransport(), siteLog, agent.RuntimeOpts{}); err != nil {
+		if err := agent.RunAll(ctx, cfg, crawler, allow, hubTr, siteLog, agent.RuntimeOpts{}); err != nil {
 			log.Error("agent_stopped", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
@@ -216,7 +265,7 @@ func main() {
 
 	port := firstNonEmpty(os.Getenv("PORT"), "8080")
 	addr := firstNonEmpty(os.Getenv("EDGEFETCH_BIND_ADDR"), ":"+port)
-	serverToken := firstNonEmpty(os.Getenv("EDGEFETCH_SERVER_TOKEN"), os.Getenv("CRAWLER_TOKEN"))
+	serverToken := firstNonEmpty(os.Getenv("EDGEFETCH_CALLER_TOKEN"), os.Getenv("CALLER_TOKEN"), os.Getenv("EDGEFETCH_SERVER_TOKEN"), os.Getenv("CRAWLER_TOKEN"))
 	allowUnauth := hasFlag(os.Args[1:], "--allow-unauthenticated") || isTruthyEnv(os.Getenv("EDGEFETCH_ALLOW_UNAUTHENTICATED"))
 	if flagAddr := flagValue(os.Args[1:], "--addr="); flagAddr != "" {
 		addr = flagAddr
@@ -232,18 +281,86 @@ func main() {
 		os.Exit(2)
 	}
 
-	crawler := crawl.NewCrawler(newCrawlTransport(60*time.Second, 2), crawl.PublicHTTPS, ua, log)
+	allow := crawl.PublicHTTPS
+	var agentCfg agent.Config
+	if modes.agent {
+		var err error
+		agentCfg, err = agent.LoadConfig(agent.DefaultHAOptionsPath)
+		if err != nil {
+			log.Error("hybrid_agent_config", slog.String("error", err.Error()))
+			os.Exit(2)
+		}
+		allow = crawl.WithAllowedHosts(allow, agentCfg.AllowedHosts)
+		for _, hURL := range agentCfg.HubURLs {
+			if hubParsed, pErr := url.Parse(hURL); pErr == nil && hubParsed.Hostname() != "" {
+				allow = crawl.WithBlockedHost(allow, hubParsed.Hostname())
+			}
+		}
+	}
+
+	defaultOtelSvc := "edgefetch-server"
+	if modes.hub {
+		defaultOtelSvc = "edgefetch-go-hub"
+	}
+	crawler := crawl.NewCrawler(newCrawlTransport(60*time.Second, 2), allow, ua, log)
 	defer func() { _ = crawler.Close() }()
 	crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
-	srv := newHTTPServer(addr, crawl.NewAuthenticatedHandler(crawler, crawl.PublicHTTPS, serverToken))
+	crawler.SetOtelExporter(otel.NewExporterFromEnv(os.Getenv, defaultOtelSvc, agent.Version, hubTr))
+
+	var handler http.Handler
+	var goHub *hub.Server
+	if modes.hub {
+		agentTokensMap, tokErr := hub.ParseAgentTokensJSON(firstNonEmpty(os.Getenv("EDGEFETCH_AGENT_TOKENS"), os.Getenv("AGENT_TOKENS")))
+		if tokErr != nil {
+			log.Error("hub_agent_tokens_config", slog.String("error", tokErr.Error()))
+			os.Exit(2)
+		}
+		sharedAgentTok := firstNonEmpty(os.Getenv("EDGEFETCH_AGENT_TOKEN"), os.Getenv("AGENT_TOKEN"))
+		if sharedAgentTok != "" && len(sharedAgentTok) < agent.MinTokenLength {
+			log.Error("hub_agent_token_config", slog.String("error", "EDGEFETCH_AGENT_TOKEN must be at least 24 characters"))
+			os.Exit(2)
+		}
+		goHub = hub.NewServer(hub.Config{
+			CallerToken:     serverToken,
+			AgentToken:      sharedAgentTok,
+			AgentTokens:     agentTokensMap,
+			FallbackCrawler: crawler,
+			Allow:           allow,
+			Logger:          log,
+		})
+		defer func() { _ = goHub.Close() }()
+		handler = goHub
+	} else {
+		handler = crawl.NewAuthenticatedHandler(crawler, allow, serverToken)
+	}
+
+	srv := newHTTPServer(addr, handler)
+	if modes.hub {
+		// Long-lived /agent/ws WebSockets must not be killed by a 30s HTTP ReadTimeout!
+		srv.ReadTimeout = 0
+	}
 
 	go func() {
-		log.Info("listening", slog.String("addr", srv.Addr), slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)), slog.String("go", runtime.Version()))
+		log.Info("listening",
+			slog.String("addr", srv.Addr),
+			slog.Bool("hub_mode", modes.hub),
+			slog.Bool("hybrid_agent", modes.agent),
+			slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)),
+			slog.String("go", runtime.Version()))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
 	}()
+
+	if modes.agent {
+		go func() {
+			siteLog := log.With(slog.String("site", agentCfg.SiteID))
+			if err := agent.RunAll(ctx, agentCfg, crawler, allow, hubTr, siteLog, agent.RuntimeOpts{}); err != nil {
+				siteLog.Error("hybrid_agent_stopped", slog.String("error", err.Error()))
+			}
+		}()
+	}
 
 	<-ctx.Done()
 

@@ -4,9 +4,29 @@
  */
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
-import { extractHtmlDocument, parseLlmsTxt, SCRAPE_PIPELINE_VERSION } from './scrape';
+import { isSafePublicHostname } from './overflow';
+import {
+  cleanPdfMarkdown,
+  decodeHtmlEntities,
+  decodeMarkdownEntities,
+  extractHtmlDocument,
+  extractMarkdownLinksAndImages,
+  extractPdfTitle,
+  formatDelimitedTableToMarkdown,
+  formatFeedXmlToMarkdown,
+  formatGitPatchToMarkdown,
+  formatIcalendarToMarkdown,
+  formatSourceCodeUrlToMarkdown,
+  formatVcardToMarkdown,
+  parseLlmsTxt,
+  parseMarkdownFrontmatter,
+  recordCompanionMdUrl,
+  sanitizeInlineHtmlInMarkdown,
+  SCRAPE_PIPELINE_VERSION,
+  tryParseJsonPayloadForScrape,
+} from './scrape';
 import { COLLECTION_ID_RE } from './search-index';
-import { r2DerivedKey, type ArtifactRetention, type OptionalStorageBindings } from './storage';
+import { r2DerivedKey, readVerifiedArtifactFromR2, type ArtifactRetention, type OptionalStorageBindings } from './storage';
 
 export type HubFetchExecutor = (
   target: 'auto' | 'agent' | 'container',
@@ -16,20 +36,11 @@ export type HubFetchExecutor = (
   artifactRetention?: ArtifactRetention | 'off',
   hydrateInline?: boolean,
   collectionId?: string,
+  crawlId?: string,
 ) => Promise<{ status: number; via: string; bodyText: string; retryAfter?: string }>;
 
 function isSafeDomainHost(hostname: string, selfHost?: string): boolean {
-  const h = hostname.toLowerCase().replace(/\.+$/, '');
-  if (!h || !h.includes('.') || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) {
-    return false;
-  }
-  if (/^[0-9]{1,3}(\.[0-9]{1,3}){3}$/.test(h) || h.includes(':')) {
-    return false;
-  }
-  if (selfHost && h === selfHost.toLowerCase().replace(/\.+$/, '')) {
-    return false;
-  }
-  return true;
+  return isSafePublicHostname(hostname, selfHost);
 }
 
 function validatePublicHttpsUrl(raw: unknown, selfHost?: string): { ok: true; url: URL } | { ok: false; message: string } {
@@ -139,8 +150,44 @@ export interface MapRequestPayload {
   limit?: unknown;
   includeSubdomains?: unknown;
   ignoreSitemap?: unknown;
+  fastEdgeMap?: unknown;
   target?: unknown;
   site?: unknown;
+}
+
+function extractAnchorTitlesFromHtml(html: string, baseUrl: string): Map<string, string> {
+  const titles = new Map<string, string>();
+  const cleanedHtml = html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<(?:script|style|svg|noscript|template)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/(?:script|style|svg|noscript|template)>/gi, ' ');
+  for (const m of cleanedHtml.matchAll(/<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]{1,600}?)<\/a>/gi)) {
+    const hrefMatch = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))/i.exec(m[1]!);
+    const rawHref = (hrefMatch?.[1] ?? hrefMatch?.[2] ?? hrefMatch?.[3] ?? '').trim();
+    if (!rawHref || rawHref.startsWith('#') || /^(?:javascript|mailto|tel|data):/i.test(rawHref)) continue;
+    let resolved: string;
+    try {
+      const u = new URL(decodeHtmlEntities(rawHref), baseUrl);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') continue;
+      u.hash = '';
+      resolved = u.toString();
+    } catch {
+      continue;
+    }
+    if (titles.has(resolved)) continue;
+    const label = decodeHtmlEntities(m[2]!.replace(/<(?:"[^"]*"|'[^']*'|[^>"'])*>/g, ' '))
+      .replace(/[#¶§🔗]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (
+      label.length >= 3 &&
+      label.length <= 140 &&
+      !/^https?:\/\//i.test(label) &&
+      !/^(?:read more|learn more|click here|see more|more|link|here|view|open|next|prev|previous|\d+)$/i.test(label)
+    ) {
+      titles.set(resolved, label);
+    }
+  }
+  return titles;
 }
 
 /**
@@ -162,7 +209,8 @@ export async function executeMapCall(params: {
   const origin = rootUrl.origin;
   const rootHost = rootUrl.hostname;
   const includeSubdomains = Boolean(payload.includeSubdomains);
-  const ignoreSitemap = Boolean(payload.ignoreSitemap);
+  const fastEdgeMap = Boolean(payload.fastEdgeMap);
+  const ignoreSitemap = Boolean(payload.ignoreSitemap) || fastEdgeMap;
   const searchFilter = typeof payload.search === 'string' ? payload.search.trim().toLowerCase() : '';
   const limit =
     typeof payload.limit === 'number' && Number.isFinite(payload.limit)
@@ -172,28 +220,42 @@ export async function executeMapCall(params: {
     payload.target === 'agent' || payload.target === 'container' ? payload.target : 'auto';
   const site = typeof payload.site === 'string' && payload.site.trim() ? payload.site.trim() : undefined;
 
-  const seedRequests: Array<Record<string, unknown>> = [
-    { id: 'home', url: rootUrl.toString(), kind: 'page' },
-    { id: 'llms', url: `${origin}/llms.txt`, kind: 'text', accept: 'text/markdown' },
-  ];
-  if (!ignoreSitemap) {
+  const trimmedSubpath = rootUrl.pathname.replace(/\/+$/, '');
+  const subpathSegments = trimmedSubpath.split('/').filter(Boolean);
+  const isGitHubRepoSubpath = rootHost.toLowerCase() === 'github.com' && subpathSegments.length >= 2;
+  const shouldProbeSubpathLlms =
+    Boolean(trimmedSubpath) &&
+    !isGitHubRepoSubpath &&
+    !trimmedSubpath.toLowerCase().endsWith('/llms.txt') &&
+    (subpathSegments.length === 1 || /\b(docs?|api|reference|guides?|manual|sdk|dev|developers)\b/i.test(trimmedSubpath));
+  const subLlmsUrl = shouldProbeSubpathLlms ? `${origin}${trimmedSubpath}/llms.txt` : '';
+
+  const seedRequests: Array<Record<string, unknown>> = isGitHubRepoSubpath
+    ? [{ id: 'home', url: rootUrl.toString(), kind: 'page' }]
+    : [
+        { id: 'home', url: rootUrl.toString(), kind: 'page' },
+        { id: 'llms', url: `${origin}/llms.txt`, kind: 'text', accept: 'text/plain' },
+        ...(subLlmsUrl ? [{ id: 'llms-sub', url: subLlmsUrl, kind: 'text', accept: 'text/plain' }] : []),
+      ];
+  if (!ignoreSitemap && !isGitHubRepoSubpath) {
     seedRequests.push(
       { id: 'robots', url: `${origin}/robots.txt`, kind: 'text', accept: 'text/plain' },
       { id: 'sitemap', url: `${origin}/sitemap.xml`, kind: 'text', accept: 'application/xml' },
+      { id: 'sitemap-index', url: `${origin}/sitemap-index.xml`, kind: 'text', accept: 'application/xml' },
     );
   }
 
   const seedRes = await executeHubFetch(
     target,
     JSON.stringify({
-      maxSeconds: 45,
-      options: { includeBody: true, respectRobots: true, pauseMs: 400 },
+      maxSeconds: fastEdgeMap ? 10 : 30,
+      options: { includeBody: true, respectRobots: true, pauseMs: 250, pauseJitterMs: 0 },
       requests: seedRequests,
     }),
     site,
     source,
-    'transient',
-    true,
+    'off',
+    false,
   );
   if (seedRes.status !== 200) {
     return { status: seedRes.status, via: seedRes.via, body: { ok: false, error: 'map_fetch_failed' } };
@@ -205,56 +267,187 @@ export async function executeMapCall(params: {
     if (typeof r.id === 'string') byId.set(r.id, r);
   }
 
+  const sourcesReport: Array<{ source: string; url: string; status: number; outcome: string; urlsFound: number }> = [];
   const discovered = new Map<string, { url: string; title?: string; source: string }>();
-  const addUrl = (rawCandidate: string, src: string, title?: string) => {
+  const ghRepoPrefix =
+    isGitHubRepoSubpath ? `/${subpathSegments[0]!.toLowerCase()}/${subpathSegments[1]!.toLowerCase()}` : '';
+  const stripTrackingParams = (u: URL): void => {
+    for (const k of [...u.searchParams.keys()]) {
+      const lk = k.toLowerCase();
+      if (
+        lk.startsWith('utm_') ||
+        lk === 'gclid' ||
+        lk === 'fbclid' ||
+        lk === 'msclkid' ||
+        lk === 'mc_cid' ||
+        lk === 'mc_eid' ||
+        lk === '_hsenc' ||
+        lk === '_hsmi' ||
+        lk === 'ref_src' ||
+        lk === 'spm'
+      ) {
+        u.searchParams.delete(k);
+      }
+    }
+  };
+  const addUrl = (rawCandidate: string, src: string, title?: string): boolean => {
     try {
       const u = new URL(rawCandidate, origin);
-      if (u.protocol !== 'https:' || (u.port && u.port !== '443')) return;
-      if (!matchesHostScope(u.hostname, rootHost, includeSubdomains)) return;
-      u.hash = '';
-      const clean = u.toString();
-      if (!discovered.has(clean)) {
-        discovered.set(clean, { url: clean, ...(title ? { title } : {}), source: src });
+      if (u.protocol !== 'https:' || (u.port && u.port !== '443')) return false;
+      if (!matchesHostScope(u.hostname, rootHost, includeSubdomains)) return false;
+      if (ghRepoPrefix && u.hostname.toLowerCase() === 'github.com') {
+        const lp = u.pathname.toLowerCase();
+        if (lp !== ghRepoPrefix && !lp.startsWith(`${ghRepoPrefix}/`)) {
+          return false;
+        }
       }
+      u.hash = '';
+      stripTrackingParams(u);
+      const clean = u.toString();
+      const existing = discovered.get(clean);
+      if (!existing) {
+        discovered.set(clean, { url: clean, ...(title ? { title: decodeHtmlEntities(title) } : {}), source: src });
+        return true;
+      }
+      if (!existing.title && title) {
+        existing.title = decodeHtmlEntities(title);
+      }
+      return false;
     } catch {
-      // ignore
+      return false;
     }
   };
   addUrl(rootUrl.toString(), 'seed');
 
   const homeItem = byId.get('home');
-  if (homeItem?.outcome === 'ok' && typeof homeItem.body === 'string') {
-    const ext = extractHtmlDocument(homeItem.body, { baseUrl: rootUrl.toString(), onlyMainContent: false });
-    for (const l of ext.links) addUrl(l, 'homepage');
+  if (homeItem) {
+    let found = 0;
+    if (homeItem.outcome === 'ok' && typeof homeItem.body === 'string') {
+      const anchorTitles = extractAnchorTitlesFromHtml(homeItem.body, rootUrl.toString());
+      const ext = extractHtmlDocument(homeItem.body, { baseUrl: rootUrl.toString(), onlyMainContent: false });
+      const homeLinks =
+        ext.links.length > 0
+          ? ext.links
+          : extractMarkdownLinksAndImages(homeItem.body, rootUrl.toString(), false).links;
+      for (const l of homeLinks) {
+        if (addUrl(l, 'homepage', anchorTitles.get(l))) found++;
+      }
+    }
+    sourcesReport.push({
+      source: 'homepage',
+      url: rootUrl.toString(),
+      status: typeof homeItem.status === 'number' ? homeItem.status : 0,
+      outcome: String(homeItem.outcome ?? 'unknown'),
+      urlsFound: found,
+    });
   }
 
-  const llmsItem = byId.get('llms');
-  if (llmsItem?.outcome === 'ok' && typeof llmsItem.body === 'string') {
-    const llmsDoc = parseLlmsTxt(llmsItem.body, `${origin}/llms.txt`);
-    if (llmsDoc) {
-      for (const l of llmsDoc.links) addUrl(l.url, 'llms.txt', l.title);
+  for (const [id, srcLabel, llmsTargetUrl] of [
+    ['llms', 'llms.txt', `${origin}/llms.txt`],
+    ...(subLlmsUrl ? ([['llms-sub', 'subpath-llms.txt', subLlmsUrl]] as const) : []),
+  ] as const) {
+    const llmsItem = byId.get(id);
+    if (!llmsItem) continue;
+    let found = 0;
+    if (llmsItem.outcome === 'ok' && typeof llmsItem.body === 'string') {
+      const llmsDoc = parseLlmsTxt(llmsItem.body, llmsTargetUrl);
+      if (llmsDoc) {
+        for (const l of llmsDoc.links) {
+          if (addUrl(l.url, 'llms.txt', l.title)) found++;
+        }
+      }
     }
+    sourcesReport.push({
+      source: srcLabel,
+      url: llmsTargetUrl,
+      status: typeof llmsItem.status === 'number' ? llmsItem.status : 0,
+      outcome: String(llmsItem.outcome ?? 'unknown'),
+      urlsFound: found,
+    });
   }
 
   if (!ignoreSitemap) {
     const childSitemaps = new Set<string>();
     const robotsItem = byId.get('robots');
-    if (robotsItem?.outcome === 'ok' && typeof robotsItem.body === 'string') {
-      for (const sm of extractRobotsSitemaps(robotsItem.body, origin)) {
-        if (sm !== `${origin}/sitemap.xml`) childSitemaps.add(sm);
+    if (robotsItem) {
+      let sitemapsFound = 0;
+      if (robotsItem.outcome === 'ok' && typeof robotsItem.body === 'string') {
+        for (const sm of extractRobotsSitemaps(robotsItem.body, origin)) {
+          sitemapsFound++;
+          if (sm !== `${origin}/sitemap.xml` && sm !== `${origin}/sitemap-index.xml`) childSitemaps.add(sm);
+        }
       }
+      sourcesReport.push({
+        source: 'robots.txt',
+        url: `${origin}/robots.txt`,
+        status: typeof robotsItem.status === 'number' ? robotsItem.status : 0,
+        outcome: String(robotsItem.outcome ?? 'unknown'),
+        urlsFound: sitemapsFound,
+      });
     }
 
-    const smItem = byId.get('sitemap');
-    if (smItem?.outcome === 'ok' && typeof smItem.body === 'string') {
-      const xml = await decodeXmlOrGzipBody(smItem.body, smItem.bodyEncoding as string | undefined, `${origin}/sitemap.xml`);
-      const parsedSm = parseSitemapXml(xml);
-      if (parsedSm.isIndex) {
-        for (const loc of parsedSm.locs.slice(0, 5)) childSitemaps.add(loc);
-      } else {
-        for (const loc of parsedSm.locs) addUrl(loc, 'sitemap');
+    for (const [smId, smUrl] of [
+      ['sitemap', `${origin}/sitemap.xml`],
+      ['sitemap-index', `${origin}/sitemap-index.xml`],
+    ] as const) {
+      const smItem = byId.get(smId);
+      if (!smItem) continue;
+      let found = 0;
+      if (smItem.outcome === 'ok' && typeof smItem.body === 'string') {
+        const xml = await decodeXmlOrGzipBody(smItem.body, smItem.bodyEncoding as string | undefined, smUrl);
+        const parsedSm = parseSitemapXml(xml);
+        if (parsedSm.isIndex) {
+          for (const loc of parsedSm.locs) {
+            childSitemaps.add(loc);
+            found++;
+          }
+        } else {
+          for (const loc of parsedSm.locs) {
+            if (addUrl(loc, 'sitemap')) found++;
+          }
+        }
       }
+      sourcesReport.push({
+        source: smId,
+        url: smUrl,
+        status: typeof smItem.status === 'number' ? smItem.status : 0,
+        outcome: String(smItem.outcome ?? 'unknown'),
+        urlsFound: found,
+      });
     }
+
+    const pathHintTokens = trimmedSubpath
+      .toLowerCase()
+      .split('/')
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2);
+    const searchHintTokens = searchFilter
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2);
+
+    const scoreChildSitemap = (smUrl: string): number => {
+      const lower = smUrl.toLowerCase();
+      let score = 0;
+      for (const pt of pathHintTokens) {
+        if (lower.includes(pt)) score += 10;
+      }
+      for (const st of searchHintTokens) {
+        if (lower.includes(st)) score += 6;
+      }
+      if (
+        score === 0 &&
+        /(?:^|[-_/])(?:authors?|archives?|tags?|users?|categories)(?:[-_.\d]|$)/i.test(lower)
+      ) {
+        score -= 8;
+      }
+      return score;
+    };
+
+    const extractSitemapSeq = (smUrl: string): number => {
+      const m = /(?:^|[-_/])(\d{1,5})\.xml(?:\.gz)?(?:$|[?#])/i.exec(smUrl);
+      return m?.[1] ? Number(m[1]) : -1;
+    };
 
     const toFetchSitemaps = [...childSitemaps]
       .filter((u) => {
@@ -264,14 +457,25 @@ export async function executeMapCall(params: {
           return false;
         }
       })
-      .slice(0, 4);
+      .map((u, idx) => ({ url: u, score: scoreChildSitemap(u), seq: extractSitemapSeq(u), idx }))
+      .filter((x) => Boolean(searchFilter) || discovered.size < limit || x.score > 0)
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        const aUnnumbered = a.seq < 0 ? 1 : 0;
+        const bUnnumbered = b.seq < 0 ? 1 : 0;
+        if (aUnnumbered !== bUnnumbered) return bUnnumbered - aUnnumbered;
+        if (a.seq >= 0 && b.seq >= 0 && b.seq !== a.seq) return b.seq - a.seq;
+        return a.idx - b.idx;
+      })
+      .slice(0, 5)
+      .map((x) => x.url);
 
-    if (toFetchSitemaps.length > 0 && discovered.size < limit) {
+    if (toFetchSitemaps.length > 0 && (Boolean(searchFilter) || pathHintTokens.length > 0 || discovered.size < limit)) {
       const subRes = await executeHubFetch(
         target,
         JSON.stringify({
-          maxSeconds: 30,
-          options: { includeBody: true, respectRobots: true, pauseMs: 400 },
+          maxSeconds: 25,
+          options: { includeBody: true, respectRobots: true, pauseMs: 200, pauseJitterMs: 0 },
           requests: toFetchSitemaps.map((u, idx) => ({
             id: `csm-${idx}`,
             url: u,
@@ -281,39 +485,150 @@ export async function executeMapCall(params: {
         }),
         site,
         `${source}:child-sitemaps`,
-        'transient',
-        true,
+        'off',
+        false,
       );
       if (subRes.status === 200) {
         const subParsed = JSON.parse(subRes.bodyText) as { results?: Array<Record<string, unknown>> };
         for (const sr of subParsed.results ?? []) {
+          const srUrl = typeof sr.url === 'string' ? sr.url : '';
+          let found = 0;
           if (sr.outcome === 'ok' && typeof sr.body === 'string') {
-            const xml = await decodeXmlOrGzipBody(sr.body, sr.bodyEncoding as string | undefined, String(sr.url ?? ''));
+            const xml = await decodeXmlOrGzipBody(sr.body, sr.bodyEncoding as string | undefined, srUrl);
             const p = parseSitemapXml(xml);
             if (!p.isIndex) {
-              for (const loc of p.locs) addUrl(loc, 'sitemap');
+              for (const loc of p.locs) {
+                if (addUrl(loc, 'sitemap')) found++;
+              }
             }
+          }
+          if (srUrl) {
+            sourcesReport.push({
+              source: 'child-sitemap',
+              url: srUrl,
+              status: typeof sr.status === 'number' ? sr.status : 0,
+              outcome: String(sr.outcome ?? 'unknown'),
+              urlsFound: found,
+            });
           }
         }
       }
     }
   }
 
+  // Merge companion `.md` and `/index.md` entries (e.g. from `/llms.txt`) onto their canonical HTML twins
+  // (`.../foo` + `.../foo.md`, `.../bar/` + `.../bar/index.md`) so `map` preserves curated `llms.txt` titles without duplicates.
+  const wantsExplicitMd = /\.md\b/i.test(searchFilter);
+  for (const [key, entry] of [...discovered.entries()]) {
+    if (!key.toLowerCase().endsWith('.md')) continue;
+    recordCompanionMdUrl(key);
+    const candidateTwins: string[] = [];
+    if (/\/index\.md$/i.test(key)) {
+      const dirWithSlash = key.slice(0, -'index.md'.length);
+      const dirNoSlash =
+        dirWithSlash.endsWith('/') && dirWithSlash.length > origin.length + 1
+          ? dirWithSlash.slice(0, -1)
+          : dirWithSlash;
+      candidateTwins.push(dirWithSlash, dirNoSlash);
+    }
+    const baseTwinUrl = key.slice(0, -3);
+    candidateTwins.push(baseTwinUrl, `${baseTwinUrl}/`);
+    const twin = candidateTwins.map((c) => discovered.get(c)).find((t) => t && t.url !== key);
+    if (twin) {
+      if (!twin.title && entry.title) {
+        twin.title = entry.title;
+      }
+      if (!wantsExplicitMd) {
+        discovered.delete(key);
+      }
+    }
+  }
+
+  const subpathPrefix = trimmedSubpath ? `${origin}${trimmedSubpath}`.toLowerCase() : '';
+  const isUnderSubpath = (urlStr: string): boolean => {
+    if (!subpathPrefix) return false;
+    const lower = urlStr.toLowerCase();
+    return lower === subpathPrefix || lower.startsWith(`${subpathPrefix}/`);
+  };
+
+  const extractUrlLocalePrefix = (pathname: string): string | null => {
+    const regional = /^\/([a-z]{2}-[a-z]{2,4})(?:\/|$)/i.exec(pathname);
+    if (regional?.[1]) return regional[1].toLowerCase();
+    const translated2 = /^\/(de|fr|es|ja|ko|zh|pt|ru|it|nl|pl|tr|vi|id|th|ar|uk|cs|sv|da|fi|he)(?:\/|$)/i.exec(pathname);
+    return translated2?.[1] ? translated2[1].toLowerCase() : null;
+  };
+  const rootLocale = extractUrlLocalePrefix(rootUrl.pathname);
+
+  const scoreMapUrlQuality = (urlStr: string): number => {
+    const lower = urlStr.toLowerCase();
+    if (/\/(?:login|signup|contact\/report-content)\b/.test(lower)) return -30;
+    if (/\/(?:actions|activity|pulse|stargazers|watchers|forks|network|security\/advisories|custom-properties)(?:\/|$)/.test(lower)) {
+      return -15;
+    }
+    let localePenalty = 0;
+    if (!rootLocale) {
+      try {
+        const candLocale = extractUrlLocalePrefix(new URL(urlStr).pathname);
+        if (candLocale && (!searchFilter || !searchFilter.includes(candLocale))) {
+          localePenalty = -18;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (/\/blob\/[^/]+\/\.[a-z0-9]/.test(lower)) return -10 + localePenalty;
+    if (/\/(?:readme\.md|docs\/|guide|getting-started|reference|api\/)/.test(lower)) return 10 + localePenalty;
+    return localePenalty;
+  };
+
   let items = [...discovered.values()];
   if (searchFilter) {
     const terms = searchFilter.split(/\s+/).filter(Boolean);
     items = items
       .map((entry) => {
-        const hay = `${entry.url} ${entry.title ?? ''}`.toLowerCase();
+        const urlLower = entry.url.toLowerCase();
+        const titleLower = (entry.title ?? '').toLowerCase();
+        const hay = `${urlLower} ${titleLower}`;
         let hits = 0;
-        for (const t of terms) if (hay.includes(t)) hits++;
-        return { entry, hits };
+        let segmentBonus = 0;
+        for (const t of terms) {
+          if (hay.includes(t)) {
+            hits++;
+            const segRe = new RegExp(`(?:^|[/._\\s-])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/._\\s-])`, 'i');
+            if (segRe.test(urlLower) || segRe.test(titleLower)) segmentBonus += 3;
+          }
+        }
+        const underSubpath = isUnderSubpath(entry.url);
+        const exactSubpathRoot =
+          terms.length === 1 && (urlLower.endsWith(`/${terms[0]}/`) || urlLower.endsWith(`/${terms[0]}`)) ? 5 : 0;
+        const score =
+          (underSubpath ? 100 : 0) +
+          hits * 20 +
+          segmentBonus +
+          exactSubpathRoot +
+          (entry.title ? 2 : 0) +
+          scoreMapUrlQuality(entry.url);
+        return { entry, hits, score };
       })
       .filter((x) => x.hits > 0)
-      .sort((a, b) => b.hits - a.hits || a.entry.url.localeCompare(b.entry.url))
+      .sort((a, b) => b.score - a.score || a.entry.url.length - b.entry.url.length || a.entry.url.localeCompare(b.entry.url))
       .map((x) => x.entry);
+  } else if (subpathPrefix) {
+    items.sort((a, b) => {
+      const aUnder = isUnderSubpath(a.url) ? 1 : 0;
+      const bUnder = isUnderSubpath(b.url) ? 1 : 0;
+      if (aUnder !== bUnder) return bUnder - aUnder;
+      const aSeed = a.source === 'seed' ? 1 : 0;
+      const bSeed = b.source === 'seed' ? 1 : 0;
+      if (aSeed !== bSeed) return bSeed - aSeed;
+      const qDiff = scoreMapUrlQuality(b.url) - scoreMapUrlQuality(a.url);
+      return qDiff || a.url.localeCompare(b.url);
+    });
   } else {
-    items.sort((a, b) => a.url.localeCompare(b.url));
+    items.sort((a, b) => {
+      const qDiff = scoreMapUrlQuality(b.url) - scoreMapUrlQuality(a.url);
+      return qDiff || a.url.localeCompare(b.url);
+    });
   }
 
   const sliced = items.slice(0, limit);
@@ -326,6 +641,7 @@ export async function executeMapCall(params: {
       total: sliced.length,
       links: sliced.map((x) => x.url),
       entries: sliced,
+      sources: sourcesReport,
     },
   };
 }
@@ -544,10 +860,19 @@ export async function executeCrawlJob(params: {
   executeHubFetch: HubFetchExecutor;
   selfHost?: string;
   webhookFetchFn?: typeof fetch;
+  waitUntilBounded?: boolean;
+  maxRuntimeMs?: number;
 }): Promise<{ status: 'completed' | 'cancelled' | 'failed'; fetchedCount: number; failedCount: number; discoveredCount: number }> {
   const { crawlId, rootUrl, options, env, executeHubFetch, selfHost, webhookFetchFn } = params;
   const metaDb = env.META!;
   const rootParsed = new URL(rootUrl);
+  const startedAt = Date.now();
+  const runtimeBudgetMs =
+    typeof params.maxRuntimeMs === 'number' && Number.isFinite(params.maxRuntimeMs) && params.maxRuntimeMs > 0
+      ? params.maxRuntimeMs
+      : params.waitUntilBounded
+        ? 23_000
+        : 120_000;
 
   const isCancelled = async (): Promise<boolean> => {
     const row = await metaDb.prepare('SELECT status FROM crawls WHERE id = ? LIMIT 1').bind(crawlId).first<{ status: string }>();
@@ -582,6 +907,9 @@ export async function executeCrawlJob(params: {
 
   try {
     for (let depth = 0; depth <= options.maxDepth && frontier.length > 0 && fetchedCount + failedCount < options.limit; depth++) {
+      if (depth > 0 && Date.now() - startedAt >= runtimeBudgetMs) {
+        break;
+      }
       if (await isCancelled()) {
         return { status: 'cancelled', fetchedCount, failedCount, discoveredCount: visited.size };
       }
@@ -591,9 +919,10 @@ export async function executeCrawlJob(params: {
       const nextFrontier: string[] = [];
 
       const retention: ArtifactRetention | undefined = env.ARTIFACTS ? 'stored' : undefined;
+      const remainingRuntimeSec = Math.max(8, Math.min(45, Math.floor(Math.max(8_000, runtimeBudgetMs - (Date.now() - startedAt)) / 1_000)));
       const call = {
-        maxSeconds: 60,
-        options: { includeBody: true, respectRobots: true, discoverLlms: depth === 0 },
+        maxSeconds: remainingRuntimeSec,
+        options: { includeBody: true, respectRobots: true, discoverLlms: false, pauseMs: 800, pauseJitterMs: 200 },
         requests: wave.map((u, idx) => ({
           id: `c-${depth}-${idx}`,
           url: u,
@@ -612,6 +941,7 @@ export async function executeCrawlJob(params: {
         retention,
         true,
         options.collectionId,
+        crawlId,
       );
 
       if (fetchOut.status !== 200) {
@@ -625,9 +955,26 @@ export async function executeCrawlJob(params: {
         if (item.outcome === 'ok') {
           fetchedCount++;
           const rawHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
-          const ext = rawHtml ? extractHtmlDocument(rawHtml, { baseUrl: itemUrl, onlyMainContent: true }) : undefined;
-          const md = (typeof item.markdown === 'string' && item.markdown) || ext?.markdown || '';
-          const links = Array.isArray(item.links) ? (item.links as string[]) : (ext?.links ?? []);
+          const isHtml = Boolean(
+            rawHtml &&
+              ((typeof item.contentType === 'string' && item.contentType.toLowerCase().includes('html')) ||
+                /^\s*<!doctype\s+html|^\s*<html|<(head|body|main|article)\b/i.test(rawHtml)),
+          );
+          const ext = isHtml ? extractHtmlDocument(rawHtml, { baseUrl: itemUrl, onlyMainContent: true }) : undefined;
+          const rawMdCandidate =
+            (isHtml ? ext?.markdown : undefined) ||
+            (typeof item.markdown === 'string' && item.markdown ? item.markdown : '') ||
+            ext?.markdown ||
+            (!isHtml ? rawHtml : '');
+          const fm = parseMarkdownFrontmatter(rawMdCandidate);
+          const md = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), itemUrl).trim();
+          const mdAssets = !isHtml && rawMdCandidate ? extractMarkdownLinksAndImages(rawMdCandidate, itemUrl, false) : undefined;
+          const itemLinks = Array.isArray(item.links) ? (item.links as string[]) : [];
+          const links = isHtml
+            ? (ext?.links && ext.links.length > 0 ? ext.links : itemLinks)
+            : itemLinks.length > 0
+              ? itemLinks
+              : (mdAssets?.links ?? []);
 
           if (options.webhook) {
             await deliverSignedWebhook({
@@ -638,7 +985,11 @@ export async function executeCrawlJob(params: {
               data: {
                 url: itemUrl,
                 status: item.status ?? 200,
-                title: (typeof item.title === 'string' && item.title) || ext?.title,
+                title:
+                  ext?.title ||
+                  fm.title ||
+                  mdAssets?.title ||
+                  (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined),
                 markdownPreview: md.slice(0, 2_000),
               },
               selfHost,
@@ -655,6 +1006,23 @@ export async function executeCrawlJob(params: {
                 if (!matchesHostScope(lu.hostname, rootParsed.hostname, options.allowSubdomains)) continue;
                 if (!pathAllowed(lu.pathname, options.includePaths, options.excludePaths)) continue;
                 lu.hash = '';
+                for (const k of [...lu.searchParams.keys()]) {
+                  const lk = k.toLowerCase();
+                  if (
+                    lk.startsWith('utm_') ||
+                    lk === 'gclid' ||
+                    lk === 'fbclid' ||
+                    lk === 'msclkid' ||
+                    lk === 'mc_cid' ||
+                    lk === 'mc_eid' ||
+                    lk === '_hsenc' ||
+                    lk === '_hsmi' ||
+                    lk === 'ref_src' ||
+                    lk === 'spm'
+                  ) {
+                    lu.searchParams.delete(k);
+                  }
+                }
                 const clean = lu.toString();
                 if (!visited.has(clean)) {
                   visited.add(clean);
@@ -670,21 +1038,17 @@ export async function executeCrawlJob(params: {
         }
       }
 
-      // Link crawl_id onto fetches rows for this URL wave so GET /v1/crawl/:id returns page results cleanly.
-      if (wave.length > 0) {
-        const placeholders = wave.map(() => '?').join(', ');
-        await metaDb
-          .prepare(
-            `UPDATE fetches
-             SET crawl_id = ?
-             WHERE crawl_id IS NULL
-               AND page_id IN (SELECT id FROM pages WHERE url IN (${placeholders}))
-               AND fetched_at >= ?`,
-          )
-          .bind(crawlId, ...wave, Date.now() - 120_000)
-          .run()
-          .catch(() => undefined);
+      const rootPrefix = rootParsed.pathname.endsWith('/') ? rootParsed.pathname : `${rootParsed.pathname}/`;
+      if (options.includePaths.length === 0 && rootPrefix !== '/' && nextFrontier.length > 1) {
+        nextFrontier.sort((a, b) => {
+          const aIn = new URL(a).pathname.startsWith(rootPrefix) ? 1 : 0;
+          const bIn = new URL(b).pathname.startsWith(rootPrefix) ? 1 : 0;
+          return bIn - aIn;
+        });
       }
+
+      // Fetch rows get this crawl's id from the ingest manifest (executeHubFetch's crawlId). The old URL match here
+      // also claimed other callers' fetches of the same URL from the last two minutes.
 
       await metaDb
         .prepare(
@@ -753,8 +1117,9 @@ export async function getCrawlJobStatus(params: {
   bucket?: R2Bucket;
   offset?: number;
   limit?: number;
+  now?: number;
 }): Promise<{ ok: true; crawl: Record<string, unknown> } | { ok: false; status: number; error: string }> {
-  const { crawlId, metaDb, bucket, offset = 0, limit = 25 } = params;
+  const { crawlId, metaDb, bucket, offset = 0, limit = 25, now = Date.now() } = params;
   if (!metaDb) return { ok: false, status: 503, error: 'tracking_not_configured' };
 
   const row = await metaDb
@@ -777,20 +1142,87 @@ export async function getCrawlJobStatus(params: {
     }>();
   if (!row) return { ok: false, status: 404, error: 'crawl_not_found' };
 
-  const safeOffset = Math.max(0, Math.floor(offset));
-  const safeLimit = Math.min(50, Math.max(1, Math.floor(limit)));
-  const pageRows = (
+  let parsedOpts: Record<string, unknown> = {};
+  try {
+    parsedOpts = JSON.parse(row.options_json) as Record<string, unknown>;
+  } catch {
+    // ignore
+  }
+  const configuredLimit =
+    typeof parsedOpts.limit === 'number' && Number.isFinite(parsedOpts.limit) && parsedOpts.limit > 0
+      ? Math.floor(parsedOpts.limit)
+      : 25;
+
+  // Reconcile live fetch counts from `fetches` so `fetchedCount` and `status` self-heal automatically even if
+  // Cloudflare Workers' 30s `ctx.waitUntil` cap terminated a background crawl right after its last wave ingested.
+  const aggRow = await metaDb
+    .prepare(
+      `SELECT
+         SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok_cnt,
+         SUM(CASE WHEN outcome != 'ok' THEN 1 ELSE 0 END) AS fail_cnt,
+         MAX(fetched_at) AS last_fetched_at
+       FROM fetches
+       WHERE crawl_id = ?`,
+    )
+    .bind(crawlId)
+    .first<{ ok_cnt: number | null; fail_cnt: number | null; last_fetched_at: number | null }>()
+    .catch(() => null);
+
+  const liveOk = Number(aggRow?.ok_cnt ?? 0);
+  const liveFail = Number(aggRow?.fail_cnt ?? 0);
+  const lastFetchedAt = Number(aggRow?.last_fetched_at ?? 0);
+  const effectiveFetched = Math.max(row.fetched_count, liveOk);
+  const effectiveFailed = Math.max(row.failed_count, liveFail);
+  const effectiveDiscovered = Math.max(row.discovered_count, effectiveFetched + effectiveFailed);
+  let effectiveStatus = row.status;
+  let effectiveUpdatedAt = Math.max(row.updated_at, lastFetchedAt);
+  let effectiveFinishedAt = row.finished_at;
+
+  if (
+    (row.status === 'queued' || row.status === 'running') &&
+    (effectiveFetched + effectiveFailed >= configuredLimit || now - effectiveUpdatedAt > 45_000)
+  ) {
+    effectiveStatus = effectiveFetched > 0 ? 'completed' : 'failed';
+    effectiveUpdatedAt = now;
+    effectiveFinishedAt = row.finished_at ?? (lastFetchedAt > 0 ? lastFetchedAt : now);
     await metaDb
       .prepare(
-        `SELECT p.url, f.status, f.outcome, f.content_sha256, f.blob_sha256, f.fetched_at, d.title
+        `UPDATE crawls
+         SET status = ?, discovered_count = ?, fetched_count = ?, failed_count = ?, updated_at = ?, finished_at = ?
+         WHERE id = ? AND status IN ('queued', 'running')`,
+      )
+      .bind(
+        effectiveStatus,
+        effectiveDiscovered,
+        effectiveFetched,
+        effectiveFailed,
+        effectiveUpdatedAt,
+        effectiveFinishedAt,
+        crawlId,
+      )
+      .run()
+      .catch(() => undefined);
+  }
+
+  const safeOffset = Math.max(0, Math.floor(offset));
+  const safeLimit = Math.min(50, Math.max(1, Math.floor(limit)));
+  const rawPageRows = (
+    await metaDb
+      .prepare(
+        `SELECT p.url, f.status, f.outcome, f.content_sha256, f.blob_sha256, f.fetched_at, d.title, d.r2_key
          FROM fetches f
          JOIN pages p ON p.id = f.page_id
-         LEFT JOIN documents d ON d.content_sha256 = f.content_sha256 AND d.format = 'markdown' AND d.pipeline_version = ?
+         LEFT JOIN documents d ON d.id = (
+           SELECT id FROM documents
+           WHERE content_sha256 = f.content_sha256 AND format = 'markdown'
+           ORDER BY pipeline_version DESC
+           LIMIT 1
+         )
          WHERE f.crawl_id = ?
          ORDER BY f.fetched_at ASC
          LIMIT ? OFFSET ?`,
       )
-      .bind(SCRAPE_PIPELINE_VERSION, crawlId, safeLimit, safeOffset)
+      .bind(crawlId, safeLimit + 1, safeOffset)
       .all<{
         url: string;
         status: number;
@@ -799,32 +1231,95 @@ export async function getCrawlJobStatus(params: {
         blob_sha256: string | null;
         fetched_at: number;
         title: string | null;
+        r2_key: string | null;
       }>()
-  ).results;
+  ).results ?? [];
+  const hasMoreRows = rawPageRows.length > safeLimit;
+  const pageRows = hasMoreRows ? rawPageRows.slice(0, safeLimit) : rawPageRows;
 
+  const pdfCandidatePipelines = [...new Set([SCRAPE_PIPELINE_VERSION, 1])];
   const data: Array<Record<string, unknown>> = [];
   for (const pr of pageRows ?? []) {
     let markdown: string | undefined;
+    let derivedTitle: string | undefined;
+    const isPdfPage = pr.url.toLowerCase().endsWith('.pdf');
     if (bucket && pr.content_sha256) {
-      const mdObj = await bucket.get(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', pr.content_sha256));
-      if (mdObj) markdown = await mdObj.text();
+      let mdObj: R2ObjectBody | null = null;
+      if (pr.r2_key) {
+        mdObj = await bucket.get(pr.r2_key);
+      } else if (isPdfPage) {
+        for (const pv of pdfCandidatePipelines) {
+          mdObj = await bucket.get(r2DerivedKey(pv, 'markdown', pr.content_sha256));
+          if (mdObj) break;
+        }
+      }
+      if (mdObj) {
+        markdown = await mdObj.text();
+      } else if (pr.blob_sha256 && pr.outcome === 'ok') {
+        // Fallback when Crawl is polled immediately before IngestWorkflow finishes or on older vCard/text rows.
+        const rawLoaded = await readVerifiedArtifactFromR2({
+          bucket,
+          blobSha256: pr.blob_sha256,
+          preferredRetention: 'stored',
+          expectedContentSha256: pr.content_sha256,
+        });
+        if (rawLoaded.ok && rawLoaded.bytes.byteLength > 0 && rawLoaded.bytes.byteLength <= 262_144) {
+          const rawText = new TextDecoder('utf-8', { fatal: false }).decode(rawLoaded.bytes);
+          if (!rawText.slice(0, 64).includes('%PDF-')) {
+            if (/^\s*<!doctype\s+html|^\s*<html/i.test(rawText)) {
+              const ext = extractHtmlDocument(rawText, { baseUrl: pr.url, onlyMainContent: true });
+              markdown = ext.markdown;
+              derivedTitle = ext.title;
+            } else if (/^BEGIN:VCARD\b/im.test(rawText.trim())) {
+              const vc = formatVcardToMarkdown(rawText);
+              markdown = vc.markdown;
+              derivedTitle = vc.title;
+            } else if (/^BEGIN:VCALENDAR\b/im.test(rawText.trim())) {
+              const ics = formatIcalendarToMarkdown(rawText);
+              markdown = ics ? ics.markdown : rawText.trim();
+              derivedTitle = ics?.title;
+            } else {
+              const structuredFallback =
+                formatFeedXmlToMarkdown(rawText, pr.url) ??
+                tryParseJsonPayloadForScrape(rawText, undefined, pr.url) ??
+                formatDelimitedTableToMarkdown(rawText, undefined, pr.url) ??
+                formatGitPatchToMarkdown(rawText, undefined, pr.url) ??
+                formatSourceCodeUrlToMarkdown(rawText, undefined, pr.url);
+              if (structuredFallback) {
+                markdown = structuredFallback.markdown;
+                derivedTitle = structuredFallback.title;
+              } else {
+                markdown = rawText.trim();
+              }
+            }
+          }
+        }
+      }
     }
+    if (markdown !== undefined) {
+      const fm = isPdfPage ? { body: markdown } : parseMarkdownFrontmatter(markdown);
+      if (!derivedTitle && fm.title) derivedTitle = fm.title;
+      let cleaned = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), pr.url);
+      if (isPdfPage) {
+        cleaned = cleanPdfMarkdown(cleaned);
+      }
+      markdown = cleaned.trim();
+      if (!derivedTitle && !pr.title && markdown) {
+        derivedTitle = isPdfPage
+          ? extractPdfTitle(markdown, pr.url)
+          : extractMarkdownLinksAndImages(markdown, pr.url, false).title;
+      }
+    }
+    const resolvedTitle = pr.title ? decodeHtmlEntities(pr.title) : derivedTitle;
     data.push({
       url: pr.url,
       status: pr.status,
       outcome: pr.outcome,
-      ...(pr.title ? { title: pr.title } : {}),
+      ...(resolvedTitle ? { title: resolvedTitle } : {}),
       ...(pr.blob_sha256 ? { artifactId: pr.blob_sha256 } : {}),
       ...(markdown !== undefined ? { markdown } : {}),
       fetchedAt: pr.fetched_at,
     });
-  }
-
-  let parsedOpts: Record<string, unknown> = {};
-  try {
-    parsedOpts = JSON.parse(row.options_json) as Record<string, unknown>;
-  } catch {
-    // ignore
   }
 
   return {
@@ -832,18 +1327,18 @@ export async function getCrawlJobStatus(params: {
     crawl: {
       id: row.id,
       rootUrl: row.root_url,
-      status: row.status,
+      status: effectiveStatus,
       collectionId: parsedOpts.collectionId,
-      discoveredCount: row.discovered_count,
-      fetchedCount: row.fetched_count,
-      failedCount: row.failed_count,
+      discoveredCount: effectiveDiscovered,
+      fetchedCount: effectiveFetched,
+      failedCount: effectiveFailed,
       createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      finishedAt: row.finished_at,
+      updatedAt: effectiveUpdatedAt,
+      finishedAt: effectiveFinishedAt,
       offset: safeOffset,
       limit: safeLimit,
-      hasMore: safeOffset + data.length < row.fetched_count + row.failed_count,
-      nextOffset: safeOffset + data.length < row.fetched_count + row.failed_count ? safeOffset + data.length : null,
+      hasMore: hasMoreRows,
+      nextOffset: hasMoreRows ? safeOffset + data.length : null,
       data,
     },
   };

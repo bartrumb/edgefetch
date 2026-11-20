@@ -5,7 +5,8 @@
  * a self-hosted EdgeFetch Hub without rewriting client code.
  */
 
-import { MIN_TOKEN_LENGTH, sameBytes } from './auth';
+import { MAX_CALL_UTF8_BYTES } from './agent-hub';
+import { isValidSecretMatch } from './auth';
 import {
   cancelCrawlJob,
   createCrawlJob,
@@ -22,7 +23,7 @@ import { executeSearchCall, type SearchBindings } from './web-search';
 export async function handleCompatRoutes(params: {
   request: Request;
   url: URL;
-  env: SearchBindings & { CALLER_TOKEN?: string; WEBHOOK_SECRET?: string };
+  env: SearchBindings & { CALLER_TOKEN?: string; MCP_TOKEN?: string; WEBHOOK_SECRET?: string };
   oauthStore: OAuthStore;
   executeHubFetch: HubFetchExecutor;
   waitUntil?: (p: Promise<unknown>) => void;
@@ -35,8 +36,16 @@ export async function handleCompatRoutes(params: {
 
   let bodyObj: Record<string, unknown> = {};
   if (request.method === 'POST') {
+    const rawText = await request.text();
+    if (new TextEncoder().encode(rawText).byteLength > MAX_CALL_UTF8_BYTES) {
+      return Response.json({ success: false, error: 'too_large' }, { status: 413 });
+    }
     try {
-      bodyObj = (await request.json()) as Record<string, unknown>;
+      const parsed = JSON.parse(rawText);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return Response.json({ success: false, error: 'bad_json' }, { status: 400 });
+      }
+      bodyObj = parsed as Record<string, unknown>;
     } catch {
       return Response.json({ success: false, error: 'bad_json' }, { status: 400 });
     }
@@ -48,6 +57,7 @@ export async function handleCompatRoutes(params: {
     request,
     origin: url.origin,
     ownerSecret: env.CALLER_TOKEN,
+    mcpToken: env.MCP_TOKEN,
     store: oauthStore,
   });
   if (auth.ok && auth.scopes.includes('crawl:fetch')) {
@@ -55,9 +65,7 @@ export async function handleCompatRoutes(params: {
   } else if (
     p.startsWith('/compat/tavily/') &&
     typeof bodyObj.api_key === 'string' &&
-    env.CALLER_TOKEN &&
-    env.CALLER_TOKEN.length >= MIN_TOKEN_LENGTH &&
-    sameBytes(bodyObj.api_key.trim(), env.CALLER_TOKEN)
+    isValidSecretMatch(bodyObj.api_key.trim(), env.CALLER_TOKEN, env.MCP_TOKEN)
   ) {
     authorized = true;
   }
@@ -75,6 +83,7 @@ export async function handleCompatRoutes(params: {
       },
       env,
       executeHubFetch,
+      selfHost: url.hostname,
       source: 'compat:firecrawl:scrape',
     });
     if (out.status !== 200) {
@@ -108,6 +117,7 @@ export async function handleCompatRoutes(params: {
       env,
       executeHubFetch,
       selfHost: url.hostname,
+      waitUntilBounded: Boolean(waitUntil) && bodyObj.sync !== true,
     });
     if (bodyObj.sync === true) {
       await jobPromise;
@@ -123,7 +133,15 @@ export async function handleCompatRoutes(params: {
   if (fcCrawlMatch) {
     const crawlId = decodeURIComponent(fcCrawlMatch[1] ?? '');
     if (request.method === 'GET') {
-      const st = await getCrawlJobStatus({ crawlId, metaDb: env.META, bucket: env.ARTIFACTS });
+      const rawOffset = Number(url.searchParams.get('offset') ?? 0);
+      const rawLimit = Number(url.searchParams.get('limit') ?? 25);
+      const st = await getCrawlJobStatus({
+        crawlId,
+        metaDb: env.META,
+        bucket: env.ARTIFACTS,
+        offset: Number.isFinite(rawOffset) ? rawOffset : 0,
+        limit: Number.isFinite(rawLimit) ? rawLimit : 25,
+      });
       if (!st.ok) return Response.json({ success: false, error: st.error }, { status: st.status });
       return Response.json({ success: true, ...st.crawl });
     }
@@ -162,6 +180,7 @@ export async function handleCompatRoutes(params: {
       payload: bodyObj,
       env,
       executeHubFetch,
+      selfHost: url.hostname,
       source: 'compat:tavily:extract',
     });
     return Response.json(

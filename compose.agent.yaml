@@ -1,0 +1,17 @@
+# 1-Command Remote Edge Worker (`docker compose -f compose.agent.yaml up -d`)
+# Joins any Linux, macOS, Windows, NAS, Raspberry Pi, or VPS to your EdgeFetch Hub with zero inbound ports.
+services:
+  edgefetch-agent:
+    image: ghcr.io/bartrumb/edgefetch-agent:latest
+    container_name: edgefetch-agent
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      EDGEFETCH_HUB_URL: ${EDGEFETCH_HUB_URL:?Set EDGEFETCH_HUB_URL (e.g. https://edgefetch.example.com)}
+      EDGEFETCH_HUB_URLS: ${EDGEFETCH_HUB_URLS:-}
+      EDGEFETCH_AGENT_TOKEN: ${EDGEFETCH_AGENT_TOKEN:?Set EDGEFETCH_AGENT_TOKEN (>= 24 characters)}
+      EDGEFETCH_SITE_ID: ${EDGEFETCH_SITE_ID:-node-1}
+      EDGEFETCH_PAUSE_MS: ${EDGEFETCH_PAUSE_MS:-3000}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}

@@ -7,7 +7,7 @@
  * box with full consent-screen protection, PKCE S256 verification, audience (`resource`) binding, and instant grant
  * revocation in `/admin`.
  */
-import { MIN_TOKEN_LENGTH, sameBytes } from './auth';
+import { callerToken, isValidSecretMatch, MIN_TOKEN_LENGTH, sameBytes } from './auth';
 
 export const MCP_SCOPES = ['crawl:read', 'crawl:fetch'] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
@@ -886,12 +886,83 @@ export function parseRequestedScopes(
   const tokens = rawScope
     .split(/\s+/)
     .map((s) => s.trim())
-    .filter(Boolean);
+    .filter((s) => Boolean(s) && s !== 'offline_access');
+  if (tokens.length === 0) return { ok: true, scopes: [...MCP_SCOPES] };
   const invalid = tokens.filter((s) => !(MCP_SCOPES as readonly string[]).includes(s));
   if (invalid.length > 0) {
     return { ok: false, invalid };
   }
   return { ok: true, scopes: [...new Set(tokens as McpScope[])] };
+}
+
+/**
+ * Resolves an OAuth Client ID Metadata Document (CIMD, `draft-ietf-oauth-client-id-metadata-document-00` / MCP SEP-991)
+ * when `client_id` is an `https://` URL hosted on an allowlisted domain (e.g. Claude's published identity).
+ */
+async function resolveCimdClient(params: {
+  clientId: string;
+  selfOrigin: string;
+  redirectAllowlist: readonly string[];
+  store: OAuthStore;
+  now: number;
+}): Promise<OAuthClientRecord | null> {
+  const { clientId, selfOrigin, redirectAllowlist, store, now } = params;
+  if (!clientId.startsWith('https://') || clientId.length > 512) return null;
+  let u: URL;
+  try {
+    u = new URL(clientId);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:' || !u.pathname || u.pathname === '/' || u.hash || u.username || u.password) {
+    return null;
+  }
+  const segments = u.pathname.split('/');
+  if (segments.some((s) => s === '.' || s === '..')) return null;
+  if (u.origin.toLowerCase() === selfOrigin.toLowerCase()) return null;
+  if (!isRedirectHostAllowlisted(u.hostname, redirectAllowlist)) return null;
+
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), 5_000);
+  try {
+    // Note: Cloudflare Workers `workerd` only supports `redirect: 'follow' | 'manual'` (`'error'` throws TypeError).
+    const res = await fetch(clientId, {
+      method: 'GET',
+      headers: { accept: 'application/json', 'user-agent': 'EdgeFetch-OAuth-CIMD/2.0' },
+      redirect: 'manual',
+      signal: abortController.signal,
+    });
+    if (res.status !== 200) return null;
+    const text = await res.text();
+    if (text.length > 32_768) return null;
+    const doc = JSON.parse(text) as {
+      client_id?: unknown;
+      client_name?: unknown;
+      redirect_uris?: unknown;
+    };
+    if (doc.client_id !== clientId) return null;
+    if (!Array.isArray(doc.redirect_uris) || doc.redirect_uris.length === 0 || doc.redirect_uris.length > 10) {
+      return null;
+    }
+    const redirectUris: string[] = [];
+    for (const r of doc.redirect_uris) {
+      if (typeof r !== 'string' || !isValidRedirectUri(r, selfOrigin, redirectAllowlist)) {
+        return null;
+      }
+      redirectUris.push(r);
+    }
+    const clientName =
+      typeof doc.client_name === 'string' && doc.client_name.trim()
+        ? doc.client_name.trim().slice(0, 80)
+        : u.hostname;
+    const record: OAuthClientRecord = { clientId, clientName, redirectUris, createdAt: now };
+    await store.putClient(record);
+    return record;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 export function normalizeScopes(rawScope: string | null | undefined): string[] {
@@ -914,25 +985,68 @@ function normalizeResource(rawResource: string | null | undefined, origin: strin
   }
 }
 
-export function oauthCorsHeaders(request: Request, selfOrigin: string): Record<string, string> {
+export const DEFAULT_TRUSTED_MCP_HOSTS = [
+  'claude.ai',
+  'claude.com',
+  'antigravity.google',
+  'chatgpt.com',
+  'openai.com',
+  'platform.openai.com',
+  'cursor.sh',
+  'cursor.com',
+  'vscode.dev',
+  'insiders.vscode.dev',
+  'windsurf.com',
+  'codeium.com',
+  'modelcontextprotocol.io',
+  'smithery.ai',
+] as const;
+
+export function isTrustedMcpBrowserOrigin(
+  originHeader: string | null,
+  selfOrigin: string,
+  extraAllowedHosts: readonly string[] = [],
+): boolean {
+  if (!originHeader) return true;
+  try {
+    const u = new URL(originHeader);
+    if (u.protocol === 'vscode-webview:') return true;
+    const host = u.hostname.toLowerCase().replace(/\.+$/, '');
+    if (isLoopbackHost(host)) {
+      return u.protocol === 'http:' || u.protocol === 'https:';
+    }
+    if (u.protocol !== 'https:') return false;
+    const selfHost = new URL(selfOrigin).hostname.toLowerCase().replace(/\.+$/, '');
+    if (host === selfHost) return true;
+    const allowlist = [...DEFAULT_TRUSTED_MCP_HOSTS, ...extraAllowedHosts];
+    return allowlist.some((rawAllowed) => {
+      const allowed = rawAllowed.trim().toLowerCase().replace(/^\*\./, '').replace(/^\.+|\.+$/g, '');
+      return Boolean(allowed) && (host === allowed || host.endsWith(`.${allowed}`));
+    });
+  } catch {
+    return false;
+  }
+}
+
+export function oauthCorsHeaders(
+  request: Request,
+  selfOrigin: string,
+  extraAllowedHosts: readonly string[] = [],
+): Record<string, string> {
   const reqOrigin = request.headers.get('origin');
-  if (!reqOrigin) return {};
+  if (!reqOrigin || !isTrustedMcpBrowserOrigin(reqOrigin, selfOrigin, extraAllowedHosts)) return {};
   try {
     const u = new URL(reqOrigin);
-    const host = u.hostname.toLowerCase();
-    const selfHost = new URL(selfOrigin).hostname.toLowerCase();
-    if (isLoopbackHost(host) || host === 'claude.ai' || host.endsWith('.claude.ai') || host === selfHost) {
-      return {
-        'access-control-allow-origin': u.origin,
-        'access-control-allow-methods': 'GET, POST, OPTIONS',
-        'access-control-allow-headers': 'authorization, content-type, accept, mcp-protocol-version',
-        vary: 'Origin',
-      };
-    }
+    const allowOrigin = u.protocol === 'vscode-webview:' ? reqOrigin : u.origin;
+    return {
+      'access-control-allow-origin': allowOrigin,
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': 'authorization, x-api-key, content-type, accept, mcp-protocol-version',
+      vary: 'Origin',
+    };
   } catch {
-    // ignore invalid Origin
+    return {};
   }
-  return {};
 }
 
 function oauthJson(body: unknown, status: number, extraHeaders: Record<string, string> = {}): Response {
@@ -984,8 +1098,8 @@ function renderAuthorizePage(params: {
 
   const authField = params.alreadySignedIn
     ? `<p class="ok-banner">Authenticated via active Admin Portal session.</p>`
-    : `<label for="owner_token">Owner Token (<code>CALLER_TOKEN</code>)</label>
-       <input id="owner_token" name="owner_token" type="password" required autocomplete="current-password" placeholder="Paste your hub caller token to authorize">`;
+    : `<label for="owner_token">EdgeFetch Token (<code>MCP_TOKEN</code> or <code>CRAWLER_TOKEN</code>)</label>
+       <input id="owner_token" name="owner_token" type="password" required autocomplete="current-password" placeholder="Paste your MCP_TOKEN to authorize">`;
 
   const errHtml = params.errorMessage ? `<div class="err">${escapeHtml(params.errorMessage)}</div>` : '';
 
@@ -1106,6 +1220,7 @@ async function parseFormOrJson(request: Request): Promise<Record<string, string>
 export interface OAuthHandlerDeps {
   store: OAuthStore;
   ownerSecret?: string;
+  mcpToken?: string;
   serviceName: string;
   redirectAllowlist?: readonly string[];
   now?: () => number;
@@ -1135,7 +1250,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   if (!isDiscovery && !isOAuth) return null;
 
   const origin = url.origin;
-  const cors = oauthCorsHeaders(request, origin);
+  const cors = oauthCorsHeaders(request, origin, deps.redirectAllowlist);
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: cors });
   }
@@ -1169,9 +1284,12 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         registration_endpoint: `${origin}/oauth/register`,
         revocation_endpoint: `${origin}/oauth/revoke`,
         response_types_supported: ['code'],
+        response_modes_supported: ['query'],
         grant_types_supported: ['authorization_code', 'refresh_token'],
         token_endpoint_auth_methods_supported: ['none'],
         code_challenge_methods_supported: ['S256'],
+        authorization_response_iss_parameter_supported: true,
+        client_id_metadata_document_supported: true,
         scopes_supported: [...MCP_SCOPES],
       },
       200,
@@ -1205,9 +1323,9 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
     }
     const bodyText = await request.text();
     if (bodyText.length > 16_384) return oauthJson({ error: 'invalid_client_metadata' }, 400, cors);
-    let body: { client_name?: unknown; redirect_uris?: unknown };
+    let body: { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
     try {
-      body = JSON.parse(bodyText) as { client_name?: unknown; redirect_uris?: unknown };
+      body = JSON.parse(bodyText) as { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
     } catch {
       return oauthJson({ error: 'invalid_client_metadata', error_description: 'Invalid JSON' }, 400, cors);
     }
@@ -1232,6 +1350,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       typeof body.client_name === 'string' && body.client_name.trim()
         ? body.client_name.trim().slice(0, 80)
         : 'MCP Client';
+    const applicationType = body.application_type === 'native' || body.application_type === 'web' ? body.application_type : undefined;
     const clientId = `mcp_${randomUrlToken(18)}`;
     // Do NOT write an info ring event on anonymous /oauth/register so attackers cannot flush hub_events (H-S1).
     await deps.store.putClient({ clientId, clientName, redirectUris, createdAt: now });
@@ -1244,6 +1363,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
         token_endpoint_auth_method: 'none',
+        ...(applicationType ? { application_type: applicationType } : {}),
       },
       201,
       cors,
@@ -1265,9 +1385,21 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       const scopeCheck = parseRequestedScopes(url.searchParams.get('scope'));
       const resCheck = normalizeResource(url.searchParams.get('resource'), origin);
 
-      const client = clientId ? await deps.store.getClient(clientId) : null;
+      let client = clientId ? await deps.store.getClient(clientId) : null;
+      if (!client && clientId.startsWith('https://')) {
+        client = await resolveCimdClient({
+          clientId,
+          selfOrigin: origin,
+          redirectAllowlist: deps.redirectAllowlist ?? [],
+          store: deps.store,
+          now,
+        });
+      }
       if (!client) {
-        return new Response('Unknown client_id. Register via POST /oauth/register first.', { status: 400, headers: CONSENT_PAGE_HEADERS });
+        return new Response('Unknown client_id. Register via POST /oauth/register or use an allowlisted Client ID Metadata Document URL.', {
+          status: 400,
+          headers: CONSENT_PAGE_HEADERS,
+        });
       }
       if (
         !redirectUri ||
@@ -1280,12 +1412,14 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         const errUrl = new URL(redirectUri);
         errUrl.searchParams.set('error', 'unsupported_response_type');
         if (state) errUrl.searchParams.set('state', state);
+        errUrl.searchParams.set('iss', origin);
         return Response.redirect(errUrl.toString(), 302);
       }
       if (!scopeCheck.ok) {
         const errUrl = new URL(redirectUri);
         errUrl.searchParams.set('error', 'invalid_scope');
         if (state) errUrl.searchParams.set('state', state);
+        errUrl.searchParams.set('iss', origin);
         return Response.redirect(errUrl.toString(), 302);
       }
       const scopes = scopeCheck.scopes;
@@ -1294,12 +1428,14 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         errUrl.searchParams.set('error', 'invalid_request');
         errUrl.searchParams.set('error_description', 'PKCE code_challenge with S256 is required');
         if (state) errUrl.searchParams.set('state', state);
+        errUrl.searchParams.set('iss', origin);
         return Response.redirect(errUrl.toString(), 302);
       }
       if (!resCheck.ok) {
         const errUrl = new URL(redirectUri);
         errUrl.searchParams.set('error', 'invalid_target');
         if (state) errUrl.searchParams.set('state', state);
+        errUrl.searchParams.set('iss', origin);
         return Response.redirect(errUrl.toString(), 302);
       }
 
@@ -1352,6 +1488,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         const denyUrl = new URL(sealed.redirectUri);
         denyUrl.searchParams.set('error', 'access_denied');
         if (sealed.state) denyUrl.searchParams.set('state', sealed.state);
+        denyUrl.searchParams.set('iss', origin);
         return Response.redirect(denyUrl.toString(), 302);
       }
 
@@ -1367,7 +1504,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           });
         }
         const supplied = (form.owner_token ?? '').trim();
-        if (!supplied || !sameBytes(supplied, deps.ownerSecret)) {
+        if (!isValidSecretMatch(supplied, deps.ownerSecret, deps.mcpToken)) {
           const rl = await deps.store.recordAuthFailure(`oauth:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
           if (!rl.allowed) {
             return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
@@ -1384,7 +1521,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
               sealedState: form.sealed ?? '',
               csrf: sealed.csrf,
               alreadySignedIn: false,
-              errorMessage: 'Invalid owner token. Paste your CALLER_TOKEN.',
+              errorMessage: 'Invalid token. Paste your MCP_TOKEN or CRAWLER_TOKEN.',
             }),
             { status: 401, headers: CONSENT_PAGE_HEADERS },
           );
@@ -1408,6 +1545,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       const cb = new URL(sealed.redirectUri);
       cb.searchParams.set('code', rawCode);
       if (sealed.state) cb.searchParams.set('state', sealed.state);
+      cb.searchParams.set('iss', origin);
 
       const headers = new Headers({ location: cb.toString(), 'cache-control': 'no-store' });
       headers.append('set-cookie', formatCookie(CONSENT_CSRF_COOKIE, '', { maxAge: 0, path: '/oauth/authorize', sameSite: 'Lax', secure: isSecure }));
@@ -1485,6 +1623,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1_000),
           refresh_token: refreshToken,
           scope: record.scopes.join(' '),
+          resource: record.resource,
         },
         200,
         cors,
@@ -1529,6 +1668,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1_000),
           refresh_token: nextRefresh,
           scope: rotated.scopes.join(' '),
+          resource: rotated.resource,
         },
         200,
         cors,
@@ -1552,13 +1692,14 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
 }
 
 /**
- * Authenticates a `/mcp` request via EITHER a direct `Bearer <CALLER_TOKEN>` OR a self-hosted OAuth 2.1 access token,
- * returning the RFC 9728 `WWW-Authenticate` header on `401` so Claude Code auto-triggers OAuth discovery.
+ * Authenticates a `/mcp` request via EITHER a direct `Bearer <MCP_TOKEN|CRAWLER_TOKEN>`, `x-api-key: <MCP_TOKEN>`,
+ * OR a self-hosted OAuth 2.1 access token, returning RFC 9728 `WWW-Authenticate` on `401`.
  */
 export async function authorizeMcpRequest(params: {
   request: Request;
   origin: string;
   ownerSecret?: string;
+  mcpToken?: string;
   store: OAuthStore;
   now?: number;
 }): Promise<
@@ -1566,12 +1707,14 @@ export async function authorizeMcpRequest(params: {
   | { ok: false; status: number; wwwAuthenticate: string }
 > {
   const wwwAuthenticate = `Bearer resource_metadata="${params.origin}/.well-known/oauth-protected-resource", scope="${MCP_SCOPES.join(' ')}"`;
-  const m = /^bearer\s+(\S+)$/i.exec(params.request.headers.get('authorization') ?? '');
-  const tok = m ? m[1] : null;
+  const tok = callerToken(params.request);
   if (!tok) return { ok: false, status: 401, wwwAuthenticate };
 
-  if (params.ownerSecret && params.ownerSecret.length >= MIN_TOKEN_LENGTH && sameBytes(tok, params.ownerSecret)) {
+  if (isValidSecretMatch(tok, params.ownerSecret)) {
     return { ok: true, scopes: [...MCP_SCOPES], principal: 'owner_token' };
+  }
+  if (isValidSecretMatch(tok, params.mcpToken)) {
+    return { ok: true, scopes: [...MCP_SCOPES], principal: 'mcp_token' };
   }
 
   const record = await params.store.getAccessToken(await sha256Base64Url(tok), params.now ?? Date.now());

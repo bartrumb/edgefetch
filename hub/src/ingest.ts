@@ -15,7 +15,6 @@ import {
   isValidRetention,
   isValidSha256Hex,
   r2ArtifactKey,
-  r2DerivedKey,
   r2ManifestKey,
   type ArtifactRetention,
   type IngestWorkflowParams,
@@ -324,6 +323,7 @@ export type ArtifactVerificationResult =
       contentSha256: string;
       contentBytes: number;
       alreadyVerified: boolean;
+      uncompressedBytes?: Uint8Array;
     }
   | {
       status: 'expired';
@@ -421,6 +421,7 @@ export async function verifyStoredArtifact(params: {
   expectedContentSha256: string;
   expectedContentBytes?: number;
   maxContentBytes?: number;
+  captureBytesMax?: number;
   now?: number;
 }): Promise<ArtifactVerificationResult> {
   const {
@@ -430,13 +431,14 @@ export async function verifyStoredArtifact(params: {
     expectedContentSha256,
     expectedContentBytes,
     maxContentBytes = MAX_ARTIFACT_CONTENT_BYTES,
+    captureBytesMax = 0,
     now = Date.now(),
   } = params;
 
   const existingRow = await metaDb
-    .prepare('SELECT content_sha256, content_bytes, verified_at FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
+    .prepare('SELECT content_sha256, content_bytes, verified_at, retention FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
     .bind(blobSha256)
-    .first<{ content_sha256: string; content_bytes: number; verified_at: number | null }>();
+    .first<{ content_sha256: string; content_bytes: number; verified_at: number | null; retention?: string | null }>();
 
   if (existingRow && existingRow.verified_at !== null && existingRow.content_sha256 === expectedContentSha256) {
     return {
@@ -448,9 +450,11 @@ export async function verifyStoredArtifact(params: {
     };
   }
 
-  let obj = await bucket.get(r2ArtifactKey('stored', blobSha256));
+  const primaryTier: ArtifactRetention = existingRow?.retention === 'transient' ? 'transient' : 'stored';
+  const fallbackTier: ArtifactRetention = primaryTier === 'stored' ? 'transient' : 'stored';
+  let obj = await bucket.get(r2ArtifactKey(primaryTier, blobSha256));
   if (!obj) {
-    obj = await bucket.get(r2ArtifactKey('transient', blobSha256));
+    obj = await bucket.get(r2ArtifactKey(fallbackTier, blobSha256));
   }
   if (!obj) {
     return { status: 'expired', blobSha256, error: 'artifact_expired' };
@@ -458,15 +462,42 @@ export async function verifyStoredArtifact(params: {
 
   const DigestStreamCtor = (
     crypto as unknown as {
-      DigestStream: new (algo: string) => WritableStream<Uint8Array> & { readonly digest: Promise<ArrayBuffer> };
+      DigestStream?: new (algo: string) => WritableStream<Uint8Array> & { readonly digest: Promise<ArrayBuffer> };
     }
   ).DigestStream;
-  const digestStream = new DigestStreamCtor('SHA-256');
+  let fallbackChunks: Uint8Array[] | null = null;
+  let resolveFallbackDigest: ((buf: ArrayBuffer) => void) | null = null;
+  const digestStream: WritableStream<Uint8Array> & { readonly digest: Promise<ArrayBuffer> } = DigestStreamCtor
+    ? new DigestStreamCtor('SHA-256')
+    : (() => {
+        fallbackChunks = [];
+        const digest = new Promise<ArrayBuffer>((res) => {
+          resolveFallbackDigest = res;
+        });
+        const ws = new WritableStream<Uint8Array>({
+          write(chunk) {
+            fallbackChunks!.push(new Uint8Array(chunk));
+          },
+          async close() {
+            const total = fallbackChunks!.reduce((acc, c) => acc + c.byteLength, 0);
+            const joined = new Uint8Array(total);
+            let off = 0;
+            for (const c of fallbackChunks!) {
+              joined.set(c, off);
+              off += c.byteLength;
+            }
+            fallbackChunks = null;
+            resolveFallbackDigest!(await crypto.subtle.digest('SHA-256', joined));
+          },
+        });
+        return Object.assign(ws, { digest });
+      })();
   const digestWriter = digestStream.getWriter();
   const decompressed = obj.body.pipeThrough(new DecompressionStream('gzip') as unknown as TransformStream<Uint8Array, Uint8Array>);
   const reader = decompressed.getReader();
 
   let totalBytes = 0;
+  let capturedChunks: Uint8Array[] | null = captureBytesMax > 0 ? [] : null;
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -484,6 +515,13 @@ export async function verifyStoredArtifact(params: {
             reason: 'decompression_limit_exceeded',
           });
           return { status: 'rejected', blobSha256, reason: 'decompression_limit_exceeded' };
+        }
+        if (capturedChunks) {
+          if (totalBytes <= captureBytesMax) {
+            capturedChunks.push(new Uint8Array(value));
+          } else {
+            capturedChunks = null;
+          }
         }
         await digestWriter.write(value);
       }
@@ -535,12 +573,23 @@ export async function verifyStoredArtifact(params: {
     .bind(now, totalBytes, now, blobSha256)
     .run();
 
+  let uncompressedBytes: Uint8Array | undefined;
+  if (capturedChunks && capturedChunks.length > 0) {
+    uncompressedBytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const ch of capturedChunks) {
+      uncompressedBytes.set(ch, offset);
+      offset += ch.byteLength;
+    }
+  }
+
   return {
     status: 'verified',
     blobSha256,
     contentSha256: actualSha256,
     contentBytes: totalBytes,
     alreadyVerified: false,
+    ...(uncompressedBytes ? { uncompressedBytes } : {}),
   };
 }
 
@@ -580,6 +629,11 @@ export async function executeIngestPipeline(
 
   const summary = await runStep('load-manifest', async () => {
     const manifest = await loadManifestFromR2(env.ARTIFACTS!, params.manifestKey);
+    const chunks = Math.ceil(manifest.results.length / TRACK_BATCH_CHUNK);
+    const trackedInLoad = chunks === 1;
+    if (trackedInLoad && manifest.results.length > 0) {
+      await trackManifestChunkInMetaD1(env.META!, manifest, manifest.results);
+    }
     const storedMap = new Map<
       string,
       { blobSha256: string; contentSha256: string; contentBytes: number; contentType?: string; url?: string }
@@ -609,117 +663,174 @@ export async function executeIngestPipeline(
     const indexPages = [...pageMap.values()].sort((a, b) => a.pageId.localeCompare(b.pageId));
     return {
       totalItems: manifest.results.length,
-      chunks: Math.ceil(manifest.results.length / TRACK_BATCH_CHUNK),
+      chunks,
+      trackedInLoad,
       collectionId: params.collectionId ?? manifest.collectionId,
       storedArtifacts,
       indexPages,
     };
   });
 
-  for (let c = 0; c < summary.chunks; c++) {
-    await runStep(`track-${c}`, async () => {
-      const manifest = await loadManifestFromR2(env.ARTIFACTS!, params.manifestKey);
-      const slice = manifest.results.slice(c * TRACK_BATCH_CHUNK, (c + 1) * TRACK_BATCH_CHUNK);
-      return await trackManifestChunkInMetaD1(env.META!, manifest, slice);
-    });
+  if (!summary.trackedInLoad) {
+    for (let c = 0; c < summary.chunks; c++) {
+      await runStep(`track-${c}`, async () => {
+        const manifest = await loadManifestFromR2(env.ARTIFACTS!, params.manifestKey);
+        const slice = manifest.results.slice(c * TRACK_BATCH_CHUNK, (c + 1) * TRACK_BATCH_CHUNK);
+        return await trackManifestChunkInMetaD1(env.META!, manifest, slice);
+      });
+    }
   }
 
   let verifiedCount = 0;
   let rejectedCount = 0;
   let expiredCount = 0;
   let derivedCount = 0;
-  const derivedDocsBySha = new Map<string, { documentId: string; title: string }>();
-
-  for (const art of summary.storedArtifacts) {
-    const verifyRes = await runStep(`verify-${art.blobSha256}`, async () => {
-      return await verifyStoredArtifact({
-        bucket: env.ARTIFACTS!,
-        metaDb: env.META!,
-        blobSha256: art.blobSha256,
-        expectedContentSha256: art.contentSha256,
-        expectedContentBytes: art.contentBytes,
-        ...(options.maxContentBytes !== undefined ? { maxContentBytes: options.maxContentBytes } : {}),
-        ...(options.now !== undefined ? { now: options.now } : {}),
-      });
-    });
-
-    if (verifyRes.status === 'verified') {
-      verifiedCount++;
-      if (!derivedDocsBySha.has(verifyRes.contentSha256)) {
-        const deriveRes = await runStep(`derive-${verifyRes.contentSha256}-v${SCRAPE_PIPELINE_VERSION}`, async () => {
-          return await deriveMarkdownDocument({
-            bucket: env.ARTIFACTS!,
-            metaDb: env.META!,
-            blobSha256: art.blobSha256,
-            contentSha256: verifyRes.contentSha256,
-            ...(art.contentType ? { contentType: art.contentType } : {}),
-            ...(art.url ? { baseUrl: art.url } : {}),
-            pipelineVersion: SCRAPE_PIPELINE_VERSION,
-            ...(options.now !== undefined ? { now: options.now } : {}),
-          });
-        });
-        if (deriveRes.status === 'derived' || deriveRes.status === 'cached') {
-          derivedCount++;
-          derivedDocsBySha.set(verifyRes.contentSha256, {
-            documentId: deriveRes.documentId,
-            title: deriveRes.title ?? '',
-          });
-        }
-      }
-    } else if (verifyRes.status === 'rejected') {
-      rejectedCount++;
-      if (options.onArtifactRejected) {
-        await options.onArtifactRejected({
-          jobId: params.jobId,
-          ...(params.siteId ? { siteId: params.siteId } : {}),
-          blobSha256: art.blobSha256,
-          claimedContentSha256: art.contentSha256,
-          reason: verifyRes.reason,
-        });
-      }
-    } else {
-      expiredCount++;
-    }
-  }
-
   let indexedCount = 0;
   let capacityStoppedCount = 0;
   const activeCollection = summary.collectionId && COLLECTION_ID_RE.test(summary.collectionId) ? summary.collectionId : undefined;
+  const shouldIndexSearch = Boolean(env.SEARCH && activeCollection);
 
-  if (env.SEARCH && activeCollection && derivedDocsBySha.size > 0) {
-    const searchIndex = new D1FtsSearchIndex(env.SEARCH, {
-      ...(options.searchWarnBytes !== undefined ? { warnBytes: options.searchWarnBytes } : {}),
-      ...(options.searchMaxBytes !== undefined ? { maxBytes: options.searchMaxBytes } : {}),
-      ...(options.searchInitialSizeBytes !== undefined ? { initialSizeBytes: options.searchInitialSizeBytes } : {}),
-      ...(options.onSearchCapacityWarning ? { onCapacityWarning: options.onSearchCapacityWarning } : {}),
+  const pagesByContentSha = new Map<string, Array<{ pageId: string; url: string; contentSha256: string; fetchedAt: number }>>();
+  for (const pg of summary.indexPages) {
+    const list = pagesByContentSha.get(pg.contentSha256) ?? [];
+    list.push(pg);
+    pagesByContentSha.set(pg.contentSha256, list);
+  }
+
+  const INGEST_ARTIFACT_STEP_BATCH = 8;
+  const INLINE_DERIVE_CAPTURE_BYTES = 2 * 1024 * 1024;
+  const seenDerivedShas = new Set<string>();
+  let stopIndexingForCapacity = false;
+
+  for (let b = 0; b < summary.storedArtifacts.length; b += INGEST_ARTIFACT_STEP_BATCH) {
+    const artifactBatch = summary.storedArtifacts.slice(b, b + INGEST_ARTIFACT_STEP_BATCH);
+    const batchIdx = Math.floor(b / INGEST_ARTIFACT_STEP_BATCH);
+    const batchOut = await runStep(`process-artifacts-${batchIdx}`, async () => {
+      let bVerified = 0;
+      let bRejected = 0;
+      let bExpired = 0;
+      let bDerived = 0;
+      let bIndexed = 0;
+      let bCapStopped = 0;
+      const derivedShas: string[] = [];
+      const rejectedItems: Array<{ blobSha256: string; claimedContentSha256: string; reason: ArtifactRejectionReason }> = [];
+      const searchIndex =
+        shouldIndexSearch && !stopIndexingForCapacity
+          ? new D1FtsSearchIndex(env.SEARCH!, {
+              ...(options.searchWarnBytes !== undefined ? { warnBytes: options.searchWarnBytes } : {}),
+              ...(options.searchMaxBytes !== undefined ? { maxBytes: options.searchMaxBytes } : {}),
+              ...(options.searchInitialSizeBytes !== undefined ? { initialSizeBytes: options.searchInitialSizeBytes } : {}),
+              ...(options.onSearchCapacityWarning ? { onCapacityWarning: options.onSearchCapacityWarning } : {}),
+            })
+          : null;
+
+      for (const art of artifactBatch) {
+        const verifyRes = await verifyStoredArtifact({
+          bucket: env.ARTIFACTS!,
+          metaDb: env.META!,
+          blobSha256: art.blobSha256,
+          expectedContentSha256: art.contentSha256,
+          expectedContentBytes: art.contentBytes,
+          captureBytesMax: INLINE_DERIVE_CAPTURE_BYTES,
+          ...(options.maxContentBytes !== undefined ? { maxContentBytes: options.maxContentBytes } : {}),
+          ...(options.now !== undefined ? { now: options.now } : {}),
+        });
+
+        if (verifyRes.status === 'verified') {
+          bVerified++;
+          if (!seenDerivedShas.has(verifyRes.contentSha256)) {
+            const pagesForSha = pagesByContentSha.get(verifyRes.contentSha256) ?? [];
+            const needMdForSearch = Boolean(searchIndex && pagesForSha.length > 0 && bCapStopped === 0);
+            const deriveRes = await deriveMarkdownDocument({
+              bucket: env.ARTIFACTS!,
+              metaDb: env.META!,
+              blobSha256: art.blobSha256,
+              contentSha256: verifyRes.contentSha256,
+              ...(art.contentType ? { contentType: art.contentType } : {}),
+              ...(art.url ? { baseUrl: art.url } : {}),
+              pipelineVersion: SCRAPE_PIPELINE_VERSION,
+              alreadyVerified: true,
+              ...(verifyRes.uncompressedBytes ? { preloadedBytes: verifyRes.uncompressedBytes } : {}),
+              includeMarkdown: needMdForSearch,
+              ...(options.now !== undefined ? { now: options.now } : {}),
+            });
+            if (deriveRes.status === 'derived' || deriveRes.status === 'cached') {
+              bDerived++;
+              seenDerivedShas.add(verifyRes.contentSha256);
+              derivedShas.push(verifyRes.contentSha256);
+              if (needMdForSearch && searchIndex) {
+                let mdText = deriveRes.markdown;
+                if (mdText === undefined) {
+                  const mdObj = await env.ARTIFACTS!.get(deriveRes.r2Key);
+                  if (mdObj) mdText = await mdObj.text();
+                }
+                if (mdText !== undefined) {
+                  for (const pg of pagesForSha) {
+                    const idxRes = await searchIndex.replacePageChunks({
+                      collectionId: activeCollection!,
+                      documentId: deriveRes.documentId,
+                      pageId: pg.pageId,
+                      url: pg.url,
+                      title: deriveRes.title ?? '',
+                      markdown: mdText,
+                      fetchedAt: pg.fetchedAt,
+                    });
+                    if (idxRes.status === 'indexed') {
+                      bIndexed++;
+                    } else if (idxRes.status === 'capacity_reached') {
+                      bCapStopped++;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } else if (verifyRes.status === 'rejected') {
+          bRejected++;
+          rejectedItems.push({
+            blobSha256: art.blobSha256,
+            claimedContentSha256: art.contentSha256,
+            reason: verifyRes.reason,
+          });
+        } else {
+          bExpired++;
+        }
+      }
+
+      return {
+        bVerified,
+        bRejected,
+        bExpired,
+        bDerived,
+        bIndexed,
+        bCapStopped,
+        derivedShas,
+        rejectedItems,
+      };
     });
 
-    for (const pg of summary.indexPages) {
-      const docInfo = derivedDocsBySha.get(pg.contentSha256);
-      if (!docInfo) continue;
-      const idxRes = await runStep(`index-${activeCollection}-${pg.pageId}`, async () => {
-        const mdKey = r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', pg.contentSha256);
-        const mdObj = await env.ARTIFACTS!.get(mdKey);
-        if (!mdObj) {
-          return { status: 'missing_derived' as const };
-        }
-        const mdText = await mdObj.text();
-        return await searchIndex.replacePageChunks({
-          collectionId: activeCollection,
-          documentId: docInfo.documentId,
-          pageId: pg.pageId,
-          url: pg.url,
-          title: docInfo.title,
-          markdown: mdText,
-          fetchedAt: pg.fetchedAt,
+    for (const s of batchOut.derivedShas) {
+      seenDerivedShas.add(s);
+    }
+    verifiedCount += batchOut.bVerified;
+    rejectedCount += batchOut.bRejected;
+    expiredCount += batchOut.bExpired;
+    derivedCount += batchOut.bDerived;
+    indexedCount += batchOut.bIndexed;
+    capacityStoppedCount += batchOut.bCapStopped;
+    if (batchOut.bCapStopped > 0) {
+      stopIndexingForCapacity = true;
+    }
+    if (options.onArtifactRejected && batchOut.rejectedItems.length > 0) {
+      for (const rj of batchOut.rejectedItems) {
+        await options.onArtifactRejected({
+          jobId: params.jobId,
+          ...(params.siteId ? { siteId: params.siteId } : {}),
+          blobSha256: rj.blobSha256,
+          claimedContentSha256: rj.claimedContentSha256,
+          reason: rj.reason,
         });
-      });
-
-      if (idxRes.status === 'indexed') {
-        indexedCount++;
-      } else if (idxRes.status === 'capacity_reached') {
-        capacityStoppedCount++;
-        break;
       }
     }
   }

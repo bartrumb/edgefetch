@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bartrumb/edgefetch/internal/classify"
@@ -25,7 +26,7 @@ import (
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
 // Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/internal/agent.Version=...".
-var Version = "2.0.6"
+var Version = "2.1.0"
 
 const (
 	DefaultPingInterval          = 30 * time.Second
@@ -83,6 +84,54 @@ type controlMessage struct {
 	Trace     map[string]string       `json:"trace,omitempty"`
 	Artifacts *artifactDispatchPolicy `json:"artifacts,omitempty"`
 	Call      crawl.FetchCall         `json:"call"`
+}
+
+// RunAll maintains persistent outbound WebSocket sessions to every controller in `cfg.HubURLs` (falling back to
+// `cfg.HubURL`), sharing one `*crawl.Crawler` and `*politeness.Registry` across active-active controllers with zero
+// coordination overhead.
+func RunAll(
+	ctx context.Context,
+	cfg Config,
+	crawler *crawl.Crawler,
+	allow func(*url.URL) error,
+	hubTransport http.RoundTripper,
+	log *slog.Logger,
+	rtOpts RuntimeOpts,
+) error {
+	hubs := cfg.HubURLs
+	if len(hubs) == 0 && strings.TrimSpace(cfg.HubURL) != "" {
+		hubs = []string{cfg.HubURL}
+	}
+	if len(hubs) <= 1 {
+		if len(hubs) == 1 {
+			cfg.HubURL = hubs[0]
+		}
+		return Run(ctx, cfg, crawler, allow, hubTransport, log, rtOpts)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(hubs))
+	for _, hURL := range hubs {
+		subCfg := cfg
+		subCfg.HubURL = hURL
+		subCfg.HubURLs = []string{hURL}
+		subLog := log.With(slog.String("controller", hURL))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := Run(ctx, subCfg, crawler, allow, hubTransport, subLog, rtOpts); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Run maintains a persistent outbound WebSocket session to `cfg.HubURL/agent/ws`, automatically reconnecting with
@@ -346,7 +395,7 @@ func handleDispatchWithOpts(
 				return res
 			}
 		}
-		reply = crawl.ExecuteCallWithSink(jobBaseCtx, crawler, call, jobLog, sink)
+		reply = crawl.ExecuteCallWithTrace(jobBaseCtx, crawler, call, hdr, jobLog, sink)
 	}
 
 	// Normal uploads get the full UploadTimeout (default 45s) across retries; only active SIGTERM shutdown drains

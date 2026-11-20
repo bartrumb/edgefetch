@@ -9,7 +9,27 @@
  *  - Only verified documents (`isContentVerifiedInMetaD1 === true`) are indexed into `SEARCH` D1.
  */
 
-import { extractHtmlDocument, lookupCachedScrape, redactPiiText, SCRAPE_PIPELINE_VERSION } from './scrape';
+import { validatePublicHttpsTargetUrl } from './overflow';
+import {
+  cleanPdfMarkdown,
+  decodeHtmlEntities,
+  decodeMarkdownEntities,
+  detectUnsupportedBinaryPayload,
+  extractHtmlDocument,
+  extractPdfTitle,
+  formatDelimitedTableToMarkdown,
+  formatFeedXmlToMarkdown,
+  formatGitPatchToMarkdown,
+  formatIcalendarToMarkdown,
+  formatSourceCodeUrlToMarkdown,
+  formatVcardToMarkdown,
+  lookupCachedScrape,
+  lookupCompanionMdUrl,
+  redactPiiText,
+  sanitizeInlineHtmlInMarkdown,
+  SCRAPE_PIPELINE_VERSION,
+  tryParseJsonPayloadForScrape,
+} from './scrape';
 import { sanitizeFtsQuery, type ArtifactRetention, type OptionalStorageBindings } from './storage';
 
 export const DEFAULT_CHUNK_CHARS = 1_500;
@@ -73,6 +93,28 @@ export interface SearchIndex {
 }
 
 /**
+ * Strips YAML frontmatter (`---\n...\n---`) from origin-served `text/markdown` documents (e.g. Cloudflare "Markdown for
+ * Agents") so extracted chunks don't waste tokens on metadata blocks, while preserving `title:` if present.
+ */
+export function stripYamlFrontmatter(md: string): { title?: string; body: string } {
+  const normalized = md.replace(/\r\n/g, '\n');
+  const m = /^---\n([\s\S]{1,4000}?)\n---(?:\n+|$)/.exec(normalized);
+  if (!m) return { body: normalized };
+  let title: string | undefined;
+  for (const line of m[1]!.split('\n')) {
+    const tm = /^title\s*:\s*(.+)$/i.exec(line.trim());
+    if (tm?.[1]) {
+      title = tm[1].trim().replace(/^(['"])([\s\S]*)\1$/, '$2').trim();
+      break;
+    }
+  }
+  return {
+    ...(title ? { title } : {}),
+    body: normalized.slice(m[0].length),
+  };
+}
+
+/**
  * Splits extracted Markdown or text into ~1,500-character chunks with a 150-character overlap while preserving
  * Markdown `#`..`######` section headings on every chunk.
  */
@@ -87,14 +129,31 @@ export function chunkMarkdownForSearch(
   const safeTarget = Math.min(MAX_CHUNK_CHARS, Math.max(200, Math.floor(targetChars)));
   const safeOverlap = Math.min(Math.floor(safeTarget / 3), Math.max(0, Math.floor(overlapChars)));
 
-  // Split into sections at Markdown headings first so every chunk knows its nearest heading.
+  // Split into sections at Markdown headings first (ignoring `#` comments inside fenced code blocks) so every chunk knows its nearest heading.
   const lines = clean.split('\n');
   const sections: Array<{ heading: string; body: string }> = [];
   let currentHeading = '';
   let buf: string[] = [];
+  let secFenceChar = '';
+  let secFenceLen = 0;
 
   for (const line of lines) {
-    const hm = /^(#{1,6})\s+(.+)$/.exec(line.trim());
+    const trimmedLine = line.trim();
+    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmedLine);
+    if (fenceMatch?.[1]) {
+      const ch = fenceMatch[1][0]!;
+      const len = fenceMatch[1].length;
+      if (!secFenceChar) {
+        secFenceChar = ch;
+        secFenceLen = len;
+      } else if (ch === secFenceChar && len >= secFenceLen && /^[`~]+\s*$/.test(trimmedLine)) {
+        secFenceChar = '';
+        secFenceLen = 0;
+      }
+      buf.push(line);
+      continue;
+    }
+    const hm = !secFenceChar ? /^(#{1,6})\s+(.+)$/.exec(trimmedLine) : null;
     if (hm) {
       if (buf.length > 0) {
         const body = buf.join('\n').trim();
@@ -108,9 +167,48 @@ export function chunkMarkdownForSearch(
     }
   }
   if (buf.length > 0) {
-    const body = buf.join('\n').trim();
+    let body = buf.join('\n').trim();
+    if (secFenceChar && body) {
+      body = `${body}\n${secFenceChar.repeat(secFenceLen)}`;
+    }
     if (body) sections.push({ heading: currentHeading, body });
   }
+
+  const scanFenceState = (
+    segment: string,
+    initialHeader: string,
+  ): { openHeader: string; openChar: string; openLen: number; lastOpenOffsetInSegment: number } => {
+    let openHeader = initialHeader;
+    let openChar = initialHeader ? initialHeader[0]! : '';
+    let openLen = 0;
+    if (initialHeader) {
+      const im = /^(`{3,}|~{3,})/.exec(initialHeader);
+      openLen = im?.[1]?.length ?? 3;
+    }
+    let lastOpenOffsetInSegment = -1;
+    let offset = 0;
+    for (const rawLine of segment.split('\n')) {
+      const trimmed = rawLine.trim();
+      const fm = /^(`{3,}|~{3,})/.exec(trimmed);
+      if (fm?.[1]) {
+        const ch = fm[1][0]!;
+        const len = fm[1].length;
+        if (!openChar) {
+          openChar = ch;
+          openLen = len;
+          openHeader = trimmed;
+          lastOpenOffsetInSegment = offset;
+        } else if (ch === openChar && len >= openLen && /^[`~]+\s*$/.test(trimmed)) {
+          openChar = '';
+          openLen = 0;
+          openHeader = '';
+          lastOpenOffsetInSegment = -1;
+        }
+      }
+      offset += rawLine.length + 1;
+    }
+    return { openHeader, openChar, openLen, lastOpenOffsetInSegment };
+  };
 
   const chunks: MarkdownChunk[] = [];
   for (const sec of sections) {
@@ -121,23 +219,98 @@ export function chunkMarkdownForSearch(
     }
 
     let start = 0;
+    let reopenFenceHeader = '';
     while (start < text.length) {
       let end = Math.min(text.length, start + safeTarget);
       if (end < text.length) {
         const paraBreak = text.lastIndexOf('\n\n', end);
         const lineBreak = text.lastIndexOf('\n', end);
+        const sentenceBreak = text.lastIndexOf('. ', end);
         const spaceBreak = text.lastIndexOf(' ', end);
-        const minSplit = start + Math.floor(safeTarget * 0.6);
-        if (paraBreak >= minSplit) end = paraBreak;
+        const minSplit = start + Math.floor(safeTarget * 0.5);
+        const isMidTableLineBreak =
+          lineBreak > start &&
+          text.slice(text.lastIndexOf('\n', lineBreak - 1) + 1, lineBreak).trimStart().startsWith('|') &&
+          text.slice(lineBreak + 1, text.indexOf('\n', lineBreak + 1) === -1 ? text.length : text.indexOf('\n', lineBreak + 1)).trimStart().startsWith('|');
+        const tableSafeMinSplit = start + Math.floor(safeTarget * 0.25);
+        if (paraBreak >= minSplit || (isMidTableLineBreak && paraBreak >= tableSafeMinSplit)) end = paraBreak;
         else if (lineBreak >= minSplit) end = lineBreak;
+        else if (sentenceBreak >= minSplit) end = sentenceBreak + 1;
         else if (spaceBreak >= minSplit) end = spaceBreak;
+        else {
+          // Avoid splitting a long token/URL mid-character if whitespace follows shortly after `end`.
+          const fwdSpace = text.slice(end, Math.min(text.length, end + 120)).search(/\s/);
+          if (fwdSpace >= 0) end += fwdSpace;
+        }
       }
-      const slice = text.slice(start, end).trim();
+
+      let forcedNextStart: number | undefined;
+      let fenceState = scanFenceState(text.slice(start, end), reopenFenceHeader);
+      if (
+        end < text.length &&
+        !reopenFenceHeader &&
+        fenceState.openChar &&
+        fenceState.lastOpenOffsetInSegment >= Math.floor(safeTarget * 0.2)
+      ) {
+        // Back up right before the opening code fence so normal-sized code blocks stay intact in the next chunk.
+        end = start + fenceState.lastOpenOffsetInSegment;
+        forcedNextStart = end;
+        fenceState = { openHeader: '', openChar: '', openLen: 0, lastOpenOffsetInSegment: -1 };
+      }
+
+      let rawSlice = text.slice(start, end);
+      if (reopenFenceHeader) {
+        rawSlice = `${reopenFenceHeader}\n${rawSlice.replace(/^\n+/, '')}`;
+      }
+      let slice = rawSlice.trim();
+      if (fenceState.openChar) {
+        // Oversized code block that must span multiple chunks: close fence cleanly here and reopen on next chunk.
+        slice = `${slice}\n${fenceState.openChar.repeat(fenceState.openLen)}`;
+        reopenFenceHeader = fenceState.openHeader;
+        forcedNextStart = end;
+      } else {
+        reopenFenceHeader = '';
+      }
+
       if (slice) {
         chunks.push({ ordinal: chunks.length, heading: sec.heading, text: slice });
       }
       if (end >= text.length) break;
-      start = Math.max(start + 1, end - safeOverlap);
+
+      let nextStart: number;
+      if (forcedNextStart !== undefined) {
+        nextStart = forcedNextStart;
+        while (nextStart < text.length && (text[nextStart] === '\n' || text[nextStart] === '\r')) {
+          nextStart++;
+        }
+      } else {
+        nextStart = Math.max(start + 1, end - safeOverlap);
+        if (nextStart > 0 && nextStart < end) {
+          const nearLine = text.indexOf('\n', nextStart);
+          if (nearLine !== -1 && nearLine < end && nearLine - nextStart <= Math.max(24, Math.floor(safeOverlap * 0.6))) {
+            nextStart = nearLine + 1;
+          } else if (!/\s/.test(text[nextStart - 1]!)) {
+            while (nextStart < end && !/\s/.test(text[nextStart]!)) {
+              nextStart++;
+            }
+          }
+        }
+        while (nextStart < text.length && /\s/.test(text[nextStart]!)) {
+          nextStart++;
+        }
+        // Never overlap mid-table rows (`| ... |`) without their table header: advance past headless table continuation rows.
+        if (nextStart < end && text[nextStart] === '|') {
+          const prevNl = text.lastIndexOf('\n', nextStart - 2);
+          const prevLine = text.slice(prevNl + 1, nextStart).trimStart();
+          if (prevLine.startsWith('|')) {
+            nextStart = end;
+            while (nextStart < text.length && (text[nextStart] === '\n' || text[nextStart] === '\r')) {
+              nextStart++;
+            }
+          }
+        }
+      }
+      start = nextStart > start ? nextStart : end;
     }
   }
 
@@ -296,7 +469,7 @@ export class D1FtsSearchIndex implements SearchIndex {
                 c.text,
                 c.fetched_at,
                 bm25(chunks_fts, 5.0, 2.0, 1.0) AS rank,
-                snippet(chunks_fts, 2, '[', ']', '...', 8) AS snippet
+                snippet(chunks_fts, 2, '', '', '...', 32) AS snippet
          FROM chunks_fts
          JOIN chunks c ON c.id = chunks_fts.rowid
          WHERE chunks_fts MATCH ?
@@ -333,6 +506,28 @@ export class D1FtsSearchIndex implements SearchIndex {
       fetchedAt: r.fetched_at,
     }));
   }
+}
+
+function chunkBoilerplateMultiplier(text: string, heading = ''): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0.1;
+  if (/was this (page )?helpful|all rights reserved|cookie preferences|privacy policy\s*\|\s*terms/i.test(trimmed)) {
+    return 0.25;
+  }
+  if (/"@context"\s*:\s*"https?:\/\/schema\.org"/i.test(trimmed)) {
+    return 0.2;
+  }
+  if (/^(?:on this page|table of contents|in this article|related resources|was this page helpful\??)$/i.test(heading.trim())) {
+    return 0.35;
+  }
+  const withoutLinks = trimmed.replace(/\[([^\]]*)\]\([^)]+\)/g, ' ');
+  const linkSyntaxChars = trimmed.length - withoutLinks.length;
+  const linkRatio = linkSyntaxChars / Math.max(1, trimmed.length);
+  const proseChars = withoutLinks.replace(/[#>*_`\-\s|]+/g, ' ').trim().length;
+  if (linkRatio > 0.55 || (trimmed.length > 120 && proseChars < 50)) {
+    return 0.25;
+  }
+  return 1.0;
 }
 
 /** In-memory BM25 chunk scorer used by `POST /v1/extract` to select top `chunksPerSource` passages for a `query`. */
@@ -373,6 +568,7 @@ export function rankChunksInMemory(
       const headingBoost = chunk.heading.toLowerCase().includes(q) ? 1.35 : 1.0;
       rawScore += idf * norm * headingBoost;
     }
+    rawScore *= chunkBoilerplateMultiplier(chunk.text, chunk.heading);
     return { ...chunk, score: Number(rawScore.toFixed(4)) };
   });
 
@@ -387,6 +583,7 @@ export interface ExtractRequestPayload {
   maxAgeMs?: unknown;
   redactPii?: unknown;
   collectionId?: unknown;
+  ephemeral?: boolean;
   target?: unknown;
   site?: unknown;
 }
@@ -404,9 +601,10 @@ export async function executeExtractCall(params: {
     collectionId?: string,
   ) => Promise<{ status: number; via: string; bodyText: string; retryAfter?: string }>;
   source?: string;
+  selfHost?: string;
   now?: number;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
-  const { payload, env, executeHubFetch, source = 'extract', now = Date.now() } = params;
+  const { payload, env, executeHubFetch, source = 'extract', selfHost, now = Date.now() } = params;
   if (!Array.isArray(payload.urls) || payload.urls.length === 0 || payload.urls.length > 20) {
     return {
       status: 400,
@@ -416,20 +614,16 @@ export async function executeExtractCall(params: {
   }
 
   const normalizedUrls: string[] = [];
+  const seenNormalizedUrls = new Set<string>();
   for (const raw of payload.urls) {
-    if (typeof raw !== 'string' || !raw.trim()) {
-      return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_urls', message: 'every URL must be a non-empty string' } };
+    const check = validatePublicHttpsTargetUrl(raw, selfHost);
+    if (!check.ok) {
+      return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_urls', message: check.message } };
     }
-    let u: URL;
-    try {
-      u = new URL(raw.trim());
-    } catch {
-      return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_urls', message: `invalid URL: ${raw}` } };
+    if (!seenNormalizedUrls.has(check.normalized)) {
+      seenNormalizedUrls.add(check.normalized);
+      normalizedUrls.push(check.normalized);
     }
-    if (u.protocol !== 'https:' || (u.port && u.port !== '443') || u.username || u.password) {
-      return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_urls', message: 'only https:// URLs on port 443 are permitted' } };
-    }
-    normalizedUrls.push(u.toString());
   }
 
   const query = typeof payload.query === 'string' ? payload.query.trim() : '';
@@ -473,12 +667,14 @@ export async function executeExtractCall(params: {
         now,
       });
       if (hit) {
+        const strippedCached = stripYamlFrontmatter(hit.markdown);
+        const cleanCachedMd = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(strippedCached.body), u);
         byUrl.set(u, {
           url: u,
           status: hit.status,
           cached: true,
-          ...(hit.title ? { title: hit.title } : {}),
-          markdown: redactPii ? redactPiiText(hit.markdown) : hit.markdown,
+          ...(hit.title || strippedCached.title ? { title: hit.title || strippedCached.title } : {}),
+          markdown: redactPii ? redactPiiText(cleanCachedMd) : cleanCachedMd,
         });
         continue;
       }
@@ -488,25 +684,46 @@ export async function executeExtractCall(params: {
 
   let via = 'cache:r2-d1';
   if (toFetch.length > 0) {
-    const retentionMode: ArtifactRetention | undefined = env.ARTIFACTS && env.META ? 'stored' : env.ARTIFACTS ? 'transient' : undefined;
+    const isEphemeral = Boolean(payload.ephemeral) && !collectionId;
+    const retentionMode: ArtifactRetention | 'off' | undefined = isEphemeral
+      ? 'off'
+      : env.ARTIFACTS && env.META
+        ? 'stored'
+        : env.ARTIFACTS
+          ? 'transient'
+          : undefined;
     const call = {
-      maxSeconds: 60,
+      maxSeconds: isEphemeral ? 35 : 60,
       options: {
         includeBody: true,
         respectRobots: true,
-        discoverLlms: true,
+        discoverLlms: false,
+        concurrency: 4,
+        pauseMs: isEphemeral ? 500 : 800,
+        pauseJitterMs: isEphemeral ? 150 : 200,
       },
-      requests: toFetch.map((item) => ({
-        id: `ext-${item.idx + 1}`,
-        url: item.url,
-        kind: 'scrape',
-        formats: ['markdown'],
-        onlyMainContent: true,
-        discoverLlms: true,
-        redactPii,
-      })),
+      requests: toFetch.map((item) => {
+        const companionMd = lookupCompanionMdUrl(item.url, now);
+        if (companionMd) {
+          return {
+            id: `ext-${item.idx + 1}`,
+            url: companionMd,
+            kind: 'text',
+            accept: 'text/markdown, text/plain;q=0.9',
+          };
+        }
+        return {
+          id: `ext-${item.idx + 1}`,
+          url: item.url,
+          kind: 'scrape',
+          formats: ['markdown'],
+          onlyMainContent: true,
+          discoverLlms: false,
+          redactPii,
+        };
+      }),
     };
-    const fetchOut = await executeHubFetch(target, JSON.stringify(call), site, source, retentionMode, true, collectionId);
+    const fetchOut = await executeHubFetch(target, JSON.stringify(call), site, source, retentionMode, !isEphemeral, collectionId);
     via = fetchOut.via;
     if (fetchOut.status !== 200) {
       let errBody: Record<string, unknown> = { ok: false, error: 'extract_failed' };
@@ -524,6 +741,41 @@ export async function executeExtractCall(params: {
       if (typeof r.id === 'string') resMap.set(r.id, r);
     }
 
+    const missedCompanionItems = toFetch.filter((item) => {
+      if (!lookupCompanionMdUrl(item.url, now)) return false;
+      const r = resMap.get(`ext-${item.idx + 1}`);
+      return !r || r.outcome !== 'ok';
+    });
+    if (missedCompanionItems.length > 0) {
+      const retryCall = {
+        maxSeconds: isEphemeral ? 25 : 45,
+        options: {
+          includeBody: true,
+          respectRobots: true,
+          discoverLlms: false,
+          concurrency: 4,
+          pauseMs: isEphemeral ? 500 : 800,
+          pauseJitterMs: isEphemeral ? 150 : 200,
+        },
+        requests: missedCompanionItems.map((item) => ({
+          id: `ext-${item.idx + 1}`,
+          url: item.url,
+          kind: 'scrape',
+          formats: ['markdown'],
+          onlyMainContent: true,
+          discoverLlms: false,
+          redactPii,
+        })),
+      };
+      const retryOut = await executeHubFetch(target, JSON.stringify(retryCall), site, `${source}:retry-html`, retentionMode, !isEphemeral, collectionId);
+      if (retryOut.status === 200) {
+        const retryParsed = JSON.parse(retryOut.bodyText) as { results?: Array<Record<string, unknown>> };
+        for (const r of retryParsed.results ?? []) {
+          if (typeof r.id === 'string') resMap.set(r.id, r);
+        }
+      }
+    }
+
     for (const item of toFetch) {
       const r = resMap.get(`ext-${item.idx + 1}`);
       if (!r || r.outcome !== 'ok') {
@@ -536,9 +788,87 @@ export async function executeExtractCall(params: {
         continue;
       }
       const rawBodyStr = typeof r.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
-      const extracted = rawBodyStr ? extractHtmlDocument(rawBodyStr, { baseUrl: item.url, onlyMainContent: true, redactPii }) : undefined;
-      const md = (typeof r.markdown === 'string' && r.markdown) || extracted?.markdown || rawBodyStr;
-      const title = (typeof r.title === 'string' && r.title) || extracted?.title;
+      const ctLower = typeof r.contentType === 'string' ? r.contentType.toLowerCase() : '';
+      const isPdf = Boolean(
+        (typeof r.pdfEngine === 'string' && r.pdfEngine) ||
+          ctLower.includes('application/pdf') ||
+          /\.pdf(?:$|[?#])/i.test(item.url) ||
+          /^https?:\/\/(?:export\.)?arxiv\.org\/pdf\/[A-Za-z0-9._/-]+$/i.test(item.url),
+      );
+      const binaryProblem = detectUnsupportedBinaryPayload({
+        rawBody: rawBodyStr,
+        contentType: r.contentType,
+        url: item.url,
+        bodyEncoding: r.bodyEncoding,
+        isPdf,
+      });
+      if (binaryProblem) {
+        byUrl.set(item.url, {
+          url: item.url,
+          status: typeof r.status === 'number' ? r.status : 200,
+          cached: false,
+          failedReason: binaryProblem,
+        });
+        continue;
+      }
+      const isVcard = Boolean(!isPdf && (ctLower.includes('vcard') || /^BEGIN:VCARD\b/im.test(rawBodyStr.trim())));
+      const isHtml = Boolean(
+        !isPdf &&
+          !isVcard &&
+          rawBodyStr &&
+          (ctLower.includes('html') || /^\s*<!doctype\s+html|^\s*<html|<(head|body|main|article)\b/i.test(rawBodyStr)),
+      );
+      const icsDoc = !isPdf && !isVcard && !isHtml && rawBodyStr ? formatIcalendarToMarkdown(rawBodyStr) : null;
+      const feedDoc = !isPdf && !isVcard && !isHtml && !icsDoc && rawBodyStr ? formatFeedXmlToMarkdown(rawBodyStr, item.url) : null;
+      const jsonDoc =
+        !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && rawBodyStr
+          ? tryParseJsonPayloadForScrape(rawBodyStr, r.contentType, item.url)
+          : null;
+      const csvDoc =
+        !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && !jsonDoc && rawBodyStr
+          ? formatDelimitedTableToMarkdown(rawBodyStr, r.contentType, item.url)
+          : null;
+      const patchDoc =
+        !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && !jsonDoc && !csvDoc && rawBodyStr
+          ? formatGitPatchToMarkdown(rawBodyStr, r.contentType, item.url)
+          : null;
+      const srcDoc =
+        !isPdf && !isVcard && !isHtml && !icsDoc && !feedDoc && !jsonDoc && !csvDoc && !patchDoc && rawBodyStr
+          ? formatSourceCodeUrlToMarkdown(rawBodyStr, r.contentType, item.url)
+          : null;
+      const structuredDoc = icsDoc || feedDoc || jsonDoc || csvDoc || patchDoc || srcDoc;
+      let md: string;
+      let title: string | undefined;
+      if (isVcard) {
+        const vc = formatVcardToMarkdown(rawBodyStr);
+        md = redactPii ? redactPiiText(vc.markdown) : vc.markdown;
+        title = vc.title;
+      } else if (structuredDoc) {
+        const cleanStructured = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(structuredDoc.markdown), item.url).trim();
+        md = redactPii ? redactPiiText(cleanStructured) : cleanStructured;
+        title = structuredDoc.title;
+      } else {
+        const extracted = isHtml ? extractHtmlDocument(rawBodyStr, { baseUrl: item.url, onlyMainContent: true, redactPii }) : undefined;
+        const rawCandidateMd =
+          (isHtml ? extracted?.markdown : undefined) ||
+          (typeof r.markdown === 'string' && r.markdown ? r.markdown : '') ||
+          extracted?.markdown ||
+          rawBodyStr;
+        const stripped = stripYamlFrontmatter(rawCandidateMd);
+        let cleaned = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(stripped.body), item.url);
+        if (isPdf) {
+          cleaned = cleanPdfMarkdown(cleaned);
+        }
+        if (redactPii) {
+          cleaned = redactPiiText(cleaned);
+        }
+        md = cleaned.trim();
+        title =
+          extracted?.title ||
+          stripped.title ||
+          (typeof r.title === 'string' && r.title ? decodeHtmlEntities(r.title) : undefined) ||
+          (isPdf && md ? extractPdfTitle(md, item.url) : undefined);
+      }
       byUrl.set(item.url, {
         url: item.url,
         status: typeof r.status === 'number' ? r.status : 200,
@@ -568,7 +898,12 @@ export async function executeExtractCall(params: {
       status: entry.status,
       cached: entry.cached,
       ...(entry.title ? { title: entry.title } : {}),
-      rawContent: query ? selectedChunks.map((c) => (c.heading ? `## ${c.heading}\n${c.text}` : c.text)).join('\n\n...\n\n') : (entry.markdown ?? ''),
+      rawContent: query
+        ? [...selectedChunks]
+            .sort((a, b) => a.ordinal - b.ordinal)
+            .map((c) => (c.heading && !/^#{1,6}\s/.test(c.text.trimStart()) ? `## ${c.heading}\n${c.text}` : c.text))
+            .join('\n\n...\n\n')
+        : (entry.markdown ?? ''),
       chunks: selectedChunks,
     });
   }

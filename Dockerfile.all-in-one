@@ -1,0 +1,58 @@
+# All-in-One Self-Hosted EdgeFetch Container (Fly.io, Railway, Render, Coolify, or standalone Docker).
+# Packages the full TypeScript Hub (`/admin`, OAuth 2.1, 11-tool `/mcp`, `node:sqlite` FTS5, `/data` artifacts, OTLP)
+# together with a local Go `edgefetch` worker + Headless Chromium + Poppler PDF — zero Postgres, zero Redis!
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS go-build
+ARG TARGETARCH
+ARG BUILD_VERSION=2.1.0
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(go env GOARCH)} go build -trimpath \
+      -ldflags="-s -w -X github.com/bartrumb/edgefetch/internal/agent.Version=${BUILD_VERSION}" \
+      -o /out/edgefetch ./cmd/edgefetch
+
+FROM --platform=$BUILDPLATFORM node:24-alpine AS hub-build
+WORKDIR /app/hub
+COPY hub/package.json hub/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY sdk ../sdk
+COPY hub/src ./src
+COPY hub/portable ./portable
+COPY hub/scripts ./scripts
+RUN npm run build:portable
+
+FROM node:24-alpine
+LABEL org.opencontainers.image.title="EdgeFetch All-in-One" \
+      org.opencontainers.image.description="Self-hosted EdgeFetch Hub + Go HTTP/2 + Headless Chromium + SQLite FTS5 in one container" \
+      org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
+      org.opencontainers.image.licenses="MIT"
+
+RUN apk add --no-cache \
+      ca-certificates \
+      chromium \
+      chromium-swiftshader \
+      font-noto \
+      poppler-utils \
+      ttf-freefont \
+      tzdata \
+    && mkdir -p /app/hub/dist /app/hub/migrations /data /tmp /var/cache/fontconfig \
+    && chown -R node:node /app /data \
+    && chmod 1777 /tmp /var/cache/fontconfig
+
+COPY --from=go-build /out/edgefetch /usr/local/bin/edgefetch
+COPY --from=hub-build /app/hub/dist/portable-server.mjs /app/hub/dist/portable-server.mjs
+COPY hub/migrations /app/hub/migrations
+COPY scripts/all-in-one-entrypoint.sh /usr/local/bin/all-in-one-entrypoint.sh
+RUN chmod +x /usr/local/bin/all-in-one-entrypoint.sh
+
+USER node:node
+WORKDIR /app/hub
+ENV PORT=8787 \
+    EDGEFETCH_DATA_DIR=/data \
+    EDGEFETCH_CHROME_BIN=/usr/lib/chromium/chromium \
+    GOMEMLIMIT=384MiB \
+    HOME=/tmp
+EXPOSE 8787
+ENTRYPOINT ["/usr/local/bin/all-in-one-entrypoint.sh"]

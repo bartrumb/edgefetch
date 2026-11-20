@@ -1,6 +1,3 @@
-// Package browser drives a sandboxed headless Chromium instance over the Chrome DevTools Protocol (CDP) using
-// EdgeFetch's zero-dependency RFC 6455 WebSocket client (`internal/ws`), while forcing every browser network socket
-// through an in-process SSRF-guarded loopback CONNECT tunnel (`SSRFProxy`).
 package browser
 
 import (

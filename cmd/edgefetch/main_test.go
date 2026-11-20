@@ -1,7 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,6 +35,9 @@ func TestValidateServerSecurity(t *testing.T) {
 	if err := validateServerSecurity("127.0.0.1:8080", "", false); err != nil {
 		t.Fatalf("expected loopback 127.0.0.1:8080 accepted: %v", err)
 	}
+	if err := validateServerSecurity("localhost:8080", "", false); err != nil {
+		t.Fatalf("expected loopback localhost:8080 accepted: %v", err)
+	}
 	if err := validateServerSecurity("[::1]:8080", "", false); err != nil {
 		t.Fatalf("expected loopback [::1]:8080 accepted: %v", err)
 	}
@@ -35,7 +47,7 @@ func TestValidateServerSecurity(t *testing.T) {
 	}
 }
 
-func TestNewHTTPServerTimeouts(t *testing.T) {
+func TestNewHTTPServerAndTransports(t *testing.T) {
 	srv := newHTTPServer("127.0.0.1:8080", http.NotFoundHandler())
 	if srv.ReadHeaderTimeout != 10*time.Second {
 		t.Fatalf("expected ReadHeaderTimeout=10s, got %s", srv.ReadHeaderTimeout)
@@ -45,5 +57,197 @@ func TestNewHTTPServerTimeouts(t *testing.T) {
 	}
 	if srv.IdleTimeout != 120*time.Second {
 		t.Fatalf("expected IdleTimeout=120s, got %s", srv.IdleTimeout)
+	}
+
+	ct := newCrawlTransport(45*time.Second, 3)
+	if !ct.ForceAttemptHTTP2 || ct.MaxIdleConnsPerHost != 3 || ct.Proxy != nil {
+		t.Fatalf("unexpected crawl transport settings: %+v", ct)
+	}
+	ht := newHubTransport()
+	if !ht.ForceAttemptHTTP2 || ht.MaxIdleConnsPerHost != 2 || ht.Proxy != nil {
+		t.Fatalf("unexpected hub transport settings: %+v", ht)
+	}
+}
+
+func TestFlagEnvAndAgentModeHelpers(t *testing.T) {
+	dir := t.TempDir()
+	haOpts := filepath.Join(dir, "options.json")
+	if err := os.WriteFile(haOpts, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !shouldRunAgent([]string{"--mode=agent"}, "", "") {
+		t.Fatal("expected --mode=agent to select agent mode")
+	}
+	if shouldRunAgent([]string{"--mode=server"}, "agent", haOpts) {
+		t.Fatal("expected explicit --mode=server flag to override env and HAOS file")
+	}
+	if !shouldRunAgent(nil, "AGENT", "") {
+		t.Fatal("expected EDGEFETCH_MODE=agent to select agent mode")
+	}
+	if shouldRunAgent(nil, "server", haOpts) {
+		t.Fatal("expected EDGEFETCH_MODE=server to override HAOS file")
+	}
+	if !shouldRunAgent(nil, "", haOpts) {
+		t.Fatal("expected existing /data/options.json to default to agent mode")
+	}
+	if shouldRunAgent(nil, "", filepath.Join(dir, "missing.json")) {
+		t.Fatal("expected missing options.json to default to server mode")
+	}
+	if m := resolveRuntimeModes([]string{"--mode=hub,agent"}, "", ""); !m.hub || !m.agent || m.server {
+		t.Fatalf("expected hybrid hub+agent modes, got %+v", m)
+	}
+	if m := resolveRuntimeModes(nil, "controller", ""); !m.hub || m.agent {
+		t.Fatalf("expected controller alias to enable hub mode, got %+v", m)
+	}
+
+	if got := firstNonEmpty("  ", "", " alpha ", "beta"); got != "alpha" {
+		t.Fatalf("firstNonEmpty = %q, want alpha", got)
+	}
+	if !hasFlag([]string{"--foo", "--allow-unauthenticated"}, "--allow-unauthenticated") {
+		t.Fatal("hasFlag missed --allow-unauthenticated")
+	}
+	if got := flagValue([]string{"--addr=127.0.0.1:9090"}, "--addr="); got != "127.0.0.1:9090" {
+		t.Fatalf("flagValue = %q", got)
+	}
+	if !isTruthyEnv("YES") || !isTruthyEnv("1") || isTruthyEnv("0") || isTruthyEnv("") {
+		t.Fatal("isTruthyEnv mismatch")
+	}
+	if isLoopbackBind("bad-addr") {
+		t.Fatal("expected invalid bind addr not treated as loopback")
+	}
+	hosts := splitCSV(" docs.example.com, , api.example.com ")
+	if len(hosts) != 2 || hosts[0] != "docs.example.com" || hosts[1] != "api.example.com" {
+		t.Fatalf("splitCSV = %+v", hosts)
+	}
+	if splitCSV("   ") != nil {
+		t.Fatal("expected empty splitCSV to return nil")
+	}
+}
+
+func TestCLIVersionHelpAndDoctor(t *testing.T) {
+	if !isOneShotCLI([]string{"version"}) || !isOneShotCLI([]string{"doctor"}) || !isOneShotCLI([]string{"scrape"}) || !isOneShotCLI([]string{"--help"}) {
+		t.Fatal("expected one-shot CLI args recognized")
+	}
+	if isOneShotCLI([]string{"--mode=server"}) || isOneShotCLI(nil) {
+		t.Fatal("daemon flags must not be intercepted as one-shot CLI")
+	}
+
+	var out, errBuf bytes.Buffer
+	if code := runOneShotCLI(context.Background(), []string{"help"}, &out, &errBuf, cliDeps{}); code != 0 || !strings.Contains(out.String(), "edgefetch scrape") {
+		t.Fatalf("help failed: code=%d out=%q", code, out.String())
+	}
+
+	out.Reset()
+	if code := runOneShotCLI(context.Background(), []string{"version", "--json"}, &out, &errBuf, cliDeps{}); code != 0 {
+		t.Fatalf("version --json failed: code=%d", code)
+	}
+	var ver map[string]any
+	if err := json.Unmarshal(out.Bytes(), &ver); err != nil || ver["version"] == "" {
+		t.Fatalf("unexpected version JSON: %s (%v)", out.String(), err)
+	}
+
+	// Doctor passes with valid wss:// Hub config.
+	out.Reset()
+	errBuf.Reset()
+	code := runOneShotCLI(context.Background(), []string{"doctor", "--json"}, &out, &errBuf, cliDeps{
+		getenv: func(k string) string {
+			switch k {
+			case "EDGEFETCH_HUB_URL":
+				return "wss://edgefetch.example.com/agent/ws"
+			case "EDGEFETCH_AGENT_TOKEN":
+				return "0123456789abcdef0123456789abcdef"
+			case "EDGEFETCH_SITE_ID":
+				return "mac-mini-1"
+			default:
+				return ""
+			}
+		},
+	})
+	if code != 0 {
+		t.Fatalf("doctor --json failed: code=%d stderr=%q out=%s", code, errBuf.String(), out.String())
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil || doc["ok"] != true {
+		t.Fatalf("unexpected doctor JSON: %s (%v)", out.String(), err)
+	}
+
+	// Doctor fails closed when EDGEFETCH_HUB_URL is invalid / short token.
+	out.Reset()
+	errBuf.Reset()
+	badCode := runOneShotCLI(context.Background(), []string{"doctor"}, &out, &errBuf, cliDeps{
+		getenv: func(k string) string {
+			if k == "EDGEFETCH_HUB_URL" {
+				return "http://insecure.example.com"
+			}
+			return ""
+		},
+	})
+	if badCode == 0 {
+		t.Fatal("expected doctor to return non-zero on invalid EDGEFETCH_HUB_URL")
+	}
+}
+
+func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			w.Header().Set("content-type", "text/plain")
+			_, _ = w.Write([]byte("User-agent: *\nDisallow: /private/\n"))
+		case "/llms.txt":
+			w.WriteHeader(http.StatusNotFound)
+		case "/docs/guide":
+			w.Header().Set("content-type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!doctype html><html><head><title>CLI Scrape Guide</title></head><body><main><h1>CLI Scrape Guide</h1><p>Returns <code>Promise&lt;void&gt;</code> over HTTP/2.</p></main></body></html>`))
+		case "/private/secret":
+			w.Header().Set("content-type", "text/html")
+			_, _ = w.Write([]byte(`<html><body>secret</body></html>`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer origin.Close()
+
+	originAddr := origin.Listener.Addr().String()
+	tlsCfg := origin.Client().Transport.(*http.Transport).TLSClientConfig
+	mockTransport := &http.Transport{
+		TLSClientConfig: tlsCfg,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
+		},
+	}
+
+	deps := cliDeps{
+		getenv:    func(string) string { return "" },
+		transport: mockTransport,
+		allow:     func(*url.URL) error { return nil },
+	}
+
+	var out, errBuf bytes.Buffer
+	code := runOneShotCLI(context.Background(), []string{"scrape", "--query=Promise", "--max-chars=200", "https://docs.example.com/docs/guide"}, &out, &errBuf, deps)
+	if code != 0 {
+		t.Fatalf("scrape failed: code=%d stderr=%s", code, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "`Promise<void>`") {
+		t.Fatalf("expected preserved generic type in CLI markdown, got: %q", out.String())
+	}
+
+	// JSON output mode
+	out.Reset()
+	errBuf.Reset()
+	codeJSON := runOneShotCLI(context.Background(), []string{"scrape", "--json", "https://docs.example.com/docs/guide"}, &out, &errBuf, deps)
+	if codeJSON != 0 {
+		t.Fatalf("scrape --json failed: code=%d stderr=%s", codeJSON, errBuf.String())
+	}
+	if !strings.Contains(out.String(), `"outcome": "ok"`) {
+		t.Fatalf("expected outcome ok in JSON output, got: %s", out.String())
+	}
+
+	// Robots.txt disallowed path must return non-zero exit code!
+	out.Reset()
+	errBuf.Reset()
+	codeBlocked := runOneShotCLI(context.Background(), []string{"scrape", "https://docs.example.com/private/secret"}, &out, &errBuf, deps)
+	if codeBlocked == 0 {
+		t.Fatal("expected robots.txt disallowed URL to return non-zero exit code")
 	}
 }

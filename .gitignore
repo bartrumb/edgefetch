@@ -8,4 +8,5 @@ coverage.html
 node_modules/
 .wrangler/
 .dev.vars
+.edgefetch-data/
 dist/

@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { EdgeFetchClient, EdgeFetchError } from '../../sdk/ts/edgefetch-client.ts';
+import { startPortableHub } from '../portable/portable-server.ts';
 import { ACTIVITY_SQLITE_SCHEMA, buildCrawlActivityEvents, createSqliteActivityStore } from '../src/activity-log.ts';
 import { handleAdminRoute } from '../src/admin.ts';
 import {
@@ -16,7 +18,7 @@ import {
   type HubSocketLike,
 } from '../src/agent-hub.ts';
 import { authorizeAgent } from '../src/auth.ts';
-import { handleMcpRequest, type McpServerDeps } from '../src/mcp.ts';
+import { defaultTextAccept, handleMcpRequest, inferKindForUrl, type McpServerDeps } from '../src/mcp.ts';
 import {
   ADMIN_COOKIE_NAME,
   OAUTH_SQLITE_SCHEMA,
@@ -29,12 +31,25 @@ import {
   type SqlStorageLike,
 } from '../src/oauth.ts';
 import {
+  buildCrawlChildSpans,
+  createRequestTraceContext,
+  flushOtlpSpans,
+  parseOtlpHeaders,
+  parseTraceparent,
+  resolveOtlpTracesUrl,
+} from '../src/otel.ts';
+import {
   cloudflareOverflowFetch,
   encodeBodyForWire,
   isRobotsAllowed,
   parseOverflowRobotsTxt,
   validateCallRobotsPolicy,
 } from '../src/overflow.ts';
+import {
+  extractHtmlDocument,
+  formatJupyterNotebookToMarkdown,
+  formatOpenApiSpecToMarkdown,
+} from '../src/scrape.ts';
 import {
   isValidSha256Hex,
   r2ArtifactKey,
@@ -1138,6 +1153,9 @@ test('V2-6: executeSearchCall prioritizes edge-map on site: domains, fuses Serpe
   );
   assert.deepEqual(extractEdgeMapDomains('site:velotricbike.com Discover 2 manual', []), {
     domains: ['velotricbike.com'],
+    siteDomains: ['velotricbike.com'],
+    siteUrls: ['https://velotricbike.com/'],
+    sitePrefixes: [],
     filterTerms: 'Discover 2 manual',
   });
 
@@ -1258,4 +1276,212 @@ test('V2-6: executeSearchCall prioritizes edge-map on site: domains, fuses Serpe
   assert.equal(fallbackOut.status, 200);
   assert.equal(tavilyCalledWithBasic, true);
   assert.equal((fallbackOut.body.results as Array<{ url: string }>)[0]?.url, 'https://www.bafang-e.com/manuals/m620.pdf');
+});
+
+test('V2-7: HTML code-stash preserves <T> generics, Jupyter .ipynb & OpenAPI 3.1 converters, and foreign locale dedup', async () => {
+  // 1. HTML code-stash preserves angle-bracket generics, C headers, and nested backticks!
+  const extracted = extractHtmlDocument(
+    `<html><head><title>Generics</title></head><body><main>
+      <h1>Generics</h1>
+      <p>Returns <code>Promise&lt;Array&lt;number&gt;&gt;</code> or <code>use \`tick\` span</code>.</p>
+      <pre><code class="language-c">#include &lt;stdio.h&gt;
+int main(void) { return 0; }</code></pre>
+    </main></body></html>`,
+    { baseUrl: 'https://docs.example.com/generics', onlyMainContent: true },
+  );
+  assert.match(extracted.markdown, /`Promise<Array<number>>`/);
+  assert.match(extracted.markdown, /`` use `tick` span ``/);
+  assert.match(extracted.markdown, /```c\n#include <stdio\.h>/);
+
+  // 2. Jupyter Notebook (.ipynb) converter
+  const nbMd = formatJupyterNotebookToMarkdown(
+    {
+      nbformat: 4,
+      metadata: { kernelspec: { language: 'python', display_name: 'Python 3' } },
+      cells: [
+        { cell_type: 'markdown', source: ['# Quickstart Notebook\n', 'Run a cell below.'] },
+        {
+          cell_type: 'code',
+          execution_count: 1,
+          source: ['print(6 * 7)'],
+          outputs: [{ output_type: 'stream', name: 'stdout', text: ['42\n'] }],
+        },
+      ],
+    },
+    'https://raw.githubusercontent.com/org/repo/main/demo.ipynb',
+  );
+  assert.ok(nbMd?.markdown.includes('```python'));
+  assert.ok(nbMd?.markdown.includes('42'));
+
+  // 3. OpenAPI 3.1 converter
+  const oaMd = formatOpenApiSpecToMarkdown({
+    openapi: '3.1.0',
+    info: { title: 'EdgeFetch Widget API', version: '2.1.0', description: 'Public REST API' },
+    paths: {
+      '/v1/widgets': {
+        get: { summary: 'List widgets', responses: { '200': { description: 'OK' } } },
+      },
+    },
+  });
+  assert.ok(oaMd?.markdown.includes('EdgeFetch Widget API'));
+  assert.ok(oaMd?.markdown.includes('GET /v1/widgets'));
+
+  // 4. URL kind & Accept inference
+  assert.equal(inferKindForUrl('https://raw.githubusercontent.com/org/repo/main/demo.ipynb'), 'json');
+  assert.equal(inferKindForUrl('https://raw.githubusercontent.com/org/repo/main/main.go'), 'text');
+  assert.equal(defaultTextAccept('https://raw.githubusercontent.com/org/repo/main/main.go'), 'text/plain');
+
+  // 5. Foreign locale mirror demotion/deduplication in search when English query has enough canonical results
+  const locSearch = await executeSearchCall({
+    payload: { query: 'TaskGroup asyncio docs', max_results: 2 },
+    env: { SERPER_API_KEY: 'serper_test_key' },
+    executeHubFetch: async () => ({ status: 200, via: 'noop', bodyText: '{"results":[]}' }),
+    providerFetchFn: async () =>
+      Response.json({
+        organic: [
+          { link: 'https://docs.python.org/uk/3/library/asyncio-task.html', title: 'Корутини і завдання', snippet: 'TaskGroup' },
+          { link: 'https://docs.python.org/ja/3/library/asyncio-task.html', title: 'コルーチンとタスク', snippet: 'TaskGroup' },
+          { link: 'https://docs.python.org/3/library/asyncio-task.html', title: 'Coroutines and Tasks', snippet: 'TaskGroup docs' },
+          { link: 'https://docs.python.org/3/library/asyncio-exceptions.html', title: 'Exceptions', snippet: 'ExceptionGroup' },
+        ],
+      }),
+  });
+  const locUrls = (locSearch.body.results as Array<{ url: string }>).map((r) => r.url);
+  assert.deepEqual(locUrls, [
+    'https://docs.python.org/3/library/asyncio-task.html',
+    'https://docs.python.org/3/library/asyncio-exceptions.html',
+  ]);
+});
+
+test('V2-8: Vendor-agnostic OTLP/HTTP exporter, W3C traceparent stitch, and EdgeFetchClient multi-hub HA failover', async () => {
+  // 1. W3C traceparent parsing & header propagation
+  const upstreamTp = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+  const parsedTp = parseTraceparent(upstreamTp);
+  assert.ok(parsedTp);
+  assert.equal(parsedTp.traceId, '4bf92f3577b34da6a3ce929d0e0e4736');
+  assert.equal(parsedTp.parentSpanId, '00f067aa0ba902b7');
+  assert.equal(parsedTp.sampled, true);
+  assert.equal(parseTraceparent('00-00000000000000000000000000000000-00f067aa0ba902b7-01'), null);
+
+  const reqCtx = createRequestTraceContext(new Request('https://hub.example.com/v1/scrape', { headers: { traceparent: upstreamTp } }));
+  assert.equal(reqCtx.headers['x-trace-id'], '4bf92f3577b34da6a3ce929d0e0e4736');
+  assert.match(reqCtx.headers.traceparent ?? '', /^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-01$/);
+
+  // 2. OTLP endpoint normalization, header parsing, and JSON trace export
+  assert.equal(resolveOtlpTracesUrl('https://api.honeycomb.io'), 'https://api.honeycomb.io/v1/traces');
+  assert.equal(resolveOtlpTracesUrl('https://otlp.grafana.net/otlp/'), 'https://otlp.grafana.net/otlp/v1/traces');
+  assert.deepEqual(parseOtlpHeaders('Authorization=Bearer%20secret, x-honeycomb-team=team_123'), {
+    Authorization: 'Bearer secret',
+    'x-honeycomb-team': 'team_123',
+  });
+
+  const childSpans = buildCrawlChildSpans({
+    traceId: reqCtx.context.traceId,
+    parentSpanId: reqCtx.context.spanId,
+    via: 'agent:mac-mini-1',
+    endTimeMs: 1_700_000_000_500,
+    replyText: JSON.stringify({
+      results: [
+        {
+          id: '1',
+          url: 'https://docs.example.com/guide?token=secret',
+          kind: 'scrape',
+          status: 200,
+          outcome: 'ok',
+          durationMs: 120,
+          timing: { dnsMs: 5, connectMs: 15, tlsMs: 25, ttfbMs: 60, reused: true, proto: 'HTTP/2.0' },
+        },
+      ],
+    }),
+  });
+  assert.equal(childSpans.length, 1);
+  assert.equal(childSpans[0]?.attributes?.['url.full'], 'https://docs.example.com/guide');
+
+  let capturedOtlpUrl = '';
+  let capturedOtlpHeaders: Record<string, string> = {};
+  let capturedOtlpBody = '';
+  const okFlush = await flushOtlpSpans({
+    env: {
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'https://otel.example.com',
+      OTEL_EXPORTER_OTLP_HEADERS: 'Authorization=Bearer%20otlp_tok',
+      OTEL_SERVICE_NAME: 'edgefetch-test-hub',
+    },
+    spans: childSpans,
+    fetchFn: async (input, init) => {
+      capturedOtlpUrl = String(input);
+      capturedOtlpHeaders = Object.fromEntries(new Headers(init?.headers).entries());
+      capturedOtlpBody = String(init?.body ?? '');
+      return new Response('{}', { status: 200 });
+    },
+  });
+  assert.equal(okFlush, true);
+  assert.equal(capturedOtlpUrl, 'https://otel.example.com/v1/traces');
+  assert.equal(capturedOtlpHeaders.authorization, 'Bearer otlp_tok');
+  assert.match(capturedOtlpBody, /"edgefetch-test-hub"/);
+  assert.match(capturedOtlpBody, /"4bf92f3577b34da6a3ce929d0e0e4736"/);
+
+  // 3. EdgeFetchClient multi-controller HA failover (503 on primary -> 200 on standby Go hub)
+  const hitUrls: string[] = [];
+  const haClient = new EdgeFetchClient({
+    baseUrls: ['https://primary-hub.example.com', 'https://standby-go-hub.tailnet.ts.net'],
+    token: 'caller-token-0123456789abcdef',
+    fetchFn: async (input) => {
+      const u = String(input);
+      hitUrls.push(u);
+      if (u.startsWith('https://primary-hub.example.com')) {
+        return Response.json({ error: 'hub_unavailable', message: 'DO shard evicting' }, { status: 503 });
+      }
+      return Response.json({ ok: true, via: 'go-standby-hub', markdown: '# Standby OK' }, { status: 200 });
+    },
+  });
+  const haOut = await haClient.scrape({ url: 'https://example.com' });
+  assert.equal(haOut.via, 'go-standby-hub');
+  assert.equal(hitUrls.length, 2);
+});
+
+test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1/capabilities, and /mcp over node:sqlite + fs artifacts', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'ef-portable-test-'));
+  const tok = 'portable-owner-secret-0123456789ab';
+  const agentTok = 'portable-agent-secret-0123456789ab';
+  const started = await startPortableHub({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir,
+    migrationsDir: resolve('migrations'),
+    envOverrides: {
+      CALLER_TOKEN: tok,
+      AGENT_TOKEN: agentTok,
+    },
+  });
+  try {
+    const base = `http://127.0.0.1:${started.port}`;
+    const health = await fetch(`${base}/health`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { ok: true });
+
+    const capsRes = await fetch(`${base}/v1/capabilities`, {
+      headers: { authorization: `Bearer ${tok}` },
+    });
+    assert.equal(capsRes.status, 200);
+    const caps = (await capsRes.json()) as { capabilities: Record<string, boolean> };
+    assert.equal(caps.capabilities.artifacts, true);
+    assert.equal(caps.capabilities.tracking, true);
+    assert.equal(caps.capabilities.search, true);
+
+    const adminPage = await fetch(`${base}/admin`);
+    assert.equal(adminPage.status, 200);
+    assert.match(await adminPage.text(), /EdgeFetch Hub/);
+
+    const mcpTools = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    assert.equal(mcpTools.status, 200);
+    const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
+    assert.equal(mcpJson.result.tools.length, 11);
+  } finally {
+    await started.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
 });

@@ -1,5 +1,5 @@
 /**
- * Zero-dependency TypeScript client SDK for EdgeFetch v2 (`sdk/ts/edgefetch-client.ts`).
+ * Zero-dependency TypeScript client SDK for EdgeFetch v2.1 (`sdk/ts/edgefetch-client.ts`).
  * Runs unmodified in Cloudflare Workers, Node.js >= 20, Deno, Bun, and browsers using standard `fetch`.
  */
 
@@ -17,7 +17,10 @@ export type ScrapeFormat =
   | { type: 'json'; schema: Record<string, unknown> };
 
 export interface EdgeFetchClientOptions {
-  baseUrl: string;
+  /** Single Hub URL (e.g. `https://edgefetch.example.com`). */
+  baseUrl?: string;
+  /** Ordered list of Hub URLs for active-standby HA failover (e.g. `[cloudflareHub, tailscaleGoHub]`). */
+  baseUrls?: string[];
   token: string;
   fetchFn?: typeof fetch;
 }
@@ -26,8 +29,14 @@ export interface ScrapeParams {
   url: string;
   formats?: ScrapeFormat[];
   onlyMainContent?: boolean;
+  includeTags?: string[];
+  excludeTags?: string[];
   discoverLlmsTxt?: boolean;
   maxAgeMs?: number;
+  noCache?: boolean;
+  ephemeral?: boolean;
+  maxChars?: number;
+  ocr?: boolean;
   renderMode?: 'off' | 'auto' | 'always';
   waitForMs?: number;
   waitSelector?: string;
@@ -42,8 +51,13 @@ export interface ScrapeParams {
 export interface ExtractParams {
   urls: string[];
   query?: string;
+  mode?: 'chunks' | 'full';
   chunksPerSource?: number;
+  maxChars?: number;
   maxAgeMs?: number;
+  noCache?: boolean;
+  ephemeral?: boolean;
+  ocr?: boolean;
   redactPii?: boolean;
   collectionId?: string;
   target?: 'auto' | 'agent' | 'container';
@@ -81,6 +95,8 @@ export interface SearchParams {
   include_domains?: string[];
   exclude_domains?: string[];
   time_range?: 'day' | 'week' | 'month' | 'year';
+  max_age_ms?: number;
+  include_answer?: boolean;
   include_raw_content?: boolean;
   chunks_per_source?: number;
   collections?: string[];
@@ -100,6 +116,7 @@ export interface InteractParams {
   sessionId?: string;
   keepSession?: boolean;
   closeSession?: boolean;
+  transcript?: boolean;
   actions?: InteractAction[];
   formats?: Array<'markdown' | 'html' | 'screenshot'>;
   waitForMs?: number;
@@ -119,35 +136,67 @@ export class EdgeFetchError extends Error {
 }
 
 export class EdgeFetchClient {
-  private readonly baseUrl: string;
+  private readonly baseUrls: string[];
   private readonly token: string;
   private readonly fetchFn: typeof fetch;
 
   constructor(options: EdgeFetchClientOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/+$/, '');
+    const urls = [
+      ...(options.baseUrls ?? []),
+      ...(options.baseUrl ? [options.baseUrl] : []),
+    ]
+      .map((u) => u.trim().replace(/\/+$/, ''))
+      .filter(Boolean);
+    if (urls.length === 0) {
+      throw new Error('EdgeFetchClient requires baseUrl or non-empty baseUrls');
+    }
+    this.baseUrls = [...new Set(urls)];
     this.token = options.token;
     this.fetchFn = options.fetchFn ?? fetch;
   }
 
   private async requestJson<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const res = await this.fetchFn(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        accept: 'application/json',
-        ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
-      },
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-    });
-    const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!res.ok) {
-      throw new EdgeFetchError(
-        res.status,
-        typeof json.error === 'string' ? json.error : `http_${res.status}`,
-        typeof json.message === 'string' ? json.message : `EdgeFetch HTTP ${res.status}`,
-      );
+    let lastError: unknown;
+    const serializedBody = body !== undefined ? JSON.stringify(body) : undefined;
+
+    for (let idx = 0; idx < this.baseUrls.length; idx++) {
+      const origin = this.baseUrls[idx]!;
+      const hasMore = idx + 1 < this.baseUrls.length;
+      let res: Response;
+      try {
+        res = await this.fetchFn(`${origin}${path}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${this.token}`,
+            accept: 'application/json',
+            ...(serializedBody !== undefined ? { 'content-type': 'application/json' } : {}),
+          },
+          ...(serializedBody !== undefined ? { body: serializedBody } : {}),
+        });
+      } catch (networkErr) {
+        lastError = networkErr;
+        if (hasMore) continue;
+        throw networkErr;
+      }
+
+      const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!res.ok) {
+        const efErr = new EdgeFetchError(
+          res.status,
+          typeof json.error === 'string' ? json.error : `http_${res.status}`,
+          typeof json.message === 'string' ? json.message : `EdgeFetch HTTP ${res.status}`,
+        );
+        // Fail over to next standby controller on 502 / 503 / 504 gateway/hub unavailability.
+        if (hasMore && (res.status === 502 || res.status === 503 || res.status === 504)) {
+          lastError = efErr;
+          continue;
+        }
+        throw efErr;
+      }
+      return json as T;
     }
-    return json as T;
+
+    throw lastError instanceof Error ? lastError : new Error('All EdgeFetch Hub endpoints failed');
   }
 
   capabilities(): Promise<Record<string, unknown>> {
@@ -186,7 +235,10 @@ export class EdgeFetchClient {
     return this.requestJson('POST', '/v1/interact', params);
   }
 
-  readArtifact(blobSha256: string, offset = 0, limit = 65_536): Promise<Record<string, unknown>> {
-    return this.requestJson('GET', `/v1/artifacts/${encodeURIComponent(blobSha256)}?format=json&offset=${offset}&limit=${limit}`);
+  readArtifact(blobSha256: string, offset = 0, limit = 65_536, format: 'raw' | 'markdown' = 'raw'): Promise<Record<string, unknown>> {
+    return this.requestJson(
+      'GET',
+      `/v1/artifacts/${encodeURIComponent(blobSha256)}?format=${format === 'markdown' ? 'markdown' : 'json'}&offset=${offset}&limit=${limit}`,
+    );
   }
 }

@@ -65,6 +65,72 @@ func TestSSRFProxyBlocksPlainHTTPNon443AndPrivateLANIPs(t *testing.T) {
 	if statusLAN != http.StatusBadGateway {
 		t.Fatalf("expected 502 when RejectNonPublicPeer blocks LAN IP, got %d", statusLAN)
 	}
+
+	// 5. Malformed CONNECT authority without port -> 400 Bad Request
+	statusMalformed := rawConnectStatus(t, proxy.Addr(), "missing-port")
+	if statusMalformed != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed CONNECT authority, got %d", statusMalformed)
+	}
+
+	// 6. Close() is idempotent
+	if err := proxy.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := proxy.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestSSRFProxyBidirectionalConnectRelay(t *testing.T) {
+	upstreamLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstreamLn.Close()
+
+	go func() {
+		conn, acceptErr := upstreamLn.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4)
+		if _, rErr := conn.Read(buf); rErr == nil && string(buf) == "PING" {
+			_, _ = conn.Write([]byte("PONG"))
+		}
+	}()
+
+	proxy, err := NewSSRFProxy(func(u *url.URL) error {
+		if u.Hostname() != "allowed.example.com" {
+			return errors.New("unexpected host")
+		}
+		return nil
+	}, func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upstreamLn.Addr().String())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	conn, err := net.DialTimeout("tcp", proxy.Addr(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = fmt.Fprintf(conn, "CONNECT allowed.example.com:443 HTTP/1.1\r\nHost: allowed.example.com:443\r\n\r\n")
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT failed: status=%v err=%v", resp, err)
+	}
+	if _, err := conn.Write([]byte("PING")); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 4)
+	if _, err := br.Read(reply); err != nil || string(reply) != "PONG" {
+		t.Fatalf("expected tunnel PONG, got %q (%v)", string(reply), err)
+	}
 }
 
 func rawConnectStatus(t *testing.T, proxyAddr, target string) int {

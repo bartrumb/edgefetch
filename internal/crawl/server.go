@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bartrumb/edgefetch/internal/classify"
+	"github.com/bartrumb/edgefetch/internal/otel"
 	"github.com/bartrumb/edgefetch/internal/politeness"
 )
 
@@ -172,11 +173,17 @@ func ValidateCallWithCrawler(c *Crawler, call FetchCall, allow func(*url.URL) er
 
 // ExecuteCall enforces `MaxSeconds`, runs `c.RunLogged`, and logs batch summary metrics.
 func ExecuteCall(ctx context.Context, c *Crawler, call FetchCall, log *slog.Logger) FetchReply {
-	return ExecuteCallWithSink(ctx, c, call, log, nil)
+	return ExecuteCallWithTrace(ctx, c, call, nil, log, nil)
 }
 
 // ExecuteCallWithSink enforces `MaxSeconds`, runs `c.RunWithSink`, and logs batch summary metrics.
 func ExecuteCallWithSink(ctx context.Context, c *Crawler, call FetchCall, log *slog.Logger, sink ResultSink) FetchReply {
+	return ExecuteCallWithTrace(ctx, c, call, nil, log, sink)
+}
+
+// ExecuteCallWithTrace enforces `MaxSeconds`, executes `call`, logs batch summary metrics, and emits stitched W3C OTLP
+// spans when `c` has an OpenTelemetry exporter configured.
+func ExecuteCallWithTrace(ctx context.Context, c *Crawler, call FetchCall, traceHdr http.Header, log *slog.Logger, sink ResultSink) FetchReply {
 	secs := call.MaxSeconds
 	if secs <= 0 {
 		secs = DefaultMaxSeconds
@@ -189,14 +196,68 @@ func ExecuteCallWithSink(ctx context.Context, c *Crawler, call FetchCall, log *s
 
 	started := time.Now()
 	results := c.RunWithSink(cctx, call.Requests, call.Options, log, sink)
+	ended := time.Now()
 	reply := FetchReply{
 		Results:    results,
 		Summary:    Summarize(results),
-		DurationMs: time.Since(started).Milliseconds(),
+		DurationMs: ended.Sub(started).Milliseconds(),
 	}
 	log.Info("call",
 		slog.Int("requests", len(call.Requests)), slog.Int64("duration_ms", reply.DurationMs),
 		slog.Any("by_outcome", reply.Summary.ByOutcome), slog.Any("by_status", reply.Summary.ByStatus))
+
+	if c != nil && c.otelExp != nil {
+		tc := otel.ExtractOrNew(traceHdr)
+		if tc.Sampled {
+			c.otelExp.Record(otel.Span{
+				TraceID:      tc.TraceID,
+				SpanID:       tc.SpanID,
+				ParentSpanID: tc.ParentSpanID,
+				Name:         "edgefetch.go.batch",
+				Kind:         2,
+				Start:        started,
+				End:          ended,
+				StatusOK:     reply.Summary.ByOutcome[string(classify.OutcomeError)] == 0,
+				Attributes: map[string]any{
+					"crawler.requests":    len(call.Requests),
+					"crawler.duration_ms": reply.DurationMs,
+				},
+			})
+			for _, r := range results {
+				dur := time.Duration(r.DurationMs) * time.Millisecond
+				if dur <= 0 {
+					dur = time.Millisecond
+				}
+				safeURL := r.URL
+				if u, err := url.Parse(r.URL); err == nil && u.Host != "" {
+					safeURL = u.Scheme + "://" + u.Host + u.Path
+				}
+				c.otelExp.Record(otel.Span{
+					TraceID:      tc.TraceID,
+					SpanID:       otel.RandomHex(8),
+					ParentSpanID: tc.SpanID,
+					Name:         "edgefetch.go.fetch." + string(r.Kind),
+					Kind:         3,
+					Start:        ended.Add(-dur),
+					End:          ended,
+					StatusOK:     r.Outcome == classify.OutcomeOK || r.Outcome == classify.OutcomeGone || r.Outcome == classify.OutcomeSkip,
+					ErrorMessage: r.Problem,
+					Attributes: map[string]any{
+						"url.full":                  safeURL,
+						"http.response.status_code": r.Status,
+						"crawler.outcome":           string(r.Outcome),
+						"crawler.rendered":          r.Rendered,
+						"net.dns_ms":                r.Timing.DNSMs,
+						"net.connect_ms":            r.Timing.ConnectMs,
+						"net.tls_ms":                r.Timing.TLSMs,
+						"net.ttfb_ms":               r.Timing.TTFBMs,
+						"net.conn_reused":           r.Timing.Reused,
+						"network.protocol.name":     r.Timing.Proto,
+					},
+				})
+			}
+		}
+	}
 	return reply
 }
 
@@ -254,7 +315,7 @@ func NewAuthenticatedHandler(c *Crawler, allow func(*url.URL) error, bearerToken
 			writeHTTPError(w, http.StatusBadRequest, code, msg)
 			return
 		}
-		reply := ExecuteCall(r.Context(), c, call, CallLogger(c.Logger(), r.Header))
+		reply := ExecuteCallWithTrace(r.Context(), c, call, r.Header, CallLogger(c.Logger(), r.Header), nil)
 		writeJSON(w, http.StatusOK, reply)
 	})
 	return mux
@@ -290,12 +351,21 @@ var traceHeaderFields = []struct{ header, field string }{
 
 var validTraceToken = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 
-// CallLogger attaches sanitized distributed trace identifiers onto `base` (blocking log-injection control characters).
+// CallLogger attaches sanitized distributed trace identifiers (including W3C `traceparent`) onto `base`.
 func CallLogger(base *slog.Logger, h http.Header) *slog.Logger {
 	var attrs []any
+	hasTraceID := false
 	for _, t := range traceHeaderFields {
 		if v := h.Get(t.header); validTraceToken.MatchString(v) {
+			if t.field == "trace_id" {
+				hasTraceID = true
+			}
 			attrs = append(attrs, slog.String(t.field, v))
+		}
+	}
+	if !hasTraceID && h != nil {
+		if tc, ok := otel.ParseTraceparent(h.Get("traceparent")); ok {
+			attrs = append(attrs, slog.String("trace_id", tc.TraceID), slog.String("parent_span_id", tc.ParentSpanID))
 		}
 	}
 	return base.With(attrs...)

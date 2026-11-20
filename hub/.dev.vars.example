@@ -2,3 +2,17 @@
 # Generate 32-byte hex tokens with: openssl rand -hex 32
 CALLER_TOKEN=
 AGENT_TOKENS={"site-1":"replace-with-32-char-random-secret"}
+
+# Optional: Multi-Shard Durable Object Ring (e.g. global,standby)
+# HUB_SHARDS=global
+
+# Optional: Web Search Providers (/v1/search & MCP search)
+# SERPER_API_KEY=
+# BRAVE_API_KEY=
+# TAVILY_API_KEY=
+# SEARXNG_URL=
+
+# Optional: Vendor-Agnostic OpenTelemetry Collector (Honeycomb, Grafana Tempo, Jaeger, Axiom, SigNoz)
+# OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io
+# OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=replace-with-key
+# OTEL_SERVICE_NAME=edgefetch-hub

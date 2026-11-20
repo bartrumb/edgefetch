@@ -1,0 +1,20 @@
+# Render.com 1-Click Blueprint (`https://render.com/deploy?repo=https://github.com/bartrumb/edgefetch`)
+services:
+  - type: web
+    name: edgefetch-hub
+    runtime: docker
+    dockerfilePath: ./Dockerfile.all-in-one
+    healthCheckPath: /health
+    disk:
+      name: edgefetch-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: PORT
+        value: "8787"
+      - key: EDGEFETCH_DATA_DIR
+        value: "/data"
+      - key: CALLER_TOKEN
+        generateValue: true
+      - key: AGENT_TOKEN
+        generateValue: true

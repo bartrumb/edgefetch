@@ -1,6 +1,3 @@
-// Package ws wraps github.com/coder/websocket behind EdgeFetch's outbound control-plane contract:
-// HTTP/1.1 ALPN upgrade, classic ECDHE TLS curves, zero ambient proxy inheritance, no redirect token leakage,
-// disabled per-message compression, 1 MiB message ceiling, and io.EOF peer-close normalization.
 package ws
 
 import (

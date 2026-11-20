@@ -1,5 +1,3 @@
-// Package politeness enforces per-origin serialization, Retry-After cooldowns, three-state circuit breaking,
-// RFC 9309 robots.txt caching, and dial-time DNS-rebinding SSRF protection (net.Dialer.Control).
 package politeness
 
 import (
@@ -240,20 +238,23 @@ func (r *Registry) Get(host string, now time.Time) *HostState {
 }
 
 // ParseRetryAfter parses an RFC 9110 `Retry-After` header (delta-seconds or HTTP-date), clamped to `[0, MaxRetryAfter]`.
+// Clamps `secs` before multiplying by `time.Second` so large headers like `Retry-After: 9227000000` cannot overflow `int64`.
 func ParseRetryAfter(val string, now time.Time) time.Duration {
 	val = strings.TrimSpace(val)
 	if val == "" {
 		return 0
 	}
-	if secs, err := strconv.Atoi(val); err == nil {
+	const maxSecs = int64(MaxRetryAfter / time.Second)
+	if secs, err := strconv.ParseInt(val, 10, 64); err == nil {
 		if secs <= 0 {
 			return 0
 		}
-		d := time.Duration(secs) * time.Second
-		if d > MaxRetryAfter {
+		if secs >= maxSecs {
 			return MaxRetryAfter
 		}
-		return d
+		return time.Duration(secs) * time.Second
+	} else if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(val, "-") {
+		return MaxRetryAfter
 	}
 	// Go's `http.ParseTime` checks RFC 1123 (`Mon, 02 Jan 2006 15:04:05 GMT`), RFC 850, and ANSI C formats.
 	if t, err := http.ParseTime(val); err == nil {

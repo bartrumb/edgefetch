@@ -24,6 +24,7 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
@@ -49,6 +50,7 @@ func isOneShotCLI(args []string) bool {
 		"install-mcp",
 		"install-service",
 		"keygen-bot-auth",
+		"bug-report",
 		"serve",
 		"desktop",
 		"help", "--help", "-h":
@@ -94,6 +96,8 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 		return runInstallService(args[1:], stdout, stderr)
 	case "keygen-bot-auth":
 		return runKeygenBotAuth(args[1:], stdout, stderr)
+	case "bug-report":
+		return runBugReportCLI(ctx, args[1:], stdout, stderr, deps)
 	case "serve":
 		return runServeMode(ctx, args[1:], stdout, stderr)
 	case "desktop":
@@ -119,6 +123,7 @@ Usage:
   edgefetch scrape [flags] <https://url>         Scrape one public HTTPS URL to clean Markdown (or --json)
   edgefetch map [flags] <https://url>            Discover URLs across /llms.txt, /sitemap.xml & homepage links
   edgefetch crawl [flags] <https://url>          Breadth-first polite site crawl (supports --out=./pages Markdown export)
+  edgefetch bug-report [--render] [https://url]  Generate a token-scrubbed GitHub Issue bundle + sanitized OTel trace
   edgefetch doctor [--json]                      Verify SSRF guard, loopback proxy, Chromium, pdftotext & config
   edgefetch version [--json]                     Print binary version, Go toolchain, and host capabilities
   edgefetch help                                 Show this help text
@@ -757,5 +762,215 @@ func runCrawlCLI(ctx context.Context, args []string, stdout, stderr io.Writer, d
 	if outDir != "" {
 		_, _ = fmt.Fprintf(stdout, "Saved Markdown pages to %s\n", outDir)
 	}
+	return 0
+}
+
+func sanitizeURLForBugReport(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "<invalid-url>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+func runBugReportCLI(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	wantRender := hasFlag(args, "--render")
+	wantJSON := hasFlag(args, "--json")
+
+	targetURL := ""
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			targetURL = strings.TrimSpace(a)
+			break
+		}
+	}
+
+	chromeBin := browser.FindChromeBinary()
+	hasPDF := extract.HasPDFToText()
+	caps := []string{"http2-v1", "scrape-v2", "llms-v1"}
+	if chromeBin != "" {
+		caps = append(caps, "browser-v1", "interact-v1")
+	}
+	if hasPDF {
+		caps = append(caps, "pdf-v1")
+	} else {
+		caps = append(caps, "pdf-lite-v1")
+	}
+
+	// Record boolean-only presence of configuration keys (NEVER inspect or print secret values!).
+	envKeys := []string{
+		"EDGEFETCH_HUB_URL",
+		"EDGEFETCH_HUB_URLS",
+		"EDGEFETCH_AGENT_TOKEN",
+		"EDGEFETCH_SERVER_TOKEN",
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		"EDGEFETCH_OTEL_STDOUT",
+	}
+	envPresence := make(map[string]string, len(envKeys))
+	for _, k := range envKeys {
+		if strings.TrimSpace(deps.getenv(k)) != "" {
+			envPresence[k] = "set (redacted)"
+		} else {
+			envPresence[k] = "unset"
+		}
+	}
+
+	tc := otel.ExtractOrNew(nil)
+	traceparent := otel.FormatTraceparent(tc)
+	var spans []otel.Span
+	var probeSummary map[string]any
+	safeTarget := ""
+
+	if targetURL != "" {
+		parsed, pErr := url.Parse(targetURL)
+		if pErr != nil {
+			_, _ = fmt.Fprintf(stderr, "invalid URL: %v\n", pErr)
+			return 2
+		}
+		if aErr := deps.allow(parsed); aErr != nil {
+			_, _ = fmt.Fprintf(stderr, "URL rejected by SSRF guard: %v\n", aErr)
+			return 2
+		}
+		safeTarget = sanitizeURLForBugReport(targetURL)
+
+		silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
+		crawler := crawl.NewCrawler(deps.transport, deps.allow, crawl.DefaultUserAgent, silentLog)
+		defer func() { _ = crawler.Close() }()
+
+		kind := classify.KindScrape
+		renderMode := "auto"
+		if wantRender {
+			kind = classify.KindRender
+			renderMode = "always"
+		}
+
+		spanStart := time.Now()
+		rep := crawl.ExecuteCall(ctx, crawler, crawl.FetchCall{
+			MaxSeconds: 45,
+			Options:    crawl.Options{Concurrency: 1, RespectRobots: crawl.Bool(true), TimeoutMs: 30000},
+			Requests: []crawl.Request{
+				{
+					ID:              "bug-report-1",
+					URL:             targetURL,
+					Kind:            kind,
+					Formats:         []string{"markdown"},
+					OnlyMainContent: crawl.Bool(true),
+					RenderMode:      renderMode,
+				},
+			},
+		}, silentLog)
+		spanEnd := time.Now()
+
+		if len(rep.Results) > 0 {
+			r := rep.Results[0]
+			wafVendor := ""
+			if r.WAF != nil {
+				wafVendor = r.WAF.Vendor
+			}
+			attrs := map[string]any{
+				"url.full":                  safeTarget,
+				"http.response.status_code": r.Status,
+				"edgefetch.kind":            string(r.Kind),
+				"edgefetch.outcome":         string(r.Outcome),
+				"edgefetch.rendered":        r.Rendered,
+				"edgefetch.bytes":           r.Bytes,
+				"edgefetch.markdown_chars":  len(r.Markdown),
+				"edgefetch.dns_ms":          r.Timing.DNSMs,
+				"edgefetch.connect_ms":      r.Timing.ConnectMs,
+				"edgefetch.tls_ms":          r.Timing.TLSMs,
+				"edgefetch.ttfb_ms":         r.Timing.TTFBMs,
+				"edgefetch.robots_ms":       r.Timing.RobotsMs,
+				"edgefetch.duration_ms":     r.DurationMs,
+				"network.protocol.name":     r.Timing.Proto,
+			}
+			if wafVendor != "" {
+				attrs["edgefetch.waf.vendor"] = wafVendor
+			}
+			spans = append(spans, otel.Span{
+				TraceID:      tc.TraceID,
+				SpanID:       tc.SpanID,
+				Name:         "edgefetch.bug_report.scrape",
+				Kind:         3,
+				Start:        spanStart,
+				End:          spanEnd,
+				StatusOK:     r.Outcome == classify.OutcomeOK,
+				ErrorMessage: r.Problem,
+				Attributes:   attrs,
+			})
+			probeSummary = map[string]any{
+				"sanitizedUrl":  safeTarget,
+				"outcome":       r.Outcome,
+				"status":        r.Status,
+				"contentType":   r.ContentType,
+				"rendered":      r.Rendered,
+				"bytes":         r.Bytes,
+				"markdownChars": len(r.Markdown),
+				"wafVendor":     wafVendor,
+				"problem":       r.Problem,
+				"timing": map[string]any{
+					"dnsMs":      r.Timing.DNSMs,
+					"connectMs":  r.Timing.ConnectMs,
+					"tlsMs":      r.Timing.TLSMs,
+					"ttfbMs":     r.Timing.TTFBMs,
+					"robotsMs":   r.Timing.RobotsMs,
+					"durationMs": r.DurationMs,
+					"proto":      r.Timing.Proto,
+					"reused":     r.Timing.Reused,
+				},
+			}
+		}
+	} else {
+		now := time.Now()
+		spans = append(spans, otel.Span{
+			TraceID:  tc.TraceID,
+			SpanID:   tc.SpanID,
+			Name:     "edgefetch.bug_report.environment",
+			Kind:     1,
+			Start:    now,
+			End:      now,
+			StatusOK: true,
+			Attributes: map[string]any{
+				"host.os":   runtime.GOOS,
+				"host.arch": runtime.GOARCH,
+			},
+		})
+	}
+
+	otlpBytes, _ := otel.BuildOTLPJSON("edgefetch-cli", agent.Version, spans)
+	var prettyOTLP any
+	_ = json.Unmarshal(otlpBytes, &prettyOTLP)
+	prettyOTLPBytes, _ := json.MarshalIndent(prettyOTLP, "", "  ")
+
+	if wantJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]any{
+			"version":      agent.Version,
+			"goVersion":    runtime.Version(),
+			"os":           runtime.GOOS,
+			"arch":         runtime.GOARCH,
+			"capabilities": caps,
+			"traceparent":  traceparent,
+			"envPresence":  envPresence,
+			"probe":        probeSummary,
+			"otlp":         prettyOTLP,
+		})
+		return 0
+	}
+
+	_, _ = fmt.Fprintf(stdout, "### EdgeFetch Diagnostic Bundle (Sanitized — Safe for Public GitHub Issues)\n\n")
+	_, _ = fmt.Fprintf(stdout, "- **Version:** `v%s` (`%s` `%s/%s`)\n", agent.Version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	_, _ = fmt.Fprintf(stdout, "- **Capabilities:** `%s`\n", strings.Join(caps, ", "))
+	_, _ = fmt.Fprintf(stdout, "- **W3C Traceparent:** `%s`\n", traceparent)
+	_, _ = fmt.Fprintf(stdout, "- **Config Presence (values redacted):** `HUB_URL=%s`, `AGENT_TOKEN=%s`, `OTEL_ENDPOINT=%s`\n",
+		envPresence["EDGEFETCH_HUB_URL"], envPresence["EDGEFETCH_AGENT_TOKEN"], envPresence["OTEL_EXPORTER_OTLP_ENDPOINT"])
+	if probeSummary != nil {
+		probeJSON, _ := json.MarshalIndent(probeSummary, "", "  ")
+		_, _ = fmt.Fprintf(stdout, "\n#### Sanitized Probe Summary (`%s`)\n```json\n%s\n```\n", safeTarget, string(probeJSON))
+	}
+	_, _ = fmt.Fprintf(stdout, "\n<details>\n<summary>OpenTelemetry OTLP/JSON Trace Span (Sanitized)</summary>\n\n```json\n%s\n```\n</details>\n", string(prettyOTLPBytes))
 	return 0
 }

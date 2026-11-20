@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -55,10 +56,33 @@ func PublicHTTPS(u *url.URL) error {
 		return fmt.Errorf("port %s not allowed", p)
 	}
 	host := politeness.CanonicalHost(u.Hostname())
-	if host == "" || net.ParseIP(host) != nil || host == "localhost" || strings.HasSuffix(host, ".localhost") || !strings.Contains(host, ".") {
+	if host == "" ||
+		net.ParseIP(host) != nil ||
+		isNetipLiteralOrShorthandIP(host) ||
+		host == "localhost" ||
+		strings.HasSuffix(host, ".localhost") ||
+		!strings.Contains(host, ".") {
 		return fmt.Errorf("host %q not allowed", host)
 	}
 	return nil
+}
+
+func isNetipLiteralOrShorthandIP(host string) bool {
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	if strings.ContainsAny(host, ":%[] \t\r\n/\\") {
+		return true
+	}
+	lastDot := strings.LastIndexByte(host, '.')
+	if lastDot < 0 || lastDot == len(host)-1 {
+		return true
+	}
+	tld := host[lastDot+1:]
+	if tld[0] < 'a' || tld[0] > 'z' {
+		return true
+	}
+	return false
 }
 
 // WithAllowedHosts restricts base to exact or subdomain matches of hosts when hosts contains non-empty entries.

@@ -9,6 +9,13 @@
  */
 
 import { applyPostFetchSiteExtractor, resolveSiteExtractorTwin } from './extractors/registry';
+import {
+  MAX_HTML_SCAN_CHARS,
+  escapeRegexLiteral,
+  replaceHtmlTagBlocksLinear,
+  stripHtmlCommentsLinear,
+  stripHtmlTagsLinear,
+} from './safe-input';
 import { isContentVerifiedInMetaD1, sha256HexString } from './ingest';
 import {
   analyzeUrlRedirect,
@@ -733,12 +740,22 @@ function flattenJsonLdEntities(rawHtml: string): Array<Record<string, unknown>> 
       }
     }
   };
-  for (const m of rawHtml.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
-    try {
-      visit(JSON.parse(m[1]!.trim()), 0);
-    } catch {
-      // ignore malformed JSON-LD blocks
-    }
+  if (rawHtml.includes('ld+json')) {
+    replaceHtmlTagBlocksLinear(
+      rawHtml,
+      'script',
+      (_full, attrStr, inner) => {
+        if (/\btype\s*=\s*["']application\/ld\+json["']/i.test(attrStr)) {
+          try {
+            visit(JSON.parse(inner.trim()), 0);
+          } catch {
+            // ignore malformed JSON-LD blocks
+          }
+        }
+        return '';
+      },
+      MAX_HTML_SCAN_CHARS,
+    );
   }
   return entities;
 }
@@ -1669,7 +1686,19 @@ export function extractHtmlDocument(
   }
 
   // Extract colors and fonts from <style> tags before stripping them.
-  const styleText = [...rawHtml.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)].map((m) => m[1]!).join('\n');
+  const styleChunks: string[] = [];
+  if (rawHtml.includes('<style') || rawHtml.includes('<STYLE')) {
+    replaceHtmlTagBlocksLinear(
+      rawHtml,
+      'style',
+      (_full, _attr, inner) => {
+        styleChunks.push(inner);
+        return '';
+      },
+      MAX_HTML_SCAN_CHARS,
+    );
+  }
+  const styleText = styleChunks.join('\n');
   const colors = [...new Set((styleText.match(/#[0-9a-fA-F]{6}\b/g) ?? []).map((c) => c.toLowerCase()))]
     .filter((c) => c !== '#ffffff' && c !== '#000000')
     .slice(0, 8);
@@ -1729,11 +1758,13 @@ export function extractHtmlDocument(
   }
 
   // Capture `<noscript>` prose fallback (e.g. Discourse / Ghost SSR crawler fallback) before stripping `<noscript>`,
-  // while promoting `<noscript><img ...></noscript>` lazy-load fallbacks inline.
+  // while promoting `<noscript><img ...></noscript>` lazy-load fallbacks inline (`M4` linear O(N) scanner, 2 MiB cap).
+  const boundedRawHtml = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
   const noscriptChunks: string[] = [];
-  const withPromotedNoscriptImgs = rawHtml.replace(
-    /<noscript\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/noscript>/gi,
-    (_full, inner: string) => {
+  const withPromotedNoscriptImgs = replaceHtmlTagBlocksLinear(
+    boundedRawHtml,
+    'noscript',
+    (_full, _attrStr, inner) => {
       const trimmedInner = inner.trim();
       if (/^<img\b(?:"[^"]*"|'[^']*'|[^>"'])*\/?>$/i.test(trimmedInner)) {
         return trimmedInner;
@@ -1743,12 +1774,14 @@ export function extractHtmlDocument(
       }
       return '';
     },
+    MAX_HTML_SCAN_CHARS,
   );
 
   // Convert YouTube & X/Twitter `<iframe>` embeds into clean Markdown links before stripping `<iframe>` tags.
-  const withEmbedLinks = withPromotedNoscriptImgs.replace(
-    /<iframe\b((?:"[^"]*"|'[^']*'|[^>"'])*)>[\s\S]*?<\/iframe>/gi,
-    (_full, attrStr: string) => {
+  const withEmbedLinks = replaceHtmlTagBlocksLinear(
+    withPromotedNoscriptImgs,
+    'iframe',
+    (_full, attrStr) => {
       const attrs = parseTagAttrs(attrStr);
       const src = attrs.src ?? attrs['data-src'] ?? '';
       if (!src) return '';
@@ -1760,35 +1793,54 @@ export function extractHtmlDocument(
       if (xEmbed?.[1]) return `\n\n[Embedded Post](https://x.com/i/status/${xEmbed[1]})\n\n`;
       return '';
     },
+    MAX_HTML_SCAN_CHARS,
   );
 
   // Preserve MathJax `<script type="math/tex">` equations BEFORE stripping `<script>` tags.
-  const withPreservedMathScripts = withEmbedLinks.replace(
-    /<script\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/script>/gi,
-    (full, attrStr: string, inner: string) => {
-      if (!/\btype\s*=\s*["']math\/tex/i.test(attrStr)) return full;
+  const withPreservedMathScripts = replaceHtmlTagBlocksLinear(
+    withEmbedLinks,
+    'script',
+    (_full, attrStr, inner) => {
+      if (!/\btype\s*=\s*["']math\/tex/i.test(attrStr)) return '';
       const tex = normalizeLatexSource(inner);
       if (!tex) return '';
       return /mode\s*=\s*display/i.test(attrStr) ? `\n\n$$\n${tex}\n$$\n\n` : `$${tex.replace(/\s+/g, ' ')}$`;
     },
+    MAX_HTML_SCAN_CHARS,
   );
 
-  // Strip comments (including Lit-SSR `<?>` bogus comments on MDN) and non-content elements.
-  const withoutCommentsAndScripts = withPreservedMathScripts
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<\?[\s\S]{0,400}?\?>|<\?>/g, '')
-    .replace(/<svg\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/svg>/gi, ' ')
-    .replace(
-      /<(head|script|style|noscript|template|canvas|iframe|include-fragment|details-dialog|details-menu|tool-tip|clipboard-copy)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/\1>/gi,
-      '',
-    );
+  // Strip comments (including Lit-SSR `<?>` bogus comments on MDN) and non-content elements in guaranteed linear O(N) time.
+  const withoutComments = stripHtmlCommentsLinear(withPreservedMathScripts, MAX_HTML_SCAN_CHARS).replace(
+    /<\?[\s\S]{0,400}?\?>|<\?>/g,
+    '',
+  );
+  const withoutSvg = stripHtmlTagsLinear(withoutComments, ['svg'], ' ', MAX_HTML_SCAN_CHARS);
+  const withoutCommentsAndScripts = stripHtmlTagsLinear(
+    withoutSvg,
+    [
+      'head',
+      'script',
+      'style',
+      'noscript',
+      'template',
+      'canvas',
+      'iframe',
+      'include-fragment',
+      'details-dialog',
+      'details-menu',
+      'tool-tip',
+      'clipboard-copy',
+    ],
+    '',
+    MAX_HTML_SCAN_CHARS,
+  );
   let work = withoutCommentsAndScripts;
 
   let extractedMarkdownBodyOnly = false;
   if (includeTags && includeTags.length > 0) {
     work = applyIncludeAndExcludeTagSelectors(work, includeTags, excludeTags);
   } else if (onlyMainContent) {
-    work = work.replace(/<(nav|footer|aside|dialog|menu)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/\1>/gi, '');
+    work = stripHtmlTagsLinear(work, ['nav', 'footer', 'aside', 'dialog', 'menu'], '', MAX_HTML_SCAN_CHARS);
     // Substack rendered post body (`<div class="body markup">`) or `window._preloads` `body_html`
     const substackMarkup = applyIncludeAndExcludeTagSelectors(work, ['.markup'], undefined);
     // GitHub / GFM pages wrap repo chrome + duplicate file tables inside `<main>` around `<article class="markdown-body">`
@@ -1963,11 +2015,17 @@ export function extractHtmlDocument(
     .replace(/<\/a>(?=<a\b)/gi, '</a> ')
     .replace(/<\/code>(?=<code\b)/gi, '</code> ')
     .replace(/([A-Za-z0-9])(?=<a\b)/g, '$1 ')
+    .replace(/<figcaption\b[^>]*\bheader\b[^>]*>\s*<span\b[^>]*\btitle\b[^>]*>\s*<\/span>\s*<span\b[^>]*\bsr-only\b[^>]*>[\s\S]{0,120}?<\/span>\s*<\/figcaption>/gi, '')
     .replace(
       /<pre\b((?:"[^"]*"|'[^']*'|[^>"'])*)>\s*(?:<code\b((?:"[^"]*"|'[^']*'|[^>"'])*)>)?([\s\S]*?)(?:<\/code>)?\s*<\/pre>/gi,
       (_m, preAttrs, codeAttrs, code) => {
         const lang = inferCodeFenceLang(String(preAttrs ?? ''), String(codeAttrs ?? ''));
-        const decodedCode = decodeHtmlEntities(String(code).replace(HTML_TAG_QUOTE_AWARE_RE, '')).trim();
+        const rawCodeHtml = String(code);
+        const withEcLines =
+          !rawCodeHtml.includes('\n') && rawCodeHtml.includes('ec-line')
+            ? rawCodeHtml.replace(/<div\b[^>]*\bec-line\b[^>]*>/gi, '\n')
+            : rawCodeHtml;
+        const decodedCode = decodeHtmlEntities(withEcLines.replace(HTML_TAG_QUOTE_AWARE_RE, '')).trim();
         return stashFence(makeSafeCodeFence(decodedCode, lang));
       },
     )
@@ -2548,11 +2606,11 @@ export function extractStructuredJsonFromPage(
             if (allBullets.length > 0) val = allBullets;
           }
         }
-      } else {
-        const fuzzyKey = propName
+      } else if (propName.length <= 80) {
+        const fuzzyKey = escapeRegexLiteral(propName)
           .replace(/([a-z0-9])([A-Z])/g, '$1[\\s_-]*$2')
-          .replace(/[_-]+/g, '[\\s_-]*');
-        const kvRe = new RegExp(`(?:^|\\n)\\s*(?:[-*]\\s*)?\\*{0,2}${fuzzyKey}\\*{0,2}\\s*:\\s*([^\\n]+)`, 'i');
+          .replace(/(?:\\_|\\-)+|[_-]+/g, '[\\s_-]*');
+        const kvRe = new RegExp(`(?:^|\\n)[ \\t]*(?:[-*][ \\t]*)?\\*{0,2}${fuzzyKey}\\*{0,2}[ \\t]*:[ \\t]*([^\\n]+)`, 'i');
         const m = kvRe.exec(doc.markdown);
         if (m?.[1]) {
           val = m[1].replace(/^`([^`]+)`$/, '$1').trim();

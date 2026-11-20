@@ -362,6 +362,19 @@ func main() {
 		handler = crawl.NewAuthenticatedHandler(crawler, allow, serverToken)
 	}
 
+	ln, listenErr := net.Listen("tcp", addr)
+	if listenErr != nil {
+		log.Error("listen", slog.String("addr", addr), slog.String("error", listenErr.Error()))
+		os.Exit(1)
+	}
+	// Drop root privileges after reading /data/options.json and binding the TCP listener so hybrid/server/hub modes
+	// run unprivileged (65532:65532) just like pure agent mode!
+	if err := priv.DropRoot(); err != nil {
+		log.Error("drop_privileges", slog.String("error", err.Error()))
+		_ = ln.Close()
+		os.Exit(2)
+	}
+
 	srv := newHTTPServer(addr, handler)
 	if modes.hub {
 		// Long-lived /agent/ws WebSockets must not be killed by a 30s HTTP ReadTimeout!
@@ -375,7 +388,7 @@ func main() {
 			slog.Bool("hybrid_agent", modes.agent),
 			slog.Int("gomaxprocs", runtime.GOMAXPROCS(0)),
 			slog.String("go", runtime.Version()))
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server", slog.String("error", err.Error()))
 			os.Exit(1)
 		}

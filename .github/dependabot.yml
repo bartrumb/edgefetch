@@ -23,3 +23,13 @@ updates:
     groups:
       hub-dev-deps:
         dependency-type: "development"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/edgefetch_fat"
+    schedule:
+      interval: "weekly"

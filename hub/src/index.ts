@@ -126,6 +126,8 @@ import {
 interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv {
   AGENT_HUB: DurableObjectNamespace<AgentHubDO>;
   HUB_SHARDS?: string;
+  SAFE_FETCH?: typeof fetch;
+  SAFE_PUBLIC_FETCH?: typeof fetch;
   CALLER_TOKEN?: string;
   MCP_TOKEN?: string;
   AGENT_TOKEN?: string;
@@ -152,6 +154,7 @@ export class AgentHubDO extends DurableObject<Env> {
   private readonly engine: AgentHubEngine;
   private readonly oauth: OAuthStore;
   private readonly activity: ActivityStore;
+  private readonly helloLogBySocket = new WeakMap<WebSocket, number>();
   private alarmScheduled = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -643,14 +646,21 @@ export class AgentHubDO extends DurableObject<Env> {
         const updated = this.engine.updateAgentHello(ws as unknown as HubSocketLike, msg);
         const att = updated ?? (ws.deserializeAttachment() as AgentAttachment | null);
         const evName = (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready';
-        console.info(JSON.stringify({ event: evName, siteId: att?.siteId, ...msg }));
-        await this.activity.recordEvent({
-          level: (msg.reconnectAttempt ?? 0) > 0 ? 'warn' : 'info',
-          category: 'agent',
-          event: evName,
-          summary: `Remote node "${att?.siteId ?? 'unknown'}" reported ${evName} (${att?.version ? `v${att.version}, ` : ''}${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
-          details: sanitizeDetails({ siteId: att?.siteId, ...msg }),
-        });
+        const nowMs = Date.now();
+        const lastHelloAt = this.helloLogBySocket.get(ws) ?? 0;
+        // M9: Rate-limit `agent_hello` ring-buffer writes per socket, log at `'info'` so agents cannot flush the
+        // `'warn'`/`'error'` security ring, and spread `...msg` FIRST so `msg.siteId` never overwrites verified `att.siteId`!
+        if (nowMs - lastHelloAt >= 60_000) {
+          this.helloLogBySocket.set(ws, nowMs);
+          console.info(JSON.stringify({ ...msg, event: evName, siteId: att?.siteId }));
+          await this.activity.recordEvent({
+            level: 'info',
+            category: 'agent',
+            event: evName,
+            summary: `Remote node "${att?.siteId ?? 'unknown'}" reported ${evName} (${att?.version ? `v${att.version}, ` : ''}${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
+            details: sanitizeDetails({ ...msg, siteId: att?.siteId }),
+          });
+        }
       }
     } catch {
       // ignore malformed frames
@@ -826,6 +836,7 @@ export default {
             callContainer: (b) =>
               cloudflareOverflowFetch(b, ua, url.hostname, {
                 bypassAllowlist,
+                ...(env.SAFE_PUBLIC_FETCH ? { fetchFn: env.SAFE_PUBLIC_FETCH } : env.SAFE_FETCH ? { fetchFn: env.SAFE_FETCH } : {}),
                 ...(env.BOT_SIGNING_PRIVATE_KEY?.trim()
                   ? {
                       botAuth: {
@@ -982,7 +993,7 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.2');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.3');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1059,7 +1070,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.5.2',
+          serverVersion: '2.5.3',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1296,7 +1307,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.5.2'), {
+        return Response.json(buildCapabilities(env, '2.5.3'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -1786,6 +1797,9 @@ export default {
           return Response.json({ ok: true, ...job }, { status: 200, headers: { 'cache-control': 'no-store' } });
         }
         if (request.method === 'DELETE') {
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ ok: false, error: 'insufficient_scope' }, { status: 403 });
+          }
           const ok = cancelBatchScrape(batchId);
           return Response.json({ ok, id: batchId, status: 'cancelled' }, { status: ok ? 200 : 404 });
         }

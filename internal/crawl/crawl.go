@@ -16,6 +16,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -184,8 +185,8 @@ const (
 	MaxTimeoutMs         = 120_000
 	DefaultMaxBytes      = 8 << 20
 	MaxMaxBytes          = 16 << 20
-	MaxStreamingPDFBytes = 256 << 20 // 256 MiB disk-streamed PDF ceiling on Fat nodes (zero 100 MiB heap spike)
-	DefaultMaxTotalBytes = 16 << 20  // 16 MiB batch body ceiling stays safely below Hub's 20 MiB reply cap & 128 MiB GOMEMLIMIT
+	MaxStreamingPDFBytes = 64 << 20 // 64 MiB default disk-streamed PDF ceiling (override via EDGEFETCH_MAX_PDF_BYTES)
+	DefaultMaxTotalBytes = 16 << 20 // 16 MiB batch body ceiling stays safely below Hub's 20 MiB reply cap & 128 MiB GOMEMLIMIT
 	MaxMaxTotalBytes     = 18 << 20
 	MaxConcurrency       = 4
 	MaxRetries           = 3
@@ -771,6 +772,9 @@ func (c *Crawler) runRequestWithRedirects(
 			hopReq.ContentType = ""
 			hopReq.IfNoneMatch = ""
 			hopReq.IfModifiedSince = ""
+			if origParsed, oErr := url.Parse(origReq.URL); oErr != nil || !strings.EqualFold(origParsed.Hostname(), parsedCur.Hostname()) {
+				hopReq.Headers = nil
+			}
 		}
 		res, loc, rawBody := c.fetchSingleHop(ctx, hopReq, opts)
 		res.Timing.RobotsMs += robotsElapsedMs
@@ -833,6 +837,11 @@ func (c *Crawler) runRequestWithRedirects(
 			}
 			upReq := origReq
 			upReq.URL = targetForRender
+			if origParsed, oErr := url.Parse(origReq.URL); oErr == nil {
+				if tgtParsed, tErr := url.Parse(targetForRender); tErr != nil || !strings.EqualFold(origParsed.Hostname(), tgtParsed.Hostname()) {
+					upReq.Headers = nil
+				}
+			}
 			renderedRes := c.runBrowserStep(ctx, upReq, opts, started)
 			if renderedRes.Outcome == classify.OutcomeOK || renderedRes.Outcome == classify.OutcomeChallenge {
 				renderedRes.ID = origReq.ID
@@ -1002,6 +1011,30 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	return res, redirectLoc, finalBody
 }
 
+func redactURLForLog(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		if idx := strings.IndexAny(raw, "?#"); idx >= 0 {
+			return raw[:idx]
+		}
+		return raw
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.User = nil
+	return u.String()
+}
+
+func resolveMaxStreamingPDFBytes(_ Options) int {
+	limit := MaxStreamingPDFBytes
+	if envRaw := strings.TrimSpace(os.Getenv("EDGEFETCH_MAX_PDF_BYTES")); envRaw != "" {
+		if n, err := strconv.Atoi(envRaw); err == nil && n >= 1024 && n <= 256<<20 {
+			limit = n
+		}
+	}
+	return limit
+}
+
 func (c *Crawler) logResult(ctx context.Context, log *slog.Logger, r Request, res Result) {
 	level := slog.LevelInfo
 	switch res.Outcome {
@@ -1011,7 +1044,7 @@ func (c *Crawler) logResult(ctx context.Context, log *slog.Logger, r Request, re
 		level = slog.LevelError
 	}
 	log.Log(ctx, level, "fetch",
-		slog.String("store", r.ID), slog.String("url", r.URL), slog.String("kind", string(r.Kind)),
+		slog.String("store", r.ID), slog.String("url", redactURLForLog(r.URL)), slog.String("kind", string(r.Kind)),
 		slog.Int("status", res.Status), slog.String("outcome", string(res.Outcome)), slog.String("problem", res.Problem),
 		slog.Int("attempts", res.Attempts), slog.Int64("duration_ms", res.DurationMs), slog.Int("bytes", res.Bytes),
 		slog.Bool("truncated", res.Truncated),
@@ -1138,6 +1171,11 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 		}
 		ctLower := strings.ToLower(resp.Header.Get("content-type"))
 		if strings.Contains(ctLower, "application/pdf") || extract.IsPDFBytes(prefix) {
+			pdfMax := resolveMaxStreamingPDFBytes(opts)
+			if cl := resp.ContentLength; cl > int64(pdfMax) {
+				phases()
+				return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, nil
+			}
 			if tmpFile, tmpErr := os.CreateTemp("", "edgefetch-pdf-*.pdf"); tmpErr == nil {
 				tmpPath := tmpFile.Name()
 				defer func() {
@@ -1152,24 +1190,27 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 					totalWritten += int64(n)
 					if wErr != nil {
 						phases()
-						return 0, nil, nil, false, MaxStreamingPDFBytes, nil, tm, wErr
+						return 0, nil, nil, false, pdfMax, nil, tm, wErr
 					}
 				}
-				remLimit := int64(MaxStreamingPDFBytes) - totalWritten + 1
+				remLimit := int64(pdfMax) - totalWritten + 1
+				if remLimit < 1 {
+					remLimit = 1
+				}
 				copyBuf := make([]byte, 32*1024)
 				copied, cErr := io.CopyBuffer(mw, io.LimitReader(resp.Body, remLimit), copyBuf)
 				totalWritten += copied
 				phases()
 				if cErr != nil {
-					return 0, nil, nil, false, MaxStreamingPDFBytes, nil, tm, cErr
+					return 0, nil, nil, false, pdfMax, nil, tm, cErr
 				}
-				if totalWritten > MaxStreamingPDFBytes {
-					return resp.StatusCode, resp.Header, nil, true, MaxStreamingPDFBytes, nil, tm, nil
+				if totalWritten > int64(pdfMax) {
+					return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, nil
 				}
 				_ = tmpFile.Close()
 				sum := hasher.Sum(nil)
 				txt, usedPoppler, extErr := extract.ExtractPDFFileText(actx, tmpPath, r.MaxPages)
-				return resp.StatusCode, resp.Header, nil, false, MaxStreamingPDFBytes, &streamedPDFResult{
+				return resp.StatusCode, resp.Header, nil, false, pdfMax, &streamedPDFResult{
 					rawBytes:    int(totalWritten),
 					sha256Hex:   hex.EncodeToString(sum),
 					text:        txt,

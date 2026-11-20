@@ -44,20 +44,19 @@ func ValidateCustomHeaders(hdrs map[string]string) error {
 	}
 	totalBytes := 0
 	for k, v := range hdrs {
-		name := strings.TrimSpace(k)
-		if !validHeaderNameRe.MatchString(name) {
+		if !validHeaderNameRe.MatchString(k) {
 			return fmt.Errorf("invalid header name %q", k)
 		}
-		lower := strings.ToLower(name)
+		lower := strings.ToLower(k)
 		if isForbiddenCustomHeader(lower) {
-			return fmt.Errorf("header %q is not permitted", name)
+			return fmt.Errorf("header %q is not permitted", k)
 		}
 		for i := 0; i < len(v); i++ {
 			if v[i] < 0x20 || v[i] > 0x7E {
-				return fmt.Errorf("header %q contains non-printable ASCII byte 0x%02x", name, v[i])
+				return fmt.Errorf("header %q contains non-printable ASCII byte 0x%02x", k, v[i])
 			}
 		}
-		totalBytes += len(name) + len(v)
+		totalBytes += len(k) + len(v)
 		if totalBytes > maxCustomHeadersBytes {
 			return fmt.Errorf("custom headers exceed %d bytes", maxCustomHeadersBytes)
 		}
@@ -461,32 +460,31 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	out, err := c.renderer.Execute(rctx, task)
 	if err != nil {
 		res.Status = out.Status
-		res.FinalURL = out.FinalURL
 		res.SessionID = out.SessionID
-		res.ActionScreenshots = out.ActionScreenshots
-		res.ActionScrapes = out.ActionScrapes
-		res.JavascriptReturns = out.JavascriptReturns
-		res.PDFBase64 = out.PDFBase64
 		if errors.Is(err, browser.ErrChallengeDetected) {
+			res.FinalURL = out.FinalURL
 			res.Outcome = classify.OutcomeChallenge
 			res.WAF = classify.ClassifyWAF(http.StatusOK, out.Headers, []byte(out.HTML))
 		} else {
 			res.Outcome = classify.OutcomeError
-			if len(out.HTML) > 0 && len(out.HTML) <= opts.MaxBytes {
-				if res.Status == 0 {
-					res.Status = http.StatusOK
-				}
-				res.Rendered = true
-				res.Bytes = len(out.HTML)
-				res.ContentType = "text/html; charset=utf-8"
-				res.Body = out.HTML
-				res.BodyEncoding = "utf-8"
-				c.enrichResult(rctx, r, opts, []byte(out.HTML), &res)
-			}
 		}
 		res.Problem = err.Error()
 		res.DurationMs = c.Now().Sub(started).Milliseconds()
 		return res
+	}
+
+	if out.FinalURL != "" && c.allow != nil {
+		if finalParsed, pErr := url.Parse(out.FinalURL); pErr != nil {
+			res.Outcome = classify.OutcomeError
+			res.Problem = "invalid rendered finalUrl"
+			res.DurationMs = c.Now().Sub(started).Milliseconds()
+			return res
+		} else if aErr := c.allow(finalParsed); aErr != nil {
+			res.Outcome = classify.OutcomeError
+			res.Problem = fmt.Sprintf("rendered finalUrl blocked by SSRF policy: %v", aErr)
+			res.DurationMs = c.Now().Sub(started).Milliseconds()
+			return res
+		}
 	}
 
 	rawBody := []byte(out.HTML)

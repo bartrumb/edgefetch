@@ -340,4 +340,31 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 			t.Fatalf("unexpected install-service output for %s: %s", targetOS, out.String())
 		}
 	}
+
+	// Test `edgefetch bug-report` redacts secret env values & URL query tokens while emitting sanitized OTLP JSON!
+	secretDeps := deps
+	secretDeps.getenv = func(k string) string {
+		if k == "EDGEFETCH_AGENT_TOKEN" {
+			return "top-secret-agent-token-do-not-print"
+		}
+		if k == "EDGEFETCH_HUB_URL" {
+			return "https://private-hub.internal.example"
+		}
+		return ""
+	}
+	out.Reset()
+	errBuf.Reset()
+	if rc := runOneShotCLI(context.Background(), []string{"bug-report", "https://docs.example.com/docs/guide?api_key=leak_me_not#frag"}, &out, &errBuf, secretDeps); rc != 0 {
+		t.Fatalf("edgefetch bug-report failed: rc=%d stderr=%s", rc, errBuf.String())
+	}
+	reportText := out.String()
+	if strings.Contains(reportText, "top-secret-agent-token-do-not-print") ||
+		strings.Contains(reportText, "private-hub.internal.example") ||
+		strings.Contains(reportText, "leak_me_not") ||
+		strings.Contains(reportText, "frag") {
+		t.Fatalf("SECURITY: bug-report leaked secret token or query/fragment! output:\n%s", reportText)
+	}
+	if !strings.Contains(reportText, `"resourceSpans"`) || !strings.Contains(reportText, "W3C Traceparent") {
+		t.Fatalf("expected sanitized OTLP resourceSpans and W3C Traceparent in bug-report output:\n%s", reportText)
+	}
 }

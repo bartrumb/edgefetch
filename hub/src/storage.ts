@@ -158,7 +158,7 @@ export function buildCapabilities(
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
-  version = '2.5.2',
+  version = '2.5.3',
 ): HubCapabilities {
   const searchProviders: string[] = ['edge-map'];
   if (env.SEARCH) searchProviders.push('d1-fts5');
@@ -202,6 +202,8 @@ export interface AuthorizeArtifactUploadCallback {
     jobNonce: string;
     siteId: string;
     requestId: string;
+    blobSha256?: string;
+    confirmOnly?: boolean;
     retention: ArtifactRetention;
     storedBytes: number;
     contentBytes: number;
@@ -295,7 +297,10 @@ export async function handleAgentArtifactUpload(params: {
     return Response.json({ error: 'empty_body' }, { status: 400 });
   }
 
-  const authz = await authorizeJobUpload({
+  // 1. Authorize job + requestId + quota FIRST before reading `request.body` so invalid jobs are rejected in O(1),
+  //    then verify SHA-256 proof-of-possession on `request.body` BEFORE deduplicating (`H6`) so an agent can never
+  //    claim an existing `<victimBlob>` via deduplication without possessing the exact compressed bytes!
+  const preAuthz = await authorizeJobUpload({
     jobId,
     jobNonce,
     siteId,
@@ -304,15 +309,62 @@ export async function handleAgentArtifactUpload(params: {
     storedBytes,
     contentBytes,
   });
-  if (!authz.ok) {
+  if (!preAuthz.ok) {
     await request.body.cancel().catch(() => undefined);
-    return Response.json({ error: authz.error }, { status: authz.status });
+    return Response.json({ error: preAuthz.error }, { status: preAuthz.status });
   }
+
+  const reader = request.body.getReader();
+  const bodyChunks: Uint8Array[] = [];
+  let actualReadBytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        actualReadBytes += value.byteLength;
+        if (actualReadBytes > storedBytes || actualReadBytes > MAX_ARTIFACT_STORED_BYTES) {
+          await reader.cancel('storedBytes exceeded').catch(() => undefined);
+          return Response.json({ error: 'stored_bytes_mismatch' }, { status: 413 });
+        }
+        bodyChunks.push(value);
+      }
+    }
+  } catch {
+    await reader.cancel().catch(() => undefined);
+    return Response.json({ error: 'upload_stream_error' }, { status: 400 });
+  }
+  if (actualReadBytes !== storedBytes) {
+    return Response.json({ error: 'content_length_mismatch' }, { status: 400 });
+  }
+  const fullPayload = new Uint8Array(actualReadBytes);
+  let off = 0;
+  for (const c of bodyChunks) {
+    fullPayload.set(c, off);
+    off += c.byteLength;
+  }
+  const actualBlobShaBuf = await crypto.subtle.digest('SHA-256', fullPayload);
+  const actualBlobSha = Array.from(new Uint8Array(actualBlobShaBuf), (b) => b.toString(16).padStart(2, '0')).join('');
+  if (actualBlobSha !== blobSha256) {
+    return Response.json({ error: 'blob_sha256_mismatch' }, { status: 400 });
+  }
+
+  // Record `blobSha256` on the pending job ONLY after proof-of-possession succeeded!
+  await authorizeJobUpload({
+    jobId,
+    jobNonce,
+    siteId,
+    requestId,
+    blobSha256,
+    confirmOnly: true,
+    retention: rawRetention,
+    storedBytes: 0,
+    contentBytes: 0,
+  });
 
   const key = r2ArtifactKey(rawRetention, blobSha256);
   const cachedUploadAt = recentArtifactUploads.get(key);
   if (cachedUploadAt !== undefined && !shouldRefreshDedupedObject(cachedUploadAt, rawRetention, now)) {
-    await request.body.cancel().catch(() => undefined);
     return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
   }
 
@@ -328,7 +380,6 @@ export async function handleAgentArtifactUpload(params: {
       existing = await bucket.head(key);
       if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
         rememberUploadedArtifact(key, existing.uploaded.getTime());
-        await request.body.cancel().catch(() => undefined);
         return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
       }
     } else {
@@ -340,7 +391,6 @@ export async function handleAgentArtifactUpload(params: {
     existing = await bucket.head(key);
     if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
       rememberUploadedArtifact(key, existing.uploaded.getTime());
-      await request.body.cancel().catch(() => undefined);
       return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
     }
   }
@@ -356,7 +406,7 @@ export async function handleAgentArtifactUpload(params: {
         retention: rawRetention,
       },
     };
-    const stored = await bucket.put(key, request.body, putOpts);
+    const stored = await bucket.put(key, fullPayload, putOpts);
     if (stored !== null) {
       rememberUploadedArtifact(key, now);
     }

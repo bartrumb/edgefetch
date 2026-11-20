@@ -6,7 +6,8 @@ EdgeFetch is designed to run safely inside private networks (such as Home Assist
 
 ### 1. Zero Inbound Attack Surface
 - **Outbound-only sockets in `agent` mode:** `edgefetch --mode=agent` never calls `net.Listen`. Router port-forwarding, UPnP, and VPN/tunnel daemons are unnecessary.
-- **No generic proxy protocol:** EdgeFetch is **not** an HTTP `CONNECT` or SOCKS5 relay. It accepts structured JSON `FetchCall` dispatches over a single authenticated TLS 1.2/1.3 WebSocket and executes bounded HTTP `GET` requests only.
+- **No generic proxy protocol:** EdgeFetch is **not** an HTTP `CONNECT` or SOCKS5 relay. It accepts structured JSON `FetchCall` dispatches over a single authenticated TLS 1.2/1.3 WebSocket and executes bounded HTTP `GET` (or bounded UTF-8 JSON/form `POST` up to `64 KiB` for public APIs such as Workday CXS job boards) against `robots.txt`-permitted public `https://:443` URLs only.
+- **Tokenless Local Loopback Hardening (`desktop` / `serve`):** When bound to `127.0.0.1` / `::1` without a caller token, EdgeFetch enforces strict DNS-rebinding and browser CSRF defenses: `Host` must resolve to `127.0.0.1`, `[::1]`, or `localhost` on the active port, `Sec-Fetch-Site` rejects `cross-site`, `Origin` (when present) must match loopback, and state-changing `POST` endpoints require `Content-Type: application/json`.
 
 ### 2. Least-Privilege Token Separation (`CALLER_TOKEN`, `AGENT_TOKENS`, & `EDGEFETCH_SERVER_TOKEN`)
 - **Caller Token (`CALLER_TOKEN`):** Authorizes upstream workflows to submit `POST /fetch` batches and view `GET /agents` on the Hub. Never place `CALLER_TOKEN` on standby nodes.
@@ -15,19 +16,22 @@ EdgeFetch is designed to run safely inside private networks (such as Home Assist
   - Comparisons use length-independent constant-time byte XOR (`sameBytes`), failing closed whenever a token is unset, `< 24` characters, or malformed JSON.
   - `siteId` is bound to the matched token key on the server so `site-1` cannot spoof `site-2`, and any fallback `AGENT_TOKEN` cannot claim a `siteId` present in `AGENT_TOKENS`.
   - Every `POST /agent/reply` must present both the server-generated `X-Job-Id` and constant-time verified one-time `X-Job-Nonce` actively pending for that exact `siteId` (`verifyPendingJob` checked before decompressing request streams; `413` replies fail the job immediately without peer re-crawls).
-- **Mandatory TLS for Non-Loopback Hubs:** `internal/agent/config.go` refuses cleartext `http://` / `ws://` hub URLs on any non-loopback address (`127.0.0.1` / `::1`), even if `EDGEFETCH_ALLOW_INSECURE_HUB=1` is set in the environment.
+- **Mandatory TLS for Non-Loopback Hubs:** `internal/agent/config.go` refuses cleartext `http://` / `ws://` hub URLs on any non-loopback address (`127.0.0.1` / `::1`), even if `EDGEFETCH_ALLOW_INSECURE_HUB=1` is set in the environment. Docker bridge containers may opt in via `EDGEFETCH_ALLOW_INSECURE_DOCKER_HUB=1` strictly for explicit container service names (`hub`, `edgefetch-hub`, `host.docker.internal`, or an operator-pinned `EDGEFETCH_INSECURE_HUB_HOST`).
+- **Origin-Locked Operator LLM Keys (`hub/src/llm.ts`):** Server-side LLM environment credentials (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `EDGEFETCH_LLM_API_KEY`) are bound strictly to their canonical provider origin (or `EDGEFETCH_LLM_BASE_URL` origin). Any caller-supplied custom `llm.baseUrl` requires an explicit caller-supplied `llm.apiKey`, refuses HTTP `3xx` redirects (`redirect: "manual"`), and enforces dial-time public-IP verification.
 
 ### 3. Multi-Layer SSRF, Redirect & Robots Protection
 Even if a caller token were compromised, an agent cannot be used to probe local LAN devices, Home Assistant APIs, Tailscale peers, cloud metadata endpoints, or robots-disallowed paths:
 1. **Hop-by-Hop URL & RFC 9309 `/robots.txt` Validation (`crawl.PublicHTTPS` + `WithBlockedHost` + `WithAllowedHosts`):**
    - Automatic HTTP client redirects are disabled in both Go and Cloudflare overflow. Every hop (up to 5) re-evaluates URL rules (`https://:443` multi-label DNS host, no IP literals, no `localhost`, no `user:pass@`), per-host locks/pacing, and `/robots.txt` (`512 KiB` parse cap, UTF-8 BOM stripping, percent-encoding normalization, exact product-token matching).
    - Callers cannot disable `robots.txt` (`400 robots_required`) unless the hub/agent owner explicitly configures `ROBOTS_BYPASS_HOSTS` / `EDGEFETCH_ROBOTS_BYPASS_HOSTS` (empty by default, audited in `hub_events`).
-2. **Dial-Time Socket Peer Inspection (`politeness.RejectNonPublicPeer` via `net.Dialer.Control` & `net/netip`):**
-   - Runs inside Go's dialer *after* DNS resolution creates the OS socket and *immediately before* `connect()` fires — eliminating DNS-rebinding TOCTOU races, and permanent SSRF refusals (`ErrNonPublicPeer`) are never retried.
+2. **Dial-Time Socket Peer Inspection (`politeness.RejectNonPublicPeer` in Go & `net.BlockList` in Portable Node Hub):**
+   - In Go, `RejectNonPublicPeer` runs inside `net.Dialer.Control` *after* DNS resolution creates the OS socket and *immediately before* `connect()` fires — eliminating DNS-rebinding TOCTOU races, and permanent SSRF refusals (`ErrNonPublicPeer`) are never retried. Cross-origin redirects automatically strip `Authorization`, `Cookie`, and `Proxy-Authorization` headers.
+   - In the self-hosted Node.js Portable Hub (`hub/portable/safe-fetch.ts`), outbound webhooks, SPA overflow adapters, and public LLM calls resolve DNS through a `node:net` `BlockList` custom `lookup` hook and re-verify `socket.remoteAddress` before transmitting bytes.
    - Permits IPv6 **only** inside `2000::/3` global unicast before applying exclusions, blocking `0.0.0.0/8`, loopback (`127.0.0.0/8`, `::1`), RFC 1918 LANs (`10/8`, `172.16/12` including Home Assistant's `172.30.32.0/23` bridge, `192.168/16`), RFC 6598 CGNAT / Tailscale (`100.64.0.0/10`), link-local / cloud metadata (`169.254.0.0/16`, `fe80::/10`), 6to4 relay (`192.88.99.0/24`), ULA (`fc00::/7`), site-local (`fec0::/10`), ORCHID/ORCHIDv2 (`2001:10::/28`, `2001:20::/28`), documentation (`2001:db8::/32`, `3fff::/20`), SRv6 (`5f00::/16`), and IPv6-to-IPv4 transition prefixes (`::/96`, `0:0:0:0:ffff:0::/96`, `64:ff9b::/96`, `64:ff9b:1::/48`, `2002::/16`, `2001::/32`, `100::/64`).
-3. **Headless Browser Subresource Isolation (`internal/browser/proxy.go` + `edgefetch_fat`):**
-   - `/robots.txt` is verified **before** launching or navigating Chromium (including every `interact` `navigate` step).
-   - Chromium runs with `--proxy-server=http://127.0.0.1:<port>`, `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"`, and `--disable-quic`, forcing 100% of browser subresources through `SSRFProxy` (`CONNECT :443` + `RejectNonPublicPeer`) so untrusted page JS can never probe Home Assistant (`:8123`) or RFC 1918 LAN IPs.
+3. **Headless Browser Subresource & Environment Isolation (`internal/browser/proxy.go`, `renderer.go` + `edgefetch_fat`):**
+   - `/robots.txt` is verified **before** launching or navigating Chromium (including every `interact` `navigate` step) and `FinalURL` is re-verified after load before returning rendered DOM.
+   - Chromium runs with `--proxy-server=http://127.0.0.1:<port>`, `--proxy-bypass-list=<-loopback>` (defeating Chromium's implicit loopback/link-local proxy bypass), `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"`, `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, and `--disable-quic`, forcing 100% of browser subresources through `SSRFProxy` (`CONNECT :443` + `RejectNonPublicPeer`).
+   - Child processes (`chromium` and Poppler `pdftotext`) are spawned with a minimal scrubbed `cmd.Env` (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TZ`, `FONTCONFIG_PATH` — never inheriting `EDGEFETCH_*` or operator tokens) and transition into a dedicated `edgefetch_fat//chromium` AppArmor subprofile that explicitly denies `/data/**`.
    - If a rendered page presents a CAPTCHA or anti-bot challenge (`DetectRenderedChallenge`), EdgeFetch halts immediately (`outcome: "challenge"`) and never attempts to solve, click through, or wait out challenges.
    - Search (`POST /v1/search`) uses Brave Search API / SearXNG JSON / local `SEARCH` D1 FTS5 only — search-engine HTML scraping is **never** routed through residential HAOS nodes.
 4. **Untrusted Agent Artifact Verification & Safe Serving (`hub/src/storage.ts`, `hub/src/ingest.ts`):**
@@ -59,4 +63,4 @@ Even if a caller token were compromised, an agent cannot be used to probe local 
 
 ## Reporting a Vulnerability
 
-Please report security issues privately via [GitHub Security Advisories](https://github.com/bartrumb/edgefetch/security/advisories/new) rather than opening a public issue.
+Please report security issues privately via [GitHub Security Advisories](https://github.com/bartrumb/edgefetch/security/advisories/new) rather than opening a public issue. Reports are acknowledged within 7 days.

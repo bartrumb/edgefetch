@@ -642,9 +642,10 @@ func runServeMode(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	defer func() { _ = crawler.Close() }()
 
 	goHub := hub.NewServer(hub.Config{
-		FallbackCrawler: crawler,
-		Allow:           allowFn,
-		Logger:          log,
+		FallbackCrawler:     crawler,
+		AllowedLoopbackPort: port,
+		Allow:               allowFn,
+		Logger:              log,
 	})
 	defer func() { _ = goHub.Close() }()
 
@@ -685,9 +686,10 @@ func runDesktopMode(ctx context.Context, args []string, stdout, stderr io.Writer
 	defer func() { _ = crawler.Close() }()
 
 	goHub := hub.NewServer(hub.Config{
-		FallbackCrawler: crawler,
-		Allow:           crawl.PublicHTTPS,
-		Logger:          log,
+		FallbackCrawler:     crawler,
+		AllowedLoopbackPort: port,
+		Allow:               crawl.PublicHTTPS,
+		Logger:              log,
 	})
 	defer func() { _ = goHub.Close() }()
 

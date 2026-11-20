@@ -1,8 +1,11 @@
 blank_issues_enabled: true
 contact_links:
+  - name: GitHub Discussions (Questions, Setup Help & Adapter Ideas)
+    url: https://github.com/bartrumb/edgefetch/discussions
+    about: Ask deployment questions, share adapter ideas, or discuss self-hosted setups.
   - name: Security Vulnerability Report
     url: https://github.com/bartrumb/edgefetch/security/advisories/new
     about: Please report SSRF, auth, or sandbox security vulnerabilities privately here.
-  - name: Launch & Architecture FAQ
-    url: https://github.com/bartrumb/edgefetch/blob/main/docs/LAUNCH-FAQ.md
-    about: Answers to common questions about Firecrawl/Crawl4AI differences, politeness, and costs.
+  - name: Support & OpenTelemetry Trace Guide
+    url: https://github.com/bartrumb/edgefetch/blob/main/SUPPORT.md
+    about: How to capture sanitized OpenTelemetry traces (`edgefetch bug-report`) without leaking secrets.

@@ -441,14 +441,25 @@ export async function verifyStoredArtifact(params: {
     .bind(blobSha256)
     .first<{ content_sha256: string; content_bytes: number; verified_at: number | null; retention?: string | null }>();
 
-  if (existingRow && existingRow.verified_at !== null && existingRow.content_sha256 === expectedContentSha256) {
-    return {
-      status: 'verified',
-      blobSha256,
-      contentSha256: existingRow.content_sha256,
-      contentBytes: existingRow.content_bytes,
-      alreadyVerified: true,
-    };
+  if (existingRow && existingRow.verified_at !== null) {
+    if (existingRow.content_sha256 === expectedContentSha256) {
+      if (typeof expectedContentBytes === 'number' && existingRow.content_bytes !== expectedContentBytes) {
+        return { status: 'rejected', blobSha256, reason: 'content_bytes_mismatch' };
+      }
+      if (captureBytesMax <= 0) {
+        return {
+          status: 'verified',
+          blobSha256,
+          contentSha256: existingRow.content_sha256,
+          contentBytes: existingRow.content_bytes,
+          alreadyVerified: true,
+        };
+      }
+    } else {
+      // H6 Security Invariant: NEVER delete an already-verified blob when another agent/caller submits a false
+      // `expectedContentSha256` claim against that blob's content-addressed key!
+      return { status: 'rejected', blobSha256, reason: 'content_hash_mismatch' };
+    }
   }
 
   const primaryTier: ArtifactRetention = existingRow?.retention === 'transient' ? 'transient' : 'stored';
@@ -543,6 +554,22 @@ export async function verifyStoredArtifact(params: {
 
   const actualSha256 = bytesToHex(await digestStream.digest);
   if (actualSha256 !== expectedContentSha256) {
+    // H6: If the stored object's decompressed SHA-256 matches its recorded `existingRow.content_sha256`, the stored
+    // object itself is genuine — only the caller's `expectedContentSha256` claim was false. Stamp `verified_at` and
+    // preserve the genuine object instead of letting a bogus claim delete it!
+    if (existingRow && existingRow.content_sha256 === actualSha256) {
+      await metaDb
+        .prepare(
+          `UPDATE artifacts
+           SET verified_at = COALESCE(verified_at, ?),
+               content_bytes = ?,
+               last_seen_at = MAX(last_seen_at, ?)
+           WHERE blob_sha256 = ?`,
+        )
+        .bind(now, totalBytes, now, blobSha256)
+        .run();
+      return { status: 'rejected', blobSha256, reason: 'content_hash_mismatch' };
+    }
     await rejectPoisonedArtifact({
       bucket,
       metaDb,
@@ -553,6 +580,9 @@ export async function verifyStoredArtifact(params: {
     return { status: 'rejected', blobSha256, reason: 'content_hash_mismatch' };
   }
   if (typeof expectedContentBytes === 'number' && totalBytes !== expectedContentBytes) {
+    if (existingRow && existingRow.content_sha256 === actualSha256 && existingRow.content_bytes === totalBytes) {
+      return { status: 'rejected', blobSha256, reason: 'content_bytes_mismatch' };
+    }
     await rejectPoisonedArtifact({
       bucket,
       metaDb,

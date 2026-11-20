@@ -82,18 +82,21 @@ EdgeFetch's keyless open-data adapters (`sec-edgar`, `openalex`, `crossref-doi`,
 
 ### 1. Official MCP Registry (`registry.modelcontextprotocol.io`)
 
-EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`) supporting both OCI `stdio` (`ghcr.io/bartrumb/edgefetch-agent:latest mcp`) and OAuth 2.1 `streamable-http` (`/mcp`).
+EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`, schema `2025-12-11`) pinned to `ghcr.io/bartrumb/edgefetch-agent:2.5.3` with the required `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"` OCI image label.
 
-To publish or update `io.github.bartrumb/edgefetch` in the Official MCP Registry:
+To validate and publish `io.github.bartrumb/edgefetch` in the Official MCP Registry:
 
 ```bash
 # 1. Install mcp-publisher (macOS/Linux/Windows)
 brew install mcp-publisher   # or download from https://github.com/modelcontextprotocol/registry/releases
 
-# 2. Authenticate via GitHub OIDC / device login (verifies ownership of github.com/bartrumb)
+# 2. Validate server.json locally before publishing
+mcp-publisher validate
+
+# 3. Authenticate via GitHub OIDC / device login (verifies ownership of github.com/bartrumb)
 mcp-publisher login github
 
-# 3. Publish server.json from the repo root
+# 4. Publish server.json from the repo root
 mcp-publisher publish
 ```
 
@@ -122,7 +125,7 @@ Every official `v*` release of EdgeFetch is protected by **two independent crypt
 
 ```bash
 # 1. Verify SLSA Build Provenance via GitHub CLI
-gh attestation verify edgefetch_2.5.2_linux_amd64.tar.gz --owner bartrumb
+gh attestation verify edgefetch_2.5.3_linux_amd64.tar.gz --owner bartrumb
 
 # 2. Verify the Owner Ed25519 Signature on checksums.txt
 openssl pkeyutl -verify -pubin \

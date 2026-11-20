@@ -84,7 +84,8 @@ var (
 	reAnchor    = regexp.MustCompile(`(?is)<a\b([^>]*)>(.*?)</a>`)
 	reImgTag    = regexp.MustCompile(`(?is)<img\b([^>]*)>`)
 	rePreCode   = regexp.MustCompile(`(?is)<pre\b([^>]*)>\s*(?:<code\b([^>]*)>)?(.*?)(?:</code>)?\s*</pre>`)
-	reCodeLang  = regexp.MustCompile(`(?i)\b(?:language|lang)-([a-z0-9_+#-]+)\b`)
+	reCodeLang  = regexp.MustCompile(`(?i)(?:\b(?:language|lang)-|\bdata-(?:language|lang)=["']?)([a-z0-9_+#-]+)\b`)
+	reEcLine    = regexp.MustCompile(`(?is)<div\b[^>]*\bec-line\b[^>]*>`)
 	reInlineCd  = regexp.MustCompile(`(?is)<code\b[^>]*>(.*?)</code>`)
 	reHeading   = regexp.MustCompile(`(?is)<h([1-6])\b[^>]*>(.*?)</h[1-6]>`)
 	reStrong    = regexp.MustCompile(`(?is)<strong\b[^>]*>(.*?)</strong>|<b\b[^>]*>(.*?)</b>`)
@@ -252,6 +253,9 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 				lang = strings.ToLower(lm[1])
 			}
 			inner = sub[3]
+		}
+		if !strings.Contains(inner, "\n") && strings.Contains(inner, "ec-line") {
+			inner = reEcLine.ReplaceAllString(inner, "\n")
 		}
 		inner = reAnyTag.ReplaceAllString(inner, "")
 		inner = strings.Trim(html.UnescapeString(inner), "\r\n")

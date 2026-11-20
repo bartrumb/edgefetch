@@ -1,25 +1,26 @@
 name: Bug Report
-description: Report a reproducible bug in scraping, extraction, MCP tools, or deployment
+description: Report a reproducible bug in scraping, extraction, MCP tools, or deployment (with optional 1-command sanitized OTel trace)
 title: "[Bug]: "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to file a bug report! Please strip any private tokens (`CALLER_TOKEN`, `AGENT_TOKEN`, API keys) before pasting logs.
+        Thanks for filing a bug report!
+        **Fastest way to include diagnostics (zero leaked tokens):** run `edgefetch bug-report https://example.com/path` and paste its output below — it automatically redacts tokens and URL query strings while capturing W3C `traceparent` + OTLP timing spans.
   - type: input
     id: version
     attributes:
       label: EdgeFetch Version & Deployment Mode
       description: Run `edgefetch version` or check `/v1/capabilities`
-      placeholder: "v2.4.0 — Desktop stdio MCP on macOS arm64 (or Cloudflare Hub + Docker agent)"
+      placeholder: "v2.5.3 — Desktop stdio MCP on macOS arm64 (or Cloudflare Hub + Docker agent)"
     validations:
       required: true
   - type: input
     id: url
     attributes:
       label: Public URL or MCP Tool Call (if applicable)
-      description: Share a public URL that reproduces the extraction/fetch issue
+      description: Share a public URL (without private query tokens) that reproduces the extraction/fetch issue
       placeholder: "https://example.com/docs/guide"
   - type: textarea
     id: actual
@@ -28,6 +29,19 @@ body:
       placeholder: "Describe the actual output/error and what clean output you expected."
     validations:
       required: true
+  - type: textarea
+    id: otel_trace
+    attributes:
+      label: Sanitized OpenTelemetry Trace / `edgefetch bug-report` Output (Optional, Recommended)
+      description: |
+        Paste output from ANY of these secret-scrubbed commands:
+        - **CLI / Docker / HAOS:** `edgefetch bug-report https://example.com/path` (add `--render` for SPA issues)
+        - **Live Stderr Spans:** `EDGEFETCH_OTEL_STDOUT=1 edgefetch scrape https://example.com/path`
+        - **Hub `/v1/agent` Run:** `curl -sS -H "Authorization: Bearer $CALLER_TOKEN" https://<your-hub>/v1/agent/<agt_id>/trace`
+      placeholder: |
+        ### EdgeFetch Diagnostic Bundle (Sanitized — Safe for Public GitHub Issues)
+        - **Version:** `v2.5.3` ...
+        - **W3C Traceparent:** `00-...`
   - type: textarea
     id: steps
     attributes:

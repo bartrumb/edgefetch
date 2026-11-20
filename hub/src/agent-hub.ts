@@ -25,7 +25,7 @@ export const DEFAULT_429_COOLDOWN_MS = 5 * 60_000; // 5m per-site/IP 429 cooldow
 export const DEFAULT_429_NO_HEADER_WAIT_MS = 15_000; // 15s shared host wait before failover when 429 lacks Retry-After
 export const HOST_STICKY_TTL_MS = 30 * 60_000; // 30m sliding host -> site affinity (prevents single-store IP rotation)
 const MIN_COOLDOWN_MS = 10_000;
-const MAX_COOLDOWN_MS = 60 * 60_000;
+export const MAX_COOLDOWN_MS = 60 * 60_000;
 export const MAX_REPLY_BYTES = 20 << 20; // 20 MiB decompressed cap
 export const MAX_WS_FRAME_BYTES = 1 << 20; // 1 MiB Go WebSocket control-frame cap
 export const MAX_CALL_UTF8_BYTES = MAX_WS_FRAME_BYTES - 8_192; // Leaves 8 KiB headroom for dispatch JSON envelope
@@ -73,6 +73,8 @@ export interface AuthorizeArtifactUploadParams {
   jobNonce: string;
   siteId: string;
   requestId: string;
+  blobSha256?: string;
+  confirmOnly?: boolean;
   retention: string;
   storedBytes: number;
   contentBytes: number;
@@ -388,11 +390,12 @@ interface PendingJob {
   ws: HubSocketLike;
   timer: ReturnType<typeof setTimeout>;
   requestIds: Set<string>;
+  authorizedBlobs: Set<string>;
   artifactPolicy?: ArtifactDispatchPolicy;
   uploadedObjects: number;
   uploadedStoredBytes: number;
   uploadedContentBytes: number;
-  resolve: (bodyText: string) => void;
+  resolve: (res: { bodyText: string; authorizedBlobs: Set<string> }) => void;
   reject: (err: Error) => void;
 }
 
@@ -584,7 +587,8 @@ export class AgentHubEngine {
 
   private recordHostPacing(host: string | null, nextAllowedAt: number): void {
     if (!host) return;
-    this.hostWindows.setNextAllowed(host, nextAllowedAt);
+    const clamped = Math.min(this.now() + MAX_COOLDOWN_MS, nextAllowedAt);
+    this.hostWindows.setNextAllowed(host, clamped);
   }
 
   private getHostNextAllowed(host: string, now: number): number {
@@ -1136,7 +1140,7 @@ export class AgentHubEngine {
             const jobNonce = this.uuid();
 
             try {
-              const bodyText = await this.withSiteSlot(att.siteId, async () => {
+              const jobResult = await this.withSiteSlot(att.siteId, async () => {
                 const sendNow = this.now();
                 let currentAtt!: AgentAttachment;
                 currentAtt = this.mutateSocketAttachment(ws, att, (cur) => {
@@ -1178,15 +1182,12 @@ export class AgentHubEngine {
                   effectiveArtifactPolicy,
                 );
               });
+              const { bodyText, authorizedBlobs } = jobResult;
               this.mutateSocketAttachment(ws, att, (cur) => {
                 cur.jobsOk++;
                 cur.lastJobAt = this.now();
               });
               sitesUsed.push(att.siteId);
-
-              if (total === 1 && reqIndices.length === 1) {
-                lastRawSingleBody = bodyText;
-              }
 
               let parsed: CrawlReplyShape;
               try {
@@ -1206,9 +1207,23 @@ export class AgentHubEngine {
               const replyNow = this.now();
               for (let j = 0; j < reqIndices.length; j++) {
                 const origIdx = reqIndices[j]!;
-                const item = parsed.results[j]!;
+                const dispatchedReq = call.requests![origIdx];
+                const rawItem = parsed.results[j]!;
+                // H6: Force `id` and `url` to the exact dispatched request and strip any artifact hash not authorized for this job!
+                const item: CrawlResultItem = {
+                  ...rawItem,
+                  ...(typeof dispatchedReq?.id === 'string' ? { id: dispatchedReq.id } : {}),
+                  url: String(dispatchedReq?.url ?? ''),
+                };
+                const rawArt = item.artifact as { blobSha256?: unknown } | undefined;
+                if (rawArt !== undefined) {
+                  const bsha = typeof rawArt?.blobSha256 === 'string' ? rawArt.blobSha256.trim().toLowerCase() : '';
+                  if (!bsha || !authorizedBlobs.has(bsha)) {
+                    delete item.artifact;
+                  }
+                }
                 finalResults[origIdx] = item;
-                const itemHost = extractPrimaryHost(call.requests![origIdx]?.url);
+                const itemHost = extractPrimaryHost(dispatchedReq?.url);
                 const exactRetryMsForHealth = parseExactRetryAfterMs(item.retryAfter, replyNow);
                 const itemTiming = (item as { timing?: { ttfbMs?: unknown } }).timing;
                 const itemWaf = (item as { waf?: { vendor?: unknown } }).waf;
@@ -1218,7 +1233,7 @@ export class AgentHubEngine {
                     status: typeof item.status === 'number' ? item.status : 0,
                     outcome: typeof item.outcome === 'string' ? item.outcome : 'error',
                     ...(typeof itemTiming?.ttfbMs === 'number' ? { ttfbMs: itemTiming.ttfbMs } : {}),
-                    ...(exactRetryMsForHealth !== null ? { retryAfterMs: exactRetryMsForHealth } : {}),
+                    ...(exactRetryMsForHealth !== null ? { retryAfterMs: Math.min(MAX_COOLDOWN_MS, exactRetryMsForHealth) } : {}),
                     ...(typeof itemWaf?.vendor === 'string' ? { wafVendor: itemWaf.vendor } : {}),
                     now: replyNow,
                   });
@@ -1232,18 +1247,20 @@ export class AgentHubEngine {
                 if (item.status === 429 && item.outcome !== 'challenge') {
                   if (att.publicIp) triedIps[origIdx]!.add(att.publicIp);
                   const exactRetryMs = parseExactRetryAfterMs(item.retryAfter, replyNow);
-                  const requiredWaitMs = exactRetryMs !== null ? exactRetryMs : DEFAULT_429_NO_HEADER_WAIT_MS;
-                  const cooldownDurMs = Math.min(MAX_COOLDOWN_MS, requiredWaitMs + DEFAULT_429_COOLDOWN_MS);
+                  const rawRequiredWaitMs = exactRetryMs !== null ? exactRetryMs : DEFAULT_429_NO_HEADER_WAIT_MS;
+                  // M7: Clamp shared host pacing to MAX_COOLDOWN_MS while still honoring budget checks on exactRetryMs!
+                  const clampedPacingWaitMs = Math.min(MAX_COOLDOWN_MS, rawRequiredWaitMs);
+                  const cooldownDurMs = Math.min(MAX_COOLDOWN_MS, rawRequiredWaitMs + DEFAULT_429_COOLDOWN_MS);
 
                   if (itemHost) {
                     this.record429CooldownForNode(itemHost, att, replyNow + cooldownDurMs);
                     this.affinities.deleteStickyHost(itemHost);
-                    this.recordHostPacing(itemHost, replyNow + requiredWaitMs);
+                    this.recordHostPacing(itemHost, replyNow + clampedPacingWaitMs);
                   }
 
                   // Only attempt failover if we can honestly wait out the full Retry-After / 15s window within budget!
                   if (!wantSite) {
-                    if (replyNow + requiredWaitMs <= budgetDeadlineAt) {
+                    if (replyNow + rawRequiredWaitMs <= budgetDeadlineAt) {
                       nextPending.push(origIdx);
                     } else {
                       retryAfterBudgetExceeded = true;
@@ -1264,6 +1281,10 @@ export class AgentHubEngine {
                     nextPending.push(origIdx);
                   }
                 }
+              }
+              if (total === 1 && reqIndices.length === 1) {
+                parsed.results = [finalResults[0]!];
+                lastRawSingleBody = JSON.stringify(parsed);
               }
             } catch (e) {
               if (e instanceof PermanentJobError) {
@@ -1374,7 +1395,7 @@ export class AgentHubEngine {
     timeoutMs: number,
     requestIds: Set<string> = new Set(),
     artifactPolicy?: ArtifactDispatchPolicy,
-  ): Promise<string> {
+  ): Promise<{ bodyText: string; authorizedBlobs: Set<string> }> {
     const frameText = JSON.stringify({
       type: 'dispatch',
       jobId,
@@ -1390,7 +1411,7 @@ export class AgentHubEngine {
       );
     }
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<{ bodyText: string; authorizedBlobs: Set<string> }>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(jobId);
         reject(new Error(`agent ${siteId} timed out after ${timeoutMs}ms`));
@@ -1403,6 +1424,7 @@ export class AgentHubEngine {
         ws,
         timer,
         requestIds,
+        authorizedBlobs: new Set<string>(),
         ...(artifactPolicy ? { artifactPolicy } : {}),
         uploadedObjects: 0,
         uploadedStoredBytes: 0,
@@ -1452,16 +1474,21 @@ export class AgentHubEngine {
     if (params.contentBytes < 0 || params.contentBytes > job.artifactPolicy.maxContentBytes) {
       return { ok: false, status: 413, error: 'content_bytes_exceeds_limit' };
     }
-    if (
-      job.uploadedObjects + 1 > MAX_JOB_ARTIFACT_OBJECTS ||
-      job.uploadedStoredBytes + params.storedBytes > MAX_JOB_STORED_BYTES ||
-      job.uploadedContentBytes + params.contentBytes > MAX_JOB_CONTENT_BYTES
-    ) {
-      return { ok: false, status: 413, error: 'job_artifact_quota_exceeded' };
+    if (!params.confirmOnly) {
+      if (
+        job.uploadedObjects + 1 > MAX_JOB_ARTIFACT_OBJECTS ||
+        job.uploadedStoredBytes + params.storedBytes > MAX_JOB_STORED_BYTES ||
+        job.uploadedContentBytes + params.contentBytes > MAX_JOB_CONTENT_BYTES
+      ) {
+        return { ok: false, status: 413, error: 'job_artifact_quota_exceeded' };
+      }
+      job.uploadedObjects += 1;
+      job.uploadedStoredBytes += params.storedBytes;
+      job.uploadedContentBytes += params.contentBytes;
     }
-    job.uploadedObjects += 1;
-    job.uploadedStoredBytes += params.storedBytes;
-    job.uploadedContentBytes += params.contentBytes;
+    if (typeof params.blobSha256 === 'string' && /^[0-9a-f]{64}$/i.test(params.blobSha256.trim())) {
+      job.authorizedBlobs.add(params.blobSha256.trim().toLowerCase());
+    }
     return { ok: true };
   }
 
@@ -1494,7 +1521,7 @@ export class AgentHubEngine {
     }
     clearTimeout(job.timer);
     this.pending.delete(jobId);
-    job.resolve(bodyText);
+    job.resolve({ bodyText, authorizedBlobs: new Set(job.authorizedBlobs) });
     return { ok: true, status: 200 };
   }
 }

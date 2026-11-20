@@ -13,7 +13,7 @@
  *     `tryExternalSpaFallback` fetches and enforces `/robots.txt` first before calling Crawl4AI or Firecrawl.
  */
 
-import { isRobotsAllowed, parseOverflowRobotsTxt } from './overflow';
+import { fetchOverflowRobots, isRobotsAllowed } from './overflow';
 import { classifyWafAndChallenge, type ContentState, type WafClassification } from './waf';
 
 export type SpaFallbackProvider = 'crawl4ai' | 'firecrawl';
@@ -32,6 +32,8 @@ export interface SpaFallbackEnv {
   SPA_FALLBACK_ORDER?: string;
   /** Optional custom fetch override for deterministic unit testing. */
   SPA_FALLBACK_FETCH?: typeof fetch;
+  SAFE_FETCH?: typeof fetch;
+  SAFE_PUBLIC_FETCH?: typeof fetch;
   USER_AGENT?: string;
 }
 
@@ -117,26 +119,12 @@ async function verifyRobotsBeforeExternalFallback(
   targetUrl: string,
   userAgent: string,
   fetchFn: typeof fetch,
+  selfHost = '',
 ): Promise<boolean> {
   try {
     const u = new URL(targetUrl);
-    const robotsUrl = `${u.protocol}//${u.host}/robots.txt`;
-    const res = await fetchFn(robotsUrl, {
-      method: 'GET',
-      headers: { 'user-agent': userAgent, accept: 'text/plain,*/*;q=0.8' },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(8_000),
-    });
-    if (res.status >= 500) {
-      // Conservative RFC 9309 handling: treat unreachable 5xx robots.txt as temporarily disallowed.
-      return false;
-    }
-    if (res.status >= 400) {
-      // 404 / 403 / 410 on /robots.txt means unrestricted per RFC 9309.
-      return true;
-    }
-    const text = (await res.text()).slice(0, 512 * 1024);
-    const parsed = parseOverflowRobotsTxt(text, userAgent);
+    if (u.protocol !== 'https:') return false;
+    const parsed = await fetchOverflowRobots(u.origin, userAgent, fetchFn, Date.now() + 8_000, selfHost);
     const pathAndQuery = `${u.pathname || '/'}${u.search || ''}`;
     return isRobotsAllowed(parsed, pathAndQuery);
   } catch {
@@ -320,11 +308,12 @@ export async function tryExternalSpaFallback(params: {
   const candidates = mode === 'auto' ? configured : configured.filter((p) => p === mode);
   if (candidates.length === 0) return null;
 
-  const fetchFn = params.env.SPA_FALLBACK_FETCH ?? fetch;
-  const ua = params.env.USER_AGENT?.trim() || 'EdgeFetch/2.4 (+https://github.com/bartrumb/edgefetch)';
+  const fetchFn = params.env.SPA_FALLBACK_FETCH ?? params.env.SAFE_FETCH ?? fetch;
+  const robotsFetchFn = params.env.SPA_FALLBACK_FETCH ?? params.env.SAFE_PUBLIC_FETCH ?? fetchFn;
+  const ua = params.env.USER_AGENT?.trim() || 'EdgeFetch/2.5 (bot@edgefetch.dev)';
 
   if (!params.robotsAlreadyVerified) {
-    const allowed = await verifyRobotsBeforeExternalFallback(params.url, ua, fetchFn);
+    const allowed = await verifyRobotsBeforeExternalFallback(params.url, ua, robotsFetchFn);
     if (!allowed) return null;
   }
 

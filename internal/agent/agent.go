@@ -26,7 +26,7 @@ import (
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
 // Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/v2/internal/agent.Version=...".
-var Version = "2.5.2"
+var Version = "2.5.3"
 
 const (
 	DefaultPingInterval          = 30 * time.Second
@@ -148,6 +148,9 @@ func Run(
 	rtOpts = rtOpts.withDefaults()
 	replyClient := &http.Client{
 		Transport: hubTransport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	attempt := 0

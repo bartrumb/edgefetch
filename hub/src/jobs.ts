@@ -14,6 +14,7 @@
  *  - `Section 4`: First-class `executeJobsCall` (`POST /v1/jobs` & MCP `jobs` tool).
  */
 
+import { compileSafeUserRegex } from './safe-input';
 import type { ArtifactRetention, OptionalStorageBindings } from './storage';
 
 export type PayPeriod = 'year' | 'month' | 'week' | 'day' | 'hour';
@@ -1331,11 +1332,11 @@ export function chunkJsonRecords(params: {
             const val = readNestedField(rec, c.field);
             if (c.op === '=') return val.toLowerCase() === c.value.toLowerCase();
             if (c.op === '!=') return val.toLowerCase() !== c.value.toLowerCase();
-            try {
-              return new RegExp(c.value, 'i').test(val);
-            } catch {
+            const safeRe = compileSafeUserRegex(c.value, 'i');
+            if (!safeRe) {
               return val.toLowerCase().includes(c.value.toLowerCase());
             }
+            return safeRe.test(val);
           }),
         );
 

@@ -277,6 +277,20 @@ export class S3ArtifactBucket {
   ): Promise<R2Object | null> {
     const bytes = await readValueBytes(value);
     const payloadSha = await sha256Hex(bytes);
+    if (options?.sha256 !== undefined) {
+      let wantHex = '';
+      if (typeof options.sha256 === 'string') {
+        wantHex = options.sha256.trim().toLowerCase();
+      } else if (options.sha256 instanceof ArrayBuffer) {
+        wantHex = Array.from(new Uint8Array(options.sha256), (b) => b.toString(16).padStart(2, '0')).join('');
+      } else if (ArrayBuffer.isView(options.sha256)) {
+        const view = new Uint8Array(options.sha256.buffer, options.sha256.byteOffset, options.sha256.byteLength);
+        wantHex = Array.from(view, (b) => b.toString(16).padStart(2, '0')).join('');
+      }
+      if (!wantHex || wantHex !== payloadSha.toLowerCase()) {
+        throw new Error('R2 sha256 checksum mismatch');
+      }
+    }
     const extraHeaders: Record<string, string> = {
       'content-length': String(bytes.byteLength),
     };

@@ -700,6 +700,7 @@ export async function startOrExecuteAgentCall(params: {
         crawlId: record.id,
         data: { agentId: record.id, status: 'processing', prompt: prompt.slice(0, 200) },
         selfHost,
+        ...(env.SAFE_PUBLIC_FETCH ? { fetchFn: env.SAFE_PUBLIC_FETCH } : env.SAFE_FETCH ? { fetchFn: env.SAFE_FETCH } : {}),
       }).catch(() => undefined);
     }
 
@@ -893,9 +894,20 @@ export async function startOrExecuteAgentCall(params: {
         if (record.pagesRead >= record.maxPages) {
           return { ok: false, budgetExhausted: true, summaryForLlm: JSON.stringify({ error: 'maxPages budget reached' }) };
         }
+        // M8 Security Invariant: Strictly allowlist non-navigating, non-JS-executing browser actions on model-emitted
+        // `/v1/agent` turns so prompt-injected page text cannot execute `navigate` (escaping `strictConstrainToURLs`)
+        // or `executeJavascript`!
+        const SAFE_AGENT_ACTION_TYPES = new Set(['click', 'fill', 'write', 'type', 'press', 'scroll', 'wait', 'select']);
+        const filteredActions = Array.isArray(args.actions)
+          ? args.actions.filter((act) => {
+              if (!act || typeof act !== 'object') return false;
+              const t = typeof (act as { type?: unknown }).type === 'string' ? (act as { type: string }).type.trim() : '';
+              return SAFE_AGENT_ACTION_TYPES.has(t);
+            })
+          : [];
         record.pagesRead++;
         const iOut = await executeInteractCall({
-          payload: { url: targetUrl, actions: args.actions, formats: ['markdown'] },
+          payload: { url: targetUrl, actions: filteredActions, formats: ['markdown'] },
           env: zeroDataRetention ? {} : env,
           executeHubFetch,
           selfHost,
@@ -1303,6 +1315,7 @@ export async function startOrExecuteAgentCall(params: {
         crawlId: record.id,
         data: formatPublicAgentResponse(record, false),
         selfHost,
+        ...(env.SAFE_PUBLIC_FETCH ? { fetchFn: env.SAFE_PUBLIC_FETCH } : env.SAFE_FETCH ? { fetchFn: env.SAFE_FETCH } : {}),
       }).catch(() => undefined);
     }
 

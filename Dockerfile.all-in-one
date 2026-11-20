@@ -1,9 +1,9 @@
 # All-in-One Self-Hosted EdgeFetch Container (Fly.io, Railway, Render, Coolify, or standalone Docker).
 # Packages the full TypeScript Hub (`/admin`, OAuth 2.1, 11-tool `/mcp`, `node:sqlite` FTS5, `/data` artifacts, OTLP)
 # together with a local Go `edgefetch` worker + Headless Chromium + Poppler PDF — zero Postgres, zero Redis!
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS go-build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS go-build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.5.2
+ARG BUILD_VERSION=2.5.3
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(go env GOARCH)} go build -tr
       -ldflags="-s -w -X github.com/bartrumb/edgefetch/v2/internal/agent.Version=${BUILD_VERSION}" \
       -o /out/edgefetch ./cmd/edgefetch
 
-FROM --platform=$BUILDPLATFORM node:24-alpine AS hub-build
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS hub-build
 WORKDIR /app/hub
 COPY hub/package.json hub/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -24,11 +24,12 @@ COPY hub/portable ./portable
 COPY hub/scripts ./scripts
 RUN npm run build:portable
 
-FROM node:24-alpine
+FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5
 LABEL org.opencontainers.image.title="EdgeFetch All-in-One" \
       org.opencontainers.image.description="Self-hosted EdgeFetch Hub + Go HTTP/2 + Headless Chromium + SQLite FTS5 in one container" \
       org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"
 
 RUN apk add --no-cache \
       ca-certificates \

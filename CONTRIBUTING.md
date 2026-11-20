@@ -14,11 +14,11 @@ Every pull request must preserve EdgeFetch's ethical, security, and supply-chain
    - **Zero anti-bot or CAPTCHA bypasses:** Never add CAPTCHA solvers, Turnstile/reCAPTCHA clickers, stealth fingerprint spoofers, or residential proxy rotation marketplaces. EdgeFetch classifies challenges (`outcome: "challenge"`) and halts immediately on the first attempt.
 2. **Minimal, Auditable Supply Chain:**
    - **Go (`go.mod`):** Strictly **one external dependency** (`github.com/coder/websocket`, zero transitive dependencies) with `CGO_ENABLED=0`. CI fails automatically if `go mod graph` gains any unexpected module.
-   - **TypeScript Hub (`hub/package.json`):** Strictly **zero npm runtime `dependencies`** (`devDependencies` only for TypeScript, esbuild, Wrangler, and Miniflare tests).
+   - **TypeScript Hub (`hub/package.json`):** Strictly **zero npm runtime `dependencies`** (`devDependencies` only for TypeScript, esbuild, Wrangler, and Miniflare-based hub tests).
 3. **Keyless Built-In Adapters Only:**
    - Built-in site and ATS adapters under [`hub/src/extractors/providers/`](hub/src/extractors/providers/) must work out of the box with **zero paid B2B API keys** (public JSON/XML twins, JSON-LD, SSR metadata, or HTML cleanup). Paid fallbacks belong strictly to optional operator-configured `FIRECRAWL_API_KEY` / BYO-LLM settings.
-4. **Release Signing & Secret Isolation:**
-   - Official release binaries (`checksums.txt.sig`) and OCI images are cryptographically signed with an owner-only Ed25519 key (`RELEASE_SIGNING_PRIVATE_KEY` in GitHub Actions Sealed Secrets, verified against [`keys/release-signing-pub.pem`](keys/release-signing-pub.pem)) plus GitHub SLSA Build Provenance attestations.
+4. **Release Signing, Provenance & Secret Isolation:**
+   - Official release checksum manifests (`checksums.txt.sig`) are cryptographically signed with an owner-only Ed25519 key (`RELEASE_SIGNING_PRIVATE_KEY` in GitHub Actions Sealed Secrets, verified against [`keys/release-signing-pub.pem`](keys/release-signing-pub.pem)), and all release archives plus GHCR OCI images carry GitHub SLSA Build Provenance attestations (`gh attestation verify`).
    - Fork pull requests **never** receive access to repository secrets, and `main` + `v*` release tags are enforced by GitHub Repository Rulesets and [`.github/CODEOWNERS`](.github/CODEOWNERS). Never modify `.github/workflows/release.yml` or `keys/` in contributor PRs unless explicitly coordinated with the maintainer.
 5. **Licensing & AI-Assisted Contributions:**
    - Inbound = Outbound (**MIT License**): By submitting a pull request, you confirm that you have the right to license your contribution under [LICENSE](LICENSE) and that no proprietary or copyleft-incompatible code is included.

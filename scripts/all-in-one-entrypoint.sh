@@ -29,11 +29,20 @@ trap cleanup INT TERM
 
 if [ "${EDGEFETCH_DISABLE_LOCAL_AGENT:-0}" != "1" ]; then
   sleep 1
-  EDGEFETCH_ALLOW_INSECURE_HUB=1 \
-  EDGEFETCH_HUB_URL="http://127.0.0.1:${PORT}" \
-  EDGEFETCH_AGENT_TOKEN="${AGENT_TOKEN}" \
-  EDGEFETCH_SITE_ID="${EDGEFETCH_SITE_ID:-local-fat-1}" \
-  /usr/local/bin/edgefetch --mode=agent &
+  # H9 Security Invariant: Launch the local worker with `env -i` so Hub secrets (`CALLER_TOKEN`, LLM API keys,
+  # `BOT_SIGNING_PRIVATE_KEY`, `TURSO_AUTH_TOKEN`, S3 keys) are NEVER present in the worker or Chromium `/proc/self/environ`!
+  env -i \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    HOME="/tmp" \
+    TMPDIR="/tmp" \
+    EDGEFETCH_CHROME_BIN="${EDGEFETCH_CHROME_BIN:-/usr/lib/chromium/chromium}" \
+    GOMEMLIMIT="${GOMEMLIMIT:-384MiB}" \
+    EDGEFETCH_ALLOW_INSECURE_HUB=1 \
+    EDGEFETCH_HUB_URL="http://127.0.0.1:${PORT}" \
+    EDGEFETCH_AGENT_TOKEN="${AGENT_TOKEN}" \
+    EDGEFETCH_SITE_ID="${EDGEFETCH_SITE_ID:-local-fat-1}" \
+    OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-}" \
+    /usr/local/bin/edgefetch --mode=agent &
   AGENT_PID=$!
 fi
 

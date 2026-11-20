@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net"
@@ -33,6 +34,7 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 	"github.com/bartrumb/edgefetch/v2/internal/otel"
+	"github.com/bartrumb/edgefetch/v2/internal/ws"
 )
 
 const (
@@ -42,6 +44,8 @@ const (
 	maxArtifactStoreBytes = 64 << 20 // 64 MiB bounded in-memory artifact ring
 	defaultCooldownDur    = 15 * time.Second
 	stickyAffinityTTL     = 10 * time.Minute
+	maxConcurrentCalls    = 8
+	maxJobArtifactUploads = 32
 )
 
 var (
@@ -52,21 +56,23 @@ var (
 
 // Config configures a self-hosted Go Hub controller instance.
 type Config struct {
-	CallerToken       string
-	AgentToken        string
-	AgentTokens       map[string]string
-	PeerURLs          []string
-	PeerToken         string
-	PeerHTTPClient    *http.Client
-	FallbackCrawler   *crawl.Crawler
-	BotSigner         *botauth.Signer
-	BotPublicJWKs     []botauth.PublicJWK
-	BotContactURL     string
-	UserAgent         string
-	Allow             func(*url.URL) error
-	Logger            *slog.Logger
-	DispatchTimeout   time.Duration
-	MaxArtifactMemory int
+	CallerToken         string
+	AgentToken          string
+	AgentTokens         map[string]string
+	PeerURLs            []string
+	PeerToken           string
+	PeerHTTPClient      *http.Client
+	FallbackCrawler     *crawl.Crawler
+	BotSigner           *botauth.Signer
+	BotPublicJWKs       []botauth.PublicJWK
+	BotContactURL       string
+	UserAgent           string
+	AllowedLoopbackPort string
+	MaxConcurrentCalls  int
+	Allow               func(*url.URL) error
+	Logger              *slog.Logger
+	DispatchTimeout     time.Duration
+	MaxArtifactMemory   int
 }
 
 type agentSession struct {
@@ -96,12 +102,17 @@ func (s *agentSession) hasCapability(want string) bool {
 }
 
 type pendingJob struct {
-	jobID     string
-	jobNonce  string
-	siteID    string
-	session   *agentSession
-	doneCh    chan jobOutcome
-	createdAt time.Time
+	jobID         string
+	jobNonce      string
+	siteID        string
+	session       *agentSession
+	requests      []crawl.Request
+	replyClaimed  bool
+	uploading     bool
+	uploadsCount  int
+	uploadedBlobs map[string]bool
+	doneCh        chan jobOutcome
+	createdAt     time.Time
 }
 
 type jobOutcome struct {
@@ -137,10 +148,11 @@ type AgentInfo struct {
 
 // Server coordinates connected Go edge workers and serves `/fetch`, `/v1/scrape`, and `/mcp`.
 type Server struct {
-	cfg    Config
-	log    *slog.Logger
-	allow  func(*url.URL) error
-	closed atomic.Bool
+	cfg     Config
+	log     *slog.Logger
+	allow   func(*url.URL) error
+	callSem chan struct{}
+	closed  atomic.Bool
 
 	mu         sync.Mutex
 	agents     map[string]*agentSession
@@ -195,10 +207,15 @@ func NewServer(cfg Config) *Server {
 	if maxCap <= 0 {
 		maxCap = maxArtifactStoreBytes
 	}
+	conc := cfg.MaxConcurrentCalls
+	if conc <= 0 {
+		conc = maxConcurrentCalls
+	}
 	return &Server{
 		cfg:        cfg,
 		log:        log,
 		allow:      allow,
+		callSem:    make(chan struct{}, conc),
 		agents:     make(map[string]*agentSession),
 		pending:    make(map[string]*pendingJob),
 		cooldowns:  make(map[string]time.Time),
@@ -340,6 +357,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized", "message": "valid Bearer or x-api-key token required"})
 		return
 	}
+	if strings.TrimSpace(s.cfg.CallerToken) == "" {
+		if code, msg := s.validateTokenlessLoopbackRequest(r); code != 0 {
+			writeJSON(w, code, map[string]string{"error": "loopback_origin_rejected", "message": msg})
+			return
+		}
+	}
 
 	switch {
 	case r.URL.Path == "/" && r.Method == http.MethodGet && strings.TrimSpace(s.cfg.CallerToken) == "":
@@ -363,23 +386,81 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case r.URL.Path == "/fetch" && r.Method == http.MethodPost:
-		s.handleCallerFetch(w, r)
+		s.withCallerConcurrencyGate(w, r, s.handleCallerFetch)
 
 	case r.URL.Path == "/v1/scrape" && r.Method == http.MethodPost:
-		s.handleCallerScrape(w, r)
+		s.withCallerConcurrencyGate(w, r, s.handleCallerScrape)
 
 	case (r.URL.Path == "/v2/scrape" || r.URL.Path == "/compat/firecrawl/v2/scrape") && r.Method == http.MethodPost:
-		s.handleFirecrawlV2Scrape(w, r)
+		s.withCallerConcurrencyGate(w, r, s.handleFirecrawlV2Scrape)
 
 	case (r.URL.Path == "/v1/map" || r.URL.Path == "/v2/map" || r.URL.Path == "/compat/firecrawl/v2/map") && r.Method == http.MethodPost:
-		s.handleCallerMap(w, r, strings.HasPrefix(r.URL.Path, "/v2/") || strings.HasPrefix(r.URL.Path, "/compat/"))
+		s.withCallerConcurrencyGate(w, r, func(rw http.ResponseWriter, req *http.Request) {
+			s.handleCallerMap(rw, req, strings.HasPrefix(req.URL.Path, "/v2/") || strings.HasPrefix(req.URL.Path, "/compat/"))
+		})
 
 	case r.URL.Path == "/mcp":
-		s.handleMCP(w, r)
+		s.withCallerConcurrencyGate(w, r, s.handleMCP)
 
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 	}
+}
+
+func (s *Server) withCallerConcurrencyGate(w http.ResponseWriter, r *http.Request, fn func(http.ResponseWriter, *http.Request)) {
+	select {
+	case s.callSem <- struct{}{}:
+		defer func() { <-s.callSem }()
+		fn(w, r)
+	default:
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server_busy", "message": "too many concurrent hub requests"})
+	}
+}
+
+func isLoopbackHostnameOnly(h string) bool {
+	clean := strings.ToLower(strings.Trim(strings.TrimSpace(h), "[]"))
+	return clean == "127.0.0.1" || clean == "localhost" || clean == "::1"
+}
+
+func (s *Server) validateTokenlessLoopbackRequest(r *http.Request) (int, string) {
+	rawHost := strings.TrimSpace(r.Host)
+	if rawHost == "" {
+		return http.StatusForbidden, "missing Host header on tokenless loopback server"
+	}
+	hostPart, portPart, splitErr := net.SplitHostPort(rawHost)
+	if splitErr != nil {
+		hostPart = rawHost
+		portPart = ""
+	}
+	if !isLoopbackHostnameOnly(hostPart) {
+		return http.StatusForbidden, "Host header must be 127.0.0.1, localhost, or [::1]"
+	}
+	wantPort := strings.TrimSpace(s.cfg.AllowedLoopbackPort)
+	if wantPort != "" && portPart != wantPort {
+		return http.StatusForbidden, "Host header port mismatch"
+	}
+
+	if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs == "cross-site" {
+		return http.StatusForbidden, "cross-site browser requests are forbidden"
+	}
+
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		ou, oErr := url.Parse(origin)
+		if oErr != nil || (ou.Scheme != "http" && ou.Scheme != "https") || !isLoopbackHostnameOnly(ou.Hostname()) {
+			return http.StatusForbidden, "cross-origin browser requests are forbidden"
+		}
+		if wantPort != "" && ou.Port() != wantPort {
+			return http.StatusForbidden, "Origin port mismatch"
+		}
+	}
+
+	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete {
+		ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+		if !strings.HasPrefix(ct, "application/json") {
+			return http.StatusUnsupportedMediaType, "tokenless loopback endpoints require Content-Type: application/json"
+		}
+	}
+	return 0, ""
 }
 
 func (s *Server) isCallerAuthorized(r *http.Request) bool {
@@ -537,10 +618,12 @@ func (s *Server) handleAgentArtifactPut(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_artifact_headers"})
 		return
 	}
-	if !s.verifyPendingJob(jobID, jobNonce, siteID) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown_job"})
+	releaseUpload, acquireCode := s.acquirePendingJobArtifactSlot(jobID, jobNonce, siteID)
+	if acquireCode != 0 {
+		writeJSON(w, acquireCode, map[string]string{"error": "artifact_upload_rejected"})
 		return
 	}
+	defer releaseUpload("")
 
 	gzBytes, err := io.ReadAll(io.LimitReader(r.Body, crawl.MaxMaxBytes+1024))
 	if err != nil || len(gzBytes) > crawl.MaxMaxBytes {
@@ -559,6 +642,7 @@ func (s *Server) handleAgentArtifactPut(w http.ResponseWriter, r *http.Request) 
 		gzBytes:       gzBytes,
 		storedAt:      time.Now(),
 	})
+	releaseUpload(blobSHA)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "blobSha256": blobSHA})
 }
 
@@ -619,8 +703,11 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_job_headers"})
 		return
 	}
-	if !s.verifyPendingJob(jobID, jobNonce, siteID) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown_job"})
+	// Atomically claim the single reply slot BEFORE reading r.Body so concurrent duplicate POSTs
+	// for the same pending job never buffer multiple 20-32 MiB payloads in memory!
+	dispatchedReqs, allowedBlobs, claimed := s.claimPendingJobReply(jobID, jobNonce, siteID)
+	if !claimed {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown_or_already_claimed_job"})
 		return
 	}
 
@@ -656,19 +743,77 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_reply_json"})
 		return
 	}
+	if len(reply.Results) != len(dispatchedReqs) {
+		s.completePending(jobID, jobNonce, siteID, jobOutcome{err: errors.New("mismatched_result_count")})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mismatched_result_count"})
+		return
+	}
+	// Enforce H6 reply integrity: bind ID and URL to the dispatched requests and strip any unauthorized artifact hash!
+	for i := range reply.Results {
+		reply.Results[i].ID = dispatchedReqs[i].ID
+		reply.Results[i].URL = dispatchedReqs[i].URL
+		if reply.Results[i].RetryAfterMs > 120_000 {
+			reply.Results[i].RetryAfterMs = 120_000
+		}
+		if reply.Results[i].Artifact != nil {
+			bsha := strings.ToLower(strings.TrimSpace(reply.Results[i].Artifact.BlobSHA256))
+			if !allowedBlobs[bsha] {
+				reply.Results[i].Artifact = nil
+			}
+		}
+	}
 
 	s.completePending(jobID, jobNonce, siteID, jobOutcome{reply: reply, raw: string(decoded)})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *Server) verifyPendingJob(jobID, jobNonce, siteID string) bool {
+func (s *Server) acquirePendingJobArtifactSlot(jobID, jobNonce, siteID string) (func(uploadedSHA string), int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pj, ok := s.pending[jobID]
-	if !ok || pj.siteID != siteID {
-		return false
+	if !ok || pj.siteID != siteID || !constantTimeEquals(jobNonce, pj.jobNonce) || pj.replyClaimed {
+		return nil, http.StatusNotFound
 	}
-	return constantTimeEquals(jobNonce, pj.jobNonce)
+	if pj.uploading {
+		return nil, http.StatusConflict
+	}
+	if pj.uploadsCount >= maxJobArtifactUploads {
+		return nil, http.StatusTooManyRequests
+	}
+	pj.uploading = true
+	var once sync.Once
+	return func(uploadedSHA string) {
+		once.Do(func() {
+			s.mu.Lock()
+			if cur, still := s.pending[jobID]; still && cur == pj {
+				cur.uploading = false
+				if uploadedSHA != "" {
+					cur.uploadsCount++
+					if cur.uploadedBlobs == nil {
+						cur.uploadedBlobs = make(map[string]bool)
+					}
+					cur.uploadedBlobs[uploadedSHA] = true
+				}
+			}
+			s.mu.Unlock()
+		})
+	}, 0
+}
+
+func (s *Server) claimPendingJobReply(jobID, jobNonce, siteID string) ([]crawl.Request, map[string]bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pj, ok := s.pending[jobID]
+	if !ok || pj.siteID != siteID || !constantTimeEquals(jobNonce, pj.jobNonce) || pj.replyClaimed {
+		return nil, nil, false
+	}
+	pj.replyClaimed = true
+	reqs := append([]crawl.Request(nil), pj.requests...)
+	blobs := make(map[string]bool, len(pj.uploadedBlobs))
+	for k, v := range pj.uploadedBlobs {
+		blobs[k] = v
+	}
+	return reqs, blobs, true
 }
 
 func (s *Server) completePending(jobID, jobNonce, siteID string, out jobOutcome) {
@@ -684,15 +829,17 @@ func (s *Server) completePending(jobID, jobNonce, siteID string, out jobOutcome)
 		return
 	}
 
-	pj.session.mu.Lock()
-	pj.session.busy = false
-	pj.session.lastJobAt = time.Now()
-	if out.err != nil {
-		pj.session.jobsErr++
-	} else {
-		pj.session.jobsOK++
+	if pj.session != nil {
+		pj.session.mu.Lock()
+		pj.session.busy = false
+		pj.session.lastJobAt = time.Now()
+		if out.err != nil {
+			pj.session.jobsErr++
+		} else {
+			pj.session.jobsOK++
+		}
+		pj.session.mu.Unlock()
 	}
-	pj.session.mu.Unlock()
 
 	if out.err == nil {
 		now := time.Now()
@@ -868,7 +1015,19 @@ func replyHitStopOrChallenge(rep crawl.FetchReply) bool {
 func (s *Server) tryPeerHandoff(ctx context.Context, call crawl.FetchCall, primaryHost string, traceMap map[string]string) (crawl.FetchReply, string, bool) {
 	client := s.cfg.PeerHTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 35 * time.Second}
+		client = &http.Client{
+			Timeout: 35 * time.Second,
+			Transport: &http.Transport{
+				Proxy:                 nil, // Never inherit ambient HTTP_PROXY / HTTPS_PROXY for peer token handoffs
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				ForceAttemptHTTP2:     true,
+				TLSClientConfig:       ws.ClassicTLSConfig(),
+			},
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 	peerTok := firstNonEmpty(s.cfg.PeerToken, s.cfg.CallerToken)
 	bodyBytes, err := json.Marshal(call)
@@ -880,6 +1039,14 @@ func (s *Server) tryPeerHandoff(ctx context.Context, call crawl.FetchCall, prima
 	for _, rawPeer := range s.cfg.PeerURLs {
 		base := strings.TrimRight(strings.TrimSpace(rawPeer), "/")
 		if base == "" {
+			continue
+		}
+		pu, pErr := url.Parse(base)
+		if pErr != nil {
+			continue
+		}
+		// Never transmit PeerToken/CallerToken over cleartext http:// to non-loopback peers!
+		if pu.Scheme != "https" && !(pu.Scheme == "http" && isLoopbackHostnameOnly(pu.Hostname())) {
 			continue
 		}
 		cdKey := "peer:" + base + "|" + primaryHost
@@ -1009,12 +1176,14 @@ func (s *Server) dispatchToSession(ctx context.Context, sess *agentSession, call
 	jobID := "job_" + randomHex(10)
 	jobNonce := randomHex(16)
 	pj := &pendingJob{
-		jobID:     jobID,
-		jobNonce:  jobNonce,
-		siteID:    sess.siteID,
-		session:   sess,
-		doneCh:    make(chan jobOutcome, 1),
-		createdAt: time.Now(),
+		jobID:         jobID,
+		jobNonce:      jobNonce,
+		siteID:        sess.siteID,
+		session:       sess,
+		requests:      append([]crawl.Request(nil), call.Requests...),
+		uploadedBlobs: make(map[string]bool),
+		doneCh:        make(chan jobOutcome, 1),
+		createdAt:     time.Now(),
 	}
 
 	s.mu.Lock()
@@ -1599,11 +1768,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func (s *Server) serveDesktopLaunchpad(w http.ResponseWriter, r *http.Request) {
-	origin := "http://" + r.Host
+	safeHost := r.Host
+	if safeHost == "" {
+		safeHost = "127.0.0.1:8787"
+	}
+	origin := "http://" + safeHost
 	mcpURL := origin + "/mcp"
 	vscodeLink := "vscode:mcp/install?%7B%22name%22%3A%22edgefetch%22%2C%22type%22%3A%22http%22%2C%22url%22%3A%22" + url.QueryEscape(mcpURL) + "%22%7D"
-	cursorCfgB64 := "eyJ1cmwiOiI" // dynamic in JS below for exact host port
-	_ = cursorCfgB64
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = fmt.Fprintf(w, `<!doctype html>
@@ -1665,5 +1836,5 @@ edgefetch install-mcp</pre>
     });
   </script>
 </body>
-</html>`, agent.Version, agent.Version, origin, vscodeLink, mcpURL, mcpURL)
+</html>`, agent.Version, agent.Version, html.EscapeString(origin), html.EscapeString(vscodeLink), html.EscapeString(mcpURL), mcpURL)
 }

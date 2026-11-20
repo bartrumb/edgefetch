@@ -60,6 +60,10 @@ jobs:
           go test -fuzz=FuzzClassify -fuzztime=2s ./internal/classify
           go test -fuzz=FuzzExtractHTML -fuzztime=2s ./internal/extract
           go test -fuzz=FuzzParseLlmsTxt -fuzztime=2s ./internal/extract
+          go test -fuzz=FuzzExtractPDFPureGo -fuzztime=2s ./internal/extract
+          go test -fuzz=FuzzBotAuthVerifyRequest -fuzztime=2s ./internal/botauth
+          go test -fuzz=FuzzValidateCustomHeaders -fuzztime=2s ./internal/crawl
+          go test -fuzz=FuzzPublicHTTPS -fuzztime=2s ./internal/crawl
 
       - name: Run allocation microbenchmarks & WASI WebAssembly build check
         run: |

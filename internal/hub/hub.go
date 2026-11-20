@@ -274,6 +274,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/v1/scrape" && r.Method == http.MethodPost:
 		s.handleCallerScrape(w, r)
 
+	case (r.URL.Path == "/v2/scrape" || r.URL.Path == "/compat/firecrawl/v2/scrape") && r.Method == http.MethodPost:
+		s.handleFirecrawlV2Scrape(w, r)
+
+	case (r.URL.Path == "/v1/map" || r.URL.Path == "/v2/map" || r.URL.Path == "/compat/firecrawl/v2/map") && r.Method == http.MethodPost:
+		s.handleCallerMap(w, r, strings.HasPrefix(r.URL.Path, "/v2/") || strings.HasPrefix(r.URL.Path, "/compat/"))
+
 	case r.URL.Path == "/mcp":
 		s.handleMCP(w, r)
 
@@ -1099,6 +1105,106 @@ func (s *Server) handleCallerScrape(w http.ResponseWriter, r *http.Request) {
 	body, via, status := s.executeScrape(r.Context(), p, r.Header)
 	w.Header().Set("X-Crawler-Via", via)
 	writeJSON(w, status, body)
+}
+
+func (s *Server) handleFirecrawlV2Scrape(w http.ResponseWriter, r *http.Request) {
+	var p scrapePayload
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, crawl.MaxCallBodyBytes))
+	if err := dec.Decode(&p); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": "bad_json", "message": err.Error()})
+		return
+	}
+	body, via, status := s.executeScrape(r.Context(), p, r.Header)
+	w.Header().Set("X-Crawler-Via", via)
+	okVal, _ := body["ok"].(bool)
+	if status != http.StatusOK || !okVal {
+		writeJSON(w, status, map[string]any{"success": false, "error": firstNonEmpty(fmt.Sprint(body["problem"]), fmt.Sprint(body["error"]))})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": body})
+}
+
+var (
+	reHubSitemapLoc = regexp.MustCompile(`(?i)<loc>\s*(https?://[^<\s]+)\s*</loc>`)
+	reHubMdURL      = regexp.MustCompile(`\]\((https?://[^)\s]+)\)`)
+)
+
+func (s *Server) handleCallerMap(w http.ResponseWriter, r *http.Request, v2Envelope bool) {
+	var mp struct {
+		URL    string `json:"url"`
+		Search string `json:"search"`
+		Limit  int    `json:"limit"`
+		Target string `json:"target"`
+		Site   string `json:"site"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, crawl.MaxCallBodyBytes))
+	if err := dec.Decode(&mp); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "success": false, "error": "bad_json"})
+		return
+	}
+	parsedURL, uErr := url.Parse(strings.TrimSpace(mp.URL))
+	if uErr != nil || s.allow(parsedURL) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "success": false, "error": "invalid_url"})
+		return
+	}
+	if mp.Limit <= 0 || mp.Limit > 500 {
+		mp.Limit = 100
+	}
+	origin := parsedURL.Scheme + "://" + parsedURL.Host
+	call := crawl.FetchCall{
+		MaxSeconds: 30,
+		Options:    crawl.Options{Concurrency: 2, IncludeBody: true, RespectRobots: crawl.Bool(true)},
+		Requests: []crawl.Request{
+			{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText},
+			{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText},
+			{ID: "home", URL: parsedURL.String(), Kind: classify.KindScrape, Formats: []string{"links"}},
+		},
+	}
+	rep, via, status, err := s.DispatchOrFallback(r.Context(), call, mp.Target, mp.Site, r.Header)
+	if err != nil {
+		writeJSON(w, status, map[string]any{"ok": false, "success": false, "error": err.Error()})
+		return
+	}
+	seen := map[string]struct{}{}
+	var links []string
+	filterLower := strings.ToLower(strings.TrimSpace(mp.Search))
+	addCand := func(cand string) {
+		cand = strings.TrimSpace(cand)
+		if (!strings.HasPrefix(cand, "https://") && !strings.HasPrefix(cand, "http://")) || len(links) >= mp.Limit {
+			return
+		}
+		if cu, cErr := url.Parse(cand); cErr != nil || s.allow(cu) != nil {
+			return
+		}
+		if filterLower != "" && !strings.Contains(strings.ToLower(cand), filterLower) {
+			return
+		}
+		if _, exists := seen[cand]; !exists {
+			seen[cand] = struct{}{}
+			links = append(links, cand)
+		}
+	}
+	for _, item := range rep.Results {
+		for _, l := range item.Links {
+			addCand(l)
+		}
+		for _, m := range reHubSitemapLoc.FindAllStringSubmatch(item.Body, 500) {
+			if len(m) > 1 {
+				addCand(m[1])
+			}
+		}
+		for _, m := range reHubMdURL.FindAllStringSubmatch(item.Body, 500) {
+			if len(m) > 1 {
+				addCand(m[1])
+			}
+		}
+	}
+	w.Header().Set("X-Crawler-Via", via)
+	if v2Envelope {
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "links": links})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": origin, "total": len(links), "links": links})
 }
 
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {

@@ -159,3 +159,22 @@ int main(void) { return 0; }</code></pre>
 		t.Fatalf("unexpected <head><title> duplication in <main>-less page:\n%s", gotNoMain.Markdown)
 	}
 }
+
+func TestResolveHrefPreservesSemicolonlessQueryParams(t *testing.T) {
+	raw := `<html><body><main><a href="https://example.com/watch?v=1&amp;currentTime=45&section=2&region=us">Video</a></main></body></html>`
+	got := ExtractHTML(raw, ExtractOptions{BaseURL: "https://example.com", OnlyMainContent: true, IncludeLinks: true})
+	want := "https://example.com/watch?v=1&currentTime=45&section=2&region=us"
+	if len(got.Links) != 1 || got.Links[0] != want {
+		t.Fatalf("expected link %q, got %v", want, got.Links)
+	}
+	if !strings.Contains(got.Markdown, want) {
+		t.Fatalf("expected Markdown to preserve %q, got: %s", want, got.Markdown)
+	}
+
+	// Invisible Unicode Tag ASCII smuggling (U+E0000..U+E007F) and Bidi overrides must be stripped.
+	smuggled := "<html><body><main><p>Clean\U000E0049\U000E0047\u202E text</p></main></body></html>"
+	gotClean := ExtractHTML(smuggled, ExtractOptions{OnlyMainContent: true})
+	if gotClean.Markdown != "Clean text" {
+		t.Fatalf("expected invisible smuggling codepoints stripped, got %q", gotClean.Markdown)
+	}
+}

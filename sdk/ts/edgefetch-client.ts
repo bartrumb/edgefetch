@@ -6,6 +6,9 @@
 export type ScrapeFormat =
   | 'markdown'
   | 'text'
+  | 'summary'
+  | 'product'
+  | 'rawBase64'
   | 'html'
   | 'rawHtml'
   | 'links'
@@ -14,7 +17,11 @@ export type ScrapeFormat =
   | 'llmsTxt'
   | 'screenshot'
   | 'changes'
-  | { type: 'json'; schema: Record<string, unknown> };
+  | 'changeTracking'
+  | { type: 'json'; prompt?: string; schema?: Record<string, unknown> }
+  | { type: 'attributes'; selectors: Array<{ selector: string; attribute: string }> }
+  | { type: 'screenshot'; fullPage?: boolean; quality?: number; viewport?: { width?: number; height?: number } }
+  | { type: 'changeTracking'; modes?: Array<'git-diff' | 'json'>; tag?: string };
 
 export interface EdgeFetchClientOptions {
   /** Single Hub URL (e.g. `https://edgefetch.example.com`). */
@@ -215,6 +222,16 @@ export class EdgeFetchClient {
     return this.requestJson('GET', `/v1/hosts?limit=${Math.max(1, Math.min(500, Math.floor(limit)))}`);
   }
 
+  extractors(category?: string): Promise<{
+    ok: boolean;
+    total: number;
+    categories: Record<string, number>;
+    extractors: Array<Record<string, unknown>>;
+  }> {
+    const qs = category ? `?category=${encodeURIComponent(category)}` : '';
+    return this.requestJson('GET', `/v1/extractors${qs}`);
+  }
+
   scrape(params: ScrapeParams): Promise<Record<string, unknown>> {
     return this.requestJson('POST', '/v1/scrape', params);
   }
@@ -246,6 +263,7 @@ export class EdgeFetchClient {
   jobs(params: {
     query?: string;
     company?: string;
+    domains?: string[];
     remote?: boolean;
     locations?: string[];
     minBase?: number;
@@ -259,6 +277,52 @@ export class EdgeFetchClient {
 
   interact(params: InteractParams): Promise<Record<string, unknown>> {
     return this.requestJson('POST', '/v1/interact', params);
+  }
+
+  batchScrape(params: { urls: string[]; sync?: boolean; [key: string]: unknown }): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/batch/scrape', params);
+  }
+
+  getBatchScrape(batchId: string): Promise<Record<string, unknown>> {
+    return this.requestJson('GET', `/v1/batch/scrape/${encodeURIComponent(batchId)}`);
+  }
+
+  cancelBatchScrape(batchId: string): Promise<Record<string, unknown>> {
+    return this.requestJson('DELETE', `/v1/batch/scrape/${encodeURIComponent(batchId)}`);
+  }
+
+  previewCrawlParams(params: { url: string; prompt: string }): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/crawl/params-preview', params);
+  }
+
+  agent(params: {
+    prompt: string;
+    urls?: string[];
+    strictConstrainToURLs?: boolean;
+    schema?: Record<string, unknown>;
+    effort?: 'low' | 'medium' | 'high';
+    maxSteps?: number;
+    maxPages?: number;
+    threadId?: string;
+    zeroDataRetention?: boolean;
+    async?: boolean;
+    safe?: boolean;
+    location?: { country?: string; languages?: string[] };
+    llm?: { provider?: string; baseUrl?: string; model?: string; apiKey?: string };
+  }): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/agent', params);
+  }
+
+  getAgent(agentId: string): Promise<Record<string, unknown>> {
+    return this.requestJson('GET', `/v1/agent/${encodeURIComponent(agentId)}`);
+  }
+
+  getAgentTrace(agentId: string): Promise<Record<string, unknown>> {
+    return this.requestJson('GET', `/v1/agent/${encodeURIComponent(agentId)}/trace`);
+  }
+
+  cancelAgent(agentId: string): Promise<Record<string, unknown>> {
+    return this.requestJson('DELETE', `/v1/agent/${encodeURIComponent(agentId)}`);
   }
 
   readArtifact(blobSha256: string, offset = 0, limit = 65_536, format: 'raw' | 'markdown' = 'raw'): Promise<Record<string, unknown>> {

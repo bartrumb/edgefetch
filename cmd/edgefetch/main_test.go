@@ -269,8 +269,14 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("expected 4 JSON-RPC lines, got %d:\n%s", len(lines), stdioOut.String())
 	}
+	if !strings.Contains(lines[1], `"fetch_batch"`) || !strings.Contains(lines[1], `"map"`) {
+		t.Fatalf("expected fetch_batch and map in stdio tools/list: %s", lines[1])
+	}
 	if !strings.Contains(lines[2], "Promise<void>") || !strings.Contains(lines[3], "ssrf_guard") {
 		t.Fatalf("unexpected stdio tool results:\nscrape=%s\ndoctor=%s", lines[2], lines[3])
+	}
+	if got := truncateUTF8Safe("Hello 世界🚀", 7); got != "Hello 世" {
+		t.Fatalf("truncateUTF8Safe split UTF-8 rune: got %q", got)
 	}
 
 	// Test `edgefetch install-mcp --config=...` safely preserves existing MCP servers!
@@ -289,6 +295,36 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	}
 	if !strings.Contains(string(mergedRaw), `"filesystem"`) || !strings.Contains(string(mergedRaw), `"/usr/local/bin/edgefetch"`) {
 		t.Fatalf("install-mcp did not merge cleanly: %s", string(mergedRaw))
+	}
+	// Verify `.bak` backup was created before modifying existing config file!
+	if _, bakErr := os.Stat(cfgFile + ".bak"); bakErr != nil {
+		t.Fatalf("expected .bak backup file for modified config: %v", bakErr)
+	}
+
+	// Test `edgefetch init` with Codex TOML (`config.toml`) and `edgefetch crawl --out`!
+	codexToml := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(codexToml, []byte("model = \"gpt-5\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	if rc := runOneShotCLI(context.Background(), []string{"init", "--config=" + codexToml, "--exe=/usr/local/bin/edgefetch"}, &out, &errBuf, deps); rc != 0 {
+		t.Fatalf("edgefetch init codex toml failed: rc=%d stderr=%s", rc, errBuf.String())
+	}
+	tomlBytes, _ := os.ReadFile(codexToml)
+	if !strings.Contains(string(tomlBytes), "[mcp_servers.edgefetch]") || !strings.Contains(string(tomlBytes), `model = "gpt-5"`) {
+		t.Fatalf("unexpected codex config.toml output: %s", string(tomlBytes))
+	}
+
+	crawlDir := filepath.Join(t.TempDir(), "crawled-md")
+	out.Reset()
+	errBuf.Reset()
+	if rc := runOneShotCLI(context.Background(), []string{"crawl", "--limit=2", "--max-depth=1", "--out=" + crawlDir, "https://docs.example.com/docs/guide"}, &out, &errBuf, deps); rc != 0 {
+		t.Fatalf("edgefetch crawl failed: rc=%d stderr=%s", rc, errBuf.String())
+	}
+	entries, _ := os.ReadDir(crawlDir)
+	if len(entries) == 0 {
+		t.Fatalf("expected crawl --out=%s to write Markdown files", crawlDir)
 	}
 
 	// Test `edgefetch install-service --dry-run` across darwin, linux, and windows templates!

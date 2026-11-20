@@ -186,6 +186,15 @@ export interface McpServerDeps {
     args: Record<string, unknown>;
     principal?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeAgent?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  findExtractors?: (params: {
+    query: string;
+    category?: string;
+    limit?: number;
+  }) => Array<Record<string, unknown>>;
   searchCollection?: (params: {
     collectionId: string;
     query: string;
@@ -254,7 +263,13 @@ function decodeMcpHeaderValue(raw: string): { ok: true; value: string } | { ok: 
 }
 
 function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | null {
-  if (toolName === 'list_agents' || toolName === 'read_artifact' || toolName === 'search' || toolName === 'search_collection') {
+  if (
+    toolName === 'list_agents' ||
+    toolName === 'read_artifact' ||
+    toolName === 'search' ||
+    toolName === 'search_collection' ||
+    toolName === 'find_extractors'
+  ) {
     return 'crawl:read';
   }
   if (
@@ -264,7 +279,9 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
     toolName === 'extract' ||
     toolName === 'interact' ||
     toolName === 'map' ||
-    toolName === 'crawl'
+    toolName === 'crawl' ||
+    toolName === 'jobs' ||
+    toolName === 'agent'
   ) {
     return 'crawl:fetch';
   }
@@ -463,16 +480,46 @@ function buildToolDefinitions(deps: McpServerDeps) {
               anyOf: [
                 {
                   type: 'string',
-                  enum: ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding', 'llmsTxt', 'screenshot', 'changes'],
+                  enum: [
+                    'markdown',
+                    'text',
+                    'summary',
+                    'product',
+                    'rawBase64',
+                    'html',
+                    'rawHtml',
+                    'links',
+                    'images',
+                    'branding',
+                    'llmsTxt',
+                    'screenshot',
+                    'changes',
+                    'changeTracking',
+                  ],
                 },
                 {
                   type: 'object',
                   properties: {
-                    type: { type: 'string', enum: ['json'] },
-                    schema: { type: 'object', description: 'Optional JSON Schema object describing properties to extract.' },
+                    type: { type: 'string', enum: ['json', 'attributes', 'screenshot', 'changeTracking'] },
+                    prompt: { type: 'string', description: 'Optional extraction instruction when type="json".' },
+                    schema: { type: 'object', description: 'Optional JSON Schema object when type="json".' },
+                    selectors: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          selector: { type: 'string' },
+                          attribute: { type: 'string' },
+                        },
+                        required: ['selector', 'attribute'],
+                      },
+                    },
+                    fullPage: { type: 'boolean' },
+                    quality: { type: 'integer', minimum: 1, maximum: 100 },
+                    modes: { type: 'array', items: { type: 'string' } },
+                    tag: { type: 'string' },
                   },
                   required: ['type'],
-                  additionalProperties: false,
                 },
               ],
             },
@@ -520,6 +567,30 @@ function buildToolDefinitions(deps: McpServerDeps) {
           discoverLlmsTxt: { type: 'boolean', default: true, description: 'Check /llms.txt and upgrade to companion .md when available.' },
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
           redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
+          checkPromptInjection: {
+            type: 'boolean',
+            default: false,
+            description: '$0 prompt-injection guard: fails fast with 403 SCRAPE_PROMPT_INJECTION_DETECTED when malicious override directives are found.',
+          },
+          mobile: { type: 'boolean', default: false, description: 'Emulate 390x844 mobile viewport in headless browser.' },
+          location: {
+            type: 'object',
+            properties: {
+              country: { type: 'string' },
+              languages: { type: 'array', items: { type: 'string' } },
+            },
+          },
+          actions: {
+            type: 'array',
+            maxItems: 50,
+            description: 'Optional inline browser actions (wait, click, write, fill, press, scroll, screenshot, scrape, executeJavascript, pdf).',
+            items: { type: 'object' },
+          },
+          parsers: {
+            type: 'array',
+            description: 'Optional PDF/image parser controls (e.g. [{ type: "pdf", mode: "auto", pages: true, pageMarkers: true }] or [] for raw base64).',
+            items: { anyOf: [{ type: 'string' }, { type: 'object' }] },
+          },
           query: { type: 'string', description: 'Optional focus query to rerank relevant passages.' },
           jsonFilter: {
             type: 'string',
@@ -816,7 +887,7 @@ function buildToolDefinitions(deps: McpServerDeps) {
     {
       name: 'jobs',
       description:
-        'One-call structured job search across official ATS boards (Greenhouse, Ashby, Lever, Workday CXS, SmartRecruiters, and optional Built In): standardizes pay ({ min, max, currency, period, basis: "base"|"ote"|"total" }), workplaceType, and locations, deduplicates by (company, title), and filters by remote, locations, minBase, postedWithinDays, and exclude.',
+        'One-call structured job search across official ATS boards (Greenhouse US/EU, Ashby, Lever US/EU, Workday CXS, Workable, Gem, Rippling, SmartRecruiters, company-domain -> ATS auto-discovery, and optional Built In): standardizes pay ({ min, max, currency, period, basis: "base"|"ote"|"total" }), workplaceType, and locations, deduplicates by (company, title), and filters by remote, locations, minBase, postedWithinDays, and exclude.',
       annotations: {
         title: 'Search & Extract Structured Job Postings',
         readOnlyHint: true,
@@ -829,6 +900,13 @@ function buildToolDefinitions(deps: McpServerDeps) {
         properties: {
           query: { type: 'string', description: 'Role or keyword query (e.g. "Forward Deployed Engineer", "Solutions Architect").' },
           company: { type: 'string', description: 'Optional company name or ATS org filter.' },
+          domains: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 10,
+            description:
+              'Optional company domains (e.g. ["cloudflare.com", "stripe.com"]) to probe /careers and /jobs for automatic ATS board discovery across 16+ ATS platforms.',
+          },
           remote: { type: 'boolean', description: 'When true, keep only remote-eligible roles.' },
           locations: {
             type: 'array',
@@ -862,6 +940,79 @@ function buildToolDefinitions(deps: McpServerDeps) {
         additionalProperties: false,
       },
     },
+    {
+      name: 'find_extractors',
+      description:
+        'On-demand dynamic search across EdgeFetch’s 49+ keyless built-in site/API adapters (SEC EDGAR, YC, Polymarket, Ashby/Greenhouse/Lever/Workday/Workable/Gem/Rippling ATS, arXiv, OpenAlex, DOI/Crossref, ClinicalTrials, openFDA, PubChem, Socrata, CKAN, ArcGIS, Legistar, USAspending, NIST NVD CVEs, npm, PyPI, Crates, Shopify, etc.) without context bloat.',
+      annotations: {
+        title: 'Search Built-In Keyless Site Adapters',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Provider name, domain, or data topic (e.g. "SEC 10-K", "CVE", "clinical trials").' },
+          category: {
+            type: 'string',
+            enum: ['jobs', 'finance', 'public-records', 'research-health', 'developer', 'genai', 'commerce-social'],
+          },
+          limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'agent',
+      description:
+        'Autonomous multi-step web research & structured JSON extraction agent: works with offline local LLMs (Ollama, LM Studio, vLLM) or online BYO-LLM (OpenAI, Anthropic, Gemini, OpenRouter, Workers AI), dynamically routing across all 49+ keyless adapters with zero 3-source cap and $0 Zero Data Retention.',
+      annotations: {
+        title: 'Autonomous Research & Structured Data Agent',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'Natural-language goal or research question (URLs optional).' },
+          agentId: { type: 'string', description: 'Existing agt_... ID to poll status, fetch trace, or cancel.' },
+          trace: { type: 'boolean', default: false, description: 'Return ordered execution spans when polling agentId.' },
+          cancel: { type: 'boolean', default: false, description: 'Cancel a running agentId.' },
+          urls: { type: 'array', items: { type: 'string' }, description: 'Optional seed public https:// URLs.' },
+          strictConstrainToURLs: { type: 'boolean', default: false, description: 'Restrict navigation strictly to seed urls.' },
+          schema: { type: 'object', description: 'Optional JSON Schema for structured output validation.' },
+          effort: { type: 'string', enum: ['low', 'medium', 'high'], default: 'medium' },
+          maxSteps: { type: 'integer', minimum: 1, maximum: 20 },
+          maxPages: { type: 'integer', minimum: 1, maximum: 40 },
+          threadId: { type: 'string', description: 'Optional prior agt_... threadId for multi-turn continuation.' },
+          zeroDataRetention: { type: 'boolean', default: false, description: '$0 native Zero Data Retention (skips D1/R2 persistence).' },
+          safe: { type: 'boolean', default: false },
+          location: {
+            type: 'object',
+            properties: {
+              country: { type: 'string' },
+              languages: { type: 'array', items: { type: 'string' } },
+            },
+          },
+          llm: {
+            type: 'object',
+            description: 'Optional BYO-LLM override (e.g. { provider: "ollama"|"openai"|"anthropic"|"gemini", model, baseUrl }).',
+            properties: {
+              provider: { type: 'string' },
+              baseUrl: { type: 'string' },
+              model: { type: 'string' },
+              apiKey: { type: 'string' },
+            },
+          },
+        },
+        additionalProperties: false,
+      },
+    },
   ];
   return allTools
     .filter((t) => {
@@ -874,6 +1025,8 @@ function buildToolDefinitions(deps: McpServerDeps) {
       if (t.name === 'interact') return Boolean(deps.executeInteract);
       if (t.name === 'read_artifact') return Boolean(deps.readArtifact);
       if (t.name === 'jobs') return Boolean(deps.executeJobs);
+      if (t.name === 'find_extractors') return Boolean(deps.findExtractors);
+      if (t.name === 'agent') return Boolean(deps.executeAgent);
       return true;
     })
     .map((t) => ({ ...t, title: t.annotations.title }));
@@ -1310,6 +1463,36 @@ async function handleToolCallInner(
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'find_extractors') {
+    if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
+    }
+    if (!deps.findExtractors) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'extractors_not_configured' }) }], isError: true };
+    }
+    const q = typeof args.query === 'string' ? args.query : '';
+    const cat = typeof args.category === 'string' ? args.category : undefined;
+    const lim = typeof args.limit === 'number' ? args.limit : 10;
+    const matches = deps.findExtractors({ query: q, ...(cat ? { category: cat } : {}), limit: lim });
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ ok: true, count: matches.length, matches }, null, 2) }],
+    };
+  }
+
+  if (name === 'agent') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    if (!deps.executeAgent) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'agent_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeAgent({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status >= 400 ? { isError: true } : {}),
     };
   }
 

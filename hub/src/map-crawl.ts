@@ -150,6 +150,9 @@ export interface MapRequestPayload {
   limit?: unknown;
   includeSubdomains?: unknown;
   ignoreSitemap?: unknown;
+  sitemap?: unknown;
+  ignoreQueryParameters?: unknown;
+  deduplicateSimilarURLs?: unknown;
   fastEdgeMap?: unknown;
   target?: unknown;
   site?: unknown;
@@ -210,7 +213,13 @@ export async function executeMapCall(params: {
   const rootHost = rootUrl.hostname;
   const includeSubdomains = Boolean(payload.includeSubdomains);
   const fastEdgeMap = Boolean(payload.fastEdgeMap);
-  const ignoreSitemap = Boolean(payload.ignoreSitemap) || fastEdgeMap;
+  const rawSitemapMode = typeof payload.sitemap === 'string' ? payload.sitemap.trim().toLowerCase() : '';
+  const sitemapMode: 'include' | 'skip' | 'only' =
+    rawSitemapMode === 'only' ? 'only' : rawSitemapMode === 'skip' || Boolean(payload.ignoreSitemap) || fastEdgeMap ? 'skip' : 'include';
+  const ignoreSitemap = sitemapMode === 'skip';
+  const sitemapOnly = sitemapMode === 'only';
+  const ignoreQueryParameters = Boolean(payload.ignoreQueryParameters);
+  const deduplicateSimilarURLs = payload.deduplicateSimilarURLs !== false;
   const searchFilter = typeof payload.search === 'string' ? payload.search.trim().toLowerCase() : '';
   const limit =
     typeof payload.limit === 'number' && Number.isFinite(payload.limit)
@@ -224,19 +233,22 @@ export async function executeMapCall(params: {
   const subpathSegments = trimmedSubpath.split('/').filter(Boolean);
   const isGitHubRepoSubpath = rootHost.toLowerCase() === 'github.com' && subpathSegments.length >= 2;
   const shouldProbeSubpathLlms =
+    !sitemapOnly &&
     Boolean(trimmedSubpath) &&
     !isGitHubRepoSubpath &&
     !trimmedSubpath.toLowerCase().endsWith('/llms.txt') &&
     (subpathSegments.length === 1 || /\b(docs?|api|reference|guides?|manual|sdk|dev|developers)\b/i.test(trimmedSubpath));
   const subLlmsUrl = shouldProbeSubpathLlms ? `${origin}${trimmedSubpath}/llms.txt` : '';
 
-  const seedRequests: Array<Record<string, unknown>> = isGitHubRepoSubpath
-    ? [{ id: 'home', url: rootUrl.toString(), kind: 'page' }]
-    : [
-        { id: 'home', url: rootUrl.toString(), kind: 'page' },
-        { id: 'llms', url: `${origin}/llms.txt`, kind: 'text', accept: 'text/plain' },
-        ...(subLlmsUrl ? [{ id: 'llms-sub', url: subLlmsUrl, kind: 'text', accept: 'text/plain' }] : []),
-      ];
+  const seedRequests: Array<Record<string, unknown>> = sitemapOnly
+    ? []
+    : isGitHubRepoSubpath
+      ? [{ id: 'home', url: rootUrl.toString(), kind: 'page' }]
+      : [
+          { id: 'home', url: rootUrl.toString(), kind: 'page' },
+          { id: 'llms', url: `${origin}/llms.txt`, kind: 'text', accept: 'text/plain' },
+          ...(subLlmsUrl ? [{ id: 'llms-sub', url: subLlmsUrl, kind: 'text', accept: 'text/plain' }] : []),
+        ];
   if (!ignoreSitemap && !isGitHubRepoSubpath) {
     seedRequests.push(
       { id: 'robots', url: `${origin}/robots.txt`, kind: 'text', accept: 'text/plain' },
@@ -269,6 +281,7 @@ export async function executeMapCall(params: {
 
   const sourcesReport: Array<{ source: string; url: string; status: number; outcome: string; urlsFound: number }> = [];
   const discovered = new Map<string, { url: string; title?: string; source: string }>();
+  const dedupeKeyToCanonical = new Map<string, string>();
   const ghRepoPrefix =
     isGitHubRepoSubpath ? `/${subpathSegments[0]!.toLowerCase()}/${subpathSegments[1]!.toLowerCase()}` : '';
   const stripTrackingParams = (u: URL): void => {
@@ -302,10 +315,19 @@ export async function executeMapCall(params: {
         }
       }
       u.hash = '';
-      stripTrackingParams(u);
+      if (ignoreQueryParameters) {
+        u.search = '';
+      } else {
+        stripTrackingParams(u);
+      }
       const clean = u.toString();
-      const existing = discovered.get(clean);
+      const simKey = deduplicateSimilarURLs
+        ? `${u.origin}${u.pathname.length > 1 ? u.pathname.replace(/\/+$/, '') : u.pathname}${u.search}`
+        : clean;
+      const canonicalKey = dedupeKeyToCanonical.get(simKey) ?? clean;
+      const existing = discovered.get(canonicalKey);
       if (!existing) {
+        dedupeKeyToCanonical.set(simKey, clean);
         discovered.set(clean, { url: clean, ...(title ? { title: decodeHtmlEntities(title) } : {}), source: src });
         return true;
       }
@@ -317,7 +339,9 @@ export async function executeMapCall(params: {
       return false;
     }
   };
-  addUrl(rootUrl.toString(), 'seed');
+  if (!sitemapOnly) {
+    addUrl(rootUrl.toString(), 'seed');
+  }
 
   const homeItem = byId.get('home');
   if (homeItem) {
@@ -790,6 +814,13 @@ export interface CrawlJobOptions {
   limit: number;
   maxDepth: number;
   allowSubdomains: boolean;
+  allowExternalLinks: boolean;
+  crawlEntireDomain: boolean;
+  regexOnFullURL: boolean;
+  ignoreQueryParameters: boolean;
+  deduplicateSimilarURLs: boolean;
+  sitemap: 'include' | 'skip' | 'only';
+  delayMs?: number;
   includePaths: string[];
   excludePaths: string[];
   collectionId?: string;
@@ -805,12 +836,34 @@ export interface CrawlWorkflowParams {
   selfHost?: string;
 }
 
-function pathAllowed(pathname: string, includePaths: string[], excludePaths: string[]): boolean {
+function matchesSafeCrawlPattern(target: string, pattern: string): boolean {
+  if (!pattern || pattern.length > 160) return false;
+  if (pattern.startsWith('/') && !/[\\^$*+?()[\]{}|]/.test(pattern)) {
+    return target.startsWith(pattern);
+  }
+  // Reject nested quantifiers to prevent ReDoS on user-supplied patterns
+  if (/\([^)]*[+*][^)]*\)[+*?{]/.test(pattern)) {
+    return target.includes(pattern);
+  }
+  try {
+    return new RegExp(pattern).test(target);
+  } catch {
+    return target.startsWith(pattern);
+  }
+}
+
+function pathAllowed(
+  candidateUrl: URL,
+  includePaths: string[],
+  excludePaths: string[],
+  regexOnFullURL: boolean,
+): boolean {
+  const subject = regexOnFullURL ? candidateUrl.toString() : candidateUrl.pathname;
   for (const ex of excludePaths) {
-    if (pathname.startsWith(ex)) return false;
+    if (matchesSafeCrawlPattern(subject, ex)) return false;
   }
   if (includePaths.length === 0) return true;
-  return includePaths.some((inc) => pathname.startsWith(inc));
+  return includePaths.some((inc) => matchesSafeCrawlPattern(subject, inc));
 }
 
 export async function createCrawlJob(params: {
@@ -852,18 +905,37 @@ export async function createCrawlJob(params: {
 
   const crawlId = `crw_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const rawColl = typeof payload.collectionId === 'string' ? payload.collectionId.trim() : crawlId;
+  const rawMaxDepth =
+    typeof payload.maxDepth === 'number' && Number.isFinite(payload.maxDepth)
+      ? payload.maxDepth
+      : typeof payload.maxDiscoveryDepth === 'number' && Number.isFinite(payload.maxDiscoveryDepth)
+        ? payload.maxDiscoveryDepth
+        : 2;
+  const regexOnFullURL = Boolean(payload.regexOnFullURL);
+  const rawSitemap = typeof payload.sitemap === 'string' ? payload.sitemap.trim().toLowerCase() : '';
+  const sitemapMode: 'include' | 'skip' | 'only' =
+    rawSitemap === 'skip' || payload.ignoreSitemap === true ? 'skip' : rawSitemap === 'only' ? 'only' : 'include';
+  const delayMs =
+    typeof payload.delay === 'number' && Number.isFinite(payload.delay) && payload.delay >= 0
+      ? Math.min(30_000, Math.round(payload.delay * 1_000))
+      : undefined;
+
   const options: CrawlJobOptions = {
     limit: typeof payload.limit === 'number' && Number.isFinite(payload.limit) ? Math.min(200, Math.max(1, Math.floor(payload.limit))) : 25,
-    maxDepth:
-      typeof payload.maxDepth === 'number' && Number.isFinite(payload.maxDepth)
-        ? Math.min(5, Math.max(0, Math.floor(payload.maxDepth)))
-        : 2,
+    maxDepth: Math.min(8, Math.max(0, Math.floor(rawMaxDepth))),
     allowSubdomains: Boolean(payload.allowSubdomains),
+    allowExternalLinks: Boolean(payload.allowExternalLinks),
+    crawlEntireDomain: typeof payload.crawlEntireDomain === 'boolean' ? payload.crawlEntireDomain : true,
+    regexOnFullURL,
+    ignoreQueryParameters: Boolean(payload.ignoreQueryParameters),
+    deduplicateSimilarURLs: payload.deduplicateSimilarURLs !== false,
+    sitemap: sitemapMode,
+    ...(delayMs !== undefined ? { delayMs } : {}),
     includePaths: Array.isArray(payload.includePaths)
-      ? payload.includePaths.filter((p): p is string => typeof p === 'string' && p.startsWith('/')).slice(0, 20)
+      ? payload.includePaths.filter((p): p is string => typeof p === 'string' && p.trim().length > 0 && p.length <= 160).slice(0, 20)
       : [],
     excludePaths: Array.isArray(payload.excludePaths)
-      ? payload.excludePaths.filter((p): p is string => typeof p === 'string' && p.startsWith('/')).slice(0, 20)
+      ? payload.excludePaths.filter((p): p is string => typeof p === 'string' && p.trim().length > 0 && p.length <= 160).slice(0, 20)
       : [],
     ...(COLLECTION_ID_RE.test(rawColl) ? { collectionId: rawColl } : {}),
     ...(payload.renderMode === 'auto' || payload.renderMode === 'always' || payload.renderMode === 'off'
@@ -939,8 +1011,39 @@ export async function executeCrawlJob(params: {
     });
   }
 
-  const visited = new Set<string>([rootUrl]);
-  let frontier: string[] = [rootUrl];
+  const visited = new Set<string>();
+  let frontier: string[] = [];
+  if (options.sitemap === 'include' || options.sitemap === 'only') {
+    const mapSeed = await executeMapCall({
+      payload: {
+        url: rootUrl,
+        limit: Math.min(options.limit * 2, 250),
+        includeSubdomains: options.allowSubdomains,
+        sitemap: options.sitemap,
+        ignoreQueryParameters: options.ignoreQueryParameters,
+        deduplicateSimilarURLs: options.deduplicateSimilarURLs,
+      },
+      executeHubFetch,
+      selfHost,
+      source: `crawl-sitemap:${crawlId}`,
+    }).catch(() => null);
+    const seedLinks = Array.isArray(mapSeed?.body?.links) ? (mapSeed!.body.links as string[]) : [];
+    for (const sl of seedLinks) {
+      try {
+        const su = new URL(sl);
+        if (pathAllowed(su, options.includePaths, options.excludePaths, options.regexOnFullURL)) {
+          visited.add(su.toString());
+          frontier.push(su.toString());
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  if (!visited.has(rootUrl) && options.sitemap !== 'only') {
+    visited.add(rootUrl);
+    frontier.unshift(rootUrl);
+  }
   let fetchedCount = 0;
   let failedCount = 0;
 
@@ -959,9 +1062,10 @@ export async function executeCrawlJob(params: {
 
       const retention: ArtifactRetention | undefined = env.ARTIFACTS ? 'stored' : undefined;
       const remainingRuntimeSec = Math.max(8, Math.min(45, Math.floor(Math.max(8_000, runtimeBudgetMs - (Date.now() - startedAt)) / 1_000)));
+      const effectivePauseMs = options.delayMs !== undefined ? options.delayMs : 800;
       const call = {
         maxSeconds: remainingRuntimeSec,
-        options: { includeBody: true, respectRobots: true, discoverLlms: false, pauseMs: 800, pauseJitterMs: 200 },
+        options: { includeBody: true, respectRobots: true, discoverLlms: false, pauseMs: effectivePauseMs, pauseJitterMs: 200 },
         requests: wave.map((u, idx) => ({
           id: `c-${depth}-${idx}`,
           url: u,
@@ -988,6 +1092,7 @@ export async function executeCrawlJob(params: {
         break;
       }
 
+      const rootSubpathPrefix = rootParsed.pathname.replace(/\/+$/, '');
       const parsed = JSON.parse(fetchOut.bodyText) as { results?: Array<Record<string, unknown>> };
       for (const item of parsed.results ?? []) {
         const itemUrl = typeof item.url === 'string' ? item.url : '';
@@ -1036,31 +1141,51 @@ export async function executeCrawlJob(params: {
             });
           }
 
-          if (depth < options.maxDepth) {
+          if (depth < options.maxDepth && options.sitemap !== 'only') {
             for (const lnk of links) {
               if (visited.size >= options.limit * 3) break;
               try {
                 const lu = new URL(lnk, itemUrl);
                 if (lu.protocol !== 'https:' || (lu.port && lu.port !== '443')) continue;
-                if (!matchesHostScope(lu.hostname, rootParsed.hostname, options.allowSubdomains)) continue;
-                if (!pathAllowed(lu.pathname, options.includePaths, options.excludePaths)) continue;
+                const sameDomainOrSub = matchesHostScope(lu.hostname, rootParsed.hostname, options.allowSubdomains);
+                if (!sameDomainOrSub) {
+                  if (!options.allowExternalLinks || !isSafeDomainHost(lu.hostname, selfHost)) continue;
+                }
+                if (
+                  sameDomainOrSub &&
+                  !options.crawlEntireDomain &&
+                  rootSubpathPrefix &&
+                  rootSubpathPrefix !== '/' &&
+                  lu.pathname !== rootSubpathPrefix &&
+                  !lu.pathname.startsWith(`${rootSubpathPrefix}/`)
+                ) {
+                  continue;
+                }
+                if (!pathAllowed(lu, options.includePaths, options.excludePaths, options.regexOnFullURL)) continue;
                 lu.hash = '';
-                for (const k of [...lu.searchParams.keys()]) {
-                  const lk = k.toLowerCase();
-                  if (
-                    lk.startsWith('utm_') ||
-                    lk === 'gclid' ||
-                    lk === 'fbclid' ||
-                    lk === 'msclkid' ||
-                    lk === 'mc_cid' ||
-                    lk === 'mc_eid' ||
-                    lk === '_hsenc' ||
-                    lk === '_hsmi' ||
-                    lk === 'ref_src' ||
-                    lk === 'spm'
-                  ) {
-                    lu.searchParams.delete(k);
+                if (options.ignoreQueryParameters) {
+                  lu.search = '';
+                } else {
+                  for (const k of [...lu.searchParams.keys()]) {
+                    const lk = k.toLowerCase();
+                    if (
+                      lk.startsWith('utm_') ||
+                      lk === 'gclid' ||
+                      lk === 'fbclid' ||
+                      lk === 'msclkid' ||
+                      lk === 'mc_cid' ||
+                      lk === 'mc_eid' ||
+                      lk === '_hsenc' ||
+                      lk === '_hsmi' ||
+                      lk === 'ref_src' ||
+                      lk === 'spm'
+                    ) {
+                      lu.searchParams.delete(k);
+                    }
                   }
+                }
+                if (options.deduplicateSimilarURLs && lu.pathname.length > 1 && lu.pathname.endsWith('/')) {
+                  lu.pathname = lu.pathname.replace(/\/+$/, '');
                 }
                 const clean = lu.toString();
                 if (!visited.has(clean)) {
@@ -1413,4 +1538,193 @@ export class CrawlWorkflow extends WorkflowEntrypoint<OptionalStorageBindings, C
     });
     return { crawlId: event.payload.crawlId, status };
   }
+}
+
+/**
+ * Translates natural-language crawl instructions (`prompt`) into structured `crawl` parameters
+ * (`POST /v1/crawl/params-preview` & `/v2/crawl/params-preview`) with zero external dependencies.
+ */
+export function previewCrawlParams(payload: Record<string, unknown>, selfHost?: string): {
+  ok: boolean;
+  status: number;
+  body: Record<string, unknown>;
+} {
+  const urlCheck = validatePublicHttpsUrl(payload.url, selfHost);
+  if (!urlCheck.ok) {
+    return { ok: false, status: 400, body: { ok: false, success: false, error: 'invalid_url', message: urlCheck.message } };
+  }
+  const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
+  const lower = prompt.toLowerCase();
+
+  const includePaths: string[] = [];
+  const excludePaths: string[] = [];
+
+  for (const m of prompt.matchAll(/(?:only|include|under)\s+((?:\/[a-zA-Z0-9._*-]+(?:\s*(?:,|and|or)\s*)?)+)/gi)) {
+    for (const seg of m[1]!.split(/\s*(?:,|and|or)\s*/i)) {
+      const clean = seg.trim();
+      if (clean.startsWith('/') && !includePaths.includes(clean)) includePaths.push(clean);
+    }
+  }
+  for (const m of prompt.matchAll(/(?:skip|exclude|ignore|avoid|without)\s+((?:\/[a-zA-Z0-9._*-]+(?:\s*(?:,|and|or)\s*)?)+)/gi)) {
+    for (const seg of m[1]!.split(/\s*(?:,|and|or)\s*/i)) {
+      const clean = seg.trim();
+      if (clean.startsWith('/') && !excludePaths.includes(clean)) excludePaths.push(clean);
+    }
+  }
+
+  const limitMatch = /\b(?:limit|max|up\s+to)\s+(\d{1,4})\s*(?:pages?|urls?)?\b/i.exec(prompt);
+  const depthMatch = /\b(?:depth|levels?)\s*(?:of|:|=|up\s+to)?\s*(\d)\b/i.exec(prompt);
+  const allowSubdomains = /\b(?:include|allow|across)\s+subdomains?\b/i.test(lower) && !/\bno\s+subdomains?\b/i.test(lower);
+  const sitemapOnly = /\bsitemap\s+only\b/i.test(lower);
+  const skipSitemap = /\b(?:skip|ignore|no)\s+sitemaps?\b/i.test(lower);
+
+  const preview = {
+    url: urlCheck.url.toString(),
+    limit: limitMatch ? Math.min(200, Math.max(1, Number(limitMatch[1]))) : 25,
+    maxDiscoveryDepth: depthMatch ? Math.min(8, Math.max(0, Number(depthMatch[1]))) : 2,
+    allowSubdomains,
+    crawlEntireDomain: includePaths.length === 0 && urlCheck.url.pathname === '/',
+    sitemap: sitemapOnly ? 'only' : skipSitemap ? 'skip' : 'include',
+    ...(includePaths.length > 0 ? { includePaths } : {}),
+    ...(excludePaths.length > 0 ? { excludePaths } : {}),
+  };
+
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      ok: true,
+      success: true,
+      data: preview,
+    },
+  };
+}
+
+export interface BatchScrapeJobRecord {
+  id: string;
+  status: 'scraping' | 'completed' | 'cancelled' | 'failed';
+  total: number;
+  completed: number;
+  failed: number;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+  data: Array<Record<string, unknown>>;
+  errors: Array<{ url: string; error: string }>;
+}
+
+const inMemoryBatchJobs = new Map<string, BatchScrapeJobRecord>();
+const MAX_BATCH_JOBS = 128;
+
+export async function startOrExecuteBatchScrape(params: {
+  payload: Record<string, unknown>;
+  selfHost?: string;
+  executeScrape: (scrapePayload: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
+  waitUntil?: (p: Promise<unknown>) => void;
+}): Promise<{ ok: true; status: number; job: BatchScrapeJobRecord } | { ok: false; status: number; error: string; message: string }> {
+  const { payload, selfHost, executeScrape, waitUntil } = params;
+  if (!Array.isArray(payload.urls) || payload.urls.length === 0) {
+    return { ok: false, status: 400, error: 'missing_urls', message: 'urls must be a non-empty array of public https:// URLs' };
+  }
+  if (payload.urls.length > 100) {
+    return { ok: false, status: 400, error: 'too_many_urls', message: 'maximum 100 URLs per batch/scrape job' };
+  }
+
+  const validUrls: string[] = [];
+  const invalidErrors: Array<{ url: string; error: string }> = [];
+  const ignoreInvalidURLs = Boolean(payload.ignoreInvalidURLs);
+
+  for (const rawU of payload.urls) {
+    const check = validatePublicHttpsUrl(rawU, selfHost);
+    if (!check.ok) {
+      if (!ignoreInvalidURLs) {
+        return { ok: false, status: 400, error: 'invalid_url', message: check.message };
+      }
+      invalidErrors.push({ url: String(rawU), error: check.message });
+    } else {
+      validUrls.push(check.url.toString());
+    }
+  }
+
+  const now = Date.now();
+  const batchId = `bch_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  const { urls: _omitUrls, sync: _omitSync, ignoreInvalidURLs: _omitIgnore, maxConcurrency, ...sharedScrapeOpts } = payload;
+  const concurrency =
+    typeof maxConcurrency === 'number' && Number.isFinite(maxConcurrency)
+      ? Math.min(8, Math.max(1, Math.floor(maxConcurrency)))
+      : 4;
+
+  const job: BatchScrapeJobRecord = {
+    id: batchId,
+    status: 'scraping',
+    total: validUrls.length,
+    completed: 0,
+    failed: invalidErrors.length,
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: now + 24 * 60 * 60_000,
+    data: [],
+    errors: invalidErrors,
+  };
+
+  if (inMemoryBatchJobs.size >= MAX_BATCH_JOBS) {
+    const oldest = inMemoryBatchJobs.keys().next().value;
+    if (oldest) inMemoryBatchJobs.delete(oldest);
+  }
+  inMemoryBatchJobs.set(batchId, job);
+
+  const runBatch = async () => {
+    for (let i = 0; i < validUrls.length; i += concurrency) {
+      if (job.status === 'cancelled') break;
+      const chunk = validUrls.slice(i, i + concurrency);
+      const results = await Promise.all(
+        chunk.map(async (u) => {
+          const out = await executeScrape({ ...sharedScrapeOpts, url: u });
+          return { u, out };
+        }),
+      );
+      for (const { u, out } of results) {
+        if (out.status === 200) {
+          job.completed++;
+          job.data.push(out.body);
+        } else {
+          job.failed++;
+          job.errors.push({
+            url: u,
+            error: String(out.body.problem ?? out.body.message ?? out.body.error ?? `HTTP ${out.status}`),
+          });
+        }
+      }
+      job.updatedAt = Date.now();
+    }
+    if (job.status !== 'cancelled') {
+      job.status = 'completed';
+      job.updatedAt = Date.now();
+    }
+  };
+
+  if (payload.sync === true || !waitUntil) {
+    await runBatch();
+    return { ok: true, status: 200, job };
+  }
+  waitUntil(runBatch());
+  return { ok: true, status: 202, job };
+}
+
+export function getBatchScrapeStatus(batchId: string): BatchScrapeJobRecord | null {
+  const job = inMemoryBatchJobs.get(batchId);
+  if (!job) return null;
+  if (job.expiresAt <= Date.now()) {
+    inMemoryBatchJobs.delete(batchId);
+    return null;
+  }
+  return job;
+}
+
+export function cancelBatchScrape(batchId: string): boolean {
+  const job = inMemoryBatchJobs.get(batchId);
+  if (!job) return false;
+  job.status = 'cancelled';
+  job.updatedAt = Date.now();
+  return true;
 }

@@ -1506,7 +1506,7 @@ test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1
     });
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
-    assert.equal(mcpJson.result.tools.length, 12);
+    assert.equal(mcpJson.result.tools.length, 14);
   } finally {
     await started.close();
     rmSync(dataDir, { recursive: true, force: true });
@@ -3049,7 +3049,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.4.1');
+    assert.equal(caps.version, '2.5.0');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);

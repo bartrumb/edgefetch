@@ -44,17 +44,28 @@ import {
   type HostWindowStore,
   type HubSocketLike,
 } from './agent-hub';
+import {
+  cancelAgentRun,
+  findRelevantAdapters,
+  formatPublicAgentResponse,
+  loadAgentRun,
+  startOrExecuteAgentCall,
+} from './agent-runner';
 import { authorizeAgent, isCallerAuthorized } from './auth';
 import { handleBotTransparencyRoutes, type BotAuthEnv } from './bot-auth';
 import { handleCompatRoutes } from './compat';
 import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
+  cancelBatchScrape,
   cancelCrawlJob,
   CrawlWorkflow,
   createCrawlJob,
   executeCrawlJob,
   executeMapCall,
+  getBatchScrapeStatus,
   getCrawlJobStatus,
+  previewCrawlParams,
+  startOrExecuteBatchScrape,
   type MapRequestPayload,
 } from './map-crawl';
 import { handleMcpRequest } from './mcp';
@@ -99,6 +110,7 @@ import {
   type ExtractRequestPayload,
 } from './search-index';
 import { executeSearchCall, type SearchRequestPayload } from './web-search';
+import { listRegisteredAdapters } from './extractors/registry';
 import {
   buildCapabilities,
   handleAgentArtifactUpload,
@@ -970,7 +982,7 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.4.1');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.0');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1047,7 +1059,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.4.1',
+          serverVersion: '2.5.0',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1181,6 +1193,36 @@ export default {
               },
             });
           },
+          findExtractors: ({ query, category, limit }) => {
+            return findRelevantAdapters({ query, category, limit }) as unknown as Array<Record<string, unknown>>;
+          },
+          executeAgent: async ({ args, principal }) => {
+            if (typeof args.agentId === 'string' && args.agentId.trim()) {
+              const aid = args.agentId.trim();
+              if (args.cancel === true) {
+                const cRes = await cancelAgentRun(aid, env.META);
+                return { status: cRes.status, body: { ok: cRes.ok, id: aid, status: 'cancelled' } };
+              }
+              const rec = await loadAgentRun(aid, env.META);
+              if (!rec) return { status: 404, body: { ok: false, error: 'agent_not_found' } };
+              if (args.trace === true) {
+                return { status: 200, body: { ok: true, id: rec.id, threadId: rec.threadId, status: rec.status, spans: rec.trace } };
+              }
+              return { status: 200, body: formatPublicAgentResponse(rec, false) };
+            }
+            const out = await startOrExecuteAgentCall({
+              payload: args,
+              env,
+              executeHubFetch,
+              selfHost: url.hostname,
+              principal: principal ?? 'mcp',
+              ...(ctx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
+            });
+            if (out.kind === 'sse') {
+              return { status: 200, body: { ok: true, note: 'SSE stream completed' } };
+            }
+            return { status: out.status, body: out.body };
+          },
           ...(env.SEARCH
             ? {
                 searchCollection: async ({ collectionId, query, limit }) => {
@@ -1254,10 +1296,35 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.4.1'), {
+        return Response.json(buildCapabilities(env, '2.5.0'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/v1/extractors') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        const category = url.searchParams.get('category') ?? undefined;
+        const extractors = listRegisteredAdapters(category);
+        const categories: Record<string, number> = {};
+        for (const ex of extractors) {
+          categories[ex.category] = (categories[ex.category] ?? 0) + 1;
+        }
+        return Response.json(
+          { ok: true, total: extractors.length, categories, extractors },
+          { status: 200, headers: { 'cache-control': 'no-store' } },
+        );
       }
 
       if (request.method === 'GET' && url.pathname === '/v1/hosts') {
@@ -1619,6 +1686,201 @@ export default {
           status: out.status,
           headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
         });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/crawl/params-preview') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        let payload: Record<string, unknown>;
+        try {
+          payload = (await request.json()) as Record<string, unknown>;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const prev = previewCrawlParams(payload, url.hostname);
+        return Response.json(prev.body, { status: prev.status, headers: { 'cache-control': 'no-store' } });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/batch/scrape') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        let payload: Record<string, unknown>;
+        try {
+          payload = (await request.json()) as Record<string, unknown>;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const batchOut = await startOrExecuteBatchScrape({
+          payload,
+          selfHost: url.hostname,
+          executeScrape: async (scArgs) => {
+            const res = await executeScrapeCall({
+              payload: scArgs as ScrapeRequestPayload,
+              env,
+              executeHubFetch,
+              selfHost: url.hostname,
+              source: `batch-scrape:${auth.principal}`,
+            });
+            return { status: res.status, body: res.body };
+          },
+          ...(ctx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
+        });
+        if (!batchOut.ok) {
+          return Response.json({ ok: false, error: batchOut.error, message: batchOut.message }, { status: batchOut.status });
+        }
+        return Response.json(
+          {
+            ok: true,
+            id: batchOut.job.id,
+            status: batchOut.job.status,
+            total: batchOut.job.total,
+            completed: batchOut.job.completed,
+            url: `${url.origin}/v1/batch/scrape/${batchOut.job.id}`,
+            ...(payload.sync === true ? { data: batchOut.job.data, errors: batchOut.job.errors } : {}),
+          },
+          { status: batchOut.status, headers: { 'cache-control': 'no-store' } },
+        );
+      }
+
+      const batchRouteMatch = /^\/v1\/batch\/scrape\/([^/]+)$/.exec(url.pathname);
+      if (batchRouteMatch) {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        const batchId = decodeURIComponent(batchRouteMatch[1] ?? '').trim();
+        if (request.method === 'GET') {
+          const job = getBatchScrapeStatus(batchId);
+          if (!job) return Response.json({ ok: false, error: 'batch_not_found' }, { status: 404 });
+          return Response.json({ ok: true, ...job }, { status: 200, headers: { 'cache-control': 'no-store' } });
+        }
+        if (request.method === 'DELETE') {
+          const ok = cancelBatchScrape(batchId);
+          return Response.json({ ok, id: batchId, status: 'cancelled' }, { status: ok ? 200 : 404 });
+        }
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/agent') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const rawAgentText = await request.text();
+        if (new TextEncoder().encode(rawAgentText).byteLength > MAX_CALL_UTF8_BYTES) {
+          return Response.json({ error: 'too_large' }, { status: 413 });
+        }
+        let payload: Record<string, unknown>;
+        try {
+          payload = JSON.parse(rawAgentText) as Record<string, unknown>;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const wantSse = (request.headers.get('accept') ?? '').toLowerCase().includes('text/event-stream');
+        const out = await startOrExecuteAgentCall({
+          payload,
+          env,
+          executeHubFetch,
+          selfHost: url.hostname,
+          principal: auth.principal,
+          wantSseStream: wantSse,
+          ...(ctx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
+        });
+        if (out.kind === 'sse') return out.response;
+        return Response.json(out.body, { status: out.status, headers: { 'cache-control': 'no-store' } });
+      }
+
+      const agentTraceMatch = /^\/v1\/agent\/([^/]+)\/trace$/.exec(url.pathname);
+      if (agentTraceMatch && request.method === 'GET') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        const agentId = decodeURIComponent(agentTraceMatch[1] ?? '').trim();
+        const rec = await loadAgentRun(agentId, env.META);
+        if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
+        return Response.json(
+          { ok: true, id: rec.id, threadId: rec.threadId, status: rec.status, spans: rec.trace },
+          { status: 200, headers: { 'cache-control': 'no-store' } },
+        );
+      }
+
+      const agentRouteMatch = /^\/v1\/agent\/([^/]+)$/.exec(url.pathname);
+      if (agentRouteMatch) {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        const agentId = decodeURIComponent(agentRouteMatch[1] ?? '').trim();
+        if (request.method === 'GET') {
+          const rec = await loadAgentRun(agentId, env.META);
+          if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
+          return Response.json(formatPublicAgentResponse(rec, false), { status: 200, headers: { 'cache-control': 'no-store' } });
+        }
+        if (request.method === 'DELETE') {
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+          }
+          const cRes = await cancelAgentRun(agentId, env.META);
+          return Response.json({ ok: cRes.ok, id: agentId, status: 'cancelled' }, { status: cRes.status });
+        }
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/crawl') {

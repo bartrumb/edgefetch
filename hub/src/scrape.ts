@@ -47,8 +47,23 @@ import {
   type SpaFallbackProvider,
   type SpaFallbackSuccess,
 } from './spa-fallback';
+import {
+  extractJsonWithOptionalLlm,
+  resolveLlmConfig,
+  summarizeMarkdownWithOptionalLlm,
+  type LlmEnvBindings,
+} from './llm';
+import {
+  detectPromptInjection,
+  encodeBodyToRawBase64,
+  extractHtmlAttributesBySelectors,
+  extractStructuredProduct,
+  normalizeInlineBrowserActions,
+  parsePdfParserOptions,
+  splitPdfPagesAndMarkers,
+} from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 22;
+export const SCRAPE_PIPELINE_VERSION = 23;
 
 export interface ScrapedImage {
   url: string;
@@ -316,6 +331,12 @@ export function cleanPdfMarkdown(md: string): string {
     .trim();
 }
 
+const URL_ONLY_TAG_ATTRS = new Set(['href', 'src', 'srcset', 'data-src', 'data-srcset', 'action', 'poster']);
+
+function unescapeUrlAttrAmpOnly(raw: string): string {
+  return raw.includes('&') ? raw.replace(/&(?:amp|#0*38|#x0*26);/gi, '&') : raw;
+}
+
 function parseTagAttrs(tag: string): Record<string, string> {
   const attrs: Record<string, string> = {};
   const re = /([a-zA-Z0-9_:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
@@ -323,7 +344,8 @@ function parseTagAttrs(tag: string): Record<string, string> {
   while ((m = re.exec(tag)) !== null) {
     const key = m[1]!.toLowerCase();
     if (!(key in attrs)) {
-      attrs[key] = decodeHtmlEntities(m[2] ?? m[3] ?? m[4] ?? '');
+      const val = m[2] ?? m[3] ?? m[4] ?? '';
+      attrs[key] = URL_ONLY_TAG_ATTRS.has(key) ? unescapeUrlAttrAmpOnly(val) : decodeHtmlEntities(val);
     }
   }
   return attrs;
@@ -548,12 +570,17 @@ function shouldStripSubtreeOpenTag(tagLower: string, attrStr: string): boolean {
     const hv = (hm?.[1] ?? hm?.[2] ?? hm?.[3] ?? '').trim().toLowerCase();
     if (hv !== 'false' && hv !== '0') return true;
   }
-  if (
-    /\bstyle\s*=/i.test(strippedQuotes) &&
-    /\bstyle\s*=\s*(?:"(?:[^"]*;)?\s*display\s*:\s*none\b[^"]*"|'(?:[^']*;)?\s*display\s*:\s*none\b[^']*')/i.test(attrStr) &&
-    !/\b(?:mwe-math|katex-mathml|mjx-assistive)\b/i.test(attrStr)
-  ) {
-    return true;
+  if (/\bstyle\s*=/i.test(strippedQuotes) && !/\b(?:mwe-math|katex-mathml|mjx-assistive)\b/i.test(attrStr)) {
+    const sm = /\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(attrStr);
+    const styleVal = sm?.[1] ?? sm?.[2] ?? '';
+    if (
+      styleVal &&
+      /(?:^|;)\s*(?:display\s*:\s*none\b|visibility\s*:\s*hidden\b|opacity\s*:\s*0(?:\.0+)?(?=\s*(?:;|$))|font-size\s*:\s*0(?:px|em|rem|%|pt)?(?=\s*(?:;|$)))/i.test(
+        styleVal,
+      )
+    ) {
+      return true;
+    }
   }
   if (
     /\brole\s*=/i.test(strippedQuotes) &&
@@ -2191,8 +2218,6 @@ export function extractHtmlDocument(
   } else if (onlyMainContent && (!includeTags || includeTags.length === 0)) {
     if (baseUrl && /^https?:\/\/github\.com\/[^/]+\/[^/]+\/(?:issues|pull)\/\d+/i.test(baseUrl)) {
       md = cleanGitHubIssueOrPrMarkdown(md);
-    } else if (baseUrl && /^https?:\/\/(?:export\.)?arxiv\.org\/abs\//i.test(baseUrl)) {
-      md = cleanArxivAbstractMarkdown(md);
     } else {
       const siteExtracted = applyPostFetchSiteExtractor(rawHtml, baseUrl, md, (frag, fragBase) => {
         const sub = extractHtmlDocument(frag, {
@@ -2218,6 +2243,8 @@ export function extractHtmlDocument(
           }
           links = siteExtracted.links;
         }
+      } else if (baseUrl && /^https?:\/\/(?:export\.)?arxiv\.org\/abs\//i.test(baseUrl)) {
+        md = cleanArxivAbstractMarkdown(md);
       }
     }
 
@@ -2251,6 +2278,8 @@ export function extractHtmlDocument(
     md = redactPiiText(md);
     plainText = redactPiiText(plainText);
   }
+  md = stripInvisibleSmugglingChars(md);
+  plainText = stripInvisibleSmugglingChars(plainText);
   const wordCount = countTextWords(md);
 
   return {
@@ -3042,13 +3071,21 @@ export async function touchRevalidatedPage(metaDb: D1Database, url: string, now 
 export type ScrapeFormatInput =
   | 'markdown'
   | 'text'
+  | 'summary'
+  | 'product'
+  | 'rawBase64'
   | 'html'
   | 'rawHtml'
   | 'links'
   | 'images'
   | 'branding'
   | 'llmsTxt'
-  | { type: 'json'; schema?: Record<string, unknown> };
+  | 'screenshot'
+  | 'changes'
+  | { type: 'json'; prompt?: string; schema?: Record<string, unknown> }
+  | { type: 'attributes'; selectors: Array<{ selector: string; attribute: string }> }
+  | { type: 'screenshot'; fullPage?: boolean; quality?: number; viewport?: { width?: number; height?: number } }
+  | { type: 'changeTracking'; modes?: Array<'git-diff' | 'json'>; tag?: string };
 
 export interface ScrapeRequestPayload {
   url?: unknown;
@@ -3060,19 +3097,29 @@ export interface ScrapeRequestPayload {
   maxChars?: unknown;
   defaultMaxChars?: unknown;
   maxAgeMs?: unknown;
+  maxAge?: unknown;
   discoverLlmsTxt?: unknown;
   redactPii?: unknown;
+  checkPromptInjection?: unknown;
   query?: unknown;
   jsonFilter?: unknown;
   headers?: unknown;
   renderMode?: unknown;
+  mobile?: unknown;
+  location?: unknown;
+  actions?: unknown;
+  parsers?: unknown;
+  llm?: unknown;
   waitForMs?: unknown;
+  waitFor?: unknown;
+  timeout?: unknown;
   waitSelector?: unknown;
   maxPages?: unknown;
   ocr?: unknown;
   waybackFallback?: unknown;
   spaFallback?: unknown;
   noCache?: unknown;
+  ephemeral?: unknown;
   collectionId?: unknown;
   target?: unknown;
   site?: unknown;
@@ -3357,6 +3404,11 @@ export function extractMarkdownLinksAndImages(
   };
 }
 
+/** Strips invisible Unicode Tag ASCII-smuggling (`U+E0000`–`U+E007F`) and Bidi spoofing override codepoints used in indirect prompt injection. */
+export function stripInvisibleSmugglingChars(s: string): string {
+  return s.replace(/[\u{E0000}-\u{E007F}\u202A-\u202E\u2066-\u2069]/gu, '');
+}
+
 function finalizeScrapedMarkdown(
   rawMd: string,
   opts: { isPdf: boolean; includeImages: boolean; maxChars?: number; baseUrl?: string },
@@ -3369,7 +3421,7 @@ function finalizeScrapedMarkdown(
   frontmatterDescription?: string;
 } {
   const fm = opts.isPdf ? { body: rawMd } : parseMarkdownFrontmatter(rawMd);
-  let md = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), opts.baseUrl);
+  let md = stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), opts.baseUrl));
   if (opts.isPdf) {
     md = cleanPdfMarkdown(md);
   }
@@ -4930,17 +4982,81 @@ export async function executeScrapeCall(params: {
 
   const rawFormats = Array.isArray(payload.formats) && payload.formats.length > 0 ? payload.formats : ['markdown'];
   const stringFormats = new Set<string>();
-  let jsonSchemaSpec: { schema?: Record<string, unknown> } | undefined;
+  let jsonSchemaSpec: { prompt?: string; schema?: Record<string, unknown> } | undefined;
+  let attributesSpec: Array<{ selector: string; attribute: string }> | undefined;
+  let screenshotSpec: { fullPage?: boolean; quality?: number; viewport?: { width?: number; height?: number } } | undefined;
+  let changeTrackingSpec: { modes?: string[]; tag?: string } | undefined;
+
   for (const f of rawFormats) {
     if (typeof f === 'string') {
-      stringFormats.add(f);
-    } else if (f && typeof f === 'object' && (f as { type?: unknown }).type === 'json') {
-      jsonSchemaSpec = { schema: (f as { schema?: Record<string, unknown> }).schema };
+      if (f === 'changeTracking') {
+        stringFormats.add('changes');
+        changeTrackingSpec = {};
+      } else {
+        stringFormats.add(f);
+      }
+    } else if (f && typeof f === 'object' && !Array.isArray(f)) {
+      const fObj = f as Record<string, unknown>;
+      if (fObj.type === 'json') {
+        jsonSchemaSpec = {
+          ...(typeof fObj.prompt === 'string' && fObj.prompt.trim() ? { prompt: fObj.prompt.trim() } : {}),
+          ...(fObj.schema && typeof fObj.schema === 'object' ? { schema: fObj.schema as Record<string, unknown> } : {}),
+        };
+      } else if (fObj.type === 'attributes' && Array.isArray(fObj.selectors)) {
+        attributesSpec = fObj.selectors
+          .filter((s): s is { selector: string; attribute: string } => Boolean(s && typeof s === 'object'))
+          .slice(0, 25);
+      } else if (fObj.type === 'screenshot') {
+        stringFormats.add('screenshot');
+        screenshotSpec = {
+          ...(typeof fObj.fullPage === 'boolean' ? { fullPage: fObj.fullPage } : {}),
+          ...(typeof fObj.quality === 'number' && Number.isFinite(fObj.quality)
+            ? { quality: Math.min(100, Math.max(1, Math.floor(fObj.quality))) }
+            : {}),
+          ...(fObj.viewport && typeof fObj.viewport === 'object'
+            ? { viewport: fObj.viewport as { width?: number; height?: number } }
+            : {}),
+        };
+      } else if (fObj.type === 'changeTracking') {
+        stringFormats.add('changes');
+        changeTrackingSpec = {
+          ...(Array.isArray(fObj.modes) ? { modes: fObj.modes.map(String) } : {}),
+          ...(typeof fObj.tag === 'string' ? { tag: fObj.tag } : {}),
+        };
+      }
     }
   }
-  if (stringFormats.size === 0 && !jsonSchemaSpec) {
+  if (stringFormats.size === 0 && !jsonSchemaSpec && !attributesSpec) {
     stringFormats.add('markdown');
   }
+
+  const inlineActionsParsed = normalizeInlineBrowserActions(payload.actions, selfHost, 50);
+  if (!inlineActionsParsed.ok) {
+    return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_action', message: inlineActionsParsed.message } };
+  }
+  const inlineActions = inlineActionsParsed.actions;
+
+  const pdfParserOpts = parsePdfParserOptions(payload.parsers);
+  const mobileEmulation = Boolean(payload.mobile);
+  const checkPromptInjection = Boolean(payload.checkPromptInjection);
+
+  const locationObj =
+    payload.location && typeof payload.location === 'object' && !Array.isArray(payload.location)
+      ? (payload.location as Record<string, unknown>)
+      : null;
+  const locationLanguages = Array.isArray(locationObj?.languages)
+    ? locationObj!.languages
+        .filter((l): l is string => typeof l === 'string' && /^[A-Za-z]{2}(?:-[A-Za-z0-9]{2,8})?$/.test(l.trim()))
+        .map((l) => l.trim())
+    : [];
+  const acceptLanguageOpt = locationLanguages.length > 0 ? locationLanguages.join(', ') : undefined;
+
+  const mergedHeaders: Record<string, string> = {
+    ...(acceptLanguageOpt ? { 'Accept-Language': acceptLanguageOpt } : {}),
+    ...(payload.headers && typeof payload.headers === 'object' && !Array.isArray(payload.headers)
+      ? (payload.headers as Record<string, string>)
+      : {}),
+  };
 
   const onlyMainContent = typeof payload.onlyMainContent === 'boolean' ? payload.onlyMainContent : true;
   const includeImages = typeof payload.includeImages === 'boolean' ? payload.includeImages : true;
@@ -4963,24 +5079,43 @@ export async function executeScrapeCall(params: {
     (explicitDiscoverLlms !== false && shouldAutoProbeOriginLlms(parsedUrl, now));
   const redactPii = Boolean(payload.redactPii);
   const spaFallbackMode = normalizeSpaFallbackMode(payload.spaFallback);
-  const waitForMsOpt =
+  const rawWaitFor =
     typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
-      ? Math.min(15_000, Math.max(0, Math.floor(payload.waitForMs)))
-      : undefined;
+      ? payload.waitForMs
+      : typeof payload.waitFor === 'number' && Number.isFinite(payload.waitFor)
+        ? payload.waitFor
+        : undefined;
+  const waitForMsOpt = rawWaitFor !== undefined ? Math.min(15_000, Math.max(0, Math.floor(rawWaitFor))) : undefined;
   const waitSelectorOpt =
     typeof payload.waitSelector === 'string' && payload.waitSelector.trim()
       ? payload.waitSelector.trim().slice(0, 200)
       : undefined;
-  const maxAgeMs = typeof payload.maxAgeMs === 'number' && Number.isFinite(payload.maxAgeMs) ? Math.max(0, Math.floor(payload.maxAgeMs)) : 0;
+  const rawMaxAge =
+    typeof payload.maxAgeMs === 'number' && Number.isFinite(payload.maxAgeMs)
+      ? payload.maxAgeMs
+      : typeof payload.maxAge === 'number' && Number.isFinite(payload.maxAge)
+        ? payload.maxAge
+        : 0;
+  const maxAgeMs = payload.noCache === true ? 0 : Math.max(0, Math.floor(rawMaxAge));
+  const timeoutMsOpt =
+    typeof payload.timeout === 'number' && Number.isFinite(payload.timeout)
+      ? Math.min(120_000, Math.max(1_000, Math.floor(payload.timeout)))
+      : 95_000;
   const maxPagesCap =
-    typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages)
+    pdfParserOpts.maxPagesOverride ??
+    (typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages)
       ? Math.min(500, Math.max(1, Math.floor(payload.maxPages)))
-      : 60;
+      : 60);
   const ocrMode: 'auto' | 'always' | 'off' =
-    payload.ocr === 'always' || payload.ocr === 'off' ? payload.ocr : 'auto';
+    pdfParserOpts.ocrModeOverride ??
+    (payload.ocr === 'always' || payload.ocr === 'off' ? payload.ocr : 'auto');
   const hasPdfOcr = Boolean(env.PDF_OCR || (env.PDF_OCR_URL?.trim() && env.PDF_OCR_TOKEN?.trim()));
   const target: 'auto' | 'agent' | 'container' =
-    payload.target === 'agent' || payload.target === 'container' ? payload.target : 'auto';
+    payload.target === 'agent' || payload.target === 'container'
+      ? payload.target
+      : inlineActions.length > 0
+        ? 'agent'
+        : 'auto';
   const site = typeof payload.site === 'string' && payload.site.trim() ? payload.site.trim() : undefined;
 
   const focusQuery = typeof payload.query === 'string' ? payload.query.trim() : '';
@@ -5010,14 +5145,20 @@ export async function executeScrapeCall(params: {
   const needsLiveHtml =
     stringFormats.has('html') ||
     stringFormats.has('rawHtml') ||
+    stringFormats.has('rawBase64') ||
+    stringFormats.has('product') ||
     stringFormats.has('links') ||
     stringFormats.has('images') ||
     stringFormats.has('branding') ||
     stringFormats.has('llmsTxt') ||
     stringFormats.has('changes') ||
+    checkPromptInjection ||
+    inlineActions.length > 0 ||
+    pdfParserOpts.skipPdfParsing ||
     includeTags.length > 0 ||
     excludeTags.length > 0 ||
-    Boolean(jsonSchemaSpec);
+    Boolean(jsonSchemaSpec) ||
+    Boolean(attributesSpec);
 
   let prevMarkdownForChanges: string | null = null;
   if (stringFormats.has('changes') && env.ARTIFACTS && env.META) {
@@ -5143,19 +5284,24 @@ export async function executeScrapeCall(params: {
   }
 
   const agentFormats = [...stringFormats].filter((f) =>
-    ['markdown', 'text', 'html', 'rawHtml', 'links', 'images', 'branding', 'screenshot'].includes(f),
+    ['markdown', 'text', 'html', 'rawHtml', 'rawBase64', 'links', 'images', 'branding', 'screenshot'].includes(f),
   );
+  if (pdfParserOpts.skipPdfParsing && !agentFormats.includes('rawBase64')) {
+    agentFormats.push('rawBase64');
+  }
   if (agentFormats.length === 0) agentFormats.push('markdown');
 
   const rawRenderModeStr = typeof payload.renderMode === 'string' ? payload.renderMode.trim().toLowerCase() : '';
   const renderMode: 'always' | 'auto' | 'off' | undefined =
-    rawRenderModeStr === 'always' || rawRenderModeStr === 'browser'
+    inlineActions.length > 0 || mobileEmulation || Boolean(screenshotSpec)
       ? 'always'
-      : rawRenderModeStr === 'auto' || rawRenderModeStr === 'off'
-        ? rawRenderModeStr
-        : stringFormats.has('screenshot')
-          ? 'always'
-          : undefined;
+      : rawRenderModeStr === 'always' || rawRenderModeStr === 'browser'
+        ? 'always'
+        : rawRenderModeStr === 'auto' || rawRenderModeStr === 'off'
+          ? rawRenderModeStr
+          : stringFormats.has('screenshot')
+            ? 'always'
+            : undefined;
   const effectiveRenderMode: 'always' | 'auto' | 'off' = renderMode ?? 'auto';
   const jsonFilterStr = typeof payload.jsonFilter === 'string' ? payload.jsonFilter.trim() : '';
   const waybackFallback = Boolean(payload.waybackFallback);
@@ -5163,7 +5309,14 @@ export async function executeScrapeCall(params: {
     typeof payload.collectionId === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(payload.collectionId.trim())
       ? payload.collectionId.trim()
       : undefined;
-  const retentionMode: ArtifactRetention | undefined = env.ARTIFACTS && env.META ? 'stored' : env.ARTIFACTS ? 'transient' : undefined;
+  const retentionMode: ArtifactRetention | undefined =
+    payload.ephemeral === true
+      ? undefined
+      : env.ARTIFACTS && env.META
+        ? 'stored'
+        : env.ARTIFACTS
+          ? 'transient'
+          : undefined;
 
   // R5: Look up stored ETag / Last-Modified validators in META D1 when a verified derived document already exists (and caller isn't updating a collection).
   const revalCandidate =
@@ -5177,19 +5330,19 @@ export async function executeScrapeCall(params: {
       : null;
 
   const fetchCall = {
-    maxSeconds: 110,
+    maxSeconds: Math.max(30, Math.ceil(timeoutMsOpt / 1_000) + 15),
     options: {
       includeBody: true,
       respectRobots: true,
       maxBytes: 16 * 1024 * 1024,
-      timeoutMs: 95_000,
+      timeoutMs: timeoutMsOpt,
       discoverLlms: goDiscoverLlms,
     },
     requests: [
       {
         id: 'scrape-1',
         url: normalizedUrl,
-        kind: renderMode === 'always' ? 'render' : 'scrape',
+        kind: pdfParserOpts.skipPdfParsing ? 'binary' : renderMode === 'always' ? 'render' : 'scrape',
         formats: agentFormats,
         onlyMainContent,
         discoverLlms: goDiscoverLlms,
@@ -5197,16 +5350,17 @@ export async function executeScrapeCall(params: {
         ...(revalCandidate?.etag ? { ifNoneMatch: revalCandidate.etag } : {}),
         ...(revalCandidate?.lastModified ? { ifModifiedSince: revalCandidate.lastModified } : {}),
         ...(renderMode ? { renderMode } : {}),
-        ...(typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
-          ? { waitForMs: Math.min(15_000, Math.max(0, Math.floor(payload.waitForMs))) }
-          : {}),
-        ...(typeof payload.waitSelector === 'string' && payload.waitSelector.trim()
-          ? { waitSelector: payload.waitSelector.trim().slice(0, 200) }
-          : {}),
-        ...(typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages)
-          ? { maxPages: Math.min(500, Math.max(1, Math.floor(payload.maxPages))) }
-          : {}),
-        ...(payload.headers && typeof payload.headers === 'object' ? { headers: payload.headers } : {}),
+        ...(mobileEmulation ? { mobile: true } : {}),
+        ...(screenshotSpec?.fullPage ? { screenshotFullPage: true } : {}),
+        ...(screenshotSpec?.quality ? { screenshotQuality: screenshotSpec.quality } : {}),
+        ...(typeof screenshotSpec?.viewport?.width === 'number' ? { viewportWidth: Math.floor(screenshotSpec.viewport.width) } : {}),
+        ...(typeof screenshotSpec?.viewport?.height === 'number' ? { viewportHeight: Math.floor(screenshotSpec.viewport.height) } : {}),
+        ...(acceptLanguageOpt ? { acceptLanguage: acceptLanguageOpt } : {}),
+        ...(waitForMsOpt !== undefined ? { waitForMs: waitForMsOpt } : {}),
+        ...(waitSelectorOpt ? { waitSelector: waitSelectorOpt } : {}),
+        ...(maxPagesCap ? { maxPages: maxPagesCap } : {}),
+        ...(Object.keys(mergedHeaders).length > 0 ? { headers: mergedHeaders } : {}),
+        ...(inlineActions.length > 0 ? { interact: { actions: inlineActions } } : {}),
       },
     ],
   };
@@ -5223,10 +5377,13 @@ export async function executeScrapeCall(params: {
   // Pre-fetch ATS API adapters (`P1` Ashby, `P2` Workday CXS `GET`/`POST`, Greenhouse, Lever) — runs even when
   // `renderMode: "browser"` / `"always"` is passed so client-hydrated ATS boards always resolve cleanly via their official APIs.
   const canUseAtsAdapter =
+    inlineActions.length === 0 &&
     !stringFormats.has('html') &&
     !stringFormats.has('rawHtml') &&
+    !stringFormats.has('rawBase64') &&
     !stringFormats.has('screenshot') &&
     !stringFormats.has('branding') &&
+    !attributesSpec &&
     !jsonSchemaSpec;
   const atsSpec = canUseAtsAdapter ? resolveAtsPreFetchSpec(normalizedUrl) : null;
   if (atsSpec) {
@@ -6216,13 +6373,37 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  const binaryScrapeProblem = detectUnsupportedBinaryPayload({
-    rawBody: rawBodyStr,
-    contentType: item.contentType,
-    url: finalUrl,
-    bodyEncoding: item.bodyEncoding,
-    isPdf: isPdfResponse,
-  });
+  const rawBase64Requested = stringFormats.has('rawBase64') || pdfParserOpts.skipPdfParsing;
+  if (rawBase64Requested && pdfParserOpts.skipPdfParsing) {
+    const rawB64 = encodeBodyToRawBase64(item);
+    return {
+      status: 200,
+      via: fetchResUsed.via,
+      body: {
+        ok: true,
+        cached: false,
+        pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        url: normalizedUrl,
+        finalUrl,
+        status: item.status ?? 200,
+        via: fetchResUsed.via,
+        ...(rawB64 ? { rawBase64: rawB64 } : {}),
+        metadata: {
+          contentType: isPdfResponse ? 'application/pdf' : item.contentType,
+        },
+      },
+    };
+  }
+
+  const binaryScrapeProblem = rawBase64Requested
+    ? null
+    : detectUnsupportedBinaryPayload({
+        rawBody: rawBodyStr,
+        contentType: item.contentType,
+        url: finalUrl,
+        bodyEncoding: item.bodyEncoding,
+        isPdf: isPdfResponse,
+      });
   if (binaryScrapeProblem) {
     return {
       status: 422,
@@ -6774,12 +6955,87 @@ export async function executeScrapeCall(params: {
   // R4: Classify `contentState` ("active" | "closed_posting" | "soft_404" | "login_wall") with anti-false-positive vetoes!
   const contentStateCheck: { state: ContentState; reason?: string } = classifyContentState({
     status: typeof item.status === 'number' ? item.status : 200,
+    url: normalizedUrl,
+    finalUrl,
     title: resolvedTitle,
     markdown: rawCleanMarkdown,
     ...(isHtmlBody ? { rawHtml: rawBodyStr } : {}),
     ...(htmlJobPosting?.validThrough ? { validThrough: htmlJobPosting.validThrough } : {}),
     nowMs: now,
   });
+
+  if (checkPromptInjection) {
+    const piCheck = detectPromptInjection({
+      markdown: rawCleanMarkdown,
+      ...(isHtmlBody ? { rawHtml: rawBodyStr } : {}),
+    });
+    if (piCheck.detected) {
+      return {
+        status: 403,
+        via: viaOut,
+        body: {
+          ok: false,
+          url: normalizedUrl,
+          finalUrl,
+          error: 'SCRAPE_PROMPT_INJECTION_DETECTED',
+          message: `Prompt injection guard blocked page content (${piCheck.triggers.join(', ')})`,
+          triggers: piCheck.triggers,
+        },
+      };
+    }
+  }
+
+  let pdfPagesArray: string[] | undefined;
+  if (isPdfResponse && (pdfParserOpts.includePagesArray || pdfParserOpts.includePageMarkers)) {
+    const rawPdfSource = typeof item.markdown === 'string' && item.markdown ? item.markdown : rawCleanMarkdown;
+    const splitPdf = splitPdfPagesAndMarkers(rawPdfSource, pdfParserOpts.includePageMarkers);
+    if (pdfParserOpts.includePagesArray) {
+      pdfPagesArray = splitPdf.pages;
+    }
+    if (pdfParserOpts.includePageMarkers && splitPdf.markedMarkdown) {
+      markdown = finalizeScrapedMarkdown(splitPdf.markedMarkdown, {
+        isPdf: true,
+        includeImages,
+        maxChars,
+        baseUrl: finalUrl,
+      }).markdown;
+    }
+  }
+
+  const llmResolved =
+    stringFormats.has('summary') || Boolean(jsonSchemaSpec)
+      ? resolveLlmConfig({
+          env: env as OptionalStorageBindings & LlmEnvBindings,
+          requestLlm: payload.llm,
+          selfHost,
+        })
+      : { ok: true as const, config: null };
+  const activeLlmConfig = llmResolved.ok ? llmResolved.config : null;
+
+  let summaryOut: string | undefined;
+  if (stringFormats.has('summary')) {
+    const sumRes = await summarizeMarkdownWithOptionalLlm({
+      markdown: rawCleanMarkdown,
+      title: resolvedTitle,
+      llmConfig: activeLlmConfig,
+    });
+    summaryOut = sumRes.summary;
+  }
+
+  let productOut: Record<string, unknown> | null = null;
+  if (stringFormats.has('product')) {
+    productOut = extractStructuredProduct({
+      rawBody: rawBodyStr,
+      finalUrl,
+      fallbackTitle: resolvedTitle,
+      fallbackDescription: resolvedDescription,
+    });
+  }
+
+  const attributesOut =
+    attributesSpec && isHtmlBody ? extractHtmlAttributesBySelectors(rawBodyStr, attributesSpec) : undefined;
+
+  const rawBase64Out = rawBase64Requested ? encodeBodyToRawBase64(item) : undefined;
 
   const docForJson: ExtractedDocument | undefined = jsonSchemaSpec
     ? {
@@ -6817,6 +7073,18 @@ export async function executeScrapeCall(params: {
       }
       structuredJsonOut = { ...structuredJsonOut, ...directPicked };
     }
+    if (activeLlmConfig && (jsonSchemaSpec.prompt || jsonSchemaSpec.schema)) {
+      const llmExt = await extractJsonWithOptionalLlm({
+        markdown: rawCleanMarkdown,
+        title: resolvedTitle,
+        url: finalUrl,
+        prompt: jsonSchemaSpec.prompt,
+        schema: jsonSchemaSpec.schema,
+        heuristicFallback: structuredJsonOut ?? {},
+        llmConfig: activeLlmConfig,
+      });
+      structuredJsonOut = llmExt.data;
+    }
   }
 
   const art = item.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
@@ -6838,6 +7106,23 @@ export async function executeScrapeCall(params: {
   }
 
   const redirectAnalysis = analyzeUrlRedirect(normalizedUrl, finalUrl);
+  const computedChanges = stringFormats.has('changes')
+    ? computeMarkdownChanges(prevMarkdownForChanges, rawCleanMarkdown)
+    : undefined;
+
+  const actionOutputsObj =
+    inlineActions.length > 0 ||
+    Array.isArray(item.actionScreenshots) ||
+    Array.isArray(item.actionScrapes) ||
+    Array.isArray(item.javascriptReturns) ||
+    typeof item.pdfBase64 === 'string'
+      ? {
+          ...(Array.isArray(item.actionScreenshots) ? { screenshots: item.actionScreenshots } : {}),
+          ...(Array.isArray(item.actionScrapes) ? { scrapes: item.actionScrapes } : {}),
+          ...(Array.isArray(item.javascriptReturns) ? { javascriptReturns: item.javascriptReturns } : {}),
+          ...(typeof item.pdfBase64 === 'string' && item.pdfBase64 ? { pdfs: [item.pdfBase64] } : {}),
+        }
+      : undefined;
 
   const out: Record<string, unknown> = {
     ok: true,
@@ -6858,6 +7143,12 @@ export async function executeScrapeCall(params: {
     ...(markdownArtifactId ? { markdownArtifactId } : {}),
     ...(stringFormats.has('markdown') ? { markdown } : {}),
     ...(stringFormats.has('text') ? { text: textOut } : {}),
+    ...(summaryOut !== undefined ? { summary: summaryOut } : {}),
+    ...(productOut ? { product: productOut } : {}),
+    ...(attributesOut ? { attributes: attributesOut } : {}),
+    ...(rawBase64Out ? { rawBase64: rawBase64Out } : {}),
+    ...(pdfPagesArray ? { pages: pdfPagesArray } : {}),
+    ...(actionOutputsObj && Object.keys(actionOutputsObj).length > 0 ? { actions: actionOutputsObj } : {}),
     ...(focused.queryFiltered
       ? { queryFiltered: true, chunks: focused.chunks }
       : jsonRecordsFormatted
@@ -6904,11 +7195,26 @@ export async function executeScrapeCall(params: {
         }
       : {}),
     ...(structuredJsonOut ? { json: structuredJsonOut } : {}),
-    ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64 ? { screenshotBase64: item.screenshotBase64 } : {}),
+    ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64
+      ? { screenshotBase64: item.screenshotBase64, screenshot: `data:image/png;base64,${item.screenshotBase64}` }
+      : {}),
     ...(item.rendered === true || renderedViaOut !== undefined ? { rendered: true } : {}),
     ...(pdfEngineOut ? { pdfEngine: pdfEngineOut } : {}),
     ...(ocrReportOut ? { ocr: ocrReportOut } : {}),
-    ...(stringFormats.has('changes') ? { changes: computeMarkdownChanges(prevMarkdownForChanges, rawCleanMarkdown) } : {}),
+    ...(computedChanges
+      ? {
+          changes: computedChanges,
+          ...(changeTrackingSpec
+            ? {
+                changeTracking: {
+                  changeStatus: computedChanges.status,
+                  ...(changeTrackingSpec.tag ? { tag: changeTrackingSpec.tag } : {}),
+                  ...(computedChanges.diffPreview ? { diff: { text: computedChanges.diffPreview } } : {}),
+                },
+              }
+            : {}),
+        }
+      : {}),
     ...(llmsPayload ? { llms: llmsPayload, ...(stringFormats.has('llmsTxt') ? { llmsTxt: llmsPayload } : {}) } : {}),
     metadata: {
       title: resolvedTitle,
@@ -7021,55 +7327,16 @@ export async function executeInteractCall(params: {
     };
   }
 
-  const actions: Array<Record<string, unknown>> = [];
-  const agentActions: Array<Record<string, unknown>> = [];
-  if (Array.isArray(payload.actions)) {
-    if (payload.actions.length > 25) {
-      return { status: 400, via: 'hub', body: { ok: false, error: 'too_many_actions', message: 'maximum 25 actions per interact turn' } };
-    }
-    for (const rawAct of payload.actions) {
-      if (!rawAct || typeof rawAct !== 'object') continue;
-      const a = rawAct as Record<string, unknown>;
-      const type = typeof a.type === 'string' ? a.type.trim().toLowerCase() : '';
-      if (!['click', 'fill', 'type', 'press', 'wait', 'scroll', 'select', 'navigate'].includes(type)) {
-        return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_action', message: `unsupported action type: ${String(a.type)}` } };
-      }
-      if (type === 'navigate') {
-        const navCheck = validatePublicHttpsTargetUrl(a.url, selfHost);
-        if (!navCheck.ok) {
-          return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: `navigate action: ${navCheck.message}` } };
-        }
-      }
-      const explicitWaitMs =
-        typeof a.waitMs === 'number' && Number.isFinite(a.waitMs)
-          ? Math.min(15_000, Math.max(0, Math.floor(a.waitMs)))
-          : undefined;
-      const keyVal = typeof a.key === 'string' ? a.key.slice(0, 40) : undefined;
-      const normalizedAct: Record<string, unknown> = {
-        type,
-        ...(typeof a.selector === 'string' ? { selector: a.selector.slice(0, 240) } : {}),
-        ...(typeof a.value === 'string' ? { value: a.value.slice(0, 4096) } : {}),
-        ...(keyVal !== undefined ? { key: keyVal } : {}),
-        ...(typeof a.url === 'string' ? { url: a.url.trim() } : {}),
-        ...(explicitWaitMs !== undefined ? { waitMs: explicitWaitMs } : {}),
-      };
-      actions.push(normalizedAct);
-      // Give `click` and `Enter` `press` actions a >=1200ms / >=900ms default settle window instead of Go's 250ms default
-      // so cross-origin link navigations and blocking `<head><script>` tags finish parsing `<body>` before DOM capture.
-      const effectiveAgentWaitMs =
-        explicitWaitMs !== undefined
-          ? explicitWaitMs
-          : type === 'click'
-            ? 1_200
-            : type === 'press' && (!keyVal || /^(?:enter|return)$/i.test(keyVal))
-              ? 900
-              : undefined;
-      agentActions.push({
-        ...normalizedAct,
-        ...(effectiveAgentWaitMs !== undefined ? { waitMs: effectiveAgentWaitMs } : {}),
-      });
-    }
+  const parsedInteractActions = normalizeInlineBrowserActions(payload.actions, selfHost, 50);
+  if (!parsedInteractActions.ok) {
+    return {
+      status: 400,
+      via: 'hub',
+      body: { ok: false, error: parsedInteractActions.message.includes('maximum') ? 'too_many_actions' : 'invalid_action', message: parsedInteractActions.message },
+    };
   }
+  const actions: Array<Record<string, unknown>> = parsedInteractActions.actions;
+  const agentActions: Array<Record<string, unknown>> = [...parsedInteractActions.actions];
 
   const topWaitForMs =
     typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)

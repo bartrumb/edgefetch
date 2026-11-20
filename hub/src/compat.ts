@@ -1,36 +1,51 @@
 /**
- * Drop-in Firecrawl v2 (`/compat/firecrawl/v2/*`) and Tavily (`/compat/tavily/*`) compatibility routes (`Addition 11`).
+ * Drop-in Firecrawl v2 (`/v2/*` AND `/compat/firecrawl/v2/*`) and Tavily (`/compat/tavily/*`) compatibility routes.
  *
- * Allows existing `firecrawl-js` / `tavily-python` / `tavily-js` callers to point their `apiUrl` / `baseURL` directly at
- * a self-hosted EdgeFetch Hub without rewriting client code.
+ * Allows unmodified `new Firecrawl({ apiUrl: "https://<hub>" })` / `FirecrawlApp(api_url=...)` / Tavily SDK callers
+ * to point directly at a self-hosted EdgeFetch Hub with zero path prefix or client code rewrites.
  */
 
 import { MAX_CALL_UTF8_BYTES } from './agent-hub';
-import { isValidSecretMatch } from './auth';
 import {
+  cancelAgentRun,
+  formatPublicAgentResponse,
+  loadAgentRun,
+  startOrExecuteAgentCall,
+} from './agent-runner';
+import { isValidSecretMatch } from './auth';
+import type { LlmEnvBindings } from './llm';
+import {
+  cancelBatchScrape,
   cancelCrawlJob,
   createCrawlJob,
   executeCrawlJob,
   executeMapCall,
+  getBatchScrapeStatus,
   getCrawlJobStatus,
+  previewCrawlParams,
+  startOrExecuteBatchScrape,
   type HubFetchExecutor,
 } from './map-crawl';
 import { authorizeMcpRequest, type OAuthStore } from './oauth';
 import { executeScrapeCall } from './scrape';
 import { executeExtractCall } from './search-index';
+import type { OptionalStorageBindings } from './storage';
 import { executeSearchCall, type SearchBindings } from './web-search';
 
 export async function handleCompatRoutes(params: {
   request: Request;
   url: URL;
-  env: SearchBindings & { CALLER_TOKEN?: string; MCP_TOKEN?: string; WEBHOOK_SECRET?: string };
+  env: OptionalStorageBindings & SearchBindings & LlmEnvBindings & { CALLER_TOKEN?: string; MCP_TOKEN?: string; WEBHOOK_SECRET?: string };
   oauthStore: OAuthStore;
   executeHubFetch: HubFetchExecutor;
   waitUntil?: (p: Promise<unknown>) => void;
 }): Promise<Response | null> {
   const { request, url, env, oauthStore, executeHubFetch, waitUntil } = params;
   const p = url.pathname;
-  if (!p.startsWith('/compat/firecrawl/v2/') && !p.startsWith('/compat/tavily/')) {
+  const isDirectFirecrawlV2 = p.startsWith('/v2/');
+  const isPrefixedFirecrawlV2 = p.startsWith('/compat/firecrawl/v2/');
+  const isTavily = p.startsWith('/compat/tavily/');
+  if (!isDirectFirecrawlV2 && !isPrefixedFirecrawlV2 && !isTavily) {
     return null;
   }
 
@@ -63,7 +78,7 @@ export async function handleCompatRoutes(params: {
   if (auth.ok && auth.scopes.includes('crawl:fetch')) {
     authorized = true;
   } else if (
-    p.startsWith('/compat/tavily/') &&
+    isTavily &&
     typeof bodyObj.api_key === 'string' &&
     isValidSecretMatch(bodyObj.api_key.trim(), env.CALLER_TOKEN, env.MCP_TOKEN)
   ) {
@@ -74,8 +89,12 @@ export async function handleCompatRoutes(params: {
     return Response.json({ success: false, error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
   }
 
-  // ── Firecrawl v2 Compatibility Surface ──
-  if (p === '/compat/firecrawl/v2/scrape' && request.method === 'POST') {
+  // Normalize `/v2/<subpath>` and `/compat/firecrawl/v2/<subpath>` into one canonical subpath
+  const fcPrefix = isDirectFirecrawlV2 ? '/v2' : '/compat/firecrawl/v2';
+  const fcSubpath = isDirectFirecrawlV2 ? p.slice('/v2'.length) : isPrefixedFirecrawlV2 ? p.slice('/compat/firecrawl/v2'.length) : '';
+
+  // ── Firecrawl v2 Compatibility Surface (`/v2/*` & `/compat/firecrawl/v2/*`) ──
+  if (fcSubpath === '/scrape' && request.method === 'POST') {
     const out = await executeScrapeCall({
       payload: {
         ...bodyObj,
@@ -92,7 +111,7 @@ export async function handleCompatRoutes(params: {
     return Response.json({ success: true, data: out.body }, { status: 200 });
   }
 
-  if (p === '/compat/firecrawl/v2/map' && request.method === 'POST') {
+  if (fcSubpath === '/map' && request.method === 'POST') {
     const out = await executeMapCall({
       payload: bodyObj,
       executeHubFetch,
@@ -105,7 +124,12 @@ export async function handleCompatRoutes(params: {
     );
   }
 
-  if (p === '/compat/firecrawl/v2/crawl' && request.method === 'POST') {
+  if (fcSubpath === '/crawl/params-preview' && request.method === 'POST') {
+    const prev = previewCrawlParams(bodyObj, url.hostname);
+    return Response.json(prev.body, { status: prev.status });
+  }
+
+  if (fcSubpath === '/crawl' && request.method === 'POST') {
     const created = await createCrawlJob({ payload: bodyObj, metaDb: env.META, selfHost: url.hostname });
     if (!created.ok) {
       return Response.json({ success: false, error: created.error, message: created.message }, { status: created.status });
@@ -126,11 +150,11 @@ export async function handleCompatRoutes(params: {
     } else {
       await jobPromise;
     }
-    return Response.json({ success: true, id: created.crawlId, url: `${url.origin}/compat/firecrawl/v2/crawl/${created.crawlId}` });
+    return Response.json({ success: true, id: created.crawlId, url: `${url.origin}${fcPrefix}/crawl/${created.crawlId}` });
   }
 
-  const fcCrawlMatch = /^\/compat\/firecrawl\/v2\/crawl\/([^/]+)$/.exec(p);
-  if (fcCrawlMatch) {
+  const fcCrawlMatch = /^\/crawl\/([^/]+)$/.exec(fcSubpath);
+  if (fcCrawlMatch && fcCrawlMatch[1] !== 'params-preview') {
     const crawlId = decodeURIComponent(fcCrawlMatch[1] ?? '');
     if (request.method === 'GET') {
       const rawOffset = Number(url.searchParams.get('offset') ?? 0);
@@ -151,7 +175,60 @@ export async function handleCompatRoutes(params: {
     }
   }
 
-  if (p === '/compat/firecrawl/v2/search' && request.method === 'POST') {
+  if (fcSubpath === '/batch/scrape' && request.method === 'POST') {
+    const batchOut = await startOrExecuteBatchScrape({
+      payload: bodyObj,
+      selfHost: url.hostname,
+      executeScrape: async (scArgs) => {
+        const res = await executeScrapeCall({
+          payload: scArgs,
+          env,
+          executeHubFetch,
+          selfHost: url.hostname,
+          source: 'compat:firecrawl:batch-scrape',
+        });
+        return { status: res.status, body: res.body };
+      },
+      ...(waitUntil ? { waitUntil } : {}),
+    });
+    if (!batchOut.ok) {
+      return Response.json({ success: false, error: batchOut.error, message: batchOut.message }, { status: batchOut.status });
+    }
+    return Response.json(
+      {
+        success: true,
+        id: batchOut.job.id,
+        url: `${url.origin}${fcPrefix}/batch/scrape/${batchOut.job.id}`,
+        ...(bodyObj.sync === true ? { status: batchOut.job.status, total: batchOut.job.total, completed: batchOut.job.completed, data: batchOut.job.data } : {}),
+      },
+      { status: 200 },
+    );
+  }
+
+  const fcBatchMatch = /^\/batch\/scrape\/([^/]+)$/.exec(fcSubpath);
+  if (fcBatchMatch) {
+    const batchId = decodeURIComponent(fcBatchMatch[1] ?? '');
+    if (request.method === 'GET') {
+      const job = getBatchScrapeStatus(batchId);
+      if (!job) return Response.json({ success: false, error: 'batch_not_found' }, { status: 404 });
+      return Response.json({
+        success: true,
+        status: job.status,
+        total: job.total,
+        completed: job.completed,
+        creditsUsed: 0,
+        expiresAt: new Date(job.expiresAt).toISOString(),
+        data: job.data,
+        ...(job.errors.length > 0 ? { errors: job.errors } : {}),
+      });
+    }
+    if (request.method === 'DELETE') {
+      const ok = cancelBatchScrape(batchId);
+      return Response.json({ success: ok, message: ok ? 'Batch scrape job cancelled' : 'Batch not found' }, { status: ok ? 200 : 404 });
+    }
+  }
+
+  if (fcSubpath === '/search' && request.method === 'POST') {
     const out = await executeSearchCall({
       payload: bodyObj,
       env,
@@ -162,6 +239,55 @@ export async function handleCompatRoutes(params: {
       out.status === 200 ? { success: true, data: out.body.results, ...out.body } : { success: false, ...out.body },
       { status: out.status },
     );
+  }
+
+  // ── Firecrawl `/v2/agent` Drop-In Compatibility (with SSE + BYO-LLM + Dynamic Adapter Router) ──
+  if (fcSubpath === '/agent' && request.method === 'POST') {
+    const wantSse = (request.headers.get('accept') ?? '').toLowerCase().includes('text/event-stream');
+    // Firecrawl POST /v2/agent defaults to async job creation unless zeroDataRetention=true or sync=true/stream=true
+    const effectivePayload =
+      bodyObj.async === undefined && bodyObj.sync !== true && bodyObj.stream !== true && !wantSse && bodyObj.zeroDataRetention !== true
+        ? { ...bodyObj, async: true }
+        : bodyObj;
+    const out = await startOrExecuteAgentCall({
+      payload: effectivePayload,
+      env,
+      executeHubFetch,
+      selfHost: url.hostname,
+      principal: auth.ok ? auth.principal : 'compat',
+      wantSseStream: wantSse,
+      ...(waitUntil ? { waitUntil } : {}),
+    });
+    if (out.kind === 'sse') return out.response;
+    return Response.json(out.body, { status: out.status });
+  }
+
+  const fcAgentTraceMatch = /^\/agent\/([^/]+)\/trace$/.exec(fcSubpath);
+  if (fcAgentTraceMatch && request.method === 'GET') {
+    const agentId = decodeURIComponent(fcAgentTraceMatch[1] ?? '');
+    const rec = await loadAgentRun(agentId, env.META);
+    if (!rec) return Response.json({ success: false, error: 'agent_not_found' }, { status: 404 });
+    return Response.json({
+      success: true,
+      id: rec.id,
+      threadId: rec.threadId,
+      status: rec.status,
+      spans: rec.trace,
+    });
+  }
+
+  const fcAgentMatch = /^\/agent\/([^/]+)$/.exec(fcSubpath);
+  if (fcAgentMatch) {
+    const agentId = decodeURIComponent(fcAgentMatch[1] ?? '');
+    if (request.method === 'GET') {
+      const rec = await loadAgentRun(agentId, env.META);
+      if (!rec) return Response.json({ success: false, error: 'agent_not_found' }, { status: 404 });
+      return Response.json(formatPublicAgentResponse(rec, false));
+    }
+    if (request.method === 'DELETE') {
+      const cRes = await cancelAgentRun(agentId, env.META);
+      return Response.json({ success: cRes.ok }, { status: cRes.status });
+    }
   }
 
   // ── Tavily Compatibility Surface ──

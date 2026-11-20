@@ -331,6 +331,12 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 
 	// 3. Images, links, headings, emphasis, lists, blockquotes.
 
+	stashURL := func(u string) string {
+		tok := "\x00URL_" + itoa(len(stash)) + "\x00"
+		stash = append(stash, placeholder{token: tok, value: u})
+		return tok
+	}
+
 	s = reImgTag.ReplaceAllStringFunc(s, func(m string) string {
 		attrs := parseAttrs(m)
 		src := resolveHref(firstAttr(attrs, "src", "data-src"), base)
@@ -338,7 +344,7 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 			return ""
 		}
 		alt := strings.TrimSpace(html.UnescapeString(attrs["alt"]))
-		return "![" + alt + "](" + src + ")"
+		return "![" + alt + "](" + stashURL(src) + ")"
 	})
 
 	s = reAnchor.ReplaceAllStringFunc(s, func(m string) string {
@@ -355,7 +361,7 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 		if href == "" || strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "#") {
 			return label
 		}
-		return "[" + label + "](" + href + ")"
+		return "[" + label + "](" + stashURL(href) + ")"
 	})
 
 	s = reHeading.ReplaceAllStringFunc(s, func(m string) string {
@@ -448,6 +454,7 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 		s = strings.ReplaceAll(s, stash[i].token, stash[i].value)
 	}
 	s = reMultiLine.ReplaceAllString(s, "\n\n")
+	s = reInvisibleSmuggling.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
 }
 
@@ -882,8 +889,21 @@ func firstAttr(attrs map[string]string, keys ...string) string {
 	return ""
 }
 
+var reHrefAmpEntity = regexp.MustCompile(`(?i)&(?:amp|#0*38|#x0*26);`)
+var reInvisibleSmuggling = regexp.MustCompile(`[\x{E0000}-\x{E007F}\x{202A}-\x{202E}\x{2066}-\x{2069}]`)
+
+// unescapeHrefAmpOnly safely replaces only `&amp;` / `&#38;` / `&#x26;` inside URLs.
+// Calling `html.UnescapeString` on raw hrefs corrupts semicolon-less query params like
+// `&currentTime=` (`&curren` -> `¤tTime=`), `&section=` (`&sect` -> `§ion=`), and `&region=` (`&reg` -> `®ion=`).
+func unescapeHrefAmpOnly(raw string) string {
+	if !strings.Contains(raw, "&") {
+		return strings.TrimSpace(raw)
+	}
+	return strings.TrimSpace(reHrefAmpEntity.ReplaceAllString(raw, "&"))
+}
+
 func resolveHref(raw string, base *url.URL) string {
-	raw = strings.TrimSpace(html.UnescapeString(raw))
+	raw = unescapeHrefAmpOnly(raw)
 	if raw == "" {
 		return ""
 	}

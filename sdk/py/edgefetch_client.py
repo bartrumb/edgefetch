@@ -108,6 +108,10 @@ class EdgeFetchClient:
         safe_limit = max(1, min(500, int(limit)))
         return self._request_json("GET", f"/v1/hosts?limit={safe_limit}")
 
+    def extractors(self, category: Optional[str] = None) -> Dict[str, Any]:
+        qs = f"?category={urllib.parse.quote(category, safe='')}" if category else ""
+        return self._request_json("GET", f"/v1/extractors{qs}")
+
     def scrape(self, url: str, **options: Any) -> Dict[str, Any]:
         return self._request_json("POST", "/v1/scrape", {"url": url, **options})
 
@@ -138,6 +142,31 @@ class EdgeFetchClient:
 
     def interact(self, **options: Any) -> Dict[str, Any]:
         return self._request_json("POST", "/v1/interact", dict(options))
+
+    def batch_scrape(self, urls: Iterable[str], **options: Any) -> Dict[str, Any]:
+        return self._request_json("POST", "/v1/batch/scrape", {"urls": list(urls), **options})
+
+    def get_batch_scrape(self, batch_id: str) -> Dict[str, Any]:
+        bid = urllib.parse.quote(batch_id, safe="")
+        return self._request_json("GET", f"/v1/batch/scrape/{bid}")
+
+    def preview_crawl_params(self, url: str, prompt: str) -> Dict[str, Any]:
+        return self._request_json("POST", "/v1/crawl/params-preview", {"url": url, "prompt": prompt})
+
+    def agent(self, prompt: str, **options: Any) -> Dict[str, Any]:
+        return self._request_json("POST", "/v1/agent", {"prompt": prompt, **options})
+
+    def get_agent(self, agent_id: str) -> Dict[str, Any]:
+        aid = urllib.parse.quote(agent_id, safe="")
+        return self._request_json("GET", f"/v1/agent/{aid}")
+
+    def get_agent_trace(self, agent_id: str) -> Dict[str, Any]:
+        aid = urllib.parse.quote(agent_id, safe="")
+        return self._request_json("GET", f"/v1/agent/{aid}/trace")
+
+    def cancel_agent(self, agent_id: str) -> Dict[str, Any]:
+        aid = urllib.parse.quote(agent_id, safe="")
+        return self._request_json("DELETE", f"/v1/agent/{aid}")
 
     def read_artifact(
         self,

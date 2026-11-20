@@ -6,6 +6,7 @@
  * operating unchanged when `ARTIFACTS` / `META` / `SEARCH` / `INGEST` are unconfigured.
  */
 
+import type { LlmEnvBindings } from './llm';
 import { encodeBodyForWire } from './overflow';
 import { listConfiguredSpaFallbacks, type SpaFallbackEnv, type SpaFallbackProvider } from './spa-fallback';
 
@@ -19,7 +20,7 @@ export interface IngestWorkflowParams {
   via: string;
 }
 
-export interface OptionalStorageBindings extends SpaFallbackEnv {
+export interface OptionalStorageBindings extends SpaFallbackEnv, LlmEnvBindings {
   ARTIFACTS?: R2Bucket;
   META?: D1Database;
   SEARCH?: D1Database;
@@ -157,7 +158,7 @@ export function buildCapabilities(
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
-  version = '2.4.1',
+  version = '2.5.0',
 ): HubCapabilities {
   const searchProviders: string[] = ['edge-map'];
   if (env.SEARCH) searchProviders.push('d1-fts5');

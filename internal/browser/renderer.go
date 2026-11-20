@@ -35,38 +35,66 @@ const (
 	maxActiveSessions     = 8
 )
 
-// InteractAction describes a single deterministic browser interaction step (`firecrawl_interact` parity).
+// InteractAction describes a single deterministic browser interaction step (`firecrawl_interact` & `/scrape` inline `actions` parity).
 type InteractAction struct {
-	Type     string `json:"type"`               // "click", "fill", "type", "press", "wait", "scroll", "select", "navigate"
-	Selector string `json:"selector,omitempty"` // CSS selector for click/fill/type/select/scroll
-	Value    string `json:"value,omitempty"`    // Input value for fill/type/select
-	Key      string `json:"key,omitempty"`      // Key name for press (e.g. "Enter", "Tab", "Escape")
-	URL      string `json:"url,omitempty"`      // HTTPS target for navigate
-	WaitMs   int    `json:"waitMs,omitempty"`   // Milliseconds to pause after or during "wait"
+	Type         string `json:"type"`                   // "click", "fill", "type", "write", "press", "wait", "scroll", "select", "navigate", "screenshot", "scrape", "executeJavascript", "pdf"
+	Selector     string `json:"selector,omitempty"`     // CSS selector for click/fill/type/select/scroll/wait
+	All          bool   `json:"all,omitempty"`          // Click every element matching Selector when true
+	Value        string `json:"value,omitempty"`        // Input value for fill/type/select/write
+	Text         string `json:"text,omitempty"`         // Alias for Value on write/type
+	Key          string `json:"key,omitempty"`          // Key name for press (e.g. "Enter", "Tab", "Escape")
+	Direction    string `json:"direction,omitempty"`    // "down" (default) or "up" for scroll
+	Script       string `json:"script,omitempty"`       // JS snippet for executeJavascript
+	FullPage     bool   `json:"fullPage,omitempty"`     // Full-page capture for screenshot action
+	URL          string `json:"url,omitempty"`          // HTTPS target for navigate
+	WaitMs       int    `json:"waitMs,omitempty"`       // Milliseconds to pause after or during "wait"
+	Milliseconds int    `json:"milliseconds,omitempty"` // Firecrawl alias for WaitMs
+}
+
+// ActionScrapeSnapshot records a mid-sequence DOM snapshot captured by a `{ "type": "scrape" }` action.
+type ActionScrapeSnapshot struct {
+	URL  string `json:"url"`
+	HTML string `json:"html"`
+}
+
+// ActionJSReturn records the return value of an `{ "type": "executeJavascript" }` action.
+type ActionJSReturn struct {
+	Type  string `json:"type"`
+	Value any    `json:"value"`
 }
 
 // Task describes a browser render or interaction request.
 type Task struct {
-	URL          string
-	UserAgent    string
-	Headers      map[string]string
-	WaitForMs    int
-	WaitSelector string
-	Screenshot   bool
-	Actions      []InteractAction
-	SessionID    string // Optional existing session to resume
-	KeepSession  bool   // Retain tab open for follow-up `interact` calls
-	CloseSession bool   // Close `SessionID` immediately after or without running actions
+	URL                string
+	UserAgent          string
+	AcceptLanguage     string
+	Headers            map[string]string
+	Mobile             bool
+	ViewportWidth      int
+	ViewportHeight     int
+	WaitForMs          int
+	WaitSelector       string
+	Screenshot         bool
+	ScreenshotFullPage bool
+	ScreenshotQuality  int
+	Actions            []InteractAction
+	SessionID          string // Optional existing session to resume
+	KeepSession        bool   // Retain tab open for follow-up `interact` calls
+	CloseSession       bool   // Close `SessionID` immediately after or without running actions
 }
 
-// Output holds the rendered DOM, HTTP metadata, screenshot, and optional session handle.
+// Output holds the rendered DOM, HTTP metadata, screenshot, action outputs, and optional session handle.
 type Output struct {
-	Status           int
-	Headers          http.Header
-	FinalURL         string
-	HTML             string
-	ScreenshotBase64 string
-	SessionID        string
+	Status            int
+	Headers           http.Header
+	FinalURL          string
+	HTML              string
+	ScreenshotBase64  string
+	ActionScreenshots []string
+	ActionScrapes     []ActionScrapeSnapshot
+	JavascriptReturns []ActionJSReturn
+	PDFBase64         string
+	SessionID         string
 }
 
 type retainedSession struct {
@@ -293,14 +321,31 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 			return Output{}, fmt.Errorf("create browser context: %w", err)
 		}
 
+		vpWidth := task.ViewportWidth
+		vpHeight := task.ViewportHeight
+		if vpWidth <= 0 {
+			if task.Mobile {
+				vpWidth = 390
+			} else {
+				vpWidth = 1366
+			}
+		}
+		if vpHeight <= 0 {
+			if task.Mobile {
+				vpHeight = 844
+			} else {
+				vpHeight = 900
+			}
+		}
+
 		var tgtOut struct {
 			TargetID string `json:"targetId"`
 		}
 		if err := cdp.call(ctx, "", "Target.createTarget", map[string]any{
 			"url":              "about:blank",
 			"browserContextId": bcOut.BrowserContextID,
-			"width":            1366,
-			"height":           900,
+			"width":            vpWidth,
+			"height":           vpHeight,
 		}, &tgtOut); err != nil {
 			_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": bcOut.BrowserContextID}, nil)
 			return Output{}, fmt.Errorf("create target: %w", err)
@@ -336,14 +381,31 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 		_ = cdp.call(ctx, sess.cdpSessionID, "Network.enable", nil, nil)
 		_ = cdp.call(ctx, sess.cdpSessionID, "Runtime.enable", nil, nil)
 
+		if task.Mobile || task.ViewportWidth > 0 || task.ViewportHeight > 0 {
+			scale := 1.0
+			if task.Mobile {
+				scale = 2.0
+			}
+			_ = cdp.call(ctx, sess.cdpSessionID, "Emulation.setDeviceMetricsOverride", map[string]any{
+				"width":             vpWidth,
+				"height":            vpHeight,
+				"deviceScaleFactor": scale,
+				"mobile":            task.Mobile,
+			}, nil)
+		}
+
 		ua := strings.TrimSpace(task.UserAgent)
 		if ua == "" {
 			ua = r.userAgent
 		}
+		acceptLang := strings.TrimSpace(task.AcceptLanguage)
+		if acceptLang == "" {
+			acceptLang = "en-US,en;q=0.9"
+		}
 		if ua != "" {
 			_ = cdp.call(ctx, sess.cdpSessionID, "Network.setUserAgentOverride", map[string]any{
 				"userAgent":      ua,
-				"acceptLanguage": "en-US,en;q=0.9",
+				"acceptLanguage": acceptLang,
 			}, nil)
 		}
 		if len(task.Headers) > 0 {
@@ -407,14 +469,24 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 		}
 	}
 
+	var (
+		actionScreenshots []string
+		actionScrapes     []ActionScrapeSnapshot
+		jsReturns         []ActionJSReturn
+		pdfBase64         string
+	)
 	for i, act := range task.Actions {
-		if err := r.runAction(ctx, cdp, sess, events, act); err != nil {
+		if err := r.runAction(ctx, cdp, sess, events, act, &actionScreenshots, &actionScrapes, &jsReturns, &pdfBase64); err != nil {
 			partialHTML, partialURL, _ := readDocumentHTML(ctx, cdp, sess.cdpSessionID)
 			partialOut := Output{
-				Status:   sess.lastStatus,
-				Headers:  sess.lastHeaders.Clone(),
-				FinalURL: partialURL,
-				HTML:     partialHTML,
+				Status:            sess.lastStatus,
+				Headers:           sess.lastHeaders.Clone(),
+				FinalURL:          partialURL,
+				HTML:              partialHTML,
+				ActionScreenshots: actionScreenshots,
+				ActionScrapes:     actionScrapes,
+				JavascriptReturns: jsReturns,
+				PDFBase64:         pdfBase64,
 			}
 			if task.KeepSession && !task.CloseSession {
 				partialOut.SessionID = sess.id
@@ -436,17 +508,30 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 		var shot struct {
 			Data string `json:"data"`
 		}
-		if sErr := cdp.call(ctx, sess.cdpSessionID, "Page.captureScreenshot", map[string]any{"format": "png"}, &shot); sErr == nil {
+		shotFormat := "png"
+		shotParams := map[string]any{"format": shotFormat}
+		if task.ScreenshotQuality > 0 && task.ScreenshotQuality < 100 {
+			shotParams["format"] = "jpeg"
+			shotParams["quality"] = task.ScreenshotQuality
+		}
+		if task.ScreenshotFullPage {
+			shotParams["captureBeyondViewport"] = true
+		}
+		if sErr := cdp.call(ctx, sess.cdpSessionID, "Page.captureScreenshot", shotParams, &shot); sErr == nil {
 			shotB64 = shot.Data
 		}
 	}
 
 	out := Output{
-		Status:           sess.lastStatus,
-		Headers:          sess.lastHeaders.Clone(),
-		FinalURL:         finalURL,
-		HTML:             htmlStr,
-		ScreenshotBase64: shotB64,
+		Status:            sess.lastStatus,
+		Headers:           sess.lastHeaders.Clone(),
+		FinalURL:          finalURL,
+		HTML:              htmlStr,
+		ScreenshotBase64:  shotB64,
+		ActionScreenshots: actionScreenshots,
+		ActionScrapes:     actionScrapes,
+		JavascriptReturns: jsReturns,
+		PDFBase64:         pdfBase64,
 	}
 	if task.KeepSession && !task.CloseSession {
 		out.SessionID = sess.id
@@ -651,14 +736,32 @@ func waitForCSSSelector(ctx context.Context, cdp *cdpConn, sessionID, selector s
 	return fmt.Errorf("selector %q did not appear within %s", selector, maxWait)
 }
 
-func (r *Renderer) runAction(ctx context.Context, cdp *cdpConn, sess *retainedSession, events <-chan cdpEvent, act InteractAction) error {
+func (r *Renderer) runAction(
+	ctx context.Context,
+	cdp *cdpConn,
+	sess *retainedSession,
+	events <-chan cdpEvent,
+	act InteractAction,
+	actionScreenshots *[]string,
+	actionScrapes *[]ActionScrapeSnapshot,
+	jsReturns *[]ActionJSReturn,
+	pdfBase64 *string,
+) error {
 	kind := strings.ToLower(strings.TrimSpace(act.Type))
 	selJSON, _ := json.Marshal(act.Selector)
-	valJSON, _ := json.Marshal(act.Value)
+	effectiveVal := act.Value
+	if effectiveVal == "" && act.Text != "" {
+		effectiveVal = act.Text
+	}
+	valJSON, _ := json.Marshal(effectiveVal)
+	effectiveWaitMs := act.WaitMs
+	if effectiveWaitMs <= 0 && act.Milliseconds > 0 {
+		effectiveWaitMs = act.Milliseconds
+	}
 
 	switch kind {
 	case "wait":
-		ms := act.WaitMs
+		ms := effectiveWaitMs
 		if ms <= 0 {
 			ms = 500
 		}
@@ -692,7 +795,7 @@ func (r *Renderer) runAction(ctx context.Context, cdp *cdpConn, sess *retainedSe
 				return err
 			}
 		}
-		st, hdrs, err := navigateAndWait(ctx, cdp, sess.cdpSessionID, events, u.String(), act.WaitMs, act.Selector)
+		st, hdrs, err := navigateAndWait(ctx, cdp, sess.cdpSessionID, events, u.String(), effectiveWaitMs, act.Selector)
 		if err != nil {
 			return err
 		}
@@ -706,19 +809,36 @@ func (r *Renderer) runAction(ctx context.Context, cdp *cdpConn, sess *retainedSe
 		if strings.TrimSpace(act.Selector) == "" {
 			return errors.New("click action requires selector")
 		}
-		js := fmt.Sprintf(`(() => {
-			const el = document.querySelector(%s);
-			if (!el) return "selector_not_found";
-			el.scrollIntoView({ block: "center" });
-			el.click();
-			return "ok";
-		})()`, string(selJSON))
+		var js string
+		if act.All {
+			js = fmt.Sprintf(`(() => {
+				const els = document.querySelectorAll(%s);
+				if (!els || els.length === 0) return "selector_not_found";
+				els.forEach((el) => { try { el.scrollIntoView({ block: "center" }); el.click(); } catch {} });
+				return "ok";
+			})()`, string(selJSON))
+		} else {
+			js = fmt.Sprintf(`(() => {
+				const el = document.querySelector(%s);
+				if (!el) return "selector_not_found";
+				el.scrollIntoView({ block: "center" });
+				el.click();
+				return "ok";
+			})()`, string(selJSON))
+		}
 		res, err := evalString(ctx, cdp, sess.cdpSessionID, js)
 		if err != nil {
 			return err
 		}
 		if res != "ok" {
 			return fmt.Errorf("click %s: %s", act.Selector, res)
+		}
+
+	case "write":
+		if effectiveVal != "" {
+			if err := cdp.call(ctx, sess.cdpSessionID, "Input.insertText", map[string]any{"text": effectiveVal}, nil); err != nil {
+				return err
+			}
 		}
 
 	case "fill", "type", "select":
@@ -753,17 +873,87 @@ func (r *Renderer) runAction(ctx context.Context, cdp *cdpConn, sess *retainedSe
 		_ = cdp.call(ctx, sess.cdpSessionID, "Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key}, nil)
 
 	case "scroll":
+		dirSign := 1
+		if strings.EqualFold(strings.TrimSpace(act.Direction), "up") {
+			dirSign = -1
+		}
 		if strings.TrimSpace(act.Selector) != "" {
 			_, _ = evalString(ctx, cdp, sess.cdpSessionID, fmt.Sprintf(`(() => { document.querySelector(%s)?.scrollIntoView({ behavior: "instant", block: "center" }); return "ok"; })()`, string(selJSON)))
 		} else {
-			_, _ = evalString(ctx, cdp, sess.cdpSessionID, `(() => { window.scrollBy(0, window.innerHeight || 800); return "ok"; })()`)
+			_, _ = evalString(ctx, cdp, sess.cdpSessionID, fmt.Sprintf(`(() => { window.scrollBy(0, %d * (window.innerHeight || 800)); return "ok"; })()`, dirSign))
+		}
+
+	case "screenshot":
+		var shot struct {
+			Data string `json:"data"`
+		}
+		shotParams := map[string]any{"format": "png"}
+		if act.FullPage {
+			shotParams["captureBeyondViewport"] = true
+		}
+		if err := cdp.call(ctx, sess.cdpSessionID, "Page.captureScreenshot", shotParams, &shot); err != nil {
+			return err
+		}
+		if shot.Data != "" && actionScreenshots != nil {
+			*actionScreenshots = append(*actionScreenshots, shot.Data)
+		}
+
+	case "scrape":
+		snapHTML, snapURL, err := readDocumentHTML(ctx, cdp, sess.cdpSessionID)
+		if err != nil {
+			return err
+		}
+		if actionScrapes != nil {
+			*actionScrapes = append(*actionScrapes, ActionScrapeSnapshot{URL: snapURL, HTML: snapHTML})
+		}
+
+	case "executejavascript":
+		script := strings.TrimSpace(act.Script)
+		if script == "" {
+			script = strings.TrimSpace(effectiveVal)
+		}
+		if script == "" {
+			return errors.New("executeJavascript action requires script")
+		}
+		var evalRes struct {
+			Result struct {
+				Type  string `json:"type"`
+				Value any    `json:"value"`
+			} `json:"result"`
+			ExceptionDetails *struct {
+				Text string `json:"text"`
+			} `json:"exceptionDetails,omitempty"`
+		}
+		if err := cdp.call(ctx, sess.cdpSessionID, "Runtime.evaluate", map[string]any{
+			"expression":    script,
+			"returnByValue": true,
+			"awaitPromise":  true,
+		}, &evalRes); err != nil {
+			return err
+		}
+		if evalRes.ExceptionDetails != nil {
+			return fmt.Errorf("js exception: %s", evalRes.ExceptionDetails.Text)
+		}
+		if jsReturns != nil {
+			*jsReturns = append(*jsReturns, ActionJSReturn{Type: evalRes.Result.Type, Value: evalRes.Result.Value})
+		}
+
+	case "pdf":
+		var pdfOut struct {
+			Data string `json:"data"`
+		}
+		if err := cdp.call(ctx, sess.cdpSessionID, "Page.printToPDF", map[string]any{"printBackground": true}, &pdfOut); err != nil {
+			return err
+		}
+		if pdfBase64 != nil && pdfOut.Data != "" {
+			*pdfBase64 = pdfOut.Data
 		}
 
 	default:
 		return fmt.Errorf("unsupported interact action type %q", act.Type)
 	}
 
-	pause := act.WaitMs
+	pause := effectiveWaitMs
 	if pause <= 0 {
 		pause = 250
 	}

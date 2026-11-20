@@ -14,13 +14,13 @@
 ## Try It in 60 Seconds
 
 ```bash
-# Option 1 — Full local Hub + 2 Go Chromium workers in Docker (zero cloud account):
+# Option 1 — Full 14-Tool Hub + BYO-LLM /v1/agent + 49+ Site/ATS Adapters + /admin UI + FTS5 in Docker (zero cloud account):
 git clone https://github.com/bartrumb/edgefetch.git && cd edgefetch && docker compose up --build -d
 # Open http://localhost:8787/admin (dev token: local-dev-caller-token-0123456789)
 
-# Option 2 — Single ~8 MB Go binary for local Claude Code / Cursor / Claude Desktop stdio MCP (zero ports):
+# Option 2 — Standalone ~8 MB Local Go Binary for Claude Code, Claude Desktop, Cursor, Windsurf, Gemini CLI & Codex (zero containers/ports):
 go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest
-edgefetch install-mcp && edgefetch doctor
+edgefetch init && edgefetch doctor
 ```
 
 <p>
@@ -52,7 +52,7 @@ edgefetch install-mcp && edgefetch doctor
 - **Polite by design — never bypasses `robots.txt` or CAPTCHAs:** `robots.txt` is enforced on every hop (including `30x` redirects), `Retry-After` is honored per host, anti-bot challenges (Cloudflare, Akamai, DataDome, PerimeterX, AWS WAF, Imperva) halt on the first attempt, and IETF RFC 9421 Web Bot Auth (`Ed25519` HTTP Message Signatures) is built in.
 - **One external Go dependency (`github.com/coder/websocket`, 0 transitive dependencies):** Enforced in CI on every PR alongside `-race`, native Go fuzzing (`Fuzz*`), `staticcheck`, and `govulncheck`.
 - **MIT licensed & lightweight:** No Redis, no PostgreSQL, no RabbitMQ. Idles at `$0` on Cloudflare Hibernating WebSocket Durable Objects or runs in one container with `node:sqlite` FTS5.
-- **Built-in job-board & developer extractors:** 12 MCP tools (`scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`) with native adapters for **Greenhouse**, **Ashby**, **Lever**, **Workday CXS**, **SmartRecruiters / Schema.org `JobPosting`**, **GitHub**, **Stack Overflow**, **npm**, **crates.io**, **Hugging Face**, **ArXiv**, **Jupyter `.ipynb`**, **OpenAPI 3.x**, and **256 MiB streaming PDFs**.
+- **49+ keyless site, open-data & ATS adapters + Autonomous BYO-LLM `/v1/agent`:** 14 MCP tools (`agent`, `find_extractors`, `scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`), drop-in Firecrawl `/v2/*` compatibility, and Claude-style dynamic adapter routing across **Workable**, **Greenhouse (US/EU)**, **Ashby**, **Lever (US/EU)**, **Workday CXS**, **Rippling**, **Gem**, **Pinpoint**, **Teamtailor**, **BambooHR**, **Oracle HCM**, **SmartRecruiters**, **SEC EDGAR**, **Y Combinator**, **Socrata / CKAN / ArcGIS / Legistar Open Data**, **DOI/Crossref**, **OpenAlex**, **arXiv**, **ClinicalTrials.gov**, **PubMed**, **NIST NVD**, **Shopify**, **GitHub**, **Stack Overflow**, **npm**, **crates.io**, **Hugging Face**, **OpenRouter**, and **256 MiB streaming PDFs** — supporting offline local LLMs (**Ollama**, **LM Studio**, **vLLM**) or online BYO-LLM (**OpenAI**, **Anthropic**, **Gemini**, **OpenRouter**, **Workers AI**) with live SSE streaming and `$0` Zero Data Retention. Add a new adapter in one file via `npm run adapter:new` (**[docs/ADAPTERS.md](docs/ADAPTERS.md)**).
 
 > **Project status:** Young personal open-source project (started November 2026), running daily as the sole web/search layer on the author's 3-node fleet (Home Assistant OS `x86_64`, Windows VM, and `arm64`). MIT licensed; issues and PRs are **triaged weekly**. See **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)** for honest trade-offs.
 
@@ -62,7 +62,7 @@ edgefetch install-mcp && edgefetch doctor
 
 Full architectural & trade-off breakdown: **[docs/COMPARISON.md](docs/COMPARISON.md)** · Common questions: **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)**
 
-| Dimension | **EdgeFetch (`v2.4`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
+| Dimension | **EdgeFetch (`v2.5`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
 |---|---|---|---|---|---|
 | **License** | **MIT** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 |
 | **Minimum Self-Hosted Stack** | **1 `~8 MB` Go binary** *or* **1 container** (`node:sqlite` + `/data`, **0 Redis, 0 Postgres**) | Docker Compose + **Redis + PostgreSQL + RabbitMQ + Playwright** (`2–4 GB+` RAM) | Cloud API key | Python 3.10+ + Playwright (`600 MB–1.5 GB` RAM) | Node.js + Puppeteer |

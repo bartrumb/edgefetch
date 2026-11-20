@@ -614,7 +614,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         liedRowCount: 0,
         bombRowCount: 0,
         expiredBlobSha: 'ee'.repeat(32),
-        derivedPipelineVersion: 22,
+        derivedPipelineVersion: 23,
         derivedR2Text: 'Verified stored article payload!',
         unverifiedDeriveStatus: 'unverified',
         capacityStopStatus: 'capacity_reached',
@@ -740,7 +740,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       const liveScrapeJson = await liveScrapeRes.json();
       assert.equal(liveScrapeJson.ok, true);
       assert.equal(liveScrapeJson.cached, false);
-      assert.equal(liveScrapeJson.pipelineVersion, 22);
+      assert.equal(liveScrapeJson.pipelineVersion, 23);
       assert.equal(liveScrapeJson.llms?.found, true);
       assert.deepEqual(liveScrapeJson.json, { name: 'Rear Axle', torqueNm: 35 });
       assert.match(liveScrapeJson.markdown, /# Torque Guide/);
@@ -760,7 +760,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(cachedScrapeRes.headers.get('x-crawler-via'), 'cache:r2-d1');
       const cachedScrapeJson = await cachedScrapeRes.json();
       assert.equal(cachedScrapeJson.cached, true);
-      assert.equal(cachedScrapeJson.pipelineVersion, 22);
+      assert.equal(cachedScrapeJson.pipelineVersion, 23);
       assert.match(cachedScrapeJson.markdown, /35 Nm/);
       assert.equal(scrapeAgentDispatches, 1);
 
@@ -945,6 +945,8 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         'interact',
         'read_artifact',
         'jobs',
+        'find_extractors',
+        'agent',
       ]);
 
       // V2-2: Verify RRF multi-provider search (Brave + SearXNG + FTS5) + HMAC-SHA256 webhook signing + SSRF webhook block!

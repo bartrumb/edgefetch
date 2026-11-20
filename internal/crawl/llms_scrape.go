@@ -277,7 +277,7 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 	wantLinks := hasFormat(r.Formats, "links")
 	wantImages := hasFormat(r.Formats, "images")
 	wantBranding := hasFormat(r.Formats, "branding")
-	wantBase64 := hasFormat(r.Formats, "base64") || r.Kind == classify.KindBinary
+	wantBase64 := hasFormat(r.Formats, "base64") || hasFormat(r.Formats, "rawBase64") || r.Kind == classify.KindBinary
 	wantRawHTML := hasFormat(r.Formats, "rawHtml") || hasFormat(r.Formats, "html")
 	onlyMain := true
 	if r.OnlyMainContent != nil {
@@ -438,12 +438,18 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	defer cancel()
 
 	task := browser.Task{
-		URL:          r.URL,
-		UserAgent:    c.userAgent,
-		Headers:      r.Headers,
-		WaitForMs:    r.WaitForMs,
-		WaitSelector: r.WaitSelector,
-		Screenshot:   hasFormat(r.Formats, "screenshot"),
+		URL:                r.URL,
+		UserAgent:          c.userAgent,
+		AcceptLanguage:     r.AcceptLanguage,
+		Headers:            r.Headers,
+		Mobile:             r.Mobile,
+		ViewportWidth:      r.ViewportWidth,
+		ViewportHeight:     r.ViewportHeight,
+		WaitForMs:          r.WaitForMs,
+		WaitSelector:       r.WaitSelector,
+		Screenshot:         hasFormat(r.Formats, "screenshot"),
+		ScreenshotFullPage: r.ScreenshotFullPage,
+		ScreenshotQuality:  r.ScreenshotQuality,
 	}
 	if r.Interact != nil {
 		task.SessionID = r.Interact.SessionID
@@ -457,6 +463,10 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 		res.Status = out.Status
 		res.FinalURL = out.FinalURL
 		res.SessionID = out.SessionID
+		res.ActionScreenshots = out.ActionScreenshots
+		res.ActionScrapes = out.ActionScrapes
+		res.JavascriptReturns = out.JavascriptReturns
+		res.PDFBase64 = out.PDFBase64
 		if errors.Is(err, browser.ErrChallengeDetected) {
 			res.Outcome = classify.OutcomeChallenge
 			res.WAF = classify.ClassifyWAF(http.StatusOK, out.Headers, []byte(out.HTML))
@@ -503,6 +513,10 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	res.Rendered = true
 	res.SessionID = out.SessionID
 	res.ScreenshotBase64 = out.ScreenshotBase64
+	res.ActionScreenshots = out.ActionScreenshots
+	res.ActionScrapes = out.ActionScrapes
+	res.JavascriptReturns = out.JavascriptReturns
+	res.PDFBase64 = out.PDFBase64
 	res.WAF = classify.ClassifyWAF(res.Status, out.Headers, rawBody)
 	res.Outcome, res.Problem = classify.Classify(classify.KindRender, res.Status, out.Headers, rawBody)
 

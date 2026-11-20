@@ -1060,7 +1060,7 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 	kind := classify.KindScrape
 	var interactSpec *crawl.InteractSpec
 	if len(p.Actions) > 0 {
-		kind = classify.KindInteract
+		kind = classify.KindRender
 		interactSpec = &crawl.InteractSpec{Actions: p.Actions}
 	} else if p.RenderMode == "always" || wantScreenshot || p.Mobile {
 		kind = classify.KindRender

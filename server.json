@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
   "name": "io.github.bartrumb/edgefetch",
-  "description": "Self-hosted scrape, map, crawl, extract, interact, and search MCP server (stdio & OAuth 2.1 HTTP).",
+  "description": "Self-hosted scrape, map, crawl, extract, interact, search, and autonomous BYO-LLM agent MCP server (stdio & OAuth 2.1 HTTP).",
   "repository": {
     "url": "https://github.com/bartrumb/edgefetch",
     "source": "github"
   },
-  "version": "2.4.1",
+  "version": "2.5.0",
   "packages": [
     {
       "registryType": "oci",

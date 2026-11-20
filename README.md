@@ -25,6 +25,10 @@
   <a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch">
     <img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" alt="Add EdgeFetch Repository to Home Assistant" height="36">
   </a>
+  &nbsp;
+  <a href="https://vscode.dev/redirect/mcp/install?name=edgefetch&config=%7B%22command%22%3A%22edgefetch%22%2C%22args%22%3A%5B%22mcp%22%5D%7D">
+    <img src="https://img.shields.io/badge/VS_Code-Install_Local_MCP-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white" alt="Install Local MCP in VS Code" height="36">
+  </a>
 </p>
 
 **EdgeFetch** (`v2.1`) is a self-hosted **scrape, map, crawl, extract, interact, and search** platform for AI agents — deployable on **Cloudflare Workers**, **Fly.io**, **Railway**, **Render**, **Docker Compose**, or **a single 9 MB static Go binary**, paired with **outbound-only Go worker nodes** (`amd64` & `arm64` Docker, Home Assistant OS, Raspberry Pi, NAS, or VPS) with HTTP/2, SSRF-proxied Headless Chromium, and streaming Poppler PDF.
@@ -53,6 +57,25 @@ Unlike self-hosted Firecrawl (which requires Redis, PostgreSQL, RabbitMQ, and a 
   - Set `OTEL_EXPORTER_OTLP_ENDPOINT` + `OTEL_EXPORTER_OTLP_HEADERS` on Hub and/or Go nodes to stream stitched parent/child `httptrace` (`dnsMs`, `connectMs`, `tlsMs`, `ttfbMs`, `reused`) waterfalls directly to **Grafana Tempo**, **Jaeger**, **Honeycomb**, **Axiom**, **SigNoz**, or any OTLP collector at zero added caller latency.
 - **Defense-in-Depth Security ([SECURITY.md](SECURITY.md)):**
   - Dial-time `net.Dialer.Control` SSRF guard (`RejectNonPublicPeer`) eliminates DNS-rebinding TOCTOU races; headless Chromium subresources are forced through an in-process loopback `SSRFProxy` (`CONNECT` + `MAP * ~NOTFOUND`); anti-bot/CAPTCHA pages halt immediately and are never bypassed.
+
+---
+
+## Head-to-Head vs. Other AI Crawlers & MCP Servers
+
+Full architectural & extraction breakdown: **[docs/COMPARISON.md](docs/COMPARISON.md)**
+
+| Dimension | **EdgeFetch (`v2.1`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
+|---|---|---|---|---|---|
+| **License** | **MIT** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 |
+| **Minimum Self-Hosted Stack** | **1 `~8 MiB` Go binary** *or* **1 container** (`node:sqlite` + `/data`, **0 Redis, 0 Postgres**) | Docker Compose + **Redis + PostgreSQL + RabbitMQ + Playwright** (`2–4 GB+` RAM) | Cloud API key | Python 3.10+ + Playwright (`600 MB–1.5 GB` RAM) | Node.js + Puppeteer |
+| **Worker Supply Chain** | **1 Go module (`coder/websocket`, 0 transitive deps)** | Dozens of npm + OS deps | Vendor SaaS | 40+ PyPI packages | Dozens of npm deps |
+| **Zero-Port Outbound Residential Fleet (`WSS`)** | **Yes — Home Assistant OS, NAS, RPi, Mac/PC behind CGNAT/Starlink** | No (needs open ports, VPN, or paid residential proxies) | Paid proxy credits | No (single-host or DIY queue) | No |
+| **Desktop `stdio` MCP (`edgefetch mcp`)** | **Yes — `~8 MiB` binary uses pre-installed OS Edge/Chrome/Brave (0 ports, 0 300 MB browser download)** | Requires cloud key or full Docker stack | Cloud API key required | Python + Playwright setup | Cloud URL or Node server |
+| **Active-Active Multi-Hub HA & Standby Mesh** | **Yes (`EDGEFETCH_HUB_URLS` + `HUB_SHARDS` DO ring + `--mode=hub,agent` + SDK `baseUrls`)** | Manual LB + Redis/Postgres HA | Single cloud vendor | Manual | Manual |
+| **DNS-Rebinding SSRF + Browser Subresource Guard** | **Dial-time `RejectNonPublicPeer` + loopback `CONNECT` `SSRFProxy` (`MAP * ~NOTFOUND`)** | Application URL blocklist | Vendor-managed | Optional / app-level | App-level |
+| **OpenTelemetry (`OTLP/HTTP` + W3C `traceparent`)** | **Stitched Hub → Go `httptrace` (`dnsMs`, `connectMs`, `tlsMs`, `ttfbMs`) to any collector** | Internal logs / BullMQ | Vendor dashboard only | Python logs | Internal logs |
+| **Extraction Extras (`v19`)** | **Code-stash `<T>` safe, `/llms.txt` 1-hop `.md`, `.ipynb`, OpenAPI 3.x, 256 MiB PDF, YouTube captions, RRF Search** | Strong HTML/PDF + hosted verticals (`Alexandria`, `agent`) | Strong SaaS scrape *or* search (separate plans) | Strong `Pruning` + `BM25` | Good Markdown + `s.jina.ai` |
+| **Typical Cost (50k scrapes + 5k searches / mo)** | **`$0 – $5 / mo`** (Cloudflare Hibernating DO + homelab/VPS) | `$25 – $80+ / mo` (VPS + proxy GBs) | `$49 – $130+ / mo` | `$10 – $40+ / mo` (VPS + proxies) | Credit-metered |
 
 ---
 
@@ -142,6 +165,32 @@ EDGEFETCH_CALLER_TOKEN="<32-char-secret>" EDGEFETCH_AGENT_TOKEN="<32-char-secret
 
 ---
 
+## Tested & Supported Platforms Matrix
+
+Status legend:
+- **✅ Production + CI Verified:** Running continuously in multi-site production fleets *and* gated by automated E2E / smoke suites on every pull request.
+- **✅ Live-Tested + CI Verified:** Executed end-to-end on real host OS/runtime during release verification *and* covered by automated CI tests.
+- **🔧 Build & Manifest Verified:** Static `CGO_ENABLED=0` binary cross-compilation (`go build`) and/or deployment manifests verified cleanly; community hardware reports welcome.
+
+| Platform / Target | Role(s) | Binary / Image Footprint | Capabilities | Verification Status |
+|---|---|---|---|---|
+| **Cloudflare Workers + Hibernating DO + D1 (FTS5) + R2 + Workflows** | Cloud Hub (`/mcp`, `/admin`, OAuth 2.1, `HUB_SHARDS`) | Serverless bundle (`0` npm runtime deps) | 11-tool MCP, RRF Search, FTS5, R2 Artifacts, OTLP | **✅ Production + CI Verified** (`workerd` `H7` & `S1` suites) |
+| **Home Assistant OS (`amd64` x86_64 & `aarch64` RPi / NUC / VM)** | Outbound Residential Worker (`edgefetch_fat`) | Multi-arch Alpine + Chromium + SwiftShader + Poppler | HTTP/2, `artifacts-v1`, `browser-v1`, `interact-v1`, 256 MiB PDF | **✅ Production + CI Verified** (multi-site residential fleet) |
+| **Linux Docker Worker — Fat (`linux/amd64`, `linux/arm64`)** | Standalone Worker (`Dockerfile.agent`) | Non-root `65532:65532` + AppArmor + Chromium WebGL | Full HTTP/2 + SSRF-proxied Headless Chromium + Poppler PDF | **✅ Production + CI Verified** (live AppArmor + WebGL CI smoke) |
+| **Linux Distroless Worker/Server — Lite (`linux/amd64`, `linux/arm64`)** | Ultra-light Worker / Server / Go Hub (`Dockerfile`) | `7.71 MiB` (`amd64`) / `7.13 MiB` (`arm64`) static binary (`~15 MiB` RAM) | HTTP/2, Markdown, pure-Go PDF, `--mode=hub`, OTLP | **✅ Production + CI Verified** (`buildx` multi-arch CI) |
+| **All-in-One Container (`Dockerfile.all-in-one` / Docker Compose)** | Full TypeScript Hub + `node:sqlite` FTS5 + Go Chromium Worker | Node 24 Alpine + Go + Chromium + Poppler (`0` Redis, `0` Postgres) | `/admin`, OAuth 2.1, `/mcp`, SQLite FTS5, `/data` artifacts, JS render | **✅ Live-Tested + CI Verified** (`V2-9` E2E + `buildx` CI) |
+| **Windows 11 (`windows/amd64` Desktop & VM)** | Local `stdio` MCP, `desktop` Launchpad, CLI & Fleet Worker | `7.92 MiB` (`edgefetch.exe`, `0` DLL deps) | Auto-detects native Windows **Chrome / Edge / Brave** for CDP JS render | **✅ Live-Tested + CI Verified** (VM fleet + `doctor` / `mcp` E2E) |
+| **Linux (`ubuntu/wsl2` `linux/amd64`)** | `--mode=hub`, `--mode=hub,agent` HA Mesh, CLI (`scrape`, `doctor`) | `7.71 MiB` static ELF | Active-active `EDGEFETCH_HUB_URLS`, Go Hub `/mcp`, `Fuzz*`, `-race` | **✅ Live-Tested + CI Verified** (Go 1.27 `-race` + `govulncheck`) |
+| **Fly.io / Railway / Render / Coolify** | 1-Click Cloud Self-Hosted All-in-One Hub + Worker | [`fly.toml`](fly.toml), [`railway.json`](railway.json), [`render.yaml`](render.yaml) | Persistent `/data` SQLite FTS5 + artifacts + Headless Chromium | **🔧 Build & Manifest Verified** (runs `Dockerfile.all-in-one`) |
+| **macOS Apple Silicon & Intel (`darwin/arm64`, `darwin/amd64`)** | Local `stdio` MCP, `desktop` Launchpad, CLI & Worker (Homebrew) | `7.28 MiB` (`arm64`) / `7.84 MiB` (`amd64`) | Auto-detects `/Applications/Google Chrome.app`, Edge & Brave | **🔧 Build & Manifest Verified** (`.goreleaser.yaml`) |
+| **Windows on ARM (`windows/arm64`)** | Desktop CLI, `stdio` MCP & Worker (Scoop / zip) | `7.20 MiB` (`edgefetch.exe`) | HTTP/2, Markdown, pure-Go PDF, OS Edge/Chrome detection | **🔧 Build & Manifest Verified** (`.goreleaser.yaml`) |
+| **Kubernetes (`amd64` / `arm64` Clusters)** | Zero-Trust Fleet Worker Pod | [`deploy/k8s/agent-deployment.yaml`](deploy/k8s/agent-deployment.yaml) | Read-only rootfs, `seccomp: RuntimeDefault`, CNI `NetworkPolicy` (`ingress: []`, RFC1918 egress blocked) | **🔧 Build & Manifest Verified** |
+| **Unraid, CasaOS, Portainer, Synology & TrueNAS** | 1-Click Homelab / NAS Worker | [`deploy/unraid/`](deploy/unraid/edgefetch-agent.xml), [`deploy/casaos/`](deploy/casaos/docker-compose.yml), [`compose.agent.yaml`](compose.agent.yaml) | Outbound `WSS` residential/homelab node (zero port forwarding) | **🔧 Build & Manifest Verified** |
+| **OpenWrt / GL.iNet Routers & Raspberry Pi (`linux/mipsle`, `linux/arm` v7)** | Always-On Router / Travel-Router Lite Worker | `8.50 MiB` (`mipsle` `softfloat`) / `7.44 MiB` (`armv7`) | HTTP/2, Markdown, pure-Go PDF (`CGO_ENABLED=0`, zero `libc` issues) | **🔧 Build & Manifest Verified** (`.goreleaser.yaml`) |
+| **OPNsense / pfSense / FreeBSD (`freebsd/amd64`, `freebsd/arm64`)** | Firewall / BSD Appliance Lite Worker or Go Hub | `7.63 MiB` (`amd64`) / `7.06 MiB` (`arm64`) | HTTP/2, Markdown, `--mode=agent` / `--mode=hub` | **🔧 Build & Manifest Verified** (`.goreleaser.yaml`) |
+
+---
+
 ## Package Layout & Documentation
 
 | Package | Responsibility |
@@ -161,6 +210,7 @@ EDGEFETCH_CALLER_TOKEN="<32-char-secret>" EDGEFETCH_AGENT_TOKEN="<32-char-secret
 | [`sdk/ts/`](sdk/ts/edgefetch-client.ts) & [`sdk/py/`](sdk/py/edgefetch_client.py) | Zero-dependency TypeScript & Python 3.9+ client SDKs (`EdgeFetchClient` with `baseUrls` HA failover) |
 | [`deploy/`](deploy/k8s/agent-deployment.yaml) & [`server.json`](server.json) | Turnkey Kubernetes (`Deployment` + Zero-Trust `NetworkPolicy`), Unraid XML, CasaOS/Portainer Compose, and Official MCP Registry manifest |
 
+- **Head-to-Head Comparison vs. Firecrawl, Crawl4AI, Tavily & Jina:** **[docs/COMPARISON.md](docs/COMPARISON.md)**
 - **Operations, OTLP Tracing, HA Mesh & MCP Guide:** **[docs/USAGE.md](docs/USAGE.md)**
 - **Hub ↔ Go Agent Wire Protocol Spec:** **[docs/PROTOCOL.md](docs/PROTOCOL.md)**
 - **Systems & Go Concurrency Internals:** **[docs/INTERNALS.md](docs/INTERNALS.md)**

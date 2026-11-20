@@ -292,19 +292,33 @@ export function classifyWafAndChallenge(params: {
     };
   }
 
-  // 8. Generic interstitial shell
-  if (
-    isGenericChallengeTitle &&
-    visibleWords < 80 &&
-    (scrubbedLower.includes('g-recaptcha') || scrubbedLower.includes('h-captcha') || scrubbedLower.includes('cf-turnstile'))
-  ) {
-    return {
-      vendor: 'generic',
-      category: 'challenge',
-      confidence: 0.88,
-      signals: [`title:${title}`],
-      summary: `anti-bot challenge page (${title})`,
-    };
+  // 8. Generic interstitial shell (CAPTCHA widget, NCBI JS browser check, or Anubis PoW gate on < 80-word shell)
+  if (visibleWords < 80) {
+    if (
+      isGenericChallengeTitle &&
+      (scrubbedLower.includes('g-recaptcha') || scrubbedLower.includes('h-captcha') || scrubbedLower.includes('cf-turnstile'))
+    ) {
+      return {
+        vendor: 'generic',
+        category: 'challenge',
+        confidence: 0.88,
+        signals: [`title:${title}`],
+        summary: `anti-bot challenge page (${title})`,
+      };
+    }
+    if (
+      scrubbedLower.includes('checking your browser before accessing ') ||
+      scrubbedLower.includes('please wait while we check your browser') ||
+      (scrubbedLower.includes("making sure you're not a bot") && scrubbedLower.includes('anubis'))
+    ) {
+      return {
+        vendor: 'generic',
+        category: 'challenge',
+        confidence: 0.9,
+        signals: ['dom:js-pow-interstitial'],
+        summary: 'JavaScript / proof-of-work anti-bot interstitial',
+      };
+    }
   }
 
   return null;

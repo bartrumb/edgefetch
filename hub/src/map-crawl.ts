@@ -741,10 +741,21 @@ export function computeMarkdownChanges(prevMarkdown: string | null, nextMarkdown
   };
 }
 
+export type WebhookEventType =
+  | 'crawl.started'
+  | 'crawl.page'
+  | 'crawl.completed'
+  | 'crawl.failed'
+  | 'agent.started'
+  | 'agent.action'
+  | 'agent.completed'
+  | 'agent.failed'
+  | 'agent.cancelled';
+
 export interface WebhookConfig {
   url: string;
   secret?: string;
-  events?: Array<'crawl.started' | 'crawl.page' | 'crawl.completed' | 'crawl.failed'>;
+  events?: WebhookEventType[];
   metadata?: Record<string, unknown>;
 }
 
@@ -759,7 +770,7 @@ export async function signWebhookPayload(secret: string, timestampSec: number, r
 export async function deliverSignedWebhook(params: {
   webhook: WebhookConfig;
   defaultSecret?: string;
-  event: 'crawl.started' | 'crawl.page' | 'crawl.completed' | 'crawl.failed';
+  event: WebhookEventType;
   crawlId: string;
   data: Record<string, unknown>;
   selfHost?: string;

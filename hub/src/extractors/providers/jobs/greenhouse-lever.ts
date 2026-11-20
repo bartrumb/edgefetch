@@ -31,7 +31,7 @@ export default defineAdapter({
       const apiHost = isGhEu ? 'boards-api.eu.greenhouse.io' : 'boards-api.greenhouse.io';
       return {
         id: isGhEu ? 'greenhouse-eu-board' : 'greenhouse-board',
-        fetchUrl: `https://${apiHost}/v1/boards/${encodeURIComponent(org)}/jobs?content=true`,
+        fetchUrl: `https://${apiHost}/v1/boards/${encodeURIComponent(org)}/jobs`,
         kind: 'json',
         accept: 'application/json',
         formatTwin: (rawBody) => {

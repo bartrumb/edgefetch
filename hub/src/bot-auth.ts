@@ -270,7 +270,7 @@ export async function handleBotTransparencyRoutes(
 
   if (url.pathname === '/.well-known/edgefetch-bot.json') {
     const keys = await resolveConfiguredBotJwks(env);
-    const ua = env.USER_AGENT?.trim() || 'EdgeFetch/2.0 (+https://github.com/bartrumb/edgefetch)';
+    const ua = env.USER_AGENT?.trim() || 'EdgeFetch/2.5 (bot@edgefetch.dev)';
     const contact = env.BOT_CONTACT_URL?.trim() || 'https://github.com/bartrumb/edgefetch';
     const doc = {
       bot: 'EdgeFetch',

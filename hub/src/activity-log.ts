@@ -104,6 +104,7 @@ export const ACTIVITY_SQLITE_SCHEMA = `
     summary TEXT NOT NULL,
     details_json TEXT NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS hub_events_level_id_idx ON hub_events(level, id DESC);
   CREATE TABLE IF NOT EXISTS mcp_activity (
     principal TEXT PRIMARY KEY,
     auth_type TEXT NOT NULL,
@@ -197,8 +198,8 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
         sql.exec(
           `DELETE FROM hub_events
            WHERE level IN ('warn', 'error')
-             AND id NOT IN (SELECT id FROM hub_events WHERE level IN ('warn', 'error') ORDER BY id DESC LIMIT ?)`,
-          MAX_SECURITY_RING_EVENTS + 16,
+             AND id <= COALESCE((SELECT id FROM hub_events WHERE level IN ('warn', 'error') ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`,
+          MAX_SECURITY_RING_EVENTS + 15,
         );
       }
     }
@@ -209,8 +210,8 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
         sql.exec(
           `DELETE FROM hub_events
            WHERE level = 'info'
-             AND id NOT IN (SELECT id FROM hub_events WHERE level = 'info' ORDER BY id DESC LIMIT ?)`,
-          MAX_INFO_RING_EVENTS + 16,
+             AND id <= COALESCE((SELECT id FROM hub_events WHERE level = 'info' ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`,
+          MAX_INFO_RING_EVENTS + 15,
         );
       }
     }

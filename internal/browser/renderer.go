@@ -599,7 +599,7 @@ func navigateAndWait(
 				} `json:"response"`
 			}
 			if json.Unmarshal(ev.Params, &rr) == nil {
-				if (rr.Type == "Document" || rr.FrameID == navOut.FrameID) && rr.Response.Status > 0 {
+				if rr.Type == "Document" && (navOut.FrameID == "" || rr.FrameID == navOut.FrameID) && rr.Response.Status > 0 {
 					status = rr.Response.Status
 					for k, v := range rr.Response.Headers {
 						hdrs.Set(k, v)

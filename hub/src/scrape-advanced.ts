@@ -296,6 +296,31 @@ export function extractStructuredProduct(params: {
     };
   }
 
+  // Fallback for barcode / consumer packaged goods & microdata pages (e.g. Open Food Facts `/product/<gtin>`)
+  const ogType = matchMetaContent(rawBody, ['og:type'])?.toLowerCase();
+  const barcodeMatch = /\/product\/(\d{8,14})(?:\/|$)/i.exec(finalUrl);
+  if (ogType === 'product' || ogType === 'og:product' || ogType?.includes('food') || barcodeMatch) {
+    const titleCandidate =
+      matchMetaContent(rawBody, ['og:title', 'twitter:title']) ??
+      /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(rawBody)?.[1]?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() ??
+      fallbackTitle;
+    if (titleCandidate) {
+      const brandFromTitle = titleCandidate.includes('–')
+        ? titleCandidate.split('–')[1]?.trim()
+        : titleCandidate.includes(' - ')
+          ? titleCandidate.split(' - ')[1]?.trim()
+          : undefined;
+      return {
+        title: titleCandidate,
+        ...(fallbackDescription ? { description: fallbackDescription } : {}),
+        ...(brandFromTitle ? { brand: brandFromTitle } : {}),
+        ...(barcodeMatch?.[1] ? { gtin: barcodeMatch[1] } : {}),
+        ...(ogImage ? { images: [ogImage] } : {}),
+        url: finalUrl,
+      };
+    }
+  }
+
   return null;
 }
 

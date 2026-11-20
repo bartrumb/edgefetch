@@ -333,6 +333,37 @@ func TestRendererWaitsForAsyncXHRNetworkIdleOverCDP(t *testing.T) {
 				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "sess-spa"}})
 			case "Page.navigate":
 				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "f1"}})
+				// Main document returns 200 text/html, followed by an Image subresource (image/png) & 404 favicon in the SAME frameId!
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Network.responseReceived",
+					"params": map[string]any{
+						"requestId": "doc-1",
+						"type":      "Document",
+						"frameId":   "f1",
+						"response":  map[string]any{"status": 200, "headers": map[string]string{"content-type": "text/html; charset=utf-8"}},
+					},
+				})
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Network.responseReceived",
+					"params": map[string]any{
+						"requestId": "img-1",
+						"type":      "Image",
+						"frameId":   "f1",
+						"response":  map[string]any{"status": 200, "headers": map[string]string{"content-type": "image/png"}},
+					},
+				})
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Network.responseReceived",
+					"params": map[string]any{
+						"requestId": "fav-404",
+						"type":      "Image",
+						"frameId":   "f1",
+						"response":  map[string]any{"status": 404, "headers": map[string]string{"content-type": "text/plain"}},
+					},
+				})
 				// Fire async SPA Fetch BEFORE loadEventFired, completing 150ms AFTER loadEventFired!
 				send(map[string]any{
 					"sessionId": req.SessionID,
@@ -392,5 +423,8 @@ func TestRendererWaitsForAsyncXHRNetworkIdleOverCDP(t *testing.T) {
 	}
 	if !strings.Contains(out.HTML, "Async SPA Hydrated") {
 		t.Fatalf("expected SPA XHR network-idle wait to capture hydrated DOM, got: %s", out.HTML)
+	}
+	if out.Status != 200 || !strings.HasPrefix(out.Headers.Get("Content-Type"), "text/html") {
+		t.Fatalf("subresource Image/404 must not overwrite Document status/Content-Type: status=%d ct=%q", out.Status, out.Headers.Get("Content-Type"))
 	}
 }

@@ -272,7 +272,10 @@ export async function handleCompatRoutes(params: {
       id: rec.id,
       threadId: rec.threadId,
       status: rec.status,
+      count: rec.trace.length,
       spans: rec.trace,
+      trace: rec.trace,
+      events: rec.trace,
     });
   }
 

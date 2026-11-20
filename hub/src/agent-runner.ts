@@ -696,7 +696,7 @@ export async function startOrExecuteAgentCall(params: {
       await deliverSignedWebhook({
         webhook,
         defaultSecret: env.WEBHOOK_SECRET,
-        event: 'crawl.started',
+        event: 'agent.started',
         crawlId: record.id,
         data: { agentId: record.id, status: 'processing', prompt: prompt.slice(0, 200) },
         selfHost,
@@ -871,7 +871,8 @@ export async function startOrExecuteAgentCall(params: {
           selfHost,
           source: `agent:${principal}:map`,
         });
-        const links = Array.isArray(mOut.body.links) ? (mOut.body.links as string[]) : [];
+        const rawLinks = Array.isArray(mOut.body.links) ? (mOut.body.links as string[]) : [];
+        const links = rawLinks.filter((l) => isUrlAllowedByConstraint(l, seedUrls, strictConstrainToURLs));
         pushSpan({
           kind: 'tool_call',
           name: 'map_site',
@@ -1207,24 +1208,40 @@ export async function startOrExecuteAgentCall(params: {
           .join('\n\n---\n\n');
         record.markdown = combinedMd;
         if (schema) {
-          const mergedHeuristic: Record<string, unknown> = {};
+          const allLinks = record.sources.map((s) => s.url);
+          const mergedHeuristic = extractStructuredJsonFromPage(
+            '',
+            {
+              markdown: combinedMd,
+              text: combinedMd,
+              title: gatheredEvidence.map((e) => e.title).filter(Boolean).join(' | ') || prompt.slice(0, 100),
+              links: allLinks,
+              images: [],
+              branding: { title: prompt.slice(0, 100) },
+            },
+            schema,
+          );
           for (const ev of gatheredEvidence) {
-            if (ev.json) Object.assign(mergedHeuristic, ev.json);
-            else if (ev.markdown) {
-              const h = extractStructuredJsonFromPage(
-                '',
-                {
-                  markdown: ev.markdown,
-                  text: ev.markdown,
-                  title: ev.title,
-                  links: [],
-                  images: [],
-                  branding: { title: ev.title },
-                },
-                schema,
-              );
-              Object.assign(mergedHeuristic, h);
+            if (ev.json) {
+              for (const [k, v] of Object.entries(ev.json)) {
+                if (mergedHeuristic[k] === undefined || mergedHeuristic[k] === '') {
+                  mergedHeuristic[k] = v;
+                }
+              }
             }
+          }
+          const schemaProps =
+            schema.properties && typeof schema.properties === 'object' ? (schema.properties as Record<string, unknown>) : {};
+          if ('sources' in schemaProps && (!Array.isArray(mergedHeuristic.sources) || mergedHeuristic.sources.length === 0)) {
+            mergedHeuristic.sources = allLinks;
+          }
+          if ('summary' in schemaProps && combinedMd) {
+            const sumRes = await summarizeMarkdownWithOptionalLlm({
+              markdown: combinedMd,
+              title: prompt.slice(0, 100),
+              llmConfig: null,
+            });
+            if (sumRes.summary) mergedHeuristic.summary = sumRes.summary;
           }
           record.data = mergedHeuristic;
           const val = validateDataAgainstJsonSchema(record.data, schema);
@@ -1277,7 +1294,12 @@ export async function startOrExecuteAgentCall(params: {
       await deliverSignedWebhook({
         webhook,
         defaultSecret: env.WEBHOOK_SECRET,
-        event: record.status === 'completed' ? 'crawl.completed' : 'crawl.failed',
+        event:
+          record.status === 'completed'
+            ? 'agent.completed'
+            : record.status === 'cancelled'
+              ? 'agent.cancelled'
+              : 'agent.failed',
         crawlId: record.id,
         data: formatPublicAgentResponse(record, false),
         selfHost,

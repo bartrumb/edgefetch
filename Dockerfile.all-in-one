@@ -19,6 +19,7 @@ COPY hub/package.json hub/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY sdk ../sdk
 COPY hub/src ./src
+COPY hub/migrations ./migrations
 COPY hub/portable ./portable
 COPY hub/scripts ./scripts
 RUN npm run build:portable

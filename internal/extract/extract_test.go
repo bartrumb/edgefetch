@@ -162,9 +162,12 @@ int main(void) { return 0; }</code></pre>
 
 func TestResolveHrefPreservesSemicolonlessQueryParams(t *testing.T) {
 	raw := `<html><body><main><a href="https://example.com/watch?v=1&amp;currentTime=45&section=2&region=us">Video</a></main></body></html>`
-	got := ExtractHTML(raw, ExtractOptions{BaseURL: "https://example.com", OnlyMainContent: true})
+	got := ExtractHTML(raw, ExtractOptions{BaseURL: "https://example.com", OnlyMainContent: true, IncludeLinks: true})
 	want := "https://example.com/watch?v=1&currentTime=45&section=2&region=us"
 	if len(got.Links) != 1 || got.Links[0] != want {
 		t.Fatalf("expected link %q, got %v", want, got.Links)
+	}
+	if !strings.Contains(got.Markdown, want) {
+		t.Fatalf("expected Markdown to preserve %q, got: %s", want, got.Markdown)
 	}
 }

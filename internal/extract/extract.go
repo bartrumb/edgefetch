@@ -331,6 +331,12 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 
 	// 3. Images, links, headings, emphasis, lists, blockquotes.
 
+	stashURL := func(u string) string {
+		tok := "\x00URL_" + itoa(len(stash)) + "\x00"
+		stash = append(stash, placeholder{token: tok, value: u})
+		return tok
+	}
+
 	s = reImgTag.ReplaceAllStringFunc(s, func(m string) string {
 		attrs := parseAttrs(m)
 		src := resolveHref(firstAttr(attrs, "src", "data-src"), base)
@@ -338,7 +344,7 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 			return ""
 		}
 		alt := strings.TrimSpace(html.UnescapeString(attrs["alt"]))
-		return "![" + alt + "](" + src + ")"
+		return "![" + alt + "](" + stashURL(src) + ")"
 	})
 
 	s = reAnchor.ReplaceAllStringFunc(s, func(m string) string {
@@ -355,7 +361,7 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 		if href == "" || strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "#") {
 			return label
 		}
-		return "[" + label + "](" + href + ")"
+		return "[" + label + "](" + stashURL(href) + ")"
 	})
 
 	s = reHeading.ReplaceAllStringFunc(s, func(m string) string {

@@ -45,6 +45,7 @@ export interface ScrapeParams {
   query?: string;
   jsonFilter?: string;
   collectionId?: string;
+  waybackFallback?: boolean;
   target?: 'auto' | 'agent' | 'container';
   site?: string;
 }
@@ -63,6 +64,7 @@ export interface ExtractParams {
   ocr?: boolean;
   redactPii?: boolean;
   collectionId?: string;
+  waybackFallback?: boolean;
   target?: 'auto' | 'agent' | 'container';
   site?: string;
 }
@@ -205,6 +207,10 @@ export class EdgeFetchClient {
 
   capabilities(): Promise<Record<string, unknown>> {
     return this.requestJson('GET', '/v1/capabilities');
+  }
+
+  hosts(limit = 100): Promise<{ ok: boolean; hosts: Array<Record<string, unknown>> }> {
+    return this.requestJson('GET', `/v1/hosts?limit=${Math.max(1, Math.min(500, Math.floor(limit)))}`);
   }
 
   scrape(params: ScrapeParams): Promise<Record<string, unknown>> {

@@ -22,8 +22,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/bartrumb/edgefetch/internal/classify"
-	"github.com/bartrumb/edgefetch/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 )
 
 func TestConfigSecurityGuards(t *testing.T) {

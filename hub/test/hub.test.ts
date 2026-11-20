@@ -21,6 +21,14 @@ import {
   type HubSocketLike,
 } from '../src/agent-hub.ts';
 import { authorizeAgent } from '../src/auth.ts';
+import {
+  computeEd25519JwkThumbprint,
+  generateBotAuthKeyPair,
+  handleBotTransparencyRoutes,
+  signOutboundBotHeaders,
+  verifyBotRequestSignature,
+} from '../src/bot-auth.ts';
+import { executeIngestPipeline, sha256HexString, writeJobManifestToR2 } from '../src/ingest.ts';
 import { defaultTextAccept, handleMcpRequest, inferKindForUrl, type McpServerDeps } from '../src/mcp.ts';
 import {
   ADMIN_COOKIE_NAME,
@@ -55,6 +63,7 @@ import {
   extractYouTubeTranscriptFromHtml,
   formatJupyterNotebookToMarkdown,
   formatOpenApiSpecToMarkdown,
+  SCRAPE_PIPELINE_VERSION,
 } from '../src/scrape.ts';
 import { executeJobsCall } from '../src/jobs.ts';
 import { executeMapCall } from '../src/map-crawl.ts';
@@ -75,6 +84,13 @@ import {
   extractEdgeMapDomains,
   resetSearchProviderPacingForTests,
 } from '../src/web-search.ts';
+import {
+  classifyContentState,
+  classifyWafAndChallenge,
+  isEligibleForWaybackFallback,
+  recoverSsrHydrationContent,
+} from '../src/waf.ts';
+import { NodeFsR2Bucket, NodeSqliteD1Database } from '../portable/node-adapters.ts';
 
 function memoryCooldowns(): CooldownStore {
   const map = new Map<string, number>();
@@ -2470,4 +2486,684 @@ test('V2-12: v2.3.0 Handoff Regression Suite (P1-P12 + structured jobs tool)', a
   assert.equal(finalJobs[0]?.company, 'ElevenLabs');
   assert.equal(finalJobs[0]?.pay.min, 230_000);
   assert.equal(finalJobs[0]?.pay.basis, 'base');
+});
+
+test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardrails, contentState, 304 ETag Revalidation, SSR Hydration, Adaptive Host Health & Wayback Fallback', async () => {
+  // --- R1: Verified Bot Registration & RFC 9421 Web Bot Auth ---
+  const kp = await generateBotAuthKeyPair();
+  assert.equal(kp.jwk.kty, 'OKP');
+  assert.equal(kp.jwk.crv, 'Ed25519');
+  assert.equal(kp.jwk.kid, kp.kid);
+
+  const dirUrl = 'https://hub.example.com/.well-known/http-message-signatures-directory';
+  const testNowMs = 1_795_000_000_000;
+  const signedHdrs = await signOutboundBotHeaders({
+    method: 'GET',
+    url: 'https://docs.example.com/guide?page=2',
+    privateKeyEncoded: kp.privateKeySeed,
+    directoryUrl: dirUrl,
+    nowMs: testNowMs,
+    ttlSeconds: 300,
+  });
+  assert.ok(signedHdrs['signature-input']!.includes(`keyid="${kp.kid}"`));
+  assert.ok(signedHdrs['signature-input']!.includes('alg="ed25519"'));
+  assert.ok(signedHdrs['signature-input']!.includes('tag="web-bot-auth"'));
+  assert.equal(signedHdrs['signature-agent'], `"${dirUrl}"`);
+
+  const validSignedReq = new Request('https://docs.example.com/guide?page=2', {
+    method: 'GET',
+    headers: signedHdrs,
+  });
+  const verified = await verifyBotRequestSignature(validSignedReq, kp.publicKey, testNowMs);
+  assert.equal(verified.ok, true);
+  assert.equal(verified.kid, kp.kid);
+
+  // Tampered URL must fail Ed25519 signature verification!
+  const tamperedReq = new Request('https://docs.example.com/guide?page=999', {
+    method: 'GET',
+    headers: signedHdrs,
+  });
+  const tamperedVerify = await verifyBotRequestSignature(tamperedReq, kp.publicKey, testNowMs);
+  assert.equal(tamperedVerify.ok, false);
+
+  // Public unauthenticated .well-known routes serve RFC 9421 JWKS directory + bot policy document
+  const jwksRes = await handleBotTransparencyRoutes(
+    new Request(dirUrl, { method: 'GET' }),
+    new URL(dirUrl),
+    { BOT_SIGNING_PRIVATE_KEY: kp.privateKeySeed, BOT_CONTACT_URL: 'https://github.com/bartrumb/edgefetch/issues' },
+    '2.4.0',
+  );
+  assert.ok(jwksRes);
+  assert.equal(jwksRes.status, 200);
+  assert.match(jwksRes.headers.get('content-type') ?? '', /application\/http-message-signatures-directory\+json/);
+  const jwksBody = (await jwksRes.json()) as { keys: Array<{ kid: string; x: string; kty: string; crv: string }> };
+  assert.equal(jwksBody.keys.length, 1);
+  assert.equal(jwksBody.keys[0]?.kid, kp.kid);
+  assert.equal(jwksBody.keys[0]?.x, kp.publicKey);
+
+  const botDocUrl = 'https://hub.example.com/.well-known/edgefetch-bot.json';
+  const botDocRes = await handleBotTransparencyRoutes(
+    new Request(botDocUrl, { method: 'GET' }),
+    new URL(botDocUrl),
+    { BOT_SIGNING_PRIVATE_KEY: kp.privateKeySeed },
+    '2.4.0',
+  );
+  assert.ok(botDocRes);
+  const botDoc = (await botDocRes.json()) as {
+    version: string;
+    policies: { robotsTxt: string; antiBotChallenges: string };
+    webBotAuth: { rfc9421Supported: boolean; activeKeyIds: string[] };
+  };
+  assert.equal(botDoc.version, '2.4.0');
+  assert.equal(botDoc.policies.robotsTxt, 'strict-rfc9309');
+  assert.equal(botDoc.policies.antiBotChallenges, 'halt-immediately-never-bypass');
+  assert.deepEqual(botDoc.webBotAuth.activeKeyIds, [kp.kid]);
+
+  // Verify `cloudflareOverflowFetch` attaches valid RFC 9421 signatures on outbound origin requests!
+  let capturedOriginReq: Request | null = null;
+  const overflowSignedRes = await cloudflareOverflowFetch(
+    JSON.stringify({
+      maxSeconds: 10,
+      options: { includeBody: true, respectRobots: true },
+      requests: [{ id: 'sig-1', url: 'https://signed-origin.example.com/article', kind: 'page' }],
+    }),
+    'EdgeFetch/2.4',
+    'hub.example.com',
+    {
+      botAuth: { privateKey: kp.privateKeySeed, directoryUrl: dirUrl },
+      fetchFn: async (input, init) => {
+        const req = input instanceof Request ? input : new Request(String(input), init);
+        if (new URL(req.url).pathname === '/robots.txt') {
+          return new Response('User-agent: *\nAllow: /\n', { status: 200 });
+        }
+        capturedOriginReq = req;
+        return new Response('<html><body><main><h1>Signed Origin OK</h1></main></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        });
+      },
+    },
+  );
+  assert.equal(overflowSignedRes.status, 200);
+  assert.ok(capturedOriginReq);
+  const originSigCheck = await verifyBotRequestSignature(capturedOriginReq as Request, kp.publicKey);
+  assert.equal(originSigCheck.ok, true);
+
+  // --- R2 & R3: 7-Vendor WAF Signature Catalog + 4-Layer Anti-False-Positive Guardrails ---
+  assert.equal(
+    classifyWafAndChallenge({ status: 403, headers: { 'cf-mitigated': 'challenge' }, rawBody: '<html>Just a moment...</html>' })?.vendor,
+    'cloudflare',
+  );
+  assert.equal(
+    classifyWafAndChallenge({
+      status: 403,
+      headers: { server: 'AkamaiGHost' },
+      rawBody: '<html><title>Access Denied</title><body>Reference #18.9f231702.1710000000.abcdef</body></html>',
+    })?.vendor,
+    'akamai',
+  );
+  assert.equal(
+    classifyWafAndChallenge({
+      status: 403,
+      headers: { 'x-datadome': 'protected' },
+      rawBody: '<script src="https://geo.captcha-delivery.com/captcha/"></script>',
+    })?.vendor,
+    'datadome',
+  );
+  assert.equal(
+    classifyWafAndChallenge({
+      status: 403,
+      headers: { 'x-px-blocked': '1' },
+      rawBody: '<div id="px-captcha"></div>',
+    })?.vendor,
+    'perimeterx',
+  );
+  assert.equal(
+    classifyWafAndChallenge({
+      status: 405,
+      headers: { 'x-amzn-waf-action': 'captcha' },
+      rawBody: '<div id="amzn-captcha-modal"></div>',
+    })?.vendor,
+    'aws-waf',
+  );
+  assert.equal(
+    classifyWafAndChallenge({
+      status: 200,
+      rawBody: '<html><body><iframe src="/_Incapsula_Resource?SWJIYLWA=719d34d31c8e3a6e6fffd425f7e032f3"></iframe></body></html>',
+    })?.vendor,
+    'imperva',
+  );
+  assert.equal(
+    classifyWafAndChallenge({
+      status: 429,
+      headers: { 'x-vercel-mitigated': 'challenge' },
+      rawBody: 'Vercel Security Checkpoint',
+    })?.vendor,
+    'vercel',
+  );
+  assert.equal(
+    classifyWafAndChallenge({
+      status: 429,
+      headers: { 'x-kpsdk-ct': '0987654321' },
+      rawBody: '',
+    })?.vendor,
+    'kasada',
+  );
+
+  // Anti-FP Veto 1 (Code/Quote Immunity): Cloudflare Turnstile documentation quoting challenge markers in `<pre><code>` & `<blockquote>`!
+  const turnstileDocsHtml = `<html><head><title>Cloudflare Turnstile Migration Guide</title></head><body>
+    <main>
+      <h1>Migrating to Turnstile</h1>
+      <p>Learn how challenge widgets render inside modern web apps.</p>
+      <blockquote>"Just a moment... Verify you are human"</blockquote>
+      <pre><code>
+        window._cf_chl_opt = { cType: 'managed' };
+        const script = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+        const px = "px-captcha";
+        const dd = "geo.captcha-delivery.com";
+      </code></pre>
+    </main>
+  </body></html>`;
+  assert.equal(classifyWafAndChallenge({ status: 200, rawBody: turnstileDocsHtml }), null);
+
+  // Anti-FP Veto 2 (Word-Count Veto): >= 250-word article with a footer newsletter reCAPTCHA widget!
+  const longProse = Array.from({ length: 280 }, (_, i) => `word${i}`).join(' ');
+  const blogWithFooterCaptcha = `<html><head><title>Just a moment in distributed systems history</title></head><body>
+    <article><p>${longProse}</p></article>
+    <footer><div class="g-recaptcha" data-sitekey="abc"></div><script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></footer>
+  </body></html>`;
+  assert.equal(classifyWafAndChallenge({ status: 200, rawBody: blogWithFooterCaptcha }), null);
+
+  // Anti-FP Veto 3 (Schema.org JSON-LD Veto): Real JobPosting page with an application form Turnstile widget!
+  const jobWithTurnstile = `<html><head>
+    <title>Principal Systems Engineer</title>
+    <script type="application/ld+json">{"@context":"https://schema.org","@type":"JobPosting","title":"Principal Systems Engineer"}</script>
+  </head><body>
+    <main><h1>Principal Systems Engineer</h1><p>Build reliable distributed edge infrastructure in Go and Rust.</p>
+    <div class="cf-turnstile" data-sitekey="1x0000"></div></main>
+  </body></html>`;
+  assert.equal(classifyWafAndChallenge({ status: 200, rawBody: jobWithTurnstile }), null);
+
+  // Anti-FP Veto 4 (Navigation Landmark Veto): Site page with <nav> (>= 4 links) and >= 120 words!
+  const navWords = Array.from({ length: 140 }, (_, i) => `engineering${i}`).join(' ');
+  const navPageHtml = `<html><body>
+    <nav><a href="/a">Docs</a><a href="/b">API</a><a href="/c">Pricing</a><a href="/d">Status</a></nav>
+    <main><h1>Security Overview</h1><p>${navWords}</p><div class="h-captcha"></div></main>
+  </body></html>`;
+  assert.equal(classifyWafAndChallenge({ status: 200, rawBody: navPageHtml }), null);
+
+  // Ethical halt on HTTP 200 Akamai/Imperva interstitial inside `executeScrapeCall`: returns 403 challenge with `waf` + `blocked`!
+  const impervaScrape = await executeScrapeCall({
+    payload: { url: 'https://protected.example.com/jobs/123', discoverLlmsTxt: false },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: 'https://protected.example.com/jobs/123',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html',
+            body: '<html><body><iframe src="/_Incapsula_Resource?SWJIYLWA=719d34d31c8e3a6e6fffd425f7e032f3"></iframe></body></html>',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(impervaScrape.status, 403);
+  assert.equal(impervaScrape.body.outcome, 'challenge');
+  assert.equal((impervaScrape.body.waf as { vendor: string }).vendor, 'imperva');
+  assert.equal((impervaScrape.body.blocked as { reason: string }).reason, 'challenge');
+
+  // --- R4: `contentState` Soft-404, Closed-Posting, & Login-Wall Classification + `jobs` & `ingest` Filtering ---
+  assert.equal(
+    classifyContentState({
+      url: 'https://boards.greenhouse.io/acme/jobs/999',
+      title: 'Role Closed',
+      markdown: '# Role Closed\n\nSorry, this job is no longer available. View all open positions.',
+    }).state,
+    'closed_posting',
+  );
+  assert.equal(
+    classifyContentState({
+      url: 'https://docs.example.com/missing-page',
+      title: '404 Not Found',
+      markdown: '# 404 - Page Not Found\n\nThe page you requested could not be found.',
+    }).state,
+    'soft_404',
+  );
+  // 300-word troubleshooting guide about HTTP 404 errors must stay `active`!
+  assert.equal(
+    classifyContentState({
+      url: 'https://docs.example.com/troubleshooting-404',
+      title: '404 Not Found Troubleshooting Guide',
+      markdown: `# 404 Not Found Troubleshooting Guide\n\n${longProse}`,
+    }).state,
+    'active',
+  );
+  assert.equal(
+    classifyContentState({
+      url: 'https://portal.example.com/dashboard',
+      title: 'Sign in to continue',
+      markdown: '# Sign in to continue\n\nPlease log in to view your workspace.',
+      rawHtml: '<html><body><form><input type="email"><input type="password"></form></body></html>',
+    }).state,
+    'login_wall',
+  );
+
+  // `executeJobsCall` automatically filters out `contentState: "closed_posting"` roles!
+  const closedRoleFilterRes = await executeJobsCall({
+    payload: { query: 'Staff Backend Engineer', includeBuiltIn: false },
+    env: {},
+    executeSearch: async ({ query: q }) => ({
+      status: 200,
+      body: {
+        results: String(q).includes('greenhouse')
+          ? [
+              { url: 'https://job-boards.greenhouse.io/acme/jobs/101' },
+              { url: 'https://job-boards.greenhouse.io/acme/jobs/102' },
+            ]
+          : [],
+      },
+    }),
+    executeScrape: async ({ url: u }) => {
+      if (String(u).endsWith('/101')) {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            contentState: 'closed_posting',
+            jobPosting: { title: 'Staff Backend Engineer (Closed)', hiringOrganization: 'Acme', workplaceType: 'remote' },
+            markdown: '# Staff Backend Engineer\n\nThis job is no longer open.',
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          contentState: 'active',
+          jobPosting: { title: 'Staff Backend Engineer', hiringOrganization: 'Acme', workplaceType: 'remote' },
+          markdown: '# Staff Backend Engineer\n\nActive opening building distributed storage.',
+        },
+      };
+    },
+  });
+  assert.equal(closedRoleFilterRes.status, 200);
+  const openJobsOnly = closedRoleFilterRes.body.jobs as Array<{ title: string }>;
+  assert.equal(openJobsOnly.length, 1);
+  assert.equal(openJobsOnly[0]?.title, 'Staff Backend Engineer');
+
+  // --- R5 (304 ETag Revalidation) + R4 (Ingest skips FTS5 indexing on soft_404) ---
+  const tmpR5Dir = mkdtempSync(join(tmpdir(), 'ef-v24-r5-'));
+  try {
+    const metaSqlPath = resolve('migrations/meta/0001_tracking.sql');
+    const searchSqlPath = resolve('migrations/search/0001_fts.sql');
+    const metaDb = new NodeSqliteD1Database(':memory:', [metaSqlPath]);
+    const searchDb = new NodeSqliteD1Database(':memory:', [searchSqlPath]);
+    const r2Bucket = new NodeFsR2Bucket(join(tmpR5Dir, 'r2'));
+
+    const sha256BytesHex = async (bytes: Uint8Array) =>
+      Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>)), (b) =>
+        b.toString(16).padStart(2, '0'),
+      ).join('');
+
+    // Verify R4 in ingest: a `soft_404` HTML artifact is verified + derived, yet NOT indexed into `SEARCH` D1 FTS5!
+    const soft404Html = '<html><head><title>404 Page Not Found</title></head><body><main><h1>404 Page Not Found</h1><p>Sorry, we could not find that page right now.</p></main></body></html>';
+    const soft404Bytes = new TextEncoder().encode(soft404Html);
+    const soft404Gz = new Uint8Array(
+      await new Response(new Blob([soft404Bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer(),
+    );
+    const soft404BlobSha = await sha256BytesHex(soft404Gz);
+    const soft404ContentSha = await sha256HexString(soft404Html);
+    await r2Bucket.put(r2ArtifactKey('stored', soft404BlobSha), soft404Gz);
+    const softManifest = await writeJobManifestToR2({
+      bucket: r2Bucket as unknown as R2Bucket,
+      jobId: 'job_soft404_check',
+      via: 'agent:site-1',
+      collectionId: 'docs-coll',
+      rawReplyText: JSON.stringify({
+        results: [
+          {
+            id: '1',
+            url: 'https://docs.example.com/dead-doc',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html',
+            artifact: {
+              blobSha256: soft404BlobSha,
+              contentSha256: soft404ContentSha,
+              contentBytes: soft404Bytes.byteLength,
+              storedBytes: soft404Gz.byteLength,
+              encoding: 'gzip',
+              retention: 'stored',
+            },
+          },
+        ],
+      }),
+    });
+    assert.equal(softManifest.ok, true);
+    if (softManifest.ok) {
+      const ingOut = await executeIngestPipeline(
+        {
+          ARTIFACTS: r2Bucket as unknown as R2Bucket,
+          META: metaDb as unknown as D1Database,
+          SEARCH: searchDb as unknown as D1Database,
+        },
+        { manifestKey: softManifest.manifestKey, jobId: 'job_soft404_check', collectionId: 'docs-coll', via: 'agent:site-1' },
+      );
+      assert.equal(ingOut.verifiedCount, 1);
+      assert.equal(ingOut.indexedCount, 0, 'soft_404 pages must never pollute SEARCH D1 FTS5');
+    }
+
+    // Seed verified page + ETag in `META` D1 + derived Markdown in `ARTIFACTS` R2 via real `executeIngestPipeline` for R5 conditional `304 Not Modified` revalidation!
+    const targetRevalUrl = 'https://handbook.example.com/architecture';
+    const revalHtml = '<html><head><title>Edge Architecture</title></head><body><main><h1>Edge Architecture</h1><p>Verified cached handbook prose served on 304 Not Modified across global nodes.</p></main></body></html>';
+    const revalBytes = new TextEncoder().encode(revalHtml);
+    const revalGz = new Uint8Array(
+      await new Response(new Blob([revalBytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer(),
+    );
+    const revalBlobSha = await sha256BytesHex(revalGz);
+    const revalContentSha = await sha256HexString(revalHtml);
+    await r2Bucket.put(r2ArtifactKey('stored', revalBlobSha), revalGz);
+    const oldFetchedAt = 1_700_000_000_000;
+    const revalManifest = await writeJobManifestToR2({
+      bucket: r2Bucket as unknown as R2Bucket,
+      jobId: 'job_reval_seed',
+      via: 'agent:site-arm64',
+      rawReplyText: JSON.stringify({
+        results: [
+          {
+            id: '1',
+            url: targetRevalUrl,
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html; charset=utf-8',
+            etag: '"etag-arch-v9"',
+            lastModified: 'Wed, 18 Nov 2026 12:00:00 GMT',
+            artifact: {
+              blobSha256: revalBlobSha,
+              contentSha256: revalContentSha,
+              contentBytes: revalBytes.byteLength,
+              storedBytes: revalGz.byteLength,
+              encoding: 'gzip',
+              retention: 'stored',
+            },
+          },
+        ],
+      }),
+      now: oldFetchedAt,
+    });
+    assert.equal(revalManifest.ok, true);
+    if (revalManifest.ok) {
+      await executeIngestPipeline(
+        {
+          ARTIFACTS: r2Bucket as unknown as R2Bucket,
+          META: metaDb as unknown as D1Database,
+        },
+        { manifestKey: revalManifest.manifestKey, jobId: 'job_reval_seed', via: 'agent:site-arm64' },
+        undefined,
+        { now: oldFetchedAt },
+      );
+    }
+
+    let sentIfNoneMatch = '';
+    let sentIfModifiedSince = '';
+    const freshNow = oldFetchedAt + 120_000; // 120s later (> maxAgeMs=5000ms -> triggers conditional revalidation!)
+    const revalRes = await executeScrapeCall({
+      payload: { url: targetRevalUrl, maxAgeMs: 5_000, discoverLlmsTxt: false },
+      env: {
+        ARTIFACTS: r2Bucket as unknown as R2Bucket,
+        META: metaDb as unknown as D1Database,
+      },
+      now: freshNow,
+      executeHubFetch: async (_target, rawCall) => {
+        const parsed = JSON.parse(rawCall) as { requests: Array<{ ifNoneMatch?: string; ifModifiedSince?: string }> };
+        sentIfNoneMatch = parsed.requests[0]?.ifNoneMatch ?? '';
+        sentIfModifiedSince = parsed.requests[0]?.ifModifiedSince ?? '';
+        return {
+          status: 200,
+          via: 'agent:site-arm64',
+          bodyText: JSON.stringify({
+            results: [{ id: 'scrape-1', url: targetRevalUrl, finalUrl: targetRevalUrl, status: 304, outcome: 'ok' }],
+          }),
+        };
+      },
+    });
+    assert.equal(sentIfNoneMatch, '"etag-arch-v9"');
+    assert.equal(sentIfModifiedSince, 'Wed, 18 Nov 2026 12:00:00 GMT');
+    assert.equal(revalRes.status, 200);
+    assert.equal(revalRes.body.ok, true);
+    assert.equal(revalRes.body.cached, true);
+    assert.equal(revalRes.body.revalidated, true);
+    assert.equal(revalRes.body.originStatus, 304);
+    assert.match(String(revalRes.body.markdown), /Verified cached handbook prose/);
+
+    const updatedPage = await metaDb
+      .prepare('SELECT last_fetched_at FROM pages WHERE url = ?')
+      .bind(targetRevalUrl)
+      .first<{ last_fetched_at: number }>();
+    assert.equal(updatedPage?.last_fetched_at, freshNow);
+
+    metaDb.close();
+    searchDb.close();
+  } finally {
+    rmSync(tmpR5Dir, { recursive: true, force: true });
+  }
+
+  // --- R6: SSR Hydration State Recovery (`__NEXT_DATA__`) without Headless Browser Render ---
+  let r6FetchCount = 0;
+  const nextJsThinHtml = `<html><head><title>Staff Infrastructure Engineer - OrbitCloud</title></head><body>
+    <div id="__next"><span>Loading role...</span></div>
+    <script id="__NEXT_DATA__" type="application/json">${JSON.stringify({
+      props: {
+        pageProps: {
+          job: {
+            title: 'Staff Infrastructure Engineer',
+            description:
+              'OrbitCloud is hiring a Staff Infrastructure Engineer to architect global multi-region control planes, zero-trust networking, consensus state machines, and low-latency edge storage across 60+ points of presence worldwide. Requirements include 8+ years of production Go or Rust experience, Linux kernel networking, BGP/Anycast operations, and distributed SQLite or Raft systems.',
+          },
+        },
+      },
+    })}</script>
+  </body></html>`;
+  const r6Scrape = await executeScrapeCall({
+    payload: { url: 'https://careers.orbitcloud.example.com/jobs/staff-infra', renderMode: 'auto', discoverLlmsTxt: false },
+    env: {},
+    executeHubFetch: async (_target, rawCall) => {
+      r6FetchCount++;
+      const parsed = JSON.parse(rawCall) as { requests: Array<{ kind: string }> };
+      assert.notEqual(parsed.requests[0]?.kind, 'render', 'SSR hydration must recover prose BEFORE triggering headless Chromium!');
+      return {
+        status: 200,
+        via: 'agent:site-lite',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: 'https://careers.orbitcloud.example.com/jobs/staff-infra',
+              finalUrl: 'https://careers.orbitcloud.example.com/jobs/staff-infra',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              body: nextJsThinHtml,
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(r6Scrape.status, 200);
+  assert.equal(r6FetchCount, 1);
+  assert.equal(r6Scrape.body.contentSource, 'ssr-hydration');
+  assert.match(String(r6Scrape.body.markdown), /multi-region control planes/);
+
+  // --- R7: Adaptive Per-Host Politeness & Health Ledger (`host_health` + `GET /v1/hosts` + SDK `hosts()`) ---
+  let r7Clock = 1_795_100_000_000;
+  const r7Engine = new AgentHubEngine({
+    getSockets: () => [],
+    now: () => r7Clock,
+  });
+  r7Engine.recordHostOutcome({ host: 'rate-sensitive.example.com', status: 429, outcome: 'error', ttfbMs: 180 });
+  r7Clock += 1_000;
+  r7Engine.recordHostOutcome({ host: 'rate-sensitive.example.com', status: 429, outcome: 'error', ttfbMs: 220 });
+  const escalated = r7Engine.listHostHealth(10)[0]!;
+  assert.equal(escalated.host, 'rate-sensitive.example.com');
+  assert.equal(escalated.rateLimit429Count, 2);
+  assert.ok(escalated.recommendedPauseMs >= 6_000, `expected escalated pause >= 6000ms, got ${escalated.recommendedPauseMs}`);
+
+  for (let i = 0; i < 6; i++) {
+    r7Clock += 1_000;
+    r7Engine.recordHostOutcome({ host: 'rate-sensitive.example.com', status: 200, outcome: 'ok', ttfbMs: 95 });
+  }
+  const decayed = r7Engine.listHostHealth(10)[0]!;
+  assert.ok(decayed.recommendedPauseMs < escalated.recommendedPauseMs, 'consecutive 200 OKs must decay recommendedPauseMs');
+  assert.equal(decayed.okCount, 6);
+
+  // Verify end-to-end Portable Hub `GET /v1/hosts` + `GET /.well-known/http-message-signatures-directory` + TS SDK `hosts()`
+  const tmpHubDir = mkdtempSync(join(tmpdir(), 'ef-v24-hub-'));
+  const portable = await startPortableHub({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: tmpHubDir,
+    envOverrides: {
+      CALLER_TOKEN: 'v24-owner-secret-0123456789abcdef',
+      BOT_SIGNING_PRIVATE_KEY: kp.privateKeySeed,
+    },
+  });
+  try {
+    const pubDirRes = await fetch(`http://127.0.0.1:${portable.port}/.well-known/http-message-signatures-directory`);
+    assert.equal(pubDirRes.status, 200);
+    const pubDirJson = (await pubDirRes.json()) as { keys: Array<{ kid: string }> };
+    assert.equal(pubDirJson.keys[0]?.kid, kp.kid);
+
+    const sdk = new EdgeFetchClient({
+      baseUrl: `http://127.0.0.1:${portable.port}`,
+      token: 'v24-owner-secret-0123456789abcdef',
+    });
+    const caps = await sdk.capabilities();
+    assert.equal(caps.version, '2.4.0');
+    assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
+    const hostsOut = await sdk.hosts(25);
+    assert.equal(hostsOut.ok, true);
+    assert.ok(Array.isArray(hostsOut.hosts));
+  } finally {
+    await portable.close();
+    rmSync(tmpHubDir, { recursive: true, force: true });
+  }
+
+  // --- R8: Opt-In Internet Archive (`Wayback CDX`) Link-Rot Fallback (Strictly ONLY on 5xx / DNS-dead!) ---
+  assert.equal(isEligibleForWaybackFallback({ outcome: 'error', status: 503, problem: 'HTTP 503' }), true);
+  assert.equal(isEligibleForWaybackFallback({ outcome: 'error', status: 0, problem: 'dial tcp: no such host' }), true);
+  assert.equal(isEligibleForWaybackFallback({ outcome: 'skip', status: 0, problem: 'robots.txt disallowed /private' }), false);
+  assert.equal(isEligibleForWaybackFallback({ outcome: 'error', status: 403, problem: 'HTTP 403' }), false);
+  assert.equal(isEligibleForWaybackFallback({ outcome: 'error', status: 404, problem: 'HTTP 404' }), false);
+  assert.equal(isEligibleForWaybackFallback({ outcome: 'error', status: 429, problem: 'HTTP 429' }), false);
+  assert.equal(
+    isEligibleForWaybackFallback({
+      outcome: 'error',
+      status: 503,
+      problem: 'Cloudflare challenge',
+      waf: { vendor: 'cloudflare', category: 'challenge', confidence: 1, signals: ['header:cf-mitigated'], summary: 'cf' },
+    }),
+    false,
+  );
+
+  // Positive R8 recovery on HTTP 503 dead origin
+  let archiveCalls = 0;
+  const wbRecovered = await executeScrapeCall({
+    payload: { url: 'https://bitrot.example.org/2021/consensus-paper', waybackFallback: true, discoverLlmsTxt: false },
+    env: {},
+    executeHubFetch: async (_target, rawCall) => {
+      const parsed = JSON.parse(rawCall) as { requests: Array<{ url: string }> };
+      const reqUrl = parsed.requests[0]!.url;
+      if (reqUrl.startsWith('https://archive.org/wayback/available')) {
+        archiveCalls++;
+        return {
+          status: 200,
+          via: 'agent:site-x86',
+          bodyText: JSON.stringify({
+            results: [
+              {
+                id: 'wb-avail',
+                url: reqUrl,
+                status: 200,
+                outcome: 'ok',
+                contentType: 'application/json',
+                body: JSON.stringify({
+                  archived_snapshots: {
+                    closest: {
+                      available: true,
+                      status: '200',
+                      timestamp: '20240512093000',
+                      url: 'http://web.archive.org/web/20240512093000/https://bitrot.example.org/2021/consensus-paper',
+                    },
+                  },
+                }),
+              },
+            ],
+          }),
+        };
+      }
+      if (reqUrl.startsWith('https://web.archive.org/web/20240512093000id_/')) {
+        archiveCalls++;
+        return {
+          status: 200,
+          via: 'agent:site-x86',
+          bodyText: JSON.stringify({
+            results: [
+              {
+                id: 'wb-snap',
+                url: reqUrl,
+                status: 200,
+                outcome: 'ok',
+                contentType: 'text/html; charset=utf-8',
+                body: '<html><head><title>Consensus Paper (2021)</title></head><body><main><h1>Consensus Paper</h1><p>Archived Paxos and Raft formal proof recovered from link rot.</p></main></body></html>',
+              },
+            ],
+          }),
+        };
+      }
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [{ id: 'scrape-1', url: reqUrl, status: 503, outcome: 'error', problem: 'HTTP 503 Service Unavailable' }],
+        }),
+      };
+    },
+  });
+  assert.equal(wbRecovered.status, 200);
+  assert.equal(wbRecovered.body.ok, true);
+  assert.equal(wbRecovered.body.contentSource, 'wayback');
+  assert.equal(wbRecovered.body.waybackTimestamp, '20240512093000');
+  assert.match(String(wbRecovered.body.markdown), /Archived Paxos and Raft formal proof/);
+  assert.equal(archiveCalls, 2);
+
+  // Ethical guardrail: `waybackFallback: true` MUST NEVER touch archive.org on `robots.txt` blocks, `403`, or `challenge`!
+  archiveCalls = 0;
+  for (const forbiddenCase of [
+    { status: 0, outcome: 'skip', problem: 'robots.txt disallowed /secret' },
+    { status: 403, outcome: 'error', problem: 'HTTP 403 Forbidden' },
+    { status: 403, outcome: 'challenge', problem: 'Cloudflare challenge (cf-mitigated)' },
+  ]) {
+    const denied = await executeScrapeCall({
+      payload: { url: 'https://restricted.example.org/secret', waybackFallback: true, discoverLlmsTxt: false },
+      env: {},
+      executeHubFetch: async (_target, rawCall) => {
+        const parsed = JSON.parse(rawCall) as { requests: Array<{ url: string }> };
+        if (parsed.requests[0]!.url.includes('archive.org')) archiveCalls++;
+        return {
+          status: 200,
+          via: 'agent:site-x86',
+          bodyText: JSON.stringify({ results: [{ id: 'scrape-1', url: 'https://restricted.example.org/secret', ...forbiddenCase }] }),
+        };
+      },
+    });
+    assert.equal(denied.body.ok, false);
+  }
+  assert.equal(archiveCalls, 0, 'Wayback fallback must NEVER run on robots.txt, 403, or anti-bot challenges');
 });

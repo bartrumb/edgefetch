@@ -108,6 +108,9 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     OTEL_EXPORTER_OTLP_ENDPOINT: mergedEnv.OTEL_EXPORTER_OTLP_ENDPOINT,
     OTEL_EXPORTER_OTLP_HEADERS: mergedEnv.OTEL_EXPORTER_OTLP_HEADERS,
     OTEL_SERVICE_NAME: mergedEnv.OTEL_SERVICE_NAME,
+    BOT_SIGNING_PRIVATE_KEY: mergedEnv.BOT_SIGNING_PRIVATE_KEY ?? mergedEnv.EDGEFETCH_BOT_SIGNING_KEY,
+    BOT_SIGNING_PUBLIC_KEY: mergedEnv.BOT_SIGNING_PUBLIC_KEY,
+    BOT_CONTACT_URL: mergedEnv.BOT_CONTACT_URL,
   };
 
   const defaultOrigin = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`;

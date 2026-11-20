@@ -133,3 +133,15 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.image }}:lite
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-lite
+
+      - name: Build & Push Multi-Arch All-in-One Hub + Agent Container (amd64 + arm64)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.all-in-one
+          platforms: linux/amd64,linux/arm64
+          build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/edgefetch:latest
+            ghcr.io/${{ github.repository_owner }}/edgefetch:${{ steps.meta.outputs.version }}

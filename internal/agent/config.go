@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bartrumb/edgefetch/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 )
 
 const (

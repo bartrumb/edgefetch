@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
 )
 
 // ImageInfo describes an image discovered on a page.
@@ -107,20 +109,15 @@ var (
 	rePhone = regexp.MustCompile(`(?:\+?1[-.\s]?)?\(\d{3}\)[-.\s]?\d{3}[-.\s]?\d{4}\b|\+\d{1,3}[-.\s]\d{2,4}[-.\s]\d{3,4}[-.\s]\d{3,4}\b`)
 	reCard  = regexp.MustCompile(`\b(?:\d[ -]*?){13,19}\b`)
 
-	reChallengeTitle = regexp.MustCompile(`(?i)\b(just a moment|attention required|verify you are human|security check|ddos-guard|checking your browser)\b`)
-	reChallengeDOM   = regexp.MustCompile(`(?i)(cf-turnstile|challenges\.cloudflare\.com|g-recaptcha|h-captcha|_cf_chl_opt)`)
-	reSPAShell       = regexp.MustCompile(`(?i)<div[^>]+id=["']?(root|app|__next|__nuxt)["']?[^>]*>\s*</div>`)
+	reSPAShell = regexp.MustCompile(`(?i)<div[^>]+id=["']?(root|app|__next|__nuxt)["']?[^>]*>\s*</div>`)
 )
 
 // DetectRenderedChallenge checks whether an HTML payload (HTTP or headless browser) is gated by a bot/CAPTCHA challenge.
-// EdgeFetch never attempts to solve, click through, or wait out anti-bot challenges.
+// Delegates to `classify.ClassifyWAF` (`R2` & `R3`) so all 4 anti-false-positive guardrails (visible word-count veto,
+// Schema.org JSON-LD veto, `<pre>`/`<code>` immunity, and `<nav>` landmark veto) protect rendered pages too.
 func DetectRenderedChallenge(rawHTML string) string {
-	title := extractTitle(rawHTML)
-	if reChallengeTitle.MatchString(title) {
-		return "anti-bot challenge page (" + title + ")"
-	}
-	if len(rawHTML) < 32_768 && reChallengeDOM.MatchString(rawHTML) && len(PlainText(rawHTML)) < 400 {
-		return "anti-bot challenge widget detected"
+	if waf := classify.ClassifyWAF(200, nil, []byte(rawHTML)); waf != nil {
+		return waf.Summary
 	}
 	return ""
 }

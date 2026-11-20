@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/bartrumb/edgefetch/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
 )
 
 func ExampleClassify() {

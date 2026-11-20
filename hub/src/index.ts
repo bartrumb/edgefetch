@@ -24,6 +24,7 @@ import {
 import { handleAdminRoute } from './admin';
 import {
   AgentHubEngine,
+  computeNextHostHealth,
   MAX_CALL_UTF8_BYTES,
   parseFetchTarget,
   readAgentReplyBody,
@@ -38,10 +39,13 @@ import {
   type CompleteJobResult,
   type CooldownStore,
   type FetchTarget,
+  type HostHealthRecord,
+  type HostHealthStore,
   type HostWindowStore,
   type HubSocketLike,
 } from './agent-hub';
 import { authorizeAgent, isCallerAuthorized } from './auth';
+import { handleBotTransparencyRoutes, type BotAuthEnv } from './bot-auth';
 import { handleCompatRoutes } from './compat';
 import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
@@ -107,7 +111,7 @@ import {
   type OptionalStorageBindings,
 } from './storage';
 
-interface Env extends OptionalStorageBindings, OtelEnvConfig {
+interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv {
   AGENT_HUB: DurableObjectNamespace<AgentHubDO>;
   HUB_SHARDS?: string;
   CALLER_TOKEN?: string;
@@ -125,7 +129,7 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig {
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const DEFAULT_UA = 'EdgeFetch/2.1 (+https://github.com/bartrumb/edgefetch)';
+const DEFAULT_UA = 'EdgeFetch/2.4 (+https://github.com/bartrumb/edgefetch)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;
@@ -157,6 +161,18 @@ export class AgentHubDO extends DurableObject<Env> {
           host TEXT PRIMARY KEY,
           site_id TEXT NOT NULL,
           expires_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS host_health (
+          host TEXT PRIMARY KEY,
+          ok_count INTEGER NOT NULL,
+          rate_limit_count INTEGER NOT NULL,
+          challenge_count INTEGER NOT NULL,
+          error_5xx_count INTEGER NOT NULL,
+          rate_limit_streak INTEGER NOT NULL,
+          ewma_ttfb_ms INTEGER NOT NULL,
+          recommended_pause_ms INTEGER NOT NULL,
+          last_waf_vendor TEXT,
+          updated_at INTEGER NOT NULL
         );
         ${OAUTH_SQLITE_SCHEMA}
         ${ACTIVITY_SQLITE_SCHEMA}
@@ -287,11 +303,107 @@ export class AgentHubDO extends DurableObject<Env> {
       },
     };
 
+    const hostHealth: HostHealthStore = {
+      recordOutcome: (params) => {
+        const key = params.host.toLowerCase();
+        if (!key) return;
+        const row = this.ctx.storage.sql
+          .exec<{
+            host: string;
+            ok_count: number;
+            rate_limit_count: number;
+            challenge_count: number;
+            error_5xx_count: number;
+            rate_limit_streak: number;
+            ewma_ttfb_ms: number;
+            recommended_pause_ms: number;
+            last_waf_vendor: string | null;
+            updated_at: number;
+          }>('SELECT * FROM host_health WHERE host = ?', key)
+          .toArray()[0];
+        const prev: HostHealthRecord | undefined = row
+          ? {
+              host: row.host,
+              okCount: row.ok_count,
+              rateLimit429Count: row.rate_limit_count,
+              challengeCount: row.challenge_count,
+              error5xxCount: row.error_5xx_count,
+              rateLimitStreak: row.rate_limit_streak,
+              ewmaTtfbMs: row.ewma_ttfb_ms,
+              recommendedPauseMs: row.recommended_pause_ms,
+              ...(row.last_waf_vendor ? { lastWafVendor: row.last_waf_vendor } : {}),
+              updatedAt: row.updated_at,
+            }
+          : undefined;
+        const next = computeNextHostHealth(prev, params);
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO host_health (
+             host, ok_count, rate_limit_count, challenge_count, error_5xx_count,
+             rate_limit_streak, ewma_ttfb_ms, recommended_pause_ms, last_waf_vendor, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          next.host,
+          next.okCount,
+          next.rateLimit429Count,
+          next.challengeCount,
+          next.error5xxCount,
+          next.rateLimitStreak,
+          next.ewmaTtfbMs,
+          next.recommendedPauseMs,
+          next.lastWafVendor ?? null,
+          next.updatedAt,
+        );
+        this.ctx.storage.sql.exec(
+          `DELETE FROM host_health
+           WHERE host IN (SELECT host FROM host_health ORDER BY updated_at DESC LIMIT -1 OFFSET ?)`,
+          MAX_SQLITE_TRACKED_HOSTS,
+        );
+      },
+      getRecommendedPauseMs: (host) => {
+        const row = this.ctx.storage.sql
+          .exec<{ recommended_pause_ms: number }>('SELECT recommended_pause_ms FROM host_health WHERE host = ?', host.toLowerCase())
+          .toArray()[0];
+        return row?.recommended_pause_ms ?? 0;
+      },
+      listHosts: (limit = 100) => {
+        const cap = Math.max(1, Math.min(500, Math.floor(limit)));
+        return this.ctx.storage.sql
+          .exec<{
+            host: string;
+            ok_count: number;
+            rate_limit_count: number;
+            challenge_count: number;
+            error_5xx_count: number;
+            rate_limit_streak: number;
+            ewma_ttfb_ms: number;
+            recommended_pause_ms: number;
+            last_waf_vendor: string | null;
+            updated_at: number;
+          }>('SELECT * FROM host_health ORDER BY updated_at DESC LIMIT ?', cap)
+          .toArray()
+          .map((row) => ({
+            host: row.host,
+            okCount: row.ok_count,
+            rateLimit429Count: row.rate_limit_count,
+            challengeCount: row.challenge_count,
+            error5xxCount: row.error_5xx_count,
+            rateLimitStreak: row.rate_limit_streak,
+            ewmaTtfbMs: row.ewma_ttfb_ms,
+            recommendedPauseMs: row.recommended_pause_ms,
+            ...(row.last_waf_vendor ? { lastWafVendor: row.last_waf_vendor } : {}),
+            updatedAt: row.updated_at,
+          }));
+      },
+      clearAll: () => {
+        this.ctx.storage.sql.exec('DELETE FROM host_health');
+      },
+    };
+
     this.engine = new AgentHubEngine({
       getSockets: (tag) => this.ctx.getWebSockets(tag) as unknown as HubSocketLike[],
       cooldowns,
       hostWindows,
       affinities,
+      hostHealth,
     });
     this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.activity = createSqliteActivityStore(this.ctx.storage.sql as unknown as SqlStorageLike);
@@ -344,6 +456,21 @@ export class AgentHubDO extends DurableObject<Env> {
 
   async clearAffinities(siteId?: string): Promise<void> {
     this.engine.clearAffinities(siteId);
+  }
+
+  async listHostHealth(limit = 100): Promise<HostHealthRecord[]> {
+    return this.engine.listHostHealth(limit);
+  }
+
+  async recordHostOutcome(params: {
+    host: string;
+    status: number;
+    outcome: string;
+    ttfbMs?: number;
+    retryAfterMs?: number;
+    wafVendor?: string;
+  }): Promise<void> {
+    this.engine.recordHostOutcome(params);
   }
 
   async recordHubEvents(events: HubEventInput[]): Promise<void> {
@@ -684,7 +811,18 @@ export default {
             body,
             trace,
             callAgent: (b, t, s) => dispatchAcrossShards(b, t, s, artifactPolicy),
-            callContainer: (b) => cloudflareOverflowFetch(b, ua, url.hostname, { bypassAllowlist }),
+            callContainer: (b) =>
+              cloudflareOverflowFetch(b, ua, url.hostname, {
+                bypassAllowlist,
+                ...(env.BOT_SIGNING_PRIVATE_KEY?.trim()
+                  ? {
+                      botAuth: {
+                        privateKey: env.BOT_SIGNING_PRIVATE_KEY.trim(),
+                        directoryUrl: `${url.origin}/.well-known/http-message-signatures-directory`,
+                      },
+                    }
+                  : {}),
+              }),
             waitForHostWindow: (hosts, p, dl) =>
               hub()
                 .waitForHostWindow(hosts, p, dl)
@@ -832,6 +970,8 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.4.0');
+      if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
         if (!auth.ok) return Response.json({ error: 'unauthorized' }, { status: 401 });
@@ -907,7 +1047,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.3.0',
+          serverVersion: '2.4.0',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1114,10 +1254,32 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.3.0'), {
+        return Response.json(buildCapabilities(env, '2.4.0'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/v1/hosts') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const rawLimit = Number(url.searchParams.get('limit') ?? 100);
+        const safeLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 100;
+        const hosts = await hub().listHostHealth(safeLimit);
+        return Response.json({ ok: true, hosts }, { status: 200, headers: { 'cache-control': 'no-store' } });
       }
 
       const compatRes = await handleCompatRoutes({

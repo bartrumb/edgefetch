@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/agent"
-	"github.com/bartrumb/edgefetch/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/agent"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 )
 
 func TestGoHubAgentDispatchMultiControllerHAAndLocalFallback(t *testing.T) {

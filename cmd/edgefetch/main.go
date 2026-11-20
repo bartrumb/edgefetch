@@ -22,13 +22,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/agent"
-	"github.com/bartrumb/edgefetch/internal/crawl"
-	"github.com/bartrumb/edgefetch/internal/hub"
-	"github.com/bartrumb/edgefetch/internal/otel"
-	"github.com/bartrumb/edgefetch/internal/politeness"
-	"github.com/bartrumb/edgefetch/internal/priv"
-	"github.com/bartrumb/edgefetch/internal/ws"
+	"github.com/bartrumb/edgefetch/v2/internal/agent"
+	"github.com/bartrumb/edgefetch/v2/internal/botauth"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/hub"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
+	"github.com/bartrumb/edgefetch/v2/internal/priv"
+	"github.com/bartrumb/edgefetch/v2/internal/ws"
 )
 
 const maxResponseHeaderBytes = 64 << 10 // 64 KiB cap prevents giant origin response headers from exhausting memory.
@@ -275,6 +276,7 @@ func main() {
 		defer func() { _ = crawler.Close() }()
 		crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
 		crawler.SetOtelExporter(otel.NewExporterFromEnv(os.Getenv, "edgefetch-agent-"+cfg.SiteID, agent.Version, hubTr))
+		configureCrawlerBotAuth(crawler, cfg.HubURLs, siteLog)
 
 		if err := agent.RunAll(ctx, cfg, crawler, allow, hubTr, siteLog, agent.RuntimeOpts{}); err != nil {
 			log.Error("agent_stopped", slog.String("error", err.Error()))
@@ -326,6 +328,7 @@ func main() {
 	defer func() { _ = crawler.Close() }()
 	crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
 	crawler.SetOtelExporter(otel.NewExporterFromEnv(os.Getenv, defaultOtelSvc, agent.Version, hubTr))
+	configureCrawlerBotAuth(crawler, agentCfg.HubURLs, log)
 
 	var handler http.Handler
 	var goHub *hub.Server
@@ -392,4 +395,28 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", slog.String("error", err.Error()))
 	}
+}
+
+func configureCrawlerBotAuth(c *crawl.Crawler, hubURLs []string, log *slog.Logger) {
+	privKey := firstNonEmpty(os.Getenv("EDGEFETCH_BOT_SIGNING_KEY"), os.Getenv("BOT_SIGNING_PRIVATE_KEY"))
+	if privKey == "" {
+		return
+	}
+	dirURL := firstNonEmpty(os.Getenv("EDGEFETCH_BOT_DIRECTORY_URL"), os.Getenv("BOT_DIRECTORY_URL"))
+	if dirURL == "" && len(hubURLs) > 0 {
+		if u, err := url.Parse(hubURLs[0]); err == nil && u.Host != "" {
+			scheme := "https"
+			if u.Scheme == "ws" || u.Scheme == "http" {
+				scheme = "http"
+			}
+			dirURL = scheme + "://" + u.Host + "/.well-known/http-message-signatures-directory"
+		}
+	}
+	signer, err := botauth.NewSigner(privKey, dirURL)
+	if err != nil {
+		log.Error("bot_auth_config_invalid", slog.String("error", err.Error()))
+		os.Exit(2)
+	}
+	c.SetBotSigner(signer)
+	log.Info("bot_auth_enabled", slog.String("kid", signer.KeyID()), slog.String("directory", dirURL))
 }

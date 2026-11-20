@@ -140,6 +140,7 @@ export interface HubCapabilities {
     search: boolean;
     webSearch: boolean;
     pdfOcr: boolean;
+    webBotAuth: boolean;
   };
   searchProviders: string[];
 }
@@ -150,8 +151,10 @@ export function buildCapabilities(
     BRAVE_API_KEY?: string;
     TAVILY_API_KEY?: string;
     SEARXNG_URL?: string;
+    BOT_SIGNING_PRIVATE_KEY?: string;
+    BOT_SIGNING_PUBLIC_KEY?: string;
   },
-  version = '2.0.0',
+  version = '2.4.0',
 ): HubCapabilities {
   const searchProviders: string[] = ['edge-map'];
   if (env.SEARCH) searchProviders.push('d1-fts5');
@@ -180,6 +183,7 @@ export function buildCapabilities(
       search: Boolean(env.SEARCH || hasWebProvider),
       webSearch: hasWebProvider,
       pdfOcr: Boolean(env.PDF_OCR || (env.PDF_OCR_URL?.trim() && env.PDF_OCR_TOKEN?.trim())),
+      webBotAuth: Boolean(env.BOT_SIGNING_PRIVATE_KEY?.trim() || env.BOT_SIGNING_PUBLIC_KEY?.trim()),
     },
     searchProviders,
   };

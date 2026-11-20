@@ -1,0 +1,39 @@
+name: Bug Report
+description: Report a reproducible bug in scraping, extraction, MCP tools, or deployment
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Please strip any private tokens (`CALLER_TOKEN`, `AGENT_TOKEN`, API keys) before pasting logs.
+  - type: input
+    id: version
+    attributes:
+      label: EdgeFetch Version & Deployment Mode
+      description: Run `edgefetch version` or check `/v1/capabilities`
+      placeholder: "v2.4.0 — Desktop stdio MCP on macOS arm64 (or Cloudflare Hub + Docker agent)"
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Public URL or MCP Tool Call (if applicable)
+      description: Share a public URL that reproduces the extraction/fetch issue
+      placeholder: "https://example.com/docs/guide"
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened vs. what you expected
+      placeholder: "Describe the actual output/error and what clean output you expected."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Run `edgefetch scrape https://...`
+        2. Observe ...
+    validations:
+      required: true

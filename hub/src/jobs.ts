@@ -1386,6 +1386,9 @@ export async function executeJobsCall(params: {
       const origU = slice[j]!;
       const sc = batchOut[j];
       if (!sc || sc.status !== 200 || sc.body?.ok !== true) continue;
+      // R4: Automatically drop closed/filled job postings, soft-404s, and login walls from active `jobs` search results!
+      const cState = sc.body.contentState;
+      if (cState === 'closed_posting' || cState === 'soft_404' || cState === 'login_wall') continue;
 
       // If board returned multiple `jobs` directly (e.g. Ashby / Workday board URL)
       if (Array.isArray(sc.body.jobs)) {

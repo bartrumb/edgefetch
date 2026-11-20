@@ -15,6 +15,7 @@ import { SITE_ID_PATTERN } from './auth';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
 import { validatePublicHttpsTargetUrl } from './overflow';
+import { classifyWafAndChallenge } from './waf';
 
 const SUPPORTED_PROTOCOL_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
 const LEGACY_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
@@ -525,6 +526,12 @@ function buildToolDefinitions(deps: McpServerDeps) {
             description: 'Optional record filter for JSON array responses (e.g. `title~"Forward Deployed"` or `id=abc123`), emitting 1 chunk per record.',
           },
           collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index the verified Markdown into.' },
+          waybackFallback: {
+            type: 'boolean',
+            default: false,
+            description:
+              'Opt-in Internet Archive Wayback fallback strictly on 5xx or network-unreachable link rot (never used on robots.txt, 401/403/429, or anti-bot challenges).',
+          },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
         },
@@ -568,6 +575,12 @@ function buildToolDefinitions(deps: McpServerDeps) {
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
           redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
           collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index extracted pages into.' },
+          waybackFallback: {
+            type: 'boolean',
+            default: false,
+            description:
+              'Opt-in Internet Archive Wayback fallback strictly on 5xx or network-unreachable link rot (never used on robots.txt, 401/403/429, or anti-bot challenges).',
+          },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
         },
@@ -919,6 +932,13 @@ export function truncateResultBodies(
       }
     }
     if (copy.outcome !== 'ok' && typeof copy.url === 'string') {
+      if (!copy.waf && typeof copy.status === 'number') {
+        const inferredWaf = classifyWafAndChallenge({
+          status: copy.status,
+          ...(typeof copy.body === 'string' && (!copy.bodyEncoding || copy.bodyEncoding === 'utf-8') ? { rawBody: copy.body } : {}),
+        });
+        if (inferredWaf) copy.waf = inferredWaf;
+      }
       const blocked = buildBlockedInfo(copy.url, copy.outcome, copy.problem, copy.status);
       if (blocked) copy.blocked = blocked;
     }

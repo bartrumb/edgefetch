@@ -21,11 +21,14 @@ import {
 } from '../src/activity-log';
 import {
   AgentHubEngine,
+  computeNextHostHealth,
   type AffinityStore,
   type AgentAttachment,
   type ArtifactDispatchPolicy,
   type AuthorizeArtifactUploadParams,
   type CooldownStore,
+  type HostHealthRecord,
+  type HostHealthStore,
   type HostWindowStore,
   type HubSocketLike,
 } from '../src/agent-hub';
@@ -440,6 +443,18 @@ export class LocalAgentHubCoordinator {
         site_id TEXT NOT NULL,
         expires_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS host_health (
+        host TEXT PRIMARY KEY,
+        ok_count INTEGER NOT NULL,
+        rate_limit_count INTEGER NOT NULL,
+        challenge_count INTEGER NOT NULL,
+        error_5xx_count INTEGER NOT NULL,
+        rate_limit_streak INTEGER NOT NULL,
+        ewma_ttfb_ms INTEGER NOT NULL,
+        recommended_pause_ms INTEGER NOT NULL,
+        last_waf_vendor TEXT,
+        updated_at INTEGER NOT NULL
+      );
       ${OAUTH_SQLITE_SCHEMA}
       ${ACTIVITY_SQLITE_SCHEMA}
     `);
@@ -517,6 +532,94 @@ export class LocalAgentHubCoordinator {
       clearAll: () => sqlLike.exec('DELETE FROM host_affinities'),
     };
 
+    const hostHealth: HostHealthStore = {
+      recordOutcome: (params) => {
+        const key = params.host.toLowerCase();
+        if (!key) return;
+        const row = sqlLike
+          .exec<{
+            host: string;
+            ok_count: number;
+            rate_limit_count: number;
+            challenge_count: number;
+            error_5xx_count: number;
+            rate_limit_streak: number;
+            ewma_ttfb_ms: number;
+            recommended_pause_ms: number;
+            last_waf_vendor: string | null;
+            updated_at: number;
+          }>('SELECT * FROM host_health WHERE host = ?', key)
+          .toArray()[0];
+        const prev: HostHealthRecord | undefined = row
+          ? {
+              host: row.host,
+              okCount: row.ok_count,
+              rateLimit429Count: row.rate_limit_count,
+              challengeCount: row.challenge_count,
+              error5xxCount: row.error_5xx_count,
+              rateLimitStreak: row.rate_limit_streak,
+              ewmaTtfbMs: row.ewma_ttfb_ms,
+              recommendedPauseMs: row.recommended_pause_ms,
+              ...(row.last_waf_vendor ? { lastWafVendor: row.last_waf_vendor } : {}),
+              updatedAt: row.updated_at,
+            }
+          : undefined;
+        const next = computeNextHostHealth(prev, params);
+        sqlLike.exec(
+          `INSERT OR REPLACE INTO host_health (
+             host, ok_count, rate_limit_count, challenge_count, error_5xx_count,
+             rate_limit_streak, ewma_ttfb_ms, recommended_pause_ms, last_waf_vendor, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          next.host,
+          next.okCount,
+          next.rateLimit429Count,
+          next.challengeCount,
+          next.error5xxCount,
+          next.rateLimitStreak,
+          next.ewmaTtfbMs,
+          next.recommendedPauseMs,
+          next.lastWafVendor ?? null,
+          next.updatedAt,
+        );
+      },
+      getRecommendedPauseMs: (host) => {
+        const row = sqlLike
+          .exec<{ recommended_pause_ms: number }>('SELECT recommended_pause_ms FROM host_health WHERE host = ?', host.toLowerCase())
+          .toArray()[0];
+        return row?.recommended_pause_ms ?? 0;
+      },
+      listHosts: (limit = 100) => {
+        const cap = Math.max(1, Math.min(500, Math.floor(limit)));
+        return sqlLike
+          .exec<{
+            host: string;
+            ok_count: number;
+            rate_limit_count: number;
+            challenge_count: number;
+            error_5xx_count: number;
+            rate_limit_streak: number;
+            ewma_ttfb_ms: number;
+            recommended_pause_ms: number;
+            last_waf_vendor: string | null;
+            updated_at: number;
+          }>('SELECT * FROM host_health ORDER BY updated_at DESC LIMIT ?', cap)
+          .toArray()
+          .map((row) => ({
+            host: row.host,
+            okCount: row.ok_count,
+            rateLimit429Count: row.rate_limit_count,
+            challengeCount: row.challenge_count,
+            error5xxCount: row.error_5xx_count,
+            rateLimitStreak: row.rate_limit_streak,
+            ewmaTtfbMs: row.ewma_ttfb_ms,
+            recommendedPauseMs: row.recommended_pause_ms,
+            ...(row.last_waf_vendor ? { lastWafVendor: row.last_waf_vendor } : {}),
+            updatedAt: row.updated_at,
+          }));
+      },
+      clearAll: () => sqlLike.exec('DELETE FROM host_health'),
+    };
+
     this.engine = new AgentHubEngine({
       getSockets: (tag) => {
         const all = [...this.sockets];
@@ -525,6 +628,7 @@ export class LocalAgentHubCoordinator {
       cooldowns,
       hostWindows,
       affinities,
+      hostHealth,
     });
     this.oauth = createSqliteOAuthStore(sqlLike);
     this.activity = createSqliteActivityStore(sqlLike);
@@ -612,6 +716,8 @@ export class LocalAgentHubCoordinator {
       listAgents: async () => this.engine.listAgents(),
       listAffinities: async () => this.engine.listAffinities(),
       clearAffinities: async (siteId?: string) => this.engine.clearAffinities(siteId),
+      listHostHealth: async (limit = 100) => this.engine.listHostHealth(limit),
+      recordHostOutcome: async (p: Parameters<AgentHubEngine['recordHostOutcome']>[0]) => this.engine.recordHostOutcome(p),
       recordHubEvents: async (events: HubEventInput[]) => {
         for (const ev of events) await this.activity.recordEvent(ev);
       },

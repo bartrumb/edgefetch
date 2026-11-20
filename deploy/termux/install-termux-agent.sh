@@ -11,7 +11,7 @@
 #   bash install-termux-agent.sh
 set -euo pipefail
 
-VERSION="${EDGEFETCH_VERSION:-2.3.0}"
+VERSION="${EDGEFETCH_VERSION:-2.4.0}"
 if [[ -z "${EDGEFETCH_HUB_URL:-}" || -z "${EDGEFETCH_AGENT_TOKEN:-}" ]]; then
   echo "ERROR: Set EDGEFETCH_HUB_URL and EDGEFETCH_AGENT_TOKEN before running." >&2
   exit 1

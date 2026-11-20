@@ -46,6 +46,15 @@ import {
   tryParseJsonPayloadForScrape,
 } from './scrape';
 import { sanitizeFtsQuery, type ArtifactRetention, type OptionalStorageBindings } from './storage';
+import {
+  classifyContentState,
+  classifyWafAndChallenge,
+  isEligibleForWaybackFallback,
+  recoverSsrHydrationContent,
+  tryFetchWaybackSnapshot,
+  type ContentState,
+  type WafClassification,
+} from './waf';
 
 export const DEFAULT_CHUNK_CHARS = 1_500;
 export const DEFAULT_CHUNK_OVERLAP = 150;
@@ -856,6 +865,7 @@ export interface ExtractRequestPayload {
   chunksPerSource?: unknown;
   maxAgeMs?: unknown;
   redactPii?: unknown;
+  waybackFallback?: unknown;
   collectionId?: unknown;
   ephemeral?: boolean;
   target?: unknown;
@@ -921,6 +931,7 @@ export async function executeExtractCall(params: {
   const maxAgeMs =
     typeof payload.maxAgeMs === 'number' && Number.isFinite(payload.maxAgeMs) ? Math.max(0, Math.floor(payload.maxAgeMs)) : 0;
   const redactPii = Boolean(payload.redactPii);
+  const waybackFallback = Boolean(payload.waybackFallback);
   const collectionId =
     typeof payload.collectionId === 'string' && COLLECTION_ID_RE.test(payload.collectionId.trim())
       ? payload.collectionId.trim()
@@ -945,12 +956,16 @@ export async function executeExtractCall(params: {
       title?: string;
       markdown?: string;
       jobPosting?: StructuredJobPosting;
-      contentSource?: 'meta-description';
+      contentState?: ContentState;
+      contentSource?: 'meta-description' | 'ssr-hydration' | 'wayback';
+      waybackSnapshotUrl?: string;
+      waybackTimestamp?: string;
       renderedVia?: 'browser' | 'browser-auto';
       preChunkedRecords?: MarkdownChunk[];
       recordCount?: number;
       totalRecords?: number;
       failedReason?: string;
+      waf?: WafClassification;
       blocked?: BlockedSuggestion;
     }
   >();
@@ -1117,12 +1132,53 @@ export async function executeExtractCall(params: {
       let r = resMap.get(`ext-${item.idx + 1}`);
       if (!r || r.outcome !== 'ok') {
         const prob = typeof r?.problem === 'string' && r.problem ? r.problem : String(r?.outcome ?? 'error');
-        const blocked = buildBlockedInfo(item.url, r?.outcome, prob, r?.status);
+        const rawErrBody = typeof r?.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
+        const errWaf =
+          (r?.waf && typeof r.waf === 'object' ? (r.waf as WafClassification) : null) ??
+          classifyWafAndChallenge({ status: typeof r?.status === 'number' ? r.status : 0, rawBody: rawErrBody });
+
+        if (
+          waybackFallback &&
+          isEligibleForWaybackFallback({
+            outcome: r?.outcome,
+            status: r?.status,
+            problem: prob,
+            waf: errWaf,
+          })
+        ) {
+          const wb = await tryFetchWaybackSnapshot({
+            url: item.url,
+            target,
+            site,
+            source,
+            executeHubFetch,
+          });
+          if (wb) {
+            const wbExt = extractHtmlDocument(wb.rawBody, { baseUrl: item.url, onlyMainContent: true, redactPii });
+            const wbMd = (wbExt.markdown.trim() || wb.rawBody.trim());
+            byUrl.set(item.url, {
+              url: item.url,
+              finalUrl: item.url,
+              status: 200,
+              cached: false,
+              ...(wbExt.title ? { title: wbExt.title } : {}),
+              contentSource: 'wayback',
+              waybackSnapshotUrl: wb.snapshotUrl,
+              waybackTimestamp: wb.timestamp,
+              markdown: redactPii ? redactPiiText(wbMd) : wbMd,
+            });
+            continue;
+          }
+        }
+
+        const effectiveProb = errWaf ? errWaf.summary : prob;
+        const blocked = buildBlockedInfo(item.url, errWaf ? 'challenge' : r?.outcome, effectiveProb, r?.status);
         byUrl.set(item.url, {
           url: item.url,
           status: typeof r?.status === 'number' ? r.status : 0,
           cached: false,
-          failedReason: prob,
+          failedReason: effectiveProb,
+          ...(errWaf ? { waf: errWaf } : {}),
           ...(blocked ? { blocked } : {}),
         });
         continue;
@@ -1132,6 +1188,23 @@ export async function executeExtractCall(params: {
       let finalUrl = typeof r.finalUrl === 'string' && r.finalUrl ? r.finalUrl : item.url;
       let renderedVia: 'browser' | 'browser-auto' | undefined =
         explicitRenderMode === 'always' ? 'browser' : r.rendered === true ? 'browser-auto' : undefined;
+
+      // R2 & R3: Guard against HTTP 200 WAF/CAPTCHA interstitials with all 4 anti-false-positive layers!
+      const okWaf =
+        (r.waf && typeof r.waf === 'object' ? (r.waf as WafClassification) : null) ??
+        (rawBodyStr ? classifyWafAndChallenge({ status: typeof r.status === 'number' ? r.status : 200, rawBody: rawBodyStr }) : null);
+      if (okWaf) {
+        const blocked = buildBlockedInfo(finalUrl, 'challenge', okWaf.summary, r.status);
+        byUrl.set(item.url, {
+          url: item.url,
+          status: typeof r.status === 'number' ? r.status : 200,
+          cached: false,
+          failedReason: okWaf.summary,
+          waf: okWaf,
+          ...(blocked ? { blocked } : {}),
+        });
+        continue;
+      }
 
       // Handle ATS pre-fetch adapter response (`P1` Ashby, `P2` Workday CXS, Greenhouse, Lever)
       const atsSpec = atsByIdx.get(item.idx);
@@ -1332,7 +1405,7 @@ export async function executeExtractCall(params: {
       let md: string;
       let title: string | undefined;
       let jobPosting: StructuredJobPosting | undefined;
-      let contentSource: 'meta-description' | undefined;
+      let contentSource: 'meta-description' | 'ssr-hydration' | undefined;
 
       if (isVcard) {
         const vc = formatVcardToMarkdown(rawBodyStr);
@@ -1345,9 +1418,19 @@ export async function executeExtractCall(params: {
       } else {
         let extracted = isHtml ? extractHtmlDocument(rawBodyStr, { baseUrl: finalUrl, onlyMainContent: true, redactPii }) : undefined;
 
+        // R6: SSR Hydration State Recovery (`__NEXT_DATA__`, Remix, Apollo) before falling back to Chromium!
+        const ssrHydrated =
+          isHtml && !isPdf && countExtractWords(extracted?.markdown ?? '') < 80
+            ? recoverSsrHydrationContent(rawBodyStr, finalUrl, htmlFragToMd)
+            : null;
+        if (ssrHydrated && countExtractWords(ssrHydrated.markdown) > countExtractWords(extracted?.markdown ?? '') * 2) {
+          contentSource = 'ssr-hydration';
+        }
+
         // P3: Automatic browser switch on thin / filter-only scripted HTML pages (`renderedVia: "browser-auto"`).
         if (
           isHtml &&
+          !contentSource &&
           effectiveRenderMode === 'auto' &&
           r.rendered !== true &&
           target !== 'container' &&
@@ -1404,6 +1487,7 @@ export async function executeExtractCall(params: {
         if (jp) jobPosting = jp;
 
         const rawCandidateMd =
+          (contentSource === 'ssr-hydration' && ssrHydrated ? ssrHydrated.markdown : undefined) ||
           (isHtml ? extracted?.markdown : undefined) ||
           (typeof r.markdown === 'string' && r.markdown ? r.markdown : '') ||
           extracted?.markdown ||
@@ -1418,6 +1502,7 @@ export async function executeExtractCall(params: {
         }
         md = cleaned.trim();
         title =
+          (contentSource === 'ssr-hydration' ? ssrHydrated?.title : undefined) ||
           extracted?.title ||
           stripped.title ||
           (typeof r.title === 'string' && r.title ? decodeHtmlEntities(r.title) : undefined) ||
@@ -1443,6 +1528,15 @@ export async function executeExtractCall(params: {
         }
       }
 
+      const stateRes = classifyContentState({
+        status: typeof r.status === 'number' ? r.status : 200,
+        title,
+        markdown: md,
+        ...(isHtml ? { rawHtml: rawBodyStr } : {}),
+        ...(jobPosting?.validThrough ? { validThrough: jobPosting.validThrough } : {}),
+        nowMs: now,
+      });
+
       byUrl.set(item.url, {
         url: item.url,
         finalUrl,
@@ -1451,6 +1545,7 @@ export async function executeExtractCall(params: {
         cached: false,
         ...(title ? { title } : {}),
         ...(jobPosting ? { jobPosting } : {}),
+        contentState: stateRes.state,
         ...(contentSource ? { contentSource } : {}),
         ...(renderedVia ? { renderedVia } : {}),
         markdown: md,
@@ -1467,6 +1562,7 @@ export async function executeExtractCall(params: {
         url: u,
         status: entry?.status ?? 0,
         error: entry?.failedReason ?? 'not_fetched',
+        ...(entry?.waf ? { waf: entry.waf } : {}),
         ...(entry?.blocked ? { blocked: entry.blocked } : {}),
       });
       continue;
@@ -1482,7 +1578,9 @@ export async function executeExtractCall(params: {
       status: entry.status,
       cached: entry.cached,
       ...(entry.title ? { title: entry.title } : {}),
+      ...(entry.contentState ? { contentState: entry.contentState } : {}),
       ...(entry.contentSource ? { contentSource: entry.contentSource } : {}),
+      ...(entry.waybackSnapshotUrl ? { waybackSnapshotUrl: entry.waybackSnapshotUrl, waybackTimestamp: entry.waybackTimestamp } : {}),
       ...(entry.renderedVia ? { renderedVia: entry.renderedVia } : {}),
       ...(entry.jobPosting ? { jobPosting: entry.jobPosting } : {}),
       ...(entry.recordCount !== undefined ? { recordCount: entry.recordCount, totalRecords: entry.totalRecords } : {}),

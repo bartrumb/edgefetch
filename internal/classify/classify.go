@@ -41,8 +41,8 @@ const (
 // Note that Go `switch` cases do NOT fall through unless `fallthrough` is written explicitly, and multiple values
 // can share one `case 403, 429, 503:` branch cleanly.
 func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, string) {
-	if header.Get("cf-mitigated") != "" {
-		return OutcomeChallenge, "Cloudflare challenge (cf-mitigated)"
+	if waf := ClassifyWAF(status, header, body); waf != nil {
+		return OutcomeChallenge, waf.Summary
 	}
 	ok := status >= 200 && status <= 299
 

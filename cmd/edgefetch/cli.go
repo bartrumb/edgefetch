@@ -16,12 +16,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/agent"
-	"github.com/bartrumb/edgefetch/internal/browser"
-	"github.com/bartrumb/edgefetch/internal/classify"
-	"github.com/bartrumb/edgefetch/internal/crawl"
-	"github.com/bartrumb/edgefetch/internal/extract"
-	"github.com/bartrumb/edgefetch/internal/politeness"
+	"github.com/bartrumb/edgefetch/v2/internal/agent"
+	"github.com/bartrumb/edgefetch/v2/internal/botauth"
+	"github.com/bartrumb/edgefetch/v2/internal/browser"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 type cliDeps struct {
@@ -42,6 +43,7 @@ func isOneShotCLI(args []string) bool {
 		"mcp",
 		"install-mcp",
 		"install-service",
+		"keygen-bot-auth",
 		"desktop",
 		"help", "--help", "-h":
 		return true
@@ -80,6 +82,8 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 		return runInstallMCP(args[1:], stdout, stderr)
 	case "install-service":
 		return runInstallService(args[1:], stdout, stderr)
+	case "keygen-bot-auth":
+		return runKeygenBotAuth(args[1:], stdout, stderr)
 	case "desktop":
 		return runDesktopMode(ctx, args[1:], stdout, stderr)
 	default:
@@ -424,5 +428,24 @@ func runScrapeCLI(ctx context.Context, args []string, stdout, stderr io.Writer, 
 		out = res.Body
 	}
 	_, _ = fmt.Fprintln(stdout, strings.TrimSpace(out))
+	return 0
+}
+
+func runKeygenBotAuth(args []string, stdout, stderr io.Writer) int {
+	kp, err := botauth.GenerateKeyPair()
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "keygen-bot-auth failed: %v\n", err)
+		return 1
+	}
+	if hasFlag(args, "--json") {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(kp)
+		return 0
+	}
+	_, _ = fmt.Fprintf(stdout, "# RFC 9421 Web Bot Auth (Ed25519) Keypair\n")
+	_, _ = fmt.Fprintf(stdout, "EDGEFETCH_BOT_SIGNING_KEY=%s\n", kp.PrivateKeySeedB64URL)
+	_, _ = fmt.Fprintf(stdout, "BOT_SIGNING_PUBLIC_KEY=%s\n", kp.PublicKeyB64URL)
+	_, _ = fmt.Fprintf(stdout, "BOT_KEY_ID=%s\n", kp.KeyID)
 	return 0
 }

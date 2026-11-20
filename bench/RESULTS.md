@@ -1,4 +1,4 @@
-# EdgeFetch Extraction & Token-Efficiency Benchmark (`SCRAPE_PIPELINE_VERSION = 21`)
+# EdgeFetch Extraction & Token-Efficiency Benchmark (`SCRAPE_PIPELINE_VERSION = 22`)
 
 Reproduce locally in <2 seconds with zero external network calls:
 
@@ -6,9 +6,11 @@ Reproduce locally in <2 seconds with zero external network calls:
 node bench/run-bench.mjs
 ```
 
-## Corpus Results (8 Multi-Platform Developer Fixtures × 50 Iterations)
+## Synthetic Regression Corpus Results (8 Multi-Platform Developer Fixtures × 50 Iterations)
 
-| Fixture | Raw Input Tokens | Naive Tag-Strip Tokens | **EdgeFetch `v21` Tokens** | **LLM Token Reduction** | Fidelity & Boilerplate Gate |
+> **Scope note:** These fixtures are deterministic offline synthetic pages modeled on real developer/documentation DOM layouts so CI can gate extraction fidelity and boilerplate stripping in <2 seconds with zero network flakiness.
+
+| Fixture | Raw Input Tokens | Naive Tag-Strip Tokens | **EdgeFetch `v22` Tokens** | **LLM Token Reduction** | Fidelity & Boilerplate Gate |
 |---|---:|---:|---:|---:|:---:|
 | Stack Overflow Q&A (Accepted Answer + Generics) | 2,283 | 1,314 | **135** | **-94.1%** | PASS |
 | VitePress / MDX Docs (Callouts + GFM Table + Mega-Menu) | 2,172 | 1,230 | **83** | **-96.2%** | PASS |

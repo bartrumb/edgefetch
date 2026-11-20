@@ -10,6 +10,7 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { deriveMarkdownDocument, SCRAPE_PIPELINE_VERSION } from './scrape';
 import { COLLECTION_ID_RE, D1FtsSearchIndex } from './search-index';
+import { classifyContentState } from './waf';
 import {
   MAX_ARTIFACT_CONTENT_BYTES,
   isValidRetention,
@@ -765,21 +766,25 @@ export async function executeIngestPipeline(
                   if (mdObj) mdText = await mdObj.text();
                 }
                 if (mdText !== undefined) {
-                  for (const pg of pagesForSha) {
-                    const idxRes = await searchIndex.replacePageChunks({
-                      collectionId: activeCollection!,
-                      documentId: deriveRes.documentId,
-                      pageId: pg.pageId,
-                      url: pg.url,
-                      title: deriveRes.title ?? '',
-                      markdown: mdText,
-                      fetchedAt: pg.fetchedAt,
-                    });
-                    if (idxRes.status === 'indexed') {
-                      bIndexed++;
-                    } else if (idxRes.status === 'capacity_reached') {
-                      bCapStopped++;
-                      break;
+                  // R4: Never pollute SEARCH D1 FTS5 collections with soft-404 ("Page Not Found") or sign-in login-wall pages!
+                  const stateCheck = classifyContentState({ status: 200, title: deriveRes.title ?? '', markdown: mdText });
+                  if (stateCheck.state !== 'soft_404' && stateCheck.state !== 'login_wall') {
+                    for (const pg of pagesForSha) {
+                      const idxRes = await searchIndex.replacePageChunks({
+                        collectionId: activeCollection!,
+                        documentId: deriveRes.documentId,
+                        pageId: pg.pageId,
+                        url: pg.url,
+                        title: deriveRes.title ?? '',
+                        markdown: mdText,
+                        fetchedAt: pg.fetchedAt,
+                      });
+                      if (idxRes.status === 'indexed') {
+                        bIndexed++;
+                      } else if (idxRes.status === 'capacity_reached') {
+                        bCapStopped++;
+                        break;
+                      }
                     }
                   }
                 }

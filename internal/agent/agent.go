@@ -19,14 +19,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/classify"
-	"github.com/bartrumb/edgefetch/internal/crawl"
-	"github.com/bartrumb/edgefetch/internal/ws"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/ws"
 )
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
-// Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/internal/agent.Version=...".
-var Version = "2.3.0"
+// Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/v2/internal/agent.Version=...".
+var Version = "2.4.0"
 
 const (
 	DefaultPingInterval          = 30 * time.Second

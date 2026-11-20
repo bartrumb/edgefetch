@@ -1,12 +1,12 @@
 # EdgeFetch vs. Other AI Web Crawlers & MCP Servers
 
-This document compares **EdgeFetch (`v2.1`)** against the leading open-source and commercial web-data stacks for AI agents across architecture, operational footprint, security, extraction fidelity, observability, and cost.
+This document compares **EdgeFetch (`v2.4`)** against the leading open-source and commercial web-data stacks for AI agents across architecture, operational footprint, security, extraction fidelity, observability, and cost.
 
 ---
 
 ## 1. Executive Architecture Face-Off
 
-| Capability / Architecture | **EdgeFetch (`v2.1`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader (`reader`)** | **Defuddle / Trafilatura** |
+| Capability / Architecture | **EdgeFetch (`v2.4`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader (`reader`)** | **Defuddle / Trafilatura** |
 |---|---|---|---|---|---|---|
 | **License** | **MIT** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 | MIT / Apache-2.0 |
 | **Minimum Self-Hosted Stack** | **1 ~8 MB static Go binary** *or* **1 container** (`node:sqlite` + `/data`, **0 Redis, 0 Postgres**) | Docker Compose + **Redis + PostgreSQL + RabbitMQ + Playwright + API** (`~2–4 GB+` RAM) | Cloud API key only | Python 3.10+ + Playwright (`~600 MB–1.5 GB` RAM) | Node.js + Puppeteer / Firebase deps | Library / CLI only (no crawler fleet or MCP server) |
@@ -26,7 +26,7 @@ This document compares **EdgeFetch (`v2.1`)** against the leading open-source an
 
 ## 2. Extraction & Search Feature Matrix
 
-| Content / RAG Capability | **EdgeFetch (`v2.1`)** | **Firecrawl** | **Crawl4AI** | **Jina Reader** | **Tavily** |
+| Content / RAG Capability | **EdgeFetch (`v2.4`)** | **Firecrawl** | **Crawl4AI** | **Jina Reader** | **Tavily** |
 |---|:---:|:---:|:---:|:---:|:---:|
 | **Sentinel-Protected `<pre><code>` & Generic `<T>` Preservation (`Promise<void>`)** | **Yes** | Yes | Partial | Yes | Partial |
 | **`/llms.txt` Discovery + `Accept: text/markdown` 1-Hop Upgrade** | **Yes (automatic)** | Partial | Partial | No | No |
@@ -36,8 +36,8 @@ This document compares **EdgeFetch (`v2.1`)** against the leading open-source an
 | **Large Streaming PDFs (up to 256 MiB disk-streamed Poppler + pure-Go fallback + optional OCR)** | **Yes (256 MiB)** | Yes (credit-tiered per page) | Basic Python PDF | Partial | Partial |
 | **YouTube Clean Transcript Extraction (`interact` without timestamp spam)** | **Yes** | Yes (`scrape`) | Custom script | Partial | No |
 | **CSV/TSV Tables, RSS/Atom Feeds, iCal (`.ics`), vCard (`.vcf`), Git `.patch` Diffs** | **Yes (all 5)** | Partial | Partial | Partial | No |
-| **Site-Specific Adapters (GitHub Issues/PRs/Commits, npm Registry Fallback, ArXiv, HN, Substack, Sphinx)** | **Yes** | Partial | Custom | Partial | Partial |
-| **Multi-Provider Search Fusion (`Serper` + `Brave` + `Tavily` + `SearXNG` + `edge-map` + Private SQLite/D1 FTS5 via RRF)** | **Yes (with foreign locale mirror dedup)** | Proprietary / SearXNG | Bring-your-own | `s.jina.ai` | Proprietary index |
+| **Site-Specific & ATS Job Adapters (Greenhouse, Ashby, Lever, Workday CXS, `JobPosting` JSON-LD, GitHub, npm, ArXiv, HN)** | **Yes (25+ built-in)** | Partial | Custom | Partial | Partial |
+| **Multi-Provider Search (`Serper` / `Brave` / `Tavily` BYOK + `$0` `SearXNG` + `edge-map` + Private SQLite/D1 FTS5)** | **Yes (bring your own keys; SearXNG & `edge-map` for `$0`)** | Proprietary / SearXNG | Bring-your-own | `s.jina.ai` | Proprietary index |
 | **Content-Addressed Artifact Store (`SHA-256` gzip in R2 / disk + `read_artifact` offset paging)** | **Yes (zero 64 KB truncation loss)** | Workspace / S3 | Local cache | Ephemeral | Ephemeral |
 
 ---
@@ -54,7 +54,7 @@ Most self-hosted crawlers force an unpleasant trade-off:
 ### 2. `~8 MB` Single-Dependency Go Binary vs. Heavy Multi-Service Stacks
 Self-hosting Firecrawl requires running and patching **Redis**, **PostgreSQL**, **RabbitMQ**, **Playwright**, and a **Node.js API** under **AGPL-3.0**.
 - EdgeFetch's worker and Go Hub compile to a **single ~8 MB static binary** (`CGO_ENABLED=0`) with **1 external Go module (`github.com/coder/websocket`) and 0 transitive dependencies**.
-- Even EdgeFetch's full **All-in-One Container** (`Dockerfile.all-in-one` — TypeScript Hub + `/admin` UI + OAuth 2.1 + 11-tool `/mcp` + `node:sqlite` FTS5 + Go HTTP/2 + Headless Chromium + Poppler PDF) runs in **one container with a `/data` volume** — zero Redis, zero Postgres, zero message broker.
+- Even EdgeFetch's full **All-in-One Container** (`Dockerfile.all-in-one` — TypeScript Hub + `/admin` UI + OAuth 2.1 + 12-tool `/mcp` + `node:sqlite` FTS5 + Go HTTP/2 + Headless Chromium + Poppler PDF) runs in **one container with a `/data` volume** — zero Redis, zero Postgres, zero message broker.
 - On Windows and macOS desktops, `edgefetch mcp` and `edgefetch desktop` piggyback your **already-installed Microsoft Edge, Chrome, or Brave** binary for headless CDP rendering — delivering full JS rendering in an **8 MB download** instead of a 300+ MB Playwright bundle.
 
 ### 3. Defense-in-Depth SSRF & Sandbox Hardening
@@ -69,10 +69,12 @@ When an AI agent scrape is slow, other crawlers give you an opaque `duration: 42
 
 | Stack | Monthly Infrastructure / API Cost | Notes |
 |---|---:|---|
-| **EdgeFetch on Cloudflare Workers + 1–3 Home Assistant / Homelab Nodes + Serper/Brave Free Tiers** | **`$0 – $5 / mo`** | Hibernating DO sleeps at `$0` idle; R2 10 GB free; D1 5 GB free; Serper includes 2,500 free queries + SearXNG is `$0` |
+| **EdgeFetch on Cloudflare Workers + 1–3 Home Assistant / Homelab Nodes + Self-Hosted SearXNG (or BYOK Free Tiers)** | **`$0 – $5 / mo`** | Hibernating DO sleeps at `$0` idle (`$0` Workers Free or `$5/mo` Workers Paid); R2 10 GB free; D1 5 GB free; SearXNG is `$0` (or bring your own Serper/Brave/Tavily API keys) |
 | **EdgeFetch All-in-One Container (Fly.io / Hetzner / Railway)** | **`$4 – $7 / mo`** | Single 512 MB–1 GB container + persistent `/data` volume |
 | **Self-Hosted Firecrawl (4 GB+ VPS + Residential Proxy Bandwidth)** | **`$25 – $80+ / mo`** | Multi-container RAM footprint + commercial proxy GB fees |
 | **Firecrawl Cloud + Tavily Cloud SaaS** | **`$49 – $130+ / mo`** | Separate monthly credit plans for scraping/crawling and search |
+
+*Cost assumptions checked November 20, 2026: compares self-hosted EdgeFetch running on Cloudflare Workers Free (`$0`) or Workers Paid (`$5/mo`) within R2 (`10 GB`) and D1 (`5 GB`) monthly free tiers plus self-hosted SearXNG (`$0`, excluding hardware/ISP electricity you already run at home) against published monthly pricing for Firecrawl Standard (`$19–$99/mo` for 3k–100k credits) plus Tavily Researcher (`$30+/mo` beyond the 1,000-credit free tier).*
 
 ---
 

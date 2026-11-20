@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bartrumb/edgefetch/internal/politeness"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 // SSRFProxy is a loopback-only HTTP CONNECT tunnel (`127.0.0.1:0`) paired with Chromium's

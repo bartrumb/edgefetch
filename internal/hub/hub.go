@@ -26,10 +26,10 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/bartrumb/edgefetch/internal/agent"
-	"github.com/bartrumb/edgefetch/internal/classify"
-	"github.com/bartrumb/edgefetch/internal/crawl"
-	"github.com/bartrumb/edgefetch/internal/otel"
+	"github.com/bartrumb/edgefetch/v2/internal/agent"
+	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 )
 
 const (

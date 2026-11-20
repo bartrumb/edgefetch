@@ -31,8 +31,17 @@ import {
   type ArtifactRetention,
   type OptionalStorageBindings,
 } from './storage';
+import {
+  classifyContentState,
+  classifyWafAndChallenge,
+  isEligibleForWaybackFallback,
+  recoverSsrHydrationContent,
+  tryFetchWaybackSnapshot,
+  type ContentState,
+  type WafClassification,
+} from './waf';
 
-export const SCRAPE_PIPELINE_VERSION = 21;
+export const SCRAPE_PIPELINE_VERSION = 22;
 
 export interface ScrapedImage {
   url: string;
@@ -2941,6 +2950,88 @@ export async function lookupCachedScrape(params: {
   };
 }
 
+/**
+ * `R5`: Looks up stored `etag` / `last_modified` + verified derived Markdown in `META` D1 + `ARTIFACTS` R2 when
+ * `maxAgeMs` has expired (or `maxAgeMs === 0`), enabling `If-None-Match` / `If-Modified-Since` -> `304 Not Modified`
+ * millisecond revalidation without re-downloading or re-chunking unchanged pages.
+ */
+export async function lookupRevalidationCandidate(params: {
+  bucket: R2Bucket;
+  metaDb: D1Database;
+  url: string;
+  pipelineVersion?: number;
+}): Promise<{
+  etag?: string;
+  lastModified?: string;
+  markdown: string;
+  contentSha256: string;
+  documentId: string;
+  pipelineVersion: number;
+  title?: string;
+  language?: string;
+} | null> {
+  const { bucket, metaDb, url, pipelineVersion = SCRAPE_PIPELINE_VERSION } = params;
+  const pageRow = await metaDb
+    .prepare(
+      `SELECT latest_outcome, latest_content_sha256, etag, last_modified
+       FROM pages
+       WHERE url = ?
+       LIMIT 1`,
+    )
+    .bind(url)
+    .first<{
+      latest_outcome: string | null;
+      latest_content_sha256: string | null;
+      etag: string | null;
+      last_modified: string | null;
+    }>();
+
+  if (
+    !pageRow ||
+    pageRow.latest_outcome !== 'ok' ||
+    !pageRow.latest_content_sha256 ||
+    (!pageRow.etag && !pageRow.last_modified)
+  ) {
+    return null;
+  }
+
+  const [verified, docRow] = await Promise.all([
+    isContentVerifiedInMetaD1(metaDb, pageRow.latest_content_sha256),
+    metaDb
+      .prepare(
+        `SELECT id, r2_key, title, language
+         FROM documents
+         WHERE content_sha256 = ? AND format = 'markdown' AND pipeline_version = ?
+         LIMIT 1`,
+      )
+      .bind(pageRow.latest_content_sha256, pipelineVersion)
+      .first<{ id: string; r2_key: string; title: string | null; language: string | null }>(),
+  ]);
+  if (!verified || !docRow) return null;
+  const obj = await bucket.get(docRow.r2_key);
+  if (!obj) return null;
+  const markdown = await obj.text();
+
+  return {
+    ...(pageRow.etag ? { etag: pageRow.etag } : {}),
+    ...(pageRow.last_modified ? { lastModified: pageRow.last_modified } : {}),
+    markdown,
+    contentSha256: pageRow.latest_content_sha256,
+    documentId: docRow.id,
+    pipelineVersion,
+    ...(docRow.title ? { title: docRow.title } : {}),
+    ...(docRow.language ? { language: docRow.language } : {}),
+  };
+}
+
+export async function touchRevalidatedPage(metaDb: D1Database, url: string, now = Date.now()): Promise<void> {
+  await metaDb
+    .prepare('UPDATE pages SET last_fetched_at = ? WHERE url = ?')
+    .bind(now, url)
+    .run()
+    .catch(() => undefined);
+}
+
 export type ScrapeFormatInput =
   | 'markdown'
   | 'text'
@@ -2972,6 +3063,7 @@ export interface ScrapeRequestPayload {
   waitSelector?: unknown;
   maxPages?: unknown;
   ocr?: unknown;
+  waybackFallback?: unknown;
   collectionId?: unknown;
   target?: unknown;
   site?: unknown;
@@ -5048,6 +5140,23 @@ export async function executeScrapeCall(params: {
           : undefined;
   const effectiveRenderMode: 'always' | 'auto' | 'off' = renderMode ?? 'auto';
   const jsonFilterStr = typeof payload.jsonFilter === 'string' ? payload.jsonFilter.trim() : '';
+  const waybackFallback = Boolean(payload.waybackFallback);
+  const collectionId =
+    typeof payload.collectionId === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(payload.collectionId.trim())
+      ? payload.collectionId.trim()
+      : undefined;
+  const retentionMode: ArtifactRetention | undefined = env.ARTIFACTS && env.META ? 'stored' : env.ARTIFACTS ? 'transient' : undefined;
+
+  // R5: Look up stored ETag / Last-Modified validators in META D1 when a verified derived document already exists (and caller isn't updating a collection).
+  const revalCandidate =
+    !needsLiveHtml && ocrMode !== 'always' && renderMode !== 'always' && !collectionId && env.ARTIFACTS && env.META
+      ? await lookupRevalidationCandidate({
+          bucket: env.ARTIFACTS,
+          metaDb: env.META,
+          url: normalizedUrl,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        })
+      : null;
 
   const fetchCall = {
     maxSeconds: 110,
@@ -5067,6 +5176,8 @@ export async function executeScrapeCall(params: {
         onlyMainContent,
         discoverLlms: goDiscoverLlms,
         redactPii,
+        ...(revalCandidate?.etag ? { ifNoneMatch: revalCandidate.etag } : {}),
+        ...(revalCandidate?.lastModified ? { ifModifiedSince: revalCandidate.lastModified } : {}),
         ...(renderMode ? { renderMode } : {}),
         ...(typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
           ? { waitForMs: Math.min(15_000, Math.max(0, Math.floor(payload.waitForMs))) }
@@ -5081,12 +5192,6 @@ export async function executeScrapeCall(params: {
       },
     ],
   };
-
-  const collectionId =
-    typeof payload.collectionId === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(payload.collectionId.trim())
-      ? payload.collectionId.trim()
-      : undefined;
-  const retentionMode: ArtifactRetention | undefined = env.ARTIFACTS && env.META ? 'stored' : env.ARTIFACTS ? 'transient' : undefined;
 
   const htmlFragToMd = (frag: string, fragBase?: string) => {
     const sub = extractHtmlDocument(frag, {
@@ -5716,19 +5821,138 @@ export async function executeScrapeCall(params: {
       }
     }
     const problemText = String(item.problem ?? 'Origin scrape did not return HTTP 2xx');
-    const robotsHint = /robots\.txt disallowed/i.test(problemText) ? buildRobotsAlternativeHint(normalizedUrl) : undefined;
-    const blockedInfo = buildBlockedInfo(normalizedUrl, item.outcome, problemText, item.status);
+    const rawErrBody = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
+    const errWaf =
+      (item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
+      classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 0, rawBody: rawErrBody });
+
+    // R8: Opt-in Internet Archive (`Wayback CDX`) link-rot fallback — strictly ONLY on 5xx / DNS-dead failures, NEVER on robots/403/429/challenges!
+    if (
+      waybackFallback &&
+      isEligibleForWaybackFallback({
+        outcome: item.outcome,
+        status: item.status,
+        problem: problemText,
+        waf: errWaf,
+      })
+    ) {
+      const wb = await tryFetchWaybackSnapshot({
+        url: normalizedUrl,
+        target,
+        site,
+        source,
+        executeHubFetch,
+      });
+      if (wb) {
+        const wbDoc = extractHtmlDocument(wb.rawBody, {
+          baseUrl: normalizedUrl,
+          onlyMainContent,
+          redactPii,
+          includeImages,
+          ...(includeTags.length > 0 ? { includeTags } : {}),
+          ...(excludeTags.length > 0 ? { excludeTags } : {}),
+        });
+        const cleanWbMd = wbDoc.markdown.trim() || wb.rawBody.trim();
+        const wbFull = finalizeScrapedMarkdown(redactPii ? redactPiiText(cleanWbMd) : cleanWbMd, {
+          isPdf: false,
+          includeImages,
+          baseUrl: normalizedUrl,
+        });
+        const wbFocused = applyQueryFocus(wbFull.markdown);
+        const wbShaped =
+          wbFocused.queryFiltered || maxChars !== undefined
+            ? finalizeScrapedMarkdown(wbFocused.markdown, { isPdf: false, includeImages, maxChars, baseUrl: normalizedUrl })
+            : wbFull;
+        return {
+          status: 200,
+          via: wb.via,
+          body: {
+            ok: true,
+            cached: false,
+            pipelineVersion: SCRAPE_PIPELINE_VERSION,
+            url: normalizedUrl,
+            finalUrl: normalizedUrl,
+            status: 200,
+            via: wb.via,
+            contentSource: 'wayback',
+            waybackSnapshotUrl: wb.snapshotUrl,
+            waybackTimestamp: wb.timestamp,
+            ...(stringFormats.has('markdown') ? { markdown: wbShaped.markdown } : {}),
+            ...(stringFormats.has('text') ? { text: wbDoc.text || wbShaped.markdown } : {}),
+            ...(stringFormats.has('links') ? { links: wbDoc.links } : {}),
+            ...(wbFocused.queryFiltered ? { queryFiltered: true, chunks: wbFocused.chunks } : {}),
+            metadata: {
+              ...(wbDoc.title ? { title: wbDoc.title } : {}),
+              ...(wbDoc.description ? { description: wbDoc.description } : {}),
+              wordCount: countTextWords(wbFull.markdown),
+              contentType: wb.contentType,
+            },
+          },
+        };
+      }
+    }
+
+    const effectiveOutcome = errWaf ? 'challenge' : (item.outcome ?? 'error');
+    const effectiveProb = errWaf ? errWaf.summary : problemText;
+    const robotsHint = /robots\.txt disallowed/i.test(effectiveProb) ? buildRobotsAlternativeHint(normalizedUrl) : undefined;
+    const blockedInfo = buildBlockedInfo(normalizedUrl, effectiveOutcome, effectiveProb, item.status);
     return {
-      status: item.status === 429 ? 429 : item.outcome === 'challenge' ? 403 : 422,
+      status: item.status === 429 ? 429 : effectiveOutcome === 'challenge' ? 403 : 422,
       via: fetchResUsed.via,
       body: {
         ok: false,
         url: normalizedUrl,
-        outcome: item.outcome ?? 'error',
+        outcome: effectiveOutcome,
         status: item.status ?? 0,
-        problem: problemText,
+        problem: effectiveProb,
+        ...(errWaf ? { waf: errWaf } : {}),
         ...(robotsHint ? { hint: robotsHint } : {}),
         ...(blockedInfo ? { blocked: blockedInfo } : {}),
+      },
+    };
+  }
+
+  // R5: `304 Not Modified` conditional revalidation hit — refresh `pages.last_fetched_at` in META D1 and serve verified R2 Markdown!
+  if (item.status === 304 && revalCandidate && env.META) {
+    await touchRevalidatedPage(env.META, normalizedUrl, now);
+    const fullReval = finalizeScrapedMarkdown(
+      redactPii ? redactPiiText(revalCandidate.markdown) : revalCandidate.markdown,
+      { isPdf: isLikelyPdfUrl(normalizedUrl), includeImages },
+    ).markdown;
+    const revalFocused = applyQueryFocus(fullReval);
+    const revalShaped = finalizeScrapedMarkdown(revalFocused.markdown, { isPdf: false, includeImages, maxChars });
+    const revalTitle = revalCandidate.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullReval, normalizedUrl) : undefined);
+    return {
+      status: 200,
+      via: `${fetchResUsed.via}+cache:304`,
+      body: {
+        ok: true,
+        cached: true,
+        revalidated: true,
+        originStatus: 304,
+        pipelineVersion: revalCandidate.pipelineVersion,
+        documentId: revalCandidate.documentId,
+        contentSha256: revalCandidate.contentSha256,
+        url: normalizedUrl,
+        finalUrl: normalizedUrl,
+        status: 200,
+        via: `${fetchResUsed.via}+cache:304`,
+        ...(stringFormats.has('markdown') ? { markdown: revalShaped.markdown } : {}),
+        ...(stringFormats.has('text') ? { text: revalShaped.markdown } : {}),
+        ...(revalFocused.queryFiltered ? { queryFiltered: true, chunks: revalFocused.chunks } : {}),
+        ...(revalShaped.truncated
+          ? {
+              truncated: true,
+              totalChars: revalShaped.totalChars,
+              nextOffset: revalShaped.nextOffset ?? revalShaped.markdown.length,
+              markdownArtifactId: `md:${revalCandidate.contentSha256}`,
+            }
+          : {}),
+        metadata: {
+          ...(revalTitle ? { title: revalTitle } : {}),
+          ...(revalCandidate.language ? { language: revalCandidate.language } : {}),
+          lastFetchedAt: now,
+        },
       },
     };
   }
@@ -5737,6 +5961,30 @@ export async function executeScrapeCall(params: {
   let finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
   let renderedViaOut: 'browser' | 'browser-auto' | undefined =
     renderMode === 'always' ? 'browser' : item.rendered === true ? 'browser-auto' : undefined;
+
+  // R2 & R3: Guard against HTTP 200 WAF/CAPTCHA interstitials (e.g. Imperva / PerimeterX / DataDome 200 shells) using all 4 anti-FP layers!
+  const okWafMatch =
+    (item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
+    (!isPdfResponse && rawBodyStr
+      ? classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 200, rawBody: rawBodyStr })
+      : null);
+  if (okWafMatch) {
+    const blockedInfo = buildBlockedInfo(finalUrl, 'challenge', okWafMatch.summary, item.status);
+    return {
+      status: 403,
+      via: fetchResUsed.via,
+      body: {
+        ok: false,
+        url: normalizedUrl,
+        finalUrl,
+        outcome: 'challenge',
+        status: item.status ?? 200,
+        problem: okWafMatch.summary,
+        waf: okWafMatch,
+        ...(blockedInfo ? { blocked: blockedInfo } : {}),
+      },
+    };
+  }
 
   // P2: Workday `{"widget":"redirect","url":"/Workday","externalSpa":true}` stub rescue -> CXS API or browser follow.
   const wdStub = !isPdfResponse && rawBodyStr ? detectWorkdayRedirectStub(rawBodyStr, finalUrl) : null;
@@ -5891,9 +6139,20 @@ export async function executeScrapeCall(params: {
       })
     : undefined;
 
-  // P3: Automatic browser switch when a `<script>`-bearing HTML page yields < 80 words or > 60% nav/filter-only lines.
+  // R6: SSR Hydration State Recovery (`__NEXT_DATA__`, Remix, Apollo) — extract full structured content directly from
+  // the embedded hydration JSON on thin `<script>` pages BEFORE paying headless Chromium latency!
+  let ssrHydrated: { title?: string; description?: string; markdown: string; framework: string } | null = null;
+  if (isHtmlBody && !isPdfResponse && countTextWords(extracted?.markdown ?? '') < 80) {
+    const candidateHydration = recoverSsrHydrationContent(rawBodyStr, finalUrl, htmlFragToMd);
+    if (candidateHydration && countTextWords(candidateHydration.markdown) > countTextWords(extracted?.markdown ?? '') * 2) {
+      ssrHydrated = candidateHydration;
+    }
+  }
+
+  // P3: Automatic browser switch when a `<script>`-bearing HTML page yields < 80 words or > 60% nav/filter-only lines (and SSR hydration didn't already recover full prose).
   if (
     isHtmlBody &&
+    !ssrHydrated &&
     effectiveRenderMode === 'auto' &&
     item.rendered !== true &&
     target !== 'container' &&
@@ -6136,6 +6395,7 @@ export async function executeScrapeCall(params: {
 
   let markdown =
     alternateMarkdownBody ||
+    ssrHydrated?.markdown ||
     structuredTextFormatted?.markdown ||
     (isHtmlBody ? extracted?.markdown : undefined) ||
     (typeof item.markdown === 'string' && item.markdown) ||
@@ -6152,6 +6412,7 @@ export async function executeScrapeCall(params: {
   }
   let textOut =
     alternateMarkdownBody ||
+    ssrHydrated?.markdown ||
     feedFormatted?.markdown ||
     vcardFormatted?.markdown ||
     icsFormatted?.markdown ||
@@ -6164,7 +6425,7 @@ export async function executeScrapeCall(params: {
   let viaOut = fetchResUsed.via;
   let pdfEngineOut = typeof item.pdfEngine === 'string' ? item.pdfEngine : undefined;
   let ocrReportOut: PdfOcrContainerReply['ocr'] | undefined;
-  let contentSourceOut: 'meta-description' | undefined;
+  let contentSourceOut: 'meta-description' | 'ssr-hydration' | undefined = ssrHydrated ? 'ssr-hydration' : undefined;
 
   // Automatic PDF OCR fallback when Poppler `pdftotext` returns empty / scanned-image output (<100 non-whitespace chars).
   if (ocrMode === 'auto' && hasPdfOcr && isPdfResponse && markdown.replace(/\s+/g, '').length < 100) {
@@ -6323,6 +6584,7 @@ export async function executeScrapeCall(params: {
         : (mdAssets?.images ?? extracted?.images ?? []);
 
   const resolvedTitle =
+    ssrHydrated?.title ||
     extracted?.title ||
     structuredTextFormatted?.title ||
     fullShaped.frontmatterTitle ||
@@ -6333,11 +6595,22 @@ export async function executeScrapeCall(params: {
       : undefined) ||
     (isPdfResponse ? extractPdfTitle(rawCleanMarkdown, finalUrl) : undefined);
   const resolvedDescription =
+    ssrHydrated?.description ||
     extracted?.description ||
     (structuredTextFormatted as { description?: string } | null)?.description ||
     fullShaped.frontmatterDescription ||
     mdAssets?.description ||
     (typeof item.description === 'string' && item.description ? decodeHtmlEntities(item.description) : undefined);
+
+  // R4: Classify `contentState` ("active" | "closed_posting" | "soft_404" | "login_wall") with anti-false-positive vetoes!
+  const contentStateCheck: { state: ContentState; reason?: string } = classifyContentState({
+    status: typeof item.status === 'number' ? item.status : 200,
+    title: resolvedTitle,
+    markdown: rawCleanMarkdown,
+    ...(isHtmlBody ? { rawHtml: rawBodyStr } : {}),
+    ...(htmlJobPosting?.validThrough ? { validThrough: htmlJobPosting.validThrough } : {}),
+    nowMs: now,
+  });
 
   const docForJson: ExtractedDocument | undefined = jsonSchemaSpec
     ? {
@@ -6406,6 +6679,8 @@ export async function executeScrapeCall(params: {
     ...(redirectAnalysis.redirected ? redirectAnalysis : {}),
     status: item.status ?? 200,
     via: viaOut,
+    contentState: contentStateCheck.state,
+    ...(contentStateCheck.reason ? { contentStateReason: contentStateCheck.reason } : {}),
     ...(contentSourceOut ? { contentSource: contentSourceOut } : {}),
     ...(renderedViaOut ? { renderedVia: renderedViaOut } : {}),
     ...(htmlJobPosting ? { jobPosting: htmlJobPosting } : {}),

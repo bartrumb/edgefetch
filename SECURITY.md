@@ -63,4 +63,4 @@ Even if a caller token were compromised, an agent cannot be used to probe local 
 
 ## Reporting a Vulnerability
 
-Please report security issues privately via [GitHub Security Advisories](https://github.com/bartrumb/edgefetch/security/advisories/new) rather than opening a public issue.
+Please report security issues privately via [GitHub Security Advisories](https://github.com/bartrumb/edgefetch/security/advisories/new) rather than opening a public issue. Reports are acknowledged within 7 days.

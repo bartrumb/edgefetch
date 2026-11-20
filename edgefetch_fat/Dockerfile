@@ -17,7 +17,8 @@ FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5
 LABEL org.opencontainers.image.title="EdgeFetch" \
       org.opencontainers.image.description="Outbound-only Go HTTP/2 + SSRF-proxied Headless Chromium + Poppler PDF worker for Cloudflare Hibernating WebSockets" \
       org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"
 
 RUN apk add --no-cache \
       ca-certificates \

@@ -28,7 +28,8 @@ FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea
 LABEL org.opencontainers.image.title="EdgeFetch All-in-One" \
       org.opencontainers.image.description="Self-hosted EdgeFetch Hub + Go HTTP/2 + Headless Chromium + SQLite FTS5 in one container" \
       org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"
 
 RUN apk add --no-cache \
       ca-certificates \

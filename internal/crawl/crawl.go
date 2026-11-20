@@ -1025,15 +1025,12 @@ func redactURLForLog(raw string) string {
 	return u.String()
 }
 
-func resolveMaxStreamingPDFBytes(opts Options) int {
+func resolveMaxStreamingPDFBytes(_ Options) int {
 	limit := MaxStreamingPDFBytes
 	if envRaw := strings.TrimSpace(os.Getenv("EDGEFETCH_MAX_PDF_BYTES")); envRaw != "" {
-		if n, err := strconv.Atoi(envRaw); err == nil && n >= 64*1024 && n <= 256<<20 {
+		if n, err := strconv.Atoi(envRaw); err == nil && n >= 1024 && n <= 256<<20 {
 			limit = n
 		}
-	}
-	if opts.MaxBytes > 0 && opts.MaxBytes < DefaultMaxBytes && opts.MaxBytes < limit {
-		limit = opts.MaxBytes
 	}
 	return limit
 }

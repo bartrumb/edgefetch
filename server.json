@@ -1,7 +1,9 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.bartrumb/edgefetch",
-  "description": "Self-hosted scrape, map, crawl, extract, interact, search, and autonomous BYO-LLM agent MCP server (stdio & OAuth 2.1 HTTP).",
+  "title": "EdgeFetch",
+  "description": "Self-hosted web scraping, search, and BYO-LLM research MCP server in one Go binary.",
+  "websiteUrl": "https://edgefetch.dev",
   "repository": {
     "url": "https://github.com/bartrumb/edgefetch",
     "source": "github"
@@ -10,7 +12,8 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/bartrumb/edgefetch-agent:latest",
+      "identifier": "ghcr.io/bartrumb/edgefetch-agent:2.5.3",
+      "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
       },
@@ -20,12 +23,6 @@
           "value": "mcp"
         }
       ]
-    }
-  ],
-  "remotes": [
-    {
-      "type": "streamable-http",
-      "url": "https://edgefetch.example.com/mcp"
     }
   ]
 }

@@ -17,7 +17,8 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 LABEL org.opencontainers.image.title="EdgeFetch Lite" \
       org.opencontainers.image.description="Minimal 9 MB distroless Go HTTP/2 crawler, agent, and self-hosted WebSocket Hub" \
       org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"
 COPY --from=build /out/edgefetch /edgefetch
 USER nonroot:nonroot
 ENV GOMEMLIMIT=200MiB

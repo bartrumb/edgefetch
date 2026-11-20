@@ -167,10 +167,10 @@ jobs:
             sleep 0.5
           done
           curl -fsS -H "Authorization: Bearer ci-aio-caller-token-0123456789abcdef" http://127.0.0.1:18787/agents | grep -q '"local-fat-1"'
-          hub_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/comm; do if [ "$(cat "$f" 2>/dev/null)" = "node" ]; then echo "${f%/comm}" | cut -d/ -f3; break; fi; done')
-          agent_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/comm; do if [ "$(cat "$f" 2>/dev/null)" = "edgefetch" ]; then echo "${f%/comm}" | cut -d/ -f3; break; fi; done')
+          hub_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/cmdline; do if tr "\0" " " < "$f" 2>/dev/null | grep -q "portable-server.mjs"; then echo "${f%/cmdline}" | cut -d/ -f3; break; fi; done')
+          agent_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/cmdline; do if tr "\0" " " < "$f" 2>/dev/null | grep -q -- "--mode=agent"; then echo "${f%/cmdline}" | cut -d/ -f3; break; fi; done')
           echo "=== ef-aio-smoke hub_pid=${hub_pid} agent_pid=${agent_pid} ==="
-          test -n "${hub_pid}" && test -n "${agent_pid}"
+          if [ -z "${hub_pid}" ] || [ -z "${agent_pid}" ]; then exit 1; fi
           docker exec ef-aio-smoke grep -E '^(Uid|Gid|NoNewPrivs):' "/proc/${hub_pid}/status"
           docker exec ef-aio-smoke grep -E '^(Uid|Gid|NoNewPrivs):' "/proc/${agent_pid}/status"
           docker exec ef-aio-smoke grep -Eq '^Uid:[[:space:]]+1000([[:space:]]+1000){3}$' "/proc/${hub_pid}/status"

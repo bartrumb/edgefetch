@@ -167,17 +167,15 @@ jobs:
             sleep 0.5
           done
           curl -fsS -H "Authorization: Bearer ci-aio-caller-token-0123456789abcdef" http://127.0.0.1:18787/agents | grep -q '"local-fat-1"'
-          hub_pid=$(docker exec ef-aio-smoke sh -ec 'for f in /proc/[0-9]*/comm; do [ "$(cat "$f" 2>/dev/null)" = "node" ] && { echo "${f%/comm}" | cut -d/ -f3; break; }; done')
-          agent_pid=$(docker exec ef-aio-smoke sh -ec 'for f in /proc/[0-9]*/comm; do [ "$(cat "$f" 2>/dev/null)" = "edgefetch" ] && { echo "${f%/comm}" | cut -d/ -f3; break; }; done')
+          hub_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/comm; do if [ "$(cat "$f" 2>/dev/null)" = "node" ]; then echo "${f%/comm}" | cut -d/ -f3; break; fi; done')
+          agent_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/comm; do if [ "$(cat "$f" 2>/dev/null)" = "edgefetch" ]; then echo "${f%/comm}" | cut -d/ -f3; break; fi; done')
           echo "=== ef-aio-smoke hub_pid=${hub_pid} agent_pid=${agent_pid} ==="
+          test -n "${hub_pid}" && test -n "${agent_pid}"
           docker exec ef-aio-smoke grep -E '^(Uid|Gid|NoNewPrivs):' "/proc/${hub_pid}/status"
           docker exec ef-aio-smoke grep -E '^(Uid|Gid|NoNewPrivs):' "/proc/${agent_pid}/status"
           docker exec ef-aio-smoke grep -Eq '^Uid:[[:space:]]+1000([[:space:]]+1000){3}$' "/proc/${hub_pid}/status"
           docker exec ef-aio-smoke grep -Eq '^Uid:[[:space:]]+65532([[:space:]]+65532){3}$' "/proc/${agent_pid}/status"
-          env_err=$(docker exec -u 65532:65532 ef-aio-smoke cat "/proc/${hub_pid}/environ" 2>&1 && exit 1 || true)
-          echo "$env_err" | grep -qi 'permission denied'
-          data_err=$(docker exec -u 65532:65532 ef-aio-smoke ls /data 2>&1 && exit 1 || true)
-          echo "$data_err" | grep -qi 'permission denied'
-          dir_err=$(docker exec -u 65532:65532 ef-aio-smoke ls /data/hub 2>&1 && exit 1 || true)
-          echo "$dir_err" | grep -qi 'permission denied'
+          if docker exec -u 65532:65532 ef-aio-smoke cat "/proc/${hub_pid}/environ" >/dev/null 2>&1; then exit 1; fi
+          if docker exec -u 65532:65532 ef-aio-smoke ls /data >/dev/null 2>&1; then exit 1; fi
+          if docker exec -u 65532:65532 ef-aio-smoke ls /data/hub >/dev/null 2>&1; then exit 1; fi
           docker stop ef-aio-smoke

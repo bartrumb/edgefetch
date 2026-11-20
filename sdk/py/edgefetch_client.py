@@ -27,6 +27,24 @@ class EdgeFetchError(Exception):
         self.message = message
 
 
+class _CrossOriginAuthStripRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strips Authorization headers whenever an HTTP redirect crosses origins (`Low`)."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        orig = urllib.parse.urlsplit(req.full_url)
+        dest = urllib.parse.urlsplit(newurl)
+        if (orig.scheme, orig.netloc) != (dest.scheme, dest.netloc):
+            redirected.headers.pop("Authorization", None)
+            redirected.unredirected_hdrs.pop("Authorization", None)
+        return redirected
+
+
+_DEFAULT_SAFE_OPENER = urllib.request.build_opener(_CrossOriginAuthStripRedirectHandler())
+
+
 class EdgeFetchClient:
     """Minimal, zero-dependency Python client for EdgeFetch v2.1."""
 
@@ -50,7 +68,7 @@ class EdgeFetchClient:
         self.base_urls = urls
         self.token = token
         self.timeout = timeout
-        self._opener = opener or (lambda req, t: urllib.request.urlopen(req, timeout=t))
+        self._opener = opener or (lambda req, t: _DEFAULT_SAFE_OPENER.open(req, timeout=t))
 
     def _request_json(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload_bytes = json.dumps(body).encode("utf-8") if body is not None else None

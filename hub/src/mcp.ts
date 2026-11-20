@@ -1687,7 +1687,7 @@ async function dispatchRpcMessage(
       if (typeof rawArgs.target === 'string') safeLogArgs.target = rawArgs.target;
       if (typeof rawArgs.site === 'string') safeLogArgs.site = rawArgs.site;
       await finishMcpTurn({
-        level: out.isError ? 'warn' : 'info',
+        level: 'info',
         category: 'mcp',
         event: 'mcp_tool_call',
         summary: `MCP ${toolName} called by ${principal} (${Date.now() - startedAt}ms)`,

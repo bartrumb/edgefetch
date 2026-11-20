@@ -38,8 +38,17 @@ func DropRoot() error {
 	if err := syscall.Setuid(nonrootUID); err != nil {
 		return fmt.Errorf("setuid(%d): %w", nonrootUID, err)
 	}
-	if os.Geteuid() != nonrootUID || os.Getuid() != nonrootUID {
-		return errors.New("privilege drop verification failed: uid/euid did not transition to 65532")
+	if os.Geteuid() != nonrootUID || os.Getuid() != nonrootUID || os.Getegid() != nonrootUID || os.Getgid() != nonrootUID {
+		return errors.New("privilege drop verification failed: uid/euid/gid/egid did not transition to 65532")
+	}
+	if groups, gErr := os.Getgroups(); gErr != nil {
+		return fmt.Errorf("verify supplementary groups: %w", gErr)
+	} else {
+		for _, g := range groups {
+			if g == 0 {
+				return errors.New("privilege drop verification failed: supplementary group 0 still present")
+			}
+		}
 	}
 	return nil
 }

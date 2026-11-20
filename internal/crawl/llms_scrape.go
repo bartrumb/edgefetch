@@ -461,32 +461,31 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	out, err := c.renderer.Execute(rctx, task)
 	if err != nil {
 		res.Status = out.Status
-		res.FinalURL = out.FinalURL
 		res.SessionID = out.SessionID
-		res.ActionScreenshots = out.ActionScreenshots
-		res.ActionScrapes = out.ActionScrapes
-		res.JavascriptReturns = out.JavascriptReturns
-		res.PDFBase64 = out.PDFBase64
 		if errors.Is(err, browser.ErrChallengeDetected) {
+			res.FinalURL = out.FinalURL
 			res.Outcome = classify.OutcomeChallenge
 			res.WAF = classify.ClassifyWAF(http.StatusOK, out.Headers, []byte(out.HTML))
 		} else {
 			res.Outcome = classify.OutcomeError
-			if len(out.HTML) > 0 && len(out.HTML) <= opts.MaxBytes {
-				if res.Status == 0 {
-					res.Status = http.StatusOK
-				}
-				res.Rendered = true
-				res.Bytes = len(out.HTML)
-				res.ContentType = "text/html; charset=utf-8"
-				res.Body = out.HTML
-				res.BodyEncoding = "utf-8"
-				c.enrichResult(rctx, r, opts, []byte(out.HTML), &res)
-			}
 		}
 		res.Problem = err.Error()
 		res.DurationMs = c.Now().Sub(started).Milliseconds()
 		return res
+	}
+
+	if out.FinalURL != "" && c.allow != nil {
+		if finalParsed, pErr := url.Parse(out.FinalURL); pErr != nil {
+			res.Outcome = classify.OutcomeError
+			res.Problem = "invalid rendered finalUrl"
+			res.DurationMs = c.Now().Sub(started).Milliseconds()
+			return res
+		} else if aErr := c.allow(finalParsed); aErr != nil {
+			res.Outcome = classify.OutcomeError
+			res.Problem = fmt.Sprintf("rendered finalUrl blocked by SSRF policy: %v", aErr)
+			res.DurationMs = c.Now().Sub(started).Milliseconds()
+			return res
+		}
 	}
 
 	rawBody := []byte(out.HTML)

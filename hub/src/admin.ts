@@ -15,6 +15,7 @@
 import type { HubEventRecord, McpClientActivity } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { MIN_TOKEN_LENGTH, SITE_ID_PATTERN, sameBytes } from './auth';
+import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
 import {
   ADMIN_COOKIE_NAME,
   createAdminSessionValue,
@@ -735,7 +736,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     return Response.json({ error: 'owner_secret_unconfigured' }, { status: 503 });
   }
 
-  const session = await verifyAdminSessionCookie(request.headers.get('cookie'), deps.ownerSecret);
+  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), deps.ownerSecret);
+  if (session.ok && typeof deps.oauthStore.checkAuthLockout === 'function') {
+    const revoked = await deps.oauthStore.checkAuthLockout(`revoked_admin:${session.csrf}`, Date.now(), 1);
+    if (!revoked.allowed) {
+      session = { ok: false };
+    }
+  }
 
   if (path === '/admin' && request.method === 'GET') {
     if (!session.ok) {
@@ -757,17 +764,24 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   if (path === '/admin/login' && request.method === 'POST') {
     const now = Date.now();
-    const clientIp = request.headers.get('cf-connecting-ip') ?? 'local';
-    // Check lockout BEFORE checking supplied token so locked-out callers always receive 429 (H-S5).
+    const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
+    // Check lockout BEFORE checking supplied token OR buffering body so locked-out callers always receive 429 (H-S5 / M6).
     const preLock = await deps.oauthStore.checkAuthLockout(`admin:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
     if (!preLock.allowed) {
+      await request.body?.cancel().catch(() => undefined);
       return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
         status: 429,
         headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
       });
     }
-    const formText = await request.text();
-    const supplied = (new URLSearchParams(formText).get('token') ?? '').trim();
+    const cappedForm = await readBodyTextCapped(request, 8_192);
+    if (!cappedForm.ok) {
+      return new Response(renderLoginHtml(deps.serviceName, 'Login payload too large.'), {
+        status: 413,
+        headers: ADMIN_HTML_HEADERS,
+      });
+    }
+    const supplied = (new URLSearchParams(cappedForm.text).get('token') ?? '').trim();
     if (!supplied || !sameBytes(supplied, deps.ownerSecret)) {
       const rl = await deps.oauthStore.recordAuthFailure(`admin:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
       if (!rl.allowed) {
@@ -790,9 +804,14 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   }
 
   if (path === '/admin/logout' && request.method === 'POST') {
-    const formCsrf = new URLSearchParams(await request.text()).get('csrf') ?? '';
+    const cappedLogout = await readBodyTextCapped(request, 4_096);
+    const formCsrf = cappedLogout.ok ? new URLSearchParams(cappedLogout.text).get('csrf') ?? '' : '';
     if (!session.ok || !sameBytes(formCsrf, session.csrf)) {
       return Response.json({ error: 'invalid_csrf' }, { status: 403 });
+    }
+    // Server-side revocation of this exact admin session cookie (`Low`): replay of the logged-out cookie fails closed!
+    if (typeof deps.oauthStore.recordAuthFailure === 'function') {
+      await deps.oauthStore.recordAuthFailure(`revoked_admin:${session.csrf}`, Date.now(), 8 * 60 * 60_000, 1);
     }
     const headers = new Headers({ location: '/admin', 'cache-control': 'no-store' });
     headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: isSecure }));

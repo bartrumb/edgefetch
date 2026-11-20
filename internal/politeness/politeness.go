@@ -457,17 +457,15 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 	var cur group
 	seenDirective := false
 
-	for _, rawLine := range strings.Split(body, "\n") {
+	normalizedBody := strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\r", "\n")
+	for _, rawLine := range strings.Split(normalizedBody, "\n") {
 		if idx := strings.IndexByte(rawLine, '#'); idx >= 0 {
 			rawLine = rawLine[:idx]
 		}
 		line := strings.TrimSpace(rawLine)
 		if line == "" {
-			if seenDirective && len(cur.agents) > 0 {
-				groups = append(groups, cur)
-				cur = group{}
-				seenDirective = false
-			}
+			// RFC 9309 §2.2.1: blank lines inside a group do NOT terminate the current User-agent group;
+			// a group only ends when a subsequent User-agent line appears after a rule directive.
 			continue
 		}
 		colon := strings.IndexByte(line, ':')

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -33,6 +34,7 @@ const (
 	sessionIdleTTL        = 3 * time.Minute
 	browserIdleTTL        = 3 * time.Minute
 	maxActiveSessions     = 8
+	maxRenderedDOMChars   = 16 << 20 // 16 MiB cap in JS prevents >24 MiB CDP frames from dropping shared connection
 )
 
 // InteractAction describes a single deterministic browser interaction step (`firecrawl_interact` & `/scrape` inline `actions` parity).
@@ -98,13 +100,33 @@ type Output struct {
 }
 
 type retainedSession struct {
+	mu               sync.Mutex
 	id               string
 	browserContextID string
 	targetID         string
 	cdpSessionID     string
+	initialHost      string
+	hasExtraHeaders  bool
 	lastUsed         time.Time
 	lastStatus       int
 	lastHeaders      http.Header
+}
+
+func (s *retainedSession) setResponseMeta(status int, hdrs http.Header) {
+	s.mu.Lock()
+	if status > 0 {
+		s.lastStatus = status
+		s.lastHeaders = hdrs
+	}
+	s.mu.Unlock()
+}
+
+func (s *retainedSession) snapshotResponseMeta() (int, http.Header) {
+	s.mu.Lock()
+	st := s.lastStatus
+	hdrs := s.lastHeaders.Clone()
+	s.mu.Unlock()
+	return st, hdrs
 }
 
 // FindChromeBinary locates an installed headless Chromium/Chrome/Edge/Brave executable across Linux, macOS, and Windows,
@@ -308,7 +330,8 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 			resumed = true
 		}
 		r.mu.Unlock()
-		if !resumed && task.URL == "" {
+		// Reject unknown caller-supplied session IDs rather than accepting attacker-chosen handles.
+		if !resumed {
 			return Output{}, fmt.Errorf("unknown or expired browser session %q", task.SessionID)
 		}
 	}
@@ -363,15 +386,20 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 			return Output{}, fmt.Errorf("attach target: %w", err)
 		}
 
-		sid := task.SessionID
-		if sid == "" {
-			sid = randomSessionID()
+		sid := randomSessionID()
+		initHost := ""
+		if task.URL != "" {
+			if parsedInit, pErr := url.Parse(task.URL); pErr == nil {
+				initHost = strings.ToLower(parsedInit.Hostname())
+			}
 		}
 		sess = &retainedSession{
 			id:               sid,
 			browserContextID: bcOut.BrowserContextID,
 			targetID:         tgtOut.TargetID,
 			cdpSessionID:     attOut.SessionID,
+			initialHost:      initHost,
+			hasExtraHeaders:  len(task.Headers) > 0,
 			lastUsed:         time.Now(),
 			lastStatus:       http.StatusOK,
 			lastHeaders:      make(http.Header),
@@ -458,13 +486,14 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 		if err != nil {
 			return Output{}, err
 		}
-		if status > 0 {
-			sess.lastStatus = status
-			sess.lastHeaders = hdrs
-		}
-		if preHTML, _, rErr := readDocumentHTML(ctx, cdp, sess.cdpSessionID); rErr == nil {
+		sess.setResponseMeta(status, hdrs)
+		if preHTML, preURL, rErr := readDocumentHTML(ctx, cdp, sess.cdpSessionID); rErr == nil {
+			if vErr := r.validateFinalURL(ctx, preURL, task.URL); vErr != nil {
+				return Output{}, vErr
+			}
 			if why := extract.DetectRenderedChallenge(preHTML); why != "" {
-				return Output{Status: sess.lastStatus, Headers: sess.lastHeaders.Clone()}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
+				st, hClone := sess.snapshotResponseMeta()
+				return Output{Status: st, Headers: hClone}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
 			}
 		}
 	}
@@ -477,21 +506,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 	)
 	for i, act := range task.Actions {
 		if err := r.runAction(ctx, cdp, sess, events, act, &actionScreenshots, &actionScrapes, &jsReturns, &pdfBase64); err != nil {
-			partialHTML, partialURL, _ := readDocumentHTML(ctx, cdp, sess.cdpSessionID)
-			partialOut := Output{
-				Status:            sess.lastStatus,
-				Headers:           sess.lastHeaders.Clone(),
-				FinalURL:          partialURL,
-				HTML:              partialHTML,
-				ActionScreenshots: actionScreenshots,
-				ActionScrapes:     actionScrapes,
-				JavascriptReturns: jsReturns,
-				PDFBase64:         pdfBase64,
-			}
-			if task.KeepSession && !task.CloseSession {
-				partialOut.SessionID = sess.id
-			}
-			return partialOut, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
+			return Output{}, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
 		}
 	}
 
@@ -499,8 +514,17 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 	if err != nil {
 		return Output{}, err
 	}
+	if vErr := r.validateFinalURL(ctx, finalURL, task.URL); vErr != nil {
+		return Output{}, vErr
+	}
+	for i := range actionScrapes {
+		if vErr := r.validateFinalURL(ctx, actionScrapes[i].URL, task.URL); vErr != nil {
+			return Output{}, vErr
+		}
+	}
+	st, hClone := sess.snapshotResponseMeta()
 	if why := extract.DetectRenderedChallenge(htmlStr); why != "" {
-		return Output{Status: sess.lastStatus, Headers: sess.lastHeaders.Clone(), FinalURL: finalURL}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
+		return Output{Status: st, Headers: hClone, FinalURL: finalURL}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
 	}
 
 	var shotB64 string
@@ -523,8 +547,8 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (Output, error) {
 	}
 
 	out := Output{
-		Status:            sess.lastStatus,
-		Headers:           sess.lastHeaders.Clone(),
+		Status:            st,
+		Headers:           hClone,
 		FinalURL:          finalURL,
 		HTML:              htmlStr,
 		ScreenshotBase64:  shotB64,
@@ -795,14 +819,15 @@ func (r *Renderer) runAction(
 				return err
 			}
 		}
+		if sess.hasExtraHeaders && sess.initialHost != "" && !strings.EqualFold(u.Hostname(), sess.initialHost) {
+			_ = cdp.call(ctx, sess.cdpSessionID, "Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{}}, nil)
+			sess.hasExtraHeaders = false
+		}
 		st, hdrs, err := navigateAndWait(ctx, cdp, sess.cdpSessionID, events, u.String(), effectiveWaitMs, act.Selector)
 		if err != nil {
 			return err
 		}
-		if st > 0 {
-			sess.lastStatus = st
-			sess.lastHeaders = hdrs
-		}
+		sess.setResponseMeta(st, hdrs)
 		return nil
 
 	case "click":
@@ -1062,6 +1087,9 @@ func readDocumentHTML(ctx context.Context, cdp *cdpConn, sessionID string) (html
 		} catch {
 			html = root.outerHTML;
 		}
+		if (html && html.length > 16777216) {
+			return JSON.stringify({ url: String(location.href || ""), html: "", oversized: html.length });
+		}
 		return JSON.stringify({ url: String(location.href || ""), html });
 	})()`
 	raw, err := evalString(ctx, cdp, sessionID, expr)
@@ -1069,13 +1097,101 @@ func readDocumentHTML(ctx context.Context, cdp *cdpConn, sessionID string) (html
 		return "", "", err
 	}
 	var payload struct {
-		URL  string `json:"url"`
-		HTML string `json:"html"`
+		URL       string `json:"url"`
+		HTML      string `json:"html"`
+		Oversized int    `json:"oversized,omitempty"`
 	}
 	if uErr := json.Unmarshal([]byte(raw), &payload); uErr != nil {
 		return raw, "", nil
 	}
+	if payload.Oversized > 0 || len(payload.HTML) > maxRenderedDOMChars {
+		return "", payload.URL, fmt.Errorf("rendered DOM exceeds %d byte safety cap", maxRenderedDOMChars)
+	}
 	return payload.HTML, payload.URL, nil
+}
+
+func (r *Renderer) validateFinalURL(ctx context.Context, finalURL, initialURL string) error {
+	trimmed := strings.TrimSpace(finalURL)
+	if trimmed == "" {
+		return nil
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "chrome-error://") {
+		return errors.New("browser navigation blocked or failed (chrome-error)")
+	}
+	if strings.EqualFold(trimmed, "about:blank") {
+		if initialURL != "" {
+			return errors.New("browser remained on about:blank after navigation")
+		}
+		return nil
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return fmt.Errorf("invalid rendered final URL: %w", err)
+	}
+	if r.allow != nil {
+		if err := r.allow(u); err != nil {
+			return fmt.Errorf("rendered final URL blocked by SSRF policy (%s): %w", u.Redacted(), err)
+		}
+	}
+	if r.CheckRobots != nil && initialURL != "" && trimmed != initialURL {
+		if err := r.CheckRobots(ctx, u.String()); err != nil {
+			return fmt.Errorf("rendered final URL disallowed by robots.txt: %w", err)
+		}
+	}
+	return nil
+}
+
+func buildSanitizedChildEnv(userDir string) []string {
+	tmpDir := os.TempDir()
+	allowKeys := []string{
+		"PATH",
+		"LANG",
+		"LC_ALL",
+		"FONTCONFIG_PATH",
+		"FONTCONFIG_FILE",
+		"TZ",
+		"SYSTEMROOT",
+		"SystemRoot",
+		"WINDIR",
+		"windir",
+		"COMSPEC",
+		"ComSpec",
+		"PATHEXT",
+		"PROGRAMFILES",
+		"ProgramFiles",
+		"PROGRAMFILES(X86)",
+		"ProgramFiles(x86)",
+		"LOCALAPPDATA",
+		"LocalAppData",
+		"APPDATA",
+		"USERPROFILE",
+	}
+	seen := make(map[string]bool, len(allowKeys)+4)
+	env := make([]string, 0, len(allowKeys)+4)
+	for _, k := range allowKeys {
+		upper := strings.ToUpper(k)
+		if seen[upper] {
+			continue
+		}
+		if v := os.Getenv(k); v != "" {
+			seen[upper] = true
+			env = append(env, k+"="+v)
+		}
+	}
+	if !seen["PATH"] {
+		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	home := userDir
+	if home == "" {
+		home = tmpDir
+	}
+	env = append(env,
+		"HOME="+home,
+		"TMPDIR="+tmpDir,
+		"TEMP="+tmpDir,
+		"TMP="+tmpDir,
+	)
+	return env
 }
 
 func evalString(ctx context.Context, cdp *cdpConn, sessionID, expr string) (string, error) {
@@ -1120,6 +1236,49 @@ func evalBool(ctx context.Context, cdp *cdpConn, sessionID, expr string) (bool, 
 	return res.Result.Value, nil
 }
 
+func buildChromiumLaunchArgs(proxyAddr, userDir string) []string {
+	args := []string{
+		"--headless=new",
+		"--no-sandbox",
+		"--disable-setuid-sandbox",
+		"--disable-gpu-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-crash-reporter",
+		"--disable-breakpad",
+		"--disable-extensions",
+		"--disable-background-networking",
+		"--disable-sync",
+		"--disable-translate",
+		"--disable-default-apps",
+		"--disable-quic",
+		"--disable-features=TranslateUI",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--autoplay-policy=user-gesture-required",
+		"--mute-audio",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--hide-scrollbars",
+		"--remote-debugging-address=127.0.0.1",
+		"--remote-debugging-port=0",
+		"--proxy-server=http://" + proxyAddr,
+		"--proxy-bypass-list=<-loopback>",
+		"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
+		"--user-data-dir=" + userDir,
+	}
+	if runtime.GOOS == "linux" {
+		args = append(args,
+			"--use-gl=angle",
+			"--use-angle=swiftshader",
+			"--enable-unsafe-swiftshader",
+			"--ignore-gpu-blocklist",
+		)
+	} else {
+		args = append(args, "--disable-gpu")
+	}
+	args = append(args, "about:blank")
+	return args
+}
+
 func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1150,45 +1309,10 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		return nil, err
 	}
 
-	args := []string{
-		"--headless=new",
-		"--no-sandbox",
-		"--disable-setuid-sandbox",
-		"--disable-gpu-sandbox",
-		"--disable-dev-shm-usage",
-		"--disable-crash-reporter",
-		"--disable-breakpad",
-		"--disable-extensions",
-		"--disable-background-networking",
-		"--disable-sync",
-		"--disable-translate",
-		"--disable-default-apps",
-		"--disable-quic",
-		"--disable-features=IsolateOrigins,site-per-process,TranslateUI",
-		"--autoplay-policy=user-gesture-required",
-		"--mute-audio",
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--hide-scrollbars",
-		"--remote-debugging-address=127.0.0.1",
-		"--remote-debugging-port=0",
-		"--proxy-server=http://" + proxy.Addr(),
-		"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
-		"--user-data-dir=" + userDir,
-	}
-	if runtime.GOOS == "linux" {
-		args = append(args,
-			"--use-gl=angle",
-			"--use-angle=swiftshader",
-			"--enable-unsafe-swiftshader",
-			"--ignore-gpu-blocklist",
-		)
-	} else {
-		args = append(args, "--disable-gpu")
-	}
-	args = append(args, "about:blank")
+	args := buildChromiumLaunchArgs(proxy.Addr(), userDir)
 
 	cmd := exec.Command(r.chromeBin, args...)
+	cmd.Env = buildSanitizedChildEnv(userDir)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = proxy.Close()
@@ -1216,6 +1340,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 			if idx := strings.Index(line, "ws://127.0.0.1:"); idx >= 0 {
 				wsCh <- strings.TrimSpace(line[idx:])
 				// Continue draining stderr and capture any post-startup FATAL/crash line for CDP error reporting.
+				// If sc.Scan() stops early on a line >64 KiB, drain the remainder via io.Copy so Chromium never blocks!
 				for sc.Scan() {
 					txt := sc.Text()
 					if c := connHolder.Load(); c != nil {
@@ -1226,10 +1351,12 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 						earlyCrashMu.Unlock()
 					}
 				}
+				_, _ = io.Copy(io.Discard, stderr)
 				return
 			}
 			reason = startupReason(reason, line)
 		}
+		_, _ = io.Copy(io.Discard, stderr)
 		msg := "chromium exited before advertising DevTools ws://127.0.0.1 endpoint"
 		if reason != "" {
 			msg += ": " + reason

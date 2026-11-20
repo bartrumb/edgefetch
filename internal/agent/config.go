@@ -55,14 +55,14 @@ func isLoopbackHost(host string) bool {
 
 func isDockerBridgeHost(host string) bool {
 	h := strings.ToLower(strings.TrimSpace(host))
-	if h == "" || h == "localhost" {
-		return false
-	}
-	if h == "host.docker.internal" {
+	switch h {
+	case "hub", "edgefetch-hub", "edgefetch", "host.docker.internal":
 		return true
 	}
-	// Single-label Docker Compose service name (e.g. "hub" or "edgefetch-hub"), never a public multi-label FQDN.
-	return !strings.Contains(h, ".") && !strings.Contains(h, ":")
+	if custom := strings.ToLower(strings.TrimSpace(os.Getenv("EDGEFETCH_INSECURE_HUB_HOST"))); custom != "" && h == custom {
+		return true
+	}
+	return false
 }
 
 // normalizeHubURL accepts `https://...` or `wss://...` (and `http://`/`ws://` for local loopback tests) and strips any

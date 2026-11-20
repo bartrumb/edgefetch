@@ -13,6 +13,57 @@
 
 import { validatePublicHttpsTargetUrl } from './overflow';
 
+const MAX_LLM_RESPONSE_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on LLM API JSON responses (H5)
+
+async function readResponseJsonCapped(res: Response, maxBytes = MAX_LLM_RESPONSE_BYTES): Promise<Record<string, unknown>> {
+  const cl = res.headers.get('content-length');
+  if (cl !== null && cl.trim() !== '') {
+    const n = Number(cl);
+    if (Number.isFinite(n) && n > maxBytes) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new Error(`LLM response Content-Length (${n}) exceeds ${maxBytes} byte limit`);
+    }
+  }
+  if (!res.body) return {};
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value && value.byteLength > 0) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel('LLM response too large').catch(() => undefined);
+        throw new Error(`LLM response body exceeds ${maxBytes} byte limit`);
+      }
+      chunks.push(value);
+    }
+  }
+  if (chunks.length === 0) return {};
+  const joined = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    joined.set(c, off);
+    off += c.byteLength;
+  }
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(joined));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function safeOriginOf(rawUrl: string | undefined): string {
+  if (!rawUrl?.trim()) return '';
+  try {
+    return new URL(rawUrl.trim()).origin.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
 export type LlmProvider =
   | 'openai'
   | 'ollama'
@@ -34,6 +85,8 @@ export interface LlmEnvBindings {
   OPENROUTER_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
   GEMINI_API_KEY?: string;
+  SAFE_FETCH?: typeof fetch;
+  SAFE_PUBLIC_FETCH?: typeof fetch;
   AI?: {
     run: (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
   };
@@ -45,6 +98,7 @@ export interface ResolvedLlmConfig {
   apiKey?: string;
   model: string;
   isOfflineLocal: boolean;
+  safeFetch?: typeof fetch;
   workersAi?: LlmEnvBindings['AI'];
 }
 
@@ -264,9 +318,17 @@ export function resolveLlmConfig(params: {
     };
   }
 
+  // C1 Security Invariant: NEVER transmit operator env API keys to a caller-chosen `llm.baseUrl` unless its
+  // origin strictly matches the operator's `EDGEFETCH_LLM_BASE_URL` origin or the provider's official default origin!
   const reqApiKey = typeof reqObj?.apiKey === 'string' && reqObj.apiKey.trim() ? reqObj.apiKey.trim() : undefined;
-  const envKeyForProvider =
-    inferredProvider === 'anthropic'
+  const resolvedOrigin = safeOriginOf(baseUrl);
+  const operatorOrigin = safeOriginOf(operatorBaseUrl);
+  const defaultProviderOrigin = safeOriginOf(DEFAULT_BASE_URLS[inferredProvider]);
+  const matchesOperatorOrigin = Boolean(operatorOrigin && resolvedOrigin === operatorOrigin);
+  const matchesDefaultProviderOrigin = Boolean(defaultProviderOrigin && resolvedOrigin === defaultProviderOrigin);
+
+  const envKeyForProvider = matchesDefaultProviderOrigin || matchesOperatorOrigin
+    ? inferredProvider === 'anthropic'
       ? env.ANTHROPIC_API_KEY?.trim()
       : inferredProvider === 'gemini'
         ? env.GEMINI_API_KEY?.trim()
@@ -274,12 +336,17 @@ export function resolveLlmConfig(params: {
           ? env.OPENROUTER_API_KEY?.trim()
           : inferredProvider === 'openai'
             ? env.OPENAI_API_KEY?.trim()
-            : undefined;
-  const apiKey = reqApiKey ?? envKeyForProvider ?? env.EDGEFETCH_LLM_API_KEY?.trim() ?? undefined;
+            : undefined
+    : undefined;
+  const genericEnvKey =
+    matchesOperatorOrigin || (matchesDefaultProviderOrigin && (!envProvider || inferredProvider === envProvider))
+      ? env.EDGEFETCH_LLM_API_KEY?.trim()
+      : undefined;
+  const apiKey = reqApiKey ?? envKeyForProvider ?? genericEnvKey ?? undefined;
 
   const model =
     (typeof reqObj?.model === 'string' && reqObj.model.trim()) ||
-    ( (!reqProvider || reqProvider === envProvider) && env.EDGEFETCH_LLM_MODEL?.trim() ? env.EDGEFETCH_LLM_MODEL.trim() : '') ||
+    ((!reqProvider || reqProvider === envProvider) && env.EDGEFETCH_LLM_MODEL?.trim() ? env.EDGEFETCH_LLM_MODEL.trim() : '') ||
     DEFAULT_MODELS[inferredProvider];
 
   if (inferredProvider === 'workers-ai' && !env.AI) {
@@ -289,6 +356,9 @@ export function resolveLlmConfig(params: {
       message: 'Workers AI provider requested, but env.AI binding is not configured on this Hub.',
     };
   }
+
+  const callerOverrodeBaseUrl = Boolean(typeof reqObj?.baseUrl === 'string' && reqObj.baseUrl.trim() && !matchesOperatorOrigin);
+  const resolvedSafeFetch = callerOverrodeBaseUrl ? (env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH) : env.SAFE_FETCH;
 
   return {
     ok: true,
@@ -302,6 +372,7 @@ export function resolveLlmConfig(params: {
         inferredProvider === 'lmstudio' ||
         inferredProvider === 'vllm' ||
         isOfflineHost(baseUrl),
+      ...(resolvedSafeFetch ? { safeFetch: resolvedSafeFetch } : {}),
       ...(env.AI ? { workersAi: env.AI } : {}),
     },
   };
@@ -407,8 +478,8 @@ export async function completeLlmTurn(params: {
     temperature = 0.1,
     maxTokens = 2048,
     timeoutMs = 45_000,
-    fetchFn = fetch,
   } = params;
+  const fetchFn = params.fetchFn ?? config.safeFetch ?? fetch;
   const allowedNames = new Set(tools.map((t) => t.name));
 
   // ── 1. Cloudflare Workers AI (`env.AI`) ──
@@ -502,9 +573,14 @@ export async function completeLlmTurn(params: {
               }
             : {}),
         }),
+        redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
-      const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      if (res.status >= 300 && res.status < 400) {
+        await res.body?.cancel().catch(() => undefined);
+        return { ok: false, content: '', toolCalls: [], error: `Anthropic endpoint returned disallowed redirect HTTP ${res.status}` };
+      }
+      const json = await readResponseJsonCapped(res);
       if (!res.ok) {
         const errMsg =
           typeof (json.error as { message?: unknown } | undefined)?.message === 'string'
@@ -609,9 +685,14 @@ export async function completeLlmTurn(params: {
             ...(jsonMode && tools.length === 0 ? { responseMimeType: 'application/json' } : {}),
           },
         }),
+        redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
-      const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      if (res.status >= 300 && res.status < 400) {
+        await res.body?.cancel().catch(() => undefined);
+        return { ok: false, content: '', toolCalls: [], error: `Gemini endpoint returned disallowed redirect HTTP ${res.status}` };
+      }
+      const json = await readResponseJsonCapped(res);
       if (!res.ok) {
         const errMsg =
           typeof (json.error as { message?: unknown } | undefined)?.message === 'string'
@@ -703,10 +784,15 @@ export async function completeLlmTurn(params: {
             ? { response_format: { type: 'json_object' } }
             : {}),
       }),
+      redirect: 'manual',
       signal: AbortSignal.timeout(timeoutMs),
     });
+    if (res.status >= 300 && res.status < 400) {
+      await res.body?.cancel().catch(() => undefined);
+      return { ok: false, content: '', toolCalls: [], error: `${config.provider} endpoint returned disallowed redirect HTTP ${res.status}` };
+    }
 
-    const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const json = await readResponseJsonCapped(res);
     if (!res.ok) {
       const errObj = json.error as { message?: unknown } | string | undefined;
       const errMsg =

@@ -27,6 +27,7 @@ import {
   type HubFetchExecutor,
 } from './map-crawl';
 import { authorizeMcpRequest, type OAuthStore } from './oauth';
+import { readBodyTextCapped } from './safe-input';
 import { executeScrapeCall } from './scrape';
 import { executeExtractCall } from './search-index';
 import type { OptionalStorageBindings } from './storage';
@@ -49,24 +50,8 @@ export async function handleCompatRoutes(params: {
     return null;
   }
 
-  let bodyObj: Record<string, unknown> = {};
-  if (request.method === 'POST') {
-    const rawText = await request.text();
-    if (new TextEncoder().encode(rawText).byteLength > MAX_CALL_UTF8_BYTES) {
-      return Response.json({ success: false, error: 'too_large' }, { status: 413 });
-    }
-    try {
-      const parsed = JSON.parse(rawText);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return Response.json({ success: false, error: 'bad_json' }, { status: 400 });
-      }
-      bodyObj = parsed as Record<string, unknown>;
-    } catch {
-      return Response.json({ success: false, error: 'bad_json' }, { status: 400 });
-    }
-  }
-
-  // Tavily SDKs pass `{ api_key: "tvly-..." }` in the POST JSON body; Firecrawl SDKs pass `Authorization: Bearer ...`.
+  // M6 Security Invariant: Authenticate header-based callers BEFORE buffering POST request bodies!
+  // Only Tavily SDKs pass `{ api_key: "tvly-..." }` inside the JSON body; for Tavily without header auth, cap pre-auth body at 64 KiB.
   let authorized = false;
   const auth = await authorizeMcpRequest({
     request,
@@ -77,7 +62,31 @@ export async function handleCompatRoutes(params: {
   });
   if (auth.ok && auth.scopes.includes('crawl:fetch')) {
     authorized = true;
-  } else if (
+  } else if (!isTavily || request.method !== 'POST') {
+    await request.body?.cancel().catch(() => undefined);
+    return Response.json({ success: false, error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
+  }
+
+  let bodyObj: Record<string, unknown> = {};
+  if (request.method === 'POST') {
+    const maxBytes = authorized ? MAX_CALL_UTF8_BYTES : 64 * 1024;
+    const capped = await readBodyTextCapped(request, maxBytes);
+    if (!capped.ok) {
+      return Response.json({ success: false, error: 'too_large' }, { status: 413 });
+    }
+    try {
+      const parsed = JSON.parse(capped.text);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return Response.json({ success: false, error: 'bad_json' }, { status: 400 });
+      }
+      bodyObj = parsed as Record<string, unknown>;
+    } catch {
+      return Response.json({ success: false, error: 'bad_json' }, { status: 400 });
+    }
+  }
+
+  if (
+    !authorized &&
     isTavily &&
     typeof bodyObj.api_key === 'string' &&
     isValidSecretMatch(bodyObj.api_key.trim(), env.CALLER_TOKEN, env.MCP_TOKEN)

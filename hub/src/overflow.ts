@@ -111,15 +111,11 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent: string): Pars
   let cur = { agents: [] as string[], rules: [] as Array<{ pattern: string; allow: boolean }>, crawlDelayMs: 0 };
   let seenDirective = false;
 
-  for (const rawLine of body.split('\n')) {
+  for (const rawLine of body.split(/\r\n|\r|\n/)) {
     const noComment = rawLine.includes('#') ? rawLine.slice(0, rawLine.indexOf('#')) : rawLine;
     const line = noComment.trim();
     if (!line) {
-      if (seenDirective && cur.agents.length > 0) {
-        groups.push(cur);
-        cur = { agents: [], rules: [], crawlDelayMs: 0 };
-        seenDirective = false;
-      }
+      // RFC 9309 §2.2.1: blank lines inside a group do NOT close the current User-agent group.
       continue;
     }
     const colon = line.indexOf(':');
@@ -478,7 +474,7 @@ async function readBoundedBytes(
   return { bytes: out, truncated };
 }
 
-async function fetchOverflowRobots(
+export async function fetchOverflowRobots(
   origin: string,
   userAgent: string,
   fetchFn: typeof fetch,

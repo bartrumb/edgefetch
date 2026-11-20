@@ -109,6 +109,28 @@ class TestEdgeFetchPythonSDK(unittest.TestCase):
         self.assertEqual(calls[1][1], "https://hub.example.com/v1/agent/agt_123/trace")
         self.assertEqual(calls[2][1], "https://hub.example.com/v1/batch/scrape")
 
+    def test_cross_origin_redirect_strips_authorization_header(self) -> None:
+        from edgefetch_client import _CrossOriginAuthStripRedirectHandler
+
+        handler = _CrossOriginAuthStripRedirectHandler()
+        orig = urllib.request.Request(
+            "https://hub.example.com/v1/scrape",
+            headers={"Authorization": "Bearer super-secret-token", "Accept": "application/json"},
+        )
+        same_origin = handler.redirect_request(
+            orig, None, 307, "Temporary Redirect", {}, "https://hub.example.com/v2/scrape"  # type: ignore[arg-type]
+        )
+        self.assertIsNotNone(same_origin)
+        assert same_origin is not None
+        self.assertEqual(same_origin.get_header("Authorization"), "Bearer super-secret-token")
+
+        cross_origin = handler.redirect_request(
+            orig, None, 302, "Found", {}, "https://evil.example.org/collect"  # type: ignore[arg-type]
+        )
+        self.assertIsNotNone(cross_origin)
+        assert cross_origin is not None
+        self.assertIsNone(cross_origin.get_header("Authorization"))
+
 
 if __name__ == "__main__":
     unittest.main()

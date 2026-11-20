@@ -8,6 +8,7 @@
  * revocation in `/admin`.
  */
 import { callerToken, isValidSecretMatch, MIN_TOKEN_LENGTH, sameBytes } from './auth';
+import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
 
 export const MCP_SCOPES = ['crawl:read', 'crawl:fetch'] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
@@ -1200,18 +1201,25 @@ async function unsealConsent(secret: string, token: string, now: number): Promis
   }
 }
 
-async function parseFormOrJson(request: Request): Promise<Record<string, string>> {
+const MAX_OAUTH_FORM_BYTES = 32 * 1024; // 32 KiB cap on unauthenticated OAuth form/JSON bodies (M6)
+
+async function parseFormOrJson(request: Request): Promise<Record<string, string> | null> {
+  const capped = await readBodyTextCapped(request, MAX_OAUTH_FORM_BYTES);
+  if (!capped.ok) return null;
   const ct = (request.headers.get('content-type') ?? '').toLowerCase();
   if (ct.includes('application/json')) {
-    const raw = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(raw ?? {})) {
-      if (typeof v === 'string') out[k] = v;
+    try {
+      const raw = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(raw ?? {})) {
+        if (typeof v === 'string') out[k] = v;
+      }
+      return out;
+    } catch {
+      return {};
     }
-    return out;
   }
-  const text = await request.text();
-  const params = new URLSearchParams(text);
+  const params = new URLSearchParams(capped.text);
   const out: Record<string, string> = {};
   for (const [k, v] of params.entries()) out[k] = v;
   return out;
@@ -1304,9 +1312,10 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   // 3. RFC 7591 Dynamic Client Registration (`POST /oauth/register`)
   if (path === '/oauth/register') {
     if (request.method !== 'POST') return oauthJson({ error: 'method_not_allowed' }, 405, cors);
-    const clientIp = request.headers.get('cf-connecting-ip') ?? 'local';
+    const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
     const regLock = await deps.store.checkAuthLockout(`reg:${clientIp}`, now, REGISTER_RATE_LIMIT_MAX);
     if (!regLock.allowed) {
+      await request.body?.cancel().catch(() => undefined);
       return oauthJson(
         { error: 'too_many_requests', error_description: 'Too many client registrations from this IP' },
         429,
@@ -1315,14 +1324,16 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
     }
     const regCount = await deps.store.recordAuthFailure(`reg:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, REGISTER_RATE_LIMIT_MAX);
     if (!regCount.allowed) {
+      await request.body?.cancel().catch(() => undefined);
       return oauthJson(
         { error: 'too_many_requests', error_description: 'Too many client registrations from this IP' },
         429,
         { ...cors, 'retry-after': String(regCount.retryAfterSec) },
       );
     }
-    const bodyText = await request.text();
-    if (bodyText.length > 16_384) return oauthJson({ error: 'invalid_client_metadata' }, 400, cors);
+    const cappedBody = await readBodyTextCapped(request, 16_384);
+    if (!cappedBody.ok) return oauthJson({ error: 'invalid_client_metadata' }, 413, cors);
+    const bodyText = cappedBody.text;
     let body: { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
     try {
       body = JSON.parse(bodyText) as { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
@@ -1373,7 +1384,13 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   // 4. OAuth 2.1 Authorization & Consent (`GET` & `POST /oauth/authorize`)
   if (path === '/oauth/authorize') {
     const isSecure = url.protocol === 'https:';
-    const adminSession = await verifyAdminSessionCookie(request.headers.get('cookie'), deps.ownerSecret, now);
+    let adminSession = await verifyAdminSessionCookie(request.headers.get('cookie'), deps.ownerSecret, now);
+    if (adminSession.ok && typeof deps.store.checkAuthLockout === 'function') {
+      const revoked = await deps.store.checkAuthLockout(`revoked_admin:${adminSession.csrf}`, now, 1);
+      if (!revoked.allowed) {
+        adminSession = { ok: false };
+      }
+    }
 
     if (request.method === 'GET') {
       const clientId = (url.searchParams.get('client_id') ?? '').trim();
@@ -1472,6 +1489,9 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
 
     if (request.method === 'POST') {
       const form = await parseFormOrJson(request);
+      if (!form) {
+        return new Response('Request payload too large.', { status: 413, headers: CONSENT_PAGE_HEADERS });
+      }
       const sealed = await unsealConsent(deps.ownerSecret, form.sealed ?? '', now);
       const cookieCsrf = readCookie(request.headers.get('cookie'), CONSENT_CSRF_COOKIE) ?? '';
       if (!sealed || !cookieCsrf || !sameBytes(cookieCsrf, sealed.csrf) || !sameBytes(form.csrf ?? '', sealed.csrf)) {
@@ -1492,7 +1512,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         return Response.redirect(denyUrl.toString(), 302);
       }
 
-      const clientIp = request.headers.get('cf-connecting-ip') ?? 'local';
+      const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
       const isExternalRedirect = !isLoopbackRedirectUri(sealed.redirectUri);
       if (!adminSession.ok || isExternalRedirect) {
         // Check lockout BEFORE checking supplied token (H-S5).
@@ -1559,6 +1579,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   if (path === '/oauth/token') {
     if (request.method !== 'POST') return oauthJson({ error: 'method_not_allowed' }, 405, cors);
     const params = await parseFormOrJson(request);
+    if (!params) return oauthJson({ error: 'invalid_request', error_description: 'Request payload too large' }, 413, cors);
     const grantType = params.grant_type ?? '';
 
     if (grantType === 'authorization_code') {
@@ -1682,6 +1703,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   if (path === '/oauth/revoke') {
     if (request.method !== 'POST') return oauthJson({ error: 'method_not_allowed' }, 405, cors);
     const params = await parseFormOrJson(request);
+    if (!params) return oauthJson({ error: 'invalid_request' }, 413, cors);
     if (params.token) {
       await deps.store.revokeByTokenHash(await sha256Base64Url(params.token));
     }

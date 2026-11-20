@@ -17,6 +17,28 @@ import (
 
 const maxPDFTextOutputBytes = 8 << 20 // 8 MiB extracted text ceiling
 
+func sanitizedPopplerEnv() []string {
+	pathVal := os.Getenv("PATH")
+	if pathVal == "" {
+		pathVal = "/usr/local/bin:/usr/bin:/bin"
+	}
+	tmp := os.TempDir()
+	env := []string{
+		"PATH=" + pathVal,
+		"HOME=" + tmp,
+		"TMPDIR=" + tmp,
+		"TEMP=" + tmp,
+		"TMP=" + tmp,
+		"LANG=C.UTF-8",
+	}
+	for _, k := range []string{"SYSTEMROOT", "SystemRoot", "WINDIR", "windir"} {
+		if v := os.Getenv(k); v != "" {
+			env = append(env, k+"="+v)
+		}
+	}
+	return env
+}
+
 // HasPDFToText reports whether `pdftotext` (`poppler-utils`, bundled in `edgefetch_fat`) is available in $PATH.
 func HasPDFToText() bool {
 	_, err := exec.LookPath("pdftotext")
@@ -26,7 +48,7 @@ func HasPDFToText() bool {
 // ExtractPDFFileText extracts UTF-8 text from an on-disk PDF file up to `maxPages` (default 60) using `pdftotext`
 // (`poppler-utils`), falling back to a bounded pure-Go FlateDecode stream reader when `pdftotext` is absent.
 // Reading from a seekable file path allows Poppler to seek directly to the PDF `xref` trailer at EOF without buffering
-// 100+ MiB manuals in RAM.
+// large manuals in RAM.
 func ExtractPDFFileText(ctx context.Context, pdfPath string, maxPages int) (text string, usedPoppler bool, err error) {
 	if maxPages <= 0 {
 		maxPages = 60
@@ -39,14 +61,23 @@ func ExtractPDFFileText(ctx context.Context, pdfPath string, maxPages int) (text
 		defer cancel()
 
 		cmd := exec.CommandContext(pctx, bin, "-layout", "-enc", "UTF-8", "-nopgbrk", "-l", strconv.Itoa(maxPages), pdfPath, "-")
+		cmd.Env = sanitizedPopplerEnv()
+		cmd.Stderr = io.Discard
 		stdout, pipeErr := cmd.StdoutPipe()
 		if pipeErr == nil {
-			var stderr bytes.Buffer
-			cmd.Stderr = &stderr
 			if startErr := cmd.Start(); startErr == nil {
-				out, readErr := io.ReadAll(io.LimitReader(stdout, maxPDFTextOutputBytes))
+				out, readErr := io.ReadAll(io.LimitReader(stdout, maxPDFTextOutputBytes+1))
+				capped := false
+				if len(out) > maxPDFTextOutputBytes {
+					capped = true
+					out = out[:maxPDFTextOutputBytes]
+					cancel()
+					if cmd.Process != nil {
+						_ = cmd.Process.Kill()
+					}
+				}
 				waitErr := cmd.Wait()
-				if readErr == nil && waitErr == nil {
+				if readErr == nil && (waitErr == nil || capped) {
 					cleaned := cleanPDFText(string(out))
 					if cleaned == "" {
 						return "", true, errors.New("PDF contains no extractable text (scanned image PDF)")
@@ -93,15 +124,24 @@ func ExtractPDFText(ctx context.Context, pdfBytes []byte, maxPages int) (text st
 		defer cancel()
 
 		cmd := exec.CommandContext(pctx, bin, "-layout", "-enc", "UTF-8", "-nopgbrk", "-l", strconv.Itoa(maxPages), "-", "-")
+		cmd.Env = sanitizedPopplerEnv()
 		cmd.Stdin = bytes.NewReader(pdfBytes)
+		cmd.Stderr = io.Discard
 		stdout, pipeErr := cmd.StdoutPipe()
 		if pipeErr == nil {
-			var stderr bytes.Buffer
-			cmd.Stderr = &stderr
 			if startErr := cmd.Start(); startErr == nil {
-				out, readErr := io.ReadAll(io.LimitReader(stdout, maxPDFTextOutputBytes))
+				out, readErr := io.ReadAll(io.LimitReader(stdout, maxPDFTextOutputBytes+1))
+				capped := false
+				if len(out) > maxPDFTextOutputBytes {
+					capped = true
+					out = out[:maxPDFTextOutputBytes]
+					cancel()
+					if cmd.Process != nil {
+						_ = cmd.Process.Kill()
+					}
+				}
 				waitErr := cmd.Wait()
-				if readErr == nil && waitErr == nil {
+				if readErr == nil && (waitErr == nil || capped) {
 					cleaned := cleanPDFText(string(out))
 					return cleaned, true, nil
 				}

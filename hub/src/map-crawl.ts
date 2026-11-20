@@ -5,6 +5,7 @@
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { isSafePublicHostname } from './overflow';
+import { compileSafeUserRegex } from './safe-input';
 import {
   cleanPdfMarkdown,
   decodeHtmlEntities,
@@ -847,20 +848,16 @@ export interface CrawlWorkflowParams {
   selfHost?: string;
 }
 
-function matchesSafeCrawlPattern(target: string, pattern: string): boolean {
+export function matchesSafeCrawlPattern(target: string, pattern: string): boolean {
   if (!pattern || pattern.length > 160) return false;
   if (pattern.startsWith('/') && !/[\\^$*+?()[\]{}|]/.test(pattern)) {
     return target.startsWith(pattern);
   }
-  // Reject nested quantifiers to prevent ReDoS on user-supplied patterns
-  if (/\([^)]*[+*][^)]*\)[+*?{]/.test(pattern)) {
+  const safeRe = compileSafeUserRegex(pattern);
+  if (!safeRe) {
     return target.includes(pattern);
   }
-  try {
-    return new RegExp(pattern).test(target);
-  } catch {
-    return target.startsWith(pattern);
-  }
+  return safeRe.test(target);
 }
 
 function pathAllowed(
@@ -985,7 +982,9 @@ export async function executeCrawlJob(params: {
   waitUntilBounded?: boolean;
   maxRuntimeMs?: number;
 }): Promise<{ status: 'completed' | 'cancelled' | 'failed'; fetchedCount: number; failedCount: number; discoveredCount: number }> {
-  const { crawlId, rootUrl, options, env, executeHubFetch, selfHost, webhookFetchFn } = params;
+  const { crawlId, rootUrl, options, env, executeHubFetch, selfHost } = params;
+  const envFetch = env as { SAFE_PUBLIC_FETCH?: typeof fetch; SAFE_FETCH?: typeof fetch };
+  const webhookFetchFn = params.webhookFetchFn ?? envFetch.SAFE_PUBLIC_FETCH ?? envFetch.SAFE_FETCH;
   const metaDb = env.META!;
   const rootParsed = new URL(rootUrl);
   const startedAt = Date.now();

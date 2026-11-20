@@ -15,6 +15,7 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   network unix dgram,
   unix (create, bind, listen, accept, connect, send, receive, getattr, setattr, setopt, getopt, shutdown),
   signal (send, receive) peer=edgefetch_fat,
+  signal (send, receive) peer=edgefetch_fat//chromium,
   deny network raw,
   deny network packet,
 
@@ -33,7 +34,7 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   deny umount,
   deny ptrace,
 
-  # Binary, Chromium, Poppler pdftotext & read-only config access
+  # Binary, Poppler pdftotext & read-only config access
   / r,
   /edgefetch ixr,
   /usr/ r,
@@ -41,12 +42,13 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   /usr/bin/** ixr,
   /usr/lib/ r,
   /usr/lib/** mr,
-  # Chromium's binary and its helpers (chrome_crashpad_handler) live here, not in /usr/bin. No shell is allowed.
+  # Transition Chromium into a dedicated child subprofile (`edgefetch_fat//chromium`) that explicitly denies `/data/**`
+  # so Chromium can NEVER read `/data/options.json` (`AGENT_TOKEN` / `HUB_URL`).
   /usr/lib/chromium/ r,
-  /usr/lib/chromium/** mrix,
+  /usr/lib/chromium/chromium Cx -> chromium,
+  /usr/lib/chromium/** mr,
   /lib/ r,
   /lib/** mr,
-  # Read-only package data. Chromium aborts at start without ICU's data in /usr/share/icu (U_FILE_ACCESS_ERROR, 2.0.1).
   /usr/share/ r,
   /usr/share/** r,
   /var/cache/fontconfig/ rw,
@@ -88,4 +90,86 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   deny /proc/kmem rwklx,
   deny /proc/mem rwklx,
   deny /sys/firmware/** rwklx,
+
+  profile chromium flags=(attach_disconnected,mediate_deleted) {
+    #include <abstractions/base>
+    #include <abstractions/nameservice>
+    #include <abstractions/ssl_certs>
+    #include <abstractions/fonts>
+
+    network inet stream,
+    network inet6 stream,
+    network inet dgram,
+    network inet6 dgram,
+    network unix stream,
+    network unix dgram,
+    unix (create, bind, listen, accept, connect, send, receive, getattr, setattr, setopt, getopt, shutdown),
+    signal (send, receive) peer=edgefetch_fat,
+    signal (send, receive) peer=edgefetch_fat//chromium,
+    deny network raw,
+    deny network packet,
+
+    deny capability setuid,
+    deny capability setgid,
+    deny capability sys_admin,
+    deny capability sys_ptrace,
+    deny capability sys_module,
+    deny capability sys_rawio,
+    deny capability net_admin,
+    deny mount,
+    deny remount,
+    deny umount,
+    deny ptrace,
+
+    # Hard kernel block preventing Chromium or any renderer child from reading Home Assistant `/data/options.json`!
+    deny /data/ r,
+    deny /data/** rwklmx,
+
+    / r,
+    /usr/ r,
+    /usr/lib/ r,
+    /usr/lib/** mr,
+    /usr/lib/chromium/ r,
+    /usr/lib/chromium/** mrix,
+    /lib/ r,
+    /lib/** mr,
+    /usr/share/ r,
+    /usr/share/** r,
+    /var/cache/fontconfig/ rw,
+    /var/cache/fontconfig/** rwkl,
+    /etc/ r,
+    /etc/** r,
+    /tmp/ rw,
+    /tmp/** rwklm,
+    /dev/ r,
+    /dev/shm/ rw,
+    /dev/shm/** rwklm,
+    /memfd:* rwklm,
+    /memfd:** rwklm,
+    /SYSV* rwklm,
+    /dev/null rw,
+    /dev/zero rw,
+    /dev/urandom rw,
+    /dev/random r,
+    /proc/ r,
+    /proc/** r,
+    /proc/@{pid}/oom_score_adj rw,
+    /proc/@{pid}/clear_refs w,
+    /proc/@{pid}/task/*/comm rw,
+    /proc/@{pid}/fd/ r,
+    /sys/ r,
+    /sys/fs/cgroup/ r,
+    /sys/fs/cgroup/** r,
+    /sys/bus/ r,
+    /sys/bus/** r,
+    /sys/class/ r,
+    /sys/class/** r,
+    /sys/devices/ r,
+    /sys/devices/** r,
+
+    deny /proc/kcore rwklx,
+    deny /proc/kmem rwklx,
+    deny /proc/mem rwklx,
+    deny /sys/firmware/** rwklx,
+  }
 }

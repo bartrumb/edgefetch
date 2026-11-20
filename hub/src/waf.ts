@@ -10,6 +10,8 @@
  *  - Wayback fallback runs STRICTLY on `5xx` / network-dead link rot — NEVER on `robots.txt`, `401`/`403`/`429`, or challenges.
  */
 
+import { MAX_HTML_SCAN_CHARS, replaceHtmlTagBlocksLinear, stripHtmlCommentsLinear, stripHtmlTagsLinear } from './safe-input';
+
 export type WafVendor =
   | 'cloudflare'
   | 'akamai'
@@ -156,10 +158,13 @@ export function classifyWafAndChallenge(params: {
   }
 
   const sample = rawBody.length > 98_304 ? rawBody.slice(0, 98_304) : rawBody;
-  const noComments = sample.replace(/<!--[\s\S]*?-->/g, ' ');
-  const visibleClean = noComments
-    .replace(/<(?:pre|code|blockquote|textarea|svg|style)\b[^>]*>[\s\S]*?<\/(?:pre|code|blockquote|textarea|svg|style)>/gi, ' ')
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ');
+  const noComments = stripHtmlCommentsLinear(sample, 98_304);
+  const visibleClean = stripHtmlTagsLinear(
+    noComments,
+    ['pre', 'code', 'blockquote', 'textarea', 'svg', 'style', 'script'],
+    ' ',
+    98_304,
+  );
   const visibleWords = stripTagsToWords(visibleClean);
 
   // --- Layer 2 & Layer 4: Structural Content Veto & Payload Geometry Check on 200 OK ---
@@ -177,9 +182,21 @@ export function classifyWafAndChallenge(params: {
   }
 
   // --- Layer 3: Strip <pre>, <code>, <blockquote>, JSON-LD, and hydration JSON before DOM pattern matching ---
-  const scrubbed = noComments
-    .replace(/<script\b[^>]*(?:type\s*=\s*["']application\/(?:ld\+)?json["']|id\s*=\s*["']__(?:NEXT|NUXT)_DATA__["'])[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<(?:pre|code|blockquote|textarea|svg|style)\b[^>]*>[\s\S]*?<\/(?:pre|code|blockquote|textarea|svg|style)>/gi, ' ');
+  const noDataScripts = replaceHtmlTagBlocksLinear(
+    noComments,
+    'script',
+    (full, attrStr) =>
+      /\b(?:type\s*=\s*["']application\/(?:ld\+)?json["']|id\s*=\s*["']__(?:NEXT|NUXT)_DATA__["'])/i.test(attrStr)
+        ? ' '
+        : full,
+    98_304,
+  );
+  const scrubbed = stripHtmlTagsLinear(
+    noDataScripts,
+    ['pre', 'code', 'blockquote', 'textarea', 'svg', 'style'],
+    ' ',
+    98_304,
+  );
   const scrubbedLower = scrubbed.toLowerCase();
   const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(scrubbed);
   const title = titleMatch?.[1] ? titleMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : '';
@@ -362,14 +379,13 @@ export function classifyContentState(params: {
     }
   }
 
-  // Strip fenced code blocks AND any leaked `<script>` / `<style>` / `<noscript>` / `<template>` blocks before matching
-  // closed-posting or soft-404 phrases (prevents Dayforce i18n "Page not found!" & Rippling script "no longer available" false positives!).
-  const proseOnly = markdown
-    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, ' ')
-    .replace(/<(script|style|noscript|template)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/\1>/gi, ' ')
-    .trim();
+  // Strip fenced code blocks AND any leaked `<script>` / `<style>` / `<noscript>` / `<template>` blocks in linear O(N) time (`M4`)
+  // before matching closed-posting or soft-404 phrases (prevents Dayforce i18n "Page not found!" & Rippling script false positives!).
+  const boundedMd = markdown.length > MAX_HTML_SCAN_CHARS ? markdown.slice(0, MAX_HTML_SCAN_CHARS) : markdown;
+  const withoutFences = boundedMd.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, ' ');
+  const proseOnly = stripHtmlTagsLinear(withoutFences, ['script', 'style', 'noscript', 'template'], ' ', MAX_HTML_SCAN_CHARS).trim();
   const cleanVisibleHtml = rawHtml
-    ? rawHtml.replace(/<(script|style|noscript|template|svg)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/\1>/gi, ' ')
+    ? stripHtmlTagsLinear(rawHtml, ['script', 'style', 'noscript', 'template', 'svg'], ' ', MAX_HTML_SCAN_CHARS)
     : '';
   const words = (proseOnly.match(/[\p{L}\p{N}_'-]+/gu) ?? []).length;
   const topSlice = `${title}\n${proseOnly.slice(0, 900)}`;
@@ -435,40 +451,51 @@ export function recoverSsrHydrationContent(
   htmlToMd: HtmlFragmentConverter,
 ): { title?: string; description?: string; markdown: string; framework: string } | null {
   if (!rawHtml || !rawHtml.includes('<script')) return null;
+  const boundedHtml = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
 
   let rawJson = '';
   let framework = '';
 
-  const nextMatch = /<script\b[^>]*\bid\s*=\s*["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i.exec(rawHtml);
-  if (nextMatch?.[1]) {
-    rawJson = nextMatch[1].trim();
-    framework = 'nextjs';
-  } else {
-    const nuxtMatch = /<script\b[^>]*\bid\s*=\s*["']__NUXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i.exec(rawHtml);
-    if (nuxtMatch?.[1]) {
-      rawJson = nuxtMatch[1].trim();
-      framework = 'nuxt';
-    } else {
-      const remixMatch = /window\.__remixContext\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i.exec(rawHtml);
-      if (remixMatch?.[1]) {
-        rawJson = remixMatch[1].trim();
-        framework = 'remix';
-      } else {
-        const apolloMatch = /window\.__APOLLO_STATE__\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i.exec(rawHtml);
-        if (apolloMatch?.[1]) {
-          rawJson = apolloMatch[1].trim();
+  // Linear O(N) `<script>` scanner (`M4`) — avoids quadratic backtracking on adversarial HTML with 20,000 unclosed `<script>` tags!
+  replaceHtmlTagBlocksLinear(
+    boundedHtml,
+    'script',
+    (_full, attrStr, inner) => {
+      if (rawJson) return '';
+      if (/\bid\s*=\s*["']__NEXT_DATA__["']/i.test(attrStr) && inner.trim()) {
+        rawJson = inner.trim();
+        framework = 'nextjs';
+      } else if (/\bid\s*=\s*["']__NUXT_DATA__["']/i.test(attrStr) && inner.trim()) {
+        rawJson = inner.trim();
+        framework = 'nuxt';
+      } else if (inner.includes('__remixContext')) {
+        const eqIdx = inner.indexOf('__remixContext');
+        const braceStart = inner.indexOf('{', eqIdx);
+        const braceEnd = inner.lastIndexOf('}');
+        if (braceStart >= 0 && braceEnd > braceStart) {
+          rawJson = inner.slice(braceStart, braceEnd + 1).trim();
+          framework = 'remix';
+        }
+      } else if (inner.includes('__APOLLO_STATE__')) {
+        const eqIdx = inner.indexOf('__APOLLO_STATE__');
+        const braceStart = inner.indexOf('{', eqIdx);
+        const braceEnd = inner.lastIndexOf('}');
+        if (braceStart >= 0 && braceEnd > braceStart) {
+          rawJson = inner.slice(braceStart, braceEnd + 1).trim();
           framework = 'apollo';
         }
       }
-    }
-  }
+      return '';
+    },
+    MAX_HTML_SCAN_CHARS,
+  );
 
   // Next.js 13–15 App Router RSC Flight stream (`self.__next_f.push([1, "..."])`) recovery!
-  if (!rawJson && rawHtml.includes('__next_f.push')) {
+  if (!rawJson && boundedHtml.includes('__next_f.push')) {
     const rscChunks: string[] = [];
     const rscRe = /self\.__next_f\.push\(\s*\[\s*1\s*,\s*("(?:[^"\\]|\\.)*")\s*\]\s*\)/g;
     let rm: RegExpExecArray | null;
-    while ((rm = rscRe.exec(rawHtml)) !== null) {
+    while ((rm = rscRe.exec(boundedHtml)) !== null && rscChunks.length < 250) {
       try {
         const decoded = JSON.parse(rm[1]!) as string;
         if (typeof decoded === 'string' && decoded.length > 0) rscChunks.push(decoded);

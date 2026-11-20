@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -175,6 +176,8 @@ func ParseHeaders(raw string) map[string]string {
 // Exporter batches and flushes OTLP/HTTP JSON spans asynchronously off the crawl critical path.
 type Exporter struct {
 	tracesURL      string
+	stdoutOut      io.Writer
+	stdoutMu       sync.Mutex
 	headers        map[string]string
 	serviceName    string
 	serviceVersion string
@@ -186,13 +189,27 @@ type Exporter struct {
 	once   sync.Once
 }
 
-// NewExporterFromEnv returns a live `*Exporter` when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured, or `nil` when unset.
+func isTruthyEnv(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// NewExporterFromEnv returns a live `*Exporter` when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured (or when
+// `EDGEFETCH_OTEL_STDOUT=1` / `OTEL_EXPORTER_OTLP_ENDPOINT=stdout` is set for local issue debugging), or `nil` when unset.
 func NewExporterFromEnv(getenv func(string) string, defaultService, version string, transport http.RoundTripper) *Exporter {
 	if getenv == nil {
 		return nil
 	}
-	tracesURL := ResolveTracesURL(getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
-	if tracesURL == "" {
+	rawEndpoint := strings.TrimSpace(getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	wantStdout := isTruthyEnv(getenv("EDGEFETCH_OTEL_STDOUT")) || strings.EqualFold(rawEndpoint, "stdout") || strings.EqualFold(rawEndpoint, "stderr")
+	tracesURL := ""
+	if !strings.EqualFold(rawEndpoint, "stdout") && !strings.EqualFold(rawEndpoint, "stderr") {
+		tracesURL = ResolveTracesURL(rawEndpoint)
+	}
+	if tracesURL == "" && !wantStdout {
 		return nil
 	}
 	svc := strings.TrimSpace(getenv("OTEL_SERVICE_NAME"))
@@ -203,14 +220,22 @@ func NewExporterFromEnv(getenv func(string) string, defaultService, version stri
 		svc = "edgefetch-go"
 	}
 	if version == "" {
-		version = "2.5.2"
+		version = "2.5.3"
 	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   5 * time.Second,
+	var client *http.Client
+	if tracesURL != "" {
+		client = &http.Client{
+			Transport: transport,
+			Timeout:   5 * time.Second,
+		}
+	}
+	var stdoutWriter io.Writer
+	if wantStdout {
+		stdoutWriter = os.Stderr
 	}
 	e := &Exporter{
 		tracesURL:      tracesURL,
+		stdoutOut:      stdoutWriter,
 		headers:        ParseHeaders(getenv("OTEL_EXPORTER_OTLP_HEADERS")),
 		serviceName:    svc,
 		serviceVersion: version,
@@ -304,6 +329,14 @@ func (e *Exporter) sendBatch(ctx context.Context, spans []Span) error {
 	bodyBytes, err := BuildOTLPJSON(e.serviceName, e.serviceVersion, spans)
 	if err != nil {
 		return err
+	}
+	if e.stdoutOut != nil {
+		e.stdoutMu.Lock()
+		_, _ = e.stdoutOut.Write(append(bodyBytes, '\n'))
+		e.stdoutMu.Unlock()
+	}
+	if e.tracesURL == "" || e.client == nil {
+		return nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.tracesURL, bytes.NewReader(bodyBytes))
 	if err != nil {

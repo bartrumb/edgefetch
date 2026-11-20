@@ -25,31 +25,40 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.27.x'
-          cache: true
+          cache: false
 
-      - name: Run GoReleaser
+      - name: Build Release Archives Locally (Publish Held Until Signature Verified)
         uses: goreleaser/goreleaser-action@9c156ee8a17a598857849441385a2041ef570552 # v6
         with:
           distribution: goreleaser
-          version: '~> v2'
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          version: 'v2.20.3'
+          args: release --clean --skip=publish
 
-      - name: Cryptographically Sign checksums.txt with Owner Release Key (Ed25519)
-        if: env.RELEASE_SIGNING_PRIVATE_KEY != ''
+      - name: Mandatory Ed25519 Signing & Atomic GitHub Release Publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if [ -z "${RELEASE_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "ERROR: RELEASE_SIGNING_PRIVATE_KEY secret must be configured; refusing to publish unsigned release." >&2
+            exit 1
+          fi
           key_tmp=$(mktemp)
           trap 'rm -f "$key_tmp"' EXIT
           chmod 600 "$key_tmp"
           printf '%s\n' "$RELEASE_SIGNING_PRIVATE_KEY" > "$key_tmp"
           openssl pkeyutl -sign -inkey "$key_tmp" -rawin -in dist/checksums.txt -out dist/checksums.txt.sig
           openssl pkeyutl -verify -pubin -inkey keys/release-signing-pub.pem -rawin -in dist/checksums.txt -sigfile dist/checksums.txt.sig
-          gh release upload "${GITHUB_REF_NAME}" dist/checksums.txt.sig keys/release-signing-pub.pem --clobber
+          gh release create "$TAG_NAME" \
+            dist/*.tar.gz \
+            dist/*.zip \
+            dist/checksums.txt \
+            dist/checksums.txt.sig \
+            keys/release-signing-pub.pem \
+            --verify-tag \
+            --generate-notes
 
       - name: Generate SLSA Build Provenance Attestations for Release Binaries
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
@@ -58,6 +67,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/checksums.txt
+            dist/checksums.txt.sig
 
   ghcr-release:
     name: Publish & Attest GHCR Images (agent:latest, agent:lite & all-in-one)
@@ -65,15 +75,26 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Determine Version & Registry Owner
+      - name: Determine Version, Floating Tags & Registry Owner
         id: meta
+        env:
+          REF: ${{ github.ref }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            ver="${GITHUB_REF#refs/tags/v}"
+          set -euo pipefail
+          owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          if [[ "$REF" == refs/tags/v* ]]; then
+            ver="${REF#refs/tags/v}"
+            echo "fat_tags=ghcr.io/${owner}/edgefetch-agent:latest,ghcr.io/${owner}/edgefetch-agent:${ver}" >> "$GITHUB_OUTPUT"
+            echo "lite_tags=ghcr.io/${owner}/edgefetch-agent:lite,ghcr.io/${owner}/edgefetch-agent:${ver}-lite" >> "$GITHUB_OUTPUT"
+            echo "aio_tags=ghcr.io/${owner}/edgefetch:latest,ghcr.io/${owner}/edgefetch:${ver}" >> "$GITHUB_OUTPUT"
           else
             ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+            short_sha="${GITHUB_SHA:0:12}"
+            echo "fat_tags=ghcr.io/${owner}/edgefetch-agent:${ver}-${short_sha}" >> "$GITHUB_OUTPUT"
+            echo "lite_tags=ghcr.io/${owner}/edgefetch-agent:${ver}-${short_sha}-lite" >> "$GITHUB_OUTPUT"
+            echo "aio_tags=ghcr.io/${owner}/edgefetch:${ver}-${short_sha}" >> "$GITHUB_OUTPUT"
           fi
-          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "owner=$owner" >> "$GITHUB_OUTPUT"
 
@@ -86,7 +107,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push Fat Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:latest)
+      - name: Build & Push Fat Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent)
         id: push-fat
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -95,9 +116,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
           push: true
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:latest
-            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.fat_tags }}
 
       - name: Attest Fat Agent OCI Image
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
@@ -115,9 +134,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
           push: true
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:lite
-            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:${{ steps.meta.outputs.version }}-lite
+          tags: ${{ steps.meta.outputs.lite_tags }}
 
       - name: Attest Distroless Lite OCI Image
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
@@ -126,7 +143,7 @@ jobs:
           subject-digest: ${{ steps.push-lite.outputs.digest }}
           push-to-registry: true
 
-      - name: Build & Push All-in-One Container (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch:latest)
+      - name: Build & Push All-in-One Container (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch)
         id: push-aio
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -135,9 +152,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
           push: true
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch:latest
-            ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch:${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.aio_tags }}
 
       - name: Attest All-in-One OCI Image
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2

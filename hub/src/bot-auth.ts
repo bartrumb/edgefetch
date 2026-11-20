@@ -422,6 +422,7 @@ export async function handleBotTransparencyRoutes(
       operatorContact: contact,
       policies: {
         robotsTxt: 'strict-rfc9309',
+        contentSignals: 'honored (ai-input)',
         crawlDelay: 'honored',
         retryAfter: 'honored',
         antiBotChallenges: 'halt-immediately-never-bypass',

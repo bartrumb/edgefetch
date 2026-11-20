@@ -207,6 +207,19 @@ func TestGoHubAgentDispatchMultiControllerHAAndLocalFallback(t *testing.T) {
 	if _, err := ParseAgentTokensJSON(`{"site-alpha":"short"}`); err == nil {
 		t.Fatal("expected short per-site token rejected")
 	}
+
+	// 8. Verify /.well-known/edgefetch-bot.json advertises Content Signals policy (G2)
+	botResp, err := http.Get(srvPrimary.URL + "/.well-known/edgefetch-bot.json")
+	if err != nil || botResp.StatusCode != 200 {
+		t.Fatalf("GET /.well-known/edgefetch-bot.json failed: resp=%v err=%v", botResp, err)
+	}
+	var botDoc map[string]any
+	_ = json.NewDecoder(botResp.Body).Decode(&botDoc)
+	_ = botResp.Body.Close()
+	policies, _ := botDoc["policies"].(map[string]any)
+	if policies["contentSignals"] != "honored (ai-input)" {
+		t.Fatalf("G2: expected contentSignals honored (ai-input) in edgefetch-bot.json, got: %+v", policies)
+	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

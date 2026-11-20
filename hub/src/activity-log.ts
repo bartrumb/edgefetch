@@ -78,6 +78,7 @@ export interface ActivityStore {
   recordEvent(input: HubEventInput): Promise<void> | void;
   recordEvents?(inputs: HubEventInput[]): Promise<void> | void;
   listEvents(limit?: number): Promise<HubEventRecord[]> | HubEventRecord[];
+  listPortalEvents?(maxWarnError?: number, maxInfo?: number): Promise<HubEventRecord[]> | HubEventRecord[];
   clearEvents(): Promise<void> | void;
   recordMcpCall(params: {
     principal: string;
@@ -160,6 +161,21 @@ export function createMemoryActivityStore(): ActivityStore {
     listEvents(limit = 120) {
       return events.slice(0, Math.min(MAX_RING_EVENTS, Math.max(1, limit)));
     },
+    listPortalEvents(maxWarnError = 75, maxInfo = 75) {
+      const secCap = Math.max(1, Math.min(MAX_SECURITY_RING_EVENTS, Math.floor(maxWarnError)));
+      const infoCap = Math.max(1, Math.min(MAX_INFO_RING_EVENTS, Math.floor(maxInfo)));
+      const secOut: HubEventRecord[] = [];
+      const infoOut: HubEventRecord[] = [];
+      for (const ev of events) {
+        if (ev.level === 'warn' || ev.level === 'error') {
+          if (secOut.length < secCap) secOut.push(ev);
+        } else if (infoOut.length < infoCap) {
+          infoOut.push(ev);
+        }
+        if (secOut.length >= secCap && infoOut.length >= infoCap) break;
+      }
+      return [...secOut, ...infoOut].sort((a, b) => b.id - a.id);
+    },
     clearEvents() {
       events.length = 0;
     },
@@ -188,32 +204,49 @@ export function createMemoryActivityStore(): ActivityStore {
 }
 
 export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
-  let infoInsertOps = 0;
-  let secInsertOps = 0;
-  const pruneIfCrossed = (addedInfo: number, addedSec: number) => {
+  const mapRowToEvent = (r: {
+    id: number;
+    ts: number;
+    level: ActivityLevel;
+    category: ActivityCategory;
+    event: string;
+    summary: string;
+    details_json: string;
+  }): HubEventRecord => {
+    let details: EventDetailMap = {};
+    try {
+      details = sanitizeDetails(JSON.parse(r.details_json) as Record<string, unknown>);
+    } catch {
+      details = {};
+    }
+    return {
+      id: r.id,
+      ts: r.ts,
+      level: r.level,
+      category: r.category,
+      event: r.event,
+      summary: r.summary,
+      details,
+    };
+  };
+
+  // Enforce strict per-severity ring quotas (`info <= 200`, `warn/error <= 150`) (`M9`).
+  const pruneRingQuotas = (addedInfo: number, addedSec: number) => {
     if (addedSec > 0) {
-      const prevSec = secInsertOps;
-      secInsertOps += addedSec;
-      if (Math.floor(prevSec / 16) !== Math.floor(secInsertOps / 16)) {
-        sql.exec(
-          `DELETE FROM hub_events
-           WHERE level IN ('warn', 'error')
-             AND id <= COALESCE((SELECT id FROM hub_events WHERE level IN ('warn', 'error') ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`,
-          MAX_SECURITY_RING_EVENTS + 15,
-        );
-      }
+      sql.exec(
+        `DELETE FROM hub_events
+         WHERE level IN ('warn', 'error')
+           AND id <= COALESCE((SELECT id FROM hub_events WHERE level IN ('warn', 'error') ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`,
+        MAX_SECURITY_RING_EVENTS - 1,
+      );
     }
     if (addedInfo > 0) {
-      const prevInfo = infoInsertOps;
-      infoInsertOps += addedInfo;
-      if (Math.floor(prevInfo / 16) !== Math.floor(infoInsertOps / 16)) {
-        sql.exec(
-          `DELETE FROM hub_events
-           WHERE level = 'info'
-             AND id <= COALESCE((SELECT id FROM hub_events WHERE level = 'info' ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`,
-          MAX_INFO_RING_EVENTS + 15,
-        );
-      }
+      sql.exec(
+        `DELETE FROM hub_events
+         WHERE level = 'info'
+           AND id <= COALESCE((SELECT id FROM hub_events WHERE level = 'info' ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`,
+        MAX_INFO_RING_EVENTS - 1,
+      );
     }
   };
 
@@ -231,7 +264,7 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
         JSON.stringify(input.details ?? {}).slice(0, 4096),
       );
       const isSec = input.level === 'warn' || input.level === 'error';
-      pruneIfCrossed(isSec ? 0 : 1, isSec ? 1 : 0);
+      pruneRingQuotas(isSec ? 0 : 1, isSec ? 1 : 0);
     },
     recordEvents(inputs) {
       if (inputs.length === 0) return;
@@ -263,7 +296,7 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
          VALUES ${placeholders.join(', ')}`,
         ...bindArgs,
       );
-      pruneIfCrossed(addedInfo, addedSec);
+      pruneRingQuotas(addedInfo, addedSec);
     },
     listEvents(limit = 120) {
       const safeLimit = Math.min(MAX_RING_EVENTS, Math.max(1, Math.floor(limit)));
@@ -278,23 +311,42 @@ export function createSqliteActivityStore(sql: SqlStorageLike): ActivityStore {
           details_json: string;
         }>('SELECT id, ts, level, category, event, summary, details_json FROM hub_events ORDER BY id DESC LIMIT ?', safeLimit)
         .toArray()
-        .map((r) => {
-          let details: EventDetailMap = {};
-          try {
-            details = sanitizeDetails(JSON.parse(r.details_json) as Record<string, unknown>);
-          } catch {
-            details = {};
-          }
-          return {
-            id: r.id,
-            ts: r.ts,
-            level: r.level,
-            category: r.category,
-            event: r.event,
-            summary: r.summary,
-            details,
-          };
-        });
+        .map(mapRowToEvent);
+    },
+    listPortalEvents(maxWarnError = 75, maxInfo = 75) {
+      const secCap = Math.max(1, Math.min(MAX_SECURITY_RING_EVENTS, Math.floor(maxWarnError)));
+      const infoCap = Math.max(1, Math.min(MAX_INFO_RING_EVENTS, Math.floor(maxInfo)));
+      const secRows = sql
+        .exec<{
+          id: number;
+          ts: number;
+          level: ActivityLevel;
+          category: ActivityCategory;
+          event: string;
+          summary: string;
+          details_json: string;
+        }>(
+          "SELECT id, ts, level, category, event, summary, details_json FROM hub_events WHERE level IN ('warn', 'error') ORDER BY id DESC LIMIT ?",
+          secCap,
+        )
+        .toArray()
+        .map(mapRowToEvent);
+      const infoRows = sql
+        .exec<{
+          id: number;
+          ts: number;
+          level: ActivityLevel;
+          category: ActivityCategory;
+          event: string;
+          summary: string;
+          details_json: string;
+        }>(
+          "SELECT id, ts, level, category, event, summary, details_json FROM hub_events WHERE level = 'info' ORDER BY id DESC LIMIT ?",
+          infoCap,
+        )
+        .toArray()
+        .map(mapRowToEvent);
+      return [...secRows, ...infoRows].sort((a, b) => b.id - a.id);
     },
     clearEvents() {
       sql.exec('DELETE FROM hub_events');
@@ -406,7 +458,12 @@ export function buildCrawlActivityEvents(params: {
     const status = r.status ?? 0;
     const outcome = r.outcome ?? 'error';
     const level: ActivityLevel =
-      status === 429 || outcome === 'challenge' || outcome === 'stop'
+      status === 429 ||
+      status === 402 ||
+      outcome === 'challenge' ||
+      outcome === 'stop' ||
+      outcome === 'payment_required' ||
+      outcome === 'content_signal_disallowed'
         ? 'warn'
         : outcome === 'error' || status >= 500 || status === 0
           ? 'error'

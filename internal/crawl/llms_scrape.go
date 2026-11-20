@@ -293,6 +293,9 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 		}
 	}
 
+	ct := strings.ToLower(res.ContentType)
+	isOriginMarkdown := strings.Contains(ct, "text/markdown") || strings.Contains(ct, "text/x-markdown")
+
 	if res.PDFEngine == "" && shouldDiscoverLlms(r, opts) && res.Outcome == classify.OutcomeOK && r.URL != "" {
 		targetForLlms := res.FinalURL
 		if targetForLlms == "" {
@@ -300,7 +303,7 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 		}
 		disc := c.discoverHostLlms(ctx, targetForLlms, opts)
 		if disc != nil {
-			preferMd := r.PreferLlmsMarkdown == nil || *r.PreferLlmsMarkdown
+			preferMd := !isOriginMarkdown && (r.PreferLlmsMarkdown == nil || *r.PreferLlmsMarkdown)
 			candidate := disc.CompanionMdURL
 			if candidate == "" && preferMd && disc.Found {
 				candidate = extract.CandidateCompanionMarkdownURL(targetForLlms)
@@ -326,7 +329,6 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 		return
 	}
 
-	ct := strings.ToLower(res.ContentType)
 	isPDF := r.Kind == classify.KindPDF || strings.Contains(ct, "application/pdf") || extract.IsPDFBytes(rawBody)
 	if isPDF && (wantMarkdown || wantText) {
 		pdfTxt, usedPoppler, err := extract.ExtractPDFText(ctx, rawBody, r.MaxPages)
@@ -357,7 +359,10 @@ func (c *Crawler) enrichResult(ctx context.Context, r Request, opts Options, raw
 		return
 	}
 
-	isMarkdownOrPlain := strings.Contains(ct, "text/markdown") || strings.Contains(ct, "text/plain")
+	if isOriginMarkdown {
+		res.ContentSource = "origin-markdown"
+	}
+	isMarkdownOrPlain := isOriginMarkdown || strings.Contains(ct, "text/plain")
 	if isMarkdownOrPlain && (wantMarkdown || wantText) {
 		txt := string(rawBody)
 		if r.Query != "" {

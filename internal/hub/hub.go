@@ -310,6 +310,7 @@ func (s *Server) handleBotTransparencyRoutes(w http.ResponseWriter, r *http.Requ
 		"operatorContact": contact,
 		"policies": map[string]any{
 			"robotsTxt":         "strict-rfc9309",
+			"contentSignals":    "honored (ai-input)",
 			"crawlDelay":        "honored",
 			"retryAfter":        "honored",
 			"antiBotChallenges": "halt-immediately-never-bypass",
@@ -1374,7 +1375,7 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 		}
 		md = md[:cut]
 	}
-	return map[string]any{
+	out := map[string]any{
 		"ok":          res.Outcome == classify.OutcomeOK,
 		"url":         res.URL,
 		"finalUrl":    res.FinalURL,
@@ -1391,7 +1392,11 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 		"llms":        res.Llms,
 		"rendered":    res.Rendered,
 		"timing":      res.Timing,
-	}, via, http.StatusOK
+	}
+	if res.ContentSource != "" {
+		out["contentSource"] = res.ContentSource
+	}
+	return out, via, http.StatusOK
 }
 
 func (s *Server) handleCallerScrape(w http.ResponseWriter, r *http.Request) {

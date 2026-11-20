@@ -10,7 +10,16 @@
  *  - Wayback fallback runs STRICTLY on `5xx` / network-dead link rot — NEVER on `robots.txt`, `401`/`403`/`429`, or challenges.
  */
 
-import { MAX_HTML_SCAN_CHARS, replaceHtmlTagBlocksLinear, stripHtmlCommentsLinear, stripHtmlTagsLinear } from './safe-input';
+import {
+  asciiLower,
+  MAX_HTML_SCAN_CHARS,
+  replaceHtmlTagBlocksLinear,
+  replacePairedHtmlElementsLinear,
+  scanHtmlTagsLinear,
+  stripHtmlCommentsLinear,
+  stripHtmlTagsLinear,
+  stripHtmlTagsQuoteAwareLinear,
+} from './safe-input';
 
 export type WafVendor =
   | 'cloudflare'
@@ -44,8 +53,7 @@ export interface ContentStateResult {
 export type HtmlFragmentConverter = (html: string, baseUrl?: string) => { markdown: string; links: string[] };
 
 function stripTagsToWords(htmlFragment: string): number {
-  const plain = htmlFragment
-    .replace(/<[^>]+>/g, ' ')
+  const plain = stripHtmlTagsQuoteAwareLinear(htmlFragment, ' ', 98_304)
     .replace(/&nbsp;/gi, ' ')
     .replace(/&[a-z0-9#]+;/gi, ' ')
     .trim();
@@ -171,14 +179,57 @@ export function classifyWafAndChallenge(params: {
   if (status >= 200 && status < 300) {
     if (visibleWords >= 120) return null;
     if (RICH_SCHEMA_TYPE_RE.test(sample)) return null;
-    const mainMatch = /<(?:main|article)\b[^>]*>([\s\S]*?)<\/(?:main|article)>/i.exec(visibleClean);
-    if (mainMatch?.[1] && stripTagsToWords(mainMatch[1]) >= 250) return null;
-    const subheadings = visibleClean.match(/<h[23]\b[^>]*>[\s\S]*?<\/h[23]>/gi) ?? [];
-    if (subheadings.length >= 2 && visibleWords >= 100) return null;
-    for (const nm of noComments.matchAll(/<nav\b[^>]*>([\s\S]*?)<\/nav>/gi)) {
-      const navLinks = nm[1]?.match(/<a\b[^>]*\bhref\s*=/gi) ?? [];
-      if (navLinks.length >= 4 && visibleWords >= 120) return null;
-    }
+    let richMain = false;
+    replacePairedHtmlElementsLinear(
+      visibleClean,
+      ['main', 'article'],
+      (_full, _t, _a, inner) => {
+        if (!richMain && stripTagsToWords(inner) >= 250) richMain = true;
+        return '';
+      },
+      { maxChars: 98_304 },
+    );
+    if (richMain) return null;
+
+    let subheadingCount = 0;
+    replacePairedHtmlElementsLinear(
+      visibleClean,
+      ['h2', 'h3'],
+      () => {
+        subheadingCount++;
+        return '';
+      },
+      { maxChars: 98_304 },
+    );
+    if (subheadingCount >= 2 && visibleWords >= 100) return null;
+
+    let richNav = false;
+    replacePairedHtmlElementsLinear(
+      noComments,
+      ['nav'],
+      (_full, _t, _a, inner) => {
+        if (!richNav && visibleWords >= 120) {
+          let hrefCount = 0;
+          scanHtmlTagsLinear(
+            inner,
+            (tag) => {
+              if (!tag.isClosing && tag.tagNameLower === 'a' && /\bhref[ \t\r\n]*=/i.test(tag.attrs)) {
+                hrefCount++;
+                if (hrefCount >= 4) {
+                  richNav = true;
+                  return false;
+                }
+              }
+              return undefined;
+            },
+            98_304,
+          );
+        }
+        return '';
+      },
+      { maxChars: 98_304 },
+    );
+    if (richNav) return null;
   }
 
   // --- Layer 3: Strip <pre>, <code>, <blockquote>, JSON-LD, and hydration JSON before DOM pattern matching ---
@@ -197,9 +248,19 @@ export function classifyWafAndChallenge(params: {
     ' ',
     98_304,
   );
-  const scrubbedLower = scrubbed.toLowerCase();
-  const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(scrubbed);
-  const title = titleMatch?.[1] ? titleMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  const scrubbedLower = asciiLower(scrubbed);
+  let title = '';
+  replacePairedHtmlElementsLinear(
+    scrubbed,
+    ['title'],
+    (_full, _t, _a, inner) => {
+      if (!title) {
+        title = stripHtmlTagsQuoteAwareLinear(inner, ' ', 4096).replace(/\s+/g, ' ').trim();
+      }
+      return '';
+    },
+    { maxChars: 98_304, maxInnerChars: 4096 },
+  );
 
   const serverHdr = readHeaderCaseInsensitive(headers, 'server').toLowerCase();
   const setCookie = readHeaderCaseInsensitive(headers, 'set-cookie').toLowerCase();
@@ -682,11 +743,34 @@ export function isEligibleForWaybackFallback(params: {
   const status = typeof params.status === 'number' ? params.status : 0;
 
   if (params.waf) return false;
-  if (outcome === 'challenge' || outcome === 'robots_disallowed') return false;
-  if (prob.includes('robots.txt') || prob.includes('challenge') || prob.includes('cf-mitigated') || prob.includes('ssrf') || prob.includes('non-public ip')) {
+  if (
+    outcome === 'challenge' ||
+    outcome === 'robots_disallowed' ||
+    outcome === 'content_signal_disallowed' ||
+    outcome === 'payment_required'
+  ) {
     return false;
   }
-  if (status === 401 || status === 403 || status === 404 || status === 410 || status === 429 || status === 451) {
+  if (
+    prob.includes('robots.txt') ||
+    prob.includes('content-signal') ||
+    prob.includes('ai-input=no') ||
+    prob.includes('challenge') ||
+    prob.includes('cf-mitigated') ||
+    prob.includes('ssrf') ||
+    prob.includes('non-public ip')
+  ) {
+    return false;
+  }
+  if (
+    status === 401 ||
+    status === 402 ||
+    status === 403 ||
+    status === 404 ||
+    status === 410 ||
+    status === 429 ||
+    status === 451
+  ) {
     return false;
   }
   return status === 0 || (status >= 500 && status <= 599);

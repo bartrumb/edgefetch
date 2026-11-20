@@ -315,12 +315,22 @@ export class RawServerWebSocket implements HubSocketLike {
   close(code = 1000, reason = ''): void {
     if (this.closed) return;
     this.closed = true;
+    this.rxBuf = Buffer.alloc(0);
     const reasonBuf = Buffer.from(reason.slice(0, 100), 'utf8');
     const body = Buffer.alloc(2 + reasonBuf.length);
     body.writeUInt16BE(code, 0);
     reasonBuf.copy(body, 2);
-    this.writeFrame(0x8, body);
-    this.socket.end();
+    try {
+      this.writeFrame(0x8, body);
+    } catch {
+      // best-effort close frame
+    }
+    try {
+      this.socket.end();
+    } catch {
+      // ignore
+    }
+    this.socket.destroy();
     this.onClosed(this, code, reason);
   }
 
@@ -352,6 +362,10 @@ export class RawServerWebSocket implements HubSocketLike {
   }
 
   private handleChunk(chunk: Buffer): void {
+    if (this.closed) {
+      this.socket.destroy();
+      return;
+    }
     this.rxBuf = Buffer.concat([this.rxBuf, chunk]);
     while (this.rxBuf.length >= 2) {
       const b0 = this.rxBuf[0]!;
@@ -417,6 +431,7 @@ export class RawServerWebSocket implements HubSocketLike {
 export class LocalAgentHubCoordinator {
   private readonly db: DatabaseSync;
   private readonly sockets = new Set<RawServerWebSocket>();
+  private readonly lastHelloLogBySite = new Map<string, number>();
   public readonly engine: AgentHubEngine;
   public readonly oauth: OAuthStore;
   public readonly activity: ActivityStore;
@@ -644,22 +659,24 @@ export class LocalAgentHubCoordinator {
     version: string | null;
     capabilities: string | null;
     publicIp: string | null;
+    subprotocol?: string | null;
   }): void {
     const acceptKey = createHash('sha1').update(params.wsKey.trim() + WS_GUID).digest('base64');
-    params.socket.write(
-      [
-        'HTTP/1.1 101 Switching Protocols',
-        'Upgrade: websocket',
-        'Connection: Upgrade',
-        `Sec-WebSocket-Accept: ${acceptKey}`,
-        '\r\n',
-      ].join('\r\n'),
-    );
+    const respHeaders = [
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${acceptKey}`,
+      ...(params.subprotocol ? [`Sec-WebSocket-Protocol: ${params.subprotocol}`] : []),
+      '\r\n',
+    ];
+    params.socket.write(respHeaders.join('\r\n'));
 
     const ws = new RawServerWebSocket(
       params.socket,
       [`site:${params.siteId}`],
       (sock, text) => {
+        if (text.length > 2048) return;
         try {
           const msg = JSON.parse(text) as {
             type?: string;
@@ -669,16 +686,25 @@ export class LocalAgentHubCoordinator {
             capabilities?: string[];
             reconnectAttempt?: number;
           };
-          if (msg.type === 'agent_hello') {
+          if (msg.type === 'agent_hello' || msg.type === 'hello') {
             const updated = this.engine.updateAgentHello(sock, msg);
             const att = updated ?? (sock.deserializeAttachment() as AgentAttachment | null);
-            void this.activity.recordEvent({
-              level: 'info',
-              category: 'agent',
-              event: 'agent_ready',
-              summary: `Remote node "${att?.siteId ?? params.siteId}" ready (${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
-              details: sanitizeDetails({ siteId: att?.siteId ?? params.siteId, ...msg }),
-            });
+            const verifiedSiteId = att?.siteId ?? params.siteId;
+            const evName = (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready';
+            const nowMs = Date.now();
+            const lastLoggedAt = this.lastHelloLogBySite.get(verifiedSiteId) ?? 0;
+            // M9: Throttle `agent_ready` event logging to at most 1 per 60s per verified `siteId`, and spread `...msg`
+            // FIRST so an untrusted `msg.siteId` NEVER overwrites the verified `siteId`!
+            if (nowMs - lastLoggedAt >= 60_000) {
+              this.lastHelloLogBySite.set(verifiedSiteId, nowMs);
+              void this.activity.recordEvent({
+                level: 'info',
+                category: 'agent',
+                event: evName,
+                summary: `Remote node "${verifiedSiteId}" ready (${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
+                details: sanitizeDetails({ ...msg, siteId: verifiedSiteId }),
+              });
+            }
           }
         } catch {
           // ignore
@@ -728,7 +754,9 @@ export class LocalAgentHubCoordinator {
         affinities: this.engine.listAffinities(),
         grants: await this.oauth.listGrants(now),
         mcpClients: await this.activity.listMcpClients(),
-        events: await this.activity.listEvents(150),
+        events: this.activity.listPortalEvents
+          ? await this.activity.listPortalEvents(75, 75)
+          : await this.activity.listEvents(150),
       }),
       waitForHostWindow: async (hosts: string[], pauseMs?: number, dl?: number) => this.engine.waitForHostWindow(hosts, pauseMs, dl),
       dispatchFetch: async (rawBody: string, trace: Record<string, string>, preferredSite?: string, artifactPolicy?: ArtifactDispatchPolicy) =>

@@ -265,7 +265,7 @@ func ExecuteCallWithTrace(ctx context.Context, c *Crawler, call FetchCall, trace
 					Start:        ended.Add(-dur),
 					End:          ended,
 					StatusOK:     r.Outcome == classify.OutcomeOK || r.Outcome == classify.OutcomeGone || r.Outcome == classify.OutcomeSkip,
-					ErrorMessage: r.Problem,
+					ErrorMessage: RedactEmbeddedURLs(r.Problem),
 					Attributes: map[string]any{
 						"url.full":                  safeURL,
 						"http.response.status_code": r.Status,

@@ -164,6 +164,10 @@ export const OAUTH_SQLITE_SCHEMA = `
     count INTEGER NOT NULL,
     reset_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS admin_revocations (
+    key TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL
+  );
 `;
 
 /** SQLite-backed `OAuthStore` living inside `AgentHubDO` (requires zero separate KV namespaces). */
@@ -460,6 +464,16 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       }
     },
     checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
+      if (bucket.startsWith('revoked_admin:')) {
+        const revRow = sql
+          .exec<{ expires_at: number }>('SELECT expires_at FROM admin_revocations WHERE key = ?', bucket)
+          .toArray()[0];
+        if (!revRow || revRow.expires_at <= now) {
+          if (revRow) sql.exec('DELETE FROM admin_revocations WHERE key = ?', bucket);
+          return { allowed: true, retryAfterSec: 0 };
+        }
+        return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((revRow.expires_at - now) / 1_000)) };
+      }
       const row = sql
         .exec<{ count: number; reset_at: number }>('SELECT count, reset_at FROM auth_failures WHERE bucket = ?', bucket)
         .toArray()[0];
@@ -473,6 +487,14 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       return { allowed: true, retryAfterSec: 0 };
     },
     recordAuthFailure(bucket, now, windowMs, maxFailures) {
+      if (bucket.startsWith('revoked_admin:')) {
+        // Dedicated `admin_revocations` table pruned ONLY by `expires_at <= now` so brute-force `auth_failures` buckets
+        // can NEVER evict a logged-out admin session revocation (`Low`)!
+        sql.exec('DELETE FROM admin_revocations WHERE expires_at <= ?', now);
+        const expiresAt = now + windowMs;
+        sql.exec('INSERT OR REPLACE INTO admin_revocations (key, expires_at) VALUES (?, ?)', bucket, expiresAt);
+        return { allowed: false, retryAfterSec: Math.max(1, Math.ceil(windowMs / 1_000)) };
+      }
       sql.exec('DELETE FROM auth_failures WHERE reset_at <= ?', now);
       const row = sql
         .exec<{ count: number; reset_at: number }>('SELECT count, reset_at FROM auth_failures WHERE bucket = ?', bucket)
@@ -500,6 +522,10 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       return { allowed: true, retryAfterSec: 0 };
     },
     clearAuthFailures(bucket) {
+      if (bucket.startsWith('revoked_admin:')) {
+        sql.exec('DELETE FROM admin_revocations WHERE key = ?', bucket);
+        return;
+      }
       sql.exec('DELETE FROM auth_failures WHERE bucket = ?', bucket);
     },
   };
@@ -510,6 +536,7 @@ export function createMemoryOAuthStore(): OAuthStore {
   const codes = new Map<string, OAuthCodeRecord>();
   const tokens = new Map<string, OAuthTokenRecord & { used?: boolean }>();
   const failures = new Map<string, { count: number; resetAt: number }>();
+  const adminRevocations = new Map<string, number>();
 
   return {
     putClient(c) {
@@ -664,6 +691,14 @@ export function createMemoryOAuthStore(): OAuthStore {
       }
     },
     checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
+      if (bucket.startsWith('revoked_admin:')) {
+        const exp = adminRevocations.get(bucket);
+        if (exp === undefined || exp <= now) {
+          if (exp !== undefined) adminRevocations.delete(bucket);
+          return { allowed: true, retryAfterSec: 0 };
+        }
+        return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((exp - now) / 1_000)) };
+      }
       const cur = failures.get(bucket);
       if (!cur || cur.resetAt <= now) {
         if (cur) failures.delete(bucket);
@@ -675,6 +710,13 @@ export function createMemoryOAuthStore(): OAuthStore {
       return { allowed: true, retryAfterSec: 0 };
     },
     recordAuthFailure(bucket, now, windowMs, maxFailures) {
+      if (bucket.startsWith('revoked_admin:')) {
+        for (const [k, exp] of adminRevocations.entries()) {
+          if (exp <= now) adminRevocations.delete(k);
+        }
+        adminRevocations.set(bucket, now + windowMs);
+        return { allowed: false, retryAfterSec: Math.max(1, Math.ceil(windowMs / 1_000)) };
+      }
       for (const [b, v] of failures.entries()) {
         if (v.resetAt <= now) failures.delete(b);
       }
@@ -698,6 +740,10 @@ export function createMemoryOAuthStore(): OAuthStore {
       return { allowed: true, retryAfterSec: 0 };
     },
     clearAuthFailures(bucket) {
+      if (bucket.startsWith('revoked_admin:')) {
+        adminRevocations.delete(bucket);
+        return;
+      }
       failures.delete(bucket);
     },
   };

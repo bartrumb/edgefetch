@@ -88,14 +88,26 @@ export function isEligibleForExternalSpaFallback(params: {
   const { mode = 'auto', outcome, status, errorCode, problem = '', waf, contentState, isThinSpa200 = false } = params;
   if (mode === 'off') return false;
   if (waf) return false;
-  if (outcome === 'challenge' || outcome === 'gone' || outcome === 'skip') return false;
-  if (/robots\.txt|disallowed|ssrf|non-public|challenge|captcha|turnstile|unauthorized|forbidden/i.test(problem)) {
+  if (
+    outcome === 'challenge' ||
+    outcome === 'gone' ||
+    outcome === 'skip' ||
+    outcome === 'content_signal_disallowed' ||
+    outcome === 'payment_required'
+  ) {
+    return false;
+  }
+  if (
+    /robots\.txt|content-signal|ai-input\s*=\s*no|payment_required|disallowed|ssrf|non-public|challenge|captcha|turnstile|unauthorized|forbidden/i.test(
+      problem,
+    )
+  ) {
     return false;
   }
   if (contentState && contentState !== 'active') return false;
 
   const code = typeof status === 'number' ? status : 0;
-  if (code === 401 || code === 403 || code === 404 || code === 410 || code === 429) {
+  if (code === 401 || code === 402 || code === 403 || code === 404 || code === 410 || code === 429) {
     return false;
   }
 

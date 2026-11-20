@@ -92,7 +92,7 @@ func LoadConfigFrom(optionsPath string, getenv func(string) string) (Config, err
 
 	if optionsPath != "" {
 		raw, err := os.ReadFile(optionsPath)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err != nil && !errors.Is(err, os.ErrNotExist) && !(optionsPath == DefaultHAOptionsPath && errors.Is(err, os.ErrPermission)) {
 			return Config{}, fmt.Errorf("read %s: %w", optionsPath, err)
 		}
 		if err == nil {

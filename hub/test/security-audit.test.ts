@@ -8,20 +8,36 @@ import test from 'node:test';
 import { gzipSync } from 'node:zlib';
 
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
-import { NodeFsR2Bucket, NodeSqliteD1Database } from '../portable/node-adapters.ts';
+import {
+  LocalAgentHubCoordinator,
+  NodeFsR2Bucket,
+  NodeSqliteD1Database,
+  RawServerWebSocket,
+} from '../portable/node-adapters.ts';
 import { startPortableHub } from '../portable/portable-server.ts';
 import { S3ArtifactBucket } from '../portable/s3-bucket.ts';
 import { createSafeOutboundFetch, isPublicIpAddress } from '../portable/safe-fetch.ts';
 import { AgentHubEngine, MAX_COOLDOWN_MS, type AgentAttachment, type HubSocketLike } from '../src/agent-hub.ts';
 import { startOrExecuteAgentCall } from '../src/agent-runner.ts';
+import { handleBotTransparencyRoutes } from '../src/bot-auth.ts';
 import { verifyStoredArtifact } from '../src/ingest.ts';
+import { buildBlockedInfo, chunkJsonRecords, parseX402PaymentTerms } from '../src/jobs.ts';
 import { completeLlmTurn, resolveLlmConfig } from '../src/llm.ts';
 import { matchesSafeCrawlPattern } from '../src/map-crawl.ts';
-import { isRobotsAllowed, parseOverflowRobotsTxt } from '../src/overflow.ts';
-import { compileSafeUserRegex, normalizeClientRateLimitIp } from '../src/safe-input.ts';
-import { executeInteractCall, extractHtmlDocument, extractStructuredJsonFromPage } from '../src/scrape.ts';
+import { createMemoryOAuthStore } from '../src/oauth.ts';
+import {
+  cloudflareOverflowFetch,
+  isRobotsAllowed,
+  MARKDOWN_FOR_AGENTS_ACCEPT,
+  parseOverflowRobotsTxt,
+} from '../src/overflow.ts';
+import { compileSafeUserRegex, normalizeClientRateLimitIp, stripHtmlTagsLinear } from '../src/safe-input.ts';
+import { executeInteractCall, executeScrapeCall, extractHtmlDocument, extractStructuredJsonFromPage } from '../src/scrape.ts';
+import { detectPromptInjection } from '../src/scrape-advanced.ts';
+import { isEligibleForExternalSpaFallback } from '../src/spa-fallback.ts';
 import { r2ArtifactKey } from '../src/storage.ts';
-import { classifyContentState, recoverSsrHydrationContent } from '../src/waf.ts';
+import { classifyContentState, isEligibleForWaybackFallback, recoverSsrHydrationContent } from '../src/waf.ts';
+import { PassThrough } from 'node:stream';
 
 function sendRawTcpRequest(port: number, rawHttp: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -624,4 +640,521 @@ test('Multi-tenant interact sessionId: HMAC-SHA256 caller principal binding bloc
     sessionSigningSecret: signingSecret,
   });
   assert.equal(turn2Unsigned.status, 403);
+});
+
+test('SEC-V255-1 (H1): Linear O(N) HTML & prompt-injection scanners finish adversarial unclosed payloads in < 100ms total', () => {
+  const t0 = performance.now();
+  extractHtmlDocument('<div role=main '.repeat(1600), 'https://example.com');
+  extractHtmlDocument('<figcaption header '.repeat(1300), 'https://example.com');
+  extractHtmlDocument('<a href="'.repeat(2700), 'https://example.com');
+  extractHtmlDocument('<span style="'.repeat(1850), 'https://example.com');
+  extractHtmlDocument('['.repeat(24000), 'https://example.com');
+
+  const advHtml =
+    '<span style="display:none">'.repeat(160) +
+    'ignore   '.repeat(300) +
+    '`'.repeat(1200) +
+    '<img alt="ignore previous '.repeat(150);
+  const inj = detectPromptInjection({
+    markdown: '```js\n' + 'ignore   '.repeat(400) + '\n```\n' + '`code '.repeat(500),
+    rawHtml: advHtml,
+  });
+  const elapsedMs = performance.now() - t0;
+  assert.equal(typeof inj.detected, 'boolean');
+  assert.ok(elapsedMs < 100, `Expected < 100ms total for H1 adversarial corpus, took ${elapsedMs.toFixed(1)}ms`);
+});
+
+test('SEC-V255-2 (M3): Turkish U+0130 UTF-16 offset preservation, form-feed 0x0C tag boundary, and nested tag convergence', () => {
+  const turkishHtml = `${'İstanbul'.repeat(20)}<script>alert(1)</script><p>clean</p>`;
+  const strippedTurkish = stripHtmlTagsLinear(turkishHtml, ['script']);
+  assert.equal(strippedTurkish.includes('alert(1)'), false, 'Turkish İ caused UTF-16 offset shift leaking <script>!');
+  assert.ok(strippedTurkish.includes('<p>clean</p>'));
+
+  const docTurkish = extractHtmlDocument(`<html><body>${turkishHtml}</body></html>`, 'https://example.com');
+  assert.equal(docTurkish.markdown.includes('alert(1)'), false);
+  assert.ok(docTurkish.markdown.includes('clean'));
+
+  const formFeedHtml = '<script\fsrc=x>evil()</script><p>ok</p>';
+  const strippedFf = stripHtmlTagsLinear(formFeedHtml, ['script']);
+  assert.equal(strippedFf.includes('evil()'), false, 'Form-feed 0x0C after <script bypassed tag boundary!');
+  assert.ok(strippedFf.includes('<p>ok</p>'));
+
+  const nestedSmuggle = '<scr<canvas></canvas>ipt>evil()</script><p>safe</p>';
+  const strippedNested = stripHtmlTagsLinear(nestedSmuggle, ['script', 'canvas']);
+  assert.equal(strippedNested.includes('evil()'), false, 'Nested <scr<canvas></canvas>ipt> reassembled into <script>!');
+  assert.ok(strippedNested.includes('<p>safe</p>'));
+});
+
+test('SEC-V255-3 (M4): compileSafeUserRegex rejects empty/quantified groups & multi-unbounded polynomial patterns + 2048-char subject cap', () => {
+  for (const evil of ['(a?a?)+$', '(aa?)+$', '([\\w-]?[\\w-]?)+#', '(a\\b?a?)+$', 'a*a*a*a*b', '(a|b)+$']) {
+    assert.equal(compileSafeUserRegex(evil), null, `Expected compileSafeUserRegex to reject ${evil}`);
+  }
+  assert.notEqual(compileSafeUserRegex('^https://docs\\.example\\.com/v[0-9]{1,4}/guide$'), null);
+
+  // 2048-char subject cap in matchesSafeCrawlPattern & chunkJsonRecords jsonFilter
+  const longSuffixUrl = `https://docs.example.com/${'a'.repeat(2100)}TAIL_MARKER`;
+  assert.equal(matchesSafeCrawlPattern(longSuffixUrl, 'TAIL_MARKER'), false);
+  assert.equal(matchesSafeCrawlPattern('https://docs.example.com/short/TAIL_MARKER', 'TAIL_MARKER'), true);
+
+  const chunked = chunkJsonRecords({
+    rawBody: JSON.stringify([
+      { id: '1', title: `${'x'.repeat(2100)}LATE_TOKEN` },
+      { id: '2', title: 'early LATE_TOKEN match' },
+    ]),
+    contentType: 'application/json',
+    url: 'https://api.example.com/v1/items.json',
+    jsonFilter: 'title~=LATE_TOKEN',
+    htmlToMd: (h) => ({ markdown: h }),
+  });
+  assert.ok(chunked);
+  assert.equal(chunked.matchedRecords, 1);
+  assert.equal(chunked.chunks[0]?.recordId, '2');
+});
+
+test('SEC-V255-4 (M1, M12 & Low): Strict path-prefix LLM key isolation, loopback Ollama guard, URL/model sanitization & linear <think>/<tool_call>', async () => {
+  // 1. Shared-origin AI Gateway: attacker account path on same origin NEVER gets operator key (`M1`).
+  const cfGwEnv = {
+    EDGEFETCH_LLM_PROVIDER: 'openai',
+    EDGEFETCH_LLM_BASE_URL: 'https://gateway.ai.cloudflare.com/v1/OPERATOR_ACCT/gw/openai',
+    OPENAI_API_KEY: 'sk-operator-gw',
+    ANTHROPIC_API_KEY: 'sk-ant-operator',
+  };
+  const gwAttacker = resolveLlmConfig({
+    env: cfGwEnv,
+    requestLlm: { baseUrl: 'https://gateway.ai.cloudflare.com/v1/ATTACKER_ACCT/gw/openai' },
+  });
+  assert.equal(gwAttacker.ok, true);
+  if (gwAttacker.ok && gwAttacker.config) {
+    assert.equal(gwAttacker.config.apiKey, undefined, 'Operator key leaked to different path on shared gateway origin!');
+  }
+  const gwOperatorExact = resolveLlmConfig({
+    env: cfGwEnv,
+    requestLlm: { baseUrl: 'https://gateway.ai.cloudflare.com/v1/OPERATOR_ACCT/gw/openai' },
+  });
+  assert.equal(gwOperatorExact.ok, true);
+  if (gwOperatorExact.ok && gwOperatorExact.config) {
+    assert.equal(gwOperatorExact.config.apiKey, 'sk-operator-gw');
+  }
+
+  // 2. Generic EDGEFETCH_LLM_API_KEY is NEVER released when caller overrides provider or baseUrl.
+  const genericEnv = { EDGEFETCH_LLM_API_KEY: 'ef-generic-secret' };
+  const genDefault = resolveLlmConfig({ env: genericEnv });
+  assert.equal(genDefault.ok && genDefault.config?.apiKey, 'ef-generic-secret');
+  for (const override of [{ provider: 'anthropic' }, { provider: 'openrouter' }, { baseUrl: 'https://other.example/v1' }]) {
+    const res = resolveLlmConfig({ env: genericEnv, requestLlm: override });
+    if (res.ok && res.config) {
+      assert.equal(res.config.apiKey, undefined, `Generic key leaked on override ${JSON.stringify(override)}`);
+    }
+  }
+
+  // 3. Loopback Ollama / LMStudio blocked unless OLLAMA_HOST or EDGEFETCH_ALLOW_LOCAL_LLM_OVERRIDE=true (`Low`).
+  const ollamaBlocked = resolveLlmConfig({ env: {}, requestLlm: { provider: 'ollama' }, selfHost: 'localhost' });
+  assert.equal(ollamaBlocked.ok, false);
+  if (!ollamaBlocked.ok) assert.equal(ollamaBlocked.error, 'local_llm_not_configured');
+
+  const lmstudioBlocked = resolveLlmConfig({ env: {}, requestLlm: { provider: 'lmstudio' } });
+  assert.equal(lmstudioBlocked.ok, false);
+
+  const ollamaExplicit = resolveLlmConfig({ env: { OLLAMA_HOST: 'http://127.0.0.1:11434' }, requestLlm: { provider: 'ollama' } });
+  assert.equal(ollamaExplicit.ok, true);
+
+  // 4. Reject `?`, `#`, `..`, `%2e` in baseUrl, validate Gemini model, and strip 200k trailing slashes in O(N).
+  for (const badUrl of [
+    'https://api.openai.com/v1?leak=1',
+    'https://api.openai.com/v1#frag',
+    'https://api.openai.com/v1/../../evil',
+    'https://api.openai.com/v1/%2e%2e/evil',
+  ]) {
+    const r = resolveLlmConfig({ env: { OPENAI_API_KEY: 'sk-x' }, requestLlm: { baseUrl: badUrl } });
+    assert.equal(r.ok, false, `Expected ${badUrl} to be rejected`);
+  }
+  const badModel = resolveLlmConfig({
+    env: { GEMINI_API_KEY: 'gem-x' },
+    requestLlm: { provider: 'gemini', model: '../../v1/evil?key=' },
+  });
+  assert.equal(badModel.ok, false);
+  if (!badModel.ok) assert.equal(badModel.error, 'invalid_llm_model');
+
+  const tSlash = performance.now();
+  resolveLlmConfig({ env: {}, requestLlm: { baseUrl: `https://a.example.com/${'/'.repeat(200_000)}x`, apiKey: 'k' } });
+  assert.ok(performance.now() - tSlash < 50, 'Trailing-slash trim must be O(N)');
+
+  // 5. M12: 80,000 unclosed <think> and <tool_call> tags complete in < 50ms each!
+  const byoCfg = resolveLlmConfig({
+    env: {},
+    requestLlm: { provider: 'openai', baseUrl: 'https://llm.example.com/v1', apiKey: 'k' },
+  });
+  assert.equal(byoCfg.ok, true);
+  if (byoCfg.ok && byoCfg.config) {
+    const thinkBody = JSON.stringify({ choices: [{ message: { content: '<think>'.repeat(80_000) } }] });
+    const t1 = performance.now();
+    const out1 = await completeLlmTurn({
+      config: byoCfg.config,
+      messages: [{ role: 'user', content: 'hi' }],
+      fetchFn: (async () => new Response(thinkBody, { status: 200 })) as typeof fetch,
+    });
+    const d1 = performance.now() - t1;
+    assert.equal(out1.ok, true);
+    assert.ok(d1 < 50, `80k <think> tags took ${d1.toFixed(1)}ms (expected < 50ms)`);
+
+    const toolBody = JSON.stringify({ choices: [{ message: { content: '<tool_call>'.repeat(80_000) } }] });
+    const t2 = performance.now();
+    const out2 = await completeLlmTurn({
+      config: byoCfg.config,
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ name: 'scrape', description: 's', parameters: {} }],
+      fetchFn: (async () => new Response(toolBody, { status: 200 })) as typeof fetch,
+    });
+    const d2 = performance.now() - t2;
+    assert.equal(out2.ok, true);
+    assert.ok(d2 < 50, `80k <tool_call> tags took ${d2.toFixed(1)}ms (expected < 50ms)`);
+  }
+});
+
+test('SEC-V255-5 (M5): createSafeOutboundFetch with pre-aborted AbortSignal never emits uncaught error events', async () => {
+  let uncaught = 0;
+  const onUncaught = () => {
+    uncaught++;
+  };
+  process.on('uncaughtException', onUncaught);
+  process.on('unhandledRejection', onUncaught);
+  try {
+    const safeFetch = createSafeOutboundFetch({
+      resolver: async () => ['93.184.216.34'],
+    });
+    for (let i = 0; i < 40; i++) {
+      await assert.rejects(
+        () => safeFetch('https://example.com/', { signal: AbortSignal.abort(new Error('already_aborted')) }),
+        /already_aborted|AbortError/i,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 25));
+    assert.equal(uncaught, 0);
+  } finally {
+    process.off('uncaughtException', onUncaught);
+    process.off('unhandledRejection', onUncaught);
+  }
+});
+
+test('SEC-V255-6 (M6, M8, M9 & Low): WS 1009 immediate destroy, rightmost XFF + EDGEFETCH_PUBLIC_ORIGIN, siteId & warn/error ring, admin_revocations', async () => {
+  // 1. M6: RawServerWebSocket destroys socket immediately on 1009 oversized frame and buffers 0 bytes afterwards.
+  const duplex = new PassThrough();
+  let closedCode = 0;
+  const ws = new RawServerWebSocket(
+    duplex,
+    ['site:test'],
+    () => {},
+    (_s, code) => {
+      closedCode = code;
+    },
+  );
+  // RFC 6455 unmasked header claiming 64-bit payload = 1 TiB (`0x0000010000000000`)
+  const oversizedHeader = Buffer.from([0x81, 0x7f, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  duplex.emit('data', oversizedHeader);
+  assert.equal(closedCode, 1009);
+  assert.equal(duplex.destroyed, true, 'Socket must be destroyed immediately after 1009 close');
+  duplex.emit('data', Buffer.alloc(65_536, 0x41));
+  void ws;
+
+  // 2. M8: Rightmost X-Forwarded-For IP + strict EDGEFETCH_PUBLIC_ORIGIN ignoring X-Forwarded-Host.
+  const tmpDir = mkdtempSync(join(tmpdir(), 'ef-m8-'));
+  const hub = await startPortableHub({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: tmpDir,
+    envOverrides: {
+      CALLER_TOKEN: 'm8-secret-token-0123456789abcdef',
+      EDGEFETCH_TRUST_PROXY: 'true',
+      EDGEFETCH_PUBLIC_ORIGIN: 'https://hub.trusted.example',
+    },
+  });
+  try {
+    const metaRes = await fetch(`http://127.0.0.1:${hub.port}/.well-known/oauth-authorization-server`, {
+      headers: {
+        'x-forwarded-host': 'evil.attacker.example',
+        'x-forwarded-proto': 'http',
+      },
+    });
+    assert.equal(metaRes.status, 200);
+    const metaJson = (await metaRes.json()) as { issuer: string; token_endpoint: string };
+    assert.equal(metaJson.issuer, 'https://hub.trusted.example');
+    assert.equal(metaJson.token_endpoint, 'https://hub.trusted.example/oauth/token');
+
+    // Forged leftmost XFF IPs (`1.1.1.i`) with identical proxy-appended rightmost IP (`198.51.100.77`) MUST hit lockout!
+    let saw429 = false;
+    for (let i = 1; i <= 14; i++) {
+      const r = await fetch(`http://127.0.0.1:${hub.port}/admin/login`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          'x-forwarded-for': `1.1.1.${i}, 198.51.100.77`,
+        },
+        body: 'token=wrong-token',
+      });
+      if (r.status === 429) {
+        saw429 = true;
+        break;
+      }
+    }
+    assert.equal(saw429, true, 'Rightmost X-Forwarded-For IP should share one brute-force lockout bucket');
+  } finally {
+    await hub.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 3. M9: LocalAgentHubCoordinator preserves verified siteId, throttles agent_ready, and isolates warn/error vs info rings.
+  const coord = new LocalAgentHubCoordinator(':memory:');
+  try {
+    const sockStream = new PassThrough();
+    coord.acceptNodeUpgrade({
+      wsKey: 'dGhlIHNhbXBsZSBub25jZQ==',
+      socket: sockStream,
+      head: Buffer.alloc(0),
+      siteId: 'verified-node-1',
+      arch: 'linux-amd64',
+      version: '2.5.5',
+      capabilities: null,
+      publicIp: '203.0.113.10',
+    });
+
+    // Helper to build a client->server masked RFC 6455 text frame
+    const makeMaskedTextFrame = (txt: string): Buffer => {
+      const payload = Buffer.from(txt, 'utf8');
+      const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
+      const masked = Buffer.alloc(payload.length);
+      for (let i = 0; i < payload.length; i++) masked[i] = payload[i]! ^ mask[i & 3]!;
+      return Buffer.concat([Buffer.from([0x81, 0x80 | payload.length]), mask, masked]);
+    };
+
+    for (let i = 0; i < 5; i++) {
+      sockStream.emit(
+        'data',
+        makeMaskedTextFrame(
+          JSON.stringify({
+            type: 'agent_hello',
+            siteId: 'SPOOFED_ADMIN_SITE',
+            version: '2.5.5',
+            arch: 'linux-amd64',
+            goVersion: 'go1.24.0',
+          }),
+        ),
+      );
+    }
+
+    await coord.activity.recordEvent({
+      level: 'warn',
+      category: 'security',
+      event: 'auth_failed',
+      summary: 'Critical security warning preserved',
+      details: { ip: '198.51.100.9' },
+    });
+    for (let i = 0; i < 260; i++) {
+      await coord.activity.recordEvent({
+        level: 'info',
+        category: 'fetch',
+        event: 'fetch_ok',
+        summary: `Routine info ${i}`,
+      });
+    }
+
+    const ns = coord.asNamespace() as { get: () => { getPortalState: (now: number) => Promise<{ events: Array<{ level: string; event: string; details: Record<string, unknown> }> }> } };
+    const portal = await ns.get().getPortalState(Date.now());
+    const readyEvents = portal.events.filter((e) => e.event === 'agent_ready');
+    assert.ok(readyEvents.length <= 1, 'agent_ready must be throttled to <= 1 per 60s per site');
+    if (readyEvents[0]) {
+      assert.equal(readyEvents[0].details.siteId, 'verified-node-1', 'Untrusted msg.siteId must never overwrite verified siteId');
+    }
+    assert.equal(
+      portal.events.some((e) => e.level === 'warn' && e.event === 'auth_failed'),
+      true,
+      '260 info events must never evict warn/error security events from getPortalState!',
+    );
+
+    // 4. Low: Dedicated admin_revocations survives >100 auth_failures lockout buckets (SQLite + Memory).
+    const now = Date.now();
+    coord.oauth.recordAuthFailure('revoked_admin:session-hash-abc', now, 86_400_000, 1);
+    const memOAuth = createMemoryOAuthStore();
+    memOAuth.recordAuthFailure('revoked_admin:session-hash-abc', now, 86_400_000, 1);
+    for (let i = 0; i < 140; i++) {
+      coord.oauth.recordAuthFailure(`ip:203.0.113.${i}`, now, 600_000, 10);
+      memOAuth.recordAuthFailure(`ip:203.0.113.${i}`, now, 600_000, 10);
+    }
+    assert.equal(coord.oauth.checkAuthLockout('revoked_admin:session-hash-abc', now + 1_000, 1).allowed, false);
+    assert.equal(memOAuth.checkAuthLockout('revoked_admin:session-hash-abc', now + 1_000, 1).allowed, false);
+  } finally {
+    coord.close();
+  }
+});
+
+test('SEC-V255-7 (Agentic Web G1–G3): Markdown for Agents Accept/origin-markdown, Content-Signal ai-input=no, and HTTP 402 x402 structured block', async () => {
+  // --- G1: Markdown for Agents (`Accept: text/markdown, ...` + `contentSource: 'origin-markdown'`) ---
+  let seenAcceptHeader = '';
+  const g1OverflowFetch: typeof fetch = (async (input, init) => {
+    const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (u.endsWith('/robots.txt')) {
+      return new Response('User-agent: *\nAllow: /\n', { status: 200 });
+    }
+    const h = new Headers(init?.headers);
+    seenAcceptHeader = h.get('accept') ?? '';
+    return new Response('# Edge Native Doc\n\nPress <kbd>Ctrl+C</kbd> to exit.\u{E0041}\u{E0042}\u{E0043}\u{E0044}', {
+      status: 200,
+      headers: { 'content-type': 'text/markdown; charset=utf-8' },
+    });
+  }) as typeof fetch;
+
+  const g1FlowRes = await cloudflareOverflowFetch(
+    JSON.stringify({ requests: [{ id: '1', url: 'https://docs.example.com/guide', kind: 'page' }], options: { includeBody: true } }),
+    'EdgeFetch/2.5.5',
+    'hub.example.com',
+    { fetchFn: g1OverflowFetch },
+  );
+  const g1BodyText = await g1FlowRes.text();
+  assert.equal(seenAcceptHeader, MARKDOWN_FOR_AGENTS_ACCEPT);
+  const g1Parsed = JSON.parse(g1BodyText) as { results: Array<Record<string, unknown>> };
+  assert.equal(g1Parsed.results[0]?.contentType, 'text/markdown; charset=utf-8');
+
+  const g1Scrape = await executeScrapeCall({
+    payload: { url: 'https://docs.example.com/guide', checkPromptInjection: true },
+    env: {},
+    executeHubFetch: async (_target, raw) => {
+      const callObj = JSON.parse(raw) as { requests: Array<{ accept?: string }> };
+      assert.equal(callObj.requests[0]?.accept, MARKDOWN_FOR_AGENTS_ACCEPT);
+      return { status: 200, via: 'cloudflare', bodyText: g1BodyText };
+    },
+  });
+  assert.equal(g1Scrape.status, 200);
+  assert.equal(g1Scrape.body.contentSource, 'origin-markdown');
+  assert.equal((g1Scrape.body.metadata as Record<string, unknown>)?.contentSource, 'origin-markdown');
+  assert.ok(String(g1Scrape.body.markdown).includes('<kbd>Ctrl+C</kbd>'), 'Inline HTML inside origin-markdown must not be stripped');
+  assert.equal(/[\u{E0000}-\u{E007F}]/u.test(String(g1Scrape.body.markdown)), false, 'Unicode smuggling chars must still be stripped');
+
+  // --- G2: Cloudflare Content Signals (`Content-Signal: ai-input=no`) ---
+  const robotsWildcardDeny = parseOverflowRobotsTxt(
+    ['User-agent: *', 'Allow: /', 'Content-Signal: search=yes, ai-input=no, ai-train=no'].join('\n'),
+  );
+  assert.equal(robotsWildcardDeny.disallowAiInput, true);
+  assert.equal(isRobotsAllowed(robotsWildcardDeny, '/public-article'), false);
+
+  const robotsEdgefetchAllow = parseOverflowRobotsTxt(
+    [
+      'User-agent: *',
+      'Allow: /',
+      'Content-Signal: search=yes, ai-input=no, ai-train=no',
+      '',
+      'User-agent: edgefetch',
+      'Allow: /',
+      'Content-Signal: search=yes, ai-input=yes, ai-train=no',
+    ].join('\n'),
+  );
+  assert.equal(Boolean(robotsEdgefetchAllow.disallowAiInput), false);
+  assert.equal(isRobotsAllowed(robotsEdgefetchAllow, '/public-article'), true);
+
+  const g2FlowRes = await cloudflareOverflowFetch(
+    JSON.stringify({ requests: [{ id: '1', url: 'https://publisher.example.com/story', kind: 'page' }], options: { includeBody: true } }),
+    'EdgeFetch/2.5.5',
+    'hub.example.com',
+    {
+      fetchFn: (async (input) => {
+        const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (u.endsWith('/robots.txt')) {
+          return new Response('User-agent: *\nAllow: /\nContent-Signal: search=yes, ai-input=no, ai-train=no\n', { status: 200 });
+        }
+        throw new Error('Origin article must NOT be fetched when Content-Signal: ai-input=no!');
+      }) as typeof fetch,
+    },
+  );
+  const g2BodyText = await g2FlowRes.text();
+  const g2Scrape = await executeScrapeCall({
+    payload: { url: 'https://publisher.example.com/story', waybackFallback: true },
+    env: {},
+    executeHubFetch: async () => ({ status: 200, via: 'cloudflare', bodyText: g2BodyText }),
+  });
+  assert.equal(g2Scrape.status, 422);
+  const g2Blocked = g2Scrape.body.blocked as Record<string, unknown>;
+  assert.equal(g2Blocked?.reason, 'content-signal');
+  assert.equal(g2Blocked?.signal, 'ai-input=no');
+  assert.equal(isEligibleForWaybackFallback({ outcome: 'content_signal_disallowed', status: 0, problem: 'content-signal: ai-input=no' }), false);
+  assert.equal(
+    isEligibleForExternalSpaFallback({ outcome: 'content_signal_disallowed', status: 0, problem: 'content-signal: ai-input=no', extractedWordCount: 0 }),
+    false,
+  );
+
+  const botTransparencyRes = await handleBotTransparencyRoutes(
+    new Request('https://hub.example.com/.well-known/edgefetch-bot.json'),
+    new URL('https://hub.example.com/.well-known/edgefetch-bot.json'),
+    {},
+    '2.5.5',
+  );
+  assert.ok(botTransparencyRes);
+  const botJson = (await botTransparencyRes.json()) as { policies: { contentSignals: string } };
+  assert.equal(botJson.policies.contentSignals, 'honored (ai-input)');
+
+  // --- G3: HTTP 402 Payment Required / x402 Awareness (Never auto-paying, never triggering fallbacks) ---
+  const x402Payload = {
+    x402Version: 1,
+    accepts: [
+      {
+        scheme: 'exact',
+        network: 'base',
+        maxAmountRequired: '2000',
+        asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+        payTo: '0x1111111111111111111111111111111111111111',
+        resource: 'https://paywall.example.com/report',
+        description: 'Premium research report',
+      },
+    ],
+  };
+  const b64PayHeader = Buffer.from(JSON.stringify(x402Payload), 'utf8').toString('base64');
+  const parsedTerms = parseX402PaymentTerms(402, { 'payment-required': b64PayHeader });
+  assert.ok(parsedTerms);
+  assert.equal(parsedTerms.price, '$0.002 USDC');
+  assert.equal(parsedTerms.terms.scheme, 'exact');
+  assert.equal(parsedTerms.terms.network, 'base');
+  assert.equal(parsedTerms.terms.asset, 'USDC');
+
+  let originCalls402 = 0;
+  const g3FlowRes = await cloudflareOverflowFetch(
+    JSON.stringify({ requests: [{ id: '1', url: 'https://paywall.example.com/report', kind: 'page' }], options: { includeBody: true } }),
+    'EdgeFetch/2.5.5',
+    'hub.example.com',
+    {
+      fetchFn: (async (input) => {
+        const u = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (u.endsWith('/robots.txt')) {
+          return new Response('User-agent: *\nAllow: /\n', { status: 200 });
+        }
+        originCalls402++;
+        return new Response(JSON.stringify(x402Payload), {
+          status: 402,
+          headers: {
+            'content-type': 'application/json',
+            'payment-required': b64PayHeader,
+          },
+        });
+      }) as typeof fetch,
+    },
+  );
+  const g3BodyText = await g3FlowRes.text();
+  assert.equal(originCalls402, 1, 'HTTP 402 must never retry or auto-pay');
+
+  const g3Scrape = await executeScrapeCall({
+    payload: { url: 'https://paywall.example.com/report', waybackFallback: true },
+    env: { FIRECRAWL_API_KEY: 'fc-should-never-be-called' },
+    executeHubFetch: async () => ({ status: 200, via: 'cloudflare', bodyText: g3BodyText }),
+    fetchFn: (async () => {
+      throw new Error('Wayback or SPA fallback must NEVER be called on HTTP 402!');
+    }) as typeof fetch,
+  });
+  assert.equal(g3Scrape.status, 402);
+  assert.equal(g3Scrape.body.outcome, 'payment_required');
+  const g3Blocked = g3Scrape.body.blocked as { reason?: string; price?: string; terms?: Record<string, unknown> };
+  assert.equal(g3Blocked?.reason, 'payment_required');
+  assert.equal(g3Blocked?.price, '$0.002 USDC');
+  assert.equal(g3Blocked?.terms?.network, 'base');
+  assert.equal(buildBlockedInfo('https://paywall.example.com/report', 'payment_required', 'HTTP 402', 402)?.reason, 'payment_required');
+  assert.equal(isEligibleForWaybackFallback({ outcome: 'payment_required', status: 402, problem: 'HTTP 402' }), false);
+  assert.equal(
+    isEligibleForExternalSpaFallback({ outcome: 'payment_required', status: 402, problem: 'HTTP 402', extractedWordCount: 0 }),
+    false,
+  );
 });

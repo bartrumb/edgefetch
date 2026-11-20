@@ -158,7 +158,7 @@ export function buildCapabilities(
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
-  version = '2.5.4',
+  version = '2.5.5',
 ): HubCapabilities {
   const searchProviders: string[] = ['edge-map'];
   if (env.SEARCH) searchProviders.push('d1-fts5');
@@ -314,20 +314,22 @@ export async function handleAgentArtifactUpload(params: {
     return Response.json({ error: preAuthz.error }, { status: preAuthz.status });
   }
 
+  // Single-buffer streaming read directly into `Uint8Array(storedBytes)` (`Low` — avoids 36 MiB double-buffering!).
   const reader = request.body.getReader();
-  const bodyChunks: Uint8Array[] = [];
+  const fullPayload = new Uint8Array(storedBytes);
   let actualReadBytes = 0;
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (value && value.byteLength > 0) {
-        actualReadBytes += value.byteLength;
-        if (actualReadBytes > storedBytes || actualReadBytes > MAX_ARTIFACT_STORED_BYTES) {
+        const nextTotal = actualReadBytes + value.byteLength;
+        if (nextTotal > storedBytes || nextTotal > MAX_ARTIFACT_STORED_BYTES) {
           await reader.cancel('storedBytes exceeded').catch(() => undefined);
           return Response.json({ error: 'stored_bytes_mismatch' }, { status: 413 });
         }
-        bodyChunks.push(value);
+        fullPayload.set(value, actualReadBytes);
+        actualReadBytes = nextTotal;
       }
     }
   } catch {
@@ -336,12 +338,6 @@ export async function handleAgentArtifactUpload(params: {
   }
   if (actualReadBytes !== storedBytes) {
     return Response.json({ error: 'content_length_mismatch' }, { status: 400 });
-  }
-  const fullPayload = new Uint8Array(actualReadBytes);
-  let off = 0;
-  for (const c of bodyChunks) {
-    fullPayload.set(c, off);
-    off += c.byteLength;
   }
   const actualBlobShaBuf = await crypto.subtle.digest('SHA-256', fullPayload);
   const actualBlobSha = Array.from(new Uint8Array(actualBlobShaBuf), (b) => b.toString(16).padStart(2, '0')).join('');

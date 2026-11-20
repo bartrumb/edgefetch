@@ -88,6 +88,7 @@ import {
   type OtlpSpanInput,
 } from './otel';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
+import { readBodyTextCapped } from './safe-input';
 import {
   executeIngestPipeline,
   IngestWorkflow,
@@ -432,6 +433,7 @@ export class AgentHubDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec('DELETE FROM oauth_codes WHERE expires_at <= ?', now);
     this.ctx.storage.sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', now);
     this.ctx.storage.sql.exec('DELETE FROM auth_failures WHERE reset_at <= ?', now);
+    this.ctx.storage.sql.exec('DELETE FROM admin_revocations WHERE expires_at <= ?', now);
     await this.ctx.storage.setAlarm(now + DAILY_CLEANUP_INTERVAL_MS);
     this.alarmScheduled = true;
   }
@@ -458,7 +460,15 @@ export class AgentHubDO extends DurableObject<Env> {
       summary: `Remote node "${att.siteId}" (${att.version ? `v${att.version}, ` : ''}${att.arch}) connected over WebSocket`,
       details: sanitizeDetails({ siteId: att.siteId, arch: att.arch, version: att.version ?? null }),
     });
-    return new Response(null, { status: 101, webSocket: client });
+    const selectedProto = (request.headers.get('sec-websocket-protocol') ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .find((s) => s === 'edgefetch-agent');
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      ...(selectedProto ? { headers: { 'sec-websocket-protocol': selectedProto } } : {}),
+    });
   }
 
   async listAgents(): Promise<{ connected: number; distinctPublicIps: number; agents: AgentAttachment[] }> {
@@ -523,7 +533,9 @@ export class AgentHubDO extends DurableObject<Env> {
       affinities: this.engine.listAffinities(),
       grants: await this.oauth.listGrants(now),
       mcpClients: await this.activity.listMcpClients(),
-      events: await this.activity.listEvents(150),
+      events: this.activity.listPortalEvents
+        ? await this.activity.listPortalEvents(75, 75)
+        : await this.activity.listEvents(150),
     };
   }
 
@@ -642,7 +654,7 @@ export class AgentHubDO extends DurableObject<Env> {
         capabilities?: string[];
         reconnectAttempt?: number;
       };
-      if (msg.type === 'agent_hello') {
+      if (msg.type === 'agent_hello' || msg.type === 'hello') {
         const updated = this.engine.updateAgentHello(ws as unknown as HubSocketLike, msg);
         const att = updated ?? (ws.deserializeAttachment() as AgentAttachment | null);
         const evName = (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready';
@@ -993,14 +1005,22 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.4');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.5');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
         if (!auth.ok) return Response.json({ error: 'unauthorized' }, { status: 401 });
         const headers = new Headers(request.headers);
         headers.set('x-verified-site', auth.siteId);
-        const clientIp = request.headers.get('cf-connecting-ip') ?? request.headers.get('x-forwarded-for');
+        const xffRaw = request.headers.get('x-forwarded-for');
+        const rightmostXff = xffRaw
+          ? xffRaw
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean)
+              .pop()
+          : undefined;
+        const clientIp = request.headers.get('cf-connecting-ip') ?? rightmostXff;
         if (clientIp) headers.set('x-verified-ip', clientIp);
         const reqShard = (url.searchParams.get('shard') ?? '').trim();
         const targetShard = reqShard && shardNames.includes(reqShard) ? reqShard : shardNames[0]!;
@@ -1070,7 +1090,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.5.4',
+          serverVersion: '2.5.5',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1309,7 +1329,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.5.4'), {
+        return Response.json(buildCapabilities(env, '2.5.5'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -1411,13 +1431,16 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
-        const rawScrapeText = await request.text();
-        if (new TextEncoder().encode(rawScrapeText).byteLength > MAX_CALL_UTF8_BYTES) {
-          return Response.json({ error: 'too_large' }, { status: 413 });
+        const cappedScrape = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedScrape.ok) {
+          return Response.json(
+            { error: cappedScrape.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedScrape.error === 'too_large' ? 413 : 400 },
+          );
         }
         let payload: ScrapeRequestPayload;
         try {
-          payload = JSON.parse(rawScrapeText) as ScrapeRequestPayload;
+          payload = JSON.parse(cappedScrape.text) as ScrapeRequestPayload;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -1463,9 +1486,15 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: corsHeaders });
         }
-        const rawClipText = await request.text();
-        if (new TextEncoder().encode(rawClipText).byteLength > 4 * 1024 * 1024) {
-          return Response.json({ error: 'too_large', message: 'Tab clip exceeds 4 MiB limit' }, { status: 413, headers: corsHeaders });
+        const cappedClip = await readBodyTextCapped(request, 4 * 1024 * 1024);
+        if (!cappedClip.ok) {
+          return Response.json(
+            {
+              error: cappedClip.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+              ...(cappedClip.error === 'too_large' ? { message: 'Tab clip exceeds 4 MiB limit' } : {}),
+            },
+            { status: cappedClip.error === 'too_large' ? 413 : 400, headers: corsHeaders },
+          );
         }
         let clipPayload: {
           url?: string;
@@ -1476,7 +1505,7 @@ export default {
           onlyMainContent?: boolean;
         };
         try {
-          clipPayload = JSON.parse(rawClipText) as typeof clipPayload;
+          clipPayload = JSON.parse(cappedClip.text) as typeof clipPayload;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400, headers: corsHeaders });
         }
@@ -1571,13 +1600,16 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
-        const rawExtractText = await request.text();
-        if (new TextEncoder().encode(rawExtractText).byteLength > MAX_CALL_UTF8_BYTES) {
-          return Response.json({ error: 'too_large' }, { status: 413 });
+        const cappedExtract = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedExtract.ok) {
+          return Response.json(
+            { error: cappedExtract.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedExtract.error === 'too_large' ? 413 : 400 },
+          );
         }
         let payload: ExtractRequestPayload;
         try {
-          payload = JSON.parse(rawExtractText) as ExtractRequestPayload;
+          payload = JSON.parse(cappedExtract.text) as ExtractRequestPayload;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -1610,13 +1642,16 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
-        const rawInteractText = await request.text();
-        if (new TextEncoder().encode(rawInteractText).byteLength > MAX_CALL_UTF8_BYTES) {
-          return Response.json({ error: 'too_large' }, { status: 413 });
+        const cappedInteract = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedInteract.ok) {
+          return Response.json(
+            { error: cappedInteract.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedInteract.error === 'too_large' ? 413 : 400 },
+          );
         }
         let payload: InteractRequestPayload;
         try {
-          payload = JSON.parse(rawInteractText) as InteractRequestPayload;
+          payload = JSON.parse(cappedInteract.text) as InteractRequestPayload;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -1651,9 +1686,16 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
+        const cappedMap = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedMap.ok) {
+          return Response.json(
+            { error: cappedMap.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedMap.error === 'too_large' ? 413 : 400 },
+          );
+        }
         let payload: MapRequestPayload;
         try {
-          payload = (await request.json()) as MapRequestPayload;
+          payload = JSON.parse(cappedMap.text) as MapRequestPayload;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -1685,9 +1727,16 @@ export default {
         if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
+        const cappedSearch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedSearch.ok) {
+          return Response.json(
+            { error: cappedSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedSearch.error === 'too_large' ? 413 : 400 },
+          );
+        }
         let payload: SearchRequestPayload;
         try {
-          payload = (await request.json()) as SearchRequestPayload;
+          payload = JSON.parse(cappedSearch.text) as SearchRequestPayload;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -1716,9 +1765,16 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
+        const cappedPreview = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedPreview.ok) {
+          return Response.json(
+            { error: cappedPreview.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedPreview.error === 'too_large' ? 413 : 400 },
+          );
+        }
         let payload: Record<string, unknown>;
         try {
-          payload = (await request.json()) as Record<string, unknown>;
+          payload = JSON.parse(cappedPreview.text) as Record<string, unknown>;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -1742,9 +1798,16 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
+        const cappedBatch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedBatch.ok) {
+          return Response.json(
+            { error: cappedBatch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedBatch.error === 'too_large' ? 413 : 400 },
+          );
+        }
         let payload: Record<string, unknown>;
         try {
-          payload = (await request.json()) as Record<string, unknown>;
+          payload = JSON.parse(cappedBatch.text) as Record<string, unknown>;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -1825,13 +1888,16 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
-        const rawAgentText = await request.text();
-        if (new TextEncoder().encode(rawAgentText).byteLength > MAX_CALL_UTF8_BYTES) {
-          return Response.json({ error: 'too_large' }, { status: 413 });
+        const cappedAgent = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedAgent.ok) {
+          return Response.json(
+            { error: cappedAgent.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedAgent.error === 'too_large' ? 413 : 400 },
+          );
         }
         let payload: Record<string, unknown>;
         try {
-          payload = JSON.parse(rawAgentText) as Record<string, unknown>;
+          payload = JSON.parse(cappedAgent.text) as Record<string, unknown>;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -1927,9 +1993,16 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
+        const cappedCrawl = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedCrawl.ok) {
+          return Response.json(
+            { error: cappedCrawl.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedCrawl.error === 'too_large' ? 413 : 400 },
+          );
+        }
         let payload: Record<string, unknown>;
         try {
-          payload = (await request.json()) as Record<string, unknown>;
+          payload = JSON.parse(cappedCrawl.text) as Record<string, unknown>;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -2032,8 +2105,15 @@ export default {
         let query = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
         let limit = Number(url.searchParams.get('limit') ?? 10);
         if (request.method === 'POST') {
+          const cappedColSearch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedColSearch.ok) {
+            return Response.json(
+              { error: cappedColSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedColSearch.error === 'too_large' ? 413 : 400, headers: { 'cache-control': 'no-store' } },
+            );
+          }
           try {
-            const bodyJson = (await request.json()) as { query?: unknown; q?: unknown; limit?: unknown };
+            const bodyJson = JSON.parse(cappedColSearch.text) as { query?: unknown; q?: unknown; limit?: unknown };
             if (typeof bodyJson.query === 'string') query = bodyJson.query;
             else if (typeof bodyJson.q === 'string') query = bodyJson.q;
             if (typeof bodyJson.limit === 'number' && Number.isFinite(bodyJson.limit)) limit = bodyJson.limit;
@@ -2069,13 +2149,16 @@ export default {
         if (!auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
-        const rawJobsText = await request.text();
-        if (new TextEncoder().encode(rawJobsText).byteLength > MAX_CALL_UTF8_BYTES) {
-          return Response.json({ error: 'too_large' }, { status: 413 });
+        const cappedJobs = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedJobs.ok) {
+          return Response.json(
+            { error: cappedJobs.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedJobs.error === 'too_large' ? 413 : 400 },
+          );
         }
         let payload: JobsToolPayload;
         try {
-          payload = JSON.parse(rawJobsText) as JobsToolPayload;
+          payload = JSON.parse(cappedJobs.text) as JobsToolPayload;
         } catch {
           return Response.json({ error: 'bad_json' }, { status: 400 });
         }
@@ -2117,10 +2200,14 @@ export default {
       if (request.method === 'POST' && url.pathname === '/fetch') {
         const parsedTarget = parseFetchTarget(url);
         if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
-        const body = await request.text();
-        if (new TextEncoder().encode(body).byteLength > MAX_CALL_UTF8_BYTES) {
-          return Response.json({ error: 'too_large' }, { status: 413 });
+        const cappedFetch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedFetch.ok) {
+          return Response.json(
+            { error: cappedFetch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedFetch.error === 'too_large' ? 413 : 400 },
+          );
         }
+        const body = cappedFetch.text;
         const rawRetention = url.searchParams.get('artifacts');
         const artifactRetention: ArtifactRetention | 'off' | undefined =
           rawRetention === 'stored'

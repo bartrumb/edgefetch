@@ -131,6 +131,19 @@ class TestEdgeFetchPythonSDK(unittest.TestCase):
         assert cross_origin is not None
         self.assertIsNone(cross_origin.get_header("Authorization"))
 
+    def test_cleartext_http_rejected_unless_loopback_or_explicit_opt_in(self) -> None:
+        with self.assertRaises(ValueError):
+            EdgeFetchClient(token="tok-123", base_url="http://remote-hub.example.com")
+        with self.assertRaises(ValueError):
+            EdgeFetchClient(token="tok-123", base_urls=["https://ok.example.com", "http://192.168.1.50:8787"])
+
+        for loopback in ("http://127.0.0.1:8787", "http://localhost:8787", "http://[::1]:8787"):
+            c = EdgeFetchClient(token="tok-123", base_url=loopback)
+            self.assertEqual(c.base_urls, [loopback])
+
+        opted_in = EdgeFetchClient(token="tok-123", base_url="http://hub.internal:8787", allow_insecure_http=True)
+        self.assertEqual(opted_in.base_urls, ["http://hub.internal:8787"])
+
 
 if __name__ == "__main__":
     unittest.main()

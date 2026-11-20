@@ -706,7 +706,9 @@ func TestRobotsFollowsMultiHopRedirectsAndBlocksSSRFRedirect(t *testing.T) {
 }
 
 func TestStreamingLargePDFExceedingMaxBytesExtractsMarkdownWithoutTruncation(t *testing.T) {
-	// Build a valid ~1.5 MiB PDF while setting Options.MaxBytes = 64 KiB so in-memory buffering would fail with "body over 65536 bytes".
+	// Build a valid ~1.5 MiB PDF while setting Options.MaxBytes = 64 KiB + EDGEFETCH_MAX_PDF_BYTES = 4 MiB so
+	// in-memory HTML buffering would fail at 64 KiB while PDF streaming honors EDGEFETCH_MAX_PDF_BYTES.
+	t.Setenv("EDGEFETCH_MAX_PDF_BYTES", "4194304")
 	var pdfBuf strings.Builder
 	pdfBuf.WriteString("%PDF-1.7\n1 0 obj << /Length 64 >>\nstream\nBT /F1 12 Tf 72 712 Td (GOTRAX Porter Torque Spec 45 Nm) Tj ET\nendstream\nendobj\n")
 	pdfBuf.WriteString("%DiagramPadding ")
@@ -731,7 +733,7 @@ func TestStreamingLargePDFExceedingMaxBytesExtractsMarkdownWithoutTruncation(t *
 	}, Options{PauseMs: 1, MaxBytes: 64 * 1024, IncludeBody: true})
 
 	if out[0].Outcome != classify.OutcomeOK {
-		t.Fatalf("expected 1.5 MiB PDF with 64 KiB MaxBytes to stream to /tmp without truncation, got: %+v", out[0])
+		t.Fatalf("expected 1.5 MiB PDF with EDGEFETCH_MAX_PDF_BYTES=4MiB to stream to /tmp without truncation, got: %+v", out[0])
 	}
 	if out[0].Bytes != len(largePDF) {
 		t.Fatalf("expected raw PDF byte count %d, got %d", len(largePDF), out[0].Bytes)
@@ -744,6 +746,22 @@ func TestStreamingLargePDFExceedingMaxBytesExtractsMarkdownWithoutTruncation(t *
 	}
 	if len(out[0].Body) >= 4096 || !strings.HasPrefix(out[0].ContentType, "text/markdown") {
 		t.Fatalf("expected compact text/markdown Body for R2 upload (len=%d, ct=%q)", len(out[0].Body), out[0].ContentType)
+	}
+
+	// M2: When EDGEFETCH_MAX_PDF_BYTES is unset, an explicit caller Options.MaxBytes != DefaultMaxBytes caps PDF streaming,
+	// whereas default Options{} uses the 64 MiB streaming ceiling!
+	t.Setenv("EDGEFETCH_MAX_PDF_BYTES", "")
+	cappedOut := c.Run(context.Background(), []Request{
+		{ID: "manual-capped", URL: "http://manuals.test/GOTRAX_Porter_User_Manual.pdf", Kind: classify.KindScrape},
+	}, Options{PauseMs: 1, MaxBytes: 64 * 1024})
+	if !cappedOut[0].Truncated || cappedOut[0].Outcome != classify.OutcomeError {
+		t.Fatalf("M2: expected explicit Options.MaxBytes=64KiB to cap streaming PDF when env is unset, got: %+v", cappedOut[0])
+	}
+	defaultOut := c.Run(context.Background(), []Request{
+		{ID: "manual-default", URL: "http://manuals.test/GOTRAX_Porter_User_Manual.pdf", Kind: classify.KindScrape},
+	}, Options{PauseMs: 1})
+	if defaultOut[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected default Options{} to stream 1.5 MiB PDF under 64 MiB cap, got: %+v", defaultOut[0])
 	}
 }
 
@@ -803,5 +821,111 @@ func TestPostJsonAndTransientRobotsRetry(t *testing.T) {
 	}
 	if out[0].Timing.RobotsMs < 0 {
 		t.Fatalf("expected Timing.RobotsMs to be recorded, got: %+v", out[0].Timing)
+	}
+}
+
+func TestAgenticWebMarkdownForAgentsContentSignalsHTTP402AndLogRedaction(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Host {
+		case "md-origin.test":
+			if r.URL.Path == "/robots.txt" {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("User-agent: *\nContent-Signal: search=yes, ai-input=yes, ai-train=no\nAllow: /\n"))
+				return
+			}
+			if r.URL.Path == "/llms.txt" || r.URL.Path == "/.well-known/llms.txt" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if strings.Contains(r.Header.Get("Accept"), "text/markdown") {
+				w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+				_, _ = w.Write([]byte("# Markdown for Agents\n\nPreserves `<T>` generic and email ops@example.com without HTML stripping.\n"))
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte("<html><body><main><h1>HTML Fallback</h1></main></body></html>"))
+
+		case "signal-blocked.test":
+			if r.URL.Path == "/robots.txt" {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("User-agent: *\nContent-Signal: search=yes, ai-input=no, ai-train=no\nAllow: /\n"))
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>should never be fetched</html>"))
+
+		case "signal-specific-allow.test":
+			if r.URL.Path == "/robots.txt" {
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("User-agent: *\nContent-Signal: ai-input=no\nDisallow: /\n\nUser-agent: edgefetch\nContent-Signal: ai-input=yes\nAllow: /\n"))
+				return
+			}
+			w.Header().Set("Content-Type", "text/markdown")
+			_, _ = w.Write([]byte("# Allowed Specific Agent\n"))
+
+		case "x402.test":
+			if r.URL.Path == "/robots.txt" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = w.Write([]byte(`{"x402Version":1,"accepts":[{"scheme":"exact","maxAmountRequired":"2000"}]}`))
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	var logBuf bytes.Buffer
+	addr := srv.Listener.Addr().String()
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}
+	c := NewCrawler(tr, func(*url.URL) error { return nil }, DefaultUserAgent, slog.New(slog.NewJSONHandler(&logBuf, nil)))
+	c.Sleep = func(context.Context, time.Duration) error { return nil }
+	defer c.Close()
+
+	res := c.Run(context.Background(), []Request{
+		{ID: "g1-scrape", URL: "http://md-origin.test/post?api_key=LOG_SECRET_123#frag", Kind: classify.KindScrape, RedactPII: true, DiscoverLlms: Bool(false)},
+		{ID: "g1-page", URL: "http://md-origin.test/page", Kind: classify.KindPage, Formats: []string{"markdown"}},
+		{ID: "g2-blocked", URL: "http://signal-blocked.test/article", Kind: classify.KindScrape},
+		{ID: "g2-allowed", URL: "http://signal-specific-allow.test/article", Kind: classify.KindPage, Formats: []string{"markdown"}},
+		{ID: "g3-pay-1", URL: "http://x402.test/paid-1?token=PAY_SECRET_456#frag2", Kind: classify.KindScrape},
+		{ID: "g3-pay-2", URL: "http://x402.test/paid-2", Kind: classify.KindScrape},
+	}, Options{PauseMs: 1, Retries: 2})
+
+	if res[0].Outcome != classify.OutcomeOK || res[0].ContentSource != "origin-markdown" {
+		t.Fatalf("G1: expected KindScrape origin-markdown ok, got: %+v", res[0])
+	}
+	if !strings.Contains(res[0].Markdown, "`<T>`") || strings.Contains(res[0].Markdown, "ops@example.com") {
+		t.Fatalf("G1: expected raw Markdown preserved + PII redacted, got: %q", res[0].Markdown)
+	}
+	if res[1].Outcome != classify.OutcomeOK || res[1].ContentSource != "origin-markdown" {
+		t.Fatalf("G1: expected KindPage 200 text/markdown accepted as OutcomeOK + origin-markdown, got: %+v", res[1])
+	}
+	if res[2].Outcome != classify.OutcomeError || res[2].Problem != "disallowed by /robots.txt Content-Signal: ai-input=no" {
+		t.Fatalf("G2: expected Content-Signal: ai-input=no block problem, got: %+v", res[2])
+	}
+	if res[3].Outcome != classify.OutcomeOK || !strings.Contains(res[3].Markdown, "Allowed Specific Agent") {
+		t.Fatalf("G2: expected specific edgefetch User-agent group to override wildcard Content-Signal, got: %+v", res[3])
+	}
+	if res[4].Outcome != classify.OutcomePaymentRequired || res[4].Attempts != 1 || res[4].Problem != "http 402 payment required" {
+		t.Fatalf("G3: expected HTTP 402 to return payment_required without retry, got: %+v", res[4])
+	}
+	if res[5].Outcome != classify.OutcomeNotTried {
+		t.Fatalf("G3: expected HTTP 402 to stop remaining host batch requests, got: %+v", res[5])
+	}
+
+	// M11: Verify RedactEmbeddedURLs and structured crawl logs strip query strings, fragments, and user:pass@.
+	scrubbed := RedactEmbeddedURLs(`Get "https://alice:s3cr3t@host.example.com/p?api_key=TOP_SECRET_999#frag": timeout`)
+	if scrubbed != `Get "https://host.example.com/p": timeout` {
+		t.Fatalf("M11: RedactEmbeddedURLs = %q", scrubbed)
+	}
+	if strings.Contains(logBuf.String(), "LOG_SECRET_123") || strings.Contains(logBuf.String(), "PAY_SECRET_456") || strings.Contains(res[5].Problem, "PAY_SECRET_456") {
+		t.Fatalf("M11: query secret leaked into logs or host-stop problem: logs=%s problem=%q", logBuf.String(), res[5].Problem)
 	}
 }

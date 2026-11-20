@@ -160,6 +160,27 @@ func TestRobotsRFC9309EdgeCasesBOMPercentEncodingProductTokenAnd500KiB(t *testin
 	if RobotsMaxBytes < 500*1024 {
 		t.Fatalf("A4 BUG: RobotsMaxBytes = %d, RFC 9309 requires >= 512000", RobotsMaxBytes)
 	}
+
+	// 5. G2 Cloudflare Content Signals: ai-input=no blocks wildcard, while specific `edgefetch` group overrides `*`!
+	cfWildBlocked := "User-agent: *\nContent-Signal: search=yes, ai-input=no, ai-train=no\nAllow: /\n"
+	wildBlockedEntry := ParseRobotsTxt(cfWildBlocked, "edgefetch", exp)
+	if !wildBlockedEntry.DisallowAIInput || !wildBlockedEntry.ContentSignalBlocked() || wildBlockedEntry.Allowed("/docs") {
+		t.Fatalf("G2: expected Content-Signal: ai-input=no to disallow retrieval, got %+v", wildBlockedEntry)
+	}
+
+	// ai-train=no with ai-input=yes MUST allow EdgeFetch (non-training user-triggered agent).
+	cfTrainBlockedOnly := "User-agent: *\nContent-Signal: search=yes, ai-input=yes, ai-train=no\nAllow: /\n"
+	trainOnlyEntry := ParseRobotsTxt(cfTrainBlockedOnly, "edgefetch", exp)
+	if trainOnlyEntry.DisallowAIInput || trainOnlyEntry.ContentSignalBlocked() || !trainOnlyEntry.Allowed("/docs") {
+		t.Fatalf("G2: expected Content-Signal: ai-input=yes, ai-train=no to allow EdgeFetch, got %+v", trainOnlyEntry)
+	}
+
+	// Specific `User-agent: edgefetch` group overrides wildcard `Content-Signal: ai-input=no` per RFC 9309 specificity.
+	cfSpecificAllow := "User-agent: *\nContent-Signal: search=yes, ai-input=no, ai-train=no\nDisallow: /\n\nUser-agent: edgefetch\nContent-Signal: ai-input=yes, ai-train=no\nAllow: /\n"
+	specAllowEntry := ParseRobotsTxt(cfSpecificAllow, "edgefetch", exp)
+	if specAllowEntry.DisallowAIInput || !specAllowEntry.Allowed("/docs") {
+		t.Fatalf("G2: expected specific edgefetch group to override wildcard Content-Signal, got %+v", specAllowEntry)
+	}
 }
 
 func FuzzParseRobotsTxt(f *testing.F) {

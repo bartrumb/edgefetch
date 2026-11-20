@@ -40,16 +40,26 @@ function normalizeSocketIp(addr: string | undefined): string {
   return raw;
 }
 
+const MAX_PORTABLE_REQ_BODY_BYTES = 20 * 1024 * 1024; // 20 MiB hard streaming ceiling on inbound Node HTTP bodies (`M8`)
+
 function resolveTrustedClientIp(req: IncomingMessage, trustProxy: boolean): string {
   if (trustProxy) {
-    const xff = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim();
-    if (xff) return normalizeSocketIp(xff);
+    // M8: Extract the RIGHTMOST comma-separated IP appended by the trusted reverse proxy — NEVER the client-spoofable leftmost IP!
+    const rawXff = req.headers['x-forwarded-for'];
+    const joined = Array.isArray(rawXff) ? rawXff.join(',') : (rawXff ?? '');
+    const parts = joined
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    const rightmost = parts.length > 0 ? parts[parts.length - 1] : undefined;
+    if (rightmost) return normalizeSocketIp(rightmost);
   }
   return normalizeSocketIp(req.socket?.remoteAddress);
 }
 
 function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array> {
   let closed = false;
+  let totalBytes = 0;
   let ctrl!: ReadableStreamDefaultController<Uint8Array>;
   const cleanup = () => {
     req.removeListener('data', onData);
@@ -59,6 +69,18 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
   };
   const onData = (chunk: Buffer | Uint8Array) => {
     if (closed) return;
+    totalBytes += chunk.byteLength;
+    if (totalBytes > MAX_PORTABLE_REQ_BODY_BYTES) {
+      closed = true;
+      cleanup();
+      try {
+        ctrl.error(new Error('Request body exceeds 20 MiB limit'));
+      } catch {
+        // ignore
+      }
+      req.destroy();
+      return;
+    }
     try {
       ctrl.enqueue(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
     } catch {
@@ -102,12 +124,19 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
   });
 }
 
-function incomingToWebRequest(req: IncomingMessage, canonicalOrigin: string, trustProxy: boolean): Request {
+function incomingToWebRequest(
+  req: IncomingMessage,
+  canonicalOrigin: string,
+  trustProxy: boolean,
+  hasExplicitPublicOrigin = false,
+): Request {
   const baseOriginUrl = new URL(canonicalOrigin);
   let proto = baseOriginUrl.protocol.replace(/:$/, '');
   let authority = baseOriginUrl.host;
 
-  if (trustProxy) {
+  // M8: When `EDGEFETCH_PUBLIC_ORIGIN` is explicitly configured, strictly pin request origin to `EDGEFETCH_PUBLIC_ORIGIN`
+  // and ignore `X-Forwarded-Host` / `X-Forwarded-Proto` so proxy header injection cannot poison OAuth / MCP origins!
+  if (trustProxy && !hasExplicitPublicOrigin) {
     const fwdProto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim().toLowerCase();
     if (fwdProto === 'https' || fwdProto === 'http') {
       proto = fwdProto;
@@ -120,8 +149,6 @@ function incomingToWebRequest(req: IncomingMessage, canonicalOrigin: string, tru
     // Reject malformed raw Host headers (`Host: [`) with 400 (H3), while keeping `selfHost` pinned to `canonicalOrigin` (H4)!
     const rawHost = req.headers.host;
     if (typeof rawHost === 'string' && rawHost.trim() !== '') {
-      // Test URL constructability on rawHost so syntactically invalid Host headers fail closed as 400 Bad Request
-      // without letting untrusted `Host: localhost` mutate `selfHost`.
       void new URL(`http://${rawHost.trim()}/`);
     }
   }
@@ -259,14 +286,16 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   };
 
   let boundPort = port;
-  const resolveCanonicalOrigin = (): string => {
-    if (mergedEnv.EDGEFETCH_PUBLIC_ORIGIN?.trim()) {
-      try {
-        return new URL(mergedEnv.EDGEFETCH_PUBLIC_ORIGIN.trim()).origin;
-      } catch {
-        // fall through to bound origin
-      }
+  let explicitPublicOrigin: string | null = null;
+  if (mergedEnv.EDGEFETCH_PUBLIC_ORIGIN?.trim()) {
+    try {
+      explicitPublicOrigin = new URL(mergedEnv.EDGEFETCH_PUBLIC_ORIGIN.trim()).origin;
+    } catch {
+      explicitPublicOrigin = null;
     }
+  }
+  const resolveCanonicalOrigin = (): string => {
+    if (explicitPublicOrigin) return explicitPublicOrigin;
     const defaultHost = host === '0.0.0.0' || host === '::' ? 'hub.local' : host;
     return `http://${defaultHost}:${boundPort}`;
   };
@@ -283,7 +312,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const server = createServer(async (req, res) => {
     let webReq: Request;
     try {
-      webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy);
+      webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy, explicitPublicOrigin !== null);
     } catch {
       res.statusCode = 400;
       res.setHeader('content-type', 'application/json');
@@ -333,7 +362,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       }
       let webReq: Request;
       try {
-        webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy);
+        webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy, explicitPublicOrigin !== null);
       } catch {
         socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
         socket.destroy();
@@ -347,6 +376,10 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         return;
       }
       const pubIp = resolveTrustedClientIp(req, trustProxy);
+      const selectedProto = String(req.headers['sec-websocket-protocol'] ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .find((s) => s === 'edgefetch-agent');
       coordinator.acceptNodeUpgrade({
         wsKey,
         socket,
@@ -356,6 +389,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         version: (req.headers['x-agent-version'] as string | undefined) ?? null,
         capabilities: (req.headers['x-agent-capabilities'] as string | undefined) ?? null,
         publicIp: pubIp,
+        subprotocol: selectedProto ?? null,
       });
     } catch {
       try {

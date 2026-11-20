@@ -29,6 +29,8 @@ export interface EdgeFetchClientOptions {
   /** Ordered list of Hub URLs for active-standby HA failover (e.g. `[cloudflareHub, tailscaleGoHub]`). */
   baseUrls?: string[];
   token: string;
+  /** Allow cleartext `http://` Hub URLs for non-loopback hosts (default `false`; `127.0.0.1` / `localhost` / `[::1]` are always allowed). */
+  allowInsecureHttp?: boolean;
   fetchFn?: typeof fetch;
 }
 
@@ -150,6 +152,30 @@ export class EdgeFetchError extends Error {
   }
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+  const clean = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return clean === '127.0.0.1' || clean === 'localhost' || clean === '::1';
+}
+
+function validateHubOrigin(raw: string, allowInsecureHttp: boolean): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`Invalid EdgeFetch Hub baseUrl "${raw}": expected https:// origin`);
+  }
+  const proto = parsed.protocol.toLowerCase();
+  if (proto !== 'https:' && proto !== 'http:') {
+    throw new Error(`Unsupported EdgeFetch Hub protocol "${parsed.protocol}" in "${raw}": expected https://`);
+  }
+  if (proto === 'http:' && !allowInsecureHttp && !isLoopbackHostname(parsed.hostname)) {
+    throw new Error(
+      `Refusing cleartext http:// Hub URL "${raw}" for non-loopback host "${parsed.hostname}" (use https:// or set allowInsecureHttp: true)`,
+    );
+  }
+  return raw;
+}
+
 export class EdgeFetchClient {
   private readonly baseUrls: string[];
   private readonly token: string;
@@ -165,7 +191,8 @@ export class EdgeFetchClient {
     if (urls.length === 0) {
       throw new Error('EdgeFetchClient requires baseUrl or non-empty baseUrls');
     }
-    this.baseUrls = [...new Set(urls)];
+    const allowInsecure = options.allowInsecureHttp === true;
+    this.baseUrls = [...new Set(urls)].map((u) => validateHubOrigin(u, allowInsecure));
     this.token = options.token;
     this.fetchFn = options.fetchFn ?? fetch;
   }

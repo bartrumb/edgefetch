@@ -202,7 +202,8 @@ function renderDashboardHtml(params: {
 <body>
   <header>
     <h1>${escapeHtml(params.serviceName)} <span class="pill" id="conn-pill">Loading...</span></h1>
-    <div style="display:flex;gap:8px;align-items:center">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span class="chip" title="Cloudflare Content Signals in robots.txt">Content Signals: honored (ai-input)</span>
       <span class="muted" id="last-poll">Live (15s)</span>
       <button type="button" id="refresh-btn">Refresh</button>
       <form method="post" action="/admin/logout" style="margin:0">
@@ -839,13 +840,35 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     }
 
     if (path === '/admin/api/affinity/clear') {
-      const body = (await request.json().catch(() => ({}))) as { siteId?: string };
+      const capped = await readBodyTextCapped(request, 65_536);
+      if (!capped.ok) {
+        return Response.json({ error: 'payload_too_large' }, { status: capped.error === 'too_large' ? 413 : 400 });
+      }
+      let body: { siteId?: string } = {};
+      if (capped.text.trim()) {
+        try {
+          body = JSON.parse(capped.text) as { siteId?: string };
+        } catch {
+          body = {};
+        }
+      }
       await deps.clearAffinities(body.siteId);
       return Response.json({ ok: true }, { status: 200, headers: { 'cache-control': 'no-store' } });
     }
 
     if (path === '/admin/api/grants/revoke') {
-      const body = (await request.json().catch(() => ({}))) as { grantId?: string };
+      const capped = await readBodyTextCapped(request, 65_536);
+      if (!capped.ok) {
+        return Response.json({ error: 'payload_too_large' }, { status: capped.error === 'too_large' ? 413 : 400 });
+      }
+      let body: { grantId?: string } = {};
+      if (capped.text.trim()) {
+        try {
+          body = JSON.parse(capped.text) as { grantId?: string };
+        } catch {
+          body = {};
+        }
+      }
       if (!body.grantId || typeof body.grantId !== 'string') {
         return Response.json({ error: 'missing_grant_id' }, { status: 400 });
       }
@@ -854,7 +877,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     }
 
     if (path === '/admin/api/fetch') {
-      const body = (await request.json().catch(() => ({}))) as {
+      const capped = await readBodyTextCapped(request, 65_536);
+      if (!capped.ok) {
+        return Response.json({ error: 'payload_too_large' }, { status: capped.error === 'too_large' ? 413 : 400 });
+      }
+      let body: {
         url?: string;
         kind?: string;
         target?: string;
@@ -864,7 +891,14 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         respectRobots?: boolean;
         robots?: boolean;
         includeBody?: boolean;
-      };
+      } = {};
+      if (capped.text.trim()) {
+        try {
+          body = JSON.parse(capped.text) as typeof body;
+        } catch {
+          return Response.json({ error: 'invalid_json' }, { status: 400 });
+        }
+      }
       if (!body.url || typeof body.url !== 'string') {
         return Response.json({ error: 'missing_url' }, { status: 400 });
       }

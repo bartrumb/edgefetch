@@ -12,7 +12,7 @@
 #   bash install-termux-agent.sh
 set -euo pipefail
 
-VERSION="${EDGEFETCH_VERSION:-2.5.4}"
+VERSION="${EDGEFETCH_VERSION:-2.5.5}"
 if [[ -z "${EDGEFETCH_HUB_URL:-}" || -z "${EDGEFETCH_AGENT_TOKEN:-}" ]]; then
   echo "ERROR: Set EDGEFETCH_HUB_URL and EDGEFETCH_AGENT_TOKEN before running." >&2
   exit 1
@@ -23,13 +23,26 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
 fi
 SITE_ID="${EDGEFETCH_SITE_ID:-android-termux-1}"
 
+ARCH="$(uname -m)"
+case "$ARCH" in
+  aarch64|arm64)
+    GOARCH="arm64"
+    ;;
+  x86_64|amd64)
+    GOARCH="amd64"
+    ;;
+  armv7*|armv8l)
+    echo "32-bit ARM is not prebuilt; run 'pkg install golang && go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@v${VERSION}'" >&2
+    exit 1
+    ;;
+  *)
+    echo "ERROR: Unsupported architecture '${ARCH}'; run 'pkg install golang && go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@v${VERSION}'" >&2
+    exit 1
+    ;;
+esac
+
 pkg update -y
 pkg install -y coreutils curl openssl-tool tar termux-api termux-services
-
-ARCH="$(uname -m)"
-GOARCH="arm64"
-[[ "$ARCH" == "x86_64" ]] && GOARCH="amd64"
-[[ "$ARCH" == "armv7l" || "$ARCH" == "armv8l" ]] && GOARCH="armv7"
 
 BIN_DIR="$PREFIX/bin"
 tmp_dir="$(mktemp -d)"

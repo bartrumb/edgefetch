@@ -157,4 +157,13 @@ func TestStreamingPDFCutOffAtConfiguredCapAndCrossOriginRedirectHeaderStrip(t *t
 	if leakedHeader.Load() {
 		t.Fatal("SECURITY: custom request header leaked across cross-origin HTTP redirect")
 	}
+
+	// M2: Verify explicit Options.MaxBytes also caps streaming PDFs when EDGEFETCH_MAX_PDF_BYTES is unset.
+	t.Setenv("EDGEFETCH_MAX_PDF_BYTES", "")
+	resOptCap := c.Run(context.Background(), []Request{
+		{ID: "pdf-opt-cap", URL: "http://first.example/giant.pdf", Kind: classify.KindScrape},
+	}, Options{MaxBytes: 4096})
+	if !resOptCap[0].Truncated || resOptCap[0].Outcome != classify.OutcomeError {
+		t.Fatalf("M2: expected giant PDF exceeding explicit Options.MaxBytes=4096 to fail truncated, got: %+v", resOptCap[0])
+	}
 }

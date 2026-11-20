@@ -189,8 +189,17 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
   const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 16, lookup: safeLookup });
   const loopbackHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 8 });
 
-  const executeSingleRequest = (targetUrl: URL, init: RequestInit | undefined, bodyBytes: Buffer | null): Promise<Response> =>
+  const executeSingleRequest = (
+    targetUrl: URL,
+    init: RequestInit | undefined,
+    bodyBytes: Buffer | null,
+    allowLoopbackThisHop: boolean,
+  ): Promise<Response> =>
     new Promise<Response>((resolve, reject) => {
+      if (init?.signal?.aborted) {
+        reject(init.signal.reason ?? new DOMException('Aborted', 'AbortError'));
+        return;
+      }
       const isHttps = targetUrl.protocol === 'https:';
       const isHttp = targetUrl.protocol === 'http:';
       if (!isHttps && !isHttp) {
@@ -198,12 +207,12 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         return;
       }
       const isExplicitLoopback =
-        opts.allowExplicitLoopbackUrls === true &&
+        allowLoopbackThisHop &&
         (targetUrl.hostname === '127.0.0.1' || targetUrl.hostname === 'localhost' || targetUrl.hostname === '[::1]');
 
       if (!isExplicitLoopback && net.isIP(targetUrl.hostname.replace(/^\[|\]$/g, '')) !== 0) {
         if (!isPublicIpAddress(targetUrl.hostname)) {
-          reject(new Error(`refusing connection to non-public IP literal ${targetUrl.hostname}`));
+          reject(new Error(`SSRF blocked: refusing connection to non-public IP literal ${targetUrl.hostname}`));
           return;
         }
       }
@@ -255,20 +264,26 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
           resolve(response);
         },
       );
+      req.on('error', (err) => {
+        reject(err);
+      });
 
       if (init?.signal) {
         if (init.signal.aborted) {
-          req.destroy(init.signal.reason instanceof Error ? init.signal.reason : new Error('Request aborted'));
+          const reason = init.signal.reason ?? new DOMException('Aborted', 'AbortError');
+          req.destroy(reason instanceof Error ? reason : new Error(String(reason)));
+          reject(reason);
           return;
         }
         const onAbort = () => {
-          req.destroy(init.signal?.reason instanceof Error ? init.signal.reason : new Error('Request aborted'));
+          const reason = init.signal?.reason ?? new DOMException('Aborted', 'AbortError');
+          req.destroy(reason instanceof Error ? reason : new Error(String(reason)));
+          reject(reason);
         };
         init.signal.addEventListener('abort', onAbort, { once: true });
         req.on('close', () => init.signal?.removeEventListener('abort', onAbort));
       }
 
-      req.on('error', reject);
       if (bodyBytes && bodyBytes.byteLength > 0) {
         req.write(bodyBytes);
       }
@@ -276,6 +291,9 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
     });
 
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    if (init?.signal?.aborted) {
+      throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
+    }
     const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     let currentUrl = new URL(rawUrl);
     let currentMethod = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
@@ -301,6 +319,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         currentUrl,
         { ...init, method: currentMethod, headers: currentHeaders },
         bodyBytes,
+        hop === 0 && opts.allowExplicitLoopbackUrls === true,
       );
       if (redirectMode !== 'follow' || res.status < 300 || res.status >= 400) {
         if (redirectMode === 'error' && res.status >= 300 && res.status < 400) {
@@ -321,6 +340,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         currentHeaders.delete('authorization');
         currentHeaders.delete('cookie');
         currentHeaders.delete('x-api-key');
+        currentHeaders.delete('x-goog-api-key');
       }
       if (res.status === 301 || res.status === 302 || res.status === 303) {
         currentMethod = 'GET';

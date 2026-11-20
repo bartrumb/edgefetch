@@ -42,10 +42,10 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      - name: Run staticcheck & govulncheck
+      - name: Run staticcheck & govulncheck (pinned Go 1.27-compatible versions)
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
           "$(go env GOPATH)/bin/staticcheck" ./...
           "$(go env GOPATH)/bin/govulncheck" ./...
 
@@ -102,15 +102,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Build server & HAOS add-on images + live AppArmor & WebGL Alpine Chromium smoke test
+      - name: Build server, all-in-one & HAOS add-on images + live AppArmor, Dumpable & UID-isolation smoke tests
         run: |
           docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile .
           docker buildx build --platform linux/amd64 -f Dockerfile.agent .
-          docker buildx build --platform linux/amd64 -f Dockerfile.all-in-one .
+          docker buildx build --load --platform linux/amd64 -t edgefetch-aio:smoke -f Dockerfile.all-in-one .
           docker buildx build --load --platform linux/amd64 -t edgefetch-ci:smoke -f edgefetch_fat/Dockerfile .
           sed 's/^profile edgefetch_fat/profile c3b8e9a1_edgefetch_fat/' edgefetch_fat/apparmor.txt > /tmp/haos_edgefetch_fat.apparmor
           sudo apparmor_parser -r /tmp/haos_edgefetch_fat.apparmor
-          mkdir -p /tmp/ef-ha-data
+          mkdir -p /tmp/ef-ha-data /tmp/ef-aio-data
           chmod 0755 /tmp/ef-ha-data
           printf '{"hub_url":"https://example.com","agent_token":"0123456789abcdef0123456789abcdef","site_id":"ci-node"}' > /tmp/ef-ha-data/options.json
           chmod 0644 /tmp/ef-ha-data/options.json
@@ -122,11 +122,20 @@ jobs:
             -p 127.0.0.1:18080:8080 \
             --entrypoint /edgefetch \
             edgefetch-ci:smoke --mode=server --addr=0.0.0.0:8080
-          trap 'sudo dmesg | grep -i edgefetch_fat || true; docker logs ef-smoke || true; docker stop ef-smoke || true' EXIT
+          trap 'sudo dmesg | grep -i edgefetch_fat || true; docker logs ef-smoke || true; docker stop ef-smoke || true; docker logs ef-aio-smoke 2>/dev/null || true; docker stop ef-aio-smoke 2>/dev/null || true' EXIT
           for i in $(seq 1 20); do
             curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
             sleep 0.5
           done
+          # Verify PID 1 AppArmor label, dropped UID 65532, and PR_SET_DUMPABLE=0 (`Dumpable: 0`)!
+          ef_pid=$(docker inspect -f '{{.State.Pid}}' ef-smoke)
+          ef_attr=$(sudo cat "/proc/${ef_pid}/attr/current")
+          ef_status=$(sudo grep -E '^(Uid|Gid|NoNewPrivs|Dumpable):' "/proc/${ef_pid}/status")
+          echo "=== ef-smoke /proc/1/attr/current: ${ef_attr} ==="
+          echo "${ef_status}"
+          echo "${ef_attr}" | grep -q 'edgefetch_fat'
+          echo "${ef_status}" | grep -Eq '^Uid:[[:space:]]+65532([[:space:]]+65532){3}$'
+          echo "${ef_status}" | grep -Eq '^Dumpable:[[:space:]]+0$'
           # Verify LockDownSecretPaths locked /data (0700) and /data/options.json (0600) so UID 65532 cannot read it!
           if docker exec -u 65532:65532 ef-smoke /usr/bin/pdftotext /data/options.json - 2>/dev/null; then
             echo "SECURITY FAILURE: UID 65532 was able to access /data/options.json!"
@@ -140,3 +149,31 @@ jobs:
           sudo dmesg | grep -i 'apparmor="DENIED".*edgefetch_fat' && exit 1 || true
           echo "$resp" | grep -q '"id":"smoke".*"outcome":"ok"'
           echo "$resp" | grep -q '"id":"webgl".*"outcome":"ok"'
+
+          # Smoke-test Dockerfile.all-in-one H3 UID isolation: Hub runs as node (1000), worker runs as 65532,
+          # and UID 65532 gets Permission denied reading /proc/<hub_pid>/environ and /data/hub!
+          docker run -d --rm --name ef-aio-smoke \
+            -v /tmp/ef-aio-data:/data \
+            -e CALLER_TOKEN=ci-aio-caller-token-0123456789abcdef \
+            -e OPENAI_API_KEY=sk-ci-hub-only-secret-do-not-leak \
+            -p 127.0.0.1:18787:8787 \
+            edgefetch-aio:smoke
+          for i in $(seq 1 30); do
+            if curl -fsS -H "Authorization: Bearer ci-aio-caller-token-0123456789abcdef" http://127.0.0.1:18787/agents 2>/dev/null | grep -q '"local-fat-1"'; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS -H "Authorization: Bearer ci-aio-caller-token-0123456789abcdef" http://127.0.0.1:18787/agents | grep -q '"local-fat-1"'
+          hub_pid=$(docker exec ef-aio-smoke sh -ec 'for f in /proc/[0-9]*/comm; do [ "$(cat "$f" 2>/dev/null)" = "node" ] && { echo "${f%/comm}" | cut -d/ -f3; break; }; done')
+          agent_pid=$(docker exec ef-aio-smoke sh -ec 'for f in /proc/[0-9]*/comm; do [ "$(cat "$f" 2>/dev/null)" = "edgefetch" ] && { echo "${f%/comm}" | cut -d/ -f3; break; }; done')
+          echo "=== ef-aio-smoke hub_pid=${hub_pid} agent_pid=${agent_pid} ==="
+          docker exec ef-aio-smoke grep -E '^(Uid|Gid|Dumpable):' "/proc/${hub_pid}/status"
+          docker exec ef-aio-smoke grep -E '^(Uid|Gid|Dumpable):' "/proc/${agent_pid}/status"
+          docker exec ef-aio-smoke grep -Eq '^Uid:[[:space:]]+1000([[:space:]]+1000){3}$' "/proc/${hub_pid}/status"
+          docker exec ef-aio-smoke grep -Eq '^Uid:[[:space:]]+65532([[:space:]]+65532){3}$' "/proc/${agent_pid}/status"
+          env_err=$(docker exec -u 65532:65532 ef-aio-smoke cat "/proc/${hub_pid}/environ" 2>&1 && exit 1 || true)
+          echo "$env_err" | grep -qi 'permission denied'
+          dir_err=$(docker exec -u 65532:65532 ef-aio-smoke ls /data/hub 2>&1 && exit 1 || true)
+          echo "$dir_err" | grep -qi 'permission denied'
+          docker stop ef-aio-smoke

@@ -121,9 +121,20 @@ function disconnect() {
   chrome.runtime.sendMessage({ type: 'NODE_STATUS_CHANGED', connected: false }).catch(() => undefined);
 }
 
+function toBase64UrlUtf8(raw) {
+  const bytes = new TextEncoder().encode(String(raw || ''));
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 async function executeDispatchedJob(cfg, frame) {
-  const payload = typeof frame.payload === 'string' ? JSON.parse(frame.payload) : frame.payload;
-  const requests = Array.isArray(payload?.requests) ? payload.requests : [];
+  const rawCall = frame.call ?? (typeof frame.payload === 'string' ? JSON.parse(frame.payload) : frame.payload);
+  const requests = Array.isArray(rawCall?.requests) ? rawCall.requests : [];
+  const jobNonce = frame.jobNonce || frame.nonce;
+  const siteId = cfg.siteId || 'browser-ext-1';
   const results = [];
   let hubHost = '';
   try {
@@ -147,6 +158,7 @@ async function executeDispatchedJob(cfg, frame) {
         res = await fetch(curUrl.toString(), {
           credentials: 'omit',
           redirect: 'manual',
+          headers: req.accept ? { accept: String(req.accept) } : undefined,
           signal: AbortSignal.timeout(25_000),
         });
         if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
@@ -189,7 +201,7 @@ async function executeDispatchedJob(cfg, frame) {
         url: req.url,
         finalUrl: curUrl.toString(),
         kind: req.kind || 'page',
-        outcome: truncated ? 'error' : res.ok ? 'ok' : `http_${res.status}`,
+        outcome: truncated ? 'error' : res.ok ? 'ok' : res.status === 402 ? 'payment_required' : `http_${res.status}`,
         status: res.status,
         contentType: res.headers.get('content-type') || 'text/html',
         bytes,
@@ -220,9 +232,9 @@ async function executeDispatchedJob(cfg, frame) {
     headers: {
       authorization: `Bearer ${cfg.agentToken}`,
       'content-type': 'application/json',
-      'x-agent-site': cfg.siteId || 'browser-ext-1',
+      'x-agent-site': siteId,
       'x-job-id': frame.jobId,
-      'x-job-nonce': frame.nonce,
+      'x-job-nonce': jobNonce,
     },
     body: JSON.stringify({ results }),
   });
@@ -231,17 +243,25 @@ async function executeDispatchedJob(cfg, frame) {
 function connect(cfg) {
   disconnect();
   activeCfg = cfg;
+  const siteId = cfg.siteId || 'browser-ext-1';
   const wsBase = cfg.hubUrl.replace(/^http:\/\//i, 'ws://').replace(/^https:\/\//i, 'wss://').replace(/\/+$/, '');
-  const wsUrl = wsBase.endsWith('/agent/ws') ? wsBase : `${wsBase}/agent/ws`;
+  const wsEndpoint = wsBase.endsWith('/agent/ws') ? wsBase : `${wsBase}/agent/ws`;
+  const wsUrlObj = new URL(wsEndpoint);
+  wsUrlObj.searchParams.set('site', siteId);
+
+  const protocols = ['edgefetch-agent'];
+  if (cfg.agentToken) {
+    protocols.push(`edgefetch-auth.${toBase64UrlUtf8(cfg.agentToken)}`);
+  }
 
   return new Promise((resolveConn) => {
     let settled = false;
-    ws = new WebSocket(wsUrl);
+    ws = new WebSocket(wsUrlObj.toString(), protocols);
     ws.onopen = () => {
       ws.send(
         JSON.stringify({
-          type: 'agent_hello',
-          version: '2.5.4',
+          type: 'hello',
+          version: '2.5.5',
           arch: 'browser-mv3',
           goVersion: 'mv3-extension',
           capabilities: [],
@@ -261,7 +281,8 @@ function connect(cfg) {
       if (typeof ev.data !== 'string' || ev.data === 'pong') return;
       try {
         const frame = JSON.parse(ev.data);
-        if (frame.type === 'dispatch' && frame.jobId && frame.nonce && activeCfg) {
+        const jobNonce = frame?.jobNonce || frame?.nonce;
+        if (frame?.type === 'dispatch' && frame.jobId && jobNonce && activeCfg) {
           executeDispatchedJob(activeCfg, frame).catch(() => undefined);
         }
       } catch {

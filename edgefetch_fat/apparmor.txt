@@ -44,9 +44,9 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   # Stack Chromium onto child subprofile (`Cx -> &chromium` => `edgefetch_fat//&edgefetch_fat//chromium`)
   # so the transition satisfies Linux `PR_SET_NO_NEW_PRIVS` (`aa_label_is_subset`) while denying `/data/**`!
   /usr/lib/chromium/ r,
-  /usr/lib/chromium/chromium mrix,
-  /usr/lib/chromium/chromium Cx -> &chromium,
-  /usr/lib/chromium/** mrix,
+  /usr/lib/chromium/chromium mrCx -> &chromium,
+  /usr/lib/chromium/chrome_crashpad_handler mrix,
+  /usr/lib/chromium/** mr,
   /lib/ r,
   /lib/** mr,
   /usr/share/ r,

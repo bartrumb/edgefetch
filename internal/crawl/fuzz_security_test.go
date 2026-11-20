@@ -112,7 +112,7 @@ func TestStreamingPDFCutOffAtConfiguredCapAndCrossOriginRedirectHeaderStrip(t *t
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			w.Header().Set("Location", "https://second.example/landed")
+			w.Header().Set("Location", "http://second.example/landed")
 			w.WriteHeader(http.StatusFound)
 		case "/landed":
 			if r.Header.Get("X-Custom-Token") != "" {

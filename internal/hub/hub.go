@@ -829,15 +829,17 @@ func (s *Server) completePending(jobID, jobNonce, siteID string, out jobOutcome)
 		return
 	}
 
-	pj.session.mu.Lock()
-	pj.session.busy = false
-	pj.session.lastJobAt = time.Now()
-	if out.err != nil {
-		pj.session.jobsErr++
-	} else {
-		pj.session.jobsOK++
+	if pj.session != nil {
+		pj.session.mu.Lock()
+		pj.session.busy = false
+		pj.session.lastJobAt = time.Now()
+		if out.err != nil {
+			pj.session.jobsErr++
+		} else {
+			pj.session.jobsOK++
+		}
+		pj.session.mu.Unlock()
 	}
-	pj.session.mu.Unlock()
 
 	if out.err == nil {
 		now := time.Now()

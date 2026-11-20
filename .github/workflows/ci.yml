@@ -82,6 +82,9 @@ jobs:
       - run: npm test
       - run: npm run type-check
       - run: npm run deploy:dry
+      - name: Run Python SDK unit tests
+        working-directory: sdk/py
+        run: python3 test_edgefetch_client.py
 
   docker-multiarch:
     name: Verify Multi-Arch Distroless Builds (amd64 & arm64)

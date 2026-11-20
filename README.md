@@ -110,19 +110,25 @@ docker compose up --build -d
 # Open http://localhost:8787/admin (default token: local-dev-caller-token-0123456789)
 ```
 
-### Option C: Standalone Go CLI & Self-Hosted Go Hub (`go install`)
+### Option C: Zero-Setup Desktop (`Win` / `macOS` / `Linux`) & Local `stdio` MCP
+
+Download a single ~8 MB binary (auto-detects pre-installed **Windows Edge / Chrome / Brave** and **macOS Chrome / Edge / Brave** for full JS rendering — zero 300 MB Chromium download!) or install with `go install`:
 
 ```bash
 go install github.com/bartrumb/edgefetch/cmd/edgefetch@latest
 
-# 1. Verify SSRF guard, loopback CONNECT proxy, Chromium & pdftotext:
-edgefetch doctor
+# 1. Auto-configure zero-daemon, zero-port stdio MCP into Claude Desktop & Cursor:
+edgefetch install-mcp
 
-# 2. Polite one-shot terminal scrape to clean Markdown (or --json with httptrace timings):
+# 2. Or launch the loopback Desktop Launchpad UI (http://127.0.0.1:8787 — also runs automatically when double-clicking edgefetch.exe!):
+edgefetch desktop
+
+# 3. Verify SSRF guard, loopback CONNECT proxy, OS Chrome/Edge & pdftotext, or scrape directly from terminal:
+edgefetch doctor
 edgefetch scrape https://example.com
 edgefetch scrape --json --query="installation" https://developers.cloudflare.com/workers/
 
-# 3. Run a 100% self-hosted Go WebSocket Hub + /v1/scrape + /mcp controller on a $4 VPS:
+# 4. Run a 100% self-hosted Go WebSocket Hub + /v1/scrape + /mcp controller on a $4 VPS:
 EDGEFETCH_CALLER_TOKEN="<32-char-secret>" EDGEFETCH_AGENT_TOKEN="<32-char-secret>" \
   edgefetch --mode=hub --addr=0.0.0.0:8080
 ```
@@ -152,7 +158,8 @@ EDGEFETCH_CALLER_TOKEN="<32-char-secret>" EDGEFETCH_AGENT_TOKEN="<32-char-secret
 | [`internal/ws`](internal/ws/client.go) | Hardened `coder/websocket` client (`http/1.1` ALPN, classic ECDHE TLS curves, 1 MiB frame cap) |
 | [`internal/priv`](internal/priv/priv_linux.go) | Linux `prctl(PR_SET_NO_NEW_PRIVS)` + `AllThreadsSyscall6` irreversible root drop (`65532:65532`) |
 | [`hub/`](hub/src/index.ts) & [`hub/portable/`](hub/portable/portable-server.ts) | Cloudflare Worker/DO Hub + Portable Node 22+ `node:sqlite` FTS5 server + `/admin` wizard + OAuth 2.1 `/mcp` |
-| [`sdk/ts/`](sdk/ts/edgefetch-client.ts) | Zero-dependency TypeScript client SDK (`EdgeFetchClient` with `baseUrls` HA failover) |
+| [`sdk/ts/`](sdk/ts/edgefetch-client.ts) & [`sdk/py/`](sdk/py/edgefetch_client.py) | Zero-dependency TypeScript & Python 3.9+ client SDKs (`EdgeFetchClient` with `baseUrls` HA failover) |
+| [`deploy/`](deploy/k8s/agent-deployment.yaml) & [`server.json`](server.json) | Turnkey Kubernetes (`Deployment` + Zero-Trust `NetworkPolicy`), Unraid XML, CasaOS/Portainer Compose, and Official MCP Registry manifest |
 
 - **Operations, OTLP Tracing, HA Mesh & MCP Guide:** **[docs/USAGE.md](docs/USAGE.md)**
 - **Hub ↔ Go Agent Wire Protocol Spec:** **[docs/PROTOCOL.md](docs/PROTOCOL.md)**

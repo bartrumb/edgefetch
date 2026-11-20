@@ -1447,7 +1447,6 @@ test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1
     port: 0,
     host: '127.0.0.1',
     dataDir,
-    migrationsDir: resolve('migrations'),
     envOverrides: {
       CALLER_TOKEN: tok,
       AGENT_TOKEN: agentTok,

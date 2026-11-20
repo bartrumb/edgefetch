@@ -12,6 +12,9 @@ buildSync({
   alias: {
     'cloudflare:workers': './portable/cloudflare-shim.ts',
   },
+  loader: {
+    '.sql': 'text',
+  },
   external: ['node:*'],
   outfile: 'dist/portable-server.mjs',
 });

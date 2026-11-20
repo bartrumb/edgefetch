@@ -234,3 +234,20 @@ EdgeFetch supports four composable HA layers with zero external consensus broker
    });
    ```
    `EdgeFetchClient` automatically retries the next controller in `baseUrls` on network errors or `502`/`503`/`504` gateway responses.
+
+---
+
+## 9. Desktop (`stdio` MCP), Kubernetes, Homelab NAS, Routers & Mobile Egress
+
+- **Zero-Daemon Local `stdio` MCP (`Claude Desktop` / `Cursor` / `VS Code` / `Windsurf`):**
+  - Run `edgefetch install-mcp` (or add `{"command": "edgefetch", "args": ["mcp"]}`). Auto-discovers pre-installed Windows Edge/Chrome/Brave and macOS Chrome/Edge/Brave via `browser.FindChromeBinary()` — zero background port, zero bearer token.
+- **Kubernetes (`deploy/k8s/agent-deployment.yaml`):**
+  - Turnkey `Deployment` (`runAsNonRoot: true`, `65532:65532`, `capabilities.drop: ["ALL"]`) paired with a CNI `NetworkPolicy` blocking all ingress and blocking RFC 1918 / CGNAT / link-local egress at the cluster network layer.
+- **Homelab & NAS App Templates:**
+  - **Unraid:** [`deploy/unraid/edgefetch-agent.xml`](../deploy/unraid/edgefetch-agent.xml)
+  - **CasaOS / Portainer / Coolify:** [`deploy/casaos/docker-compose.yml`](../deploy/casaos/docker-compose.yml)
+- **Routers, Firewalls & Mobile Standby Nodes (`CGO_ENABLED=0`):**
+  - **MikroTik RouterOS v7:** Pull `ghcr.io/bartrumb/edgefetch-agent:lite` (~9 MB distroless `arm64`/`amd64`).
+  - **OpenWrt / GL.iNet Travel Routers:** Cross-compiled via `.goreleaser.yaml` (`linux/mipsle` `softfloat`, `linux/arm` `v7`, `linux/arm64`).
+  - **OPNsense / pfSense:** Cross-compiled `freebsd/amd64` & `freebsd/arm64` static binaries.
+  - **Android (Termux):** Build `GOOS=linux GOARCH=arm64` + `termux-wake-lock` on spare Wi-Fi / 5G phones (~15 MB RAM).

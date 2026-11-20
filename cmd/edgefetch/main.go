@@ -223,6 +223,26 @@ func main() {
 		return
 	}
 
+	// Zero-setup Desktop Double-Click Experience (Windows / macOS): when launched with zero CLI args and no server/agent
+	// env vars configured, start the loopback-only Desktop Launchpad (`127.0.0.1:8787`) and open the browser!
+	if len(os.Args) == 1 && (runtime.GOOS == "windows" || runtime.GOOS == "darwin") &&
+		firstNonEmpty(
+			os.Getenv("EDGEFETCH_MODE"),
+			os.Getenv("CRAWLER_MODE"),
+			os.Getenv("PORT"),
+			os.Getenv("EDGEFETCH_BIND_ADDR"),
+			os.Getenv("EDGEFETCH_SERVER_TOKEN"),
+			os.Getenv("EDGEFETCH_CALLER_TOKEN"),
+			os.Getenv("CALLER_TOKEN"),
+			os.Getenv("EDGEFETCH_HUB_URL"),
+			os.Getenv("EDGEFETCH_HUB_URLS"),
+		) == "" {
+		if code := runDesktopMode(ctx, nil, os.Stdout, os.Stderr); code != 0 {
+			os.Exit(code)
+		}
+		return
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	envMode := firstNonEmpty(os.Getenv("EDGEFETCH_MODE"), os.Getenv("CRAWLER_MODE"))

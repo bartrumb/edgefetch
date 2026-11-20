@@ -250,4 +250,44 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	if codeBlocked == 0 {
 		t.Fatal("expected robots.txt disallowed URL to return non-zero exit code")
 	}
+
+	// Test zero-port stdio MCP server (`edgefetch mcp`) over stdin/stdout JSON-RPC 2.0!
+	stdioInput := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"scrape","arguments":{"url":"https://docs.example.com/docs/guide"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"doctor","arguments":{}}}`,
+	}, "\n") + "\n"
+
+	var stdioOut, stdioErr bytes.Buffer
+	if rc := runMCPStdio(context.Background(), strings.NewReader(stdioInput), &stdioOut, &stdioErr, deps); rc != 0 {
+		t.Fatalf("runMCPStdio failed: rc=%d stderr=%s", rc, stdioErr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdioOut.String()), "\n")
+	// 4 request IDs -> exactly 4 newline-delimited JSON-RPC responses (notification emitted 0 lines)!
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 JSON-RPC lines, got %d:\n%s", len(lines), stdioOut.String())
+	}
+	if !strings.Contains(lines[2], "Promise<void>") || !strings.Contains(lines[3], "ssrf_guard") {
+		t.Fatalf("unexpected stdio tool results:\nscrape=%s\ndoctor=%s", lines[2], lines[3])
+	}
+
+	// Test `edgefetch install-mcp --config=...` safely preserves existing MCP servers!
+	cfgFile := filepath.Join(t.TempDir(), "claude_desktop_config.json")
+	if err := os.WriteFile(cfgFile, []byte(`{"mcpServers":{"filesystem":{"command":"npx"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	if rc := runInstallMCP([]string{"--config=" + cfgFile, "--exe=/usr/local/bin/edgefetch"}, &out, &errBuf); rc != 0 {
+		t.Fatalf("runInstallMCP failed: rc=%d stderr=%s", rc, errBuf.String())
+	}
+	mergedRaw, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(mergedRaw), `"filesystem"`) || !strings.Contains(string(mergedRaw), `"/usr/local/bin/edgefetch"`) {
+		t.Fatalf("install-mcp did not merge cleanly: %s", string(mergedRaw))
+	}
 }

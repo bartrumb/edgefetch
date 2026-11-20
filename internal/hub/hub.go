@@ -245,6 +245,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case r.URL.Path == "/" && r.Method == http.MethodGet && strings.TrimSpace(s.cfg.CallerToken) == "":
+		s.serveDesktopLaunchpad(w, r)
+
 	case r.URL.Path == "/agents" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, s.ListAgents())
 
@@ -1245,4 +1248,74 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) serveDesktopLaunchpad(w http.ResponseWriter, r *http.Request) {
+	origin := "http://" + r.Host
+	mcpURL := origin + "/mcp"
+	vscodeLink := "vscode:mcp/install?%7B%22name%22%3A%22edgefetch%22%2C%22type%22%3A%22http%22%2C%22url%22%3A%22" + url.QueryEscape(mcpURL) + "%22%7D"
+	cursorCfgB64 := "eyJ1cmwiOiI" // dynamic in JS below for exact host port
+	_ = cursorCfgB64
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = fmt.Fprintf(w, `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EdgeFetch %s — Local Desktop MCP Launchpad</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font: 14px/1.55 system-ui, -apple-system, sans-serif; margin: 0; background: #0b1120; color: #e2e8f0; padding: 28px 16px; }
+    main { max-width: 860px; margin: 0 auto; display: grid; gap: 18px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; }
+    h1 { margin: 0 0 6px; font-size: 1.3rem; color: #f8fafc; }
+    h2 { margin: 0 0 10px; font-size: 1rem; color: #f8fafc; }
+    p { margin: 0; color: #94a3b8; }
+    .btns { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    a.btn, button { font: inherit; font-weight: 600; font-size: 0.85rem; text-decoration: none; padding: 8px 14px; border-radius: 8px; border: 1px solid #3b82f6; background: #2563eb; color: #fff; cursor: pointer; }
+    a.btn.alt { background: #0f172a; border-color: #475569; color: #38bdf8; }
+    input[type="url"] { width: 100%%; box-sizing: border-box; padding: 9px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; }
+    pre { background: #090d16; border: 1px solid #334155; border-radius: 8px; padding: 12px; overflow: auto; max-height: 360px; color: #7dd3fc; font-size: 0.82rem; margin: 10px 0 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>EdgeFetch v%s — Local Desktop MCP Running</h1>
+      <p>Listening strictly on loopback (<code>%s</code>) with HTTP/2 + SSRF-proxied OS Browser JS rendering.</p>
+      <div class="btns">
+        <a class="btn" id="cursor-btn" href="#">+ Install in Cursor</a>
+        <a class="btn" href="%s">+ Install in VS Code</a>
+        <a class="btn alt" href="/v1/capabilities" target="_blank">View Capabilities JSON</a>
+      </div>
+      <pre>claude mcp add --transport http edgefetch %s
+# Or zero-daemon stdio mode (Claude Desktop / Cursor / Windsurf):
+edgefetch install-mcp</pre>
+    </section>
+    <section class="card">
+      <h2>Live Local Scrape Tester</h2>
+      <form id="f" style="display:grid;grid-template-columns:1fr auto;gap:10px">
+        <input id="u" type="url" required value="https://example.com" placeholder="https://...">
+        <button type="submit" id="b">Scrape to Markdown</button>
+      </form>
+      <pre id="out">Click "Scrape to Markdown" to test your local node...</pre>
+    </section>
+  </main>
+  <script>
+    const mcpUrl = %q;
+    document.getElementById('cursor-btn').href = 'cursor://anysphere.cursor-deeplink/mcp/install?name=edgefetch&config=' + encodeURIComponent(btoa(JSON.stringify({ url: mcpUrl })));
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const b = document.getElementById('b');
+      b.disabled = true; b.textContent = 'Scraping...';
+      try {
+        const r = await fetch('/v1/scrape', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: document.getElementById('u').value }) });
+        const j = await r.json();
+        document.getElementById('out').textContent = j.markdown || JSON.stringify(j, null, 2);
+      } finally { b.disabled = false; b.textContent = 'Scrape to Markdown'; }
+    });
+  </script>
+</body>
+</html>`, agent.Version, agent.Version, origin, vscodeLink, mcpURL, mcpURL)
 }

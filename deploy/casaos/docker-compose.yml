@@ -1,0 +1,25 @@
+name: edgefetch
+services:
+  edgefetch:
+    image: ghcr.io/bartrumb/edgefetch-agent:latest
+    container_name: edgefetch-agent
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      EDGEFETCH_HUB_URL: "${EDGEFETCH_HUB_URL}"
+      EDGEFETCH_AGENT_TOKEN: "${EDGEFETCH_AGENT_TOKEN}"
+      EDGEFETCH_SITE_ID: "${EDGEFETCH_SITE_ID:-casaos-1}"
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: edgefetch
+  author: bartrumb
+  category: Developer
+  description:
+    en_us: Outbound-only Go HTTP/2 + Headless Chromium + Poppler PDF worker node for EdgeFetch AI web scraping (zero inbound ports).
+  tagline:
+    en_us: Self-hosted AI web scraper & browser worker node
+  title:
+    en_us: EdgeFetch Agent

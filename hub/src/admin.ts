@@ -351,7 +351,13 @@ function renderDashboardHtml(params: {
       </section>
 
       <section class="card">
-        <h2><span>MCP Clients &amp; OAuth 2.1 Grants</span></h2>
+        <h2>
+          <span>MCP Clients &amp; OAuth 2.1 Grants</span>
+          <span style="display:inline-flex;gap:6px;flex-wrap:wrap">
+            <a class="btn-link" id="cursor-mcp-btn" href="#">+ Cursor MCP</a>
+            <a class="btn-link" id="vscode-mcp-btn" href="#">+ VS Code MCP</a>
+          </span>
+        </h2>
         <div style="margin-bottom:10px">
           <div class="cmd-bar">
             <code id="mcp-cmd">${escapeHtml(mcpCmd)}</code>
@@ -707,6 +713,9 @@ function renderDashboardHtml(params: {
       b.textContent = 'Copied!';
       setTimeout(() => { b.textContent = 'Copy Command'; }, 1500);
     });
+    const mcpEndpoint = HUB_ORIGIN + '/mcp';
+    el('cursor-mcp-btn').href = 'cursor://anysphere.cursor-deeplink/mcp/install?name=${encodeURIComponent(params.mcpSlug)}&config=' + encodeURIComponent(btoa(JSON.stringify({ url: mcpEndpoint })));
+    el('vscode-mcp-btn').href = 'vscode:mcp/install?' + encodeURIComponent(JSON.stringify({ name: ${JSON.stringify(params.mcpSlug)}, type: 'http', url: mcpEndpoint }));
 
     loadState();
     setInterval(() => {

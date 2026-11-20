@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>EdgeFetch-Agent</Name>
+  <Repository>ghcr.io/bartrumb/edgefetch-agent:latest</Repository>
+  <Registry>https://github.com/bartrumb/edgefetch/pkgs/container/edgefetch-agent</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/bartrumb/edgefetch/issues</Support>
+  <Project>https://github.com/bartrumb/edgefetch</Project>
+  <Overview>Outbound-only Go HTTP/2 + SSRF-proxied Headless Chromium + Poppler PDF worker node for EdgeFetch (zero inbound router ports).</Overview>
+  <Category>Tools: Network:Web</Category>
+  <ExtraParams>--security-opt no-new-privileges:true</ExtraParams>
+  <Config Name="Hub URL" Target="EDGEFETCH_HUB_URL" Default="" Mode="" Description="Cloudflare or self-hosted EdgeFetch Hub URL (e.g. https://edgefetch.example.com)" Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Agent Token" Target="EDGEFETCH_AGENT_TOKEN" Default="" Mode="" Description="Shared or site-scoped agent secret (at least 24 characters)" Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Site ID" Target="EDGEFETCH_SITE_ID" Default="unraid-1" Mode="" Description="Unique lowercase identifier for this Unraid node" Type="Variable" Display="always" Required="true" Mask="false"/>
+</Container>

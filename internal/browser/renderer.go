@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -78,11 +79,15 @@ type retainedSession struct {
 	lastHeaders      http.Header
 }
 
-// FindChromeBinary locates an installed headless Chromium/Chrome executable, or returns "" when absent.
+// FindChromeBinary locates an installed headless Chromium/Chrome/Edge/Brave executable across Linux, macOS, and Windows,
+// enabling a ~8 MB desktop binary download to render JavaScript (`browser-v1` + `interact-v1`) using pre-installed OS browsers.
 func FindChromeBinary() string {
 	if custom := strings.TrimSpace(os.Getenv("EDGEFETCH_CHROME_BIN")); custom != "" {
 		if p, err := exec.LookPath(custom); err == nil {
 			return p
+		}
+		if st, err := os.Stat(custom); err == nil && !st.IsDir() {
+			return custom
 		}
 	}
 	for _, candidate := range []string{
@@ -90,9 +95,56 @@ func FindChromeBinary() string {
 		"chromium",
 		"google-chrome-stable",
 		"google-chrome",
+		"msedge",
+		"brave-browser",
+		"brave",
 	} {
 		if p, err := exec.LookPath(candidate); err == nil {
 			return p
+		}
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		var roots []string
+		for _, envKey := range []string{"ProgramFiles", "ProgramFiles(x86)", "LocalAppData"} {
+			if dir := strings.TrimSpace(os.Getenv(envKey)); dir != "" {
+				roots = append(roots, dir)
+			}
+		}
+		relPaths := []string{
+			filepath.Join("Google", "Chrome", "Application", "chrome.exe"),
+			filepath.Join("Microsoft", "Edge", "Application", "msedge.exe"),
+			filepath.Join("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+			filepath.Join("Chromium", "Application", "chrome.exe"),
+		}
+		for _, r := range roots {
+			for _, rel := range relPaths {
+				cand := filepath.Join(r, rel)
+				if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+					return cand
+				}
+			}
+		}
+	case "darwin":
+		home, _ := os.UserHomeDir()
+		appRoots := []string{"/Applications"}
+		if home != "" {
+			appRoots = append(appRoots, filepath.Join(home, "Applications"))
+		}
+		appBins := []string{
+			"Google Chrome.app/Contents/MacOS/Google Chrome",
+			"Chromium.app/Contents/MacOS/Chromium",
+			"Brave Browser.app/Contents/MacOS/Brave Browser",
+			"Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+		}
+		for _, r := range appRoots {
+			for _, rel := range appBins {
+				cand := filepath.Join(r, rel)
+				if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+					return cand
+				}
+			}
 		}
 	}
 	return ""

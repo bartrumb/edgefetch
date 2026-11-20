@@ -117,17 +117,17 @@ class LocalD1Statement {
 export class NodeSqliteD1Database {
   public readonly db: DatabaseSync;
 
-  constructor(filePath: string, migrationSqlFiles: string[] = []) {
+  constructor(filePath: string, migrations: Array<{ name: string; sql?: string; path?: string }> | string[] = []) {
     if (filePath !== ':memory:') {
       mkdirSync(dirname(resolve(filePath)), { recursive: true });
     }
     this.db = new DatabaseSync(filePath);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; CREATE TABLE IF NOT EXISTS _ef_migrations (name TEXT PRIMARY KEY);');
-    for (const migPath of migrationSqlFiles) {
-      const migKey = migPath.replace(/\\/g, '/').split('/').slice(-2).join('/');
+    for (const item of migrations) {
+      const migKey = typeof item === 'string' ? item.replace(/\\/g, '/').split('/').slice(-2).join('/') : item.name;
       const already = this.db.prepare('SELECT 1 FROM _ef_migrations WHERE name = ?').get(migKey);
       if (already) continue;
-      const sql = readFileSync(migPath, 'utf8');
+      const sql = typeof item === 'string' ? readFileSync(item, 'utf8') : item.sql ?? readFileSync(item.path!, 'utf8');
       this.db.exec(sql);
       this.db.prepare('INSERT INTO _ef_migrations (name) VALUES (?)').run(migKey);
     }

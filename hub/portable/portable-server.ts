@@ -8,12 +8,11 @@
 import { createServer, type IncomingMessage } from 'node:http';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
-import { fileURLToPath } from 'node:url';
+import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
+import searchSchemaSql from '../migrations/search/0001_fts.sql';
 import { authorizeAgent } from '../src/auth';
 import hubWorker from '../src/index';
 import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './node-adapters';
-
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 export interface PortableHubOptions {
   port?: number;
@@ -47,11 +46,20 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const port = opts.port ?? Number(process.env.PORT || 8787);
   const host = opts.host ?? process.env.HOST ?? '0.0.0.0';
   const dataDir = resolve(opts.dataDir ?? process.env.EDGEFETCH_DATA_DIR ?? './.edgefetch-data');
-  const migrationsDir = resolve(opts.migrationsDir ?? join(__dirname, '..', 'migrations'));
 
   const coordinator = new LocalAgentHubCoordinator(join(dataDir, 'hub.sqlite'));
-  const metaDb = new NodeSqliteD1Database(join(dataDir, 'meta.sqlite'), [join(migrationsDir, 'meta', '0001_tracking.sql')]);
-  const searchDb = new NodeSqliteD1Database(join(dataDir, 'search.sqlite'), [join(migrationsDir, 'search', '0001_fts.sql')]);
+  const metaDb = new NodeSqliteD1Database(
+    join(dataDir, 'meta.sqlite'),
+    opts.migrationsDir
+      ? [join(resolve(opts.migrationsDir), 'meta', '0001_tracking.sql')]
+      : [{ name: 'meta/0001_tracking.sql', sql: metaSchemaSql }],
+  );
+  const searchDb = new NodeSqliteD1Database(
+    join(dataDir, 'search.sqlite'),
+    opts.migrationsDir
+      ? [join(resolve(opts.migrationsDir), 'search', '0001_fts.sql')]
+      : [{ name: 'search/0001_fts.sql', sql: searchSchemaSql }],
+  );
   const artifacts = new NodeFsR2Bucket(join(dataDir, 'artifacts'));
 
   const mergedEnv = { ...process.env, ...(opts.envOverrides ?? {}) };
@@ -174,8 +182,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   });
 }
 
-// Run directly when executed as main CLI script (`node dist/portable-server.mjs`).
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}` || process.argv[1]?.endsWith('portable-server.mjs')) {
+// Run directly ONLY when executed as the standalone portable-server CLI script (never when imported inside bundled tests).
+if (process.argv[1]?.replace(/\\/g, '/').endsWith('/portable-server.mjs') || process.argv[1] === 'portable-server.mjs') {
   startPortableHub()
     .then(({ port }) => {
       console.info(JSON.stringify({ event: 'portable_hub_listening', port, dataDir: process.env.EDGEFETCH_DATA_DIR ?? './.edgefetch-data' }));

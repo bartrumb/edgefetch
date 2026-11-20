@@ -39,6 +39,9 @@ func isOneShotCLI(args []string) bool {
 	case "version", "--version", "-v",
 		"doctor", "--doctor",
 		"scrape",
+		"mcp",
+		"install-mcp",
+		"desktop",
 		"help", "--help", "-h":
 		return true
 	}
@@ -70,6 +73,12 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 		return runDoctor(args[1:], stdout, stderr, deps)
 	case "scrape":
 		return runScrapeCLI(ctx, args[1:], stdout, stderr, deps)
+	case "mcp":
+		return runMCPStdio(ctx, os.Stdin, stdout, stderr, deps)
+	case "install-mcp":
+		return runInstallMCP(args[1:], stdout, stderr)
+	case "desktop":
+		return runDesktopMode(ctx, args[1:], stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "unknown subcommand %q (try 'edgefetch help')\n", args[0])
 		return 2
@@ -84,6 +93,9 @@ Usage:
   edgefetch --mode=agent                         Start outbound WebSocket worker (supports EDGEFETCH_HUB_URLS HA)
   edgefetch --mode=hub                           Start self-hosted Go WebSocket Hub + /v1/scrape + /mcp controller
   edgefetch --mode=hub,agent                     Hybrid mesh node: local standby Hub + outbound upstream Agent
+  edgefetch desktop [--port=8787]                Start loopback Desktop MCP Launchpad & open browser (Win/macOS/Linux)
+  edgefetch mcp                                  Run local stdio MCP server (zero ports/tokens — Claude Desktop/Cursor)
+  edgefetch install-mcp [--dry-run]              Auto-configure EdgeFetch stdio MCP in Claude Desktop & Cursor
   edgefetch scrape [flags] <https://url>         Scrape one public HTTPS URL to clean Markdown (or --json)
   edgefetch doctor [--json]                      Verify SSRF guard, loopback proxy, Chromium, pdftotext & config
   edgefetch version [--json]                     Print binary version, Go toolchain, and host capabilities

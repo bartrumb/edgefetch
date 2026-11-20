@@ -1,0 +1,102 @@
+# Turnkey Kubernetes EdgeFetch Worker Deployment + Zero-Trust CNI NetworkPolicy
+# Usage:
+#   kubectl create namespace edgefetch
+#   kubectl -n edgefetch create secret generic edgefetch-agent-secret \
+#     --from-literal=hub-url="https://edgefetch.example.com" \
+#     --from-literal=agent-token="<YOUR_32_CHAR_AGENT_TOKEN>"
+#   kubectl apply -f deploy/k8s/agent-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edgefetch-agent
+  namespace: edgefetch
+  labels:
+    app.kubernetes.io/name: edgefetch-agent
+    app.kubernetes.io/version: "2.1.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: edgefetch-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: edgefetch-agent
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/bartrumb/edgefetch-agent:latest
+          args: ["--mode=agent"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: EDGEFETCH_HUB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: edgefetch-agent-secret
+                  key: hub-url
+            - name: EDGEFETCH_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: edgefetch-agent-secret
+                  key: agent-token
+            - name: EDGEFETCH_SITE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GOMEMLIMIT
+              value: "384MiB"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+---
+# Zero-Trust CNI NetworkPolicy:
+# 1. Blocks ALL inbound traffic (zero ingress ports).
+# 2. Allows DNS (UDP/TCP 53) and outbound TLS (:443) ONLY to public internet IPs — blocking cluster-internal
+#    RFC 1918, CGNAT, and cloud-metadata (169.254.169.254) ranges at the Kubernetes CNI layer in addition to
+#    EdgeFetch's in-process net.Dialer.Control SSRF guard.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: edgefetch-agent-egress-only
+  namespace: edgefetch
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: edgefetch-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

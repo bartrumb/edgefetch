@@ -22,6 +22,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/bartrumb/edgefetch/internal/botauth"
 	"github.com/bartrumb/edgefetch/internal/browser"
 	"github.com/bartrumb/edgefetch/internal/classify"
 	"github.com/bartrumb/edgefetch/internal/extract"
@@ -100,6 +101,7 @@ type Result struct {
 	Status           int                      `json:"status"`
 	ContentType      string                   `json:"contentType,omitempty"`
 	CfMitigated      string                   `json:"cfMitigated,omitempty"`
+	WAF              *classify.WAFMatch       `json:"waf,omitempty"`
 	ETag             string                   `json:"etag,omitempty"`
 	LastModified     string                   `json:"lastModified,omitempty"`
 	RetryAfter       string                   `json:"retryAfter,omitempty"`
@@ -273,6 +275,7 @@ type Crawler struct {
 	llms              *llmsCache
 	renderer          *browser.Renderer
 	otelExp           *otel.Exporter
+	botSigner         *botauth.Signer
 	robotsBypassHosts []string
 	globalMu          sync.Mutex
 	globalNext        time.Time
@@ -343,6 +346,11 @@ func (c *Crawler) SetOtelExporter(exp *otel.Exporter) {
 	c.otelExp = exp
 }
 
+// SetBotSigner attaches an optional IETF RFC 9421 Ed25519 Web Bot Auth request signer.
+func (c *Crawler) SetBotSigner(s *botauth.Signer) {
+	c.botSigner = s
+}
+
 // Close shuts down any running headless Chromium subprocess, loopback SSRF proxy, and OTLP exporter.
 func (c *Crawler) Close() error {
 	if c == nil {
@@ -368,6 +376,9 @@ func (c *Crawler) Capabilities() []string {
 	}
 	if extract.HasPDFToText() {
 		caps = append(caps, "pdf-v1")
+	}
+	if c != nil && c.botSigner != nil {
+		caps = append(caps, "bot-auth-v1")
 	}
 	return caps
 }
@@ -962,6 +973,7 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 		} else if status == http.StatusNotModified && (r.IfNoneMatch != "" || r.IfModifiedSince != "") && res.CfMitigated == "" {
 			res.Outcome, res.Problem = classify.OutcomeOK, ""
 		} else {
+			res.WAF = classify.ClassifyWAF(status, header, body)
 			res.Outcome, res.Problem = classify.Classify(r.Kind, status, header, body)
 		}
 		finalBody = body
@@ -1085,6 +1097,9 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	}
 	if r.IfModifiedSince != "" {
 		req.Header.Set("If-Modified-Since", r.IfModifiedSince)
+	}
+	if c.botSigner != nil {
+		_ = c.botSigner.SignRequest(req, c.Now())
 	}
 
 	resp, err := c.client.Do(req)
@@ -1241,6 +1256,9 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			}
 			req.Header.Set("User-Agent", c.userAgent)
 			req.Header.Set("Accept", "text/plain,*/*;q=0.8")
+			if c.botSigner != nil {
+				_ = c.botSigner.SignRequest(req, c.Now())
+			}
 
 			resp, err = c.client.Do(req)
 			if err == nil {

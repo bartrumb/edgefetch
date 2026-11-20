@@ -104,6 +104,10 @@ class EdgeFetchClient:
     def capabilities(self) -> Dict[str, Any]:
         return self._request_json("GET", "/v1/capabilities")
 
+    def hosts(self, limit: int = 100) -> Dict[str, Any]:
+        safe_limit = max(1, min(500, int(limit)))
+        return self._request_json("GET", f"/v1/hosts?limit={safe_limit}")
+
     def scrape(self, url: str, **options: Any) -> Dict[str, Any]:
         return self._request_json("POST", "/v1/scrape", {"url": url, **options})
 

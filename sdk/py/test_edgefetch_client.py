@@ -80,6 +80,18 @@ class TestEdgeFetchPythonSDK(unittest.TestCase):
         self.assertEqual(captured["body"], {"query": "Forward Deployed Engineer", "remote": True, "minBase": 200000})
         self.assertEqual(out["count"], 1)
 
+    def test_hosts_endpoint(self) -> None:
+        captured = {}
+
+        def fake_opener(req: urllib.request.Request, _timeout: float) -> _FakeResp:
+            captured["url"] = req.full_url
+            return _FakeResp({"ok": True, "hosts": [{"host": "example.com", "recommendedPauseMs": 0}]})
+
+        client = EdgeFetchClient(token="tok-123", base_url="https://hub.example.com", opener=fake_opener)
+        out = client.hosts(limit=25)
+        self.assertEqual(captured["url"], "https://hub.example.com/v1/hosts?limit=25")
+        self.assertEqual(out["hosts"][0]["host"], "example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

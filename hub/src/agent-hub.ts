@@ -127,6 +127,125 @@ export interface AffinityStore {
   clearAll(): void;
 }
 
+export interface HostHealthRecord {
+  host: string;
+  okCount: number;
+  rateLimit429Count: number;
+  challengeCount: number;
+  error5xxCount: number;
+  rateLimitStreak: number;
+  ewmaTtfbMs: number;
+  recommendedPauseMs: number;
+  lastWafVendor?: string;
+  updatedAt: number;
+}
+
+export interface HostHealthStore {
+  recordOutcome(params: {
+    host: string;
+    status: number;
+    outcome: string;
+    ttfbMs?: number;
+    retryAfterMs?: number;
+    wafVendor?: string;
+    now: number;
+  }): void;
+  getRecommendedPauseMs(host: string): number;
+  listHosts(limit?: number): HostHealthRecord[];
+  clearAll(): void;
+}
+
+export function computeNextHostHealth(
+  prev: HostHealthRecord | undefined,
+  params: {
+    host: string;
+    status: number;
+    outcome: string;
+    ttfbMs?: number;
+    retryAfterMs?: number;
+    wafVendor?: string;
+    now: number;
+  },
+): HostHealthRecord {
+  const host = params.host.toLowerCase();
+  const cur: HostHealthRecord = prev
+    ? { ...prev }
+    : {
+        host,
+        okCount: 0,
+        rateLimit429Count: 0,
+        challengeCount: 0,
+        error5xxCount: 0,
+        rateLimitStreak: 0,
+        ewmaTtfbMs: 0,
+        recommendedPauseMs: 0,
+        updatedAt: params.now,
+      };
+
+  const is429 = params.status === 429;
+  const isChallenge = params.outcome === 'challenge' || Boolean(params.wafVendor);
+  const is5xx = params.status >= 500 && params.status <= 599;
+  const isOk = params.outcome === 'ok' && params.status >= 200 && params.status < 400;
+
+  if (is429) {
+    cur.rateLimit429Count++;
+    cur.rateLimitStreak++;
+    const baseWait = Math.max(2_000, params.retryAfterMs && params.retryAfterMs > 0 ? Math.min(30_000, params.retryAfterMs) : 3_000);
+    cur.recommendedPauseMs = Math.min(30_000, Math.round(baseWait * Math.pow(2, Math.min(3, cur.rateLimitStreak - 1))));
+  } else if (isChallenge) {
+    cur.challengeCount++;
+    cur.recommendedPauseMs = Math.max(cur.recommendedPauseMs, 5_000);
+  } else if (is5xx) {
+    cur.error5xxCount++;
+    cur.recommendedPauseMs = Math.min(30_000, Math.max(cur.recommendedPauseMs, 2_500));
+  } else if (isOk) {
+    cur.okCount++;
+    if (cur.recommendedPauseMs > 0) {
+      const decayed = Math.floor(cur.recommendedPauseMs * 0.7);
+      cur.recommendedPauseMs = decayed < 800 ? 0 : decayed;
+      if (cur.recommendedPauseMs === 0) cur.rateLimitStreak = 0;
+    }
+  }
+
+  if (typeof params.ttfbMs === 'number' && Number.isFinite(params.ttfbMs) && params.ttfbMs >= 0) {
+    cur.ewmaTtfbMs = cur.ewmaTtfbMs === 0 ? Math.round(params.ttfbMs) : Math.round(cur.ewmaTtfbMs * 0.75 + params.ttfbMs * 0.25);
+  }
+  if (params.wafVendor) {
+    cur.lastWafVendor = params.wafVendor;
+  }
+  cur.updatedAt = params.now;
+  return cur;
+}
+
+export function createMemoryHostHealthStore(): HostHealthStore {
+  const map = new Map<string, HostHealthRecord>();
+  return {
+    recordOutcome(params) {
+      const k = params.host.toLowerCase();
+      if (!k) return;
+      const updated = computeNextHostHealth(map.get(k), params);
+      map.delete(k);
+      map.set(k, updated);
+      while (map.size > MAX_TRACKED_HOSTS) {
+        const oldest = map.keys().next().value;
+        if (oldest === undefined) break;
+        map.delete(oldest);
+      }
+    },
+    getRecommendedPauseMs(host) {
+      return map.get(host.toLowerCase())?.recommendedPauseMs ?? 0;
+    },
+    listHosts(limit = 100) {
+      return [...map.values()]
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, Math.max(1, Math.min(500, limit)));
+    },
+    clearAll() {
+      map.clear();
+    },
+  };
+}
+
 export function createMemoryAffinityStore(): AffinityStore {
   const map = new Map<string, { siteId: string; expiresAt: number }>();
   return {
@@ -420,6 +539,7 @@ export interface AgentHubDeps {
   cooldowns: CooldownStore;
   hostWindows?: HostWindowStore;
   affinities?: AffinityStore;
+  hostHealth?: HostHealthStore;
   now?: () => number;
   uuid?: () => string;
   sleep?: (ms: number) => Promise<void>;
@@ -430,6 +550,7 @@ export class AgentHubEngine {
   private readonly cooldowns: CooldownStore;
   private readonly hostWindows: HostWindowStore;
   private readonly affinities: AffinityStore;
+  private readonly hostHealth: HostHealthStore;
   private readonly now: () => number;
   private readonly uuid: () => string;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -443,6 +564,7 @@ export class AgentHubEngine {
     this.cooldowns = deps.cooldowns;
     this.hostWindows = deps.hostWindows ?? createMemoryHostWindowStore();
     this.affinities = deps.affinities ?? createMemoryAffinityStore();
+    this.hostHealth = deps.hostHealth ?? createMemoryHostHealthStore();
     this.now = deps.now ?? Date.now;
     this.uuid = deps.uuid ?? (() => crypto.randomUUID());
     this.sleep =
@@ -596,7 +718,8 @@ export class AgentHubEngine {
       }
       const afterSleep = this.now();
       for (const host of hosts) {
-        this.recordHostPacing(host, afterSleep + Math.max(0, pauseMs));
+        const adaptivePause = Math.max(0, pauseMs, this.hostHealth.getRecommendedPauseMs(host));
+        this.recordHostPacing(host, afterSleep + adaptivePause);
       }
       return { ok: true };
     });
@@ -799,7 +922,24 @@ export class AgentHubEngine {
       this.cooldowns.clearAll();
       this.hostWindows.clearAll();
       this.affinities.clearAll();
+      this.hostHealth.clearAll();
     }
+  }
+
+  listHostHealth(limit = 100): HostHealthRecord[] {
+    return this.hostHealth.listHosts(limit);
+  }
+
+  recordHostOutcome(params: {
+    host: string;
+    status: number;
+    outcome: string;
+    ttfbMs?: number;
+    retryAfterMs?: number;
+    wafVendor?: string;
+    now?: number;
+  }): void {
+    this.hostHealth.recordOutcome({ ...params, now: params.now ?? this.now() });
   }
 
   async dispatchFetch(
@@ -1069,7 +1209,25 @@ export class AgentHubEngine {
                 const item = parsed.results[j]!;
                 finalResults[origIdx] = item;
                 const itemHost = extractPrimaryHost(call.requests![origIdx]?.url);
-                this.recordHostPacing(itemHost, replyNow + crossNodePauseMs);
+                const exactRetryMsForHealth = parseExactRetryAfterMs(item.retryAfter, replyNow);
+                const itemTiming = (item as { timing?: { ttfbMs?: unknown } }).timing;
+                const itemWaf = (item as { waf?: { vendor?: unknown } }).waf;
+                if (itemHost) {
+                  this.hostHealth.recordOutcome({
+                    host: itemHost,
+                    status: typeof item.status === 'number' ? item.status : 0,
+                    outcome: typeof item.outcome === 'string' ? item.outcome : 'error',
+                    ...(typeof itemTiming?.ttfbMs === 'number' ? { ttfbMs: itemTiming.ttfbMs } : {}),
+                    ...(exactRetryMsForHealth !== null ? { retryAfterMs: exactRetryMsForHealth } : {}),
+                    ...(typeof itemWaf?.vendor === 'string' ? { wafVendor: itemWaf.vendor } : {}),
+                    now: replyNow,
+                  });
+                }
+                const effectiveHostPause = Math.max(
+                  crossNodePauseMs,
+                  itemHost ? this.hostHealth.getRecommendedPauseMs(itemHost) : 0,
+                );
+                this.recordHostPacing(itemHost, replyNow + effectiveHostPause);
 
                 if (item.status === 429 && item.outcome !== 'challenge') {
                   if (att.publicIp) triedIps[origIdx]!.add(att.publicIp);

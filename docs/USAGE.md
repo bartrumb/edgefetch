@@ -143,34 +143,39 @@ claude mcp add --transport http edgefetch https://<your-hub>.workers.dev/mcp
 
 When Claude Code connects for the first time, it discovers `/.well-known/oauth-protected-resource`, registers dynamically, and opens your browser to `/oauth/authorize`. Paste your `CALLER_TOKEN` once (or click **Approve** immediately if already signed into `/admin`) — **no raw bearer tokens are ever saved in `.claude.json` or shell history**.
 
-### Exposed MCP Tools (11-Tool v2.1 Surface)
+### Exposed MCP Tools (12-Tool v2.4 Surface)
 
 | Tool | Required Scope | Description |
 |---|---|---|
 | `list_agents` | `crawl:read` | Lists connected standby agents (`siteId`, `LITE`/`FAT` tier, `capabilities`, `version`, `arch`) and active `429` cooldowns. |
-| `scrape` | `crawl:fetch` | Scrapes a public `https://` URL to clean GFM Markdown, Jupyter `.ipynb`, OpenAPI 3.x, CSV, `.ics`, metadata, links, images, branding, `changes` diff, and `/llms.txt` + companion `.md` (`maxAgeMs` verified cache, `renderMode: "off"\|"auto"\|"always"`). |
-| `extract` | `crawl:fetch` | Fetches 1..20 URLs politely and returns BM25 query-ranked ~1,500-char chunks (`chunksPerSource`) or full documents (`mode: "full"`). |
+| `scrape` | `crawl:fetch` | Scrapes a public `https://` URL to clean GFM Markdown, Jupyter `.ipynb`, OpenAPI 3.x, CSV, `.ics`, metadata, `contentState`, `waf` diagnostics, SSR hydration recovery, `304` `ETag` revalidation, and optional `waybackFallback`. |
+| `extract` | `crawl:fetch` | Fetches 1..20 URLs politely and returns BM25 query-ranked ~1,500-char chunks (`chunksPerSource`) or full documents (`mode: "full"`), with `jsonFilter` and optional `waybackFallback`. |
 | `map` | `crawl:fetch` | Discovers site URLs across `robots.txt` `Sitemap:`, `sitemap.xml` / `.xml.gz`, `/llms.txt`, and homepage links with anchor titles. |
 | `crawl` | `crawl:fetch` | Starts an async breadth-first site crawl (`includePaths`/`excludePaths`, D1 FTS5 indexing, HMAC webhooks), or polls/cancels `crawlId`. |
-| `search` | `crawl:read` | Searches Serper, Brave, Tavily, SearXNG JSON, `edge-map`, and/or private `SEARCH` D1 FTS5 `collections` fused via Reciprocal Rank Fusion (`RRF`). |
+| `search` | `crawl:read` | Searches Serper, Brave, Tavily, SearXNG JSON, `edge-map`, and/or private `SEARCH` D1 FTS5 `collections` via cost-efficient waterfall or Reciprocal Rank Fusion (`RRF`). |
+| `jobs` | `crawl:fetch` | One-call structured ATS job search across Greenhouse, Ashby, Lever, Workday CXS, SmartRecruiters, and optional Built In with standardized pay (`basis: "base"\|"ote"\|"total"`), deduplication, and closed-role filtering. |
 | `search_collection` | `crawl:read` | Queries a specific crawled `SEARCH` D1 FTS5 collection directly via BM25 ranking. |
 | `interact` | `crawl:fetch` | Drives a sandboxed headless Chromium session on a `browser-v1` node (`click`, `fill`, `press`, `scroll`, `wait`, PNG screenshots, YouTube transcripts). |
-| `read_artifact` | `crawl:read` | Pages stored artifacts by `artifactId` (`blobSha256`) + `offset` + `limit` (`format: "raw"\|"markdown"`). |
-| `fetch_url` | `crawl:fetch` | Low-level single-URL fetch returning status, `httptrace` phase timing, headers, and outcome. |
-| `fetch_batch` | `crawl:fetch` | Low-level multi-URL batch fetch across `page` / `json` / `text` / `feed` / `pdf` kinds. |
+| `read_artifact` | `crawl:read` | Pages stored artifacts by `artifactId` (`blobSha256` or `md:<sha256>`) + `offset` + `limit` (`format: "raw"\|"markdown"`). |
+| `fetch_url` | `crawl:fetch` | Low-level single-URL fetch returning status, `httptrace` phase timing, `stageTimingsMs`, headers, `waf`, and outcome. |
+| `fetch_batch` | `crawl:fetch` | Low-level multi-URL batch fetch (`concurrency: 4`) across `page` / `json` / `text` / `feed` / `pdf` kinds. |
 
 ---
 
-## 6. v2 REST Endpoints, Storage Layers & Compatibility Routes
+## 6. v2.4 REST Endpoints, Verified Bot Auth, Storage Layers & Compatibility Routes
 
 | Endpoint | Description |
 |---|---|
-| `GET /v1/capabilities` | Reports active bindings (`artifacts`, `tracking`, `ingestWorkflow`, `search`, `webSearch`, `crawl`, `interact`). |
-| `POST /v1/scrape` | Clean Markdown, `/llms.txt` + `.md` upgrade, `{type:"json",schema}`, `branding`, `changes` diff, `maxAgeMs` verified cache, `renderMode`. |
-| `POST /v1/extract` | Multi-URL polite batch extraction + BM25 query-ranked chunks (`urls`, `query`, `chunksPerSource`). |
+| `GET /.well-known/http-message-signatures-directory` | Public unauthenticated IETF RFC 9421 Web Bot Auth `Ed25519` JWKS directory (`application/http-message-signatures-directory+json`, `edgefetch keygen-bot-auth`). |
+| `GET /.well-known/edgefetch-bot.json` | Public bot transparency & policy manifest (`strict-rfc9309` `robots.txt`, `halt-immediately-never-bypass` on challenges, active signing `kid`s). |
+| `GET /v1/capabilities` | Reports active bindings (`artifacts`, `tracking`, `ingestWorkflow`, `search`, `webSearch`, `crawl`, `interact`, `webBotAuth`). |
+| `GET /v1/hosts` | Returns adaptive per-host politeness & health ledger (`okCount`, `rateLimit429Count`, `challengeCount`, `error5xxCount`, `ewmaTtfbMs`, `recommendedPauseMs`, `lastWafVendor`). |
+| `POST /v1/scrape` | Clean Markdown, `/llms.txt` + `.md` upgrade, `{type:"json",schema}`, `jsonFilter`, `304` `ETag` revalidation, SSR hydration recovery, `contentState`, `waybackFallback`. |
+| `POST /v1/extract` | Multi-URL polite batch extraction + BM25 query-ranked chunks (`urls`, `query`, `jsonFilter`, `chunksPerSource`, `waybackFallback`). |
+| `POST /v1/jobs` | Structured multi-ATS job discovery & extraction (`query`, `company`, `remote`, `locations`, `minBase`, `postedWithinDays`, `exclude`). |
 | `POST /v1/map` | Rapid polite URL discovery (`robots.txt`, sitemaps, `/llms.txt`, homepage links, `search` filter). |
 | `POST /v1/crawl`, `GET\|DELETE /v1/crawl/:id` | Async site crawl tracked in `META` D1 `crawls` + indexed in `SEARCH` D1 FTS5 + HMAC-SHA256 webhooks (`X-EdgeFetch-Signature`). |
-| `POST /v1/search` & `POST /v1/collections/:id/search` | RRF web + private D1 FTS5 search (`BRAVE_API_KEY`, `SEARXNG_URL`, `collections`, `include_raw_content`). |
+| `POST /v1/search` & `POST /v1/collections/:id/search` | Waterfall / RRF web + private D1 FTS5 search (`SERPER_API_KEY`, `BRAVE_API_KEY`, `SEARXNG_URL`, `collections`, `include_raw_content`). |
 | `POST /v1/interact` | Stateful headless browser interaction routed to `edgefetch_fat` (`browser-v1`) nodes. |
 | `GET /v1/artifacts/:blobSha256` | Authenticated offset-paged artifact reader (`text/plain; charset=utf-8`, `nosniff`, `CSP: sandbox`, `410 Gone` when expired). |
 | `/compat/firecrawl/v2/*` & `/compat/tavily/*` | Drop-in compatibility routes for existing Firecrawl v2 and Tavily SDK clients. |

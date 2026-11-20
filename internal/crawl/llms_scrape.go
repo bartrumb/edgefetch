@@ -69,7 +69,8 @@ func isForbiddenCustomHeader(lower string) bool {
 	switch lower {
 	case "host", "user-agent", "authorization", "cookie", "cookie2", "set-cookie",
 		"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection",
-		"te", "trailer", "transfer-encoding", "upgrade", "content-length", "via", "forwarded":
+		"te", "trailer", "transfer-encoding", "upgrade", "content-length", "via", "forwarded",
+		"signature", "signature-input", "signature-agent":
 		return true
 	}
 	return strings.HasPrefix(lower, "proxy-") ||
@@ -458,6 +459,7 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 		res.SessionID = out.SessionID
 		if errors.Is(err, browser.ErrChallengeDetected) {
 			res.Outcome = classify.OutcomeChallenge
+			res.WAF = classify.ClassifyWAF(http.StatusOK, out.Headers, []byte(out.HTML))
 		} else {
 			res.Outcome = classify.OutcomeError
 			if len(out.HTML) > 0 && len(out.HTML) <= opts.MaxBytes {
@@ -501,6 +503,7 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	res.Rendered = true
 	res.SessionID = out.SessionID
 	res.ScreenshotBase64 = out.ScreenshotBase64
+	res.WAF = classify.ClassifyWAF(res.Status, out.Headers, rawBody)
 	res.Outcome, res.Problem = classify.Classify(classify.KindRender, res.Status, out.Headers, rawBody)
 
 	if opts.IncludeBody && len(rawBody) > 0 {

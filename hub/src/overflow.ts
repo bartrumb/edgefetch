@@ -11,6 +11,8 @@
  *    (empty/off by default) and emits a security event when used.
  */
 import { recomputeSummary, type CrawlResultItem } from './agent-hub';
+import { signOutboundBotHeaders } from './bot-auth';
+import { classifyWafAndChallenge } from './waf';
 
 export const ROBOTS_MAX_BYTES = 512 * 1024; // 512 KiB >= RFC 9309 500 KiB minimum
 const ROBOTS_TIMEOUT_MS = 10_000;
@@ -556,6 +558,10 @@ export interface OverflowDeps {
   fetchFn?: typeof fetch;
   sleepFn?: (ms: number) => Promise<void>;
   bypassAllowlist?: string[];
+  botAuth?: {
+    privateKey: string;
+    directoryUrl?: string;
+  };
 }
 
 export async function cloudflareOverflowFetch(
@@ -708,6 +714,20 @@ export async function cloudflareOverflowFetch(
           }
         }
 
+        if (deps.botAuth?.privateKey) {
+          try {
+            const sigHdrs = await signOutboundBotHeaders({
+              url: parsedUrl.toString(),
+              method: reqMethod,
+              privateKeyEncoded: deps.botAuth.privateKey,
+              ...(deps.botAuth.directoryUrl ? { directoryUrl: deps.botAuth.directoryUrl } : {}),
+            });
+            for (const [sk, sv] of Object.entries(sigHdrs)) headers.set(sk, sv);
+          } catch {
+            // Non-fatal if optional bot signing key is invalid.
+          }
+        }
+
         const resp = await fetchFn(parsedUrl.toString(), {
           method: reqMethod,
           headers,
@@ -743,12 +763,17 @@ export async function cloudflareOverflowFetch(
         }
 
         const { bytes, truncated } = await readBoundedBytes(resp.body, maxBytes, hopSignal);
+        const decodedPreview = !truncated && bytes.byteLength <= 98_304 ? new TextDecoder('utf-8', { fatal: false }).decode(bytes) : '';
+        const wafMatch = !truncated
+          ? classifyWafAndChallenge({ status: resp.status, headers: resp.headers, rawBody: decodedPreview })
+          : null;
         const encodedBody = includeBody && !truncated ? encodeBodyForWire(bytes) : undefined;
+        const isNotModified = resp.status === 304 && Boolean(r.ifNoneMatch || r.ifModifiedSince);
         const outcome = truncated
           ? 'error'
-          : cfMitigated
+          : wafMatch || cfMitigated
             ? 'challenge'
-            : resp.status >= 200 && resp.status < 300
+            : (resp.status >= 200 && resp.status < 300) || isNotModified
               ? 'ok'
               : resp.status === 404 || resp.status === 410
                 ? 'gone'
@@ -758,14 +783,17 @@ export async function cloudflareOverflowFetch(
         results.push({
           id: r.id,
           url: r.url,
+          ...(curUrlStr !== r.url ? { finalUrl: curUrlStr } : {}),
           kind: r.kind,
           status: resp.status,
           outcome,
+          ...(wafMatch ? { problem: wafMatch.summary, waf: wafMatch } : {}),
           bytes: bytes.byteLength,
           truncated,
           durationMs: Date.now() - reqStart,
           contentType: resp.headers.get('content-type') ?? undefined,
           etag: resp.headers.get('etag') ?? undefined,
+          lastModified: resp.headers.get('last-modified') ?? undefined,
           retryAfter: resp.headers.get('retry-after') ?? undefined,
           ...(cfMitigated ? { cfMitigated } : {}),
           ...(encodedBody ? { body: encodedBody.body, bodyEncoding: encodedBody.bodyEncoding } : {}),

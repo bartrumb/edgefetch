@@ -439,3 +439,85 @@ func openBrowserBestEffort(targetURL string) {
 	}
 	_ = cmd.Start()
 }
+
+// runInstallService generates (or writes) a user-level background startup service (`launchd` on macOS,
+// `systemd --user` on Linux, or Startup `.cmd` launcher on Windows) running `edgefetch desktop --no-open`.
+func runInstallService(args []string, stdout, stderr io.Writer) int {
+	dryRun := hasFlag(args, "--dry-run")
+	port := flagValue(args, "--port=")
+	if port == "" {
+		port = "8787"
+	}
+	exePath := flagValue(args, "--exe=")
+	if exePath == "" {
+		resolved, err := os.Executable()
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "resolve executable path: %v\n", err)
+			return 1
+		}
+		exePath = resolved
+	}
+	targetOS := flagValue(args, "--os=")
+	if targetOS == "" {
+		targetOS = runtime.GOOS
+	}
+	home, _ := os.UserHomeDir()
+
+	var destPath, content string
+	switch targetOS {
+	case "darwin":
+		destPath = filepath.Join(home, "Library", "LaunchAgents", "com.bartrumb.edgefetch.desktop.plist")
+		content = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.bartrumb.edgefetch.desktop</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string>
+    <string>desktop</string>
+    <string>--no-open</string>
+    <string>--port=%s</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+`, exePath, port)
+
+	case "windows":
+		appData := os.Getenv("APPDATA")
+		destPath = filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "EdgeFetchDesktop.cmd")
+		content = fmt.Sprintf("@echo off\r\nstart \"\" /B \"%s\" desktop --no-open --port=%s\r\n", exePath, port)
+
+	default:
+		destPath = filepath.Join(home, ".config", "systemd", "user", "edgefetch-desktop.service")
+		content = fmt.Sprintf(`[Unit]
+Description=EdgeFetch Local Loopback MCP & Scrape Service
+After=network-online.target
+
+[Service]
+ExecStart=%s desktop --no-open --port=%s
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+`, exePath, port)
+	}
+
+	if dryRun {
+		_, _ = fmt.Fprintf(stdout, "# %s (%s)\n%s", targetOS, destPath, content)
+		return 0
+	}
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		_, _ = fmt.Fprintf(stderr, "mkdir %s: %v\n", filepath.Dir(destPath), err)
+		return 1
+	}
+	if err := os.WriteFile(destPath, []byte(content), 0o644); err != nil {
+		_, _ = fmt.Fprintf(stderr, "write %s: %v\n", destPath, err)
+		return 1
+	}
+	_, _ = fmt.Fprintf(stdout, "[OK] Installed user startup service -> %s\n", destPath)
+	return 0
+}

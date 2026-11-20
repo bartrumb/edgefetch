@@ -22,6 +22,10 @@
     <img src="https://img.shields.io/badge/Deploy%20on-Fly.io-7B3FE4?style=for-the-badge&logo=flydotio&logoColor=white" alt="Deploy on Fly.io" height="36">
   </a>
   &nbsp;
+  <a href="https://console.deno.com/new?clone=https://github.com/bartrumb/edgefetch&entrypoint=hub/portable/deno-server.ts">
+    <img src="https://deno.com/button" alt="Deploy on Deno" height="36">
+  </a>
+  &nbsp;
   <a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbartrumb%2Fedgefetch">
     <img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" alt="Add EdgeFetch Repository to Home Assistant" height="36">
   </a>
@@ -31,7 +35,7 @@
   </a>
 </p>
 
-**EdgeFetch** (`v2.1`) is a self-hosted **scrape, map, crawl, extract, interact, and search** platform for AI agents — deployable on **Cloudflare Workers**, **Fly.io**, **Railway**, **Render**, **Docker Compose**, or **a single 9 MB static Go binary**, paired with **outbound-only Go worker nodes** (`amd64` & `arm64` Docker, Home Assistant OS, Raspberry Pi, NAS, or VPS) with HTTP/2, SSRF-proxied Headless Chromium, and streaming Poppler PDF.
+**EdgeFetch** (`v2.2`) is a self-hosted **scrape, map, crawl, extract, interact, and search** platform for AI agents — deployable on **Cloudflare Workers**, **Deno Deploy**, **Fly.io**, **Railway**, **Render**, **Docker Compose**, or **a single ~8 MiB static Go binary**, paired with **outbound-only Go worker nodes** (`amd64` & `arm64` Docker, Home Assistant OS, Proxmox LXC, Raspberry Pi, NAS, Android Termux, or VPS) with HTTP/2, SSRF-proxied Headless Chromium, and streaming Poppler PDF.
 
 Unlike self-hosted Firecrawl (which requires Redis, PostgreSQL, RabbitMQ, and a separate Playwright cluster under AGPL-3.0), EdgeFetch is **MIT-licensed**, uses **one external Go dependency (`coder/websocket`, zero transitive dependencies)**, opens **zero inbound router ports** on worker nodes, exports **vendor-agnostic OpenTelemetry (`OTLP/HTTP` + W3C `traceparent`)** traces to any collector, and idles near **$0/month** on Cloudflare Hibernating WebSocket Durable Objects or a single container.
 
@@ -48,9 +52,9 @@ Unlike self-hosted Firecrawl (which requires Redis, PostgreSQL, RabbitMQ, and a 
   - **Cloudflare Hub (`hub/`):** Hibernating WebSocket Durable Object (`AgentHubDO`) + optional R2 + D1 + D1 FTS5 (`~$0` idle cost).
   - **All-in-One Portable Container (`Dockerfile.all-in-one`):** Runs the full TypeScript Hub (`/admin`, OAuth 2.1, 11-tool `/mcp`, `node:sqlite` FTS5, `/data` artifacts) + local Go Chromium/Poppler worker in **one container** on Fly.io (`fly.toml`), Railway (`railway.json`), Render (`render.yaml`), Coolify, or `docker compose up` — zero Postgres, zero Redis.
   - **Pure Go Controller & HA Mesh (`edgefetch --mode=hub` / `--mode=hub,agent`):** The exact same ~9 MB static Go binary can act as a central WebSocket controller (`/agent/ws`, `/v1/scrape`, `/fetch`, `/mcp`), an outbound worker (`--mode=agent` with active-active `EDGEFETCH_HUB_URLS` multi-controller fan-out), or a hybrid Tailscale/LAN standby controller (`--mode=hub,agent`).
-- **Best-of-Breed Open-Source Extraction (`SCRAPE_PIPELINE_VERSION = 19`):**
-  - Sentinel-protected `<pre><code>` & multi-backtick inline `<code>` conversion preserves generic types (`Promise<void>`, `#include <stdio.h>`), GFM tables, footnotes (`[^1]`), `<figure>/<figcaption>`, callouts (`> [!NOTE]`), and LaTeX math.
-  - Native converters for **Jupyter Notebooks (`.ipynb`)**, **OpenAPI 3.x / Swagger 2.0**, **RSS/Atom XML**, **CSV/TSV**, **iCalendar (`.ics`)**, **vCard (`.vcf`)**, **Git `.patch` diffs**, **source/config files**, **Hacker News**, **Substack**, **GitHub Issues/PRs**, **ArXiv**, **Sphinx**, **YouTube transcripts**, **`/llms.txt` companion `.md`**, and **256 MiB streaming Poppler PDFs** (with optional external OCR).
+- **Best-of-Breed Open-Source Extraction (`SCRAPE_PIPELINE_VERSION = 20`, `-91.6%` LLM Token Reduction):**
+  - Modular **20+ Platform Site Extractor Registry** ([`hub/src/extractors/registry.ts`](hub/src/extractors/registry.ts)): 1-hop JSON/raw/patch upgrades & DOM extractors for **npm**, **crates.io**, **Hugging Face** (YAML model cards → GFM tables), **GitHub** (raw, `.patch`, Issues/PRs, Gist), **GitLab**, **Codeberg**, **Stack Overflow / Stack Exchange** (`✅ Accepted Answer`), **Discourse** (`/t/<slug>/<id>.json`), **Lobsters**, **Reddit**, **Bluesky** (ATProto), **Mastodon**, **DEV.to**, **pkg.go.dev**, **PyPI**, **RubyGems**, **Packagist**, **Hex.pm**, **JSR**, **Wikipedia**, **IETF RFCs**, **ArXiv**, **PubMed/PMC**, **Hacker News**, **Substack**, and **YouTube transcripts**.
+  - Sentinel-protected `<pre><code>` & multi-backtick inline `<code>` conversion preserves generic types (`Promise<void>`, `#include <stdio.h>`), GFM tables, footnotes (`[^1]`), `<figure>/<figcaption>`, callouts (`> [!NOTE]`), LaTeX math, **Jupyter `.ipynb`**, **OpenAPI 3.x**, **CSV/TSV**, **RSS/Atom**, **`.ics`**, **`.vcf`**, and **256 MiB streaming Poppler PDFs** — benchmarked in **[bench/RESULTS.md](bench/RESULTS.md)**.
 - **11-Tool Dual-Era OAuth 2.1 MCP Server (`2026-07-28` & `2025-03-26`) + Firecrawl / Tavily Drop-In Compat:**
   - Exposes `list_agents`, `scrape`, `extract`, `map`, `crawl`, `search` (Serper + Brave + Tavily + SearXNG + `edge-map` + private D1 FTS5 fused via Reciprocal Rank Fusion with foreign locale deduplication), `search_collection`, `interact`, `read_artifact`, `fetch_url`, and `fetch_batch`, plus `/compat/firecrawl/v2/*`, `/compat/tavily/*`, and [`sdk/ts/edgefetch-client.ts`](sdk/ts/edgefetch-client.ts) (with `baseUrls` automatic multi-controller HA failover).
 - **Vendor-Agnostic OpenTelemetry (`OTLP/HTTP` + W3C `traceparent`):**
@@ -188,6 +192,11 @@ Status legend:
 | **Unraid, CasaOS, Portainer, Synology & TrueNAS** | 1-Click Homelab / NAS Worker | [`deploy/unraid/`](deploy/unraid/edgefetch-agent.xml), [`deploy/casaos/`](deploy/casaos/docker-compose.yml), [`compose.agent.yaml`](compose.agent.yaml) | Outbound `WSS` residential/homelab node (zero port forwarding) | **🔧 Build & Manifest Verified** |
 | **OpenWrt / GL.iNet Routers & Raspberry Pi (`linux/mipsle`, `linux/arm` v7)** | Always-On Router / Travel-Router Lite Worker | `8.50 MiB` (`mipsle` `softfloat`) / `7.44 MiB` (`armv7`) | HTTP/2, Markdown, pure-Go PDF (`CGO_ENABLED=0`, zero `libc` issues) | **🔧 Build & Manifest Verified** (`.goreleaser.yaml`) |
 | **OPNsense / pfSense / FreeBSD (`freebsd/amd64`, `freebsd/arm64`)** | Firewall / BSD Appliance Lite Worker or Go Hub | `7.63 MiB` (`amd64`) / `7.06 MiB` (`arm64`) | HTTP/2, Markdown, `--mode=agent` / `--mode=hub` | **🔧 Build & Manifest Verified** (`.goreleaser.yaml`) |
+| **Proxmox VE Unprivileged Alpine LXC** | 64 MiB Lite / 512 MiB Fat Homelab Worker | [`deploy/proxmox/create-edgefetch-lxc.sh`](deploy/proxmox/create-edgefetch-lxc.sh) | OpenRC service (`/etc/init.d/edgefetch`), zero Docker VM overhead | **🔧 Build & Manifest Verified** |
+| **Android (Termux + `Termux:Boot` on Wi-Fi / 5G)** | Always-On Spare-Phone Mobile Carrier Node | [`deploy/termux/install-termux-agent.sh`](deploy/termux/install-termux-agent.sh) (`7.13 MiB` `arm64`) | Wake-locked outbound `WSS` worker (`~15 MiB` RAM) | **🔧 Build & Manifest Verified** |
+| **WebAssembly / WASI (`wasip1/wasm`)** | Sandboxed Offline HTML → Markdown / JSON Extractor | [`cmd/edgefetch-wasm`](cmd/edgefetch-wasm/main.go) (`make build-wasm`) | Runs inside `wasmtime`, `wazero`, iPad `a-Shell`, or Wasm sandboxes | **✅ Live-Tested + CI Verified** (`go build` + unit test) |
+| **Chrome / Firefox Manifest V3 Extension** | Active-Tab FTS5 Clipper (`POST /v1/ingest-tab`) & Opt-In Node | [`extensions/browser-clipper/`](extensions/browser-clipper/manifest.json) | Clips authenticated tabs ethically into private FTS5 collections | **✅ Live-Tested + CI Verified** (`V2-11` E2E) |
+| **Deno Deploy + Turso HTTP + S3 SigV4** | Multi-Region Serverless Hub | [`hub/portable/deno-server.ts`](hub/portable/deno-server.ts), [`s3-bucket.ts`](hub/portable/s3-bucket.ts), [`turso-d1.ts`](hub/portable/turso-d1.ts) | Zero-dep WebCrypto SigV4 (S3/R2/Tigris/MinIO/B2) + Turso `/v2/pipeline` | **✅ Live-Tested + CI Verified** (`V2-11` unit + `tsc`) |
 
 ---
 
@@ -211,6 +220,7 @@ Status legend:
 | [`deploy/`](deploy/k8s/agent-deployment.yaml) & [`server.json`](server.json) | Turnkey Kubernetes (`Deployment` + Zero-Trust `NetworkPolicy`), Unraid XML, CasaOS/Portainer Compose, and Official MCP Registry manifest |
 
 - **Head-to-Head Comparison vs. Firecrawl, Crawl4AI, Tavily & Jina:** **[docs/COMPARISON.md](docs/COMPARISON.md)**
+- **Reproducible Extraction & Token-Efficiency Benchmarks (`-91.6%` tokens):** **[bench/RESULTS.md](bench/RESULTS.md)**
 - **Operations, OTLP Tracing, HA Mesh & MCP Guide:** **[docs/USAGE.md](docs/USAGE.md)**
 - **Hub ↔ Go Agent Wire Protocol Spec:** **[docs/PROTOCOL.md](docs/PROTOCOL.md)**
 - **Systems & Go Concurrency Internals:** **[docs/INTERNALS.md](docs/INTERNALS.md)**

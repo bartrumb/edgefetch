@@ -290,4 +290,16 @@ func TestCLIScrapeOneShotMarkdownAndJSON(t *testing.T) {
 	if !strings.Contains(string(mergedRaw), `"filesystem"`) || !strings.Contains(string(mergedRaw), `"/usr/local/bin/edgefetch"`) {
 		t.Fatalf("install-mcp did not merge cleanly: %s", string(mergedRaw))
 	}
+
+	// Test `edgefetch install-service --dry-run` across darwin, linux, and windows templates!
+	for _, targetOS := range []string{"darwin", "linux", "windows"} {
+		out.Reset()
+		errBuf.Reset()
+		if rc := runOneShotCLI(context.Background(), []string{"install-service", "--dry-run", "--os=" + targetOS, "--exe=/opt/edgefetch", "--port=9898"}, &out, &errBuf, deps); rc != 0 {
+			t.Fatalf("install-service --os=%s failed: %s", targetOS, errBuf.String())
+		}
+		if !strings.Contains(out.String(), "desktop") || !strings.Contains(out.String(), "9898") {
+			t.Fatalf("unexpected install-service output for %s: %s", targetOS, out.String())
+		}
+	}
 }

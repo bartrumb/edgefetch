@@ -208,3 +208,87 @@ func TestGoHubAgentDispatchMultiControllerHAAndLocalFallback(t *testing.T) {
 		t.Fatal("expected short per-site token rejected")
 	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestPeerHandoffOn429WithLoopPrevention(t *testing.T) {
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	peerTok := "peer-mesh-secret-token-0123456789abcdef"
+
+	var peerCalls int
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peerCalls++
+		if r.Header.Get("X-EdgeFetch-Peer-Hop") != "1" {
+			t.Errorf("expected X-EdgeFetch-Peer-Hop=1 header on peer handoff")
+		}
+		if r.Header.Get("Authorization") != "Bearer "+peerTok {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"id":"r1","url":"https://shop.example.com/item","kind":"page","outcome":"ok","status":200,"bytes":14,"attempts":1,"durationMs":12,"body":"<h1>Peer OK</h1>"}]}`))
+	}))
+	defer peerSrv.Close()
+
+	// Local Hub's own egress gets HTTP 429 Retry-After: 30 on shop.example.com!
+	localTr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/robots.txt" {
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("User-agent: *\nAllow: /\n")),
+				Request:    req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: 429,
+			Header:     http.Header{"Retry-After": []string{"1"}},
+			Body:       io.NopCloser(strings.NewReader("rate limited")),
+			Request:    req,
+		}, nil
+	})
+	localCrawler := crawl.NewCrawler(localTr, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	defer func() { _ = localCrawler.Close() }()
+
+	hubA := NewServer(Config{
+		CallerToken:     peerTok,
+		PeerURLs:        []string{peerSrv.URL},
+		PeerToken:       peerTok,
+		FallbackCrawler: localCrawler,
+		Allow:           crawl.PublicHTTPS,
+		Logger:          log,
+	})
+	defer func() { _ = hubA.Close() }()
+
+	call := crawl.FetchCall{
+		MaxSeconds: 15,
+		Options:    crawl.Options{IncludeBody: true, RespectRobots: crawl.Bool(true)},
+		Requests:   []crawl.Request{{ID: "r1", URL: "https://shop.example.com/item", Kind: "page"}},
+	}
+
+	// Normal caller request: local 429 seamlessly hands off 1 hop to Tailscale/WireGuard peer!
+	rep, via, status, err := hubA.DispatchOrFallback(context.Background(), call, "auto", "", http.Header{})
+	if err != nil || status != 200 || !strings.HasPrefix(via, "peer:") || len(rep.Results) != 1 || rep.Results[0].Outcome != "ok" {
+		t.Fatalf("expected peer handoff ok, got status=%d via=%q err=%v results=%+v", status, via, err, rep.Results)
+	}
+	if peerCalls != 1 {
+		t.Fatalf("expected 1 peer call, got %d", peerCalls)
+	}
+
+	// Loop guard: if incoming request ALREADY carries `X-EdgeFetch-Peer-Hop: 1`, hubA MUST NOT forward again!
+	hopCall := crawl.FetchCall{
+		MaxSeconds: 5,
+		Options:    crawl.Options{IncludeBody: true, RespectRobots: crawl.Bool(true)},
+		Requests:   []crawl.Request{{ID: "r2", URL: "https://shop2.example.com/item", Kind: "page"}},
+	}
+	hopHdr := http.Header{}
+	hopHdr.Set("X-EdgeFetch-Peer-Hop", "1")
+	rep2, via2, _, _ := hubA.DispatchOrFallback(context.Background(), hopCall, "auto", "", hopHdr)
+	if via2 != "local-hub" || rep2.Results[0].Outcome != "stop" || peerCalls != 1 {
+		t.Fatalf("expected loop guard to prevent 2nd hop: via=%q outcome=%q peerCalls=%d", via2, rep2.Results[0].Outcome, peerCalls)
+	}
+}

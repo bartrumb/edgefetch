@@ -344,6 +344,8 @@ func main() {
 			CallerToken:     serverToken,
 			AgentToken:      sharedAgentTok,
 			AgentTokens:     agentTokensMap,
+			PeerURLs:        splitCSV(os.Getenv("EDGEFETCH_PEERS")),
+			PeerToken:       firstNonEmpty(os.Getenv("EDGEFETCH_PEER_TOKEN"), serverToken),
 			FallbackCrawler: crawler,
 			Allow:           allow,
 			Logger:          log,

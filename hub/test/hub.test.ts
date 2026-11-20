@@ -6,6 +6,9 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { EdgeFetchClient, EdgeFetchError } from '../../sdk/ts/edgefetch-client.ts';
 import { startPortableHub } from '../portable/portable-server.ts';
+import { buildSigV4Headers, S3ArtifactBucket } from '../portable/s3-bucket.ts';
+import { TursoHttpD1Database } from '../portable/turso-d1.ts';
+import { formatYamlFrontmatterCard, resolveSiteExtractorTwin } from '../src/extractors/registry.ts';
 import { ACTIVITY_SQLITE_SCHEMA, buildCrawlActivityEvents, createSqliteActivityStore } from '../src/activity-log.ts';
 import { handleAdminRoute } from '../src/admin.ts';
 import {
@@ -1479,6 +1482,297 @@ test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
     assert.equal(mcpJson.result.tools.length, 11);
+  } finally {
+    await started.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('V2-10: Modular Site Extractor Registry (18+ platforms: npm, crates.io, HF, GitLab, Codeberg, Discourse, Lobsters, Bluesky, Mastodon, DEV.to, StackOverflow, Gist, pkg.go.dev, PyPI, Reddit, Wikipedia, RFC & PubMed)', async () => {
+  const htmlToMd = (frag: string, baseUrl?: string) => {
+    const out = extractHtmlDocument(frag, { baseUrl, onlyMainContent: false });
+    return { markdown: out.markdown, links: out.links };
+  };
+
+  // 1. npm (@scope/pkg) -> registry.npmjs.org
+  const npmTwin = resolveSiteExtractorTwin('https://www.npmjs.com/package/@cloudflare/workers-types/v/4.20260101.0');
+  assert.equal(npmTwin?.id, 'npm-registry');
+  assert.equal(npmTwin?.fetchUrl, 'https://registry.npmjs.org/@cloudflare%2Fworkers-types');
+  const npmDoc = npmTwin?.formatTwin(
+    JSON.stringify({
+      name: '@cloudflare/workers-types',
+      'dist-tags': { latest: '4.20260101.0' },
+      versions: { '4.20260101.0': { description: 'TypeScript definitions for Workers', license: 'MIT', types: 'index.d.ts', dependencies: {} } },
+      readme: '# Workers Types\n\nInstall for `Promise<Response>` types.',
+    }),
+    'https://www.npmjs.com/package/@cloudflare/workers-types',
+    htmlToMd,
+  );
+  assert.match(npmDoc?.markdown ?? '', /npm install @cloudflare\/workers-types/);
+  assert.match(npmDoc?.markdown ?? '', /Promise<Response>/);
+
+  // 2. crates.io -> /api/v1/crates/serde
+  const crateTwin = resolveSiteExtractorTwin('https://crates.io/crates/serde');
+  assert.equal(crateTwin?.id, 'crates-io');
+  const crateDoc = crateTwin?.formatTwin(
+    JSON.stringify({
+      crate: { name: 'serde', max_stable_version: '1.0.218', description: 'Serialization framework', downloads: 450000000, repository: 'https://github.com/serde-rs/serde' },
+      versions: [{ num: '1.0.218', license: 'MIT OR Apache-2.0', rust_version: '1.56', created_at: '2026-02-01T00:00:00Z', features: { derive: ['serde_derive'] } }],
+    }),
+    'https://crates.io/crates/serde',
+    htmlToMd,
+  );
+  assert.match(crateDoc?.markdown ?? '', /cargo add serde/);
+  assert.match(crateDoc?.markdown ?? '', /Rust `1\.56`/);
+
+  // 3–5. RubyGems, Packagist, Hex.pm
+  assert.equal(resolveSiteExtractorTwin('https://rubygems.org/gems/rails')?.id, 'rubygems');
+  assert.equal(resolveSiteExtractorTwin('https://packagist.org/packages/symfony/console')?.id, 'packagist');
+  assert.equal(resolveSiteExtractorTwin('https://hex.pm/packages/phoenix')?.id, 'hex-pm');
+
+  // 6. Hugging Face Model Card YAML frontmatter -> GFM metadata table
+  const hfTwin = resolveSiteExtractorTwin('https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct');
+  assert.equal(hfTwin?.id, 'huggingface-card');
+  assert.equal(hfTwin?.fetchUrl, 'https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct/raw/main/README.md');
+  const hfCard = formatYamlFrontmatterCard(
+    '---\nlicense: apache-2.0\npipeline_tag: text-generation\ntags:\n  - code\n  - qwen2\n---\n\n# Qwen2.5-Coder\n\nSupports `Vec<u8>` generation.',
+    'Qwen/Qwen2.5-Coder-32B-Instruct',
+  );
+  assert.match(hfCard.markdown, /\|\s*\*\*license\*\*\s*\|\s*apache-2\.0\s*\|/);
+  assert.match(hfCard.markdown, /Vec<u8>/);
+
+  // 7–8. GitLab & Codeberg raw + commit patch upgrades
+  assert.equal(
+    resolveSiteExtractorTwin('https://gitlab.com/inkscape/inkscape/-/blob/master/CMakeLists.txt')?.fetchUrl,
+    'https://gitlab.com/inkscape/inkscape/-/raw/master/CMakeLists.txt',
+  );
+  assert.equal(
+    resolveSiteExtractorTwin('https://codeberg.org/forgejo/forgejo/commit/abcdef1234567')?.fetchUrl,
+    'https://codeberg.org/forgejo/forgejo/commit/abcdef1234567.patch',
+  );
+
+  // 9. Universal Discourse `/t/<slug>/<id>` -> `.json` with `accepted_answer`
+  const discTwin = resolveSiteExtractorTwin('https://community.home-assistant.io/t/websocket-reconnect-best-practices/712345');
+  assert.equal(discTwin?.id, 'discourse-topic');
+  const discDoc = discTwin?.formatTwin(
+    JSON.stringify({
+      title: 'WebSocket Reconnect Best Practices',
+      tags: ['addons', 'websocket'],
+      accepted_answer: { post_number: 2, username: 'maintainer' },
+      post_stream: {
+        posts: [
+          { post_number: 1, username: 'asker', created_at: '2026-10-01T10:00:00Z', cooked: '<p>How should jitter backoff work?</p>' },
+          { post_number: 2, username: 'maintainer', created_at: '2026-10-01T10:05:00Z', cooked: '<p>Use full jitter with <code>Retry-After</code>.</p>' },
+        ],
+      },
+    }),
+    'https://community.home-assistant.io/t/websocket-reconnect-best-practices/712345',
+    htmlToMd,
+  );
+  assert.match(discDoc?.markdown ?? '', /✅ Accepted Solution — @maintainer/);
+  assert.match(discDoc?.markdown ?? '', /`Retry-After`/);
+
+  // 10–13. Lobsters, Bluesky ATProto, Mastodon, DEV.to
+  const lobTwin = resolveSiteExtractorTwin('https://lobste.rs/s/abc123/zero_alloc_go_parsers');
+  assert.equal(lobTwin?.id, 'lobsters');
+  const bskyTwin = resolveSiteExtractorTwin('https://bsky.app/profile/golang.org/post/3lbxyz123');
+  assert.equal(bskyTwin?.id, 'bluesky-thread');
+  const bskyDoc = bskyTwin?.formatTwin(
+    JSON.stringify({
+      thread: {
+        post: {
+          author: { handle: 'golang.org', displayName: 'The Go Programming Language' },
+          record: { text: 'Go 1.27 is released with faster SwissTables!', createdAt: '2026-08-12T16:00:00Z' },
+          likeCount: 420,
+          repostCount: 95,
+        },
+        replies: [{ post: { author: { handle: 'gopher.dev' }, record: { text: 'Zero regressions under -race!' } } }],
+      },
+    }),
+    'https://bsky.app/profile/golang.org/post/3lbxyz123',
+    htmlToMd,
+  );
+  assert.match(bskyDoc?.markdown ?? '', /SwissTables/);
+  assert.match(bskyDoc?.markdown ?? '', /@gopher\.dev/);
+
+  assert.equal(resolveSiteExtractorTwin('https://fosstodon.org/@user/113456789012345678')?.id, 'mastodon-status');
+  assert.equal(resolveSiteExtractorTwin('https://dev.to/gopher/writing-fuzz-tests')?.id, 'dev-to');
+
+  // 14. Stack Overflow Q&A DOM extractor (Question + ✅ Accepted Answer + code generics)
+  const soHtml = `<!doctype html><html><body>
+    <div id="question-header"><h1>How to type Promise&lt;Result&lt;T&gt;&gt; in TypeScript?</h1></div>
+    <div id="question" data-score="42">
+      <div class="s-prose js-post-body"><p>I need <code>Promise&lt;Result&lt;T&gt;&gt;</code> without losing generics.</p></div>
+      <a class="post-tag">typescript</a><a class="post-tag">generics</a>
+      <span class="comment-copy">Tested on TS 5.8?</span>
+    </div>
+    <div id="answer-10" data-score="5"><div class="s-prose js-post-body"><p>Older workaround.</p></div></div>
+    <div id="answer-20" class="answer accepted-answer" data-score="88">
+      <div class="s-prose js-post-body"><p>Return <code>Awaited&lt;T&gt;</code> directly:</p><pre><code>type Unwrap&lt;T&gt; = Awaited&lt;T&gt;;</code></pre></div>
+    </div>
+    <div id="hot-network-questions"><ul><li>Noise question 1</li></ul></div>
+  </body></html>`;
+  const soOut = extractHtmlDocument(soHtml, { baseUrl: 'https://stackoverflow.com/questions/99999/how-to-type-promise' });
+  assert.match(soOut.markdown, /## ✅ Accepted Answer \(Score: 88\)/);
+  assert.match(soOut.markdown, /`Promise<Result<T>>`/);
+  assert.match(soOut.markdown, /type Unwrap<T> = Awaited<T>;/);
+  assert.equal(soOut.markdown.includes('Noise question 1'), false);
+
+  // 15–18. GitHub Gist, pkg.go.dev, PyPI, IETF RFC, Wikipedia, Reddit & PubMed
+  const rfcHtml = `<!doctype html><html><head><title>RFC 9110: HTTP Semantics</title></head><body>
+    <pre class="newpage">RFC 9110                     HTTP Semantics                    June 2022
+
+10.2.3. Retry-After
+
+The "Retry-After" header field indicates how long the user agent ought to wait.
+
+Fielding, et al.             Standards Track                   [Page 42]</pre>
+  </body></html>`;
+  const rfcOut = extractHtmlDocument(rfcHtml, { baseUrl: 'https://www.rfc-editor.org/rfc/rfc9110' });
+  assert.match(rfcOut.markdown, /#### 10\.2\.3\. Retry-After/);
+  assert.equal(rfcOut.markdown.includes('[Page 42]'), false);
+
+  const wikiHtml = `<!doctype html><html><body><main>
+    <h1>Bloom filter</h1>
+    <p>A Bloom filter<span class="mw-editsection">[edit]</span> is a space-efficient probabilistic data structure.[citation needed]</p>
+  </main></body></html>`;
+  const wikiOut = extractHtmlDocument(wikiHtml, { baseUrl: 'https://en.wikipedia.org/wiki/Bloom_filter' });
+  assert.equal(wikiOut.markdown.includes('[citation needed]'), false);
+  assert.equal(wikiOut.markdown.includes('[edit]'), false);
+
+  const redditHtml = `<!doctype html><html><body>
+    <shreddit-post post-title="Self-hosting MCP servers on Home Assistant" author="homelabber" score="312" subreddit-prefixed-name="r/selfhosted">
+      <div><p>Zero open router ports over outbound WebSockets!</p></div>
+    </shreddit-post>
+    <shreddit-comment author="builder" score="45" depth="0"><p>Works great on Raspberry Pi 5.</p></shreddit-comment>
+  </body></html>`;
+  const redditOut = extractHtmlDocument(redditHtml, { baseUrl: 'https://www.reddit.com/r/selfhosted/comments/xyz123/selfhosting/' });
+  assert.match(redditOut.markdown, /# Self-hosting MCP servers on Home Assistant/);
+  assert.match(redditOut.markdown, /\*\*u\/builder\*\* \(45\): Works great on Raspberry Pi 5\./);
+});
+
+test('V2-11: WebCrypto AWS SigV4 S3ArtifactBucket, TursoHttpD1Database /v2/pipeline, and MV3 POST /v1/ingest-tab FTS5 clip indexing', async () => {
+  // 1. Deterministic AWS SigV4 signing check + S3ArtifactBucket conditional PUT/GET/HEAD
+  const sigHeaders = await buildSigV4Headers({
+    method: 'PUT',
+    url: 'https://s3.us-east-1.amazonaws.com/edgefetch-bucket/raw/sha256/aa/test.gz',
+    region: 'us-east-1',
+    accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+    secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    payloadSha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    now: new Date('2026-11-20T00:00:00Z'),
+  });
+  assert.match(sigHeaders.authorization ?? '', /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/20261120\/us-east-1\/s3\/aws4_request/);
+
+  const memObjects = new Map<string, { bytes: Uint8Array; headers: Record<string, string> }>();
+  const s3 = new S3ArtifactBucket({
+    endpoint: 'https://s3.example.internal',
+    bucket: 'ef-artifacts',
+    accessKeyId: 'test-key',
+    secretAccessKey: 'test-secret',
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      const reqHeaders = (init?.headers ?? {}) as Record<string, string>;
+      if (method === 'PUT') {
+        if (reqHeaders['if-none-match'] === '*' && memObjects.has(url)) {
+          return new Response(null, { status: 412 });
+        }
+        const body = init?.body as Uint8Array;
+        memObjects.set(url, { bytes: new Uint8Array(body), headers: reqHeaders });
+        return new Response(null, { status: 200, headers: { etag: '"abc123"' } });
+      }
+      const existing = memObjects.get(url);
+      if (!existing) return new Response(null, { status: 404 });
+      const resHeaders: Record<string, string> = {
+        'content-length': String(existing.bytes.byteLength),
+        'content-type': existing.headers['content-type'] ?? 'application/octet-stream',
+        etag: '"abc123"',
+      };
+      for (const [k, v] of Object.entries(existing.headers)) {
+        if (k.startsWith('x-amz-meta-')) resHeaders[k] = v;
+      }
+      return new Response(method === 'HEAD' ? null : (existing.bytes as BodyInit), { status: 200, headers: resHeaders });
+    },
+  });
+
+  const firstPut = await s3.put('tmp/test.txt', 'hello sigv4', {
+    onlyIf: new Headers({ 'if-none-match': '*' }),
+    customMetadata: { contentSha256: 'deadbeef' },
+  });
+  assert.ok(firstPut);
+  const dupPut = await s3.put('tmp/test.txt', 'hello sigv4', { onlyIf: new Headers({ 'if-none-match': '*' }) });
+  assert.equal(dupPut, null);
+  const gotS3 = await s3.get('tmp/test.txt');
+  assert.equal(await gotS3?.text(), 'hello sigv4');
+  assert.equal(gotS3?.customMetadata?.contentsha256, 'deadbeef');
+
+  // 2. TursoHttpD1Database /v2/pipeline batch execution
+  let capturedPipelineUrl = '';
+  const turso = new TursoHttpD1Database({
+    url: 'libsql://edgefetch-org.turso.io',
+    authToken: 'turso-jwt-token',
+    fetchImpl: async (input, init) => {
+      capturedPipelineUrl = String(input);
+      const body = JSON.parse(String(init?.body ?? '{}')) as { requests: Array<{ type: string }> };
+      assert.equal(body.requests.at(-1)?.type, 'close');
+      return Response.json({
+        results: [
+          {
+            type: 'ok',
+            response: {
+              type: 'execute',
+              result: {
+                cols: [{ name: 'id' }, { name: 'title' }],
+                rows: [[{ type: 'integer', value: '7' }, { type: 'text', value: 'Turso Row' }]],
+                affected_row_count: 1,
+              },
+            },
+          },
+          { type: 'ok', response: { type: 'close' } },
+        ],
+      });
+    },
+  });
+  const row = await turso.prepare('SELECT id, title FROM pages WHERE id = ?').bind(7).first<{ id: number; title: string }>();
+  assert.equal(capturedPipelineUrl, 'https://edgefetch-org.turso.io/v2/pipeline');
+  assert.deepEqual(row, { id: 7, title: 'Turso Row' });
+
+  // 3. MV3 Browser Extension `POST /v1/ingest-tab` -> immediate FTS5 collection search!
+  const dataDir = mkdtempSync(join(tmpdir(), 'ef-clip-test-'));
+  const tok = 'clipper-owner-secret-0123456789ab';
+  const started = await startPortableHub({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir,
+    envOverrides: { CALLER_TOKEN: tok, AGENT_TOKEN: 'clipper-agent-secret-0123456789ab' },
+  });
+  try {
+    const base = `http://127.0.0.1:${started.port}`;
+    const clipRes = await fetch(`${base}/v1/ingest-tab`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        url: 'https://internal.example.com/runbooks/failover',
+        html: '<!doctype html><html><head><title>Failover Runbook</title></head><body><main><h1>Failover Runbook</h1><p>Promote standby hub via Tailscale quorum.</p></main></body></html>',
+        collectionId: 'team-runbooks',
+      }),
+    });
+    assert.equal(clipRes.status, 200);
+    const clipJson = (await clipRes.json()) as { ok: boolean; indexedChunks: number; markdown: string };
+    assert.equal(clipJson.ok, true);
+    assert.equal(clipJson.indexedChunks >= 1, true);
+    assert.match(clipJson.markdown, /Tailscale quorum/);
+
+    const ftsRes = await fetch(`${base}/v1/collections/team-runbooks/search`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'Tailscale quorum' }),
+    });
+    assert.equal(ftsRes.status, 200);
+    const ftsJson = (await ftsRes.json()) as { hits: Array<{ url: string }> };
+    assert.equal(ftsJson.hits.length, 1);
+    assert.equal(ftsJson.hits[0]?.url, 'https://internal.example.com/runbooks/failover');
   } finally {
     await started.close();
     rmSync(dataDir, { recursive: true, force: true });

@@ -26,6 +26,8 @@ func FuzzValidateCustomHeaders(f *testing.F) {
 	f.Add("Proxy-Authorization", "Basic abc")
 	f.Add("X-Inject\r\nEvil", "val")
 	f.Add("X-Test", "line1\r\nHost: internal")
+	f.Add("\n0", "0")
+	f.Add(" X-Padded ", "0")
 
 	f.Fuzz(func(t *testing.T, k, v string) {
 		if len(k) > 8192 || len(v) > 16384 {
@@ -34,14 +36,15 @@ func FuzzValidateCustomHeaders(f *testing.F) {
 		err := ValidateCustomHeaders(map[string]string{k: v})
 		if err == nil {
 			trimmed := strings.ToLower(strings.TrimSpace(k))
-			if trimmed == "" ||
+			if k != strings.TrimSpace(k) ||
+				trimmed == "" ||
 				trimmed == "host" ||
 				trimmed == "authorization" ||
 				trimmed == "cookie" ||
 				strings.HasPrefix(trimmed, "proxy-") ||
 				strings.HasPrefix(trimmed, "cf-") ||
 				strings.HasPrefix(trimmed, "x-forwarded-") ||
-				strings.ContainsAny(k, "\r\n\x00") ||
+				strings.ContainsAny(k, " \t\r\n\x00") ||
 				strings.ContainsAny(v, "\r\n\x00") {
 				t.Fatalf("SECURITY: forbidden custom header accepted: %q=%q", k, v)
 			}

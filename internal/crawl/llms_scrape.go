@@ -44,20 +44,19 @@ func ValidateCustomHeaders(hdrs map[string]string) error {
 	}
 	totalBytes := 0
 	for k, v := range hdrs {
-		name := strings.TrimSpace(k)
-		if !validHeaderNameRe.MatchString(name) {
+		if !validHeaderNameRe.MatchString(k) {
 			return fmt.Errorf("invalid header name %q", k)
 		}
-		lower := strings.ToLower(name)
+		lower := strings.ToLower(k)
 		if isForbiddenCustomHeader(lower) {
-			return fmt.Errorf("header %q is not permitted", name)
+			return fmt.Errorf("header %q is not permitted", k)
 		}
 		for i := 0; i < len(v); i++ {
 			if v[i] < 0x20 || v[i] > 0x7E {
-				return fmt.Errorf("header %q contains non-printable ASCII byte 0x%02x", name, v[i])
+				return fmt.Errorf("header %q contains non-printable ASCII byte 0x%02x", k, v[i])
 			}
 		}
-		totalBytes += len(name) + len(v)
+		totalBytes += len(k) + len(v)
 		if totalBytes > maxCustomHeadersBytes {
 			return fmt.Errorf("custom headers exceed %d bytes", maxCustomHeadersBytes)
 		}

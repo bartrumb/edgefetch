@@ -1,6 +1,7 @@
 # Compiled binaries & test artifacts
 /edgefetch
 /edgefetch.exe
+/edgefetch-wasm.wasm
 *.out
 coverage.html
 

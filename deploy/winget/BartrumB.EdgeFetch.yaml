@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.9.0.schema.json
+PackageIdentifier: BartrumB.EdgeFetch
+PackageVersion: 2.2.0
+PackageLocale: en-US
+Publisher: BartrumB
+PublisherUrl: https://github.com/bartrumb/edgefetch
+PackageName: EdgeFetch
+PackageUrl: https://github.com/bartrumb/edgefetch
+License: MIT
+LicenseUrl: https://github.com/bartrumb/edgefetch/blob/main/LICENSE
+ShortDescription: Single-binary polite HTTP/2 + OS-browser Web Scraper, Crawler & Local/Remote MCP Server for AI Agents.
+Tags:
+  - mcp
+  - web-scraping
+  - crawler
+  - markdown
+  - ai-agents
+  - golang
+ManifestType: singleton
+ManifestVersion: 1.9.0
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: edgefetch.exe
+        PortableCommandAlias: edgefetch
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.2.0/edgefetch_2.2.0_windows_amd64.zip
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+  - Architecture: arm64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: edgefetch.exe
+        PortableCommandAlias: edgefetch
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.2.0/edgefetch_2.2.0_windows_arm64.zip
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000

@@ -1,10 +1,13 @@
-.PHONY: build test race fuzz bench bench-extract doctor hub-test up down fmt vet
+.PHONY: build build-wasm test race fuzz bench bench-extract doctor hub-test up down fmt vet
 
-VERSION ?= 2.1.0
+VERSION ?= 2.2.0
 LDFLAGS := -s -w -X github.com/bartrumb/edgefetch/internal/agent.Version=$(VERSION)
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o edgefetch ./cmd/edgefetch
+
+build-wasm:
+	GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o edgefetch-wasm.wasm ./cmd/edgefetch-wasm
 
 fmt:
 	gofmt -s -w .

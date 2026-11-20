@@ -76,11 +76,14 @@ import {
   executeIngestPipeline,
   IngestWorkflow,
   pruneExpiredFetchHistory,
+  sha256HexString,
   writeJobManifestToR2,
 } from './ingest';
 import {
   executeInteractCall,
   executeScrapeCall,
+  extractHtmlDocument,
+  SCRAPE_PIPELINE_VERSION,
   type InteractRequestPayload,
   type ScrapeRequestPayload,
 } from './scrape';
@@ -97,6 +100,7 @@ import {
   handleArtifactGetRequest,
   hydrateReplyBodiesFromR2,
   MAX_ARTIFACT_CONTENT_BYTES,
+  r2DerivedKey,
   readArtifactPage,
   type ArtifactRetention,
   type OptionalStorageBindings,
@@ -884,7 +888,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.1.0',
+          serverVersion: '2.2.0',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1066,7 +1070,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.1.0'), {
+        return Response.json(buildCapabilities(env, '2.2.0'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -1146,6 +1150,123 @@ export default {
             ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
           },
         });
+      }
+
+      if (url.pathname === '/v1/ingest-tab' && (request.method === 'OPTIONS' || request.method === 'POST')) {
+        const corsHeaders: Record<string, string> = {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'POST, OPTIONS',
+          'access-control-allow-headers': 'Authorization, Content-Type',
+          'cache-control': 'no-store',
+        };
+        if (request.method === 'OPTIONS') {
+          return new Response(null, { status: 204, headers: corsHeaders });
+        }
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { ...corsHeaders, 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: corsHeaders });
+        }
+        const rawClipText = await request.text();
+        if (new TextEncoder().encode(rawClipText).byteLength > 4 * 1024 * 1024) {
+          return Response.json({ error: 'too_large', message: 'Tab clip exceeds 4 MiB limit' }, { status: 413, headers: corsHeaders });
+        }
+        let clipPayload: {
+          url?: string;
+          title?: string;
+          html?: string;
+          markdown?: string;
+          collectionId?: string;
+          onlyMainContent?: boolean;
+        };
+        try {
+          clipPayload = JSON.parse(rawClipText) as typeof clipPayload;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400, headers: corsHeaders });
+        }
+        const tabUrl = typeof clipPayload.url === 'string' ? clipPayload.url.trim() : '';
+        let parsedTabUrl: URL;
+        try {
+          parsedTabUrl = new URL(tabUrl);
+          if (parsedTabUrl.protocol !== 'https:' && parsedTabUrl.protocol !== 'http:') {
+            throw new Error('scheme');
+          }
+        } catch {
+          return Response.json({ error: 'invalid_url', message: 'Valid http(s) tab url required' }, { status: 400, headers: corsHeaders });
+        }
+        parsedTabUrl.hash = '';
+        const cleanUrl = parsedTabUrl.toString();
+        const collectionId =
+          typeof clipPayload.collectionId === 'string' && COLLECTION_ID_RE.test(clipPayload.collectionId.trim())
+            ? clipPayload.collectionId.trim()
+            : 'browser-clips';
+
+        let markdown = typeof clipPayload.markdown === 'string' ? clipPayload.markdown.trim() : '';
+        let resolvedTitle = typeof clipPayload.title === 'string' ? clipPayload.title.trim() : '';
+        let description: string | undefined;
+        if (!markdown && typeof clipPayload.html === 'string' && clipPayload.html.trim()) {
+          const extracted = extractHtmlDocument(clipPayload.html, {
+            baseUrl: cleanUrl,
+            onlyMainContent: clipPayload.onlyMainContent !== false,
+          });
+          markdown = extracted.markdown.trim();
+          if (!resolvedTitle && extracted.title) resolvedTitle = extracted.title;
+          description = extracted.description;
+        }
+        if (!markdown) {
+          return Response.json({ error: 'empty_content', message: 'Clipped tab produced empty Markdown' }, { status: 400, headers: corsHeaders });
+        }
+
+        const contentSha256 = await sha256HexString(markdown);
+        const pageId = (await sha256HexString(cleanUrl)).slice(0, 32);
+        const documentId = `clip:${contentSha256.slice(0, 32)}`;
+        const nowMs = Date.now();
+
+        if (env.ARTIFACTS) {
+          await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256), markdown, {
+            httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+          }).catch(() => undefined);
+        }
+
+        let indexedChunks = 0;
+        if (env.SEARCH) {
+          const idx = new D1FtsSearchIndex(env.SEARCH);
+          const rep = await idx.replacePageChunks({
+            collectionId,
+            documentId,
+            pageId,
+            url: cleanUrl,
+            title: resolvedTitle || cleanUrl,
+            markdown,
+            fetchedAt: nowMs,
+          });
+          if (rep.status === 'indexed') indexedChunks = rep.chunkCount;
+        }
+
+        return Response.json(
+          {
+            ok: true,
+            url: cleanUrl,
+            title: resolvedTitle || cleanUrl,
+            ...(description ? { description } : {}),
+            collectionId,
+            indexedChunks,
+            contentSha256,
+            pipelineVersion: SCRAPE_PIPELINE_VERSION,
+            markdown,
+          },
+          { status: 200, headers: corsHeaders },
+        );
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/extract') {

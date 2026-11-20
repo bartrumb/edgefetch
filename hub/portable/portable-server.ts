@@ -13,6 +13,8 @@ import searchSchemaSql from '../migrations/search/0001_fts.sql';
 import { authorizeAgent } from '../src/auth';
 import hubWorker from '../src/index';
 import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './node-adapters';
+import { S3ArtifactBucket } from './s3-bucket';
+import { TursoHttpD1Database } from './turso-d1';
 
 export interface PortableHubOptions {
   port?: number;
@@ -47,22 +49,45 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const host = opts.host ?? process.env.HOST ?? '0.0.0.0';
   const dataDir = resolve(opts.dataDir ?? process.env.EDGEFETCH_DATA_DIR ?? './.edgefetch-data');
 
-  const coordinator = new LocalAgentHubCoordinator(join(dataDir, 'hub.sqlite'));
-  const metaDb = new NodeSqliteD1Database(
-    join(dataDir, 'meta.sqlite'),
-    opts.migrationsDir
-      ? [join(resolve(opts.migrationsDir), 'meta', '0001_tracking.sql')]
-      : [{ name: 'meta/0001_tracking.sql', sql: metaSchemaSql }],
-  );
-  const searchDb = new NodeSqliteD1Database(
-    join(dataDir, 'search.sqlite'),
-    opts.migrationsDir
-      ? [join(resolve(opts.migrationsDir), 'search', '0001_fts.sql')]
-      : [{ name: 'search/0001_fts.sql', sql: searchSchemaSql }],
-  );
-  const artifacts = new NodeFsR2Bucket(join(dataDir, 'artifacts'));
-
   const mergedEnv = { ...process.env, ...(opts.envOverrides ?? {}) };
+  const tursoUrl = mergedEnv.TURSO_DATABASE_URL;
+  const tursoToken = mergedEnv.TURSO_AUTH_TOKEN;
+
+  const coordinator = new LocalAgentHubCoordinator(join(dataDir, 'hub.sqlite'));
+  const localMetaDb = (mergedEnv.META_TURSO_URL || tursoUrl)
+    ? null
+    : new NodeSqliteD1Database(
+        join(dataDir, 'meta.sqlite'),
+        opts.migrationsDir
+          ? [join(resolve(opts.migrationsDir), 'meta', '0001_tracking.sql')]
+          : [{ name: 'meta/0001_tracking.sql', sql: metaSchemaSql }],
+      );
+  const localSearchDb = (mergedEnv.SEARCH_TURSO_URL || tursoUrl)
+    ? null
+    : new NodeSqliteD1Database(
+        join(dataDir, 'search.sqlite'),
+        opts.migrationsDir
+          ? [join(resolve(opts.migrationsDir), 'search', '0001_fts.sql')]
+          : [{ name: 'search/0001_fts.sql', sql: searchSchemaSql }],
+      );
+
+  const metaDb = localMetaDb
+    ? localMetaDb
+    : new TursoHttpD1Database({ url: (mergedEnv.META_TURSO_URL || tursoUrl)!, authToken: tursoToken }).asD1Database();
+  const searchDb = localSearchDb
+    ? localSearchDb
+    : new TursoHttpD1Database({ url: (mergedEnv.SEARCH_TURSO_URL || tursoUrl)!, authToken: tursoToken }).asD1Database();
+  const artifacts =
+    mergedEnv.S3_ENDPOINT && mergedEnv.S3_BUCKET && mergedEnv.S3_ACCESS_KEY_ID && mergedEnv.S3_SECRET_ACCESS_KEY
+      ? new S3ArtifactBucket({
+          endpoint: mergedEnv.S3_ENDPOINT,
+          bucket: mergedEnv.S3_BUCKET,
+          accessKeyId: mergedEnv.S3_ACCESS_KEY_ID,
+          secretAccessKey: mergedEnv.S3_SECRET_ACCESS_KEY,
+          region: mergedEnv.S3_REGION || 'auto',
+        }).asR2Bucket()
+      : new NodeFsR2Bucket(join(dataDir, 'artifacts'));
+
   const workerEnv: Record<string, unknown> = {
     AGENT_HUB: coordinator.asNamespace(),
     META: metaDb,
@@ -172,8 +197,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
           new Promise<void>((resClose) => {
             server.close(() => {
               coordinator.close();
-              metaDb.close();
-              searchDb.close();
+              localMetaDb?.close();
+              localSearchDb?.close();
               resClose();
             });
           }),

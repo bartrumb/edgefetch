@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>EdgeFetch</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 14px; width: 340px; font: 13px/1.45 system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; }
+    h1 { margin: 0 0 10px; font-size: 15px; display: flex; align-items: center; justify-content: space-between; }
+    .badge { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: #1e293b; color: #94a3b8; }
+    .badge.live { background: #064e3b; color: #6ee7b7; }
+    label { display: block; font-size: 11px; color: #94a3b8; margin: 8px 0 3px; }
+    input[type="text"], input[type="password"] {
+      width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px;
+      border: 1px solid #334155; background: #1e293b; color: #f8fafc; font-size: 12px;
+    }
+    button {
+      width: 100%; margin-top: 10px; padding: 8px 10px; border: 0; border-radius: 6px;
+      font-weight: 600; cursor: pointer; background: #38bdf8; color: #0f172a;
+    }
+    button.secondary { background: #334155; color: #f8fafc; }
+    .row { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; padding-top: 10px; border-top: 1px solid #1e293b; }
+    pre { margin: 10px 0 0; padding: 8px; max-height: 150px; overflow: auto; background: #020617; border: 1px solid #1e293b; border-radius: 6px; font-size: 11px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>
+    <span>EdgeFetch Clipper</span>
+    <span id="nodeBadge" class="badge">Node: Off</span>
+  </h1>
+
+  <label for="hubUrl">Hub URL</label>
+  <input id="hubUrl" type="text" placeholder="https://edgefetch.example.com">
+
+  <label for="callerToken">Caller Token (for Tab Clipping)</label>
+  <input id="callerToken" type="password" placeholder="Bearer token for /v1/ingest-tab">
+
+  <label for="collectionId">Search Collection ID</label>
+  <input id="collectionId" type="text" value="browser-clips">
+
+  <button id="clipBtn">Clip Active Tab to EdgeFetch</button>
+
+  <div class="row">
+    <span>Connect Browser as Edge Node</span>
+    <input id="nodeToggle" type="checkbox">
+  </div>
+  <label for="agentToken">Agent Token &amp; Site ID (when Node enabled)</label>
+  <input id="agentToken" type="password" placeholder="AGENT_TOKEN">
+  <input id="siteId" type="text" value="browser-ext-1" style="margin-top:4px;">
+  <button id="saveBtn" class="secondary">Save Settings</button>
+
+  <pre id="statusBox" hidden></pre>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

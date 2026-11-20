@@ -41,6 +41,7 @@ func isOneShotCLI(args []string) bool {
 		"scrape",
 		"mcp",
 		"install-mcp",
+		"install-service",
 		"desktop",
 		"help", "--help", "-h":
 		return true
@@ -77,6 +78,8 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 		return runMCPStdio(ctx, os.Stdin, stdout, stderr, deps)
 	case "install-mcp":
 		return runInstallMCP(args[1:], stdout, stderr)
+	case "install-service":
+		return runInstallService(args[1:], stdout, stderr)
 	case "desktop":
 		return runDesktopMode(ctx, args[1:], stdout, stderr)
 	default:

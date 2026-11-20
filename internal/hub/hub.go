@@ -52,6 +52,9 @@ type Config struct {
 	CallerToken       string
 	AgentToken        string
 	AgentTokens       map[string]string
+	PeerURLs          []string
+	PeerToken         string
+	PeerHTTPClient    *http.Client
 	FallbackCrawler   *crawl.Crawler
 	Allow             func(*url.URL) error
 	Logger            *slog.Logger
@@ -686,6 +689,10 @@ func (s *Server) DispatchOrFallback(
 		}
 	}
 
+	alreadyHopped := traceHdr != nil && strings.TrimSpace(traceHdr.Get("X-EdgeFetch-Peer-Hop")) != ""
+	var lastAgentReply *crawl.FetchReply
+	var lastAgentVia string
+
 	triedSites := make(map[string]bool)
 	if target == "auto" || target == "agent" {
 		for attempt := 0; attempt < 3; attempt++ {
@@ -705,28 +712,133 @@ func (s *Server) DispatchOrFallback(
 				s.hydrateArtifacts(&rep)
 			}
 			// If agent hit HTTP 429/403 stop and another peer exists, fail over automatically!
-			hitStop := false
-			for _, r := range rep.Results {
-				if r.Outcome == classify.OutcomeStop || r.Outcome == classify.OutcomeChallenge {
-					hitStop = true
+			if replyHitStopOrChallenge(rep) && preferredSite == "" {
+				if s.pickAgent(primaryHost, "", needsBrowser, triedSites) != nil {
+					continue
+				}
+				if !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
+					repCopy := rep
+					lastAgentReply = &repCopy
+					lastAgentVia = "agent:" + sess.siteID
 					break
 				}
 			}
-			if hitStop && preferredSite == "" && s.pickAgent(primaryHost, "", needsBrowser, triedSites) != nil {
-				continue
-			}
 			return rep, "agent:" + sess.siteID, http.StatusOK, nil
 		}
-		if target == "agent" {
+		if target == "agent" && lastAgentReply == nil {
 			return crawl.FetchReply{}, "hub", http.StatusServiceUnavailable, errors.New("no matching healthy remote agents available")
 		}
 	}
 
+	// Tailscale / WireGuard Peer-to-Peer Egress Handoff (`EDGEFETCH_PEERS`):
+	// When local agents hit 429/challenge (or before local fallback if local fallback hits 429), forward 1 hop to healthy peers.
+	if lastAgentReply != nil && !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
+		if peerRep, peerVia, ok := s.tryPeerHandoff(ctx, call, primaryHost, traceMap); ok {
+			return peerRep, peerVia, http.StatusOK, nil
+		}
+		return *lastAgentReply, lastAgentVia, http.StatusOK, nil
+	}
+
 	if s.cfg.FallbackCrawler == nil {
+		if !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
+			if peerRep, peerVia, ok := s.tryPeerHandoff(ctx, call, primaryHost, traceMap); ok {
+				return peerRep, peerVia, http.StatusOK, nil
+			}
+		}
 		return crawl.FetchReply{}, "hub", http.StatusServiceUnavailable, errors.New("no remote agents connected and local fallback crawler disabled")
 	}
 	rep := crawl.ExecuteCallWithTrace(ctx, s.cfg.FallbackCrawler, call, traceHdr, crawl.CallLogger(s.log, traceHdr), nil)
+	if replyHitStopOrChallenge(rep) && !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
+		if peerRep, peerVia, ok := s.tryPeerHandoff(ctx, call, primaryHost, traceMap); ok {
+			return peerRep, peerVia, http.StatusOK, nil
+		}
+	}
 	return rep, "local-hub", http.StatusOK, nil
+}
+
+func replyHitStopOrChallenge(rep crawl.FetchReply) bool {
+	for _, r := range rep.Results {
+		if r.Outcome == classify.OutcomeStop || r.Outcome == classify.OutcomeChallenge || r.Outcome == classify.OutcomeNotTried {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) tryPeerHandoff(ctx context.Context, call crawl.FetchCall, primaryHost string, traceMap map[string]string) (crawl.FetchReply, string, bool) {
+	client := s.cfg.PeerHTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 35 * time.Second}
+	}
+	peerTok := firstNonEmpty(s.cfg.PeerToken, s.cfg.CallerToken)
+	bodyBytes, err := json.Marshal(call)
+	if err != nil {
+		return crawl.FetchReply{}, "", false
+	}
+
+	now := time.Now()
+	for _, rawPeer := range s.cfg.PeerURLs {
+		base := strings.TrimRight(strings.TrimSpace(rawPeer), "/")
+		if base == "" {
+			continue
+		}
+		cdKey := "peer:" + base + "|" + primaryHost
+		s.mu.Lock()
+		exp, cooled := s.cooldowns[cdKey]
+		if cooled && now.Before(exp) {
+			s.mu.Unlock()
+			continue
+		}
+		if cooled {
+			delete(s.cooldowns, cdKey)
+		}
+		s.mu.Unlock()
+
+		req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, base+"/fetch", bytes.NewReader(bodyBytes))
+		if rErr != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-EdgeFetch-Peer-Hop", "1")
+		if peerTok != "" {
+			req.Header.Set("Authorization", "Bearer "+peerTok)
+		}
+		for hk, hv := range traceMap {
+			if hv != "" {
+				req.Header.Set(hk, hv)
+			}
+		}
+
+		resp, dErr := client.Do(req)
+		if dErr != nil {
+			continue
+		}
+		var peerReply crawl.FetchReply
+		decErr := json.NewDecoder(io.LimitReader(resp.Body, maxDecodedReplyBytes)).Decode(&peerReply)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || decErr != nil {
+			continue
+		}
+		if replyHitStopOrChallenge(peerReply) {
+			cd := defaultCooldownDur
+			for _, r := range peerReply.Results {
+				if r.RetryAfterMs > 0 {
+					cd = time.Duration(r.RetryAfterMs) * time.Millisecond
+					break
+				}
+			}
+			s.mu.Lock()
+			s.cooldowns[cdKey] = time.Now().Add(cd)
+			s.mu.Unlock()
+			continue
+		}
+		peerHost := base
+		if pu, pErr := url.Parse(base); pErr == nil && pu.Host != "" {
+			peerHost = pu.Host
+		}
+		return peerReply, "peer:" + peerHost, true
+	}
+	return crawl.FetchReply{}, "", false
 }
 
 func (s *Server) pickAgent(host, preferredSite string, needsBrowser bool, exclude map[string]bool) *agentSession {

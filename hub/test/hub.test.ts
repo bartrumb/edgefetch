@@ -6,6 +6,8 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { EdgeFetchClient, EdgeFetchError } from '../../sdk/ts/edgefetch-client.ts';
 import { startPortableHub } from '../portable/portable-server.ts';
+import { buildSigV4Headers, S3ArtifactBucket } from '../portable/s3-bucket.ts';
+import { TursoHttpD1Database } from '../portable/turso-d1.ts';
 import { formatYamlFrontmatterCard, resolveSiteExtractorTwin } from '../src/extractors/registry.ts';
 import { ACTIVITY_SQLITE_SCHEMA, buildCrawlActivityEvents, createSqliteActivityStore } from '../src/activity-log.ts';
 import { handleAdminRoute } from '../src/admin.ts';
@@ -1647,4 +1649,132 @@ Fielding, et al.             Standards Track                   [Page 42]</pre>
   const redditOut = extractHtmlDocument(redditHtml, { baseUrl: 'https://www.reddit.com/r/selfhosted/comments/xyz123/selfhosting/' });
   assert.match(redditOut.markdown, /# Self-hosting MCP servers on Home Assistant/);
   assert.match(redditOut.markdown, /\*\*u\/builder\*\* \(45\): Works great on Raspberry Pi 5\./);
+});
+
+test('V2-11: WebCrypto AWS SigV4 S3ArtifactBucket, TursoHttpD1Database /v2/pipeline, and MV3 POST /v1/ingest-tab FTS5 clip indexing', async () => {
+  // 1. Deterministic AWS SigV4 signing check + S3ArtifactBucket conditional PUT/GET/HEAD
+  const sigHeaders = await buildSigV4Headers({
+    method: 'PUT',
+    url: 'https://s3.us-east-1.amazonaws.com/edgefetch-bucket/raw/sha256/aa/test.gz',
+    region: 'us-east-1',
+    accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+    secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    payloadSha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    now: new Date('2026-11-20T00:00:00Z'),
+  });
+  assert.match(sigHeaders.authorization ?? '', /^AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE\/20261120\/us-east-1\/s3\/aws4_request/);
+
+  const memObjects = new Map<string, { bytes: Uint8Array; headers: Record<string, string> }>();
+  const s3 = new S3ArtifactBucket({
+    endpoint: 'https://s3.example.internal',
+    bucket: 'ef-artifacts',
+    accessKeyId: 'test-key',
+    secretAccessKey: 'test-secret',
+    fetchImpl: async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      const reqHeaders = (init?.headers ?? {}) as Record<string, string>;
+      if (method === 'PUT') {
+        if (reqHeaders['if-none-match'] === '*' && memObjects.has(url)) {
+          return new Response(null, { status: 412 });
+        }
+        const body = init?.body as Uint8Array;
+        memObjects.set(url, { bytes: new Uint8Array(body), headers: reqHeaders });
+        return new Response(null, { status: 200, headers: { etag: '"abc123"' } });
+      }
+      const existing = memObjects.get(url);
+      if (!existing) return new Response(null, { status: 404 });
+      const resHeaders: Record<string, string> = {
+        'content-length': String(existing.bytes.byteLength),
+        'content-type': existing.headers['content-type'] ?? 'application/octet-stream',
+        etag: '"abc123"',
+      };
+      for (const [k, v] of Object.entries(existing.headers)) {
+        if (k.startsWith('x-amz-meta-')) resHeaders[k] = v;
+      }
+      return new Response(method === 'HEAD' ? null : (existing.bytes as BodyInit), { status: 200, headers: resHeaders });
+    },
+  });
+
+  const firstPut = await s3.put('tmp/test.txt', 'hello sigv4', {
+    onlyIf: new Headers({ 'if-none-match': '*' }),
+    customMetadata: { contentSha256: 'deadbeef' },
+  });
+  assert.ok(firstPut);
+  const dupPut = await s3.put('tmp/test.txt', 'hello sigv4', { onlyIf: new Headers({ 'if-none-match': '*' }) });
+  assert.equal(dupPut, null);
+  const gotS3 = await s3.get('tmp/test.txt');
+  assert.equal(await gotS3?.text(), 'hello sigv4');
+  assert.equal(gotS3?.customMetadata?.contentsha256, 'deadbeef');
+
+  // 2. TursoHttpD1Database /v2/pipeline batch execution
+  let capturedPipelineUrl = '';
+  const turso = new TursoHttpD1Database({
+    url: 'libsql://edgefetch-org.turso.io',
+    authToken: 'turso-jwt-token',
+    fetchImpl: async (input, init) => {
+      capturedPipelineUrl = String(input);
+      const body = JSON.parse(String(init?.body ?? '{}')) as { requests: Array<{ type: string }> };
+      assert.equal(body.requests.at(-1)?.type, 'close');
+      return Response.json({
+        results: [
+          {
+            type: 'ok',
+            response: {
+              type: 'execute',
+              result: {
+                cols: [{ name: 'id' }, { name: 'title' }],
+                rows: [[{ type: 'integer', value: '7' }, { type: 'text', value: 'Turso Row' }]],
+                affected_row_count: 1,
+              },
+            },
+          },
+          { type: 'ok', response: { type: 'close' } },
+        ],
+      });
+    },
+  });
+  const row = await turso.prepare('SELECT id, title FROM pages WHERE id = ?').bind(7).first<{ id: number; title: string }>();
+  assert.equal(capturedPipelineUrl, 'https://edgefetch-org.turso.io/v2/pipeline');
+  assert.deepEqual(row, { id: 7, title: 'Turso Row' });
+
+  // 3. MV3 Browser Extension `POST /v1/ingest-tab` -> immediate FTS5 collection search!
+  const dataDir = mkdtempSync(join(tmpdir(), 'ef-clip-test-'));
+  const tok = 'clipper-owner-secret-0123456789ab';
+  const started = await startPortableHub({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir,
+    envOverrides: { CALLER_TOKEN: tok, AGENT_TOKEN: 'clipper-agent-secret-0123456789ab' },
+  });
+  try {
+    const base = `http://127.0.0.1:${started.port}`;
+    const clipRes = await fetch(`${base}/v1/ingest-tab`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        url: 'https://internal.example.com/runbooks/failover',
+        html: '<!doctype html><html><head><title>Failover Runbook</title></head><body><main><h1>Failover Runbook</h1><p>Promote standby hub via Tailscale quorum.</p></main></body></html>',
+        collectionId: 'team-runbooks',
+      }),
+    });
+    assert.equal(clipRes.status, 200);
+    const clipJson = (await clipRes.json()) as { ok: boolean; indexedChunks: number; markdown: string };
+    assert.equal(clipJson.ok, true);
+    assert.equal(clipJson.indexedChunks >= 1, true);
+    assert.match(clipJson.markdown, /Tailscale quorum/);
+
+    const ftsRes = await fetch(`${base}/v1/collections/team-runbooks/search`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${tok}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'Tailscale quorum' }),
+    });
+    assert.equal(ftsRes.status, 200);
+    const ftsJson = (await ftsRes.json()) as { hits: Array<{ url: string }> };
+    assert.equal(ftsJson.hits.length, 1);
+    assert.equal(ftsJson.hits[0]?.url, 'https://internal.example.com/runbooks/failover');
+  } finally {
+    await started.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
 });

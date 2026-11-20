@@ -61,8 +61,11 @@ jobs:
           go test -fuzz=FuzzExtractHTML -fuzztime=2s ./internal/extract
           go test -fuzz=FuzzParseLlmsTxt -fuzztime=2s ./internal/extract
 
-      - name: Run allocation microbenchmarks
-        run: go test -bench=. -benchmem ./...
+      - name: Run allocation microbenchmarks & WASI WebAssembly build check
+        run: |
+          go test -bench=. -benchmem ./...
+          GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tmp/edgefetch-wasm.wasm ./cmd/edgefetch-wasm
+          rm -f /tmp/edgefetch-wasm.wasm
 
   hub:
     name: Cloudflare Hub Type-Check & Bundle Dry-Run
@@ -82,6 +85,9 @@ jobs:
       - run: npm test
       - run: npm run type-check
       - run: npm run deploy:dry
+      - name: Run Extraction & Token-Efficiency Fidelity Benchmark
+        working-directory: .
+        run: node bench/run-bench.mjs
       - name: Run Python SDK unit tests
         working-directory: sdk/py
         run: python3 test_edgefetch_client.py

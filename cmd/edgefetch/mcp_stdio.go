@@ -488,24 +488,6 @@ func allMCPClientTargets(goos, homeDir, appData string) []mcpClientTarget {
 	return out
 }
 
-// defaultMCPConfigPaths preserves test compatibility while returning the primary JSON MCP targets.
-func defaultMCPConfigPaths(goos, homeDir, appData string) []struct {
-	client string
-	path   string
-} {
-	all := allMCPClientTargets(goos, homeDir, appData)
-	var out []struct {
-		client string
-		path   string
-	}
-	for _, t := range all {
-		if t.slug == "claude-desktop" || t.slug == "cursor" {
-			out = append(out, struct{ client, path string }{t.client, t.path})
-		}
-	}
-	return out
-}
-
 func upsertCodexTomlMCP(existing string, exePath string) string {
 	escapedExe := strings.ReplaceAll(exePath, `\`, `\\`)
 	block := fmt.Sprintf("[mcp_servers.edgefetch]\ncommand = %q\nargs = [\"mcp\"]\n", escapedExe)

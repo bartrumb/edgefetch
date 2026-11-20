@@ -111,6 +111,11 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     BOT_SIGNING_PRIVATE_KEY: mergedEnv.BOT_SIGNING_PRIVATE_KEY ?? mergedEnv.EDGEFETCH_BOT_SIGNING_KEY,
     BOT_SIGNING_PUBLIC_KEY: mergedEnv.BOT_SIGNING_PUBLIC_KEY,
     BOT_CONTACT_URL: mergedEnv.BOT_CONTACT_URL,
+    CRAWL4AI_API_URL: mergedEnv.CRAWL4AI_API_URL,
+    CRAWL4AI_API_TOKEN: mergedEnv.CRAWL4AI_API_TOKEN,
+    FIRECRAWL_API_URL: mergedEnv.FIRECRAWL_API_URL,
+    FIRECRAWL_API_KEY: mergedEnv.FIRECRAWL_API_KEY,
+    SPA_FALLBACK_ORDER: mergedEnv.SPA_FALLBACK_ORDER,
   };
 
   const defaultOrigin = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`;

@@ -168,9 +168,9 @@ When Claude Code connects for the first time, it discovers `/.well-known/oauth-p
 |---|---|
 | `GET /.well-known/http-message-signatures-directory` | Public unauthenticated IETF RFC 9421 Web Bot Auth `Ed25519` JWKS directory (`application/http-message-signatures-directory+json`, `edgefetch keygen-bot-auth`). |
 | `GET /.well-known/edgefetch-bot.json` | Public bot transparency & policy manifest (`strict-rfc9309` `robots.txt`, `halt-immediately-never-bypass` on challenges, active signing `kid`s). |
-| `GET /v1/capabilities` | Reports active bindings (`artifacts`, `tracking`, `ingestWorkflow`, `search`, `webSearch`, `crawl`, `interact`, `webBotAuth`). |
+| `GET /v1/capabilities` | Reports active bindings (`artifacts`, `tracking`, `ingestWorkflow`, `search`, `webSearch`, `crawl`, `interact`, `webBotAuth`, `spaFallback`, `spaFallbacks`). |
 | `GET /v1/hosts` | Returns adaptive per-host politeness & health ledger (`okCount`, `rateLimit429Count`, `challengeCount`, `error5xxCount`, `ewmaTtfbMs`, `recommendedPauseMs`, `lastWafVendor`). |
-| `POST /v1/scrape` | Clean Markdown, `/llms.txt` + `.md` upgrade, `{type:"json",schema}`, `jsonFilter`, `304` `ETag` revalidation, SSR hydration recovery, `contentState`, `waybackFallback`. |
+| `POST /v1/scrape` | Clean Markdown, `/llms.txt` + `.md` upgrade, `{type:"json",schema}`, `jsonFilter`, `304` `ETag` revalidation, Next.js RSC / `__NEXT_DATA__` / Nuxt SSR hydration, `spaFallback` (`Crawl4AI` / `Firecrawl`), `contentState`, `waybackFallback`. |
 | `POST /v1/extract` | Multi-URL polite batch extraction + BM25 query-ranked chunks (`urls`, `query`, `jsonFilter`, `chunksPerSource`, `waybackFallback`). |
 | `POST /v1/jobs` | Structured multi-ATS job discovery & extraction (`query`, `company`, `remote`, `locations`, `minBase`, `postedWithinDays`, `exclude`). |
 | `POST /v1/map` | Rapid polite URL discovery (`robots.txt`, sitemaps, `/llms.txt`, homepage links, `search` filter). |

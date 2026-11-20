@@ -532,6 +532,13 @@ function buildToolDefinitions(deps: McpServerDeps) {
             description:
               'Opt-in Internet Archive Wayback fallback strictly on 5xx or network-unreachable link rot (never used on robots.txt, 401/403/429, or anti-bot challenges).',
           },
+          spaFallback: {
+            type: 'string',
+            enum: ['auto', 'off', 'crawl4ai', 'firecrawl'],
+            default: 'auto',
+            description:
+              'When CRAWL4AI_API_URL or FIRECRAWL_API_URL/KEY is configured on the Hub, ethically falls back on heavy/unhydrated SPAs or missing local browser nodes (never used on robots.txt, 403/429, or challenges).',
+          },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
         },
@@ -580,6 +587,13 @@ function buildToolDefinitions(deps: McpServerDeps) {
             default: false,
             description:
               'Opt-in Internet Archive Wayback fallback strictly on 5xx or network-unreachable link rot (never used on robots.txt, 401/403/429, or anti-bot challenges).',
+          },
+          spaFallback: {
+            type: 'string',
+            enum: ['auto', 'off', 'crawl4ai', 'firecrawl'],
+            default: 'auto',
+            description:
+              'When CRAWL4AI_API_URL or FIRECRAWL_API_URL/KEY is configured on the Hub, ethically falls back on heavy/unhydrated SPAs or missing local browser nodes (never used on robots.txt, 403/429, or challenges).',
           },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional standby site ID when target="agent".' },

@@ -7,6 +7,7 @@
  */
 
 import { encodeBodyForWire } from './overflow';
+import { listConfiguredSpaFallbacks, type SpaFallbackEnv, type SpaFallbackProvider } from './spa-fallback';
 
 export type ArtifactRetention = 'transient' | 'stored';
 
@@ -18,7 +19,7 @@ export interface IngestWorkflowParams {
   via: string;
 }
 
-export interface OptionalStorageBindings {
+export interface OptionalStorageBindings extends SpaFallbackEnv {
   ARTIFACTS?: R2Bucket;
   META?: D1Database;
   SEARCH?: D1Database;
@@ -141,8 +142,10 @@ export interface HubCapabilities {
     webSearch: boolean;
     pdfOcr: boolean;
     webBotAuth: boolean;
+    spaFallback: boolean;
   };
   searchProviders: string[];
+  spaFallbacks: SpaFallbackProvider[];
 }
 
 export function buildCapabilities(
@@ -154,7 +157,7 @@ export function buildCapabilities(
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
-  version = '2.4.0',
+  version = '2.4.1',
 ): HubCapabilities {
   const searchProviders: string[] = ['edge-map'];
   if (env.SEARCH) searchProviders.push('d1-fts5');
@@ -162,6 +165,7 @@ export function buildCapabilities(
   if (env.BRAVE_API_KEY?.trim()) searchProviders.push('brave');
   if (env.TAVILY_API_KEY?.trim()) searchProviders.push('tavily');
   if (env.SEARXNG_URL?.trim()) searchProviders.push('searxng');
+  const spaFallbacks = listConfiguredSpaFallbacks(env);
 
   const hasWebProvider = Boolean(
     env.SERPER_API_KEY?.trim() || env.BRAVE_API_KEY?.trim() || env.TAVILY_API_KEY?.trim() || env.SEARXNG_URL?.trim(),
@@ -184,8 +188,10 @@ export function buildCapabilities(
       webSearch: hasWebProvider,
       pdfOcr: Boolean(env.PDF_OCR || (env.PDF_OCR_URL?.trim() && env.PDF_OCR_TOKEN?.trim())),
       webBotAuth: Boolean(env.BOT_SIGNING_PRIVATE_KEY?.trim() || env.BOT_SIGNING_PUBLIC_KEY?.trim()),
+      spaFallback: spaFallbacks.length > 0,
     },
     searchProviders,
+    spaFallbacks,
   };
 }
 

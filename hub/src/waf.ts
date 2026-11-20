@@ -400,15 +400,81 @@ export function recoverSsrHydrationContent(
     rawJson = nextMatch[1].trim();
     framework = 'nextjs';
   } else {
-    const remixMatch = /window\.__remixContext\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i.exec(rawHtml);
-    if (remixMatch?.[1]) {
-      rawJson = remixMatch[1].trim();
-      framework = 'remix';
+    const nuxtMatch = /<script\b[^>]*\bid\s*=\s*["']__NUXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i.exec(rawHtml);
+    if (nuxtMatch?.[1]) {
+      rawJson = nuxtMatch[1].trim();
+      framework = 'nuxt';
     } else {
-      const apolloMatch = /window\.__APOLLO_STATE__\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i.exec(rawHtml);
-      if (apolloMatch?.[1]) {
-        rawJson = apolloMatch[1].trim();
-        framework = 'apollo';
+      const remixMatch = /window\.__remixContext\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i.exec(rawHtml);
+      if (remixMatch?.[1]) {
+        rawJson = remixMatch[1].trim();
+        framework = 'remix';
+      } else {
+        const apolloMatch = /window\.__APOLLO_STATE__\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i.exec(rawHtml);
+        if (apolloMatch?.[1]) {
+          rawJson = apolloMatch[1].trim();
+          framework = 'apollo';
+        }
+      }
+    }
+  }
+
+  // Next.js 13–15 App Router RSC Flight stream (`self.__next_f.push([1, "..."])`) recovery!
+  if (!rawJson && rawHtml.includes('__next_f.push')) {
+    const rscChunks: string[] = [];
+    const rscRe = /self\.__next_f\.push\(\s*\[\s*1\s*,\s*("(?:[^"\\]|\\.)*")\s*\]\s*\)/g;
+    let rm: RegExpExecArray | null;
+    while ((rm = rscRe.exec(rawHtml)) !== null) {
+      try {
+        const decoded = JSON.parse(rm[1]!) as string;
+        if (typeof decoded === 'string' && decoded.length > 0) rscChunks.push(decoded);
+      } catch {
+        // skip malformed chunk
+      }
+    }
+    if (rscChunks.length > 0) {
+      const combinedRsc = rscChunks.join('');
+      const rscBlocks: string[] = [];
+      const seenRsc = new Set<string>();
+      let rscTitle = '';
+      // Extract JSON objects or long prose strings embedded inside RSC Flight lines (`12:["$","div",null,{"children":"..."}]` or `T1f4,...markdown...`)
+      for (const strMatch of combinedRsc.matchAll(/"((?:[^"\\]|\\.){80,})"/g)) {
+        try {
+          const unescaped = JSON.parse(`"${strMatch[1]!}"`) as string;
+          const trimmed = unescaped.trim();
+          if (!/\s/.test(trimmed.slice(0, 80)) || /^(?:https?:\/\/|\/_next\/)/i.test(trimmed)) continue;
+          const converted = /<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|a)\b/i.test(trimmed)
+            ? htmlToMd(trimmed, baseUrl).markdown.trim()
+            : trimmed;
+          const wc = (converted.match(/[\p{L}\p{N}_'-]+/gu) ?? []).length;
+          if (wc >= 25 && !seenRsc.has(converted)) {
+            seenRsc.add(converted);
+            rscBlocks.push(converted);
+          }
+        } catch {
+          // ignore
+        }
+      }
+      const titleTag = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(rawHtml)?.[1]?.trim() ?? '';
+      if (titleTag) rscTitle = titleTag;
+      // Also capture raw RSC `T<hex>,` text blocks (used by Next.js App Router for large Markdown/prose props!)
+      for (const rawBlock of combinedRsc.split(/\n[0-9a-f]+:/i)) {
+        const trimmed = rawBlock.replace(/^[0-9a-f]*:?T[0-9a-f]+,/i, '').trim();
+        if (trimmed.length >= 140 && !trimmed.startsWith('[') && !trimmed.startsWith('{') && /\s/.test(trimmed.slice(0, 80))) {
+          const wc = (trimmed.match(/[\p{L}\p{N}_'-]+/gu) ?? []).length;
+          if (wc >= 30 && !seenRsc.has(trimmed)) {
+            seenRsc.add(trimmed);
+            rscBlocks.push(trimmed);
+          }
+        }
+      }
+      const rscJoined = rscBlocks.join('\n\n').trim();
+      if ((rscJoined.match(/[\p{L}\p{N}_'-]+/gu) ?? []).length >= 25) {
+        return {
+          ...(rscTitle ? { title: rscTitle } : {}),
+          markdown: rscTitle && !rscJoined.startsWith('# ') ? `# ${rscTitle}\n\n${rscJoined}` : rscJoined,
+          framework: 'nextjs-rsc',
+        };
       }
     }
   }

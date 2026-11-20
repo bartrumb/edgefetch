@@ -90,6 +90,10 @@ import {
   isEligibleForWaybackFallback,
   recoverSsrHydrationContent,
 } from '../src/waf.ts';
+import {
+  isEligibleForExternalSpaFallback,
+  listConfiguredSpaFallbacks,
+} from '../src/spa-fallback.ts';
 import { NodeFsR2Bucket, NodeSqliteD1Database } from '../portable/node-adapters.ts';
 
 function memoryCooldowns(): CooldownStore {
@@ -3045,7 +3049,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.4.0');
+    assert.equal(caps.version, '2.4.1');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);
@@ -3166,4 +3170,202 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
     assert.equal(denied.body.ok, false);
   }
   assert.equal(archiveCalls, 0, 'Wayback fallback must NEVER run on robots.txt, 403, or anti-bot challenges');
+});
+
+test('V2-14: v2.4.1 Next.js App Router RSC Hydration + Ethical Crawl4AI & Firecrawl Heavy-SPA Fallback (Cloud & Self-Hosted)', async () => {
+  // 1. Next.js 13–15 App Router RSC Flight (`self.__next_f.push([1, "..."])`) 1-hop hydration recovery without launching a browser!
+  const rscFlightPayload =
+    '12:["$","main",null,{"children":"HyperEdge is seeking a Principal Systems Architect to lead distributed consensus, multi-region WebSocket routing, and zero-trust kernel sandboxing across 80 edge locations globally. Candidates need deep Go and Rust production experience and familiarity with HTTP/2 and QUIC internals."}]\n';
+  const rscHtml = `<html><head><title>Principal Systems Architect - HyperEdge</title></head><body>
+    <div id="app">Loading...</div>
+    <script>self.__next_f=self.__next_f||[];self.__next_f.push([1,${JSON.stringify(rscFlightPayload)}])</script>
+  </body></html>`;
+  const rscRecovered = recoverSsrHydrationContent(rscHtml, 'https://hyperedge.example.com/jobs/1', (h) => ({ markdown: h, links: [] }));
+  assert.ok(rscRecovered);
+  assert.equal(rscRecovered.framework, 'nextjs-rsc');
+  assert.match(rscRecovered.markdown, /multi-region WebSocket routing/);
+
+  // 2. Provider discovery & priority ordering (`crawl4ai` -> `firecrawl` default, or custom `SPA_FALLBACK_ORDER`)
+  assert.deepEqual(
+    listConfiguredSpaFallbacks({
+      CRAWL4AI_API_URL: 'http://crawl4ai.local:11235',
+      FIRECRAWL_API_KEY: 'fc-test-key',
+    }),
+    ['crawl4ai', 'firecrawl'],
+  );
+  assert.deepEqual(
+    listConfiguredSpaFallbacks({
+      CRAWL4AI_API_URL: 'http://crawl4ai.local:11235',
+      FIRECRAWL_API_URL: 'http://firecrawl.local:3002',
+      SPA_FALLBACK_ORDER: 'firecrawl,crawl4ai',
+    }),
+    ['firecrawl', 'crawl4ai'],
+  );
+
+  // 3. Rescue `503 fat_agent_required` (Lite-only fleet) via self-hosted Crawl4AI after verifying `/robots.txt` allows the URL!
+  const fallbackCalls: string[] = [];
+  let crawl4AiShouldFail = false;
+  let robotsDisallowSpa = false;
+
+  const mockSpaFetch: typeof fetch = async (input, init) => {
+    const reqUrl = input instanceof Request ? input.url : String(input);
+    fallbackCalls.push(reqUrl);
+    if (reqUrl.endsWith('/robots.txt')) {
+      return new Response(
+        robotsDisallowSpa ? 'User-agent: *\nDisallow: /private-spa\n' : 'User-agent: *\nAllow: /\n',
+        { status: 200, headers: { 'content-type': 'text/plain' } },
+      );
+    }
+    if (reqUrl === 'http://crawl4ai.internal:11235/crawl') {
+      const parsedBody = JSON.parse(String(init?.body ?? '{}')) as { crawler_config?: { params?: { check_robots_txt?: boolean; magic?: boolean } } };
+      assert.equal(parsedBody.crawler_config?.params?.check_robots_txt, true);
+      assert.equal(parsedBody.crawler_config?.params?.magic, false);
+      if (crawl4AiShouldFail) {
+        return new Response('upstream error', { status: 502 });
+      }
+      return Response.json({
+        success: true,
+        results: [
+          {
+            url: 'https://heavy-spa.example.com/dashboard',
+            status_code: 200,
+            metadata: { title: 'Heavy WebGL SPA Docs' },
+            markdown: {
+              fit_markdown:
+                '# Heavy WebGL SPA Docs\n\nFull client-rendered WebGL & Shadow DOM documentation recovered cleanly via self-hosted Crawl4AI worker.',
+            },
+          },
+        ],
+      });
+    }
+    if (reqUrl === 'http://firecrawl.internal:3002/v1/scrape') {
+      assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer fc-selfhosted-secret');
+      return Response.json({
+        success: true,
+        data: {
+          markdown:
+            '# Heavy WebGL SPA Docs (Firecrawl)\n\nRecovered cleanly via self-hosted Firecrawl fallback when Crawl4AI was unavailable.',
+          metadata: {
+            title: 'Heavy WebGL SPA Docs (Firecrawl)',
+            statusCode: 200,
+            sourceURL: 'https://heavy-spa.example.com/dashboard',
+          },
+        },
+      });
+    }
+    return new Response('not found', { status: 404 });
+  };
+
+  const spaEnv = {
+    CRAWL4AI_API_URL: 'http://crawl4ai.internal:11235',
+    FIRECRAWL_API_URL: 'http://firecrawl.internal:3002',
+    FIRECRAWL_API_KEY: 'fc-selfhosted-secret',
+    SPA_FALLBACK_FETCH: mockSpaFetch,
+  };
+
+  // Case A: Lite-only fleet returns `503 fat_agent_required` on `renderMode: "always"` -> Crawl4AI rescues after `/robots.txt` check!
+  const liteFleetRescue = await executeScrapeCall({
+    payload: { url: 'https://heavy-spa.example.com/dashboard', renderMode: 'always', discoverLlmsTxt: false },
+    env: spaEnv,
+    executeHubFetch: async () => ({
+      status: 503,
+      via: 'hub',
+      bodyText: JSON.stringify({ error: 'fat_agent_required', message: 'No browser-v1 agent connected' }),
+    }),
+  });
+  assert.equal(liteFleetRescue.status, 200);
+  assert.equal(liteFleetRescue.via, 'fallback:crawl4ai');
+  assert.equal(liteFleetRescue.body.renderedVia, 'crawl4ai');
+  assert.match(String(liteFleetRescue.body.markdown), /recovered cleanly via self-hosted Crawl4AI/);
+  assert.deepEqual(fallbackCalls, [
+    'https://heavy-spa.example.com/robots.txt',
+    'http://crawl4ai.internal:11235/crawl',
+  ]);
+
+  // Case B: Thin `200 OK` `<script>` SPA shell (`< 50` words) when Crawl4AI is down -> cascades automatically to Firecrawl!
+  fallbackCalls.length = 0;
+  crawl4AiShouldFail = true;
+  const thinSpaCascade = await executeScrapeCall({
+    payload: { url: 'https://heavy-spa.example.com/dashboard', renderMode: 'auto', discoverLlmsTxt: false },
+    env: spaEnv,
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-lite',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: 'https://heavy-spa.example.com/dashboard',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html; charset=utf-8',
+            body: '<html><head><title>App</title><script src="/app.bundle.js"></script></head><body><div id="root">Loading...</div></body></html>',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(thinSpaCascade.status, 200);
+  assert.equal(thinSpaCascade.via, 'fallback:firecrawl');
+  assert.equal(thinSpaCascade.body.renderedVia, 'firecrawl');
+  assert.match(String(thinSpaCascade.body.markdown), /self-hosted Firecrawl fallback/);
+  crawl4AiShouldFail = false;
+
+  // Case C: Also works inside `executeExtractCall` (`POST /v1/extract`)!
+  const extractSpaRescue = await executeExtractCall({
+    payload: { urls: ['https://heavy-spa.example.com/dashboard'], query: 'WebGL Shadow DOM', renderMode: 'always' },
+    env: spaEnv,
+    executeHubFetch: async () => ({
+      status: 503,
+      via: 'hub',
+      bodyText: JSON.stringify({ error: 'fat_agent_required', message: 'No browser-v1 agent connected' }),
+    }),
+  });
+  assert.equal(extractSpaRescue.status, 200);
+  assert.equal(extractSpaRescue.via, 'fallback:crawl4ai');
+  const extResults = extractSpaRescue.body.results as Array<{ renderedVia?: string; rawContent?: string; chunks?: Array<{ text: string }> }>;
+  assert.equal(extResults[0]?.renderedVia, 'crawl4ai');
+
+  // 4. STRICT ETHICAL GUARDRAILS: Crawl4AI & Firecrawl MUST NEVER be called on `robots.txt` blocks, `403`, `429`, WAF challenges, or login walls!
+  fallbackCalls.length = 0;
+  robotsDisallowSpa = true;
+  const robotsPrecheckBlocked = await executeScrapeCall({
+    payload: { url: 'https://heavy-spa.example.com/private-spa', renderMode: 'always', discoverLlmsTxt: false },
+    env: spaEnv,
+    executeHubFetch: async () => ({
+      status: 503,
+      via: 'hub',
+      bodyText: JSON.stringify({ error: 'fat_agent_required', message: 'No browser-v1 agent connected' }),
+    }),
+  });
+  assert.equal(robotsPrecheckBlocked.status, 503);
+  assert.deepEqual(fallbackCalls, ['https://heavy-spa.example.com/robots.txt'], 'Disallowed robots.txt must halt before calling Crawl4AI or Firecrawl!');
+  robotsDisallowSpa = false;
+
+  fallbackCalls.length = 0;
+  for (const unethicalCase of [
+    { status: 0, outcome: 'skip', problem: 'robots.txt disallowed /admin' },
+    { status: 403, outcome: 'error', problem: 'HTTP 403 Forbidden' },
+    { status: 429, outcome: 'error', problem: 'HTTP 429 Too Many Requests' },
+    { status: 403, outcome: 'challenge', problem: 'Cloudflare challenge (cf-mitigated)' },
+    {
+      status: 200,
+      outcome: 'ok',
+      contentType: 'text/html',
+      body: '<html><head><title>Sign in to continue</title><script src="/auth.js"></script></head><body><form><input type="password"></form></body></html>',
+    },
+  ]) {
+    const res = await executeScrapeCall({
+      payload: { url: 'https://restricted.example.com/admin', discoverLlmsTxt: false },
+      env: spaEnv,
+      executeHubFetch: async () => ({
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({ results: [{ id: 'scrape-1', url: 'https://restricted.example.com/admin', ...unethicalCase }] }),
+      }),
+    });
+    assert.equal(res.body.renderedVia, undefined);
+  }
+  assert.equal(fallbackCalls.length, 0, 'Crawl4AI and Firecrawl must NEVER be called on robots.txt, 403, 429, challenges, or login walls!');
+  assert.equal(isEligibleForExternalSpaFallback({ mode: 'off', errorCode: 'fat_agent_required', status: 503 }), false);
 });

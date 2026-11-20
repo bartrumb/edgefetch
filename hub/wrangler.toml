@@ -56,10 +56,15 @@ new_sqlite_classes = ["AgentHubDO"]
 # # [triggers]
 # # crons = ["0 4 * * *"]
 #
-# # Optional open-web search & signed webhook secrets (`npx wrangler secret put ...`):
-# #   BRAVE_API_KEY   — Brave Search API subscription token for POST /v1/search
-# #   SEARXNG_URL     — Optional self-hosted SearXNG JSON endpoint (e.g. https://searx.example.org)
-# #   WEBHOOK_SECRET  — Default HMAC-SHA256 signing secret for async /v1/crawl webhooks
+# # Optional open-web search, ethical heavy-SPA fallback & signed webhook secrets (`npx wrangler secret put ...`):
+# #   BRAVE_API_KEY       — Brave Search API subscription token for POST /v1/search
+# #   SEARXNG_URL         — Optional self-hosted SearXNG JSON endpoint (e.g. https://searx.example.org)
+# #   CRAWL4AI_API_URL    — Optional self-hosted/cloud Crawl4AI endpoint (e.g. https://crawl4ai.example.org) for heavy SPA fallback
+# #   CRAWL4AI_API_TOKEN  — Optional Bearer token for authenticated Crawl4AI instances
+# #   FIRECRAWL_API_URL   — Optional self-hosted Firecrawl URL (defaults to https://api.firecrawl.dev when FIRECRAWL_API_KEY is set)
+# #   FIRECRAWL_API_KEY   — Optional Firecrawl API key for heavy SPA fallback (never used on robots.txt, 403/429, or challenges)
+# #   SPA_FALLBACK_ORDER  — Optional provider priority (default: "crawl4ai,firecrawl")
+# #   WEBHOOK_SECRET      — Default HMAC-SHA256 signing secret for async /v1/crawl webhooks
 
 # Owner production environment with full three-layer storage (R2 + META D1 + SEARCH D1 FTS5 + IngestWorkflow).
 # Top-level config remains storage-optional so public 1-Click Deploy users succeed without foreign D1 database IDs.

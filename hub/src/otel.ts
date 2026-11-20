@@ -154,7 +154,7 @@ export function buildOtlpTracePayload(params: {
   spans: OtlpSpanInput[];
 }): Record<string, unknown> {
   const serviceName = params.serviceName?.trim() || 'edgefetch-hub';
-  const serviceVersion = params.serviceVersion?.trim() || '2.4.0';
+  const serviceVersion = params.serviceVersion?.trim() || '2.4.1';
   return {
     resourceSpans: [
       {

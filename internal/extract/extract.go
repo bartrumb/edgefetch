@@ -882,8 +882,20 @@ func firstAttr(attrs map[string]string, keys ...string) string {
 	return ""
 }
 
+var reHrefAmpEntity = regexp.MustCompile(`(?i)&(?:amp|#0*38|#x0*26);`)
+
+// unescapeHrefAmpOnly safely replaces only `&amp;` / `&#38;` / `&#x26;` inside URLs.
+// Calling `html.UnescapeString` on raw hrefs corrupts semicolon-less query params like
+// `&currentTime=` (`&curren` -> `¤tTime=`), `&section=` (`&sect` -> `§ion=`), and `&region=` (`&reg` -> `®ion=`).
+func unescapeHrefAmpOnly(raw string) string {
+	if !strings.Contains(raw, "&") {
+		return strings.TrimSpace(raw)
+	}
+	return strings.TrimSpace(reHrefAmpEntity.ReplaceAllString(raw, "&"))
+}
+
 func resolveHref(raw string, base *url.URL) string {
-	raw = strings.TrimSpace(html.UnescapeString(raw))
+	raw = unescapeHrefAmpOnly(raw)
 	if raw == "" {
 		return ""
 	}

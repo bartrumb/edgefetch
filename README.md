@@ -52,7 +52,7 @@ edgefetch install-mcp && edgefetch doctor
 - **Polite by design — never bypasses `robots.txt` or CAPTCHAs:** `robots.txt` is enforced on every hop (including `30x` redirects), `Retry-After` is honored per host, anti-bot challenges (Cloudflare, Akamai, DataDome, PerimeterX, AWS WAF, Imperva) halt on the first attempt, and IETF RFC 9421 Web Bot Auth (`Ed25519` HTTP Message Signatures) is built in.
 - **One external Go dependency (`github.com/coder/websocket`, 0 transitive dependencies):** Enforced in CI on every PR alongside `-race`, native Go fuzzing (`Fuzz*`), `staticcheck`, and `govulncheck`.
 - **MIT licensed & lightweight:** No Redis, no PostgreSQL, no RabbitMQ. Idles at `$0` on Cloudflare Hibernating WebSocket Durable Objects or runs in one container with `node:sqlite` FTS5.
-- **Built-in job-board & developer extractors:** 12 MCP tools (`scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`) with native adapters for **Greenhouse**, **Ashby**, **Lever**, **Workday CXS**, **SmartRecruiters / Schema.org `JobPosting`**, **GitHub**, **Stack Overflow**, **npm**, **crates.io**, **Hugging Face**, **ArXiv**, **Jupyter `.ipynb`**, **OpenAPI 3.x**, and **256 MiB streaming PDFs**.
+- **49+ keyless site, open-data & ATS adapters (contributor-ready plugin library):** 12 MCP tools (`scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`) plus `GET /v1/extractors` across **Workable**, **Greenhouse (US/EU)**, **Ashby**, **Lever (US/EU)**, **Workday CXS**, **Rippling**, **Gem**, **Pinpoint**, **Teamtailor**, **BambooHR**, **Oracle HCM**, **SmartRecruiters**, **SEC EDGAR**, **Y Combinator**, **Socrata / CKAN / ArcGIS / Legistar Open Data**, **DOI/Crossref**, **OpenAlex**, **arXiv**, **ClinicalTrials.gov**, **PubMed**, **NIST NVD**, **Shopify**, **GitHub**, **Stack Overflow**, **npm**, **crates.io**, **Hugging Face**, **OpenRouter**, and **256 MiB streaming PDFs** — plus automatic **company-domain → ATS board discovery** (`domains` on `jobs`). Add a new adapter in one file via `npm run adapter:new` (**[docs/ADAPTERS.md](docs/ADAPTERS.md)**).
 
 > **Project status:** Young personal open-source project (started November 2026), running daily as the sole web/search layer on the author's 3-node fleet (Home Assistant OS `x86_64`, Windows VM, and `arm64`). MIT licensed; issues and PRs are **triaged weekly**. See **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)** for honest trade-offs.
 
@@ -62,7 +62,7 @@ edgefetch install-mcp && edgefetch doctor
 
 Full architectural & trade-off breakdown: **[docs/COMPARISON.md](docs/COMPARISON.md)** · Common questions: **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)**
 
-| Dimension | **EdgeFetch (`v2.4`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
+| Dimension | **EdgeFetch (`v2.5`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
 |---|---|---|---|---|---|
 | **License** | **MIT** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 |
 | **Minimum Self-Hosted Stack** | **1 `~8 MB` Go binary** *or* **1 container** (`node:sqlite` + `/data`, **0 Redis, 0 Postgres**) | Docker Compose + **Redis + PostgreSQL + RabbitMQ + Playwright** (`2–4 GB+` RAM) | Cloud API key | Python 3.10+ + Playwright (`600 MB–1.5 GB` RAM) | Node.js + Puppeteer |

@@ -1,11 +1,12 @@
 {
   "name": "edgefetch-hub",
-  "version": "2.4.1",
+  "version": "2.5.0",
   "private": true,
   "description": "Cloudflare Hibernating WebSocket Durable Object coordinator, /admin Control Center, and Self-Hosted OAuth 2.1 /mcp server for EdgeFetch.",
   "scripts": {
     "type-check": "tsc --noEmit -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
+    "adapter:new": "node scripts/new-adapter.mjs",
     "build:portable": "node scripts/build-portable.mjs",
     "start:portable": "node scripts/build-portable.mjs && node dist/portable-server.mjs",
     "deploy:dry": "wrangler deploy --dry-run -c wrangler.toml --env=\"\" && wrangler deploy --dry-run -c wrangler.toml -e production",

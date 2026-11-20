@@ -1,0 +1,56 @@
+import { defineAdapter } from '../../types';
+import { extractAllMetaContents, extractMetaContent, stripScriptsAndStyles, stripTagsInline } from '../../utils';
+
+export default defineAdapter({
+  id: 'arxiv',
+  name: 'arXiv Preprints',
+  category: 'research-health',
+  description: 'Extracts arXiv preprint title, authors, submission date, subject classifications, PDF/HTML links, and clean abstract from arxiv.org/abs/<id> (strictly respecting robots.txt).',
+  domains: ['arxiv.org', 'www.arxiv.org'],
+  exampleUrls: ['https://arxiv.org/abs/1706.03762'],
+  extractHtml({ path, rawHtml }) {
+    const m = /^\/abs\/([A-Za-z0-9._/-]+)$/i.exec(path);
+    if (!m?.[1]) return null;
+    const arxivId = m[1];
+
+    const clean = stripScriptsAndStyles(rawHtml);
+    const title =
+      extractMetaContent(rawHtml, 'citation_title') ||
+      stripTagsInline(/<h1\b[^>]*\btitle\b[^>]*>([\s\S]*?)<\/h1>/i.exec(clean)?.[1] ?? '').replace(/^Title:\s*/i, '');
+    if (!title) return null;
+
+    const metaAuthors = extractAllMetaContents(rawHtml, 'citation_author');
+    const domAuthors = [...clean.matchAll(/<div\b[^>]*\bauthors\b[^>]*>([\s\S]*?)<\/div>/gi)]
+      .flatMap((am) => [...am[1]!.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi)].map((x) => stripTagsInline(x[1]!)))
+      .filter(Boolean);
+    const authors = (metaAuthors.length > 0 ? metaAuthors : domAuthors).slice(0, 20);
+
+    const date = extractMetaContent(rawHtml, 'citation_date') || extractMetaContent(rawHtml, 'citation_online_date');
+    const doi = extractMetaContent(rawHtml, 'citation_doi');
+    const primarySubject = stripTagsInline(/<span\b[^>]*\bprimary-subject\b[^>]*>([\s\S]*?)<\/span>/i.exec(clean)?.[1] ?? '');
+
+    const absBlock = /<blockquote\b[^>]*\babstract\b[^>]*>([\s\S]*?)<\/blockquote>/i.exec(clean)?.[1] ?? '';
+    const abstract = stripTagsInline(absBlock).replace(/^Abstract:\s*/i, '').trim() || extractMetaContent(rawHtml, 'citation_abstract');
+    if (!abstract) return null;
+
+    const pdfUrl = `https://arxiv.org/pdf/${arxivId}`;
+    const htmlPaperUrl = `https://arxiv.org/html/${arxivId}`;
+
+    const bullets: string[] = [`- **arXiv ID**: \`${arxivId}\``];
+    if (authors.length > 0) bullets.push(`- **Authors**: ${authors.join(', ')}`);
+    if (date) bullets.push(`- **Submitted**: ${date}`);
+    if (primarySubject) bullets.push(`- **Primary Subject**: ${primarySubject}`);
+    if (doi) bullets.push(`- **DOI**: \`${doi}\``);
+    bullets.push(`- **Full Text**: [PDF](${pdfUrl}) · [ar5iv / HTML](${htmlPaperUrl})`);
+
+    return {
+      extractorId: 'arxiv',
+      title,
+      description: abstract.slice(0, 260),
+      ...(authors.length > 0 ? { author: authors.slice(0, 4).join(', ') } : {}),
+      ...(date ? { publishedTime: date } : {}),
+      markdown: [`# ${title}`, bullets.join('\n'), `## Abstract\n\n${abstract}`].join('\n\n'),
+      links: [pdfUrl, htmlPaperUrl],
+    };
+  },
+});

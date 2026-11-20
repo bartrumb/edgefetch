@@ -215,6 +215,16 @@ export class EdgeFetchClient {
     return this.requestJson('GET', `/v1/hosts?limit=${Math.max(1, Math.min(500, Math.floor(limit)))}`);
   }
 
+  extractors(category?: string): Promise<{
+    ok: boolean;
+    total: number;
+    categories: Record<string, number>;
+    extractors: Array<Record<string, unknown>>;
+  }> {
+    const qs = category ? `?category=${encodeURIComponent(category)}` : '';
+    return this.requestJson('GET', `/v1/extractors${qs}`);
+  }
+
   scrape(params: ScrapeParams): Promise<Record<string, unknown>> {
     return this.requestJson('POST', '/v1/scrape', params);
   }
@@ -246,6 +256,7 @@ export class EdgeFetchClient {
   jobs(params: {
     query?: string;
     company?: string;
+    domains?: string[];
     remote?: boolean;
     locations?: string[];
     minBase?: number;

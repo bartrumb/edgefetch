@@ -317,16 +317,46 @@ export function classifyWafAndChallenge(params: {
 export function classifyContentState(params: {
   status?: number;
   url?: string;
+  finalUrl?: string;
   title?: string;
   markdown: string;
   rawHtml?: string;
   validThrough?: string;
   nowMs?: number;
 }): ContentStateResult {
-  const { status = 200, title = '', markdown, rawHtml = '', validThrough, nowMs = Date.now() } = params;
+  const { status = 200, url, finalUrl, title = '', markdown, rawHtml = '', validThrough, nowMs = Date.now() } = params;
 
-  // Strip fenced code blocks before checking prose phrases so docs about HTTP 404 or login flows never false-positive!
-  const proseOnly = markdown.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, ' ').trim();
+  // 0. Deterministic ATS silent-redirect dead-link trap (e.g. closed Greenhouse postings 200-redirect to `?error=true` or board root!)
+  const checkUrlStr = finalUrl || url || '';
+  if (checkUrlStr) {
+    try {
+      const finU = new URL(checkUrlStr);
+      const finHost = finU.hostname.toLowerCase();
+      const isGhHost =
+        finHost === 'boards.greenhouse.io' ||
+        finHost === 'job-boards.greenhouse.io' ||
+        finHost === 'eu-boards.greenhouse.io' ||
+        finHost === 'job-boards.eu.greenhouse.io';
+      if (isGhHost && finU.searchParams.get('error') === 'true') {
+        return { state: 'closed_posting', reason: 'Greenhouse redirected closed posting to ?error=true.' };
+      }
+      if (isGhHost && url && /\/jobs\/\d+/i.test(url) && !/\/jobs\/\d+/i.test(finU.pathname)) {
+        return { state: 'closed_posting', reason: 'Greenhouse job posting redirected back to board root (role closed).' };
+      }
+    } catch {
+      // ignore invalid URL
+    }
+  }
+
+  // Strip fenced code blocks AND any leaked `<script>` / `<style>` / `<noscript>` / `<template>` blocks before matching
+  // closed-posting or soft-404 phrases (prevents Dayforce i18n "Page not found!" & Rippling script "no longer available" false positives!).
+  const proseOnly = markdown
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, ' ')
+    .replace(/<(script|style|noscript|template)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/\1>/gi, ' ')
+    .trim();
+  const cleanVisibleHtml = rawHtml
+    ? rawHtml.replace(/<(script|style|noscript|template|svg)\b(?:"[^"]*"|'[^']*'|[^>"'])*>[\s\S]*?<\/\1>/gi, ' ')
+    : '';
   const words = (proseOnly.match(/[\p{L}\p{N}_'-]+/gu) ?? []).length;
   const topSlice = `${title}\n${proseOnly.slice(0, 900)}`;
 
@@ -363,9 +393,9 @@ export function classifyContentState(params: {
     }
   }
 
-  // 3. Login-wall check (thin body < 110 words gated by sign-in prompt or password form)
+  // 3. Login-wall check (thin body < 110 words gated by sign-in prompt or password form outside scripts/templates)
   if (words < 110) {
-    const hasPasswordInput = /<input\b[^>]*\btype\s*=\s*["']password["']/i.test(rawHtml);
+    const hasPasswordInput = /<input\b[^>]*\btype\s*=\s*["']password["']/i.test(cleanVisibleHtml);
     const hasLoginGateHeading =
       /^(?:sign\s+in|log\s*in|authentication\s+required|members\s+only)(?:\s+to\s+\S+|\s*[-|–]\s*.*)?$/i.test(title.trim());
     const hasLoginGateCopy =

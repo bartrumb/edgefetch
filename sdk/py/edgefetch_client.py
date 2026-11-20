@@ -108,6 +108,10 @@ class EdgeFetchClient:
         safe_limit = max(1, min(500, int(limit)))
         return self._request_json("GET", f"/v1/hosts?limit={safe_limit}")
 
+    def extractors(self, category: Optional[str] = None) -> Dict[str, Any]:
+        qs = f"?category={urllib.parse.quote(category, safe='')}" if category else ""
+        return self._request_json("GET", f"/v1/extractors{qs}")
+
     def scrape(self, url: str, **options: Any) -> Dict[str, Any]:
         return self._request_json("POST", "/v1/scrape", {"url": url, **options})
 

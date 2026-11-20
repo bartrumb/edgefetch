@@ -816,7 +816,7 @@ function buildToolDefinitions(deps: McpServerDeps) {
     {
       name: 'jobs',
       description:
-        'One-call structured job search across official ATS boards (Greenhouse, Ashby, Lever, Workday CXS, SmartRecruiters, and optional Built In): standardizes pay ({ min, max, currency, period, basis: "base"|"ote"|"total" }), workplaceType, and locations, deduplicates by (company, title), and filters by remote, locations, minBase, postedWithinDays, and exclude.',
+        'One-call structured job search across official ATS boards (Greenhouse US/EU, Ashby, Lever US/EU, Workday CXS, Workable, Gem, Rippling, SmartRecruiters, company-domain -> ATS auto-discovery, and optional Built In): standardizes pay ({ min, max, currency, period, basis: "base"|"ote"|"total" }), workplaceType, and locations, deduplicates by (company, title), and filters by remote, locations, minBase, postedWithinDays, and exclude.',
       annotations: {
         title: 'Search & Extract Structured Job Postings',
         readOnlyHint: true,
@@ -829,6 +829,13 @@ function buildToolDefinitions(deps: McpServerDeps) {
         properties: {
           query: { type: 'string', description: 'Role or keyword query (e.g. "Forward Deployed Engineer", "Solutions Architect").' },
           company: { type: 'string', description: 'Optional company name or ATS org filter.' },
+          domains: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 10,
+            description:
+              'Optional company domains (e.g. ["cloudflare.com", "stripe.com"]) to probe /careers and /jobs for automatic ATS board discovery across 16+ ATS platforms.',
+          },
           remote: { type: 'boolean', description: 'When true, keep only remote-eligible roles.' },
           locations: {
             type: 'array',

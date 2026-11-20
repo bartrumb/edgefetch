@@ -1,0 +1,13 @@
+{
+  "adapterId": "workable-board",
+  "mode": "twin",
+  "inputUrl": "https://apply.workable.com/identiv/",
+  "expectedFetchUrl": "https://apply.workable.com/api/v1/widget/accounts/identiv?details=true",
+  "mockPayload": "{\"name\":\"Identiv\",\"jobs\":[{\"shortcode\":\"ABC1234\",\"title\":\"Staff Firmware Engineer\",\"city\":\"Fremont\",\"state\":\"CA\",\"country\":\"United States\",\"telecommuting\":true,\"department\":\"Engineering\",\"published_on\":\"2026-11-18\"},{\"shortcode\":\"ABC1234\",\"title\":\"Staff Firmware Engineer\",\"city\":\"Austin\",\"state\":\"TX\",\"country\":\"United States\",\"telecommuting\":true,\"department\":\"Engineering\",\"published_on\":\"2026-11-18\"}]}",
+  "expectTitleIncludes": "Identiv — Open Roles (1)",
+  "expectMarkdownIncludes": [
+    "Staff Firmware Engineer",
+    "Fremont, CA, United States; Austin, TX, United States",
+    "Remote"
+  ]
+}

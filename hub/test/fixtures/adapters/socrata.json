@@ -1,0 +1,13 @@
+{
+  "adapterId": "socrata",
+  "mode": "twin",
+  "inputUrl": "https://data.cityofnewyork.us/Housing-Development/DOB-Job-Application-Filings/ic3t-wcy2",
+  "expectedFetchUrl": "https://data.cityofnewyork.us/api/views/ic3t-wcy2.json",
+  "mockPayload": "{\"id\":\"ic3t-wcy2\",\"name\":\"DOB Job Application Filings\",\"description\":\"All job applications submitted through the Borough Offices.\",\"attribution\":\"Department of Buildings (DOB)\",\"rowsUpdatedAt\":1795000000,\"columns\":[{\"fieldName\":\"job__\",\"name\":\"Job #\",\"dataTypeName\":\"text\",\"description\":\"DOB job number\"},{\"fieldName\":\"borough\",\"name\":\"Borough\",\"dataTypeName\":\"text\",\"description\":\"NYC Borough\"}]}",
+  "expectTitleIncludes": "DOB Job Application Filings",
+  "expectMarkdownIncludes": [
+    "https://data.cityofnewyork.us/resource/ic3t-wcy2.json?$limit=50",
+    "Department of Buildings (DOB)",
+    "`job__`"
+  ]
+}

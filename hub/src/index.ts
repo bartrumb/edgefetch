@@ -99,6 +99,7 @@ import {
   type ExtractRequestPayload,
 } from './search-index';
 import { executeSearchCall, type SearchRequestPayload } from './web-search';
+import { listRegisteredAdapters } from './extractors/registry';
 import {
   buildCapabilities,
   handleAgentArtifactUpload,
@@ -1254,10 +1255,35 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.4.1'), {
+        return Response.json(buildCapabilities(env, '2.5.0'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/v1/extractors') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        const category = url.searchParams.get('category') ?? undefined;
+        const extractors = listRegisteredAdapters(category);
+        const categories: Record<string, number> = {};
+        for (const ex of extractors) {
+          categories[ex.category] = (categories[ex.category] ?? 0) + 1;
+        }
+        return Response.json(
+          { ok: true, total: extractors.length, categories, extractors },
+          { status: 200, headers: { 'cache-control': 'no-store' } },
+        );
       }
 
       if (request.method === 'GET' && url.pathname === '/v1/hosts') {

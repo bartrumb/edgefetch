@@ -1,0 +1,13 @@
+{
+  "adapterId": "arxiv",
+  "mode": "html",
+  "inputUrl": "https://arxiv.org/abs/1706.03762",
+  "mockPayload": "<!doctype html><html><head><meta name=\"citation_title\" content=\"Attention Is All You Need\"><meta name=\"citation_author\" content=\"Vaswani, Ashish\"><meta name=\"citation_author\" content=\"Shazeer, Noam\"><meta name=\"citation_date\" content=\"2017/06/12\"></head><body><span class=\"primary-subject\">Computation and Language (cs.CL)</span><blockquote class=\"abstract mathjax\"><span class=\"descriptor\">Abstract:</span>The dominant sequence transduction models are based on complex recurrent or convolutional neural networks.</blockquote></body></html>",
+  "expectTitleIncludes": "Attention Is All You Need",
+  "expectMarkdownIncludes": [
+    "`1706.03762`",
+    "Vaswani, Ashish, Shazeer, Noam",
+    "https://arxiv.org/pdf/1706.03762",
+    "dominant sequence transduction models"
+  ]
+}

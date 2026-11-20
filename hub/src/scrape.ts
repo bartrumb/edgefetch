@@ -48,7 +48,7 @@ import {
   type SpaFallbackSuccess,
 } from './spa-fallback';
 
-export const SCRAPE_PIPELINE_VERSION = 22;
+export const SCRAPE_PIPELINE_VERSION = 23;
 
 export interface ScrapedImage {
   url: string;
@@ -316,6 +316,12 @@ export function cleanPdfMarkdown(md: string): string {
     .trim();
 }
 
+const URL_ONLY_TAG_ATTRS = new Set(['href', 'src', 'srcset', 'data-src', 'data-srcset', 'action', 'poster']);
+
+function unescapeUrlAttrAmpOnly(raw: string): string {
+  return raw.includes('&') ? raw.replace(/&(?:amp|#0*38|#x0*26);/gi, '&') : raw;
+}
+
 function parseTagAttrs(tag: string): Record<string, string> {
   const attrs: Record<string, string> = {};
   const re = /([a-zA-Z0-9_:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
@@ -323,7 +329,8 @@ function parseTagAttrs(tag: string): Record<string, string> {
   while ((m = re.exec(tag)) !== null) {
     const key = m[1]!.toLowerCase();
     if (!(key in attrs)) {
-      attrs[key] = decodeHtmlEntities(m[2] ?? m[3] ?? m[4] ?? '');
+      const val = m[2] ?? m[3] ?? m[4] ?? '';
+      attrs[key] = URL_ONLY_TAG_ATTRS.has(key) ? unescapeUrlAttrAmpOnly(val) : decodeHtmlEntities(val);
     }
   }
   return attrs;
@@ -6774,6 +6781,8 @@ export async function executeScrapeCall(params: {
   // R4: Classify `contentState` ("active" | "closed_posting" | "soft_404" | "login_wall") with anti-false-positive vetoes!
   const contentStateCheck: { state: ContentState; reason?: string } = classifyContentState({
     status: typeof item.status === 'number' ? item.status : 200,
+    url: normalizedUrl,
+    finalUrl,
     title: resolvedTitle,
     markdown: rawCleanMarkdown,
     ...(isHtmlBody ? { rawHtml: rawBodyStr } : {}),

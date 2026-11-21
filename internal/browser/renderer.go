@@ -569,13 +569,13 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 
 	r.mu.Lock()
 	r.activeRuns++
-	if len(task.Headers) > 0 {
-		r.taintedByHeaders = true
-	}
 	r.lastUsedAt = time.Now()
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
+		if len(task.Headers) > 0 {
+			r.taintedByHeaders = true
+		}
 		if r.activeRuns > 0 {
 			r.activeRuns--
 		}
@@ -589,6 +589,11 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 	cdp, err := r.ensureBrowser(ctx)
 	if err != nil {
 		return Output{}, err
+	}
+	if len(task.Headers) > 0 {
+		r.mu.Lock()
+		r.taintedByHeaders = true
+		r.mu.Unlock()
 	}
 	r.reapExpiredSessions(ctx, cdp)
 

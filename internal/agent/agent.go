@@ -46,6 +46,7 @@ type RuntimeOpts struct {
 	ShutdownDrain         time.Duration
 	UploadTimeout         time.Duration
 	ShutdownUploadTimeout time.Duration
+	WarmUpOnStart         bool
 	OnConnected           func()
 }
 
@@ -107,7 +108,10 @@ func RunAll(
 	log *slog.Logger,
 	rtOpts RuntimeOpts,
 ) error {
-	warmUpCrawlerBounded(ctx, crawler)
+	if rtOpts.WarmUpOnStart {
+		warmUpCrawlerBounded(ctx, crawler)
+		rtOpts.WarmUpOnStart = false
+	}
 	hubs := cfg.HubURLs
 	if len(hubs) == 0 && strings.TrimSpace(cfg.HubURL) != "" {
 		hubs = []string{cfg.HubURL}
@@ -156,7 +160,9 @@ func Run(
 	rtOpts RuntimeOpts,
 ) error {
 	rtOpts = rtOpts.withDefaults()
-	warmUpCrawlerBounded(ctx, crawler)
+	if rtOpts.WarmUpOnStart {
+		warmUpCrawlerBounded(ctx, crawler)
+	}
 	replyClient := &http.Client{
 		Transport: hubTransport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -289,8 +295,12 @@ func runSession(
 		}
 	}()
 	defer func() {
+		cancelSession()
+		_ = conn.CloseNow()
 		close(dispatchCh)
-		wg.Wait()
+		if ctx.Err() != nil {
+			wg.Wait()
+		}
 	}()
 
 	for {

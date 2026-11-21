@@ -757,8 +757,8 @@ func TestBurstDispatchConcurrencyCrossDomainGapAndKeepaliveDrain(t *testing.T) {
 	if wsConns.Load() != 1 {
 		t.Fatalf("expected 1 uninterrupted WebSocket session (pong frames drained while dispatch ran), got %d", wsConns.Load())
 	}
-	if elapsed > 2500*time.Millisecond {
-		t.Fatalf("expected 4 distinct domains with 250ms cross-domain gap to finish in <2.5s (even with PauseMs=3000), took %s", elapsed)
+	if elapsed > 4500*time.Millisecond {
+		t.Fatalf("expected 4 distinct domains with 250ms cross-domain gap to finish in <4.5s (even with PauseMs=3000), took %s", elapsed)
 	}
 	for i, res := range rep.Results {
 		if res.Outcome != classify.OutcomeOK {

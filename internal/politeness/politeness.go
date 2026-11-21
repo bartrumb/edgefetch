@@ -517,6 +517,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 	var cur group
 	var preGroupAiInput *bool
 	seenDirective := false
+	seenAnyUserAgent := false
 
 	normalizedBody := robotsLineReplacer.Replace(body)
 	for _, rawLine := range strings.Split(normalizedBody, "\n") {
@@ -541,14 +542,15 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 		val := trimRobotsWS(line[colon+1:])
 		switch field {
 		case "user-agent":
-			ua := canonicalProductToken(val)
-			if ua == "" {
-				continue
-			}
+			seenAnyUserAgent = true
 			if seenDirective && len(cur.agents) > 0 {
 				groups = append(groups, cur)
 				cur = group{}
 				seenDirective = false
+			}
+			ua := canonicalProductToken(val)
+			if ua == "" {
+				continue
 			}
 			cur.agents = append(cur.agents, ua)
 		case "allow":
@@ -589,7 +591,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 					v := disallow
 					cur.aiInputDisallow = &v
 				}
-			} else if len(groups) == 0 {
+			} else if !seenAnyUserAgent {
 				if disallow, found := parseContentSignalAIInput(val); found {
 					v := disallow
 					preGroupAiInput = &v
@@ -670,10 +672,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 }
 
 func parseContentSignalAIInput(val string) (disallow, found bool) {
-	for _, item := range strings.Split(val, ",") {
-		if semi := strings.IndexByte(item, ';'); semi >= 0 {
-			item = item[:semi]
-		}
+	for _, item := range strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == ';' }) {
 		k, v, ok := strings.Cut(item, "=")
 		if !ok {
 			continue
@@ -682,7 +681,7 @@ func parseContentSignalAIInput(val string) (disallow, found bool) {
 			continue
 		}
 		cleanV := trimRobotsWS(v)
-		if len(cleanV) >= 2 && cleanV[0] == '"' && cleanV[len(cleanV)-1] == '"' {
+		if len(cleanV) >= 2 && ((cleanV[0] == '"' && cleanV[len(cleanV)-1] == '"') || (cleanV[0] == '\'' && cleanV[len(cleanV)-1] == '\'')) {
 			cleanV = trimRobotsWS(cleanV[1 : len(cleanV)-1])
 		}
 		switch strings.ToLower(cleanV) {

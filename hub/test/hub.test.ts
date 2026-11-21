@@ -3067,7 +3067,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.6.0');
+    assert.equal(caps.version, '2.6.1');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);

@@ -122,6 +122,7 @@ function createDenoSafeFetch(selfHost?: string): typeof fetch {
       await assertDenoResolvedPublicIp(check.url.hostname);
 
       const hopHeaders = new Headers(baseHeaders);
+      hopHeaders.delete('host');
       if (check.url.origin !== initialOrigin) {
         hopHeaders.delete('authorization');
         hopHeaders.delete('cookie');
@@ -134,8 +135,9 @@ function createDenoSafeFetch(selfHost?: string): typeof fetch {
         ...init,
         method,
         headers: hopHeaders,
-        body: method === 'GET' || method === 'HEAD' ? undefined : body,
+        body: method === 'GET' || method === 'HEAD' || method === 'OPTIONS' ? undefined : body,
         redirect: 'manual',
+        signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
       });
 
       if (res.status >= 300 && res.status < 400) {
@@ -207,6 +209,58 @@ function resolveDenoTrustedClientIp(
   return sockCandidate && net.isIP(sockCandidate) !== 0 ? sockCandidate : '127.0.0.1';
 }
 
+const STRICT_SINGLE_HOST_RE =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([1-9]\d{0,4}))?$/;
+
+export function parseStrictSingleHost(raw: string | undefined | null): string | null {
+  if (typeof raw !== 'string') return null;
+  if (raw.includes(',') || raw.includes('..') || raw.includes('[') || raw.includes(']')) return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 255 || /\s/.test(trimmed)) return null;
+  const lower = trimmed.toLowerCase();
+  const m = STRICT_SINGLE_HOST_RE.exec(lower);
+  if (!m) return null;
+  if (m[1] !== undefined) {
+    const portNum = Number(m[1]);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return null;
+  }
+  return lower;
+}
+
+export function resolvePublicOrigin(params: {
+  canonicalOrigin: string;
+  trustProxy: boolean;
+  hasExplicitPublicOrigin: boolean;
+  hostHeader?: string | null;
+  forwardedHostHeader?: string | null;
+  forwardedProtoHeader?: string | null;
+}): { origin: string; trustedForwardedHost: string | null } {
+  const baseOriginUrl = new URL(params.canonicalOrigin);
+  if (params.hasExplicitPublicOrigin || !params.trustProxy) {
+    return { origin: baseOriginUrl.origin, trustedForwardedHost: null };
+  }
+
+  let proto = baseOriginUrl.protocol.replace(/:$/, '');
+  const protoTokens = (params.forwardedProtoHeader ?? '')
+    .split(',')
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+  const rightmostProto = protoTokens.length > 0 ? protoTokens[protoTokens.length - 1] : undefined;
+  if (rightmostProto === 'https' || rightmostProto === 'http') {
+    proto = rightmostProto;
+  }
+
+  const validHost = parseStrictSingleHost(params.hostHeader);
+  const validFwdHost = parseStrictSingleHost(params.forwardedHostHeader);
+  const authority = validHost ?? baseOriginUrl.host;
+  const trustedForwardedHost = validFwdHost !== null && validHost !== null && validFwdHost === validHost ? validFwdHost : null;
+
+  return {
+    origin: new URL(`${proto}://${authority}`).origin,
+    trustedForwardedHost,
+  };
+}
+
 function sanitizeDenoInboundRequest(
   req: Request,
   info: { remoteAddr?: { hostname?: string } } | undefined,
@@ -214,28 +268,20 @@ function sanitizeDenoInboundRequest(
   canonicalOrigin: string,
   hasExplicitPublicOrigin: boolean,
 ): Request {
-  const baseOriginUrl = new URL(canonicalOrigin);
-  let targetOrigin = baseOriginUrl.origin;
-
-  if (trustProxy && !hasExplicitPublicOrigin) {
-    let proto = baseOriginUrl.protocol.replace(/:$/, '');
-    let authority = baseOriginUrl.host;
-    const fwdProto = req.headers.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
-    if (fwdProto === 'https' || fwdProto === 'http') proto = fwdProto;
-    const fwdHost = req.headers.get('x-forwarded-host')?.split(',')[0]?.trim();
-    if (fwdHost && /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?::\d{1,5})?$/.test(fwdHost) && !fwdHost.includes('..')) {
-      try {
-        const parsedFwd = new URL(`http://${fwdHost}/`);
-        const pNum = parsedFwd.port ? Number(parsedFwd.port) : 80;
-        if (parsedFwd.hostname && pNum >= 1 && pNum <= 65535 && !fwdHost.endsWith(':0')) {
-          authority = parsedFwd.host;
-        }
-      } catch {
-        // ignore invalid X-Forwarded-Host
-      }
-    }
-    targetOrigin = `${proto}://${authority}`;
+  let fallbackReqHost: string | null = null;
+  try {
+    fallbackReqHost = new URL(req.url).host;
+  } catch {
+    fallbackReqHost = null;
   }
+  const { origin: targetOrigin, trustedForwardedHost } = resolvePublicOrigin({
+    canonicalOrigin,
+    trustProxy,
+    hasExplicitPublicOrigin,
+    hostHeader: req.headers.get('host') ?? fallbackReqHost,
+    forwardedHostHeader: req.headers.get('x-forwarded-host'),
+    forwardedProtoHeader: req.headers.get('x-forwarded-proto'),
+  });
 
   // Extract raw path + query from `req.url` without re-decoding malformed `%` sequences before `hubWorker` handles them
   const rawUrl = req.url;
@@ -251,13 +297,14 @@ function sanitizeDenoInboundRequest(
     // `R3-M9`: Strip client-supplied `cf-connecting-ip` / `x-real-ip`, and strip `x-forwarded-*` unless `EDGEFETCH_TRUST_PROXY=1`.
     if (lower === 'cf-connecting-ip' || lower === 'x-real-ip') return;
     if (!trustProxy && lower.startsWith('x-forwarded-')) return;
+    if (lower === 'x-forwarded-host' && trustedForwardedHost === null) return;
     headers.append(key, val);
   });
   headers.set('cf-connecting-ip', trustedIp);
   headers.set('x-real-ip', trustedIp);
 
   const method = req.method.toUpperCase();
-  const hasBody = method !== 'GET' && method !== 'HEAD' && req.body !== null;
+  const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && req.body !== null;
   return new Request(cleanUrl, {
     method,
     headers,

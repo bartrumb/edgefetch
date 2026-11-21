@@ -2,6 +2,40 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.6.1] - 2026-11-21
+
+### Security
+- **Eliminated residual superlinear scanner & regex paths (`R4-H1`, `R4-H2`, `R4-H3`):**
+  - Cached monotonic `nextNameBoundary` offsets inside `tryParseTagAt` (`hub/src/safe-input.ts`) so repeated `<x` pseudo-tags finish in linear $O(N)$ time (`< 5 ms` at 16K chars).
+  - Anchored HTML attribute scanning with a `64 KiB` tag cap (`parseTagAttributes`), eliminated V8 ConsString rope flattening in `sanitizeAndResolveMarkdownProseLinksLinear`, cached `>` offsets per line in `extractMarkdownLinksAndImages`, and fixed an unanchored `.myshopify.com` detector pattern (`hub/src/scrape.ts`, `hub/src/extractors/providers/commerce-social/shopify.ts`).
+  - Hardened `compileSafeUserRegex` (`hub/src/safe-input.ts`) so non-terminal optional/branch groups containing unbounded quantifiers (e.g. `a*(b)?aa*(b)?aa*$`) cannot reset ambiguity tracking unless followed by a disjoint mandatory barrier or true pattern end.
+- **Markdown sanitization & inline-code stash preservation (`R4-M6`, `R4-M7`):**
+  - Honored CommonMark backslash-escaped backticks (`\``) during inline code-span scanning so `` \`<img src=x onerror=...>` `` cannot smuggle raw HTML past tag stripping.
+  - Hardened `hasDangerousUriScheme` against entity-encoded schemes (`javascript&colon;...`, numeric entities, and undecoded `&...;` before `/`/`?`/`#`) and stripped dangerous URI schemes on multi-line `[label\nlabel2](...)` links (`hub/src/scrape.ts`).
+  - Preserved internal `\u0000EF...\u0000` inline-code stash sentinels across NUL-stripping passes (`hub/src/safe-input.ts`) so inline backtick spans survive `<svg>` removal (`SCRAPE_PIPELINE_VERSION = 28`).
+- **Go worker, Chromium header scope, Portable Hub & Vouch Gate hardening (`R4-M*`, `D-L1`..`D-L4`):**
+  - Scoped CDP `Fetch.requestPaused` caller headers to exact `(scheme, canonicalHost, effectivePort)`, restricted Linux `--no-sandbox` fallback strictly to Chromium sandbox-init diagnostics (`isSandboxStartupFailure`), bounded detached `/robots.txt` contexts + partial `1 MiB` trailing lines, and drained `runSession` worker goroutines unconditionally (`internal/browser`, `internal/crawl`, `internal/agent`, `internal/politeness`).
+  - Hardened Portable Node/Deno Hub against `Host` header overrides in `safe-fetch.ts`, `1xx` response loops, unbounded origin streams (`32 MiB`), slowloris `POST` drips (`requestTimeout = 30s`), unmasked RFC 6455 client WebSocket frames (`1002`), and unvalidated `X-Forwarded-Host` issuer spoofing (`hub/portable/*`).
+  - Fixed `.github/workflows/vouch.yml` to read `.github/VOUCHED.td` from `${BASE_SHA}` (preventing self-vouching in PR branches) and check DCO `Signed-off-by:` trailers across every non-merge commit in a multi-commit PR.
+  - Removed destructive global `deduplicateClonedProseParagraphs` (`D-M1`, keeping scoped DOM carousel-clone class stripping), capped `salvageAshbyBoardFromTruncatedJson` at `5,000` jobs + verify concurrency `2` (`D-L1`), required `status === 200` on truncated ATS formatters (`D-L2`), restored `1h` OAuth access TTL alongside `90d` refresh TTL (`D-L3`), aligned MCP `capabilities.tools` (`D-L4`), and escaped `/admin` inline `<script>` backslashes/newlines.
+
+### Fixed
+- **ATS `jobs` search precision, Workday domain discovery & `similarOpenRoles` ranking (`hub/src/jobs.ts`, `hub/src/mcp.ts`):**
+  - Replaced any-token `query` matching with phrase-first (`matchedOn: "phrase"`) and all-tokens (`matchedOn: "all_tokens"`) relevance filtering, ranking exact phrase matches first.
+  - Added `minBaseMode: "floor" | "ceiling"` (default `"floor"`, checking `pay.min >= minBase`) and `strictPay` (default `false`, surfacing unlisted-pay roles with `payUnknown: true` and `payUnknownCount`).
+  - Separated geographic `locations` filters from `"Remote"` workplace eligibility so `locations: ["United States", "Remote"]` enforces US geography instead of matching worldwide remote postings.
+  - Added Workday CXS tenant/site probes (`wd5`/`wd1`) and search-assisted ATS discovery to `domains`, reported explicit `boardStatus: "not_found"` + `tried` when a domain has no ATS board, prevented cross-company bleed when `domains` or `company` is set, made `includePublicFeeds` strictly opt-in (`default: false`) with `sourcesUsed` telemetry, and restricted `verify` `similarOpenRoles` to distinctive title-token matches.
+
+## [2.6.0] - 2026-11-20
+
+### Added
+- **Full-store `catalog` sync (`POST /v1/catalog` & MCP `catalog` tool):** Polite (`>= 2s` + jitter) whole-catalog pagination for Shopify (`/products.json` + custom-domain `.js` inventory enrichment) and WooCommerce Store API (`/wp-json/wc/store/v1/products`), NDJSON R2 snapshot streaming, `shrink` projection, `sinceArtifactId` diffing, and UCP `robots.txt` discovery (`SCRAPE_PIPELINE_VERSION = 26`..`27`).
+- **ATS `jobs` reliability, `verify` mode & 16 MiB board support:** Added batch job-liveness `mode: "verify"` (`live`, `closed` + `similarOpenRoles`, `board_gone`, `unknown`), domain-to-ATS auto-discovery, `iCIMS` (`?ss=1&in_iframe=1`) and Workday (`onsite` + `?offset=` paging) enhancements, `16 MiB` Ashby board support with linear truncated-JSON salvaging, and Go `KindText` `Accept` allowlist alignment.
+- **RFC 9309 full compliance, 3-strikes `429` backoff & 64 KiB linear framework detection:** Added 5-hop `/robots.txt` redirect handling, `Cache-Control: max-age` clamping (`[60s, 24h]`), `robots_unreachable` classification, `ROBOTS_BYPASS_HOSTS` operator override, 3-attempt adaptive `429` backoff, `detectSiteFrameworkLinear`, Inertia `data-page` SSR hydration unlock, fault-isolated `runAdapterSyncInBulkhead`, Chromium native OS sandbox probing, 4-way multi-domain agent concurrency, and `.github/VOUCHED.td` contributor gate.
+
+### Security
+- **Round 3 security re-audit fixes (`R3-H1`..`R3-H3`, `R3-M1`..`R3-M10`):** Replaced quadratic HTML/Markdown/provider regexes with linear scanners, prevented split-tag `<im<form></form>g>` reassembly, rejected stacked quantifiers in `compileSafeUserRegex`, pinned dial-time DNS resolutions in `safe-fetch.ts`, sanitized `origin-markdown` HTML/WAF/prompt-injection vectors, scoped CDP custom headers via `Fetch.requestPaused` + `taintedByHeaders` browser recycling, pinned `O_NOFOLLOW` descriptor `fchmod`/`fchown` in `internal/priv`, and tag-locked GitHub `release` environment secrets (`v*`).
+
 ## [2.5.5] - 2026-11-20
 
 ### Added

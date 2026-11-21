@@ -85,12 +85,13 @@ export function normalizeRobotsURI(raw: string): string {
 
 function canonicalProductToken(raw: string): string {
   const trimmed = raw.replace(/[\u200B-\u200F\u2060\uFEFF]/g, '').trim().toLowerCase();
+  if (!trimmed) return '';
   if (trimmed === '*') return '*';
   const slash = trimmed.indexOf('/');
   const head = slash >= 0 ? trimmed.slice(0, slash) : trimmed;
   const token = head.split(/\s+/)[0] ?? '';
   const cleanMatch = /^[a-z_-]+/.exec(token);
-  return cleanMatch ? cleanMatch[0] : token;
+  return cleanMatch ? cleanMatch[0] : '';
 }
 
 /** Iterative O(P*T) wildcard matcher (`*` and trailing `$`) with zero ReDoS surface. */
@@ -123,12 +124,20 @@ export function matchRobotsPattern(rawPattern: string, target: string): boolean 
   return true;
 }
 
+function trimAsciiSpaceTab(s: string): string {
+  let start = 0;
+  let end = s.length;
+  while (start < end && (s.charCodeAt(start) === 32 || s.charCodeAt(start) === 9)) start++;
+  while (end > start && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end--;
+  return start === 0 && end === s.length ? s : s.slice(start, end);
+}
+
 function applySingleContentSignalPair(rawKey: string, rawValue: string, target: ContentSignals): boolean {
-  const k = rawKey.trim().toLowerCase();
+  const k = trimAsciiSpaceTab(rawKey).toLowerCase();
   if (k !== 'search' && k !== 'ai-input' && k !== 'ai-train') return false;
-  let v = rawValue.trim();
-  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-    v = v.slice(1, -1).trim();
+  let v = trimAsciiSpaceTab(rawValue);
+  if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
+    v = trimAsciiSpaceTab(v.slice(1, -1));
   }
   v = v.toLowerCase();
   if (v !== 'yes' && v !== 'no') return false;
@@ -141,17 +150,10 @@ function applySingleContentSignalPair(rawKey: string, rawValue: string, target: 
 
 function parseContentSignalLine(rawVal: string, target: ContentSignals): void {
   const bounded = rawVal.length > 524_288 ? rawVal.slice(0, 524_288) : rawVal;
-  for (const commaPart of bounded.split(',')) {
-    const semiSegments = commaPart.split(';');
-    for (let i = 0; i < semiSegments.length; i++) {
-      const seg = semiSegments[i]!;
-      const eq = seg.indexOf('=');
-      if (eq <= 0) continue;
-      const k = seg.slice(0, eq);
-      const v = seg.slice(eq + 1);
-      // Segment 0 is the primary directive; subsequent `;foo=bar` parameters are stripped unless they are themselves known Content-Signal keys.
-      applySingleContentSignalPair(k, v, target);
-    }
+  for (const seg of bounded.split(/[,;]/)) {
+    const eq = seg.indexOf('=');
+    if (eq <= 0) continue;
+    applySingleContentSignalPair(seg.slice(0, eq), seg.slice(eq + 1), target);
   }
 }
 
@@ -206,22 +208,25 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
       // RFC 9309 §2.2.1: blank lines inside a group do NOT close the current User-agent group.
       continue;
     }
-    const colon = line.indexOf(':');
+    const colon = noComment.indexOf(':');
     if (colon <= 0) continue;
-    const rawField = line.slice(0, colon);
+    const rawField = noComment.slice(0, colon);
     if (rawField.includes('\0')) continue;
     const field = rawField.trim().toLowerCase();
-    const val = line.slice(colon + 1).trim();
+    const rawValAfterColon = noComment.slice(colon + 1);
+    const val = rawValAfterColon.trim();
     if (field === 'user-agent') {
+      const parsedUa = canonicalProductToken(val);
+      if (!val || !parsedUa) {
+        // Ignore empty `User-agent:` lines consistently with Go without closing the active group.
+        continue;
+      }
       if (seenDirective && cur.agents.length > 0) {
         groups.push(cur);
         cur = { agents: [], rules: [], crawlDelayMs: 0, signals: {} };
         seenDirective = false;
       }
-      const parsedUa = canonicalProductToken(val);
-      if (parsedUa) {
-        cur.agents.push(parsedUa);
-      }
+      cur.agents.push(parsedUa);
     } else if (field === 'allow' && cur.agents.length > 0 && val) {
       seenDirective = true;
       const norm = normalizeRobotsURI(val);
@@ -244,12 +249,15 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
       if (Number.isFinite(secs) && secs > 0) {
         cur.crawlDelayMs = Math.min(30_000, Math.round(secs * 1000));
       }
-    } else if (field === 'content-signal' && val) {
-      if (cur.agents.length === 0) {
-        parseContentSignalLine(val, preGroupSignals);
-      } else {
-        seenDirective = true;
-        parseContentSignalLine(val, cur.signals);
+    } else if (field === 'content-signal') {
+      const csVal = trimAsciiSpaceTab(rawValAfterColon);
+      if (csVal) {
+        if (cur.agents.length === 0) {
+          parseContentSignalLine(csVal, preGroupSignals);
+        } else {
+          seenDirective = true;
+          parseContentSignalLine(csVal, cur.signals);
+        }
       }
     }
   }
@@ -812,6 +820,7 @@ export async function cloudflareOverflowFetch(
       headers?: Record<string, unknown>;
       ifNoneMatch?: string;
       ifModifiedSince?: string;
+      maxBytes?: number;
     }>;
     options?: { includeBody?: boolean; maxBytes?: number; pauseMs?: number; timeoutMs?: number; respectRobots?: boolean; robots?: boolean };
   };
@@ -831,7 +840,11 @@ export async function cloudflareOverflowFetch(
   const perReqCapMs = Math.min(PER_REQ_TIMEOUT_MS, Math.max(500, call.options?.timeoutMs ?? PER_REQ_TIMEOUT_MS));
 
   const reqs = Array.isArray(call.requests) ? call.requests : [];
-  const maxBytes = Math.min(16 << 20, Math.max(1024, call.options?.maxBytes ?? 8 << 20));
+  const rawOptMaxBytes = call.options?.maxBytes;
+  const maxBytes =
+    typeof rawOptMaxBytes === 'number' && Number.isFinite(rawOptMaxBytes) && rawOptMaxBytes > 0
+      ? Math.min(16 << 20, Math.max(1024, Math.floor(rawOptMaxBytes)))
+      : 8 << 20;
   const includeBody = Boolean(call.options?.includeBody);
   const pauseMs = Math.min(30_000, Math.max(0, Math.floor(call.options?.pauseMs ?? 2000)));
   const callerWantsRobots = call.options?.respectRobots ?? call.options?.robots ?? true;
@@ -1061,7 +1074,11 @@ export async function cloudflareOverflowFetch(
         }
 
         const remainingBatchBytes = Math.max(0, MAX_OVERFLOW_BATCH_BYTES - aggregateBatchBytes);
-        const perItemMaxBytes = Math.min(maxBytes, remainingBatchBytes);
+        const reqMaxBytes =
+          typeof r.maxBytes === 'number' && Number.isFinite(r.maxBytes) && r.maxBytes > 0
+            ? Math.min(16 << 20, Math.max(1024, Math.floor(r.maxBytes)))
+            : maxBytes;
+        const perItemMaxBytes = Math.min(reqMaxBytes, remainingBatchBytes);
         const { bytes, truncated } = await readBoundedBytes(resp.body, perItemMaxBytes, activeSignal);
         aggregateBatchBytes += bytes.byteLength;
 

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,7 +113,7 @@ type retainedSession struct {
 	browserContextID string
 	targetID         string
 	cdpSessionID     string
-	initialHost      string
+	initialOrigin    string
 	lastCheckedURL   string
 	hasExtraHeaders  bool
 	extraHeaders     map[string]string
@@ -122,6 +123,36 @@ type retainedSession struct {
 	lastUsed         time.Time
 	lastStatus       int
 	lastHeaders      http.Header
+}
+
+func canonicalURLOrigin(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme != "https" && scheme != "http" {
+		return ""
+	}
+	host := politeness.CanonicalHost(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	port := strings.TrimSpace(u.Port())
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	} else {
+		pNum, pErr := strconv.Atoi(port)
+		if pErr != nil || pNum < 1 || pNum > 65535 {
+			return ""
+		}
+		port = strconv.Itoa(pNum)
+	}
+	return scheme + "://" + host + ":" + port
 }
 
 func (s *retainedSession) stopFetch() {
@@ -249,22 +280,19 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 
 	s.mu.Lock()
 	cdpSID := s.cdpSessionID
-	initHost := s.initialHost
+	initOrigin := s.initialOrigin
 	extra := s.extraHeaders
 	s.mu.Unlock()
 
-	sameOriginHost := false
-	if initHost != "" && paused.Request.URL != "" {
-		if u, err := url.Parse(paused.Request.URL); err == nil {
-			reqHost := politeness.CanonicalHost(u.Hostname())
-			if reqHost != "" && reqHost == initHost {
-				sameOriginHost = true
-			}
+	sameOrigin := false
+	if initOrigin != "" && paused.Request.URL != "" {
+		if reqOrigin := canonicalURLOrigin(paused.Request.URL); reqOrigin != "" && reqOrigin == initOrigin {
+			sameOrigin = true
 		}
 	}
 
 	params := map[string]any{"requestId": paused.RequestID}
-	if sameOriginHost && len(extra) > 0 {
+	if sameOrigin && len(extra) > 0 {
 		params["headers"] = mergeCDPRequestHeaders(paused.Request.Headers, extra)
 	}
 	go func() {
@@ -614,6 +642,13 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			return Output{}, fmt.Errorf("unknown or expired browser session %q", task.SessionID)
 		}
 		if len(task.Headers) > 0 {
+			if task.URL != "" {
+				if upOrigin := canonicalURLOrigin(task.URL); upOrigin != "" {
+					sess.mu.Lock()
+					sess.initialOrigin = upOrigin
+					sess.mu.Unlock()
+				}
+			}
 			if err := sess.enableOriginScopedHeaders(ctx, cdp, task.Headers); err != nil {
 				return Output{}, err
 			}
@@ -671,18 +706,16 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		}
 
 		sid := randomSessionID()
-		initHost := ""
+		initOrigin := ""
 		if task.URL != "" {
-			if parsedInit, pErr := url.Parse(task.URL); pErr == nil {
-				initHost = politeness.CanonicalHost(parsedInit.Hostname())
-			}
+			initOrigin = canonicalURLOrigin(task.URL)
 		}
 		sess = &retainedSession{
 			id:               sid,
 			browserContextID: bcOut.BrowserContextID,
 			targetID:         tgtOut.TargetID,
 			cdpSessionID:     attOut.SessionID,
-			initialHost:      initHost,
+			initialOrigin:    initOrigin,
 			hasExtraHeaders:  len(task.Headers) > 0,
 			lastUsed:         time.Now(),
 			lastStatus:       http.StatusOK,
@@ -1116,8 +1149,8 @@ func (r *Renderer) runAction(
 		}
 		sess.setLastCheckedURL(u.String())
 		sess.mu.Lock()
-		if sess.initialHost == "" {
-			sess.initialHost = politeness.CanonicalHost(u.Hostname())
+		if sess.initialOrigin == "" {
+			sess.initialOrigin = canonicalURLOrigin(u.String())
 		}
 		sess.mu.Unlock()
 		st, hdrs, err := navigateAndWait(ctx, cdp, sess, events, u.String(), effectiveWaitMs, act.Selector)
@@ -1592,6 +1625,30 @@ func buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir string, useSandbox bo
 	return args
 }
 
+func isSandboxStartupFailureText(s string) bool {
+	lower := strings.ToLower(s)
+	for _, marker := range []string{
+		"zygote_host_impl_linux",
+		"no usable sandbox",
+		"sandbox_linux",
+		"setuid sandbox",
+		"namespace sandbox",
+		"without --no-sandbox",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSandboxStartupFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isSandboxStartupFailureText(err.Error())
+}
+
 func linuxSandboxBlockedByHostPolicy() bool {
 	if runtime.GOOS != "linux" {
 		return false
@@ -1756,28 +1813,23 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	}
 
 	waitBudget := 15 * time.Second
-	if runtime.GOOS == "linux" && useSandbox && !r.requireSandbox {
-		waitBudget = 3 * time.Second
-	}
 	cmd, userDir, conn, launchErr := r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, waitBudget)
-	if launchErr != nil && runtime.GOOS == "linux" && useSandbox {
+	if launchErr != nil && runtime.GOOS == "linux" && useSandbox && ctx.Err() == nil && isSandboxStartupFailure(launchErr) {
 		if r.requireSandbox {
 			r.sandboxState = "off"
 			r.disabledByPolicy = true
 			_ = proxy.Close()
 			return nil, fmt.Errorf("chromium OS sandbox failed and EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set: %w", launchErr)
 		}
-		if ctx.Err() == nil {
-			r.sandboxFallback = true
-			r.sandboxState = "off"
-			if r.log != nil {
-				r.log.Warn("browser_sandbox_fallback",
-					slog.String("bin", r.chromeBin),
-					slog.String("reason", launchErr.Error()))
-			}
-			useSandbox = false
-			cmd, userDir, conn, launchErr = r.launchAndDialLocked(ctx, proxy.Addr(), false, 15*time.Second)
+		r.sandboxFallback = true
+		r.sandboxState = "off"
+		if r.log != nil {
+			r.log.Warn("browser_sandbox_fallback",
+				slog.String("bin", r.chromeBin),
+				slog.String("reason", launchErr.Error()))
 		}
+		useSandbox = false
+		cmd, userDir, conn, launchErr = r.launchAndDialLocked(ctx, proxy.Addr(), false, waitBudget)
 	}
 	if launchErr != nil {
 		_ = proxy.Close()
@@ -1941,10 +1993,10 @@ func startupReason(current, line string) string {
 	if len(line) > 300 {
 		line = line[:300]
 	}
-	if strings.Contains(line, ":FATAL:") {
+	if strings.Contains(line, ":FATAL:") || isSandboxStartupFailureText(line) {
 		return line
 	}
-	if strings.Contains(current, ":FATAL:") {
+	if strings.Contains(current, ":FATAL:") || isSandboxStartupFailureText(current) {
 		return current
 	}
 	return line

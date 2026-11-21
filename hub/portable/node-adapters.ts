@@ -460,8 +460,8 @@ export class RawServerWebSocket implements HubSocketLike {
         this.close(1002, 'rsv_bits_not_allowed');
         return;
       }
-      // RFC 6455 §5.1: Server MUST close with 1002 if a client sends an unmasked frame
-      if (!masked) {
+      // RFC 6455 §5.1: Client-to-server frames MUST have MASK bit set (`(b1 & 0x80) !== 0`); immediately close/destroy with 1002 if unset!
+      if ((b1 & 0x80) === 0 || !masked) {
         this.close(1002, 'unmasked_client_frame');
         return;
       }

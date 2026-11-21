@@ -20,14 +20,16 @@ import type { ArtifactRetention, OptionalStorageBindings } from './storage';
 export type PayPeriod = 'year' | 'month' | 'week' | 'day' | 'hour';
 export type PayBasis = 'base' | 'ote' | 'total';
 export type WorkplaceType = 'remote' | 'hybrid' | 'onsite' | 'unknown';
-export type AtsBoardStatus = 'ok' | 'empty_board' | 'wrong_slug' | 'blocked_or_down';
+export type AtsBoardStatus = 'ok' | 'empty_board' | 'wrong_slug' | 'blocked_or_down' | 'not_found';
 
 export interface DiscoveredAtsBoard {
+  domain?: string;
   platform: string;
   slug: string;
   boardUrl: string;
   discoveredFrom: string;
   boardStatus?: AtsBoardStatus;
+  tried?: string[];
   total?: number;
   returned?: number;
   truncated?: boolean;
@@ -135,6 +137,8 @@ export interface StructuredJobRecord {
   workplaceType: WorkplaceType;
   locations: string[];
   pay: NormalizedPay | null;
+  payUnknown?: boolean;
+  matchedOn?: 'phrase' | 'all_tokens' | 'company_filter';
   postedAt: string | null;
   source: string;
   employmentType?: string;
@@ -625,6 +629,7 @@ export function salvageAshbyBoardFromTruncatedJson(raw: string): {
           const parsed = safeJsonParse(raw.slice(objStart, i + 1));
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
             jobs.push(parsed as Record<string, unknown>);
+            if (jobs.length >= 5_000) break;
           }
           objStart = -1;
         }
@@ -2052,20 +2057,128 @@ function hasOwnProp(obj: Record<string, unknown>, key: string): boolean {
   return !X402_FORBIDDEN_KEYS.has(key) && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
+const DECEPTIVE_402_TOKEN_RE = /(?:free|ok2fetch|freetrial)/i;
+
 /**
- * Strips ANSI CSI/OSC escape sequences, ASCII C0/C1 control characters, CR/LF newlines, DEL, and Unicode BiDi
- * override controls (`U+202A`–`U+202E`, `U+2066`–`U+2069`), collapsing whitespace and capping at `maxLen` chars.
+ * Strips ANSI CSI/OSC escape sequences, ASCII C0/C1 control characters, CR/LF newlines, DEL, zero-width / soft-hyphen,
+ * Unicode Tag smuggling (`U+E0000`–`U+E01EF`), and Unicode BiDi override/isolate controls, collapsing whitespace and capping at `maxLen` chars.
  */
 function sanitizeX402String(raw: unknown, maxLen = 256): string | undefined {
   if (typeof raw !== 'string') return undefined;
   const cleaned = raw
     .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
-    .replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]+/g, ' ')
+    .replace(/[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u{e0000}-\u{e01ef}]+/gu, '')
+    .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, ' ')
     .replace(/[ \t]+/g, ' ')
     .trim();
   if (!cleaned) return undefined;
   return cleaned.length > maxLen ? cleaned.slice(0, maxLen) : cleaned;
+}
+
+/**
+ * Strips Markdown inline/image/reference links (`[label](dest)` -> `label`, `![alt](dest)` -> `''`), angle-bracket
+ * autolinks/HTML tags (`<...>`), plus control / zero-width / BiDi characters in guaranteed linear O(N) time.
+ */
+function sanitizeX402PlainField(raw: unknown, maxLen = 256, strictIdentifier = false): string | undefined {
+  const base = sanitizeX402String(raw, 2_048);
+  if (!base) return undefined;
+  let out = '';
+  let i = 0;
+  while (i < base.length) {
+    const ch = base.charCodeAt(i);
+    // Strip `<...>` angle-bracket autolinks or inline HTML tags
+    if (ch === 60 /* '<' */) {
+      const gt = base.indexOf('>', i + 1);
+      if (gt > i) {
+        i = gt + 1;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    // Strip `![alt](dest)` or `[label](dest)` / `[label][ref]`
+    if (ch === 33 /* '!' */ && i + 1 < base.length && base.charCodeAt(i + 1) === 91 /* '[' */) {
+      const closeBr = base.indexOf(']', i + 2);
+      if (closeBr >= 0 && closeBr + 1 < base.length && base.charCodeAt(closeBr + 1) === 40 /* '(' */) {
+        let p = closeBr + 2;
+        let depth = 1;
+        while (p < base.length && depth > 0) {
+          const pc = base.charCodeAt(p);
+          if (pc === 92 /* '\\' */ && p + 1 < base.length) {
+            p += 2;
+            continue;
+          }
+          if (pc === 40) depth++;
+          else if (pc === 41) depth--;
+          p++;
+        }
+        if (depth === 0) {
+          i = p;
+          continue;
+        }
+      }
+    }
+    if (ch === 91 /* '[' */) {
+      const closeBr = base.indexOf(']', i + 1);
+      if (closeBr >= 0) {
+        const label = base.slice(i + 1, closeBr);
+        if (closeBr + 1 < base.length && base.charCodeAt(closeBr + 1) === 40 /* '(' */) {
+          let p = closeBr + 2;
+          let depth = 1;
+          while (p < base.length && depth > 0) {
+            const pc = base.charCodeAt(p);
+            if (pc === 92 /* '\\' */ && p + 1 < base.length) {
+              p += 2;
+              continue;
+            }
+            if (pc === 40) depth++;
+            else if (pc === 41) depth--;
+            p++;
+          }
+          if (depth === 0) {
+            out += label;
+            i = p;
+            continue;
+          }
+        } else if (closeBr + 1 < base.length && base.charCodeAt(closeBr + 1) === 91 /* '[' */) {
+          const refClose = base.indexOf(']', closeBr + 2);
+          if (refClose >= 0) {
+            out += label;
+            i = refClose + 1;
+            continue;
+          }
+        }
+      }
+      i++;
+      continue;
+    }
+    if (ch === 93 /* ']' */ || ch === 62 /* '>' */) {
+      i++;
+      continue;
+    }
+    if (strictIdentifier && (ch === 40 /* '(' */ || ch === 41 /* ')' */ || ch === 96 /* '`' */)) {
+      i++;
+      continue;
+    }
+    out += base[i]!;
+    i++;
+  }
+  const normalized = out.replace(/[ \t]+/g, ' ').trim();
+  if (!normalized) return undefined;
+  return normalized.length > maxLen ? normalized.slice(0, maxLen) : normalized;
+}
+
+function sanitizeX402HttpsResource(raw: unknown): string | undefined {
+  const s = sanitizeX402String(raw, 512);
+  if (!s || !/^https:\/\//i.test(s) || /[\s<>[\]`]/.test(s)) return undefined;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== 'https:' || u.username || u.password || !u.hostname) return undefined;
+    return s.startsWith('https://') ? s : u.toString();
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -2112,32 +2225,39 @@ function validateX402StandalonePrice(raw: unknown, fallbackCurrency?: string): s
     }
     s = String(raw === 0 ? 0 : raw);
   } else if (typeof raw === 'string') {
-    if (/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(raw)) return undefined;
+    if (/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(raw) || DECEPTIVE_402_TOKEN_RE.test(raw)) {
+      return undefined;
+    }
     s = raw.trim().replace(/[ \t]+/g, ' ');
   } else {
     return undefined;
   }
-  if (!/^\$?\d{1,12}(?:\.\d{1,8})?(?: [A-Z0-9]{2,10})?$/.test(s)) return undefined;
+  if (!/^\$?\d{1,12}(?:\.\d{1,8})?(?: [A-Z0-9]{2,10})?$/.test(s) || DECEPTIVE_402_TOKEN_RE.test(s)) return undefined;
   if (s.startsWith('$') || / [A-Z0-9]{2,10}$/.test(s)) return s;
+  if (fallbackCurrency && DECEPTIVE_402_TOKEN_RE.test(fallbackCurrency)) return undefined;
   const curRaw = (fallbackCurrency ?? 'USD').trim().toUpperCase();
-  const cur = /^[A-Z0-9]{2,10}$/.test(curRaw) ? curRaw : 'USD';
+  const cur = /^[A-Z0-9]{2,10}$/.test(curRaw) && !DECEPTIVE_402_TOKEN_RE.test(curRaw) ? curRaw : 'USD';
   return cur === 'USD' ? `$${s}` : `$${s} ${cur}`;
 }
 
-function isUsdcAssetOrExtra(assetRaw: string, extraName?: string): boolean {
-  const lower = assetRaw.trim().toLowerCase();
-  if (lower === 'usdc' || lower === 'usd' || KNOWN_USDC_CONTRACTS.has(lower)) return true;
-  if (extraName && /\busdc\b|\busd coin\b/i.test(extraName)) return true;
-  return false;
+function isKnownUsdcAsset(assetRaw: string): boolean {
+  const trimmed = assetRaw.trim();
+  if (!trimmed) return false;
+  return trimmed.toUpperCase() === 'USDC' || KNOWN_USDC_CONTRACTS.has(trimmed.toLowerCase());
 }
 
-function formatX402PriceString(terms: X402PaymentTerms): string | undefined {
+function formatX402PriceString(terms: X402PaymentTerms, sawDeceptiveCurrency = false): string | undefined {
   const assetRaw = typeof terms.asset === 'string' ? terms.asset.trim() : '';
   const currencyRaw = typeof terms.currency === 'string' ? terms.currency.trim() : '';
   const extraObj = terms.extra && typeof terms.extra === 'object' ? terms.extra : undefined;
-  const isUsdc = isUsdcAssetOrExtra(assetRaw || currencyRaw, extraObj?.name);
-  const rawLabel = KNOWN_USDC_CONTRACTS.has(assetRaw.toLowerCase()) ? 'USDC' : assetRaw || currencyRaw || (isUsdc ? 'USDC' : '');
-  const assetLabel = /^[A-Za-z0-9._-]{1,24}$/.test(rawLabel) ? rawLabel : isUsdc ? 'USDC' : '';
+  const isUsdc = isKnownUsdcAsset(assetRaw) || (!assetRaw && isKnownUsdcAsset(currencyRaw));
+  const rawLabel = isUsdc ? 'USDC' : assetRaw || currencyRaw;
+  const assetLabel =
+    isUsdc
+      ? 'USDC'
+      : /^[A-Za-z0-9._:-]{1,68}$/.test(rawLabel) && !DECEPTIVE_402_TOKEN_RE.test(rawLabel)
+        ? rawLabel
+        : '';
 
   const validAmt =
     normalizeX402AtomicAmount(terms.maxAmountRequired) ?? normalizeX402AtomicAmount(terms.amount);
@@ -2147,10 +2267,13 @@ function formatX402PriceString(terms: X402PaymentTerms): string | undefined {
     // Whenever `maxAmountRequired` / `amount` is > 0n, ALWAYS compute `price` from atomic amount — NEVER allow free-text `price` override!
     if (amtBig > 0n) {
       if (isUsdc) {
-        // Force `decimals = 6` on USDC/USD so `extra.decimals: 18` can NEVER understate a USDC price by 10^12!
+        // Force `decimals = 6` on USDC so `extra.decimals: 18` can NEVER understate a USDC price by 10^12!
         const decStr = formatAtomicAmountDecimalString(validAmt, 6);
-        const unitSuffix = assetLabel.toUpperCase() === 'USD' ? 'USD' : 'USDC';
-        return `$${decStr} ${unitSuffix}`;
+        return `$${decStr} USDC`;
+      }
+      if (assetLabel.toUpperCase() === 'USD' && extraObj?.decimals === undefined) {
+        const decStr = formatAtomicAmountDecimalString(validAmt, 6);
+        return `$${decStr} USD`;
       }
       const d = extraObj?.decimals;
       if (typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 18) {
@@ -2161,12 +2284,17 @@ function formatX402PriceString(terms: X402PaymentTerms): string | undefined {
     }
 
     // `amtBig === 0n`
-    const validZeroPrice = validateX402StandalonePrice(terms.price, currencyRaw || assetLabel);
-    if (validZeroPrice) return validZeroPrice;
+    if (!sawDeceptiveCurrency) {
+      const validZeroPrice = validateX402StandalonePrice(terms.price, currencyRaw || assetLabel);
+      if (validZeroPrice) return validZeroPrice;
+    }
     if (isUsdc) return '$0 USDC';
     return assetLabel ? `0 ${assetLabel}` : '0';
   }
 
+  if (sawDeceptiveCurrency && typeof terms.price === 'string' && !terms.price.startsWith('$') && !/ [A-Z0-9]{2,10}$/.test(terms.price)) {
+    return undefined;
+  }
   return validateX402StandalonePrice(terms.price, currencyRaw || assetLabel);
 }
 
@@ -2291,6 +2419,7 @@ export function parseX402PaymentTerms(
 
   const terms: X402PaymentTerms = {};
   let rawCandidatePrice: unknown;
+  let sawDeceptiveCurrency = false;
 
   const payHdr =
     readPaymentHeader(headers, 'payment-required') || readPaymentHeader(headers, 'x-payment-required');
@@ -2322,10 +2451,10 @@ export function parseX402PaymentTerms(
     const scheme = sanitizeX402String(readOwn('scheme'), 256);
     const assetRaw = sanitizeX402String(readOwn('asset'), 256);
     const currency = sanitizeX402String(readOwn('currency'), 256);
-    const network = sanitizeX402String(readOwn('network'), 256);
-    const payTo = sanitizeX402String(readOwn('payTo') ?? readOwn('recipient'), 256);
-    const resource = sanitizeX402String(readOwn('resource'), 256);
-    const description = sanitizeX402String(readOwn('description'), 256);
+    const network = sanitizeX402PlainField(readOwn('network'), 256, true);
+    const payTo = sanitizeX402PlainField(readOwn('payTo') ?? readOwn('recipient'), 256, true);
+    const resource = sanitizeX402HttpsResource(readOwn('resource'));
+    const description = sanitizeX402PlainField(readOwn('description'), 256, false);
     const amount = normalizeX402AtomicAmount(readOwn('amount'));
     const maxAmountRequired = normalizeX402AtomicAmount(readOwn('maxAmountRequired'));
     const candPrice = readOwn('price');
@@ -2334,8 +2463,20 @@ export function parseX402PaymentTerms(
     if (candPrice !== undefined) rawCandidatePrice = candPrice;
     if (amount !== undefined) terms.amount = amount;
     if (maxAmountRequired !== undefined) terms.maxAmountRequired = maxAmountRequired;
-    if (assetRaw) terms.asset = KNOWN_USDC_CONTRACTS.has(assetRaw.toLowerCase()) ? 'USDC' : assetRaw;
-    if (currency) terms.currency = currency;
+    if (assetRaw) {
+      if (DECEPTIVE_402_TOKEN_RE.test(assetRaw)) {
+        sawDeceptiveCurrency = true;
+      } else {
+        terms.asset = isKnownUsdcAsset(assetRaw) ? 'USDC' : assetRaw;
+      }
+    }
+    if (currency) {
+      if (DECEPTIVE_402_TOKEN_RE.test(currency)) {
+        sawDeceptiveCurrency = true;
+      } else {
+        terms.currency = currency;
+      }
+    }
     if (network) terms.network = network;
     if (payTo) terms.payTo = payTo;
     if (resource) terms.resource = resource;
@@ -2346,12 +2487,12 @@ export function parseX402PaymentTerms(
     if (rawExtra && typeof rawExtra === 'object' && !Array.isArray(rawExtra)) {
       const eo = rawExtra as Record<string, unknown>;
       const safeExtra: X402ExtraMetadata = {};
-      const extraName = hasOwnProp(eo, 'name') ? sanitizeX402String(eo.name, 256) : undefined;
+      const extraName = hasOwnProp(eo, 'name') ? sanitizeX402PlainField(eo.name, 256, false) : undefined;
       const extraVer = hasOwnProp(eo, 'version') ? sanitizeX402String(eo.version, 256) : undefined;
       if (extraName) safeExtra.name = extraName;
       if (extraVer) safeExtra.version = extraVer;
 
-      const effectiveIsUsdc = isUsdcAssetOrExtra(terms.asset ?? terms.currency ?? '', extraName);
+      const effectiveIsUsdc = isKnownUsdcAsset(terms.asset ?? terms.currency ?? '');
       if (hasOwnProp(eo, 'decimals') && typeof eo.decimals === 'number') {
         if (effectiveIsUsdc) {
           safeExtra.decimals = 6;
@@ -2394,16 +2535,28 @@ export function parseX402PaymentTerms(
         if (m !== undefined) terms.maxAmountRequired = m;
       } else if (k === 'asset' && !terms.asset) {
         const as = sanitizeX402String(rawV, 256);
-        if (as) terms.asset = KNOWN_USDC_CONTRACTS.has(as.toLowerCase()) ? 'USDC' : as;
+        if (as) {
+          if (DECEPTIVE_402_TOKEN_RE.test(as)) sawDeceptiveCurrency = true;
+          else terms.asset = isKnownUsdcAsset(as) ? 'USDC' : as;
+        }
       } else if (k === 'currency' && !terms.currency) {
         const cu = sanitizeX402String(rawV, 256);
-        if (cu) terms.currency = cu;
+        if (cu) {
+          if (DECEPTIVE_402_TOKEN_RE.test(cu)) sawDeceptiveCurrency = true;
+          else terms.currency = cu;
+        }
       } else if (k === 'network' && !terms.network) {
-        const nw = sanitizeX402String(rawV, 256);
+        const nw = sanitizeX402PlainField(rawV, 256, true);
         if (nw) terms.network = nw;
       } else if ((k === 'payto' || k === 'recipient') && !terms.payTo) {
-        const pt = sanitizeX402String(rawV, 256);
+        const pt = sanitizeX402PlainField(rawV, 256, true);
         if (pt) terms.payTo = pt;
+      } else if (k === 'resource' && !terms.resource) {
+        const rs = sanitizeX402HttpsResource(rawV);
+        if (rs) terms.resource = rs;
+      } else if (k === 'description' && !terms.description) {
+        const ds = sanitizeX402PlainField(rawV, 256, false);
+        if (ds) terms.description = ds;
       } else if (k === 'invoice') {
         const inv = sanitizeX402String(rawV, 256);
         if (inv) terms.invoice = inv;
@@ -2414,12 +2567,18 @@ export function parseX402PaymentTerms(
     }
   }
 
-  const validStandalone = validateX402StandalonePrice(rawCandidatePrice, terms.currency || terms.asset);
+  const validStandalone =
+    sawDeceptiveCurrency &&
+    typeof rawCandidatePrice === 'string' &&
+    !rawCandidatePrice.trim().startsWith('$') &&
+    !/ [A-Z0-9]{2,10}$/.test(rawCandidatePrice.trim())
+      ? undefined
+      : validateX402StandalonePrice(rawCandidatePrice, terms.currency || terms.asset);
   if (validStandalone) {
     terms.price = validStandalone;
   }
 
-  const formattedPrice = formatX402PriceString(terms);
+  const formattedPrice = formatX402PriceString(terms, sawDeceptiveCurrency);
   if (formattedPrice) {
     terms.price = formattedPrice;
   } else {
@@ -2561,6 +2720,8 @@ export interface JobsToolPayload {
   remote?: unknown;
   locations?: unknown;
   minBase?: unknown;
+  minBaseMode?: unknown;
+  strictPay?: unknown;
   postedWithinDays?: unknown;
   limit?: unknown;
   includeBuiltIn?: unknown;
@@ -2811,8 +2972,40 @@ export interface AtsPostingIdentity {
   roleTokens: string[];
 }
 
-function tokenizeRoleSlug(slugOrPath: string): string[] {
+const GENERIC_ROLE_TOKENS = new Set([
+  'engineer',
+  'engineering',
+  'developer',
+  'software',
+  'manager',
+  'director',
+  'staff',
+  'principal',
+  'specialist',
+  'analyst',
+  'associate',
+  'intern',
+  'consultant',
+  'architect',
+  'designer',
+  'product',
+  'operations',
+  'systems',
+  'technical',
+  'remote',
+  'hybrid',
+  'junior',
+  'senior',
+  'lead',
+]);
+
+function tokenizeRoleSlug(slugOrPath: string, excludeSlug?: string): string[] {
   const stop = new Set(['job', 'jobs', 'apply', 'application', 'careers', 'postings', 'senior', 'lead', 'the', 'and', 'for']);
+  if (excludeSlug) {
+    for (const part of excludeSlug.toLowerCase().split(/[^a-z0-9]+/)) {
+      if (part.length >= 2) stop.add(part);
+    }
+  }
   return (slugOrPath.toLowerCase().match(/[a-z]{3,}/g) ?? []).filter((w) => !stop.has(w));
 }
 
@@ -2845,7 +3038,7 @@ export function parseAtsPostingIdentity(urlStr: string): AtsPostingIdentity | nu
         slug: org,
         boardUrl: `https://${boardHost}/${org}`,
         postingId,
-        roleTokens: tokenizeRoleSlug(u.pathname),
+        roleTokens: tokenizeRoleSlug(parts.slice(2).join('-') || u.pathname, org),
       };
     }
   }
@@ -2858,7 +3051,7 @@ export function parseAtsPostingIdentity(urlStr: string): AtsPostingIdentity | nu
         slug: baseCo,
         boardUrl: `https://job-boards.greenhouse.io/${baseCo}`,
         postingId: ghQueryId,
-        roleTokens: tokenizeRoleSlug(u.pathname),
+        roleTokens: tokenizeRoleSlug(u.pathname, baseCo),
       };
     }
   }
@@ -2995,23 +3188,35 @@ function findSimilarRoles(
   openRoles: Array<{ title: string; url: string }>,
   roleTokens: string[],
 ): Array<{ title: string; url: string }> {
-  if (openRoles.length === 0) return [];
-  if (roleTokens.length === 0) {
-    return openRoles.slice(0, 3);
+  if (openRoles.length === 0 || roleTokens.length === 0) {
+    return [];
   }
+  const uniqueTokens = [...new Set(roleTokens)];
   const scored = openRoles
     .map((r) => {
-      const lower = r.title.toLowerCase();
-      let hits = 0;
-      for (const tok of roleTokens) {
-        if (lower.includes(tok)) hits++;
+      const titleWords = new Set(r.title.toLowerCase().match(/[a-z0-9]{2,}/g) ?? []);
+      let distinctiveHits = 0;
+      let genericHits = 0;
+      for (const tok of uniqueTokens) {
+        if (!titleWords.has(tok)) continue;
+        if (GENERIC_ROLE_TOKENS.has(tok)) {
+          genericHits++;
+        } else {
+          distinctiveHits++;
+        }
       }
-      return { role: r, hits };
+      const totalHits = distinctiveHits + genericHits;
+      const qualifies =
+        distinctiveHits >= 2 ||
+        (distinctiveHits >= 1 && totalHits >= 2) ||
+        (distinctiveHits >= 1 && uniqueTokens.length === 1) ||
+        (distinctiveHits === 0 && genericHits >= 2 && uniqueTokens.every((t) => GENERIC_ROLE_TOKENS.has(t)));
+      return { role: r, score: distinctiveHits * 3 + genericHits, qualifies };
     })
-    .sort((a, b) => b.hits - a.hits);
+    .filter((s) => s.qualifies)
+    .sort((a, b) => b.score - a.score);
 
-  const withHits = scored.filter((s) => s.hits > 0).map((s) => s.role);
-  return (withHits.length > 0 ? withHits : openRoles).slice(0, 3);
+  return scored.slice(0, 3).map((s) => s.role);
 }
 
 async function executeJobsVerifyMode(params: {
@@ -3051,8 +3256,8 @@ async function executeJobsVerifyMode(params: {
   >();
 
   const groupEntries = [...boardGroups.entries()];
-  for (let i = 0; i < groupEntries.length; i += 5) {
-    const batch = groupEntries.slice(i, i + 5);
+  for (let i = 0; i < groupEntries.length; i += 2) {
+    const batch = groupEntries.slice(i, i + 2);
     const outs = await Promise.all(
       batch.map(([, grp]) =>
         executeScrape({
@@ -3242,6 +3447,92 @@ async function executeJobsVerifyMode(params: {
   };
 }
 
+const QUERY_STOP_WORDS = new Set(['the', 'and', 'for', 'with', 'from', 'into', 'role', 'job', 'jobs', 'open', 'position']);
+const REMOTE_LOCATION_TOKENS = new Set(['remote', 'anywhere', 'work from home', 'wfh']);
+
+function matchesJobQueryRelevance(
+  title: string,
+  snippet: string | undefined,
+  query: string,
+): 'phrase' | 'all_tokens' | null {
+  const normPhrase = query.toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!normPhrase) return 'phrase';
+  const titleLower = title.toLowerCase().replace(/\s+/g, ' ');
+  if (titleLower.includes(normPhrase)) return 'phrase';
+
+  const qTokens = (normPhrase.match(/[\p{L}\p{N}+#]+/gu) ?? []).filter(
+    (t) => t.length >= 2 && !QUERY_STOP_WORDS.has(t),
+  );
+  if (qTokens.length === 0) {
+    return titleLower.includes(normPhrase) ? 'phrase' : null;
+  }
+  if (qTokens.every((qt) => titleLower.includes(qt))) {
+    return 'all_tokens';
+  }
+  const distinctiveQ = qTokens.filter((qt) => !GENERIC_ROLE_TOKENS.has(qt));
+  if (distinctiveQ.length > 0 && distinctiveQ.every((qt) => titleLower.includes(qt))) {
+    const fullHay = `${titleLower} ${(snippet ?? '').toLowerCase()}`;
+    if (qTokens.every((qt) => fullHay.includes(qt))) {
+      return 'all_tokens';
+    }
+  }
+  return null;
+}
+
+function matchesSingleGeoLocation(locStr: string, filterTerm: string): boolean {
+  const isUsFilter =
+    filterTerm === 'united states' ||
+    filterTerm === 'usa' ||
+    filterTerm === 'u.s.' ||
+    filterTerm === 'u.s.a.' ||
+    filterTerm === 'us';
+  if (!isUsFilter) {
+    return locStr.includes(filterTerm);
+  }
+  const hasExplicitUsCountryOrCity =
+    /\b(?:united states|usa|u\.s\.a?\.?|us\b|americas?\s*\(us\)|us-[a-z]{2}\b|california|new york|texas|washington|massachusetts|virginia|colorado|illinois|georgia|florida|san francisco|nyc|seattle|austin|boston|chicago|los angeles|denver|atlanta|menlo park|mountain view|palo alto|sunnyvale|santa clara|san jose|redmond|bellevue|mclean|reston)\b/i.test(
+      locStr,
+    );
+  if (hasExplicitUsCountryOrCity) return true;
+
+  // Match `, CA` / `, NY` / `, WA` state abbreviations unless `, ON, CA` / `Canada` ISO country code
+  const hasCanadianProvinceOrCountry = /\b(?:canada|toronto|vancouver|montreal|ottawa|calgary|ontario|quebec|british columbia)\b|,\s*(?:on|bc|qc|ab),\s*ca\b/i.test(
+    locStr,
+  );
+  if (hasCanadianProvinceOrCountry) return false;
+
+  return /,\s*(?:al|ak|az|ar|ca|co|ct|de|dc|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|wi|wy)\b/i.test(
+    locStr,
+  );
+}
+
+function matchesGeoLocationsFilter(jobLocations: string[], geoFilters: string[]): boolean {
+  const locStr = jobLocations.join(' | ').toLowerCase().trim();
+  if (!locStr) return false;
+  return geoFilters.some((gf) => matchesSingleGeoLocation(locStr, gf));
+}
+
+function matchesAllowedCompanyOrDomain(
+  job: StructuredJobRecord,
+  allowedTokens: Set<string>,
+  allowedBoardPrefixes: string[],
+): boolean {
+  const urlLower = job.url.toLowerCase();
+  if (allowedBoardPrefixes.some((p) => p && urlLower.startsWith(p))) return true;
+  const compClean = job.company.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const inferredClean = inferCompanyFromAtsUrl(job.url).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  for (const tok of allowedTokens) {
+    if (!tok) continue;
+    if (
+      (compClean && (compClean.includes(tok) || tok.includes(compClean))) ||
+      (inferredClean && (inferredClean.includes(tok) || tok.includes(inferredClean)))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * `Section 4`: One-call `jobs` sweep across Greenhouse, Ashby, Lever, Workday, Workable, Gem, Rippling, SmartRecruiters,
  * iCIMS, robots-allowed public feeds (We Work Remotely, Himalayas, Working Nomads), company-domain -> ATS auto-discovery (`domains`),
@@ -3295,18 +3586,25 @@ export async function executeJobsCall(params: {
     };
   }
 
-  const wantRemote = payload.remote === true ? true : payload.remote === false ? false : undefined;
-  const locationsFilter = Array.isArray(payload.locations)
+  const rawLocationsFilter = Array.isArray(payload.locations)
     ? payload.locations.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((s) => s.trim().toLowerCase())
     : [];
+  const geoLocationsFilter = rawLocationsFilter.filter((s) => !REMOTE_LOCATION_TOKENS.has(s));
+  const hasRemoteInLocations = rawLocationsFilter.some((s) => REMOTE_LOCATION_TOKENS.has(s));
+  const rawWantRemote = payload.remote === true ? true : payload.remote === false ? false : undefined;
+  const wantRemote = rawWantRemote !== undefined ? rawWantRemote : hasRemoteInLocations ? true : undefined;
+
   const minBase = typeof payload.minBase === 'number' && Number.isFinite(payload.minBase) && payload.minBase > 0 ? payload.minBase : undefined;
+  const minBaseMode: 'floor' | 'ceiling' = payload.minBaseMode === 'ceiling' ? 'ceiling' : 'floor';
+  const strictPay = payload.strictPay === true;
   const postedWithinDays =
     typeof payload.postedWithinDays === 'number' && Number.isFinite(payload.postedWithinDays) && payload.postedWithinDays > 0
       ? payload.postedWithinDays
       : undefined;
   const limit =
     typeof payload.limit === 'number' && Number.isFinite(payload.limit) ? Math.min(50, Math.max(1, Math.floor(payload.limit))) : 20;
-  const includeBuiltIn = payload.includeBuiltIn !== false;
+  const hasCompanyOrDomainScope = Boolean(companyFilter) || domainsInput.length > 0;
+  const includeBuiltIn = hasCompanyOrDomainScope ? payload.includeBuiltIn === true : payload.includeBuiltIn !== false;
   const excludeList = Array.isArray(payload.exclude)
     ? (payload.exclude as Array<Record<string, unknown>>)
         .filter((x) => x && typeof x === 'object')
@@ -3320,13 +3618,17 @@ export async function executeJobsCall(params: {
   const candidateUrls = new Set<string>();
   const notes: string[] = [];
   const discoveredBoards: DiscoveredAtsBoard[] = [];
+  const sourcesUsed = new Set<string>();
 
-  // 1. Company Domain -> ATS Board Auto-Discovery (`domains: ["stripe.com", "f5.com"]`)
+  // 1. Company Domain -> ATS Board Auto-Discovery (`domains: ["stripe.com", "nvidia.com", "f5.com"]`)
   if (domainsInput.length > 0) {
     await Promise.all(
       domainsInput.map(async (dom) => {
+        const tried: string[] = [];
+        const foundForDom: DiscoveredAtsBoard[] = [];
         for (const probePath of ['/careers', '/jobs', '/about/careers']) {
           const probeUrl = `https://${dom}${probePath}`;
+          tried.push(probeUrl);
           const res = await executeScrape({
             url: probeUrl,
             renderMode: 'auto',
@@ -3344,20 +3646,44 @@ export async function executeJobsCall(params: {
           });
           if (boards.length > 0) {
             for (const b of boards) {
-              discoveredBoards.push(b);
-              candidateUrls.add(b.boardUrl);
+              const entry: DiscoveredAtsBoard = { ...b, domain: dom };
+              foundForDom.push(entry);
+              discoveredBoards.push(entry);
+              candidateUrls.add(entry.boardUrl);
             }
             return;
           }
         }
-        // Fallback when company uses a custom SPA careers portal: probe canonical domain slug across Greenhouse, Ashby & Lever JSON boards
+        // Fallback when company uses a custom SPA careers portal (e.g. Eightfold/AEM): probe canonical domain slug across Greenhouse, Ashby, Lever & Workday CXS
         const baseSlug = dom.split('.')[0]?.toLowerCase() ?? '';
         if (isValidAtsSlug(baseSlug)) {
-          const slugProbes: Array<{ platform: string; boardUrl: string }> = [
-            { platform: 'greenhouse', boardUrl: `https://boards.greenhouse.io/${baseSlug}` },
-            { platform: 'ashby', boardUrl: `https://jobs.ashbyhq.com/${baseSlug}` },
-            { platform: 'lever', boardUrl: `https://jobs.lever.co/${baseSlug}` },
+          const upperSlug = baseSlug.toUpperCase();
+          const slugProbes: Array<{ platform: string; slug: string; boardUrl: string }> = [
+            { platform: 'greenhouse', slug: baseSlug, boardUrl: `https://boards.greenhouse.io/${baseSlug}` },
+            { platform: 'ashby', slug: baseSlug, boardUrl: `https://jobs.ashbyhq.com/${baseSlug}` },
+            { platform: 'lever', slug: baseSlug, boardUrl: `https://jobs.lever.co/${baseSlug}` },
+            {
+              platform: 'workday',
+              slug: `${baseSlug}/${upperSlug}ExternalCareerSite`,
+              boardUrl: `https://${baseSlug}.wd5.myworkdayjobs.com/${upperSlug}ExternalCareerSite`,
+            },
+            {
+              platform: 'workday',
+              slug: `${baseSlug}/${upperSlug}ExternalCareerSite`,
+              boardUrl: `https://${baseSlug}.wd1.myworkdayjobs.com/${upperSlug}ExternalCareerSite`,
+            },
+            {
+              platform: 'workday',
+              slug: `${baseSlug}/External`,
+              boardUrl: `https://${baseSlug}.wd5.myworkdayjobs.com/External`,
+            },
+            {
+              platform: 'workday',
+              slug: `${baseSlug}/External`,
+              boardUrl: `https://${baseSlug}.wd1.myworkdayjobs.com/External`,
+            },
           ];
+          for (const sp of slugProbes) tried.push(sp.boardUrl);
           const probeResults = await Promise.all(
             slugProbes.map(async (sp) => {
               const r = await executeScrape({
@@ -3371,17 +3697,63 @@ export async function executeJobsCall(params: {
           );
           for (const { sp, r } of probeResults) {
             const links = Array.isArray(r?.body?.links) ? (r!.body.links as string[]) : [];
-            if (r?.status === 200 && r.body?.ok === true && links.length > 0) {
-              discoveredBoards.push({
+            const jobsArr = Array.isArray(r?.body?.jobs) ? (r!.body.jobs as unknown[]) : [];
+            if (r?.status === 200 && r.body?.ok === true && (jobsArr.length > 0 || links.length > 0)) {
+              const entry: DiscoveredAtsBoard = {
+                domain: dom,
                 platform: sp.platform,
-                slug: baseSlug,
+                slug: sp.slug,
                 boardUrl: sp.boardUrl,
                 discoveredFrom: `slug-probe:${dom}`,
                 boardStatus: 'ok',
-              });
+              };
+              foundForDom.push(entry);
+              discoveredBoards.push(entry);
               candidateUrls.add(sp.boardUrl);
             }
           }
+
+          // Search-assisted ATS board fallback when company uses a non-standard Workday/Greenhouse/Ashby tenant slug
+          if (foundForDom.length === 0) {
+            tried.push(`search:ats:${dom}`);
+            const sr = await executeSearch({
+              query: `(site:myworkdayjobs.com OR site:job-boards.greenhouse.io OR site:boards.greenhouse.io OR site:jobs.ashbyhq.com OR site:jobs.lever.co OR site:apply.workable.com OR site:jobs.smartrecruiters.com OR site:icims.com) "${baseSlug}"`,
+              maxResults: 10,
+            }).catch(() => null);
+            const srHits = Array.isArray(sr?.body?.results) ? (sr!.body.results as Array<Record<string, unknown>>) : [];
+            const hitLinks = srHits
+              .map((h) => (typeof h.url === 'string' ? h.url.trim() : ''))
+              .filter((u) => u.startsWith('https://'));
+            if (hitLinks.length > 0) {
+              const searchBoards = discoverAtsBoardsFromHtml({
+                sourceUrl: `search:${dom}`,
+                links: hitLinks,
+              });
+              for (const sb of searchBoards) {
+                const normBoardSlug = sb.slug.toLowerCase().replace(/[^a-z0-9]+/g, '');
+                const normBase = baseSlug.replace(/[^a-z0-9]+/g, '');
+                if (normBase && (normBoardSlug.includes(normBase) || normBase.includes(normBoardSlug))) {
+                  const entry: DiscoveredAtsBoard = { ...sb, domain: dom };
+                  foundForDom.push(entry);
+                  discoveredBoards.push(entry);
+                  candidateUrls.add(entry.boardUrl);
+                }
+              }
+            }
+          }
+        }
+
+        if (foundForDom.length === 0) {
+          discoveredBoards.push({
+            domain: dom,
+            platform: 'unknown',
+            slug: baseSlug || dom,
+            boardUrl: '',
+            discoveredFrom: 'none',
+            boardStatus: 'not_found',
+            tried,
+          });
+          notes.push(`No ATS job board discovered for "${dom}" after probing ${tried.length} candidates.`);
         }
       }),
     );
@@ -3396,7 +3768,8 @@ export async function executeJobsCall(params: {
     .filter(Boolean)
     .join(' ');
 
-  if (coreTerms) {
+  // Never run unscoped cross-company web search when the caller explicitly scoped to `domains: [...]` without `company`
+  if (coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
     const searchResponses = await Promise.all(
       atsGroups.map((grp) =>
         executeSearch({
@@ -3407,15 +3780,18 @@ export async function executeJobsCall(params: {
       ),
     );
 
+    let addedSearchHits = 0;
     for (const sr of searchResponses) {
       const webResults = Array.isArray(sr.body?.results) ? (sr.body.results as Array<Record<string, unknown>>) : [];
       for (const hit of webResults) {
         const u = typeof hit.url === 'string' ? hit.url.trim() : '';
         if (u.startsWith('https://') && candidateUrls.size < Math.min(35, limit * 2)) {
           candidateUrls.add(u);
+          addedSearchHits++;
         }
       }
     }
+    if (addedSearchHits > 0) sourcesUsed.add('ats_search');
   }
 
   const collected: StructuredJobRecord[] = [];
@@ -3430,6 +3806,7 @@ export async function executeJobsCall(params: {
     }).catch(() => null);
     const biMd = typeof biRes?.body?.markdown === 'string' ? biRes.body.markdown : '';
     if (biRes?.status === 200 && biMd) {
+      sourcesUsed.add('builtin');
       // Extract Built In job links (`https://builtin.com/job/...`) + inline card compensation if present
       const cardRe = /\[([^\[\]\n]{4,120})\]\((https:\/\/(?:www\.)?builtin\.com\/job\/[^)\s]+)\)([\s\S]{0,260}?)(?=\[[^\[\]\n]+\]\(https:\/\/(?:www\.)?builtin\.com\/job\/|$)/gi;
       let bm: RegExpExecArray | null;
@@ -3455,24 +3832,24 @@ export async function executeJobsCall(params: {
     }
   }
 
-  // Optional robots.txt-allowed public remote job feeds (We Work Remotely RSS, Himalayas, Working Nomads)
-  const shouldFetchPublicFeeds =
-    payload.includePublicFeeds === true ||
-    (payload.includePublicFeeds !== false && Boolean(query) && !companyFilter && domainsInput.length === 0);
+  // Strictly opt-in robots.txt-allowed public remote job feeds (We Work Remotely RSS, Himalayas, Working Nomads)
+  const shouldFetchPublicFeeds = payload.includePublicFeeds === true;
   if (shouldFetchPublicFeeds) {
     const feedOuts = await Promise.all(
-      PUBLIC_JOB_FEEDS.map((feed) =>
-        executeScrape({
+      PUBLIC_JOB_FEEDS.map(async (feed) => ({
+        feed,
+        fo: await executeScrape({
           url: feed.url,
           renderMode: 'auto',
           formats: ['markdown'],
           ...(payload.target ? { target: payload.target } : {}),
           ...(payload.site ? { site: payload.site } : {}),
         }).catch(() => null),
-      ),
+      })),
     );
-    for (const fo of feedOuts) {
+    for (const { feed, fo } of feedOuts) {
       if (fo?.status === 200 && fo.body?.ok === true && Array.isArray(fo.body.jobs)) {
+        sourcesUsed.add(`public_feed:${feed.id}`);
         for (const fj of fo.body.jobs as StructuredJobRecord[]) {
           collected.push(fj);
         }
@@ -3485,15 +3862,25 @@ export async function executeJobsCall(params: {
   for (let i = 0; i < urlList.length; i += 5) {
     const slice = urlList.slice(i, i + 5);
     const batchOut = await Promise.all(
-      slice.map((u) =>
-        executeScrape({
-          url: u,
+      slice.map((u) => {
+        let scrapeUrl = u;
+        if (query && /myworkday(?:jobs|site)\.com/i.test(u) && !/\/job\//i.test(u)) {
+          try {
+            const wdU = new URL(u);
+            if (!wdU.searchParams.has('q')) wdU.searchParams.set('q', query);
+            scrapeUrl = wdU.toString();
+          } catch {
+            scrapeUrl = u;
+          }
+        }
+        return executeScrape({
+          url: scrapeUrl,
           renderMode: 'auto',
           formats: ['markdown'],
           ...(payload.target ? { target: payload.target } : {}),
           ...(payload.site ? { site: payload.site } : {}),
-        }).catch(() => null),
-      ),
+        }).catch(() => null);
+      }),
     );
     for (let j = 0; j < slice.length; j++) {
       const origU = slice[j]!;
@@ -3585,6 +3972,7 @@ export async function executeJobsCall(params: {
           }
         }
         for (const br of boardJobs) {
+          if (br.source) sourcesUsed.add(`ats:${br.source}`);
           collected.push(br);
         }
         continue;
@@ -3592,6 +3980,7 @@ export async function executeJobsCall(params: {
 
       // Support twin-extracted job boards (`icims` `records[]`) in `jobs` search mode
       if (Array.isArray(sc.body.records) && sc.body.extractorId === 'icims') {
+        sourcesUsed.add('ats:icims');
         const icimsRecs = sc.body.records as Array<Record<string, unknown>>;
         const icimsCo = inferCompanyFromAtsUrl(origU);
         for (const rc of icimsRecs) {
@@ -3631,6 +4020,8 @@ export async function executeJobsCall(params: {
       const wp = jp?.workplaceType && jp.workplaceType !== 'unknown' ? jp.workplaceType : inferWorkplaceType(`${locs.join(' ')} ${md.slice(0, 400)}`);
       const postedAt = jp?.datePosted ?? (typeof meta.publishedTime === 'string' ? meta.publishedTime : null);
       const applyUrl = jp?.applyUrl || origU;
+      const jobSource = jp?.source || String(sc.body.extractorId ?? 'ats');
+      sourcesUsed.add(`ats:${jobSource}`);
 
       collected.push({
         title: rawTitle,
@@ -3641,64 +4032,117 @@ export async function executeJobsCall(params: {
         locations: locs,
         pay,
         postedAt,
-        source: jp?.source || String(sc.body.extractorId ?? 'ats'),
+        source: jobSource,
         ...(jp?.employmentType ? { employmentType: jp.employmentType } : {}),
       });
     }
   }
 
+  const allowedCompanyTokens = new Set<string>();
+  if (companyFilter) {
+    const cf = companyFilter.toLowerCase().replace(/[^a-z0-9]+/g, '');
+    if (cf) allowedCompanyTokens.add(cf);
+  }
+  for (const dom of domainsInput) {
+    const ds = (dom.split('.')[0] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    if (ds) allowedCompanyTokens.add(ds);
+  }
+  for (const db of discoveredBoards) {
+    if (db.boardStatus !== 'not_found' && db.slug) {
+      const rootSlug = (db.slug.split('/')[0] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+      if (rootSlug) allowedCompanyTokens.add(rootSlug);
+    }
+  }
+  const allowedBoardPrefixes = discoveredBoards
+    .filter((b) => b.boardStatus !== 'not_found' && b.boardUrl)
+    .map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase());
+
   const nowMs = Date.now();
   const maxAgeCutoffMs = postedWithinDays ? nowMs - postedWithinDays * 86_400_000 : null;
   const seenKeys = new Set<string>();
   const seenUrls = new Set<string>();
-  const finalJobs: StructuredJobRecord[] = [];
+  const matchedJobs: StructuredJobRecord[] = [];
 
-  for (const job of collected) {
-    const cleanUrlKey = job.url.replace(/\/+$/, '').toLowerCase();
-    const dedupKey = canonicalJobKey(job.company, job.title);
+  for (const rawJob of collected) {
+    const cleanUrlKey = rawJob.url.replace(/\/+$/, '').toLowerCase();
+    const dedupKey = canonicalJobKey(rawJob.company, rawJob.title);
     if (seenUrls.has(cleanUrlKey) || seenKeys.has(dedupKey)) continue;
+
+    // Strict company / domain scope guard: never leak unrelated companies' postings when `company` or `domains` is set
+    if (hasCompanyOrDomainScope && !matchesAllowedCompanyOrDomain(rawJob, allowedCompanyTokens, allowedBoardPrefixes)) {
+      continue;
+    }
 
     // Exclude already-applied list
     const isExcluded = excludeList.some((ex) => {
       if (ex.url && ex.url === cleanUrlKey) return true;
-      const compMatch = ex.company && job.company.toLowerCase().includes(ex.company);
-      const titleMatch = ex.title && job.title.toLowerCase().includes(ex.title);
+      const compMatch = ex.company && rawJob.company.toLowerCase().includes(ex.company);
+      const titleMatch = ex.title && rawJob.title.toLowerCase().includes(ex.title);
       return Boolean((ex.company && ex.title && compMatch && titleMatch) || (ex.company && !ex.title && compMatch));
     });
     if (isExcluded) continue;
 
-    // Query relevance filter on board-level expansions
+    // Strict phrase / all-tokens query relevance filter (`matchedOn`)
+    let matchedOn: 'phrase' | 'all_tokens' | 'company_filter' = 'company_filter';
     if (query) {
-      const qTokens = (query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((t) => t.length >= 3);
-      const hay = `${job.title} ${job.company} ${job.snippet ?? ''}`.toLowerCase();
-      if (qTokens.length > 0 && !qTokens.some((qt) => hay.includes(qt))) continue;
+      const qMatch = matchesJobQueryRelevance(rawJob.title, rawJob.snippet, query);
+      if (!qMatch) continue;
+      matchedOn = qMatch;
     }
 
-    if (wantRemote === true && job.workplaceType !== 'remote' && !job.locations.some((l) => /remote/i.test(l))) {
+    if (wantRemote === true && rawJob.workplaceType !== 'remote' && !rawJob.locations.some((l) => /remote/i.test(l))) {
       continue;
     }
-    if (locationsFilter.length > 0) {
-      const locHay = `${job.locations.join(' ')} ${job.workplaceType}`.toLowerCase();
-      if (!locationsFilter.some((lf) => locHay.includes(lf))) continue;
+    if (geoLocationsFilter.length > 0 && !matchesGeoLocationsFilter(rawJob.locations, geoLocationsFilter)) {
+      continue;
     }
-    if (minBase !== undefined && job.pay) {
-      // P11: Never treat `total` / `ote` target cash as meeting `minBase` unless its floor meets `minBase` and basis === 'base'
-      if (job.pay.basis !== 'base') continue;
-      const ceiling = job.pay.max ?? job.pay.min ?? 0;
-      if (ceiling < minBase) continue;
+
+    let payUnknown = false;
+    if (minBase !== undefined) {
+      if (!rawJob.pay) {
+        if (strictPay) continue;
+        payUnknown = true;
+      } else {
+        // P11: Never treat `total` / `ote` target cash as meeting `minBase` unless basis === 'base'
+        if (rawJob.pay.basis !== 'base') continue;
+        const comparedPay =
+          minBaseMode === 'ceiling'
+            ? (rawJob.pay.max ?? rawJob.pay.min ?? 0)
+            : (rawJob.pay.min ?? rawJob.pay.max ?? 0);
+        if (comparedPay < minBase) continue;
+      }
     }
-    if (maxAgeCutoffMs !== null && job.postedAt) {
-      const parsedTs = Date.parse(job.postedAt);
+
+    if (maxAgeCutoffMs !== null && rawJob.postedAt) {
+      const parsedTs = Date.parse(rawJob.postedAt);
       if (Number.isFinite(parsedTs) && parsedTs < maxAgeCutoffMs) continue;
     }
 
     seenUrls.add(cleanUrlKey);
     seenKeys.add(dedupKey);
-    finalJobs.push(job);
-    if (finalJobs.length >= limit) break;
+    matchedJobs.push({
+      ...rawJob,
+      matchedOn,
+      ...(payUnknown ? { payUnknown: true } : {}),
+    });
   }
 
-  if (candidateUrls.size === 0 && collected.length === 0) {
+  // Rank exact phrase matches ahead of all-tokens matches (and verified base pay ahead of unknown pay when `minBase` is set)
+  matchedJobs.sort((a, b) => {
+    const rankMatch = (m?: string) => (m === 'phrase' ? 0 : m === 'all_tokens' ? 1 : 2);
+    const dm = rankMatch(a.matchedOn) - rankMatch(b.matchedOn);
+    if (dm !== 0) return dm;
+    if (minBase !== undefined) {
+      const dp = (a.payUnknown ? 1 : 0) - (b.payUnknown ? 1 : 0);
+      if (dp !== 0) return dp;
+    }
+    return 0;
+  });
+
+  const finalJobs = matchedJobs.slice(0, limit);
+  const payUnknownCount = minBase !== undefined ? finalJobs.filter((j) => j.payUnknown === true).length : undefined;
+
+  if (candidateUrls.size === 0 && collected.length === 0 && domainsInput.length === 0) {
     notes.push('No ATS search results returned; ensure SERPER_API_KEY or SEARXNG_URL is configured on the Hub.');
   }
 
@@ -3709,6 +4153,8 @@ export async function executeJobsCall(params: {
       query,
       ...(companyFilter ? { company: companyFilter } : {}),
       ...(domainsInput.length > 0 ? { domains: domainsInput, discoveredBoards } : {}),
+      ...(minBase !== undefined ? { minBaseMode, strictPay, payUnknownCount } : {}),
+      sourcesUsed: [...sourcesUsed],
       count: finalJobs.length,
       candidatesChecked: candidateUrls.size,
       jobs: finalJobs,

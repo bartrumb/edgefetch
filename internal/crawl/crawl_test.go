@@ -920,10 +920,14 @@ func TestAgenticWebMarkdownForAgentsContentSignalsHTTP402AndLogRedaction(t *test
 		t.Fatalf("G3: expected HTTP 402 to stop remaining host batch requests, got: %+v", res[5])
 	}
 
-	// M11: Verify RedactEmbeddedURLs and structured crawl logs strip query strings, fragments, and user:pass@.
+	// M11: Verify RedactEmbeddedURLs and structured crawl logs strip query strings, fragments, and user:pass@ (including malformed URLs with < > brackets).
 	scrubbed := RedactEmbeddedURLs(`Get "https://alice:s3cr3t@host.example.com/p?api_key=TOP_SECRET_999#frag": timeout`)
 	if scrubbed != `Get "https://host.example.com/p": timeout` {
 		t.Fatalf("M11: RedactEmbeddedURLs = %q", scrubbed)
+	}
+	malformedScrubbed := RedactEmbeddedURLs(`parse "https://al<ic>e:s3[cr]3t@host.example.com/p?tok=SECRET": invalid character`)
+	if strings.Contains(malformedScrubbed, "s3[cr]3t") || strings.Contains(malformedScrubbed, "SECRET") || !strings.Contains(malformedScrubbed, "https://host.example.com/p") {
+		t.Fatalf("expected malformed URL credentials scrubbed, got %q", malformedScrubbed)
 	}
 	if strings.Contains(logBuf.String(), "LOG_SECRET_123") || strings.Contains(logBuf.String(), "PAY_SECRET_456") || strings.Contains(res[5].Problem, "PAY_SECRET_456") {
 		t.Fatalf("M11: query secret leaked into logs or host-stop problem: logs=%s problem=%q", logBuf.String(), res[5].Problem)
@@ -989,6 +993,35 @@ func TestRobotsRFC9309RedirectLimitCacheControlAnd1MiBCap(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte("<html>should be blocked</html>"))
+
+		case "cut-1mib.test":
+			if r.URL.Path == "/robots.txt" {
+				// Construct a >1 MiB robots.txt where byte 1,048,576 cuts "Disallow: /public-internal-only" mid-token as "Disallow: /pub".
+				header := "User-agent: *\nDisallow: /admin\n"
+				partialPrefix := "Disallow: /pub"
+				padNeeded := politeness.RobotsMaxBytes - len(header) - len(partialPrefix)
+				padLine := "# " + strings.Repeat("x", 61) + "\n" // 64 bytes per comment line
+				var sb strings.Builder
+				sb.Grow(politeness.RobotsMaxBytes + 64)
+				sb.WriteString(header)
+				for sb.Len()+len(padLine) <= len(header)+padNeeded {
+					sb.WriteString(padLine)
+				}
+				if rem := (politeness.RobotsMaxBytes - len(partialPrefix)) - sb.Len(); rem > 0 {
+					if rem == 1 {
+						sb.WriteByte('\n')
+					} else {
+						sb.WriteByte('#')
+						sb.WriteString(strings.Repeat("y", rem-2))
+						sb.WriteByte('\n')
+					}
+				}
+				sb.WriteString("Disallow: /public-internal-only\n")
+				_, _ = w.Write([]byte(sb.String()))
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>public ok</html>"))
 		}
 	}))
 	c.allow = func(u *url.URL) error {
@@ -1005,6 +1038,8 @@ func TestRobotsRFC9309RedirectLimitCacheControlAnd1MiBCap(t *testing.T) {
 		{ID: "five", URL: "http://five-redir.test/locked", Kind: classify.KindPage},
 		{ID: "ssrf6", URL: "http://six-redir-ssrf.test/page", Kind: classify.KindPage},
 		{ID: "pad", URL: "http://pad-540k.test/after-540k", Kind: classify.KindPage},
+		{ID: "cut-pub", URL: "http://cut-1mib.test/public/docs", Kind: classify.KindPage},
+		{ID: "cut-adm", URL: "http://cut-1mib.test/admin/panel", Kind: classify.KindPage},
 	}, Options{PauseMs: 1})
 
 	if out[0].Outcome != classify.OutcomeOK || sixRedirHops.Load() != 6 {
@@ -1024,6 +1059,12 @@ func TestRobotsRFC9309RedirectLimitCacheControlAnd1MiBCap(t *testing.T) {
 	}
 	if exp := c.hostStateFor("pad-540k.test").CachedRobots(fixedNow).ExpiresAt; !exp.Equal(fixedNow.Add(60 * time.Second)) {
 		t.Fatalf("expected Cache-Control max-age=5 clamped to 60s floor, got %v", exp.Sub(fixedNow))
+	}
+	if out[4].Outcome != classify.OutcomeOK {
+		t.Fatalf("truncated partial line at 1 MiB boundary became bogus Disallow:/pub prefix rule: %+v", out[4])
+	}
+	if out[5].Outcome != classify.OutcomeSkip {
+		t.Fatalf("expected intact earlier Disallow: /admin rule to remain enforced, got %+v", out[5])
 	}
 }
 

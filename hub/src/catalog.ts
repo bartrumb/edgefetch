@@ -17,6 +17,7 @@ import {
   type CatalogVariantRecord,
 } from './extractors/registry';
 import { buildBlockedInfo, type BlockedSuggestion } from './jobs';
+import { isSafePublicHostname } from './overflow';
 import type { OptionalStorageBindings } from './storage';
 
 export type CatalogRunStatus = 'running' | 'cooling_down' | 'complete' | 'partial' | 'challenged';
@@ -110,13 +111,16 @@ export interface NormalizedHubPageResponse {
   retryAfterMs?: number;
 }
 
-export type CatalogHubFetchFn = (args: {
+export interface CatalogHubFetchParams {
   url: string;
   kind?: 'json' | 'text';
   accept?: string;
+  maxBytes?: number;
   target?: unknown;
   site?: unknown;
-}) => Promise<unknown>;
+}
+
+export type CatalogHubFetchFn = (args: CatalogHubFetchParams) => Promise<unknown>;
 
 interface D1PreparedStatementLike {
   bind(...values: unknown[]): D1PreparedStatementLike;
@@ -432,18 +436,23 @@ export function discoverUcpEndpointFromRobots(originStr: string, robotsText: str
   }
 }
 
-function isSafeHttpsStoreUrl(rawUrl: string): URL | null {
+export function isSafeHttpsStoreUrl(urlStr: string, selfHost?: string): URL | null {
   try {
-    const u = new URL(rawUrl.trim());
+    const trimmed = urlStr.trim();
+    if (!trimmed) return null;
+    const u = new URL(trimmed);
     if (u.protocol !== 'https:' || u.username || u.password) return null;
-    const h = u.hostname.toLowerCase();
+    if (u.port !== '' && u.port !== '443') return null;
+    const host = u.hostname.toLowerCase();
     if (
-      !h ||
-      h === 'localhost' ||
-      h.endsWith('.local') ||
-      h.endsWith('.internal') ||
-      /^\d+\.\d+\.\d+\.\d+$/.test(h) ||
-      h.includes(':')
+      !host ||
+      host.endsWith('.') ||
+      !host.includes('.') ||
+      host === 'localhost' ||
+      host.endsWith('.localhost') ||
+      host.endsWith('.local') ||
+      host.endsWith('.internal') ||
+      !isSafePublicHostname(host, selfHost)
     ) {
       return null;
     }
@@ -451,6 +460,18 @@ function isSafeHttpsStoreUrl(rawUrl: string): URL | null {
   } catch {
     return null;
   }
+}
+
+function stripLeadingWww(host: string): string {
+  return host.startsWith('www.') ? host.slice(4) : host;
+}
+
+function isAllowedStoreRedirectUrl(finalUrlStr: string, requestedOriginUrl: URL, selfHost?: string): boolean {
+  const parsedFinal = isSafeHttpsStoreUrl(finalUrlStr, selfHost);
+  if (!parsedFinal) return false;
+  const reqHost = requestedOriginUrl.hostname.toLowerCase();
+  const finHost = parsedFinal.hostname.toLowerCase();
+  return finHost === reqHost || stripLeadingWww(finHost) === stripLeadingWww(reqHost);
 }
 
 function decodeBase64Utf8(b64: string): string {
@@ -779,6 +800,7 @@ export async function executeCatalogCall(params: {
   payload: CatalogCallPayload;
   env?: OptionalStorageBindings & Record<string, unknown>;
   executeHubFetch: CatalogHubFetchFn;
+  selfHost?: string;
   ctx?: { waitUntil?: (promise: Promise<unknown>) => void };
   sleepFn?: (ms: number) => Promise<void>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -822,7 +844,7 @@ export async function executeCatalogCall(params: {
   }
 
   const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
-  const parsedUrl = isSafeHttpsStoreUrl(rawUrl);
+  const parsedUrl = isSafeHttpsStoreUrl(rawUrl, params.selfHost);
   if (!parsedUrl) {
     return {
       status: 400,
@@ -938,6 +960,7 @@ export async function executeCatalogCall(params: {
           url: currentUrl,
           kind: 'json',
           accept: 'application/json',
+          maxBytes: 16_777_216,
           ...(payload.target !== undefined ? { target: payload.target } : {}),
           ...(payload.site !== undefined ? { site: payload.site } : {}),
         }).catch((err: unknown) => ({
@@ -951,6 +974,14 @@ export async function executeCatalogCall(params: {
         pageResp = normalizeHubPageResponse(rawFetchOut);
         if (!pageResp) {
           stopReason = strikes > 0 ? 'rate_limited' : 'empty_response';
+          break;
+        }
+
+        // Reject cross-origin redirects to an unrelated host on `/products.json` or `/wp-json/wc/store/v1/products`
+        // (allow only the same host or `www.`-equivalent of the requested store origin).
+        if (pageResp.finalUrl && !isAllowedStoreRedirectUrl(pageResp.finalUrl, originUrl, params.selfHost)) {
+          stopReason = 'cross_origin_redirect';
+          pageResp = null;
           break;
         }
 

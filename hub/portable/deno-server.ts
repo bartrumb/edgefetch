@@ -5,8 +5,14 @@
  * `/agent/ws` nodes, `BroadcastChannel('edgefetch-hub-bus')` for cross-region isolate dispatch notifications, and
  * optional `TursoHttpD1Database` + `S3ArtifactBucket` storage bindings.
  */
+import { mkdirSync } from 'node:fs';
+import net from 'node:net';
+import { dirname, join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import {
+  ACTIVITY_SQLITE_SCHEMA,
   createMemoryActivityStore,
+  createSqliteActivityStore,
   sanitizeDetails,
   type ActivityStore,
   type HubEventInput,
@@ -26,10 +32,13 @@ import { authorizeAgent } from '../src/auth.ts';
 import hubWorker from '../src/index.ts';
 import {
   createMemoryOAuthStore,
+  createSqliteOAuthStore,
+  OAUTH_SQLITE_SCHEMA,
   type OAuthClientRecord,
   type OAuthCodeRecord,
   type OAuthStore,
   type RotateRefreshParams,
+  type SqlStorageLike,
 } from '../src/oauth.ts';
 import { validatePublicHttpsTargetUrl } from '../src/overflow.ts';
 import { isPublicIpAddress } from './safe-fetch.ts';
@@ -152,8 +161,152 @@ function createDenoSafeFetch(selfHost?: string): typeof fetch {
   }) as typeof fetch;
 }
 
+function isTruthyDenoFlag(val: string | undefined): boolean {
+  const clean = (val ?? '').trim().toLowerCase();
+  return clean === '1' || clean === 'true' || clean === 'yes' || clean === 'on';
+}
+
+function stripDenoIpPortAndBrackets(addr: string | undefined): string {
+  let clean = (addr ?? '').trim();
+  if (!clean) return '';
+  if (clean.startsWith('[') && clean.includes(']')) {
+    clean = clean.slice(1, clean.indexOf(']'));
+  } else {
+    const v4Port = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(clean);
+    if (v4Port) clean = v4Port[1]!;
+  }
+  if (clean.toLowerCase().startsWith('::ffff:')) {
+    const v4 = clean.slice('::ffff:'.length);
+    if (net.isIP(v4) === 4) return v4;
+  }
+  const zoneIdx = clean.indexOf('%');
+  if (zoneIdx >= 0) clean = clean.slice(0, zoneIdx);
+  return clean;
+}
+
+function resolveDenoTrustedClientIp(
+  req: Request,
+  info: { remoteAddr?: { hostname?: string } } | undefined,
+  trustProxy: boolean,
+): string {
+  if (trustProxy) {
+    const rawXff = req.headers.get('x-forwarded-for') ?? '';
+    const parts = rawXff
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    const rightmost = parts.length > 0 ? parts[parts.length - 1] : undefined;
+    if (rightmost) {
+      const candidate = stripDenoIpPortAndBrackets(rightmost);
+      if (candidate && net.isIP(candidate) !== 0) {
+        return candidate;
+      }
+    }
+  }
+  const sockCandidate = stripDenoIpPortAndBrackets(info?.remoteAddr?.hostname);
+  return sockCandidate && net.isIP(sockCandidate) !== 0 ? sockCandidate : '127.0.0.1';
+}
+
+function sanitizeDenoInboundRequest(
+  req: Request,
+  info: { remoteAddr?: { hostname?: string } } | undefined,
+  trustProxy: boolean,
+  canonicalOrigin: string,
+  hasExplicitPublicOrigin: boolean,
+): Request {
+  const baseOriginUrl = new URL(canonicalOrigin);
+  let targetOrigin = baseOriginUrl.origin;
+
+  if (trustProxy && !hasExplicitPublicOrigin) {
+    let proto = baseOriginUrl.protocol.replace(/:$/, '');
+    let authority = baseOriginUrl.host;
+    const fwdProto = req.headers.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+    if (fwdProto === 'https' || fwdProto === 'http') proto = fwdProto;
+    const fwdHost = req.headers.get('x-forwarded-host')?.split(',')[0]?.trim();
+    if (fwdHost && /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?::\d{1,5})?$/.test(fwdHost) && !fwdHost.includes('..')) {
+      try {
+        const parsedFwd = new URL(`http://${fwdHost}/`);
+        const pNum = parsedFwd.port ? Number(parsedFwd.port) : 80;
+        if (parsedFwd.hostname && pNum >= 1 && pNum <= 65535 && !fwdHost.endsWith(':0')) {
+          authority = parsedFwd.host;
+        }
+      } catch {
+        // ignore invalid X-Forwarded-Host
+      }
+    }
+    targetOrigin = `${proto}://${authority}`;
+  }
+
+  // Extract raw path + query from `req.url` without re-decoding malformed `%` sequences before `hubWorker` handles them
+  const rawUrl = req.url;
+  const schemeIdx = rawUrl.indexOf('://');
+  const slashIdx = schemeIdx >= 0 ? rawUrl.indexOf('/', schemeIdx + 3) : -1;
+  const rawPathAndQuery = slashIdx >= 0 ? rawUrl.slice(slashIdx) : '/';
+  const cleanUrl = `${targetOrigin}${rawPathAndQuery}`;
+
+  const trustedIp = resolveDenoTrustedClientIp(req, info, trustProxy);
+  const headers = new Headers();
+  req.headers.forEach((val, key) => {
+    const lower = key.toLowerCase();
+    // `R3-M9`: Strip client-supplied `cf-connecting-ip` / `x-real-ip`, and strip `x-forwarded-*` unless `EDGEFETCH_TRUST_PROXY=1`.
+    if (lower === 'cf-connecting-ip' || lower === 'x-real-ip') return;
+    if (!trustProxy && lower.startsWith('x-forwarded-')) return;
+    headers.append(key, val);
+  });
+  headers.set('cf-connecting-ip', trustedIp);
+  headers.set('x-real-ip', trustedIp);
+
+  const method = req.method.toUpperCase();
+  const hasBody = method !== 'GET' && method !== 'HEAD' && req.body !== null;
+  return new Request(cleanUrl, {
+    method,
+    headers,
+    ...(hasBody ? { body: req.body, duplex: 'half' } : {}),
+  } as RequestInit);
+}
+
+const fallbackSharedOAuthStore: OAuthStore = createMemoryOAuthStore();
+const fallbackSharedActivityStore: ActivityStore = createMemoryActivityStore();
+
+function openDenoPersistentStores(dataDir: string): { oauth: OAuthStore; activity: ActivityStore } {
+  try {
+    const sqlitePath = join(resolve(dataDir), 'hub.sqlite');
+    mkdirSync(dirname(sqlitePath), { recursive: true });
+    const db = new DatabaseSync(sqlitePath);
+    db.exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; ${OAUTH_SQLITE_SCHEMA} ${ACTIVITY_SQLITE_SCHEMA}`);
+    const sqlLike: SqlStorageLike = {
+      exec: <T = Record<string, unknown>>(query: string, ...bindings: unknown[]) => {
+        const stmt = db.prepare(query);
+        const bound = bindings.map((v) => {
+          if (v === undefined || v === null) return null;
+          if (typeof v === 'boolean') return v ? 1 : 0;
+          if (typeof v === 'number' || typeof v === 'bigint' || typeof v === 'string' || v instanceof Uint8Array) return v;
+          return JSON.stringify(v);
+        });
+        const upper = query.trimStart().toUpperCase();
+        if (upper.startsWith('SELECT') || upper.startsWith('WITH') || /\bRETURNING\b/i.test(query)) {
+          const rows = stmt.all(...bound) as T[];
+          return { toArray: () => rows };
+        }
+        stmt.run(...bound);
+        return { toArray: () => [] as T[] };
+      },
+    };
+    return {
+      oauth: createSqliteOAuthStore(sqlLike),
+      activity: createSqliteActivityStore(sqlLike),
+    };
+  } catch {
+    return {
+      oauth: fallbackSharedOAuthStore,
+      activity: fallbackSharedActivityStore,
+    };
+  }
+}
+
 export function startDenoHub() {
   const envMap = Deno.env.toObject();
+  const trustProxy = isTruthyDenoFlag(envMap.EDGEFETCH_TRUST_PROXY);
   const sockets = new Set<DenoHubSocket>();
   const lastHelloLogBySite = new Map<string, number>();
   const engine = new AgentHubEngine({
@@ -166,8 +319,9 @@ export function startDenoHub() {
     affinities: createMemoryAffinityStore(),
     hostHealth: createMemoryHostHealthStore(),
   });
-  const oauth: OAuthStore = createMemoryOAuthStore();
-  const activity: ActivityStore = createMemoryActivityStore();
+  const persistentStores = openDenoPersistentStores(envMap.EDGEFETCH_DATA_DIR || './.edgefetch-deno-data');
+  const oauth: OAuthStore = persistentStores.oauth;
+  const activity: ActivityStore = persistentStores.activity;
   const bus = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('edgefetch-hub-bus') : null;
   void bus;
 
@@ -190,11 +344,15 @@ export function startDenoHub() {
         }).asR2Bucket()
       : undefined;
 
+  let explicitPublicOrigin: string | null = null;
   let selfHost: string | undefined;
-  if (envMap.EDGEFETCH_PUBLIC_ORIGIN) {
+  if (envMap.EDGEFETCH_PUBLIC_ORIGIN?.trim()) {
     try {
-      selfHost = new URL(envMap.EDGEFETCH_PUBLIC_ORIGIN).hostname;
+      const pubUrl = new URL(envMap.EDGEFETCH_PUBLIC_ORIGIN.trim());
+      explicitPublicOrigin = pubUrl.origin;
+      selfHost = pubUrl.hostname;
     } catch {
+      explicitPublicOrigin = null;
       selfHost = undefined;
     }
   }
@@ -266,14 +424,16 @@ export function startDenoHub() {
   } as unknown as ExecutionContext;
 
   const port = Number(envMap.PORT || 8787);
+  const canonicalOrigin = explicitPublicOrigin ?? `http://hub.local:${port}`;
   return Deno.serve({ port }, (req, info) => {
-    const url = new URL(req.url);
-    if (url.pathname === '/agent/ws' && req.headers.get('upgrade')?.toLowerCase() === 'websocket') {
-      const auth = authorizeAgent(req, workerEnv as never);
+    const cleanReq = sanitizeDenoInboundRequest(req, info, trustProxy, canonicalOrigin, explicitPublicOrigin !== null);
+    const url = new URL(cleanReq.url);
+    if (url.pathname === '/agent/ws' && cleanReq.headers.get('upgrade')?.toLowerCase() === 'websocket') {
+      const auth = authorizeAgent(cleanReq, workerEnv as never);
       if (!auth.ok) {
         return Response.json({ error: 'unauthorized' }, { status: 401 });
       }
-      const offeredProtocols = (req.headers.get('sec-websocket-protocol') ?? '')
+      const offeredProtocols = (cleanReq.headers.get('sec-websocket-protocol') ?? '')
         .split(',')
         .map((p) => p.trim())
         .filter(Boolean);
@@ -282,13 +442,14 @@ export function startDenoHub() {
         req,
         chosenSubprotocol ? { protocol: chosenSubprotocol } : undefined,
       );
+      const pubIp = resolveDenoTrustedClientIp(req, info, trustProxy);
       const hubSock = new DenoHubSocket(socket, [`site:${auth.siteId}`]);
       socket.onopen = () => {
         sockets.add(hubSock);
-        const att = engine.registerAgent(hubSock, auth.siteId, req.headers.get('x-agent-arch')?.slice(0, 32) || null, {
-          version: req.headers.get('x-agent-version')?.slice(0, 64) || null,
-          publicIp: info.remoteAddr?.hostname || null,
-          capabilities: req.headers.get('x-agent-capabilities') || null,
+        const att = engine.registerAgent(hubSock, auth.siteId, cleanReq.headers.get('x-agent-arch')?.slice(0, 32) || null, {
+          version: cleanReq.headers.get('x-agent-version')?.slice(0, 64) || null,
+          publicIp: pubIp,
+          capabilities: cleanReq.headers.get('x-agent-capabilities') || null,
         });
         hubSock.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
       };
@@ -325,13 +486,20 @@ export function startDenoHub() {
               const nowMs = Date.now();
               const lastLoggedAt = lastHelloLogBySite.get(verifiedSiteId) ?? 0;
               if (nowMs - lastLoggedAt >= 60_000) {
+                if (lastHelloLogBySite.size >= 512) lastHelloLogBySite.clear();
                 lastHelloLogBySite.set(verifiedSiteId, nowMs);
                 void activity.recordEvent({
                   level: 'info',
                   category: 'agent',
                   event: (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready',
                   summary: `Remote node "${verifiedSiteId}" ready (${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
-                  details: sanitizeDetails({ ...msg, siteId: verifiedSiteId }),
+                  details: sanitizeDetails({
+                    siteId: verifiedSiteId,
+                    version: typeof msg.version === 'string' ? msg.version.slice(0, 64) : null,
+                    arch: typeof msg.arch === 'string' ? msg.arch.slice(0, 32) : null,
+                    goVersion: typeof msg.goVersion === 'string' ? msg.goVersion.slice(0, 32) : null,
+                    capabilities: Array.isArray(msg.capabilities) ? msg.capabilities.slice(0, 16) : [],
+                  }),
                 });
               }
             }
@@ -346,7 +514,7 @@ export function startDenoHub() {
       };
       return response;
     }
-    return (hubWorker as { fetch(r: Request, e: unknown, c?: ExecutionContext): Promise<Response> }).fetch(req, workerEnv, ctx);
+    return (hubWorker as { fetch(r: Request, e: unknown, c?: ExecutionContext): Promise<Response> }).fetch(cleanReq, workerEnv, ctx);
   });
 }
 

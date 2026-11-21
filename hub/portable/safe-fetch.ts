@@ -10,7 +10,6 @@ import dns from 'node:dns';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
-import { Readable } from 'node:stream';
 
 const IPV4_BLOCKLIST = (() => {
   const bl = new net.BlockList();
@@ -22,8 +21,11 @@ const IPV4_BLOCKLIST = (() => {
   bl.addSubnet('172.16.0.0', 12, 'ipv4');
   bl.addSubnet('192.0.0.0', 24, 'ipv4');
   bl.addSubnet('192.0.2.0', 24, 'ipv4');
+  bl.addSubnet('192.31.196.0', 24, 'ipv4'); // RFC 7535 AS112-v4
+  bl.addSubnet('192.52.193.0', 24, 'ipv4'); // RFC 7450 AMT
   bl.addSubnet('192.88.99.0', 24, 'ipv4'); // 6to4 relay
   bl.addSubnet('192.168.0.0', 16, 'ipv4');
+  bl.addSubnet('192.175.48.0', 24, 'ipv4'); // RFC 7534 Direct Delegation AS112
   bl.addSubnet('198.18.0.0', 15, 'ipv4'); // Benchmarking
   bl.addSubnet('198.51.100.0', 24, 'ipv4');
   bl.addSubnet('203.0.113.0', 24, 'ipv4');
@@ -40,11 +42,11 @@ const IPV6_BLOCKLIST = (() => {
   bl.addSubnet('fe80::', 10, 'ipv6'); // Link-local
   bl.addSubnet('fec0::', 10, 'ipv6'); // Site-local
   bl.addSubnet('ff00::', 8, 'ipv6'); // Multicast
+  bl.addSubnet('2001::', 23, 'ipv6'); // RFC 2928 / IANA IETF Protocol Assignments (Teredo, Benchmarking, AMT, AS112, ORCHID, Drone ID)
   bl.addSubnet('2001:db8::', 32, 'ipv6'); // Documentation
-  bl.addSubnet('2001:10::', 28, 'ipv6'); // ORCHID
-  bl.addSubnet('2001:20::', 28, 'ipv6'); // ORCHIDv2
-  bl.addSubnet('2001::', 32, 'ipv6'); // Teredo
   bl.addSubnet('2002::', 16, 'ipv6'); // 6to4
+  bl.addSubnet('2620:4f:8000::', 48, 'ipv6'); // Direct Delegation AS112-v6
+  bl.addSubnet('3ffe::', 16, 'ipv6'); // 6bone deprecated
   bl.addSubnet('3fff::', 20, 'ipv6'); // Documentation
   bl.addSubnet('5f00::', 16, 'ipv6'); // SRv6
   bl.addSubnet('64:ff9b::', 96, 'ipv6'); // NAT64 well-known
@@ -86,7 +88,9 @@ function expandIpv6ToWords(addr: string): number[] | null {
  * matching Go `politeness.IsPublicAddr` (`internal/politeness/ssrf.go`).
  */
 export function isPublicIpAddress(rawIp: string): boolean {
+  if (typeof rawIp !== 'string') return false;
   const clean = rawIp.trim().replace(/^\[|\]$/g, '');
+  if (!clean || clean.includes('%')) return false;
   const ver = net.isIP(clean);
   if (ver === 4) {
     return !IPV4_BLOCKLIST.check(clean, 'ipv4');
@@ -115,7 +119,10 @@ export function createPublicOnlyLookup(resolver: LookupResolverFn = dns.lookup):
   return (hostname, options, callback) => {
     const optsObj = typeof options === 'object' && options !== null ? options : {};
     const wantAll = Boolean((optsObj as { all?: boolean }).all);
+    let settled = false;
     const failLookup = (err: Error, family = 4) => {
+      if (settled) return;
+      settled = true;
       if (wantAll) {
         (callback as unknown as (e: Error | null, addrs: dns.LookupAddress[]) => void)(err, []);
       } else {
@@ -123,6 +130,7 @@ export function createPublicOnlyLookup(resolver: LookupResolverFn = dns.lookup):
       }
     };
     const handleResolved = (err: NodeJS.ErrnoException | null, addresses: dns.LookupAddress[]) => {
+      if (settled) return;
       if (err) {
         failLookup(err);
         return;
@@ -131,32 +139,35 @@ export function createPublicOnlyLookup(resolver: LookupResolverFn = dns.lookup):
         failLookup(new Error(`SSRF blocked: DNS lookup returned no addresses for ${hostname}`));
         return;
       }
-      // Every resolved A/AAAA record must be public unicast (defeating round-robin `[public, 127.0.0.1]` DNS rebinding!).
+      // Every resolved A/AAAA record must be a valid public unicast IP string (defeating round-robin `[public, 127.0.0.1]` DNS rebinding!).
       for (const entry of addresses) {
-        if (!isPublicIpAddress(entry.address)) {
+        const addrStr = entry && typeof entry === 'object' && typeof entry.address === 'string' ? entry.address.trim() : '';
+        const fam = entry && typeof entry === 'object' && (entry.family === 4 || entry.family === 6) ? entry.family : 4;
+        if (!addrStr || !isPublicIpAddress(addrStr)) {
           failLookup(
-            new Error(`SSRF blocked: refusing connection to non-public IP ${entry.address} resolved for ${hostname}`),
-            entry.family,
+            new Error(`SSRF blocked: refusing connection to non-public IP ${addrStr || String(entry)} resolved for ${hostname}`),
+            fam,
           );
           return;
         }
       }
+      settled = true;
       if (wantAll) {
-        (callback as unknown as (e: Error | null, addrs: dns.LookupAddress[]) => void)(null, addresses);
+        const normalized = addresses.map((e) => ({ address: e.address.trim(), family: e.family }));
+        (callback as unknown as (e: Error | null, addrs: dns.LookupAddress[]) => void)(null, normalized);
       } else {
-        callback(null, addresses[0]!.address, addresses[0]!.family);
+        callback(null, addresses[0]!.address.trim(), addresses[0]!.family);
       }
     };
 
     try {
       if (resolver.length <= 2) {
-        (resolver as (h: string, o: dns.LookupAllOptions) => Promise<dns.LookupAddress[]>)(hostname, {
+        Promise.resolve((resolver as (h: string, o: dns.LookupAllOptions) => Promise<dns.LookupAddress[]>)(hostname, {
           all: true,
           verbatim: true,
-        }).then(
-          (addrs) => handleResolved(null, addrs),
-          (err) => failLookup(err instanceof Error ? err : new Error(String(err))),
-        );
+        }))
+          .then((addrs) => handleResolved(null, addrs))
+          .catch((err) => failLookup(err instanceof Error ? err : new Error(String(err))));
       } else {
         (
           resolver as (
@@ -164,7 +175,13 @@ export function createPublicOnlyLookup(resolver: LookupResolverFn = dns.lookup):
             o: dns.LookupAllOptions,
             cb: (e: NodeJS.ErrnoException | null, a: dns.LookupAddress[]) => void,
           ) => void
-        )(hostname, { all: true, verbatim: true }, handleResolved);
+        )(hostname, { all: true, verbatim: true }, (err, addrs) => {
+          try {
+            handleResolved(err, addrs);
+          } catch (cbErr) {
+            failLookup(cbErr instanceof Error ? cbErr : new Error(String(cbErr)));
+          }
+        });
       }
     } catch (err) {
       failLookup(err instanceof Error ? err : new Error(String(err)));
@@ -230,58 +247,221 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
 
       const mod = isHttps ? https : http;
       const agent = isExplicitLoopback && isHttp ? loopbackHttpAgent : isHttps ? httpsAgent : httpAgent;
-      const req = mod.request(
-        targetUrl,
-        {
-          method: (init?.method ?? 'GET').toUpperCase(),
-          headers: hdrObj,
-          agent,
-          ...(isExplicitLoopback ? {} : { lookup: safeLookup }),
-        },
-        (res) => {
-          const respHeaders = new Headers();
-          for (const [k, v] of Object.entries(res.headers)) {
-            if (Array.isArray(v)) {
-              for (const item of v) respHeaders.append(k, item);
-            } else if (typeof v === 'string') {
-              respHeaders.set(k, v);
-            }
-          }
-          const status = res.statusCode ?? 502;
-          const nullBodyStatus = status === 101 || status === 204 || status === 205 || status === 304;
-          if (nullBodyStatus || (init?.method ?? 'GET').toUpperCase() === 'HEAD') {
-            res.resume();
-            resolve(new Response(null, { status, statusText: res.statusMessage ?? '', headers: respHeaders }));
-            return;
-          }
-          const webStream = Readable.toWeb(res) as unknown as ReadableStream<Uint8Array>;
-          const response = new Response(webStream, {
-            status,
-            statusText: res.statusMessage ?? '',
-            headers: respHeaders,
-          });
-          Object.defineProperty(response, 'url', { value: targetUrl.toString(), configurable: true });
-          resolve(response);
-        },
-      );
-      req.on('error', (err) => {
+      const reqMethod = (init?.method ?? 'GET').toUpperCase();
+
+      let settled = false;
+      let activeRes: http.IncomingMessage | null = null;
+      let onAbort: (() => void) | null = null;
+
+      const detachAbort = () => {
+        if (onAbort && init?.signal) {
+          init.signal.removeEventListener('abort', onAbort);
+          onAbort = null;
+        }
+      };
+
+      const finishOk = (response: Response) => {
+        if (settled) return;
+        settled = true;
+        resolve(response);
+      };
+
+      const finishErr = (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        detachAbort();
         reject(err);
+      };
+
+      let req: http.ClientRequest;
+      try {
+        req = mod.request(
+          targetUrl,
+          {
+            method: reqMethod,
+            headers: hdrObj,
+            agent,
+            ...(isExplicitLoopback ? {} : { lookup: safeLookup }),
+          },
+          (res) => {
+            activeRes = res;
+            const status = res.statusCode ?? 502;
+            // `R3-M2`: Never permit `101 Switching Protocols` upgrades on outbound HTTP fetches!
+            if (status === 101) {
+              res.on('error', () => undefined);
+              res.socket?.destroy();
+              res.destroy();
+              finishErr(new Error('HTTP 101 Switching Protocols is not allowed'));
+              return;
+            }
+
+            const respHeaders = new Headers();
+            for (const [k, v] of Object.entries(res.headers)) {
+              if (Array.isArray(v)) {
+                for (const item of v) respHeaders.append(k, item);
+              } else if (typeof v === 'string') {
+                respHeaders.set(k, v);
+              }
+            }
+
+            const nullBodyStatus = status === 204 || status === 205 || status === 304;
+            if (nullBodyStatus || reqMethod === 'HEAD') {
+              res.on('error', () => undefined);
+              detachAbort();
+              const hasBogusBodyFraming =
+                (status === 204 || status === 205) &&
+                Boolean(res.headers['transfer-encoding'] || (res.headers['content-length'] && res.headers['content-length'] !== '0'));
+              if (hasBogusBodyFraming) {
+                res.destroy();
+              } else {
+                res.resume();
+              }
+              const response = new Response(null, { status, statusText: res.statusMessage ?? '', headers: respHeaders });
+              Object.defineProperty(response, 'url', { value: targetUrl.toString(), configurable: true });
+              finishOk(response);
+              return;
+            }
+
+            // Wrap `res` in an error-safe Web `ReadableStream` so unread/aborted responses NEVER emit uncaught `'error'` events (`R3-M2`)!
+            let streamClosed = false;
+            let streamCtrl: ReadableStreamDefaultController<Uint8Array> | null = null;
+            let pendingStreamErr: unknown = null;
+
+            const cleanupResListeners = () => {
+              detachAbort();
+              res.removeListener('data', onResData);
+              res.removeListener('end', onResEnd);
+              res.removeListener('close', onResClose);
+            };
+
+            const failStream = (err: unknown) => {
+              if (streamClosed) return;
+              streamClosed = true;
+              cleanupResListeners();
+              if (streamCtrl) {
+                try {
+                  streamCtrl.error(err);
+                } catch {
+                  // ignore
+                }
+              } else {
+                pendingStreamErr = err;
+              }
+            };
+
+            const onResData = (chunk: Buffer | Uint8Array) => {
+              if (streamClosed || !streamCtrl) return;
+              try {
+                streamCtrl.enqueue(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
+                if ((streamCtrl.desiredSize ?? 1) <= 0) {
+                  res.pause();
+                }
+              } catch {
+                streamClosed = true;
+                cleanupResListeners();
+              }
+            };
+
+            const onResEnd = () => {
+              if (streamClosed) return;
+              streamClosed = true;
+              cleanupResListeners();
+              try {
+                streamCtrl?.close();
+              } catch {
+                // ignore
+              }
+            };
+
+            const onResClose = () => {
+              if (streamClosed) return;
+              if (!res.complete) {
+                failStream(new Error('Premature close: incomplete HTTP response body'));
+                return;
+              }
+              onResEnd();
+            };
+
+            res.on('error', (err) => {
+              failStream(err);
+            });
+            res.pause();
+
+            const webStream = new ReadableStream<Uint8Array>({
+              start(c) {
+                streamCtrl = c;
+                if (pendingStreamErr !== null) {
+                  c.error(pendingStreamErr);
+                  return;
+                }
+                res.on('data', onResData);
+                res.once('end', onResEnd);
+                res.once('close', onResClose);
+              },
+              pull() {
+                if (!streamClosed) res.resume();
+              },
+              cancel() {
+                if (streamClosed) return;
+                streamClosed = true;
+                cleanupResListeners();
+                res.destroy();
+              },
+            });
+
+            const response = new Response(webStream, {
+              status,
+              statusText: res.statusMessage ?? '',
+              headers: respHeaders,
+            });
+            Object.defineProperty(response, 'url', { value: targetUrl.toString(), configurable: true });
+            finishOk(response);
+          },
+        );
+      } catch (syncErr) {
+        finishErr(syncErr);
+        return;
+      }
+
+      req.on('upgrade', (_res, socket) => {
+        socket.on('error', () => undefined);
+        socket.destroy();
+        finishErr(new Error('HTTP 101 Switching Protocols is not allowed'));
+      });
+      req.on('connect', (_res, socket) => {
+        socket.on('error', () => undefined);
+        socket.destroy();
+        finishErr(new Error('HTTP CONNECT is not allowed'));
+      });
+      req.on('error', (err) => {
+        finishErr(err);
+      });
+      req.on('close', () => {
+        if (!settled) {
+          finishErr(new Error('Socket closed before HTTP response completed'));
+        }
       });
 
       if (init?.signal) {
         if (init.signal.aborted) {
           const reason = init.signal.reason ?? new DOMException('Aborted', 'AbortError');
-          req.destroy(reason instanceof Error ? reason : new Error(String(reason)));
-          reject(reason);
+          req.destroy();
+          finishErr(reason);
           return;
         }
-        const onAbort = () => {
+        onAbort = () => {
           const reason = init.signal?.reason ?? new DOMException('Aborted', 'AbortError');
-          req.destroy(reason instanceof Error ? reason : new Error(String(reason)));
-          reject(reason);
+          const errObj = reason instanceof Error ? reason : new Error(String(reason));
+          if (activeRes) {
+            activeRes.destroy(errObj);
+          }
+          req.destroy(errObj);
+          finishErr(reason);
         };
         init.signal.addEventListener('abort', onAbort, { once: true });
-        req.on('close', () => init.signal?.removeEventListener('abort', onAbort));
+        req.on('close', () => {
+          if (!activeRes) detachAbort();
+        });
       }
 
       if (bodyBytes && bodyBytes.byteLength > 0) {

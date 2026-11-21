@@ -156,9 +156,12 @@ func TestRobotsRFC9309EdgeCasesBOMPercentEncodingProductTokenAnd500KiB(t *testin
 		t.Fatal("expected wildcard Disallow: /secret to apply")
 	}
 
-	// 4. RFC 9309 §2.5 requires parsing at least 500 KiB of robots.txt.
-	if RobotsMaxBytes < 500*1024 {
-		t.Fatalf("A4 BUG: RobotsMaxBytes = %d, RFC 9309 requires >= 512000", RobotsMaxBytes)
+	// 4. RFC 9309 §2.5 requires parsing at least 500 KiB of robots.txt; EdgeFetch enforces 1 MiB + 60s distress TTL.
+	if RobotsMaxBytes != 1<<20 {
+		t.Fatalf("RobotsMaxBytes = %d, want %d (1 MiB)", RobotsMaxBytes, 1<<20)
+	}
+	if RobotsDistressTTL != 60*time.Second {
+		t.Fatalf("RobotsDistressTTL = %s, want 60s", RobotsDistressTTL)
 	}
 
 	// 5. G2 Cloudflare Content Signals: ai-input=no blocks wildcard, while specific `edgefetch` group overrides `*`!
@@ -180,6 +183,91 @@ func TestRobotsRFC9309EdgeCasesBOMPercentEncodingProductTokenAnd500KiB(t *testin
 	specAllowEntry := ParseRobotsTxt(cfSpecificAllow, "edgefetch", exp)
 	if specAllowEntry.DisallowAIInput || !specAllowEntry.Allowed("/docs") {
 		t.Fatalf("G2: expected specific edgefetch group to override wildcard Content-Signal, got %+v", specAllowEntry)
+	}
+}
+
+func TestRobotsRFC9309FullParityAndContentSignalInheritance(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+
+	// 1. Repeated UTF-8 BOMs, NEL/LS/PS line separators, NUL before colon, and trailing # comments.
+	weird := "\xef\xbb\xbf\xef\xbb\xbfUser-agent:\tedgefetch # inline comment\u0085" +
+		"Disallow\x00: /ignored-nul\u2028" +
+		"Disallow: relative-without-slash\u2029" +
+		"Disallow: *.bak$\n" +
+		"Content-Signal: search=yes, ai-input=\"NO\";foo=bar # ai-input=yes\n"
+	we := ParseRobotsTxt(weird, "edgefetch", exp)
+	if !we.DisallowAIInput || we.Allowed("/index.html") {
+		t.Fatalf("expected quoted parameterized ai-input=\"NO\";foo=bar to block, got %+v", we)
+	}
+	// Verify underlying rule parsing by clearing DisallowAIInput on a copy.
+	weRulesOnly := *we
+	weRulesOnly.DisallowAIInput = false
+	if !weRulesOnly.Allowed("/ignored-nul") || !weRulesOnly.Allowed("/relative-without-slash") {
+		t.Fatalf("expected NUL field and non-slash/non-star Disallow to be ignored: %+v", weRulesOnly.Rules)
+	}
+	if weRulesOnly.Allowed("/backup/db.bak") {
+		t.Fatalf("expected leading-* Disallow: *.bak$ to match /backup/db.bak: %+v", weRulesOnly.Rules)
+	}
+
+	// 2. Empty Disallow: adds no rule and MUST NOT override Disallow: / when multiple groups combine!
+	combined := "User-agent: *\nDisallow: /\n\nUser-agent: *\nDisallow:\n"
+	if ParseRobotsTxt(combined, "edgefetch", exp).Allowed("/secret") {
+		t.Fatal("RFC 9309 §2.2.1: empty Disallow: in second * group must not defeat Disallow: / in first * group")
+	}
+	emptyOnly := "User-agent: *\nDisallow:\n"
+	if !ParseRobotsTxt(emptyOnly, "edgefetch", exp).Allowed("/public") {
+		t.Fatal("empty Disallow: alone must allow all paths")
+	}
+
+	// 3. Consecutive User-agent lines separated by blank/comment lines form a single group.
+	multiUA := "User-agent: googlebot\n\n# comment between UAs\nUser-agent: edgefetch\nDisallow: /only-bots\n"
+	if ParseRobotsTxt(multiUA, "edgefetch", exp).Allowed("/only-bots/1") {
+		t.Fatal("expected consecutive User-agent lines separated by blank/comment lines to share one group")
+	}
+
+	// 4. Within ONE group, later Content-Signal overrides earlier (no->yes and yes->no).
+	singleOverrideAllow := "User-agent: *\nContent-Signal: ai-input=no\nContent-Signal: ai-input=yes\nAllow: /\n"
+	if ParseRobotsTxt(singleOverrideAllow, "edgefetch", exp).DisallowAIInput {
+		t.Fatal("within single group, later ai-input=yes must override earlier ai-input=no")
+	}
+	singleOverrideDeny := "User-agent: *\nContent-Signal: ai-input=yes\nContent-Signal: ai-input=no\nAllow: /\n"
+	if !ParseRobotsTxt(singleOverrideDeny, "edgefetch", exp).DisallowAIInput {
+		t.Fatal("within single group, later ai-input=no must override earlier ai-input=yes")
+	}
+
+	// 5. Across MULTIPLE combined groups of same specificity, ANY group resolving to ai-input=no blocks!
+	multiGroupDeny := "User-agent: edgefetch\nContent-Signal: ai-input=yes\nAllow: /\n\nUser-agent: edgefetch\nContent-Signal: ai-input=no\nDisallow: /admin\n"
+	if !ParseRobotsTxt(multiGroupDeny, "edgefetch", exp).DisallowAIInput {
+		t.Fatal("across combined groups of same specificity, any ai-input=no must disallow")
+	}
+
+	// 6. Specific group without Content-Signal inherits from * group, or pre-group file default!
+	inheritFromWild := "User-agent: *\nContent-Signal: ai-input=no\nDisallow: /all\n\nUser-agent: edgefetch\nDisallow: /sub\n"
+	if !ParseRobotsTxt(inheritFromWild, "edgefetch", exp).DisallowAIInput {
+		t.Fatal("specific edgefetch group without Content-Signal must inherit ai-input=no from * group")
+	}
+	inheritFromPreGroup := "Content-Signal: ai-input=no\n\nUser-agent: edgefetch\nAllow: /\n"
+	if !ParseRobotsTxt(inheritFromPreGroup, "edgefetch", exp).DisallowAIInput {
+		t.Fatal("specific edgefetch group without Content-Signal must inherit pre-group Content-Signal: ai-input=no")
+	}
+	preGroupOnly := "Content-Signal: ai-input=no\n"
+	if !ParseRobotsTxt(preGroupOnly, "edgefetch", exp).DisallowAIInput {
+		t.Fatal("top-level pre-group Content-Signal: ai-input=no without User-agent groups must disallow")
+	}
+
+	// 7. HostState 429 cooldown tracking (`NoteRateLimit` & `CoolingDownRetryAfterMs`).
+	now := time.Unix(1_750_000_000, 0)
+	hs := NewRegistry().Get("throttle.example.com", now)
+	if got := hs.CoolingDownRetryAfterMs(now); got != 0 {
+		t.Fatalf("initial CoolingDownRetryAfterMs = %d, want 0", got)
+	}
+	hs.NoteRateLimit(now, 8*time.Second)
+	if got := hs.CoolingDownRetryAfterMs(now.Add(3 * time.Second)); got != 5000 {
+		t.Fatalf("CoolingDownRetryAfterMs = %d, want 5000", got)
+	}
+	hs.RecordOutcome(now.Add(4*time.Second), time.Second, 0, 200, false, false)
+	if got := hs.CoolingDownRetryAfterMs(now.Add(4 * time.Second)); got != 0 {
+		t.Fatalf("expected HTTP 200 RecordOutcome to clear 429 cooldown, got %d", got)
 	}
 }
 

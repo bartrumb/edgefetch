@@ -26,7 +26,7 @@ import (
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
 // Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/v2/internal/agent.Version=...".
-var Version = "2.5.5"
+var Version = "2.6.0"
 
 const (
 	DefaultPingInterval          = 30 * time.Second
@@ -86,6 +86,15 @@ type controlMessage struct {
 	Call      crawl.FetchCall         `json:"call"`
 }
 
+func warmUpCrawlerBounded(ctx context.Context, crawler *crawl.Crawler) {
+	if crawler == nil || ctx.Err() != nil {
+		return
+	}
+	warmCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	_ = crawler.WarmUp(warmCtx)
+	cancel()
+}
+
 // RunAll maintains persistent outbound WebSocket sessions to every controller in `cfg.HubURLs` (falling back to
 // `cfg.HubURL`), sharing one `*crawl.Crawler` and `*politeness.Registry` across active-active controllers with zero
 // coordination overhead.
@@ -98,6 +107,7 @@ func RunAll(
 	log *slog.Logger,
 	rtOpts RuntimeOpts,
 ) error {
+	warmUpCrawlerBounded(ctx, crawler)
 	hubs := cfg.HubURLs
 	if len(hubs) == 0 && strings.TrimSpace(cfg.HubURL) != "" {
 		hubs = []string{cfg.HubURL}
@@ -146,6 +156,7 @@ func Run(
 	rtOpts RuntimeOpts,
 ) error {
 	rtOpts = rtOpts.withDefaults()
+	warmUpCrawlerBounded(ctx, crawler)
 	replyClient := &http.Client{
 		Transport: hubTransport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -203,13 +214,18 @@ func runSession(
 	lastError string,
 ) error {
 	caps := crawler.Capabilities()
-	conn, err := ws.Dial(ctx, cfg.HubURL+"/agent/ws", cfg.UserAgent, map[string]string{
+	bVer, bSandbox := crawler.BrowserInfo()
+	wsHeaders := map[string]string{
 		"Authorization":        "Bearer " + cfg.AgentToken,
 		"X-Agent-Site":         cfg.SiteID,
 		"X-Agent-Arch":         runtime.GOARCH,
 		"X-Agent-Version":      Version,
 		"X-Agent-Capabilities": strings.Join(caps, ","),
-	})
+	}
+	if bSandbox != "" {
+		wsHeaders["X-Agent-Browser-Sandbox"] = bSandbox
+	}
+	conn, err := ws.Dial(ctx, cfg.HubURL+"/agent/ws", cfg.UserAgent, wsHeaders)
 	if err != nil {
 		return err
 	}
@@ -220,7 +236,7 @@ func runSession(
 		slog.String("version", Version),
 		slog.String("capabilities", strings.Join(caps, ",")))
 
-	helloPayload, _ := json.Marshal(map[string]any{
+	helloMap := map[string]any{
 		"type":             "agent_hello",
 		"version":          Version,
 		"arch":             runtime.GOARCH,
@@ -228,7 +244,14 @@ func runSession(
 		"capabilities":     caps,
 		"reconnectAttempt": reconnectAttempt,
 		"lastError":        lastError,
-	})
+	}
+	if bVer != "" {
+		helloMap["browserVersion"] = bVer
+	}
+	if bSandbox != "" {
+		helloMap["browserSandbox"] = bSandbox
+	}
+	helloPayload, _ := json.Marshal(helloMap)
 	_ = conn.WriteText(string(helloPayload))
 	if rtOpts.OnConnected != nil {
 		rtOpts.OnConnected()
@@ -254,6 +277,20 @@ func runSession(
 				}
 			}
 		}
+	}()
+
+	dispatchCh := make(chan controlMessage, 8)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for msg := range dispatchCh {
+			handleDispatchWithOpts(ctx, cfg, crawler, allow, replyClient, log, rtOpts, msg)
+		}
+	}()
+	defer func() {
+		close(dispatchCh)
+		wg.Wait()
 	}()
 
 	for {
@@ -282,7 +319,11 @@ func runSession(
 				log.Warn("agent_missing_job_id")
 				continue
 			}
-			handleDispatchWithOpts(ctx, cfg, crawler, allow, replyClient, log, rtOpts, msg)
+			select {
+			case dispatchCh <- msg:
+			case <-sessionCtx.Done():
+				return nil
+			}
 		default:
 			log.Warn("agent_unknown_type", slog.String("type", msg.Type))
 		}
@@ -331,15 +372,20 @@ func handleDispatchWithOpts(
 	jobLog := crawl.CallLogger(baseLog, hdr).With(slog.String("job_id", msg.JobID))
 
 	call := msg.Call
-	call.Options.Concurrency = 1
+	if len(call.Requests) <= 1 {
+		call.Options.Concurrency = 1
+	} else if call.Options.Concurrency <= 0 || call.Options.Concurrency > crawl.MaxConcurrency {
+		call.Options.Concurrency = crawl.MaxConcurrency
+	}
 	if call.Options.PauseMs < cfg.PauseMs {
 		call.Options.PauseMs = cfg.PauseMs
 	}
 	if call.Options.PauseJitterMs < cfg.PauseJitterMs {
 		call.Options.PauseJitterMs = cfg.PauseJitterMs
 	}
-	if call.Options.GapMs < cfg.PauseMs {
-		call.Options.GapMs = cfg.PauseMs
+	minGap := minInt(cfg.PauseMs, 250)
+	if call.Options.GapMs < minGap {
+		call.Options.GapMs = minGap
 	}
 
 	var reply crawl.FetchReply
@@ -366,6 +412,7 @@ func handleDispatchWithOpts(
 			if maxContent <= 0 || maxContent > crawl.MaxMaxBytes {
 				maxContent = crawl.MaxMaxBytes
 			}
+			var uploadMu sync.Mutex
 			sink = func(_ int, res crawl.Result) crawl.Result {
 				if res.Body == "" {
 					return res
@@ -385,11 +432,13 @@ func handleDispatchWithOpts(
 					res.ArtifactError = fmt.Sprintf("body (%d bytes) exceeds artifact maxContentBytes (%d)", len(rawBytes), maxContent)
 					return res
 				}
+				uploadMu.Lock()
 				upStart := time.Now()
 				artCtx, cancelArt := context.WithTimeout(context.Background(), rtOpts.UploadTimeout)
 				artRef, upErr := uploadArtifact(artCtx, replyClient, cfg, msg.JobID, msg.JobNonce, res.ID, retention, rawBytes)
 				cancelArt()
 				res.Timing.ArtifactUploadMs = time.Since(upStart).Milliseconds()
+				uploadMu.Unlock()
 				if upErr != nil {
 					res.BodyOmitted = true
 					res.ArtifactError = upErr.Error()

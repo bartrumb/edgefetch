@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { defineAdapter, extractXmlTagTextLinear, findAllElementInnersLinear } from '../../types';
 import { formatGfmTable, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -22,18 +22,14 @@ export default defineAdapter({
       accept: 'application/xml, text/xml',
       formatTwin: (rawBody) => {
         if (!/<jobs\b|<job\b/i.test(rawBody)) return null;
-        const jobBlocks = [...rawBody.matchAll(/<job\b[^>]*>([\s\S]*?)<\/job>/gi)];
-        const extractTag = (xml: string, tag: string): string => {
-          const tm = new RegExp(`<${tag}\\b[^>]*>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([\\s\\S]*?))<\\/${tag}>`, 'i').exec(xml);
-          return stripTagsInline(tm?.[1] ?? tm?.[2] ?? '');
-        };
+        const jobBlocks = findAllElementInnersLinear(rawBody, 'job', undefined, 500);
+        const extractTag = (xml: string, tag: string): string => stripTagsInline(extractXmlTagTextLinear(xml, tag));
 
         const title = `${org} — JazzHR Job Board (${jobBlocks.length} open roles)`;
         if (jobBlocks.length === 0) return { title, markdown: `# ${title}\n\nNo open positions currently listed.` };
         const links: string[] = [];
         const rows: Array<Array<string>> = [];
-        for (const jb of jobBlocks.slice(0, 100)) {
-          const b = jb[1]!;
+        for (const b of jobBlocks.slice(0, 100)) {
           const jTitle = extractTag(b, 'title');
           if (!jTitle) continue;
           const jUrl = extractTag(b, 'url');

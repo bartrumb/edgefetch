@@ -39,6 +39,9 @@ func TestChromiumLaunchFlagsAndSanitizedChildEnv(t *testing.T) {
 	if strings.Contains(joined, "IsolateOrigins") || strings.Contains(joined, "site-per-process") {
 		t.Fatalf("H9: Chromium site isolation must not be disabled: %s", joined)
 	}
+	if strings.Contains(joined, "--no-sandbox") || strings.Contains(joined, "--disable-setuid-sandbox") || strings.Contains(joined, "--disable-gpu-sandbox") {
+		t.Fatalf("default buildChromiumLaunchArgs must keep native OS process sandbox enabled: %s", joined)
+	}
 
 	t.Setenv("EDGEFETCH_AGENT_TOKEN", "super-secret-agent-token-0123456789")
 	t.Setenv("OPENAI_API_KEY", "sk-live-secret-should-never-leak")
@@ -47,6 +50,36 @@ func TestChromiumLaunchFlagsAndSanitizedChildEnv(t *testing.T) {
 		if strings.HasPrefix(kv, "EDGEFETCH_") || strings.HasPrefix(kv, "OPENAI_") || strings.Contains(kv, "super-secret-agent-token") {
 			t.Fatalf("H9: secret env leaked into Chromium child environment: %q", kv)
 		}
+	}
+}
+
+func TestBuildChromiumLaunchArgsWithSandboxToggleAndPolicy(t *testing.T) {
+	sandboxed := strings.Join(buildChromiumLaunchArgsWithSandbox("127.0.0.1:43210", "/tmp/ef-profile", true), " ")
+	if strings.Contains(sandboxed, "--no-sandbox") || strings.Contains(sandboxed, "--disable-setuid-sandbox") || strings.Contains(sandboxed, "--disable-gpu-sandbox") {
+		t.Fatalf("useSandbox=true must omit --no-sandbox flags, got: %s", sandboxed)
+	}
+
+	fallback := strings.Join(buildChromiumLaunchArgsWithSandbox("127.0.0.1:43210", "/tmp/ef-profile", false), " ")
+	if !strings.Contains(fallback, "--no-sandbox") || !strings.Contains(fallback, "--disable-setuid-sandbox") || !strings.Contains(fallback, "--disable-gpu-sandbox") {
+		t.Fatalf("useSandbox=false must include --no-sandbox fallback flags, got: %s", fallback)
+	}
+
+	t.Setenv("EDGEFETCH_REQUIRE_BROWSER_SANDBOX", "1")
+	r := NewRenderer("/fake/chromium", nil, "EdgeFetchTest/2.6.0", 1, nil)
+	if !r.requireSandbox || !r.Available() {
+		t.Fatalf("expected requireSandbox=true and Available()=true initially")
+	}
+	r.mu.Lock()
+	r.browserVersion = "HeadlessChrome/136.0.0.0"
+	r.sandboxState = "off"
+	r.disabledByPolicy = true
+	r.mu.Unlock()
+	if r.Available() {
+		t.Fatal("expected Available()=false when requireSandbox=true and sandboxState=off")
+	}
+	ver, sb := r.BrowserInfo()
+	if ver != "HeadlessChrome/136.0.0.0" || sb != "off" {
+		t.Fatalf("unexpected BrowserInfo: version=%q sandbox=%q", ver, sb)
 	}
 }
 
@@ -170,9 +203,14 @@ func TestValidateFinalURLChecksRobotsEvenOnResumedInteractSession(t *testing.T) 
 func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *testing.T) {
 	var (
 		mu              sync.Mutex
-		extraHeaderSets []map[string]string
 		disposedCtxs    int
+		setExtraHeaders atomic.Int32
+		fetchEnabled    atomic.Bool
+		allContinued    sync.Once
 	)
+	continuedHdrs := make(map[string][]fetchHeaderEntry)
+	continuedHasOverride := make(map[string]bool)
+	allContinuedCh := make(chan struct{})
 	failNavigate := true
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -181,6 +219,18 @@ func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *tes
 			return
 		}
 		defer conn.CloseNow()
+
+		var writeMu sync.Mutex
+		send := func(obj any) {
+			b, _ := json.Marshal(obj)
+			writeMu.Lock()
+			_ = conn.Write(req.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+
+		connFetchEnabled := false
+		var docContinuedOnce sync.Once
+		docContinuedCh := make(chan struct{})
 
 		for {
 			_, rawMsg, err := conn.Read(req.Context())
@@ -196,10 +246,6 @@ func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *tes
 			if json.Unmarshal(rawMsg, &rpc) != nil {
 				continue
 			}
-			send := func(obj any) {
-				b, _ := json.Marshal(obj)
-				_ = conn.Write(req.Context(), websocket.MessageText, b)
-			}
 
 			switch rpc.Method {
 			case "Target.createBrowserContext":
@@ -214,17 +260,74 @@ func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *tes
 				mu.Unlock()
 				send(map[string]any{"id": rpc.ID, "result": map[string]any{}})
 			case "Network.setExtraHTTPHeaders":
-				var p struct {
-					Headers map[string]string `json:"headers"`
-				}
-				_ = json.Unmarshal(rpc.Params, &p)
-				mu.Lock()
-				extraHeaderSets = append(extraHeaderSets, p.Headers)
-				mu.Unlock()
+				setExtraHeaders.Add(1)
 				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{}})
+			case "Fetch.enable":
+				connFetchEnabled = true
+				fetchEnabled.Store(true)
+				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{}})
+			case "Fetch.continueRequest":
+				var p struct {
+					RequestID string             `json:"requestId"`
+					Headers   []fetchHeaderEntry `json:"headers"`
+				}
+				var rawMap map[string]json.RawMessage
+				_ = json.Unmarshal(rpc.Params, &p)
+				_ = json.Unmarshal(rpc.Params, &rawMap)
+				_, hasHdrs := rawMap["headers"]
+
+				mu.Lock()
+				continuedHdrs[p.RequestID] = p.Headers
+				continuedHasOverride[p.RequestID] = hasHdrs
+				doneCount := len(continuedHdrs)
+				mu.Unlock()
+
+				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{}})
+				if p.RequestID == "audit-doc" {
+					docContinuedOnce.Do(func() { close(docContinuedCh) })
+				}
+				if doneCount >= 2 {
+					allContinued.Do(func() { close(allContinuedCh) })
+				}
 			case "Page.navigate":
 				if failNavigate {
 					send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{"frameId": "f1", "errorText": "net::ERR_ABORTED"}})
+					continue
+				}
+				if connFetchEnabled {
+					navID := rpc.ID
+					navSID := rpc.SessionID
+					go func() {
+						send(map[string]any{
+							"sessionId": navSID,
+							"method":    "Fetch.requestPaused",
+							"params": map[string]any{
+								"requestId": "audit-doc",
+								"request": map[string]any{
+									"url":     "https://first.example.com/page",
+									"headers": map[string]string{"Accept": "text/html"},
+								},
+							},
+						})
+						select {
+						case <-docContinuedCh:
+						case <-req.Context().Done():
+							return
+						}
+						send(map[string]any{"id": navID, "sessionId": navSID, "result": map[string]any{"frameId": "f1"}})
+						send(map[string]any{
+							"sessionId": navSID,
+							"method":    "Fetch.requestPaused",
+							"params": map[string]any{
+								"requestId": "audit-cross",
+								"request": map[string]any{
+									"url":     "https://cdn.other.example/app.js",
+									"headers": map[string]string{"Accept": "*/*"},
+								},
+							},
+						})
+						send(map[string]any{"sessionId": navSID, "method": "Page.loadEventFired", "params": map[string]any{}})
+					}()
 					continue
 				}
 				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{"frameId": "f1"}})
@@ -250,7 +353,7 @@ func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *tes
 	}))
 	defer srv.Close()
 
-	r := NewMockRenderer("ws://"+strings.TrimPrefix(srv.URL, "http://"), nil, "EdgeFetchTest/2.5.5")
+	r := NewMockRenderer("ws://"+strings.TrimPrefix(srv.URL, "http://"), nil, "EdgeFetchTest/2.6.0")
 	defer r.Close()
 
 	// 1. Failed initial KeepSession navigation MUST dispose the browser context and NOT retain a leaked session slot!
@@ -271,7 +374,7 @@ func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *tes
 		t.Fatalf("failed KeepSession leaked session: sessions=%d disposed=%d", leakedSessions, disposedAfterFail)
 	}
 
-	// 2. Successful navigation with custom Headers MUST clear Network.setExtraHTTPHeaders ({}) right after navigateAndWait!
+	// 2. Successful navigation with custom Headers MUST use origin-scoped CDP Fetch interception (never Network.setExtraHTTPHeaders)!
 	failNavigate = false
 	out, okErr := r.Execute(context.Background(), Task{
 		URL:       "https://first.example.com/page",
@@ -281,10 +384,25 @@ func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *tes
 	if okErr != nil || !strings.Contains(out.HTML, "OK") {
 		t.Fatalf("expected second render to succeed: err=%v out=%+v", okErr, out)
 	}
+	select {
+	case <-allContinuedCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Fetch.continueRequest calls")
+	}
+	if setExtraHeaders.Load() != 0 || !fetchEnabled.Load() {
+		t.Fatalf("expected setExtraHeaders=0 and fetchEnabled=true, got setExtraHeaders=%d fetchEnabled=%v", setExtraHeaders.Load(), fetchEnabled.Load())
+	}
 	mu.Lock()
-	recordedHdrs := append([]map[string]string(nil), extraHeaderSets...)
+	docHdrs := continuedHdrs["audit-doc"]
+	crossOverridden := continuedHasOverride["audit-cross"]
 	mu.Unlock()
-	if len(recordedHdrs) < 2 || recordedHdrs[0]["X-Api-Version"] != "2026-11" || len(recordedHdrs[len(recordedHdrs)-1]) != 0 {
-		t.Fatalf("expected extra HTTP headers to be set then cleared to empty map after navigateAndWait, got: %+v", recordedHdrs)
+	sawCustom := false
+	for _, h := range docHdrs {
+		if strings.EqualFold(h.Name, "X-Api-Version") && h.Value == "2026-11" {
+			sawCustom = true
+		}
+	}
+	if !sawCustom || crossOverridden {
+		t.Fatalf("expected X-Api-Version on same-origin doc only: docHdrs=%+v crossOverridden=%v", docHdrs, crossOverridden)
 	}
 }

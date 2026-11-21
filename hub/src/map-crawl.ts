@@ -6,7 +6,9 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { isSafePublicHostname } from './overflow';
 import {
+  asciiLower,
   compileSafeUserRegex,
+  isTagNameBoundary,
   MAX_HTML_SCAN_CHARS,
   replacePairedHtmlElementsLinear,
   stripHtmlCommentsLinear,
@@ -102,16 +104,83 @@ export function extractRobotsSitemaps(robotsText: string, origin: string): strin
   return out;
 }
 
-/** Parses XML `<sitemapindex>` and `<urlset>` `<loc>` entries. */
+function safeDecodeURIComponent(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function unwrapXmlCdataLinear(raw: string): string {
+  if (!raw.includes('<![CDATA[')) return raw;
+  let out = '';
+  let pos = 0;
+  while (pos < raw.length) {
+    const start = raw.indexOf('<![CDATA[', pos);
+    if (start < 0) {
+      out += raw.slice(pos);
+      break;
+    }
+    out += raw.slice(pos, start);
+    const end = raw.indexOf(']]>', start + 9);
+    if (end < 0) {
+      out += raw.slice(start + 9);
+      break;
+    }
+    out += raw.slice(start + 9, end);
+    pos = end + 3;
+  }
+  return out;
+}
+
+/** Parses XML `<sitemapindex>` and `<urlset>` `<loc>` entries in guaranteed linear O(N) time (`R3-H1`). */
 export function parseSitemapXml(xmlText: string): { isIndex: boolean; locs: string[] } {
-  const isIndex = /<\s*sitemapindex\b/i.test(xmlText);
+  const bounded = xmlText.length > 4 * 1024 * 1024 ? xmlText.slice(0, 4 * 1024 * 1024) : xmlText;
+  const isIndex = /<\s*sitemapindex\b/i.test(bounded.slice(0, 4_096));
   const locs: string[] = [];
   const seen = new Set<string>();
-  const locRe = /<\s*loc\b[^>]*>([\s\S]*?)<\/\s*loc\s*>/gi;
-  let m: RegExpExecArray | null;
-  while ((m = locRe.exec(xmlText)) !== null) {
-    const raw = m[1]!
-      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+  const lower = asciiLower(bounded);
+  let pos = 0;
+
+  while (pos < bounded.length && locs.length < 5_000) {
+    const openIdx = lower.indexOf('<loc', pos);
+    if (openIdx < 0) break;
+    const afterName = openIdx + 4;
+    if (afterName >= bounded.length) break;
+    const boundaryCode = bounded.charCodeAt(afterName);
+    if (!isTagNameBoundary(boundaryCode)) {
+      pos = afterName;
+      continue;
+    }
+    const openGt = bounded.indexOf('>', afterName);
+    if (openGt < 0) break;
+    if (bounded.charCodeAt(openGt - 1) === 0x2f /* self-closing <loc/> */) {
+      pos = openGt + 1;
+      continue;
+    }
+    const closeIdx = lower.indexOf('</loc', openGt + 1);
+    if (closeIdx < 0) break;
+    const afterCloseName = closeIdx + 5;
+    if (afterCloseName >= bounded.length) break;
+    const closeGt = bounded.indexOf('>', afterCloseName);
+    if (closeGt < 0) break;
+
+    // Handle malformed unclosed `<loc>` before a valid `<loc>...</loc>` by taking the last `<loc...>` before `closeIdx`.
+    let innerStart = openGt + 1;
+    if (closeIdx - innerStart > 2_048) {
+      const nestedLoc = lower.lastIndexOf('<loc', closeIdx - 1);
+      if (nestedLoc > openIdx && nestedLoc + 4 < closeIdx && isTagNameBoundary(bounded.charCodeAt(nestedLoc + 4))) {
+        const nestedGt = bounded.indexOf('>', nestedLoc + 4);
+        if (nestedGt > nestedLoc && nestedGt < closeIdx) {
+          innerStart = nestedGt + 1;
+        }
+      }
+    }
+
+    pos = closeGt + 1;
+    if (closeIdx - innerStart > 8_192) continue;
+    const raw = unwrapXmlCdataLinear(bounded.slice(innerStart, closeIdx))
       .replace(/&amp;/g, '&')
       .trim();
     if (!raw || seen.has(raw)) continue;
@@ -123,7 +192,6 @@ export function parseSitemapXml(xmlText: string): { isIndex: boolean; locs: stri
         if (!seen.has(clean)) {
           seen.add(clean);
           locs.push(clean);
-          if (locs.length >= 5_000) break;
         }
       }
     } catch {
@@ -161,6 +229,9 @@ export interface MapRequestPayload {
   sitemap?: unknown;
   ignoreQueryParameters?: unknown;
   deduplicateSimilarURLs?: unknown;
+  includePaths?: unknown;
+  excludePaths?: unknown;
+  regexOnFullURL?: unknown;
   fastEdgeMap?: unknown;
   target?: unknown;
   site?: unknown;
@@ -225,6 +296,17 @@ export async function executeMapCall(params: {
   if (!check.ok) {
     return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: check.message } };
   }
+  const incCheck = validateCrawlPathPatterns(payload.includePaths, 'includePaths');
+  if (!incCheck.ok) {
+    return { status: 400, via: 'hub', body: { ok: false, status: 400, error: incCheck.error, message: incCheck.message } };
+  }
+  const excCheck = validateCrawlPathPatterns(payload.excludePaths, 'excludePaths');
+  if (!excCheck.ok) {
+    return { status: 400, via: 'hub', body: { ok: false, status: 400, error: excCheck.error, message: excCheck.message } };
+  }
+  const mapIncludePaths = incCheck.patterns;
+  const mapExcludePaths = excCheck.patterns;
+  const mapRegexOnFullURL = Boolean(payload.regexOnFullURL);
   const rootUrl = check.url;
   const origin = rootUrl.origin;
   const rootHost = rootUrl.hostname;
@@ -613,13 +695,7 @@ export async function executeMapCall(params: {
   // Tokenize URL paths and page titles on `/ - _ .` and camelCase boundaries so `search=voice` matches `voice` / `voice-agent`
   // and NEVER matches inside unrelated words like `/billing/manage/invoices/` ("invoices" -> token "invoices", not "voice").
   const tokenizeMapSegment = (raw: string): string[] => {
-    const dec = (() => {
-      try {
-        return decodeURIComponent(raw);
-      } catch {
-        return raw;
-      }
-    })();
+    const dec = safeDecodeURIComponent(raw);
     const whole = dec.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
     const camelSplit = dec.replace(/([a-z\d])([A-Z])/g, '$1 $2');
     const split = camelSplit.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
@@ -671,6 +747,15 @@ export async function executeMapCall(params: {
   let items = [...discovered.values()];
   if (subpathPrefix && !includeOutsidePath) {
     items = items.filter((entry) => isUnderSubpath(entry.url));
+  }
+  if (mapIncludePaths.length > 0 || mapExcludePaths.length > 0) {
+    items = items.filter((entry) => {
+      try {
+        return pathAllowed(new URL(entry.url), mapIncludePaths, mapExcludePaths, mapRegexOnFullURL);
+      } catch {
+        return false;
+      }
+    });
   }
   if (searchFilter) {
     const terms = (searchFilter.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(Boolean);
@@ -888,6 +973,55 @@ export interface CrawlWorkflowParams {
   selfHost?: string;
 }
 
+export function validateCrawlPathPatterns(
+  rawList: unknown,
+  fieldName: 'includePaths' | 'excludePaths',
+): { ok: true; patterns: string[] } | { ok: false; status: 400; error: 'invalid_pattern'; message: string } {
+  if (rawList === undefined || rawList === null) {
+    return { ok: true, patterns: [] };
+  }
+  if (!Array.isArray(rawList)) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'invalid_pattern',
+      message: `${fieldName} must be an array of pattern strings`,
+    };
+  }
+  if (rawList.length > 20) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'invalid_pattern',
+      message: `${fieldName} exceeds maximum of 20 patterns`,
+    };
+  }
+  const patterns: string[] = [];
+  for (let i = 0; i < rawList.length; i++) {
+    const p = rawList[i];
+    if (typeof p !== 'string' || !p.trim() || p.length > 160) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'invalid_pattern',
+        message: `${fieldName}[${i}] must be a non-empty pattern string up to 160 characters`,
+      };
+    }
+    const trimmed = p.trim();
+    const isPlainPrefix = trimmed.startsWith('/') && !/[\\^$*+?()[\]{}|]/.test(trimmed);
+    if (!isPlainPrefix && !compileSafeUserRegex(trimmed)) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'invalid_pattern',
+        message: `${fieldName}[${i}] is an invalid or unsafe regular expression: ${trimmed.slice(0, 80)}`,
+      };
+    }
+    patterns.push(trimmed);
+  }
+  return { ok: true, patterns };
+}
+
 export function matchesSafeCrawlPattern(target: string, pattern: string): boolean {
   if (!pattern || pattern.length > 160) return false;
   const boundedTarget = target.length > 2048 ? target.slice(0, 2048) : target;
@@ -896,7 +1030,7 @@ export function matchesSafeCrawlPattern(target: string, pattern: string): boolea
   }
   const safeRe = compileSafeUserRegex(pattern);
   if (!safeRe) {
-    return boundedTarget.includes(pattern);
+    return false;
   }
   return safeRe.test(boundedTarget);
 }
@@ -925,12 +1059,20 @@ export async function createCrawlJob(params: {
   | { ok: false; status: number; error: string; message: string }
 > {
   const { payload, metaDb, selfHost, now = Date.now() } = params;
-  if (!metaDb) {
-    return { ok: false, status: 503, error: 'tracking_not_configured', message: 'Async crawl requires META D1 binding' };
-  }
   const urlCheck = validatePublicHttpsUrl(payload.url, selfHost);
   if (!urlCheck.ok) {
     return { ok: false, status: 400, error: 'invalid_url', message: urlCheck.message };
+  }
+  const incCheck = validateCrawlPathPatterns(payload.includePaths, 'includePaths');
+  if (!incCheck.ok) {
+    return incCheck;
+  }
+  const excCheck = validateCrawlPathPatterns(payload.excludePaths, 'excludePaths');
+  if (!excCheck.ok) {
+    return excCheck;
+  }
+  if (!metaDb) {
+    return { ok: false, status: 503, error: 'tracking_not_configured', message: 'Async crawl requires META D1 binding' };
   }
 
   let webhook: WebhookConfig | undefined;
@@ -980,12 +1122,8 @@ export async function createCrawlJob(params: {
     deduplicateSimilarURLs: payload.deduplicateSimilarURLs !== false,
     sitemap: sitemapMode,
     ...(delayMs !== undefined ? { delayMs } : {}),
-    includePaths: Array.isArray(payload.includePaths)
-      ? payload.includePaths.filter((p): p is string => typeof p === 'string' && p.trim().length > 0 && p.length <= 160).slice(0, 20)
-      : [],
-    excludePaths: Array.isArray(payload.excludePaths)
-      ? payload.excludePaths.filter((p): p is string => typeof p === 'string' && p.trim().length > 0 && p.length <= 160).slice(0, 20)
-      : [],
+    includePaths: incCheck.patterns,
+    excludePaths: excCheck.patterns,
     ...(COLLECTION_ID_RE.test(rawColl) ? { collectionId: rawColl } : {}),
     ...(payload.renderMode === 'auto' || payload.renderMode === 'always' || payload.renderMode === 'off'
       ? { renderMode: payload.renderMode }

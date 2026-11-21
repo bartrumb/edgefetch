@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { attrHasTokenLinear, defineAdapter, findElementInnerLinear, findOpenTagLinear } from '../../types';
 import {
   decodeBasicEntities,
   detectFenceLang,
@@ -27,10 +27,11 @@ const GITLAB_RESERVED_ROOTS = new Set([
 function extractGitlabBlobPlainSource(rawBody: string): string | null {
   const obj = parseJsonObject(rawBody);
   if (!obj || typeof obj.html !== 'string') return null;
-  const codeMatch = /<pre\b[^>]*>\s*<code\b[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/i.exec(obj.html);
-  if (!codeMatch?.[1]) return null;
+  const preInner = findElementInnerLinear(obj.html, 'pre');
+  const codeInner = preInner ? findElementInnerLinear(preInner, 'code') ?? preInner : null;
+  if (!codeInner) return null;
   const plain = decodeBasicEntities(
-    codeMatch[1]
+    codeInner
       .replace(/<[^>]+>/g, '')
       .replace(/&#x000A;/gi, '\n'),
   )
@@ -115,7 +116,7 @@ export default defineAdapter({
     if ((host === 'codeberg.org' || host === 'gitea.com') && parts.length === 2) {
       const slug = `${parts[0]}/${parts[1]}`;
       const desc = extractMetaContent(rawHtml, 'og:description') || extractMetaContent(rawHtml, 'description');
-      const markupMatch = /<div\b[^>]*\bclass=["'][^"']*\bmarkup\b[^"']*["'][^>]*>/i.exec(rawHtml);
+      const markupMatch = findOpenTagLinear(rawHtml, 'div', (a) => attrHasTokenLinear(a, 'class', 'markup'));
       if (markupMatch) {
         const inner = extractBalancedDivAt(rawHtml, markupMatch.index);
         if (inner) {

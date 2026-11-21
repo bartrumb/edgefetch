@@ -8,10 +8,26 @@
  *    and tracked in `META` D1 `documents` with `(content_sha256, format, pipeline_version)` uniqueness.
  */
 
-import { applyPostFetchSiteExtractor, resolveSiteExtractorTwin } from './extractors/registry';
+import {
+  applyPostFetchSiteExtractor,
+  enrichShopifyProductFromJson,
+  extractShopifyCurrencyFromHtml,
+  isShopifyHtmlOrHeaders,
+  resolveCustomDomainShopifyProductTwinUrl,
+  resolveSiteExtractorTwin,
+  type PaginationInfo,
+  type PostFetchSiteResult,
+  type TwinFormattedDoc,
+} from './extractors/registry';
+import {
+  detectSiteFrameworkLinear,
+  extractInertiaPagePropsLinear,
+  type BrowserFrameworkGlobals,
+} from './framework-detect';
 import {
   asciiLower,
   escapeRegexLiteral,
+  isTagNameBoundary,
   MAX_HTML_SCAN_CHARS,
   replaceHtmlOpenTagsLinear,
   replaceHtmlTagBlocksLinear,
@@ -47,8 +63,10 @@ import {
 import {
   classifyContentState,
   classifyWafAndChallenge,
+  hasExternalOrWidgetIframeLinear,
   isEligibleForWaybackFallback,
   recoverSsrHydrationContent,
+  refineBlockedInfo,
   tryFetchWaybackSnapshot,
   type ContentState,
   type WafClassification,
@@ -76,7 +94,7 @@ import {
   splitPdfPagesAndMarkers,
 } from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 25;
+export const SCRAPE_PIPELINE_VERSION = 26;
 
 export interface ScrapedImage {
   url: string;
@@ -122,6 +140,14 @@ export interface ExtractedDocument {
   canonicalUrl?: string;
   markdownAlternateUrl?: string;
   favicon?: string;
+  extractorId?: string;
+  records?: Array<Record<string, unknown>>;
+  pagination?: PaginationInfo;
+  total?: number;
+  returned?: number;
+  truncated?: boolean;
+  nextCursor?: string;
+  inertiaHydrated?: boolean;
   markdown: string;
   text: string;
   links: string[];
@@ -275,9 +301,18 @@ export function decodeMarkdownEntities(md: string): string {
   return parts.map((part, idx) => (idx % 2 === 1 ? part : decodeHtmlEntities(part))).join('');
 }
 
+function safeDecodeURIComponent(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 /** Normalizes Poppler / OCR PDF layout whitespace (column-alignment spaces and line-wrap hyphenations). */
 export function cleanPdfMarkdown(md: string): string {
   if (!md) return md;
+  const bounded = md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md;
   const compoundPrefixes = new Set([
     'self',
     'multi',
@@ -320,17 +355,20 @@ export function cleanPdfMarkdown(md: string): string {
     'edge',
     'cloud',
   ]);
-  const parts = splitMarkdownByCodeFences(md);
+  const parts = splitMarkdownByCodeFences(bounded);
   return parts
     .map((part, idx) => {
       if (idx % 2 === 1) return part;
-      return part
-        .replace(/([A-Za-z0-9]+)-\r?\n[ \t]*([A-Za-z]+)/g, (_m, left: string, right: string) => {
-          if (/\d$/.test(left) || /^[A-Z]/.test(right) || compoundPrefixes.has(left.toLowerCase())) {
-            return `${left}-${right}`;
-          }
-          return `${left}${right}`;
-        })
+      const dehyphenated =
+        part.includes('-\n') || part.includes('-\r\n')
+          ? part.replace(/(?<![A-Za-z0-9])([A-Za-z0-9]{1,64})-\r?\n[ \t]{0,32}([A-Za-z]{1,64})/g, (_m, left: string, right: string) => {
+              if (/\d$/.test(left) || /^[A-Z]/.test(right) || compoundPrefixes.has(left.toLowerCase())) {
+                return `${left}-${right}`;
+              }
+              return `${left}${right}`;
+            })
+          : part;
+      return dehyphenated
         .split('\n')
         .map((line) => {
           const trimmed = line.trimStart();
@@ -497,11 +535,25 @@ function cleanHeadingPermalinks(headingText: string): string {
     .trim();
 }
 
+const PII_EMAIL_RE =
+  /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){1,10}[A-Za-z]{2,24}\b/g;
+const PII_SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
+const PII_PHONE_RE =
+  /(?<![0-9A-Za-z-])(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?\d{3}[-.\s]?\d{4}|\d{3}[-.\s]\d{3}[-.\s]\d{4})\b/g;
+
 export function redactPiiText(text: string): string {
-  return text
-    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[REDACTED_EMAIL]')
-    .replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[REDACTED_SSN]')
-    .replace(/(?<![0-9A-Za-z-])(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?\d{3}[-.\s]?\d{4}|\d{3}[-.\s]\d{3}[-.\s]\d{4})\b/g, '[REDACTED_PHONE]');
+  if (!text) return text;
+  let out = text;
+  if (out.includes('@')) {
+    out = out.replace(PII_EMAIL_RE, '[REDACTED_EMAIL]');
+  }
+  if (/\d{3}/.test(out)) {
+    if (out.includes('-')) {
+      out = out.replace(PII_SSN_RE, '[REDACTED_SSN]');
+    }
+    out = out.replace(PII_PHONE_RE, '[REDACTED_PHONE]');
+  }
+  return out;
 }
 
 const VOID_HTML_TAGS = new Set([
@@ -1047,13 +1099,26 @@ function extractSubstackPreloadData(rawHtml: string): SubstackPreloadExtracted |
     };
   };
 
-  const scriptTagMatch = /<script\b[^>]*\bid=(?:"preloads-json"|'preloads-json')[^>]*>([\s\S]*?)<\/script>/i.exec(rawHtml);
-  if (scriptTagMatch?.[1]) {
-    try {
-      const res = readFromData(JSON.parse(scriptTagMatch[1]));
-      if (res) return res;
-    } catch {
-      // fall through
+  if (rawHtml.includes('preloads-json')) {
+    let preloadJsonStr = '';
+    replaceHtmlTagBlocksLinear(
+      rawHtml,
+      'script',
+      (_full, attrStr, inner) => {
+        if (!preloadJsonStr && (parseTagAttrs(attrStr).id ?? '').toLowerCase() === 'preloads-json') {
+          preloadJsonStr = inner;
+        }
+        return '';
+      },
+      MAX_HTML_SCAN_CHARS,
+    );
+    if (preloadJsonStr) {
+      try {
+        const res = readFromData(JSON.parse(preloadJsonStr));
+        if (res) return res;
+      } catch {
+        // fall through
+      }
     }
   }
 
@@ -1085,9 +1150,19 @@ function extractSubstackPreloadData(rawHtml: string): SubstackPreloadExtracted |
   return null;
 }
 
+function hasClassToken(attrStr: string, tokenLower: string): boolean {
+  const cls = (parseTagAttrs(attrStr).class ?? '').toLowerCase();
+  if (!cls) return false;
+  return cls.split(/\s+/).includes(tokenLower);
+}
+
 function hnFragmentToMarkdown(fragHtml: string, baseUrl: string): string {
   const codeBlocks: string[] = [];
-  let s = fragHtml.replace(/<div\b[^>]*\breply\b[^>]*>[\s\S]*?<\/div>/gi, '');
+  let s = fragHtml.includes('reply')
+    ? replacePairedHtmlElementsLinear(fragHtml, ['div'], (full, _t, attrStr) =>
+        hasClassToken(attrStr, 'reply') ? '' : full,
+      )
+    : fragHtml;
   s = replacePairedHtmlElementsLinear(s, ['pre'], (_full, _t, _attrs, inner) => {
     const clean = decodeHtmlEntities(stripHtmlTagsQuoteAwareLinear(inner, '')).trimEnd();
     const idx = codeBlocks.push(`\n\n${makeSafeCodeFence(clean)}\n\n`) - 1;
@@ -1123,10 +1198,105 @@ function hnFragmentToMarkdown(fragHtml: string, baseUrl: string): string {
   return s.replace(/\u0000HNCODE(\d+)\u0000/g, (_m, idx: string) => codeBlocks[Number(idx)] ?? '');
 }
 
+function findFirstClassSubtreeLinear(html: string, tagNames: readonly string[], classTokenLower: string): { inner: string; endIdx: number } | null {
+  const tagSet = new Set(tagNames);
+  let matchTag = '';
+  let depth = 0;
+  let innerStart = -1;
+  let result: { inner: string; endIdx: number } | null = null;
+
+  scanHtmlTagsLinear(
+    html,
+    (tag) => {
+      if (!tagSet.has(tag.tagNameLower)) return;
+      if (!matchTag) {
+        if (tag.isClosing || tag.isSelfClosing) return;
+        if (hasClassToken(tag.attrs, classTokenLower)) {
+          matchTag = tag.tagNameLower;
+          depth = 1;
+          innerStart = tag.end;
+        }
+        return undefined;
+      }
+      if (tag.tagNameLower !== matchTag) return;
+      if (tag.isClosing) {
+        depth--;
+        if (depth === 0) {
+          result = { inner: html.slice(innerStart, tag.index), endIdx: tag.end };
+          return false;
+        }
+      } else if (!tag.isSelfClosing) {
+        depth++;
+      }
+      return undefined;
+    },
+    MAX_HTML_SCAN_CHARS,
+    false,
+  );
+  return result;
+}
+
+function findFirstAnchorInFragment(frag: string): { href?: string; text: string } | null {
+  let found: { href?: string; text: string } | null = null;
+  replacePairedHtmlElementsLinear(
+    frag,
+    ['a'],
+    (_full, _t, attrStr, inner) => {
+      if (!found) {
+        const attrs = parseTagAttrs(attrStr);
+        found = { ...(attrs.href ? { href: attrs.href } : {}), text: cleanInlineHtml(inner) };
+      }
+      return '';
+    },
+    { maxChars: 24_000, maxInnerChars: 4_000 },
+  );
+  return found;
+}
+
+function findHnAuthorInFragment(frag: string): string | undefined {
+  let author: string | undefined;
+  replacePairedHtmlElementsLinear(
+    frag,
+    ['a'],
+    (_full, _t, attrStr, inner) => {
+      if (author === undefined) {
+        const attrs = parseTagAttrs(attrStr);
+        const href = attrs.href ?? '';
+        const cls = (attrs.class ?? '').toLowerCase();
+        if (href.startsWith('user?id=') || cls.split(/\s+/).includes('hnuser')) {
+          const cleaned = cleanInlineHtml(inner);
+          if (cleaned) author = cleaned;
+        }
+      }
+      return '';
+    },
+    { maxChars: 32_000, maxInnerChars: 1_000 },
+  );
+  return author;
+}
+
+function findSpanAttrInFragment(frag: string, classTokenLower: string, attrNameLower: string): string {
+  let val = '';
+  scanHtmlTagsLinear(
+    frag,
+    (tag) => {
+      if (!tag.isClosing && tag.tagNameLower === 'span' && hasClassToken(tag.attrs, classTokenLower)) {
+        val = parseTagAttrs(tag.attrs)[attrNameLower] ?? '';
+        return false;
+      }
+      return undefined;
+    },
+    32_000,
+    false,
+  );
+  return val;
+}
+
 function extractHackerNewsMarkdown(
   rawHtml: string,
   baseUrl?: string,
 ): { title?: string; author?: string; publishedTime?: string; markdown: string; links: string[] } | null {
+  const boundedHtml = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
   let isHnHost = false;
   if (baseUrl) {
     try {
@@ -1135,9 +1305,26 @@ function extractHackerNewsMarkdown(
       isHnHost = false;
     }
   }
-  if (!isHnHost && !/<table\b[^>]*\bid=(?:"hnmain"|'hnmain')/i.test(rawHtml)) {
-    return null;
+  if (!isHnHost) {
+    if (!boundedHtml.includes('hnmain') && !boundedHtml.includes('HNMAIN')) {
+      return null;
+    }
+    let hasHnMainTable = false;
+    scanHtmlTagsLinear(
+      boundedHtml,
+      (tag) => {
+        if (!tag.isClosing && tag.tagNameLower === 'table' && (parseTagAttrs(tag.attrs).id ?? '').toLowerCase() === 'hnmain') {
+          hasHnMainTable = true;
+          return false;
+        }
+        return undefined;
+      },
+      MAX_HTML_SCAN_CHARS,
+      false,
+    );
+    if (!hasHnMainTable) return null;
   }
+
   const hnBase = baseUrl || 'https://news.ycombinator.com/';
   const links: string[] = [];
   const addLink = (rawHref: string | undefined) => {
@@ -1146,37 +1333,37 @@ function extractHackerNewsMarkdown(
     return r;
   };
 
-  const fatMatch = /<table\b[^>]*\bfatitem\b[^>]*>([\s\S]{1,80000}?)<\/table>/i.exec(rawHtml);
-  if (fatMatch?.[1]) {
-    const fat = fatMatch[1];
-    const titleLink = /<span\b[^>]*\btitleline\b[^>]*>\s*<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/i.exec(fat);
-    const onStoryLink = /<span\b[^>]*\bonstory\b[^>]*>[\s\S]*?<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/i.exec(fat);
-    const authorMatch = /<a\b[^>]*\bhref=(?:"user\?id=([^"&]+)"|'user\?id=([^'&]+)')[^>]*>([\s\S]*?)<\/a>/i.exec(fat);
-    const author = authorMatch ? cleanInlineHtml(authorMatch[3]!) : undefined;
-    const ageTitleMatch = /<span\b[^>]*\bage\b[^>]*\btitle=(?:"([^"]+)"|'([^']+)')/i.exec(fat);
-    const rawIso = (ageTitleMatch?.[1] ?? ageTitleMatch?.[2] ?? '').split(' ')[0]?.trim() || undefined;
+  const fatSub = boundedHtml.includes('fatitem') ? findFirstClassSubtreeLinear(boundedHtml, ['table'], 'fatitem') : null;
+  if (fatSub && fatSub.inner.length > 0 && fatSub.inner.length <= 120_000) {
+    const fat = fatSub.inner;
+    const titlelineSpan = fat.includes('titleline') ? findFirstClassSubtreeLinear(fat, ['span'], 'titleline') : null;
+    const titleLink = titlelineSpan ? findFirstAnchorInFragment(titlelineSpan.inner) : null;
+    const onStorySpan = fat.includes('onstory') ? findFirstClassSubtreeLinear(fat, ['span'], 'onstory') : null;
+    const onStoryLink = onStorySpan ? findFirstAnchorInFragment(onStorySpan.inner) : null;
+    const author = findHnAuthorInFragment(fat);
+    const rawAgeTitle = fat.includes('age') ? findSpanAttrInFragment(fat, 'age', 'title') : '';
+    const rawIso = rawAgeTitle.split(' ')[0]?.trim() || undefined;
     const dateShort = rawIso ? rawIso.split('T')[0] : undefined;
-    const scoreMatch = /<span\b[^>]*\bscore\b[^>]*>([\s\S]*?)<\/span>/i.exec(fat);
-    const score = scoreMatch ? cleanInlineHtml(scoreMatch[1]!) : '';
+    const scoreSub = fat.includes('score') ? findFirstClassSubtreeLinear(fat, ['span'], 'score') : null;
+    const score = scoreSub ? cleanInlineHtml(scoreSub.inner) : '';
 
     const sections: string[] = [];
     let outTitle: string | undefined;
 
     if (titleLink) {
-      const tAttrs = parseTagAttrs(titleLink[1]!);
-      const storyUrl = addLink(tAttrs.href);
-      outTitle = cleanInlineHtml(titleLink[2]!);
+      const storyUrl = addLink(titleLink.href);
+      outTitle = titleLink.text;
       sections.push(storyUrl ? `# [${outTitle}](${storyUrl})` : `# ${outTitle}`);
       const metaBits = [score, author ? `by ${author}` : '', dateShort ?? ''].filter(Boolean);
       if (metaBits.length > 0) sections.push(`*${metaBits.join(' · ')}*`);
-      const topTextMatch = /<div\b[^>]*\btoptext\b[^>]*>([\s\S]*?)<\/div>/i.exec(fat);
-      if (topTextMatch?.[1]) {
-        const topMd = hnFragmentToMarkdown(topTextMatch[1], hnBase);
+      const topTextSub = fat.includes('toptext') ? findFirstClassSubtreeLinear(fat, ['div'], 'toptext') : null;
+      if (topTextSub?.inner) {
+        const topMd = hnFragmentToMarkdown(topTextSub.inner, hnBase);
         if (topMd) sections.push(topMd);
       }
     } else {
-      const storyTitle = onStoryLink ? cleanInlineHtml(onStoryLink[2]!) : 'Hacker News Thread';
-      const storyHref = onStoryLink ? addLink(parseTagAttrs(onStoryLink[1]!).href) : undefined;
+      const storyTitle = onStoryLink?.text || 'Hacker News Thread';
+      const storyHref = onStoryLink ? addLink(onStoryLink.href) : undefined;
       outTitle = storyTitle;
       sections.push(`# ${storyTitle}`);
       const metaBits = [
@@ -1185,48 +1372,89 @@ function extractHackerNewsMarkdown(
         storyHref ? `on [${storyTitle}](${storyHref})` : '',
       ].filter(Boolean);
       if (metaBits.length > 0) sections.push(metaBits.join(' · '));
-      const mainCommMatch = /<div\b[^>]*\bcommtext\b[^>]*>([\s\S]*?)<\/div>\s*<div\b[^>]*\breply\b/i.exec(fat) ??
-        /<span\b[^>]*\bcommtext\b[^>]*>([\s\S]*?)<\/span>/i.exec(fat);
-      if (mainCommMatch?.[1]) {
-        const bodyMd = hnFragmentToMarkdown(mainCommMatch[1], hnBase);
+      const mainCommSub = fat.includes('commtext') ? findFirstClassSubtreeLinear(fat, ['div', 'span'], 'commtext') : null;
+      if (mainCommSub?.inner) {
+        const bodyMd = hnFragmentToMarkdown(mainCommSub.inner, hnBase);
         if (bodyMd) sections.push(bodyMd);
       }
     }
 
     const commentItems: string[] = [];
     const seenIds = new Set<string>();
-    const afterFat = rawHtml.slice((fatMatch.index ?? 0) + fatMatch[0].length);
-    for (const cm of afterFat.matchAll(/<tr\b([^>]*\bcomtr\b[^>]*)>([\s\S]{1,24000}?)<\/tr>/gi)) {
-      const trAttrs = parseTagAttrs(cm[1]!);
-      const cid = trAttrs.id ?? '';
-      if (cid && seenIds.has(cid)) continue;
-      if (cid) seenIds.add(cid);
-      const rowHtml = cm[2]!;
-      if (/\bnoshow\b/i.test(cm[1]!)) continue;
-      const indWidth = /<td\b[^>]*\bind\b[^>]*>[\s\S]{0,160}?<img\b[^>]*\bwidth=(?:"(\d+)"|'(\d+)'|(\d+))/i.exec(rowHtml);
-      const px = Number(indWidth?.[1] ?? indWidth?.[2] ?? indWidth?.[3] ?? '0') || 0;
-      const depth = Math.min(5, Math.max(0, Math.round(px / 40)));
-      const cAuthorMatch =
-        /<a\b[^>]*\bhref=(?:"user\?id=([^"&]+)"|'user\?id=([^'&]+)')[^>]*>([\s\S]*?)<\/a>/i.exec(rowHtml) ??
-        /<a\b[^>]*\bclass=(?:"[^"]*\bhnuser\b[^"]*"|'[^']*\bhnuser\b[^']*')[^>]*>()()([\s\S]*?)<\/a>/i.exec(rowHtml);
-      const cAuthor = cAuthorMatch ? cleanInlineHtml(cAuthorMatch[3]!) : '[deleted]';
-      const cAgeMatch = /<span\b[^>]*\bage\b[^>]*\btitle=(?:"([^"]+)"|'([^']+)')/i.exec(rowHtml);
-      const cDate = (cAgeMatch?.[1] ?? cAgeMatch?.[2] ?? '').split('T')[0] ?? '';
-      const commMatch =
-        /<div\b[^>]*\bcommtext\b[^>]*>([\s\S]*?)<\/div>\s*<div\b[^>]*\breply\b/i.exec(rowHtml) ??
-        /<div\b[^>]*\bcommtext\b[^>]*>([\s\S]*?)<\/div>/i.exec(rowHtml) ??
-        /<span\b[^>]*\bcommtext\b[^>]*>([\s\S]*?)<\/span>/i.exec(rowHtml);
-      if (!commMatch?.[1]) continue;
-      const cBody = hnFragmentToMarkdown(commMatch[1], hnBase);
-      if (!cBody || cBody === '[dead]' || cBody === '[flagged]') continue;
-      const indent = '  '.repeat(depth);
-      const indentedBody = cBody
-        .split('\n')
-        .map((line, idx) => (idx === 0 ? line : line ? `${indent}  ${line}` : ''))
-        .join('\n');
-      const header = cDate ? `**${cAuthor}** *(${cDate})*` : `**${cAuthor}**`;
-      commentItems.push(`${indent}- ${header}: ${indentedBody}`);
-      if (commentItems.length >= 120) break;
+    const afterFat = boundedHtml.slice(fatSub.endIdx);
+    if (afterFat.includes('comtr')) {
+      const comRows: Array<{ attrs: Record<string, string>; inner: string }> = [];
+      let comDepth = 0;
+      let comInnerStart = -1;
+      let comAttrs: Record<string, string> = {};
+      scanHtmlTagsLinear(
+        afterFat,
+        (tag) => {
+          if (tag.tagNameLower !== 'tr') return;
+          if (comDepth === 0) {
+            if (!tag.isClosing && !tag.isSelfClosing && hasClassToken(tag.attrs, 'comtr')) {
+              const parsed = parseTagAttrs(tag.attrs);
+              if (!(parsed.class ?? '').toLowerCase().split(/\s+/).includes('noshow')) {
+                comDepth = 1;
+                comInnerStart = tag.end;
+                comAttrs = parsed;
+              }
+            }
+            return undefined;
+          }
+          if (tag.isClosing) {
+            comDepth--;
+            if (comDepth === 0) {
+              if (tag.index - comInnerStart <= 32_000) {
+                comRows.push({ attrs: comAttrs, inner: afterFat.slice(comInnerStart, tag.index) });
+                if (comRows.length >= 120) return false;
+              }
+            }
+          } else if (!tag.isSelfClosing) {
+            comDepth++;
+          }
+          return undefined;
+        },
+        MAX_HTML_SCAN_CHARS,
+        false,
+      );
+
+      for (const cr of comRows) {
+        const cid = cr.attrs.id ?? '';
+        if (cid && seenIds.has(cid)) continue;
+        if (cid) seenIds.add(cid);
+        const rowHtml = cr.inner;
+        let px = 0;
+        const indTd = rowHtml.includes('ind') ? findFirstClassSubtreeLinear(rowHtml, ['td'], 'ind') : null;
+        if (indTd) {
+          scanHtmlTagsLinear(
+            indTd.inner,
+            (t) => {
+              if (!t.isClosing && t.tagNameLower === 'img') {
+                px = Number(parseTagAttrs(t.attrs).width ?? '0') || 0;
+                return false;
+              }
+              return undefined;
+            },
+            1024,
+            false,
+          );
+        }
+        const depth = Math.min(5, Math.max(0, Math.round(px / 40)));
+        const cAuthor = findHnAuthorInFragment(rowHtml) ?? '[deleted]';
+        const cDate = (rowHtml.includes('age') ? findSpanAttrInFragment(rowHtml, 'age', 'title') : '').split('T')[0] ?? '';
+        const commSub = rowHtml.includes('commtext') ? findFirstClassSubtreeLinear(rowHtml, ['div', 'span'], 'commtext') : null;
+        if (!commSub?.inner) continue;
+        const cBody = hnFragmentToMarkdown(commSub.inner, hnBase);
+        if (!cBody || cBody === '[dead]' || cBody === '[flagged]') continue;
+        const indent = '  '.repeat(depth);
+        const indentedBody = cBody
+          .split('\n')
+          .map((line, idx) => (idx === 0 ? line : line ? `${indent}  ${line}` : ''))
+          .join('\n');
+        const header = cDate ? `**${cAuthor}** *(${cDate})*` : `**${cAuthor}**`;
+        commentItems.push(`${indent}- ${header}: ${indentedBody}`);
+      }
     }
     if (commentItems.length > 0) {
       sections.push(`## Comments\n\n${commentItems.join('\n\n')}`);
@@ -1243,38 +1471,82 @@ function extractHackerNewsMarkdown(
     }
   }
 
-  // Hacker News story listing page (`news`, `newest`, `ask`, `show`, `front`)
+  // Hacker News story listing page (`news`, `newest`, `ask`, `show`, `front`) — strictly linear O(N) `<tr>` pair scan
   const listingItems: string[] = [];
-  const rowPairsRe =
-    /<tr\b([^>]*\bathing\b[^>]*)>([\s\S]{1,4000}?)<\/tr>\s*<tr>([\s\S]{1,3000}?)<\/tr>/gi;
-  for (const sm of rawHtml.matchAll(rowPairsRe)) {
-    const rowAttrs = parseTagAttrs(sm[1]!);
-    const id = rowAttrs.id ?? '';
-    const tMatch = /<span\b[^>]*\btitleline\b[^>]*>\s*<a\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/a>/i.exec(sm[2]!);
-    if (!tMatch) continue;
-    const storyTitle = cleanInlineHtml(tMatch[2]!);
-    const storyHref = addLink(parseTagAttrs(tMatch[1]!).href);
-    const siteMatch = /<span\b[^>]*\bsitestr\b[^>]*>([\s\S]*?)<\/span>/i.exec(sm[2]!);
-    const siteStr = siteMatch ? cleanInlineHtml(siteMatch[1]!) : '';
-    const subHtml = sm[3]!;
-    const pts = cleanInlineHtml(/<span\b[^>]*\bscore\b[^>]*>([\s\S]*?)<\/span>/i.exec(subHtml)?.[1] ?? '');
-    const byUser = cleanInlineHtml(
-      /<a\b[^>]*\bhref=(?:"user\?id=[^"]+"|'user\?id=[^']+')[^>]*>([\s\S]*?)<\/a>/i.exec(subHtml)?.[1] ??
-        /<a\b[^>]*\bclass=(?:"hnuser"|'hnuser')[^>]*>([\s\S]*?)<\/a>/i.exec(subHtml)?.[1] ??
-        '',
+  if (boundedHtml.includes('athing')) {
+    const trList: Array<{ attrs: string; inner: string }> = [];
+    let trDepth = 0;
+    let trStart = -1;
+    let trAttrStr = '';
+    scanHtmlTagsLinear(
+      boundedHtml,
+      (tag) => {
+        if (tag.tagNameLower !== 'tr') return;
+        if (trDepth === 0) {
+          if (!tag.isClosing && !tag.isSelfClosing) {
+            trDepth = 1;
+            trStart = tag.end;
+            trAttrStr = tag.attrs;
+          }
+          return undefined;
+        }
+        if (tag.isClosing) {
+          trDepth--;
+          if (trDepth === 0) {
+            if (tag.index - trStart <= 12_000) {
+              trList.push({ attrs: trAttrStr, inner: boundedHtml.slice(trStart, tag.index) });
+              if (trList.length >= 300) return false;
+            }
+          }
+        } else if (!tag.isSelfClosing) {
+          trDepth++;
+        }
+        return undefined;
+      },
+      MAX_HTML_SCAN_CHARS,
+      false,
     );
-    const commLinks = [...subHtml.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi)];
-    const lastText = commLinks.length > 0 ? cleanInlineHtml(commLinks[commLinks.length - 1]![1]!) : '';
-    const commentsPart =
-      id && /\bcomment|\bdiscuss/i.test(lastText)
-        ? `[${lastText}](${addLink(`https://news.ycombinator.com/item?id=${id}`)})`
-        : '';
-    const meta = [pts, byUser ? `by ${byUser}` : '', commentsPart].filter(Boolean).join(' · ');
-    const head = storyHref ? `**[${storyTitle}](${storyHref})**` : `**${storyTitle}**`;
-    listingItems.push(
-      `${listingItems.length + 1}. ${head}${siteStr ? ` *(${siteStr})*` : ''}${meta ? ` — ${meta}` : ''}`,
-    );
-    if (listingItems.length >= 60) break;
+
+    for (let idx = 0; idx < trList.length; idx++) {
+      const curTr = trList[idx]!;
+      if (!hasClassToken(curTr.attrs, 'athing') || hasClassToken(curTr.attrs, 'comtr')) continue;
+      const nextTr = trList[idx + 1];
+      if (!nextTr || hasClassToken(nextTr.attrs, 'athing')) continue;
+      const rowAttrs = parseTagAttrs(curTr.attrs);
+      const id = rowAttrs.id ?? '';
+      const tSpan = curTr.inner.includes('titleline') ? findFirstClassSubtreeLinear(curTr.inner, ['span'], 'titleline') : null;
+      const tAnchor = tSpan ? findFirstAnchorInFragment(tSpan.inner) : null;
+      if (!tAnchor?.text) continue;
+      const storyTitle = tAnchor.text;
+      const storyHref = addLink(tAnchor.href);
+      const siteSub = curTr.inner.includes('sitestr') ? findFirstClassSubtreeLinear(curTr.inner, ['span'], 'sitestr') : null;
+      const siteStr = siteSub ? cleanInlineHtml(siteSub.inner) : '';
+      const subHtml = nextTr.inner;
+      const scoreSub = subHtml.includes('score') ? findFirstClassSubtreeLinear(subHtml, ['span'], 'score') : null;
+      const pts = scoreSub ? cleanInlineHtml(scoreSub.inner) : '';
+      const byUser = findHnAuthorInFragment(subHtml) ?? '';
+      let lastAnchorText = '';
+      replacePairedHtmlElementsLinear(
+        subHtml,
+        ['a'],
+        (_f, _t, _a, aInner) => {
+          lastAnchorText = cleanInlineHtml(aInner);
+          return '';
+        },
+        { maxChars: 8_000, maxInnerChars: 500 },
+      );
+      const commentsPart =
+        id && /\bcomment|\bdiscuss/i.test(lastAnchorText)
+          ? `[${lastAnchorText}](${addLink(`https://news.ycombinator.com/item?id=${id}`)})`
+          : '';
+      const meta = [pts, byUser ? `by ${byUser}` : '', commentsPart].filter(Boolean).join(' · ');
+      const head = storyHref ? `**[${storyTitle}](${storyHref})**` : `**${storyTitle}**`;
+      listingItems.push(
+        `${listingItems.length + 1}. ${head}${siteStr ? ` *(${siteStr})*` : ''}${meta ? ` — ${meta}` : ''}`,
+      );
+      idx++; // skip consumed subtext row
+      if (listingItems.length >= 60) break;
+    }
   }
   if (listingItems.length >= 2) {
     return {
@@ -1287,26 +1559,24 @@ function extractHackerNewsMarkdown(
 }
 
 function cleanGitHubIssueOrPrMarkdown(md: string): string {
-  return md
-    // Strip duplicate sticky header (`## Title #100 user merged 1 commit into ...`) right below `# Title`.
-    .replace(/(^#\s+[^\n]+\n+(?:(?:Open|Closed|Merged|Draft)\n+[\s\S]{0,400}?\n+)?)##\s+[^\n]+#\d+\s+[^\n]+\n+/i, '$1')
-    // Strip sign-up wall & trailing right-sidebar metadata blocks (`### Reviewers`, `### Assignees`, `### Labels`, etc.).
-    .replace(
-      /\n+\[Sign up for free\]\(https:\/\/github\.com\/join[^)]*\)[\s\S]*$/i,
-      '',
-    )
-    .replace(
-      /\n+###\s+Reviewers\b[\s\S]*$/i,
-      '',
-    )
-    .trim();
+  let out = md.replace(/(^#\s+[^\n]+\n+(?:(?:Open|Closed|Merged|Draft)\n+[\s\S]{0,400}?\n+)?)##\s+[^\n]+#\d+\s+[^\n]+\n+/i, '$1');
+  const lower = asciiLower(out);
+  const signUpIdx = lower.indexOf('[sign up for free](https://github.com/join');
+  if (signUpIdx >= 0) {
+    out = out.slice(0, signUpIdx);
+  }
+  const revIdx = asciiLower(out).indexOf('\n### reviewers');
+  if (revIdx >= 0) {
+    out = out.slice(0, revIdx);
+  }
+  return out.trim();
 }
 
 function cleanArxivAbstractMarkdown(md: string): string {
   return md
     .replace(/^#\s+[^\n]+>\s+[^\n]+\n+/, '')
     .replace(/^#\s+Title:\s+/m, '# ')
-    .replace(/\n+###\s+(?:Current browse context|Bibliographic and Citation Tools|Code, Data and Media Associated with this Article|Demos|Recommenders and Search Tools|arXivLabs:)\b[\s\S]*$/i, '')
+    .replace(/\n###\s+(?:Current browse context|Bibliographic and Citation Tools|Code, Data and Media Associated with this Article|Demos|Recommenders and Search Tools|arXivLabs:)\b[\s\S]*$/i, '')
     .trim();
 }
 
@@ -1321,17 +1591,44 @@ function cleanArxivAbstractMarkdown(md: string): string {
 function standardizeElementsInHtml(html: string, stashCode?: (mdBlock: string) => string): string {
   let out = html;
 
-  // Strip pure line-number gutter cells in 2-column Chroma / Rouge / Highlight.js code tables, then unwrap 1x1 `<pre>` wrapper tables.
+  // Strip pure line-number gutter cells in 2-column Chroma / Rouge / Highlight.js code tables, then unwrap 1x1 `<pre>` wrapper tables (`R3-H1` linear O(N)).
   if (/(?:lntd|gutter|hljs-ln-numbers|blob-num)/i.test(out)) {
-    out = out
-      .replace(/<td\b[^>]*\b(?:lntd|gutter|hljs-ln-numbers|blob-num)\b[^>]*>([\s\S]{0,8000}?)<\/td>/gi, (full, inner: string) => {
+    out = replacePairedHtmlElementsLinear(
+      out,
+      ['td'],
+      (full, _t, attrStr, inner) => {
+        const clsTokens = (parseTagAttrs(attrStr).class ?? '').toLowerCase().split(/\s+/);
+        if (
+          !clsTokens.includes('lntd') &&
+          !clsTokens.includes('gutter') &&
+          !clsTokens.includes('hljs-ln-numbers') &&
+          !clsTokens.includes('blob-num')
+        ) {
+          return full;
+        }
         const plain = stripHtmlTagsQuoteAwareLinear(inner, '').trim();
         return /^[\d\s]+$/.test(plain) ? '' : full;
-      })
-      .replace(
-        /<table\b[^>]*>\s*(?:<tbody\b[^>]*>\s*)?<tr\b[^>]*>\s*<td\b[^>]*>(\s*<pre\b[\s\S]{0,60000}?<\/pre>\s*)<\/td>\s*<\/tr>\s*(?:<\/tbody>\s*)?<\/table>/gi,
-        '$1',
-      );
+      },
+      { maxInnerChars: 12_000 },
+    );
+    out = replacePairedHtmlElementsLinear(
+      out,
+      ['table'],
+      (full, _t, _attrStr, inner) => {
+        if (!/<pre\b/i.test(inner)) return full;
+        const strippedLayout = replaceHtmlTagsQuoteAwareLinear(
+          inner,
+          (t) => (t.tagNameLower === 'tbody' || t.tagNameLower === 'tr' || t.tagNameLower === 'td' ? '' : t.rawTag),
+          65_536,
+          false,
+        ).trim();
+        if (/^<pre\b/i.test(strippedLayout) && /<\/pre>$/i.test(strippedLayout)) {
+          return `\n\n${strippedLayout}\n\n`;
+        }
+        return full;
+      },
+      { maxInnerChars: 65_536 },
+    );
   }
 
   // Propagate Sphinx / ReadTheDocs two-level `<div class="highlight-python3 notranslate"><div class="highlight"><pre>` language onto inner `<pre>`.
@@ -1349,25 +1646,59 @@ function standardizeElementsInHtml(html: string, stashCode?: (mdBlock: string) =
     );
   }
 
-  // Convert GitHub / Sphinx syntax-highlighted `<div class="highlight ..."><pre>...</pre></div>` directly (stashing code so `<T>` is never stripped!).
+  // Convert GitHub / Sphinx syntax-highlighted `<div class="highlight ..."><pre>...</pre></div>` linearly (`R3-H1`: zero backtracking on `<div "`).
   if (out.includes('highlight')) {
-    out = out.replace(
-      /<div\b((?:"[^"]*"|'[^']*'|[^>"']){1,6000})>\s*<pre\b([^>]{0,600})>([\s\S]{0,100000}?)<\/pre>\s*<\/div>/gi,
-      (full, divAttrStr: string, preAttrStr: string, preInner: string) => {
-        if (!/\bhighlight\b/i.test(divAttrStr)) return full;
-        const divAttrs = parseTagAttrs(divAttrStr);
+    const src = out;
+    const chunks: string[] = [];
+    let lastCopied = 0;
+    const lowerSrc = asciiLower(src);
+    scanHtmlTagsLinear(
+      src,
+      (tag) => {
+        if (tag.index < lastCopied || tag.isClosing || tag.isSelfClosing || tag.tagNameLower !== 'div') return;
+        if (!tag.attrs.includes('highlight') && !tag.attrs.includes('HIGHLIGHT')) return;
+        const divAttrs = parseTagAttrs(tag.attrs);
         const cls = divAttrs.class ?? '';
-        if (!/\bhighlight\b/i.test(cls)) return full;
-        const lang = inferCodeFenceLang(divAttrStr, preAttrStr);
+        if (!cls.toLowerCase().split(/\s+/).includes('highlight')) return;
+
+        let afterDiv = tag.end;
+        while (afterDiv < src.length && (src.charCodeAt(afterDiv) === 32 || src.charCodeAt(afterDiv) === 9 || src.charCodeAt(afterDiv) === 10 || src.charCodeAt(afterDiv) === 13)) {
+          afterDiv++;
+        }
+        if (lowerSrc.slice(afterDiv, afterDiv + 4) !== '<pre' || (afterDiv + 4 < src.length && !isTagNameBoundary(src.charCodeAt(afterDiv + 4)))) {
+          return undefined;
+        }
+        const preOpenGt = src.indexOf('>', afterDiv + 4);
+        if (preOpenGt < 0 || preOpenGt - afterDiv > 800) return undefined;
+        const preAttrStr = src.slice(afterDiv + 4, preOpenGt);
+        const preCloseIdx = lowerSrc.indexOf('</pre>', preOpenGt + 1);
+        if (preCloseIdx < 0 || preCloseIdx - (preOpenGt + 1) > 100_000) return undefined;
+        let afterPre = preCloseIdx + 6;
+        while (afterPre < src.length && (src.charCodeAt(afterPre) === 32 || src.charCodeAt(afterPre) === 9 || src.charCodeAt(afterPre) === 10 || src.charCodeAt(afterPre) === 13)) {
+          afterPre++;
+        }
+        if (lowerSrc.slice(afterPre, afterPre + 6) !== '</div>') return undefined;
+
+        const preInner = src.slice(preOpenGt + 1, preCloseIdx);
+        const lang = inferCodeFenceLang(tag.attrs, preAttrStr);
         const rawClip = divAttrs['data-snippet-clipboard-copy-content'];
         const codeText =
           rawClip && rawClip.trim().length > 0
             ? rawClip
             : decodeHtmlEntities(stripHtmlTagsQuoteAwareLinear(preInner, ''));
         const block = `\n\n${makeSafeCodeFence(codeText.trim(), lang)}\n\n`;
-        return stashCode ? stashCode(block) : block;
+        chunks.push(src.slice(lastCopied, tag.index));
+        chunks.push(stashCode ? stashCode(block) : block);
+        lastCopied = afterPre + 6;
+        return undefined;
       },
+      MAX_HTML_SCAN_CHARS,
+      false,
     );
+    if (chunks.length > 0) {
+      chunks.push(src.slice(lastCopied));
+      out = chunks.join('');
+    }
   }
 
   // Convert GFM / HTML task-list checkboxes (`<input type="checkbox" checked>`) before generic void tags are stripped (`H1` linear O(N)).
@@ -1655,6 +1986,7 @@ export function extractHtmlDocument(
   } = {},
 ): ExtractedDocument {
   const { baseUrl, onlyMainContent = true, redactPii = false, includeImages = true, includeTags, excludeTags } = options;
+  const deadlineAt = Date.now() + 2_500;
   const boundedRawHtml = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
 
   const jsonLdEntities = flattenJsonLdEntities(boundedRawHtml);
@@ -2063,7 +2395,9 @@ export function extractHtmlDocument(
   const codeStash: string[] = [];
   const stashCode = (renderedCodeMd: string): string => `\u0000EFCODE${codeStash.push(renderedCodeMd) - 1}\u0000`;
 
-  work = standardizeElementsInHtml(work, stashCode);
+  if (Date.now() <= deadlineAt) {
+    work = standardizeElementsInHtml(work, stashCode);
+  }
 
   const collectAnchorLinks = (htmlSource: string): string[] => {
     const outLinks: string[] = [];
@@ -2259,7 +2593,7 @@ export function extractHtmlDocument(
     );
   }
 
-  if (/<table/i.test(md)) {
+  if (/<table/i.test(md) && Date.now() <= deadlineAt) {
     md = replacePairedHtmlElementsLinear(md, ['table'], (full, _t, _attrs, tbl) => {
       if (/<table\b/i.test(tbl)) return full;
       const rows: string[][] = [];
@@ -2503,15 +2837,15 @@ export function extractHtmlDocument(
     .replace(/\u0000EFFENCE(\d+)\u0000/g, (_m, idx: string) => codeStash[Number(idx)] ?? '')
     .replace(/\u0000EFCODE(\d+)\u0000/g, (_m, idx: string) => codeStash[Number(idx)] ?? '');
 
-  md = splitMarkdownByCodeFences(decodeMarkdownEntities(md))
+  md = splitMarkdownByCodeFences(decodeMarkdownEntitiesPreservingLt(md))
     .map((part, idx) => {
       if (idx % 2 === 1) return part;
-      return part
-        .replace(/`([^`\n]+)`(?=`[^`\n]+`)/g, '`$1` ')
-        .replace(/\[([^\[\]\n]+?)[ \t]*\((https?:\/\/[^)\s]+)\)\]\(\2\)/g, (_m, lbl: string, u: string) => `[${lbl.trim()}](${u})`)
-        .replace(/(\[[^\[\]\n]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1')
-        .replace(/([A-Za-z0-9])(\[[^\[\]\n]+\]\(https?:\/\/[^)\s]+\))/g, '$1 $2')
-        .replace(/(\[[^\[\]\n]+\]\(https?:\/\/[^)\s]+\))([A-Za-z0-9])/g, '$1 $2')
+      const withCleanLinks = sanitizeAndResolveMarkdownProseLinksLinear(part, {
+        baseUrl,
+        includeImages,
+        spaceAdjacentAlnum: true,
+      });
+      return withCleanLinks
         .split('\n')
         .map((line) => {
           const normalizedTask = line.replace(/^(\s*-\s+)\[\s*([xX])\s*\]/, '$1[x]');
@@ -2537,11 +2871,14 @@ export function extractHtmlDocument(
       /(^|\n\n)(js|javascript|ts|typescript|jsx|tsx|html|css|scss|json|bash|sh|shell|python|py|rust|go|sql|yaml|toml|xml|http|wasm)[ \t]*\n+```([a-z0-9_+#-]*)[ \t]*\n/gi,
       (_m, lead: string, rawLang: string, existingFenceLang: string) =>
         `${lead}\`\`\`${existingFenceLang.trim() || normalizeFenceLang(rawLang)}\n`,
-    )
-    .replace(/\n+##\s+Help improve MDN\b[\s\S]{0,600}$/i, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    );
+  if (md.slice(Math.max(0, md.length - 800)).toLowerCase().includes('help improve mdn')) {
+    md = md.replace(/\n+##[ \t]+Help improve MDN\b[\s\S]{0,600}$/i, '');
+  }
+  md = md.replace(/\n{3,}/g, '\n\n').trim();
 
+  let matchedSiteExtracted: PostFetchSiteResult | null = null;
+  let inertiaHydrated = false;
   if (ytMeta) {
     if (ytMeta.title) title = ytMeta.title;
     if (ytMeta.description) description = ytMeta.description.slice(0, 320);
@@ -2558,11 +2895,11 @@ export function extractHtmlDocument(
       }
       links = hnExtracted.links;
     }
-  } else if (onlyMainContent && (!includeTags || includeTags.length === 0)) {
+  } else if (onlyMainContent && (!includeTags || includeTags.length === 0) && Date.now() <= deadlineAt) {
     if (baseUrl && /^https?:\/\/github\.com\/[^/]+\/[^/]+\/(?:issues|pull)\/\d+/i.test(baseUrl)) {
       md = cleanGitHubIssueOrPrMarkdown(md);
     } else {
-      const siteExtracted = applyPostFetchSiteExtractor(rawHtml, baseUrl, md, (frag, fragBase) => {
+      const siteExtracted = applyPostFetchSiteExtractor(boundedRawHtml, baseUrl, md, (frag, fragBase) => {
         const sub = extractHtmlDocument(frag, {
           baseUrl: fragBase,
           onlyMainContent: false,
@@ -2571,6 +2908,7 @@ export function extractHtmlDocument(
         return { markdown: sub.markdown, links: sub.links };
       });
       if (siteExtracted) {
+        matchedSiteExtracted = siteExtracted;
         md = siteExtracted.markdown;
         if (siteExtracted.title) title = siteExtracted.title;
         if (siteExtracted.description && !description) description = siteExtracted.description;
@@ -2596,14 +2934,14 @@ export function extractHtmlDocument(
     if (mdWords < 30 && schemaMeta.articleBody) {
       const schemaWords = countTextWords(schemaMeta.articleBody);
       if (schemaWords > Math.max(40, mdWords * 2)) {
-        const cleanSchemaMd = /<[a-z][\s\S]*>/i.test(schemaMeta.articleBody)
+        const cleanSchemaMd = schemaMeta.articleBody.includes('<')
           ? cleanInlineHtml(schemaMeta.articleBody)
           : decodeHtmlEntities(schemaMeta.articleBody).trim();
         if (cleanSchemaMd) {
           md = title && !cleanSchemaMd.startsWith('# ') ? `# ${title}\n\n${cleanSchemaMd}` : cleanSchemaMd;
         }
       }
-    } else if (mdWords < 25 && noscriptChunks.length > 0) {
+    } else if (mdWords < 25 && noscriptChunks.length > 0 && Date.now() <= deadlineAt) {
       const rescuedDoc = extractHtmlDocument(noscriptChunks.join('\n\n'), {
         baseUrl,
         onlyMainContent: false,
@@ -2614,14 +2952,44 @@ export function extractHtmlDocument(
         if (links.length === 0 && rescuedDoc.links.length > 0) links = rescuedDoc.links;
       }
     }
+
+    // Inertia.js SSR `data-page` hydration unlock: extract structured `component` + `props` without Chromium when prose < 50 words.
+    if (
+      countTextWords(md) < 50 &&
+      (boundedRawHtml.includes('data-page="{&quot;component&quot;') || boundedRawHtml.includes("data-page='{\"component\""))
+    ) {
+      const inertiaPage = extractInertiaPagePropsLinear(boundedRawHtml);
+      if (inertiaPage) {
+        const inertiaDoc = formatInertiaPagePropsToMarkdown(inertiaPage, baseUrl, (frag, fragBase) => {
+          const sub = extractHtmlDocument(frag, {
+            baseUrl: fragBase,
+            onlyMainContent: false,
+            includeImages,
+          });
+          return { markdown: sub.markdown, links: sub.links };
+        });
+        if (inertiaDoc && inertiaDoc.markdown.trim()) {
+          md = inertiaDoc.markdown;
+          if (inertiaDoc.title && !title) title = inertiaDoc.title;
+          if (inertiaDoc.description && !description) description = inertiaDoc.description;
+          inertiaHydrated = true;
+        }
+      }
+    }
   }
 
-  let plainText = ytMeta ? ytMeta.markdown : hnExtracted ? hnExtracted.markdown : cleanInlineHtml(work);
+  let plainText = ytMeta
+    ? ytMeta.markdown
+    : hnExtracted
+      ? hnExtracted.markdown
+      : inertiaHydrated
+        ? md
+        : cleanInlineHtml(work);
   if (redactPii) {
     md = redactPiiText(md);
     plainText = redactPiiText(plainText);
   }
-  md = stripInvisibleSmugglingChars(md);
+  md = escapeResidualHtmlOutsideCodeLinear(stripInvisibleSmugglingChars(md), false);
   plainText = stripInvisibleSmugglingChars(plainText);
   const wordCount = countTextWords(md);
 
@@ -2637,6 +3005,14 @@ export function extractHtmlDocument(
     ...(canonicalUrl ? { canonicalUrl } : {}),
     ...(markdownAlternateUrl ? { markdownAlternateUrl } : {}),
     ...(favicon ? { favicon } : {}),
+    ...(matchedSiteExtracted?.extractorId ? { extractorId: matchedSiteExtracted.extractorId } : {}),
+    ...(matchedSiteExtracted?.records !== undefined ? { records: matchedSiteExtracted.records } : {}),
+    ...(matchedSiteExtracted?.pagination !== undefined ? { pagination: matchedSiteExtracted.pagination } : {}),
+    ...(matchedSiteExtracted?.total !== undefined ? { total: matchedSiteExtracted.total } : {}),
+    ...(matchedSiteExtracted?.returned !== undefined ? { returned: matchedSiteExtracted.returned } : {}),
+    ...(matchedSiteExtracted?.truncated !== undefined ? { truncated: matchedSiteExtracted.truncated } : {}),
+    ...(matchedSiteExtracted?.nextCursor !== undefined ? { nextCursor: matchedSiteExtracted.nextCursor } : {}),
+    ...(inertiaHydrated ? { inertiaHydrated: true } : {}),
     markdown: md,
     text: plainText,
     links,
@@ -2652,6 +3028,147 @@ export function extractHtmlDocument(
       ...(colors.length > 0 ? { colors } : {}),
       ...(fonts.length > 0 ? { fonts } : {}),
     },
+  };
+}
+
+const INERTIA_SKIP_PROP_KEYS = new Set([
+  'errors',
+  'flash',
+  'ziggy',
+  'csrf_token',
+  '_token',
+  'jetstream',
+  'locale',
+  'locales',
+  'translations',
+  '__inertia',
+]);
+
+/**
+ * Renders an Inertia.js `data-page` payload (`{ component, props, url, version }`) into a clean GFM summary
+ * of the component and its non-boilerplate props so Laravel/Rails Inertia apps extract without Chromium.
+ */
+export function formatInertiaPagePropsToMarkdown(
+  inertiaObj: Record<string, unknown>,
+  baseUrl?: string,
+  htmlToMd?: (frag: string, base?: string) => { markdown: string; links: string[] },
+): { title?: string; description?: string; markdown: string } | null {
+  const component = typeof inertiaObj.component === 'string' ? inertiaObj.component.trim() : '';
+  if (!component) return null;
+  const rawProps =
+    inertiaObj.props && typeof inertiaObj.props === 'object' && !Array.isArray(inertiaObj.props)
+      ? (inertiaObj.props as Record<string, unknown>)
+      : {};
+
+  let bestTitle = '';
+  let bestDescription = '';
+  let visited = 0;
+
+  const escapeCell = (val: unknown): string =>
+    String(val ?? '')
+      .replace(/\r?\n+/g, ' ')
+      .replace(/\|/g, '\\|')
+      .trim()
+      .slice(0, 160);
+
+  const convertRichString = (raw: string): string => {
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    if (htmlToMd && /<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|em|a|table|blockquote)\b/i.test(trimmed)) {
+      return htmlToMd(trimmed, baseUrl).markdown.trim();
+    }
+    return trimmed;
+  };
+
+  const renderObjectFields = (obj: Record<string, unknown>, depth: number): string[] => {
+    if (depth > 3 || visited > 400) return [];
+    const bullets: string[] = [];
+    const subBlocks: string[] = [];
+    for (const [k, v] of Object.entries(obj)) {
+      if (visited++ > 400) break;
+      const lower = k.toLowerCase();
+      if (INERTIA_SKIP_PROP_KEYS.has(lower) || v === null || v === undefined || v === '') continue;
+      if (lower === 'auth' && typeof v === 'object' && !Array.isArray(v) && !(v as Record<string, unknown>).user) {
+        continue;
+      }
+      if (typeof v === 'string') {
+        const clean = v.trim();
+        if (!clean) continue;
+        if (!bestTitle && (lower === 'title' || lower === 'pagetitle' || lower === 'headline' || lower === 'name') && clean.length <= 180) {
+          bestTitle = clean;
+        }
+        if (!bestDescription && (lower === 'description' || lower === 'summary' || lower === 'excerpt') && clean.length >= 20 && clean.length <= 400 && !/<[a-z]/i.test(clean)) {
+          bestDescription = clean;
+        }
+        const isProse =
+          clean.length >= 80 ||
+          lower === 'body' ||
+          lower === 'content' ||
+          lower === 'markdown' ||
+          lower === 'html' ||
+          lower === 'descriptionhtml';
+        if (isProse && /\s/.test(clean)) {
+          const rich = convertRichString(clean);
+          if (rich) subBlocks.push(rich);
+        } else {
+          bullets.push(`- **${k}**: ${clean.slice(0, 300)}`);
+        }
+      } else if (typeof v === 'number' || typeof v === 'boolean') {
+        bullets.push(`- **${k}**: ${String(v)}`);
+      } else if (Array.isArray(v) && v.length > 0) {
+        const slice = v.slice(0, 40);
+        if (slice.every((it) => typeof it === 'string' || typeof it === 'number' || typeof it === 'boolean')) {
+          bullets.push(`- **${k}**: ${slice.map(String).join(', ')}`);
+        } else if (slice.every((it) => it && typeof it === 'object' && !Array.isArray(it))) {
+          const firstRow = slice[0] as Record<string, unknown>;
+          const cols = Object.keys(firstRow)
+            .filter((ck) => {
+              const cv = firstRow[ck];
+              return typeof cv === 'string' || typeof cv === 'number' || typeof cv === 'boolean';
+            })
+            .slice(0, 6);
+          if (cols.length >= 2) {
+            const header = `| ${cols.map(escapeCell).join(' | ')} |`;
+            const sep = `| ${cols.map(() => '---').join(' | ')} |`;
+            const rows = slice.map((it) => {
+              const r = it as Record<string, unknown>;
+              return `| ${cols.map((c) => escapeCell(r[c])).join(' | ')} |`;
+            });
+            subBlocks.push(`### ${k}\n\n${[header, sep, ...rows].join('\n')}`);
+          } else {
+            const itemLines: string[] = [];
+            for (const it of slice) {
+              const r = it as Record<string, unknown>;
+              const label = String(r.title ?? r.name ?? r.label ?? r.id ?? '').trim();
+              const desc = typeof r.body === 'string' ? convertRichString(r.body) : typeof r.description === 'string' ? convertRichString(r.description) : '';
+              if (label && desc) itemLines.push(`- **${label}**: ${desc.slice(0, 400)}`);
+              else if (label) itemLines.push(`- ${label}`);
+            }
+            if (itemLines.length > 0) subBlocks.push(`### ${k}\n\n${itemLines.join('\n')}`);
+          }
+        }
+      } else if (typeof v === 'object' && !Array.isArray(v) && depth < 2) {
+        const nestedParts = renderObjectFields(v as Record<string, unknown>, depth + 1);
+        if (nestedParts.length > 0) {
+          subBlocks.push(`${depth === 0 ? '##' : '###'} ${k}\n\n${nestedParts.join('\n\n')}`);
+        }
+      }
+    }
+    const out: string[] = [];
+    if (bullets.length > 0) out.push(bullets.join('\n'));
+    out.push(...subBlocks);
+    return out;
+  };
+
+  const propSections = renderObjectFields(rawProps, 0);
+  if (propSections.length === 0) return null;
+
+  const headingTitle = bestTitle || component.replace(/\//g, ' — ');
+  const sections = [`# ${headingTitle}`, `- **Inertia Component**: \`${component}\``, ...propSections];
+  return {
+    ...(bestTitle ? { title: bestTitle } : {}),
+    ...(bestDescription ? { description: bestDescription } : {}),
+    markdown: sections.join('\n\n').trim(),
   };
 }
 
@@ -2828,12 +3345,17 @@ export function extractStructuredJsonFromPage(
     }
 
     if (val === undefined) {
+      const mdWithoutFences = doc.markdown
+        ? splitMarkdownByCodeFences(doc.markdown)
+            .filter((_, idx) => idx % 2 === 0)
+            .join('')
+        : '';
+      const mdScanSlice = doc.markdown ? doc.markdown.slice(0, 65_536) : '';
       if (lowerProp === 'title' || lowerProp === 'name' || lowerProp === 'headline') val = doc.title;
       else if (lowerProp === 'description' || lowerProp === 'summary' || lowerProp === 'overview') {
         val = doc.description;
-        if (!val && doc.markdown) {
-          const proseBlocks = doc.markdown
-            .replace(/```[\s\S]*?```/g, '')
+        if (!val && mdWithoutFences) {
+          const proseBlocks = mdWithoutFences
             .split(/\n{2,}/)
             .map((b) => b.trim())
             .filter(
@@ -2842,17 +3364,17 @@ export function extractStructuredJsonFromPage(
                 !/^(?:#{1,6}\s|>|\||[-*]\s|\d+\.\s|!\[)/.test(b),
             );
           if (proseBlocks[0]) {
-            val = proseBlocks[0].replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/\s+/g, ' ').trim().slice(0, 500);
+            val = stripMarkdownLinksToLabelsLinear(proseBlocks[0]).replace(/\s+/g, ' ').trim().slice(0, 500);
           }
         }
       } else if (lowerProp === 'url' || lowerProp === 'canonicalurl') val = doc.canonicalUrl;
       else if (lowerProp === 'links') val = doc.links;
       else if (lowerProp === 'images') val = doc.images.map((i) => i.url);
-      else if (propSpec?.type === 'array' && doc.markdown) {
-        const cleanMd = doc.markdown.replace(/```[\s\S]*?```/g, '');
+      else if (propSpec?.type === 'array' && mdWithoutFences) {
+        const cleanMd = mdWithoutFences;
         if (/headings|sections|topics/i.test(propName)) {
-          const headings = [...cleanMd.matchAll(/^#{2,3}\s+(.+)$/gm)]
-            .map((m) => m[1]!.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim())
+          const headings = [...cleanMd.matchAll(/^#{2,3}[ \t]+(.+)$/gm)]
+            .map((m) => stripMarkdownLinksToLabelsLinear(m[1]!).trim())
             .filter(Boolean)
             .slice(0, 20);
           if (headings.length > 0) val = headings;
@@ -2865,17 +3387,17 @@ export function extractStructuredJsonFromPage(
           const lines = cleanMd.split(/\r?\n/);
           const collectBullets = (subset: string[]): string[] =>
             subset
-              .map((l) => /^(?:[-*]|\d+\.)\s+(.+)$/.exec(l.trim())?.[1] ?? '')
-              .map((s) => s.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1').trim())
+              .map((l) => /^(?:[-*]|\d+\.)[ \t]+(.+)$/.exec(l.trim())?.[1] ?? '')
+              .map((s) => stripMarkdownLinksToLabelsLinear(s).replace(/\*{1,2}([^*\n]+)\*{1,2}/g, '$1').trim())
               .filter((s) => s.length >= 4)
               .slice(0, 15);
           if (propWords.length > 0) {
             for (let i = 0; i < lines.length; i++) {
-              const hm = /^#{1,4}\s+(.+)$/.exec(lines[i]!.trim());
+              const hm = /^#{1,4}[ \t]+(.+)$/.exec(lines[i]!.trim());
               if (hm && propWords.some((w) => hm[1]!.toLowerCase().includes(w))) {
                 const sectionLines: string[] = [];
                 for (let j = i + 1; j < lines.length; j++) {
-                  if (/^#{1,3}\s+/.test(lines[j]!.trim())) break;
+                  if (/^#{1,3}[ \t]+/.test(lines[j]!.trim())) break;
                   sectionLines.push(lines[j]!);
                 }
                 const secBullets = collectBullets(sectionLines);
@@ -2891,38 +3413,44 @@ export function extractStructuredJsonFromPage(
             if (allBullets.length > 0) val = allBullets;
           }
         }
-      } else if (propName.length <= 80) {
-        const fuzzyKey = escapeRegexLiteral(propName)
-          .replace(/([a-z0-9])([A-Z])/g, '$1[\\s_-]*$2')
-          .replace(/(?:\\_|\\-)+|[_-]+/g, '[\\s_-]*');
-        const kvRe = new RegExp(`(?:^|\\n)[ \\t]*(?:[-*][ \\t]*)?\\*{0,2}${fuzzyKey}\\*{0,2}[ \\t]*:[ \\t]*([^\\n]+)`, 'i');
-        const m = kvRe.exec(doc.markdown);
-        if (m?.[1]) {
-          val = m[1].replace(/^`([^`]+)`$/, '$1').trim();
+      } else if (propName.length <= 80 && /[A-Za-z0-9]/.test(propName)) {
+        const trimmedKey = propName.replace(/^[\s_-]+|[\s_-]+$/g, '');
+        if (trimmedKey && /[A-Za-z0-9]/.test(trimmedKey) && mdScanSlice) {
+          const fuzzyKey = escapeRegexLiteral(trimmedKey)
+            .replace(/([a-z0-9])([A-Z])/g, '$1[ \\t_-]{0,8}$2')
+            .replace(/(?:\\_|\\-)+|[_-\s]+/g, '[ \\t_-]{0,8}');
+          const kvRe = new RegExp(
+            `(?:^|\\n)[ \\t]{0,32}(?:[-*][ \\t]{0,16})?\\*{0,2}${fuzzyKey}\\*{0,2}[ \\t]{0,16}:[ \\t]{0,16}([^\\r\\n]{1,500})`,
+            'i',
+          );
+          const m = kvRe.exec(mdScanSlice);
+          if (m?.[1]) {
+            val = m[1].replace(/^`([^`]+)`$/, '$1').trim();
+          }
         }
         if (val === undefined && /^(?:version|latestversion|currentversion|release)$/i.test(lowerProp)) {
           const verFromHeading =
-            /^#{1,2}\s+[^\r\n#]*?\bv?(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)\b/m.exec(doc.markdown)?.[1] ??
+            /^#{1,2}[ \t]+[^\r\n#]{0,120}?\bv?(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)\b/m.exec(mdScanSlice)?.[1] ??
             /\bv?(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?)\b/.exec(doc.title ?? '')?.[1];
           if (verFromHeading) val = verFromHeading;
         }
         if (val === undefined && /^(?:installcommand|install|installation)$/i.test(lowerProp) && propSpec?.type !== 'array') {
           const installMatch =
-            /\b((?:pip3?|uv\s+(?:pip\s+install|add)|poetry\s+add|conda\s+install|npm\s+(?:install|i|add|create)|pnpm\s+(?:add|install|i|create)|yarn\s+(?:add|create)|bun\s+(?:add|install|i|create)|cargo\s+(?:add|install)|go\s+(?:get|install)|brew\s+install|gem\s+install|composer\s+require|dotnet\s+add\s+package)\s+[^\r\n`"'|;]{1,120})/i.exec(
-              doc.markdown,
+            /\b((?:pip3?|uv[ \t]+(?:pip[ \t]+install|add)|poetry[ \t]+add|conda[ \t]+install|npm[ \t]+(?:install|i|add|create)|pnpm[ \t]+(?:add|install|i|create)|yarn[ \t]+(?:add|create)|bun[ \t]+(?:add|install|i|create)|cargo[ \t]+(?:add|install)|go[ \t]+(?:get|install)|brew[ \t]+install|gem[ \t]+install|composer[ \t]+require|dotnet[ \t]+add[ \t]+package)[ \t]+[^\r\n`"'|;]{1,120})/i.exec(
+              mdScanSlice,
             );
           if (installMatch?.[1]) {
-            val = installMatch[1].replace(/\s+#.*$/, '').trim();
+            val = installMatch[1].replace(/[ \t]+#.*$/, '').trim();
           }
         }
         if (val === undefined && /^(?:license|spdxlicense)$/i.test(lowerProp)) {
           const licHeading =
-            /(?:^|\n)(?:#{1,4}\s*License|\*\*License\*\*|License\s*:)\s*\r?\n+([^\r\n#|]{2,120})/i.exec(doc.markdown)?.[1] ??
-            /\b((?:MIT|Apache-2\.0|Apache\s+Software\s+License|BSD-[23]-Clause|BSD\s+License|GPL-[23]\.0(?:-only|-or-later)?|LGPL-[23]\.[01]|MPL-2\.0|ISC|Unlicense)(?:\s*\([^)\r\n]{1,40}\))?)\b/i.exec(
-              doc.markdown,
+            /(?:^|\n)(?:#{1,4}[ \t]*License|\*\*License\*\*|License[ \t]*:)[ \t]*\r?\n+([^\r\n#|]{2,120})/i.exec(mdScanSlice)?.[1] ??
+            /\b((?:MIT|Apache-2\.0|Apache[ \t]+Software[ \t]+License|BSD-[23]-Clause|BSD[ \t]+License|GPL-[23]\.0(?:-only|-or-later)?|LGPL-[23]\.[01]|MPL-2\.0|ISC|Unlicense)(?:[ \t]*\([^)\r\n]{1,40}\))?)\b/i.exec(
+              mdScanSlice,
             )?.[1];
           if (licHeading) {
-            val = licHeading.replace(/^[-*]\s+/, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim();
+            val = stripMarkdownLinksToLabelsLinear(licHeading.replace(/^[-*][ \t]+/, '')).trim();
           }
         }
       }
@@ -2987,7 +3515,7 @@ export function extractPdfTitle(md: string, urlStr?: string): string | undefined
   }
   if (urlStr) {
     try {
-      const seg = decodeURIComponent(new URL(urlStr).pathname.split('/').pop() ?? '').replace(/\.pdf$/i, '');
+      const seg = safeDecodeURIComponent(new URL(urlStr).pathname.split('/').pop() ?? '').replace(/\.pdf$/i, '');
       if (seg) return seg.replace(/[-_]+/g, ' ').trim();
     } catch {
       // ignore
@@ -3442,6 +3970,7 @@ export interface ScrapeRequestPayload {
   maxAgeMs?: unknown;
   maxAge?: unknown;
   discoverLlmsTxt?: unknown;
+  preferOriginMarkdown?: unknown;
   redactPii?: unknown;
   checkPromptInjection?: unknown;
   query?: unknown;
@@ -3502,20 +4031,551 @@ function dedupeConsecutiveStandaloneLinkParagraphs(prose: string): string {
   return out.join('\n\n');
 }
 
-function resolveMarkdownRelativeLinksInProse(prose: string, baseUrl?: string): string {
-  if (!baseUrl) return prose;
-  return prose.replace(/(`+[^`\n]*`+)|(!?\[(?:!\[[^\[\]\n]*\]\([^)\n]*\)|[^\[\]\n])*\])\(([^)\s]+)(\s+"[^"\n]*")?\)/g, (full, codeSpan, labelPart, rawHref, titleSuffix) => {
-    if (codeSpan) return String(codeSpan);
-    const href = String(rawHref ?? '');
-    if (!/^(?:\/(?!\/)|\.{1,2}\/)/.test(href)) return full;
-    try {
-      const resolved = new URL(href, baseUrl);
-      if (resolved.protocol !== 'https:' && resolved.protocol !== 'http:') return full;
-      return `${String(labelPart)}(${resolved.toString()}${titleSuffix ?? ''})`;
-    } catch {
-      return full;
+interface MarkdownLineScanCursors {
+  nextCloseBracket: number;
+  noCloseBracket: boolean;
+  nextCloseParen: number;
+  noCloseParen: boolean;
+  noTickMask: number;
+}
+
+interface ParsedMarkdownLinkToken {
+  isImage: boolean;
+  rawLabel: string;
+  rawUrl: string;
+  titleSuffix: string;
+  end: number;
+}
+
+function createMarkdownLineScanCursors(): MarkdownLineScanCursors {
+  return {
+    nextCloseBracket: -1,
+    noCloseBracket: false,
+    nextCloseParen: -1,
+    noCloseParen: false,
+    noTickMask: 0,
+  };
+}
+
+function scanCodeSpanEndLinear(line: string, start: number, cursors: MarkdownLineScanCursors): { tickEnd: number; spanEnd: number } {
+  let tickEnd = start + 1;
+  while (tickEnd < line.length && line.charCodeAt(tickEnd) === 96) tickEnd++;
+  const tickLen = tickEnd - start;
+  if (tickLen < 31 && (cursors.noTickMask & (1 << tickLen)) !== 0) {
+    return { tickEnd, spanEnd: -1 };
+  }
+  let pos = tickEnd;
+  while (pos < line.length) {
+    const idx = line.indexOf('`', pos);
+    if (idx < 0) break;
+    let runEnd = idx + 1;
+    while (runEnd < line.length && line.charCodeAt(runEnd) === 96) runEnd++;
+    if (runEnd - idx === tickLen) {
+      return { tickEnd, spanEnd: runEnd };
     }
-  });
+    pos = runEnd;
+  }
+  if (tickLen < 31) cursors.noTickMask |= 1 << tickLen;
+  return { tickEnd, spanEnd: -1 };
+}
+
+function hasDangerousUriScheme(rawHref: string): boolean {
+  if (!rawHref) return false;
+  const decoded = decodeHtmlEntities(rawHref)
+    .replace(/[\u0000-\u0020\u007F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]+/gu, '')
+    .trim();
+  return /^(?:javascript|vbscript|data|file|blob):/i.test(decoded);
+}
+
+function tryParseMarkdownLinkOrImageAt(
+  line: string,
+  pos: number,
+  cursors: MarkdownLineScanCursors,
+  allowNestedImage = true,
+): ParsedMarkdownLinkToken | null {
+  const c0 = line.charCodeAt(pos);
+  let isImage = false;
+  let labelStart = pos + 1;
+  if (c0 === 33) {
+    if (pos + 1 >= line.length || line.charCodeAt(pos + 1) !== 91) return null;
+    isImage = true;
+    labelStart = pos + 2;
+  } else if (c0 !== 91) {
+    return null;
+  }
+
+  if (cursors.noCloseBracket) return null;
+  if (cursors.nextCloseBracket < labelStart) {
+    cursors.nextCloseBracket = line.indexOf(']', labelStart);
+    if (cursors.nextCloseBracket < 0) {
+      cursors.noCloseBracket = true;
+      return null;
+    }
+  }
+  if (cursors.nextCloseBracket - labelStart > 1_000) return null;
+
+  const labelMaxEnd = Math.min(line.length, labelStart + 1_000);
+  let labelEnd = -1;
+  let j = labelStart;
+  while (j < labelMaxEnd) {
+    const ch = line.charCodeAt(j);
+    if (ch === 92) {
+      j += 2;
+      continue;
+    }
+    if (ch === 93) {
+      labelEnd = j;
+      break;
+    }
+    if (!isImage && allowNestedImage && ch === 33 && j + 1 < labelMaxEnd && line.charCodeAt(j + 1) === 91) {
+      const nestedCursors = createMarkdownLineScanCursors();
+      const nestedImg = tryParseMarkdownLinkOrImageAt(line, j, nestedCursors, false);
+      if (!nestedImg) return null;
+      j = nestedImg.end;
+      continue;
+    }
+    if (ch === 91 || (ch === 33 && j + 1 < labelMaxEnd && line.charCodeAt(j + 1) === 91)) {
+      return null;
+    }
+    j++;
+  }
+  if (labelEnd < 0 || labelEnd + 1 >= line.length || line.charCodeAt(labelEnd + 1) !== 40) {
+    return null;
+  }
+
+  const destStart = labelEnd + 2;
+  if (cursors.noCloseParen) return null;
+  if (cursors.nextCloseParen < destStart) {
+    cursors.nextCloseParen = line.indexOf(')', destStart);
+    if (cursors.nextCloseParen < 0) {
+      cursors.noCloseParen = true;
+      return null;
+    }
+  }
+  if (cursors.nextCloseParen - destStart > 2_560) return null;
+
+  let k = destStart;
+  while (k < line.length && (line.charCodeAt(k) === 32 || line.charCodeAt(k) === 9)) k++;
+  if (k >= line.length) return null;
+
+  let rawUrl = '';
+  if (line.charCodeAt(k) === 60) {
+    const angleLimit = Math.min(line.length, k + 2_049);
+    let gt = -1;
+    for (let p = k + 1; p < angleLimit; p++) {
+      const pc = line.charCodeAt(p);
+      if (pc === 62) {
+        gt = p;
+        break;
+      }
+      if (pc === 60 || pc === 10 || pc === 13) return null;
+    }
+    if (gt < 0) return null;
+    rawUrl = line.slice(k + 1, gt).trim();
+    k = gt + 1;
+  } else {
+    const urlStart = k;
+    const urlLimit = Math.min(line.length, urlStart + 2_048);
+    let parenDepth = 0;
+    while (k < urlLimit) {
+      const uc = line.charCodeAt(k);
+      if (uc === 92 && k + 1 < urlLimit) {
+        k += 2;
+        continue;
+      }
+      if (uc === 32 || uc === 9) {
+        break;
+      }
+      if (uc === 40) {
+        parenDepth++;
+        if (parenDepth > 4) return null;
+      } else if (uc === 41) {
+        if (parenDepth === 0) break;
+        parenDepth--;
+      } else if (uc === 93 && k + 1 < urlLimit && line.charCodeAt(k + 1) === 40) {
+        return null;
+      }
+      k++;
+    }
+    if (parenDepth !== 0) return null;
+    rawUrl = line.slice(urlStart, k);
+  }
+
+  const wsStart = k;
+  while (k < line.length && (line.charCodeAt(k) === 32 || line.charCodeAt(k) === 9)) k++;
+  let titleSuffix = '';
+  if (k < line.length && k > wsStart && (line.charCodeAt(k) === 34 || line.charCodeAt(k) === 39)) {
+    const quoteChar = line.charCodeAt(k);
+    const titleLimit = Math.min(line.length, k + 512);
+    let qEnd = -1;
+    for (let p = k + 1; p < titleLimit; p++) {
+      const tc = line.charCodeAt(p);
+      if (tc === 92) {
+        p++;
+        continue;
+      }
+      if (tc === quoteChar) {
+        qEnd = p;
+        break;
+      }
+    }
+    if (qEnd < 0) return null;
+    titleSuffix = line.slice(wsStart, qEnd + 1);
+    k = qEnd + 1;
+    while (k < line.length && (line.charCodeAt(k) === 32 || line.charCodeAt(k) === 9)) k++;
+  }
+
+  if (k >= line.length || line.charCodeAt(k) !== 41) return null;
+  return {
+    isImage,
+    rawLabel: line.slice(labelStart, labelEnd),
+    rawUrl,
+    titleSuffix,
+    end: k + 1,
+  };
+}
+
+/** Strips `[label](url)` -> `label` and `![alt](url)` -> `alt` in guaranteed O(N) linear time. */
+function stripMarkdownLinksToLabelsLinear(text: string): string {
+  if (!text || (!text.includes('](') && !text.includes('<'))) return text;
+  const bounded = text.length > MAX_HTML_SCAN_CHARS ? text.slice(0, MAX_HTML_SCAN_CHARS) : text;
+  return bounded
+    .split('\n')
+    .map((line) => {
+      if (!line.includes('](')) return line;
+      const cursors = createMarkdownLineScanCursors();
+      let out = '';
+      let lastIdx = 0;
+      let i = 0;
+      while (i < line.length) {
+        const ch = line.charCodeAt(i);
+        if (ch === 96) {
+          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+          i = spanEnd > 0 ? spanEnd : tickEnd;
+          continue;
+        }
+        if (ch === 33 || ch === 91) {
+          const tok = tryParseMarkdownLinkOrImageAt(line, i, cursors, true);
+          if (tok) {
+            out += line.slice(lastIdx, i);
+            const cleanLabel = tok.rawLabel.includes('](') ? stripMarkdownLinksToLabelsLinear(tok.rawLabel) : tok.rawLabel;
+            out += cleanLabel;
+            i = tok.end;
+            lastIdx = i;
+            continue;
+          }
+        }
+        i++;
+      }
+      return lastIdx === 0 ? line : out + line.slice(lastIdx);
+    })
+    .join('\n');
+}
+
+function isAsciiAlnumCode(c: number): boolean {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+/**
+ * Normalizes inline code spacing (`\`a\`\`b\`` -> `\`a\` \`b\``), duplicate link suffixes (`[lbl (url)](url)` / `[lbl](url)(url)`),
+ * relative URL resolution, dangerous URI scheme stripping (`javascript:`, `vbscript:`, `data:`, `file:`, `blob:`),
+ * autolink conversion (`<https://...>` -> `[https://...](https://...)`), and decorative/optional image stripping in O(N) time.
+ */
+function sanitizeAndResolveMarkdownProseLinksLinear(
+  prose: string,
+  opts: { baseUrl?: string; includeImages?: boolean; spaceAdjacentAlnum?: boolean } = {},
+): string {
+  if (!prose) return prose;
+  if (!prose.includes('](') && !prose.includes('<') && !prose.includes('`') && !prose.includes(']:')) {
+    return prose;
+  }
+  const { baseUrl, includeImages = true, spaceAdjacentAlnum = false } = opts;
+  const bounded = prose.length > MAX_HTML_SCAN_CHARS ? prose.slice(0, MAX_HTML_SCAN_CHARS) : prose;
+  return bounded
+    .split('\n')
+    .map((line) => {
+      // Strip dangerous reference-link definitions (`[id]: javascript:alert(1)`) in O(1) fast-path + bounded linear check.
+      const trimmedLead = line.trimStart();
+      if (trimmedLead.startsWith('[') && line.includes(']:')) {
+        const closeDef = trimmedLead.indexOf(']:');
+        if (closeDef > 1 && closeDef <= 205) {
+          const rhs = trimmedLead.slice(closeDef + 2).trim();
+          const destToken = rhs.startsWith('<') ? rhs.slice(1, rhs.indexOf('>') > 0 ? rhs.indexOf('>') : rhs.length) : (rhs.split(/\s+/)[0] ?? '');
+          if (hasDangerousUriScheme(destToken)) {
+            return '';
+          }
+        }
+      }
+      if (!line.includes('](') && !line.includes('<') && !line.includes('`')) {
+        return line;
+      }
+
+      const cursors = createMarkdownLineScanCursors();
+      let out = '';
+      let lastCopyIdx = 0;
+      let i = 0;
+      while (i < line.length) {
+        const ch = line.charCodeAt(i);
+        // 1. Preserve inline backtick code spans untouched (spacing adjacent single-backtick spans when requested).
+        if (ch === 96) {
+          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+          if (spanEnd > 0) {
+            if (spaceAdjacentAlnum && spanEnd < line.length && line.charCodeAt(spanEnd) === 96) {
+              out += `${line.slice(lastCopyIdx, spanEnd)} `;
+              lastCopyIdx = spanEnd;
+            }
+            i = spanEnd;
+          } else {
+            i = tickEnd;
+          }
+          continue;
+        }
+
+        // 2. Handle angle-bracket autolinks (`<https://...>`, `<mailto:...>`, `<javascript:...>`).
+        if (ch === 60 && i + 3 < line.length) {
+          const gtLimit = Math.min(line.length, i + 2_049);
+          let gt = -1;
+          for (let p = i + 1; p < gtLimit; p++) {
+            const pc = line.charCodeAt(p);
+            if (pc === 62) {
+              gt = p;
+              break;
+            }
+            if (pc <= 32 || pc === 60) break;
+          }
+          if (gt > i + 2) {
+            const innerAuto = line.slice(i + 1, gt);
+            if (hasDangerousUriScheme(innerAuto)) {
+              out += line.slice(lastCopyIdx, i);
+              i = gt + 1;
+              lastCopyIdx = i;
+              continue;
+            }
+            if (/^https?:\/\/\S+$/i.test(innerAuto)) {
+              out += `${line.slice(lastCopyIdx, i)}[${innerAuto}](${innerAuto})`;
+              i = gt + 1;
+              lastCopyIdx = i;
+              continue;
+            }
+            if (/^mailto:[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(innerAuto)) {
+              const addr = innerAuto.slice(7);
+              out += `${line.slice(lastCopyIdx, i)}[${addr}](${innerAuto})`;
+              i = gt + 1;
+              lastCopyIdx = i;
+              continue;
+            }
+          }
+        }
+
+        // 3. Handle Markdown links `[label](url)` and images `![alt](url)`.
+        if (ch === 33 || ch === 91) {
+          if (cursors.noCloseBracket || cursors.noCloseParen) {
+            // Neither links nor images can match anywhere later on this line; if no `<` or `` ` `` remains, finish in O(1)!
+            if (line.indexOf('<', i + 1) < 0 && line.indexOf('`', i + 1) < 0) {
+              break;
+            }
+            i++;
+            continue;
+          }
+          const tok = tryParseMarkdownLinkOrImageAt(line, i, cursors, true);
+          if (tok) {
+            let href = tok.rawUrl.trim();
+            let nextIdx = tok.end;
+
+            if (!href || hasDangerousUriScheme(href)) {
+              out += line.slice(lastCopyIdx, i);
+              if (!tok.isImage) {
+                const cleanLbl = tok.rawLabel.includes('](')
+                  ? sanitizeAndResolveMarkdownProseLinksLinear(tok.rawLabel, { baseUrl, includeImages })
+                  : tok.rawLabel;
+                out += cleanLbl;
+              }
+              i = nextIdx;
+              lastCopyIdx = i;
+              continue;
+            }
+
+            if (baseUrl && /^(?:\/(?!\/)|\.{1,2}\/)/.test(href)) {
+              try {
+                const resolved = new URL(href, baseUrl);
+                if (resolved.protocol === 'https:' || resolved.protocol === 'http:') {
+                  href = resolved.toString();
+                }
+              } catch {
+                // keep relative href when baseUrl cannot parse
+              }
+            }
+
+            if (tok.isImage) {
+              out += line.slice(lastCopyIdx, i);
+              if (!includeImages || isTinyOrAvatarImageUrl(href, tok.rawLabel)) {
+                i = nextIdx;
+                lastCopyIdx = i;
+                continue;
+              }
+              out += `![${tok.rawLabel}](${href}${tok.titleSuffix})`;
+              // Separate consecutive inline images (`![a](u1) ![b](u2)`) onto distinct paragraphs.
+              let wsAfter = nextIdx;
+              while (wsAfter < line.length && (line.charCodeAt(wsAfter) === 32 || line.charCodeAt(wsAfter) === 9)) wsAfter++;
+              if (wsAfter < line.length - 1 && line.charCodeAt(wsAfter) === 33 && line.charCodeAt(wsAfter + 1) === 91) {
+                out += '\n\n';
+                nextIdx = wsAfter;
+              }
+              i = nextIdx;
+              lastCopyIdx = i;
+              continue;
+            }
+
+            // Skip `[Skip to content](#...)` anchor boilerplate.
+            if (href.startsWith('#') && /^skip to (?:main )?content$/i.test(tok.rawLabel.trim())) {
+              out += line.slice(lastCopyIdx, i);
+              while (nextIdx < line.length && (line.charCodeAt(nextIdx) === 32 || line.charCodeAt(nextIdx) === 9)) nextIdx++;
+              i = nextIdx;
+              lastCopyIdx = i;
+              continue;
+            }
+
+            let labelOut = tok.rawLabel;
+            if (labelOut.includes('](') || labelOut.includes('<')) {
+              labelOut = sanitizeAndResolveMarkdownProseLinksLinear(labelOut, { baseUrl, includeImages });
+            }
+            // Strip redundant `(https://same-url)` suffix inside `[label (https://same-url)](https://same-url)`.
+            if (/^https?:\/\//i.test(href) && labelOut.endsWith(`(${href})`)) {
+              const trimmedPrefix = labelOut.slice(0, labelOut.length - href.length - 2).trimEnd();
+              if (trimmedPrefix) labelOut = trimmedPrefix;
+            }
+            // Strip redundant trailing `(https://same-url)` immediately after `[label](https://same-url)(https://same-url)`.
+            if (/^https?:\/\//i.test(href)) {
+              let trail = nextIdx;
+              while (trail < line.length && (line.charCodeAt(trail) === 32 || line.charCodeAt(trail) === 9)) trail++;
+              if (line.charCodeAt(trail) === 40 && line.startsWith(href, trail + 1) && line.charCodeAt(trail + 1 + href.length) === 41) {
+                nextIdx = trail + 2 + href.length;
+              }
+            }
+
+            const prevCharCode = i > lastCopyIdx ? line.charCodeAt(i - 1) : out.length > 0 ? out.charCodeAt(out.length - 1) : 0;
+            out += line.slice(lastCopyIdx, i);
+            if (spaceAdjacentAlnum && /^https?:\/\//i.test(href) && prevCharCode > 0 && isAsciiAlnumCode(prevCharCode)) {
+              out += ' ';
+            }
+            out += `[${labelOut}](${href}${tok.titleSuffix})`;
+            if (spaceAdjacentAlnum && /^https?:\/\//i.test(href) && nextIdx < line.length && isAsciiAlnumCode(line.charCodeAt(nextIdx))) {
+              out += ' ';
+            }
+            i = nextIdx;
+            lastCopyIdx = i;
+            continue;
+          }
+        }
+
+        i++;
+      }
+      return lastCopyIdx === 0 ? line : out + line.slice(lastCopyIdx);
+    })
+    .join('\n');
+}
+
+function isResidualHtmlStartChar(c: number): boolean {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 47 || c === 33 || c === 63;
+}
+
+/**
+ * `R3-H2` defense-in-depth: escapes any residual raw `<tag`, `</tag`, `<!--`, `<!`, or `<?` outside fenced code blocks
+ * and inline backtick code spans so raw HTML/XSS tags can never survive into final Markdown prose.
+ */
+function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMarkers = false): string {
+  if (!prose || !prose.includes('<')) return prose;
+  return prose
+    .split('\n')
+    .map((line) => {
+      if (!line.includes('<')) return line;
+      if (allowPdfPageMarkers && /^<!-- page \d{1,6} -->$/.test(line.trim())) {
+        return line;
+      }
+      const cursors = createMarkdownLineScanCursors();
+      let nextGtIdx = -1;
+      let noGtAfter = false;
+      let out = '';
+      let lastIdx = 0;
+      let i = 0;
+      while (i < line.length) {
+        const ch = line.charCodeAt(i);
+        if (ch === 96) {
+          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+          i = spanEnd > 0 ? spanEnd : tickEnd;
+          continue;
+        }
+        if (ch === 60 && i + 1 < line.length) {
+          const nextCode = line.charCodeAt(i + 1);
+          if (isResidualHtmlStartChar(nextCode)) {
+            // Preserve valid `<https://...>` and `<mailto:...>` autolinks if not already converted (monotonic `>` cursor).
+            if (!noGtAfter && (nextCode === 104 || nextCode === 72 || nextCode === 109 || nextCode === 77)) {
+              if (nextGtIdx <= i) {
+                nextGtIdx = line.indexOf('>', i + 1);
+                if (nextGtIdx < 0) noGtAfter = true;
+              }
+              if (!noGtAfter && nextGtIdx > i + 2 && nextGtIdx - i <= 2_048) {
+                const candidate = line.slice(i + 1, nextGtIdx);
+                if (/^(?:https?:\/\/\S+|mailto:[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)$/i.test(candidate)) {
+                  i = nextGtIdx + 1;
+                  continue;
+                }
+              }
+            }
+            out += `${line.slice(lastIdx, i)}&lt;`;
+            i++;
+            lastIdx = i;
+            continue;
+          }
+        }
+        i++;
+      }
+      return lastIdx === 0 ? line : out + line.slice(lastIdx);
+    })
+    .join('\n');
+}
+
+function escapeResidualHtmlOutsideCodeLinear(md: string, allowPdfPageMarkers = false): string {
+  if (!md || !md.includes('<')) return md;
+  return splitMarkdownByCodeFences(md)
+    .map((part, idx) => (idx % 2 === 1 ? part : escapeResidualHtmlInMarkdownProseLinear(part, allowPdfPageMarkers)))
+    .join('');
+}
+
+/** Decodes HTML entities in Markdown prose EXCEPT `<` (`&lt;`, `&#60;`, `&#x3c;`) so escaped tag examples never re-materialize as raw HTML. */
+function decodeMarkdownEntitiesPreservingLt(prose: string): string {
+  if (!prose || !prose.includes('&')) return prose;
+  const guarded = prose.replace(/&(?:lt|LT|#0*60|#[xX]0*3[cC]);/g, '\u0000EFLT\u0000');
+  return decodeHtmlEntities(guarded).replace(/\u0000EFLT\u0000/g, '&lt;');
+}
+
+function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): string {
+  if (!prose || !prose.includes('`')) return prose;
+  return prose
+    .split('\n')
+    .map((line) => {
+      if (!line.includes('`')) return line;
+      const cursors = createMarkdownLineScanCursors();
+      let out = '';
+      let lastIdx = 0;
+      let i = 0;
+      while (i < line.length) {
+        if (line.charCodeAt(i) === 96) {
+          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+          if (spanEnd > 0) {
+            out += `${line.slice(lastIdx, i)}\u0000EFMDINLINE${stash.push(line.slice(i, spanEnd)) - 1}\u0000`;
+            i = spanEnd;
+            lastIdx = i;
+            continue;
+          }
+          i = tickEnd;
+          continue;
+        }
+        i++;
+      }
+      return lastIdx === 0 ? line : out + line.slice(lastIdx);
+    })
+    .join('\n');
 }
 
 function cleanCodeFenceSegment(fenceBlock: string): string {
@@ -3534,11 +4594,16 @@ function cleanCodeFenceSegment(fenceBlock: string): string {
 
   const isTwoslash = /\btwoslash\b/i.test(rawHeader) || /^[ \t]*\/\/[ \t]*---cut(?:-(?:before|after))?---[ \t]*$/m.test(innerCode);
   if (isTwoslash) {
-    const cutBeforeRe = /^[\s\S]*?^[ \t]*\/\/[ \t]*---cut(?:-before)?---[ \t]*\r?\n/m;
-    innerCode = innerCode.replace(cutBeforeRe, '');
-    innerCode = innerCode.replace(/\r?\n[ \t]*\/\/[ \t]*---cut-after---[ \t]*(?:\r?\n[\s\S]*)?$/, '');
+    const cutLineMatch = /^[ \t]*\/\/[ \t]*---cut(?:-before)?---[ \t]*\r?\n/m.exec(innerCode);
+    if (cutLineMatch) {
+      innerCode = innerCode.slice(cutLineMatch.index + cutLineMatch[0].length);
+    }
+    const cutAfterMatch = /\r?\n[ \t]*\/\/[ \t]*---cut-after---[ \t]*(?:\r?\n|$)/m.exec(innerCode);
+    if (cutAfterMatch) {
+      innerCode = innerCode.slice(0, cutAfterMatch.index);
+    }
     innerCode = innerCode.replace(
-      /^[ \t]*\/\/[ \t]*@(?:noErrors|errors:\s*[\d\s]+|target:\s*\S+|module:\s*\S+|moduleResolution:\s*\S+|lib:\s*\S+|strict(?::\s*\S+)?)[ \t]*\r?\n/gm,
+      /^[ \t]*\/\/[ \t]*@(?:noErrors|errors:[ \t]*[\d \t]+|target:[ \t]*\S+|module:[ \t]*\S+|moduleResolution:[ \t]*\S+|lib:[ \t]*\S+|strict(?::[ \t]*\S+)?)[ \t]*\r?\n/gm,
       '',
     );
   }
@@ -3552,17 +4617,31 @@ function cleanCodeFenceSegment(fenceBlock: string): string {
   return `${cleanHeader}\n${innerCode}\n${closingFence}`;
 }
 
-export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string): string {
-  const withoutMintlifyBanner = md
-    .replace(/[\u200b\u200e\u200f\ufeff]/g, '')
-    .replace(
+export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
+  if (!md) return '';
+  let withoutMintlifyBanner = stripInvisibleSmugglingChars(md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md);
+  if (withoutMintlifyBanner.slice(0, 256).includes('Documentation Index')) {
+    withoutMintlifyBanner = withoutMintlifyBanner.replace(
       /^\s*>\s*##\s*Documentation Index[ \t]*\r?\n>\s*Fetch the complete documentation index at:\s*\S+[ \t]*\r?\n>\s*Use this file to discover all available pages before exploring further\.[ \t]*\r?\n+/i,
       '',
-    )
-    .replace(
-      /\r?\n+This documentation is built and hosted on \[Mintlify\]\([^)]+\),\s*a developer documentation platform\.[ \t]*$/i,
-      '',
     );
+  }
+  const mintlifyNeedle = 'this documentation is built and hosted on [mintlify](';
+  const tailStart = Math.max(0, withoutMintlifyBanner.length - 600);
+  const tailLower = withoutMintlifyBanner.slice(tailStart).toLowerCase();
+  const mintlifyRelIdx = tailLower.lastIndexOf(mintlifyNeedle);
+  if (mintlifyRelIdx >= 0) {
+    const absIdx = tailStart + mintlifyRelIdx;
+    const suffix = withoutMintlifyBanner.slice(absIdx);
+    if (/^This documentation is built and hosted on \[Mintlify\]\([^)\r\n]{1,300}\),\s*a developer documentation platform\.[ \t]*$/i.test(suffix)) {
+      let cut = absIdx;
+      while (cut > 0 && (withoutMintlifyBanner.charCodeAt(cut - 1) === 10 || withoutMintlifyBanner.charCodeAt(cut - 1) === 13)) {
+        cut--;
+      }
+      withoutMintlifyBanner = withoutMintlifyBanner.slice(0, cut);
+    }
+  }
+
   const parts = splitMarkdownByCodeFences(withoutMintlifyBanner);
   return parts
     .map((part, idx) => {
@@ -3590,138 +4669,267 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string): stri
         }
         proseWork = outJsx;
       }
-      proseWork = proseWork
-        // Convert VitePress / Docusaurus `:::` / `::::` admonition containers into clean bold callout headers and strip layout containers.
-        .replace(
-          /^[ \t]*:{3,}[ \t]*(info|tip|note|warning|caution|danger|important|details)(?:[ \t]+([^\r\n]+))?[ \t]*$/gim,
-          (_m, kindRaw: string, customTitle?: string) => {
-            const kindLabel = kindRaw.charAt(0).toUpperCase() + kindRaw.slice(1).toLowerCase();
-            const custom = customTitle?.trim();
-            if (custom && custom.toLowerCase() !== kindRaw.toLowerCase()) {
-              return `\n\n**${kindLabel}: ${custom}**\n\n`;
-            }
-            return `\n\n**${kindLabel}**\n\n`;
-          },
-        )
-        .replace(/^[ \t]*:{3,}(?:[ \t]*(?:code-group|tabs|tab(?:\s+[^\r\n]*)?|raw|v-pre))?[ \t]*$/gim, '')
-        // Unwrap standalone MDX PascalCase component wrapper / self-closing lines (`<Intro>`, `</Intro>`, `<InlineToc />`, `<DeepDive title="...">`)
-        .replace(/^[ \t]*<([A-Z][A-Za-z0-9._]*)\b((?:"[^"\n]*"|'[^'\n]*'|[^>"'\n])*)\s*(\/?)>[ \t]*$/gm, (_m, _tag, attrStr: string, selfClose: string) => {
-          if (selfClose === '/') return '';
-          const attrs = parseTagAttrs(String(attrStr ?? ''));
-          const headingTitle = (attrs.title ?? attrs.titletext ?? '').trim();
-          return headingTitle ? `\n\n**${headingTitle}**\n\n` : '';
-        })
-        .replace(/^[ \t]*<\/[A-Z][A-Za-z0-9._]*>[ \t]*$/gm, '')
-        // Unwrap inline MDX PascalCase components (`<CodeStep step={1}>current state</CodeStep>`) outside inline code spans.
-        .replace(/`+[^`\n]*`+|<\/?[A-Z][A-Za-z0-9._]*\b(?:"[^"\n]*"|'[^'\n]*'|[^>"'\n])*>/g, (full) =>
-          full.charCodeAt(0) === 96 ? full : '',
-        )
-        .replace(/\[\s*<h([1-6])\b[^>\"\n]*>([^<\n]{1,400})<\/h\1>\s*\]\(([^)\n]+)\)/gi, (_m, lvl, inner, href) => {
-          const label = cleanInlineHtml(String(inner));
-          return label ? `\n\n${'#'.repeat(Number(lvl))} [${label}](${String(href).trim()})\n\n` : '';
-        });
 
-      proseWork = replacePairedHtmlElementsLinear(
-        proseWork,
-        ['a'],
-        (full, _tag, attrStr, inner) => {
-          const trimmedInner = inner.trim();
-          const hMatch = /^<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>$/i.exec(trimmedInner);
-          if (hMatch) {
-            const attrs = parseTagAttrs(attrStr);
-            const href = resolveHttpsHref(attrs.href, baseUrl);
-            const label = cleanInlineHtml(hMatch[2] ?? '');
-            if (!label) return '';
-            return href ? `\n\n${'#'.repeat(Number(hMatch[1]))} [${label}](${href})\n\n` : `\n\n${'#'.repeat(Number(hMatch[1]))} ${label}\n\n`;
-          }
-          const attrs = parseTagAttrs(attrStr);
-          const href = resolveHttpsHref(attrs.href, baseUrl);
-          const label = cleanInlineHtml(inner);
-          if (!label) return '';
-          return href ? `[${label}](${href})` : label;
-        },
-        { maxChars: MAX_HTML_SCAN_CHARS },
-      );
+      // Stash inline backtick code spans (`...`) BEFORE HTML sanitization so `<script>` / `<T>` inside backticks stay untouched.
+      const inlineCodeStash: string[] = [];
+      proseWork = stashMarkdownInlineCodeSpansLinear(proseWork, inlineCodeStash);
 
-      proseWork = replacePairedHtmlElementsLinear(
-        proseWork,
-        ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'summary', 'code', 'strong', 'b', 'em', 'i', 'sup'],
-        (_full, tag, _attrStr, inner) => {
-          const txt = cleanInlineHtml(inner);
-          if (!txt) return '';
-          if (tag.length === 2 && tag.charCodeAt(0) === 104) {
-            const lvl = tag.charCodeAt(1) - 48;
-            return `\n\n${'#'.repeat(lvl)} ${txt}\n\n`;
-          }
-          if (tag === 'summary') return `\n\n**${txt}**\n\n`;
-          if (tag === 'code') return `\`${txt}\``;
-          if (tag === 'strong' || tag === 'b') return `**${txt}**`;
-          if (tag === 'em' || tag === 'i') return `*${txt}*`;
-          return /^[\d,\s-]+$/.test(txt) ? ` [${txt}]` : `^${txt}`;
-        },
-        { maxChars: MAX_HTML_SCAN_CHARS },
-      );
+      // Strip HTML comments, dangerous active/script/style/svg/form subtrees, and hidden (`display:none` / `[hidden]`) subtrees linearly.
+      if (proseWork.includes('<!--')) {
+        if (allowPdfPageMarkers) {
+          proseWork = proseWork.replace(/^([ \t]*)<!-- page (\d{1,6}) -->([ \t]*)$/gm, '$1\u0000EFPDFPAGE$2\u0000$3');
+        }
+        proseWork = stripHtmlCommentsLinear(proseWork, MAX_HTML_SCAN_CHARS);
+        if (allowPdfPageMarkers && proseWork.includes('\u0000EFPDFPAGE')) {
+          proseWork = proseWork.replace(/\u0000EFPDFPAGE(\d{1,6})\u0000/g, '<!-- page $1 -->');
+        }
+      }
+      if (proseWork.includes('<') && proseWork.includes('>')) {
+        if (/<(?:script|style|iframe|object|embed|applet|svg|math|form|noscript|template|head|meta|link|base)\b/i.test(proseWork)) {
+          proseWork = stripHtmlTagsLinear(
+            proseWork,
+            ['script', 'style', 'iframe', 'object', 'embed', 'applet', 'svg', 'math', 'form', 'noscript', 'template', 'head', 'meta', 'link', 'base'],
+            '',
+            MAX_HTML_SCAN_CHARS,
+          );
+        }
+        if (/(?:hidden|style|role|class)/i.test(proseWork)) {
+          proseWork = stripHiddenAndChromeSubtrees(proseWork);
+        }
+      }
 
-      const cleanedProse = replaceHtmlTagsQuoteAwareLinear(
-        proseWork
-          .split('\n')
-          .map((line) =>
-            line.trimStart().startsWith('|')
-              ? line.replace(/<br\b[^>]*\/?>/gi, ' / ')
-              : line.replace(/<br\b[^>]*\/?>/gi, '\n'),
+      if (proseWork.includes(':::')) {
+        proseWork = proseWork
+          // Convert VitePress / Docusaurus `:::` / `::::` admonition containers into clean bold callout headers and strip layout containers.
+          .replace(
+            /^[ \t]*:{3,}[ \t]*(info|tip|note|warning|caution|danger|important|details)(?:[ \t]+([^\r\n]{1,200}))?[ \t]*$/gim,
+            (_m, kindRaw: string, customTitle?: string) => {
+              const kindLabel = kindRaw.charAt(0).toUpperCase() + kindRaw.slice(1).toLowerCase();
+              const custom = customTitle?.trim();
+              if (custom && custom.toLowerCase() !== kindRaw.toLowerCase()) {
+                return `\n\n**${kindLabel}: ${custom}**\n\n`;
+              }
+              return `\n\n**${kindLabel}**\n\n`;
+            },
           )
-          .join('\n'),
-        (tag) =>
-          tag.tagNameLower === 'u' ||
-          tag.tagNameLower === 'details' ||
-          tag.tagNameLower === 'span' ||
-          tag.tagNameLower === 'div' ||
-          tag.tagNameLower === 'p' ||
-          tag.tagNameLower === 'button'
-            ? ''
-            : tag.rawTag,
-        MAX_HTML_SCAN_CHARS,
-      )
-        .replace(/\[Skip to content\]\(#[^)]*\)\s*/gi, '')
-        .replace(/(?:^|\n)Was this (?:page )?helpful\?[ \t]*(?:\n+(?:Yes\s*No|Yes[ \t]*\/[ \t]*No))?[ \t]*(?=\n|$)/gi, '\n')
-        .replace(/!\[\s*\]\(\s*(?:""|'')?\s*\)/g, '')
-        .replace(/!\[([^\[\]\n]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (full, alt: string, rawUrl: string) =>
-          isTinyOrAvatarImageUrl(rawUrl, alt) ? '' : full,
-        )
-        .replace(/(!\[[^\[\]\n]*\]\([^)\s]+(?:\s+"[^"]*")?\))[ \t]*(?=!\[)/g, '$1\n\n')
-        .replace(
-          idx === parts.length - 1
-            ? /\n##+\s+On this page[ \t]*(?:\n+(?:[-*]\s+\[[^\[\]\n]+\]\(#[^)\n]+\)[ \t]*)+)?(?:\n+\[!\[[^\[\]\n]*\]\([^)\n]+\)[^\[\]\n]*\]\([^)\n]+\)[ \t]*)?\s*$/i
-            : /$^/,
-          '',
+          .replace(/^[ \t]*:{3,}(?:[ \t]*(?:code-group|tabs|tab(?:[ \t]+[^\r\n]{0,120})?|raw|v-pre))?[ \t]*$/gim, '');
+      }
+
+      if (proseWork.includes('<') && proseWork.includes('>')) {
+        if (proseWork.includes('[') && proseWork.includes('</h')) {
+          proseWork = proseWork.replace(/\[\s*<h([1-6])\b[^>"\n]{0,200}>([^<\n]{1,400})<\/h\1>\s*\]\(([^)\s\n]{1,2048})\)/gi, (_m, lvl, inner, href) => {
+            const label = cleanInlineHtml(String(inner));
+            const rawHref = String(href).trim();
+            if (!label || hasDangerousUriScheme(rawHref)) return label;
+            return `\n\n${'#'.repeat(Number(lvl))} [${label}](${rawHref})\n\n`;
+          });
+        }
+
+        if (proseWork.includes('</')) {
+          proseWork = replacePairedHtmlElementsLinear(
+            proseWork,
+            ['a'],
+            (_full, _tag, attrStr, inner) => {
+              const trimmedInner = inner.trim();
+              if (/^<h[1-6]\b/i.test(trimmedInner)) {
+                let hInfo: { lvl: number; txt: string } | null = null;
+                replacePairedHtmlElementsLinear(trimmedInner, ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], (hf, ht, _ha, hInner) => {
+                  if (!hInfo && hf.length === trimmedInner.length) {
+                    hInfo = { lvl: Number(ht.slice(1)), txt: cleanInlineHtml(hInner) };
+                  }
+                  return '';
+                });
+                if (hInfo) {
+                  const hi = hInfo as { lvl: number; txt: string };
+                  if (!hi.txt) return '';
+                  const attrs = parseTagAttrs(attrStr);
+                  const href = resolveHttpsHref(attrs.href, baseUrl, true);
+                  return href ? `\n\n${'#'.repeat(hi.lvl)} [${hi.txt}](${href})\n\n` : `\n\n${'#'.repeat(hi.lvl)} ${hi.txt}\n\n`;
+                }
+              }
+              const attrs = parseTagAttrs(attrStr);
+              const href = resolveHttpsHref(attrs.href, baseUrl, true);
+              const label = cleanInlineHtml(inner);
+              if (!label) return '';
+              return href ? `[${label}](${href})` : label;
+            },
+            { maxChars: MAX_HTML_SCAN_CHARS },
+          );
+
+          proseWork = replacePairedHtmlElementsLinear(
+            proseWork,
+            ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'summary', 'code', 'kbd', 'strong', 'b', 'em', 'i', 'sup'],
+            (_full, tag, _attrStr, inner) => {
+              const txt = cleanInlineHtml(inner);
+              if (!txt) return '';
+              if (tag.length === 2 && tag.charCodeAt(0) === 104) {
+                const lvl = tag.charCodeAt(1) - 48;
+                return `\n\n${'#'.repeat(lvl)} ${txt}\n\n`;
+              }
+              if (tag === 'summary') return `\n\n**${txt}**\n\n`;
+              if (tag === 'code' || tag === 'kbd') {
+                const span = formatInlineCodeSpan(txt);
+                return span ? `\u0000EFMDINLINE${inlineCodeStash.push(span) - 1}\u0000` : '';
+              }
+              if (tag === 'strong' || tag === 'b') return `**${txt}**`;
+              if (tag === 'em' || tag === 'i') return `*${txt}*`;
+              return /^[\d,\s-]+$/.test(txt) ? ` [${txt}]` : `^${txt}`;
+            },
+            { maxChars: MAX_HTML_SCAN_CHARS },
+          );
+        }
+
+        // Single linear quote-aware tag pass with monotonic O(1) amortized line-bounds cursor (`< 5 ms` on `<br>`.repeat(100k) and `<A HREF="x">`.repeat(50k)).
+        let curLineStart = 0;
+        const firstNl = proseWork.indexOf('\n');
+        let curLineEnd = firstNl < 0 ? proseWork.length : firstNl;
+        const computeStartsWithPipe = (ls: number, le: number): boolean => {
+          let p = ls;
+          while (p < le && (proseWork.charCodeAt(p) === 32 || proseWork.charCodeAt(p) === 9)) p++;
+          return p < le && proseWork.charCodeAt(p) === 124;
+        };
+        let curLineStartsWithPipe = computeStartsWithPipe(curLineStart, curLineEnd);
+        const syncLineBounds = (tagIdx: number) => {
+          if (tagIdx > curLineEnd) {
+            curLineStart = proseWork.lastIndexOf('\n', tagIdx - 1) + 1;
+            const nextNl = proseWork.indexOf('\n', tagIdx);
+            curLineEnd = nextNl < 0 ? proseWork.length : nextNl;
+            curLineStartsWithPipe = computeStartsWithPipe(curLineStart, curLineEnd);
+          }
+        };
+
+        proseWork = replaceHtmlTagsQuoteAwareLinear(
+          proseWork,
+          (tag) => {
+            if (tag.tagNameLower === 'br') {
+              syncLineBounds(tag.index);
+              return curLineStartsWithPipe ? ' / ' : '\n';
+            }
+            if (tag.tagNameLower === 'hr' && !tag.isClosing) {
+              return '\n\n---\n\n';
+            }
+            if (tag.tagNameLower === 'img' && !tag.isClosing) {
+              const attrs = parseTagAttrs(tag.attrs);
+              const resolvedSrc = resolveHttpsHref(attrs.src ?? attrs['data-src'], baseUrl);
+              const alt = cleanInlineHtml(attrs.alt ?? '');
+              if (!resolvedSrc || isTinyOrAvatarImageUrl(resolvedSrc, alt)) return '';
+              return `![${alt}](${resolvedSrc})`;
+            }
+            const firstRawCode = tag.rawTag.charCodeAt(tag.isClosing ? 2 : 1);
+            if (firstRawCode >= 65 && firstRawCode <= 90) {
+              if (!tag.isClosing && !tag.isSelfClosing && tag.attrs && (tag.attrs.includes('title') || tag.attrs.includes('TITLE'))) {
+                syncLineBounds(tag.index);
+                if (
+                  tag.index - curLineStart <= 64 &&
+                  curLineEnd - tag.end <= 64 &&
+                  proseWork.slice(curLineStart, tag.index).trim() === '' &&
+                  proseWork.slice(tag.end, curLineEnd).trim() === ''
+                ) {
+                  const attrs = parseTagAttrs(tag.attrs);
+                  const headingTitle = cleanInlineHtml(attrs.title ?? attrs.titletext ?? '');
+                  if (headingTitle) return `\n\n**${headingTitle}**\n\n`;
+                }
+              }
+              return '';
+            }
+            if (
+              tag.tagNameLower === 'u' ||
+              tag.tagNameLower === 'details' ||
+              tag.tagNameLower === 'span' ||
+              tag.tagNameLower === 'div' ||
+              tag.tagNameLower === 'p' ||
+              tag.tagNameLower === 'button' ||
+              tag.tagNameLower === 'section' ||
+              tag.tagNameLower === 'article' ||
+              tag.tagNameLower === 'main' ||
+              tag.tagNameLower === 'header' ||
+              tag.tagNameLower === 'footer' ||
+              tag.tagNameLower === 'nav' ||
+              tag.tagNameLower === 'aside'
+            ) {
+              return '';
+            }
+            return tag.rawTag;
+          },
+          MAX_HTML_SCAN_CHARS,
+          false,
         );
-      return resolveMarkdownRelativeLinksInProse(cleanedProse, baseUrl)
-        .replace(/\[([^\[\]\n]+?)[ \t]*\((https?:\/\/[^)\s]+)\)\]\(\2\)/g, (_m, lbl: string, u: string) => `[${lbl.trim()}](${u})`)
-        .replace(/(\[[^\[\]\n]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1')
-        .replace(/\n{3,}/g, '\n\n');
+      }
+
+      proseWork = decodeMarkdownEntitiesPreservingLt(proseWork);
+      if (inlineCodeStash.length > 0) {
+        proseWork = proseWork.replace(/\u0000EFMDINLINE(\d+)\u0000/g, (_m, sIdx: string) => inlineCodeStash[Number(sIdx)] ?? '');
+      }
+
+      if (proseWork.toLowerCase().includes('helpful?')) {
+        proseWork = proseWork.replace(
+          /(?:^|\n)Was this (?:page )?helpful\?[ \t]*(?:\n+(?:Yes[ \t]*No|Yes[ \t]*\/[ \t]*No))?[ \t]*(?=\n|$)/gi,
+          '\n',
+        );
+      }
+      if (idx === parts.length - 1) {
+        const tailOnPage = proseWork.slice(Math.max(0, proseWork.length - 2_000));
+        const onPageIdx = tailOnPage.toLowerCase().lastIndexOf('\n## on this page');
+        if (onPageIdx >= 0) {
+          const absOnPage = Math.max(0, proseWork.length - 2_000) + onPageIdx;
+          const tailCandidate = proseWork.slice(absOnPage);
+          if (/^\n##+[ \t]+On this page[ \t]*(?:\n+(?:[-*][ \t]+\[[^\[\]\n]{1,200}\]\(#[^)\n]{1,200}\)[ \t]*)+)?[ \t]*$/i.test(tailCandidate)) {
+            proseWork = proseWork.slice(0, absOnPage);
+          }
+        }
+      }
+
+      const resolvedProse = sanitizeAndResolveMarkdownProseLinksLinear(proseWork, { baseUrl, includeImages: true });
+      return escapeResidualHtmlInMarkdownProseLinear(resolvedProse, allowPdfPageMarkers).replace(/\n{3,}/g, '\n\n');
     })
     .map((part, idx) => (idx % 2 === 1 ? part : dedupeConsecutiveStandaloneLinkParagraphs(part)))
     .join('');
 }
 
+function sanitizeFrontmatterFieldText(raw: string): string {
+  const withoutComments = raw.includes('<!--') ? stripHtmlCommentsLinear(raw, 4_096) : raw;
+  const withoutScripts = withoutComments.includes('<')
+    ? stripHtmlTagsLinear(withoutComments, ['script', 'style', 'iframe', 'svg', 'noscript', 'template'], ' ', 4_096)
+    : withoutComments;
+  const withoutTags = withoutScripts.includes('<') ? stripHtmlTagsQuoteAwareLinear(withoutScripts, ' ', 4_096) : withoutScripts;
+  return stripInvisibleSmugglingChars(decodeHtmlEntities(withoutTags)).replace(/\s+/g, ' ').trim();
+}
+
 export function parseMarkdownFrontmatter(md: string): { title?: string; description?: string; body: string } {
-  const normalized = md.replace(/\r\n/g, '\n');
-  const m = /^---\n([\s\S]{1,4000}?)\n---(?:\n+|$)/.exec(normalized);
-  if (!m?.[1]) return { body: md };
+  if (!md.startsWith('---')) return { body: md };
+  const head = md.slice(0, 4_200).replace(/\r\n/g, '\n');
+  if (!head.startsWith('---\n')) return { body: md };
+  const closeIdx = head.indexOf('\n---', 4);
+  if (closeIdx < 0 || closeIdx > 4_004) return { body: md };
+  let afterClose = closeIdx + 4;
+  if (afterClose < head.length && head.charCodeAt(afterClose) !== 10) return { body: md };
+  while (afterClose < head.length && head.charCodeAt(afterClose) === 10) afterClose++;
+
+  const fmBlock = head.slice(4, closeIdx);
   let title: string | undefined;
   let description: string | undefined;
-  for (const line of m[1].split('\n')) {
-    const kv = /^([a-zA-Z0-9_-]+)\s*:\s*(.+)$/.exec(line.trim());
+  for (const line of fmBlock.split('\n')) {
+    const kv = /^([a-zA-Z0-9_-]{1,64})[ \t]*:[ \t]*(.+)$/.exec(line.trim());
     if (!kv) continue;
     const k = kv[1]!.toLowerCase();
     const v = kv[2]!.trim().replace(/^(['"])([\s\S]*)\1$/, '$2').trim();
-    if (k === 'title' && v && !title) title = decodeHtmlEntities(v);
-    if (k === 'description' && v && !description) description = decodeHtmlEntities(v);
+    if (k === 'title' && v && !title) {
+      const cleanTitle = sanitizeFrontmatterFieldText(v);
+      if (cleanTitle) title = cleanTitle;
+    }
+    if (k === 'description' && v && !description) {
+      const cleanDesc = sanitizeFrontmatterFieldText(v);
+      if (cleanDesc) description = cleanDesc;
+    }
   }
+
+  // Advance past the matching `---` + blank lines in the original string (handling `\r\n` cleanly).
+  const rawCloseMatch = /^---\r?\n[\s\S]{1,4004}?\r?\n---(?:\r?\n+|$)/.exec(md.slice(0, 4_300));
+  const body = rawCloseMatch ? md.slice(rawCloseMatch[0].length) : md.slice(afterClose);
   return {
     ...(title ? { title } : {}),
     ...(description ? { description } : {}),
-    body: normalized.slice(m[0].length),
+    body,
   };
 }
 
@@ -3730,50 +4938,96 @@ export function extractMarkdownLinksAndImages(
   baseUrl: string,
   includeImages: boolean,
 ): { links: string[]; images: ScrapedImage[]; title?: string; description?: string } {
-  const fmParsed = parseMarkdownFrontmatter(md);
+  const boundedMd = md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md;
+  const fmParsed = parseMarkdownFrontmatter(boundedMd);
   let title = fmParsed.title;
   const description = fmParsed.description;
 
   const proseOnly = splitMarkdownByCodeFences(fmParsed.body)
     .filter((_, idx) => idx % 2 === 0)
     .join('\n');
+  const lines = proseOnly.split(/\r?\n/);
   if (!title) {
-    for (const rawLine of proseOnly.split(/\r?\n/)) {
+    for (const rawLine of lines) {
       const trimmed = rawLine.trim();
       if (!trimmed || trimmed.startsWith('>')) continue;
-      const h1 = /^#\s+(.+)$/.exec(trimmed);
+      const h1 = /^#[ \t]+(.+)$/.exec(trimmed);
       if (h1?.[1]) {
-        title = decodeHtmlEntities(h1[1].replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim());
+        const cleanH1 = sanitizeFrontmatterFieldText(stripMarkdownLinksToLabelsLinear(h1[1]));
+        if (cleanH1) title = cleanH1;
         break;
       }
     }
   }
+
   const images: ScrapedImage[] = [];
   const seenImages = new Set<string>();
-  if (includeImages) {
-    for (const im of proseOnly.matchAll(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g)) {
-      const alt = im[1]?.trim() ?? '';
-      const resolved = resolveHttpsHref(im[2], baseUrl);
-      if (resolved && !seenImages.has(resolved) && !isTinyOrAvatarImageUrl(resolved, alt)) {
-        seenImages.add(resolved);
-        images.push({ url: resolved, ...(alt ? { alt } : {}) });
-        if (images.length >= 60) break;
-      }
-    }
-  }
-
-  const withoutImages = proseOnly.replace(/!\[[^\[\]\n]*\]\([^)\n]+\)/g, ' ');
   const links: string[] = [];
   const seenLinks = new Set<string>();
-  for (const lm of withoutImages.matchAll(/\[([^\[\]\n]+)\]\(([^)\s]+)(?:\s+"[^"\n]*")?\)/g)) {
-    const rawHref = lm[2]?.trim() ?? '';
-    if (!rawHref || rawHref.startsWith('#')) continue;
-    const resolved = resolveHttpsHref(rawHref, baseUrl);
-    if (resolved && !seenLinks.has(resolved)) {
-      seenLinks.add(resolved);
-      links.push(resolved);
-      if (links.length >= 250) break;
+
+  const collectFromLine = (line: string) => {
+    if (!line.includes('](') && !line.includes('<')) return;
+    const cursors = createMarkdownLineScanCursors();
+    let i = 0;
+    while (i < line.length) {
+      if (links.length >= 250 && (!includeImages || images.length >= 60)) break;
+      const ch = line.charCodeAt(i);
+      if (ch === 96) {
+        const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+        i = spanEnd > 0 ? spanEnd : tickEnd;
+        continue;
+      }
+      if (ch === 60 && links.length < 250) {
+        const gt = line.indexOf('>', i + 1);
+        if (gt > i + 8 && gt - i <= 2_048) {
+          const autoCandidate = line.slice(i + 1, gt);
+          if (/^https?:\/\/\S+$/i.test(autoCandidate)) {
+            const resolved = resolveHttpsHref(autoCandidate, baseUrl);
+            if (resolved && !seenLinks.has(resolved)) {
+              seenLinks.add(resolved);
+              links.push(resolved);
+            }
+            i = gt + 1;
+            continue;
+          }
+        }
+      }
+      if (ch === 33 || ch === 91) {
+        const tok = tryParseMarkdownLinkOrImageAt(line, i, cursors, true);
+        if (tok) {
+          const rawHref = tok.rawUrl.trim();
+          if (tok.isImage) {
+            if (includeImages && images.length < 60 && rawHref && !hasDangerousUriScheme(rawHref)) {
+              const alt = tok.rawLabel.trim();
+              const resolved = resolveHttpsHref(rawHref, baseUrl);
+              if (resolved && !seenImages.has(resolved) && !isTinyOrAvatarImageUrl(resolved, alt)) {
+                seenImages.add(resolved);
+                images.push({ url: resolved, ...(alt ? { alt } : {}) });
+              }
+            }
+          } else {
+            if (tok.rawLabel.includes('![') && includeImages && images.length < 60) {
+              collectFromLine(tok.rawLabel);
+            }
+            if (links.length < 250 && rawHref && !rawHref.startsWith('#') && !hasDangerousUriScheme(rawHref)) {
+              const resolved = resolveHttpsHref(rawHref, baseUrl);
+              if (resolved && !seenLinks.has(resolved)) {
+                seenLinks.add(resolved);
+                links.push(resolved);
+              }
+            }
+          }
+          i = tok.end;
+          continue;
+        }
+      }
+      i++;
     }
+  };
+
+  for (const line of lines) {
+    if (links.length >= 250 && (!includeImages || images.length >= 60)) break;
+    collectFromLine(line);
   }
 
   return {
@@ -3784,14 +5038,24 @@ export function extractMarkdownLinksAndImages(
   };
 }
 
-/** Strips invisible Unicode Tag ASCII-smuggling (`U+E0000`–`U+E007F`) and Bidi spoofing override codepoints used in indirect prompt injection. */
+/**
+ * Strips invisible Unicode Tag smuggling (`U+E0000`–`U+E007F`), Variation Selectors Supplement (`U+E0100`–`U+E01EF`),
+ * Bidi overrides/isolates, zero-width / soft-hyphen characters, ANSI CSI sequences, and raw ASCII C0/DEL control bytes.
+ */
 export function stripInvisibleSmugglingChars(s: string): string {
-  return s.replace(/[\u{E0000}-\u{E007F}\u202A-\u202E\u2066-\u2069]/gu, '');
+  if (!s) return s;
+  return s
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(
+      /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu,
+      '',
+    );
 }
 
 function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
-  const parts = splitMarkdownByCodeFences(md);
-  return parts
+  const bounded = md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md;
+  const parts = splitMarkdownByCodeFences(bounded);
+  const withoutSchemaFences = parts
     .map((part, idx) => {
       if (idx % 2 === 1) {
         const trimmedFence = part.trim();
@@ -3804,20 +5068,23 @@ function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
         }
         return part;
       }
-      const cleaned = part
-        .replace(/\[Skip to content\]\(#[^)\n]*\)\s*/gi, '')
-        .replace(/!\[\s*\]\(\s*(?:""|'')?\s*\)/g, '')
-        .replace(/<\/?u>/gi, '')
-        .replace(/\[([^\[\]\n]+?)[ \t]*\((https?:\/\/[^)\s]+)\)\]\(\2\)/g, (_m, lbl: string, u: string) => `[${lbl.trim()}](${u})`)
-        .replace(/(\[[^\[\]\n]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1');
-      return resolveMarkdownRelativeLinksInProse(cleaned, baseUrl).replace(/\n{3,}/g, '\n\n');
+      return part;
     })
     .join('');
+  // `R3-M3`: Always run full `sanitizeInlineHtmlInMarkdown` + dangerous link scheme stripping + residual `<tag` escaping on `origin-markdown`!
+  return sanitizeInlineHtmlInMarkdown(withoutSchemaFences, baseUrl);
 }
 
 function finalizeScrapedMarkdown(
   rawMd: string,
-  opts: { isPdf: boolean; includeImages: boolean; maxChars?: number; baseUrl?: string; preserveOriginMarkdown?: boolean },
+  opts: {
+    isPdf: boolean;
+    includeImages: boolean;
+    maxChars?: number;
+    baseUrl?: string;
+    preserveOriginMarkdown?: boolean;
+    allowPdfPageMarkers?: boolean;
+  },
 ): {
   markdown: string;
   truncated?: boolean;
@@ -3826,21 +5093,25 @@ function finalizeScrapedMarkdown(
   frontmatterTitle?: string;
   frontmatterDescription?: string;
 } {
-  const fm = opts.isPdf ? { body: rawMd } : parseMarkdownFrontmatter(rawMd);
+  const deadlineAt = Date.now() + 2_500;
+  const boundedInput = rawMd.length > MAX_HTML_SCAN_CHARS ? rawMd.slice(0, MAX_HTML_SCAN_CHARS) : rawMd;
+  const fm = opts.isPdf ? { body: boundedInput } : parseMarkdownFrontmatter(boundedInput);
   let md = opts.preserveOriginMarkdown
     ? stripInvisibleSmugglingChars(cleanOriginNegotiatedMarkdown(fm.body, opts.baseUrl))
-    : stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), opts.baseUrl));
-  if (opts.isPdf) {
+    : stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(fm.body, opts.baseUrl, Boolean(opts.allowPdfPageMarkers)));
+  if (opts.isPdf && Date.now() <= deadlineAt) {
     md = cleanPdfMarkdown(md);
   }
-  if (!opts.includeImages) {
-    md = md
-      .replace(/!\[[^\[\]\n]*\]\([^)\n]+\)/g, '')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-  } else {
-    md = md.replace(/\n{3,}/g, '\n\n').trim();
+  if (!opts.includeImages && Date.now() <= deadlineAt) {
+    md = splitMarkdownByCodeFences(md)
+      .map((part, idx) =>
+        idx % 2 === 1 ? part : sanitizeAndResolveMarkdownProseLinksLinear(part, { baseUrl: opts.baseUrl, includeImages: false }),
+      )
+      .join('');
   }
+  md = escapeResidualHtmlOutsideCodeLinear(md, Boolean(opts.allowPdfPageMarkers))
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
   const fmMeta = {
     ...(fm.title ? { frontmatterTitle: fm.title } : {}),
     ...(fm.description ? { frontmatterDescription: fm.description } : {}),
@@ -3860,10 +5131,10 @@ function finalizeScrapedMarkdown(
     // Close any open fenced code block so truncated previews never leave unbalanced Markdown fences.
     let openFence = '';
     for (const line of sliced.split('\n')) {
-      const fm = /^(`{3,}|~{3,})/.exec(line.trim());
-      if (fm?.[1]) {
-        if (!openFence) openFence = fm[1][0]!.repeat(fm[1].length);
-        else if (fm[1][0] === openFence[0] && fm[1].length >= openFence.length && /^[`~]+\s*$/.test(line.trim())) openFence = '';
+      const fmLine = /^(`{3,}|~{3,})/.exec(line.trim());
+      if (fmLine?.[1]) {
+        if (!openFence) openFence = fmLine[1][0]!.repeat(fmLine[1].length);
+        else if (fmLine[1][0] === openFence[0] && fmLine[1].length >= openFence.length && /^[`~]+\s*$/.test(line.trim())) openFence = '';
       }
     }
     if (openFence) {
@@ -4030,7 +5301,9 @@ function parseGitHubCommitPatchTarget(urlStr: string): {
 /** Formats RFC 5545 iCalendar (`text/calendar` / `BEGIN:VCALENDAR`) feeds into clean Markdown event summaries. */
 export function formatIcalendarToMarkdown(raw: string): { title?: string; description?: string; markdown: string } | null {
   if (!/^BEGIN:VCALENDAR\b/im.test(raw.slice(0, 512))) return null;
-  const unfolded = raw.replace(/\r?\n[ \t]/g, '');
+  const boundedRaw = raw.length > MAX_HTML_SCAN_CHARS ? raw.slice(0, MAX_HTML_SCAN_CHARS) : raw;
+  const unfolded = boundedRaw.replace(/\r?\n[ \t]/g, '');
+  const upperUnfolded = unfolded.toUpperCase();
   const formatIcsDate = (v: string): string => {
     const clean = v.trim();
     const dtMatch = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?$/.exec(clean);
@@ -4048,7 +5321,8 @@ export function formatIcalendarToMarkdown(raw: string): { title?: string; descri
 
   let calName = '';
   let calDesc = '';
-  const headerSlice = unfolded.split(/^BEGIN:VEVENT\b/im)[0] ?? unfolded;
+  const firstVeventIdx = upperUnfolded.indexOf('BEGIN:VEVENT');
+  const headerSlice = firstVeventIdx >= 0 ? unfolded.slice(0, firstVeventIdx) : unfolded.slice(0, 8_192);
   for (const line of headerSlice.split(/\r?\n/)) {
     const colon = line.indexOf(':');
     if (colon <= 0) continue;
@@ -4059,16 +5333,32 @@ export function formatIcalendarToMarkdown(raw: string): { title?: string; descri
   }
 
   const eventSections: string[] = [];
-  const eventRe = /BEGIN:VEVENT\b([\s\S]*?)END:VEVENT\b/gi;
-  let m: RegExpExecArray | null;
-  while ((m = eventRe.exec(unfolded)) !== null && eventSections.length < 50) {
+  const beginMarker = 'BEGIN:VEVENT';
+  const endMarker = 'END:VEVENT';
+  let scanPos = firstVeventIdx >= 0 ? firstVeventIdx : unfolded.length;
+  while (scanPos < upperUnfolded.length && eventSections.length < 50) {
+    const bIdx = upperUnfolded.indexOf(beginMarker, scanPos);
+    if (bIdx < 0) break;
+    const afterBegin = bIdx + beginMarker.length;
+    if (afterBegin < upperUnfolded.length) {
+      const nextCh = upperUnfolded.charCodeAt(afterBegin);
+      if (nextCh !== 10 && nextCh !== 13 && nextCh !== 32 && nextCh !== 9) {
+        scanPos = afterBegin;
+        continue;
+      }
+    }
+    const eIdx = upperUnfolded.indexOf(endMarker, afterBegin);
+    if (eIdx < 0) break;
+    const eventBody = unfolded.slice(afterBegin, eIdx);
+    scanPos = eIdx + endMarker.length;
+
     let summary = '';
     let dtStart = '';
     let dtEnd = '';
     let location = '';
     let url = '';
     let desc = '';
-    for (const line of m[1]!.split(/\r?\n/)) {
+    for (const line of eventBody.split(/\r?\n/)) {
       const colon = line.indexOf(':');
       if (colon <= 0) continue;
       const k = line.slice(0, colon).split(';')[0]!.trim().toUpperCase();
@@ -4163,7 +5453,7 @@ export function formatGitPatchToMarkdown(
         fallbackTitle = `${parts[0]}/${parts[1]}@${cleanSha.slice(0, 10)}`;
       } else {
         const last = parts[parts.length - 1];
-        if (last) fallbackTitle = decodeURIComponent(last);
+        if (last) fallbackTitle = safeDecodeURIComponent(last);
       }
     } catch {
       // ignore
@@ -4252,7 +5542,7 @@ export function formatSourceCodeUrlToMarkdown(
   }
   const parts = u.pathname.split('/').filter(Boolean);
   if (parts.length === 0) return null;
-  const baseName = decodeURIComponent(parts[parts.length - 1]!);
+  const baseName = safeDecodeURIComponent(parts[parts.length - 1]!);
   const lowerBase = baseName.toLowerCase();
   let lang = '';
   if (lowerBase === 'dockerfile' || lowerBase.startsWith('dockerfile.')) lang = 'dockerfile';
@@ -4279,7 +5569,7 @@ export function formatSourceCodeUrlToMarkdown(
         : rest.slice(1).join('/');
     if (filePath) title = `${owner}/${repo}/${filePath}`;
   } else if (parts.length >= 2) {
-    title = `${decodeURIComponent(parts[parts.length - 2]!)}/${baseName}`;
+    title = `${safeDecodeURIComponent(parts[parts.length - 2]!)}/${baseName}`;
   }
 
   let description: string | undefined;
@@ -4303,16 +5593,63 @@ export function formatSourceCodeUrlToMarkdown(
 
 function unwrapXmlText(raw: string | undefined): string {
   if (!raw) return '';
-  const cdata = /^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/.exec(raw);
-  if (cdata) return cdata[1]!.trim();
-  return decodeHtmlEntities(raw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')).trim();
+  if (!raw.includes('<![CDATA[')) {
+    return decodeHtmlEntities(raw).trim();
+  }
+  let out = '';
+  let pos = 0;
+  while (pos < raw.length) {
+    const start = raw.indexOf('<![CDATA[', pos);
+    if (start < 0) {
+      out += decodeHtmlEntities(raw.slice(pos));
+      break;
+    }
+    if (start > pos) {
+      out += decodeHtmlEntities(raw.slice(pos, start));
+    }
+    const end = raw.indexOf(']]>', start + 9);
+    if (end < 0) {
+      out += raw.slice(start + 9);
+      break;
+    }
+    out += raw.slice(start + 9, end);
+    pos = end + 3;
+  }
+  return out.trim();
 }
 
 function matchFirstXmlTag(block: string, tagNames: string[]): string {
+  const lowerBlock = block.toLowerCase();
   for (const tag of tagNames) {
-    const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
-    const m = re.exec(block);
-    if (m?.[1] !== undefined && m[1].trim()) return unwrapXmlText(m[1]);
+    const tagLower = tag.toLowerCase();
+    const openNeedle = `<${tagLower}`;
+    const closeNeedle = `</${tagLower}`;
+    let pos = 0;
+    while (pos < lowerBlock.length) {
+      const openIdx = lowerBlock.indexOf(openNeedle, pos);
+      if (openIdx < 0) break;
+      const afterName = openIdx + openNeedle.length;
+      if (afterName < lowerBlock.length && !isTagNameBoundary(lowerBlock.charCodeAt(afterName))) {
+        pos = afterName;
+        continue;
+      }
+      const openGt = lowerBlock.indexOf('>', afterName);
+      if (openGt < 0) break;
+      if (lowerBlock.charCodeAt(openGt - 1) === 47) {
+        pos = openGt + 1;
+        continue;
+      }
+      const closeIdx = lowerBlock.indexOf(closeNeedle, openGt + 1);
+      if (closeIdx < 0) break;
+      const afterCloseName = closeIdx + closeNeedle.length;
+      if (afterCloseName < lowerBlock.length && !isTagNameBoundary(lowerBlock.charCodeAt(afterCloseName))) {
+        pos = afterCloseName;
+        continue;
+      }
+      const inner = block.slice(openGt + 1, closeIdx);
+      if (inner.trim()) return unwrapXmlText(inner);
+      pos = afterCloseName;
+    }
   }
   return '';
 }
@@ -4322,17 +5659,25 @@ export function formatFeedXmlToMarkdown(
   rawXml: string,
   baseUrl?: string,
 ): { title?: string; description?: string; markdown: string; links: string[] } | null {
-  const head = rawXml.slice(0, 1200);
-  const isRss = /<(?:rss|rdf:RDF)\b/i.test(head) && /<item\b/i.test(rawXml);
-  const isAtom = /<feed\b/i.test(head) && /<entry\b/i.test(rawXml);
+  if (!rawXml) return null;
+  const boundedXml = rawXml.length > MAX_HTML_SCAN_CHARS ? rawXml.slice(0, MAX_HTML_SCAN_CHARS) : rawXml;
+  const headLower = boundedXml.slice(0, 1_200).toLowerCase();
+  const hasRssRoot = headLower.includes('<rss') || headLower.includes('<rdf:rdf');
+  const hasAtomRoot = headLower.includes('<feed');
+  if (!hasRssRoot && !hasAtomRoot) return null;
+
+  const lowerXml = boundedXml.toLowerCase();
+  const isRss = hasRssRoot && lowerXml.includes('<item');
+  const isAtom = !isRss && hasAtomRoot && lowerXml.includes('<entry');
   if (!isRss && !isAtom) return null;
 
-  const firstItemIdx = rawXml.search(/<(?:item|entry)\b/i);
-  const channelHeader = firstItemIdx > 0 ? rawXml.slice(0, firstItemIdx) : head;
+  const openNeedle = isAtom ? '<entry' : '<item';
+  const closeNeedle = isAtom ? '</entry>' : '</item>';
+  const firstItemIdx = lowerXml.indexOf(openNeedle);
+  const channelHeader = firstItemIdx > 0 ? boundedXml.slice(0, Math.min(firstItemIdx, 32_768)) : boundedXml.slice(0, 1_200);
   const feedTitle = cleanInlineHtml(matchFirstXmlTag(channelHeader, ['title']));
   const feedDesc = cleanInlineHtml(matchFirstXmlTag(channelHeader, ['description', 'subtitle']));
 
-  const itemRe = isAtom ? /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi : /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
   const lines: string[] = [];
   if (feedTitle) lines.push(`# ${feedTitle}`);
   if (feedDesc && feedDesc !== feedTitle) lines.push(feedDesc);
@@ -4340,16 +5685,50 @@ export function formatFeedXmlToMarkdown(
   const links: string[] = [];
   const seenLinks = new Set<string>();
   let count = 0;
-  let m: RegExpExecArray | null;
-  while ((m = itemRe.exec(rawXml)) !== null && count < 40) {
-    const block = m[1]!;
+  let searchPos = firstItemIdx >= 0 ? firstItemIdx : boundedXml.length;
+  while (searchPos < lowerXml.length && count < 40) {
+    const openIdx = lowerXml.indexOf(openNeedle, searchPos);
+    if (openIdx < 0) break;
+    const afterName = openIdx + openNeedle.length;
+    if (afterName < lowerXml.length && !isTagNameBoundary(lowerXml.charCodeAt(afterName))) {
+      searchPos = afterName;
+      continue;
+    }
+    const openGt = lowerXml.indexOf('>', afterName);
+    if (openGt < 0) break;
+    if (lowerXml.charCodeAt(openGt - 1) === 47) {
+      searchPos = openGt + 1;
+      continue;
+    }
+    const closeIdx = lowerXml.indexOf(closeNeedle, openGt + 1);
+    if (closeIdx < 0) break;
+    const block = boundedXml.slice(openGt + 1, closeIdx);
+    searchPos = closeIdx + closeNeedle.length;
+
     const itemTitle = cleanInlineHtml(matchFirstXmlTag(block, ['title'])) || `Entry ${count + 1}`;
     let rawLink = '';
     if (isAtom) {
-      const altHref =
-        /<link\b[^>]*rel=(?:"alternate"|'alternate')[^>]*href=(?:"([^"]+)"|'([^']+)')/i.exec(block) ??
-        /<link\b[^>]*href=(?:"([^"]+)"|'([^']+)')/i.exec(block);
-      rawLink = decodeHtmlEntities(altHref?.[1] ?? altHref?.[2] ?? '').trim();
+      let altHref = '';
+      let anyHref = '';
+      scanHtmlTagsLinear(
+        block,
+        (tag) => {
+          if (tag.isClosing || tag.tagNameLower !== 'link') return undefined;
+          const attrs = parseTagAttrs(tag.attrs);
+          const hrefVal = (attrs.href ?? '').trim();
+          if (!hrefVal) return undefined;
+          if (!anyHref) anyHref = hrefVal;
+          const relVal = (attrs.rel ?? '').trim().toLowerCase();
+          if (!relVal || relVal === 'alternate') {
+            altHref = hrefVal;
+            return false;
+          }
+          return undefined;
+        },
+        Math.min(block.length, 65_536),
+        false,
+      );
+      rawLink = decodeHtmlEntities(altHref || anyHref).trim();
     } else {
       rawLink = matchFirstXmlTag(block, ['link']);
       if (!rawLink) {
@@ -4592,7 +5971,7 @@ export function formatDelimitedTableToMarkdown(
   let fileLabel = '';
   if (urlStr) {
     try {
-      const seg = decodeURIComponent(new URL(urlStr).pathname.split('/').filter(Boolean).pop() ?? '');
+      const seg = safeDecodeURIComponent(new URL(urlStr).pathname.split('/').filter(Boolean).pop() ?? '');
       if (seg) fileLabel = seg;
     } catch {
       // ignore
@@ -4735,8 +6114,8 @@ export function deriveQuickMarkdownFromRawBytes(bytes: Uint8Array, baseUrl?: str
   if (patchDoc) return patchDoc.markdown;
   const srcDoc = formatSourceCodeUrlToMarkdown(rawText, undefined, baseUrl);
   if (srcDoc) return srcDoc.markdown;
-  const fm = parseMarkdownFrontmatter(trimmed);
-  return sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), baseUrl).trim();
+  const fm = parseMarkdownFrontmatter(trimmed.length > MAX_HTML_SCAN_CHARS ? trimmed.slice(0, MAX_HTML_SCAN_CHARS) : trimmed);
+  return sanitizeInlineHtmlInMarkdown(fm.body, baseUrl).trim();
 }
 
 function joinIpynbLines(val: unknown): string {
@@ -4793,7 +6172,7 @@ export function formatJupyterNotebookToMarkdown(
         if (!title && tl.startsWith('# ')) {
           title = tl.slice(2).trim();
         } else if (!description && !tl.startsWith('#') && !tl.startsWith('```') && tl.length >= 20) {
-          description = tl.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').slice(0, 280);
+          description = stripMarkdownLinksToLabelsLinear(tl).slice(0, 280);
         }
       }
     } else if (cellType === 'code') {
@@ -4859,8 +6238,7 @@ export function formatOpenApiSpecToMarkdown(
   const apiVer = typeof info.version === 'string' && info.version.trim() ? info.version.trim() : '';
   const specBadge = oaVer ? `OpenAPI ${oaVer}` : `Swagger ${swVer}`;
   const rawDesc = typeof info.description === 'string' ? info.description.trim() : '';
-  const cleanSummaryDesc = rawDesc
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+  const cleanSummaryDesc = stripMarkdownLinksToLabelsLinear(rawDesc)
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 300);
@@ -5323,6 +6701,7 @@ async function runPdfOcrFallback(params: {
           'x-pdf-bytes': String(pdfBytes.byteLength),
         },
         body: bodyPayload,
+        signal: AbortSignal.timeout(300_000),
       });
     } else {
       ocrRes = await fetch(`${ocrUrlBase}/ocr?${qs}`, {
@@ -5465,6 +6844,17 @@ export async function executeScrapeCall(params: {
       ? (payload.headers as Record<string, string>)
       : {}),
   };
+  let callerExplicitAccept: string | undefined;
+  for (const [hk, hv] of Object.entries(mergedHeaders)) {
+    if (hk.toLowerCase() === 'accept' && typeof hv === 'string' && hv.trim()) {
+      callerExplicitAccept = hv.trim();
+      break;
+    }
+  }
+  if (!callerExplicitAccept && typeof (payload as Record<string, unknown>).accept === 'string') {
+    const rawPayloadAccept = String((payload as Record<string, unknown>).accept).trim();
+    if (rawPayloadAccept) callerExplicitAccept = rawPayloadAccept;
+  }
 
   const onlyMainContent = typeof payload.onlyMainContent === 'boolean' ? payload.onlyMainContent : true;
   const includeImages = typeof payload.includeImages === 'boolean' ? payload.includeImages : true;
@@ -5549,8 +6939,11 @@ export async function executeScrapeCall(params: {
     return { markdown: focused, chunks: ranked, queryFiltered: true };
   };
 
+  const preferOriginMarkdown = payload.preferOriginMarkdown !== false;
+
   // Serve from verified META D1 + ARTIFACTS R2 cache when maxAgeMs is satisfied and only markdown/metadata are requested.
   const needsLiveHtml =
+    !preferOriginMarkdown ||
     stringFormats.has('html') ||
     stringFormats.has('rawHtml') ||
     stringFormats.has('rawBase64') ||
@@ -5561,6 +6954,7 @@ export async function executeScrapeCall(params: {
     stringFormats.has('llmsTxt') ||
     stringFormats.has('changes') ||
     checkPromptInjection ||
+    Boolean(callerExplicitAccept) ||
     inlineActions.length > 0 ||
     pdfParserOpts.skipPdfParsing ||
     includeTags.length > 0 ||
@@ -5765,9 +7159,17 @@ export async function executeScrapeCall(params: {
         id: 'scrape-1',
         url: normalizedUrl,
         kind: pdfParserOpts.skipPdfParsing ? 'binary' : renderMode === 'always' ? 'render' : 'scrape',
-        ...(!pdfParserOpts.skipPdfParsing && !Object.keys(mergedHeaders).some((k) => k.toLowerCase() === 'accept')
-          ? { accept: MARKDOWN_FOR_AGENTS_ACCEPT }
-          : {}),
+        ...(!pdfParserOpts.skipPdfParsing
+          ? {
+              accept:
+                callerExplicitAccept ??
+                (!preferOriginMarkdown || stringFormats.has('html') || stringFormats.has('rawHtml')
+                  ? 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8'
+                  : MARKDOWN_FOR_AGENTS_ACCEPT),
+            }
+          : callerExplicitAccept
+            ? { accept: callerExplicitAccept }
+            : {}),
         formats: agentFormats,
         onlyMainContent,
         discoverLlms: goDiscoverLlms,
@@ -6268,6 +7670,20 @@ export async function executeScrapeCall(params: {
                 })
               : null;
             const twinRawBase64Out = stringFormats.has('rawBase64') ? encodeBodyToRawBase64(twinItem) : undefined;
+            const twinHeaders =
+              twinItem.headers && typeof twinItem.headers === 'object' && !Array.isArray(twinItem.headers)
+                ? (twinItem.headers as Record<string, string | undefined>)
+                : undefined;
+            const twinDetected = detectSiteFrameworkLinear({
+              url: normalizedUrl,
+              ...(twinHeaders ? { headers: twinHeaders } : {}),
+            });
+            const hasTwinDetected = Boolean(
+              twinDetected.platform ||
+                twinDetected.framework ||
+                twinDetected.generators.length > 0 ||
+                (twinDetected.contentFlags && twinDetected.contentFlags.length > 0),
+            );
             return {
               status: 200,
               via: twinRes.via,
@@ -6280,9 +7696,15 @@ export async function executeScrapeCall(params: {
                 status: twinItem.status ?? 200,
                 via: twinRes.via,
                 extractorId: registryTwin.id,
+                ...(hasTwinDetected ? { detected: twinDetected } : {}),
                 ...(twinArt?.contentSha256 ? { contentSha256: twinArt.contentSha256 } : {}),
                 ...(twinArt?.blobSha256 ? { artifactId: twinArt.blobSha256 } : {}),
                 ...(twinMdArtifactId ? { markdownArtifactId: twinMdArtifactId } : {}),
+                ...(formatted.records !== undefined ? { records: formatted.records } : {}),
+                ...(formatted.pagination !== undefined ? { pagination: formatted.pagination } : {}),
+                ...(formatted.total !== undefined ? { total: formatted.total } : {}),
+                ...(formatted.returned !== undefined ? { returned: formatted.returned } : {}),
+                ...(formatted.nextCursor !== undefined ? { nextCursor: formatted.nextCursor } : {}),
                 ...(stringFormats.has('markdown') ? { markdown: twinShaped.markdown } : {}),
                 ...(stringFormats.has('text') ? { text: twinShaped.markdown } : {}),
                 ...(twinSummaryOut !== undefined ? { summary: twinSummaryOut } : {}),
@@ -6297,7 +7719,9 @@ export async function executeScrapeCall(params: {
                       totalChars: twinShaped.totalChars,
                       nextOffset: twinShaped.nextOffset ?? twinShaped.markdown.length,
                     }
-                  : {}),
+                  : formatted.truncated === true
+                    ? { truncated: true }
+                    : {}),
                 metadata: {
                   title: formatted.title,
                   ...(formatted.description ? { description: formatted.description } : {}),
@@ -6674,14 +8098,25 @@ export async function executeScrapeCall(params: {
         ? 'challenge'
         : (item.outcome ?? 'error');
     const effectiveProb = errWaf ? errWaf.summary : problemText;
-    const robotsHint = /robots\.txt disallowed/i.test(effectiveProb) ? buildRobotsAlternativeHint(normalizedUrl) : undefined;
+    const robotsHint =
+      /robots\.txt disallowed/i.test(effectiveProb) && !/^robots_unreachable\b/i.test(effectiveProb)
+        ? buildRobotsAlternativeHint(normalizedUrl)
+        : undefined;
     const itemPaymentHeaders =
       item.paymentHeaders && typeof item.paymentHeaders === 'object' && !Array.isArray(item.paymentHeaders)
         ? (item.paymentHeaders as Record<string, string | undefined>)
         : undefined;
-    const blockedInfo = buildBlockedInfo(normalizedUrl, effectiveOutcome, effectiveProb, item.status, {
+    const rawBlockedInfo = buildBlockedInfo(normalizedUrl, effectiveOutcome, effectiveProb, item.status, {
       headers: itemPaymentHeaders,
       rawBody: rawErrBody,
+    });
+    const blockedInfo = refineBlockedInfo({
+      url: normalizedUrl,
+      outcome: effectiveOutcome,
+      problem: effectiveProb,
+      status: item.status,
+      retryAfter: typeof item.retryAfter === 'string' ? item.retryAfter : fetchResUsed.retryAfter,
+      baseBlocked: rawBlockedInfo,
     });
     return {
       status: isPaymentRequiredErr
@@ -6755,21 +8190,37 @@ export async function executeScrapeCall(params: {
   let renderedViaOut: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
     renderMode === 'always' ? 'browser' : item.rendered === true ? 'browser-auto' : undefined;
 
+  const rawTrimmedHead = rawBodyStr ? rawBodyStr.trimStart().slice(0, 64) : '';
+  const looksLikeHtmlDocument = /^(?:<!doctype\b|<html\b)/i.test(rawTrimmedHead);
   const isOriginMarkdown = Boolean(
     rawBodyStr &&
       !isPdfResponse &&
+      !looksLikeHtmlDocument &&
       typeof item.contentType === 'string' &&
-      /^text\/x?-?markdown\b/i.test(item.contentType.trim()),
+      /^text\/(?:x-)?markdown\s*(?:;|$)/i.test(item.contentType.trim()),
   );
+  let originMdCapTruncated = false;
+  let originMdOriginalChars = 0;
+  if (isOriginMarkdown && rawBodyStr.length > MAX_HTML_SCAN_CHARS) {
+    originMdCapTruncated = true;
+    originMdOriginalChars = rawBodyStr.length;
+    rawBodyStr = rawBodyStr.slice(0, MAX_HTML_SCAN_CHARS);
+  }
 
-  // R2 & R3: Guard against HTTP 200 WAF/CAPTCHA interstitials (e.g. Imperva / PerimeterX / DataDome 200 shells) using all 4 anti-FP layers!
+  // R2 & R3 (`R3-M3`): Guard against HTTP 200 WAF/CAPTCHA interstitials on BOTH HTML AND `origin-markdown` responses!
   const okWafMatch =
     (item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
-    (!isPdfResponse && !isOriginMarkdown && rawBodyStr
+    (!isPdfResponse && rawBodyStr
       ? classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 200, rawBody: rawBodyStr })
       : null);
   if (okWafMatch) {
-    const blockedInfo = buildBlockedInfo(finalUrl, 'challenge', okWafMatch.summary, item.status);
+    const blockedInfo = refineBlockedInfo({
+      url: finalUrl,
+      outcome: 'challenge',
+      problem: okWafMatch.summary,
+      status: item.status,
+      baseBlocked: buildBlockedInfo(finalUrl, 'challenge', okWafMatch.summary, item.status),
+    });
     return {
       status: 403,
       via: fetchResUsed.via,
@@ -6967,24 +8418,141 @@ export async function executeScrapeCall(params: {
       })
     : undefined;
 
-  // R6: SSR Hydration State Recovery (`__NEXT_DATA__`, Remix, Apollo) — extract full structured content directly from
-  // the embedded hydration JSON on thin `<script>` pages BEFORE paying headless Chromium latency!
-  let ssrHydrated: { title?: string; description?: string; markdown: string; framework: string } | null = null;
-  if (isHtmlBody && !isPdfResponse && countTextWords(extracted?.markdown ?? '') < 80) {
-    const candidateHydration = recoverSsrHydrationContent(rawBodyStr, finalUrl, htmlFragToMd);
-    if (candidateHydration && countTextWords(candidateHydration.markdown) > countTextWords(extracted?.markdown ?? '') * 2) {
-      ssrHydrated = candidateHydration;
+  const readItemHeaders = (): Record<string, string | undefined> | undefined =>
+    item.headers && typeof item.headers === 'object' && !Array.isArray(item.headers)
+      ? (item.headers as Record<string, string | undefined>)
+      : undefined;
+
+  // Custom-Domain Shopify Product Enrichment: when an HTML page on a custom domain (not `*.myshopify.com`, which already
+  // used pre-fetch `resolveSiteExtractorTwin`) matches `isShopifyHtmlOrHeaders` + `/products/<handle>`, fetch `.json` (+ optional `.js`)
+  // politely via `executeHubFetch` and merge its rich GFM variant table + normalized `CatalogRecord`.
+  let customShopifyDoc: TwinFormattedDoc | null = null;
+  let prelimHostLower = '';
+  try {
+    prelimHostLower = new URL(finalUrl).hostname.toLowerCase();
+  } catch {
+    prelimHostLower = '';
+  }
+  if (
+    isHtmlBody &&
+    !isPdfResponse &&
+    prelimHostLower &&
+    !prelimHostLower.endsWith('.myshopify.com') &&
+    isShopifyHtmlOrHeaders(rawBodyStr, readItemHeaders())
+  ) {
+    const shopTwin = resolveCustomDomainShopifyProductTwinUrl(finalUrl);
+    if (shopTwin) {
+      try {
+        const htmlCurrency = extractShopifyCurrencyFromHtml(rawBodyStr);
+        const fetchShopifyTwinBody = async (epUrl: string, tag: string): Promise<string> => {
+          const epRes = await executeHubFetch(
+            target,
+            JSON.stringify({
+              maxSeconds: 25,
+              options: { includeBody: true, respectRobots: true },
+              requests: [{ id: tag, url: epUrl, kind: 'json', accept: 'application/json' }],
+            }),
+            site,
+            `${source}:${tag}`,
+            retentionMode,
+            true,
+            collectionId,
+          );
+          if (epRes.status !== 200) return '';
+          const epParsed = JSON.parse(epRes.bodyText) as { results?: Array<Record<string, unknown>> };
+          const epItem = epParsed.results?.[0];
+          return epItem?.outcome === 'ok' && typeof epItem.body === 'string' && epItem.bodyEncoding !== 'base64'
+            ? epItem.body
+            : '';
+        };
+
+        const jsonBody = await fetchShopifyTwinBody(shopTwin.jsonUrl, 'shopify-product-json');
+        if (jsonBody.trim()) {
+          let needsJsEnrich = true;
+          try {
+            const parsedJ = JSON.parse(jsonBody) as {
+              product?: { variants?: Array<Record<string, unknown>> };
+              variants?: Array<Record<string, unknown>>;
+            };
+            const firstVar = (parsedJ.product?.variants ?? parsedJ.variants)?.[0];
+            if (firstVar && typeof firstVar.available === 'boolean') {
+              needsJsEnrich = false;
+            }
+          } catch {
+            needsJsEnrich = false;
+          }
+          const jsBody = needsJsEnrich
+            ? await fetchShopifyTwinBody(shopTwin.jsUrl, 'shopify-product-js').catch(() => '')
+            : '';
+          customShopifyDoc = enrichShopifyProductFromJson({
+            rawJson: jsonBody,
+            productUrl: finalUrl,
+            htmlToMd: htmlFragToMd,
+            currency: htmlCurrency,
+            ...(jsBody.trim() ? { ajaxJsBody: jsBody } : {}),
+          });
+        } else {
+          const jsBody = await fetchShopifyTwinBody(shopTwin.jsUrl, 'shopify-product-js').catch(() => '');
+          if (jsBody.trim()) {
+            customShopifyDoc = enrichShopifyProductFromJson({
+              rawJson: jsBody,
+              productUrl: finalUrl,
+              htmlToMd: htmlFragToMd,
+              currency: htmlCurrency,
+              isAjaxJs: true,
+            });
+          }
+        }
+      } catch {
+        // Gracefully keep standard HTML / JSON-LD extraction if .json / .js endpoints fail.
+      }
     }
   }
 
-  // P3: Automatic browser switch when a `<script>`-bearing HTML page yields < 80 words or > 60% nav/filter-only lines (and SSR hydration didn't already recover full prose).
+  // R6: SSR Hydration State Recovery (`__NEXT_DATA__`, Remix, Apollo, Inertia `data-page`) — extract full structured content
+  // directly from the embedded hydration JSON on thin `<script>` pages BEFORE paying headless Chromium latency!
+  let ssrHydrated: { title?: string; description?: string; markdown: string; framework: string } | null = null;
+  if (isHtmlBody && !isPdfResponse && !customShopifyDoc) {
+    if (extracted?.inertiaHydrated && extracted.markdown.trim()) {
+      ssrHydrated = {
+        ...(extracted.title ? { title: extracted.title } : {}),
+        ...(extracted.description ? { description: extracted.description } : {}),
+        markdown: extracted.markdown,
+        framework: 'inertia',
+      };
+    } else if (countTextWords(extracted?.markdown ?? '') < 80) {
+      const candidateHydration = recoverSsrHydrationContent(rawBodyStr, finalUrl, htmlFragToMd);
+      if (candidateHydration && countTextWords(candidateHydration.markdown) > countTextWords(extracted?.markdown ?? '') * 2) {
+        ssrHydrated = candidateHydration;
+      } else if (
+        countTextWords(extracted?.markdown ?? '') < 50 &&
+        (rawBodyStr.includes('data-page="{&quot;component&quot;') || rawBodyStr.includes("data-page='{\"component\""))
+      ) {
+        const inertiaPage = extractInertiaPagePropsLinear(rawBodyStr);
+        const inertiaDoc = inertiaPage ? formatInertiaPagePropsToMarkdown(inertiaPage, finalUrl, htmlFragToMd) : null;
+        if (inertiaDoc && inertiaDoc.markdown.trim()) {
+          ssrHydrated = {
+            ...(inertiaDoc.title ? { title: inertiaDoc.title } : {}),
+            ...(inertiaDoc.description ? { description: inertiaDoc.description } : {}),
+            markdown: inertiaDoc.markdown,
+            framework: 'inertia',
+          };
+        }
+      }
+    }
+  }
+
+  // P3: Automatic browser switch when a `<script>`-bearing or thin external/widget `<iframe>` (e.g. `#icims_content_iframe`) HTML page yields < 80 words.
+  const hasThinExternalIframe =
+    isHtmlBody && !customShopifyDoc && countTextWords(extracted?.markdown ?? '') < 50 && hasExternalOrWidgetIframeLinear(rawBodyStr).found;
   if (
     isHtmlBody &&
+    !customShopifyDoc &&
     !ssrHydrated &&
     effectiveRenderMode === 'auto' &&
     item.rendered !== true &&
     target !== 'container' &&
-    isThinScriptedPage(rawBodyStr, extracted?.markdown ?? '')
+    (isThinScriptedPage(rawBodyStr, extracted?.markdown ?? '') || hasThinExternalIframe)
   ) {
     try {
       const autoBrowserRes = await executeHubFetch(
@@ -7228,13 +8796,14 @@ export async function executeScrapeCall(params: {
   let markdown = isOriginMarkdown
     ? rawBodyStr
     : alternateMarkdownBody ||
+      customShopifyDoc?.markdown ||
       ssrHydrated?.markdown ||
       structuredTextFormatted?.markdown ||
       (isHtmlBody ? extracted?.markdown : undefined) ||
       (typeof item.markdown === 'string' && item.markdown) ||
       extracted?.markdown ||
       (isHtmlBody ? '' : rawBodyStr);
-  if (htmlJobPosting && isHtmlBody && !alternateMarkdownBody) {
+  if (htmlJobPosting && isHtmlBody && !alternateMarkdownBody && !customShopifyDoc) {
     const jpHeader = formatJobPostingHeaderMarkdown(htmlJobPosting);
     if (jpHeader && !/\*\*Compensation\*\*:/.test(markdown.slice(0, 400))) {
       const topHeadingMatch = /^(#\s+[^\n]+)\n+([\s\S]*)$/.exec(markdown.trim());
@@ -7246,6 +8815,7 @@ export async function executeScrapeCall(params: {
   let textOut = isOriginMarkdown
     ? rawBodyStr
     : alternateMarkdownBody ||
+      customShopifyDoc?.markdown ||
       ssrHydrated?.markdown ||
       feedFormatted?.markdown ||
       vcardFormatted?.markdown ||
@@ -7311,6 +8881,8 @@ export async function executeScrapeCall(params: {
   if (
     isHtmlBody &&
     !isPdfResponse &&
+    !customShopifyDoc &&
+    !ssrHydrated &&
     bodyWordsBeforeRescue < 50 &&
     prelimDescription &&
     metaDescWords >= 18 &&
@@ -7330,20 +8902,25 @@ export async function executeScrapeCall(params: {
     contentSourceOut = 'meta-description';
   }
 
-  // Ethical Heavy-SPA Fallback (`Crawl4AI` / `Firecrawl`) when a `200 OK` `<script>` SPA shell remained thin (`< 50` words)
+  // Ethical Heavy-SPA Fallback (`Crawl4AI` / `Firecrawl`) when a `200 OK` `<script>` or external-iframe SPA shell remained thin (`< 50` words)
   // even after SSR hydration + local browser attempt, provided there is NO WAF challenge, login wall, soft-404, or closed posting!
+  const isThinIframeShellAfterLocal =
+    isHtmlBody && !customShopifyDoc && countTextWords(rawCleanMarkdown) < 50 && hasExternalOrWidgetIframeLinear(rawBodyStr).found;
   if (
     isHtmlBody &&
     !isPdfResponse &&
+    !customShopifyDoc &&
+    !ssrHydrated &&
     effectiveRenderMode !== 'off' &&
     countTextWords(rawCleanMarkdown) < 50 &&
-    isThinScriptedPage(rawBodyStr, rawCleanMarkdown)
+    (isThinScriptedPage(rawBodyStr, rawCleanMarkdown) || isThinIframeShellAfterLocal)
   ) {
     const preState = classifyContentState({
       status: typeof item.status === 'number' ? item.status : 200,
       title: prelimTitle,
       markdown: rawCleanMarkdown,
       rawHtml: rawBodyStr,
+      rendered: Boolean(item.rendered === true || renderedViaOut !== undefined),
       nowMs: now,
     });
     if (
@@ -7352,7 +8929,7 @@ export async function executeScrapeCall(params: {
         outcome: 'ok',
         status: item.status ?? 200,
         waf: okWafMatch,
-        contentState: preState.state,
+        contentState: preState.state === 'empty_shell' ? 'active' : preState.state,
         isThinSpa200: true,
       })
     ) {
@@ -7411,7 +8988,7 @@ export async function executeScrapeCall(params: {
         })
       : fullShaped;
   markdown = shaped.markdown;
-  textOut = isOriginMarkdown ? stripInvisibleSmugglingChars(textOut) : decodeHtmlEntities(textOut);
+  textOut = isOriginMarkdown ? rawCleanMarkdown : decodeHtmlEntities(textOut);
 
   let llmsPayload: unknown = item.llms;
   if (llmsPayload && typeof llmsPayload === 'object') {
@@ -7477,7 +9054,8 @@ export async function executeScrapeCall(params: {
         ? (item.images as ScrapedImage[]).filter((img) => !isTinyOrAvatarImageUrl(img.url ?? '', img.alt ?? ''))
         : (mdAssets?.images ?? extracted?.images ?? []);
 
-  const resolvedTitle =
+  const rawResolvedTitle =
+    customShopifyDoc?.title ||
     ssrHydrated?.title ||
     extracted?.title ||
     structuredTextFormatted?.title ||
@@ -7488,15 +9066,22 @@ export async function executeScrapeCall(params: {
       ? decodeHtmlEntities((llmsPayload as { matchedEntry: { title: string } }).matchedEntry.title)
       : undefined) ||
     (isPdfResponse ? extractPdfTitle(rawCleanMarkdown, finalUrl) : undefined);
-  const resolvedDescription =
+  const rawResolvedDescription =
+    customShopifyDoc?.description ||
     ssrHydrated?.description ||
     extracted?.description ||
     (structuredTextFormatted as { description?: string } | null)?.description ||
     fullShaped.frontmatterDescription ||
     mdAssets?.description ||
     (typeof item.description === 'string' && item.description ? decodeHtmlEntities(item.description) : undefined);
+  const resolvedTitle = rawResolvedTitle ? (redactPii ? redactPiiText(rawResolvedTitle) : rawResolvedTitle) : undefined;
+  const resolvedDescription = rawResolvedDescription
+    ? redactPii
+      ? redactPiiText(rawResolvedDescription)
+      : rawResolvedDescription
+    : undefined;
 
-  // R4: Classify `contentState` ("active" | "closed_posting" | "soft_404" | "login_wall") with anti-false-positive vetoes!
+  // R4: Classify `contentState` ("active" | "closed_posting" | "soft_404" | "login_wall" | "empty_shell") with anti-false-positive vetoes!
   const contentStateCheck: { state: ContentState; reason?: string } = classifyContentState({
     status: typeof item.status === 'number' ? item.status : 200,
     url: normalizedUrl,
@@ -7504,14 +9089,16 @@ export async function executeScrapeCall(params: {
     title: resolvedTitle,
     markdown: rawCleanMarkdown,
     ...(isHtmlBody ? { rawHtml: rawBodyStr } : {}),
+    rendered: Boolean(item.rendered === true || renderedViaOut !== undefined),
     ...(htmlJobPosting?.validThrough ? { validThrough: htmlJobPosting.validThrough } : {}),
     nowMs: now,
   });
 
   if (checkPromptInjection) {
+    const mdForInjectionCheck = [resolvedTitle, resolvedDescription, rawCleanMarkdown].filter(Boolean).join('\n\n');
     const piCheck = detectPromptInjection({
-      markdown: rawCleanMarkdown,
-      ...(isHtmlBody ? { rawHtml: rawBodyStr } : {}),
+      markdown: mdForInjectionCheck,
+      ...(isHtmlBody || isOriginMarkdown ? { rawHtml: rawBodyStr } : {}),
     });
     if (piCheck.detected) {
       return {
@@ -7542,6 +9129,7 @@ export async function executeScrapeCall(params: {
         includeImages,
         maxChars,
         baseUrl: finalUrl,
+        allowPdfPageMarkers: true,
       }).markdown;
     }
   }
@@ -7559,7 +9147,7 @@ export async function executeScrapeCall(params: {
   let summaryOut: string | undefined;
   if (stringFormats.has('summary')) {
     const sumRes = await summarizeMarkdownWithOptionalLlm({
-      markdown: rawCleanMarkdown,
+      markdown: rawCleanMarkdown.slice(0, 32_768),
       title: resolvedTitle,
       llmConfig: activeLlmConfig,
     });
@@ -7668,6 +9256,40 @@ export async function executeScrapeCall(params: {
         }
       : undefined;
 
+  const itemGlobals =
+    (item.frameworkGlobals ?? item.globals) &&
+    typeof (item.frameworkGlobals ?? item.globals) === 'object' &&
+    !Array.isArray(item.frameworkGlobals ?? item.globals)
+      ? ((item.frameworkGlobals ?? item.globals) as BrowserFrameworkGlobals)
+      : undefined;
+  const finalHeadersForDetect = readItemHeaders();
+  const detectedStack = !isPdfResponse
+    ? detectSiteFrameworkLinear({
+        url: finalUrl,
+        body: isOriginMarkdown || isHtmlBody ? rawBodyStr : '',
+        ...(isOriginMarkdown ? { contentSource: 'origin-markdown' as const } : isHtmlBody ? { contentSource: 'html' as const } : {}),
+        ...(finalHeadersForDetect ? { headers: finalHeadersForDetect } : {}),
+        ...(itemGlobals ? { globals: itemGlobals } : {}),
+      })
+    : null;
+  const hasDetectedStack = Boolean(
+    detectedStack &&
+      (detectedStack.platform ||
+        detectedStack.framework ||
+        detectedStack.generators.length > 0 ||
+        (detectedStack.contentFlags && detectedStack.contentFlags.length > 0)),
+  );
+
+  const extractorIdOut = customShopifyDoc ? 'shopify' : extracted?.extractorId;
+  const adapterRecordsOut = customShopifyDoc?.records ?? extracted?.records;
+  const adapterPaginationOut = customShopifyDoc?.pagination ?? extracted?.pagination;
+  const adapterTotalOut = customShopifyDoc?.total ?? extracted?.total;
+  const adapterReturnedOut = customShopifyDoc?.returned ?? extracted?.returned;
+  const adapterTruncatedOut = customShopifyDoc?.truncated ?? extracted?.truncated;
+  const adapterNextCursorOut = customShopifyDoc?.nextCursor ?? extracted?.nextCursor;
+  const resolvedAuthor = customShopifyDoc?.author ?? extracted?.author;
+  const resolvedPublishedTime = customShopifyDoc?.publishedTime ?? extracted?.publishedTime ?? htmlJobPosting?.datePosted;
+
   const out: Record<string, unknown> = {
     ok: true,
     cached: false,
@@ -7677,11 +9299,18 @@ export async function executeScrapeCall(params: {
     ...(redirectAnalysis.redirected ? redirectAnalysis : {}),
     status: item.status ?? 200,
     via: viaOut,
+    ...(extractorIdOut ? { extractorId: extractorIdOut } : {}),
+    ...(hasDetectedStack && detectedStack ? { detected: detectedStack } : {}),
     contentState: contentStateCheck.state,
     ...(contentStateCheck.reason ? { contentStateReason: contentStateCheck.reason } : {}),
     ...(contentSourceOut ? { contentSource: contentSourceOut } : {}),
     ...(renderedViaOut ? { renderedVia: renderedViaOut } : {}),
     ...(htmlJobPosting ? { jobPosting: htmlJobPosting } : {}),
+    ...(adapterRecordsOut !== undefined ? { records: adapterRecordsOut } : {}),
+    ...(adapterPaginationOut !== undefined ? { pagination: adapterPaginationOut } : {}),
+    ...(adapterTotalOut !== undefined ? { total: adapterTotalOut } : {}),
+    ...(adapterReturnedOut !== undefined ? { returned: adapterReturnedOut } : {}),
+    ...(adapterNextCursorOut !== undefined ? { nextCursor: adapterNextCursorOut } : {}),
     ...(art?.contentSha256 ? { contentSha256: art.contentSha256 } : {}),
     ...(art?.blobSha256 ? { artifactId: art.blobSha256 } : {}),
     ...(markdownArtifactId ? { markdownArtifactId } : {}),
@@ -7702,13 +9331,15 @@ export async function executeScrapeCall(params: {
             totalRecords: jsonRecordsFormatted.totalRecords,
           }
         : {}),
-    ...(shaped.truncated
+    ...(shaped.truncated || originMdCapTruncated
       ? {
           truncated: true,
-          totalChars: shaped.totalChars,
+          totalChars: shaped.totalChars ?? originMdOriginalChars,
           nextOffset: shaped.nextOffset ?? markdown.length,
         }
-      : {}),
+      : adapterTruncatedOut === true
+        ? { truncated: true }
+        : {}),
     ...(stringFormats.has('rawHtml') || stringFormats.has('html') ? { rawHtml: rawBodyStr, html: rawBodyStr } : {}),
     ...(stringFormats.has('links') ? { links: resolvedLinks } : {}),
     ...(stringFormats.has('images') ? { images: resolvedImages } : {}),
@@ -7763,10 +9394,8 @@ export async function executeScrapeCall(params: {
     metadata: {
       title: resolvedTitle,
       description: resolvedDescription,
-      ...(extracted?.author ? { author: extracted.author } : {}),
-      ...(extracted?.publishedTime || htmlJobPosting?.datePosted
-        ? { publishedTime: extracted?.publishedTime ?? htmlJobPosting?.datePosted }
-        : {}),
+      ...(resolvedAuthor ? { author: resolvedAuthor } : {}),
+      ...(resolvedPublishedTime ? { publishedTime: resolvedPublishedTime } : {}),
       ...(extracted?.modifiedTime ? { modifiedTime: extracted.modifiedTime } : {}),
       ...(extracted?.siteName || htmlJobPosting?.hiringOrganization
         ? { siteName: extracted?.siteName ?? htmlJobPosting?.hiringOrganization }
@@ -7786,17 +9415,47 @@ export async function executeScrapeCall(params: {
 
 export function extractYouTubeTranscriptFromHtml(rawHtml: string): string {
   if (!rawHtml) return '';
+  const bounded = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
+  const lower = bounded.toLowerCase();
   const segments: string[] = [];
-  for (const m of rawHtml.matchAll(/<transcript-segment-view-model\b[^>]*>([\s\S]*?)<\/transcript-segment-view-model>/gi)) {
-    const span = /<span\b[^>]*role="text"[^>]*>([\s\S]*?)<\/span>/i.exec(m[1]!);
-    const cleaned = cleanInlineHtml(span ? span[1]! : m[1]!);
-    if (cleaned) segments.push(cleaned);
+  if (lower.includes('transcript-segment-view-model')) {
+    replacePairedHtmlElementsLinear(
+      bounded,
+      ['transcript-segment-view-model'],
+      (_full, _tag, _attrs, segInner) => {
+        let roleText = '';
+        replacePairedHtmlElementsLinear(
+          segInner,
+          ['span'],
+          (_sf, _st, sAttrs, sInner) => {
+            if (!roleText && /\brole\s*=\s*(?:"text"|'text')/i.test(sAttrs)) {
+              roleText = sInner;
+            }
+            return '';
+          },
+          { maxChars: 4_096, maxInnerChars: 2_048 },
+        );
+        const cleaned = cleanInlineHtml(roleText || segInner);
+        if (cleaned) segments.push(cleaned);
+        return '';
+      },
+      { maxChars: MAX_HTML_SCAN_CHARS, maxInnerChars: 4_096 },
+    );
   }
-  if (segments.length === 0) {
-    for (const m of rawHtml.matchAll(/<yt-formatted-string\b[^>]*class="[^"]*\bsegment-text\b[^"]*"[^>]*>([\s\S]*?)<\/yt-formatted-string>/gi)) {
-      const cleaned = cleanInlineHtml(m[1]!);
-      if (cleaned) segments.push(cleaned);
-    }
+  if (segments.length === 0 && lower.includes('segment-text')) {
+    replacePairedHtmlElementsLinear(
+      bounded,
+      ['yt-formatted-string'],
+      (_full, _tag, attrStr, segInner) => {
+        const cls = parseTagAttrs(attrStr).class ?? '';
+        if (/\bsegment-text\b/i.test(cls)) {
+          const cleaned = cleanInlineHtml(segInner);
+          if (cleaned) segments.push(cleaned);
+        }
+        return '';
+      },
+      { maxChars: MAX_HTML_SCAN_CHARS, maxInnerChars: 4_096 },
+    );
   }
   if (segments.length === 0) return '';
   return segments
@@ -7857,9 +9516,13 @@ function normalizeInteractPrincipal(principal?: string, source?: string): string
   return stripped || 'default';
 }
 
+const DEFAULT_INTERACT_HMAC_KEY_FALLBACK = 'edgefetch-default-interact-key';
+
 async function computeInteractSessionMacHex(secret: string, principal: string, siteId: string, agentSessionId: string): Promise<string> {
   const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const effectiveSecret = secret.trim() || DEFAULT_INTERACT_HMAC_KEY_FALLBACK;
+  const derivedKeyBytes = await crypto.subtle.digest('SHA-256', enc.encode(effectiveSecret));
+  const key = await crypto.subtle.importKey('raw', derivedKeyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const macBuf = await crypto.subtle.sign('HMAC', key, enc.encode(`ef-interact-v1|${principal}|${siteId}|${agentSessionId}`));
   return Array.from(new Uint8Array(macBuf).subarray(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
 }
@@ -7896,12 +9559,15 @@ export async function executeInteractCall(params: {
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const { payload, env, executeHubFetch, source = 'interact', selfHost, principal, sessionSigningSecret } = params;
   const effectivePrincipal = normalizeInteractPrincipal(principal, source);
-  const signingSecret = typeof sessionSigningSecret === 'string' && sessionSigningSecret.trim().length >= 16 ? sessionSigningSecret.trim() : '';
+  const signingSecret =
+    typeof sessionSigningSecret === 'string' && sessionSigningSecret.trim()
+      ? sessionSigningSecret.trim()
+      : DEFAULT_INTERACT_HMAC_KEY_FALLBACK;
   const parsedSession = splitCompositeSessionId(payload.sessionId);
   if (parsedSession.malformed) {
     return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_session_id', message: 'malformed interact sessionId' } };
   }
-  if (parsedSession.agentSessionId && signingSecret) {
+  if (parsedSession.agentSessionId) {
     if (!parsedSession.siteId || !parsedSession.sigHex) {
       return {
         status: 403,
@@ -8108,21 +9774,22 @@ export async function executeInteractCall(params: {
     const partialFinalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
     const partialDoc = partialHtml ? extractHtmlDocument(partialHtml, { baseUrl: partialFinalUrl || undefined, onlyMainContent: true }) : undefined;
     const partialTranscript = partialHtml ? extractYouTubeTranscriptFromHtml(partialHtml) : '';
-    const partialMd = partialDoc?.markdown ? decodeMarkdownEntities(partialDoc.markdown).trim() : '';
+    const partialMd = partialDoc?.markdown ? partialDoc.markdown.trim() : '';
     const errSiteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
-    const errActualSite = (errSiteMatch?.[1] ?? pinnedSite)?.toLowerCase();
+    const errActualSite = (errSiteMatch?.[1] ?? pinnedSite ?? 'default').toLowerCase();
     const errAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
-    const errSig =
-      errAgentSid && errActualSite && signingSecret
-        ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, errActualSite, errAgentSid)
-        : undefined;
-    const errPublicSid =
-      errAgentSid && errActualSite
-        ? errSig
-          ? `${errActualSite}.${errAgentSid}.${errSig}`
-          : `${errActualSite}.${errAgentSid}`
-        : errAgentSid;
-    const blockedInfo = buildBlockedInfo(partialFinalUrl || normalizedUrl, item.outcome, prob, item.status);
+    const errSig = errAgentSid
+      ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, errActualSite, errAgentSid)
+      : undefined;
+    const errPublicSid = errAgentSid && errSig ? `${errActualSite}.${errAgentSid}.${errSig}` : errAgentSid;
+    const blockedInfo = refineBlockedInfo({
+      url: partialFinalUrl || normalizedUrl,
+      outcome: item.outcome,
+      problem: prob,
+      status: item.status,
+      retryAfter: typeof item.retryAfter === 'string' ? item.retryAfter : fetchRes.retryAfter,
+      baseBlocked: buildBlockedInfo(partialFinalUrl || normalizedUrl, item.outcome, prob, item.status),
+    });
 
     return {
       status: item.outcome === 'challenge' ? 403 : 422,
@@ -8145,18 +9812,12 @@ export async function executeInteractCall(params: {
   }
 
   const siteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
-  const actualSite = (siteMatch?.[1] ?? pinnedSite)?.toLowerCase();
+  const actualSite = (siteMatch?.[1] ?? pinnedSite ?? 'default').toLowerCase();
   const returnedAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
-  const sessionSig =
-    returnedAgentSid && actualSite && signingSecret
-      ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, actualSite, returnedAgentSid)
-      : undefined;
-  const publicSessionId =
-    returnedAgentSid && actualSite
-      ? sessionSig
-        ? `${actualSite}.${returnedAgentSid}.${sessionSig}`
-        : `${actualSite}.${returnedAgentSid}`
-      : returnedAgentSid;
+  const sessionSig = returnedAgentSid
+    ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, actualSite, returnedAgentSid)
+    : undefined;
+  const publicSessionId = returnedAgentSid && sessionSig ? `${actualSite}.${returnedAgentSid}.${sessionSig}` : returnedAgentSid;
 
   const rawHtml = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
   const finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
@@ -8165,15 +9826,26 @@ export async function executeInteractCall(params: {
   const requestedTranscript = formats.includes('transcript');
   const extracted = rawHtml ? extractHtmlDocument(rawHtml, { baseUrl: finalUrl || undefined, onlyMainContent: true }) : undefined;
   const transcript = (requestedTranscript || wantMarkdown) && rawHtml ? extractYouTubeTranscriptFromHtml(rawHtml) : '';
-  let markdown = decodeMarkdownEntities(extracted?.markdown || (typeof item.markdown === 'string' && item.markdown ? item.markdown : ''));
+  let markdown =
+    extracted?.markdown ||
+    (typeof item.markdown === 'string' && item.markdown ? sanitizeInlineHtmlInMarkdown(item.markdown, finalUrl || undefined).trim() : '');
   if (wantMarkdown && transcript && !/^#{2,3}\s*Transcript\b/im.test(markdown)) {
     markdown = markdown ? `${markdown}\n\n## Transcript\n\n${transcript}` : `## Transcript\n\n${transcript}`;
   }
   const fallbackTitle =
     !extracted && rawHtml
       ? (() => {
-          const tm = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(rawHtml);
-          return tm ? cleanInlineHtml(tm[1]!) : undefined;
+          let t: string | undefined;
+          replacePairedHtmlElementsLinear(
+            rawHtml,
+            ['title'],
+            (_f, _tag, _a, inner) => {
+              if (t === undefined) t = cleanInlineHtml(inner);
+              return '';
+            },
+            { maxChars: MAX_HTML_SCAN_CHARS, maxInnerChars: 4_096 },
+          );
+          return t;
         })()
       : undefined;
   const actionResults = actions.map((a, idx) => describeAction(a, idx, 'ok'));

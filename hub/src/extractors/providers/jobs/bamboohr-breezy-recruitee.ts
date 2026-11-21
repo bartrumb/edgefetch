@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { defineAdapter, extractXmlTagTextLinear, findAllElementInnersLinear } from '../../types';
 import { formatGfmTable, parseJsonObject, parseJsonValue } from '../../utils';
 
 const BAMBOO_JUNK_SUBDOMAINS = new Set(['www', 'resources', 'help', 'documentation', 'developers', 'blog', 'status', 'api']);
@@ -166,16 +166,12 @@ export default defineAdapter({
         accept: 'application/xml, text/xml',
         formatTwin: (rawBody) => {
           if (!/<workzag-jobs|<position\b/i.test(rawBody)) return null;
-          const posBlocks = [...rawBody.matchAll(/<position\b[^>]*>([\s\S]*?)<\/position>/gi)];
-          const tag = (xml: string, t: string) => {
-            const m = new RegExp(`<${t}>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([\\s\\S]*?))<\\/${t}>`, 'i').exec(xml);
-            return (m?.[1] ?? m?.[2] ?? '').trim();
-          };
+          const posBlocks = findAllElementInnersLinear(rawBody, 'position', undefined, 500);
+          const tag = (xml: string, t: string) => extractXmlTagTextLinear(xml, t);
           const title = `${org} — Personio Job Board (${posBlocks.length} open roles)`;
           if (posBlocks.length === 0) return { title, markdown: `# ${title}\n\nNo open positions currently listed.` };
           const links: string[] = [];
-          const rows = posBlocks.slice(0, 100).map((pb) => {
-            const b = pb[1]!;
+          const rows = posBlocks.slice(0, 100).map((b) => {
             const id = tag(b, 'id');
             const pName = tag(b, 'name') || 'Role';
             const jUrl = `https://${host}/job/${id}`;

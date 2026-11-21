@@ -889,7 +889,8 @@ test('H-S1, H-S2, H-S3, H-S5: OAuth registration/redirect/scope/replay/lockout s
     return (await handleAdminRoute(r, new URL(r.url), adminDeps))!.status;
   };
   for (let i = 0; i < 6; i++) await login(`wrong-${i}`);
-  assert.equal(await login(OWNER), 429, 'H-S5: locked-out IP must receive 429 BEFORE checking owner token');
+  assert.equal(await login('wrong-6'), 429, 'H-S5: locked-out IP must receive 429 on further wrong attempts');
+  assert.equal(await login(OWNER), 302, 'H-S5 / R3-M4: valid constant-time CALLER_TOKEN clears spoofed-IP lockout');
 
   for (let i = 0; i < 200; i++) await login('wrong', `2001:db8::${i.toString(16)}`);
   const failureRows = (db.prepare('SELECT COUNT(*) AS c FROM auth_failures').get() as { c: number }).c;
@@ -1507,7 +1508,7 @@ test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1
     });
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
-    assert.equal(mcpJson.result.tools.length, 14);
+    assert.equal(mcpJson.result.tools.length, 15);
   } finally {
     await started.close();
     rmSync(dataDir, { recursive: true, force: true });
@@ -3066,7 +3067,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.5.5');
+    assert.equal(caps.version, '2.6.0');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);

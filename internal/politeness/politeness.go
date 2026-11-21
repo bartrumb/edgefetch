@@ -24,8 +24,8 @@ const (
 	CircuitFailureWindow    = 60 * time.Second
 	CircuitOpenCooldown     = 30 * time.Second
 	RobotsCacheTTL          = 24 * time.Hour
-	RobotsDistressTTL       = 5 * time.Minute
-	RobotsMaxBytes          = 512 << 10 // 512 KiB (>= 500 KiB minimum required by RFC 9309 §2.5).
+	RobotsDistressTTL       = 60 * time.Second
+	RobotsMaxBytes          = 1 << 20 // 1 MiB (>= 500 KiB minimum required by RFC 9309 §2.5; closes 520 KiB padding bypass).
 	RobotsTimeout           = 10 * time.Second
 	MaxCrawlDelay           = 30 * time.Second
 )
@@ -37,6 +37,7 @@ type HostState struct {
 
 	mu                sync.Mutex
 	nextAllowed       time.Time
+	rateLimitedUntil  time.Time
 	consecutiveErrors int
 	firstErrorAt      time.Time
 	circuitOpenUntil  time.Time
@@ -125,6 +126,34 @@ func (h *HostState) SetRobots(now time.Time, entry *RobotsEntry, distressPause t
 	}
 }
 
+// NoteRateLimit records an active HTTP 429 backoff window so concurrent callers whose contexts expire while waiting on
+// `Acquire` can report `Status: 429` with `RetryAfterMs` instead of a generic cancellation.
+func (h *HostState) NoteRateLimit(now time.Time, wait time.Duration) {
+	if wait <= 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastSeen = now
+	if until := now.Add(wait); until.After(h.rateLimitedUntil) {
+		h.rateLimitedUntil = until
+	}
+}
+
+// CoolingDownRetryAfterMs returns the remaining HTTP 429 cooldown in milliseconds (`0` when not cooling down from a 429).
+func (h *HostState) CoolingDownRetryAfterMs(now time.Time) int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.rateLimitedUntil.After(now) {
+		ms := h.rateLimitedUntil.Sub(now).Milliseconds()
+		if ms < 1 {
+			return 1
+		}
+		return ms
+	}
+	return 0
+}
+
 // RecordOutcome updates `nextAllowed` and drives the three-state dead-origin circuit breaker (Closed -> Open -> Half-Open).
 //
 // Why don't HTTP 403 or 429 responses trip the dead-origin circuit breaker?
@@ -144,8 +173,16 @@ func (h *HostState) RecordOutcome(now time.Time, minPause, retryAfter time.Durat
 	} else if throttled && DefaultThrottlePause > pause {
 		pause = DefaultThrottlePause
 	}
-	if next := now.Add(pause); next.After(h.nextAllowed) {
+	next := now.Add(pause)
+	if next.After(h.nextAllowed) {
 		h.nextAllowed = next
+	}
+	if status == http.StatusTooManyRequests {
+		if next.After(h.rateLimitedUntil) {
+			h.rateLimitedUntil = next
+		}
+	} else if !transientDead && status >= 200 && status < 400 {
+		h.rateLimitedUntil = time.Time{}
 	}
 
 	if transientDead {
@@ -450,29 +487,43 @@ func robotsMatch(pattern, target string) bool {
 	return true
 }
 
+var robotsLineReplacer = strings.NewReplacer(
+	"\r\n", "\n",
+	"\r", "\n",
+	"\u0085", "\n",
+	"\u2028", "\n",
+	"\u2029", "\n",
+)
+
+func trimRobotsWS(s string) string {
+	return strings.Trim(s, " \t")
+}
+
 // ParseRobotsTxt extracts directives matching `agentToken` (lowercase product token, preferred per RFC 9309 specificity)
-// or fallback `*`, plus `Crawl-delay` clamped to `MaxCrawlDelay`.
+// or fallback `*`, plus `Crawl-delay` clamped to `MaxCrawlDelay` and `Content-Signal` (`ai-input`).
 func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
-	// RFC 9309 §2.1: strip optional leading UTF-8 BOM so the first User-agent line is never corrupted.
-	body = strings.TrimPrefix(body, "\xef\xbb\xbf")
+	// RFC 9309 §2.1: strip any leading UTF-8 BOMs (including repeated BOMs) so the first directive is never corrupted.
+	for strings.HasPrefix(body, "\xef\xbb\xbf") {
+		body = strings.TrimPrefix(body, "\xef\xbb\xbf")
+	}
 	agentToken = canonicalProductToken(agentToken)
 	type group struct {
-		agents     []string
-		rules      []RobotsRule
-		crawlDelay time.Duration
-		aiInputYes bool
-		aiInputNo  bool
+		agents          []string
+		rules           []RobotsRule
+		crawlDelay      time.Duration
+		aiInputDisallow *bool
 	}
 	var groups []group
 	var cur group
+	var preGroupAiInput *bool
 	seenDirective := false
 
-	normalizedBody := strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\r", "\n")
+	normalizedBody := robotsLineReplacer.Replace(body)
 	for _, rawLine := range strings.Split(normalizedBody, "\n") {
 		if idx := strings.IndexByte(rawLine, '#'); idx >= 0 {
 			rawLine = rawLine[:idx]
 		}
-		line := strings.TrimSpace(rawLine)
+		line := trimRobotsWS(rawLine)
 		if line == "" {
 			// RFC 9309 §2.2.1: blank lines inside a group do NOT terminate the current User-agent group;
 			// a group only ends when a subsequent User-agent line appears after a rule directive.
@@ -482,28 +533,42 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 		if colon <= 0 {
 			continue
 		}
-		field := strings.ToLower(strings.TrimSpace(line[:colon]))
-		val := strings.TrimSpace(line[colon+1:])
+		rawField := line[:colon]
+		if strings.IndexByte(rawField, 0) >= 0 {
+			continue
+		}
+		field := strings.ToLower(trimRobotsWS(rawField))
+		val := trimRobotsWS(line[colon+1:])
 		switch field {
 		case "user-agent":
+			ua := canonicalProductToken(val)
+			if ua == "" {
+				continue
+			}
 			if seenDirective && len(cur.agents) > 0 {
 				groups = append(groups, cur)
 				cur = group{}
 				seenDirective = false
 			}
-			cur.agents = append(cur.agents, canonicalProductToken(val))
+			cur.agents = append(cur.agents, ua)
 		case "allow":
-			if len(cur.agents) > 0 && val != "" {
+			if len(cur.agents) > 0 {
 				seenDirective = true
-				cur.rules = append(cur.rules, RobotsRule{Pattern: NormalizeRobotsURI(val), Allow: true})
+				if val != "" {
+					pat := NormalizeRobotsURI(val)
+					if strings.HasPrefix(pat, "/") || strings.HasPrefix(pat, "*") {
+						cur.rules = append(cur.rules, RobotsRule{Pattern: pat, Allow: true})
+					}
+				}
 			}
 		case "disallow":
 			if len(cur.agents) > 0 {
 				seenDirective = true
-				if val == "" {
-					cur.rules = append(cur.rules, RobotsRule{Pattern: "/", Allow: true})
-				} else {
-					cur.rules = append(cur.rules, RobotsRule{Pattern: NormalizeRobotsURI(val), Allow: false})
+				if val != "" {
+					pat := NormalizeRobotsURI(val)
+					if strings.HasPrefix(pat, "/") || strings.HasPrefix(pat, "*") {
+						cur.rules = append(cur.rules, RobotsRule{Pattern: pat, Allow: false})
+					}
 				}
 			}
 		case "crawl-delay":
@@ -521,11 +586,13 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 			if len(cur.agents) > 0 {
 				seenDirective = true
 				if disallow, found := parseContentSignalAIInput(val); found {
-					if disallow {
-						cur.aiInputNo = true
-					} else {
-						cur.aiInputYes = true
-					}
+					v := disallow
+					cur.aiInputDisallow = &v
+				}
+			} else if len(groups) == 0 {
+				if disallow, found := parseContentSignalAIInput(val); found {
+					v := disallow
+					preGroupAiInput = &v
 				}
 			}
 		}
@@ -536,34 +603,42 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 
 	var specificRules, wildcardRules []RobotsRule
 	var specificDelay, wildcardDelay time.Duration
-	var specificAIYes, specificAINo, wildcardAIYes, wildcardAINo bool
+	var specificSetAI, specificDisallowAI, wildcardSetAI, wildcardDisallowAI bool
 	matchedSpecific, matchedWildcard := false, false
 
 	for _, g := range groups {
+		groupSpecific := false
+		groupWildcard := false
 		for _, ua := range g.agents {
 			if agentToken != "" && ua == agentToken {
-				matchedSpecific = true
-				specificRules = append(specificRules, g.rules...)
-				if g.crawlDelay > specificDelay {
-					specificDelay = g.crawlDelay
-				}
-				if g.aiInputYes {
-					specificAIYes = true
-				}
-				if g.aiInputNo {
-					specificAINo = true
-				}
+				groupSpecific = true
 			} else if ua == "*" {
-				matchedWildcard = true
-				wildcardRules = append(wildcardRules, g.rules...)
-				if g.crawlDelay > wildcardDelay {
-					wildcardDelay = g.crawlDelay
+				groupWildcard = true
+			}
+		}
+		if groupSpecific {
+			matchedSpecific = true
+			specificRules = append(specificRules, g.rules...)
+			if g.crawlDelay > specificDelay {
+				specificDelay = g.crawlDelay
+			}
+			if g.aiInputDisallow != nil {
+				specificSetAI = true
+				if *g.aiInputDisallow {
+					specificDisallowAI = true
 				}
-				if g.aiInputYes {
-					wildcardAIYes = true
-				}
-				if g.aiInputNo {
-					wildcardAINo = true
+			}
+		}
+		if groupWildcard {
+			matchedWildcard = true
+			wildcardRules = append(wildcardRules, g.rules...)
+			if g.crawlDelay > wildcardDelay {
+				wildcardDelay = g.crawlDelay
+			}
+			if g.aiInputDisallow != nil {
+				wildcardSetAI = true
+				if *g.aiInputDisallow {
+					wildcardDisallowAI = true
 				}
 			}
 		}
@@ -573,26 +648,44 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 	if matchedSpecific {
 		out.Rules = specificRules
 		out.CrawlDelay = specificDelay
-		out.DisallowAIInput = specificAINo && !specificAIYes
+		if specificSetAI {
+			out.DisallowAIInput = specificDisallowAI
+		} else if wildcardSetAI {
+			out.DisallowAIInput = wildcardDisallowAI
+		} else if preGroupAiInput != nil {
+			out.DisallowAIInput = *preGroupAiInput
+		}
 	} else if matchedWildcard {
 		out.Rules = wildcardRules
 		out.CrawlDelay = wildcardDelay
-		out.DisallowAIInput = wildcardAINo && !wildcardAIYes
+		if wildcardSetAI {
+			out.DisallowAIInput = wildcardDisallowAI
+		} else if preGroupAiInput != nil {
+			out.DisallowAIInput = *preGroupAiInput
+		}
+	} else if preGroupAiInput != nil {
+		out.DisallowAIInput = *preGroupAiInput
 	}
 	return out
 }
 
 func parseContentSignalAIInput(val string) (disallow, found bool) {
-	for _, item := range strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == ';' }) {
+	for _, item := range strings.Split(val, ",") {
+		if semi := strings.IndexByte(item, ';'); semi >= 0 {
+			item = item[:semi]
+		}
 		k, v, ok := strings.Cut(item, "=")
 		if !ok {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(k), "ai-input") {
+		if !strings.EqualFold(trimRobotsWS(k), "ai-input") {
 			continue
 		}
-		cleanV := strings.ToLower(strings.TrimSpace(v))
-		switch cleanV {
+		cleanV := trimRobotsWS(v)
+		if len(cleanV) >= 2 && cleanV[0] == '"' && cleanV[len(cleanV)-1] == '"' {
+			cleanV = trimRobotsWS(cleanV[1 : len(cleanV)-1])
+		}
+		switch strings.ToLower(cleanV) {
 		case "no":
 			disallow = true
 			found = true
@@ -605,15 +698,15 @@ func parseContentSignalAIInput(val string) (disallow, found bool) {
 }
 
 func canonicalProductToken(raw string) string {
-	tok := strings.ToLower(strings.TrimSpace(raw))
+	tok := strings.ToLower(trimRobotsWS(raw))
 	if tok == "*" {
 		return "*"
 	}
 	if slash := strings.IndexByte(tok, '/'); slash >= 0 {
-		tok = strings.TrimSpace(tok[:slash])
+		tok = trimRobotsWS(tok[:slash])
 	}
 	if sp := strings.IndexAny(tok, " \t"); sp >= 0 {
-		tok = strings.TrimSpace(tok[:sp])
+		tok = trimRobotsWS(tok[:sp])
 	}
 	return tok
 }

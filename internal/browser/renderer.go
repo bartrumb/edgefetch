@@ -16,12 +16,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 // ErrChallengeDetected is returned when a rendered DOM contains a CAPTCHA or anti-bot challenge;
@@ -99,6 +101,11 @@ type Output struct {
 	SessionID         string
 }
 
+type fetchHeaderEntry struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 type retainedSession struct {
 	mu               sync.Mutex
 	id               string
@@ -108,9 +115,163 @@ type retainedSession struct {
 	initialHost      string
 	lastCheckedURL   string
 	hasExtraHeaders  bool
+	extraHeaders     map[string]string
+	fetchEnabled     bool
+	stopFetchOnce    sync.Once
+	stopFetchCh      chan struct{}
 	lastUsed         time.Time
 	lastStatus       int
 	lastHeaders      http.Header
+}
+
+func (s *retainedSession) stopFetch() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	ch := s.stopFetchCh
+	s.mu.Unlock()
+	if ch != nil {
+		s.stopFetchOnce.Do(func() {
+			close(ch)
+		})
+	}
+}
+
+func mergeCDPRequestHeaders(existing map[string]any, extra map[string]string) []fetchHeaderEntry {
+	overrideLower := make(map[string]bool, len(extra))
+	extraKeys := make([]string, 0, len(extra))
+	for k := range extra {
+		tk := strings.TrimSpace(k)
+		if tk == "" {
+			continue
+		}
+		overrideLower[strings.ToLower(tk)] = true
+		extraKeys = append(extraKeys, k)
+	}
+	sort.Strings(extraKeys)
+
+	existingKeys := make([]string, 0, len(existing))
+	for k := range existing {
+		if overrideLower[strings.ToLower(strings.TrimSpace(k))] {
+			continue
+		}
+		existingKeys = append(existingKeys, k)
+	}
+	sort.Strings(existingKeys)
+
+	out := make([]fetchHeaderEntry, 0, len(existingKeys)+len(extraKeys))
+	for _, k := range existingKeys {
+		v, ok := existing[k]
+		if !ok || v == nil {
+			continue
+		}
+		if sv, isStr := v.(string); isStr {
+			out = append(out, fetchHeaderEntry{Name: k, Value: sv})
+		} else {
+			out = append(out, fetchHeaderEntry{Name: k, Value: fmt.Sprint(v)})
+		}
+	}
+	for _, k := range extraKeys {
+		out = append(out, fetchHeaderEntry{Name: strings.TrimSpace(k), Value: extra[k]})
+	}
+	return out
+}
+
+func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cdpConn, hdrs map[string]string) error {
+	if s == nil || len(hdrs) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(hdrs))
+	for k, v := range hdrs {
+		if tk := strings.TrimSpace(k); tk != "" {
+			cloned[tk] = v
+		}
+	}
+	if len(cloned) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	s.extraHeaders = cloned
+	s.hasExtraHeaders = true
+	needEnable := !s.fetchEnabled
+	if needEnable {
+		s.fetchEnabled = true
+		s.stopFetchCh = make(chan struct{})
+	}
+	stopCh := s.stopFetchCh
+	cdpSID := s.cdpSessionID
+	s.mu.Unlock()
+
+	if !needEnable {
+		return nil
+	}
+
+	fetchEvents, fetchUnsub := cdp.subscribe()
+	go func() {
+		defer fetchUnsub()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-cdp.closeCh:
+				return
+			case ev := <-fetchEvents:
+				if ev.SessionID != cdpSID || ev.Method != "Fetch.requestPaused" {
+					continue
+				}
+				s.handleRequestPaused(cdp, ev.Params)
+			}
+		}
+	}()
+
+	if err := cdp.call(ctx, cdpSID, "Fetch.enable", map[string]any{
+		"patterns": []map[string]any{{"urlPattern": "*"}},
+	}, nil); err != nil {
+		s.stopFetch()
+		return fmt.Errorf("enable origin-scoped Fetch interception: %w", err)
+	}
+	return nil
+}
+
+func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMessage) {
+	var paused struct {
+		RequestID string `json:"requestId"`
+		Request   struct {
+			URL     string         `json:"url"`
+			Headers map[string]any `json:"headers"`
+		} `json:"request"`
+	}
+	if json.Unmarshal(rawParams, &paused) != nil || paused.RequestID == "" {
+		return
+	}
+
+	s.mu.Lock()
+	cdpSID := s.cdpSessionID
+	initHost := s.initialHost
+	extra := s.extraHeaders
+	s.mu.Unlock()
+
+	sameOriginHost := false
+	if initHost != "" && paused.Request.URL != "" {
+		if u, err := url.Parse(paused.Request.URL); err == nil {
+			reqHost := politeness.CanonicalHost(u.Hostname())
+			if reqHost != "" && reqHost == initHost {
+				sameOriginHost = true
+			}
+		}
+	}
+
+	params := map[string]any{"requestId": paused.RequestID}
+	if sameOriginHost && len(extra) > 0 {
+		params["headers"] = mergeCDPRequestHeaders(paused.Request.Headers, extra)
+	}
+	go func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = cdp.call(cctx, cdpSID, "Fetch.continueRequest", params, nil)
+	}()
 }
 
 func (s *retainedSession) getLastCheckedURL() string {
@@ -221,25 +382,37 @@ func FindChromeBinary() string {
 
 // Renderer manages a shared headless Chromium process + SSRF-safe loopback CONNECT proxy.
 type Renderer struct {
-	chromeBin   string
-	allow       func(*url.URL) error
-	CheckRobots func(ctx context.Context, rawURL string) error
-	userAgent   string
-	log         *slog.Logger
-	sem         chan struct{}
+	chromeBin      string
+	allow          func(*url.URL) error
+	CheckRobots    func(ctx context.Context, rawURL string) error
+	userAgent      string
+	log            *slog.Logger
+	sem            chan struct{}
+	requireSandbox bool
 
 	// Optional hook allowing unit tests to attach a mock CDP WebSocket URL without spawning OS Chromium.
 	dialOverrideWS string
 
-	mu          sync.Mutex
-	proxy       *SSRFProxy
-	cmd         *exec.Cmd
-	userDataDir string
-	cdp         *cdpConn
-	sessions    map[string]*retainedSession
-	activeRuns  int
-	lastUsedAt  time.Time
-	closed      bool
+	probeOnce        sync.Once
+	mu               sync.Mutex
+	proxy            *SSRFProxy
+	cmd              *exec.Cmd
+	userDataDir      string
+	cdp              *cdpConn
+	sessions         map[string]*retainedSession
+	activeRuns       int
+	taintedByHeaders bool
+	sandboxFallback  bool
+	disabledByPolicy bool
+	sandboxState     string
+	browserVersion   string
+	lastUsedAt       time.Time
+	closed           bool
+}
+
+func isSandboxRequiredByEnv() bool {
+	v := strings.TrimSpace(os.Getenv("EDGEFETCH_REQUIRE_BROWSER_SANDBOX"))
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 // NewRenderer constructs a Renderer bounded to `maxConcurrent` simultaneous tabs (default 2).
@@ -253,13 +426,23 @@ func NewRenderer(chromeBin string, allow func(*url.URL) error, userAgent string,
 	if chromeBin == "" {
 		chromeBin = FindChromeBinary()
 	}
+	initialSandbox := ""
+	if chromeBin != "" {
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+			initialSandbox = "on"
+		} else {
+			initialSandbox = "unknown"
+		}
+	}
 	r := &Renderer{
-		chromeBin: chromeBin,
-		allow:     allow,
-		userAgent: userAgent,
-		log:       log,
-		sem:       make(chan struct{}, maxConcurrent),
-		sessions:  make(map[string]*retainedSession),
+		chromeBin:      chromeBin,
+		allow:          allow,
+		userAgent:      userAgent,
+		log:            log,
+		sem:            make(chan struct{}, maxConcurrent),
+		requireSandbox: isSandboxRequiredByEnv(),
+		sessions:       make(map[string]*retainedSession),
+		sandboxState:   initialSandbox,
 	}
 	return r
 }
@@ -271,9 +454,69 @@ func NewMockRenderer(wsURL string, allow func(*url.URL) error, userAgent string)
 	return r
 }
 
-// Available reports whether a headless browser binary (or test override) is available.
+// Available reports whether a headless browser binary (or test override) is available and permitted by sandbox policy.
 func (r *Renderer) Available() bool {
-	return r != nil && (r.chromeBin != "" || r.dialOverrideWS != "")
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	disabled := r.disabledByPolicy
+	r.mu.Unlock()
+	return !disabled && (r.chromeBin != "" || r.dialOverrideWS != "")
+}
+
+// BrowserInfo returns the detected Chromium product version and OS process sandbox state ("on", "off", or "unknown").
+func (r *Renderer) BrowserInfo() (version string, sandbox string) {
+	if r == nil {
+		return "", ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.browserVersion, r.sandboxState
+}
+
+// ProbeStartup pre-populates r.browserVersion via `<chromeBin> --version` and probes OS sandbox support on Linux.
+// When EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set and the OS sandbox is "off", Available() becomes false.
+func (r *Renderer) ProbeStartup(ctx context.Context) {
+	if r == nil || r.chromeBin == "" || r.dialOverrideWS != "" || ctx.Err() != nil {
+		return
+	}
+	r.probeOnce.Do(func() {
+		vctx, vcancel := context.WithTimeout(ctx, 3*time.Second)
+		vcmd := exec.CommandContext(vctx, r.chromeBin, "--version")
+		vcmd.Env = buildSanitizedChildEnv("")
+		if out, err := vcmd.Output(); err == nil {
+			line := strings.TrimSpace(string(out))
+			if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+				line = strings.TrimSpace(line[:nl])
+			}
+			if line != "" {
+				r.mu.Lock()
+				if r.browserVersion == "" {
+					r.browserVersion = line
+				}
+				r.mu.Unlock()
+			}
+		}
+		vcancel()
+
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+			r.mu.Lock()
+			r.sandboxState = "on"
+			r.mu.Unlock()
+			return
+		}
+		if runtime.GOOS == "linux" {
+			pctx, pcancel := context.WithTimeout(ctx, 4*time.Second)
+			_, _ = r.ensureBrowser(pctx)
+			pcancel()
+			r.mu.Lock()
+			if r.requireSandbox && r.sandboxState == "off" {
+				r.disabledByPolicy = true
+			}
+			r.mu.Unlock()
+		}
+	})
 }
 
 // CloseSession terminates a retained `interact` browser session immediately (`interact_stop`).
@@ -292,12 +535,18 @@ func (r *Renderer) CloseSession(ctx context.Context, sessionID string) bool {
 	if !ok {
 		return false
 	}
+	sess.stopFetch()
 	if cdp != nil && !cdp.isClosed() {
 		cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		_ = cdp.call(cctx, "", "Target.closeTarget", map[string]any{"targetId": sess.targetID}, nil)
 		_ = cdp.call(cctx, "", "Target.disposeBrowserContext", map[string]any{"browserContextId": sess.browserContextID}, nil)
 		cancel()
 	}
+	r.mu.Lock()
+	if r.taintedByHeaders && r.activeRuns == 0 && len(r.sessions) == 0 {
+		r.shutdownLocked()
+	}
+	r.mu.Unlock()
 	return true
 }
 
@@ -320,6 +569,9 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 
 	r.mu.Lock()
 	r.activeRuns++
+	if len(task.Headers) > 0 {
+		r.taintedByHeaders = true
+	}
 	r.lastUsedAt = time.Now()
 	r.mu.Unlock()
 	defer func() {
@@ -328,6 +580,9 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			r.activeRuns--
 		}
 		r.lastUsedAt = time.Now()
+		if r.taintedByHeaders && r.activeRuns == 0 && len(r.sessions) == 0 {
+			r.shutdownLocked()
+		}
 		r.mu.Unlock()
 	}()
 
@@ -352,6 +607,11 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		// Reject unknown caller-supplied session IDs rather than accepting attacker-chosen handles.
 		if !resumed {
 			return Output{}, fmt.Errorf("unknown or expired browser session %q", task.SessionID)
+		}
+		if len(task.Headers) > 0 {
+			if err := sess.enableOriginScopedHeaders(ctx, cdp, task.Headers); err != nil {
+				return Output{}, err
+			}
 		}
 	}
 
@@ -409,7 +669,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		initHost := ""
 		if task.URL != "" {
 			if parsedInit, pErr := url.Parse(task.URL); pErr == nil {
-				initHost = strings.ToLower(parsedInit.Hostname())
+				initHost = politeness.CanonicalHost(parsedInit.Hostname())
 			}
 		}
 		sess = &retainedSession{
@@ -456,9 +716,11 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			}, nil)
 		}
 		if len(task.Headers) > 0 {
-			_ = cdp.call(ctx, sess.cdpSessionID, "Network.setExtraHTTPHeaders", map[string]any{
-				"headers": task.Headers,
-			}, nil)
+			if err := sess.enableOriginScopedHeaders(ctx, cdp, task.Headers); err != nil {
+				_ = cdp.call(context.Background(), "", "Target.closeTarget", map[string]any{"targetId": sess.targetID}, nil)
+				_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": sess.browserContextID}, nil)
+				return Output{}, err
+			}
 		}
 	}
 
@@ -468,6 +730,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			cleanupOnExit = true
 		}
 		if cleanupOnExit {
+			sess.stopFetch()
 			r.mu.Lock()
 			delete(r.sessions, sess.id)
 			r.mu.Unlock()
@@ -506,7 +769,6 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		}
 		sess.setLastCheckedURL(u.String())
 		status, hdrs, err := navigateAndWait(ctx, cdp, sess, events, task.URL, task.WaitForMs, task.WaitSelector)
-		clearExtraHTTPHeaders(ctx, cdp, sess)
 		if err != nil {
 			return Output{}, err
 		}
@@ -587,28 +849,6 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 	return out, nil
 }
 
-func clearExtraHTTPHeaders(ctx context.Context, cdp *cdpConn, sess *retainedSession) {
-	if sess == nil {
-		return
-	}
-	sess.mu.Lock()
-	if !sess.hasExtraHeaders {
-		sess.mu.Unlock()
-		return
-	}
-	sess.hasExtraHeaders = false
-	cdpSID := sess.cdpSessionID
-	sess.mu.Unlock()
-
-	cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	if ctx != nil && ctx.Err() == nil {
-		cancel()
-		cctx, cancel = context.WithTimeout(ctx, 2*time.Second)
-	}
-	_ = cdp.call(cctx, cdpSID, "Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{}}, nil)
-	cancel()
-}
-
 func navigateAndWait(
 	ctx context.Context,
 	cdp *cdpConn,
@@ -647,22 +887,12 @@ func navigateAndWait(
 			var rw struct {
 				RequestID string `json:"requestId"`
 				Type      string `json:"type"`
-				Request   struct {
-					URL string `json:"url"`
-				} `json:"request"`
 			}
-			if json.Unmarshal(ev.Params, &rw) == nil {
-				if sess != nil && sess.initialHost != "" && rw.Request.URL != "" {
-					if reqU, uErr := url.Parse(rw.Request.URL); uErr == nil && reqU.Hostname() != "" && !strings.EqualFold(reqU.Hostname(), sess.initialHost) {
-						clearExtraHTTPHeaders(ctx, cdp, sess)
-					}
-				}
-				if rw.RequestID != "" {
-					// Track SPA data & code requests; ignore long-lived streaming/beacon types (WebSocket, EventSource, Media, Ping).
-					switch rw.Type {
-					case "Document", "XHR", "Fetch", "Script":
-						inFlight[rw.RequestID] = time.Now()
-					}
+			if json.Unmarshal(ev.Params, &rw) == nil && rw.RequestID != "" {
+				// Track SPA data & code requests; ignore long-lived streaming/beacon types (WebSocket, EventSource, Media, Ping).
+				switch rw.Type {
+				case "Document", "XHR", "Fetch", "Script":
+					inFlight[rw.RequestID] = time.Now()
 				}
 			}
 		case "Network.loadingFinished", "Network.loadingFailed":
@@ -880,11 +1110,12 @@ func (r *Renderer) runAction(
 			}
 		}
 		sess.setLastCheckedURL(u.String())
-		if sess.initialHost == "" || !strings.EqualFold(u.Hostname(), sess.initialHost) {
-			clearExtraHTTPHeaders(ctx, cdp, sess)
+		sess.mu.Lock()
+		if sess.initialHost == "" {
+			sess.initialHost = politeness.CanonicalHost(u.Hostname())
 		}
+		sess.mu.Unlock()
 		st, hdrs, err := navigateAndWait(ctx, cdp, sess, events, u.String(), effectiveWaitMs, act.Selector)
-		clearExtraHTTPHeaders(ctx, cdp, sess)
 		if err != nil {
 			return err
 		}
@@ -1300,11 +1531,23 @@ func evalBool(ctx context.Context, cdp *cdpConn, sessionID, expr string) (bool, 
 }
 
 func buildChromiumLaunchArgs(proxyAddr, userDir string) []string {
+	return buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir, true)
+}
+
+func buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir string, useSandbox bool) []string {
+	proxyFlag := "--proxy-server=http://" + proxyAddr
+	profileFlag := "--user-data-dir=" + userDir
 	args := []string{
 		"--headless=new",
-		"--no-sandbox",
-		"--disable-setuid-sandbox",
-		"--disable-gpu-sandbox",
+	}
+	if !useSandbox {
+		args = append(args,
+			"--no-sandbox",
+			"--disable-setuid-sandbox",
+			"--disable-gpu-sandbox",
+		)
+	}
+	args = append(args,
 		"--disable-dev-shm-usage",
 		"--disable-crash-reporter",
 		"--disable-breakpad",
@@ -1325,11 +1568,11 @@ func buildChromiumLaunchArgs(proxyAddr, userDir string) []string {
 		"--hide-scrollbars",
 		"--remote-debugging-address=127.0.0.1",
 		"--remote-debugging-port=0",
-		"--proxy-server=http://" + proxyAddr,
+		proxyFlag,
 		"--proxy-bypass-list=<-loopback>",
 		"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
-		"--user-data-dir=" + userDir,
-	}
+		profileFlag,
+	)
 	if runtime.GOOS == "linux" {
 		args = append(args,
 			"--use-gl=angle",
@@ -1344,50 +1587,45 @@ func buildChromiumLaunchArgs(proxyAddr, userDir string) []string {
 	return args
 }
 
-func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil, errors.New("renderer closed")
+func linuxSandboxBlockedByHostPolicy() bool {
+	if runtime.GOOS != "linux" {
+		return false
 	}
-	if r.cdp != nil && !r.cdp.isClosed() {
-		return r.cdp, nil
-	}
-	r.shutdownLocked()
-
-	if r.dialOverrideWS != "" {
-		conn, err := dialCDP(ctx, r.dialOverrideWS)
-		if err != nil {
-			return nil, err
+	if attr, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+		if strings.Contains(strings.ToLower(strings.TrimSpace(string(attr))), "edgefetch_fat") {
+			return true
 		}
-		r.cdp = conn
-		return conn, nil
 	}
+	if cloneVal, err := os.ReadFile("/proc/sys/kernel/unprivileged_userns_clone"); err == nil {
+		if strings.TrimSpace(string(cloneVal)) == "0" {
+			return true
+		}
+	}
+	return false
+}
 
-	proxy, err := NewSSRFProxy(r.allow, nil)
-	if err != nil {
-		return nil, err
-	}
+func (r *Renderer) launchAndDialLocked(ctx context.Context, proxyAddr string, useSandbox bool, startupWait time.Duration) (*exec.Cmd, string, *cdpConn, error) {
 	userDir, err := os.MkdirTemp("", "edgefetch-chrome-*")
 	if err != nil {
-		_ = proxy.Close()
-		return nil, err
+		return nil, "", nil, err
+	}
+	if err := os.Chmod(userDir, 0o700); err != nil {
+		_ = os.RemoveAll(userDir)
+		return nil, "", nil, err
 	}
 
-	args := buildChromiumLaunchArgs(proxy.Addr(), userDir)
-
+	args := buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir, useSandbox)
 	cmd := exec.Command(r.chromeBin, args...)
 	cmd.Env = buildSanitizedChildEnv(userDir)
+	configureBrowserProcGroup(cmd)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		_ = proxy.Close()
 		_ = os.RemoveAll(userDir)
-		return nil, err
+		return nil, "", nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		_ = proxy.Close()
 		_ = os.RemoveAll(userDir)
-		return nil, fmt.Errorf("start chromium: %w", err)
+		return nil, "", nil, fmt.Errorf("start chromium: %w", err)
 	}
 
 	var (
@@ -1398,26 +1636,30 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	wsCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 	go func() {
+		const devToolsPrefix = "DevTools listening on "
 		sc := bufio.NewScanner(stderr)
 		reason := ""
 		for sc.Scan() {
 			line := sc.Text()
-			if idx := strings.Index(line, "ws://127.0.0.1:"); idx >= 0 {
-				wsCh <- strings.TrimSpace(line[idx:])
-				// Continue draining stderr and capture any post-startup FATAL/crash line for CDP error reporting.
-				// If sc.Scan() stops early on a line >64 KiB, drain the remainder via io.Copy so Chromium never blocks!
-				for sc.Scan() {
-					txt := sc.Text()
-					if c := connHolder.Load(); c != nil {
-						c.setCrashReason(txt)
-					} else {
-						earlyCrashMu.Lock()
-						earlyCrash = startupReason(earlyCrash, txt)
-						earlyCrashMu.Unlock()
+			if idx := strings.Index(line, devToolsPrefix); idx >= 0 {
+				endpoint := strings.TrimSpace(line[idx+len(devToolsPrefix):])
+				if strings.HasPrefix(endpoint, "ws://127.0.0.1:") {
+					wsCh <- endpoint
+					// Continue draining stderr and capture any post-startup FATAL/crash line for CDP error reporting.
+					// If sc.Scan() stops early on a line >64 KiB, drain the remainder via io.Copy so Chromium never blocks!
+					for sc.Scan() {
+						txt := sc.Text()
+						if c := connHolder.Load(); c != nil {
+							c.setCrashReason(txt)
+						} else {
+							earlyCrashMu.Lock()
+							earlyCrash = startupReason(earlyCrash, txt)
+							earlyCrashMu.Unlock()
+						}
 					}
+					_, _ = io.Copy(io.Discard, stderr)
+					return
 				}
-				_, _ = io.Copy(io.Discard, stderr)
-				return
 			}
 			reason = startupReason(reason, line)
 		}
@@ -1430,44 +1672,129 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	}()
 
 	var wsURL string
-	startTimer := time.NewTimer(15 * time.Second)
+	startTimer := time.NewTimer(startupWait)
 	defer startTimer.Stop()
 	select {
 	case wsURL = <-wsCh:
 	case e := <-errCh:
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		_ = proxy.Close()
+		killBrowserProcessGroup(cmd)
 		_ = os.RemoveAll(userDir)
-		return nil, e
+		return nil, "", nil, e
 	case <-startTimer.C:
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		_ = proxy.Close()
+		killBrowserProcessGroup(cmd)
 		_ = os.RemoveAll(userDir)
-		return nil, errors.New("timed out waiting for chromium DevTools endpoint")
+		return nil, "", nil, errors.New("timed out waiting for chromium DevTools endpoint")
 	case <-ctx.Done():
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		_ = proxy.Close()
+		killBrowserProcessGroup(cmd)
 		_ = os.RemoveAll(userDir)
-		return nil, ctx.Err()
+		return nil, "", nil, ctx.Err()
 	}
 
 	conn, err := dialCDP(ctx, wsURL)
 	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		_ = proxy.Close()
+		killBrowserProcessGroup(cmd)
 		_ = os.RemoveAll(userDir)
-		return nil, fmt.Errorf("dial chromium cdp: %w", err)
+		return nil, "", nil, fmt.Errorf("dial chromium cdp: %w", err)
 	}
+	_ = os.Remove(filepath.Join(userDir, "DevToolsActivePort"))
 	earlyCrashMu.Lock()
 	if earlyCrash != "" {
 		conn.setCrashReason(earlyCrash)
 	}
 	earlyCrashMu.Unlock()
 	connHolder.Store(conn)
+	return cmd, userDir, conn, nil
+}
+
+func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, errors.New("renderer closed")
+	}
+	if r.disabledByPolicy {
+		return nil, ErrBrowserUnavailable
+	}
+	if r.cdp != nil && !r.cdp.isClosed() {
+		if !(r.taintedByHeaders && r.activeRuns <= 1 && len(r.sessions) == 0) {
+			return r.cdp, nil
+		}
+	}
+	r.shutdownLocked()
+
+	if r.dialOverrideWS != "" {
+		conn, err := dialCDP(ctx, r.dialOverrideWS)
+		if err != nil {
+			return nil, err
+		}
+		r.cdp = conn
+		return conn, nil
+	}
+
+	useSandbox := true
+	if runtime.GOOS == "linux" {
+		if !r.sandboxFallback && linuxSandboxBlockedByHostPolicy() {
+			if r.requireSandbox {
+				r.sandboxState = "off"
+				r.disabledByPolicy = true
+				return nil, errors.New("chromium OS sandbox unavailable under host MAC/userns policy and EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set")
+			}
+			r.sandboxFallback = true
+			r.sandboxState = "off"
+		}
+		useSandbox = !r.sandboxFallback
+	}
+
+	proxy, err := NewSSRFProxy(r.allow, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	waitBudget := 15 * time.Second
+	if runtime.GOOS == "linux" && useSandbox && !r.requireSandbox {
+		waitBudget = 3 * time.Second
+	}
+	cmd, userDir, conn, launchErr := r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, waitBudget)
+	if launchErr != nil && runtime.GOOS == "linux" && useSandbox {
+		if r.requireSandbox {
+			r.sandboxState = "off"
+			r.disabledByPolicy = true
+			_ = proxy.Close()
+			return nil, fmt.Errorf("chromium OS sandbox failed and EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set: %w", launchErr)
+		}
+		if ctx.Err() == nil {
+			r.sandboxFallback = true
+			r.sandboxState = "off"
+			if r.log != nil {
+				r.log.Warn("browser_sandbox_fallback",
+					slog.String("bin", r.chromeBin),
+					slog.String("reason", launchErr.Error()))
+			}
+			useSandbox = false
+			cmd, userDir, conn, launchErr = r.launchAndDialLocked(ctx, proxy.Addr(), false, 15*time.Second)
+		}
+	}
+	if launchErr != nil {
+		_ = proxy.Close()
+		return nil, launchErr
+	}
+
+	if useSandbox {
+		r.sandboxState = "on"
+	} else {
+		r.sandboxState = "off"
+	}
+
+	var verOut struct {
+		Product string `json:"product"`
+	}
+	vctx, vcancel := context.WithTimeout(ctx, 2*time.Second)
+	if vErr := conn.call(vctx, "", "Browser.getVersion", nil, &verOut); vErr == nil {
+		if prod := strings.TrimSpace(verOut.Product); prod != "" {
+			r.browserVersion = prod
+		}
+	}
+	vcancel()
 
 	r.proxy = proxy
 	r.cmd = cmd
@@ -1475,7 +1802,11 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	r.cdp = conn
 	r.lastUsedAt = time.Now()
 	if r.log != nil {
-		r.log.Info("browser_started", slog.String("bin", r.chromeBin), slog.String("proxy", proxy.Addr()))
+		r.log.Info("browser_started",
+			slog.String("bin", r.chromeBin),
+			slog.String("proxy", proxy.Addr()),
+			slog.String("sandbox", r.sandboxState),
+			slog.String("version", r.browserVersion))
 	}
 	go r.idleReaperLoop(conn)
 	return conn, nil
@@ -1497,10 +1828,11 @@ func (r *Renderer) idleReaperLoop(target *cdpConn) {
 			now := time.Now()
 			for id, s := range r.sessions {
 				if now.Sub(s.lastUsed) > sessionIdleTTL {
+					s.stopFetch()
 					delete(r.sessions, id)
 				}
 			}
-			if r.activeRuns == 0 && len(r.sessions) == 0 && now.Sub(r.lastUsedAt) >= browserIdleTTL {
+			if r.activeRuns == 0 && len(r.sessions) == 0 && (r.taintedByHeaders || now.Sub(r.lastUsedAt) >= browserIdleTTL) {
 				if r.log != nil {
 					r.log.Info("browser_idle_shutdown", slog.Duration("idle", now.Sub(r.lastUsedAt)))
 				}
@@ -1525,6 +1857,7 @@ func (r *Renderer) reapExpiredSessions(ctx context.Context, cdp *cdpConn) {
 	}
 	r.mu.Unlock()
 	for _, s := range expired {
+		s.stopFetch()
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		_ = cdp.call(cctx, "", "Target.closeTarget", map[string]any{"targetId": s.targetID}, nil)
 		_ = cdp.call(cctx, "", "Target.disposeBrowserContext", map[string]any{"browserContextId": s.browserContextID}, nil)
@@ -1540,6 +1873,7 @@ func (r *Renderer) evictOldestSessionLocked(cdp *cdpConn) {
 		}
 	}
 	if oldest != nil {
+		oldest.stopFetch()
 		delete(r.sessions, oldest.id)
 		go func(s *retainedSession) {
 			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1551,14 +1885,17 @@ func (r *Renderer) evictOldestSessionLocked(cdp *cdpConn) {
 }
 
 func (r *Renderer) shutdownLocked() {
+	for _, s := range r.sessions {
+		s.stopFetch()
+	}
 	r.sessions = make(map[string]*retainedSession)
+	r.taintedByHeaders = false
 	if r.cdp != nil {
 		_ = r.cdp.close()
 		r.cdp = nil
 	}
-	if r.cmd != nil && r.cmd.Process != nil {
-		_ = r.cmd.Process.Kill()
-		_ = r.cmd.Wait()
+	if r.cmd != nil {
+		killBrowserProcessGroup(r.cmd)
 		r.cmd = nil
 	}
 	if r.proxy != nil {

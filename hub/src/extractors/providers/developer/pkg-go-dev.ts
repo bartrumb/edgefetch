@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { attrHasTokenLinear, defineAdapter, findElementInnerLinear, findOpenTagLinear } from '../../types';
 import { extractBalancedDivAt, stripScriptsAndStyles, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -11,14 +11,14 @@ export default defineAdapter({
   extractHtml({ path, rawHtml, baseUrl, htmlToMd }) {
     if (path.length <= 1) return null;
     const clean = stripScriptsAndStyles(rawHtml);
-    const title = stripTagsInline(/<title>([\s\S]*?)<\/title>/i.exec(clean)?.[1] ?? '')
+    const title = stripTagsInline(findElementInnerLinear(clean, 'title') ?? '')
       .replace(/\s*-\s*Go Packages\s*$/i, '')
       .trim();
 
     const sections: string[] = [];
     if (title) sections.push(`# ${title}`);
 
-    const readmeOpen = /<div\b[^>]*\bUnitReadme-content\b[^>]*>/i.exec(clean);
+    const readmeOpen = findOpenTagLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'UnitReadme-content'));
     if (readmeOpen) {
       const inner = extractBalancedDivAt(clean, readmeOpen.index);
       if (inner) {
@@ -27,7 +27,7 @@ export default defineAdapter({
       }
     }
 
-    const docOpen = /<div\b[^>]*\bDocumentation-content\b[^>]*>/i.exec(clean);
+    const docOpen = findOpenTagLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'Documentation-content'));
     if (docOpen) {
       const inner = extractBalancedDivAt(clean, docOpen.index);
       if (inner) {

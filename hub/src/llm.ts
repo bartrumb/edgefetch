@@ -12,7 +12,7 @@
  */
 
 import { validatePublicHttpsTargetUrl } from './overflow';
-import { asciiLower } from './safe-input';
+import { asciiLower, safeDecodeURIComponent } from './safe-input';
 
 const MAX_LLM_RESPONSE_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on LLM API JSON responses (H5)
 
@@ -73,13 +73,46 @@ function validateCleanHttpBaseUrl(rawUrl: string): { ok: true; url: URL; normali
   if (!rawUrl || rawUrl.length > 2048) {
     return { ok: false, message: 'baseUrl must be a non-empty URL <= 2048 chars' };
   }
-  // Block raw control chars, whitespace, backslashes, query strings, fragments, and dot-segment traversal before URL normalization!
-  if (/[\x00-\x20\x7f\\?#]/.test(rawUrl)) {
-    return { ok: false, message: 'baseUrl must not contain query strings, fragments, backslashes, or control/whitespace characters' };
+  // Block raw control chars, whitespace, non-ASCII confusables (`．．`, `‥`, `\u00ad`), backslashes, semicolons (`;`), query strings, and fragments!
+  if (!/^[\x21-\x7e]+$/.test(rawUrl) || /[\\?#;]/.test(rawUrl)) {
+    return {
+      ok: false,
+      message: 'baseUrl must contain only printable ASCII without whitespace, semicolons, query strings, fragments, or backslashes',
+    };
   }
-  if (/%2e|%2f|%5c/i.test(rawUrl)) {
-    return { ok: false, message: 'baseUrl must not contain percent-encoded path separators or dot segments' };
+  // Require strict `https://<authority>` or `http://<authority>` (blocks single-slash `https:/host/...` URL normalization bypass!)
+  if (!/^https?:\/\/[^/]/i.test(rawUrl)) {
+    return { ok: false, message: 'baseUrl must start with https:// or http:// followed by a valid authority' };
   }
+
+  // Fully decode repeated percent-encoding (`%252e` -> `%2e` -> `.`) and reject encoded path separators, dots, or semicolons!
+  let decoded = rawUrl;
+  for (let round = 0; round < 5; round++) {
+    if (/%2e|%2f|%5c|%3b|%3f|%23/i.test(decoded)) {
+      return { ok: false, message: 'baseUrl must not contain percent-encoded path separators, semicolons, or dot segments' };
+    }
+    if (!decoded.includes('%')) break;
+    if (round === 4) {
+      return { ok: false, message: 'baseUrl must not contain deeply nested percent-encoding' };
+    }
+    const next = safeDecodeURIComponent(decoded);
+    if (next === null) {
+      return { ok: false, message: 'baseUrl contains malformed percent-encoding' };
+    }
+    if (!/^[\x21-\x7e]+$/.test(next) || /[\\?#;]/.test(next)) {
+      return { ok: false, message: 'baseUrl contains disallowed percent-encoded characters' };
+    }
+    if (next === decoded) break;
+    decoded = next;
+  }
+
+  // Reject empty double-slash segments (`//v1`, `/v1//acct`, `/v1//`) while allowing a single trailing slash (`/v1/`)
+  const afterScheme = rawUrl.slice(rawUrl.indexOf('://') + 3);
+  const withoutSingleTrailingSlash = afterScheme.endsWith('/') ? afterScheme.slice(0, -1) : afterScheme;
+  if (withoutSingleTrailingSlash.includes('//')) {
+    return { ok: false, message: 'baseUrl path must not contain empty "//" segments' };
+  }
+
   const trimmed = trimTrailingSlashes(rawUrl);
   let u: URL;
   try {
@@ -99,16 +132,21 @@ function validateCleanHttpBaseUrl(rawUrl: string): { ok: true; url: URL; normali
   if (u.hostname.endsWith('.')) {
     return { ok: false, message: 'baseUrl hostname must not have a trailing dot' };
   }
-  // Inspect raw path portion before `new URL()` collapses `/../../`!
-  const schemeEnd = trimmed.indexOf('://');
-  const pathSlash = schemeEnd >= 0 ? trimmed.indexOf('/', schemeEnd + 3) : -1;
-  const rawPath = pathSlash >= 0 ? trimmed.slice(pathSlash) : '/';
-  const rawSegs = rawPath.split('/');
-  if (rawSegs.some((seg) => seg === '.' || seg === '..')) {
-    return { ok: false, message: 'baseUrl must not contain "." or ".." path traversal segments' };
+
+  // Inspect BOTH raw and fully-decoded path segments before `new URL()` collapses `/../../`!
+  for (const candidateStr of [trimmed, trimTrailingSlashes(decoded)]) {
+    const schemeEnd = candidateStr.indexOf('://');
+    const pathSlash = schemeEnd >= 0 ? candidateStr.indexOf('/', schemeEnd + 3) : -1;
+    const rawPath = pathSlash >= 0 ? candidateStr.slice(pathSlash) : '/';
+    const rawSegs = rawPath.split('/');
+    if (rawSegs.some((seg) => /^\.+$/.test(seg))) {
+      return { ok: false, message: 'baseUrl must not contain "." or ".." path traversal segments' };
+    }
   }
+
   const cleanPathname = trimTrailingSlashes(u.pathname) || '';
-  return { ok: true, url: u, normalized: `${u.origin}${cleanPathname}` };
+  // Lowercase ONLY `u.origin` (scheme + hostname); preserve `cleanPathname` case-sensitively (`/v1/ACCT` !== `/v1/acct`)!
+  return { ok: true, url: u, normalized: `${u.origin.toLowerCase()}${cleanPathname}` };
 }
 
 function matchesTrustedBaseUrlPrefix(candidateUrlStr: string | undefined, trustedUrlStr: string | undefined): boolean {
@@ -402,11 +440,16 @@ export function resolveLlmConfig(params: {
       : '') ||
     DEFAULT_MODELS[inferredProvider];
 
-  if (!/^[A-Za-z0-9._:@/-]{1,160}$/.test(model) || model.includes('..')) {
+  if (
+    !/^[A-Za-z0-9._:@/-]{1,160}$/.test(model) ||
+    model.includes('..') ||
+    model.includes(';') ||
+    model.split('/').some((seg) => seg === '' || /^\.+$/.test(seg))
+  ) {
     return {
       ok: false,
       error: 'invalid_llm_model',
-      message: 'llm.model must match /^[A-Za-z0-9._:@/-]{1,160}$/ and must not contain ".."',
+      message: 'llm.model must match /^[A-Za-z0-9._:@/-]{1,160}$/ without empty, ".", or ".." path segments',
     };
   }
 
@@ -447,13 +490,15 @@ export function resolveLlmConfig(params: {
       : undefined;
 
   const providerMatchesOperatorDefault = Boolean(operatorDefaultProvider && inferredProvider === operatorDefaultProvider);
+  const parsedBaseCheck = validateCleanHttpBaseUrl(baseUrl);
+  const parsedOpDefaultCheck = operatorDefaultBaseUrl ? validateCleanHttpBaseUrl(operatorDefaultBaseUrl) : null;
   const baseUrlMatchesOperatorDefault = Boolean(
     !hasCallerBaseUrl ||
-      (operatorDefaultBaseUrl &&
-        validateCleanHttpBaseUrl(baseUrl).ok &&
-        validateCleanHttpBaseUrl(operatorDefaultBaseUrl).ok &&
-        (validateCleanHttpBaseUrl(baseUrl) as { normalized: string }).normalized.toLowerCase() ===
-          (validateCleanHttpBaseUrl(operatorDefaultBaseUrl) as { normalized: string }).normalized.toLowerCase()),
+      (parsedBaseCheck.ok &&
+        parsedOpDefaultCheck &&
+        parsedOpDefaultCheck.ok &&
+        // Compare case-sensitively (`normalized` already lowercases scheme + hostname while keeping pathname case-sensitive!)
+        parsedBaseCheck.normalized === parsedOpDefaultCheck.normalized),
   );
   const genericEnvKey =
     providerMatchesOperatorDefault && baseUrlMatchesOperatorDefault ? env.EDGEFETCH_LLM_API_KEY?.trim() : undefined;
@@ -1019,9 +1064,12 @@ function stripDelimitedMarkerLinear(src: string, marker: string): string {
   return out.join('');
 }
 
+const BOUNDED_SUMMARY_LINK_RE = /\[([^\[\]\n]{1,1000})\]\([^)\n]{1,2048}\)/g;
+
 export function buildDeterministicSummary(markdown: string, title?: string): string {
-  if (!markdown.trim()) return title ? `${title}.` : '';
-  const withoutFences = stripDelimitedMarkerLinear(stripDelimitedMarkerLinear(markdown, '```'), '~~~');
+  const capped = markdown.length > 65_536 ? markdown.slice(0, 65_536) : markdown;
+  if (!capped.trim()) return title ? `${title}.` : '';
+  const withoutFences = stripDelimitedMarkerLinear(stripDelimitedMarkerLinear(capped, '```'), '~~~');
   const lines = withoutFences
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -1033,17 +1081,21 @@ export function buildDeterministicSummary(markdown: string, title?: string): str
 
   for (const line of lines) {
     if (/^#{1,3}\s+/.test(line)) {
-      const h = line.replace(/^#{1,3}\s+/, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim();
-      if (h && h.toLowerCase() !== (title ?? '').toLowerCase() && headings.length < 5) {
-        headings.push(h);
+      if (headings.length < 5) {
+        const h = line.slice(0, 2_048).replace(/^#{1,3}\s+/, '').replace(BOUNDED_SUMMARY_LINK_RE, '$1').trim();
+        if (h && h.toLowerCase() !== (title ?? '').toLowerCase()) {
+          headings.push(h);
+        }
       }
     } else if (/^[-*]\s+/.test(line)) {
-      const b = line.replace(/^[-*]\s+/, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim();
-      if (b.length >= 18 && b.length <= 220 && bullets.length < 4) {
-        bullets.push(b);
+      if (bullets.length < 4) {
+        const b = line.slice(0, 4_096).replace(/^[-*]\s+/, '').replace(BOUNDED_SUMMARY_LINK_RE, '$1').trim();
+        if (b.length >= 18 && b.length <= 220) {
+          bullets.push(b);
+        }
       }
     } else if (!line.startsWith('|') && !line.startsWith('!') && line.length >= 45 && paragraphs.length < 2) {
-      const cleanP = line.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/\s+/g, ' ').trim();
+      const cleanP = line.slice(0, 4_096).replace(BOUNDED_SUMMARY_LINK_RE, '$1').replace(/\s+/g, ' ').trim();
       if (cleanP.length >= 45) paragraphs.push(cleanP.slice(0, 360));
     }
   }

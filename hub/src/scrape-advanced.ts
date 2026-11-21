@@ -13,6 +13,7 @@ import {
   asciiLower,
   isTagNameBoundary,
   MAX_HTML_SCAN_CHARS,
+  replaceHtmlTagsQuoteAwareLinear,
   replacePairedHtmlElementsLinear,
   scanHtmlTagsLinear,
   stripHtmlCommentsLinear,
@@ -123,77 +124,147 @@ function stripMarkdownCodeBlocksAndSpansLinear(md: string): string {
     .join('\n');
 }
 
+const INLINE_SPLIT_TAGS = new Set([
+  'a',
+  'abbr',
+  'b',
+  'bdi',
+  'bdo',
+  'cite',
+  'del',
+  'dfn',
+  'em',
+  'font',
+  'i',
+  'ins',
+  'kbd',
+  'mark',
+  'q',
+  's',
+  'samp',
+  'small',
+  'span',
+  'strike',
+  'strong',
+  'sub',
+  'sup',
+  'time',
+  'u',
+  'var',
+  'wbr',
+]);
+
+function normalizeProseForInjectionScan(prose: string): string {
+  let out = prose;
+  if (out.includes('<!--')) {
+    out = stripHtmlCommentsLinear(out, MAX_HTML_SCAN_CHARS);
+  }
+  if (out.includes('<')) {
+    out = stripHtmlTagsLinear(out, ['script', 'style', 'noscript', 'template'], ' ', MAX_HTML_SCAN_CHARS);
+    out = replaceHtmlTagsQuoteAwareLinear(
+      out,
+      (tag) => (INLINE_SPLIT_TAGS.has(tag.tagNameLower) ? '' : ' '),
+      MAX_HTML_SCAN_CHARS,
+      false,
+    );
+  }
+  if (out.includes('&')) {
+    out = out
+      .replace(/&#(\d{1,7});/g, (_m, dec: string) => {
+        const cp = Number(dec);
+        return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+      })
+      .replace(/&#x([0-9a-fA-F]{1,6});/g, (_m, hex: string) => {
+        const cp = parseInt(hex, 16);
+        return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+      })
+      .replace(/&(?:nbsp|ensp|emsp|thinsp);/gi, ' ')
+      .replace(/&shy;/gi, '')
+      .replace(/&(?:zwj|zwnj);/gi, '')
+      .replace(/&quot;/gi, '"')
+      .replace(/&apos;/gi, "'")
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&amp;/gi, '&');
+  }
+  return out.replace(/[\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]/gu, '');
+}
+
 /**
  * Scans extracted prose and raw HTML for indirect prompt-injection payloads while stripping fenced code blocks and
- * `<code>`/`<pre>` elements so security documentation discussing prompt injection does not false-positive (`H1`).
+ * `<code>`/`<pre>` elements so security documentation discussing prompt injection does not false-positive (`H1`, `R3-M3`).
  */
 export function detectPromptInjection(params: {
   markdown: string;
   rawHtml?: string;
 }): { detected: boolean; triggers: string[] } {
-  const boundedHtml = (params.rawHtml ?? '').slice(0, 250_000);
-  const boundedMd = params.markdown.slice(0, 250_000);
+  const boundedHtml = (params.rawHtml ?? '').slice(0, MAX_HTML_SCAN_CHARS);
+  const boundedMd = params.markdown.slice(0, MAX_HTML_SCAN_CHARS);
   const triggers: string[] = [];
   let totalScore = 0;
 
-  // 1. Invisible Unicode Tag ASCII smuggling (`U+E0000`–`U+E007F`) in raw source
-  if (/[\u{E0000}-\u{E007F}]{4,}/u.test(boundedHtml)) {
+  // 1. Invisible Unicode Tag ASCII smuggling (`U+E0000`–`U+E007F`) in raw source or Markdown
+  if (/[\u{E0000}-\u{E007F}]{4,}/u.test(boundedHtml) || /[\u{E0000}-\u{E007F}]{4,}/u.test(boundedMd)) {
     triggers.push('unicode_tag_ascii_smuggling');
     totalScore += 4;
   }
 
   // 2. Hidden CSS / DOM subtree containing imperative LLM override phrases (strictly linear O(N) scan with monotonic close-tag & window cursors)
-  const rawWithoutCode = stripHtmlTagsLinear(boundedHtml, ['pre', 'code'], ' ', 250_000);
-  const lowerWithoutCode = asciiLower(rawWithoutCode);
-  const nextCloseByTag = new Map<string, number>();
-  let scannedHiddenUpTo = 0;
-  scanHtmlTagsLinear(
-    rawWithoutCode,
-    (tag) => {
-      if (tag.isClosing || tag.isSelfClosing || tag.isDeclaration) return;
-      if (tag.attrs.indexOf('style') < 0 && tag.attrs.indexOf('STYLE') < 0 && !/style/i.test(tag.attrs)) return;
-      const attrs = parseOpenTagAttributes(tag.attrs);
-      const styleVal = attrs.style ?? '';
-      if (!styleVal || !HIDDEN_STYLE_TOKEN_RE.test(styleVal)) return;
+  if (boundedHtml) {
+    const rawWithoutCode = stripHtmlTagsLinear(boundedHtml, ['pre', 'code'], ' ', MAX_HTML_SCAN_CHARS);
+    const lowerWithoutCode = asciiLower(rawWithoutCode);
+    const nextCloseByTag = new Map<string, number>();
+    let scannedHiddenUpTo = 0;
+    scanHtmlTagsLinear(
+      rawWithoutCode,
+      (tag) => {
+        if (tag.isClosing || tag.isSelfClosing || tag.isDeclaration) return;
+        if (tag.attrs.indexOf('style') < 0 && tag.attrs.indexOf('STYLE') < 0 && !/style/i.test(tag.attrs)) return;
+        const attrs = parseOpenTagAttributes(tag.attrs);
+        const styleVal = attrs.style ?? '';
+        if (!styleVal || !HIDDEN_STYLE_TOKEN_RE.test(styleVal)) return;
 
-      const closeNeedle = `</${tag.tagNameLower}`;
-      let closeIdx = nextCloseByTag.get(tag.tagNameLower);
-      if (closeIdx === undefined || (closeIdx >= 0 && closeIdx < tag.end)) {
-        let searchFrom = closeIdx !== undefined && closeIdx >= 0 ? Math.max(tag.end, closeIdx) : tag.end;
-        let found = -1;
-        while (searchFrom < rawWithoutCode.length) {
-          const cand = lowerWithoutCode.indexOf(closeNeedle, searchFrom);
-          if (cand < 0) break;
-          const afterIdx = cand + closeNeedle.length;
-          if (afterIdx < rawWithoutCode.length && isTagNameBoundary(rawWithoutCode.charCodeAt(afterIdx))) {
-            found = cand;
-            break;
+        const closeNeedle = `</${tag.tagNameLower}`;
+        let closeIdx = nextCloseByTag.get(tag.tagNameLower);
+        if (closeIdx === undefined || (closeIdx >= 0 && closeIdx < tag.end)) {
+          let searchFrom = closeIdx !== undefined && closeIdx >= 0 ? Math.max(tag.end, closeIdx) : tag.end;
+          let found = -1;
+          while (searchFrom < rawWithoutCode.length) {
+            const cand = lowerWithoutCode.indexOf(closeNeedle, searchFrom);
+            if (cand < 0) break;
+            const afterIdx = cand + closeNeedle.length;
+            if (afterIdx < rawWithoutCode.length && isTagNameBoundary(rawWithoutCode.charCodeAt(afterIdx))) {
+              found = cand;
+              break;
+            }
+            searchFrom = afterIdx;
           }
-          searchFrom = afterIdx;
+          closeIdx = found;
+          nextCloseByTag.set(tag.tagNameLower, closeIdx);
         }
-        closeIdx = found;
-        nextCloseByTag.set(tag.tagNameLower, closeIdx);
-      }
 
-      const maxSearchEnd = Math.min(rawWithoutCode.length, tag.end + 1400);
-      const sliceEnd = closeIdx >= 0 && closeIdx <= maxSearchEnd ? closeIdx : Math.min(rawWithoutCode.length, tag.end + 1200);
-      const sliceStart = Math.max(tag.end, scannedHiddenUpTo - 64);
-      if (sliceEnd <= sliceStart) return;
-      scannedHiddenUpTo = Math.max(scannedHiddenUpTo, sliceEnd);
-      const innerTxt = stripHtmlTagsQuoteAwareLinear(rawWithoutCode.slice(sliceStart, sliceEnd), ' ', 2000);
-      if (HIDDEN_OVERRIDE_KEYWORD_RE.test(innerTxt)) {
-        triggers.push('hidden_css_instruction_injection');
-        totalScore += 5;
-        return false;
-      }
-      return undefined;
-    },
-    250_000,
-    false,
-  );
+        const maxSearchEnd = Math.min(rawWithoutCode.length, tag.end + 1400);
+        const sliceEnd = closeIdx >= 0 && closeIdx <= maxSearchEnd ? closeIdx : Math.min(rawWithoutCode.length, tag.end + 1200);
+        const sliceStart = Math.max(tag.end, scannedHiddenUpTo - 64);
+        if (sliceEnd <= sliceStart) return;
+        scannedHiddenUpTo = Math.max(scannedHiddenUpTo, sliceEnd);
+        const innerTxt = normalizeProseForInjectionScan(
+          stripHtmlTagsQuoteAwareLinear(rawWithoutCode.slice(sliceStart, sliceEnd), ' ', 2000),
+        );
+        if (HIDDEN_OVERRIDE_KEYWORD_RE.test(innerTxt)) {
+          triggers.push('hidden_css_instruction_injection');
+          totalScore += 5;
+          return false;
+        }
+        return undefined;
+      },
+      MAX_HTML_SCAN_CHARS,
+      false,
+    );
+  }
 
-  // 3. Prose scan (excluding fenced code blocks and inline code spans)
-  const proseWithoutCode = stripMarkdownCodeBlocksAndSpansLinear(boundedMd);
+  // 3. Prose scan (excluding fenced code blocks and inline code spans, stripping zero-width chars, entities, and inline HTML tags)
+  const proseWithoutCode = normalizeProseForInjectionScan(stripMarkdownCodeBlocksAndSpansLinear(boundedMd));
 
   for (const pat of INJECTION_PATTERNS) {
     if (pat.re.test(proseWithoutCode)) {

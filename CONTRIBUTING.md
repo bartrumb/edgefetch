@@ -11,8 +11,13 @@ Every pull request must preserve EdgeFetch's ethical, security, and supply-chain
 1. **Politeness & Ethics First:**
    - **Never weaken `robots.txt` enforcement** (`internal/politeness/robots.go`, `hub/src/robots.ts`), `Crawl-delay` / `Retry-After` handling, or dial-time SSRF peer checks (`internal/politeness/ssrf.go`).
    - **Verify `robots.txt` for every new adapter:** Before adding or modifying a `resolveTwin` endpoint (`hub/src/extractors/providers/`), check `https://<domain>/robots.txt` and ensure `User-agent: *` permits the twin path. If an API/raw path is disallowed (e.g., `api.smartrecruiters.com` or `gitlab.com/*/raw`), use `robots.txt`-allowed paths or `extractHtml` on the public HTML page instead.
-   - **Zero anti-bot or CAPTCHA bypasses:** Never add CAPTCHA solvers, Turnstile/reCAPTCHA clickers, stealth fingerprint spoofers, or residential proxy rotation marketplaces. EdgeFetch classifies challenges (`outcome: "challenge"`) and halts immediately on the first attempt.
-2. **Minimal, Auditable Supply Chain:**
+   - **Zero anti-bot, TLS/browser fingerprinting, or CAPTCHA bypasses (Permanently Out of Scope):** Anti-bot evasion, TLS/JA3/JA4/HTTP2 fingerprint spoofing, stealth browser patches, Turnstile/reCAPTCHA/hCaptcha clickers or solvers, and residential proxy rotation marketplaces are **permanently out of scope**. EdgeFetch classifies challenges (`outcome: "challenge"`) and halts immediately on the first attempt. Pull requests introducing stealth or fingerprinting features will be closed without review.
+   - **Every outbound request must carry an explicit deadline:** Every `fetch` / `http.Client.Do` call in Hub or Go code must attach a bounded `AbortSignal` or `context.WithTimeout` deadline and drain or cancel unread response bodies.
+2. **Contributor Sign-Off (DCO) & Vouch Gate:**
+   - Sign off every commit with `git commit -s` (`Signed-off-by: Your Name <you@example.com>`) certifying the [Developer Certificate of Origin](https://developercertificate.org/) under the [MIT License](LICENSE).
+   - Pull requests from first-time external accounts are gated by [`.github/VOUCHED.td`](.github/VOUCHED.td) (`vouch.yml`) before CI runs untrusted workflows. Comment on your issue or PR with test output and `robots.txt` verification so a maintainer can vouch your GitHub handle.
+   - Contributed site adapters (`hub/src/extractors/providers/`) execute inside a zero-secret, zero-network bulkhead (`runIsolatedAdapterHook`) with no access to Hub environment bindings, tokens, or `fetch`.
+3. **Minimal, Auditable Supply Chain:**
    - **Go (`go.mod`):** Strictly **one external dependency** (`github.com/coder/websocket`, zero transitive dependencies) with `CGO_ENABLED=0`. CI fails automatically if `go mod graph` gains any unexpected module.
    - **TypeScript Hub (`hub/package.json`):** Strictly **zero npm runtime `dependencies`** (`devDependencies` only for TypeScript, esbuild, Wrangler, and Miniflare-based hub tests).
 3. **Keyless Built-In Adapters Only:**

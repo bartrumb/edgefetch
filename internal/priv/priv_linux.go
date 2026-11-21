@@ -22,37 +22,82 @@ const (
 	prSetNoNewPriv = 38 // Linux <sys/prctl.h> PR_SET_NO_NEW_PRIVS
 )
 
-// LockDownSecretPaths restricts secret configuration files (such as Home Assistant `/data/options.json`) to `0600`
-// owned by `0:0` (`root:root`) and locks `/data` to `0700` while the process is still UID 0, right before DropRoot().
-// Once DropRoot() transitions the process to UID/GID 65532, Linux VFS DAC unconditionally denies access to `/data`
-// and `/data/options.json` for both `/edgefetch` and any spawned Chromium / helper child processes.
-func LockDownSecretPaths(paths ...string) {
-	if os.Geteuid() != 0 {
-		return
+// LockDownSecretPaths restricts `/data` (`0700` owned by `0:0`) first and then restricts secret configuration files
+// (such as Home Assistant `/data/options.json`, `0600` owned by `0:0`) while the process is still UID 0, right before
+// DropRoot(). Fails closed with a non-nil error if an existing `/data` or secret path is a symlink or if `Chown`/`Chmod`
+// fails while `euid == 0`.
+func LockDownSecretPaths(paths ...string) error {
+	return lockDownSecretPathsWith(os.Geteuid(), "/data", os.Chown, os.Chmod, paths...)
+}
+
+// LockDownSecretPathsStrict enforces LockDownSecretPaths and returns any symlink or permission-lockdown error.
+func LockDownSecretPathsStrict(paths ...string) error {
+	return LockDownSecretPaths(paths...)
+}
+
+func lockDownSecretPathsWith(
+	euid int,
+	dataDir string,
+	chownFn func(string, int, int) error,
+	chmodFn func(string, os.FileMode) error,
+	paths ...string,
+) error {
+	if euid != 0 {
+		return nil
 	}
+	if dataDir != "" {
+		cleanData := filepath.Clean(dataDir)
+		dst, err := os.Lstat(cleanData)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("lstat %s: %w", cleanData, err)
+			}
+		} else {
+			if dst.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("refusing symlink secret directory %s", cleanData)
+			}
+			if !dst.IsDir() {
+				return fmt.Errorf("secret path %s is not a directory", cleanData)
+			}
+			if err := chownFn(cleanData, 0, 0); err != nil {
+				return fmt.Errorf("chown %s: %w", cleanData, err)
+			}
+			if err := chmodFn(cleanData, 0o700); err != nil {
+				return fmt.Errorf("chmod %s: %w", cleanData, err)
+			}
+		}
+	}
+
 	for _, raw := range paths {
 		if raw == "" {
 			continue
 		}
 		clean := filepath.Clean(raw)
+		if dataDir != "" && clean == filepath.Clean(dataDir) {
+			continue
+		}
 		st, err := os.Lstat(clean)
-		if err != nil || st.Mode()&os.ModeSymlink != 0 {
-			continue
-		}
-		_ = os.Chown(clean, 0, 0)
-		if st.IsDir() {
-			_ = os.Chmod(clean, 0o700)
-			continue
-		}
-		_ = os.Chmod(clean, 0o600)
-		dir := filepath.Dir(clean)
-		if dir == "/data" {
-			if dst, dErr := os.Lstat(dir); dErr == nil && dst.IsDir() && dst.Mode()&os.ModeSymlink == 0 {
-				_ = os.Chown(dir, 0, 0)
-				_ = os.Chmod(dir, 0o700)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
 			}
+			return fmt.Errorf("lstat %s: %w", clean, err)
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlink secret path %s", clean)
+		}
+		if err := chownFn(clean, 0, 0); err != nil {
+			return fmt.Errorf("chown %s: %w", clean, err)
+		}
+		mode := os.FileMode(0o600)
+		if st.IsDir() {
+			mode = 0o700
+		}
+		if err := chmodFn(clean, mode); err != nil {
+			return fmt.Errorf("chmod %s: %w", clean, err)
 		}
 	}
+	return nil
 }
 
 // DropRoot permanently transitions UID/GID 0 down to unprivileged `65532:65532` (`nonroot`), sets `NO_NEW_PRIVS`,

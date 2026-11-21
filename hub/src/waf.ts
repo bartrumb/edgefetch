@@ -43,7 +43,7 @@ export interface WafClassification {
   summary: string;
 }
 
-export type ContentState = 'active' | 'closed_posting' | 'soft_404' | 'login_wall';
+export type ContentState = 'active' | 'closed_posting' | 'soft_404' | 'login_wall' | 'empty_shell';
 
 export interface ContentStateResult {
   state: ContentState;
@@ -74,8 +74,27 @@ function readHeaderCaseInsensitive(headers: Headers | Record<string, string | un
   return '';
 }
 
-const RICH_SCHEMA_TYPE_RE =
-  /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>[\s\S]{0,16000}?"@type"\s*:\s*(?:\[[^\]]*)?["'](?:Article|TechArticle|NewsArticle|BlogPosting|ScholarlyArticle|JobPosting|Product|SoftwareSourceCode|FAQPage|APIReference)["']/i;
+const RICH_SCHEMA_INNER_RE =
+  /"@type"\s*:\s*(?:\[[^\]]{0,400})?["'](?:Article|TechArticle|NewsArticle|BlogPosting|ScholarlyArticle|JobPosting|Product|SoftwareSourceCode|FAQPage|APIReference)["']/i;
+
+function hasRichSchemaJsonLdLinear(sample: string): boolean {
+  if (!sample.includes('ld+json') && !sample.includes('LD+JSON')) return false;
+  let found = false;
+  replaceHtmlTagBlocksLinear(
+    sample,
+    'script',
+    (_full, attrStr, inner) => {
+      if (!found && /\btype\s*=\s*["']application\/ld\+json["']/i.test(attrStr)) {
+        if (RICH_SCHEMA_INNER_RE.test(inner.slice(0, 24_000))) {
+          found = true;
+        }
+      }
+      return '';
+    },
+    98_304,
+  );
+  return found;
+}
 
 /**
  * Evaluates HTTP status, response headers, and body against the 7-Vendor WAF & Challenge Signature Catalog (`R2`)
@@ -178,7 +197,7 @@ export function classifyWafAndChallenge(params: {
   // --- Layer 2 & Layer 4: Structural Content Veto & Payload Geometry Check on 200 OK ---
   if (status >= 200 && status < 300) {
     if (visibleWords >= 120) return null;
-    if (RICH_SCHEMA_TYPE_RE.test(sample)) return null;
+    if (hasRichSchemaJsonLdLinear(sample)) return null;
     let richMain = false;
     replacePairedHtmlElementsLinear(
       visibleClean,
@@ -402,8 +421,82 @@ export function classifyWafAndChallenge(params: {
   return null;
 }
 
+const NON_CONTENT_IFRAME_HOST_RE =
+  /(?:googletagmanager\.com|doubleclick\.net|googlesyndication\.com|google-analytics\.com|facebook\.com\/tr|challenges\.cloudflare\.com|recaptcha|hcaptcha|captcha-delivery\.com|_incapsula_resource|js\.stripe\.com|newrelic\.com|demdex\.net)/i;
+
+function readSimpleTagAttr(attrChunk: string, targetKeyLower: string): string {
+  const re = /([a-zA-Z_:][a-zA-Z0-9_.:-]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(attrChunk)) !== null) {
+    if (m[1]!.toLowerCase() === targetKeyLower) {
+      return (m[2] ?? m[3] ?? m[4] ?? '').trim();
+    }
+  }
+  return '';
+}
+
 /**
- * `R4`: Classifies `contentState: "active" | "closed_posting" | "soft_404" | "login_wall"` with anti-false-positive
+ * Linear O(N) `<iframe` shell detector for `iCIMS` (`#icims_content_iframe`) and external ATS / widget wrapper pages
+ * that return `200 OK` with `< 50` words of outer chrome (`isThinSpa200` / `contentState: 'empty_shell'`).
+ */
+export function hasExternalOrWidgetIframeLinear(rawHtml: string): {
+  found: boolean;
+  iframeSrc?: string;
+  isIcims?: boolean;
+} {
+  if (!rawHtml || (rawHtml.indexOf('<iframe') < 0 && rawHtml.indexOf('<IFRAME') < 0 && !/iframe/i.test(rawHtml))) {
+    return { found: false };
+  }
+  let found = false;
+  let iframeSrc: string | undefined;
+  let isIcims = false;
+
+  scanHtmlTagsLinear(
+    rawHtml,
+    (tag) => {
+      if (tag.isClosing || tag.tagNameLower !== 'iframe') return;
+      const id = readSimpleTagAttr(tag.attrs, 'id');
+      const name = readSimpleTagAttr(tag.attrs, 'name');
+      const cls = readSimpleTagAttr(tag.attrs, 'class');
+      const src = readSimpleTagAttr(tag.attrs, 'src') || readSimpleTagAttr(tag.attrs, 'data-src');
+      const style = readSimpleTagAttr(tag.attrs, 'style');
+      const width = readSimpleTagAttr(tag.attrs, 'width');
+      const height = readSimpleTagAttr(tag.attrs, 'height');
+      const ariaHidden = readSimpleTagAttr(tag.attrs, 'aria-hidden').toLowerCase();
+      if (ariaHidden === 'true') return;
+      if (width === '0' || width === '1' || height === '0' || height === '1') return;
+      if (style && /(?:display\s*:\s*none|visibility\s*:\s*hidden)/i.test(style)) return;
+      if (/\bhidden(?:\s*=\s*(?:""|''|"true"|'true'|"hidden"|'hidden'|true|hidden))?(?=\s|$)/i.test(tag.attrs)) return;
+
+      const combinedMeta = `${id} ${name} ${cls} ${src}`.toLowerCase();
+      if (combinedMeta.includes('icims')) {
+        found = true;
+        isIcims = true;
+        if (src) iframeSrc = src;
+        return false;
+      }
+      if (!src || /^(?:about:blank|javascript:|data:)/i.test(src)) return;
+      if (NON_CONTENT_IFRAME_HOST_RE.test(src)) return;
+      if (/^(?:https?:\/\/|\/\/|\/[A-Za-z0-9_.-])/i.test(src)) {
+        found = true;
+        iframeSrc = src;
+        return false;
+      }
+      return undefined;
+    },
+    MAX_HTML_SCAN_CHARS,
+    false,
+  );
+
+  return {
+    found,
+    ...(iframeSrc ? { iframeSrc } : {}),
+    ...(isIcims ? { isIcims: true } : {}),
+  };
+}
+
+/**
+ * `R4`: Classifies `contentState: "active" | "closed_posting" | "soft_404" | "login_wall" | "empty_shell"` with anti-false-positive
  * word-count & structural vetoes so documentation pages mentioning HTTP 404 or login forms stay `"active"`.
  */
 export function classifyContentState(params: {
@@ -414,9 +507,10 @@ export function classifyContentState(params: {
   markdown: string;
   rawHtml?: string;
   validThrough?: string;
+  rendered?: boolean;
   nowMs?: number;
 }): ContentStateResult {
-  const { status = 200, url, finalUrl, title = '', markdown, rawHtml = '', validThrough, nowMs = Date.now() } = params;
+  const { status = 200, url, finalUrl, title = '', markdown, rawHtml = '', validThrough, rendered = false, nowMs = Date.now() } = params;
 
   // 0. Deterministic ATS silent-redirect dead-link trap (e.g. closed Greenhouse/Lever/Ashby postings 200-redirect to `?error=true`, board root, or custom `/careers` index!)
   const checkUrlStr = finalUrl || url || '';
@@ -533,7 +627,21 @@ export function classifyContentState(params: {
 
   // 3. Login-wall check (thin body < 110 words gated by sign-in prompt or password form outside scripts/templates)
   if (words < 110) {
-    const hasPasswordInput = /<input\b[^>]*\btype\s*=\s*["']password["']/i.test(cleanVisibleHtml);
+    let hasPasswordInput = false;
+    if (cleanVisibleHtml && (cleanVisibleHtml.includes('password') || cleanVisibleHtml.includes('PASSWORD'))) {
+      scanHtmlTagsLinear(
+        cleanVisibleHtml,
+        (tag) => {
+          if (!tag.isClosing && tag.tagNameLower === 'input' && readSimpleTagAttr(tag.attrs, 'type').toLowerCase() === 'password') {
+            hasPasswordInput = true;
+            return false;
+          }
+          return undefined;
+        },
+        MAX_HTML_SCAN_CHARS,
+        false,
+      );
+    }
     const hasLoginGateHeading =
       /^(?:sign\s+in|log\s*in|authentication\s+required|members\s+only)(?:\s+to\s+\S+|\s*[-|–]\s*.*)?$/i.test(title.trim());
     const hasLoginGateCopy =
@@ -542,6 +650,19 @@ export function classifyContentState(params: {
       );
     if (hasLoginGateCopy || (hasPasswordInput && (hasLoginGateHeading || words < 65))) {
       return { state: 'login_wall', reason: 'Content is gated behind an authentication / sign-in wall.' };
+    }
+  }
+
+  // 4. Unrendered thin `<iframe>` shell check (e.g. `#icims_content_iframe` or external ATS/widget iframe with < 50 extracted words)
+  if (status >= 200 && status < 300 && words < 50 && !rendered && rawHtml) {
+    const iframeShell = hasExternalOrWidgetIframeLinear(rawHtml);
+    if (iframeShell.found) {
+      return {
+        state: 'empty_shell',
+        reason: iframeShell.isIcims
+          ? 'Unrendered iCIMS ATS iframe shell (#icims_content_iframe) with < 50 words of outer chrome.'
+          : 'Unrendered HTML shell (< 50 words) wrapping an external or widget <iframe>.',
+      };
     }
   }
 
@@ -634,7 +755,16 @@ export function recoverSsrHydrationContent(
           // ignore
         }
       }
-      const titleTag = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(rawHtml)?.[1]?.trim() ?? '';
+      let titleTag = '';
+      replacePairedHtmlElementsLinear(
+        boundedHtml.slice(0, 65_536),
+        ['title'],
+        (_f, _t, _a, inner) => {
+          if (!titleTag) titleTag = stripHtmlTagsQuoteAwareLinear(inner, ' ', 4096).replace(/\s+/g, ' ').trim();
+          return '';
+        },
+        { maxChars: 65_536, maxInnerChars: 4096 },
+      );
       if (titleTag) rscTitle = titleTag;
       // Also capture raw RSC `T<hex>,` text blocks (used by Next.js App Router for large Markdown/prose props!)
       for (const rawBlock of combinedRsc.split(/\n[0-9a-f]+:/i)) {
@@ -793,13 +923,16 @@ export function isEligibleForWaybackFallback(params: {
   if (
     outcome === 'challenge' ||
     outcome === 'robots_disallowed' ||
+    outcome === 'robots_unreachable' ||
     outcome === 'content_signal_disallowed' ||
-    outcome === 'payment_required'
+    outcome === 'payment_required' ||
+    outcome === 'rate_limited'
   ) {
     return false;
   }
   if (
     prob.includes('robots.txt') ||
+    prob.includes('robots_unreachable') ||
     prob.includes('content-signal') ||
     prob.includes('ai-input=no') ||
     prob.includes('challenge') ||
@@ -904,4 +1037,90 @@ export async function tryFetchWaybackSnapshot(params: {
   } catch {
     return null;
   }
+}
+
+/**
+ * Post-processes `buildBlockedInfo` output across `mcp.ts` and `scrape.ts` so:
+ *  - Unreachable `/robots.txt` (`robots_unreachable: ...` or `outcome === 'stop'` with unreachable/timed-out `/robots.txt`)
+ *    emits `reason: 'robots_unreachable'` per RFC 9309 §2.3.1.4 instead of claiming the site disallows the path.
+ *  - `icims.com` (`*.icims.com`) is treated as the employer's official ATS rather than a third-party job aggregator.
+ *  - Non-challenge HTTP `429` responses carry `reason: 'rate_limited'` with `retryAfterMs` when available.
+ */
+export function refineBlockedInfo(params: {
+  url: string;
+  outcome?: unknown;
+  problem?: unknown;
+  status?: unknown;
+  retryAfter?: unknown;
+  baseBlocked: unknown;
+  nowMs?: number;
+}): Record<string, unknown> | undefined {
+  const { url, outcome, problem, status, retryAfter, nowMs = Date.now() } = params;
+  const baseBlocked =
+    params.baseBlocked && typeof params.baseBlocked === 'object' && !Array.isArray(params.baseBlocked)
+      ? (params.baseBlocked as Record<string, unknown>)
+      : undefined;
+  let host = '';
+  try {
+    host = new URL(url).hostname.toLowerCase().replace(/\.+$/, '');
+  } catch {
+    host = '';
+  }
+  const outStr = typeof outcome === 'string' ? outcome.trim().toLowerCase() : '';
+  const probStr = typeof problem === 'string' ? problem.trim() : '';
+
+  if (
+    probStr.toLowerCase().startsWith('robots_unreachable') ||
+    ((outStr === 'stop' || outStr === 'robots_unreachable' || outStr === 'error') &&
+      /robots\.txt[\s\S]{0,180}?(?:unreachable|timed out|returned http (?:5\d\d|429)|budget exhausted|redirect failed|unexpected http)/i.test(
+        probStr,
+      ))
+  ) {
+    const labelHost = host || 'origin';
+    return {
+      reason: 'robots_unreachable',
+      host: labelHost,
+      suggestion: `${labelHost}'s /robots.txt timed out or returned 5xx (disallow assumed temporarily per RFC 9309 §2.3.1.4). Retry shortly.`,
+    };
+  }
+
+  let retryAfterMs: number | undefined;
+  if (typeof retryAfter === 'string' && retryAfter.trim()) {
+    const trimmed = retryAfter.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const secs = Number(trimmed);
+      if (Number.isFinite(secs) && secs >= 0) retryAfterMs = secs * 1_000;
+    } else {
+      const parsedDate = Date.parse(trimmed);
+      if (Number.isFinite(parsedDate)) retryAfterMs = Math.max(0, parsedDate - nowMs);
+    }
+  }
+
+  if ((status === 429 || outStr === 'rate_limited') && outStr !== 'challenge' && baseBlocked?.reason !== 'challenge') {
+    const labelHost = host || (typeof baseBlocked?.host === 'string' ? baseBlocked.host : 'origin');
+    return {
+      ...(baseBlocked ?? {}),
+      reason: 'rate_limited',
+      host: labelHost,
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      suggestion:
+        typeof baseBlocked?.suggestion === 'string' &&
+        baseBlocked.suggestion &&
+        !/disallows\s+this\s+path\s+in\s+robots\.txt/i.test(baseBlocked.suggestion)
+          ? baseBlocked.suggestion
+          : `${labelHost} returned HTTP 429 Too Many Requests${retryAfterMs !== undefined ? ` (Retry-After: ${Math.ceil(retryAfterMs / 1000)}s)` : ''}. Wait out the cooldown window before retrying.`,
+    };
+  }
+
+  if (baseBlocked && (host === 'icims.com' || host.endsWith('.icims.com'))) {
+    const sug = typeof baseBlocked.suggestion === 'string' ? baseBlocked.suggestion : '';
+    if (/aggregator|go\s+directly\s+to\s+the\s+employer|board\s+instead\s+of\s+job\s+boards/i.test(sug) || baseBlocked.category === 'aggregator') {
+      const copy = { ...baseBlocked };
+      delete copy.category;
+      copy.suggestion = `${host} is the employer's iCIMS ATS portal. Try rendering with browser / ?in_iframe=1 or check if the employer mirrors openings on its main careers site.`;
+      return copy;
+    }
+  }
+
+  return baseBlocked ?? undefined;
 }

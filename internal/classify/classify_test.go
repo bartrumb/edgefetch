@@ -118,14 +118,39 @@ func TestAcceptForAndStopsHost(t *testing.T) {
 		}
 	}
 
-	if !StopsHost(KindScrape, OutcomeChallenge) || !StopsHost(KindScrape, OutcomeStop) || !StopsHost(KindPage, OutcomePaymentRequired) {
-		t.Fatal("Challenge, Stop, and PaymentRequired must always stop host")
+	if !StopsHost(KindScrape, OutcomeChallenge) || !StopsHost(KindScrape, OutcomeStop) || !StopsHost(KindPage, OutcomeRateLimited) || !StopsHost(KindPage, OutcomePaymentRequired) {
+		t.Fatal("Challenge, Stop, RateLimited, and PaymentRequired must always stop host")
 	}
 	if !StopsHost(KindFeed, OutcomeError) || !StopsHost(KindJSON, OutcomeError) || !StopsHost(KindCatalog, OutcomeError) {
 		t.Fatal("OutcomeError on Feed/JSON/Catalog must stop host")
 	}
 	if StopsHost(KindPage, OutcomeError) || StopsHost(KindScrape, OutcomeGone) {
 		t.Fatal("OutcomeError on Page or OutcomeGone on Scrape must not stop host")
+	}
+
+	autoOKTypes := []string{
+		"application/json; charset=utf-8",
+		"application/ld+json",
+		"application/problem+json",
+		"application/rss+xml",
+		"application/atom+xml",
+		"application/xml",
+		"text/xml; charset=utf-8",
+		"text/plain; charset=utf-8",
+		"text/markdown",
+	}
+	for _, ct := range autoOKTypes {
+		h := http.Header{"Content-Type": []string{ct}}
+		if got, _ := ClassifyAuto(KindPage, true, 200, h, []byte("{}")); got != OutcomeOK {
+			t.Fatalf("ClassifyAuto(KindPage, true, 200, %q) = %q, want %q", ct, got, OutcomeOK)
+		}
+		if got, _ := ClassifyAuto("", false, 200, h, []byte("{}")); got != OutcomeOK {
+			t.Fatalf("ClassifyAuto(\"\", false, 200, %q) = %q, want %q", ct, got, OutcomeOK)
+		}
+	}
+	imgH := http.Header{"Content-Type": []string{"image/png"}}
+	if got, _ := ClassifyAuto(KindPage, true, 200, imgH, []byte("\x89PNG")); got != OutcomeSkip {
+		t.Fatalf("ClassifyAuto(KindPage, true, 200, image/png) = %q, want %q", got, OutcomeSkip)
 	}
 }
 

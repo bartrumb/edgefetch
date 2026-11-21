@@ -1,6 +1,9 @@
+# TEMPLATE MANIFEST — DO NOT SUBMIT OR INSTALL UNMODIFIED!
+# Populate `PackageVersion` and `InstallerSha256` from the Ed25519-signed `checksums.txt` on GitHub Releases
+# (e.g. via `wingetcreate update`) before opening a PR to microsoft/winget-pkgs.
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.9.0.schema.json
 PackageIdentifier: BartrumB.EdgeFetch
-PackageVersion: 2.5.5
+PackageVersion: 2.6.0
 PackageLocale: en-US
 Publisher: BartrumB
 PublisherUrl: https://github.com/bartrumb/edgefetch
@@ -18,7 +21,6 @@ Tags:
   - golang
 ManifestType: singleton
 ManifestVersion: 1.9.0
-# Note: InstallerSha256 placeholders below are populated post-release from the Ed25519-signed `checksums.txt` on GitHub Releases before submitting to winget-pkgs.
 Installers:
   - Architecture: x64
     InstallerType: zip
@@ -26,13 +28,13 @@ Installers:
     NestedInstallerFiles:
       - RelativeFilePath: edgefetch.exe
         PortableCommandAlias: edgefetch
-    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.5.5/edgefetch_2.5.5_windows_amd64.zip
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.6.0/edgefetch_2.6.0_windows_amd64.zip
+    InstallerSha256: <REPLACE_WITH_RELEASE_WINDOWS_AMD64_ZIP_SHA256>
   - Architecture: arm64
     InstallerType: zip
     NestedInstallerType: portable
     NestedInstallerFiles:
       - RelativeFilePath: edgefetch.exe
         PortableCommandAlias: edgefetch
-    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.5.5/edgefetch_2.5.5_windows_arm64.zip
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.6.0/edgefetch_2.6.0_windows_arm64.zip
+    InstallerSha256: <REPLACE_WITH_RELEASE_WINDOWS_ARM64_ZIP_SHA256>

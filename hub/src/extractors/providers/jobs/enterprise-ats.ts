@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { attrHasTokenLinear, defineAdapter, findElementInnerLinear, findOpenTagLinear, getAttrValueLinear } from '../../types';
 import { extractBalancedDivAt, extractJsonLdObjects, formatGfmTable, parseJsonObject, stripScriptsAndStyles, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -106,14 +106,15 @@ export default defineAdapter({
       const jobLd = ldObjects.find((o) => String(o['@type'] ?? '') === 'JobPosting');
       const title =
         (typeof jobLd?.title === 'string' ? jobLd.title.trim() : '') ||
-        stripTagsInline(/<h1\b[^>]*\bjob-title\b[^>]*>([\s\S]*?)<\/h1>/i.exec(clean)?.[1] ?? '');
+        stripTagsInline(findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'job-title')) ?? '');
       const company =
         (typeof (jobLd?.hiringOrganization as Record<string, unknown> | undefined)?.name === 'string'
           ? String((jobLd!.hiringOrganization as Record<string, unknown>).name).trim()
           : '') || parts[0]!;
+      const descDivOpen = findOpenTagLinear(clean, 'div', (a) => getAttrValueLinear(a, 'itemprop') === 'description');
       const descSec =
-        /<div\b[^>]*itemprop=["']description["'][^>]*>([\s\S]*?)<\/div>/i.exec(clean)?.[1] ??
-        /<section\b[^>]*id=["']st-jobDescription["'][^>]*>([\s\S]*?)<\/section>/i.exec(clean)?.[1] ??
+        (descDivOpen ? extractBalancedDivAt(clean, descDivOpen.index) : null) ??
+        findElementInnerLinear(clean, 'section', (a) => getAttrValueLinear(a, 'id') === 'st-jobDescription') ??
         (typeof jobLd?.description === 'string' ? jobLd.description : '');
       if (!title || !descSec) return null;
       const bodyMd = htmlToMd(descSec, baseUrl).markdown.trim();
@@ -126,12 +127,16 @@ export default defineAdapter({
 
     // Jobvite (`jobs.jobvite.com/<org>/job/<id>` fallback when JSON-LD is absent)
     if (host === 'jobs.jobvite.com' && parts.length >= 3 && parts[1] === 'job') {
-      const descOpen = /<div\b[^>]*\bjv-job-detail-description\b[^>]*>/i.exec(clean);
+      const descOpen = findOpenTagLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'jv-job-detail-description'));
       if (!descOpen) return null;
       const inner = extractBalancedDivAt(clean, descOpen.index);
-      const title = stripTagsInline(/<h2\b[^>]*\bjv-header\b[^>]*>([\s\S]*?)<\/h2>/i.exec(clean)?.[1] ?? '');
+      const title = stripTagsInline(
+        findElementInnerLinear(clean, 'h2', (a) => attrHasTokenLinear(a, 'class', 'jv-header')) ?? '',
+      );
       if (!inner || !title) return null;
-      const meta = stripTagsInline(/<p\b[^>]*\bjv-job-detail-meta\b[^>]*>([\s\S]*?)<\/p>/i.exec(clean)?.[1] ?? '');
+      const meta = stripTagsInline(
+        findElementInnerLinear(clean, 'p', (a) => attrHasTokenLinear(a, 'class', 'jv-job-detail-meta')) ?? '',
+      );
       const bodyMd = htmlToMd(inner, baseUrl).markdown.trim();
       return {
         extractorId: 'jobvite',

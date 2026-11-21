@@ -5,6 +5,8 @@
  * compatible with AWS S3, Cloudflare R2 S3 API, Fly.io Tigris, MinIO, Backblaze B2, and Garage with zero `@aws-sdk/*` bloat.
  */
 
+import { safeDecodeURIComponent } from '../src/safe-input';
+
 export interface S3BucketConfig {
   endpoint: string;
   bucket: string;
@@ -93,7 +95,7 @@ export async function buildSigV4Headers(input: SigV4SignInput): Promise<Record<s
 
   const canonicalUri = u.pathname
     .split('/')
-    .map((seg) => encodeRfc3986(decodeURIComponent(seg)))
+    .map((seg) => encodeRfc3986(safeDecodeURIComponent(seg) ?? seg))
     .join('/');
 
   const canonicalRequest = [

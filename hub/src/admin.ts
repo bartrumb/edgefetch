@@ -766,15 +766,6 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   if (path === '/admin/login' && request.method === 'POST') {
     const now = Date.now();
     const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
-    // Check lockout BEFORE checking supplied token OR buffering body so locked-out callers always receive 429 (H-S5 / M6).
-    const preLock = await deps.oauthStore.checkAuthLockout(`admin:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
-    if (!preLock.allowed) {
-      await request.body?.cancel().catch(() => undefined);
-      return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
-        status: 429,
-        headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
-      });
-    }
     const cappedForm = await readBodyTextCapped(request, 8_192);
     if (!cappedForm.ok) {
       return new Response(renderLoginHtml(deps.serviceName, 'Login payload too large.'), {
@@ -783,7 +774,16 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       });
     }
     const supplied = (new URLSearchParams(cappedForm.text).get('token') ?? '').trim();
+    // `R3-M4`: Verify constant-time `CALLER_TOKEN` match FIRST so an attacker spoofing `X-Forwarded-For` or sharing a
+    // reverse-proxy / IPv6 `/64` bucket can NEVER lock out the legitimate admin, while invalid tokens get `429` after 5 failures!
     if (!supplied || !sameBytes(supplied, deps.ownerSecret)) {
+      const preLock = await deps.oauthStore.checkAuthLockout(`admin:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
+      if (!preLock.allowed) {
+        return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
+          status: 429,
+          headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+        });
+      }
       const rl = await deps.oauthStore.recordAuthFailure(`admin:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
       if (!rl.allowed) {
         return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {

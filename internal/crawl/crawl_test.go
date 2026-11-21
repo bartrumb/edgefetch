@@ -929,3 +929,289 @@ func TestAgenticWebMarkdownForAgentsContentSignalsHTTP402AndLogRedaction(t *test
 		t.Fatalf("M11: query secret leaked into logs or host-stop problem: logs=%s problem=%q", logBuf.String(), res[5].Problem)
 	}
 }
+
+func TestRobotsRFC9309RedirectLimitCacheControlAnd1MiBCap(t *testing.T) {
+	var sixRedirHops atomic.Int32
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Host {
+		case "six-redir.test":
+			if strings.HasPrefix(r.URL.Path, "/robots") {
+				hop := sixRedirHops.Add(1)
+				w.Header().Set("Location", fmt.Sprintf("http://six-redir.test/robots-%d", hop))
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>allowed after >5 valid redirects</html>"))
+
+		case "five-redir.test":
+			switch r.URL.Path {
+			case "/robots.txt":
+				http.Redirect(w, r, "/r1", http.StatusFound)
+			case "/r1":
+				http.Redirect(w, r, "/r2", http.StatusFound)
+			case "/r2":
+				http.Redirect(w, r, "/r3", http.StatusFound)
+			case "/r3":
+				http.Redirect(w, r, "/r4", http.StatusFound)
+			case "/r4":
+				http.Redirect(w, r, "/r5", http.StatusFound)
+			case "/r5":
+				w.Header().Set("Cache-Control", "public, max-age=120")
+				_, _ = w.Write([]byte("User-agent: *\nDisallow: /locked\n"))
+			default:
+				w.Header().Set("Content-Type", "text/html")
+				_, _ = w.Write([]byte("<html>page</html>"))
+			}
+
+		case "six-redir-ssrf.test":
+			switch r.URL.Path {
+			case "/robots.txt":
+				http.Redirect(w, r, "/s1", http.StatusFound)
+			case "/s1":
+				http.Redirect(w, r, "/s2", http.StatusFound)
+			case "/s2":
+				http.Redirect(w, r, "/s3", http.StatusFound)
+			case "/s3":
+				http.Redirect(w, r, "/s4", http.StatusFound)
+			case "/s4":
+				http.Redirect(w, r, "/s5", http.StatusFound)
+			case "/s5":
+				w.Header().Set("Location", "http://127.0.0.1/robots.txt")
+				w.WriteHeader(http.StatusFound)
+			}
+
+		case "pad-540k.test":
+			if r.URL.Path == "/robots.txt" {
+				w.Header().Set("Cache-Control", "max-age=5")
+				_, _ = w.Write([]byte("User-agent: *\n" + strings.Repeat("# 0123456789abcdef0123456789abcdef\n", 16000) + "Disallow: /after-540k\n"))
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>should be blocked</html>"))
+		}
+	}))
+	c.allow = func(u *url.URL) error {
+		if u.Hostname() == "127.0.0.1" {
+			return fmt.Errorf("refusing connection to non-public IP 127.0.0.1")
+		}
+		return nil
+	}
+	fixedNow := time.Unix(1_750_000_000, 0)
+	c.Now = func() time.Time { return fixedNow }
+
+	out := c.Run(context.Background(), []Request{
+		{ID: "six", URL: "http://six-redir.test/page", Kind: classify.KindPage},
+		{ID: "five", URL: "http://five-redir.test/locked", Kind: classify.KindPage},
+		{ID: "ssrf6", URL: "http://six-redir-ssrf.test/page", Kind: classify.KindPage},
+		{ID: "pad", URL: "http://pad-540k.test/after-540k", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+
+	if out[0].Outcome != classify.OutcomeOK || sixRedirHops.Load() != 6 {
+		t.Fatalf("RFC 9309 §2.3.1.2: >5 valid public redirects on /robots.txt must be unavailable (allow all after 6 hops), got hops=%d res=%+v", sixRedirHops.Load(), out[0])
+	}
+	if out[1].Outcome != classify.OutcomeSkip {
+		t.Fatalf("expected 5th redirect /robots.txt Disallow: /locked enforced, got %+v", out[1])
+	}
+	if exp := c.hostStateFor("five-redir.test").CachedRobots(fixedNow).ExpiresAt; !exp.Equal(fixedNow.Add(120 * time.Second)) {
+		t.Fatalf("expected Cache-Control max-age=120s honored, got %v", exp.Sub(fixedNow))
+	}
+	if out[2].Outcome != classify.OutcomeStop || !strings.HasPrefix(out[2].Problem, "robots_unreachable: ") {
+		t.Fatalf("expected SSRF redirect on hop 5 to fail closed with robots_unreachable prefix, got %+v", out[2])
+	}
+	if out[3].Outcome != classify.OutcomeSkip {
+		t.Fatalf("expected 540 KiB /robots.txt rule enforced under 1 MiB cap, got %+v", out[3])
+	}
+	if exp := c.hostStateFor("pad-540k.test").CachedRobots(fixedNow).ExpiresAt; !exp.Equal(fixedNow.Add(60 * time.Second)) {
+		t.Fatalf("expected Cache-Control max-age=5 clamped to 60s floor, got %v", exp.Sub(fixedNow))
+	}
+}
+
+func TestHimiwayCallerDeadlineDoesNotPoisonRobotsCache(t *testing.T) {
+	var robotsHits atomic.Int32
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			robotsHits.Add(1)
+			time.Sleep(60 * time.Millisecond)
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("User-agent: *\nAllow: /\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html>himiway ok</html>"))
+	}))
+
+	// 1. Pre-cancelled context must abort immediately WITHOUT touching network or poisoning HostState.
+	cancelledCtx, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	_ = c.Run(cancelledCtx, []Request{{ID: "pre", URL: "http://himiway.test/bikes", Kind: classify.KindPage}}, Options{})
+	if c.hostStateFor("himiway.test").CachedRobots(c.Now()) != nil || robotsHits.Load() != 0 {
+		t.Fatalf("pre-cancelled context must not fetch or cache robots.txt (hits=%d)", robotsHits.Load())
+	}
+
+	// 2. Caller context expiring mid-flight (25ms < 60ms robots latency) must NOT abort /robots.txt or poison cache!
+	shortCtx, cancelShort := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelShort()
+	_ = c.Run(shortCtx, []Request{{ID: "c1", URL: "http://himiway.test/bikes", Kind: classify.KindPage}}, Options{})
+
+	cached := c.hostStateFor("himiway.test").CachedRobots(c.Now())
+	if cached == nil || cached.Distressed {
+		t.Fatalf("Himiway bug: expiring caller deadline poisoned HostState robots cache: %+v", cached)
+	}
+
+	// Next caller immediately succeeds using the clean cached /robots.txt without another /robots.txt round-trip!
+	res2 := c.Run(context.Background(), []Request{{ID: "c2", URL: "http://himiway.test/bikes", Kind: classify.KindPage}}, Options{PauseMs: 1})
+	if res2[0].Outcome != classify.OutcomeOK || robotsHits.Load() != 1 {
+		t.Fatalf("expected second caller to succeed with cached robots (hits=%d, res=%+v)", robotsHits.Load(), res2[0])
+	}
+}
+
+func TestThreeStrikesAdaptive429BackoffCooldownAndKindAuto(t *testing.T) {
+	var recoverCalls, threeStrikeCalls, deadlineCalls atomic.Int32
+	c, sleeps := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		switch r.Host {
+		case "recover429.test":
+			n := recoverCalls.Add(1)
+			if n == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			if n == 2 {
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>recovered on strike 3</html>"))
+
+		case "out429.test":
+			threeStrikeCalls.Add(1)
+			w.Header().Set("Retry-After", "3")
+			w.WriteHeader(http.StatusTooManyRequests)
+
+		case "deadline429.test":
+			deadlineCalls.Add(1)
+			w.Header().Set("Retry-After", "20")
+			w.WriteHeader(http.StatusTooManyRequests)
+
+		case "auto-kind.test":
+			switch r.URL.Path {
+			case "/api.json":
+				w.Header().Set("Content-Type", "application/problem+json")
+				_, _ = w.Write([]byte(`{"status":200}`))
+			case "/feed.xml":
+				w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+				_, _ = w.Write([]byte(`<rss version="2.0"></rss>`))
+			case "/readme.txt":
+				w.Header().Set("Content-Type", "text/plain")
+				_, _ = w.Write([]byte("plain text"))
+			}
+		}
+	}))
+
+	// 1. Strike 1 (429 no Retry-After -> 4s+0.5s=4.5s) + Strike 2 (429 Retry-After:2 -> 2s+250ms+250ms=2.5s) -> Strike 3 200 OK!
+	recRes := c.Run(context.Background(), []Request{
+		{ID: "rec", URL: "http://recover429.test/items", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	if recRes[0].Outcome != classify.OutcomeOK || recRes[0].Attempts != 3 || recoverCalls.Load() != 3 {
+		t.Fatalf("expected 429 recovery on Strike 3, got %+v (calls=%d)", recRes[0], recoverCalls.Load())
+	}
+	if len(sleeps.all) != 2 || sleeps.all[0] != 4500*time.Millisecond || sleeps.all[1] != 2500*time.Millisecond {
+		t.Fatalf("unexpected adaptive 429 sleeps: %v", sleeps.all)
+	}
+
+	// 2. 3 strikes and you're out: stops at exactly 3 attempts with Status 429 and RetryAfterMs=3000.
+	outRes := c.Run(context.Background(), []Request{
+		{ID: "out", URL: "http://out429.test/items", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	if outRes[0].Status != http.StatusTooManyRequests || outRes[0].Outcome != classify.OutcomeStop || outRes[0].Attempts != 3 || outRes[0].RetryAfterMs != 3000 || threeStrikeCalls.Load() != 3 {
+		t.Fatalf("expected 3 strikes and out (429 stop, RetryAfterMs=3000), got %+v", outRes[0])
+	}
+
+	// 3. Deadline guard: Retry-After: 20 exceeds 5s caller deadline -> breaks on Strike 1 without sleeping!
+	sleeps.all = nil
+	dlCtx, dlCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dlCancel()
+	dlRes := c.Run(dlCtx, []Request{
+		{ID: "dl", URL: "http://deadline429.test/items", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	if dlRes[0].Status != http.StatusTooManyRequests || dlRes[0].Attempts != 1 || dlRes[0].RetryAfterMs != 20000 || len(sleeps.all) != 0 || deadlineCalls.Load() != 1 {
+		t.Fatalf("expected deadline guard to break on Strike 1 with 0 sleeps, got %+v (sleeps=%v)", dlRes[0], sleeps.all)
+	}
+
+	// 4. Concurrent caller whose Acquire expires while host is cooling down from 429 gets Status 429 + RetryAfterMs!
+	hs := c.hostStateFor("deadline429.test")
+	_ = hs.Acquire(context.Background())
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer waitCancel()
+	cdRes := c.Run(waitCtx, []Request{
+		{ID: "cd", URL: "http://deadline429.test/other", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	hs.Release()
+	if cdRes[0].Status != http.StatusTooManyRequests || cdRes[0].Outcome != classify.OutcomeStop || cdRes[0].RetryAfterMs <= 0 || !strings.Contains(cdRes[0].Problem, "HTTP 429 host cooling down") {
+		t.Fatalf("expected cooling-down host Acquire timeout to report 429 + RetryAfterMs, got %+v", cdRes[0])
+	}
+
+	// 5. KindAuto == true (and empty Kind == "") accepts JSON, RSS/XML, and text/plain as OutcomeOK.
+	autoRes := c.Run(context.Background(), []Request{
+		{ID: "a1", URL: "http://auto-kind.test/api.json", Kind: classify.KindPage, KindAuto: true},
+		{ID: "a2", URL: "http://auto-kind.test/feed.xml", Kind: ""},
+		{ID: "a3", URL: "http://auto-kind.test/readme.txt", Kind: classify.KindPage, KindAuto: true},
+	}, Options{PauseMs: 1, IncludeBody: true})
+	for idx, r := range autoRes {
+		if r.Outcome != classify.OutcomeOK {
+			t.Fatalf("KindAuto request %d failed: %+v", idx, r)
+		}
+	}
+}
+
+func TestCuratedSafeResponseHeadersAndWarmUp(t *testing.T) {
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Server", "  cloudflare  ")
+		w.Header().Set("X-Powered-By", "Next.js")
+		w.Header().Set("X-Shopify-Stage", "production")
+		w.Header().Set("Link", strings.Repeat("L", 700))
+		w.Header().Set("Set-Cookie", "sid=TOP_SECRET_SESSION_COOKIE; HttpOnly")
+		w.Header().Set("X-Internal-Secret", "do-not-expose")
+		_, _ = w.Write([]byte("<html><body>ok</body></html>"))
+	}))
+	c.SetRenderer(browser.NewMockRenderer("ws://127.0.0.1:1", nil, DefaultUserAgent))
+	defer c.Close()
+
+	if err := c.WarmUp(context.Background()); err != nil {
+		t.Fatalf("WarmUp failed: %v", err)
+	}
+	var uninit Crawler
+	if err := uninit.WarmUp(context.Background()); err == nil {
+		t.Fatal("expected uninitialized Crawler.WarmUp to fail")
+	}
+
+	res := c.Run(context.Background(), []Request{
+		{ID: "hdrs", URL: "http://shop.test/products", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	if len(res) != 1 || res[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected OutcomeOK, got %+v", res)
+	}
+	hdrs := res[0].ResponseHeaders
+	if hdrs["server"] != "cloudflare" || hdrs["x-powered-by"] != "Next.js" || hdrs["x-shopify-stage"] != "production" {
+		t.Fatalf("expected curated response headers, got %+v", hdrs)
+	}
+	if len(hdrs["link"]) != 512 {
+		t.Fatalf("expected Link header capped at 512 bytes, got %d", len(hdrs["link"]))
+	}
+	if _, leaked := hdrs["set-cookie"]; leaked {
+		t.Fatalf("SECURITY: Set-Cookie must never appear in ResponseHeaders: %+v", hdrs)
+	}
+	if _, leaked := hdrs["x-internal-secret"]; leaked {
+		t.Fatalf("unexpected non-allowlisted header in ResponseHeaders: %+v", hdrs)
+	}
+}

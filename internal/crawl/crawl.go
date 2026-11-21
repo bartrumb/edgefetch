@@ -34,7 +34,7 @@ import (
 
 // DefaultUserAgent is sent when no custom User-Agent is configured. Always identify crawlers honestly
 // (includes contact mailto for SEC EDGAR Fair Access & OpenAlex/Crossref/NCBI Polite Pools).
-const DefaultUserAgent = "EdgeFetch/2.5 (bot@edgefetch.dev)"
+const DefaultUserAgent = "EdgeFetch/2.6 (bot@edgefetch.dev)"
 
 // InteractSpec configures stateful or single-turn headless Chromium interaction (`firecrawl_interact` parity).
 type InteractSpec struct {
@@ -52,6 +52,7 @@ type Request struct {
 	RequestBody        string            `json:"requestBody,omitempty"` // Optional UTF-8 POST body when Method == "POST"
 	ContentType        string            `json:"contentType,omitempty"` // Optional Content-Type header when Method == "POST"
 	Kind               classify.Kind     `json:"kind"`
+	KindAuto           bool              `json:"kindAuto,omitempty"`
 	Accept             string            `json:"accept,omitempty"`
 	IfNoneMatch        string            `json:"ifNoneMatch,omitempty"`
 	IfModifiedSince    string            `json:"ifModifiedSince,omitempty"`
@@ -110,6 +111,7 @@ type Result struct {
 	Status            int                            `json:"status"`
 	ContentType       string                         `json:"contentType,omitempty"`
 	ContentSource     string                         `json:"contentSource,omitempty"`
+	ResponseHeaders   map[string]string              `json:"headers,omitempty"`
 	CfMitigated       string                         `json:"cfMitigated,omitempty"`
 	WAF               *classify.WAFMatch             `json:"waf,omitempty"`
 	ETag              string                         `json:"etag,omitempty"`
@@ -381,6 +383,25 @@ func (c *Crawler) Close() error {
 	return c.renderer.Close()
 }
 
+// WarmUp verifies crawler HTTP client readiness and probes headless browser version/sandbox state when configured.
+func (c *Crawler) WarmUp(ctx context.Context) error {
+	if c == nil || c.client == nil {
+		return errors.New("crawler HTTP client is not initialized")
+	}
+	if c.renderer != nil {
+		c.renderer.ProbeStartup(ctx)
+	}
+	return nil
+}
+
+// BrowserInfo returns the detected headless Chromium version and OS sandbox state ("on", "off", or "unknown").
+func (c *Crawler) BrowserInfo() (string, string) {
+	if c == nil || c.renderer == nil {
+		return "", ""
+	}
+	return c.renderer.BrowserInfo()
+}
+
 // Capabilities returns the runtime feature tokens advertised in `X-Agent-Capabilities` (`artifacts-v1`, plus
 // `browser-v1` when Chromium is present and `pdf-v1` when Poppler `pdftotext` is installed).
 func (c *Crawler) Capabilities() []string {
@@ -536,8 +557,13 @@ func (c *Crawler) RunWithSink(ctx context.Context, reqs []Request, opts Options,
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
+			remMs := c.hostStateFor(h).CoolingDownRetryAfterMs(c.Now())
 			for _, i := range idx {
-				results[i] = notTried(reqs[i], "crawl cancelled")
+				if remMs > 0 {
+					results[i] = rateLimitedCooldownResult(reqs[i], remMs)
+				} else {
+					results[i] = notTried(reqs[i], "crawl cancelled")
+				}
 			}
 			continue
 		}
@@ -550,7 +576,17 @@ func (c *Crawler) RunWithSink(ctx context.Context, reqs []Request, opts Options,
 			stopped := ""
 			for n, i := range idx {
 				r := reqs[i]
+				if r.Kind == "" {
+					r.Kind = classify.KindPage
+					r.KindAuto = true
+				}
 				if stopped != "" {
+					if stopped == "crawl cancelled" {
+						if remMs := c.hostStateFor(host).CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
+							results[i] = rateLimitedCooldownResult(r, remMs)
+							continue
+						}
+					}
 					results[i] = notTried(r, stopped)
 					continue
 				}
@@ -609,6 +645,10 @@ func (c *Crawler) runRequestWithRedirects(
 	minPause, maxJitter, gap time.Duration,
 	log *slog.Logger,
 ) (Result, bool) {
+	if origReq.Kind == "" {
+		origReq.Kind = classify.KindPage
+		origReq.KindAuto = true
+	}
 	if err := ValidateCustomHeaders(origReq.Headers); err != nil {
 		return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: err.Error()}, false
 	}
@@ -627,6 +667,9 @@ func (c *Crawler) runRequestWithRedirects(
 		curHost := hostOf(origReq.URL)
 		hs := c.hostStateFor(curHost)
 		if err := hs.Acquire(ctx); err != nil {
+			if remMs := hs.CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
+				return rateLimitedCooldownResult(origReq, remMs), true
+			}
 			return notTried(origReq, "crawl cancelled"), true
 		}
 		if why := hs.CheckCircuit(c.Now(), curHost); why != "" {
@@ -651,11 +694,17 @@ func (c *Crawler) runRequestWithRedirects(
 		if waitDur > 0 {
 			if err := c.Sleep(ctx, waitDur); err != nil {
 				hs.Release()
+				if remMs := hs.CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
+					return rateLimitedCooldownResult(origReq, remMs), true
+				}
 				return notTried(origReq, "crawl cancelled"), true
 			}
 		}
 		if err := c.waitGlobalGap(ctx, gap); err != nil {
 			hs.Release()
+			if remMs := hs.CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
+				return rateLimitedCooldownResult(origReq, remMs), true
+			}
 			return notTried(origReq, "crawl cancelled"), true
 		}
 		if c.shouldCheckRobots(curHost, opts) {
@@ -704,6 +753,9 @@ func (c *Crawler) runRequestWithRedirects(
 		curHost := hostOf(curURLStr)
 		hs := c.hostStateFor(curHost)
 		if err := hs.Acquire(ctx); err != nil {
+			if remMs := hs.CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
+				return rateLimitedCooldownResult(origReq, remMs), true
+			}
 			return notTried(origReq, "crawl cancelled"), true
 		}
 
@@ -730,6 +782,9 @@ func (c *Crawler) runRequestWithRedirects(
 		if waitDur > 0 {
 			if err := c.Sleep(ctx, waitDur); err != nil {
 				hs.Release()
+				if remMs := hs.CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
+					return rateLimitedCooldownResult(origReq, remMs), true
+				}
 				return notTried(origReq, "crawl cancelled"), true
 			}
 		}
@@ -737,6 +792,9 @@ func (c *Crawler) runRequestWithRedirects(
 
 		if err := c.waitGlobalGap(ctx, gap); err != nil {
 			hs.Release()
+			if remMs := hs.CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
+				return rateLimitedCooldownResult(origReq, remMs), true
+			}
 			return notTried(origReq, "crawl cancelled"), true
 		}
 
@@ -793,12 +851,12 @@ func (c *Crawler) runRequestWithRedirects(
 		if maxJitter > 0 {
 			nextFloor += c.Jitter(maxJitter)
 		}
-		throttled := res.Status == http.StatusTooManyRequests || res.Status == http.StatusServiceUnavailable || res.Outcome == classify.OutcomeChallenge
+		throttled := res.Status == http.StatusTooManyRequests || res.Status == http.StatusServiceUnavailable || res.Outcome == classify.OutcomeChallenge || res.Outcome == classify.OutcomeRateLimited
 		transientDead := (res.Status == 0 && res.Outcome == classify.OutcomeError) || retriableStatus(res.Status)
 		hs.RecordOutcome(c.Now(), nextFloor, retryAfter, res.Status, throttled, transientDead)
 		hs.Release()
 
-		if gap > 0 && (res.Outcome == classify.OutcomeChallenge || res.Status == http.StatusTooManyRequests) {
+		if gap > 0 && (res.Outcome == classify.OutcomeChallenge || res.Outcome == classify.OutcomeRateLimited || res.Status == http.StatusTooManyRequests) {
 			cool := politeness.DefaultThrottlePause
 			if retryAfter > cool {
 				cool = retryAfter
@@ -848,6 +906,9 @@ func (c *Crawler) runRequestWithRedirects(
 			if renderedRes.Outcome == classify.OutcomeOK || renderedRes.Outcome == classify.OutcomeChallenge {
 				renderedRes.ID = origReq.ID
 				renderedRes.URL = origReq.URL
+				if len(renderedRes.ResponseHeaders) == 0 && len(res.ResponseHeaders) > 0 {
+					renderedRes.ResponseHeaders = res.ResponseHeaders
+				}
 				c.logResult(ctx, log, origReq, renderedRes)
 				return renderedRes, false
 			}
@@ -863,7 +924,27 @@ func (c *Crawler) runRequestWithRedirects(
 }
 
 func notTried(r Request, why string) Result {
-	return Result{ID: r.ID, URL: r.URL, Kind: r.Kind, Outcome: classify.OutcomeNotTried, Problem: why}
+	k := r.Kind
+	if k == "" {
+		k = classify.KindPage
+	}
+	return Result{ID: r.ID, URL: r.URL, Kind: k, Outcome: classify.OutcomeNotTried, Problem: why}
+}
+
+func rateLimitedCooldownResult(r Request, remMs int64) Result {
+	k := r.Kind
+	if k == "" {
+		k = classify.KindPage
+	}
+	return Result{
+		ID:           r.ID,
+		URL:          r.URL,
+		Kind:         k,
+		Status:       http.StatusTooManyRequests,
+		RetryAfterMs: remMs,
+		Outcome:      classify.OutcomeStop,
+		Problem:      fmt.Sprintf("HTTP 429 host cooling down (%dms remaining)", remMs),
+	}
 }
 
 func hostOf(raw string) string {
@@ -899,6 +980,69 @@ func isPermanentFetchError(err error) bool {
 	return strings.Contains(msg, "refusing connection to non-public IP") || strings.Contains(msg, "unsupported protocol scheme")
 }
 
+const maxCuratedResponseHeaderBytes = 512
+
+var safeResponseHeaderAllowlist = []string{
+	"server",
+	"powered-by",
+	"x-powered-by",
+	"x-generator",
+	"x-shopid",
+	"x-shopify-stage",
+	"x-wix-request-id",
+	"x-drupal-cache",
+	"x-drupal-dynamic-cache",
+	"x-nextjs-cache",
+	"x-remix-response",
+	"x-vercel-id",
+	"x-nf-request-id",
+	"x-github-request-id",
+	"x-hs-hub-id",
+	"x-typo3-parsetime",
+	"cf-ray",
+	"cf-cache-status",
+	"cf-mitigated",
+	"via",
+	"vary",
+	"link",
+	"x-robots-tag",
+	"content-signal",
+	"x-markdown-tokens",
+	"cache-control",
+}
+
+func extractSafeResponseHeaders(h http.Header) map[string]string {
+	if len(h) == 0 {
+		return nil
+	}
+	var out map[string]string
+	for _, key := range safeResponseHeaderAllowlist {
+		vals := h.Values(key)
+		if len(vals) == 0 {
+			vals = h[key]
+		}
+		if len(vals) == 0 {
+			continue
+		}
+		val := strings.TrimSpace(strings.Join(vals, ", "))
+		if val == "" {
+			continue
+		}
+		if len(val) > maxCuratedResponseHeaderBytes {
+			cut := maxCuratedResponseHeaderBytes
+			for cut > 0 && !utf8.RuneStart(val[cut]) {
+				cut--
+			}
+			val = val[:cut]
+		}
+		if out == nil {
+			out = make(map[string]string, 4)
+		}
+		out[key] = val
+	}
+	return out
+}
+
 type streamedPDFResult struct {
 	rawBytes    int
 	sha256Hex   string
@@ -908,6 +1052,10 @@ type streamedPDFResult struct {
 }
 
 func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (Result, string, []byte) {
+	if r.Kind == "" {
+		r.Kind = classify.KindPage
+		r.KindAuto = true
+	}
 	res := Result{ID: r.ID, URL: r.URL, Kind: r.Kind}
 	accept, err := classify.AcceptFor(r.Kind, r.Accept)
 	if err != nil {
@@ -942,13 +1090,37 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 		res.Bytes = len(body)
 		res.Truncated = truncated
 		res.ContentType = header.Get("content-type")
+		res.ResponseHeaders = extractSafeResponseHeaders(header)
 		res.CfMitigated = header.Get("cf-mitigated")
 		res.ETag = header.Get("etag")
 		res.LastModified = header.Get("last-modified")
 		res.RetryAfter = header.Get("retry-after")
 		redirectLoc = strings.TrimSpace(header.Get("location"))
-		if ra := politeness.ParseRetryAfter(res.RetryAfter, c.Now()); ra > 0 {
+		res.RetryAfterMs = 0
+		ra := politeness.ParseRetryAfter(res.RetryAfter, c.Now())
+		if ra > 0 {
 			res.RetryAfterMs = ra.Milliseconds()
+		} else if status == http.StatusTooManyRequests && res.CfMitigated == "" {
+			res.RetryAfterMs = politeness.DefaultThrottlePause.Milliseconds()
+		}
+
+		// 3-Strikes Adaptive 429 Backoff ("3 strikes and you're out!"):
+		// Retry non-challenge HTTP 429 on Strike 1 and Strike 2 when enough caller budget remains.
+		if status == http.StatusTooManyRequests && res.CfMitigated == "" && classify.ClassifyWAF(status, header, body) == nil && attempt < 3 {
+			var wait time.Duration
+			if ra > 0 {
+				wait = ra + 250*time.Millisecond + c.Jitter(500*time.Millisecond)
+			} else if attempt == 1 {
+				wait = 4*time.Second + c.Jitter(time.Second)
+			} else {
+				wait = 10*time.Second + c.Jitter(2*time.Second)
+			}
+			if deadline, hasDeadline := ctx.Deadline(); !hasDeadline || !c.Now().Add(wait+1500*time.Millisecond).After(deadline) {
+				c.hostStateFor(hostOf(r.URL)).NoteRateLimit(c.Now(), wait)
+				if c.Sleep(ctx, wait) == nil {
+					continue
+				}
+			}
 		}
 
 		if isRedirectStatus(status) && redirectLoc != "" && res.CfMitigated == "" {
@@ -996,7 +1168,7 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 			res.Outcome, res.Problem = classify.OutcomeOK, ""
 		} else {
 			res.WAF = classify.ClassifyWAF(status, header, body)
-			res.Outcome, res.Problem = classify.Classify(r.Kind, status, header, body)
+			res.Outcome, res.Problem = classify.ClassifyAuto(r.Kind, r.KindAuto, status, header, body)
 		}
 		finalBody = body
 		if pdfStream == nil && opts.IncludeBody {
@@ -1088,7 +1260,7 @@ func resolveMaxStreamingPDFBytes(opts Options) int {
 func (c *Crawler) logResult(ctx context.Context, log *slog.Logger, r Request, res Result) {
 	level := slog.LevelInfo
 	switch res.Outcome {
-	case classify.OutcomeChallenge, classify.OutcomeStop, classify.OutcomePaymentRequired:
+	case classify.OutcomeChallenge, classify.OutcomeStop, classify.OutcomeRateLimited, classify.OutcomePaymentRequired:
 		level = slog.LevelWarn
 	case classify.OutcomeError:
 		level = slog.LevelError
@@ -1295,6 +1467,37 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	return resp.StatusCode, resp.Header, limited, truncated, opts.MaxBytes, nil, tm, nil
 }
 
+func parseRobotsCacheTTL(header http.Header) time.Duration {
+	const (
+		minTTL  = 60 * time.Second
+		maxSecs = int64(politeness.RobotsCacheTTL / time.Second)
+	)
+	for _, rawVal := range header.Values("Cache-Control") {
+		for _, dir := range strings.Split(rawVal, ",") {
+			k, v, ok := strings.Cut(dir, "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(k), "max-age") {
+				continue
+			}
+			v = strings.TrimSpace(v)
+			if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+				v = strings.TrimSpace(v[1 : len(v)-1])
+			}
+			if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+				if secs < int64(minTTL/time.Second) {
+					return minTTL
+				}
+				if secs >= maxSecs {
+					return politeness.RobotsCacheTTL
+				}
+				return time.Duration(secs) * time.Second
+			} else if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(v, "-") {
+				return politeness.RobotsCacheTTL
+			}
+		}
+	}
+	return politeness.RobotsCacheTTL
+}
+
 func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, rawURL string) (allowed, distressed bool, reason string) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -1303,14 +1506,21 @@ func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, raw
 	now := c.Now()
 	entry := hs.CachedRobots(now)
 	if entry == nil {
+		if ctx.Err() != nil {
+			return false, true, "robots_unreachable: caller context cancelled before /robots.txt fetch: " + ctx.Err().Error()
+		}
 		var pause time.Duration
 		entry, pause = c.fetchRobots(ctx, u)
-		hs.SetRobots(c.Now(), entry, pause)
+		if !(entry.Distressed && ctx.Err() != nil) {
+			hs.SetRobots(c.Now(), entry, pause)
+		}
 	}
 	if entry.Distressed {
 		msg := entry.Reason
 		if msg == "" {
-			msg = "robots.txt unreachable (disallow assumed per RFC 9309)"
+			msg = "robots_unreachable: robots.txt unreachable (disallow assumed per RFC 9309)"
+		} else if !strings.HasPrefix(msg, "robots_unreachable: ") {
+			msg = "robots_unreachable: " + msg
 		}
 		return false, true, msg
 	}
@@ -1323,12 +1533,20 @@ func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, raw
 	return true, false, ""
 }
 
-// fetchRobots implements RFC 9309 §2.3.1 (following up to MaxRedirects validated redirects, e.g. apex -> www):
-//   - 3xx (up to MaxRedirects hops): validate Location via `c.allow` and follow.
-//   - 2xx: parse rules and cache for RobotsCacheTTL (24 h).
-//   - 4xx except 429 (e.g. 404, 403, 410): "unavailable" -> allow all for RobotsCacheTTL (24 h).
-//   - Network/timeout error, body read error, 429, or 5xx: "unreachable" -> disallow all for RobotsDistressTTL (5 m).
+// fetchRobots implements RFC 9309 §2.3.1 & §2.4 (following up to MaxRedirects = 5 validated redirects):
+//   - 3xx (up to 5 consecutive public redirects): validate Location via `c.allow` and follow; > 5 valid redirects -> unavailable (allow all).
+//   - 2xx: parse rules and cache for Cache-Control max-age clamped to [60s, RobotsCacheTTL (24h)].
+//   - 4xx except 429 (e.g. 404, 403, 410): "unavailable" -> allow all for clamped Cache-Control max-age / RobotsCacheTTL (24h).
+//   - Network/timeout error, SSRF redirect failure, body read error, 429, or 5xx: "unreachable" -> disallow all for RobotsDistressTTL (60s).
 func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness.RobotsEntry, time.Duration) {
+	if ctx.Err() != nil {
+		return &politeness.RobotsEntry{
+			Distressed: true,
+			Reason:     "robots_unreachable: caller context cancelled: " + ctx.Err().Error(),
+			ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
+		}, 0
+	}
+	baseCtx := context.WithoutCancel(ctx)
 	curURL := &url.URL{Scheme: target.Scheme, Host: target.Host, Path: "/robots.txt"}
 
 	for hop := 0; hop <= MaxRedirects; hop++ {
@@ -1336,7 +1554,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			if err := c.allow(curURL); err != nil {
 				return &politeness.RobotsEntry{
 					Distressed: true,
-					Reason:     "robots.txt disallowed redirect target: " + err.Error(),
+					Reason:     "robots_unreachable: robots.txt disallowed redirect target: " + err.Error(),
 					ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 				}, politeness.DefaultThrottlePause
 			}
@@ -1349,13 +1567,13 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			if robAttempt == 1 {
 				attemptTimeout = politeness.RobotsTimeout + 3*time.Second
 			}
-			rctxAttempt, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
+			rctxAttempt, cancelAttempt := context.WithTimeout(baseCtx, attemptTimeout)
 			req, reqErr := http.NewRequestWithContext(rctxAttempt, http.MethodGet, curURL.String(), nil)
 			if reqErr != nil {
 				cancelAttempt()
 				return &politeness.RobotsEntry{
 					Distressed: true,
-					Reason:     "robots.txt request invalid: " + reqErr.Error(),
+					Reason:     "robots_unreachable: robots.txt request invalid: " + reqErr.Error(),
 					ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 				}, politeness.DefaultThrottlePause
 			}
@@ -1377,9 +1595,9 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			}
 		}
 		if err != nil {
-			prefixMsg := "robots.txt unreachable (disallow assumed per RFC 9309): "
+			prefixMsg := "robots_unreachable: robots.txt unreachable (disallow assumed per RFC 9309): "
 			if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
-				prefixMsg = "robots.txt timed out after retry (disallow assumed per RFC 9309): "
+				prefixMsg = "robots_unreachable: timed out fetching /robots.txt (disallow assumed per RFC 9309): "
 			}
 			return &politeness.RobotsEntry{
 				Distressed: true,
@@ -1396,14 +1614,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			if loc == "" {
 				return &politeness.RobotsEntry{
 					Distressed: true,
-					Reason:     fmt.Sprintf("robots.txt redirect HTTP %d missing Location", resp.StatusCode),
-					ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
-				}, politeness.DefaultThrottlePause
-			}
-			if hop == MaxRedirects {
-				return &politeness.RobotsEntry{
-					Distressed: true,
-					Reason:     fmt.Sprintf("robots.txt exceeded %d redirects", MaxRedirects),
+					Reason:     fmt.Sprintf("robots_unreachable: robots.txt redirect HTTP %d missing Location", resp.StatusCode),
 					ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 				}, politeness.DefaultThrottlePause
 			}
@@ -1411,11 +1622,25 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			if parseErr != nil {
 				return &politeness.RobotsEntry{
 					Distressed: true,
-					Reason:     "robots.txt invalid redirect Location: " + parseErr.Error(),
+					Reason:     "robots_unreachable: robots.txt invalid redirect Location: " + parseErr.Error(),
 					ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 				}, politeness.DefaultThrottlePause
 			}
-			curURL = curURL.ResolveReference(locURL)
+			nextURL := curURL.ResolveReference(locURL)
+			if c.allow != nil {
+				if err := c.allow(nextURL); err != nil {
+					return &politeness.RobotsEntry{
+						Distressed: true,
+						Reason:     "robots_unreachable: robots.txt disallowed redirect target: " + err.Error(),
+						ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
+					}, politeness.DefaultThrottlePause
+				}
+			}
+			if hop == MaxRedirects {
+				// RFC 9309 §2.3.1.2: > 5 consecutive valid redirects -> treat /robots.txt as unavailable (allow all).
+				return &politeness.RobotsEntry{ExpiresAt: now.Add(politeness.RobotsCacheTTL)}, 0
+			}
+			curURL = nextURL
 			continue
 		}
 
@@ -1427,19 +1652,20 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			_ = resp.Body.Close()
 			return &politeness.RobotsEntry{
 				Distressed: true,
-				Reason:     fmt.Sprintf("robots.txt returned HTTP %d (disallow assumed per RFC 9309)", resp.StatusCode),
+				Reason:     fmt.Sprintf("robots_unreachable: /robots.txt returned HTTP %d (disallow assumed per RFC 9309)", resp.StatusCode),
 				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 			}, pause
 		}
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			ttl := parseRobotsCacheTTL(resp.Header)
 			_ = resp.Body.Close()
-			return &politeness.RobotsEntry{ExpiresAt: now.Add(politeness.RobotsCacheTTL)}, 0
+			return &politeness.RobotsEntry{ExpiresAt: now.Add(ttl)}, 0
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			_ = resp.Body.Close()
 			return &politeness.RobotsEntry{
 				Distressed: true,
-				Reason:     fmt.Sprintf("robots.txt returned unexpected HTTP %d", resp.StatusCode),
+				Reason:     fmt.Sprintf("robots_unreachable: /robots.txt returned unexpected HTTP %d", resp.StatusCode),
 				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 			}, politeness.DefaultThrottlePause
 		}
@@ -1448,23 +1674,20 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 		if err != nil {
 			return &politeness.RobotsEntry{
 				Distressed: true,
-				Reason:     "robots.txt read failed (disallow assumed per RFC 9309): " + err.Error(),
+				Reason:     "robots_unreachable: /robots.txt read failed (disallow assumed per RFC 9309): " + err.Error(),
 				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 			}, politeness.DefaultThrottlePause
 		}
 
+		ttl := parseRobotsCacheTTL(resp.Header)
 		uaProduct := strings.ToLower(c.userAgent)
 		if slash := strings.IndexByte(uaProduct, '/'); slash > 0 {
 			uaProduct = uaProduct[:slash]
 		}
-		return politeness.ParseRobotsTxt(string(raw), uaProduct, now.Add(politeness.RobotsCacheTTL)), 0
+		return politeness.ParseRobotsTxt(string(raw), uaProduct, now.Add(ttl)), 0
 	}
 
-	return &politeness.RobotsEntry{
-		Distressed: true,
-		Reason:     fmt.Sprintf("robots.txt exceeded %d redirects", MaxRedirects),
-		ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
-	}, politeness.DefaultThrottlePause
+	return &politeness.RobotsEntry{ExpiresAt: c.Now().Add(politeness.RobotsCacheTTL)}, 0
 }
 
 // Summary aggregates outcome and status-code histograms across a `FetchReply`.

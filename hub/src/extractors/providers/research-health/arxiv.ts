@@ -1,4 +1,9 @@
-import { defineAdapter } from '../../types';
+import {
+  attrHasTokenLinear,
+  defineAdapter,
+  findAllElementInnersLinear,
+  findElementInnerLinear,
+} from '../../types';
 import { extractAllMetaContents, extractMetaContent, stripScriptsAndStyles, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -16,20 +21,22 @@ export default defineAdapter({
     const clean = stripScriptsAndStyles(rawHtml);
     const title =
       extractMetaContent(rawHtml, 'citation_title') ||
-      stripTagsInline(/<h1\b[^>]*\btitle\b[^>]*>([\s\S]*?)<\/h1>/i.exec(clean)?.[1] ?? '').replace(/^Title:\s*/i, '');
+      stripTagsInline(findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'title')) ?? '').replace(/^Title:\s*/i, '');
     if (!title) return null;
 
     const metaAuthors = extractAllMetaContents(rawHtml, 'citation_author');
-    const domAuthors = [...clean.matchAll(/<div\b[^>]*\bauthors\b[^>]*>([\s\S]*?)<\/div>/gi)]
-      .flatMap((am) => [...am[1]!.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi)].map((x) => stripTagsInline(x[1]!)))
+    const domAuthors = findAllElementInnersLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'authors'), 5)
+      .flatMap((am) => findAllElementInnersLinear(am, 'a', undefined, 50).map((x) => stripTagsInline(x)))
       .filter(Boolean);
     const authors = (metaAuthors.length > 0 ? metaAuthors : domAuthors).slice(0, 20);
 
     const date = extractMetaContent(rawHtml, 'citation_date') || extractMetaContent(rawHtml, 'citation_online_date');
     const doi = extractMetaContent(rawHtml, 'citation_doi');
-    const primarySubject = stripTagsInline(/<span\b[^>]*\bprimary-subject\b[^>]*>([\s\S]*?)<\/span>/i.exec(clean)?.[1] ?? '');
+    const primarySubject = stripTagsInline(
+      findElementInnerLinear(clean, 'span', (a) => attrHasTokenLinear(a, 'class', 'primary-subject')) ?? '',
+    );
 
-    const absBlock = /<blockquote\b[^>]*\babstract\b[^>]*>([\s\S]*?)<\/blockquote>/i.exec(clean)?.[1] ?? '';
+    const absBlock = findElementInnerLinear(clean, 'blockquote', (a) => attrHasTokenLinear(a, 'class', 'abstract')) ?? '';
     const abstract = stripTagsInline(absBlock).replace(/^Abstract:\s*/i, '').trim() || extractMetaContent(rawHtml, 'citation_abstract');
     if (!abstract) return null;
 

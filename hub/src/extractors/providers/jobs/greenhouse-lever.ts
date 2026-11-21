@@ -5,7 +5,7 @@ export default defineAdapter({
   id: 'greenhouse-lever-boards',
   name: 'Greenhouse & Lever Whole-Board + EU APIs',
   category: 'jobs',
-  description: 'Upgrades Greenhouse (US & EU) and Lever (US & EU) board root URLs to their official JSON posting feeds.',
+  description: 'Upgrades Greenhouse (US & EU) and Lever (US & EU) board root URLs to their official JSON posting feeds with truncation metadata.',
   domains: [
     'boards.greenhouse.io',
     'job-boards.greenhouse.io',
@@ -38,11 +38,22 @@ export default defineAdapter({
           const data = parseJsonObject(rawBody);
           const jobs = Array.isArray(data?.jobs) ? (data.jobs as Array<Record<string, unknown>>) : null;
           if (!jobs) return null;
-          const title = `${org} — Greenhouse Job Board (${jobs.length} open roles)`;
+          const metaObj = data?.meta as Record<string, unknown> | undefined;
+          const total =
+            typeof metaObj?.total === 'number' && Number.isFinite(metaObj.total)
+              ? Math.max(metaObj.total, jobs.length)
+              : jobs.length;
+          const title = `${org} — Greenhouse Job Board (${total} open roles)`;
           if (jobs.length === 0) {
-            return { title, markdown: `# ${title}\n\nNo open positions currently listed.` };
+            return { title, markdown: `# ${title}\n\nNo open positions currently listed.`, total: 0, returned: 0, truncated: false };
           }
           const links: string[] = [];
+          for (const j of jobs.slice(0, 2000)) {
+            const jUrl = typeof j.absolute_url === 'string' && j.absolute_url.startsWith('https://')
+              ? j.absolute_url
+              : `https://${host}/${org}/jobs/${String(j.id ?? '')}`;
+            links.push(jUrl);
+          }
           const rows = jobs.slice(0, 120).map((j) => {
             const jTitle = String(j.title ?? 'Role').trim();
             const loc = String((j.location as Record<string, unknown> | undefined)?.name ?? '-');
@@ -52,13 +63,18 @@ export default defineAdapter({
             const jUrl = typeof j.absolute_url === 'string' && j.absolute_url.startsWith('https://')
               ? j.absolute_url
               : `https://${host}/${org}/jobs/${String(j.id ?? '')}`;
-            links.push(jUrl);
             return [`[${jTitle}](${jUrl})`, dept, loc, updated];
           });
+          const returned = rows.length;
+          const truncated = total > returned;
           return {
             title,
             markdown: `# ${title}\n\n${formatGfmTable(['Role', 'Department', 'Location', 'Updated'], rows)}`,
             links,
+            total,
+            returned,
+            truncated,
+            ...(truncated ? { nextCursor: String(returned) } : {}),
           };
         },
       };
@@ -77,11 +93,18 @@ export default defineAdapter({
           const parsed = parseJsonValue(rawBody);
           if (!Array.isArray(parsed)) return null;
           const jobs = parsed as Array<Record<string, unknown>>;
-          const title = `${org} — Lever Job Board (${jobs.length} open roles)`;
+          const total = jobs.length;
+          const title = `${org} — Lever Job Board (${total} open roles)`;
           if (jobs.length === 0) {
-            return { title, markdown: `# ${title}\n\nNo open positions currently listed.` };
+            return { title, markdown: `# ${title}\n\nNo open positions currently listed.`, total: 0, returned: 0, truncated: false };
           }
           const links: string[] = [];
+          for (const j of jobs.slice(0, 2000)) {
+            const jUrl = typeof j.hostedUrl === 'string' && j.hostedUrl.startsWith('https://')
+              ? j.hostedUrl
+              : `https://${host}/${org}/${String(j.id ?? '')}`;
+            links.push(jUrl);
+          }
           const rows = jobs.slice(0, 120).map((j) => {
             const jTitle = String(j.text ?? 'Role').trim();
             const cats = (j.categories as Record<string, unknown> | undefined) ?? {};
@@ -91,13 +114,18 @@ export default defineAdapter({
             const jUrl = typeof j.hostedUrl === 'string' && j.hostedUrl.startsWith('https://')
               ? j.hostedUrl
               : `https://${host}/${org}/${String(j.id ?? '')}`;
-            links.push(jUrl);
             return [`[${jTitle}](${jUrl})`, team, loc, wp];
           });
+          const returned = rows.length;
+          const truncated = total > returned;
           return {
             title,
             markdown: `# ${title}\n\n${formatGfmTable(['Role', 'Team', 'Location', 'Workplace'], rows)}`,
             links,
+            total,
+            returned,
+            truncated,
+            ...(truncated ? { nextCursor: String(jobs[returned - 1]?.id ?? returned) } : {}),
           };
         },
       };

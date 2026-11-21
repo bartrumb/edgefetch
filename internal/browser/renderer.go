@@ -415,6 +415,7 @@ func FindChromeBinary() string {
 			return custom
 		}
 	}
+	var snapFallback string
 	for _, candidate := range []string{
 		"chromium-browser",
 		"chromium",
@@ -425,8 +426,17 @@ func FindChromeBinary() string {
 		"brave",
 	} {
 		if p, err := exec.LookPath(candidate); err == nil {
+			if runtime.GOOS == "linux" && isLinuxSnapWrapper(p) {
+				if snapFallback == "" {
+					snapFallback = p
+				}
+				continue
+			}
 			return p
 		}
+	}
+	if snapFallback != "" {
+		return snapFallback
 	}
 
 	switch runtime.GOOS {
@@ -1764,12 +1774,54 @@ func isSandboxStartupFailureText(s string) bool {
 	if !strings.Contains(lower, ":fatal:") {
 		return false
 	}
-	for _, marker := range []string{"zygote_host_impl_linux", "sandbox_linux", "setuid sandbox", "namespace sandbox"} {
+	for _, marker := range []string{
+		"zygote_host_impl_linux",
+		"sandbox_linux",
+		"sandbox_host_linux",
+		"credentials.cc",
+		"setuid sandbox",
+		"namespace sandbox",
+	} {
 		if strings.Contains(lower, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+func isLinuxSnapWrapper(binPath string) bool {
+	if strings.Contains(binPath, "/snap/") {
+		return true
+	}
+	if resolved, err := filepath.EvalSymlinks(binPath); err == nil && strings.Contains(resolved, "/snap/") {
+		return true
+	}
+	st, err := os.Stat(binPath)
+	if err != nil || st.IsDir() || st.Size() > 8192 {
+		return false
+	}
+	raw, err := os.ReadFile(binPath)
+	if err != nil {
+		return false
+	}
+	s := string(raw)
+	return strings.HasPrefix(s, "#!") && (strings.Contains(s, "snap run ") || strings.Contains(s, "/snap/bin/"))
+}
+
+func isLinuxProcessZombieOrDead(pid int) bool {
+	if runtime.GOOS != "linux" || pid <= 0 {
+		return false
+	}
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return true
+	}
+	rparen := bytes.LastIndexByte(raw, ')')
+	if rparen < 0 || rparen+2 >= len(raw) {
+		return false
+	}
+	rest := strings.Fields(string(raw[rparen+1:]))
+	return len(rest) > 0 && (rest[0] == "Z" || rest[0] == "X" || rest[0] == "x")
 }
 
 func isSandboxStartupFailure(err error) bool {
@@ -1836,10 +1888,17 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 	_ = fromChromeWrite.Close()
 
 	var (
-		connHolder   atomic.Pointer[cdpConn]
-		earlyCrashMu sync.Mutex
-		earlyCrash   string
+		connHolder     atomic.Pointer[cdpConn]
+		earlyCrashMu   sync.Mutex
+		earlyCrash     string
+		closePipesOnce sync.Once
 	)
+	closePipes := func() {
+		closePipesOnce.Do(func() {
+			_ = toChromeWrite.Close()
+			_ = fromChromeRead.Close()
+		})
+	}
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
@@ -1852,6 +1911,9 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 				earlyCrashMu.Lock()
 				earlyCrash = startupReason(earlyCrash, txt)
 				earlyCrashMu.Unlock()
+				if strings.Contains(txt, ":FATAL:") || isSandboxStartupFailureText(txt) {
+					closePipes()
+				}
 			}
 		}
 		_, _ = io.Copy(io.Discard, stderr)
@@ -1859,21 +1921,13 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		_ = toChromeWrite.Close()
-		_ = fromChromeRead.Close()
+		closePipes()
 		killBrowserProcessGroup(cmd)
 		_ = os.RemoveAll(userDir)
 		return nil, "", nil, err
 	}
 	secretPath := "/cdp/" + randomSessionID()
 	var accepted atomic.Bool
-	var closePipesOnce sync.Once
-	closePipes := func() {
-		closePipesOnce.Do(func() {
-			_ = toChromeWrite.Close()
-			_ = fromChromeRead.Close()
-		})
-	}
 
 	bridgeSrv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -1985,18 +2039,34 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 		_ = os.RemoveAll(userDir)
 		return nil, "", nil, fmt.Errorf("dial chromium cdp pipe: %w", err)
 	}
-	connHolder.Store(conn)
-	earlyCrashMu.Lock()
-	if earlyCrash != "" {
-		conn.setCrashReason(earlyCrash)
-	}
-	earlyCrashMu.Unlock()
 
 	probeCtx, probeCancel := context.WithTimeout(ctx, startupWait)
+	probeDone := make(chan struct{})
+	if cmd.Process != nil {
+		pid := cmd.Process.Pid
+		go func() {
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-probeDone:
+					return
+				case <-probeCtx.Done():
+					return
+				case <-ticker.C:
+					if isLinuxProcessZombieOrDead(pid) {
+						closePipes()
+						return
+					}
+				}
+			}
+		}()
+	}
 	var verOut struct {
 		Product string `json:"product"`
 	}
 	probeErr := conn.call(probeCtx, "", "Browser.getVersion", nil, &verOut)
+	close(probeDone)
 	probeCancel()
 	if probeErr != nil {
 		closePipes()
@@ -2006,9 +2076,6 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 		if ctx.Err() != nil {
 			return nil, "", nil, ctx.Err()
 		}
-		if errors.Is(probeErr, context.DeadlineExceeded) {
-			return nil, "", nil, errors.New("timed out waiting for chromium DevTools endpoint")
-		}
 		select {
 		case <-stderrDone:
 		case <-time.After(250 * time.Millisecond):
@@ -2016,6 +2083,9 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 		earlyCrashMu.Lock()
 		reason := earlyCrash
 		earlyCrashMu.Unlock()
+		if errors.Is(probeErr, context.DeadlineExceeded) && reason == "" {
+			return nil, "", nil, errors.New("timed out waiting for chromium DevTools endpoint")
+		}
 		msg := "chromium exited before advertising DevTools ws://127.0.0.1 endpoint"
 		if reason != "" {
 			msg += ": " + reason
@@ -2028,6 +2098,12 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 		r.browserVersion = prod
 	}
 	_ = os.Remove(filepath.Join(userDir, "DevToolsActivePort"))
+	earlyCrashMu.Lock()
+	if earlyCrash != "" {
+		conn.setCrashReason(earlyCrash)
+	}
+	earlyCrashMu.Unlock()
+	connHolder.Store(conn)
 	return cmd, userDir, conn, nil
 }
 
@@ -2186,7 +2262,15 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	}
 
 	waitBudget := 15 * time.Second
-	cmd, userDir, conn, launchErr := r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, waitBudget)
+	firstAttemptWait := waitBudget
+	if useSandbox && runtime.GOOS == "linux" {
+		if dl, ok := ctx.Deadline(); ok {
+			if half := time.Until(dl) / 2; half > 2*time.Second && half < firstAttemptWait {
+				firstAttemptWait = half
+			}
+		}
+	}
+	cmd, userDir, conn, launchErr := r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, firstAttemptWait)
 	if launchErr != nil && runtime.GOOS == "linux" && useSandbox && ctx.Err() == nil && isSandboxStartupFailure(launchErr) {
 		if r.requireSandbox {
 			r.sandboxState = "off"

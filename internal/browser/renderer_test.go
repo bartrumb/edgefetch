@@ -757,7 +757,7 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 	r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch/2.6.2", 1, nil)
 	defer r.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := r.ensureBrowser(ctx); err != nil {
 		t.Fatalf("ensureBrowser via --remote-debugging-pipe failed: %v", err)

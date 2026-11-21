@@ -3068,9 +3068,11 @@ async function executeJobsVerifyMode(params: {
       const [key, grp] = batch[j]!;
       const sc = outs[j];
       if (!sc || sc.status !== 200 || sc.body?.ok !== true) {
+        const upstreamStatus =
+          typeof sc?.body?.status === 'number' && sc.body.status > 0 ? sc.body.status : (sc?.status ?? 0);
         boardSnapshots.set(key, {
           boardStatus: classifyAtsBoardStatus({
-            httpStatus: sc?.status ?? 0,
+            httpStatus: upstreamStatus,
             requestedUrl: grp.boardUrl,
             finalUrl: typeof sc?.body?.finalUrl === 'string' ? sc.body.finalUrl : undefined,
           }),
@@ -3141,7 +3143,14 @@ async function executeJobsVerifyMode(params: {
       }).catch(() => null);
       if (!direct) {
         results.push({ url: item.url, status: 'unknown' });
-      } else if (direct.status === 404 || direct.status === 410 || direct.body?.contentState === 'closed_posting' || direct.body?.contentState === 'soft_404') {
+      } else if (
+        direct.status === 404 ||
+        direct.status === 410 ||
+        direct.body?.status === 404 ||
+        direct.body?.status === 410 ||
+        direct.body?.contentState === 'closed_posting' ||
+        direct.body?.contentState === 'soft_404'
+      ) {
         results.push({ url: item.url, status: 'closed' });
       } else if (direct.status === 200 && direct.body?.ok === true) {
         results.push({ url: item.url, status: 'live' });
@@ -3492,8 +3501,10 @@ export async function executeJobsCall(params: {
       const discEntry = discoveredBoards.find((b) => b.boardUrl === origU);
       if (!sc || sc.status !== 200 || sc.body?.ok !== true) {
         if (discEntry) {
+          const upstreamStatus =
+            typeof sc?.body?.status === 'number' && sc.body.status > 0 ? sc.body.status : (sc?.status ?? 0);
           discEntry.boardStatus = classifyAtsBoardStatus({
-            httpStatus: sc?.status ?? 0,
+            httpStatus: upstreamStatus,
             requestedUrl: origU,
             finalUrl: typeof sc?.body?.finalUrl === 'string' ? sc.body.finalUrl : undefined,
           });

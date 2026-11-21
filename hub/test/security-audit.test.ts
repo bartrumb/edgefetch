@@ -18,6 +18,7 @@ import { startPortableHub } from '../portable/portable-server.ts';
 import { S3ArtifactBucket } from '../portable/s3-bucket.ts';
 import { createSafeOutboundFetch, isPublicIpAddress } from '../portable/safe-fetch.ts';
 import { AdapterNetworkForbiddenError, runAdapterSyncInBulkhead } from '../src/adapter-sandbox.ts';
+import { handleAdminRoute } from '../src/admin.ts';
 import {
   AgentHubEngine,
   createMemoryCooldownStore,
@@ -46,7 +47,7 @@ import {
 import { buildDeterministicSummary, completeLlmTurn, resolveLlmConfig } from '../src/llm.ts';
 import { executeMapCall, matchesSafeCrawlPattern } from '../src/map-crawl.ts';
 import { handleMcpRequest, truncateResultBodies } from '../src/mcp.ts';
-import { createMemoryOAuthStore } from '../src/oauth.ts';
+import { ADMIN_COOKIE_NAME, createAdminSessionValue, createMemoryOAuthStore } from '../src/oauth.ts';
 import {
   cloudflareOverflowFetch,
   fetchOverflowRobots,
@@ -2451,4 +2452,34 @@ test('QA-V260-ROUND4: overflow kindAuto text/html fix, Cloudflare vs Mintlify or
   const wdJobs = wdScrape.body.jobs as Array<{ workplaceType: string }>;
   assert.equal(wdJobs[0]?.workplaceType, 'onsite', 'Concrete physical Workday location must infer onsite');
   assert.equal(wdJobs[1]?.workplaceType, 'unknown', 'Ambiguous N Locations count must remain unknown');
+
+  // 8. `/admin` dashboard inline `<script>` must parse cleanly in V8 (regression guard for template-literal `\\` / `\\n` escapes)
+  const adminSecret = 'admin-owner-secret-0123456789abcdef';
+  const adminSess = await createAdminSessionValue(adminSecret);
+  const adminHtmlRes = await handleAdminRoute(
+    new Request('https://hub.example.com/admin', {
+      headers: { cookie: `${ADMIN_COOKIE_NAME}=${adminSess.value}` },
+    }),
+    new URL('https://hub.example.com/admin'),
+    {
+      serviceName: 'EdgeFetch Hub',
+      mcpSlug: 'edgefetch',
+      ownerSecret: adminSecret,
+      oauthStore: createMemoryOAuthStore(),
+      allowedTargets: ['auto', 'agent'],
+      defaultTarget: 'auto',
+      getState: async () => ({ connected: 3, agents: [], affinities: [], grants: [] }),
+      clearAffinities: async () => {},
+      revokeGrant: async () => false,
+      executeFetch: async () => ({ status: 200, via: 'auto', bodyText: '{}' }),
+    },
+  );
+  assert.ok(adminHtmlRes);
+  assert.equal(adminHtmlRes.status, 200);
+  const adminHtml = await adminHtmlRes.text();
+  const scriptOpen = adminHtml.indexOf('<script>');
+  const scriptClose = adminHtml.indexOf('</script>', scriptOpen);
+  assert.ok(scriptOpen > 0 && scriptClose > scriptOpen, '/admin HTML must contain inline <script>');
+  const inlineJs = adminHtml.slice(scriptOpen + '<script>'.length, scriptClose);
+  assert.doesNotThrow(() => new Function(inlineJs), '/admin inline <script> must have zero JS syntax errors');
 });

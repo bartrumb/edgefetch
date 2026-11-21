@@ -312,7 +312,7 @@ export default defineAdapter({
       id: 'icims',
       fetchUrl: twinUrl.toString(),
       kind: 'text',
-      accept: 'text/html,application/xhtml+xml',
+      accept: 'text/html',
       formatTwin: (rawBody, origUrl, htmlToMd) => formatIcimsHtml(rawBody, origUrl, htmlToMd),
     };
   },

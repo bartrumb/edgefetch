@@ -1063,7 +1063,7 @@ export async function executeExtractCall(params: {
             id: `ext-${item.idx + 1}`,
             url: companionMd,
             kind: 'text',
-            accept: 'text/markdown, text/plain;q=0.9',
+            accept: 'text/markdown',
           };
         }
         return {

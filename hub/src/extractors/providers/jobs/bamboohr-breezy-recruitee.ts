@@ -163,7 +163,7 @@ export default defineAdapter({
         id: 'personio',
         fetchUrl: `https://${host}/xml?language=en`,
         kind: 'text',
-        accept: 'application/xml, text/xml',
+        accept: 'application/xml',
         formatTwin: (rawBody) => {
           if (!/<workzag-jobs|<position\b/i.test(rawBody)) return null;
           const posBlocks = findAllElementInnersLinear(rawBody, 'position', undefined, 500);

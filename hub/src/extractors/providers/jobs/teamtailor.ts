@@ -53,7 +53,7 @@ export default defineAdapter({
       id: 'teamtailor',
       fetchUrl: `https://${host}/jobs.rss`,
       kind: 'text',
-      accept: 'application/rss+xml, application/xml, text/xml',
+      accept: 'application/rss+xml',
       formatTwin: (rawBody) => parseRssJobsXml(rawBody, m[1]!),
     };
   },

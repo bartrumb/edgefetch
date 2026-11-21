@@ -7813,7 +7813,7 @@ export async function executeScrapeCall(params: {
               id: 'companion-md-1',
               url: cachedCompanionUrl,
               kind: 'text',
-              accept: 'text/markdown, text/plain;q=0.9',
+              accept: 'text/markdown',
             },
           ],
         }),

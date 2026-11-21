@@ -564,6 +564,102 @@ function parseAshbyPay(job: Record<string, unknown>, descText: string): Normaliz
 }
 
 /**
+ * Linear O(N) quote-aware brace scanner that salvages complete job objects from an Ashby
+ * `posting-api/job-board/{org}` JSON response even if an extreme board exceeded `maxBytes` mid-stream.
+ */
+export function salvageAshbyBoardFromTruncatedJson(raw: string): {
+  salvaged: true;
+  organizationName?: string;
+  jobs: Array<Record<string, unknown>>;
+} | null {
+  const jobsKeyIdx = raw.indexOf('"jobs"');
+  if (jobsKeyIdx < 0) return null;
+  let organizationName: string | undefined;
+  const headSlice = raw.slice(0, Math.min(raw.length, 4096));
+  const orgMatch = /"organizationName"\s*:\s*"((?:\\.|[^"\\])*)"/.exec(headSlice);
+  if (orgMatch?.[1]) {
+    try {
+      organizationName = JSON.parse(`"${orgMatch[1]}"`) as string;
+    } catch {
+      organizationName = orgMatch[1];
+    }
+  }
+
+  let pos = jobsKeyIdx + 6;
+  while (pos < raw.length && (raw[pos] === ' ' || raw[pos] === '\t' || raw[pos] === '\r' || raw[pos] === '\n')) pos++;
+  if (raw[pos] !== ':') return null;
+  pos++;
+  while (pos < raw.length && (raw[pos] === ' ' || raw[pos] === '\t' || raw[pos] === '\r' || raw[pos] === '\n')) pos++;
+  if (raw[pos] !== '[') return null;
+  pos++;
+
+  const jobs: Array<Record<string, unknown>> = [];
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  let objStart = -1;
+
+  for (let i = pos; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) objStart = i;
+      depth++;
+    } else if (ch === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && objStart >= 0) {
+          const parsed = safeJsonParse(raw.slice(objStart, i + 1));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            jobs.push(parsed as Record<string, unknown>);
+          }
+          objStart = -1;
+        }
+      }
+    } else if (ch === ']' && depth === 0) {
+      break;
+    }
+  }
+
+  if (jobs.length === 0) return null;
+  return {
+    salvaged: true,
+    ...(organizationName ? { organizationName } : {}),
+    jobs,
+  };
+}
+
+function inferWorkdayWorkplaceType(remoteType: string, locText: string, title: string): WorkplaceType {
+  const explicit = resolveExplicitWorkplaceType(remoteType, '', '');
+  if (explicit) return explicit;
+  const inferred = inferWorkplaceType(`${remoteType} ${locText} ${title}`);
+  if (inferred !== 'unknown') return inferred;
+  const cleanLoc = locText.trim();
+  if (
+    cleanLoc.length > 0 &&
+    !/^(?:locations?|multiple(?:\s+locations?)?|various|flexible|global|worldwide|anywhere|tbd|n\/a|\d+\s+locations?)$/i.test(
+      cleanLoc,
+    )
+  ) {
+    return 'onsite';
+  }
+  return 'unknown';
+}
+
+/**
  * Resolves pre-fetch ATS API adapters (`P1` Ashby, `P2` Workday CXS `GET` & `POST`, Greenhouse, Lever) for both
  * `scrape` and `extract`.
  */
@@ -586,6 +682,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
       parts.length >= 2 && secondSeg !== 'application' && !(parts.length === 2 && secondSeg === 'jobs')
         ? decodeURIComponent(parts[1]!)
         : '';
+    const reqOffset = Math.max(0, parseInt(u.searchParams.get('offset') ?? '0', 10) || 0);
     if (/^[A-Za-z0-9._-]+$/.test(org)) {
       return {
         id: jobId ? 'ashby-job' : 'ashby-board',
@@ -594,7 +691,18 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
         kind: 'json',
         accept: 'application/json',
         format: (rawBody, origUrl, htmlToMd) => {
-          const data = safeJsonParse(rawBody) as Record<string, unknown> | null;
+          let data = safeJsonParse(rawBody) as Record<string, unknown> | null;
+          let salvaged = false;
+          if ((!data || !Array.isArray(data.jobs)) && rawBody.includes('"jobs"')) {
+            const salv = salvageAshbyBoardFromTruncatedJson(rawBody);
+            if (salv) {
+              data = {
+                ...(salv.organizationName ? { organizationName: salv.organizationName } : {}),
+                jobs: salv.jobs,
+              };
+              salvaged = true;
+            }
+          }
           if (!data || !Array.isArray(data.jobs)) return null;
           const jobs = data.jobs as Array<Record<string, unknown>>;
           const orgTitle = typeof data.organizationName === 'string' && data.organizationName ? data.organizationName : org;
@@ -669,8 +777,9 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           }
 
           const records: StructuredJobRecord[] = [];
-          const lines: string[] = [`# ${orgTitle} — Open Roles (${total})`];
-          for (const j of jobs.slice(0, 100)) {
+          const countLabel = salvaged ? `${total}+` : String(total);
+          const lines: string[] = [`# ${orgTitle} — Open Roles (${countLabel})`];
+          for (const j of jobs.slice(reqOffset, reqOffset + 100)) {
             const jId = String(j.id ?? '');
             const jTitle = String(j.title ?? 'Role').trim();
             const jLoc = String(j.location ?? '').trim();
@@ -697,16 +806,17 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
           }
           const returned = records.length;
-          const truncated = total > returned;
+          const truncated = salvaged || total > reqOffset + returned;
+          const nextOffsetVal = reqOffset + returned;
           return {
-            title: `${orgTitle} Jobs (${total})`,
+            title: `${orgTitle} Jobs (${countLabel})`,
             markdown: lines.join('\n'),
             links,
             jobs: records,
-            total,
+            ...(salvaged ? {} : { total }),
             returned,
             truncated,
-            ...(truncated ? { nextCursor: String(returned) } : {}),
+            ...(truncated && (salvaged || nextOffsetVal < total) ? { nextCursor: String(nextOffsetVal) } : {}),
           };
         },
       };
@@ -747,7 +857,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const bodyMd = descHtml ? htmlToMd(descHtml, origUrl).markdown.trim() : '';
             const pay = parsePayFromText(bodyMd);
             const extUrl = typeof info.externalUrl === 'string' && info.externalUrl.startsWith('http') ? info.externalUrl : origUrl;
-            const wp = inferWorkplaceType(`${remoteType} ${allLocs.join(' ')} ${title}`);
+            const wp = inferWorkdayWorkplaceType(remoteType, allLocs.join(' '), title);
 
             const jp: StructuredJobPosting = {
               title,
@@ -803,7 +913,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const locTxt = typeof p.locationsText === 'string' ? p.locationsText.trim() : '';
             const postedOn = typeof p.postedOn === 'string' ? p.postedOn.trim() : null;
             const bullets = Array.isArray(p.bulletFields) ? p.bulletFields.map(String).filter(Boolean).join(', ') : '';
-            const wp = inferWorkplaceType(`${locTxt} ${pTitle} ${String(p.remoteType ?? '')}`);
+            const wp = inferWorkdayWorkplaceType(String(p.remoteType ?? ''), locTxt, pTitle);
             links.push(fullUrl);
             records.push({
               title: pTitle,
@@ -843,6 +953,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
     const ghApiHost = isGhEu ? 'boards-api.eu.greenhouse.io' : 'boards-api.greenhouse.io';
     const co = parts[0]!;
     if (parts.length === 1 && /^[A-Za-z0-9_-]+$/.test(co) && co.toLowerCase() !== 'embed' && co.toLowerCase() !== 'v1') {
+      const reqOffset = Math.max(0, parseInt(u.searchParams.get('offset') ?? '0', 10) || 0);
       return {
         id: isGhEu ? 'greenhouse-eu-board' : 'greenhouse-board',
         fetchUrl: `https://${ghApiHost}/v1/boards/${encodeURIComponent(co)}/jobs?content=true`,
@@ -868,7 +979,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             links.push(jUrl);
           }
           const lines: string[] = [`# ${co} — Greenhouse Job Board (${total} open roles)`];
-          for (const j of jobs.slice(0, 120)) {
+          for (const j of jobs.slice(reqOffset, reqOffset + 120)) {
             const jTitle = String(j.title ?? '').trim();
             if (!jTitle) continue;
             const loc = String((j.location as Record<string, unknown> | undefined)?.name ?? '').trim();
@@ -895,7 +1006,8 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
           }
           const returned = records.length;
-          const truncated = total > returned;
+          const nextOffsetVal = reqOffset + returned;
+          const truncated = total > nextOffsetVal;
           return {
             title: `${co} Jobs (${total})`,
             markdown: lines.join('\n'),
@@ -904,7 +1016,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             total,
             returned,
             truncated,
-            ...(truncated ? { nextCursor: String(returned) } : {}),
+            ...(truncated ? { nextCursor: String(nextOffsetVal) } : {}),
           };
         },
       };
@@ -2932,6 +3044,7 @@ async function executeJobsVerifyMode(params: {
     {
       boardStatus: AtsBoardStatus;
       truncated: boolean;
+      boardIncomplete: boolean;
       openLinksLower: string[];
       openRoles: Array<{ title: string; url: string }>;
     }
@@ -2962,6 +3075,7 @@ async function executeJobsVerifyMode(params: {
             finalUrl: typeof sc?.body?.finalUrl === 'string' ? sc.body.finalUrl : undefined,
           }),
           truncated: false,
+          boardIncomplete: false,
           openLinksLower: [],
           openRoles: [],
         });
@@ -2996,10 +3110,18 @@ async function executeJobsVerifyMode(params: {
         contentState: cState,
         jobCount: Math.max(openRoles.length, rawLinks.length),
       });
+      const totalNum = typeof sc.body.total === 'number' && Number.isFinite(sc.body.total) ? sc.body.total : undefined;
+      const extId = typeof sc.body.extractorId === 'string' ? sc.body.extractorId : '';
+      const linksCoverFullBoard =
+        totalNum !== undefined &&
+        rawLinks.length >= totalNum &&
+        extId !== 'workday-board' &&
+        extId !== 'icims';
 
       boardSnapshots.set(key, {
         boardStatus: bStatus,
         truncated: sc.body.truncated === true,
+        boardIncomplete: sc.body.truncated === true && !linksCoverFullBoard,
         openLinksLower,
         openRoles,
       });
@@ -3069,8 +3191,8 @@ async function executeJobsVerifyMode(params: {
       continue;
     }
 
-    // Workday CXS boards paginate 20 at a time: if the board was truncated, check the single Workday job endpoint before marking closed!
-    if (item.identity.platform === 'workday' && snap.truncated) {
+    // Paginated boards (Workday CXS 20/page, iCIMS, or salvaged >16 MiB boards): check the single job URL before marking closed!
+    if (snap.boardIncomplete) {
       const wdCheck = await executeScrape({
         url: item.url,
         renderMode: 'auto',
@@ -3453,6 +3575,36 @@ export async function executeJobsCall(params: {
         }
         for (const br of boardJobs) {
           collected.push(br);
+        }
+        continue;
+      }
+
+      // Support twin-extracted job boards (`icims` `records[]`) in `jobs` search mode
+      if (Array.isArray(sc.body.records) && sc.body.extractorId === 'icims') {
+        const icimsRecs = sc.body.records as Array<Record<string, unknown>>;
+        const icimsCo = inferCompanyFromAtsUrl(origU);
+        for (const rc of icimsRecs) {
+          const rTitle = typeof rc.title === 'string' ? rc.title.trim() : '';
+          const rUrl = typeof rc.url === 'string' ? rc.url.trim() : '';
+          if (!rTitle || !rUrl) continue;
+          const rLoc =
+            typeof rc.location === 'string'
+              ? rc.location.trim()
+              : Array.isArray(rc.locations) && typeof rc.locations[0] === 'string'
+                ? rc.locations[0].trim()
+                : '';
+          const rSalary = typeof rc.salary === 'string' ? rc.salary : typeof rc.payRaw === 'string' ? rc.payRaw : '';
+          collected.push({
+            title: rTitle,
+            company: icimsCo,
+            url: rUrl,
+            applyUrl: rUrl,
+            workplaceType: inferWorkdayWorkplaceType('', rLoc, rTitle),
+            locations: rLoc ? [rLoc] : [],
+            pay: rSalary ? parsePayFromText(rSalary) : null,
+            postedAt: typeof rc.postedAt === 'string' ? rc.postedAt : null,
+            source: 'icims',
+          });
         }
         continue;
       }

@@ -1767,12 +1767,12 @@ async function dispatchRpcMessage(
         body: jsonRpcResult(id, {
           resultType: 'complete',
           supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
-          capabilities: { tools: { listChanged: false } },
+          capabilities: { tools: { listChanged: true } },
           _meta: {
             'io.modelcontextprotocol/serverInfo': { name: deps.serverName, version: deps.serverVersion },
           },
           instructions: MCP_INSTRUCTIONS,
-          ttlMs: 3_600_000,
+          ttlMs: 60_000,
           cacheScope: 'private',
         }),
       };
@@ -1793,7 +1793,7 @@ async function dispatchRpcMessage(
       return {
         body: jsonRpcResult(id, {
           protocolVersion,
-          capabilities: { tools: { listChanged: false } },
+          capabilities: { tools: { listChanged: true } },
           serverInfo: { name: deps.serverName, version: deps.serverVersion },
           instructions: MCP_INSTRUCTIONS,
         }),

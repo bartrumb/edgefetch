@@ -34,12 +34,14 @@ import {
   filterSafeResponseHeaders,
 } from '../src/framework-detect.ts';
 import { verifyStoredArtifact } from '../src/ingest.ts';
+import icimsAdapter from '../src/extractors/providers/jobs/icims.ts';
 import {
   buildBlockedInfo,
   chunkJsonRecords,
   executeJobsCall,
   extractJobPostingJsonLd,
   parseX402PaymentTerms,
+  salvageAshbyBoardFromTruncatedJson,
 } from '../src/jobs.ts';
 import { buildDeterministicSummary, completeLlmTurn, resolveLlmConfig } from '../src/llm.ts';
 import { executeMapCall, matchesSafeCrawlPattern } from '../src/map-crawl.ts';
@@ -2321,4 +2323,132 @@ test('QA-V260-ROUND4: overflow kindAuto text/html fix, Cloudflare vs Mintlify or
   );
   assert.equal(carouselDoc.markdown.includes('Cloned Swiper Slide Should Drop'), false);
   assert.equal(carouselDoc.markdown.split('Michael Patterson').length - 1, 1, 'Cloned duplicate long review block must appear once');
+
+  // 6. iCIMS `/jobs/search` adds `ss=1&in_iframe=1`, parses `iCIMS_JobCardItem` + `Page 1 of 37`, and NEVER lies `total: 0` on an unparsed shell!
+  const icimsUrl = new URL('https://careers-gdms.icims.com/jobs/search');
+  const icimsTwin = icimsAdapter.resolveTwin!({
+    url: icimsUrl,
+    host: icimsUrl.hostname,
+    path: icimsUrl.pathname,
+  });
+  assert.ok(icimsTwin, 'iCIMS resolveTwin must match /jobs/search');
+  assert.equal(icimsTwin.fetchUrl, 'https://careers-gdms.icims.com/jobs/search?ss=1&in_iframe=1');
+  const htmlToMdStub = (h: string) => ({ markdown: stripHtmlTagsLinear(h), links: [] as string[] });
+  const icimsOuterShell = icimsTwin.formatTwin(
+    '<!doctype html><html><body><div>Skip to content General Dynamics Mission Systems Careers Search Jobs</div></body></html>',
+    'https://careers-gdms.icims.com/jobs/search',
+    htmlToMdStub,
+  );
+  assert.equal(icimsOuterShell, null, 'Unparsed iCIMS shell without explicit zero-results message must return null, NEVER total: 0');
+  const icimsRealCards = icimsTwin.formatTwin(
+    `<!doctype html><html><body>
+      <h2>Search Results Page 1 of 37</h2>
+      <div class="row iCIMS_JobCardItem">
+        <a class="iCIMS_Anchor" href="/jobs/68708/senior-information-assurance-engineer/job?in_iframe=1"><h3>Senior Information Assurance Engineer</h3></a>
+        <dl><dt>ID</dt><dd>2026-82989</dd><dt>Job Locations</dt><dd>US-AZ-Scottsdale</dd><dt>Minimum Pay</dt><dd>USD $157,487.00 - USD $174,713.00 /Yr.</dd></dl>
+      </div>
+    </body></html>`,
+    'https://careers-gdms.icims.com/jobs/search',
+    htmlToMdStub,
+  );
+  assert.ok(icimsRealCards, 'iCIMS real card markup must format cleanly');
+  assert.equal(icimsRealCards.returned, 1);
+  assert.equal(icimsRealCards.truncated, true);
+  assert.equal(icimsRealCards.nextCursor, 'pr=1');
+  assert.equal(icimsRealCards.total, undefined, 'Paginated iCIMS page 1 of 37 must omit misleading single-page total');
+  assert.equal((icimsRealCards.records?.[0] as Record<string, unknown>)?.location, 'US-AZ-Scottsdale');
+  assert.match(String((icimsRealCards.records?.[0] as Record<string, unknown>)?.salary), /157,487/);
+
+  // 7. Ashby 16 MiB `maxBytes` + truncated JSON salvager + `?offset=` paging + Workday `scrape` truncation fields & `onsite` classification
+  const truncatedAshbyRaw =
+    '{"organizationName":"OpenAI","jobs":[{"id":"role-1","title":"Research Engineer","location":"San Francisco, CA","workplaceType":"Hybrid"},{"id":"role-2","title":"Distributed Systems Engineer","location":"San Francisco, CA","isRemote":false},{"id":"cut-off","title":"Half';
+  const salvaged = salvageAshbyBoardFromTruncatedJson(truncatedAshbyRaw);
+  assert.ok(salvaged);
+  assert.equal(salvaged.organizationName, 'OpenAI');
+  assert.equal(salvaged.jobs.length, 2);
+
+  let seenAtsMaxBytes = 0;
+  const ashbyScrape = await executeScrapeCall({
+    payload: { url: 'https://jobs.ashbyhq.com/openai?offset=1' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const parsed = JSON.parse(rawBody) as { options?: { maxBytes?: number } };
+      seenAtsMaxBytes = parsed.options?.maxBytes ?? 0;
+      return {
+        status: 200,
+        via: 'agent:site-arm64',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'ats-ashby-board',
+              url: 'https://api.ashbyhq.com/posting-api/job-board/openai?includeCompensation=true',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'application/json',
+              body: JSON.stringify({
+                organizationName: 'OpenAI',
+                jobs: [
+                  { id: 'r1', title: 'Role One', location: 'San Francisco, CA' },
+                  { id: 'r2', title: 'Role Two', location: 'San Francisco, CA', workplaceType: 'OnSite' },
+                  { id: 'r3', title: 'Role Three', location: 'Remote - US', isRemote: true },
+                ],
+              }),
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(seenAtsMaxBytes, 16_777_216, 'ATS pre-fetch must request 16 MiB maxBytes so large Ashby boards (OpenAI ~15 MiB) never drop to HTML');
+  assert.equal(ashbyScrape.body.extractorId, 'ashby-board');
+  assert.equal(ashbyScrape.body.contentState, 'active');
+  assert.equal(ashbyScrape.body.total, 3);
+  assert.equal(ashbyScrape.body.returned, 2);
+  assert.equal(ashbyScrape.body.truncated, false);
+
+  const wdScrape = await executeScrapeCall({
+    payload: { url: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite' },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-arm64',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'ats-workday-board',
+            url: 'https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDIAExternalCareerSite/jobs',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'application/json',
+            body: JSON.stringify({
+              total: 2012,
+              jobPostings: [
+                {
+                  title: 'Senior GPU Compiler Engineer',
+                  externalPath: '/job/US-CA-Santa-Clara/Senior-GPU-Compiler-Engineer_JR1',
+                  locationsText: 'US, CA, Santa Clara',
+                  postedOn: 'Posted Today',
+                },
+                {
+                  title: 'Solutions Architect',
+                  externalPath: '/job/US-CA-Santa-Clara/Solutions-Architect_JR2',
+                  locationsText: '2 Locations',
+                  postedOn: 'Posted Yesterday',
+                },
+              ],
+            }),
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(wdScrape.body.extractorId, 'workday-board');
+  assert.equal(wdScrape.body.contentState, 'active');
+  assert.equal(wdScrape.body.total, 2012);
+  assert.equal(wdScrape.body.returned, 2);
+  assert.equal(wdScrape.body.truncated, true);
+  assert.equal(wdScrape.body.nextCursor, '20');
+  const wdJobs = wdScrape.body.jobs as Array<{ workplaceType: string }>;
+  assert.equal(wdJobs[0]?.workplaceType, 'onsite', 'Concrete physical Workday location must infer onsite');
+  assert.equal(wdJobs[1]?.workplaceType, 'unknown', 'Ambiguous N Locations count must remain unknown');
 });

@@ -7269,8 +7269,8 @@ export async function executeScrapeCall(params: {
       const atsRes = await executeHubFetch(
         target,
         JSON.stringify({
-          maxSeconds: 30,
-          options: { includeBody: true, respectRobots: true },
+          maxSeconds: 45,
+          options: { includeBody: true, respectRobots: true, maxBytes: 16_777_216 },
           requests: [
             {
               id: `ats-${atsSpec.id}`,
@@ -7293,7 +7293,7 @@ export async function executeScrapeCall(params: {
         const atsParsed = JSON.parse(atsRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const atsItem = atsParsed.results?.[0];
         const atsBody = typeof atsItem?.body === 'string' && atsItem.bodyEncoding !== 'base64' ? atsItem.body : '';
-        if (atsItem?.outcome === 'ok' && atsBody.trim().length > 0) {
+        if ((atsItem?.outcome === 'ok' || atsItem?.truncated === true) && atsBody.trim().length > 0) {
           const filteredBoard =
             jsonFilterStr && atsSpec.id.endsWith('-board')
               ? chunkJsonRecords({
@@ -7345,11 +7345,15 @@ export async function executeScrapeCall(params: {
                 status: atsItem.status ?? 200,
                 via: atsRes.via,
                 extractorId: atsSpec.id,
+                contentState: 'active' as const,
                 ...(atsArt?.contentSha256 ? { contentSha256: atsArt.contentSha256 } : {}),
                 ...(atsArt?.blobSha256 ? { artifactId: atsArt.blobSha256 } : {}),
                 ...(atsMdArtifactId ? { markdownArtifactId: atsMdArtifactId } : {}),
                 ...(formatted?.jobPosting ? { jobPosting: formatted.jobPosting } : {}),
                 ...(formatted?.jobs && !filteredBoard ? { jobs: formatted.jobs } : {}),
+                ...(formatted?.total !== undefined && !filteredBoard ? { total: formatted.total } : {}),
+                ...(formatted?.returned !== undefined && !filteredBoard ? { returned: formatted.returned } : {}),
+                ...(formatted?.nextCursor !== undefined && !filteredBoard ? { nextCursor: formatted.nextCursor } : {}),
                 ...(filteredBoard
                   ? {
                       chunks: filteredBoard.chunks,
@@ -7367,7 +7371,9 @@ export async function executeScrapeCall(params: {
                       totalChars: atsShaped.totalChars,
                       nextOffset: atsShaped.nextOffset ?? atsShaped.markdown.length,
                     }
-                  : {}),
+                  : formatted?.truncated !== undefined && !filteredBoard
+                    ? { truncated: formatted.truncated }
+                    : {}),
                 metadata: {
                   title: atsTitle,
                   ...(formatted?.description ? { description: formatted.description } : {}),
@@ -7747,6 +7753,7 @@ export async function executeScrapeCall(params: {
                 status: twinItem.status ?? 200,
                 via: twinRes.via,
                 extractorId: registryTwin.id,
+                contentState: 'active' as const,
                 ...(hasTwinDetected ? { detected: twinDetected } : {}),
                 ...(twinArt?.contentSha256 ? { contentSha256: twinArt.contentSha256 } : {}),
                 ...(twinArt?.blobSha256 ? { artifactId: twinArt.blobSha256 } : {}),
@@ -7770,8 +7777,8 @@ export async function executeScrapeCall(params: {
                       totalChars: twinShaped.totalChars,
                       nextOffset: twinShaped.nextOffset ?? twinShaped.markdown.length,
                     }
-                  : formatted.truncated === true
-                    ? { truncated: true }
+                  : formatted.truncated !== undefined
+                    ? { truncated: formatted.truncated }
                     : {}),
                 metadata: {
                   title: formatted.title,
@@ -8297,8 +8304,8 @@ export async function executeScrapeCall(params: {
         const stubRes = await executeHubFetch(
           target,
           JSON.stringify({
-            maxSeconds: 30,
-            options: { includeBody: true, respectRobots: true },
+            maxSeconds: 45,
+            options: { includeBody: true, respectRobots: true, maxBytes: 16_777_216 },
             requests: [
               {
                 id: `ats-${stubAts.id}`,
@@ -8321,7 +8328,10 @@ export async function executeScrapeCall(params: {
           const stubParsed = JSON.parse(stubRes.bodyText) as { results?: Array<Record<string, unknown>> };
           const stubItem = stubParsed.results?.[0];
           const stubBody = typeof stubItem?.body === 'string' && stubItem.bodyEncoding !== 'base64' ? stubItem.body : '';
-          const stubFormatted = stubItem?.outcome === 'ok' && stubBody ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd) : null;
+          const stubFormatted =
+            (stubItem?.outcome === 'ok' || stubItem?.truncated === true) && stubBody
+              ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd)
+              : null;
           if (stubFormatted && stubFormatted.markdown.trim().length > 0) {
             const stubRedirect = analyzeUrlRedirect(normalizedUrl, wdStub.redirectUrl);
             const cleanStubMd = redactPii ? redactPiiText(stubFormatted.markdown) : stubFormatted.markdown;
@@ -8339,11 +8349,24 @@ export async function executeScrapeCall(params: {
                 status: stubItem?.status ?? 200,
                 via: stubRes.via,
                 extractorId: stubAts.id,
+                contentState: 'active' as const,
                 ...(stubFormatted.jobPosting ? { jobPosting: stubFormatted.jobPosting } : {}),
                 ...(stubFormatted.jobs ? { jobs: stubFormatted.jobs } : {}),
+                ...(stubFormatted.total !== undefined ? { total: stubFormatted.total } : {}),
+                ...(stubFormatted.returned !== undefined ? { returned: stubFormatted.returned } : {}),
+                ...(stubFormatted.nextCursor !== undefined ? { nextCursor: stubFormatted.nextCursor } : {}),
                 ...(stringFormats.has('markdown') ? { markdown: stubShaped.markdown } : {}),
                 ...(stringFormats.has('text') ? { text: stubShaped.markdown } : {}),
                 ...(stringFormats.has('links') && stubFormatted.links ? { links: stubFormatted.links } : {}),
+                ...(stubShaped.truncated
+                  ? {
+                      truncated: true,
+                      totalChars: stubShaped.totalChars,
+                      nextOffset: stubShaped.nextOffset ?? stubShaped.markdown.length,
+                    }
+                  : stubFormatted.truncated !== undefined
+                    ? { truncated: stubFormatted.truncated }
+                    : {}),
                 metadata: {
                   title: stubFormatted.title,
                   wordCount: countTextWords(stubShaped.markdown),

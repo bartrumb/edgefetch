@@ -34,6 +34,7 @@ const ADMIN_HTML_HEADERS: Record<string, string> = {
   'cache-control': 'no-store',
   'content-security-policy':
     "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  'x-content-type-options': 'nosniff',
   'x-frame-options': 'DENY',
   'referrer-policy': 'no-referrer',
 };

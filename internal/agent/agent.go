@@ -26,7 +26,7 @@ import (
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
 // Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/v2/internal/agent.Version=...".
-var Version = "2.6.0"
+var Version = "2.6.1"
 
 const (
 	DefaultPingInterval          = 30 * time.Second
@@ -298,9 +298,7 @@ func runSession(
 		cancelSession()
 		_ = conn.CloseNow()
 		close(dispatchCh)
-		if ctx.Err() != nil {
-			wg.Wait()
-		}
+		wg.Wait()
 	}()
 
 	for {

@@ -36,6 +36,7 @@ import {
 } from '../src/framework-detect.ts';
 import { verifyStoredArtifact } from '../src/ingest.ts';
 import icimsAdapter from '../src/extractors/providers/jobs/icims.ts';
+import { isShopifyHtmlOrHeaders } from '../src/extractors/providers/commerce-social/shopify.ts';
 import {
   buildBlockedInfo,
   chunkJsonRecords,
@@ -63,7 +64,13 @@ import {
   stripHtmlTagsLinear,
   stripHtmlTagsQuoteAwareLinear,
 } from '../src/safe-input.ts';
-import { executeInteractCall, executeScrapeCall, extractHtmlDocument, extractStructuredJsonFromPage } from '../src/scrape.ts';
+import {
+  executeInteractCall,
+  executeScrapeCall,
+  extractHtmlDocument,
+  extractStructuredJsonFromPage,
+  sanitizeInlineHtmlInMarkdown,
+} from '../src/scrape.ts';
 import { detectPromptInjection } from '../src/scrape-advanced.ts';
 import { isEligibleForExternalSpaFallback } from '../src/spa-fallback.ts';
 import { r2ArtifactKey } from '../src/storage.ts';
@@ -2315,15 +2322,15 @@ test('QA-V260-ROUND4: overflow kindAuto text/html fix, Cloudflare vs Mintlify or
   assert.equal(pypiDoc.extractorId, 'pypi-project');
   assert.match(pypiDoc.markdown, /pip install httpx/);
 
-  // 5. Cloned review carousel deduplication (`swiper-slide-duplicate` + consecutive identical >= 120-char prose blocks)
+  // 5. Cloned review carousel deduplication (`swiper-slide-duplicate` / `slick-cloned` DOM clone classes)
   const repeatedReview =
     'August 4, 2025 I have not ridden a bike in twenty years and bought the Prodigy V2 step-over chain drive for daily commuting and fitness.';
   const carouselDoc = extractHtmlDocument(
-    `<!doctype html><html><body><main><h1>Customer Reviews</h1><div><p><strong>Michael Patterson</strong></p><p>${repeatedReview}</p><p>(1)</p><p>(0)</p></div><div><p><strong>Michael Patterson</strong></p><p>${repeatedReview}</p><p>(1)</p><p>(0)</p></div><div class="swiper-slide swiper-slide-duplicate"><p>Cloned Swiper Slide Should Drop</p></div></main></body></html>`,
+    `<!doctype html><html><body><main><h1>Customer Reviews</h1><div><p><strong>Michael Patterson</strong></p><p>${repeatedReview}</p><p>(1)</p><p>(0)</p></div><div class="slick-cloned"><p><strong>Michael Patterson</strong></p><p>${repeatedReview}</p><p>(1)</p><p>(0)</p></div><div class="swiper-slide swiper-slide-duplicate"><p>Cloned Swiper Slide Should Drop</p></div></main></body></html>`,
     { baseUrl: 'https://shop.example.com/reviews', onlyMainContent: true },
   );
   assert.equal(carouselDoc.markdown.includes('Cloned Swiper Slide Should Drop'), false);
-  assert.equal(carouselDoc.markdown.split('Michael Patterson').length - 1, 1, 'Cloned duplicate long review block must appear once');
+  assert.equal(carouselDoc.markdown.split('Michael Patterson').length - 1, 1, 'Cloned duplicate slick-cloned review block must appear once');
 
   // 6. iCIMS `/jobs/search` adds `ss=1&in_iframe=1`, parses `iCIMS_JobCardItem` + `Page 1 of 37`, and NEVER lies `total: 0` on an unparsed shell!
   const icimsUrl = new URL('https://careers-gdms.icims.com/jobs/search');
@@ -2482,4 +2489,272 @@ test('QA-V260-ROUND4: overflow kindAuto text/html fix, Cloudflare vs Mintlify or
   assert.ok(scriptOpen > 0 && scriptClose > scriptOpen, '/admin HTML must contain inline <script>');
   const inlineJs = adminHtml.slice(scriptOpen + '<script>'.length, scriptClose);
   assert.doesNotThrow(() => new Function(inlineJs), '/admin inline <script> must have zero JS syntax errors');
+});
+
+test('SEC-V261-ROUND5: R4-H1..H3 O(N) Scanners, R4-M6..M7 XSS/Sentinel Hygiene, D-M1 Prose Preservation & 6 Jobs Search/Verify Fixes', async () => {
+  // 1. R4-H1 & R4-H2 linear O(N) scanner/regex PoC timing guards
+  const tH1Start = performance.now();
+  extractHtmlDocument('<p>ok</p>' + '<x'.repeat(8_000), { baseUrl: 'https://example.com/' });
+  assert.ok(performance.now() - tH1Start < 150, 'R4-H1 <x.repeat(8000) must finish in linear time');
+
+  const tH2AttrStart = performance.now();
+  extractHtmlDocument(`<p><a ${'a'.repeat(32_000)}>link</a></p>`, { baseUrl: 'https://example.com/' });
+  assert.ok(performance.now() - tH2AttrStart < 150, 'R4-H2 unquoted 32K attribute must finish in linear time');
+
+  const tH2RopeStart = performance.now();
+  sanitizeInlineHtmlInMarkdown('[a](/x)'.repeat(18_724), 'https://example.com/');
+  assert.ok(performance.now() - tH2RopeStart < 200, 'R4-H2 18.7K markdown links must not trigger quadratic slice');
+
+  const tH2LtStart = performance.now();
+  sanitizeInlineHtmlInMarkdown('<'.repeat(500_000), 'https://example.com/');
+  assert.ok(performance.now() - tH2LtStart < 250, 'R4-H2 500K < chars must scan linearly');
+
+  const tH2ShopStart = performance.now();
+  assert.equal(isShopifyHtmlOrHeaders('a'.repeat(120_000)), false);
+  assert.ok(performance.now() - tH2ShopStart < 100, 'R4-H2 Shopify marker scan on 120K a must finish in <100ms');
+
+  // 2. R4-H3 safe user regex guard rejects multi-unbounded polynomial pattern with $ anchor
+  assert.equal(compileSafeUserRegex('a*(b)?aa*(b)?aa*$'), null, 'R4-H3 polynomial regex must be rejected');
+
+  // 3. R4-M6 & R4-M7 origin-markdown XSS & inline-code sentinel preservation
+  const escapedTickMd = sanitizeInlineHtmlInMarkdown('\\`<img src=x onerror=alert(1)>`', 'https://example.com/');
+  assert.equal(/<img\b/i.test(escapedTickMd), false, 'R4-M6 escaped backtick must not shield raw <img onerror>');
+  assert.equal(/onerror/i.test(escapedTickMd), false);
+
+  const entityJsLinkMd = sanitizeInlineHtmlInMarkdown(
+    '[click](javascript&colon;alert(1)) and [two\nline](javascript:alert(1))',
+    'https://example.com/',
+  );
+  assert.equal(/javascript/i.test(entityJsLinkMd), false, 'R4-M6 entity & multiline javascript: links must be stripped');
+
+  const inlinePlusSvgMd = sanitizeInlineHtmlInMarkdown(
+    'Run `npm test` then <svg><path d="M0 0"/></svg> then `npm run build`.',
+    'https://example.com/',
+  );
+  assert.equal(inlinePlusSvgMd.includes('EFMDINLINE'), false, 'R4-M7 inline code sentinels must be restored after <svg> strip');
+  assert.match(inlinePlusSvgMd, /`npm test`/);
+  assert.match(inlinePlusSvgMd, /`npm run build`/);
+
+  // 4. D-M1 legitimate repeated refrain, repeated indented code block & speaker label preserved
+  const refrain =
+    'This invariant holds across every distributed worker node regardless of whether transport runs over HTTP/2 or headless Chromium.';
+  const dm1Doc = extractHtmlDocument(
+    `<!doctype html><html><body><article>
+      <h2>Example A</h2>
+      <p><strong>Alice</strong></p>
+      <p>${refrain}</p>
+      <pre><code>const limit = 16 * 1024 * 1024;\nconst timeoutMs = 30_000;\nassert(limit &gt; 0 &amp;&amp; timeoutMs &gt; 0);\nconsole.log(limit, timeoutMs);</code></pre>
+      <h2>Example B</h2>
+      <p><strong>Alice</strong></p>
+      <p>${refrain}</p>
+      <pre><code>const limit = 16 * 1024 * 1024;\nconst timeoutMs = 30_000;\nassert(limit &gt; 0 &amp;&amp; timeoutMs &gt; 0);\nconsole.log(limit, timeoutMs);</code></pre>
+    </article></body></html>`,
+    { baseUrl: 'https://docs.example.com/spec', onlyMainContent: true },
+  );
+  assert.equal(dm1Doc.markdown.split(refrain).length - 1, 2, 'D-M1 repeated refrain must be preserved in both sections');
+  assert.equal(dm1Doc.markdown.split('Alice').length - 1, 2, 'D-M1 speaker labels before repeated prose must be preserved');
+  assert.equal(dm1Doc.markdown.split('timeoutMs = 30_000').length - 1, 2, 'D-M1 repeated code sample under Example B must be preserved');
+
+  // 5. Jobs Gap 1: `similarOpenRoles` omits alphabetical noise on closed numeric Greenhouse URLs, keeps genuine overlap
+  const verifySimilarRes = await executeJobsCall({
+    payload: {
+      verify: [
+        'https://boards.greenhouse.io/cloudflare/jobs/7347047',
+        'https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/job/US-CA-Santa-Clara/Senior-Forward-Deployed-Engineer_JR9999999',
+      ],
+    },
+    env: {},
+    executeSearch: async () => ({ status: 200, body: { results: [] } }),
+    executeScrape: async ({ url }) => {
+      if (String(url).includes('greenhouse.io/cloudflare')) {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            jobs: [
+              { title: 'Account Executive, FedCiv', company: 'Cloudflare', url: 'https://boards.greenhouse.io/cloudflare/jobs/1', applyUrl: 'https://boards.greenhouse.io/cloudflare/jobs/1', workplaceType: 'remote', locations: ['US'], pay: null, postedAt: null, source: 'greenhouse' },
+              { title: 'Systems Engineer', company: 'Cloudflare', url: 'https://boards.greenhouse.io/cloudflare/jobs/2', applyUrl: 'https://boards.greenhouse.io/cloudflare/jobs/2', workplaceType: 'remote', locations: ['US'], pay: null, postedAt: null, source: 'greenhouse' },
+            ],
+          },
+        };
+      }
+      if (String(url).endsWith('NVIDIAExternalCareerSite')) {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            truncated: false,
+            jobs: [
+              { title: 'Account Executive', company: 'nvidia', url: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US/AE_JR1', applyUrl: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US/AE_JR1', workplaceType: 'remote', locations: ['US'], pay: null, postedAt: null, source: 'workday' },
+              { title: 'Growth Engineer', company: 'nvidia', url: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US/GE_JR2', applyUrl: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US/GE_JR2', workplaceType: 'remote', locations: ['US'], pay: null, postedAt: null, source: 'workday' },
+              { title: 'Forward Deployed Engineer, Enterprise AI', company: 'nvidia', url: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US/FDE_JR3', applyUrl: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US/FDE_JR3', workplaceType: 'remote', locations: ['US'], pay: null, postedAt: null, source: 'workday' },
+            ],
+          },
+        };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  const vr = verifySimilarRes.body.results as Array<{ status: string; similarOpenRoles?: Array<{ title: string }> }>;
+  assert.equal(vr[0]?.status, 'closed');
+  assert.equal(vr[0]?.similarOpenRoles, undefined, 'Closed numeric URL with zero title tokens must NOT suggest Account Executive');
+  assert.equal(vr[1]?.status, 'closed');
+  assert.deepEqual(
+    vr[1]?.similarOpenRoles?.map((r) => r.title),
+    ['Forward Deployed Engineer, Enterprise AI'],
+    'similarOpenRoles must keep only distinctive role overlap, rejecting generic single-word Engineer noise',
+  );
+
+  // 6. Jobs Gaps 2–6: Workday `domains` discovery + `not_found` reporting, zero cross-company bleed, phrase/all_tokens query, floor `minBase` + `payUnknown`, US-only geo filter, opt-in public feeds
+  let publicFeedCalled = false;
+  const strictSearchRes = await executeJobsCall({
+    payload: {
+      query: 'Forward Deployed Engineer',
+      remote: true,
+      minBase: 220_000,
+      locations: ['United States', 'Remote'],
+      includeBuiltIn: false,
+    },
+    env: {},
+    executeSearch: async ({ query: q }) => ({
+      status: 200,
+      body: {
+        results: String(q).includes('ashbyhq')
+          ? [{ url: 'https://jobs.ashbyhq.com/acmeai' }]
+          : [],
+      },
+    }),
+    executeScrape: async ({ url }) => {
+      if (String(url).includes('weworkremotely') || String(url).includes('himalayas') || String(url).includes('workingnomads')) {
+        publicFeedCalled = true;
+      }
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          jobs: [
+            {
+              title: 'Growth Engineer',
+              company: 'AcmeAI',
+              url: 'https://jobs.ashbyhq.com/acmeai/noise-1',
+              applyUrl: 'https://jobs.ashbyhq.com/acmeai/noise-1/application',
+              workplaceType: 'remote',
+              locations: ['Remote - United States'],
+              pay: { min: 250_000, max: 300_000, currency: 'USD', period: 'year', basis: 'base' },
+              postedAt: null,
+              source: 'ashby',
+            },
+            {
+              title: 'Forward Deployed Engineer (Low Floor)',
+              company: 'AcmeAI',
+              url: 'https://jobs.ashbyhq.com/acmeai/low-floor',
+              applyUrl: 'https://jobs.ashbyhq.com/acmeai/low-floor/application',
+              workplaceType: 'remote',
+              locations: ['Remote - United States'],
+              pay: { min: 175_500, max: 230_000, currency: 'USD', period: 'year', basis: 'base' },
+              postedAt: null,
+              source: 'ashby',
+            },
+            {
+              title: 'Forward Deployed Engineer (Canada)',
+              company: 'AcmeAI',
+              url: 'https://jobs.ashbyhq.com/acmeai/canada',
+              applyUrl: 'https://jobs.ashbyhq.com/acmeai/canada/application',
+              workplaceType: 'remote',
+              locations: ['Remote - Canada; Remote - Ireland'],
+              pay: { min: 240_000, max: 290_000, currency: 'USD', period: 'year', basis: 'base' },
+              postedAt: null,
+              source: 'ashby',
+            },
+            {
+              title: 'Forward Deployed Software Engineer',
+              company: 'AcmeAI',
+              url: 'https://jobs.ashbyhq.com/acmeai/all-tokens-unlisted-pay',
+              applyUrl: 'https://jobs.ashbyhq.com/acmeai/all-tokens-unlisted-pay/application',
+              workplaceType: 'remote',
+              locations: ['Remote - United States'],
+              pay: null,
+              postedAt: null,
+              source: 'ashby',
+            },
+            {
+              title: 'Forward Deployed Engineer, Commercial',
+              company: 'AcmeAI',
+              url: 'https://jobs.ashbyhq.com/acmeai/phrase-hit',
+              applyUrl: 'https://jobs.ashbyhq.com/acmeai/phrase-hit/application',
+              workplaceType: 'remote',
+              locations: ['San Francisco, CA'],
+              pay: { min: 230_000, max: 280_000, currency: 'USD', period: 'year', basis: 'base' },
+              postedAt: null,
+              source: 'ashby',
+            },
+          ],
+        },
+      };
+    },
+  });
+  assert.equal(publicFeedCalled, false, 'Public feeds must be strictly opt-in (default false)');
+  assert.equal(strictSearchRes.body.minBaseMode, 'floor');
+  assert.equal(strictSearchRes.body.payUnknownCount, 1);
+  assert.ok(Array.isArray(strictSearchRes.body.sourcesUsed));
+  const strictJobs = strictSearchRes.body.jobs as Array<{ title: string; matchedOn?: string; payUnknown?: boolean }>;
+  assert.deepEqual(
+    strictJobs.map((j) => ({ title: j.title, matchedOn: j.matchedOn, payUnknown: Boolean(j.payUnknown) })),
+    [
+      { title: 'Forward Deployed Engineer, Commercial', matchedOn: 'phrase', payUnknown: false },
+      { title: 'Forward Deployed Software Engineer', matchedOn: 'all_tokens', payUnknown: true },
+    ],
+  );
+
+  // `domains: ["nvidia.com", "noatsboard999.example"]` discovers Workday CXS & reports `not_found` with zero cross-company bleed
+  const domainProbeRes = await executeJobsCall({
+    payload: { domains: ['nvidia.com', 'noatsboard999.example'], query: 'Solutions Architect' },
+    env: {},
+    executeSearch: async () => ({
+      status: 200,
+      body: { results: [{ url: 'https://jobs.ashbyhq.com/unrelatedcorp' }] },
+    }),
+    executeScrape: async ({ url }) => {
+      const u = String(url);
+      if (u.startsWith('https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite')) {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            total: 2000,
+            returned: 1,
+            truncated: true,
+            nextCursor: '100',
+            jobs: [
+              {
+                title: 'Senior Solutions Architect, Generative AI',
+                company: 'nvidia',
+                url: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US-CA-Santa-Clara/SA_JR1',
+                applyUrl: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US-CA-Santa-Clara/SA_JR1',
+                workplaceType: 'remote',
+                locations: ['US, CA, Remote'],
+                pay: { min: 224_000, max: 356_500, currency: 'USD', period: 'year', basis: 'base' },
+                postedAt: null,
+                source: 'workday',
+              },
+            ],
+          },
+        };
+      }
+      if (u.includes('careers') || u.includes('jobs')) {
+        return { status: 200, body: { ok: true, rawHtml: '<html><body>Marketing SPA</body></html>', links: [] } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  const domBoards = domainProbeRes.body.discoveredBoards as Array<{ domain?: string; platform: string; boardStatus?: string; tried?: string[] }>;
+  const nvBoard = domBoards.find((b) => b.domain === 'nvidia.com');
+  const missBoard = domBoards.find((b) => b.domain === 'noatsboard999.example');
+  assert.equal(nvBoard?.platform, 'workday');
+  assert.equal(nvBoard?.boardStatus, 'ok');
+  assert.equal(missBoard?.boardStatus, 'not_found');
+  assert.ok((missBoard?.tried?.length ?? 0) >= 3);
+  const domJobs = domainProbeRes.body.jobs as Array<{ company: string; title: string }>;
+  assert.equal(domJobs.length, 1);
+  assert.equal(domJobs[0]?.company, 'nvidia');
 });

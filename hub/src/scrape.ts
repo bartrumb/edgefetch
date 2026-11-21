@@ -97,7 +97,7 @@ import {
   splitPdfPagesAndMarkers,
 } from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 27;
+export const SCRAPE_PIPELINE_VERSION = 28;
 
 export interface ScrapedImage {
   url: string;
@@ -210,6 +210,22 @@ const NAMED_HTML_ENTITIES: Record<string, string> = {
   shy: '',
   zwj: '\u200d',
   zwnj: '\u200c',
+  colon: ':',
+  tab: '\t',
+  newline: '\n',
+  lpar: '(',
+  rpar: ')',
+  sol: '/',
+  bsol: '\\',
+  semi: ';',
+  equals: '=',
+  num: '#',
+  quest: '?',
+  excl: '!',
+  commat: '@',
+  lsqb: '[',
+  rsqb: ']',
+  grave: '`',
 };
 
 export function decodeHtmlEntities(input: string): string {
@@ -392,8 +408,9 @@ function unescapeUrlAttrAmpOnly(raw: string): string {
 }
 
 function parseTagAttrs(tag: string): Record<string, string> {
+  if (tag.length > 65_536) tag = tag.slice(0, 65_536);
   const attrs: Record<string, string> = {};
-  const re = /([a-zA-Z0-9_:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
+  const re = /(?<![a-zA-Z0-9_:-])([a-zA-Z0-9_:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(tag)) !== null) {
     const key = m[1]!.toLowerCase();
@@ -516,7 +533,7 @@ function inferCodeFenceLang(preAttrStr: string, codeAttrStr = ''): string {
   const directNorm = normalizeFenceLang(direct);
   if (directNorm) return directNorm;
 
-  const classes = `${codeAttrs.class ?? ''} ${preAttrs.class ?? ''}`;
+  const classes = `${(codeAttrs.class ?? '').slice(0, 512)} ${(preAttrs.class ?? '').slice(0, 512)}`;
   const m =
     /\b(?:highlight-source-|language-|lang-|highlight-|syntax-|code-|brush:\s*)([a-zA-Z0-9_+#-]+)/i.exec(classes) ??
     /\b([a-zA-Z0-9_+#-]+)-(?:code|snippet)\b/i.exec(classes) ??
@@ -605,48 +622,6 @@ const ALWAYS_HIDDEN_OR_CHROME_CLASSES = new Set([
   'glide__slide--clone',
   'owl-cloned',
 ]);
-
-/**
- * Deduplicates cloned prose paragraphs (`>= 120` chars) outside code fences — e.g. review carousels that render
- * identical review slides 3-4x in static HTML — while keeping headings, tables, lists, and code blocks untouched.
- */
-function dedupeClonedProseParagraphs(markdown: string): string {
-  if (markdown.length < 300) return markdown;
-  return splitMarkdownByCodeFences(markdown)
-    .map((part, idx) => {
-      if (idx % 2 === 1) return part;
-      const blocks = part.split(/\n{2,}/);
-      if (blocks.length < 2) return part;
-      const seenLongProse = new Set<string>();
-      const kept: string[] = [];
-      let droppedPrev = false;
-      for (let i = 0; i < blocks.length; i++) {
-        const b = blocks[i]!;
-        const trimmed = b.trim();
-        if (droppedPrev && /^\(\d+\)$/.test(trimmed)) {
-          continue;
-        }
-        const isProse =
-          trimmed.length >= 120 &&
-          !/^(?:#{1,6}\s|\||[-*+]\s|\d+\.\s|>\s|```|~~~)/.test(trimmed);
-        if (isProse) {
-          const norm = trimmed.replace(/\s+/g, ' ');
-          if (seenLongProse.has(norm)) {
-            if (kept.length > 0 && /^\*\*[^*\n]{1,64}\*\*$/.test(kept[kept.length - 1]!.trim())) {
-              kept.pop();
-            }
-            droppedPrev = true;
-            continue;
-          }
-          seenLongProse.add(norm);
-        }
-        droppedPrev = false;
-        kept.push(b);
-      }
-      return kept.join('\n\n');
-    })
-    .join('');
-}
 
 /** Extracts the inner HTML of a balanced `<div|section ... role="main">` landmark in guaranteed O(N) time (`H1`). */
 function extractBalancedRoleMainHtml(html: string): string | null {
@@ -2926,7 +2901,7 @@ export function extractHtmlDocument(
   if (md.slice(Math.max(0, md.length - 800)).toLowerCase().includes('help improve mdn')) {
     md = md.replace(/\n+##[ \t]+Help improve MDN\b[\s\S]{0,600}$/i, '');
   }
-  md = dedupeClonedProseParagraphs(md).replace(/\n{3,}/g, '\n\n').trim();
+  md = md.replace(/\n{3,}/g, '\n\n').trim();
 
   let matchedSiteExtracted: PostFetchSiteResult | null = null;
   let inertiaHydrated = false;
@@ -4108,6 +4083,16 @@ function createMarkdownLineScanCursors(): MarkdownLineScanCursors {
   };
 }
 
+function isBackslashEscapedAt(str: string, idx: number): boolean {
+  let bs = 0;
+  let p = idx - 1;
+  while (p >= 0 && str.charCodeAt(p) === 92 /* '\\' */) {
+    bs++;
+    p--;
+  }
+  return (bs & 1) === 1;
+}
+
 function scanCodeSpanEndLinear(line: string, start: number, cursors: MarkdownLineScanCursors): { tickEnd: number; spanEnd: number } {
   let tickEnd = start + 1;
   while (tickEnd < line.length && line.charCodeAt(tickEnd) === 96) tickEnd++;
@@ -4130,12 +4115,52 @@ function scanCodeSpanEndLinear(line: string, start: number, cursors: MarkdownLin
   return { tickEnd, spanEnd: -1 };
 }
 
+function decodeUriEntitiesForScheme(input: string): string {
+  if (!input.includes('&')) return input;
+  return decodeHtmlEntities(input)
+    .replace(/&#0*(\d{1,7});?/g, (full, dec: string) => {
+      const code = Number(dec);
+      return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
+        ? code === 0
+          ? ''
+          : String.fromCodePoint(code)
+        : full;
+    })
+    .replace(/&#[xX]0*([0-9a-fA-F]{1,6});?/g, (full, hex: string) => {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
+        ? code === 0
+          ? ''
+          : String.fromCodePoint(code)
+        : full;
+    });
+}
+
 function hasDangerousUriScheme(rawHref: string): boolean {
   if (!rawHref) return false;
-  const decoded = decodeHtmlEntities(rawHref)
-    .replace(/[\u0000-\u0020\u007F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]+/gu, '')
+  const unescaped = rawHref.replace(/\\([!-/:-@[-`{-~])/g, '$1');
+  const decoded = decodeUriEntitiesForScheme(unescaped)
+    .replace(
+      /[\u0000-\u0020\u007F-\u009F\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]+/gu,
+      '',
+    )
     .trim();
-  return /^(?:javascript|vbscript|data|file|blob):/i.test(decoded);
+  if (/^(?:javascript|vbscript|data|file|blob):/i.test(decoded)) {
+    return true;
+  }
+  let stopIdx = decoded.length;
+  for (let i = 0; i < decoded.length; i++) {
+    const c = decoded.charCodeAt(i);
+    if (c === 47 /* '/' */ || c === 63 /* '?' */ || c === 35 /* '#' */) {
+      stopIdx = i;
+      break;
+    }
+  }
+  const beforePath = decoded.slice(0, stopIdx);
+  if (beforePath.includes('&') && /&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});?/.test(beforePath)) {
+    return true;
+  }
+  return false;
 }
 
 function tryParseMarkdownLinkOrImageAt(
@@ -4172,6 +4197,15 @@ function tryParseMarkdownLinkOrImageAt(
     const ch = line.charCodeAt(j);
     if (ch === 92) {
       j += 2;
+      continue;
+    }
+    if (ch === 96) {
+      const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, j, cursors);
+      if (spanEnd > 0 && spanEnd <= labelMaxEnd) {
+        j = spanEnd;
+        continue;
+      }
+      j = tickEnd;
       continue;
     }
     if (ch === 93) {
@@ -4301,11 +4335,15 @@ function stripMarkdownLinksToLabelsLinear(text: string): string {
       while (i < line.length) {
         const ch = line.charCodeAt(i);
         if (ch === 96) {
+          if (isBackslashEscapedAt(line, i)) {
+            i++;
+            continue;
+          }
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
           i = spanEnd > 0 ? spanEnd : tickEnd;
           continue;
         }
-        if (ch === 33 || ch === 91) {
+        if ((ch === 33 || ch === 91) && !isBackslashEscapedAt(line, i)) {
           const tok = tryParseMarkdownLinkOrImageAt(line, i, cursors, true);
           if (tok) {
             out += line.slice(lastIdx, i);
@@ -4328,6 +4366,269 @@ function isAsciiAlnumCode(c: number): boolean {
 }
 
 /**
+ * Linear O(N) pass over non-fenced Markdown prose that detects multi-line `[label\nlabel2](dest)` (and `![alt\nalt2](dest)`
+ * or `[label](\ndest)`) links within a single paragraph (no blank-line break) and strips the link wrapper to plain
+ * `label\nlabel2` whenever `dest` is empty or `hasDangerousUriScheme(dest)` is true (`R4-M6`).
+ */
+function stripDangerousMultilineMarkdownLinksLinear(prose: string): string {
+  if (!prose || !prose.includes('\n') || !prose.includes('](')) return prose;
+  const parts = prose.split(/(\r?\n[ \t]*\r?\n+)/);
+  let changedAny = false;
+  for (let pIdx = 0; pIdx < parts.length; pIdx += 2) {
+    const para = parts[pIdx]!;
+    if (!para.includes('\n') || !para.includes('](')) continue;
+
+    const cachedTickPos = new Map<number, number>();
+    const scannedTickTo = new Map<number, number>();
+    const findClosingTicks = (tickLen: number, fromIdx: number): number => {
+      if (tickLen > 32) return -1;
+      let pos = cachedTickPos.get(tickLen) ?? -2;
+      while (pos !== -1 && pos < fromIdx) {
+        let search = Math.max(fromIdx, scannedTickTo.get(tickLen) ?? 0);
+        pos = -1;
+        while (search < para.length) {
+          const hit = para.indexOf('`', search);
+          if (hit < 0) {
+            scannedTickTo.set(tickLen, para.length);
+            break;
+          }
+          let end = hit + 1;
+          while (end < para.length && para.charCodeAt(end) === 96) end++;
+          scannedTickTo.set(tickLen, end);
+          if (end - hit === tickLen && (hit === 0 || para.charCodeAt(hit - 1) !== 96)) {
+            pos = hit;
+            break;
+          }
+          search = end;
+        }
+        cachedTickPos.set(tickLen, pos);
+      }
+      return pos;
+    };
+
+    let nextBracketParen = -1;
+    let noBracketParen = false;
+    let nextCloseParen = -1;
+    let noCloseParen = false;
+    const outChunks: string[] = [];
+    let lastCopy = 0;
+    let i = 0;
+
+    while (i < para.length) {
+      const ch = para.charCodeAt(i);
+      if (ch === 96) {
+        if (isBackslashEscapedAt(para, i)) {
+          i++;
+          continue;
+        }
+        let tEnd = i + 1;
+        while (tEnd < para.length && para.charCodeAt(tEnd) === 96) tEnd++;
+        const tickLen = tEnd - i;
+        const closeHit = findClosingTicks(tickLen, tEnd);
+        i = closeHit >= tEnd ? closeHit + tickLen : tEnd;
+        continue;
+      }
+
+      if ((ch === 33 || ch === 91) && !isBackslashEscapedAt(para, i)) {
+        const isImg = ch === 33;
+        if (isImg && (i + 1 >= para.length || para.charCodeAt(i + 1) !== 91)) {
+          i++;
+          continue;
+        }
+        if (noBracketParen || noCloseParen) {
+          if (para.indexOf('`', i + 1) < 0) break;
+          i++;
+          continue;
+        }
+        const labelStart = isImg ? i + 2 : i + 1;
+        if (nextBracketParen < labelStart - 1) {
+          nextBracketParen = para.indexOf('](', Math.max(0, labelStart - 1));
+          if (nextBracketParen < 0) {
+            noBracketParen = true;
+            i++;
+            continue;
+          }
+        }
+        if (nextBracketParen - labelStart > 1_000) {
+          i++;
+          continue;
+        }
+
+        const labelLimit = Math.min(para.length, labelStart + 1_000);
+        let labelEnd = -1;
+        let bracketDepth = 0;
+        let j = labelStart;
+        while (j < labelLimit) {
+          const jc = para.charCodeAt(j);
+          if (jc === 92) {
+            j += 2;
+            continue;
+          }
+          if (jc === 96) {
+            let te = j + 1;
+            while (te < para.length && para.charCodeAt(te) === 96) te++;
+            const tl = te - j;
+            const chClose = findClosingTicks(tl, te);
+            if (chClose >= te && chClose + tl <= labelLimit) {
+              j = chClose + tl;
+              continue;
+            }
+            j = te;
+            continue;
+          }
+          if (jc === 93) {
+            if (bracketDepth === 0) {
+              if (j + 1 < para.length && para.charCodeAt(j + 1) === 40) {
+                labelEnd = j;
+              }
+              break;
+            }
+            bracketDepth--;
+            j++;
+            continue;
+          }
+          if (jc === 91) {
+            bracketDepth++;
+            if (bracketDepth > 4) break;
+            j++;
+            continue;
+          }
+          j++;
+        }
+
+        if (labelEnd >= 0) {
+          const destStart = labelEnd + 2;
+          if (nextCloseParen < destStart) {
+            nextCloseParen = para.indexOf(')', destStart);
+            if (nextCloseParen < 0) {
+              noCloseParen = true;
+              i++;
+              continue;
+            }
+          }
+          if (nextCloseParen - destStart <= 2_560) {
+            let k = destStart;
+            while (
+              k < para.length &&
+              (para.charCodeAt(k) === 32 || para.charCodeAt(k) === 9 || para.charCodeAt(k) === 13 || para.charCodeAt(k) === 10)
+            ) {
+              k++;
+            }
+            let rawUrl = '';
+            let validDest = k < para.length;
+            if (validDest && para.charCodeAt(k) === 60) {
+              const angleLimit = Math.min(para.length, k + 2_049);
+              let gt = -1;
+              for (let p = k + 1; p < angleLimit; p++) {
+                const pc = para.charCodeAt(p);
+                if (pc === 62) {
+                  gt = p;
+                  break;
+                }
+                if (pc === 60 || pc === 10 || pc === 13) {
+                  validDest = false;
+                  break;
+                }
+              }
+              if (gt < 0) validDest = false;
+              else {
+                rawUrl = para.slice(k + 1, gt).trim();
+                k = gt + 1;
+              }
+            } else if (validDest) {
+              const urlStart = k;
+              const urlLimit = Math.min(para.length, urlStart + 2_048);
+              let parenDepth = 0;
+              while (k < urlLimit) {
+                const uc = para.charCodeAt(k);
+                if (uc === 92 && k + 1 < urlLimit) {
+                  k += 2;
+                  continue;
+                }
+                if (uc === 32 || uc === 9 || uc === 10 || uc === 13) break;
+                if (uc === 40) {
+                  parenDepth++;
+                  if (parenDepth > 4) {
+                    validDest = false;
+                    break;
+                  }
+                } else if (uc === 41) {
+                  if (parenDepth === 0) break;
+                  parenDepth--;
+                }
+                k++;
+              }
+              if (parenDepth !== 0) validDest = false;
+              else rawUrl = para.slice(urlStart, k);
+            }
+
+            if (validDest) {
+              const wsStart = k;
+              while (
+                k < para.length &&
+                (para.charCodeAt(k) === 32 || para.charCodeAt(k) === 9 || para.charCodeAt(k) === 13 || para.charCodeAt(k) === 10)
+              ) {
+                k++;
+              }
+              if (k < para.length && k > wsStart && (para.charCodeAt(k) === 34 || para.charCodeAt(k) === 39)) {
+                const qChar = para.charCodeAt(k);
+                const tLimit = Math.min(para.length, k + 512);
+                let qEnd = -1;
+                for (let p = k + 1; p < tLimit; p++) {
+                  const tc = para.charCodeAt(p);
+                  if (tc === 92) {
+                    p++;
+                    continue;
+                  }
+                  if (tc === qChar) {
+                    qEnd = p;
+                    break;
+                  }
+                }
+                if (qEnd < 0) validDest = false;
+                else {
+                  k = qEnd + 1;
+                  while (
+                    k < para.length &&
+                    (para.charCodeAt(k) === 32 || para.charCodeAt(k) === 9 || para.charCodeAt(k) === 13 || para.charCodeAt(k) === 10)
+                  ) {
+                    k++;
+                  }
+                }
+              }
+            }
+
+            if (validDest && k < para.length && para.charCodeAt(k) === 41) {
+              const fullEnd = k + 1;
+              if (para.slice(i, fullEnd).includes('\n') && (!rawUrl.trim() || hasDangerousUriScheme(rawUrl.trim()))) {
+                outChunks.push(para.slice(lastCopy, i));
+                if (!isImg) {
+                  const rawLabel = para.slice(labelStart, labelEnd);
+                  outChunks.push(
+                    rawLabel.includes('](') ? stripDangerousMultilineMarkdownLinksLinear(rawLabel) : rawLabel,
+                  );
+                }
+                i = fullEnd;
+                lastCopy = i;
+                continue;
+              }
+            }
+          }
+        }
+      }
+      i++;
+    }
+
+    if (lastCopy > 0) {
+      if (lastCopy < para.length) outChunks.push(para.slice(lastCopy));
+      parts[pIdx] = outChunks.join('');
+      changedAny = true;
+    }
+  }
+  return changedAny ? parts.join('') : prose;
+}
+
+/**
  * Normalizes inline code spacing (`\`a\`\`b\`` -> `\`a\` \`b\``), duplicate link suffixes (`[lbl (url)](url)` / `[lbl](url)(url)`),
  * relative URL resolution, dangerous URI scheme stripping (`javascript:`, `vbscript:`, `data:`, `file:`, `blob:`),
  * autolink conversion (`<https://...>` -> `[https://...](https://...)`), and decorative/optional image stripping in O(N) time.
@@ -4341,7 +4642,8 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
     return prose;
   }
   const { baseUrl, includeImages = true, spaceAdjacentAlnum = false } = opts;
-  const bounded = prose.length > MAX_HTML_SCAN_CHARS ? prose.slice(0, MAX_HTML_SCAN_CHARS) : prose;
+  const rawBounded = prose.length > MAX_HTML_SCAN_CHARS ? prose.slice(0, MAX_HTML_SCAN_CHARS) : prose;
+  const bounded = stripDangerousMultilineMarkdownLinksLinear(rawBounded);
   return bounded
     .split('\n')
     .map((line) => {
@@ -4363,16 +4665,27 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
 
       const cursors = createMarkdownLineScanCursors();
       let out = '';
+      let lastEmittedCode = 0;
+      const emit = (chunk: string) => {
+        if (!chunk) return;
+        out += chunk;
+        lastEmittedCode = chunk.charCodeAt(chunk.length - 1);
+      };
+      let checkedNoLtOrTick = false;
       let lastCopyIdx = 0;
       let i = 0;
       while (i < line.length) {
         const ch = line.charCodeAt(i);
         // 1. Preserve inline backtick code spans untouched (spacing adjacent single-backtick spans when requested).
         if (ch === 96) {
+          if (isBackslashEscapedAt(line, i)) {
+            i++;
+            continue;
+          }
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
           if (spanEnd > 0) {
             if (spaceAdjacentAlnum && spanEnd < line.length && line.charCodeAt(spanEnd) === 96) {
-              out += `${line.slice(lastCopyIdx, spanEnd)} `;
+              emit(`${line.slice(lastCopyIdx, spanEnd)} `);
               lastCopyIdx = spanEnd;
             }
             i = spanEnd;
@@ -4397,20 +4710,20 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
           if (gt > i + 2) {
             const innerAuto = line.slice(i + 1, gt);
             if (hasDangerousUriScheme(innerAuto)) {
-              out += line.slice(lastCopyIdx, i);
+              emit(line.slice(lastCopyIdx, i));
               i = gt + 1;
               lastCopyIdx = i;
               continue;
             }
             if (/^https?:\/\/\S+$/i.test(innerAuto)) {
-              out += `${line.slice(lastCopyIdx, i)}[${innerAuto}](${innerAuto})`;
+              emit(`${line.slice(lastCopyIdx, i)}[${innerAuto}](${innerAuto})`);
               i = gt + 1;
               lastCopyIdx = i;
               continue;
             }
             if (/^mailto:[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(innerAuto)) {
               const addr = innerAuto.slice(7);
-              out += `${line.slice(lastCopyIdx, i)}[${addr}](${innerAuto})`;
+              emit(`${line.slice(lastCopyIdx, i)}[${addr}](${innerAuto})`);
               i = gt + 1;
               lastCopyIdx = i;
               continue;
@@ -4419,11 +4732,14 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
         }
 
         // 3. Handle Markdown links `[label](url)` and images `![alt](url)`.
-        if (ch === 33 || ch === 91) {
+        if ((ch === 33 || ch === 91) && !isBackslashEscapedAt(line, i)) {
           if (cursors.noCloseBracket || cursors.noCloseParen) {
-            // Neither links nor images can match anywhere later on this line; if no `<` or `` ` `` remains, finish in O(1)!
-            if (line.indexOf('<', i + 1) < 0 && line.indexOf('`', i + 1) < 0) {
-              break;
+            // Neither links nor images can match anywhere later on this line; check once if no `<` or `` ` `` remains to finish in O(1)!
+            if (!checkedNoLtOrTick) {
+              checkedNoLtOrTick = true;
+              if (line.indexOf('<', i + 1) < 0 && line.indexOf('`', i + 1) < 0) {
+                break;
+              }
             }
             i++;
             continue;
@@ -4434,12 +4750,12 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
             let nextIdx = tok.end;
 
             if (!href || hasDangerousUriScheme(href)) {
-              out += line.slice(lastCopyIdx, i);
+              emit(line.slice(lastCopyIdx, i));
               if (!tok.isImage) {
                 const cleanLbl = tok.rawLabel.includes('](')
                   ? sanitizeAndResolveMarkdownProseLinksLinear(tok.rawLabel, { baseUrl, includeImages })
                   : tok.rawLabel;
-                out += cleanLbl;
+                emit(cleanLbl);
               }
               i = nextIdx;
               lastCopyIdx = i;
@@ -4458,18 +4774,18 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
             }
 
             if (tok.isImage) {
-              out += line.slice(lastCopyIdx, i);
+              emit(line.slice(lastCopyIdx, i));
               if (!includeImages || isTinyOrAvatarImageUrl(href, tok.rawLabel)) {
                 i = nextIdx;
                 lastCopyIdx = i;
                 continue;
               }
-              out += `![${tok.rawLabel}](${href}${tok.titleSuffix})`;
+              emit(`![${tok.rawLabel}](${href}${tok.titleSuffix})`);
               // Separate consecutive inline images (`![a](u1) ![b](u2)`) onto distinct paragraphs.
               let wsAfter = nextIdx;
               while (wsAfter < line.length && (line.charCodeAt(wsAfter) === 32 || line.charCodeAt(wsAfter) === 9)) wsAfter++;
               if (wsAfter < line.length - 1 && line.charCodeAt(wsAfter) === 33 && line.charCodeAt(wsAfter + 1) === 91) {
-                out += '\n\n';
+                emit('\n\n');
                 nextIdx = wsAfter;
               }
               i = nextIdx;
@@ -4479,7 +4795,7 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
 
             // Skip `[Skip to content](#...)` anchor boilerplate.
             if (href.startsWith('#') && /^skip to (?:main )?content$/i.test(tok.rawLabel.trim())) {
-              out += line.slice(lastCopyIdx, i);
+              emit(line.slice(lastCopyIdx, i));
               while (nextIdx < line.length && (line.charCodeAt(nextIdx) === 32 || line.charCodeAt(nextIdx) === 9)) nextIdx++;
               i = nextIdx;
               lastCopyIdx = i;
@@ -4504,14 +4820,14 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
               }
             }
 
-            const prevCharCode = i > lastCopyIdx ? line.charCodeAt(i - 1) : out.length > 0 ? out.charCodeAt(out.length - 1) : 0;
-            out += line.slice(lastCopyIdx, i);
+            const prevCharCode = i > lastCopyIdx ? line.charCodeAt(i - 1) : lastEmittedCode;
+            emit(line.slice(lastCopyIdx, i));
             if (spaceAdjacentAlnum && /^https?:\/\//i.test(href) && prevCharCode > 0 && isAsciiAlnumCode(prevCharCode)) {
-              out += ' ';
+              emit(' ');
             }
-            out += `[${labelOut}](${href}${tok.titleSuffix})`;
+            emit(`[${labelOut}](${href}${tok.titleSuffix})`);
             if (spaceAdjacentAlnum && /^https?:\/\//i.test(href) && nextIdx < line.length && isAsciiAlnumCode(line.charCodeAt(nextIdx))) {
-              out += ' ';
+              emit(' ');
             }
             i = nextIdx;
             lastCopyIdx = i;
@@ -4552,6 +4868,10 @@ function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMark
       while (i < line.length) {
         const ch = line.charCodeAt(i);
         if (ch === 96) {
+          if (isBackslashEscapedAt(line, i)) {
+            i++;
+            continue;
+          }
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
           i = spanEnd > 0 ? spanEnd : tickEnd;
           continue;
@@ -4612,6 +4932,10 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
       let i = 0;
       while (i < line.length) {
         if (line.charCodeAt(i) === 96) {
+          if (isBackslashEscapedAt(line, i)) {
+            i++;
+            continue;
+          }
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
           if (spanEnd > 0) {
             out += `${line.slice(lastIdx, i)}\u0000EFMDINLINE${stash.push(line.slice(i, spanEnd)) - 1}\u0000`;
@@ -4907,6 +5231,9 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allow
         );
       }
 
+      if (proseWork.includes('&') && (proseWork.includes('](') || proseWork.includes('<') || proseWork.includes(']:'))) {
+        proseWork = sanitizeAndResolveMarkdownProseLinksLinear(proseWork, { baseUrl, includeImages: true });
+      }
       proseWork = decodeMarkdownEntitiesPreservingLt(proseWork);
       if (inlineCodeStash.length > 0) {
         proseWork = proseWork.replace(/\u0000EFMDINLINE(\d+)\u0000/g, (_m, sIdx: string) => inlineCodeStash[Number(sIdx)] ?? '');
@@ -5019,31 +5346,40 @@ export function extractMarkdownLinksAndImages(
   const collectFromLine = (line: string) => {
     if (!line.includes('](') && !line.includes('<')) return;
     const cursors = createMarkdownLineScanCursors();
+    let nextGt = -1;
+    let noGtLeft = false;
     let i = 0;
     while (i < line.length) {
       if (links.length >= 250 && (!includeImages || images.length >= 60)) break;
       const ch = line.charCodeAt(i);
       if (ch === 96) {
+        if (isBackslashEscapedAt(line, i)) {
+          i++;
+          continue;
+        }
         const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
         i = spanEnd > 0 ? spanEnd : tickEnd;
         continue;
       }
-      if (ch === 60 && links.length < 250) {
-        const gt = line.indexOf('>', i + 1);
-        if (gt > i + 8 && gt - i <= 2_048) {
-          const autoCandidate = line.slice(i + 1, gt);
+      if (ch === 60 && !noGtLeft && links.length < 250) {
+        if (nextGt <= i) {
+          nextGt = line.indexOf('>', i + 1);
+          if (nextGt < 0) noGtLeft = true;
+        }
+        if (!noGtLeft && nextGt > i + 8 && nextGt - i <= 2_048) {
+          const autoCandidate = line.slice(i + 1, nextGt);
           if (/^https?:\/\/\S+$/i.test(autoCandidate)) {
             const resolved = resolveHttpsHref(autoCandidate, baseUrl);
             if (resolved && !seenLinks.has(resolved)) {
               seenLinks.add(resolved);
               links.push(resolved);
             }
-            i = gt + 1;
+            i = nextGt + 1;
             continue;
           }
         }
       }
-      if (ch === 33 || ch === 91) {
+      if ((ch === 33 || ch === 91) && !isBackslashEscapedAt(line, i)) {
         const tok = tryParseMarkdownLinkOrImageAt(line, i, cursors, true);
         if (tok) {
           const rawHref = tok.rawUrl.trim();
@@ -7293,7 +7629,7 @@ export async function executeScrapeCall(params: {
         const atsParsed = JSON.parse(atsRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const atsItem = atsParsed.results?.[0];
         const atsBody = typeof atsItem?.body === 'string' && atsItem.bodyEncoding !== 'base64' ? atsItem.body : '';
-        if ((atsItem?.outcome === 'ok' || atsItem?.truncated === true) && atsBody.trim().length > 0) {
+        if ((atsItem?.outcome === 'ok' || (atsItem?.truncated === true && atsItem?.status === 200)) && atsBody.trim().length > 0) {
           const filteredBoard =
             jsonFilterStr && atsSpec.id.endsWith('-board')
               ? chunkJsonRecords({
@@ -8329,7 +8665,7 @@ export async function executeScrapeCall(params: {
           const stubItem = stubParsed.results?.[0];
           const stubBody = typeof stubItem?.body === 'string' && stubItem.bodyEncoding !== 'base64' ? stubItem.body : '';
           const stubFormatted =
-            (stubItem?.outcome === 'ok' || stubItem?.truncated === true) && stubBody
+            (stubItem?.outcome === 'ok' || (stubItem?.truncated === true && stubItem?.status === 200)) && stubBody
               ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd)
               : null;
           if (stubFormatted && stubFormatted.markdown.trim().length > 0) {

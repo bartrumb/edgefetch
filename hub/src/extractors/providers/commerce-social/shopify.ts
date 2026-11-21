@@ -56,7 +56,7 @@ export function isShopifyHtmlOrHeaders(
   if (!rawHtml) return false;
   const headSlice = rawHtml.slice(0, 120_000);
   return (
-    /[a-z0-9-]+\.myshopify\.com\b/i.test(headSlice) ||
+    /[a-z0-9-]\.myshopify\.com\b/i.test(headSlice) ||
     headSlice.includes('cdn.shopify.com') ||
     /Shopify\.shop\s*=/.test(headSlice) ||
     headSlice.includes('shopify-digital-wallet') ||

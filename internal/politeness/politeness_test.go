@@ -255,7 +255,29 @@ func TestRobotsRFC9309FullParityAndContentSignalInheritance(t *testing.T) {
 		t.Fatal("top-level pre-group Content-Signal: ai-input=no without User-agent groups must disallow")
 	}
 
-	// 7. HostState 429 cooldown tracking (`NoteRateLimit` & `CoolingDownRetryAfterMs`).
+	// 7. Semicolon-separated Content-Signal (`search=yes;ai-input=no`), single-quoted `'no'`, and empty `User-agent:` group isolation.
+	semiSignal := "User-agent: *\nContent-Signal: search=yes;ai-input=no\nAllow: /\n"
+	if se := ParseRobotsTxt(semiSignal, "edgefetch", exp); !se.DisallowAIInput || se.Allowed("/docs") {
+		t.Fatalf("expected Content-Signal: search=yes;ai-input=no to disallow ai-input, got %+v", se)
+	}
+	singleQuoted := "User-agent: *\nContent-Signal: search=yes, ai-input=' no '\nAllow: /\n"
+	if sq := ParseRobotsTxt(singleQuoted, "edgefetch", exp); !sq.DisallowAIInput || sq.Allowed("/docs") {
+		t.Fatalf("expected Content-Signal: ai-input='no' to disallow ai-input, got %+v", sq)
+	}
+	singleQuotedExact := "User-agent: *\nContent-Signal: ai-input='no'\nAllow: /\n"
+	if sq2 := ParseRobotsTxt(singleQuotedExact, "edgefetch", exp); !sq2.DisallowAIInput || sq2.Allowed("/docs") {
+		t.Fatalf("expected Content-Signal: ai-input='no' to disallow ai-input, got %+v", sq2)
+	}
+	emptyUAAfterGroup := "User-agent: *\nAllow: /\n\nUser-agent:\nDisallow: /\n"
+	if !ParseRobotsTxt(emptyUAAfterGroup, "edgefetch", exp).Allowed("/public") {
+		t.Fatal("empty User-agent: after a valid group must terminate the group and NOT attach Disallow: / to unnamed or previous group")
+	}
+	emptyUATop := "User-agent:\nDisallow: /\nContent-Signal: ai-input=no\n"
+	if topEmpty := ParseRobotsTxt(emptyUATop, "edgefetch", exp); topEmpty.DisallowAIInput || !topEmpty.Allowed("/public") {
+		t.Fatalf("empty User-agent: at top of file must not attach Disallow or Content-Signal, got %+v", topEmpty)
+	}
+
+	// 8. HostState 429 cooldown tracking (`NoteRateLimit` & `CoolingDownRetryAfterMs`).
 	now := time.Unix(1_750_000_000, 0)
 	hs := NewRegistry().Get("throttle.example.com", now)
 	if got := hs.CoolingDownRetryAfterMs(now); got != 0 {

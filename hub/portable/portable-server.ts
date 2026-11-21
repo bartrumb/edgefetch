@@ -176,48 +176,103 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
   });
 }
 
+const STRICT_SINGLE_HOST_RE =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([1-9]\d{0,4}))?$/;
+
+export function parseStrictSingleHost(raw: string | readonly string[] | undefined | null): string | null {
+  if (Array.isArray(raw)) {
+    if (raw.length !== 1) return null;
+    raw = raw[0];
+  }
+  if (typeof raw !== 'string') return null;
+  if (raw.includes(',') || raw.includes('..') || raw.includes('[') || raw.includes(']')) return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 255 || /\s/.test(trimmed)) return null;
+  const lower = trimmed.toLowerCase();
+  const m = STRICT_SINGLE_HOST_RE.exec(lower);
+  if (!m) return null;
+  if (m[1] !== undefined) {
+    const portNum = Number(m[1]);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return null;
+  }
+  return lower;
+}
+
+export function resolvePublicOrigin(params: {
+  canonicalOrigin: string;
+  trustProxy: boolean;
+  hasExplicitPublicOrigin: boolean;
+  hostHeader?: string | readonly string[] | null;
+  forwardedHostHeader?: string | readonly string[] | null;
+  forwardedProtoHeader?: string | readonly string[] | null;
+}): { origin: string; trustedForwardedHost: string | null } {
+  const baseOriginUrl = new URL(params.canonicalOrigin);
+
+  // Reject malformed raw Host headers (`Host: [`) with 400 (`H3`), and reject duplicate Host headers.
+  if (Array.isArray(params.hostHeader)) {
+    if (params.hostHeader.length > 1) {
+      throw new Error('Multiple Host headers are not allowed');
+    }
+    const first = params.hostHeader[0];
+    if (typeof first === 'string' && first.trim() !== '') {
+      void new URL(`http://${first.trim()}/`);
+    }
+  } else if (typeof params.hostHeader === 'string' && params.hostHeader.trim() !== '') {
+    void new URL(`http://${params.hostHeader.trim()}/`);
+  }
+
+  // M8: When `EDGEFETCH_PUBLIC_ORIGIN` is explicitly configured (or proxy headers are untrusted), strictly pin to `canonicalOrigin`.
+  if (params.hasExplicitPublicOrigin || !params.trustProxy) {
+    return { origin: baseOriginUrl.origin, trustedForwardedHost: null };
+  }
+
+  let proto = baseOriginUrl.protocol.replace(/:$/, '');
+  const rawProto = Array.isArray(params.forwardedProtoHeader)
+    ? params.forwardedProtoHeader.join(',')
+    : (params.forwardedProtoHeader ?? '');
+  const protoTokens = rawProto
+    .split(',')
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+  const rightmostProto = protoTokens.length > 0 ? protoTokens[protoTokens.length - 1] : undefined;
+  if (rightmostProto === 'https' || rightmostProto === 'http') {
+    proto = rightmostProto;
+  }
+
+  // Strictly validate single-host syntax on both `Host` and `X-Forwarded-Host` (port <= 65535, no commas/spaces/`..`/IPv6),
+  // and require `EDGEFETCH_PUBLIC_ORIGIN` to override `Host` behind a proxy — falling back only to validated `Host` so a
+  // spoofed `X-Forwarded-Host` cannot forge OAuth issuer metadata or bypass `/mcp` `Origin` validation!
+  const validHost = parseStrictSingleHost(params.hostHeader);
+  const validFwdHost = parseStrictSingleHost(params.forwardedHostHeader);
+  const authority = validHost ?? baseOriginUrl.host;
+  const trustedForwardedHost = validFwdHost !== null && validHost !== null && validFwdHost === validHost ? validFwdHost : null;
+
+  return {
+    origin: new URL(`${proto}://${authority}`).origin,
+    trustedForwardedHost,
+  };
+}
+
 function incomingToWebRequest(
   req: IncomingMessage,
   canonicalOrigin: string,
   trustProxy: boolean,
   hasExplicitPublicOrigin = false,
 ): Request {
-  const baseOriginUrl = new URL(canonicalOrigin);
-  let proto = baseOriginUrl.protocol.replace(/:$/, '');
-  let authority = baseOriginUrl.host;
-
-  // M8: When `EDGEFETCH_PUBLIC_ORIGIN` is explicitly configured, strictly pin request origin to `EDGEFETCH_PUBLIC_ORIGIN`
-  // and ignore `X-Forwarded-Host` / `X-Forwarded-Proto` so proxy header injection cannot poison OAuth / MCP origins!
-  if (trustProxy && !hasExplicitPublicOrigin) {
-    const fwdProto = (req.headers['x-forwarded-proto'] as string | undefined)?.split(',')[0]?.trim().toLowerCase();
-    if (fwdProto === 'https' || fwdProto === 'http') {
-      proto = fwdProto;
-    }
-    const fwdHost = (req.headers['x-forwarded-host'] as string | undefined)?.split(',')[0]?.trim();
-    if (fwdHost && /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?::\d{1,5})?$/.test(fwdHost) && !fwdHost.includes('..')) {
-      try {
-        const parsedFwd = new URL(`http://${fwdHost}/`);
-        const portNum = parsedFwd.port ? Number(parsedFwd.port) : 80;
-        if (parsedFwd.hostname && portNum >= 1 && portNum <= 65535 && !fwdHost.endsWith(':0')) {
-          authority = parsedFwd.host;
-        }
-      } catch {
-        // ignore invalid X-Forwarded-Host
-      }
-    }
-  } else {
-    // Reject malformed raw Host headers (`Host: [`) with 400 (H3), while keeping `selfHost` pinned to `canonicalOrigin` (H4)!
-    const rawHost = req.headers.host;
-    if (typeof rawHost === 'string' && rawHost.trim() !== '') {
-      void new URL(`http://${rawHost.trim()}/`);
-    }
-  }
+  const { origin, trustedForwardedHost } = resolvePublicOrigin({
+    canonicalOrigin,
+    trustProxy,
+    hasExplicitPublicOrigin,
+    hostHeader: req.headers.host,
+    forwardedHostHeader: req.headers['x-forwarded-host'],
+    forwardedProtoHeader: req.headers['x-forwarded-proto'],
+  });
 
   const rawTarget = req.url ?? '/';
   if (!rawTarget.startsWith('/') && rawTarget !== '*') {
     throw new Error('Malformed request-target');
   }
-  const fullUrl = new URL(rawTarget === '*' ? '/' : rawTarget, `${proto}://${authority}`).toString();
+  const fullUrl = new URL(rawTarget === '*' ? '/' : rawTarget, origin).toString();
 
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) {
@@ -225,6 +280,7 @@ function incomingToWebRequest(
     // H4: Never trust client-supplied `cf-connecting-ip`, and strip `x-forwarded-*` unless `EDGEFETCH_TRUST_PROXY=1`.
     if (lower === 'cf-connecting-ip') continue;
     if (!trustProxy && lower.startsWith('x-forwarded-')) continue;
+    if (lower === 'x-forwarded-host' && trustedForwardedHost === null) continue;
     if (Array.isArray(v)) {
       for (const item of v) headers.append(k, item);
     } else if (typeof v === 'string') {
@@ -233,9 +289,10 @@ function incomingToWebRequest(
   }
   headers.set('cf-connecting-ip', resolveTrustedClientIp(req, trustProxy));
 
-  const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+  const method = (req.method ?? 'GET').toUpperCase();
+  const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
   return new Request(fullUrl, {
-    method: req.method ?? 'GET',
+    method,
     headers,
     ...(hasBody ? { body: safeNodeReqToWebStream(req), duplex: 'half' } : {}),
   } as RequestInit);
@@ -398,8 +455,13 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         res.setHeader(key, val);
       });
       // `R3-M1`: Whenever an unauthenticated / over-limit / error response (`>= 400`) finishes while the client is still
-      // streaming an unread request body (`!req.complete`), send `Connection: close` and destroy the socket after flush!
-      const shouldDestroyAfterFlush = !req.complete && webRes.status >= 400;
+      // streaming an unread request body (`!req.complete`), OR when a `GET`/`HEAD`/`OPTIONS` request includes unexpected body framing,
+      // send `Connection: close` and destroy the socket after flush!
+      const methodUpper = (req.method ?? 'GET').toUpperCase();
+      const ignoredBodyFraming =
+        (methodUpper === 'GET' || methodUpper === 'HEAD' || methodUpper === 'OPTIONS') &&
+        Boolean(req.headers['transfer-encoding'] || (req.headers['content-length'] && req.headers['content-length'] !== '0'));
+      const shouldDestroyAfterFlush = (!req.complete && webRes.status >= 400) || ignoredBodyFraming;
       if (shouldDestroyAfterFlush) {
         res.setHeader('connection', 'close');
         res.once('finish', () => {
@@ -429,8 +491,9 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       res.end(JSON.stringify({ error: 'internal_error', message: err instanceof Error ? err.message : String(err) }));
     }
   });
-  server.requestTimeout = 60_000;
   server.headersTimeout = 15_000;
+  server.requestTimeout = 30_000;
+  server.keepAliveTimeout = 5_000;
   server.maxConnections = 512;
 
   server.on('upgrade', (req, socket, head) => {

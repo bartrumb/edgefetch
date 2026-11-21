@@ -948,12 +948,24 @@ function buildToolDefinitions(deps: McpServerDeps) {
             minimum: 0,
             description: 'Minimum annual base salary floor (ignores total-target-cash / OTE unless basis === "base").',
           },
+          minBaseMode: {
+            type: 'string',
+            enum: ['floor', 'ceiling'],
+            default: 'floor',
+            description: 'How minBase evaluates salary ranges: "floor" (default, pay.min >= minBase) or "ceiling" (pay.max >= minBase).',
+          },
+          strictPay: {
+            type: 'boolean',
+            default: false,
+            description: 'When true and minBase is set, drop jobs with unlisted pay instead of keeping them with payUnknown: true.',
+          },
           postedWithinDays: { type: 'integer', minimum: 1, maximum: 365, description: 'Filter postings published within N days.' },
           limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
-          includeBuiltIn: { type: 'boolean', default: true, description: 'Also check Built In remote job search.' },
+          includeBuiltIn: { type: 'boolean', default: true, description: 'Also check Built In remote job search (disabled by default when company or domains is set).' },
           includePublicFeeds: {
             type: 'boolean',
-            description: 'Include robots.txt-allowed public remote job feeds (We Work Remotely, Himalayas, Working Nomads).',
+            default: false,
+            description: 'Opt-in to robots.txt-allowed public remote job feeds (We Work Remotely, Himalayas, Working Nomads).',
           },
           mode: {
             type: 'string',
@@ -1767,7 +1779,7 @@ async function dispatchRpcMessage(
         body: jsonRpcResult(id, {
           resultType: 'complete',
           supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
-          capabilities: { tools: { listChanged: true } },
+          capabilities: { tools: {} },
           _meta: {
             'io.modelcontextprotocol/serverInfo': { name: deps.serverName, version: deps.serverVersion },
           },
@@ -1793,7 +1805,7 @@ async function dispatchRpcMessage(
       return {
         body: jsonRpcResult(id, {
           protocolVersion,
-          capabilities: { tools: { listChanged: true } },
+          capabilities: { tools: {} },
           serverInfo: { name: deps.serverName, version: deps.serverVersion },
           instructions: MCP_INSTRUCTIONS,
         }),

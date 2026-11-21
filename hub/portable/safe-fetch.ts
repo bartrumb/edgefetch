@@ -189,11 +189,18 @@ export function createPublicOnlyLookup(resolver: LookupResolverFn = dns.lookup):
   };
 }
 
+export const DEFAULT_SAFE_FETCH_TIMEOUT_MS = 30_000;
+export const MAX_SAFE_FETCH_RESPONSE_BYTES = 32 * 1024 * 1024; // 32 MiB hard streamed response ceiling
+
 export interface SafeOutboundFetchOptions {
   /** Custom DNS resolver hook for deterministic unit tests (`H5`). */
   resolver?: LookupResolverFn;
   /** Allow explicit operator-configured loopback HTTP URLs (e.g. local Ollama `http://127.0.0.1:11434`). */
   allowExplicitLoopbackUrls?: boolean;
+  /** Default request timeout in milliseconds when caller omits a tighter `AbortSignal` (default `30_000`). */
+  defaultTimeoutMs?: number;
+  /** Maximum streamed response bytes before aborting the socket (default `32 MiB`). */
+  maxResponseBytes?: number;
 }
 
 /**
@@ -205,21 +212,32 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
   const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 32, lookup: safeLookup });
   const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 16, lookup: safeLookup });
   const loopbackHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 8 });
+  const defaultTimeoutMs =
+    typeof opts.defaultTimeoutMs === 'number' && opts.defaultTimeoutMs > 0
+      ? opts.defaultTimeoutMs
+      : DEFAULT_SAFE_FETCH_TIMEOUT_MS;
+  const maxResponseBytes =
+    typeof opts.maxResponseBytes === 'number' && opts.maxResponseBytes > 0
+      ? opts.maxResponseBytes
+      : MAX_SAFE_FETCH_RESPONSE_BYTES;
 
   const executeSingleRequest = (
     targetUrl: URL,
     init: RequestInit | undefined,
     bodyBytes: Buffer | null,
     allowLoopbackThisHop: boolean,
+    onBodySettled?: () => void,
   ): Promise<Response> =>
     new Promise<Response>((resolve, reject) => {
       if (init?.signal?.aborted) {
+        onBodySettled?.();
         reject(init.signal.reason ?? new DOMException('Aborted', 'AbortError'));
         return;
       }
       const isHttps = targetUrl.protocol === 'https:';
       const isHttp = targetUrl.protocol === 'http:';
       if (!isHttps && !isHttp) {
+        onBodySettled?.();
         reject(new Error(`Unsupported protocol: ${targetUrl.protocol}`));
         return;
       }
@@ -229,6 +247,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
 
       if (!isExplicitLoopback && net.isIP(targetUrl.hostname.replace(/^\[|\]$/g, '')) !== 0) {
         if (!isPublicIpAddress(targetUrl.hostname)) {
+          onBodySettled?.();
           reject(new Error(`SSRF blocked: refusing connection to non-public IP literal ${targetUrl.hostname}`));
           return;
         }
@@ -238,7 +257,10 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
       if (init?.headers) {
         const h = new Headers(init.headers);
         h.forEach((v, k) => {
-          hdrObj[k] = v;
+          const lower = k.trim().toLowerCase();
+          // Strip caller-supplied Host/:authority overrides so `headers: { host: 'evil.internal' }` can never spoof Host.
+          if (lower === 'host' || lower === ':authority') return;
+          hdrObj[lower] = v;
         });
       }
       if (bodyBytes && hdrObj['content-length'] === undefined) {
@@ -270,6 +292,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         if (settled) return;
         settled = true;
         detachAbort();
+        onBodySettled?.();
         reject(err);
       };
 
@@ -286,12 +309,12 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
           (res) => {
             activeRes = res;
             const status = res.statusCode ?? 502;
-            // `R3-M2`: Never permit `101 Switching Protocols` upgrades on outbound HTTP fetches!
-            if (status === 101) {
+            // `R3-M2`: Never permit `1xx` / `101 Switching Protocols` final responses on outbound HTTP fetches!
+            if (status >= 100 && status < 200) {
               res.on('error', () => undefined);
               res.socket?.destroy();
               res.destroy();
-              finishErr(new Error('HTTP 101 Switching Protocols is not allowed'));
+              finishErr(new Error(`HTTP ${status} informational response is not allowed`));
               return;
             }
 
@@ -308,6 +331,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
             if (nullBodyStatus || reqMethod === 'HEAD') {
               res.on('error', () => undefined);
               detachAbort();
+              onBodySettled?.();
               const hasBogusBodyFraming =
                 (status === 204 || status === 205) &&
                 Boolean(res.headers['transfer-encoding'] || (res.headers['content-length'] && res.headers['content-length'] !== '0'));
@@ -324,11 +348,13 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
 
             // Wrap `res` in an error-safe Web `ReadableStream` so unread/aborted responses NEVER emit uncaught `'error'` events (`R3-M2`)!
             let streamClosed = false;
+            let streamedBytes = 0;
             let streamCtrl: ReadableStreamDefaultController<Uint8Array> | null = null;
             let pendingStreamErr: unknown = null;
 
             const cleanupResListeners = () => {
               detachAbort();
+              onBodySettled?.();
               res.removeListener('data', onResData);
               res.removeListener('end', onResEnd);
               res.removeListener('close', onResClose);
@@ -351,6 +377,15 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
 
             const onResData = (chunk: Buffer | Uint8Array) => {
               if (streamClosed || !streamCtrl) return;
+              streamedBytes += chunk.byteLength;
+              if (streamedBytes > maxResponseBytes) {
+                const capErr = new Error(
+                  `Outbound response body exceeds ${maxResponseBytes} bytes (32 MiB) limit`,
+                );
+                failStream(capErr);
+                res.destroy();
+                return;
+              }
               try {
                 streamCtrl.enqueue(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
                 if ((streamCtrl.desiredSize ?? 1) <= 0) {
@@ -423,6 +458,21 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         return;
       }
 
+      // Guard against infinite 1xx informational response loops: permit at most two 103 Early Hints,
+      // and immediately destroy/reject on any other 1xx (100/102/199) or > 2 informational frames.
+      let info103Count = 0;
+      req.on('information', (info) => {
+        const code = info?.statusCode ?? 0;
+        if (code === 103 && info103Count < 2) {
+          info103Count += 1;
+          return;
+        }
+        const err = new Error(`Disallowed HTTP ${code} informational response`);
+        req.socket?.on('error', () => undefined);
+        req.socket?.destroy();
+        req.destroy(err);
+        finishErr(err);
+      });
       req.on('upgrade', (_res, socket) => {
         socket.on('error', () => undefined);
         socket.destroy();
@@ -493,43 +543,77 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
 
     const redirectMode = init?.redirect ?? 'manual';
     let currentHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    currentHeaders.delete('host');
 
-    for (let hop = 0; hop <= 5; hop++) {
-      const res = await executeSingleRequest(
-        currentUrl,
-        { ...init, method: currentMethod, headers: currentHeaders },
-        bodyBytes,
-        hop === 0 && opts.allowExplicitLoopbackUrls === true,
-      );
-      if (redirectMode !== 'follow' || res.status < 300 || res.status >= 400) {
-        if (redirectMode === 'error' && res.status >= 300 && res.status < 400) {
-          await res.body?.cancel().catch(() => undefined);
-          throw new Error(`Unexpected redirect HTTP ${res.status}`);
+    const timeoutCtrl = new AbortController();
+    const timeoutTimer = setTimeout(() => {
+      const err = new Error(`Outbound request timed out after ${defaultTimeoutMs}ms`);
+      err.name = 'TimeoutError';
+      timeoutCtrl.abort(err);
+    }, defaultTimeoutMs);
+    timeoutTimer.unref?.();
+    const clearRequestTimer = () => clearTimeout(timeoutTimer);
+    const effectiveSignal = init?.signal ? AbortSignal.any([init.signal, timeoutCtrl.signal]) : timeoutCtrl.signal;
+
+    try {
+      for (let hop = 0; hop <= 5; hop++) {
+        const isLastReturnedHop = { kept: false };
+        const res = await executeSingleRequest(
+          currentUrl,
+          { ...init, method: currentMethod, headers: currentHeaders, signal: effectiveSignal },
+          bodyBytes,
+          hop === 0 && opts.allowExplicitLoopbackUrls === true,
+          () => {
+            if (isLastReturnedHop.kept) clearRequestTimer();
+          },
+        );
+        if (redirectMode !== 'follow' || res.status < 300 || res.status >= 400) {
+          if (redirectMode === 'error' && res.status >= 300 && res.status < 400) {
+            await res.body?.cancel().catch(() => undefined);
+            clearRequestTimer();
+            throw new Error(`Unexpected redirect HTTP ${res.status}`);
+          }
+          if (res.body === null) {
+            clearRequestTimer();
+          } else {
+            isLastReturnedHop.kept = true;
+          }
+          return res;
         }
-        return res;
+        const loc = res.headers.get('location');
+        await res.body?.cancel().catch(() => undefined);
+        if (!loc) {
+          clearRequestTimer();
+          return res;
+        }
+        if (hop === 5) {
+          clearRequestTimer();
+          throw new Error('Too many redirects');
+        }
+        const nextUrl = new URL(loc, currentUrl);
+        if (nextUrl.protocol !== 'https:') {
+          clearRequestTimer();
+          throw new Error(`Refusing redirect to non-HTTPS URL: ${nextUrl.protocol}`);
+        }
+        if (nextUrl.origin !== currentUrl.origin) {
+          currentHeaders.delete('authorization');
+          currentHeaders.delete('cookie');
+          currentHeaders.delete('x-api-key');
+          currentHeaders.delete('x-goog-api-key');
+        }
+        if (res.status === 301 || res.status === 302 || res.status === 303) {
+          currentMethod = 'GET';
+          bodyBytes = null;
+          currentHeaders.delete('content-type');
+          currentHeaders.delete('content-length');
+        }
+        currentUrl = nextUrl;
       }
-      const loc = res.headers.get('location');
-      await res.body?.cancel().catch(() => undefined);
-      if (!loc) return res;
-      if (hop === 5) throw new Error('Too many redirects');
-      const nextUrl = new URL(loc, currentUrl);
-      if (nextUrl.protocol !== 'https:') {
-        throw new Error(`Refusing redirect to non-HTTPS URL: ${nextUrl.protocol}`);
-      }
-      if (nextUrl.origin !== currentUrl.origin) {
-        currentHeaders.delete('authorization');
-        currentHeaders.delete('cookie');
-        currentHeaders.delete('x-api-key');
-        currentHeaders.delete('x-goog-api-key');
-      }
-      if (res.status === 301 || res.status === 302 || res.status === 303) {
-        currentMethod = 'GET';
-        bodyBytes = null;
-        currentHeaders.delete('content-type');
-        currentHeaders.delete('content-length');
-      }
-      currentUrl = nextUrl;
+      clearRequestTimer();
+      throw new Error('Too many redirects');
+    } catch (err) {
+      clearRequestTimer();
+      throw err;
     }
-    throw new Error('Too many redirects');
   }) as typeof fetch;
 }

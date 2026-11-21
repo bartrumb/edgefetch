@@ -62,6 +62,27 @@ function trimTrailingSlashes(s: string): string {
   return s.slice(0, end);
 }
 
+function normalizeOperatorBaseUrlPreservingQuery(raw: string): string {
+  const qIdx = raw.indexOf('?');
+  if (qIdx < 0) return trimTrailingSlashes(raw);
+  return `${trimTrailingSlashes(raw.slice(0, qIdx))}${raw.slice(qIdx)}`;
+}
+
+function stripBaseUrlQuery(raw: string): string {
+  const qIdx = raw.indexOf('?');
+  return qIdx >= 0 ? trimTrailingSlashes(raw.slice(0, qIdx)) : trimTrailingSlashes(raw);
+}
+
+function appendEndpointToBaseUrl(baseUrl: string, suffixPath: string, alreadyEndsWith?: string): string {
+  const qIdx = baseUrl.indexOf('?');
+  const pathPart = qIdx >= 0 ? trimTrailingSlashes(baseUrl.slice(0, qIdx)) : trimTrailingSlashes(baseUrl);
+  const queryPart = qIdx >= 0 ? baseUrl.slice(qIdx) : '';
+  if (alreadyEndsWith && pathPart.endsWith(alreadyEndsWith)) {
+    return `${pathPart}${queryPart}`;
+  }
+  return `${pathPart}${suffixPath}${queryPart}`;
+}
+
 const OFFICIAL_PROVIDER_TRUSTED_PREFIXES: Partial<Record<LlmProvider, string>> = {
   openai: 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com',
@@ -290,9 +311,23 @@ function isOfflineHost(urlStr: string): boolean {
 
 export function redactLlmConfigForLog(cfg: ResolvedLlmConfig | null): Record<string, unknown> | undefined {
   if (!cfg) return undefined;
+  let safeBaseUrl = cfg.baseUrl;
+  if (!safeBaseUrl.startsWith('workers-ai://')) {
+    try {
+      const u = new URL(safeBaseUrl);
+      if (u.username || u.password) {
+        u.username = '';
+        u.password = '';
+        const serialized = u.toString();
+        safeBaseUrl = !u.search && !u.hash ? trimTrailingSlashes(serialized) : serialized;
+      }
+    } catch {
+      safeBaseUrl = safeBaseUrl.replace(/^(https?:\/\/)[^/@\s]+@/i, '$1');
+    }
+  }
   return {
     provider: cfg.provider,
-    baseUrl: cfg.baseUrl,
+    baseUrl: safeBaseUrl,
     model: cfg.model,
     isOfflineLocal: cfg.isOfflineLocal,
     hasApiKey: Boolean(cfg.apiKey),
@@ -369,7 +404,7 @@ export function resolveLlmConfig(params: {
     ? `${trimTrailingSlashes(rawOllamaHost).replace(/\/v1$/, '')}/v1`
     : '';
   const operatorBaseUrl = rawEnvBase
-    ? trimTrailingSlashes(rawEnvBase)
+    ? normalizeOperatorBaseUrlPreservingQuery(rawEnvBase)
     : operatorDefaultProvider === 'ollama' && normalizedOllamaBase
       ? normalizedOllamaBase
       : '';
@@ -396,7 +431,7 @@ export function resolveLlmConfig(params: {
     }
     const candidate = cleanedCandidate.normalized;
     let allowedOverride = false;
-    if (operatorBaseUrl && matchesTrustedBaseUrlPrefix(candidate, operatorBaseUrl)) {
+    if (operatorBaseUrl && matchesTrustedBaseUrlPrefix(candidate, stripBaseUrlQuery(operatorBaseUrl))) {
       allowedOverride = true;
     }
     if (!allowedOverride && env.EDGEFETCH_ALLOW_LOCAL_LLM_OVERRIDE === 'true') {
@@ -469,11 +504,15 @@ export function resolveLlmConfig(params: {
   //    values identical to the operator's default `provider` and `baseUrl`).
   const reqApiKey = typeof reqObj?.apiKey === 'string' && reqObj.apiKey.trim() ? reqObj.apiKey.trim() : undefined;
   const officialPrefix = OFFICIAL_PROVIDER_TRUSTED_PREFIXES[inferredProvider];
-  const matchesOfficialProviderPrefix = Boolean(officialPrefix && matchesTrustedBaseUrlPrefix(baseUrl, officialPrefix));
+  const baseForPrefixCheck = !hasCallerBaseUrl ? stripBaseUrlQuery(baseUrl) : baseUrl;
+  const operatorBaseForPrefixCheck = operatorBaseUrl ? stripBaseUrlQuery(operatorBaseUrl) : '';
+  const matchesOfficialProviderPrefix = Boolean(
+    officialPrefix && matchesTrustedBaseUrlPrefix(baseForPrefixCheck, officialPrefix),
+  );
   const matchesOperatorConfiguredProviderPrefix = Boolean(
     operatorBaseUrl &&
       operatorDefaultProvider === inferredProvider &&
-      matchesTrustedBaseUrlPrefix(baseUrl, operatorBaseUrl),
+      (!hasCallerBaseUrl || matchesTrustedBaseUrlPrefix(baseForPrefixCheck, operatorBaseForPrefixCheck)),
   );
 
   const envKeyForProvider =
@@ -490,8 +529,10 @@ export function resolveLlmConfig(params: {
       : undefined;
 
   const providerMatchesOperatorDefault = Boolean(operatorDefaultProvider && inferredProvider === operatorDefaultProvider);
-  const parsedBaseCheck = validateCleanHttpBaseUrl(baseUrl);
-  const parsedOpDefaultCheck = operatorDefaultBaseUrl ? validateCleanHttpBaseUrl(operatorDefaultBaseUrl) : null;
+  const parsedBaseCheck = validateCleanHttpBaseUrl(baseForPrefixCheck);
+  const parsedOpDefaultCheck = operatorDefaultBaseUrl
+    ? validateCleanHttpBaseUrl(!hasCallerBaseUrl ? stripBaseUrlQuery(operatorDefaultBaseUrl) : operatorDefaultBaseUrl)
+    : null;
   const baseUrlMatchesOperatorDefault = Boolean(
     !hasCallerBaseUrl ||
       (parsedBaseCheck.ok &&
@@ -505,7 +546,10 @@ export function resolveLlmConfig(params: {
 
   const apiKey = reqApiKey ?? envKeyForProvider ?? genericEnvKey ?? undefined;
 
-  const matchesOperatorPrefix = Boolean(operatorBaseUrl && matchesTrustedBaseUrlPrefix(baseUrl, operatorBaseUrl));
+  const matchesOperatorPrefix = Boolean(
+    operatorBaseUrl &&
+      (!hasCallerBaseUrl || matchesTrustedBaseUrlPrefix(baseForPrefixCheck, operatorBaseForPrefixCheck)),
+  );
   const callerOverrodeBaseUrl = Boolean(hasCallerBaseUrl && !matchesOperatorPrefix);
   const resolvedSafeFetch =
     callerOverrodeBaseUrl && !isOfflineHost(baseUrl)
@@ -742,7 +786,7 @@ export async function completeLlmTurn(params: {
         });
       }
     }
-    const endpoint = config.baseUrl.endsWith('/messages') ? config.baseUrl : `${config.baseUrl}/messages`;
+    const endpoint = appendEndpointToBaseUrl(config.baseUrl, '/messages', '/messages');
     try {
       const res = await fetchFn(endpoint, {
         method: 'POST',
@@ -849,7 +893,7 @@ export async function completeLlmTurn(params: {
       }
     }
     const cleanModel = config.model.replace(/^models\//, '');
-    const endpoint = `${config.baseUrl}/models/${encodeURIComponent(cleanModel)}:generateContent`;
+    const endpoint = appendEndpointToBaseUrl(config.baseUrl, `/models/${encodeURIComponent(cleanModel)}:generateContent`);
     try {
       const res = await fetchFn(endpoint, {
         method: 'POST',
@@ -946,9 +990,7 @@ export async function completeLlmTurn(params: {
     return { role: m.role, content: m.content };
   });
 
-  const endpoint = config.baseUrl.endsWith('/chat/completions')
-    ? config.baseUrl
-    : `${config.baseUrl}/chat/completions`;
+  const endpoint = appendEndpointToBaseUrl(config.baseUrl, '/chat/completions', '/chat/completions');
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (config.apiKey) {
     headers.authorization = `Bearer ${config.apiKey}`;

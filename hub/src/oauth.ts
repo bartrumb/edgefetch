@@ -14,8 +14,8 @@ export const MCP_SCOPES = ['crawl:read', 'crawl:fetch'] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
 
 const AUTH_CODE_TTL_MS = 90_000; // 90s single-use authorization code
-const ACCESS_TOKEN_TTL_MS = 24 * 60 * 60_000; // 24h access token for durable multi-hour CLI/MCP sessions
-const REFRESH_TOKEN_TTL_MS = 90 * 24 * 60 * 60_000; // 90d rotating refresh token
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1_000; // 1h access token (with 90d rotating refresh token)
+const REFRESH_TOKEN_TTL_MS = 90 * 24 * 60 * 60 * 1_000; // 90d rotating refresh token
 const ADMIN_SESSION_TTL_MS = 8 * 60 * 60_000; // 8h admin browser session
 const RATE_LIMIT_WINDOW_MS = 5 * 60_000; // 5m brute-force window
 const RATE_LIMIT_MAX_FAILURES = 5;
@@ -1121,6 +1121,7 @@ const CONSENT_PAGE_HEADERS: Record<string, string> = {
   'content-type': 'text/html; charset=utf-8',
   'cache-control': 'no-store',
   'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+  'x-content-type-options': 'nosniff',
   'x-frame-options': 'DENY',
   'referrer-policy': 'no-referrer',
 };

@@ -1185,7 +1185,7 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	return res, redirectLoc, finalBody
 }
 
-var reEmbeddedHTTPURL = regexp.MustCompile(`(?i)https?://[^\s"'<>` + "`" + `)\]]+`)
+var reEmbeddedHTTPURL = regexp.MustCompile(`(?i)https?://[^\s"\\]+`)
 
 func scrubSingleURLToken(raw string) string {
 	if idx := strings.IndexByte(raw, '#'); idx >= 0 {
@@ -1546,7 +1546,8 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 		}, 0
 	}
-	baseCtx := context.WithoutCancel(ctx)
+	baseCtx, cancelAll := context.WithTimeout(context.WithoutCancel(ctx), politeness.RobotsTimeout+3*time.Second)
+	defer cancelAll()
 	curURL := &url.URL{Scheme: target.Scheme, Host: target.Host, Path: "/robots.txt"}
 
 	for hop := 0; hop <= MaxRedirects; hop++ {
@@ -1590,7 +1591,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 				break
 			}
 			cancelAttempt()
-			if ctx.Err() != nil || isPermanentFetchError(err) {
+			if ctx.Err() != nil || baseCtx.Err() != nil || isPermanentFetchError(err) {
 				break
 			}
 		}
@@ -1677,6 +1678,13 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 				Reason:     "robots_unreachable: /robots.txt read failed (disallow assumed per RFC 9309): " + err.Error(),
 				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 			}, politeness.DefaultThrottlePause
+		}
+		if len(raw) >= politeness.RobotsMaxBytes {
+			if nl := strings.LastIndexAny(string(raw), "\r\n"); nl >= 0 {
+				raw = raw[:nl+1]
+			} else {
+				raw = nil
+			}
 		}
 
 		ttl := parseRobotsCacheTTL(resp.Header)

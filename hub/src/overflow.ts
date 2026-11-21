@@ -639,7 +639,7 @@ function storeCachedHubRobots(cacheKey: string, entry: ParsedRobots, now: number
 }
 
 const AUTO_KIND_ACCEPTABLE_CT_RE =
-  /^(?:text\/|application\/(?:[a-z0-9.+-]*\+)?(?:json|xml)|application\/(?:xhtml\+xml|rss\+xml|atom\+xml|x-ndjson|yaml|x-yaml|csv|javascript|ecmascript))(?:[;\s]|$)/i;
+  /^(?:text\/[a-z0-9.+-]+|application\/(?:[a-z0-9.+-]*\+)?(?:json|xml)|application\/(?:xhtml\+xml|rss\+xml|atom\+xml|x-ndjson|yaml|x-yaml|csv|javascript|ecmascript))(?:[;\s]|$)/i;
 
 function readCallerHeaderCaseInsensitive(
   hdrs: Record<string, unknown> | undefined,

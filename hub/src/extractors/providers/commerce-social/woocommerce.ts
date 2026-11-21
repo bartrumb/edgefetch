@@ -6,6 +6,7 @@ import {
   type CatalogRecord,
   type CatalogSpec,
   type CatalogVariantRecord,
+  type HtmlFragmentConverter,
   type TwinFormattedDoc,
 } from '../../types';
 import {
@@ -39,9 +40,97 @@ export function isWooCommerceHtmlOrHeaders(
     slice.includes('woocommerce-page') ||
     slice.includes('wc-block-grid') ||
     slice.includes('/plugins/woocommerce/') ||
+    slice.includes('WooCommerce') ||
     slice.includes('wc_add_to_cart_params') ||
     slice.includes('/wp-json/wc/store/')
   );
+}
+
+/**
+ * Resolves the public WooCommerce Store API v1 lookup URL (`${origin}/wp-json/wc/store/v1/products?slug=<slug>`)
+ * when `productUrl` matches `/product/<slug>/?` on an `https://` origin.
+ */
+export function resolveCustomDomainWooCommerceProductTwinUrl(
+  productUrl: string,
+): { slug: string; storeApiUrl: string } | null {
+  let u: URL;
+  try {
+    u = new URL(productUrl);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:') return null;
+  const m = /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/product\/([a-z0-9._~%-]+)\/?$/i.exec(u.pathname);
+  if (!m?.[1]) return null;
+  let slug = m[1];
+  try {
+    slug = decodeURIComponent(slug).trim();
+  } catch {
+    slug = m[1].trim();
+  }
+  if (!slug || slug.length > 160 || slug.includes('/')) return null;
+  return {
+    slug,
+    storeApiUrl: `${u.origin}/wp-json/wc/store/v1/products?slug=${encodeURIComponent(slug)}`,
+  };
+}
+
+export function enrichWooCommerceProductFromStoreApi(params: {
+  rawJson: string;
+  productUrl: string;
+  slug: string;
+  htmlToMd: HtmlFragmentConverter;
+  fallbackBodyMd?: string;
+}): TwinFormattedDoc | null {
+  const parsed = parseJsonValue(params.rawJson);
+  const candidates = Array.isArray(parsed)
+    ? (parsed as Array<Record<string, unknown>>)
+    : parsed && typeof parsed === 'object'
+      ? [parsed as Record<string, unknown>]
+      : [];
+  if (candidates.length === 0) return null;
+
+  const targetSlugLower = params.slug.toLowerCase();
+  const matched =
+    candidates.find((c) => typeof c?.slug === 'string' && c.slug.trim().toLowerCase() === targetSlugLower) ??
+    (candidates.length === 1 ? candidates[0] : undefined);
+  if (!matched || typeof matched !== 'object') return null;
+
+  const rec = normalizeWooCommerceProductRecord(matched, params.productUrl);
+  if (!rec) return null;
+
+  const descHtml = typeof matched.description === 'string' ? matched.description : '';
+  const apiBodyMd = descHtml ? params.htmlToMd(descHtml, params.productUrl).markdown.trim() : '';
+  const cleanedFallbackMd = (params.fallbackBodyMd ?? '').replace(/^#\s+[^\n]+\n+/, '').trim();
+  const bodyMd = apiBodyMd.length >= 80 ? apiBodyMd : cleanedFallbackMd || apiBodyMd;
+
+  const metaLines: string[] = [];
+  if (rec.vendor) metaLines.push(`- **Brand / Vendor**: ${rec.vendor}`);
+  if (rec.productType) metaLines.push(`- **Category**: ${rec.productType}`);
+  if (rec.tags.length > 0) metaLines.push(`- **Tags**: ${rec.tags.join(', ')}`);
+
+  const rows = rec.variants.map((v) => [
+    v.title ?? rec.title,
+    `\`${v.sku || '-'}\``,
+    v.price !== null ? `${v.currency ?? 'USD'} ${v.price.toFixed(2)}` : '-',
+    v.compareAt !== null ? `${v.currency ?? 'USD'} ${v.compareAt.toFixed(2)}` : '-',
+    v.available === true ? 'In Stock' : v.available === false ? 'Out of Stock' : '-',
+  ]);
+
+  return {
+    title: rec.title,
+    ...(rec.descriptionText ? { description: rec.descriptionText.slice(0, 260) } : {}),
+    markdown: [
+      `# ${rec.title}`,
+      metaLines.length > 0 ? metaLines.join('\n') : '',
+      `## Variants & Pricing\n\n${formatGfmTable(['Variant', 'SKU', 'Price', 'Compare At', 'Stock'], rows)}`,
+      bodyMd ? `## Product Details\n\n${bodyMd}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    links: [rec.url],
+    records: [rec as unknown as Record<string, unknown>],
+  };
 }
 
 function scaleMinorUnitPrice(raw: unknown, minorUnit: number): number | null {
@@ -110,9 +199,13 @@ export function normalizeWooCommerceProductRecord(
     : [];
 
   const images = Array.isArray(rawProd.images)
-    ? (rawProd.images as Array<Record<string, unknown>>)
-        .map((img) => (typeof img?.src === 'string' && img.src.startsWith('http') ? img.src : ''))
-        .filter(Boolean)
+    ? Array.from(
+        new Set(
+          (rawProd.images as Array<Record<string, unknown>>)
+            .map((img) => (typeof img?.src === 'string' && img.src.startsWith('http') ? img.src : ''))
+            .filter(Boolean),
+        ),
+      )
     : [];
 
   const options: Array<{ name: string; values: string[] }> = [];

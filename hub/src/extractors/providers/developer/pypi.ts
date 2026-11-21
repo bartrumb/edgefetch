@@ -12,7 +12,11 @@ export default defineAdapter({
     if (!/^\/project\/[^/]+/i.test(path)) return null;
     const clean = stripScriptsAndStyles(rawHtml);
     const headerName = stripTagsInline(
-      findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'package-header__name')) ?? '',
+      findElementInnerLinear(
+        clean,
+        'h1',
+        (a) => attrHasTokenLinear(a, 'class', 'project-header__name') || attrHasTokenLinear(a, 'class', 'package-header__name'),
+      ) ?? '',
     );
     if (!headerName) return null;
     const descOpen =
@@ -23,7 +27,13 @@ export default defineAdapter({
       findElementInnerLinear(clean, 'span', (a) => getAttrValueLinear(a, 'id') === 'pip-command') ?? '',
     );
     const summary = stripTagsInline(
-      findElementInnerLinear(clean, 'p', (a) => attrHasTokenLinear(a, 'class', 'package-description__summary')) ?? '',
+      findElementInnerLinear(
+        clean,
+        'p',
+        (a) =>
+          attrHasTokenLinear(a, 'class', 'project-header__summary') ||
+          attrHasTokenLinear(a, 'class', 'package-description__summary'),
+      ) ?? '',
     );
     const inner = extractBalancedDivAt(clean, descOpen.index);
     if (!inner) return null;

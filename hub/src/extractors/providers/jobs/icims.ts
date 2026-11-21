@@ -19,6 +19,65 @@ import {
 
 const ICIMS_EXCLUDED_SUBDOMAINS = new Set(['www', 'status', 'support', 'community', 'developer', 'developers', 'login']);
 
+interface IcimsParsedCard {
+  id: string;
+  title: string;
+  url: string;
+  location: string;
+  pay: string;
+  postedAt: string;
+}
+
+function parseIcimsCardDetails(cardHtml: string): { location: string; pay: string; postedAt: string } {
+  let location = '';
+  let pay = '';
+  let postedAt = '';
+
+  const spanTags = findAllOpenTagsLinear(cardHtml, 'span', (a) => Boolean(getAttrValueLinear(a, 'title')), 12);
+  for (const st of spanTags) {
+    const tVal = (getAttrValueLinear(st.attrStr, 'title') ?? '').trim();
+    if (/^\d{1,2}\/\d{1,2}\/\d{4}\b/.test(tVal)) {
+      postedAt = tVal.split(/\s+/)[0] ?? tVal;
+      break;
+    }
+  }
+
+  const tagDivs = findAllOpenTagsLinear(cardHtml, 'div', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_JobHeaderTag'), 16);
+  for (const td of tagDivs) {
+    const block = extractBalancedDivAt(cardHtml, td.index);
+    if (!block) continue;
+    const dtTxt = stripTagsInline(findElementInnerLinear(block, 'dt') ?? '').toLowerCase();
+    const ddTxt = stripTagsInline(findElementInnerLinear(block, 'dd') ?? '');
+    if (!ddTxt) continue;
+    if (!location && dtTxt.includes('location')) {
+      location = ddTxt;
+    } else if (!pay && (dtTxt.includes('salary') || dtTxt.includes('pay') || dtTxt.includes('compensation'))) {
+      pay = ddTxt;
+    }
+  }
+
+  if (!location || !pay) {
+    const dts = findAllOpenTagsLinear(cardHtml, 'dt', undefined, 16);
+    for (let k = 0; k < dts.length; k++) {
+      const dtOpen = dts[k]!;
+      const dtEnd = cardHtml.toLowerCase().indexOf('</dt>', dtOpen.openEnd);
+      if (dtEnd === -1) continue;
+      const dtTxt = stripTagsInline(cardHtml.slice(dtOpen.openEnd, dtEnd)).toLowerCase();
+      const nextBound = k + 1 < dts.length ? dts[k + 1]!.index : cardHtml.length;
+      const ddHtml = findElementInnerLinear(cardHtml.slice(dtEnd + 5, nextBound), 'dd');
+      const ddTxt = stripTagsInline(ddHtml ?? '');
+      if (!ddTxt) continue;
+      if (!location && dtTxt.includes('location')) {
+        location = ddTxt;
+      } else if (!pay && (dtTxt.includes('salary') || dtTxt.includes('pay') || dtTxt.includes('compensation'))) {
+        pay = ddTxt;
+      }
+    }
+  }
+
+  return { location, pay, postedAt };
+}
+
 function formatIcimsHtml(
   rawHtml: string,
   origUrl: string,
@@ -96,14 +155,34 @@ function formatIcimsHtml(
     };
   }
 
-  // iCIMS Search / Board listing (`/jobs/search?in_iframe=1` or `/jobs/intro`)
+  // iCIMS Search / Board listing (`/jobs/search?ss=1&in_iframe=1` or `/jobs/intro`)
   const clean = stripScriptsAndStyles(rawHtml);
-  const anchorOpens = findAllOpenTagsLinear(clean, 'a', (a) => {
-    const href = getAttrValueLinear(a, 'href') ?? '';
-    return /\/jobs\/\d+\//i.test(href);
-  }, 200);
+  const cardStarts = [
+    ...findAllOpenTagsLinear(clean, 'li', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_JobCardItem'), 200),
+    ...findAllOpenTagsLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_JobCardItem'), 200),
+  ].sort((a, b) => a.index - b.index);
+  const cardSlicesByJobId = new Map<string, string>();
+  for (let i = 0; i < cardStarts.length; i++) {
+    const start = cardStarts[i]!.index;
+    const end = i + 1 < cardStarts.length ? cardStarts[i + 1]!.index : Math.min(clean.length, start + 12_000);
+    const slice = clean.slice(start, end);
+    const idM = /\/jobs\/(\d+)\//i.exec(slice);
+    if (idM?.[1] && !cardSlicesByJobId.has(idM[1])) {
+      cardSlicesByJobId.set(idM[1], slice);
+    }
+  }
 
-  const byId = new Map<string, { id: string; title: string; url: string }>();
+  const anchorOpens = findAllOpenTagsLinear(
+    clean,
+    'a',
+    (a) => {
+      const href = getAttrValueLinear(a, 'href') ?? '';
+      return /\/jobs\/\d+\//i.test(href);
+    },
+    200,
+  );
+
+  const byId = new Map<string, IcimsParsedCard>();
   for (const ao of anchorOpens) {
     const rawHref = unescapeHrefUrl(getAttrValueLinear(ao.attrStr, 'href') ?? '');
     const idMatch = /\/jobs\/(\d+)\//i.exec(rawHref);
@@ -113,9 +192,12 @@ function formatIcimsHtml(
 
     const closeIdx = clean.toLowerCase().indexOf('</a>', ao.openEnd);
     const anchorInner = closeIdx !== -1 ? clean.slice(ao.openEnd, closeIdx) : '';
+    const h3Inner = findElementInnerLinear(anchorInner, 'h3');
+    const rawTitleAttr = (getAttrValueLinear(ao.attrStr, 'title') ?? '').replace(/^\d+\s*-\s*/, '').trim();
     const linkTitle =
-      stripTagsInline(anchorInner).replace(/^Job\s+Title\s*/i, '').trim() ||
-      (getAttrValueLinear(ao.attrStr, 'title') ?? '').trim();
+      stripTagsInline(h3Inner ?? anchorInner)
+        .replace(/^(?:Job\s+Title|Title)\s+/i, '')
+        .trim() || rawTitleAttr;
     if (!linkTitle) continue;
 
     let resolvedUrl = '';
@@ -127,17 +209,28 @@ function formatIcimsHtml(
       continue;
     }
     if (!resolvedUrl) continue;
-    byId.set(jobId, { id: jobId, title: linkTitle, url: resolvedUrl });
+
+    const cardHtml = cardSlicesByJobId.get(jobId) ?? '';
+    const meta = cardHtml ? parseIcimsCardDetails(cardHtml) : { location: '', pay: '', postedAt: '' };
+    byId.set(jobId, { id: jobId, title: linkTitle, url: resolvedUrl, ...meta });
   }
 
-  if (byId.size === 0 && !rawHtml.includes('iCIMS')) return null;
-
   const jobs = [...byId.values()];
-  const title = `${hostSlug} — iCIMS Career Portal (${jobs.length} open roles)`;
   if (jobs.length === 0) {
+    // Never emit a confident false zero (`total: 0`) on an outer iframe shell or unsubmitted search form!
+    // Only report `0` when iCIMS explicitly renders its zero-results message inside the search frame.
+    const plainBody = stripTagsInline(clean);
+    const explicitZero =
+      /\b(?:no\s+results\s+found|sorry,\s+no\s+jobs|currently\s+no\s+open\s+positions|there\s+are\s+currently\s+no\s+open|0\s+results\s+available)\b/i.test(
+        plainBody,
+      );
+    if (!explicitZero) {
+      return null;
+    }
+    const emptyTitle = `${hostSlug} — iCIMS Career Portal (0 open roles)`;
     return {
-      title,
-      markdown: `# ${title}\n\nNo open positions currently listed.`,
+      title: emptyTitle,
+      markdown: `# ${emptyTitle}\n\nNo open positions currently listed.`,
       links: [],
       records: [],
       total: 0,
@@ -146,16 +239,49 @@ function formatIcimsHtml(
     };
   }
 
+  const plainHeader = stripTagsInline(clean.slice(0, 80_000));
+  const pageMatch = /\bPage\s+(\d+)\s+of\s+(\d+)\b/i.exec(plainHeader);
+  const curPage = pageMatch?.[1] ? Math.max(1, parseInt(pageMatch[1], 10) || 1) : 1;
+  const totalPages = pageMatch?.[2] ? Math.max(1, parseInt(pageMatch[2], 10) || 1) : 1;
+  const hasNextRel = clean.includes('rel="next"') || clean.includes("rel='next'");
+  const hasMorePages = curPage < totalPages || (totalPages === 1 && hasNextRel);
+
+  const portalHeading = stripTagsInline(
+    findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_Header')) ?? '',
+  );
+  const companyLabel = portalHeading ? portalHeading.replace(/\s*Career\s+Listings\s*$/i, '').trim() || hostSlug : hostSlug;
+
   const links = jobs.map((j) => j.url);
-  const rows = jobs.slice(0, 100).map((j) => [`[${j.title}](${j.url})`, `\`${j.id}\``]);
+  const rows = jobs.slice(0, 100).map((j) => [
+    `[${j.title}](${j.url})`,
+    `\`${j.id}\``,
+    j.location || '-',
+    j.pay || '-',
+  ]);
+  const isTruncated = hasMorePages || jobs.length > rows.length;
+  const title =
+    totalPages > 1
+      ? `${companyLabel} — iCIMS Career Portal (Page ${curPage} of ${totalPages}, ${rows.length} shown)`
+      : `${companyLabel} — iCIMS Career Portal (${jobs.length} open roles)`;
+
   return {
     title,
-    markdown: `# ${title}\n\n${formatGfmTable(['Role', 'Job ID'], rows)}`,
+    markdown: `# ${title}\n\n${formatGfmTable(['Role', 'Job ID', 'Location', 'Salary'], rows)}`,
     links,
-    records: jobs.map((j) => ({ id: j.id, title: j.title, company: hostSlug, url: j.url, source: 'icims' })),
-    total: jobs.length,
+    records: jobs.map((j) => ({
+      id: j.id,
+      title: j.title,
+      company: companyLabel,
+      url: j.url,
+      ...(j.location ? { location: j.location, locations: [j.location] } : {}),
+      ...(j.pay ? { payRaw: j.pay, salary: j.pay } : {}),
+      ...(j.postedAt ? { postedAt: j.postedAt } : {}),
+      source: 'icims',
+    })),
+    ...(!hasMorePages ? { total: jobs.length } : {}),
     returned: rows.length,
-    truncated: jobs.length > rows.length,
+    truncated: isTruncated,
+    ...(hasMorePages ? { nextCursor: `pr=${curPage}` } : jobs.length > rows.length ? { nextCursor: String(rows.length) } : {}),
   };
 }
 
@@ -164,7 +290,7 @@ export default defineAdapter({
   name: 'iCIMS Enterprise Career Portals',
   category: 'jobs',
   description:
-    'Upgrades *.icims.com/jobs/... portals and postings to their server-rendered ?in_iframe=1 twin, extracting JobPosting JSON-LD and open role links without outer iframe shells.',
+    'Upgrades *.icims.com/jobs/... portals and postings to their server-rendered ?ss=1&in_iframe=1 twin, extracting JobPosting JSON-LD and open role cards without outer iframe shells.',
   domains: ['*.icims.com'],
   exampleUrls: [
     'https://careers-acme.icims.com/jobs/search?ss=1',
@@ -176,7 +302,7 @@ export default defineAdapter({
     if (!/^\/jobs(?:\/|$)/i.test(path)) return null;
 
     const twinUrl = new URL(url.toString());
-    if (/^\/jobs\/?(?:intro)?\/?$/i.test(twinUrl.pathname)) {
+    if (/^\/jobs\/?(?:intro|search)?\/?$/i.test(twinUrl.pathname)) {
       twinUrl.pathname = '/jobs/search';
       if (!twinUrl.searchParams.has('ss')) twinUrl.searchParams.set('ss', '1');
     }
@@ -203,9 +329,10 @@ export default defineAdapter({
       markdown: formatted.markdown,
       links: formatted.links,
       records: formatted.records,
-      total: formatted.total,
-      returned: formatted.returned,
-      truncated: formatted.truncated,
+      ...(formatted.total !== undefined ? { total: formatted.total } : {}),
+      ...(formatted.returned !== undefined ? { returned: formatted.returned } : {}),
+      ...(formatted.truncated !== undefined ? { truncated: formatted.truncated } : {}),
+      ...(formatted.nextCursor !== undefined ? { nextCursor: formatted.nextCursor } : {}),
     };
   },
 });

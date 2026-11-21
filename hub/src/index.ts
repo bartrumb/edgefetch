@@ -151,7 +151,7 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv {
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const DEFAULT_UA = 'EdgeFetch/2.5 (bot@edgefetch.dev)';
+const DEFAULT_UA = 'EdgeFetch/2.6 (bot@edgefetch.dev)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;

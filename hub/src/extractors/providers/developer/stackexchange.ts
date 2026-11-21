@@ -32,6 +32,24 @@ function resolveStackExchangeSiteParam(host: string): string | null {
 // Deterministic Stack Exchange API v2.3 filter including question + answers `body_markdown`, `body`, `score`, `is_accepted`, `tags`, `owner`.
 const SE_QUESTION_ANSWERS_FILTER = '!20aKG._8Oscv*6dguVOli';
 
+function cleanStackExchangeMarkdown(rawMd: string): string {
+  const decoded = decodeBasicEntities(rawMd.replace(/\r\n/g, '\n'));
+  const lines = decoded.split('\n');
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (/^\s*(?:```|~~~)/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence || /^(?: {4}|\t)/.test(line)) continue;
+    lines[i] = line
+      .replace(/^(\s*\[\d+\]:\s+)\/\//, '$1https://')
+      .replace(/<\/?(?:sub|sup|kbd)\s*>/gi, '');
+  }
+  return lines.join('\n').trim();
+}
+
 export default defineAdapter({
   id: 'stackexchange-qa',
   name: 'Stack Overflow & Stack Exchange Q&A',
@@ -71,7 +89,7 @@ export default defineAdapter({
         const tags = Array.isArray(q.tags) ? q.tags.map(String).filter(Boolean).slice(0, 8) : [];
         const qMd =
           typeof q.body_markdown === 'string' && q.body_markdown.trim()
-            ? decodeBasicEntities(q.body_markdown.replace(/\r\n/g, '\n')).trim()
+            ? cleanStackExchangeMarkdown(q.body_markdown)
             : typeof q.body === 'string' && q.body.trim()
               ? htmlToMd(q.body, origUrl).markdown.trim()
               : '';
@@ -91,7 +109,7 @@ export default defineAdapter({
             const author = decodeBasicEntities(String((a.owner as Record<string, unknown> | undefined)?.display_name ?? '')).trim();
             const md =
               typeof a.body_markdown === 'string' && a.body_markdown.trim()
-                ? decodeBasicEntities(a.body_markdown.replace(/\r\n/g, '\n')).trim()
+                ? cleanStackExchangeMarkdown(a.body_markdown)
                 : typeof a.body === 'string' && a.body.trim()
                   ? htmlToMd(a.body, origUrl).markdown.trim()
                   : '';

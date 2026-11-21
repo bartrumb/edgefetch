@@ -34,12 +34,14 @@ import {
   filterSafeResponseHeaders,
 } from '../src/framework-detect.ts';
 import { verifyStoredArtifact } from '../src/ingest.ts';
+import icimsAdapter from '../src/extractors/providers/jobs/icims.ts';
 import {
   buildBlockedInfo,
   chunkJsonRecords,
   executeJobsCall,
   extractJobPostingJsonLd,
   parseX402PaymentTerms,
+  salvageAshbyBoardFromTruncatedJson,
 } from '../src/jobs.ts';
 import { buildDeterministicSummary, completeLlmTurn, resolveLlmConfig } from '../src/llm.ts';
 import { executeMapCall, matchesSafeCrawlPattern } from '../src/map-crawl.ts';
@@ -2170,4 +2172,283 @@ test('SEC-V260-5 (Framework Detect, Inertia Unlock, Adapter Bulkhead & Browser S
   });
   assert.equal(engine.listAgents().agents[0]?.browserVersion, 'Chromium/137.0.0.1');
   assert.equal(engine.listAgents().agents[0]?.browserSandbox, 'off');
+});
+
+test('QA-V260-ROUND4: overflow kindAuto text/html fix, Cloudflare vs Mintlify origin-markdown, WooCommerce /product/<slug> enrichment, PyPI project-header & carousel clone dedup', async () => {
+  resetOverflowRobotsCacheForTests();
+
+  // 1. `cloudflareOverflowFetch` with `kindAuto: true` accepts `200 text/html` & `200 text/markdown; charset=utf-8` as `ok`, while skipping `200 image/png`
+  const overflowHtmlRes = await cloudflareOverflowFetch(
+    JSON.stringify({
+      maxSeconds: 15,
+      options: { includeBody: true, respectRobots: true },
+      requests: [
+        { id: 'r1', url: 'https://docs.example.com/', kind: 'page', kindAuto: true },
+        { id: 'r2', url: 'https://docs.example.com/logo', kind: 'page', kindAuto: true },
+      ],
+    }),
+    'EdgeFetch/2.6 (bot@edgefetch.dev)',
+    'hub.example.com',
+    {
+      sleepFn: async () => {},
+      fetchFn: async (input) => {
+        const u = String(input);
+        if (u.endsWith('/robots.txt')) {
+          return new Response('User-agent: *\nAllow: /\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+        }
+        if (u.endsWith('/logo')) {
+          return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), { status: 200, headers: { 'content-type': 'image/png' } });
+        }
+        return new Response('<!doctype html><html><body><main><h1>Hello</h1></main></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        });
+      },
+    },
+  );
+  const overflowJson = (await overflowHtmlRes.json()) as { results: Array<{ id: string; outcome: string }> };
+  assert.equal(overflowJson.results[0]?.outcome, 'ok', 'kindAuto text/html must classify as ok');
+  assert.equal(overflowJson.results[1]?.outcome, 'skip', 'kindAuto image/png must classify as skip');
+
+  // 2. Cloudflare Markdown-for-Agents (`developers.cloudflare.com`) is NOT misclassified as Mintlify, and detects `/_astro/` + `llms-index` + `ucp`
+  const cfWorkersMdDet = detectSiteFrameworkLinear({
+    url: 'https://developers.cloudflare.com/workers/',
+    contentSource: 'origin-markdown',
+    body: '> Documentation Index\n> Fetch the complete documentation index at: https://developers.cloudflare.com/workers/llms.txt\n\n# Cloudflare Workers\n\n[![](https://developers.cloudflare.com/_astro/logo.svg)Docs](https://developers.cloudflare.com/)',
+  });
+  assert.equal(cfWorkersMdDet.platform, undefined);
+  assert.equal(cfWorkersMdDet.framework, 'astro');
+  assert.ok(cfWorkersMdDet.contentFlags?.includes('llms-index'));
+
+  const ucpShopifyDet = detectSiteFrameworkLinear({
+    url: 'https://www.aventon.com/products.json',
+    headers: { 'powered-by': 'Shopify', link: '</.well-known/ucp>; rel="ucp"; version="2026-08-25"' },
+  });
+  assert.equal(ucpShopifyDet.platform, 'shopify');
+  assert.ok(ucpShopifyDet.contentFlags?.includes('ucp'));
+
+  const wooRefinedDet = detectSiteFrameworkLinear({
+    url: 'https://ride1up.com/product/prodigy-v2-eco/',
+    contentSource: 'html',
+    headers: { link: '<https://ride1up.com/wp-json/>; rel="https://api.w.org/"' },
+    body: '<!doctype html><html><head><meta name="generator" content="WooCommerce Wholesale Prices 2.3.1"></head><body></body></html>',
+  });
+  assert.equal(wooRefinedDet.platform, 'woocommerce');
+  assert.equal(wooRefinedDet.framework, 'wordpress');
+
+  // 3. Custom-domain WooCommerce `/product/<slug>/` Store API enrichment + duplicate image deduplication + preserving rich HTML specs
+  const wooHtmlScrape = await executeScrapeCall({
+    payload: { url: 'https://ride1up.example.com/product/prodigy-v2-eco/' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const parsed = JSON.parse(rawBody) as { requests?: Array<{ url?: string }> };
+      const reqUrl = parsed.requests?.[0]?.url ?? '';
+      if (reqUrl.includes('/wp-json/wc/store/v1/products?slug=prodigy-v2-eco')) {
+        return {
+          status: 200,
+          via: 'agent:site-arm64',
+          bodyText: JSON.stringify({
+            results: [
+              {
+                id: 'woocommerce-product-json',
+                url: reqUrl,
+                status: 200,
+                outcome: 'ok',
+                contentType: 'application/json',
+                body: JSON.stringify([
+                  {
+                    id: 687835,
+                    name: 'Prodigy v2 ECO',
+                    slug: 'prodigy-v2-eco',
+                    permalink: 'https://ride1up.example.com/product/prodigy-v2-eco/',
+                    description: '',
+                    is_in_stock: true,
+                    categories: [{ name: 'Ebikes' }],
+                    images: [
+                      { src: 'https://ride1up.example.com/wp-content/uploads/bike.webp' },
+                      { src: 'https://ride1up.example.com/wp-content/uploads/bike.webp' },
+                    ],
+                    prices: { price: '129500', regular_price: '139500', currency_code: 'USD', currency_minor_unit: 2 },
+                    variations: [
+                      { id: 687881, attributes: [{ value: 'st' }, { value: 'onyx-black' }], is_in_stock: true },
+                    ],
+                  },
+                ]),
+              },
+            ],
+          }),
+        };
+      }
+      return {
+        status: 200,
+        via: 'agent:site-arm64',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: 'https://ride1up.example.com/product/prodigy-v2-eco/',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              headers: { link: '<https://ride1up.example.com/wp-json/>; rel="https://api.w.org/"' },
+              body: '<!doctype html><html><head><meta name="generator" content="WooCommerce 9.4"></head><body class="woocommerce-page single-product"><main><h1>Prodigy v2 ECO</h1><h3>Components & Tech Specs</h3><p>Brose TF Sprinter German made mid-drive motor with 90nm torque.</p></main></body></html>',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(wooHtmlScrape.status, 200);
+  assert.equal(wooHtmlScrape.body.extractorId, 'woocommerce');
+  const wooRec = (wooHtmlScrape.body.records as Array<{ images?: string[]; variants: Array<{ price: number; compareAt: number }> }>)[0]!;
+  assert.equal(wooRec.images?.length, 1, 'Duplicate WooCommerce image URLs must be deduplicated');
+  assert.equal(wooRec.variants[0]?.price, 1295);
+  assert.equal(wooRec.variants[0]?.compareAt, 1395);
+  assert.match(String(wooHtmlScrape.body.markdown), /Brose TF Sprinter/, 'Fallback HTML tech specs must be preserved when Store API description is empty');
+
+  // 4. PyPI live `project-header__name` + `project-header__summary` (`extractorId: "pypi-project"`)
+  const pypiDoc = extractHtmlDocument(
+    '<!doctype html><html><body><main><div class="project-header"><h1 class="project-header__name">httpx 0.28.1</h1><p class="project-header__summary">The next generation HTTP client.</p><span id="pip-command">pip install httpx</span></div><div id="description"><div class="project-description"><p>HTTPX is a fully featured HTTP/2 client library for Python 3.</p></div></div></main></body></html>',
+    { baseUrl: 'https://pypi.org/project/httpx/', onlyMainContent: true },
+  );
+  assert.equal(pypiDoc.extractorId, 'pypi-project');
+  assert.match(pypiDoc.markdown, /pip install httpx/);
+
+  // 5. Cloned review carousel deduplication (`swiper-slide-duplicate` + consecutive identical >= 120-char prose blocks)
+  const repeatedReview =
+    'August 4, 2025 I have not ridden a bike in twenty years and bought the Prodigy V2 step-over chain drive for daily commuting and fitness.';
+  const carouselDoc = extractHtmlDocument(
+    `<!doctype html><html><body><main><h1>Customer Reviews</h1><div><p><strong>Michael Patterson</strong></p><p>${repeatedReview}</p><p>(1)</p><p>(0)</p></div><div><p><strong>Michael Patterson</strong></p><p>${repeatedReview}</p><p>(1)</p><p>(0)</p></div><div class="swiper-slide swiper-slide-duplicate"><p>Cloned Swiper Slide Should Drop</p></div></main></body></html>`,
+    { baseUrl: 'https://shop.example.com/reviews', onlyMainContent: true },
+  );
+  assert.equal(carouselDoc.markdown.includes('Cloned Swiper Slide Should Drop'), false);
+  assert.equal(carouselDoc.markdown.split('Michael Patterson').length - 1, 1, 'Cloned duplicate long review block must appear once');
+
+  // 6. iCIMS `/jobs/search` adds `ss=1&in_iframe=1`, parses `iCIMS_JobCardItem` + `Page 1 of 37`, and NEVER lies `total: 0` on an unparsed shell!
+  const icimsUrl = new URL('https://careers-gdms.icims.com/jobs/search');
+  const icimsTwin = icimsAdapter.resolveTwin!({
+    url: icimsUrl,
+    host: icimsUrl.hostname,
+    path: icimsUrl.pathname,
+  });
+  assert.ok(icimsTwin, 'iCIMS resolveTwin must match /jobs/search');
+  assert.equal(icimsTwin.fetchUrl, 'https://careers-gdms.icims.com/jobs/search?ss=1&in_iframe=1');
+  const htmlToMdStub = (h: string) => ({ markdown: stripHtmlTagsLinear(h), links: [] as string[] });
+  const icimsOuterShell = icimsTwin.formatTwin(
+    '<!doctype html><html><body><div>Skip to content General Dynamics Mission Systems Careers Search Jobs</div></body></html>',
+    'https://careers-gdms.icims.com/jobs/search',
+    htmlToMdStub,
+  );
+  assert.equal(icimsOuterShell, null, 'Unparsed iCIMS shell without explicit zero-results message must return null, NEVER total: 0');
+  const icimsRealCards = icimsTwin.formatTwin(
+    `<!doctype html><html><body>
+      <h2>Search Results Page 1 of 37</h2>
+      <div class="row iCIMS_JobCardItem">
+        <a class="iCIMS_Anchor" href="/jobs/68708/senior-information-assurance-engineer/job?in_iframe=1"><h3>Senior Information Assurance Engineer</h3></a>
+        <dl><dt>ID</dt><dd>2026-82989</dd><dt>Job Locations</dt><dd>US-AZ-Scottsdale</dd><dt>Minimum Pay</dt><dd>USD $157,487.00 - USD $174,713.00 /Yr.</dd></dl>
+      </div>
+    </body></html>`,
+    'https://careers-gdms.icims.com/jobs/search',
+    htmlToMdStub,
+  );
+  assert.ok(icimsRealCards, 'iCIMS real card markup must format cleanly');
+  assert.equal(icimsRealCards.returned, 1);
+  assert.equal(icimsRealCards.truncated, true);
+  assert.equal(icimsRealCards.nextCursor, 'pr=1');
+  assert.equal(icimsRealCards.total, undefined, 'Paginated iCIMS page 1 of 37 must omit misleading single-page total');
+  assert.equal((icimsRealCards.records?.[0] as Record<string, unknown>)?.location, 'US-AZ-Scottsdale');
+  assert.match(String((icimsRealCards.records?.[0] as Record<string, unknown>)?.salary), /157,487/);
+
+  // 7. Ashby 16 MiB `maxBytes` + truncated JSON salvager + `?offset=` paging + Workday `scrape` truncation fields & `onsite` classification
+  const truncatedAshbyRaw =
+    '{"organizationName":"OpenAI","jobs":[{"id":"role-1","title":"Research Engineer","location":"San Francisco, CA","workplaceType":"Hybrid"},{"id":"role-2","title":"Distributed Systems Engineer","location":"San Francisco, CA","isRemote":false},{"id":"cut-off","title":"Half';
+  const salvaged = salvageAshbyBoardFromTruncatedJson(truncatedAshbyRaw);
+  assert.ok(salvaged);
+  assert.equal(salvaged.organizationName, 'OpenAI');
+  assert.equal(salvaged.jobs.length, 2);
+
+  let seenAtsMaxBytes = 0;
+  const ashbyScrape = await executeScrapeCall({
+    payload: { url: 'https://jobs.ashbyhq.com/openai?offset=1' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const parsed = JSON.parse(rawBody) as { options?: { maxBytes?: number } };
+      seenAtsMaxBytes = parsed.options?.maxBytes ?? 0;
+      return {
+        status: 200,
+        via: 'agent:site-arm64',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'ats-ashby-board',
+              url: 'https://api.ashbyhq.com/posting-api/job-board/openai?includeCompensation=true',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'application/json',
+              body: JSON.stringify({
+                organizationName: 'OpenAI',
+                jobs: [
+                  { id: 'r1', title: 'Role One', location: 'San Francisco, CA' },
+                  { id: 'r2', title: 'Role Two', location: 'San Francisco, CA', workplaceType: 'OnSite' },
+                  { id: 'r3', title: 'Role Three', location: 'Remote - US', isRemote: true },
+                ],
+              }),
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(seenAtsMaxBytes, 16_777_216, 'ATS pre-fetch must request 16 MiB maxBytes so large Ashby boards (OpenAI ~15 MiB) never drop to HTML');
+  assert.equal(ashbyScrape.body.extractorId, 'ashby-board');
+  assert.equal(ashbyScrape.body.contentState, 'active');
+  assert.equal(ashbyScrape.body.total, 3);
+  assert.equal(ashbyScrape.body.returned, 2);
+  assert.equal(ashbyScrape.body.truncated, false);
+
+  const wdScrape = await executeScrapeCall({
+    payload: { url: 'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite' },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-arm64',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'ats-workday-board',
+            url: 'https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDIAExternalCareerSite/jobs',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'application/json',
+            body: JSON.stringify({
+              total: 2012,
+              jobPostings: [
+                {
+                  title: 'Senior GPU Compiler Engineer',
+                  externalPath: '/job/US-CA-Santa-Clara/Senior-GPU-Compiler-Engineer_JR1',
+                  locationsText: 'US, CA, Santa Clara',
+                  postedOn: 'Posted Today',
+                },
+                {
+                  title: 'Solutions Architect',
+                  externalPath: '/job/US-CA-Santa-Clara/Solutions-Architect_JR2',
+                  locationsText: '2 Locations',
+                  postedOn: 'Posted Yesterday',
+                },
+              ],
+            }),
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(wdScrape.body.extractorId, 'workday-board');
+  assert.equal(wdScrape.body.contentState, 'active');
+  assert.equal(wdScrape.body.total, 2012);
+  assert.equal(wdScrape.body.returned, 2);
+  assert.equal(wdScrape.body.truncated, true);
+  assert.equal(wdScrape.body.nextCursor, '20');
+  const wdJobs = wdScrape.body.jobs as Array<{ workplaceType: string }>;
+  assert.equal(wdJobs[0]?.workplaceType, 'onsite', 'Concrete physical Workday location must infer onsite');
+  assert.equal(wdJobs[1]?.workplaceType, 'unknown', 'Ambiguous N Locations count must remain unknown');
 });

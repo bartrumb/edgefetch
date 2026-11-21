@@ -17,8 +17,10 @@ import {
   resolveCustomDomainShopifyProductTwinUrl,
 } from './providers/commerce-social/shopify';
 import woocommerceAdapter, {
+  enrichWooCommerceProductFromStoreApi,
   isWooCommerceHtmlOrHeaders,
   normalizeWooCommerceProductRecord,
+  resolveCustomDomainWooCommerceProductTwinUrl,
 } from './providers/commerce-social/woocommerce';
 import icimsAdapter from './providers/jobs/icims';
 import type {
@@ -52,6 +54,7 @@ export type {
 };
 export {
   enrichShopifyProductFromJson,
+  enrichWooCommerceProductFromStoreApi,
   extractShopifyCurrencyFromHtml,
   formatYamlFrontmatterCard,
   isShopifyHtmlOrHeaders,
@@ -59,6 +62,7 @@ export {
   normalizeShopifyProductRecord,
   normalizeWooCommerceProductRecord,
   resolveCustomDomainShopifyProductTwinUrl,
+  resolveCustomDomainWooCommerceProductTwinUrl,
   unescapeHrefUrl,
 };
 

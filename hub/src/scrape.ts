@@ -11,9 +11,12 @@
 import {
   applyPostFetchSiteExtractor,
   enrichShopifyProductFromJson,
+  enrichWooCommerceProductFromStoreApi,
   extractShopifyCurrencyFromHtml,
   isShopifyHtmlOrHeaders,
+  isWooCommerceHtmlOrHeaders,
   resolveCustomDomainShopifyProductTwinUrl,
+  resolveCustomDomainWooCommerceProductTwinUrl,
   resolveSiteExtractorTwin,
   type PaginationInfo,
   type PostFetchSiteResult,
@@ -94,7 +97,7 @@ import {
   splitPdfPagesAndMarkers,
 } from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 26;
+export const SCRAPE_PIPELINE_VERSION = 27;
 
 export interface ScrapedImage {
   url: string;
@@ -595,7 +598,55 @@ const ALWAYS_HIDDEN_OR_CHROME_CLASSES = new Set([
   'line-numbers-rows',
   'line-numbers-wrapper',
   'hljs-ln-numbers',
+  'swiper-slide-duplicate',
+  'slick-cloned',
+  'splide__slide--clone',
+  'flickity-cloned',
+  'glide__slide--clone',
+  'owl-cloned',
 ]);
+
+/**
+ * Deduplicates cloned prose paragraphs (`>= 120` chars) outside code fences — e.g. review carousels that render
+ * identical review slides 3-4x in static HTML — while keeping headings, tables, lists, and code blocks untouched.
+ */
+function dedupeClonedProseParagraphs(markdown: string): string {
+  if (markdown.length < 300) return markdown;
+  return splitMarkdownByCodeFences(markdown)
+    .map((part, idx) => {
+      if (idx % 2 === 1) return part;
+      const blocks = part.split(/\n{2,}/);
+      if (blocks.length < 2) return part;
+      const seenLongProse = new Set<string>();
+      const kept: string[] = [];
+      let droppedPrev = false;
+      for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i]!;
+        const trimmed = b.trim();
+        if (droppedPrev && /^\(\d+\)$/.test(trimmed)) {
+          continue;
+        }
+        const isProse =
+          trimmed.length >= 120 &&
+          !/^(?:#{1,6}\s|\||[-*+]\s|\d+\.\s|>\s|```|~~~)/.test(trimmed);
+        if (isProse) {
+          const norm = trimmed.replace(/\s+/g, ' ');
+          if (seenLongProse.has(norm)) {
+            if (kept.length > 0 && /^\*\*[^*\n]{1,64}\*\*$/.test(kept[kept.length - 1]!.trim())) {
+              kept.pop();
+            }
+            droppedPrev = true;
+            continue;
+          }
+          seenLongProse.add(norm);
+        }
+        droppedPrev = false;
+        kept.push(b);
+      }
+      return kept.join('\n\n');
+    })
+    .join('');
+}
 
 /** Extracts the inner HTML of a balanced `<div|section ... role="main">` landmark in guaranteed O(N) time (`H1`). */
 function extractBalancedRoleMainHtml(html: string): string | null {
@@ -2875,7 +2926,7 @@ export function extractHtmlDocument(
   if (md.slice(Math.max(0, md.length - 800)).toLowerCase().includes('help improve mdn')) {
     md = md.replace(/\n+##[ \t]+Help improve MDN\b[\s\S]{0,600}$/i, '');
   }
-  md = md.replace(/\n{3,}/g, '\n\n').trim();
+  md = dedupeClonedProseParagraphs(md).replace(/\n{3,}/g, '\n\n').trim();
 
   let matchedSiteExtracted: PostFetchSiteResult | null = null;
   let inertiaHydrated = false;
@@ -8423,16 +8474,39 @@ export async function executeScrapeCall(params: {
       ? (item.headers as Record<string, string | undefined>)
       : undefined;
 
-  // Custom-Domain Shopify Product Enrichment: when an HTML page on a custom domain (not `*.myshopify.com`, which already
-  // used pre-fetch `resolveSiteExtractorTwin`) matches `isShopifyHtmlOrHeaders` + `/products/<handle>`, fetch `.json` (+ optional `.js`)
-  // politely via `executeHubFetch` and merge its rich GFM variant table + normalized `CatalogRecord`.
+  // Custom-Domain Commerce Product Enrichment (Shopify + WooCommerce): when an HTML page on a custom domain matches
+  // Shopify (`/products/<handle>`) or WooCommerce (`/product/<slug>/`), politely fetch the public JSON/Store API endpoint
+  // via `executeHubFetch` and merge its rich GFM variant table + normalized `CatalogRecord`.
   let customShopifyDoc: TwinFormattedDoc | null = null;
+  let customCommerceId: 'shopify' | 'woocommerce' | null = null;
   let prelimHostLower = '';
   try {
     prelimHostLower = new URL(finalUrl).hostname.toLowerCase();
   } catch {
     prelimHostLower = '';
   }
+  const fetchCommerceTwinBody = async (epUrl: string, tag: string): Promise<string> => {
+    const epRes = await executeHubFetch(
+      target,
+      JSON.stringify({
+        maxSeconds: 25,
+        options: { includeBody: true, respectRobots: true },
+        requests: [{ id: tag, url: epUrl, kind: 'json', accept: 'application/json' }],
+      }),
+      site,
+      `${source}:${tag}`,
+      retentionMode,
+      true,
+      collectionId,
+    );
+    if (epRes.status !== 200) return '';
+    const epParsed = JSON.parse(epRes.bodyText) as { results?: Array<Record<string, unknown>> };
+    const epItem = epParsed.results?.[0];
+    return epItem?.outcome === 'ok' && typeof epItem.body === 'string' && epItem.bodyEncoding !== 'base64'
+      ? epItem.body
+      : '';
+  };
+
   if (
     isHtmlBody &&
     !isPdfResponse &&
@@ -8444,29 +8518,7 @@ export async function executeScrapeCall(params: {
     if (shopTwin) {
       try {
         const htmlCurrency = extractShopifyCurrencyFromHtml(rawBodyStr);
-        const fetchShopifyTwinBody = async (epUrl: string, tag: string): Promise<string> => {
-          const epRes = await executeHubFetch(
-            target,
-            JSON.stringify({
-              maxSeconds: 25,
-              options: { includeBody: true, respectRobots: true },
-              requests: [{ id: tag, url: epUrl, kind: 'json', accept: 'application/json' }],
-            }),
-            site,
-            `${source}:${tag}`,
-            retentionMode,
-            true,
-            collectionId,
-          );
-          if (epRes.status !== 200) return '';
-          const epParsed = JSON.parse(epRes.bodyText) as { results?: Array<Record<string, unknown>> };
-          const epItem = epParsed.results?.[0];
-          return epItem?.outcome === 'ok' && typeof epItem.body === 'string' && epItem.bodyEncoding !== 'base64'
-            ? epItem.body
-            : '';
-        };
-
-        const jsonBody = await fetchShopifyTwinBody(shopTwin.jsonUrl, 'shopify-product-json');
+        const jsonBody = await fetchCommerceTwinBody(shopTwin.jsonUrl, 'shopify-product-json');
         if (jsonBody.trim()) {
           let needsJsEnrich = true;
           try {
@@ -8482,7 +8534,7 @@ export async function executeScrapeCall(params: {
             needsJsEnrich = false;
           }
           const jsBody = needsJsEnrich
-            ? await fetchShopifyTwinBody(shopTwin.jsUrl, 'shopify-product-js').catch(() => '')
+            ? await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js').catch(() => '')
             : '';
           customShopifyDoc = enrichShopifyProductFromJson({
             rawJson: jsonBody,
@@ -8491,8 +8543,9 @@ export async function executeScrapeCall(params: {
             currency: htmlCurrency,
             ...(jsBody.trim() ? { ajaxJsBody: jsBody } : {}),
           });
+          if (customShopifyDoc) customCommerceId = 'shopify';
         } else {
-          const jsBody = await fetchShopifyTwinBody(shopTwin.jsUrl, 'shopify-product-js').catch(() => '');
+          const jsBody = await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js').catch(() => '');
           if (jsBody.trim()) {
             customShopifyDoc = enrichShopifyProductFromJson({
               rawJson: jsBody,
@@ -8501,10 +8554,36 @@ export async function executeScrapeCall(params: {
               currency: htmlCurrency,
               isAjaxJs: true,
             });
+            if (customShopifyDoc) customCommerceId = 'shopify';
           }
         }
       } catch {
         // Gracefully keep standard HTML / JSON-LD extraction if .json / .js endpoints fail.
+      }
+    }
+  } else if (
+    isHtmlBody &&
+    !isPdfResponse &&
+    prelimHostLower &&
+    !extracted?.records &&
+    isWooCommerceHtmlOrHeaders(rawBodyStr, readItemHeaders())
+  ) {
+    const wooTwin = resolveCustomDomainWooCommerceProductTwinUrl(finalUrl);
+    if (wooTwin) {
+      try {
+        const wcJsonBody = await fetchCommerceTwinBody(wooTwin.storeApiUrl, 'woocommerce-product-json');
+        if (wcJsonBody.trim()) {
+          customShopifyDoc = enrichWooCommerceProductFromStoreApi({
+            rawJson: wcJsonBody,
+            productUrl: finalUrl,
+            slug: wooTwin.slug,
+            htmlToMd: htmlFragToMd,
+            ...(extracted?.markdown ? { fallbackBodyMd: extracted.markdown } : {}),
+          });
+          if (customShopifyDoc) customCommerceId = 'woocommerce';
+        }
+      } catch {
+        // Gracefully keep standard HTML extraction if WooCommerce Store API is disabled or unreachable.
       }
     }
   }
@@ -9280,7 +9359,7 @@ export async function executeScrapeCall(params: {
         (detectedStack.contentFlags && detectedStack.contentFlags.length > 0)),
   );
 
-  const extractorIdOut = customShopifyDoc ? 'shopify' : extracted?.extractorId;
+  const extractorIdOut = customCommerceId ?? extracted?.extractorId;
   const adapterRecordsOut = customShopifyDoc?.records ?? extracted?.records;
   const adapterPaginationOut = customShopifyDoc?.pagination ?? extracted?.pagination;
   const adapterTotalOut = customShopifyDoc?.total ?? extracted?.total;
@@ -9310,6 +9389,7 @@ export async function executeScrapeCall(params: {
     ...(adapterPaginationOut !== undefined ? { pagination: adapterPaginationOut } : {}),
     ...(adapterTotalOut !== undefined ? { total: adapterTotalOut } : {}),
     ...(adapterReturnedOut !== undefined ? { returned: adapterReturnedOut } : {}),
+    ...(adapterTruncatedOut !== undefined ? { truncated: adapterTruncatedOut } : {}),
     ...(adapterNextCursorOut !== undefined ? { nextCursor: adapterNextCursorOut } : {}),
     ...(art?.contentSha256 ? { contentSha256: art.contentSha256 } : {}),
     ...(art?.blobSha256 ? { artifactId: art.blobSha256 } : {}),

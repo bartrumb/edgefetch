@@ -263,6 +263,9 @@ export function detectSiteFrameworkLinear(params: {
     platform = 'typo3';
     signals.push('header:typo3');
   }
+  if (linkHdr.includes('rel="ucp"') || linkHdr.includes('/.well-known/ucp')) {
+    contentFlags.push('ucp');
+  }
   if (poweredBy.includes('next.js') || safeHeaders['x-nextjs-cache']) {
     framework = 'nextjs';
     signals.push('header:nextjs');
@@ -317,7 +320,11 @@ export function detectSiteFrameworkLinear(params: {
 
   // 3. Origin-negotiated Markdown path (`contentSource === 'origin-markdown'`)
   if (params.contentSource === 'origin-markdown') {
-    if (win.includes('built and hosted on [Mintlify]') || (win.includes('Documentation Index') && win.includes('/llms.txt'))) {
+    if (
+      win.includes('built and hosted on [Mintlify]') ||
+      win.includes('mintlify.com') ||
+      (win.includes('> ## Documentation Index') && (win.includes('## Agent Instructions') || win.includes('?ask=')))
+    ) {
       platform = platform ?? 'mintlify';
       signals.push('md:mintlify');
     } else if (win.includes('This documentation is published with GitBook.')) {
@@ -332,6 +339,16 @@ export function detectSiteFrameworkLinear(params: {
     } else if (win.includes('/fileadmin/') && (win.includes('/extension-storage/_processed_/') || win.includes('cHash='))) {
       platform = platform ?? 'typo3';
       signals.push('md:typo3-paths');
+    }
+    if (!framework && win.includes('/_astro/')) {
+      framework = 'astro';
+      signals.push('md:astro-assets');
+    } else if (!framework && win.includes('/_next/')) {
+      framework = 'nextjs';
+      signals.push('md:nextjs-assets');
+    }
+    if (win.includes('Documentation Index') && win.includes('/llms.txt')) {
+      contentFlags.push('llms-index');
     }
     if (win.includes('## Agent Instructions') || win.includes('?ask=<question>&goal=')) {
       contentFlags.push('agent-instructions');
@@ -353,6 +370,7 @@ export function detectSiteFrameworkLinear(params: {
       ...(framework ? { framework } : {}),
       generators: [],
       signals,
+      ...(contentFlags.length > 0 ? { contentFlags } : {}),
     };
   }
 
@@ -403,6 +421,10 @@ export function detectSiteFrameworkLinear(params: {
     } else if (g.startsWith('gatsby')) {
       framework = framework ?? 'gatsby';
       signals.push('generator:gatsby');
+    } else if (g.includes('woocommerce')) {
+      if (!platform || platform === 'wordpress') platform = 'woocommerce';
+      framework = framework ?? 'wordpress';
+      signals.push('generator:woocommerce');
     } else if (g.startsWith('wordpress')) {
       platform = platform ?? 'wordpress';
       signals.push('generator:wordpress');
@@ -443,6 +465,14 @@ export function detectSiteFrameworkLinear(params: {
   }
 
   // 5. Verified structural HTML literals in the first 64 KiB (pure `includes` checks -> linear O(N))
+  if (
+    (!platform || platform === 'wordpress') &&
+    (win.includes('/wp-content/plugins/woocommerce/') || (win.includes('/wp-content/') && win.includes('woocommerce')))
+  ) {
+    platform = 'woocommerce';
+    framework = framework ?? 'wordpress';
+    signals.push('html:woocommerce');
+  }
   if (!platform) {
     if (
       win.includes('shopify.exit_interstitial') ||

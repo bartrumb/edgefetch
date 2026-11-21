@@ -322,7 +322,7 @@ export async function tryExternalSpaFallback(params: {
 
   const fetchFn = params.env.SPA_FALLBACK_FETCH ?? params.env.SAFE_FETCH ?? fetch;
   const robotsFetchFn = params.env.SPA_FALLBACK_FETCH ?? params.env.SAFE_PUBLIC_FETCH ?? fetchFn;
-  const ua = params.env.USER_AGENT?.trim() || 'EdgeFetch/2.5 (bot@edgefetch.dev)';
+  const ua = params.env.USER_AGENT?.trim() || 'EdgeFetch/2.6 (bot@edgefetch.dev)';
 
   if (!params.robotsAlreadyVerified) {
     const allowed = await verifyRobotsBeforeExternalFallback(params.url, ua, robotsFetchFn);

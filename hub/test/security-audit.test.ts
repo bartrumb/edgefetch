@@ -2171,3 +2171,154 @@ test('SEC-V260-5 (Framework Detect, Inertia Unlock, Adapter Bulkhead & Browser S
   assert.equal(engine.listAgents().agents[0]?.browserVersion, 'Chromium/137.0.0.1');
   assert.equal(engine.listAgents().agents[0]?.browserSandbox, 'off');
 });
+
+test('QA-V260-ROUND4: overflow kindAuto text/html fix, Cloudflare vs Mintlify origin-markdown, WooCommerce /product/<slug> enrichment, PyPI project-header & carousel clone dedup', async () => {
+  resetOverflowRobotsCacheForTests();
+
+  // 1. `cloudflareOverflowFetch` with `kindAuto: true` accepts `200 text/html` & `200 text/markdown; charset=utf-8` as `ok`, while skipping `200 image/png`
+  const overflowHtmlRes = await cloudflareOverflowFetch(
+    JSON.stringify({
+      maxSeconds: 15,
+      options: { includeBody: true, respectRobots: true },
+      requests: [
+        { id: 'r1', url: 'https://docs.example.com/', kind: 'page', kindAuto: true },
+        { id: 'r2', url: 'https://docs.example.com/logo', kind: 'page', kindAuto: true },
+      ],
+    }),
+    'EdgeFetch/2.6 (bot@edgefetch.dev)',
+    'hub.example.com',
+    {
+      sleepFn: async () => {},
+      fetchFn: async (input) => {
+        const u = String(input);
+        if (u.endsWith('/robots.txt')) {
+          return new Response('User-agent: *\nAllow: /\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+        }
+        if (u.endsWith('/logo')) {
+          return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), { status: 200, headers: { 'content-type': 'image/png' } });
+        }
+        return new Response('<!doctype html><html><body><main><h1>Hello</h1></main></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        });
+      },
+    },
+  );
+  const overflowJson = (await overflowHtmlRes.json()) as { results: Array<{ id: string; outcome: string }> };
+  assert.equal(overflowJson.results[0]?.outcome, 'ok', 'kindAuto text/html must classify as ok');
+  assert.equal(overflowJson.results[1]?.outcome, 'skip', 'kindAuto image/png must classify as skip');
+
+  // 2. Cloudflare Markdown-for-Agents (`developers.cloudflare.com`) is NOT misclassified as Mintlify, and detects `/_astro/` + `llms-index` + `ucp`
+  const cfWorkersMdDet = detectSiteFrameworkLinear({
+    url: 'https://developers.cloudflare.com/workers/',
+    contentSource: 'origin-markdown',
+    body: '> Documentation Index\n> Fetch the complete documentation index at: https://developers.cloudflare.com/workers/llms.txt\n\n# Cloudflare Workers\n\n[![](https://developers.cloudflare.com/_astro/logo.svg)Docs](https://developers.cloudflare.com/)',
+  });
+  assert.equal(cfWorkersMdDet.platform, undefined);
+  assert.equal(cfWorkersMdDet.framework, 'astro');
+  assert.ok(cfWorkersMdDet.contentFlags?.includes('llms-index'));
+
+  const ucpShopifyDet = detectSiteFrameworkLinear({
+    url: 'https://www.aventon.com/products.json',
+    headers: { 'powered-by': 'Shopify', link: '</.well-known/ucp>; rel="ucp"; version="2026-08-25"' },
+  });
+  assert.equal(ucpShopifyDet.platform, 'shopify');
+  assert.ok(ucpShopifyDet.contentFlags?.includes('ucp'));
+
+  const wooRefinedDet = detectSiteFrameworkLinear({
+    url: 'https://ride1up.com/product/prodigy-v2-eco/',
+    contentSource: 'html',
+    headers: { link: '<https://ride1up.com/wp-json/>; rel="https://api.w.org/"' },
+    body: '<!doctype html><html><head><meta name="generator" content="WooCommerce Wholesale Prices 2.3.1"></head><body></body></html>',
+  });
+  assert.equal(wooRefinedDet.platform, 'woocommerce');
+  assert.equal(wooRefinedDet.framework, 'wordpress');
+
+  // 3. Custom-domain WooCommerce `/product/<slug>/` Store API enrichment + duplicate image deduplication + preserving rich HTML specs
+  const wooHtmlScrape = await executeScrapeCall({
+    payload: { url: 'https://ride1up.example.com/product/prodigy-v2-eco/' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const parsed = JSON.parse(rawBody) as { requests?: Array<{ url?: string }> };
+      const reqUrl = parsed.requests?.[0]?.url ?? '';
+      if (reqUrl.includes('/wp-json/wc/store/v1/products?slug=prodigy-v2-eco')) {
+        return {
+          status: 200,
+          via: 'agent:site-arm64',
+          bodyText: JSON.stringify({
+            results: [
+              {
+                id: 'woocommerce-product-json',
+                url: reqUrl,
+                status: 200,
+                outcome: 'ok',
+                contentType: 'application/json',
+                body: JSON.stringify([
+                  {
+                    id: 687835,
+                    name: 'Prodigy v2 ECO',
+                    slug: 'prodigy-v2-eco',
+                    permalink: 'https://ride1up.example.com/product/prodigy-v2-eco/',
+                    description: '',
+                    is_in_stock: true,
+                    categories: [{ name: 'Ebikes' }],
+                    images: [
+                      { src: 'https://ride1up.example.com/wp-content/uploads/bike.webp' },
+                      { src: 'https://ride1up.example.com/wp-content/uploads/bike.webp' },
+                    ],
+                    prices: { price: '129500', regular_price: '139500', currency_code: 'USD', currency_minor_unit: 2 },
+                    variations: [
+                      { id: 687881, attributes: [{ value: 'st' }, { value: 'onyx-black' }], is_in_stock: true },
+                    ],
+                  },
+                ]),
+              },
+            ],
+          }),
+        };
+      }
+      return {
+        status: 200,
+        via: 'agent:site-arm64',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: 'https://ride1up.example.com/product/prodigy-v2-eco/',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              headers: { link: '<https://ride1up.example.com/wp-json/>; rel="https://api.w.org/"' },
+              body: '<!doctype html><html><head><meta name="generator" content="WooCommerce 9.4"></head><body class="woocommerce-page single-product"><main><h1>Prodigy v2 ECO</h1><h3>Components & Tech Specs</h3><p>Brose TF Sprinter German made mid-drive motor with 90nm torque.</p></main></body></html>',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(wooHtmlScrape.status, 200);
+  assert.equal(wooHtmlScrape.body.extractorId, 'woocommerce');
+  const wooRec = (wooHtmlScrape.body.records as Array<{ images?: string[]; variants: Array<{ price: number; compareAt: number }> }>)[0]!;
+  assert.equal(wooRec.images?.length, 1, 'Duplicate WooCommerce image URLs must be deduplicated');
+  assert.equal(wooRec.variants[0]?.price, 1295);
+  assert.equal(wooRec.variants[0]?.compareAt, 1395);
+  assert.match(String(wooHtmlScrape.body.markdown), /Brose TF Sprinter/, 'Fallback HTML tech specs must be preserved when Store API description is empty');
+
+  // 4. PyPI live `project-header__name` + `project-header__summary` (`extractorId: "pypi-project"`)
+  const pypiDoc = extractHtmlDocument(
+    '<!doctype html><html><body><main><div class="project-header"><h1 class="project-header__name">httpx 0.28.1</h1><p class="project-header__summary">The next generation HTTP client.</p><span id="pip-command">pip install httpx</span></div><div id="description"><div class="project-description"><p>HTTPX is a fully featured HTTP/2 client library for Python 3.</p></div></div></main></body></html>',
+    { baseUrl: 'https://pypi.org/project/httpx/', onlyMainContent: true },
+  );
+  assert.equal(pypiDoc.extractorId, 'pypi-project');
+  assert.match(pypiDoc.markdown, /pip install httpx/);
+
+  // 5. Cloned review carousel deduplication (`swiper-slide-duplicate` + consecutive identical >= 120-char prose blocks)
+  const repeatedReview =
+    'August 4, 2025 I have not ridden a bike in twenty years and bought the Prodigy V2 step-over chain drive for daily commuting and fitness.';
+  const carouselDoc = extractHtmlDocument(
+    `<!doctype html><html><body><main><h1>Customer Reviews</h1><div><p><strong>Michael Patterson</strong></p><p>${repeatedReview}</p><p>(1)</p><p>(0)</p></div><div><p><strong>Michael Patterson</strong></p><p>${repeatedReview}</p><p>(1)</p><p>(0)</p></div><div class="swiper-slide swiper-slide-duplicate"><p>Cloned Swiper Slide Should Drop</p></div></main></body></html>`,
+    { baseUrl: 'https://shop.example.com/reviews', onlyMainContent: true },
+  );
+  assert.equal(carouselDoc.markdown.includes('Cloned Swiper Slide Should Drop'), false);
+  assert.equal(carouselDoc.markdown.split('Michael Patterson').length - 1, 1, 'Cloned duplicate long review block must appear once');
+});

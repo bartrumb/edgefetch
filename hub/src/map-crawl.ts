@@ -297,7 +297,7 @@ export async function executeMapCall(params: {
   }
 
   const sourcesReport: Array<{ source: string; url: string; status: number; outcome: string; urlsFound: number }> = [];
-  const discovered = new Map<string, { url: string; title?: string; source: string }>();
+  const discovered = new Map<string, { url: string; title?: string; description?: string; source: string }>();
   const dedupeKeyToCanonical = new Map<string, string>();
   const ghRepoPrefix =
     isGitHubRepoSubpath ? `/${subpathSegments[0]!.toLowerCase()}/${subpathSegments[1]!.toLowerCase()}` : '';
@@ -320,7 +320,7 @@ export async function executeMapCall(params: {
       }
     }
   };
-  const addUrl = (rawCandidate: string, src: string, title?: string): boolean => {
+  const addUrl = (rawCandidate: string, src: string, title?: string, description?: string): boolean => {
     try {
       const u = new URL(rawCandidate, origin);
       if (u.protocol !== 'https:' || (u.port && u.port !== '443')) return false;
@@ -343,13 +343,26 @@ export async function executeMapCall(params: {
         : clean;
       const canonicalKey = dedupeKeyToCanonical.get(simKey) ?? clean;
       const existing = discovered.get(canonicalKey);
+      const cleanDesc = description ? decodeHtmlEntities(description).trim() : '';
       if (!existing) {
         dedupeKeyToCanonical.set(simKey, clean);
-        discovered.set(clean, { url: clean, ...(title ? { title: decodeHtmlEntities(title) } : {}), source: src });
+        discovered.set(clean, {
+          url: clean,
+          ...(title ? { title: decodeHtmlEntities(title) } : {}),
+          ...(cleanDesc ? { description: cleanDesc } : {}),
+          source: src,
+        });
         return true;
       }
-      if (!existing.title && title) {
+      const isCuratedLlms = src === 'llms.txt' || src === 'subpath-llms.txt';
+      if ((!existing.title || isCuratedLlms) && title) {
         existing.title = decodeHtmlEntities(title);
+      }
+      if (!existing.description && cleanDesc) {
+        existing.description = cleanDesc;
+      }
+      if (isCuratedLlms && existing.source !== 'llms.txt' && existing.source !== 'subpath-llms.txt') {
+        existing.source = src;
       }
       return false;
     } catch {
@@ -394,7 +407,8 @@ export async function executeMapCall(params: {
       const llmsDoc = parseLlmsTxt(llmsItem.body, llmsTargetUrl);
       if (llmsDoc) {
         for (const l of llmsDoc.links) {
-          if (addUrl(l.url, 'llms.txt', l.title)) found++;
+          const noteSummary = [l.section, l.notes].filter(Boolean).join(' — ');
+          if (addUrl(l.url, srcLabel, l.title, noteSummary || undefined)) found++;
         }
       }
     }
@@ -579,6 +593,9 @@ export async function executeMapCall(params: {
       if (!twin.title && entry.title) {
         twin.title = entry.title;
       }
+      if (!twin.description && entry.description) {
+        twin.description = entry.description;
+      }
       if (!wantsExplicitMd) {
         discovered.delete(key);
       }
@@ -603,8 +620,10 @@ export async function executeMapCall(params: {
         return raw;
       }
     })();
+    const whole = dec.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
     const camelSplit = dec.replace(/([a-z\d])([A-Z])/g, '$1 $2');
-    return (camelSplit.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(Boolean);
+    const split = camelSplit.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+    return [...new Set([...whole, ...split])].filter(Boolean);
   };
 
   const matchesWholeMapToken = (tokens: string[], queryTerm: string): { matched: boolean; exact: boolean } => {
@@ -655,7 +674,7 @@ export async function executeMapCall(params: {
   }
   if (searchFilter) {
     const terms = (searchFilter.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(Boolean);
-    items = items
+    const scored = items
       .map((entry) => {
         const urlLower = entry.url.toLowerCase();
         let pathAndQuery = entry.url;
@@ -667,15 +686,18 @@ export async function executeMapCall(params: {
         }
         const urlTokens = tokenizeMapSegment(pathAndQuery);
         const titleTokens = tokenizeMapSegment(entry.title ?? '');
+        const descTokens = tokenizeMapSegment(entry.description ?? '');
         let hits = 0;
         let exactBonus = 0;
         for (const t of terms) {
           const uMatch = matchesWholeMapToken(urlTokens, t);
           const tMatch = matchesWholeMapToken(titleTokens, t);
-          if (uMatch.matched || tMatch.matched) {
+          const dMatch = matchesWholeMapToken(descTokens, t);
+          if (uMatch.matched || tMatch.matched || dMatch.matched) {
             hits++;
             if (uMatch.exact) exactBonus += 6;
             else if (tMatch.exact) exactBonus += 3;
+            else if (dMatch.exact) exactBonus += 2;
           }
         }
         const underSubpath = subpathPrefix ? isUnderSubpath(entry.url) : false;
@@ -690,7 +712,9 @@ export async function executeMapCall(params: {
           scoreMapUrlQuality(entry.url);
         return { entry, hits, score };
       })
-      .filter((x) => x.hits > 0 && (terms.length <= 1 || x.hits === terms.length || x.hits >= 2))
+      .filter((x) => x.hits > 0);
+    const strong = scored.filter((x) => terms.length <= 1 || x.hits === terms.length || x.hits >= 2);
+    items = (strong.length > 0 ? strong : scored)
       .sort((a, b) => b.score - a.score || a.entry.url.length - b.entry.url.length || a.entry.url.localeCompare(b.entry.url))
       .map((x) => x.entry);
   } else if (subpathPrefix) {

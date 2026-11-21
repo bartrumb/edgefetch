@@ -227,6 +227,11 @@ export function parseStrictSingleHost(raw: string | undefined | null): string | 
   return lower;
 }
 
+function isLoopbackHostOnly(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase();
+  return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
+}
+
 export function resolvePublicOrigin(params: {
   canonicalOrigin: string;
   trustProxy: boolean;
@@ -252,8 +257,17 @@ export function resolvePublicOrigin(params: {
 
   const validHost = parseStrictSingleHost(params.hostHeader);
   const validFwdHost = parseStrictSingleHost(params.forwardedHostHeader);
-  const authority = validHost ?? baseOriginUrl.host;
-  const trustedForwardedHost = validFwdHost !== null && validHost !== null && validFwdHost === validHost ? validFwdHost : null;
+  let allowLoopbackHostOverride = false;
+  if (validHost !== null && isLoopbackHostOnly(baseOriginUrl.hostname)) {
+    try {
+      allowLoopbackHostOverride = isLoopbackHostOnly(new URL(`http://${validHost}`).hostname);
+    } catch {
+      allowLoopbackHostOverride = false;
+    }
+  }
+  const authority = allowLoopbackHostOverride && validHost !== null ? validHost : baseOriginUrl.host;
+  const trustedForwardedHost =
+    allowLoopbackHostOverride && validFwdHost !== null && validHost !== null && validFwdHost === validHost ? validFwdHost : null;
 
   return {
     origin: new URL(`${proto}://${authority}`).origin,

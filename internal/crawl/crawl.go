@@ -1187,6 +1187,10 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 
 var reEmbeddedHTTPURL = regexp.MustCompile(`(?i)https?://[^\s"\\]+`)
 
+// reQuotedHTTPURL matches a strconv.Quote'd URL exactly as net/url.Error prints it (`Get "https://...": ...`),
+// including escaped quotes/backslashes and raw spaces inside the query.
+var reQuotedHTTPURL = regexp.MustCompile(`(?i)"https?://(?:[^"\\]|\\.)*"`)
+
 func scrubSingleURLToken(raw string) string {
 	if idx := strings.IndexByte(raw, '#'); idx >= 0 {
 		raw = raw[:idx]
@@ -1222,6 +1226,13 @@ func RedactEmbeddedURLs(s string) string {
 	if !strings.Contains(lower, "http://") && !strings.Contains(lower, "https://") {
 		return s
 	}
+	s = reQuotedHTTPURL.ReplaceAllStringFunc(s, func(q string) string {
+		raw, err := strconv.Unquote(q)
+		if err != nil {
+			raw = q[1 : len(q)-1]
+		}
+		return strconv.Quote(scrubSingleURLToken(raw))
+	})
 	return reEmbeddedHTTPURL.ReplaceAllStringFunc(s, scrubSingleURLToken)
 }
 
@@ -1511,9 +1522,7 @@ func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, raw
 		}
 		var pause time.Duration
 		entry, pause = c.fetchRobots(ctx, u)
-		if !(entry.Distressed && ctx.Err() != nil) {
-			hs.SetRobots(c.Now(), entry, pause)
-		}
+		hs.SetRobots(c.Now(), entry, pause)
 	}
 	if entry.Distressed {
 		msg := entry.Reason
@@ -1546,7 +1555,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 		}, 0
 	}
-	baseCtx, cancelAll := context.WithTimeout(context.WithoutCancel(ctx), politeness.RobotsTimeout+3*time.Second)
+	robotsCtx, cancelAll := context.WithTimeout(context.WithoutCancel(ctx), politeness.RobotsTimeout)
 	defer cancelAll()
 	curURL := &url.URL{Scheme: target.Scheme, Host: target.Host, Path: "/robots.txt"}
 
@@ -1564,14 +1573,8 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 		var resp *http.Response
 		var err error
 		for robAttempt := 0; robAttempt < 2; robAttempt++ {
-			attemptTimeout := politeness.RobotsTimeout
-			if robAttempt == 1 {
-				attemptTimeout = politeness.RobotsTimeout + 3*time.Second
-			}
-			rctxAttempt, cancelAttempt := context.WithTimeout(baseCtx, attemptTimeout)
-			req, reqErr := http.NewRequestWithContext(rctxAttempt, http.MethodGet, curURL.String(), nil)
+			req, reqErr := http.NewRequestWithContext(robotsCtx, http.MethodGet, curURL.String(), nil)
 			if reqErr != nil {
-				cancelAttempt()
 				return &politeness.RobotsEntry{
 					Distressed: true,
 					Reason:     "robots_unreachable: robots.txt request invalid: " + reqErr.Error(),
@@ -1586,12 +1589,10 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 
 			resp, err = c.client.Do(req)
 			if err == nil {
-				// Keep rctxAttempt alive until body read completes below!
-				defer cancelAttempt()
 				break
 			}
-			cancelAttempt()
-			if ctx.Err() != nil || baseCtx.Err() != nil || isPermanentFetchError(err) {
+			isTimeout := errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout")
+			if robotsCtx.Err() != nil || isTimeout || isPermanentFetchError(err) {
 				break
 			}
 		}
@@ -1670,7 +1671,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 			}, politeness.DefaultThrottlePause
 		}
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, politeness.RobotsMaxBytes))
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, politeness.RobotsMaxBytes+1))
 		_ = resp.Body.Close()
 		if err != nil {
 			return &politeness.RobotsEntry{
@@ -1679,9 +1680,10 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 			}, politeness.DefaultThrottlePause
 		}
-		if len(raw) >= politeness.RobotsMaxBytes {
-			if nl := strings.LastIndexAny(string(raw), "\r\n"); nl >= 0 {
-				raw = raw[:nl+1]
+		if len(raw) > politeness.RobotsMaxBytes {
+			raw = raw[:politeness.RobotsMaxBytes]
+			if nl := strings.LastIndexAny(string(raw), "\r\n\u0085\u2028\u2029"); nl >= 0 {
+				raw = raw[:nl]
 			} else {
 				raw = nil
 			}

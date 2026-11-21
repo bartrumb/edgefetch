@@ -8,14 +8,20 @@
 import { createServer, type IncomingMessage } from 'node:http';
 import net from 'node:net';
 import { join, resolve } from 'node:path';
+import { WebSocketServer } from 'ws';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
 import { authorizeAgent } from '../src/auth';
 import hubWorker from '../src/index';
+import { normalizeClientRateLimitIp } from '../src/safe-input';
 import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './node-adapters';
 import { S3ArtifactBucket } from './s3-bucket';
 import { createSafeOutboundFetch, type LookupResolverFn } from './safe-fetch';
 import { TursoHttpD1Database } from './turso-d1';
+
+export const MAX_INFLIGHT_PER_IP = 16;
+export const MAX_INFLIGHT_TOTAL = 128;
+const MAX_BODY_STREAM_IDLE_OR_TOTAL_MS = 15_000;
 
 export interface PortableHubOptions {
   port?: number;
@@ -24,6 +30,8 @@ export interface PortableHubOptions {
   migrationsDir?: string;
   envOverrides?: Record<string, string | undefined>;
   dnsResolver?: LookupResolverFn;
+  maxInflightPerIp?: number;
+  maxInflightTotal?: number;
 }
 
 function isTruthyFlag(val: string | undefined): boolean {
@@ -87,9 +95,14 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
   let closed = false;
   let attached = false;
   let totalBytes = 0;
+  let bodyDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let ctrl!: ReadableStreamDefaultController<Uint8Array>;
 
   const cleanup = () => {
+    if (bodyDeadlineTimer) {
+      clearTimeout(bodyDeadlineTimer);
+      bodyDeadlineTimer = null;
+    }
     if (!attached) return;
     attached = false;
     req.removeListener('data', onData);
@@ -157,6 +170,19 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
       if (closed) return;
       if (!attached) {
         attached = true;
+        bodyDeadlineTimer = setTimeout(() => {
+          if (closed) return;
+          closed = true;
+          cleanup();
+          req.pause();
+          try {
+            ctrl.error(new Error('Request body read timed out'));
+          } catch {
+            // ignore
+          }
+          req.destroy();
+        }, MAX_BODY_STREAM_IDLE_OR_TOTAL_MS);
+        bodyDeadlineTimer.unref?.();
         req.on('data', onData);
         req.once('end', onEnd);
         req.once('close', onEnd);
@@ -196,6 +222,11 @@ export function parseStrictSingleHost(raw: string | readonly string[] | undefine
     if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return null;
   }
   return lower;
+}
+
+function isLoopbackHostOnly(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase();
+  return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
 }
 
 export function resolvePublicOrigin(params: {
@@ -239,13 +270,22 @@ export function resolvePublicOrigin(params: {
     proto = rightmostProto;
   }
 
-  // Strictly validate single-host syntax on both `Host` and `X-Forwarded-Host` (port <= 65535, no commas/spaces/`..`/IPv6),
-  // and require `EDGEFETCH_PUBLIC_ORIGIN` to override `Host` behind a proxy — falling back only to validated `Host` so a
-  // spoofed `X-Forwarded-Host` cannot forge OAuth issuer metadata or bypass `/mcp` `Origin` validation!
+  // `R5-Low`: Even when `trustProxy === true` and `EDGEFETCH_PUBLIC_ORIGIN` is unset, NEVER let an arbitrary external
+  // `Host: evil.test` override `baseOriginUrl.host` (preventing OAuth `/.well-known/oauth-authorization-server` issuer poisoning).
+  // Only allow loopback-to-loopback authority substitution (`127.0.0.1` <-> `localhost`).
   const validHost = parseStrictSingleHost(params.hostHeader);
   const validFwdHost = parseStrictSingleHost(params.forwardedHostHeader);
-  const authority = validHost ?? baseOriginUrl.host;
-  const trustedForwardedHost = validFwdHost !== null && validHost !== null && validFwdHost === validHost ? validFwdHost : null;
+  let allowLoopbackHostOverride = false;
+  if (validHost !== null && isLoopbackHostOnly(baseOriginUrl.hostname)) {
+    try {
+      allowLoopbackHostOverride = isLoopbackHostOnly(new URL(`http://${validHost}`).hostname);
+    } catch {
+      allowLoopbackHostOverride = false;
+    }
+  }
+  const authority = allowLoopbackHostOverride && validHost !== null ? validHost : baseOriginUrl.host;
+  const trustedForwardedHost =
+    allowLoopbackHostOverride && validFwdHost !== null && validHost !== null && validFwdHost === validHost ? validFwdHost : null;
 
   return {
     origin: new URL(`${proto}://${authority}`).origin,
@@ -426,75 +466,125 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     },
   } as unknown as ExecutionContext;
 
+  const maxInflightPerIp =
+    typeof opts.maxInflightPerIp === 'number' && opts.maxInflightPerIp > 0
+      ? Math.floor(opts.maxInflightPerIp)
+      : MAX_INFLIGHT_PER_IP;
+  const maxInflightTotal =
+    typeof opts.maxInflightTotal === 'number' && opts.maxInflightTotal > 0
+      ? Math.floor(opts.maxInflightTotal)
+      : MAX_INFLIGHT_TOTAL;
+  const inflightByIp = new Map<string, number>();
+  let totalInflight = 0;
+
   const server = createServer(async (req, res) => {
     req.on('error', () => undefined);
-    let webReq: Request;
-    try {
-      webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy, explicitPublicOrigin !== null);
-    } catch {
-      res.statusCode = 400;
+    const clientBucket = normalizeClientRateLimitIp(resolveTrustedClientIp(req, trustProxy));
+    const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
+    if (curIpInflight >= maxInflightPerIp || totalInflight >= maxInflightTotal) {
+      res.statusCode = 429;
       res.setHeader('content-type', 'application/json');
+      res.setHeader('cache-control', 'no-store');
+      res.setHeader('retry-after', '1');
       res.setHeader('connection', 'close');
       res.once('finish', () => {
         setImmediate(() => req.destroy());
       });
-      res.end(JSON.stringify({ error: 'bad_request', message: 'Malformed HTTP request or Host header' }));
+      res.end(JSON.stringify({ error: 'too_many_requests', message: 'Too many concurrent in-flight requests' }));
       return;
     }
+
+    totalInflight++;
+    inflightByIp.set(clientBucket, curIpInflight + 1);
+    let slotReleased = false;
+    const releaseInflightSlot = () => {
+      if (slotReleased) return;
+      slotReleased = true;
+      totalInflight = Math.max(0, totalInflight - 1);
+      const rem = inflightByIp.get(clientBucket) ?? 0;
+      if (rem <= 1) inflightByIp.delete(clientBucket);
+      else inflightByIp.set(clientBucket, rem - 1);
+    };
+    res.once('close', releaseInflightSlot);
+
     try {
-      const webRes = await (hubWorker as { fetch(r: Request, e: unknown, c?: ExecutionContext): Promise<Response> }).fetch(webReq, workerEnv, ctx);
-      res.statusCode = webRes.status;
-      webRes.headers.forEach((val, key) => {
-        if (key.toLowerCase() === 'set-cookie') {
-          const getSetCookie = (webRes.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie;
-          if (typeof getSetCookie === 'function') {
-            res.setHeader('set-cookie', getSetCookie.call(webRes.headers));
-            return;
-          }
-        }
-        res.setHeader(key, val);
-      });
-      // `R3-M1`: Whenever an unauthenticated / over-limit / error response (`>= 400`) finishes while the client is still
-      // streaming an unread request body (`!req.complete`), OR when a `GET`/`HEAD`/`OPTIONS` request includes unexpected body framing,
-      // send `Connection: close` and destroy the socket after flush!
-      const methodUpper = (req.method ?? 'GET').toUpperCase();
-      const ignoredBodyFraming =
-        (methodUpper === 'GET' || methodUpper === 'HEAD' || methodUpper === 'OPTIONS') &&
-        Boolean(req.headers['transfer-encoding'] || (req.headers['content-length'] && req.headers['content-length'] !== '0'));
-      const shouldDestroyAfterFlush = (!req.complete && webRes.status >= 400) || ignoredBodyFraming;
-      if (shouldDestroyAfterFlush) {
+      let webReq: Request;
+      try {
+        webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy, explicitPublicOrigin !== null);
+      } catch {
+        res.statusCode = 400;
+        res.setHeader('content-type', 'application/json');
         res.setHeader('connection', 'close');
         res.once('finish', () => {
           setImmediate(() => req.destroy());
         });
-      }
-      if (!webRes.body) {
-        res.end();
+        res.end(JSON.stringify({ error: 'bad_request', message: 'Malformed HTTP request or Host header' }));
         return;
       }
-      const reader = webRes.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        res.write(value);
-      }
-      res.end();
-    } catch (err) {
-      res.statusCode = 500;
-      res.setHeader('content-type', 'application/json');
-      res.setHeader('connection', 'close');
-      if (!req.complete) {
-        res.once('finish', () => {
-          setImmediate(() => req.destroy());
+      try {
+        const webRes = await (hubWorker as { fetch(r: Request, e: unknown, c?: ExecutionContext): Promise<Response> }).fetch(webReq, workerEnv, ctx);
+        res.statusCode = webRes.status;
+        webRes.headers.forEach((val, key) => {
+          if (key.toLowerCase() === 'set-cookie') {
+            const getSetCookie = (webRes.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie;
+            if (typeof getSetCookie === 'function') {
+              res.setHeader('set-cookie', getSetCookie.call(webRes.headers));
+              return;
+            }
+          }
+          res.setHeader(key, val);
         });
+        // `R3-M1`: Whenever an unauthenticated / over-limit / error response (`>= 400`) finishes while the client is still
+        // streaming an unread request body (`!req.complete`), OR when a `GET`/`HEAD`/`OPTIONS` request includes unexpected body framing,
+        // send `Connection: close` and destroy the socket after flush!
+        const methodUpper = (req.method ?? 'GET').toUpperCase();
+        const ignoredBodyFraming =
+          (methodUpper === 'GET' || methodUpper === 'HEAD' || methodUpper === 'OPTIONS') &&
+          Boolean(req.headers['transfer-encoding'] || (req.headers['content-length'] && req.headers['content-length'] !== '0'));
+        const shouldDestroyAfterFlush = (!req.complete && webRes.status >= 400) || ignoredBodyFraming;
+        if (shouldDestroyAfterFlush) {
+          res.setHeader('connection', 'close');
+          res.once('finish', () => {
+            setImmediate(() => req.destroy());
+          });
+        }
+        if (!webRes.body) {
+          res.end();
+          return;
+        }
+        const reader = webRes.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(value);
+        }
+        res.end();
+      } catch (err) {
+        res.statusCode = 500;
+        res.setHeader('content-type', 'application/json');
+        res.setHeader('connection', 'close');
+        if (!req.complete) {
+          res.once('finish', () => {
+            setImmediate(() => req.destroy());
+          });
+        }
+        res.end(JSON.stringify({ error: 'internal_error', message: err instanceof Error ? err.message : String(err) }));
       }
-      res.end(JSON.stringify({ error: 'internal_error', message: err instanceof Error ? err.message : String(err) }));
+    } finally {
+      releaseInflightSlot();
     }
   });
   server.headersTimeout = 15_000;
   server.requestTimeout = 30_000;
   server.keepAliveTimeout = 5_000;
   server.maxConnections = 512;
+
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: 1_048_576,
+    perMessageDeflate: false,
+    handleProtocols: (protocols) => (protocols.has('edgefetch-agent') ? 'edgefetch-agent' : false),
+  });
 
   server.on('upgrade', (req, socket, head) => {
     socket.on('error', () => undefined);
@@ -521,22 +611,17 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         return;
       }
       const pubIp = resolveTrustedClientIp(req, trustProxy);
-      const selectedProto = String(req.headers['sec-websocket-protocol'] ?? '')
-        .split(',')
-        .map((s) => s.trim())
-        .find((s) => s === 'edgefetch-agent');
-      coordinator.acceptNodeUpgrade({
-        wsKey,
-        socket,
-        head,
-        siteId: auth.siteId,
-        arch: (req.headers['x-agent-arch'] as string | undefined) ?? null,
-        version: (req.headers['x-agent-version'] as string | undefined) ?? null,
-        browserVersion: (req.headers['x-agent-browser-version'] as string | undefined) ?? null,
-        browserSandbox: (req.headers['x-agent-browser-sandbox'] as string | undefined) ?? null,
-        capabilities: (req.headers['x-agent-capabilities'] as string | undefined) ?? null,
-        publicIp: pubIp,
-        subprotocol: selectedProto ?? null,
+      wss.handleUpgrade(req, socket, head, (wsClient) => {
+        coordinator.acceptWebSocket({
+          ws: wsClient,
+          siteId: auth.siteId,
+          arch: (req.headers['x-agent-arch'] as string | undefined) ?? null,
+          version: (req.headers['x-agent-version'] as string | undefined) ?? null,
+          browserVersion: (req.headers['x-agent-browser-version'] as string | undefined) ?? null,
+          browserSandbox: (req.headers['x-agent-browser-sandbox'] as string | undefined) ?? null,
+          capabilities: (req.headers['x-agent-capabilities'] as string | undefined) ?? null,
+          publicIp: pubIp,
+        });
       });
     } catch {
       try {
@@ -559,6 +644,14 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         close: () =>
           new Promise<void>((resClose) => {
             coordinator.close();
+            for (const client of wss.clients) {
+              try {
+                client.terminate();
+              } catch {
+                // ignore
+              }
+            }
+            wss.close();
             server.close(() => {
               localMetaDb?.close();
               localSearchDb?.close();

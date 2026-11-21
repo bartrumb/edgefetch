@@ -1,0 +1,103 @@
+# Shared Go + TypeScript Declarative Site Adapter: DOI.org & Crossref
+id: doi-crossref
+name: DOI.org & Crossref Bibliographic Resolver
+category: research-health
+description: Upgrades doi.org/10.<prefix>/<suffix> links to api.crossref.org/works/<doi> bibliographic JSON (authors, venue, citations, JATS abstract, and publisher URL).
+domains:
+  - doi.org
+  - www.doi.org
+  - dx.doi.org
+exampleUrls:
+  - https://doi.org/10.1038/s41586-021-03819-2
+
+# Greedy multi-segment capture validated strictly as 10.<4-9 digits>/<non-whitespace>
+match:
+  pathSegments:
+    - param: doi
+      charset: doi_rest
+      greedy: true
+      minLen: 8
+      maxLen: 240
+
+twin:
+  fetchUrl: https://api.crossref.org/works/{doi}
+  kind: json
+  accept: application/json
+
+extract:
+  rootPath: message
+  requireVars:
+    - title
+  vars:
+    title:
+      paths: [title.0]
+      fallbackTemplate: "{doi}"
+      format: strip_tags
+    authors:
+      paths: [author]
+      subFieldsJoin:
+        fields: [given, family]
+        sep: " "
+        fallbackField: name
+      join: ", "
+      limit: 16
+    authorsShort:
+      paths: [author]
+      subFieldsJoin:
+        fields: [given, family]
+        sep: " "
+        fallbackField: name
+      join: ", "
+      limit: 4
+    venue:
+      paths: [container-title.0]
+    publisher:
+      paths: [publisher]
+    venueFull:
+      template: "{venue} ({publisher})"
+      whenVars: [venue, publisher]
+      fallbackVar: venue
+    citations:
+      paths: [is-referenced-by-count]
+      format: int_comma
+    pubUrl:
+      paths: [URL]
+      fallbackTemplate: https://doi.org/{doi}
+      requireHttps: true
+    pubDate:
+      paths: [issued.date-parts.0]
+      format: date_parts
+    abstract:
+      paths: [abstract]
+      format: jats_abstract
+    abstractShort:
+      paths: [abstract]
+      format: jats_abstract
+      sliceMax: 260
+  titleTemplate: "{title}"
+  descriptionVar: abstractShort
+  authorVar: authorsShort
+  publishedTimeVar: pubDate
+  bullets:
+    - label: DOI
+      template: "`{doi}`"
+    - label: Authors
+      template: "{authors}"
+      whenVar: authors
+    - label: Venue / Journal
+      template: "{venueFull}"
+      whenVar: venueFull
+    - label: Published
+      template: "{pubDate}"
+      whenVar: pubDate
+    - label: Cited By (Crossref)
+      template: "{citations}"
+      whenVar: citations
+    - label: Publisher Link
+      template: "{pubUrl}"
+      whenVar: pubUrl
+  sections:
+    - heading: Abstract
+      textVar: abstract
+  linksVars:
+    - pubUrl

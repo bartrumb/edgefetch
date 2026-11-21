@@ -1,0 +1,86 @@
+# Shared Go + TypeScript Declarative Site Adapter: Polymarket Prediction Markets
+id: polymarket
+name: Polymarket Prediction Markets
+category: finance
+description: Upgrades polymarket.com/event/<slug> pages to gamma-api.polymarket.com JSON with live outcome probabilities, volume, and liquidity.
+domains:
+  - polymarket.com
+  - www.polymarket.com
+exampleUrls:
+  - https://polymarket.com/event/fed-decision-in-december
+
+match:
+  exactSegments: false
+  pathSegments:
+    - event
+    - param: slug
+      charset: alnum_dash
+      minLen: 2
+      maxLen: 140
+
+twin:
+  fetchUrl: https://gamma-api.polymarket.com/events?slug={slug}
+  kind: json
+  accept: application/json
+
+extract:
+  unwrapFirstArrayElement: true
+  requireFields:
+    - title
+  vars:
+    title:
+      paths: [title]
+      trim: true
+    desc:
+      paths: [description]
+      trim: true
+    descShort:
+      paths: [description]
+      trim: true
+      sliceMax: 260
+    vol:
+      paths: [volume]
+      format: usd_compact
+    liq:
+      paths: [liquidity]
+      format: usd_compact
+    endDate:
+      paths: [endDate]
+      sliceMax: 10
+    status:
+      paths: [closed]
+      format: bool_map
+      trueValue: Closed / Resolved
+      falseValue: Active
+  titleTemplate: "{title}"
+  descriptionVar: descShort
+  bullets:
+    - label: Status
+      template: "{status}"
+    - label: Total Volume
+      template: "{vol}"
+      whenVar: vol
+    - label: Liquidity
+      template: "{liq}"
+      whenVar: liq
+    - label: End Date
+      template: "{endDate}"
+      whenVar: endDate
+  sections:
+    - heading: Market Odds
+      arrayPath: markets
+      limit: 25
+      columns:
+        - header: Market / Outcome
+          paths: [groupItemTitle, question]
+          fallbackVar: title
+        - header: Implied Probability
+          format: paired_percent
+          outcomesField: outcomes
+          pricesField: outcomePrices
+          defaultOutcomes: [Yes, No]
+        - header: Volume
+          paths: [volume]
+          format: usd_compact
+    - heading: Resolution Rules
+      textVar: desc

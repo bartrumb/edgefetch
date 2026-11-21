@@ -39,6 +39,15 @@ const ADMIN_HTML_HEADERS: Record<string, string> = {
   'referrer-policy': 'no-referrer',
 };
 
+const ADMIN_JSON_HEADERS: Record<string, string> = {
+  'cache-control': 'no-store',
+  'x-content-type-options': 'nosniff',
+};
+
+function adminJson(data: unknown, status = 200): Response {
+  return Response.json(data, { status, headers: ADMIN_JSON_HEADERS });
+}
+
 export interface AdminPortalDeps {
   serviceName: string;
   mcpSlug: string;
@@ -735,7 +744,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   const isSecure = url.protocol === 'https:';
   if (!deps.ownerSecret || deps.ownerSecret.length < MIN_TOKEN_LENGTH) {
-    return Response.json({ error: 'owner_secret_unconfigured' }, { status: 503 });
+    return adminJson({ error: 'owner_secret_unconfigured' }, 503);
   }
 
   let session = await verifyAdminSessionCookie(request.headers.get('cookie'), deps.ownerSecret);
@@ -809,41 +818,41 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     const cappedLogout = await readBodyTextCapped(request, 4_096);
     const formCsrf = cappedLogout.ok ? new URLSearchParams(cappedLogout.text).get('csrf') ?? '' : '';
     if (!session.ok || !sameBytes(formCsrf, session.csrf)) {
-      return Response.json({ error: 'invalid_csrf' }, { status: 403 });
+      return adminJson({ error: 'invalid_csrf' }, 403);
     }
     // Server-side revocation of this exact admin session cookie (`Low`): replay of the logged-out cookie fails closed!
     if (typeof deps.oauthStore.recordAuthFailure === 'function') {
       await deps.oauthStore.recordAuthFailure(`revoked_admin:${session.csrf}`, Date.now(), 8 * 60 * 60_000, 1);
     }
-    const headers = new Headers({ location: '/admin', 'cache-control': 'no-store' });
+    const headers = new Headers({ location: '/admin', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
     headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: isSecure }));
     return new Response(null, { status: 302, headers });
   }
 
   if (!session.ok) {
-    return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
+    return adminJson({ error: 'unauthorized' }, 401);
   }
 
   if (path === '/admin/api/state' && request.method === 'GET') {
     const state = await deps.getState();
-    return Response.json(state, { status: 200, headers: { 'cache-control': 'no-store' } });
+    return adminJson(state, 200);
   }
 
   if (request.method === 'POST') {
     const hdrCsrf = request.headers.get('x-csrf-token') ?? '';
     if (!hdrCsrf || !sameBytes(hdrCsrf, session.csrf)) {
-      return Response.json({ error: 'invalid_csrf' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+      return adminJson({ error: 'invalid_csrf' }, 403);
     }
 
     if (path === '/admin/api/events/clear') {
       await deps.clearEvents?.();
-      return Response.json({ ok: true }, { status: 200, headers: { 'cache-control': 'no-store' } });
+      return adminJson({ ok: true }, 200);
     }
 
     if (path === '/admin/api/affinity/clear') {
       const capped = await readBodyTextCapped(request, 65_536);
       if (!capped.ok) {
-        return Response.json({ error: 'payload_too_large' }, { status: capped.error === 'too_large' ? 413 : 400 });
+        return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
       }
       let body: { siteId?: string } = {};
       if (capped.text.trim()) {
@@ -854,13 +863,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
       }
       await deps.clearAffinities(body.siteId);
-      return Response.json({ ok: true }, { status: 200, headers: { 'cache-control': 'no-store' } });
+      return adminJson({ ok: true }, 200);
     }
 
     if (path === '/admin/api/grants/revoke') {
       const capped = await readBodyTextCapped(request, 65_536);
       if (!capped.ok) {
-        return Response.json({ error: 'payload_too_large' }, { status: capped.error === 'too_large' ? 413 : 400 });
+        return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
       }
       let body: { grantId?: string } = {};
       if (capped.text.trim()) {
@@ -871,16 +880,16 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
       }
       if (!body.grantId || typeof body.grantId !== 'string') {
-        return Response.json({ error: 'missing_grant_id' }, { status: 400 });
+        return adminJson({ error: 'missing_grant_id' }, 400);
       }
       const revoked = await deps.revokeGrant(body.grantId);
-      return Response.json({ ok: true, revoked }, { status: 200, headers: { 'cache-control': 'no-store' } });
+      return adminJson({ ok: true, revoked }, 200);
     }
 
     if (path === '/admin/api/fetch') {
       const capped = await readBodyTextCapped(request, 65_536);
       if (!capped.ok) {
-        return Response.json({ error: 'payload_too_large' }, { status: capped.error === 'too_large' ? 413 : 400 });
+        return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
       }
       let body: {
         url?: string;
@@ -897,19 +906,19 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         try {
           body = JSON.parse(capped.text) as typeof body;
         } catch {
-          return Response.json({ error: 'invalid_json' }, { status: 400 });
+          return adminJson({ error: 'invalid_json' }, 400);
         }
       }
       if (!body.url || typeof body.url !== 'string') {
-        return Response.json({ error: 'missing_url' }, { status: 400 });
+        return adminJson({ error: 'missing_url' }, 400);
       }
       const target = (typeof body.target === 'string' ? body.target.toLowerCase() : deps.defaultTarget) as FetchTarget;
       if (!deps.allowedTargets.includes(target)) {
-        return Response.json({ error: 'invalid_target' }, { status: 400 });
+        return adminJson({ error: 'invalid_target' }, 400);
       }
       const site = typeof body.site === 'string' && body.site.trim() ? body.site.trim().toLowerCase() : undefined;
       if (site && !SITE_ID_PATTERN.test(site)) {
-        return Response.json({ error: 'invalid_site' }, { status: 400 });
+        return adminJson({ error: 'invalid_site' }, 400);
       }
 
       const respectRobots =
@@ -942,9 +951,9 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       } catch {
         // leave raw
       }
-      return Response.json({ status: out.status, via: out.via, reply }, { status: 200, headers: { 'cache-control': 'no-store' } });
+      return adminJson({ status: out.status, via: out.via, reply }, 200);
     }
   }
 
-  return Response.json({ error: 'not_found' }, { status: 404 });
+  return adminJson({ error: 'not_found' }, 404);
 }

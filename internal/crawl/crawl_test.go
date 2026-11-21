@@ -929,6 +929,18 @@ func TestAgenticWebMarkdownForAgentsContentSignalsHTTP402AndLogRedaction(t *test
 	if strings.Contains(malformedScrubbed, "s3[cr]3t") || strings.Contains(malformedScrubbed, "SECRET") || !strings.Contains(malformedScrubbed, "https://host.example.com/p") {
 		t.Fatalf("expected malformed URL credentials scrubbed, got %q", malformedScrubbed)
 	}
+	for _, quotedErr := range []string{
+		fmt.Sprintf("Get %q: dial tcp: connection refused", `https://host.example/p?a="x"&api_key=QSECRET_1`),
+		fmt.Sprintf("Get %q: dial tcp: connection refused", `https://host.example/p?q=a b&api_key=QSECRET_2`),
+		fmt.Sprintf("Get %q: dial tcp: connection refused", `https://host.example/p?q=a\b&api_key=QSECRET_3`),
+		fmt.Sprintf("Get %q: dial tcp: connection refused", `https://user:pa"ss-QSECRET_4@host.example/p`),
+		`parse "https://host.example/p?api_key=QSECRET_5\x00": net/url: invalid control character in URL`,
+	} {
+		red := RedactEmbeddedURLs(quotedErr)
+		if strings.Contains(red, "QSECRET_") || !strings.Contains(red, `"https://host.example/p"`) {
+			t.Fatalf("expected strconv.Quote URL secret scrubbed from %q, got %q", quotedErr, red)
+		}
+	}
 	if strings.Contains(logBuf.String(), "LOG_SECRET_123") || strings.Contains(logBuf.String(), "PAY_SECRET_456") || strings.Contains(res[5].Problem, "PAY_SECRET_456") {
 		t.Fatalf("M11: query secret leaked into logs or host-stop problem: logs=%s problem=%q", logBuf.String(), res[5].Problem)
 	}
@@ -1022,6 +1034,18 @@ func TestRobotsRFC9309RedirectLimitCacheControlAnd1MiBCap(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte("<html>public ok</html>"))
+
+		case "exact-1mib.test":
+			if r.URL.Path == "/robots.txt" {
+				// File is EXACTLY politeness.RobotsMaxBytes (1 MiB) with no trailing newline — nothing was truncated,
+				// so the final Disallow: /exact-private rule MUST be preserved!
+				head, last := "User-agent: *\nAllow: /\n", "Disallow: /exact-private"
+				exactBody := head + strings.Repeat("#", politeness.RobotsMaxBytes-len(head)-len(last)-1) + "\n" + last
+				_, _ = w.Write([]byte(exactBody))
+				return
+			}
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>exact</html>"))
 		}
 	}))
 	c.allow = func(u *url.URL) error {
@@ -1040,6 +1064,7 @@ func TestRobotsRFC9309RedirectLimitCacheControlAnd1MiBCap(t *testing.T) {
 		{ID: "pad", URL: "http://pad-540k.test/after-540k", Kind: classify.KindPage},
 		{ID: "cut-pub", URL: "http://cut-1mib.test/public/docs", Kind: classify.KindPage},
 		{ID: "cut-adm", URL: "http://cut-1mib.test/admin/panel", Kind: classify.KindPage},
+		{ID: "exact-priv", URL: "http://exact-1mib.test/exact-private/doc", Kind: classify.KindPage},
 	}, Options{PauseMs: 1})
 
 	if out[0].Outcome != classify.OutcomeOK || sixRedirHops.Load() != 6 {
@@ -1065,6 +1090,9 @@ func TestRobotsRFC9309RedirectLimitCacheControlAnd1MiBCap(t *testing.T) {
 	}
 	if out[5].Outcome != classify.OutcomeSkip {
 		t.Fatalf("expected intact earlier Disallow: /admin rule to remain enforced, got %+v", out[5])
+	}
+	if out[6].Outcome != classify.OutcomeSkip {
+		t.Fatalf("expected exact 1 MiB /robots.txt final Disallow: /exact-private rule preserved, got %+v", out[6])
 	}
 }
 
@@ -1254,5 +1282,61 @@ func TestCuratedSafeResponseHeadersAndWarmUp(t *testing.T) {
 	}
 	if _, leaked := hdrs["x-internal-secret"]; leaked {
 		t.Fatalf("unexpected non-allowlisted header in ResponseHeaders: %+v", hdrs)
+	}
+}
+
+func TestRobotsSlowDripTarpitBoundedWithoutRetry(t *testing.T) {
+	var robotsHits atomic.Int32
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			robotsHits.Add(1)
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-ticker.C:
+					_, _ = w.Write([]byte("#"))
+					if flusher != nil {
+						flusher.Flush()
+					}
+				}
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html>ok</html>"))
+	}))
+
+	start := time.Now()
+	res := c.Run(context.Background(), []Request{
+		{ID: "tarpit-1", URL: "http://tarpit-robots.test/page", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	elapsed := time.Since(start)
+
+	if len(res) != 1 || res[0].Outcome != classify.OutcomeStop || !strings.HasPrefix(res[0].Problem, "robots_unreachable: ") {
+		t.Fatalf("expected tarpit /robots.txt to fail closed with robots_unreachable, got %+v", res)
+	}
+	if robotsHits.Load() != 1 {
+		t.Fatalf("expected zero retries on /robots.txt tarpit timeout, got %d hits", robotsHits.Load())
+	}
+	if elapsed < 4500*time.Millisecond || elapsed > 6500*time.Millisecond {
+		t.Fatalf("expected /robots.txt tarpit bounded to ~5s RobotsTimeout, took %v", elapsed)
+	}
+
+	// Subsequent request must fail fast via cached Distressed state without re-hitting tarpit!
+	start2 := time.Now()
+	res2 := c.Run(context.Background(), []Request{
+		{ID: "tarpit-2", URL: "http://tarpit-robots.test/page2", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	elapsed2 := time.Since(start2)
+	if len(res2) != 1 || res2[0].Outcome != classify.OutcomeStop || robotsHits.Load() != 1 || elapsed2 > 250*time.Millisecond {
+		t.Fatalf("expected cached tarpit distress to fail fast without second /robots.txt hit (hits=%d, elapsed=%v, res=%+v)", robotsHits.Load(), elapsed2, res2)
 	}
 }

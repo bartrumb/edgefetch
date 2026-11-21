@@ -15,6 +15,10 @@ import {
   parseJsonObject,
   stripTagsInline,
 } from '../../utils';
+import { safeDecodeURIComponent } from '../../../safe-input';
+
+const MAX_IMAGES_PER_PRODUCT = 250;
+const MAX_VARIANTS_PER_PRODUCT = 250;
 
 function readHeaderCaseInsensitive(
   headers: Record<string, string | undefined> | Headers | undefined,
@@ -101,7 +105,8 @@ export function resolveCustomDomainShopifyProductTwinUrl(
   const parts = u.pathname.split('/').filter(Boolean);
   const prodIdx = parts.indexOf('products');
   if (prodIdx < 0 || !parts[prodIdx + 1]) return null;
-  const rawSeg = decodeURIComponent(parts[prodIdx + 1]!);
+  const rawSeg = safeDecodeURIComponent(parts[prodIdx + 1]!);
+  if (rawSeg === null) return null;
   const handle = rawSeg.replace(/\.(?:json|js)$/i, '');
   if (!/^[A-Za-z0-9_-]{1,160}$/.test(handle)) return null;
   const encoded = encodeURIComponent(handle);
@@ -198,26 +203,36 @@ export function normalizeShopifyProductRecord(
   const imageById = new Map<string, string>();
   const imageByVariantId = new Map<string, string>();
   const allImageUrls: string[] = [];
+  const seenImageUrls = new Set<string>();
 
   for (const img of rawImages) {
     if (typeof img === 'string') {
       const u = normalizeImageHttps(img);
-      if (u && !allImageUrls.includes(u)) allImageUrls.push(u);
+      if (u && !seenImageUrls.has(u) && allImageUrls.length < MAX_IMAGES_PER_PRODUCT) {
+        seenImageUrls.add(u);
+        allImageUrls.push(u);
+      }
     } else if (img && typeof img === 'object') {
       const io = img as Record<string, unknown>;
       const u = normalizeImageHttps(io.src ?? io.url);
       if (!u) continue;
-      if (!allImageUrls.includes(u)) allImageUrls.push(u);
-      if (io.id !== undefined && io.id !== null) {
+      if (!seenImageUrls.has(u) && allImageUrls.length < MAX_IMAGES_PER_PRODUCT) {
+        seenImageUrls.add(u);
+        allImageUrls.push(u);
+      }
+      if (io.id !== undefined && io.id !== null && imageById.size < MAX_IMAGES_PER_PRODUCT * 4) {
         imageById.set(String(io.id), u);
       }
       if (Array.isArray(io.variant_ids)) {
         for (const vid of io.variant_ids) {
-          if (vid !== undefined && vid !== null) {
+          if (vid !== undefined && vid !== null && imageByVariantId.size < MAX_VARIANTS_PER_PRODUCT * 4) {
             imageByVariantId.set(String(vid), u);
           }
         }
       }
+    }
+    if (allImageUrls.length >= MAX_IMAGES_PER_PRODUCT && imageById.size >= MAX_IMAGES_PER_PRODUCT * 4) {
+      break;
     }
   }
 
@@ -242,7 +257,9 @@ export function normalizeShopifyProductRecord(
   const currency =
     opts?.currency && /^[A-Z]{3}$/i.test(opts.currency) ? opts.currency.toUpperCase() : null;
 
-  const rawVariants = Array.isArray(rawProd.variants) ? (rawProd.variants as Array<Record<string, unknown>>) : [];
+  const rawVariants = Array.isArray(rawProd.variants)
+    ? (rawProd.variants as Array<Record<string, unknown>>).slice(0, MAX_VARIANTS_PER_PRODUCT)
+    : [];
   const variants: CatalogVariantRecord[] = rawVariants.map((rv) => {
     const variantId = String(rv.id ?? '');
     const ajaxV = variantId && opts?.ajaxVariantsById ? opts.ajaxVariantsById.get(variantId) : undefined;
@@ -484,7 +501,8 @@ function formatShopifyProductsFeedTwin(rawBody: string, origUrl: string): TwinFo
   }
 
   const colMatch = /^\/collections\/([^/]+)\/products\.json$/i.exec(u.pathname);
-  const scopeLabel = colMatch?.[1] ? `${u.hostname} (${decodeURIComponent(colMatch[1])})` : u.hostname;
+  const decodedCol = colMatch?.[1] ? safeDecodeURIComponent(colMatch[1]) : null;
+  const scopeLabel = decodedCol ? `${u.hostname} (${decodedCol})` : u.hostname;
   const totalVariants = records.reduce((acc, r) => acc + r.variants.length, 0);
   const title = `${scopeLabel} — Shopify Catalog Inventory (Page ${page}, ${returned} products)`;
 
@@ -675,7 +693,8 @@ export default defineAdapter({
 
     const prodIdx = parts.indexOf('products');
     if (prodIdx < 0 || !parts[prodIdx + 1]) return null;
-    const rawSeg = decodeURIComponent(parts[prodIdx + 1]!);
+    const rawSeg = safeDecodeURIComponent(parts[prodIdx + 1]!);
+    if (rawSeg === null) return null;
     const isJsEndpoint = /\.js$/i.test(rawSeg);
     const handle = rawSeg.replace(/\.(?:json|js)$/i, '');
     if (!/^[A-Za-z0-9_-]{1,160}$/.test(handle)) return null;
@@ -745,7 +764,7 @@ export default defineAdapter({
 
     const parts = path.split('/').filter(Boolean);
     const pIdx = parts.indexOf('products');
-    const handle = pIdx >= 0 && parts[pIdx + 1] ? decodeURIComponent(parts[pIdx + 1]!) : '';
+    const handle = pIdx >= 0 && parts[pIdx + 1] ? (safeDecodeURIComponent(parts[pIdx + 1]!) ?? '') : '';
 
     const variants: CatalogVariantRecord[] = [];
     const rows: Array<Array<string>> = [];

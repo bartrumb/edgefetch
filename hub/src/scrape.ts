@@ -97,7 +97,7 @@ import {
   splitPdfPagesAndMarkers,
 } from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 28;
+export const SCRAPE_PIPELINE_VERSION = 29;
 
 export interface ScrapedImage {
   url: string;
@@ -257,6 +257,7 @@ export function splitMarkdownByCodeFences(md: string): string[] {
   let inFence = false;
   let fenceChar = '';
   let fenceLen = 0;
+  let fenceIndent = 0;
   let segStart = 0;
   let pos = 0;
   const len = md.length;
@@ -275,6 +276,7 @@ export function splitMarkdownByCodeFences(md: string): string[] {
         inFence = true;
         fenceChar = openMatch[1]![0]!;
         fenceLen = openMatch[1]!.length;
+        fenceIndent = rawLine.length - trimmedStart.length;
         segStart = pos;
       }
     } else {
@@ -285,6 +287,22 @@ export function splitMarkdownByCodeFences(md: string): string[] {
         fenceChar = '';
         fenceLen = 0;
         segStart = lineRawEnd;
+      } else if (fenceIndent > 0 && rawLine.trim() !== '') {
+        let ind = 0;
+        for (let q = 0; q < rawLine.length; q++) {
+          const qc = rawLine.charCodeAt(q);
+          if (qc === 32) ind++;
+          else if (qc === 9) ind += 4;
+          else break;
+        }
+        if (ind < fenceIndent) {
+          out.push(md.slice(segStart, pos));
+          inFence = false;
+          fenceChar = '';
+          fenceLen = 0;
+          segStart = pos;
+          continue;
+        }
       }
     }
     pos = nextPos;
@@ -2013,7 +2031,8 @@ export function extractHtmlDocument(
 ): ExtractedDocument {
   const { baseUrl, onlyMainContent = true, redactPii = false, includeImages = true, includeTags, excludeTags } = options;
   const deadlineAt = Date.now() + 2_500;
-  const boundedRawHtml = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
+  let boundedRawHtml = rawHtml.length > MAX_HTML_SCAN_CHARS ? rawHtml.slice(0, MAX_HTML_SCAN_CHARS) : rawHtml;
+  if (boundedRawHtml.includes('\u0000')) boundedRawHtml = boundedRawHtml.replace(/\u0000/g, '');
 
   const jsonLdEntities = flattenJsonLdEntities(boundedRawHtml);
   const schemaMeta = extractSchemaMetadataAndBody(jsonLdEntities);
@@ -4136,6 +4155,183 @@ function decodeUriEntitiesForScheme(input: string): string {
     });
 }
 
+
+/** R5: CommonMark code spans may continue across lines of one paragraph. Marks every line that follows an unmatched backtick run in the same paragraph; per-line code-span detection must not be trusted there. */
+function computeTickPoisonedLines(lines: string[]): Uint8Array {
+  const poisoned = new Uint8Array(lines.length);
+  let carry = false;
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li]!;
+    if (line.trim() === '') {
+      carry = false;
+      continue;
+    }
+    if (carry) {
+      poisoned[li] = 1;
+      continue;
+    }
+    if (!line.includes('`')) continue;
+    const cursors = createMarkdownLineScanCursors();
+    let i = 0;
+    let lastTick = -2;
+    while (i < line.length) {
+      const ch = line.charCodeAt(i);
+      if (ch === 96) {
+        if (isBackslashEscapedAt(line, i)) {
+          i++;
+          continue;
+        }
+        const { spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+        if (spanEnd < 0) {
+          carry = true;
+          break;
+        }
+        i = spanEnd;
+        continue;
+      }
+      // A link/image destination or title is raw text for CommonMark: a backtick inside one (or after a `](` the precise
+      // parser could not consume) makes backtick pairing ambiguous for the rest of the paragraph.
+      if ((ch === 33 || ch === 91) && !isBackslashEscapedAt(line, i)) {
+        const tok = tryParseMarkdownLinkOrImageAt(line, i, cursors, true);
+        if (tok) {
+          if (tok.rawUrl.includes('`') || tok.titleSuffix.includes('`')) {
+            poisoned[li] = 1;
+            carry = true;
+            break;
+          }
+          i = tok.end;
+          continue;
+        }
+      }
+      if (ch === 93 && i + 1 < line.length && line.charCodeAt(i + 1) === 40) {
+        if (lastTick === -2) lastTick = line.lastIndexOf('`');
+        if (lastTick > i) {
+          poisoned[li] = 1;
+          carry = true;
+          break;
+        }
+      }
+      i++;
+    }
+  }
+  return poisoned;
+}
+
+const DANGEROUS_SCHEME_PREFIXES = ['javascript:', 'vbscript:', 'data:', 'file:', 'blob:'];
+
+/** O(1)-amortised streaming check: does the (backslash-/entity-encoded) link destination starting at `from` begin with a dangerous scheme? */
+function destinationStartsWithDangerousScheme(s: string, from: number, angle: boolean): boolean {
+  let acc = '';
+  let p = from;
+  let steps = 0;
+  while (p < s.length && steps++ < 8192) {
+    const c = s.charCodeAt(p);
+    let piece = '';
+    if (c === 92 && p + 1 < s.length && /[!-/:-@[-`{-~]/.test(s[p + 1]!)) {
+      piece = s[p + 1]!;
+      p += 2;
+    } else if (c === 38) {
+      const m = /^&(?:#(\d{1,12});?|#[xX]([0-9a-fA-F]{1,12});?|([A-Za-z][A-Za-z0-9]{1,15});)/.exec(s.slice(p, p + 24));
+      if (m) {
+        if (m[3]) {
+          const named = decodeHtmlEntities(m[0]);
+          piece = named === m[0] ? '&' : named;
+          p += named === m[0] ? 1 : m[0].length;
+        } else {
+          const code = m[1] ? Number(m[1]) : parseInt(m[2]!, 16);
+          piece = code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '';
+          p += m[0].length;
+        }
+      } else {
+        piece = '&';
+        p += 1;
+      }
+    } else {
+      if (angle ? c === 62 || c === 10 || c === 13 : c === 32 || c === 9 || c === 10 || c === 13 || c === 41) return false;
+      piece = s[p]!;
+      p += 1;
+    }
+    for (let k = 0; k < piece.length; k++) {
+      const pc = piece.charCodeAt(k);
+      if (
+        pc <= 0x20 ||
+        (pc >= 0x7f && pc <= 0x9f) ||
+        pc === 0xa0 ||
+        pc === 0xad ||
+        pc === 0x61c ||
+        pc === 0x1680 ||
+        (pc >= 0x2000 && pc <= 0x200a) ||
+        pc === 0x205f ||
+        pc === 0x3000 ||
+        pc === 0x180e ||
+        (pc >= 0x200b && pc <= 0x200f) ||
+        (pc >= 0x2028 && pc <= 0x202f) ||
+        (pc >= 0x2060 && pc <= 0x206f) ||
+        pc === 0xfeff
+      ) {
+        continue;
+      }
+      acc += piece[k]!.toLowerCase();
+      let viable = false;
+      for (const sc of DANGEROUS_SCHEME_PREFIXES) {
+        if (sc === acc) return true;
+        if (sc.startsWith(acc)) viable = true;
+      }
+      if (!viable) return false;
+    }
+  }
+  return false;
+}
+
+/** R5 fail-closed pass: any `](` / `]:` outside trusted code spans that is followed (same or next line) by a dangerous scheme is broken with a backslash, whatever the precise link parser decided. */
+function neutralizeResidualDangerousLinkDestinations(prose: string): string {
+  if (!prose.includes('](') && !prose.includes(']:')) return prose;
+  const lines = prose.split('\n');
+  const poisoned = computeTickPoisonedLines(lines);
+  let changed = false;
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li]!;
+    if (!line.includes('](') && !line.includes(']:')) continue;
+    const cursors = createMarkdownLineScanCursors();
+    let out = '';
+    let last = 0;
+    let i = 0;
+    while (i < line.length) {
+      const ch = line.charCodeAt(i);
+      if (ch === 96 && poisoned[li] === 0 && !isBackslashEscapedAt(line, i)) {
+        const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+        i = spanEnd > 0 ? spanEnd : tickEnd;
+        continue;
+      }
+      if (ch === 93 && i + 1 < line.length) {
+        const nx = line.charCodeAt(i + 1);
+        if (nx === 40 || nx === 58) {
+          let hay = line;
+          let k = i + 2;
+          while (k < hay.length && (hay.charCodeAt(k) === 32 || hay.charCodeAt(k) === 9 || hay.charCodeAt(k) === 13)) k++;
+          if (k >= hay.length && li + 1 < lines.length) {
+            hay = lines[li + 1]!;
+            k = 0;
+            let skipped = 0;
+            while (k < hay.length && skipped++ < 64 && (hay.charCodeAt(k) === 32 || hay.charCodeAt(k) === 9 || hay.charCodeAt(k) === 62)) k++;
+            const lm = /^(?:[-*+][ \t]{1,8}|\d{1,9}[.)][ \t]{1,8})/.exec(hay.slice(k, k + 24));
+            if (lm) k += lm[0].length;
+          }
+          const angle = k < hay.length && hay.charCodeAt(k) === 60;
+          if (destinationStartsWithDangerousScheme(hay, angle ? k + 1 : k, angle)) {
+            out += line.slice(last, i + 1) + '\\';
+            last = i + 1;
+            changed = true;
+          }
+        }
+      }
+      i++;
+    }
+    if (last > 0) lines[li] = out + line.slice(last);
+  }
+  return changed ? lines.join('\n') : prose;
+}
+
 function hasDangerousUriScheme(rawHref: string): boolean {
   if (!rawHref) return false;
   const unescaped = rawHref.replace(/\\([!-/:-@[-`{-~])/g, '$1');
@@ -4644,9 +4840,10 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
   const { baseUrl, includeImages = true, spaceAdjacentAlnum = false } = opts;
   const rawBounded = prose.length > MAX_HTML_SCAN_CHARS ? prose.slice(0, MAX_HTML_SCAN_CHARS) : prose;
   const bounded = stripDangerousMultilineMarkdownLinksLinear(rawBounded);
-  return bounded
-    .split('\n')
-    .map((line) => {
+  const proseLines = bounded.split('\n');
+  const tickPoisoned = computeTickPoisonedLines(proseLines);
+  const resolvedLines = proseLines
+    .map((line, lineIdx) => {
       // Strip dangerous reference-link definitions (`[id]: javascript:alert(1)`) in O(1) fast-path + bounded linear check.
       const trimmedLead = line.trimStart();
       if (trimmedLead.startsWith('[') && line.includes(']:')) {
@@ -4677,7 +4874,7 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
       while (i < line.length) {
         const ch = line.charCodeAt(i);
         // 1. Preserve inline backtick code spans untouched (spacing adjacent single-backtick spans when requested).
-        if (ch === 96) {
+        if (ch === 96 && tickPoisoned[lineIdx] === 0) {
           if (isBackslashEscapedAt(line, i)) {
             i++;
             continue;
@@ -4838,8 +5035,8 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
         i++;
       }
       return lastCopyIdx === 0 ? line : out + line.slice(lastCopyIdx);
-    })
-    .join('\n');
+    });
+  return neutralizeResidualDangerousLinkDestinations(resolvedLines.join('\n'));
 }
 
 function isResidualHtmlStartChar(c: number): boolean {
@@ -4852,13 +5049,15 @@ function isResidualHtmlStartChar(c: number): boolean {
  */
 function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMarkers = false): string {
   if (!prose || !prose.includes('<')) return prose;
-  return prose
-    .split('\n')
-    .map((line) => {
+  const residualLines = prose.split('\n');
+  const residualPoisoned = computeTickPoisonedLines(residualLines);
+  return residualLines
+    .map((line, lineIdx) => {
       if (!line.includes('<')) return line;
       if (allowPdfPageMarkers && /^<!-- page \d{1,6} -->$/.test(line.trim())) {
         return line;
       }
+      const isTableRow = line.trimStart().startsWith('|');
       const cursors = createMarkdownLineScanCursors();
       let nextGtIdx = -1;
       let noGtAfter = false;
@@ -4867,13 +5066,13 @@ function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMark
       let i = 0;
       while (i < line.length) {
         const ch = line.charCodeAt(i);
-        if (ch === 96) {
+        if (ch === 96 && residualPoisoned[lineIdx] === 0) {
           if (isBackslashEscapedAt(line, i)) {
             i++;
             continue;
           }
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
-          i = spanEnd > 0 ? spanEnd : tickEnd;
+          i = spanEnd > 0 && !(isTableRow && line.slice(i, spanEnd).includes('|')) ? spanEnd : tickEnd;
           continue;
         }
         if (ch === 60 && i + 1 < line.length) {
@@ -4953,7 +5152,13 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
     .join('\n');
 }
 
-function cleanCodeFenceSegment(fenceBlock: string): string {
+function cleanCodeFenceSegment(rawFenceBlock: string): string {
+  let fenceBlock = rawFenceBlock;
+  {
+    const infoNl = fenceBlock.indexOf('\n');
+    const infoLine = infoNl === -1 ? fenceBlock : fenceBlock.slice(0, infoNl);
+    if (infoLine.includes('<')) fenceBlock = infoLine.replace(/</g, '&lt;') + (infoNl === -1 ? '' : fenceBlock.slice(infoNl));
+  }
   // Strip single-line minified `<script type="application/ld+json">` (`schema.org`) metadata blocks emitted by
   // edge HTML-to-Markdown converters, while leaving multi-line JSON-LD code examples in tutorials untouched.
   if (/^`{3,}json[ \t]*\r?\n\{\s*"@context"\s*:\s*"https?:\/\/schema\.org"[^\r\n]{100,}\r?\n`{3,}$/i.test(fenceBlock.trim())) {
@@ -4962,6 +5167,7 @@ function cleanCodeFenceSegment(fenceBlock: string): string {
   const nlIdx = fenceBlock.indexOf('\n');
   if (nlIdx === -1) return fenceBlock;
   const rawHeader = fenceBlock.slice(0, nlIdx).replace(/\r$/, '');
+  if (rawHeader.length > 512) return fenceBlock;
   const closeMatch = /\r?\n([ ]{0,3}(?:`{3,}|~{3,})[ \t]*)$/.exec(fenceBlock);
   if (!closeMatch) return fenceBlock;
   const closingFence = closeMatch[1]!;
@@ -4994,7 +5200,10 @@ function cleanCodeFenceSegment(fenceBlock: string): string {
 
 export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
   if (!md) return '';
-  let withoutMintlifyBanner = stripInvisibleSmugglingChars(md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md);
+  let boundedInput = md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md;
+  if (boundedInput.includes('\u0000')) boundedInput = boundedInput.replace(/\u0000/g, '');
+  let withoutMintlifyBanner = stripInvisibleSmugglingChars(boundedInput);
+  if (withoutMintlifyBanner.includes('\r')) withoutMintlifyBanner = withoutMintlifyBanner.replace(/\r(?!\n)/g, '\n');
   if (withoutMintlifyBanner.slice(0, 256).includes('Documentation Index')) {
     withoutMintlifyBanner = withoutMintlifyBanner.replace(
       /^\s*>\s*##\s*Documentation Index[ \t]*\r?\n>\s*Fetch the complete documentation index at:\s*\S+[ \t]*\r?\n>\s*Use this file to discover all available pages before exploring further\.[ \t]*\r?\n+/i,
@@ -5462,7 +5671,7 @@ function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
   return sanitizeInlineHtmlInMarkdown(withoutSchemaFences, baseUrl);
 }
 
-function finalizeScrapedMarkdown(
+export function finalizeScrapedMarkdown(
   rawMd: string,
   opts: {
     isPdf: boolean;

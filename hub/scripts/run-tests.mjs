@@ -12,14 +12,17 @@ const secAuditOutfile = join(dir, 'security-audit.test.mjs');
 const workerOutfile = join(dir, 'workerd-entry.mjs');
 const e2eTestFile = resolve('test/workerd.e2e.test.mjs');
 
+const textAssetLoaders = { '.sql': 'text', '.yaml': 'text', '.yml': 'text' };
+
 try {
   buildSync({
     entryPoints: ['test/hub.test.ts'],
     bundle: true,
     platform: 'node',
     format: 'esm',
+    banner: { js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);" },
     alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
-    loader: { '.sql': 'text' },
+    loader: textAssetLoaders,
     outfile: unitOutfile,
   });
 
@@ -28,8 +31,9 @@ try {
     bundle: true,
     platform: 'node',
     format: 'esm',
+    banner: { js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);" },
     alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
-    loader: { '.sql': 'text' },
+    loader: textAssetLoaders,
     outfile: adaptersOutfile,
   });
 
@@ -38,8 +42,9 @@ try {
     bundle: true,
     platform: 'node',
     format: 'esm',
+    banner: { js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);" },
     alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
-    loader: { '.sql': 'text' },
+    loader: textAssetLoaders,
     outfile: agentAdvOutfile,
   });
 
@@ -48,8 +53,9 @@ try {
     bundle: true,
     platform: 'node',
     format: 'esm',
+    banner: { js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);" },
     alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
-    loader: { '.sql': 'text' },
+    loader: textAssetLoaders,
     outfile: secAuditOutfile,
   });
 
@@ -60,6 +66,7 @@ try {
     mainFields: ['module', 'main'],
     conditions: ['workerd', 'worker', 'browser'],
     format: 'esm',
+    loader: textAssetLoaders,
     external: ['cloudflare:workers', 'node:*'],
     outfile: workerOutfile,
   });

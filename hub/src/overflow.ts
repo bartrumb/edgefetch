@@ -199,6 +199,7 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
     signals: {} as ContentSignals,
   };
   let seenDirective = false;
+  let seenAnyUserAgent = false;
 
   for (const rawLine of body.split('\n')) {
     const hashIdx = rawLine.indexOf('#');
@@ -216,15 +217,16 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
     const rawValAfterColon = noComment.slice(colon + 1);
     const val = rawValAfterColon.trim();
     if (field === 'user-agent') {
-      const parsedUa = canonicalProductToken(val);
-      if (!val || !parsedUa) {
-        // Ignore empty `User-agent:` lines consistently with Go without closing the active group.
-        continue;
-      }
+      seenAnyUserAgent = true;
       if (seenDirective && cur.agents.length > 0) {
         groups.push(cur);
         cur = { agents: [], rules: [], crawlDelayMs: 0, signals: {} };
         seenDirective = false;
+      }
+      const parsedUa = canonicalProductToken(val);
+      if (!val || !parsedUa) {
+        // Match Go `politeness.ParseRobotsTxt`: empty `User-agent:` closes a preceding group that saw directives, without adding an agent.
+        continue;
       }
       cur.agents.push(parsedUa);
     } else if (field === 'allow' && cur.agents.length > 0 && val) {
@@ -252,9 +254,9 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
     } else if (field === 'content-signal') {
       const csVal = trimAsciiSpaceTab(rawValAfterColon);
       if (csVal) {
-        if (cur.agents.length === 0) {
+        if (!seenAnyUserAgent && cur.agents.length === 0) {
           parseContentSignalLine(csVal, preGroupSignals);
-        } else {
+        } else if (cur.agents.length > 0) {
           seenDirective = true;
           parseContentSignalLine(csVal, cur.signals);
         }

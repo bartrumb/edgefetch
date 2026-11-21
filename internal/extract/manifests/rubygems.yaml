@@ -1,0 +1,74 @@
+# Shared Go + TypeScript Declarative Site Adapter: RubyGems Registry
+id: rubygems
+name: RubyGems Registry
+category: developer
+description: Upgrades rubygems.org gem pages to /api/v1/gems/<gem>.json metadata.
+domains:
+  - rubygems.org
+  - www.rubygems.org
+exampleUrls:
+  - https://rubygems.org/gems/rails
+
+# Matches /gems/<gem> (allowing optional trailing version subpaths)
+match:
+  exactSegments: false
+  pathSegments:
+    - gems
+    - param: gem
+      charset: pkg
+      minLen: 1
+      maxLen: 80
+
+twin:
+  fetchUrl: https://rubygems.org/api/v1/gems/{gem}.json
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - name
+  vars:
+    name:
+      paths: [name]
+    version:
+      paths: [version]
+    info:
+      paths: [info]
+      trim: true
+    infoShort:
+      paths: [info]
+      trim: true
+      sliceMax: 260
+    licenses:
+      paths: [licenses]
+      join: ", "
+    authors:
+      paths: [authors]
+    repo:
+      paths: [source_code_uri, homepage_uri]
+    docs:
+      paths: [documentation_uri]
+  titleTemplate: "{name} {version} (RubyGem)"
+  titleWhenVar: version
+  titleFallbackTemplate: "{name} (RubyGem)"
+  descriptionVar: infoShort
+  authorVar: authors
+  introVar: info
+  bullets:
+    - label: Install
+      template: "`gem install {name}`"
+    - label: Version
+      template: "`{version}`"
+      whenVar: version
+    - label: License
+      template: "{licenses}"
+      whenVar: licenses
+    - label: Authors
+      template: "{authors}"
+      whenVar: authors
+    - label: Documentation
+      template: "{docs}"
+      whenVar: docs
+    - label: Repository
+      template: "{repo}"
+      whenVar: repo

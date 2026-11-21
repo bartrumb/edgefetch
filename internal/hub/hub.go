@@ -33,6 +33,7 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/browser"
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/extract"
 	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/ws"
 )
@@ -380,11 +381,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"capabilities": map[string]bool{
 				"fetch":         true,
 				"scrape":        true,
+				"extractors":    true,
 				"mcp":           true,
 				"artifacts":     true,
 				"localFallback": s.cfg.FallbackCrawler != nil,
 			},
 		})
+
+	case r.URL.Path == "/v1/extractors" && r.Method == http.MethodGet:
+		s.handleCallerExtractors(w, r)
 
 	case r.URL.Path == "/fetch" && r.Method == http.MethodPost:
 		s.withCallerConcurrencyGate(w, r, s.handleCallerFetch)
@@ -1327,6 +1332,95 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 	} else if p.RenderMode == "always" || wantScreenshot || p.Mobile {
 		kind = classify.KindRender
 	}
+
+	// Pre-fetch 1-hop declarative JSON/text twin upgrade when standard non-interactive scrape is requested.
+	// Falls back seamlessly to standard HTML scraping if the twin endpoint errors, blocks, or mismatches schema.
+	if kind == classify.KindScrape {
+		if twin, ok := extract.ResolveDeclarativeTwin(u); ok {
+			if twinURL, tErr := url.Parse(twin.FetchURL); tErr == nil && s.allow(twinURL) == nil {
+				twinCall := crawl.FetchCall{
+					MaxSeconds: 30,
+					Options: crawl.Options{
+						Concurrency:   1,
+						IncludeBody:   true,
+						RespectRobots: crawl.Bool(true),
+					},
+					Requests: []crawl.Request{
+						{
+							ID:     "twin-1",
+							URL:    twin.FetchURL,
+							Kind:   twin.Kind,
+							Accept: twin.Accept,
+						},
+					},
+				}
+				if twinRep, twinVia, _, dErr := s.DispatchOrFallback(ctx, twinCall, p.Target, p.Site, hdr); dErr == nil && len(twinRep.Results) > 0 {
+					tRes := twinRep.Results[0]
+					if tRes.Status == http.StatusOK && tRes.Outcome == classify.OutcomeOK {
+						bodyBytes, decErr := tRes.DecodeBody()
+						bodyStr := tRes.Body
+						if decErr == nil && len(bodyBytes) > 0 {
+							bodyStr = string(bodyBytes)
+						}
+						if doc, fmtOK := twin.Format(bodyStr); fmtOK && doc != nil && strings.TrimSpace(doc.Markdown) != "" {
+							md := doc.Markdown
+							if p.Query != "" {
+								md = extract.RerankPassages(md, p.Query, p.MaxChars)
+							} else if p.MaxChars > 0 && len(md) > p.MaxChars {
+								cut := p.MaxChars
+								for cut > 0 && !utf8.RuneStart(md[cut]) {
+									cut--
+								}
+								md = md[:cut]
+							}
+							finalURL := tRes.FinalURL
+							if finalURL == "" {
+								finalURL = twin.FetchURL
+							}
+							meta := map[string]any{
+								"title":     doc.Title,
+								"sourceURL": u,
+							}
+							if doc.Description != "" {
+								meta["description"] = doc.Description
+							}
+							if doc.Author != "" {
+								meta["author"] = doc.Author
+							}
+							if doc.PublishedTime != "" {
+								meta["publishedTime"] = doc.PublishedTime
+							}
+							out := map[string]any{
+								"ok":            true,
+								"url":           u,
+								"finalUrl":      finalURL,
+								"via":           twinVia,
+								"status":        tRes.Status,
+								"outcome":       tRes.Outcome,
+								"extractorId":   twin.ID,
+								"contentSource": "twin:" + twin.ID,
+								"title":         doc.Title,
+								"description":   doc.Description,
+								"markdown":      md,
+								"text":          md,
+								"links":         doc.Links,
+								"metadata":      meta,
+								"rendered":      false,
+								"timing":        tRes.Timing,
+							}
+							if doc.Author != "" {
+								out["author"] = doc.Author
+							}
+							if doc.PublishedTime != "" {
+								out["publishedTime"] = doc.PublishedTime
+							}
+							return out, twinVia, http.StatusOK
+						}
+					}
+				}
+			}
+		}
+	}
 	waitMs := p.WaitForMs
 	if waitMs <= 0 && p.WaitFor > 0 {
 		waitMs = p.WaitFor
@@ -1397,6 +1491,26 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 		out["contentSource"] = res.ContentSource
 	}
 	return out, via, http.StatusOK
+}
+
+func (s *Server) handleCallerExtractors(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	category := strings.TrimSpace(q.Get("category"))
+	query := firstNonEmpty(q.Get("query"), q.Get("q"))
+	limit, _ := strconv.Atoi(strings.TrimSpace(q.Get("limit")))
+	extractors := extract.FindDeclarativeAdapters(query, category, limit)
+	categories := make(map[string]int)
+	for _, ex := range extractors {
+		categories[ex.Category]++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"count":      len(extractors),
+		"total":      len(extractors),
+		"runtime":    "go-declarative",
+		"categories": categories,
+		"extractors": extractors,
+	})
 }
 
 func (s *Server) handleCallerScrape(w http.ResponseWriter, r *http.Request) {
@@ -1570,6 +1684,21 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 						"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 					},
 					{
+						"name":        "find_extractors",
+						"description": "Search built-in declarative keyless site/API adapters by optional provider query or category.",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"query": map[string]any{"type": "string"},
+								"category": map[string]any{
+									"type": "string",
+									"enum": []string{"developer", "genai", "jobs", "finance", "public-records", "research-health", "commerce-social"},
+								},
+								"limit": map[string]any{"type": "integer"},
+							},
+						},
+					},
+					{
 						"name":        "scrape",
 						"description": "Scrape a public HTTPS URL to clean Markdown via connected Go nodes or local Hub fallback.",
 						"inputSchema": map[string]any{
@@ -1619,6 +1748,22 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		switch callParams.Name {
 		case "list_agents":
 			txt, _ := json.MarshalIndent(s.ListAgents(), "", "  ")
+			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), false))
+			return
+		case "find_extractors":
+			var fp struct {
+				Query    string `json:"query"`
+				Category string `json:"category"`
+				Limit    int    `json:"limit"`
+			}
+			_ = json.Unmarshal(callParams.Arguments, &fp)
+			matches := extract.FindDeclarativeAdapters(fp.Query, fp.Category, fp.Limit)
+			txt, _ := json.MarshalIndent(map[string]any{
+				"ok":         true,
+				"count":      len(matches),
+				"runtime":    "go-declarative",
+				"extractors": matches,
+			}, "", "  ")
 			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), false))
 			return
 		case "scrape":

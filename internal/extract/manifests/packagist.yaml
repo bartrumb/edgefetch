@@ -1,0 +1,64 @@
+# Shared Go + TypeScript Declarative Site Adapter: Packagist PHP Composer Registry
+id: packagist
+name: Packagist PHP Composer Registry
+category: developer
+description: Upgrades packagist.org PHP Composer package pages to their official .json metadata feed.
+domains:
+  - packagist.org
+  - www.packagist.org
+exampleUrls:
+  - https://packagist.org/packages/symfony/console
+
+match:
+  exactSegments: true
+  pathSegments:
+    - packages
+    - param: vendor
+      charset: pkg
+    - param: pkg
+      charset: pkg
+
+twin:
+  fetchUrl: https://packagist.org/packages/{vendor}/{pkg}.json
+  kind: json
+  accept: application/json
+
+extract:
+  rootPath: package
+  requireFields:
+    - name
+  vars:
+    name:
+      paths: [name]
+    desc:
+      paths: [description]
+      trim: true
+    repo:
+      paths: [repository]
+    # Selects the first release tag in `versions` that is not a `dev-*` branch
+    stableVer:
+      paths: [versions]
+      firstNonMatchingKey: dev
+    license:
+      dynamicKeyPath:
+        base: versions
+        keyVar: stableVer
+        subPath: license
+      join: ", "
+  titleTemplate: "{name} {stableVer} (Composer)"
+  titleWhenVar: stableVer
+  titleFallbackTemplate: "{name}"
+  descriptionVar: desc
+  introVar: desc
+  bullets:
+    - label: Install
+      template: "`composer require {name}`"
+    - label: Latest Version
+      template: "`{stableVer}`"
+      whenVar: stableVer
+    - label: License
+      template: "{license}"
+      whenVar: license
+    - label: Repository
+      template: "{repo}"
+      whenVar: repo

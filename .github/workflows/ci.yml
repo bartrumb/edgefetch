@@ -61,6 +61,7 @@ jobs:
           go test -fuzz=FuzzExtractHTML -fuzztime=2s ./internal/extract
           go test -fuzz=FuzzParseLlmsTxt -fuzztime=2s ./internal/extract
           go test -fuzz=FuzzExtractPDFPureGo -fuzztime=2s ./internal/extract
+          go test -fuzz=FuzzDeclarativeFormat -fuzztime=2s ./internal/extract
           go test -fuzz=FuzzBotAuthVerifyRequest -fuzztime=2s ./internal/botauth
           go test -fuzz=FuzzValidateCustomHeaders -fuzztime=2s ./internal/crawl
           go test -fuzz=FuzzPublicHTTPS -fuzztime=2s ./internal/crawl
@@ -86,6 +87,7 @@ jobs:
           cache-dependency-path: hub/package-lock.json
       - run: npm ci --no-audit --no-fund
       - run: npm run build:portable
+      - run: npm run adapter:test
       - run: npm test
       - run: npm run type-check
       - run: npm run deploy:dry

@@ -1,8 +1,9 @@
 /**
- * Zero-dependency parsing, HTML-stripping, JSON-LD, and Markdown table utilities for Site Adapters.
+ * HTML5 DOM parsing (`parseHtmlDoc`), HTML-stripping, JSON-LD, and Markdown table utilities for Site Adapters.
  */
 
 import {
+  compileLinearRegex,
   escapeResidualHtmlTagsOutsideCode,
   findTagOpenEndQuoteAware,
   replaceHtmlTagBlocksLinear,
@@ -10,6 +11,9 @@ import {
   stripHtmlTagsLinear,
   stripHtmlTagsQuoteAwareLinear,
 } from '../safe-input';
+
+export { compileLinearRegex };
+export { HtmlDoc, HtmlNode, parseHtmlDoc } from './html-doc';
 
 export const CODE_EXT_FENCE_MAP: Record<string, string> = {
   ts: 'ts',

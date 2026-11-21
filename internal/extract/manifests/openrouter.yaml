@@ -1,0 +1,110 @@
+# Shared Go + TypeScript Declarative Site Adapter: OpenRouter AI Model Catalog
+id: openrouter
+name: OpenRouter AI Model Catalog
+category: genai
+description: Upgrades OpenRouter model pages to keyless /api/v1/models specs (context window, token pricing, modalities, and tool support).
+domains:
+  - openrouter.ai
+exampleUrls:
+  - https://openrouter.ai/anthropic/claude-3.7-sonnet
+  - https://openrouter.ai/models/qwen/qwen-2.5-coder-32b-instruct
+
+match:
+  anyOf:
+    - exactSegments: true
+      pathSegments:
+        - models
+        - param: org
+          charset: pkg
+        - param: slug
+          charset: model_slug
+    - exactSegments: true
+      pathSegments:
+        - param: org
+          charset: pkg
+          reserved:
+            - docs
+            - rankings
+            - chat
+            - activity
+            - settings
+            - keys
+            - credits
+            - privacy
+            - terms
+            - about
+            - blog
+            - pricing
+            - providers
+        - param: slug
+          charset: model_slug
+
+twin:
+  fetchUrl: https://openrouter.ai/api/v1/models
+  kind: json
+  accept: application/json
+
+extract:
+  findInArray:
+    arrayPath: data
+    matchField: id
+    matchTemplate: "{org}/{slug}"
+    ignoreCase: true
+  vars:
+    id:
+      paths: [id]
+    name:
+      paths: [name]
+      fallbackTemplate: "{org}/{slug}"
+      trim: true
+    ctxLen:
+      paths: [context_length]
+      format: int_comma
+    maxOut:
+      paths: [top_provider.max_completion_tokens]
+      format: int_comma
+    promptPrice:
+      paths: [pricing.prompt]
+      format: usd_per_million_tokens
+    compPrice:
+      paths: [pricing.completion]
+      format: usd_per_million_tokens
+    modality:
+      paths: [architecture.modality]
+    params:
+      paths: [supported_parameters]
+      join: "`, `"
+      limit: 14
+    desc:
+      paths: [description]
+      trim: true
+    descShort:
+      paths: [description]
+      trim: true
+      sliceMax: 260
+  titleTemplate: "{name}"
+  descriptionVar: descShort
+  bullets:
+    - label: Model ID
+      template: "`{id}`"
+    - label: Context Window
+      template: "{ctxLen} tokens"
+      whenVar: ctxLen
+    - label: Max Output
+      template: "{maxOut} tokens"
+      whenVar: maxOut
+    - label: Input Pricing
+      template: "{promptPrice}"
+      whenVar: promptPrice
+    - label: Output Pricing
+      template: "{compPrice}"
+      whenVar: compPrice
+    - label: Modality
+      template: "`{modality}`"
+      whenVar: modality
+    - label: Supported Parameters
+      template: "`{params}`"
+      whenVar: params
+  sections:
+    - heading: Description
+      textVar: desc

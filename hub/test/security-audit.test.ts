@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { createConnection } from 'node:net';
+import { createConnection, createServer as createTcpServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -14,9 +15,10 @@ import {
   NodeSqliteD1Database,
   RawServerWebSocket,
 } from '../portable/node-adapters.ts';
-import { startPortableHub } from '../portable/portable-server.ts';
+import { resolvePublicOrigin as resolveDenoPublicOrigin } from '../portable/deno-server.ts';
+import { resolvePublicOrigin, startPortableHub } from '../portable/portable-server.ts';
 import { S3ArtifactBucket } from '../portable/s3-bucket.ts';
-import { createSafeOutboundFetch, isPublicIpAddress } from '../portable/safe-fetch.ts';
+import { createSafeOutboundFetch, isPublicIpAddress, MAX_SAFE_FETCH_TIMEOUT_MS } from '../portable/safe-fetch.ts';
 import { AdapterNetworkForbiddenError, runAdapterSyncInBulkhead } from '../src/adapter-sandbox.ts';
 import { handleAdminRoute } from '../src/admin.ts';
 import {
@@ -36,16 +38,22 @@ import {
 } from '../src/framework-detect.ts';
 import { verifyStoredArtifact } from '../src/ingest.ts';
 import icimsAdapter from '../src/extractors/providers/jobs/icims.ts';
-import { isShopifyHtmlOrHeaders } from '../src/extractors/providers/commerce-social/shopify.ts';
+import shopifyAdapter, {
+  isShopifyHtmlOrHeaders,
+  resolveCustomDomainShopifyProductTwinUrl,
+} from '../src/extractors/providers/commerce-social/shopify.ts';
 import {
   buildBlockedInfo,
   chunkJsonRecords,
   executeJobsCall,
   extractJobPostingJsonLd,
+  matchesAllowedCompanyOrDomain,
+  MAX_JOBS_CONCURRENT_SCRAPES,
+  MAX_JOBS_TOTAL_SCRAPES,
   parseX402PaymentTerms,
   salvageAshbyBoardFromTruncatedJson,
 } from '../src/jobs.ts';
-import { buildDeterministicSummary, completeLlmTurn, resolveLlmConfig } from '../src/llm.ts';
+import { buildDeterministicSummary, completeLlmTurn, redactLlmConfigForLog, resolveLlmConfig } from '../src/llm.ts';
 import { executeMapCall, matchesSafeCrawlPattern } from '../src/map-crawl.ts';
 import { handleMcpRequest, truncateResultBodies } from '../src/mcp.ts';
 import { ADMIN_COOKIE_NAME, createAdminSessionValue, createMemoryOAuthStore } from '../src/oauth.ts';
@@ -69,8 +77,11 @@ import {
   executeScrapeCall,
   extractHtmlDocument,
   extractStructuredJsonFromPage,
+  finalizeScrapedMarkdown,
   sanitizeInlineHtmlInMarkdown,
+  SCRAPE_PIPELINE_VERSION,
 } from '../src/scrape.ts';
+import { executeExtractCall } from '../src/search-index.ts';
 import { detectPromptInjection } from '../src/scrape-advanced.ts';
 import { isEligibleForExternalSpaFallback } from '../src/spa-fallback.ts';
 import { r2ArtifactKey } from '../src/storage.ts';
@@ -2757,4 +2768,474 @@ test('SEC-V261-ROUND5: R4-H1..H3 O(N) Scanners, R4-M6..M7 XSS/Sentinel Hygiene, 
   const domJobs = domainProbeRes.body.jobs as Array<{ company: string; title: string }>;
   assert.equal(domJobs.length, 1);
   assert.equal(domJobs[0]?.company, 'nvidia');
+});
+
+test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forgery, Host/safe-fetch & Hub Lows', async () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 29);
+
+  // 1. Exact `v5.mjs` PoCs (`R5-H3`, `R5-H4`, `R5-M1`, `R5-M2`) + Sentinel Forgery
+  const fin = (md: string, origin = true) =>
+    finalizeScrapedMarkdown(md, {
+      isPdf: false,
+      includeImages: true,
+      baseUrl: 'https://example.com/a',
+      preserveOriginMarkdown: origin,
+    }).markdown;
+
+  // F1: 32k-tab code-fence info header completes in linear time (< 80ms)
+  const tFence = performance.now();
+  const f1Out = fin('```js' + '\t'.repeat(32_000) + 'x\ncode\n```');
+  const f1Ms = performance.now() - tFence;
+  assert.ok(f1Ms < 80, `F1 32k-tab fence header must be linear (<80ms), took ${f1Ms.toFixed(1)}ms`);
+  assert.match(f1Out, /\ncode\n```$/);
+
+  // F2 (`R5-M1`): Optional group before `$` (`(a*aaa*)?$`) rejected by `compileSafeUserRegex`
+  assert.equal(compileSafeUserRegex('(a*aaa*)?$'), null);
+  const jsonFilterRes = chunkJsonRecords({
+    rawBody: JSON.stringify([
+      { id: 1, title: 'Senior Backend Engineer' },
+      { id: 2, title: 'aaaa' },
+    ]),
+    contentType: 'application/json',
+    jsonFilter: 'title~=(a*aaa*)?$',
+    htmlToMd: (h) => h,
+  });
+  assert.equal(jsonFilterRes?.matchedRecords, 0, 'Rejected unsafe regex in jsonFilter must fail closed');
+  const jsonPlainKeyword = chunkJsonRecords({
+    rawBody: JSON.stringify([
+      { id: 1, title: 'Senior Backend Engineer' },
+      { id: 2, title: 'Junior Designer' },
+    ]),
+    contentType: 'application/json',
+    jsonFilter: 'title~=Senior',
+    htmlToMd: (h) => h,
+  });
+  assert.equal(jsonPlainKeyword?.matchedRecords, 1);
+
+  // F3 & F4 (`R5-H3`, `R5-H4`, `R5-M2`): CommonMark backtick-poisoned paragraphs, list-indented fences, table pipes, and dangerous links
+  const v5Md1 = fin('[x](`) <script>alert(1)</script> `');
+  assert.equal(/<script\b/i.test(v5Md1), false, `Expected <script> stripped/escaped, got: ${v5Md1}`);
+
+  const v5Md2 = fin('`a\nb` <img src=x onerror=alert(1)> `c`');
+  assert.equal(/<img\b/i.test(v5Md2), false, `Expected <img onerror> escaped across multi-line code span, got: ${v5Md2}`);
+
+  const v5Md3 = fin('1. a\n\n   ```\n   code\n\n<img src=x onerror=alert(1)>');
+  assert.equal(/<img\b/i.test(v5Md3), false, `Expected unindented line to close list fence and escape <img>, got: ${v5Md3}`);
+
+  const v5Md4 = fin('[a [b] c](javascript:alert(1))');
+  assert.equal(/\]\(\s*javascript:/i.test(v5Md4), false, `Expected nested-bracket javascript: link neutralized, got: ${v5Md4}`);
+
+  const v5Md5 = fin('[y]\n\n> [y]: javascript:alert(1)');
+  assert.equal(/\]:\s*javascript:/i.test(v5Md5), false, `Expected blockquote ref-link javascript: neutralized, got: ${v5Md5}`);
+
+  const tablePipeMd = fin('| col1 | col2 |\n| --- | --- |\n| `a | <img src=x onerror=alert(1)> ` |');
+  assert.equal(/<img\b/i.test(tablePipeMd), false, `Expected GFM table cell <img> escaped even with backticks across |, got: ${tablePipeMd}`);
+
+  // F3 HTML (`v5.mjs` line 8): literal backtick before `<br><code>&lt;script&gt;...</code>` must NOT leave raw `<script>` in CommonMark prose
+  const v5HtmlDoc = extractHtmlDocument(
+    '<html><body><main><p>`a<br><code>&lt;script&gt;alert(1)&lt;/script&gt;</code> tail and enough words to count as a real paragraph of text here.</p></main></body></html>',
+    { baseUrl: 'https://example.com/' },
+  );
+  assert.equal(/<script\b/i.test(v5HtmlDoc.markdown), false, `F3 html must escape <script> on tick-poisoned line: ${v5HtmlDoc.markdown}`);
+
+  // Sentinel Forgery (`\u0000EFCODE0\u0000` / `\u0000EFMDINLINE0\u0000`)
+  const forgedHtml = extractHtmlDocument(
+    '<html><body><main><pre><code>SECRET_STASH_TOKEN</code></pre><p>Attacker payload \u0000EFCODE0\u0000 with enough words to count as a real paragraph of prose content here.</p></main></body></html>',
+    { baseUrl: 'https://example.com/' },
+  );
+  const stashOccurrences = forgedHtml.markdown.split('SECRET_STASH_TOKEN').length - 1;
+  assert.equal(stashOccurrences, 1, `Forged \\u0000EFCODE0\\u0000 must never replay stashed code blocks: ${forgedHtml.markdown}`);
+
+  const forgedMd = sanitizeInlineHtmlInMarkdown('`ONCE_INLINE_TOKEN` forged \u0000EFMDINLINE0\u0000');
+  assert.equal(forgedMd.split('ONCE_INLINE_TOKEN').length - 1, 1);
+
+  // 2. `R5-H2` & Low `URIError` (`shopify.ts`): Set-based O(N) image dedup + 250 cap + malformed `%E0%A4%A` safe decode
+  assert.doesNotThrow(() => {
+    assert.equal(resolveCustomDomainShopifyProductTwinUrl('https://shop.example.com/products/%E0%A4%A'), null);
+  });
+  const manyImages = Array.from({ length: 2_000 }, (_, i) => ({
+    id: i + 1,
+    src: `https://cdn.shopify.com/s/files/1/0001/img-${i % 400}.jpg`,
+  }));
+  const tShop = performance.now();
+  const shopParsed = shopifyAdapter.catalog!.parsePage(
+    JSON.stringify({
+      products: [
+        {
+          id: 99,
+          title: 'Mega Gallery Jacket',
+          handle: 'mega-jacket',
+          images: manyImages,
+          variants: Array.from({ length: 400 }, (_, i) => ({ id: i + 1, title: `V${i}`, price: '19.99', available: true })),
+        },
+      ],
+    }),
+    new URL('https://shop.example.com'),
+  );
+  const shopMs = performance.now() - tShop;
+  assert.ok(shopMs < 100, `Shopify 2000-image dedup must be linear (<100ms), took ${shopMs.toFixed(1)}ms`);
+  assert.equal(shopParsed.records[0]?.images?.length, 250);
+  assert.equal(shopParsed.records[0]?.variants.length, 250);
+
+  // 3. `R5-H1` & `R5-M4` (`catalog.ts` & `index.ts`): byte budget, R2 flush, per-principal concurrency `429`, sleep budget, and `maxBytes` forwarding
+  const r2Store = new Map<string, string>();
+  const mockR2 = {
+    async put(key: string, val: string) {
+      r2Store.set(key, val);
+    },
+    async get(key: string) {
+      const v = r2Store.get(key);
+      return v !== undefined ? { async text() { return v; } } : null;
+    },
+  };
+  const r2CatRun = await executeCatalogCall({
+    payload: { url: 'https://r2-shop.example.com', pauseMs: 1 },
+    env: { ARTIFACTS: mockR2 as unknown as R2Bucket },
+    sleepFn: async () => {},
+    executeHubFetch: async ({ url, maxBytes }) => {
+      if (!url.endsWith('/robots.txt')) {
+        assert.equal(maxBytes, 16_777_216);
+      }
+      if (url.includes('page=1')) {
+        return {
+          status: 200,
+          outcome: 'ok',
+          body: JSON.stringify({
+            products: [{ id: 1, title: 'R2 Boots', handle: 'r2-boots', variants: [{ id: 10, price: '99.00', available: true }] }],
+          }),
+        };
+      }
+      return { status: 200, outcome: 'ok', body: JSON.stringify({ products: [] }) };
+    },
+  });
+  assert.equal(r2CatRun.status, 200);
+  assert.ok(String(r2CatRun.body.artifactId).startsWith('catalog/'));
+  const r2Reloaded = await getCatalogRecords({
+    catalogId: String(r2CatRun.body.catalogId),
+    env: { ARTIFACTS: mockR2 as unknown as R2Bucket },
+  });
+  assert.equal(r2Reloaded.status, 200);
+  assert.equal(r2Reloaded.body.totalProducts, 1);
+
+  // Per-run 16 MiB byte budget halts cleanly with `reason: 'byte_budget'` & `truncated: true`
+  const bigDesc = 'X'.repeat(55_000);
+  const byteBudgetRun = await executeCatalogCall({
+    payload: { url: 'https://huge-catalog.example.com', maxPages: 10, pauseMs: 1 },
+    sleepFn: async () => {},
+    executeHubFetch: async ({ url }) => {
+      if (url.endsWith('/robots.txt')) return { status: 200, outcome: 'ok', body: 'User-agent: *\nAllow: /\n' };
+      const m = /page=(\d+)/.exec(url);
+      const pg = Number(m?.[1] ?? 1);
+      return {
+        status: 200,
+        outcome: 'ok',
+        body: JSON.stringify({
+          products: Array.from({ length: 60 }, (_, idx) => ({
+            id: pg * 1000 + idx,
+            title: `Heavy Product ${pg}-${idx}`,
+            handle: `heavy-${pg}-${idx}`,
+            body_html: `<p>${bigDesc}</p>`,
+            variants: [{ id: pg * 10000 + idx, price: '10.00', available: true }],
+          })),
+        }),
+      };
+    },
+  });
+  assert.equal(byteBudgetRun.body.status, 'partial');
+  assert.equal(byteBudgetRun.body.truncated, true);
+  assert.equal(byteBudgetRun.body.reason, 'byte_budget');
+
+  // Sleep budget (`MAX_CATALOG_TOTAL_SLEEP_MS = 120_000`) halts cleanly on excessive Retry-After / pacing
+  const sleepBudgetRun = await executeCatalogCall({
+    payload: { url: 'https://slow-cooldown.example.com', maxPages: 5, pauseMs: 1 },
+    sleepFn: async () => {},
+    executeHubFetch: async ({ url }) => {
+      if (url.endsWith('/robots.txt')) return { status: 200, outcome: 'ok', body: 'User-agent: *\nAllow: /\n' };
+      return { status: 429, outcome: 'rate_limited', headers: { 'retry-after': '90' }, body: 'Slow down' };
+    },
+  });
+  assert.equal(sleepBudgetRun.body.status, 'partial');
+  assert.equal(sleepBudgetRun.body.reason, 'sleep_budget_exceeded');
+
+  // Per-principal concurrency cap (`<= 2` active runs per principal -> 3rd returns `429 catalog_busy`)
+  let releaseGate!: () => void;
+  const gatePromise = new Promise<void>((res) => {
+    releaseGate = res;
+  });
+  const bgPromises: Promise<unknown>[] = [];
+  const waitCtx = { waitUntil: (p: Promise<unknown>) => { bgPromises.push(p); } };
+  const slowFetch = async () => {
+    await gatePromise;
+    return { status: 200, outcome: 'ok', body: JSON.stringify({ products: [] }) };
+  };
+  const c1 = await executeCatalogCall({
+    payload: { url: 'https://conc1.example.com', sync: false },
+    principal: 'tenant-a',
+    ctx: waitCtx,
+    sleepFn: async () => {},
+    executeHubFetch: slowFetch,
+  });
+  const c2 = await executeCatalogCall({
+    payload: { url: 'https://conc2.example.com', sync: false },
+    principal: 'tenant-a',
+    ctx: waitCtx,
+    sleepFn: async () => {},
+    executeHubFetch: slowFetch,
+  });
+  const c3 = await executeCatalogCall({
+    payload: { url: 'https://conc3.example.com', sync: false },
+    principal: 'tenant-a',
+    ctx: waitCtx,
+    sleepFn: async () => {},
+    executeHubFetch: slowFetch,
+  });
+  assert.equal(c1.status, 202);
+  assert.equal(c2.status, 202);
+  assert.equal(c3.status, 429);
+  assert.equal(c3.body.error, 'catalog_busy');
+  releaseGate();
+  await Promise.all(bgPromises);
+
+  // 4. `R5-M3`: `/v1/extract` Twin & JSON-Records Markdown Sanitization (`search-index.ts`)
+  const extractTwinRes = await executeExtractCall({
+    payload: {
+      urls: ['https://shop.example.com/products.json'],
+    },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'cloudflare',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'ext-1',
+            url: 'https://shop.example.com/products.json',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'application/json',
+            body: JSON.stringify({
+              products: [
+                {
+                  id: 1,
+                  title: 'Widget <script>alert(1)</script> [click](javascript:alert(1))',
+                  handle: 'widget',
+                  variants: [{ id: 2, price: '9.99', available: true }],
+                },
+              ],
+            }),
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(extractTwinRes.status, 200);
+  const extResults = extractTwinRes.body.results as Array<{ markdown?: string }>;
+  const extMd = extResults[0]?.markdown ?? '';
+  assert.equal(/<script\b/i.test(extMd), false, `Twin markdown in /v1/extract must strip <script>: ${extMd}`);
+  assert.equal(/\]\(\s*javascript:/i.test(extMd), false, `Twin markdown in /v1/extract must strip javascript: links: ${extMd}`);
+
+  // 5. `R5-M5` (Per-IP In-Flight Cap), Low `Host` OAuth Issuer Protection, Malformed `%` -> `400`, Admin `nosniff`, & `/v1/catalog` `maxBytes`
+  assert.equal(
+    resolvePublicOrigin({
+      canonicalOrigin: 'http://hub.local:8787',
+      trustProxy: true,
+      hasExplicitPublicOrigin: false,
+      hostHeader: 'evil.test',
+      forwardedProtoHeader: 'https',
+    }).origin,
+    'https://hub.local:8787',
+  );
+  assert.equal(
+    resolveDenoPublicOrigin({
+      canonicalOrigin: 'http://hub.local:8787',
+      trustProxy: true,
+      hasExplicitPublicOrigin: false,
+      hostHeader: 'evil.test',
+      forwardedProtoHeader: 'https',
+    }).origin,
+    'https://hub.local:8787',
+  );
+
+  const tmpHubDir = mkdtempSync(join(tmpdir(), 'ef-r5-hub-'));
+  const r5Token = 'r5-owner-token-0123456789abcdef012345';
+  const r5Hub = await startPortableHub({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: tmpHubDir,
+    maxInflightPerIp: 2,
+    envOverrides: {
+      CALLER_TOKEN: r5Token,
+      EDGEFETCH_TRUST_PROXY: 'true',
+      EDGEFETCH_PUBLIC_ORIGIN: '',
+    },
+  });
+  try {
+    // OAuth metadata ignores `Host: evil.test` when `EDGEFETCH_PUBLIC_ORIGIN` is unset even with `EDGEFETCH_TRUST_PROXY=true`
+    const rawOAuth = await sendRawTcpRequest(
+      r5Hub.port,
+      'GET /.well-known/oauth-authorization-server HTTP/1.1\r\nHost: evil.test\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n',
+    );
+    assert.equal(rawOAuth.includes('evil.test'), false, `OAuth metadata must NOT reflect untrusted Host: evil.test: ${rawOAuth}`);
+
+    // Malformed `%E0%A4%A` path param returns `400` (not `503` uncaught URIError)
+    const badPctRes = await fetch(`http://127.0.0.1:${r5Hub.port}/v1/catalog/%E0%A4%A`, {
+      headers: { authorization: `Bearer ${r5Token}` },
+    });
+    assert.equal(badPctRes.status, 400);
+    const badCompatPctRes = await fetch(`http://127.0.0.1:${r5Hub.port}/v2/crawl/%E0%A4%A`, {
+      headers: { authorization: `Bearer ${r5Token}` },
+    });
+    assert.equal(badCompatPctRes.status, 400);
+
+    // Admin JSON response includes `x-content-type-options: nosniff`
+    const adminUnauth = await fetch(`http://127.0.0.1:${r5Hub.port}/admin/api/state`);
+    assert.equal(adminUnauth.status, 401);
+    assert.equal(adminUnauth.headers.get('x-content-type-options'), 'nosniff');
+
+    // `R5-M5`: Hold 2 slow-body POST sockets open from the same IP; 3rd request from that IP gets `429`, while another IP (`198.51.100.88`) still succeeds (`200`)!
+    const openSlowPost = (): Promise<{ destroy: () => void }> =>
+      new Promise((resolveConn, rejectConn) => {
+        const s = createConnection({ host: '127.0.0.1', port: r5Hub.port }, () => {
+          s.write(
+            `POST /v1/search HTTP/1.1\r\nHost: 127.0.0.1:${r5Hub.port}\r\nAuthorization: Bearer ${r5Token}\r\nX-Forwarded-For: 203.0.113.55\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n{"q":`,
+          );
+          setTimeout(() => resolveConn({ destroy: () => s.destroy() }), 35);
+        });
+        s.on('error', rejectConn);
+      });
+
+    const slow1 = await openSlowPost();
+    const slow2 = await openSlowPost();
+    try {
+      const blockedSameIp = await fetch(`http://127.0.0.1:${r5Hub.port}/health`, {
+        headers: { 'x-forwarded-for': '203.0.113.55' },
+      });
+      assert.equal(blockedSameIp.status, 429, '3rd concurrent request from same IP must hit 429 per-IP slot cap');
+
+      const otherIpOk = await fetch(`http://127.0.0.1:${r5Hub.port}/health`, {
+        headers: { 'x-forwarded-for': '198.51.100.88' },
+      });
+      assert.equal(otherIpOk.status, 200, 'Other client IP must remain unaffected by slow IP');
+    } finally {
+      slow1.destroy();
+      slow2.destroy();
+    }
+  } finally {
+    await r5Hub.close();
+    rmSync(tmpHubDir, { recursive: true, force: true });
+  }
+
+  // 6. Low `safe-fetch.ts`: HTTP `100 Continue` permitted (`<= 3`), caller `Content-Length` stripped/recomputed, `MAX_SAFE_FETCH_TIMEOUT_MS = 60_000`
+  assert.equal(MAX_SAFE_FETCH_TIMEOUT_MS, 60_000);
+  let seenContentLength = '';
+  const rawContinueSrv = createTcpServer((sock) => {
+    let reqBuf = '';
+    let sent100 = false;
+    let replied200 = false;
+    sock.on('data', (chunk) => {
+      reqBuf += chunk.toString('utf8');
+      const hdrEnd = reqBuf.indexOf('\r\n\r\n');
+      if (hdrEnd >= 0 && !sent100) {
+        sent100 = true;
+        const clMatch = /\r\ncontent-length:\s*(\d+)\r\n/i.exec(reqBuf.slice(0, hdrEnd + 2));
+        seenContentLength = clMatch?.[1] ?? '';
+        sock.write('HTTP/1.1 100 Continue\r\n\r\n');
+      }
+      if (hdrEnd >= 0 && !replied200 && reqBuf.slice(hdrEnd + 4).length >= 4) {
+        replied200 = true;
+        sock.write(
+          'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong',
+        );
+        sock.end();
+      }
+    });
+  });
+  await new Promise<void>((res) => rawContinueSrv.listen(0, '127.0.0.1', () => res()));
+  try {
+    const srvAddr = rawContinueSrv.address() as { port: number };
+    const sf = createSafeOutboundFetch({ allowExplicitLoopbackUrls: true });
+    const sfRes = await sf(`http://127.0.0.1:${srvAddr.port}/test`, {
+      method: 'POST',
+      headers: { 'content-length': '999999', expect: '100-continue' },
+      body: 'ping',
+      signal: AbortSignal.timeout(45_000),
+    });
+    assert.equal(sfRes.status, 200);
+    assert.equal(await sfRes.text(), 'pong');
+    assert.equal(seenContentLength, '4', 'safe-fetch must strip forged Content-Length and send exact byte length');
+  } finally {
+    await new Promise<void>((res) => rawContinueSrv.close(() => res()));
+  }
+  void createHttpServer;
+
+  // 7. Remaining Hub Lows (`jobs.ts` company match + scrape cap + `x402`, `overflow.ts` empty `User-agent:`, `llm.ts` query redaction)
+  const stripeTokens = new Set(['stripe']);
+  const makeJobStub = (company: string, url = 'https://example.com/jobs/1') => ({
+    title: 'Backend Engineer',
+    company,
+    url,
+    applyUrl: url,
+    workplaceType: 'remote' as const,
+    locations: ['Remote'],
+    pay: null,
+    postedAt: null,
+    source: 'custom',
+  });
+  assert.equal(matchesAllowedCompanyOrDomain(makeJobStub('st'), stripeTokens, []), false);
+  assert.equal(matchesAllowedCompanyOrDomain(makeJobStub('ri'), stripeTokens, []), false);
+  assert.equal(matchesAllowedCompanyOrDomain(makeJobStub('notstripe'), stripeTokens, []), false);
+  assert.equal(matchesAllowedCompanyOrDomain(makeJobStub('Stripe, Inc.'), stripeTokens, []), true);
+
+  let curJobsActive = 0;
+  let maxJobsActiveSeen = 0;
+  let totalJobsScrapes = 0;
+  await executeJobsCall({
+    payload: {
+      domains: ['d1.com', 'd2.com', 'd3.com', 'd4.com', 'd5.com', 'd6.com', 'd7.com', 'd8.com'],
+      query: 'Engineer',
+    },
+    env: {},
+    executeSearch: async () => ({ status: 200, body: { results: [] } }),
+    executeScrape: async () => {
+      curJobsActive++;
+      totalJobsScrapes++;
+      if (curJobsActive > maxJobsActiveSeen) maxJobsActiveSeen = curJobsActive;
+      await new Promise((r) => setTimeout(r, 5));
+      curJobsActive--;
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.ok(maxJobsActiveSeen <= MAX_JOBS_CONCURRENT_SCRAPES, `Expected <= ${MAX_JOBS_CONCURRENT_SCRAPES} concurrent scrapes, got ${maxJobsActiveSeen}`);
+  assert.ok(totalJobsScrapes <= MAX_JOBS_TOTAL_SCRAPES, `Expected <= ${MAX_JOBS_TOTAL_SCRAPES} total scrapes, got ${totalJobsScrapes}`);
+
+  // `parseX402PaymentTerms`: zero-value / gratis / complimentary rejected + unverified custom token `extra.decimals` not trusted for scaling
+  const zeroPrice402 = parseX402PaymentTerms(402, {}, JSON.stringify({ x402Version: 1, price: '$0.00' }));
+  assert.equal(zeroPrice402?.price, undefined);
+  const gratis402 = parseX402PaymentTerms(402, {}, JSON.stringify({ x402Version: 1, price: '5 USD', description: 'Complimentary trial access' }));
+  assert.equal(gratis402?.price, undefined);
+  const customToken402 = parseX402PaymentTerms(
+    402,
+    {},
+    JSON.stringify({
+      x402Version: 1,
+      accepts: [{ scheme: 'exact', network: 'base', maxAmountRequired: '1000000000000', asset: '0xDeadBeefToken', extra: { decimals: 18 } }],
+    }),
+  );
+  assert.equal(customToken402?.price, '1000000000000 atomic units (0xDeadBeefToken)');
+  assert.equal(customToken402?.terms.extra?.decimals, undefined);
+
+  // `overflow.ts`: empty `User-agent:` closes preceding group that saw directives (matching Go `politeness.ParseRobotsTxt`)
+  const emptyUaRobots = parseOverflowRobotsTxt('User-agent: *\nDisallow: /secret\nUser-agent:\nDisallow: /not-in-wildcard\n');
+  assert.equal(isRobotsAllowed(emptyUaRobots, '/secret'), false);
+  assert.equal(isRobotsAllowed(emptyUaRobots, '/not-in-wildcard'), true);
+
+  // `llm.ts`: `redactLlmConfigForLog` strips query string (`?key=...`) and hash fragments from `baseUrl`
+  const redactedLlm = redactLlmConfigForLog({
+    provider: 'gemini',
+    baseUrl: 'https://user:pw@generativelanguage.googleapis.com/v1beta/openai?key=AIzaSecretKey123#frag',
+    apiKey: 'AIzaSecretKey123',
+    model: 'gemini-2.5-flash',
+    isOfflineLocal: false,
+  });
+  assert.equal(redactedLlm?.baseUrl, 'https://generativelanguage.googleapis.com/v1beta/openai');
 });

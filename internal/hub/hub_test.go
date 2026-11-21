@@ -305,3 +305,147 @@ func TestPeerHandoffOn429WithLoopPrevention(t *testing.T) {
 		t.Fatalf("expected loop guard to prevent 2nd hop: via=%q outcome=%q peerCalls=%d", via2, rep2.Results[0].Outcome, peerCalls)
 	}
 }
+
+func TestGoHubDeclarativeExtractorsAndTwinScrapeUpgrade(t *testing.T) {
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	const callerTok = "caller-declarative-token-0123456789"
+
+	mockTr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.URL.Path == "/robots.txt" || req.URL.Path == "/llms.txt":
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("not found")),
+				Request:    req,
+			}, nil
+		case req.URL.Host == "rubygems.org" && req.URL.Path == "/api/v1/gems/rails.json":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"name":"rails","version":"8.0.1","info":"Full-stack Ruby web framework.","licenses":["MIT"],"authors":"DHH"}`)),
+				Request:    req,
+			}, nil
+		case req.URL.Host == "rubygems.org" && req.URL.Path == "/api/v1/gems/fallbackgem.json":
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":"not found"}`)),
+				Request:    req,
+			}, nil
+		case req.URL.Host == "rubygems.org" && req.URL.Path == "/gems/fallbackgem":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader(`<!doctype html><html><head><title>Fallback Gem HTML</title></head><body><main><h1>Fallback Gem HTML</h1><p>Rendered from live HTML fallback.</p></main></body></html>`)),
+				Request:    req,
+			}, nil
+		default:
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("not found")),
+				Request:    req,
+			}, nil
+		}
+	})
+
+	crawler := crawl.NewCrawler(mockTr, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	crawler.Sleep = func(context.Context, time.Duration) error { return nil }
+	defer func() { _ = crawler.Close() }()
+
+	hubSrv := NewServer(Config{
+		CallerToken:     callerTok,
+		FallbackCrawler: crawler,
+		Allow:           crawl.PublicHTTPS,
+		Logger:          log,
+	})
+	defer func() { _ = hubSrv.Close() }()
+	ts := httptest.NewServer(hubSrv)
+	defer ts.Close()
+
+	// 1. Unauthenticated /v1/extractors rejected; authenticated returns go-declarative catalog.
+	unauthResp, err := http.Get(ts.URL + "/v1/extractors")
+	if err != nil || unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated /v1/extractors, got resp=%v err=%v", unauthResp, err)
+	}
+	_ = unauthResp.Body.Close()
+
+	exReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/extractors?category=developer", nil)
+	exReq.Header.Set("Authorization", "Bearer "+callerTok)
+	exResp, err := http.DefaultClient.Do(exReq)
+	if err != nil || exResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/extractors failed: resp=%v err=%v", exResp, err)
+	}
+	var exBody struct {
+		OK         bool             `json:"ok"`
+		Count      int              `json:"count"`
+		Runtime    string           `json:"runtime"`
+		Extractors []map[string]any `json:"extractors"`
+	}
+	_ = json.NewDecoder(exResp.Body).Decode(&exBody)
+	_ = exResp.Body.Close()
+	if !exBody.OK || exBody.Runtime != "go-declarative" || exBody.Count < 3 {
+		t.Fatalf("unexpected /v1/extractors body: %+v", exBody)
+	}
+
+	// 2. MCP tools/list & find_extractors tool call.
+	mcpListReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", bytes.NewBufferString(`{"jsonrpc":"2.0","id":11,"method":"tools/list"}`))
+	mcpListReq.Header.Set("Authorization", "Bearer "+callerTok)
+	mcpListResp, err := http.DefaultClient.Do(mcpListReq)
+	if err != nil || mcpListResp.StatusCode != http.StatusOK {
+		t.Fatalf("MCP tools/list failed: %v", err)
+	}
+	rawTools, _ := io.ReadAll(mcpListResp.Body)
+	_ = mcpListResp.Body.Close()
+	if !strings.Contains(string(rawTools), `"find_extractors"`) {
+		t.Fatalf("expected find_extractors in MCP tools/list, got: %s", string(rawTools))
+	}
+
+	mcpFindReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", bytes.NewBufferString(`{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"find_extractors","arguments":{"query":"usaspending"}}}`))
+	mcpFindReq.Header.Set("Authorization", "Bearer "+callerTok)
+	mcpFindResp, err := http.DefaultClient.Do(mcpFindReq)
+	if err != nil || mcpFindResp.StatusCode != http.StatusOK {
+		t.Fatalf("MCP find_extractors call failed: %v", err)
+	}
+	rawFind, _ := io.ReadAll(mcpFindResp.Body)
+	_ = mcpFindResp.Body.Close()
+	if !strings.Contains(string(rawFind), `\"id\": \"usaspending\"`) || !strings.Contains(string(rawFind), `go-declarative`) {
+		t.Fatalf("expected usaspending in MCP find_extractors output, got: %s", string(rawFind))
+	}
+
+	// 3. POST /v2/scrape upgrades https://rubygems.org/gems/rails -> /api/v1/gems/rails.json natively in Go!
+	v2Req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/scrape", strings.NewReader(`{"url":"https://rubygems.org/gems/rails"}`))
+	v2Req.Header.Set("Authorization", "Bearer "+callerTok)
+	v2Resp, err := http.DefaultClient.Do(v2Req)
+	if err != nil || v2Resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v2/scrape twin failed: resp=%v err=%v", v2Resp, err)
+	}
+	var v2Body struct {
+		Success bool           `json:"success"`
+		Data    map[string]any `json:"data"`
+	}
+	_ = json.NewDecoder(v2Resp.Body).Decode(&v2Body)
+	_ = v2Resp.Body.Close()
+	if !v2Body.Success || v2Body.Data["extractorId"] != "rubygems" || !strings.Contains(v2Body.Data["markdown"].(string), "`gem install rails`") {
+		t.Fatalf("unexpected /v2/scrape twin response: %+v", v2Body)
+	}
+	meta, _ := v2Body.Data["metadata"].(map[string]any)
+	if meta["sourceURL"] != "https://rubygems.org/gems/rails" || meta["title"] != "rails 8.0.1 (RubyGem)" {
+		t.Fatalf("unexpected /v2/scrape metadata: %+v", meta)
+	}
+
+	// 4. Failed twin (404) falls back seamlessly to HTML scrape!
+	fbReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/scrape", strings.NewReader(`{"url":"https://rubygems.org/gems/fallbackgem"}`))
+	fbReq.Header.Set("Authorization", "Bearer "+callerTok)
+	fbResp, err := http.DefaultClient.Do(fbReq)
+	if err != nil || fbResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/scrape HTML fallback failed: resp=%v err=%v", fbResp, err)
+	}
+	var fbMap map[string]any
+	_ = json.NewDecoder(fbResp.Body).Decode(&fbMap)
+	_ = fbResp.Body.Close()
+	if fbMap["ok"] != true || !strings.Contains(fbMap["markdown"].(string), "Rendered from live HTML fallback.") {
+		t.Fatalf("expected seamless HTML fallback when twin returns 404, got: %+v", fbMap)
+	}
+}

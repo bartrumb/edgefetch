@@ -7,6 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -436,9 +440,394 @@ func TestOriginScopedHeadersStrictSchemeHostPortAndSandboxClassifier(t *testing.
 		context.DeadlineExceeded,
 		errors.New("timed out waiting for chromium DevTools endpoint"),
 		errors.New("error while loading shared libraries: libnss3.so: cannot open shared object file"),
+		errors.New("[23:23:ERROR:sandbox_linux.cc(380)] InitializeSandbox() called with multiple threads in process gpu-process."),
+		errors.New("[9:9:ERROR:process_singleton_posix.cc(340)] Failed to create /data/namespace sandbox/SingletonLock: No space left on device"),
 	} {
 		if isSandboxStartupFailure(nonSandbox) {
 			t.Fatalf("SECURITY: expected isSandboxStartupFailure(%v) == false so timeouts/unrelated errors never downgrade to --no-sandbox", nonSandbox)
+		}
+	}
+}
+
+func TestResumedNavigateOriginScopingAndCrossOrigin302HeaderStripping(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		hasOverride = make(map[string]bool)
+		gotValue    = make(map[string]string)
+	)
+	waitForID := func(id string) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			_, seen := hasOverride[id]
+			mu.Unlock()
+			if seen {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for Fetch.continueRequest(%q)", id)
+	}
+
+	var curDocURL atomic.Value
+	curDocURL.Store("https://first.test/start")
+
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		var writeMu sync.Mutex
+		send := func(v any) {
+			b, _ := json.Marshal(v)
+			writeMu.Lock()
+			_ = conn.Write(r.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+
+		fetchEnabled := false
+		continuedCh := make(map[string]chan struct{})
+		var chMu sync.Mutex
+		sig := func(id string) chan struct{} {
+			chMu.Lock()
+			defer chMu.Unlock()
+			ch, ok := continuedCh[id]
+			if !ok {
+				ch = make(chan struct{})
+				continuedCh[id] = ch
+			}
+			return ch
+		}
+
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				continue
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-r5"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-r5"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "s-r5"}})
+			case "Fetch.enable":
+				fetchEnabled = true
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			case "Fetch.continueRequest":
+				var p struct {
+					RequestID string             `json:"requestId"`
+					Headers   []fetchHeaderEntry `json:"headers"`
+				}
+				var rawMap map[string]json.RawMessage
+				_ = json.Unmarshal(req.Params, &p)
+				_ = json.Unmarshal(req.Params, &rawMap)
+				_, overridden := rawMap["headers"]
+				val := ""
+				for _, h := range p.Headers {
+					if strings.EqualFold(h.Name, "Authorization") {
+						val = h.Value
+					}
+				}
+				mu.Lock()
+				hasOverride[p.RequestID] = overridden
+				gotValue[p.RequestID] = val
+				mu.Unlock()
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+				select {
+				case <-sig(p.RequestID):
+				default:
+					close(sig(p.RequestID))
+				}
+			case "Page.navigate":
+				var np struct {
+					URL string `json:"url"`
+				}
+				_ = json.Unmarshal(req.Params, &np)
+				navID := req.ID
+				navSID := req.SessionID
+				if !fetchEnabled {
+					curDocURL.Store(np.URL)
+					send(map[string]any{"id": navID, "sessionId": navSID, "result": map[string]any{"frameId": "main-f"}})
+					send(map[string]any{"sessionId": navSID, "method": "Page.loadEventFired", "params": map[string]any{}})
+					continue
+				}
+				go func() {
+					if strings.Contains(np.URL, "second.test") {
+						curDocURL.Store("https://second.test/app")
+						send(map[string]any{
+							"sessionId": navSID,
+							"method":    "Fetch.requestPaused",
+							"params": map[string]any{
+								"requestId":    "resumed-second-doc",
+								"frameId":      "main-f",
+								"resourceType": "Document",
+								"request": map[string]any{
+									"url":     "https://second.test/app",
+									"headers": map[string]string{"Accept": "text/html"},
+								},
+							},
+						})
+						<-sig("resumed-second-doc")
+						send(map[string]any{"id": navID, "sessionId": navSID, "result": map[string]any{"frameId": "main-f"}})
+						// Subresource back to first.test MUST NOT receive second.test's secret!
+						send(map[string]any{
+							"sessionId": navSID,
+							"method":    "Fetch.requestPaused",
+							"params": map[string]any{
+								"requestId":    "resumed-first-img",
+								"frameId":      "main-f",
+								"resourceType": "Image",
+								"request": map[string]any{
+									"url":     "https://first.test/logo.png",
+									"headers": map[string]string{"Accept": "image/*"},
+								},
+							},
+						})
+						send(map[string]any{"sessionId": navSID, "method": "Page.loadEventFired", "params": map[string]any{}})
+						return
+					}
+					// 302 cross-origin redirect scenario: victim.test/redir -> attacker.test/landing -> attacker JS fetches victim.test/api/transfer
+					curDocURL.Store("https://attacker.test/landing")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "redir-hop0-victim",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://victim.test/redir",
+								"headers": map[string]string{"Accept": "text/html"},
+							},
+						},
+					})
+					<-sig("redir-hop0-victim")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":           "redir-hop1-attacker",
+							"frameId":             "main-f",
+							"resourceType":        "Document",
+							"redirectStatusCode":  302,
+							"redirectedRequestId": "redir-hop0-victim",
+							"request": map[string]any{
+								"url":     "https://attacker.test/landing",
+								"headers": map[string]string{"Accept": "text/html"},
+							},
+						},
+					})
+					<-sig("redir-hop1-attacker")
+					send(map[string]any{"id": navID, "sessionId": navSID, "result": map[string]any{"frameId": "main-f"}})
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "confused-deputy-post",
+							"frameId":      "main-f",
+							"resourceType": "Fetch",
+							"request": map[string]any{
+								"url": "https://victim.test/api/transfer",
+								"headers": map[string]string{
+									"Origin":         "https://attacker.test",
+									"Sec-Fetch-Site": "cross-site",
+								},
+							},
+						},
+					})
+					send(map[string]any{"sessionId": navSID, "method": "Page.loadEventFired", "params": map[string]any{}})
+				}()
+			case "Runtime.evaluate":
+				u, _ := curDocURL.Load().(string)
+				docJSON, _ := json.Marshal(map[string]string{
+					"url":  u,
+					"html": "<html><body><main>ok</main></body></html>",
+				})
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result":    map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}},
+				})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+
+	r := NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, "EdgeFetchTest/1.0")
+	defer r.Close()
+
+	// 1. Resumed session with URL=="" + Headers + navigate action updates initialOrigin to second.test (and fails closed on invalid port :0).
+	out1, err := r.Execute(context.Background(), Task{
+		URL:         "https://first.test/start",
+		KeepSession: true,
+		WaitForMs:   15,
+	})
+	if err != nil || out1.SessionID == "" {
+		t.Fatalf("Turn 1 failed: err=%v out=%+v", err, out1)
+	}
+	if _, badErr := r.Execute(context.Background(), Task{
+		SessionID:   out1.SessionID,
+		URL:         "https://second.test:0/bad",
+		Headers:     map[string]string{"Authorization": "Bearer never-send"},
+		KeepSession: true,
+	}); badErr == nil {
+		t.Fatal("expected non-canonical port :0 with custom Headers to fail closed")
+	}
+	if _, err := r.Execute(context.Background(), Task{
+		SessionID: out1.SessionID,
+		Headers:   map[string]string{"Authorization": "Bearer secret-second"},
+		Actions:   []InteractAction{{Type: "navigate", URL: "https://second.test/app", WaitMs: 15}},
+	}); err != nil {
+		t.Fatalf("Turn 2 resumed navigate failed: %v", err)
+	}
+	waitForID("resumed-second-doc")
+	waitForID("resumed-first-img")
+
+	mu.Lock()
+	secondGot := gotValue["resumed-second-doc"]
+	firstLeaked := hasOverride["resumed-first-img"]
+	mu.Unlock()
+	if secondGot != "Bearer secret-second" || firstLeaked {
+		t.Fatalf("expected headers scoped strictly to resumed navigate origin second.test (secondGot=%q, firstLeaked=%v)", secondGot, firstLeaked)
+	}
+
+	// 2. Top-level 302 redirect away from victim.test -> attacker.test strips headers on subsequent subrequests back to victim.test!
+	if _, err := r.Execute(context.Background(), Task{
+		URL:       "https://victim.test/redir",
+		Headers:   map[string]string{"Authorization": "Bearer secret-victim"},
+		WaitForMs: 20,
+	}); err != nil {
+		t.Fatalf("302 redirect Execute failed: %v", err)
+	}
+	waitForID("confused-deputy-post")
+
+	mu.Lock()
+	hop0Got := gotValue["redir-hop0-victim"]
+	hop1Overridden := hasOverride["redir-hop1-attacker"]
+	deputyOverridden := hasOverride["confused-deputy-post"]
+	mu.Unlock()
+	if hop0Got != "Bearer secret-victim" || hop1Overridden || deputyOverridden {
+		t.Fatalf("SECURITY: cross-origin 302 leaked ambient headers (hop0=%q, hop1=%v, deputy=%v)", hop0Got, hop1Overridden, deputyOverridden)
+	}
+}
+
+func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *testing.T) {
+	args := buildChromiumLaunchArgsWithSandbox("127.0.0.1:8888", "/tmp/ef-prof", true)
+	var sawPipe, sawPort bool
+	for _, a := range args {
+		if a == "--remote-debugging-pipe" {
+			sawPipe = true
+		}
+		if strings.HasPrefix(a, "--remote-debugging-port=") {
+			sawPort = true
+		}
+	}
+	if runtime.GOOS == "windows" {
+		if sawPipe || !sawPort {
+			t.Fatalf("expected --remote-debugging-port=0 on windows, got %v", args)
+		}
+	} else {
+		if !sawPipe || sawPort {
+			t.Fatalf("expected --remote-debugging-pipe (and zero --remote-debugging-port) on %s, got %v", runtime.GOOS, args)
+		}
+	}
+
+	if runtime.GOOS != "linux" {
+		return
+	}
+	bin := FindChromeBinary()
+	if bin == "" {
+		t.Skip("no headless Chromium/Chrome binary installed; skipping live R5-M6 pipe transport check")
+	}
+
+	r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch/2.6.2", 1, nil)
+	defer r.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := r.ensureBrowser(ctx); err != nil {
+		t.Fatalf("ensureBrowser via --remote-debugging-pipe failed: %v", err)
+	}
+
+	r.mu.Lock()
+	pid := 0
+	if r.cmd != nil && r.cmd.Process != nil {
+		pid = r.cmd.Process.Pid
+	}
+	userDataDir := r.userDataDir
+	ver := r.browserVersion
+	r.mu.Unlock()
+
+	if pid <= 0 || ver == "" {
+		t.Fatalf("expected live Chromium pid and version, got pid=%d ver=%q", pid, ver)
+	}
+	info, err := os.Stat(userDataDir)
+	if err != nil {
+		t.Fatalf("stat userDataDir: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("expected userDataDir mode 0700, got %04o", perm)
+	}
+
+	// Collect listening socket inodes from /proc/net/tcp and /proc/net/tcp6 (state 0A == TCP_LISTEN).
+	listenInodes := make(map[string]string)
+	for _, procNet := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		raw, err := os.ReadFile(procNet)
+		if err != nil {
+			continue
+		}
+		for idx, line := range strings.Split(string(raw), "\n") {
+			if idx == 0 {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 10 && fields[3] == "0A" && fields[9] != "0" {
+				listenInodes["socket:["+fields[9]+"]"] = fields[1]
+			}
+		}
+	}
+
+	// Inspect Chromium root PID and direct child PIDs to prove zero listening TCP sockets belong to Chromium.
+	pids := []int{pid}
+	if childrenMatches, _ := filepath.Glob("/proc/" + strconv.Itoa(pid) + "/task/*/children"); len(childrenMatches) > 0 {
+		for _, cm := range childrenMatches {
+			if b, err := os.ReadFile(cm); err == nil {
+				for _, tok := range strings.Fields(string(b)) {
+					if cpid, err := strconv.Atoi(tok); err == nil && cpid > 0 {
+						pids = append(pids, cpid)
+					}
+				}
+			}
+		}
+	}
+	for _, checkPID := range pids {
+		fdDir := "/proc/" + strconv.Itoa(checkPID) + "/fd"
+		entries, err := os.ReadDir(fdDir)
+		if err != nil {
+			continue
+		}
+		for _, ent := range entries {
+			target, err := os.Readlink(filepath.Join(fdDir, ent.Name()))
+			if err != nil {
+				continue
+			}
+			if localHex, listening := listenInodes[target]; listening {
+				t.Fatalf("SECURITY (R5-M6): Chromium pid %d opened listening TCP socket %s (%s) under --remote-debugging-pipe!", checkPID, target, localHex)
+			}
 		}
 	}
 }

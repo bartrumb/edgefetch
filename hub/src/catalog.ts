@@ -53,6 +53,7 @@ export interface CatalogStatusSummary {
   pagesRead: number;
   pauseMs: number;
   durationMs: number;
+  truncated?: boolean;
   reason?: string;
   resumeAt?: string;
   warning?: 'shrink';
@@ -150,19 +151,110 @@ interface SnapshotHashBundle {
 interface StoredCatalogRun {
   summary: CatalogStatusSummary;
   hashes: SnapshotHashBundle;
-  records: CatalogRecord[];
+  records: CatalogRecord[] | null;
+  retainedBytes: number;
 }
 
+export const MAX_CATALOG_IN_MEMORY_BYTES = 16 * 1024 * 1024;
+export const MAX_GLOBAL_CATALOG_BYTES = 32 * 1024 * 1024;
+export const MAX_CACHED_CATALOG_RUNS = 8;
+export const MAX_CONCURRENT_CATALOG_PER_PRINCIPAL = 2;
+export const MAX_CONCURRENT_CATALOG_GLOBAL = 8;
+export const MAX_CATALOG_TOTAL_SLEEP_MS = 120_000;
+export const MAX_CATALOG_WALL_MS = 180_000;
+const MAX_RECORD_SERIALIZED_BYTES = 64 * 1024;
+const MAX_IMAGES_PER_CATALOG_RECORD = 250;
+const MAX_VARIANTS_PER_CATALOG_RECORD = 250;
+const MAX_COMPACT_HISTORY_RUNS = 32;
+
 const MEMORY_CATALOG_RUNS = new Map<string, StoredCatalogRun>();
-const MAX_MEMORY_CATALOG_RUNS = 60;
+const ACTIVE_CATALOG_BY_PRINCIPAL = new Map<string, number>();
+let activeCatalogGlobal = 0;
 const D1_INIT_CACHE = new WeakSet<object>();
+
+function approxUtf8Bytes(s: string): number {
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+function clampCatalogRecord(rec: CatalogRecord): { record: CatalogRecord; bytes: number } {
+  let desc = rec.descriptionText;
+  if (typeof desc === 'string' && desc.length > 60_000) {
+    desc = desc.slice(0, 60_000);
+  }
+  const images = Array.isArray(rec.images) ? rec.images.slice(0, MAX_IMAGES_PER_CATALOG_RECORD) : [];
+  const variants = Array.isArray(rec.variants) ? rec.variants.slice(0, MAX_VARIANTS_PER_CATALOG_RECORD) : [];
+  const tags = Array.isArray(rec.tags) ? rec.tags.slice(0, 128) : [];
+  const options = Array.isArray(rec.options) ? rec.options.slice(0, 32) : [];
+
+  let clamped: CatalogRecord = {
+    ...rec,
+    ...(desc !== undefined ? { descriptionText: desc } : {}),
+    images,
+    variants,
+    tags,
+    options,
+  };
+  let serialized = JSON.stringify(clamped);
+  let bytes = approxUtf8Bytes(serialized);
+  if (bytes > MAX_RECORD_SERIALIZED_BYTES) {
+    if (typeof clamped.descriptionText === 'string' && clamped.descriptionText.length > 0) {
+      const keepDesc = Math.max(0, Math.min(4_096, clamped.descriptionText.length - (bytes - MAX_RECORD_SERIALIZED_BYTES)));
+      clamped = { ...clamped, descriptionText: clamped.descriptionText.slice(0, keepDesc) };
+      serialized = JSON.stringify(clamped);
+      bytes = approxUtf8Bytes(serialized);
+    }
+    if (bytes > MAX_RECORD_SERIALIZED_BYTES && clamped.variants.length > 32) {
+      clamped = {
+        ...clamped,
+        variants: clamped.variants.slice(0, 32),
+        ...(clamped.images ? { images: clamped.images.slice(0, 32) } : {}),
+      };
+      serialized = JSON.stringify(clamped);
+      bytes = approxUtf8Bytes(serialized);
+    }
+  }
+  return { record: clamped, bytes };
+}
 
 function rememberRunInMemory(catalogId: string, entry: StoredCatalogRun): void {
   if (MEMORY_CATALOG_RUNS.has(catalogId)) {
     MEMORY_CATALOG_RUNS.delete(catalogId);
   }
   MEMORY_CATALOG_RUNS.set(catalogId, entry);
-  while (MEMORY_CATALOG_RUNS.size > MAX_MEMORY_CATALOG_RUNS) {
+
+  // Enforce LRU cap on full in-memory record bodies (`MAX_CACHED_CATALOG_RUNS = 8`, `MAX_GLOBAL_CATALOG_BYTES = 32 MiB`)
+  let cachedBodyRuns = 0;
+  let globalBytes = 0;
+  for (const v of MEMORY_CATALOG_RUNS.values()) {
+    if (v.records !== null) {
+      cachedBodyRuns++;
+      globalBytes += v.retainedBytes;
+    }
+  }
+  if (cachedBodyRuns > MAX_CACHED_CATALOG_RUNS || globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
+    for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+      if (k === catalogId || v.records === null) continue;
+      globalBytes -= v.retainedBytes;
+      cachedBodyRuns--;
+      v.records = null;
+      v.retainedBytes = 0;
+      if (cachedBodyRuns <= MAX_CACHED_CATALOG_RUNS && globalBytes <= MAX_GLOBAL_CATALOG_BYTES) {
+        break;
+      }
+    }
+  }
+
+  while (MEMORY_CATALOG_RUNS.size > MAX_COMPACT_HISTORY_RUNS) {
     const oldestKey = MEMORY_CATALOG_RUNS.keys().next().value;
     if (oldestKey === undefined) break;
     MEMORY_CATALOG_RUNS.delete(oldestKey);
@@ -801,6 +893,7 @@ export async function executeCatalogCall(params: {
   env?: OptionalStorageBindings & Record<string, unknown>;
   executeHubFetch: CatalogHubFetchFn;
   selfHost?: string;
+  principal?: string;
   ctx?: { waitUntil?: (promise: Promise<unknown>) => void };
   sleepFn?: (ms: number) => Promise<void>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -899,10 +992,35 @@ export async function executeCatalogCall(params: {
     };
   }
 
+  // `R5-M4`: Per-principal (`2`) and global (`8`) active catalog pull concurrency guard
+  const principalKey = (params.principal ?? 'anonymous').trim() || 'anonymous';
+  const activeForPrincipal = ACTIVE_CATALOG_BY_PRINCIPAL.get(principalKey) ?? 0;
+  if (activeCatalogGlobal >= MAX_CONCURRENT_CATALOG_GLOBAL || activeForPrincipal >= MAX_CONCURRENT_CATALOG_PER_PRINCIPAL) {
+    return {
+      status: 429,
+      body: {
+        ok: false,
+        error: 'catalog_busy',
+        message: 'Too many concurrent catalog pulls are active. Wait for an active run to finish or poll its catalogId.',
+      },
+    };
+  }
+  activeCatalogGlobal++;
+  ACTIVE_CATALOG_BY_PRINCIPAL.set(principalKey, activeForPrincipal + 1);
+  let releasedConcurrencySlot = false;
+  const releaseConcurrencySlot = () => {
+    if (releasedConcurrencySlot) return;
+    releasedConcurrencySlot = true;
+    activeCatalogGlobal = Math.max(0, activeCatalogGlobal - 1);
+    const curCount = ACTIVE_CATALOG_BY_PRINCIPAL.get(principalKey) ?? 0;
+    if (curCount <= 1) ACTIVE_CATALOG_BY_PRINCIPAL.delete(principalKey);
+    else ACTIVE_CATALOG_BY_PRINCIPAL.set(principalKey, curCount - 1);
+  };
+
   let activeSpec: CatalogSpec = initialAdapter.catalog;
   const reqPause = typeof payload.pauseMs === 'number' && Number.isFinite(payload.pauseMs) ? Math.floor(payload.pauseMs) : activeSpec.pauseMs;
   const computeEffectivePauseMs = (spec: CatalogSpec): number =>
-    Math.max(spec.platform === 'shopify' ? 2000 : spec.pauseMs, reqPause);
+    Math.min(30_000, Math.max(spec.platform === 'shopify' ? 2000 : spec.pauseMs, reqPause));
 
   let effectivePauseMs = computeEffectivePauseMs(activeSpec);
   const maxPages =
@@ -933,12 +1051,18 @@ export async function executeCatalogCall(params: {
     },
     hashes: { products: {}, variants: {} },
     records: [],
+    retainedBytes: 0,
   };
 
   await persistCatalogRun(env, currentEntry);
 
   const runPull = async (): Promise<CatalogStatusSummary> => {
+    try {
     const byProductId = new Map<string, CatalogRecord>();
+    const bytesByProductId = new Map<string, number>();
+    let accumulatedBytes = 0;
+    let totalSleptMs = 0;
+    let truncatedByBudget = false;
     let pagesRead = 0;
     let naturalCompletion = false;
     let finalStatus: CatalogRunStatus = 'partial';
@@ -948,7 +1072,18 @@ export async function executeCatalogCall(params: {
     let triedAutoFallbackToWc = rawPlatform !== 'auto' || activeSpec.platform === 'woocommerce';
 
     while (currentUrl && pagesRead < maxPages) {
+      if (Date.now() - startedAtMs > MAX_CATALOG_WALL_MS) {
+        stopReason = 'time_budget_exceeded';
+        truncatedByBudget = true;
+        break;
+      }
       if (pagesRead > 0) {
+        if (totalSleptMs + effectivePauseMs > MAX_CATALOG_TOTAL_SLEEP_MS) {
+          stopReason = 'sleep_budget_exceeded';
+          truncatedByBudget = true;
+          break;
+        }
+        totalSleptMs += effectivePauseMs;
         await sleep(effectivePauseMs);
       }
 
@@ -1015,6 +1150,13 @@ export async function executeCatalogCall(params: {
           }
           const defaultCooldownMs = activeSpec.platform === 'shopify' ? 60_000 : 30_000;
           const waitMs = parseRetryAfterMs(pageResp, defaultCooldownMs);
+          if (totalSleptMs + waitMs > MAX_CATALOG_TOTAL_SLEEP_MS || Date.now() - startedAtMs + waitMs > MAX_CATALOG_WALL_MS) {
+            stopReason = 'sleep_budget_exceeded';
+            truncatedByBudget = true;
+            pageResp = null;
+            break;
+          }
+          totalSleptMs += waitMs;
           const resumeAt = new Date(Date.now() + waitMs).toISOString();
           currentEntry.summary = {
             ...currentEntry.summary,
@@ -1096,14 +1238,26 @@ export async function executeCatalogCall(params: {
       }
 
       pagesRead++;
+      let hitByteBudget = false;
       for (const rec of parsedPage.records) {
         const key = rec.productId || rec.handle || rec.url;
-        byProductId.set(key, rec);
+        const { record: clampedRec, bytes: recBytes } = clampCatalogRecord(rec);
+        const prevBytes = bytesByProductId.get(key) ?? 0;
+        if (accumulatedBytes - prevBytes + recBytes > MAX_CATALOG_IN_MEMORY_BYTES) {
+          hitByteBudget = true;
+          truncatedByBudget = true;
+          stopReason = 'byte_budget';
+          break;
+        }
+        accumulatedBytes = accumulatedBytes - prevBytes + recBytes;
+        bytesByProductId.set(key, recBytes);
+        byProductId.set(key, clampedRec);
       }
 
       const currentRecords = [...byProductId.values()];
       const currentVariantsCount = currentRecords.reduce((acc, r) => acc + r.variants.length, 0);
       currentEntry.records = currentRecords;
+      currentEntry.retainedBytes = accumulatedBytes;
       currentEntry.summary = {
         ...currentEntry.summary,
         products: currentRecords.length,
@@ -1114,6 +1268,10 @@ export async function executeCatalogCall(params: {
         updatedAt: new Date().toISOString(),
       };
       await persistCatalogRun(env, currentEntry);
+
+      if (hitByteBudget) {
+        break;
+      }
 
       if (parsedPage.done) {
         naturalCompletion = true;
@@ -1214,6 +1372,7 @@ export async function executeCatalogCall(params: {
       pagesRead,
       pauseMs: effectivePauseMs,
       durationMs: Date.now() - startedAtMs,
+      ...(truncatedByBudget || stopReason === 'max_pages_reached' ? { truncated: true } : {}),
       ...(stopReason ? { reason: stopReason } : {}),
       ...(shrinkWarning ? { warning: shrinkWarning, previousProducts } : {}),
       ...(artifactId ? { artifactId } : {}),
@@ -1225,9 +1384,19 @@ export async function executeCatalogCall(params: {
 
     currentEntry.summary = finalSummary;
     currentEntry.hashes = currHashes;
-    currentEntry.records = finalRecords;
+    // Flush full in-memory record bodies once persisted to `ARTIFACTS` R2 (`getCatalogRecords` reloads from R2 `artifactId`)
+    if (artifactId) {
+      currentEntry.records = null;
+      currentEntry.retainedBytes = 0;
+    } else {
+      currentEntry.records = finalRecords;
+      currentEntry.retainedBytes = accumulatedBytes;
+    }
     await persistCatalogRun(env, currentEntry);
     return finalSummary;
+    } finally {
+      releaseConcurrencySlot();
+    }
   };
 
   const wantAsync = payload.sync === false && typeof params.ctx?.waitUntil === 'function';

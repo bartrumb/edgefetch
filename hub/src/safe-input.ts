@@ -3,6 +3,8 @@
  * and IPv6 `/64` rate-limit key canonicalization (`hub/src/safe-input.ts`).
  */
 
+import { RE2JS } from 're2js';
+
 export const MAX_HTML_SCAN_CHARS = 2 * 1024 * 1024; // 2 MiB ceiling on regex/DOM scan inputs (M4)
 
 const utf8Decoder = new TextDecoder();
@@ -1076,15 +1078,92 @@ interface RegexItem {
   allCs: RegexCharset;
 }
 
-// Validates and compiles a caller-supplied regular expression (`M4`, `M5`, `R3-H3`), supporting leading `(?i)`
+const MAX_LINEAR_REGEX_LEN = 512;
+const MAX_LINEAR_REGEX_SUBJECT_LEN = 32_768;
+const MAX_USER_REGEX_LEN = 256;
+const MAX_USER_REGEX_SUBJECT_LEN = 2048;
+
+function buildRe2RegExp(
+  rawSource: string,
+  effectivePattern: string,
+  seenFlags: ReadonlySet<string>,
+  maxSubjectLen: number,
+): RegExp | null {
+  if (seenFlags.has('y')) return null;
+  let re2Flags = 0;
+  if (seenFlags.has('i')) re2Flags |= RE2JS.CASE_INSENSITIVE;
+  if (seenFlags.has('m')) re2Flags |= RE2JS.MULTILINE;
+  if (seenFlags.has('s')) re2Flags |= RE2JS.DOTALL;
+
+  try {
+    const translated = RE2JS.translateRegExp(effectivePattern).replace(/\\0(?![0-7])/g, '\\x00');
+    const compiled = RE2JS.compile(translated, re2Flags);
+    const canonicalFlags = ['d', 'g', 'i', 'm', 's', 'u', 'y'].filter((f) => seenFlags.has(f)).join('');
+    const regExpLike = {
+      source: rawSource,
+      flags: canonicalFlags,
+      global: seenFlags.has('g'),
+      ignoreCase: seenFlags.has('i'),
+      multiline: seenFlags.has('m'),
+      dotAll: seenFlags.has('s'),
+      unicode: seenFlags.has('u'),
+      sticky: false,
+      hasIndices: seenFlags.has('d'),
+      lastIndex: 0,
+      test(subject: string): boolean {
+        if (typeof subject !== 'string' || subject.length > maxSubjectLen) return false;
+        return compiled.matcher(subject).find();
+      },
+      exec(subject: string): RegExpExecArray | null {
+        if (typeof subject !== 'string' || subject.length > maxSubjectLen) return null;
+        return compiled.exec(subject) as RegExpExecArray | null;
+      },
+      toString(): string {
+        return `/${rawSource}/${canonicalFlags}`;
+      },
+    };
+    return regExpLike as unknown as RegExp;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compiles a regular expression up to `512` chars using Google's Thompson NFA `RE2JS` engine (`O(N)` worst-case time,
+ * `subject.length <= 32_768`, never invoking V8's backtracking `RegExp`).
+ */
+export function compileLinearRegex(pattern: string, flags = ''): RegExp | null {
+  if (typeof pattern !== 'string' || !pattern || pattern.length > MAX_LINEAR_REGEX_LEN) return null;
+  if (typeof flags !== 'string' || flags.length > 8) return null;
+  if (/\\[1-9]|\\k<|\(\?<[=!]/i.test(pattern)) return null;
+
+  let effectivePattern = pattern;
+  let effectiveFlags = flags;
+  if (effectivePattern.startsWith('(?i)')) {
+    effectivePattern = effectivePattern.slice(4);
+    if (!effectivePattern) return null;
+    if (!effectiveFlags.includes('i')) effectiveFlags += 'i';
+  }
+
+  const seenFlags = new Set<string>();
+  for (const f of effectiveFlags) {
+    if (!'dgimsuy'.includes(f) || seenFlags.has(f)) return null;
+    seenFlags.add(f);
+  }
+
+  return buildRe2RegExp(pattern, effectivePattern, seenFlags, MAX_LINEAR_REGEX_SUBJECT_LEN);
+}
+
+// Validates and compiles a caller-supplied regular expression (`M4`, `M5`, `R3-H3`) via structural AST precheck +
+// `RE2JS` linear-time Thompson NFA execution (`O(N)` guarantee, zero V8 backtracking `RegExp`), supporting leading `(?i)`
 // and disjoint-delimiter multi-segment patterns (`^/[^/]+/[^/]+$`, `/[a-z]+/[a-z]+/`, `/release-notes/v\d+\.\d+\.\d+`,
 // `.*/blog/.*`, `^/blog/.*/comments/.*$`, `^/a/(b|c)?$`) while rejecting:
-//  - Patterns > 160 chars, invalid/duplicate flags, `v` unicodeSets flag, backreferences, and lookbehinds
+//  - Patterns > 256 chars, invalid/duplicate flags, `v` unicodeSets flag, backreferences, and lookbehinds
 //  - Star-height >= 2 (groups repeated `>= 2` times containing inner quantifiers, alternations, lookarounds, or `minLen === 0`)
 //  - Bounded-quantifier & alternation towers (`a{0,32}` x 3+, `a*a?a?a?`, `(aa){1,32}` x 5, lookahead towers) via `branchProduct > 64`
 //  - Overlapping multi-wildcard polynomial patterns (`a*a*b`, `.*.*.*`, `\d+\d+\d+$`, `.*.{0,32}{4}X`).
 export function compileSafeUserRegex(pattern: string, flags = ''): RegExp | null {
-  if (typeof pattern !== 'string' || !pattern || pattern.length > 160) return null;
+  if (typeof pattern !== 'string' || !pattern || pattern.length > MAX_USER_REGEX_LEN) return null;
   if (typeof flags !== 'string' || flags.length > 8) return null;
 
   let effectivePattern = pattern;
@@ -1604,7 +1683,7 @@ export function compileSafeUserRegex(pattern: string, flags = ''): RegExp | null
           branchProduct = 1;
           hasUnclosedUnbounded = false;
         }
-        const sub = analyzeSeq(innerFlat, false, nextItem === null && tailIsPatternEnd);
+        const sub = analyzeSeq(innerFlat, false, idx === items.length - 1 && tailIsPatternEnd);
         if (!sub.ok) return { ok: false };
         if (it.node.hasUnbounded) {
           if (hasUnclosedUnbounded) return { ok: false };
@@ -1713,11 +1792,7 @@ export function compileSafeUserRegex(pattern: string, flags = ''): RegExp | null
     if (!res.ok) return null;
   }
 
-  try {
-    return new RegExp(effectivePattern, effectiveFlags);
-  } catch {
-    return null;
-  }
+  return buildRe2RegExp(pattern, effectivePattern, seenFlags, MAX_USER_REGEX_SUBJECT_LEN);
 }
 
 function parseStrictIpv4Canonical(s: string): string | null {

@@ -1,20 +1,15 @@
 import {
-  attrHasTokenLinear,
   defineAdapter,
-  findAllOpenTagsLinear,
-  findElementInnerLinear,
-  findOpenTagLinear,
-  getAttrValueLinear,
   type HtmlFragmentConverter,
   type TwinFormattedDoc,
 } from '../../types';
 import {
-  extractBalancedDivAt,
   extractJsonLdObjects,
   formatGfmTable,
-  stripScriptsAndStyles,
+  parseHtmlDoc,
   stripTagsInline,
   unescapeHrefUrl,
+  type HtmlNode,
 } from '../../utils';
 
 const ICIMS_EXCLUDED_SUBDOMAINS = new Set(['www', 'status', 'support', 'community', 'developer', 'developers', 'login']);
@@ -28,44 +23,21 @@ interface IcimsParsedCard {
   postedAt: string;
 }
 
-function parseIcimsCardDetails(cardHtml: string): { location: string; pay: string; postedAt: string } {
+function parseIcimsCardDetails(card: HtmlNode): { location: string; pay: string; postedAt: string } {
   let location = '';
   let pay = '';
   let postedAt = '';
 
-  const spanTags = findAllOpenTagsLinear(cardHtml, 'span', (a) => Boolean(getAttrValueLinear(a, 'title')), 12);
-  for (const st of spanTags) {
-    const tVal = (getAttrValueLinear(st.attrStr, 'title') ?? '').trim();
+  for (const span of card.select('span[title]', 12)) {
+    const tVal = (span.attr('title') ?? '').trim();
     if (/^\d{1,2}\/\d{1,2}\/\d{4}\b/.test(tVal)) {
       postedAt = tVal.split(/\s+/)[0] ?? tVal;
       break;
     }
   }
 
-  const tagDivs = findAllOpenTagsLinear(cardHtml, 'div', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_JobHeaderTag'), 16);
-  for (const td of tagDivs) {
-    const block = extractBalancedDivAt(cardHtml, td.index);
-    if (!block) continue;
-    const dtTxt = stripTagsInline(findElementInnerLinear(block, 'dt') ?? '').toLowerCase();
-    const ddTxt = stripTagsInline(findElementInnerLinear(block, 'dd') ?? '');
-    if (!ddTxt) continue;
-    if (!location && dtTxt.includes('location')) {
-      location = ddTxt;
-    } else if (!pay && (dtTxt.includes('salary') || dtTxt.includes('pay') || dtTxt.includes('compensation'))) {
-      pay = ddTxt;
-    }
-  }
-
-  if (!location || !pay) {
-    const dts = findAllOpenTagsLinear(cardHtml, 'dt', undefined, 16);
-    for (let k = 0; k < dts.length; k++) {
-      const dtOpen = dts[k]!;
-      const dtEnd = cardHtml.toLowerCase().indexOf('</dt>', dtOpen.openEnd);
-      if (dtEnd === -1) continue;
-      const dtTxt = stripTagsInline(cardHtml.slice(dtOpen.openEnd, dtEnd)).toLowerCase();
-      const nextBound = k + 1 < dts.length ? dts[k + 1]!.index : cardHtml.length;
-      const ddHtml = findElementInnerLinear(cardHtml.slice(dtEnd + 5, nextBound), 'dd');
-      const ddTxt = stripTagsInline(ddHtml ?? '');
+  for (const dlPairs of [card.dlMap('div.iCIMS_JobHeaderTag'), card.dlMap()]) {
+    for (const [dtTxt, ddTxt] of Object.entries(dlPairs)) {
       if (!ddTxt) continue;
       if (!location && dtTxt.includes('location')) {
         location = ddTxt;
@@ -73,6 +45,7 @@ function parseIcimsCardDetails(cardHtml: string): { location: string; pay: strin
         pay = ddTxt;
       }
     }
+    if (location && pay) break;
   }
 
   return { location, pay, postedAt };
@@ -92,16 +65,16 @@ function formatIcimsHtml(
 
   const hostSlug = u.hostname.split('.')[0] ?? u.hostname;
   const isSingleJob = /\/jobs\/\d+(?:\/|$)/i.test(u.pathname);
+  const doc = parseHtmlDoc(rawHtml);
 
   if (isSingleJob) {
     const ldObjects = extractJsonLdObjects(rawHtml);
     const jobLd = ldObjects.find((o) => /JobPosting/i.test(String(o['@type'] ?? '')));
-    const clean = stripScriptsAndStyles(rawHtml);
 
     const title =
       (typeof jobLd?.title === 'string' ? stripTagsInline(jobLd.title) : '') ||
-      stripTagsInline(findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_Header')) ?? '') ||
-      stripTagsInline(findElementInnerLinear(clean, 'h1') ?? '');
+      doc.text('h1.iCIMS_Header') ||
+      doc.text('h1');
     if (!title) return null;
 
     const orgObj = jobLd?.hiringOrganization as Record<string, unknown> | string | undefined;
@@ -128,12 +101,10 @@ function formatIcimsHtml(
       }
     }
 
-    const descOpen =
-      findOpenTagLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_JobContent')) ??
-      findOpenTagLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_InfoMsg_Job'));
     const descHtml =
       (typeof jobLd?.description === 'string' && jobLd.description.trim() ? jobLd.description : '') ||
-      (descOpen ? extractBalancedDivAt(clean, descOpen.index) ?? '' : '');
+      doc.html('div.iCIMS_JobContent') ||
+      doc.html('div.iCIMS_InfoMsg_Job');
     const bodyMd = descHtml ? htmlToMd(descHtml, origUrl).markdown.trim() : '';
     if (!bodyMd && !jobLd) return null;
 
@@ -156,47 +127,30 @@ function formatIcimsHtml(
   }
 
   // iCIMS Search / Board listing (`/jobs/search?ss=1&in_iframe=1` or `/jobs/intro`)
-  const clean = stripScriptsAndStyles(rawHtml);
-  const cardStarts = [
-    ...findAllOpenTagsLinear(clean, 'li', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_JobCardItem'), 200),
-    ...findAllOpenTagsLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_JobCardItem'), 200),
-  ].sort((a, b) => a.index - b.index);
-  const cardSlicesByJobId = new Map<string, string>();
-  for (let i = 0; i < cardStarts.length; i++) {
-    const start = cardStarts[i]!.index;
-    const end = i + 1 < cardStarts.length ? cardStarts[i + 1]!.index : Math.min(clean.length, start + 12_000);
-    const slice = clean.slice(start, end);
-    const idM = /\/jobs\/(\d+)\//i.exec(slice);
-    if (idM?.[1] && !cardSlicesByJobId.has(idM[1])) {
-      cardSlicesByJobId.set(idM[1], slice);
+  const cardsByJobId = new Map<string, HtmlNode>();
+  for (const card of doc.select('li.iCIMS_JobCardItem, div.iCIMS_JobCardItem', 200)) {
+    for (const cardLink of card.select('a[href*="/jobs/"]', 8)) {
+      const href = unescapeHrefUrl(cardLink.attr('href') ?? '');
+      const idM = /\/jobs\/(\d+)\//i.exec(href);
+      if (idM?.[1] && !cardsByJobId.has(idM[1])) {
+        cardsByJobId.set(idM[1], card);
+        break;
+      }
     }
   }
 
-  const anchorOpens = findAllOpenTagsLinear(
-    clean,
-    'a',
-    (a) => {
-      const href = getAttrValueLinear(a, 'href') ?? '';
-      return /\/jobs\/\d+\//i.test(href);
-    },
-    200,
-  );
-
   const byId = new Map<string, IcimsParsedCard>();
-  for (const ao of anchorOpens) {
-    const rawHref = unescapeHrefUrl(getAttrValueLinear(ao.attrStr, 'href') ?? '');
+  for (const ao of doc.select('a.iCIMS_Anchor, a[href*="/jobs/"]', 200)) {
+    const rawHref = unescapeHrefUrl(ao.attr('href') ?? '');
     const idMatch = /\/jobs\/(\d+)\//i.exec(rawHref);
     if (!idMatch?.[1]) continue;
     const jobId = idMatch[1];
     if (byId.has(jobId)) continue;
 
-    const closeIdx = clean.toLowerCase().indexOf('</a>', ao.openEnd);
-    const anchorInner = closeIdx !== -1 ? clean.slice(ao.openEnd, closeIdx) : '';
-    const h3Inner = findElementInnerLinear(anchorInner, 'h3');
-    const rawTitleAttr = (getAttrValueLinear(ao.attrStr, 'title') ?? '').replace(/^\d+\s*-\s*/, '').trim();
+    const rawTitleAttr = (ao.attr('title') ?? '').replace(/^\d+\s*-\s*/, '').trim();
     const linkTitle =
-      stripTagsInline(h3Inner ?? anchorInner)
-        .replace(/^(?:Job\s+Title|Title)\s+/i, '')
+      (ao.text('h3') || ao.text())
+        .replace(/^(?:Job\s+Title|Title)\s*/i, '')
         .trim() || rawTitleAttr;
     if (!linkTitle) continue;
 
@@ -210,8 +164,8 @@ function formatIcimsHtml(
     }
     if (!resolvedUrl) continue;
 
-    const cardHtml = cardSlicesByJobId.get(jobId) ?? '';
-    const meta = cardHtml ? parseIcimsCardDetails(cardHtml) : { location: '', pay: '', postedAt: '' };
+    const cardNode = cardsByJobId.get(jobId);
+    const meta = cardNode ? parseIcimsCardDetails(cardNode) : { location: '', pay: '', postedAt: '' };
     byId.set(jobId, { id: jobId, title: linkTitle, url: resolvedUrl, ...meta });
   }
 
@@ -219,7 +173,7 @@ function formatIcimsHtml(
   if (jobs.length === 0) {
     // Never emit a confident false zero (`total: 0`) on an outer iframe shell or unsubmitted search form!
     // Only report `0` when iCIMS explicitly renders its zero-results message inside the search frame.
-    const plainBody = stripTagsInline(clean);
+    const plainBody = doc.text();
     const explicitZero =
       /\b(?:no\s+results\s+found|sorry,\s+no\s+jobs|currently\s+no\s+open\s+positions|there\s+are\s+currently\s+no\s+open|0\s+results\s+available)\b/i.test(
         plainBody,
@@ -239,16 +193,14 @@ function formatIcimsHtml(
     };
   }
 
-  const plainHeader = stripTagsInline(clean.slice(0, 80_000));
+  const plainHeader = doc.text().slice(0, 80_000);
   const pageMatch = /\bPage\s+(\d+)\s+of\s+(\d+)\b/i.exec(plainHeader);
   const curPage = pageMatch?.[1] ? Math.max(1, parseInt(pageMatch[1], 10) || 1) : 1;
   const totalPages = pageMatch?.[2] ? Math.max(1, parseInt(pageMatch[2], 10) || 1) : 1;
-  const hasNextRel = clean.includes('rel="next"') || clean.includes("rel='next'");
+  const hasNextRel = doc.first('[rel="next"]') !== null;
   const hasMorePages = curPage < totalPages || (totalPages === 1 && hasNextRel);
 
-  const portalHeading = stripTagsInline(
-    findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'iCIMS_Header')) ?? '',
-  );
+  const portalHeading = doc.text('h1.iCIMS_Header');
   const companyLabel = portalHeading ? portalHeading.replace(/\s*Career\s+Listings\s*$/i, '').trim() || hostSlug : hostSlug;
 
   const links = jobs.map((j) => j.url);

@@ -95,7 +95,7 @@ import {
   type OtlpSpanInput,
 } from './otel';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
-import { readBodyTextCapped } from './safe-input';
+import { readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 import {
   executeIngestPipeline,
   IngestWorkflow,
@@ -1022,7 +1022,7 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.1');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.2');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1097,14 +1097,20 @@ export default {
 
       const makeCatalogHubFetch =
         (sourceLabel: string): CatalogHubFetchFn =>
-        async ({ url: pageUrl, kind = 'json', accept = 'application/json', target: rawTgt, site: rawSite }) => {
+        async ({ url: pageUrl, kind = 'json', accept = 'application/json', maxBytes, target: rawTgt, site: rawSite }) => {
           const tgt: FetchTarget = rawTgt === 'agent' || rawTgt === 'container' ? rawTgt : 'auto';
           const siteStr = typeof rawSite === 'string' && rawSite.trim() ? rawSite.trim() : undefined;
+          const boundedMaxBytes =
+            typeof maxBytes === 'number' && Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : undefined;
           const hubOut = await executeHubFetch(
             tgt,
             JSON.stringify({
               maxSeconds: 30,
-              options: { includeBody: true, respectRobots: true },
+              options: {
+                includeBody: true,
+                respectRobots: true,
+                ...(boundedMaxBytes !== undefined ? { maxBytes: boundedMaxBytes } : {}),
+              },
               requests: [{ id: 'cat-1', url: pageUrl, kind, accept }],
             }),
             siteStr,
@@ -1149,7 +1155,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.6.1',
+          serverVersion: '2.6.2',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1293,6 +1299,8 @@ export default {
               payload: args as CatalogCallPayload,
               env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
               executeHubFetch: makeCatalogHubFetch(`mcp-catalog:${principal ?? 'client'}`),
+              selfHost: url.hostname,
+              principal: principal ?? 'mcp',
               ...(ctx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } } : {}),
             });
           },
@@ -1396,7 +1404,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.6.1'), {
+        return Response.json(buildCapabilities(env, '2.6.2'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -1924,7 +1932,11 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        const batchId = decodeURIComponent(batchRouteMatch[1] ?? '').trim();
+        const rawBatchId = safeDecodeURIComponent(batchRouteMatch[1] ?? '');
+        if (rawBatchId === null) {
+          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+        }
+        const batchId = rawBatchId.trim();
         if (request.method === 'GET') {
           const job = getBatchScrapeStatus(batchId);
           if (!job) return Response.json({ ok: false, error: 'batch_not_found' }, { status: 404 });
@@ -1996,7 +2008,11 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        const agentId = decodeURIComponent(agentTraceMatch[1] ?? '').trim();
+        const rawAgentId = safeDecodeURIComponent(agentTraceMatch[1] ?? '');
+        if (rawAgentId === null) {
+          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+        }
+        const agentId = rawAgentId.trim();
         const rec = await loadAgentRun(agentId, env.META);
         if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
         return Response.json(
@@ -2029,7 +2045,11 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        const agentId = decodeURIComponent(agentRouteMatch[1] ?? '').trim();
+        const rawAgentId = safeDecodeURIComponent(agentRouteMatch[1] ?? '');
+        if (rawAgentId === null) {
+          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+        }
+        const agentId = rawAgentId.trim();
         if (request.method === 'GET') {
           const rec = await loadAgentRun(agentId, env.META);
           if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
@@ -2121,7 +2141,11 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        const crawlId = decodeURIComponent(crawlRouteMatch[1] ?? '').trim();
+        const rawCrawlId = safeDecodeURIComponent(crawlRouteMatch[1] ?? '');
+        if (rawCrawlId === null) {
+          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+        }
+        const crawlId = rawCrawlId.trim();
         if (request.method === 'GET') {
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
             return Response.json({ error: 'insufficient_scope' }, { status: 403 });
@@ -2165,7 +2189,11 @@ export default {
         if (!env.SEARCH) {
           return Response.json({ error: 'search_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
         }
-        const collectionId = decodeURIComponent(collectionSearchMatch[1] ?? '').trim();
+        const rawCollectionId = safeDecodeURIComponent(collectionSearchMatch[1] ?? '');
+        if (rawCollectionId === null) {
+          return Response.json({ error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+        }
+        const collectionId = rawCollectionId.trim();
         if (!COLLECTION_ID_RE.test(collectionId)) {
           return Response.json({ error: 'invalid_collection_id' }, { status: 400, headers: { 'cache-control': 'no-store' } });
         }
@@ -2291,6 +2319,8 @@ export default {
           payload,
           env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
           executeHubFetch: makeCatalogHubFetch(`catalog:${auth.principal}`),
+          selfHost: url.hostname,
+          principal: auth.principal,
           ...(ctx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } } : {}),
         });
         return Response.json(out.body, {
@@ -2316,7 +2346,11 @@ export default {
         if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
-        const catalogId = decodeURIComponent(catalogRecordsMatch[1] ?? '').trim();
+        const rawCatalogId = safeDecodeURIComponent(catalogRecordsMatch[1] ?? '');
+        if (rawCatalogId === null) {
+          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+        }
+        const catalogId = rawCatalogId.trim();
         const vendors = url.searchParams.getAll('vendor').filter(Boolean);
         const productTypes = url.searchParams.getAll('productType').filter(Boolean);
         const rawOffset = url.searchParams.get('offset');
@@ -2360,7 +2394,11 @@ export default {
         if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
           return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
         }
-        const catalogId = decodeURIComponent(catalogStatusMatch[1] ?? '').trim();
+        const rawCatalogId = safeDecodeURIComponent(catalogStatusMatch[1] ?? '');
+        if (rawCatalogId === null) {
+          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+        }
+        const catalogId = rawCatalogId.trim();
         const out = await getCatalogStatus({
           catalogId,
           env: env as unknown as OptionalStorageBindings & Record<string, unknown>,

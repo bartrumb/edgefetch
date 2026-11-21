@@ -1,0 +1,89 @@
+# Shared Go + TypeScript Declarative Site Adapter: USAspending.gov Federal Awards
+id: usaspending
+name: USAspending.gov Federal Awards
+category: public-records
+description: Upgrades usaspending.gov/award/<id> pages to api.usaspending.gov/api/v2/awards/<id>/ JSON details.
+domains:
+  - www.usaspending.gov
+  - usaspending.gov
+exampleUrls:
+  - https://www.usaspending.gov/award/CONT_AWD_NNK17MA01B_8000_-NONE-_-NONE-
+
+match:
+  exactSegments: false
+  pathSegments:
+    - award
+    - param: awardId
+      charset: pkg
+      minLen: 4
+      maxLen: 140
+
+twin:
+  fetchUrl: https://api.usaspending.gov/api/v2/awards/{awardId}/
+  kind: json
+  accept: application/json
+
+extract:
+  requireAnyFields:
+    - generated_unique_award_id
+    - piid
+    - fain
+  vars:
+    idLabel:
+      paths: [piid, fain, uri]
+      fallbackTemplate: "{awardId}"
+    category:
+      paths: [category]
+      default: Federal Award
+    recipient:
+      paths: [recipient.recipient_name]
+    awardingAgency:
+      paths: [awarding_agency.toptier_agency.name]
+    fundingAgency:
+      paths: [funding_agency.toptier_agency.name]
+    obligation:
+      paths: [total_obligation]
+      format: usd_compact
+    desc:
+      paths: [description]
+      trim: true
+    descShort:
+      paths: [description]
+      trim: true
+      sliceMax: 260
+    startDate:
+      paths: [period_of_performance.start_date]
+    hasPop:
+      paths: [period_of_performance.start_date, period_of_performance.end_date]
+    startOrQ:
+      paths: [period_of_performance.start_date]
+      default: "?"
+    endOrQ:
+      paths: [period_of_performance.end_date]
+      default: "?"
+  titleTemplate: "{idLabel} — {recipient} (USAspending)"
+  titleWhenVar: recipient
+  titleFallbackTemplate: "{idLabel} (USAspending)"
+  descriptionVar: descShort
+  publishedTimeVar: startDate
+  bullets:
+    - label: Award ID
+      template: "`{idLabel}` ({category})"
+    - label: Recipient
+      template: "{recipient}"
+      whenVar: recipient
+    - label: Total Obligation
+      template: "{obligation}"
+      whenVar: obligation
+    - label: Awarding Agency
+      template: "{awardingAgency}"
+      whenVar: awardingAgency
+    - label: Funding Agency
+      template: "{fundingAgency}"
+      whenVar: fundingAgency
+    - label: Period of Performance
+      template: "{startOrQ} → {endOrQ}"
+      whenVar: hasPop
+  sections:
+    - heading: Award Description
+      textVar: desc

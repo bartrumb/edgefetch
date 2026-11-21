@@ -9,9 +9,12 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import type { IncomingMessage } from 'node:http';
+import { Socket } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Duplex } from 'node:stream';
+import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import {
   ACTIVITY_SQLITE_SCHEMA,
   createSqliteActivityStore,
@@ -276,84 +279,218 @@ export class NodeFsR2Bucket {
   }
 }
 
-// ── 3. RFC 6455 Raw TCP WebSocket Wrapper + In-Process `AgentHubDO` Coordinator ───────────────────────────────────
+// ── 3. `ws` RFC 6455 WebSocket Wrapper + In-Process `AgentHubDO` Coordinator ───────────────────────────────────────
 
-const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const MAX_WS_MESSAGE_BYTES = 1_048_576; // 1 MiB max frame & reassembled message size
+const MAX_WS_MESSAGE_BYTES = 1_048_576; // 1 MiB max frame & reassembled message size (`maxPayload: 1_048_576`)
 const MAX_WS_PENDING_OUTBOUND_BYTES = 65_536; // 64 KiB cap on pending outbound `pong` / write queue (`Low`)
-const UTF8_FATAL_DECODER = new TextDecoder('utf-8', { fatal: true });
+
+const STANDALONE_WSS = new WebSocketServer({
+  noServer: true,
+  maxPayload: MAX_WS_MESSAGE_BYTES,
+  perMessageDeflate: false,
+});
+
+function extractWsErrorStatusCode(err: unknown): number {
+  if (err && typeof err === 'object') {
+    for (const sym of Object.getOwnPropertySymbols(err)) {
+      if (sym.description === 'status-code') {
+        const val = (err as Record<symbol, unknown>)[sym];
+        if (typeof val === 'number' && val >= 1000 && val <= 4999) return val;
+      }
+    }
+    const code = (err as { code?: string }).code;
+    if (code === 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH' || code === 'WS_ERR_UNSUPPORTED_DATA_PAYLOAD_LENGTH') {
+      return 1009;
+    }
+    if (code === 'WS_ERR_INVALID_UTF8') return 1007;
+    if (code === 'WS_ERR_TOO_MANY_BUFFERED_PARTS') return 1008;
+    if (typeof code === 'string' && code.startsWith('WS_ERR_')) return 1002;
+  }
+  return 1011;
+}
+
+function rawDataToUtf8(data: RawData): string {
+  if (Buffer.isBuffer(data)) return data.toString('utf8');
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf8');
+  return Buffer.from(data).toString('utf8');
+}
 
 export class RawServerWebSocket implements HubSocketLike {
+  private readonly ws: WebSocket;
+  private readonly rawSocket: Duplex | null;
   private attachment: unknown = null;
   private closed = false;
-  private rxChunks: Buffer[] = [];
-  private rxBytes = 0;
-  private fragChunks: Buffer[] = [];
-  private fragBytes = 0;
-  private inFragmentedText = false;
 
   constructor(
-    private readonly socket: Duplex,
+    socketOrWs: Duplex | WebSocket,
     public readonly tags: string[],
     private readonly onText: (ws: RawServerWebSocket, msg: string) => void,
     private readonly onClosed: (ws: RawServerWebSocket, code: number, reason: string) => void,
   ) {
-    socket.on('data', (chunk: Buffer) => this.handleChunk(chunk));
-    socket.on('close', () => {
+    if (socketOrWs instanceof WebSocket) {
+      this.ws = socketOrWs;
+      this.rawSocket = (socketOrWs as unknown as { _socket?: Duplex })._socket ?? null;
+      this.bindListeners();
+    } else {
+      const ServerWsCtor = STANDALONE_WSS.options.WebSocket ?? WebSocket;
+      const wsInstance = new ServerWsCtor(null, undefined as unknown as string[], STANDALONE_WSS.options as never);
+      this.ws = wsInstance;
+      this.rawSocket = socketOrWs;
+      this.bindListeners();
+      (
+        wsInstance as unknown as {
+          setSocket(
+            s: Duplex,
+            head: Buffer,
+            opts: {
+              allowSynchronousEvents: boolean;
+              maxBufferedChunks: number;
+              maxFragments: number;
+              maxPayload: number;
+              skipUTF8Validation: boolean;
+            },
+          ): void;
+        }
+      ).setSocket(socketOrWs, Buffer.alloc(0), {
+        allowSynchronousEvents: true,
+        maxBufferedChunks: STANDALONE_WSS.options.maxBufferedChunks ?? 262_144,
+        maxFragments: STANDALONE_WSS.options.maxFragments ?? 16_384,
+        maxPayload: MAX_WS_MESSAGE_BYTES,
+        skipUTF8Validation: false,
+      });
+    }
+
+    if (this.rawSocket) {
+      this.rawSocket.on('data', () => {
+        if (this.closed) return;
+        const rxErr = (this.ws as unknown as { _receiver?: { _writableState?: { errored?: Error | null } } })._receiver
+          ?._writableState?.errored;
+        if (rxErr) {
+          this.finishClose(
+            extractWsErrorStatusCode(rxErr),
+            (rxErr as NodeJS.ErrnoException).code ?? 'ws_protocol_error',
+            true,
+            false,
+          );
+        }
+      });
+      this.rawSocket.on('close', () => {
+        if (!this.closed) {
+          this.finishClose(1006, 'tcp_closed', false, false);
+        }
+      });
+      this.rawSocket.on('error', () => {
+        if (!this.closed) {
+          this.finishClose(1011, 'socket_error', true, true);
+        }
+      });
+    }
+  }
+
+  private bindListeners(): void {
+    this.ws.on('error', (err) => {
       if (!this.closed) {
-        this.closed = true;
-        this.rxChunks = [];
-        this.rxBytes = 0;
-        this.fragChunks = [];
-        this.fragBytes = 0;
-        this.onClosed(this, 1006, 'tcp_closed');
+        this.finishClose(
+          extractWsErrorStatusCode(err),
+          (err as NodeJS.ErrnoException).code ?? 'ws_error',
+          true,
+          false,
+        );
       }
     });
-    socket.on('error', () => {
-      if (!this.closed) {
-        this.closed = true;
-        this.rxChunks = [];
-        this.rxBytes = 0;
-        this.fragChunks = [];
-        this.fragBytes = 0;
-        this.onClosed(this, 1011, 'socket_error');
+
+    this.ws.on('message', (data: RawData, isBinary: boolean) => {
+      if (this.closed) return;
+      if (isBinary) {
+        this.close(1003, 'binary_frames_unsupported');
+        return;
+      }
+      const text = rawDataToUtf8(data);
+      if (text === 'ping') {
+        if (this.ws.bufferedAmount > MAX_WS_PENDING_OUTBOUND_BYTES) {
+          this.close(1008, 'pong_queue_exceeded');
+          return;
+        }
+        this.send('pong');
+      } else {
+        this.onText(this, text);
       }
     });
+
+    this.ws.on('close', (code: number, reason: Buffer) => {
+      if (!this.closed) {
+        this.finishClose(code || 1006, reason?.length ? reason.toString('utf8') : '', false, false);
+      }
+    });
+  }
+
+  get readyState(): number {
+    return this.closed ? WebSocket.CLOSED : this.ws.readyState;
   }
 
   send(data: string): void {
-    if (this.closed) throw new Error('websocket_closed');
-    if (this.socket.writableLength > MAX_WS_MESSAGE_BYTES) {
+    if (this.closed || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('websocket_closed');
+    }
+    if (this.ws.bufferedAmount > MAX_WS_MESSAGE_BYTES) {
       this.close(1008, 'outbound_backpressure');
       return;
     }
-    const payload = Buffer.from(data, 'utf8');
-    this.writeFrame(0x1, payload);
+    this.ws.send(data);
   }
 
   close(code = 1000, reason = ''): void {
+    this.finishClose(code, reason, true, code === 1001);
+  }
+
+  terminate(): void {
+    this.finishClose(1001, 'shutdown', true, true);
+  }
+
+  private finishClose(code: number, reason: string, sendCloseFrame: boolean, forceImmediateTcpDestroy: boolean): void {
     if (this.closed) return;
     this.closed = true;
-    this.rxChunks = [];
-    this.rxBytes = 0;
-    this.fragChunks = [];
-    this.fragBytes = 0;
-    const reasonBuf = Buffer.from(reason.slice(0, 100), 'utf8');
-    const body = Buffer.alloc(2 + reasonBuf.length);
-    body.writeUInt16BE(code, 0);
-    reasonBuf.copy(body, 2);
-    try {
-      this.writeFrame(0x8, body);
-    } catch {
-      // best-effort close frame
+    const cleanReason = reason.slice(0, 100);
+    if (sendCloseFrame) {
+      try {
+        if (this.ws.readyState === WebSocket.OPEN) {
+          this.ws.close(code, cleanReason);
+        }
+      } catch {
+        // best-effort close frame
+      }
+      const closeTimer = (this.ws as unknown as { _closeTimer?: ReturnType<typeof setTimeout> | null })._closeTimer;
+      if (closeTimer) clearTimeout(closeTimer);
+
+      if (this.rawSocket instanceof Socket && !forceImmediateTcpDestroy) {
+        // Flush queued RFC 6455 close frame (`1009`, `1002`, `1000`) cleanly before tearing down TCP socket.
+        try {
+          this.rawSocket.end();
+        } catch {
+          // ignore
+        }
+        const destroyTimer = setTimeout(() => {
+          try {
+            this.rawSocket?.destroy();
+          } catch {
+            // ignore
+          }
+        }, 50);
+        destroyTimer.unref?.();
+      } else {
+        try {
+          this.ws.terminate();
+        } catch {
+          // ignore
+        }
+        try {
+          this.rawSocket?.destroy();
+        } catch {
+          // ignore
+        }
+      }
     }
-    try {
-      this.socket.end();
-    } catch {
-      // ignore
-    }
-    this.socket.destroy();
-    this.onClosed(this, code, reason);
+    this.onClosed(this, code, cleanReason);
   }
 
   serializeAttachment(value: unknown): void {
@@ -363,220 +500,16 @@ export class RawServerWebSocket implements HubSocketLike {
   deserializeAttachment(): unknown {
     return this.attachment ? structuredClone(this.attachment) : null;
   }
-
-  private writeFrame(opcode: number, payload: Buffer): void {
-    const len = payload.length;
-    let header: Buffer;
-    if (len < 126) {
-      header = Buffer.from([0x80 | opcode, len]);
-    } else if (len < 65536) {
-      header = Buffer.alloc(4);
-      header[0] = 0x80 | opcode;
-      header[1] = 126;
-      header.writeUInt16BE(len, 2);
-    } else {
-      header = Buffer.alloc(10);
-      header[0] = 0x80 | opcode;
-      header[1] = 127;
-      header.writeBigUInt64BE(BigInt(len), 2);
-    }
-    this.socket.write(Buffer.concat([header, payload]));
-  }
-
-  private ensureCoalescedPrefix(minBytes: number): Buffer {
-    if (this.rxChunks.length === 0) return Buffer.alloc(0);
-    if (this.rxChunks[0]!.length >= minBytes) return this.rxChunks[0]!;
-    if (this.rxChunks.length > 1) {
-      const merged = Buffer.concat(this.rxChunks, this.rxBytes);
-      this.rxChunks = [merged];
-      return merged;
-    }
-    return this.rxChunks[0]!;
-  }
-
-  private consumeRxBytes(count: number): Buffer {
-    const head = this.ensureCoalescedPrefix(count);
-    const slice = head.subarray(0, count);
-    const rest = head.subarray(count);
-    this.rxBytes -= count;
-    this.rxChunks = rest.length > 0 ? [rest] : [];
-    return slice;
-  }
-
-  private deliverCompleteText(rawBytes: Buffer): void {
-    let text: string;
-    try {
-      text = UTF8_FATAL_DECODER.decode(rawBytes);
-    } catch {
-      this.close(1007, 'invalid_utf8');
-      return;
-    }
-    if (text === 'ping') {
-      if (this.socket.writableLength > MAX_WS_PENDING_OUTBOUND_BYTES) {
-        this.close(1008, 'pong_queue_exceeded');
-        return;
-      }
-      this.send('pong');
-    } else {
-      this.onText(this, text);
-    }
-  }
-
-  private handleChunk(chunk: Buffer): void {
-    if (this.closed) {
-      this.socket.destroy();
-      return;
-    }
-    if (chunk.length === 0) return;
-    this.rxChunks.push(chunk);
-    this.rxBytes += chunk.length;
-
-    while (this.rxBytes >= 2 && !this.closed) {
-      // Peek header bytes without O(N^2) coalescing of trailing drip chunks!
-      let hdr = this.rxChunks[0]!;
-      if (hdr.length < Math.min(this.rxBytes, 14)) {
-        const take = Math.min(this.rxBytes, 14);
-        let gathered = Buffer.allocUnsafe(take);
-        let copied = 0;
-        for (const c of this.rxChunks) {
-          const n = Math.min(c.length, take - copied);
-          c.copy(gathered, copied, 0, n);
-          copied += n;
-          if (copied >= take) break;
-        }
-        hdr = gathered;
-      }
-
-      const b0 = hdr[0]!;
-      const b1 = hdr[1]!;
-      const fin = (b0 & 0x80) !== 0;
-      const rsv = b0 & 0x70;
-      const opcode = b0 & 0x0f;
-      const masked = (b1 & 0x80) !== 0;
-      const len7 = b1 & 0x7f;
-
-      // RFC 6455 §5.2: Reject any non-zero RSV1-3 bits when no extension was negotiated
-      if (rsv !== 0) {
-        this.close(1002, 'rsv_bits_not_allowed');
-        return;
-      }
-      // RFC 6455 §5.1: Client-to-server frames MUST have MASK bit set (`(b1 & 0x80) !== 0`); immediately close/destroy with 1002 if unset!
-      if ((b1 & 0x80) === 0 || !masked) {
-        this.close(1002, 'unmasked_client_frame');
-        return;
-      }
-      // RFC 6455 §5.5: Control frames (`>= 0x8`) MUST NOT be fragmented (`FIN=0`) and MUST have payload <= 125 bytes!
-      if (opcode >= 0x8) {
-        if (opcode !== 0x8 && opcode !== 0x9 && opcode !== 0x0a) {
-          this.close(1002, 'invalid_control_opcode');
-          return;
-        }
-        if (!fin || len7 > 125) {
-          this.close(1002, 'invalid_control_frame');
-          return;
-        }
-      } else if (opcode === 0x2) {
-        this.close(1003, 'binary_frames_unsupported');
-        return;
-      } else if (opcode !== 0x0 && opcode !== 0x1) {
-        this.close(1002, 'reserved_data_opcode');
-        return;
-      }
-
-      let payloadLen = len7;
-      let offset = 2;
-
-      if (len7 === 126) {
-        if (this.rxBytes < 4) return;
-        payloadLen = hdr.readUInt16BE(2);
-        offset = 4;
-      } else if (len7 === 127) {
-        if (this.rxBytes < 10) return;
-        const bigLen = hdr.readBigUInt64BE(2);
-        if (bigLen > BigInt(MAX_WS_MESSAGE_BYTES)) {
-          this.close(1009, 'message_too_big');
-          return;
-        }
-        payloadLen = Number(bigLen);
-        offset = 10;
-      }
-      if (payloadLen > MAX_WS_MESSAGE_BYTES || (opcode < 0x8 && this.fragBytes + payloadLen > MAX_WS_MESSAGE_BYTES)) {
-        this.close(1009, 'message_too_big');
-        return;
-      }
-
-      const frameTotalBytes = offset + 4 + payloadLen;
-      if (this.rxBytes < frameTotalBytes) {
-        // Wait for remaining frame bytes in O(1) without copying `rxChunks`!
-        return;
-      }
-
-      const rawFrame = this.consumeRxBytes(frameTotalBytes);
-      const mask = rawFrame.subarray(offset, offset + 4);
-      const payload = Buffer.from(rawFrame.subarray(offset + 4, frameTotalBytes));
-      for (let i = 0; i < payload.length; i++) {
-        payload[i]! ^= mask[i & 3]!;
-      }
-
-      if (opcode === 0x8) {
-        if (payload.length === 1) {
-          this.close(1002, 'invalid_close_payload');
-          return;
-        }
-        this.close(1000, 'peer_close');
-        return;
-      }
-      if (opcode === 0x9) {
-        if (this.socket.writableLength > MAX_WS_PENDING_OUTBOUND_BYTES) {
-          this.close(1008, 'pong_queue_exceeded');
-          return;
-        }
-        this.writeFrame(0x0a, payload);
-        continue;
-      }
-      if (opcode === 0x0a) {
-        // Unsolicited/expected Pong -> ignore
-        continue;
-      }
-
-      // Data frames (`0x1` text or `0x0` continuation)
-      if (opcode === 0x1) {
-        if (this.inFragmentedText) {
-          this.close(1002, 'interleaved_data_frame');
-          return;
-        }
-        if (fin) {
-          this.deliverCompleteText(payload);
-        } else {
-          this.inFragmentedText = true;
-          this.fragChunks = [payload];
-          this.fragBytes = payload.length;
-        }
-      } else if (opcode === 0x0) {
-        if (!this.inFragmentedText) {
-          this.close(1002, 'unexpected_continuation_frame');
-          return;
-        }
-        this.fragChunks.push(payload);
-        this.fragBytes += payload.length;
-        if (this.fragBytes > MAX_WS_MESSAGE_BYTES) {
-          this.close(1009, 'message_too_big');
-          return;
-        }
-        if (fin) {
-          const full = Buffer.concat(this.fragChunks, this.fragBytes);
-          this.inFragmentedText = false;
-          this.fragChunks = [];
-          this.fragBytes = 0;
-          this.deliverCompleteText(full);
-        }
-      }
-    }
-  }
 }
 
 export class LocalAgentHubCoordinator {
   private readonly db: DatabaseSync;
+  private readonly wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: MAX_WS_MESSAGE_BYTES,
+    perMessageDeflate: false,
+    handleProtocols: (protocols) => (protocols.has('edgefetch-agent') ? 'edgefetch-agent' : false),
+  });
   private readonly sockets = new Set<RawServerWebSocket>();
   private readonly lastHelloLogBySite = new Map<string, number>();
   private readonly lastConnectLogByKey = new Map<string, number>();
@@ -797,11 +730,9 @@ export class LocalAgentHubCoordinator {
     this.activity = createSqliteActivityStore(sqlLike);
   }
 
-  /** Accepts an RFC 6455 HTTP `Upgrade: websocket` socket from `node:http` `server.on('upgrade')`. */
-  acceptNodeUpgrade(params: {
-    wsKey: string;
-    socket: Duplex;
-    head: Buffer;
+  /** Registers an already-upgraded `ws` `WebSocket` client with `AgentHubEngine`. */
+  acceptWebSocket(params: {
+    ws: WebSocket;
     siteId: string;
     arch: string | null;
     version: string | null;
@@ -809,21 +740,9 @@ export class LocalAgentHubCoordinator {
     browserSandbox?: string | null;
     capabilities: string | null;
     publicIp: string | null;
-    subprotocol?: string | null;
   }): void {
-    const acceptKey = createHash('sha1').update(params.wsKey.trim() + WS_GUID).digest('base64');
-    const respHeaders = [
-      'HTTP/1.1 101 Switching Protocols',
-      'Upgrade: websocket',
-      'Connection: Upgrade',
-      `Sec-WebSocket-Accept: ${acceptKey}`,
-      ...(params.subprotocol ? [`Sec-WebSocket-Protocol: ${params.subprotocol}`] : []),
-      '\r\n',
-    ];
-    params.socket.write(respHeaders.join('\r\n'));
-
-    const ws = new RawServerWebSocket(
-      params.socket,
+    const wrapped = new RawServerWebSocket(
+      params.ws,
       [`site:${params.siteId}`],
       (sock, text) => {
         if (text.length > 2048) return;
@@ -875,20 +794,17 @@ export class LocalAgentHubCoordinator {
       },
     );
 
-    this.sockets.add(ws);
-    if (params.head.length > 0) {
-      params.socket.emit('data', params.head);
-    }
-    const att = this.engine.registerAgent(ws, params.siteId, params.arch, {
+    this.sockets.add(wrapped);
+    const att = this.engine.registerAgent(wrapped, params.siteId, params.arch, {
       version: params.version,
       browserVersion: params.browserVersion,
       browserSandbox: params.browserSandbox,
       publicIp: params.publicIp,
       capabilities: params.capabilities,
     });
-    if (!this.sockets.has(ws)) return;
+    if (!this.sockets.has(wrapped)) return;
     try {
-      ws.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
+      wrapped.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
     } catch {
       return;
     }
@@ -910,6 +826,50 @@ export class LocalAgentHubCoordinator {
         details: sanitizeDetails({ siteId: att.siteId, arch: att.arch, version: att.version ?? null }),
       });
     }
+  }
+
+  /** Accepts an RFC 6455 HTTP `Upgrade: websocket` socket via `ws` `WebSocketServer.handleUpgrade`. */
+  acceptNodeUpgrade(params: {
+    req?: IncomingMessage;
+    wsKey: string;
+    socket: Duplex;
+    head: Buffer;
+    siteId: string;
+    arch: string | null;
+    version: string | null;
+    browserVersion?: string | null;
+    browserSandbox?: string | null;
+    capabilities: string | null;
+    publicIp: string | null;
+    subprotocol?: string | null;
+  }): void {
+    const upgradeReq =
+      params.req ??
+      ({
+        method: 'GET',
+        url: '/agent/ws',
+        headers: {
+          upgrade: 'websocket',
+          connection: 'Upgrade',
+          'sec-websocket-version': '13',
+          'sec-websocket-key': params.wsKey.trim(),
+          ...(params.subprotocol ? { 'sec-websocket-protocol': params.subprotocol } : {}),
+        },
+        socket: params.socket,
+      } as unknown as IncomingMessage);
+
+    this.wss.handleUpgrade(upgradeReq, params.socket, params.head, (wsClient) => {
+      this.acceptWebSocket({
+        ws: wsClient,
+        siteId: params.siteId,
+        arch: params.arch,
+        version: params.version,
+        browserVersion: params.browserVersion,
+        browserSandbox: params.browserSandbox,
+        capabilities: params.capabilities,
+        publicIp: params.publicIp,
+      });
+    });
   }
 
   /** Returns a `DurableObjectNamespace<AgentHubDO>`-compatible stub object for `hub/src/index.ts`. */
@@ -973,6 +933,11 @@ export class LocalAgentHubCoordinator {
       } catch {
         // ignore
       }
+    }
+    try {
+      this.wss.close();
+    } catch {
+      // ignore
     }
     try {
       this.db.close();

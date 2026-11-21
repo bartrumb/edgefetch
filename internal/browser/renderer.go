@@ -2,6 +2,7 @@ package browser
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +27,7 @@ import (
 
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
+	"github.com/coder/websocket"
 )
 
 // ErrChallengeDetected is returned when a rendered DOM contains a CAPTCHA or anti-bot challenge;
@@ -108,21 +111,23 @@ type fetchHeaderEntry struct {
 }
 
 type retainedSession struct {
-	mu               sync.Mutex
-	id               string
-	browserContextID string
-	targetID         string
-	cdpSessionID     string
-	initialOrigin    string
-	lastCheckedURL   string
-	hasExtraHeaders  bool
-	extraHeaders     map[string]string
-	fetchEnabled     bool
-	stopFetchOnce    sync.Once
-	stopFetchCh      chan struct{}
-	lastUsed         time.Time
-	lastStatus       int
-	lastHeaders      http.Header
+	mu                    sync.Mutex
+	id                    string
+	browserContextID      string
+	targetID              string
+	cdpSessionID          string
+	mainFrameID           string
+	initialOrigin         string
+	redirectedCrossOrigin bool
+	lastCheckedURL        string
+	hasExtraHeaders       bool
+	extraHeaders          map[string]string
+	fetchEnabled          bool
+	stopFetchOnce         sync.Once
+	stopFetchCh           chan struct{}
+	lastUsed              time.Time
+	lastStatus            int
+	lastHeaders           http.Header
 }
 
 func canonicalURLOrigin(rawURL string) string {
@@ -266,10 +271,52 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 	return nil
 }
 
+func isSameOriginInitiatorHeaders(hdrs map[string]any, initOrigin string) bool {
+	if len(hdrs) == 0 {
+		return true
+	}
+	var originHdr, refererHdr, secFetchSite string
+	for k, rawV := range hdrs {
+		if rawV == nil {
+			continue
+		}
+		val := strings.TrimSpace(fmt.Sprint(rawV))
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "origin":
+			originHdr = val
+		case "referer":
+			refererHdr = val
+		case "sec-fetch-site":
+			secFetchSite = strings.ToLower(val)
+		}
+	}
+	hasProvenSameOrigin := false
+	if originHdr != "" {
+		if strings.EqualFold(originHdr, "null") || canonicalURLOrigin(originHdr) != initOrigin {
+			return false
+		}
+		hasProvenSameOrigin = true
+	}
+	if refererHdr != "" {
+		if canonicalURLOrigin(refererHdr) != initOrigin {
+			return false
+		}
+		hasProvenSameOrigin = true
+	}
+	if secFetchSite != "" && secFetchSite != "same-origin" && secFetchSite != "none" {
+		return hasProvenSameOrigin
+	}
+	return true
+}
+
 func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMessage) {
 	var paused struct {
-		RequestID string `json:"requestId"`
-		Request   struct {
+		RequestID           string `json:"requestId"`
+		FrameID             string `json:"frameId"`
+		ResourceType        string `json:"resourceType"`
+		RedirectStatusCode  int    `json:"redirectStatusCode"`
+		RedirectedRequestID string `json:"redirectedRequestId"`
+		Request             struct {
 			URL     string         `json:"url"`
 			Headers map[string]any `json:"headers"`
 		} `json:"request"`
@@ -278,21 +325,41 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 		return
 	}
 
+	reqOrigin := ""
+	if paused.Request.URL != "" {
+		reqOrigin = canonicalURLOrigin(paused.Request.URL)
+	}
+
 	s.mu.Lock()
 	cdpSID := s.cdpSessionID
 	initOrigin := s.initialOrigin
 	extra := s.extraHeaders
+	isMainDoc := strings.EqualFold(paused.ResourceType, "Document") &&
+		(s.mainFrameID == "" || paused.FrameID == "" || paused.FrameID == s.mainFrameID)
+	if isMainDoc {
+		if s.mainFrameID == "" && paused.FrameID != "" {
+			s.mainFrameID = paused.FrameID
+		}
+		if initOrigin != "" {
+			if reqOrigin != initOrigin {
+				// Top-level document navigated or 30x-redirected away from initialOrigin:
+				// mark session cross-origin so subsequent subrequests back to initialOrigin never carry extraHeaders!
+				s.redirectedCrossOrigin = true
+			} else if paused.RedirectedRequestID == "" && paused.RedirectStatusCode == 0 {
+				s.redirectedCrossOrigin = false
+			}
+		}
+	}
+	crossTainted := s.redirectedCrossOrigin
 	s.mu.Unlock()
 
-	sameOrigin := false
-	if initOrigin != "" && paused.Request.URL != "" {
-		if reqOrigin := canonicalURLOrigin(paused.Request.URL); reqOrigin != "" && reqOrigin == initOrigin {
-			sameOrigin = true
-		}
+	allowInject := initOrigin != "" && reqOrigin != "" && reqOrigin == initOrigin && !crossTainted
+	if allowInject && !isMainDoc {
+		allowInject = isSameOriginInitiatorHeaders(paused.Request.Headers, initOrigin)
 	}
 
 	params := map[string]any{"requestId": paused.RequestID}
-	if sameOrigin && len(extra) > 0 {
+	if allowInject && len(extra) > 0 {
 		params["headers"] = mergeCDPRequestHeaders(paused.Request.Headers, extra)
 	}
 	go func() {
@@ -641,17 +708,44 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		if !resumed {
 			return Output{}, fmt.Errorf("unknown or expired browser session %q", task.SessionID)
 		}
+		navTarget := task.URL
+		if navTarget == "" {
+			for _, a := range task.Actions {
+				if strings.EqualFold(strings.TrimSpace(a.Type), "navigate") {
+					navTarget = strings.TrimSpace(a.URL)
+					break
+				}
+			}
+		}
 		if len(task.Headers) > 0 {
-			if task.URL != "" {
-				if upOrigin := canonicalURLOrigin(task.URL); upOrigin != "" {
-					sess.mu.Lock()
-					sess.initialOrigin = upOrigin
-					sess.mu.Unlock()
+			if navTarget != "" {
+				upOrigin := canonicalURLOrigin(navTarget)
+				if upOrigin == "" {
+					return Output{}, errors.New("cannot scope request headers: navigation target has no canonical http(s) origin")
+				}
+				sess.mu.Lock()
+				prevOrigin := sess.initialOrigin
+				sess.initialOrigin = upOrigin
+				sess.redirectedCrossOrigin = task.URL == "" && prevOrigin != "" && prevOrigin != upOrigin
+				sess.mu.Unlock()
+			} else {
+				sess.mu.Lock()
+				hasInit := sess.initialOrigin != ""
+				sess.mu.Unlock()
+				if !hasInit {
+					return Output{}, errors.New("cannot scope request headers: session has no canonical http(s) origin")
 				}
 			}
 			if err := sess.enableOriginScopedHeaders(ctx, cdp, task.Headers); err != nil {
 				return Output{}, err
 			}
+		} else if navTarget != "" {
+			navOrigin := canonicalURLOrigin(navTarget)
+			sess.mu.Lock()
+			if sess.initialOrigin != "" && navOrigin != sess.initialOrigin {
+				sess.redirectedCrossOrigin = true
+			}
+			sess.mu.Unlock()
 		}
 	}
 
@@ -709,6 +803,18 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		initOrigin := ""
 		if task.URL != "" {
 			initOrigin = canonicalURLOrigin(task.URL)
+		} else {
+			for _, a := range task.Actions {
+				if strings.EqualFold(strings.TrimSpace(a.Type), "navigate") {
+					initOrigin = canonicalURLOrigin(a.URL)
+					break
+				}
+			}
+		}
+		if len(task.Headers) > 0 && initOrigin == "" {
+			_ = cdp.call(context.Background(), "", "Target.closeTarget", map[string]any{"targetId": tgtOut.TargetID}, nil)
+			_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": bcOut.BrowserContextID}, nil)
+			return Output{}, errors.New("cannot scope request headers: navigation target has no canonical http(s) origin")
 		}
 		sess = &retainedSession{
 			id:               sid,
@@ -906,6 +1012,13 @@ func navigateAndWait(
 	}
 	if err := cdp.call(ctx, sessionID, "Page.navigate", map[string]any{"url": targetURL}, &navOut); err != nil {
 		return 0, nil, err
+	}
+	if sess != nil && navOut.FrameID != "" {
+		sess.mu.Lock()
+		if sess.mainFrameID == "" {
+			sess.mainFrameID = navOut.FrameID
+		}
+		sess.mu.Unlock()
 	}
 	if navOut.ErrorText != "" {
 		return 0, nil, fmt.Errorf("navigation failed: %s", navOut.ErrorText)
@@ -1148,10 +1261,12 @@ func (r *Renderer) runAction(
 			}
 		}
 		sess.setLastCheckedURL(u.String())
+		navOrigin := canonicalURLOrigin(u.String())
 		sess.mu.Lock()
 		if sess.initialOrigin == "" {
-			sess.initialOrigin = canonicalURLOrigin(u.String())
+			sess.initialOrigin = navOrigin
 		}
+		sess.redirectedCrossOrigin = sess.initialOrigin != "" && navOrigin != sess.initialOrigin
 		sess.mu.Unlock()
 		st, hdrs, err := navigateAndWait(ctx, cdp, sess, events, u.String(), effectiveWaitMs, act.Selector)
 		if err != nil {
@@ -1604,13 +1719,20 @@ func buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir string, useSandbox bo
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--hide-scrollbars",
-		"--remote-debugging-address=127.0.0.1",
-		"--remote-debugging-port=0",
 		proxyFlag,
 		"--proxy-bypass-list=<-loopback>",
 		"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
 		profileFlag,
 	)
+	if runtime.GOOS == "windows" {
+		args = append(args,
+			"--remote-debugging-address=127.0.0.1",
+			"--remote-debugging-port=0",
+		)
+	} else {
+		// R5-M6: Use inherited anonymous OS pipes (FD 3 / FD 4) on Linux & macOS so Chromium opens ZERO TCP ports!
+		args = append(args, "--remote-debugging-pipe")
+	}
 	if runtime.GOOS == "linux" {
 		args = append(args,
 			"--use-gl=angle",
@@ -1627,14 +1749,22 @@ func buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir string, useSandbox bo
 
 func isSandboxStartupFailureText(s string) bool {
 	lower := strings.ToLower(s)
-	for _, marker := range []string{
-		"zygote_host_impl_linux",
+	for _, phrase := range []string{
 		"no usable sandbox",
-		"sandbox_linux",
-		"setuid sandbox",
-		"namespace sandbox",
-		"without --no-sandbox",
+		"without --no-sandbox is not supported",
+		"failed to move to new namespace",
+		"setuid sandbox is not running as root",
+		"suid sandbox helper binary was found, but is not configured correctly",
+		"namespace sandbox failed",
 	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	if !strings.Contains(lower, ":fatal:") {
+		return false
+	}
+	for _, marker := range []string{"zygote_host_impl_linux", "sandbox_linux", "setuid sandbox", "namespace sandbox"} {
 		if strings.Contains(lower, marker) {
 			return true
 		}
@@ -1666,6 +1796,241 @@ func linuxSandboxBlockedByHostPolicy() bool {
 	return false
 }
 
+func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, args []string, startupWait time.Duration) (*exec.Cmd, string, *cdpConn, error) {
+	toChromeRead, toChromeWrite, err := os.Pipe()
+	if err != nil {
+		_ = os.RemoveAll(userDir)
+		return nil, "", nil, err
+	}
+	fromChromeRead, fromChromeWrite, err := os.Pipe()
+	if err != nil {
+		_ = toChromeRead.Close()
+		_ = toChromeWrite.Close()
+		_ = os.RemoveAll(userDir)
+		return nil, "", nil, err
+	}
+
+	cmd := exec.Command(r.chromeBin, args...)
+	cmd.Env = buildSanitizedChildEnv(userDir)
+	cmd.ExtraFiles = []*os.File{toChromeRead, fromChromeWrite}
+	configureBrowserProcGroup(cmd)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = toChromeRead.Close()
+		_ = toChromeWrite.Close()
+		_ = fromChromeRead.Close()
+		_ = fromChromeWrite.Close()
+		_ = os.RemoveAll(userDir)
+		return nil, "", nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = toChromeRead.Close()
+		_ = toChromeWrite.Close()
+		_ = fromChromeRead.Close()
+		_ = fromChromeWrite.Close()
+		_ = os.RemoveAll(userDir)
+		return nil, "", nil, fmt.Errorf("start chromium: %w", err)
+	}
+	// Close child-side pipe ends in the parent immediately so EOF propagates cleanly if Chromium exits.
+	_ = toChromeRead.Close()
+	_ = fromChromeWrite.Close()
+
+	var (
+		connHolder   atomic.Pointer[cdpConn]
+		earlyCrashMu sync.Mutex
+		earlyCrash   string
+	)
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		sc := bufio.NewScanner(stderr)
+		for sc.Scan() {
+			txt := sc.Text()
+			if c := connHolder.Load(); c != nil {
+				c.setCrashReason(txt)
+			} else {
+				earlyCrashMu.Lock()
+				earlyCrash = startupReason(earlyCrash, txt)
+				earlyCrashMu.Unlock()
+			}
+		}
+		_, _ = io.Copy(io.Discard, stderr)
+	}()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = toChromeWrite.Close()
+		_ = fromChromeRead.Close()
+		killBrowserProcessGroup(cmd)
+		_ = os.RemoveAll(userDir)
+		return nil, "", nil, err
+	}
+	secretPath := "/cdp/" + randomSessionID()
+	var accepted atomic.Bool
+	var closePipesOnce sync.Once
+	closePipes := func() {
+		closePipesOnce.Do(func() {
+			_ = toChromeWrite.Close()
+			_ = fromChromeRead.Close()
+		})
+	}
+
+	bridgeSrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.URL.Path != secretPath || !accepted.CompareAndSwap(false, true) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			wsConn, aErr := websocket.Accept(w, req, nil)
+			if aErr != nil {
+				closePipes()
+				return
+			}
+			// Close the ephemeral listener immediately after the single in-process dial connects:
+			// ZERO TCP ports remain listening for CDP!
+			_ = ln.Close()
+			wsConn.SetReadLimit(maxCDPFrameBytes)
+
+			var bridgeDone sync.Once
+			teardown := func() {
+				bridgeDone.Do(func() {
+					closePipes()
+					select {
+					case <-stderrDone:
+					case <-time.After(250 * time.Millisecond):
+					}
+					if c := connHolder.Load(); c != nil {
+						earlyCrashMu.Lock()
+						ec := earlyCrash
+						earlyCrashMu.Unlock()
+						if ec != "" {
+							c.setCrashReason(ec)
+						}
+					}
+					_ = wsConn.CloseNow()
+				})
+			}
+			defer teardown()
+
+			go func() {
+				defer teardown()
+				var writeMu sync.Mutex
+				for {
+					typ, msg, rErr := wsConn.Read(context.Background())
+					if rErr != nil {
+						return
+					}
+					if typ != websocket.MessageText {
+						continue
+					}
+					framed := make([]byte, len(msg)+1)
+					copy(framed, msg)
+					framed[len(msg)] = 0
+					writeMu.Lock()
+					_, wErr := toChromeWrite.Write(framed)
+					writeMu.Unlock()
+					if wErr != nil {
+						return
+					}
+				}
+			}()
+
+			readBuf := make([]byte, 32*1024)
+			var pending []byte
+			for {
+				n, rErr := fromChromeRead.Read(readBuf)
+				if n > 0 {
+					chunk := readBuf[:n]
+					for {
+						nul := bytes.IndexByte(chunk, 0)
+						if nul < 0 {
+							pending = append(pending, chunk...)
+							if len(pending) > maxCDPFrameBytes {
+								return
+							}
+							break
+						}
+						var frame []byte
+						if len(pending) == 0 {
+							frame = chunk[:nul]
+						} else {
+							if len(pending)+nul > maxCDPFrameBytes {
+								return
+							}
+							frame = append(pending, chunk[:nul]...)
+							pending = pending[:0]
+						}
+						chunk = chunk[nul+1:]
+						if len(frame) > 0 {
+							if wErr := wsConn.Write(context.Background(), websocket.MessageText, frame); wErr != nil {
+								return
+							}
+						}
+					}
+				}
+				if rErr != nil {
+					return
+				}
+			}
+		}),
+	}
+	go func() { _ = bridgeSrv.Serve(ln) }()
+
+	wsURL := "ws://" + ln.Addr().String() + secretPath
+	conn, err := dialCDP(ctx, wsURL)
+	_ = ln.Close()
+	if err != nil {
+		closePipes()
+		killBrowserProcessGroup(cmd)
+		_ = os.RemoveAll(userDir)
+		return nil, "", nil, fmt.Errorf("dial chromium cdp pipe: %w", err)
+	}
+	connHolder.Store(conn)
+	earlyCrashMu.Lock()
+	if earlyCrash != "" {
+		conn.setCrashReason(earlyCrash)
+	}
+	earlyCrashMu.Unlock()
+
+	probeCtx, probeCancel := context.WithTimeout(ctx, startupWait)
+	var verOut struct {
+		Product string `json:"product"`
+	}
+	probeErr := conn.call(probeCtx, "", "Browser.getVersion", nil, &verOut)
+	probeCancel()
+	if probeErr != nil {
+		closePipes()
+		_ = conn.close()
+		killBrowserProcessGroup(cmd)
+		_ = os.RemoveAll(userDir)
+		if ctx.Err() != nil {
+			return nil, "", nil, ctx.Err()
+		}
+		if errors.Is(probeErr, context.DeadlineExceeded) {
+			return nil, "", nil, errors.New("timed out waiting for chromium DevTools endpoint")
+		}
+		select {
+		case <-stderrDone:
+		case <-time.After(250 * time.Millisecond):
+		}
+		earlyCrashMu.Lock()
+		reason := earlyCrash
+		earlyCrashMu.Unlock()
+		msg := "chromium exited before advertising DevTools ws://127.0.0.1 endpoint"
+		if reason != "" {
+			msg += ": " + reason
+		} else {
+			msg += ": " + probeErr.Error()
+		}
+		return nil, "", nil, errors.New(msg)
+	}
+	if prod := strings.TrimSpace(verOut.Product); prod != "" {
+		r.browserVersion = prod
+	}
+	_ = os.Remove(filepath.Join(userDir, "DevToolsActivePort"))
+	return cmd, userDir, conn, nil
+}
+
 func (r *Renderer) launchAndDialLocked(ctx context.Context, proxyAddr string, useSandbox bool, startupWait time.Duration) (*exec.Cmd, string, *cdpConn, error) {
 	userDir, err := os.MkdirTemp("", "edgefetch-chrome-*")
 	if err != nil {
@@ -1677,6 +2042,9 @@ func (r *Renderer) launchAndDialLocked(ctx context.Context, proxyAddr string, us
 	}
 
 	args := buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir, useSandbox)
+	if runtime.GOOS != "windows" {
+		return r.launchAndDialPipeLocked(ctx, userDir, args, startupWait)
+	}
 	cmd := exec.Command(r.chromeBin, args...)
 	cmd.Env = buildSanitizedChildEnv(userDir)
 	configureBrowserProcGroup(cmd)
@@ -1803,6 +2171,11 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 			}
 			r.sandboxFallback = true
 			r.sandboxState = "off"
+			if r.log != nil {
+				r.log.Warn("browser_sandbox_fallback",
+					slog.String("bin", r.chromeBin),
+					slog.String("reason", "host MAC/userns policy blocks the Chromium sandbox (pre-check)"))
+			}
 		}
 		useSandbox = !r.sandboxFallback
 	}

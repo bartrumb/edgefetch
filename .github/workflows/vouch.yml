@@ -1,38 +1,52 @@
 name: Contributor DCO & Vouch Gate
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   verify-contributor:
     name: Verify Vouched Contributor & DCO Sign-Off
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    permissions:
+      contents: read
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout trusted base commit only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
 
       - name: Check VOUCHED.td allowlist & DCO sign-off
         env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          set -euo pipefail
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid pull request metadata."
+            exit 1
+          fi
           author_lc="$(printf '%s' "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')"
           echo "Checking contributor: ${author_lc}"
           if ! git show "${BASE_SHA}:.github/VOUCHED.td" | grep -v '^[[:space:]]*#' | sed 's/[[:space:]]//g' | grep -Fxq "$author_lc"; then
             echo "::error::GitHub user '${PR_AUTHOR}' is not yet listed in .github/VOUCHED.td on the base branch. A maintainer will review your PR, verify robots.txt/test compliance, and vouch your handle."
             exit 1
           fi
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          fetched_sha="$(git rev-parse FETCH_HEAD)"
+          if [ "$fetched_sha" != "$HEAD_SHA" ]; then
+            echo "::error::Fetched PR head (${fetched_sha}) did not match event HEAD_SHA (${HEAD_SHA}); re-run check on latest commit."
+            exit 1
+          fi
           if [ "$author_lc" != "bartrumb" ] && [ "$author_lc" != "dependabot[bot]" ] && [ "$author_lc" != "github-actions[bot]" ]; then
-            missing_dco="$(git log --no-merges --format='%H %B' "${BASE_SHA}..${HEAD_SHA}" | awk '/^[0-9a-f]{40} /{if (sha != "" && !ok) print sha; sha=$1; ok=0} /^Signed-off-by: .+ <.+@.+>/{ok=1} END{if (sha != "" && !ok) print sha}')"
+            missing_dco="$(git log --no-merges --format='%H %B' "${BASE_SHA}..FETCH_HEAD" | awk '/^[0-9a-f]{40} /{if (sha != "" && !ok) print sha; sha=$1; ok=0} /^Signed-off-by: .+ <.+@.+>/{ok=1} END{if (sha != "" && !ok) print sha}')"
             if [ -n "$missing_dco" ]; then
               missing_flat="$(printf '%s' "$missing_dco" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
               echo "::error::External contributor commits must include a DCO sign-off ('git commit -s'). Missing on: ${missing_flat}"

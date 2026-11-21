@@ -3,7 +3,7 @@
 # together with a local Go `edgefetch` worker + Headless Chromium + Poppler PDF — zero Postgres, zero Redis!
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS go-build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.6.1
+ARG BUILD_VERSION=2.6.2
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -18,6 +18,7 @@ WORKDIR /app/hub
 COPY hub/package.json hub/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY sdk ../sdk
+COPY internal ../internal
 COPY hub/src ./src
 COPY hub/migrations ./migrations
 COPY hub/portable ./portable
@@ -28,7 +29,7 @@ FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6
 LABEL org.opencontainers.image.title="EdgeFetch All-in-One" \
       org.opencontainers.image.description="Self-hosted EdgeFetch Hub + Go HTTP/2 + Headless Chromium + SQLite FTS5 in one container" \
       org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
-      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.licenses="MIT AND FSL-1.1-MIT" \
       io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"
 
 RUN apk add --no-cache \
@@ -49,6 +50,7 @@ RUN apk add --no-cache \
 
 COPY --from=go-build /out/edgefetch /usr/local/bin/edgefetch
 COPY --from=hub-build /app/hub/dist/portable-server.mjs /app/hub/dist/portable-server.mjs
+COPY hub/LICENSE /app/hub/LICENSE
 COPY hub/migrations /app/hub/migrations
 COPY scripts/all-in-one-entrypoint.sh /usr/local/bin/all-in-one-entrypoint.sh
 RUN chown -R root:root /app /usr/local/bin/edgefetch /usr/local/bin/all-in-one-entrypoint.sh \

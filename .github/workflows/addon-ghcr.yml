@@ -18,14 +18,17 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
-  attestations: write
 
 jobs:
   publish-ha-addon:
-    name: Build & Push ${{ matrix.image_prefix }}-${{ matrix.ha_arch }}
+    name: Build & Push ${{ matrix.image_prefix }}-${{ matrix.ha_arch }} (edge)
     runs-on: ${{ matrix.runner }}
+    if: "!startsWith(github.ref, 'refs/tags/v')"
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -43,26 +46,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Extract Add-on Version & Tags from ${{ matrix.addon_dir }}/config.yaml
+      - name: Extract Add-on Version & Edge Tags
         id: meta
         env:
-          REF: ${{ github.ref }}
           REPO_OWNER: ${{ github.repository_owner }}
+          ADDON_DIR: ${{ matrix.addon_dir }}
+          IMAGE_PREFIX: ${{ matrix.image_prefix }}
+          HA_ARCH: ${{ matrix.ha_arch }}
         run: |
           set -euo pipefail
-          ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "${{ matrix.addon_dir }}/config.yaml")
+          ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "${ADDON_DIR}/config.yaml")
           if [ -z "$ver" ]; then
-            echo "Failed to read version from ${{ matrix.addon_dir }}/config.yaml"
+            echo "Failed to read version from ${ADDON_DIR}/config.yaml"
             exit 1
           fi
           owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
-          image="ghcr.io/${owner}/${{ matrix.image_prefix }}-${{ matrix.ha_arch }}"
+          image="ghcr.io/${owner}/${IMAGE_PREFIX}-${HA_ARCH}"
           short_sha="${GITHUB_SHA::7}"
-          if [[ "$REF" == refs/tags/v* ]]; then
-            echo "tags=${image}:${ver},${image}:latest" >> "$GITHUB_OUTPUT"
-          else
-            echo "tags=${image}:edge,${image}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
-          fi
+          echo "tags=${image}:edge,${image}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "image=$image" >> "$GITHUB_OUTPUT"
 
@@ -98,10 +99,96 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
+  publish-ha-addon-release:
+    name: Build & Push ${{ matrix.image_prefix }}-${{ matrix.ha_arch }} (release)
+    runs-on: ${{ matrix.runner }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - addon_dir: edgefetch_fat
+            image_prefix: edgefetch-fat-addon
+            platform: linux/amd64
+            ha_arch: amd64
+            runner: ubuntu-latest
+          - addon_dir: edgefetch_fat
+            image_prefix: edgefetch-fat-addon
+            platform: linux/arm64
+            ha_arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract Add-on Release Version & Tags
+        id: meta
+        env:
+          REF: ${{ github.ref }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          ADDON_DIR: ${{ matrix.addon_dir }}
+          IMAGE_PREFIX: ${{ matrix.image_prefix }}
+          HA_ARCH: ${{ matrix.ha_arch }}
+        run: |
+          set -euo pipefail
+          ver="${REF#refs/tags/v}"
+          cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "${ADDON_DIR}/config.yaml")
+          if [ -z "$cfg_ver" ]; then
+            echo "Failed to read version from ${ADDON_DIR}/config.yaml"
+            exit 1
+          fi
+          owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner}/${IMAGE_PREFIX}-${HA_ARCH}"
+          echo "tags=${image}:${ver},${image}:latest" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push release add-on image (${{ matrix.addon_dir }})
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.addon_dir }}/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            io.hass.version=${{ steps.meta.outputs.version }}
+            io.hass.type=addon
+            io.hass.arch=${{ matrix.ha_arch }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Generate SLSA build provenance attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
   publish-standalone-multiarch:
-    name: Publish Multi-Arch OCI Agent Images (edge & release)
+    name: Publish Multi-Arch OCI Agent Images (edge)
     runs-on: ubuntu-latest
     if: "!startsWith(github.ref, 'refs/tags/v')"
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

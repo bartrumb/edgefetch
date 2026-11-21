@@ -24,6 +24,11 @@ class_name = "AgentHubDO"
 tag = "v1"
 new_sqlite_classes = ["AgentHubDO"]
 
+[[rules]]
+type = "Text"
+globs = ["**/*.yaml", "**/*.yml"]
+fallthrough = true
+
 # Configure separate least-privilege secrets via Wrangler (never commit values):
 #   npx wrangler secret put CALLER_TOKEN   # >= 24 random chars (used by upstream callers on POST /fetch & GET /agents)
 #   npx wrangler secret put AGENT_TOKENS   # JSON map {"site-1":"<24+ random chars>","site-2":"..."} for outbound agents

@@ -27,7 +27,7 @@ import {
   type HubFetchExecutor,
 } from './map-crawl';
 import { authorizeMcpRequest, type OAuthStore } from './oauth';
-import { readBodyTextCapped } from './safe-input';
+import { readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 import { executeScrapeCall } from './scrape';
 import { executeExtractCall } from './search-index';
 import type { OptionalStorageBindings } from './storage';
@@ -164,7 +164,8 @@ export async function handleCompatRoutes(params: {
 
   const fcCrawlMatch = /^\/crawl\/([^/]+)$/.exec(fcSubpath);
   if (fcCrawlMatch && fcCrawlMatch[1] !== 'params-preview') {
-    const crawlId = decodeURIComponent(fcCrawlMatch[1] ?? '');
+    const crawlId = safeDecodeURIComponent(fcCrawlMatch[1] ?? '');
+    if (crawlId === null) return Response.json({ success: false, error: 'bad_request' }, { status: 400 });
     if (request.method === 'GET') {
       const rawOffset = Number(url.searchParams.get('offset') ?? 0);
       const rawLimit = Number(url.searchParams.get('limit') ?? 25);
@@ -216,7 +217,8 @@ export async function handleCompatRoutes(params: {
 
   const fcBatchMatch = /^\/batch\/scrape\/([^/]+)$/.exec(fcSubpath);
   if (fcBatchMatch) {
-    const batchId = decodeURIComponent(fcBatchMatch[1] ?? '');
+    const batchId = safeDecodeURIComponent(fcBatchMatch[1] ?? '');
+    if (batchId === null) return Response.json({ success: false, error: 'bad_request' }, { status: 400 });
     if (request.method === 'GET') {
       const job = getBatchScrapeStatus(batchId);
       if (!job) return Response.json({ success: false, error: 'batch_not_found' }, { status: 404 });
@@ -273,7 +275,8 @@ export async function handleCompatRoutes(params: {
 
   const fcAgentTraceMatch = /^\/agent\/([^/]+)\/trace$/.exec(fcSubpath);
   if (fcAgentTraceMatch && request.method === 'GET') {
-    const agentId = decodeURIComponent(fcAgentTraceMatch[1] ?? '');
+    const agentId = safeDecodeURIComponent(fcAgentTraceMatch[1] ?? '');
+    if (agentId === null) return Response.json({ success: false, error: 'bad_request' }, { status: 400 });
     const rec = await loadAgentRun(agentId, env.META);
     if (!rec) return Response.json({ success: false, error: 'agent_not_found' }, { status: 404 });
     return Response.json({
@@ -290,7 +293,8 @@ export async function handleCompatRoutes(params: {
 
   const fcAgentMatch = /^\/agent\/([^/]+)$/.exec(fcSubpath);
   if (fcAgentMatch) {
-    const agentId = decodeURIComponent(fcAgentMatch[1] ?? '');
+    const agentId = safeDecodeURIComponent(fcAgentMatch[1] ?? '');
+    if (agentId === null) return Response.json({ success: false, error: 'bad_request' }, { status: 400 });
     if (request.method === 'GET') {
       const rec = await loadAgentRun(agentId, env.META);
       if (!rec) return Response.json({ success: false, error: 'agent_not_found' }, { status: 404 });

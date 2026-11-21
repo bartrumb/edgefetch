@@ -1278,7 +1278,10 @@ export async function executeExtractCall(params: {
             : null;
         const formatted = atsSpec.format(rawBodyStr, item.url, htmlFragToMd);
         if ((jsonFilterStr && filteredBoard) || (formatted && formatted.markdown.trim())) {
-          const mdRaw = jsonFilterStr && filteredBoard ? filteredBoard.markdown : formatted!.markdown;
+          const mdRaw = sanitizeInlineHtmlInMarkdown(
+            jsonFilterStr && filteredBoard ? filteredBoard.markdown : formatted!.markdown,
+            item.url,
+          ).trim();
           const cleanMd = redactPii ? redactPiiText(mdRaw) : mdRaw;
           byUrl.set(item.url, {
             url: item.url,
@@ -1290,7 +1293,10 @@ export async function executeExtractCall(params: {
             ...(formatted?.jobPosting ? { jobPosting: formatted.jobPosting } : {}),
             ...(filteredBoard && (jsonFilterStr || atsSpec.id.endsWith('-board'))
               ? {
-                  preChunkedRecords: filteredBoard.chunks,
+                  preChunkedRecords: filteredBoard.chunks.map((c) => {
+                    const sanitizedChunk = sanitizeInlineHtmlInMarkdown(c.text, item.url).trim();
+                    return { ...c, text: redactPii ? redactPiiText(sanitizedChunk) : sanitizedChunk };
+                  }),
                   recordCount: filteredBoard.matchedRecords,
                   totalRecords: filteredBoard.totalRecords,
                 }
@@ -1305,13 +1311,14 @@ export async function executeExtractCall(params: {
       if (twinSpec && rawBodyStr) {
         const twinOut = twinSpec.formatTwin(rawBodyStr, item.url, htmlFragToMd);
         if (twinOut && twinOut.markdown.trim()) {
+          const sanitizedTwin = sanitizeInlineHtmlInMarkdown(twinOut.markdown, item.url).trim();
           byUrl.set(item.url, {
             url: item.url,
             finalUrl: item.url,
             status: typeof r.status === 'number' ? r.status : 200,
             cached: false,
             title: twinOut.title,
-            markdown: redactPii ? redactPiiText(twinOut.markdown) : twinOut.markdown,
+            markdown: redactPii ? redactPiiText(sanitizedTwin) : sanitizedTwin,
           });
           continue;
         }
@@ -1352,6 +1359,7 @@ export async function executeExtractCall(params: {
               const stubBody = typeof stubItem?.body === 'string' && stubItem.bodyEncoding !== 'base64' ? stubItem.body : '';
               const stubFmt = stubItem?.outcome === 'ok' && stubBody ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd) : null;
               if (stubFmt && stubFmt.markdown.trim()) {
+                const sanitizedStub = sanitizeInlineHtmlInMarkdown(stubFmt.markdown, wdStub.redirectUrl).trim();
                 byUrl.set(item.url, {
                   url: item.url,
                   finalUrl: wdStub.redirectUrl,
@@ -1359,7 +1367,7 @@ export async function executeExtractCall(params: {
                   status: typeof stubItem?.status === 'number' ? stubItem.status : 200,
                   cached: false,
                   title: stubFmt.title,
-                  markdown: redactPii ? redactPiiText(stubFmt.markdown) : stubFmt.markdown,
+                  markdown: redactPii ? redactPiiText(sanitizedStub) : sanitizedStub,
                   ...(stubFmt.jobPosting ? { jobPosting: stubFmt.jobPosting } : {}),
                 });
                 continue;
@@ -1428,7 +1436,8 @@ export async function executeExtractCall(params: {
             })
           : null;
       if (jsonRecordsDoc) {
-        const cleanJsonMd = redactPii ? redactPiiText(jsonRecordsDoc.markdown) : jsonRecordsDoc.markdown;
+        const sanitizedJsonMd = sanitizeInlineHtmlInMarkdown(jsonRecordsDoc.markdown, finalUrl).trim();
+        const cleanJsonMd = redactPii ? redactPiiText(sanitizedJsonMd) : sanitizedJsonMd;
         byUrl.set(item.url, {
           url: item.url,
           finalUrl,
@@ -1437,9 +1446,10 @@ export async function executeExtractCall(params: {
           cached: false,
           title: jsonRecordsDoc.title,
           markdown: cleanJsonMd,
-          preChunkedRecords: redactPii
-            ? jsonRecordsDoc.chunks.map((c) => ({ ...c, text: redactPiiText(c.text) }))
-            : jsonRecordsDoc.chunks,
+          preChunkedRecords: jsonRecordsDoc.chunks.map((c) => {
+            const sanitizedChunk = sanitizeInlineHtmlInMarkdown(c.text, finalUrl).trim();
+            return { ...c, text: redactPii ? redactPiiText(sanitizedChunk) : sanitizedChunk };
+          }),
           recordCount: jsonRecordsDoc.matchedRecords,
           totalRecords: jsonRecordsDoc.totalRecords,
         });
@@ -1466,7 +1476,8 @@ export async function executeExtractCall(params: {
 
       if (isVcard) {
         const vc = formatVcardToMarkdown(rawBodyStr);
-        md = redactPii ? redactPiiText(vc.markdown) : vc.markdown;
+        const sanitizedVc = sanitizeInlineHtmlInMarkdown(vc.markdown, finalUrl).trim();
+        md = redactPii ? redactPiiText(sanitizedVc) : sanitizedVc;
         title = vc.title;
       } else if (structuredDoc) {
         const cleanStructured = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(structuredDoc.markdown), finalUrl).trim();

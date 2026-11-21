@@ -14,22 +14,23 @@ jobs:
     name: Build, Sign & Attest Release Archives (GoReleaser + Ed25519 + SLSA)
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    environment: release
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: '1.27.x'
           cache: false
 
       - name: Build Release Archives Locally (Publish Held Until Signature Verified)
-        uses: goreleaser/goreleaser-action@9c156ee8a17a598857849441385a2041ef570552 # v6
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v6
         with:
           distribution: goreleaser
           version: 'v2.20.3'
@@ -62,7 +63,7 @@ jobs:
             --generate-notes
 
       - name: Generate SLSA Build Provenance Attestations for Release Binaries
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
@@ -81,7 +82,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Determine Version, Floating Tags & Registry Owner
         id: meta
@@ -98,18 +99,18 @@ jobs:
             echo "aio_tags=ghcr.io/${owner}/edgefetch:latest,ghcr.io/${owner}/edgefetch:${ver}" >> "$GITHUB_OUTPUT"
           else
             ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
-            short_sha="${GITHUB_SHA:0:12}"
-            echo "fat_tags=ghcr.io/${owner}/edgefetch-agent:${ver}-${short_sha}" >> "$GITHUB_OUTPUT"
-            echo "lite_tags=ghcr.io/${owner}/edgefetch-agent:${ver}-${short_sha}-lite" >> "$GITHUB_OUTPUT"
-            echo "aio_tags=ghcr.io/${owner}/edgefetch:${ver}-${short_sha}" >> "$GITHUB_OUTPUT"
+            short_sha="${GITHUB_SHA::7}"
+            echo "fat_tags=ghcr.io/${owner}/edgefetch-agent:edge,ghcr.io/${owner}/edgefetch-agent:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+            echo "lite_tags=ghcr.io/${owner}/edgefetch-agent:edge-lite,ghcr.io/${owner}/edgefetch-agent:sha-${short_sha}-lite" >> "$GITHUB_OUTPUT"
+            echo "aio_tags=ghcr.io/${owner}/edgefetch:edge,ghcr.io/${owner}/edgefetch:sha-${short_sha}" >> "$GITHUB_OUTPUT"
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "owner=$owner" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -117,7 +118,7 @@ jobs:
 
       - name: Build & Push Fat Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent)
         id: push-fat
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.agent
@@ -127,7 +128,7 @@ jobs:
           tags: ${{ steps.meta.outputs.fat_tags }}
 
       - name: Attest Fat Agent OCI Image
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent
           subject-digest: ${{ steps.push-fat.outputs.digest }}
@@ -135,7 +136,7 @@ jobs:
 
       - name: Build & Push Distroless Lite Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:lite)
         id: push-lite
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -145,7 +146,7 @@ jobs:
           tags: ${{ steps.meta.outputs.lite_tags }}
 
       - name: Attest Distroless Lite OCI Image
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent
           subject-digest: ${{ steps.push-lite.outputs.digest }}
@@ -153,7 +154,7 @@ jobs:
 
       - name: Build & Push All-in-One Container (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch)
         id: push-aio
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.all-in-one
@@ -163,7 +164,7 @@ jobs:
           tags: ${{ steps.meta.outputs.aio_tags }}
 
       - name: Attest All-in-One OCI Image
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch
           subject-digest: ${{ steps.push-aio.outputs.digest }}

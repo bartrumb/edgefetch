@@ -26,6 +26,7 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
 	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
+	"github.com/bartrumb/edgefetch/v2/internal/priv"
 )
 
 type cliDeps struct {
@@ -60,6 +61,14 @@ func isOneShotCLI(args []string) bool {
 }
 
 func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	lockPaths := []string{agent.DefaultHAOptionsPath}
+	if deps.haPath != "" && deps.haPath != agent.DefaultHAOptionsPath {
+		lockPaths = append(lockPaths, deps.haPath)
+	}
+	if err := priv.LockDownSecretPathsStrict(lockPaths...); err != nil {
+		_, _ = fmt.Fprintf(stderr, "secret lockdown failed: %v\n", err)
+		return 1
+	}
 	if deps.getenv == nil {
 		deps.getenv = os.Getenv
 	}

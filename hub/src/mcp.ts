@@ -12,26 +12,28 @@
 import { redactUrlForLog, sanitizeDetails, type ActivityStore, type HubEventInput } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { SITE_ID_PATTERN } from './auth';
+import { filterSafeResponseHeaders } from './framework-detect';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
 import { validatePublicHttpsTargetUrl } from './overflow';
 import { readBodyTextCapped } from './safe-input';
-import { classifyWafAndChallenge } from './waf';
+import { classifyWafAndChallenge, refineBlockedInfo } from './waf';
 
 const SUPPORTED_PROTOCOL_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
 const LEGACY_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
 const DEFAULT_PROTOCOL_VERSION = '2025-03-26';
 const MCP_INSTRUCTIONS =
-  'Use search for web & crawled-collection discovery (Serper/Tavily/Brave/SearXNG waterfall + edge-map + SEARCH D1), jobs for one-call structured ATS job search across Greenhouse/Ashby/Lever/Workday/SmartRecruiters/Built In, scrape / extract for clean Markdown, Jupyter .ipynb, OpenAPI, & PDFs (with optional PDF OCR and companion .md discovery), map / crawl for site discovery, interact for headless Chromium sessions & YouTube transcripts, read_artifact for large stored docs, and list_agents for fleet status.';
+  'Use search for web & crawled-collection discovery (Serper/Tavily/Brave/SearXNG waterfall + edge-map + SEARCH D1), jobs for one-call structured ATS job search & batch posting verification across Greenhouse/Ashby/Lever/Workday/SmartRecruiters/Built In, catalog for polite full-store Shopify & WooCommerce catalog extraction & diffing, scrape / extract for clean Markdown, Jupyter .ipynb, OpenAPI, & PDFs (with optional PDF OCR and companion .md discovery), map / crawl for site discovery, interact for headless Chromium sessions & YouTube transcripts, read_artifact for large stored docs, and list_agents for fleet status.';
 const MAX_MCP_REQUEST_BYTES = 256 * 1024;
 const MAX_BODY_PREVIEW_CHARS = 64 * 1024;
 const DEFAULT_MCP_SCRAPE_MAX_CHARS = 100_000;
 const DEFAULT_BATCH_PREVIEW_CHARS = 3 * 1024;
 const MAX_BATCH_URLS = 25;
 
-/** The Accept values a `kind: "text"` request may carry: the set both Go crawlers (container and agents) accept. */
+/** The Accept values a `kind: "text"` or `kind: "page"` request may carry. */
 export const TEXT_ACCEPTS = [
   'text/html',
+  'text/markdown',
   'application/xml',
   'text/xml',
   'application/rss+xml',
@@ -59,9 +61,9 @@ export function defaultTextAccept(url: string): (typeof TEXT_ACCEPTS)[number] {
     return 'text/html';
   }
   if (/\.(xml|xml\.gz)$/.test(pathname) || pathname.includes('sitemap')) return 'application/xml';
-  if (/\.(rss)$/.test(pathname) || /\/(rss|feed)\/?$/.test(pathname)) return 'application/rss+xml';
-  if (/\.(atom)$/.test(pathname) || /\/atom\/?$/.test(pathname)) return 'application/atom+xml';
-  if (/\.(json|webmanifest|jsonl|ndjson|ipynb)$/.test(pathname)) return 'application/json';
+  if (/\.(rss)$/.test(pathname) || /\/(?:rss|feed|feeds)(?:\/|$)/.test(pathname)) return 'application/rss+xml';
+  if (/\.(atom)$/.test(pathname) || /\/atom(?:\/|$)/.test(pathname)) return 'application/atom+xml';
+  if (/\.(json|webmanifest|jsonl|ndjson|ipynb)$/.test(pathname) || /(?:^|\/)api(?:\/|$)/.test(pathname)) return 'application/json';
   if (/\.ics$/.test(pathname)) return 'text/calendar';
   if (
     RAW_TEXT_FILE_EXT_RE.test(pathname) ||
@@ -87,8 +89,18 @@ export function inferKindForUrl(url: string): 'page' | 'text' | 'json' {
     return 'page';
   }
   if (
+    /\.(xml|xml\.gz|rss|atom|ics)$/.test(pathname) ||
+    RAW_TEXT_FILE_EXT_RE.test(pathname) ||
+    /\/(?:dockerfile|makefile)$/.test(pathname) ||
+    /\/(?:rss|feed|feeds|atom)(?:\/|$)/.test(pathname) ||
+    pathname.includes('sitemap')
+  ) {
+    return 'text';
+  }
+  if (
     /\.(json|webmanifest|jsonl|ndjson|ipynb)$/.test(pathname) ||
     pathname.startsWith('/.well-known/') ||
+    (!/\.(?:html?|xhtml|php|asp|aspx)$/.test(pathname) && /(?:^|\/)api(?:\/|$)/.test(pathname)) ||
     host === 'registry.npmjs.org' ||
     host === 'api.github.com' ||
     (host === 'pypi.org' && /\/json\/?$/.test(pathname))
@@ -96,11 +108,6 @@ export function inferKindForUrl(url: string): 'page' | 'text' | 'json' {
     return 'json';
   }
   if (
-    /\.(xml|xml\.gz|rss|atom|ics)$/.test(pathname) ||
-    RAW_TEXT_FILE_EXT_RE.test(pathname) ||
-    /\/(?:dockerfile|makefile)$/.test(pathname) ||
-    /\/(rss|feed|atom)\/?$/.test(pathname) ||
-    pathname.includes('sitemap') ||
     host === 'raw.githubusercontent.com' ||
     host === 'gist.githubusercontent.com' ||
     pathname.includes('/-/raw/')
@@ -110,12 +117,21 @@ export function inferKindForUrl(url: string): 'page' | 'text' | 'json' {
   return 'page';
 }
 
+export const inferRequestKind = inferKindForUrl;
+
 /** The Accept to send with one request, or an error for one the crawlers would refuse. */
 export function textAcceptFor(kind: string, url: string, requested: unknown): { ok: true; accept?: string } | { ok: false; error: string } {
-  if (kind !== 'text') return { ok: true };
-  if (requested === undefined || requested === null || requested === '') return { ok: true, accept: defaultTextAccept(url) };
-  if (typeof requested === 'string' && (TEXT_ACCEPTS as readonly string[]).includes(requested)) return { ok: true, accept: requested };
-  return { ok: false, error: `accept must be one of ${TEXT_ACCEPTS.join(', ')}` };
+  if (kind === 'text') {
+    if (requested === undefined || requested === null || requested === '') return { ok: true, accept: defaultTextAccept(url) };
+    if (typeof requested === 'string' && (TEXT_ACCEPTS as readonly string[]).includes(requested)) return { ok: true, accept: requested };
+    return { ok: false, error: `accept must be one of ${TEXT_ACCEPTS.join(', ')}` };
+  }
+  if (kind === 'page') {
+    if (requested === undefined || requested === null || requested === '') return { ok: true };
+    if (typeof requested === 'string' && (TEXT_ACCEPTS as readonly string[]).includes(requested)) return { ok: true, accept: requested };
+    return { ok: false, error: `accept must be one of ${TEXT_ACCEPTS.join(', ')}` };
+  }
+  return { ok: true };
 }
 
 interface JsonRpcRequest {
@@ -187,6 +203,10 @@ export interface McpServerDeps {
     args: Record<string, unknown>;
     principal?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeCatalog?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeAgent?: (params: {
     args: Record<string, unknown>;
     principal?: string;
@@ -205,6 +225,8 @@ export interface McpServerDeps {
   allowedOrigins?: readonly string[];
   selfHost?: string;
 }
+
+export type McpHandlerOptions = McpServerDeps;
 
 function isAllowedMcpOrigin(
   originHeader: string | null,
@@ -282,6 +304,7 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
     toolName === 'map' ||
     toolName === 'crawl' ||
     toolName === 'jobs' ||
+    toolName === 'catalog' ||
     toolName === 'agent'
   ) {
     return 'crawl:fetch';
@@ -380,7 +403,8 @@ function buildToolDefinitions(deps: McpServerDeps) {
           accept: {
             type: 'string',
             enum: [...TEXT_ACCEPTS],
-            description: 'For kind "text" only. Default: picked from the URL (.xml or sitemap = application/xml, .txt/.md = text/plain, /rss = application/rss+xml, else text/html).',
+            description:
+              'Optional Accept media type override (e.g. "text/html" on kind="page" to request HTML instead of text/markdown; for kind="text", defaults from URL extension).',
           },
           target: {
             type: 'string',
@@ -566,6 +590,11 @@ function buildToolDefinitions(deps: McpServerDeps) {
               'Optional max Markdown character limit (default 100000 on MCP; truncates cleanly at paragraph/word boundary and returns markdownArtifactId + nextOffset for lossless paging via read_artifact).',
           },
           discoverLlmsTxt: { type: 'boolean', default: true, description: 'Check /llms.txt and upgrade to companion .md when available.' },
+          preferOriginMarkdown: {
+            type: 'boolean',
+            default: true,
+            description: 'Set false to negotiate text/html instead of text/markdown on origins supporting Markdown for Agents.',
+          },
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
           redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
           checkPromptInjection: {
@@ -922,6 +951,27 @@ function buildToolDefinitions(deps: McpServerDeps) {
           postedWithinDays: { type: 'integer', minimum: 1, maximum: 365, description: 'Filter postings published within N days.' },
           limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
           includeBuiltIn: { type: 'boolean', default: true, description: 'Also check Built In remote job search.' },
+          includePublicFeeds: {
+            type: 'boolean',
+            description: 'Include robots.txt-allowed public remote job feeds (We Work Remotely, Himalayas, Working Nomads).',
+          },
+          mode: {
+            type: 'string',
+            enum: ['search', 'verify'],
+            description: 'Execution mode ("search" default, or "verify" to batch-check saved job posting URLs).',
+          },
+          verify: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 50,
+            description: 'Optional list of saved https:// job posting URLs to batch-verify ("live" | "closed" | "board_gone" | "unknown") by grouping per ATS board.',
+          },
+          urls: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 50,
+            description: 'Alias for verify when mode="verify".',
+          },
           exclude: {
             type: 'array',
             items: {
@@ -963,6 +1013,56 @@ function buildToolDefinitions(deps: McpServerDeps) {
           limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
         },
         required: ['query'],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'catalog',
+      description:
+        'Polite, single-host sequential full-store e-commerce catalog extraction (Shopify /products.json and WooCommerce Store API) with robots.txt + Content-Signal compliance, 3-strikes 429 cooldown, shrink guard, variant-level snapshot diffing, and paged record filtering via catalogId.',
+      annotations: {
+        title: 'Extract & Diff Full Storefront Catalog',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Public https:// storefront or collection URL (omit when polling/paging an existing catalogId).' },
+          catalogId: { type: 'string', description: 'Existing catalog run ID (`cat_...`) to poll status or page/filter normalized records.' },
+          platform: {
+            type: 'string',
+            enum: ['auto', 'shopify', 'woocommerce'],
+            default: 'auto',
+            description: 'Storefront platform ("auto" detects Shopify vs WooCommerce).',
+          },
+          collection: { type: 'string', description: 'Optional Shopify/WooCommerce collection or category slug.' },
+          fields: {
+            type: 'string',
+            enum: ['full', 'lean'],
+            default: 'full',
+            description: '"full" includes descriptionText and images; "lean" keeps pricing/SKU/availability fields compact.',
+          },
+          maxPages: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum catalog pages to fetch sequentially.' },
+          pauseMs: { type: 'integer', minimum: 500, maximum: 30000, description: 'Polite pause between sequential pages in ms (>= 2000ms on Shopify).' },
+          sync: { type: 'boolean', default: true, description: 'Set false to run asynchronously via waitUntil and poll with catalogId.' },
+          offset: { type: 'integer', minimum: 0, description: 'Record offset when paging an existing catalogId.' },
+          limit: { type: 'integer', minimum: 1, maximum: 250, description: 'Max records to return when paging an existing catalogId (default 50).' },
+          vendor: {
+            anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+            description: 'Optional vendor/brand filter when paging catalogId records.',
+          },
+          productType: {
+            anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+            description: 'Optional productType filter when paging catalogId records.',
+          },
+          availableOnly: { type: 'boolean', description: 'When true on catalogId record queries, keep only products with >=1 available variant.' },
+          query: { type: 'string', description: 'Optional keyword search across title, handle, vendor, tags, and SKUs when paging catalogId.' },
+          target: { type: 'string', enum: allowedTargets, default: defaultTarget },
+          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+        },
         additionalProperties: false,
       },
     },
@@ -1026,6 +1126,7 @@ function buildToolDefinitions(deps: McpServerDeps) {
       if (t.name === 'interact') return Boolean(deps.executeInteract);
       if (t.name === 'read_artifact') return Boolean(deps.readArtifact);
       if (t.name === 'jobs') return Boolean(deps.executeJobs);
+      if (t.name === 'catalog') return Boolean(deps.executeCatalog);
       if (t.name === 'find_extractors') return Boolean(deps.findExtractors);
       if (t.name === 'agent') return Boolean(deps.executeAgent);
       return true;
@@ -1044,6 +1145,17 @@ export function truncateResultBodies(
   const results = parsed.results.map((item) => {
     if (!item || typeof item !== 'object') return item;
     const copy = { ...(item as Record<string, unknown>) };
+    if (copy.headers !== undefined) {
+      const safeHdrs =
+        copy.headers && typeof copy.headers === 'object' && !Array.isArray(copy.headers)
+          ? filterSafeResponseHeaders(copy.headers as Record<string, string | undefined>)
+          : undefined;
+      if (safeHdrs) {
+        copy.headers = safeHdrs;
+      } else {
+        delete copy.headers;
+      }
+    }
     const art = copy.artifact as { blobSha256?: string; retention?: string } | undefined;
     if (art?.blobSha256) {
       copy.artifactId = art.blobSha256;
@@ -1062,17 +1174,17 @@ export function truncateResultBodies(
       promotedTruncatedErrors++;
     }
 
-    // When caller omitted `kind` (`autoInferredKind === true`) and an extensionless URL returned HTTP 2xx with a valid
-    // JSON/XML/text/Markdown/vCard/CSV payload and body, promote `kind="page"` skip to `ok` instead of failing the caller.
+    // When caller omitted `kind` (`autoInferredKind === true` or `copy.kindAuto === true`) and an extensionless URL returned HTTP 2xx with a valid
+    // JSON/XML/RSS/Atom/text/Markdown/vCard/CSV payload and body, promote `kind="page"`/`"json"`/`"text"` skip to `ok` instead of failing the caller.
     if (
-      autoInferredKind &&
+      (autoInferredKind || copy.kindAuto === true) &&
       copy.outcome === 'skip' &&
       typeof copy.status === 'number' &&
       copy.status >= 200 &&
       copy.status < 300 &&
       ((typeof copy.body === 'string' && copy.body.length > 0) || Boolean(art?.blobSha256)) &&
       typeof copy.contentType === 'string' &&
-      /^(?:text\/|application\/(?:[a-z0-9.+-]*\+)?(?:json|xml|rss|atom|yaml|csv|javascript)|application\/x-ndjson)/i.test(
+      /^(?:text\/|application\/(?:[a-z0-9.+-]*\+)?(?:json|xml)|application\/(?:xhtml\+xml|rss\+xml|atom\+xml|yaml|x-yaml|csv|javascript|x-ndjson))(?:[;\s]|$)/i.test(
         copy.contentType.trim(),
       )
     ) {
@@ -1107,12 +1219,23 @@ export function truncateResultBodies(
         });
         if (inferredWaf) copy.waf = inferredWaf;
       }
-      const blocked = buildBlockedInfo(copy.url, copy.outcome, copy.problem, copy.status, {
+      if ((copy.status === 429 || copy.outcome === 'rate_limited') && copy.outcome !== 'challenge' && !copy.waf) {
+        copy.rateLimited = true;
+      }
+      const baseBlocked = buildBlockedInfo(copy.url, copy.outcome, copy.problem, copy.status, {
         headers:
           copy.paymentHeaders && typeof copy.paymentHeaders === 'object' && !Array.isArray(copy.paymentHeaders)
             ? (copy.paymentHeaders as Record<string, string | undefined>)
             : undefined,
         rawBody: typeof copy.body === 'string' && (!copy.bodyEncoding || copy.bodyEncoding === 'utf-8') ? copy.body : undefined,
+      }) as Record<string, unknown> | null;
+      const blocked = refineBlockedInfo({
+        url: copy.url,
+        outcome: copy.outcome,
+        problem: copy.problem,
+        status: copy.status,
+        retryAfter: copy.retryAfter,
+        baseBlocked,
       });
       if (blocked) copy.blocked = blocked;
       if (typeof copy.body === 'string' && copy.body.includes('cf-footer-ip')) {
@@ -1227,6 +1350,7 @@ async function handleToolCallInner(
           id: 'mcp-1',
           url: check.url,
           kind,
+          ...(explicitKind === undefined ? { kindAuto: true } : {}),
           ...(accept.accept ? { accept: accept.accept } : {}),
           ...(typeof args.ifNoneMatch === 'string' && args.ifNoneMatch ? { ifNoneMatch: args.ifNoneMatch } : {}),
           ...(typeof args.ifModifiedSince === 'string' && args.ifModifiedSince ? { ifModifiedSince: args.ifModifiedSince } : {}),
@@ -1238,12 +1362,25 @@ async function handleToolCallInner(
       }
       requests = [];
       for (let i = 0; i < args.urls.length; i++) {
-        const check = validatePublicHttpsUrl(args.urls[i], deps.selfHost);
+        const rawEntry = args.urls[i];
+        const entryObj = rawEntry && typeof rawEntry === 'object' && !Array.isArray(rawEntry) ? (rawEntry as Record<string, unknown>) : null;
+        const rawUrlVal = entryObj ? entryObj.url : rawEntry;
+        const itemExplicitKind =
+          entryObj && (entryObj.kind === 'feed' || entryObj.kind === 'json' || entryObj.kind === 'text' || entryObj.kind === 'page')
+            ? entryObj.kind
+            : explicitKind;
+        const check = validatePublicHttpsUrl(rawUrlVal, deps.selfHost);
         if (!check.ok) return { content: [{ type: 'text', text: `urls[${i}]: ${check.error}` }], isError: true };
-        const kind = explicitKind ?? inferKindForUrl(check.url);
-        const accept = textAcceptFor(kind, check.url, args.accept);
+        const kind = itemExplicitKind ?? inferKindForUrl(check.url);
+        const accept = textAcceptFor(kind, check.url, entryObj?.accept ?? args.accept);
         if (!accept.ok) return { content: [{ type: 'text', text: accept.error }], isError: true };
-        requests.push({ id: `mcp-${i + 1}`, url: check.url, kind, ...(accept.accept ? { accept: accept.accept } : {}) });
+        requests.push({
+          id: `mcp-${i + 1}`,
+          url: check.url,
+          kind,
+          ...(itemExplicitKind === undefined ? { kindAuto: true } : {}),
+          ...(accept.accept ? { accept: accept.accept } : {}),
+        });
       }
     }
 
@@ -1473,6 +1610,20 @@ async function handleToolCallInner(
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'catalog') {
+    if (!scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+    }
+    if (!deps.executeCatalog) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'catalog_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeCatalog({ args, principal });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status >= 400 ? { isError: true } : {}),
     };
   }
 

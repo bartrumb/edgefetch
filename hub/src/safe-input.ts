@@ -79,6 +79,17 @@ export async function readBodyTextCapped(
 }
 
 /**
+ * Decodes a URI component without throwing an uncaught `URIError` on malformed percent-encoding (`%zz`, `%E0%A4%A`).
+ */
+export function safeDecodeURIComponent(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * ASCII-only lowercasing (`A-Z` -> `a-z`) that strictly preserves UTF-16 `.length` and 1:1 code-unit offsets on 100%
  * of inputs (`M3` — prevents `'İ'.toLowerCase()` -> `'i\u0307'` length expansion from shifting slice indices!).
  */
@@ -87,8 +98,8 @@ export function asciiLower(s: string): string {
 }
 
 export function isTagNameBoundary(ch: number): boolean {
-  // space (0x20), tab (0x09), LF (0x0A), FF (0x0C), CR (0x0D), '/' (0x2F), '>' (0x3E) (`M3`)
-  return ch === 32 || ch === 9 || ch === 10 || ch === 12 || ch === 13 || ch === 47 || ch === 62;
+  // space (0x20), tab (0x09), LF (0x0A), VT (0x0B), FF (0x0C), CR (0x0D), '/' (0x2F), '>' (0x3E) (`M3` & `R3-H2`)
+  return ch === 32 || ch === 9 || ch === 10 || ch === 11 || ch === 12 || ch === 13 || ch === 47 || ch === 62;
 }
 
 function isAsciiAlpha(ch: number): boolean {
@@ -96,9 +107,14 @@ function isAsciiAlpha(ch: number): boolean {
   return lower >= 97 && lower <= 122;
 }
 
-function isTagNameChar(ch: number): boolean {
-  const lower = ch | 32;
-  return (lower >= 97 && lower <= 122) || (ch >= 48 && ch <= 57) || ch === 45 /* '-' */ || ch === 58 /* ':' */;
+export interface ScannerDeadState {
+  mask?: Uint8Array;
+  noCommentCloseFrom?: number;
+  noCdataCloseFrom?: number;
+  nextStdCommentClose?: number;
+  nextBangCommentClose?: number;
+  nextCdataClose?: number;
+  nextGtPos?: number;
 }
 
 function markDeadTagScanPath(src: string, fromIdx: number, stopIdx: number, deadMask: Uint8Array): void {
@@ -128,7 +144,7 @@ function markDeadTagScanPath(src: string, fromIdx: number, stopIdx: number, dead
 export function findTagOpenEndQuoteAware(
   src: string,
   fromIdx: number,
-  deadRef?: { mask?: Uint8Array },
+  deadRef?: ScannerDeadState,
 ): number {
   const existingMask = deadRef?.mask;
   if (existingMask && fromIdx < existingMask.length && (existingMask[fromIdx]! & 1) !== 0) {
@@ -160,6 +176,45 @@ export function findTagOpenEndQuoteAware(
   return -1;
 }
 
+/**
+ * Finds the exclusive end index (right after `>`) of an HTML5 comment starting with `<!--` at `ltIdx` (`R3-H1`).
+ * Handles WHATWG HTML5 abrupt comments (`<!-->`, `<!--->`), bang-closed comments (`--!>`), and standard `-->`
+ * with monotonic + dead-path memoization so `'<!--'.repeat(70_000)` runs in guaranteed **O(N)** (`< 5ms`) time!
+ */
+function findHtmlCommentCloseEnd(src: string, ltIdx: number, deadRef: ScannerDeadState): number {
+  const bodyStart = ltIdx + 4;
+  const len = src.length;
+  if (bodyStart < len && src.charCodeAt(bodyStart) === 62 /* '>' */) {
+    return bodyStart + 1;
+  }
+  if (bodyStart + 1 < len && src.charCodeAt(bodyStart) === 45 /* '-' */ && src.charCodeAt(bodyStart + 1) === 62 /* '>' */) {
+    return bodyStart + 2;
+  }
+  if (deadRef.noCommentCloseFrom !== undefined && bodyStart >= deadRef.noCommentCloseFrom) {
+    return -1;
+  }
+  let stdIdx = deadRef.nextStdCommentClose ?? -2;
+  if (stdIdx !== -1 && stdIdx < bodyStart) {
+    stdIdx = src.indexOf('-->', bodyStart);
+    deadRef.nextStdCommentClose = stdIdx;
+  }
+  let bangIdx = deadRef.nextBangCommentClose ?? -2;
+  if (bangIdx !== -1 && bangIdx < bodyStart) {
+    bangIdx = src.indexOf('--!>', bodyStart);
+    deadRef.nextBangCommentClose = bangIdx;
+  }
+  if (stdIdx < 0 && bangIdx < 0) {
+    if (deadRef.noCommentCloseFrom === undefined || bodyStart < deadRef.noCommentCloseFrom) {
+      deadRef.noCommentCloseFrom = bodyStart;
+    }
+    return -1;
+  }
+  if (stdIdx >= 0 && (bangIdx < 0 || stdIdx <= bangIdx)) {
+    return stdIdx + 3;
+  }
+  return bangIdx + 4;
+}
+
 export interface ScannedHtmlTag {
   index: number;
   end: number; // exclusive index right after '>'
@@ -174,7 +229,7 @@ export interface ScannedHtmlTag {
 function tryParseTagAt(
   src: string,
   ltIdx: number,
-  deadRef: { mask?: Uint8Array },
+  deadRef: ScannerDeadState,
   allowDeclarations: boolean,
 ): ScannedHtmlTag | null {
   const len = src.length;
@@ -192,12 +247,13 @@ function tryParseTagAt(
     isDeclaration = true;
     p++;
     if (p >= len) return null;
-    // Handle `<!-- ... -->` or `<![CDATA[ ... ]]>` or `<!DOCTYPE ...>` / `<?xml ...>`
+    // Handle `<!-- ... -->` / `<!-->` / `<!--->` / `--!>` or `<![CDATA[ ... ]]>` or `<!DOCTYPE ...>` / `<?xml ...>`
     const declNext = src.charCodeAt(p);
     if (first === 33 && declNext === 45 && p + 1 < len && src.charCodeAt(p + 1) === 45) {
-      const commentEnd = src.indexOf('-->', p + 2);
-      if (commentEnd < 0) return null;
-      const end = commentEnd + 3;
+      const end = findHtmlCommentCloseEnd(src, ltIdx, deadRef);
+      if (end < 0) return null;
+      const bodyStart = ltIdx + 4;
+      const innerEnd = end <= bodyStart + 2 ? bodyStart : src.charCodeAt(end - 2) === 33 /* '!' */ ? end - 4 : end - 3;
       return {
         index: ltIdx,
         end,
@@ -206,12 +262,25 @@ function tryParseTagAt(
         isClosing: false,
         isSelfClosing: true,
         isDeclaration: true,
-        attrs: src.slice(p + 2, commentEnd),
+        attrs: innerEnd > bodyStart ? src.slice(bodyStart, innerEnd) : '',
       };
     }
-    if (first === 33 && src.startsWith('[CDATA[', p)) {
-      const cdataEnd = src.indexOf(']]>', p + 7);
-      if (cdataEnd < 0) return null;
+    if (first === 33 && declNext === 91 /* '[' */ && src.startsWith('[CDATA[', p)) {
+      const afterCdata = p + 7;
+      if (deadRef.noCdataCloseFrom !== undefined && afterCdata >= deadRef.noCdataCloseFrom) {
+        return null;
+      }
+      let cdataEnd = deadRef.nextCdataClose ?? -2;
+      if (cdataEnd !== -1 && cdataEnd < afterCdata) {
+        cdataEnd = src.indexOf(']]>', afterCdata);
+        deadRef.nextCdataClose = cdataEnd;
+      }
+      if (cdataEnd < 0) {
+        if (deadRef.noCdataCloseFrom === undefined || afterCdata < deadRef.noCdataCloseFrom) {
+          deadRef.noCdataCloseFrom = afterCdata;
+        }
+        return null;
+      }
       const end = cdataEnd + 3;
       return {
         index: ltIdx,
@@ -221,7 +290,7 @@ function tryParseTagAt(
         isClosing: false,
         isSelfClosing: true,
         isDeclaration: true,
-        attrs: src.slice(p + 7, cdataEnd),
+        attrs: src.slice(afterCdata, cdataEnd),
       };
     }
     if (!isAsciiAlpha(declNext)) return null;
@@ -231,13 +300,21 @@ function tryParseTagAt(
 
   const nameStart = isDeclaration ? ltIdx + 1 : p;
   p++;
-  while (p < len && isTagNameChar(src.charCodeAt(p))) p++;
-  if (p >= len || !isTagNameBoundary(src.charCodeAt(p))) return null;
+  // HTML5 Tag Name state (`R3-H2`): once `<` + ASCII alpha opens a tag, ALL characters up to a tag-name boundary
+  // (`\t`, `\n`, `\v`, `\f`, `\r`, `' '`, `'/'`, `'>'`) belong to this single tag name (preventing `<im<form>` split-tag bypasses).
+  while (p < len && !isTagNameBoundary(src.charCodeAt(p))) p++;
+  if (p >= len) return null;
 
-  const openEnd = findTagOpenEndQuoteAware(src, p, deadRef);
-  if (openEnd < 0) return null;
+  // HTML5 End Tag state (`R3-H2`): closing tags `</tag ...>` close at the FIRST `>` without parsing quoted attributes!
+  const openEnd = isClosing ? src.indexOf('>', p) : findTagOpenEndQuoteAware(src, p, deadRef);
+  if (openEnd < 0) {
+    if (isClosing) deadRef.nextGtPos = -1;
+    return null;
+  }
 
-  const tagNameLower = asciiLower(src.slice(nameStart, p));
+  const rawName = src.slice(nameStart, p);
+  const cleanName = rawName.indexOf('\u0000') >= 0 ? rawName.replace(/\u0000/g, '') : rawName;
+  const tagNameLower = asciiLower(cleanName);
   const rawAttrs = src.slice(p, openEnd);
   const isSelfClosing = !isClosing && (isDeclaration || src.charCodeAt(openEnd - 1) === 47 /* '/' */);
   const attrs = !isClosing && !isDeclaration && isSelfClosing ? rawAttrs.slice(0, -1) : rawAttrs;
@@ -254,8 +331,59 @@ function tryParseTagAt(
 }
 
 /**
- * General O(N) quote-aware HTML tag scanner (`H1`).
- * Never rescans unclosed `<tag ...` suffixes thanks to 3-state quote dead-path memoization.
+ * Prevents split-tag reassembly (`R3-H2`: `<<form></form>img src=x onerror=alert(1)>` or `<im<form></form>g ...>`)
+ * whenever a tag/element/comment is deleted with an empty string `''`. If the accumulated output ends with an
+ * unclosed `<` tag-open prefix (`<`, `</`, `<!`, `<?`, or `<tagchars` with no `>`/whitespace/quote), escapes that
+ * trailing `<` to `&lt;` unless `deferReassemblySet` contains the resulting tag name (so nested `<scr<style></style>ipt>`
+ * inside `stripHtmlTagsLinear` still collapses and strips the outer `<script>...</script>` block completely!).
+ */
+function guardSplitTagReassemblyOnEmptyRemoval(
+  out: string[],
+  nextSuffix: string,
+  deferReassemblySet?: ReadonlySet<string>,
+): void {
+  if (!nextSuffix) return;
+  let chunkIdx = out.length - 1;
+  while (chunkIdx >= 0 && out[chunkIdx]!.length === 0) chunkIdx--;
+  if (chunkIdx < 0) return;
+  const tail = out[chunkIdx]!;
+  const minScan = Math.max(0, tail.length - 64);
+  let ltPos = -1;
+  for (let i = tail.length - 1; i >= minScan; i--) {
+    const ch = tail.charCodeAt(i);
+    if (ch === 62 /* '>' */ || ch === 34 /* '"' */ || ch === 39 /* "'" */ || ch === 61 /* '=' */) {
+      return;
+    }
+    if (ch === 32 || ch === 9 || ch === 10 || ch === 11 || ch === 12 || ch === 13) {
+      return;
+    }
+    if (ch === 60 /* '<' */) {
+      ltPos = i;
+      break;
+    }
+  }
+  if (ltPos < 0) return;
+
+  if (deferReassemblySet && deferReassemblySet.size > 0) {
+    const prefixAfterLt = tail.slice(ltPos + 1);
+    const combined = asciiLower((prefixAfterLt + nextSuffix.slice(0, 24)).replace(/\u0000/g, ''));
+    const checkStart = combined.startsWith('/') ? 1 : 0;
+    for (const target of deferReassemblySet) {
+      if (combined.startsWith(target, checkStart)) {
+        const afterIdx = checkStart + target.length;
+        if (afterIdx < combined.length && isTagNameBoundary(combined.charCodeAt(afterIdx))) {
+          return;
+        }
+      }
+    }
+  }
+
+  out[chunkIdx] = `${tail.slice(0, ltPos)}&lt;${tail.slice(ltPos + 1)}`;
+}
+
+/**
+ * General O(N) quote-aware HTML tag scanner (`H1` & `R3-H1`).
+ * Never rescans unclosed `<tag ...`, `<!--`, or `<![CDATA[` suffixes thanks to dead-path memoization.
  */
 export function scanHtmlTagsLinear(
   rawHtml: string,
@@ -264,13 +392,27 @@ export function scanHtmlTagsLinear(
   allowDeclarations = false,
 ): void {
   const src = rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
-  const deadRef: { mask?: Uint8Array } = {};
+  const deadRef: ScannerDeadState = {};
   let pos = src.indexOf('<');
   while (pos >= 0 && pos < src.length) {
     const parsed = tryParseTagAt(src, pos, deadRef, allowDeclarations);
     if (!parsed) {
-      // Fast bailout: if `deadRef.mask` just proved no unquoted `>` exists from a state-0 index, check if ANY `>` remains at all!
-      if (deadRef.mask && src.indexOf('>', pos + 1) < 0) break;
+      if (deadRef.mask || deadRef.noCommentCloseFrom !== undefined || deadRef.noCdataCloseFrom !== undefined || deadRef.nextGtPos === -1) {
+        if (deadRef.nextGtPos === undefined || (deadRef.nextGtPos !== -1 && deadRef.nextGtPos <= pos)) {
+          deadRef.nextGtPos = src.indexOf('>', pos + 1);
+        }
+        if (deadRef.nextGtPos < 0) break;
+      }
+      if (allowDeclarations && pos + 3 < src.length && src.charCodeAt(pos + 1) === 33) {
+        if (src.charCodeAt(pos + 2) === 45 && src.charCodeAt(pos + 3) === 45) {
+          pos = src.indexOf('<', pos + 4);
+          continue;
+        }
+        if (src.charCodeAt(pos + 2) === 91 && src.startsWith('[CDATA[', pos + 2)) {
+          pos = src.indexOf('<', pos + 9);
+          continue;
+        }
+      }
       pos = src.indexOf('<', pos + 1);
       continue;
     }
@@ -281,7 +423,7 @@ export function scanHtmlTagsLinear(
 }
 
 /**
- * Linear O(N) quote-aware HTML tag replacer (`H1`).
+ * Linear O(N) quote-aware HTML tag replacer (`H1` & `R3-H2`).
  */
 export function replaceHtmlTagsQuoteAwareLinear(
   rawHtml: string,
@@ -297,7 +439,12 @@ export function replaceHtmlTagsQuoteAwareLinear(
     src,
     (tag) => {
       if (tag.index > cursor) out.push(src.slice(cursor, tag.index));
-      out.push(replacer(tag));
+      const rep = replacer(tag);
+      if (rep === '' && tag.end < src.length) {
+        guardSplitTagReassemblyOnEmptyRemoval(out, src.slice(tag.end, tag.end + 24));
+      } else {
+        out.push(rep);
+      }
       cursor = tag.end;
     },
     maxChars,
@@ -338,7 +485,12 @@ export function replaceHtmlOpenTagsLinear(
     (tag) => {
       if (tag.isClosing || tag.isDeclaration || !targetSet.has(tag.tagNameLower)) return;
       if (tag.index > cursor) out.push(src.slice(cursor, tag.index));
-      out.push(replacer(tag));
+      const rep = replacer(tag);
+      if (rep === '' && tag.end < src.length) {
+        guardSplitTagReassemblyOnEmptyRemoval(out, src.slice(tag.end, tag.end + 24));
+      } else {
+        out.push(rep);
+      }
       cursor = tag.end;
     },
     maxChars,
@@ -364,7 +516,7 @@ function findNextValidCloseTag(lower: string, src: string, closeNeedle: string, 
 /**
  * Linear O(N) paired-element replacer (`<a>...</a>`, `<pre>...</pre>`, `<h1..h6>`, `<math>`, `<figcaption>`, etc.).
  * Uses BOTH 3-state quote dead-path memoization AND monotonic per-tag close-position caching so unclosed tags,
- * unclosed quotes, `'<a><a>'.repeat(12000)`, and `maxInnerChars`-bounded elements run in guaranteed O(N) time (`H1`).
+ * unclosed quotes, `'<a><a>'.repeat(12000)`, and `maxInnerChars`-bounded elements run in guaranteed O(N) time (`H1` & `R3-H2`).
  */
 export function replacePairedHtmlElementsLinear(
   rawHtml: string,
@@ -387,7 +539,7 @@ export function replacePairedHtmlElementsLinear(
   }
   if (!hasAny) return src;
 
-  const deadRef: { mask?: Uint8Array } = {};
+  const deadRef: ScannerDeadState = {};
   // Monotonic cached close tag index per tag name (`-2` = uninitialized, `-1` = none left anywhere in `src`)
   const cachedCloseByTag = new Map<string, number>();
   for (const t of targetSet) cachedCloseByTag.set(t, -2);
@@ -399,7 +551,12 @@ export function replacePairedHtmlElementsLinear(
   while (pos >= 0 && pos < src.length) {
     const parsed = tryParseTagAt(src, pos, deadRef, false);
     if (!parsed) {
-      if (deadRef.mask && src.indexOf('>', pos + 1) < 0) break;
+      if (deadRef.mask || deadRef.nextGtPos === -1) {
+        if (deadRef.nextGtPos === undefined || (deadRef.nextGtPos !== -1 && deadRef.nextGtPos <= pos)) {
+          deadRef.nextGtPos = src.indexOf('>', pos + 1);
+        }
+        if (deadRef.nextGtPos < 0) break;
+      }
       pos = src.indexOf('<', pos + 1);
       continue;
     }
@@ -409,7 +566,12 @@ export function replacePairedHtmlElementsLinear(
     }
     if (parsed.isSelfClosing) {
       if (parsed.index > cursor) out.push(src.slice(cursor, parsed.index));
-      out.push(replacer(parsed.rawTag, parsed.tagNameLower, parsed.attrs, ''));
+      const rep = replacer(parsed.rawTag, parsed.tagNameLower, parsed.attrs, '');
+      if (rep === '' && parsed.end < src.length) {
+        guardSplitTagReassemblyOnEmptyRemoval(out, src.slice(parsed.end, parsed.end + 24));
+      } else {
+        out.push(rep);
+      }
       cursor = parsed.end;
       pos = src.indexOf('<', cursor);
       continue;
@@ -429,7 +591,8 @@ export function replacePairedHtmlElementsLinear(
       pos = src.indexOf('<', parsed.end);
       continue;
     }
-    const closeEnd = findTagOpenEndQuoteAware(src, closePos + 2 + tag.length, deadRef);
+    // HTML5 End Tag state (`R3-H2`): closing tags close at the FIRST `>`, never swallowing quoted attributes across later elements!
+    const closeEnd = src.indexOf('>', closePos + 2 + tag.length);
     if (closeEnd < 0) {
       cachedCloseByTag.set(tag, -1);
       pos = src.indexOf('<', parsed.end);
@@ -437,7 +600,12 @@ export function replacePairedHtmlElementsLinear(
     }
     if (parsed.index > cursor) out.push(src.slice(cursor, parsed.index));
     const inner = src.slice(parsed.end, closePos);
-    out.push(replacer(src.slice(parsed.index, closeEnd + 1), tag, parsed.attrs, inner));
+    const rep = replacer(src.slice(parsed.index, closeEnd + 1), tag, parsed.attrs, inner);
+    if (rep === '' && closeEnd + 1 < src.length) {
+      guardSplitTagReassemblyOnEmptyRemoval(out, src.slice(closeEnd + 1, closeEnd + 25));
+    } else {
+      out.push(rep);
+    }
     cursor = closeEnd + 1;
     pos = src.indexOf('<', cursor);
   }
@@ -447,25 +615,46 @@ export function replacePairedHtmlElementsLinear(
   return out.join('');
 }
 
+const DANGEROUS_BLOCK_TAG_SET: ReadonlySet<string> = new Set([
+  'script',
+  'style',
+  'noscript',
+  'template',
+  'iframe',
+  'svg',
+  'object',
+  'embed',
+]);
+
 /**
- * Pure `indexOf` O(N) HTML comment stripper (`<!-- ... -->`) with zero regex backtracking (`M4`).
+ * Pure `indexOf` O(N) HTML comment stripper (`<!-- ... -->`, `<!-->`, `<!--->`, `--!>`) with dead-path memoization
+ * (`M4` & `R3-H1`) and without swallowing the rest of the document on unterminated `<!--` tokens.
  */
 export function stripHtmlCommentsLinear(rawHtml: string, maxChars = MAX_HTML_SCAN_CHARS): string {
   const src = rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
   let pos = src.indexOf('<!--');
   if (pos < 0) return src;
+  const deadRef: ScannerDeadState = {};
   const out: string[] = [];
   let cursor = 0;
   while (pos >= 0) {
-    out.push(src.slice(cursor, pos));
-    const closeIdx = src.indexOf('-->', pos + 4);
-    if (closeIdx < 0) {
-      cursor = src.length;
-      break;
+    const closeEnd = findHtmlCommentCloseEnd(src, pos, deadRef);
+    if (closeEnd < 0) {
+      // Unterminated `<!--`: no `-->` or `--!>` exists anywhere after `pos + 4`. Jump directly to any abrupt `<!-->` / `<!--->` if present!
+      const abrupt1 = src.indexOf('<!-->', pos + 4);
+      const abrupt2 = src.indexOf('<!--->', pos + 4);
+      if (abrupt1 < 0 && abrupt2 < 0) break;
+      pos = abrupt1 >= 0 && (abrupt2 < 0 || abrupt1 <= abrupt2) ? abrupt1 : abrupt2;
+      continue;
     }
-    cursor = closeIdx + 3;
+    if (pos > cursor) out.push(src.slice(cursor, pos));
+    if (closeEnd < src.length) {
+      guardSplitTagReassemblyOnEmptyRemoval(out, src.slice(closeEnd, closeEnd + 24), DANGEROUS_BLOCK_TAG_SET);
+    }
+    cursor = closeEnd;
     pos = src.indexOf('<!--', cursor);
   }
+  if (cursor === 0) return src;
   if (cursor < src.length) out.push(src.slice(cursor));
   return out.join('');
 }
@@ -473,22 +662,24 @@ export function stripHtmlCommentsLinear(rawHtml: string, maxChars = MAX_HTML_SCA
 /**
  * Pure `indexOf` O(N) HTML element replacer/stripper for a single tag (`<noscript>`, `<iframe>`, `<script>`).
  * Prevents quadratic `O(N^2)` backtracking when an adversarial HTML document contains 20,000+ unclosed `<noscript>` tags (`M4`),
- * and uses `asciiLower` + form-feed boundary (`M3`).
+ * uses `asciiLower` + vertical-tab/form-feed boundaries, strips NULs, and prevents split-tag `<img` reassembly (`R3-H2`).
  */
 export function replaceHtmlTagBlocksLinear(
   rawHtml: string,
   tagNameLower: string,
   replacer: (fullMatch: string, attrStr: string, innerHtml: string) => string,
   maxChars = MAX_HTML_SCAN_CHARS,
+  deferReassemblySet?: ReadonlySet<string>,
 ): string {
-  const src = rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
+  const capped = rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
+  const src = capped.indexOf('\u0000') >= 0 ? capped.replace(/\u0000/g, '') : capped;
   const lower = asciiLower(src);
   const openNeedle = `<${tagNameLower}`;
   const closeNeedle = `</${tagNameLower}`;
   let firstHit = lower.indexOf(openNeedle, 0);
   if (firstHit < 0) return src;
 
-  const deadRef: { mask?: Uint8Array } = {};
+  const deadRef: ScannerDeadState = {};
   const out: string[] = [];
   let cursor = 0;
   let cachedClosePos = -2;
@@ -506,10 +697,15 @@ export function replaceHtmlTagBlocksLinear(
       cursor = src.length;
       break;
     }
-    out.push(src.slice(cursor, firstHit));
+    if (firstHit > cursor) out.push(src.slice(cursor, firstHit));
     const attrStr = src.slice(afterNameIdx, openEnd);
     if (src.charCodeAt(openEnd - 1) === 47 /* self-closing '/>' */) {
-      out.push(replacer(src.slice(firstHit, openEnd + 1), attrStr.slice(0, -1), ''));
+      const rep = replacer(src.slice(firstHit, openEnd + 1), attrStr.slice(0, -1), '');
+      if (rep === '' && openEnd + 1 < src.length) {
+        guardSplitTagReassemblyOnEmptyRemoval(out, src.slice(openEnd + 1, openEnd + 25), deferReassemblySet);
+      } else {
+        out.push(rep);
+      }
       cursor = openEnd + 1;
       firstHit = lower.indexOf(openNeedle, cursor);
       continue;
@@ -529,13 +725,19 @@ export function replaceHtmlTagBlocksLinear(
       continue;
     }
 
-    const closeEnd = findTagOpenEndQuoteAware(src, cachedClosePos + closeNeedle.length, deadRef);
+    // HTML5 End Tag state (`R3-H2`): closing tags close at the FIRST `>`, not quote-parsed attributes.
+    const closeEnd = src.indexOf('>', cachedClosePos + closeNeedle.length);
     if (closeEnd < 0) {
       cursor = src.length;
       break;
     }
     const inner = src.slice(openEnd + 1, cachedClosePos);
-    out.push(replacer(src.slice(firstHit, closeEnd + 1), attrStr, inner));
+    const rep = replacer(src.slice(firstHit, closeEnd + 1), attrStr, inner);
+    if (rep === '' && closeEnd + 1 < src.length) {
+      guardSplitTagReassemblyOnEmptyRemoval(out, src.slice(closeEnd + 1, closeEnd + 25), deferReassemblySet);
+    } else {
+      out.push(rep);
+    }
     cursor = closeEnd + 1;
     firstHit = lower.indexOf(openNeedle, cursor);
   }
@@ -545,8 +747,8 @@ export function replaceHtmlTagBlocksLinear(
 }
 
 /**
- * Strips all blocks for a list of HTML tags (`script`, `style`, `noscript`, `template`, `svg`, etc.) in guaranteed O(N) time (`M4` & `M3`).
- * Re-runs `script`/`style` once if stripping nested tags (`<scr<canvas></canvas>ipt>`) reassembled an executable tag.
+ * Strips all blocks for a list of HTML tags (`script`, `style`, `noscript`, `template`, `svg`, etc.) in guaranteed O(N) time (`M4`, `M3`, `R3-H2`).
+ * Strips NUL bytes, prevents split-tag `<img` reassembly on non-target tags, and iterates to fixed point on reassembled target tags (`<sc<st...`).
  */
 export function stripHtmlTagsLinear(
   rawHtml: string,
@@ -554,25 +756,195 @@ export function stripHtmlTagsLinear(
   replacement = '',
   maxChars = MAX_HTML_SCAN_CHARS,
 ): string {
-  let cur = rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
-  let wantsScript = false;
-  let wantsStyle = false;
-  for (const tag of tagNamesLower) {
-    if (tag === 'script') wantsScript = true;
-    if (tag === 'style') wantsStyle = true;
-    cur = replaceHtmlTagBlocksLinear(cur, tag, () => replacement, maxChars);
+  const capped = rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
+  let cur = capped.indexOf('\u0000') >= 0 ? capped.replace(/\u0000/g, '') : capped;
+  const targetSet = new Set(tagNamesLower.map((t) => asciiLower(t)));
+  const deferSet = replacement === '' ? targetSet : undefined;
+
+  for (const tag of targetSet) {
+    cur = replaceHtmlTagBlocksLinear(cur, tag, () => replacement, maxChars, deferSet);
   }
-  if (wantsScript || wantsStyle) {
-    for (let pass = 0; pass < 2; pass++) {
+
+  if (replacement === '' && targetSet.size > 0) {
+    for (let pass = 0; pass < 8; pass++) {
+      const prevLen = cur.length;
       const lower = asciiLower(cur);
-      const hitScript = wantsScript && lower.indexOf('<script') >= 0;
-      const hitStyle = wantsStyle && lower.indexOf('<style') >= 0;
-      if (!hitScript && !hitStyle) break;
-      if (hitScript) cur = replaceHtmlTagBlocksLinear(cur, 'script', () => replacement, maxChars);
-      if (hitStyle) cur = replaceHtmlTagBlocksLinear(cur, 'style', () => replacement, maxChars);
+      let matchedAny = false;
+      for (const tag of targetSet) {
+        if (lower.indexOf(`<${tag}`) >= 0) {
+          matchedAny = true;
+          cur = replaceHtmlTagBlocksLinear(cur, tag, () => replacement, maxChars, deferSet);
+        }
+      }
+      if (!matchedAny || cur.length === prevLen) break;
     }
   }
   return cur;
+}
+
+/**
+ * Linear O(N) CommonMark-aware sanitizer (`R3-H2`) that escapes any residual `<` followed by `[A-Za-z/!?]`
+ * outside fenced code blocks (` ``` ` / ` ~~~ `) and closed inline backtick code spans (`` `...` ``) as `&lt;`.
+ */
+export function escapeResidualHtmlTagsOutsideCode(
+  markdown: string,
+  maxChars = MAX_HTML_SCAN_CHARS,
+): string {
+  if (!markdown || markdown.indexOf('<') < 0) return markdown;
+  const src = markdown.length > maxChars ? markdown.slice(0, maxChars) : markdown;
+  const len = src.length;
+  const out: string[] = [];
+  let cursor = 0;
+  let i = 0;
+  let atLineStart = true;
+
+  // Monotonic per-backtick-run-length cursors (`<= 32` chars) so 200k unclosed backticks run in guaranteed O(N) time!
+  const cachedTickPos = new Map<number, number>();
+  const scannedTickTo = new Map<number, number>();
+  let nextParaBreak = -2;
+
+  const findParaBreakFrom = (fromIdx: number): number => {
+    if (nextParaBreak !== -1 && nextParaBreak < fromIdx) {
+      let search = fromIdx;
+      nextParaBreak = -1;
+      while (search < len) {
+        const nl = src.indexOf('\n', search);
+        if (nl < 0) break;
+        let p = nl + 1;
+        while (p < len && (src.charCodeAt(p) === 32 || src.charCodeAt(p) === 9 || src.charCodeAt(p) === 13)) p++;
+        if (p < len && src.charCodeAt(p) === 10) {
+          nextParaBreak = nl;
+          break;
+        }
+        search = nl + 1;
+      }
+    }
+    return nextParaBreak;
+  };
+
+  const findClosingBacktickRun = (tickLen: number, fromIdx: number): number => {
+    if (tickLen > 32) return -1;
+    let pos = cachedTickPos.get(tickLen) ?? -2;
+    while (pos !== -1 && pos < fromIdx) {
+      let search = Math.max(fromIdx, scannedTickTo.get(tickLen) ?? 0);
+      pos = -1;
+      while (search < len) {
+        const hit = src.indexOf('`', search);
+        if (hit < 0) {
+          scannedTickTo.set(tickLen, len);
+          break;
+        }
+        let end = hit + 1;
+        while (end < len && src.charCodeAt(end) === 96 /* '`' */) end++;
+        const runLen = end - hit;
+        scannedTickTo.set(tickLen, end);
+        if (runLen === tickLen && (hit === 0 || src.charCodeAt(hit - 1) !== 96)) {
+          pos = hit;
+          break;
+        }
+        search = end;
+      }
+      cachedTickPos.set(tickLen, pos);
+    }
+    return pos;
+  };
+
+  while (i < len) {
+    if (atLineStart) {
+      let indent = 0;
+      while (indent < 3 && i + indent < len && src.charCodeAt(i + indent) === 32) indent++;
+      const fPos = i + indent;
+      const fCh = fPos < len ? src.charCodeAt(fPos) : 0;
+      if (fCh === 96 /* '`' */ || fCh === 126 /* '~' */) {
+        let fEnd = fPos + 1;
+        while (fEnd < len && src.charCodeAt(fEnd) === fCh) fEnd++;
+        const fenceLen = fEnd - fPos;
+        if (fenceLen >= 3) {
+          const lineEnd = src.indexOf('\n', fEnd);
+          const infoEnd = lineEnd < 0 ? len : lineEnd;
+          // In CommonMark, backtick fence info strings cannot contain backticks
+          const validFenceOpen = fCh === 126 || src.slice(fEnd, infoEnd).indexOf('`') < 0;
+          if (validFenceOpen) {
+            if (lineEnd < 0) {
+              i = len;
+              break;
+            }
+            let scanLine = lineEnd + 1;
+            let closedEnd = len;
+            while (scanLine < len) {
+              const nextNl = src.indexOf('\n', scanLine);
+              const lEnd = nextNl < 0 ? len : nextNl;
+              let cIndent = 0;
+              while (cIndent < 3 && scanLine + cIndent < lEnd && src.charCodeAt(scanLine + cIndent) === 32) cIndent++;
+              let cPos = scanLine + cIndent;
+              let cTicks = 0;
+              while (cPos < lEnd && src.charCodeAt(cPos) === fCh) {
+                cTicks++;
+                cPos++;
+              }
+              if (cTicks >= fenceLen) {
+                while (
+                  cPos < lEnd &&
+                  (src.charCodeAt(cPos) === 32 || src.charCodeAt(cPos) === 9 || src.charCodeAt(cPos) === 13)
+                ) {
+                  cPos++;
+                }
+                if (cPos === lEnd) {
+                  closedEnd = nextNl < 0 ? len : nextNl + 1;
+                  break;
+                }
+              }
+              if (nextNl < 0) break;
+              scanLine = nextNl + 1;
+            }
+            i = closedEnd;
+            atLineStart = true;
+            continue;
+          }
+        }
+      }
+      atLineStart = false;
+    }
+
+    const ch = src.charCodeAt(i);
+    if (ch === 10 /* '\n' */) {
+      atLineStart = true;
+      i++;
+      continue;
+    }
+    if (ch === 96 /* '`' */) {
+      let tEnd = i + 1;
+      while (tEnd < len && src.charCodeAt(tEnd) === 96) tEnd++;
+      const tickLen = tEnd - i;
+      const closeHit = findClosingBacktickRun(tickLen, tEnd);
+      if (closeHit >= tEnd) {
+        const paraBreak = findParaBreakFrom(tEnd);
+        if (paraBreak < 0 || closeHit < paraBreak) {
+          i = closeHit + tickLen;
+          continue;
+        }
+      }
+      i = tEnd;
+      continue;
+    }
+    if (ch === 60 /* '<' */ && i + 1 < len) {
+      const next = src.charCodeAt(i + 1);
+      if (isAsciiAlpha(next) || next === 47 /* '/' */ || next === 33 /* '!' */ || next === 63 /* '?' */) {
+        if (i > cursor) out.push(src.slice(cursor, i));
+        out.push('&lt;');
+        cursor = i + 1;
+      }
+    }
+    i++;
+  }
+
+  if (cursor === 0 && markdown.length <= maxChars) return markdown;
+  if (cursor < len) out.push(src.slice(cursor));
+  if (markdown.length > maxChars) {
+    // Also escape any `<` in the tail beyond `maxChars` without code-span tracking so >2MiB markdown never passes raw `<tag`
+    out.push(markdown.slice(maxChars).replace(/<(?=[A-Za-z/!?])/g, '&lt;'));
+  }
+  return out.join('');
 }
 
 /** Escapes all ECMAScript RegExp metacharacters in an untrusted literal string (`M5`). */
@@ -580,213 +952,739 @@ export function escapeRegexLiteral(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * Validates and compiles a caller-supplied regular expression (`M4` / `M5`), rejecting:
- *  - Patterns > 160 chars
- *  - Backreferences (`\1`..`\9`, `\k<...>`) and lookbehinds (`(?<=`, `(?<!`)
- *  - ANY parenthesized group `(...)` followed by a quantifier (`+`, `*`, `?`, `{`) if the group body contains ANY
- *    quantifier (`?`, `*`, `+`, `{`), ANY alternation (`|`), OR can match the empty string (`minLen === 0`) —
- *    blocking `(a?a?)+$`, `(aa?)+$`, `([\w-]?[\w-]?)+#`, `(a\b?a?)+$`, `((a+))+$`, and `(a|aa)+$`!
- *  - Patterns with more than 1 unbounded quantifier (`*`, `+`, `{n,}`) anywhere in the pattern — blocking
- *    polynomial `a*a*a*a*b`, `\w*\w*\w*\w*#`, and `(?=(a+))a*b`!
- *  - Excessive bounded quantifiers / alternations (`> 10` total quantifiers or `> 10` alternations, or `{n,m}` > 32).
- */
-export function compileSafeUserRegex(pattern: string, flags = ''): RegExp | null {
-  if (!pattern || pattern.length > 160) return null;
-  if (/\\[1-9]|\\k<|\(\?<[=!]/i.test(pattern)) return null;
+interface RegexCharset {
+  lo: bigint; // ASCII 0..63
+  hi: bigint; // ASCII 64..127
+  nonAscii: boolean;
+}
 
-  interface GroupFrame {
-    isLookaround: boolean;
-    hasQuantifier: boolean;
-    hasAlternation: boolean;
-    branchMinLen: number;
-    minBranchLen: number;
-    lastAtomMinLen: number;
-    canQuantifyLastAtom: boolean;
+const CS_MASK64 = (1n << 64n) - 1n;
+const EMPTY_CHARSET: RegexCharset = { lo: 0n, hi: 0n, nonAscii: false };
+const ALL_CHARSET: RegexCharset = { lo: CS_MASK64, hi: CS_MASK64, nonAscii: true };
+
+function csUnion(a: RegexCharset, b: RegexCharset): RegexCharset {
+  return { lo: a.lo | b.lo, hi: a.hi | b.hi, nonAscii: a.nonAscii || b.nonAscii };
+}
+
+function csDisjoint(a: RegexCharset, b: RegexCharset): boolean {
+  return (a.lo & b.lo) === 0n && (a.hi & b.hi) === 0n && !(a.nonAscii && b.nonAscii);
+}
+
+function csSingleBit(code: number): RegexCharset {
+  if (code < 0 || code >= 128) return { lo: 0n, hi: 0n, nonAscii: true };
+  if (code < 64) return { lo: 1n << BigInt(code), hi: 0n, nonAscii: false };
+  return { lo: 0n, hi: 1n << BigInt(code - 64), nonAscii: false };
+}
+
+function csFromChar(code: number, ignoreCase: boolean, unicodeMode: boolean): RegexCharset {
+  if (code >= 128) {
+    // Under `/iu`, `\u017f` ('ſ') and `\u212a` ('K') fold to ASCII 's' and 'k'
+    if (ignoreCase && unicodeMode && (code === 0x017f || code === 0x212a)) {
+      return ALL_CHARSET;
+    }
+    return { lo: 0n, hi: 0n, nonAscii: true };
+  }
+  let cs = csSingleBit(code);
+  if (ignoreCase) {
+    const lower = code | 32;
+    if (lower >= 97 && lower <= 122) {
+      cs = csUnion(cs, csSingleBit(code ^ 32));
+    }
+  }
+  return cs;
+}
+
+function csRange(fromCode: number, toCode: number, ignoreCase: boolean, unicodeMode: boolean): RegexCharset {
+  let acc = EMPTY_CHARSET;
+  const hiBound = Math.min(toCode, 127);
+  for (let c = Math.max(0, fromCode); c <= hiBound; c++) {
+    acc = csUnion(acc, csFromChar(c, ignoreCase, unicodeMode));
+  }
+  if (toCode >= 128) {
+    acc = csUnion(acc, csFromChar(toCode, ignoreCase, unicodeMode));
+    acc = { lo: acc.lo, hi: acc.hi, nonAscii: true };
+  }
+  return acc;
+}
+
+const CS_DIGITS = csRange(48, 57, false, false);
+const CS_NOT_DIGITS: RegexCharset = { lo: (~CS_DIGITS.lo) & CS_MASK64, hi: (~CS_DIGITS.hi) & CS_MASK64, nonAscii: true };
+const CS_WORD_ASCII = csUnion(
+  csUnion(csRange(65, 90, false, false), csRange(97, 122, false, false)),
+  csUnion(CS_DIGITS, csSingleBit(95 /* '_' */)),
+);
+const CS_SPACE_ASCII: RegexCharset = {
+  lo: (1n << 9n) | (1n << 10n) | (1n << 11n) | (1n << 12n) | (1n << 13n) | (1n << 32n),
+  hi: 0n,
+  nonAscii: true,
+};
+const CS_NOT_SPACE: RegexCharset = {
+  lo: (~CS_SPACE_ASCII.lo) & CS_MASK64,
+  hi: CS_MASK64,
+  nonAscii: true,
+};
+
+type RegexNode =
+  | { kind: 'anchor'; isCaret: boolean; isDollar: boolean }
+  | { kind: 'atom'; cs: RegexCharset; isLiteral: boolean }
+  | {
+      kind: 'group';
+      groupKind: 'normal' | 'pos_lookahead' | 'neg_lookahead';
+      branches: RegexItem[][];
+      hasQuantifier: boolean;
+      hasLookaround: boolean;
+      hasUnbounded: boolean;
+      minLen: number;
+      maxLen: number;
+      firstCs: RegexCharset;
+      allCs: RegexCharset;
+    };
+
+interface RegexItem {
+  node: RegexNode;
+  quantified: boolean;
+  min: number;
+  max: number; // Number.POSITIVE_INFINITY for unbounded
+  minLen: number;
+  maxLen: number;
+  firstCs: RegexCharset;
+  allCs: RegexCharset;
+}
+
+// Validates and compiles a caller-supplied regular expression (`M4`, `M5`, `R3-H3`), supporting leading `(?i)`
+// and disjoint-delimiter multi-segment patterns (`^/[^/]+/[^/]+$`, `/[a-z]+/[a-z]+/`, `/release-notes/v\d+\.\d+\.\d+`,
+// `.*/blog/.*`, `^/blog/.*/comments/.*$`, `^/a/(b|c)?$`) while rejecting:
+//  - Patterns > 160 chars, invalid/duplicate flags, `v` unicodeSets flag, backreferences, and lookbehinds
+//  - Star-height >= 2 (groups repeated `>= 2` times containing inner quantifiers, alternations, lookarounds, or `minLen === 0`)
+//  - Bounded-quantifier & alternation towers (`a{0,32}` x 3+, `a*a?a?a?`, `(aa){1,32}` x 5, lookahead towers) via `branchProduct > 64`
+//  - Overlapping multi-wildcard polynomial patterns (`a*a*b`, `.*.*.*`, `\d+\d+\d+$`, `.*.{0,32}{4}X`).
+export function compileSafeUserRegex(pattern: string, flags = ''): RegExp | null {
+  if (typeof pattern !== 'string' || !pattern || pattern.length > 160) return null;
+  if (typeof flags !== 'string' || flags.length > 8) return null;
+
+  let effectivePattern = pattern;
+  let effectiveFlags = flags;
+  if (effectivePattern.startsWith('(?i)')) {
+    effectivePattern = effectivePattern.slice(4);
+    if (!effectivePattern) return null;
+    if (!effectiveFlags.includes('i')) effectiveFlags += 'i';
   }
 
-  const makeFrame = (isLookaround: boolean): GroupFrame => ({
-    isLookaround,
-    hasQuantifier: false,
-    hasAlternation: false,
-    branchMinLen: 0,
-    minBranchLen: Number.POSITIVE_INFINITY,
-    lastAtomMinLen: 0,
-    canQuantifyLastAtom: false,
-  });
+  // Validate RegExp flags (`v` disallowed to keep character-class grammar unambiguous)
+  const seenFlags = new Set<string>();
+  for (const f of effectiveFlags) {
+    if (!'dgimsuy'.includes(f) || seenFlags.has(f)) return null;
+    seenFlags.add(f);
+  }
 
-  const stack: GroupFrame[] = [makeFrame(false)];
-  let inCharClass = false;
-  let unboundedQuantifiers = 0;
+  if (/\\[1-9]|\\k<|\(\?<[=!]/i.test(effectivePattern)) return null;
+
+  const ignoreCase = seenFlags.has('i');
+  const unicodeMode = seenFlags.has('u');
+  const dotAll = seenFlags.has('s');
+  const multiline = seenFlags.has('m');
+
+  const wordCs: RegexCharset = ignoreCase && unicodeMode ? { ...CS_WORD_ASCII, nonAscii: true } : CS_WORD_ASCII;
+  const notWordCs: RegexCharset =
+    ignoreCase && unicodeMode
+      ? ALL_CHARSET
+      : { lo: (~CS_WORD_ASCII.lo) & CS_MASK64, hi: (~CS_WORD_ASCII.hi) & CS_MASK64, nonAscii: true };
+  const dotCs: RegexCharset = dotAll
+    ? ALL_CHARSET
+    : { lo: CS_MASK64 & ~((1n << 10n) | (1n << 13n)), hi: CS_MASK64, nonAscii: true };
+
   let totalQuantifiers = 0;
   let totalAlternations = 0;
+  let pos = 0;
+  const len = effectivePattern.length;
 
-  const pushAtom = (minLen: number) => {
-    const top = stack[stack.length - 1]!;
-    top.branchMinLen += minLen;
-    top.lastAtomMinLen = minLen;
-    top.canQuantifyLastAtom = true;
+  const parseEscapeOutsideOrInside = (inClass: boolean): { ok: true; isAssertion?: boolean; cs: RegexCharset; isLiteral: boolean } | { ok: false } => {
+    // Assumes `effectivePattern[pos] === '\\'`
+    pos++;
+    if (pos >= len) return { ok: false };
+    const esc = effectivePattern[pos]!;
+    pos++;
+    if (!inClass && (esc === 'b' || esc === 'B')) {
+      return { ok: true, isAssertion: true, cs: EMPTY_CHARSET, isLiteral: false };
+    }
+    if (esc === 'd') return { ok: true, cs: CS_DIGITS, isLiteral: false };
+    if (esc === 'D') return { ok: true, cs: CS_NOT_DIGITS, isLiteral: false };
+    if (esc === 'w') return { ok: true, cs: wordCs, isLiteral: false };
+    if (esc === 'W') return { ok: true, cs: notWordCs, isLiteral: false };
+    if (esc === 's') return { ok: true, cs: CS_SPACE_ASCII, isLiteral: false };
+    if (esc === 'S') return { ok: true, cs: CS_NOT_SPACE, isLiteral: false };
+    if (esc === 't') return { ok: true, cs: csSingleBit(9), isLiteral: true };
+    if (esc === 'n') return { ok: true, cs: csSingleBit(10), isLiteral: true };
+    if (esc === 'v') return { ok: true, cs: csSingleBit(11), isLiteral: true };
+    if (esc === 'f') return { ok: true, cs: csSingleBit(12), isLiteral: true };
+    if (esc === 'r') return { ok: true, cs: csSingleBit(13), isLiteral: true };
+    if (esc === '0') return { ok: true, cs: csSingleBit(0), isLiteral: true };
+    if (esc === 'x') {
+      const hex = effectivePattern.slice(pos, pos + 2);
+      if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
+        pos += 2;
+        return { ok: true, cs: csFromChar(parseInt(hex, 16), ignoreCase, unicodeMode), isLiteral: true };
+      }
+      return { ok: true, cs: csFromChar(120 /* 'x' */, ignoreCase, unicodeMode), isLiteral: true };
+    }
+    if (esc === 'u') {
+      if (effectivePattern[pos] === '{') {
+        const closeBrace = effectivePattern.indexOf('}', pos + 1);
+        if (closeBrace > pos + 1) {
+          const hex = effectivePattern.slice(pos + 1, closeBrace);
+          if (/^[0-9A-Fa-f]{1,6}$/.test(hex)) {
+            const cp = parseInt(hex, 16);
+            if (cp <= 0x10ffff) {
+              pos = closeBrace + 1;
+              return { ok: true, cs: csFromChar(cp, ignoreCase, unicodeMode), isLiteral: true };
+            }
+          }
+        }
+      } else {
+        const hex = effectivePattern.slice(pos, pos + 4);
+        if (/^[0-9A-Fa-f]{4}$/.test(hex)) {
+          pos += 4;
+          return { ok: true, cs: csFromChar(parseInt(hex, 16), ignoreCase, unicodeMode), isLiteral: true };
+        }
+      }
+      return { ok: true, cs: csFromChar(117 /* 'u' */, ignoreCase, unicodeMode), isLiteral: true };
+    }
+    if ((esc === 'p' || esc === 'P') && effectivePattern[pos] === '{') {
+      const closeBrace = effectivePattern.indexOf('}', pos + 1);
+      if (closeBrace < 0) return { ok: false };
+      if (unicodeMode) {
+        pos = closeBrace + 1;
+        return { ok: true, cs: ALL_CHARSET, isLiteral: false };
+      }
+      // Without `/u`, `\p` is literal `'p'` and `{...}` is parsed next in main loop
+      return { ok: true, cs: csFromChar(esc.charCodeAt(0), ignoreCase, unicodeMode), isLiteral: true };
+    }
+    if (esc === 'c') {
+      if (pos < len && isAsciiAlpha(effectivePattern.charCodeAt(pos))) {
+        const ctrl = effectivePattern.charCodeAt(pos) & 31;
+        pos++;
+        return { ok: true, cs: csSingleBit(ctrl), isLiteral: true };
+      }
+      return { ok: true, cs: ALL_CHARSET, isLiteral: false };
+    }
+    return { ok: true, cs: csFromChar(esc.charCodeAt(0), ignoreCase, unicodeMode), isLiteral: true };
   };
 
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i]!;
-    if (ch === '\\') {
-      if (i + 1 >= pattern.length) return null;
-      const esc = pattern[i + 1]!;
-      i++;
-      if (!inCharClass) {
-        // Word-boundary assertions `\b` / `\B` are zero-width (`minLen = 0`); other escapes match >= 1 char.
-        if (esc === 'b' || esc === 'B') {
-          const top = stack[stack.length - 1]!;
-          top.lastAtomMinLen = 0;
-          top.canQuantifyLastAtom = true;
+  const parseCharClass = (): RegexCharset | null => {
+    // Assumes `effectivePattern[pos] === '['`
+    pos++;
+    if (pos >= len) return null;
+    let negated = false;
+    if (effectivePattern[pos] === '^') {
+      negated = true;
+      pos++;
+    }
+    let acc = EMPTY_CHARSET;
+    let hasComplexInsideNegated = false;
+
+    const readClassElem = (): { kind: 'char'; code: number; cs: RegexCharset } | { kind: 'set'; cs: RegexCharset } | null => {
+      if (pos >= len) return null;
+      const c = effectivePattern[pos]!;
+      if (c === '\\') {
+        const save = pos;
+        const escRes = parseEscapeOutsideOrInside(true);
+        if (!escRes.ok) return null;
+        const rawEsc = effectivePattern[save + 1]!;
+        if ('dDwWsSpP'.includes(rawEsc)) {
+          if (negated && 'DWS'.includes(rawEsc) || rawEsc === 'p' || rawEsc === 'P') {
+            hasComplexInsideNegated = true;
+          }
+          return { kind: 'set', cs: escRes.cs };
+        }
+        if (rawEsc === 't') return { kind: 'char', code: 9, cs: escRes.cs };
+        if (rawEsc === 'n') return { kind: 'char', code: 10, cs: escRes.cs };
+        if (rawEsc === 'v') return { kind: 'char', code: 11, cs: escRes.cs };
+        if (rawEsc === 'f') return { kind: 'char', code: 12, cs: escRes.cs };
+        if (rawEsc === 'r') return { kind: 'char', code: 13, cs: escRes.cs };
+        if (rawEsc === '0') return { kind: 'char', code: 0, cs: escRes.cs };
+        if (rawEsc !== 'x' && rawEsc !== 'u' && rawEsc !== 'c') {
+          return { kind: 'char', code: rawEsc.charCodeAt(0), cs: escRes.cs };
+        }
+        hasComplexInsideNegated = negated;
+        return { kind: 'set', cs: escRes.cs };
+      }
+      const cp = effectivePattern.codePointAt(pos)!;
+      pos += cp > 0xffff ? 2 : 1;
+      return { kind: 'char', code: cp, cs: csFromChar(cp, ignoreCase, unicodeMode) };
+    };
+
+    while (pos < len && effectivePattern[pos] !== ']') {
+      const first = readClassElem();
+      if (!first) return null;
+      if (pos + 1 < len && effectivePattern[pos] === '-' && effectivePattern[pos + 1] !== ']') {
+        pos++; // consume '-'
+        const second = readClassElem();
+        if (!second) return null;
+        if (first.kind === 'char' && second.kind === 'char') {
+          if (first.code > second.code) return null;
+          if (negated && (first.code >= 128 || second.code >= 128)) hasComplexInsideNegated = true;
+          acc = csUnion(acc, csRange(first.code, second.code, ignoreCase, unicodeMode));
         } else {
-          pushAtom(1);
+          hasComplexInsideNegated = true;
+          acc = ALL_CHARSET;
         }
+      } else {
+        if (negated && first.kind === 'char' && first.code >= 128) hasComplexInsideNegated = true;
+        acc = csUnion(acc, first.cs);
       }
-      continue;
     }
-    if (inCharClass) {
-      if (ch === ']') {
-        inCharClass = false;
-        pushAtom(1);
-      }
-      continue;
-    }
-    if (ch === '[') {
-      inCharClass = true;
-      continue;
-    }
-    if (ch === '^' || ch === '$') {
-      const top = stack[stack.length - 1]!;
-      top.lastAtomMinLen = 0;
-      top.canQuantifyLastAtom = true;
-      continue;
-    }
-    if (ch === '(') {
-      const next = pattern[i + 1] ?? '';
-      if (next === '?') {
-        const mod = pattern[i + 2] ?? '';
-        if (mod === ':' || mod === '=' || mod === '!') {
-          stack.push(makeFrame(mod === '=' || mod === '!'));
-          i += 2;
+    if (pos >= len || effectivePattern[pos] !== ']') return null;
+    pos++; // consume ']'
+
+    if (!negated) return acc;
+    if (hasComplexInsideNegated) return ALL_CHARSET;
+    return {
+      lo: (~acc.lo) & CS_MASK64,
+      hi: (~acc.hi) & CS_MASK64,
+      nonAscii: true,
+    };
+  };
+
+  const computeSeqSummary = (items: RegexItem[]) => {
+    let minLen = 0;
+    let maxLen = 0;
+    let firstCs = EMPTY_CHARSET;
+    let allCs = EMPTY_CHARSET;
+    let canStillBeFirst = true;
+    let hasQuantifier = false;
+    let hasLookaround = false;
+    let hasUnbounded = false;
+
+    for (const it of items) {
+      if (it.quantified) hasQuantifier = true;
+      if (it.max === Number.POSITIVE_INFINITY) hasUnbounded = true;
+      if (it.node.kind === 'group') {
+        if (it.node.groupKind !== 'normal') {
+          hasLookaround = true;
+          if (it.node.hasQuantifier) hasQuantifier = true;
+          if (it.node.hasUnbounded) hasUnbounded = true;
           continue;
         }
-        if (mod === '<') {
-          const closeAngle = pattern.indexOf('>', i + 3);
-          if (closeAngle < 0) return null;
-          const name = pattern.slice(i + 3, closeAngle);
-          if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) return null;
-          stack.push(makeFrame(false));
-          i = closeAngle;
-          continue;
-        }
-        return null;
+        if (it.node.hasQuantifier) hasQuantifier = true;
+        if (it.node.hasLookaround) hasLookaround = true;
+        if (it.node.hasUnbounded) hasUnbounded = true;
       }
-      stack.push(makeFrame(false));
-      continue;
+      if (it.node.kind === 'anchor') continue;
+
+      if (canStillBeFirst) {
+        firstCs = csUnion(firstCs, it.firstCs);
+        if (it.minLen > 0) canStillBeFirst = false;
+      }
+      allCs = csUnion(allCs, it.allCs);
+      minLen += it.minLen;
+      maxLen = maxLen === Number.POSITIVE_INFINITY || it.maxLen === Number.POSITIVE_INFINITY
+        ? Number.POSITIVE_INFINITY
+        : maxLen + it.maxLen;
     }
-    if (ch === '|') {
-      totalAlternations++;
-      if (totalAlternations > 10) return null;
-      const top = stack[stack.length - 1]!;
-      top.hasAlternation = true;
-      top.minBranchLen = Math.min(top.minBranchLen, top.branchMinLen);
-      top.branchMinLen = 0;
-      top.lastAtomMinLen = 0;
-      top.canQuantifyLastAtom = false;
-      continue;
-    }
-    if (ch === ')') {
-      if (stack.length <= 1) return null; // unbalanced ')'
-      const closed = stack.pop()!;
-      const groupMinLen = closed.isLookaround ? 0 : Math.min(closed.minBranchLen, closed.branchMinLen);
-      const next = pattern[i + 1] ?? '';
-      const groupIsQuantified = next === '+' || next === '*' || next === '?' || next === '{';
-      if (groupIsQuantified) {
-        if (closed.isLookaround || closed.hasQuantifier || closed.hasAlternation || groupMinLen === 0) {
-          return null;
-        }
+
+    return { minLen, maxLen, firstCs, allCs, hasQuantifier, hasLookaround, hasUnbounded };
+  };
+
+  const parseBranches = (depth: number, stopAtParen: boolean): RegexItem[][] | null => {
+    if (depth > 16) return null;
+    const branches: RegexItem[][] = [];
+    let current: RegexItem[] = [];
+
+    while (pos < len) {
+      const ch = effectivePattern[pos]!;
+      if (ch === ')') {
+        if (!stopAtParen) return null;
+        break;
       }
-      const parent = stack[stack.length - 1]!;
-      if (closed.hasQuantifier) parent.hasQuantifier = true;
-      if (closed.hasAlternation) parent.hasAlternation = true;
-      parent.branchMinLen += groupMinLen;
-      parent.lastAtomMinLen = groupMinLen;
-      parent.canQuantifyLastAtom = !closed.isLookaround;
-      continue;
-    }
-    if (ch === '+' || ch === '*' || ch === '?') {
-      const top = stack[stack.length - 1]!;
-      if (!top.canQuantifyLastAtom) return null;
-      totalQuantifiers++;
-      if (totalQuantifiers > 10) return null;
-      if (ch === '+' || ch === '*') {
-        unboundedQuantifiers++;
-        if (unboundedQuantifiers > 1) return null;
-      }
-      if (ch === '*' || ch === '?') {
-        top.branchMinLen -= top.lastAtomMinLen;
-        top.lastAtomMinLen = 0;
-      }
-      top.hasQuantifier = true;
-      top.canQuantifyLastAtom = false;
-      // Optional lazy modifier (`*?`, `+?`, `??`)
-      if (pattern[i + 1] === '?') {
-        i++;
-      }
-      const after = pattern[i + 1] ?? '';
-      if (after === '+' || after === '*' || after === '?' || after === '{') return null;
-      continue;
-    }
-    if (ch === '{') {
-      const braceMatch = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(i));
-      if (!braceMatch) {
-        // Non-quantifier literal `{`
-        pushAtom(1);
+      if (ch === '|') {
+        totalAlternations++;
+        if (totalAlternations > 10) return null;
+        branches.push(current);
+        current = [];
+        pos++;
         continue;
       }
-      const top = stack[stack.length - 1]!;
-      if (!top.canQuantifyLastAtom) return null;
-      const minRep = Number(braceMatch[1]);
-      const rawMax = braceMatch[2];
-      if (!Number.isFinite(minRep) || minRep > 32) return null;
-      totalQuantifiers++;
-      if (totalQuantifiers > 10) return null;
-      if (rawMax === '') {
-        unboundedQuantifiers++;
-        if (unboundedQuantifiers > 1) return null;
-      } else if (rawMax !== undefined) {
-        const maxRep = Number(rawMax);
-        if (!Number.isFinite(maxRep) || maxRep < minRep || maxRep > 32) return null;
+
+      let node: RegexNode | null = null;
+      if (ch === '^' || ch === '$') {
+        pos++;
+        node = { kind: 'anchor', isCaret: ch === '^', isDollar: ch === '$' };
+      } else if (ch === '\\') {
+        const escRes = parseEscapeOutsideOrInside(false);
+        if (!escRes.ok) return null;
+        if (escRes.isAssertion) {
+          node = { kind: 'anchor', isCaret: false, isDollar: false };
+        } else {
+          node = { kind: 'atom', cs: escRes.cs, isLiteral: escRes.isLiteral };
+        }
+      } else if (ch === '[') {
+        const cls = parseCharClass();
+        if (!cls) return null;
+        node = { kind: 'atom', cs: cls, isLiteral: false };
+      } else if (ch === '.') {
+        pos++;
+        node = { kind: 'atom', cs: dotCs, isLiteral: false };
+      } else if (ch === '(') {
+        pos++;
+        let groupKind: 'normal' | 'pos_lookahead' | 'neg_lookahead' = 'normal';
+        if (effectivePattern[pos] === '?') {
+          const mod = effectivePattern[pos + 1] ?? '';
+          if (mod === ':') {
+            pos += 2;
+          } else if (mod === '=') {
+            groupKind = 'pos_lookahead';
+            pos += 2;
+          } else if (mod === '!') {
+            groupKind = 'neg_lookahead';
+            pos += 2;
+          } else if (mod === '<') {
+            const closeAngle = effectivePattern.indexOf('>', pos + 2);
+            if (closeAngle < 0) return null;
+            const name = effectivePattern.slice(pos + 2, closeAngle);
+            if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) return null;
+            pos = closeAngle + 1;
+          } else {
+            return null;
+          }
+        }
+        const innerBranches = parseBranches(depth + 1, true);
+        if (!innerBranches || pos >= len || effectivePattern[pos] !== ')') return null;
+        pos++; // consume ')'
+
+        let minLen = Number.POSITIVE_INFINITY;
+        let maxLen = 0;
+        let firstCs = EMPTY_CHARSET;
+        let allCs = EMPTY_CHARSET;
+        let hasQuantifier = false;
+        let hasLookaround = groupKind !== 'normal';
+        let hasUnbounded = false;
+
+        for (const br of innerBranches) {
+          const sum = computeSeqSummary(br);
+          minLen = Math.min(minLen, sum.minLen);
+          maxLen = Math.max(maxLen, sum.maxLen);
+          firstCs = csUnion(firstCs, sum.firstCs);
+          allCs = csUnion(allCs, sum.allCs);
+          if (sum.hasQuantifier) hasQuantifier = true;
+          if (sum.hasLookaround) hasLookaround = true;
+          if (sum.hasUnbounded) hasUnbounded = true;
+        }
+        if (groupKind !== 'normal') {
+          minLen = 0;
+          maxLen = 0;
+          firstCs = EMPTY_CHARSET;
+          allCs = EMPTY_CHARSET;
+        }
+        node = {
+          kind: 'group',
+          groupKind,
+          branches: innerBranches,
+          hasQuantifier,
+          hasLookaround,
+          hasUnbounded,
+          minLen,
+          maxLen,
+          firstCs,
+          allCs,
+        };
+      } else if (ch === '+' || ch === '*' || ch === '?') {
+        return null; // unquantifiable position
+      } else if (ch === '{') {
+        if (/^\{\d+(?:,\d*)?\}/.test(effectivePattern.slice(pos))) {
+          return null; // quantifier with nothing to quantify
+        }
+        pos++;
+        node = { kind: 'atom', cs: csFromChar(123 /* '{' */, ignoreCase, unicodeMode), isLiteral: true };
+      } else {
+        const cp = effectivePattern.codePointAt(pos)!;
+        pos += cp > 0xffff ? 2 : 1;
+        node = { kind: 'atom', cs: csFromChar(cp, ignoreCase, unicodeMode), isLiteral: true };
       }
-      // Adjust minimum branch length from 1x atom to `minRep`x atom
-      top.branchMinLen += (minRep - 1) * top.lastAtomMinLen;
-      if (minRep === 0) top.lastAtomMinLen = 0;
-      top.hasQuantifier = true;
-      top.canQuantifyLastAtom = false;
-      i += braceMatch[0].length - 1;
-      if (pattern[i + 1] === '?') {
-        i++;
+
+      // Optional trailing quantifier on `node`
+      let quantified = false;
+      let minRep = 1;
+      let maxRep = 1;
+      if (pos < len) {
+        const qch = effectivePattern[pos]!;
+        if (qch === '+' || qch === '*' || qch === '?') {
+          quantified = true;
+          minRep = qch === '+' ? 1 : 0;
+          maxRep = qch === '?' ? 1 : Number.POSITIVE_INFINITY;
+          pos++;
+        } else if (qch === '{') {
+          const bm = /^\{(\d+)(?:,(\d*))?\}/.exec(effectivePattern.slice(pos));
+          if (bm) {
+            quantified = true;
+            minRep = Number(bm[1]);
+            const rawMax = bm[2];
+            if (!Number.isFinite(minRep) || minRep > 32) return null;
+            if (rawMax === undefined) {
+              maxRep = minRep;
+            } else if (rawMax === '') {
+              maxRep = Number.POSITIVE_INFINITY;
+            } else {
+              maxRep = Number(rawMax);
+              if (!Number.isFinite(maxRep) || maxRep < minRep || maxRep > 32) return null;
+            }
+            pos += bm[0].length;
+          }
+        }
       }
-      const after = pattern[i + 1] ?? '';
-      if (after === '+' || after === '*' || after === '?' || after === '{') return null;
-      continue;
+
+      if (quantified) {
+        totalQuantifiers++;
+        if (totalQuantifiers > 10) return null;
+        // Disallow zero-repetition `{0}` / `{0,0}` tricks and quantified anchors/lookarounds
+        if (maxRep === 0) return null;
+        if (node.kind === 'anchor') {
+          if (minRep === 0) return null; // `(a^?)+`, `(a\B?a?)+`
+        }
+        if (node.kind === 'group') {
+          if (node.groupKind !== 'normal') return null; // `(?=a)+`, `(?=a)?`
+          if (maxRep >= 2) {
+            if (node.hasQuantifier || node.branches.length > 1 || node.hasLookaround || node.minLen === 0) {
+              return null;
+            }
+          }
+        }
+        // Optional lazy modifier (`*?`, `+?`, `??`, `{1,3}?`)
+        if (effectivePattern[pos] === '?') {
+          pos++;
+        }
+        const afterQ = effectivePattern[pos] ?? '';
+        if (afterQ === '+' || afterQ === '*' || afterQ === '?' || /^\{\d+(?:,\d*)?\}/.test(effectivePattern.slice(pos))) {
+          return null; // chained quantifiers `a**`, `a+?+`, `a{1,2}{1,2}`, `a{1,3}??`
+        }
+      }
+
+      const baseMin = node.kind === 'atom' ? 1 : node.kind === 'group' ? node.minLen : 0;
+      const baseMax = node.kind === 'atom' ? 1 : node.kind === 'group' ? node.maxLen : 0;
+      const baseFirst = node.kind === 'atom' ? node.cs : node.kind === 'group' ? node.firstCs : EMPTY_CHARSET;
+      const baseAll = node.kind === 'atom' ? node.cs : node.kind === 'group' ? node.allCs : EMPTY_CHARSET;
+
+      current.push({
+        node,
+        quantified,
+        min: minRep,
+        max: maxRep,
+        minLen: baseMin * minRep,
+        maxLen:
+          baseMax === 0
+            ? 0
+            : maxRep === Number.POSITIVE_INFINITY || baseMax === Number.POSITIVE_INFINITY
+              ? Number.POSITIVE_INFINITY
+              : baseMax * maxRep,
+        firstCs: baseFirst,
+        allCs: baseAll,
+      });
     }
-    pushAtom(1);
+
+    branches.push(current);
+    return branches;
+  };
+
+  const rootBranches = parseBranches(0, false);
+  if (!rootBranches || pos !== len) return null;
+
+  // Flatten unquantified (or `{1}`/`{1,1}`) single-branch normal groups so `(a{0,32})(a{0,32})` === `a{0,32}a{0,32}`
+  const flattenSeq = (items: RegexItem[]): RegexItem[] => {
+    const out: RegexItem[] = [];
+    for (const it of items) {
+      if (it.node.kind === 'group' && it.node.groupKind === 'normal' && it.node.branches.length === 1 && it.min === 1 && it.max === 1) {
+        out.push(...flattenSeq(it.node.branches[0]!));
+      } else {
+        out.push(it);
+      }
+    }
+    return out;
+  };
+
+  let globalUnclosedUnbounded = 0;
+
+  const analyzeSeq = (rawItems: RegexItem[], isTopLevel: boolean): { ok: true; branchProduct: number } | { ok: false } => {
+    const items = flattenSeq(rawItems);
+    const isStartAnchored =
+      isTopLevel &&
+      !multiline &&
+      items.length > 0 &&
+      items[0]!.node.kind === 'anchor' &&
+      items[0]!.node.isCaret;
+
+    let activeUnionCs = EMPTY_CHARSET;
+    let chainVarCount = 0;
+    let branchProduct = 1;
+    let hasUnclosedUnbounded = false;
+    let mandatoryLiteralsSinceUnbounded = 0;
+
+    for (let idx = 0; idx < items.length; idx++) {
+      const it = items[idx]!;
+      if (it.node.kind === 'anchor') continue;
+
+      if (it.node.kind === 'group' && it.node.groupKind !== 'normal') {
+        for (const br of it.node.branches) {
+          const sub = analyzeSeq(br, false);
+          if (!sub.ok) return { ok: false };
+        }
+        if (it.node.hasUnbounded) {
+          if (hasUnclosedUnbounded || globalUnclosedUnbounded >= 1) return { ok: false };
+          hasUnclosedUnbounded = true;
+          globalUnclosedUnbounded++;
+          mandatoryLiteralsSinceUnbounded = 0;
+          branchProduct *= 32;
+          if (branchProduct > 64) return { ok: false };
+          chainVarCount++;
+          activeUnionCs = ALL_CHARSET;
+        }
+        continue;
+      }
+
+      // Disjoint mandatory character barrier check (`^/[^/]+/[^/]+$`, `/[a-z]+/[a-z]+/`, `/release-notes/v\d+\.\d+\.\d+`)
+      if (chainVarCount === 1 && it.minLen >= 1 && csDisjoint(it.firstCs, activeUnionCs)) {
+        activeUnionCs = EMPTY_CHARSET;
+        chainVarCount = 0;
+        branchProduct = 1;
+        hasUnclosedUnbounded = false;
+      }
+
+      // Optional single-branch group starting with a mandatory disjoint delimiter (`^/items/\d+(\?.*)?$`, `^/[a-z]{2}(-[A-Z]{2})?/`)
+      if (
+        it.node.kind === 'group' &&
+        it.node.groupKind === 'normal' &&
+        it.node.branches.length === 1 &&
+        it.min === 0 &&
+        it.max === 1
+      ) {
+        const innerFlat = flattenSeq(it.node.branches[0]!);
+        const firstReal = innerFlat.find((x) => x.node.kind !== 'anchor');
+        if (firstReal && firstReal.minLen >= 1 && chainVarCount <= 1 && csDisjoint(firstReal.firstCs, activeUnionCs)) {
+          activeUnionCs = EMPTY_CHARSET;
+          chainVarCount = 0;
+          branchProduct = 1;
+          hasUnclosedUnbounded = false;
+        }
+        const sub = analyzeSeq(innerFlat, false);
+        if (!sub.ok) return { ok: false };
+        const factor = Math.max(2, sub.branchProduct + 1);
+        branchProduct *= factor;
+        if (branchProduct > 64) return { ok: false };
+        chainVarCount++;
+        activeUnionCs = csUnion(activeUnionCs, it.allCs);
+        continue;
+      }
+
+      // Validate inner branches of any group
+      let maxInnerProduct = 1;
+      let allBranchesDisjointFixed = false;
+      if (it.node.kind === 'group' && it.node.groupKind === 'normal') {
+        let unionFirst = EMPTY_CHARSET;
+        let pairwiseDisjoint = it.node.branches.length > 1;
+        let sameFixedLen: number | null = null;
+
+        for (const br of it.node.branches) {
+          const sub = analyzeSeq(br, false);
+          if (!sub.ok) return { ok: false };
+          if (sub.branchProduct > maxInnerProduct) maxInnerProduct = sub.branchProduct;
+          const sum = computeSeqSummary(br);
+          if (sum.minLen < 1 || sum.minLen !== sum.maxLen || !csDisjoint(sum.firstCs, unionFirst)) {
+            pairwiseDisjoint = false;
+          } else if (sameFixedLen === null) {
+            sameFixedLen = sum.minLen;
+          } else if (sameFixedLen !== sum.minLen) {
+            pairwiseDisjoint = false;
+          }
+          unionFirst = csUnion(unionFirst, sum.firstCs);
+        }
+        allBranchesDisjointFixed = pairwiseDisjoint;
+      }
+
+      if (it.min < it.max) {
+        // Variable-length item (`?`, `*`, `+`, `{n,}`, `{n,m}`)
+        if (it.max === Number.POSITIVE_INFINITY) {
+          if (hasUnclosedUnbounded) {
+            globalUnclosedUnbounded++;
+            if (globalUnclosedUnbounded > 2 || mandatoryLiteralsSinceUnbounded < 2) {
+              return { ok: false };
+            }
+            const restItems = items.slice(idx + 1);
+            const isTrailingAtEnd = restItems.length === 0;
+            if (!isStartAnchored && !isTrailingAtEnd) {
+              return { ok: false };
+            }
+            // Safe 2nd wildcard separated by >= 2 mandatory literal chars (`^/blog/.*/comments/.*$` or `.*/blog/.*`)
+            branchProduct = 1;
+          } else {
+            if (globalUnclosedUnbounded === 0) globalUnclosedUnbounded = 1;
+          }
+          hasUnclosedUnbounded = true;
+          mandatoryLiteralsSinceUnbounded = 0;
+        }
+
+        const repFactor = it.max === Number.POSITIVE_INFINITY ? 32 : it.max - it.min + 1;
+        const groupAltFactor =
+          it.node.kind === 'group' && it.node.branches.length > 1 && !allBranchesDisjointFixed
+            ? it.node.branches.length
+            : 1;
+        branchProduct *= repFactor * groupAltFactor * maxInnerProduct;
+        if (branchProduct > 64) return { ok: false };
+        chainVarCount++;
+        activeUnionCs = csUnion(activeUnionCs, it.allCs);
+      } else if (it.node.kind === 'group' && it.node.groupKind === 'normal') {
+        const altFactor =
+          it.node.branches.length > 1 && !allBranchesDisjointFixed ? it.node.branches.length : 1;
+        const combined = altFactor * maxInnerProduct;
+        if (combined > 1) {
+          for (let r = 0; r < it.min; r++) {
+            branchProduct *= combined;
+            if (branchProduct > 64) return { ok: false };
+          }
+          chainVarCount++;
+          activeUnionCs = csUnion(activeUnionCs, it.allCs);
+        } else {
+          if (chainVarCount > 0) activeUnionCs = csUnion(activeUnionCs, it.allCs);
+        }
+      } else {
+        // Fixed mandatory atom (`min === max >= 1`)
+        if (it.node.kind === 'atom' && it.node.isLiteral) {
+          mandatoryLiteralsSinceUnbounded += it.min;
+        }
+        if (chainVarCount > 0) {
+          activeUnionCs = csUnion(activeUnionCs, it.allCs);
+        }
+      }
+    }
+
+    return { ok: true, branchProduct };
+  };
+
+  for (const br of rootBranches) {
+    const res = analyzeSeq(br, rootBranches.length === 1);
+    if (!res.ok) return null;
   }
-  if (stack.length !== 1 || inCharClass) return null;
 
   try {
-    return new RegExp(pattern, flags);
+    return new RegExp(effectivePattern, effectiveFlags);
   } catch {
     return null;
   }
 }
 
+function parseStrictIpv4Canonical(s: string): string | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if (!m) return null;
+  const octets: number[] = [];
+  for (let i = 1; i <= 4; i++) {
+    const n = Number(m[i]);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    octets.push(n);
+  }
+  return `${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}`;
+}
+
 /**
- * Canonicalizes a client IP for brute-force lockout / rate-limiting (`H4` & `Low`):
- *  - Strips IPv4-mapped IPv6 prefix (`::ffff:192.0.2.1` -> `192.0.2.1`).
+ * Canonicalizes a client IP for brute-force lockout / rate-limiting (`H4`, `R3-M4`, & `Low`):
+ *  - Strips `:port` from IPv4 (`1.2.3.4:12345` -> `1.2.3.4`) and bracketed IPv6 (`[::1]:12345` -> `::1`).
+ *  - Strips IPv4-mapped IPv6 prefix in both dotted-quad (`::ffff:192.0.2.1`) and hex (`::ffff:c000:0201`) forms.
  *  - Collapses IPv6 addresses to their `/64` subnet prefix (`2001:0db8:0001:0002::/64`) so an attacker rotating
  *    host addresses inside one `/64` allocation shares one lockout bucket.
  */
@@ -795,20 +1693,40 @@ export function normalizeClientRateLimitIp(rawIp: string | null | undefined): st
   if (!clean) return 'local';
   if (clean.startsWith('[') && clean.includes(']')) {
     clean = clean.slice(1, clean.indexOf(']'));
+  } else {
+    const v4PortMatch = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(clean);
+    if (v4PortMatch) {
+      clean = v4PortMatch[1]!;
+    }
   }
   if (clean.startsWith('::ffff:')) {
-    const v4 = clean.slice('::ffff:'.length);
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(v4)) return v4;
+    const v4 = parseStrictIpv4Canonical(clean.slice('::ffff:'.length));
+    if (v4) return v4;
   }
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(clean)) {
-    return clean;
-  }
+  const directV4 = parseStrictIpv4Canonical(clean);
+  if (directV4) return directV4;
+
   if (clean === '::1') return '127.0.0.1';
   if (clean.includes(':')) {
     const zoneIdx = clean.indexOf('%');
     const noZone = zoneIdx >= 0 ? clean.slice(0, zoneIdx) : clean;
     const expanded = expandIpv6Hextets(noZone);
     if (expanded) {
+      // Check canonical IPv4-mapped IPv6 (`0000:0000:0000:0000:0000:ffff:XXYY:ZZWW`) and `::1`
+      const isZeros0to4 =
+        expanded[0] === '0000' &&
+        expanded[1] === '0000' &&
+        expanded[2] === '0000' &&
+        expanded[3] === '0000' &&
+        expanded[4] === '0000';
+      if (isZeros0to4 && expanded[5] === '0000' && expanded[6] === '0000' && expanded[7] === '0001') {
+        return '127.0.0.1';
+      }
+      if (isZeros0to4 && expanded[5] === 'ffff') {
+        const hi = parseInt(expanded[6]!, 16);
+        const lo = parseInt(expanded[7]!, 16);
+        return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+      }
       return `${expanded.slice(0, 4).join(':')}::/64`;
     }
   }
@@ -816,7 +1734,17 @@ export function normalizeClientRateLimitIp(rawIp: string | null | undefined): st
 }
 
 function expandIpv6Hextets(addr: string): string[] | null {
-  const parts = addr.split('::');
+  let clean = addr;
+  const lastColon = clean.lastIndexOf(':');
+  if (lastColon >= 0 && clean.slice(lastColon + 1).includes('.')) {
+    const v4 = parseStrictIpv4Canonical(clean.slice(lastColon + 1));
+    if (!v4) return null;
+    const oct = v4.split('.').map(Number);
+    const hi = ((oct[0]! << 8) | oct[1]!).toString(16);
+    const lo = ((oct[2]! << 8) | oct[3]!).toString(16);
+    clean = `${clean.slice(0, lastColon)}:${hi}:${lo}`;
+  }
+  const parts = clean.split('::');
   if (parts.length > 2) return null;
   const left = parts[0] ? parts[0].split(':').filter(Boolean) : [];
   const right = parts.length === 2 && parts[1] ? parts[1].split(':').filter(Boolean) : [];

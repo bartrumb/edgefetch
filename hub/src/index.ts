@@ -54,6 +54,13 @@ import {
 import { authorizeAgent, isCallerAuthorized } from './auth';
 import { handleBotTransparencyRoutes, type BotAuthEnv } from './bot-auth';
 import { handleCompatRoutes } from './compat';
+import {
+  executeCatalogCall,
+  getCatalogRecords,
+  getCatalogStatus,
+  type CatalogCallPayload,
+  type CatalogHubFetchFn,
+} from './catalog';
 import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
   cancelBatchScrape,
@@ -445,13 +452,21 @@ export class AgentHubDO extends DurableObject<Env> {
     const siteId = (request.headers.get('x-verified-site') ?? '').trim().toLowerCase();
     const arch = request.headers.get('x-agent-arch');
     const version = request.headers.get('x-agent-version');
+    const browserVersion = request.headers.get('x-agent-browser-version');
+    const browserSandbox = request.headers.get('x-agent-browser-sandbox');
     const capabilities = request.headers.get('x-agent-capabilities');
     const publicIp = request.headers.get('x-verified-ip') ?? request.headers.get('cf-connecting-ip');
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server, [`site:${siteId}`]);
-    const att = this.engine.registerAgent(server as unknown as HubSocketLike, siteId, arch, { version, publicIp, capabilities });
+    const att = this.engine.registerAgent(server as unknown as HubSocketLike, siteId, arch, {
+      version,
+      browserVersion,
+      browserSandbox,
+      publicIp,
+      capabilities,
+    });
     server.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
     await this.activity.recordEvent({
       level: 'info',
@@ -651,6 +666,8 @@ export class AgentHubDO extends DurableObject<Env> {
         version?: string;
         arch?: string;
         goVersion?: string;
+        browserVersion?: string;
+        browserSandbox?: string | boolean;
         capabilities?: string[];
         reconnectAttempt?: number;
       };
@@ -1005,7 +1022,7 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.5.5');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.0');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1078,6 +1095,48 @@ export default {
       const oauthStore = hubOAuthStore(hub);
       const activity = hubActivityProxy(hub);
 
+      const makeCatalogHubFetch =
+        (sourceLabel: string): CatalogHubFetchFn =>
+        async ({ url: pageUrl, kind = 'json', accept = 'application/json', target: rawTgt, site: rawSite }) => {
+          const tgt: FetchTarget = rawTgt === 'agent' || rawTgt === 'container' ? rawTgt : 'auto';
+          const siteStr = typeof rawSite === 'string' && rawSite.trim() ? rawSite.trim() : undefined;
+          const hubOut = await executeHubFetch(
+            tgt,
+            JSON.stringify({
+              maxSeconds: 30,
+              options: { includeBody: true, respectRobots: true },
+              requests: [{ id: 'cat-1', url: pageUrl, kind, accept }],
+            }),
+            siteStr,
+            sourceLabel,
+            'transient',
+            true,
+          );
+          if (hubOut.status !== 200) {
+            return {
+              status: hubOut.status,
+              outcome: hubOut.status === 429 ? 'rate_limited' : 'error',
+              problem: hubOut.bodyText.slice(0, 240),
+              headers: hubOut.retryAfter ? { 'retry-after': hubOut.retryAfter } : {},
+              body: '',
+            };
+          }
+          try {
+            const parsedObj = JSON.parse(hubOut.bodyText) as { results?: Array<Record<string, unknown>> };
+            const first = parsedObj.results?.[0];
+            if (first && typeof first.retryAfter === 'string' && first.retryAfter) {
+              const existingHdrs =
+                first.headers && typeof first.headers === 'object' && !Array.isArray(first.headers)
+                  ? (first.headers as Record<string, string>)
+                  : {};
+              first.headers = { 'retry-after': first.retryAfter, ...existingHdrs };
+            }
+            return parsedObj;
+          } catch {
+            return { status: 502, outcome: 'error', problem: 'malformed hub reply', headers: {}, body: '' };
+          }
+        };
+
       const oauthRes = await handleOAuthRoute(request, url, {
         store: oauthStore,
         ownerSecret: env.CALLER_TOKEN,
@@ -1090,7 +1149,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.5.5',
+          serverVersion: '2.6.0',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1229,6 +1288,14 @@ export default {
           findExtractors: ({ query, category, limit }) => {
             return findRelevantAdapters({ query, category, limit }) as unknown as Array<Record<string, unknown>>;
           },
+          executeCatalog: async ({ args, principal }) => {
+            return await executeCatalogCall({
+              payload: args as CatalogCallPayload,
+              env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+              executeHubFetch: makeCatalogHubFetch(`mcp-catalog:${principal ?? 'client'}`),
+              ...(ctx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } } : {}),
+            });
+          },
           executeAgent: async ({ args, principal }) => {
             if (typeof args.agentId === 'string' && args.agentId.trim()) {
               const aid = args.agentId.trim();
@@ -1329,7 +1396,7 @@ export default {
             { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
           );
         }
-        return Response.json(buildCapabilities(env, '2.5.5'), {
+        return Response.json(buildCapabilities(env, '2.6.0'), {
           status: 200,
           headers: { 'cache-control': 'no-store' },
         });
@@ -2184,6 +2251,119 @@ export default {
             });
             return { status: scOut.status, body: scOut.body };
           },
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: { 'cache-control': 'no-store' },
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/catalog') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const cappedCat = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+        if (!cappedCat.ok) {
+          return Response.json(
+            { error: cappedCat.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+            { status: cappedCat.error === 'too_large' ? 413 : 400 },
+          );
+        }
+        let payload: CatalogCallPayload;
+        try {
+          payload = JSON.parse(cappedCat.text) as CatalogCallPayload;
+        } catch {
+          return Response.json({ error: 'bad_json' }, { status: 400 });
+        }
+        const out = await executeCatalogCall({
+          payload,
+          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+          executeHubFetch: makeCatalogHubFetch(`catalog:${auth.principal}`),
+          ...(ctx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } } : {}),
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: { 'cache-control': 'no-store' },
+        });
+      }
+
+      const catalogRecordsMatch = /^\/v1\/catalog\/([^/]+)\/records$/.exec(url.pathname);
+      if (catalogRecordsMatch && request.method === 'GET') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const catalogId = decodeURIComponent(catalogRecordsMatch[1] ?? '').trim();
+        const vendors = url.searchParams.getAll('vendor').filter(Boolean);
+        const productTypes = url.searchParams.getAll('productType').filter(Boolean);
+        const rawOffset = url.searchParams.get('offset');
+        const rawLimit = url.searchParams.get('limit');
+        const rawAvail = url.searchParams.get('availableOnly');
+        const query = url.searchParams.get('query') ?? url.searchParams.get('q') ?? undefined;
+        const out = await getCatalogRecords({
+          catalogId,
+          ...(rawOffset !== null && Number.isFinite(Number(rawOffset)) ? { offset: Number(rawOffset) } : {}),
+          ...(rawLimit !== null && Number.isFinite(Number(rawLimit)) ? { limit: Number(rawLimit) } : {}),
+          ...(vendors.length > 1 ? { vendor: vendors } : vendors.length === 1 ? { vendor: vendors[0] } : {}),
+          ...(productTypes.length > 1
+            ? { productType: productTypes }
+            : productTypes.length === 1
+              ? { productType: productTypes[0] }
+              : {}),
+          ...(rawAvail === 'true' || rawAvail === '1' ? { availableOnly: true } : {}),
+          ...(query ? { query } : {}),
+          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+        });
+        return Response.json(out.body, {
+          status: out.status,
+          headers: { 'cache-control': 'no-store' },
+        });
+      }
+
+      const catalogStatusMatch = /^\/v1\/catalog\/([^/]+)$/.exec(url.pathname);
+      if (catalogStatusMatch && request.method === 'GET') {
+        const auth = await authorizeMcpRequest({
+          request,
+          origin: url.origin,
+          ownerSecret: env.CALLER_TOKEN,
+          store: oauthStore,
+        });
+        if (!auth.ok) {
+          return Response.json(
+            { error: 'unauthorized' },
+            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+          );
+        }
+        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+        }
+        const catalogId = decodeURIComponent(catalogStatusMatch[1] ?? '').trim();
+        const out = await getCatalogStatus({
+          catalogId,
+          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
         });
         return Response.json(out.body, {
           status: out.status,

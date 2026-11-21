@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { defineAdapter, findElementInnerLinear, getAttrValueLinear } from '../../types';
 import { formatGfmTable, parseJsonObject, parseJsonValue } from '../../utils';
 
 export default defineAdapter({
@@ -76,9 +76,9 @@ export default defineAdapter({
     };
   },
   extractHtml({ rawHtml, baseUrl, htmlToMd }) {
-    const nextDataMatch = /<script\b[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i.exec(rawHtml);
-    if (!nextDataMatch?.[1]) return null;
-    const parsed = parseJsonObject(nextDataMatch[1]);
+    const nextDataRaw = findElementInnerLinear(rawHtml, 'script', (a) => getAttrValueLinear(a, 'id') === '__NEXT_DATA__');
+    if (!nextDataRaw) return null;
+    const parsed = parseJsonObject(nextDataRaw);
     const pageProps = (parsed?.props as Record<string, unknown> | undefined)?.pageProps as Record<string, unknown> | undefined;
     const jobPost = ((pageProps?.apiData as Record<string, unknown> | undefined)?.jobPost ?? pageProps?.jobPost) as
       | Record<string, unknown>

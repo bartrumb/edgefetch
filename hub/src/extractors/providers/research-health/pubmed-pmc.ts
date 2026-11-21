@@ -1,4 +1,11 @@
-import { defineAdapter } from '../../types';
+import {
+  attrHasTokenLinear,
+  defineAdapter,
+  findAllElementInnersLinear,
+  findElementInnerLinear,
+  findOpenTagLinear,
+  getAttrValueLinear,
+} from '../../types';
 import { extractBalancedDivAt, parseJsonObject, stripScriptsAndStyles, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -70,15 +77,15 @@ export default defineAdapter({
         kind: 'text',
         accept: 'application/xml, text/xml',
         formatTwin: (rawXml) => {
-          const title = stripTagsInline(/<article-title\b[^>]*>([\s\S]*?)<\/article-title>/i.exec(rawXml)?.[1] ?? '');
+          const title = stripTagsInline(findElementInnerLinear(rawXml, 'article-title') ?? '');
           if (!title) return null;
-          const abs = stripTagsInline(/<abstract\b[^>]*>([\s\S]*?)<\/abstract>/i.exec(rawXml)?.[1] ?? '');
+          const abs = stripTagsInline(findElementInnerLinear(rawXml, 'abstract') ?? '');
           const bodyBlocks: string[] = [];
-          const bodyXml = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(rawXml)?.[1] ?? '';
-          for (const sec of bodyXml.matchAll(/<sec\b[^>]*>([\s\S]*?)<\/sec>/gi)) {
-            const secTitle = stripTagsInline(/<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(sec[1]!)?.[1] ?? '');
-            const paras = [...sec[1]!.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/gi)]
-              .map((p) => stripTagsInline(p[1]!))
+          const bodyXml = findElementInnerLinear(rawXml, 'body') ?? '';
+          for (const sec of findAllElementInnersLinear(bodyXml, 'sec', undefined, 60)) {
+            const secTitle = stripTagsInline(findElementInnerLinear(sec, 'title') ?? '');
+            const paras = findAllElementInnersLinear(sec, 'p', undefined, 100)
+              .map((p) => stripTagsInline(p))
               .filter(Boolean);
             if (paras.length > 0 && bodyBlocks.length < 30) {
               bodyBlocks.push(secTitle ? `## ${secTitle}\n\n${paras.join('\n\n')}` : paras.join('\n\n'));
@@ -104,29 +111,37 @@ export default defineAdapter({
 
     const clean = stripScriptsAndStyles(rawHtml);
     const title = stripTagsInline(
-      /<h1\b[^>]*\bheading-title\b[^>]*>([\s\S]*?)<\/h1>/i.exec(clean)?.[1] ??
-        /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(clean)?.[1] ??
+      findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'heading-title')) ??
+        findElementInnerLinear(clean, 'h1') ??
         '',
     );
     if (!title) return null;
 
-    const authors = [...clean.matchAll(/<a\b[^>]*\bfull-name\b[^>]*>([\s\S]*?)<\/a>/gi)]
-      .map((m) => stripTagsInline(m[1]!))
+    const authors = findAllElementInnersLinear(clean, 'a', (a) => attrHasTokenLinear(a, 'class', 'full-name'), 20)
+      .map((inner) => stripTagsInline(inner))
       .filter((a, i, arr) => Boolean(a) && arr.indexOf(a) === i)
       .slice(0, 15);
-    const doi = stripTagsInline(/<span\b[^>]*\bcitation-doi\b[^>]*>([\s\S]*?)<\/span>/i.exec(clean)?.[1] ?? '');
+    const doi = stripTagsInline(
+      findElementInnerLinear(clean, 'span', (a) => attrHasTokenLinear(a, 'class', 'citation-doi')) ?? '',
+    );
 
-    const absOpen =
-      /<div\b[^>]*\bid=["'](?:abstract|eng-abstract)["'][^>]*>/i.exec(clean) ??
-      /<section\b[^>]*\bclass=["'][^"']*\babstract\b[^"']*["'][^>]*>([\s\S]*?)<\/section>/i.exec(clean);
+    const absDivOpen = findOpenTagLinear(clean, 'div', (a) => {
+      const id = getAttrValueLinear(a, 'id');
+      return id === 'abstract' || id === 'eng-abstract';
+    });
+    const absSectionInner = !absDivOpen
+      ? findElementInnerLinear(clean, 'section', (a) => attrHasTokenLinear(a, 'class', 'abstract'))
+      : null;
 
     let bodyMd = '';
-    const pmcArticle = /<article\b[^>]*\barticle\b[^>]*>([\s\S]*?)<\/article>/i.exec(clean);
+    const pmcArticle = findElementInnerLinear(clean, 'article', (a) => attrHasTokenLinear(a, 'class', 'article'));
     if (pmcArticle) {
-      bodyMd = htmlToMd(pmcArticle[1]!, baseUrl).markdown.trim();
-    } else if (absOpen) {
-      const inner = absOpen[0].startsWith('<div') ? extractBalancedDivAt(clean, absOpen.index) : absOpen[1] ?? '';
+      bodyMd = htmlToMd(pmcArticle, baseUrl).markdown.trim();
+    } else if (absDivOpen) {
+      const inner = extractBalancedDivAt(clean, absDivOpen.index);
       if (inner) bodyMd = htmlToMd(inner, baseUrl).markdown.trim();
+    } else if (absSectionInner) {
+      bodyMd = htmlToMd(absSectionInner, baseUrl).markdown.trim();
     }
     if (!bodyMd) return null;
 

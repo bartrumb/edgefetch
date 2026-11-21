@@ -28,6 +28,10 @@ export interface DiscoveredAtsBoard {
   boardUrl: string;
   discoveredFrom: string;
   boardStatus?: AtsBoardStatus;
+  total?: number;
+  returned?: number;
+  truncated?: boolean;
+  nextCursor?: string;
 }
 
 export interface NormalizedPay {
@@ -55,6 +59,12 @@ export interface StructuredJobPosting {
   source?: string;
 }
 
+export interface X402ExtraMetadata {
+  name?: string;
+  version?: string;
+  decimals?: number;
+}
+
 export interface X402PaymentTerms {
   x402Version?: number;
   scheme?: string;
@@ -69,6 +79,7 @@ export interface X402PaymentTerms {
   description?: string;
   invoice?: string;
   macaroon?: string;
+  extra?: X402ExtraMetadata;
   [k: string]: unknown;
 }
 
@@ -109,6 +120,10 @@ export interface AtsPreFetchSpec {
     links?: string[];
     jobPosting?: StructuredJobPosting;
     jobs?: StructuredJobRecord[];
+    total?: number;
+    returned?: number;
+    truncated?: boolean;
+    nextCursor?: string;
   } | null;
 }
 
@@ -267,6 +282,46 @@ export function inferWorkplaceType(text: string): WorkplaceType {
   return 'unknown';
 }
 
+function resolveExplicitWorkplaceType(
+  explicitField: unknown,
+  htmlContext = '',
+  proseContext = '',
+): WorkplaceType | null {
+  const checkToken = (val: string): WorkplaceType | null => {
+    const t = val.trim();
+    if (!t) return null;
+    if (/^hybrid$|\bhybrid\b/i.test(t)) return 'hybrid';
+    if (/^(?:on[-_\s]?site|in[-_\s]?office|in[-_\s]?person)$|\bon[-_\s]?site\b|\bin[-_\s]?office\b/i.test(t)) return 'onsite';
+    if (/^remote$|\bremote\b/i.test(t)) return 'remote';
+    return null;
+  };
+
+  if (typeof explicitField === 'string') {
+    const direct = checkToken(explicitField);
+    if (direct) return direct;
+  }
+
+  if (htmlContext) {
+    const ashbyEmbedded = /"workplaceType"\s*:\s*"(Hybrid|OnSite|On-site|Remote)"/i.exec(htmlContext.slice(0, 200_000));
+    if (ashbyEmbedded?.[1]) {
+      const parsed = checkToken(ashbyEmbedded[1]);
+      if (parsed) return parsed;
+    }
+  }
+
+  if (proseContext) {
+    const labelMatch = /(?:Location|Workplace)\s*Type\s*[:\n\r\t-]+\s*(Hybrid|On[-_\s]?site|In[-_\s]?office|Remote)\b/i.exec(
+      proseContext,
+    );
+    if (labelMatch?.[1]) {
+      const parsed = checkToken(labelMatch[1]);
+      if (parsed) return parsed;
+    }
+  }
+
+  return null;
+}
+
 /**
  * `P4`: Parses `<script type="application/ld+json">` blocks (including `@graph` arrays) for `@type: JobPosting`.
  */
@@ -331,7 +386,16 @@ export function extractJobPostingJsonLd(rawHtml: string, baseUrl?: string, fallb
 
   const jobLocationType = typeof jp.jobLocationType === 'string' ? jp.jobLocationType.trim() : undefined;
   const applicantLocReq = jp.applicantLocationRequirements;
-  if (jobLocationType && /TELECOMMUTE/i.test(jobLocationType) && locations.length === 0) {
+  const pagePlainWindow = `${stripTagsPlain(rawHtml.slice(0, 120_000))} ${fallbackProse}`;
+  // Prefer Ashby / ATS explicit `workplaceType` or `"Location Type: Hybrid"` over JSON-LD `jobLocationType: "TELECOMMUTE"`!
+  const explicitWorkplace = resolveExplicitWorkplaceType(jp.workplaceType, rawHtml, pagePlainWindow);
+
+  if (
+    (!explicitWorkplace || explicitWorkplace === 'remote') &&
+    jobLocationType &&
+    /TELECOMMUTE/i.test(jobLocationType) &&
+    locations.length === 0
+  ) {
     if (applicantLocReq && typeof applicantLocReq === 'object' && typeof (applicantLocReq as { name?: string }).name === 'string') {
       locations.push(`Remote (${(applicantLocReq as { name: string }).name})`);
     } else {
@@ -391,11 +455,12 @@ export function extractJobPostingJsonLd(rawHtml: string, baseUrl?: string, fallb
 
   const wpText = `${jobLocationType ?? ''} ${locations.join(' ')} ${title}`;
   const workplaceType: WorkplaceType =
-    jobLocationType && /TELECOMMUTE/i.test(jobLocationType)
+    explicitWorkplace ??
+    (jobLocationType && /TELECOMMUTE/i.test(jobLocationType)
       ? /hybrid/i.test(wpText)
         ? 'hybrid'
         : 'remote'
-      : inferWorkplaceType(wpText);
+      : inferWorkplaceType(wpText));
 
   const empRaw = jp.employmentType;
   const employmentType = Array.isArray(empRaw) ? empRaw.map(String).join(', ') : typeof empRaw === 'string' ? empRaw : undefined;
@@ -516,7 +581,11 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
   // P1: Ashby (`jobs.ashbyhq.com/{org}[/{jobId}[/application]]`)
   if (host === 'jobs.ashbyhq.com' && parts.length >= 1) {
     const org = decodeURIComponent(parts[0]!);
-    const jobId = parts.length >= 2 && parts[1]!.toLowerCase() !== 'application' ? decodeURIComponent(parts[1]!) : '';
+    const secondSeg = parts.length >= 2 ? parts[1]!.toLowerCase() : '';
+    const jobId =
+      parts.length >= 2 && secondSeg !== 'application' && !(parts.length === 2 && secondSeg === 'jobs')
+        ? decodeURIComponent(parts[1]!)
+        : '';
     if (/^[A-Za-z0-9._-]+$/.test(org)) {
       return {
         id: jobId ? 'ashby-job' : 'ashby-board',
@@ -526,9 +595,9 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
         accept: 'application/json',
         format: (rawBody, origUrl, htmlToMd) => {
           const data = safeJsonParse(rawBody) as Record<string, unknown> | null;
-          const jobs = Array.isArray(data?.jobs) ? (data.jobs as Array<Record<string, unknown>>) : [];
-          if (jobs.length === 0) return null;
-          const orgTitle = typeof data?.organizationName === 'string' && data.organizationName ? data.organizationName : org;
+          if (!data || !Array.isArray(data.jobs)) return null;
+          const jobs = data.jobs as Array<Record<string, unknown>>;
+          const orgTitle = typeof data.organizationName === 'string' && data.organizationName ? data.organizationName : org;
 
           if (jobId) {
             const match = jobs.find((j) => String(j.id ?? '').toLowerCase() === jobId.toLowerCase());
@@ -541,17 +610,13 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
                   .filter(Boolean)
               : [];
             const allLocs = [loc, ...secLocs].filter(Boolean);
-            const wpRaw = String(match.workplaceType ?? (match.isRemote ? 'Remote' : ''));
-            const workplaceType: WorkplaceType = /hybrid/i.test(wpRaw)
-              ? 'hybrid'
-              : /remote/i.test(wpRaw) || Boolean(match.isRemote)
-                ? 'remote'
-                : /onsite|on-site|office/i.test(wpRaw)
-                  ? 'onsite'
-                  : inferWorkplaceType(`${wpRaw} ${allLocs.join(' ')}`);
             const descHtml = typeof match.descriptionHtml === 'string' ? match.descriptionHtml : '';
             const descPlain = typeof match.descriptionPlain === 'string' ? match.descriptionPlain : '';
             const bodyMd = descHtml.trim() ? htmlToMd(descHtml, origUrl).markdown.trim() : descPlain.trim();
+            const explicitWp = resolveExplicitWorkplaceType(match.workplaceType, '', `${descPlain} ${bodyMd}`);
+            const workplaceType: WorkplaceType =
+              explicitWp ??
+              (match.isRemote === true ? 'remote' : inferWorkplaceType(`${allLocs.join(' ')} ${title}`));
             const pay = parseAshbyPay(match, `${descPlain} ${bodyMd}`);
             const postedAt = typeof match.publishedAt === 'string' ? match.publishedAt : undefined;
             const empType = typeof match.employmentType === 'string' ? match.employmentType : undefined;
@@ -582,21 +647,41 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             };
           }
 
-          // Whole Ashby job board summary
-          const records: StructuredJobRecord[] = [];
-          const lines: string[] = [`# ${orgTitle} — Open Roles (${jobs.length})`];
+          // Whole Ashby job board summary (never return `null` on `jobs.length === 0` so empty Ashby boards never trigger Chromium!)
+          const total = jobs.length;
+          if (total === 0) {
+            return {
+              title: `${orgTitle} Jobs (0)`,
+              markdown: `# ${orgTitle} — Open Roles (0)\n\nNo open positions currently listed.`,
+              links: [],
+              jobs: [],
+              total: 0,
+              returned: 0,
+              truncated: false,
+            };
+          }
+
           const links: string[] = [];
+          for (const j of jobs.slice(0, 2000)) {
+            const jId = String(j.id ?? '');
+            const jUrl = typeof j.jobUrl === 'string' && j.jobUrl ? j.jobUrl : `https://jobs.ashbyhq.com/${org}/${jId}`;
+            links.push(jUrl);
+          }
+
+          const records: StructuredJobRecord[] = [];
+          const lines: string[] = [`# ${orgTitle} — Open Roles (${total})`];
           for (const j of jobs.slice(0, 100)) {
             const jId = String(j.id ?? '');
             const jTitle = String(j.title ?? 'Role').trim();
             const jLoc = String(j.location ?? '').trim();
-            const wpRaw = String(j.workplaceType ?? (j.isRemote ? 'Remote' : ''));
-            const wp = inferWorkplaceType(`${wpRaw} ${jLoc}`);
-            const pay = parseAshbyPay(j, String(j.descriptionPlain ?? ''));
+            const descPlain = String(j.descriptionPlain ?? '');
+            const explicitWp = resolveExplicitWorkplaceType(j.workplaceType, '', descPlain);
+            const wp: WorkplaceType =
+              explicitWp ?? (j.isRemote === true ? 'remote' : inferWorkplaceType(`${jLoc} ${jTitle}`));
+            const pay = parseAshbyPay(j, descPlain);
             const jUrl = typeof j.jobUrl === 'string' && j.jobUrl ? j.jobUrl : `https://jobs.ashbyhq.com/${org}/${jId}`;
             const applyUrl = typeof j.applyUrl === 'string' && j.applyUrl ? j.applyUrl : `${jUrl}/application`;
             const postedAt = typeof j.publishedAt === 'string' ? j.publishedAt : null;
-            links.push(jUrl);
             records.push({
               title: jTitle,
               company: orgTitle,
@@ -611,11 +696,17 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const meta = [jLoc, wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : ''].filter(Boolean).join(' · ');
             lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
           }
+          const returned = records.length;
+          const truncated = total > returned;
           return {
-            title: `${orgTitle} Jobs (${jobs.length})`,
+            title: `${orgTitle} Jobs (${total})`,
             markdown: lines.join('\n'),
             links,
             jobs: records,
+            total,
+            returned,
+            truncated,
+            ...(truncated ? { nextCursor: String(returned) } : {}),
           };
         },
       };
@@ -685,11 +776,12 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
 
       // Workday Board / Search URL -> `POST /wday/cxs/{tenant}/{site}/jobs`
       const searchText = (u.searchParams.get('q') ?? u.searchParams.get('searchText') ?? u.searchParams.get('search') ?? '').trim();
+      const reqOffset = Math.max(0, parseInt(u.searchParams.get('offset') ?? '0', 10) || 0);
       return {
         id: 'workday-board',
         fetchUrl: `https://${host}/wday/cxs/${tenant}/${site}/jobs`,
         method: 'POST',
-        requestBody: JSON.stringify({ appliedFacets: {}, limit: 20, offset: 0, searchText }),
+        requestBody: JSON.stringify({ appliedFacets: {}, limit: 20, offset: reqOffset, searchText }),
         contentType: 'application/json',
         kind: 'json',
         accept: 'application/json',
@@ -697,7 +789,8 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           const data = safeJsonParse(rawBody) as Record<string, unknown> | null;
           const postings = Array.isArray(data?.jobPostings) ? (data.jobPostings as Array<Record<string, unknown>>) : null;
           if (!postings) return null;
-          const total = typeof data?.total === 'number' ? data.total : postings.length;
+          const rawTotal = typeof data?.total === 'number' && Number.isFinite(data.total) && data.total > 0 ? data.total : 0;
+          const total = Math.max(rawTotal, postings.length > 0 ? reqOffset + postings.length : 0);
           const heading = `${tenant} (${site}) — Workday Job Board (${total} open roles${searchText ? ` matching "${searchText}"` : ''})`;
           const lines: string[] = [`# ${heading}`];
           const links: string[] = [];
@@ -726,11 +819,17 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const meta = [locTxt, postedOn, bullets].filter(Boolean).join(' · ');
             lines.push(`- **[${pTitle}](${fullUrl})**${meta ? ` — ${meta}` : ''}`);
           }
+          const returned = records.length;
+          const truncated = postings.length > 0 && total > reqOffset + returned;
           return {
             title: heading,
             markdown: lines.join('\n'),
             links,
             jobs: records,
+            total,
+            returned,
+            truncated,
+            ...(truncated ? { nextCursor: String(reqOffset + 20) } : {}),
           };
         },
       };
@@ -754,9 +853,21 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           const data = safeJsonParse(rawBody) as Record<string, unknown> | null;
           const jobs = Array.isArray(data?.jobs) ? (data.jobs as Array<Record<string, unknown>>) : null;
           if (!jobs) return null;
+          const metaObj = data?.meta as Record<string, unknown> | undefined;
+          const total =
+            typeof metaObj?.total === 'number' && Number.isFinite(metaObj.total)
+              ? Math.max(metaObj.total, jobs.length)
+              : jobs.length;
           const records: StructuredJobRecord[] = [];
           const links: string[] = [];
-          const lines: string[] = [`# ${co} — Greenhouse Job Board (${jobs.length} open roles)`];
+          for (const j of jobs.slice(0, 2000)) {
+            const jUrl =
+              typeof j.absolute_url === 'string' && j.absolute_url.startsWith('https://')
+                ? j.absolute_url
+                : `https://${host}/${co}/jobs/${String(j.id ?? '')}`;
+            links.push(jUrl);
+          }
+          const lines: string[] = [`# ${co} — Greenhouse Job Board (${total} open roles)`];
           for (const j of jobs.slice(0, 120)) {
             const jTitle = String(j.title ?? '').trim();
             if (!jTitle) continue;
@@ -769,7 +880,6 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const rawDesc = typeof j.content === 'string' ? decodeEntitiesBasic(j.content) : '';
             const pay = parsePayFromText(stripTagsPlain(rawDesc));
             const postedAt = typeof j.updated_at === 'string' ? j.updated_at : null;
-            links.push(jUrl);
             records.push({
               title: jTitle,
               company: co,
@@ -784,11 +894,17 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const meta = [loc, wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : ''].filter(Boolean).join(' · ');
             lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
           }
+          const returned = records.length;
+          const truncated = total > returned;
           return {
-            title: `${co} Jobs (${records.length})`,
+            title: `${co} Jobs (${total})`,
             markdown: lines.join('\n'),
             links,
             jobs: records,
+            total,
+            returned,
+            truncated,
+            ...(truncated ? { nextCursor: String(returned) } : {}),
           };
         },
       };
@@ -876,9 +992,14 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           const parsed = safeJsonParse(rawBody);
           if (!Array.isArray(parsed)) return null;
           const jobs = parsed as Array<Record<string, unknown>>;
+          const total = jobs.length;
           const records: StructuredJobRecord[] = [];
           const links: string[] = [];
-          const lines: string[] = [`# ${co} — Lever Job Board (${jobs.length} open roles)`];
+          for (const j of jobs.slice(0, 2000)) {
+            const jUrl = typeof j.hostedUrl === 'string' && j.hostedUrl.startsWith('https://') ? j.hostedUrl : `https://${host}/${co}/${String(j.id ?? '')}`;
+            links.push(jUrl);
+          }
+          const lines: string[] = [`# ${co} — Lever Job Board (${total} open roles)`];
           for (const j of jobs.slice(0, 120)) {
             const jTitle = String(j.text ?? '').trim();
             if (!jTitle) continue;
@@ -892,7 +1013,6 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const jUrl = typeof j.hostedUrl === 'string' && j.hostedUrl.startsWith('https://') ? j.hostedUrl : `https://${host}/${co}/${String(j.id ?? '')}`;
             const applyUrl = typeof j.applyUrl === 'string' && j.applyUrl.startsWith('https://') ? j.applyUrl : `${jUrl}/apply`;
             const createdIso = typeof j.createdAt === 'number' ? new Date(j.createdAt).toISOString() : null;
-            links.push(jUrl);
             records.push({
               title: jTitle,
               company: co,
@@ -907,11 +1027,17 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const meta = [allLocs[0] ?? '', wp !== 'unknown' ? wp : ''].filter(Boolean).join(' · ');
             lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
           }
+          const returned = records.length;
+          const truncated = total > returned;
           return {
-            title: `${co} Jobs (${records.length})`,
+            title: `${co} Jobs (${total})`,
             markdown: lines.join('\n'),
             links,
             jobs: records,
+            total,
+            returned,
+            truncated,
+            ...(truncated ? { nextCursor: String(jobs[returned - 1]?.id ?? returned) } : {}),
           };
         },
       };
@@ -1225,7 +1351,237 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
     }
   }
 
+  // Robots-allowed Public Remote Job Feeds (We Work Remotely RSS, Himalayas, Working Nomads — Remotive is excluded per robots.txt)
+  if ((host === 'weworkremotely.com' || host === 'www.weworkremotely.com') && /\.rss$/i.test(u.pathname)) {
+    return {
+      id: 'weworkremotely-feed',
+      fetchUrl: urlStr,
+      method: 'GET',
+      kind: 'text',
+      accept: 'application/rss+xml, application/xml, text/xml',
+      format: (rawBody) => {
+        const records = parsePublicJobFeedRecords('weworkremotely', rawBody);
+        if (records.length === 0) return null;
+        const lines = [`# We Work Remotely Jobs (${records.length})`];
+        const links = records.map((r) => r.url);
+        for (const r of records.slice(0, 50)) {
+          lines.push(`- **[${r.title}](${r.url})** — ${r.company} · ${r.locations[0] ?? 'Remote'}`);
+        }
+        return {
+          title: `We Work Remotely Jobs (${records.length})`,
+          markdown: lines.join('\n'),
+          links,
+          jobs: records,
+          total: records.length,
+          returned: records.length,
+          truncated: false,
+        };
+      },
+    };
+  }
+
+  if ((host === 'himalayas.app' || host === 'www.himalayas.app') && u.pathname.startsWith('/jobs/api')) {
+    return {
+      id: 'himalayas-feed',
+      fetchUrl: urlStr,
+      method: 'GET',
+      kind: 'json',
+      accept: 'application/json',
+      format: (rawBody) => {
+        const parsed = safeJsonParse(rawBody) as Record<string, unknown> | null;
+        const records = parsePublicJobFeedRecords('himalayas', rawBody);
+        if (!parsed || !Array.isArray(parsed.jobs)) return null;
+        const total = typeof parsed.totalCount === 'number' ? Math.max(parsed.totalCount, records.length) : records.length;
+        const lines = [`# Himalayas Remote Jobs (${records.length} of ${total})`];
+        const links = records.map((r) => r.url);
+        for (const r of records) {
+          lines.push(`- **[${r.title}](${r.url})** — ${r.company}`);
+        }
+        return {
+          title: `Himalayas Remote Jobs (${records.length})`,
+          markdown: lines.join('\n'),
+          links,
+          jobs: records,
+          total,
+          returned: records.length,
+          truncated: total > records.length,
+        };
+      },
+    };
+  }
+
+  if ((host === 'www.workingnomads.com' || host === 'workingnomads.com') && u.pathname.startsWith('/api/exposed_jobs')) {
+    return {
+      id: 'workingnomads-feed',
+      fetchUrl: urlStr,
+      method: 'GET',
+      kind: 'json',
+      accept: 'application/json',
+      format: (rawBody) => {
+        const records = parsePublicJobFeedRecords('workingnomads', rawBody);
+        if (records.length === 0) return null;
+        const lines = [`# Working Nomads Remote Jobs (${records.length})`];
+        const links = records.map((r) => r.url);
+        for (const r of records.slice(0, 50)) {
+          lines.push(`- **[${r.title}](${r.url})** — ${r.company}`);
+        }
+        return {
+          title: `Working Nomads Remote Jobs (${records.length})`,
+          markdown: lines.join('\n'),
+          links,
+          jobs: records,
+          total: records.length,
+          returned: records.length,
+          truncated: false,
+        };
+      },
+    };
+  }
+
   return null;
+}
+
+/**
+ * Keyless `robots.txt`-allowed public remote job feeds integrated into `jobs` (`remotive.com/api/remote-jobs` is intentionally omitted per `robots.txt`).
+ */
+export const PUBLIC_JOB_FEEDS = [
+  { id: 'weworkremotely' as const, url: 'https://weworkremotely.com/remote-jobs.rss' },
+  { id: 'himalayas' as const, url: 'https://himalayas.app/jobs/api?limit=50' },
+  { id: 'workingnomads' as const, url: 'https://www.workingnomads.com/api/exposed_jobs/' },
+] as const;
+
+function extractLinearXmlSimpleTag(xml: string, tag: string): string {
+  const openToken = `<${tag.toLowerCase()}`;
+  const closeToken = `</${tag.toLowerCase()}>`;
+  const lower = xml.toLowerCase();
+  const openIdx = lower.indexOf(openToken);
+  if (openIdx === -1) return '';
+  const gt = xml.indexOf('>', openIdx + openToken.length);
+  if (gt === -1) return '';
+  const closeIdx = lower.indexOf(closeToken, gt + 1);
+  if (closeIdx === -1) return '';
+  const inner = xml.slice(gt + 1, closeIdx).trim();
+  if (inner.startsWith('<![CDATA[') && inner.endsWith(']]>')) {
+    return inner.slice(9, -3).trim();
+  }
+  return inner;
+}
+
+export function parsePublicJobFeedRecords(
+  feedId: 'weworkremotely' | 'himalayas' | 'workingnomads',
+  rawBody: string,
+): StructuredJobRecord[] {
+  const out: StructuredJobRecord[] = [];
+  if (feedId === 'weworkremotely') {
+    const lower = rawBody.toLowerCase();
+    let pos = 0;
+    while (pos < rawBody.length && out.length < 100) {
+      const openIdx = lower.indexOf('<item', pos);
+      if (openIdx === -1) break;
+      const gt = rawBody.indexOf('>', openIdx + 5);
+      if (gt === -1) break;
+      const closeIdx = lower.indexOf('</item>', gt + 1);
+      if (closeIdx === -1) break;
+      const itemXml = rawBody.slice(gt + 1, closeIdx);
+      pos = closeIdx + 7;
+
+      const fullTitle = stripTagsPlain(extractLinearXmlSimpleTag(itemXml, 'title'));
+      const link = stripTagsPlain(extractLinearXmlSimpleTag(itemXml, 'link'));
+      if (!fullTitle || !link.startsWith('https://')) continue;
+      const colon = fullTitle.indexOf(':');
+      const company = colon > 0 ? fullTitle.slice(0, colon).trim() : 'We Work Remotely';
+      const role = colon > 0 ? fullTitle.slice(colon + 1).trim() : fullTitle;
+      const region = stripTagsPlain(extractLinearXmlSimpleTag(itemXml, 'region')) || 'Remote';
+      const pubDate = stripTagsPlain(extractLinearXmlSimpleTag(itemXml, 'pubDate'));
+      const desc = stripTagsPlain(extractLinearXmlSimpleTag(itemXml, 'description'));
+      const parsedTs = pubDate ? Date.parse(pubDate) : NaN;
+
+      out.push({
+        title: role,
+        company,
+        url: link,
+        applyUrl: link,
+        workplaceType: 'remote',
+        locations: [region],
+        pay: parsePayFromText(desc),
+        postedAt: Number.isFinite(parsedTs) ? new Date(parsedTs).toISOString() : null,
+        source: 'weworkremotely',
+        ...(desc ? { snippet: desc.slice(0, 220) } : {}),
+      });
+    }
+    return out;
+  }
+
+  if (feedId === 'himalayas') {
+    const data = safeJsonParse(rawBody) as Record<string, unknown> | null;
+    const jobs = Array.isArray(data?.jobs) ? (data.jobs as Array<Record<string, unknown>>) : [];
+    for (const j of jobs.slice(0, 100)) {
+      const title = String(j.title ?? '').trim();
+      const company = String(j.companyName ?? '').trim();
+      const url =
+        typeof j.applicationLink === 'string' && j.applicationLink.startsWith('https://')
+          ? j.applicationLink
+          : typeof j.guid === 'string' && j.guid.startsWith('https://')
+            ? j.guid
+            : '';
+      if (!title || !url) continue;
+      const locs = Array.isArray(j.locationRestrictions)
+        ? j.locationRestrictions.map(String).filter(Boolean)
+        : ['Remote'];
+      const minSal = typeof j.minSalary === 'number' && j.minSalary > 0 ? Math.round(j.minSalary) : null;
+      const maxSal = typeof j.maxSalary === 'number' && j.maxSalary > 0 ? Math.round(j.maxSalary) : null;
+      const cur = typeof j.currency === 'string' && j.currency.trim() ? j.currency.trim().toUpperCase() : 'USD';
+      const pay: NormalizedPay | null =
+        minSal || maxSal
+          ? { min: minSal, max: maxSal ?? minSal, currency: cur, period: 'year', basis: 'base' }
+          : null;
+      const pubSec = typeof j.pubDate === 'number' ? j.pubDate : NaN;
+      const postedAt = Number.isFinite(pubSec)
+        ? new Date(pubSec > 1e12 ? pubSec : pubSec * 1_000).toISOString()
+        : typeof j.pubDate === 'string'
+          ? j.pubDate
+          : null;
+      out.push({
+        title,
+        company: company || 'Himalayas Listing',
+        url,
+        applyUrl: url,
+        workplaceType: 'remote',
+        locations: locs.length > 0 ? locs : ['Remote'],
+        pay,
+        postedAt,
+        source: 'himalayas',
+        ...(typeof j.excerpt === 'string' && j.excerpt ? { snippet: stripTagsPlain(j.excerpt).slice(0, 220) } : {}),
+      });
+    }
+    return out;
+  }
+
+  // `workingnomads`
+  const parsed = safeJsonParse(rawBody);
+  const items = Array.isArray(parsed) ? (parsed as Array<Record<string, unknown>>) : [];
+  for (const j of items.slice(0, 100)) {
+    const title = String(j.title ?? '').trim();
+    const company = String(j.company_name ?? '').trim();
+    const url = typeof j.url === 'string' && j.url.startsWith('https://') ? j.url : '';
+    if (!title || !url) continue;
+    const loc = String(j.location || 'Remote').trim();
+    const desc = stripTagsPlain(String(j.description ?? ''));
+    const postedAt = typeof j.pub_date === 'string' && j.pub_date ? j.pub_date : null;
+    out.push({
+      title,
+      company: company || 'Working Nomads Listing',
+      url,
+      applyUrl: url,
+      workplaceType: 'remote',
+      locations: [loc],
+      pay: parsePayFromText(desc),
+      postedAt,
+      source: 'workingnomads',
+      ...(desc ? { snippet: desc.slice(0, 220) } : {}),
+    });
+  }
+  return out;
 }
 
 /** `P2`: Detects Workday's `{"widget":"redirect","url":"/Workday","externalSpa":true}` stub response. */
@@ -1567,51 +1923,252 @@ const KNOWN_USDC_CONTRACTS = new Set([
   '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // Base mainnet USDC
   '0x036cbd53842c5426634e7929541ec2318f3dcf7e', // Base Sepolia USDC
   '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', // Ethereum mainnet USDC
-  '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', // Polygon USDC
+  '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', // Ethereum Sepolia USDC
+  '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', // Polygon mainnet USDC
+  '0x2791bca1f2de4661ed88a30c99a7a9449aa84174', // Polygon USDC.e
+  '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // Arbitrum mainnet USDC
+  '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // Arbitrum USDC.e
+  '0x0b2c639c533813f4aa9d7837caf62653d097ff85', // Optimism mainnet USDC
+  '0x7f5c764cbc14f9669b88837ca1490cca17c31607', // Optimism USDC.e
+  '0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e', // Avalanche mainnet USDC
+  'epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwytdt1v', // Solana mainnet USDC mint
 ]);
 
-function formatX402PriceString(terms: X402PaymentTerms): string | undefined {
-  if (typeof terms.price === 'string' && terms.price.trim()) {
-    const p = terms.price.trim();
-    if (p.startsWith('$') || /[A-Za-z]/.test(p)) return p;
-    const cur = (terms.currency || terms.asset || 'USD').toUpperCase();
-    return cur === 'USD' ? `$${p}` : `$${p} ${cur}`;
-  }
-  const rawAmt = terms.maxAmountRequired ?? terms.amount;
-  if (!rawAmt) return undefined;
-  const assetRaw = String(terms.asset ?? terms.currency ?? '').trim();
-  const assetLower = assetRaw.toLowerCase();
-  const isUsdc =
-    assetLower === 'usdc' ||
-    assetLower === 'usd' ||
-    KNOWN_USDC_CONTRACTS.has(assetLower) ||
-    (typeof terms.extra === 'object' &&
-      terms.extra !== null &&
-      /usdc|usd coin/i.test(String((terms.extra as Record<string, unknown>).name ?? '')));
-  const assetLabel = KNOWN_USDC_CONTRACTS.has(assetLower) ? 'USDC' : assetRaw || 'USDC';
+const X402_FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
-  if (/^\d+\.\d+$/.test(rawAmt)) {
-    return isUsdc ? `$${rawAmt}${assetLabel.toUpperCase() === 'USD' ? '' : ` ${assetLabel}`}` : `${rawAmt} ${assetLabel}`;
-  }
-  if (/^\d+$/.test(rawAmt) && isUsdc) {
-    const decimals =
-      typeof terms.extra === 'object' &&
-      terms.extra !== null &&
-      typeof (terms.extra as Record<string, unknown>).decimals === 'number'
-        ? ((terms.extra as Record<string, unknown>).decimals as number)
-        : 6;
-    const scaled = Number(rawAmt) / 10 ** decimals;
-    if (Number.isFinite(scaled) && scaled > 0) {
-      const decStr = scaled.toFixed(decimals).replace(/\.?0+$/, '');
-      return `$${decStr} USDC`;
-    }
-  }
-  return assetLabel ? `${rawAmt} ${assetLabel}` : rawAmt;
+function hasOwnProp(obj: Record<string, unknown>, key: string): boolean {
+  return !X402_FORBIDDEN_KEYS.has(key) && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
 /**
- * `G3`: Parses HTTP `402 Payment Required` (`x402` v1/v2 `PAYMENT-REQUIRED` / `X-Payment-Required` JSON or base64 headers,
- * `WWW-Authenticate: x402` / `L402`, and JSON `402` response bodies) into structured `{ price, terms }` — NEVER paying automatically.
+ * Strips ANSI CSI/OSC escape sequences, ASCII C0/C1 control characters, CR/LF newlines, DEL, and Unicode BiDi
+ * override controls (`U+202A`–`U+202E`, `U+2066`–`U+2069`), collapsing whitespace and capping at `maxLen` chars.
+ */
+function sanitizeX402String(raw: unknown, maxLen = 256): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const cleaned = raw
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
+    .replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]+/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+  if (!cleaned) return undefined;
+  return cleaned.length > maxLen ? cleaned.slice(0, maxLen) : cleaned;
+}
+
+/**
+ * Validates atomic integer amounts strictly as `/^\d{1,30}$/` (or safe non-negative integer `0..2^53-1`),
+ * rejecting negative numbers, floats, `NaN`, `Infinity`, scientific notation (`2e3`, `1e+21`), and 400-digit strings.
+ */
+function normalizeX402AtomicAmount(raw: unknown): string | undefined {
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw) || raw < 0) return undefined;
+    return String(raw === 0 ? 0 : raw);
+  }
+  if (typeof raw === 'string') {
+    if (/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(raw)) return undefined;
+    const s = raw.trim();
+    if (!/^\d{1,30}$/.test(s)) return undefined;
+    return BigInt(s).toString();
+  }
+  return undefined;
+}
+
+/**
+ * Formats an atomic integer string (`1..30` digits) with `decimals` (`0..18`) purely via string padding and slicing —
+ * ZERO `Number.toFixed`, ZERO IEEE-754 precision loss above `2^53`, and ZERO scientific notation!
+ */
+function formatAtomicAmountDecimalString(atomicDigits: string, decimals: number): string {
+  const canonical = BigInt(atomicDigits).toString();
+  if (decimals <= 0) return canonical;
+  const padded = canonical.padStart(decimals + 1, '0');
+  const splitIdx = padded.length - decimals;
+  const whole = padded.slice(0, splitIdx);
+  const frac = padded.slice(splitIdx).replace(/0+$/, '');
+  return frac ? `${whole}.${frac}` : whole;
+}
+
+/**
+ * Validates standalone free-text `price` strictly against `/^\$?\d{1,12}(?:\.\d{1,8})?(?: [A-Z0-9]{2,10})?$/`
+ * (blocking `$0.00 (FREE)` spoofing, ANSI/newline sequences, and prompt-injection payloads).
+ */
+function validateX402StandalonePrice(raw: unknown, fallbackCurrency?: string): string | undefined {
+  let s: string;
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw < 0 || raw > 999_999_999_999 || String(raw).includes('e') || String(raw).includes('E')) {
+      return undefined;
+    }
+    s = String(raw === 0 ? 0 : raw);
+  } else if (typeof raw === 'string') {
+    if (/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(raw)) return undefined;
+    s = raw.trim().replace(/[ \t]+/g, ' ');
+  } else {
+    return undefined;
+  }
+  if (!/^\$?\d{1,12}(?:\.\d{1,8})?(?: [A-Z0-9]{2,10})?$/.test(s)) return undefined;
+  if (s.startsWith('$') || / [A-Z0-9]{2,10}$/.test(s)) return s;
+  const curRaw = (fallbackCurrency ?? 'USD').trim().toUpperCase();
+  const cur = /^[A-Z0-9]{2,10}$/.test(curRaw) ? curRaw : 'USD';
+  return cur === 'USD' ? `$${s}` : `$${s} ${cur}`;
+}
+
+function isUsdcAssetOrExtra(assetRaw: string, extraName?: string): boolean {
+  const lower = assetRaw.trim().toLowerCase();
+  if (lower === 'usdc' || lower === 'usd' || KNOWN_USDC_CONTRACTS.has(lower)) return true;
+  if (extraName && /\busdc\b|\busd coin\b/i.test(extraName)) return true;
+  return false;
+}
+
+function formatX402PriceString(terms: X402PaymentTerms): string | undefined {
+  const assetRaw = typeof terms.asset === 'string' ? terms.asset.trim() : '';
+  const currencyRaw = typeof terms.currency === 'string' ? terms.currency.trim() : '';
+  const extraObj = terms.extra && typeof terms.extra === 'object' ? terms.extra : undefined;
+  const isUsdc = isUsdcAssetOrExtra(assetRaw || currencyRaw, extraObj?.name);
+  const rawLabel = KNOWN_USDC_CONTRACTS.has(assetRaw.toLowerCase()) ? 'USDC' : assetRaw || currencyRaw || (isUsdc ? 'USDC' : '');
+  const assetLabel = /^[A-Za-z0-9._-]{1,24}$/.test(rawLabel) ? rawLabel : isUsdc ? 'USDC' : '';
+
+  const validAmt =
+    normalizeX402AtomicAmount(terms.maxAmountRequired) ?? normalizeX402AtomicAmount(terms.amount);
+
+  if (validAmt !== undefined) {
+    const amtBig = BigInt(validAmt);
+    // Whenever `maxAmountRequired` / `amount` is > 0n, ALWAYS compute `price` from atomic amount — NEVER allow free-text `price` override!
+    if (amtBig > 0n) {
+      if (isUsdc) {
+        // Force `decimals = 6` on USDC/USD so `extra.decimals: 18` can NEVER understate a USDC price by 10^12!
+        const decStr = formatAtomicAmountDecimalString(validAmt, 6);
+        const unitSuffix = assetLabel.toUpperCase() === 'USD' ? 'USD' : 'USDC';
+        return `$${decStr} ${unitSuffix}`;
+      }
+      const d = extraObj?.decimals;
+      if (typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 18) {
+        const decStr = formatAtomicAmountDecimalString(validAmt, d);
+        return assetLabel ? `${decStr} ${assetLabel}` : decStr;
+      }
+      return assetLabel ? `${validAmt} ${assetLabel}` : validAmt;
+    }
+
+    // `amtBig === 0n`
+    const validZeroPrice = validateX402StandalonePrice(terms.price, currencyRaw || assetLabel);
+    if (validZeroPrice) return validZeroPrice;
+    if (isUsdc) return '$0 USDC';
+    return assetLabel ? `0 ${assetLabel}` : '0';
+  }
+
+  return validateX402StandalonePrice(terms.price, currencyRaw || assetLabel);
+}
+
+function isAuthTokenChar(code: number): boolean {
+  return (
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    (code >= 48 && code <= 57) ||
+    code === 45 ||
+    code === 95
+  );
+}
+
+/**
+ * Strictly linear `O(N)` `WWW-Authenticate` key-value scanner capped at `8192` chars (replaces superlinear regex).
+ */
+function parseWwwAuthenticateLinear(rawWwwAuth: string): { scheme?: string; pairs: Array<[string, string]> } {
+  const s = rawWwwAuth.slice(0, 8_192);
+  const n = s.length;
+  const pairs: Array<[string, string]> = [];
+  let i = 0;
+
+  while (i < n && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9 || s.charCodeAt(i) === 44)) i++;
+  let scheme: string | undefined;
+  const schemeStart = i;
+  while (i < n && isAuthTokenChar(s.charCodeAt(i))) i++;
+  if (i > schemeStart) {
+    let probe = i;
+    while (probe < n && (s.charCodeAt(probe) === 32 || s.charCodeAt(probe) === 9)) probe++;
+    if (probe >= n || s.charCodeAt(probe) !== 61 /* '=' */) {
+      const cand = s.slice(schemeStart, i);
+      if (/^(?:x402|l402|lsat)$/i.test(cand)) {
+        scheme = cand.toLowerCase() === 'lsat' ? 'L402' : cand;
+      }
+    } else {
+      i = schemeStart;
+    }
+  }
+
+  while (i < n) {
+    while (
+      i < n &&
+      (s.charCodeAt(i) === 32 ||
+        s.charCodeAt(i) === 9 ||
+        s.charCodeAt(i) === 13 ||
+        s.charCodeAt(i) === 10 ||
+        s.charCodeAt(i) === 44)
+    ) {
+      i++;
+    }
+    if (i >= n) break;
+
+    const kStart = i;
+    while (i < n && isAuthTokenChar(s.charCodeAt(i))) i++;
+    if (i === kStart) {
+      // Skip unexpected delimiter or non-token run up to next whitespace/comma without backtracking
+      while (i < n && s.charCodeAt(i) !== 32 && s.charCodeAt(i) !== 9 && s.charCodeAt(i) !== 44) i++;
+      continue;
+    }
+    const key = s.slice(kStart, i).toLowerCase();
+
+    while (i < n && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
+    if (i >= n || s.charCodeAt(i) !== 61 /* '=' */) {
+      continue;
+    }
+    i++; // consume '='
+    while (i < n && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
+    if (i >= n) break;
+
+    let val = '';
+    const q = s.charCodeAt(i);
+    if (q === 34 /* '"' */ || q === 39 /* "'" */) {
+      i++;
+      const chunks: string[] = [];
+      while (i < n) {
+        const ch = s.charCodeAt(i);
+        if (ch === q) {
+          i++;
+          break;
+        }
+        if (ch === 92 /* '\\' */ && q === 34 && i + 1 < n) {
+          chunks.push(s[i + 1]!);
+          i += 2;
+          continue;
+        }
+        chunks.push(s[i]!);
+        i++;
+      }
+      val = chunks.join('');
+    } else {
+      const vStart = i;
+      while (
+        i < n &&
+        s.charCodeAt(i) !== 32 &&
+        s.charCodeAt(i) !== 9 &&
+        s.charCodeAt(i) !== 13 &&
+        s.charCodeAt(i) !== 10 &&
+        s.charCodeAt(i) !== 44
+      ) {
+        i++;
+      }
+      val = s.slice(vStart, i);
+    }
+
+    if (val) pairs.push([key, val]);
+  }
+
+  return { ...(scheme ? { scheme } : {}), pairs };
+}
+
+/**
+ * `G3` (`R3-M5` Hardened): Parses HTTP `402 Payment Required` (`x402` v1/v2 `PAYMENT-REQUIRED` / `X-Payment-Required`
+ * JSON or base64 headers, `WWW-Authenticate: x402` / `L402`, and JSON `402` response bodies) into sanitized `{ price, terms }` —
+ * NEVER paying automatically, NEVER calling `Number.toFixed` on untrusted `decimals`, and blocking prompt injection.
  */
 export function parseX402PaymentTerms(
   status: unknown,
@@ -1621,48 +2178,78 @@ export function parseX402PaymentTerms(
   if (status !== 402) return null;
 
   const terms: X402PaymentTerms = {};
+  let rawCandidatePrice: unknown;
+
   const payHdr =
     readPaymentHeader(headers, 'payment-required') || readPaymentHeader(headers, 'x-payment-required');
   const wwwAuth = readPaymentHeader(headers, 'www-authenticate');
 
   const applyRequirementObj = (root: Record<string, unknown>) => {
-    if (typeof root.x402Version === 'number') terms.x402Version = root.x402Version;
-    const accepts = Array.isArray(root.accepts) ? root.accepts : [];
+    if (
+      hasOwnProp(root, 'x402Version') &&
+      typeof root.x402Version === 'number' &&
+      Number.isInteger(root.x402Version) &&
+      root.x402Version >= 1 &&
+      root.x402Version <= 10
+    ) {
+      terms.x402Version = root.x402Version;
+    }
+
+    const accepts = hasOwnProp(root, 'accepts') && Array.isArray(root.accepts) ? root.accepts : [];
     const primary =
       accepts.length > 0 && accepts[0] && typeof accepts[0] === 'object' && !Array.isArray(accepts[0])
         ? (accepts[0] as Record<string, unknown>)
         : root;
 
-    const strField = (k: string): string | undefined => {
-      const v = primary[k] ?? root[k];
-      if (typeof v === 'string' && v.trim()) return v.trim();
-      if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+    const readOwn = (k: string): unknown => {
+      if (hasOwnProp(primary, k) && primary[k] !== undefined && primary[k] !== null) return primary[k];
+      if (primary !== root && hasOwnProp(root, k) && root[k] !== undefined && root[k] !== null) return root[k];
       return undefined;
     };
 
-    const scheme = strField('scheme');
-    const price = strField('price');
-    const amount = strField('amount');
-    const maxAmountRequired = strField('maxAmountRequired');
-    const asset = strField('asset');
-    const currency = strField('currency');
-    const network = strField('network');
-    const payTo = strField('payTo') ?? strField('recipient');
-    const resource = strField('resource');
-    const description = strField('description');
+    const scheme = sanitizeX402String(readOwn('scheme'), 256);
+    const assetRaw = sanitizeX402String(readOwn('asset'), 256);
+    const currency = sanitizeX402String(readOwn('currency'), 256);
+    const network = sanitizeX402String(readOwn('network'), 256);
+    const payTo = sanitizeX402String(readOwn('payTo') ?? readOwn('recipient'), 256);
+    const resource = sanitizeX402String(readOwn('resource'), 256);
+    const description = sanitizeX402String(readOwn('description'), 256);
+    const amount = normalizeX402AtomicAmount(readOwn('amount'));
+    const maxAmountRequired = normalizeX402AtomicAmount(readOwn('maxAmountRequired'));
+    const candPrice = readOwn('price');
 
     if (scheme) terms.scheme = scheme;
-    if (price) terms.price = price;
-    if (amount) terms.amount = amount;
-    if (maxAmountRequired) terms.maxAmountRequired = maxAmountRequired;
-    if (asset) terms.asset = KNOWN_USDC_CONTRACTS.has(asset.toLowerCase()) ? 'USDC' : asset;
+    if (candPrice !== undefined) rawCandidatePrice = candPrice;
+    if (amount !== undefined) terms.amount = amount;
+    if (maxAmountRequired !== undefined) terms.maxAmountRequired = maxAmountRequired;
+    if (assetRaw) terms.asset = KNOWN_USDC_CONTRACTS.has(assetRaw.toLowerCase()) ? 'USDC' : assetRaw;
     if (currency) terms.currency = currency;
     if (network) terms.network = network;
     if (payTo) terms.payTo = payTo;
     if (resource) terms.resource = resource;
     if (description) terms.description = description;
-    if (primary.extra && typeof primary.extra === 'object' && !Array.isArray(primary.extra)) {
-      terms.extra = primary.extra as Record<string, unknown>;
+
+    // Shallow depth-1 allowlisted `extra` (`{ name?, version?, decimals? }`) — never copies `__proto__` or deep trees!
+    const rawExtra = hasOwnProp(primary, 'extra') ? primary.extra : undefined;
+    if (rawExtra && typeof rawExtra === 'object' && !Array.isArray(rawExtra)) {
+      const eo = rawExtra as Record<string, unknown>;
+      const safeExtra: X402ExtraMetadata = {};
+      const extraName = hasOwnProp(eo, 'name') ? sanitizeX402String(eo.name, 256) : undefined;
+      const extraVer = hasOwnProp(eo, 'version') ? sanitizeX402String(eo.version, 256) : undefined;
+      if (extraName) safeExtra.name = extraName;
+      if (extraVer) safeExtra.version = extraVer;
+
+      const effectiveIsUsdc = isUsdcAssetOrExtra(terms.asset ?? terms.currency ?? '', extraName);
+      if (hasOwnProp(eo, 'decimals') && typeof eo.decimals === 'number') {
+        if (effectiveIsUsdc) {
+          safeExtra.decimals = 6;
+        } else if (Number.isInteger(eo.decimals) && eo.decimals >= 0 && eo.decimals <= 18) {
+          safeExtra.decimals = eo.decimals;
+        }
+      }
+      if (Object.keys(safeExtra).length > 0) {
+        terms.extra = safeExtra;
+      }
     }
   };
 
@@ -1671,7 +2258,7 @@ export function parseX402PaymentTerms(
     if (hdrObj) applyRequirementObj(hdrObj);
   }
 
-  if (rawBody && rawBody.trim().startsWith('{') && rawBody.length <= 65_536) {
+  if (rawBody && rawBody.length <= 65_536 && rawBody.trim().startsWith('{')) {
     const bodyObj = safeJsonParse(rawBody);
     if (bodyObj && typeof bodyObj === 'object' && !Array.isArray(bodyObj)) {
       applyRequirementObj(bodyObj as Record<string, unknown>);
@@ -1679,32 +2266,54 @@ export function parseX402PaymentTerms(
   }
 
   if (wwwAuth) {
-    const schemeMatch = /^(x402|l402|lsat)\b/i.exec(wwwAuth);
-    if (schemeMatch && !terms.scheme) {
-      terms.scheme = schemeMatch[1]!.toLowerCase() === 'lsat' ? 'L402' : schemeMatch[1]!;
+    const parsedAuth = parseWwwAuthenticateLinear(wwwAuth);
+    if (parsedAuth.scheme && !terms.scheme) {
+      const sc = sanitizeX402String(parsedAuth.scheme, 256);
+      if (sc) terms.scheme = sc;
     }
-    const kvRe = /([a-zA-Z0-9_-]+)[ \t]*=[ \t]*(?:"([^"]*)"|'([^']*)'|([^\s,]+))/g;
-    let m: RegExpExecArray | null;
-    while ((m = kvRe.exec(wwwAuth)) !== null) {
-      const k = m[1]!.toLowerCase();
-      const v = (m[2] ?? m[3] ?? m[4] ?? '').trim();
-      if (!v) continue;
-      if (k === 'price' && !terms.price) terms.price = v;
-      else if (k === 'amount' && !terms.amount) terms.amount = v;
-      else if (k === 'maxamountrequired' && !terms.maxAmountRequired) terms.maxAmountRequired = v;
-      else if (k === 'asset' && !terms.asset) terms.asset = v;
-      else if (k === 'currency' && !terms.currency) terms.currency = v;
-      else if (k === 'network' && !terms.network) terms.network = v;
-      else if ((k === 'payto' || k === 'recipient') && !terms.payTo) terms.payTo = v;
-      else if (k === 'invoice') terms.invoice = v;
-      else if (k === 'macaroon') terms.macaroon = v;
+    for (const [k, rawV] of parsedAuth.pairs) {
+      if (k === 'price' && rawCandidatePrice === undefined) {
+        rawCandidatePrice = rawV;
+      } else if (k === 'amount' && terms.amount === undefined) {
+        const a = normalizeX402AtomicAmount(rawV);
+        if (a !== undefined) terms.amount = a;
+      } else if (k === 'maxamountrequired' && terms.maxAmountRequired === undefined) {
+        const m = normalizeX402AtomicAmount(rawV);
+        if (m !== undefined) terms.maxAmountRequired = m;
+      } else if (k === 'asset' && !terms.asset) {
+        const as = sanitizeX402String(rawV, 256);
+        if (as) terms.asset = KNOWN_USDC_CONTRACTS.has(as.toLowerCase()) ? 'USDC' : as;
+      } else if (k === 'currency' && !terms.currency) {
+        const cu = sanitizeX402String(rawV, 256);
+        if (cu) terms.currency = cu;
+      } else if (k === 'network' && !terms.network) {
+        const nw = sanitizeX402String(rawV, 256);
+        if (nw) terms.network = nw;
+      } else if ((k === 'payto' || k === 'recipient') && !terms.payTo) {
+        const pt = sanitizeX402String(rawV, 256);
+        if (pt) terms.payTo = pt;
+      } else if (k === 'invoice') {
+        const inv = sanitizeX402String(rawV, 256);
+        if (inv) terms.invoice = inv;
+      } else if (k === 'macaroon') {
+        const mac = sanitizeX402String(rawV, 256);
+        if (mac) terms.macaroon = mac;
+      }
     }
   }
 
-  const formattedPrice = formatX402PriceString(terms);
-  if (formattedPrice && !terms.price) {
-    terms.price = formattedPrice;
+  const validStandalone = validateX402StandalonePrice(rawCandidatePrice, terms.currency || terms.asset);
+  if (validStandalone) {
+    terms.price = validStandalone;
   }
+
+  const formattedPrice = formatX402PriceString(terms);
+  if (formattedPrice) {
+    terms.price = formattedPrice;
+  } else {
+    delete terms.price;
+  }
+
   return {
     ...(formattedPrice ? { price: formattedPrice } : {}),
     terms,
@@ -1820,7 +2429,20 @@ export function buildBlockedInfo(
   };
 }
 
+export type VerifiedPostingStatus = 'live' | 'closed' | 'board_gone' | 'unknown';
+
+export interface VerifiedJobResult {
+  url: string;
+  status: VerifiedPostingStatus;
+  platform?: string;
+  slug?: string;
+  similarOpenRoles?: Array<{ title: string; url: string }>;
+}
+
 export interface JobsToolPayload {
+  mode?: unknown;
+  verify?: unknown;
+  urls?: unknown;
   query?: unknown;
   company?: unknown;
   domains?: unknown;
@@ -1830,6 +2452,7 @@ export interface JobsToolPayload {
   postedWithinDays?: unknown;
   limit?: unknown;
   includeBuiltIn?: unknown;
+  includePublicFeeds?: unknown;
   exclude?: unknown;
   target?: unknown;
   site?: unknown;
@@ -2021,6 +2644,12 @@ export function discoverAtsBoardsFromHtml(params: {
   for (const m of corpus.matchAll(/https?:\/\/jobs\.jobvite\.com\/([A-Za-z0-9_-]+)/gi)) {
     addBoard('jobvite', m[1]!, `https://jobs.jobvite.com/${m[1]!}`);
   }
+  for (const m of corpus.matchAll(/https?:\/\/([a-z0-9-]+)\.icims\.com\/jobs\b/gi)) {
+    const icimsSlug = m[1]!.toLowerCase();
+    if (icimsSlug !== 'www' && icimsSlug !== 'login') {
+      addBoard('icims', icimsSlug, `https://${icimsSlug}.icims.com/jobs/search?ss=1&in_iframe=1`);
+    }
+  }
 
   return [...found.values()];
 }
@@ -2062,9 +2691,430 @@ function inferCompanyFromAtsUrl(urlStr: string): string {
   }
 }
 
+export interface AtsPostingIdentity {
+  platform: string;
+  slug: string;
+  boardUrl: string;
+  postingId: string;
+  roleTokens: string[];
+}
+
+function tokenizeRoleSlug(slugOrPath: string): string[] {
+  const stop = new Set(['job', 'jobs', 'apply', 'application', 'careers', 'postings', 'senior', 'lead', 'the', 'and', 'for']);
+  return (slugOrPath.toLowerCase().match(/[a-z]{3,}/g) ?? []).filter((w) => !stop.has(w));
+}
+
+/**
+ * Parses a saved ATS posting URL into `(platform, slug, boardUrl, postingId)` so `verify` mode can batch-check
+ * dozens of saved postings by fetching each company's board only **once**.
+ */
+export function parseAtsPostingIdentity(urlStr: string): AtsPostingIdentity | null {
+  let u: URL;
+  try {
+    u = new URL(urlStr);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:') return null;
+  const host = u.hostname.toLowerCase();
+  const parts = u.pathname.split('/').filter(Boolean);
+
+  // 1. Greenhouse (`boards.greenhouse.io/<org>/jobs/<id>`, `job-boards.[eu.]greenhouse.io/<org>/jobs/<id>`, or `?gh_jid=<id>`)
+  const isGhUs = host === 'boards.greenhouse.io' || host === 'job-boards.greenhouse.io';
+  const isGhEu = host === 'eu-boards.greenhouse.io' || host === 'job-boards.eu.greenhouse.io';
+  if ((isGhUs || isGhEu) && parts[0]) {
+    const org = parts[0];
+    const ghJid = u.searchParams.get('gh_jid') ?? '';
+    const postingId = parts[1] === 'jobs' && parts[2] ? parts[2] : /^\d+$/.test(ghJid) ? ghJid : '';
+    if (postingId && isValidAtsSlug(org)) {
+      const boardHost = isGhEu ? 'job-boards.eu.greenhouse.io' : 'job-boards.greenhouse.io';
+      return {
+        platform: 'greenhouse',
+        slug: org,
+        boardUrl: `https://${boardHost}/${org}`,
+        postingId,
+        roleTokens: tokenizeRoleSlug(u.pathname),
+      };
+    }
+  }
+  const ghQueryId = u.searchParams.get('gh_jid');
+  if (ghQueryId && /^\d+$/.test(ghQueryId)) {
+    const baseCo = host.replace(/^(?:www|careers|jobs)\./, '').split('.')[0] ?? '';
+    if (isValidAtsSlug(baseCo)) {
+      return {
+        platform: 'greenhouse',
+        slug: baseCo,
+        boardUrl: `https://job-boards.greenhouse.io/${baseCo}`,
+        postingId: ghQueryId,
+        roleTokens: tokenizeRoleSlug(u.pathname),
+      };
+    }
+  }
+
+  // 2. Ashby (`jobs.ashbyhq.com/<org>/<jobId>[/application]`)
+  if (host === 'jobs.ashbyhq.com' && parts.length >= 2 && parts[1]!.toLowerCase() !== 'jobs' && parts[1]!.toLowerCase() !== 'application') {
+    const org = decodeURIComponent(parts[0]!);
+    const jobId = decodeURIComponent(parts[1]!);
+    return {
+      platform: 'ashby',
+      slug: org,
+      boardUrl: `https://jobs.ashbyhq.com/${encodeURIComponent(org)}`,
+      postingId: jobId,
+      roleTokens: [],
+    };
+  }
+
+  // 3. Lever (`jobs.[eu.]lever.co/<org>/<id>[/apply]`)
+  if ((host === 'jobs.lever.co' || host === 'jobs.eu.lever.co') && parts.length >= 2) {
+    const org = parts[0]!;
+    const id = parts[1]!;
+    return {
+      platform: 'lever',
+      slug: org,
+      boardUrl: `https://${host}/${org}`,
+      postingId: id,
+      roleTokens: [],
+    };
+  }
+
+  // 4. Workday (`<tenant>.wd<N>.myworkdayjobs.com/[locale/]<site>/job/...`)
+  const wdMatch = /^([a-z0-9-]+)\.(?:wd\d+\.)?myworkday(?:jobs|site)\.com$/i.exec(host);
+  if (wdMatch?.[1] && parts.length >= 3) {
+    const tenant = wdMatch[1];
+    const idx = /^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(parts[0]!) ? 1 : 0;
+    const site = parts[idx] ?? '';
+    const rest = parts.slice(idx + 1);
+    if (site && rest[0] === 'job' && rest.length >= 2) {
+      const tailSeg = rest[rest.length - 1]!;
+      return {
+        platform: 'workday',
+        slug: `${tenant}/${site}`,
+        boardUrl: `https://${host}/${site}`,
+        postingId: tailSeg,
+        roleTokens: tokenizeRoleSlug(tailSeg),
+      };
+    }
+  }
+
+  // 5. Workable (`apply.workable.com/<org>/j/<shortcode>`)
+  if (host === 'apply.workable.com' && parts.length >= 3 && parts[1] === 'j') {
+    return {
+      platform: 'workable',
+      slug: parts[0]!,
+      boardUrl: `https://apply.workable.com/${parts[0]!}/`,
+      postingId: parts[2]!,
+      roleTokens: [],
+    };
+  }
+
+  // 6. Gem (`jobs.gem.com/<org>/<id>`)
+  if (host === 'jobs.gem.com' && parts.length >= 2) {
+    return {
+      platform: 'gem',
+      slug: parts[0]!,
+      boardUrl: `https://jobs.gem.com/${parts[0]!}`,
+      postingId: parts[1]!,
+      roleTokens: [],
+    };
+  }
+
+  // 7. Rippling (`ats.rippling.com/[locale/]<org>/jobs/<uuid>`)
+  if (host === 'ats.rippling.com' && parts.length >= 3) {
+    const idx = /^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(parts[0]!) ? 1 : 0;
+    const org = parts[idx] ?? '';
+    const rest = parts.slice(idx + 1);
+    if (org && rest[0] === 'jobs' && rest[1]) {
+      return {
+        platform: 'rippling',
+        slug: org,
+        boardUrl: `https://ats.rippling.com/${org}/jobs`,
+        postingId: rest[1],
+        roleTokens: [],
+      };
+    }
+  }
+
+  // 8. Pinpoint, BambooHR, Recruitee, iCIMS
+  const pinpoint = /^([a-z0-9-]+)\.pinpointhq\.com$/i.exec(host);
+  if (pinpoint?.[1] && parts[0] === 'postings' && parts[1]) {
+    return {
+      platform: 'pinpoint',
+      slug: pinpoint[1],
+      boardUrl: `https://${host}/`,
+      postingId: parts[1],
+      roleTokens: tokenizeRoleSlug(parts[1]),
+    };
+  }
+  const bamboo = /^([a-z0-9-]+)\.bamboohr\.com$/i.exec(host);
+  if (bamboo?.[1] && parts[0] === 'careers' && parts[1]) {
+    return {
+      platform: 'bamboohr',
+      slug: bamboo[1],
+      boardUrl: `https://${host}/careers`,
+      postingId: parts[1],
+      roleTokens: [],
+    };
+  }
+  const recruitee = /^([a-z0-9-]+)\.recruitee\.com$/i.exec(host);
+  if (recruitee?.[1] && parts[0] === 'o' && parts[1]) {
+    return {
+      platform: 'recruitee',
+      slug: recruitee[1],
+      boardUrl: `https://${host}/`,
+      postingId: parts[1],
+      roleTokens: tokenizeRoleSlug(parts[1]),
+    };
+  }
+  const icims = /^([a-z0-9-]+)\.icims\.com$/i.exec(host);
+  if (icims?.[1] && parts[0] === 'jobs' && parts[1] && /^\d+$/.test(parts[1])) {
+    return {
+      platform: 'icims',
+      slug: icims[1],
+      boardUrl: `https://${host}/jobs/search?ss=1&in_iframe=1`,
+      postingId: parts[1],
+      roleTokens: tokenizeRoleSlug(parts.slice(2).join('-')),
+    };
+  }
+
+  return null;
+}
+
+function findSimilarRoles(
+  openRoles: Array<{ title: string; url: string }>,
+  roleTokens: string[],
+): Array<{ title: string; url: string }> {
+  if (openRoles.length === 0) return [];
+  if (roleTokens.length === 0) {
+    return openRoles.slice(0, 3);
+  }
+  const scored = openRoles
+    .map((r) => {
+      const lower = r.title.toLowerCase();
+      let hits = 0;
+      for (const tok of roleTokens) {
+        if (lower.includes(tok)) hits++;
+      }
+      return { role: r, hits };
+    })
+    .sort((a, b) => b.hits - a.hits);
+
+  const withHits = scored.filter((s) => s.hits > 0).map((s) => s.role);
+  return (withHits.length > 0 ? withHits : openRoles).slice(0, 3);
+}
+
+async function executeJobsVerifyMode(params: {
+  urls: string[];
+  payload: JobsToolPayload;
+  executeScrape: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { urls, payload, executeScrape } = params;
+  const parsedItems = urls.slice(0, 100).map((rawUrl) => ({
+    url: rawUrl,
+    identity: parseAtsPostingIdentity(rawUrl),
+  }));
+
+  // Group by `(platform, slug)` so each company board is fetched ONLY ONCE!
+  const boardGroups = new Map<string, { boardUrl: string; platform: string; slug: string }>();
+  for (const it of parsedItems) {
+    if (!it.identity) continue;
+    const key = `${it.identity.platform}:${it.identity.slug.toLowerCase()}`;
+    if (!boardGroups.has(key)) {
+      boardGroups.set(key, {
+        boardUrl: it.identity.boardUrl,
+        platform: it.identity.platform,
+        slug: it.identity.slug,
+      });
+    }
+  }
+
+  const boardSnapshots = new Map<
+    string,
+    {
+      boardStatus: AtsBoardStatus;
+      truncated: boolean;
+      openLinksLower: string[];
+      openRoles: Array<{ title: string; url: string }>;
+    }
+  >();
+
+  const groupEntries = [...boardGroups.entries()];
+  for (let i = 0; i < groupEntries.length; i += 5) {
+    const batch = groupEntries.slice(i, i + 5);
+    const outs = await Promise.all(
+      batch.map(([, grp]) =>
+        executeScrape({
+          url: grp.boardUrl,
+          renderMode: 'auto',
+          formats: ['markdown', 'links'],
+          ...(payload.target ? { target: payload.target } : {}),
+          ...(payload.site ? { site: payload.site } : {}),
+        }).catch(() => null),
+      ),
+    );
+    for (let j = 0; j < batch.length; j++) {
+      const [key, grp] = batch[j]!;
+      const sc = outs[j];
+      if (!sc || sc.status !== 200 || sc.body?.ok !== true) {
+        boardSnapshots.set(key, {
+          boardStatus: classifyAtsBoardStatus({
+            httpStatus: sc?.status ?? 0,
+            requestedUrl: grp.boardUrl,
+            finalUrl: typeof sc?.body?.finalUrl === 'string' ? sc.body.finalUrl : undefined,
+          }),
+          truncated: false,
+          openLinksLower: [],
+          openRoles: [],
+        });
+        continue;
+      }
+
+      const cState = typeof sc.body.contentState === 'string' ? sc.body.contentState : undefined;
+      const rawJobs = Array.isArray(sc.body.jobs) ? (sc.body.jobs as StructuredJobRecord[]) : [];
+      const rawRecords = Array.isArray(sc.body.records) ? (sc.body.records as Array<Record<string, unknown>>) : [];
+      const rawLinks = Array.isArray(sc.body.links) ? (sc.body.links as string[]) : [];
+
+      const openRoles: Array<{ title: string; url: string }> = [];
+      for (const rj of rawJobs) {
+        if (rj?.title && rj?.url) openRoles.push({ title: rj.title, url: rj.url });
+      }
+      if (openRoles.length === 0) {
+        for (const rc of rawRecords) {
+          if (typeof rc?.title === 'string' && typeof rc?.url === 'string') {
+            openRoles.push({ title: rc.title, url: rc.url });
+          }
+        }
+      }
+
+      const openLinksLower = [
+        ...rawLinks.map((l) => String(l).toLowerCase()),
+        ...openRoles.map((r) => r.url.toLowerCase()),
+      ];
+      const bStatus = classifyAtsBoardStatus({
+        httpStatus: sc.status,
+        requestedUrl: grp.boardUrl,
+        finalUrl: typeof sc.body.finalUrl === 'string' ? sc.body.finalUrl : undefined,
+        contentState: cState,
+        jobCount: Math.max(openRoles.length, rawLinks.length),
+      });
+
+      boardSnapshots.set(key, {
+        boardStatus: bStatus,
+        truncated: sc.body.truncated === true,
+        openLinksLower,
+        openRoles,
+      });
+    }
+  }
+
+  const results: VerifiedJobResult[] = [];
+  for (const item of parsedItems) {
+    if (!item.identity) {
+      // Non-grouped custom URL: check directly once
+      const direct = await executeScrape({
+        url: item.url,
+        renderMode: 'auto',
+        formats: ['markdown'],
+        ...(payload.target ? { target: payload.target } : {}),
+        ...(payload.site ? { site: payload.site } : {}),
+      }).catch(() => null);
+      if (!direct) {
+        results.push({ url: item.url, status: 'unknown' });
+      } else if (direct.status === 404 || direct.status === 410 || direct.body?.contentState === 'closed_posting' || direct.body?.contentState === 'soft_404') {
+        results.push({ url: item.url, status: 'closed' });
+      } else if (direct.status === 200 && direct.body?.ok === true) {
+        results.push({ url: item.url, status: 'live' });
+      } else {
+        results.push({ url: item.url, status: 'unknown' });
+      }
+      continue;
+    }
+
+    const key = `${item.identity.platform}:${item.identity.slug.toLowerCase()}`;
+    const snap = boardSnapshots.get(key);
+    if (!snap || snap.boardStatus === 'blocked_or_down') {
+      results.push({
+        url: item.url,
+        status: 'unknown',
+        platform: item.identity.platform,
+        slug: item.identity.slug,
+      });
+      continue;
+    }
+    if (snap.boardStatus === 'wrong_slug') {
+      results.push({
+        url: item.url,
+        status: 'board_gone',
+        platform: item.identity.platform,
+        slug: item.identity.slug,
+      });
+      continue;
+    }
+
+    const idLower = item.identity.postingId.toLowerCase();
+    const cleanOrigLower = item.url.replace(/\/+$/, '').toLowerCase();
+    const isMatch = snap.openLinksLower.some(
+      (lnk) =>
+        lnk.replace(/\/+$/, '') === cleanOrigLower ||
+        lnk.includes(`/${idLower}`) ||
+        lnk.endsWith(`=${idLower}`),
+    );
+
+    if (isMatch) {
+      results.push({
+        url: item.url,
+        status: 'live',
+        platform: item.identity.platform,
+        slug: item.identity.slug,
+      });
+      continue;
+    }
+
+    // Workday CXS boards paginate 20 at a time: if the board was truncated, check the single Workday job endpoint before marking closed!
+    if (item.identity.platform === 'workday' && snap.truncated) {
+      const wdCheck = await executeScrape({
+        url: item.url,
+        renderMode: 'auto',
+        formats: ['markdown'],
+        ...(payload.target ? { target: payload.target } : {}),
+        ...(payload.site ? { site: payload.site } : {}),
+      }).catch(() => null);
+      if (wdCheck?.status === 200 && wdCheck.body?.ok === true && wdCheck.body?.contentState !== 'closed_posting' && wdCheck.body?.contentState !== 'soft_404') {
+        results.push({
+          url: item.url,
+          status: 'live',
+          platform: item.identity.platform,
+          slug: item.identity.slug,
+        });
+        continue;
+      }
+    }
+
+    const similar = findSimilarRoles(snap.openRoles, item.identity.roleTokens);
+    results.push({
+      url: item.url,
+      status: 'closed',
+      platform: item.identity.platform,
+      slug: item.identity.slug,
+      ...(similar.length > 0 ? { similarOpenRoles: similar } : {}),
+    });
+  }
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      mode: 'verify',
+      boardsFetched: boardGroups.size,
+      checked: results.length,
+      results,
+    },
+  };
+}
+
 /**
  * `Section 4`: One-call `jobs` sweep across Greenhouse, Ashby, Lever, Workday, Workable, Gem, Rippling, SmartRecruiters,
- * company-domain -> ATS auto-discovery (`domains`), and optional Built In browser rendering.
+ * iCIMS, robots-allowed public feeds (We Work Remotely, Himalayas, Working Nomads), company-domain -> ATS auto-discovery (`domains`),
+ * and batch saved-posting verification (`verify` / `mode: 'verify'`).
  */
 export async function executeJobsCall(params: {
   payload: JobsToolPayload;
@@ -2073,6 +3123,30 @@ export async function executeJobsCall(params: {
   executeScrape: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { payload, executeSearch, executeScrape } = params;
+
+  // Batch `verify` mode (`verify: [...]` or `mode: 'verify', urls: [...]`)
+  const rawVerifyArray = Array.isArray(payload.verify)
+    ? payload.verify
+    : payload.mode === 'verify' && Array.isArray(payload.urls)
+      ? payload.urls
+      : null;
+  if (rawVerifyArray !== null || payload.mode === 'verify') {
+    const cleanVerifyUrls = (rawVerifyArray ?? [])
+      .filter((u): u is string => typeof u === 'string' && u.trim().startsWith('https://'))
+      .map((u) => u.trim());
+    if (cleanVerifyUrls.length === 0) {
+      return {
+        status: 400,
+        body: {
+          ok: false,
+          error: 'missing_verify_urls',
+          message: 'Provide one or more `https://` posting URLs in `verify` (or `mode: "verify", urls: [...]`).',
+        },
+      };
+    }
+    return executeJobsVerifyMode({ urls: cleanVerifyUrls, payload, executeScrape });
+  }
+
   const query = typeof payload.query === 'string' ? payload.query.trim() : '';
   const companyFilter = typeof payload.company === 'string' ? payload.company.trim() : '';
   const domainsInput = Array.isArray(payload.domains)
@@ -2250,6 +3324,31 @@ export async function executeJobsCall(params: {
     }
   }
 
+  // Optional robots.txt-allowed public remote job feeds (We Work Remotely RSS, Himalayas, Working Nomads)
+  const shouldFetchPublicFeeds =
+    payload.includePublicFeeds === true ||
+    (payload.includePublicFeeds !== false && Boolean(query) && !companyFilter && domainsInput.length === 0);
+  if (shouldFetchPublicFeeds) {
+    const feedOuts = await Promise.all(
+      PUBLIC_JOB_FEEDS.map((feed) =>
+        executeScrape({
+          url: feed.url,
+          renderMode: 'auto',
+          formats: ['markdown'],
+          ...(payload.target ? { target: payload.target } : {}),
+          ...(payload.site ? { site: payload.site } : {}),
+        }).catch(() => null),
+      ),
+    );
+    for (const fo of feedOuts) {
+      if (fo?.status === 200 && fo.body?.ok === true && Array.isArray(fo.body.jobs)) {
+        for (const fj of fo.body.jobs as StructuredJobRecord[]) {
+          collected.push(fj);
+        }
+      }
+    }
+  }
+
   // Fetch candidate ATS URLs in parallel batches of 5 through `executeScrape` (which invokes Ashby, Workday CXS, Greenhouse, Lever & JSON-LD!)
   const urlList = [...candidateUrls];
   for (let i = 0; i < urlList.length; i += 5) {
@@ -2295,7 +3394,49 @@ export async function executeJobsCall(params: {
 
       // If board returned multiple `jobs` directly (e.g. Ashby / Workday / Greenhouse / Lever / Workable / Gem / Rippling board URL)
       if (Array.isArray(sc.body.jobs)) {
-        const boardJobs = sc.body.jobs as StructuredJobRecord[];
+        const boardJobs = [...(sc.body.jobs as StructuredJobRecord[])];
+        let boardTotal = typeof sc.body.total === 'number' ? sc.body.total : boardJobs.length;
+        let boardTruncated = sc.body.truncated === true;
+        let boardNextCursor = typeof sc.body.nextCursor === 'string' ? sc.body.nextCursor : undefined;
+
+        // Paginate Workday CXS boards (`offset: 20, 40, ...` up to `offset <= 80`) when truncated!
+        if (boardTruncated && boardNextCursor && /myworkday(?:jobs|site)\.com/i.test(origU)) {
+          let nextOffset = parseInt(boardNextCursor, 10);
+          while (Number.isFinite(nextOffset) && nextOffset > 0 && nextOffset <= 80) {
+            let pageUrlStr = '';
+            try {
+              const wdPageU = new URL(origU);
+              wdPageU.searchParams.set('offset', String(nextOffset));
+              if (query && !wdPageU.searchParams.has('q')) wdPageU.searchParams.set('q', query);
+              pageUrlStr = wdPageU.toString();
+            } catch {
+              break;
+            }
+            const wdPageRes = await executeScrape({
+              url: pageUrlStr,
+              renderMode: 'auto',
+              formats: ['markdown'],
+              ...(payload.target ? { target: payload.target } : {}),
+              ...(payload.site ? { site: payload.site } : {}),
+            }).catch(() => null);
+            const moreJobs = Array.isArray(wdPageRes?.body?.jobs)
+              ? (wdPageRes!.body.jobs as StructuredJobRecord[])
+              : [];
+            if (wdPageRes?.status !== 200 || moreJobs.length === 0) {
+              boardTruncated = boardTotal > boardJobs.length;
+              break;
+            }
+            boardJobs.push(...moreJobs);
+            if (typeof wdPageRes.body.total === 'number') {
+              boardTotal = Math.max(boardTotal, wdPageRes.body.total);
+            }
+            boardTruncated = wdPageRes.body.truncated === true;
+            boardNextCursor = typeof wdPageRes.body.nextCursor === 'string' ? wdPageRes.body.nextCursor : undefined;
+            if (!boardTruncated || !boardNextCursor) break;
+            nextOffset = parseInt(boardNextCursor, 10);
+          }
+        }
+
         if (discEntry) {
           discEntry.boardStatus = classifyAtsBoardStatus({
             httpStatus: sc.status,
@@ -2303,6 +3444,12 @@ export async function executeJobsCall(params: {
             finalUrl: typeof sc.body.finalUrl === 'string' ? sc.body.finalUrl : undefined,
             jobCount: boardJobs.length,
           });
+          discEntry.total = boardTotal;
+          discEntry.returned = boardJobs.length;
+          discEntry.truncated = boardTotal > boardJobs.length;
+          if (boardTotal > boardJobs.length && boardNextCursor) {
+            discEntry.nextCursor = boardNextCursor;
+          }
         }
         for (const br of boardJobs) {
           collected.push(br);

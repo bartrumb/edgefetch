@@ -101,6 +101,8 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   deny /proc/kmem rwklx,
   deny /proc/mem rwklx,
   deny /proc/*/mem rwklx,
+  deny /proc/*/task/*/mem rw,
   deny /proc/*/environ r,
+  deny /proc/*/task/*/environ r,
   deny /sys/firmware/** rwklx,
 }

@@ -53,6 +53,8 @@ export interface AgentAttachment {
   arch: string;
   version?: string;
   goVersion?: string;
+  browserVersion?: string;
+  browserSandbox?: 'on' | 'off' | 'unknown';
   publicIp?: string;
   capabilities?: string[];
   connectedAt: number;
@@ -458,6 +460,22 @@ function sanitizeGoVersion(raw: string | null | undefined): string | undefined {
   return /^(?:go|mv3-)[0-9A-Za-z._+-]{1,28}$/i.test(clean) ? clean : undefined;
 }
 
+function sanitizeBrowserVersion(raw: string | null | undefined): string | undefined {
+  const clean = (raw ?? '').trim();
+  if (!clean || clean.length > 96 || /[\r\n\0<>]/.test(clean)) return undefined;
+  return /^[A-Za-z0-9._/: ()+-]{1,96}$/.test(clean) ? clean : undefined;
+}
+
+function sanitizeBrowserSandbox(raw: unknown): 'on' | 'off' | 'unknown' | undefined {
+  if (typeof raw === 'boolean') return raw ? 'on' : 'off';
+  if (typeof raw !== 'string') return undefined;
+  const clean = raw.trim().toLowerCase();
+  if (clean === 'on' || clean === 'true' || clean === '1' || clean === 'enabled') return 'on';
+  if (clean === 'off' || clean === 'false' || clean === '0' || clean === 'disabled') return 'off';
+  if (clean === 'unknown') return 'unknown';
+  return undefined;
+}
+
 function sanitizeCapabilities(raw?: string | string[] | null): string[] | undefined {
   if (!raw) return undefined;
   const items = Array.isArray(raw) ? raw : raw.split(',');
@@ -808,7 +826,14 @@ export class AgentHubEngine {
     ws: HubSocketLike,
     siteId: string,
     arch?: string | null,
-    meta?: { version?: string | null; goVersion?: string | null; publicIp?: string | null; capabilities?: string | string[] | null },
+    meta?: {
+      version?: string | null;
+      goVersion?: string | null;
+      browserVersion?: string | null;
+      browserSandbox?: string | boolean | null;
+      publicIp?: string | null;
+      capabilities?: string | string[] | null;
+    },
   ): AgentAttachment {
     const normalized = siteId.trim().toLowerCase();
     for (const old of this.getSockets(`site:${normalized}`)) {
@@ -818,6 +843,8 @@ export class AgentHubEngine {
     }
     const version = sanitizeVersion(meta?.version);
     const goVersion = sanitizeGoVersion(meta?.goVersion);
+    const browserVersion = sanitizeBrowserVersion(meta?.browserVersion);
+    const browserSandbox = sanitizeBrowserSandbox(meta?.browserSandbox);
     const publicIp = sanitizePublicIp(meta?.publicIp);
     const capabilities = sanitizeCapabilities(meta?.capabilities);
     const att: AgentAttachment = {
@@ -825,6 +852,8 @@ export class AgentHubEngine {
       arch: sanitizeArch(arch),
       ...(version ? { version } : {}),
       ...(goVersion ? { goVersion } : {}),
+      ...(browserVersion ? { browserVersion } : {}),
+      ...(browserSandbox ? { browserSandbox } : {}),
       ...(publicIp ? { publicIp } : {}),
       ...(capabilities ? { capabilities } : {}),
       connectedAt: this.now(),
@@ -836,15 +865,24 @@ export class AgentHubEngine {
     return att;
   }
 
-  /** Updates version / goVersion / arch / capabilities metadata on an active socket when `agent_hello` arrives. */
+  /** Updates version / goVersion / browserVersion / browserSandbox / arch / capabilities metadata on an active socket when `agent_hello` arrives. */
   updateAgentHello(
     ws: HubSocketLike,
-    hello: { version?: string | null; goVersion?: string | null; arch?: string | null; capabilities?: string[] | null },
+    hello: {
+      version?: string | null;
+      goVersion?: string | null;
+      browserVersion?: string | null;
+      browserSandbox?: string | boolean | null;
+      arch?: string | null;
+      capabilities?: string[] | null;
+    },
   ): AgentAttachment | null {
     const raw = ws.deserializeAttachment();
     if (!isAttachment(raw)) return null;
     const version = sanitizeVersion(hello.version) ?? raw.version;
     const goVersion = sanitizeGoVersion(hello.goVersion) ?? raw.goVersion;
+    const browserVersion = sanitizeBrowserVersion(hello.browserVersion) ?? raw.browserVersion;
+    const browserSandbox = sanitizeBrowserSandbox(hello.browserSandbox) ?? raw.browserSandbox;
     const arch = hello.arch ? sanitizeArch(hello.arch) : raw.arch;
     const capabilities = sanitizeCapabilities(hello.capabilities) ?? raw.capabilities;
     const updated: AgentAttachment = {
@@ -852,6 +890,8 @@ export class AgentHubEngine {
       arch,
       ...(version ? { version } : {}),
       ...(goVersion ? { goVersion } : {}),
+      ...(browserVersion ? { browserVersion } : {}),
+      ...(browserSandbox ? { browserSandbox } : {}),
       ...(capabilities ? { capabilities } : {}),
     };
     ws.serializeAttachment(updated);

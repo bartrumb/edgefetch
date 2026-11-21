@@ -1,5 +1,5 @@
 name: "EdgeFetch"
-version: "2.5.5"
+version: "2.6.0"
 slug: "edgefetch_fat"
 image: "ghcr.io/bartrumb/edgefetch-fat-addon-{arch}"
 description: "Outbound-only Go HTTP/2 + on-demand Headless Chromium JS rendering + streaming Poppler PDF worker for Cloudflare Hibernating WebSocket Durable Objects (zero inbound ports, loopback SSRF CONNECT proxy, AppArmor confined)."
@@ -19,10 +19,11 @@ options:
   hub_url: ""
   agent_token: ""
   site_id: "site-fat-1"
-  user_agent: "EdgeFetch/2.5 (bot@edgefetch.dev)"
+  user_agent: "EdgeFetch/2.6 (bot@edgefetch.dev)"
   pause_ms: 3000
   pause_jitter_ms: 1500
   allowed_hosts: []
+  robots_bypass_hosts: []
 
 schema:
   hub_url: url
@@ -33,3 +34,5 @@ schema:
   pause_jitter_ms: "int(0,30000)"
   allowed_hosts:
     - str
+  robots_bypass_hosts:
+    - str?

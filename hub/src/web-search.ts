@@ -123,9 +123,39 @@ const EDGE_MAP_QUERY_STOPWORDS = new Set([
   'using',
 ]);
 
+function safeDecodeURIComponent(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function stripProviderInlineTagsLinear(raw: string): string {
+  if (!raw.includes('<')) return raw;
+  let out = '';
+  let i = 0;
+  while (i < raw.length) {
+    const lt = raw.indexOf('<', i);
+    if (lt < 0) {
+      out += raw.slice(i);
+      break;
+    }
+    out += raw.slice(i, lt);
+    const gt = raw.indexOf('>', lt + 1);
+    if (gt < 0) {
+      out += raw.slice(lt);
+      break;
+    }
+    out += ' ';
+    i = gt + 1;
+  }
+  return out;
+}
+
 function cleanProviderText(raw: string | undefined): string {
   if (!raw) return '';
-  return decodeHtmlEntities(raw.replace(/<[^>]+>/g, ' '))
+  return decodeHtmlEntities(stripProviderInlineTagsLinear(raw))
     .replace(/[\u200b\u200e\u200f\ufeff]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -136,7 +166,7 @@ function humanizeUrlTitle(urlStr: string): string {
     const u = new URL(urlStr);
     const segments = u.pathname
       .split('/')
-      .map((s) => decodeURIComponent(s).trim())
+      .map((s) => safeDecodeURIComponent(s).trim())
       .filter((s) => s && !/^index\.[a-z0-9]+$/i.test(s))
       .slice(-4)
       .map((seg) =>

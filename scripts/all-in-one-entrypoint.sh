@@ -16,6 +16,10 @@ if [ -z "${AGENT_TOKEN:-}" ]; then
 fi
 
 CUR_UID="$(id -u)"
+if [ "$CUR_UID" != "0" ] && [ "${EDGEFETCH_DISABLE_LOCAL_AGENT:-0}" != "1" ] && [ "${EDGEFETCH_ALLOW_SHARED_UID:-0}" != "1" ]; then
+  echo "ERROR: running EdgeFetch all-in-one with --user != 0 (uid=${CUR_UID}) disables UID separation between Hub and Chromium; set EDGEFETCH_ALLOW_SHARED_UID=1 or EDGEFETCH_DISABLE_LOCAL_AGENT=1 to override." >&2
+  exit 1
+fi
 if [ "$CUR_UID" = "0" ]; then
   # H3 UID Isolation: keep Hub SQLite + artifacts inside `0700` `node:node` `/data/hub` (with `0710` `root:node` `/data`
   # so UID `65532` has zero `---` traverse/read/write bits on `/data` itself, even across upgrades from older volumes).
@@ -69,6 +73,8 @@ if [ "${EDGEFETCH_DISABLE_LOCAL_AGENT:-0}" != "1" ]; then
     EDGEFETCH_AGENT_TOKEN="${AGENT_TOKEN}" \
     EDGEFETCH_SITE_ID="${EDGEFETCH_SITE_ID:-local-fat-1}" \
     EDGEFETCH_ALLOWED_HOSTS="${EDGEFETCH_ALLOWED_HOSTS:-}" \
+    EDGEFETCH_ROBOTS_BYPASS_HOSTS="${EDGEFETCH_ROBOTS_BYPASS_HOSTS:-${CRAWLER_ROBOTS_BYPASS_HOSTS:-}}" \
+    EDGEFETCH_REQUIRE_BROWSER_SANDBOX="${EDGEFETCH_REQUIRE_BROWSER_SANDBOX:-}" \
     EDGEFETCH_USER_AGENT="${EDGEFETCH_USER_AGENT:-}" \
     EDGEFETCH_PAUSE_MS="${EDGEFETCH_PAUSE_MS:-}" \
     EDGEFETCH_PAUSE_JITTER_MS="${EDGEFETCH_PAUSE_JITTER_MS:-}" \

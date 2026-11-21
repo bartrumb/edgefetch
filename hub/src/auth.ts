@@ -68,7 +68,20 @@ function decodeBase64UrlUtf8(raw: string): string | null {
 }
 
 function extractAgentCredentials(request: Request): { token: string | null; siteHint: string } {
-  const isWsUpgrade = (request.headers.get('upgrade') ?? '').toLowerCase() === 'websocket';
+  let pathname = '';
+  let urlObj: URL | null = null;
+  try {
+    urlObj = new URL(request.url);
+    pathname = urlObj.pathname;
+  } catch {
+    pathname = '';
+  }
+  // Only accept WebSocket subprotocol credentials on genuine `GET /agent/ws` upgrades — NEVER on HTTP POST `/agent/reply`!
+  const isWsUpgrade =
+    request.method.toUpperCase() === 'GET' &&
+    pathname === '/agent/ws' &&
+    (request.headers.get('upgrade') ?? '').toLowerCase() === 'websocket';
+
   let token: string | null = bearerToken(request) ?? (request.headers.get('x-agent-token') ?? '').trim();
   if (token === '') token = null;
 
@@ -76,33 +89,33 @@ function extractAgentCredentials(request: Request): { token: string | null; site
     const protoHdr = request.headers.get('sec-websocket-protocol') ?? '';
     for (const part of protoHdr.split(',')) {
       const p = part.trim();
-      if (p.startsWith('edgefetch-auth.')) {
+      if (p.startsWith('edgefetch-v1.')) {
+        const decoded = decodeBase64UrlUtf8(p.slice('edgefetch-v1.'.length));
+        if (decoded) {
+          token = decoded;
+          break;
+        }
+      } else if (p.startsWith('edgefetch-auth.')) {
         const decoded = decodeBase64UrlUtf8(p.slice('edgefetch-auth.'.length));
         if (decoded) {
           token = decoded;
           break;
         }
       } else if (p.startsWith('bearer.')) {
-        token = p.slice('bearer.'.length);
-        break;
+        const rawTok = p.slice('bearer.'.length).trim();
+        if (rawTok) {
+          token = rawTok;
+          break;
+        }
       }
     }
   }
 
   let siteHint = (request.headers.get('x-agent-site') ?? '').trim().toLowerCase();
-  if (isWsUpgrade && (!token || !siteHint)) {
-    try {
-      const u = new URL(request.url);
-      if (!siteHint) {
-        siteHint = (u.searchParams.get('site') ?? '').trim().toLowerCase();
-      }
-      if (!token) {
-        const qTok = (u.searchParams.get('token') ?? '').trim();
-        if (qTok) token = qTok;
-      }
-    } catch {
-      // ignore malformed request URL
-    }
+  // Never accept `?token=` in URL query parameters (prevents secret leakage in access logs / Referer / proxy traces);
+  // non-secret `?site=` hint remains supported on `GET /agent/ws` upgrades.
+  if (isWsUpgrade && !siteHint && urlObj) {
+    siteHint = (urlObj.searchParams.get('site') ?? '').trim().toLowerCase();
   }
   return { token, siteHint };
 }

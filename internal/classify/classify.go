@@ -30,6 +30,7 @@ const (
 	OutcomeOK              Outcome = "ok"
 	OutcomeChallenge       Outcome = "challenge"        // Edge anti-bot challenge (`cf-mitigated`) — never retried
 	OutcomeStop            Outcome = "stop"             // Origin answered 403, 429, or 503 — halt remaining URLs for this host
+	OutcomeRateLimited     Outcome = "rate_limited"     // Explicit rate-limit outcome — halts remaining URLs for this host
 	OutcomePaymentRequired Outcome = "payment_required" // Origin answered HTTP 402 (e.g. x402 / Monetization Gateway) — halt host, never auto-pay
 	OutcomeGone            Outcome = "gone"             // Document answered 404 or 410
 	OutcomeSkip            Outcome = "skip"             // Non-200 or non-HTML/Markdown page that can be skipped without failing the host
@@ -167,10 +168,50 @@ func invalidJSONMessage(header http.Header) string {
 	return fmt.Sprintf("not JSON (%s)", ct)
 }
 
+// IsAutoPageContentType reports whether a response `Content-Type` header should be accepted as `OutcomeOK` when a caller
+// omitted an explicit `Kind` (`KindAuto == true`).
+func IsAutoPageContentType(contentType string) bool {
+	mediaType := strings.TrimSpace(strings.ToLower(contentType))
+	if semi := strings.IndexByte(mediaType, ';'); semi >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:semi])
+	}
+	switch mediaType {
+	case "text/html",
+		"application/xhtml+xml",
+		"text/markdown",
+		"text/x-markdown",
+		"application/json",
+		"application/rss+xml",
+		"application/atom+xml",
+		"application/xml",
+		"text/xml",
+		"text/plain":
+		return true
+	}
+	return strings.HasPrefix(mediaType, "application/") && strings.HasSuffix(mediaType, "+json")
+}
+
+// ClassifyAuto evaluates `Classify` and promotes structured/text 2xx responses (`application/json`, `application/*+json`,
+// `application/rss+xml`, `application/atom+xml`, `application/xml`, `text/xml`, `text/plain`, `text/markdown`) to
+// `OutcomeOK` when `kindAuto` is true (or `kind == ""`).
+func ClassifyAuto(kind Kind, kindAuto bool, status int, header http.Header, body []byte) (Outcome, string) {
+	if kind == "" {
+		kind = KindPage
+		kindAuto = true
+	}
+	out, prob := Classify(kind, status, header, body)
+	if kindAuto && kind == KindPage && out == OutcomeSkip && status >= 200 && status <= 299 {
+		if IsAutoPageContentType(header.Get("content-type")) {
+			return OutcomeOK, ""
+		}
+	}
+	return out, prob
+}
+
 // StopsHost reports whether `outcome` on `kind` should leave remaining queued URLs for the same host `not_tried`.
 func StopsHost(kind Kind, o Outcome) bool {
 	switch o {
-	case OutcomeChallenge, OutcomeStop, OutcomePaymentRequired:
+	case OutcomeChallenge, OutcomeStop, OutcomeRateLimited, OutcomePaymentRequired:
 		return true
 	case OutcomeError:
 		return kind == KindFeed || kind == KindJSON || kind == KindCatalog

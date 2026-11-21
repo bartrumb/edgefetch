@@ -256,7 +256,10 @@ func main() {
 			log.Error("agent_config", slog.String("error", err.Error()))
 			os.Exit(2)
 		}
-		priv.LockDownSecretPaths(agent.DefaultHAOptionsPath)
+		if err := priv.LockDownSecretPaths(agent.DefaultHAOptionsPath); err != nil {
+			log.Error("agent_lockdown_secrets", slog.String("error", err.Error()))
+			os.Exit(2)
+		}
 		if err := priv.DropRoot(); err != nil {
 			log.Error("agent_drop_privileges", slog.String("error", err.Error()))
 			os.Exit(2)
@@ -275,9 +278,12 @@ func main() {
 			slog.String("go", runtime.Version()))
 		crawler := crawl.NewCrawler(newCrawlTransport(90*time.Second, 4), allow, cfg.UserAgent, siteLog)
 		defer func() { _ = crawler.Close() }()
-		crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
+		crawler.SetRobotsBypassHosts(cfg.RobotsBypassHosts)
 		crawler.SetOtelExporter(otel.NewExporterFromEnv(os.Getenv, "edgefetch-agent-"+cfg.SiteID, agent.Version, hubTr))
 		configureCrawlerBotAuth(crawler, cfg.HubURLs, siteLog)
+		warmCtx, cancelWarm := context.WithTimeout(ctx, 6*time.Second)
+		_ = crawler.WarmUp(warmCtx)
+		cancelWarm()
 
 		if err := agent.RunAll(ctx, cfg, crawler, allow, hubTr, siteLog, agent.RuntimeOpts{}); err != nil {
 			log.Error("agent_stopped", slog.String("error", err.Error()))
@@ -327,7 +333,11 @@ func main() {
 	}
 	crawler := crawl.NewCrawler(newCrawlTransport(60*time.Second, 2), allow, ua, log)
 	defer func() { _ = crawler.Close() }()
-	crawler.SetRobotsBypassHosts(splitCSV(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS")))
+	bypassHosts := splitCSV(firstNonEmpty(os.Getenv("EDGEFETCH_ROBOTS_BYPASS_HOSTS"), os.Getenv("CRAWLER_ROBOTS_BYPASS_HOSTS")))
+	if len(bypassHosts) == 0 && len(agentCfg.RobotsBypassHosts) > 0 {
+		bypassHosts = agentCfg.RobotsBypassHosts
+	}
+	crawler.SetRobotsBypassHosts(bypassHosts)
 	crawler.SetOtelExporter(otel.NewExporterFromEnv(os.Getenv, defaultOtelSvc, agent.Version, hubTr))
 	botSigner := configureCrawlerBotAuth(crawler, agentCfg.HubURLs, log)
 
@@ -370,7 +380,11 @@ func main() {
 	}
 	// Drop root privileges after reading /data/options.json, locking down /data, and binding the TCP listener so
 	// hybrid/server/hub modes run unprivileged (65532:65532) just like pure agent mode!
-	priv.LockDownSecretPaths(agent.DefaultHAOptionsPath)
+	if err := priv.LockDownSecretPaths(agent.DefaultHAOptionsPath); err != nil {
+		log.Error("lockdown_secrets", slog.String("error", err.Error()))
+		_ = ln.Close()
+		os.Exit(2)
+	}
 	if err := priv.DropRoot(); err != nil {
 		log.Error("drop_privileges", slog.String("error", err.Error()))
 		_ = ln.Close()

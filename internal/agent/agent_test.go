@@ -33,7 +33,8 @@ func TestConfigSecurityGuards(t *testing.T) {
 		"hub_url": "https://hub.example.com/",
 		"agent_token": "secret-agent-token-0123456789",
 		"site_id": "Site-ARM64",
-		"user_agent": "CustomBot/2.0 (+https://example.com)"
+		"user_agent": "CustomBot/2.0 (+https://example.com)",
+		"robots_bypass_hosts": ["internal.example.com"]
 	}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +45,19 @@ func TestConfigSecurityGuards(t *testing.T) {
 	}
 	if cfg.SiteID != "site-arm64" || cfg.HubURL != "https://hub.example.com" || cfg.UserAgent != "CustomBot/2.0 (+https://example.com)" {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+	if len(cfg.RobotsBypassHosts) != 1 || cfg.RobotsBypassHosts[0] != "internal.example.com" {
+		t.Fatalf("expected robots_bypass_hosts from options.json, got %+v", cfg.RobotsBypassHosts)
+	}
+
+	overrideCfg, err := LoadConfigFrom(optPath, func(k string) string {
+		if k == "EDGEFETCH_ROBOTS_BYPASS_HOSTS" {
+			return "alpha.example.com, beta.example.com"
+		}
+		return ""
+	})
+	if err != nil || len(overrideCfg.RobotsBypassHosts) != 2 || overrideCfg.RobotsBypassHosts[1] != "beta.example.com" {
+		t.Fatalf("expected EDGEFETCH_ROBOTS_BYPASS_HOSTS override, got %+v (err=%v)", overrideCfg.RobotsBypassHosts, err)
 	}
 
 	// SECURITY S2: Even with EDGEFETCH_ALLOW_INSECURE_HUB=1, cleartext http:// to a remote host MUST be rejected!
@@ -270,13 +284,12 @@ func TestAgentSessionReconnectHelloPingAndGzipReply(t *testing.T) {
 }
 
 func TestShutdownDrainStillUploadsPartialResults(t *testing.T) {
-	var calls atomic.Int32
 	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/robots.txt" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		if calls.Add(1) == 1 {
+		if r.URL.Path == "/1" {
 			w.Header().Set("content-type", "text/html")
 			_, _ = w.Write([]byte("<html>done-1</html>"))
 			return
@@ -608,5 +621,148 @@ func TestArtifactModeStreams40MiBLogicalBatchWithoutBodiesInReply(t *testing.T) 
 	failedArt := gotReply.Results[5]
 	if failedArt.Outcome != classify.OutcomeOK || failedArt.Body != "" || !failedArt.BodyOmitted || failedArt.ArtifactError == "" {
 		t.Fatalf("failed upload must keep OutcomeOK, omit inline Body, and set ArtifactError; got %+v", failedArt)
+	}
+}
+
+func TestBurstDispatchConcurrencyCrossDomainGapAndKeepaliveDrain(t *testing.T) {
+	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		time.Sleep(180 * time.Millisecond)
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte("<html>burst-ok</html>"))
+	}))
+	defer originSrv.Close()
+	originAddr := originSrv.Listener.Addr().String()
+
+	tr := &http.Transport{
+		TLSClientConfig: originSrv.Client().Transport.(*http.Transport).TLSClientConfig,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
+		},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	crawler := crawl.NewCrawler(tr, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+
+	var (
+		wsConns   atomic.Int32
+		replyOnce sync.Once
+		replyCh   = make(chan crawl.FetchReply, 1)
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/agent/ws", func(w http.ResponseWriter, r *http.Request) {
+		wsConns.Add(1)
+		sc, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer sc.CloseNow()
+
+		var writeMu sync.Mutex
+		writeText := func(payload []byte) {
+			writeMu.Lock()
+			_ = sc.Write(r.Context(), websocket.MessageText, payload)
+			writeMu.Unlock()
+		}
+
+		// Wait for agent_hello, then dispatch a 4-domain batch while echoing pings continuously.
+		dispatched := false
+		for {
+			typ, data, err := sc.Read(r.Context())
+			if err != nil {
+				return
+			}
+			if typ != websocket.MessageText {
+				continue
+			}
+			s := string(data)
+			if s == "ping" {
+				writeText([]byte("pong"))
+				continue
+			}
+			if !dispatched && strings.Contains(s, `"agent_hello"`) {
+				dispatched = true
+				rawDispatch, _ := json.Marshal(map[string]any{
+					"type":     "dispatch",
+					"jobId":    "job-burst",
+					"jobNonce": "nonce-burst",
+					"call": crawl.FetchCall{
+						Requests: []crawl.Request{
+							{ID: "d1", URL: "https://d1.example.com/item", Kind: classify.KindPage},
+							{ID: "d2", URL: "https://d2.example.com/item", Kind: classify.KindPage},
+							{ID: "d3", URL: "https://d3.example.com/item", Kind: classify.KindPage},
+							{ID: "d4", URL: "https://d4.example.com/item", Kind: classify.KindPage},
+						},
+						Options: crawl.Options{IncludeBody: true},
+					},
+				})
+				writeText(rawDispatch)
+			}
+		}
+	})
+	mux.HandleFunc("/agent/reply", func(w http.ResponseWriter, r *http.Request) {
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer gz.Close()
+		var rep crawl.FetchReply
+		if err := json.NewDecoder(gz).Decode(&rep); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		replyOnce.Do(func() { replyCh <- rep })
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hubSrv := httptest.NewServer(mux)
+	defer hubSrv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	cfg := Config{
+		HubURL:        hubSrv.URL,
+		AgentToken:    "agent-secret-token-0123456789-abcdef",
+		SiteID:        "site-arm64",
+		UserAgent:     crawl.DefaultUserAgent,
+		PauseMs:       3000,
+		PauseJitterMs: 1000,
+	}
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, cfg, crawler, crawl.PublicHTTPS, http.DefaultTransport, log, RuntimeOpts{
+			PingInterval:  20 * time.Millisecond,
+			ReadWatchdog:  120 * time.Millisecond,
+			ShutdownDrain: time.Second,
+		})
+	}()
+
+	var rep crawl.FetchReply
+	select {
+	case rep = <-replyCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for multi-domain burst reply (GapMs or Concurrency starved batch)")
+	}
+	elapsed := time.Since(started)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if wsConns.Load() != 1 {
+		t.Fatalf("expected 1 uninterrupted WebSocket session (pong frames drained while dispatch ran), got %d", wsConns.Load())
+	}
+	if elapsed > 4500*time.Millisecond {
+		t.Fatalf("expected 4 distinct domains with 250ms cross-domain gap to finish in <4.5s (even with PauseMs=3000), took %s", elapsed)
+	}
+	for i, res := range rep.Results {
+		if res.Outcome != classify.OutcomeOK {
+			t.Fatalf("result %d failed: %+v", i, res)
+		}
 	}
 }

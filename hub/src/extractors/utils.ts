@@ -3,6 +3,7 @@
  */
 
 import {
+  escapeResidualHtmlTagsOutsideCode,
   findTagOpenEndQuoteAware,
   replaceHtmlTagBlocksLinear,
   scanHtmlTagsLinear,
@@ -83,9 +84,11 @@ export function decodeBasicEntities(s: string): string {
 }
 
 export function stripTagsInline(html: string): string {
-  return decodeBasicEntities(stripHtmlTagsQuoteAwareLinear(html, ' '))
-    .replace(/\s+/g, ' ')
-    .trim();
+  return escapeResidualHtmlTagsOutsideCode(
+    decodeBasicEntities(stripHtmlTagsQuoteAwareLinear(html, ' '))
+      .replace(/\s+/g, ' ')
+      .trim(),
+  );
 }
 
 /**
@@ -98,7 +101,7 @@ export function unescapeHrefUrl(rawHref: string): string {
 }
 
 export function stripScriptsAndStyles(rawHtml: string): string {
-  return stripHtmlTagsLinear(rawHtml, ['script', 'style', 'svg'], '');
+  return stripHtmlTagsLinear(rawHtml, ['script', 'style', 'svg', 'iframe', 'object', 'embed'], '');
 }
 
 export function detectFenceLang(filePath: string): { lang: string; isMarkdown: boolean } {

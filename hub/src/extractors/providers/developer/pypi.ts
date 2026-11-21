@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { attrHasTokenLinear, defineAdapter, findElementInnerLinear, findOpenTagLinear, getAttrValueLinear } from '../../types';
 import { extractBalancedDivAt, stripScriptsAndStyles, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -11,11 +11,20 @@ export default defineAdapter({
   extractHtml({ path, rawHtml, baseUrl, htmlToMd }) {
     if (!/^\/project\/[^/]+/i.test(path)) return null;
     const clean = stripScriptsAndStyles(rawHtml);
-    const headerName = stripTagsInline(/<h1\b[^>]*\bpackage-header__name\b[^>]*>([\s\S]*?)<\/h1>/i.exec(clean)?.[1] ?? '');
-    const pipCmd = stripTagsInline(/<span\b[^>]*\bid=["']pip-command["'][^>]*>([\s\S]*?)<\/span>/i.exec(clean)?.[1] ?? '');
-    const summary = stripTagsInline(/<p\b[^>]*\bpackage-description__summary\b[^>]*>([\s\S]*?)<\/p>/i.exec(clean)?.[1] ?? '');
-    const descOpen = /<div\b[^>]*\bid=["']description["'][^>]*>/i.exec(clean) ?? /<div\b[^>]*\bproject-description\b[^>]*>/i.exec(clean);
-    if (!descOpen || !headerName) return null;
+    const headerName = stripTagsInline(
+      findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'package-header__name')) ?? '',
+    );
+    if (!headerName) return null;
+    const descOpen =
+      findOpenTagLinear(clean, 'div', (a) => getAttrValueLinear(a, 'id') === 'description') ??
+      findOpenTagLinear(clean, 'div', (a) => attrHasTokenLinear(a, 'class', 'project-description'));
+    if (!descOpen) return null;
+    const pipCmd = stripTagsInline(
+      findElementInnerLinear(clean, 'span', (a) => getAttrValueLinear(a, 'id') === 'pip-command') ?? '',
+    );
+    const summary = stripTagsInline(
+      findElementInnerLinear(clean, 'p', (a) => attrHasTokenLinear(a, 'class', 'package-description__summary')) ?? '',
+    );
     const inner = extractBalancedDivAt(clean, descOpen.index);
     if (!inner) return null;
     const readmeMd = htmlToMd(inner, baseUrl).markdown.trim();

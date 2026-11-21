@@ -7,11 +7,28 @@
  *  - Exposes `listRegisteredAdapters()` for `GET /v1/extractors` and automated fixture testing.
  */
 
+import { runAdapterSyncInBulkhead } from '../adapter-sandbox';
 import { BUILTIN_SITE_ADAPTERS } from './providers/index';
+import {
+  enrichShopifyProductFromJson,
+  extractShopifyCurrencyFromHtml,
+  isShopifyHtmlOrHeaders,
+  normalizeShopifyProductRecord,
+  resolveCustomDomainShopifyProductTwinUrl,
+} from './providers/commerce-social/shopify';
+import woocommerceAdapter, {
+  isWooCommerceHtmlOrHeaders,
+  normalizeWooCommerceProductRecord,
+} from './providers/commerce-social/woocommerce';
+import icimsAdapter from './providers/jobs/icims';
 import type {
   AdapterCatalogEntry,
   AdapterCategory,
+  CatalogRecord,
+  CatalogSpec,
+  CatalogVariantRecord,
   HtmlFragmentConverter,
+  PaginationInfo,
   PostFetchSiteResult,
   SiteAdapter,
   SiteExtractorTwin,
@@ -23,13 +40,27 @@ export { defineAdapter } from './types';
 export type {
   AdapterCatalogEntry,
   AdapterCategory,
+  CatalogRecord,
+  CatalogSpec,
+  CatalogVariantRecord,
   HtmlFragmentConverter,
+  PaginationInfo,
   PostFetchSiteResult,
   SiteAdapter,
   SiteExtractorTwin,
   TwinFormattedDoc,
 };
-export { formatYamlFrontmatterCard, unescapeHrefUrl };
+export {
+  enrichShopifyProductFromJson,
+  extractShopifyCurrencyFromHtml,
+  formatYamlFrontmatterCard,
+  isShopifyHtmlOrHeaders,
+  isWooCommerceHtmlOrHeaders,
+  normalizeShopifyProductRecord,
+  normalizeWooCommerceProductRecord,
+  resolveCustomDomainShopifyProductTwinUrl,
+  unescapeHrefUrl,
+};
 
 interface WildcardRule {
   kind: 'suffix' | 'prefix' | 'infix';
@@ -106,7 +137,20 @@ class AdapterRegistryIndex {
   }
 }
 
-const DEFAULT_INDEX = new AdapterRegistryIndex(BUILTIN_SITE_ADAPTERS);
+const EXTRA_REGISTERED_ADAPTERS: SiteAdapter[] = [woocommerceAdapter, icimsAdapter];
+const ALL_REGISTERED_ADAPTERS: SiteAdapter[] = (() => {
+  const seenIds = new Set<string>();
+  const out: SiteAdapter[] = [];
+  for (const a of [...BUILTIN_SITE_ADAPTERS, ...EXTRA_REGISTERED_ADAPTERS]) {
+    if (!seenIds.has(a.id)) {
+      seenIds.add(a.id);
+      out.push(a);
+    }
+  }
+  return out;
+})();
+
+const DEFAULT_INDEX = new AdapterRegistryIndex(ALL_REGISTERED_ADAPTERS);
 
 /** Validates that a twin target URL is strictly `https://` with no embedded credentials. */
 function isSafePublicTwinUrl(fetchUrl: string): boolean {
@@ -142,26 +186,24 @@ export function resolveSiteExtractorTwin(urlStr: string): SiteExtractorTwin | nu
 
   for (const adapter of DEFAULT_INDEX.candidatesForHost(host)) {
     if (!adapter.resolveTwin) continue;
-    try {
-      const twin = adapter.resolveTwin(ctx);
-      if (twin && isSafePublicTwinUrl(twin.fetchUrl)) {
-        const rawFormat = twin.formatTwin;
-        return {
-          ...twin,
-          formatTwin: (rawBody, originalUrl, htmlToMd) => {
-            try {
-              return rawFormat(rawBody, originalUrl, htmlToMd);
-            } catch {
-              // Fault-isolated bulkhead: if an upstream JSON schema changes, return null so EdgeFetch
-              // automatically falls back to standard HTML / JSON-LD / SSR / CDP extraction without failing!
-              return null;
-            }
-          },
-        };
-      }
-    } catch {
-      // Fault-isolated bulkhead: skip throwing adapter and continue
-      continue;
+    const twinRes = runAdapterSyncInBulkhead(adapter.id, (inp) => adapter.resolveTwin!(inp), ctx);
+    if (!twinRes.ok) continue;
+    const twin = twinRes.value;
+    if (twin && isSafePublicTwinUrl(twin.fetchUrl)) {
+      const rawFormat = twin.formatTwin;
+      return {
+        ...twin,
+        formatTwin: (rawBody, originalUrl, htmlToMd) => {
+          const fmtRes = runAdapterSyncInBulkhead(
+            adapter.id,
+            (inp) => rawFormat(inp.rawBody, inp.originalUrl, inp.htmlToMd),
+            { rawBody, originalUrl, htmlToMd },
+          );
+          // Fault-isolated bulkhead: if an upstream JSON schema changes or adapter throws (including network attempts),
+          // return null so EdgeFetch automatically falls back to standard HTML / JSON-LD / SSR / CDP extraction!
+          return fmtRes.ok ? fmtRes.value : null;
+        },
+      };
     }
   }
   return null;
@@ -190,14 +232,10 @@ export function applyPostFetchSiteExtractor(
 
   for (const adapter of DEFAULT_INDEX.candidatesForHost(host)) {
     if (!adapter.extractHtml) continue;
-    try {
-      const res = adapter.extractHtml(ctx);
-      if (res && res.markdown.trim()) {
-        return res;
-      }
-    } catch {
-      // Fault-isolated bulkhead: never let a DOM change or buggy community adapter fail a scrape!
-      continue;
+    // Fault-isolated zero-network bulkhead: never let a DOM change, network call, or buggy community adapter fail a scrape!
+    const res = runAdapterSyncInBulkhead(adapter.id, (inp) => adapter.extractHtml!(inp), ctx);
+    if (res.ok && res.value && res.value.markdown.trim()) {
+      return res.value;
     }
   }
   return null;
@@ -250,9 +288,10 @@ const BUILTIN_ATS_CORE_CATALOG: AdapterCatalogEntry[] = [
 /** Returns all registered Site & ATS Adapters for `GET /v1/extractors`, CLI/SDK inspection, and test verification. */
 export function listRegisteredAdapters(categoryFilter?: string): AdapterCatalogEntry[] {
   const fromModular: AdapterCatalogEntry[] = DEFAULT_INDEX.all.map((a) => {
-    const modes: Array<'twin' | 'html' | 'ats'> = [];
+    const modes: Array<'twin' | 'html' | 'ats' | 'catalog'> = [];
     if (a.resolveTwin) modes.push('twin');
     if (a.extractHtml) modes.push('html');
+    if (a.catalog) modes.push('catalog');
     return {
       id: a.id,
       name: a.name,
@@ -274,4 +313,15 @@ export function listRegisteredAdapters(categoryFilter?: string): AdapterCatalogE
 /** Exposes raw `SiteAdapter` objects for automated test validation. */
 export function getRawRegisteredSiteAdapters(): readonly SiteAdapter[] {
   return DEFAULT_INDEX.all;
+}
+
+/** Returns all registered `SiteAdapter` definitions that implement a `CatalogSpec` (`shopify`, `woocommerce`, etc.). */
+export function listCatalogAdapters(): SiteAdapter[] {
+  return DEFAULT_INDEX.all.filter((a) => Boolean(a.catalog));
+}
+
+/** Looks up a `CatalogSpec`-capable `SiteAdapter` by platform identifier (`shopify`, `woocommerce`). */
+export function getCatalogAdapter(platform: string): SiteAdapter | null {
+  const norm = platform.trim().toLowerCase();
+  return DEFAULT_INDEX.all.find((a) => a.catalog && a.catalog.platform.toLowerCase() === norm) ?? null;
 }

@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { attrHasTokenLinear, defineAdapter, findAllElementInnersLinear, findElementInnerLinear } from '../../types';
 import { decodeBasicEntities, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -13,9 +13,9 @@ export default defineAdapter({
     const isRfcEditor = (host === 'www.rfc-editor.org' || host === 'rfc-editor.org') && /^\/rfc\/rfc\d+/i.test(path);
     if (!isDatatracker && !isRfcEditor) return null;
 
-    const preBlocks = [...rawHtml.matchAll(/<pre\b[^>]*\bclass=["'][^"']*\bnewpage\b[^"']*["'][^>]*>([\s\S]*?)<\/pre>/gi)];
+    const preBlocks = findAllElementInnersLinear(rawHtml, 'pre', (a) => attrHasTokenLinear(a, 'class', 'newpage'), 400);
     const sourceText =
-      preBlocks.length > 0 ? preBlocks.map((m) => decodeBasicEntities(m[1]!.replace(/<[^>]+>/g, ''))).join('\n') : currentMd;
+      preBlocks.length > 0 ? preBlocks.map((inner) => decodeBasicEntities(inner.replace(/<[^>]+>/g, ''))).join('\n') : currentMd;
     if (!sourceText || sourceText.trim().length < 80) return null;
 
     const cleanedLines: string[] = [];
@@ -38,7 +38,7 @@ export default defineAdapter({
     }
 
     const md = cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-    const title = stripTagsInline(/<title>([\s\S]*?)<\/title>/i.exec(rawHtml)?.[1] ?? '').trim();
+    const title = stripTagsInline(findElementInnerLinear(rawHtml, 'title') ?? '').trim();
     return {
       extractorId: 'ietf-rfc',
       ...(title ? { title } : {}),

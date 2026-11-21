@@ -4,8 +4,8 @@
 Package `priv` drops root OS privileges on Linux process startup (`UID 0` to `65532:65532` with `PR_SET_NO_NEW_PRIVS` across all Go runtime OS threads) and provides a no-op stub on non-Linux platforms.
 
 ## Interface
-- `[priv_linux.go:LockDownSecretPaths]` (`//go:build linux`): `func LockDownSecretPaths(paths ...string)` — restricts secret configuration files (such as `/data/options.json`) to `0600` `0:0` and `/data` to `0700` `0:0` while `os.Geteuid() == 0` right before `DropRoot()`.
-- `[priv_other.go:LockDownSecretPaths]` (`//go:build !linux`): `func LockDownSecretPaths(_ ...string)` — no-op stub on non-Linux targets.
+- `[priv_linux.go:LockDownSecretPaths]`, `[priv_linux.go:LockDownSecretPathsStrict]` (`//go:build linux`): `func LockDownSecretPaths(paths ...string) error` and `func LockDownSecretPathsStrict(paths ...string) error` — lock `/data` (`0700` `0:0`) first and then secret configuration files (such as `/data/options.json`, `0600` `0:0`) while `os.Geteuid() == 0` right before `DropRoot()`, failing closed on symlinks or `Chown`/`Chmod` errors.
+- `[priv_other.go:LockDownSecretPaths]`, `[priv_other.go:LockDownSecretPathsStrict]` (`//go:build !linux`): `func LockDownSecretPaths(_ ...string) error` and `func LockDownSecretPathsStrict(_ ...string) error` — no-op stubs returning `nil` on non-Linux targets.
 - `[priv_linux.go:DropRoot]` (`//go:build linux`): `func DropRoot() error` — transitions real, effective, and saved UID/GID `0` to `65532:65532` and enables `PR_SET_NO_NEW_PRIVS` across all Go OS threads; returns `nil` immediately when `os.Geteuid() != 0`.
 - `[priv_other.go:DropRoot]` (`//go:build !linux`): `func DropRoot() error` — no-op stub returning `nil` on non-Linux targets.
 

@@ -8,7 +8,7 @@
  * revocation in `/admin`.
  */
 import { callerToken, isValidSecretMatch, MIN_TOKEN_LENGTH, sameBytes } from './auth';
-import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
+import { normalizeClientRateLimitIp, readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 
 export const MCP_SCOPES = ['crawl:read', 'crawl:fetch'] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
@@ -488,9 +488,15 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     },
     recordAuthFailure(bucket, now, windowMs, maxFailures) {
       if (bucket.startsWith('revoked_admin:')) {
-        // Dedicated `admin_revocations` table pruned ONLY by `expires_at <= now` so brute-force `auth_failures` buckets
-        // can NEVER evict a logged-out admin session revocation (`Low`)!
+        // Dedicated `admin_revocations` table pruned ONLY by `expires_at <= now` (bounded to 4096 entries) so brute-force
+        // `auth_failures` buckets can NEVER evict a logged-out admin session revocation (`Low`)!
         sql.exec('DELETE FROM admin_revocations WHERE expires_at <= ?', now);
+        sql.exec(
+          `DELETE FROM admin_revocations
+           WHERE key IN (
+             SELECT key FROM admin_revocations ORDER BY expires_at DESC LIMIT -1 OFFSET 4095
+           )`,
+        );
         const expiresAt = now + windowMs;
         sql.exec('INSERT OR REPLACE INTO admin_revocations (key, expires_at) VALUES (?, ?)', bucket, expiresAt);
         return { allowed: false, retryAfterSec: Math.max(1, Math.ceil(windowMs / 1_000)) };
@@ -787,7 +793,8 @@ export function readCookie(cookieHeader: string | null, name: string): string | 
   for (const part of cookieHeader.split(';')) {
     const trimmed = part.trim();
     if (trimmed.startsWith(`${name}=`)) {
-      return trimmed.slice(name.length + 1);
+      const rawVal = trimmed.slice(name.length + 1);
+      return rawVal.includes('%') ? (safeDecodeURIComponent(rawVal) ?? rawVal) : rawVal;
     }
   }
   return null;
@@ -1561,16 +1568,19 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
       const isExternalRedirect = !isLoopbackRedirectUri(sealed.redirectUri);
       if (!adminSession.ok || isExternalRedirect) {
-        // Check lockout BEFORE checking supplied token (H-S5).
-        const preLock = await deps.store.checkAuthLockout(`oauth:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
-        if (!preLock.allowed) {
-          return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
-            status: 429,
-            headers: { ...CONSENT_PAGE_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
-          });
-        }
         const supplied = (form.owner_token ?? '').trim();
-        if (!isValidSecretMatch(supplied, deps.ownerSecret, deps.mcpToken)) {
+        // Verify constant-time secret match FIRST (`R3-M4`): a valid owner/MCP token succeeds and clears any spoofed/shared-IP
+        // lockout bucket, while invalid guesses are rejected with `429` once the bucket reaches `RATE_LIMIT_MAX_FAILURES`!
+        if (isValidSecretMatch(supplied, deps.ownerSecret, deps.mcpToken)) {
+          await deps.store.clearAuthFailures(`oauth:${clientIp}`);
+        } else {
+          const preLock = await deps.store.checkAuthLockout(`oauth:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
+          if (!preLock.allowed) {
+            return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
+              status: 429,
+              headers: { ...CONSENT_PAGE_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+            });
+          }
           const rl = await deps.store.recordAuthFailure(`oauth:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
           if (!rl.allowed) {
             return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
@@ -1592,7 +1602,6 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
             { status: 401, headers: CONSENT_PAGE_HEADERS },
           );
         }
-        await deps.store.clearAuthFailures(`oauth:${clientIp}`);
       }
 
       const rawCode = `efc_${randomUrlToken(32)}`;
@@ -1789,5 +1798,5 @@ export async function authorizeMcpRequest(params: {
   if (!record || record.resource.toLowerCase() !== `${params.origin.toLowerCase()}/mcp`) {
     return { ok: false, status: 401, wwwAuthenticate };
   }
-  return { ok: true, scopes: record.scopes, principal: `oauth:${record.clientName}` };
+  return { ok: true, scopes: record.scopes, principal: `oauth:${record.clientId}` };
 }

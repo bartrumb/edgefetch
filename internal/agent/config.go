@@ -24,14 +24,15 @@ var validSiteID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 // Config holds validated settings for outbound `agent` mode (including multi-controller HA via `HubURLs`).
 type Config struct {
-	HubURL        string   `json:"hub_url"`
-	HubURLs       []string `json:"hub_urls,omitempty"`
-	AgentToken    string   `json:"agent_token"`
-	SiteID        string   `json:"site_id"`
-	UserAgent     string   `json:"user_agent"`
-	PauseMs       int      `json:"pause_ms"`
-	PauseJitterMs int      `json:"pause_jitter_ms"`
-	AllowedHosts  []string `json:"allowed_hosts"`
+	HubURL            string   `json:"hub_url"`
+	HubURLs           []string `json:"hub_urls,omitempty"`
+	AgentToken        string   `json:"agent_token"`
+	SiteID            string   `json:"site_id"`
+	UserAgent         string   `json:"user_agent"`
+	PauseMs           int      `json:"pause_ms"`
+	PauseJitterMs     int      `json:"pause_jitter_ms"`
+	AllowedHosts      []string `json:"allowed_hosts"`
+	RobotsBypassHosts []string `json:"robots_bypass_hosts,omitempty"`
 }
 
 // LoadConfig loads `/data/options.json` (when present) and overlays `EDGEFETCH_*` (or `CRAWLER_*`) environment variables.
@@ -158,6 +159,16 @@ func LoadConfigFrom(optionsPath string, getenv func(string) string) (Config, err
 			}
 		}
 		cfg.AllowedHosts = hosts
+	}
+	if v := firstEnv(getenv, "EDGEFETCH_ROBOTS_BYPASS_HOSTS", "CRAWLER_ROBOTS_BYPASS_HOSTS"); v != "" {
+		parts := strings.Split(v, ",")
+		hosts := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if h := strings.TrimSpace(p); h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+		cfg.RobotsBypassHosts = hosts
 	}
 
 	var rawHubs []string

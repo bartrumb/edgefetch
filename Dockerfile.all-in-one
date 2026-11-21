@@ -3,7 +3,7 @@
 # together with a local Go `edgefetch` worker + Headless Chromium + Poppler PDF — zero Postgres, zero Redis!
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS go-build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.5.5
+ARG BUILD_VERSION=2.6.0
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(go env GOARCH)} go build -tr
       -ldflags="-s -w -X github.com/bartrumb/edgefetch/v2/internal/agent.Version=${BUILD_VERSION}" \
       -o /out/edgefetch ./cmd/edgefetch
 
-FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS hub-build
+FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS hub-build
 WORKDIR /app/hub
 COPY hub/package.json hub/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -24,7 +24,7 @@ COPY hub/portable ./portable
 COPY hub/scripts ./scripts
 RUN npm run build:portable
 
-FROM node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5
 LABEL org.opencontainers.image.title="EdgeFetch All-in-One" \
       org.opencontainers.image.description="Self-hosted EdgeFetch Hub + Go HTTP/2 + Headless Chromium + SQLite FTS5 in one container" \
       org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
@@ -57,7 +57,7 @@ RUN chown -R root:root /app /usr/local/bin/edgefetch /usr/local/bin/all-in-one-e
 
 # Entrypoint starts as root solely to lock mounted `/data/hub` (`0700` `node:node`) and immediately drops via `su-exec`
 # into two isolated UIDs: Hub runs as `node:node` (`1000:1000`) while the Go worker + Chromium run as `65532:65532`
-# with `env -i` (falls back gracefully without `su-exec` when started with `--user != 0`).
+# with `env -i` (refuses `--user != 0` unless `EDGEFETCH_ALLOW_SHARED_UID=1` or `EDGEFETCH_DISABLE_LOCAL_AGENT=1`).
 USER root
 WORKDIR /app/hub
 ENV PORT=8787 \

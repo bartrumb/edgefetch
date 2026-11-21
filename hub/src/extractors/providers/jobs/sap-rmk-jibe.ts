@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { defineAdapter, extractXmlTagTextLinear, findAllElementInnersLinear } from '../../types';
 import { formatGfmTable, parseJsonObject, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -59,19 +59,15 @@ export default defineAdapter({
     // SAP SuccessFactors RMK `/sitemap.xml` is actually an RSS `<channel><item>` feed with `<g:location>` & `<g:employer>`!
     if (!/sitemap\.xml$/i.test(path)) return null;
     if (!/<g:location>|<g:employer>/i.test(rawHtml.slice(0, 20000))) return null;
-    const items = [...rawHtml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)];
+    const items = findAllElementInnersLinear(rawHtml, 'item', undefined, 500);
     if (items.length === 0) return null;
 
-    const extractTag = (xml: string, tag: string): string => {
-      const m = new RegExp(`<${tag}\\b[^>]*>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([\\s\\S]*?))<\\/${tag}>`, 'i').exec(xml);
-      return stripTagsInline(m?.[1] ?? m?.[2] ?? '');
-    };
+    const extractTag = (xml: string, tag: string): string => stripTagsInline(extractXmlTagTextLinear(xml, tag));
 
-    const employer = extractTag(items[0]![1]!, 'g:employer') || host;
+    const employer = extractTag(items[0]!, 'g:employer') || host;
     const title = `${employer} — SAP RMK Job Feed (${items.length} open roles)`;
     const links: string[] = [];
-    const rows = items.slice(0, 100).map((it) => {
-      const b = it[1]!;
+    const rows = items.slice(0, 100).map((b) => {
       const jTitle = extractTag(b, 'title') || 'Role';
       const jLink = extractTag(b, 'link');
       if (jLink.startsWith('https://')) links.push(jLink);

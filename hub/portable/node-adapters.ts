@@ -279,11 +279,18 @@ export class NodeFsR2Bucket {
 // ── 3. RFC 6455 Raw TCP WebSocket Wrapper + In-Process `AgentHubDO` Coordinator ───────────────────────────────────
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const MAX_WS_MESSAGE_BYTES = 1_048_576; // 1 MiB max frame & reassembled message size
+const MAX_WS_PENDING_OUTBOUND_BYTES = 65_536; // 64 KiB cap on pending outbound `pong` / write queue (`Low`)
+const UTF8_FATAL_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 export class RawServerWebSocket implements HubSocketLike {
   private attachment: unknown = null;
   private closed = false;
-  private rxBuf = Buffer.alloc(0);
+  private rxChunks: Buffer[] = [];
+  private rxBytes = 0;
+  private fragChunks: Buffer[] = [];
+  private fragBytes = 0;
+  private inFragmentedText = false;
 
   constructor(
     private readonly socket: Duplex,
@@ -295,12 +302,20 @@ export class RawServerWebSocket implements HubSocketLike {
     socket.on('close', () => {
       if (!this.closed) {
         this.closed = true;
+        this.rxChunks = [];
+        this.rxBytes = 0;
+        this.fragChunks = [];
+        this.fragBytes = 0;
         this.onClosed(this, 1006, 'tcp_closed');
       }
     });
     socket.on('error', () => {
       if (!this.closed) {
         this.closed = true;
+        this.rxChunks = [];
+        this.rxBytes = 0;
+        this.fragChunks = [];
+        this.fragBytes = 0;
         this.onClosed(this, 1011, 'socket_error');
       }
     });
@@ -308,6 +323,10 @@ export class RawServerWebSocket implements HubSocketLike {
 
   send(data: string): void {
     if (this.closed) throw new Error('websocket_closed');
+    if (this.socket.writableLength > MAX_WS_MESSAGE_BYTES) {
+      this.close(1008, 'outbound_backpressure');
+      return;
+    }
     const payload = Buffer.from(data, 'utf8');
     this.writeFrame(0x1, payload);
   }
@@ -315,7 +334,10 @@ export class RawServerWebSocket implements HubSocketLike {
   close(code = 1000, reason = ''): void {
     if (this.closed) return;
     this.closed = true;
-    this.rxBuf = Buffer.alloc(0);
+    this.rxChunks = [];
+    this.rxBytes = 0;
+    this.fragChunks = [];
+    this.fragBytes = 0;
     const reasonBuf = Buffer.from(reason.slice(0, 100), 'utf8');
     const body = Buffer.alloc(2 + reasonBuf.length);
     body.writeUInt16BE(code, 0);
@@ -361,67 +383,192 @@ export class RawServerWebSocket implements HubSocketLike {
     this.socket.write(Buffer.concat([header, payload]));
   }
 
+  private ensureCoalescedPrefix(minBytes: number): Buffer {
+    if (this.rxChunks.length === 0) return Buffer.alloc(0);
+    if (this.rxChunks[0]!.length >= minBytes) return this.rxChunks[0]!;
+    if (this.rxChunks.length > 1) {
+      const merged = Buffer.concat(this.rxChunks, this.rxBytes);
+      this.rxChunks = [merged];
+      return merged;
+    }
+    return this.rxChunks[0]!;
+  }
+
+  private consumeRxBytes(count: number): Buffer {
+    const head = this.ensureCoalescedPrefix(count);
+    const slice = head.subarray(0, count);
+    const rest = head.subarray(count);
+    this.rxBytes -= count;
+    this.rxChunks = rest.length > 0 ? [rest] : [];
+    return slice;
+  }
+
+  private deliverCompleteText(rawBytes: Buffer): void {
+    let text: string;
+    try {
+      text = UTF8_FATAL_DECODER.decode(rawBytes);
+    } catch {
+      this.close(1007, 'invalid_utf8');
+      return;
+    }
+    if (text === 'ping') {
+      if (this.socket.writableLength > MAX_WS_PENDING_OUTBOUND_BYTES) {
+        this.close(1008, 'pong_queue_exceeded');
+        return;
+      }
+      this.send('pong');
+    } else {
+      this.onText(this, text);
+    }
+  }
+
   private handleChunk(chunk: Buffer): void {
     if (this.closed) {
       this.socket.destroy();
       return;
     }
-    this.rxBuf = Buffer.concat([this.rxBuf, chunk]);
-    while (this.rxBuf.length >= 2) {
-      const b0 = this.rxBuf[0]!;
-      const b1 = this.rxBuf[1]!;
+    if (chunk.length === 0) return;
+    this.rxChunks.push(chunk);
+    this.rxBytes += chunk.length;
+
+    while (this.rxBytes >= 2 && !this.closed) {
+      // Peek header bytes without O(N^2) coalescing of trailing drip chunks!
+      let hdr = this.rxChunks[0]!;
+      if (hdr.length < Math.min(this.rxBytes, 14)) {
+        const take = Math.min(this.rxBytes, 14);
+        let gathered = Buffer.allocUnsafe(take);
+        let copied = 0;
+        for (const c of this.rxChunks) {
+          const n = Math.min(c.length, take - copied);
+          c.copy(gathered, copied, 0, n);
+          copied += n;
+          if (copied >= take) break;
+        }
+        hdr = gathered;
+      }
+
+      const b0 = hdr[0]!;
+      const b1 = hdr[1]!;
+      const fin = (b0 & 0x80) !== 0;
+      const rsv = b0 & 0x70;
       const opcode = b0 & 0x0f;
       const masked = (b1 & 0x80) !== 0;
-      let payloadLen = b1 & 0x7f;
+      const len7 = b1 & 0x7f;
+
+      // RFC 6455 §5.2: Reject any non-zero RSV1-3 bits when no extension was negotiated
+      if (rsv !== 0) {
+        this.close(1002, 'rsv_bits_not_allowed');
+        return;
+      }
+      // RFC 6455 §5.1: Server MUST close with 1002 if a client sends an unmasked frame
+      if (!masked) {
+        this.close(1002, 'unmasked_client_frame');
+        return;
+      }
+      // RFC 6455 §5.5: Control frames (`>= 0x8`) MUST NOT be fragmented (`FIN=0`) and MUST have payload <= 125 bytes!
+      if (opcode >= 0x8) {
+        if (opcode !== 0x8 && opcode !== 0x9 && opcode !== 0x0a) {
+          this.close(1002, 'invalid_control_opcode');
+          return;
+        }
+        if (!fin || len7 > 125) {
+          this.close(1002, 'invalid_control_frame');
+          return;
+        }
+      } else if (opcode === 0x2) {
+        this.close(1003, 'binary_frames_unsupported');
+        return;
+      } else if (opcode !== 0x0 && opcode !== 0x1) {
+        this.close(1002, 'reserved_data_opcode');
+        return;
+      }
+
+      let payloadLen = len7;
       let offset = 2;
 
-      if (payloadLen === 126) {
-        if (this.rxBuf.length < 4) return;
-        payloadLen = this.rxBuf.readUInt16BE(2);
+      if (len7 === 126) {
+        if (this.rxBytes < 4) return;
+        payloadLen = hdr.readUInt16BE(2);
         offset = 4;
-      } else if (payloadLen === 127) {
-        if (this.rxBuf.length < 10) return;
-        const bigLen = this.rxBuf.readBigUInt64BE(2);
-        if (bigLen > 1_048_576n) {
+      } else if (len7 === 127) {
+        if (this.rxBytes < 10) return;
+        const bigLen = hdr.readBigUInt64BE(2);
+        if (bigLen > BigInt(MAX_WS_MESSAGE_BYTES)) {
           this.close(1009, 'message_too_big');
           return;
         }
         payloadLen = Number(bigLen);
         offset = 10;
       }
-      if (payloadLen > 1_048_576) {
+      if (payloadLen > MAX_WS_MESSAGE_BYTES || (opcode < 0x8 && this.fragBytes + payloadLen > MAX_WS_MESSAGE_BYTES)) {
         this.close(1009, 'message_too_big');
         return;
       }
 
-      const maskLen = masked ? 4 : 0;
-      if (this.rxBuf.length < offset + maskLen + payloadLen) return;
-
-      const payload = Buffer.from(this.rxBuf.subarray(offset + maskLen, offset + maskLen + payloadLen));
-      if (masked) {
-        const mask = this.rxBuf.subarray(offset, offset + 4);
-        for (let i = 0; i < payload.length; i++) {
-          payload[i]! ^= mask[i & 3]!;
-        }
+      const frameTotalBytes = offset + 4 + payloadLen;
+      if (this.rxBytes < frameTotalBytes) {
+        // Wait for remaining frame bytes in O(1) without copying `rxChunks`!
+        return;
       }
-      this.rxBuf = this.rxBuf.subarray(offset + maskLen + payloadLen);
+
+      const rawFrame = this.consumeRxBytes(frameTotalBytes);
+      const mask = rawFrame.subarray(offset, offset + 4);
+      const payload = Buffer.from(rawFrame.subarray(offset + 4, frameTotalBytes));
+      for (let i = 0; i < payload.length; i++) {
+        payload[i]! ^= mask[i & 3]!;
+      }
 
       if (opcode === 0x8) {
-        // Close frame
+        if (payload.length === 1) {
+          this.close(1002, 'invalid_close_payload');
+          return;
+        }
         this.close(1000, 'peer_close');
         return;
       }
       if (opcode === 0x9) {
-        // Ping -> Pong
+        if (this.socket.writableLength > MAX_WS_PENDING_OUTBOUND_BYTES) {
+          this.close(1008, 'pong_queue_exceeded');
+          return;
+        }
         this.writeFrame(0x0a, payload);
         continue;
       }
+      if (opcode === 0x0a) {
+        // Unsolicited/expected Pong -> ignore
+        continue;
+      }
+
+      // Data frames (`0x1` text or `0x0` continuation)
       if (opcode === 0x1) {
-        const text = payload.toString('utf8');
-        if (text === 'ping') {
-          this.send('pong');
+        if (this.inFragmentedText) {
+          this.close(1002, 'interleaved_data_frame');
+          return;
+        }
+        if (fin) {
+          this.deliverCompleteText(payload);
         } else {
-          this.onText(this, text);
+          this.inFragmentedText = true;
+          this.fragChunks = [payload];
+          this.fragBytes = payload.length;
+        }
+      } else if (opcode === 0x0) {
+        if (!this.inFragmentedText) {
+          this.close(1002, 'unexpected_continuation_frame');
+          return;
+        }
+        this.fragChunks.push(payload);
+        this.fragBytes += payload.length;
+        if (this.fragBytes > MAX_WS_MESSAGE_BYTES) {
+          this.close(1009, 'message_too_big');
+          return;
+        }
+        if (fin) {
+          const full = Buffer.concat(this.fragChunks, this.fragBytes);
+          this.inFragmentedText = false;
+          this.fragChunks = [];
+          this.fragBytes = 0;
+          this.deliverCompleteText(full);
         }
       }
     }
@@ -432,6 +579,7 @@ export class LocalAgentHubCoordinator {
   private readonly db: DatabaseSync;
   private readonly sockets = new Set<RawServerWebSocket>();
   private readonly lastHelloLogBySite = new Map<string, number>();
+  private readonly lastConnectLogByKey = new Map<string, number>();
   public readonly engine: AgentHubEngine;
   public readonly oauth: OAuthStore;
   public readonly activity: ActivityStore;
@@ -657,6 +805,8 @@ export class LocalAgentHubCoordinator {
     siteId: string;
     arch: string | null;
     version: string | null;
+    browserVersion?: string | null;
+    browserSandbox?: string | null;
     capabilities: string | null;
     publicIp: string | null;
     subprotocol?: string | null;
@@ -683,6 +833,8 @@ export class LocalAgentHubCoordinator {
             version?: string;
             arch?: string;
             goVersion?: string;
+            browserVersion?: string;
+            browserSandbox?: string | boolean;
             capabilities?: string[];
             reconnectAttempt?: number;
           };
@@ -693,16 +845,23 @@ export class LocalAgentHubCoordinator {
             const evName = (msg.reconnectAttempt ?? 0) > 0 ? 'agent_reconnected' : 'agent_ready';
             const nowMs = Date.now();
             const lastLoggedAt = this.lastHelloLogBySite.get(verifiedSiteId) ?? 0;
-            // M9: Throttle `agent_ready` event logging to at most 1 per 60s per verified `siteId`, and spread `...msg`
-            // FIRST so an untrusted `msg.siteId` NEVER overwrites the verified `siteId`!
+            // M9: Throttle `agent_ready` event logging to at most 1 per 60s per verified `siteId`, and allowlist fields
+            // so untrusted client keys (`msg.siteId`, `msg.level`, `msg.event`) NEVER pollute activity log details!
             if (nowMs - lastLoggedAt >= 60_000) {
+              if (this.lastHelloLogBySite.size >= 512) this.lastHelloLogBySite.clear();
               this.lastHelloLogBySite.set(verifiedSiteId, nowMs);
               void this.activity.recordEvent({
                 level: 'info',
                 category: 'agent',
                 event: evName,
                 summary: `Remote node "${verifiedSiteId}" ready (${msg.goVersion ?? 'go'}, ${msg.arch ?? ''})`,
-                details: sanitizeDetails({ ...msg, siteId: verifiedSiteId }),
+                details: sanitizeDetails({
+                  siteId: verifiedSiteId,
+                  version: typeof msg.version === 'string' ? msg.version.slice(0, 64) : null,
+                  arch: typeof msg.arch === 'string' ? msg.arch.slice(0, 32) : null,
+                  goVersion: typeof msg.goVersion === 'string' ? msg.goVersion.slice(0, 32) : null,
+                  capabilities: Array.isArray(msg.capabilities) ? msg.capabilities.slice(0, 16) : [],
+                }),
               });
             }
           }
@@ -722,17 +881,35 @@ export class LocalAgentHubCoordinator {
     }
     const att = this.engine.registerAgent(ws, params.siteId, params.arch, {
       version: params.version,
+      browserVersion: params.browserVersion,
+      browserSandbox: params.browserSandbox,
       publicIp: params.publicIp,
       capabilities: params.capabilities,
     });
-    ws.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
-    void this.activity.recordEvent({
-      level: 'info',
-      category: 'agent',
-      event: 'agent_ws_connected',
-      summary: `Remote node "${att.siteId}" connected over WebSocket`,
-      details: sanitizeDetails({ siteId: att.siteId, arch: att.arch, version: att.version ?? null }),
-    });
+    if (!this.sockets.has(ws)) return;
+    try {
+      ws.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
+    } catch {
+      return;
+    }
+    // Rate-limit `agent_ws_connected` activity-log entries per site AND per IP (`Low` — prevents 260x reconnect floods from flushing `hub_events`)!
+    const nowConnectMs = Date.now();
+    const siteLogKey = `site:${att.siteId}`;
+    const ipLogKey = `ip:${params.publicIp ?? 'unknown'}`;
+    const lastSiteConn = this.lastConnectLogByKey.get(siteLogKey) ?? 0;
+    const lastIpConn = this.lastConnectLogByKey.get(ipLogKey) ?? 0;
+    if (nowConnectMs - lastSiteConn >= 60_000 && nowConnectMs - lastIpConn >= 5_000) {
+      if (this.lastConnectLogByKey.size >= 512) this.lastConnectLogByKey.clear();
+      this.lastConnectLogByKey.set(siteLogKey, nowConnectMs);
+      this.lastConnectLogByKey.set(ipLogKey, nowConnectMs);
+      void this.activity.recordEvent({
+        level: 'info',
+        category: 'agent',
+        event: 'agent_ws_connected',
+        summary: `Remote node "${att.siteId}" connected over WebSocket`,
+        details: sanitizeDetails({ siteId: att.siteId, arch: att.arch, version: att.version ?? null }),
+      });
+    }
   }
 
   /** Returns a `DurableObjectNamespace<AgentHubDO>`-compatible stub object for `hub/src/index.ts`. */

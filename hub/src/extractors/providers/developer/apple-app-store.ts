@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { attrHasTokenLinear, defineAdapter, findElementInnerLinear } from '../../types';
 import { extractJsonLdObjects, extractMetaContent, stripScriptsAndStyles, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -17,13 +17,13 @@ export default defineAdapter({
     const title =
       (typeof appLd?.name === 'string' ? appLd.name.trim() : '') ||
       extractMetaContent(rawHtml, 'og:title').replace(/\s+on the App\s*Store$/i, '').trim() ||
-      stripTagsInline(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(clean)?.[1] ?? '');
+      stripTagsInline(findElementInnerLinear(clean, 'h1') ?? '');
     if (!title) return null;
 
     const authorObj = appLd?.author as Record<string, unknown> | undefined;
     const developer =
       (typeof authorObj?.name === 'string' ? authorObj.name.trim() : '') ||
-      stripTagsInline(/<h2\b[^>]*\bproduct-header__identity\b[^>]*>([\s\S]*?)<\/h2>/i.exec(clean)?.[1] ?? '');
+      stripTagsInline(findElementInnerLinear(clean, 'h2', (a) => attrHasTokenLinear(a, 'class', 'product-header__identity')) ?? '');
 
     const aggRating = appLd?.aggregateRating as Record<string, unknown> | undefined;
     const ratingVal = aggRating?.ratingValue !== undefined ? String(aggRating.ratingValue) : '';

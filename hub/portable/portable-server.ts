@@ -1,11 +1,12 @@
 /**
  * Portable Node.js 22.5+ / Docker / Fly.io / Railway / Render Hub entrypoint (`hub/dist/portable-server.mjs`).
  *
- * Runs the complete EdgeFetch Hub (`/admin` Control Center, OAuth 2.1, 14-tool `/mcp`, `.ipynb`/OpenAPI/Defuddle
+ * Runs the complete EdgeFetch Hub (`/admin` Control Center, OAuth 2.1, 15-tool `/mcp`, `.ipynb`/OpenAPI/Defuddle
  * extractors, `node:sqlite` FTS5 search, local `/data/artifacts` object store, `/agent/ws` Go worker fleet, and
  * vendor-agnostic OTLP trace export) with zero Cloudflare account, zero Postgres, and zero Redis!
  */
 import { createServer, type IncomingMessage } from 'node:http';
+import net from 'node:net';
 import { join, resolve } from 'node:path';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
@@ -30,21 +31,36 @@ function isTruthyFlag(val: string | undefined): boolean {
   return clean === '1' || clean === 'true' || clean === 'yes' || clean === 'on';
 }
 
-function normalizeSocketIp(addr: string | undefined): string {
-  const raw = (addr ?? '').trim();
-  if (!raw) return '127.0.0.1';
-  if (raw.startsWith('::ffff:')) {
-    const v4 = raw.slice('::ffff:'.length);
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(v4)) return v4;
+function stripIpPortAndBrackets(addr: string | undefined): string {
+  let clean = (addr ?? '').trim();
+  if (!clean) return '';
+  if (clean.startsWith('[') && clean.includes(']')) {
+    clean = clean.slice(1, clean.indexOf(']'));
+  } else {
+    const v4Port = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(clean);
+    if (v4Port) clean = v4Port[1]!;
   }
-  return raw;
+  if (clean.toLowerCase().startsWith('::ffff:')) {
+    const v4 = clean.slice('::ffff:'.length);
+    if (net.isIP(v4) === 4) return v4;
+  }
+  const zoneIdx = clean.indexOf('%');
+  if (zoneIdx >= 0) clean = clean.slice(0, zoneIdx);
+  return clean;
+}
+
+function normalizeSocketIp(addr: string | undefined): string {
+  const clean = stripIpPortAndBrackets(addr);
+  if (!clean || net.isIP(clean) === 0) return '127.0.0.1';
+  return clean;
 }
 
 const MAX_PORTABLE_REQ_BODY_BYTES = 20 * 1024 * 1024; // 20 MiB hard streaming ceiling on inbound Node HTTP bodies (`M8`)
 
 function resolveTrustedClientIp(req: IncomingMessage, trustProxy: boolean): string {
   if (trustProxy) {
-    // M8: Extract the RIGHTMOST comma-separated IP appended by the trusted reverse proxy — NEVER the client-spoofable leftmost IP!
+    // M8 & R3-M4: Extract the RIGHTMOST comma-separated IP appended by the trusted reverse proxy, stripping `:port`
+    // and falling back to socket IP if the rightmost token is malformed garbage (`X-Forwarded-For: 1.2.3.4, zz0`).
     const rawXff = req.headers['x-forwarded-for'];
     const joined = Array.isArray(rawXff) ? rawXff.join(',') : (rawXff ?? '');
     const parts = joined
@@ -52,27 +68,43 @@ function resolveTrustedClientIp(req: IncomingMessage, trustProxy: boolean): stri
       .map((p) => p.trim())
       .filter(Boolean);
     const rightmost = parts.length > 0 ? parts[parts.length - 1] : undefined;
-    if (rightmost) return normalizeSocketIp(rightmost);
+    if (rightmost) {
+      const candidate = stripIpPortAndBrackets(rightmost);
+      if (candidate && net.isIP(candidate) !== 0) {
+        return candidate;
+      }
+    }
   }
   return normalizeSocketIp(req.socket?.remoteAddress);
 }
 
+/**
+ * Pull-driven Web `ReadableStream` wrapper over Node `IncomingMessage` (`R3-M1`):
+ * Keeps `req` paused until a route handler explicitly reads `request.body` AFTER authentication succeeds,
+ * so unauthenticated 19 MiB uploads on `/mcp`, `/v1/scrape`, or `/agent/reply` buffer ZERO bytes in RAM!
+ */
 function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array> {
   let closed = false;
+  let attached = false;
   let totalBytes = 0;
   let ctrl!: ReadableStreamDefaultController<Uint8Array>;
+
   const cleanup = () => {
+    if (!attached) return;
+    attached = false;
     req.removeListener('data', onData);
     req.removeListener('end', onEnd);
     req.removeListener('close', onEnd);
     req.removeListener('error', onErr);
   };
+
   const onData = (chunk: Buffer | Uint8Array) => {
     if (closed) return;
     totalBytes += chunk.byteLength;
     if (totalBytes > MAX_PORTABLE_REQ_BODY_BYTES) {
       closed = true;
       cleanup();
+      req.pause();
       try {
         ctrl.error(new Error('Request body exceeds 20 MiB limit'));
       } catch {
@@ -83,11 +115,16 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
     }
     try {
       ctrl.enqueue(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
+      if ((ctrl.desiredSize ?? 1) <= 0) {
+        req.pause();
+      }
     } catch {
       closed = true;
       cleanup();
+      req.pause();
     }
   };
+
   const onEnd = () => {
     if (closed) return;
     closed = true;
@@ -98,6 +135,7 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
       // ignore if already closed
     }
   };
+
   const onErr = (err: Error) => {
     if (closed) return;
     closed = true;
@@ -108,18 +146,32 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
       // ignore
     }
   };
+
+  req.pause();
+
   return new ReadableStream<Uint8Array>({
     start(c) {
       ctrl = c;
-      req.on('data', onData);
-      req.once('end', onEnd);
-      req.once('close', onEnd);
-      req.once('error', onErr);
+    },
+    pull() {
+      if (closed) return;
+      if (!attached) {
+        attached = true;
+        req.on('data', onData);
+        req.once('end', onEnd);
+        req.once('close', onEnd);
+        req.once('error', onErr);
+        if (req.complete && req.readableLength === 0) {
+          onEnd();
+          return;
+        }
+      }
+      req.resume();
     },
     cancel() {
       closed = true;
       cleanup();
-      req.resume();
+      req.pause();
     },
   });
 }
@@ -142,8 +194,16 @@ function incomingToWebRequest(
       proto = fwdProto;
     }
     const fwdHost = (req.headers['x-forwarded-host'] as string | undefined)?.split(',')[0]?.trim();
-    if (fwdHost && /^[A-Za-z0-9._-]+(?::\d{1,5})?$/.test(fwdHost)) {
-      authority = fwdHost;
+    if (fwdHost && /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?::\d{1,5})?$/.test(fwdHost) && !fwdHost.includes('..')) {
+      try {
+        const parsedFwd = new URL(`http://${fwdHost}/`);
+        const portNum = parsedFwd.port ? Number(parsedFwd.port) : 80;
+        if (parsedFwd.hostname && portNum >= 1 && portNum <= 65535 && !fwdHost.endsWith(':0')) {
+          authority = parsedFwd.host;
+        }
+      } catch {
+        // ignore invalid X-Forwarded-Host
+      }
     }
   } else {
     // Reject malformed raw Host headers (`Host: [`) with 400 (H3), while keeping `selfHost` pinned to `canonicalOrigin` (H4)!
@@ -310,6 +370,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   } as unknown as ExecutionContext;
 
   const server = createServer(async (req, res) => {
+    req.on('error', () => undefined);
     let webReq: Request;
     try {
       webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy, explicitPublicOrigin !== null);
@@ -317,6 +378,9 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       res.statusCode = 400;
       res.setHeader('content-type', 'application/json');
       res.setHeader('connection', 'close');
+      res.once('finish', () => {
+        setImmediate(() => req.destroy());
+      });
       res.end(JSON.stringify({ error: 'bad_request', message: 'Malformed HTTP request or Host header' }));
       return;
     }
@@ -333,6 +397,15 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         }
         res.setHeader(key, val);
       });
+      // `R3-M1`: Whenever an unauthenticated / over-limit / error response (`>= 400`) finishes while the client is still
+      // streaming an unread request body (`!req.complete`), send `Connection: close` and destroy the socket after flush!
+      const shouldDestroyAfterFlush = !req.complete && webRes.status >= 400;
+      if (shouldDestroyAfterFlush) {
+        res.setHeader('connection', 'close');
+        res.once('finish', () => {
+          setImmediate(() => req.destroy());
+        });
+      }
       if (!webRes.body) {
         res.end();
         return;
@@ -347,9 +420,18 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     } catch (err) {
       res.statusCode = 500;
       res.setHeader('content-type', 'application/json');
+      res.setHeader('connection', 'close');
+      if (!req.complete) {
+        res.once('finish', () => {
+          setImmediate(() => req.destroy());
+        });
+      }
       res.end(JSON.stringify({ error: 'internal_error', message: err instanceof Error ? err.message : String(err) }));
     }
   });
+  server.requestTimeout = 60_000;
+  server.headersTimeout = 15_000;
+  server.maxConnections = 512;
 
   server.on('upgrade', (req, socket, head) => {
     socket.on('error', () => undefined);
@@ -387,6 +469,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         siteId: auth.siteId,
         arch: (req.headers['x-agent-arch'] as string | undefined) ?? null,
         version: (req.headers['x-agent-version'] as string | undefined) ?? null,
+        browserVersion: (req.headers['x-agent-browser-version'] as string | undefined) ?? null,
+        browserSandbox: (req.headers['x-agent-browser-sandbox'] as string | undefined) ?? null,
         capabilities: (req.headers['x-agent-capabilities'] as string | undefined) ?? null,
         publicIp: pubIp,
         subprotocol: selectedProto ?? null,
@@ -411,8 +495,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         port: boundPort,
         close: () =>
           new Promise<void>((resClose) => {
+            coordinator.close();
             server.close(() => {
-              coordinator.close();
               localMetaDb?.close();
               localSearchDb?.close();
               resClose();

@@ -1,4 +1,4 @@
-import { defineAdapter } from '../../types';
+import { defineAdapter, extractXmlTagTextLinear, findAllElementInnersLinear, findElementInnerLinear } from '../../types';
 import { formatGfmTable, stripTagsInline } from '../../utils';
 
 function parseRssJobsXml(rawXml: string, fallbackOrg: string): {
@@ -7,20 +7,19 @@ function parseRssJobsXml(rawXml: string, fallbackOrg: string): {
   links: string[];
 } | null {
   if (!/<rss\b|<channel\b/i.test(rawXml)) return null;
-  const chanTitle = stripTagsInline(/<channel>[\s\S]{0,1500}?<title>([\s\S]*?)<\/title>/i.exec(rawXml)?.[1] ?? '') || fallbackOrg;
-  const items = [...rawXml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)];
+  const chanHeader = rawXml.slice(0, 4000);
+  const firstItemIdx = chanHeader.toLowerCase().indexOf('<item');
+  const chanScope = firstItemIdx !== -1 ? chanHeader.slice(0, firstItemIdx) : chanHeader;
+  const chanTitle = stripTagsInline(findElementInnerLinear(chanScope, 'title') ?? '') || fallbackOrg;
+  const items = findAllElementInnersLinear(rawXml, 'item', undefined, 500);
   const title = `${chanTitle} — Open Roles (${items.length})`;
   if (items.length === 0) return { title, markdown: `# ${title}\n\nNo open positions currently listed.`, links: [] };
 
-  const extractTag = (xml: string, tag: string): string => {
-    const m = new RegExp(`<${tag}\\b[^>]*>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([\\s\\S]*?))<\\/${tag}>`, 'i').exec(xml);
-    return stripTagsInline(m?.[1] ?? m?.[2] ?? '');
-  };
+  const extractTag = (xml: string, tag: string): string => stripTagsInline(extractXmlTagTextLinear(xml, tag));
 
   const links: string[] = [];
   const rows: Array<Array<string>> = [];
-  for (const it of items.slice(0, 100)) {
-    const block = it[1]!;
+  for (const block of items.slice(0, 100)) {
     const jTitle = extractTag(block, 'title');
     const jLink = extractTag(block, 'link');
     if (!jTitle) continue;

@@ -1,0 +1,41 @@
+name: Contributor DCO & Vouch Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-contributor:
+    name: Verify Vouched Contributor & DCO Sign-Off
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Check VOUCHED.td allowlist & DCO sign-off
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          author_lc="$(printf '%s' "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')"
+          echo "Checking contributor: ${author_lc}"
+          if ! grep -v '^[[:space:]]*#' .github/VOUCHED.td | sed 's/[[:space:]]//g' | grep -Fxq "$author_lc"; then
+            echo "::error::GitHub user '${PR_AUTHOR}' is not yet listed in .github/VOUCHED.td. A maintainer will review your PR, verify robots.txt/test compliance, and vouch your handle."
+            exit 1
+          fi
+          if [ "$author_lc" != "bartrumb" ] && [ "$author_lc" != "dependabot[bot]" ] && [ "$author_lc" != "github-actions[bot]" ]; then
+            missing_dco="$(git log --no-merges --format='%H %B' "${BASE_SHA}..${HEAD_SHA}" | awk '/^[0-9a-f]{40} /{sha=$1; ok=0} /^Signed-off-by: .+ <.+@.+>/{ok=1} END{if (sha != "" && !ok) print sha}')"
+            if [ -n "$missing_dco" ]; then
+              echo "::error::External contributor commits must include a DCO sign-off ('git commit -s'). Missing on: ${missing_dco}"
+              exit 1
+            fi
+          fi
+          echo "Contributor '${PR_AUTHOR}' verified."

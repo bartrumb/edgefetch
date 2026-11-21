@@ -10,15 +10,20 @@
  *  - `respectRobots: false` is rejected unless every target host matches the owner's explicit `ROBOTS_BYPASS_HOSTS` allowlist
  *    (empty/off by default) and emits a security event when used.
  */
-import { recomputeSummary, type CrawlResultItem } from './agent-hub';
+import { parseExactRetryAfterMs, recomputeSummary, type CrawlResultItem } from './agent-hub';
 import { signOutboundBotHeaders } from './bot-auth';
+import { filterSafeResponseHeaders } from './framework-detect';
 import { classifyWafAndChallenge } from './waf';
 
-export const ROBOTS_MAX_BYTES = 512 * 1024; // 512 KiB >= RFC 9309 500 KiB minimum
+export const ROBOTS_MAX_BYTES = 1024 * 1024; // 1 MiB >= RFC 9309 500 KiB minimum
 export const MAX_OVERFLOW_BATCH_BYTES = 18 * 1024 * 1024; // 18 MiB aggregate batch cap across all requests (`Low`)
 const ROBOTS_TIMEOUT_MS = 10_000;
 const PER_REQ_TIMEOUT_MS = 30_000;
 const MAX_REDIRECT_HOPS = 5;
+const ROBOTS_CACHE_MIN_MS = 60_000;
+const ROBOTS_CACHE_MAX_MS = 86_400_000;
+const ROBOTS_CACHE_DEFAULT_MS = 3_600_000;
+const MAX_ROBOTS_CACHE_ENTRIES = 512;
 export const MARKDOWN_FOR_AGENTS_ACCEPT =
   'text/markdown, text/html;q=0.9, application/xhtml+xml;q=0.8, */*;q=0.7';
 
@@ -35,6 +40,7 @@ export interface ParsedRobots {
   rules: Array<{ pattern: string; allow: boolean }>;
   contentSignals?: ContentSignals;
   disallowAiInput?: boolean;
+  cacheTtlMs?: number;
 }
 
 function isUnreservedAsciiByte(b: number): boolean {
@@ -78,11 +84,13 @@ export function normalizeRobotsURI(raw: string): string {
 }
 
 function canonicalProductToken(raw: string): string {
-  const trimmed = raw.trim().toLowerCase();
+  const trimmed = raw.replace(/[\u200B-\u200F\u2060\uFEFF]/g, '').trim().toLowerCase();
   if (trimmed === '*') return '*';
   const slash = trimmed.indexOf('/');
   const head = slash >= 0 ? trimmed.slice(0, slash) : trimmed;
-  return head.split(/\s+/)[0] ?? '';
+  const token = head.split(/\s+/)[0] ?? '';
+  const cleanMatch = /^[a-z_-]+/.exec(token);
+  return cleanMatch ? cleanMatch[0] : token;
 }
 
 /** Iterative O(P*T) wildcard matcher (`*` and trailing `$`) with zero ReDoS surface. */
@@ -115,32 +123,67 @@ export function matchRobotsPattern(rawPattern: string, target: string): boolean 
   return true;
 }
 
+function applySingleContentSignalPair(rawKey: string, rawValue: string, target: ContentSignals): boolean {
+  const k = rawKey.trim().toLowerCase();
+  if (k !== 'search' && k !== 'ai-input' && k !== 'ai-train') return false;
+  let v = rawValue.trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  v = v.toLowerCase();
+  if (v !== 'yes' && v !== 'no') return false;
+  const allowed = v === 'yes';
+  if (k === 'search') target.search = allowed;
+  else if (k === 'ai-input') target.aiInput = allowed;
+  else if (k === 'ai-train') target.aiTrain = allowed;
+  return true;
+}
+
 function parseContentSignalLine(rawVal: string, target: ContentSignals): void {
-  for (const part of rawVal.split(',')) {
-    const eq = part.indexOf('=');
-    if (eq <= 0) continue;
-    const k = part.slice(0, eq).trim().toLowerCase();
-    const v = part.slice(eq + 1).trim().toLowerCase();
-    if (v !== 'yes' && v !== 'no') continue;
-    const allowed = v === 'yes';
-    if (k === 'search') target.search = allowed;
-    else if (k === 'ai-input') target.aiInput = allowed;
-    else if (k === 'ai-train') target.aiTrain = allowed;
+  const bounded = rawVal.length > 524_288 ? rawVal.slice(0, 524_288) : rawVal;
+  for (const commaPart of bounded.split(',')) {
+    const semiSegments = commaPart.split(';');
+    for (let i = 0; i < semiSegments.length; i++) {
+      const seg = semiSegments[i]!;
+      const eq = seg.indexOf('=');
+      if (eq <= 0) continue;
+      const k = seg.slice(0, eq);
+      const v = seg.slice(eq + 1);
+      // Segment 0 is the primary directive; subsequent `;foo=bar` parameters are stripped unless they are themselves known Content-Signal keys.
+      applySingleContentSignalPair(k, v, target);
+    }
   }
 }
 
 function mergeGroupSignals(into: ContentSignals, from: ContentSignals): void {
   for (const key of ['search', 'aiInput', 'aiTrain'] as const) {
     if (from[key] !== undefined) {
-      // Within multiple groups for the same User-agent token, explicit `no` (`false`) takes restrictive precedence
+      // Across multiple combined groups of the same specificity, explicit `no` (`false`) takes restrictive precedence.
       into[key] = into[key] === false ? false : from[key];
     }
   }
 }
 
-export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2.5.5'): ParsedRobots {
-  const body = rawBody.replace(/^\uFEFF/, '');
+export function parseRobotsCacheControlTtlMs(cacheControlHeader: string | null | undefined, defaultMs = ROBOTS_CACHE_DEFAULT_MS): number {
+  if (typeof cacheControlHeader === 'string' && cacheControlHeader.trim()) {
+    const m = /(?:^|[,\s])max-age\s*=\s*"?(\d+)"?/i.exec(cacheControlHeader);
+    if (m?.[1]) {
+      const secs = Number(m[1]);
+      if (Number.isFinite(secs) && secs >= 0) {
+        return Math.min(ROBOTS_CACHE_MAX_MS, Math.max(ROBOTS_CACHE_MIN_MS, Math.round(secs * 1_000)));
+      }
+    }
+  }
+  return Math.min(ROBOTS_CACHE_MAX_MS, Math.max(ROBOTS_CACHE_MIN_MS, defaultMs));
+}
+
+export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2.6.0'): ParsedRobots {
+  // Strip repeated UTF-8 BOMs (decoded U+FEFF or byte-decoded \xEF\xBB\xBF) and normalize all Unicode/ASCII line breaks.
+  const body = rawBody
+    .replace(/^(?:\uFEFF|\xEF\xBB\xBF)+/, '')
+    .replace(/\r\n|\r|\u0085|\u2028|\u2029/g, '\n');
   const uaToken = canonicalProductToken(userAgent);
+  const preGroupSignals: ContentSignals = {};
   const groups: Array<{
     agents: string[];
     rules: Array<{ pattern: string; allow: boolean }>;
@@ -155,8 +198,9 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
   };
   let seenDirective = false;
 
-  for (const rawLine of body.split(/\r\n|\r|\n/)) {
-    const noComment = rawLine.includes('#') ? rawLine.slice(0, rawLine.indexOf('#')) : rawLine;
+  for (const rawLine of body.split('\n')) {
+    const hashIdx = rawLine.indexOf('#');
+    const noComment = hashIdx >= 0 ? rawLine.slice(0, hashIdx) : rawLine;
     const line = noComment.trim();
     if (!line) {
       // RFC 9309 §2.2.1: blank lines inside a group do NOT close the current User-agent group.
@@ -164,7 +208,9 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
     }
     const colon = line.indexOf(':');
     if (colon <= 0) continue;
-    const field = line.slice(0, colon).trim().toLowerCase();
+    const rawField = line.slice(0, colon);
+    if (rawField.includes('\0')) continue;
+    const field = rawField.trim().toLowerCase();
     const val = line.slice(colon + 1).trim();
     if (field === 'user-agent') {
       if (seenDirective && cur.agents.length > 0) {
@@ -172,22 +218,39 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
         cur = { agents: [], rules: [], crawlDelayMs: 0, signals: {} };
         seenDirective = false;
       }
-      cur.agents.push(canonicalProductToken(val));
+      const parsedUa = canonicalProductToken(val);
+      if (parsedUa) {
+        cur.agents.push(parsedUa);
+      }
     } else if (field === 'allow' && cur.agents.length > 0 && val) {
       seenDirective = true;
-      cur.rules.push({ pattern: normalizeRobotsURI(val), allow: true });
+      const norm = normalizeRobotsURI(val);
+      if (norm.startsWith('/') || norm.startsWith('*')) {
+        cur.rules.push({ pattern: norm, allow: true });
+      }
     } else if (field === 'disallow' && cur.agents.length > 0) {
       seenDirective = true;
-      cur.rules.push(val === '' ? { pattern: '/', allow: true } : { pattern: normalizeRobotsURI(val), allow: false });
+      if (val === '') {
+        cur.rules.push({ pattern: '/', allow: true });
+      } else {
+        const norm = normalizeRobotsURI(val);
+        if (norm.startsWith('/') || norm.startsWith('*')) {
+          cur.rules.push({ pattern: norm, allow: false });
+        }
+      }
     } else if (field === 'crawl-delay' && cur.agents.length > 0) {
       seenDirective = true;
       const secs = Number(val);
       if (Number.isFinite(secs) && secs > 0) {
         cur.crawlDelayMs = Math.min(30_000, Math.round(secs * 1000));
       }
-    } else if (field === 'content-signal' && cur.agents.length > 0 && val) {
-      seenDirective = true;
-      parseContentSignalLine(val, cur.signals);
+    } else if (field === 'content-signal' && val) {
+      if (cur.agents.length === 0) {
+        parseContentSignalLine(val, preGroupSignals);
+      } else {
+        seenDirective = true;
+        parseContentSignalLine(val, cur.signals);
+      }
     }
   }
   if (cur.agents.length > 0) groups.push(cur);
@@ -201,21 +264,35 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
   let hasSpecific = false;
 
   for (const g of groups) {
-    for (const ua of g.agents) {
-      if (uaToken && ua === uaToken) {
-        hasSpecific = true;
-        specific.push(...g.rules);
-        specificDelay = Math.max(specificDelay, g.crawlDelayMs);
-        mergeGroupSignals(specificSignals, g.signals);
-      } else if (ua === '*') {
-        wildcard.push(...g.rules);
-        wildcardDelay = Math.max(wildcardDelay, g.crawlDelayMs);
-        mergeGroupSignals(wildcardSignals, g.signals);
-      }
+    const matchesSpecific = Boolean(uaToken && g.agents.includes(uaToken));
+    const matchesWildcard = g.agents.includes('*');
+    if (matchesSpecific) {
+      hasSpecific = true;
+      specific.push(...g.rules);
+      specificDelay = Math.max(specificDelay, g.crawlDelayMs);
+      mergeGroupSignals(specificSignals, g.signals);
+    }
+    if (matchesWildcard) {
+      wildcard.push(...g.rules);
+      wildcardDelay = Math.max(wildcardDelay, g.crawlDelayMs);
+      mergeGroupSignals(wildcardSignals, g.signals);
     }
   }
 
-  const winningSignals = hasSpecific ? specificSignals : wildcardSignals;
+  // Inherit unset Content-Signal keys from `*` groups, and fall back to pre-group `Content-Signal:` lines.
+  const winningSignals: ContentSignals = {};
+  for (const key of ['search', 'aiInput', 'aiTrain'] as const) {
+    const resolved =
+      hasSpecific && specificSignals[key] !== undefined
+        ? specificSignals[key]
+        : wildcardSignals[key] !== undefined
+          ? wildcardSignals[key]
+          : preGroupSignals[key];
+    if (resolved !== undefined) {
+      winningSignals[key] = resolved;
+    }
+  }
+
   const hasAnySignal =
     winningSignals.search !== undefined || winningSignals.aiInput !== undefined || winningSignals.aiTrain !== undefined;
   const disallowAiInput = winningSignals.aiInput === false;
@@ -533,6 +610,50 @@ async function readBoundedBytes(
   return { bytes: out, truncated };
 }
 
+const hubRobotsTtlCache = new Map<string, { entry: ParsedRobots; expiresAt: number }>();
+
+export function resetOverflowRobotsCacheForTests(): void {
+  hubRobotsTtlCache.clear();
+}
+
+function readCachedHubRobots(cacheKey: string, now: number): ParsedRobots | undefined {
+  const hit = hubRobotsTtlCache.get(cacheKey);
+  if (!hit) return undefined;
+  if (now >= hit.expiresAt) {
+    hubRobotsTtlCache.delete(cacheKey);
+    return undefined;
+  }
+  return hit.entry;
+}
+
+function storeCachedHubRobots(cacheKey: string, entry: ParsedRobots, now: number): void {
+  const ttl = entry.cacheTtlMs ?? (entry.unreachable ? ROBOTS_CACHE_MIN_MS : ROBOTS_CACHE_DEFAULT_MS);
+  const clampedTtl = Math.min(ROBOTS_CACHE_MAX_MS, Math.max(ROBOTS_CACHE_MIN_MS, ttl));
+  hubRobotsTtlCache.delete(cacheKey);
+  hubRobotsTtlCache.set(cacheKey, { entry, expiresAt: now + clampedTtl });
+  while (hubRobotsTtlCache.size > MAX_ROBOTS_CACHE_ENTRIES) {
+    const oldest = hubRobotsTtlCache.keys().next().value;
+    if (oldest === undefined) break;
+    hubRobotsTtlCache.delete(oldest);
+  }
+}
+
+const AUTO_KIND_ACCEPTABLE_CT_RE =
+  /^(?:text\/|application\/(?:[a-z0-9.+-]*\+)?(?:json|xml)|application\/(?:xhtml\+xml|rss\+xml|atom\+xml|x-ndjson|yaml|x-yaml|csv|javascript|ecmascript))(?:[;\s]|$)/i;
+
+function readCallerHeaderCaseInsensitive(
+  hdrs: Record<string, unknown> | undefined,
+  targetNameLower: string,
+): string | undefined {
+  if (!hdrs || typeof hdrs !== 'object' || Array.isArray(hdrs)) return undefined;
+  for (const [k, v] of Object.entries(hdrs)) {
+    if (k.toLowerCase() === targetNameLower && typeof v === 'string' && v.trim() && !/[\r\n\0]/.test(v)) {
+      return v.trim();
+    }
+  }
+  return undefined;
+}
+
 export async function fetchOverflowRobots(
   origin: string,
   userAgent: string,
@@ -542,7 +663,13 @@ export async function fetchOverflowRobots(
 ): Promise<ParsedRobots> {
   const remMs = budgetDeadlineAt - Date.now();
   if (remMs <= 0) {
-    return { unreachable: true, reason: 'request budget exhausted before robots.txt check', crawlDelayMs: 0, rules: [] };
+    return {
+      unreachable: true,
+      reason: 'robots_unreachable: request budget exhausted before robots.txt check',
+      crawlDelayMs: 0,
+      rules: [],
+      cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+    };
   }
   const signal = AbortSignal.timeout(Math.min(ROBOTS_TIMEOUT_MS, remMs));
   try {
@@ -550,7 +677,13 @@ export async function fetchOverflowRobots(
     for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
       const parsedCur = new URL(curUrl);
       if (isDisallowedOverflowUrl(parsedCur, canonicalSelf)) {
-        return { unreachable: true, reason: 'robots.txt disallowed redirect target', crawlDelayMs: 15_000, rules: [] };
+        return {
+          unreachable: true,
+          reason: 'robots_unreachable: robots.txt disallowed redirect target',
+          crawlDelayMs: 15_000,
+          rules: [],
+          cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+        };
       }
       const resp = await fetchFn(curUrl, {
         method: 'GET',
@@ -561,50 +694,83 @@ export async function fetchOverflowRobots(
       if (resp.status >= 300 && resp.status < 400) {
         await resp.body?.cancel().catch(() => undefined);
         const loc = resp.headers.get('location')?.trim();
-        if (!loc || hop === MAX_REDIRECT_HOPS) {
+        if (!loc) {
           return {
             unreachable: true,
-            reason: `robots.txt redirect failed (HTTP ${resp.status})`,
+            reason: `robots_unreachable: robots.txt redirect failed (HTTP ${resp.status})`,
             crawlDelayMs: 15_000,
             rules: [],
+            cacheTtlMs: ROBOTS_CACHE_MIN_MS,
           };
         }
-        curUrl = new URL(loc, curUrl).toString();
+        let nextUrl: URL;
+        try {
+          nextUrl = new URL(loc, curUrl);
+        } catch {
+          return {
+            unreachable: true,
+            reason: `robots_unreachable: robots.txt invalid redirect location (HTTP ${resp.status})`,
+            crawlDelayMs: 15_000,
+            rules: [],
+            cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+          };
+        }
+        if (isDisallowedOverflowUrl(nextUrl, canonicalSelf)) {
+          return {
+            unreachable: true,
+            reason: 'robots_unreachable: robots.txt disallowed redirect target',
+            crawlDelayMs: 15_000,
+            rules: [],
+            cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+          };
+        }
+        if (hop === MAX_REDIRECT_HOPS) {
+          // RFC 9309 §2.3.1.2: after 5 consecutive valid public https:// redirects, treat /robots.txt as unavailable (allow all).
+          const ttlMs = parseRobotsCacheControlTtlMs(resp.headers.get('cache-control'));
+          return { unreachable: false, crawlDelayMs: 0, rules: [], cacheTtlMs: ttlMs };
+        }
+        curUrl = nextUrl.toString();
         continue;
       }
       if (resp.status === 429 || resp.status >= 500) {
         await resp.body?.cancel().catch(() => undefined);
         return {
           unreachable: true,
-          reason: `robots.txt returned HTTP ${resp.status} (disallow assumed per RFC 9309)`,
+          reason: `robots_unreachable: robots.txt returned HTTP ${resp.status} (disallow assumed per RFC 9309)`,
           crawlDelayMs: 15_000,
           rules: [],
+          cacheTtlMs: ROBOTS_CACHE_MIN_MS,
         };
       }
       if (resp.status >= 400 && resp.status < 500) {
         await resp.body?.cancel().catch(() => undefined);
-        return { unreachable: false, crawlDelayMs: 0, rules: [] };
+        const ttlMs = parseRobotsCacheControlTtlMs(resp.headers.get('cache-control'));
+        return { unreachable: false, crawlDelayMs: 0, rules: [], cacheTtlMs: ttlMs };
       }
       if (resp.ok) {
         const { bytes } = await readBoundedBytes(resp.body, ROBOTS_MAX_BYTES, signal);
         const rawText = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-        return parseOverflowRobotsTxt(rawText.replace(/^\xef\xbb\xbf/, ''), userAgent);
+        const parsed = parseOverflowRobotsTxt(rawText, userAgent);
+        parsed.cacheTtlMs = parseRobotsCacheControlTtlMs(resp.headers.get('cache-control'));
+        return parsed;
       }
       await resp.body?.cancel().catch(() => undefined);
       return {
         unreachable: true,
-        reason: `robots.txt returned unexpected HTTP ${resp.status}`,
+        reason: `robots_unreachable: robots.txt returned unexpected HTTP ${resp.status}`,
         crawlDelayMs: 15_000,
         rules: [],
+        cacheTtlMs: ROBOTS_CACHE_MIN_MS,
       };
     }
-    return { unreachable: true, reason: `robots.txt exceeded ${MAX_REDIRECT_HOPS} redirects`, crawlDelayMs: 15_000, rules: [] };
+    return { unreachable: false, crawlDelayMs: 0, rules: [], cacheTtlMs: ROBOTS_CACHE_DEFAULT_MS };
   } catch (e) {
     return {
       unreachable: true,
-      reason: `robots.txt unreachable (disallow assumed per RFC 9309): ${e instanceof Error ? e.message : String(e)}`,
+      reason: `robots_unreachable: robots.txt unreachable (disallow assumed per RFC 9309): ${e instanceof Error ? e.message : String(e)}`,
       crawlDelayMs: 15_000,
       rules: [],
+      cacheTtlMs: ROBOTS_CACHE_MIN_MS,
     };
   }
 }
@@ -626,6 +792,7 @@ export async function cloudflareOverflowFetch(
   deps: OverflowDeps = {},
 ): Promise<Response> {
   const fetchFn = deps.fetchFn ?? fetch;
+  const useSharedRobotsCache = deps.fetchFn === undefined;
   const sleepFn = deps.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const bypassAllowlist = deps.bypassAllowlist ?? [];
 
@@ -639,7 +806,10 @@ export async function cloudflareOverflowFetch(
       requestBody?: string;
       contentType?: string;
       kind?: string;
+      kindAuto?: boolean;
       accept?: string;
+      acceptLanguage?: string;
+      headers?: Record<string, unknown>;
       ifNoneMatch?: string;
       ifModifiedSince?: string;
     }>;
@@ -666,6 +836,7 @@ export async function cloudflareOverflowFetch(
   const pauseMs = Math.min(30_000, Math.max(0, Math.floor(call.options?.pauseMs ?? 2000)));
   const callerWantsRobots = call.options?.respectRobots ?? call.options?.robots ?? true;
   const canonicalSelf = selfHost.toLowerCase().replace(/\.+$/, '');
+  const uaCacheToken = canonicalProductToken(userAgent);
 
   const results: CrawlResultItem[] = [];
   const hostLastDone = new Map<string, number>();
@@ -715,9 +886,16 @@ export async function cloudflareOverflowFetch(
       let robotsEntry: ParsedRobots | undefined;
       if (enforceRobotsOnHop) {
         robotsEntry = robotsCache.get(host);
+        if (!robotsEntry && useSharedRobotsCache) {
+          robotsEntry = readCachedHubRobots(`${parsedUrl.origin.toLowerCase()}|${uaCacheToken}`, Date.now());
+          if (robotsEntry) robotsCache.set(host, robotsEntry);
+        }
         if (!robotsEntry) {
           robotsEntry = await fetchOverflowRobots(parsedUrl.origin, userAgent, fetchFn, budgetDeadlineAt, canonicalSelf);
           robotsCache.set(host, robotsEntry);
+          if (useSharedRobotsCache) {
+            storeCachedHubRobots(`${parsedUrl.origin.toLowerCase()}|${uaCacheToken}`, robotsEntry, Date.now());
+          }
         }
         const pathAndQuery = `${parsedUrl.pathname || '/'}${parsedUrl.search || ''}`;
         if (!isRobotsAllowed(robotsEntry, pathAndQuery)) {
@@ -763,53 +941,101 @@ export async function cloudflareOverflowFetch(
         break;
       }
 
-      const hopSignal = AbortSignal.timeout(Math.min(perReqCapMs, remainingBudget));
       try {
-        const acceptHeader = r.accept
-          ? r.accept
-          : r.kind === 'feed' || r.kind === 'json'
-            ? 'application/json'
-            : MARKDOWN_FOR_AGENTS_ACCEPT;
-        const headers = new Headers({
-          'user-agent': userAgent,
-          accept: acceptHeader,
-        });
+        const callerExplicitAccept =
+          (typeof r.accept === 'string' && r.accept.trim() && !/[\r\n\0]/.test(r.accept) ? r.accept.trim() : undefined) ??
+          readCallerHeaderCaseInsensitive(r.headers, 'accept');
+        const acceptHeader = callerExplicitAccept
+          ? callerExplicitAccept
+          : r.kindAuto === true
+            ? 'text/markdown, text/html;q=0.9, application/xhtml+xml;q=0.8, application/json;q=0.8, application/xml;q=0.8, text/xml;q=0.8, text/plain;q=0.8, */*;q=0.7'
+            : r.kind === 'feed' || r.kind === 'json'
+              ? 'application/json'
+              : MARKDOWN_FOR_AGENTS_ACCEPT;
+        const callerAcceptLang =
+          (typeof r.acceptLanguage === 'string' && r.acceptLanguage.trim() && !/[\r\n\0]/.test(r.acceptLanguage)
+            ? r.acceptLanguage.trim()
+            : undefined) ?? readCallerHeaderCaseInsensitive(r.headers, 'accept-language');
+
         let reqMethod = 'GET';
         let reqBody: string | undefined;
-        if (hop === 0) {
-          if (r.ifNoneMatch) headers.set('if-none-match', r.ifNoneMatch);
-          if (r.ifModifiedSince) headers.set('if-modified-since', r.ifModifiedSince);
-          if (typeof r.method === 'string' && r.method.trim().toUpperCase() === 'POST') {
-            reqMethod = 'POST';
-            reqBody = typeof r.requestBody === 'string' ? r.requestBody : '';
-            headers.set('content-type', r.contentType?.trim() || 'application/json');
-          }
+        if (hop === 0 && typeof r.method === 'string' && r.method.trim().toUpperCase() === 'POST') {
+          reqMethod = 'POST';
+          reqBody = typeof r.requestBody === 'string' ? r.requestBody : '';
         }
 
-        if (deps.botAuth?.privateKey) {
-          try {
-            const sigHdrs = await signOutboundBotHeaders({
-              url: parsedUrl.toString(),
-              method: reqMethod,
-              privateKeyEncoded: deps.botAuth.privateKey,
-              ...(deps.botAuth.directoryUrl ? { directoryUrl: deps.botAuth.directoryUrl } : {}),
-            });
-            for (const [sk, sv] of Object.entries(sigHdrs)) headers.set(sk, sv);
-          } catch {
-            // Non-fatal if optional bot signing key is invalid.
+        let resp!: Response;
+        let activeSignal!: AbortSignal;
+        let cfMitigated: string | undefined;
+
+        // 3-strikes adaptive backoff on non-challenge HTTP 429 responses (up to 3 total attempts per hop).
+        for (let strike = 1; strike <= 3; strike++) {
+          const strikeRemainingMs = budgetDeadlineAt - Date.now();
+          if (strikeRemainingMs <= 0) {
+            throw new Error('maxSeconds budget exhausted');
           }
+          activeSignal = AbortSignal.timeout(Math.min(perReqCapMs, strikeRemainingMs));
+          const headers = new Headers({
+            'user-agent': userAgent,
+            accept: acceptHeader,
+          });
+          if (callerAcceptLang) {
+            headers.set('accept-language', callerAcceptLang);
+          }
+          if (hop === 0) {
+            if (r.ifNoneMatch) headers.set('if-none-match', r.ifNoneMatch);
+            if (r.ifModifiedSince) headers.set('if-modified-since', r.ifModifiedSince);
+            if (reqMethod === 'POST') {
+              headers.set('content-type', r.contentType?.trim() || 'application/json');
+            }
+          }
+          if (deps.botAuth?.privateKey) {
+            try {
+              const sigHdrs = await signOutboundBotHeaders({
+                url: parsedUrl.toString(),
+                method: reqMethod,
+                privateKeyEncoded: deps.botAuth.privateKey,
+                ...(deps.botAuth.directoryUrl ? { directoryUrl: deps.botAuth.directoryUrl } : {}),
+              });
+              for (const [sk, sv] of Object.entries(sigHdrs)) headers.set(sk, sv);
+            } catch {
+              // Non-fatal if optional bot signing key is invalid.
+            }
+          }
+
+          resp = await fetchFn(parsedUrl.toString(), {
+            method: reqMethod,
+            headers,
+            ...(reqBody !== undefined ? { body: reqBody } : {}),
+            redirect: 'manual',
+            signal: activeSignal,
+          });
+          hostLastDone.set(host, Date.now());
+          cfMitigated = resp.headers.get('cf-mitigated') ?? undefined;
+
+          if (resp.status === 429 && !cfMitigated && strike < 3) {
+            const hdrWaf = classifyWafAndChallenge({ status: 429, headers: resp.headers });
+            if (!hdrWaf) {
+              const now429 = Date.now();
+              const exactRetryMs = parseExactRetryAfterMs(resp.headers.get('retry-after'), now429);
+              const jitterMs = 250 + Math.floor(Math.random() * 501);
+              const waitMs =
+                exactRetryMs !== null && exactRetryMs > 0
+                  ? exactRetryMs + jitterMs
+                  : strike === 1
+                    ? 4_000
+                    : 10_000;
+              if (now429 + waitMs + 1_500 < budgetDeadlineAt) {
+                await resp.body?.cancel().catch(() => undefined);
+                await sleepFn(waitMs);
+                hostLastDone.set(host, Date.now());
+                continue;
+              }
+            }
+          }
+          break;
         }
 
-        const resp = await fetchFn(parsedUrl.toString(), {
-          method: reqMethod,
-          headers,
-          ...(reqBody !== undefined ? { body: reqBody } : {}),
-          redirect: 'manual',
-          signal: hopSignal,
-        });
-        hostLastDone.set(host, Date.now());
-
-        const cfMitigated = resp.headers.get('cf-mitigated') ?? undefined;
         const loc = resp.headers.get('location')?.trim();
         if (
           !cfMitigated &&
@@ -836,7 +1062,7 @@ export async function cloudflareOverflowFetch(
 
         const remainingBatchBytes = Math.max(0, MAX_OVERFLOW_BATCH_BYTES - aggregateBatchBytes);
         const perItemMaxBytes = Math.min(maxBytes, remainingBatchBytes);
-        const { bytes, truncated } = await readBoundedBytes(resp.body, perItemMaxBytes, hopSignal);
+        const { bytes, truncated } = await readBoundedBytes(resp.body, perItemMaxBytes, activeSignal);
         aggregateBatchBytes += bytes.byteLength;
 
         const isPaymentRequired = resp.status === 402;
@@ -851,19 +1077,30 @@ export async function cloudflareOverflowFetch(
             ? encodeBodyForWire(bytes)
             : undefined;
         const isNotModified = resp.status === 304 && Boolean(r.ifNoneMatch || r.ifModifiedSince);
+        const respCt = (resp.headers.get('content-type') ?? '').trim();
+        const isAutoKindSkip =
+          r.kindAuto === true &&
+          resp.status >= 200 &&
+          resp.status < 300 &&
+          Boolean(respCt) &&
+          !AUTO_KIND_ACCEPTABLE_CT_RE.test(respCt);
         const outcome = truncated
           ? 'error'
           : isPaymentRequired
             ? 'payment_required'
             : wafMatch || cfMitigated
               ? 'challenge'
-              : (resp.status >= 200 && resp.status < 300) || isNotModified
-                ? 'ok'
-                : resp.status === 404 || resp.status === 410
-                  ? 'gone'
-                  : resp.status === 403 || resp.status === 429 || resp.status === 503
-                    ? 'stop'
-                    : 'error';
+              : isAutoKindSkip
+                ? 'skip'
+                : (resp.status >= 200 && resp.status < 300) || isNotModified
+                  ? 'ok'
+                  : resp.status === 404 || resp.status === 410
+                    ? 'gone'
+                    : resp.status === 429
+                      ? 'rate_limited'
+                      : resp.status === 403 || resp.status === 503
+                        ? 'stop'
+                        : 'error';
         const paymentHeaders: Record<string, string> = {};
         if (isPaymentRequired) {
           for (const hName of ['payment-required', 'x-payment-required', 'www-authenticate']) {
@@ -871,20 +1108,26 @@ export async function cloudflareOverflowFetch(
             if (hv) paymentHeaders[hName] = hv;
           }
         }
+        const safeHeaders = filterSafeResponseHeaders(resp.headers);
         results.push({
           id: r.id,
           url: r.url,
           ...(curUrlStr !== r.url ? { finalUrl: curUrlStr } : {}),
           kind: r.kind,
+          ...(r.kindAuto === true ? { kindAuto: true } : {}),
           status: resp.status,
           outcome,
+          ...(outcome === 'rate_limited' ? { rateLimited: true } : {}),
           ...(wafMatch ? { problem: wafMatch.summary, waf: wafMatch } : {}),
           ...(isPaymentRequired && !wafMatch ? { problem: 'HTTP 402 Payment Required' } : {}),
+          ...(outcome === 'rate_limited' && !wafMatch ? { problem: 'HTTP 429 Too Many Requests' } : {}),
+          ...(isAutoKindSkip ? { problem: `Unsupported binary content-type "${respCt}" for auto-detected fetch` } : {}),
           ...(Object.keys(paymentHeaders).length > 0 ? { paymentHeaders } : {}),
+          ...(safeHeaders ? { headers: safeHeaders } : {}),
           bytes: bytes.byteLength,
           truncated,
           durationMs: Date.now() - reqStart,
-          contentType: resp.headers.get('content-type') ?? undefined,
+          contentType: respCt || undefined,
           etag: resp.headers.get('etag') ?? undefined,
           lastModified: resp.headers.get('last-modified') ?? undefined,
           retryAfter: resp.headers.get('retry-after') ?? undefined,

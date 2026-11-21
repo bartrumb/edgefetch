@@ -1,0 +1,1216 @@
+/**
+ * Polite Full-Store Catalog Engine (`hub/src/catalog.ts`):
+ *
+ *  - Sequential, single-host-at-a-time pagination through `CatalogSpec` adapters (`shopify`, `woocommerce`).
+ *  - Every page executes through `executeHubFetch` (enforcing `robots.txt`, `Content-Signal`, Web Bot Auth, and SSRF guards).
+ *  - 3-Strikes `429` cooldown (`status: 'cooling_down'`, `resumeAt`, honoring `Retry-After` / default `60s` on Shopify).
+ *  - Immediate ethical halt on WAF/challenges or non-JSON bodies (`status: 'challenged'`, never bypassing).
+ *  - All-or-nothing completion (`status: 'complete'` iff every page succeeded and natural end-of-catalog was reached).
+ *  - Shrink Guard (`warning: 'shrink'`, `previousProducts`) when `< 50%` of prior `complete` snapshot for the same origin.
+ *  - NDJSON artifact serialization in `ARTIFACTS` R2 + deterministic snapshot diff (`added`, `removed`, `changed`) ignoring `updatedAt`.
+ */
+
+import {
+  getCatalogAdapter,
+  type CatalogRecord,
+  type CatalogSpec,
+  type CatalogVariantRecord,
+} from './extractors/registry';
+import { buildBlockedInfo, type BlockedSuggestion } from './jobs';
+import type { OptionalStorageBindings } from './storage';
+
+export type CatalogRunStatus = 'running' | 'cooling_down' | 'complete' | 'partial' | 'challenged';
+
+export interface CatalogVariantDiffCounts {
+  added: number;
+  removed: number;
+  changed: number;
+}
+
+export interface CatalogSnapshotDiff {
+  added: number;
+  removed: number;
+  changed: number;
+  variantDiff?: CatalogVariantDiffCounts;
+}
+
+export interface CatalogUcpMetadata {
+  advertised: boolean;
+  endpoint: string;
+}
+
+export interface CatalogStatusSummary {
+  ok: boolean;
+  catalogId: string;
+  status: CatalogRunStatus;
+  platform: string;
+  origin: string;
+  collection?: string;
+  products: number;
+  variants: number;
+  pages: number;
+  pagesRead: number;
+  pauseMs: number;
+  durationMs: number;
+  reason?: string;
+  resumeAt?: string;
+  warning?: 'shrink';
+  previousProducts?: number;
+  artifactId?: string;
+  diff?: CatalogSnapshotDiff | null;
+  ucp?: CatalogUcpMetadata;
+  blocked?: BlockedSuggestion;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CatalogRecordsResult {
+  ok: boolean;
+  catalogId: string;
+  status: CatalogRunStatus;
+  platform: string;
+  origin: string;
+  totalProducts: number;
+  matchedProducts: number;
+  offset: number;
+  limit: number;
+  returned: number;
+  hasMore: boolean;
+  records: CatalogRecord[];
+}
+
+export interface CatalogCallPayload {
+  url?: unknown;
+  platform?: unknown;
+  collection?: unknown;
+  scope?: unknown;
+  fields?: unknown;
+  maxPages?: unknown;
+  pauseMs?: unknown;
+  sync?: unknown;
+  catalogId?: unknown;
+  catalogJobId?: unknown;
+  offset?: unknown;
+  limit?: unknown;
+  vendor?: unknown;
+  productType?: unknown;
+  availableOnly?: unknown;
+  query?: unknown;
+  target?: unknown;
+  site?: unknown;
+}
+
+export interface NormalizedHubPageResponse {
+  status: number;
+  outcome?: string;
+  problem?: string;
+  headers: Record<string, string>;
+  body: string;
+  finalUrl?: string;
+  retryAfterMs?: number;
+}
+
+export type CatalogHubFetchFn = (args: {
+  url: string;
+  kind?: 'json' | 'text';
+  accept?: string;
+  target?: unknown;
+  site?: unknown;
+}) => Promise<unknown>;
+
+interface D1PreparedStatementLike {
+  bind(...values: unknown[]): D1PreparedStatementLike;
+  run(): Promise<unknown>;
+  first<T = Record<string, unknown>>(): Promise<T | null>;
+  all<T = Record<string, unknown>>(): Promise<{ results?: T[] }>;
+}
+
+interface D1DatabaseLike {
+  prepare(query: string): D1PreparedStatementLike;
+}
+
+interface R2ObjectBodyLike {
+  text(): Promise<string>;
+}
+
+interface R2BucketLike {
+  put(key: string, value: string, options?: Record<string, unknown>): Promise<unknown>;
+  get(key: string): Promise<R2ObjectBodyLike | null>;
+}
+
+interface SnapshotHashBundle {
+  products: Record<string, string>;
+  variants: Record<string, string>;
+}
+
+interface StoredCatalogRun {
+  summary: CatalogStatusSummary;
+  hashes: SnapshotHashBundle;
+  records: CatalogRecord[];
+}
+
+const MEMORY_CATALOG_RUNS = new Map<string, StoredCatalogRun>();
+const MAX_MEMORY_CATALOG_RUNS = 60;
+const D1_INIT_CACHE = new WeakSet<object>();
+
+function rememberRunInMemory(catalogId: string, entry: StoredCatalogRun): void {
+  if (MEMORY_CATALOG_RUNS.has(catalogId)) {
+    MEMORY_CATALOG_RUNS.delete(catalogId);
+  }
+  MEMORY_CATALOG_RUNS.set(catalogId, entry);
+  while (MEMORY_CATALOG_RUNS.size > MAX_MEMORY_CATALOG_RUNS) {
+    const oldestKey = MEMORY_CATALOG_RUNS.keys().next().value;
+    if (oldestKey === undefined) break;
+    MEMORY_CATALOG_RUNS.delete(oldestKey);
+  }
+}
+
+function getMetaD1(env?: OptionalStorageBindings & Record<string, unknown>): D1DatabaseLike | null {
+  const cand = env?.META as D1DatabaseLike | undefined;
+  return cand && typeof cand.prepare === 'function' ? cand : null;
+}
+
+function getArtifactsR2(env?: OptionalStorageBindings & Record<string, unknown>): R2BucketLike | null {
+  const cand = env?.ARTIFACTS as R2BucketLike | undefined;
+  return cand && typeof cand.put === 'function' && typeof cand.get === 'function' ? cand : null;
+}
+
+async function ensureCatalogRunsTable(db: D1DatabaseLike): Promise<void> {
+  const key = db as unknown as object;
+  if (D1_INIT_CACHE.has(key)) return;
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS catalog_runs (
+        catalog_id TEXT PRIMARY KEY,
+        origin TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        collection TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        products_count INTEGER NOT NULL DEFAULT 0,
+        variants_count INTEGER NOT NULL DEFAULT 0,
+        pages_read INTEGER NOT NULL DEFAULT 0,
+        artifact_id TEXT,
+        hashes_json TEXT,
+        summary_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+    )
+    .run();
+  await db
+    .prepare(
+      `CREATE INDEX IF NOT EXISTS idx_catalog_runs_origin_status ON catalog_runs(origin, collection, status, created_at)`,
+    )
+    .run()
+    .catch(() => null);
+  D1_INIT_CACHE.add(key);
+}
+
+async function persistCatalogRun(
+  env: (OptionalStorageBindings & Record<string, unknown>) | undefined,
+  entry: StoredCatalogRun,
+): Promise<void> {
+  rememberRunInMemory(entry.summary.catalogId, entry);
+  const db = getMetaD1(env);
+  if (!db) return;
+  try {
+    await ensureCatalogRunsTable(db);
+    const s = entry.summary;
+    await db
+      .prepare(
+        `INSERT OR REPLACE INTO catalog_runs (
+          catalog_id, origin, platform, collection, status,
+          products_count, variants_count, pages_read, artifact_id,
+          hashes_json, summary_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        s.catalogId,
+        s.origin,
+        s.platform,
+        s.collection ?? '',
+        s.status,
+        s.products,
+        s.variants,
+        s.pagesRead,
+        s.artifactId ?? null,
+        JSON.stringify(entry.hashes),
+        JSON.stringify(s),
+        s.createdAt,
+        s.updatedAt,
+      )
+      .run();
+  } catch {
+    // Non-fatal fallback to in-memory store
+  }
+}
+
+async function findPreviousCompleteCatalogRun(
+  env: (OptionalStorageBindings & Record<string, unknown>) | undefined,
+  origin: string,
+  collection: string,
+  excludeCatalogId: string,
+): Promise<{ productsCount: number; hashes: SnapshotHashBundle | null } | null> {
+  const db = getMetaD1(env);
+  if (db) {
+    try {
+      await ensureCatalogRunsTable(db);
+      const rowsRes = await db
+        .prepare(
+          `SELECT catalog_id, products_count, hashes_json, summary_json
+           FROM catalog_runs
+           WHERE origin = ? AND collection = ? AND status = 'complete' AND catalog_id != ?
+           ORDER BY created_at DESC
+           LIMIT 5`,
+        )
+        .bind(origin, collection, excludeCatalogId)
+        .all<{ catalog_id: string; products_count: number; hashes_json: string | null; summary_json: string }>();
+      const rows = rowsRes.results ?? [];
+      for (const row of rows) {
+        let parsedSummary: Record<string, unknown> | null = null;
+        try {
+          parsedSummary = JSON.parse(row.summary_json) as Record<string, unknown>;
+        } catch {
+          parsedSummary = null;
+        }
+        // Never use an already shrink-warned snapshot as the trusted baseline
+        if (parsedSummary?.warning === 'shrink') continue;
+        let hashes: SnapshotHashBundle | null = null;
+        if (row.hashes_json) {
+          try {
+            hashes = JSON.parse(row.hashes_json) as SnapshotHashBundle;
+          } catch {
+            hashes = null;
+          }
+        }
+        return { productsCount: Number(row.products_count) || 0, hashes };
+      }
+    } catch {
+      // Fall through to in-memory lookup
+    }
+  }
+
+  const memEntries = [...MEMORY_CATALOG_RUNS.values()].reverse();
+  for (const item of memEntries) {
+    if (
+      item.summary.catalogId !== excludeCatalogId &&
+      item.summary.origin === origin &&
+      (item.summary.collection ?? '') === collection &&
+      item.summary.status === 'complete' &&
+      item.summary.warning !== 'shrink'
+    ) {
+      return {
+        productsCount: item.summary.products,
+        hashes: item.hashes,
+      };
+    }
+  }
+  return null;
+}
+
+function fnv1a64Hex(input: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0xc9dc5118;
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i);
+    h1 ^= c;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= c ^ (i & 0xff);
+    h2 = Math.imul(h2, 0x01000193);
+  }
+  return `${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+export function computeCatalogVariantHash(v: CatalogVariantRecord): string {
+  const canonical = JSON.stringify({
+    variantId: v.variantId,
+    sku: v.sku ?? null,
+    barcode: v.barcode ?? null,
+    title: v.title ?? null,
+    options: v.options,
+    price: v.price,
+    compareAt: v.compareAt,
+    currency: v.currency,
+    available: v.available,
+    inventoryPolicy: v.inventoryPolicy ?? null,
+    grams: v.grams,
+    image: v.image,
+  });
+  return fnv1a64Hex(canonical);
+}
+
+/**
+ * Computes a deterministic content hash for a `CatalogRecord` **explicitly ignoring `updatedAt` and `publishedAt`**
+ * so Shopify inventory timestamp bumps do not trigger false `changed` diffs.
+ */
+export function computeCatalogProductHash(rec: CatalogRecord): string {
+  const sortedVariantHashes = rec.variants
+    .map((v) => `${v.variantId}:${computeCatalogVariantHash(v)}`)
+    .sort();
+  const canonical = JSON.stringify({
+    productId: rec.productId,
+    handle: rec.handle,
+    title: rec.title,
+    vendor: rec.vendor,
+    productType: rec.productType,
+    tags: [...rec.tags].sort(),
+    options: rec.options,
+    variants: sortedVariantHashes,
+  });
+  return fnv1a64Hex(canonical);
+}
+
+function buildSnapshotHashBundle(records: CatalogRecord[]): SnapshotHashBundle {
+  const products: Record<string, string> = Object.create(null) as Record<string, string>;
+  const variants: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const r of records) {
+    const pKey = r.productId || r.handle;
+    if (!pKey) continue;
+    products[pKey] = computeCatalogProductHash(r);
+    for (const v of r.variants) {
+      const vKey = `${pKey}::${v.variantId || v.sku || v.title || '0'}`;
+      variants[vKey] = computeCatalogVariantHash(v);
+    }
+  }
+  return { products, variants };
+}
+
+export function computeCatalogSnapshotDiff(
+  prev: SnapshotHashBundle,
+  curr: SnapshotHashBundle,
+): CatalogSnapshotDiff {
+  let added = 0;
+  let removed = 0;
+  let changed = 0;
+  for (const [k, h] of Object.entries(curr.products)) {
+    const prevH = Object.prototype.hasOwnProperty.call(prev.products, k) ? prev.products[k] : undefined;
+    if (prevH === undefined) added++;
+    else if (prevH !== h) changed++;
+  }
+  for (const k of Object.keys(prev.products)) {
+    if (!Object.prototype.hasOwnProperty.call(curr.products, k)) removed++;
+  }
+
+  let vAdded = 0;
+  let vRemoved = 0;
+  let vChanged = 0;
+  for (const [vk, vh] of Object.entries(curr.variants)) {
+    const prevVh = Object.prototype.hasOwnProperty.call(prev.variants, vk) ? prev.variants[vk] : undefined;
+    if (prevVh === undefined) vAdded++;
+    else if (prevVh !== vh) vChanged++;
+  }
+  for (const vk of Object.keys(prev.variants)) {
+    if (!Object.prototype.hasOwnProperty.call(curr.variants, vk)) vRemoved++;
+  }
+
+  return {
+    added,
+    removed,
+    changed,
+    variantDiff: {
+      added: vAdded,
+      removed: vRemoved,
+      changed: vChanged,
+    },
+  };
+}
+
+/**
+ * Inspects `robots.txt` text (or response headers) for advertised Shopify/Universal Commerce Protocol (UCP) endpoints
+ * (`/.well-known/ucp` or `/api/ucp/mcp`), strictly treating `robots.txt` prose as untrusted data.
+ */
+export function discoverUcpEndpointFromRobots(originStr: string, robotsText: string): CatalogUcpMetadata | null {
+  if (!robotsText) return null;
+  const bounded = robotsText.slice(0, 32_768);
+  const m = /(?:\/api\/ucp\/mcp|\/\.well-known\/ucp)\b/i.exec(bounded);
+  if (!m?.[0]) return null;
+  try {
+    const endpoint = new URL(m[0], originStr).toString();
+    return { advertised: true, endpoint };
+  } catch {
+    return null;
+  }
+}
+
+function isSafeHttpsStoreUrl(rawUrl: string): URL | null {
+  try {
+    const u = new URL(rawUrl.trim());
+    if (u.protocol !== 'https:' || u.username || u.password) return null;
+    const h = u.hostname.toLowerCase();
+    if (
+      !h ||
+      h === 'localhost' ||
+      h.endsWith('.local') ||
+      h.endsWith('.internal') ||
+      /^\d+\.\d+\.\d+\.\d+$/.test(h) ||
+      h.includes(':')
+    ) {
+      return null;
+    }
+    return u;
+  } catch {
+    return null;
+  }
+}
+
+function decodeBase64Utf8(b64: string): string {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  } catch {
+    return '';
+  }
+}
+
+function normalizeHeadersMap(raw: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!raw) return out;
+  if (typeof (raw as Headers).forEach === 'function') {
+    (raw as Headers).forEach((v, k) => {
+      out[k.toLowerCase()] = v;
+    });
+    return out;
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === 'string') out[k.toLowerCase()] = v;
+    }
+  }
+  return out;
+}
+
+function normalizeHubPageResponse(raw: unknown): NormalizedHubPageResponse | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+
+  // Unwrap `{ status, body: { results: [item] } }` from `fetch_url` / `fetch_batch` style responses if needed
+  const nestedBody = obj.body && typeof obj.body === 'object' && !Array.isArray(obj.body)
+    ? (obj.body as Record<string, unknown>)
+    : null;
+  const firstResult =
+    nestedBody && Array.isArray(nestedBody.results) && nestedBody.results[0] && typeof nestedBody.results[0] === 'object'
+      ? (nestedBody.results[0] as Record<string, unknown>)
+      : Array.isArray(obj.results) && obj.results[0] && typeof obj.results[0] === 'object'
+        ? (obj.results[0] as Record<string, unknown>)
+        : null;
+
+  const target = firstResult ?? (nestedBody && typeof nestedBody.status === 'number' ? nestedBody : obj);
+  const status = typeof target.status === 'number' ? target.status : typeof obj.status === 'number' ? obj.status : 0;
+  const outcome = typeof target.outcome === 'string' ? target.outcome : typeof obj.outcome === 'string' ? obj.outcome : undefined;
+  const problem = typeof target.problem === 'string' ? target.problem : typeof obj.problem === 'string' ? obj.problem : undefined;
+  const headers = normalizeHeadersMap(target.headers ?? obj.headers);
+
+  let bodyStr = '';
+  if (typeof target.body === 'string') {
+    bodyStr = target.bodyEncoding === 'base64' ? decodeBase64Utf8(target.body) : target.body;
+  } else if (typeof target.rawBody === 'string') {
+    bodyStr = target.rawBody;
+  } else if (target.body && typeof target.body === 'object') {
+    bodyStr = JSON.stringify(target.body);
+  }
+
+  const retryAfterMs =
+    typeof target.retryAfterMs === 'number' && Number.isFinite(target.retryAfterMs)
+      ? target.retryAfterMs
+      : undefined;
+  const finalUrl = typeof target.finalUrl === 'string' ? target.finalUrl : undefined;
+
+  return {
+    status,
+    ...(outcome ? { outcome } : {}),
+    ...(problem ? { problem } : {}),
+    headers,
+    body: bodyStr,
+    ...(finalUrl ? { finalUrl } : {}),
+    ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+  };
+}
+
+function parseRetryAfterMs(resp: NormalizedHubPageResponse, defaultMs: number): number {
+  if (resp.retryAfterMs !== undefined && resp.retryAfterMs > 0) {
+    return Math.min(300_000, Math.max(1_000, Math.round(resp.retryAfterMs)));
+  }
+  const hdr = resp.headers['retry-after']?.trim();
+  if (hdr) {
+    if (/^\d+$/.test(hdr)) {
+      const secs = parseInt(hdr, 10);
+      if (Number.isFinite(secs) && secs > 0) {
+        return Math.min(300_000, Math.max(1_000, secs * 1_000));
+      }
+    }
+    const parsedDate = Date.parse(hdr);
+    if (Number.isFinite(parsedDate)) {
+      const delta = parsedDate - Date.now();
+      if (delta > 0) return Math.min(300_000, Math.max(1_000, delta));
+    }
+  }
+  return defaultMs;
+}
+
+function isChallengeResponse(resp: NormalizedHubPageResponse): boolean {
+  const out = (resp.outcome ?? '').toLowerCase();
+  if (out === 'challenge') return true;
+  if (resp.headers['cf-mitigated']) return true;
+  const prob = resp.problem ?? '';
+  if (/challenge|cf-mitigated|turnstile|captcha|verify you are human/i.test(prob)) return true;
+  const bodyHead = resp.body.slice(0, 4096);
+  if (
+    (resp.status === 403 || resp.status === 503 || resp.status === 200) &&
+    /cf-mitigated|_cf_chl_opt|challenge-platform|turnstile|verify you are human/i.test(bodyHead)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isRobotsOrSignalBlocked(resp: NormalizedHubPageResponse): 'robots_disallowed' | 'robots_unreachable' | 'content_signal_disallowed' | null {
+  const out = (resp.outcome ?? '').toLowerCase();
+  const prob = resp.problem ?? '';
+  if (out === 'content_signal_disallowed' || /content-signal|ai-input\s*=\s*no/i.test(prob)) {
+    return 'content_signal_disallowed';
+  }
+  if (out === 'robots_unreachable' || (/robots\.txt/i.test(prob) && /timed?\s*out|unreachable/i.test(prob))) {
+    return 'robots_unreachable';
+  }
+  if (out === 'robots_disallowed' || /robots\.txt/i.test(prob)) {
+    return 'robots_disallowed';
+  }
+  return null;
+}
+
+function generateCatalogId(): string {
+  const rand = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  return `cat_${rand}`;
+}
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Retrieves the live or completed status of a catalog job (`running`, `cooling_down`, `complete`, `partial`, `challenged`).
+ */
+export async function getCatalogStatus(params: {
+  catalogId: string;
+  env?: OptionalStorageBindings & Record<string, unknown>;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const catalogId = params.catalogId.trim();
+  if (!catalogId) {
+    return { status: 400, body: { ok: false, error: 'missing_catalog_id', message: 'Provide `catalogId`.' } };
+  }
+
+  const mem = MEMORY_CATALOG_RUNS.get(catalogId);
+  if (mem) {
+    return { status: 200, body: { ...mem.summary } };
+  }
+
+  const db = getMetaD1(params.env);
+  if (db) {
+    try {
+      await ensureCatalogRunsTable(db);
+      const row = await db
+        .prepare(`SELECT summary_json FROM catalog_runs WHERE catalog_id = ?`)
+        .bind(catalogId)
+        .first<{ summary_json: string }>();
+      if (row?.summary_json) {
+        const parsed = JSON.parse(row.summary_json) as CatalogStatusSummary;
+        return { status: 200, body: { ...parsed } };
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    status: 404,
+    body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` },
+  };
+}
+
+/**
+ * Pages and filters normalized `CatalogRecord` rows from an in-memory or R2 NDJSON catalog artifact
+ * without pulling multi-megabyte raw JSON pages into agent context.
+ */
+export async function getCatalogRecords(params: {
+  catalogId: string;
+  offset?: number;
+  limit?: number;
+  vendor?: string | string[];
+  productType?: string | string[];
+  availableOnly?: boolean;
+  query?: string;
+  env?: OptionalStorageBindings & Record<string, unknown>;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const catalogId = params.catalogId.trim();
+  if (!catalogId) {
+    return { status: 400, body: { ok: false, error: 'missing_catalog_id', message: 'Provide `catalogId`.' } };
+  }
+
+  let summary: CatalogStatusSummary | null = null;
+  let records: CatalogRecord[] | null = null;
+
+  const mem = MEMORY_CATALOG_RUNS.get(catalogId);
+  if (mem) {
+    summary = mem.summary;
+    records = mem.records;
+  }
+
+  const db = getMetaD1(params.env);
+  if (!summary && db) {
+    try {
+      await ensureCatalogRunsTable(db);
+      const row = await db
+        .prepare(`SELECT summary_json FROM catalog_runs WHERE catalog_id = ?`)
+        .bind(catalogId)
+        .first<{ summary_json: string }>();
+      if (row?.summary_json) {
+        summary = JSON.parse(row.summary_json) as CatalogStatusSummary;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!summary) {
+    return {
+      status: 404,
+      body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` },
+    };
+  }
+
+  if (!records) {
+    records = [];
+    const r2 = getArtifactsR2(params.env);
+    if (r2 && summary.artifactId) {
+      try {
+        const obj = await r2.get(summary.artifactId);
+        if (obj) {
+          const ndjson = await obj.text();
+          for (const line of ndjson.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              records.push(JSON.parse(trimmed) as CatalogRecord);
+            } catch {
+              // skip malformed line
+            }
+          }
+        }
+      } catch {
+        // ignore R2 read errors
+      }
+    }
+  }
+
+  const offset = typeof params.offset === 'number' && Number.isFinite(params.offset) ? Math.max(0, Math.floor(params.offset)) : 0;
+  const limit =
+    typeof params.limit === 'number' && Number.isFinite(params.limit)
+      ? Math.min(250, Math.max(1, Math.floor(params.limit)))
+      : 50;
+
+  const vendorFilters = (
+    Array.isArray(params.vendor) ? params.vendor : typeof params.vendor === 'string' && params.vendor.trim() ? [params.vendor] : []
+  ).map((v) => v.trim().toLowerCase());
+
+  const typeFilters = (
+    Array.isArray(params.productType)
+      ? params.productType
+      : typeof params.productType === 'string' && params.productType.trim()
+        ? [params.productType]
+        : []
+  ).map((t) => t.trim().toLowerCase());
+
+  const queryLower = typeof params.query === 'string' ? params.query.trim().toLowerCase() : '';
+  const availableOnly = params.availableOnly === true;
+
+  const filtered = records.filter((r) => {
+    if (vendorFilters.length > 0) {
+      const rv = (r.vendor ?? '').toLowerCase();
+      if (!vendorFilters.some((vf) => rv === vf || rv.includes(vf))) return false;
+    }
+    if (typeFilters.length > 0) {
+      const rt = (r.productType ?? '').toLowerCase();
+      if (!typeFilters.some((tf) => rt === tf || rt.includes(tf))) return false;
+    }
+    if (availableOnly) {
+      if (!r.variants.some((v) => v.available === true)) return false;
+    }
+    if (queryLower) {
+      const hay = [
+        r.title,
+        r.handle,
+        r.vendor ?? '',
+        r.productType ?? '',
+        r.tags.join(' '),
+        ...r.variants.map((v) => `${v.sku ?? ''} ${v.title ?? ''}`),
+      ]
+        .join(' ')
+        .toLowerCase();
+      if (!hay.includes(queryLower)) return false;
+    }
+    return true;
+  });
+
+  const sliced = filtered.slice(offset, offset + limit);
+  const result: CatalogRecordsResult = {
+    ok: true,
+    catalogId,
+    status: summary.status,
+    platform: summary.platform,
+    origin: summary.origin,
+    totalProducts: records.length,
+    matchedProducts: filtered.length,
+    offset,
+    limit,
+    returned: sliced.length,
+    hasMore: offset + sliced.length < filtered.length,
+    records: sliced,
+  };
+
+  return { status: 200, body: result as unknown as Record<string, unknown> };
+}
+
+/**
+ * Starts a polite full-store catalog pull OR polls/pages an existing `catalogId`.
+ */
+export async function executeCatalogCall(params: {
+  payload: CatalogCallPayload;
+  env?: OptionalStorageBindings & Record<string, unknown>;
+  executeHubFetch: CatalogHubFetchFn;
+  ctx?: { waitUntil?: (promise: Promise<unknown>) => void };
+  sleepFn?: (ms: number) => Promise<void>;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { payload, env, executeHubFetch } = params;
+  const sleep = params.sleepFn ?? defaultSleep;
+
+  const existingId =
+    typeof payload.catalogId === 'string' && payload.catalogId.trim()
+      ? payload.catalogId.trim()
+      : typeof payload.catalogJobId === 'string' && payload.catalogJobId.trim()
+        ? payload.catalogJobId.trim()
+        : '';
+
+  if (existingId && !payload.url) {
+    const wantsRecords =
+      payload.offset !== undefined ||
+      payload.limit !== undefined ||
+      payload.vendor !== undefined ||
+      payload.productType !== undefined ||
+      payload.availableOnly !== undefined ||
+      payload.query !== undefined;
+    if (wantsRecords) {
+      return getCatalogRecords({
+        catalogId: existingId,
+        offset: typeof payload.offset === 'number' ? payload.offset : undefined,
+        limit: typeof payload.limit === 'number' ? payload.limit : undefined,
+        vendor:
+          typeof payload.vendor === 'string' || Array.isArray(payload.vendor)
+            ? (payload.vendor as string | string[])
+            : undefined,
+        productType:
+          typeof payload.productType === 'string' || Array.isArray(payload.productType)
+            ? (payload.productType as string | string[])
+            : undefined,
+        availableOnly: payload.availableOnly === true,
+        query: typeof payload.query === 'string' ? payload.query : undefined,
+        env,
+      });
+    }
+    return getCatalogStatus({ catalogId: existingId, env });
+  }
+
+  const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
+  const parsedUrl = isSafeHttpsStoreUrl(rawUrl);
+  if (!parsedUrl) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: 'invalid_url',
+        message: 'Provide a valid public `https://` storefront URL in `url` (or `catalogId` to poll an existing run).',
+      },
+    };
+  }
+
+  const rawPlatform = typeof payload.platform === 'string' ? payload.platform.trim().toLowerCase() : 'auto';
+  if (rawPlatform !== 'auto' && rawPlatform !== 'shopify' && rawPlatform !== 'woocommerce') {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: 'invalid_platform',
+        message: 'Supported `platform` values are `"auto"`, `"shopify"`, or `"woocommerce"`.',
+      },
+    };
+  }
+
+  const scopeObj = payload.scope && typeof payload.scope === 'object' ? (payload.scope as Record<string, unknown>) : undefined;
+  const pathColMatch = /^\/collections\/([A-Za-z0-9_-]+)/i.exec(parsedUrl.pathname);
+  const collection =
+    (typeof payload.collection === 'string' && payload.collection.trim()
+      ? payload.collection.trim()
+      : typeof scopeObj?.collection === 'string' && scopeObj.collection.trim()
+        ? scopeObj.collection.trim()
+        : pathColMatch?.[1] ?? '');
+
+  const fields: 'full' | 'lean' = payload.fields === 'lean' ? 'lean' : 'full';
+  const originUrl = new URL(parsedUrl.origin);
+  if (collection) {
+    originUrl.pathname = `/collections/${encodeURIComponent(collection)}`;
+  }
+
+  // Resolve initial `CatalogSpec`
+  const initialPlatform =
+    rawPlatform !== 'auto'
+      ? rawPlatform
+      : parsedUrl.pathname.toLowerCase().includes('/wp-json/wc/store/')
+        ? 'woocommerce'
+        : 'shopify';
+
+  const initialAdapter = getCatalogAdapter(initialPlatform);
+  if (!initialAdapter?.catalog) {
+    return {
+      status: 500,
+      body: { ok: false, error: 'missing_catalog_adapter', message: `Catalog adapter "${initialPlatform}" is not registered.` },
+    };
+  }
+
+  let activeSpec: CatalogSpec = initialAdapter.catalog;
+  const reqPause = typeof payload.pauseMs === 'number' && Number.isFinite(payload.pauseMs) ? Math.floor(payload.pauseMs) : activeSpec.pauseMs;
+  const computeEffectivePauseMs = (spec: CatalogSpec): number =>
+    Math.max(spec.platform === 'shopify' ? 2000 : spec.pauseMs, reqPause);
+
+  let effectivePauseMs = computeEffectivePauseMs(activeSpec);
+  const maxPages =
+    typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages) && payload.maxPages >= 1
+      ? Math.min(activeSpec.pageCap, Math.floor(payload.maxPages))
+      : activeSpec.pageCap;
+
+  const catalogId = generateCatalogId();
+  const startedAtMs = Date.now();
+  const createdAt = new Date(startedAtMs).toISOString();
+
+  const currentEntry: StoredCatalogRun = {
+    summary: {
+      ok: true,
+      catalogId,
+      status: 'running',
+      platform: activeSpec.platform,
+      origin: parsedUrl.origin,
+      ...(collection ? { collection } : {}),
+      products: 0,
+      variants: 0,
+      pages: 0,
+      pagesRead: 0,
+      pauseMs: effectivePauseMs,
+      durationMs: 0,
+      createdAt,
+      updatedAt: createdAt,
+    },
+    hashes: { products: {}, variants: {} },
+    records: [],
+  };
+
+  await persistCatalogRun(env, currentEntry);
+
+  const runPull = async (): Promise<CatalogStatusSummary> => {
+    const byProductId = new Map<string, CatalogRecord>();
+    let pagesRead = 0;
+    let naturalCompletion = false;
+    let finalStatus: CatalogRunStatus = 'partial';
+    let stopReason: string | undefined;
+    let blockedInfo: BlockedSuggestion | undefined;
+    let currentUrl: string | null = activeSpec.firstPage(originUrl, collection ? { collection } : undefined);
+    let triedAutoFallbackToWc = rawPlatform !== 'auto' || activeSpec.platform === 'woocommerce';
+
+    while (currentUrl && pagesRead < maxPages) {
+      if (pagesRead > 0) {
+        await sleep(effectivePauseMs);
+      }
+
+      let strikes = 0;
+      let pageResp: NormalizedHubPageResponse | null = null;
+
+      while (true) {
+        const rawFetchOut = await executeHubFetch({
+          url: currentUrl,
+          kind: 'json',
+          accept: 'application/json',
+          ...(payload.target !== undefined ? { target: payload.target } : {}),
+          ...(payload.site !== undefined ? { site: payload.site } : {}),
+        }).catch((err: unknown) => ({
+          status: 0,
+          outcome: 'network_error',
+          problem: err instanceof Error ? err.message : String(err),
+          headers: {},
+          body: '',
+        }));
+
+        pageResp = normalizeHubPageResponse(rawFetchOut);
+        if (!pageResp) {
+          stopReason = strikes > 0 ? 'rate_limited' : 'empty_response';
+          break;
+        }
+
+        // 1. Immediate ethical halt on `robots.txt` or `Content-Signal`
+        const blockKind = isRobotsOrSignalBlocked(pageResp);
+        if (blockKind) {
+          stopReason = blockKind;
+          blockedInfo =
+            buildBlockedInfo(currentUrl, pageResp.outcome ?? blockKind, pageResp.problem, pageResp.status) ?? undefined;
+          pageResp = null;
+          break;
+        }
+
+        // 2. Immediate halt on WAF / bot challenge (`cf-mitigated`, `outcome: "challenge"`, Turnstile)
+        if (isChallengeResponse(pageResp)) {
+          finalStatus = 'challenged';
+          stopReason = 'challenge';
+          blockedInfo =
+            buildBlockedInfo(currentUrl, 'challenge', pageResp.problem || 'anti-bot challenge', pageResp.status) ?? undefined;
+          pageResp = null;
+          break;
+        }
+
+        // 3. Polite 3-Strikes `429` Cooldown Handling
+        if (pageResp.status === 429 || pageResp.outcome === 'rate_limited') {
+          strikes++;
+          if (strikes > 3) {
+            stopReason = 'rate_limited';
+            pageResp = null;
+            break;
+          }
+          const defaultCooldownMs = activeSpec.platform === 'shopify' ? 60_000 : 30_000;
+          const waitMs = parseRetryAfterMs(pageResp, defaultCooldownMs);
+          const resumeAt = new Date(Date.now() + waitMs).toISOString();
+          currentEntry.summary = {
+            ...currentEntry.summary,
+            status: 'cooling_down',
+            resumeAt,
+            pages: pagesRead,
+            pagesRead,
+            durationMs: Date.now() - startedAtMs,
+            updatedAt: new Date().toISOString(),
+          };
+          await persistCatalogRun(env, currentEntry);
+          await sleep(waitMs);
+          const { resumeAt: _cleared, ...restSummary } = currentEntry.summary;
+          currentEntry.summary = {
+            ...restSummary,
+            status: 'running',
+            updatedAt: new Date().toISOString(),
+          };
+          await persistCatalogRun(env, currentEntry);
+          continue;
+        }
+
+        break;
+      }
+
+      if (!pageResp) {
+        break;
+      }
+
+      // Platform `auto` fallback: if page 1 on `/products.json` returned 404/400/405, try WooCommerce Store API!
+      if (
+        pagesRead === 0 &&
+        !triedAutoFallbackToWc &&
+        (pageResp.status === 404 || pageResp.status === 400 || pageResp.status === 405)
+      ) {
+        triedAutoFallbackToWc = true;
+        const wcAdapter = getCatalogAdapter('woocommerce');
+        if (wcAdapter?.catalog) {
+          activeSpec = wcAdapter.catalog;
+          effectivePauseMs = computeEffectivePauseMs(activeSpec);
+          currentEntry.summary.platform = activeSpec.platform;
+          currentEntry.summary.pauseMs = effectivePauseMs;
+          currentUrl = activeSpec.firstPage(originUrl, collection ? { collection } : undefined);
+          continue;
+        }
+      }
+
+      if (pageResp.status !== 200) {
+        stopReason = `http_${pageResp.status || 'error'}`;
+        break;
+      }
+
+      // Parse page strictly; non-JSON body on a 200 catalog feed is a bot wall / interstitial -> `challenged`!
+      let parsedPage: { records: CatalogRecord[]; done: boolean };
+      try {
+        parsedPage = activeSpec.parsePage(pageResp.body, originUrl, {
+          fields,
+          headers: pageResp.headers,
+        });
+      } catch {
+        // If `auto` mode got non-Shopify JSON on page 1 (e.g. a custom JSON object without `products`), try WooCommerce once if body was valid JSON; if HTML/non-JSON, halt as `challenged`!
+        const trimmedBody = pageResp.body.trim();
+        const looksLikeJson = trimmedBody.startsWith('{') || trimmedBody.startsWith('[');
+        if (pagesRead === 0 && !triedAutoFallbackToWc && looksLikeJson) {
+          triedAutoFallbackToWc = true;
+          const wcAdapter = getCatalogAdapter('woocommerce');
+          if (wcAdapter?.catalog) {
+            activeSpec = wcAdapter.catalog;
+            effectivePauseMs = computeEffectivePauseMs(activeSpec);
+            currentEntry.summary.platform = activeSpec.platform;
+            currentEntry.summary.pauseMs = effectivePauseMs;
+            currentUrl = activeSpec.firstPage(originUrl, collection ? { collection } : undefined);
+            continue;
+          }
+        }
+        finalStatus = 'challenged';
+        stopReason = 'non_json_body';
+        break;
+      }
+
+      pagesRead++;
+      for (const rec of parsedPage.records) {
+        const key = rec.productId || rec.handle || rec.url;
+        byProductId.set(key, rec);
+      }
+
+      const currentRecords = [...byProductId.values()];
+      const currentVariantsCount = currentRecords.reduce((acc, r) => acc + r.variants.length, 0);
+      currentEntry.records = currentRecords;
+      currentEntry.summary = {
+        ...currentEntry.summary,
+        products: currentRecords.length,
+        variants: currentVariantsCount,
+        pages: pagesRead,
+        pagesRead,
+        durationMs: Date.now() - startedAtMs,
+        updatedAt: new Date().toISOString(),
+      };
+      await persistCatalogRun(env, currentEntry);
+
+      if (parsedPage.done) {
+        naturalCompletion = true;
+        break;
+      }
+
+      const nextUrl = activeSpec.nextPage({
+        url: currentUrl,
+        body: pageResp.body,
+        pageIndex: pagesRead - 1,
+        headers: pageResp.headers,
+      });
+
+      if (!nextUrl) {
+        naturalCompletion = true;
+        break;
+      }
+
+      if (pagesRead >= maxPages) {
+        stopReason = 'max_pages_reached';
+        break;
+      }
+
+      currentUrl = nextUrl;
+    }
+
+    if (finalStatus !== 'challenged') {
+      if (naturalCompletion) {
+        finalStatus = 'complete';
+      } else {
+        finalStatus = 'partial';
+        if (!stopReason) stopReason = 'incomplete_pagination';
+      }
+    }
+
+    const finalRecords = [...byProductId.values()];
+    const totalVariants = finalRecords.reduce((acc, r) => acc + r.variants.length, 0);
+    const currHashes = buildSnapshotHashBundle(finalRecords);
+
+    // Optional lightweight `robots.txt` check for Shopify UCP / MCP endpoint advertisement
+    let ucpMeta: CatalogUcpMetadata | undefined;
+    if (finalStatus === 'complete' || pagesRead > 0) {
+      const robotsOut = await executeHubFetch({
+        url: `${parsedUrl.origin}/robots.txt`,
+        kind: 'text',
+        accept: 'text/plain',
+        ...(payload.target !== undefined ? { target: payload.target } : {}),
+        ...(payload.site !== undefined ? { site: payload.site } : {}),
+      }).catch(() => null);
+      const normRobots = normalizeHubPageResponse(robotsOut);
+      if (normRobots && normRobots.status === 200 && normRobots.body) {
+        ucpMeta = discoverUcpEndpointFromRobots(parsedUrl.origin, normRobots.body) ?? undefined;
+      }
+    }
+
+    // Write NDJSON artifact to R2 when `ARTIFACTS` is bound
+    let artifactId: string | undefined;
+    const r2 = getArtifactsR2(env);
+    if (r2 && finalRecords.length > 0) {
+      const key = `catalog/${catalogId}.ndjson`;
+      const ndjson = `${finalRecords.map((r) => JSON.stringify(r)).join('\n')}\n`;
+      try {
+        await r2.put(key, ndjson, {
+          httpMetadata: { contentType: 'application/x-ndjson; charset=utf-8' },
+        });
+        artifactId = key;
+      } catch {
+        // Non-fatal if R2 put fails
+      }
+    }
+
+    // Shrink Guard & Variant-Level Snapshot Diff against last trusted `complete` run for `(origin, collection)`
+    let shrinkWarning: 'shrink' | undefined;
+    let previousProducts: number | undefined;
+    let diff: CatalogSnapshotDiff | null = null;
+
+    const prevRun = await findPreviousCompleteCatalogRun(env, parsedUrl.origin, collection, catalogId);
+    if (prevRun) {
+      if (prevRun.productsCount > 0 && finalRecords.length < prevRun.productsCount * 0.5) {
+        shrinkWarning = 'shrink';
+        previousProducts = prevRun.productsCount;
+      }
+      if (prevRun.hashes && finalStatus === 'complete') {
+        diff = computeCatalogSnapshotDiff(prevRun.hashes, currHashes);
+      }
+    }
+
+    const finishedNow = new Date().toISOString();
+    const { resumeAt: _dropResume, ...cleanBase } = currentEntry.summary;
+    const finalSummary: CatalogStatusSummary = {
+      ...cleanBase,
+      ok: finalStatus === 'complete',
+      status: finalStatus,
+      platform: activeSpec.platform,
+      products: finalRecords.length,
+      variants: totalVariants,
+      pages: pagesRead,
+      pagesRead,
+      pauseMs: effectivePauseMs,
+      durationMs: Date.now() - startedAtMs,
+      ...(stopReason ? { reason: stopReason } : {}),
+      ...(shrinkWarning ? { warning: shrinkWarning, previousProducts } : {}),
+      ...(artifactId ? { artifactId } : {}),
+      diff,
+      ...(ucpMeta ? { ucp: ucpMeta } : {}),
+      ...(blockedInfo ? { blocked: blockedInfo } : {}),
+      updatedAt: finishedNow,
+    };
+
+    currentEntry.summary = finalSummary;
+    currentEntry.hashes = currHashes;
+    currentEntry.records = finalRecords;
+    await persistCatalogRun(env, currentEntry);
+    return finalSummary;
+  };
+
+  const wantAsync = payload.sync === false && typeof params.ctx?.waitUntil === 'function';
+  if (wantAsync) {
+    params.ctx!.waitUntil!(runPull());
+    return {
+      status: 202,
+      body: { ...currentEntry.summary },
+    };
+  }
+
+  const completedSummary = await runPull();
+  return {
+    status: 200,
+    body: { ...completedSummary },
+  };
+}

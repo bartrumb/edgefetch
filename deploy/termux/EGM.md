@@ -8,7 +8,7 @@ Provides a turnkey shell installer (`install-termux-agent.sh`) that provisions a
 
 - `[install-termux-agent.sh:EDGEFETCH_HUB_URL]`: Required environment variable specifying the target EdgeFetch Hub endpoint URL; exported into `$HOME/.config/edgefetch/agent.env`.
 - `[install-termux-agent.sh:EDGEFETCH_AGENT_TOKEN]`: Required environment variable specifying the shared or site-scoped agent authentication secret; exported into `$HOME/.config/edgefetch/agent.env`.
-- `[install-termux-agent.sh:EDGEFETCH_VERSION]`: Optional environment variable (assigned to `VERSION`, default `2.5.3`) selecting the GitHub release tag (`v${VERSION}`) to download.
+- `[install-termux-agent.sh:EDGEFETCH_VERSION]`: Optional environment variable (assigned to `VERSION`, default `2.6.0`) selecting the GitHub release tag (`v${VERSION}`) to download.
 - `[install-termux-agent.sh:EDGEFETCH_SITE_ID]`: Optional environment variable (assigned to `SITE_ID`, default `android-termux-1`) identifying the worker node; exported into `$HOME/.config/edgefetch/agent.env`.
 - `[install-termux-agent.sh:PREFIX]`: Termux runtime prefix environment variable used to locate `BIN_DIR="$PREFIX/bin"` and invoked in `$HOME/.termux/boot/start-edgefetch.sh`.
 - `[install-termux-agent.sh:sq_escape]`: Internal shell helper function that single-quotes strings and escapes embedded single quotes before writing `export` statements to `agent.env`.

@@ -1,4 +1,11 @@
-import { defineAdapter } from '../../types';
+import {
+  attrHasTokenLinear,
+  defineAdapter,
+  findAllElementInnersLinear,
+  findAllOpenTagsLinear,
+  findElementInnerLinear,
+  getAttrValueLinear,
+} from '../../types';
 import { decodeBasicEntities, detectFenceLang, extractBalancedDivAt, safeFence, stripTagsInline } from '../../utils';
 
 export default defineAdapter({
@@ -11,28 +18,32 @@ export default defineAdapter({
   extractHtml({ parts, rawHtml, baseUrl, htmlToMd }) {
     if (parts.length < 2) return null;
     const desc = stripTagsInline(
-      /<div\b[^>]*\bgist-content\b[\s\S]{0,1200}?<div\b[^>]*itemprop=["']about["'][^>]*>([\s\S]*?)<\/div>/i.exec(rawHtml)?.[1] ?? '',
+      findElementInnerLinear(rawHtml, 'div', (a) => getAttrValueLinear(a, 'itemprop') === 'about') ?? '',
     );
-    const titleRaw = stripTagsInline(/<title>([\s\S]*?)<\/title>/i.exec(rawHtml)?.[1] ?? '')
+    const titleRaw = stripTagsInline(findElementInnerLinear(rawHtml, 'title') ?? '')
       .replace(/\s*·\s*GitHub\s*$/i, '')
       .trim();
     const files: string[] = [];
 
-    const fileBoxRe = /<div\b[^>]*\bclass=["'][^"']*\bfile\b[^"']*["'][^>]*>/gi;
-    let fm: RegExpExecArray | null;
-    while ((fm = fileBoxRe.exec(rawHtml)) !== null && files.length < 20) {
+    const fileBoxes = findAllOpenTagsLinear(rawHtml, 'div', (a) => attrHasTokenLinear(a, 'class', 'file'), 20);
+    for (const fm of fileBoxes) {
       const box = extractBalancedDivAt(rawHtml, fm.index);
       if (!box) continue;
-      const name = stripTagsInline(/<strong\b[^>]*\bgist-blob-name\b[^>]*>([\s\S]*?)<\/strong>/i.exec(box)?.[1] ?? '');
+      const name = stripTagsInline(
+        findElementInnerLinear(box, 'strong', (a) => attrHasTokenLinear(a, 'class', 'gist-blob-name')) ?? '',
+      );
       if (!name) continue;
-      const mdArticle = /<article\b[^>]*\bmarkdown-body\b[^>]*>([\s\S]*?)<\/article>/i.exec(box);
+      const mdArticle = findElementInnerLinear(box, 'article', (a) => attrHasTokenLinear(a, 'class', 'markdown-body'));
       if (mdArticle) {
-        files.push(`## ${name}\n\n${htmlToMd(mdArticle[1]!, baseUrl).markdown.trim()}`);
+        files.push(`## ${name}\n\n${htmlToMd(mdArticle, baseUrl).markdown.trim()}`);
         continue;
       }
-      const codeLines = [...box.matchAll(/<td\b[^>]*\bblob-code-inner\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) =>
-        decodeBasicEntities(m[1]!.replace(/<[^>]+>/g, '')),
-      );
+      const codeLines = findAllElementInnersLinear(
+        box,
+        'td',
+        (a) => attrHasTokenLinear(a, 'class', 'blob-code-inner'),
+        5000,
+      ).map((inner) => decodeBasicEntities(stripTagsInline(inner)));
       if (codeLines.length > 0) {
         const { lang } = detectFenceLang(name);
         files.push(`## ${name}\n\n${safeFence(codeLines.join('\n'), lang)}`);

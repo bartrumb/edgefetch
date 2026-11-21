@@ -13,9 +13,9 @@ jobs:
     name: Go Vet, Staticcheck, Govulncheck, Race Detector & Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: '1.27.x'
           cache: true
@@ -78,8 +78,8 @@ jobs:
       run:
         working-directory: hub
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: 'npm'
@@ -100,8 +100,8 @@ jobs:
     name: Verify Multi-Arch Distroless Builds (amd64 & arm64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build server, all-in-one & HAOS add-on images + live AppArmor, Dumpable & UID-isolation smoke tests
         run: |
           docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile .
@@ -127,7 +127,7 @@ jobs:
             curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
             sleep 0.5
           done
-          # Verify PID 1 AppArmor label (`enforce`), dropped UID 65532, NoNewPrivs=1, and PR_SET_DUMPABLE=0 (`/proc/<pid>/environ` owned by `0:0`)!
+          # Verify PID 1 AppArmor label (`enforce`), dropped UID 65532, NoNewPrivs=1, and PR_SET_DUMPABLE=0 (`/proc/<pid>/environ` unreadable by UID 65532)!
           ef_pid=$(docker inspect -f '{{.State.Pid}}' ef-smoke)
           ef_attr=$(sudo cat "/proc/${ef_pid}/attr/current")
           ef_status=$(sudo grep -E '^(Uid|Gid|NoNewPrivs):' "/proc/${ef_pid}/status")
@@ -138,9 +138,19 @@ jobs:
           echo "${ef_status}" | grep -Eq '^Uid:[[:space:]]+65532([[:space:]]+65532){3}$'
           echo "${ef_status}" | grep -Eq '^NoNewPrivs:[[:space:]]+1$'
           test "${ef_env_owner}" = "0:0"
-          # Verify LockDownSecretPaths locked /data (0700) and /data/options.json (0600) so UID 65532 cannot read it!
-          if docker exec -u 65532:65532 ef-smoke /usr/bin/pdftotext /data/options.json - 2>/dev/null; then
-            echo "SECURITY FAILURE: UID 65532 was able to access /data/options.json!"
+          if sudo -u '#65532' cat "/proc/${ef_pid}/environ" >/dev/null 2>&1; then
+            echo "ERROR: environ readable by 65532"
+            exit 1
+          fi
+          if sudo -u '#65532' cat "/proc/${ef_pid}/task/${ef_pid}/environ" >/dev/null 2>&1; then
+            echo "ERROR: task environ readable by 65532"
+            exit 1
+          fi
+          # Verify LockDownSecretPaths locked /data (0700 0:0) and /data/options.json (0600 0:0) so UID 65532 cannot read it!
+          test "$(sudo stat -c '%a %u:%g' /tmp/ef-ha-data)" = "700 0:0"
+          test "$(sudo stat -c '%a %u:%g' /tmp/ef-ha-data/options.json)" = "600 0:0"
+          if sudo -u '#65532' cat /tmp/ef-ha-data/options.json >/dev/null 2>&1; then
+            echo "SECURITY FAILURE: UID 65532 was able to read /data/options.json!"
             exit 1
           fi
           resp=$(curl -fsS -H "Authorization: Bearer ci-smoke-token-0123456789abcdef" \
@@ -167,8 +177,8 @@ jobs:
             sleep 0.5
           done
           curl -fsS -H "Authorization: Bearer ci-aio-caller-token-0123456789abcdef" http://127.0.0.1:18787/agents | grep -q '"local-fat-1"'
-          hub_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/cmdline; do if tr "\0" " " < "$f" 2>/dev/null | grep -q "portable-server.mjs"; then echo "${f%/cmdline}" | cut -d/ -f3; break; fi; done')
-          agent_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/cmdline; do if tr "\0" " " < "$f" 2>/dev/null | grep -q -- "--mode=agent"; then echo "${f%/cmdline}" | cut -d/ -f3; break; fi; done')
+          hub_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/cmdline; do p="${f%/cmdline}"; p="${p#/proc/}"; [ "$p" = "$$" ] && continue; argv0=$(tr "\0" "\n" < "$f" 2>/dev/null | sed -n "1p"); argv1=$(tr "\0" "\n" < "$f" 2>/dev/null | sed -n "2p"); case "$argv0:$argv1" in *node*:*portable-server.mjs*) echo "$p"; break ;; esac; done')
+          agent_pid=$(docker exec ef-aio-smoke sh -c 'for f in /proc/[0-9]*/cmdline; do p="${f%/cmdline}"; p="${p#/proc/}"; [ "$p" = "$$" ] && continue; argv0=$(tr "\0" "\n" < "$f" 2>/dev/null | sed -n "1p"); case "$argv0" in */edgefetch|edgefetch) echo "$p"; break ;; esac; done')
           echo "=== ef-aio-smoke hub_pid=${hub_pid} agent_pid=${agent_pid} ==="
           if [ -z "${hub_pid}" ] || [ -z "${agent_pid}" ]; then exit 1; fi
           docker exec ef-aio-smoke grep -E '^(Uid|Gid|NoNewPrivs):' "/proc/${hub_pid}/status"

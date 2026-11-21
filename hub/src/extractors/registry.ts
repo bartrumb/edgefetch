@@ -156,6 +156,29 @@ const ALL_REGISTERED_ADAPTERS: SiteAdapter[] = (() => {
 
 const DEFAULT_INDEX = new AdapterRegistryIndex(ALL_REGISTERED_ADAPTERS);
 
+/** Go worker `classify.AcceptFor(KindText, ...)` strict MIME allowlist (`internal/classify/classify.go`). */
+export const GO_KIND_TEXT_ACCEPT_ALLOWLIST = new Set([
+  'text/html',
+  'text/markdown',
+  'text/x-markdown',
+  'application/xml',
+  'text/xml',
+  'application/rss+xml',
+  'application/atom+xml',
+  'application/json',
+  'text/calendar',
+  'text/plain',
+]);
+
+function normalizeTwinAcceptForGo(kind: string, rawAccept: string): string {
+  if (kind !== 'text') return rawAccept;
+  const trimmed = rawAccept.trim().toLowerCase();
+  if (GO_KIND_TEXT_ACCEPT_ALLOWLIST.has(trimmed)) return trimmed;
+  const primary = trimmed.split(',')[0]?.split(';')[0]?.trim() ?? '';
+  if (GO_KIND_TEXT_ACCEPT_ALLOWLIST.has(primary)) return primary;
+  return 'text/plain';
+}
+
 /** Validates that a twin target URL is strictly `https://` with no embedded credentials. */
 function isSafePublicTwinUrl(fetchUrl: string): boolean {
   try {
@@ -197,6 +220,7 @@ export function resolveSiteExtractorTwin(urlStr: string): SiteExtractorTwin | nu
       const rawFormat = twin.formatTwin;
       return {
         ...twin,
+        accept: normalizeTwinAcceptForGo(twin.kind, twin.accept),
         formatTwin: (rawBody, originalUrl, htmlToMd) => {
           const fmtRes = runAdapterSyncInBulkhead(
             adapter.id,

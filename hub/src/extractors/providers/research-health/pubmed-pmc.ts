@@ -75,7 +75,7 @@ export default defineAdapter({
         id: 'pmc-europepmc',
         fetchUrl: `https://www.ebi.ac.uk/europepmc/webservices/rest/${pmcid}/fullTextXML`,
         kind: 'text',
-        accept: 'application/xml, text/xml',
+        accept: 'application/xml',
         formatTwin: (rawXml) => {
           const title = stripTagsInline(findElementInnerLinear(rawXml, 'article-title') ?? '');
           if (!title) return null;

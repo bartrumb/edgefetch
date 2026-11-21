@@ -6,6 +6,7 @@ import test from 'node:test';
 import {
   applyPostFetchSiteExtractor,
   getRawRegisteredSiteAdapters,
+  GO_KIND_TEXT_ACCEPT_ALLOWLIST,
   listRegisteredAdapters,
   resolveSiteExtractorTwin,
 } from '../src/extractors/registry.ts';
@@ -53,6 +54,20 @@ test('ADAPTER-1: Registry catalog integrity, unique IDs, categories & SSRF https
     assert.ok(entry.exampleUrls.length >= 1, `missing exampleUrls on ${entry.id}`);
     for (const ex of entry.exampleUrls) {
       assert.ok(ex.startsWith('https://'), `exampleUrl on ${entry.id} must use https://: ${ex}`);
+      const twin = resolveSiteExtractorTwin(ex);
+      if (twin?.kind === 'text') {
+        assert.ok(
+          GO_KIND_TEXT_ACCEPT_ALLOWLIST.has(twin.accept),
+          `twin ${twin.id} (${ex}) kind="text" accept="${twin.accept}" violates Go classify.AcceptFor allowlist`,
+        );
+      }
+      const ats = resolveAtsPreFetchSpec(ex);
+      if (ats?.kind === 'text') {
+        assert.ok(
+          GO_KIND_TEXT_ACCEPT_ALLOWLIST.has(ats.accept),
+          `ats ${ats.id} (${ex}) kind="text" accept="${ats.accept}" violates Go classify.AcceptFor allowlist`,
+        );
+      }
     }
   }
 

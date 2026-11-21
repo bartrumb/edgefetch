@@ -19,7 +19,7 @@ export default defineAdapter({
       id: 'jazzhr',
       fetchUrl: `https://app.jazz.co/feeds/export/jobs/${encodeURIComponent(org)}`,
       kind: 'text',
-      accept: 'application/xml, text/xml',
+      accept: 'application/xml',
       formatTwin: (rawBody) => {
         if (!/<jobs\b|<job\b/i.test(rawBody)) return null;
         const jobBlocks = findAllElementInnersLinear(rawBody, 'job', undefined, 500);

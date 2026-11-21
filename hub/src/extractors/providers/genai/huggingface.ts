@@ -36,7 +36,7 @@ export default defineAdapter({
         id: 'huggingface-card',
         fetchUrl: `https://huggingface.co/${repoPrefix}/raw/${encodeURIComponent(rev)}/README.md`,
         kind: 'text',
-        accept: 'text/markdown, text/plain;q=0.9',
+        accept: 'text/markdown',
         formatTwin: (rawBody) => {
           if (!rawBody.trim() || /^\s*<!doctype\s+html|^\s*<html/i.test(rawBody)) return null;
           return formatYamlFrontmatterCard(rawBody, repoPrefix);

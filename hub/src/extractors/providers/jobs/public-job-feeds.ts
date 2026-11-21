@@ -42,7 +42,7 @@ export default defineAdapter({
         id: 'weworkremotely-feed',
         fetchUrl: fetchTarget,
         kind: 'text',
-        accept: 'application/rss+xml, application/xml, text/xml',
+        accept: 'application/rss+xml',
         formatTwin: (rawXml) => {
           if (!/<rss\b|<channel\b/i.test(rawXml)) return null;
           const items = findAllElementInnersLinear(rawXml, 'item', undefined, 200);

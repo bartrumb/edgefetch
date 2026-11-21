@@ -1470,7 +1470,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
       fetchUrl: urlStr,
       method: 'GET',
       kind: 'text',
-      accept: 'application/rss+xml, application/xml, text/xml',
+      accept: 'application/rss+xml',
       format: (rawBody) => {
         const records = parsePublicJobFeedRecords('weworkremotely', rawBody);
         if (records.length === 0) return null;

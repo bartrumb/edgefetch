@@ -1,23 +1,24 @@
 # Hub Build & Developer Scripts (`hub/scripts`)
 
 ## Overview
-Node.js ESM developer and CI scripts for bundling the standalone portable Hub server (`build-portable.mjs`), scaffolding new site extraction adapters (`new-adapter.mjs`), and compiling and running the Node + `workerd` test suites (`run-tests.mjs`).
+Node.js ESM developer and CI scripts for bundling the standalone portable Hub server (`build-portable.mjs`), scaffolding declarative YAML or TypeScript site extraction adapters (`new-adapter.mjs`), live-testing/recording and fuzzing site adapters (`test-adapter.mjs`), and compiling and running the Node + `workerd` test suites (`run-tests.mjs`).
 
 ## Interface
-- `node scripts/build-portable.mjs` (`npm run build:portable`) — CLI entrypoint taking no arguments that bundles `portable/portable-server.ts` into `dist/portable-server.mjs` `[build-portable.mjs:buildSync]`.
-- `node scripts/new-adapter.mjs <category>/<slug>` (`npm run adapter:new <category>/<slug>`) — CLI entrypoint reading `process.argv[2]` to scaffold a provider adapter, JSON test fixture, and barrel registration `[new-adapter.mjs:rawArg]`.
-- `node scripts/run-tests.mjs` (`npm test`) — CLI entrypoint taking no arguments that bundles TypeScript test suites and the `workerd` harness with `esbuild`, then executes `node --test --test-force-exit` with `EDGEFETCH_WORKERD_BUNDLE` and `EDGEFETCH_HUB_ROOT` `[run-tests.mjs:execFileSync]`.
+- `node scripts/build-portable.mjs` (`npm run build:portable`) — Bundles `portable/portable-server.ts` into `dist/portable-server.mjs` with `.sql`/`.yaml`/`.yml` text asset loaders and an ESM `createRequire` shim `[build-portable.mjs:buildSync]`.
+- `node scripts/new-adapter.mjs <category>/<slug> [--html | --ts]` (`npm run adapter:new`) — Scaffolds either a shared Go+TS declarative YAML manifest (`internal/extract/manifests/<slug>.yaml`) by default or a TypeScript `parseHtmlDoc` / `resolveTwin` provider (`--html` / `--ts`) plus `test/fixtures/adapters/<slug>.json` `[new-adapter.mjs:rawArg]`.
+- `node scripts/test-adapter.mjs [<adapter-id>] [<https://url>] [--record]` (`npm run adapter:test`) — Validates adapter metadata & Go `Accept` allowlist compliance, executes JSON fixtures, runs 6 adversarial `100 KB+` linear-time bulkhead fuzz payloads per adapter (`<= 120 ms` cap), and optionally performs a `robots.txt`-checked live preview + `--record` fixture capture `[test-adapter.mjs:MAX_FUZZ_MS_PER_PAYLOAD]`.
+- `node scripts/run-tests.mjs` (`npm test`) — Bundles TypeScript test suites and the `workerd` harness with `esbuild` (`.sql`/`.yaml`/`.yml` text loaders), then executes `node --test --test-force-exit` `[run-tests.mjs:execFileSync]`.
 
 ## Invariants
-- `build-portable.mjs` bundles for Node 22 ESM (`platform: 'node'`, `target: 'node22'`, `format: 'esm'`, `bundle: true`), aliases `'cloudflare:workers'` to `'./portable/cloudflare-shim.ts'`, loads `'.sql'` files as `'text'`, and marks `'node:*'` external `[build-portable.mjs:buildSync]`.
-- `new-adapter.mjs` requires a non-empty `process.argv[2]` containing `'/'`, `category` in `VALID_CATEGORIES` (`'developer'`, `'genai'`, `'jobs'`, `'finance'`, `'public-records'`, `'research-health'`, `'commerce-social'`), `slug` matching `/^[a-z0-9][a-z0-9-]{1,48}$/`, and non-existence of `src/extractors/providers/<category>/<slug>.ts` before writing any files `[new-adapter.mjs:rawArg]` `[new-adapter.mjs:VALID_CATEGORIES]` `[new-adapter.mjs:slug]` `[new-adapter.mjs:existsSync]`.
-- `new-adapter.mjs` barrel registration in `src/extractors/providers/index.ts` is idempotent if `importStmt` already exists and requires exact marker `'export const BUILTIN_SITE_ADAPTERS: readonly SiteAdapter[] = ['` plus trailing `/\n\];\s*$/` `[new-adapter.mjs:barrelSrc]`.
-- `run-tests.mjs` compiles `test/hub.test.ts`, `test/adapters.test.ts`, `test/agent-advanced.test.ts`, and `test/security-audit.test.ts` with `'cloudflare:workers'` aliased to `'./test/cloudflare-workers-stub.ts'` and `'.sql'` loaded as `'text'`, compiles `test/workerd-harness-entry.ts` as neutral ESM (`conditions: ['workerd', 'worker', 'browser']`, `external: ['cloudflare:workers', 'node:*']`), and removes its temporary build directory inside `finally` `[run-tests.mjs:buildSync]` `[run-tests.mjs:rmSync]`.
+- `build-portable.mjs`, `test-adapter.mjs`, and all 5 `buildSync` targets in `run-tests.mjs` register `.yaml` and `.yml` as `text` loaders so shared declarative YAML manifests bundle into both Node ESM and `workerd` (`platform: 'neutral'`) without filesystem reads `[build-portable.mjs:buildSync]` `[run-tests.mjs:textAssetLoaders]`.
+- `new-adapter.mjs` validates `category` against `VALID_CATEGORIES` and `slug` against `/^[a-z0-9][a-z0-9-]{1,48}$/`, refusing to overwrite existing manifests or `.ts` adapters `[new-adapter.mjs:VALID_CATEGORIES]`.
+- `test-adapter.mjs` enforces `createSafeOutboundFetch` + `fetchOverflowRobots` (`Content-Signal: ai-input` and path rules) before any live HTTP request and wraps adapter calls in `runAdapterSyncInBulkhead` `[test-adapter.mjs:checkPoliteRobots]`.
 
 ## Side Effects
-- `build-portable.mjs` creates `dist/` (`mkdirSync`) and writes `dist/portable-server.mjs` `[build-portable.mjs:mkdirSync]` `[build-portable.mjs:buildSync]`.
-- `new-adapter.mjs` creates `src/extractors/providers/<category>/` and `test/fixtures/adapters/`, writes `src/extractors/providers/<category>/<slug>.ts` and `test/fixtures/adapters/<slug>.json`, mutates `src/extractors/providers/index.ts`, or writes errors to `stderr` and exits with code `1` on validation failure `[new-adapter.mjs:mkdirSync]` `[new-adapter.mjs:writeFileSync]` `[new-adapter.mjs:process.exit]`.
-- `run-tests.mjs` creates `<os.tmpdir()>/edgefetch-hub-test-*`, writes compiled `.mjs` test and `workerd` bundles, spawns `process.execPath --test --test-force-exit` synchronously with `stdio: 'inherit'`, and deletes the temporary directory on exit `[run-tests.mjs:mkdtempSync]` `[run-tests.mjs:buildSync]` `[run-tests.mjs:execFileSync]` `[run-tests.mjs:rmSync]`.
+- `build-portable.mjs` writes `dist/portable-server.mjs`.
+- `new-adapter.mjs` writes `internal/extract/manifests/<slug>.yaml` + updates `src/extractors/declarative.ts` (default) or writes `src/extractors/providers/<category>/<slug>.ts` + updates `src/extractors/providers/index.ts` (`--html`/`--ts`), plus `test/fixtures/adapters/<slug>.json`.
+- `test-adapter.mjs` compiles a temporary bundle in `os.tmpdir()` (cleaned up in `finally`), optionally makes polite HTTPS requests when `<https://url>` is given, and writes `test/fixtures/adapters/<id>.json` when `--record` is set.
+- `run-tests.mjs` compiles test bundles into `os.tmpdir()`, runs `node --test`, and removes the temp directory on exit.
 
 ## Verification
-- Run: `npm --prefix hub test`
+- Run: `npm --prefix hub run adapter:test && npm --prefix hub test`

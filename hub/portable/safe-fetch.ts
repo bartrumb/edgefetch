@@ -190,6 +190,7 @@ export function createPublicOnlyLookup(resolver: LookupResolverFn = dns.lookup):
 }
 
 export const DEFAULT_SAFE_FETCH_TIMEOUT_MS = 30_000;
+export const MAX_SAFE_FETCH_TIMEOUT_MS = 60_000;
 export const MAX_SAFE_FETCH_RESPONSE_BYTES = 32 * 1024 * 1024; // 32 MiB hard streamed response ceiling
 
 export interface SafeOutboundFetchOptions {
@@ -258,12 +259,12 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         const h = new Headers(init.headers);
         h.forEach((v, k) => {
           const lower = k.trim().toLowerCase();
-          // Strip caller-supplied Host/:authority overrides so `headers: { host: 'evil.internal' }` can never spoof Host.
-          if (lower === 'host' || lower === ':authority') return;
+          // Strip caller-supplied Host/:authority and content-length so exact byte length is always computed from `bodyBytes`.
+          if (lower === 'host' || lower === ':authority' || lower === 'content-length') return;
           hdrObj[lower] = v;
         });
       }
-      if (bodyBytes && hdrObj['content-length'] === undefined) {
+      if (bodyBytes !== null) {
         hdrObj['content-length'] = String(bodyBytes.byteLength);
       }
 
@@ -458,13 +459,13 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         return;
       }
 
-      // Guard against infinite 1xx informational response loops: permit at most two 103 Early Hints,
-      // and immediately destroy/reject on any other 1xx (100/102/199) or > 2 informational frames.
-      let info103Count = 0;
+      // Guard against infinite 1xx informational response loops: permit HTTP 100 Continue and 103 Early Hints
+      // up to 3 total informational frames, and immediately destroy/reject on any other 1xx (102/199) or > 3 frames.
+      let infoCount = 0;
       req.on('information', (info) => {
         const code = info?.statusCode ?? 0;
-        if (code === 103 && info103Count < 2) {
-          info103Count += 1;
+        if ((code === 100 || code === 103) && infoCount < 3) {
+          infoCount += 1;
           return;
         }
         const err = new Error(`Disallowed HTTP ${code} informational response`);
@@ -544,13 +545,20 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
     const redirectMode = init?.redirect ?? 'manual';
     let currentHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
     currentHeaders.delete('host');
+    currentHeaders.delete('content-length');
 
+    // Respect caller-provided `AbortSignal` up to `MAX_SAFE_FETCH_TIMEOUT_MS` (`60_000ms`, e.g. `45s` LLM timeouts),
+    // while keeping `defaultTimeoutMs` (`30_000ms` or explicit `opts.defaultTimeoutMs`) when caller omits `init.signal`.
+    const effectiveTimeoutMs =
+      init?.signal && opts.defaultTimeoutMs === undefined
+        ? Math.max(defaultTimeoutMs, MAX_SAFE_FETCH_TIMEOUT_MS)
+        : defaultTimeoutMs;
     const timeoutCtrl = new AbortController();
     const timeoutTimer = setTimeout(() => {
-      const err = new Error(`Outbound request timed out after ${defaultTimeoutMs}ms`);
+      const err = new Error(`Outbound request timed out after ${effectiveTimeoutMs}ms`);
       err.name = 'TimeoutError';
       timeoutCtrl.abort(err);
-    }, defaultTimeoutMs);
+    }, effectiveTimeoutMs);
     timeoutTimer.unref?.();
     const clearRequestTimer = () => clearTimeout(timeoutTimer);
     const effectiveSignal = init?.signal ? AbortSignal.any([init.signal, timeoutCtrl.signal]) : timeoutCtrl.signal;

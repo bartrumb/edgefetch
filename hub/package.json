@@ -1,12 +1,14 @@
 {
   "name": "edgefetch-hub",
-  "version": "2.6.1",
+  "version": "2.6.2",
   "private": true,
+  "license": "FSL-1.1-MIT",
   "description": "Cloudflare Hibernating WebSocket Durable Object coordinator, /admin Control Center, and Self-Hosted OAuth 2.1 /mcp server for EdgeFetch.",
   "scripts": {
     "type-check": "tsc --noEmit -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
     "adapter:new": "node scripts/new-adapter.mjs",
+    "adapter:test": "node scripts/test-adapter.mjs",
     "build:portable": "node scripts/build-portable.mjs",
     "start:portable": "node scripts/build-portable.mjs && node dist/portable-server.mjs",
     "deploy:dry": "wrangler deploy --dry-run -c wrangler.toml --env=\"\" && wrangler deploy --dry-run -c wrangler.toml -e production",
@@ -24,9 +26,16 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260804.1",
+    "@types/ws": "8.18.2",
     "esbuild": "^0.28.2",
     "miniflare": "5.20261117.0-beta",
     "typescript": "^5.8.3",
     "wrangler": "^4.164.0"
+  },
+  "dependencies": {
+    "htmlparser2": "12.0.0",
+    "re2js": "2.10.0",
+    "ws": "8.23.0",
+    "yaml": "2.9.1"
   }
 }

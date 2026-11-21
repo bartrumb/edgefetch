@@ -1827,6 +1827,11 @@ export function chunkJsonRecords(params: {
             if (c.op === '!=') return val.toLowerCase() !== c.value.toLowerCase();
             const safeRe = compileSafeUserRegex(c.value, 'i');
             if (!safeRe) {
+              // Fail closed if caller supplied regex metacharacters that were rejected as unsafe/malformed;
+              // keep case-insensitive substring fallback only for plain keyword tokens (e.g. "Senior").
+              if (/[\\^$.*+?()[\]{}|]/.test(c.value) || c.value.length > 256) {
+                return false;
+              }
               return val.toLowerCase().includes(c.value.toLowerCase());
             }
             return safeRe.test(val.length > 2048 ? val.slice(0, 2048) : val);
@@ -2057,7 +2062,8 @@ function hasOwnProp(obj: Record<string, unknown>, key: string): boolean {
   return !X402_FORBIDDEN_KEYS.has(key) && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
-const DECEPTIVE_402_TOKEN_RE = /(?:free|ok2fetch|freetrial)/i;
+const DECEPTIVE_402_TOKEN_RE = /(?:\b(?:gratis|free|trial|complimentary)\b|free|gratis|complimentary|ok2fetch|freetrial)/i;
+const ZERO_VALUE_402_PRICE_RE = /^[$€£]?\s*0+(?:\.0+)?(?:\b|\s|$)/;
 
 /**
  * Strips ANSI CSI/OSC escape sequences, ASCII C0/C1 control characters, CR/LF newlines, DEL, zero-width / soft-hyphen,
@@ -2220,19 +2226,27 @@ function formatAtomicAmountDecimalString(atomicDigits: string, decimals: number)
 function validateX402StandalonePrice(raw: unknown, fallbackCurrency?: string): string | undefined {
   let s: string;
   if (typeof raw === 'number') {
-    if (!Number.isFinite(raw) || raw < 0 || raw > 999_999_999_999 || String(raw).includes('e') || String(raw).includes('E')) {
+    if (!Number.isFinite(raw) || raw <= 0 || raw > 999_999_999_999 || String(raw).includes('e') || String(raw).includes('E')) {
       return undefined;
     }
-    s = String(raw === 0 ? 0 : raw);
+    s = String(raw);
   } else if (typeof raw === 'string') {
-    if (/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(raw) || DECEPTIVE_402_TOKEN_RE.test(raw)) {
+    if (
+      /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(raw) ||
+      DECEPTIVE_402_TOKEN_RE.test(raw) ||
+      ZERO_VALUE_402_PRICE_RE.test(raw.trim())
+    ) {
       return undefined;
     }
     s = raw.trim().replace(/[ \t]+/g, ' ');
   } else {
     return undefined;
   }
-  if (!/^\$?\d{1,12}(?:\.\d{1,8})?(?: [A-Z0-9]{2,10})?$/.test(s) || DECEPTIVE_402_TOKEN_RE.test(s)) return undefined;
+  if (!/^\$?\d{1,12}(?:\.\d{1,8})?(?: [A-Z0-9]{2,10})?$/.test(s) || DECEPTIVE_402_TOKEN_RE.test(s) || ZERO_VALUE_402_PRICE_RE.test(s)) {
+    return undefined;
+  }
+  const numPart = /^\$?(\d{1,12}(?:\.\d{1,8})?)/.exec(s);
+  if (!numPart || !(Number(numPart[1]) > 0)) return undefined;
   if (s.startsWith('$') || / [A-Z0-9]{2,10}$/.test(s)) return s;
   if (fallbackCurrency && DECEPTIVE_402_TOKEN_RE.test(fallbackCurrency)) return undefined;
   const curRaw = (fallbackCurrency ?? 'USD').trim().toUpperCase();
@@ -2249,7 +2263,6 @@ function isKnownUsdcAsset(assetRaw: string): boolean {
 function formatX402PriceString(terms: X402PaymentTerms, sawDeceptiveCurrency = false): string | undefined {
   const assetRaw = typeof terms.asset === 'string' ? terms.asset.trim() : '';
   const currencyRaw = typeof terms.currency === 'string' ? terms.currency.trim() : '';
-  const extraObj = terms.extra && typeof terms.extra === 'object' ? terms.extra : undefined;
   const isUsdc = isKnownUsdcAsset(assetRaw) || (!assetRaw && isKnownUsdcAsset(currencyRaw));
   const rawLabel = isUsdc ? 'USDC' : assetRaw || currencyRaw;
   const assetLabel =
@@ -2259,40 +2272,33 @@ function formatX402PriceString(terms: X402PaymentTerms, sawDeceptiveCurrency = f
         ? rawLabel
         : '';
 
+  const normMax = normalizeX402AtomicAmount(terms.maxAmountRequired);
+  const normAmt = normalizeX402AtomicAmount(terms.amount);
+  const maxBig = normMax !== undefined ? BigInt(normMax) : null;
+  const amtBigCandidate = normAmt !== undefined ? BigInt(normAmt) : null;
   const validAmt =
-    normalizeX402AtomicAmount(terms.maxAmountRequired) ?? normalizeX402AtomicAmount(terms.amount);
+    maxBig !== null && maxBig > 0n
+      ? normMax
+      : amtBigCandidate !== null && amtBigCandidate > 0n
+        ? normAmt
+        : normMax ?? normAmt;
 
   if (validAmt !== undefined) {
     const amtBig = BigInt(validAmt);
-    // Whenever `maxAmountRequired` / `amount` is > 0n, ALWAYS compute `price` from atomic amount — NEVER allow free-text `price` override!
-    if (amtBig > 0n) {
-      if (isUsdc) {
-        // Force `decimals = 6` on USDC so `extra.decimals: 18` can NEVER understate a USDC price by 10^12!
-        const decStr = formatAtomicAmountDecimalString(validAmt, 6);
-        return `$${decStr} USDC`;
-      }
-      if (assetLabel.toUpperCase() === 'USD' && extraObj?.decimals === undefined) {
-        const decStr = formatAtomicAmountDecimalString(validAmt, 6);
-        return `$${decStr} USD`;
-      }
-      const d = extraObj?.decimals;
-      if (typeof d === 'number' && Number.isInteger(d) && d >= 0 && d <= 18) {
-        const decStr = formatAtomicAmountDecimalString(validAmt, d);
-        return assetLabel ? `${decStr} ${assetLabel}` : decStr;
-      }
-      return assetLabel ? `${validAmt} ${assetLabel}` : validAmt;
+    // Reject zero-value atomic amounts (`0` / `0n`) on HTTP 402 paywalls so zero/free claims are never classified as paid prices.
+    if (amtBig <= 0n) {
+      return undefined;
     }
-
-    // `amtBig === 0n`
-    if (!sawDeceptiveCurrency) {
-      const validZeroPrice = validateX402StandalonePrice(terms.price, currencyRaw || assetLabel);
-      if (validZeroPrice) return validZeroPrice;
+    if (isUsdc) {
+      // Force `decimals = 6` on USDC / `KNOWN_USDC_CONTRACTS` so `extra.decimals: 18` can NEVER understate a USDC price by 10^12!
+      const decStr = formatAtomicAmountDecimalString(validAmt, 6);
+      return `$${decStr} USDC`;
     }
-    if (isUsdc) return '$0 USDC';
-    return assetLabel ? `0 ${assetLabel}` : '0';
+    // For non-USDC assets, never divide `validAmt` by untrusted `extra.decimals` — explicitly label raw atomic units!
+    return assetLabel ? `${validAmt} atomic units (${assetLabel})` : `${validAmt} atomic units`;
   }
 
-  if (sawDeceptiveCurrency && typeof terms.price === 'string' && !terms.price.startsWith('$') && !/ [A-Z0-9]{2,10}$/.test(terms.price)) {
+  if (sawDeceptiveCurrency) {
     return undefined;
   }
   return validateX402StandalonePrice(terms.price, currencyRaw || assetLabel);
@@ -2480,7 +2486,13 @@ export function parseX402PaymentTerms(
     if (network) terms.network = network;
     if (payTo) terms.payTo = payTo;
     if (resource) terms.resource = resource;
-    if (description) terms.description = description;
+    if (description) {
+      if (DECEPTIVE_402_TOKEN_RE.test(description)) {
+        sawDeceptiveCurrency = true;
+      } else {
+        terms.description = description;
+      }
+    }
 
     // Shallow depth-1 allowlisted `extra` (`{ name?, version?, decimals? }`) — never copies `__proto__` or deep trees!
     const rawExtra = hasOwnProp(primary, 'extra') ? primary.extra : undefined;
@@ -2489,16 +2501,18 @@ export function parseX402PaymentTerms(
       const safeExtra: X402ExtraMetadata = {};
       const extraName = hasOwnProp(eo, 'name') ? sanitizeX402PlainField(eo.name, 256, false) : undefined;
       const extraVer = hasOwnProp(eo, 'version') ? sanitizeX402String(eo.version, 256) : undefined;
-      if (extraName) safeExtra.name = extraName;
+      if (extraName && !DECEPTIVE_402_TOKEN_RE.test(extraName)) safeExtra.name = extraName;
       if (extraVer) safeExtra.version = extraVer;
 
-      const effectiveIsUsdc = isKnownUsdcAsset(terms.asset ?? terms.currency ?? '');
-      if (hasOwnProp(eo, 'decimals') && typeof eo.decimals === 'number') {
+      const effectiveIsUsdc = isKnownUsdcAsset(assetRaw ?? currency ?? terms.asset ?? terms.currency ?? '');
+      if (hasOwnProp(eo, 'decimals') && typeof eo.decimals === 'number' && Number.isInteger(eo.decimals) && eo.decimals >= 0 && eo.decimals <= 18) {
         if (effectiveIsUsdc) {
           safeExtra.decimals = 6;
-        } else if (Number.isInteger(eo.decimals) && eo.decimals >= 0 && eo.decimals <= 18) {
-          safeExtra.decimals = eo.decimals;
+        } else if (eo.decimals === 0) {
+          safeExtra.decimals = 0;
         }
+      } else if (effectiveIsUsdc && hasOwnProp(eo, 'decimals') && typeof eo.decimals === 'number') {
+        safeExtra.decimals = 6;
       }
       if (Object.keys(safeExtra).length > 0) {
         terms.extra = safeExtra;
@@ -2556,7 +2570,10 @@ export function parseX402PaymentTerms(
         if (rs) terms.resource = rs;
       } else if (k === 'description' && !terms.description) {
         const ds = sanitizeX402PlainField(rawV, 256, false);
-        if (ds) terms.description = ds;
+        if (ds) {
+          if (DECEPTIVE_402_TOKEN_RE.test(ds)) sawDeceptiveCurrency = true;
+          else terms.description = ds;
+        }
       } else if (k === 'invoice') {
         const inv = sanitizeX402String(rawV, 256);
         if (inv) terms.invoice = inv;
@@ -3512,26 +3529,73 @@ function matchesGeoLocationsFilter(jobLocations: string[], geoFilters: string[])
   return geoFilters.some((gf) => matchesSingleGeoLocation(locStr, gf));
 }
 
-function matchesAllowedCompanyOrDomain(
+const COMPANY_CORPORATE_SUFFIXES = new Set([
+  'inc',
+  'incorporated',
+  'corp',
+  'corporation',
+  'llc',
+  'ltd',
+  'limited',
+  'co',
+  'company',
+  'hq',
+  'jobs',
+  'careers',
+  'global',
+  'labs',
+  'tech',
+  'technologies',
+  'group',
+  'holdings',
+]);
+
+function matchesCompanyCandidateAgainstToken(rawCandidate: string, tok: string): boolean {
+  if (!rawCandidate || !tok) return false;
+  const words: string[] = rawCandidate.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  if (words.length === 0) return false;
+  const clean = words.join('');
+  if (clean.length < 3) {
+    // Short 2-char company names (e.g. "f5") require exact canonical token equality — never substring ("st" in "stripe").
+    return clean.length >= 2 && clean === tok;
+  }
+  if (clean === tok) return true;
+  if (tok.length < 3) return false;
+  if (words.includes(tok)) return true;
+  // Adjacent hyphen/space-split words joining to `tok` (e.g. "Open AI" <-> "openai")
+  for (let i = 0; i + 1 < words.length; i++) {
+    if (words[i]! + words[i + 1]! === tok) return true;
+  }
+  // Canonical ATS board slug suffix (e.g. "stripehq", "stripejobs", "stripeinc") — never prefix "notstripe" or "striper"!
+  if (clean.startsWith(tok)) {
+    const suffix = clean.slice(tok.length);
+    if (COMPANY_CORPORATE_SUFFIXES.has(suffix)) return true;
+  }
+  return false;
+}
+
+export function matchesAllowedCompanyOrDomain(
   job: StructuredJobRecord,
   allowedTokens: Set<string>,
   allowedBoardPrefixes: string[],
 ): boolean {
   const urlLower = job.url.toLowerCase();
   if (allowedBoardPrefixes.some((p) => p && urlLower.startsWith(p))) return true;
-  const compClean = job.company.toLowerCase().replace(/[^a-z0-9]+/g, '');
-  const inferredClean = inferCompanyFromAtsUrl(job.url).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const inferred = inferCompanyFromAtsUrl(job.url);
   for (const tok of allowedTokens) {
     if (!tok) continue;
     if (
-      (compClean && (compClean.includes(tok) || tok.includes(compClean))) ||
-      (inferredClean && (inferredClean.includes(tok) || tok.includes(inferredClean)))
+      matchesCompanyCandidateAgainstToken(job.company, tok) ||
+      matchesCompanyCandidateAgainstToken(inferred, tok)
     ) {
       return true;
     }
   }
   return false;
 }
+
+export const MAX_JOBS_CONCURRENT_SCRAPES = 5;
+export const MAX_JOBS_TOTAL_SCRAPES = 40;
 
 /**
  * `Section 4`: One-call `jobs` sweep across Greenhouse, Ashby, Lever, Workday, Workable, Gem, Rippling, SmartRecruiters,
@@ -3544,7 +3608,43 @@ export async function executeJobsCall(params: {
   executeSearch: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeScrape: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
-  const { payload, executeSearch, executeScrape } = params;
+  const { payload, executeSearch } = params;
+  const rawExecuteScrape = params.executeScrape;
+
+  // Enforce hard `<= 5` concurrent scrapes and `<= 40` total scrapes per `executeJobsCall` across discovery, verify & boards.
+  let activeScrapes = 0;
+  let totalScrapesUsed = 0;
+  const scrapeWaitQueue: Array<() => void> = [];
+  const executeScrape = async (
+    args: Record<string, unknown>,
+  ): Promise<{ status: number; body: Record<string, unknown> }> => {
+    while (activeScrapes >= MAX_JOBS_CONCURRENT_SCRAPES) {
+      if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+        return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
+      }
+      await new Promise<void>((resolve) => scrapeWaitQueue.push(resolve));
+    }
+    if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+      while (scrapeWaitQueue.length > 0) {
+        scrapeWaitQueue.shift()?.();
+      }
+      return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
+    }
+    activeScrapes++;
+    totalScrapesUsed++;
+    try {
+      return await rawExecuteScrape(args);
+    } finally {
+      activeScrapes--;
+      if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+        while (scrapeWaitQueue.length > 0) {
+          scrapeWaitQueue.shift()?.();
+        }
+      } else {
+        scrapeWaitQueue.shift()?.();
+      }
+    }
+  };
 
   // Batch `verify` mode (`verify: [...]` or `mode: 'verify', urls: [...]`)
   const rawVerifyArray = Array.isArray(payload.verify)

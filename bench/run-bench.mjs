@@ -32,6 +32,13 @@ await build({
   platform: 'node',
   format: 'esm',
   target: 'node22',
+  banner: {
+    js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);",
+  },
+  loader: {
+    '.yaml': 'text',
+    '.yml': 'text',
+  },
   outfile,
   alias: {
     'cloudflare:workers': resolve(hubDir, 'test/cloudflare-workers-stub.ts'),
@@ -54,6 +61,13 @@ const { formatYamlFrontmatterCard } = await (async () => {
     platform: 'node',
     format: 'esm',
     target: 'node22',
+    banner: {
+      js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);",
+    },
+    loader: {
+      '.yaml': 'text',
+      '.yml': 'text',
+    },
     outfile: regOut,
   });
   return import(pathToFileURL(regOut).href);

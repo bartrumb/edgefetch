@@ -2,6 +2,30 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.6.2] - 2026-11-21
+
+### Security
+- **Round 5 Hub, Catalog, Sanitizer & Portable Closure (`R5-H1`..`R5-H4`, `R5-M1`..`R5-M5`, `SCRAPE_PIPELINE_VERSION = 29`):**
+  - **Bounded `catalog` memory, concurrency & pacing (`R5-H1`, `R5-M4`):** Wired `maxBytes: 16_777_216` through Hub fetch wrappers, enforced a `16 MiB` per-run in-memory retention cap (`32 MiB` global LRU across 8 runs, streaming full NDJSON to R2), capped concurrent async runs at `2` per caller, and bounded per-run pacing sleep budgets.
+  - **Linear Shopify image deduplication & code-fence headers (`R5-H2`, `R5-H3`):** Replaced quadratic `allImageUrls.includes(u)` in `normalizeShopifyProductRecord` with a `Set` (`<= 250` images/product) and capped code-fence info-string header cleaning at `512` chars (`hub/src/extractors/providers/commerce-social/shopify.ts`, `hub/src/scrape.ts`).
+  - **Multi-line CommonMark code-span, list-indented fence & residual `javascript:` sanitization (`R5-H4`, `R5-M2`, `R5-M3`):** Tracked cross-line unmatched backtick runs (`computeTickPoisonedLines`), closed indented fences on dedent in `splitMarkdownByCodeFences`, stripped residual nested-bracket/blockquote-reference `javascript:` destinations, stripped entry NUL bytes before sentinel stashing, and sanitized twin Markdown stored via `/v1/extract`.
+  - **Google RE2 Thompson NFA regex engine + per-IP Portable Hub slot cap (`R5-M1`, `R5-M5`):** Swapped `compileSafeUserRegex` execution onto `re2js` (plus rejecting optional groups before `$` like `(a*aaa*)?$`), replaced hand-rolled RFC 6455 frame parsing with `ws`, and added per-IP in-flight request slot limits + `100 Continue` / `Content-Length` / `Host` hardening in `hub/portable/*`.
+- **Round 5 Go Renderer, Crawler & CI Hardening (`R5-M6`..`R5-M8` + Lows):**
+  - **Zero-TCP `--remote-debugging-pipe` Chromium & `302` header stripping (`R5-M6`):** Launched Linux/macOS Chromium over inherited OS pipes (`--remote-debugging-pipe`, `0` listening TCP sockets on Chromium, `0700` `userDataDir`), updated `initialOrigin` on resumed `navigate` actions, stripped custom caller headers after cross-origin `302` redirects, tightened `:fatal:` sandbox failure classification, and logged `browser_sandbox_fallback` warnings.
+  - **Non-blocking session reconnect, quoted URL scrubbing & exact `1 MiB` `/robots.txt`:** Hoisted `dispatchCh` into `agent.Run` so WebSocket reconnects never block on slow in-flight jobs, scrubbed `strconv.Quote`'d URLs containing spaces/backslashes in `RedactEmbeddedURLs`, read `RobotsMaxBytes + 1` so exact-`1 MiB` `/robots.txt` files retain their final rule, and enforced a single `5s` non-retrying `/robots.txt` tarpit ceiling.
+  - **Enforced Vouch + DCO ruleset & `release` environment gates (`R5-M7`, `R5-M8`):** Switched `vouch.yml` to safe `pull_request_target` (`permissions: contents: read`, zero untrusted code execution), added `Verify Vouched Contributor & DCO Sign-Off` to `main`'s required status checks, and gated release container tag jobs on `environment: release`.
+
+### Added
+- **Shared Go + TypeScript Declarative YAML Site Adapters (`internal/extract/manifests/*.yaml`, `internal/extract/yaml_subset.go`, `hub/src/extractors/declarative.ts`):**
+  - Converted 10 pure API-twin site adapters (`rubygems`, `packagist`, `hex-pm`, `dev-to`, `huggingface`, `lobsters`, `doi-crossref`, `usaspending`, `polymarket`, `openrouter`) into `#`-commented YAML manifests (`maxAliasCount: 0` / `&` and `*` alias-bomb rejection).
+  - Embedded `manifests/*.yaml` into `edgefetch --mode=hub` via `//go:embed` (`0` Go dependencies added) and wired `ResolveDeclarativeTwin`, `GET /v1/extractors`, and MCP `find_extractors` into `internal/hub/hub.go` so the standalone pure-Go Hub natively runs site adapters with zero TypeScript runtime.
+- **Adapter Authoring Workbench & CSS-Selector HTML Engine (`hub/src/extractors/html-doc.ts`, `hub/scripts/test-adapter.mjs`, `hub/scripts/new-adapter.mjs`):**
+  - Added `parseHtmlDoc()` (`htmlparser2` WHATWG HTML5 DOM + linear CSS selectors: `select`, `first`, `text`, `html`, `attr`, `dlMap`, `tableRows`) and `compileLinearRegex()` (`re2js`), refactoring `icims` and `openfoodfacts`.
+  - Added `npm run adapter:test [<id>] [<https://url>] [--record]` for `robots.txt`-checked live previews, fixture recording, and 390-case `100 KB+` linear-time bulkhead fuzzing, plus `.yaml`-by-default scaffolding in `npm run adapter:new`.
+
+### Changed
+- **Dual-Boundary SaaS-Protective Hub Licensing (`LICENSE`, `hub/LICENSE`):** Kept the Go worker, CLI, `stdio` MCP, SDKs, and declarative YAML site manifests (`cmd/`, `internal/`, `sdk/`, `extensions/`) under `MIT`, while licensing the TypeScript Hub coordinator plane (`hub/`) under `FSL-1.1-MIT` (free to self-host personally or internally; prohibits competing third-party hosted SaaS; converts to `MIT` after 2 years).
+
 ## [2.6.1] - 2026-11-21
 
 ### Security

@@ -26,7 +26,7 @@ import (
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
 // Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/v2/internal/agent.Version=...".
-var Version = "2.6.1"
+var Version = "2.6.2"
 
 const (
 	DefaultPingInterval          = 30 * time.Second
@@ -170,6 +170,20 @@ func Run(
 		},
 	}
 
+	dispatchCh := make(chan controlMessage, 8)
+	var dispatchWG sync.WaitGroup
+	dispatchWG.Add(1)
+	go func() {
+		defer dispatchWG.Done()
+		for msg := range dispatchCh {
+			handleDispatchWithOpts(ctx, cfg, crawler, allow, replyClient, log, rtOpts, msg)
+		}
+	}()
+	defer func() {
+		close(dispatchCh)
+		dispatchWG.Wait()
+	}()
+
 	attempt := 0
 	lastErr := ""
 	for {
@@ -178,7 +192,7 @@ func Run(
 		}
 
 		connectedAt := time.Now()
-		err := runSession(ctx, cfg, crawler, allow, replyClient, log, rtOpts, attempt, lastErr)
+		err := runSession(ctx, cfg, crawler, allow, replyClient, log, rtOpts, attempt, lastErr, dispatchCh)
 		if ctx.Err() != nil {
 			log.Info("agent_exit", slog.String("reason", "context_cancelled"))
 			return nil
@@ -218,6 +232,7 @@ func runSession(
 	rtOpts RuntimeOpts,
 	reconnectAttempt int,
 	lastError string,
+	dispatchCh chan<- controlMessage,
 ) error {
 	caps := crawler.Capabilities()
 	bVer, bSandbox := crawler.BrowserInfo()
@@ -285,20 +300,9 @@ func runSession(
 		}
 	}()
 
-	dispatchCh := make(chan controlMessage, 8)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for msg := range dispatchCh {
-			handleDispatchWithOpts(ctx, cfg, crawler, allow, replyClient, log, rtOpts, msg)
-		}
-	}()
 	defer func() {
 		cancelSession()
 		_ = conn.CloseNow()
-		close(dispatchCh)
-		wg.Wait()
 	}()
 
 	for {

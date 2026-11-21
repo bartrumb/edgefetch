@@ -1,0 +1,63 @@
+# Shared Go + TypeScript Declarative Site Adapter: DEV Community (dev.to)
+id: dev-to
+name: DEV Community Articles (dev.to)
+category: commerce-social
+description: Upgrades dev.to/<author>/<slug> articles to dev.to/api/articles raw body_markdown.
+domains:
+  - dev.to
+  - www.dev.to
+exampleUrls:
+  - https://dev.to/gopher/writing-fuzz-tests
+
+# Matches /<author>/<slug> while skipping site-level navigation routes
+match:
+  exactSegments: true
+  pathSegments:
+    - param: author
+      charset: alnum_dash
+      reserved:
+        - t
+        - top
+        - latest
+        - pod
+        - videos
+        - tags
+        - search
+        - settings
+        - enter
+        - new
+        - about
+        - privacy
+        - terms
+    - param: slug
+      charset: alnum_dash
+
+twin:
+  fetchUrl: https://dev.to/api/articles/{author}/{slug}
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - title
+    - body_markdown
+  vars:
+    title:
+      paths: [title]
+      trim: true
+    desc:
+      paths: [description]
+      trim: true
+    author:
+      paths: [user.name]
+    publishedTime:
+      paths: [published_timestamp]
+    body:
+      paths: [body_markdown]
+      stripFrontmatter: true
+      trim: true
+  titleTemplate: "{title}"
+  descriptionVar: desc
+  authorVar: author
+  publishedTimeVar: publishedTime
+  bodyVar: body

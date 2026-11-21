@@ -1,0 +1,58 @@
+# Shared Go + TypeScript Declarative Site Adapter: Hex.pm Elixir & Erlang Registry
+id: hex-pm
+name: Hex.pm Elixir & Erlang Registry
+category: developer
+description: Upgrades hex.pm package pages to /api/packages/<pkg> metadata and HexDocs links.
+domains:
+  - hex.pm
+  - www.hex.pm
+exampleUrls:
+  - https://hex.pm/packages/phoenix
+
+match:
+  exactSegments: true
+  pathSegments:
+    - packages
+    - param: pkg
+      charset: alnum_dash
+
+twin:
+  fetchUrl: https://hex.pm/api/packages/{pkg}
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - name
+  vars:
+    name:
+      paths: [name]
+    desc:
+      paths: [meta.description]
+      trim: true
+    licenses:
+      paths: [meta.licenses]
+      join: ", "
+    ver:
+      paths: [releases.0.version]
+    verOrDefault:
+      paths: [releases.0.version]
+      default: "0.1"
+    docsUrl:
+      paths: [docs_html_url]
+      fallbackTemplate: https://hexdocs.pm/{name}
+  titleTemplate: "{name} {ver} (Hex)"
+  titleWhenVar: ver
+  titleFallbackTemplate: "{name} (Hex)"
+  descriptionVar: desc
+  introVar: desc
+  bullets:
+    - label: Mix
+      template: '`{:{name}, "~> {verOrDefault}"}`'
+    - label: HexDocs
+      template: "{docsUrl}"
+    - label: License
+      template: "{licenses}"
+      whenVar: licenses
+  # Appends `- **<Label>**: <https://...>` bullets from meta.links in wire order
+  objectLinksPath: meta.links

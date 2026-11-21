@@ -1,108 +1,133 @@
 # Writing & Contributing Site Adapters
 
-EdgeFetch ships a modular, zero-dependency **Site & ATS Adapter Library** (`hub/src/extractors/providers/`) covering **49+ keyless public platforms** across 7 categories.
+EdgeFetch ships a modular **Site, Commerce & ATS Adapter Library** covering **50+ keyless public platforms** across 7 categories, designed so contributors and coding agents can add a new platform in minutes with zero regex pitfalls.
 
-Every adapter lives in **one self-contained file** + **one JSON test fixture**, so contributors and coding agents can add a new site or job board in ~5 minutes with **zero merge conflicts** on core engine code.
+## 1. Two Authoring Tiers (Pick the Simplest One That Fits)
 
-> **Architecture Note (Zero Edge-Node Redeploys & Automatic Fail-Open):**
-> - **0% of site/ATS adapters are compiled into the Go edge worker binary.** Go edge nodes (`edgefetch`) are stateless HTTP/2, CDP, and PDF engines; all 49+ adapters live on the TypeScript Hub (`hub/src/extractors/providers/` and `hub/src/jobs.ts`). Updating or adding an adapter is a 3-second Hub deploy with **zero binary updates** across your Raspberry Pi / Home Assistant / VM fleet.
-> - **Fault-isolated fail-open fallback:** Every `resolveTwin()`, `formatTwin()`, and `extractHtml()` call runs inside an isolated `try / catch` bulkhead. If an upstream site changes a JSON key or DOM selector tomorrow, the adapter returns `null` and EdgeFetch **automatically falls back** to generic HTML / Schema.org JSON-LD / SSR Hydration / Headless CDP extraction instead of failing the request.
+1. **Tier 1 — Shared Zero-Code Declarative YAML Manifest (`internal/extract/manifests/<slug>.yaml`, Recommended for ~80% of Sites):**
+   - Best whenever a site exposes a public, `robots.txt`-allowed JSON or Markdown endpoint (e.g., `rubygems`, `packagist`, `hex-pm`, `dev-to`, `huggingface`, `lobsters`, `doi-crossref`, `usaspending`, `polymarket`, `openrouter`).
+   - Supports `#` comments, clean unquoted keys, zero trailing-comma errors, **zero code, zero regex ReDoS risk, zero `fetch()` escape, and zero YAML alias expansion (`maxAliasCount: 0`)**.
+   - **Runs in BOTH the pure-Go Hub (`edgefetch --mode=hub` via `//go:embed` with zero TypeScript runtime!) AND the Cloudflare / Node Hub.**
+2. **Tier 2 — TypeScript Adapter with `parseHtmlDoc()` CSS Selectors (`hub/src/extractors/providers/<category>/<slug>.ts`):**
+   - Best when `/api` is disallowed by `robots.txt` so extraction runs over public HTML (`openfoodfacts`, `icims`, `arxiv`, `clinicaltrials`), or when custom multi-endpoint enrichment is required (`shopify`, `woocommerce`, `sec-edgar`).
+   - Uses `parseHtmlDoc(rawHtml)` (`htmlparser2` WHATWG HTML5 DOM + linear CSS selectors: `doc.select('.job-card')`, `card.text('h3')`, `card.attr('a', 'href')`, `card.dlMap()`, `card.tableRows()`) and `compileLinearRegex()` (`re2js` Thompson NFA) inside a fault-isolated bulkhead (`runAdapterSyncInBulkhead`).
 
 ---
 
-## 1. Ground Rules (Enforced by CI & Registry Guards)
+## 2. Ground Rules (Enforced by `npm run adapter:test` & CI)
 
-1. **100% Keyless & Public Sources Only:**
-   - Built-in EdgeFetch adapters target **public, keyless APIs, feeds, registries, and structured HTML**.
-   - Never add commercial B2B enrichment wrappers that require paid seats or proprietary API keys (users who want commercial third-party providers can configure `FIRECRAWL_API_KEY`).
+1. **100% Keyless & Public Sources Only:** Target public APIs, feeds, registries, and structured HTML (no paid B2B API keys).
 2. **Strict `robots.txt` & Ethical Compliance:**
-   - **Always verify `/robots.txt` on the target host first.** For example, `api.smartrecruiters.com`, `export.arxiv.org`, `clinicaltrials.gov/api/`, and `world.openfoodfacts.org/api` disallow automated crawlers in `robots.txt`, whereas their public HTML pages (`/study/NCT...`, `/abs/...`, `/product/...`) are allowed — so those adapters use `extractHtml()` instead of `resolveTwin()`!
-   - Adapters **never** call `fetch()` directly. `resolveTwin()` returns a declarative `https://` URL that EdgeFetch executes through `executeHubFetch`, inheriting `robots.txt` checks, dial-time SSRF protection, per-host politeness, and OTLP tracing automatically.
-3. **No Anti-Bot Bypasses:**
-   - Never add CAPTCHA solvers, stealth fingerprint spoofing, or WAF workarounds.
+   - Adapters **never** call `fetch()` directly (`globalThis.fetch` throws `AdapterNetworkForbiddenError` inside the bulkhead).
+   - `npm run adapter:test <id> <https://url>` automatically checks `/robots.txt` (`RFC 9309` + `Content-Signal: ai-input`) and Go's `GO_KIND_TEXT_ACCEPT_ALLOWLIST` before testing live URLs.
+3. **Fail-Open Fallback:** Returning `null` from an adapter cleanly falls back to generic HTML / Schema.org JSON-LD / SSR Hydration / Headless CDP extraction.
 
 ---
 
-## 2. Directory Layout
+## 3. Quickstart Workflow (`adapter:new` + `adapter:test --record`)
 
-```text
-hub/src/extractors/
-├── types.ts                      # defineAdapter(), SiteAdapter, TwinMatchContext, HtmlExtractContext
-├── utils.ts                      # parseJsonObject, formatGfmTable, extractJsonLdObjects, safeFence, ...
-├── registry.ts                   # O(1) exact-domain Map + wildcard & universal-engine dispatcher
-└── providers/
-    ├── index.ts                  # Barrel registration list
-    ├── developer/                # npm, crates.io, PyPI, pkg.go.dev, NIST NVD, App Store, Google Play, ...
-    ├── genai/                    # Hugging Face, OpenRouter, Internet Archive
-    ├── jobs/                     # Workable, Greenhouse, Lever, Gem, Pinpoint, Rippling, Teamtailor, ...
-    ├── finance/                  # SEC EDGAR, Y Combinator / Work at a Startup, Polymarket
-    ├── public-records/           # Socrata SODA, CKAN (data.gov), ArcGIS REST, Legistar, USAspending
-    ├── research-health/          # PubMed/PMC, DOI/Crossref, OpenAlex, arXiv, ClinicalTrials, PubChem, openFDA
-    └── commerce-social/          # Shopify, Open Food Facts, Hacker News, Bluesky, Mastodon, Discourse, Reddit, ...
-```
-
-Live catalog inspection is available at **`GET /v1/extractors`** (and `GET /v1/extractors?category=jobs`).
-
----
-
-## 3. Quickstart: Add an Adapter in 3 Steps
-
-### Step 1 — Scaffold the Adapter & Fixture
+### Option A — Add a Shared Go + TS Declarative YAML Adapter (Zero Code)
 
 ```bash
 cd hub
-npm run adapter:new <category>/<slug>
-# Example:
-npm run adapter:new developer/deno-land
+npm run adapter:new developer/my-registry
 ```
 
-This single command:
-1. Creates `hub/src/extractors/providers/developer/deno-land.ts`
-2. Creates `hub/test/fixtures/adapters/deno-land.json`
-3. Registers `denoLand` in `hub/src/extractors/providers/index.ts`
+This creates `internal/extract/manifests/my-registry.yaml`, registers it in `hub/src/extractors/declarative.ts` (and embeds it into Go's `internal/extract` automatically), and creates `hub/test/fixtures/adapters/my-registry.json`:
 
-### Step 2 — Choose `resolveTwin` vs. `extractHtml`
+```yaml
+# Shared Go + TypeScript Declarative Site Adapter: RubyGems Registry
+id: rubygems
+name: RubyGems Registry
+category: developer
+description: Upgrades rubygems.org gem pages to /api/v1/gems/<gem>.json metadata.
+domains:
+  - rubygems.org
+  - www.rubygems.org
+exampleUrls:
+  - https://rubygems.org/gems/rails
 
-- **Use `resolveTwin({ url, host, path, parts })`** when the site exposes an official, keyless, `robots.txt`-permitted JSON, Markdown, XML/RSS, or `.patch` endpoint (1 network hop total, zero HTML parsing overhead).
-- **Use `extractHtml({ url, host, path, parts, rawHtml, currentMd, htmlToMd })`** when the public JSON endpoint is disallowed by `robots.txt` (or doesn't exist), and the public HTML embeds structured JSON-LD (`extractJsonLdObjects`), SSR state, or clean DOM landmarks (`extractBalancedDivAt`).
+# Matches /gems/<gem> (allowing optional trailing version subpaths)
+match:
+  exactSegments: false
+  pathSegments:
+    - gems
+    - param: gem
+      charset: pkg
+      minLen: 1
+      maxLen: 80
+
+twin:
+  fetchUrl: https://rubygems.org/api/v1/gems/{gem}.json
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields: [name]
+  vars:
+    name:
+      paths: [name]
+    version:
+      paths: [version]
+    info:
+      paths: [info]
+      trim: true
+  titleTemplate: "{name} {version} (RubyGem)"
+  titleWhenVar: version
+  titleFallbackTemplate: "{name} (RubyGem)"
+  introVar: info
+  bullets:
+    - label: Install
+      template: "`gem install {name}`"
+    - label: Version
+      template: "`{version}`"
+      whenVar: version
+```
+
+### Option B — Add an HTML Adapter Using `parseHtmlDoc()` CSS Selectors
+
+```bash
+cd hub
+npm run adapter:new jobs/my-board --html
+```
 
 ```ts
 import { defineAdapter } from '../../types';
-import { formatGfmTable, parseJsonObject } from '../../utils';
+import { formatGfmTable, parseHtmlDoc } from '../../utils';
 
 export default defineAdapter({
-  id: 'my-provider',
-  name: 'My Public Registry',
-  category: 'developer',
-  description: 'Upgrades example.org item pages to clean public JSON metadata.',
-  domains: ['example.org', 'www.example.org'], // supports '*.example.org' subdomains too
-  exampleUrls: ['https://example.org/pkg/demo'],
-  resolveTwin({ parts }) {
-    if (parts[0] !== 'pkg' || !parts[1]) return null;
+  id: 'my-board',
+  name: 'My Job Board',
+  category: 'jobs',
+  description: 'Extracts structured job cards using WHATWG HTML5 CSS selectors.',
+  domains: ['jobs.example.org'],
+  exampleUrls: ['https://jobs.example.org/openings'],
+  extractHtml({ rawHtml }) {
+    const doc = parseHtmlDoc(rawHtml);
+    const rows: string[][] = [];
+    for (const card of doc.select('.job-card', 50)) {
+      const title = card.text('h3, h2');
+      const href = card.attrOf('a[href*="/jobs/"]', 'href') ?? '';
+      const meta = card.dlMap(); // pairs <dt> -> <dd> cleanly
+      if (title) rows.push([href ? `[${title}](${href})` : title, meta['location'] ?? '-']);
+    }
+    if (rows.length === 0) return null;
     return {
-      id: 'my-provider',
-      fetchUrl: `https://example.org/api/v1/pkg/${encodeURIComponent(parts[1])}.json`,
-      kind: 'json',
-      accept: 'application/json',
-      formatTwin: (rawBody) => {
-        const data = parseJsonObject(rawBody);
-        if (!data || typeof data.name !== 'string') return null;
-        return {
-          title: data.name,
-          markdown: `# ${data.name}\n\n${String(data.summary ?? '')}`,
-        };
-      },
+      extractorId: 'my-board',
+      title: doc.text('h1') || 'Open Roles',
+      markdown: formatGfmTable(['Role', 'Location'], rows),
     };
   },
 });
 ```
 
-### Step 3 — Update Your JSON Fixture & Run Tests
-
-Edit `hub/test/fixtures/adapters/<slug>.json` with a realistic sample URL, mock API/HTML payload, and expected Markdown substrings. `hub/test/adapters.test.ts` **automatically discovers and runs every `.json` file** in `hub/test/fixtures/adapters/`!
+### Test Live, Auto-Record Fixture & Fuzz in 1 Command
 
 ```bash
 cd hub
-npm run type-check
-npm test
+# Polite live test (verifies /robots.txt + Content-Signal, previews Markdown & token savings, and writes fixture JSON):
+npm run adapter:test rubygems https://rubygems.org/gems/rails --record
+
+# Run offline schema validation + fixture checks + 100 KB linear-time bulkhead fuzzer across all adapters:
+npm run adapter:test
 ```

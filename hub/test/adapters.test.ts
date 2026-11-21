@@ -567,3 +567,45 @@ test('ADAPTER-7: Podcast & HN Hardening — Fault-isolated adapter bulkhead + In
   assert.ok(!/[\u{E0000}-\u{E007F}\u202A-\u202E]/u.test(doc.markdown));
 });
 
+test('ADAPTER-8: Vetted DevEx Stack — parseHtmlDoc (htmlparser2), compileLinearRegex (re2js) & Shared Go+TS Declarative Manifests', async () => {
+  const { parseHtmlDoc, compileLinearRegex } = await import('../src/extractors/utils.ts');
+  const { DECLARATIVE_SITE_ADAPTERS } = await import('../src/extractors/declarative.ts');
+
+  // 1. At least 10 shared Go+TS declarative manifests compiled cleanly
+  assert.ok(DECLARATIVE_SITE_ADAPTERS.length >= 10, `expected >= 10 declarative adapters, got ${DECLARATIVE_SITE_ADAPTERS.length}`);
+  const rubyTwin = resolveSiteExtractorTwin('https://rubygems.org/gems/rails');
+  assert.equal(rubyTwin?.id, 'rubygems');
+  assert.equal(rubyTwin?.fetchUrl, 'https://rubygems.org/api/v1/gems/rails.json');
+
+  // 2. `parseHtmlDoc` handles nested divs, CSS combinators, dlMap, and tableRows without regexes
+  const sampleHtml = `<!doctype html><html><body>
+    <div id="panel_ingredients_content"><div>Water, <span>Organic Oats</span></div></div>
+    <div class="job-list">
+      <div class="row iCIMS_JobCardItem">
+        <a class="iCIMS_Anchor" href="/jobs/42/staff-rust-engineer"><h3>Staff Rust Engineer</h3></a>
+        <dl><dt>Job Locations:</dt><dd>US-Remote</dd><dt>Base Pay</dt><dd>$220,000</dd></dl>
+      </div>
+    </div>
+    <table><tr><th>Tier</th><th>Footprint</th></tr><tr><td>Lite</td><td>8 MB</td></tr></table>
+  </body></html>`;
+  const hdoc = parseHtmlDoc(sampleHtml);
+  assert.equal(hdoc.text('#panel_ingredients_content'), 'Water, Organic Oats');
+  const cards = hdoc.select('.job-list > .iCIMS_JobCardItem');
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0]?.text('h3, h2'), 'Staff Rust Engineer');
+  assert.equal(cards[0]?.attrOf('a.iCIMS_Anchor', 'href'), '/jobs/42/staff-rust-engineer');
+  assert.deepEqual(cards[0]?.dlMap(), { 'job locations': 'US-Remote', 'base pay': '$220,000' });
+  assert.deepEqual(hdoc.tableRows('table'), [
+    ['Tier', 'Footprint'],
+    ['Lite', '8 MB'],
+  ]);
+
+  // 3. `compileLinearRegex` executes classic exponential backtracking pattern `(a+)+$` in guaranteed O(N) time via re2js
+  const linRe = compileLinearRegex('(a+)+$');
+  assert.ok(linRe, 're2js must compile (a+)+$ into a linear automaton');
+  const t0 = performance.now();
+  assert.equal(linRe.test(`${'a'.repeat(5_000)}!`), false);
+  assert.ok(performance.now() - t0 < 50, 're2js Thompson NFA must evaluate 5,000-char non-matching subject in <50ms');
+});
+
+

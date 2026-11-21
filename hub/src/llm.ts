@@ -315,14 +315,13 @@ export function redactLlmConfigForLog(cfg: ResolvedLlmConfig | null): Record<str
   if (!safeBaseUrl.startsWith('workers-ai://')) {
     try {
       const u = new URL(safeBaseUrl);
-      if (u.username || u.password) {
-        u.username = '';
-        u.password = '';
-        const serialized = u.toString();
-        safeBaseUrl = !u.search && !u.hash ? trimTrailingSlashes(serialized) : serialized;
-      }
+      u.username = '';
+      u.password = '';
+      u.search = '';
+      u.hash = '';
+      safeBaseUrl = trimTrailingSlashes(u.toString());
     } catch {
-      safeBaseUrl = safeBaseUrl.replace(/^(https?:\/\/)[^/@\s]+@/i, '$1');
+      safeBaseUrl = safeBaseUrl.replace(/^(https?:\/\/)[^/@\s]+@/i, '$1').replace(/[?#].*$/, '');
     }
   }
   return {

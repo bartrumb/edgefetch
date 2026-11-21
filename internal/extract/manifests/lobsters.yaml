@@ -1,0 +1,84 @@
+# Shared Go + TypeScript Declarative Site Adapter: Lobste.rs Stories
+id: lobsters
+name: Lobste.rs Computing Stories
+category: commerce-social
+description: Upgrades lobste.rs/s/<id> story pages to their .json feed with nested plain-text comments.
+domains:
+  - lobste.rs
+exampleUrls:
+  - https://lobste.rs/s/abc123/zero_alloc_go_parsers
+
+match:
+  exactSegments: false
+  pathSegments:
+    - s
+    - param: shortId
+      charset: alnum
+      minLen: 4
+      maxLen: 12
+
+twin:
+  fetchUrl: https://lobste.rs/s/{shortId}.json
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - title
+  vars:
+    title:
+      paths: [title]
+      trim: true
+    storyUrl:
+      paths: [url]
+    score:
+      paths: [score]
+      default: "0"
+    user:
+      paths: [submitter_user]
+    created:
+      paths: [created_at]
+    tags:
+      paths: [tags]
+      itemWrap: "`"
+      join: ", "
+    descPlain:
+      paths: [description_plain]
+      trim: true
+  titleTemplate: "{title}"
+  authorVar: user
+  publishedTimeVar: created
+  metaLine:
+    - label: Score
+      template: "{score}"
+    - label: By
+      template: "@{user}"
+      whenVar: user
+    - label: Tags
+      template: "{tags}"
+      whenVar: tags
+    - label: Link
+      template: "{storyUrl}"
+      whenVar: storyUrl
+  introVar: descPlain
+  sections:
+    - heading: Comments
+      listArrayPath: comments
+      limit: 40
+      indentField: indent_level
+      indentOffset: -1
+      maxIndent: 6
+      itemTemplate: "**@{user}** ({score} pts): {body}"
+      requireItemVar: body
+      itemVars:
+        user:
+          paths: [commenting_user]
+          default: user
+        score:
+          paths: [score]
+          default: "0"
+        body:
+          paths: [comment_plain]
+          trim: true
+  linksVars:
+    - storyUrl

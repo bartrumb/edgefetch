@@ -766,3 +766,154 @@ func TestBurstDispatchConcurrencyCrossDomainGapAndKeepaliveDrain(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionReconnectDoesNotBlockOnInFlightDispatch(t *testing.T) {
+	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		select {
+		case <-time.After(1600 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte("<html>slow-origin-ok</html>"))
+	}))
+	defer originSrv.Close()
+	originAddr := originSrv.Listener.Addr().String()
+
+	tr := &http.Transport{
+		TLSClientConfig: originSrv.Client().Transport.(*http.Transport).TLSClientConfig,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
+		},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	crawler := crawl.NewCrawler(tr, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	crawler.Jitter = func(time.Duration) time.Duration { return 250 * time.Millisecond }
+
+	var (
+		mu              sync.Mutex
+		dropAt          time.Time
+		reconnectedAt   time.Time
+		wsSessionCount  int
+		secondConnected = make(chan struct{})
+		replyCh         = make(chan crawl.FetchReply, 1)
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/agent/ws", func(w http.ResponseWriter, r *http.Request) {
+		sc, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer sc.CloseNow()
+
+		mu.Lock()
+		wsSessionCount++
+		sessNum := wsSessionCount
+		if sessNum == 2 {
+			reconnectedAt = time.Now()
+			close(secondConnected)
+		}
+		mu.Unlock()
+
+		for {
+			_, data, err := sc.Read(r.Context())
+			if err != nil {
+				return
+			}
+			s := string(data)
+			if s == "ping" {
+				_ = sc.Write(r.Context(), websocket.MessageText, []byte("pong"))
+				continue
+			}
+			if sessNum == 1 && strings.Contains(s, `"agent_hello"`) {
+				rawDispatch, _ := json.Marshal(map[string]any{
+					"type":     "dispatch",
+					"jobId":    "job-inflight-drop",
+					"jobNonce": "nonce-inflight-drop",
+					"call": crawl.FetchCall{
+						Requests: []crawl.Request{{ID: "slow", URL: "https://slow.example.com/page", Kind: classify.KindPage}},
+						Options:  crawl.Options{IncludeBody: true, TimeoutMs: 5000},
+					},
+				})
+				_ = sc.Write(r.Context(), websocket.MessageText, rawDispatch)
+				time.Sleep(150 * time.Millisecond)
+				mu.Lock()
+				dropAt = time.Now()
+				mu.Unlock()
+				return // Drop first WebSocket while 1.6s origin request is still in flight!
+			}
+		}
+	})
+	mux.HandleFunc("/agent/reply", func(w http.ResponseWriter, r *http.Request) {
+		gz, err := gzip.NewReader(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer gz.Close()
+		var rep crawl.FetchReply
+		if err := json.NewDecoder(gz).Decode(&rep); err == nil {
+			select {
+			case replyCh <- rep:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	hubSrv := httptest.NewServer(mux)
+	defer hubSrv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := Config{
+		HubURL:     hubSrv.URL,
+		AgentToken: "agent-secret-token-0123456789-abcdef",
+		SiteID:     "site-r5",
+		UserAgent:  crawl.DefaultUserAgent,
+		PauseMs:    1000,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, cfg, crawler, crawl.PublicHTTPS, http.DefaultTransport, log, RuntimeOpts{
+			PingInterval:  50 * time.Millisecond,
+			ReadWatchdog:  time.Second,
+			ShutdownDrain: 500 * time.Millisecond,
+		})
+	}()
+
+	select {
+	case <-secondConnected:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for immediate WebSocket reconnect while job was in flight")
+	}
+
+	mu.Lock()
+	reconnectGap := reconnectedAt.Sub(dropAt)
+	mu.Unlock()
+	if reconnectGap > 900*time.Millisecond {
+		t.Fatalf("expected WebSocket reconnect (<900ms) without waiting for 1.6s in-flight job, took %s", reconnectGap)
+	}
+
+	var got crawl.FetchReply
+	select {
+	case got = <-replyCh:
+	case <-ctx.Done():
+		t.Fatal("in-flight job never uploaded /agent/reply after socket reconnect")
+	}
+	if len(got.Results) != 1 || got.Results[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected in-flight job reply OutcomeOK, got %+v", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+}

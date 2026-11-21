@@ -26,7 +26,7 @@ const (
 	RobotsCacheTTL          = 24 * time.Hour
 	RobotsDistressTTL       = 60 * time.Second
 	RobotsMaxBytes          = 1 << 20 // 1 MiB (>= 500 KiB minimum required by RFC 9309 §2.5; closes 520 KiB padding bypass).
-	RobotsTimeout           = 10 * time.Second
+	RobotsTimeout           = 5 * time.Second
 	MaxCrawlDelay           = 30 * time.Second
 )
 

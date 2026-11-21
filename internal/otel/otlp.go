@@ -220,7 +220,7 @@ func NewExporterFromEnv(getenv func(string) string, defaultService, version stri
 		svc = "edgefetch-go"
 	}
 	if version == "" {
-		version = "2.6.1"
+		version = "2.6.2"
 	}
 	var client *http.Client
 	if tracesURL != "" {

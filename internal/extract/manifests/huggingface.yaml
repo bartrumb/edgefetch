@@ -1,0 +1,128 @@
+# Shared Go + TypeScript Declarative Site Adapter: Hugging Face Hub
+id: huggingface
+name: Hugging Face Models, Datasets & Spaces
+category: genai
+description: Upgrades Hugging Face model/dataset/space pages and file blobs to raw README.md with parsed YAML frontmatter tables.
+domains:
+  - huggingface.co
+  - www.huggingface.co
+exampleUrls:
+  - https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct
+
+routes:
+  # 1. Dataset & Space cards (/datasets/<org>/<repo> and /spaces/<org>/<repo>[/tree/<rev>])
+  - match:
+      anyOf:
+        - exactSegments: true
+          pathSegments:
+            - param: repoType
+              allowValues: [datasets, spaces]
+            - param: org
+              charset: pkg
+            - param: repo
+              charset: pkg
+          defaults:
+            rev: main
+        - exactSegments: true
+          pathSegments:
+            - param: repoType
+              allowValues: [datasets, spaces]
+            - param: org
+              charset: pkg
+            - param: repo
+              charset: pkg
+            - tree
+            - param: rev
+              charset: pkg
+    twin:
+      id: huggingface-card
+      fetchUrl: https://huggingface.co/{repoType}/{org}/{repo}/raw/{rev}/README.md
+      kind: text
+      accept: text/markdown
+    extract:
+      textMode: yaml_frontmatter_card
+      titleTemplate: "{repoType}/{org}/{repo}"
+
+  # 2. Model cards (/<org>/<repo>[/tree/<rev>])
+  - match:
+      anyOf:
+        - exactSegments: true
+          pathSegments:
+            - param: org
+              charset: pkg
+              reserved: [models, datasets, spaces, docs, blog, papers, posts, tasks, organizations, settings, login, join, pricing]
+            - param: repo
+              charset: pkg
+          defaults:
+            rev: main
+        - exactSegments: true
+          pathSegments:
+            - param: org
+              charset: pkg
+              reserved: [models, datasets, spaces, docs, blog, papers, posts, tasks, organizations, settings, login, join, pricing]
+            - param: repo
+              charset: pkg
+            - tree
+            - param: rev
+              charset: pkg
+    twin:
+      id: huggingface-card
+      fetchUrl: https://huggingface.co/{org}/{repo}/raw/{rev}/README.md
+      kind: text
+      accept: text/markdown
+    extract:
+      textMode: yaml_frontmatter_card
+      titleTemplate: "{org}/{repo}"
+
+  # 3. Dataset & Space file blobs (/datasets|spaces/<org>/<repo>/blob/<rev>/<filePath...>)
+  - match:
+      pathSegments:
+        - param: repoType
+          allowValues: [datasets, spaces]
+        - param: org
+          charset: pkg
+        - param: repo
+          charset: pkg
+        - blob
+        - param: rev
+          charset: pkg
+        - param: filePath
+          charset: safe_subpath
+          greedy: true
+          maxLen: 240
+    twin:
+      id: huggingface-blob
+      fetchUrl: https://huggingface.co/{repoType}/{org}/{repo}/raw/{rev}/{filePath}
+      rawPathParams: [filePath]
+      kind: text
+      accept: text/plain
+    extract:
+      textMode: code_or_markdown_by_path
+      pathParam: filePath
+      titleTemplate: "{repoType}/{org}/{repo}/{filePath}"
+
+  # 4. Model file blobs (/<org>/<repo>/blob/<rev>/<filePath...>)
+  - match:
+      pathSegments:
+        - param: org
+          charset: pkg
+          reserved: [models, datasets, spaces, docs, blog, papers, posts, tasks, organizations, settings, login, join, pricing]
+        - param: repo
+          charset: pkg
+        - blob
+        - param: rev
+          charset: pkg
+        - param: filePath
+          charset: safe_subpath
+          greedy: true
+          maxLen: 240
+    twin:
+      id: huggingface-blob
+      fetchUrl: https://huggingface.co/{org}/{repo}/raw/{rev}/{filePath}
+      rawPathParams: [filePath]
+      kind: text
+      accept: text/plain
+    extract:
+      textMode: code_or_markdown_by_path
+      pathParam: filePath
+      titleTemplate: "{org}/{repo}/{filePath}"

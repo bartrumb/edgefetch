@@ -1,0 +1,64 @@
+# Shared Go + TypeScript Declarative Site Adapter: JazzHR Career Boards (applytojob.com)
+id: jazzhr
+name: "JazzHR Career Boards (applytojob.com)"
+category: jobs
+description: "Upgrades <org>.applytojob.com boards to app.jazz.co/feeds/export/jobs/<org> XML export (which includes full job descriptions and returns clean 404 on invalid slugs)."
+domains:
+  - "*.applytojob.com"
+exampleUrls:
+  - "https://acme.applytojob.com/apply"
+
+# Matches board root (/) or /apply on <org>.applytojob.com
+match:
+  hostSubdomain:
+    suffix: .applytojob.com
+    param: org
+    reserved:
+      - www
+      - app
+  maxSegments: 1
+
+twin:
+  id: jazzhr
+  fetchUrl: "https://app.jazz.co/feeds/export/jobs/{org}"
+  kind: text
+  accept: application/xml
+
+extract:
+  xml:
+    mode: items_table
+    requireAnyTags:
+      - jobs
+      - job
+    itemTag: job
+    titleTemplate: "{org} — JazzHR Job Board ({itemCount} open roles)"
+    emptyText: "No open positions currently listed."
+    limit: 100
+    requireItemVar: jTitle
+    collectLinkVar: jUrl
+    itemVars:
+      jTitle:
+        tags: [title]
+      jUrl:
+        tags: [url]
+      dept:
+        tags: [department]
+        default: "-"
+      city:
+        tags: [city]
+      state:
+        tags: [state]
+      country:
+        tags: [country]
+      jType:
+        tags: [type]
+        default: "-"
+    columns:
+      - header: Role
+        template: "[{jTitle}]({jUrl})"
+      - header: Department
+        template: "{dept}"
+      - header: Location
+        template: "{city} {state} {country}"
+      - header: Type
+        template: "{jType}"

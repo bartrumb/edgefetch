@@ -1,0 +1,956 @@
+# Shared Go + TypeScript Declarative Site Adapter: Public Open Job Feeds
+# Note: remotive.com is intentionally excluded because remotive.com/robots.txt disallows /api/remote-jobs.
+id: public-job-feeds
+name: "Public Open Job Feeds (WWR, Himalayas, Working Nomads, The Muse, Jobicy, Arbeitnow & RemoteOK)"
+category: jobs
+description: "Formats robots.txt-allowed keyless public job feeds (We Work Remotely RSS, Himalayas, Working Nomads, The Muse, Jobicy, Arbeitnow, and RemoteOK) into clean job tables."
+domains:
+  - weworkremotely.com
+  - www.weworkremotely.com
+  - himalayas.app
+  - www.himalayas.app
+  - www.workingnomads.com
+  - workingnomads.com
+  - www.themuse.com
+  - themuse.com
+  - jobicy.com
+  - www.arbeitnow.com
+  - arbeitnow.com
+  - remoteok.com
+exampleUrls:
+  - "https://weworkremotely.com/remote-jobs.rss"
+  - "https://himalayas.app/jobs/api?limit=50"
+  - "https://www.workingnomads.com/api/exposed_jobs/"
+  - "https://www.themuse.com/api/public/jobs?page=1"
+  - "https://jobicy.com/api/v2/remote-jobs?count=20"
+  - "https://www.arbeitnow.com/api/job-board-api"
+  - "https://remoteok.com/api"
+
+routes:
+  # 1a. We Work Remotely RSS (*.rss)
+  - match:
+      hosts:
+        - weworkremotely.com
+        - www.weworkremotely.com
+      pathSuffix: .rss
+    twin:
+      id: weworkremotely-feed
+      fetchUrl: "{requestUrl}"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags:
+          - rss
+          - channel
+        itemTag: item
+        titleTemplate: "We Work Remotely Jobs ({itemCount})"
+        limit: 50
+        collectLinkVar: jLink
+        emitTotals: true
+        itemVars:
+          company:
+            tags: [title]
+            splitColonPart: 0
+            default: "We Work Remotely"
+          role:
+            tags: [title]
+            splitColonPart: 1
+            default: Role
+          jLink:
+            tags: [link]
+          region:
+            tags: [region]
+            default: Remote
+          category:
+            tags: [category]
+            default: "-"
+          pubDate:
+            tags: [pubDate]
+          pubDisplay:
+            tags: [pubDate, category]
+            sliceMax: 16
+            default: "-"
+        recordFields:
+          title: "{role}"
+          company: "{company}"
+          url: "{jLink}"
+          region: "{region}"
+          category: "{category}"
+          postedAt: "{pubDate}"
+          source: weworkremotely
+        columns:
+          - header: Role
+            template: "[{role}]({jLink})"
+          - header: Company
+            template: "{company}"
+          - header: Region
+            template: "{region}"
+          - header: Published
+            template: "{pubDisplay}"
+
+  # 1b. We Work Remotely HTML board upgrade (/remote-jobs -> /remote-jobs.rss)
+  - match:
+      hosts:
+        - weworkremotely.com
+        - www.weworkremotely.com
+      pathEquals:
+        - /remote-jobs
+        - /remote-jobs/
+    twin:
+      id: weworkremotely-feed
+      fetchUrl: "https://weworkremotely.com/remote-jobs.rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags:
+          - rss
+          - channel
+        itemTag: item
+        titleTemplate: "We Work Remotely Jobs ({itemCount})"
+        limit: 50
+        collectLinkVar: jLink
+        emitTotals: true
+        itemVars:
+          company:
+            tags: [title]
+            splitColonPart: 0
+            default: "We Work Remotely"
+          role:
+            tags: [title]
+            splitColonPart: 1
+            default: Role
+          jLink:
+            tags: [link]
+          region:
+            tags: [region]
+            default: Remote
+          category:
+            tags: [category]
+            default: "-"
+          pubDate:
+            tags: [pubDate]
+          pubDisplay:
+            tags: [pubDate, category]
+            sliceMax: 16
+            default: "-"
+        recordFields:
+          title: "{role}"
+          company: "{company}"
+          url: "{jLink}"
+          region: "{region}"
+          category: "{category}"
+          postedAt: "{pubDate}"
+          source: weworkremotely
+        columns:
+          - header: Role
+            template: "[{role}]({jLink})"
+          - header: Company
+            template: "{company}"
+          - header: Region
+            template: "{region}"
+          - header: Published
+            template: "{pubDisplay}"
+
+  # 2a. Himalayas direct JSON API (/jobs/api?...)
+  - match:
+      hosts:
+        - himalayas.app
+        - www.himalayas.app
+      pathPrefix: /jobs/api
+    twin:
+      id: himalayas-feed
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+        totalFmt:
+          paths: [totalCount]
+          format: int_comma
+          fallbackTemplate: "{jobCount}"
+      requireVars:
+        - jobCount
+      titleTemplate: "Himalayas Remote Jobs ({jobCount} of {totalFmt})"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 50
+          emptyText: "No open positions currently listed."
+          paginationMeta:
+            totalPath: totalCount
+            cursorMode: offset
+          itemVars:
+            jTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            company:
+              paths: [companyName]
+              trim: true
+              default: "-"
+            appUrl:
+              paths: [applicationLink]
+              requireHttps: true
+            guidUrl:
+              paths: [guid]
+              requireHttps: true
+            jUrl:
+              template: "{appUrl}"
+              whenVars: [appUrl]
+              fallbackVar: guidUrl
+            locs:
+              paths: [locationRestrictions]
+              join: ", "
+              default: Worldwide
+            cur:
+              paths: [currency]
+              trim: true
+              default: USD
+            minSal:
+              paths: [minSalary]
+              format: int_comma
+              excludeEquals: "0"
+            maxSal:
+              paths: [maxSalary]
+              format: int_comma
+              excludeEquals: "0"
+            salRange:
+              template: "{cur} {minSal}–{maxSal}"
+              whenVars: [minSal, maxSal]
+            salMinOnly:
+              template: "{cur} {minSal}"
+              whenVars: [minSal]
+            sal:
+              template: "{salRange}"
+              whenVars: [salRange]
+              fallbackVar: salMinOnly
+              default: "-"
+            roleCell:
+              template: "[{jTitle}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - jUrl
+          recordFields:
+            title: "{jTitle}"
+            company: "{company}"
+            url: "{jUrl}"
+            locations: "{locs}"
+            salary: "{sal}"
+            source: himalayas
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Region
+              template: "{locs}"
+            - header: Salary
+              template: "{sal}"
+
+  # 2b. Himalayas HTML board upgrade (/jobs... -> /jobs/api?limit=50)
+  - match:
+      hosts:
+        - himalayas.app
+        - www.himalayas.app
+      pathPrefix: /jobs
+    twin:
+      id: himalayas-feed
+      fetchUrl: "https://himalayas.app/jobs/api?limit=50"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+        totalFmt:
+          paths: [totalCount]
+          format: int_comma
+          fallbackTemplate: "{jobCount}"
+      requireVars:
+        - jobCount
+      titleTemplate: "Himalayas Remote Jobs ({jobCount} of {totalFmt})"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 50
+          emptyText: "No open positions currently listed."
+          paginationMeta:
+            totalPath: totalCount
+            cursorMode: offset
+          itemVars:
+            jTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            company:
+              paths: [companyName]
+              trim: true
+              default: "-"
+            appUrl:
+              paths: [applicationLink]
+              requireHttps: true
+            guidUrl:
+              paths: [guid]
+              requireHttps: true
+            jUrl:
+              template: "{appUrl}"
+              whenVars: [appUrl]
+              fallbackVar: guidUrl
+            locs:
+              paths: [locationRestrictions]
+              join: ", "
+              default: Worldwide
+            cur:
+              paths: [currency]
+              trim: true
+              default: USD
+            minSal:
+              paths: [minSalary]
+              format: int_comma
+              excludeEquals: "0"
+            maxSal:
+              paths: [maxSalary]
+              format: int_comma
+              excludeEquals: "0"
+            salRange:
+              template: "{cur} {minSal}–{maxSal}"
+              whenVars: [minSal, maxSal]
+            salMinOnly:
+              template: "{cur} {minSal}"
+              whenVars: [minSal]
+            sal:
+              template: "{salRange}"
+              whenVars: [salRange]
+              fallbackVar: salMinOnly
+              default: "-"
+            roleCell:
+              template: "[{jTitle}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - jUrl
+          recordFields:
+            title: "{jTitle}"
+            company: "{company}"
+            url: "{jUrl}"
+            locations: "{locs}"
+            salary: "{sal}"
+            source: himalayas
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Region
+              template: "{locs}"
+            - header: Salary
+              template: "{sal}"
+
+  # 3a. Working Nomads direct JSON API (/api/exposed_jobs/...)
+  - match:
+      hosts:
+        - www.workingnomads.com
+        - workingnomads.com
+      pathPrefix: /api/exposed_jobs
+    twin:
+      id: workingnomads-feed
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: jobs
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+      requireVars:
+        - jobCount
+      titleTemplate: "Working Nomads Remote Jobs ({jobCount})"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 50
+          emptyText: "No open positions currently listed."
+          paginationMeta:
+            cursorMode: offset
+          itemVars:
+            jTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            company:
+              paths: [company_name]
+              trim: true
+              default: "-"
+            jUrl:
+              paths: [url]
+              requireHttps: true
+            loc:
+              paths: [location]
+              trim: true
+              default: Remote
+            pub:
+              paths: [pub_date]
+              sliceMax: 10
+              trim: true
+              default: "-"
+            roleCell:
+              template: "[{jTitle}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - jUrl
+          recordFields:
+            title: "{jTitle}"
+            company: "{company}"
+            url: "{jUrl}"
+            location: "{loc}"
+            postedAt: "{pub}"
+            source: workingnomads
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Location
+              template: "{loc}"
+            - header: Published
+              template: "{pub}"
+
+  # 3b. Working Nomads HTML board upgrade (/jobs -> /api/exposed_jobs/)
+  - match:
+      hosts:
+        - www.workingnomads.com
+        - workingnomads.com
+      pathEquals:
+        - /jobs
+        - /jobs/
+    twin:
+      id: workingnomads-feed
+      fetchUrl: "https://www.workingnomads.com/api/exposed_jobs/"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: jobs
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+      requireVars:
+        - jobCount
+      titleTemplate: "Working Nomads Remote Jobs ({jobCount})"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 50
+          emptyText: "No open positions currently listed."
+          paginationMeta:
+            cursorMode: offset
+          itemVars:
+            jTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            company:
+              paths: [company_name]
+              trim: true
+              default: "-"
+            jUrl:
+              paths: [url]
+              requireHttps: true
+            loc:
+              paths: [location]
+              trim: true
+              default: Remote
+            pub:
+              paths: [pub_date]
+              sliceMax: 10
+              trim: true
+              default: "-"
+            roleCell:
+              template: "[{jTitle}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - jUrl
+          recordFields:
+            title: "{jTitle}"
+            company: "{company}"
+            url: "{jUrl}"
+            location: "{loc}"
+            postedAt: "{pub}"
+            source: workingnomads
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Location
+              template: "{loc}"
+            - header: Published
+              template: "{pub}"
+
+  # 4. The Muse public jobs API (/api/public/jobs?...)
+  - match:
+      hosts:
+        - www.themuse.com
+        - themuse.com
+      pathPrefix: /api/public/jobs
+    twin:
+      id: themuse-feed
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        resCount:
+          paths: [results]
+          format: array_len
+        totalFmt:
+          paths: [total]
+          format: int_comma
+          fallbackTemplate: "{resCount}"
+      requireVars:
+        - resCount
+      titleTemplate: "The Muse Public Jobs ({resCount} of {totalFmt})"
+      sections:
+        - heading: ""
+          arrayPath: results
+          limit: 50
+          emptyText: "No open positions currently listed."
+          itemVars:
+            jTitle:
+              paths: [name]
+              trim: true
+              default: Role
+            co:
+              paths: [company.name]
+              trim: true
+              default: "-"
+            locs:
+              paths: [locations]
+              subField: name
+              join: "; "
+              default: "-"
+            lUrl:
+              paths: [refs.landing_page]
+              requireHttps: true
+            pub:
+              paths: [publication_date]
+              sliceMax: 10
+              trim: true
+              default: "-"
+            roleCell:
+              template: "[{jTitle}]({lUrl})"
+              whenVars: [lUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - lUrl
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{co}"
+            - header: Locations
+              template: "{locs}"
+            - header: Published
+              template: "{pub}"
+
+  # 5a. Jobicy direct JSON API (/api/v2/remote-jobs?...)
+  - match:
+      hosts:
+        - jobicy.com
+      pathPrefix: /api/v2/remote-jobs
+    twin:
+      id: jobicy-feed
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+      requireVars:
+        - jobCount
+      titleTemplate: "Jobicy Remote Jobs ({jobCount})"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 50
+          emptyText: "No open positions currently listed."
+          itemVars:
+            jTitle:
+              paths: [jobTitle]
+              format: strip_tags
+              trim: true
+              default: Role
+            jUrl:
+              paths: [url]
+              requireHttps: true
+            company:
+              paths: [companyName]
+              trim: true
+              default: "-"
+            geo:
+              paths: [jobGeo]
+              trim: true
+              default: Remote
+            cur:
+              paths: [salaryCurrency]
+              trim: true
+              default: USD
+            salMin:
+              paths: [annualSalaryMin]
+              excludeEquals: "0"
+            salMax:
+              paths: [annualSalaryMax]
+              excludeEquals: "0"
+            salRange:
+              template: "{cur} {salMin}–{salMax}"
+              whenVars: [salMin, salMax]
+            salMinOnly:
+              template: "{cur} {salMin}"
+              whenVars: [salMin]
+            sal:
+              template: "{salRange}"
+              whenVars: [salRange]
+              fallbackVar: salMinOnly
+              default: "-"
+            roleCell:
+              template: "[{jTitle}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Region
+              template: "{geo}"
+            - header: "Annual Salary"
+              template: "{sal}"
+
+  # 5b. Jobicy HTML/RSS board upgrade (/jobs-rss-feed or /remote-* -> /api/v2/remote-jobs?count=30)
+  - match:
+      anyOf:
+        - hosts:
+            - jobicy.com
+          pathEquals:
+            - /jobs-rss-feed
+            - /jobs-rss-feed/
+        - hosts:
+            - jobicy.com
+          pathPrefix: /remote-
+    twin:
+      id: jobicy-feed
+      fetchUrl: "https://jobicy.com/api/v2/remote-jobs?count=30"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+      requireVars:
+        - jobCount
+      titleTemplate: "Jobicy Remote Jobs ({jobCount})"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 50
+          emptyText: "No open positions currently listed."
+          itemVars:
+            jTitle:
+              paths: [jobTitle]
+              format: strip_tags
+              trim: true
+              default: Role
+            jUrl:
+              paths: [url]
+              requireHttps: true
+            company:
+              paths: [companyName]
+              trim: true
+              default: "-"
+            geo:
+              paths: [jobGeo]
+              trim: true
+              default: Remote
+            cur:
+              paths: [salaryCurrency]
+              trim: true
+              default: USD
+            salMin:
+              paths: [annualSalaryMin]
+              excludeEquals: "0"
+            salMax:
+              paths: [annualSalaryMax]
+              excludeEquals: "0"
+            salRange:
+              template: "{cur} {salMin}–{salMax}"
+              whenVars: [salMin, salMax]
+            salMinOnly:
+              template: "{cur} {salMin}"
+              whenVars: [salMin]
+            sal:
+              template: "{salRange}"
+              whenVars: [salRange]
+              fallbackVar: salMinOnly
+              default: "-"
+            roleCell:
+              template: "[{jTitle}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Region
+              template: "{geo}"
+            - header: "Annual Salary"
+              template: "{sal}"
+
+  # 6a. Arbeitnow direct JSON API (/api/job-board-api...)
+  - match:
+      hosts:
+        - www.arbeitnow.com
+        - arbeitnow.com
+      pathPrefix: /api/job-board-api
+    twin:
+      id: arbeitnow-feed
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        jobCount:
+          paths: [data]
+          format: array_len
+      requireVars:
+        - jobCount
+      titleTemplate: "Arbeitnow Job Feed ({jobCount})"
+      sections:
+        - heading: ""
+          arrayPath: data
+          limit: 50
+          emptyText: "No open positions currently listed."
+          itemVars:
+            jTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            jUrl:
+              paths: [url]
+              requireHttps: true
+            company:
+              paths: [company_name]
+              trim: true
+              default: "-"
+            loc:
+              paths: [location]
+              trim: true
+              default: "-"
+            wp:
+              paths: [remote]
+              format: bool_map
+              trueValue: Remote
+              falseValue: On-site
+            roleCell:
+              template: "[{jTitle}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Location
+              template: "{loc}"
+            - header: Workplace
+              template: "{wp}"
+
+  # 6b. Arbeitnow HTML board upgrade (/jobs -> /api/job-board-api)
+  - match:
+      hosts:
+        - www.arbeitnow.com
+        - arbeitnow.com
+      pathEquals:
+        - /jobs
+        - /jobs/
+    twin:
+      id: arbeitnow-feed
+      fetchUrl: "https://www.arbeitnow.com/api/job-board-api"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        jobCount:
+          paths: [data]
+          format: array_len
+      requireVars:
+        - jobCount
+      titleTemplate: "Arbeitnow Job Feed ({jobCount})"
+      sections:
+        - heading: ""
+          arrayPath: data
+          limit: 50
+          emptyText: "No open positions currently listed."
+          itemVars:
+            jTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            jUrl:
+              paths: [url]
+              requireHttps: true
+            company:
+              paths: [company_name]
+              trim: true
+              default: "-"
+            loc:
+              paths: [location]
+              trim: true
+              default: "-"
+            wp:
+              paths: [remote]
+              format: bool_map
+              trueValue: Remote
+              falseValue: On-site
+            roleCell:
+              template: "[{jTitle}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Location
+              template: "{loc}"
+            - header: Workplace
+              template: "{wp}"
+
+  # 7. RemoteOK (/api, /, or /remote-<catTag>-jobs -> skips index-0 legal notice via requireField: position)
+  - match:
+      anyOf:
+        - hosts:
+            - remoteok.com
+          pathSegments: []
+        - hosts:
+            - remoteok.com
+          pathSegments:
+            - api
+        - hosts:
+            - remoteok.com
+          pathPrefix: /remote-
+          pathSuffix: -jobs
+          pathSegments:
+            - param: catTag
+              charset: alnum_dash
+              stripPrefix: remote-
+              stripSuffix: -jobs
+              transform: lower
+        - hosts:
+            - remoteok.com
+          pathPrefix: /remote-
+          pathSuffix: -jobs/
+          pathSegments:
+            - param: catTag
+              charset: alnum_dash
+              stripPrefix: remote-
+              stripSuffix: -jobs
+              transform: lower
+    twin:
+      id: remoteok-feed
+      fetchUrl: "https://remoteok.com/api"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: jobs
+      vars:
+        rawCount:
+          paths: [jobs]
+          format: array_len
+        dedupCount:
+          default: "{dedupCount}"
+      requireVars:
+        - rawCount
+      titleTemplate: "RemoteOK Remote Jobs ({dedupCount})"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 50
+          emptyText: "No open positions currently listed."
+          filter:
+            requireField: position
+            tagFilterParam:
+              param: catTag
+              skipIfEquals: dev
+              tagsField: tags
+          itemVars:
+            pos:
+              paths: [position]
+              trim: true
+              default: Role
+            jUrl:
+              paths: [url]
+              requireHttps: true
+            company:
+              paths: [company]
+              trim: true
+              default: "-"
+            loc:
+              paths: [location]
+              trim: true
+              default: Remote
+            salMin:
+              paths: [salary_min]
+              excludeEquals: "0"
+            salMax:
+              paths: [salary_max]
+              excludeEquals: "0"
+            salRange:
+              template: "${salMin}–${salMax}"
+              whenVars: [salMin, salMax]
+            salMinOnly:
+              template: "${salMin}"
+              whenVars: [salMin]
+            sal:
+              template: "{salRange}"
+              whenVars: [salRange]
+              fallbackVar: salMinOnly
+              default: "-"
+            roleCell:
+              template: "[{pos}]({jUrl})"
+              whenVars: [jUrl]
+              fallbackVar: pos
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: Company
+              template: "{company}"
+            - header: Location
+              template: "{loc}"
+            - header: Salary
+              template: "{sal}"

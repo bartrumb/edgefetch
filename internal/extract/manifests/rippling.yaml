@@ -1,0 +1,163 @@
+# Shared Go + TypeScript Declarative Site Adapter: Rippling ATS Career Boards
+id: rippling
+name: Rippling ATS Career Boards
+category: jobs
+description: "Upgrades ats.rippling.com/[locale/]<org>/jobs to api.rippling.com (merging multi-location rows by uuid) and extracts __NEXT_DATA__ jobPost on detail pages."
+domains:
+  - ats.rippling.com
+exampleUrls:
+  - "https://ats.rippling.com/rippling/jobs"
+  - "https://ats.rippling.com/en-GB/acme/jobs"
+
+# Matches /[locale/]<org>[/jobs] while allowing detail URLs (/<org>/jobs/<uuid>) to use htmlRoutes
+match:
+  optionalLeadingLocale: true
+  pathSegments:
+    - param: org
+      charset: slug
+      maxLen: 80
+    - param: jobsLit
+      charset: alnum
+      allowValues:
+        - jobs
+      optional: true
+
+twin:
+  id: rippling-board
+  fetchUrl: "https://api.rippling.com/platform/api/ats/v1/board/{org}/jobs"
+  kind: json
+  accept: application/json
+
+extract:
+  wrapRootArrayAs: results
+  vars:
+    rawCount:
+      paths: [results]
+      format: array_len
+    dedupCount:
+      default: "{dedupCount}"
+  requireVars:
+    - rawCount
+  titleTemplate: "{org} — Rippling Job Board ({dedupCount} open roles)"
+  sections:
+    - heading: ""
+      arrayPath: results
+      limit: 100
+      linkScanLimit: 2000
+      emptyText: "No open positions currently listed."
+      dedupeBy:
+        keyPaths:
+          - uuid
+          - id
+        mergeTextPaths:
+          - workLocation.label
+          - workLocation
+        mergeTargetVar: _mergedLocs
+        mergeSep: "; "
+        mergeLimit: 4
+      requireItemVar: jName
+      itemVars:
+        uuid:
+          paths: [uuid, id]
+          trim: true
+        jName:
+          paths: [name, title]
+          trim: true
+        rawUrl:
+          paths: [url]
+          requireHttps: true
+        jUrl:
+          template: "{rawUrl}"
+          whenVars: [rawUrl]
+          fallbackTemplate: "https://ats.rippling.com/{org}/jobs/{uuid}"
+        dept:
+          paths: [department.label, department]
+          trim: true
+          default: "-"
+        locs:
+          paths: [_mergedLocs]
+          trim: true
+          default: "-"
+      collectLinkVars:
+        - jUrl
+      columns:
+        - header: Role
+          template: "[{jName}]({jUrl})"
+        - header: Department
+          template: "{dept}"
+        - header: Locations
+          template: "{locs}"
+
+htmlRoutes:
+  - id: rippling-job
+    mode: embedded_json
+    scriptId: __NEXT_DATA__
+    match:
+      hosts:
+        - ats.rippling.com
+    extract:
+      vars:
+        jobTitle:
+          paths:
+            - props.pageProps.apiData.jobPost.name
+            - props.pageProps.apiData.jobPost.title
+            - props.pageProps.jobPost.name
+            - props.pageProps.jobPost.title
+          trim: true
+        company:
+          paths:
+            - props.pageProps.apiData.jobPost.companyName
+            - props.pageProps.jobPost.companyName
+          trim: true
+          default: Company
+        descDirect:
+          paths:
+            - props.pageProps.apiData.jobPost.description
+            - props.pageProps.jobPost.description
+          format: html_to_md
+        descCompany:
+          paths:
+            - props.pageProps.apiData.jobPost.description.company
+            - props.pageProps.jobPost.description.company
+          format: html_to_md
+        descRole:
+          paths:
+            - props.pageProps.apiData.jobPost.description.role
+            - props.pageProps.jobPost.description.role
+          format: html_to_md
+        descReqs:
+          paths:
+            - props.pageProps.apiData.jobPost.description.requirements
+            - props.pageProps.jobPost.description.requirements
+          format: html_to_md
+        descBenefits:
+          paths:
+            - props.pageProps.apiData.jobPost.description.benefits
+            - props.pageProps.jobPost.description.benefits
+          format: html_to_md
+        hasAnyBody:
+          template: ok
+          whenAnyVars:
+            - descDirect
+            - descCompany
+            - descRole
+            - descReqs
+            - descBenefits
+      requireVars:
+        - jobTitle
+        - hasAnyBody
+      titleTemplate: "{jobTitle} @ {company}"
+      bodyVar: descDirect
+      sections:
+        - heading: ""
+          unlessVar: descDirect
+          textVar: descCompany
+        - heading: ""
+          unlessVar: descDirect
+          textVar: descRole
+        - heading: ""
+          unlessVar: descDirect
+          textVar: descReqs
+        - heading: ""
+          unlessVar: descDirect
+          textVar: descBenefits

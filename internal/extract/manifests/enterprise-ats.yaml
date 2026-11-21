@@ -1,0 +1,318 @@
+# Shared Go + TypeScript Declarative Site Adapter: SmartRecruiters, Oracle HCM Cloud & Jobvite
+id: enterprise-ats
+name: "SmartRecruiters, Oracle HCM Cloud & Jobvite"
+category: jobs
+description: "Keyless Oracle HCM Cloud recruitingCEJobRequisitions REST twin + robots.txt-safe SmartRecruiters and Jobvite HTML posting extractors."
+domains:
+  - jobs.smartrecruiters.com
+  - "*.oraclecloud.com"
+  - jobs.jobvite.com
+exampleUrls:
+  - "https://jobs.smartrecruiters.com/Visa/744000012345678-senior-software-engineer"
+  - "https://acme.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/requisitions"
+  - "https://jobs.jobvite.com/acme/job/oABCdef1"
+
+routes:
+  # 1. Oracle HCM Cloud single requisition detail (/sites/<siteNumber>/job/<reqId> or /requisitions/preview/<reqId>)
+  - match:
+      anyOf:
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: false
+          pathSegments:
+            - hcmUI
+            - CandidateExperience
+            - param: lang
+              charset: pkg
+            - sites
+            - param: siteNumber
+              charset: slug
+          scanSegment:
+            afterLiteral: job
+            param: reqId
+            charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: false
+          pathContainsSegment: requisitions
+          pathSegments:
+            - hcmUI
+            - CandidateExperience
+            - param: lang
+              charset: pkg
+            - sites
+            - param: siteNumber
+              charset: slug
+          scanSegment:
+            afterLiteral: preview
+            param: reqId
+            charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: false
+          pathSegments:
+            - hcmUI
+            - CandidateExperience
+            - sites
+            - param: siteNumber
+              charset: slug
+          scanSegment:
+            afterLiteral: job
+            param: reqId
+            charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: false
+          pathContainsSegment: requisitions
+          pathSegments:
+            - hcmUI
+            - CandidateExperience
+            - sites
+            - param: siteNumber
+              charset: slug
+          scanSegment:
+            afterLiteral: preview
+            param: reqId
+            charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: false
+          pathSegments:
+            - sites
+            - param: siteNumber
+              charset: slug
+          scanSegment:
+            afterLiteral: job
+            param: reqId
+            charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: false
+          pathContainsSegment: requisitions
+          pathSegments:
+            - sites
+            - param: siteNumber
+              charset: slug
+          scanSegment:
+            afterLiteral: preview
+            param: reqId
+            charset: slug
+    twin:
+      id: oracle-hcm-job
+      fetchUrl: "https://{host}/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails?onlyData=true&expand=all&finder=ById;Id=%22{reqId}%22,siteNumber={siteNumber}"
+      kind: json
+      accept: application/json
+    extract:
+      rootPath: items.0
+      requireFields:
+        - Title
+      vars:
+        jobTitle:
+          paths: [Title]
+          trim: true
+        loc:
+          paths: [PrimaryLocation]
+          trim: true
+        wp:
+          paths: [WorkplaceType]
+          trim: true
+        posted:
+          paths: [ExternalPostedStartDate]
+          sliceMax: 10
+          trim: true
+        extDesc:
+          paths: [ExternalDescriptionStr]
+          format: html_to_md
+        extResp:
+          paths: [ExternalResponsibilitiesStr]
+          format: html_to_md
+        extQual:
+          paths: [ExternalQualificationsStr]
+          format: html_to_md
+      titleTemplate: "{jobTitle}"
+      publishedTimeVar: posted
+      bullets:
+        - label: "Requisition ID"
+          template: "`{reqId}`"
+        - label: "Primary Location"
+          template: "{loc}"
+          whenVar: loc
+        - label: Workplace
+          template: "{wp}"
+          whenVar: wp
+        - label: Posted
+          template: "{posted}"
+          whenVar: posted
+      bodyVar: extDesc
+      sections:
+        - heading: Responsibilities
+          textVar: extResp
+        - heading: Qualifications
+          textVar: extQual
+
+  # 2. Oracle HCM Cloud open requisitions board (/sites/<siteNumber>/requisitions or /sites/<siteNumber>)
+  - match:
+      anyOf:
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          pathSuffix: /requisitions
+          scanSegment:
+            afterLiteral: sites
+            param: siteNumber
+            charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          pathSuffix: /requisitions/
+          scanSegment:
+            afterLiteral: sites
+            param: siteNumber
+            charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: true
+          pathSegments:
+            - hcmUI
+            - CandidateExperience
+            - param: lang
+              charset: pkg
+            - sites
+            - param: siteNumber
+              charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: true
+          pathSegments:
+            - hcmUI
+            - CandidateExperience
+            - sites
+            - param: siteNumber
+              charset: slug
+        - hosts:
+            - "*.fa.*oraclecloud.com"
+          exactSegments: true
+          pathSegments:
+            - sites
+            - param: siteNumber
+              charset: slug
+    twin:
+      id: oracle-hcm-board
+      fetchUrl: "https://{host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions?onlyData=true&expand=requisitionList.secondaryLocations&finder=findReqs;siteNumber={siteNumber},limit=25"
+      kind: json
+      accept: application/json
+    extract:
+      rootPath: items.0
+      vars:
+        reqCount:
+          paths: [requisitionList]
+          format: array_len
+        total:
+          paths: [TotalJobsCount]
+          fallbackTemplate: "{reqCount}"
+      requireVars:
+        - reqCount
+      titleTemplate: "Oracle HCM ({siteNumber}) — Open Requisitions ({total})"
+      sections:
+        - heading: ""
+          arrayPath: requisitionList
+          limit: 50
+          emptyText: "No open requisitions currently listed."
+          itemVars:
+            id:
+              paths: [Id]
+            rTitle:
+              paths: [Title]
+              trim: true
+              default: Requisition
+            rUrl:
+              template: "https://{host}/hcmUI/CandidateExperience/en/sites/{siteNumber}/job/{id}"
+            loc:
+              paths: [PrimaryLocation]
+              trim: true
+              default: "-"
+            wp:
+              paths: [WorkplaceType]
+              trim: true
+              default: "-"
+            posted:
+              paths: [PostedDate]
+              sliceMax: 10
+              trim: true
+              default: "-"
+          collectLinkVars:
+            - rUrl
+          columns:
+            - header: Requisition
+              template: "[{rTitle}]({rUrl})"
+            - header: Location
+              template: "{loc}"
+            - header: Workplace
+              template: "{wp}"
+            - header: Posted
+              template: "{posted}"
+
+htmlRoutes:
+  # SmartRecruiters HTML posting extractor (strictly HTML, never hitting disallowed api.smartrecruiters.com)
+  - id: smartrecruiters
+    mode: dom
+    match:
+      hosts:
+        - jobs.smartrecruiters.com
+      exactSegments: false
+      minSegments: 2
+      pathSegments:
+        - param: org
+          charset: pkg
+    jsonLdTypes:
+      - JobPosting
+    vars:
+      jobTitle:
+        jsonLdPaths:
+          - title
+        cssText:
+          - h1.job-title
+      company:
+        jsonLdPaths:
+          - hiringOrganization.name
+        fallbackTemplate: "{org}"
+      body:
+        cssHtmlToMd:
+          - "div[itemprop=\"description\"]"
+          - "section#st-jobDescription"
+        jsonLdPaths:
+          - description
+    requireVars:
+      - jobTitle
+      - body
+    titleTemplate: "{jobTitle} @ {company}"
+    bodyVar: body
+
+  # Jobvite HTML posting extractor (jobs.jobvite.com/<org>/job/<jobId>)
+  - id: jobvite
+    mode: dom
+    match:
+      hosts:
+        - jobs.jobvite.com
+      exactSegments: false
+      pathSegments:
+        - param: org
+          charset: pkg
+        - job
+        - param: jobId
+          charset: pkg
+    vars:
+      jobTitle:
+        cssText:
+          - h2.jv-header
+      meta:
+        cssText:
+          - p.jv-job-detail-meta
+      body:
+        cssHtmlToMd:
+          - div.jv-job-detail-description
+    requireVars:
+      - jobTitle
+      - body
+    titleTemplate: "{jobTitle} @ {org}"
+    metaItalicTemplate: "{meta}"
+    metaItalicWhenVar: meta
+    bodyVar: body

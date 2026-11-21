@@ -1,0 +1,135 @@
+# Shared Go + TypeScript Declarative Site Adapter: ArcGIS REST FeatureServer & MapServer Layers
+id: arcgis
+name: ArcGIS REST FeatureServer & MapServer Layers
+category: public-records
+description: Upgrades public ArcGIS REST FeatureServer/MapServer layer URLs to ?f=json metadata, geometry type, spatial reference, and field schemas.
+domains:
+  - services.arcgis.com
+  - "*.arcgis.com"
+universalEngine: true
+exampleUrls:
+  - https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/USA_States_Generalized/FeatureServer/0
+
+# Match any .../rest/services/.../(FeatureServer|MapServer)[/<layerId>] path
+match:
+  arcgisRestLayer: true
+  pathSegments:
+    - param: restPath
+      charset: safe_subpath
+      greedy: true
+      maxLen: 500
+
+twin:
+  fetchUrl: "{requestUrl}"
+  setQueryParams:
+    f: json
+  kind: json
+  accept: application/json
+
+extract:
+  rejectIfFieldTruthy: error
+  vars:
+    name:
+      paths:
+        - name
+        - mapName
+        - serviceDescription
+      trim: true
+      default: ArcGIS Service
+    desc:
+      paths:
+        - description
+        - serviceDescription
+      format: strip_tags
+    descShort:
+      paths:
+        - description
+        - serviceDescription
+      format: strip_tags
+      sliceMax: 260
+    geomType:
+      paths:
+        - geometryType
+    maxRec:
+      paths:
+        - maxRecordCount
+    capabilities:
+      paths:
+        - capabilities
+    wkid:
+      paths:
+        - extent.spatialReference.latestWkid
+        - extent.spatialReference.wkid
+    baseClean:
+      template: "https://{host}/{restPath}"
+    hasFields:
+      paths:
+        - fields
+      format: array_len
+      excludeEquals: "0"
+    hasLayers:
+      paths:
+        - layers
+      format: array_len
+      excludeEquals: "0"
+  titleTemplate: "{name}"
+  descriptionVar: descShort
+  bullets:
+    - label: REST Endpoint
+      template: "`{baseClean}`"
+    - label: Geometry Type
+      template: "`{geomType}`"
+      whenVar: geomType
+    - label: Spatial Reference (WKID)
+      template: "`EPSG:{wkid}`"
+      whenVar: wkid
+    - label: Max Record Count / Query
+      template: "{maxRec}"
+      whenVar: maxRec
+    - label: Capabilities
+      template: "{capabilities}"
+      whenVar: capabilities
+  sections:
+    - heading: Description
+      textVar: desc
+    - heading: Layer Fields
+      headingTemplate: "Layer Fields ({count})"
+      whenVar: hasFields
+      arrayPath: fields
+      limit: 40
+      columns:
+        - header: Field
+          paths:
+            - name
+          code: true
+        - header: Alias
+          paths:
+            - alias
+        - header: Type
+          paths:
+            - type
+          stripPrefix: esriFieldType
+    - heading: Sublayers
+      headingTemplate: "Sublayers ({count})"
+      whenVar: hasLayers
+      unlessVar: hasFields
+      arrayPath: layers
+      limit: 30
+      itemVars:
+        layerId:
+          paths:
+            - id
+          default: "0"
+        layerName:
+          paths:
+            - name
+          default: Layer
+      columns:
+        - header: ID
+          paths:
+            - id
+        - header: Layer
+          template: "[{layerName}]({baseClean}/{layerId})"
+        - header: Geometry
+          paths:
+            - geometryType

@@ -20,7 +20,9 @@ Defines the keyless `SiteAdapter` SDK (`types.ts`), shared HTML/JSON/GFM parsing
 - `[utils.ts:parseJsonObject]`, `[utils.ts:parseJsonValue]` — Exception-free, UTF-8 BOM-tolerant JSON parsers.
 - `[utils.ts:escapeGfmCell]`, `[utils.ts:formatGfmTable]`, `[utils.ts:formatUsdCompact]`, `[utils.ts:formatYamlFrontmatterCard]` — GFM table cell sanitization/building, compact USD formatting, and bounded YAML frontmatter-to-GFM card conversion (re-exported as `[registry.ts:formatYamlFrontmatterCard]`).
 - `[utils.ts:extractMetaContent]`, `[utils.ts:extractAllMetaContents]`, `[utils.ts:extractJsonLdObjects]`, `[utils.ts:extractBalancedDivAt]` — Bounded `<meta>`, `<script type="application/ld+json">`, and nested `<div>` HTML extractors.
-- [Built-In Site Adapter Providers](./providers/EGM.md) — Barrel registry (`BUILTIN_SITE_ADAPTERS`) and 7 category subpackages housing 54 keyless `SiteAdapter` modules.
+- `[declarative.ts:DECLARATIVE_SITE_ADAPTERS]`, `[declarative.ts:compileDeclarativeAdapter]`, `[declarative.ts:parseAndValidateDeclarativeYaml]` — Compiles all 56 declarative `#`-commented `.yaml` manifests (`internal/extract/manifests/*.yaml` -> `internal/extract/manifests/compiled.json`) into standard `SiteAdapter` objects with strict AST safety, M2 host-claim validation, and SSRF guards.
+- `[commerce-engine.ts:buildDeclarativeCatalogSpec]`, `[commerce-engine.ts:normalizeShopifyProductRecord]`, `[commerce-engine.ts:normalizeWooCommerceProductRecord]` — Shared Shopify & WooCommerce catalog pagination, twin enrichment, and neutral `CatalogRecord` normalizers backing `shopify.yaml` and `woocommerce.yaml`.
+- `[html-doc.ts:parseHtmlDoc]` — Depth- and node-bounded (`MAX_DOM_DEPTH = 128`, `MAX_DOM_NODES = 40_000`) `htmlparser2` DOM query wrapper with linear `dlMap()`, `tableRows()`, and `WeakMap`-memoized text extraction.
 
 ## Invariants
 

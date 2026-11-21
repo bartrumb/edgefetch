@@ -1,0 +1,106 @@
+# Shared Go + TypeScript Declarative Site Adapter: Google Play Store
+id: google-play
+name: Google Play Store
+category: developer
+description: "Extracts structured Google Play app metadata (package ID, developer, rating, downloads/reviews, category, price, and full description)."
+domains:
+  - play.google.com
+exampleUrls:
+  - "https://play.google.com/store/apps/details?id=com.cloudflare.onedotonedotonedotone"
+
+# Post-fetch DOM + JSON-LD extraction on /store/apps/details?id=<pkgId>
+htmlRoutes:
+  - match:
+      pathPrefix: /store/apps/details
+      queryParams:
+        - name: id
+          param: pkgId
+          charset: pkg
+          optional: true
+    mode: dom
+    jsonLdTypes:
+      - SoftwareApplication
+      - MobileApplication
+    vars:
+      title:
+        jsonLdPaths:
+          - name
+        metaKeys:
+          - "og:title"
+        stripRegexSuffix: "\\s*-\\s*Apps on Google Play$"
+      developer:
+        jsonLdPaths:
+          - "author.name"
+      ratingVal:
+        jsonLdPaths:
+          - "aggregateRating.ratingValue"
+      ratingCount:
+        jsonLdPaths:
+          - "aggregateRating.ratingCount"
+          - "aggregateRating.reviewCount"
+      ratingOnly:
+        template: "{ratingVal} / 5"
+        whenVars:
+          - ratingVal
+      rating:
+        template: "{ratingVal} / 5 ({ratingCount} reviews)"
+        whenVars:
+          - ratingVal
+          - ratingCount
+        fallbackVar: ratingOnly
+      currency:
+        jsonLdPaths:
+          - "offers.0.priceCurrency"
+          - "offers.priceCurrency"
+        default: USD
+      price:
+        jsonLdPaths:
+          - "offers.0.price"
+          - "offers.price"
+        format: free_or_currency
+        currencyVar: currency
+      category:
+        jsonLdPaths:
+          - applicationCategory
+      contentRating:
+        jsonLdPaths:
+          - contentRating
+      desc:
+        jsonLdPaths:
+          - description
+        metaKeys:
+          - description
+      descShort:
+        template: "{desc}"
+        whenVars:
+          - desc
+        sliceMax: 260
+    requireVars:
+      - title
+    requireBulletsOrVars:
+      - desc
+    titleTemplate: "{title}"
+    descriptionVar: descShort
+    authorVar: developer
+    bullets:
+      - label: Package ID
+        template: "`{pkgId}`"
+        whenVar: pkgId
+      - label: Developer
+        template: "{developer}"
+        whenVar: developer
+      - label: Category
+        template: "{category}"
+        whenVar: category
+      - label: Rating
+        template: "{rating}"
+        whenVar: rating
+      - label: Price
+        template: "{price}"
+        whenVar: price
+      - label: Content Rating
+        template: "{contentRating}"
+        whenVar: contentRating
+    sections:
+      - heading: About This App
+        textVar: desc

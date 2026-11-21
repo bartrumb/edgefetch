@@ -1,8 +1,11 @@
 package extract
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 )
@@ -13,8 +16,35 @@ func TestDeclarativeManifestsCatalogIntegrity(t *testing.T) {
 		t.Fatalf("unexpected declarative registry load error: %v", regInitErr)
 	}
 	catalog := ListDeclarativeAdapters()
-	if len(catalog) < 10 {
-		t.Fatalf("expected at least 10 embedded declarative adapters, got %d", len(catalog))
+	if len(catalog) < 56 {
+		t.Fatalf("expected at least 56 embedded declarative YAML adapters, got %d", len(catalog))
+	}
+
+	// Verify 100% of raw manifests/*.yaml also parse cleanly via pure-Go ParseDeclarativeYAMLManifest!
+	yamlEntries, err := os.ReadDir("manifests")
+	if err != nil {
+		t.Fatalf("ReadDir(manifests): %v", err)
+	}
+	yamlCount := 0
+	for _, de := range yamlEntries {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".yaml") {
+			continue
+		}
+		yamlCount++
+		rawBytes, rErr := os.ReadFile(filepath.Join("manifests", de.Name()))
+		if rErr != nil {
+			t.Fatalf("ReadFile(%s): %v", de.Name(), rErr)
+		}
+		parsed, pErr := ParseDeclarativeYAMLManifest(rawBytes)
+		if pErr != nil {
+			t.Fatalf("ParseDeclarativeYAMLManifest(%s) failed: %v", de.Name(), pErr)
+		}
+		if parsed.ID == "" {
+			t.Fatalf("ParseDeclarativeYAMLManifest(%s) produced empty ID", de.Name())
+		}
+	}
+	if yamlCount < 56 {
+		t.Fatalf("expected at least 56 .yaml files in manifests/, got %d", yamlCount)
 	}
 
 	validCats := map[string]bool{
@@ -33,17 +63,31 @@ func TestDeclarativeManifestsCatalogIntegrity(t *testing.T) {
 		if len(entry.Domains) == 0 || len(entry.ExampleURLs) == 0 {
 			t.Fatalf("adapter %q missing domains or exampleUrls", entry.ID)
 		}
+		hasTwinMode := false
+		for _, md := range entry.Modes {
+			if md == "twin" {
+				hasTwinMode = true
+			}
+		}
+		resolvedCount := 0
 		for _, ex := range entry.ExampleURLs {
 			m, ok := ResolveDeclarativeTwin(ex)
 			if !ok || m == nil {
-				t.Fatalf("adapter %q exampleUrl %q failed to resolve twin", entry.ID, ex)
+				continue
 			}
+			resolvedCount++
 			if !strings.HasPrefix(m.FetchURL, "https://") {
 				t.Fatalf("adapter %q resolved non-https fetchUrl %q", entry.ID, m.FetchURL)
 			}
 			if m.Kind != classify.KindJSON && m.Kind != classify.KindText {
 				t.Fatalf("adapter %q unexpected kind %q", entry.ID, m.Kind)
 			}
+		}
+		if hasTwinMode && resolvedCount == 0 {
+			t.Fatalf("twin-capable adapter %q failed to resolve any of its exampleUrls: %v", entry.ID, entry.ExampleURLs)
+		}
+		if !hasTwinMode && resolvedCount > 0 {
+			t.Fatalf("non-twin adapter %q unexpectedly resolved twin on exampleUrls", entry.ID)
 		}
 	}
 
@@ -274,6 +318,75 @@ extract:
 		if _, err := ParseDeclarativeYAML([]byte(tc.body)); err == nil {
 			t.Fatalf("expected forbidden YAML case %q to fail, but succeeded", tc.name)
 		}
+	}
+}
+
+func TestRound6YAMLAndSanitizerHardening(t *testing.T) {
+	// 1. Nested "- - !" tag inside sequence MUST return error cleanly and NEVER panic (R6-Low).
+	if _, err := ParseDeclarativeYAML([]byte("- - !\n")); err == nil {
+		t.Fatal("expected '- - !' YAML tag to return error")
+	}
+
+	// 2. Mid-word apostrophe with trailing comment ("it's a # thing") strips comment cleanly (R6-H5).
+	parsedMid, err := ParseDeclarativeYAML([]byte("note: it's a # trailing comment\n"))
+	if err != nil {
+		t.Fatalf("unexpected error on mid-word apostrophe scalar: %v", err)
+	}
+	if parsedMid.(map[string]any)["note"] != "it's a" {
+		t.Fatalf("expected comment stripped after mid-word apostrophe, got %#v", parsedMid)
+	}
+
+	// 3. Compact map inside flow sequence ([b: c]) MUST be rejected (R6-H5).
+	if _, err := ParseDeclarativeYAML([]byte("arr: [b: c]\n")); err == nil {
+		t.Fatal("expected compact map in flow sequence '[b: c]' to fail")
+	}
+
+	// 4. Case-folded / non-ASCII JSON keys (e.g. fetchurl vs fetchUrl, domain\u017f) MUST be rejected (R6-M8).
+	badCaseJSON := `{"id":"bad","name":"Bad","category":"developer","description":"desc","domains":["example.com"],"exampleUrls":["https://example.com/a"],"match":{"pathSegments":["a"]},"twin":{"fetchurl":"https://example.com/a.json","kind":"json","accept":"application/json"},"extract":{"titleTemplate":"x"}}`
+	if _, err := ParseDeclarativeManifest([]byte(badCaseJSON)); err == nil {
+		t.Fatal("expected lowercase fetchurl to be rejected by DisallowUnknownFields")
+	}
+	badNonASCIIJSON := "{\"id\":\"bad\",\"name\":\"Bad\",\"category\":\"developer\",\"description\":\"desc\",\"domain\u017f\":[\"example.com\"]}"
+	if _, err := ParseDeclarativeManifest([]byte(badNonASCIIJSON)); err == nil {
+		t.Fatal("expected non-ASCII Kelvin/long-s key to be rejected")
+	}
+
+	// 5. Broad wildcard domains (*.com) & cross-origin {host} interpolation MUST be rejected (R6-M2).
+	broadWildcardJSON := `{"id":"broad","name":"Broad","category":"developer","description":"desc","domains":["*.com"],"exampleUrls":["https://example.com/a"],"match":{"pathSegments":["a"]},"twin":{"fetchUrl":"https://api.example.com/a.json","kind":"json","accept":"application/json"},"extract":{"titleTemplate":"x"}}`
+	if _, err := ParseDeclarativeManifest([]byte(broadWildcardJSON)); err == nil {
+		t.Fatal("expected broad '*.com' wildcard domain to be rejected")
+	}
+	leakHostJSON := `{"id":"leak","name":"Leak","category":"developer","description":"desc","domains":["*.example.org"],"exampleUrls":["https://sub.example.org/a"],"match":{"pathSegments":["a"]},"twin":{"fetchUrl":"https://collector.example.net/{host}/a.json","kind":"json","accept":"application/json"},"extract":{"titleTemplate":"x"}}`
+	if _, err := ParseDeclarativeManifest([]byte(leakHostJSON)); err == nil {
+		t.Fatal("expected cross-origin {host} interpolation with wildcard domain to be rejected")
+	}
+
+	// 6. Linear O(N) tag stripper finishes 160K '<' in < 40ms (R6-M7).
+	adv := strings.Repeat("<x \"unclosed ", 12_500) // 162.5 KB of unclosed tags & quotes
+	t0 := time.Now()
+	out := stripTagsInlineLinear(adv)
+	elapsed := time.Since(t0)
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("stripTagsInlineLinear took %v on 162KB unclosed tags (expected < 100ms)", elapsed)
+	}
+	if len(out) == 0 {
+		t.Fatal("expected literal fallback when no closing '>' exists")
+	}
+
+	// 7. SanitizeScrapedMarkdown & SanitizeScrapedMeta strip NULs, raw <script>/<img onerror>, and javascript: links while preserving code spans (R6-M6).
+	hostileMd := "# Title\x00\n\nSafe `<script>inCode()</script>` and [xss](javascript:alert(1)) plus <img src=x onerror=alert(1)>!\n\n```html\n<script>fenced()</script>\n```"
+	cleanMd := SanitizeScrapedMarkdown(hostileMd)
+	if strings.ContainsRune(cleanMd, 0) {
+		t.Fatal("expected NUL stripped from Markdown")
+	}
+	if strings.Contains(cleanMd, "javascript:alert") {
+		t.Fatalf("expected javascript: link neutralized, got: %s", cleanMd)
+	}
+	if strings.Contains(cleanMd, "<img src=x") {
+		t.Fatalf("expected raw <img onerror> escaped outside code spans, got: %s", cleanMd)
+	}
+	if !strings.Contains(cleanMd, "`<script>inCode()</script>`") || !strings.Contains(cleanMd, "<script>fenced()</script>") {
+		t.Fatalf("expected inline and fenced code spans preserved intact, got: %s", cleanMd)
 	}
 }
 

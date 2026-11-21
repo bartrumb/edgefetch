@@ -1,0 +1,65 @@
+# Shared Go + TypeScript Declarative Site Adapter: iCIMS Enterprise Career Portals
+id: icims
+name: iCIMS Enterprise Career Portals
+category: jobs
+description: "Upgrades *.icims.com/jobs/... portals and postings to their server-rendered ?ss=1&in_iframe=1 twin, extracting JobPosting JSON-LD and open role cards without outer iframe shells."
+domains:
+  - "*.icims.com"
+exampleUrls:
+  - "https://careers-acme.icims.com/jobs/search?ss=1"
+  - "https://careers-acme.icims.com/jobs/12345/senior-software-engineer/job"
+
+# Matches <org>.icims.com/jobs/... while rejecting marketing/support subdomains
+match:
+  hostSubdomain:
+    suffix: .icims.com
+    param: org
+    reserved:
+      - www
+      - status
+      - support
+      - community
+      - developer
+      - developers
+      - login
+  exactSegments: false
+  pathSegments:
+    - jobs
+
+twin:
+  id: icims
+  fetchUrl: "{requestUrl}"
+  overridePathIf:
+    matchPaths:
+      - /jobs
+      - /jobs/intro
+      - /jobs/search
+    newPath: /jobs/search
+  defaultQueryParams:
+    ss: "1"
+  setQueryParams:
+    in_iframe: "1"
+  kind: text
+  accept: text/html
+
+extract:
+  icimsPortal: true
+
+htmlRoutes:
+  - id: icims
+    mode: icims_portal
+    match:
+      hostSubdomain:
+        suffix: .icims.com
+        param: org
+        reserved:
+          - www
+          - status
+          - support
+          - community
+          - developer
+          - developers
+          - login
+      exactSegments: false
+      pathSegments:
+        - jobs

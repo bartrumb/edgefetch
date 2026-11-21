@@ -1,0 +1,131 @@
+# Shared Go + TypeScript Declarative Site Adapter: Rust Crates.io
+id: crates-io
+name: Rust Crates.io
+category: developer
+description: "Upgrades crates.io pages to the v1 JSON API with Cargo install command, MSRV, Cargo features, downloads, and release history."
+domains:
+  - crates.io
+  - www.crates.io
+exampleUrls:
+  - "https://crates.io/crates/serde"
+
+# Matches /crates/<crateName> (allowing optional version/subpath suffixes)
+match:
+  exactSegments: false
+  pathSegments:
+    - crates
+    - param: crateName
+      charset: alnum_dash
+      minLen: 1
+      maxLen: 64
+
+twin:
+  fetchUrl: "https://crates.io/api/v1/crates/{crateName}"
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - "crate.name"
+  vars:
+    name:
+      paths:
+        - "crate.name"
+    ver:
+      paths:
+        - "crate.max_stable_version"
+        - "crate.max_version"
+        - "versions.0.num"
+    desc:
+      paths:
+        - "crate.description"
+      trim: true
+    license:
+      paths:
+        - "versions.0.license"
+    msrv:
+      paths:
+        - "versions.0.rust_version"
+    repo:
+      paths:
+        - "crate.repository"
+    docs:
+      paths:
+        - "crate.documentation"
+      fallbackTemplate: "https://docs.rs/{name}"
+    downloads:
+      paths:
+        - "crate.downloads"
+      format: int_comma
+    features:
+      paths:
+        - "versions.0.features"
+      format: object_keys
+      limit: 14
+      itemWrap: "`"
+      join: ", "
+    categories:
+      paths:
+        - categories
+      subField: category
+      join: ", "
+    keywords:
+      paths:
+        - keywords
+      subField: keyword
+      join: ", "
+  titleTemplate: "{name} v{ver} (Rust Crate)"
+  titleWhenVar: ver
+  titleFallbackTemplate: "{name} (Rust Crate)"
+  descriptionVar: desc
+  introVar: desc
+  bullets:
+    - label: Cargo
+      template: "`cargo add {name}`"
+    - label: Version
+      template: "`{ver}`"
+      whenVar: ver
+    - label: MSRV
+      template: "Rust `{msrv}`"
+      whenVar: msrv
+    - label: License
+      template: "{license}"
+      whenVar: license
+    - label: Downloads
+      template: "{downloads}"
+      whenVar: downloads
+    - label: API Docs
+      template: "{docs}"
+      whenVar: docs
+    - label: Repository
+      template: "{repo}"
+      whenVar: repo
+    - label: Cargo Features
+      template: "{features}"
+      whenVar: features
+    - label: Categories
+      template: "{categories}"
+      whenVar: categories
+    - label: Keywords
+      template: "{keywords}"
+      whenVar: keywords
+  sections:
+    - heading: Recent Releases
+      arrayPath: versions
+      minItems: 2
+      limit: 6
+      columns:
+        - header: Version
+          paths:
+            - num
+          code: true
+        - header: Published
+          paths:
+            - created_at
+          sliceMax: 10
+        - header: MSRV
+          paths:
+            - rust_version
+  linksVars:
+    - docs
+    - repo

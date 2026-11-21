@@ -1,0 +1,99 @@
+# Shared Go + TypeScript Declarative Site Adapter: ClinicalTrials.gov Studies
+id: clinicaltrials
+name: ClinicalTrials.gov Studies
+category: research-health
+description: Extracts clinical trial NCT ID, recruitment status, phase, conditions, interventions, sponsor, and summary from rendered clinicaltrials.gov/study/NCT... pages (strictly respecting robots.txt).
+domains:
+  - clinicaltrials.gov
+  - www.clinicaltrials.gov
+exampleUrls:
+  - https://clinicaltrials.gov/study/NCT04280705
+
+# Post-fetch HTML extractor supporting SSR protocolSection state and MedicalStudy JSON-LD
+htmlRoutes:
+  - match:
+      scanSegment:
+        param: nctId
+        charset: nct_id
+        transform: upper
+    mode: dom
+    jsonLdTypes:
+      - MedicalStudy
+      - MedicalTrial
+      - ClinicalTrial
+    embeddedBalancedKey: protocolSection
+    requireVars:
+      - title
+      - hasAnyDetail
+    vars:
+      title:
+        embeddedPaths:
+          - identificationModule.briefTitle
+        jsonLdPaths:
+          - name
+        metaKeys:
+          - "og:title"
+      overallStatus:
+        embeddedPaths:
+          - statusModule.overallStatus
+        jsonLdPaths:
+          - status
+      phases:
+        embeddedPaths:
+          - designModule.phases
+        join: ", "
+      leadSponsor:
+        embeddedPaths:
+          - sponsorCollaboratorsModule.leadSponsor.name
+        jsonLdPaths:
+          - sponsor.name
+      conditions:
+        embeddedPaths:
+          - conditionsModule.conditions
+        jsonLdPaths:
+          - healthCondition
+        limit: 10
+        join: ", "
+      summary:
+        embeddedPaths:
+          - descriptionModule.briefSummary
+        jsonLdPaths:
+          - description
+        metaKeys:
+          - description
+      summaryShort:
+        template: "{summary}"
+        whenVars:
+          - summary
+        sliceMax: 260
+      hasAnyDetail:
+        template: "1"
+        whenAnyVars:
+          - overallStatus
+          - phases
+          - leadSponsor
+          - conditions
+          - summary
+    titleTemplate: "{title} ({nctId})"
+    descriptionVar: summaryShort
+    bullets:
+      - label: NCT Number
+        template: "`{nctId}`"
+      - label: Status
+        template: "{overallStatus}"
+        whenVar: overallStatus
+      - label: Phase
+        template: "{phases}"
+        whenVar: phases
+      - label: Lead Sponsor
+        template: "{leadSponsor}"
+        whenVar: leadSponsor
+      - label: Conditions
+        template: "{conditions}"
+        whenVar: conditions
+    sections:
+      - heading: Brief Summary
+        textVar: summary
+    appendCurrentMdDelta:
+      baseVar: summary
+      minExtraChars: 120

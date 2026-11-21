@@ -1,0 +1,118 @@
+# Shared Go + TypeScript Declarative Site Adapter: Legistar Municipal Council Legislation & Meetings
+id: legistar
+name: Legistar Municipal Council Legislation & Meetings
+category: public-records
+description: Upgrades <client>.legistar.com municipal council portals to the keyless webapi.legistar.com REST API for ordinances, resolutions, and meetings.
+domains:
+  - "*.legistar.com"
+exampleUrls:
+  - https://nyc.legistar.com/Legislation.aspx
+  - https://seattle.legistar.com/Calendar.aspx
+
+routes:
+  # Calendar / Meetings route (/Calendar.aspx or /calendar)
+  - match:
+      anyOf:
+        - hostSubdomain:
+            suffix: .legistar.com
+            param: client
+            reserved:
+              - www
+              - webapi
+          pathSuffix: calendar.aspx
+          derivedParams:
+            clientUpper:
+              fromParam: client
+              transform: upper
+        - hostSubdomain:
+            suffix: .legistar.com
+            param: client
+            reserved:
+              - www
+              - webapi
+          pathContainsSegment: calendar
+          derivedParams:
+            clientUpper:
+              fromParam: client
+              transform: upper
+    twin:
+      fetchUrl: "https://webapi.legistar.com/v1/{client}/events?$top=20&$orderby=EventDate%20desc"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: items
+      requireAnyFields:
+        - items
+      titleTemplate: "{clientUpper} Municipal Council \u2014 Recent Meetings (Legistar)"
+      sections:
+        - heading: ""
+          arrayPath: items
+          limit: 20
+          itemVars:
+            agendaUrl:
+              paths:
+                - EventInSiteURL
+              requireHttps: true
+            linkCell:
+              template: "[Agenda]({agendaUrl})"
+              whenVars:
+                - agendaUrl
+              default: "-"
+          columns:
+            - header: Date
+              paths:
+                - EventDate
+              sliceMax: 10
+            - header: Body / Committee
+              paths:
+                - EventBodyName
+            - header: Location
+              paths:
+                - EventLocation
+            - header: Link
+              template: "{linkCell}"
+
+  # Default Legislation / Matters route
+  - match:
+      hostSubdomain:
+        suffix: .legistar.com
+        param: client
+        reserved:
+          - www
+          - webapi
+      derivedParams:
+        clientUpper:
+          fromParam: client
+          transform: upper
+    twin:
+      fetchUrl: "https://webapi.legistar.com/v1/{client}/matters?$top=25&$orderby=MatterIntroDate%20desc"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: items
+      requireAnyFields:
+        - items
+      titleTemplate: "{clientUpper} Municipal Legislation \u2014 Recent Matters (Legistar)"
+      sections:
+        - heading: ""
+          arrayPath: items
+          limit: 25
+          columns:
+            - header: "File #"
+              paths:
+                - MatterFile
+              code: true
+            - header: Type
+              paths:
+                - MatterTypeName
+            - header: Status
+              paths:
+                - MatterStatusName
+            - header: Introduced
+              paths:
+                - MatterIntroDate
+              sliceMax: 10
+            - header: Title
+              paths:
+                - MatterTitle
+                - MatterName

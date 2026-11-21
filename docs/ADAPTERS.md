@@ -1,39 +1,39 @@
-# Writing & Contributing Site Adapters
+# Writing & Contributing Declarative YAML Site Adapters
 
-EdgeFetch ships a modular **Site, Commerce & ATS Adapter Library** covering **50+ keyless public platforms** across 7 categories, designed so contributors and coding agents can add a new platform in minutes with zero regex pitfalls.
+EdgeFetch ships a **100% Declarative YAML Site, Commerce & ATS Adapter Library** covering **56+ keyless public platforms** across 7 categories (`developer`, `genai`, `jobs`, `finance`, `public-records`, `research-health`, `commerce-social`).
 
-## 1. Two Authoring Tiers (Pick the Simplest One That Fits)
-
-1. **Tier 1 — Shared Zero-Code Declarative YAML Manifest (`internal/extract/manifests/<slug>.yaml`, Recommended for ~80% of Sites):**
-   - Best whenever a site exposes a public, `robots.txt`-allowed JSON or Markdown endpoint (e.g., `rubygems`, `packagist`, `hex-pm`, `dev-to`, `huggingface`, `lobsters`, `doi-crossref`, `usaspending`, `polymarket`, `openrouter`).
-   - Supports `#` comments, clean unquoted keys, zero trailing-comma errors, **zero code, zero regex ReDoS risk, zero `fetch()` escape, and zero YAML alias expansion (`maxAliasCount: 0`)**.
-   - **Runs in BOTH the pure-Go Hub (`edgefetch --mode=hub` via `//go:embed` with zero TypeScript runtime!) AND the Cloudflare / Node Hub.**
-2. **Tier 2 — TypeScript Adapter with `parseHtmlDoc()` CSS Selectors (`hub/src/extractors/providers/<category>/<slug>.ts`):**
-   - Best when `/api` is disallowed by `robots.txt` so extraction runs over public HTML (`openfoodfacts`, `icims`, `arxiv`, `clinicaltrials`), or when custom multi-endpoint enrichment is required (`shopify`, `woocommerce`, `sec-edgar`).
-   - Uses `parseHtmlDoc(rawHtml)` (`htmlparser2` WHATWG HTML5 DOM + linear CSS selectors: `doc.select('.job-card')`, `card.text('h3')`, `card.attr('a', 'href')`, `card.dlMap()`, `card.tableRows()`) and `compileLinearRegex()` (`re2js` Thompson NFA) inside a fault-isolated bulkhead (`runAdapterSyncInBulkhead`).
+Every built-in and community site adapter is authored as a `#`-commented YAML 1.2 Core manifest in `internal/extract/manifests/<slug>.yaml` (`MIT`-licensed) and compiled by `npm run adapter:compile` (`hub/scripts/compile-manifests.mjs`) into the checked canonical IR `internal/extract/manifests/compiled.json` embedded in **both** the Cloudflare/Node TypeScript Hub and the pure-Go Hub (`//go:embed manifests/compiled.json`).
 
 ---
 
-## 2. Ground Rules (Enforced by `npm run adapter:test` & CI)
+## 1. Security & Architecture Guarantees (Zero TypeScript Adapter Code)
 
-1. **100% Keyless & Public Sources Only:** Target public APIs, feeds, registries, and structured HTML (no paid B2B API keys).
-2. **Strict `robots.txt` & Ethical Compliance:**
-   - Adapters **never** call `fetch()` directly (`globalThis.fetch` throws `AdapterNetworkForbiddenError` inside the bulkhead).
-   - `npm run adapter:test <id> <https://url>` automatically checks `/robots.txt` (`RFC 9309` + `Content-Signal: ai-input`) and Go's `GO_KIND_TEXT_ACCEPT_ALLOWLIST` before testing live URLs.
-3. **Fail-Open Fallback:** Returning `null` from an adapter cleanly falls back to generic HTML / Schema.org JSON-LD / SSR Hydration / Headless CDP extraction.
+1. **Zero Arbitrary Code Execution & Zero Network Escape:**
+   - Adapters contain **zero executable TypeScript/JavaScript**, **zero `eval`/`Function`**, **zero `fetch()` calls**, and **zero backtracking regular expressions** (any `regexExtract` pattern is compiled strictly via `re2js` linear-time Thompson NFA).
+2. **Single Checked Canonical IR (Zero Go-vs-TS YAML Differentials):**
+   - Contributors write clean `#`-commented `.yaml` files in `internal/extract/manifests/*.yaml`.
+   - `npm run adapter:compile` parses every manifest with `yaml` (`maxAliasCount: 0, merge: false, uniqueKeys: true`), rejects anchors (`&`), aliases (`*`), merge keys (`<<`), explicit tags (`!`), non-ASCII keys, and unknown/case-mismatched schema keys, and emits deterministic `internal/extract/manifests/compiled.json`.
+   - Go decodes `compiled.json` with `json.Decoder.DisallowUnknownFields()` and strict ASCII key verification.
+3. **Host-Claim & SSRF Hardening:**
+   - Duplicate manifest `id`s and cross-manifest duplicate `twin.id`s are rejected at compile and load time.
+   - Broad TLD/eTLD wildcards (`*`, `*.com`, `*.org`, `*.co.uk`) are forbidden; wildcard or `universalEngine: true` routes may only interpolate `{host}` / `{origin}` into same-origin `https://{host}/...` URLs.
+   - All resolved `fetchUrl` targets are validated as public `https://` URLs with no credentials, fragments, non-443 ports, or loopback/rebinding suffixes.
+4. **100% Keyless, Polite & `robots.txt`-Compliant:**
+   - Target public APIs, feeds, registries, and structured HTML (never paid B2B API keys).
+   - When `/api` is disallowed by `robots.txt` (e.g., `openfoodfacts`, `arxiv`, `clinicaltrials`, `icims`), use declarative `htmlRoutes` over `robots.txt`-permitted public HTML instead of `twin`.
 
 ---
 
-## 3. Quickstart Workflow (`adapter:new` + `adapter:test --record`)
+## 2. Quickstart Workflow (`adapter:new` + `adapter:test --record`)
 
-### Option A — Add a Shared Go + TS Declarative YAML Adapter (Zero Code)
+### Option A — Declarative Pre-Fetch JSON / XML / Markdown Twin (`routes` or `match`+`twin`+`extract`)
 
 ```bash
 cd hub
 npm run adapter:new developer/my-registry
 ```
 
-This creates `internal/extract/manifests/my-registry.yaml`, registers it in `hub/src/extractors/declarative.ts` (and embeds it into Go's `internal/extract` automatically), and creates `hub/test/fixtures/adapters/my-registry.json`:
+This creates `internal/extract/manifests/my-registry.yaml`, creates `hub/test/fixtures/adapters/my-registry.json`, and compiles `internal/extract/manifests/compiled.json`:
 
 ```yaml
 # Shared Go + TypeScript Declarative Site Adapter: RubyGems Registry
@@ -79,55 +79,70 @@ extract:
   bullets:
     - label: Install
       template: "`gem install {name}`"
+      whenVar: version
     - label: Version
       template: "`{version}`"
       whenVar: version
 ```
 
-### Option B — Add an HTML Adapter Using `parseHtmlDoc()` CSS Selectors
+### Option B — Declarative Post-Fetch HTML CSS-Selector / Schema.org JSON-LD (`htmlRoutes`)
 
 ```bash
 cd hub
 npm run adapter:new jobs/my-board --html
 ```
 
-```ts
-import { defineAdapter } from '../../types';
-import { formatGfmTable, parseHtmlDoc } from '../../utils';
+```yaml
+# Shared Go + TypeScript Declarative Site Adapter: My Job Board
+id: my-board
+name: My Job Board
+category: jobs
+description: Extracts structured job postings using declarative CSS selectors and Schema.org JSON-LD.
+domains:
+  - jobs.example.org
+exampleUrls:
+  - https://jobs.example.org/listings/senior-systems-engineer
 
-export default defineAdapter({
-  id: 'my-board',
-  name: 'My Job Board',
-  category: 'jobs',
-  description: 'Extracts structured job cards using WHATWG HTML5 CSS selectors.',
-  domains: ['jobs.example.org'],
-  exampleUrls: ['https://jobs.example.org/openings'],
-  extractHtml({ rawHtml }) {
-    const doc = parseHtmlDoc(rawHtml);
-    const rows: string[][] = [];
-    for (const card of doc.select('.job-card', 50)) {
-      const title = card.text('h3, h2');
-      const href = card.attrOf('a[href*="/jobs/"]', 'href') ?? '';
-      const meta = card.dlMap(); // pairs <dt> -> <dd> cleanly
-      if (title) rows.push([href ? `[${title}](${href})` : title, meta['location'] ?? '-']);
-    }
-    if (rows.length === 0) return null;
-    return {
-      extractorId: 'my-board',
-      title: doc.text('h1') || 'Open Roles',
-      markdown: formatGfmTable(['Role', 'Location'], rows),
-    };
-  },
-});
+htmlRoutes:
+  - id: my-board
+    match:
+      minSegments: 2
+      pathPrefix: /listings
+    mode: dom
+    jsonLdTypes: [JobPosting]
+    vars:
+      title:
+        jsonLdPaths: [title, name]
+        cssText: h1
+        trim: true
+      location:
+        jsonLdPaths: [jobLocation.address.addressLocality]
+        cssText: ".job-location"
+        trim: true
+      body:
+        cssHtmlToMd: "article, main, .job-description"
+    requireVars: [title]
+    titleTemplate: "{title}"
+    bullets:
+      - label: Location
+        template: "{location}"
+        whenVar: location
+    bodyVar: body
 ```
 
-### Test Live, Auto-Record Fixture & Fuzz in 1 Command
+---
+
+## 3. Compile, Polite Live-Record & Fuzz in 1 Command
 
 ```bash
 cd hub
+
+# Compile & strictly validate all internal/extract/manifests/*.yaml -> compiled.json:
+npm run adapter:compile
+
 # Polite live test (verifies /robots.txt + Content-Signal, previews Markdown & token savings, and writes fixture JSON):
 npm run adapter:test rubygems https://rubygems.org/gems/rails --record
 
-# Run offline schema validation + fixture checks + 100 KB linear-time bulkhead fuzzer across all adapters:
+# Run schema validation + fixture checks + >100 KB linear-time (< 50ms/case) bulkhead fuzzer across all 56+ adapters:
 npm run adapter:test
 ```

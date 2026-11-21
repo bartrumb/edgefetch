@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 /**
- * Scaffolds a new contributor Site Adapter + JSON test fixture in 1 command:
+ * Scaffolds a new contributor Declarative YAML Site Adapter + JSON test fixture in 1 command:
  *
- *   npm run adapter:new <category>/<slug>                # Default: zero-code shared Go+TS declarative YAML manifest
- *   npm run adapter:new <category>/<slug> --html         # TypeScript HTML adapter powered by parseHtmlDoc() CSS selectors
- *   npm run adapter:new <category>/<slug> --ts           # TypeScript custom logic adapter
+ *   npm run adapter:new <category>/<slug>          # Default: declarative YAML pre-fetch JSON/text twin manifest
+ *   npm run adapter:new <category>/<slug> --html   # Declarative YAML post-fetch HTML CSS-selector/JSON-LD manifest
+ *
+ * 100% of EdgeFetch site adapters are declarative `#`-commented `.yaml` manifests in
+ * `internal/extract/manifests/<slug>.yaml` compiled to `internal/extract/manifests/compiled.json`
+ * and shared across both the TypeScript Hub and the pure-Go Hub (`//go:embed`).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const VALID_CATEGORIES = new Set([
@@ -21,10 +25,18 @@ const VALID_CATEGORIES = new Set([
   'commerce-social',
 ]);
 
-const hubRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const scriptsDir = dirname(fileURLToPath(import.meta.url));
+const hubRoot = resolve(scriptsDir, '..');
 const repoRoot = resolve(hubRoot, '..');
 const args = process.argv.slice(2);
-const useTsMode = args.includes('--html') || args.includes('--ts');
+
+if (args.includes('--ts')) {
+  console.error(
+    'TypeScript site adapters have been retired: 100% of EdgeFetch site adapters are declarative YAML manifests in internal/extract/manifests/<slug>.yaml.\nUse `npm run adapter:new <category>/<slug>` (or add `--html` for declarative CSS-selector/JSON-LD HTML routes).',
+  );
+  process.exit(1);
+}
+
 const useHtmlTemplate = args.includes('--html');
 const rawArg = (args.find((a) => !a.startsWith('--')) ?? '').trim();
 
@@ -32,8 +44,8 @@ if (!rawArg || !rawArg.includes('/')) {
   console.error(
     [
       'Usage:',
-      '  npm run adapter:new <category>/<slug>          # Zero-code shared Go+TS YAML manifest (recommended)',
-      '  npm run adapter:new <category>/<slug> --html   # TypeScript HTML adapter with parseHtmlDoc() CSS selectors',
+      '  npm run adapter:new <category>/<slug>          # Shared Go+TS declarative YAML twin manifest',
+      '  npm run adapter:new <category>/<slug> --html   # Shared declarative YAML HTML CSS-selector/JSON-LD manifest',
       `Categories: ${[...VALID_CATEGORIES].join(', ')}`,
       'Example: npm run adapter:new developer/deno-land',
     ].join('\n'),
@@ -51,26 +63,76 @@ if (!slug || !/^[a-z0-9][a-z0-9-]{1,48}$/.test(slug)) {
   process.exit(1);
 }
 
-const camelIdentifier = slug.replace(/-([a-z0-9])/g, (_m, ch) => ch.toUpperCase());
 const titleLabel = slug
   .split('-')
   .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
   .join(' ');
 
-const fixturePath = join(hubRoot, 'test', 'fixtures', 'adapters', `${slug}.json`);
-mkdirSync(dirname(fixturePath), { recursive: true });
+const manifestsDir = resolve(repoRoot, 'internal', 'extract', 'manifests');
+const manifestPath = resolve(manifestsDir, `${slug}.yaml`);
+if (!manifestPath.startsWith(manifestsDir + sep)) {
+  console.error(`Refusing unsafe manifest path: ${manifestPath}`);
+  process.exit(1);
+}
+if (existsSync(manifestPath)) {
+  console.error(`Declarative YAML manifest already exists: ${manifestPath}`);
+  process.exit(1);
+}
 
-if (!useTsMode) {
-  const manifestPath = join(repoRoot, 'internal', 'extract', 'manifests', `${slug}.yaml`);
-  const declarativeTsPath = join(hubRoot, 'src', 'extractors', 'declarative.ts');
+const fixturesDir = resolve(hubRoot, 'test', 'fixtures', 'adapters');
+const fixturePath = resolve(fixturesDir, `${slug}.json`);
+if (!fixturePath.startsWith(fixturesDir + sep)) {
+  console.error(`Refusing unsafe fixture path: ${fixturePath}`);
+  process.exit(1);
+}
 
-  if (existsSync(manifestPath) || existsSync(join(repoRoot, 'internal', 'extract', 'manifests', `${slug}.json`))) {
-    console.error(`Declarative manifest already exists: ${manifestPath}`);
-    process.exit(1);
-  }
-  mkdirSync(dirname(manifestPath), { recursive: true });
+mkdirSync(manifestsDir, { recursive: true });
+mkdirSync(fixturesDir, { recursive: true });
 
-  const manifestYaml = `# Shared Go + TypeScript Declarative Site Adapter: ${titleLabel}
+const manifestYaml = useHtmlTemplate
+  ? `# Shared Go + TypeScript Declarative Site Adapter: ${titleLabel}
+id: ${slug}
+name: ${titleLabel}
+category: ${category}
+description: Extracts structured records from ${titleLabel} HTML pages using declarative CSS selectors and Schema.org JSON-LD.
+domains:
+  - example.com
+exampleUrls:
+  - https://example.com/listings/sample
+
+htmlRoutes:
+  - id: ${slug}
+    match:
+      minSegments: 1
+      pathPrefix: /listings
+    mode: dom
+    jsonLdTypes: [Article, WebPage, JobPosting, Product]
+    vars:
+      title:
+        jsonLdPaths: [name, headline]
+        cssText: h1
+        metaKeys: [og:title]
+        trim: true
+      summary:
+        jsonLdPaths: [description]
+        metaKeys: [description, og:description]
+        trim: true
+      location:
+        cssText: ".listing-location"
+        trim: true
+      body:
+        cssHtmlToMd: "article, main, .listing-body"
+    requireVars: [title]
+    titleTemplate: "{title}"
+    descriptionVar: summary
+    introVar: summary
+    bullets:
+      - label: Location
+        template: "{location}"
+        whenVar: location
+    bodyVar: body
+`
+  : `# Shared Go + TypeScript Declarative Site Adapter: ${titleLabel}
 id: ${slug}
 name: ${titleLabel}
 category: ${category}
@@ -116,141 +178,34 @@ extract:
       whenVar: version
 `;
 
-  const fixtureTemplate = {
-    adapterId: slug,
-    mode: 'twin',
-    inputUrl: 'https://example.com/items/sample',
-    expectedFetchUrl: 'https://example.com/api/items/sample.json',
-    mockPayload: JSON.stringify({
-      title: `Sample ${titleLabel} Record`,
-      summary: 'Clean structured output verified by the automatic fixture runner.',
-      version: '1.0.0',
-    }),
-    expectTitleIncludes: `Sample ${titleLabel}`,
-    expectMarkdownIncludes: [`# Sample ${titleLabel} Record`, 'Clean structured output'],
-  };
-
-  writeFileSync(manifestPath, manifestYaml, 'utf8');
-  writeFileSync(fixturePath, `${JSON.stringify(fixtureTemplate, null, 2)}\n`, 'utf8');
-
-  const manifestVar = `${camelIdentifier}Manifest`;
-  const importStmt = `import ${manifestVar} from '../../../internal/extract/manifests/${slug}.yaml';\n`;
-  const declSrc = readFileSync(declarativeTsPath, 'utf8');
-  if (!declSrc.includes(importStmt)) {
-    const arrMarker = 'const RAW_DECLARATIVE_MANIFESTS: ReadonlyArray<DeclarativeAdapterManifest | string> = [';
-    const updated = declSrc
-      .replace("import type { AdapterCategory", `${importStmt}\nimport type { AdapterCategory`)
-      .replace(arrMarker, `${arrMarker}\n  ${manifestVar},`);
-    writeFileSync(declarativeTsPath, updated, 'utf8');
-  }
-
-  console.log(`Created shared Go+TS manifest: ${manifestPath}`);
-  console.log(`Created fixture:               ${fixturePath}`);
-  console.log(`Registered in:                 ${declarativeTsPath} (and auto-embedded in Go via //go:embed)`);
-  console.log(`\nNext: edit ${manifestPath}, then run: npm run adapter:test ${slug} <https://live-url> --record`);
-} else {
-  const providerPath = join(hubRoot, 'src', 'extractors', 'providers', category, `${slug}.ts`);
-  const barrelPath = join(hubRoot, 'src', 'extractors', 'providers', 'index.ts');
-
-  if (existsSync(providerPath)) {
-    console.error(`Adapter already exists: ${providerPath}`);
-    process.exit(1);
-  }
-  mkdirSync(dirname(providerPath), { recursive: true });
-
-  const adapterTemplate = useHtmlTemplate
-    ? `import { defineAdapter } from '../../types';
-import { formatGfmTable, parseHtmlDoc } from '../../utils';
-
-export default defineAdapter({
-  id: '${slug}',
-  name: '${titleLabel}',
-  category: '${category}',
-  description: 'Extracts structured records from ${titleLabel} HTML pages using parseHtmlDoc() CSS selectors.',
-  domains: ['example.com'],
-  exampleUrls: ['https://example.com/listings'],
-  extractHtml({ rawHtml }) {
-    const doc = parseHtmlDoc(rawHtml);
-    const title = doc.text('h1') || '${titleLabel}';
-    const rows: string[][] = [];
-    for (const card of doc.select('.listing-card', 50)) {
-      const name = card.text('h2, h3');
-      const meta = card.dlMap();
-      if (name) rows.push([name, meta['location'] ?? '-']);
+const fixtureTemplate = useHtmlTemplate
+  ? {
+      adapterId: slug,
+      mode: 'html',
+      inputUrl: 'https://example.com/listings/sample',
+      mockPayload: `<!doctype html><html><body><h1>Sample ${titleLabel}</h1><meta name="description" content="Clean structured HTML extraction." /><span class="listing-location">Remote</span><article><p>Detailed body text.</p></article></body></html>`,
+      expectTitleIncludes: `Sample ${titleLabel}`,
+      expectMarkdownIncludes: [`# Sample ${titleLabel}`, 'Remote'],
     }
-    if (rows.length === 0) return null;
-    return {
-      extractorId: '${slug}',
-      title,
-      markdown: [\`# \${title}\`, formatGfmTable(['Item', 'Location'], rows)].join('\\n\\n'),
+  : {
+      adapterId: slug,
+      mode: 'twin',
+      inputUrl: 'https://example.com/items/sample',
+      expectedFetchUrl: 'https://example.com/api/items/sample.json',
+      mockPayload: JSON.stringify({
+        title: `Sample ${titleLabel} Record`,
+        summary: 'Clean structured output verified by the automatic fixture runner.',
+        version: '1.0.0',
+      }),
+      expectTitleIncludes: `Sample ${titleLabel}`,
+      expectMarkdownIncludes: [`# Sample ${titleLabel} Record`, 'Clean structured output'],
     };
-  },
-});
-`
-    : `import { defineAdapter } from '../../types';
-import { parseJsonObject } from '../../utils';
 
-export default defineAdapter({
-  id: '${slug}',
-  name: '${titleLabel}',
-  category: '${category}',
-  description: 'Upgrades ${titleLabel} pages to their public JSON endpoint.',
-  domains: ['example.com'],
-  exampleUrls: ['https://example.com/items/sample'],
-  resolveTwin({ host, parts }) {
-    if (parts[0] !== 'items' || !parts[1]) return null;
-    const id = encodeURIComponent(parts[1]);
-    return {
-      id: '${slug}',
-      fetchUrl: \`https://\${host}/api/items/\${id}.json\`,
-      kind: 'json',
-      accept: 'application/json',
-      formatTwin: (rawBody) => {
-        const data = parseJsonObject(rawBody);
-        if (!data || typeof data.title !== 'string') return null;
-        const title = data.title.trim();
-        const summary = typeof data.summary === 'string' ? data.summary.trim() : '';
-        return {
-          title,
-          ...(summary ? { description: summary } : {}),
-          markdown: [\`# \${title}\`, summary].filter(Boolean).join('\\n\\n'),
-        };
-      },
-    };
-  },
-});
-`;
+writeFileSync(manifestPath, manifestYaml, 'utf8');
+writeFileSync(fixturePath, `${JSON.stringify(fixtureTemplate, null, 2)}\n`, 'utf8');
 
-  const fixtureTemplate = {
-    adapterId: slug,
-    mode: useHtmlTemplate ? 'html' : 'twin',
-    inputUrl: useHtmlTemplate ? 'https://example.com/listings' : 'https://example.com/items/sample',
-    ...(useHtmlTemplate ? {} : { expectedFetchUrl: 'https://example.com/api/items/sample.json' }),
-    mockPayload: useHtmlTemplate
-      ? `<!doctype html><html><body><h1>Sample ${titleLabel}</h1><div class="listing-card"><h3>First Item</h3><dl><dt>Location</dt><dd>Remote</dd></dl></div></body></html>`
-      : JSON.stringify({
-          title: `Sample ${titleLabel} Record`,
-          summary: 'Clean structured output verified by the automatic fixture runner.',
-        }),
-    expectTitleIncludes: `Sample ${titleLabel}`,
-    expectMarkdownIncludes: [`# Sample ${titleLabel}`],
-  };
+execFileSync(process.execPath, [join(scriptsDir, 'compile-manifests.mjs')], { stdio: 'inherit' });
 
-  writeFileSync(providerPath, adapterTemplate, 'utf8');
-  writeFileSync(fixturePath, `${JSON.stringify(fixtureTemplate, null, 2)}\n`, 'utf8');
-
-  const barrelSrc = readFileSync(barrelPath, 'utf8');
-  const importStmt = `import ${camelIdentifier} from './${category}/${slug}';\n`;
-  if (!barrelSrc.includes(importStmt)) {
-    const marker = 'export const BUILTIN_SITE_ADAPTERS: readonly SiteAdapter[] = [';
-    const updated = barrelSrc
-      .replace(marker, `${importStmt}\n${marker}`)
-      .replace(/\n\];\s*$/, `\n  ${camelIdentifier},\n];\n`);
-    writeFileSync(barrelPath, updated, 'utf8');
-  }
-
-  console.log(`Created TypeScript adapter: ${providerPath}`);
-  console.log(`Created fixture:            ${fixturePath}`);
-  console.log(`Registered in:              ${barrelPath}`);
-  console.log(`\nNext: customize selectors/URLs, then run: npm run adapter:test ${slug}`);
-}
+console.log(`Created declarative YAML manifest: ${manifestPath}`);
+console.log(`Created fixture:                   ${fixturePath}`);
+console.log(`\nNext: customize ${manifestPath}, then run: npm run adapter:test ${slug} <https://live-url> --record`);

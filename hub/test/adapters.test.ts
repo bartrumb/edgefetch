@@ -571,8 +571,8 @@ test('ADAPTER-8: Vetted DevEx Stack — parseHtmlDoc (htmlparser2), compileLinea
   const { parseHtmlDoc, compileLinearRegex } = await import('../src/extractors/utils.ts');
   const { DECLARATIVE_SITE_ADAPTERS } = await import('../src/extractors/declarative.ts');
 
-  // 1. At least 10 shared Go+TS declarative manifests compiled cleanly
-  assert.ok(DECLARATIVE_SITE_ADAPTERS.length >= 10, `expected >= 10 declarative adapters, got ${DECLARATIVE_SITE_ADAPTERS.length}`);
+  // 1. All 56+ shared Go+TS declarative YAML manifests compiled cleanly
+  assert.ok(DECLARATIVE_SITE_ADAPTERS.length >= 56, `expected >= 56 declarative adapters, got ${DECLARATIVE_SITE_ADAPTERS.length}`);
   const rubyTwin = resolveSiteExtractorTwin('https://rubygems.org/gems/rails');
   assert.equal(rubyTwin?.id, 'rubygems');
   assert.equal(rubyTwin?.fetchUrl, 'https://rubygems.org/api/v1/gems/rails.json');
@@ -607,5 +607,92 @@ test('ADAPTER-8: Vetted DevEx Stack — parseHtmlDoc (htmlparser2), compileLinea
   assert.equal(linRe.test(`${'a'.repeat(5_000)}!`), false);
   assert.ok(performance.now() - t0 < 50, 're2js Thompson NFA must evaluate 5,000-char non-matching subject in <50ms');
 });
+
+test('ADAPTER-9: Round 6 Hardening — 100% YAML Zero-TS Providers, M1 Selector Depth/Colon Bounds, M2 Host-Claim Guards & R6-H5 YAML Safety', async () => {
+  const { existsSync } = await import('node:fs');
+  const { parseHtmlDoc } = await import('../src/extractors/utils.ts');
+  const { compileValidatedManifestSet, parseDeclarativeManifest } = await import('../src/extractors/declarative.ts');
+
+  // 1. Zero TypeScript provider files remain under src/extractors/providers
+  const hubRoot = process.env.EDGEFETCH_HUB_ROOT ? resolve(process.env.EDGEFETCH_HUB_ROOT) : resolve('.');
+  const providersDir = join(hubRoot, 'src', 'extractors', 'providers');
+  assert.equal(existsSync(providersDir), false, 'src/extractors/providers directory must be completely removed');
+
+  // 2. M1: 50,000-deep nested <div> and 100,000 trailing colons in <dt> finish linearly in < 50ms without stack overflow
+  const deepHtml = `${'<div>'.repeat(50_000)}deep${'</div>'.repeat(50_000)}`;
+  const tDeep = performance.now();
+  const deepDoc = parseHtmlDoc(deepHtml);
+  assert.equal(deepDoc.text('div'), 'deep');
+  assert.ok(performance.now() - tDeep < 50, 'M1: 50,000-deep HTML DOM cap must finish in < 50ms');
+
+  const colonHtml = `<dl><dt>Key${':'.repeat(100_000)}   </dt><dd>Value</dd></dl>`;
+  const tColon = performance.now();
+  const colonDoc = parseHtmlDoc(colonHtml);
+  assert.deepEqual(colonDoc.dlMap(), { key: 'Value' });
+  assert.ok(performance.now() - tColon < 80, 'M1: dlMap trailing colon trim must run in O(N)');
+
+  // 3. R6-H5: YAML anchors, aliases, merge keys, explicit tags, and non-ASCII keys are rejected
+  assert.throws(() => parseDeclarativeManifest('id: &a foo\nname: *a\n'), /anchor|alias/i);
+  assert.throws(() => parseDeclarativeManifest('id: !!str foo\n'), /tag/i);
+  assert.throws(() => parseDeclarativeManifest('base:\n  k: v\nchild:\n  <<: *base\n'), /anchor|alias|merge/i);
+  assert.throws(() => parseDeclarativeManifest('id: bad\ndomain\u017f: [example.com]\n'), /non-ASCII/i);
+
+  // 4. M2: Broad TLD wildcards (*.com), cross-origin {host} exfiltration, and duplicate adapter/twin IDs are rejected
+  assert.throws(
+    () =>
+      parseDeclarativeManifest(
+        [
+          'id: broad-claim',
+          'name: Broad',
+          'category: developer',
+          'description: Attempt broad wildcard claim',
+          'domains: ["*.com"]',
+          'exampleUrls: ["https://example.com/a"]',
+          'match: { pathSegments: ["a"] }',
+          'twin: { fetchUrl: "https://api.example.com/a.json", kind: "json", accept: "application/json" }',
+          'extract: { titleTemplate: "x" }',
+        ].join('\n'),
+      ),
+    /broad|wildcard/i,
+  );
+
+  assert.throws(
+    () =>
+      parseDeclarativeManifest(
+        [
+          'id: leak-host',
+          'name: Leak',
+          'category: developer',
+          'description: Attempt cross-origin host interpolation',
+          'domains: ["*.example.org"]',
+          'exampleUrls: ["https://sub.example.org/a"]',
+          'match: { pathSegments: ["a"] }',
+          'twin: { fetchUrl: "https://collector.example.net/{host}/a.json", kind: "json", accept: "application/json" }',
+          'extract: { titleTemplate: "x" }',
+        ].join('\n'),
+      ),
+    /same-origin|host/i,
+  );
+
+  const validM = parseDeclarativeManifest(
+    [
+      'id: dup-check',
+      'name: Dup Check',
+      'category: developer',
+      'description: Valid manifest for duplicate check',
+      'domains: ["example.org"]',
+      'exampleUrls: ["https://example.org/a"]',
+      'match: { pathSegments: ["a"] }',
+      'twin: { id: "shared-twin", fetchUrl: "https://example.org/a.json", kind: "json", accept: "application/json" }',
+      'extract: { titleTemplate: "x" }',
+    ].join('\n'),
+  );
+  assert.throws(() => compileValidatedManifestSet([validM, validM]), /Duplicate declarative adapter manifest id/i);
+  assert.throws(
+    () => compileValidatedManifestSet([validM, { ...validM, id: 'dup-check-2' }]),
+    /Duplicate twin id/i,
+  );
+});
+
 
 

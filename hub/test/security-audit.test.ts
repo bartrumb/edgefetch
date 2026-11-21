@@ -37,11 +37,12 @@ import {
   filterSafeResponseHeaders,
 } from '../src/framework-detect.ts';
 import { verifyStoredArtifact } from '../src/ingest.ts';
-import icimsAdapter from '../src/extractors/providers/jobs/icims.ts';
-import shopifyAdapter, {
+import {
+  icimsAdapter,
   isShopifyHtmlOrHeaders,
   resolveCustomDomainShopifyProductTwinUrl,
-} from '../src/extractors/providers/commerce-social/shopify.ts';
+  shopifyAdapter,
+} from '../src/extractors/registry.ts';
 import {
   buildBlockedInfo,
   chunkJsonRecords,

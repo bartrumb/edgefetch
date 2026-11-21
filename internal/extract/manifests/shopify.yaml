@@ -1,0 +1,93 @@
+# Shared Go + TypeScript Declarative Site Adapter: Shopify Universal Storefront & Catalogs
+id: shopify
+name: "Shopify Universal Storefront & Catalogs"
+category: commerce-social
+description: "Formats /products.json and /collections/<h>/products.json store inventories, upgrades *.myshopify.com and custom-domain /products/<handle> pages, and implements polite full-store catalog pulls."
+domains:
+  - "*.myshopify.com"
+universalEngine: true
+exampleUrls:
+  - https://allbirds.myshopify.com/products/mens-tree-runners
+  - "https://allbirds.myshopify.com/products.json?limit=30&page=1"
+
+# Polite full-store and per-collection catalog pagination configuration
+catalog:
+  platform: shopify
+  pauseMs: 2000
+  pageCap: 200
+  firstPageTemplate: "{origin}/products.json?limit=250&page=1"
+  collectionPageTemplate: "{origin}/collections/{collection}/products.json?limit=250&page=1"
+  perPage: 250
+  maxVariantsPerProduct: 250
+  maxImagesPerProduct: 250
+
+routes:
+  # 1. Storefront /products.json or /collections/<col>/products.json on any domain
+  - match:
+      anyOf:
+        - pathEquals:
+            - /products.json
+        - exactSegments: true
+          pathSegments:
+            - collections
+            - param: col
+              charset: slug
+              maxLen: 160
+            - products.json
+    twin:
+      id: shopify-catalog-page
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      commerceMode: shopify_catalog_page
+
+  # 2. Explicit /products/<handle>.js Ajax endpoint on any domain
+  - match:
+      pathSuffix: .js
+      scanSegment:
+        afterLiteral: products
+        param: handle
+        charset: slug
+        stripSuffix: .js
+        maxLen: 160
+    twin:
+      id: shopify
+      fetchUrl: "https://{host}/products/{handle}.js"
+      kind: json
+      accept: application/json
+    extract:
+      commerceMode: shopify_product_js
+
+  # 3. Explicit /products/<handle>.json on any domain OR /products/<handle> on *.myshopify.com
+  - match:
+      anyOf:
+        - pathSuffix: .json
+          scanSegment:
+            afterLiteral: products
+            param: handle
+            charset: slug
+            stripSuffix: .json
+            maxLen: 160
+        - hosts:
+            - "*.myshopify.com"
+          scanSegment:
+            afterLiteral: products
+            param: handle
+            charset: slug
+            stripSuffix: .json
+            maxLen: 160
+    twin:
+      id: shopify
+      fetchUrl: "https://{host}/products/{handle}.json"
+      kind: json
+      accept: application/json
+    extract:
+      commerceMode: shopify_product
+
+# Custom-domain post-fetch HTML product extractor (embedded JSON + Schema.org Product fallback)
+htmlRoutes:
+  - id: shopify
+    match:
+      pathContainsSegment: products
+    mode: shopify_html

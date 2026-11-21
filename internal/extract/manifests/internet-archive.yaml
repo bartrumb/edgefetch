@@ -1,0 +1,123 @@
+# Shared Go + TypeScript Declarative Site Adapter: Internet Archive (archive.org)
+id: internet-archive
+name: Internet Archive Items (archive.org)
+category: genai
+description: Upgrades archive.org/details/<id> pages to the official /metadata/<id> JSON feed with creator, license, and downloadable files.
+domains:
+  - archive.org
+  - www.archive.org
+exampleUrls:
+  - https://archive.org/details/apollo11-audio
+
+# Match /details/<identifier> (2..120 safe pkg chars; rejects leading '@')
+match:
+  exactSegments: true
+  pathSegments:
+    - details
+    - param: identifier
+      charset: pkg
+      minLen: 2
+      maxLen: 120
+
+twin:
+  fetchUrl: "https://archive.org/metadata/{identifier}"
+  kind: json
+  accept: application/json
+
+extract:
+  requireAnyFields:
+    - metadata
+  vars:
+    title:
+      paths:
+        - metadata.title
+      fallbackTemplate: "{identifier}"
+      trim: true
+    creator:
+      paths:
+        - metadata.creator
+      join: ", "
+    mediatype:
+      paths:
+        - metadata.mediatype
+    date:
+      paths:
+        - metadata.date
+        - metadata.publicdate
+    license:
+      paths:
+        - metadata.licenseurl
+    collections:
+      paths:
+        - metadata.collection
+      limit: 6
+      join: ", "
+    desc:
+      paths:
+        - metadata.description
+      join: "\n\n"
+      format: strip_tags
+    descShort:
+      paths:
+        - metadata.description
+      join: "\n\n"
+      format: strip_tags
+      sliceMax: 260
+  titleTemplate: "{title}"
+  descriptionVar: descShort
+  authorVar: creator
+  publishedTimeVar: date
+  bullets:
+    - label: Identifier
+      template: "`{identifier}`"
+    - label: Creator
+      template: "{creator}"
+      whenVar: creator
+    - label: Media Type
+      template: "{mediatype}"
+      whenVar: mediatype
+    - label: Date
+      template: "{date}"
+      whenVar: date
+    - label: Collections
+      template: "{collections}"
+      whenVar: collections
+    - label: License
+      template: "{license}"
+      whenVar: license
+  sections:
+    - heading: Description
+      textVar: desc
+    - heading: Files
+      arrayPath: files
+      filter:
+        excludeFieldSuffixes:
+          field: name
+          suffixes:
+            - _meta.xml
+            - _files.xml
+      limit: 15
+      requireItemVar: fname
+      collectLinkVars:
+        - dlUrl
+      itemVars:
+        fname:
+          paths:
+            - name
+        dlUrl:
+          template: "https://archive.org/download/{identifier}/{fname}"
+          whenVars:
+            - fname
+          replaceAll:
+            from: " "
+            to: "%20"
+      columns:
+        - header: File
+          template: "[{fname}]({dlUrl})"
+        - header: Format
+          paths:
+            - format
+        - header: Size
+          paths:
+            - size
+          format: bytes_human

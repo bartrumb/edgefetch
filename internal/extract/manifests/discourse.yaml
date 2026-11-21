@@ -1,0 +1,101 @@
+# Shared Go + TypeScript Declarative Site Adapter: Discourse Forum Threads (Universal Engine)
+id: discourse-topic
+name: Discourse Forum Threads (Universal Engine)
+category: commerce-social
+description: Upgrades any Discourse forum thread (/t/<slug>/<id>) to its .json post_stream with Accepted Solution badges.
+domains:
+  - meta.discourse.org
+  - community.home-assistant.io
+  - users.rust-lang.org
+  - discuss.python.org
+universalEngine: true
+exampleUrls:
+  - https://community.home-assistant.io/t/websocket-reconnect-backoff/712345
+
+# Matches /t/<slug>/<topicId> (requiring numeric topicId at segment 2)
+match:
+  exactSegments: false
+  pathSegments:
+    - t
+    - param: slug
+      charset: url_seg
+    - param: topicId
+      charset: digits
+
+twin:
+  id: discourse-topic
+  fetchUrl: "https://{host}/t/{slug}/{topicId}.json"
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - title
+  requireAnyFields:
+    - post_stream.posts
+  vars:
+    title:
+      paths: [title]
+      trim: true
+    tags:
+      paths: [tags]
+      itemWrap: "`"
+      join: ", "
+      limit: 20
+    firstAuthor:
+      paths: [post_stream.posts.0.username]
+    firstCreated:
+      paths: [post_stream.posts.0.created_at]
+    acceptedPostNum:
+      paths: [accepted_answer.post_number]
+  titleTemplate: "{title}"
+  authorVar: firstAuthor
+  publishedTimeVar: firstCreated
+  metaLine:
+    - label: Tags
+      template: "{tags}"
+      whenVar: tags
+  sections:
+    - heading: ""
+      subsectionsArrayPath: post_stream.posts
+      limit: 20
+      requireItemVar: body
+      subsectionHeadingTemplate: "Original Post \u2014 {userWithDate}"
+      subsectionAltWhenVar: nonOpPostNum
+      subsectionAltHeadingTemplate: "{replyBadge} \u2014 {userWithDate}"
+      subsectionBodyVar: body
+      itemVars:
+        postNum:
+          paths: [post_number]
+          fallbackTemplate: "{index1}"
+        nonOpPostNum:
+          paths: [post_number]
+          excludeEquals: "1"
+        isAcceptedFlag:
+          paths: [accepted_answer]
+          format: bool_map
+          trueValue: "1"
+          falseValue: ""
+        isAcceptedPostNum:
+          paths: [post_number]
+          equalsVar: acceptedPostNum
+        replyBadge:
+          template: "\u2705 Accepted Solution"
+          whenAnyVars: [isAcceptedFlag, isAcceptedPostNum]
+          fallbackTemplate: "Reply #{postNum}"
+        username:
+          paths: [username]
+        userLabel:
+          template: "@{username}"
+          whenVars: [username]
+          default: user
+        createdDate:
+          paths: [created_at]
+          sliceMax: 10
+        userWithDate:
+          template: "{userLabel} ({createdDate})"
+          whenVars: [createdDate]
+          fallbackVar: userLabel
+        body:
+          paths: [cooked]
+          format: html_to_md

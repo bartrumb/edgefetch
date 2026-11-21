@@ -1,0 +1,104 @@
+# Shared Go + TypeScript Declarative Site Adapter: openFDA Recalls, Labels & Adverse Events API
+id: openfda
+name: openFDA Recalls, Labels & Adverse Events API
+category: research-health
+description: Formats keyless api.fda.gov JSON endpoints (drug/food/device enforcement recalls, drug labels, and adverse events) into clean Markdown tables.
+domains:
+  - api.fda.gov
+exampleUrls:
+  - "https://api.fda.gov/food/enforcement.json?limit=5"
+
+# Match any api.fda.gov/*.json endpoint while preserving query parameters via {requestUrl}
+match:
+  pathSuffix: .json
+  pathSegments:
+    - param: endpointLabel
+      charset: safe_subpath
+      greedy: true
+      stripSuffix: .json
+
+twin:
+  fetchUrl: "{requestUrl}"
+  kind: json
+  accept: application/json
+
+extract:
+  requireAnyFields:
+    - results
+  vars:
+    resultsCount:
+      paths:
+        - results
+      format: array_len
+    total:
+      paths:
+        - meta.results.total
+      format: int_comma
+      fallbackTemplate: "{resultsCount}"
+    isRecall:
+      paths:
+        - results.0.recall_number
+        - results.0.reason_for_recall
+  titleTemplate: "openFDA {endpointLabel} ({resultsCount} of {total} records)"
+  sections:
+    - heading: ""
+      whenVar: isRecall
+      arrayPath: results
+      limit: 25
+      columns:
+        - header: "Recall #"
+          paths:
+            - recall_number
+          code: true
+        - header: Class
+          paths:
+            - classification
+        - header: Status
+          paths:
+            - status
+        - header: Firm
+          paths:
+            - recalling_firm
+        - header: Reason
+          paths:
+            - reason_for_recall
+    - heading: ""
+      unlessVar: isRecall
+      subsectionsArrayPath: results
+      limit: 10
+      subsectionHeadingTemplate: "{recHeading}"
+      subsectionSubkeys:
+        - indications_and_usage
+        - warnings
+        - boxed_warning
+        - dosage_and_administration
+        - adverse_reactions
+      itemVars:
+        brand:
+          paths:
+            - openfda.brand_name.0
+        generic:
+          paths:
+            - openfda.generic_name.0
+        genericParens:
+          template: "({generic})"
+          whenVars:
+            - generic
+        brandAndGeneric:
+          template: "{brand} {genericParens}"
+          whenVars:
+            - brand
+            - genericParens
+          fallbackVar: brand
+        brandOrGeneric:
+          template: "{brandAndGeneric}"
+          whenVars:
+            - brandAndGeneric
+          fallbackVar: genericParens
+        recFallback:
+          template: "Record #{index1}"
+        recHeading:
+          template: "{brandOrGeneric}"
+          whenVars:
+            - brandOrGeneric
+          fallbackVar: recFallback

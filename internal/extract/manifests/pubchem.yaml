@@ -1,0 +1,171 @@
+# Shared Go + TypeScript Declarative Site Adapter: PubChem Chemical Compounds (NCBI)
+id: pubchem
+name: PubChem Chemical Compounds (NCBI)
+category: research-health
+description: Upgrades pubchem.ncbi.nlm.nih.gov/compound/<cid|name> to NCBI PUG-REST compound properties + pharmacological descriptions (with HTML JSON-LD fallback).
+domains:
+  - pubchem.ncbi.nlm.nih.gov
+exampleUrls:
+  - https://pubchem.ncbi.nlm.nih.gov/compound/2244
+
+# Numeric CIDs upgrade to robots.txt-allowed PUG-View Names and Identifiers JSON
+routes:
+  - match:
+      exactSegments: false
+      pathSegments:
+        - compound
+        - param: cid
+          charset: digits
+          minLen: 1
+          maxLen: 12
+    twin:
+      fetchUrl: "https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/{cid}/JSON/?heading=Names+and+Identifiers"
+      kind: json
+      accept: application/json
+    extract:
+      rootPath: Record
+      requireFields:
+        - RecordTitle
+      vars:
+        cidVal:
+          paths:
+            - RecordNumber
+          fallbackTemplate: "{cid}"
+        recTitle:
+          paths:
+            - RecordTitle
+          trim: true
+          fallbackTemplate: "Compound {cidVal}"
+        formula:
+          format: pubchem_toc
+          tocHeading: Molecular Formula
+        iupac:
+          format: pubchem_toc
+          tocHeading: IUPAC Name
+        inchiKey:
+          format: pubchem_toc
+          tocHeading: InChIKey
+        canonicalSmiles:
+          format: pubchem_toc
+          tocHeading: Canonical SMILES
+        smilesRaw:
+          format: pubchem_toc
+          tocHeading: SMILES
+        smiles:
+          template: "{smilesRaw}"
+          whenVars:
+            - smilesRaw
+          fallbackVar: canonicalSmiles
+        cas:
+          format: pubchem_toc
+          tocHeading: CAS
+        desc:
+          format: pubchem_toc
+          tocHeading: Record Description
+        descShort:
+          format: pubchem_toc
+          tocHeading: Record Description
+          sliceMax: 260
+      titleTemplate: "{recTitle} (PubChem CID {cidVal})"
+      descriptionVar: descShort
+      bullets:
+        - label: PubChem CID
+          template: "`{cidVal}`"
+        - label: Molecular Formula
+          template: "`{formula}`"
+          whenVar: formula
+        - label: CAS Number
+          template: "`{cas}`"
+          whenVar: cas
+        - label: IUPAC Name
+          template: "`{iupac}`"
+          whenVar: iupac
+        - label: InChIKey
+          template: "`{inchiKey}`"
+          whenVar: inchiKey
+        - label: SMILES
+          template: "`{smiles}`"
+          whenVar: smiles
+      sections:
+        - heading: Summary
+          textVar: desc
+      linkTemplates:
+        - "https://pubchem.ncbi.nlm.nih.gov/compound/{cidVal}"
+
+# HTML JSON-LD fallback for /compound/<cid|name> pages
+htmlRoutes:
+  - match:
+      exactSegments: false
+      pathSegments:
+        - compound
+        - param: slug
+          charset: url_seg
+    mode: dom
+    jsonLdTypes:
+      - MolecularEntity
+      - ChemicalSubstance
+    requireVars:
+      - title
+    requireBulletsOrVars:
+      - desc
+    vars:
+      title:
+        jsonLdPaths:
+          - name
+        metaKeys:
+          - "og:title"
+        stripRegexSuffix: "\\s*\\|\\s*C\\d+.*?\\s*-\\s*PubChem$"
+      formula:
+        jsonLdPaths:
+          - molecularFormula
+      weightValObj:
+        jsonLdPaths:
+          - molecularWeight.value
+      weightFromObj:
+        template: "{weightValObj} g/mol"
+        whenVars:
+          - weightValObj
+      weight:
+        jsonLdPaths:
+          - molecularWeight
+        fallbackVar: weightFromObj
+      iupac:
+        jsonLdPaths:
+          - iupacName
+      inchiKey:
+        jsonLdPaths:
+          - inChIKey
+      smiles:
+        jsonLdPaths:
+          - smiles
+        limit: 1
+      desc:
+        metaKeys:
+          - description
+      descShort:
+        metaKeys:
+          - description
+        sliceMax: 260
+    titleTemplate: "{title} (PubChem)"
+    descriptionVar: descShort
+    bullets:
+      - label: Molecular Formula
+        template: "`{formula}`"
+        whenVar: formula
+      - label: Molecular Weight
+        template: "{weight}"
+        whenVar: weight
+      - label: IUPAC Name
+        template: "`{iupac}`"
+        whenVar: iupac
+      - label: InChIKey
+        template: "`{inchiKey}`"
+        whenVar: inchiKey
+      - label: SMILES
+        template: "`{smiles}`"
+        whenVar: smiles
+    sections:
+      - heading: Summary
+        textVar: desc
+    appendCurrentMdDelta:
+      minExtraChars: 200

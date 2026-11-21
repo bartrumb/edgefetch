@@ -1,5 +1,11 @@
+import { execFileSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildSync } from 'esbuild';
+
+const scriptsDir = dirname(fileURLToPath(import.meta.url));
+execFileSync(process.execPath, [join(scriptsDir, 'compile-manifests.mjs')], { stdio: 'inherit' });
 
 mkdirSync('dist', { recursive: true });
 

@@ -6,17 +6,30 @@
  */
 
 import render from 'dom-serializer';
-import { type ChildNode, type Document, type Element, isTag, isText } from 'domhandler';
+import { type ChildNode, Document, Element, Text, isTag, isText } from 'domhandler';
 import { textContent } from 'domutils';
-import { parseDocument } from 'htmlparser2';
+import { Parser } from 'htmlparser2';
 
 const DEFAULT_MAX_HTML_DOC_CHARS = 2_097_152; // 2 MiB default input cap
+const MAX_HARD_HTML_DOC_CHARS = 4_194_304; // 4 MiB hard ceiling even when caller passes higher maxChars
+const MAX_DOM_DEPTH = 128;
+const MAX_DOM_NODES = 40_000;
+const MAX_DLMAP_VISITS = 4_000;
 const MAX_SELECTOR_CHARS = 256;
 const MAX_SELECTOR_GROUPS = 16;
 const MAX_COMBINATOR_STEPS = 8;
 const MAX_SELECT_LIMIT = 5_000;
 
-const STRIPPED_TEXT_TAGS: ReadonlySet<string> = new Set(['script', 'style', 'noscript', 'template']);
+const STRIPPED_TEXT_TAGS: ReadonlySet<string> = new Set([
+  'script',
+  'style',
+  'noscript',
+  'template',
+  'svg',
+  'xmp',
+  'plaintext',
+  'textarea',
+]);
 
 const BLOCK_BOUNDARY_TAGS: ReadonlySet<string> = new Set([
   'address',
@@ -508,39 +521,220 @@ function isSimpleLeafTextElement(node: Document | Element): boolean {
   return true;
 }
 
-function collectCleanTextChunks(children: readonly ChildNode[], out: string[]): void {
-  for (const child of children) {
+const CLEAN_NODE_TEXT_CACHE = new WeakMap<Document | Element, string>();
+
+function trimTrailingColonsAndWsLinear(input: string): string {
+  let end = input.length;
+  while (end > 0) {
+    const code = input.charCodeAt(end - 1);
+    if (code <= 32 || code === 58 /* ':' */ || code === 0xff1a /* '：' */ || code === 0x00a0) {
+      end--;
+    } else {
+      break;
+    }
+  }
+  let start = 0;
+  while (start < end && input.charCodeAt(start) <= 32) {
+    start++;
+  }
+  return start === 0 && end === input.length ? input : input.slice(start, end);
+}
+
+function computeRawNodeTextCached(node: Document | Element, rawCache: WeakMap<Document | Element, string>): string {
+  const hit = rawCache.get(node);
+  if (hit !== undefined) return hit;
+
+  if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
+    rawCache.set(node, '');
+    return '';
+  }
+
+  // Iterative post-order evaluation so deep subtrees never recurse and every Element is computed at most once.
+  const stack: Array<{ target: Document | Element; childIdx: number; chunks: string[] }> = [
+    { target: node, childIdx: 0, chunks: [] },
+  ];
+
+  while (stack.length > 0) {
+    const top = stack[stack.length - 1]!;
+    const children = top.target.children;
+    if (top.childIdx >= children.length) {
+      const joined = top.chunks.length === 0 ? '' : top.chunks.join('');
+      rawCache.set(top.target, joined);
+      stack.pop();
+      if (stack.length > 0) {
+        const parentFrame = stack[stack.length - 1]!;
+        const finishedTag = isTag(top.target) ? top.target.name.toLowerCase() : '';
+        const isBlock = finishedTag !== '' && BLOCK_BOUNDARY_TAGS.has(finishedTag);
+        if (isBlock) parentFrame.chunks.push(' ');
+        if (joined) parentFrame.chunks.push(joined);
+        if (isBlock) parentFrame.chunks.push(' ');
+      }
+      continue;
+    }
+
+    const child = children[top.childIdx++]!;
     if (isText(child)) {
-      if (child.data) out.push(child.data);
+      if (child.data) top.chunks.push(child.data);
       continue;
     }
     if (!isTag(child)) continue;
     const tagLower = child.name.toLowerCase();
     if (STRIPPED_TEXT_TAGS.has(tagLower)) continue;
     if (tagLower === 'br' || tagLower === 'hr') {
-      out.push(' ');
+      top.chunks.push(' ');
       continue;
     }
-    const isBlock = BLOCK_BOUNDARY_TAGS.has(tagLower);
-    if (isBlock) out.push(' ');
-    if (child.children.length > 0) {
-      collectCleanTextChunks(child.children, out);
+    const cachedChild = rawCache.get(child);
+    if (cachedChild !== undefined) {
+      const isBlock = BLOCK_BOUNDARY_TAGS.has(tagLower);
+      if (isBlock) top.chunks.push(' ');
+      if (cachedChild) top.chunks.push(cachedChild);
+      if (isBlock) top.chunks.push(' ');
+      continue;
     }
-    if (isBlock) out.push(' ');
+    stack.push({ target: child, childIdx: 0, chunks: [] });
+  }
+
+  return rawCache.get(node) ?? '';
+}
+
+const RAW_NODE_TEXT_CACHE = new WeakMap<Document | Element, string>();
+
+function extractCleanNodeText(node: Document | Element): string {
+  const cached = CLEAN_NODE_TEXT_CACHE.get(node);
+  if (cached !== undefined) return cached;
+  if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
+    CLEAN_NODE_TEXT_CACHE.set(node, '');
+    return '';
+  }
+  let clean: string;
+  if (isSimpleLeafTextElement(node)) {
+    clean = textContent(node).replace(/\s+/g, ' ').trim();
+  } else {
+    const raw = computeRawNodeTextCached(node, RAW_NODE_TEXT_CACHE);
+    clean = raw ? raw.replace(/\s+/g, ' ').trim() : '';
+  }
+  CLEAN_NODE_TEXT_CACHE.set(node, clean);
+  return clean;
+}
+
+class BoundedHtmlParser extends Parser {
+  private overflowDepth = 0;
+  private currentOpenOverflowed = false;
+  private readonly sourceHtml: string;
+
+  constructor(sourceHtml: string, cbs: ConstructorParameters<typeof Parser>[0], options: ConstructorParameters<typeof Parser>[1]) {
+    super(cbs, options);
+    this.sourceHtml = sourceHtml;
+  }
+
+  override onopentagname(start: number, endIndex: number): void {
+    const rawName = this.sourceHtml.slice(start, endIndex).toLowerCase();
+    const normName = rawName === 'image' && !this.isInForeignContext() ? 'img' : rawName;
+    const stackLen = (this as unknown as { stack: string[] }).stack.length;
+    if (stackLen >= MAX_DOM_DEPTH && !this.isVoidElement(normName)) {
+      this.endIndex = endIndex;
+      this.overflowDepth++;
+      this.currentOpenOverflowed = true;
+      (this as unknown as { tagname: string }).tagname = '';
+      return;
+    }
+    this.currentOpenOverflowed = false;
+    super.onopentagname(start, endIndex);
+  }
+
+  override onselfclosingtag(endIndex: number): void {
+    if (this.currentOpenOverflowed) {
+      this.currentOpenOverflowed = false;
+      if (this.isInForeignContext()) {
+        this.overflowDepth = Math.max(0, this.overflowDepth - 1);
+      }
+      this.startIndex = endIndex + 1;
+      return;
+    }
+    super.onselfclosingtag(endIndex);
+  }
+
+  override onclosetag(start: number, endIndex: number): void {
+    this.currentOpenOverflowed = false;
+    if (this.overflowDepth > 0) {
+      this.endIndex = endIndex;
+      const rawName = this.sourceHtml.slice(start, endIndex).toLowerCase();
+      const normName = rawName === 'image' && !this.isInForeignContext() ? 'img' : rawName;
+      if (!this.isVoidElement(normName)) {
+        this.overflowDepth--;
+      }
+      this.startIndex = endIndex + 1;
+      return;
+    }
+    super.onclosetag(start, endIndex);
   }
 }
 
-function extractCleanNodeText(node: Document | Element): string {
-  if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
-    return '';
-  }
-  if (isSimpleLeafTextElement(node)) {
-    return textContent(node).replace(/\s+/g, ' ').trim();
-  }
-  const chunks: string[] = [];
-  collectCleanTextChunks(node.children, chunks);
-  if (chunks.length === 0) return '';
-  return chunks.join('').replace(/\s+/g, ' ').trim();
+function buildBoundedDomDocument(html: string): Document {
+  const root = new Document([]);
+  const stack: Array<Document | Element> = [root];
+  let nodeCount = 0;
+  let halted = false;
+
+  const appendChildLinear = (parent: Document | Element, child: ChildNode) => {
+    const siblings = parent.children;
+    const prev = siblings.length > 0 ? siblings[siblings.length - 1]! : null;
+    child.parent = parent;
+    child.prev = prev;
+    child.next = null;
+    if (prev) prev.next = child;
+    siblings.push(child);
+  };
+
+  const parser = new BoundedHtmlParser(
+    html,
+    {
+      onopentag(name, attribs) {
+        if (halted) return;
+        if (nodeCount >= MAX_DOM_NODES) {
+          halted = true;
+          return;
+        }
+        if (stack.length - 1 < MAX_DOM_DEPTH) {
+          const el = new Element(name, attribs, []);
+          appendChildLinear(stack[stack.length - 1]!, el);
+          stack.push(el);
+          nodeCount++;
+        }
+      },
+      ontext(data) {
+        if (halted || !data) return;
+        const parent = stack[stack.length - 1]!;
+        const siblings = parent.children;
+        const last = siblings.length > 0 ? siblings[siblings.length - 1]! : null;
+        if (last && isText(last)) {
+          last.data += data;
+          return;
+        }
+        if (nodeCount >= MAX_DOM_NODES) {
+          halted = true;
+          return;
+        }
+        appendChildLinear(parent, new Text(data));
+        nodeCount++;
+      },
+      onclosetag() {
+        if (halted) return;
+        if (stack.length > 1) {
+          stack.pop();
+        }
+      },
+    },
+    {
+      decodeEntities: true,
+      lowerCaseTags: true,
+      lowerCaseAttributeNames: true,
+    },
+  );
+
+  parser.end(html);
+  return root;
 }
 
 function walkSubtreeElements(root: Document | Element, visit: (el: Element) => boolean | void): void {
@@ -643,16 +837,18 @@ export class HtmlNode {
     const containers = subSelector !== undefined ? this.select(subSelector, 200) : [this];
     const out: Record<string, string> = {};
     let count = 0;
+    let visits = 0;
+    const seenElements = new Set<Element>();
 
     for (const container of containers) {
+      if (isTag(container.node) && seenElements.has(container.node)) continue;
       let pendingKey = '';
       walkSubtreeElements(container.node, (el) => {
+        if (++visits > MAX_DLMAP_VISITS) return false;
+        seenElements.add(el);
         const t = el.name.toLowerCase();
         if (t === 'dt') {
-          pendingKey = extractCleanNodeText(el)
-            .toLowerCase()
-            .replace(/[:：\s]+$/, '')
-            .trim();
+          pendingKey = trimTrailingColonsAndWsLinear(extractCleanNodeText(el).toLowerCase());
         } else if (t === 'dd' && pendingKey) {
           const val = extractCleanNodeText(el);
           if (val && !(pendingKey in out)) {
@@ -664,7 +860,7 @@ export class HtmlNode {
         }
         return undefined;
       });
-      if (count >= 200) break;
+      if (count >= 200 || visits > MAX_DLMAP_VISITS) break;
     }
 
     return out;
@@ -719,7 +915,12 @@ export class HtmlDoc extends HtmlNode {
  * Parses `rawHtml` (capped to `maxChars`, default `2 MiB`) into a linear-time queryable `HtmlDoc`.
  */
 export function parseHtmlDoc(rawHtml: string, maxChars = DEFAULT_MAX_HTML_DOC_CHARS): HtmlDoc {
-  const safeHtml =
-    typeof rawHtml === 'string' ? (rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml) : '';
-  return new HtmlDoc(parseDocument(safeHtml));
+  const effectiveCap = Math.max(0, Math.min(MAX_HARD_HTML_DOC_CHARS, maxChars));
+  let safeHtml =
+    typeof rawHtml === 'string' ? (rawHtml.length > effectiveCap ? rawHtml.slice(0, effectiveCap) : rawHtml) : '';
+  if (safeHtml.includes('\0') || safeHtml.includes('&#')) {
+    safeHtml = safeHtml.replace(/\0|&#(?:0+|x0+);/gi, '');
+  }
+  const doc = buildBoundedDomDocument(safeHtml);
+  return new HtmlDoc(doc);
 }

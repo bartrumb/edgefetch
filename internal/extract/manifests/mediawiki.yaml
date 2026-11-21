@@ -1,0 +1,19 @@
+# Shared Go + TypeScript Declarative Site Adapter: Wikipedia & MediaWiki Encyclopedias
+id: mediawiki
+name: "Wikipedia & MediaWiki Encyclopedias"
+category: commerce-social
+description: "Strips [edit], [citation needed], reference back-link noise, and trailing MediaWiki navigation menus."
+domains:
+  - "*.wikipedia.org"
+  - wiki.archlinux.org
+universalEngine: true
+exampleUrls:
+  - https://en.wikipedia.org/wiki/HTTP/2
+
+# Post-fetch Markdown cleanup preset for Wikipedia and MediaWiki installations
+htmlRoutes:
+  - id: mediawiki
+    match:
+      exactSegments: false
+    mode: markdown_clean
+    cleanPreset: mediawiki

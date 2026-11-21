@@ -449,3 +449,110 @@ func TestGoHubDeclarativeExtractorsAndTwinScrapeUpgrade(t *testing.T) {
 		t.Fatalf("expected seamless HTML fallback when twin returns 404, got: %+v", fbMap)
 	}
 }
+
+func TestGoHubTwinSanitizationAndCrossDomainRedirectBlock(t *testing.T) {
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	const callerTok = "caller-secret-token-0123456789abcdef"
+
+	mockTr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.URL.Path == "/robots.txt" || req.URL.Path == "/llms.txt":
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("not found")),
+				Request:    req,
+			}, nil
+		case req.URL.Host == "rubygems.org" && req.URL.Path == "/api/v1/gems/xssgem.json":
+			// Hostile twin payload containing NULs, raw <script>/<img onerror>, and javascript: link
+			payload := `{"name":"xssgem\u0000<script>alert(1)</script>","version":"1.0.0","info":"Bad <img src=x onerror=alert(1)> and [click](javascript:alert(2))","homepage_uri":"https://rubygems.org/gems/xssgem"}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(payload)),
+				Request:    req,
+			}, nil
+		case req.URL.Host == "rubygems.org" && req.URL.Path == "/api/v1/gems/redirgem.json":
+			// Cross-domain twin redirect to evil.example.net MUST be rejected so HTML fallback runs!
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"https://evil.example.net/hijack.json"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		case req.URL.Host == "evil.example.net" && req.URL.Path == "/hijack.json":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"name":"hijacked","version":"9.9.9","info":"spoofed"}`)),
+				Request:    req,
+			}, nil
+		default:
+			html := `<!doctype html><html><head><title>Safe Fallback</title></head><body><main><h1>Safe Fallback</h1><p>Fallback rendered cleanly.</p></main></body></html>`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+				Body:       io.NopCloser(strings.NewReader(html)),
+				Request:    req,
+			}, nil
+		}
+	})
+
+	crawler := crawl.NewCrawler(mockTr, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	crawler.Sleep = func(context.Context, time.Duration) error { return nil }
+	defer func() { _ = crawler.Close() }()
+
+	hubSrv := NewServer(Config{
+		CallerToken:     callerTok,
+		FallbackCrawler: crawler,
+		Allow:           crawl.PublicHTTPS,
+		Logger:          log,
+	})
+	defer func() { _ = hubSrv.Close() }()
+	ts := httptest.NewServer(hubSrv)
+	defer ts.Close()
+
+	// 1. Hostile twin output is sanitized (M6).
+	xssReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/scrape", strings.NewReader(`{"url":"https://rubygems.org/gems/xssgem"}`))
+	xssReq.Header.Set("Authorization", "Bearer "+callerTok)
+	xssResp, err := http.DefaultClient.Do(xssReq)
+	if err != nil || xssResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v2/scrape xssgem failed: resp=%v err=%v", xssResp, err)
+	}
+	var xssBody struct {
+		Success bool           `json:"success"`
+		Data    map[string]any `json:"data"`
+	}
+	_ = json.NewDecoder(xssResp.Body).Decode(&xssBody)
+	_ = xssResp.Body.Close()
+	md, _ := xssBody.Data["markdown"].(string)
+	meta, _ := xssBody.Data["metadata"].(map[string]any)
+	title, _ := meta["title"].(string)
+	if strings.ContainsRune(md, 0) || strings.ContainsRune(title, 0) {
+		t.Fatalf("expected NUL bytes stripped, got title=%q md=%q", title, md)
+	}
+	if strings.Contains(md, "<img src=x") || strings.Contains(md, "javascript:alert") || strings.Contains(md, "# xssgem<script>") {
+		t.Fatalf("expected hostile HTML & javascript: stripped from Go Hub twin markdown, got: %s", md)
+	}
+	if !strings.Contains(md, "# xssgem&lt;script>alert(1)&lt;/script>") || !strings.Contains(md, "[click](#)") {
+		t.Fatalf("expected escaped heading tag and neutralized link in Go Hub twin markdown, got: %s", md)
+	}
+
+	// 2. Cross-domain twin redirect is rejected and falls back to HTML!
+	redirReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/v2/scrape", strings.NewReader(`{"url":"https://rubygems.org/gems/redirgem"}`))
+	redirReq.Header.Set("Authorization", "Bearer "+callerTok)
+	redirResp, err := http.DefaultClient.Do(redirReq)
+	if err != nil || redirResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v2/scrape redirgem failed: resp=%v err=%v", redirResp, err)
+	}
+	var redirBody struct {
+		Success bool           `json:"success"`
+		Data    map[string]any `json:"data"`
+	}
+	_ = json.NewDecoder(redirResp.Body).Decode(&redirBody)
+	_ = redirResp.Body.Close()
+	redirMd, _ := redirBody.Data["markdown"].(string)
+	if strings.Contains(redirMd, "spoofed") || !strings.Contains(redirMd, "Fallback rendered cleanly.") {
+		t.Fatalf("expected cross-domain twin redirect to reject spoofed JSON and fall back to HTML, got: %s", redirMd)
+	}
+}

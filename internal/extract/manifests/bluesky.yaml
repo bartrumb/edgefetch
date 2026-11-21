@@ -1,0 +1,109 @@
+# Shared Go + TypeScript Declarative Site Adapter: Bluesky ATProto Post Threads
+id: bluesky-thread
+name: Bluesky ATProto Post Threads
+category: commerce-social
+description: Upgrades bsky.app post URLs to public.api.bsky.app ATProto getPostThread JSON with replies and embeds.
+domains:
+  - bsky.app
+  - staging.bsky.app
+exampleUrls:
+  - https://bsky.app/profile/golang.org/post/3lbxyz123
+
+# Matches /profile/<actor>/post/<rkey> and upgrades to public ATProto getPostThread JSON
+match:
+  exactSegments: false
+  pathSegments:
+    - profile
+    - param: actor
+      charset: url_seg
+    - post
+    - param: rkey
+      charset: pkg
+
+twin:
+  id: bluesky-thread
+  fetchUrl: "https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?uri=at%3A%2F%2F{actor}%2Fapp.bsky.feed.post%2F{rkey}&depth=6"
+  kind: json
+  accept: application/json
+
+extract:
+  rootPath: thread
+  requireFields:
+    - post.record.text
+  vars:
+    handle:
+      paths: [post.author.handle]
+      fallbackTemplate: "{actor}"
+    displayName:
+      paths: [post.author.displayName]
+      fallbackTemplate: "{handle}"
+    text:
+      paths: [post.record.text]
+      trim: true
+    desc:
+      paths: [post.record.text]
+      trim: true
+      sliceMax: 220
+    createdAt:
+      paths: [post.record.createdAt]
+    createdAtShort:
+      paths: [post.record.createdAt]
+      replaceAll:
+        from: "T"
+        to: " "
+      sliceMax: 16
+    postedPrefix:
+      template: "{createdAtShort} UTC \u00b7 "
+      whenVars: [createdAtShort]
+    likes:
+      paths: [post.likeCount]
+      default: "0"
+    reposts:
+      paths: [post.repostCount]
+      default: "0"
+    extUri:
+      paths: [post.embed.external.uri]
+    extTitle:
+      paths: [post.embed.external.title]
+      fallbackTemplate: "{extUri}"
+    extDesc:
+      paths: [post.embed.external.description]
+    extDescSuffix:
+      template: " \u2014 {extDesc}"
+      whenVars: [extDesc]
+    linkedEmbed:
+      template: "> **Linked**: [{extTitle}]({extUri}){extDescSuffix}"
+      whenVars: [extUri]
+  titleTemplate: "{displayName} (@{handle}) on Bluesky"
+  descriptionVar: desc
+  authorTemplate: "@{handle}"
+  publishedTimeVar: createdAt
+  bodyVar: text
+  footerItalicTemplate: "Posted {postedPrefix}{likes} likes \u00b7 {reposts} reposts"
+  sections:
+    - heading: ""
+      textVar: linkedEmbed
+    - heading: ""
+      listArrayPath: post.embed.images
+      limit: 10
+      requireItemVar: imgAlt
+      itemVars:
+        imgAlt:
+          paths: [alt]
+          trim: true
+      itemTemplate: "*Image alt*: {imgAlt}"
+    - heading: Replies
+      listArrayPath: replies
+      limit: 15
+      requireItemVar: replyText
+      itemVars:
+        replyAuthor:
+          paths: [post.author.handle]
+          default: user
+        replyText:
+          paths: [post.record.text]
+          trim: true
+          replaceAll:
+            from: "\n"
+            to: " "
+      itemTemplate: "**@{replyAuthor}**: {replyText}"

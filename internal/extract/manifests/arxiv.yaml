@@ -1,0 +1,102 @@
+# Shared Go + TypeScript Declarative Site Adapter: arXiv Preprints
+id: arxiv
+name: arXiv Preprints
+category: research-health
+description: Extracts arXiv preprint title, authors, submission date, subject classifications, PDF/HTML links, and clean abstract from arxiv.org/abs/<id> (strictly respecting robots.txt).
+domains:
+  - arxiv.org
+  - www.arxiv.org
+exampleUrls:
+  - https://arxiv.org/abs/1706.03762
+
+# Post-fetch HTML extractor for /abs/<arxivId> (new-style YYMM.NNNNN and archive/YYMMNNN IDs)
+htmlRoutes:
+  - match:
+      pathSegments:
+        - abs
+        - param: arxivId
+          charset: arxiv_id
+          greedy: true
+    mode: dom
+    requireVars:
+      - title
+      - abstract
+    vars:
+      titleDom:
+        cssText:
+          - h1.title
+        stripPrefix: "Title:"
+      title:
+        metaKeys:
+          - citation_title
+        fallbackVar: titleDom
+      authors:
+        allMetaKey: citation_author
+        cssAllText:
+          selector: "div.authors a"
+          limit: 50
+          join: ", "
+        limit: 20
+        join: ", "
+      authorsShort:
+        allMetaKey: citation_author
+        cssAllText:
+          selector: "div.authors a"
+          limit: 50
+          join: ", "
+        limit: 4
+        join: ", "
+      date:
+        metaKeys:
+          - citation_date
+          - citation_online_date
+      doi:
+        metaKeys:
+          - citation_doi
+      primarySubject:
+        cssText:
+          - span.primary-subject
+      absMeta:
+        metaKeys:
+          - citation_abstract
+      abstract:
+        cssText:
+          - blockquote.abstract
+        stripPrefix: "Abstract:"
+        fallbackVar: absMeta
+      abstractShort:
+        template: "{abstract}"
+        whenVars:
+          - abstract
+        sliceMax: 260
+      pdfUrl:
+        template: "https://arxiv.org/pdf/{arxivId}"
+      htmlPaperUrl:
+        template: "https://arxiv.org/html/{arxivId}"
+    titleTemplate: "{title}"
+    descriptionVar: abstractShort
+    authorVar: authorsShort
+    publishedTimeVar: date
+    bullets:
+      - label: arXiv ID
+        template: "`{arxivId}`"
+      - label: Authors
+        template: "{authors}"
+        whenVar: authors
+      - label: Submitted
+        template: "{date}"
+        whenVar: date
+      - label: Primary Subject
+        template: "{primarySubject}"
+        whenVar: primarySubject
+      - label: DOI
+        template: "`{doi}`"
+        whenVar: doi
+      - label: Full Text
+        template: "[PDF]({pdfUrl}) \u00b7 [ar5iv / HTML]({htmlPaperUrl})"
+    sections:
+      - heading: Abstract
+        textVar: abstract
+    linkTemplates:
+      - "https://arxiv.org/pdf/{arxivId}"
+      - "https://arxiv.org/html/{arxivId}"

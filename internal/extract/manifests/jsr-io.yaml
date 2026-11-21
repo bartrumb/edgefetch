@@ -1,0 +1,21 @@
+# Shared Go + TypeScript Declarative Site Adapter: JSR JavaScript Registry
+id: jsr-io
+name: JSR JavaScript Registry
+category: developer
+description: "Strips top-bar navigation and duplicate version/scorecard tabs from jsr.io/@scope/pkg Markdown."
+domains:
+  - jsr.io
+exampleUrls:
+  - "https://jsr.io/@std/path"
+
+# Post-fetch Markdown cleanup on /@<scope>/<pkg> pages
+htmlRoutes:
+  - match:
+      exactSegments: false
+      pathSegments:
+        - param: scope
+          charset: npm_scope
+        - param: pkg
+          charset: npm_pkg
+    mode: markdown_clean
+    cleanPreset: jsr_io

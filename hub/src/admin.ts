@@ -668,31 +668,31 @@ function renderDashboardHtml(params: {
       const site = (el('wiz-site').value || 'node-1').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'node-1';
       const snippets = {
         docker: [
-          'docker run -d --name edgefetch-agent --restart=unless-stopped \\',
-          '  --security-opt no-new-privileges:true \\',
-          '  -e EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' \\',
-          '  -e EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
-          '  -e EDGEFETCH_SITE_ID="' + site + '" \\',
+          'docker run -d --name edgefetch-agent --restart=unless-stopped \\\\',
+          '  --security-opt no-new-privileges:true \\\\',
+          '  -e EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' \\\\',
+          '  -e EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\\\',
+          '  -e EDGEFETCH_SITE_ID="' + site + '" \\\\',
           '  ghcr.io/bartrumb/edgefetch-agent:latest',
-        ].join('\n'),
+        ].join('\\n'),
         lite: [
-          'docker run -d --name edgefetch-lite --restart=unless-stopped --read-only \\',
-          '  -e EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' \\',
-          '  -e EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
-          '  -e EDGEFETCH_SITE_ID="' + site + '" \\',
+          'docker run -d --name edgefetch-lite --restart=unless-stopped --read-only \\\\',
+          '  -e EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' \\\\',
+          '  -e EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\\\',
+          '  -e EDGEFETCH_SITE_ID="' + site + '" \\\\',
           '  ghcr.io/bartrumb/edgefetch-agent:lite --mode=agent',
-        ].join('\n'),
+        ].join('\\n'),
         compose: [
           '# Save .env with EDGEFETCH_HUB_URL, EDGEFETCH_AGENT_TOKEN, EDGEFETCH_SITE_ID=' + site,
           'curl -fsSLO https://raw.githubusercontent.com/bartrumb/edgefetch/main/compose.agent.yaml',
-          'EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' EDGEFETCH_SITE_ID=' + site + ' EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
+          'EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' EDGEFETCH_SITE_ID=' + site + ' EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\\\',
           '  docker compose -f compose.agent.yaml up -d',
-        ].join('\n'),
+        ].join('\\n'),
         go: [
           'go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest',
-          'EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' EDGEFETCH_SITE_ID=' + site + ' EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\',
+          'EDGEFETCH_HUB_URL=' + HUB_ORIGIN + ' EDGEFETCH_SITE_ID=' + site + ' EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \\\\',
           '  edgefetch --mode=agent',
-        ].join('\n'),
+        ].join('\\n'),
       };
       el('wiz-code').textContent = snippets[activeWiz] || snippets.docker;
     }

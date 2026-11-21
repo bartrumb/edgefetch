@@ -7,6 +7,7 @@
   "scripts": {
     "type-check": "tsc --noEmit -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
+    "openapi:generate": "node scripts/generate-openapi.mjs",
     "adapter:new": "node scripts/new-adapter.mjs",
     "adapter:test": "node scripts/test-adapter.mjs",
     "build:portable": "node scripts/build-portable.mjs",

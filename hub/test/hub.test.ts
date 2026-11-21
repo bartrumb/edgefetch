@@ -30,7 +30,15 @@ import {
   verifyDirectoryResponseSignature,
 } from '../src/bot-auth.ts';
 import { executeIngestPipeline, sha256HexString, writeJobManifestToR2 } from '../src/ingest.ts';
-import { defaultTextAccept, handleMcpRequest, inferKindForUrl, type McpServerDeps } from '../src/mcp.ts';
+import {
+  buildCanonicalMcpToolSchemas,
+  defaultTextAccept,
+  handleMcpRequest,
+  inferKindForUrl,
+  MCP_TOOL_SCHEMAS,
+  type McpServerDeps,
+} from '../src/mcp.ts';
+import { buildOpenApiSpec, sanitizeOpenApiOrigin } from '../src/openapi.ts';
 import {
   ADMIN_COOKIE_NAME,
   OAUTH_SQLITE_SCHEMA,
@@ -3386,4 +3394,165 @@ test('V2-14: v2.4.1 Next.js App Router RSC Hydration + Ethical Crawl4AI & Firecr
   }
   assert.equal(fallbackCalls.length, 0, 'Crawl4AI and Firecrawl must NEVER be called on robots.txt, 403, 429, challenges, or login walls!');
   assert.equal(isEligibleForExternalSpaFallback({ mode: 'off', errorCode: 'fat_agent_required', status: 503 }), false);
+});
+
+test('OpenAPI 3.1.0 endpoint, anti-drift /v1/* route & MCP schema contract, scrape extractor, and docs/openapi.json byte parity', async () => {
+  const hubDir = process.env.EDGEFETCH_HUB_ROOT ?? process.cwd();
+  const pkg = JSON.parse(readFileSync(resolve(hubDir, 'package.json'), 'utf8')) as { version: string };
+
+  // 1. Origin sanitization (`Host` poisoning prevention)
+  assert.equal(sanitizeOpenApiOrigin('https://hub.example.com/extra?x=1'), 'https://hub.example.com');
+  assert.equal(sanitizeOpenApiOrigin('http://127.0.0.1:8787/openapi.json'), 'http://127.0.0.1:8787');
+  assert.equal(sanitizeOpenApiOrigin('http://localhost:8787'), 'http://localhost:8787');
+  assert.equal(sanitizeOpenApiOrigin('http://evil.attacker.example:8080'), 'https://edgefetch.dev');
+  assert.equal(sanitizeOpenApiOrigin('https://user:pass@evil.example.com'), 'https://edgefetch.dev');
+  assert.equal(sanitizeOpenApiOrigin('javascript:alert(1)'), 'https://edgefetch.dev');
+  assert.equal(sanitizeOpenApiOrigin(''), 'https://edgefetch.dev');
+
+  // 2. Live Portable Hub `GET /openapi.json` + `OPTIONS /openapi.json` CORS preflight + `Accept` negotiation
+  const tmpData = mkdtempSync(join(tmpdir(), 'ef-openapi-hub-'));
+  const hub = await startPortableHub({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: tmpData,
+    envOverrides: { CALLER_TOKEN: 'caller-secret-token-0123456789abcdef' },
+  });
+  let liveSpecText = '';
+  let liveSpec: Record<string, unknown>;
+  try {
+    const preflight = await fetch(`http://127.0.0.1:${hub.port}/openapi.json`, { method: 'OPTIONS' });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get('access-control-allow-origin'), '*');
+    assert.equal(preflight.headers.get('x-content-type-options'), 'nosniff');
+
+    const res = await fetch(`http://127.0.0.1:${hub.port}/openapi.json`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    assert.match(String(res.headers.get('content-type')), /^application\/json;\s*charset=utf-8$/i);
+    liveSpecText = await res.text();
+    liveSpec = JSON.parse(liveSpecText) as Record<string, unknown>;
+    assert.equal(liveSpec.openapi, '3.1.0');
+
+    const oaRes = await fetch(`http://127.0.0.1:${hub.port}/openapi.json`, {
+      headers: { Accept: 'application/openapi+json' },
+    });
+    assert.equal(oaRes.status, 200);
+    assert.match(String(oaRes.headers.get('content-type')), /^application\/openapi\+json;\s*charset=utf-8$/i);
+  } finally {
+    await hub.close();
+    rmSync(tmpData, { recursive: true, force: true });
+  }
+
+  const info = liveSpec.info as { version: string; license: { name: string; url: string } };
+  assert.equal(info.version, pkg.version);
+  assert.equal(info.license.name, 'FSL-1.1-MIT (Hub) / MIT (Worker, SDKs & Adapters)');
+  assert.equal(info.license.url, 'https://github.com/bartrumb/edgefetch/blob/main/README.md#license--trademarks');
+
+  const components = liveSpec.components as {
+    securitySchemes: Record<string, Record<string, unknown>>;
+    schemas: Record<string, Record<string, unknown>>;
+  };
+  assert.equal(components.securitySchemes.bearerAuth?.type, 'http');
+  assert.equal(components.securitySchemes.bearerAuth?.scheme, 'bearer');
+  assert.equal(components.securitySchemes.oauth2Pkce?.type, 'oauth2');
+  const authCodeFlow = (components.securitySchemes.oauth2Pkce?.flows as Record<string, Record<string, unknown>>)?.authorizationCode;
+  assert.ok(String(authCodeFlow?.authorizationUrl).endsWith('/oauth/authorize'));
+  assert.ok(String(authCodeFlow?.tokenUrl).endsWith('/oauth/token'));
+  assert.ok('crawl:read' in (authCodeFlow?.scopes as Record<string, unknown>));
+  assert.ok('crawl:fetch' in (authCodeFlow?.scopes as Record<string, unknown>));
+
+  // 3. Anti-drift `/v1/*` route scanner across `hub/src/index.ts` -> 100% must exist in `spec.paths`!
+  const indexSrc = readFileSync(resolve(hubDir, 'src', 'index.ts'), 'utf8');
+  const specPaths = liveSpec.paths as Record<string, Record<string, unknown>>;
+  const discoveredV1Routes = new Set<string>();
+
+  for (const m of indexSrc.matchAll(/url\.pathname\s*===\s*'(\/v1\/[^']+)'/g)) {
+    discoveredV1Routes.add(m[1]!);
+  }
+  for (const m of indexSrc.matchAll(/url\.pathname\.startsWith\('(\/v1\/[^']+)'\)/g)) {
+    const prefix = m[1]!;
+    if (prefix === '/v1/artifacts/') {
+      discoveredV1Routes.add('/v1/artifacts/{blobSha256}');
+    } else {
+      discoveredV1Routes.add(`${prefix}{id}`);
+    }
+  }
+  for (const m of indexSrc.matchAll(/\/\^\\\/v1\\\/([^$]+)\$\//g)) {
+    const rawPattern = `/v1/${m[1]!.replace(/\\\//g, '/')}`;
+    const normalized = rawPattern
+      .replace('/batch/scrape/([^/]+)', '/batch/scrape/{batchId}')
+      .replace('/agent/([^/]+)', '/agent/{agentId}')
+      .replace('/crawl/([^/]+)', '/crawl/{crawlId}')
+      .replace('/collections/([^/]+)', '/collections/{collectionId}')
+      .replace('/catalog/([^/]+)', '/catalog/{catalogId}');
+    discoveredV1Routes.add(normalized);
+  }
+
+  assert.ok(discoveredV1Routes.size >= 20, `Expected >= 20 /v1/* routes in index.ts, found ${discoveredV1Routes.size}`);
+  for (const v1Path of discoveredV1Routes) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(specPaths, v1Path),
+      `Anti-drift failure: Hub route "${v1Path}" in hub/src/index.ts is missing from OpenAPI spec.paths!`,
+    );
+  }
+
+  // Also verify zero-drift sharing with all 15 canonical MCP tool schemas
+  const canonicalTools = buildCanonicalMcpToolSchemas();
+  assert.equal(canonicalTools.length, 15);
+  assert.deepEqual(components.schemas.ScrapeRequest, MCP_TOOL_SCHEMAS.scrape);
+  assert.deepEqual(components.schemas.ExtractRequest, MCP_TOOL_SCHEMAS.extract);
+  assert.deepEqual(components.schemas.InteractRequest, MCP_TOOL_SCHEMAS.interact);
+  assert.deepEqual(components.schemas.MapRequest, MCP_TOOL_SCHEMAS.map);
+  assert.deepEqual(components.schemas.SearchRequest, MCP_TOOL_SCHEMAS.search);
+  assert.deepEqual(components.schemas.JobsRequest, MCP_TOOL_SCHEMAS.jobs);
+  assert.deepEqual(components.schemas.CatalogRequest, MCP_TOOL_SCHEMAS.catalog);
+
+  // 4. Verify EdgeFetch's own OpenAPI 3.1 extractor in `scrape.ts` cleanly converts `/openapi.json` into structured Markdown!
+  const directMd = formatOpenApiSpecToMarkdown(liveSpec);
+  assert.ok(directMd, 'formatOpenApiSpecToMarkdown must recognize EdgeFetch OpenAPI 3.1.0 spec');
+  assert.equal(directMd.title, 'EdgeFetch Hub API');
+  assert.match(directMd.markdown, /OpenAPI 3\.1\.0/);
+  assert.match(directMd.markdown, /POST` \| `\/v1\/scrape`/);
+  assert.match(directMd.markdown, /\*\*oauth2Pkce\*\*/);
+
+  const scrapedSpec = await executeScrapeCall({
+    payload: { url: 'https://edgefetch.dev/openapi.json', discoverLlmsTxt: false },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-1',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: 'https://edgefetch.dev/openapi.json',
+            finalUrl: 'https://edgefetch.dev/openapi.json',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'application/openapi+json; charset=utf-8',
+            body: liveSpecText,
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(scrapedSpec.status, 200);
+  assert.equal(scrapedSpec.body.ok, true);
+  assert.equal((scrapedSpec.body.metadata as { title?: string } | undefined)?.title, 'EdgeFetch Hub API');
+  assert.match(String(scrapedSpec.body.markdown), /## Endpoints/);
+  assert.match(String(scrapedSpec.body.markdown), /\/v1\/catalog/);
+
+  // 5. Verify `docs/openapi.json` matches `buildOpenApiSpec({ origin: 'https://edgefetch.dev', version })` byte-for-byte!
+  const expectedStaticJson = `${JSON.stringify(
+    buildOpenApiSpec({ origin: 'https://edgefetch.dev', version: pkg.version }),
+    null,
+    2,
+  )}\n`;
+  const committedStaticJson = readFileSync(resolve(hubDir, '..', 'docs', 'openapi.json'), 'utf8');
+  assert.equal(
+    committedStaticJson,
+    expectedStaticJson,
+    'docs/openapi.json is out of sync with buildOpenApiSpec() — run `npm run openapi:generate` in hub/',
+  );
 });

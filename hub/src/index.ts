@@ -76,6 +76,7 @@ import {
   type MapRequestPayload,
 } from './map-crawl';
 import { handleMcpRequest } from './mcp';
+import { handleOpenApiRoute } from './openapi';
 import { authorizeMcpRequest, createSqliteOAuthStore, handleOAuthRoute, OAUTH_SQLITE_SCHEMA } from './oauth';
 import type {
   OAuthClientRecord,
@@ -1022,6 +1023,8 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
+      const openApiRes = handleOpenApiRoute(request, url, '2.6.2');
+      if (openApiRes) return openApiRes;
       const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.2');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {

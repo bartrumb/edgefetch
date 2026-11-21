@@ -1,0 +1,30 @@
+# crawl
+
+## Overview
+Package `crawl` implements a bounded-concurrency, polite HTTP/2 batch crawler and standalone HTTP `/fetch` server with hop-by-hop redirect SSRF validation, `httptrace` phase telemetry, `/robots.txt` enforcement, `/llms.txt` companion Markdown discovery, headless browser promotion, and disk-streamed PDF text extraction.
+
+## Interface
+- `[crawl.go:DefaultUserAgent]`, `[crawl.go:DefaultPauseMs]`, `[crawl.go:MaxPauseJitterMs]`, `[crawl.go:DefaultTimeoutMs]`, `[crawl.go:MaxTimeoutMs]`, `[crawl.go:DefaultMaxBytes]`, `[crawl.go:MaxMaxBytes]`, `[crawl.go:MaxStreamingPDFBytes]`, `[crawl.go:DefaultMaxTotalBytes]`, `[crawl.go:MaxMaxTotalBytes]`, `[crawl.go:MaxConcurrency]`, `[crawl.go:MaxRetries]`, `[crawl.go:MaxRedirects]`: Batch, payload, concurrency, retry, and redirect ceiling constants.
+- `[crawl.go:InteractSpec]`, `[crawl.go:Request]`, `[crawl.go:Timing]`, `[crawl.go:ArtifactRef]`, `[crawl.go:Result]`, `[crawl.go:Result.DecodeBody]`, `[crawl.go:Options]`, `[crawl.go:Options.RobotsEnabled]`, `[crawl.go:Options.Normalize]`, `[crawl.go:Bool]`, `[crawl.go:Summary]`, `[crawl.go:Summarize]`: Core crawl request, option, result, and batch summary contracts.
+- `[crawl.go:ValidateUserAgent]`, `[llms_scrape.go:ValidateCustomHeaders]`: Input validators for `User-Agent` and per-request custom HTTP headers.
+- `[crawl.go:Crawler]`, `[crawl.go:NewCrawler]`, `[crawl.go:ResultSink]`: Polite batch runner exposing `SetRenderer`, `SetOtelExporter`, `SetBotSigner`, `SetRobotsBypassHosts`, `AllowsRobotsBypass`, `Capabilities`, `Logger`, `Run`, `RunLogged`, `RunWithSink`, `Close`, and `[crawl.go:SleepCtx]`.
+- `[server.go:MaxRequestsPerCall]`, `[server.go:MaxCallBodyBytes]`, `[server.go:DefaultMaxSeconds]`, `[server.go:MaxMaxSeconds]`, `[server.go:MaxConcurrentServerCalls]`, `[server.go:FetchCall]`, `[server.go:FetchReply]`: Standalone server bounds and wire envelopes.
+- `[server.go:PublicHTTPS]`, `[server.go:WithAllowedHosts]`, `[server.go:WithBlockedHost]`: Composable SSRF URL allowlist policies.
+- `[server.go:ValidateCall]`, `[server.go:ValidateCallWithCrawler]`, `[server.go:ExecuteCall]`, `[server.go:ExecuteCallWithSink]`, `[server.go:ExecuteCallWithTrace]`, `[server.go:CallLogger]`: Batch validation, traced execution, and structured request logging helpers.
+- `[server.go:NewHandler]`, `[server.go:NewAuthenticatedHandler]`: `http.Handler` constructors serving `GET /healthz` and `POST /fetch`.
+
+## Invariants
+- `[server.go:PublicHTTPS]`, `[crawl.go:NewCrawler]`, `[crawl.go:Crawler.runRequestWithRedirects]`: `PublicHTTPS` requires `https://` on port `443` with a multi-label non-IP, non-`localhost` DNS hostname; `http.Client.CheckRedirect` returns `http.ErrUseLastResponse` so every `301`/`302`/`303`/`307`/`308` redirect hop (`<= MaxRedirects = 5`) re-validates `c.allow`, per-host locks, pacing, and `/robots.txt`, downgrades to `GET`, and strips custom headers across host changes.
+- `[llms_scrape.go:ValidateCustomHeaders]`, `[llms_scrape.go:isForbiddenCustomHeader]`: Caps custom headers at `16` entries and `2048` bytes, requires valid RFC token names and printable ASCII values, and rejects hop-by-hop, `Host`, `Authorization`, `Cookie`, `Signature*`, `Proxy-*`, `Sec-*`, `CF-*`, `X-Forwarded-*`, and `X-Real-IP*` headers.
+- `[crawl.go:Options.Normalize]`, `[crawl.go:Crawler.RunWithSink]`: Clamps `Concurrency` to `[1, 4]`, `MaxBytes` to `<= 16 MiB`, `MaxTotalBytes` to `<= 18 MiB`, `TimeoutMs` to `<= 120s`, and `Retries` to `[0, 3]`; preserves input order in `[]Result`; short-circuits sibling same-host URLs to `OutcomeNotTried` on `classify.StopsHost`; and enforces batch-wide `MaxTotalBytes` via atomic CAS.
+- `[crawl.go:Crawler.shouldCheckRobots]`, `[crawl.go:Crawler.fetchRobots]`, `[server.go:ValidateCallWithCrawler]`: Enforces `/robots.txt` unless both `opts.RobotsEnabled()` is `false` and `c.AllowsRobotsBypass(host)` is `true` (never allowed on resumed `Interact` sessions); network/5xx/`429` `/robots.txt` failures mark the host `Distressed` (disallow-all) for `RobotsDistressTTL`.
+- `[crawl.go:Crawler.onceWithPDFStream]`, `[llms_scrape.go:runAuxiliaryFetch]`, `[llms_scrape.go:runBrowserStep]`: Streams `2xx` PDFs up to `MaxStreamingPDFBytes` (`64 MiB` default, or `EDGEFETCH_MAX_PDF_BYTES` clamped to `[1024, 256 MiB]`); routes `/llms.txt` and companion `.md` probes through `runRequestWithRedirects` (`llmsCache` bounded at `512` hosts / `1h` TTL); and re-validates `out.FinalURL` against `c.allow` after headless browser execution.
+- `[server.go:NewAuthenticatedHandler]`, `[crawl.go:redactURLForLog]`: Enforces constant-time SHA-256 Bearer auth when `bearerToken != ""`, `<= 4` concurrent `/fetch` calls (`503` with `Retry-After: 2`), `<= 1 MiB` strict JSON body (`DisallowUnknownFields`), `Cache-Control: no-store`, and query/credential-redacted URLs in logs and OTLP spans.
+
+## Side Effects
+- `[crawl.go:NewCrawler]`, `[crawl.go:Crawler.Close]`: Instantiates `browser.Renderer`, seeds a mutex-guarded PRNG, and on `Close` flushes `otel.Exporter` and terminates headless Chromium / `SSRFProxy`.
+- `[crawl.go:Crawler.RunWithSink]`, `[llms_scrape.go:enrichResult]`, `[llms_scrape.go:runBrowserStep]`: Spawns bounded host worker goroutines, mutates per-host `politeness.Registry` and `llmsCache`, performs outbound HTTP/2 requests (`c.client.Do`), signs requests via `botauth.Signer`, executes `browser.Renderer` tasks, and emits `slog` records and OTLP spans (`[server.go:ExecuteCallWithTrace]`).
+- `[crawl.go:resolveMaxStreamingPDFBytes]`, `[crawl.go:Crawler.onceWithPDFStream]`: Reads `EDGEFETCH_MAX_PDF_BYTES` via `os.Getenv`, writes and removes temporary `edgefetch-pdf-*.pdf` files (`os.CreateTemp` / `os.Remove`), and invokes `extract.ExtractPDFFileText` / `extract.ExtractPDFText` (spawning Poppler `pdftotext` when installed).
+
+## Verification
+- Run: `go test ./internal/crawl`

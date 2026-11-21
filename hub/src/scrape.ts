@@ -76,7 +76,7 @@ import {
   splitPdfPagesAndMarkers,
 } from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 24;
+export const SCRAPE_PIPELINE_VERSION = 25;
 
 export interface ScrapedImage {
   url: string;
@@ -2508,6 +2508,7 @@ export function extractHtmlDocument(
       if (idx % 2 === 1) return part;
       return part
         .replace(/`([^`\n]+)`(?=`[^`\n]+`)/g, '`$1` ')
+        .replace(/\[([^\[\]\n]+?)[ \t]*\((https?:\/\/[^)\s]+)\)\]\(\2\)/g, (_m, lbl: string, u: string) => `[${lbl.trim()}](${u})`)
         .replace(/(\[[^\[\]\n]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1')
         .replace(/([A-Za-z0-9])(\[[^\[\]\n]+\]\(https?:\/\/[^)\s]+\))/g, '$1 $2')
         .replace(/(\[[^\[\]\n]+\]\(https?:\/\/[^)\s]+\))([A-Za-z0-9])/g, '$1 $2')
@@ -3695,6 +3696,7 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string): stri
           '',
         );
       return resolveMarkdownRelativeLinksInProse(cleanedProse, baseUrl)
+        .replace(/\[([^\[\]\n]+?)[ \t]*\((https?:\/\/[^)\s]+)\)\]\(\2\)/g, (_m, lbl: string, u: string) => `[${lbl.trim()}](${u})`)
         .replace(/(\[[^\[\]\n]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1')
         .replace(/\n{3,}/g, '\n\n');
     })
@@ -3787,6 +3789,32 @@ export function stripInvisibleSmugglingChars(s: string): string {
   return s.replace(/[\u{E0000}-\u{E007F}\u202A-\u202E\u2066-\u2069]/gu, '');
 }
 
+function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
+  const parts = splitMarkdownByCodeFences(md);
+  return parts
+    .map((part, idx) => {
+      if (idx % 2 === 1) {
+        const trimmedFence = part.trim();
+        if (
+          /^`{3,}json[ \t]*\r?\n(?:\{\s*"@context"\s*:\s*"https?:\/\/schema\.org"[^\r\n]{80,}\r?\n)+\s*`{3,}$/i.test(
+            trimmedFence,
+          )
+        ) {
+          return '';
+        }
+        return part;
+      }
+      const cleaned = part
+        .replace(/\[Skip to content\]\(#[^)\n]*\)\s*/gi, '')
+        .replace(/!\[\s*\]\(\s*(?:""|'')?\s*\)/g, '')
+        .replace(/<\/?u>/gi, '')
+        .replace(/\[([^\[\]\n]+?)[ \t]*\((https?:\/\/[^)\s]+)\)\]\(\2\)/g, (_m, lbl: string, u: string) => `[${lbl.trim()}](${u})`)
+        .replace(/(\[[^\[\]\n]+\]\((https?:\/\/[^)\s]+)\))[ \t]*\(\2\)/g, '$1');
+      return resolveMarkdownRelativeLinksInProse(cleaned, baseUrl).replace(/\n{3,}/g, '\n\n');
+    })
+    .join('');
+}
+
 function finalizeScrapedMarkdown(
   rawMd: string,
   opts: { isPdf: boolean; includeImages: boolean; maxChars?: number; baseUrl?: string; preserveOriginMarkdown?: boolean },
@@ -3800,7 +3828,7 @@ function finalizeScrapedMarkdown(
 } {
   const fm = opts.isPdf ? { body: rawMd } : parseMarkdownFrontmatter(rawMd);
   let md = opts.preserveOriginMarkdown
-    ? stripInvisibleSmugglingChars(fm.body)
+    ? stripInvisibleSmugglingChars(cleanOriginNegotiatedMarkdown(fm.body, opts.baseUrl))
     : stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), opts.baseUrl));
   if (opts.isPdf) {
     md = cleanPdfMarkdown(md);

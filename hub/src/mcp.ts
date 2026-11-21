@@ -1115,6 +1115,9 @@ export function truncateResultBodies(
         rawBody: typeof copy.body === 'string' && (!copy.bodyEncoding || copy.bodyEncoding === 'utf-8') ? copy.body : undefined,
       });
       if (blocked) copy.blocked = blocked;
+      if (typeof copy.body === 'string' && copy.body.includes('cf-footer-ip')) {
+        copy.body = copy.body.replace(/(<span\b[^>]*\bid=["']?cf-footer-ip["']?[^>]*>)[^<]{1,80}(<\/span>)/gi, '$1[redacted]$2');
+      }
     }
 
     if (typeof copy.body === 'string' && copy.body.length > inlineMaxChars) {

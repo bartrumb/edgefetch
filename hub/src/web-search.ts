@@ -872,17 +872,18 @@ export async function executeSearchCall(params: {
               ),
             ];
             const mappedItems: RawSearchHit[] = [];
-            for (const rawEntry of mapOut.body.entries as Array<{ url?: string; title?: string; source?: string }>) {
+            for (const rawEntry of mapOut.body.entries as Array<{ url?: string; title?: string; description?: string; source?: string }>) {
               if (typeof rawEntry.url !== 'string') continue;
               const entrySource = rawEntry.source ?? 'sitemap';
               const cleanTitle = cleanProviderText(rawEntry.title);
+              const cleanDesc = cleanProviderText(rawEntry.description);
               // Skip bare homepage/seed filler that carries neither a curated title nor keyword signal.
               if (entrySource === 'seed' || (entrySource === 'homepage' && !cleanTitle && !edgeMapSpec.filterTerms)) {
                 continue;
               }
               const canon = canonicalizeSearchResultUrl(rawEntry.url);
               if (!canon || !urlMatchesSitePrefixes(canon, edgeMapSpec.sitePrefixes)) continue;
-              const hayLower = `${canon} ${cleanTitle}`.toLowerCase();
+              const hayLower = `${canon} ${cleanTitle} ${cleanDesc}`.toLowerCase();
               const matchedTokens = queryTokens.filter((t) => hayLower.includes(t)).length;
               const coverage = queryTokens.length > 0 ? matchedTokens / queryTokens.length : 1;
               // Sitemap entries matching only 1 generic word out of a 3+ term technical query (e.g. "storage" on `/plans`)
@@ -897,7 +898,7 @@ export async function executeSearchCall(params: {
               mappedItems.push({
                 url: canon,
                 title: cleanTitle || humanizeUrlTitle(canon),
-                snippet: cleanTitle ? `Listed in ${entrySource} on ${domain}` : '',
+                snippet: cleanDesc || (cleanTitle ? `Listed in ${entrySource} on ${domain}` : ''),
                 isFiller: isUntitledMapHit || isWeakMultiTermMatch,
                 rrfWeight,
               });

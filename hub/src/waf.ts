@@ -418,22 +418,46 @@ export function classifyContentState(params: {
 }): ContentStateResult {
   const { status = 200, url, finalUrl, title = '', markdown, rawHtml = '', validThrough, nowMs = Date.now() } = params;
 
-  // 0. Deterministic ATS silent-redirect dead-link trap (e.g. closed Greenhouse postings 200-redirect to `?error=true` or board root!)
+  // 0. Deterministic ATS silent-redirect dead-link trap (e.g. closed Greenhouse/Lever/Ashby postings 200-redirect to `?error=true`, board root, or custom `/careers` index!)
   const checkUrlStr = finalUrl || url || '';
   if (checkUrlStr) {
     try {
       const finU = new URL(checkUrlStr);
       const finHost = finU.hostname.toLowerCase();
-      const isGhHost =
+      const origU = url ? new URL(url) : finU;
+      const origHost = origU.hostname.toLowerCase();
+      const isGhFinHost =
         finHost === 'boards.greenhouse.io' ||
         finHost === 'job-boards.greenhouse.io' ||
         finHost === 'eu-boards.greenhouse.io' ||
         finHost === 'job-boards.eu.greenhouse.io';
-      if (isGhHost && finU.searchParams.get('error') === 'true') {
+      const isGhOrigHost =
+        origHost === 'boards.greenhouse.io' ||
+        origHost === 'job-boards.greenhouse.io' ||
+        origHost === 'eu-boards.greenhouse.io' ||
+        origHost === 'job-boards.eu.greenhouse.io';
+      if ((isGhFinHost || isGhOrigHost) && finU.searchParams.get('error') === 'true') {
         return { state: 'closed_posting', reason: 'Greenhouse redirected closed posting to ?error=true.' };
       }
-      if (isGhHost && url && /\/jobs\/\d+/i.test(url) && !/\/jobs\/\d+/i.test(finU.pathname)) {
-        return { state: 'closed_posting', reason: 'Greenhouse job posting redirected back to board root (role closed).' };
+      const ghJobMatch = isGhOrigHost ? /\/jobs\/(\d+)/i.exec(origU.pathname) : null;
+      const ghQueryId = origU.searchParams.get('gh_jid');
+      const leverJobMatch =
+        origHost === 'jobs.lever.co' || origHost === 'jobs.eu.lever.co'
+          ? /^\/[^/]+\/([0-9a-f]{8}-[0-9a-f-]{27})\b/i.exec(origU.pathname)
+          : null;
+      const ashbyJobMatch =
+        origHost === 'jobs.ashbyhq.com'
+          ? /^\/[^/]+\/([0-9a-f]{8}-[0-9a-f-]{27})\b/i.exec(origU.pathname)
+          : null;
+      const origJobToken = ghJobMatch?.[1] ?? ghQueryId ?? leverJobMatch?.[1] ?? ashbyJobMatch?.[1];
+      if (origJobToken && finalUrl && finalUrl !== url) {
+        const finCombined = `${finU.pathname}${finU.search}`.toLowerCase();
+        if (!finCombined.includes(origJobToken.toLowerCase())) {
+          return {
+            state: 'closed_posting',
+            reason: 'ATS job posting redirected away from its job ID to a generic careers/board index (role closed).',
+          };
+        }
       }
     } catch {
       // ignore invalid URL
@@ -443,7 +467,30 @@ export function classifyContentState(params: {
   // Strip fenced code blocks AND any leaked `<script>` / `<style>` / `<noscript>` / `<template>` blocks in linear O(N) time (`M4`)
   // before matching closed-posting or soft-404 phrases (prevents Dayforce i18n "Page not found!" & Rippling script false positives!).
   const boundedMd = markdown.length > MAX_HTML_SCAN_CHARS ? markdown.slice(0, MAX_HTML_SCAN_CHARS) : markdown;
-  const withoutFences = boundedMd.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, ' ');
+  const withoutFences = (() => {
+    if (boundedMd.indexOf('```') < 0 && boundedMd.indexOf('~~~') < 0) return boundedMd;
+    const outLines: string[] = [];
+    let fenceChar = '';
+    let fenceLen = 0;
+    for (const ln of boundedMd.split('\n')) {
+      if (!fenceChar) {
+        const m = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(ln);
+        if (m && (m[1]![0] !== '`' || !ln.slice(m[0].length).includes('`'))) {
+          fenceChar = m[1]![0]!;
+          fenceLen = m[1]!.length;
+          continue;
+        }
+        outLines.push(ln);
+      } else {
+        const cm = (fenceChar === '`' ? /^[ \t]{0,3}(`{3,})[ \t\r]*$/ : /^[ \t]{0,3}(~{3,})[ \t\r]*$/).exec(ln);
+        if (cm && cm[1]!.length >= fenceLen) {
+          fenceChar = '';
+          fenceLen = 0;
+        }
+      }
+    }
+    return outLines.join('\n');
+  })();
   const proseOnly = stripHtmlTagsLinear(withoutFences, ['script', 'style', 'noscript', 'template'], ' ', MAX_HTML_SCAN_CHARS).trim();
   const cleanVisibleHtml = rawHtml
     ? stripHtmlTagsLinear(rawHtml, ['script', 'style', 'noscript', 'template', 'svg'], ' ', MAX_HTML_SCAN_CHARS)

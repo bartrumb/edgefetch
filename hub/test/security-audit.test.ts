@@ -23,7 +23,8 @@ import { handleBotTransparencyRoutes } from '../src/bot-auth.ts';
 import { verifyStoredArtifact } from '../src/ingest.ts';
 import { buildBlockedInfo, chunkJsonRecords, parseX402PaymentTerms } from '../src/jobs.ts';
 import { completeLlmTurn, resolveLlmConfig } from '../src/llm.ts';
-import { matchesSafeCrawlPattern } from '../src/map-crawl.ts';
+import { executeMapCall, matchesSafeCrawlPattern } from '../src/map-crawl.ts';
+import { truncateResultBodies } from '../src/mcp.ts';
 import { createMemoryOAuthStore } from '../src/oauth.ts';
 import {
   cloudflareOverflowFetch,
@@ -1157,4 +1158,112 @@ test('SEC-V255-7 (Agentic Web G1–G3): Markdown for Agents Accept/origin-markdo
     isEligibleForExternalSpaFallback({ outcome: 'payment_required', status: 402, problem: 'HTTP 402', extractedWordCount: 0 }),
     false,
   );
+});
+
+test('QA-V255-ROUND3: cross-origin ATS closed_posting redirect, origin-markdown hygiene, inner-bracket duplicate URL collapse, llms.txt notes map search & cf-footer-ip redaction', async () => {
+  // 1. Cross-origin Greenhouse closed posting redirect (`job-boards.greenhouse.io/cloudflare/jobs/7347047` -> `www.cloudflare.com/careers/#open-roles`)
+  const closedCheck = classifyContentState({
+    status: 200,
+    url: 'https://job-boards.greenhouse.io/cloudflare/jobs/7347047',
+    finalUrl: 'https://www.cloudflare.com/careers/#open-roles',
+    title: 'Cloudflare Careers',
+    markdown: '## Cloudflare Careers\n\nExplore open roles across 30+ countries.',
+  });
+  assert.equal(closedCheck.state, 'closed_posting');
+
+  // Active Greenhouse posting redirecting to `?gh_jid=7347047` stays `active`!
+  const activeCustomCheck = classifyContentState({
+    status: 200,
+    url: 'https://job-boards.greenhouse.io/cloudflare/jobs/7347047',
+    finalUrl: 'https://www.cloudflare.com/careers/jobs/?gh_jid=7347047',
+    title: 'Systems Engineer',
+    markdown: '## Systems Engineer\n\nJoin our systems engineering team to build reliable edge infrastructure.',
+  });
+  assert.equal(activeCustomCheck.state, 'active');
+
+  // 2. Origin-markdown hygiene (`[Skip to content]`, `![]()`, `[<u>text</u>]`, and minified `schema.org` JSON-LD block stripped while keeping code fences)
+  const originMdOut = await executeScrapeCall({
+    payload: { url: 'https://blog.example.com/markdown-for-agents/' },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-arm64',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: 'https://blog.example.com/markdown-for-agents/',
+            finalUrl: 'https://blog.example.com/markdown-for-agents/',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/markdown; charset=utf-8',
+            contentSource: 'origin-markdown',
+            body: '[Skip to content](#main-content)\n\n# Introducing Markdown\n\n![]()![Hero](https://blog.example.com/hero.png)\n\n[<u>Markdown</u>](https://en.wikipedia.org/wiki/Markdown) is fast.\n\n```ts\nconst x = 1;\n```\n\n```json\n{"@context":"https://schema.org","@type":"BlogPosting","headline":"Introducing Markdown","description":"Structured data dump that should not pollute prose tokens in origin markdown responses."}\n```',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(originMdOut.status, 200);
+  assert.equal(originMdOut.body.contentSource, 'origin-markdown');
+  const cleanedOriginMd = String(originMdOut.body.markdown);
+  assert.ok(!cleanedOriginMd.includes('[Skip to content]'));
+  assert.ok(!cleanedOriginMd.includes('![]()'));
+  assert.ok(cleanedOriginMd.includes('[Markdown](https://en.wikipedia.org/wiki/Markdown)'));
+  assert.ok(cleanedOriginMd.includes('const x = 1;'));
+  assert.ok(!cleanedOriginMd.includes('"@context":"https://schema.org"'));
+
+  // 3. Inner-bracket USWDS print-URL deduplication (`[Learn About Studies (url)](url)` -> `[Learn About Studies](url)`)
+  const ctExtract = extractHtmlDocument(
+    '<main><h1>Study</h1><p>Read <a href="https://clinicaltrials.gov/study-basics/learn-about-studies">Learn About Studies (https://clinicaltrials.gov/study-basics/learn-about-studies)</a> today.</p></main>',
+    { baseUrl: 'https://clinicaltrials.gov/study/NCT04280705', onlyMainContent: true },
+  );
+  assert.ok(ctExtract.markdown.includes('[Learn About Studies](https://clinicaltrials.gov/study-basics/learn-about-studies)'));
+  assert.ok(!ctExtract.markdown.includes('(https://clinicaltrials.gov/study-basics/learn-about-studies)]('));
+
+  // 4. `map` indexes `llms.txt` notes & falls back cleanly on 2-term queries when 1 term is in `llms.txt` notes
+  const mapRes = await executeMapCall({
+    payload: { url: 'https://edgefetch.dev/', search: 'AppArmor Chromium' },
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-win-vm',
+      bodyText: JSON.stringify({
+        results: [
+          { id: 'home', url: 'https://edgefetch.dev/', status: 200, outcome: 'ok', contentType: 'text/html', body: '<a href="/concepts/security/">Security model</a>' },
+          {
+            id: 'llms',
+            url: 'https://edgefetch.dev/llms.txt',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/plain',
+            body: '# EdgeFetch\n\n## Concepts\n- [Security model](https://edgefetch.dev/concepts/security/): SSRF protection, AppArmor confinement, and non-root execution.\n',
+          },
+          { id: 'robots', url: 'https://edgefetch.dev/robots.txt', status: 200, outcome: 'ok', contentType: 'text/plain', body: 'User-agent: *\nAllow: /\n' },
+          { id: 'sitemap', url: 'https://edgefetch.dev/sitemap.xml', status: 404, outcome: 'skip', contentType: 'text/plain', body: '' },
+          { id: 'sitemap-index', url: 'https://edgefetch.dev/sitemap-index.xml', status: 404, outcome: 'skip', contentType: 'text/plain', body: '' },
+        ],
+      }),
+    }),
+  });
+  assert.equal(mapRes.status, 200);
+  const mapEntries = mapRes.body.entries as Array<{ url: string; description?: string }>;
+  assert.equal(mapEntries.length, 1);
+  assert.equal(mapEntries[0]?.url, 'https://edgefetch.dev/concepts/security/');
+  assert.ok(mapEntries[0]?.description?.includes('AppArmor'));
+
+  // 5. `truncateResultBodies` scrubs `cf-footer-ip` home IP from Cloudflare 5xx error pages
+  const scrubbed = truncateResultBodies({
+    results: [
+      {
+        id: 'mcp-1',
+        url: 'https://broken.example.com/',
+        status: 502,
+        outcome: 'stop',
+        body: '<div>Your IP: <span class="hidden" id="cf-footer-ip">198.51.100.42</span></div>',
+      },
+    ],
+  });
+  const firstItem = (scrubbed.results as Array<{ body: string }>)[0]!;
+  assert.ok(!firstItem.body.includes('198.51.100.42'));
+  assert.ok(firstItem.body.includes('[redacted]'));
 });

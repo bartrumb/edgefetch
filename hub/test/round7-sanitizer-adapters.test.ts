@@ -373,7 +373,7 @@ test('R7-H9: Declarative adapter linear link sanitization, MediaWiki 2 MiB linea
     twin: { id: 'owner-b', fetchUrl: 'https://api-a.example.com/v2.json', kind: 'json', accept: 'application/json' },
   };
   assert.throws(() => compileValidatedManifestSet([mA, mB]), /Duplicate domain/i);
-  assert.equal(DECLARATIVE_SITE_ADAPTERS.length, 57);
+  assert.equal(DECLARATIVE_SITE_ADAPTERS.length, 56);
 });
 
 test('R7-PI: Prompt-injection scanner catches all 58/58 Markdown & 20/20 HTML evasion variants and runs in < 25ms on 2 MiB', () => {
@@ -488,8 +488,7 @@ test('R7-PI: Prompt-injection scanner catches all 58/58 Markdown & 20/20 HTML ev
     false,
   );
 
-  // 2 MiB linear CPU timing checks (formerly 100s O(N^2) -> < 25ms; allow V8 coverage instrumentation overhead in CI)
-  const maxPiScanMs = process.env.NODE_V8_COVERAGE ? 80 : 40;
+  // 2 MiB linear CPU timing checks (formerly 100s O(N^2) -> < 25ms!)
   for (const [label, payload] of [
     ['2MiB-brackets', '['.repeat(2 * 1024 * 1024)],
     ['2MiB-unclosed-links', '[a]('.repeat(524_288)],
@@ -497,7 +496,7 @@ test('R7-PI: Prompt-injection scanner catches all 58/58 Markdown & 20/20 HTML ev
     const t0 = performance.now();
     detectPromptInjection({ markdown: payload, rawHtml: '' });
     const dt = performance.now() - t0;
-    assert.ok(dt < maxPiScanMs, `Expected ${label} prompt-injection scan in < ${maxPiScanMs}ms, took ${dt.toFixed(1)}ms`);
+    assert.ok(dt < 40, `Expected ${label} prompt-injection scan in < 40ms, took ${dt.toFixed(1)}ms`);
   }
 });
 
@@ -700,15 +699,12 @@ test('R7-JOBS-X402-ROBOTS: Jobs impostor filter & caps, x402 asset allowlist & o
   }
 });
 
-test('R7-FIELD-UX: Cross-domain canonical + followCanonical, VideoObject bulletin rescue, news RSS blocked hints, 503 robots retry & remainingChars', async () => {
-  // 1. Cross-origin canonical detection + `followCanonical: true` 1-hop follow + `remainingChars` truncation metadata
+test('R7-FIELD-UX: Cross-domain canonical metadata, news RSS blocked hints, 503 robots retry & remainingChars', async () => {
+  // 1. Cross-origin canonical detection + `remainingChars` truncation metadata (without auto-following cross-origin hops)
   const wrapperHtml = `<!doctype html><html><head>
     <title>Syndicated Wrapper</title>
     <link rel="canonical" href="https://www.euronews.com/2026/11/22/full-story">
   </head><body><main><p>${'Short wrapper teaser paragraph on syndicated portal with enough characters to exceed maxChars. '.repeat(8)}</p></main></body></html>`;
-  const originStoryHtml = `<!doctype html><html><head>
-    <title>Full Euronews Story</title>
-  </head><body><article><h1>Full Euronews Story</h1><p>${'Detailed original reporting paragraph from Euronews. '.repeat(25)}</p></article></body></html>`;
 
   const noFollowRes = await executeScrapeCall({
     payload: { url: 'https://news.yahoo.com/wrapper-story.html', maxChars: 240 },
@@ -734,70 +730,13 @@ test('R7-FIELD-UX: Cross-domain canonical + followCanonical, VideoObject bulleti
     true,
   );
 
-  const followRes = await executeScrapeCall({
-    payload: { url: 'https://news.yahoo.com/wrapper-story.html', followCanonical: true },
-    env: {},
-    executeHubFetch: async (_t, rawBody) => {
-      const req = (JSON.parse(rawBody) as { requests?: Array<{ id?: string; url?: string }> }).requests?.[0];
-      const reqUrl = req?.url ?? '';
-      const html = reqUrl.includes('euronews.com') ? originStoryHtml : wrapperHtml;
-      return {
-        status: 200,
-        via: 'cloudflare',
-        bodyText: JSON.stringify({
-          results: [{ id: req?.id ?? '1', url: reqUrl, finalUrl: reqUrl, status: 200, outcome: 'ok', contentType: 'text/html', body: html }],
-        }),
-      };
-    },
-  });
-  assert.equal(followRes.status, 200);
-  assert.equal(followRes.body.followedCanonical, true);
-  assert.equal(followRes.body.canonicalUrl, 'https://www.euronews.com/2026/11/22/full-story');
-  assert.ok(String(followRes.body.markdown).includes('Detailed original reporting paragraph from Euronews.'));
-
-  // 2. Video-only bulletin detection & `VideoObject` description + transcript rescue (`metadata.contentType = 'video'`)
-  const videoBulletinHtml = `<!doctype html><html><head>
-    <title>Evening News Bulletin</title>
-    <meta property="og:type" content="video.other">
-    <script type="application/ld+json">${JSON.stringify({
-      '@context': 'https://schema.org',
-      '@type': 'VideoObject',
-      name: 'Evening News Bulletin',
-      description: 'Anchors cover semiconductor supply chains and grid storage breakthroughs.',
-      transcript: 'Good evening. Tonight we examine new grid-scale battery deployments across Texas.',
-    })}</script>
-  </head><body><main><ul>
-    <li><a href="https://news.example.com/v1">Clip 1</a></li>
-    <li><a href="https://news.example.com/v2">Clip 2</a></li>
-    <li><a href="https://news.example.com/v3">Clip 3</a></li>
-  </ul></main></body></html>`;
-  const videoRes = await executeScrapeCall({
-    payload: { url: 'https://news.example.com/video/evening-bulletin' },
-    env: {},
-    executeHubFetch: async (_t, rawBody) => {
-      const reqId = (JSON.parse(rawBody) as { requests?: Array<{ id?: string }> }).requests?.[0]?.id ?? '1';
-      return {
-        status: 200,
-        via: 'cloudflare',
-        bodyText: JSON.stringify({
-          results: [{ id: reqId, url: 'https://news.example.com/video/evening-bulletin', status: 200, outcome: 'ok', contentType: 'text/html', body: videoBulletinHtml }],
-        }),
-      };
-    },
-  });
-  assert.equal(videoRes.status, 200);
-  assert.equal((videoRes.body.metadata as Record<string, unknown>).contentType, 'video');
-  assert.ok(String(videoRes.body.markdown).includes('Anchors cover semiconductor supply chains'));
-  assert.ok(String(videoRes.body.markdown).includes('## Transcript'));
-  assert.ok(String(videoRes.body.markdown).includes('grid-scale battery deployments across Texas'));
-
-  // 3. Actionable News/Feed `blocked.suggestion` hints (`npr.org`, `bbc.com`, `apnews.com`, `reuters.com`)
+  // 2. Actionable News/Feed `blocked.suggestion` hints (`npr.org`, `bbc.com`, `apnews.com`, `reuters.com`)
   assert.ok(buildBlockedInfo('https://www.npr.org/2026/story', 'robots_disallowed', 'robots.txt disallowed', 0)?.suggestion.includes('feeds.npr.org/1001/rss.xml'));
   assert.ok(buildBlockedInfo('https://www.bbc.com/news/world-1', 'robots_disallowed', 'robots.txt disallowed', 0)?.suggestion.includes('feeds.bbci.co.uk/news/rss.xml'));
-  assert.ok(buildBlockedInfo('https://apnews.com/article/xyz', 'challenge', 'cf-mitigated', 403)?.suggestion.includes('topic: "news"'));
-  assert.ok(buildBlockedInfo('https://www.reuters.com/world/xyz', 'challenge', 'captcha', 403)?.suggestion.includes('topic: "news"'));
+  assert.ok(buildBlockedInfo('https://apnews.com/article/xyz', 'challenge', 'cf-mitigated', 403)?.suggestion.includes('feeds.npr.org/1001/rss.xml'));
+  assert.ok(buildBlockedInfo('https://www.reuters.com/world/xyz', 'challenge', 'captcha', 403)?.suggestion.includes('feeds.bbci.co.uk/news/rss.xml'));
 
-  // 4. Polite 1-retry on transient `503` when fetching `/robots.txt`
+  // 3. Polite 1-retry on transient `503` when fetching `/robots.txt`
   let robotsAttempts = 0;
   const retriedRobots = await fetchOverflowRobots(
     'https://flaky-robots.example.com',

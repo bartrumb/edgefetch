@@ -7,6 +7,7 @@
  * internal-DNS (`*.plex.direct`, corporate split-DNS, Home Assistant DuckDNS -> `192.168.x.x`) bypasses on Hub-side
  * overflow fetches, webhooks, SPA-fallback robots checks, and remote LLM calls!
  */
+import { Buffer } from 'node:buffer';
 import dns from 'node:dns';
 import http from 'node:http';
 import https from 'node:https';

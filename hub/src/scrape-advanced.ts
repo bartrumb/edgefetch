@@ -287,6 +287,9 @@ function normalizeCssStyleForHiddenCheck(rawStyle: string): string {
 }
 
 function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'strip' | 'wordstream' = 'space'): string {
+  if (!prose.includes('&') && !/[^\x00-\x7F]/.test(prose) && !/[A-Za-z]/.test(prose)) {
+    return '';
+  }
   let out = prose.includes('[SCRUBBED:')
     ? prose.replace(/\[SCRUBBED:\s*prompt injection blocked\s*\([^)\r\n]{0,200}\)\]/gi, ' ')
     : prose;

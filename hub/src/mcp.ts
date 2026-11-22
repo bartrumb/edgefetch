@@ -662,12 +662,6 @@ export function buildCanonicalMcpToolSchemas(options?: {
               'Maximum Markdown characters returned inline (default 100000 on MCP; truncates cleanly and returns markdownArtifactId + nextOffset for paging via read_artifact).',
           },
           discoverLlmsTxt: { type: 'boolean', default: true, description: 'Check /llms.txt and prefer publisher-provided companion .md files when available.' },
-          followCanonical: {
-            type: 'boolean',
-            default: false,
-            description:
-              'When true and a syndicated wrapper page declares a cross-origin canonical HTTPS URL, follows 1 hop (respecting robots.txt) to scrape the original article.',
-          },
           preferOriginMarkdown: {
             type: 'boolean',
             default: true,
@@ -877,13 +871,6 @@ export function buildCanonicalMcpToolSchemas(options?: {
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Search query (1..500 characters). Supports site:domain.com filtering.' },
-          topic: {
-            type: 'string',
-            enum: ['auto', 'general', 'news'],
-            default: 'auto',
-            description:
-              'Search topic: "auto" (default) detects news queries automatically; "news" targets news headlines; "general" runs standard web search.',
-          },
           maxResults: { type: 'integer', minimum: 1, maximum: 20, default: 5, description: 'Maximum search results to return (1..20).' },
           timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'], description: 'Optional recency filter.' },
           includeDomains: { type: 'array', items: { type: 'string' }, description: 'Restrict results to these domains.' },

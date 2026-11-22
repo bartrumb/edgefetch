@@ -91,9 +91,6 @@ try {
   const round7SanitizerOutfile = join(dir, 'round7-sanitizer-adapters.test.mjs');
   buildNodeTestBundle('test/round7-sanitizer-adapters.test.ts', round7SanitizerOutfile);
   nodeTestFiles.push(round7SanitizerOutfile);
-  const searchNewsUxOutfile = join(dir, 'search-news-ux.test.mjs');
-  buildNodeTestBundle('test/search-news-ux.test.ts', searchNewsUxOutfile);
-  nodeTestFiles.push(searchNewsUxOutfile);
   const liveMcpAuditOutfile = join(dir, 'live-mcp-audit.test.mjs');
   buildNodeTestBundle('test/live-mcp-audit.test.ts', liveMcpAuditOutfile);
   nodeTestFiles.push(liveMcpAuditOutfile);

@@ -511,7 +511,6 @@ const VALID_ADAPTER_IDS = new Set([
   'mcp-federated',
   'mediawiki',
   'mkdocs-material',
-  'news-feeds',
   'nextra',
   'nist-nvd',
   'notion',

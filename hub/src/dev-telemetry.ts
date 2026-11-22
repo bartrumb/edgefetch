@@ -298,7 +298,6 @@ export const KNOWN_TELEMETRY_ADAPTER_IDS: ReadonlySet<string> = new Set([
   'mcp-federated',
   'mediawiki',
   'mkdocs-material',
-  'news-feeds',
   'nextra',
   'nist-nvd',
   'notion',

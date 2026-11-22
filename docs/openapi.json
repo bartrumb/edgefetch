@@ -3918,11 +3918,6 @@
             "default": true,
             "description": "Check /llms.txt and prefer publisher-provided companion .md files when available."
           },
-          "followCanonical": {
-            "type": "boolean",
-            "default": false,
-            "description": "When true and a syndicated wrapper page declares a cross-origin canonical HTTPS URL, follows 1 hop (respecting robots.txt) to scrape the original article."
-          },
           "preferOriginMarkdown": {
             "type": "boolean",
             "default": true,
@@ -4307,16 +4302,6 @@
           "query": {
             "type": "string",
             "description": "Search query (1..500 characters). Supports site:domain.com filtering."
-          },
-          "topic": {
-            "type": "string",
-            "enum": [
-              "auto",
-              "general",
-              "news"
-            ],
-            "default": "auto",
-            "description": "Search topic: \"auto\" (default) detects news queries automatically; \"news\" targets news headlines; \"general\" runs standard web search."
           },
           "maxResults": {
             "type": "integer",
@@ -6228,11 +6213,6 @@
             "default": true,
             "description": "Check /llms.txt and prefer publisher-provided companion .md files when available."
           },
-          "followCanonical": {
-            "type": "boolean",
-            "default": false,
-            "description": "When true and a syndicated wrapper page declares a cross-origin canonical HTTPS URL, follows 1 hop (respecting robots.txt) to scrape the original article."
-          },
           "preferOriginMarkdown": {
             "type": "boolean",
             "default": true,
@@ -6581,16 +6561,6 @@
           "query": {
             "type": "string",
             "description": "Search query (1..500 characters). Supports site:domain.com filtering."
-          },
-          "topic": {
-            "type": "string",
-            "enum": [
-              "auto",
-              "general",
-              "news"
-            ],
-            "default": "auto",
-            "description": "Search topic: \"auto\" (default) detects news queries automatically; \"news\" targets news headlines; \"general\" runs standard web search."
           },
           "maxResults": {
             "type": "integer",

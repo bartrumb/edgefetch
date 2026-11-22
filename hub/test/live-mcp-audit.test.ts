@@ -955,7 +955,6 @@ test('C.1, C.2 & C.3: MCP initialize/discover advertise listChanged + 2.7.1, all
   const searchPropKeys = Object.keys(searchSchema.properties);
   assert.deepEqual(searchPropKeys, [
     'query',
-    'topic',
     'maxResults',
     'timeRange',
     'includeDomains',

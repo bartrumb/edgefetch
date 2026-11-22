@@ -161,7 +161,6 @@ export interface ExtractedDocument {
   wordCount?: number;
   language?: string;
   canonicalUrl?: string;
-  isVideoPage?: boolean;
   markdownAlternateUrl?: string;
   favicon?: string;
   extractorId?: string;
@@ -1288,26 +1287,12 @@ function extractSchemaMetadataAndBody(entities: Array<Record<string, unknown>>):
   modifiedTime?: string;
   siteName?: string;
   articleBody?: string;
-  hasVideoObject?: boolean;
-  videoName?: string;
-  videoDescription?: string;
-  videoTranscript?: string;
 } {
   let author: string | undefined;
   let publishedTime: string | undefined;
   let modifiedTime: string | undefined;
   let siteName: string | undefined;
   let articleBody: string | undefined;
-  let hasVideoObject = false;
-  let videoName: string | undefined;
-  let videoDescription: string | undefined;
-  let videoTranscript: string | undefined;
-
-  const hasVideoType = (rawType: unknown): boolean => {
-    if (typeof rawType === 'string') return /\bvideoobject\b/i.test(rawType);
-    if (Array.isArray(rawType)) return rawType.some((t) => typeof t === 'string' && /\bvideoobject\b/i.test(t));
-    return false;
-  };
 
   const extractAuthorNames = (rawAuthor: unknown): string[] => {
     if (!rawAuthor) return [];
@@ -1355,24 +1340,6 @@ function extractSchemaMetadataAndBody(entities: Array<Record<string, unknown>>):
     if (bodyCand && (!articleBody || bodyCand.length > articleBody.length)) {
       articleBody = bodyCand;
     }
-    if (hasVideoType(ent['@type'])) {
-      hasVideoObject = true;
-      if (!videoName && typeof ent.name === 'string' && !isPlaceholderMetaValue(ent.name)) {
-        videoName = cleanInlineHtml(ent.name);
-      }
-      if (typeof ent.description === 'string' && !isPlaceholderMetaValue(ent.description)) {
-        const cleanVd = cleanInlineHtml(ent.description);
-        if (cleanVd && (!videoDescription || cleanVd.length > videoDescription.length)) {
-          videoDescription = cleanVd;
-        }
-      }
-      if (typeof ent.transcript === 'string' && !isPlaceholderMetaValue(ent.transcript)) {
-        const cleanVt = cleanInlineHtml(ent.transcript);
-        if (cleanVt && (!videoTranscript || cleanVt.length > videoTranscript.length)) {
-          videoTranscript = cleanVt;
-        }
-      }
-    }
   }
   return {
     ...(author ? { author } : {}),
@@ -1380,10 +1347,6 @@ function extractSchemaMetadataAndBody(entities: Array<Record<string, unknown>>):
     ...(modifiedTime ? { modifiedTime } : {}),
     ...(siteName ? { siteName } : {}),
     ...(articleBody ? { articleBody } : {}),
-    ...(hasVideoObject ? { hasVideoObject: true } : {}),
-    ...(videoName ? { videoName } : {}),
-    ...(videoDescription ? { videoDescription } : {}),
-    ...(videoTranscript ? { videoTranscript } : {}),
   };
 }
 
@@ -3594,42 +3557,11 @@ export function extractHtmlDocument(
     }
   }
 
-  // Field Issue #5: Video-Only Bulletin Detection & `VideoObject` Description/Transcript Rescue
-  let isVideoPage = false;
-  const hasVideoPathSignal = Boolean(baseUrl && /\/videos?(?:\/|$)/i.test(baseUrl));
-  const hasVideoSignal = Boolean((ogType && ogType.startsWith('video')) || schemaMeta.hasVideoObject || hasVideoPathSignal);
-  if (hasVideoSignal) {
-    const nonEmptyMdLines = md
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-    const linkHeavyLineCount = nonEmptyMdLines.filter((l) => /^(?:[-*+]\s+)?\[[^\]]+\]\([^)]+\)$|^#{1,6}\s+/.test(l)).length;
-    const isMostlyHeadlineLinks =
-      nonEmptyMdLines.length > 0 && linkHeavyLineCount / nonEmptyMdLines.length >= 0.65;
-    const proseWithoutLinks = md.replace(/\[([^\]]*)\]\([^)]*\)/g, '').trim();
-    const isThinVideoBody = md.trim().length < 400 || proseWithoutLinks.length < 240 || isMostlyHeadlineLinks;
-    if (isThinVideoBody) {
-      isVideoPage = true;
-      const vHeading = schemaMeta.videoName || title;
-      const vDesc = schemaMeta.videoDescription || description;
-      const vTranscript = schemaMeta.videoTranscript;
-      if (vDesc || vTranscript) {
-        const videoParts: string[] = [];
-        if (vHeading) videoParts.push(`# ${vHeading}`);
-        if (vDesc) videoParts.push(vDesc);
-        if (vTranscript && vTranscript !== vDesc) {
-          videoParts.push(`## Transcript\n\n${vTranscript}`);
-        }
-        md = videoParts.join('\n\n');
-      }
-    }
-  }
-
   let plainText = ytMeta
     ? ytMeta.markdown
     : hnExtracted
       ? hnExtracted.markdown
-      : inertiaHydrated || isVideoPage
+      : inertiaHydrated
         ? md
         : cleanInlineHtml(work);
   if (redactPii) {
@@ -3656,7 +3588,6 @@ export function extractHtmlDocument(
     ...(wordCount > 0 ? { wordCount } : {}),
     ...(language ? { language } : {}),
     ...(canonicalUrl ? { canonicalUrl } : {}),
-    ...(isVideoPage ? { isVideoPage: true } : {}),
     ...(markdownAlternateUrl ? { markdownAlternateUrl } : {}),
     ...(favicon ? { favicon } : {}),
     ...(matchedSiteExtracted?.extractorId ? { extractorId: matchedSiteExtracted.extractorId } : {}),
@@ -5025,8 +4956,6 @@ export interface ScrapeRequestPayload {
   ocr?: unknown;
   waybackFallback?: unknown;
   spaFallback?: unknown;
-  followCanonical?: unknown;
-  _followedCanonicalHop?: boolean;
   noCache?: unknown;
   ephemeral?: unknown;
   visibility?: unknown;
@@ -11056,7 +10985,6 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  // Field Issue #4: Cross-domain syndicated `<link rel="canonical" href="https://...">` detection & optional 1-hop `followCanonical`
   let safeCanonicalUrl: string | undefined;
   let crossOriginCanonical = false;
   if (extracted?.canonicalUrl) {
@@ -11072,44 +11000,6 @@ export async function executeScrapeCall(params: {
       } catch {
         // ignore
       }
-    }
-  }
-  if (
-    Boolean(payload.followCanonical) &&
-    !payload._followedCanonicalHop &&
-    crossOriginCanonical &&
-    safeCanonicalUrl
-  ) {
-    const canonHopRes = await executeScrapeCall({
-      ...params,
-      payload: {
-        ...payload,
-        url: safeCanonicalUrl,
-        followCanonical: false,
-        _followedCanonicalHop: true,
-      },
-      source: `${source}:canonical-hop`,
-    });
-    if (canonHopRes.status === 200 && canonHopRes.body?.ok === true) {
-      const hopMeta =
-        canonHopRes.body.metadata && typeof canonHopRes.body.metadata === 'object'
-          ? (canonHopRes.body.metadata as Record<string, unknown>)
-          : {};
-      return {
-        ...canonHopRes,
-        body: {
-          ...canonHopRes.body,
-          url: normalizedUrl,
-          syndicatedFromUrl: finalUrl,
-          canonicalUrl: safeCanonicalUrl,
-          followedCanonical: true,
-          metadata: {
-            ...hopMeta,
-            canonicalUrl: safeCanonicalUrl,
-            crossOriginCanonical: true,
-          },
-        },
-      };
     }
   }
 
@@ -11938,7 +11828,7 @@ export async function executeScrapeCall(params: {
   const resolvedPublishedTime = customShopifyDoc?.publishedTime ?? extracted?.publishedTime ?? htmlJobPosting?.datePosted;
 
   const resolvedFavicon = (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon || defaultFaviconForUrl(finalUrl);
-  const resolvedContentType = isPdfResponse ? 'application/pdf' : extracted?.isVideoPage ? 'video' : (typeof item.contentType === 'string' ? item.contentType : undefined);
+  const resolvedContentType = isPdfResponse ? 'application/pdf' : (typeof item.contentType === 'string' ? item.contentType : undefined);
   const resolvedWordCount = rawCleanMarkdown ? countTextWords(rawCleanMarkdown) : undefined;
   const resolvedRendered = Boolean(renderMode === 'always' || renderedViaOut !== undefined);
 

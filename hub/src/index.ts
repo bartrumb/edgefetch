@@ -156,7 +156,6 @@ import {
 } from './search-index';
 import {
   executeSearchCall,
-  type SearchHostHealthSnapshot,
   type SearchRequestPayload,
 } from './web-search';
 import { listRegisteredAdapters } from './extractors/registry';
@@ -1381,29 +1380,6 @@ export default {
           };
       const activity = hubActivityProxy(hub);
       const safePublicFetch = env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch;
-      const loadSearchHostHealthGetter = async (): Promise<((hostname: string) => SearchHostHealthSnapshot | null) | undefined> => {
-        if (!env.AGENT_HUB) return undefined;
-        try {
-          const stub = hub() as unknown as Partial<AgentHubDO>;
-          if (typeof stub.listHostHealth !== 'function') return undefined;
-          const rows = await stub.listHostHealth(500);
-          if (!Array.isArray(rows) || rows.length === 0) return undefined;
-          const byHost = new Map<string, SearchHostHealthSnapshot>();
-          for (const r of rows) {
-            if (r && typeof r.host === 'string') {
-              byHost.set(r.host.toLowerCase(), {
-                okCount: r.okCount ?? 0,
-                challengeCount: r.challengeCount ?? 0,
-                rateLimitCount: r.rateLimit429Count ?? 0,
-                error5xxCount: r.error5xxCount ?? 0,
-              });
-            }
-          }
-          return byHost.size > 0 ? (hostname: string) => byHost.get(hostname.toLowerCase()) ?? null : undefined;
-        } catch {
-          return undefined;
-        }
-      };
 
       const makeCatalogHubFetch = (sourceLabel: string): CatalogHubFetchFn => {
         const boundTracer = getActiveRequestTracer();
@@ -1711,12 +1687,10 @@ export default {
             };
           },
           executeSearch: async ({ args, principal, userId }) => {
-            const getHostHealth = await loadSearchHostHealthGetter();
             const out = await executeSearchCall({
               payload: args as SearchRequestPayload,
               env,
               executeHubFetch,
-              ...(getHostHealth ? { getHostHealth } : {}),
               source: `mcp-search:${principal ?? 'client'}`,
               userId,
             });
@@ -1727,12 +1701,10 @@ export default {
               payload: args as JobsToolPayload,
               env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
               executeSearch: async (sArgs) => {
-                const getHostHealth = await loadSearchHostHealthGetter();
                 const sOut = await executeSearchCall({
                   payload: sArgs as SearchRequestPayload,
                   env,
                   executeHubFetch,
-                  ...(getHostHealth ? { getHostHealth } : {}),
                   source: `mcp-jobs-search:${principal ?? 'client'}`,
                   userId,
                 });
@@ -2580,12 +2552,10 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
-          const getHostHealth = await loadSearchHostHealthGetter();
           const out = await executeSearchCall({
             payload,
             env,
             executeHubFetch,
-            ...(getHostHealth ? { getHostHealth } : {}),
             source: `search:${auth.principal}`,
             userId: auth.userId,
           });
@@ -3118,12 +3088,10 @@ export default {
             payload,
             env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
             executeSearch: async (sArgs) => {
-              const getHostHealth = await loadSearchHostHealthGetter();
               const sOut = await executeSearchCall({
                 payload: sArgs as SearchRequestPayload,
                 env,
                 executeHubFetch,
-                ...(getHostHealth ? { getHostHealth } : {}),
                 source: `jobs-search:${auth.principal}`,
                 userId: auth.userId,
               });

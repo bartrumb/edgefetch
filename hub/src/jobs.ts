@@ -2899,7 +2899,7 @@ export function buildBlockedInfo(
       reason,
       host,
       suggestion:
-        `${host} blocks automated HTML scraping via ${reason === 'robots' ? 'robots.txt' : 'anti-bot challenge'}. Call \`search\` with \`topic: "news"\` or scrape official broadcaster RSS feeds (\`https://www.cbsnews.com/latest/rss/main\`, \`https://feeds.nbcnews.com/nbcnews/public/news\`, \`https://feeds.npr.org/1001/rss.xml\`, \`https://feeds.bbci.co.uk/news/rss.xml\`).`,
+        `${host} blocks automated HTML scraping via ${reason === 'robots' ? 'robots.txt' : 'anti-bot challenge'}. Do not retry this URL; use \`search\` or scrape official public broadcaster RSS feeds (\`https://www.cbsnews.com/latest/rss/main\`, \`https://feeds.nbcnews.com/nbcnews/public/news\`, \`https://feeds.npr.org/1001/rss.xml\`, \`https://feeds.bbci.co.uk/news/rss.xml\`).`,
     };
   }
 

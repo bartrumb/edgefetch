@@ -29,16 +29,32 @@ import {
   type HubSocketLike,
 } from '../src/agent-hub.ts';
 import { authorizeAgent } from '../src/auth.ts';
+import {
+  createMemoryHubSettingsStore,
+  createSqliteHubSettingsStore,
+  HUB_SETTINGS_SQLITE_SCHEMA,
+  type HubSettingsStore,
+} from '../src/dev-telemetry.ts';
 import hubWorker from '../src/index.ts';
+import {
+  createMemoryMcpVaultStore,
+  createSqliteMcpVaultStore,
+  MCP_VAULT_SQLITE_SCHEMA,
+  type McpVaultStore,
+  type PendingMcpOAuthStateRow,
+  type StoredMcpServerRow,
+} from '../src/mcp-vault.ts';
 import {
   createMemoryOAuthStore,
   createSqliteOAuthStore,
   OAUTH_SQLITE_SCHEMA,
+  type HubUserRecord,
   type OAuthClientRecord,
   type OAuthCodeRecord,
   type OAuthStore,
   type RotateRefreshParams,
   type SqlStorageLike,
+  type UserRole,
 } from '../src/oauth.ts';
 import { validatePublicHttpsTargetUrl } from '../src/overflow.ts';
 import { normalizeClientRateLimitIp } from '../src/safe-input.ts';
@@ -83,6 +99,15 @@ const KNOWN_DENO_ENV_KEYS = [
   'FLY_ALLOC_ID',
   'FLY_REGION',
   'EDGEFETCH_PUBLIC_ORIGIN',
+  'SESSION_SECRET',
+  'EDGEFETCH_SESSION_SECRET',
+  'GITHUB_CLIENT_ID',
+  'GITHUB_CLIENT_SECRET',
+  'GITHUB_ALLOWED_USERS',
+  'GITHUB_OWNER_LOGIN',
+  'SIGNUP_MODE',
+  'VAULT_MASTER_KEY',
+  'EDGEFETCH_VAULT_MASTER_KEY',
   'CALLER_TOKEN',
   'EDGEFETCH_CALLER_TOKEN',
   'EDGEFETCH_SERVER_TOKEN',
@@ -138,6 +163,11 @@ const KNOWN_DENO_ENV_KEYS = [
   'S3_ACCESS_KEY_ID',
   'S3_SECRET_ACCESS_KEY',
   'S3_REGION',
+  'EDGEFETCH_DISABLE_UPDATE_CHECK',
+  'EDGEFETCH_DEV_TELEMETRY',
+  'EDGEFETCH_DEV_TELEMETRY_ENDPOINT',
+  'EDGEFETCH_DEV_TELEMETRY_URL',
+  'DO_NOT_TRACK',
 ] as const;
 
 function readDenoEnvMap(overrides?: Record<string, string | undefined>): Record<string, string> {
@@ -736,16 +766,19 @@ function sanitizeDenoInboundRequest(
 }
 
 const fallbackSharedOAuthStore: OAuthStore = createMemoryOAuthStore();
+const fallbackSharedMcpVaultStore: McpVaultStore = createMemoryMcpVaultStore();
 const fallbackSharedActivityStore: ActivityStore = createMemoryActivityStore();
 
 function openDenoPersistentStores(
   dataDir: string,
   ephemeralStores = false,
-): { oauth: OAuthStore; activity: ActivityStore; close: () => void } {
+): { oauth: OAuthStore; mcpVault: McpVaultStore; activity: ActivityStore; close: () => void } {
   if (ephemeralStores || dataDir.trim() === ':memory:') {
     return {
       oauth: createMemoryOAuthStore(),
+      mcpVault: createMemoryMcpVaultStore(),
       activity: createMemoryActivityStore(),
+      settings: createMemoryHubSettingsStore(),
       close: () => {},
     };
   }
@@ -756,7 +789,9 @@ function openDenoPersistentStores(
       mkdirSync(dirname(sqlitePath), { recursive: true });
     }
     const db = new DatabaseSync(sqlitePath);
-    db.exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; ${OAUTH_SQLITE_SCHEMA} ${ACTIVITY_SQLITE_SCHEMA}`);
+    db.exec(
+      `PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; ${OAUTH_SQLITE_SCHEMA} ${MCP_VAULT_SQLITE_SCHEMA} ${ACTIVITY_SQLITE_SCHEMA} ${HUB_SETTINGS_SQLITE_SCHEMA}`,
+    );
     const sqlLike: SqlStorageLike = {
       exec: <T = Record<string, unknown>>(query: string, ...bindings: unknown[]) => {
         const stmt = db.prepare(query);
@@ -777,7 +812,9 @@ function openDenoPersistentStores(
     };
     return {
       oauth: createSqliteOAuthStore(sqlLike),
+      mcpVault: createSqliteMcpVaultStore(sqlLike),
       activity: createSqliteActivityStore(sqlLike),
+      settings: createSqliteHubSettingsStore(sqlLike),
       close: () => {
         try {
           db.close();
@@ -789,7 +826,9 @@ function openDenoPersistentStores(
   } catch {
     return {
       oauth: fallbackSharedOAuthStore,
+      mcpVault: fallbackSharedMcpVaultStore,
       activity: fallbackSharedActivityStore,
+      settings: createMemoryHubSettingsStore(),
       close: () => {},
     };
   }
@@ -871,7 +910,9 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     options.ephemeralStores,
   );
   const oauth: OAuthStore = persistentStores.oauth;
+  const mcpVault: McpVaultStore = persistentStores.mcpVault;
   const activity: ActivityStore = persistentStores.activity;
+  const settings: HubSettingsStore = persistentStores.settings;
   const bus = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('edgefetch-hub-bus') : null;
 
   const tursoUrl = envMap.TURSO_DATABASE_URL;
@@ -932,6 +973,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
       ...engine.listAgents(),
       affinities: engine.listAffinities(),
       grants: await oauth.listGrants(now),
+      users: (await oauth.listUsers?.()) ?? [],
       mcpClients: await activity.listMcpClients(),
       events: activity.listPortalEvents ? await activity.listPortalEvents(75, 75) : await activity.listEvents(150),
     }),
@@ -953,12 +995,26 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     oauthGetAccessToken: (h: string, now: number) => oauth.getAccessToken(h, now),
     oauthConsumeRefreshToken: (h: string, now: number) => oauth.consumeRefreshToken(h, now),
     oauthRotateRefreshToken: (p: RotateRefreshParams) => oauth.rotateRefreshToken(p),
-    oauthListGrants: (now: number) => oauth.listGrants(now),
-    oauthRevokeGrant: (id: string) => oauth.revokeGrant(id),
+    oauthListGrants: (now: number, userId?: string) => oauth.listGrants(now, userId),
+    oauthRevokeGrant: (id: string, userId?: string) => oauth.revokeGrant(id, userId),
     oauthRevokeByTokenHash: (h: string) => oauth.revokeByTokenHash(h),
+    oauthUpsertUser: (u: HubUserRecord) => oauth.upsertUser?.(u) ?? u,
+    oauthGetUser: (id: string) => oauth.getUser?.(id) ?? null,
+    oauthListUsers: () => oauth.listUsers?.() ?? [],
+    oauthCountUsers: () => oauth.countUsers?.() ?? 0,
+    oauthUpdateUserRole: (id: string, role: UserRole) => oauth.updateUserRole?.(id, role) ?? false,
     oauthCheckAuthLockout: (b: string, now: number, m?: number) => oauth.checkAuthLockout(b, now, m),
     oauthRecordAuthFailure: (b: string, now: number, w: number, m: number) => oauth.recordAuthFailure(b, now, w, m),
     oauthClearAuthFailures: (b: string) => oauth.clearAuthFailures(b),
+    vaultListServers: (userId: string) => mcpVault.listServers(userId),
+    vaultGetServer: (userId: string, slugOrDomain: string) => mcpVault.getServer(userId, slugOrDomain),
+    vaultUpsertServer: (row: StoredMcpServerRow) => mcpVault.upsertServer(row),
+    vaultDeleteServer: (userId: string, slug: string) => mcpVault.deleteServer(userId, slug),
+    vaultPutOAuthState: (row: PendingMcpOAuthStateRow) => mcpVault.putOAuthState(row),
+    vaultConsumeOAuthState: (stateHash: string, userId: string, now: number) =>
+      mcpVault.consumeOAuthState(stateHash, userId, now),
+    getHubSetting: (k: string) => settings.getSetting(k),
+    setHubSetting: (k: string, v: string) => settings.setSetting(k, v),
   };
 
   const workerEnv: Record<string, unknown> = {
@@ -966,6 +1022,13 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     SAFE_FETCH: safeFetch,
     SAFE_PUBLIC_FETCH: safePublicFetch,
     CALLER_TOKEN: envMap.CALLER_TOKEN ?? envMap.EDGEFETCH_CALLER_TOKEN ?? envMap.EDGEFETCH_SERVER_TOKEN,
+    SESSION_SECRET: envMap.SESSION_SECRET ?? envMap.EDGEFETCH_SESSION_SECRET,
+    GITHUB_CLIENT_ID: envMap.GITHUB_CLIENT_ID,
+    GITHUB_CLIENT_SECRET: envMap.GITHUB_CLIENT_SECRET,
+    GITHUB_ALLOWED_USERS: envMap.GITHUB_ALLOWED_USERS,
+    GITHUB_OWNER_LOGIN: envMap.GITHUB_OWNER_LOGIN,
+    SIGNUP_MODE: envMap.SIGNUP_MODE,
+    VAULT_MASTER_KEY: envMap.VAULT_MASTER_KEY ?? envMap.EDGEFETCH_VAULT_MASTER_KEY,
     MCP_TOKEN: envMap.MCP_TOKEN,
     AGENT_TOKEN: envMap.AGENT_TOKEN ?? envMap.EDGEFETCH_AGENT_TOKEN,
     AGENT_TOKENS: envMap.AGENT_TOKENS ?? envMap.EDGEFETCH_AGENT_TOKENS,

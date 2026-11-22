@@ -47,13 +47,22 @@ import {
   formatSourceCodeUrlToMarkdown,
   formatVcardToMarkdown,
   lookupCachedScrape,
+  lookupPrivateCachedScrape,
   lookupCompanionMdUrl,
   redactPiiText,
   sanitizeInlineHtmlInMarkdown,
   SCRAPE_PIPELINE_VERSION,
   tryParseJsonPayloadForScrape,
+  writePrivateCachedScrape,
 } from './scrape';
-import { sanitizeFtsQuery, type ArtifactRetention, type OptionalStorageBindings } from './storage';
+import {
+  normalizeVisibility,
+  sanitizeFtsQuery,
+  sanitizeStorageUserId,
+  type ArtifactRetention,
+  type ArtifactVisibility,
+  type OptionalStorageBindings,
+} from './storage';
 import {
   classifyContentState,
   classifyWafAndChallenge,
@@ -78,6 +87,44 @@ export const SEARCH_BATCH_INSERT_LIMIT = 45; // <= 46 statements per db.batch() 
 export const WARN_SEARCH_DB_BYTES = 7 * 1024 * 1024 * 1024; // 7 GB warning threshold
 export const MAX_SEARCH_DB_BYTES = 9 * 1024 * 1024 * 1024; // 9 GB hard stop for new indexing
 export const COLLECTION_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+export const INTERNAL_COLLECTION_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/**
+ * Resolves a caller-supplied collection name into a tenant-isolated FTS5 `collection_id`:
+ *  - Explicit `private:<targetUserId>:<name>` is allowed ONLY when `<targetUserId>` matches `userId` (`403` otherwise).
+ *  - Non-owner users (`gh_<id>`) or `visibility === 'private'` automatically namespace `<name>` to `private:<userId>:<name>`.
+ *  - Single-owner `userId === 'owner'` with `visibility === 'public'` preserves `<name>` unchanged for backward compatibility.
+ */
+export function resolveUserCollectionId(
+  rawCollectionId: string,
+  userId = 'owner',
+  visibility: ArtifactVisibility = 'public',
+): { ok: true; scopedId: string; displayId: string } | { ok: false; status: number; error: string; message: string } {
+  const trimmed = rawCollectionId.trim();
+  const safeUser = sanitizeStorageUserId(userId);
+  if (trimmed.startsWith('private:')) {
+    const m = /^private:([A-Za-z0-9_-]{1,64}):([A-Za-z0-9_.:-]{1,64})$/.exec(trimmed);
+    if (!m) {
+      return { ok: false, status: 400, error: 'invalid_collection_id', message: 'Invalid private collection identifier' };
+    }
+    if (m[1] !== safeUser) {
+      return { ok: false, status: 403, error: 'forbidden_collection', message: 'Access to another user private collection is forbidden' };
+    }
+    const scopedId = `private:${safeUser}:${m[2]}`;
+    return { ok: true, scopedId, displayId: trimmed };
+  }
+  if (!COLLECTION_ID_RE.test(trimmed)) {
+    return { ok: false, status: 400, error: 'invalid_collection_id', message: 'Invalid collection identifier' };
+  }
+  if (safeUser !== 'owner' || visibility === 'private') {
+    const scopedId = `private:${safeUser}:${trimmed}`;
+    if (!INTERNAL_COLLECTION_ID_RE.test(scopedId)) {
+      return { ok: false, status: 400, error: 'invalid_collection_id', message: 'Collection identifier exceeds maximum length' };
+    }
+    return { ok: true, scopedId, displayId: trimmed };
+  }
+  return { ok: true, scopedId: trimmed, displayId: trimmed };
+}
 
 export interface MarkdownChunk {
   ordinal: number;
@@ -661,7 +708,7 @@ export class D1FtsSearchIndex implements SearchIndex {
     tracer?: RequestTracer | TraceContext;
   }): Promise<ReplacePageChunksResult> {
     const { collectionId, documentId, pageId, url, title, markdown, fetchedAt } = params;
-    if (!COLLECTION_ID_RE.test(collectionId)) {
+    if (!INTERNAL_COLLECTION_ID_RE.test(collectionId)) {
       throw new Error(`invalid collectionId: ${collectionId}`);
     }
 
@@ -778,7 +825,7 @@ export class D1FtsSearchIndex implements SearchIndex {
     tracer?: RequestTracer | TraceContext;
   }): Promise<SearchChunkHit[]> {
     const { collectionId, query, limit = 10 } = params;
-    if (!COLLECTION_ID_RE.test(collectionId)) return [];
+    if (!INTERNAL_COLLECTION_ID_RE.test(collectionId)) return [];
     const safeMatch = sanitizeFtsQuery(query);
     if (!safeMatch) return [];
 
@@ -940,6 +987,8 @@ export interface ExtractRequestPayload {
   spaFallback?: unknown;
   noCache?: unknown;
   collectionId?: unknown;
+  visibility?: unknown;
+  headers?: unknown;
   ephemeral?: boolean;
   target?: unknown;
   site?: unknown;
@@ -963,12 +1012,13 @@ export async function executeExtractCall(params: {
   ) => Promise<{ status: number; via: string; bodyText: string; retryAfter?: string }>;
   source?: string;
   selfHost?: string;
+  userId?: string;
   now?: number;
   tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runExtract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
-  const { payload, env, executeHubFetch, source = 'extract', selfHost, now = Date.now() } = params;
+  const { payload, env, executeHubFetch, source = 'extract', selfHost, userId = 'owner', now = Date.now() } = params;
   if (!Array.isArray(payload.urls) || payload.urls.length === 0 || payload.urls.length > 20) {
     return {
       status: 400,
@@ -1009,10 +1059,20 @@ export async function executeExtractCall(params: {
   const redactPii = Boolean(payload.redactPii);
   const waybackFallback = Boolean(payload.waybackFallback);
   const spaFallbackMode = normalizeSpaFallbackMode(payload.spaFallback);
-  const collectionId =
-    typeof payload.collectionId === 'string' && COLLECTION_ID_RE.test(payload.collectionId.trim())
-      ? payload.collectionId.trim()
-      : undefined;
+  const visibility = normalizeVisibility(payload.visibility, payload.headers);
+  const isPrivateExtract = visibility === 'private';
+  let collectionId: string | undefined;
+  if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {
+    const resolvedColl = resolveUserCollectionId(payload.collectionId, userId, visibility);
+    if (!resolvedColl.ok) {
+      return {
+        status: resolvedColl.status,
+        via: 'hub',
+        body: { ok: false, error: resolvedColl.error, message: 'Invalid or unauthorized collectionId' },
+      };
+    }
+    collectionId = resolvedColl.scopedId;
+  }
   const target: 'auto' | 'agent' | 'container' =
     payload.target === 'agent' || payload.target === 'container' ? payload.target : 'auto';
   const site = typeof payload.site === 'string' && payload.site.trim() ? payload.site.trim() : undefined;
@@ -1050,16 +1110,25 @@ export async function executeExtractCall(params: {
   const toFetch: Array<{ idx: number; url: string }> = [];
   for (let i = 0; i < normalizedUrls.length; i++) {
     const u = normalizedUrls[i]!;
-    if (maxAgeMs > 0 && env.ARTIFACTS && env.META && !jsonFilterStr) {
+    if (maxAgeMs > 0 && env.ARTIFACTS && (isPrivateExtract || env.META) && !jsonFilterStr) {
       const cacheStartMs = Date.now();
-      const hit = await lookupCachedScrape({
-        bucket: env.ARTIFACTS,
-        metaDb: env.META,
-        url: u,
-        maxAgeMs,
-        pipelineVersion: SCRAPE_PIPELINE_VERSION,
-        now,
-      });
+      const hit = isPrivateExtract
+        ? await lookupPrivateCachedScrape({
+            bucket: env.ARTIFACTS,
+            userId,
+            url: u,
+            maxAgeMs,
+            pipelineVersion: SCRAPE_PIPELINE_VERSION,
+            now,
+          })
+        : await lookupCachedScrape({
+            bucket: env.ARTIFACTS,
+            metaDb: env.META!,
+            url: u,
+            maxAgeMs,
+            pipelineVersion: SCRAPE_PIPELINE_VERSION,
+            now,
+          });
       if (hit) {
         if (activeTracer) {
           const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
@@ -1067,7 +1136,7 @@ export async function executeExtractCall(params: {
             startTimeMs: cacheStartMs,
             attributes: {
               'cache.hit': true,
-              'cache.tier': 'r2-d1',
+              'cache.tier': isPrivateExtract ? 'private-r2' : 'r2-d1',
               'cache.revalidated': false,
               'url.full': sanitizeUrlForSpan(u),
               'http.response.status_code': hit.status,
@@ -1092,20 +1161,21 @@ export async function executeExtractCall(params: {
     toFetch.push({ idx: i, url: u });
   }
 
-  let via = 'cache:r2-d1';
+  let via = isPrivateExtract ? 'cache:private-r2' : 'cache:r2-d1';
   if (toFetch.length === 0 && activeTracer) {
     setActiveSpanAttribute('edgefetch.via', via, activeTracer);
     setActiveSpanAttribute('edgefetch.cached', true, activeTracer);
   }
   if (toFetch.length > 0) {
     const isEphemeral = Boolean(payload.ephemeral) && !collectionId;
-    const retentionMode: ArtifactRetention | 'off' | undefined = isEphemeral
-      ? 'off'
-      : env.ARTIFACTS && env.META
-        ? 'stored'
-        : env.ARTIFACTS
-          ? 'transient'
-          : undefined;
+    const retentionMode: ArtifactRetention | 'off' | undefined =
+      isEphemeral || isPrivateExtract
+        ? 'off'
+        : env.ARTIFACTS && env.META
+          ? 'stored'
+          : env.ARTIFACTS
+            ? 'transient'
+            : undefined;
 
     const atsByIdx = new Map<number, NonNullable<ReturnType<typeof resolveAtsPreFetchSpec>>>();
     const twinByIdx = new Map<number, NonNullable<ReturnType<typeof resolveSiteExtractorTwin>>>();
@@ -1166,7 +1236,15 @@ export async function executeExtractCall(params: {
         };
       }),
     };
-    const fetchOut = await executeHubFetch(target, JSON.stringify(call), site, source, retentionMode, !isEphemeral, collectionId);
+    const fetchOut = await executeHubFetch(
+      target,
+      JSON.stringify(call),
+      site,
+      source,
+      retentionMode,
+      isPrivateExtract ? true : !isEphemeral,
+      isPrivateExtract ? undefined : collectionId,
+    );
     via = fetchOut.via;
     let batchHubErrCode: unknown;
     const resMap = new Map<string, Record<string, unknown>>();
@@ -1229,7 +1307,15 @@ export async function executeExtractCall(params: {
           redactPii,
         })),
       };
-      const retryOut = await executeHubFetch(target, JSON.stringify(retryCall), site, `${source}:retry-html`, retentionMode, !isEphemeral, collectionId);
+      const retryOut = await executeHubFetch(
+        target,
+        JSON.stringify(retryCall),
+        site,
+        `${source}:retry-html`,
+        retentionMode,
+        isPrivateExtract ? true : !isEphemeral,
+        isPrivateExtract ? undefined : collectionId,
+      );
       if (retryOut.status === 200) {
         const retryParsed = JSON.parse(retryOut.bodyText) as { results?: Array<Record<string, unknown>> };
         for (const r of retryParsed.results ?? []) {
@@ -1784,6 +1870,35 @@ export async function executeExtractCall(params: {
         ...(entry?.blocked ? { blocked: entry.blocked } : {}),
       });
       continue;
+    }
+    if (isPrivateExtract && !entry.cached && entry.markdown && payload.ephemeral !== true) {
+      if (env.ARTIFACTS) {
+        await writePrivateCachedScrape({
+          bucket: env.ARTIFACTS,
+          userId,
+          url: u,
+          markdown: entry.markdown,
+          ...(entry.title ? { title: entry.title } : {}),
+          status: entry.status,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          now,
+        }).catch(() => undefined);
+      }
+      if (collectionId && env.SEARCH) {
+        const idx = new D1FtsSearchIndex(env.SEARCH);
+        const privPageId = `pg_${sanitizeStorageUserId(userId)}_${u.slice(-24).replace(/[^A-Za-z0-9]/g, '_')}`;
+        await idx
+          .replacePageChunks({
+            collectionId,
+            documentId: `pdoc_${privPageId}`,
+            pageId: privPageId,
+            url: u,
+            title: entry.title || u,
+            markdown: entry.markdown,
+            fetchedAt: now,
+          })
+          .catch(() => undefined);
+      }
     }
     const effectiveBase = entry.finalUrl || u;
     const allChunks = entry.preChunkedRecords ?? chunkMarkdownForSearch(entry.markdown ?? '');

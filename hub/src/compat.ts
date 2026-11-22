@@ -13,7 +13,9 @@ import {
   startOrExecuteAgentCall,
 } from './agent-runner';
 import { isValidSecretMatch } from './auth';
+import { resolveSessionSecret, type GitHubAuthEnv } from './github-auth';
 import type { LlmEnvBindings } from './llm';
+import type { McpVaultStore } from './mcp-vault';
 import {
   cancelBatchScrape,
   cancelCrawlJob,
@@ -30,20 +32,30 @@ import { authorizeMcpRequest, type OAuthStore } from './oauth';
 import { getActiveRequestTracer, type RequestTracer, type TraceContext } from './otel';
 import { readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 import { executeScrapeCall } from './scrape';
-import { executeExtractCall } from './search-index';
+import { executeExtractCall, resolveUserCollectionId } from './search-index';
 import type { OptionalStorageBindings } from './storage';
 import { executeSearchCall, type SearchBindings } from './web-search';
 
 export async function handleCompatRoutes(params: {
   request: Request;
   url: URL;
-  env: OptionalStorageBindings & SearchBindings & LlmEnvBindings & { CALLER_TOKEN?: string; MCP_TOKEN?: string; WEBHOOK_SECRET?: string };
+  env: OptionalStorageBindings &
+    SearchBindings &
+    LlmEnvBindings &
+    GitHubAuthEnv & {
+      MCP_TOKEN?: string;
+      WEBHOOK_SECRET?: string;
+      VAULT_MASTER_KEY?: string;
+      SAFE_PUBLIC_FETCH?: typeof fetch;
+      SAFE_FETCH?: typeof fetch;
+    };
   oauthStore: OAuthStore;
+  vaultStore?: McpVaultStore;
   executeHubFetch: HubFetchExecutor;
   waitUntil?: (p: Promise<unknown>) => void;
   tracer?: RequestTracer | TraceContext;
 }): Promise<Response | null> {
-  const { request, url, env, oauthStore, executeHubFetch, waitUntil } = params;
+  const { request, url, env, oauthStore, vaultStore, executeHubFetch, waitUntil } = params;
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runCompat = async (): Promise<Response | null> => {
   const p = url.pathname;
@@ -101,6 +113,8 @@ export async function handleCompatRoutes(params: {
   if (!authorized) {
     return Response.json({ success: false, error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
   }
+  const callerUserId = auth.ok ? auth.userId : 'owner';
+  const sessionSigningSecret = resolveSessionSecret(env);
 
   // Normalize `/v2/<subpath>` and `/compat/firecrawl/v2/<subpath>` into one canonical subpath
   const fcPrefix = isDirectFirecrawlV2 ? '/v2' : '/compat/firecrawl/v2';
@@ -116,6 +130,7 @@ export async function handleCompatRoutes(params: {
       env,
       executeHubFetch,
       selfHost: url.hostname,
+      userId: callerUserId,
       source: 'compat:firecrawl:scrape',
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
@@ -145,7 +160,15 @@ export async function handleCompatRoutes(params: {
   }
 
   if (fcSubpath === '/crawl' && request.method === 'POST') {
-    const created = await createCrawlJob({ payload: bodyObj, metaDb: env.META, selfHost: url.hostname });
+    const crawlPayload = { ...bodyObj };
+    if (typeof crawlPayload.collectionId === 'string' && crawlPayload.collectionId.trim()) {
+      const scoped = resolveUserCollectionId(crawlPayload.collectionId, callerUserId);
+      if (!scoped.ok) {
+        return Response.json({ success: false, error: scoped.error }, { status: scoped.status });
+      }
+      crawlPayload.collectionId = scoped.scopedId;
+    }
+    const created = await createCrawlJob({ payload: crawlPayload, metaDb: env.META, selfHost: url.hostname });
     if (!created.ok) {
       return Response.json({ success: false, error: created.error, message: created.message }, { status: created.status });
     }
@@ -202,6 +225,7 @@ export async function handleCompatRoutes(params: {
           env,
           executeHubFetch,
           selfHost: url.hostname,
+          userId: callerUserId,
           source: 'compat:firecrawl:batch-scrape',
           ...(activeTracer ? { tracer: activeTracer } : {}),
         });
@@ -253,6 +277,7 @@ export async function handleCompatRoutes(params: {
       payload: bodyObj,
       env,
       executeHubFetch,
+      userId: callerUserId,
       source: 'compat:firecrawl:search',
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
@@ -271,6 +296,7 @@ export async function handleCompatRoutes(params: {
       env,
       executeHubFetch,
       selfHost: url.hostname,
+      userId: callerUserId,
       source: 'compat:firecrawl:extract',
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
@@ -294,6 +320,9 @@ export async function handleCompatRoutes(params: {
       executeHubFetch,
       selfHost: url.hostname,
       principal: auth.ok ? auth.principal : 'compat',
+      userId: callerUserId,
+      ...(sessionSigningSecret ? { sessionSigningSecret } : {}),
+      ...(vaultStore ? { vaultStore } : {}),
       wantSseStream: wantSse,
       ...(waitUntil ? { waitUntil } : {}),
       ...(activeTracer ? { tracer: activeTracer } : {}),
@@ -306,7 +335,7 @@ export async function handleCompatRoutes(params: {
   if (fcAgentTraceMatch && request.method === 'GET') {
     const agentId = safeDecodeURIComponent(fcAgentTraceMatch[1] ?? '');
     if (agentId === null) return Response.json({ success: false, error: 'bad_request' }, { status: 400 });
-    const rec = await loadAgentRun(agentId, env.META);
+    const rec = await loadAgentRun(agentId, env.META, callerUserId);
     if (!rec) return Response.json({ success: false, error: 'agent_not_found' }, { status: 404 });
     return Response.json({
       success: true,
@@ -325,12 +354,12 @@ export async function handleCompatRoutes(params: {
     const agentId = safeDecodeURIComponent(fcAgentMatch[1] ?? '');
     if (agentId === null) return Response.json({ success: false, error: 'bad_request' }, { status: 400 });
     if (request.method === 'GET') {
-      const rec = await loadAgentRun(agentId, env.META);
+      const rec = await loadAgentRun(agentId, env.META, callerUserId);
       if (!rec) return Response.json({ success: false, error: 'agent_not_found' }, { status: 404 });
       return Response.json(formatPublicAgentResponse(rec, false));
     }
     if (request.method === 'DELETE') {
-      const cRes = await cancelAgentRun(agentId, env.META);
+      const cRes = await cancelAgentRun(agentId, env.META, callerUserId);
       return Response.json({ success: cRes.ok }, { status: cRes.status });
     }
   }
@@ -341,6 +370,7 @@ export async function handleCompatRoutes(params: {
       payload: bodyObj,
       env,
       executeHubFetch,
+      userId: callerUserId,
       source: 'compat:tavily:search',
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });
@@ -353,6 +383,7 @@ export async function handleCompatRoutes(params: {
       env,
       executeHubFetch,
       selfHost: url.hostname,
+      userId: callerUserId,
       source: 'compat:tavily:extract',
       ...(activeTracer ? { tracer: activeTracer } : {}),
     });

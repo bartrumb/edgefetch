@@ -478,6 +478,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/mcp":
 		s.withCallerConcurrencyGate(w, r, s.handleMCP)
 
+	case r.URL.Path == "/v1/mcp/registry" && r.Method == http.MethodGet:
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		if q == "" {
+			q = strings.TrimSpace(r.URL.Query().Get("query"))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"runtime":    "go-hub",
+			"query":      q,
+			"remoteOnly": r.URL.Query().Get("remoteOnly") == "true",
+			"count":      0,
+			"servers":    []any{},
+			"note":       "Use Cloudflare Worker Hub or Node Portable Hub for live dual-source MCP Registry + AES-256-GCM Vault connectors.",
+		})
+
+	case r.URL.Path == "/v1/mcp/query" && r.Method == http.MethodPost:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":         true,
+			"action":     "list_connected",
+			"visibility": "private",
+			"count":      0,
+			"servers":    []any{},
+		})
+
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 	}

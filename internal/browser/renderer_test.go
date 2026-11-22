@@ -756,7 +756,7 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live R6 pipe transport check")
 	}
 
-	r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch/2.6.3", 1, nil)
+	r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch/2.7.0", 1, nil)
 	defer r.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

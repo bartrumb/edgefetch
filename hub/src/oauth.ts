@@ -8,11 +8,34 @@
  * revocation in `/admin`.
  */
 import { callerToken, isValidSecretMatch, MIN_TOKEN_LENGTH, sameBytes } from './auth';
+import { verifySessionJwt } from './github-auth';
 import { getActiveRequestTracer, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 
 export const MCP_SCOPES = ['crawl:read', 'crawl:fetch'] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
+export type UserRole = 'owner' | 'member';
+
+export interface HubUserRecord {
+  userId: string;
+  githubId?: string;
+  githubLogin?: string;
+  avatarUrl?: string;
+  role: UserRole;
+  createdAt: number;
+  lastLoginAt: number;
+}
+
+export interface AdminPrincipal {
+  userId: string;
+  role: UserRole;
+  authMethod: 'github' | 'owner_token';
+  csrf: string;
+  jti?: string;
+  githubLogin?: string;
+  avatarUrl?: string;
+  expiresAt: number;
+}
 
 const AUTH_CODE_TTL_MS = 90_000; // 90s single-use authorization code
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1_000; // 1h access token (with 90d rotating refresh token)
@@ -41,6 +64,8 @@ export interface OAuthCodeRecord {
   codeChallenge: string;
   scopes: string[];
   resource: string;
+  userId?: string;
+  userRole?: UserRole;
   expiresAt: number;
 }
 
@@ -51,6 +76,8 @@ export interface OAuthTokenRecord {
   clientName: string;
   scopes: string[];
   resource: string;
+  userId?: string;
+  userRole?: UserRole;
   createdAt: number;
   expiresAt: number;
 }
@@ -60,6 +87,8 @@ export interface OAuthGrantSummary {
   clientId: string;
   clientName: string;
   scopes: string[];
+  userId?: string;
+  userRole?: UserRole;
   createdAt: number;
   expiresAt: number;
 }
@@ -82,6 +111,8 @@ export type RotateRefreshResult =
       clientName: string;
       scopes: string[];
       resource: string;
+      userId: string;
+      userRole: UserRole;
     }
   | {
       ok: false;
@@ -104,6 +135,8 @@ export interface OAuthStore {
     clientName: string;
     scopes: string[];
     resource: string;
+    userId?: string;
+    userRole?: UserRole;
     createdAt: number;
     accessExpiresAt: number;
     refreshExpiresAt: number;
@@ -111,9 +144,14 @@ export interface OAuthStore {
   getAccessToken(tokenHash: string, now: number): Promise<OAuthTokenRecord | null> | OAuthTokenRecord | null;
   consumeRefreshToken(tokenHash: string, now: number): Promise<OAuthTokenRecord | null> | OAuthTokenRecord | null;
   rotateRefreshToken(params: RotateRefreshParams): Promise<RotateRefreshResult> | RotateRefreshResult;
-  listGrants(now: number): Promise<OAuthGrantSummary[]> | OAuthGrantSummary[];
-  revokeGrant(grantId: string): Promise<boolean> | boolean;
+  listGrants(now: number, userId?: string): Promise<OAuthGrantSummary[]> | OAuthGrantSummary[];
+  revokeGrant(grantId: string, userId?: string): Promise<boolean> | boolean;
   revokeByTokenHash(tokenHash: string): Promise<void> | void;
+  upsertUser?(user: HubUserRecord): Promise<HubUserRecord> | HubUserRecord;
+  getUser?(userId: string): Promise<HubUserRecord | null> | HubUserRecord | null;
+  listUsers?(): Promise<HubUserRecord[]> | HubUserRecord[];
+  countUsers?(): Promise<number> | number;
+  updateUserRole?(userId: string, role: UserRole): Promise<boolean> | boolean;
   checkAuthLockout(
     bucket: string,
     now: number,
@@ -147,6 +185,8 @@ export const OAUTH_SQLITE_SCHEMA = `
     code_challenge TEXT NOT NULL,
     scopes_json TEXT NOT NULL,
     resource TEXT NOT NULL,
+    user_id TEXT NOT NULL DEFAULT 'owner',
+    user_role TEXT NOT NULL DEFAULT 'owner',
     expires_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS oauth_tokens (
@@ -157,8 +197,19 @@ export const OAUTH_SQLITE_SCHEMA = `
     client_name TEXT NOT NULL,
     scopes_json TEXT NOT NULL,
     resource TEXT NOT NULL,
+    user_id TEXT NOT NULL DEFAULT 'owner',
+    user_role TEXT NOT NULL DEFAULT 'owner',
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    github_id TEXT,
+    github_login TEXT NOT NULL,
+    avatar_url TEXT,
+    role TEXT NOT NULL DEFAULT 'member',
+    created_at INTEGER NOT NULL,
+    last_login_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS auth_failures (
     bucket TEXT PRIMARY KEY,
@@ -171,8 +222,40 @@ export const OAUTH_SQLITE_SCHEMA = `
   );
 `;
 
+function normalizeRoleForUser(userId: string, rawRole?: string | null): UserRole {
+  if (rawRole === 'owner') return 'owner';
+  if (rawRole === 'member') return 'member';
+  return userId === 'owner' ? 'owner' : 'member';
+}
+
 /** SQLite-backed `OAuthStore` living inside `AgentHubDO` (requires zero separate KV namespaces). */
 export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
+  let multiUserMigrated = false;
+  const ensureMultiUserColumns = () => {
+    if (multiUserMigrated) return;
+    try {
+      sql.exec(OAUTH_SQLITE_SCHEMA);
+      const alterStatements = [
+        "ALTER TABLE oauth_codes ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
+        "ALTER TABLE oauth_codes ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
+        "ALTER TABLE oauth_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
+        "ALTER TABLE oauth_tokens ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
+      ];
+      for (const ddl of alterStatements) {
+        try {
+          sql.exec(ddl);
+        } catch {
+          // Column already exists
+        }
+      }
+      sql.exec('SELECT user_id FROM oauth_tokens LIMIT 1');
+      multiUserMigrated = true;
+    } catch {
+      // Schema not yet initialized; will run on first query
+    }
+  };
+  ensureMultiUserColumns();
+
   return {
     putClient(c) {
       // Evict only clients that have NO active grants or pending authorization codes (H-S1).
@@ -214,6 +297,9 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       };
     },
     putCode(code) {
+      ensureMultiUserColumns();
+      const userId = code.userId ?? 'owner';
+      const userRole = normalizeRoleForUser(userId, code.userRole);
       sql.exec('DELETE FROM oauth_codes WHERE expires_at <= ?', code.expiresAt - AUTH_CODE_TTL_MS);
       sql.exec(
         `DELETE FROM oauth_codes
@@ -223,8 +309,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       );
       sql.exec(
         `INSERT OR REPLACE INTO oauth_codes
-         (code_hash, client_id, client_name, redirect_uri, code_challenge, scopes_json, resource, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (code_hash, client_id, client_name, redirect_uri, code_challenge, scopes_json, resource, user_id, user_role, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         code.codeHash,
         code.clientId,
         code.clientName,
@@ -232,10 +318,13 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         code.codeChallenge,
         JSON.stringify(code.scopes),
         code.resource,
+        userId,
+        userRole,
         code.expiresAt,
       );
     },
     consumeCode(codeHash, now) {
+      ensureMultiUserColumns();
       const rows = sql
         .exec<{
           code_hash: string;
@@ -245,12 +334,15 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           code_challenge: string;
           scopes_json: string;
           resource: string;
+          user_id?: string;
+          user_role?: string;
           expires_at: number;
         }>('SELECT * FROM oauth_codes WHERE code_hash = ?', codeHash)
         .toArray();
       sql.exec('DELETE FROM oauth_codes WHERE code_hash = ? OR expires_at <= ?', codeHash, now);
       const r = rows[0];
       if (!r || r.expires_at <= now) return null;
+      const userId = r.user_id || 'owner';
       return {
         codeHash: r.code_hash,
         clientId: r.client_id,
@@ -259,10 +351,15 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         codeChallenge: r.code_challenge,
         scopes: JSON.parse(r.scopes_json) as string[],
         resource: r.resource,
+        userId,
+        userRole: normalizeRoleForUser(userId, r.user_role),
         expiresAt: r.expires_at,
       };
     },
     putTokenPair(p) {
+      ensureMultiUserColumns();
+      const userId = p.userId ?? 'owner';
+      const userRole = normalizeRoleForUser(userId, p.userRole);
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', p.createdAt);
       sql.exec(
         `DELETE FROM oauth_tokens
@@ -273,32 +370,37 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       const scopesJson = JSON.stringify(p.scopes);
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
-         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, created_at, expires_at)
-         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?)`,
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, created_at, expires_at)
+         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?, ?, ?)`,
         p.accessHash,
         p.grantId,
         p.clientId,
         p.clientName,
         scopesJson,
         p.resource,
+        userId,
+        userRole,
         p.createdAt,
         p.accessExpiresAt,
       );
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
-         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, created_at, expires_at)
-         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?)`,
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, created_at, expires_at)
+         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?, ?, ?)`,
         p.refreshHash,
         p.grantId,
         p.clientId,
         p.clientName,
         scopesJson,
         p.resource,
+        userId,
+        userRole,
         p.createdAt,
         p.refreshExpiresAt,
       );
     },
     getAccessToken(tokenHash, now) {
+      ensureMultiUserColumns();
       const rows = sql
         .exec<{
           grant_id: string;
@@ -307,6 +409,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           client_name: string;
           scopes_json: string;
           resource: string;
+          user_id?: string;
+          user_role?: string;
           created_at: number;
           expires_at: number;
         }>("SELECT * FROM oauth_tokens WHERE token_hash = ? AND kind = 'access'", tokenHash)
@@ -317,6 +421,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         sql.exec('DELETE FROM oauth_tokens WHERE token_hash = ?', tokenHash);
         return null;
       }
+      const userId = r.user_id || 'owner';
       return {
         grantId: r.grant_id,
         kind: 'access',
@@ -324,11 +429,14 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         clientName: r.client_name,
         scopes: JSON.parse(r.scopes_json) as string[],
         resource: r.resource,
+        userId,
+        userRole: normalizeRoleForUser(userId, r.user_role),
         createdAt: r.created_at,
         expiresAt: r.expires_at,
       };
     },
     consumeRefreshToken(tokenHash, now) {
+      ensureMultiUserColumns();
       const rows = sql
         .exec<{
           grant_id: string;
@@ -337,6 +445,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           client_name: string;
           scopes_json: string;
           resource: string;
+          user_id?: string;
+          user_role?: string;
           created_at: number;
           expires_at: number;
         }>("SELECT * FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh'", tokenHash)
@@ -346,6 +456,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       // Rotate both previous access & refresh tokens under this grant before minting the fresh pair.
       sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
       if (r.expires_at <= now) return null;
+      const userId = r.user_id || 'owner';
       return {
         grantId: r.grant_id,
         kind: 'refresh',
@@ -353,11 +464,14 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         clientName: r.client_name,
         scopes: JSON.parse(r.scopes_json) as string[],
         resource: r.resource,
+        userId,
+        userRole: normalizeRoleForUser(userId, r.user_role),
         createdAt: r.created_at,
         expiresAt: r.expires_at,
       };
     },
     rotateRefreshToken(params) {
+      ensureMultiUserColumns();
       const rows = sql
         .exec<{
           grant_id: string;
@@ -366,6 +480,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           client_name: string;
           scopes_json: string;
           resource: string;
+          user_id?: string;
+          user_role?: string;
           created_at: number;
           expires_at: number;
         }>("SELECT * FROM oauth_tokens WHERE token_hash = ? AND kind IN ('refresh', 'refresh_used')", params.refreshHash)
@@ -392,6 +508,9 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         return { ok: false, error: 'invalid_grant' };
       }
 
+      const userId = r.user_id || 'owner';
+      const userRole = normalizeRoleForUser(userId, r.user_role);
+
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', params.now);
       sql.exec("DELETE FROM oauth_tokens WHERE grant_id = ? AND kind = 'access'", r.grant_id);
       sql.exec(
@@ -401,27 +520,31 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       );
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
-         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, created_at, expires_at)
-         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?)`,
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, created_at, expires_at)
+         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?, ?, ?)`,
         params.nextAccessHash,
         r.grant_id,
         r.client_id,
         r.client_name,
         r.scopes_json,
         r.resource,
+        userId,
+        userRole,
         r.created_at,
         params.accessExpiresAt,
       );
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
-         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, created_at, expires_at)
-         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?)`,
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, created_at, expires_at)
+         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?, ?, ?)`,
         params.nextRefreshHash,
         r.grant_id,
         r.client_id,
         r.client_name,
         r.scopes_json,
         r.resource,
+        userId,
+        userRole,
         r.created_at,
         params.refreshExpiresAt,
       );
@@ -432,36 +555,75 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         clientName: r.client_name,
         scopes: JSON.parse(r.scopes_json) as string[],
         resource: r.resource,
+        userId,
+        userRole,
       };
     },
-    listGrants(now) {
+    listGrants(now, userId) {
+      ensureMultiUserColumns();
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', now);
-      const rows = sql
-        .exec<{
-          grant_id: string;
-          client_id: string;
-          client_name: string;
-          scopes_json: string;
-          created_at: number;
-          max_exp: number;
-        }>(
-          `SELECT grant_id, client_id, client_name, scopes_json, MIN(created_at) AS created_at, MAX(expires_at) AS max_exp
-           FROM oauth_tokens
-           WHERE kind IN ('access', 'refresh')
-           GROUP BY grant_id
-           ORDER BY created_at DESC`,
-        )
-        .toArray();
-      return rows.map((r) => ({
-        grantId: r.grant_id,
-        clientId: r.client_id,
-        clientName: r.client_name,
-        scopes: JSON.parse(r.scopes_json) as string[],
-        createdAt: r.created_at,
-        expiresAt: r.max_exp,
-      }));
+      const rows = userId
+        ? sql
+            .exec<{
+              grant_id: string;
+              client_id: string;
+              client_name: string;
+              scopes_json: string;
+              user_id: string;
+              user_role: string;
+              created_at: number;
+              max_exp: number;
+            }>(
+              `SELECT grant_id, client_id, client_name, scopes_json, user_id, user_role, MIN(created_at) AS created_at, MAX(expires_at) AS max_exp
+               FROM oauth_tokens
+               WHERE kind IN ('access', 'refresh') AND user_id = ?
+               GROUP BY grant_id
+               ORDER BY created_at DESC`,
+              userId,
+            )
+            .toArray()
+        : sql
+            .exec<{
+              grant_id: string;
+              client_id: string;
+              client_name: string;
+              scopes_json: string;
+              user_id: string;
+              user_role: string;
+              created_at: number;
+              max_exp: number;
+            }>(
+              `SELECT grant_id, client_id, client_name, scopes_json, user_id, user_role, MIN(created_at) AS created_at, MAX(expires_at) AS max_exp
+               FROM oauth_tokens
+               WHERE kind IN ('access', 'refresh')
+               GROUP BY grant_id
+               ORDER BY created_at DESC`,
+            )
+            .toArray();
+      return rows.map((r) => {
+        const uid = r.user_id || 'owner';
+        return {
+          grantId: r.grant_id,
+          clientId: r.client_id,
+          clientName: r.client_name,
+          scopes: JSON.parse(r.scopes_json) as string[],
+          userId: uid,
+          userRole: normalizeRoleForUser(uid, r.user_role),
+          createdAt: r.created_at,
+          expiresAt: r.max_exp,
+        };
+      });
     },
-    revokeGrant(grantId) {
+    revokeGrant(grantId, userId) {
+      ensureMultiUserColumns();
+      if (userId) {
+        const existing = sql
+          .exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE grant_id = ? AND user_id = ?', grantId, userId)
+          .toArray()[0];
+        if (!existing || existing.c <= 0) return false;
+        sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ? AND user_id = ?', grantId, userId);
+        return true;
+      }
       const existing = sql
         .exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE grant_id = ?', grantId)
         .toArray()[0];
@@ -475,6 +637,91 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       if (row?.grant_id) {
         sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', row.grant_id);
       }
+    },
+    upsertUser(user) {
+      ensureMultiUserColumns();
+      sql.exec(
+        `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, created_at, last_login_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+           github_id = COALESCE(excluded.github_id, users.github_id),
+           github_login = excluded.github_login,
+           avatar_url = excluded.avatar_url,
+           role = excluded.role,
+           last_login_at = excluded.last_login_at`,
+        user.userId,
+        user.githubId ?? null,
+        user.githubLogin ?? user.userId,
+        user.avatarUrl ?? null,
+        user.role,
+        user.createdAt,
+        user.lastLoginAt,
+      );
+      return { ...user };
+    },
+    getUser(userId) {
+      ensureMultiUserColumns();
+      const r = sql
+        .exec<{
+          user_id: string;
+          github_id: string | null;
+          github_login: string;
+          avatar_url: string | null;
+          role: string;
+          created_at: number;
+          last_login_at: number;
+        }>('SELECT * FROM users WHERE user_id = ? LIMIT 1', userId)
+        .toArray()[0];
+      if (!r) return null;
+      return {
+        userId: r.user_id,
+        ...(r.github_id ? { githubId: r.github_id } : {}),
+        githubLogin: r.github_login,
+        ...(r.avatar_url ? { avatarUrl: r.avatar_url } : {}),
+        role: normalizeRoleForUser(r.user_id, r.role),
+        createdAt: r.created_at,
+        lastLoginAt: r.last_login_at,
+      };
+    },
+    listUsers() {
+      ensureMultiUserColumns();
+      return sql
+        .exec<{
+          user_id: string;
+          github_id: string | null;
+          github_login: string;
+          avatar_url: string | null;
+          role: string;
+          created_at: number;
+          last_login_at: number;
+        }>('SELECT * FROM users ORDER BY last_login_at DESC LIMIT 500')
+        .toArray()
+        .map((r) => ({
+          userId: r.user_id,
+          ...(r.github_id ? { githubId: r.github_id } : {}),
+          githubLogin: r.github_login,
+          ...(r.avatar_url ? { avatarUrl: r.avatar_url } : {}),
+          role: normalizeRoleForUser(r.user_id, r.role),
+          createdAt: r.created_at,
+          lastLoginAt: r.last_login_at,
+        }));
+    },
+    countUsers() {
+      ensureMultiUserColumns();
+      const row = sql
+        .exec<{ c: number }>("SELECT COUNT(*) AS c FROM users WHERE user_id != 'owner'")
+        .toArray()[0];
+      return row?.c ?? 0;
+    },
+    updateUserRole(userId, role) {
+      ensureMultiUserColumns();
+      const existing = sql
+        .exec<{ c: number }>('SELECT COUNT(*) AS c FROM users WHERE user_id = ?', userId)
+        .toArray()[0];
+      if (!existing || existing.c <= 0) return false;
+      sql.exec('UPDATE users SET role = ? WHERE user_id = ?', role, userId);
+      sql.exec('UPDATE oauth_tokens SET user_role = ? WHERE user_id = ?', role, userId);
+      return true;
     },
     checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
       if (bucket.startsWith('revoked_admin:')) {
@@ -554,6 +801,7 @@ export function createMemoryOAuthStore(): OAuthStore {
   const clients = new Map<string, OAuthClientRecord>();
   const codes = new Map<string, OAuthCodeRecord>();
   const tokens = new Map<string, OAuthTokenRecord & { used?: boolean }>();
+  const users = new Map<string, HubUserRecord>();
   const failures = new Map<string, { count: number; resetAt: number }>();
   const adminRevocations = new Map<string, number>();
 
@@ -585,7 +833,13 @@ export function createMemoryOAuthStore(): OAuthStore {
         if (oldest === undefined) break;
         codes.delete(oldest);
       }
-      codes.set(code.codeHash, { ...code, scopes: [...code.scopes] });
+      const userId = code.userId ?? 'owner';
+      codes.set(code.codeHash, {
+        ...code,
+        userId,
+        userRole: normalizeRoleForUser(userId, code.userRole),
+        scopes: [...code.scopes],
+      });
     },
     consumeCode(codeHash, now) {
       const c = codes.get(codeHash);
@@ -602,6 +856,8 @@ export function createMemoryOAuthStore(): OAuthStore {
         if (oldest === undefined) break;
         tokens.delete(oldest);
       }
+      const userId = p.userId ?? 'owner';
+      const userRole = normalizeRoleForUser(userId, p.userRole);
       tokens.set(p.accessHash, {
         grantId: p.grantId,
         kind: 'access',
@@ -609,6 +865,8 @@ export function createMemoryOAuthStore(): OAuthStore {
         clientName: p.clientName,
         scopes: [...p.scopes],
         resource: p.resource,
+        userId,
+        userRole,
         createdAt: p.createdAt,
         expiresAt: p.accessExpiresAt,
       });
@@ -619,6 +877,8 @@ export function createMemoryOAuthStore(): OAuthStore {
         clientName: p.clientName,
         scopes: [...p.scopes],
         resource: p.resource,
+        userId,
+        userRole,
         createdAt: p.createdAt,
         expiresAt: p.refreshExpiresAt,
       });
@@ -656,6 +916,8 @@ export function createMemoryOAuthStore(): OAuthStore {
       for (const [h, row] of tokens.entries()) {
         if (row.grantId === t.grantId && row.kind === 'access') tokens.delete(h);
       }
+      const userId = t.userId ?? 'owner';
+      const userRole = normalizeRoleForUser(userId, t.userRole);
       t.used = true;
       t.expiresAt = Math.max(t.expiresAt, params.refreshExpiresAt);
       tokens.set(params.nextAccessHash, {
@@ -665,6 +927,8 @@ export function createMemoryOAuthStore(): OAuthStore {
         clientName: t.clientName,
         scopes: [...t.scopes],
         resource: t.resource,
+        userId,
+        userRole,
         createdAt: t.createdAt,
         expiresAt: params.accessExpiresAt,
       });
@@ -675,6 +939,8 @@ export function createMemoryOAuthStore(): OAuthStore {
         clientName: t.clientName,
         scopes: [...t.scopes],
         resource: t.resource,
+        userId,
+        userRole,
         createdAt: t.createdAt,
         expiresAt: params.refreshExpiresAt,
       });
@@ -685,9 +951,11 @@ export function createMemoryOAuthStore(): OAuthStore {
         clientName: t.clientName,
         scopes: [...t.scopes],
         resource: t.resource,
+        userId,
+        userRole,
       };
     },
-    listGrants(now) {
+    listGrants(now, userId) {
       const byGrant = new Map<string, OAuthGrantSummary>();
       for (const [hash, t] of tokens.entries()) {
         if (t.expiresAt <= now) {
@@ -695,6 +963,8 @@ export function createMemoryOAuthStore(): OAuthStore {
           continue;
         }
         if (t.used) continue;
+        const rowUserId = t.userId ?? 'owner';
+        if (userId && rowUserId !== userId) continue;
         const prev = byGrant.get(t.grantId);
         if (!prev || t.expiresAt > prev.expiresAt) {
           byGrant.set(t.grantId, {
@@ -702,6 +972,8 @@ export function createMemoryOAuthStore(): OAuthStore {
             clientId: t.clientId,
             clientName: t.clientName,
             scopes: [...t.scopes],
+            userId: rowUserId,
+            userRole: normalizeRoleForUser(rowUserId, t.userRole),
             createdAt: t.createdAt,
             expiresAt: t.expiresAt,
           });
@@ -709,10 +981,10 @@ export function createMemoryOAuthStore(): OAuthStore {
       }
       return [...byGrant.values()].sort((a, b) => b.createdAt - a.createdAt);
     },
-    revokeGrant(grantId) {
+    revokeGrant(grantId, userId) {
       let removed = false;
       for (const [hash, t] of tokens.entries()) {
-        if (t.grantId === grantId) {
+        if (t.grantId === grantId && (!userId || (t.userId ?? 'owner') === userId)) {
           tokens.delete(hash);
           removed = true;
         }
@@ -725,6 +997,34 @@ export function createMemoryOAuthStore(): OAuthStore {
       for (const [hash, row] of tokens.entries()) {
         if (row.grantId === t.grantId) tokens.delete(hash);
       }
+    },
+    upsertUser(user) {
+      const copy: HubUserRecord = { ...user };
+      users.set(user.userId, copy);
+      return { ...copy };
+    },
+    getUser(userId) {
+      const u = users.get(userId);
+      return u ? { ...u } : null;
+    },
+    listUsers() {
+      return [...users.values()].map((u) => ({ ...u })).sort((a, b) => b.lastLoginAt - a.lastLoginAt);
+    },
+    countUsers() {
+      let c = 0;
+      for (const k of users.keys()) {
+        if (k !== 'owner') c++;
+      }
+      return c;
+    },
+    updateUserRole(userId, role) {
+      const u = users.get(userId);
+      if (!u) return false;
+      u.role = role;
+      for (const t of tokens.values()) {
+        if ((t.userId ?? 'owner') === userId) t.userRole = role;
+      }
+      return true;
     },
     checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
       if (bucket.startsWith('revoked_admin:')) {
@@ -847,8 +1147,14 @@ export async function isAdminSessionRevoked(
   store: Pick<OAuthStore, 'checkAuthLockout'> | undefined,
   csrf: string,
   now: number,
+  jti?: string,
 ): Promise<boolean> {
   if (!store || typeof store.checkAuthLockout !== 'function') return false;
+  if (jti) {
+    const jtiHash = await sha256Base64Url(jti);
+    const jtiCheck = await store.checkAuthLockout(`revoked_admin:jti:${jtiHash}`, now, 1);
+    if (!jtiCheck.allowed) return true;
+  }
   const csrfHash = await sha256Base64Url(csrf);
   const hashedCheck = await store.checkAuthLockout(`revoked_admin:${csrfHash}`, now, 1);
   if (!hashedCheck.allowed) return true;
@@ -926,11 +1232,15 @@ export async function verifyAdminSessionCookie(
   cookieHeader: string | null,
   secret: string | undefined,
   now = Date.now(),
-): Promise<{ ok: true; csrf: string; expiresAt: number } | { ok: false }> {
-  if (!secret || secret.length < MIN_TOKEN_LENGTH) return { ok: false };
+): Promise<({ ok: true } & AdminPrincipal) | { ok: false }> {
+  if (!secret) return { ok: false };
   const raw = readCookie(cookieHeader, ADMIN_COOKIE_NAME);
   if (!raw) return { ok: false };
   const parts = raw.split('.');
+  if (parts.length === 3 && !raw.startsWith('v1.')) {
+    return verifySessionJwt(raw, secret, now);
+  }
+  if (secret.length < MIN_TOKEN_LENGTH) return { ok: false };
   if (parts.length !== 4 || parts[0] !== 'v1') return { ok: false };
   const expiresAt = Number(parts[1]);
   const csrf = parts[2] ?? '';
@@ -940,7 +1250,7 @@ export async function verifyAdminSessionCookie(
   }
   const expected = await hmacSha256Base64Url(`admin-cookie:${secret}`, `v1.${expiresAt}.${csrf}`);
   if (!sameBytes(sig, expected)) return { ok: false };
-  return { ok: true, csrf, expiresAt };
+  return { ok: true, userId: 'owner', role: 'owner', authMethod: 'owner_token', csrf, expiresAt };
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -1242,6 +1552,9 @@ function renderAuthorizePage(params: {
   sealedState: string;
   csrf: string;
   alreadySignedIn: boolean;
+  signedInLabel?: string;
+  githubLoginUrl?: string;
+  hasOwnerTokenAuth?: boolean;
   errorMessage?: string;
 }): string {
   let redirectHost = params.redirectUri;
@@ -1259,11 +1572,23 @@ function renderAuthorizePage(params: {
     )
     .join('');
 
-  const authField = params.alreadySignedIn
-    ? `<p class="ok-banner">Authenticated via active Admin Portal session.</p>`
-    : `<label for="owner_token">EdgeFetch Token (<code>MCP_TOKEN</code> or <code>CRAWLER_TOKEN</code>)</label>
-       <input id="owner_token" name="owner_token" type="password" required autocomplete="current-password" placeholder="Paste your MCP_TOKEN to authorize">`;
+  const ghBtnHtml = params.githubLoginUrl
+    ? `<a class="gh-btn" href="${escapeHtml(params.githubLoginUrl)}"><svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>${params.alreadySignedIn ? 'Switch GitHub Account' : 'Sign in with GitHub'}</a>`
+    : '';
 
+  const hasTokenInput = params.hasOwnerTokenAuth !== false;
+  const authField = params.alreadySignedIn
+    ? `<p class="ok-banner">Authenticated via ${escapeHtml(params.signedInLabel ?? 'active Admin Portal session')}.</p>${ghBtnHtml}`
+    : `${ghBtnHtml}${
+        ghBtnHtml && hasTokenInput ? '<div class="divider"><span>or use owner token</span></div>' : ''
+      }${
+        hasTokenInput
+          ? `<label for="owner_token">EdgeFetch Token (<code>MCP_TOKEN</code> or <code>CALLER_TOKEN</code>)</label>
+       <input id="owner_token" name="owner_token" type="password" required autocomplete="current-password" placeholder="Paste your MCP_TOKEN to authorize">`
+          : '<p class="muted-note">Sign in with GitHub above to authorize MCP access for your account.</p>'
+      }`;
+
+  const canApproveNow = params.alreadySignedIn || hasTokenInput;
   const errHtml = params.errorMessage ? `<div class="err">${escapeHtml(params.errorMessage)}</div>` : '';
 
   return `<!doctype html>
@@ -1285,11 +1610,17 @@ function renderAuthorizePage(params: {
     input[type="password"] { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; }
     .meta { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 10px 12px; margin: 12px 0; font-size: 0.88rem; }
     .err { background: #450a0a; border: 1px solid #dc2626; color: #fecaca; padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; font-size: 0.9rem; }
-    .ok-banner { background: #052e16; border: 1px solid #16a34a; color: #bbf7d0; padding: 8px 12px; border-radius: 8px; font-size: 0.88rem; }
+    .ok-banner { background: #052e16; border: 1px solid #16a34a; color: #bbf7d0; padding: 8px 12px; border-radius: 8px; font-size: 0.88rem; margin-bottom: 10px; }
+    .gh-btn { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; box-sizing: border-box; padding: 10px 16px; border-radius: 8px; border: 1px solid #475569; background: #24292f; color: #ffffff; text-decoration: none; font-weight: 600; margin: 10px 0; }
+    .gh-btn:hover { background: #32383f; }
+    .divider { display: flex; align-items: center; gap: 10px; color: #94a3b8; font-size: 0.8rem; margin: 12px 0; }
+    .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid #334155; }
+    .muted-note { font-size: 0.86rem; color: #94a3b8; }
     .actions { display: flex; gap: 10px; margin-top: 20px; }
     button { font: inherit; font-weight: 600; padding: 10px 18px; border-radius: 8px; border: 1px solid #475569; background: #334155; color: #f8fafc; cursor: pointer; }
     button.approve { background: #2563eb; border-color: #3b82f6; color: #fff; flex: 1; }
     button.approve:hover { background: #1d4ed8; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
     @media (prefers-color-scheme: light) {
       body { background: #f1f5f9; color: #0f172a; }
       main { background: #ffffff; border-color: #cbd5e1; box-shadow: 0 8px 24px rgba(15,23,42,.08); }
@@ -1317,7 +1648,7 @@ function renderAuthorizePage(params: {
       <input type="hidden" name="csrf" value="${escapeHtml(params.csrf)}">
       ${authField}
       <div class="actions">
-        <button class="approve" type="submit" name="decision" value="approve">Approve MCP Access</button>
+        <button class="approve" type="submit" name="decision" value="approve"${canApproveNow ? '' : ' disabled'}>Approve MCP Access</button>
         <button type="submit" name="decision" value="deny" formnovalidate>Deny</button>
       </div>
     </form>
@@ -1391,6 +1722,8 @@ export interface OAuthHandlerDeps {
   store: OAuthStore;
   ownerSecret?: string;
   mcpToken?: string;
+  sessionSecret?: string;
+  githubAuthEnabled?: boolean;
   serviceName: string;
   publicOrigin?: string;
   redirectAllowlist?: readonly string[];
@@ -1485,7 +1818,16 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   }
 
   const ownerSecret = deps.ownerSecret;
-  if (!ownerSecret || ownerSecret.length < MIN_TOKEN_LENGTH) {
+  const hasOwnerTokenAuth = Boolean(
+    (ownerSecret && ownerSecret.length >= MIN_TOKEN_LENGTH) || (deps.mcpToken && deps.mcpToken.length >= MIN_TOKEN_LENGTH),
+  );
+  const signingSecret =
+    deps.sessionSecret && deps.sessionSecret.length >= 16
+      ? deps.sessionSecret
+      : ownerSecret && ownerSecret.length >= MIN_TOKEN_LENGTH
+        ? ownerSecret
+        : undefined;
+  if (!signingSecret) {
     return oauthJson({ error: 'server_error', error_description: 'Owner token secret is not configured on hub' }, 503, cors);
   }
 
@@ -1592,8 +1934,8 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   if (path === '/oauth/authorize') {
     return withOAuthAuditSpan('authorize', async (span) => {
       const isSecure = isEffectiveHttpsOrigin(url, deps.publicOrigin);
-      let adminSession = await verifyAdminSessionCookie(request.headers.get('cookie'), ownerSecret, now);
-      if (adminSession.ok && (await isAdminSessionRevoked(deps.store, adminSession.csrf, now))) {
+      let adminSession = await verifyAdminSessionCookie(request.headers.get('cookie'), signingSecret, now);
+      if (adminSession.ok && (await isAdminSessionRevoked(deps.store, adminSession.csrf, now, adminSession.jti))) {
         adminSession = { ok: false };
       }
 
@@ -1676,7 +2018,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
 
         const isExternalRedirect = !isLoopbackRedirectUri(redirectUri);
         const csrf = randomUrlToken(24);
-        const sealedState = await sealConsent(ownerSecret, {
+        const sealedState = await sealConsent(signingSecret, {
           clientId: client.clientId,
           clientName: client.clientName,
           redirectUri,
@@ -1687,6 +2029,18 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           csrf,
           exp: now + 10 * 60_000,
         });
+
+        const githubLoginUrl = deps.githubAuthEnabled
+          ? `/admin/auth/github?return_to=${encodeURIComponent(`${url.pathname}${url.search}`)}`
+          : undefined;
+        // Non-loopback external redirects require explicit CALLER_TOKEN when signed in via legacy owner cookie (H-S2),
+        // while verified GitHub OAuth sessions (`authMethod === 'github'`) carry per-user identity.
+        const canReuseSession = adminSession.ok && (!isExternalRedirect || adminSession.authMethod === 'github');
+        const signedInLabel = adminSession.ok
+          ? adminSession.githubLogin
+            ? `GitHub @${adminSession.githubLogin} (${adminSession.role})`
+            : 'active Admin Portal session'
+          : undefined;
 
         const headers = new Headers(CONSENT_PAGE_HEADERS);
         headers.append('set-cookie', formatCookie(CONSENT_CSRF_COOKIE, csrf, { maxAge: 600, path: '/oauth/authorize', sameSite: 'Lax', secure: isSecure }));
@@ -1706,8 +2060,10 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
             scopes,
             sealedState,
             csrf,
-            // Non-loopback external redirects ALWAYS require explicit CALLER_TOKEN entry even if signed into /admin (H-S2).
-            alreadySignedIn: adminSession.ok && !isExternalRedirect,
+            alreadySignedIn: canReuseSession,
+            ...(signedInLabel ? { signedInLabel } : {}),
+            ...(githubLoginUrl ? { githubLoginUrl } : {}),
+            hasOwnerTokenAuth,
           }),
           { status: 200, headers },
         );
@@ -1728,7 +2084,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           span.setStatus(false, 'payload_too_large');
           return new Response('Request payload too large.', { status: 413, headers: CONSENT_PAGE_HEADERS });
         }
-        const sealed = await unsealConsent(ownerSecret, form.sealed ?? '', now);
+        const sealed = await unsealConsent(signingSecret, form.sealed ?? '', now);
         const cookieCsrf = readCookie(request.headers.get('cookie'), CONSENT_CSRF_COOKIE) ?? '';
         if (!sealed || !cookieCsrf || !sameBytes(cookieCsrf, sealed.csrf) || !sameBytes(form.csrf ?? '', sealed.csrf)) {
           span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_csrf', 'http.response.status_code': 400 });
@@ -1766,12 +2122,18 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
 
         const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
         const isExternalRedirect = !isLoopbackRedirectUri(sealed.redirectUri);
-        if (!adminSession.ok || isExternalRedirect) {
+        const canReuseSession = adminSession.ok && (!isExternalRedirect || adminSession.authMethod === 'github');
+        let grantedUserId = adminSession.ok ? adminSession.userId : 'owner';
+        let grantedUserRole: UserRole = adminSession.ok ? adminSession.role : 'owner';
+
+        if (!canReuseSession) {
           const supplied = (form.owner_token ?? '').trim();
           // Verify constant-time secret match FIRST (`R3-M4`): a valid owner/MCP token succeeds and clears any spoofed/shared-IP
           // lockout bucket, while invalid guesses are rejected with `429` once the bucket reaches `RATE_LIMIT_MAX_FAILURES`!
           if (isValidSecretMatch(supplied, deps.ownerSecret, deps.mcpToken)) {
             await deps.store.clearAuthFailures(`oauth:${clientIp}`);
+            grantedUserId = 'owner';
+            grantedUserRole = 'owner';
           } else {
             const preLock = await deps.store.checkAuthLockout(`oauth:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
             if (!preLock.allowed) {
@@ -1802,7 +2164,11 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
                 sealedState: form.sealed ?? '',
                 csrf: sealed.csrf,
                 alreadySignedIn: false,
-                errorMessage: 'Invalid token. Paste your MCP_TOKEN or CRAWLER_TOKEN.',
+                ...(deps.githubAuthEnabled ? { githubLoginUrl: '/admin/auth/github' } : {}),
+                hasOwnerTokenAuth,
+                errorMessage: hasOwnerTokenAuth
+                  ? 'Invalid token. Paste your MCP_TOKEN or CALLER_TOKEN.'
+                  : 'Sign in with GitHub first to authorize MCP access.',
               }),
               { status: 401, headers: CONSENT_PAGE_HEADERS },
             );
@@ -1819,6 +2185,8 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           codeChallenge: sealed.codeChallenge,
           scopes: sealed.scopes,
           resource: sealed.resource,
+          userId: grantedUserId,
+          userRole: grantedUserRole,
           expiresAt: now + AUTH_CODE_TTL_MS,
         });
 
@@ -1836,6 +2204,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         span.setAttributes({
           'oauth.phase': 'code_issued',
           'oauth.scopes': sealed.scopes.join(' '),
+          'oauth.user_id': grantedUserId,
           'oauth.external_redirect': isExternalRedirect,
           'oauth.admin_session': adminSession.ok,
           'oauth.outcome': 'approved',
@@ -1917,6 +2286,8 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         const accessToken = `efa_${randomUrlToken(32)}`;
         const refreshToken = `efr_${randomUrlToken(32)}`;
         const grantId = `grant_${randomUrlToken(12)}`;
+        const grantUserId = record.userId ?? 'owner';
+        const grantUserRole = normalizeRoleForUser(grantUserId, record.userRole);
         await deps.store.putTokenPair({
           grantId,
           accessHash: await sha256Base64Url(accessToken),
@@ -1925,6 +2296,8 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           clientName: record.clientName,
           scopes: record.scopes,
           resource: record.resource,
+          userId: grantUserId,
+          userRole: grantUserRole,
           createdAt: now,
           accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
           refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
@@ -1934,11 +2307,12 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           category: 'oauth',
           event: 'oauth_token_issued',
           summary: `Issued OAuth 2.1 access + refresh tokens for "${record.clientName}" (${grantId})`,
-          details: { grantId, clientId: record.clientId, clientName: record.clientName, scopes: record.scopes },
+          details: { grantId, clientId: record.clientId, clientName: record.clientName, userId: grantUserId, scopes: record.scopes },
         });
         span.setAttributes({
           'oauth.client_id': record.clientId,
           'oauth.grant_id': grantId,
+          'oauth.user_id': grantUserId,
           'oauth.scopes': record.scopes.join(' '),
           'oauth.outcome': 'issued',
           'http.response.status_code': 200,
@@ -2064,9 +2438,13 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   return null;
 }
 
+export type McpAuthResult =
+  | { ok: true; scopes: string[]; principal: string; userId: string; role: UserRole }
+  | { ok: false; status: number; wwwAuthenticate: string };
+
 /**
- * Authenticates a `/mcp` request via EITHER a direct `Bearer <MCP_TOKEN|CRAWLER_TOKEN>`, `x-api-key: <MCP_TOKEN>`,
- * OR a self-hosted OAuth 2.1 access token, returning RFC 9728 `WWW-Authenticate` on `401`.
+ * Authenticates a `/mcp` or `/v1/*` request via EITHER a direct `Bearer <MCP_TOKEN|CALLER_TOKEN>`, `x-api-key: <MCP_TOKEN>`,
+ * OR a self-hosted OAuth 2.1 access token, returning canonical `userId` (`'owner'` or `'gh_<id>'`) and `role` (`'owner' | 'member'`).
  */
 export async function authorizeMcpRequest(params: {
   request: Request;
@@ -2075,24 +2453,23 @@ export async function authorizeMcpRequest(params: {
   mcpToken?: string;
   store: OAuthStore;
   now?: number;
-}): Promise<
-  | { ok: true; scopes: string[]; principal: string }
-  | { ok: false; status: number; wwwAuthenticate: string }
-> {
+}): Promise<McpAuthResult> {
   const wwwAuthenticate = `Bearer resource_metadata="${params.origin}/.well-known/oauth-protected-resource", scope="${MCP_SCOPES.join(' ')}"`;
   const tok = callerToken(params.request);
   if (!tok) return { ok: false, status: 401, wwwAuthenticate };
 
   if (isValidSecretMatch(tok, params.ownerSecret)) {
-    return { ok: true, scopes: [...MCP_SCOPES], principal: 'owner_token' };
+    return { ok: true, scopes: [...MCP_SCOPES], principal: 'owner_token', userId: 'owner', role: 'owner' };
   }
   if (isValidSecretMatch(tok, params.mcpToken)) {
-    return { ok: true, scopes: [...MCP_SCOPES], principal: 'mcp_token' };
+    return { ok: true, scopes: [...MCP_SCOPES], principal: 'mcp_token', userId: 'owner', role: 'owner' };
   }
 
   const record = await params.store.getAccessToken(await sha256Base64Url(tok), params.now ?? Date.now());
   if (!record || record.resource.toLowerCase() !== `${params.origin.toLowerCase()}/mcp`) {
     return { ok: false, status: 401, wwwAuthenticate };
   }
-  return { ok: true, scopes: record.scopes, principal: `oauth:${record.clientId}` };
+  const userId = record.userId ?? 'owner';
+  const role = normalizeRoleForUser(userId, record.userRole);
+  return { ok: true, scopes: record.scopes, principal: `oauth:${record.clientId}`, userId, role };
 }

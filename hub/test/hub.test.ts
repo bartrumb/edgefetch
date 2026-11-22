@@ -1635,7 +1635,7 @@ test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1
     });
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
-    assert.equal(mcpJson.result.tools.length, 15);
+    assert.equal(mcpJson.result.tools.length, 17);
   } finally {
     await started.close();
     rmSync(dataDir, { recursive: true, force: true });
@@ -3194,7 +3194,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.6.3');
+    assert.equal(caps.version, '2.7.0');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);
@@ -12413,7 +12413,7 @@ test('M1-C-R2 Combine: final Node-reachable closure for portable-server, node-ad
             contentType: 'application/json',
             body: JSON.stringify({
               name: 'edgefetch-demo',
-              'dist-tags': { latest: '2.6.3' },
+              'dist-tags': { latest: '2.7.0' },
               description: 'Comprehensive demo package description that exceeds fifty characters for truncation testing.',
               readme: Array.from({ length: 40 }, (_, i) => `Section ${i} documentation text.`).join('\n'),
             }),
@@ -12591,7 +12591,7 @@ test('M1-C-R3 Group 1: src/mcp.ts batch scope enforcement & helpers, src/storage
     ];
     const baseDeps: McpServerDeps = {
       serverName: 'edgefetch-test',
-      serverVersion: '2.6.3',
+      serverVersion: '2.7.0',
       ownerSecret: 'owner-secret-token-for-mcp-test-0001',
       mcpToken: 'mcp-secret-token-for-mcp-test-0002',
       oauthStore,
@@ -13114,7 +13114,7 @@ test('M1-C-R3 Group 2: src/index.ts AgentHubDO SQLite/RPCs, Worker routes, batch
     s1.serializeAttachment({
       siteId: 's1',
       arch: 'amd64',
-      version: '2.6.3',
+      version: '2.7.0',
       connectedAt: Date.now(),
       publicIp: '198.51.100.1',
       capabilities: ['http', 'browser', 'artifacts-v1'],
@@ -13854,7 +13854,7 @@ test('M1-C-R3 Group 3: portable/deno-server.ts persistent SQLite/XFF/IPv6, porta
           head,
           siteId: 's-coord',
           arch: 'amd64',
-          version: '2.6.3',
+          version: '2.7.0',
           capabilities: 'http',
           publicIp: '198.51.100.7',
           subprotocol: 'edgefetch-agent',
@@ -14401,9 +14401,9 @@ test('OpenAPI 3.1.0 endpoint, anti-drift /v1/* route & MCP schema contract, scra
     );
   }
 
-  // Also verify zero-drift sharing with all 15 canonical MCP tool schemas
+  // Also verify zero-drift sharing with all 17 canonical MCP tool schemas
   const canonicalTools = buildCanonicalMcpToolSchemas();
-  assert.equal(canonicalTools.length, 15);
+  assert.equal(canonicalTools.length, 17);
   assert.deepEqual(components.schemas.ScrapeRequest, MCP_TOOL_SCHEMAS.scrape);
   assert.deepEqual(components.schemas.ExtractRequest, MCP_TOOL_SCHEMAS.extract);
   assert.deepEqual(components.schemas.InteractRequest, MCP_TOOL_SCHEMAS.interact);

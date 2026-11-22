@@ -56,11 +56,21 @@ import {
 import { computeMarkdownChanges } from './map-crawl';
 import { MARKDOWN_FOR_AGENTS_ACCEPT, validatePublicHttpsTargetUrl } from './overflow';
 import { getActiveRequestTracer, sanitizeUrlForSpan, setActiveSpanAttribute, type RequestTracer, type TraceContext } from './otel';
-import { chunkMarkdownForSearch, rankChunksInMemory } from './search-index';
+import {
+  chunkMarkdownForSearch,
+  D1FtsSearchIndex,
+  rankChunksInMemory,
+  resolveUserCollectionId,
+} from './search-index';
 import {
   isValidSha256Hex,
+  normalizeVisibility,
   r2DerivedKey,
+  r2PrivateDerivedKey,
+  r2PrivateScrapeCacheKey,
   readVerifiedArtifactFromR2,
+  sanitizeStorageUserId,
+  writePrivateArtifactToR2,
   type ArtifactRetention,
   type OptionalStorageBindings,
 } from './storage';
@@ -4264,6 +4274,128 @@ export async function lookupCachedScrape(params: {
   };
 }
 
+export interface PrivateCachedScrapeRecord {
+  url: string;
+  markdown: string;
+  contentSha256: string;
+  blobSha256?: string;
+  documentId: string;
+  pipelineVersion: number;
+  title?: string;
+  language?: string;
+  status: number;
+  lastFetchedAt: number;
+}
+
+export async function lookupPrivateCachedScrape(params: {
+  bucket: R2Bucket;
+  userId: string;
+  url: string;
+  maxAgeMs: number;
+  pipelineVersion?: number;
+  now?: number;
+}): Promise<PrivateCachedScrapeRecord | null> {
+  const { bucket, userId, url, maxAgeMs, pipelineVersion = SCRAPE_PIPELINE_VERSION, now = Date.now() } = params;
+  if (!(maxAgeMs > 0) || !userId) return null;
+  const urlSha = await sha256HexString(url);
+  const key = r2PrivateScrapeCacheKey(userId, pipelineVersion, urlSha);
+  const obj = await bucket.get(key).catch(() => null);
+  if (!obj) return null;
+  try {
+    const parsed = (await obj.json()) as PrivateCachedScrapeRecord;
+    if (
+      !parsed ||
+      parsed.url !== url ||
+      typeof parsed.markdown !== 'string' ||
+      typeof parsed.lastFetchedAt !== 'number' ||
+      now - parsed.lastFetchedAt > maxAgeMs
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function writePrivateCachedScrape(params: {
+  bucket: R2Bucket;
+  userId: string;
+  url: string;
+  markdown: string;
+  rawBytes?: Uint8Array;
+  title?: string;
+  language?: string;
+  status?: number;
+  pipelineVersion?: number;
+  now?: number;
+}): Promise<{ blobSha256?: string; contentSha256: string; markdownSha256: string; documentId: string }> {
+  const {
+    bucket,
+    userId,
+    url,
+    markdown,
+    rawBytes,
+    title,
+    language,
+    status = 200,
+    pipelineVersion = SCRAPE_PIPELINE_VERSION,
+    now = Date.now(),
+  } = params;
+  const markdownSha256 = await sha256HexString(markdown);
+  let blobSha256: string | undefined;
+  let contentSha256 = markdownSha256;
+  if (rawBytes && rawBytes.byteLength > 0) {
+    const writtenRaw = await writePrivateArtifactToR2({
+      bucket,
+      userId,
+      rawBytes,
+      retention: 'stored',
+    });
+    blobSha256 = writtenRaw.blobSha256;
+    contentSha256 = writtenRaw.contentSha256;
+  }
+  await bucket.put(r2PrivateDerivedKey(userId, pipelineVersion, 'markdown', markdownSha256), markdown, {
+    httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+    customMetadata: {
+      userId: sanitizeStorageUserId(userId),
+      visibility: 'private',
+    },
+  });
+  if (contentSha256 !== markdownSha256) {
+    await bucket.put(r2PrivateDerivedKey(userId, pipelineVersion, 'markdown', contentSha256), markdown, {
+      httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+      customMetadata: {
+        userId: sanitizeStorageUserId(userId),
+        visibility: 'private',
+      },
+    });
+  }
+  const safeUser = sanitizeStorageUserId(userId);
+  const documentId = `pdoc_${(await sha256HexString(`${safeUser}:${contentSha256}:${pipelineVersion}`)).slice(0, 32)}`;
+  const urlSha = await sha256HexString(url);
+  const cacheEntry: PrivateCachedScrapeRecord = {
+    url,
+    markdown,
+    contentSha256,
+    ...(blobSha256 ? { blobSha256 } : {}),
+    documentId,
+    pipelineVersion,
+    ...(title ? { title } : {}),
+    ...(language ? { language } : {}),
+    status,
+    lastFetchedAt: now,
+  };
+  await bucket.put(r2PrivateScrapeCacheKey(userId, pipelineVersion, urlSha), JSON.stringify(cacheEntry), {
+    httpMetadata: { contentType: 'application/json' },
+    customMetadata: {
+      userId: safeUser,
+      visibility: 'private',
+    },
+  });
+  return { ...(blobSha256 ? { blobSha256 } : {}), contentSha256, markdownSha256, documentId };
+}
+
 /**
  * `R5`: Looks up stored `etag` / `last_modified` + verified derived Markdown in `META` D1 + `ARTIFACTS` R2 when
  * `maxAgeMs` has expired (or `maxAgeMs === 0`), enabling `If-None-Match` / `If-Modified-Since` -> `304 Not Modified`
@@ -4399,6 +4531,7 @@ export interface ScrapeRequestPayload {
   spaFallback?: unknown;
   noCache?: unknown;
   ephemeral?: unknown;
+  visibility?: unknown;
   collectionId?: unknown;
   target?: unknown;
   site?: unknown;
@@ -7948,12 +8081,13 @@ export async function executeScrapeCall(params: {
   ) => Promise<{ status: number; via: string; bodyText: string; retryAfter?: string }>;
   source?: string;
   selfHost?: string;
+  userId?: string;
   now?: number;
   tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; body: Record<string, unknown>; via: string; retryAfter?: string }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runScrape = async (): Promise<{ status: number; body: Record<string, unknown>; via: string; retryAfter?: string }> => {
-  const { payload, env, executeHubFetch, source = 'scrape', selfHost, now = Date.now() } = params;
+  const { payload, env, executeHubFetch, source = 'scrape', selfHost, userId = 'owner', now = Date.now() } = params;
   const urlCheck = validatePublicHttpsTargetUrl(payload.url, selfHost);
   if (!urlCheck.ok) {
     return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: urlCheck.message } };
@@ -8170,39 +8304,61 @@ export async function executeScrapeCall(params: {
     excludeTags.length > 0 ||
     Boolean(attributesSpec);
 
+  const visibility = normalizeVisibility(payload.visibility, payload.headers);
+  const isPrivateScrape = visibility === 'private';
+
   let prevMarkdownForChanges: string | null = null;
-  if (stringFormats.has('changes') && env.ARTIFACTS && env.META) {
-    const prevHit = await lookupCachedScrape({
-      bucket: env.ARTIFACTS,
-      metaDb: env.META,
-      url: normalizedUrl,
-      maxAgeMs: 365 * 24 * 60 * 60_000,
-      pipelineVersion: SCRAPE_PIPELINE_VERSION,
-      now,
-    });
+  if (stringFormats.has('changes') && env.ARTIFACTS && (isPrivateScrape || env.META)) {
+    const prevHit = isPrivateScrape
+      ? await lookupPrivateCachedScrape({
+          bucket: env.ARTIFACTS,
+          userId,
+          url: normalizedUrl,
+          maxAgeMs: 365 * 24 * 60 * 60_000,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          now,
+        })
+      : await lookupCachedScrape({
+          bucket: env.ARTIFACTS,
+          metaDb: env.META!,
+          url: normalizedUrl,
+          maxAgeMs: 365 * 24 * 60 * 60_000,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          now,
+        });
     if (prevHit) {
       prevMarkdownForChanges = prevHit.markdown;
     }
   }
 
-  if (!needsLiveHtml && ocrMode !== 'always' && maxAgeMs > 0 && env.ARTIFACTS && env.META) {
+  if (!needsLiveHtml && ocrMode !== 'always' && maxAgeMs > 0 && env.ARTIFACTS && (isPrivateScrape || env.META)) {
     const cacheStartMs = Date.now();
-    const hit = await lookupCachedScrape({
-      bucket: env.ARTIFACTS,
-      metaDb: env.META,
-      url: normalizedUrl,
-      maxAgeMs,
-      pipelineVersion: SCRAPE_PIPELINE_VERSION,
-      now,
-    });
+    const hit = isPrivateScrape
+      ? await lookupPrivateCachedScrape({
+          bucket: env.ARTIFACTS,
+          userId,
+          url: normalizedUrl,
+          maxAgeMs,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          now,
+        })
+      : await lookupCachedScrape({
+          bucket: env.ARTIFACTS,
+          metaDb: env.META!,
+          url: normalizedUrl,
+          maxAgeMs,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          now,
+        });
     if (hit) {
+      const cacheVia = isPrivateScrape ? 'cache:private-r2' : 'cache:r2-d1';
       if (activeTracer) {
         const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
           kind: 1,
           startTimeMs: cacheStartMs,
           attributes: {
             'cache.hit': true,
-            'cache.tier': 'r2-d1',
+            'cache.tier': isPrivateScrape ? 'private-r2' : 'r2-d1',
             'cache.revalidated': false,
             'url.full': sanitizeUrlForSpan(normalizedUrl),
             'http.response.status_code': hit.status,
@@ -8211,7 +8367,7 @@ export async function executeScrapeCall(params: {
         });
         cacheSpan.setStatus(true);
         cacheSpan.end();
-        activeTracer.setAttribute('edgefetch.via', 'cache:r2-d1');
+        activeTracer.setAttribute('edgefetch.via', cacheVia);
         activeTracer.setAttribute('edgefetch.cached', true);
       }
       const fullCached = finalizeScrapedMarkdown(redactPii ? redactPiiText(hit.markdown) : hit.markdown, {
@@ -8225,15 +8381,18 @@ export async function executeScrapeCall(params: {
         maxChars,
       });
       const cachedTitle = hit.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullCached, normalizedUrl) : undefined);
+      const privBlobSha = 'blobSha256' in hit ? hit.blobSha256 : undefined;
       return {
         status: 200,
-        via: 'cache:r2-d1',
+        via: cacheVia,
         body: {
           ok: true,
           cached: true,
+          ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
           pipelineVersion: hit.pipelineVersion,
           documentId: hit.documentId,
           contentSha256: hit.contentSha256,
+          ...(privBlobSha ? { artifactId: privBlobSha } : {}),
           url: normalizedUrl,
           status: hit.status,
           markdown: shaped.markdown,
@@ -8334,13 +8493,22 @@ export async function executeScrapeCall(params: {
   const effectiveRenderMode: 'always' | 'auto' | 'off' = renderMode ?? 'auto';
   const jsonFilterStr = typeof payload.jsonFilter === 'string' ? payload.jsonFilter.trim() : '';
   const waybackFallback = Boolean(payload.waybackFallback);
-  const collectionId =
-    typeof payload.collectionId === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(payload.collectionId.trim())
-      ? payload.collectionId.trim()
-      : undefined;
-  const retentionMode: ArtifactRetention | undefined =
-    payload.ephemeral === true
-      ? undefined
+  let scopedUserCollectionId: string | undefined;
+  if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {
+    const resolvedColl = resolveUserCollectionId(payload.collectionId, userId, visibility);
+    if (!resolvedColl.ok) {
+      return {
+        status: resolvedColl.status,
+        via: 'hub',
+        body: { ok: false, error: resolvedColl.error, message: 'Invalid or unauthorized collectionId' },
+      };
+    }
+    scopedUserCollectionId = resolvedColl.scopedId;
+  }
+  const collectionId = isPrivateScrape ? undefined : scopedUserCollectionId;
+  const retentionMode: ArtifactRetention | 'off' | undefined =
+    payload.ephemeral === true || isPrivateScrape
+      ? 'off'
       : env.ARTIFACTS && env.META
         ? 'stored'
         : env.ARTIFACTS
@@ -8349,7 +8517,7 @@ export async function executeScrapeCall(params: {
 
   // R5: Look up stored ETag / Last-Modified validators in META D1 when a verified derived document already exists (and caller isn't updating a collection).
   const revalCandidate =
-    !needsLiveHtml && ocrMode !== 'always' && renderMode !== 'always' && !collectionId && env.ARTIFACTS && env.META
+    !isPrivateScrape && !needsLiveHtml && ocrMode !== 'always' && renderMode !== 'always' && !scopedUserCollectionId && env.ARTIFACTS && env.META
       ? await lookupRevalidationCandidate({
           bucket: env.ARTIFACTS,
           metaDb: env.META,
@@ -9323,6 +9491,10 @@ export async function executeScrapeCall(params: {
       : errWaf
         ? 'challenge'
         : (item.outcome ?? 'error');
+    if (errWaf?.vendor) {
+      setActiveSpanAttribute('edgefetch.waf.vendor', errWaf.vendor, activeTracer ?? undefined);
+    }
+    setActiveSpanAttribute('edgefetch.outcome', String(effectiveOutcome), activeTracer ?? undefined);
     const effectiveProb = errWaf ? errWaf.summary : problemText;
     const robotsHint =
       /robots\.txt disallowed/i.test(effectiveProb) && !/^robots_unreachable\b/i.test(effectiveProb)
@@ -9461,6 +9633,8 @@ export async function executeScrapeCall(params: {
       ? classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 200, rawBody: wafSourceStr })
       : null);
   if (okWafMatch) {
+    setActiveSpanAttribute('edgefetch.waf.vendor', okWafMatch.vendor, activeTracer ?? undefined);
+    setActiveSpanAttribute('edgefetch.outcome', 'challenge', activeTracer ?? undefined);
     const blockedInfo = refineBlockedInfo({
       url: finalUrl,
       outcome: 'challenge',
@@ -10514,9 +10688,54 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  const art = item.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+  let art = item.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
   let markdownArtifactId: string | undefined;
-  if (shaped.truncated && env.ARTIFACTS && rawCleanMarkdown) {
+  if (isPrivateScrape && payload.ephemeral !== true && rawCleanMarkdown) {
+    if (env.ARTIFACTS) {
+      try {
+        const rawBytesForPrivate = rawBodyStr ? new TextEncoder().encode(rawBodyStr) : new TextEncoder().encode(rawCleanMarkdown);
+        const privStored = await writePrivateCachedScrape({
+          bucket: env.ARTIFACTS,
+          userId,
+          url: normalizedUrl,
+          markdown: rawCleanMarkdown,
+          rawBytes: rawBytesForPrivate,
+          ...(resolvedTitle ? { title: resolvedTitle } : {}),
+          ...(extracted?.language ? { language: extracted.language } : {}),
+          status: typeof item.status === 'number' ? item.status : 200,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          now,
+        });
+        art = {
+          ...(privStored.blobSha256 ? { blobSha256: privStored.blobSha256 } : {}),
+          contentSha256: privStored.contentSha256,
+        };
+        if (shaped.truncated) {
+          markdownArtifactId = `md:${privStored.markdownSha256}`;
+        }
+      } catch {
+        // Non-fatal if private R2 write fails
+      }
+    }
+    if (scopedUserCollectionId && env.SEARCH) {
+      try {
+        const idx = new D1FtsSearchIndex(env.SEARCH);
+        const privPageId = `pg_${(await sha256HexString(`${sanitizeStorageUserId(userId)}:${normalizedUrl}`)).slice(0, 32)}`;
+        const privDocId = `pdoc_${(await sha256HexString(`${sanitizeStorageUserId(userId)}:${rawCleanMarkdown}`)).slice(0, 32)}`;
+        await idx.replacePageChunks({
+          collectionId: scopedUserCollectionId,
+          documentId: privDocId,
+          pageId: privPageId,
+          url: normalizedUrl,
+          title: resolvedTitle || normalizedUrl,
+          markdown: rawCleanMarkdown,
+          fetchedAt: now,
+        });
+      } catch {
+        // Non-fatal if FTS5 indexing fails
+      }
+    }
+  } else if (shaped.truncated && env.ARTIFACTS && rawCleanMarkdown) {
     const usesUpgradedBody = Boolean(alternateMarkdownBody || ocrReportOut || structuredTextFormatted || contentSourceOut || htmlJobPosting);
     const mdContentSha =
       !usesUpgradedBody && art?.contentSha256 && isValidSha256Hex(art.contentSha256)
@@ -10591,6 +10810,7 @@ export async function executeScrapeCall(params: {
   const out: Record<string, unknown> = {
     ok: true,
     cached: false,
+    ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
     pipelineVersion: SCRAPE_PIPELINE_VERSION,
     url: normalizedUrl,
     finalUrl,
@@ -10819,12 +11039,19 @@ function normalizeInteractPrincipal(principal?: string, source?: string): string
 
 const DEFAULT_INTERACT_HMAC_KEY_FALLBACK = 'edgefetch-default-interact-key';
 
-async function computeInteractSessionMacHex(secret: string, principal: string, siteId: string, agentSessionId: string): Promise<string> {
+async function computeInteractSessionMacHex(
+  secret: string,
+  userId: string,
+  principal: string,
+  siteId: string,
+  agentSessionId: string,
+): Promise<string> {
   const enc = new TextEncoder();
   const effectiveSecret = secret.trim() || DEFAULT_INTERACT_HMAC_KEY_FALLBACK;
+  const safeUser = sanitizeStorageUserId(userId);
   const derivedKeyBytes = await crypto.subtle.digest('SHA-256', enc.encode(effectiveSecret));
   const key = await crypto.subtle.importKey('raw', derivedKeyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const macBuf = await crypto.subtle.sign('HMAC', key, enc.encode(`ef-interact-v1|${principal}|${siteId}|${agentSessionId}`));
+  const macBuf = await crypto.subtle.sign('HMAC', key, enc.encode(`ef-interact-v1|${safeUser}|${principal}|${siteId}|${agentSessionId}`));
   return Array.from(new Uint8Array(macBuf).subarray(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -10856,12 +11083,13 @@ export async function executeInteractCall(params: {
   source?: string;
   selfHost?: string;
   principal?: string;
+  userId?: string;
   sessionSigningSecret?: string;
   tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runInteract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
-  const { payload, env, executeHubFetch, source = 'interact', selfHost, principal, sessionSigningSecret } = params;
+  const { payload, env, executeHubFetch, source = 'interact', selfHost, principal, userId = 'owner', sessionSigningSecret } = params;
   const effectivePrincipal = normalizeInteractPrincipal(principal, source);
   const signingSecret =
     typeof sessionSigningSecret === 'string' && sessionSigningSecret.trim()
@@ -10881,6 +11109,7 @@ export async function executeInteractCall(params: {
     }
     const expectedSig = await computeInteractSessionMacHex(
       signingSecret,
+      userId,
       effectivePrincipal,
       parsedSession.siteId,
       parsedSession.agentSessionId,
@@ -11093,7 +11322,7 @@ export async function executeInteractCall(params: {
       setActiveSpanAttribute('edgefetch.interact.session_hash', errSessionHash, activeTracer ?? undefined);
     }
     const errSig = errAgentSid
-      ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, errActualSite, errAgentSid)
+      ? await computeInteractSessionMacHex(signingSecret, userId, effectivePrincipal, errActualSite, errAgentSid)
       : undefined;
     const errPublicSid = errAgentSid && errSig ? `${errActualSite}.${errAgentSid}.${errSig}` : errAgentSid;
     const blockedInfo = refineBlockedInfo({
@@ -11133,7 +11362,7 @@ export async function executeInteractCall(params: {
     setActiveSpanAttribute('edgefetch.interact.session_hash', okSessionHash, activeTracer ?? undefined);
   }
   const sessionSig = returnedAgentSid
-    ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, actualSite, returnedAgentSid)
+    ? await computeInteractSessionMacHex(signingSecret, userId, effectivePrincipal, actualSite, returnedAgentSid)
     : undefined;
   const publicSessionId = returnedAgentSid && sessionSig ? `${actualSite}.${returnedAgentSid}.${sessionSig}` : returnedAgentSid;
 

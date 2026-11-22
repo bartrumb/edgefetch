@@ -35,7 +35,29 @@ import {
   type HostWindowStore,
   type HubSocketLike,
 } from '../src/agent-hub';
-import { createSqliteOAuthStore, OAUTH_SQLITE_SCHEMA, type OAuthClientRecord, type OAuthCodeRecord, type OAuthStore, type RotateRefreshParams, type SqlStorageLike } from '../src/oauth';
+import {
+  createSqliteHubSettingsStore,
+  HUB_SETTINGS_SQLITE_SCHEMA,
+  type HubSettingsStore,
+} from '../src/dev-telemetry';
+import {
+  createSqliteMcpVaultStore,
+  MCP_VAULT_SQLITE_SCHEMA,
+  type McpVaultStore,
+  type PendingMcpOAuthStateRow,
+  type StoredMcpServerRow,
+} from '../src/mcp-vault';
+import {
+  createSqliteOAuthStore,
+  OAUTH_SQLITE_SCHEMA,
+  type HubUserRecord,
+  type OAuthClientRecord,
+  type OAuthCodeRecord,
+  type OAuthStore,
+  type RotateRefreshParams,
+  type SqlStorageLike,
+  type UserRole,
+} from '../src/oauth';
 
 // Polyfill Cloudflare's streaming `crypto.DigestStream` on Node.js using zero-copy `node:crypto` `createHash`.
 if (typeof (globalThis.crypto as unknown as { DigestStream?: unknown }).DigestStream !== 'function') {
@@ -515,7 +537,9 @@ export class LocalAgentHubCoordinator {
   private readonly lastConnectLogByKey = new Map<string, number>();
   public readonly engine: AgentHubEngine;
   public readonly oauth: OAuthStore;
+  public readonly mcpVault: McpVaultStore;
   public readonly activity: ActivityStore;
+  public readonly settings: HubSettingsStore;
 
   constructor(sqlitePath: string) {
     if (sqlitePath !== ':memory:') {
@@ -552,7 +576,9 @@ export class LocalAgentHubCoordinator {
         updated_at INTEGER NOT NULL
       );
       ${OAUTH_SQLITE_SCHEMA}
+      ${MCP_VAULT_SQLITE_SCHEMA}
       ${ACTIVITY_SQLITE_SCHEMA}
+      ${HUB_SETTINGS_SQLITE_SCHEMA}
     `);
 
     const sqlLike: SqlStorageLike = {
@@ -727,7 +753,9 @@ export class LocalAgentHubCoordinator {
       hostHealth,
     });
     this.oauth = createSqliteOAuthStore(sqlLike);
+    this.mcpVault = createSqliteMcpVaultStore(sqlLike);
     this.activity = createSqliteActivityStore(sqlLike);
+    this.settings = createSqliteHubSettingsStore(sqlLike);
   }
 
   /** Registers an already-upgraded `ws` `WebSocket` client with `AgentHubEngine`. */
@@ -890,6 +918,7 @@ export class LocalAgentHubCoordinator {
         ...this.engine.listAgents(),
         affinities: this.engine.listAffinities(),
         grants: await this.oauth.listGrants(now),
+        users: (await this.oauth.listUsers?.()) ?? [],
         mcpClients: await this.activity.listMcpClients(),
         events: this.activity.listPortalEvents
           ? await this.activity.listPortalEvents(75, 75)
@@ -913,12 +942,26 @@ export class LocalAgentHubCoordinator {
       oauthGetAccessToken: (h: string, now: number) => this.oauth.getAccessToken(h, now),
       oauthConsumeRefreshToken: (h: string, now: number) => this.oauth.consumeRefreshToken(h, now),
       oauthRotateRefreshToken: (p: RotateRefreshParams) => this.oauth.rotateRefreshToken(p),
-      oauthListGrants: (now: number) => this.oauth.listGrants(now),
-      oauthRevokeGrant: (id: string) => this.oauth.revokeGrant(id),
+      oauthListGrants: (now: number, userId?: string) => this.oauth.listGrants(now, userId),
+      oauthRevokeGrant: (id: string, userId?: string) => this.oauth.revokeGrant(id, userId),
       oauthRevokeByTokenHash: (h: string) => this.oauth.revokeByTokenHash(h),
+      oauthUpsertUser: (u: HubUserRecord) => this.oauth.upsertUser?.(u) ?? u,
+      oauthGetUser: (id: string) => this.oauth.getUser?.(id) ?? null,
+      oauthListUsers: () => this.oauth.listUsers?.() ?? [],
+      oauthCountUsers: () => this.oauth.countUsers?.() ?? 0,
+      oauthUpdateUserRole: (id: string, role: UserRole) => this.oauth.updateUserRole?.(id, role) ?? false,
       oauthCheckAuthLockout: (b: string, now: number, m?: number) => this.oauth.checkAuthLockout(b, now, m),
       oauthRecordAuthFailure: (b: string, now: number, w: number, m: number) => this.oauth.recordAuthFailure(b, now, w, m),
       oauthClearAuthFailures: (b: string) => this.oauth.clearAuthFailures(b),
+      vaultListServers: (userId: string) => this.mcpVault.listServers(userId),
+      vaultGetServer: (userId: string, slugOrDomain: string) => this.mcpVault.getServer(userId, slugOrDomain),
+      vaultUpsertServer: (row: StoredMcpServerRow) => this.mcpVault.upsertServer(row),
+      vaultDeleteServer: (userId: string, slug: string) => this.mcpVault.deleteServer(userId, slug),
+      vaultPutOAuthState: (row: PendingMcpOAuthStateRow) => this.mcpVault.putOAuthState(row),
+      vaultConsumeOAuthState: (stateHash: string, userId: string, now: number) =>
+        this.mcpVault.consumeOAuthState(stateHash, userId, now),
+      getHubSetting: (k: string) => this.settings.getSetting(k),
+      setHubSetting: (k: string, v: string) => this.settings.setSetting(k, v),
     };
     return {
       idFromName: (name: string) => name,

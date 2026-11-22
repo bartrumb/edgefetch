@@ -1,0 +1,32 @@
+name = "edgefetch-telemetry"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+workers_dev = false
+preview_urls = false
+
+# Custom domain route for opt-in structural error telemetry collector:
+# routes = [{ pattern = "telemetry.edgefetch.dev", custom_domain = true }]
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+head_sampling_rate = 1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+
+[vars]
+MAX_ERROR_FINGERPRINTS = "10000"
+
+# Configure admin triage token via Wrangler secret (never commit values):
+#   npx wrangler secret put TELEMETRY_ADMIN_TOKEN   # >= 24 random chars (`openssl rand -hex 32`)
+
+[[d1_databases]]
+binding = "DB"
+database_name = "edgefetch-telemetry"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

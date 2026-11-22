@@ -23,6 +23,15 @@ import {
 } from './activity-log';
 import { handleAdminRoute } from './admin';
 import {
+  createSqliteHubSettingsStore,
+  DEV_TELEMETRY_SETTING_KEY,
+  HUB_SETTINGS_SQLITE_SCHEMA,
+  isTruthyTelemetryFlag,
+  resolveDevTelemetryState,
+  type HubSettingsStore,
+} from './dev-telemetry';
+import { checkHubUpdateStatus, HUB_VERSION } from './update-check';
+import {
   AgentHubEngine,
   computeNextHostHealth,
   MAX_CALL_UTF8_BYTES,
@@ -76,9 +85,24 @@ import {
   type MapRequestPayload,
 } from './map-crawl';
 import { handleMcpRequest } from './mcp';
+import {
+  executeFederatedMcpQuery,
+  tryScrapeViaConnectedMcp,
+  type QueryMcpCallInput,
+} from './mcp-federation';
+import { discoverMcps } from './mcp-registry';
+import {
+  createSqliteMcpVaultStore,
+  MCP_VAULT_SQLITE_SCHEMA,
+  resolveCallerUserId,
+  type McpVaultStore,
+  type PendingMcpOAuthStateRow,
+  type StoredMcpServerRow,
+} from './mcp-vault';
 import { handleOpenApiRoute } from './openapi';
 import { authorizeMcpRequest, createSqliteOAuthStore, handleOAuthRoute, OAUTH_SQLITE_SCHEMA } from './oauth';
 import type {
+  HubUserRecord,
   OAuthClientRecord,
   OAuthCodeRecord,
   OAuthGrantSummary,
@@ -87,7 +111,9 @@ import type {
   RotateRefreshParams,
   RotateRefreshResult,
   SqlStorageLike,
+  UserRole,
 } from './oauth';
+import { isGitHubAuthConfigured, resolveSessionSecret, type GitHubAuthEnv } from './github-auth';
 import {
   buildCrawlChildSpans,
   getActiveRequestTracer,
@@ -118,6 +144,7 @@ import {
   COLLECTION_ID_RE,
   D1FtsSearchIndex,
   executeExtractCall,
+  resolveUserCollectionId,
   type ExtractRequestPayload,
 } from './search-index';
 import { executeSearchCall, type SearchRequestPayload } from './web-search';
@@ -128,18 +155,22 @@ import {
   handleArtifactGetRequest,
   hydrateReplyBodiesFromR2,
   MAX_ARTIFACT_CONTENT_BYTES,
+  normalizeVisibility,
   r2DerivedKey,
+  r2PrivateDerivedKey,
   readArtifactPage,
+  sanitizeStorageUserId,
   type ArtifactRetention,
   type OptionalStorageBindings,
 } from './storage';
 
-interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv {
+interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHubAuthEnv {
   AGENT_HUB: DurableObjectNamespace<AgentHubDO>;
   HUB_SHARDS?: string;
   SAFE_FETCH?: typeof fetch;
   SAFE_PUBLIC_FETCH?: typeof fetch;
   CALLER_TOKEN?: string;
+  VAULT_MASTER_KEY?: string;
   MCP_TOKEN?: string;
   AGENT_TOKEN?: string;
   AGENT_TOKENS?: string;
@@ -151,10 +182,15 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv {
   TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
   WEBHOOK_SECRET?: string;
+  EDGEFETCH_DISABLE_UPDATE_CHECK?: string;
+  EDGEFETCH_DEV_TELEMETRY?: string;
+  EDGEFETCH_DEV_TELEMETRY_ENDPOINT?: string;
+  EDGEFETCH_DEV_TELEMETRY_URL?: string;
+  DO_NOT_TRACK?: string;
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const DEFAULT_UA = 'EdgeFetch/2.6 (bot@edgefetch.dev)';
+const DEFAULT_UA = 'EdgeFetch/2.7 (bot@edgefetch.dev)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;
@@ -164,7 +200,9 @@ export { CrawlWorkflow, IngestWorkflow };
 export class AgentHubDO extends DurableObject<Env> {
   private readonly engine: AgentHubEngine;
   private readonly oauth: OAuthStore;
+  private readonly mcpVault: McpVaultStore;
   private readonly activity: ActivityStore;
+  private readonly settings: HubSettingsStore;
   private readonly helloLogBySocket = new WeakMap<WebSocket, number>();
   private alarmScheduled = false;
 
@@ -201,7 +239,9 @@ export class AgentHubDO extends DurableObject<Env> {
           updated_at INTEGER NOT NULL
         );
         ${OAUTH_SQLITE_SCHEMA}
+        ${MCP_VAULT_SQLITE_SCHEMA}
         ${ACTIVITY_SQLITE_SCHEMA}
+        ${HUB_SETTINGS_SQLITE_SCHEMA}
       `);
       const existingAlarm = await this.ctx.storage.getAlarm();
       if (existingAlarm === null) {
@@ -432,7 +472,9 @@ export class AgentHubDO extends DurableObject<Env> {
       hostHealth,
     });
     this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+    this.mcpVault = createSqliteMcpVaultStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.activity = createSqliteActivityStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+    this.settings = createSqliteHubSettingsStore(this.ctx.storage.sql as unknown as SqlStorageLike);
   }
 
   override async alarm(): Promise<void> {
@@ -442,6 +484,7 @@ export class AgentHubDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec('DELETE FROM host_affinities WHERE expires_at <= ?', now);
     this.ctx.storage.sql.exec('DELETE FROM oauth_codes WHERE expires_at <= ?', now);
     this.ctx.storage.sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', now);
+    this.ctx.storage.sql.exec('DELETE FROM mcp_oauth_states WHERE expires_at <= ?', now);
     this.ctx.storage.sql.exec('DELETE FROM auth_failures WHERE reset_at <= ?', now);
     this.ctx.storage.sql.exec('DELETE FROM admin_revocations WHERE expires_at <= ?', now);
     await this.ctx.storage.setAlarm(now + DAILY_CLEANUP_INTERVAL_MS);
@@ -544,6 +587,7 @@ export class AgentHubDO extends DurableObject<Env> {
     grants: OAuthGrantSummary[];
     mcpClients: McpClientActivity[];
     events: HubEventRecord[];
+    users: HubUserRecord[];
   }> {
     const fleet = this.engine.listAgents();
     return {
@@ -554,6 +598,7 @@ export class AgentHubDO extends DurableObject<Env> {
       events: this.activity.listPortalEvents
         ? await this.activity.listPortalEvents(75, 75)
         : await this.activity.listEvents(150),
+      users: this.oauth.listUsers ? await this.oauth.listUsers() : [],
     };
   }
 
@@ -621,6 +666,8 @@ export class AgentHubDO extends DurableObject<Env> {
     createdAt: number;
     accessExpiresAt: number;
     refreshExpiresAt: number;
+    userId?: string;
+    userRole?: UserRole;
   }): Promise<void> {
     await this.oauth.putTokenPair(p);
   }
@@ -633,11 +680,11 @@ export class AgentHubDO extends DurableObject<Env> {
   async oauthRotateRefreshToken(params: RotateRefreshParams): Promise<RotateRefreshResult> {
     return await this.oauth.rotateRefreshToken(params);
   }
-  async oauthListGrants(now: number): Promise<OAuthGrantSummary[]> {
-    return await this.oauth.listGrants(now);
+  async oauthListGrants(now: number, userId?: string): Promise<OAuthGrantSummary[]> {
+    return await this.oauth.listGrants(now, userId);
   }
-  async oauthRevokeGrant(id: string): Promise<boolean> {
-    return await this.oauth.revokeGrant(id);
+  async oauthRevokeGrant(id: string, userId?: string): Promise<boolean> {
+    return await this.oauth.revokeGrant(id, userId);
   }
   async oauthRevokeByTokenHash(h: string): Promise<void> {
     await this.oauth.revokeByTokenHash(h);
@@ -659,6 +706,49 @@ export class AgentHubDO extends DurableObject<Env> {
   }
   async oauthClearAuthFailures(bucket: string): Promise<void> {
     await this.oauth.clearAuthFailures(bucket);
+  }
+  async oauthUpsertUser(u: HubUserRecord): Promise<HubUserRecord> {
+    if (!this.oauth.upsertUser) return u;
+    return await this.oauth.upsertUser(u);
+  }
+  async oauthGetUser(id: string): Promise<HubUserRecord | null> {
+    return this.oauth.getUser ? await this.oauth.getUser(id) : null;
+  }
+  async oauthListUsers(): Promise<HubUserRecord[]> {
+    return this.oauth.listUsers ? await this.oauth.listUsers() : [];
+  }
+  async oauthCountUsers(): Promise<number> {
+    return this.oauth.countUsers ? await this.oauth.countUsers() : 0;
+  }
+  async oauthUpdateUserRole(id: string, role: UserRole): Promise<boolean> {
+    return this.oauth.updateUserRole ? await this.oauth.updateUserRole(id, role) : false;
+  }
+
+  // Per-user AES-256-GCM MCP Vault SQLite RPC methods
+  async vaultListServers(userId: string): Promise<StoredMcpServerRow[]> {
+    return await this.mcpVault.listServers(userId);
+  }
+  async vaultGetServer(userId: string, slugOrDomain: string): Promise<StoredMcpServerRow | null> {
+    return await this.mcpVault.getServer(userId, slugOrDomain);
+  }
+  async vaultUpsertServer(row: StoredMcpServerRow): Promise<void> {
+    await this.mcpVault.upsertServer(row);
+  }
+  async vaultDeleteServer(userId: string, slug: string): Promise<boolean> {
+    return await this.mcpVault.deleteServer(userId, slug);
+  }
+  async vaultPutOAuthState(row: PendingMcpOAuthStateRow): Promise<void> {
+    await this.mcpVault.putOAuthState(row);
+  }
+  async vaultConsumeOAuthState(stateHash: string, userId: string, now: number): Promise<PendingMcpOAuthStateRow | null> {
+    return await this.mcpVault.consumeOAuthState(stateHash, userId, now);
+  }
+
+  async getHubSetting(key: string): Promise<string | null> {
+    return await this.settings.getSetting(key);
+  }
+  async setHubSetting(key: string, value: string): Promise<void> {
+    await this.settings.setSetting(key, value);
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -728,12 +818,48 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
     getAccessToken: (h, now) => hub().oauthGetAccessToken(h, now),
     consumeRefreshToken: (h, now) => hub().oauthConsumeRefreshToken(h, now),
     rotateRefreshToken: (p) => hub().oauthRotateRefreshToken(p),
-    listGrants: (now) => hub().oauthListGrants(now),
-    revokeGrant: (id) => hub().oauthRevokeGrant(id),
+    listGrants: (now, userId) => hub().oauthListGrants(now, userId),
+    revokeGrant: (id, userId) => hub().oauthRevokeGrant(id, userId),
     revokeByTokenHash: (h) => hub().oauthRevokeByTokenHash(h),
     checkAuthLockout: (b, now, m) => hub().oauthCheckAuthLockout(b, now, m),
     recordAuthFailure: (b, now, w, m) => hub().oauthRecordAuthFailure(b, now, w, m),
     clearAuthFailures: (b) => hub().oauthClearAuthFailures(b),
+    upsertUser: (u) => hub().oauthUpsertUser(u),
+    getUser: (id) => hub().oauthGetUser(id),
+    listUsers: () => hub().oauthListUsers(),
+    countUsers: () => hub().oauthCountUsers(),
+    updateUserRole: (id, role) => hub().oauthUpdateUserRole(id, role),
+  };
+}
+
+function hubMcpVaultStore(hub: () => DurableObjectStub<AgentHubDO>): McpVaultStore {
+  return {
+    listServers: async (userId) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      return typeof stub.vaultListServers === 'function' ? await stub.vaultListServers(userId) : [];
+    },
+    getServer: async (userId, slugOrDomain) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      return typeof stub.vaultGetServer === 'function' ? await stub.vaultGetServer(userId, slugOrDomain) : null;
+    },
+    upsertServer: async (row) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      if (typeof stub.vaultUpsertServer === 'function') await stub.vaultUpsertServer(row);
+    },
+    deleteServer: async (userId, slug) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      return typeof stub.vaultDeleteServer === 'function' ? await stub.vaultDeleteServer(userId, slug) : false;
+    },
+    putOAuthState: async (row) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      if (typeof stub.vaultPutOAuthState === 'function') await stub.vaultPutOAuthState(row);
+    },
+    consumeOAuthState: async (stateHash, userId, now) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      return typeof stub.vaultConsumeOAuthState === 'function'
+        ? await stub.vaultConsumeOAuthState(stateHash, userId, now)
+        : null;
+    },
   };
 }
 
@@ -818,25 +944,12 @@ function wrapSseResponseWithFlush(res: Response, onClose: () => void | Promise<u
   });
 }
 
+const devTelemetrySettingCache = new WeakMap<object, { value: string | null; expiresAt: number }>();
+
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const rootTracer = RequestTracer.fromRequest(request, { suppressWhenUnsampledHealth: true });
-    const trackedCtx: ExecutionContext | undefined = ctx
-      ? ({
-          waitUntil(promise: Promise<unknown>) {
-            const active = getActiveRequestTracer() ?? rootTracer;
-            const wrapped = active
-              .bindPromise(promise)
-              .catch(() => undefined)
-              .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
-            ctx.waitUntil(wrapped);
-          },
-          passThroughOnException() {
-            ctx.passThroughOnException?.();
-          },
-        } as unknown as ExecutionContext)
-      : undefined;
     const shardNames = (env.HUB_SHARDS ?? 'global')
       .split(',')
       .map((s) => s.trim())
@@ -844,6 +957,47 @@ export default {
     if (shardNames.length === 0) shardNames.push('global');
     const hubShard = (name = shardNames[0]!) => env.AGENT_HUB.get(env.AGENT_HUB.idFromName(name));
     const hub = () => hubShard(shardNames[0]!);
+
+    const getCachedDevTelemetrySetting = async (): Promise<string | null> => {
+      if (isTruthyTelemetryFlag(env.DO_NOT_TRACK)) return null;
+      const cacheKey = (env.AGENT_HUB as unknown as object | undefined) ?? null;
+      const now = Date.now();
+      if (cacheKey) {
+        const hit = devTelemetrySettingCache.get(cacheKey);
+        if (hit && hit.expiresAt > now) return hit.value;
+      }
+      try {
+        const stub = hub() as unknown as { getHubSetting?: (k: string) => Promise<string | null> };
+        const val = typeof stub.getHubSetting === 'function' ? await stub.getHubSetting(DEV_TELEMETRY_SETTING_KEY) : null;
+        if (cacheKey) {
+          devTelemetrySettingCache.set(cacheKey, { value: val, expiresAt: now + 30_000 });
+        }
+        return val;
+      } catch {
+        return null;
+      }
+    };
+
+    const flushTracerWithTelemetry = async (tracer: RequestTracer): Promise<boolean> => {
+      const devTelemetrySetting = await getCachedDevTelemetrySetting();
+      return tracer.flush({ env, fetchFn: env.SAFE_FETCH, devTelemetrySetting });
+    };
+
+    const trackedCtx: ExecutionContext | undefined = ctx
+      ? ({
+          waitUntil(promise: Promise<unknown>) {
+            const active = getActiveRequestTracer() ?? rootTracer;
+            const wrapped = active
+              .bindPromise(promise)
+              .catch(() => undefined)
+              .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
+            ctx.waitUntil(wrapped);
+          },
+          passThroughOnException() {
+            ctx.passThroughOnException?.();
+          },
+        } as unknown as ExecutionContext)
+      : undefined;
     const dispatchAcrossShards = async (
       rawBody: string,
       traceMap: Record<string, string>,
@@ -1104,7 +1258,7 @@ export default {
           );
 
           if (!activeParent && !localTracer.suppressed && localTracer.sampled) {
-            const flushPromise = localTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+            const flushPromise = flushTracerWithTelemetry(localTracer);
             if (ctx?.waitUntil) {
               ctx.waitUntil(flushPromise);
             } else {
@@ -1131,9 +1285,9 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const openApiRes = handleOpenApiRoute(request, url, '2.6.3');
+      const openApiRes = handleOpenApiRoute(request, url, '2.7.0');
       if (openApiRes) return openApiRes;
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.3');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.7.0');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1204,7 +1358,18 @@ export default {
       }
 
       const oauthStore = hubOAuthStore(hub);
+      const vaultStore: McpVaultStore = env.AGENT_HUB
+        ? hubMcpVaultStore(hub)
+        : {
+            listServers: () => [],
+            getServer: () => null,
+            upsertServer: () => undefined,
+            deleteServer: () => false,
+            putOAuthState: () => undefined,
+            consumeOAuthState: () => null,
+          };
       const activity = hubActivityProxy(hub);
+      const safePublicFetch = env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch;
 
       const makeCatalogHubFetch = (sourceLabel: string): CatalogHubFetchFn => {
         const boundTracer = getActiveRequestTracer();
@@ -1258,9 +1423,13 @@ export default {
         };
       };
 
+      const sessionSecret = resolveSessionSecret(env);
       const oauthRes = await handleOAuthRoute(request, url, {
         store: oauthStore,
         ownerSecret: env.CALLER_TOKEN,
+        ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
+        ...(sessionSecret ? { sessionSecret } : {}),
+        githubAuthEnabled: isGitHubAuthConfigured(env),
         serviceName: 'EdgeFetch Hub',
         redirectAllowlist: parseHostAllowlist(env.OAUTH_REDIRECT_ALLOWLIST),
         onEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
@@ -1270,7 +1439,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.6.3',
+          serverVersion: '2.7.0',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1285,27 +1454,42 @@ export default {
           },
           executeFetch: ({ target, site, body, principal }) =>
             executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`),
-          executeScrape: async ({ args, principal }) => {
+          executeScrape: async ({ args, principal, userId }) => {
+            const effectiveUserId = userId ?? resolveCallerUserId({ principal });
+            if (typeof args.url === 'string' && args.url.trim() && args.useConnectedMcp !== false) {
+              const mcpOut = await tryScrapeViaConnectedMcp({
+                userId: effectiveUserId,
+                targetUrl: args.url.trim(),
+                ...(typeof args.query === 'string' ? { query: args.query } : {}),
+                vaultStore,
+                vaultMasterKey: env.VAULT_MASTER_KEY,
+                fetchFn: safePublicFetch,
+                selfHost: url.hostname,
+              });
+              if (mcpOut) return { status: mcpOut.status, body: mcpOut.body };
+            }
             const out = await executeScrapeCall({
               payload: args as ScrapeRequestPayload,
               env,
               executeHubFetch,
               selfHost: url.hostname,
               source: `mcp-scrape:${principal ?? 'client'}`,
+              userId: effectiveUserId,
             });
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
-          executeExtract: async ({ args, principal }) => {
+          executeExtract: async ({ args, principal, userId }) => {
             const out = await executeExtractCall({
               payload: args as ExtractRequestPayload,
               env,
               executeHubFetch,
               selfHost: url.hostname,
               source: `mcp-extract:${principal ?? 'client'}`,
+              userId,
             });
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
-          executeInteract: async ({ args, principal }) => {
+          executeInteract: async ({ args, principal, userId }) => {
             const out = await executeInteractCall({
               payload: args as InteractRequestPayload,
               env,
@@ -1313,7 +1497,8 @@ export default {
               selfHost: url.hostname,
               source: `mcp-interact:${principal ?? 'client'}`,
               principal: principal ?? 'client',
-              sessionSigningSecret: env.CALLER_TOKEN,
+              userId,
+              sessionSigningSecret: sessionSecret,
             });
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
@@ -1326,7 +1511,7 @@ export default {
             });
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
-          executeCrawl: async ({ args, principal }) => {
+          executeCrawl: async ({ args, principal, userId }) => {
             const existingId = typeof args.crawlId === 'string' ? args.crawlId.trim() : '';
             if (existingId) {
               if (args.cancel === true) {
@@ -1342,7 +1527,17 @@ export default {
               });
               return st.ok ? { status: 200, body: st.crawl } : { status: st.status, body: { ok: false, error: st.error } };
             }
-            const created = await createCrawlJob({ payload: args, metaDb: env.META, selfHost: url.hostname });
+            const crawlArgs: Record<string, unknown> = { ...args };
+            let displayCollectionId: string | undefined;
+            if (typeof crawlArgs.collectionId === 'string' && crawlArgs.collectionId.trim()) {
+              const resolvedColl = resolveUserCollectionId(crawlArgs.collectionId, userId);
+              if (!resolvedColl.ok) {
+                return { status: resolvedColl.status, body: { ok: false, error: resolvedColl.error, message: resolvedColl.message } };
+              }
+              crawlArgs.collectionId = resolvedColl.scopedId;
+              displayCollectionId = resolvedColl.displayId;
+            }
+            const created = await createCrawlJob({ payload: crawlArgs, metaDb: env.META, selfHost: url.hostname });
             if (!created.ok) {
               return { status: created.status, body: { ok: false, error: created.error, message: created.message } };
             }
@@ -1366,22 +1561,23 @@ export default {
                 ok: true,
                 crawlId: created.crawlId,
                 status: 'queued',
-                collectionId: created.options.collectionId,
+                collectionId: displayCollectionId ?? created.options.collectionId,
                 pollUrl: `${url.origin}/v1/crawl/${created.crawlId}`,
                 principal: principal ?? 'client',
               },
             };
           },
-          executeSearch: async ({ args, principal }) => {
+          executeSearch: async ({ args, principal, userId }) => {
             const out = await executeSearchCall({
               payload: args as SearchRequestPayload,
               env,
               executeHubFetch,
               source: `mcp-search:${principal ?? 'client'}`,
+              userId,
             });
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
-          executeJobs: async ({ args, principal }) => {
+          executeJobs: async ({ args, principal, userId }) => {
             return await executeJobsCall({
               payload: args as JobsToolPayload,
               env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
@@ -1391,6 +1587,7 @@ export default {
                   env,
                   executeHubFetch,
                   source: `mcp-jobs-search:${principal ?? 'client'}`,
+                  userId,
                 });
                 return { status: sOut.status, body: sOut.body };
               },
@@ -1401,6 +1598,7 @@ export default {
                   executeHubFetch,
                   selfHost: url.hostname,
                   source: `mcp-jobs-scrape:${principal ?? 'client'}`,
+                  userId,
                 });
                 return { status: scOut.status, body: scOut.body };
               },
@@ -1419,14 +1617,15 @@ export default {
               ...(trackedCtx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } } : {}),
             });
           },
-          executeAgent: async ({ args, principal }) => {
+          executeAgent: async ({ args, principal, userId }) => {
+            const effectiveUserId = userId ?? resolveCallerUserId({ principal });
             if (typeof args.agentId === 'string' && args.agentId.trim()) {
               const aid = args.agentId.trim();
               if (args.cancel === true) {
-                const cRes = await cancelAgentRun(aid, env.META);
+                const cRes = await cancelAgentRun(aid, env.META, effectiveUserId);
                 return { status: cRes.status, body: { ok: cRes.ok, id: aid, status: 'cancelled' } };
               }
-              const rec = await loadAgentRun(aid, env.META);
+              const rec = await loadAgentRun(aid, env.META, effectiveUserId);
               if (!rec) return { status: 404, body: { ok: false, error: 'agent_not_found' } };
               if (args.trace === true) {
                 return { status: 200, body: { ok: true, id: rec.id, threadId: rec.threadId, status: rec.status, spans: rec.trace } };
@@ -1446,6 +1645,9 @@ export default {
               executeHubFetch,
               selfHost: url.hostname,
               principal: principal ?? 'mcp',
+              userId: effectiveUserId,
+              sessionSigningSecret: sessionSecret,
+              vaultStore,
               waitUntil: mcpAgentWaitUntil,
             });
             if (out.kind === 'sse') {
@@ -1453,27 +1655,54 @@ export default {
             }
             return { status: out.status, body: out.body };
           },
+          discoverMcps: async ({ query, remoteOnly, limit }) => {
+            const out = await discoverMcps({
+              query,
+              remoteOnly,
+              limit,
+              fetchFn: safePublicFetch,
+              selfHost: url.hostname,
+            });
+            return { status: out.status, body: out as unknown as Record<string, unknown> };
+          },
+          executeQueryMcp: async ({ args, principal, userId }) => {
+            const effectiveUserId = userId ?? resolveCallerUserId({ principal });
+            return await executeFederatedMcpQuery({
+              userId: effectiveUserId,
+              input: args as QueryMcpCallInput,
+              vaultStore,
+              vaultMasterKey: env.VAULT_MASTER_KEY,
+              fetchFn: safePublicFetch,
+              selfHost: url.hostname,
+            });
+          },
           ...(env.SEARCH
             ? {
-                searchCollection: async ({ collectionId, query, limit }) => {
-                  if (!COLLECTION_ID_RE.test(collectionId)) {
-                    return { ok: false as const, status: 400, error: 'invalid_collection_id' };
+                searchCollection: async ({ collectionId, query, limit, userId }) => {
+                  const resolved = resolveUserCollectionId(collectionId, userId);
+                  if (!resolved.ok) {
+                    return { ok: false as const, status: resolved.status, error: resolved.error };
                   }
                   const idx = new D1FtsSearchIndex(env.SEARCH!);
-                  const hits = await idx.searchCollection({ collectionId, query, limit });
-                  return { ok: true as const, hits: hits as unknown as Array<Record<string, unknown>> };
+                  const hits = await idx.searchCollection({ collectionId: resolved.scopedId, query, limit });
+                  return {
+                    ok: true as const,
+                    hits: hits.map((h) => ({ ...h, collectionId: resolved.displayId })) as unknown as Array<Record<string, unknown>>,
+                  };
                 },
               }
             : {}),
           ...(env.ARTIFACTS
             ? {
-                readArtifact: async ({ blobSha256, retention, format, offset, limit }) => {
+                readArtifact: async ({ blobSha256, retention, format, offset, limit, userId, visibility }) => {
                   const res = await readArtifactPage({
                     bucket: env.ARTIFACTS!,
                     ...(env.META ? { metaDb: env.META } : {}),
                     blobSha256,
                     ...(retention ? { retention } : {}),
                     ...(format ? { format } : {}),
+                    ...(userId ? { userId } : {}),
+                    ...(visibility ? { visibility } : {}),
                     offset,
                     limit,
                   });
@@ -1490,21 +1719,59 @@ export default {
         serviceName: 'EdgeFetch Hub',
         mcpSlug: 'edgefetch',
         ownerSecret: env.CALLER_TOKEN,
+        githubAuthEnv: env,
+        metaDb: env.META,
+        vaultMasterKey: env.VAULT_MASTER_KEY,
+        vaultStore,
+        safePublicFetch,
+        selfHost: url.hostname,
         oauthStore,
+        onEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
         allowedTargets: ALLOWED_TARGETS,
         defaultTarget: 'auto',
         getState: () => hub().getPortalState(Date.now()),
+        getUpdateStatus: (agents) =>
+          checkHubUpdateStatus({
+            currentVersion: HUB_VERSION,
+            agents,
+            env,
+          }),
+        getTelemetrySettings: async () => {
+          const stub = hub() as unknown as { getHubSetting?: (k: string) => Promise<string | null> };
+          const dbSettingValue =
+            typeof stub.getHubSetting === 'function' ? await stub.getHubSetting(DEV_TELEMETRY_SETTING_KEY) : null;
+          return resolveDevTelemetryState({ env, dbSettingValue });
+        },
+        setTelemetryOptIn: async (enabled) => {
+          const val = enabled ? '1' : '0';
+          const stub = hub() as unknown as { setHubSetting?: (k: string, v: string) => Promise<void> };
+          if (typeof stub.setHubSetting === 'function') {
+            await stub.setHubSetting(DEV_TELEMETRY_SETTING_KEY, val);
+          }
+          const cacheKey = (env.AGENT_HUB as unknown as object | undefined) ?? null;
+          if (cacheKey) {
+            devTelemetrySettingCache.set(cacheKey, { value: val, expiresAt: Date.now() + 30_000 });
+          }
+          await activity.recordEvent({
+            level: 'info',
+            category: 'agent',
+            event: 'dev_telemetry_updated',
+            summary: `Opt-in dev error telemetry set to ${enabled ? 'ON' : 'OFF'} via /admin`,
+            details: { enabled },
+          });
+          return resolveDevTelemetryState({ env, dbSettingValue: val });
+        },
         clearAffinities: (siteId) => hub().clearAffinities(siteId),
         clearEvents: () => hub().clearHubEvents(),
-        revokeGrant: async (grantId) => {
-          const revoked = await hub().oauthRevokeGrant(grantId);
+        revokeGrant: async (grantId, userId) => {
+          const revoked = await hub().oauthRevokeGrant(grantId, userId);
           if (revoked) {
             await activity.recordEvent({
               level: 'warn',
               category: 'oauth',
               event: 'oauth_grant_revoked',
               summary: `Revoked OAuth 2.1 grant ${grantId} from /admin`,
-              details: { grantId },
+              details: { grantId, ...(userId ? { userId } : {}) },
             });
           }
           return revoked;
@@ -1527,7 +1794,7 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
-          return Response.json(buildCapabilities(env, '2.6.3'), {
+          return Response.json(buildCapabilities(env, '2.7.0'), {
             status: 200,
             headers: { 'cache-control': 'no-store' },
           });
@@ -1600,6 +1867,7 @@ export default {
             url,
             env,
             oauthStore,
+            vaultStore,
             executeHubFetch,
             waitUntil: compatWaitUntil,
             tracer: getActiveRequestTracer() ?? rootTracer,
@@ -1637,6 +1905,91 @@ export default {
             blobSha256,
             bucket: env.ARTIFACTS,
             metaDb: env.META,
+            userId: auth.userId,
+          });
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/v1/mcp/registry') {
+        return withRouteSpan('edgefetch.mcp_registry', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            mcpToken: env.MCP_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const q = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
+          const remoteOnly = url.searchParams.get('remoteOnly') === 'true' || url.searchParams.get('remoteOnly') === '1';
+          const rawLimit = Number(url.searchParams.get('limit') ?? 20);
+          const out = await discoverMcps({
+            query: q,
+            remoteOnly,
+            ...(Number.isFinite(rawLimit) ? { limit: rawLimit } : {}),
+            fetchFn: safePublicFetch,
+            selfHost: url.hostname,
+          });
+          return Response.json(out, { status: out.status, headers: { 'cache-control': 'no-store' } });
+        });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/mcp/query') {
+        return withRouteSpan('edgefetch.mcp_query', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            mcpToken: env.MCP_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const cappedMcpQuery = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedMcpQuery.ok) {
+            return Response.json(
+              { error: cappedMcpQuery.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedMcpQuery.error === 'too_large' ? 413 : 400, headers: { 'cache-control': 'no-store' } },
+            );
+          }
+          let payload: QueryMcpCallInput;
+          try {
+            payload = JSON.parse(cappedMcpQuery.text) as QueryMcpCallInput;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+          }
+          const action = payload.action ?? 'list_connected';
+          if (action === 'call_tool') {
+            if (!auth.scopes.includes('crawl:fetch')) {
+              return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            }
+          } else if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const userId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const out = await executeFederatedMcpQuery({
+            userId,
+            input: payload,
+            vaultStore,
+            vaultMasterKey: env.VAULT_MASTER_KEY,
+            fetchFn: safePublicFetch,
+            selfHost: url.hostname,
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'private, no-store' },
           });
         });
       }
@@ -1671,12 +2024,34 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          if (typeof payload.url === 'string' && payload.url.trim() && (payload as Record<string, unknown>).useConnectedMcp !== false) {
+            const mcpOut = await tryScrapeViaConnectedMcp({
+              userId: callerUserId,
+              targetUrl: payload.url.trim(),
+              ...(typeof payload.query === 'string' ? { query: payload.query } : {}),
+              vaultStore,
+              vaultMasterKey: env.VAULT_MASTER_KEY,
+              fetchFn: safePublicFetch,
+              selfHost: url.hostname,
+            });
+            if (mcpOut) {
+              return Response.json(mcpOut.body, {
+                status: mcpOut.status,
+                headers: {
+                  'cache-control': 'private, no-store',
+                  'x-crawler-via': mcpOut.via,
+                },
+              });
+            }
+          }
           const out = await executeScrapeCall({
             payload,
             env,
             executeHubFetch,
             selfHost: url.hostname,
             source: `scrape:${auth.principal}`,
+            userId: auth.userId,
           });
           return Response.json(out.body, {
             status: out.status,
@@ -1732,6 +2107,7 @@ export default {
             markdown?: string;
             collectionId?: string;
             onlyMainContent?: boolean;
+            visibility?: unknown;
           };
           try {
             clipPayload = JSON.parse(cappedClip.text) as typeof clipPayload;
@@ -1750,10 +2126,22 @@ export default {
           }
           parsedTabUrl.hash = '';
           const cleanUrl = parsedTabUrl.toString();
-          const collectionId =
-            typeof clipPayload.collectionId === 'string' && COLLECTION_ID_RE.test(clipPayload.collectionId.trim())
+          const clipVisibility =
+            clipPayload.visibility === 'private' || auth.userId !== 'owner'
+              ? 'private'
+              : normalizeVisibility(clipPayload.visibility);
+          const rawCollectionId =
+            typeof clipPayload.collectionId === 'string' && clipPayload.collectionId.trim()
               ? clipPayload.collectionId.trim()
               : 'browser-clips';
+          const resolvedClipCollection = resolveUserCollectionId(rawCollectionId, auth.userId, clipVisibility);
+          if (!resolvedClipCollection.ok) {
+            return Response.json(
+              { error: resolvedClipCollection.error, message: resolvedClipCollection.message },
+              { status: resolvedClipCollection.status, headers: corsHeaders },
+            );
+          }
+          const collectionId = resolvedClipCollection.displayId;
           setActiveSpanAttribute('url.full', sanitizeUrlForSpan(cleanUrl));
           setActiveSpanAttribute('edgefetch.collection_id', collectionId);
 
@@ -1774,12 +2162,18 @@ export default {
           }
 
           const contentSha256 = await sha256HexString(markdown);
-          const pageId = (await sha256HexString(cleanUrl)).slice(0, 32);
+          const pageIdSeed =
+            clipVisibility === 'private' ? `${sanitizeStorageUserId(auth.userId)}:${cleanUrl}` : cleanUrl;
+          const pageId = (await sha256HexString(pageIdSeed)).slice(0, 32);
           const documentId = `clip:${contentSha256.slice(0, 32)}`;
           const nowMs = Date.now();
 
           if (env.ARTIFACTS) {
-            await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256), markdown, {
+            const mdKey =
+              clipVisibility === 'private'
+                ? r2PrivateDerivedKey(auth.userId, SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256)
+                : r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256);
+            await env.ARTIFACTS.put(mdKey, markdown, {
               httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
             }).catch(() => undefined);
           }
@@ -1788,7 +2182,7 @@ export default {
           if (env.SEARCH) {
             const idx = new D1FtsSearchIndex(env.SEARCH);
             const rep = await idx.replacePageChunks({
-              collectionId,
+              collectionId: resolvedClipCollection.scopedId,
               documentId,
               pageId,
               url: cleanUrl,
@@ -1807,6 +2201,7 @@ export default {
               title: resolvedTitle || cleanUrl,
               ...(description ? { description } : {}),
               collectionId,
+              visibility: clipVisibility,
               indexedChunks,
               contentSha256,
               pipelineVersion: SCRAPE_PIPELINE_VERSION,
@@ -1853,6 +2248,7 @@ export default {
             executeHubFetch,
             selfHost: url.hostname,
             source: `extract:${auth.principal}`,
+            userId: auth.userId,
           });
           return Response.json(out.body, {
             status: out.status,
@@ -1898,7 +2294,8 @@ export default {
             selfHost: url.hostname,
             source: `interact:${auth.principal}`,
             principal: auth.principal,
-            sessionSigningSecret: env.CALLER_TOKEN,
+            userId: auth.userId,
+            sessionSigningSecret: sessionSecret,
           });
           return Response.json(out.body, {
             status: out.status,
@@ -1985,6 +2382,7 @@ export default {
             env,
             executeHubFetch,
             source: `search:${auth.principal}`,
+            userId: auth.userId,
           });
           return Response.json(out.body, {
             status: out.status,
@@ -2065,6 +2463,7 @@ export default {
                 executeHubFetch,
                 selfHost: url.hostname,
                 source: `batch-scrape:${auth.principal}`,
+                userId: auth.userId,
               });
               return { status: res.status, body: res.body };
             },
@@ -2162,12 +2561,16 @@ export default {
                   .catch(() => undefined)
                   .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
               };
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           const out = await startOrExecuteAgentCall({
             payload,
             env,
             executeHubFetch,
             selfHost: url.hostname,
             principal: auth.principal,
+            userId: callerUserId,
+            sessionSigningSecret: sessionSecret,
+            vaultStore,
             wantSseStream: wantSse,
             waitUntil: agentWaitUntil,
           });
@@ -2202,7 +2605,8 @@ export default {
             return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
           }
           const agentId = rawAgentId.trim();
-          const rec = await loadAgentRun(agentId, env.META);
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const rec = await loadAgentRun(agentId, env.META, callerUserId);
           if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
           return Response.json(
             {
@@ -2241,8 +2645,9 @@ export default {
             return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
           }
           const agentId = rawAgentId.trim();
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           if (request.method === 'GET') {
-            const rec = await loadAgentRun(agentId, env.META);
+            const rec = await loadAgentRun(agentId, env.META, callerUserId);
             if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
             return Response.json(formatPublicAgentResponse(rec, false), { status: 200, headers: { 'cache-control': 'no-store' } });
           }
@@ -2250,7 +2655,7 @@ export default {
             if (!auth.scopes.includes('crawl:fetch')) {
               return Response.json({ error: 'insufficient_scope' }, { status: 403 });
             }
-            const cRes = await cancelAgentRun(agentId, env.META);
+            const cRes = await cancelAgentRun(agentId, env.META, callerUserId);
             return Response.json({ ok: cRes.ok, id: agentId, status: 'cancelled' }, { status: cRes.status });
           }
           return Response.json({ error: 'not_found' }, { status: 404 });
@@ -2287,6 +2692,18 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
+          let displayCollectionId: string | undefined;
+          if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {
+            const resolvedColl = resolveUserCollectionId(payload.collectionId, auth.userId);
+            if (!resolvedColl.ok) {
+              return Response.json(
+                { ok: false, error: resolvedColl.error, message: resolvedColl.message },
+                { status: resolvedColl.status, headers: { 'cache-control': 'no-store' } },
+              );
+            }
+            payload = { ...payload, collectionId: resolvedColl.scopedId };
+            displayCollectionId = resolvedColl.displayId;
+          }
           const created = await createCrawlJob({ payload, metaDb: env.META, selfHost: url.hostname });
           if (!created.ok) {
             return Response.json(
@@ -2314,7 +2731,7 @@ export default {
               ok: true,
               id: created.crawlId,
               status: payload.sync === true ? 'completed' : 'queued',
-              collectionId: created.options.collectionId,
+              collectionId: displayCollectionId ?? created.options.collectionId,
               url: `${url.origin}/v1/crawl/${created.crawlId}`,
             },
             { status: payload.sync === true ? 200 : 202, headers: { 'cache-control': 'no-store' } },
@@ -2392,9 +2809,12 @@ export default {
           if (rawCollectionId === null) {
             return Response.json({ error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400, headers: { 'cache-control': 'no-store' } });
           }
-          const collectionId = rawCollectionId.trim();
-          if (!COLLECTION_ID_RE.test(collectionId)) {
-            return Response.json({ error: 'invalid_collection_id' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+          const resolvedCol = resolveUserCollectionId(rawCollectionId.trim(), auth.userId);
+          if (!resolvedCol.ok) {
+            return Response.json(
+              { error: resolvedCol.error, message: resolvedCol.message },
+              { status: resolvedCol.status, headers: { 'cache-control': 'no-store' } },
+            );
           }
           let query = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
           let limit = Number(url.searchParams.get('limit') ?? 10);
@@ -2417,12 +2837,17 @@ export default {
           }
           const idx = new D1FtsSearchIndex(env.SEARCH);
           const hits = await idx.searchCollection({
-            collectionId,
+            collectionId: resolvedCol.scopedId,
             query,
             limit: Number.isFinite(limit) ? limit : 10,
           });
           return Response.json(
-            { ok: true, collectionId, query, hits },
+            {
+              ok: true,
+              collectionId: resolvedCol.displayId,
+              query,
+              hits: hits.map((h) => ({ ...h, collectionId: resolvedCol.displayId })),
+            },
             { status: 200, headers: { 'cache-control': 'no-store' } },
           );
         });
@@ -2467,6 +2892,7 @@ export default {
                 env,
                 executeHubFetch,
                 source: `jobs-search:${auth.principal}`,
+                userId: auth.userId,
               });
               return { status: sOut.status, body: sOut.body };
             },
@@ -2477,6 +2903,7 @@ export default {
                 executeHubFetch,
                 selfHost: url.hostname,
                 source: `jobs-scrape:${auth.principal}`,
+                userId: auth.userId,
               });
               return { status: scOut.status, body: scOut.body };
             },
@@ -2690,7 +3117,7 @@ export default {
       );
     } finally {
       if (!rootTracer.suppressed && rootTracer.sampled) {
-        const flushPromise = rootTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+        const flushPromise = flushTracerWithTelemetry(rootTracer);
         if (ctx?.waitUntil) {
           ctx.waitUntil(flushPromise);
         } else {

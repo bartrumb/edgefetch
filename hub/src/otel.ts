@@ -13,6 +13,7 @@
 
 // @ts-ignore: `hub/tsconfig.json` uses `@cloudflare/workers-types` without `@types/node`
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { flushDevErrorTelemetry, type DevTelemetryEnvConfig } from './dev-telemetry';
 
 export interface TraceContext {
   traceId: string; // 32 lowercase hex chars (16 bytes)
@@ -37,7 +38,7 @@ export interface OtlpSpanInput {
 export type OtlpSpanRecord = OtlpSpanInput;
 export type SpanAttributes = Record<string, string | number | boolean | undefined>;
 
-export interface OtelEnvConfig {
+export interface OtelEnvConfig extends DevTelemetryEnvConfig {
   OTEL_EXPORTER_OTLP_ENDPOINT?: string;
   OTEL_EXPORTER_OTLP_HEADERS?: string;
   OTEL_SERVICE_NAME?: string;
@@ -183,7 +184,7 @@ export function buildOtlpTracePayload(params: {
   spans: OtlpSpanInput[];
 }): Record<string, unknown> {
   const serviceName = params.serviceName?.trim() || 'edgefetch-hub';
-  const serviceVersion = params.serviceVersion?.trim() || '2.6.3';
+  const serviceVersion = params.serviceVersion?.trim() || '2.7.0';
   return {
     resourceSpans: [
       {
@@ -312,6 +313,7 @@ export function buildCrawlChildSpans(params: {
         outcome?: string;
         durationMs?: number;
         rendered?: boolean;
+        waf?: { vendor?: string };
         timing?: {
           dnsMs?: number;
           connectMs?: number;
@@ -340,6 +342,7 @@ export function buildCrawlChildSpans(params: {
           'crawler.via': params.via,
           'crawler.outcome': r.outcome ?? 'unknown',
           'crawler.rendered': Boolean(r.rendered),
+          ...(typeof r.waf?.vendor === 'string' && r.waf.vendor ? { 'edgefetch.waf.vendor': r.waf.vendor } : {}),
           'net.dns_ms': r.timing?.dnsMs ?? 0,
           'net.connect_ms': r.timing?.connectMs ?? 0,
           'net.tls_ms': r.timing?.tlsMs ?? 0,
@@ -677,19 +680,30 @@ export class RequestTracer {
   }
 
   async flush(params: {
-    env: OtelEnvConfig & { SAFE_FETCH?: typeof fetch };
+    env: OtelEnvConfig & { SAFE_FETCH?: typeof fetch; SAFE_PUBLIC_FETCH?: typeof fetch };
     fetchFn?: typeof fetch;
+    devTelemetrySetting?: string | boolean | null;
     ctx?: { waitUntil?: (p: Promise<unknown>) => void };
   }): Promise<boolean> {
     const batch = this.state.spans.splice(0, this.state.spans.length);
     if (batch.length === 0 || this.state.suppressed || !this.sampled) {
       return false;
     }
-    const doFlush = flushOtlpSpans({
-      env: params.env,
-      spans: batch,
-      ...(params.fetchFn ?? params.env.SAFE_FETCH ? { fetchFn: params.fetchFn ?? params.env.SAFE_FETCH } : {}),
-    });
+    const doFlush = Promise.all([
+      flushOtlpSpans({
+        env: params.env,
+        spans: batch,
+        ...(params.fetchFn ?? params.env.SAFE_FETCH ? { fetchFn: params.fetchFn ?? params.env.SAFE_FETCH } : {}),
+      }),
+      flushDevErrorTelemetry({
+        env: params.env,
+        spans: batch,
+        dbSettingValue: params.devTelemetrySetting,
+        ...(params.fetchFn ?? params.env.SAFE_PUBLIC_FETCH ?? params.env.SAFE_FETCH
+          ? { fetchFn: params.fetchFn ?? params.env.SAFE_PUBLIC_FETCH ?? params.env.SAFE_FETCH }
+          : {}),
+      }),
+    ]).then(([otlpOk, devTelOk]) => otlpOk || devTelOk);
     if (params.ctx?.waitUntil) {
       params.ctx.waitUntil(doFlush);
       return true;

@@ -261,7 +261,7 @@ function connect(cfg) {
       ws.send(
         JSON.stringify({
           type: 'hello',
-          version: '2.6.3',
+          version: '2.7.0',
           arch: 'browser-mv3',
           goVersion: 'mv3-extension',
           capabilities: [],

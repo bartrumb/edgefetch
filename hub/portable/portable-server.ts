@@ -5,11 +5,13 @@
  * extractors, `node:sqlite` FTS5 search, local `/data/artifacts` object store, `/agent/ws` Go worker fleet, and
  * vendor-agnostic OTLP trace export) with zero Cloudflare account, zero Postgres, and zero Redis!
  */
+import { existsSync } from 'node:fs';
 import { createServer, type IncomingMessage } from 'node:http';
 import net from 'node:net';
 import { join, resolve } from 'node:path';
 import { WebSocketServer } from 'ws';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
+import metaMultiUserSql from '../migrations/meta/0002_multiuser.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
 import { authorizeAgent } from '../src/auth';
 import hubWorker from '../src/index';
@@ -402,8 +404,16 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     : new NodeSqliteD1Database(
         join(dataDir, 'meta.sqlite'),
         opts.migrationsDir
-          ? [join(resolve(opts.migrationsDir), 'meta', '0001_tracking.sql')]
-          : [{ name: 'meta/0001_tracking.sql', sql: metaSchemaSql }],
+          ? [
+              join(resolve(opts.migrationsDir), 'meta', '0001_tracking.sql'),
+              existsSync(join(resolve(opts.migrationsDir), 'meta', '0002_multiuser.sql'))
+                ? join(resolve(opts.migrationsDir), 'meta', '0002_multiuser.sql')
+                : { name: 'meta/0002_multiuser.sql', sql: metaMultiUserSql },
+            ]
+          : [
+              { name: 'meta/0001_tracking.sql', sql: metaSchemaSql },
+              { name: 'meta/0002_multiuser.sql', sql: metaMultiUserSql },
+            ],
       );
   const localSearchDb = (mergedEnv.SEARCH_TURSO_URL || tursoUrl)
     ? null
@@ -454,6 +464,13 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     SAFE_FETCH: safeFetch,
     SAFE_PUBLIC_FETCH: safePublicFetch,
     CALLER_TOKEN: mergedEnv.CALLER_TOKEN ?? mergedEnv.EDGEFETCH_CALLER_TOKEN ?? mergedEnv.EDGEFETCH_SERVER_TOKEN,
+    SESSION_SECRET: mergedEnv.SESSION_SECRET ?? mergedEnv.EDGEFETCH_SESSION_SECRET,
+    GITHUB_CLIENT_ID: mergedEnv.GITHUB_CLIENT_ID,
+    GITHUB_CLIENT_SECRET: mergedEnv.GITHUB_CLIENT_SECRET,
+    GITHUB_ALLOWED_USERS: mergedEnv.GITHUB_ALLOWED_USERS,
+    GITHUB_OWNER_LOGIN: mergedEnv.GITHUB_OWNER_LOGIN,
+    SIGNUP_MODE: mergedEnv.SIGNUP_MODE,
+    VAULT_MASTER_KEY: mergedEnv.VAULT_MASTER_KEY ?? mergedEnv.EDGEFETCH_VAULT_MASTER_KEY,
     MCP_TOKEN: mergedEnv.MCP_TOKEN,
     AGENT_TOKEN: mergedEnv.AGENT_TOKEN ?? mergedEnv.EDGEFETCH_AGENT_TOKEN,
     AGENT_TOKENS: mergedEnv.AGENT_TOKENS ?? mergedEnv.EDGEFETCH_AGENT_TOKENS,
@@ -489,6 +506,11 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     ANTHROPIC_API_KEY: mergedEnv.ANTHROPIC_API_KEY,
     GEMINI_API_KEY: mergedEnv.GEMINI_API_KEY,
     EDGEFETCH_PUBLIC_ORIGIN: mergedEnv.EDGEFETCH_PUBLIC_ORIGIN,
+    EDGEFETCH_DISABLE_UPDATE_CHECK: mergedEnv.EDGEFETCH_DISABLE_UPDATE_CHECK,
+    EDGEFETCH_DEV_TELEMETRY: mergedEnv.EDGEFETCH_DEV_TELEMETRY,
+    EDGEFETCH_DEV_TELEMETRY_ENDPOINT: mergedEnv.EDGEFETCH_DEV_TELEMETRY_ENDPOINT,
+    EDGEFETCH_DEV_TELEMETRY_URL: mergedEnv.EDGEFETCH_DEV_TELEMETRY_URL,
+    DO_NOT_TRACK: mergedEnv.DO_NOT_TRACK,
   };
 
   let boundPort = port;

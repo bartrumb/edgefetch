@@ -570,16 +570,20 @@ func allMCPClientTargets(goos, homeDir, appData string) []mcpClientTarget {
 	return out
 }
 
-func upsertCodexTomlMCP(existing string, exePath string) string {
+func upsertCodexTomlMCP(existing string, exePath string, enableDevTelemetry ...bool) string {
+	wantTelemetry := len(enableDevTelemetry) > 0 && enableDevTelemetry[0]
 	block := fmt.Sprintf("[mcp_servers.edgefetch]\ncommand = %q\nargs = [\"mcp\"]\n", exePath)
-	// Strip any prior [mcp_servers.edgefetch] section cleanly before appending updated block
+	if wantTelemetry {
+		block += "env = { EDGEFETCH_DEV_TELEMETRY = \"1\" }\n"
+	}
+	// Strip any prior [mcp_servers.edgefetch] (or [mcp_servers.edgefetch.env]) section cleanly before appending updated block
 	lines := strings.Split(strings.ReplaceAll(existing, "\r\n", "\n"), "\n")
 	var kept []string
 	skipping := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			if trimmed == "[mcp_servers.edgefetch]" {
+			if trimmed == "[mcp_servers.edgefetch]" || trimmed == "[mcp_servers.edgefetch.env]" {
 				skipping = true
 				continue
 			}
@@ -596,8 +600,32 @@ func upsertCodexTomlMCP(existing string, exePath string) string {
 	return cleaned + "\n\n" + block
 }
 
+func isInteractiveStdinTTY(stdin io.Reader, deps cliDeps) bool {
+	if deps.stdinIsTTY != nil {
+		return *deps.stdinIsTTY
+	}
+	f, ok := stdin.(*os.File)
+	if !ok || f == nil {
+		return false
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (st.Mode() & os.ModeCharDevice) != 0
+}
+
 func runInstallMCP(args []string, stdout, stderr io.Writer) int {
+	return runInstallMCPWithDeps(args, nil, stdout, stderr, cliDeps{getenv: os.Getenv})
+}
+
+func runInstallMCPWithDeps(args []string, stdin io.Reader, stdout, stderr io.Writer, deps cliDeps) int {
+	if deps.getenv == nil {
+		deps.getenv = os.Getenv
+	}
 	dryRun := hasFlag(args, "--dry-run")
+	explicitTelemetryOn := hasFlag(args, "--telemetry")
+	explicitTelemetryOff := hasFlag(args, "--no-telemetry")
 	agentFilter := strings.ToLower(strings.TrimSpace(flagValue(args, "--agent=")))
 	exePath := flagValue(args, "--exe=")
 	if exePath == "" {
@@ -640,9 +668,31 @@ func runInstallMCP(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Strict Opt-In Telemetry Prompt:
+	//  - Hard disabled when `DO_NOT_TRACK=1` (even if `--telemetry` or `EDGEFETCH_DEV_TELEMETRY=1` is set).
+	//  - Strictly skipped when `stdin` is non-TTY (piped/CI/unattended) or `--dry-run` / `--no-telemetry` is passed.
+	enableDevTelemetry := false
+	if !otel.IsDoNotTrack(deps.getenv("DO_NOT_TRACK")) && !explicitTelemetryOff {
+		if explicitTelemetryOn || otel.IsDevTelemetryEnabled(deps.getenv) {
+			enableDevTelemetry = true
+		} else if !dryRun && stdin != nil && isInteractiveStdinTTY(stdin, deps) {
+			_, _ = fmt.Fprint(stdout, "Share anonymous structural adapter & WAF error codes (zero URLs/content; DO_NOT_TRACK=1 honored) to help fix broken extractors? [y/N]: ")
+			line, _ := bufio.NewReader(stdin).ReadString('\n')
+			ans := strings.ToLower(strings.TrimSpace(line))
+			if ans == "y" || ans == "yes" {
+				enableDevTelemetry = true
+			}
+		}
+	}
+
 	entry := map[string]any{
 		"command": exePath,
 		"args":    []string{"mcp"},
+	}
+	if enableDevTelemetry {
+		entry["env"] = map[string]any{
+			"EDGEFETCH_DEV_TELEMETRY": "1",
+		}
 	}
 
 	for _, t := range targets {
@@ -650,7 +700,7 @@ func runInstallMCP(args []string, stdout, stderr io.Writer) int {
 		existingBytes, readErr := os.ReadFile(t.path)
 
 		if t.format == "toml" {
-			updated := upsertCodexTomlMCP(string(existingBytes), exePath)
+			updated := upsertCodexTomlMCP(string(existingBytes), exePath, enableDevTelemetry)
 			outBytes = []byte(updated)
 		} else {
 			root := map[string]any{}

@@ -15,6 +15,7 @@ import { SITE_ID_PATTERN } from './auth';
 import { filterSafeResponseHeaders } from './framework-detect';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
+import { resolveCallerUserId } from './mcp-vault';
 import { getActiveRequestTracer, type RequestTracer } from './otel';
 import { validatePublicHttpsTargetUrl } from './overflow';
 import { readBodyTextCapped } from './safe-input';
@@ -173,44 +174,65 @@ export interface McpServerDeps {
     blobSha256: string;
     retention?: 'transient' | 'stored';
     format?: 'raw' | 'markdown';
+    visibility?: 'public' | 'private';
     offset?: number;
     limit?: number;
+    userId?: string;
   }) => Promise<{ ok: true; page: Record<string, unknown> } | { ok: false; status: number; error: string; message?: string }>;
   executeScrape?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeExtract?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeInteract?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeMap?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeCrawl?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeSearch?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeJobs?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeCatalog?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeAgent?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  discoverMcps?: (params: {
+    query?: string;
+    remoteOnly?: boolean;
+    limit?: number;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  executeQueryMcp?: (params: {
+    args: Record<string, unknown>;
+    principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   findExtractors?: (params: {
     query: string;
@@ -221,6 +243,7 @@ export interface McpServerDeps {
     collectionId: string;
     query: string;
     limit?: number;
+    userId?: string;
   }) => Promise<{ ok: true; hits: Array<Record<string, unknown>> } | { ok: false; status: number; error: string }>;
   scheduleBackground?: (promise: Promise<unknown>) => void;
   tracer?: RequestTracer;
@@ -293,7 +316,8 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
     toolName === 'read_artifact' ||
     toolName === 'search' ||
     toolName === 'search_collection' ||
-    toolName === 'find_extractors'
+    toolName === 'find_extractors' ||
+    toolName === 'discover_mcps'
   ) {
     return 'crawl:read';
   }
@@ -307,7 +331,8 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
     toolName === 'crawl' ||
     toolName === 'jobs' ||
     toolName === 'catalog' ||
-    toolName === 'agent'
+    toolName === 'agent' ||
+    toolName === 'query_mcp'
   ) {
     return 'crawl:fetch';
   }
@@ -384,7 +409,7 @@ export interface CanonicalMcpToolDefinition {
 }
 
 /**
- * Canonical single-source-of-truth definitions for all 15 EdgeFetch MCP tools.
+ * Canonical single-source-of-truth definitions for all 17 EdgeFetch MCP tools.
  * Shared directly by `POST /mcp` (`tools/list`) and `GET /openapi.json` (`hub/src/openapi.ts`) so schemas never drift.
  */
 export function buildCanonicalMcpToolSchemas(options?: {
@@ -659,6 +684,13 @@ export function buildCanonicalMcpToolSchemas(options?: {
             description: 'Optional record filter for JSON array responses (e.g. `title~"Forward Deployed"` or `id=abc123`), emitting 1 chunk per record.',
           },
           collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index the verified Markdown into.' },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description:
+              'Artifact & cache isolation mode ("private" stores R2 blobs/cache under private/<userId>/... and skips shared public cache).',
+          },
           waybackFallback: {
             type: 'boolean',
             default: false,
@@ -715,6 +747,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
           redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
           collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index extracted pages into.' },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description: 'Artifact & cache isolation mode ("private" isolates R2 cache & FTS5 chunks to the authenticated user).',
+          },
           waybackFallback: {
             type: 'boolean',
             default: false,
@@ -1158,6 +1196,82 @@ export function buildCanonicalMcpToolSchemas(options?: {
         additionalProperties: false,
       },
     },
+    {
+      name: 'discover_mcps',
+      description:
+        'Search the Official Model Context Protocol Registry (registry.modelcontextprotocol.io) and Glama MCP Directory (glama.ai) to discover remote Streamable HTTP / SSE and local MCP servers, required auth headers, environment variables, and associated web domains.',
+      annotations: {
+        title: 'Discover MCP Servers (Official Registry + Glama)',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'Search keyword, service name, or domain (e.g. "linear", "notion", "github", "sentry", "stripe").',
+          },
+          remoteOnly: {
+            type: 'boolean',
+            default: false,
+            description: 'When true, keep only servers advertising remote streamable-http or sse endpoints.',
+          },
+          limit: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 50,
+            default: 20,
+            description: 'Maximum registry entries to return (1..50).',
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: 'query_mcp',
+      description:
+        'List your user-isolated connected downstream MCP servers, inspect their cached or live tool schemas on demand (zero top-level context bloat), or execute an authenticated JSON-RPC tools/call against a connected remote MCP server.',
+      annotations: {
+        title: 'Query Connected Federated MCP Server',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list_connected', 'list_tools', 'call_tool'],
+            default: 'list_connected',
+            description:
+              '"list_connected" lists your connected MCPs and domains; "list_tools" lists tools on server; "call_tool" executes tool on server.',
+          },
+          server: {
+            type: 'string',
+            description: 'Connected MCP server slug or associated domain (required for "list_tools" and "call_tool").',
+          },
+          tool: {
+            type: 'string',
+            description: 'Downstream MCP tool name to execute (required when action="call_tool").',
+          },
+          arguments: {
+            type: 'object',
+            description: 'JSON object arguments passed to the downstream MCP tool when action="call_tool".',
+          },
+          refresh: {
+            type: 'boolean',
+            default: false,
+            description: 'When true on action="list_tools", refreshes tools/list live from the remote MCP endpoint.',
+          },
+        },
+        additionalProperties: false,
+      },
+    },
   ];
 }
 
@@ -1184,6 +1298,8 @@ function buildToolDefinitions(deps: McpServerDeps) {
       if (t.name === 'catalog') return Boolean(deps.executeCatalog);
       if (t.name === 'find_extractors') return Boolean(deps.findExtractors);
       if (t.name === 'agent') return Boolean(deps.executeAgent);
+      if (t.name === 'discover_mcps') return Boolean(deps.discoverMcps);
+      if (t.name === 'query_mcp') return Boolean(deps.executeQueryMcp);
       return true;
     })
     .map((t) => ({ ...t, title: t.annotations.title }));
@@ -1342,6 +1458,7 @@ async function handleToolCallInner(
   scopes: string[],
   principal: string,
   deps: McpServerDeps,
+  userId = 'owner',
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   if (name === 'list_agents') {
     if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
@@ -1526,14 +1643,17 @@ async function handleToolCallInner(
     const blobSha256 = typeof args.artifactId === 'string' ? args.artifactId.trim().toLowerCase() : '';
     const retention = args.retention === 'stored' ? 'stored' : args.retention === 'transient' ? 'transient' : undefined;
     const format = args.format === 'markdown' ? 'markdown' : args.format === 'raw' ? 'raw' : undefined;
+    const visibility = args.visibility === 'private' ? 'private' : args.visibility === 'public' ? 'public' : undefined;
     const offset = typeof args.offset === 'number' ? Math.max(0, Math.floor(args.offset)) : 0;
     const limit = typeof args.limit === 'number' ? Math.min(262_144, Math.max(1, Math.floor(args.limit))) : MAX_BODY_PREVIEW_CHARS;
     const out = await deps.readArtifact({
       blobSha256,
       ...(retention ? { retention } : {}),
       ...(format ? { format } : {}),
+      ...(visibility ? { visibility } : {}),
       offset,
       limit,
+      userId,
     });
     if (!out.ok) {
       return {
@@ -1558,7 +1678,7 @@ async function handleToolCallInner(
     }
     const scrapeArgs =
       args.maxChars === undefined ? { ...args, defaultMaxChars: DEFAULT_MCP_SCRAPE_MAX_CHARS } : args;
-    const res = await deps.executeScrape({ args: scrapeArgs, principal });
+    const res = await deps.executeScrape({ args: scrapeArgs, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1572,7 +1692,7 @@ async function handleToolCallInner(
     if (!deps.executeExtract) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'extract_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeExtract({ args, principal });
+    const res = await deps.executeExtract({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1589,7 +1709,7 @@ async function handleToolCallInner(
     const collectionId = typeof args.collectionId === 'string' && args.collectionId.trim() ? args.collectionId.trim() : 'default';
     const query = typeof args.query === 'string' ? args.query : '';
     const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : 10;
-    const res = await deps.searchCollection({ collectionId, query, limit });
+    const res = await deps.searchCollection({ collectionId, query, limit, userId });
     if (!res.ok) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: res.error }) }], isError: true };
     }
@@ -1605,7 +1725,7 @@ async function handleToolCallInner(
     if (!deps.executeInteract) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'interact_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeInteract({ args, principal });
+    const res = await deps.executeInteract({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1619,7 +1739,7 @@ async function handleToolCallInner(
     if (!deps.executeMap) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'map_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeMap({ args, principal });
+    const res = await deps.executeMap({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1633,7 +1753,7 @@ async function handleToolCallInner(
     if (!deps.executeCrawl) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'crawl_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeCrawl({ args, principal });
+    const res = await deps.executeCrawl({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status >= 400 ? { isError: true } : {}),
@@ -1647,7 +1767,7 @@ async function handleToolCallInner(
     if (!deps.executeSearch) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'search_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeSearch({ args, principal });
+    const res = await deps.executeSearch({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1661,7 +1781,7 @@ async function handleToolCallInner(
     if (!deps.executeJobs) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'jobs_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeJobs({ args, principal });
+    const res = await deps.executeJobs({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1675,7 +1795,7 @@ async function handleToolCallInner(
     if (!deps.executeCatalog) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'catalog_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeCatalog({ args, principal });
+    const res = await deps.executeCatalog({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status >= 400 ? { isError: true } : {}),
@@ -1705,7 +1825,43 @@ async function handleToolCallInner(
     if (!deps.executeAgent) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'agent_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeAgent({ args, principal });
+    const res = await deps.executeAgent({ args, principal, userId });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status >= 400 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'discover_mcps') {
+    if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
+    }
+    if (!deps.discoverMcps) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'registry_not_configured' }) }], isError: true };
+    }
+    const query = typeof args.query === 'string' ? args.query : undefined;
+    const remoteOnly = typeof args.remoteOnly === 'boolean' ? args.remoteOnly : false;
+    const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : 20;
+    const res = await deps.discoverMcps({ ...(query !== undefined ? { query } : {}), remoteOnly, limit });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      ...(res.status >= 400 ? { isError: true } : {}),
+    };
+  }
+
+  if (name === 'query_mcp') {
+    const action = typeof args.action === 'string' ? args.action : 'list_connected';
+    if (action === 'call_tool') {
+      if (!scopes.includes('crawl:fetch')) {
+        return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+      }
+    } else if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
+      return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
+    }
+    if (!deps.executeQueryMcp) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'mcp_federation_not_configured' }) }], isError: true };
+    }
+    const res = await deps.executeQueryMcp({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status >= 400 ? { isError: true } : {}),
@@ -1721,9 +1877,10 @@ async function handleToolCall(
   scopes: string[],
   principal: string,
   deps: McpServerDeps,
+  userId = 'owner',
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   try {
-    return await handleToolCallInner(name, args, scopes, principal, deps);
+    return await handleToolCallInner(name, args, scopes, principal, deps, userId);
   } catch (err) {
     return {
       content: [
@@ -1748,6 +1905,7 @@ async function dispatchRpcMessage(
   userAgent: string,
   deps: McpServerDeps,
   isModern = false,
+  userId = 'owner',
 ): Promise<{ body: Record<string, unknown>; status?: number } | null> {
   const isNotification = msg.id === undefined;
   const id = msg.id ?? null;
@@ -1893,7 +2051,7 @@ async function dispatchRpcMessage(
         return { body: jsonRpcError(id, -32602, 'Missing tool name') };
       }
       const activeTracer = deps.tracer ?? getActiveRequestTracer();
-      const invokeTool = () => handleToolCall(toolName, rawArgs, scopes, principal, deps);
+      const invokeTool = () => handleToolCall(toolName, rawArgs, scopes, principal, deps, userId);
       const out = activeTracer
         ? await activeTracer.withSpan(
             'edgefetch.mcp.tool',
@@ -2097,6 +2255,7 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
   }
 
   const userAgent = request.headers.get('user-agent') ?? 'mcp-client';
+  const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
 
   if (Array.isArray(parsed)) {
     if (parsed.length === 0 || parsed.length > 20) {
@@ -2104,7 +2263,15 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
     }
     const replies: Array<Record<string, unknown>> = [];
     for (const item of parsed) {
-      const out = await dispatchRpcMessage((item ?? {}) as JsonRpcRequest, auth.scopes, auth.principal, userAgent, resolvedDeps, false);
+      const out = await dispatchRpcMessage(
+        (item ?? {}) as JsonRpcRequest,
+        auth.scopes,
+        auth.principal,
+        userAgent,
+        resolvedDeps,
+        false,
+        callerUserId,
+      );
       if (out) replies.push(out.body);
     }
     if (replies.length === 0) return new Response(null, { status: 202, headers: cors });
@@ -2139,7 +2306,7 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
     }
   }
 
-  const single = await dispatchRpcMessage(msg, auth.scopes, auth.principal, userAgent, resolvedDeps, era.isModern);
+  const single = await dispatchRpcMessage(msg, auth.scopes, auth.principal, userAgent, resolvedDeps, era.isModern, callerUserId);
   if (!single) {
     return new Response(null, { status: 202, headers: cors });
   }

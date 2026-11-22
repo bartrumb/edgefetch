@@ -15,8 +15,37 @@
 import type { HubEventRecord, McpClientActivity } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { MIN_TOKEN_LENGTH, SITE_ID_PATTERN, sameBytes } from './auth';
+import type { DevTelemetrySettingsView } from './dev-telemetry';
+import {
+  handleGitHubOAuthCallback,
+  isGitHubAuthConfigured,
+  resolveSessionSecret,
+  startGitHubOAuthFlow,
+  type GitHubAuthEnv,
+} from './github-auth';
+import { testAndListRemoteMcpTools } from './mcp-federation';
+import { discoverMcps, inferAssociatedDomains, isSafePublicHttpsUrl, slugifyMcpServerName } from './mcp-registry';
+import {
+  buildMaskedAuthSummary,
+  completeDownstreamMcpOAuthCallback,
+  MCP_OAUTH_BIND_COOKIE,
+  probeRemoteMcpOAuthMetadata,
+  resolveCallerUserId,
+  sanitizeSecretHeadersInput,
+  sealVaultCredentials,
+  startDownstreamMcpOAuth,
+  toPublicMcpServerSummary,
+  unsealVaultCredentials,
+  validateVaultMasterKey,
+  type McpVaultStore,
+  type PublicMcpServerSummary,
+  type StoredMcpServerRow,
+  type VaultSecretPayload,
+} from './mcp-vault';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
+import { stripInvisibleSmugglingChars } from './scrape';
+import type { UpdateCheckStatus } from './update-check';
 import {
   ADMIN_COOKIE_NAME,
   createAdminSessionValue,
@@ -27,8 +56,11 @@ import {
   isSameOriginFormPost,
   sha256Base64Url,
   verifyAdminSessionCookie,
+  type AdminPrincipal,
+  type HubUserRecord,
   type OAuthGrantSummary,
   type OAuthStore,
+  type UserRole,
 } from './oauth';
 
 const RATE_LIMIT_WINDOW_MS = 5 * 60_000;
@@ -71,21 +103,38 @@ export interface AdminPortalDeps {
   sampleUrl?: string;
   publicOrigin?: string;
   ownerSecret?: string;
+  githubAuthEnv?: GitHubAuthEnv;
+  metaDb?: D1Database;
+  vaultMasterKey?: string;
+  vaultStore?: McpVaultStore;
+  safePublicFetch?: typeof fetch;
+  selfHost?: string;
   oauthStore: OAuthStore;
   allowedTargets: FetchTarget[];
   defaultTarget: FetchTarget;
+  onEvent?: (ev: {
+    level: 'info' | 'warn' | 'error';
+    category: 'oauth';
+    event: string;
+    summary: string;
+    details?: Record<string, unknown>;
+  }) => Promise<void> | void;
   getState: () => Promise<{
     connected: number;
     distinctPublicIps?: number;
     agents: AgentAttachment[];
     affinities: AffinityPin[];
     grants: OAuthGrantSummary[];
+    users?: HubUserRecord[];
     mcpClients?: McpClientActivity[];
     events?: HubEventRecord[];
   }>;
   clearAffinities: (siteId?: string) => Promise<void>;
   clearEvents?: () => Promise<void>;
-  revokeGrant: (grantId: string) => Promise<boolean>;
+  revokeGrant: (grantId: string, userId?: string) => Promise<boolean>;
+  getUpdateStatus?: (agents: AgentAttachment[]) => Promise<UpdateCheckStatus>;
+  getTelemetrySettings?: () => Promise<DevTelemetrySettingsView>;
+  setTelemetryOptIn?: (enabled: boolean) => Promise<DevTelemetrySettingsView>;
   executeFetch: (params: {
     target: FetchTarget;
     site?: string;
@@ -93,8 +142,26 @@ export interface AdminPortalDeps {
   }) => Promise<{ status: number; via: string; bodyText: string }>;
 }
 
-function renderLoginHtml(serviceName: string, errorMsg?: string): string {
+function renderLoginHtml(
+  serviceName: string,
+  errorMsg?: string,
+  opts: { githubEnabled?: boolean; ownerTokenEnabled?: boolean } = {},
+): string {
   const err = errorMsg ? `<div class="err">${escapeHtml(errorMsg)}</div>` : '';
+  const githubEnabled = Boolean(opts.githubEnabled);
+  const ownerTokenEnabled = opts.ownerTokenEnabled !== false;
+  const ghBlock = githubEnabled
+    ? `<a class="gh-btn" href="/admin/auth/github"><svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>Sign in with GitHub</a>`
+    : '';
+  const divider = githubEnabled && ownerTokenEnabled ? `<div class="divider"><span>or use owner token</span></div>` : '';
+  const tokenForm = ownerTokenEnabled
+    ? `<form method="post" action="/admin/login">
+      <label for="token">Caller Token</label>
+      <input id="token" name="token" type="password" required${githubEnabled ? '' : ' autofocus'} autocomplete="current-password" placeholder="Paste bearer token...">
+      <button type="submit">Open Control Center</button>
+    </form>`
+    : '';
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -111,19 +178,25 @@ function renderLoginHtml(serviceName: string, errorMsg?: string): string {
     input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; margin-bottom: 16px; }
     button { width: 100%; padding: 10px 16px; border-radius: 8px; border: 1px solid #3b82f6; background: #2563eb; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
     button:hover { background: #1d4ed8; }
+    .gh-btn { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; box-sizing: border-box; padding: 10px 16px; border-radius: 8px; border: 1px solid #475569; background: #24292f; color: #fff; text-decoration: none; font-weight: 600; margin-bottom: 14px; }
+    .gh-btn:hover { background: #32383f; }
+    .divider { display: flex; align-items: center; gap: 10px; color: #94a3b8; font-size: 0.8rem; margin: 4px 0 14px; }
+    .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid #334155; }
     .err { background: #450a0a; border: 1px solid #dc2626; color: #fecaca; padding: 10px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 0.88rem; }
   </style>
 </head>
 <body>
   <main>
     <h1>${escapeHtml(serviceName)}</h1>
-    <p>Sign in with your hub caller token (<code>CALLER_TOKEN</code>) to view live crawl &amp; MCP logs, inspect remote sites, and manage OAuth grants.</p>
+    <p>${
+      githubEnabled
+        ? 'Sign in with GitHub or your hub caller token (<code>CALLER_TOKEN</code>) to manage MCP OAuth grants and view hub telemetry.'
+        : 'Sign in with your hub caller token (<code>CALLER_TOKEN</code>) to view live crawl &amp; MCP logs, inspect remote sites, and manage OAuth grants.'
+    }</p>
     ${err}
-    <form method="post" action="/admin/login">
-      <label for="token">Caller Token</label>
-      <input id="token" name="token" type="password" required autofocus autocomplete="current-password" placeholder="Paste bearer token...">
-      <button type="submit">Open Control Center</button>
-    </form>
+    ${ghBlock}
+    ${divider}
+    ${tokenForm}
   </main>
 </body>
 </html>`;
@@ -135,6 +208,7 @@ function renderDashboardHtml(params: {
   sampleUrl: string;
   origin: string;
   csrf: string;
+  principal?: Pick<AdminPrincipal, 'userId' | 'role' | 'githubLogin'>;
   allowedTargets: FetchTarget[];
   defaultTarget: FetchTarget;
 }): string {
@@ -162,8 +236,10 @@ function renderDashboardHtml(params: {
     * { box-sizing: border-box; }
     body { font: 14px/1.5 system-ui, -apple-system, sans-serif; margin: 0; background: #0b1120; color: #e2e8f0; }
     header { background: #111827; border-bottom: 1px solid #1f2937; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-    header h1 { font-size: 1.1rem; margin: 0; display: flex; align-items: center; gap: 10px; color: #f8fafc; }
-    .pill { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #064e3b; color: #6ee7b7; border: 1px solid #059669; font-weight: 600; }
+    header h1 { font-size: 1.1rem; margin: 0; display: flex; align-items: center; gap: 10px; color: #f8fafc; flex-wrap: wrap; }
+    .pill { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #064e3b; color: #6ee7b7; border: 1px solid #059669; font-weight: 600; text-decoration: none; }
+    .pill-warn { background: #78350f; color: #fde68a; border-color: #d97706; }
+    .pill-muted { background: #1e293b; color: #94a3b8; border-color: #475569; }
     .wrap { max-width: 1240px; margin: 0 auto; padding: 20px; display: grid; gap: 18px; }
     .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
     .kpi { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px 16px; }
@@ -213,7 +289,7 @@ function renderDashboardHtml(params: {
     .log-row.open .log-detail { display: block; }
     .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 10px; }
     label { display: block; font-size: 0.78rem; font-weight: 600; color: #cbd5e1; margin-bottom: 4px; }
-    input[type="text"], input[type="url"], input[type="number"], select { width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; }
+    input[type="text"], input[type="url"], input[type="number"], input[type="password"], select { width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; }
     table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
     th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid #334155; }
     th { color: #94a3b8; font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .03em; }
@@ -229,8 +305,9 @@ function renderDashboardHtml(params: {
 </head>
 <body>
   <header>
-    <h1>${escapeHtml(params.serviceName)} <span class="pill" id="conn-pill">Loading...</span></h1>
+    <h1>${escapeHtml(params.serviceName)} <span class="pill" id="conn-pill">Loading...</span> <a class="pill" id="update-pill" href="https://github.com/bartrumb/edgefetch/releases" target="_blank" rel="noopener noreferrer" style="display:none"></a></h1>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span class="chip" id="viewer-pill">${escapeHtml(params.principal?.githubLogin ? `@${params.principal.githubLogin} (${params.principal.role})` : `${params.principal?.userId ?? 'owner'} (${params.principal?.role ?? 'owner'})`)}</span>
       <span class="chip" title="Cloudflare Content Signals in robots.txt">Content Signals: honored (ai-input)</span>
       <span class="muted" id="last-poll">Live (15s)</span>
       <button type="button" id="refresh-btn">Refresh</button>
@@ -406,6 +483,113 @@ function renderDashboardHtml(params: {
       </section>
     </div>
 
+    <section class="card" id="mcp-connectors">
+      <h2>
+        <span>MCP Registry &amp; Encrypted Connectors (<span id="mcp-conn-count">0</span> connected)</span>
+        <span style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="pill" id="vault-status-pill" title="AES-256-GCM HKDF Vault Status">AES-256-GCM Vault</span>
+          <button type="button" class="primary" id="custom-mcp-btn" style="padding:4px 11px;font-size:0.78rem">+ Connect Custom HTTPS MCP</button>
+        </span>
+      </h2>
+      <p class="muted" style="margin:0 0 12px">Connect downstream Streamable HTTP / SSE MCP servers once in your per-user <code>AES-256-GCM</code> vault. EdgeFetch routes matching domains and <code>query_mcp</code> calls agent-to-agent with zero prompt schema bloat.</p>
+
+      <div style="margin-bottom:14px">
+        <table>
+          <thead><tr><th>Connector</th><th>Auth Vault</th><th>Domains</th><th>Tools</th><th>Verified</th><th>Actions</th></tr></thead>
+          <tbody id="mcp-conn-tbody"><tr><td colspan="6" class="muted">No downstream MCP connectors configured yet. Search the Registry below to add auth.</td></tr></tbody>
+        </table>
+      </div>
+
+      <div id="mcp-connect-panel" style="display:none;margin-bottom:16px;padding:16px;background:#0f172a;border:1px solid #3b82f6;border-radius:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px">
+          <strong id="mcp-form-title" style="color:#f8fafc">Connect Remote MCP Server</strong>
+          <button type="button" id="mcp-form-close-btn" style="padding:3px 9px;font-size:0.76rem">Close</button>
+        </div>
+        <div id="mcp-oauth-banner" style="display:none;margin-bottom:12px;padding:10px 12px;background:#064e3b;border:1px solid #059669;border-radius:8px;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+          <span style="font-size:0.83rem;color:#ecfdf5">OAuth 2.1 PKCE metadata detected on this remote MCP endpoint!</span>
+          <button type="button" class="primary" id="mcp-oauth-start-btn">1-Click Connect with OAuth 2.1 (PKCE)</button>
+        </div>
+        <form id="mcp-connect-form">
+          <div class="form-grid">
+            <div>
+              <label for="mc-name">Display Name</label>
+              <input id="mc-name" type="text" required placeholder="Linear MCP">
+            </div>
+            <div>
+              <label for="mc-slug">Connector Slug</label>
+              <input id="mc-slug" type="text" required placeholder="linear">
+            </div>
+            <div>
+              <label for="mc-transport">Transport</label>
+              <select id="mc-transport">
+                <option value="streamable-http" selected>streamable-http (JSON-RPC / SSE)</option>
+                <option value="sse">sse</option>
+              </select>
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <label for="mc-url">Remote HTTPS MCP Endpoint URL (port 443)</label>
+            <input id="mc-url" type="url" required placeholder="https://mcp.linear.app/mcp">
+          </div>
+          <div style="margin-top:10px">
+            <label for="mc-domains">Associated Domains (comma-separated, routed MCP-first in /v1/agent)</label>
+            <input id="mc-domains" type="text" placeholder="linear.app">
+          </div>
+          <div id="mc-manifest-headers" style="margin-top:10px"></div>
+          <div class="form-grid" style="margin-top:10px">
+            <div>
+              <label for="mc-bearer">Bearer Token (write-only, optional)</label>
+              <input id="mc-bearer" type="password" autocomplete="new-password" placeholder="Paste API / OAuth token...">
+            </div>
+            <div>
+              <label for="mc-hdr-name">Custom Header Name (optional)</label>
+              <input id="mc-hdr-name" type="text" placeholder="X-Api-Key">
+            </div>
+            <div>
+              <label for="mc-hdr-val">Custom Header Secret (write-only)</label>
+              <input id="mc-hdr-val" type="password" autocomplete="new-password" placeholder="Paste header secret...">
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px">
+            <button type="button" id="mc-test-btn">Test Connection (tools/list)</button>
+            <button type="submit" class="primary" id="mc-save-btn">Save to Encrypted Vault</button>
+            <span id="mc-status" class="muted"></span>
+          </div>
+        </form>
+        <pre class="out" id="mc-test-out" style="display:none"></pre>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+        <input id="mcp-reg-q" type="text" placeholder="Search Official MCP Registry + Glama (e.g. linear, notion, github, sentry, stripe)..." style="flex:1;min-width:240px">
+        <label style="display:inline-flex;align-items:center;gap:6px;margin:0;font-size:0.82rem"><input id="mcp-reg-remote" type="checkbox" checked> Remote HTTP/SSE only</label>
+        <button type="button" class="primary" id="mcp-reg-search-btn">Search Registry</button>
+      </div>
+      <div id="mcp-reg-grid" class="grid-3"><div class="muted">Click "Search Registry" to browse live remote MCP connectors from registry.modelcontextprotocol.io and glama.ai.</div></div>
+    </section>
+
+    <section class="card">
+      <h2>
+        <span>Auto-Updates &amp; Opt-In Dev Error Telemetry</span>
+        <span style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="badge cat" id="telemetry-status-badge">OFF by default</span>
+          <button type="button" id="telemetry-toggle-btn" style="padding:5px 12px;font-size:0.78rem">Enable Opt-In Error Telemetry</button>
+        </span>
+      </h2>
+      <p class="muted" style="margin:0 0 8px" id="telemetry-desc">Unattended default is <strong>0 outbound telemetry</strong> (<code>DO_NOT_TRACK=1</code> acts as a hard disable override). When opted in, shares <strong>only</strong> structural adapter &amp; WAF error codes to help fix broken site extractors — <strong>zero URLs, zero hostnames, zero paths, zero content, zero tokens</strong>.</p>
+      <div class="chips" style="margin-top:6px">
+        <code class="chip">schemaVersion: 1</code>
+        <code class="chip">version</code>
+        <code class="chip">runtime</code>
+        <code class="chip">os / arch</code>
+        <code class="chip">spanName</code>
+        <code class="chip">adapterId</code>
+        <code class="chip">wafVendor</code>
+        <code class="chip">httpStatus</code>
+        <code class="chip">errorClass</code>
+      </div>
+      <div class="muted" id="update-fleet-hint" style="margin-top:8px;display:none"></div>
+    </section>
+
     <section class="card">
       <h2><span>Cloudflare Workers Observability — Single Pane of Glass Filters</span></h2>
       <p class="muted" style="margin:0">Open <strong>Cloudflare Dashboard -&gt; Workers &amp; Pages -&gt; Observability (Traces &amp; Logs)</strong> for long-term retention &amp; OTel waterfall traces:</p>
@@ -490,6 +674,67 @@ function renderDashboardHtml(params: {
       el('last-poll').textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour12: false });
       el('site-count').textContent = data.connected;
       el('conn-pill').textContent = data.connected + ' site' + (data.connected === 1 ? '' : 's') + ' online';
+
+      const upd = data.updateStatus;
+      const updPill = el('update-pill');
+      const updHint = el('update-fleet-hint');
+      if (upd && upd.pillLabel) {
+        updPill.style.display = 'inline-block';
+        updPill.textContent = upd.pillLabel;
+        updPill.href = upd.releaseUrl || 'https://github.com/bartrumb/edgefetch/releases';
+        updPill.className =
+          upd.pillStatus === 'update_available'
+            ? 'pill pill-warn'
+            : upd.pillStatus === 'up_to_date'
+              ? 'pill'
+              : 'pill pill-muted';
+        const outdatedNodes = Array.isArray(upd.outdatedAgents) ? upd.outdatedAgents : [];
+        if (upd.pillStatus === 'update_available') {
+          const parts = [];
+          if (upd.hubUpdateAvailable) parts.push('Hub ' + upd.currentVersion + ' -> ' + (upd.latestTag || upd.latestVersion));
+          if (outdatedNodes.length) {
+            parts.push('Run edgefetch update on: ' + outdatedNodes.map((n) => n.siteId + ' (' + n.version + ')').join(', '));
+          }
+          updPill.title = parts.join(' · ') || 'Signed GitHub Release available';
+          if (updHint) {
+            updHint.style.display = 'block';
+            updHint.textContent = parts.join(' · ');
+          }
+        } else {
+          updPill.title = 'Signed GitHub Release verified (' + (upd.currentVersion || '') + ')';
+          if (updHint) updHint.style.display = 'none';
+        }
+      } else {
+        updPill.style.display = 'none';
+        if (updHint) updHint.style.display = 'none';
+      }
+
+      const tel = data.devTelemetry;
+      const telBadge = el('telemetry-status-badge');
+      const telBtn = el('telemetry-toggle-btn');
+      if (tel && telBadge && telBtn) {
+        if (tel.doNotTrack) {
+          telBadge.className = 'badge lvl-warn';
+          telBadge.textContent = 'LOCKED OFF (DO_NOT_TRACK=1)';
+          telBtn.disabled = true;
+          telBtn.className = '';
+          telBtn.textContent = 'Disabled by DO_NOT_TRACK=1';
+        } else if (tel.enabled) {
+          telBadge.className = 'badge lvl-info';
+          telBadge.textContent = 'ON (' + (tel.source === 'env' ? 'ENV OPT-IN' : 'ADMIN OPT-IN') + ')';
+          telBtn.disabled = false;
+          telBtn.className = '';
+          telBtn.textContent = 'Disable Dev Error Telemetry';
+          telBtn.setAttribute('data-next-enabled', 'false');
+        } else {
+          telBadge.className = 'badge cat';
+          telBadge.textContent = 'OFF (' + (tel.source === 'admin_opt_out' ? 'OPTED OUT' : 'DEFAULT 0 TELEMETRY') + ')';
+          telBtn.disabled = false;
+          telBtn.className = 'primary';
+          telBtn.textContent = 'Enable Opt-In Error Telemetry';
+          telBtn.setAttribute('data-next-enabled', 'true');
+        }
+      }
 
       const totalOk = agents.reduce((s, a) => s + Number(a.jobsOk || 0), 0);
       const totalErr = agents.reduce((s, a) => s + Number(a.jobsErr || 0), 0);
@@ -580,13 +825,258 @@ function renderDashboardHtml(params: {
 
       el('grants-tbody').innerHTML = grants.length
         ? grants.map((g) =>
-            '<tr><td><strong>' + esc(g.clientName) + '</strong></td><td><code>' + esc(g.scopes.join(' ')) + '</code></td><td>' + esc(relTime(g.expiresAt)) + '</td>' +
+            '<tr><td><strong>' + esc(g.clientName) + '</strong>' + (g.userId ? ' <span class="muted">(' + esc(g.userId) + ')</span>' : '') + '</td><td><code>' + esc(g.scopes.join(' ')) + '</code></td><td>' + esc(relTime(g.expiresAt)) + '</td>' +
             '<td><button type="button" class="danger" data-revoke="' + esc(g.grantId) + '">Revoke</button></td></tr>'
           ).join('')
         : '<tr><td colspan="4" class="muted">No OAuth 2.1 grants issued yet</td></tr>';
 
+      renderMcpConnectors(data.mcpServers || [], Boolean(data.vaultConfigured));
       renderLogs();
     }
+
+    let lastRegistryResults = [];
+    let currentManifestHeaders = [];
+
+    function renderMcpConnectors(servers, vaultConfigured) {
+      el('mcp-conn-count').textContent = servers.length;
+      const pill = el('vault-status-pill');
+      pill.textContent = vaultConfigured ? 'AES-256-GCM Ready' : 'VAULT_MASTER_KEY Unset';
+      pill.style.background = vaultConfigured ? '#064e3b' : '#78350f';
+      pill.style.borderColor = vaultConfigured ? '#059669' : '#d97706';
+      pill.style.color = vaultConfigured ? '#6ee7b7' : '#fde68a';
+
+      const tbody = el('mcp-conn-tbody');
+      if (!servers.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">No downstream MCP connectors configured yet. Search the Registry below to add auth.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = servers.map((s) => {
+        const badge = s.authSummary?.maskedBadge || s.authType;
+        const doms = (s.domains || []).map((d) => '<code>' + esc(d) + '</code>').join(', ') || '—';
+        return '<tr>' +
+          '<td><strong>' + esc(s.name) + '</strong><div class="muted"><code>' + esc(s.slug) + '</code> &middot; ' + esc(s.remoteOrigin) + '</div></td>' +
+          '<td><span class="badge lvl-info">' + esc(badge) + '</span></td>' +
+          '<td>' + doms + '</td>' +
+          '<td><strong>' + Number(s.toolCount || 0) + '</strong> tools</td>' +
+          '<td>' + esc(s.lastVerifiedAt ? relTime(s.lastVerifiedAt) : 'unverified') + '</td>' +
+          '<td style="display:flex;gap:6px;flex-wrap:wrap">' +
+            '<button type="button" data-mcp-retest="' + esc(s.slug) + '" style="padding:4px 8px;font-size:0.75rem">Test tools/list</button>' +
+            '<button type="button" data-mcp-rotate="' + esc(s.slug) + '" style="padding:4px 8px;font-size:0.75rem">Rotate Auth</button>' +
+            '<button type="button" class="danger" data-mcp-disconnect="' + esc(s.slug) + '">Disconnect</button>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    function openConnectPanel(opts) {
+      el('mcp-connect-panel').style.display = 'block';
+      el('mcp-form-title').textContent = opts.rotate ? ('Rotate Auth — ' + (opts.title || opts.slug)) : ('Connect / Add Auth — ' + (opts.title || 'Custom HTTPS MCP'));
+      el('mc-name').value = opts.title || '';
+      el('mc-slug').value = opts.slug || '';
+      el('mc-url').value = opts.remoteUrl || '';
+      el('mc-transport').value = opts.transport || 'streamable-http';
+      el('mc-domains').value = (opts.domains || []).join(', ');
+      el('mc-bearer').value = '';
+      el('mc-hdr-name').value = '';
+      el('mc-hdr-val').value = '';
+      el('mc-status').textContent = '';
+      el('mc-test-out').style.display = 'none';
+      el('mcp-oauth-banner').style.display = 'none';
+
+      currentManifestHeaders = Array.isArray(opts.headers) ? opts.headers : [];
+      const container = el('mc-manifest-headers');
+      if (currentManifestHeaders.length) {
+        container.innerHTML = '<div class="muted" style="margin-bottom:6px">Manifest-required authentication headers (write-only):</div>' +
+          '<div class="form-grid">' +
+          currentManifestHeaders.map((h, i) =>
+            '<div><label>' + esc(h.name) + (h.isRequired ? ' *' : '') + '</label>' +
+            '<input type="' + (h.isSecret === false ? 'text' : 'password') + '" data-manifest-hdr="' + i + '" autocomplete="new-password" placeholder="' + esc(h.placeholder || h.description || h.name) + '">' +
+            '</div>'
+          ).join('') + '</div>';
+      } else {
+        container.innerHTML = '';
+      }
+
+      if (opts.remoteUrl) {
+        fetch('/admin/api/mcp/probe', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+          body: JSON.stringify({ remoteUrl: opts.remoteUrl }),
+        }).then((r) => r.json()).then((probe) => {
+          if (probe && probe.supported) {
+            el('mcp-oauth-banner').style.display = 'flex';
+          }
+        }).catch(() => {});
+      }
+    }
+
+    function collectSecretHeadersFromForm() {
+      const headers = {};
+      document.querySelectorAll('[data-manifest-hdr]').forEach((inp) => {
+        const idx = Number(inp.getAttribute('data-manifest-hdr'));
+        const spec = currentManifestHeaders[idx];
+        if (spec && inp.value.trim()) headers[spec.name] = inp.value.trim();
+      });
+      const customName = el('mc-hdr-name').value.trim();
+      const customVal = el('mc-hdr-val').value.trim();
+      if (customName && customVal) headers[customName] = customVal;
+      return headers;
+    }
+
+    el('custom-mcp-btn').addEventListener('click', () => openConnectPanel({}));
+    el('mcp-form-close-btn').addEventListener('click', () => { el('mcp-connect-panel').style.display = 'none'; });
+
+    el('mcp-oauth-start-btn').addEventListener('click', async () => {
+      el('mc-status').textContent = 'Starting OAuth 2.1 PKCE...';
+      const res = await fetch('/admin/mcp/oauth/start', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+        body: JSON.stringify({
+          remoteUrl: el('mc-url').value.trim(),
+          slug: el('mc-slug').value.trim(),
+          name: el('mc-name').value.trim(),
+          transport: el('mc-transport').value,
+          domains: el('mc-domains').value.split(',').map((s) => s.trim()).filter(Boolean),
+        }),
+      });
+      const out = await res.json();
+      if (out.ok && out.authorizationUrl) {
+        location.href = out.authorizationUrl;
+      } else {
+        el('mc-status').textContent = out.message || out.error || 'OAuth start failed';
+      }
+    });
+
+    el('mc-test-btn').addEventListener('click', async () => {
+      el('mc-status').textContent = 'Testing initialize + tools/list...';
+      const res = await fetch('/admin/api/mcp/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+        body: JSON.stringify({
+          remoteUrl: el('mc-url').value.trim(),
+          transport: el('mc-transport').value,
+          bearerToken: el('mc-bearer').value.trim() || undefined,
+          headers: collectSecretHeadersFromForm(),
+        }),
+      });
+      const out = await res.json();
+      el('mc-test-out').style.display = 'block';
+      el('mc-test-out').textContent = JSON.stringify(out, null, 2);
+      el('mc-status').textContent = out.ok ? ('Verified ' + out.toolCount + ' tools!') : ('Error: ' + (out.message || out.error));
+    });
+
+    el('mcp-connect-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      el('mc-status').textContent = 'Encrypting & verifying...';
+      const res = await fetch('/admin/api/mcp/connect', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+        body: JSON.stringify({
+          name: el('mc-name').value.trim(),
+          slug: el('mc-slug').value.trim(),
+          remoteUrl: el('mc-url').value.trim(),
+          transport: el('mc-transport').value,
+          domains: el('mc-domains').value.split(',').map((s) => s.trim()).filter(Boolean),
+          bearerToken: el('mc-bearer').value.trim() || undefined,
+          headers: collectSecretHeadersFromForm(),
+        }),
+      });
+      const out = await res.json();
+      if (out.ok) {
+        el('mc-bearer').value = '';
+        el('mc-hdr-val').value = '';
+        el('mcp-connect-panel').style.display = 'none';
+        await loadState();
+      } else {
+        el('mc-status').textContent = out.message || out.error || 'Failed to save connector';
+      }
+    });
+
+    el('mcp-conn-tbody').addEventListener('click', async (ev) => {
+      const disc = ev.target.closest('[data-mcp-disconnect]');
+      if (disc) {
+        await fetch('/admin/api/mcp/disconnect', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+          body: JSON.stringify({ slug: disc.getAttribute('data-mcp-disconnect') }),
+        });
+        await loadState();
+        return;
+      }
+      const retest = ev.target.closest('[data-mcp-retest]');
+      if (retest) {
+        await fetch('/admin/api/mcp/test', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+          body: JSON.stringify({ slug: retest.getAttribute('data-mcp-retest') }),
+        });
+        await loadState();
+        return;
+      }
+      const rot = ev.target.closest('[data-mcp-rotate]');
+      if (rot) {
+        const slug = rot.getAttribute('data-mcp-rotate');
+        const srv = (lastStateData?.mcpServers || []).find((s) => s.slug === slug);
+        if (srv) {
+          openConnectPanel({
+            rotate: true,
+            title: srv.name,
+            slug: srv.slug,
+            remoteUrl: srv.remoteUrl,
+            transport: srv.transport,
+            domains: srv.domains,
+          });
+        }
+      }
+    });
+
+    async function searchMcpRegistry() {
+      const q = el('mcp-reg-q').value.trim();
+      const remOnly = el('mcp-reg-remote').checked;
+      const grid = el('mcp-reg-grid');
+      grid.innerHTML = '<div class="muted">Searching Official MCP Registry &amp; Glama...</div>';
+      const res = await fetch('/admin/api/mcp/registry?q=' + encodeURIComponent(q) + '&remoteOnly=' + (remOnly ? 'true' : 'false'));
+      const out = await res.json();
+      lastRegistryResults = out.servers || [];
+      if (!lastRegistryResults.length) {
+        grid.innerHTML = '<div class="muted">' + esc(out.error ? ('Registry error: ' + out.error) : 'No matching MCP servers found.') + '</div>';
+        return;
+      }
+      grid.innerHTML = lastRegistryResults.map((srv, idx) => {
+        const rem = (srv.remotes || [])[0];
+        const srcBadges = (srv.sources || []).map((s) => '<span class="arch">' + esc(s) + '</span>').join(' ');
+        const domText = (srv.domains || []).slice(0, 3).join(', ') || 'general';
+        return '<div class="site-card">' +
+          '<div class="site-top"><span class="site-name">' + esc(srv.title || srv.name) + '</span><span>' + srcBadges + '</span></div>' +
+          '<div class="muted" style="margin-bottom:8px;font-size:0.8rem">' + esc((srv.description || '').slice(0, 140)) + '</div>' +
+          '<div class="kv"><span>Domains</span><strong><code>' + esc(domText) + '</code></strong></div>' +
+          '<div class="kv"><span>Transport</span><strong>' + esc(rem ? rem.type : 'local-package') + '</strong></div>' +
+          '<div style="margin-top:10px;display:flex;justify-content:flex-end">' +
+            (rem
+              ? '<button type="button" class="primary" data-reg-connect="' + idx + '" style="padding:4px 10px;font-size:0.76rem">Connect / Add Auth</button>'
+              : '<span class="muted" style="font-size:0.75rem">Stdio package only</span>') +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    el('mcp-reg-search-btn').addEventListener('click', searchMcpRegistry);
+    el('mcp-reg-q').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); searchMcpRegistry(); } });
+    el('mcp-reg-grid').addEventListener('click', (ev) => {
+      const btn = ev.target.closest('[data-reg-connect]');
+      if (!btn) return;
+      const srv = lastRegistryResults[Number(btn.getAttribute('data-reg-connect'))];
+      if (!srv) return;
+      const rem = (srv.remotes || [])[0];
+      openConnectPanel({
+        title: srv.title || srv.name,
+        slug: srv.slug,
+        remoteUrl: rem ? rem.url : '',
+        transport: rem ? rem.type : 'streamable-http',
+        domains: srv.domains || [],
+        headers: rem ? rem.headers : [],
+      });
+    });
 
     async function loadState() {
       const res = await fetch('/admin/api/state', { headers: { 'accept': 'application/json' } });
@@ -633,6 +1123,23 @@ function renderDashboardHtml(params: {
     });
 
     el('refresh-btn').addEventListener('click', loadState);
+
+    el('telemetry-toggle-btn').addEventListener('click', async () => {
+      const btn = el('telemetry-toggle-btn');
+      if (btn.disabled) return;
+      const nextEnabled = btn.getAttribute('data-next-enabled') === 'true';
+      btn.disabled = true;
+      try {
+        await fetch('/admin/api/telemetry', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+          body: JSON.stringify({ enabled: nextEnabled }),
+        });
+        await loadState();
+      } finally {
+        btn.disabled = false;
+      }
+    });
 
     el('clear-affinity-btn').addEventListener('click', async () => {
       await fetch('/admin/api/affinity/clear', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF }, body: '{}' });
@@ -765,12 +1272,37 @@ const NOOP_ADMIN_AUDIT_SPAN: AdminAuditSpan = {
 };
 
 async function withAdminAuditSpan<T>(
-  op: 'login' | 'logout' | 'events_clear' | 'affinity_clear' | 'grant_revoke' | 'fetch',
+  op:
+    | 'login'
+    | 'logout'
+    | 'github_login'
+    | 'github_callback'
+    | 'events_clear'
+    | 'affinity_clear'
+    | 'grant_revoke'
+    | 'user_role'
+    | 'telemetry_toggle'
+    | 'fetch'
+    | 'mcp_connect'
+    | 'mcp_disconnect'
+    | 'mcp_test'
+    | 'mcp_oauth',
   fn: (span: AdminAuditSpan) => Promise<T>,
 ): Promise<T> {
   const tracer = getActiveRequestTracer();
   if (!tracer) return fn(NOOP_ADMIN_AUDIT_SPAN);
   return tracer.withSpan(`edgefetch.admin.${op}`, { kind: 1, attributes: { 'admin.op': op } }, (span) => fn(span));
+}
+
+function readCookieFromHeader(cookieHeader: string | null, targetName: string): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const k = part.slice(0, eq).trim();
+    if (k === targetName) return part.slice(eq + 1).trim();
+  }
+  return null;
 }
 
 export async function handleAdminRoute(request: Request, url: URL, deps: AdminPortalDeps): Promise<Response | null> {
@@ -779,13 +1311,65 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   const isSecure = isEffectiveHttpsOrigin(url, deps.publicOrigin);
   const ownerSecret = deps.ownerSecret;
-  if (!ownerSecret || ownerSecret.length < MIN_TOKEN_LENGTH) {
+  const hasOwnerSecret = Boolean(ownerSecret && ownerSecret.length >= MIN_TOKEN_LENGTH);
+  const ghEnv: GitHubAuthEnv = {
+    ...(deps.githubAuthEnv ?? {}),
+    ...(ownerSecret ? { CALLER_TOKEN: ownerSecret } : {}),
+  };
+  const githubEnabled = isGitHubAuthConfigured(ghEnv);
+  const signingSecret = resolveSessionSecret(ghEnv) ?? (hasOwnerSecret ? ownerSecret : undefined);
+
+  if (path === '/admin/auth/github' && request.method === 'GET') {
+    return withAdminAuditSpan('github_login', async (span) => {
+      const started = await startGitHubOAuthFlow({
+        request,
+        url,
+        env: ghEnv,
+        publicOrigin: deps.publicOrigin,
+      });
+      span.setAttributes({
+        'admin.outcome': started.outcome,
+        'http.response.status_code': started.response.status,
+      });
+      if (started.response.status >= 400) {
+        span.setStatus(false, started.outcome);
+      }
+      return started.response;
+    });
+  }
+
+  if (path === '/admin/auth/github/callback' && request.method === 'GET') {
+    return withAdminAuditSpan('github_callback', async (span) => {
+      const cb = await handleGitHubOAuthCallback({
+        request,
+        url,
+        env: ghEnv,
+        oauthStore: deps.oauthStore,
+        ...(deps.metaDb ? { metaDb: deps.metaDb } : {}),
+        serviceName: deps.serviceName,
+        publicOrigin: deps.publicOrigin,
+        ...(deps.onEvent ? { onEvent: deps.onEvent } : {}),
+      });
+      span.setAttributes({
+        'admin.outcome': cb.outcome,
+        ...(cb.userId ? { 'admin.user_id': cb.userId } : {}),
+        ...(cb.role ? { 'admin.role': cb.role } : {}),
+        'http.response.status_code': cb.response.status,
+      });
+      if (cb.response.status >= 400) {
+        span.setStatus(false, cb.outcome);
+      }
+      return cb.response;
+    });
+  }
+
+  if (!signingSecret) {
     return adminJson({ error: 'owner_secret_unconfigured' }, 503);
   }
 
   const nowMs = Date.now();
-  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), ownerSecret, nowMs);
-  if (session.ok && (await isAdminSessionRevoked(deps.oauthStore, session.csrf, nowMs))) {
+  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), signingSecret, nowMs);
+  if (session.ok && (await isAdminSessionRevoked(deps.oauthStore, session.csrf, nowMs, session.jti))) {
     session = { ok: false };
   }
 
@@ -795,7 +1379,10 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   if (path === '/admin' && request.method === 'GET') {
     if (!session.ok) {
-      return new Response(renderLoginHtml(deps.serviceName), { status: 200, headers: ADMIN_HTML_HEADERS });
+      return new Response(
+        renderLoginHtml(deps.serviceName, undefined, { githubEnabled, ownerTokenEnabled: hasOwnerSecret }),
+        { status: 200, headers: ADMIN_HTML_HEADERS },
+      );
     }
     return new Response(
       renderDashboardHtml({
@@ -804,6 +1391,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         sampleUrl: deps.sampleUrl ?? 'https://example.com/',
         origin: url.origin,
         csrf: session.csrf,
+        principal: {
+          userId: session.userId,
+          role: session.role,
+          ...(session.githubLogin ? { githubLogin: session.githubLogin } : {}),
+        },
         allowedTargets: deps.allowedTargets,
         defaultTarget: deps.defaultTarget,
       }),
@@ -813,16 +1405,30 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   if (path === '/admin/login' && request.method === 'POST') {
     return withAdminAuditSpan('login', async (span) => {
+      if (!hasOwnerSecret || !ownerSecret) {
+        span.setAttributes({ 'admin.outcome': 'owner_token_disabled', 'http.response.status_code': 403 });
+        span.setStatus(false, 'owner_token_disabled');
+        return new Response(
+          renderLoginHtml(deps.serviceName, 'Caller token login is disabled; sign in with GitHub.', {
+            githubEnabled,
+            ownerTokenEnabled: false,
+          }),
+          { status: 403, headers: ADMIN_HTML_HEADERS },
+        );
+      }
       const now = Date.now();
       const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
       const cappedForm = await readBodyTextCapped(request, 8_192);
       if (!cappedForm.ok) {
         span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': 413 });
         span.setStatus(false, 'payload_too_large');
-        return new Response(renderLoginHtml(deps.serviceName, 'Login payload too large.'), {
-          status: 413,
-          headers: ADMIN_HTML_HEADERS,
-        });
+        return new Response(
+          renderLoginHtml(deps.serviceName, 'Login payload too large.', { githubEnabled, ownerTokenEnabled: hasOwnerSecret }),
+          {
+            status: 413,
+            headers: ADMIN_HTML_HEADERS,
+          },
+        );
       }
       const supplied = (new URLSearchParams(cappedForm.text).get('token') ?? '').trim();
       // `R3-M4`: Verify constant-time `CALLER_TOKEN` match FIRST so an attacker spoofing `X-Forwarded-For` or sharing a
@@ -832,36 +1438,51 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!preLock.allowed) {
           span.setAttributes({ 'admin.outcome': 'rate_limited', 'http.response.status_code': 429 });
           span.setStatus(false, 'rate_limited');
-          return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
-            status: 429,
-            headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
-          });
+          return new Response(
+            renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.', {
+              githubEnabled,
+              ownerTokenEnabled: hasOwnerSecret,
+            }),
+            {
+              status: 429,
+              headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+            },
+          );
         }
         const rl = await deps.oauthStore.recordAuthFailure(`admin:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
         if (!rl.allowed) {
           span.setAttributes({ 'admin.outcome': 'rate_limited', 'http.response.status_code': 429 });
           span.setStatus(false, 'rate_limited');
-          return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
-            status: 429,
-            headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(rl.retryAfterSec) },
-          });
+          return new Response(
+            renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.', {
+              githubEnabled,
+              ownerTokenEnabled: hasOwnerSecret,
+            }),
+            {
+              status: 429,
+              headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(rl.retryAfterSec) },
+            },
+          );
         }
         span.setAttributes({ 'admin.outcome': 'unauthorized', 'http.response.status_code': 401 });
         span.setStatus(false, 'unauthorized');
-        return new Response(renderLoginHtml(deps.serviceName, 'Invalid caller token.'), {
-          status: 401,
-          headers: ADMIN_HTML_HEADERS,
-        });
+        return new Response(
+          renderLoginHtml(deps.serviceName, 'Invalid caller token.', { githubEnabled, ownerTokenEnabled: hasOwnerSecret }),
+          {
+            status: 401,
+            headers: ADMIN_HTML_HEADERS,
+          },
+        );
       }
 
       await deps.oauthStore.clearAuthFailures(`admin:${clientIp}`);
-      const minted = await createAdminSessionValue(ownerSecret);
+      const minted = await createAdminSessionValue(signingSecret);
       const headers = new Headers({
         location: '/admin',
         ...ADMIN_JSON_HEADERS,
       });
       headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, minted.value, { maxAge: minted.maxAgeSec, path: '/', sameSite: 'Lax', secure: isSecure }));
-      span.setAttributes({ 'admin.outcome': 'authenticated', 'http.response.status_code': 302 });
+      span.setAttributes({ 'admin.outcome': 'authenticated', 'admin.user_id': 'owner', 'http.response.status_code': 302 });
       return new Response(null, { status: 302, headers });
     });
   }
@@ -875,17 +1496,26 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         span.setStatus(false, 'invalid_csrf');
         return adminJson({ error: 'invalid_csrf' }, 403);
       }
-      // Server-side revocation of this exact admin session cookie (`Low`): store SHA-256 hash so raw CSRF token is never stored in cleartext!
+      // Server-side revocation of this exact admin session cookie (`Low`): revoke both `csrf` AND JWT `jti`!
       if (typeof deps.oauthStore.recordAuthFailure === 'function') {
+        const nowRevoke = Date.now();
         const csrfHash = await sha256Base64Url(session.csrf);
-        await deps.oauthStore.recordAuthFailure(`revoked_admin:${csrfHash}`, Date.now(), 8 * 60 * 60_000, 1);
+        await deps.oauthStore.recordAuthFailure(`revoked_admin:${csrfHash}`, nowRevoke, 8 * 60 * 60_000, 1);
+        if (session.jti) {
+          const jtiHash = await sha256Base64Url(session.jti);
+          await deps.oauthStore.recordAuthFailure(`revoked_admin:jti:${jtiHash}`, nowRevoke, 8 * 60 * 60_000, 1);
+        }
       }
       const headers = new Headers({
         location: '/admin',
         ...ADMIN_JSON_HEADERS,
       });
       headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: isSecure }));
-      span.setAttributes({ 'admin.outcome': 'logged_out', 'http.response.status_code': 302 });
+      span.setAttributes({
+        'admin.outcome': 'logged_out',
+        'admin.user_id': session.userId,
+        'http.response.status_code': 302,
+      });
       return new Response(null, { status: 302, headers });
     });
   }
@@ -898,9 +1528,21 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           ? ('affinity_clear' as const)
           : path === '/admin/api/grants/revoke'
             ? ('grant_revoke' as const)
-            : path === '/admin/api/fetch'
-              ? ('fetch' as const)
-              : null
+            : path === '/admin/api/users/role'
+              ? ('user_role' as const)
+              : path === '/admin/api/telemetry'
+                ? ('telemetry_toggle' as const)
+                : path === '/admin/api/fetch'
+                  ? ('fetch' as const)
+                  : path === '/admin/api/mcp/connect'
+                    ? ('mcp_connect' as const)
+                    : path === '/admin/api/mcp/disconnect'
+                      ? ('mcp_disconnect' as const)
+                      : path === '/admin/api/mcp/test'
+                        ? ('mcp_test' as const)
+                        : path === '/admin/mcp/oauth/start'
+                          ? ('mcp_oauth' as const)
+                          : null
       : null;
 
   if (!session.ok) {
@@ -914,9 +1556,188 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     return adminJson({ error: 'unauthorized' }, 401);
   }
 
+  const userId = resolveCallerUserId(session as { userId?: string });
+  const safeFetch = deps.safePublicFetch ?? fetch;
+  const selfHost = deps.selfHost ?? url.hostname;
+
   if (path === '/admin/api/state' && request.method === 'GET') {
     const state = await deps.getState();
-    return adminJson(state, 200);
+    const viewer = {
+      userId: session.userId,
+      role: session.role,
+      ...(session.githubLogin ? { githubLogin: session.githubLogin } : {}),
+      ...(session.avatarUrl ? { avatarUrl: session.avatarUrl } : {}),
+    };
+    const mcpServers: PublicMcpServerSummary[] = deps.vaultStore
+      ? (await deps.vaultStore.listServers(userId)).map(toPublicMcpServerSummary)
+      : [];
+    const vaultConfigured = validateVaultMasterKey(deps.vaultMasterKey).ok;
+    if (session.role !== 'owner') {
+      const ownGrants = (state.grants ?? []).filter((g) => (g.userId ?? 'owner') === session.userId);
+      return adminJson(
+        {
+          viewer,
+          userId,
+          vaultConfigured,
+          mcpServers,
+          connected: state.connected,
+          agents: [],
+          affinities: [],
+          grants: ownGrants,
+          mcpClients: [],
+          events: [],
+          users: [],
+        },
+        200,
+      );
+    }
+    const [users, updateStatus, devTelemetry] = await Promise.all([
+      state.users ? Promise.resolve(state.users) : Promise.resolve(deps.oauthStore.listUsers?.() ?? []),
+      deps.getUpdateStatus ? deps.getUpdateStatus(state.agents).catch(() => undefined) : Promise.resolve(undefined),
+      deps.getTelemetrySettings ? deps.getTelemetrySettings().catch(() => undefined) : Promise.resolve(undefined),
+    ]);
+    return adminJson(
+      {
+        ...state,
+        viewer,
+        users,
+        userId,
+        vaultConfigured,
+        mcpServers,
+        ...(updateStatus ? { updateStatus } : {}),
+        ...(devTelemetry ? { devTelemetry } : {}),
+      },
+      200,
+    );
+  }
+
+  if (path === '/admin/api/mcp/registry' && request.method === 'GET') {
+    const q = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
+    const remoteOnly = url.searchParams.get('remoteOnly') === 'true' || url.searchParams.get('remoteOnly') === '1';
+    const rawLim = Number(url.searchParams.get('limit') ?? 20);
+    const out = await discoverMcps({
+      query: q,
+      remoteOnly,
+      ...(Number.isFinite(rawLim) ? { limit: rawLim } : {}),
+      fetchFn: safeFetch,
+      selfHost,
+    });
+    return adminJson(out, out.status);
+  }
+
+  if (path === '/admin/api/mcp/servers' && request.method === 'GET') {
+    if (!deps.vaultStore) {
+      return adminJson({ ok: true, userId, servers: [] }, 200);
+    }
+    const rows = await deps.vaultStore.listServers(userId);
+    return adminJson(
+      {
+        ok: true,
+        userId,
+        vaultConfigured: validateVaultMasterKey(deps.vaultMasterKey).ok,
+        servers: rows.map(toPublicMcpServerSummary),
+      },
+      200,
+    );
+  }
+
+  if (path === '/admin/mcp/oauth/start' && request.method === 'GET') {
+    return withAdminAuditSpan('mcp_oauth', async () => {
+      const qCsrf = url.searchParams.get('csrf') ?? '';
+      if (!qCsrf || !sameBytes(qCsrf, session.csrf)) {
+        return adminJson({ error: 'invalid_csrf' }, 403);
+      }
+      if (!deps.vaultStore) return adminJson({ error: 'vault_not_configured' }, 503);
+      const started = await startDownstreamMcpOAuth({
+        userId,
+        sessionCsrf: session.csrf,
+        hubOrigin: deps.publicOrigin ?? url.origin,
+        remoteUrl: url.searchParams.get('remoteUrl') ?? '',
+        slug: url.searchParams.get('slug') ?? undefined,
+        name: url.searchParams.get('name') ?? undefined,
+        clientId: url.searchParams.get('clientId') ?? undefined,
+        scope: url.searchParams.get('scope') ?? undefined,
+        vaultMasterKey: deps.vaultMasterKey,
+        vaultStore: deps.vaultStore,
+        fetchFn: safeFetch,
+        selfHost,
+      });
+      if (!started.ok) return adminJson(started, started.status);
+      const headers = new Headers({
+        location: started.authorizationUrl,
+        ...ADMIN_JSON_HEADERS,
+      });
+      headers.append(
+        'set-cookie',
+        formatCookie(MCP_OAUTH_BIND_COOKIE, started.bindCookieValue, {
+          maxAge: 600,
+          path: '/admin/mcp/oauth/callback',
+          sameSite: 'Lax',
+          secure: isSecure,
+        }),
+      );
+      return new Response(null, { status: 302, headers });
+    });
+  }
+
+  if (path === '/admin/mcp/oauth/callback' && request.method === 'GET') {
+    return withAdminAuditSpan('mcp_oauth', async () => {
+      if (!deps.vaultStore) return adminJson({ error: 'vault_not_configured' }, 503);
+      const bindCookie = readCookieFromHeader(request.headers.get('cookie'), MCP_OAUTH_BIND_COOKIE);
+      const completed = await completeDownstreamMcpOAuthCallback({
+        userId,
+        sessionCsrf: session.csrf,
+        bindCookieHeader: bindCookie,
+        code: url.searchParams.get('code') ?? '',
+        state: url.searchParams.get('state') ?? '',
+        vaultMasterKey: deps.vaultMasterKey,
+        vaultStore: deps.vaultStore,
+        fetchFn: safeFetch,
+        selfHost,
+      });
+      if (!completed.ok) {
+        return adminJson(completed, completed.status);
+      }
+      // Best-effort live `tools/list` populate right after OAuth connect
+      const unsealed = completed.server.encryptedCredentials
+        ? await unsealVaultCredentials({
+            vaultMasterKey: deps.vaultMasterKey,
+            userId,
+            remoteOrigin: completed.server.remoteOrigin,
+            ciphertext: completed.server.encryptedCredentials,
+          })
+        : null;
+      if (unsealed?.ok) {
+        const listed = await testAndListRemoteMcpTools({
+          remoteUrl: completed.server.remoteUrl,
+          secret: unsealed.payload,
+          fetchFn: safeFetch,
+          selfHost,
+        });
+        if (listed.ok) {
+          completed.server.cachedTools = listed.tools;
+          completed.server.toolCount = listed.tools.length;
+          await deps.vaultStore.upsertServer(completed.server);
+        }
+      }
+      const clearBindCookie = formatCookie(MCP_OAUTH_BIND_COOKIE, '', {
+        maxAge: 0,
+        path: '/admin/mcp/oauth/callback',
+        sameSite: 'Lax',
+        secure: isSecure,
+      });
+      if ((request.headers.get('accept') ?? '').toLowerCase().includes('application/json')) {
+        const headers = new Headers(ADMIN_JSON_HEADERS);
+        headers.append('set-cookie', clearBindCookie);
+        return Response.json({ ok: true, server: toPublicMcpServerSummary(completed.server) }, { status: 200, headers });
+      }
+      const headers = new Headers({
+        location: '/admin#mcp-connectors',
+        ...ADMIN_JSON_HEADERS,
+      });
+      headers.append('set-cookie', clearBindCookie);
+      return new Response(null, { status: 302, headers });
+    });
   }
 
   if (request.method === 'POST') {
@@ -930,6 +1751,370 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         });
       }
       return adminJson({ error: 'invalid_csrf' }, 403);
+    }
+
+    if (path === '/admin/api/grants/revoke') {
+      return withAdminAuditSpan('grant_revoke', async (span) => {
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
+        }
+        let body: { grantId?: string } = {};
+        if (capped.text.trim()) {
+          try {
+            body = JSON.parse(capped.text) as { grantId?: string };
+          } catch {
+            body = {};
+          }
+        }
+        if (!body.grantId || typeof body.grantId !== 'string') {
+          span.setAttributes({ 'admin.outcome': 'missing_grant_id', 'http.response.status_code': 400 });
+          span.setStatus(false, 'missing_grant_id');
+          return adminJson({ error: 'missing_grant_id' }, 400);
+        }
+        const scopedUserId = session.role === 'owner' ? undefined : session.userId;
+        const revoked = await deps.revokeGrant(body.grantId, scopedUserId);
+        span.setAttributes({
+          'admin.grant_id': body.grantId,
+          'admin.user_id': session.userId,
+          'admin.revoked': revoked,
+          'admin.outcome': revoked ? 'revoked' : 'not_found',
+          'http.response.status_code': 200,
+        });
+        return adminJson({ ok: true, revoked }, 200);
+      });
+    }
+
+    // Per-user MCP Registry & Encrypted Vault connectors (`user_id`-scoped): accessible to both `owner` and `member` users!
+    if (path === '/admin/api/mcp/probe') {
+      const capped = await readBodyTextCapped(request, 16_384);
+      if (!capped.ok) return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+      let body: { remoteUrl?: unknown } = {};
+      try {
+        body = JSON.parse(capped.text || '{}') as { remoteUrl?: unknown };
+      } catch {
+        return adminJson({ error: 'invalid_json' }, 400);
+      }
+      const check = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+      if (!check.ok) return adminJson({ ok: false, supported: false, error: 'invalid_remote_url', message: check.reason }, 400);
+      const probe = await probeRemoteMcpOAuthMetadata({ remoteUrl: check.normalized, fetchFn: safeFetch, selfHost });
+      return adminJson({ ok: true, ...probe }, 200);
+    }
+
+    if (path === '/admin/mcp/oauth/start') {
+      return withAdminAuditSpan('mcp_oauth', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 32_768);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+        const started = await startDownstreamMcpOAuth({
+          userId,
+          sessionCsrf: session.csrf,
+          hubOrigin: deps.publicOrigin ?? url.origin,
+          remoteUrl: typeof body.remoteUrl === 'string' ? body.remoteUrl : '',
+          slug: typeof body.slug === 'string' ? body.slug : undefined,
+          name: typeof body.name === 'string' ? body.name : undefined,
+          transport: body.transport === 'sse' ? 'sse' : 'streamable-http',
+          domains: Array.isArray(body.domains) ? body.domains.filter((d): d is string => typeof d === 'string') : undefined,
+          clientId: typeof body.clientId === 'string' ? body.clientId : undefined,
+          clientSecret: typeof body.clientSecret === 'string' ? body.clientSecret : undefined,
+          scope: typeof body.scope === 'string' ? body.scope : undefined,
+          vaultMasterKey: deps.vaultMasterKey,
+          vaultStore: deps.vaultStore,
+          fetchFn: safeFetch,
+          selfHost,
+        });
+        if (!started.ok) return adminJson(started, started.status);
+        const headers = new Headers(ADMIN_JSON_HEADERS);
+        headers.append(
+          'set-cookie',
+          formatCookie(MCP_OAUTH_BIND_COOKIE, started.bindCookieValue, {
+            maxAge: 600,
+            path: '/admin/mcp/oauth/callback',
+            sameSite: 'Lax',
+            secure: isSecure,
+          }),
+        );
+        return Response.json(
+          { ok: true, slug: started.slug, authorizationUrl: started.authorizationUrl },
+          { status: 200, headers },
+        );
+      });
+    }
+
+    if (path === '/admin/api/mcp/test') {
+      return withAdminAuditSpan('mcp_test', async () => {
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+
+        // Case 1: Re-test an already stored connector by `slug` using server-side decrypted credentials
+        if (typeof body.slug === 'string' && body.slug.trim() && !body.remoteUrl) {
+          if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+          const existing = await deps.vaultStore.getServer(userId, body.slug.trim());
+          if (!existing) return adminJson({ ok: false, error: 'mcp_server_not_found' }, 404);
+          let secret: VaultSecretPayload | null = { kind: 'none', pinnedOrigin: existing.remoteOrigin };
+          if (existing.encryptedCredentials && existing.authType !== 'none') {
+            const unsealed = await unsealVaultCredentials({
+              vaultMasterKey: deps.vaultMasterKey,
+              userId,
+              remoteOrigin: existing.remoteOrigin,
+              ciphertext: existing.encryptedCredentials,
+            });
+            if (!unsealed.ok) return adminJson({ ok: false, error: unsealed.error, message: unsealed.message }, 500);
+            secret = unsealed.payload;
+          }
+          const tested = await testAndListRemoteMcpTools({
+            remoteUrl: existing.remoteUrl,
+            secret,
+            fetchFn: safeFetch,
+            selfHost,
+          });
+          const now = Date.now();
+          if (!tested.ok) {
+            await deps.vaultStore.upsertServer({ ...existing, lastError: tested.message.slice(0, 240), updatedAt: now });
+            return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+          }
+          const updated: StoredMcpServerRow = {
+            ...existing,
+            cachedTools: tested.tools,
+            toolCount: tested.tools.length,
+            lastVerifiedAt: now,
+            lastError: null,
+            updatedAt: now,
+          };
+          await deps.vaultStore.upsertServer(updated);
+          return adminJson(
+            {
+              ok: true,
+              slug: updated.slug,
+              toolCount: tested.tools.length,
+              tools: tested.tools,
+              ...(tested.serverInfo ? { serverInfo: tested.serverInfo } : {}),
+            },
+            200,
+          );
+        }
+
+        // Case 2: Test unsaved form credentials before saving
+        const urlCheck = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+        if (!urlCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_remote_url', message: urlCheck.reason }, 400);
+        }
+        const hdrCheck = sanitizeSecretHeadersInput({ bearerToken: body.bearerToken, headers: body.headers });
+        if (!hdrCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_headers', message: hdrCheck.error }, 400);
+        }
+        const secret: VaultSecretPayload =
+          Object.keys(hdrCheck.headers).length > 0
+            ? { kind: 'headers', pinnedOrigin: urlCheck.origin, headers: hdrCheck.headers }
+            : { kind: 'none', pinnedOrigin: urlCheck.origin };
+
+        const tested = await testAndListRemoteMcpTools({
+          remoteUrl: urlCheck.normalized,
+          secret,
+          fetchFn: safeFetch,
+          selfHost,
+        });
+        if (!tested.ok) {
+          return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+        }
+        return adminJson(
+          {
+            ok: true,
+            remoteOrigin: urlCheck.origin,
+            toolCount: tested.tools.length,
+            tools: tested.tools,
+            ...(tested.serverInfo ? { serverInfo: tested.serverInfo } : {}),
+          },
+          200,
+        );
+      });
+    }
+
+    if (path === '/admin/api/mcp/connect') {
+      return withAdminAuditSpan('mcp_connect', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+
+        const urlCheck = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+        if (!urlCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_remote_url', message: urlCheck.reason }, 400);
+        }
+        const hdrCheck = sanitizeSecretHeadersInput({ bearerToken: body.bearerToken, headers: body.headers });
+        if (!hdrCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_headers', message: hdrCheck.error }, 400);
+        }
+
+        const hasSecrets = Object.keys(hdrCheck.headers).length > 0;
+        const secretPayload: VaultSecretPayload = hasSecrets
+          ? { kind: 'headers', pinnedOrigin: urlCheck.origin, headers: hdrCheck.headers }
+          : { kind: 'none', pinnedOrigin: urlCheck.origin };
+
+        let encryptedCredentials: string | null = null;
+        if (hasSecrets) {
+          const sealed = await sealVaultCredentials({
+            vaultMasterKey: deps.vaultMasterKey,
+            userId,
+            remoteOrigin: urlCheck.origin,
+            payload: secretPayload,
+          });
+          if (!sealed.ok) {
+            return adminJson(sealed, sealed.status);
+          }
+          encryptedCredentials = sealed.ciphertext;
+        }
+
+        const cleanName =
+          stripInvisibleSmugglingChars(typeof body.name === 'string' ? body.name : '').trim().slice(0, 120) ||
+          urlCheck.url.hostname;
+        const slug = slugifyMcpServerName(typeof body.slug === 'string' && body.slug.trim() ? body.slug : cleanName);
+        const explicitDomains = Array.isArray(body.domains)
+          ? body.domains
+              .filter((d): d is string => typeof d === 'string')
+              .map((d) => d.trim().toLowerCase().replace(/^www\./, ''))
+              .filter((d) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d))
+          : [];
+        const domains =
+          explicitDomains.length > 0
+            ? [...new Set(explicitDomains)].slice(0, 16)
+            : inferAssociatedDomains({ name: cleanName, remotes: [{ url: urlCheck.normalized }] });
+
+        const now = Date.now();
+        const existing = await deps.vaultStore.getServer(userId, slug);
+        let cachedTools = existing?.cachedTools ?? [];
+        let lastVerifiedAt = existing?.lastVerifiedAt ?? null;
+        let lastError: string | null = null;
+
+        if (body.skipVerify !== true) {
+          const tested = await testAndListRemoteMcpTools({
+            remoteUrl: urlCheck.normalized,
+            secret: secretPayload,
+            fetchFn: safeFetch,
+            selfHost,
+          });
+          if (tested.ok) {
+            cachedTools = tested.tools;
+            lastVerifiedAt = now;
+          } else {
+            lastError = tested.message.slice(0, 240);
+            if (body.requireVerify === true) {
+              return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+            }
+          }
+        }
+
+        const row: StoredMcpServerRow = {
+          id: existing?.id ?? `mcp_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`,
+          userId,
+          slug,
+          name: cleanName,
+          remoteUrl: urlCheck.normalized,
+          remoteOrigin: urlCheck.origin,
+          transport: body.transport === 'sse' ? 'sse' : 'streamable-http',
+          authType: hasSecrets ? 'headers' : 'none',
+          encryptedCredentials,
+          authSummary: buildMaskedAuthSummary(secretPayload),
+          domains,
+          cachedTools,
+          toolCount: cachedTools.length,
+          enabled: body.enabled !== false,
+          lastVerifiedAt,
+          lastError,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+        };
+
+        await deps.vaultStore.upsertServer(row);
+        return adminJson({ ok: true, server: toPublicMcpServerSummary(row) }, 200);
+      });
+    }
+
+    if (path === '/admin/api/mcp/disconnect') {
+      return withAdminAuditSpan('mcp_disconnect', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 16_384);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: { slug?: unknown } = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as { slug?: unknown };
+        } catch {
+          return adminJson({ error: 'invalid_json' }, 400);
+        }
+        const slug = typeof body.slug === 'string' ? body.slug.trim() : '';
+        if (!slug) return adminJson({ ok: false, error: 'missing_slug' }, 400);
+        const deleted = await deps.vaultStore.deleteServer(userId, slug);
+        return adminJson({ ok: true, deleted }, 200);
+      });
+    }
+
+    // All remaining `/admin/api/*` mutations (`events/clear`, `affinity/clear`, `users/role`, `fetch`) are owner-only!
+    if (session.role !== 'owner') {
+      if (apiOp) {
+        return withAdminAuditSpan(apiOp, async (span) => {
+          span.setAttributes({
+            'admin.user_id': session.userId,
+            'admin.outcome': 'forbidden_role',
+            'http.response.status_code': 403,
+          });
+          span.setStatus(false, 'forbidden_role');
+          return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
+        });
+      }
+      return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
+    }
+
+    if (path === '/admin/api/users/role') {
+      return withAdminAuditSpan('user_role', async (span) => {
+        const capped = await readBodyTextCapped(request, 16_384);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
+        }
+        let body: { userId?: string; role?: string } = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as typeof body;
+        } catch {
+          body = {};
+        }
+        const targetUserId = typeof body.userId === 'string' ? body.userId.trim() : '';
+        const targetRole: UserRole | null = body.role === 'owner' ? 'owner' : body.role === 'member' ? 'member' : null;
+        if (!targetUserId || !targetRole) {
+          span.setAttributes({ 'admin.outcome': 'invalid_params', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_params');
+          return adminJson({ error: 'invalid_params' }, 400);
+        }
+        const updated = (await deps.oauthStore.updateUserRole?.(targetUserId, targetRole)) ?? false;
+        span.setAttributes({
+          'admin.target_user_id': targetUserId,
+          'admin.target_role': targetRole,
+          'admin.outcome': updated ? 'updated' : 'not_found',
+          'http.response.status_code': updated ? 200 : 404,
+        });
+        return adminJson({ ok: updated, userId: targetUserId, role: targetRole }, updated ? 200 : 404);
+      });
     }
 
     if (path === '/admin/api/events/clear') {
@@ -967,36 +2152,40 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       });
     }
 
-    if (path === '/admin/api/grants/revoke') {
-      return withAdminAuditSpan('grant_revoke', async (span) => {
-        const capped = await readBodyTextCapped(request, 65_536);
+    if (path === '/admin/api/telemetry') {
+      return withAdminAuditSpan('telemetry_toggle', async (span) => {
+        if (!deps.setTelemetryOptIn) {
+          span.setAttributes({ 'admin.outcome': 'unsupported', 'http.response.status_code': 501 });
+          span.setStatus(false, 'unsupported');
+          return adminJson({ error: 'telemetry_settings_unavailable' }, 501);
+        }
+        const capped = await readBodyTextCapped(request, 4_096);
         if (!capped.ok) {
           const st = capped.error === 'too_large' ? 413 : 400;
           span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
           span.setStatus(false, 'payload_too_large');
           return adminJson({ error: 'payload_too_large' }, st);
         }
-        let body: { grantId?: string } = {};
-        if (capped.text.trim()) {
-          try {
-            body = JSON.parse(capped.text) as { grantId?: string };
-          } catch {
-            body = {};
-          }
+        let body: { enabled?: unknown } = {};
+        try {
+          body = JSON.parse(capped.text) as { enabled?: unknown };
+        } catch {
+          span.setAttributes({ 'admin.outcome': 'invalid_json', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_json');
+          return adminJson({ error: 'invalid_json' }, 400);
         }
-        if (!body.grantId || typeof body.grantId !== 'string') {
-          span.setAttributes({ 'admin.outcome': 'missing_grant_id', 'http.response.status_code': 400 });
-          span.setStatus(false, 'missing_grant_id');
-          return adminJson({ error: 'missing_grant_id' }, 400);
+        if (typeof body.enabled !== 'boolean') {
+          span.setAttributes({ 'admin.outcome': 'invalid_enabled_flag', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_enabled_flag');
+          return adminJson({ error: 'invalid_enabled_flag' }, 400);
         }
-        const revoked = await deps.revokeGrant(body.grantId);
+        const devTelemetry = await deps.setTelemetryOptIn(body.enabled);
         span.setAttributes({
-          'admin.grant_id': body.grantId,
-          'admin.revoked': revoked,
-          'admin.outcome': revoked ? 'revoked' : 'not_found',
+          'admin.telemetry_enabled': devTelemetry.enabled,
+          'admin.outcome': 'updated',
           'http.response.status_code': 200,
         });
-        return adminJson({ ok: true, revoked }, 200);
+        return adminJson({ ok: true, devTelemetry }, 200);
       });
     }
 

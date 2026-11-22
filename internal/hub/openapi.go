@@ -232,6 +232,34 @@ func buildGoHubOpenAPISpec(origin string) map[string]any {
 					},
 				},
 			},
+			"/v1/mcp/registry": map[string]any{
+				"get": map[string]any{
+					"tags":        []string{"Coordinator & MCP"},
+					"operationId": "discoverMcpRegistry",
+					"summary":     "Search Official MCP Registry and Glama MCP Directory",
+					"security":    bearerSec,
+					"parameters": []map[string]any{
+						{"name": "q", "in": "query", "schema": map[string]any{"type": "string"}},
+						{"name": "remoteOnly", "in": "query", "schema": map[string]any{"type": "boolean"}},
+						{"name": "limit", "in": "query", "schema": map[string]any{"type": "integer", "minimum": 1, "maximum": 50}},
+					},
+					"responses": map[string]any{
+						"200": map[string]any{"description": "Normalized MCP registry entries.", "content": jsonSchema("GenericObject")},
+					},
+				},
+			},
+			"/v1/mcp/query": map[string]any{
+				"post": map[string]any{
+					"tags":        []string{"Coordinator & MCP"},
+					"operationId": "queryConnectedMcp",
+					"summary":     "List or invoke tools on a user-connected federated MCP server",
+					"security":    bearerSec,
+					"requestBody": map[string]any{"required": true, "content": jsonSchema("GenericObject")},
+					"responses": map[string]any{
+						"200": map[string]any{"description": "Federated MCP response.", "content": jsonSchema("GenericObject")},
+					},
+				},
+			},
 			"/v2/scrape": map[string]any{
 				"post": map[string]any{
 					"tags":        []string{"Compatibility"},

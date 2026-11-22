@@ -1,0 +1,129 @@
+name: Opt-In Upstream Release Sync & Hub Deploy
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-upstream:
+    name: Verify Signed Upstream Release & Sync Fork Hub
+    if: vars.EDGEFETCH_AUTO_SYNC_UPSTREAM == 'true' && github.repository != 'bartrumb/edgefetch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch Latest Upstream Release & Verify Ed25519 Signature
+        id: verify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          expected_spki="MCowBQYDK2VwAyEAv8+ZT9d/404KI0pY1PILOVBzsUvTHWaL0aLghciWy90="
+          if ! grep -Fq "$expected_spki" keys/release-signing-pub.pem; then
+            echo "::error::Pinned keys/release-signing-pub.pem does not match expected Ed25519 SPKI key."
+            exit 1
+          fi
+
+          tmp_dir=$(mktemp -d)
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -o "$tmp_dir/release.json" \
+            "https://api.github.com/repos/bartrumb/edgefetch/releases/latest"
+
+          latest_tag=$(node -e '
+            const fs = require("node:fs");
+            const rel = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const tag = typeof rel.tag_name === "string" ? rel.tag_name.trim() : "";
+            if (!/^v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9._-]+)?$/.test(tag)) {
+              process.exit(1);
+            }
+            process.stdout.write(tag);
+          ' "$tmp_dir/release.json")
+
+          curl -fsSL -o "$tmp_dir/checksums.txt" \
+            "https://github.com/bartrumb/edgefetch/releases/download/${latest_tag}/checksums.txt"
+          curl -fsSL -o "$tmp_dir/checksums.txt.sig" \
+            "https://github.com/bartrumb/edgefetch/releases/download/${latest_tag}/checksums.txt.sig"
+
+          openssl pkeyutl -verify \
+            -pubin -inkey keys/release-signing-pub.pem \
+            -rawin -in "$tmp_dir/checksums.txt" \
+            -sigfile "$tmp_dir/checksums.txt.sig"
+
+          git fetch --no-tags https://github.com/bartrumb/edgefetch.git "refs/tags/${latest_tag}:refs/tags/${latest_tag}"
+          target_commit=$(git rev-parse "${latest_tag}^{commit}")
+          head_commit=$(git rev-parse HEAD)
+
+          if [ "$head_commit" = "$target_commit" ] || git merge-base --is-ancestor "$target_commit" HEAD; then
+            echo "Already synced to ${latest_tag} (${target_commit})."
+            echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          if ! git merge-base --is-ancestor HEAD "$target_commit"; then
+            echo "::error::Fork branch has diverged from upstream ${latest_tag}; refusing non-fast-forward sync."
+            exit 1
+          fi
+
+          git merge --ff-only "$target_commit"
+          if ! grep -Fq "$expected_spki" keys/release-signing-pub.pem; then
+            echo "::error::Post-merge keys/release-signing-pub.pem changed unexpectedly; aborting push."
+            exit 1
+          fi
+
+          git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}" "refs/tags/${latest_tag}:refs/tags/${latest_tag}"
+          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.verify.outputs.should_deploy == 'true'
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: hub/package-lock.json
+
+      - name: Install, Test & Type-Check Hub
+        if: steps.verify.outputs.should_deploy == 'true'
+        working-directory: hub
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+          npm run type-check
+          node scripts/compile-manifests.mjs
+
+      - name: Deploy Synced Fork Hub to Cloudflare
+        if: steps.verify.outputs.should_deploy == 'true'
+        working-directory: hub
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_ENV: ${{ vars.EDGEFETCH_WRANGLER_ENV }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "Fork synced to ${GITHUB_SHA}; skipping Cloudflare deploy because CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID secrets are not set."
+            exit 0
+          fi
+          if [ -n "${WRANGLER_ENV:-}" ]; then
+            npx wrangler deploy -c wrangler.toml -e "$WRANGLER_ENV"
+          else
+            npx wrangler deploy -c wrangler.toml --env=""
+          fi

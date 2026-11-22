@@ -103,6 +103,9 @@ jobs:
       - run: npm run adapter:test
       - name: Run Hub, Miniflare workerd E2E & TypeScript SDK tests with V8 coverage
         run: node scripts/run-tests.mjs --coverage --include-sdk
+      - name: Run Opt-In Error Telemetry Collector tests
+        working-directory: .
+        run: node --test telemetry/test/collector.test.ts
       - run: npm run type-check
       - run: npm run deploy:dry
       - name: Run Deno Deploy Hub OTLP & SafeFetch smoke tests (SHA-256 verified Deno v2.2.4)

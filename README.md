@@ -17,15 +17,15 @@
 ## Try It in 60 Seconds
 
 ```bash
-# Option 1 — Full 15-Tool Hub + BYO-LLM /v1/agent + 50+ Site/ATS/Commerce Adapters + /admin UI + FTS5 in Docker (zero cloud account):
+# Option 1 — Full 17-Tool Federated MCP Hub + Sign in with GitHub + BYO-LLM /v1/agent + 56 Site/ATS/Commerce Adapters + /admin UI + FTS5 in Docker (zero cloud account):
 git clone https://github.com/bartrumb/edgefetch.git && cd edgefetch
-export CALLER_TOKEN="$(openssl rand -hex 24)" AGENT_TOKEN="$(openssl rand -hex 24)"
+export CALLER_TOKEN="$(openssl rand -hex 24)" AGENT_TOKEN="$(openssl rand -hex 24)" VAULT_MASTER_KEY="$(openssl rand -hex 24)"
 docker compose up --build -d
-# Open http://127.0.0.1:8787/admin and sign in with $CALLER_TOKEN
+# Open http://127.0.0.1:8787/admin and sign in with $CALLER_TOKEN (or configure GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET)
 
 # Option 2 — Standalone ~8 MB Local Go Binary for Claude Code, Claude Desktop, Cursor, Windsurf, Gemini CLI & Codex (zero containers/ports):
 go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest
-edgefetch init && edgefetch doctor
+edgefetch init && edgefetch doctor && edgefetch update --check
 ```
 
 <p>
@@ -56,9 +56,9 @@ edgefetch init && edgefetch doctor
 - **Dial-time SSRF protection (including the browser):** `politeness.RejectNonPublicPeer` checks resolved peer IPs inside Go's `net.Dialer.Control` right before `connect()` (blocking DNS-rebinding TOCTOU), and headless Chromium subresources are forced through an in-process loopback `CONNECT` proxy (`--host-resolver-rules=MAP * ~NOTFOUND`).
 - **Polite by design — with actionable `blocked.suggestion` rerouting:** `robots.txt` and `Content-Signal: ai-input` are enforced on every hop (including `30x` redirects), `Retry-After` is honored per host, HTTP `402` (`x402`) halts immediately as `payment_required` without auto-paying, anti-bot challenges (Cloudflare, Akamai, DataDome, PerimeterX, AWS WAF, Imperva) halt on the first attempt, and IETF RFC 9421 Web Bot Auth (`Ed25519` HTTP Message Signatures) is built in. When a path is blocked by `robots.txt` or a WAF, EdgeFetch returns a structured **`blocked.suggestion`** steering your agent to official public JSON boards, registries, or APIs (e.g., Greenhouse/Ashby/Workday CXS instead of LinkedIn, or Overpass/Nominatim instead of OSM `/api/`).
 - **Clean Two-Plane Architecture (Pure Go Edge Engine & Hub + Serverless V8 Hub):**
-  - **Go Data Plane & Standalone Hub (`cmd/`, `internal/` — 1 external Go module `coder/websocket`, `0` transitive deps, `~8 MB` static binary):** Runs 100% standalone with **zero TypeScript/Node** (`edgefetch scrape`, `edgefetch mcp` over `stdio`, or `edgefetch --mode=hub` with embedded declarative site adapters!) *or* as an outbound worker daemon, handling every untrusted socket, dial-time SSRF check, 100% RFC 9309 `robots.txt` check, streaming PDF parse, and CDP Chromium session.
-  - **Cloudflare / Portable Fair-Source Hub Plane (`hub/` — vetted runtime packages: `re2js`, `htmlparser2`, `ws`, `yaml`):** Optional full-featured fleet coordinator running natively on Cloudflare Hibernating WebSocket Durable Objects + D1 FTS5 + R2 (`$0` idle) or self-hosted `node:sqlite` (`dist/portable-server.mjs`, `0` runtime `node_modules` in containers). Combines Google RE2 linear-time Thompson NFA regex safety (`re2js`), WHATWG HTML5 CSS-selector extraction (`parseHtmlDoc` via `htmlparser2`), RFC 6455 WebSocket framing (`ws`), shared Go+TS declarative YAML manifests (`internal/extract/manifests/*.yaml`), and 56+ MIT-licensed hot-deployable site/ATS/commerce adapters (`hub/src/extractors/`).
-- **50+ keyless site, commerce, open-data & ATS adapters + Store `catalog` + Autonomous BYO-LLM `/v1/agent`:** 15 MCP tools (`agent`, `find_extractors`, `scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `catalog`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`), drop-in Firecrawl `/v2/*` compatibility, linear `64 KiB` framework detection, polite full-store **Shopify** (custom domains + `/products.json`) & **WooCommerce** inventory catalogs with variant diffs, and Claude-style dynamic adapter routing across **Workable**, **Greenhouse (US/EU)**, **Ashby**, **Lever (US/EU)**, **Workday CXS**, **iCIMS**, **Rippling**, **Gem**, **Pinpoint**, **Teamtailor**, **BambooHR**, **Oracle HCM**, **SmartRecruiters**, **SEC EDGAR**, **Y Combinator**, **Socrata / CKAN / ArcGIS / Legistar Open Data**, **DOI/Crossref**, **OpenAlex**, **arXiv**, **ClinicalTrials.gov**, **PubMed**, **NIST NVD**, **GitHub**, **Stack Overflow**, **npm**, **crates.io**, **Hugging Face**, **OpenRouter**, and **256 MiB streaming PDFs** — supporting offline local LLMs (**Ollama**, **LM Studio**, **vLLM**) or online BYO-LLM (**OpenAI**, **Anthropic**, **Gemini**, **OpenRouter**, **Workers AI**) with live SSE streaming and `$0` Zero Data Retention. Add a new adapter in one file via `npm run adapter:new` (**[docs/ADAPTERS.md](docs/ADAPTERS.md)**).
+  - **Go Data Plane & Standalone Hub (`cmd/`, `internal/` — 1 external Go module `coder/websocket`, `0` transitive deps, `~8 MB` static binary):** Runs 100% standalone with **zero TypeScript/Node** (`edgefetch scrape`, `edgefetch mcp` over `stdio`, `edgefetch update` Ed25519-verified self-updater, or `edgefetch --mode=hub` with embedded declarative site adapters!) *or* as an outbound worker daemon, handling every untrusted socket, dial-time SSRF check, 100% RFC 9309 `robots.txt` check, streaming PDF parse, and CDP Chromium session.
+  - **Cloudflare / Portable Fair-Source Hub Plane (`hub/` — 6 vetted runtime packages: `re2js`, `htmlparser2`, `jose`, `oauth4webapi`, `ws`, `yaml`):** Optional full-featured fleet & MCP federation coordinator running natively on Cloudflare Hibernating WebSocket Durable Objects + D1 FTS5 + R2 (`$0` idle) or self-hosted `node:sqlite` (`dist/portable-server.mjs`, `0` runtime `node_modules` in containers). Combines **Sign in with GitHub** (`oauth4webapi` OAuth 2.1 PKCE + `jose` HS256 sessions) with strict `user_id` multi-user tenant isolation, a built-in **`/admin` MCP Registry & `AES-256-GCM` Connector Vault** (`HKDF-SHA256` per-user/per-origin keys + downstream OAuth 2.1 PKCE auto-refresh), **federated `discover_mcps` + `query_mcp` MCP-first routing** (calling official connected MCP servers before HTML scraping with zero prompt-schema bloat), Google RE2 linear-time regex safety (`re2js`), WHATWG HTML5 CSS-selector extraction (`parseHtmlDoc` via `htmlparser2`), RFC 6455 WebSocket framing (`ws`), and 56 MIT-licensed declarative YAML site/ATS/commerce adapters (`internal/extract/manifests/*.yaml`, `hub/src/extractors/`).
+- **17 MCP tools + Federated MCP Connectors + 56 keyless site, commerce, open-data & ATS adapters + Autonomous BYO-LLM `/v1/agent`:** 17 MCP tools (`agent`, `discover_mcps`, `query_mcp`, `find_extractors`, `scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `catalog`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`), drop-in Firecrawl `/v2/*` compatibility, linear `64 KiB` framework detection, polite full-store **Shopify** (custom domains + `/products.json`) & **WooCommerce** inventory catalogs with variant diffs, and Claude-style dynamic MCP-first + adapter routing across **Workable**, **Greenhouse (US/EU)**, **Ashby**, **Lever (US/EU)**, **Workday CXS**, **iCIMS**, **Rippling**, **Gem**, **Pinpoint**, **Teamtailor**, **BambooHR**, **Oracle HCM**, **SmartRecruiters**, **SEC EDGAR**, **Y Combinator**, **Socrata / CKAN / ArcGIS / Legistar Open Data**, **DOI/Crossref**, **OpenAlex**, **arXiv**, **ClinicalTrials.gov**, **PubMed**, **NIST NVD**, **GitHub**, **Stack Overflow**, **npm**, **crates.io**, **Hugging Face**, **OpenRouter**, and **256 MiB streaming PDFs** — supporting offline local LLMs (**Ollama**, **LM Studio**, **vLLM**) or online BYO-LLM (**OpenAI**, **Anthropic**, **Gemini**, **OpenRouter**, **Workers AI**) with live SSE streaming and `$0` Zero Data Retention. Add a new adapter in one file via `npm run adapter:new` (**[docs/ADAPTERS.md](docs/ADAPTERS.md)**).
 
 > **Project status:** Young personal project (started November 2026), running daily as the sole web/search layer on the author's 3-node fleet (Home Assistant OS `x86_64`, Windows VM, and `arm64`). Open-source worker, SDKs, and adapters ([MIT](LICENSE)); fair-source hub ([FSL-1.1-MIT](hub/LICENSE), MIT after two years). Issues and PRs are **triaged weekly**. See **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)** for honest trade-offs.
 
@@ -68,7 +68,7 @@ edgefetch init && edgefetch doctor
 
 Full architectural & trade-off breakdown: **[docs/COMPARISON.md](docs/COMPARISON.md)** · Common questions: **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)**
 
-| Dimension | **EdgeFetch (`v2.6`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
+| Dimension | **EdgeFetch (`v2.7`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
 |---|---|---|---|---|---|
 | **License** | **Open-source worker, SDKs & adapters (`MIT`); fair-source hub (`FSL-1.1`, `MIT` after 2 yrs)** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 |
 | **Minimum Self-Hosted Stack** | **1 `~8 MB` Go binary** *or* **1 container** (`node:sqlite` + `/data`, **0 Redis, 0 Postgres**) | Docker Compose + **Redis + PostgreSQL + RabbitMQ + Playwright** (`2–4 GB+` RAM) | Cloud API key | Python 3.10+ + Playwright (`600 MB–1.5 GB` RAM) | Node.js + Puppeteer |
@@ -135,7 +135,8 @@ go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest
 # Auto-configure zero-daemon, zero-port stdio MCP into Claude Desktop & Cursor:
 edgefetch install-mcp
 
-# Verify SSRF guard, loopback CONNECT proxy, OS Chrome/Edge & pdftotext, or scrape from terminal:
+# Verify Ed25519-signed updates or self-update binary in place, and run diagnostics:
+edgefetch update --check
 edgefetch doctor
 edgefetch scrape https://example.com
 edgefetch scrape --json --query="installation" https://developers.cloudflare.com/workers/
@@ -156,7 +157,7 @@ EDGEFETCH_CALLER_TOKEN="<32-char-secret>" EDGEFETCH_AGENT_TOKEN="<32-char-secret
 
 ---
 
-## Feature & Extraction Highlights (`v2.6`, `SCRAPE_PIPELINE_VERSION = 26`)
+## Feature & Extraction Highlights (`v2.7`, `SCRAPE_PIPELINE_VERSION = 30`)
 
 - **25+ Site & ATS Job-Board Extractors ([`hub/src/extractors/registry.ts`](hub/src/extractors/registry.ts), [`hub/src/jobs.ts`](hub/src/jobs.ts)):**
   - **ATS Job Boards & Structured `jobs` Tool:** One-call job search & extraction across **Greenhouse**, **Ashby** (`?includeCompensation=true`), **Lever**, **Workday CXS** (`GET` & `POST`), and **SmartRecruiters / Schema.org `JobPosting` JSON-LD**, normalizing pay (`{ min, max, currency, period, basis: "base"|"ote"|"total" }`) and filtering out closed postings (`contentState: "closed_posting"`).
@@ -181,7 +182,7 @@ Status legend:
 
 | Platform / Target | Role(s) | Binary / Image Footprint | Capabilities | Verification Status |
 |---|---|---|---|---|
-| **Cloudflare Workers + Hibernating DO + D1 (FTS5) + R2 + Workflows** | Cloud Hub (`/mcp`, `/admin`, OAuth 2.1, `HUB_SHARDS`) | Serverless bundle (`re2js` + `htmlparser2`, `~380 KB` gzip) | 15-tool MCP, Search, FTS5, R2 Artifacts, RFC 9421, OTLP | **✅ Daily-Driver + CI Verified** (`workerd` `H7` & `S1` suites) |
+| **Cloudflare Workers + Hibernating DO + D1 (FTS5) + R2 + Workflows** | Cloud Hub (`/mcp`, `/admin`, GitHub OAuth + OAuth 2.1, `AES-256-GCM` MCP Vault) | Serverless bundle (`~450 KB` gzip) | 17-tool Federated MCP, Search, FTS5, R2 Artifacts, RFC 9421, OTLP | **✅ Daily-Driver + CI Verified** (`workerd` `H7` & `S1` suites) |
 | **Home Assistant OS (`amd64` x86_64 & `aarch64` RPi / NUC / VM)** | Outbound Home Worker (`edgefetch_fat`) | Multi-arch Alpine + Chromium + SwiftShader + Poppler | HTTP/2, `artifacts-v1`, `browser-v1`, `interact-v1`, 256 MiB PDF | **✅ Daily-Driver + CI Verified** (`x86_64` & `arm64` home nodes) |
 | **Windows 11 (`windows/amd64` Desktop & VM)** | Local `stdio` MCP, `desktop` Launchpad, CLI & Fleet Worker | `~8 MB` (`edgefetch.exe`, `0` DLL deps) | Auto-detects native Windows **Chrome / Edge / Brave** for CDP JS render | **✅ Daily-Driver + CI Verified** (Windows VM node + CLI E2E) |
 | **Linux Docker Worker — Fat (`linux/amd64`, `linux/arm64`)** | Standalone Worker (`Dockerfile.agent`) | Non-root `65532:65532` + AppArmor + Chromium WebGL | Full HTTP/2 + SSRF-proxied Headless Chromium + Poppler PDF | **✅ Live-Tested + CI Verified** (live AppArmor + WebGL CI smoke) |

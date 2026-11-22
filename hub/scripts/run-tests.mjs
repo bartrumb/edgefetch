@@ -33,6 +33,7 @@ const agentAdvOutfile = join(dir, 'agent-advanced.test.mjs');
 const secAuditOutfile = join(dir, 'security-audit.test.mjs');
 const ghMultiOutfile = join(dir, 'github-auth-multiuser.test.mjs');
 const mcpFedOutfile = join(dir, 'mcp-federation.test.mjs');
+const updatesTelOutfile = join(dir, 'updates-telemetry.test.mjs');
 const sdkTsTestFile = resolve('test/sdk-ts.test.ts');
 const hasSdkTsTest = existsSync(sdkTsTestFile);
 const sdkTsOutfile = join(dir, 'sdk-ts.test.mjs');
@@ -66,8 +67,17 @@ try {
   buildNodeTestBundle('test/security-audit.test.ts', secAuditOutfile);
   buildNodeTestBundle('test/github-auth-multiuser.test.ts', ghMultiOutfile);
   buildNodeTestBundle('test/mcp-federation.test.ts', mcpFedOutfile);
+  buildNodeTestBundle('test/updates-telemetry.test.ts', updatesTelOutfile);
 
-  const nodeTestFiles = [unitOutfile, adaptersOutfile, agentAdvOutfile, secAuditOutfile, ghMultiOutfile, mcpFedOutfile];
+  const nodeTestFiles = [
+    unitOutfile,
+    adaptersOutfile,
+    agentAdvOutfile,
+    secAuditOutfile,
+    ghMultiOutfile,
+    mcpFedOutfile,
+    updatesTelOutfile,
+  ];
   if (hasSdkTsTest) {
     buildNodeTestBundle('test/sdk-ts.test.ts', sdkTsOutfile);
     nodeTestFiles.push(sdkTsOutfile);

@@ -36,6 +36,18 @@ import {
   type HubSocketLike,
 } from '../src/agent-hub';
 import {
+  createSqliteHubSettingsStore,
+  HUB_SETTINGS_SQLITE_SCHEMA,
+  type HubSettingsStore,
+} from '../src/dev-telemetry';
+import {
+  createSqliteMcpVaultStore,
+  MCP_VAULT_SQLITE_SCHEMA,
+  type McpVaultStore,
+  type PendingMcpOAuthStateRow,
+  type StoredMcpServerRow,
+} from '../src/mcp-vault';
+import {
   createSqliteOAuthStore,
   OAUTH_SQLITE_SCHEMA,
   type HubUserRecord,
@@ -46,13 +58,6 @@ import {
   type SqlStorageLike,
   type UserRole,
 } from '../src/oauth';
-import {
-  createSqliteMcpVaultStore,
-  MCP_VAULT_SQLITE_SCHEMA,
-  type McpVaultStore,
-  type PendingMcpOAuthStateRow,
-  type StoredMcpServerRow,
-} from '../src/mcp-vault';
 
 // Polyfill Cloudflare's streaming `crypto.DigestStream` on Node.js using zero-copy `node:crypto` `createHash`.
 if (typeof (globalThis.crypto as unknown as { DigestStream?: unknown }).DigestStream !== 'function') {
@@ -534,6 +539,7 @@ export class LocalAgentHubCoordinator {
   public readonly oauth: OAuthStore;
   public readonly mcpVault: McpVaultStore;
   public readonly activity: ActivityStore;
+  public readonly settings: HubSettingsStore;
 
   constructor(sqlitePath: string) {
     if (sqlitePath !== ':memory:') {
@@ -572,6 +578,7 @@ export class LocalAgentHubCoordinator {
       ${OAUTH_SQLITE_SCHEMA}
       ${MCP_VAULT_SQLITE_SCHEMA}
       ${ACTIVITY_SQLITE_SCHEMA}
+      ${HUB_SETTINGS_SQLITE_SCHEMA}
     `);
 
     const sqlLike: SqlStorageLike = {
@@ -748,6 +755,7 @@ export class LocalAgentHubCoordinator {
     this.oauth = createSqliteOAuthStore(sqlLike);
     this.mcpVault = createSqliteMcpVaultStore(sqlLike);
     this.activity = createSqliteActivityStore(sqlLike);
+    this.settings = createSqliteHubSettingsStore(sqlLike);
   }
 
   /** Registers an already-upgraded `ws` `WebSocket` client with `AgentHubEngine`. */
@@ -952,6 +960,8 @@ export class LocalAgentHubCoordinator {
       vaultPutOAuthState: (row: PendingMcpOAuthStateRow) => this.mcpVault.putOAuthState(row),
       vaultConsumeOAuthState: (stateHash: string, userId: string, now: number) =>
         this.mcpVault.consumeOAuthState(stateHash, userId, now),
+      getHubSetting: (k: string) => this.settings.getSetting(k),
+      setHubSetting: (k: string, v: string) => this.settings.setSetting(k, v),
     };
     return {
       idFromName: (name: string) => name,

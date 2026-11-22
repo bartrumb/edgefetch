@@ -30,11 +30,12 @@ import (
 )
 
 type cliDeps struct {
-	getenv    func(string) string
-	transport http.RoundTripper
-	allow     func(*url.URL) error
-	haPath    string
-	stdin     io.Reader
+	getenv     func(string) string
+	transport  http.RoundTripper
+	allow      func(*url.URL) error
+	haPath     string
+	stdin      io.Reader
+	stdinIsTTY *bool
 }
 
 func isOneShotCLI(args []string) bool {
@@ -44,6 +45,7 @@ func isOneShotCLI(args []string) bool {
 	switch args[0] {
 	case "version", "--version", "-v",
 		"doctor", "--doctor",
+		"update",
 		"scrape",
 		"map",
 		"crawl",
@@ -96,6 +98,8 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 		return runVersion(args[1:], stdout)
 	case "doctor", "--doctor":
 		return runDoctor(args[1:], stdout, stderr, deps)
+	case "update":
+		return runUpdateCLI(ctx, args[1:], stdout, stderr, deps)
 	case "scrape":
 		return runScrapeCLI(ctx, args[1:], stdout, stderr, deps)
 	case "map":
@@ -105,7 +109,7 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 	case "mcp":
 		return runMCPStdio(ctx, stdin, stdout, stderr, deps)
 	case "init", "install-mcp":
-		return runInstallMCP(args[1:], stdout, stderr)
+		return runInstallMCPWithDeps(args[1:], stdin, stdout, stderr, deps)
 	case "install-service":
 		return runInstallService(args[1:], stdout, stderr)
 	case "keygen-bot-auth":
@@ -137,6 +141,7 @@ Usage:
   edgefetch desktop [--port=8787]                Start loopback Desktop MCP Launchpad & open browser (Win/macOS/Linux)
   edgefetch mcp                                  Run local stdio MCP server (zero ports/tokens — Claude/Cursor/Codex)
   edgefetch init [--agent=all] [--dry-run]       Auto-configure MCP in Claude Code, Claude Desktop, Cursor, Windsurf, Gemini & Codex
+  edgefetch update [--check] [--version vX.Y.Z]  Verify Ed25519 signature + SHA-256 and atomically update the edgefetch binary
   edgefetch scrape [flags] <https://url>         Scrape one public HTTPS URL to clean Markdown (or --json)
   edgefetch map [flags] <https://url>            Discover URLs across /llms.txt, /sitemap.xml & homepage links
   edgefetch crawl [flags] <https://url>          Breadth-first polite site crawl (supports --out=./pages Markdown export)
@@ -392,6 +397,8 @@ func runScrapeCLI(ctx context.Context, args []string, stdout, stderr io.Writer, 
 
 	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	crawler := crawl.NewCrawler(deps.transport, deps.allow, ua, silentLog)
+	otelExp := otel.NewExporterFromEnv(deps.getenv, "edgefetch-cli", agent.Version, newHubTransport())
+	crawler.SetOtelExporter(otelExp)
 	defer func() { _ = crawler.Close() }()
 
 	kind := classify.KindScrape
@@ -428,7 +435,13 @@ func runScrapeCLI(ctx context.Context, args []string, stdout, stderr io.Writer, 
 		return 2
 	}
 
-	reply := crawl.ExecuteCall(ctx, crawler, call, silentLog)
+	var traceHdr http.Header
+	if otelExp != nil {
+		tc := otel.ExtractOrNew(nil)
+		traceHdr = http.Header{}
+		otel.InjectHeaders(traceHdr, tc, tc.SpanID)
+	}
+	reply := crawl.ExecuteCallWithTrace(ctx, crawler, call, traceHdr, silentLog, nil)
 	if len(reply.Results) == 0 {
 		_, _ = fmt.Fprintln(stderr, "scrape produced no result")
 		return 1
@@ -541,6 +554,8 @@ func runMapCLI(ctx context.Context, args []string, stdout, stderr io.Writer, dep
 	}
 	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	crawler := crawl.NewCrawler(deps.transport, deps.allow, ua, silentLog)
+	otelExp := otel.NewExporterFromEnv(deps.getenv, "edgefetch-cli", agent.Version, newHubTransport())
+	crawler.SetOtelExporter(otelExp)
 	defer func() { _ = crawler.Close() }()
 
 	origin := parsedU.Scheme + "://" + parsedU.Host
@@ -699,6 +714,8 @@ func runCrawlCLI(ctx context.Context, args []string, stdout, stderr io.Writer, d
 	}
 	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	crawler := crawl.NewCrawler(deps.transport, deps.allow, ua, silentLog)
+	otelExp := otel.NewExporterFromEnv(deps.getenv, "edgefetch-cli", agent.Version, newHubTransport())
+	crawler.SetOtelExporter(otelExp)
 	defer func() { _ = crawler.Close() }()
 
 	kind := classify.KindScrape

@@ -2605,21 +2605,22 @@ test('SEC-V261-ROUND5: R4-H1..H3 O(N) Scanners, R4-M6..M7 XSS/Sentinel Hygiene, 
   extractHtmlDocument('<p>ok</p>' + '<x'.repeat(8_000), { baseUrl: 'https://example.com/' });
   assert.ok(performance.now() - tH1Start < 150, 'R4-H1 <x.repeat(8000) must finish in linear time');
 
+  const covMul = process.env.NODE_V8_COVERAGE ? 3 : 1;
   const tH2AttrStart = performance.now();
   extractHtmlDocument(`<p><a ${'a'.repeat(32_000)}>link</a></p>`, { baseUrl: 'https://example.com/' });
-  assert.ok(performance.now() - tH2AttrStart < 150, 'R4-H2 unquoted 32K attribute must finish in linear time');
+  assert.ok(performance.now() - tH2AttrStart < 150 * covMul, 'R4-H2 unquoted 32K attribute must finish in linear time');
 
   const tH2RopeStart = performance.now();
   sanitizeInlineHtmlInMarkdown('[a](/x)'.repeat(18_724), 'https://example.com/');
-  assert.ok(performance.now() - tH2RopeStart < 200, 'R4-H2 18.7K markdown links must not trigger quadratic slice');
+  assert.ok(performance.now() - tH2RopeStart < 200 * covMul, 'R4-H2 18.7K markdown links must not trigger quadratic slice');
 
   const tH2LtStart = performance.now();
   sanitizeInlineHtmlInMarkdown('<'.repeat(500_000), 'https://example.com/');
-  assert.ok(performance.now() - tH2LtStart < 250, 'R4-H2 500K < chars must scan linearly');
+  assert.ok(performance.now() - tH2LtStart < 250 * covMul, 'R4-H2 500K < chars must scan linearly');
 
   const tH2ShopStart = performance.now();
   assert.equal(isShopifyHtmlOrHeaders('a'.repeat(120_000)), false);
-  assert.ok(performance.now() - tH2ShopStart < 100, 'R4-H2 Shopify marker scan on 120K a must finish in <100ms');
+  assert.ok(performance.now() - tH2ShopStart < 100 * covMul, 'R4-H2 Shopify marker scan on 120K a must finish in <100ms');
 
   // 2. R4-H3 safe user regex guard rejects multi-unbounded polynomial pattern with $ anchor
   assert.equal(compileSafeUserRegex('a*(b)?aa*(b)?aa*$'), null, 'R4-H3 polynomial regex must be rejected');
@@ -7081,8 +7082,12 @@ test('SEC-R2-B7: branch polish pass across auth, bot-auth, spa-fallback, overflo
       new Response(
         new ReadableStream({
           pull() {
-            return new Promise((_res, rej) => {
-              init?.signal?.addEventListener('abort', () => rej(new Error('aborted')));
+            return new Promise((resolve, rej) => {
+              const keepAlive = setTimeout(resolve, 1_000);
+              init?.signal?.addEventListener('abort', () => {
+                clearTimeout(keepAlive);
+                rej(new Error('aborted'));
+              });
             });
           },
         }),

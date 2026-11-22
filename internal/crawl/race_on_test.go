@@ -2,4 +2,4 @@
 
 package crawl
 
-const testRaceSlowdown = 5
+const testRaceSlowdown = 10

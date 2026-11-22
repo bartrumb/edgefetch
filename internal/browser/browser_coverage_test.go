@@ -475,6 +475,83 @@ func TestRendererHelpersHeadersEnvSnapAndHostPolicy(t *testing.T) {
 		t.Fatal("expected :FATAL: oom.cc not to match sandbox failure")
 	}
 
+	// R7: canFallbackToNoSandboxLocked policy matrix (default fail-closed; opt-in EDGEFETCH_ALLOW_NO_SANDBOX=1; hard override EDGEFETCH_REQUIRE_BROWSER_SANDBOX=1).
+	t.Run("r7_sandbox_fallback_policy", func(t *testing.T) {
+		t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "")
+		t.Setenv("EDGEFETCH_REQUIRE_BROWSER_SANDBOX", "")
+		rDef := NewRenderer("/fake/chrome", nil, "UA", 1, nil)
+		if rDef.canFallbackToNoSandboxLocked() {
+			t.Fatal("SECURITY: default Renderer must NOT allow --no-sandbox fallback without EDGEFETCH_ALLOW_NO_SANDBOX=1")
+		}
+
+		t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
+		rOptIn := NewRenderer("/fake/chrome", nil, "UA", 1, nil)
+		if !rOptIn.canFallbackToNoSandboxLocked() {
+			t.Fatal("expected EDGEFETCH_ALLOW_NO_SANDBOX=1 to allow --no-sandbox fallback when requireSandbox is unset")
+		}
+
+		t.Setenv("EDGEFETCH_REQUIRE_BROWSER_SANDBOX", "1")
+		rOverride := NewRenderer("/fake/chrome", nil, "UA", 1, nil)
+		if rOverride.canFallbackToNoSandboxLocked() {
+			t.Fatal("SECURITY: EDGEFETCH_REQUIRE_BROWSER_SANDBOX=1 must override EDGEFETCH_ALLOW_NO_SANDBOX=1")
+		}
+	})
+
+	// R7: buildChromiumLaunchArgs LAN Cast / MediaRouter / mDNS (:8009) suppression flags & seccomp profile integrity.
+	t.Run("r7_cast_suppression_flags_and_seccomp_profile", func(t *testing.T) {
+		args := buildChromiumLaunchArgs("/tmp/ud", "http://127.0.0.1:9999")
+		joined := strings.Join(args, "\n")
+		for _, mustFlag := range []string{
+			"--media-router=0",
+			"--disable-component-extensions-with-background-pages",
+			"--disable-domain-reliability",
+			"--disable-client-side-phishing-detection",
+			"MediaRouter",
+			"DialMediaRouteProvider",
+			"CastMediaRouteProvider",
+		} {
+			if !strings.Contains(joined, mustFlag) {
+				t.Fatalf("missing Chromium network-hardening flag %q in %v", mustFlag, args)
+			}
+		}
+
+		seccompBytes, err := os.ReadFile(filepath.Join("..", "..", "deploy", "seccomp", "chromium-sandbox.json"))
+		if err != nil {
+			t.Fatalf("read deploy/seccomp/chromium-sandbox.json: %v", err)
+		}
+		var profile struct {
+			DefaultAction string `json:"defaultAction"`
+			Syscalls      []struct {
+				Names  []string `json:"names"`
+				Action string   `json:"action"`
+			} `json:"syscalls"`
+		}
+		if err := json.Unmarshal(seccompBytes, &profile); err != nil {
+			t.Fatalf("invalid seccomp JSON: %v", err)
+		}
+		if profile.DefaultAction != "SCMP_ACT_ERRNO" {
+			t.Fatalf("expected defaultAction SCMP_ACT_ERRNO, got %q", profile.DefaultAction)
+		}
+		allowed := make(map[string]bool)
+		for _, rule := range profile.Syscalls {
+			if rule.Action == "SCMP_ACT_ALLOW" {
+				for _, n := range rule.Names {
+					allowed[n] = true
+				}
+			}
+		}
+		for _, need := range []string{"clone", "clone3", "unshare", "setns", "chroot", "seccomp", "prctl"} {
+			if !allowed[need] {
+				t.Fatalf("seccomp profile missing required Chromium sandbox syscall %q", need)
+			}
+		}
+		for _, forbidden := range []string{"kexec_load", "init_module", "finit_module", "bpf", "perf_event_open", "userfaultfd", "keyctl", "mount", "umount2", "pivot_root", "ptrace", "acct", "swapon", "swapoff"} {
+			if allowed[forbidden] {
+				t.Fatalf("SECURITY: seccomp profile must NOT allow dangerous syscall %q", forbidden)
+			}
+		}
+	})
+
 	if runtime.GOOS != "linux" {
 		return
 	}
@@ -1309,21 +1386,32 @@ func TestRendererProbeStartupPipeLaunchAndSandboxFallback(t *testing.T) {
 		t.Skip("Linux-specific sandbox fallback & /proc helper test")
 	}
 
-	// 2. Helper script: fallback_ok (fails without --no-sandbox, succeeds with --no-sandbox + split-frame pipe response!).
+	// 2a. Default (EDGEFETCH_ALLOW_NO_SANDBOX unset): fallback_ok MUST fail closed instead of silently running --no-sandbox!
 	fallbackBin := makeChromeHelperWrapper(t, "fallback_ok")
 	NewRenderer(fallbackBin, nil, "UA", 1, nil).ProbeStartup(cancelledCtx)
 
+	t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "")
+	t.Setenv("EDGEFETCH_REQUIRE_BROWSER_SANDBOX", "")
 	var logBuf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	rDefaultDeny := NewRenderer(fallbackBin, nil, "UA", 1, log)
+	defer rDefaultDeny.Close()
+	rDefaultDeny.ProbeStartup(context.Background())
+	if rDefaultDeny.Available() {
+		t.Fatalf("SECURITY: expected ProbeStartup without EDGEFETCH_ALLOW_NO_SANDBOX=1 to fail closed, log=%s", logBuf.String())
+	}
+
+	// 2b. Explicit EDGEFETCH_ALLOW_NO_SANDBOX=1: fallback_ok succeeds with --no-sandbox + split-frame pipe response!
+	t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
 	rFallback := NewRenderer(fallbackBin, nil, "UA", 1, log)
 	defer rFallback.Close()
 	rFallback.ProbeStartup(context.Background())
 	ver, sb := rFallback.BrowserInfo()
 	if ver == "" || sb != "off" || !rFallback.Available() {
-		t.Fatalf("expected sandbox fallback to succeed and remain Available, got ver=%q sb=%q avail=%v log=%s", ver, sb, rFallback.Available(), logBuf.String())
+		t.Fatalf("expected opt-in sandbox fallback to succeed and remain Available, got ver=%q sb=%q avail=%v log=%s", ver, sb, rFallback.Available(), logBuf.String())
 	}
 
-	// 3. Helper script: fatal_sandbox with EDGEFETCH_REQUIRE_BROWSER_SANDBOX=1 -> disabledByPolicy = true, Available() = false.
+	// 3. Helper script: fatal_sandbox with BOTH EDGEFETCH_ALLOW_NO_SANDBOX=1 and EDGEFETCH_REQUIRE_BROWSER_SANDBOX=1 -> disabledByPolicy = true, Available() = false.
 	fatalBin := makeChromeHelperWrapper(t, "fatal_sandbox")
 	t.Setenv("EDGEFETCH_REQUIRE_BROWSER_SANDBOX", "1")
 	rPolicy := NewRenderer(fatalBin, nil, "UA", 1, log)
@@ -1332,6 +1420,8 @@ func TestRendererProbeStartupPipeLaunchAndSandboxFallback(t *testing.T) {
 	if rPolicy.Available() {
 		t.Fatal("expected Available() == false when fatal_sandbox hits EDGEFETCH_REQUIRE_BROWSER_SANDBOX=1")
 	}
+	t.Setenv("EDGEFETCH_REQUIRE_BROWSER_SANDBOX", "")
+	t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "")
 
 	// 4. Nonexistent chromeBin -> cmd.Start() error.
 	rMissing := NewRenderer("/nonexistent/chrome-bin-xyz", nil, "UA", 1, nil)
@@ -1383,11 +1473,18 @@ func TestRendererProbeStartupPipeLaunchAndSandboxFallback(t *testing.T) {
 	if _, err := rPreDeny.ensureBrowser(context.Background()); !errors.Is(err, ErrBrowserUnavailable) {
 		t.Fatalf("expected ErrBrowserUnavailable on subsequent ensureBrowser when disabledByPolicy is true, got %v", err)
 	}
+	rPreDefaultDeny := NewRenderer(fallbackBin, nil, "UA", 1, log)
+	rPreDefaultDeny.requireSandbox = false
+	rPreDefaultDeny.allowNoSandbox = false
+	if _, err := rPreDefaultDeny.ensureBrowser(context.Background()); err == nil || !rPreDefaultDeny.disabledByPolicy {
+		t.Fatalf("expected pre-check default denial when allowNoSandbox=false, got err=%v disabled=%v", err, rPreDefaultDeny.disabledByPolicy)
+	}
 	rPreFallback := NewRenderer(fallbackBin, nil, "UA", 1, log)
 	rPreFallback.requireSandbox = false
+	rPreFallback.allowNoSandbox = true
 	defer rPreFallback.Close()
 	if _, err := rPreFallback.ensureBrowser(context.Background()); err != nil || !rPreFallback.sandboxFallback {
-		t.Fatalf("expected pre-check sandboxFallback to succeed, got err=%v fallback=%v", err, rPreFallback.sandboxFallback)
+		t.Fatalf("expected pre-check opt-in sandboxFallback to succeed, got err=%v fallback=%v", err, rPreFallback.sandboxFallback)
 	}
 
 	// 9. hang helper + readProcFile returning zombie "Z" stat -> triggers isLinuxProcessZombieOrDead in 50ms ticker and reason == "" error.

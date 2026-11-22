@@ -3,12 +3,14 @@
  *
  * Routes:
  *  - `POST /v1/dev-errors`:
- *      1. Enforces `<= 8 KiB` (`8192` bytes) streaming body cap (`413` on overflow).
- *      2. Enforces per-IP token-bucket rate limit (`<= 30 req/min`, IPv6 `/64` bucketed, `429` + `Retry-After`).
- *      3. Enforces strict allowlist schema validation (`400` if ANY unexpected key or `http://` / `https://` / `://` URL
- *         substring appears in ANY field — anti-PII & anti-poisoning!).
- *      4. Computes deterministic SHA-256 `fingerprint` over `(version, runtime, spanName, adapterId, wafVendor, httpStatus, errorClass)`
- *         and upserts `error_fingerprints` in D1 (`count = count + 1`, `last_seen_at`, bounded row cap!).
+ *      1. Enforces `<= 8 KiB` (`8192` bytes) streaming body cap (`413` on overflow) + cross-origin simple-POST CSRF guard.
+ *      2. Enforces two-tier token-bucket rate limit (`<= 30 req/min` per IPv4 or IPv6 `/64`, `<= 60 req/min` aggregate
+ *         per IPv6 `/48`, non-evicting active-lockout map, plus bounded global new-fingerprint creation rate!).
+ *      3. Enforces strict enum/allowlist schema validation (`400` if ANY unexpected key, URL/path substring, hostname,
+ *         or unknown `spanName`/`adapterId`/`wafVendor`/`errorClass`/`os`/`arch`/`mode`/non-semver `version` appears!).
+ *      4. Deduplicates fingerprints within each POST (`<= 8` events/POST) and upserts `error_fingerprints` in D1,
+ *         evicting ONLY stale `count = 1` rows (`ORDER BY count ASC, last_seen_at ASC LIMIT 1`) when `maxRows` is full
+ *         so multi-hit real regressions (`count >= 2`) can NEVER be blinded by single-hit floods!
  *  - `GET /v1/dev-errors/summary`:
  *      Bearer `TELEMETRY_ADMIN_TOKEN`-authenticated (`>= 24` chars, constant-time SHA-256 comparison) triage endpoint
  *      returning top broken adapters & WAF regressions sorted by `count DESC, last_seen_at DESC`.
@@ -48,12 +50,14 @@ export interface ValidatedDevErrorEvent {
 }
 
 export const MAX_INGEST_BODY_BYTES = 8_192; // Strict 8 KiB cap
-export const RATE_LIMIT_CAPACITY = 30; // <= 30 req/min per IP bucket
+export const RATE_LIMIT_CAPACITY = 30; // <= 30 req/min per IPv4 or IPv6 `/64`
+export const IPV6_PREFIX48_RATE_LIMIT_CAPACITY = 60; // <= 60 req/min aggregate across an entire IPv6 `/48`
+export const GLOBAL_NEW_FINGERPRINTS_PER_MIN = 250; // Bounds brand-new D1 row churn across distributed IPs
 export const RATE_LIMIT_WINDOW_MS = 60_000;
 export const DEFAULT_MAX_FINGERPRINT_ROWS = 10_000;
 export const MIN_ADMIN_TOKEN_LENGTH = 24;
-const MAX_EVENTS_PER_POST = 16;
-const MAX_IP_BUCKETS = 4_096;
+export const MAX_EVENTS_PER_POST = 8;
+const MAX_IP_BUCKETS = 32_768;
 
 const SECURITY_JSON_HEADERS: Record<string, string> = {
   'content-type': 'application/json; charset=utf-8',
@@ -71,7 +75,7 @@ function jsonResponse(data: unknown, status = 200, extraHeaders?: Record<string,
   });
 }
 
-// ── Per-IP Token-Bucket Rate Limiter (`<= 30 req/min`, IPv6 `/64` normalized) ───────────────────────────────────────
+// ── Two-Tier Per-IP & IPv6 `/64` + `/48` Token-Bucket Rate Limiter ─────────────────────────────────────────────────
 
 interface TokenBucket {
   tokens: number;
@@ -79,72 +83,191 @@ interface TokenBucket {
 }
 
 const ipBuckets = new Map<string, TokenBucket>();
+const ipv6Slash48Buckets = new Map<string, TokenBucket>();
+let globalNewFpBucket: TokenBucket = { tokens: GLOBAL_NEW_FINGERPRINTS_PER_MIN, lastRefillMs: Date.now() };
 
 export function resetCollectorRateLimiters(): void {
   ipBuckets.clear();
+  ipv6Slash48Buckets.clear();
+  globalNewFpBucket = { tokens: GLOBAL_NEW_FINGERPRINTS_PER_MIN, lastRefillMs: Date.now() };
+}
+
+function parseStrictIpv4(raw: string): string | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(raw);
+  if (!m) return null;
+  const octets: number[] = [];
+  for (let i = 1; i <= 4; i++) {
+    const part = m[i]!;
+    if (part.length > 1 && part.startsWith('0')) return null;
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    octets.push(n);
+  }
+  return octets.join('.');
+}
+
+function expandIpv6Hextets(raw: string): string[] | null {
+  const zoneIdx = raw.indexOf('%');
+  let clean = zoneIdx >= 0 ? raw.slice(0, zoneIdx) : raw;
+  const lastColon = clean.lastIndexOf(':');
+  if (lastColon >= 0 && clean.slice(lastColon + 1).includes('.')) {
+    const v4 = parseStrictIpv4(clean.slice(lastColon + 1));
+    if (!v4) return null;
+    const nums = v4.split('.').map(Number);
+    const hi = ((nums[0]! << 8) | nums[1]!).toString(16);
+    const lo = ((nums[2]! << 8) | nums[3]!).toString(16);
+    clean = `${clean.slice(0, lastColon)}:${hi}:${lo}`;
+  }
+  const halves = clean.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':').filter(Boolean) : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':').filter(Boolean) : [];
+  const missing = 8 - (left.length + right.length);
+  if ((halves.length === 1 && missing !== 0) || missing < 0) return null;
+  const full = [...left, ...Array<string>(halves.length === 2 ? missing : 0).fill('0'), ...right];
+  if (full.length !== 8) return null;
+  const out: string[] = [];
+  for (const h of full) {
+    if (!/^[0-9a-f]{1,4}$/.test(h)) return null;
+    out.push(h.padStart(4, '0'));
+  }
+  return out;
+}
+
+export function normalizeClientIpBuckets(rawIp: string | null | undefined): {
+  primaryKey: string;
+  ipv6Prefix48Key: string | null;
+} {
+  const trimmed = (rawIp ?? '').trim().toLowerCase();
+  if (!trimmed) return { primaryKey: 'unknown', ipv6Prefix48Key: null };
+  if (trimmed.includes(',') || /\s/.test(trimmed)) {
+    return { primaryKey: 'invalid', ipv6Prefix48Key: null };
+  }
+  let clean = trimmed;
+  if (clean.startsWith('[') && clean.includes(']')) {
+    clean = clean.slice(1, clean.indexOf(']'));
+  } else {
+    const v4Port = /^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/.exec(clean);
+    if (v4Port) clean = v4Port[1]!;
+  }
+  if (clean.startsWith('::ffff:')) {
+    const v4 = parseStrictIpv4(clean.slice('::ffff:'.length));
+    if (v4) return { primaryKey: v4, ipv6Prefix48Key: null };
+  }
+  const directV4 = parseStrictIpv4(clean);
+  if (directV4) {
+    return { primaryKey: directV4, ipv6Prefix48Key: null };
+  }
+  if (clean.includes(':')) {
+    const hextets = expandIpv6Hextets(clean);
+    if (hextets) {
+      const isZeros0to4 =
+        hextets[0] === '0000' &&
+        hextets[1] === '0000' &&
+        hextets[2] === '0000' &&
+        hextets[3] === '0000' &&
+        hextets[4] === '0000';
+      if (isZeros0to4 && hextets[5] === 'ffff') {
+        const hi = parseInt(hextets[6]!, 16);
+        const lo = parseInt(hextets[7]!, 16);
+        const mappedV4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+        return { primaryKey: mappedV4, ipv6Prefix48Key: null };
+      }
+      return {
+        primaryKey: `${hextets.slice(0, 4).join(':')}::/64`,
+        ipv6Prefix48Key: `${hextets.slice(0, 3).join(':')}::/48`,
+      };
+    }
+  }
+  return { primaryKey: 'invalid', ipv6Prefix48Key: null };
 }
 
 export function normalizeRateLimitClientIp(rawIp: string | null | undefined): string {
-  const trimmed = (rawIp ?? '').trim().toLowerCase();
-  if (!trimmed) return 'unknown';
-  const noBrackets = trimmed.startsWith('[') && trimmed.endsWith(']') ? trimmed.slice(1, -1) : trimmed;
-  if (noBrackets.startsWith('::ffff:')) {
-    const v4 = noBrackets.slice('::ffff:'.length);
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(v4)) return v4;
+  return normalizeClientIpBuckets(rawIp).primaryKey;
+}
+
+function tryAcquireBucketToken(
+  map: Map<string, TokenBucket>,
+  key: string,
+  capacity: number,
+  nowMs: number,
+): { ok: true; bucket: TokenBucket; isNew: boolean } | { ok: false; retryAfterSec: number } {
+  const refillPerMs = capacity / RATE_LIMIT_WINDOW_MS;
+  const existing = map.get(key);
+  if (existing) {
+    const elapsed = Math.max(0, nowMs - existing.lastRefillMs);
+    const nextTokens = Math.min(capacity, existing.tokens + elapsed * refillPerMs);
+    existing.tokens = nextTokens;
+    existing.lastRefillMs = nowMs;
+    if (nextTokens < 1) {
+      const neededMs = (1 - nextTokens) / refillPerMs;
+      return { ok: false, retryAfterSec: Math.max(1, Math.ceil(neededMs / 1_000)) };
+    }
+    return { ok: true, bucket: existing, isNew: false };
   }
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(noBrackets)) {
-    return noBrackets;
-  }
-  if (noBrackets.includes(':')) {
-    // Canonicalize IPv6 to `/64` prefix (first 4 hextets) so rotating `/64` interface IDs share one bucket.
-    const parts = noBrackets.split('::');
-    if (parts.length <= 2) {
-      const left = parts[0] ? parts[0].split(':').filter(Boolean) : [];
-      const right = parts.length === 2 && parts[1] ? parts[1].split(':').filter(Boolean) : [];
-      const missing = Math.max(0, 8 - (left.length + right.length));
-      const full = [...left, ...Array<string>(missing).fill('0'), ...right]
-        .slice(0, 4)
-        .map((h) => h.padStart(4, '0'));
-      if (full.length === 4) return `${full.join(':')}::/64`;
+
+  if (map.size >= MAX_IP_BUCKETS) {
+    // Sweep expired/idle buckets first; NEVER evict an actively exhausted (`tokens < 1`) bucket within the 60s window!
+    for (const [k, b] of map) {
+      if (nowMs - b.lastRefillMs >= RATE_LIMIT_WINDOW_MS || b.tokens >= capacity - 1) {
+        map.delete(k);
+        if (map.size < MAX_IP_BUCKETS) break;
+      }
+    }
+    if (map.size >= MAX_IP_BUCKETS) {
+      return { ok: false, retryAfterSec: 5 };
     }
   }
-  return noBrackets.slice(0, 64);
+  const created: TokenBucket = { tokens: capacity, lastRefillMs: nowMs };
+  return { ok: true, bucket: created, isNew: true };
 }
 
 export function consumeIpRateLimit(
   rawIp: string | null | undefined,
   nowMs = Date.now(),
 ): { allowed: true; remaining: number } | { allowed: false; retryAfterSec: number } {
-  const key = normalizeRateLimitClientIp(rawIp);
-  let bucket = ipBuckets.get(key);
-  const refillPerMs = RATE_LIMIT_CAPACITY / RATE_LIMIT_WINDOW_MS;
+  const { primaryKey, ipv6Prefix48Key } = normalizeClientIpBuckets(rawIp);
 
-  if (!bucket) {
-    if (ipBuckets.size >= MAX_IP_BUCKETS) {
-      // Evict oldest map entry (`O(1)`)
-      const oldestKey = ipBuckets.keys().next().value;
-      if (oldestKey !== undefined) ipBuckets.delete(oldestKey);
+  const p64Check = tryAcquireBucketToken(ipBuckets, primaryKey, RATE_LIMIT_CAPACITY, nowMs);
+  if (!p64Check.ok) {
+    return { allowed: false, retryAfterSec: p64Check.retryAfterSec };
+  }
+
+  let p48Check: { ok: true; bucket: TokenBucket; isNew: boolean } | null = null;
+  if (ipv6Prefix48Key !== null) {
+    const res48 = tryAcquireBucketToken(ipv6Slash48Buckets, ipv6Prefix48Key, IPV6_PREFIX48_RATE_LIMIT_CAPACITY, nowMs);
+    if (!res48.ok) {
+      return { allowed: false, retryAfterSec: res48.retryAfterSec };
     }
-    bucket = { tokens: RATE_LIMIT_CAPACITY - 1, lastRefillMs: nowMs };
-    ipBuckets.set(key, bucket);
-    return { allowed: true, remaining: Math.floor(bucket.tokens) };
+    p48Check = res48;
   }
 
-  const elapsed = Math.max(0, nowMs - bucket.lastRefillMs);
-  bucket.tokens = Math.min(RATE_LIMIT_CAPACITY, bucket.tokens + elapsed * refillPerMs);
-  bucket.lastRefillMs = nowMs;
+  p64Check.bucket.tokens -= 1;
+  if (!p64Check.isNew) ipBuckets.delete(primaryKey);
+  ipBuckets.set(primaryKey, p64Check.bucket);
 
-  if (bucket.tokens < 1) {
-    const neededMs = (1 - bucket.tokens) / refillPerMs;
-    const retryAfterSec = Math.max(1, Math.ceil(neededMs / 1_000));
-    return { allowed: false, retryAfterSec };
+  let remaining = Math.floor(p64Check.bucket.tokens);
+  if (p48Check && ipv6Prefix48Key !== null) {
+    p48Check.bucket.tokens -= 1;
+    if (!p48Check.isNew) ipv6Slash48Buckets.delete(ipv6Prefix48Key);
+    ipv6Slash48Buckets.set(ipv6Prefix48Key, p48Check.bucket);
+    remaining = Math.min(remaining, Math.floor(p48Check.bucket.tokens));
   }
 
-  bucket.tokens -= 1;
-  // Refresh insertion order for LRU behavior
-  ipBuckets.delete(key);
-  ipBuckets.set(key, bucket);
-  return { allowed: true, remaining: Math.floor(bucket.tokens) };
+  return { allowed: true, remaining };
+}
+
+function consumeGlobalNewFingerprintBudget(nowMs: number): boolean {
+  const refillPerMs = GLOBAL_NEW_FINGERPRINTS_PER_MIN / RATE_LIMIT_WINDOW_MS;
+  const elapsed = Math.max(0, nowMs - globalNewFpBucket.lastRefillMs);
+  globalNewFpBucket.tokens = Math.min(
+    GLOBAL_NEW_FINGERPRINTS_PER_MIN,
+    globalNewFpBucket.tokens + elapsed * refillPerMs,
+  );
+  globalNewFpBucket.lastRefillMs = nowMs;
+  if (globalNewFpBucket.tokens < 1) return false;
+  globalNewFpBucket.tokens -= 1;
+  return true;
 }
 
 // ── Streaming `<= 8 KiB` Body Reader ───────────────────────────────────────────────────────────────────────────────
@@ -198,7 +321,7 @@ async function readBodyCapped8KiB(
   return { ok: true, text: new TextDecoder().decode(merged), byteLength: total };
 }
 
-// ── Strict Allowlist Schema Validation (Anti-PII & Anti-Poisoning) ─────────────────────────────────────────────────
+// ── Strict Enum / Allowlist Schema Validation (Anti-PII, Zero-Hostname & Anti-Blinding) ────────────────────────────
 
 const EVENT_ALLOWED_KEYS = new Set([
   'schemaVersion',
@@ -215,13 +338,267 @@ const EVENT_ALLOWED_KEYS = new Set([
 ]);
 
 const VALID_RUNTIMES = new Set<CollectorRuntime>(['workers', 'node', 'deno', 'go']);
-const VERSION_RE = /^[A-Za-z0-9._+-]{1,32}$/;
-const SHORT_TOKEN_RE = /^[a-z0-9_-]{1,32}$/;
-const MODE_RE = /^[a-z0-9_,-]{1,32}$/;
-const SPAN_NAME_RE = /^[A-Za-z0-9._:-]{1,96}$/;
-const ADAPTER_ID_RE = /^[A-Za-z0-9._:-]{0,64}$/;
-const WAF_VENDOR_RE = /^[a-z0-9_-]{0,32}$/;
-const ERROR_CLASS_RE = /^[a-z0-9_:-]{1,64}$/;
+const VERSION_RE = /^(?:\d{1,3}\.\d{1,3}\.\d{1,4}(?:-(?:alpha|beta|rc)(?:\.\d{1,3})?)?|dev|unknown)$/;
+const SPAN_NAME_RE =
+  /^(?:edgefetch\.(?:go|http|scrape|batch_scrape|ingest_tab|fetch|extract|search|collection_search|jobs|catalog|map|crawl|interact|agent|agents|browser|bug_report|mcp|mcp_registry|mcp_query|llm|dispatch|admin|oauth|artifacts|hub|spa_fallback|span|cache|overflow|ingest|webhook|capabilities|extractors|hosts)(?:\.[a-z0-9_]{1,24}){0,2}|cache:(?:r2-d1|private-r2|304))$/;
+
+const VALID_OS = new Set([
+  'linux',
+  'darwin',
+  'win32',
+  'windows',
+  'freebsd',
+  'openbsd',
+  'netbsd',
+  'android',
+  'aix',
+  'sunos',
+  'cloudflare',
+  'unknown',
+]);
+
+const VALID_ARCH = new Set([
+  'x64',
+  'amd64',
+  'arm64',
+  'aarch64',
+  'arm',
+  'ia32',
+  '386',
+  'riscv64',
+  'ppc64',
+  'ppc64le',
+  's390x',
+  'v8',
+  'wasm32',
+  'unknown',
+]);
+
+const VALID_MODES = new Set(['hub', 'agent', 'server', 'serve', 'mcp', 'desktop', 'cli', 'portable', 'worker', 'container']);
+
+const VALID_WAF_VENDORS = new Set([
+  'cloudflare',
+  'akamai',
+  'datadome',
+  'perimeterx',
+  'aws-waf',
+  'imperva',
+  'vercel',
+  'fastly',
+  'kasada',
+  'sucuri',
+  'f5',
+  'radware',
+  'turnstile',
+  'hcaptcha',
+  'recaptcha',
+  'generic',
+]);
+
+const VALID_ERROR_CLASSES = new Set([
+  'waf_challenge',
+  'waf_block',
+  'rate_limited',
+  'payment_required',
+  'robots_disallowed',
+  'ssrf_blocked',
+  'timeout',
+  'tls_error',
+  'dns_error',
+  'connect_error',
+  'browser_error',
+  'adapter_error',
+  'http_401',
+  'http_403',
+  'http_404',
+  'http_4xx',
+  'http_5xx',
+  'internal_error',
+]);
+
+const VALID_ADAPTER_IDS = new Set([
+  'apple-app-store',
+  'arbeitnow',
+  'arbeitnow-feed',
+  'arcgis',
+  'arxiv',
+  'ashby',
+  'atom',
+  'bamboohr',
+  'bamboohr-board',
+  'bamboohr-breezy-recruitee',
+  'bamboohr-job',
+  'big-cartel',
+  'bigcommerce',
+  'blogger',
+  'bluesky',
+  'bluesky-thread',
+  'breezy-hr',
+  'breezyhr',
+  'bubble',
+  'ckan',
+  'clinicaltrials',
+  'craft-cms',
+  'crates-io',
+  'datacite',
+  'defuddle',
+  'deps-dev',
+  'dev-to',
+  'discourse',
+  'discourse-topic',
+  'dockerhub',
+  'docsify',
+  'docusaurus',
+  'doi-crossref',
+  'drupal',
+  'duda',
+  'enterprise-ats',
+  'federalregister',
+  'framer',
+  'gem',
+  'gem-ats',
+  'gem-board',
+  'generic',
+  'ghost',
+  'github',
+  'github-gist',
+  'gitlab',
+  'gitlab-blob-json',
+  'gitlab-forgejo',
+  'gitlab-readme-json',
+  'godaddy-builder',
+  'google-play',
+  'greenhouse',
+  'greenhouse-board',
+  'greenhouse-eu-board',
+  'greenhouse-job',
+  'greenhouse-lever',
+  'greenhouse-lever-boards',
+  'hackernews',
+  'hex-pm',
+  'himalayas',
+  'himalayas-feed',
+  'homebrew',
+  'huggingface',
+  'huggingface-blob',
+  'huggingface-card',
+  'icims',
+  'ietf-rfc',
+  'internet-archive',
+  'ipynb',
+  'jazzhr',
+  'jibe-careers',
+  'jimdo',
+  'jobicy',
+  'jobicy-feed',
+  'jobvite',
+  'joomla',
+  'jsonld',
+  'jsr',
+  'jsr-io',
+  'kajabi',
+  'legistar',
+  'lemmy',
+  'lever',
+  'lever-board',
+  'lever-eu-board',
+  'lever-job',
+  'llms-txt',
+  'lobsters',
+  'mastodon',
+  'mastodon-status',
+  'maven-central',
+  'mcp-federated',
+  'mediawiki',
+  'mkdocs-material',
+  'nextra',
+  'nist-nvd',
+  'notion',
+  'npm',
+  'npm-registry',
+  'nuget',
+  'openalex',
+  'openapi',
+  'opencart',
+  'openfda',
+  'openfoodfacts',
+  'openrouter',
+  'oracle-hcm',
+  'oracle-hcm-board',
+  'oracle-hcm-job',
+  'packagist',
+  'pdf',
+  'pdf-ocr',
+  'personio',
+  'pinpoint',
+  'pkg-go-dev',
+  'pmc-europepmc',
+  'podia',
+  'polymarket',
+  'pubchem',
+  'public-job-feeds',
+  'pubmed-europepmc',
+  'pubmed-pmc',
+  'pypi',
+  'pypi-project',
+  'recruitee',
+  'reddit',
+  'reddit-thread',
+  'remoteok',
+  'remoteok-feed',
+  'rippling',
+  'rippling-board',
+  'rippling-job',
+  'rss',
+  'rubygems',
+  'salesforce-experience-cloud',
+  'sap-rmk',
+  'sap-rmk-jibe',
+  'sec-edgar',
+  'shopify',
+  'shopify-catalog-page',
+  'sitemap',
+  'smartrecruiters',
+  'socrata',
+  'square-online',
+  'squarespace',
+  'ssr-hydration',
+  'stackexchange',
+  'stackexchange-qa',
+  'storybook',
+  'substack',
+  'swagger-ui',
+  'teachable',
+  'teamtailor',
+  'themuse',
+  'themuse-feed',
+  'thinkific',
+  'typo3',
+  'unknown',
+  'usaspending',
+  'vitepress',
+  'wayback',
+  'webflow',
+  'weworkremotely',
+  'weworkremotely-feed',
+  'wix',
+  'woocommerce',
+  'woocommerce-catalog-page',
+  'woocommerce-product',
+  'wordpress',
+  'workable',
+  'workable-board',
+  'workable-job',
+  'workatastartup-yc-mirror',
+  'workday',
+  'workday-board',
+  'workday-cxs',
+  'workday-job',
+  'workingnomads',
+  'workingnomads-feed',
+  'ycombinator',
+  'youtube',
+]);
 
 function containsForbiddenUrlOrPii(val: string): boolean {
   const lower = val.toLowerCase();
@@ -248,6 +625,9 @@ export function validateSingleErrorEvent(
     return { ok: false, error: 'invalid object prototype' };
   }
   const obj = raw as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(obj, '__proto__')) {
+    return { ok: false, error: 'unexpected field "__proto__"' };
+  }
   const keys = Object.keys(obj);
   for (const k of keys) {
     if (!EVENT_ALLOWED_KEYS.has(k)) {
@@ -270,28 +650,28 @@ export function validateSingleErrorEvent(
   if (typeof obj.runtime !== 'string' || !VALID_RUNTIMES.has(obj.runtime as CollectorRuntime)) {
     return { ok: false, error: 'invalid runtime' };
   }
-  if (typeof obj.os !== 'string' || !SHORT_TOKEN_RE.test(obj.os)) {
+  if (typeof obj.os !== 'string' || !VALID_OS.has(obj.os)) {
     return { ok: false, error: 'invalid os' };
   }
-  if (typeof obj.arch !== 'string' || !SHORT_TOKEN_RE.test(obj.arch)) {
+  if (typeof obj.arch !== 'string' || !VALID_ARCH.has(obj.arch)) {
     return { ok: false, error: 'invalid arch' };
   }
-  if (typeof obj.mode !== 'string' || !MODE_RE.test(obj.mode)) {
+  if (typeof obj.mode !== 'string' || !VALID_MODES.has(obj.mode)) {
     return { ok: false, error: 'invalid mode' };
   }
   if (typeof obj.spanName !== 'string' || !SPAN_NAME_RE.test(obj.spanName)) {
     return { ok: false, error: 'invalid spanName' };
   }
-  if (typeof obj.adapterId !== 'string' || !ADAPTER_ID_RE.test(obj.adapterId)) {
+  if (typeof obj.adapterId !== 'string' || (obj.adapterId !== '' && !VALID_ADAPTER_IDS.has(obj.adapterId))) {
     return { ok: false, error: 'invalid adapterId' };
   }
-  if (typeof obj.wafVendor !== 'string' || !WAF_VENDOR_RE.test(obj.wafVendor)) {
+  if (typeof obj.wafVendor !== 'string' || (obj.wafVendor !== '' && !VALID_WAF_VENDORS.has(obj.wafVendor))) {
     return { ok: false, error: 'invalid wafVendor' };
   }
   if (typeof obj.httpStatus !== 'number' || !Number.isInteger(obj.httpStatus) || obj.httpStatus < 0 || obj.httpStatus > 599) {
     return { ok: false, error: 'invalid httpStatus' };
   }
-  if (typeof obj.errorClass !== 'string' || !ERROR_CLASS_RE.test(obj.errorClass)) {
+  if (typeof obj.errorClass !== 'string' || !VALID_ERROR_CLASSES.has(obj.errorClass)) {
     return { ok: false, error: 'invalid errorClass' };
   }
 
@@ -391,6 +771,17 @@ export default {
     }
 
     if (request.method === 'POST' && url.pathname === '/v1/dev-errors') {
+      // Block browser cross-origin simple-POST CSRF (`Origin` header or non-JSON `Content-Type` like `text/plain`).
+      const rawCt = request.headers.get('content-type');
+      if (rawCt !== null && !rawCt.trim().toLowerCase().startsWith('application/json')) {
+        await request.body?.cancel().catch(() => undefined);
+        return jsonResponse({ ok: false, error: 'unsupported_media_type' }, 415);
+      }
+      if (request.headers.has('origin')) {
+        await request.body?.cancel().catch(() => undefined);
+        return jsonResponse({ ok: false, error: 'cross_origin_forbidden' }, 403);
+      }
+
       const clientIp = request.headers.get('cf-connecting-ip') ?? 'unknown';
       const rl = consumeIpRateLimit(clientIp);
       if (!rl.allowed) {
@@ -420,12 +811,62 @@ export default {
 
       const nowMs = Date.now();
       const rawMaxRows = Number(env.MAX_ERROR_FINGERPRINTS ?? DEFAULT_MAX_FINGERPRINT_ROWS);
-      const maxRows = Number.isFinite(rawMaxRows) && rawMaxRows >= 1 ? Math.min(100_000, Math.floor(rawMaxRows)) : DEFAULT_MAX_FINGERPRINT_ROWS;
+      const maxRows =
+        Number.isFinite(rawMaxRows) && rawMaxRows >= 1 ? Math.min(100_000, Math.floor(rawMaxRows)) : DEFAULT_MAX_FINGERPRINT_ROWS;
 
-      const fingerprints: string[] = [];
+      // Deduplicate identical fingerprints within a single POST so sending 8 identical events increments `count` by 1, not 8!
+      const uniqueEventsByFp = new Map<string, ValidatedDevErrorEvent>();
       for (const ev of validated.events) {
         const fp = await computeErrorFingerprint(ev);
-        fingerprints.push(fp);
+        if (!uniqueEventsByFp.has(fp)) {
+          uniqueEventsByFp.set(fp, ev);
+        }
+      }
+
+      const acceptedFingerprints: string[] = [];
+      let cachedRowCount: number | null = null;
+
+      for (const [fp, ev] of uniqueEventsByFp) {
+        const existing = await env.DB.prepare('SELECT count FROM error_fingerprints WHERE fingerprint = ?')
+          .bind(fp)
+          .first<{ count: number }>();
+
+        if (existing) {
+          await env.DB.prepare(
+            `UPDATE error_fingerprints
+             SET count = count + 1,
+                 last_seen_at = MAX(last_seen_at, ?)
+             WHERE fingerprint = ?`,
+          )
+            .bind(nowMs, fp)
+            .run();
+          acceptedFingerprints.push(fp);
+          continue;
+        }
+
+        if (!consumeGlobalNewFingerprintBudget(nowMs)) {
+          continue;
+        }
+
+        if (cachedRowCount === null) {
+          const cntRow = await env.DB.prepare('SELECT COUNT(*) AS cnt FROM error_fingerprints').first<{ cnt: number }>();
+          cachedRowCount = Number(cntRow?.cnt ?? 0);
+        }
+
+        if (cachedRowCount >= maxRows) {
+          // Evict ONLY the lowest-value stale row (`count = 1` oldest first, falling back to `count ASC, last_seen_at ASC`)
+          // so multi-hit real regressions (`count >= 2`) are NEVER evicted by single-hit noise!
+          await env.DB.prepare(
+            `DELETE FROM error_fingerprints
+             WHERE fingerprint IN (
+               SELECT fingerprint FROM error_fingerprints
+               ORDER BY count ASC, last_seen_at ASC
+               LIMIT 1
+             )`,
+          ).run();
+          cachedRowCount = Math.max(0, cachedRowCount - 1);
+        }
+
         await env.DB.prepare(
           `INSERT INTO error_fingerprints (
              fingerprint, schema_version, version, runtime, os, arch, mode,
@@ -434,10 +875,7 @@ export default {
            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
            ON CONFLICT(fingerprint) DO UPDATE SET
              count = error_fingerprints.count + 1,
-             last_seen_at = MAX(error_fingerprints.last_seen_at, excluded.last_seen_at),
-             os = excluded.os,
-             arch = excluded.arch,
-             mode = excluded.mode`,
+             last_seen_at = MAX(error_fingerprints.last_seen_at, excluded.last_seen_at)`,
         )
           .bind(
             fp,
@@ -455,21 +893,11 @@ export default {
             nowMs,
           )
           .run();
+        cachedRowCount += 1;
+        acceptedFingerprints.push(fp);
       }
 
-      // Bounded row cap: retain top `maxRows` most recent/frequent fingerprints, evicting oldest rows beyond cap.
-      await env.DB.prepare(
-        `DELETE FROM error_fingerprints
-         WHERE fingerprint IN (
-           SELECT fingerprint FROM error_fingerprints
-           ORDER BY last_seen_at DESC, count DESC
-           LIMIT -1 OFFSET ?
-         )`,
-      )
-        .bind(maxRows)
-        .run();
-
-      return jsonResponse({ ok: true, accepted: fingerprints.length, fingerprints }, 202);
+      return jsonResponse({ ok: true, accepted: acceptedFingerprints.length, fingerprints: acceptedFingerprints }, 202);
     }
 
     if (request.method === 'GET' && url.pathname === '/v1/dev-errors/summary') {
@@ -478,8 +906,8 @@ export default {
         return jsonResponse({ ok: false, error: 'admin_token_unconfigured' }, 503);
       }
       const authHdr = request.headers.get('authorization') ?? '';
-      const bearerMatch = /^Bearer\s+(.+)$/i.exec(authHdr.trim());
-      const supplied = bearerMatch?.[1]?.trim() ?? '';
+      const bearerMatch = /^Bearer\s+(\S+)$/i.exec(authHdr);
+      const supplied = bearerMatch?.[1] ?? '';
       if (!supplied || !(await constantTimeSecretMatch(supplied, adminSecret))) {
         return jsonResponse(
           { ok: false, error: 'unauthorized' },
@@ -500,11 +928,11 @@ export default {
         whereClauses.push('version = ?');
         bindValues.push(versionFilter);
       }
-      if (adapterFilter && ADAPTER_ID_RE.test(adapterFilter)) {
+      if (adapterFilter && VALID_ADAPTER_IDS.has(adapterFilter)) {
         whereClauses.push('adapter_id = ?');
         bindValues.push(adapterFilter);
       }
-      if (wafFilter && WAF_VENDOR_RE.test(wafFilter)) {
+      if (wafFilter && VALID_WAF_VENDORS.has(wafFilter)) {
         whereClauses.push('waf_vendor = ?');
         bindValues.push(wafFilter);
       }

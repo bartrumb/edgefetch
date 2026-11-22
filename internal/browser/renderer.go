@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -43,11 +44,14 @@ const (
 )
 
 var (
-	idleReaperInterval = 30 * time.Second
-	navLoadTimeout     = 15 * time.Second
-	staleInFlightTTL   = 8 * time.Second
-	minIdleBudget      = 3500 * time.Millisecond
-	readProcFile       = os.ReadFile
+	idleReaperInterval       = 30 * time.Second
+	navLoadTimeout           = 15 * time.Second
+	actionNavWatchWindow     = 400 * time.Millisecond
+	actionNavLoadTimeout     = 10 * time.Second
+	enterSubmitFallbackDelay = 50 * time.Millisecond
+	staleInFlightTTL         = 8 * time.Second
+	minIdleBudget            = 3500 * time.Millisecond
+	readProcFile             = os.ReadFile
 )
 
 // InteractAction describes a single deterministic browser interaction step (`firecrawl_interact` & `/scrape` inline `actions` parity).
@@ -76,6 +80,17 @@ type ActionScrapeSnapshot struct {
 type ActionJSReturn struct {
 	Type  string `json:"type"`
 	Value any    `json:"value"`
+}
+
+// ActionResult records per-step outcome diagnostics for browser `interact` actions.
+type ActionResult struct {
+	Index      int    `json:"index"`
+	Type       string `json:"type"`
+	Status     string `json:"status"` // "ok" or "no_effect"
+	URLChanged bool   `json:"urlChanged"`
+	DOMChanged bool   `json:"domChanged"`
+	FinalURL   string `json:"finalUrl,omitempty"`
+	Warning    string `json:"warning,omitempty"`
 }
 
 // Task describes a browser render or interaction request.
@@ -108,6 +123,7 @@ type Output struct {
 	ActionScreenshots []string
 	ActionScrapes     []ActionScrapeSnapshot
 	JavascriptReturns []ActionJSReturn
+	ActionResults     []ActionResult
 	PDFBase64         string
 	SessionID         string
 }
@@ -271,6 +287,8 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 				switch ev.Method {
 				case "Page.frameNavigated":
 					s.noteFrameNavigated(ev.Params)
+				case "Page.frameDetached":
+					s.noteFrameDetached(ev.Params)
 				case "Fetch.requestPaused":
 					s.handleRequestPaused(cdp, ev.Params)
 				}
@@ -402,6 +420,18 @@ func (s *retainedSession) noteFrameNavigated(rawParams json.RawMessage) {
 	s.mu.Unlock()
 }
 
+func (s *retainedSession) noteFrameDetached(rawParams json.RawMessage) {
+	var ev struct {
+		FrameID string `json:"frameId"`
+	}
+	if json.Unmarshal(rawParams, &ev) != nil || ev.FrameID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.frameOrigins, ev.FrameID)
+	s.mu.Unlock()
+}
+
 func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 	type node struct {
 		Frame struct {
@@ -451,7 +481,7 @@ func (s *retainedSession) expectHarnessNavigation(targetURL string) {
 	}
 	targetOrigin := canonicalURLOrigin(targetURL)
 	s.mu.Lock()
-	if s.initialOrigin != "" && targetOrigin == s.initialOrigin && !s.redirectedCrossOrigin {
+	if s.initialOrigin != "" && targetOrigin == s.initialOrigin {
 		s.harnessNavURL = targetURL
 	} else {
 		s.harnessNavURL = ""
@@ -496,32 +526,11 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	extra := s.extraHeaders
 	isMainDoc := strings.EqualFold(paused.ResourceType, "Document") &&
 		(s.mainFrameID == "" || paused.FrameID == "" || paused.FrameID == s.mainFrameID)
-	if isMainDoc {
-		if s.mainFrameID == "" && paused.FrameID != "" {
-			s.mainFrameID = paused.FrameID
-		}
-		if initOrigin != "" {
-			if reqOrigin != initOrigin {
-				// Top-level document navigated or 30x-redirected away from initialOrigin:
-				// mark session cross-origin so subsequent subrequests back to initialOrigin never carry extraHeaders!
-				s.redirectedCrossOrigin = true
-			} else if paused.RedirectedRequestID == "" && paused.RedirectStatusCode == 0 {
-				s.redirectedCrossOrigin = false
-			}
-		}
+	if isMainDoc && s.mainFrameID == "" && paused.FrameID != "" {
+		s.mainFrameID = paused.FrameID
 	}
-	crossTainted := s.redirectedCrossOrigin
 	sameOriginReq := initOrigin != "" && reqOrigin != "" && reqOrigin == initOrigin
 	isDocReq := strings.EqualFold(paused.ResourceType, "Document")
-	if isDocReq && paused.FrameID != "" && !sameOriginReq {
-		// A frame that starts loading a foreign document is no longer a bound frame (Page.frameNavigated is a
-		// renderer-side event and may arrive after the new document's first requests).
-		if s.frameOrigins == nil {
-			s.frameOrigins = make(map[string]string)
-		}
-		s.frameOrigins[paused.FrameID] = ""
-	}
-	frameCommitted, frameKnown := s.frameOrigins[paused.FrameID]
 	// A redirect hop is only as trustworthy as the hop before it: bound -> third party -> bound never gets headers.
 	chainOK := paused.RedirectedRequestID == "" || s.injectedReqs[paused.RedirectedRequestID]
 	harnessHop := false
@@ -537,6 +546,26 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 			s.navChainReqID = paused.RequestID
 		}
 	}
+	if isMainDoc && initOrigin != "" {
+		if reqOrigin != initOrigin {
+			// Top-level document navigated or 30x-redirected away from initialOrigin:
+			// mark session cross-origin so subsequent subrequests back to initialOrigin never carry extraHeaders!
+			s.redirectedCrossOrigin = true
+		} else if harnessHop && paused.RedirectedRequestID == "" && paused.RedirectStatusCode == 0 {
+			// Only a harness-initiated top-level navigation clears cross-origin taint (never an attacker-initiated location= bounce).
+			s.redirectedCrossOrigin = false
+		}
+	}
+	crossTainted := s.redirectedCrossOrigin
+	if isDocReq && paused.FrameID != "" && (!sameOriginReq || harnessHop || crossTainted) {
+		// Clear the frame's committed origin as soon as a new non-bound, harness, or cross-tainted document load starts
+		// so the outgoing document cannot rely on a stale frameOrigins entry while the navigation is in flight.
+		if s.frameOrigins == nil {
+			s.frameOrigins = make(map[string]string)
+		}
+		s.frameOrigins[paused.FrameID] = ""
+	}
+	frameCommitted, frameKnown := s.frameOrigins[paused.FrameID]
 	proof := hasPositiveSameOriginProof(paused.Request.Headers, initOrigin)
 	allowInject := false
 	switch {
@@ -549,10 +578,11 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 		// an attacker but never forged, so "absent" must mean "no headers".
 		allowInject = !crossTainted && chainOK && proof
 	default:
-		// Subresource / sub-frame document: positive proof, or (for no-referrer bound pages) a requesting frame whose
-		// committed document is known to be on the bound origin and no header naming another origin.
+		// Subresource / sub-frame document: positive proof, or (strictly for non-document subresources on no-referrer
+		// bound pages) a requesting frame whose committed document is known to be on the bound origin and no header
+		// naming another origin. Never trust paused.FrameID on Document requests (it names the target frame, not the initiator!).
 		allowInject = !crossTainted && chainOK && isSameOriginInitiatorHeaders(paused.Request.Headers, initOrigin) &&
-			(proof || (frameKnown && frameCommitted == initOrigin))
+			(proof || (!isDocReq && frameKnown && frameCommitted == initOrigin))
 	}
 	if allowInject && len(extra) > 0 {
 		if s.injectedReqs == nil || len(s.injectedReqs) > 4096 {
@@ -580,6 +610,15 @@ func (s *retainedSession) getLastCheckedURL() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastCheckedURL
+}
+
+func (s *retainedSession) getMainFrameID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mainFrameID
 }
 
 func (s *retainedSession) setLastCheckedURL(u string) {
@@ -698,9 +737,12 @@ type Renderer struct {
 	log            *slog.Logger
 	sem            chan struct{}
 	requireSandbox bool
+	allowNoSandbox bool
 
-	// Optional hook allowing unit tests to attach a mock CDP WebSocket URL without spawning OS Chromium.
+	// Optional hooks allowing unit/E2E tests to attach a mock CDP WebSocket URL or custom proxy dialer.
 	dialOverrideWS string
+	proxyDial      func(ctx context.Context, network, addr string) (net.Conn, error)
+	extraFlags     []string
 
 	probeOnce        sync.Once
 	mu               sync.Mutex
@@ -722,6 +764,11 @@ type Renderer struct {
 
 func isSandboxRequiredByEnv() bool {
 	v := strings.TrimSpace(os.Getenv("EDGEFETCH_REQUIRE_BROWSER_SANDBOX"))
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+func isNoSandboxAllowedByEnv() bool {
+	v := strings.TrimSpace(os.Getenv("EDGEFETCH_ALLOW_NO_SANDBOX"))
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
@@ -751,6 +798,7 @@ func NewRenderer(chromeBin string, allow func(*url.URL) error, userAgent string,
 		log:            log,
 		sem:            make(chan struct{}, maxConcurrent),
 		requireSandbox: isSandboxRequiredByEnv(),
+		allowNoSandbox: isNoSandboxAllowedByEnv(),
 		sessions:       make(map[string]*retainedSession),
 		sandboxState:   initialSandbox,
 	}
@@ -841,7 +889,7 @@ func (r *Renderer) ProbeStartup(ctx context.Context) {
 			_, _ = r.ensureBrowser(pctx)
 			pcancel()
 			r.mu.Lock()
-			if r.requireSandbox && r.sandboxState == "off" {
+			if (r.requireSandbox || !r.allowNoSandbox) && r.sandboxState == "off" {
 				r.disabledByPolicy = true
 			}
 			r.mu.Unlock()
@@ -991,7 +1039,13 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 				sess.mu.Lock()
 				prevOrigin := sess.initialOrigin
 				sess.initialOrigin = upOrigin
-				sess.redirectedCrossOrigin = task.URL == "" && prevOrigin != "" && prevOrigin != upOrigin
+				if prevOrigin != upOrigin {
+					sess.injectedReqs = nil
+					sess.navChainReqID = ""
+				}
+				if task.URL == "" && prevOrigin != "" && prevOrigin != upOrigin {
+					sess.redirectedCrossOrigin = true
+				}
 				sess.mu.Unlock()
 			} else {
 				sess.mu.Lock()
@@ -1197,29 +1251,36 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		actionScreenshots []string
 		actionScrapes     []ActionScrapeSnapshot
 		jsReturns         []ActionJSReturn
+		actionResults     []ActionResult
 		pdfBase64         string
 	)
+	if len(task.Actions) > 0 {
+		actionResults = make([]ActionResult, 0, len(task.Actions))
+	}
 	for i, act := range task.Actions {
-		if err := r.runAction(ctx, cdp, sess, events, act, &actionScreenshots, &actionScrapes, &jsReturns, &pdfBase64); err != nil {
-			return Output{}, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
+		ar, err := r.runActionStep(ctx, cdp, sess, events, i, act, &actionScreenshots, &actionScrapes, &jsReturns, &pdfBase64)
+		if err != nil {
+			stErr, hErr := sess.snapshotResponseMeta()
+			return Output{Status: stErr, Headers: hErr, ActionResults: actionResults}, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
 		}
+		actionResults = append(actionResults, ar)
 	}
 
 	htmlStr, finalURL, err := readDocumentHTML(ctx, cdp, sess.cdpSessionID)
 	if err != nil {
-		return Output{}, err
+		return Output{ActionResults: actionResults}, err
 	}
 	if vErr := r.validateFinalURL(ctx, sess, finalURL, task.URL); vErr != nil {
-		return Output{}, vErr
+		return Output{ActionResults: actionResults}, vErr
 	}
 	for i := range actionScrapes {
 		if vErr := r.validateFinalURL(ctx, sess, actionScrapes[i].URL, task.URL); vErr != nil {
-			return Output{}, vErr
+			return Output{ActionResults: actionResults}, vErr
 		}
 	}
 	st, hClone := sess.snapshotResponseMeta()
 	if why := extract.DetectRenderedChallenge(htmlStr); why != "" {
-		return Output{Status: st, Headers: hClone, FinalURL: finalURL}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
+		return Output{Status: st, Headers: hClone, FinalURL: finalURL, ActionResults: actionResults}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
 	}
 
 	var shotB64 string
@@ -1250,6 +1311,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		ActionScreenshots: actionScreenshots,
 		ActionScrapes:     actionScrapes,
 		JavascriptReturns: jsReturns,
+		ActionResults:     actionResults,
 		PDFBase64:         pdfBase64,
 	}
 	if task.KeepSession && !task.CloseSession {
@@ -1468,6 +1530,443 @@ func waitForCSSSelector(ctx context.Context, cdp *cdpConn, sessionID, selector s
 	return fmt.Errorf("selector %q did not appear within %s", selector, maxWait)
 }
 
+type cdpKeySpec struct {
+	key  string
+	code string
+	text string
+	vk   int
+}
+
+func resolveCDPKeySpec(raw string) cdpKeySpec {
+	if raw == " " {
+		return cdpKeySpec{key: " ", code: "Space", text: " ", vk: 32}
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return cdpKeySpec{key: "Enter", code: "Enter", text: "\r", vk: 13}
+	}
+	switch strings.ToLower(trimmed) {
+	case "enter", "return", "numpadenter":
+		return cdpKeySpec{key: "Enter", code: "Enter", text: "\r", vk: 13}
+	case "tab":
+		return cdpKeySpec{key: "Tab", code: "Tab", vk: 9}
+	case "escape", "esc":
+		return cdpKeySpec{key: "Escape", code: "Escape", vk: 27}
+	case "backspace":
+		return cdpKeySpec{key: "Backspace", code: "Backspace", vk: 8}
+	case "delete":
+		return cdpKeySpec{key: "Delete", code: "Delete", vk: 46}
+	case "space", "spacebar":
+		return cdpKeySpec{key: " ", code: "Space", text: " ", vk: 32}
+	case "arrowdown":
+		return cdpKeySpec{key: "ArrowDown", code: "ArrowDown", vk: 40}
+	case "arrowup":
+		return cdpKeySpec{key: "ArrowUp", code: "ArrowUp", vk: 38}
+	case "arrowleft":
+		return cdpKeySpec{key: "ArrowLeft", code: "ArrowLeft", vk: 37}
+	case "arrowright":
+		return cdpKeySpec{key: "ArrowRight", code: "ArrowRight", vk: 39}
+	case "home":
+		return cdpKeySpec{key: "Home", code: "Home", vk: 36}
+	case "end":
+		return cdpKeySpec{key: "End", code: "End", vk: 35}
+	case "pageup":
+		return cdpKeySpec{key: "PageUp", code: "PageUp", vk: 33}
+	case "pagedown":
+		return cdpKeySpec{key: "PageDown", code: "PageDown", vk: 34}
+	}
+	if len(trimmed) == 1 && trimmed[0] >= 0x20 && trimmed[0] <= 0x7e {
+		ch := trimmed[0]
+		switch {
+		case ch >= 'a' && ch <= 'z':
+			upper := ch - 'a' + 'A'
+			return cdpKeySpec{key: trimmed, code: "Key" + string(upper), text: trimmed, vk: int(upper)}
+		case ch >= 'A' && ch <= 'Z':
+			return cdpKeySpec{key: trimmed, code: "Key" + trimmed, text: trimmed, vk: int(ch)}
+		case ch >= '0' && ch <= '9':
+			return cdpKeySpec{key: trimmed, code: "Digit" + trimmed, text: trimmed, vk: int(ch)}
+		default:
+			return cdpKeySpec{key: trimmed, code: trimmed, text: trimmed, vk: int(ch)}
+		}
+	}
+	return cdpKeySpec{key: trimmed, code: trimmed}
+}
+
+type actionDOMSnapshot struct {
+	url    string
+	digest string
+	ok     bool
+}
+
+func captureActionDOMState(ctx context.Context, cdp *cdpConn, sessionID string) actionDOMSnapshot {
+	if cdp == nil || ctx.Err() != nil {
+		return actionDOMSnapshot{}
+	}
+	const expr = `(() => {
+		const u = String(location.href || "");
+		const title = String(document.title || "");
+		const bodyText = String((document.body && document.body.innerText) || "");
+		let h = 2166136261;
+		for (let i = 0; i < bodyText.length; i++) {
+			h ^= bodyText.charCodeAt(i);
+			h = Math.imul(h, 16777619);
+		}
+		const els = document.body ? document.body.getElementsByTagName("*").length : 0;
+		const controls = document.querySelectorAll ? document.querySelectorAll("input,textarea,select,[open],[aria-expanded]") : [];
+		for (let i = 0; i < controls.length && i < 64; i++) {
+			const c = controls[i];
+			const v = (c.type === "checkbox" || c.type === "radio")
+				? String(Boolean(c.checked))
+				: String((c.value !== undefined ? c.value : "") + "|" + (c.getAttribute ? (c.getAttribute("aria-expanded") || "") : "") + "|" + Boolean(c.open));
+			for (let j = 0; j < v.length; j++) {
+				h ^= v.charCodeAt(j);
+				h = Math.imul(h, 16777619);
+			}
+		}
+		return JSON.stringify({
+			url: u,
+			digest: bodyText.length + ":" + title + ":" + els + ":" + (h >>> 0)
+		});
+	})()`
+	raw, err := evalString(ctx, cdp, sessionID, expr)
+	if err != nil || len(raw) == 0 || raw[0] != '{' {
+		return actionDOMSnapshot{}
+	}
+	var payload struct {
+		URL    string `json:"url"`
+		Digest string `json:"digest"`
+		HTML   string `json:"html"`
+	}
+	if json.Unmarshal([]byte(raw), &payload) != nil {
+		return actionDOMSnapshot{}
+	}
+	dig := payload.Digest
+	if dig == "" && payload.HTML != "" {
+		dig = strconv.Itoa(len(payload.HTML)) + ":" + payload.HTML
+	}
+	if dig == "" && payload.URL == "" {
+		return actionDOMSnapshot{}
+	}
+	return actionDOMSnapshot{url: payload.URL, digest: dig, ok: true}
+}
+
+type actionNavTracker struct {
+	sessionID        string
+	sess             *retainedSession
+	navStarted       bool
+	sameDocNav       bool
+	loadFired        bool
+	docStatus        int
+	docHeaders       http.Header
+	inFlight         map[string]time.Time
+	requestedDocURLs []string
+}
+
+func newActionNavTracker(sess *retainedSession) *actionNavTracker {
+	sid := ""
+	if sess != nil {
+		sid = sess.cdpSessionID
+	}
+	return &actionNavTracker{
+		sessionID:  sid,
+		sess:       sess,
+		docHeaders: make(http.Header),
+		inFlight:   make(map[string]time.Time),
+	}
+}
+
+func (t *actionNavTracker) isMainFrame(frameID string) bool {
+	if frameID == "" || t.sess == nil {
+		return true
+	}
+	mf := t.sess.getMainFrameID()
+	return mf == "" || frameID == mf
+}
+
+func (t *actionNavTracker) handleEvent(ev cdpEvent) {
+	if ev.SessionID != t.sessionID {
+		return
+	}
+	switch ev.Method {
+	case "Page.frameStartedLoading":
+		var f struct {
+			FrameID string `json:"frameId"`
+		}
+		if json.Unmarshal(ev.Params, &f) == nil && t.isMainFrame(f.FrameID) {
+			t.navStarted = true
+		}
+	case "Page.navigatedWithinDocument":
+		var f struct {
+			FrameID string `json:"frameId"`
+			URL     string `json:"url"`
+		}
+		if json.Unmarshal(ev.Params, &f) == nil && t.isMainFrame(f.FrameID) {
+			t.sameDocNav = true
+			if f.URL != "" {
+				t.requestedDocURLs = append(t.requestedDocURLs, f.URL)
+			}
+		}
+	case "Page.frameNavigated":
+		var fn struct {
+			Frame struct {
+				ID       string `json:"id"`
+				ParentID string `json:"parentId"`
+				URL      string `json:"url"`
+			} `json:"frame"`
+		}
+		if json.Unmarshal(ev.Params, &fn) == nil && (fn.Frame.ParentID == "" || (fn.Frame.ID != "" && t.isMainFrame(fn.Frame.ID))) {
+			if t.sess != nil && fn.Frame.ParentID == "" && fn.Frame.ID != "" {
+				t.sess.mu.Lock()
+				t.sess.mainFrameID = fn.Frame.ID
+				t.sess.mu.Unlock()
+			}
+			t.navStarted = true
+			if fn.Frame.URL != "" {
+				t.requestedDocURLs = append(t.requestedDocURLs, fn.Frame.URL)
+			}
+		}
+	case "Page.loadEventFired":
+		t.loadFired = true
+	case "Network.requestWillBeSent":
+		var rw struct {
+			RequestID string `json:"requestId"`
+			FrameID   string `json:"frameId"`
+			Type      string `json:"type"`
+			Request   struct {
+				URL string `json:"url"`
+			} `json:"request"`
+		}
+		if json.Unmarshal(ev.Params, &rw) == nil {
+			if rw.RequestID != "" {
+				switch rw.Type {
+				case "Document", "XHR", "Fetch", "Script":
+					t.inFlight[rw.RequestID] = time.Now()
+				}
+			}
+			if rw.Type == "Document" && t.isMainFrame(rw.FrameID) && rw.Request.URL != "" {
+				t.requestedDocURLs = append(t.requestedDocURLs, rw.Request.URL)
+			}
+		}
+	case "Network.loadingFinished", "Network.loadingFailed":
+		var lf struct {
+			RequestID string `json:"requestId"`
+		}
+		if json.Unmarshal(ev.Params, &lf) == nil && lf.RequestID != "" {
+			delete(t.inFlight, lf.RequestID)
+		}
+	case "Network.responseReceived":
+		var rr struct {
+			Type     string `json:"type"`
+			FrameID  string `json:"frameId"`
+			Response struct {
+				Status  int               `json:"status"`
+				Headers map[string]string `json:"headers"`
+			} `json:"response"`
+		}
+		if json.Unmarshal(ev.Params, &rr) == nil {
+			if rr.Type == "Document" && t.isMainFrame(rr.FrameID) && rr.Response.Status > 0 {
+				t.docStatus = rr.Response.Status
+				for k, v := range rr.Response.Headers {
+					t.docHeaders.Set(k, v)
+				}
+			}
+		}
+	}
+}
+
+func (r *Renderer) checkPendingNavURLs(ctx context.Context, cdp *cdpConn, sess *retainedSession, tracker *actionNavTracker, checked *int) error {
+	for *checked < len(tracker.requestedDocURLs) {
+		cand := strings.TrimSpace(tracker.requestedDocURLs[*checked])
+		*checked++
+		if cand == "" || strings.EqualFold(cand, "about:blank") || strings.HasPrefix(strings.ToLower(cand), "chrome-error://") {
+			continue
+		}
+		u, err := url.Parse(cand)
+		if err != nil {
+			continue
+		}
+		if r.allow != nil {
+			if aErr := r.allow(u); aErr != nil {
+				_ = cdp.call(ctx, tracker.sessionID, "Page.stopLoading", nil, nil)
+				return fmt.Errorf("rendered final URL blocked by SSRF policy (%s): %w", politeness.SanitizeURL(u.String()), aErr)
+			}
+		}
+		prevChecked := sess.getLastCheckedURL()
+		if r.CheckRobots != nil && u.String() != prevChecked {
+			if rErr := r.CheckRobots(ctx, u.String()); rErr != nil {
+				_ = cdp.call(ctx, tracker.sessionID, "Page.stopLoading", nil, nil)
+				return fmt.Errorf("rendered final URL disallowed by robots.txt: %w", rErr)
+			}
+			sess.setLastCheckedURL(u.String())
+		}
+	}
+	return nil
+}
+
+func waitForActionDOMQuiescence(ctx context.Context, cdp *cdpConn, sessionID string) {
+	const js = `new Promise((resolve) => {
+		try {
+			let lastMut = Date.now();
+			const start = lastMut;
+			const obs = new MutationObserver(() => { lastMut = Date.now(); });
+			if (document.documentElement) {
+				obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+			}
+			const check = () => {
+				const now = Date.now();
+				if (now - start >= 600 || (now - lastMut >= 160 && now - start >= 120)) {
+					obs.disconnect();
+					resolve(true);
+					return;
+				}
+				setTimeout(check, 50);
+			};
+			setTimeout(check, 80);
+		} catch {
+			resolve(true);
+		}
+	})`
+	var out struct {
+		Result struct {
+			Value bool `json:"value"`
+		} `json:"result"`
+	}
+	qctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	_ = cdp.call(qctx, sessionID, "Runtime.evaluate", map[string]any{
+		"expression":    js,
+		"returnByValue": true,
+		"awaitPromise":  true,
+	}, &out)
+}
+
+func (r *Renderer) watchActionEventsWindow(
+	ctx context.Context,
+	cdp *cdpConn,
+	sess *retainedSession,
+	events <-chan cdpEvent,
+	tracker *actionNavTracker,
+	checkedIdx *int,
+	window time.Duration,
+) error {
+	if events == nil || window <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	for !tracker.navStarted && !tracker.sameDocNav {
+		select {
+		case ev := <-events:
+			tracker.handleEvent(ev)
+			if err := r.checkPendingNavURLs(ctx, cdp, sess, tracker, checkedIdx); err != nil {
+				return err
+			}
+		case <-timer.C:
+			return nil
+		case <-cdp.closeCh:
+			return cdp.crashError("during interact navigation watch")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (r *Renderer) finishActionNavigationIfStarted(
+	ctx context.Context,
+	cdp *cdpConn,
+	sess *retainedSession,
+	events <-chan cdpEvent,
+	tracker *actionNavTracker,
+	checkedIdx *int,
+) error {
+	if events == nil {
+		return nil
+	}
+	if err := r.checkPendingNavURLs(ctx, cdp, sess, tracker, checkedIdx); err != nil {
+		return err
+	}
+	if tracker.navStarted {
+		loadTimer := time.NewTimer(actionNavLoadTimeout)
+		for !tracker.loadFired {
+			select {
+			case ev := <-events:
+				tracker.handleEvent(ev)
+				if err := r.checkPendingNavURLs(ctx, cdp, sess, tracker, checkedIdx); err != nil {
+					loadTimer.Stop()
+					return err
+				}
+			case <-loadTimer.C:
+				tracker.loadFired = true
+			case <-cdp.closeCh:
+				loadTimer.Stop()
+				return cdp.crashError("during interact Page.loadEventFired wait")
+			case <-ctx.Done():
+				loadTimer.Stop()
+				return ctx.Err()
+			}
+		}
+		loadTimer.Stop()
+
+		// Brief post-load network quiescence (bounded to 1.2s, 200ms quiet window).
+		idleDeadline := time.Now().Add(1200 * time.Millisecond)
+		idleSince := time.Time{}
+		if len(tracker.inFlight) == 0 {
+			idleSince = time.Now()
+		}
+		tick := time.NewTicker(40 * time.Millisecond)
+		for {
+			now := time.Now()
+			for id, started := range tracker.inFlight {
+				if now.Sub(started) > staleInFlightTTL {
+					delete(tracker.inFlight, id)
+				}
+			}
+			if len(tracker.inFlight) == 0 {
+				if idleSince.IsZero() {
+					idleSince = now
+				}
+				if now.Sub(idleSince) >= 200*time.Millisecond {
+					break
+				}
+			} else {
+				idleSince = time.Time{}
+			}
+			if !now.Before(idleDeadline) {
+				break
+			}
+			select {
+			case ev := <-events:
+				tracker.handleEvent(ev)
+				if err := r.checkPendingNavURLs(ctx, cdp, sess, tracker, checkedIdx); err != nil {
+					tick.Stop()
+					return err
+				}
+				if len(tracker.inFlight) > 0 {
+					idleSince = time.Time{}
+				}
+			case <-tick.C:
+			case <-cdp.closeCh:
+				tick.Stop()
+				return cdp.crashError("during interact network quiescence")
+			case <-ctx.Done():
+				tick.Stop()
+				return ctx.Err()
+			}
+		}
+		tick.Stop()
+		waitForActionDOMQuiescence(ctx, cdp, tracker.sessionID)
+		if tracker.docStatus > 0 {
+			sess.setResponseMeta(tracker.docStatus, tracker.docHeaders)
+		}
+		return nil
+	}
+	if tracker.sameDocNav {
+		waitForActionDOMQuiescence(ctx, cdp, tracker.sessionID)
+	}
+	return nil
+}
+
 func (r *Renderer) runAction(
 	ctx context.Context,
 	cdp *cdpConn,
@@ -1479,6 +1978,22 @@ func (r *Renderer) runAction(
 	jsReturns *[]ActionJSReturn,
 	pdfBase64 *string,
 ) error {
+	_, err := r.runActionStep(ctx, cdp, sess, events, 0, act, actionScreenshots, actionScrapes, jsReturns, pdfBase64)
+	return err
+}
+
+func (r *Renderer) runActionStep(
+	ctx context.Context,
+	cdp *cdpConn,
+	sess *retainedSession,
+	events <-chan cdpEvent,
+	index int,
+	act InteractAction,
+	actionScreenshots *[]string,
+	actionScrapes *[]ActionScrapeSnapshot,
+	jsReturns *[]ActionJSReturn,
+	pdfBase64 *string,
+) (ActionResult, error) {
 	kind := strings.ToLower(strings.TrimSpace(act.Type))
 	selJSON, _ := json.Marshal(act.Selector)
 	effectiveVal := act.Value
@@ -1491,6 +2006,11 @@ func (r *Renderer) runAction(
 		effectiveWaitMs = act.Milliseconds
 	}
 
+	var beforeSnap actionDOMSnapshot
+	if kind == "click" || kind == "press" {
+		beforeSnap = captureActionDOMState(ctx, cdp, sess.cdpSessionID)
+	}
+
 	switch kind {
 	case "wait":
 		ms := effectiveWaitMs
@@ -1501,30 +2021,34 @@ func (r *Renderer) runAction(
 			ms = maxRenderSettleMs
 		}
 		if act.Selector != "" {
-			return waitForCSSSelector(ctx, cdp, sess.cdpSessionID, act.Selector, time.Duration(ms)*time.Millisecond)
+			if err := waitForCSSSelector(ctx, cdp, sess.cdpSessionID, act.Selector, time.Duration(ms)*time.Millisecond); err != nil {
+				return ActionResult{}, err
+			}
+			return ActionResult{Index: index, Type: kind, Status: "ok", DOMChanged: true}, nil
 		}
 		t := time.NewTimer(time.Duration(ms) * time.Millisecond)
 		defer t.Stop()
 		select {
 		case <-t.C:
-			return nil
+			return ActionResult{Index: index, Type: kind, Status: "ok"}, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return ActionResult{}, ctx.Err()
 		}
 
 	case "navigate":
+		prevURL := sess.getLastCheckedURL()
 		u, err := url.Parse(strings.TrimSpace(act.URL))
 		if err != nil {
-			return err
+			return ActionResult{}, err
 		}
 		if r.allow != nil {
 			if err := r.allow(u); err != nil {
-				return err
+				return ActionResult{}, err
 			}
 		}
 		if r.CheckRobots != nil {
 			if err := r.CheckRobots(ctx, u.String()); err != nil {
-				return err
+				return ActionResult{}, err
 			}
 		}
 		sess.setLastCheckedURL(u.String())
@@ -1533,19 +2057,30 @@ func (r *Renderer) runAction(
 		if sess.initialOrigin == "" {
 			sess.initialOrigin = navOrigin
 		}
-		sess.redirectedCrossOrigin = sess.initialOrigin != "" && navOrigin != sess.initialOrigin
+		if sess.initialOrigin != "" && navOrigin != sess.initialOrigin {
+			sess.redirectedCrossOrigin = true
+		}
 		sess.mu.Unlock()
 		st, hdrs, err := navigateAndWait(ctx, cdp, sess, events, u.String(), effectiveWaitMs, act.Selector)
 		if err != nil {
-			return err
+			return ActionResult{}, err
 		}
 		sess.setResponseMeta(st, hdrs)
-		return nil
+		return ActionResult{
+			Index:      index,
+			Type:       kind,
+			Status:     "ok",
+			URLChanged: u.String() != prevURL,
+			DOMChanged: true,
+			FinalURL:   u.String(),
+		}, nil
 
 	case "click":
 		if strings.TrimSpace(act.Selector) == "" {
-			return errors.New("click action requires selector")
+			return ActionResult{}, errors.New("click action requires selector")
 		}
+		tracker := newActionNavTracker(sess)
+		checkedIdx := 0
 		var js string
 		if act.All {
 			js = fmt.Sprintf(`(() => {
@@ -1565,22 +2100,28 @@ func (r *Renderer) runAction(
 		}
 		res, err := evalString(ctx, cdp, sess.cdpSessionID, js)
 		if err != nil {
-			return err
+			return ActionResult{}, err
 		}
 		if res != "ok" {
-			return fmt.Errorf("click %s: %s", act.Selector, res)
+			return ActionResult{}, fmt.Errorf("click %s: %s", act.Selector, res)
+		}
+		if err := r.watchActionEventsWindow(ctx, cdp, sess, events, tracker, &checkedIdx, actionNavWatchWindow); err != nil {
+			return ActionResult{}, err
+		}
+		if err := r.finishActionNavigationIfStarted(ctx, cdp, sess, events, tracker, &checkedIdx); err != nil {
+			return ActionResult{}, err
 		}
 
 	case "write":
 		if effectiveVal != "" {
 			if err := cdp.call(ctx, sess.cdpSessionID, "Input.insertText", map[string]any{"text": effectiveVal}, nil); err != nil {
-				return err
+				return ActionResult{}, err
 			}
 		}
 
 	case "fill", "type", "select":
 		if strings.TrimSpace(act.Selector) == "" {
-			return fmt.Errorf("%s action requires selector", kind)
+			return ActionResult{}, fmt.Errorf("%s action requires selector", kind)
 		}
 		js := fmt.Sprintf(`(() => {
 			const el = document.querySelector(%s);
@@ -1595,19 +2136,110 @@ func (r *Renderer) runAction(
 		})()`, string(selJSON), string(valJSON))
 		res, err := evalString(ctx, cdp, sess.cdpSessionID, js)
 		if err != nil {
-			return err
+			return ActionResult{}, err
 		}
 		if res != "ok" {
-			return fmt.Errorf("%s %s: %s", kind, act.Selector, res)
+			return ActionResult{}, fmt.Errorf("%s %s: %s", kind, act.Selector, res)
 		}
 
 	case "press":
-		key := strings.TrimSpace(act.Key)
-		if key == "" {
-			key = "Enter"
+		spec := resolveCDPKeySpec(act.Key)
+		tracker := newActionNavTracker(sess)
+		checkedIdx := 0
+		if strings.TrimSpace(act.Selector) != "" {
+			_, _ = evalString(ctx, cdp, sess.cdpSessionID, fmt.Sprintf(`(() => { document.querySelector(%s)?.focus(); return "ok"; })()`, string(selJSON)))
 		}
-		_ = cdp.call(ctx, sess.cdpSessionID, "Input.dispatchKeyEvent", map[string]any{"type": "keyDown", "key": key}, nil)
-		_ = cdp.call(ctx, sess.cdpSessionID, "Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key}, nil)
+		if spec.key == "Enter" && ctx.Err() == nil {
+			_, _ = evalString(ctx, cdp, sess.cdpSessionID, `(() => {
+				window.__efEnterDefaultPrevented = false;
+				window.__efEnterBeforeHref = String(location.href || "");
+				const mark = (e) => { if (e && e.defaultPrevented) window.__efEnterDefaultPrevented = true; };
+				window.addEventListener("keydown", mark, { once: true });
+				window.addEventListener("keypress", mark, { once: true });
+				return "ok";
+			})()`)
+		}
+		downType := "keyDown"
+		if spec.text != "" {
+			downType = "rawKeyDown"
+		}
+		downParams := map[string]any{"type": downType, "key": spec.key}
+		if spec.code != "" {
+			downParams["code"] = spec.code
+		}
+		if spec.vk > 0 {
+			downParams["windowsVirtualKeyCode"] = spec.vk
+			downParams["nativeVirtualKeyCode"] = spec.vk
+		}
+		_ = cdp.call(ctx, sess.cdpSessionID, "Input.dispatchKeyEvent", downParams, nil)
+		if spec.text != "" {
+			charParams := map[string]any{
+				"type":           "char",
+				"key":            spec.key,
+				"text":           spec.text,
+				"unmodifiedText": spec.text,
+			}
+			if spec.code != "" {
+				charParams["code"] = spec.code
+			}
+			if spec.vk > 0 {
+				charParams["windowsVirtualKeyCode"] = spec.vk
+				charParams["nativeVirtualKeyCode"] = spec.vk
+			}
+			_ = cdp.call(ctx, sess.cdpSessionID, "Input.dispatchKeyEvent", charParams, nil)
+		}
+		upParams := map[string]any{"type": "keyUp", "key": spec.key}
+		if spec.code != "" {
+			upParams["code"] = spec.code
+		}
+		if spec.vk > 0 {
+			upParams["windowsVirtualKeyCode"] = spec.vk
+			upParams["nativeVirtualKeyCode"] = spec.vk
+		}
+		_ = cdp.call(ctx, sess.cdpSessionID, "Input.dispatchKeyEvent", upParams, nil)
+
+		remWatch := actionNavWatchWindow
+		if spec.key == "Enter" && events != nil {
+			firstSlice := enterSubmitFallbackDelay
+			if firstSlice > remWatch {
+				firstSlice = remWatch
+			}
+			if err := r.watchActionEventsWindow(ctx, cdp, sess, events, tracker, &checkedIdx, firstSlice); err != nil {
+				return ActionResult{}, err
+			}
+			remWatch -= firstSlice
+			if !tracker.navStarted && !tracker.sameDocNav && ctx.Err() == nil {
+				_, _ = evalString(ctx, cdp, sess.cdpSessionID, `(() => {
+					if (window.__efEnterDefaultPrevented) return "prevented";
+					if (window.__efEnterBeforeHref && String(location.href || "") !== window.__efEnterBeforeHref) return "navigating";
+					const el = document.activeElement;
+					if (!el || !el.tagName) return "no_active";
+					const tag = el.tagName.toUpperCase();
+					if (tag !== "INPUT" && tag !== "SELECT" && tag !== "BUTTON") return "not_control";
+					if (tag === "BUTTON" && el.type && el.type.toLowerCase() !== "submit") return "non_submit_btn";
+					if (tag === "INPUT") {
+						const it = (el.type || "text").toLowerCase();
+						if (it === "button" || it === "reset" || it === "checkbox" || it === "radio" || it === "file") return "non_submit_input";
+					}
+					const form = el.form || (el.closest ? el.closest("form") : null);
+					if (!form) return "no_form";
+					if (typeof form.requestSubmit === "function") {
+						form.requestSubmit();
+					} else {
+						form.submit();
+					}
+					return "submitted";
+				})()`)
+			}
+		}
+		if remWatch > 0 {
+			if err := r.watchActionEventsWindow(ctx, cdp, sess, events, tracker, &checkedIdx, remWatch); err != nil {
+				return ActionResult{}, err
+			}
+		}
+		if err := r.finishActionNavigationIfStarted(ctx, cdp, sess, events, tracker, &checkedIdx); err != nil {
+			return ActionResult{}, err
+		}
 
 	case "scroll":
 		dirSign := 1
@@ -1629,7 +2261,7 @@ func (r *Renderer) runAction(
 			shotParams["captureBeyondViewport"] = true
 		}
 		if err := cdp.call(ctx, sess.cdpSessionID, "Page.captureScreenshot", shotParams, &shot); err != nil {
-			return err
+			return ActionResult{}, err
 		}
 		if shot.Data != "" && actionScreenshots != nil {
 			*actionScreenshots = append(*actionScreenshots, shot.Data)
@@ -1638,7 +2270,7 @@ func (r *Renderer) runAction(
 	case "scrape":
 		snapHTML, snapURL, err := readDocumentHTML(ctx, cdp, sess.cdpSessionID)
 		if err != nil {
-			return err
+			return ActionResult{}, err
 		}
 		if actionScrapes != nil {
 			*actionScrapes = append(*actionScrapes, ActionScrapeSnapshot{URL: snapURL, HTML: snapHTML})
@@ -1650,7 +2282,7 @@ func (r *Renderer) runAction(
 			script = strings.TrimSpace(effectiveVal)
 		}
 		if script == "" {
-			return errors.New("executeJavascript action requires script")
+			return ActionResult{}, errors.New("executeJavascript action requires script")
 		}
 		var evalRes struct {
 			Result struct {
@@ -1666,10 +2298,10 @@ func (r *Renderer) runAction(
 			"returnByValue": true,
 			"awaitPromise":  true,
 		}, &evalRes); err != nil {
-			return err
+			return ActionResult{}, err
 		}
 		if evalRes.ExceptionDetails != nil {
-			return fmt.Errorf("js exception: %s", evalRes.ExceptionDetails.Text)
+			return ActionResult{}, fmt.Errorf("js exception: %s", evalRes.ExceptionDetails.Text)
 		}
 		if jsReturns != nil {
 			*jsReturns = append(*jsReturns, ActionJSReturn{Type: evalRes.Result.Type, Value: evalRes.Result.Value})
@@ -1680,14 +2312,14 @@ func (r *Renderer) runAction(
 			Data string `json:"data"`
 		}
 		if err := cdp.call(ctx, sess.cdpSessionID, "Page.printToPDF", map[string]any{"printBackground": true}, &pdfOut); err != nil {
-			return err
+			return ActionResult{}, err
 		}
 		if pdfBase64 != nil && pdfOut.Data != "" {
 			*pdfBase64 = pdfOut.Data
 		}
 
 	default:
-		return fmt.Errorf("unsupported interact action type %q", act.Type)
+		return ActionResult{}, fmt.Errorf("unsupported interact action type %q", act.Type)
 	}
 
 	pause := effectiveWaitMs
@@ -1701,10 +2333,46 @@ func (r *Renderer) runAction(
 	defer t.Stop()
 	select {
 	case <-t.C:
-		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return ActionResult{}, ctx.Err()
 	}
+
+	resDiag := ActionResult{
+		Index:  index,
+		Type:   kind,
+		Status: "ok",
+	}
+	switch kind {
+	case "fill", "type", "select":
+		resDiag.DOMChanged = true
+	case "write":
+		resDiag.DOMChanged = effectiveVal != ""
+	case "click", "press":
+		afterSnap := captureActionDOMState(ctx, cdp, sess.cdpSessionID)
+		if afterSnap.ok {
+			if afterSnap.url != "" {
+				resDiag.FinalURL = afterSnap.url
+			}
+			if beforeSnap.ok {
+				resDiag.URLChanged = afterSnap.url != beforeSnap.url
+				resDiag.DOMChanged = afterSnap.digest != beforeSnap.digest
+				if resDiag.URLChanged && afterSnap.url != "" {
+					if vErr := r.validateFinalURL(ctx, sess, afterSnap.url, beforeSnap.url); vErr != nil {
+						return ActionResult{}, vErr
+					}
+				}
+				if !resDiag.URLChanged && !resDiag.DOMChanged {
+					resDiag.Status = "no_effect"
+					resDiag.Warning = "action completed without changing URL or visible DOM"
+				}
+			} else {
+				resDiag.DOMChanged = true
+			}
+		} else {
+			resDiag.DOMChanged = true
+		}
+	}
+	return resDiag, nil
 }
 
 func waitForSPADOMQuiescence(ctx context.Context, cdp *cdpConn, sessionID string) error {
@@ -1972,12 +2640,16 @@ func buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir string, useSandbox bo
 		"--disable-crash-reporter",
 		"--disable-breakpad",
 		"--disable-extensions",
+		"--disable-component-extensions-with-background-pages",
 		"--disable-background-networking",
+		"--disable-domain-reliability",
+		"--disable-client-side-phishing-detection",
 		"--disable-sync",
 		"--disable-translate",
 		"--disable-default-apps",
 		"--disable-quic",
-		"--disable-features=TranslateUI",
+		"--media-router=0",
+		"--disable-features=TranslateUI,MediaRouter,DialMediaRouteProvider,CastMediaRouteProvider,CastStreamingWin,GlobalMediaControls,NetworkTimeServiceQuerying,OptimizationHints",
 		"--webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--enforce-webrtc-ip-permission-check",
@@ -2248,7 +2920,17 @@ func (r *Renderer) launchAndDialLocked(ctx context.Context, proxyAddr string, us
 	}
 
 	args := buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir, useSandbox)
+	if len(r.extraFlags) > 0 {
+		// Insert test-only flags before the trailing "about:blank" positional argument.
+		tail := args[len(args)-1]
+		args = append(append([]string(nil), args[:len(args)-1]...), r.extraFlags...)
+		args = append(args, tail)
+	}
 	return r.launchAndDialPipeLocked(ctx, userDir, args, startupWait)
+}
+
+func (r *Renderer) canFallbackToNoSandboxLocked() bool {
+	return !r.requireSandbox && r.allowNoSandbox
 }
 
 func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
@@ -2279,23 +2961,31 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	useSandbox := true
 	if runtime.GOOS == "linux" {
 		if !r.sandboxFallback && linuxSandboxBlockedByHostPolicy() {
-			if r.requireSandbox {
+			if !r.canFallbackToNoSandboxLocked() {
 				r.sandboxState = "off"
 				r.disabledByPolicy = true
-				return nil, errors.New("chromium OS sandbox unavailable under host MAC/userns policy and EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set")
+				if r.log != nil {
+					r.log.Warn("browser_sandbox_disabled",
+						slog.String("bin", r.chromeBin),
+						slog.String("reason", "host MAC/userns policy blocks the Chromium sandbox; mount deploy/seccomp/chromium-sandbox.json or set EDGEFETCH_ALLOW_NO_SANDBOX=1"))
+				}
+				if r.requireSandbox {
+					return nil, errors.New("chromium OS sandbox unavailable under host MAC/userns policy and EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set")
+				}
+				return nil, errors.New("chromium OS sandbox unavailable under host MAC/userns policy (configure deploy/seccomp/chromium-sandbox.json or set EDGEFETCH_ALLOW_NO_SANDBOX=1)")
 			}
 			r.sandboxFallback = true
 			r.sandboxState = "off"
 			if r.log != nil {
 				r.log.Warn("browser_sandbox_fallback",
 					slog.String("bin", r.chromeBin),
-					slog.String("reason", "host MAC/userns policy blocks the Chromium sandbox (pre-check)"))
+					slog.String("reason", "host MAC/userns policy blocks the Chromium sandbox (pre-check; EDGEFETCH_ALLOW_NO_SANDBOX=1)"))
 			}
 		}
 		useSandbox = !r.sandboxFallback
 	}
 
-	proxy, err := NewSSRFProxy(r.allow, nil)
+	proxy, err := NewSSRFProxy(r.allow, r.proxyDial)
 	if err != nil {
 		return nil, err
 	}
@@ -2311,11 +3001,19 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 	}
 	cmd, userDir, conn, launchErr := r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, firstAttemptWait)
 	if launchErr != nil && runtime.GOOS == "linux" && useSandbox && ctx.Err() == nil && isSandboxStartupFailure(launchErr) {
-		if r.requireSandbox {
+		if !r.canFallbackToNoSandboxLocked() {
 			r.sandboxState = "off"
 			r.disabledByPolicy = true
 			_ = proxy.Close()
-			return nil, fmt.Errorf("chromium OS sandbox failed and EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set: %w", launchErr)
+			if r.log != nil {
+				r.log.Warn("browser_sandbox_disabled",
+					slog.String("bin", r.chromeBin),
+					slog.String("reason", launchErr.Error()))
+			}
+			if r.requireSandbox {
+				return nil, fmt.Errorf("chromium OS sandbox failed and EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set: %w", launchErr)
+			}
+			return nil, fmt.Errorf("chromium OS sandbox failed (configure deploy/seccomp/chromium-sandbox.json or set EDGEFETCH_ALLOW_NO_SANDBOX=1): %w", launchErr)
 		}
 		r.sandboxFallback = true
 		r.sandboxState = "off"

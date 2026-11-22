@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -733,6 +734,32 @@ func TestResumedNavigateOriginScopingAndCrossOrigin302HeaderStripping(t *testing
 	}
 }
 
+func allowNoSandboxInTestOnRestrictedLinuxHost(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return
+	}
+	if linuxSandboxBlockedByHostPolicy() {
+		t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
+		return
+	}
+	for _, sysctlPath := range []string{
+		"/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+		"/proc/sys/user/max_user_namespaces",
+	} {
+		raw, err := os.ReadFile(sysctlPath)
+		if err != nil {
+			continue
+		}
+		val := strings.TrimSpace(string(raw))
+		if (strings.HasSuffix(sysctlPath, "apparmor_restrict_unprivileged_userns") && val == "1") ||
+			(strings.HasSuffix(sysctlPath, "max_user_namespaces") && val == "0") {
+			t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
+			return
+		}
+	}
+}
+
 func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *testing.T) {
 	args := buildChromiumLaunchArgsWithSandbox("127.0.0.1:8888", "/tmp/ef-prof", true)
 	var sawPipe, sawPort bool
@@ -755,6 +782,7 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live R6 pipe transport check")
 	}
+	allowNoSandboxInTestOnRestrictedLinuxHost(t)
 
 	r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch/2.7.0", 1, nil)
 	defer r.Close()
@@ -1341,5 +1369,650 @@ func TestR6DirectPipeCDPTransportFramingAndCaps(t *testing.T) {
 		if err == nil || !conn.isClosed() {
 			t.Fatalf("expected oversized non-NUL stream to close pipe cdpConn, got err=%v closed=%v", err, conn.isClosed())
 		}
+	}
+}
+
+func TestR7NestedSubframeDocumentRenavigationHeaderLeakMockCDP(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		hasOverride = make(map[string]bool)
+	)
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		var writeMu sync.Mutex
+		send := func(v any) {
+			b, _ := json.Marshal(v)
+			writeMu.Lock()
+			_ = conn.Write(r.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+		sig := make(map[string]chan struct{})
+		var sigMu sync.Mutex
+		chFor := func(id string) chan struct{} {
+			sigMu.Lock()
+			defer sigMu.Unlock()
+			c, ok := sig[id]
+			if !ok {
+				c = make(chan struct{})
+				sig[id] = c
+			}
+			return c
+		}
+
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				continue
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-r7"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-r7"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "s-r7"}})
+			case "Page.getFrameTree":
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result": map[string]any{
+						"frameTree": map[string]any{
+							"frame": map[string]any{"id": "main-f", "url": "about:blank", "securityOrigin": "://"},
+						},
+					},
+				})
+			case "Fetch.continueRequest":
+				var p struct {
+					RequestID string `json:"requestId"`
+				}
+				var rawMap map[string]json.RawMessage
+				_ = json.Unmarshal(req.Params, &p)
+				_ = json.Unmarshal(req.Params, &rawMap)
+				_, overridden := rawMap["headers"]
+				mu.Lock()
+				hasOverride[p.RequestID] = overridden
+				mu.Unlock()
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+				select {
+				case <-chFor(p.RequestID):
+				default:
+					close(chFor(p.RequestID))
+				}
+			case "Page.navigate":
+				navID := req.ID
+				navSID := req.SessionID
+				go func() {
+					// 1. Harness navigation commits main-f on https://example.com.
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "main-doc",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request":      map[string]any{"url": "https://example.com/start", "headers": map[string]string{"Accept": "text/html"}},
+						},
+					})
+					<-chFor("main-doc")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameNavigated",
+						"params":    map[string]any{"frame": map[string]any{"id": "main-f", "url": "https://example.com/start", "securityOrigin": "https://example.com"}},
+					})
+
+					// 2. Same-site cross-origin subframe (sub.example.com) commits, then creates grandchild iframe `child-f` on https://example.com/benign.
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameNavigated",
+						"params":    map[string]any{"frame": map[string]any{"id": "sub-f", "parentId": "main-f", "url": "https://sub.example.com/embed", "securityOrigin": "https://sub.example.com"}},
+					})
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "grandchild-init-doc",
+							"frameId":      "child-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://example.com/benign",
+								"headers": map[string]string{"Referer": "https://sub.example.com/", "Sec-Fetch-Site": "same-site"},
+							},
+						},
+					})
+					<-chFor("grandchild-init-doc")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameNavigated",
+						"params":    map[string]any{"frame": map[string]any{"id": "child-f", "parentId": "sub-f", "url": "https://example.com/benign", "securityOrigin": "https://example.com"}},
+					})
+
+					// 3. Medium #1 Attack: sub.example.com re-navigates `child-f` (whose frameOrigins["child-f"] == "https://example.com"!)
+					//    to https://example.com/secret with `no-referrer` (omitting Referer & Origin, Sec-Fetch-Site: same-site)!
+					//    MUST NOT inject Authorization/Cookie/X-API-Key!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "grandchild-renav-noref-samesite",
+							"frameId":      "child-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://example.com/secret",
+								"headers": map[string]string{"Accept": "text/html", "Sec-Fetch-Site": "same-site"},
+							},
+						},
+					})
+					<-chFor("grandchild-renav-noref-samesite")
+
+					// Also test cross-port nested iframe re-navigation where Sec-Fetch-Site is "same-site" (or even omitted)!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "grandchild-renav-noref-no-sfs",
+							"frameId":      "child-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://example.com/secret-2",
+								"headers": map[string]string{"Accept": "text/html"},
+							},
+						},
+					})
+					<-chFor("grandchild-renav-noref-no-sfs")
+
+					// 4. Legitimate Referer-proven same-origin link click inside `child-f` MUST still receive headers!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "legit-referer-doc-click",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://example.com/next-page",
+								"headers": map[string]string{"Referer": "https://example.com/start", "Sec-Fetch-Site": "same-origin"},
+							},
+						},
+					})
+					<-chFor("legit-referer-doc-click")
+
+					// 5. Page.frameDetached on `child-f` MUST evict `frameOrigins["child-f"]`, so any subsequent no-referrer subresource on reused frameId is denied!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameDetached",
+						"params":    map[string]any{"frameId": "child-f"},
+					})
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "post-detach-subresource",
+							"frameId":      "child-f",
+							"resourceType": "Fetch",
+							"request": map[string]any{
+								"url":     "https://example.com/api/after-detach",
+								"headers": map[string]string{"Accept": "*/*"},
+							},
+						},
+					})
+					<-chFor("post-detach-subresource")
+
+					send(map[string]any{"id": navID, "sessionId": navSID, "result": map[string]any{"frameId": "main-f"}})
+					send(map[string]any{"sessionId": navSID, "method": "Page.loadEventFired", "params": map[string]any{}})
+				}()
+			case "Runtime.evaluate":
+				docJSON, _ := json.Marshal(map[string]string{"url": "https://example.com/start", "html": "<html><body>ok</body></html>"})
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}}})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+
+	r := NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, "EdgeFetchTest/2.7.0")
+	defer r.Close()
+
+	if _, err := r.Execute(context.Background(), Task{
+		URL: "https://example.com/start",
+		Headers: map[string]string{
+			"Authorization": "Bearer TOP_SECRET_BEARER",
+			"Cookie":        "sid=TOP_SECRET_COOKIE",
+			"X-API-Key":     "TOP_SECRET_API_KEY",
+		},
+		WaitForMs: 25,
+	}); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, wantTrue := range []string{"main-doc", "legit-referer-doc-click"} {
+		if !hasOverride[wantTrue] {
+			t.Fatalf("expected %q to receive caller headers, got %+v", wantTrue, hasOverride)
+		}
+	}
+	for _, wantFalse := range []string{
+		"grandchild-init-doc",
+		"grandchild-renav-noref-samesite",
+		"grandchild-renav-noref-no-sfs",
+		"post-detach-subresource",
+	} {
+		if hasOverride[wantFalse] {
+			t.Fatalf("SECURITY (R7 Medium #1): %q leaked caller headers! got %+v", wantFalse, hasOverride)
+		}
+	}
+}
+
+func TestR7LiveHeadlessChromeNestedSubframeNoReferrerAndPositiveControls(t *testing.T) {
+	bin := FindChromeBinary()
+	if bin == "" {
+		t.Skip("no headless Chromium/Chrome binary installed; skipping live R7 nested subframe CDP test")
+	}
+	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+
+	type hitRecord struct {
+		Host   string
+		Path   string
+		Auth   string
+		Cookie string
+		APIKey string
+	}
+	var (
+		mu   sync.Mutex
+		hits []hitRecord
+	)
+	recordHit := func(r *http.Request) {
+		mu.Lock()
+		hits = append(hits, hitRecord{
+			Host:   r.Host,
+			Path:   r.URL.Path,
+			Auth:   r.Header.Get("Authorization"),
+			Cookie: r.Header.Get("Cookie"),
+			APIKey: r.Header.Get("X-API-Key"),
+		})
+		mu.Unlock()
+	}
+
+	var crossPortURL string
+	mainSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordHit(r)
+		hostOnly := r.Host
+		if h, _, err := net.SplitHostPort(r.Host); err == nil {
+			hostOnly = h
+		}
+		if strings.EqualFold(hostOnly, "sub.example.com") {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!doctype html><html><body>
+<script>
+const gc = document.createElement('iframe');
+gc.name = 'gc_sub';
+gc.src = 'https://example.com/benign-child';
+let step = 0;
+gc.onload = () => {
+  step++;
+  if (step === 1) {
+    gc.referrerPolicy = 'no-referrer';
+    gc.src = 'https://example.com/secret-from-sub-renav';
+  } else if (step === 2) {
+    const a = document.createElement('a');
+    a.href = 'https://example.com/secret-from-sub-noreferrer-link';
+    a.target = 'gc_sub';
+    a.rel = 'noreferrer';
+    document.body.appendChild(a);
+    a.click();
+  } else if (step === 3) {
+    parent.postMessage('sub_attack_done', '*');
+  }
+};
+document.body.appendChild(gc);
+</script></body></html>`))
+			return
+		}
+
+		// Bound origin: https://example.com
+		switch r.URL.Path {
+		case "/start":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!doctype html><html><head><meta name="referrer" content="no-referrer"></head><body>
+<img src="/api/noref-img">
+<iframe src="https://sub.example.com/embed"></iframe>
+<iframe src="` + crossPortURL + `/embed-port"></iframe>
+<a id="legit-link" href="/legit-next" referrerpolicy="origin">Next</a>
+<script>
+let doneCount = 0;
+let subFetchDone = false;
+function checkReady() {
+  if (doneCount >= 2 && subFetchDone) {
+    document.body.setAttribute('data-attack-finished', '1');
+  }
+}
+window.addEventListener('message', (e) => {
+  if (e.data === 'sub_attack_done' || e.data === 'port_attack_done') {
+    doneCount++;
+    checkReady();
+  }
+});
+fetch('/api/noref-fetch').then(() => { subFetchDone = true; checkReady(); });
+</script></body></html>`))
+		case "/benign-child", "/secret-from-sub-renav", "/secret-from-sub-noreferrer-link", "/secret-from-port-renav":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!doctype html><html><body>child frame</body></html>`))
+		case "/api/noref-fetch":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/api/noref-img":
+			w.Header().Set("Content-Type", "image/gif")
+			_, _ = w.Write([]byte("GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"))
+		case "/legit-next":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!doctype html><html><body><main id="final-ok">Legit Next Page</main></body></html>`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mainSrv.Close()
+
+	portSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordHit(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><html><body>
+<script>
+const gc2 = document.createElement('iframe');
+gc2.src = 'https://example.com/benign-child';
+let pStep = 0;
+gc2.onload = () => {
+  pStep++;
+  if (pStep === 1) {
+    gc2.referrerPolicy = 'no-referrer';
+    gc2.src = 'https://example.com/secret-from-port-renav';
+  } else if (pStep === 2) {
+    parent.postMessage('port_attack_done', '*');
+  }
+};
+document.body.appendChild(gc2);
+</script></body></html>`))
+	}))
+	defer portSrv.Close()
+
+	mainAddr := mainSrv.Listener.Addr().String()
+	portAddr := portSrv.Listener.Addr().String()
+	_, portNum, _ := net.SplitHostPort(portAddr)
+	crossPortURL = "https://example.com:" + portNum
+
+	r := NewRenderer(bin, func(u *url.URL) error { return nil }, "EdgeFetchTest/2.7.0", 1, nil)
+	r.extraFlags = []string{"--ignore-certificate-errors"}
+	r.proxyDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		_, p, err := net.SplitHostPort(addr)
+		if err == nil && p == portNum {
+			return (&net.Dialer{}).DialContext(ctx, network, portAddr)
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, mainAddr)
+	}
+	defer r.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	const (
+		secretAuth   = "Bearer R7_LIVE_SECRET_TOKEN"
+		secretCookie = "session=R7_LIVE_SECRET_COOKIE"
+		secretKey    = "R7_LIVE_SECRET_API_KEY"
+	)
+	out, err := r.Execute(ctx, Task{
+		URL: "https://example.com/start",
+		Headers: map[string]string{
+			"Authorization": secretAuth,
+			"Cookie":        secretCookie,
+			"X-API-Key":     secretKey,
+		},
+		WaitSelector: "[data-attack-finished='1']",
+		Actions: []InteractAction{
+			{Type: "click", Selector: "#legit-link", WaitMs: 50},
+			{Type: "wait", Selector: "#final-ok", Milliseconds: 5000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("live Chrome Execute failed: %v", err)
+	}
+	if !strings.Contains(out.HTML, "Legit Next Page") {
+		t.Fatalf("expected navigation to /legit-next, got URL=%q HTML=%q", out.FinalURL, out.HTML)
+	}
+
+	mu.Lock()
+	recorded := append([]hitRecord(nil), hits...)
+	mu.Unlock()
+
+	sawbyPath := make(map[string][]hitRecord)
+	for _, h := range recorded {
+		sawbyPath[h.Path] = append(sawbyPath[h.Path], h)
+	}
+
+	// 1. Assert attacker nested-iframe re-navigations NEVER received ANY bound caller header!
+	for _, forbiddenPath := range []string{
+		"/embed",
+		"/embed-port",
+		"/benign-child",
+		"/secret-from-sub-renav",
+		"/secret-from-sub-noreferrer-link",
+		"/secret-from-port-renav",
+	} {
+		recs := sawbyPath[forbiddenPath]
+		if len(recs) == 0 {
+			t.Fatalf("expected live Chrome to actually request %q so attack path is exercised! saw=%+v", forbiddenPath, sawbyPath)
+		}
+		for _, hr := range recs {
+			if hr.Auth != "" || hr.Cookie != "" || hr.APIKey != "" {
+				t.Fatalf("SECURITY (R7 Medium #1 LIVE): caller secret header leaked on %s (host=%s): %+v", forbiddenPath, hr.Host, hr)
+			}
+		}
+	}
+
+	// 2. Assert legitimate bound-origin requests (initial doc, no-referrer same-origin fetch & img, and Referer-proven link click) DID receive ALL 3 headers!
+	for _, legitPath := range []string{
+		"/start",
+		"/api/noref-fetch",
+		"/api/noref-img",
+		"/legit-next",
+	} {
+		recs := sawbyPath[legitPath]
+		if len(recs) == 0 {
+			t.Fatalf("expected live Chrome to request legitimate path %q! saw=%+v", legitPath, sawbyPath)
+		}
+		for _, hr := range recs {
+			if hr.Auth != secretAuth || hr.Cookie != secretCookie || hr.APIKey != secretKey {
+				t.Fatalf("REGRESSION: legitimate bound request %s missed caller headers: %+v", legitPath, hr)
+			}
+		}
+	}
+}
+
+func TestV271ResolveCDPKeySpecUnit(t *testing.T) {
+	cases := []struct {
+		raw      string
+		wantKey  string
+		wantCode string
+		wantText string
+		wantVK   int
+	}{
+		{"", "Enter", "Enter", "\r", 13},
+		{"Enter", "Enter", "Enter", "\r", 13},
+		{"Tab", "Tab", "Tab", "", 9},
+		{"Escape", "Escape", "Escape", "", 27},
+		{"Backspace", "Backspace", "Backspace", "", 8},
+		{"Delete", "Delete", "Delete", "", 46},
+		{" ", " ", "Space", " ", 32},
+		{"Space", " ", "Space", " ", 32},
+		{"ArrowDown", "ArrowDown", "ArrowDown", "", 40},
+		{"ArrowUp", "ArrowUp", "ArrowUp", "", 38},
+		{"ArrowLeft", "ArrowLeft", "ArrowLeft", "", 37},
+		{"ArrowRight", "ArrowRight", "ArrowRight", "", 39},
+		{"a", "a", "KeyA", "a", 'A'},
+		{"G", "G", "KeyG", "G", 'G'},
+		{"5", "5", "Digit5", "5", '5'},
+		{"/", "/", "/", "/", '/'},
+	}
+	for _, tc := range cases {
+		got := resolveCDPKeySpec(tc.raw)
+		if got.key != tc.wantKey || got.code != tc.wantCode || got.text != tc.wantText || got.vk != tc.wantVK {
+			t.Fatalf("resolveCDPKeySpec(%q) = %+v, want key=%q code=%q text=%q vk=%d", tc.raw, got, tc.wantKey, tc.wantCode, tc.wantText, tc.wantVK)
+		}
+	}
+}
+
+func TestV271LiveHeadlessChromeFormEnterSubmitClickNavSSRFAndNoEffect(t *testing.T) {
+	bin := FindChromeBinary()
+	if bin == "" {
+		t.Skip("no headless Chromium/Chrome binary installed; skipping live v2.7.1 form Enter + ActionResult test")
+	}
+	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/":
+			// Multi-input form without a submit button (like Wikipedia #searchInput) so bare keyDown("Enter")
+			// without VK_RETURN / char "\r" / requestSubmit fallback fails unless properly handled!
+			_, _ = w.Write([]byte(`<!doctype html><html><head><title>Wiki Home</title></head><body>
+				<form id="searchForm" action="/search" method="GET">
+					<input id="searchInput" name="q" type="text" value="">
+					<input id="extraFilter" name="ns" type="text" value="main">
+				</form>
+				<a id="aboutLink" href="/about">About Wiki</a>
+				<a id="robotsBlockedLink" href="/disallowed-dest">Disallowed</a>
+				<a id="ssrfLink" href="http://169.254.169.254/latest/meta-data/">SSRF</a>
+			</body></html>`))
+		case "/search":
+			q := r.URL.Query().Get("q")
+			ns := r.URL.Query().Get("ns")
+			_, _ = w.Write([]byte(`<!doctype html><html><head><title>Search: ` + q + `</title></head><body>
+				<main><h1 id="resHeading">Results for ` + q + ` (` + ns + `)</h1></main>
+			</body></html>`))
+		case "/about":
+			_, _ = w.Write([]byte(`<!doctype html><html><head><title>About Page</title></head><body>
+				<main><h1>About EdgeFetch Live Navigation</h1></main>
+			</body></html>`))
+		case "/disallowed-dest":
+			_, _ = w.Write([]byte(`<!doctype html><html><body>secret</body></html>`))
+		case "/inert":
+			_, _ = w.Write([]byte(`<!doctype html><html><head><title>Inert Page</title></head><body>
+				<div id="inertBox">Static inert content</div>
+			</body></html>`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	srvAddr := srv.Listener.Addr().String()
+	allowPublic := func(u *url.URL) error {
+		if u.Scheme != "https" || u.Hostname() != "wiki.example.com" {
+			return errors.New("blocked by SSRF policy: non-public target")
+		}
+		return nil
+	}
+	r := NewRenderer(bin, allowPublic, "EdgeFetchTest/2.7.1", 1, nil)
+	r.extraFlags = []string{"--ignore-certificate-errors"}
+	r.proxyDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, srvAddr)
+	}
+	r.CheckRobots = func(_ context.Context, rawURL string) error {
+		if strings.Contains(rawURL, "/disallowed-dest") {
+			return errors.New("robots.txt disallowed /disallowed-dest")
+		}
+		return nil
+	}
+	defer r.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	// 1. fill("#searchInput", "Go") + press("Enter") submits the form, awaits navigation, updates FinalURL & HTML, and reports ActionResults!
+	outSearch, err := r.Execute(ctx, Task{
+		URL: "https://wiki.example.com/",
+		Actions: []InteractAction{
+			{Type: "fill", Selector: "#searchInput", Value: "Go", WaitMs: 20},
+			{Type: "press", Key: "Enter", WaitMs: 50},
+		},
+	})
+	if err != nil {
+		t.Fatalf("live Chrome fill + press(Enter) failed: %v", err)
+	}
+	if !strings.Contains(outSearch.FinalURL, "https://wiki.example.com/search?q=Go") {
+		t.Fatalf("expected FinalURL navigated to /search?q=Go, got %q", outSearch.FinalURL)
+	}
+	if !strings.Contains(outSearch.HTML, "Results for Go (main)") {
+		t.Fatalf("expected rendered search results HTML, got %q", outSearch.HTML)
+	}
+	if len(outSearch.ActionResults) != 2 {
+		t.Fatalf("expected 2 ActionResults, got %+v", outSearch.ActionResults)
+	}
+	enterRes := outSearch.ActionResults[1]
+	if enterRes.Status != "ok" || !enterRes.URLChanged || !enterRes.DOMChanged || !strings.Contains(enterRes.FinalURL, "/search?q=Go") {
+		t.Fatalf("expected press(Enter) ActionResult urlChanged=true domChanged=true status=ok, got %+v", enterRes)
+	}
+
+	// 2. click("#aboutLink") awaits navigation to /about and updates FinalURL & HTML!
+	outClick, err := r.Execute(ctx, Task{
+		URL: "https://wiki.example.com/",
+		Actions: []InteractAction{
+			{Type: "click", Selector: "#aboutLink", WaitMs: 50},
+		},
+	})
+	if err != nil {
+		t.Fatalf("live Chrome click(#aboutLink) failed: %v", err)
+	}
+	if outClick.FinalURL != "https://wiki.example.com/about" || !strings.Contains(outClick.HTML, "About EdgeFetch Live Navigation") {
+		t.Fatalf("expected click navigation to /about, got FinalURL=%q HTML=%q", outClick.FinalURL, outClick.HTML)
+	}
+	if len(outClick.ActionResults) != 1 || !outClick.ActionResults[0].URLChanged || outClick.ActionResults[0].Status != "ok" {
+		t.Fatalf("unexpected click(#aboutLink) ActionResults: %+v", outClick.ActionResults)
+	}
+
+	// 3. Inert page: press("ArrowDown") and click("#inertBox") report status="no_effect", urlChanged=false, domChanged=false, and warning!
+	outInert, err := r.Execute(ctx, Task{
+		URL: "https://wiki.example.com/inert",
+		Actions: []InteractAction{
+			{Type: "press", Key: "ArrowDown", WaitMs: 20},
+			{Type: "click", Selector: "#inertBox", WaitMs: 20},
+		},
+	})
+	if err != nil {
+		t.Fatalf("live Chrome inert page actions failed: %v", err)
+	}
+	if len(outInert.ActionResults) != 2 {
+		t.Fatalf("expected 2 inert ActionResults, got %+v", outInert.ActionResults)
+	}
+	for idx, ar := range outInert.ActionResults {
+		if ar.Status != "no_effect" || ar.URLChanged || ar.DOMChanged || ar.Warning == "" {
+			t.Fatalf("inert ActionResults[%d] expected no_effect + urlChanged=false + domChanged=false + warning, got %+v", idx, ar)
+		}
+	}
+
+	// 4. Navigations triggered by click to robots-disallowed path or SSRF URL MUST fail closed!
+	if _, err := r.Execute(ctx, Task{
+		URL:     "https://wiki.example.com/",
+		Actions: []InteractAction{{Type: "click", Selector: "#robotsBlockedLink", WaitMs: 50}},
+	}); err == nil || !strings.Contains(err.Error(), "robots.txt") {
+		t.Fatalf("SECURITY: expected click navigation to robots-disallowed path to fail closed, got %v", err)
+	}
+	if _, err := r.Execute(ctx, Task{
+		URL:     "https://wiki.example.com/",
+		Actions: []InteractAction{{Type: "click", Selector: "#ssrfLink", WaitMs: 50}},
+	}); err == nil {
+		t.Fatal("SECURITY: expected click navigation to 169.254.169.254 SSRF URL to fail closed")
 	}
 }

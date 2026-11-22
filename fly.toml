@@ -12,6 +12,8 @@ primary_region = "iad"
   EDGEFETCH_SITE_ID = "fly-edge-1"
   EDGEFETCH_TRUST_PROXY = "1"
   EDGEFETCH_TRUST_FLY_CLIENT_IP = "1"
+  # Update EDGEFETCH_PUBLIC_ORIGIN if you change `app` or attach a custom domain (required for `/admin` CSRF origin checks behind Fly TLS).
+  EDGEFETCH_PUBLIC_ORIGIN = "https://edgefetch-hub.fly.dev"
 
 [[mounts]]
   source = "edgefetch_data"

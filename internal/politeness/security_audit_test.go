@@ -1,9 +1,55 @@
 package politeness
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestRedactEmbeddedURLsDNSResolverIPs(t *testing.T) {
+	cases := []struct {
+		in      string
+		forbid  []string
+		require string
+	}{
+		{
+			in:      `Get "https://missing.example/robots.txt?api_key=SECRET_1": dial tcp: lookup missing.example on 127.0.0.11:53: no such host`,
+			forbid:  []string{"127.0.0.11", "SECRET_1"},
+			require: "on [redacted-resolver]:53: no such host",
+		},
+		{
+			in:      `lookup slow.example on 10.96.0.10:53: read udp 172.17.0.4:52134->10.96.0.10:53: i/o timeout`,
+			forbid:  []string{"10.96.0.10", "172.17.0.4", "52134"},
+			require: "lookup slow.example on [redacted-resolver]:53: read udp [redacted-resolver]:53: i/o timeout",
+		},
+		{
+			in:      `lookup ipv6.example on [fd00::10]:53: write udp [fd00::2]:44112->[fd00::10]:53: network is unreachable`,
+			forbid:  []string{"fd00::10", "fd00::2"},
+			require: "lookup ipv6.example on [redacted-resolver]:53: write udp [redacted-resolver]:53: network is unreachable",
+		},
+		{
+			in:      `dial udp 127.0.0.53:53: connect: connection refused`,
+			forbid:  []string{"127.0.0.53"},
+			require: "dial udp [redacted-resolver]:53: connect: connection refused",
+		},
+		{
+			in:      `dial tcp 10.0.0.2:53: i/o timeout`,
+			forbid:  []string{"10.0.0.2"},
+			require: "dial tcp [redacted-resolver]:53: i/o timeout",
+		},
+	}
+	for _, tc := range cases {
+		got := RedactEmbeddedURLs(tc.in)
+		for _, bad := range tc.forbid {
+			if strings.Contains(got, bad) {
+				t.Fatalf("SECURITY: internal DNS resolver IP %q leaked in %q (input=%q)", bad, got, tc.in)
+			}
+		}
+		if !strings.Contains(got, tc.require) {
+			t.Fatalf("expected %q to contain %q, got %q", tc.in, tc.require, got)
+		}
+	}
+}
 
 func TestRobotsBlankLinesInGroupAndCROnlyEndings(t *testing.T) {
 	exp := time.Unix(1_800_000_000, 0)

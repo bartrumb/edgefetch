@@ -5,6 +5,7 @@
  * `/agent/ws` nodes, `BroadcastChannel('edgefetch-hub-bus')` for cross-region isolate dispatch notifications, and
  * optional `TursoHttpD1Database` + `S3ArtifactBucket` storage bindings.
  */
+import dns from 'node:dns';
 import { mkdirSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
@@ -28,13 +29,14 @@ import {
   type AuthorizeArtifactUploadParams,
   type HubSocketLike,
 } from '../src/agent-hub.ts';
-import { authorizeAgent } from '../src/auth.ts';
+import { authorizeAgent, isValidSecretMatch } from '../src/auth.ts';
 import {
   createMemoryHubSettingsStore,
   createSqliteHubSettingsStore,
   HUB_SETTINGS_SQLITE_SCHEMA,
   type HubSettingsStore,
 } from '../src/dev-telemetry.ts';
+import { resolveSessionSecret } from '../src/github-auth.ts';
 import hubWorker from '../src/index.ts';
 import {
   createMemoryMcpVaultStore,
@@ -45,9 +47,11 @@ import {
   type StoredMcpServerRow,
 } from '../src/mcp-vault.ts';
 import {
+  ADMIN_COOKIE_NAME,
   createMemoryOAuthStore,
   createSqliteOAuthStore,
   OAUTH_SQLITE_SCHEMA,
+  verifyAdminSessionCookie,
   type HubUserRecord,
   type OAuthClientRecord,
   type OAuthCodeRecord,
@@ -58,7 +62,13 @@ import {
 } from '../src/oauth.ts';
 import { validatePublicHttpsTargetUrl } from '../src/overflow.ts';
 import { normalizeClientRateLimitIp } from '../src/safe-input.ts';
-import { isPublicIpAddress } from './safe-fetch.ts';
+import {
+  createSafeOutboundFetch,
+  isPublicIpAddress,
+  stripSensitiveCrossOriginHeaders,
+  validateExplicitLoopbackTargetUrl,
+  type LookupResolverFn,
+} from './safe-fetch.ts';
 import { S3ArtifactBucket } from './s3-bucket.ts';
 import { TursoHttpD1Database } from './turso-d1.ts';
 
@@ -98,7 +108,12 @@ const KNOWN_DENO_ENV_KEYS = [
   'FLY_APP_NAME',
   'FLY_ALLOC_ID',
   'FLY_REGION',
+  'RENDER_EXTERNAL_URL',
+  'RENDER_EXTERNAL_HOSTNAME',
+  'RAILWAY_PUBLIC_DOMAIN',
+  'RAILWAY_STATIC_URL',
   'EDGEFETCH_PUBLIC_ORIGIN',
+  'EDGEFETCH_MAX_CONNECTIONS_PER_IP',
   'SESSION_SECRET',
   'EDGEFETCH_SESSION_SECRET',
   'GITHUB_CLIENT_ID',
@@ -209,6 +224,7 @@ export const MAX_DENO_REQ_BODY_BYTES = 20 * 1024 * 1024; // 20 MiB inbound body 
 export const MAX_DENO_SAFE_RESPONSE_BYTES = 32 * 1024 * 1024; // 32 MiB outbound response cap matching `safe-fetch.ts`
 export const MAX_DENO_WS_CONNECTIONS = 128;
 export const MAX_DENO_WS_PER_SITE = 16;
+export const MAX_DENO_WS_PER_IP = 32;
 const MAX_DENO_WS_FRAME_BYTES = 1 * 1024 * 1024; // 1 MiB (`M6`)
 const MAX_DENO_SAFE_HOPS = 5;
 const MAX_DENO_BODY_IDLE_MS = 15_000;
@@ -347,36 +363,6 @@ export interface DenoSafeFetchOptions {
   maxResponseBytes?: number;
 }
 
-function validateExplicitLoopbackTargetUrl(raw: string): URL | null {
-  const trimmed = raw.trim();
-  const authorityMatch = /^https?:\/\/([^/?#]+)/i.exec(trimmed);
-  if (!authorityMatch) return null;
-  const rawAuthority = authorityMatch[1]!;
-  if (!rawAuthority || rawAuthority.includes('@')) return null;
-
-  // Enforce strict literal authority allowlist BEFORE WHATWG `new URL(...)` normalization
-  // so decimal/hex/octal/short IPv4 (e.g. 2130706433, 0x7f000001, 0177.0.0.1, 127.1),
-  // non-canonical IPv6 (e.g. [0:0:0:0:0:0:0:1]), trailing dots, and invalid ports are rejected.
-  const literalMatch = /^(127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$/i.exec(rawAuthority);
-  if (!literalMatch) return null;
-  if (literalMatch[2] !== undefined) {
-    const port = Number(literalMatch[2]);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
-  }
-
-  let u: URL;
-  try {
-    u = new URL(trimmed);
-  } catch {
-    return null;
-  }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
-  if (u.username || u.password) return null;
-  const h = u.hostname.toLowerCase();
-  if (h !== '127.0.0.1' && h !== 'localhost' && h !== '[::1]') return null;
-  return u;
-}
-
 class DenoHubSocket implements HubSocketLike {
   private attachment: AgentAttachment | null = null;
   constructor(
@@ -406,16 +392,33 @@ class DenoHubSocket implements HubSocketLike {
   }
 }
 
-async function assertDenoResolvedPublicIp(
+async function resolveDenoDnsRecordsWithFallback(
   hostname: string,
-  resolveDnsFn: ((query: string, recordType: 'A' | 'AAAA') => Promise<string[]>) | undefined = getDenoRuntime()?.resolveDns,
-): Promise<void> {
-  if (typeof resolveDnsFn !== 'function') return;
-  const [v4, v6] = await Promise.all([
-    resolveDnsFn(hostname, 'A').catch(() => [] as string[]),
-    resolveDnsFn(hostname, 'AAAA').catch(() => [] as string[]),
-  ]);
-  const ips = [...v4, ...v6];
+  resolveDnsFn?: (query: string, recordType: 'A' | 'AAAA') => Promise<string[]>,
+): Promise<string[]> {
+  const activeResolveDns = resolveDnsFn ?? getDenoRuntime()?.resolveDns;
+  if (typeof activeResolveDns === 'function') {
+    const [v4, v6] = await Promise.all([
+      activeResolveDns(hostname, 'A').catch(() => [] as string[]),
+      activeResolveDns(hostname, 'AAAA').catch(() => [] as string[]),
+    ]);
+    return [...v4, ...v6];
+  }
+  // Fail-closed OS DNS fallback (`node:dns`) when `Deno.resolveDns` is unavailable (never fail open!).
+  const lookedUp = await new Promise<dns.LookupAddress[]>((res, rej) => {
+    dns.lookup(hostname, { all: true, verbatim: true }, (err, addrs) => {
+      if (err) rej(err);
+      else res(addrs);
+    });
+  }).catch(() => [] as dns.LookupAddress[]);
+  return lookedUp.map((a) => a.address);
+}
+
+async function resolveValidatedDenoPublicIp(
+  hostname: string,
+  resolveDnsFn?: (query: string, recordType: 'A' | 'AAAA') => Promise<string[]>,
+): Promise<{ pinnedIp: string; family: 4 | 6 }> {
+  const ips = await resolveDenoDnsRecordsWithFallback(hostname, resolveDnsFn);
   if (ips.length === 0) {
     throw new Error(`DNS resolution returned no A/AAAA records for ${hostname}`);
   }
@@ -424,16 +427,54 @@ async function assertDenoResolvedPublicIp(
       throw new Error(`SSRF blocked: ${hostname} resolved to non-public IP ${ip}`);
     }
   }
+  const pinnedIp = ips[0]!.trim().replace(/^\[|\]$/g, '');
+  const family: 4 | 6 = net.isIP(pinnedIp) === 6 ? 6 : 4;
+  return { pinnedIp, family };
 }
 
+function buildLookupFromDenoResolver(
+  resolveDnsFn?: (query: string, recordType: 'A' | 'AAAA') => Promise<string[]>,
+): LookupResolverFn {
+  return async (hostname: string): Promise<dns.LookupAddress[]> => {
+    const ips = await resolveDenoDnsRecordsWithFallback(hostname, resolveDnsFn);
+    if (ips.length === 0) {
+      throw new Error(`DNS resolution returned no A/AAAA records for ${hostname}`);
+    }
+    return ips.map((raw) => {
+      const trimmed = typeof raw === 'string' ? raw.trim().replace(/^\[|\]$/g, '') : '';
+      const fam = net.isIP(trimmed) === 6 ? 6 : 4;
+      // Preserve raw string if invalid/whitespace/octal so `isPublicIpAddress` inside `createPublicOnlyLookup` rejects it cleanly!
+      return { address: typeof raw === 'string' && isPublicIpAddress(raw) ? trimmed : String(raw), family: fam };
+    });
+  };
+}
+
+/**
+ * Single-resolution SSRF-safe outbound `fetch` for Deno (`R7-H/M`):
+ *  - When `opts.fetchImpl` is omitted (real runtime), delegates each validated hop to `createSafeOutboundFetch`
+ *    which resolves DNS ONCE via `resolvePinnedPublicAddress` and dials the literal validated IP directly with
+ *    TLS SNI `servername` + `tls.checkServerIdentity` — eliminating check-then-dial DNS rebinding TOCTOU completely!
+ *  - Fails closed whenever DNS resolution is unavailable or returns 0 / non-public records.
+ *  - Rejects trailing-dot FQDN hostnames (`https://example.com./`) and strips all sensitive auth/token/secret headers
+ *    permanently across any cross-origin redirect (`a.example -> b.example -> a.example`).
+ */
 export function createDenoSafeFetch(
   selfHost?: string,
   optsOrMaxBytes: DenoSafeFetchOptions | number = {},
 ): typeof fetch {
   const opts: DenoSafeFetchOptions =
     typeof optsOrMaxBytes === 'number' ? { maxResponseBytes: optsOrMaxBytes } : optsOrMaxBytes;
-  const doFetch = opts.fetchImpl ?? fetch;
   const maxResponseBytes = opts.maxResponseBytes ?? MAX_DENO_SAFE_RESPONSE_BYTES;
+  const singlePassPinnedFetch = opts.fetchImpl
+    ? null
+    : createSafeOutboundFetch({
+        resolver: buildLookupFromDenoResolver(opts.resolveDns),
+        pinResolvedIp: true,
+        allowExplicitLoopbackUrls: true,
+        maxResponseBytes,
+        defaultTimeoutMs: 30_000,
+      });
+
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const reqObj = input instanceof Request ? input : null;
     let currentUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
@@ -467,12 +508,12 @@ export function createDenoSafeFetch(
         // ignore invalid header names
       }
     }
-    let initialOrigin = '';
 
     for (let hop = 0; hop <= MAX_DENO_SAFE_HOPS; hop++) {
       const allowLoopbackThisHop = hop === 0 && opts.allowExplicitLoopbackUrls === true;
       const loopbackUrl = allowLoopbackThisHop ? validateExplicitLoopbackTargetUrl(currentUrl) : null;
       let validatedUrl: URL;
+      let pinnedIp: string | undefined;
       if (loopbackUrl) {
         validatedUrl = loopbackUrl;
       } else {
@@ -480,23 +521,18 @@ export function createDenoSafeFetch(
         if (!check.ok) {
           throw new Error(`SSRF blocked outbound URL: ${check.message}`);
         }
+        if (check.url.hostname.endsWith('.')) {
+          throw new Error(`SSRF blocked outbound URL: disallowed trailing-dot hostname: ${check.url.hostname}`);
+        }
         validatedUrl = check.url;
-        await assertDenoResolvedPublicIp(validatedUrl.hostname, opts.resolveDns);
-      }
-
-      if (hop === 0) {
-        initialOrigin = validatedUrl.origin;
+        if (opts.fetchImpl) {
+          const resolved = await resolveValidatedDenoPublicIp(validatedUrl.hostname, opts.resolveDns);
+          pinnedIp = resolved.pinnedIp;
+        }
       }
 
       const hopHeaders = new Headers(currentHeaders);
       hopHeaders.delete('host');
-      if (validatedUrl.origin !== initialOrigin) {
-        hopHeaders.delete('authorization');
-        hopHeaders.delete('cookie');
-        hopHeaders.delete('proxy-authorization');
-        hopHeaders.delete('x-api-key');
-        hopHeaders.delete('x-goog-api-key');
-      }
 
       const hopCtrl = new AbortController();
       const hopTimer = setTimeout(() => {
@@ -506,14 +542,20 @@ export function createDenoSafeFetch(
       getDenoRuntime()?.unrefTimer?.(hopTimer as unknown as number);
       let res: Response;
       try {
-        res = await doFetch(validatedUrl.toString(), {
+        const hopInit: RequestInit & { pinnedIp?: string } = {
           ...init,
           method,
           headers: hopHeaders,
           body: method === 'GET' || method === 'HEAD' || method === 'OPTIONS' ? undefined : body,
           redirect: 'manual',
           signal: init?.signal ? AbortSignal.any([init.signal, hopCtrl.signal]) : hopCtrl.signal,
-        });
+          ...(pinnedIp ? { pinnedIp } : {}),
+        };
+        if (opts.fetchImpl) {
+          res = await opts.fetchImpl(validatedUrl.toString(), hopInit);
+        } else {
+          res = await singlePassPinnedFetch!(validatedUrl.toString(), hopInit);
+        }
       } finally {
         clearTimeout(hopTimer);
       }
@@ -533,7 +575,12 @@ export function createDenoSafeFetch(
         if (!loc || hop === MAX_DENO_SAFE_HOPS) {
           throw new Error(`Too many or invalid redirects from ${validatedUrl.origin}`);
         }
-        currentUrl = new URL(loc, validatedUrl).toString();
+        const nextUrl = new URL(loc, validatedUrl);
+        if (nextUrl.origin !== validatedUrl.origin) {
+          // Mutate `currentHeaders` permanently so cross-origin redirects (`a -> b -> a`) NEVER restore credentials!
+          stripSensitiveCrossOriginHeaders(currentHeaders);
+        }
+        currentUrl = nextUrl.toString();
         if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === 'POST')) {
           method = 'GET';
           body = undefined;
@@ -543,7 +590,7 @@ export function createDenoSafeFetch(
         continue;
       }
 
-      if (res.body !== null) {
+      if (opts.fetchImpl && res.body !== null) {
         const cappedStream = capWebReadableStream(res.body, maxResponseBytes, 30_000);
         const wrapped = new Response(cappedStream, {
           status: res.status,
@@ -617,6 +664,7 @@ export function resolveDenoTrustedClientIp(
 
 const STRICT_SINGLE_HOST_RE =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([1-9]\d{0,4}))?$/;
+const STRICT_FLY_APP_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 
 export function parseStrictSingleHost(raw: string | undefined | null): string | null {
   if (typeof raw !== 'string') return null;
@@ -638,6 +686,52 @@ function isLoopbackHostOnly(hostname: string): boolean {
   return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1';
 }
 
+export function resolveConfiguredPublicOrigin(env: Record<string, string | undefined>): string | null {
+  const parseOriginCandidate = (rawUrl: string | undefined): string | null => {
+    const trimmed = (rawUrl ?? '').trim();
+    if (!trimmed) return null;
+    try {
+      const u = new URL(trimmed);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+      if (u.username || u.password) return null;
+      if (parseStrictSingleHost(u.host) === null && !isLoopbackHostOnly(u.hostname)) return null;
+      return u.origin;
+    } catch {
+      return null;
+    }
+  };
+
+  const explicit = parseOriginCandidate(env.EDGEFETCH_PUBLIC_ORIGIN);
+  if (explicit) return explicit;
+
+  const renderUrl = parseOriginCandidate(env.RENDER_EXTERNAL_URL);
+  if (renderUrl) return renderUrl;
+
+  const renderHost = parseStrictSingleHost(env.RENDER_EXTERNAL_HOSTNAME);
+  if (renderHost && renderHost.includes('.')) {
+    return `https://${renderHost}`;
+  }
+
+  const railwayDomain = parseStrictSingleHost(env.RAILWAY_PUBLIC_DOMAIN);
+  if (railwayDomain && railwayDomain.includes('.')) {
+    return `https://${railwayDomain}`;
+  }
+
+  const railwayStaticUrl = parseOriginCandidate(env.RAILWAY_STATIC_URL);
+  if (railwayStaticUrl) return railwayStaticUrl;
+  const railwayStaticHost = parseStrictSingleHost(env.RAILWAY_STATIC_URL);
+  if (railwayStaticHost && railwayStaticHost.includes('.')) {
+    return `https://${railwayStaticHost}`;
+  }
+
+  const flyApp = (env.FLY_APP_NAME ?? '').trim();
+  if (flyApp && STRICT_FLY_APP_NAME_RE.test(flyApp)) {
+    return `https://${flyApp.toLowerCase()}.fly.dev`;
+  }
+
+  return null;
+}
+
 export function resolvePublicOrigin(params: {
   canonicalOrigin: string;
   trustProxy: boolean;
@@ -653,8 +747,31 @@ export function resolvePublicOrigin(params: {
     }
     void new URL(`http://${params.hostHeader.trim()}/`);
   }
-  if (params.hasExplicitPublicOrigin || !params.trustProxy) {
+  if (params.hasExplicitPublicOrigin) {
     return { origin: baseOriginUrl.origin, trustedForwardedHost: null };
+  }
+
+  const validHost = parseStrictSingleHost(params.hostHeader);
+  let samePortLoopbackAuthority: string | null = null;
+  if (validHost !== null && (isLoopbackHostOnly(baseOriginUrl.hostname) || baseOriginUrl.hostname === 'hub.local')) {
+    try {
+      const cand = new URL(`http://${validHost}`);
+      const basePort = baseOriginUrl.port || (baseOriginUrl.protocol === 'https:' ? '443' : '80');
+      const candPort = cand.port || '80';
+      if (isLoopbackHostOnly(cand.hostname) && candPort === basePort) {
+        samePortLoopbackAuthority = validHost;
+      }
+    } catch {
+      samePortLoopbackAuthority = null;
+    }
+  }
+
+  if (!params.trustProxy) {
+    const authority = samePortLoopbackAuthority ?? baseOriginUrl.host;
+    return {
+      origin: new URL(`${baseOriginUrl.protocol}//${authority}`).origin,
+      trustedForwardedHost: null,
+    };
   }
 
   let proto = baseOriginUrl.protocol.replace(/:$/, '');
@@ -667,10 +784,9 @@ export function resolvePublicOrigin(params: {
     proto = rightmostProto;
   }
 
-  const validHost = parseStrictSingleHost(params.hostHeader);
   const validFwdHost = parseStrictSingleHost(params.forwardedHostHeader);
-  let allowLoopbackHostOverride = false;
-  if (validHost !== null && isLoopbackHostOnly(baseOriginUrl.hostname)) {
+  let allowLoopbackHostOverride = samePortLoopbackAuthority !== null;
+  if (!allowLoopbackHostOverride && validHost !== null && isLoopbackHostOnly(baseOriginUrl.hostname)) {
     try {
       allowLoopbackHostOverride = isLoopbackHostOnly(new URL(`http://${validHost}`).hostname);
     } catch {
@@ -696,6 +812,7 @@ function sanitizeDenoInboundRequest(
   trustFlyClientIp = false,
   maxReqBodyBytes = MAX_DENO_REQ_BODY_BYTES,
   onBodyCapExceeded?: () => void,
+  verifiedCallerAuth = false,
 ): Request {
   let fallbackReqHost: string | null = null;
   try {
@@ -734,13 +851,15 @@ function sanitizeDenoInboundRequest(
   const headers = new Headers();
   req.headers.forEach((val, key) => {
     const lower = key.toLowerCase();
-    // `R3-M9`: Strip client-supplied `cf-connecting-ip` / `x-real-ip` / `fly-client-ip` / `true-client-ip`,
+    // `R3-M9` & `R7`: Strip client-supplied `cf-connecting-ip` / `cf-ray` / `x-real-ip` / `fly-client-ip` / `true-client-ip` / `x-ef-verified-auth`,
     // and strip `x-forwarded-*` unless `EDGEFETCH_TRUST_PROXY=1`.
     if (
       lower === 'cf-connecting-ip' ||
+      lower === 'cf-ray' ||
       lower === 'x-real-ip' ||
       lower === 'fly-client-ip' ||
-      lower === 'true-client-ip'
+      lower === 'true-client-ip' ||
+      lower === 'x-ef-verified-auth'
     ) {
       return;
     }
@@ -750,6 +869,9 @@ function sanitizeDenoInboundRequest(
   });
   headers.set('cf-connecting-ip', trustedIp);
   headers.set('x-real-ip', trustedIp);
+  if (verifiedCallerAuth) {
+    headers.set('x-ef-verified-auth', '1');
+  }
 
   const method = req.method.toUpperCase();
   const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && req.body !== null;
@@ -765,6 +887,14 @@ function sanitizeDenoInboundRequest(
   } as RequestInit);
 }
 
+async function sha256Base64UrlDeno(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  const bytes = new Uint8Array(digest);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
 const fallbackSharedOAuthStore: OAuthStore = createMemoryOAuthStore();
 const fallbackSharedMcpVaultStore: McpVaultStore = createMemoryMcpVaultStore();
 const fallbackSharedActivityStore: ActivityStore = createMemoryActivityStore();
@@ -772,7 +902,13 @@ const fallbackSharedActivityStore: ActivityStore = createMemoryActivityStore();
 function openDenoPersistentStores(
   dataDir: string,
   ephemeralStores = false,
-): { oauth: OAuthStore; mcpVault: McpVaultStore; activity: ActivityStore; close: () => void } {
+): {
+  oauth: OAuthStore;
+  mcpVault: McpVaultStore;
+  activity: ActivityStore;
+  settings: HubSettingsStore;
+  close: () => void;
+} {
   if (ephemeralStores || dataDir.trim() === ':memory:') {
     return {
       oauth: createMemoryOAuthStore(),
@@ -893,6 +1029,8 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
   const maxUnauthInflight =
     maxInflightTotal >= 8 ? maxInflightTotal - Math.min(32, Math.floor(maxInflightTotal / 4)) : maxInflightTotal;
   const activeWsBySite = new Map<string, number>();
+  const activeWsByIp = new Map<string, number>();
+  let pendingOrOpenWsCount = 0;
   const sockets = new Set<DenoHubSocket>();
   const lastHelloLogBySite = new Map<string, number>();
   const engine = new AgentHubEngine({
@@ -934,18 +1072,8 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
         }).asR2Bucket()
       : undefined;
 
-  let explicitPublicOrigin: string | null = null;
-  let selfHost: string | undefined;
-  if (envMap.EDGEFETCH_PUBLIC_ORIGIN?.trim()) {
-    try {
-      const pubUrl = new URL(envMap.EDGEFETCH_PUBLIC_ORIGIN.trim());
-      explicitPublicOrigin = pubUrl.origin;
-      selfHost = pubUrl.hostname;
-    } catch {
-      explicitPublicOrigin = null;
-      selfHost = undefined;
-    }
-  }
+  const explicitPublicOrigin = resolveConfiguredPublicOrigin(envMap);
+  const selfHost = explicitPublicOrigin ? new URL(explicitPublicOrigin).hostname : undefined;
   const safeFetch = createDenoSafeFetch(selfHost, {
     allowExplicitLoopbackUrls: true,
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
@@ -956,6 +1084,12 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     ...(options.resolveDns ? { resolveDns: options.resolveDns } : {}),
   });
+
+  const callerTokenSecret =
+    envMap.CALLER_TOKEN ?? envMap.EDGEFETCH_CALLER_TOKEN ?? envMap.EDGEFETCH_SERVER_TOKEN;
+  const mcpTokenSecret = envMap.MCP_TOKEN;
+  const agentTokenSecret = envMap.AGENT_TOKEN ?? envMap.EDGEFETCH_AGENT_TOKEN;
+  const agentTokensMapRaw = envMap.AGENT_TOKENS ?? envMap.EDGEFETCH_AGENT_TOKENS;
 
   const stub = {
     fetch: async () => new Response('use deno upgrade handler', { status: 426 }),
@@ -1021,7 +1155,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     ...envMap,
     SAFE_FETCH: safeFetch,
     SAFE_PUBLIC_FETCH: safePublicFetch,
-    CALLER_TOKEN: envMap.CALLER_TOKEN ?? envMap.EDGEFETCH_CALLER_TOKEN ?? envMap.EDGEFETCH_SERVER_TOKEN,
+    CALLER_TOKEN: callerTokenSecret,
     SESSION_SECRET: envMap.SESSION_SECRET ?? envMap.EDGEFETCH_SESSION_SECRET,
     GITHUB_CLIENT_ID: envMap.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: envMap.GITHUB_CLIENT_SECRET,
@@ -1029,9 +1163,9 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     GITHUB_OWNER_LOGIN: envMap.GITHUB_OWNER_LOGIN,
     SIGNUP_MODE: envMap.SIGNUP_MODE,
     VAULT_MASTER_KEY: envMap.VAULT_MASTER_KEY ?? envMap.EDGEFETCH_VAULT_MASTER_KEY,
-    MCP_TOKEN: envMap.MCP_TOKEN,
-    AGENT_TOKEN: envMap.AGENT_TOKEN ?? envMap.EDGEFETCH_AGENT_TOKEN,
-    AGENT_TOKENS: envMap.AGENT_TOKENS ?? envMap.EDGEFETCH_AGENT_TOKENS,
+    MCP_TOKEN: mcpTokenSecret,
+    AGENT_TOKEN: agentTokenSecret,
+    AGENT_TOKENS: agentTokensMapRaw,
     USER_AGENT: envMap.USER_AGENT ?? envMap.EDGEFETCH_USER_AGENT,
     ROBOTS_BYPASS_HOSTS: envMap.ROBOTS_BYPASS_HOSTS ?? envMap.EDGEFETCH_ROBOTS_BYPASS_HOSTS,
     OTEL_EXPORTER_OTLP_ENDPOINT: envMap.OTEL_EXPORTER_OTLP_ENDPOINT,
@@ -1042,6 +1176,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     BOT_CONTACT_URL: envMap.BOT_CONTACT_URL,
     BOT_KEY_NBF: envMap.BOT_KEY_NBF ?? envMap.EDGEFETCH_BOT_KEY_NBF,
     BOT_KEY_EXP: envMap.BOT_KEY_EXP ?? envMap.EDGEFETCH_BOT_KEY_EXP,
+    EDGEFETCH_PUBLIC_ORIGIN: explicitPublicOrigin ?? envMap.EDGEFETCH_PUBLIC_ORIGIN,
     AGENT_HUB: {
       idFromName: () => ({ toString: () => 'deno-global' }),
       get: () => stub,
@@ -1049,6 +1184,50 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     ...(metaDb ? { META: metaDb } : {}),
     ...(searchDb ? { SEARCH: searchDb } : {}),
     ...(s3Bucket ? { ARTIFACTS: s3Bucket } : {}),
+  };
+
+  const sessionSecret = resolveSessionSecret(workerEnv as {
+    SESSION_SECRET?: string;
+    CALLER_TOKEN?: string;
+    GITHUB_CLIENT_ID?: string;
+    GITHUB_CLIENT_SECRET?: string;
+  });
+
+  const hasVerifiedDenoCallerCredentials = async (req: Request, pathname: string): Promise<boolean> => {
+    const authHdr = req.headers.get('authorization');
+    const apiKeyHdr = req.headers.get('x-api-key');
+    const agentTokHdr = req.headers.get('x-agent-token');
+    const cookieHdr = req.headers.get('cookie');
+
+    if (!authHdr && !apiKeyHdr && !agentTokHdr && !cookieHdr) {
+      return false;
+    }
+
+    const bearerMatch = authHdr ? /^bearer\s+(\S+)$/i.exec(authHdr.trim()) : null;
+    const bearerTok = bearerMatch?.[1] ?? null;
+    const cleanApiKey = apiKeyHdr && !/\s/.test(apiKeyHdr.trim()) ? apiKeyHdr.trim() : null;
+    const presentedCallerTok = bearerTok ?? cleanApiKey;
+
+    if (presentedCallerTok && isValidSecretMatch(presentedCallerTok, callerTokenSecret, mcpTokenSecret)) {
+      return true;
+    }
+
+    if (bearerTok && bearerTok.startsWith('efa_') && bearerTok.length >= 24 && bearerTok.length <= 128) {
+      const tokenHash = await sha256Base64UrlDeno(bearerTok);
+      const rec = await oauth.getAccessToken(tokenHash, Date.now());
+      if (rec) return true;
+    }
+
+    if (pathname.startsWith('/agent/') && authorizeAgent(req, { AGENT_TOKEN: agentTokenSecret, AGENT_TOKENS: agentTokensMapRaw }).ok) {
+      return true;
+    }
+
+    if (cookieHdr && cookieHdr.includes(`${ADMIN_COOKIE_NAME}=`) && sessionSecret) {
+      const verifiedSession = await verifyAdminSessionCookie(cookieHdr, sessionSecret);
+      if (verifiedSession.ok) return true;
+    }
+
+    return false;
   };
 
   const pendingWaitUntil = new Set<Promise<unknown>>();
@@ -1067,7 +1246,8 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
   const rawEnvPort = envMap.PORT !== undefined && envMap.PORT !== '' ? Number(envMap.PORT) : 8787;
   const port = options.port ?? (Number.isFinite(rawEnvPort) ? rawEnvPort : 8787);
   let boundPort = port;
-  const canonicalOrigin = () => explicitPublicOrigin ?? `http://hub.local:${boundPort}`;
+  const defaultHost = options.hostname && options.hostname !== '0.0.0.0' && options.hostname !== '::' ? options.hostname : 'hub.local';
+  const canonicalOrigin = () => explicitPublicOrigin ?? `http://${defaultHost}:${boundPort}`;
 
   const handler = async (req: Request, info?: { remoteAddr?: { hostname?: string } }): Promise<Response> => {
     const methodUpper = req.method.toUpperCase();
@@ -1082,9 +1262,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     }
     const isHealthProbe =
       (methodUpper === 'GET' || methodUpper === 'HEAD') && (rawPathname === '/health' || rawPathname === '/readyz');
-    const hasCallerAuth = Boolean(
-      req.headers.get('authorization') || req.headers.get('x-api-key') || req.headers.get('cookie'),
-    );
+    const hasCallerAuth = isHealthProbe ? false : await hasVerifiedDenoCallerCredentials(req, rawPathname);
     const clientBucket = normalizeClientRateLimitIp(resolveDenoTrustedClientIp(req, info, trustProxy, trustFlyClientIp));
     const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
     const hitPerIpLimit = curIpInflight >= maxInflightPerIp;
@@ -1135,6 +1313,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
           () => {
             bodyCapExceeded = true;
           },
+          hasCallerAuth,
         );
       } catch (err) {
         await req.body?.cancel().catch(() => undefined);
@@ -1149,6 +1328,10 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
           ),
           explicitPublicOrigin?.startsWith('https://') ?? false,
         );
+      }
+
+      if ((methodUpper === 'GET' || methodUpper === 'HEAD' || methodUpper === 'OPTIONS') && req.body !== null) {
+        await req.body.cancel().catch(() => undefined);
       }
 
       const isHttpsReq = cleanReq.url.startsWith('https://');
@@ -1173,7 +1356,9 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
           return applyDenoSecurityHeaders(Response.json({ error: 'websocket_upgrade_unavailable' }, { status: 501 }), isHttpsReq);
         }
         const curSiteWs = activeWsBySite.get(auth.siteId) ?? 0;
-        if (sockets.size >= MAX_DENO_WS_CONNECTIONS || curSiteWs >= MAX_DENO_WS_PER_SITE) {
+        const curIpWs = activeWsByIp.get(clientBucket) ?? 0;
+        const perIpWsCap = trustProxy ? MAX_DENO_WS_CONNECTIONS : MAX_DENO_WS_PER_IP;
+        if (pendingOrOpenWsCount >= MAX_DENO_WS_CONNECTIONS || curSiteWs >= MAX_DENO_WS_PER_SITE || curIpWs >= perIpWsCap) {
           return applyDenoSecurityHeaders(
             Response.json(
               { error: 'too_many_requests', message: 'Too many active agent WebSocket connections' },
@@ -1193,11 +1378,26 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
         );
         const pubIp = resolveDenoTrustedClientIp(req, info, trustProxy, trustFlyClientIp);
         const hubSock = new DenoHubSocket(socket, [`site:${auth.siteId}`]);
-        let wsTracked = false;
+
+        // Reserve WS slot synchronously before `onopen` so concurrent upgrades cannot race past `MAX_DENO_WS_CONNECTIONS`!
+        pendingOrOpenWsCount++;
+        activeWsBySite.set(auth.siteId, curSiteWs + 1);
+        activeWsByIp.set(clientBucket, curIpWs + 1);
+        let wsSlotReleased = false;
+        const releaseWsReservation = () => {
+          if (wsSlotReleased) return;
+          wsSlotReleased = true;
+          pendingOrOpenWsCount = Math.max(0, pendingOrOpenWsCount - 1);
+          const remSite = activeWsBySite.get(auth.siteId) ?? 0;
+          if (remSite <= 1) activeWsBySite.delete(auth.siteId);
+          else activeWsBySite.set(auth.siteId, remSite - 1);
+          const remIp = activeWsByIp.get(clientBucket) ?? 0;
+          if (remIp <= 1) activeWsByIp.delete(clientBucket);
+          else activeWsByIp.set(clientBucket, remIp - 1);
+        };
+
         socket.onopen = () => {
-          wsTracked = true;
           sockets.add(hubSock);
-          activeWsBySite.set(auth.siteId, (activeWsBySite.get(auth.siteId) ?? 0) + 1);
           const att = engine.registerAgent(hubSock, auth.siteId, cleanReq.headers.get('x-agent-arch')?.slice(0, 32) || null, {
             version: cleanReq.headers.get('x-agent-version')?.slice(0, 64) || null,
             publicIp: pubIp,
@@ -1260,14 +1460,14 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
             }
           }
         };
+        socket.onerror = () => {
+          if (!sockets.has(hubSock)) {
+            releaseWsReservation();
+          }
+        };
         socket.onclose = (ev) => {
           sockets.delete(hubSock);
-          if (wsTracked) {
-            wsTracked = false;
-            const rem = activeWsBySite.get(auth.siteId) ?? 0;
-            if (rem <= 1) activeWsBySite.delete(auth.siteId);
-            else activeWsBySite.set(auth.siteId, rem - 1);
-          }
+          releaseWsReservation();
           engine.handleDisconnect(hubSock, ev.reason || `closed_${ev.code}`);
         };
         return response;

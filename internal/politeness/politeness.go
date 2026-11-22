@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -28,6 +29,7 @@ const (
 	RobotsDistressTTL       = 60 * time.Second
 	RobotsMaxBytes          = 1 << 20 // 1 MiB (>= 500 KiB minimum required by RFC 9309 §2.5; closes 520 KiB padding bypass).
 	RobotsTimeout           = 5 * time.Second
+	MaxRobotsFetchTimeout   = 10 * time.Second
 	MaxCrawlDelay           = 30 * time.Second
 )
 
@@ -445,6 +447,8 @@ type RobotsEntry struct {
 	CrawlDelay      time.Duration
 	DisallowAIInput bool
 	Distressed      bool
+	DNSNotFound     bool
+	SSRFBlocked     bool
 	Reason          string
 	ExpiresAt       time.Time
 	compiled        []compiledRobotsRule
@@ -723,6 +727,86 @@ func trimRobotsWS(s string) string {
 	return strings.Trim(s, " \t")
 }
 
+func isZeroWidthRobotsRune(r rune) bool {
+	switch r {
+	case '\uFEFF', '\u200B', '\u200C', '\u200D', '\u2060':
+		return true
+	default:
+		return false
+	}
+}
+
+func trimRobotsWSAndZeroWidth(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return r == ' ' || r == '\t' || isZeroWidthRobotsRune(r)
+	})
+}
+
+func asciiLowerRobotsString(s string) string {
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			hasUpper = true
+			break
+		}
+	}
+	if !hasUpper {
+		return s
+	}
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return string(b)
+}
+
+func isValidCrawlDelayDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[i] == '+' || s[i] == '-' {
+		i++
+	}
+	if i >= len(s) {
+		return false
+	}
+	sawDigit := false
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		sawDigit = true
+		i++
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			sawDigit = true
+			i++
+		}
+	}
+	if !sawDigit {
+		return false
+	}
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		i++
+		if i < len(s) && (s[i] == '+' || s[i] == '-') {
+			i++
+		}
+		expDigits := 0
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			expDigits++
+			i++
+		}
+		if expDigits == 0 {
+			return false
+		}
+	}
+	return i == len(s)
+}
+
 // ParseRobotsTxt extracts directives matching `agentToken` (lowercase product token, preferred per RFC 9309 specificity)
 // or fallback `*`, plus `Crawl-delay` clamped to `MaxCrawlDelay` and `Content-Signal` (`ai-input`).
 func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
@@ -734,10 +818,8 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 			body = ""
 		}
 	}
-	// RFC 9309 §2.1: strip any leading UTF-8 BOMs (including repeated BOMs) so the first directive is never corrupted.
-	for strings.HasPrefix(body, "\xef\xbb\xbf") {
-		body = strings.TrimPrefix(body, "\xef\xbb\xbf")
-	}
+	// RFC 9309 §2.1: strip any leading UTF-8 BOMs and zero-width format characters so the first directive is never corrupted.
+	body = strings.TrimLeftFunc(body, isZeroWidthRobotsRune)
 	agentToken = canonicalProductToken(agentToken)
 	type group struct {
 		agents          []string
@@ -756,10 +838,10 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 		if idx := strings.IndexByte(rawLine, '#'); idx >= 0 {
 			rawLine = rawLine[:idx]
 		}
-		line := trimRobotsWS(rawLine)
-		for strings.HasPrefix(line, "\xef\xbb\xbf") {
-			line = trimRobotsWS(strings.TrimPrefix(line, "\xef\xbb\xbf"))
-		}
+		line := strings.TrimLeftFunc(rawLine, func(r rune) bool {
+			return r == ' ' || r == '\t' || isZeroWidthRobotsRune(r)
+		})
+		line = trimRobotsWS(line)
 		if line == "" {
 			// RFC 9309 §2.2.1: blank lines inside a group do NOT terminate the current User-agent group;
 			// a group only ends when a subsequent User-agent line appears after a rule directive.
@@ -773,8 +855,9 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 		if strings.IndexByte(rawField, 0) >= 0 {
 			continue
 		}
-		field := strings.ToLower(trimRobotsWS(rawField))
-		val := trimRobotsWS(line[colon+1:])
+		field := asciiLowerRobotsString(trimRobotsWSAndZeroWidth(rawField))
+		rawVal := trimRobotsWS(line[colon+1:])
+		val := rawVal
 		if nul := strings.IndexByte(val, 0); nul >= 0 {
 			val = trimRobotsWS(val[:nul])
 		}
@@ -814,23 +897,26 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 		case "crawl-delay":
 			if len(cur.agents) > 0 {
 				seenDirective = true
-				if secs, err := strconv.ParseFloat(val, 64); err == nil && secs > 0 {
-					d := time.Duration(secs * float64(time.Second))
-					if d > MaxCrawlDelay {
-						d = MaxCrawlDelay
+				if isValidCrawlDelayDecimal(val) {
+					if secs, err := strconv.ParseFloat(val, 64); err == nil && !math.IsNaN(secs) && !math.IsInf(secs, 0) && secs > 0 {
+						maxSecs := float64(MaxCrawlDelay) / float64(time.Second)
+						if secs >= maxSecs {
+							cur.crawlDelay = MaxCrawlDelay
+						} else {
+							cur.crawlDelay = time.Duration(secs * float64(time.Second))
+						}
 					}
-					cur.crawlDelay = d
 				}
 			}
 		case "content-signal":
 			if len(cur.agents) > 0 {
 				seenDirective = true
-				if disallow, found := parseContentSignalAIInput(val); found {
+				if disallow, found := parseContentSignalAIInput(rawVal); found {
 					v := disallow
 					cur.aiInputDisallow = &v
 				}
 			} else if !seenAnyUserAgent {
-				if disallow, found := parseContentSignalAIInput(val); found {
+				if disallow, found := parseContentSignalAIInput(rawVal); found {
 					v := disallow
 					preGroupAiInput = &v
 				}
@@ -911,19 +997,25 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 }
 
 func parseContentSignalAIInput(val string) (disallow, found bool) {
+	if len(val) > 524_288 {
+		val = val[:524_288]
+	}
 	for _, item := range strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == ';' }) {
+		if strings.IndexByte(item, 0) >= 0 {
+			continue
+		}
 		k, v, ok := strings.Cut(item, "=")
 		if !ok {
 			continue
 		}
-		if !strings.EqualFold(trimRobotsWS(k), "ai-input") {
+		if asciiLowerRobotsString(trimRobotsWS(k)) != "ai-input" {
 			continue
 		}
 		cleanV := trimRobotsWS(v)
 		if len(cleanV) >= 2 && ((cleanV[0] == '"' && cleanV[len(cleanV)-1] == '"') || (cleanV[0] == '\'' && cleanV[len(cleanV)-1] == '\'')) {
 			cleanV = trimRobotsWS(cleanV[1 : len(cleanV)-1])
 		}
-		switch strings.ToLower(cleanV) {
+		switch asciiLowerRobotsString(cleanV) {
 		case "no":
 			disallow = true
 			found = true
@@ -936,7 +1028,7 @@ func parseContentSignalAIInput(val string) (disallow, found bool) {
 }
 
 func canonicalProductToken(raw string) string {
-	tok := strings.ToLower(trimRobotsWS(raw))
+	tok := asciiLowerRobotsString(trimRobotsWS(raw))
 	if tok == "*" {
 		return "*"
 	}

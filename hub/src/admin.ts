@@ -19,16 +19,18 @@ import type { DevTelemetrySettingsView } from './dev-telemetry';
 import {
   handleGitHubOAuthCallback,
   isGitHubAuthConfigured,
+  PINNED_OWNER_GITHUB_ID_SETTING_KEY,
   resolveSessionSecret,
   startGitHubOAuthFlow,
   type GitHubAuthEnv,
 } from './github-auth';
 import { testAndListRemoteMcpTools } from './mcp-federation';
-import { discoverMcps, inferAssociatedDomains, isSafePublicHttpsUrl, slugifyMcpServerName } from './mcp-registry';
+import { discoverMcps, isSafePublicHttpsUrl, slugifyMcpServerName, validateConnectorDomains } from './mcp-registry';
 import {
   buildMaskedAuthSummary,
   completeDownstreamMcpOAuthCallback,
   MCP_OAUTH_BIND_COOKIE,
+  MCP_OAUTH_BIND_COOKIE_DEV,
   probeRemoteMcpOAuthMetadata,
   resolveCallerUserId,
   sanitizeSecretHeadersInput,
@@ -48,14 +50,14 @@ import { stripInvisibleSmugglingChars } from './scrape';
 import type { UpdateCheckStatus } from './update-check';
 import {
   ADMIN_COOKIE_NAME,
+  ADMIN_COOKIE_NAME_DEV,
   createAdminSessionValue,
   escapeHtml,
   formatCookie,
-  isAdminSessionRevoked,
-  isEffectiveHttpsOrigin,
   isSameOriginFormPost,
+  resolveAdminCookieAttrs,
   sha256Base64Url,
-  verifyAdminSessionCookie,
+  verifyLiveAdminSession,
   type AdminPrincipal,
   type HubUserRecord,
   type OAuthGrantSummary,
@@ -135,6 +137,8 @@ export interface AdminPortalDeps {
   getUpdateStatus?: (agents: AgentAttachment[]) => Promise<UpdateCheckStatus>;
   getTelemetrySettings?: () => Promise<DevTelemetrySettingsView>;
   setTelemetryOptIn?: (enabled: boolean) => Promise<DevTelemetrySettingsView>;
+  getHubSetting?: (key: string) => Promise<string | null>;
+  setHubSetting?: (key: string, value: string) => Promise<void>;
   executeFetch: (params: {
     target: FetchTarget;
     site?: string;
@@ -1281,6 +1285,7 @@ async function withAdminAuditSpan<T>(
     | 'affinity_clear'
     | 'grant_revoke'
     | 'user_role'
+    | 'user_delete'
     | 'telemetry_toggle'
     | 'fetch'
     | 'mcp_connect'
@@ -1309,7 +1314,8 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   const path = url.pathname;
   if (path !== '/admin' && !path.startsWith('/admin/')) return null;
 
-  const isSecure = isEffectiveHttpsOrigin(url, deps.publicOrigin);
+  const cookieAttrs = resolveAdminCookieAttrs(url, deps.publicOrigin);
+  const mcpBindCookieName = cookieAttrs.strictHostPrefix ? MCP_OAUTH_BIND_COOKIE : MCP_OAUTH_BIND_COOKIE_DEV;
   const ownerSecret = deps.ownerSecret;
   const hasOwnerSecret = Boolean(ownerSecret && ownerSecret.length >= MIN_TOKEN_LENGTH);
   const ghEnv: GitHubAuthEnv = {
@@ -1346,6 +1352,8 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         env: ghEnv,
         oauthStore: deps.oauthStore,
         ...(deps.metaDb ? { metaDb: deps.metaDb } : {}),
+        ...(deps.getHubSetting ? { getHubSetting: deps.getHubSetting } : {}),
+        ...(deps.setHubSetting ? { setHubSetting: deps.setHubSetting } : {}),
         serviceName: deps.serviceName,
         publicOrigin: deps.publicOrigin,
         ...(deps.onEvent ? { onEvent: deps.onEvent } : {}),
@@ -1368,12 +1376,16 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   }
 
   const nowMs = Date.now();
-  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), signingSecret, nowMs);
-  if (session.ok && (await isAdminSessionRevoked(deps.oauthStore, session.csrf, nowMs, session.jti))) {
-    session = { ok: false };
-  }
+  const session = await verifyLiveAdminSession({
+    cookieHeader: request.headers.get('cookie'),
+    signingSecret,
+    store: deps.oauthStore,
+    now: nowMs,
+    strictHostPrefix: cookieAttrs.strictHostPrefix,
+    githubAuthEnv: ghEnv,
+  });
 
-  if (request.method === 'POST' && !isSameOriginFormPost(request, url, deps.publicOrigin)) {
+  if ((request.method === 'POST' || request.method === 'DELETE') && !isSameOriginFormPost(request, url, deps.publicOrigin)) {
     return adminJson({ error: 'invalid_origin' }, 403);
   }
 
@@ -1481,7 +1493,15 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         location: '/admin',
         ...ADMIN_JSON_HEADERS,
       });
-      headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, minted.value, { maxAge: minted.maxAgeSec, path: '/', sameSite: 'Lax', secure: isSecure }));
+      headers.append(
+        'set-cookie',
+        formatCookie(cookieAttrs.name, minted.value, {
+          maxAge: minted.maxAgeSec,
+          path: '/',
+          sameSite: 'Lax',
+          secure: cookieAttrs.secure,
+        }),
+      );
       span.setAttributes({ 'admin.outcome': 'authenticated', 'admin.user_id': 'owner', 'http.response.status_code': 302 });
       return new Response(null, { status: 302, headers });
     });
@@ -1510,7 +1530,16 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         location: '/admin',
         ...ADMIN_JSON_HEADERS,
       });
-      headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: isSecure }));
+      headers.append(
+        'set-cookie',
+        formatCookie(cookieAttrs.name, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: cookieAttrs.secure }),
+      );
+      if (cookieAttrs.name !== ADMIN_COOKIE_NAME_DEV) {
+        headers.append(
+          'set-cookie',
+          formatCookie(ADMIN_COOKIE_NAME_DEV, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: cookieAttrs.secure }),
+        );
+      }
       span.setAttributes({
         'admin.outcome': 'logged_out',
         'admin.user_id': session.userId,
@@ -1521,7 +1550,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   }
 
   const apiOp =
-    request.method === 'POST'
+    request.method === 'POST' || request.method === 'DELETE'
       ? path === '/admin/api/events/clear'
         ? ('events_clear' as const)
         : path === '/admin/api/affinity/clear'
@@ -1530,7 +1559,9 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
             ? ('grant_revoke' as const)
             : path === '/admin/api/users/role'
               ? ('user_role' as const)
-              : path === '/admin/api/telemetry'
+              : path === '/admin/api/users/delete' || path === '/admin/api/users'
+                ? ('user_delete' as const)
+                : path === '/admin/api/telemetry'
                 ? ('telemetry_toggle' as const)
                 : path === '/admin/api/fetch'
                   ? ('fetch' as const)
@@ -1655,6 +1686,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         remoteUrl: url.searchParams.get('remoteUrl') ?? '',
         slug: url.searchParams.get('slug') ?? undefined,
         name: url.searchParams.get('name') ?? undefined,
+        autoRouteScrape: url.searchParams.get('autoRouteScrape') === 'true',
         clientId: url.searchParams.get('clientId') ?? undefined,
         scope: url.searchParams.get('scope') ?? undefined,
         vaultMasterKey: deps.vaultMasterKey,
@@ -1669,11 +1701,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       });
       headers.append(
         'set-cookie',
-        formatCookie(MCP_OAUTH_BIND_COOKIE, started.bindCookieValue, {
+        formatCookie(mcpBindCookieName, started.bindCookieValue, {
           maxAge: 600,
-          path: '/admin/mcp/oauth/callback',
+          path: '/',
           sameSite: 'Lax',
-          secure: isSecure,
+          secure: cookieAttrs.secure,
         }),
       );
       return new Response(null, { status: 302, headers });
@@ -1683,13 +1715,14 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   if (path === '/admin/mcp/oauth/callback' && request.method === 'GET') {
     return withAdminAuditSpan('mcp_oauth', async () => {
       if (!deps.vaultStore) return adminJson({ error: 'vault_not_configured' }, 503);
-      const bindCookie = readCookieFromHeader(request.headers.get('cookie'), MCP_OAUTH_BIND_COOKIE);
+      const bindCookie = readCookieFromHeader(request.headers.get('cookie'), mcpBindCookieName);
       const completed = await completeDownstreamMcpOAuthCallback({
         userId,
         sessionCsrf: session.csrf,
         bindCookieHeader: bindCookie,
         code: url.searchParams.get('code') ?? '',
         state: url.searchParams.get('state') ?? '',
+        iss: url.searchParams.get('iss'),
         vaultMasterKey: deps.vaultMasterKey,
         vaultStore: deps.vaultStore,
         fetchFn: safeFetch,
@@ -1704,6 +1737,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
             vaultMasterKey: deps.vaultMasterKey,
             userId,
             remoteOrigin: completed.server.remoteOrigin,
+            remoteUrl: completed.server.remoteUrl,
             ciphertext: completed.server.encryptedCredentials,
           })
         : null;
@@ -1720,11 +1754,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           await deps.vaultStore.upsertServer(completed.server);
         }
       }
-      const clearBindCookie = formatCookie(MCP_OAUTH_BIND_COOKIE, '', {
+      const clearBindCookie = formatCookie(mcpBindCookieName, '', {
         maxAge: 0,
-        path: '/admin/mcp/oauth/callback',
+        path: '/',
         sameSite: 'Lax',
-        secure: isSecure,
+        secure: cookieAttrs.secure,
       });
       if ((request.headers.get('accept') ?? '').toLowerCase().includes('application/json')) {
         const headers = new Headers(ADMIN_JSON_HEADERS);
@@ -1740,7 +1774,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     });
   }
 
-  if (request.method === 'POST') {
+  if (request.method === 'POST' || request.method === 'DELETE') {
     const hdrCsrf = request.headers.get('x-csrf-token') ?? '';
     if (!hdrCsrf || !sameBytes(hdrCsrf, session.csrf)) {
       if (apiOp) {
@@ -1824,6 +1858,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           name: typeof body.name === 'string' ? body.name : undefined,
           transport: body.transport === 'sse' ? 'sse' : 'streamable-http',
           domains: Array.isArray(body.domains) ? body.domains.filter((d): d is string => typeof d === 'string') : undefined,
+          autoRouteScrape: body.autoRouteScrape === true || body.routeScrapeDomains === true,
           clientId: typeof body.clientId === 'string' ? body.clientId : undefined,
           clientSecret: typeof body.clientSecret === 'string' ? body.clientSecret : undefined,
           scope: typeof body.scope === 'string' ? body.scope : undefined,
@@ -1836,11 +1871,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         const headers = new Headers(ADMIN_JSON_HEADERS);
         headers.append(
           'set-cookie',
-          formatCookie(MCP_OAUTH_BIND_COOKIE, started.bindCookieValue, {
+          formatCookie(mcpBindCookieName, started.bindCookieValue, {
             maxAge: 600,
-            path: '/admin/mcp/oauth/callback',
+            path: '/',
             sameSite: 'Lax',
-            secure: isSecure,
+            secure: cookieAttrs.secure,
           }),
         );
         return Response.json(
@@ -1872,6 +1907,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
               vaultMasterKey: deps.vaultMasterKey,
               userId,
               remoteOrigin: existing.remoteOrigin,
+              remoteUrl: existing.remoteUrl,
               ciphertext: existing.encryptedCredentials,
             });
             if (!unsealed.ok) return adminJson({ ok: false, error: unsealed.error, message: unsealed.message }, 500);
@@ -1966,10 +2002,20 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           return adminJson({ ok: false, error: 'invalid_headers', message: hdrCheck.error }, 400);
         }
 
+        const autoRouteScrape = body.autoRouteScrape === true || body.routeScrapeDomains === true;
+        const rawDomains = Array.isArray(body.domains)
+          ? body.domains.filter((d): d is string => typeof d === 'string')
+          : undefined;
+        const domValidation = validateConnectorDomains(rawDomains, urlCheck.origin, autoRouteScrape);
+        if (!domValidation.ok) {
+          return adminJson({ ok: false, error: 'invalid_domains', message: domValidation.error }, 400);
+        }
+        const domains = domValidation.domains;
+
         const hasSecrets = Object.keys(hdrCheck.headers).length > 0;
         const secretPayload: VaultSecretPayload = hasSecrets
-          ? { kind: 'headers', pinnedOrigin: urlCheck.origin, headers: hdrCheck.headers }
-          : { kind: 'none', pinnedOrigin: urlCheck.origin };
+          ? { kind: 'headers', pinnedOrigin: urlCheck.origin, pinnedUrl: urlCheck.normalized, headers: hdrCheck.headers }
+          : { kind: 'none', pinnedOrigin: urlCheck.origin, pinnedUrl: urlCheck.normalized };
 
         let encryptedCredentials: string | null = null;
         if (hasSecrets) {
@@ -1989,16 +2035,6 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           stripInvisibleSmugglingChars(typeof body.name === 'string' ? body.name : '').trim().slice(0, 120) ||
           urlCheck.url.hostname;
         const slug = slugifyMcpServerName(typeof body.slug === 'string' && body.slug.trim() ? body.slug : cleanName);
-        const explicitDomains = Array.isArray(body.domains)
-          ? body.domains
-              .filter((d): d is string => typeof d === 'string')
-              .map((d) => d.trim().toLowerCase().replace(/^www\./, ''))
-              .filter((d) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d))
-          : [];
-        const domains =
-          explicitDomains.length > 0
-            ? [...new Set(explicitDomains)].slice(0, 16)
-            : inferAssociatedDomains({ name: cleanName, remotes: [{ url: urlCheck.normalized }] });
 
         const now = Date.now();
         const existing = await deps.vaultStore.getServer(userId, slug);
@@ -2036,6 +2072,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           encryptedCredentials,
           authSummary: buildMaskedAuthSummary(secretPayload),
           domains,
+          autoRouteScrape,
           cachedTools,
           toolCount: cachedTools.length,
           enabled: body.enabled !== false,
@@ -2084,7 +2121,19 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
     }
 
-    if (path === '/admin/api/users/role') {
+    const resolvePinnedFounderUserId = async (): Promise<string | null> => {
+      const envOwnerId = (ghEnv.GITHUB_OWNER_ID ?? '').trim();
+      if (/^[1-9][0-9]{0,19}$/.test(envOwnerId)) {
+        return `gh_${envOwnerId}`;
+      }
+      const pinnedId = ((await deps.getHubSetting?.(PINNED_OWNER_GITHUB_ID_SETTING_KEY)) ?? '').trim();
+      if (/^[1-9][0-9]{0,19}$/.test(pinnedId)) {
+        return `gh_${pinnedId}`;
+      }
+      return null;
+    };
+
+    if (path === '/admin/api/users/role' && request.method === 'POST') {
       return withAdminAuditSpan('user_role', async (span) => {
         const capped = await readBodyTextCapped(request, 16_384);
         if (!capped.ok) {
@@ -2106,7 +2155,25 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           span.setStatus(false, 'invalid_params');
           return adminJson({ error: 'invalid_params' }, 400);
         }
+        if (targetUserId === session.userId) {
+          span.setAttributes({ 'admin.outcome': 'self_modification_forbidden', 'http.response.status_code': 400 });
+          span.setStatus(false, 'self_modification_forbidden');
+          return adminJson({ ok: false, error: 'self_modification_forbidden', message: 'Cannot modify your own role' }, 400);
+        }
+        const pinnedFounderUserId = await resolvePinnedFounderUserId();
+        if (targetUserId === 'owner' || (targetRole !== 'owner' && pinnedFounderUserId && targetUserId === pinnedFounderUserId)) {
+          span.setAttributes({ 'admin.outcome': 'founder_protected', 'http.response.status_code': 403 });
+          span.setStatus(false, 'founder_protected');
+          return adminJson({ ok: false, error: 'founder_protected', message: 'Pinned founder/owner cannot be demoted' }, 403);
+        }
         const updated = (await deps.oauthStore.updateUserRole?.(targetUserId, targetRole)) ?? false;
+        if (updated && deps.metaDb) {
+          await deps.metaDb
+            .prepare('UPDATE users SET role = ?1, session_epoch = COALESCE(session_epoch, 1) + 1 WHERE user_id = ?2')
+            .bind(targetRole, targetUserId)
+            .run()
+            .catch(() => undefined);
+        }
         span.setAttributes({
           'admin.target_user_id': targetUserId,
           'admin.target_role': targetRole,
@@ -2114,6 +2181,83 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           'http.response.status_code': updated ? 200 : 404,
         });
         return adminJson({ ok: updated, userId: targetUserId, role: targetRole }, updated ? 200 : 404);
+      });
+    }
+
+    if (
+      (path === '/admin/api/users/delete' && request.method === 'POST') ||
+      (path === '/admin/api/users' && request.method === 'DELETE')
+    ) {
+      return withAdminAuditSpan('user_delete', async (span) => {
+        const capped = await readBodyTextCapped(request, 16_384);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
+        }
+        let body: { userId?: string } = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as typeof body;
+        } catch {
+          body = {};
+        }
+        const targetUserId = (
+          typeof body.userId === 'string' && body.userId.trim()
+            ? body.userId.trim()
+            : (url.searchParams.get('userId') ?? '').trim()
+        );
+        if (!targetUserId) {
+          span.setAttributes({ 'admin.outcome': 'invalid_params', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_params');
+          return adminJson({ ok: false, error: 'invalid_params' }, 400);
+        }
+        if (targetUserId === session.userId) {
+          span.setAttributes({ 'admin.outcome': 'self_modification_forbidden', 'http.response.status_code': 400 });
+          span.setStatus(false, 'self_modification_forbidden');
+          return adminJson({ ok: false, error: 'self_modification_forbidden', message: 'Cannot delete your own account' }, 400);
+        }
+        const pinnedFounderUserId = await resolvePinnedFounderUserId();
+        if (targetUserId === 'owner' || (pinnedFounderUserId && targetUserId === pinnedFounderUserId)) {
+          span.setAttributes({ 'admin.outcome': 'founder_protected', 'http.response.status_code': 403 });
+          span.setStatus(false, 'founder_protected');
+          return adminJson({ ok: false, error: 'founder_protected', message: 'Pinned founder/owner cannot be deleted' }, 403);
+        }
+        const existingUser = (await deps.oauthStore.getUser?.(targetUserId)) ?? null;
+        if (!existingUser) {
+          span.setAttributes({ 'admin.target_user_id': targetUserId, 'admin.outcome': 'not_found', 'http.response.status_code': 404 });
+          return adminJson({ ok: false, error: 'user_not_found' }, 404);
+        }
+        const nextEpoch = (existingUser.sessionEpoch ?? 1) + 1;
+        await deps.oauthStore.upsertUser?.({
+          ...existingUser,
+          role: 'member',
+          disabled: true,
+          sessionEpoch: nextEpoch,
+        });
+        const userGrants = await Promise.resolve(deps.oauthStore.listGrants(Date.now(), targetUserId)).catch(() => []);
+        for (const g of userGrants) {
+          await Promise.resolve(deps.revokeGrant(g.grantId, targetUserId)).catch(() => false);
+        }
+        if (deps.vaultStore) {
+          const userServers = await Promise.resolve(deps.vaultStore.listServers(targetUserId)).catch(() => []);
+          for (const s of userServers) {
+            await Promise.resolve(deps.vaultStore.deleteServer(targetUserId, s.slug)).catch(() => false);
+          }
+        }
+        if (deps.metaDb) {
+          await deps.metaDb
+            .prepare('UPDATE users SET role = ?1, disabled = 1, session_epoch = ?2 WHERE user_id = ?3')
+            .bind('member', nextEpoch, targetUserId)
+            .run()
+            .catch(() => undefined);
+        }
+        span.setAttributes({
+          'admin.target_user_id': targetUserId,
+          'admin.outcome': 'deleted',
+          'http.response.status_code': 200,
+        });
+        return adminJson({ ok: true, deleted: true, userId: targetUserId }, 200);
       });
     }
 

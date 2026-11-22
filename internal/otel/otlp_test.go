@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 func TestTraceparentParseFormatAndExtract(t *testing.T) {
@@ -425,7 +427,7 @@ func TestExporterEnvVariantsTickerBatchDrainAndErrors(t *testing.T) {
 		}
 		return ""
 	}, "", "", nil, safeWriter, 5*time.Millisecond)
-	if stdExp == nil || stdExp.serviceName != "edgefetch-go" || stdExp.serviceVersion != "2.7.0" {
+	if stdExp == nil || stdExp.serviceName != "edgefetch-go" || stdExp.serviceVersion != "2.7.1" {
 		t.Fatalf("unexpected default service/version on stdout exporter: %+v", stdExp)
 	}
 
@@ -571,4 +573,48 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) {
 	return f(p)
+}
+
+func TestR7OtelAndPolitenessRedactionParity(t *testing.T) {
+	urlInputs := []string{
+		"",
+		"   ",
+		"https://user:SECRET_PASS@api.example.com/v1/items?api_key=SECRET_Q#SECRET_FRAG",
+		"ws://user:SECRET_WS@hub.example.com:8443/agent/ws?token=SECRET_TOK#SECRET_F",
+		"wss://admin:SECRET_WSS@hub.example.com/ws;jsessionid=SECRET_MAT/sub",
+		"https://user:p/a/s/s@api.example.com/v1/data?sig=SECRET_SIG",
+		"user:SECRET_SCHEMELESS@api.example.com/path?tok=SECRET_Q",
+		"https://auth.example.com/reset/SECRET_RESET_TOKEN_999",
+	}
+	for _, raw := range urlInputs {
+		gotOtel := SanitizeURL(raw)
+		gotPol := politeness.SanitizeURL(raw)
+		if gotOtel != gotPol {
+			t.Fatalf("SanitizeURL parity mismatch for %q: otel=%q politeness=%q", raw, gotOtel, gotPol)
+		}
+		if strings.Contains(gotOtel, "SECRET_") {
+			t.Fatalf("SECURITY: SanitizeURL(%q) leaked secret: %q", raw, gotOtel)
+		}
+	}
+
+	embeddedInputs := []string{
+		`dial wss://agent:SECRET-1@hub.example.com/ws?token=SECRET-2#SECRET-3 failed`,
+		`ws://u:SECRET-4@127.0.0.1:9000/cdp?key=SECRET-5`,
+		`json error {"url":"https:\/\/u:SECRET-6@api.example.com\/v1?api_key=SECRET-7#SECRET-8"}`,
+		`encoded https%3A%2F%2Fu%3ASECRET-9%40api.example.com%2Fp%3Ftoken%3DSECRET-10`,
+		`schemeless dial user:SECRET-11@internal.example.com:5432/db?password=SECRET-12`,
+		`slash-in-pass https://admin:SEC/RET-13@api.example.com/v1/ok`,
+		`matrix https://api.example.com/items;sid=SECRET-14/list and Authorization: Bearer SECRET-15 and Basic SECRET-16`,
+		`ftp://u:SECRET-17@files.example.com/pub?k=SECRET-18 mailto:ops@example.com?token=SECRET-19#SECRET-22 //u:SECRET-20@cdn.example.com/x?q=SECRET-21`,
+	}
+	for i, raw := range embeddedInputs {
+		gotOtel := RedactEmbeddedURLs(raw)
+		gotPol := politeness.RedactEmbeddedURLs(raw)
+		if gotOtel != gotPol {
+			t.Fatalf("RedactEmbeddedURLs parity mismatch #%d:\n  otel=%q\n  pol =%q", i+1, gotOtel, gotPol)
+		}
+		if strings.Contains(gotOtel, "SECRET-") {
+			t.Fatalf("SECURITY: OTel RedactEmbeddedURLs #%d leaked secret:\n  in =%s\n  out=%s", i+1, raw, gotOtel)
+		}
+	}
 }

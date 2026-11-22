@@ -541,7 +541,7 @@ func TestShouldAllowPrivateOriginAndAgentCrawlPolicy(t *testing.T) {
 		t.Fatalf("expected 4 redirect results, got %d", len(rep.Results))
 	}
 	for _, res := range rep.Results {
-		if res.Outcome != classify.OutcomeError {
+		if res.Outcome != classify.OutcomeBlockedSSRF && res.Outcome != classify.OutcomeError {
 			t.Fatalf("SECURITY: expected redirect to unspecified/leading-zero Hub IP to fail, got %+v", res)
 		}
 	}

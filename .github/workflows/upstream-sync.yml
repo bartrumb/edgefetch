@@ -57,14 +57,52 @@ jobs:
             "https://github.com/bartrumb/edgefetch/releases/download/${latest_tag}/checksums.txt"
           curl -fsSL -o "$tmp_dir/checksums.txt.sig" \
             "https://github.com/bartrumb/edgefetch/releases/download/${latest_tag}/checksums.txt.sig"
+          curl -fsSL -o "$tmp_dir/release-manifest.json" \
+            "https://github.com/bartrumb/edgefetch/releases/download/${latest_tag}/release-manifest.json"
+          curl -fsSL -o "$tmp_dir/release-manifest.json.sig" \
+            "https://github.com/bartrumb/edgefetch/releases/download/${latest_tag}/release-manifest.json.sig"
 
           openssl pkeyutl -verify \
             -pubin -inkey keys/release-signing-pub.pem \
             -rawin -in "$tmp_dir/checksums.txt" \
             -sigfile "$tmp_dir/checksums.txt.sig"
+          openssl pkeyutl -verify \
+            -pubin -inkey keys/release-signing-pub.pem \
+            -rawin -in "$tmp_dir/release-manifest.json" \
+            -sigfile "$tmp_dir/release-manifest.json.sig"
+
+          expected_archive="edgefetch_${latest_tag#v}_linux_amd64.tar.gz"
+          if ! awk -v want="$expected_archive" '$1 ~ /^[0-9a-fA-F]{64}$/ && ($2 == want || $2 == "*" want) { found=1 } END { exit !found }' "$tmp_dir/checksums.txt"; then
+            echo "::error::Verified checksums.txt does not contain SHA-256 entry for ${expected_archive}."
+            exit 1
+          fi
 
           git fetch --no-tags https://github.com/bartrumb/edgefetch.git "refs/tags/${latest_tag}:refs/tags/${latest_tag}"
           target_commit=$(git rev-parse "${latest_tag}^{commit}")
+          actual_checksums_sha256=$(sha256sum "$tmp_dir/checksums.txt" | awk '{print $1}')
+
+          node -e '
+            const fs = require("node:fs");
+            const [manifestPath, latestTag, targetCommit, actualChecksumsSha] = process.argv.slice(1);
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+            if (!manifest || typeof manifest !== "object") {
+              console.error("::error::Invalid release-manifest.json object.");
+              process.exit(1);
+            }
+            if (manifest.tag !== latestTag) {
+              console.error(`::error::Manifest tag mismatch (${manifest.tag} !== ${latestTag}).`);
+              process.exit(1);
+            }
+            if (typeof manifest.commit !== "string" || !/^[0-9a-f]{40}$/.test(manifest.commit) || manifest.commit !== targetCommit) {
+              console.error(`::error::Manifest commit mismatch (${manifest.commit} !== ${targetCommit}).`);
+              process.exit(1);
+            }
+            if (typeof manifest.checksumsSha256 !== "string" || manifest.checksumsSha256.toLowerCase() !== actualChecksumsSha.toLowerCase()) {
+              console.error(`::error::Manifest checksumsSha256 mismatch (${manifest.checksumsSha256} !== ${actualChecksumsSha}).`);
+              process.exit(1);
+            }
+          ' "$tmp_dir/release-manifest.json" "$latest_tag" "$target_commit" "$actual_checksums_sha256"
+
           head_commit=$(git rev-parse HEAD)
 
           if [ "$head_commit" = "$target_commit" ] || git merge-base --is-ancestor "$target_commit" HEAD; then

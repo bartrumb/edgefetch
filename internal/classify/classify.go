@@ -32,7 +32,10 @@ const (
 	OutcomeStop            Outcome = "stop"             // Origin answered 403, 429, or 503 — halt remaining URLs for this host
 	OutcomeRateLimited     Outcome = "rate_limited"     // Explicit rate-limit outcome — halts remaining URLs for this host
 	OutcomePaymentRequired Outcome = "payment_required" // Origin answered HTTP 402 (e.g. x402 / Monetization Gateway) — halt host, never auto-pay
-	OutcomeGone            Outcome = "gone"             // Document answered 404 or 410
+	OutcomeNotFound        Outcome = "not_found"        // Document answered HTTP 404
+	OutcomeGone            Outcome = "gone"             // Document answered HTTP 410
+	OutcomeDNSNotFound     Outcome = "dns_not_found"    // Domain does not exist in DNS (NXDOMAIN) — never retried
+	OutcomeBlockedSSRF     Outcome = "blocked_ssrf"     // Target or redirect blocked by SSRF policy — never retried
 	OutcomeSkip            Outcome = "skip"             // Non-200 or non-HTML/Markdown page that can be skipped without failing the host
 	OutcomeError           Outcome = "error"            // Feed/transport failure
 	OutcomeNotTried        Outcome = "not_tried"        // Left unsent because an earlier request stopped the host or timed out
@@ -72,7 +75,9 @@ func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, 
 		switch status {
 		case 403, 429, 503:
 			return OutcomeStop, fmt.Sprintf("HTTP %d", status)
-		case 404, 410:
+		case 404:
+			return OutcomeNotFound, ""
+		case 410:
 			return OutcomeGone, ""
 		}
 		ctLower := strings.ToLower(header.Get("content-type"))
@@ -97,7 +102,9 @@ func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, 
 		switch status {
 		case 403, 429, 503:
 			return OutcomeStop, fmt.Sprintf("HTTP %d", status)
-		case 404, 410:
+		case 404:
+			return OutcomeNotFound, fmt.Sprintf("HTTP %d", status)
+		case 410:
 			return OutcomeGone, fmt.Sprintf("HTTP %d", status)
 		}
 		if !ok {
@@ -109,7 +116,9 @@ func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, 
 		switch status {
 		case 403, 429, 503:
 			return OutcomeStop, fmt.Sprintf("HTTP %d", status)
-		case 404, 410:
+		case 404:
+			return OutcomeNotFound, fmt.Sprintf("HTTP %d", status)
+		case 410:
 			return OutcomeGone, fmt.Sprintf("HTTP %d", status)
 		}
 		if !ok {
@@ -129,7 +138,9 @@ func Classify(kind Kind, status int, header http.Header, body []byte) (Outcome, 
 		switch status {
 		case 403, 429, 503:
 			return OutcomeStop, fmt.Sprintf("HTTP %d", status)
-		case 404, 410:
+		case 404:
+			return OutcomeNotFound, fmt.Sprintf("HTTP %d", status)
+		case 410:
 			return OutcomeGone, fmt.Sprintf("HTTP %d", status)
 		}
 		if !ok {

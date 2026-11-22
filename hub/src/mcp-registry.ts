@@ -127,12 +127,43 @@ export function isSafePublicHttpsUrl(
   if (baseCheck.url.hash) {
     return { ok: false, reason: 'URL fragments (#) are not permitted on MCP endpoints' };
   }
+  if (baseCheck.url.hostname.endsWith('.')) {
+    return { ok: false, reason: 'Trailing-dot FQDN hostnames are not permitted on MCP endpoints' };
+  }
   return {
     ok: true,
     url: baseCheck.url,
     normalized: baseCheck.normalized,
     origin: baseCheck.url.origin.toLowerCase(),
   };
+}
+
+export function isJsonDepthWithinLimit(rawJson: string, maxDepth = 32): boolean {
+  let depth = 0;
+  let inStr = false;
+  let escaped = false;
+  for (let i = 0; i < rawJson.length; i++) {
+    const ch = rawJson.charCodeAt(i);
+    if (inStr) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === 92 /* '\\' */) {
+        escaped = true;
+      } else if (ch === 34 /* '"' */) {
+        inStr = false;
+      }
+      continue;
+    }
+    if (ch === 34 /* '"' */) {
+      inStr = true;
+    } else if (ch === 91 /* '[' */ || ch === 123 /* '{' */) {
+      depth++;
+      if (depth > maxDepth) return false;
+    } else if (ch === 93 /* ']' */ || ch === 125 /* '}' */) {
+      if (depth > 0) depth--;
+    }
+  }
+  return true;
 }
 
 function sanitizeManifestString(raw: unknown, maxLen = 600): string {
@@ -161,116 +192,151 @@ export function slugifyMcpServerName(rawName: string): string {
 }
 
 const GENERIC_HOSTING_DOMAINS = new Set([
-  'github.com',
-  'www.github.com',
   'raw.githubusercontent.com',
-  'gitlab.com',
-  'npmjs.com',
-  'www.npmjs.com',
-  'pypi.org',
-  'crates.io',
-  'docker.com',
-  'hub.docker.com',
-  'glama.ai',
-  'www.glama.ai',
-  'modelcontextprotocol.io',
-  'registry.modelcontextprotocol.io',
-  'smithery.ai',
-  'mcp.so',
+  'githubusercontent.com',
+  'github.io',
+  'gitlab.io',
+  'workers.dev',
+  'pages.dev',
+  'vercel.app',
+  'netlify.app',
+  'fly.dev',
+  'onrender.com',
+  'railway.app',
+  'herokuapp.com',
+  'googleapis.com',
+  'amazonaws.com',
+  'cloudfront.net',
+  'azurewebsites.net',
+  'ngrok-free.app',
+  'trycloudflare.com',
 ]);
 
-const WELL_KNOWN_SERVICE_DOMAINS: ReadonlyArray<{ pattern: RegExp; domains: readonly string[] }> = [
-  { pattern: /(?:^|[-/.])github(?:[-/.]|$)/i, domains: ['github.com', 'api.github.com'] },
-  { pattern: /(?:^|[-/.])gitlab(?:[-/.]|$)/i, domains: ['gitlab.com'] },
-  { pattern: /(?:^|[-/.])linear(?:[-/.]|$)/i, domains: ['linear.app'] },
-  { pattern: /(?:^|[-/.])notion(?:[-/.]|$)/i, domains: ['notion.so', 'notion.com', 'notion.site'] },
-  { pattern: /(?:^|[-/.])sentry(?:[-/.]|$)/i, domains: ['sentry.io'] },
-  { pattern: /(?:^|[-/.])cloudflare(?:[-/.]|$)/i, domains: ['cloudflare.com', 'dash.cloudflare.com'] },
-  { pattern: /(?:^|[-/.])stripe(?:[-/.]|$)/i, domains: ['stripe.com'] },
-  { pattern: /(?:^|[-/.])(?:atlassian|jira|confluence)(?:[-/.]|$)/i, domains: ['atlassian.net', 'atlassian.com'] },
-  { pattern: /(?:^|[-/.])slack(?:[-/.]|$)/i, domains: ['slack.com'] },
-  { pattern: /(?:^|[-/.])figma(?:[-/.]|$)/i, domains: ['figma.com'] },
-  { pattern: /(?:^|[-/.])asana(?:[-/.]|$)/i, domains: ['asana.com'] },
-  { pattern: /(?:^|[-/.])supabase(?:[-/.]|$)/i, domains: ['supabase.com'] },
-  { pattern: /(?:^|[-/.])vercel(?:[-/.]|$)/i, domains: ['vercel.com'] },
-  { pattern: /(?:^|[-/.])intercom(?:[-/.]|$)/i, domains: ['intercom.com'] },
-  { pattern: /(?:^|[-/.])hubspot(?:[-/.]|$)/i, domains: ['hubspot.com'] },
-  { pattern: /(?:^|[-/.])datadog(?:[-/.]|$)/i, domains: ['datadoghq.com'] },
-  { pattern: /(?:^|[-/.])pagerduty(?:[-/.]|$)/i, domains: ['pagerduty.com'] },
-];
+const MULTI_PART_PUBLIC_SUFFIXES = new Set([
+  'co.uk',
+  'org.uk',
+  'gov.uk',
+  'ac.uk',
+  'me.uk',
+  'com.au',
+  'net.au',
+  'org.au',
+  'edu.au',
+  'gov.au',
+  'co.nz',
+  'org.nz',
+  'co.jp',
+  'ne.jp',
+  'or.jp',
+  'com.br',
+  'org.br',
+  'co.in',
+  'org.in',
+  'com.sg',
+  'com.hk',
+  'co.kr',
+  'co.za',
+  'com.mx',
+  'com.cn',
+]);
 
-function normalizeDomainCandidate(hostname: string): string[] {
-  const h = hostname.trim().toLowerCase().replace(/^www\./, '').replace(/\.+$/, '');
-  if (!h || !h.includes('.')) return [];
-  const out = [h];
-  const strippedPrefix = h.replace(/^(?:mcp|api|sse|connect)\./, '');
-  if (strippedPrefix !== h && strippedPrefix.includes('.')) {
-    out.unshift(strippedPrefix);
+const STRICT_CONNECTOR_DOMAIN_RE =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+export function extractRegistrableDomain(hostname: string): string | null {
+  const clean = hostname.trim().toLowerCase().replace(/\.+$/, '');
+  if (!clean || !STRICT_CONNECTOR_DOMAIN_RE.test(clean)) return null;
+  if (/^\d+(?:\.\d+){3}$/.test(clean)) return null;
+  const labels = clean.split('.');
+  if (labels.length < 2) return null;
+  const lastTwo = `${labels[labels.length - 2]}.${labels[labels.length - 1]}`;
+  if (MULTI_PART_PUBLIC_SUFFIXES.has(lastTwo)) {
+    if (labels.length < 3) return null;
+    return `${labels[labels.length - 3]}.${lastTwo}`;
   }
-  return out;
+  if (GENERIC_HOSTING_DOMAINS.has(lastTwo) && labels.length >= 3) {
+    return `${labels[labels.length - 3]}.${lastTwo}`;
+  }
+  return lastTwo;
 }
 
 /**
- * Infers associated target web domains (`domains[]`) from a server's `name`, `websiteUrl`, and `remotes[].url`.
+ * Validates operator/user-supplied `domains` on a vault MCP connector:
+ *  - Rejects wildcards (`*.example.com`), bare public suffixes (`co.uk`, `github.io`), IPs, and reserved/internal TLDs.
+ *  - Rejects unrelated third-party domains unless `allowUnrelatedDomains === true` (`autoRouteScrape` / `routeScrapeDomains` explicitly enabled).
  */
-export function inferAssociatedDomains(params: {
+export function validateConnectorDomains(
+  rawDomains: unknown,
+  remoteOrigin: string,
+  allowUnrelatedDomains = false,
+): { ok: true; domains: string[] } | { ok: false; error: string } {
+  if (rawDomains === undefined || rawDomains === null) {
+    return { ok: true, domains: [] };
+  }
+  if (!Array.isArray(rawDomains)) {
+    return { ok: false, error: 'domains must be an array of domain strings' };
+  }
+  let remoteHost = '';
+  try {
+    remoteHost = new URL(remoteOrigin).hostname.toLowerCase();
+  } catch {
+    return { ok: false, error: 'Invalid remoteOrigin for domain validation' };
+  }
+  const remoteBase = extractRegistrableDomain(remoteHost);
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of rawDomains.slice(0, 16)) {
+    if (typeof raw !== 'string') {
+      return { ok: false, error: 'Each domain entry must be a string' };
+    }
+    const trimmed = raw.trim().toLowerCase().replace(/^www\./, '');
+    if (!trimmed) continue;
+    if (trimmed.includes('*') || trimmed.includes('/') || trimmed.includes(':') || trimmed.endsWith('.')) {
+      return { ok: false, error: `Wildcard or malformed domain "${raw}" is not permitted` };
+    }
+    if (trimmed.length > 128 || !STRICT_CONNECTOR_DOMAIN_RE.test(trimmed)) {
+      return { ok: false, error: `Invalid domain syntax "${raw}"` };
+    }
+    if (/\.(?:local|localhost|internal|intranet|corp|home|lan|arpa|onion)$/i.test(trimmed)) {
+      return { ok: false, error: `Internal or reserved domain "${trimmed}" is not permitted` };
+    }
+    if (MULTI_PART_PUBLIC_SUFFIXES.has(trimmed) || GENERIC_HOSTING_DOMAINS.has(trimmed)) {
+      return { ok: false, error: `Shared hosting or public suffix "${trimmed}" cannot be claimed as a connector domain` };
+    }
+    const candBase = extractRegistrableDomain(trimmed);
+    if (!candBase) {
+      return { ok: false, error: `Unregistrable domain "${trimmed}"` };
+    }
+    if (!allowUnrelatedDomains) {
+      const sameHostOrSub = trimmed === remoteHost || remoteHost.endsWith(`.${trimmed}`) || trimmed.endsWith(`.${remoteHost}`);
+      const sameRegistrable = Boolean(remoteBase && candBase === remoteBase);
+      if (!sameHostOrSub && !sameRegistrable) {
+        return {
+          ok: false,
+          error: `Domain "${trimmed}" does not match connector origin "${remoteHost}". Enable routeScrapeDomains / autoRouteScrape explicitly to claim external domains.`,
+        };
+      }
+    }
+    if (!seen.has(trimmed)) {
+      seen.add(trimmed);
+      out.push(trimmed);
+    }
+  }
+  return { ok: true, domains: out };
+}
+
+/**
+ * Security Invariant (H1): Never infer third-party domains (`github.com`, `notion.so`, `linear.app`, etc.) from
+ * untrusted server names, descriptions, reverse-DNS namespaces, or `websiteUrl`. Always defaults strictly to `[]`.
+ */
+export function inferAssociatedDomains(_params: {
   name: string;
   title?: string;
   websiteUrl?: string;
   remotes?: ReadonlyArray<{ url: string }>;
 }): string[] {
-  const seen = new Set<string>();
-  const add = (d: string) => {
-    const clean = d.trim().toLowerCase().replace(/^\*\./, '').replace(/^www\./, '').replace(/\.+$/, '');
-    if (clean && clean.includes('.') && clean.length <= 128 && /^[a-z0-9.-]+$/.test(clean)) {
-      seen.add(clean);
-    }
-  };
-
-  for (const rem of params.remotes ?? []) {
-    try {
-      const u = new URL(rem.url);
-      for (const cand of normalizeDomainCandidate(u.hostname)) {
-        if (!GENERIC_HOSTING_DOMAINS.has(cand)) add(cand);
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  if (params.websiteUrl) {
-    try {
-      const w = new URL(params.websiteUrl);
-      const wh = w.hostname.toLowerCase().replace(/^www\./, '');
-      if (!GENERIC_HOSTING_DOMAINS.has(wh)) {
-        for (const cand of normalizeDomainCandidate(wh)) add(cand);
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  // Reverse-DNS namespace prefix (`com.stripe/mcp` -> `stripe.com`, `app.linear/linear` -> `linear.app`)
-  const slashIdx = params.name.indexOf('/');
-  if (slashIdx > 0) {
-    const ns = params.name.slice(0, slashIdx).toLowerCase();
-    const parts = ns.split('.').filter(Boolean);
-    if (parts.length >= 2 && !(parts[0] === 'io' && (parts[1] === 'github' || parts[1] === 'modelcontextprotocol'))) {
-      const reversed = [...parts].reverse().join('.');
-      if (!GENERIC_HOSTING_DOMAINS.has(reversed)) {
-        for (const cand of normalizeDomainCandidate(reversed)) add(cand);
-      }
-    }
-  }
-
-  const combinedIdentity = `${params.name} ${params.title ?? ''}`;
-  for (const wk of WELL_KNOWN_SERVICE_DOMAINS) {
-    if (wk.pattern.test(combinedIdentity)) {
-      for (const d of wk.domains) add(d);
-    }
-  }
-
-  return [...seen].slice(0, 12);
+  return [];
 }
 
 async function readJsonBounded(resp: Response, maxBytes: number): Promise<unknown> {
@@ -309,18 +375,53 @@ async function readJsonBounded(resp: Response, maxBytes: number): Promise<unknow
     off += c.byteLength;
   }
   const text = new TextDecoder('utf-8', { fatal: false }).decode(merged);
-  return text.trim() ? JSON.parse(text) : null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (!isJsonDepthWithinLimit(trimmed, 32)) {
+    throw new Error('Registry JSON nesting depth exceeded limit');
+  }
+  return JSON.parse(trimmed);
 }
+
+const FORBIDDEN_MANIFEST_HEADER_NAMES = new Set([
+  'cookie',
+  'set-cookie',
+  'host',
+  ':authority',
+  ':method',
+  ':path',
+  ':scheme',
+  'origin',
+  'referer',
+  'forwarded',
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-real-ip',
+  'cf-connecting-ip',
+  'true-client-ip',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'keep-alive',
+  'upgrade',
+  'te',
+  'proxy-authorization',
+  'mcp-session-id',
+]);
 
 function parseHeadersArray(rawHeaders: unknown): McpRemoteHeaderSpec[] {
   if (!Array.isArray(rawHeaders)) return [];
   const out: McpRemoteHeaderSpec[] = [];
+  const seenNames = new Set<string>();
   for (const item of rawHeaders.slice(0, 20)) {
     if (!item || typeof item !== 'object') continue;
     const h = item as Record<string, unknown>;
     const rawName = typeof h.name === 'string' ? h.name.trim() : '';
     if (!rawName || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,80}$/.test(rawName)) continue;
     const lower = rawName.toLowerCase();
+    if (FORBIDDEN_MANIFEST_HEADER_NAMES.has(lower) || seenNames.has(lower)) continue;
+    seenNames.add(lower);
     const inferredSecret =
       Boolean(h.isSecret ?? h.secret) ||
       lower === 'authorization' ||
@@ -442,7 +543,7 @@ export function parseOfficialRegistryPayload(payload: unknown, selfHost?: string
       : [];
 
   const entries: NormalizedMcpRegistryEntry[] = [];
-  for (const rawItem of list) {
+  for (const rawItem of list.slice(0, 250)) {
     if (!rawItem || typeof rawItem !== 'object') continue;
     const wrapper = rawItem as Record<string, unknown>;
     const srv =
@@ -470,16 +571,8 @@ export function parseOfficialRegistryPayload(payload: unknown, selfHost?: string
 
     const remotes = parseRemotesArray(srv.remotes, selfHost);
     const packages = parsePackagesArray(srv.packages);
-    const explicitDomains = Array.isArray(srv.domains)
-      ? srv.domains.filter((d): d is string => typeof d === 'string').map((d) => d.trim().toLowerCase())
-      : [];
-    const inferredDomains = inferAssociatedDomains({
-      name,
-      title,
-      ...(websiteUrl ? { websiteUrl } : {}),
-      remotes,
-    });
-    const domains = [...new Set([...explicitDomains, ...inferredDomains])].filter((d) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d));
+    // H1: Never trust third-party domain claims (`srv.domains`) or heuristic domain inference on untrusted registry manifests!
+    const domains: string[] = [];
 
     entries.push({
       id: name,
@@ -508,7 +601,7 @@ export function parseGlamaRegistryPayload(payload: unknown, selfHost?: string): 
       : [];
 
   const entries: NormalizedMcpRegistryEntry[] = [];
-  for (const rawItem of list) {
+  for (const rawItem of list.slice(0, 250)) {
     if (!rawItem || typeof rawItem !== 'object') continue;
     const srv = rawItem as Record<string, unknown>;
     const namespace = sanitizeManifestString(srv.namespace, 80);
@@ -720,7 +813,8 @@ export async function discoverMcps(params: {
       ? Math.max(1, Math.min(50, Math.floor(params.limit)))
       : 20;
   const now = params.now ?? Date.now();
-  const cacheKey = `${q.toLowerCase()}|${remoteOnly ? '1' : '0'}|${limit}`;
+  const selfHostKey = (params.selfHost ?? '').trim().toLowerCase();
+  const cacheKey = `${selfHostKey}|${q.toLowerCase()}|${remoteOnly ? '1' : '0'}|${limit}`;
 
   if (!params.bypassCache) {
     const hit = registryCache.get(cacheKey);

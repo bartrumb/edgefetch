@@ -16,6 +16,9 @@ services:
         value: "/data"
       - key: EDGEFETCH_TRUST_PROXY
         value: "1"
+      # Set EDGEFETCH_PUBLIC_ORIGIN to your public Render URL or custom domain (falls back to RENDER_EXTERNAL_URL in all-in-one-entrypoint.sh).
+      - key: EDGEFETCH_PUBLIC_ORIGIN
+        value: "https://edgefetch-hub.onrender.com"
       - key: CALLER_TOKEN
         generateValue: true
       - key: AGENT_TOKEN

@@ -17,6 +17,7 @@ import {
   detectWorkdayRedirectStub,
   extractJobPostingJsonLd,
   formatJobPostingHeaderMarkdown,
+  hasExecutableScriptTag,
   isJobLegalBoilerplateChunk,
   isThinScriptedPage,
   resolveAtsPreFetchSpec,
@@ -24,7 +25,14 @@ import {
   type RedirectAnalysis,
   type StructuredJobPosting,
 } from './jobs';
-import { validatePublicHttpsTargetUrl } from './overflow';
+import {
+  DNS_NOT_FOUND_MESSAGE,
+  isDnsNotFoundError,
+  isSsrfBlockedError,
+  scrubResolverIpFromError,
+  SSRF_BLOCKED_INFO,
+  validatePublicHttpsTargetUrl,
+} from './overflow';
 import {
   getActiveRequestTracer,
   sanitizeUrlForSpan,
@@ -140,7 +148,7 @@ export interface SearchChunkHit {
   url: string;
   title: string;
   heading: string;
-  snippet: string;
+  snippet?: string;
   text: string;
   score: number;
   fetchedAt: number;
@@ -182,6 +190,29 @@ export interface SearchIndex {
  * Strips YAML frontmatter (`---\n...\n---`) from origin-served `text/markdown` documents (e.g. Cloudflare "Markdown for
  * Agents") so extracted chunks don't waste tokens on metadata blocks, while preserving `title:` if present.
  */
+export function sanitizeExtractedTitle(rawTitle: string | undefined, finalUrl: string, redactPii: boolean): string | undefined {
+  if (!rawTitle) return undefined;
+  const bounded = rawTitle.length > 1_024 ? rawTitle.slice(0, 1_024) : rawTitle;
+  const decoded = decodeHtmlEntities(bounded);
+  const redacted = redactPii ? redactPiiText(decoded) : decoded;
+  const mdSanitized = sanitizeInlineHtmlInMarkdown(redacted, finalUrl)
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/<(?=[A-Za-z/!?])/g, '&lt;')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const finalTitle = redactPii ? redactPiiText(mdSanitized) : mdSanitized;
+  return finalTitle || undefined;
+}
+
+function sanitizeAndRedactExtractMarkdown(rawMd: string, finalUrl: string, redactPii: boolean): string {
+  const preRedacted = redactPii ? redactPiiText(rawMd) : rawMd;
+  const sanitized = sanitizeInlineHtmlInMarkdown(preRedacted, finalUrl).trim();
+  if (!redactPii) return sanitized;
+  const postRedacted = redactPiiText(sanitized);
+  return postRedacted === sanitized ? sanitized : sanitizeInlineHtmlInMarkdown(postRedacted, finalUrl).trim();
+}
+
 export function stripYamlFrontmatter(md: string): { title?: string; body: string } {
   const normalized = md.replace(/\r\n/g, '\n');
   const m = /^---\n([\s\S]{1,4000}?)\n---(?:\n+|$)/.exec(normalized);
@@ -656,10 +687,37 @@ export function chunkMarkdownForSearch(
   return chunks;
 }
 
-/**
- * Converts SQLite FTS5 `bm25()` rank (lower / more negative = stronger match; ~`-1e-6` on tiny 1-2 row tables)
- * into a strictly monotonic `(0, 1)` local relevance score where higher numbers indicate stronger matches.
- */
+function buildCompactQuerySnippet(text: string, queryTerms: readonly string[], maxLen = 200): string | undefined {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (clean.length <= 280) return undefined;
+  const lower = clean.toLowerCase();
+  let bestIdx = -1;
+  for (const term of queryTerms) {
+    if (!term) continue;
+    const idx = lower.indexOf(term.toLowerCase());
+    if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+      bestIdx = idx;
+    }
+  }
+  if (bestIdx === -1) {
+    return `${clean.slice(0, maxLen - 3).trimEnd()}...`;
+  }
+  const half = Math.floor((maxLen - 6) / 2);
+  let start = Math.max(0, bestIdx - half);
+  if (start > 0) {
+    const sp = clean.indexOf(' ', start);
+    if (sp !== -1 && sp - start < 24) start = sp + 1;
+  }
+  let end = Math.min(clean.length, start + (maxLen - 6));
+  if (end < clean.length) {
+    const sp = clean.lastIndexOf(' ', end);
+    if (sp > start + 40) end = sp;
+  }
+  const prefix = start > 0 ? '...' : '';
+  const suffix = end < clean.length ? '...' : '';
+  const slice = `${prefix}${clean.slice(start, end).trim()}${suffix}`;
+  return slice.length > maxLen ? `${slice.slice(0, maxLen - 3).trimEnd()}...` : slice;
+}
 export function bm25RankToScore(rank: number): number {
   if (!Number.isFinite(rank)) return 0;
   const clamped = Math.max(-50, Math.min(50, rank));
@@ -826,8 +884,17 @@ export class D1FtsSearchIndex implements SearchIndex {
   }): Promise<SearchChunkHit[]> {
     const { collectionId, query, limit = 10 } = params;
     if (!INTERNAL_COLLECTION_ID_RE.test(collectionId)) return [];
-    const safeMatch = sanitizeFtsQuery(query);
+    const rawWords = typeof query === 'string' ? query.match(/[\p{L}\p{N}_]+/gu) ?? [] : [];
+    const hasBooleanSyntaxChars = typeof query === 'string' && /[()"^*:]/.test(query);
+    const cleanedWords = rawWords.filter((w) => {
+      if (/^(?:AND|OR|NOT|NEAR)$/.test(w)) return false;
+      if ((rawWords.length > 1 || hasBooleanSyntaxChars) && /^(?:and|or|not|near)$/i.test(w)) return false;
+      return true;
+    });
+    const safeMatch = cleanedWords.length > 0 ? sanitizeFtsQuery(cleanedWords.join(' ')) : '';
     if (!safeMatch) return [];
+    const queryTerms = [...safeMatch.matchAll(/"([^"]+)"/g)].map((m) => m[1]!.toLowerCase()).filter(Boolean);
+    if (queryTerms.length === 0) return [];
 
     const safeLimit = Math.min(50, Math.max(1, Math.floor(limit)));
     const activeTracer = getActiveRequestTracer(params.tracer);
@@ -866,19 +933,96 @@ export class D1FtsSearchIndex implements SearchIndex {
       }>();
 
     await this.observeMeta(rows.meta);
-    const hits = (rows.results ?? []).map((r) => ({
-      collectionId,
-      pageId: r.page_id,
-      documentId: r.document_id,
-      ordinal: r.ordinal,
-      url: r.url,
-      title: r.title,
-      heading: r.heading,
-      snippet: r.snippet,
-      text: r.text,
-      score: bm25RankToScore(r.rank),
-      fetchedAt: r.fetched_at,
-    }));
+    const rawRows = rows.results ?? [];
+    if (rawRows.length === 0) {
+      span?.setAttribute('edgefetch.fts5.hit_count', 0);
+      span?.setAttribute('search.hit_count', 0);
+      return [];
+    }
+
+    const rowTokens = rawRows.map((r) => {
+      const rRec = r as Record<string, unknown>;
+      const safeTitle = typeof r.title === 'string' ? r.title : '';
+      const safeHeading = typeof r.heading === 'string' ? r.heading : typeof rRec.heading_path === 'string' ? rRec.heading_path : '';
+      const safeText = typeof r.text === 'string' ? r.text : typeof rRec.content === 'string' ? rRec.content : '';
+      const titleToks = safeTitle.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+      const headingToks = safeHeading.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+      const textToks = safeText.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [];
+      const allToks = [...titleToks, ...headingToks, ...textToks];
+      return { safeTitle, safeHeading, safeText, titleToks, headingToks, textToks, allToks };
+    });
+
+    const avgLen = Math.max(
+      1,
+      rowTokens.reduce((sum, rt) => sum + rt.allToks.length, 0) / Math.max(1, rowTokens.length),
+    );
+    const df = new Map<string, number>();
+    for (const qt of queryTerms) {
+      let c = 0;
+      for (const rt of rowTokens) {
+        if (rt.allToks.includes(qt)) c++;
+      }
+      df.set(qt, c);
+    }
+
+    const scoredCandidates: Array<{ hit: SearchChunkHit; rawRank: number }> = [];
+    const k1 = 1.5;
+    const b = 0.75;
+    for (let i = 0; i < rawRows.length; i++) {
+      const r = rawRows[i]!;
+      const rt = rowTokens[i]!;
+      const tfAll = new Map<string, number>();
+      for (const tok of rt.allToks) tfAll.set(tok, (tfAll.get(tok) ?? 0) + 1);
+      const titleSet = new Set(rt.titleToks);
+      const headingSet = new Set(rt.headingToks);
+
+      let matchedTerms = 0;
+      let bm25Local = 0;
+      for (const qt of queryTerms) {
+        const freq = tfAll.get(qt) ?? 0;
+        if (freq === 0) continue;
+        matchedTerms++;
+        const docFreq = df.get(qt) ?? 1;
+        const idf = Math.log(1 + (rawRows.length - docFreq + 0.5) / (docFreq + 0.5) + 0.35);
+        const tfNorm = (freq * (k1 + 1)) / (freq + k1 * (1 - b + (b * rt.allToks.length) / avgLen));
+        const fieldBoost = (titleSet.has(qt) ? 1.55 : 1.0) * (headingSet.has(qt) ? 1.35 : 1.0);
+        bm25Local += idf * tfNorm * fieldBoost;
+      }
+      if (matchedTerms === 0) continue;
+
+      const coverageBoost = (matchedTerms / queryTerms.length) * 0.65;
+      const ftsSignal = Number.isFinite(r.rank) && r.rank < 0 ? Math.min(4, Math.abs(r.rank) * 0.25) : 0;
+      const densityBoost = Math.min(0.45, (matchedTerms / Math.sqrt(Math.max(8, rt.textToks.length))) * 0.5);
+      const rawScore = Math.max(0.12, bm25Local + coverageBoost + ftsSignal + densityBoost);
+      const roundedScore = Number(rawScore.toFixed(2));
+      const compactSnippet = buildCompactQuerySnippet(rt.safeText, queryTerms, 200);
+
+      scoredCandidates.push({
+        rawRank: Number.isFinite(r.rank) ? r.rank : 0,
+        hit: {
+          collectionId,
+          pageId: r.page_id,
+          documentId: r.document_id,
+          ordinal: r.ordinal,
+          url: r.url,
+          title: rt.safeTitle,
+          heading: rt.safeHeading,
+          ...(compactSnippet !== undefined ? { snippet: compactSnippet } : {}),
+          text: rt.safeText,
+          score: roundedScore,
+          fetchedAt: r.fetched_at,
+        },
+      });
+    }
+
+    scoredCandidates.sort((a, b2) =>
+      b2.hit.score !== a.hit.score
+        ? b2.hit.score - a.hit.score
+        : a.rawRank !== b2.rawRank
+          ? a.rawRank - b2.rawRank
+          : a.hit.ordinal - b2.hit.ordinal,
+    );
+    const hits = scoredCandidates.map((c) => c.hit);
     span?.setAttribute('edgefetch.fts5.hit_count', hits.length);
     span?.setAttribute('search.hit_count', hits.length);
     return hits;
@@ -981,6 +1125,8 @@ export interface ExtractRequestPayload {
   jsonFilter?: unknown;
   renderMode?: unknown;
   chunksPerSource?: unknown;
+  includeRawContent?: unknown;
+  include_raw_content?: unknown;
   maxAgeMs?: unknown;
   redactPii?: unknown;
   waybackFallback?: unknown;
@@ -1059,7 +1205,13 @@ export async function executeExtractCall(params: {
   const redactPii = Boolean(payload.redactPii);
   const waybackFallback = Boolean(payload.waybackFallback);
   const spaFallbackMode = normalizeSpaFallbackMode(payload.spaFallback);
-  const visibility = normalizeVisibility(payload.visibility, payload.headers);
+  const visibility = normalizeVisibility(payload.visibility, payload.headers, {
+    cookies: (payload as { cookies?: unknown }).cookies,
+    preferMcp:
+      (payload as { useConnectedMcp?: unknown }).useConnectedMcp === true ||
+      (payload as { preferMcp?: unknown }).preferMcp === true,
+    userId,
+  });
   const isPrivateExtract = visibility === 'private';
   let collectionId: string | undefined;
   if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {
@@ -1102,8 +1254,10 @@ export async function executeExtractCall(params: {
       recordCount?: number;
       totalRecords?: number;
       failedReason?: string;
+      retryable?: boolean;
+      errorMessage?: string;
       waf?: WafClassification;
-      blocked?: BlockedSuggestion;
+      blocked?: BlockedSuggestion | Record<string, unknown>;
     }
   >();
 
@@ -1228,7 +1382,7 @@ export async function executeExtractCall(params: {
           id: `ext-${item.idx + 1}`,
           url: item.url,
           kind: explicitRenderMode === 'always' ? 'render' : 'scrape',
-          ...(explicitRenderMode ? { renderMode: explicitRenderMode } : {}),
+          renderMode: explicitRenderMode === 'always' ? 'always' : 'off',
           formats: ['markdown'],
           onlyMainContent: true,
           discoverLlms: false,
@@ -1327,7 +1481,29 @@ export async function executeExtractCall(params: {
     for (const item of toFetch) {
       let r = resMap.get(`ext-${item.idx + 1}`);
       if (!r || r.outcome !== 'ok') {
-        const prob = typeof r?.problem === 'string' && r.problem ? r.problem : String(r?.outcome ?? 'error');
+        const rawProb = typeof r?.problem === 'string' && r.problem ? r.problem : String(r?.outcome ?? 'error');
+        const prob = scrubResolverIpFromError(rawProb);
+        if (isDnsNotFoundError(r?.outcome, prob) && !waybackFallback) {
+          byUrl.set(item.url, {
+            url: item.url,
+            status: 502,
+            cached: false,
+            failedReason: 'dns_not_found',
+            retryable: false,
+            errorMessage: DNS_NOT_FOUND_MESSAGE,
+          });
+          continue;
+        }
+        if (isSsrfBlockedError(r?.outcome, prob)) {
+          byUrl.set(item.url, {
+            url: item.url,
+            status: typeof r?.status === 'number' ? r.status : 0,
+            cached: false,
+            failedReason: 'blocked',
+            blocked: { ...SSRF_BLOCKED_INFO },
+          });
+          continue;
+        }
         const rawErrBody = typeof r?.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
         const errWaf =
           (r?.waf && typeof r.waf === 'object' ? (r.waf as WafClassification) : null) ??
@@ -1406,7 +1582,14 @@ export async function executeExtractCall(params: {
         }
 
         const effectiveProb = errWaf ? errWaf.summary : prob;
-        const blocked = buildBlockedInfo(item.url, errWaf ? 'challenge' : r?.outcome, effectiveProb, r?.status);
+        const itemPayHeaders =
+          r?.paymentHeaders && typeof r.paymentHeaders === 'object' && !Array.isArray(r.paymentHeaders)
+            ? (r.paymentHeaders as Record<string, string>)
+            : undefined;
+        const blocked = buildBlockedInfo(item.url, errWaf ? 'challenge' : r?.outcome, effectiveProb, r?.status, {
+          ...(itemPayHeaders ? { headers: itemPayHeaders } : {}),
+          ...(rawErrBody ? { rawBody: rawErrBody } : {}),
+        });
         byUrl.set(item.url, {
           url: item.url,
           status: typeof r?.status === 'number' ? r.status : 0,
@@ -1421,7 +1604,11 @@ export async function executeExtractCall(params: {
       let rawBodyStr = typeof r.body === 'string' && r.bodyEncoding !== 'base64' ? r.body : '';
       let finalUrl = typeof r.finalUrl === 'string' && r.finalUrl ? r.finalUrl : item.url;
       let renderedVia: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
-        explicitRenderMode === 'always' ? 'browser' : r.rendered === true ? 'browser-auto' : undefined;
+        explicitRenderMode === 'always'
+          ? 'browser'
+          : r.rendered === true && (!rawBodyStr || hasExecutableScriptTag(rawBodyStr))
+            ? 'browser-auto'
+            : undefined;
 
       // R2 & R3: Guard against HTTP 200 WAF/CAPTCHA interstitials with all 4 anti-false-positive layers!
       const okWaf =
@@ -1755,20 +1942,20 @@ export async function executeExtractCall(params: {
           extracted?.markdown ||
           rawBodyStr;
         const stripped = stripYamlFrontmatter(rawCandidateMd);
-        let cleaned = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(stripped.body), finalUrl);
+        const decodedBody = decodeMarkdownEntities(stripped.body);
+        let cleaned = sanitizeAndRedactExtractMarkdown(decodedBody, finalUrl, redactPii);
         if (isPdf) {
           cleaned = cleanPdfMarkdown(cleaned);
-        }
-        if (redactPii) {
-          cleaned = redactPiiText(cleaned);
+          if (redactPii) cleaned = sanitizeAndRedactExtractMarkdown(cleaned, finalUrl, true);
         }
         md = cleaned.trim();
-        title =
+        const rawCandidateTitle =
           (contentSource === 'ssr-hydration' ? ssrHydrated?.title : undefined) ||
           extracted?.title ||
           stripped.title ||
           (typeof r.title === 'string' && r.title ? decodeHtmlEntities(r.title) : undefined) ||
           (isPdf && md ? extractPdfTitle(md, finalUrl) : undefined);
+        title = sanitizeExtractedTitle(rawCandidateTitle, finalUrl, redactPii);
 
         // P4: Prepend structured JobPosting facts header so pay/workplace/location rank #1 during passage selection!
         if (jobPosting) {
@@ -1780,7 +1967,7 @@ export async function executeExtractCall(params: {
             const assembledJpMd = topH
               ? `${topH[1]}\n\n${safeJpHdr}\n\n${topH[2]}`
               : `# ${safeJpTitle}\n\n${safeJpHdr}\n\n${md}`;
-            md = sanitizeInlineHtmlInMarkdown(assembledJpMd, finalUrl).trim();
+            md = sanitizeAndRedactExtractMarkdown(assembledJpMd, finalUrl, redactPii);
           }
         }
 
@@ -1790,8 +1977,7 @@ export async function executeExtractCall(params: {
         const descWords = desc ? countExtractWords(desc) : 0;
         if (isHtml && !isPdf && mdWords < 50 && desc && descWords >= 18 && descWords > mdWords * 2) {
           const rawRescued = [title ? `# ${title}` : '', desc].filter(Boolean).join('\n\n');
-          const sanitizedRescued = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(rawRescued), finalUrl).trim();
-          md = redactPii ? redactPiiText(sanitizedRescued) : sanitizedRescued;
+          md = sanitizeAndRedactExtractMarkdown(decodeMarkdownEntities(rawRescued), finalUrl, redactPii);
           contentSource = 'meta-description';
         }
       }
@@ -1857,15 +2043,22 @@ export async function executeExtractCall(params: {
     }
   }
 
+  const wantRawContent = payload.includeRawContent === true || payload.include_raw_content === true;
+  const queryTermsForMatch = query
+    ? [...new Set((query.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []).filter((t) => t.length >= 2))].slice(0, 12)
+    : [];
   const results: Array<Record<string, unknown>> = [];
   const failedResults: Array<Record<string, unknown>> = [];
   for (const u of normalizedUrls) {
     const entry = byUrl.get(u);
     if (!entry || entry.failedReason !== undefined) {
+      const entryAny = entry as Record<string, unknown> | undefined;
       failedResults.push({
         url: u,
         status: entry?.status ?? 0,
         error: entry?.failedReason ?? 'not_fetched',
+        ...(typeof entryAny?.retryable === 'boolean' ? { retryable: entryAny.retryable } : {}),
+        ...(typeof entryAny?.errorMessage === 'string' ? { message: entryAny.errorMessage } : {}),
         ...(entry?.waf ? { waf: entry.waf } : {}),
         ...(entry?.blocked ? { blocked: entry.blocked } : {}),
       });
@@ -1902,41 +2095,85 @@ export async function executeExtractCall(params: {
     }
     const effectiveBase = entry.finalUrl || u;
     const allChunks = entry.preChunkedRecords ?? chunkMarkdownForSearch(entry.markdown ?? '');
+    let matchedQueryTerms = 0;
+    if (query) {
+      if (queryTermsForMatch.length > 0) {
+        const combinedToks = new Set(
+          allChunks.flatMap((c) => `${c.heading} ${c.text}`.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []),
+        );
+        for (const qt of queryTermsForMatch) {
+          if (combinedToks.has(qt)) matchedQueryTerms++;
+        }
+      }
+    }
+    const safeFinalTitle = entry.title ? sanitizeExtractedTitle(entry.title, effectiveBase, redactPii) : undefined;
+    if (query && matchedQueryTerms === 0) {
+      const fullCleanRaw = wantRawContent
+        ? sanitizeAndRedactExtractMarkdown(entry.markdown ?? '', effectiveBase, redactPii)
+        : undefined;
+      results.push({
+        url: u,
+        ...(entry.finalUrl && entry.finalUrl !== u ? { finalUrl: entry.finalUrl } : {}),
+        ...(entry.redirectInfo?.redirected ? entry.redirectInfo : {}),
+        status: entry.status,
+        cached: entry.cached,
+        ...(safeFinalTitle ? { title: safeFinalTitle } : {}),
+        ...(entry.contentState ? { contentState: entry.contentState } : {}),
+        ...(entry.contentSource ? { contentSource: entry.contentSource } : {}),
+        ...(entry.waybackSnapshotUrl ? { waybackSnapshotUrl: entry.waybackSnapshotUrl, waybackTimestamp: entry.waybackTimestamp } : {}),
+        ...(entry.renderedVia ? { renderedVia: entry.renderedVia } : {}),
+        ...(entry.jobPosting ? { jobPosting: entry.jobPosting } : {}),
+        ...(entry.recordCount !== undefined ? { recordCount: entry.recordCount, totalRecords: entry.totalRecords } : {}),
+        matchedQueryTerms: 0,
+        noRelevantMatch: true,
+        score: 0,
+        note: 'Zero query terms matched any extracted passage on this page.',
+        ...(fullCleanRaw !== undefined ? { rawContent: fullCleanRaw } : {}),
+        chunks: [],
+      });
+      continue;
+    }
     const rawSelectedChunks = query
-      ? rankChunksInMemory(allChunks, query, chunksPerSource)
+      ? rankChunksInMemory(allChunks, query, chunksPerSource).filter((c) => c.score > 0)
       : allChunks.slice(0, chunksPerSource).map((c) => ({ ...c, score: 1 }));
     const selectedChunks = rawSelectedChunks.map((c) => {
-      const cleanText = sanitizeInlineHtmlInMarkdown(c.text, effectiveBase).trim();
+      const cleanText = sanitizeAndRedactExtractMarkdown(c.text, effectiveBase, redactPii);
       const cleanHeading = c.heading
-        ? sanitizeInlineHtmlInMarkdown(c.heading, effectiveBase).replace(/\s+/g, ' ').trim()
+        ? sanitizeAndRedactExtractMarkdown(c.heading, effectiveBase, redactPii).replace(/\s+/g, ' ').trim()
         : c.heading;
       return {
         ...c,
         ...(cleanHeading !== undefined ? { heading: cleanHeading } : {}),
-        text: redactPii ? redactPiiText(cleanText) : cleanText,
+        text: cleanText,
       };
     });
-    const assembledRawContent = query
-      ? [...selectedChunks]
-          .sort((a, b) => a.ordinal - b.ordinal)
-          .map((c) => (c.heading && !/^#{1,6}\s/.test(c.text.trimStart()) ? `## ${c.heading}\n${c.text}` : c.text))
-          .join('\n\n...\n\n')
-      : (entry.markdown ?? '');
-    const safeRawContent = sanitizeInlineHtmlInMarkdown(assembledRawContent, effectiveBase).trim();
+    const safeRawContent = wantRawContent
+      ? sanitizeAndRedactExtractMarkdown(
+          query
+            ? [...selectedChunks]
+                .sort((a, b) => a.ordinal - b.ordinal)
+                .map((c) => (c.heading && !/^#{1,6}\s/.test(c.text.trimStart()) ? `## ${c.heading}\n${c.text}` : c.text))
+                .join('\n\n...\n\n')
+            : (entry.markdown ?? ''),
+          effectiveBase,
+          redactPii,
+        )
+      : undefined;
     results.push({
       url: u,
       ...(entry.finalUrl && entry.finalUrl !== u ? { finalUrl: entry.finalUrl } : {}),
       ...(entry.redirectInfo?.redirected ? entry.redirectInfo : {}),
       status: entry.status,
       cached: entry.cached,
-      ...(entry.title ? { title: entry.title } : {}),
+      ...(safeFinalTitle ? { title: safeFinalTitle } : {}),
       ...(entry.contentState ? { contentState: entry.contentState } : {}),
       ...(entry.contentSource ? { contentSource: entry.contentSource } : {}),
       ...(entry.waybackSnapshotUrl ? { waybackSnapshotUrl: entry.waybackSnapshotUrl, waybackTimestamp: entry.waybackTimestamp } : {}),
       ...(entry.renderedVia ? { renderedVia: entry.renderedVia } : {}),
       ...(entry.jobPosting ? { jobPosting: entry.jobPosting } : {}),
       ...(entry.recordCount !== undefined ? { recordCount: entry.recordCount, totalRecords: entry.totalRecords } : {}),
-      rawContent: redactPii ? redactPiiText(safeRawContent) : safeRawContent,
+      ...(query ? { matchedQueryTerms, score: selectedChunks[0]?.score ?? 0 } : {}),
+      ...(safeRawContent !== undefined ? { rawContent: safeRawContent } : {}),
       chunks: selectedChunks,
     });
   }

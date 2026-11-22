@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 //go:embed manifests/*
@@ -1470,20 +1471,67 @@ func isLikelySocrataHostGo(host string) bool {
 	return parts[2] == "gov" || parts[2] == "org" || parts[2] == "us"
 }
 
+func asciiLowerExtractByte(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func asciiLowerExtractString(s string) string {
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			hasUpper = true
+			break
+		}
+	}
+	if !hasUpper {
+		return s
+	}
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		b[i] = asciiLowerExtractByte(s[i])
+	}
+	return string(b)
+}
+
+func indexFoldASCIIExtract(s, lowerNeedle string) int {
+	if lowerNeedle == "" {
+		return 0
+	}
+	if len(s) < len(lowerNeedle) {
+		return -1
+	}
+	for i := 0; i+len(lowerNeedle) <= len(s); i++ {
+		match := true
+		for j := 0; j < len(lowerNeedle); j++ {
+			if asciiLowerExtractByte(s[i+j]) != lowerNeedle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
 func isArcgisRestLayerPathGo(p string) bool {
 	clean := strings.TrimRight(p, "/")
-	lower := strings.ToLower(clean)
-	idx := strings.Index(lower, "/rest/services/")
+	const marker = "/rest/services/"
+	idx := indexFoldASCIIExtract(clean, marker)
 	if idx < 0 {
 		return false
 	}
-	tail := clean[idx+len("/rest/services/"):]
+	tail := clean[idx+len(marker):]
 	segs := splitNonEmptyEscapedSegments(tail)
 	if len(segs) < 2 {
 		return false
 	}
-	last := strings.ToLower(segs[len(segs)-1])
-	prev := strings.ToLower(segs[len(segs)-2])
+	last := asciiLowerExtractString(segs[len(segs)-1])
+	prev := asciiLowerExtractString(segs[len(segs)-2])
 	if last == "featureserver" || last == "mapserver" {
 		return true
 	}
@@ -2349,6 +2397,43 @@ func findAllLinearElementInnersGo(src, tagName string, maxItems int) []string {
 	return out
 }
 
+func isSafePublicHTTPSFeedURL(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if !strings.HasPrefix(s, "https://") || len(s) > 2048 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= 0x20 || c == 0x7f || c == '(' || c == ')' || c == '[' || c == ']' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '`' || c == '\\' {
+			return false
+		}
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	host := politeness.CanonicalHost(u.Hostname())
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return false
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return politeness.IsPublicIP(ip)
+	}
+	return strings.IndexByte(host, '.') > 0
+}
+
+func sortedMapKeys[V any](m map[string]V) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func extractXMLTagTextGo(xmlSrc, tagName string) string {
 	inner, _, ok := findLinearElementInnerGo(xmlSrc, strings.ToLower(tagName), 0)
 	if !ok {
@@ -2439,7 +2524,7 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 		if len(head) > 4000 {
 			head = head[:4000]
 		}
-		if idx := strings.Index(strings.ToLower(head), "<"+strings.ToLower(itemTag)); idx >= 0 {
+		if idx := indexFoldASCIIExtract(head, "<"+asciiLowerExtractString(itemTag)); idx >= 0 {
 			head = head[:idx]
 		}
 		ct := extractXMLTagTextGo(head, "title")
@@ -2449,7 +2534,8 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 		topVars["channelTitle"] = ct
 	}
 	if len(xmlSpec.FirstItemVars) > 0 && len(blocks) > 0 {
-		for vn, tList := range xmlSpec.FirstItemVars {
+		for _, vn := range sortedMapKeys(xmlSpec.FirstItemVars) {
+			tList := xmlSpec.FirstItemVars[vn]
 			got := ""
 			for _, tg := range tList {
 				got = extractXMLTagTextGo(blocks[0], tg)
@@ -2468,7 +2554,7 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 	if tpl == "" {
 		tpl = "{host} ({itemCount})"
 	}
-	title := strings.TrimSpace(expandTemplate(tpl, func(k string) string { return topVars[k] }))
+	title := SanitizeScrapedMeta(strings.TrimSpace(expandTemplate(tpl, func(k string) string { return topVars[k] })))
 	if title == "" {
 		return nil, false
 	}
@@ -2478,7 +2564,7 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 		}
 		return &DeclarativeFormattedDoc{
 			Title:    title,
-			Markdown: "# " + title + "\n\n" + xmlSpec.EmptyText,
+			Markdown: SanitizeScrapedMarkdown("# " + title + "\n\n" + xmlSpec.EmptyText),
 		}, true
 	}
 
@@ -2489,6 +2575,7 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 	if limit > len(blocks) {
 		limit = len(blocks)
 	}
+	xmlItemVarKeys := sortedMapKeys(xmlSpec.ItemVars)
 	var rows [][]string
 	var links []string
 	for _, b := range blocks[:limit] {
@@ -2496,7 +2583,8 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 		for k, v := range topVars {
 			rowVars[k] = v
 		}
-		for ivName, ivSpec := range xmlSpec.ItemVars {
+		for _, ivName := range xmlItemVarKeys {
+			ivSpec := xmlSpec.ItemVars[ivName]
 			val := ""
 			for _, tg := range ivSpec.Tags {
 				val = extractXMLTagTextGo(b, tg)
@@ -2528,16 +2616,35 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 		}
 		if xmlSpec.CollectLinkVar != "" {
 			lv := strings.TrimSpace(rowVars[xmlSpec.CollectLinkVar])
-			if strings.HasPrefix(lv, "https://") {
+			if isSafePublicHTTPSFeedURL(lv) {
 				links = append(links, lv)
 			}
 		}
 		row := make([]string, len(xmlSpec.Columns))
 		for cIdx, c := range xmlSpec.Columns {
-			row[cIdx] = strings.TrimSpace(expandTemplate(c.Template, func(k string) string { return rowVars[k] }))
-			if row[cIdx] == "" {
-				row[cIdx] = "-"
+			cell := ""
+			if strings.HasPrefix(c.Template, "[{") && strings.HasSuffix(c.Template, "})") {
+				mid := strings.Index(c.Template, "}]({")
+				if mid > 2 && strings.Index(c.Template[mid+4:], "}") == len(c.Template)-(mid+4)-2 {
+					labelVar := c.Template[2:mid]
+					urlVar := c.Template[mid+4 : len(c.Template)-2]
+					lTxt := strings.TrimSpace(rowVars[labelVar])
+					uTxt := strings.TrimSpace(rowVars[urlVar])
+					if isSafePublicHTTPSFeedURL(uTxt) {
+						cell = "[" + lTxt + "](" + uTxt + ")"
+					} else {
+						cell = lTxt
+					}
+				} else {
+					cell = strings.TrimSpace(expandTemplate(c.Template, func(k string) string { return rowVars[k] }))
+				}
+			} else {
+				cell = strings.TrimSpace(expandTemplate(c.Template, func(k string) string { return rowVars[k] }))
 			}
+			if cell == "" {
+				cell = "-"
+			}
+			row[cIdx] = cell
 		}
 		rows = append(rows, row)
 	}
@@ -2550,7 +2657,7 @@ func formatXMLTwinGo(rawXML string, xmlSpec *DeclarativeXMLSpec, params map[stri
 	}
 	return &DeclarativeFormattedDoc{
 		Title:    title,
-		Markdown: "# " + title + "\n\n" + formatDeclarativeGFMTable(headers, rows),
+		Markdown: SanitizeScrapedMarkdown("# " + title + "\n\n" + formatDeclarativeGFMTable(headers, rows)),
 		Links:    links,
 	}, true
 }
@@ -3220,7 +3327,7 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		return val
 	}
 
-	for name := range ext.Vars {
+	for _, name := range sortedMapKeys(ext.Vars) {
 		_ = lookup(name)
 	}
 	for _, reqVar := range ext.RequireVars {
@@ -3718,17 +3825,30 @@ func (m *DeclarativeTwinMatch) formatJSONBytesTwin(rawBytes []byte, ext Declarat
 		}
 		sliced := rawArr[:lim]
 
+		secItemVarKeys := sortedMapKeys(sec.ItemVars)
 		evalRowMap := func(itemObj map[string]any, idx int) map[string]string {
 			itemMap := make(map[string]string, len(sec.ItemVars)+1)
 			itemMap["index1"] = strconv.Itoa(idx + 1)
-			rowLookup := func(k string) string {
+			rowVisiting := make(map[string]bool, len(sec.ItemVars))
+			var rowLookup func(string) string
+			rowLookup = func(k string) string {
 				if v, has := itemMap[k]; has {
+					return v
+				}
+				if ivSpec, isRowVar := sec.ItemVars[k]; isRowVar {
+					if rowVisiting[k] {
+						return ""
+					}
+					rowVisiting[k] = true
+					v := evalVar(ivSpec, itemObj, rowLookup)
+					delete(rowVisiting, k)
+					itemMap[k] = v
 					return v
 				}
 				return lookup(k)
 			}
-			for ivName, ivSpec := range sec.ItemVars {
-				itemMap[ivName] = evalVar(ivSpec, itemObj, rowLookup)
+			for _, ivName := range secItemVarKeys {
+				_ = rowLookup(ivName)
 			}
 			return itemMap
 		}
@@ -4069,7 +4189,8 @@ func reconstructInvertedAbstractGo(raw any) string {
 	words := make([]string, 10000)
 	maxIdx := -1
 	entries := 0
-	for token, posAny := range obj {
+	for _, token := range sortedMapKeys(obj) {
+		posAny := obj[token]
 		entries++
 		if entries > 5000 {
 			break

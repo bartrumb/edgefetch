@@ -50,10 +50,11 @@ const (
 )
 
 var (
-	reReleaseTag     = regexp.MustCompile(`^v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z._-]+))?$`)
-	reSHA256Hex      = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
-	ErrBadSignature  = errors.New("ed25519 signature verification failed for checksums.txt")
-	ErrBadArchiveSHA = errors.New("archive SHA-256 mismatch against verified checksums.txt")
+	reReleaseTag        = regexp.MustCompile(`^v([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z._-]+))?$`)
+	reSHA256Hex         = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	ErrBadSignature     = errors.New("ed25519 signature verification failed for checksums.txt")
+	ErrBadArchiveSHA    = errors.New("archive SHA-256 mismatch against verified checksums.txt")
+	ErrDowngradeRefused = errors.New("refusing version downgrade without --allow-downgrade")
 )
 
 type updateDeps struct {
@@ -318,8 +319,39 @@ func extractFromZip(archiveBytes []byte, wantBin string) ([]byte, error) {
 	return nil, fmt.Errorf("binary %q not found in zip archive", wantBin)
 }
 
+// RecoverInterruptedUpdate heals an interrupted Windows two-step rename (`exe -> exe.old`, crash before `tmp -> exe`)
+// when `exePath` is missing and a regular `exePath + ".old"` backup exists, and cleans up stale `.old` files once
+// `exePath` is healthy.
+func RecoverInterruptedUpdate(exePath string) error {
+	trimmed := strings.TrimSpace(exePath)
+	if trimmed == "" {
+		return nil
+	}
+	targetPath := filepath.Clean(trimmed)
+	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil && strings.TrimSpace(resolved) != "" {
+		targetPath = filepath.Clean(resolved)
+	}
+	oldPath := targetPath + ".old"
+	oldInfo, oldErr := os.Lstat(oldPath)
+	if oldErr != nil {
+		return nil
+	}
+	if !oldInfo.Mode().IsRegular() {
+		return nil
+	}
+	if _, tgtErr := os.Stat(targetPath); errors.Is(tgtErr, os.ErrNotExist) {
+		if err := os.Rename(oldPath, targetPath); err != nil {
+			return fmt.Errorf("restore %s from %s: %w", targetPath, oldPath, err)
+		}
+		return nil
+	} else if tgtErr == nil {
+		_ = os.Remove(oldPath)
+	}
+	return nil
+}
+
 // AtomicReplaceExecutable writes `newBinary` to a sibling temp file in `filepath.Dir(exePath)`, fsyncs, and atomically
-// swaps it over `exePath` (handling Windows locked-executable `.old` rename semantics cleanly).
+// swaps it over `exePath` (single-step `rename(2)` on Unix; rollback-protected `.old` swap on Windows).
 func AtomicReplaceExecutable(exePath string, newBinary []byte, goos string) error {
 	if strings.TrimSpace(exePath) == "" {
 		return errors.New("empty executable path")
@@ -327,6 +359,7 @@ func AtomicReplaceExecutable(exePath string, newBinary []byte, goos string) erro
 	if len(newBinary) == 0 {
 		return errors.New("empty replacement binary")
 	}
+	_ = RecoverInterruptedUpdate(exePath)
 	targetPath := exePath
 	if resolved, err := filepath.EvalSymlinks(exePath); err == nil && strings.TrimSpace(resolved) != "" {
 		targetPath = resolved
@@ -369,7 +402,13 @@ func AtomicReplaceExecutable(exePath string, newBinary []byte, goos string) erro
 
 	if goos == "windows" {
 		oldPath := targetPath + ".old"
-		_ = os.Remove(oldPath)
+		if st, lErr := os.Lstat(oldPath); lErr == nil {
+			if st.IsDir() {
+				_ = os.RemoveAll(oldPath)
+			} else {
+				_ = os.Remove(oldPath)
+			}
+		}
 		hadExisting := false
 		if _, stErr := os.Stat(targetPath); stErr == nil {
 			if rErr := os.Rename(targetPath, oldPath); rErr != nil {
@@ -379,7 +418,9 @@ func AtomicReplaceExecutable(exePath string, newBinary []byte, goos string) erro
 		}
 		if err := os.Rename(tmpPath, targetPath); err != nil {
 			if hadExisting {
-				_ = os.Rename(oldPath, targetPath)
+				if rbErr := os.Rename(oldPath, targetPath); rbErr != nil {
+					return fmt.Errorf("activate updated executable: %w (rollback also failed: %v)", err, rbErr)
+				}
 			}
 			return fmt.Errorf("activate updated executable: %w", err)
 		}
@@ -388,6 +429,7 @@ func AtomicReplaceExecutable(exePath string, newBinary []byte, goos string) erro
 		return nil
 	}
 
+	// Single-step POSIX atomic rename(2) over targetPath — zero window where targetPath is absent!
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		return fmt.Errorf("atomic rename onto %s: %w", targetPath, err)
 	}
@@ -462,9 +504,10 @@ func runUpdateCLI(ctx context.Context, args []string, stdout, stderr io.Writer, 
 
 func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Writer, deps updateDeps) int {
 	var (
-		checkOnly   bool
-		jsonOut     bool
-		wantVersion string
+		checkOnly      bool
+		jsonOut        bool
+		allowDowngrade bool
+		wantVersion    string
 	)
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -473,6 +516,8 @@ func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Wri
 			checkOnly = true
 		case a == "--json":
 			jsonOut = true
+		case a == "--allow-downgrade":
+			allowDowngrade = true
 		case strings.HasPrefix(a, "--version="):
 			wantVersion = strings.TrimSpace(strings.TrimPrefix(a, "--version="))
 		case a == "--version":
@@ -483,9 +528,15 @@ func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Wri
 			i++
 			wantVersion = strings.TrimSpace(args[i])
 		default:
-			_, _ = fmt.Fprintf(stderr, "unknown update flag %q (usage: edgefetch update [--check] [--version vX.Y.Z])\n", a)
+			_, _ = fmt.Fprintf(stderr, "unknown update flag %q (usage: edgefetch update [--check] [--version vX.Y.Z] [--allow-downgrade])\n", a)
 			return 2
 		}
+	}
+
+	if deps.exePath != "" {
+		_ = RecoverInterruptedUpdate(deps.exePath)
+	} else if selfExe, eErr := os.Executable(); eErr == nil {
+		_ = RecoverInterruptedUpdate(selfExe)
 	}
 
 	if deps.allow == nil {
@@ -536,8 +587,19 @@ func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Wri
 		}
 	}
 
-	cmp := compareSemverTags("v"+targetVerNoV, "v"+curVer)
+	curTag, _, curValidSemver := normalizeReleaseTag(curVer)
+	cmp := 0
+	if curValidSemver == nil {
+		cmp = compareSemverTags(targetTag, curTag)
+	} else {
+		cmp = compareSemverTags("v"+targetVerNoV, "v"+curVer)
+	}
 	updateAvailable := cmp > 0
+
+	if !checkOnly && curValidSemver == nil && cmp < 0 && !allowDowngrade {
+		_, _ = fmt.Fprintf(stderr, "SECURITY: %v (target %s < current %s; pass --allow-downgrade to roll back intentionally)\n", ErrDowngradeRefused, targetTag, curTag)
+		return 1
+	}
 
 	// Always fetch & verify signed checksums.txt + checksums.txt.sig for the target release!
 	checksumsURL := fmt.Sprintf("%s/%s/releases/download/%s/checksums.txt", dlBase, githubReleaseRepo, targetTag)

@@ -34,6 +34,8 @@ const secAuditOutfile = join(dir, 'security-audit.test.mjs');
 const ghMultiOutfile = join(dir, 'github-auth-multiuser.test.mjs');
 const mcpFedOutfile = join(dir, 'mcp-federation.test.mjs');
 const updatesTelOutfile = join(dir, 'updates-telemetry.test.mjs');
+const r7MultiMcpOutfile = join(dir, 'round7-multiuser-mcp.test.mjs');
+const r7PortTelOutfile = join(dir, 'round7-portable-telemetry.test.mjs');
 const sdkTsTestFile = resolve('test/sdk-ts.test.ts');
 const hasSdkTsTest = existsSync(sdkTsTestFile);
 const sdkTsOutfile = join(dir, 'sdk-ts.test.mjs');
@@ -68,6 +70,8 @@ try {
   buildNodeTestBundle('test/github-auth-multiuser.test.ts', ghMultiOutfile);
   buildNodeTestBundle('test/mcp-federation.test.ts', mcpFedOutfile);
   buildNodeTestBundle('test/updates-telemetry.test.ts', updatesTelOutfile);
+  buildNodeTestBundle('test/round7-multiuser-mcp.test.ts', r7MultiMcpOutfile);
+  buildNodeTestBundle('test/round7-portable-telemetry.test.ts', r7PortTelOutfile);
 
   const nodeTestFiles = [
     unitOutfile,
@@ -77,11 +81,19 @@ try {
     ghMultiOutfile,
     mcpFedOutfile,
     updatesTelOutfile,
+    r7MultiMcpOutfile,
+    r7PortTelOutfile,
   ];
   if (hasSdkTsTest) {
     buildNodeTestBundle('test/sdk-ts.test.ts', sdkTsOutfile);
     nodeTestFiles.push(sdkTsOutfile);
   }
+  const round7SanitizerOutfile = join(dir, 'round7-sanitizer-adapters.test.mjs');
+  buildNodeTestBundle('test/round7-sanitizer-adapters.test.ts', round7SanitizerOutfile);
+  nodeTestFiles.push(round7SanitizerOutfile);
+  const liveMcpAuditOutfile = join(dir, 'live-mcp-audit.test.mjs');
+  buildNodeTestBundle('test/live-mcp-audit.test.ts', liveMcpAuditOutfile);
+  nodeTestFiles.push(liveMcpAuditOutfile);
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],

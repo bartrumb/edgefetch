@@ -37,6 +37,7 @@ export interface ContentSignals {
 
 export interface ParsedRobots {
   unreachable: boolean;
+  dnsNotFound?: boolean;
   reason?: string;
   crawlDelayMs: number;
   rules: Array<{ pattern: string; allow: boolean }>;
@@ -44,6 +45,46 @@ export interface ParsedRobots {
   disallowAiInput?: boolean;
   cacheTtlMs?: number;
   doNotCacheShared?: boolean;
+}
+
+export const DNS_NOT_FOUND_MESSAGE = 'Domain does not exist (DNS NXDOMAIN). Do not retry.';
+
+export const SSRF_BLOCKED_INFO = {
+  reason: 'ssrf' as const,
+  retryable: false,
+  message: 'Target or redirect resolved to a non-public/metadata IP address and was blocked.',
+};
+
+/** Scrubs internal/container DNS resolver IP:port suffixes (`on 127.0.0.11:53`, `on [::1]:53`) from error messages. */
+export function scrubResolverIpFromError(raw: string): string {
+  if (!raw) return raw;
+  return raw
+    .replace(/\s+on\s+(?:\[[0-9a-fA-F:.]+\]|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?\b/gi, '')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}:53:?\s*/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/** Detects non-retryable DNS NXDOMAIN / host-not-found errors across Go agents and Workers fetch. */
+export function isDnsNotFoundError(outcome: unknown, problem: unknown): boolean {
+  const out = typeof outcome === 'string' ? outcome.trim().toLowerCase() : '';
+  if (out === 'dns_not_found') return true;
+  const prob = typeof problem === 'string' ? problem : '';
+  if (!prob) return false;
+  return /\b(?:enotfound|nxdomain|dns_not_found|eai_noname)\b|no such host|name or service not known|nodename nor servname provided|domain does not exist/i.test(
+    prob,
+  );
+}
+
+/** Detects SSRF / non-public peer / cloud metadata IP blocks across Go agents and Workers fetch. */
+export function isSsrfBlockedError(outcome: unknown, problem: unknown): boolean {
+  const out = typeof outcome === 'string' ? outcome.trim().toLowerCase() : '';
+  if (out === 'blocked_ssrf') return true;
+  const prob = typeof problem === 'string' ? problem : '';
+  if (!prob) return false;
+  return /\b(?:blocked_ssrf|ssrf)\b|non-public(?:\s+ip|\s+peer|\s+address)?|metadata\s+(?:ip|endpoint|address|service)|private\s+(?:ip|network|address)|loopback\s+(?:ip|address)|link-local\s+(?:ip|address)|disallowed_url|disallowed\s+redirect\s+target|resolved\s+to\s+(?:a\s+)?(?:private|loopback|link-local|reserved|non-public|internal)/i.test(
+    prob,
+  );
 }
 
 function isUnreservedAsciiByte(b: number): boolean {
@@ -186,6 +227,54 @@ export function parseRobotsCacheControlTtlMs(cacheControlHeader: string | null |
   return Math.min(ROBOTS_CACHE_MAX_MS, Math.max(ROBOTS_CACHE_MIN_MS, defaultMs));
 }
 
+function trimRobotsDirectiveLine(s: string): string {
+  // Trim ASCII space/tab plus leading/trailing BOM & zero-width format characters (`\uFEFF`, `\u200B`, `\u200C`, `\u200D`, `\u2060`)
+  return s.replace(/^[ \t\uFEFF\u200B\u200C\u200D\u2060]+|[ \t\uFEFF\u200B\u200C\u200D\u2060]+$/g, '');
+}
+
+function lowerRobotsFieldName(rawField: string): string {
+  // Match Go `strings.ToLower` on ASCII + `\u0130` (`İ` -> `'i'`, whereas JS `'İ'.toLowerCase()` expands to `'i\u0307'`)
+  return rawField
+    .replace(/\u0130/g, 'i')
+    .replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) | 32));
+}
+
+function canonicalizeRobotsTarget(rawTarget: string): string {
+  let s = rawTarget || '/';
+  const hashIdx = s.indexOf('#');
+  if (hashIdx >= 0) s = s.slice(0, hashIdx);
+  if (!s) return '/';
+  const norm = normalizeRobotsURI(s);
+  const qIdx = norm.indexOf('?');
+  const pathPart = qIdx >= 0 ? norm.slice(0, qIdx) : norm;
+  const queryPart = qIdx >= 0 ? norm.slice(qIdx) : '';
+  // Fast path when canonical single-slash path has no `//`, `/./`, `/../`, `;`, or missing leading `/`
+  if (
+    pathPart.startsWith('/') &&
+    !pathPart.includes('//') &&
+    !pathPart.includes('/.') &&
+    !pathPart.includes(';')
+  ) {
+    return `${pathPart}${queryPart}`;
+  }
+  const trailingSlash =
+    pathPart.endsWith('/') || pathPart.endsWith('/.') || pathPart.endsWith('/..');
+  const rawSegs = pathPart.replace(/^\/+/, '').split('/');
+  const segs: string[] = [];
+  for (let seg of rawSegs) {
+    const semi = seg.indexOf(';');
+    if (semi >= 0) seg = seg.slice(0, semi);
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (segs.length > 0) segs.pop();
+      continue;
+    }
+    segs.push(seg);
+  }
+  const builtPath = `/${segs.join('/')}${trailingSlash && segs.length > 0 ? '/' : ''}`;
+  return `${builtPath}${queryPart}`;
+}
+
 export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2.6.0'): ParsedRobots {
   // Strip repeated UTF-8 BOMs (decoded U+FEFF or byte-decoded \xEF\xBB\xBF) and normalize all Unicode/ASCII line breaks.
   const body = rawBody
@@ -211,8 +300,8 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
   for (const rawLine of body.split('\n')) {
     const hashIdx = rawLine.indexOf('#');
     const noComment = hashIdx >= 0 ? rawLine.slice(0, hashIdx) : rawLine;
-    // Match Go `politeness.ParseRobotsTxt` (`trimRobotsWS` trims ONLY ASCII space and tab `" \t"`).
-    const line = trimAsciiSpaceTab(noComment);
+    // Strip leading/trailing ASCII space/tab + BOM/zero-width chars (`\uFEFF`, `\u200B`..`\u200D`, `\u2060`) on directive lines.
+    const line = trimRobotsDirectiveLine(noComment);
     if (!line) {
       // RFC 9309 §2.2.1: blank lines inside a group do NOT close the current User-agent group.
       continue;
@@ -221,8 +310,12 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
     if (colon <= 0) continue;
     const rawField = line.slice(0, colon);
     if (rawField.includes('\0')) continue;
-    const field = trimAsciiSpaceTab(rawField).toLowerCase();
-    const val = trimAsciiSpaceTab(line.slice(colon + 1));
+    const field = lowerRobotsFieldName(trimRobotsDirectiveLine(rawField));
+    let rawValSlice = line.slice(colon + 1);
+    // Match Go `politeness.ParseRobotsTxt`: truncate directive value at first NUL byte (`ai-input=no\0` -> `ai-input=no`)
+    const nulIdx = rawValSlice.indexOf('\0');
+    if (nulIdx >= 0) rawValSlice = rawValSlice.slice(0, nulIdx);
+    const val = trimRobotsDirectiveLine(rawValSlice);
     if (field === 'user-agent') {
       seenAnyUserAgent = true;
       if (seenDirective && cur.agents.length > 0) {
@@ -254,8 +347,8 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
       }
     } else if (field === 'crawl-delay' && cur.agents.length > 0) {
       seenDirective = true;
-      if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(val)) {
-        const secs = Number(val);
+      if (/^[+-]?(?:\d+(?:_\d+)*(?:\.\d+(?:_\d+)*|\.)?|\.\d+(?:_\d+)*)(?:e[+-]?\d+(?:_\d+)*)?$/i.test(val)) {
+        const secs = Number(val.replace(/_/g, ''));
         if (Number.isFinite(secs) && secs > 0) {
           cur.crawlDelayMs = Math.min(30_000, Math.floor((secs * 1e9) / 1e6));
         }
@@ -325,7 +418,7 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
 export function isRobotsAllowed(entry: ParsedRobots, rawPathAndQuery: string): boolean {
   if (entry.unreachable || entry.disallowAiInput) return false;
   if (entry.rules.length === 0) return true;
-  const target = normalizeRobotsURI(rawPathAndQuery || '/');
+  const target = canonicalizeRobotsTarget(rawPathAndQuery || '/');
   let bestLen = -1;
   let bestAllow = true;
   for (const r of entry.rules) {
@@ -692,9 +785,24 @@ export async function fetchOverflowRobots(
     };
   }
   const callerBudgetConstrained = remMs < ROBOTS_TIMEOUT_MS;
-  const signal = AbortSignal.timeout(Math.min(ROBOTS_TIMEOUT_MS, remMs));
-  try {
+  const hardTimeoutMs = Math.min(ROBOTS_TIMEOUT_MS, remMs);
+  const controller = new AbortController();
+  const signal = controller.signal;
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  let hardKillTimerId: ReturnType<typeof setTimeout> | undefined;
+  const deadlinePromise = new Promise<never>((_, reject) => {
+    timerId = setTimeout(() => {
+      const err = new Error(`robots.txt timed out after ${hardTimeoutMs}ms`);
+      controller.abort(err);
+      // Give `readBoundedBytes` `reader.cancel()` one tick (`50ms`) to resolve partial `200` streams cleanly per RFC 9309,
+      // then force-reject if an uncooperative `fetchFn` or custom stream ignores `signal` & `cancel()`.
+      hardKillTimerId = setTimeout(() => reject(err), 50);
+    }, hardTimeoutMs);
+  });
+
+  const runRobotsFetch = async (): Promise<ParsedRobots> => {
     let curUrl = `${origin}/robots.txt`;
+    let retriedTransient5xx = false;
     for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
       const parsedCur = new URL(curUrl);
       if (isDisallowedOverflowUrl(parsedCur, canonicalSelf)) {
@@ -706,12 +814,43 @@ export async function fetchOverflowRobots(
           cacheTtlMs: ROBOTS_UNREACHABLE_CACHE_MAX_MS,
         };
       }
-      const resp = await fetchFn(curUrl, {
+      let resp = await fetchFn(curUrl, {
         method: 'GET',
         headers: { 'user-agent': userAgent, accept: 'text/plain,*/*;q=0.8' },
         redirect: 'manual',
         signal,
       });
+      // Polite single retry (250ms delay within the 10s total robots budget) on transient gateway 502/503/504 errors
+      if (
+        !retriedTransient5xx &&
+        (resp.status === 502 || resp.status === 503 || resp.status === 504) &&
+        !signal.aborted &&
+        budgetDeadlineAt - Date.now() > 400
+      ) {
+        retriedTransient5xx = true;
+        await resp.body?.cancel().catch(() => undefined);
+        await new Promise<void>((resolve, reject) => {
+          const retryTimer = setTimeout(() => {
+            signal.removeEventListener('abort', onRetryAbort);
+            resolve();
+          }, 250);
+          const onRetryAbort = () => {
+            clearTimeout(retryTimer);
+            reject(signal.reason ?? new Error('aborted'));
+          };
+          if (signal.aborted) {
+            onRetryAbort();
+            return;
+          }
+          signal.addEventListener('abort', onRetryAbort, { once: true });
+        });
+        resp = await fetchFn(curUrl, {
+          method: 'GET',
+          headers: { 'user-agent': userAgent, accept: 'text/plain,*/*;q=0.8' },
+          redirect: 'manual',
+          signal,
+        });
+      }
       if (resp.status >= 300 && resp.status < 400) {
         await resp.body?.cancel().catch(() => undefined);
         const loc = resp.headers.get('location')?.trim();
@@ -785,17 +924,35 @@ export async function fetchOverflowRobots(
       };
     }
     return { unreachable: false, crawlDelayMs: 0, rules: [], cacheTtlMs: ROBOTS_CACHE_DEFAULT_MS };
+  };
+
+  try {
+    return await Promise.race([runRobotsFetch(), deadlinePromise]);
   } catch (e) {
+    const rawMsg = scrubResolverIpFromError(e instanceof Error ? e.message : String(e));
+    if (isDnsNotFoundError(undefined, rawMsg)) {
+      return {
+        unreachable: false,
+        dnsNotFound: true,
+        reason: DNS_NOT_FOUND_MESSAGE,
+        crawlDelayMs: 0,
+        rules: [],
+        cacheTtlMs: ROBOTS_UNREACHABLE_CACHE_MAX_MS,
+      };
+    }
     // Never poison global `hubRobotsTtlCache` when a caller's own short `maxSeconds` budget caused the abort/timeout!
     const abortedByShortCallerBudget = callerBudgetConstrained && (signal.aborted || Date.now() >= budgetDeadlineAt);
     return {
       unreachable: true,
-      reason: `robots_unreachable: robots.txt unreachable (disallow assumed per RFC 9309): ${e instanceof Error ? e.message : String(e)}`,
+      reason: `robots_unreachable: robots.txt unreachable (disallow assumed per RFC 9309): ${rawMsg}`,
       crawlDelayMs: abortedByShortCallerBudget ? 0 : 15_000,
       rules: [],
       cacheTtlMs: abortedByShortCallerBudget ? 0 : ROBOTS_UNREACHABLE_CACHE_MAX_MS,
       ...(abortedByShortCallerBudget ? { doNotCacheShared: true } : {}),
     };
+  } finally {
+    if (timerId !== undefined) clearTimeout(timerId);
+    if (hardKillTimerId !== undefined) clearTimeout(hardKillTimerId);
   }
 }
 
@@ -908,7 +1065,15 @@ export async function cloudflareOverflowFetch(
       }
 
       if (isDisallowedOverflowUrl(parsedUrl, canonicalSelf)) {
-        results.push({ id: r.id, url: r.url, kind: r.kind, status: 0, outcome: 'error', problem: 'disallowed_url' });
+        results.push({
+          id: r.id,
+          url: r.url,
+          kind: r.kind,
+          status: 0,
+          outcome: 'error',
+          problem: 'disallowed_url',
+          ...(hop > 0 ? { blocked: { ...SSRF_BLOCKED_INFO } } : {}),
+        });
         finished = true;
         break;
       }
@@ -929,6 +1094,22 @@ export async function cloudflareOverflowFetch(
           if (useSharedRobotsCache) {
             storeCachedHubRobots(`${parsedUrl.origin.toLowerCase()}|${uaCacheToken}`, robotsEntry, Date.now());
           }
+        }
+        if (robotsEntry.dnsNotFound) {
+          results.push({
+            id: r.id,
+            url: r.url,
+            kind: r.kind,
+            status: 0,
+            outcome: 'dns_not_found',
+            error: 'dns_not_found',
+            retryable: false,
+            message: DNS_NOT_FOUND_MESSAGE,
+            problem: DNS_NOT_FOUND_MESSAGE,
+            durationMs: Date.now() - reqStart,
+          });
+          finished = true;
+          break;
         }
         const pathAndQuery = `${parsedUrl.pathname || '/'}${parsedUrl.search || ''}`;
         if (!isRobotsAllowed(robotsEntry, pathAndQuery)) {
@@ -1115,9 +1296,13 @@ export async function cloudflareOverflowFetch(
             ? classifyWafAndChallenge({ status: resp.status, headers: resp.headers, rawBody: decodedPreview })
             : null;
         const encodedBody =
-          (includeBody || (isPaymentRequired && bytes.byteLength <= 65_536)) && !truncated
-            ? encodeBodyForWire(bytes)
-            : undefined;
+          isPaymentRequired
+            ? !truncated && bytes.byteLength <= 65_536
+              ? encodeBodyForWire(bytes)
+              : undefined
+            : includeBody && !truncated
+              ? encodeBodyForWire(bytes)
+              : undefined;
         const isNotModified = resp.status === 304 && Boolean(r.ifNoneMatch || r.ifModifiedSince);
         const respCt = (resp.headers.get('content-type') ?? '').trim();
         const isAutoKindSkip =
@@ -1126,19 +1311,22 @@ export async function cloudflareOverflowFetch(
           resp.status < 300 &&
           Boolean(respCt) &&
           !AUTO_KIND_ACCEPTABLE_CT_RE.test(respCt);
-        const outcome = truncated
-          ? 'error'
-          : isPaymentRequired
-            ? 'payment_required'
+        // HTTP 402 MUST ALWAYS surface as `payment_required` (status 402) even if an untrusted origin sent an oversized `> maxBytes` body (`x402_7.mjs`)!
+        const outcome = isPaymentRequired
+          ? 'payment_required'
+          : truncated
+            ? 'error'
             : wafMatch || cfMitigated
               ? 'challenge'
               : isAutoKindSkip
                 ? 'skip'
                 : (resp.status >= 200 && resp.status < 300) || isNotModified
                   ? 'ok'
-                  : resp.status === 404 || resp.status === 410
-                    ? 'gone'
-                    : resp.status === 429
+                  : resp.status === 404
+                    ? 'not_found'
+                    : resp.status === 410
+                      ? 'gone'
+                      : resp.status === 429
                       ? 'rate_limited'
                       : resp.status === 403 || resp.status === 503
                         ? 'stop'
@@ -1180,15 +1368,42 @@ export async function cloudflareOverflowFetch(
         break;
       } catch (e) {
         hostLastDone.set(host, Date.now());
-        results.push({
-          id: r.id,
-          url: r.url,
-          kind: r.kind,
-          status: 0,
-          outcome: 'error',
-          problem: e instanceof Error ? e.message : String(e),
-          durationMs: Date.now() - reqStart,
-        });
+        const rawErrMsg = scrubResolverIpFromError(e instanceof Error ? e.message : String(e));
+        if (isDnsNotFoundError(undefined, rawErrMsg)) {
+          results.push({
+            id: r.id,
+            url: r.url,
+            kind: r.kind,
+            status: 0,
+            outcome: 'dns_not_found',
+            error: 'dns_not_found',
+            retryable: false,
+            message: DNS_NOT_FOUND_MESSAGE,
+            problem: DNS_NOT_FOUND_MESSAGE,
+            durationMs: Date.now() - reqStart,
+          });
+        } else if (isSsrfBlockedError(undefined, rawErrMsg)) {
+          results.push({
+            id: r.id,
+            url: r.url,
+            kind: r.kind,
+            status: 0,
+            outcome: 'blocked',
+            problem: SSRF_BLOCKED_INFO.message,
+            blocked: { ...SSRF_BLOCKED_INFO },
+            durationMs: Date.now() - reqStart,
+          });
+        } else {
+          results.push({
+            id: r.id,
+            url: r.url,
+            kind: r.kind,
+            status: 0,
+            outcome: 'error',
+            problem: rawErrMsg,
+            durationMs: Date.now() - reqStart,
+          });
+        }
         finished = true;
         break;
       }

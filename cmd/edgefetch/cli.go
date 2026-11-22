@@ -141,7 +141,7 @@ Usage:
   edgefetch desktop [--port=8787]                Start loopback Desktop MCP Launchpad & open browser (Win/macOS/Linux)
   edgefetch mcp                                  Run local stdio MCP server (zero ports/tokens — Claude/Cursor/Codex)
   edgefetch init [--agent=all] [--dry-run]       Auto-configure MCP in Claude Code, Claude Desktop, Cursor, Windsurf, Gemini & Codex
-  edgefetch update [--check] [--version vX.Y.Z]  Verify Ed25519 signature + SHA-256 and atomically update the edgefetch binary
+  edgefetch update [--check] [--version vX.Y.Z] [--allow-downgrade]  Verify Ed25519 signature + SHA-256 and atomically update binary
   edgefetch scrape [flags] <https://url>         Scrape one public HTTPS URL to clean Markdown (or --json)
   edgefetch map [flags] <https://url>            Discover URLs across /llms.txt, /sitemap.xml & homepage links
   edgefetch crawl [flags] <https://url>          Breadth-first polite site crawl (supports --out=./pages Markdown export)

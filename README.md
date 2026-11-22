@@ -113,6 +113,7 @@ Multi-arch OCI manifests (`linux/amd64` + `linux/arm64`) run as non-root `65532:
 # Full "Fat" Agent (Go HTTP/2 + SSRF-proxied Headless Chromium + SwiftShader + Poppler PDF):
 docker run -d --name edgefetch-agent --restart=unless-stopped \
   --security-opt no-new-privileges:true \
+  --security-opt seccomp=./deploy/seccomp/chromium-sandbox.json \
   -e EDGEFETCH_HUB_URL=https://<your-hub-domain> \
   -e EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \
   -e EDGEFETCH_SITE_ID="node-1" \
@@ -158,9 +159,9 @@ EDGEFETCH_CALLER_TOKEN="<32-char-secret>" EDGEFETCH_AGENT_TOKEN="<32-char-secret
 
 ---
 
-## Feature & Extraction Highlights (`v2.7`, `SCRAPE_PIPELINE_VERSION = 30`)
+## Feature & Extraction Highlights (`v2.7.1`, `SCRAPE_PIPELINE_VERSION = 31`)
 
-- **25+ Site & ATS Job-Board Extractors ([`hub/src/extractors/registry.ts`](hub/src/extractors/registry.ts), [`hub/src/jobs.ts`](hub/src/jobs.ts)):**
+- **56 Declarative YAML Site, Commerce & ATS Adapters ([`internal/extract/manifests/`](internal/extract/manifests), [`hub/src/extractors/registry.ts`](hub/src/extractors/registry.ts), [`hub/src/jobs.ts`](hub/src/jobs.ts)):**
   - **ATS Job Boards & Structured `jobs` Tool:** One-call job search & extraction across **Greenhouse**, **Ashby** (`?includeCompensation=true`), **Lever**, **Workday CXS** (`GET` & `POST`), and **SmartRecruiters / Schema.org `JobPosting` JSON-LD**, normalizing pay (`{ min, max, currency, period, basis: "base"|"ote"|"total" }`) and filtering out closed postings (`contentState: "closed_posting"`).
   - **Developer & Research Sites:** 1-hop JSON/raw/patch upgrades for **GitHub** (raw, `.patch`, Issues/PRs, Gist), **GitLab**, **Codeberg**, **Stack Overflow** (`✅ Accepted Answer`), **npm**, **crates.io**, **Hugging Face** (YAML model cards → GFM tables), **Discourse**, **Lobsters**, **Reddit**, **Bluesky** (ATProto), **Mastodon**, **DEV.to**, **pkg.go.dev**, **PyPI**, **Wikipedia**, **IETF RFCs**, **ArXiv**, **PubMed/PMC**, **Hacker News**, and **YouTube transcripts**.
 - **Data-Gathering & SPA Reliability:**

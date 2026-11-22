@@ -70,6 +70,46 @@ export interface ActiveSpanHandle {
 const TRACEPARENT_RE = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
 const ALL_ZERO_32 = '0'.repeat(32);
 const ALL_ZERO_16 = '0'.repeat(16);
+const SAFE_REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+const RFC_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$/;
+const FORBIDDEN_OTLP_HEADER_NAMES = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+  'host',
+  ':authority',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'keep-alive',
+  'upgrade',
+  'te',
+  'trailer',
+  'proxy-connection',
+]);
+
+export const MAX_INFLIGHT_OTLP_EXPORTS = 32;
+export const UNAUTH_OTLP_EXPORT_CAPACITY = 30;
+const UNAUTH_OTLP_WINDOW_MS = 60_000;
+
+let inflightOtlpExports = 0;
+let unauthOtlpTokens = UNAUTH_OTLP_EXPORT_CAPACITY;
+let unauthOtlpLastRefillMs = Date.now();
+
+export function resetOtlpExportLimitersForTests(): void {
+  unauthOtlpTokens = UNAUTH_OTLP_EXPORT_CAPACITY;
+  unauthOtlpLastRefillMs = Date.now();
+}
+
+function consumeUnauthOtlpBudget(nowMs = Date.now()): boolean {
+  const elapsed = Math.max(0, nowMs - unauthOtlpLastRefillMs);
+  const refillPerMs = UNAUTH_OTLP_EXPORT_CAPACITY / UNAUTH_OTLP_WINDOW_MS;
+  unauthOtlpTokens = Math.min(UNAUTH_OTLP_EXPORT_CAPACITY, unauthOtlpTokens + elapsed * refillPerMs);
+  unauthOtlpLastRefillMs = nowMs;
+  if (unauthOtlpTokens < 1) return false;
+  unauthOtlpTokens -= 1;
+  return true;
+}
 
 export function randomHex(byteLength: number): string {
   const bytes = new Uint8Array(byteLength);
@@ -83,7 +123,7 @@ export function randomHex(byteLength: number): string {
 
 /** Parses an incoming W3C `traceparent` header (`00-<traceId>-<spanId>-<flags>`). */
 export function parseTraceparent(headerValue: string | null | undefined): TraceContext | null {
-  if (!headerValue) return null;
+  if (!headerValue || headerValue.length > 256) return null;
   const m = TRACEPARENT_RE.exec(headerValue.trim());
   if (!m) return null;
   const traceId = (m[1] as string).toLowerCase();
@@ -103,6 +143,13 @@ export function formatTraceparent(ctx: { traceId: string; spanId: string; sample
   return `00-${ctx.traceId}-${ctx.spanId}-${ctx.sampled === false ? '00' : '01'}`;
 }
 
+function sanitizeInboundRequestId(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed || !SAFE_REQUEST_ID_RE.test(trimmed)) return null;
+  return trimmed;
+}
+
 /** Extracts W3C `traceparent` from `request` or starts a new root trace context, returning propagation headers for Go workers. */
 export function createRequestTraceContext(request: Request): {
   context: TraceContext;
@@ -114,7 +161,10 @@ export function createRequestTraceContext(request: Request): {
     spanId: randomHex(8),
     sampled: true,
   };
-  const ray = request.headers.get('cf-ray') ?? request.headers.get('x-request-id') ?? context.spanId;
+  const ray =
+    sanitizeInboundRequestId(request.headers.get('cf-ray')) ??
+    sanitizeInboundRequestId(request.headers.get('x-request-id')) ??
+    context.spanId;
   return {
     context,
     headers: {
@@ -128,21 +178,26 @@ export function createRequestTraceContext(request: Request): {
 
 /** Parses standard `OTEL_EXPORTER_OTLP_HEADERS` (`key1=val1,key2=val2` with URL-encoded value support). */
 export function parseOtlpHeaders(raw?: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!raw || !raw.trim()) return out;
+  const out: Record<string, string> = Object.create(null) as Record<string, string>;
+  if (!raw || !raw.trim()) return { ...out };
   for (const entry of raw.split(',')) {
     const eq = entry.indexOf('=');
     if (eq <= 0) continue;
     const key = entry.slice(0, eq).trim();
     const rawVal = entry.slice(eq + 1).trim();
-    if (!key || /[\r\n\0]/.test(key) || /[\r\n\0]/.test(rawVal)) continue;
+    if (!key || !RFC_HEADER_NAME_RE.test(key)) continue;
+    if (FORBIDDEN_OTLP_HEADER_NAMES.has(key.toLowerCase())) continue;
+    if (/[\r\n\0]/.test(key) || /[\r\n\0]/.test(rawVal)) continue;
+    let decoded = rawVal;
     try {
-      out[key] = decodeURIComponent(rawVal);
+      decoded = decodeURIComponent(rawVal);
     } catch {
-      out[key] = rawVal;
+      decoded = rawVal;
     }
+    if (/[\r\n\0]/.test(decoded)) continue;
+    out[key] = decoded;
   }
-  return out;
+  return { ...out };
 }
 
 /** Normalizes `OTEL_EXPORTER_OTLP_ENDPOINT` to its `/v1/traces` HTTP endpoint. */
@@ -156,6 +211,7 @@ export function resolveOtlpTracesUrl(endpoint?: string): string | null {
     return null;
   }
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  if (u.username || u.password || u.hash) return null;
   if (!u.pathname || u.pathname === '/') {
     u.pathname = '/v1/traces';
   } else if (!u.pathname.endsWith('/v1/traces')) {
@@ -184,7 +240,7 @@ export function buildOtlpTracePayload(params: {
   spans: OtlpSpanInput[];
 }): Record<string, unknown> {
   const serviceName = params.serviceName?.trim() || 'edgefetch-hub';
-  const serviceVersion = params.serviceVersion?.trim() || '2.7.0';
+  const serviceVersion = params.serviceVersion?.trim() || '2.7.1';
   return {
     resourceSpans: [
       {
@@ -203,14 +259,18 @@ export function buildOtlpTracePayload(params: {
               for (const [k, v] of Object.entries(s.attributes ?? {})) {
                 if (v !== undefined) attrs.push(toOtlpAttribute(k, v));
               }
+              const safeStartMs = Number.isFinite(s.startTimeMs) ? Math.max(0, Math.floor(s.startTimeMs)) : 0;
+              const safeEndMs = Number.isFinite(s.endTimeMs)
+                ? Math.max(safeStartMs, Math.floor(s.endTimeMs))
+                : safeStartMs;
               return {
                 traceId: s.traceId,
                 spanId: s.spanId,
                 ...(s.parentSpanId ? { parentSpanId: s.parentSpanId } : {}),
-                name: s.name,
+                name: s.name.slice(0, 128),
                 kind: s.kind ?? 2,
-                startTimeUnixNano: `${BigInt(Math.max(0, Math.floor(s.startTimeMs))) * 1_000_000n}`,
-                endTimeUnixNano: `${BigInt(Math.max(s.startTimeMs, Math.floor(s.endTimeMs))) * 1_000_000n}`,
+                startTimeUnixNano: `${BigInt(safeStartMs) * 1_000_000n}`,
+                endTimeUnixNano: `${BigInt(safeEndMs) * 1_000_000n}`,
                 attributes: attrs,
                 status:
                   s.statusOk === false
@@ -258,17 +318,22 @@ export function sanitizeErrorMessageForSpan(errOrMsg: unknown, fallback = ''): s
 export function sanitizeUrlForSpan(rawUrl: string): string {
   const trimmed = rawUrl.trim();
   if (!trimmed) return '';
+  if (trimmed.toLowerCase().startsWith('blob:')) {
+    const inner = sanitizeUrlForSpan(trimmed.slice(5));
+    return (inner ? `blob:${inner}` : 'blob:').slice(0, 512);
+  }
   try {
     const u = new URL(trimmed);
     if (u.origin && u.origin !== 'null') {
-      return `${u.origin}${u.pathname}`;
+      return `${u.origin}${u.pathname}`.slice(0, 512);
     }
   } catch {
     // Fallback for malformed URLs below
   }
   return redactInlineSecrets(trimmed)
     .replace(/:\/\/[^/?#\s]+@/g, '://')
-    .replace(/[?#].*$/, '');
+    .replace(/[?#].*$/, '')
+    .slice(0, 512);
 }
 
 /** Sanitizes span attributes by redacting secret keys/values and stripping URL query/userinfo. */
@@ -303,52 +368,63 @@ export function buildCrawlChildSpans(params: {
   replyText: string;
 }): OtlpSpanInput[] {
   const out: OtlpSpanInput[] = [];
+  const safeEndMs = Number.isFinite(params.endTimeMs) ? Math.max(0, Math.floor(params.endTimeMs)) : Date.now();
   try {
     const parsed = JSON.parse(params.replyText) as {
       results?: Array<{
         id?: string;
         url?: string;
-        kind?: string;
-        status?: number;
-        outcome?: string;
-        durationMs?: number;
+        kind?: unknown;
+        status?: unknown;
+        outcome?: unknown;
+        durationMs?: unknown;
         rendered?: boolean;
-        waf?: { vendor?: string };
+        waf?: { vendor?: unknown };
         timing?: {
-          dnsMs?: number;
-          connectMs?: number;
-          tlsMs?: number;
-          ttfbMs?: number;
+          dnsMs?: unknown;
+          connectMs?: unknown;
+          tlsMs?: unknown;
+          ttfbMs?: unknown;
           reused?: boolean;
-          proto?: string;
+          proto?: unknown;
         };
       }>;
     };
     for (const r of (parsed.results ?? []).slice(0, 32)) {
-      const dur = Math.max(1, Number(r.durationMs ?? r.timing?.ttfbMs ?? 1));
-      const safeUrl = sanitizeUrlForSpan(r.url ?? '');
+      const rawDur = Number(r.durationMs ?? r.timing?.ttfbMs ?? 1);
+      const dur = Number.isFinite(rawDur) ? Math.max(1, Math.min(86_400_000, Math.floor(rawDur))) : 1;
+      const safeKind =
+        typeof r.kind === 'string' && /^[a-z0-9_-]{1,24}$/i.test(r.kind.trim()) ? r.kind.trim().toLowerCase() : 'page';
+      const rawStatus = Number(r.status);
+      const safeStatus = Number.isFinite(rawStatus) ? Math.max(0, Math.min(999, Math.floor(rawStatus))) : 0;
+      const safeOutcome = typeof r.outcome === 'string' ? r.outcome : 'unknown';
+      const safeUrl = sanitizeUrlForSpan(typeof r.url === 'string' ? r.url : '');
+      const dnsMs = Number(r.timing?.dnsMs);
+      const connectMs = Number(r.timing?.connectMs);
+      const tlsMs = Number(r.timing?.tlsMs);
+      const ttfbMs = Number(r.timing?.ttfbMs);
       out.push({
         traceId: params.traceId,
         spanId: randomHex(8),
         parentSpanId: params.parentSpanId,
-        name: `edgefetch.fetch.${r.kind ?? 'page'}`,
+        name: `edgefetch.fetch.${safeKind}`,
         kind: 3,
-        startTimeMs: Math.max(0, params.endTimeMs - dur),
-        endTimeMs: params.endTimeMs,
-        statusOk: r.outcome === 'ok' || r.outcome === 'gone' || r.outcome === 'skip',
+        startTimeMs: Math.max(0, safeEndMs - dur),
+        endTimeMs: safeEndMs,
+        statusOk: safeOutcome === 'ok' || safeOutcome === 'gone' || safeOutcome === 'skip',
         attributes: sanitizeSpanAttributes({
           'url.full': safeUrl,
-          'http.response.status_code': r.status ?? 0,
+          'http.response.status_code': safeStatus,
           'crawler.via': params.via,
-          'crawler.outcome': r.outcome ?? 'unknown',
+          'crawler.outcome': safeOutcome,
           'crawler.rendered': Boolean(r.rendered),
           ...(typeof r.waf?.vendor === 'string' && r.waf.vendor ? { 'edgefetch.waf.vendor': r.waf.vendor } : {}),
-          'net.dns_ms': r.timing?.dnsMs ?? 0,
-          'net.connect_ms': r.timing?.connectMs ?? 0,
-          'net.tls_ms': r.timing?.tlsMs ?? 0,
-          'net.ttfb_ms': r.timing?.ttfbMs ?? 0,
+          'net.dns_ms': Number.isFinite(dnsMs) ? Math.max(0, Math.floor(dnsMs)) : 0,
+          'net.connect_ms': Number.isFinite(connectMs) ? Math.max(0, Math.floor(connectMs)) : 0,
+          'net.tls_ms': Number.isFinite(tlsMs) ? Math.max(0, Math.floor(tlsMs)) : 0,
+          'net.ttfb_ms': Number.isFinite(ttfbMs) ? Math.max(0, Math.floor(ttfbMs)) : 0,
           'net.conn_reused': Boolean(r.timing?.reused),
-          ...(r.timing?.proto ? { 'network.protocol.name': r.timing.proto } : {}),
+          ...(typeof r.timing?.proto === 'string' && r.timing.proto ? { 'network.protocol.name': r.timing.proto } : {}),
         }),
       });
     }
@@ -367,6 +443,7 @@ export async function flushOtlpSpans(params: {
   if (params.spans.length === 0) return false;
   const tracesUrl = resolveOtlpTracesUrl(params.env.OTEL_EXPORTER_OTLP_ENDPOINT);
   if (!tracesUrl) return false;
+  if (inflightOtlpExports >= MAX_INFLIGHT_OTLP_EXPORTS) return false;
 
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -382,9 +459,11 @@ export async function flushOtlpSpans(params: {
     ctrl.abort(new DOMException('OTLP export timed out', 'TimeoutError'));
   }, 4_000);
   (timer as { unref?: () => void }).unref?.();
+  inflightOtlpExports++;
   try {
     const res = await doFetch(tracesUrl, {
       method: 'POST',
+      redirect: 'manual',
       headers,
       body: JSON.stringify(payload),
       signal: ctrl.signal,
@@ -394,8 +473,71 @@ export async function flushOtlpSpans(params: {
   } catch {
     return false;
   } finally {
+    inflightOtlpExports = Math.max(0, inflightOtlpExports - 1);
     clearTimeout(timer);
   }
+}
+
+const PROTECTED_ROUTE_SPAN_NAMES: ReadonlySet<string> = new Set([
+  'edgefetch.scrape',
+  'edgefetch.batch_scrape',
+  'edgefetch.ingest_tab',
+  'edgefetch.extract',
+  'edgefetch.search',
+  'edgefetch.collection_search',
+  'edgefetch.jobs',
+  'edgefetch.catalog',
+  'edgefetch.map',
+  'edgefetch.crawl',
+  'edgefetch.interact',
+  'edgefetch.agent',
+  'edgefetch.agents',
+  'edgefetch.fetch',
+  'edgefetch.capabilities',
+  'edgefetch.extractors',
+  'edgefetch.mcp_registry',
+  'edgefetch.mcp_query',
+  'edgefetch.hosts',
+  'edgefetch.artifacts',
+  'edgefetch.mcp.tool',
+  'edgefetch.dispatch',
+]);
+
+function classifyBatchAuthStatus(
+  batch: OtlpSpanInput[],
+  explicitAuthenticated: boolean,
+): 'authenticated' | 'unauth_rejected' | 'public_unauth' {
+  if (explicitAuthenticated) return 'authenticated';
+  const serverHttpSpan = batch.find((s) => s.name === 'edgefetch.http' && s.kind === 2);
+  if (!serverHttpSpan) {
+    // Non-HTTP background / direct unit-test tracer spans are caller-controlled programmatic traces
+    return 'authenticated';
+  }
+  const httpStatus = Number(serverHttpSpan.attributes?.['http.response.status_code'] ?? 0);
+  const hasAuthenticatedWork = batch.some(
+    (s) =>
+      s.kind === 3 ||
+      s.name === 'edgefetch.dispatch' ||
+      s.name.startsWith('edgefetch.fetch.') ||
+      s.name === 'edgefetch.mcp.tool' ||
+      s.name.startsWith('edgefetch.agent.') ||
+      s.attributes?.['admin.outcome'] === 'authenticated' ||
+      (httpStatus !== 401 && httpStatus !== 403 && PROTECTED_ROUTE_SPAN_NAMES.has(s.name)),
+  );
+  if (hasAuthenticatedWork) return 'authenticated';
+  if (httpStatus === 401 || httpStatus === 403) {
+    // Preserve rate-limited OTLP `/admin` security audit spans (`edgefetch.admin.*` unauthorized/invalid_csrf)
+    // while strictly dropping all other unauthenticated `401`/`403` requests (`0` OTLP & `0` dev-telemetry).
+    const hasAdminAuditSpan = batch.some((s) => s.name.startsWith('edgefetch.admin.'));
+    return hasAdminAuditSpan ? 'public_unauth' : 'unauth_rejected';
+  }
+  const hasAdminAuthenticated =
+    httpStatus >= 200 &&
+    httpStatus < 400 &&
+    typeof serverHttpSpan.attributes?.['url.path'] === 'string' &&
+    serverHttpSpan.attributes['url.path'].startsWith('/admin/api/');
+  if (hasAdminAuthenticated) return 'authenticated';
+  return 'public_unauth';
 }
 
 interface RequestTracerState {
@@ -404,6 +546,7 @@ interface RequestTracerState {
   spans: OtlpSpanInput[];
   openSpans: Set<ActiveSpanHandle>;
   suppressed: boolean;
+  authenticated: boolean;
   rootSpanClaimed: boolean;
 }
 
@@ -445,17 +588,21 @@ export class RequestTracer {
 
   static fromRequest(
     request: Request,
-    opts?: { suppress?: boolean; suppressWhenUnsampledHealth?: boolean },
+    opts?: { suppress?: boolean; suppressWhenUnsampledHealth?: boolean; authenticated?: boolean },
   ): RequestTracer {
     const { context, headers } = createRequestTraceContext(request);
     let suppress = Boolean(opts?.suppress);
-    if (!suppress && opts?.suppressWhenUnsampledHealth && request.method === 'GET' && !request.headers.get('traceparent')) {
+    const methodUpper = request.method.toUpperCase();
+    if (!suppress && opts?.suppressWhenUnsampledHealth && (methodUpper === 'GET' || methodUpper === 'HEAD')) {
       try {
-        if (new URL(request.url).pathname === '/health') suppress = true;
+        const pathname = new URL(request.url).pathname;
+        if (pathname === '/health' || pathname === '/readyz') suppress = true;
       } catch {
         // ignore invalid URL
       }
     }
+    const preVerified =
+      Boolean(opts?.authenticated) || request.headers.get('x-ef-verified-auth') === '1';
     return new RequestTracer(
       {
         rootContext: context,
@@ -463,13 +610,18 @@ export class RequestTracer {
         spans: [],
         openSpans: new Set<ActiveSpanHandle>(),
         suppressed: suppress,
+        authenticated: preVerified,
         rootSpanClaimed: false,
       },
       context.spanId,
     );
   }
 
-  static fromContext(context: TraceContext, requestId?: string, opts?: { suppress?: boolean }): RequestTracer {
+  static fromContext(
+    context: TraceContext,
+    requestId?: string,
+    opts?: { suppress?: boolean; authenticated?: boolean },
+  ): RequestTracer {
     const parentHandle: ActiveSpanHandle = {
       traceId: context.traceId,
       spanId: context.spanId,
@@ -484,10 +636,11 @@ export class RequestTracer {
     return new RequestTracer(
       {
         rootContext: { ...context },
-        requestId: requestId ?? context.spanId,
+        requestId: sanitizeInboundRequestId(requestId) ?? context.spanId,
         spans: [],
         openSpans: new Set<ActiveSpanHandle>(),
         suppressed: Boolean(opts?.suppress),
+        authenticated: opts?.authenticated ?? true,
         rootSpanClaimed: true,
       },
       context.spanId,
@@ -517,6 +670,14 @@ export class RequestTracer {
 
   get suppressed(): boolean {
     return this.state.suppressed;
+  }
+
+  get authenticated(): boolean {
+    return this.state.authenticated;
+  }
+
+  markAuthenticated(authenticated = true): void {
+    this.state.authenticated = authenticated;
   }
 
   get context(): TraceContext {
@@ -550,7 +711,8 @@ export class RequestTracer {
       this.currentSpan !== undefined
         ? this.currentSpan.spanId
         : this.state.rootContext.parentSpanId;
-    const startTimeMs = opts?.startTimeMs ?? Date.now();
+    const rawStart = opts?.startTimeMs ?? Date.now();
+    const startTimeMs = Number.isFinite(rawStart) ? rawStart : Date.now();
     const kind = opts?.kind ?? 1;
     const attributes: Record<string, string | number | boolean> = sanitizeSpanAttributes(opts?.attributes);
     let statusOk = true;
@@ -588,6 +750,7 @@ export class RequestTracer {
         ended = true;
         state.openSpans.delete(handle);
         if (state.suppressed || !state.rootContext.sampled) return;
+        const safeEnd = Number.isFinite(endTimeMs) ? Math.max(startTimeMs, endTimeMs) : startTimeMs;
         state.spans.push({
           traceId: state.rootContext.traceId,
           spanId,
@@ -595,7 +758,7 @@ export class RequestTracer {
           name,
           kind,
           startTimeMs,
-          endTimeMs: Math.max(startTimeMs, endTimeMs),
+          endTimeMs: safeEnd,
           statusOk,
           ...(errorMessage ? { errorMessage } : {}),
           attributes,
@@ -689,20 +852,33 @@ export class RequestTracer {
     if (batch.length === 0 || this.state.suppressed || !this.sampled) {
       return false;
     }
+
+    const authClass = classifyBatchAuthStatus(batch, this.state.authenticated);
+    // Never emit outbound OTLP or Dev-Telemetry network POSTs on unauthenticated `401`/`403` gate rejections!
+    if (authClass === 'unauth_rejected') {
+      return false;
+    }
+    const allowOtlp = authClass === 'authenticated' || consumeUnauthOtlpBudget();
+    const allowDevTelemetry = authClass === 'authenticated';
+
     const doFlush = Promise.all([
-      flushOtlpSpans({
-        env: params.env,
-        spans: batch,
-        ...(params.fetchFn ?? params.env.SAFE_FETCH ? { fetchFn: params.fetchFn ?? params.env.SAFE_FETCH } : {}),
-      }),
-      flushDevErrorTelemetry({
-        env: params.env,
-        spans: batch,
-        dbSettingValue: params.devTelemetrySetting,
-        ...(params.fetchFn ?? params.env.SAFE_PUBLIC_FETCH ?? params.env.SAFE_FETCH
-          ? { fetchFn: params.fetchFn ?? params.env.SAFE_PUBLIC_FETCH ?? params.env.SAFE_FETCH }
-          : {}),
-      }),
+      allowOtlp
+        ? flushOtlpSpans({
+            env: params.env,
+            spans: batch,
+            ...(params.fetchFn ?? params.env.SAFE_FETCH ? { fetchFn: params.fetchFn ?? params.env.SAFE_FETCH } : {}),
+          })
+        : Promise.resolve(false),
+      allowDevTelemetry
+        ? flushDevErrorTelemetry({
+            env: params.env,
+            spans: batch,
+            dbSettingValue: params.devTelemetrySetting,
+            ...(params.fetchFn ?? params.env.SAFE_PUBLIC_FETCH ?? params.env.SAFE_FETCH
+              ? { fetchFn: params.fetchFn ?? params.env.SAFE_PUBLIC_FETCH ?? params.env.SAFE_FETCH }
+              : {}),
+          })
+        : Promise.resolve(false),
     ]).then(([otlpOk, devTelOk]) => otlpOk || devTelOk);
     if (params.ctx?.waitUntil) {
       params.ctx.waitUntil(doFlush);

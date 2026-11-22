@@ -100,7 +100,14 @@ import {
   type StoredMcpServerRow,
 } from './mcp-vault';
 import { handleOpenApiRoute } from './openapi';
-import { authorizeMcpRequest, createSqliteOAuthStore, handleOAuthRoute, OAUTH_SQLITE_SCHEMA } from './oauth';
+import {
+  authorizeMcpRequest,
+  createSqliteOAuthStore,
+  getActiveCallerAuthContext,
+  handleOAuthRoute,
+  OAUTH_SQLITE_SCHEMA,
+  runWithCallerAuthContext,
+} from './oauth';
 import type {
   HubUserRecord,
   OAuthClientRecord,
@@ -147,7 +154,10 @@ import {
   resolveUserCollectionId,
   type ExtractRequestPayload,
 } from './search-index';
-import { executeSearchCall, type SearchRequestPayload } from './web-search';
+import {
+  executeSearchCall,
+  type SearchRequestPayload,
+} from './web-search';
 import { listRegisteredAdapters } from './extractors/registry';
 import {
   buildCapabilities,
@@ -1285,9 +1295,9 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const openApiRes = handleOpenApiRoute(request, url, '2.7.0');
+      const openApiRes = handleOpenApiRoute(request, url, HUB_VERSION);
       if (openApiRes) return openApiRes;
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.7.0');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, HUB_VERSION);
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1430,6 +1440,7 @@ export default {
         ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
         ...(sessionSecret ? { sessionSecret } : {}),
         githubAuthEnabled: isGitHubAuthConfigured(env),
+        githubAuthEnv: env,
         serviceName: 'EdgeFetch Hub',
         redirectAllowlist: parseHostAllowlist(env.OAUTH_REDIRECT_ALLOWLIST),
         onEvent: (ev) => activity.recordEvent({ ...ev, details: sanitizeDetails(ev.details) }),
@@ -1439,7 +1450,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.7.0',
+          serverVersion: HUB_VERSION,
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1450,17 +1461,29 @@ export default {
           defaultTarget: 'auto',
           listFleet: async () => {
             const state = await hub().getPortalState(Date.now());
+            if (getActiveCallerAuthContext()?.role === 'member') {
+              return { connected: state.connected, agents: [], affinities: [] };
+            }
             return { connected: state.connected, agents: state.agents, affinities: state.affinities };
           },
           executeFetch: ({ target, site, body, principal }) =>
             executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`),
           executeScrape: async ({ args, principal, userId }) => {
             const effectiveUserId = userId ?? resolveCallerUserId({ principal });
-            if (typeof args.url === 'string' && args.url.trim() && args.useConnectedMcp !== false) {
+            const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanArgs } = args as Record<string, unknown>;
+            const hasCallerCookies =
+              (typeof cleanArgs.cookies === 'string' && cleanArgs.cookies.trim().length > 0) ||
+              (Array.isArray(cleanArgs.cookies) && cleanArgs.cookies.length > 0) ||
+              (cleanArgs.cookies !== null && typeof cleanArgs.cookies === 'object' && Object.keys(cleanArgs.cookies as object).length > 0);
+            if (hasCallerCookies || cleanArgs.auth || cleanArgs.preferMcp === true || effectiveUserId !== 'owner') {
+              cleanArgs.visibility = 'private';
+            }
+            if (typeof cleanArgs.url === 'string' && cleanArgs.url.trim() && cleanArgs.useConnectedMcp !== false) {
               const mcpOut = await tryScrapeViaConnectedMcp({
                 userId: effectiveUserId,
-                targetUrl: args.url.trim(),
-                ...(typeof args.query === 'string' ? { query: args.query } : {}),
+                targetUrl: cleanArgs.url.trim(),
+                ...(typeof cleanArgs.query === 'string' ? { query: cleanArgs.query } : {}),
+                preferMcp: cleanArgs.preferMcp === true,
                 vaultStore,
                 vaultMasterKey: env.VAULT_MASTER_KEY,
                 fetchFn: safePublicFetch,
@@ -1469,7 +1492,7 @@ export default {
               if (mcpOut) return { status: mcpOut.status, body: mcpOut.body };
             }
             const out = await executeScrapeCall({
-              payload: args as ScrapeRequestPayload,
+              payload: cleanArgs as ScrapeRequestPayload,
               env,
               executeHubFetch,
               selfHost: url.hostname,
@@ -1512,10 +1535,11 @@ export default {
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeCrawl: async ({ args, principal, userId }) => {
+            const effectiveUserId = userId ?? resolveCallerUserId({ principal });
             const existingId = typeof args.crawlId === 'string' ? args.crawlId.trim() : '';
             if (existingId) {
               if (args.cancel === true) {
-                const cRes = await cancelCrawlJob(existingId, env.META);
+                const cRes = await cancelCrawlJob(existingId, env.META, effectiveUserId);
                 return { status: cRes.status, body: { ok: cRes.ok, crawlId: existingId, status: 'cancelled' } };
               }
               const st = await getCrawlJobStatus({
@@ -1524,36 +1548,64 @@ export default {
                 bucket: env.ARTIFACTS,
                 offset: typeof args.offset === 'number' ? args.offset : 0,
                 ...(typeof args.limit === 'number' && Number.isFinite(args.limit) ? { limit: args.limit } : {}),
+                userId: effectiveUserId,
               });
               return st.ok ? { status: 200, body: st.crawl } : { status: st.status, body: { ok: false, error: st.error } };
             }
             const crawlArgs: Record<string, unknown> = { ...args };
             let displayCollectionId: string | undefined;
             if (typeof crawlArgs.collectionId === 'string' && crawlArgs.collectionId.trim()) {
-              const resolvedColl = resolveUserCollectionId(crawlArgs.collectionId, userId);
+              const resolvedColl = resolveUserCollectionId(crawlArgs.collectionId, effectiveUserId);
               if (!resolvedColl.ok) {
                 return { status: resolvedColl.status, body: { ok: false, error: resolvedColl.error, message: resolvedColl.message } };
               }
               crawlArgs.collectionId = resolvedColl.scopedId;
               displayCollectionId = resolvedColl.displayId;
             }
-            const created = await createCrawlJob({ payload: crawlArgs, metaDb: env.META, selfHost: url.hostname });
+            const created = await createCrawlJob({
+              payload: crawlArgs,
+              metaDb: env.META,
+              selfHost: url.hostname,
+              userId: effectiveUserId,
+            });
             if (!created.ok) {
               return { status: created.status, body: { ok: false, error: created.error, message: created.message } };
             }
-            const jobPromise = executeCrawlJob({
-              crawlId: created.crawlId,
-              rootUrl: created.rootUrl,
-              options: created.options,
-              env,
-              executeHubFetch,
-              selfHost: url.hostname,
-              waitUntilBounded: Boolean(trackedCtx?.waitUntil),
-            });
-            if (trackedCtx?.waitUntil) {
-              trackedCtx.waitUntil(jobPromise);
-            } else {
-              await jobPromise;
+            const resolvedCollectionId = displayCollectionId ?? created.options.collectionId;
+            const pollHint = 'Call crawl with { crawlId } to poll progress';
+
+            let dispatchedViaWorkflow = false;
+            if (env.CRAWL) {
+              try {
+                await env.CRAWL.create({
+                  id: created.crawlId,
+                  params: {
+                    crawlId: created.crawlId,
+                    rootUrl: created.rootUrl,
+                    options: created.options,
+                    selfHost: url.hostname,
+                  },
+                });
+                dispatchedViaWorkflow = true;
+              } catch {
+                dispatchedViaWorkflow = false;
+              }
+            }
+            if (!dispatchedViaWorkflow) {
+              const jobPromise = executeCrawlJob({
+                crawlId: created.crawlId,
+                rootUrl: created.rootUrl,
+                options: created.options,
+                env,
+                executeHubFetch,
+                selfHost: url.hostname,
+                waitUntilBounded: Boolean(trackedCtx?.waitUntil),
+              });
+              if (trackedCtx?.waitUntil) {
+                trackedCtx.waitUntil(jobPromise);
+              } else {
+                await jobPromise;
+              }
             }
             return {
               status: 202,
@@ -1561,9 +1613,8 @@ export default {
                 ok: true,
                 crawlId: created.crawlId,
                 status: 'queued',
-                collectionId: displayCollectionId ?? created.options.collectionId,
-                pollUrl: `${url.origin}/v1/crawl/${created.crawlId}`,
-                principal: principal ?? 'client',
+                collectionId: resolvedCollectionId,
+                pollHint,
               },
             };
           },
@@ -1608,12 +1659,15 @@ export default {
             return findRelevantAdapters({ query, category, limit }) as unknown as Array<Record<string, unknown>>;
           },
           executeCatalog: async ({ args, principal }) => {
+            const effectiveUserId = getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
             return await executeCatalogCall({
               payload: args as CatalogCallPayload,
               env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
               executeHubFetch: makeCatalogHubFetch(`mcp-catalog:${principal ?? 'client'}`),
               selfHost: url.hostname,
               principal: principal ?? 'mcp',
+              userId: effectiveUserId,
+              devTelemetrySetting: getCachedDevTelemetrySetting,
               ...(trackedCtx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } } : {}),
             });
           },
@@ -1637,7 +1691,7 @@ export default {
               : (p: Promise<unknown>) => {
                   void p
                     .catch(() => undefined)
-                    .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
+                    .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
                 };
             const out = await startOrExecuteAgentCall({
               payload: args,
@@ -1666,6 +1720,18 @@ export default {
             return { status: out.status, body: out as unknown as Record<string, unknown> };
           },
           executeQueryMcp: async ({ args, principal, userId }) => {
+            const activeAuth = getActiveCallerAuthContext();
+            const action = (args as QueryMcpCallInput).action ?? 'list_connected';
+            if (action === 'call_tool' && activeAuth && !activeAuth.scopes.includes('mcp:call')) {
+              return {
+                status: 403,
+                body: {
+                  ok: false,
+                  error: 'insufficient_scope',
+                  message: 'OAuth scope mcp:call is required for action="call_tool"',
+                },
+              };
+            }
             const effectiveUserId = userId ?? resolveCallerUserId({ principal });
             return await executeFederatedMcpQuery({
               userId: effectiveUserId,
@@ -1708,7 +1774,13 @@ export default {
                   });
                   return res.ok
                     ? { ok: true as const, page: res.page as unknown as Record<string, unknown> }
-                    : { ok: false as const, status: res.status, error: res.error };
+                    : {
+                        ok: false as const,
+                        status: res.status,
+                        via: 'hub' as const,
+                        error: res.error,
+                        ...(res.message ? { message: res.message } : {}),
+                      };
                 },
               }
             : {}),
@@ -1741,6 +1813,16 @@ export default {
           const dbSettingValue =
             typeof stub.getHubSetting === 'function' ? await stub.getHubSetting(DEV_TELEMETRY_SETTING_KEY) : null;
           return resolveDevTelemetryState({ env, dbSettingValue });
+        },
+        getHubSetting: async (k) => {
+          const stub = hub() as unknown as { getHubSetting?: (key: string) => Promise<string | null> };
+          return typeof stub.getHubSetting === 'function' ? await stub.getHubSetting(k) : null;
+        },
+        setHubSetting: async (k, v) => {
+          const stub = hub() as unknown as { setHubSetting?: (key: string, val: string) => Promise<void> };
+          if (typeof stub.setHubSetting === 'function') {
+            await stub.setHubSetting(k, v);
+          }
         },
         setTelemetryOptIn: async (enabled) => {
           const val = enabled ? '1' : '0';
@@ -1794,7 +1876,7 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
-          return Response.json(buildCapabilities(env, '2.7.0'), {
+          return Response.json(buildCapabilities(env, HUB_VERSION), {
             status: 200,
             headers: { 'cache-control': 'no-store' },
           });
@@ -1845,6 +1927,9 @@ export default {
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
             return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
           }
+          if (auth.role === 'member') {
+            return Response.json({ ok: true, hosts: [] }, { status: 200, headers: { 'cache-control': 'no-store' } });
+          }
           const rawLimit = Number(url.searchParams.get('limit') ?? 100);
           const safeLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 100;
           const hosts = await hub().listHostHealth(safeLimit);
@@ -1860,7 +1945,7 @@ export default {
             : (p: Promise<unknown>) => {
                 void p
                   .catch(() => undefined)
-                  .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
+                  .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
               };
           const res = await handleCompatRoutes({
             request,
@@ -1874,7 +1959,7 @@ export default {
           });
           if (res && (res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
             return wrapSseResponseWithFlush(res, () => {
-              const p = rootTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+              const p = flushTracerWithTelemetry(rootTracer);
               if (ctx?.waitUntil) ctx.waitUntil(p);
               return p;
             });
@@ -1972,10 +2057,14 @@ export default {
           }
           const action = payload.action ?? 'list_connected';
           if (action === 'call_tool') {
-            if (!auth.scopes.includes('crawl:fetch')) {
+            if (!auth.scopes.includes('mcp:call')) {
               return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
             }
-          } else if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+          } else if (
+            !auth.scopes.includes('crawl:read') &&
+            !auth.scopes.includes('crawl:fetch') &&
+            !auth.scopes.includes('mcp:call')
+          ) {
             return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
           }
           const userId = resolveCallerUserId(auth as { userId?: string; principal?: string });
@@ -2025,11 +2114,28 @@ export default {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
           const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
-          if (typeof payload.url === 'string' && payload.url.trim() && (payload as Record<string, unknown>).useConnectedMcp !== false) {
+          const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanScrapeObj } =
+            payload as unknown as Record<string, unknown>;
+          const hasCallerCookies =
+            (typeof cleanScrapeObj.cookies === 'string' && cleanScrapeObj.cookies.trim().length > 0) ||
+            (Array.isArray(cleanScrapeObj.cookies) && cleanScrapeObj.cookies.length > 0) ||
+            (cleanScrapeObj.cookies !== null &&
+              typeof cleanScrapeObj.cookies === 'object' &&
+              Object.keys(cleanScrapeObj.cookies as object).length > 0);
+          if (hasCallerCookies || cleanScrapeObj.auth || cleanScrapeObj.preferMcp === true || callerUserId !== 'owner') {
+            cleanScrapeObj.visibility = 'private';
+          }
+          const cleanPayload = cleanScrapeObj as ScrapeRequestPayload;
+          if (
+            typeof cleanPayload.url === 'string' &&
+            cleanPayload.url.trim() &&
+            cleanScrapeObj.useConnectedMcp !== false
+          ) {
             const mcpOut = await tryScrapeViaConnectedMcp({
               userId: callerUserId,
-              targetUrl: payload.url.trim(),
-              ...(typeof payload.query === 'string' ? { query: payload.query } : {}),
+              targetUrl: cleanPayload.url.trim(),
+              ...(typeof cleanPayload.query === 'string' ? { query: cleanPayload.query } : {}),
+              preferMcp: cleanScrapeObj.preferMcp === true,
               vaultStore,
               vaultMasterKey: env.VAULT_MASTER_KEY,
               fetchFn: safePublicFetch,
@@ -2046,17 +2152,18 @@ export default {
             }
           }
           const out = await executeScrapeCall({
-            payload,
+            payload: cleanPayload,
             env,
             executeHubFetch,
             selfHost: url.hostname,
             source: `scrape:${auth.principal}`,
             userId: auth.userId,
           });
+          const isPrivateScrape = (out.body as { visibility?: string }).visibility === 'private';
           return Response.json(out.body, {
             status: out.status,
             headers: {
-              'cache-control': 'no-store',
+              'cache-control': isPrivateScrape ? 'private, no-store' : 'no-store',
               'x-crawler-via': out.via,
               ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
             },
@@ -2456,6 +2563,7 @@ export default {
           const batchOut = await startOrExecuteBatchScrape({
             payload,
             selfHost: url.hostname,
+            userId: auth.userId,
             executeScrape: async (scArgs) => {
               const res = await executeScrapeCall({
                 payload: scArgs as ScrapeRequestPayload,
@@ -2508,7 +2616,7 @@ export default {
           }
           const batchId = rawBatchId.trim();
           if (request.method === 'GET') {
-            const job = getBatchScrapeStatus(batchId);
+            const job = getBatchScrapeStatus(batchId, auth.userId);
             if (!job) return Response.json({ ok: false, error: 'batch_not_found' }, { status: 404 });
             return Response.json({ ok: true, ...job }, { status: 200, headers: { 'cache-control': 'no-store' } });
           }
@@ -2516,7 +2624,7 @@ export default {
             if (!auth.scopes.includes('crawl:fetch')) {
               return Response.json({ ok: false, error: 'insufficient_scope' }, { status: 403 });
             }
-            const ok = cancelBatchScrape(batchId);
+            const ok = cancelBatchScrape(batchId, auth.userId);
             return Response.json({ ok, id: batchId, status: 'cancelled' }, { status: ok ? 200 : 404 });
           }
           return Response.json({ error: 'not_found' }, { status: 404 });
@@ -2559,7 +2667,7 @@ export default {
             : (p: Promise<unknown>) => {
                 void p
                   .catch(() => undefined)
-                  .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
+                  .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
               };
           const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           const out = await startOrExecuteAgentCall({
@@ -2576,7 +2684,7 @@ export default {
           });
           if (out.kind === 'sse') {
             return wrapSseResponseWithFlush(out.response, () => {
-              const p = rootTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+              const p = flushTracerWithTelemetry(rootTracer);
               if (ctx?.waitUntil) ctx.waitUntil(p);
               return p;
             });
@@ -2704,27 +2812,51 @@ export default {
             payload = { ...payload, collectionId: resolvedColl.scopedId };
             displayCollectionId = resolvedColl.displayId;
           }
-          const created = await createCrawlJob({ payload, metaDb: env.META, selfHost: url.hostname });
+          const created = await createCrawlJob({
+            payload,
+            metaDb: env.META,
+            selfHost: url.hostname,
+            userId: auth.userId,
+          });
           if (!created.ok) {
             return Response.json(
               { ok: false, error: created.error, message: created.message },
               { status: created.status, headers: { 'cache-control': 'no-store' } },
             );
           }
-          const jobPromise = executeCrawlJob({
-            crawlId: created.crawlId,
-            rootUrl: created.rootUrl,
-            options: created.options,
-            env,
-            executeHubFetch,
-            selfHost: url.hostname,
-          });
-          if (payload.sync === true) {
-            await jobPromise;
-          } else if (trackedCtx?.waitUntil) {
-            trackedCtx.waitUntil(jobPromise);
-          } else {
-            await jobPromise;
+          let startedViaWorkflow = false;
+          if (payload.sync !== true && env.CRAWL) {
+            try {
+              await env.CRAWL.create({
+                id: created.crawlId,
+                params: {
+                  crawlId: created.crawlId,
+                  rootUrl: created.rootUrl,
+                  options: created.options,
+                  selfHost: url.hostname,
+                },
+              });
+              startedViaWorkflow = true;
+            } catch {
+              startedViaWorkflow = false;
+            }
+          }
+          if (!startedViaWorkflow) {
+            const jobPromise = executeCrawlJob({
+              crawlId: created.crawlId,
+              rootUrl: created.rootUrl,
+              options: created.options,
+              env,
+              executeHubFetch,
+              selfHost: url.hostname,
+            });
+            if (payload.sync === true) {
+              await jobPromise;
+            } else if (trackedCtx?.waitUntil) {
+              trackedCtx.waitUntil(jobPromise);
+            } else {
+              await jobPromise;
+            }
           }
           return Response.json(
             {
@@ -2769,6 +2901,7 @@ export default {
               bucket: env.ARTIFACTS,
               offset: Number(url.searchParams.get('offset') ?? 0),
               limit: Number(url.searchParams.get('limit') ?? 25),
+              userId: auth.userId,
             });
             if (!st.ok) return Response.json({ ok: false, error: st.error }, { status: st.status });
             return Response.json({ ok: true, ...st.crawl }, { status: 200, headers: { 'cache-control': 'no-store' } });
@@ -2777,7 +2910,7 @@ export default {
             if (!auth.scopes.includes('crawl:fetch')) {
               return Response.json({ error: 'insufficient_scope' }, { status: 403 });
             }
-            const cRes = await cancelCrawlJob(crawlId, env.META);
+            const cRes = await cancelCrawlJob(crawlId, env.META, auth.userId);
             return Response.json({ ok: cRes.ok, id: crawlId, status: 'cancelled' }, { status: cRes.status });
           }
           return Response.json({ error: 'not_found' }, { status: 404 });
@@ -2951,6 +3084,8 @@ export default {
             executeHubFetch: makeCatalogHubFetch(`catalog:${auth.principal}`),
             selfHost: url.hostname,
             principal: auth.principal,
+            userId: auth.userId,
+            devTelemetrySetting: getCachedDevTelemetrySetting,
             ...(trackedCtx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } } : {}),
           });
           return Response.json(out.body, {
@@ -3001,6 +3136,7 @@ export default {
                 : {}),
             ...(rawAvail === 'true' || rawAvail === '1' ? { availableOnly: true } : {}),
             ...(query ? { query } : {}),
+            userId: auth.userId,
             env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
           });
           return Response.json(out.body, {
@@ -3035,6 +3171,7 @@ export default {
           const catalogId = rawCatalogId.trim();
           const out = await getCatalogStatus({
             catalogId,
+            userId: auth.userId,
             env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
           });
           return Response.json(out.body, {
@@ -3100,7 +3237,7 @@ export default {
             },
           },
           async (httpSpan) => {
-            const res = await routeRequest();
+            const res = await runWithCallerAuthContext(() => routeRequest(), undefined, env);
             httpSpan.setAttribute('http.response.status_code', res.status);
             httpSpan.setStatus(res.status < 500);
             return res;

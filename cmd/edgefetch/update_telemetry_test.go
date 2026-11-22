@@ -393,3 +393,146 @@ func TestWorkflowsPinExact40HexCommitSHAs(t *testing.T) {
 		}
 	}
 }
+
+func TestR7UpdateDowngradeGuardAndAtomicCrashRecovery(t *testing.T) {
+	priv, pubPEM := generateTestSigningKeyPEM(t)
+
+	oldLinuxPayload := []byte("#!/bin/sh\necho edgefetch-v2.6.2-old\n")
+	oldArchive := buildTestTarGz(t, "edgefetch", oldLinuxPayload)
+	oldSHA := sha256.Sum256(oldArchive)
+	checksums262 := fmt.Sprintf("%s  edgefetch_2.6.2_linux_amd64.tar.gz\n", hex.EncodeToString(oldSHA[:]))
+	sig262 := ed25519.Sign(priv, []byte(checksums262))
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/bartrumb/edgefetch/releases/latest":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"tag_name":"v2.6.2"}`))
+		case "/bartrumb/edgefetch/releases/download/v2.6.2/checksums.txt":
+			_, _ = w.Write([]byte(checksums262))
+		case "/bartrumb/edgefetch/releases/download/v2.6.2/checksums.txt.sig":
+			_, _ = w.Write(sig262)
+		case "/bartrumb/edgefetch/releases/download/v2.6.2/edgefetch_2.6.2_linux_amd64.tar.gz":
+			_, _ = w.Write(oldArchive)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	srvAddr := srv.Listener.Addr().String()
+	tlsClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: srv.Client().Transport.(*http.Transport).TLSClientConfig,
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, srvAddr)
+			},
+		},
+	}
+
+	tmpDir := t.TempDir()
+	linuxExe := filepath.Join(tmpDir, "edgefetch")
+	curBytes := []byte("current-v2.7.0-binary")
+	if err := os.WriteFile(linuxExe, curBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := updateDeps{
+		httpClient:      tlsClient,
+		allow:           func(*url.URL) error { return nil },
+		apiBaseURL:      srv.URL,
+		downloadBaseURL: srv.URL,
+		publicKeyPEM:    pubPEM,
+		currentVersion:  "2.7.0",
+		exePath:         linuxExe,
+		goos:            "linux",
+		goarch:          "amd64",
+	}
+
+	// 1. Implicit rollback via /releases/latest returning older tag v2.6.2 MUST fail closed without --allow-downgrade!
+	var outBuf, errBuf bytes.Buffer
+	if rc := runUpdateWithDeps(context.Background(), nil, &outBuf, &errBuf, deps); rc == 0 {
+		t.Fatal("SECURITY: expected implicit downgrade via /releases/latest to be refused")
+	}
+	if !strings.Contains(errBuf.String(), ErrDowngradeRefused.Error()) {
+		t.Fatalf("expected ErrDowngradeRefused on stderr, got %q", errBuf.String())
+	}
+	if got, _ := os.ReadFile(linuxExe); !bytes.Equal(got, curBytes) {
+		t.Fatal("SECURITY: binary modified despite refused implicit downgrade")
+	}
+
+	// 2. Explicit `--version v2.6.2` (< v2.7.0) without `--allow-downgrade` MUST also fail closed!
+	outBuf.Reset()
+	errBuf.Reset()
+	if rc := runUpdateWithDeps(context.Background(), []string{"--version", "v2.6.2"}, &outBuf, &errBuf, deps); rc == 0 {
+		t.Fatal("SECURITY: expected explicit --version v2.6.2 downgrade without --allow-downgrade to fail")
+	}
+	if !strings.Contains(errBuf.String(), ErrDowngradeRefused.Error()) {
+		t.Fatalf("expected ErrDowngradeRefused on stderr, got %q", errBuf.String())
+	}
+	if got, _ := os.ReadFile(linuxExe); !bytes.Equal(got, curBytes) {
+		t.Fatal("SECURITY: binary modified despite refused explicit downgrade")
+	}
+
+	// 3. `--check --json` on older /releases/latest succeeds cleanly with updateAvailable=false.
+	outBuf.Reset()
+	errBuf.Reset()
+	if rc := runUpdateWithDeps(context.Background(), []string{"--check", "--json"}, &outBuf, &errBuf, deps); rc != 0 {
+		t.Fatalf("expected --check to succeed when upstream tag is older: %s", errBuf.String())
+	}
+	if !strings.Contains(outBuf.String(), `"updateAvailable": false`) {
+		t.Fatalf("expected updateAvailable:false in --check output: %s", outBuf.String())
+	}
+
+	// 4. Explicit `--version v2.6.2 --allow-downgrade` succeeds via single-step Unix rename (no .old left behind)!
+	outBuf.Reset()
+	errBuf.Reset()
+	if rc := runUpdateWithDeps(context.Background(), []string{"--version", "v2.6.2", "--allow-downgrade"}, &outBuf, &errBuf, deps); rc != 0 {
+		t.Fatalf("expected --allow-downgrade to succeed: rc=%d stderr=%s", rc, errBuf.String())
+	}
+	if got, _ := os.ReadFile(linuxExe); !bytes.Equal(got, oldLinuxPayload) {
+		t.Fatalf("expected downgraded payload after --allow-downgrade, got %q", string(got))
+	}
+	if _, err := os.Lstat(linuxExe + ".old"); !os.IsNotExist(err) {
+		t.Fatalf("expected zero .old file on Unix single-step rename, got err=%v", err)
+	}
+
+	// 5. RecoverInterruptedUpdate heals missing target from .old and removes stale .old when target exists!
+	winExe := filepath.Join(tmpDir, "edgefetch-win.exe")
+	winOld := winExe + ".old"
+	backupBytes := []byte("healthy-previous-win-exe")
+	if err := os.WriteFile(winOld, backupBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecoverInterruptedUpdate(winExe); err != nil {
+		t.Fatalf("RecoverInterruptedUpdate restore failed: %v", err)
+	}
+	if got, err := os.ReadFile(winExe); err != nil || !bytes.Equal(got, backupBytes) {
+		t.Fatalf("expected RecoverInterruptedUpdate to restore %s from .old, got %q err=%v", winExe, string(got), err)
+	}
+	if _, err := os.Lstat(winOld); !os.IsNotExist(err) {
+		t.Fatalf("expected .old moved back to targetPath, got err=%v", err)
+	}
+
+	// Stale .old when target is healthy -> removed cleanly.
+	if err := os.WriteFile(winOld, []byte("stale-old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecoverInterruptedUpdate(winExe); err != nil {
+		t.Fatalf("RecoverInterruptedUpdate cleanup failed: %v", err)
+	}
+	if _, err := os.Lstat(winOld); !os.IsNotExist(err) {
+		t.Fatalf("expected stale .old removed, got err=%v", err)
+	}
+
+	// Pre-existing directory at .old is cleaned up on Windows AtomicReplaceExecutable.
+	if err := os.MkdirAll(filepath.Join(winOld, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := AtomicReplaceExecutable(winExe, []byte("updated-win-exe"), "windows"); err != nil {
+		t.Fatalf("AtomicReplaceExecutable windows with directory .old failed: %v", err)
+	}
+	if got, _ := os.ReadFile(winExe); string(got) != "updated-win-exe" {
+		t.Fatalf("unexpected winExe content: %q", string(got))
+	}
+}

@@ -1384,6 +1384,7 @@ export async function executeSearchCall(params: {
         urls: results.map((r) => r.url),
         query,
         chunksPerSource,
+        includeRawContent: true,
         maxAgeMs: 3_600_000,
         ephemeral: true,
         target: payload.target ?? 'auto',

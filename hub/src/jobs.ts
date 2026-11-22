@@ -1720,12 +1720,36 @@ export function detectWorkdayRedirectStub(rawBody: string, baseUrl: string): { r
   return null;
 }
 
+/** Returns true only when `rawHtml` contains at least one executable `<script>` tag (ignoring static JSON-LD, JSON data, templates, and MathJax TeX blocks). */
+export function hasExecutableScriptTag(rawHtml: string): boolean {
+  if (!/<script\b/i.test(rawHtml)) return false;
+  const scriptOpenRe = /<script\b([^>]{0,600})>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = scriptOpenRe.exec(rawHtml)) !== null) {
+    const attrs = m[1] ?? '';
+    const tm = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs);
+    const tVal = (tm?.[1] ?? tm?.[2] ?? tm?.[3] ?? '').trim().toLowerCase();
+    if (
+      tVal === 'application/ld+json' ||
+      tVal === 'application/json' ||
+      tVal === 'text/plain' ||
+      tVal === 'text/template' ||
+      tVal === 'text/x-template' ||
+      tVal.startsWith('math/tex')
+    ) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 /**
  * `P3`: Determines whether a `<script>`-bearing HTML page yielded a thin / filter-only shell that should automatically
  * upgrade to headless Chromium in `auto` mode (`< 80` words OR `> 60%` link-only / short filter-label lines).
  */
 export function isThinScriptedPage(rawHtml: string, extractedMarkdown: string): boolean {
-  if (!/<script\b/i.test(rawHtml)) return false;
+  if (!hasExecutableScriptTag(rawHtml)) return false;
   const trimmed = extractedMarkdown.trim();
   const words = (trimmed.match(/[\p{L}\p{N}_]+/gu) ?? []).length;
   if (words < 80) return true;
@@ -2196,14 +2220,41 @@ function sanitizeX402Identifier(raw: unknown, re: RegExp, maxLen: number): strin
   return s;
 }
 
+const ALLOWED_X402_ONCHAIN_ASSET_LABELS = new Set([
+  'USDC',
+  'USDC.e',
+  'USDT',
+  'DAI',
+  'PYUSD',
+  'EURC',
+  'USDP',
+  'FRAX',
+  'LUSD',
+  'WETH',
+  'ETH',
+  'WBTC',
+  'BTC',
+  'SAT',
+  'SATS',
+  'SOL',
+]);
+
+const ALLOWED_X402_FIAT_CURRENCIES = new Set(['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'NZD', 'SGD', 'HKD']);
+
 function isSafeX402AssetLabel(rawLabel: string): boolean {
   if (!rawLabel || /[^\x21-\x7e]/.test(rawLabel)) return false;
   if (DECEPTIVE_402_TOKEN_RE.test(rawLabel) || X402_INJECTION_PROSE_RE.test(rawLabel)) return false;
-  // Hex contract/token ID (`0xDeadBeefToken`, `0x8335...`), Solana base58 mint, or short clean ticker (`USDC`, `USDT`, `USDC.e`, `CUSTOM`)
+  // Explicit allowlist: verified `0x...` token/contract ID (`0xDeadBeefToken`, `0x8335...`), Solana base58 mint,
+  // or canonical case-checked crypto asset ticker (`USDC`, `USDC.e`, `USDT`, `DAI`, `WETH`, `SAT`, `SOL`) — NEVER arbitrary words (`PAIDUP`, `SETTLD`, `USDCE`, `USD`, `CENTS`)!
   if (/^0x[A-Za-z0-9]{4,64}$/.test(rawLabel)) return true;
   if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(rawLabel)) return true;
-  if (/^[A-Za-z0-9]{2,10}(?:\.[A-Za-z0-9]{1,4})?$/.test(rawLabel)) return true;
-  return false;
+  if (rawLabel === 'USDC.e') return true;
+  return ALLOWED_X402_ONCHAIN_ASSET_LABELS.has(rawLabel.toUpperCase()) && !rawLabel.includes('.');
+}
+
+function isSafeX402CurrencyLabel(rawLabel: string): boolean {
+  if (isSafeX402AssetLabel(rawLabel)) return true;
+  return ALLOWED_X402_FIAT_CURRENCIES.has(rawLabel.toUpperCase());
 }
 
 const KNOWN_MAINNET_USDC_NETWORKS: ReadonlySet<string> = new Set(
@@ -2662,7 +2713,7 @@ export function parseX402PaymentTerms(
         const cu = sanitizeX402String(rawV, 64);
         if (cu) {
           if (DECEPTIVE_402_TOKEN_RE.test(cu)) sawDeceptiveCurrency = true;
-          else if (isSafeX402AssetLabel(cu)) terms.currency = cu;
+          else if (isSafeX402CurrencyLabel(cu)) terms.currency = cu;
           else sawDeceptiveCurrency = true;
         }
       } else if (k === 'network' && !terms.network) {
@@ -2770,6 +2821,15 @@ export function buildBlockedInfo(
     };
   }
 
+  if (
+    outStr === 'dns_not_found' ||
+    /\b(?:enotfound|nxdomain|dns_not_found|eai_noname)\b|no such host|name or service not known|nodename nor servname provided|domain does not exist/i.test(
+      probStr,
+    )
+  ) {
+    return null;
+  }
+
   const isRobots = /robots\.txt/i.test(probStr) || outStr === 'robots_disallowed';
   const isChallenge =
     outStr === 'challenge' ||
@@ -2813,6 +2873,33 @@ export function buildBlockedInfo(
       host,
       suggestion:
         'openstreetmap.org disallows /node/, /way/, /relation/, and /api/ in robots.txt to protect community servers. Query Nominatim, the Overpass API, or bulk Planet.osm extracts instead.',
+    };
+  }
+
+  if (host === 'npr.org' || host.endsWith('.npr.org')) {
+    return {
+      reason,
+      host,
+      suggestion:
+        `${host} blocks automated HTML scraping via ${reason === 'robots' ? 'robots.txt' : 'bot protection'}. Fetch NPR's official public RSS feeds instead: \`https://feeds.npr.org/1001/rss.xml\` (News), \`https://feeds.npr.org/1003/rss.xml\` (US), or \`https://feeds.npr.org/1004/rss.xml\` (World).`,
+    };
+  }
+
+  if (host === 'bbc.com' || host.endsWith('.bbc.com') || host === 'bbc.co.uk' || host.endsWith('.bbc.co.uk')) {
+    return {
+      reason,
+      host,
+      suggestion:
+        `${host} restricts automated HTML scraping via ${reason === 'robots' ? 'robots.txt' : 'bot protection'}. Fetch BBC News's official public RSS feed instead: \`https://feeds.bbci.co.uk/news/rss.xml\` (or \`https://feeds.bbci.co.uk/news/world/rss.xml\`).`,
+    };
+  }
+
+  if (host === 'apnews.com' || host.endsWith('.apnews.com') || host === 'reuters.com' || host.endsWith('.reuters.com')) {
+    return {
+      reason,
+      host,
+      suggestion:
+        `${host} blocks automated HTML scraping via ${reason === 'robots' ? 'robots.txt' : 'anti-bot challenge'}. Do not retry this URL; use \`search\` or scrape official public broadcaster RSS feeds (\`https://www.cbsnews.com/latest/rss/main\`, \`https://feeds.nbcnews.com/nbcnews/public/news\`, \`https://feeds.npr.org/1001/rss.xml\`, \`https://feeds.bbci.co.uk/news/rss.xml\`).`,
     };
   }
 
@@ -3694,28 +3781,22 @@ function matchesGeoLocationsFilter(jobLocations: string[], geoFilters: string[])
   return boundedFilters.some((gf) => matchesSingleGeoLocation(locStr, gf));
 }
 
-const COMPANY_CORPORATE_SUFFIXES = new Set([
+const COMPANY_LEGAL_ENTITY_SUFFIXES = new Set([
   'inc',
   'incorporated',
   'corp',
   'corporation',
   'llc',
-  'ltd',
-  'limited',
-  'co',
-  'company',
-  'hq',
-  'jobs',
-  'careers',
-  'global',
-  'labs',
-  'tech',
-  'technologies',
-  'group',
-  'holdings',
   'plc',
   'gmbh',
-  'ag',
+]);
+
+const COMPANY_DISPLAY_NON_ATS_SUFFIXES = new Set([
+  ...COMPANY_LEGAL_ENTITY_SUFFIXES,
+  'ltd',
+  'limited',
+  'company',
+  'labs',
 ]);
 
 const COMPANY_NEGATION_WORDS = new Set([
@@ -3741,45 +3822,103 @@ const COMPANY_NEGATION_WORDS = new Set([
 
 const CONCAT_NEGATION_PREFIX_RE = /^(?:not|non|anti|ex|former|unlike|fake|clone|mock|spoof)/;
 
-function matchesCompanyCandidateAgainstToken(rawCandidate: string, tok: string): boolean {
+function isKnownMultiTenantAtsUrl(urlStr: string): boolean {
+  try {
+    const u = new URL(urlStr);
+    const host = u.hostname.toLowerCase();
+    return (
+      host.endsWith('.greenhouse.io') ||
+      host === 'greenhouse.io' ||
+      host === 'jobs.ashbyhq.com' ||
+      host === 'jobs.lever.co' ||
+      host === 'jobs.eu.lever.co' ||
+      host === 'jobs.smartrecruiters.com' ||
+      host === 'apply.workable.com' ||
+      host === 'jobs.gem.com' ||
+      host === 'ats.rippling.com' ||
+      host.endsWith('.myworkdayjobs.com') ||
+      host.endsWith('.myworkdaysite.com') ||
+      host.endsWith('.pinpointhq.com') ||
+      host.endsWith('.bamboohr.com') ||
+      host.endsWith('.breezy.hr') ||
+      host.endsWith('.recruitee.com') ||
+      host.endsWith('.applytojob.com') ||
+      host.endsWith('.teamtailor.com') ||
+      host.endsWith('.icims.com') ||
+      host.endsWith('.personio.de') ||
+      host.endsWith('.personio.com') ||
+      host.endsWith('.oraclecloud.com')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function matchesCompanyCandidateAgainstToken(
+  rawCandidate: string,
+  tok: string,
+  opts: { isAtsSlug?: boolean; strictMultiTenant?: boolean } = {},
+): boolean {
   if (!rawCandidate || !tok || tok.length > 128) return false;
   const bounded = rawCandidate.length > 256 ? rawCandidate.slice(0, 256) : rawCandidate;
-  const words: string[] = bounded.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  // Reject zero-width / bidi / non-breaking-space format chars used to spoof company names or ATS board slugs (`Stripe\u200b`, `STRIPE\u00a0INC`)
+  if (/[\u0000-\u001f\u007f-\u00a0\u00ad\u034f\u061c\u17b4\u17b5\u180b-\u180f\u2000-\u200f\u2028-\u202f\u205f-\u206f\ufeff]/.test(bounded)) {
+    return false;
+  }
+  // ATS board tenant slugs must strictly be clean kebab/alnum slugs without spaces or dots (`stripe.jobs`, `Stripe Careers`)
+  if (opts.isAtsSlug && !/^[A-Za-z0-9_-]+$/.test(bounded)) {
+    return false;
+  }
+  // Tokenize ALL Unicode letter/number words (`\p{L}\p{N}`) so Cyrillic/CJK/homoglyph prefixes or suffixes (`Не Stripe`, `Stripe 偽物`, `Stripe Fаke`) are NEVER dropped!
+  const words: string[] = bounded.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
   if (words.length === 0) return false;
-
-  // Reject negation / impersonation modifiers (`"not stripe"`, `"anti-stripe"`, `"ex-stripe"`, `"former stripe"`, `"stripe-fake"`, `"stripe-clone"`, `M12`)
   for (let i = 0; i < words.length; i++) {
-    if (COMPANY_NEGATION_WORDS.has(words[i]!)) return false;
+    const w = words[i]!;
+    if (!/^[a-z0-9]+$/.test(w)) return false;
+    if (COMPANY_NEGATION_WORDS.has(w)) return false;
   }
 
-  const clean = words.join('');
-  if (clean.length < 3) {
-    // Short 2-char company names (e.g. "f5") require exact canonical token equality — never substring ("st" in "stripe").
-    return clean.length >= 2 && clean === tok;
+  const allowedSuffixSet =
+    opts.isAtsSlug || opts.strictMultiTenant ? COMPANY_LEGAL_ENTITY_SUFFIXES : COMPANY_DISPLAY_NON_ATS_SUFFIXES;
+
+  if (words.length === 1) {
+    const only = words[0]!;
+    if (only.length < 3) {
+      return only.length >= 2 && only === tok;
+    }
+    if (only === tok) return true;
+    // Allow unseparated display-only legal/labs suffix (e.g. `AcmeLabs` on verified `boards.greenhouse.io/acme`) ONLY when NOT evaluating an ATS URL slug!
+    if (!opts.isAtsSlug && !opts.strictMultiTenant && tok.length >= 3 && only.startsWith(tok)) {
+      const rem = only.slice(tok.length);
+      if (COMPANY_DISPLAY_NON_ATS_SUFFIXES.has(rem)) return true;
+    }
+    return false;
   }
-  if (clean === tok) return true;
+
   if (tok.length < 3) return false;
+  const clean = words.join('');
   if (CONCAT_NEGATION_PREFIX_RE.test(clean) && clean !== tok) return false;
 
-  // Exact leading token followed ONLY by recognized corporate/board suffixes (`"Stripe Inc."`, `"stripe-careers"`, `"stripe-jobs"` — NEVER `"stripe-fake"`, `"stripe-clone"`, or `"stripe-careers-apply-now"`)
-  if (words[0] === tok && words.slice(1).every((w) => COMPANY_CORPORATE_SUFFIXES.has(w))) {
+  // Exact leading token followed ONLY by vetted legal-entity suffixes (`"Stripe, Inc."`, `"stripe-inc"` — NEVER `"Stripe Careers"`, `"stripe-jobs"`, `"stripe-hq"`, `"stripe-global"`, `"stripe-co"`, `"stripe-ltd"` on multi-tenant ATS!)
+  if (words[0] === tok && words.slice(1).every((w) => allowedSuffixSet.has(w))) {
     return true;
   }
 
-  // Adjacent hyphen/space-split words at the start joining to `tok` (`"Open AI"`, `"Open AI Inc."` <-> `"openai"`)
+  // Space-separated 2-word compound company name (`"Open AI"` <-> `"openai"`, `"Palo Alto"` <-> `"paloalto"`):
+  // ONLY when separated by ASCII space (NOT `.`, `-`, `/`, `_` so `S.T.R.I.P.E`, `St-Ripe`, `s/t/r/i/p/e`, `s-t-r-i-p-e` are 100% rejected!)
+  // and `words[0].length >= 3` (`"S t r i p e"` has 1-char words -> rejected!).
   if (
+    !opts.isAtsSlug &&
     words.length >= 2 &&
+    words[0]!.length >= 3 &&
+    words[1]!.length >= 2 &&
+    !/[.\-/_]/.test(bounded) &&
     words[0]! + words[1]! === tok &&
-    words.slice(2).every((w) => COMPANY_CORPORATE_SUFFIXES.has(w))
+    words.slice(2).every((w) => allowedSuffixSet.has(w))
   ) {
     return true;
   }
 
-  // Canonical concatenated ATS board slug suffix (e.g. `"stripehq"`, `"stripejobs"`, `"stripeinc"`) — never `"notstripe"`, `"striper"`, or `"stripefake"`!
-  if (clean.startsWith(tok)) {
-    const suffix = clean.slice(tok.length);
-    if (COMPANY_CORPORATE_SUFFIXES.has(suffix)) return true;
-  }
   return false;
 }
 
@@ -3790,15 +3929,37 @@ export function matchesAllowedCompanyOrDomain(
 ): boolean {
   const rawUrl = typeof job.url === 'string' ? (job.url.length > 2048 ? job.url.slice(0, 2048) : job.url) : '';
   const urlLower = rawUrl.toLowerCase();
-  if (allowedBoardPrefixes.some((p) => p && urlLower.startsWith(p))) return true;
+  if (
+    allowedBoardPrefixes.some(
+      (p) => p && (urlLower === p || urlLower.startsWith(`${p}/`) || urlLower.startsWith(`${p}?`)),
+    )
+  ) {
+    return true;
+  }
+  const isMultiTenantAts = isKnownMultiTenantAtsUrl(rawUrl);
   const inferred = inferCompanyFromAtsUrl(rawUrl);
+  const hasExplicitCompany = typeof job.company === 'string' && job.company.trim() !== '' && job.company.trim().toLowerCase() !== 'unknown';
   let checked = 0;
   for (const tok of allowedTokens) {
     if (!tok) continue;
     if (++checked > 128) break;
+    if (isMultiTenantAts) {
+      // On unverified multi-tenant ATS boards (`jobs.lever.co/<slug>`, `boards.greenhouse.io/<slug>`, etc.),
+      // BOTH the ATS tenant slug AND `job.company` (when present) must match `tok` (`jobs8.mjs` impostor board & unrelated board guards)!
+      const slugOk = matchesCompanyCandidateAgainstToken(inferred, tok, { isAtsSlug: true, strictMultiTenant: true });
+      if (!slugOk) continue;
+      const isExactSlugMatch = inferred.trim().toLowerCase() === tok;
+      if (
+        hasExplicitCompany &&
+        !matchesCompanyCandidateAgainstToken(job.company, tok, { strictMultiTenant: !isExactSlugMatch })
+      ) {
+        continue;
+      }
+      return true;
+    }
     if (
       matchesCompanyCandidateAgainstToken(job.company, tok) ||
-      matchesCompanyCandidateAgainstToken(inferred, tok)
+      (inferred !== 'unknown' && matchesCompanyCandidateAgainstToken(inferred, tok))
     ) {
       return true;
     }
@@ -3874,8 +4035,10 @@ export async function executeJobsCall(params: {
       ? payload.urls
       : null;
   if (rawVerifyArray !== null || payload.mode === 'verify') {
+    // Bound verify array BEFORE filtering/trimming so 100k-entry arrays finish in O(1) (`jobs8.mjs` Part E)
     const cleanVerifyUrls = (rawVerifyArray ?? [])
-      .filter((u): u is string => typeof u === 'string' && u.trim().startsWith('https://'))
+      .slice(0, 100)
+      .filter((u): u is string => typeof u === 'string' && u.length <= 2_048 && u.trim().startsWith('https://'))
       .map((u) => u.trim());
     if (cleanVerifyUrls.length === 0) {
       activeTracer?.setAttribute('edgefetch.jobs.mode', 'verify');
@@ -3899,6 +4062,16 @@ export async function executeJobsCall(params: {
     });
   }
 
+  if (typeof payload.query === 'string' && payload.query.length > 4_096) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: 'invalid_query',
+        message: `\`query\` must be at most ${MAX_JOBS_QUERY_CHARS} characters.`,
+      },
+    };
+  }
   const rawQueryTrimmed = typeof payload.query === 'string' ? payload.query.trim() : '';
   if (rawQueryTrimmed.length > MAX_JOBS_QUERY_CHARS) {
     return {
@@ -3911,11 +4084,32 @@ export async function executeJobsCall(params: {
     };
   }
   const query = rawQueryTrimmed;
+  if (typeof payload.company === 'string' && payload.company.length > 4_096) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: 'invalid_company',
+        message: '`company` must be at most 128 characters.',
+      },
+    };
+  }
   const rawCompanyTrimmed = typeof payload.company === 'string' ? payload.company.trim() : '';
-  const companyFilter = rawCompanyTrimmed.length > 128 ? rawCompanyTrimmed.slice(0, 128) : rawCompanyTrimmed;
+  if (rawCompanyTrimmed.length > 128) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: 'invalid_company',
+        message: '`company` must be at most 128 characters.',
+      },
+    };
+  }
+  const companyFilter = rawCompanyTrimmed;
   const domainsInput = Array.isArray(payload.domains)
     ? payload.domains
-        .filter((d): d is string => typeof d === 'string' && d.trim().length > 0)
+        .slice(0, 25)
+        .filter((d): d is string => typeof d === 'string' && d.length <= 256 && d.trim().length > 0)
         .map((d) => d.trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '').toLowerCase())
         .filter((d) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d))
         .slice(0, 10)
@@ -3932,7 +4126,11 @@ export async function executeJobsCall(params: {
   }
 
   const rawLocationsFilter = Array.isArray(payload.locations)
-    ? payload.locations.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((s) => s.trim().toLowerCase())
+    ? payload.locations
+        .slice(0, 32)
+        .filter((x): x is string => typeof x === 'string')
+        .map((s) => (s.length > 160 ? s.slice(0, 160) : s).trim().toLowerCase())
+        .filter((s) => s.length > 0)
     : [];
   const geoLocationsFilter = rawLocationsFilter.filter((s) => !REMOTE_LOCATION_TOKENS.has(s));
   const hasRemoteInLocations = rawLocationsFilter.some((s) => REMOTE_LOCATION_TOKENS.has(s));
@@ -3952,11 +4150,12 @@ export async function executeJobsCall(params: {
   const includeBuiltIn = hasCompanyOrDomainScope ? payload.includeBuiltIn === true : payload.includeBuiltIn !== false;
   const excludeList = Array.isArray(payload.exclude)
     ? (payload.exclude as Array<Record<string, unknown>>)
+        .slice(0, 200)
         .filter((x) => x && typeof x === 'object')
         .map((x) => ({
-          company: typeof x.company === 'string' ? x.company.trim().toLowerCase() : '',
-          title: typeof x.title === 'string' ? x.title.trim().toLowerCase() : '',
-          url: typeof x.url === 'string' ? x.url.trim().replace(/\/+$/, '').toLowerCase() : '',
+          company: typeof x.company === 'string' ? (x.company.length > 256 ? x.company.slice(0, 256) : x.company).trim().toLowerCase() : '',
+          title: typeof x.title === 'string' ? (x.title.length > 256 ? x.title.slice(0, 256) : x.title).trim().toLowerCase() : '',
+          url: typeof x.url === 'string' ? (x.url.length > 2_048 ? x.url.slice(0, 2_048) : x.url).trim().replace(/\/+$/, '').toLowerCase() : '',
         }))
     : [];
 

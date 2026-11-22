@@ -20,6 +20,40 @@ permissions:
   contents: read
 
 jobs:
+  verify-tests:
+    name: Gate Release Add-on Images on Go & Hub Test Suites
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.27.x'
+          cache: true
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: hub/package-lock.json
+
+      - name: Run Go vet, staticcheck & race test suite
+        run: |
+          go vet ./...
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          "$(go env GOPATH)/bin/staticcheck" ./...
+          go test -race ./...
+
+      - name: Run Hub adapter check, unit/E2E tests, type-check & deploy dry-run
+        working-directory: hub
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run adapter:check
+          npm test
+          npm run type-check
+          npm run deploy:dry
+
   publish-ha-addon:
     name: Build & Push ${{ matrix.image_prefix }}-${{ matrix.ha_arch }} (edge)
     runs-on: ${{ matrix.runner }}
@@ -116,6 +150,7 @@ jobs:
   publish-ha-addon-release:
     name: Build & Push ${{ matrix.image_prefix }}-${{ matrix.ha_arch }} (release)
     runs-on: ${{ matrix.runner }}
+    needs: [verify-tests]
     if: startsWith(github.ref, 'refs/tags/v')
     environment: release
     permissions:

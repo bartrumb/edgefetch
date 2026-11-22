@@ -908,3 +908,51 @@ func BenchmarkParseRetryAfter(b *testing.B) {
 		_ = ParseRetryAfter("120", now)
 	}
 }
+
+func TestR7ZeroWidthBeforeDirectivesAndRobotsParity153(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+
+	if MaxRobotsFetchTimeout != 10*time.Second {
+		t.Fatalf("expected MaxRobotsFetchTimeout == 10s, got %s", MaxRobotsFetchTimeout)
+	}
+
+	// 1. Zero-width format characters (\u200B, \u200C, \u200D, \u2060, \uFEFF) before User-agent / Disallow / Allow / Crawl-delay / Content-Signal MUST be stripped!
+	for _, zw := range []string{"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "  \u200b\ufeff "} {
+		rob := ParseRobotsTxt(zw+"User-agent: *\n"+zw+"Disallow: /secret\n"+zw+"Crawl-delay: 4\n"+zw+"Content-Signal: ai-input=no\n", "edgefetch", exp)
+		if rob.Allowed("/secret/page") {
+			t.Fatalf("SECURITY: zero-width prefix %q bypassed User-agent / Disallow!", zw)
+		}
+		if rob.CrawlDelay != 4*time.Second {
+			t.Fatalf("expected CrawlDelay=4s with zero-width prefix %q, got %s", zw, rob.CrawlDelay)
+		}
+		if !rob.DisallowAIInput || !rob.ContentSignalBlocked() {
+			t.Fatalf("expected Content-Signal ai-input=no enforced with zero-width prefix %q", zw)
+		}
+	}
+
+	// 2. Pure ASCII case-folding parity (153/153 with Hub TS): non-ASCII Kelvin/dotted-I/long-s must NOT fold to ASCII directives,
+	//    NUL inside Content-Signal item must reject, and underscore/Inf Crawl-delay must reject.
+	if ParseRobotsTxt("U\u017fer-agent: *\nDisallow: /\n", "edgefetch", exp).Allowed("/") == false {
+		t.Fatal("non-ASCII U\\u017fer-agent must not fold to User-agent")
+	}
+	if ParseRobotsTxt("User-agent: *\nCONTENT-S\u0130GNAL: ai-input=no\n", "edgefetch", exp).DisallowAIInput {
+		t.Fatal("non-ASCII CONTENT-S\\u0130GNAL must not fold to Content-Signal")
+	}
+	if ParseRobotsTxt("User-agent: *\nContent-Signal: a\u0130-input=no\n", "edgefetch", exp).DisallowAIInput {
+		t.Fatal("non-ASCII a\\u0130-input must not fold to ai-input")
+	}
+	if ParseRobotsTxt("User-agent: *\nContent-Signal: ai-input=no\x00\n", "edgefetch", exp).DisallowAIInput {
+		t.Fatal("NUL-tainted ai-input=no\\x00 must be rejected for TS parity")
+	}
+	for _, badDelay := range []string{"1_0", "Inf", "+Inf", "-Inf", "NaN", "1e"} {
+		if d := ParseRobotsTxt("User-agent: *\nCrawl-delay: "+badDelay+"\n", "edgefetch", exp).CrawlDelay; d != 0 {
+			t.Fatalf("Crawl-delay: %q parsed as %s, want 0", badDelay, d)
+		}
+	}
+	if d := ParseRobotsTxt("User-agent: *\nCrawl-delay: 1e2\n", "edgefetch", exp).CrawlDelay; d != MaxCrawlDelay {
+		t.Fatalf("Crawl-delay: 1e2 = %s, want %s (TS Number() parity)", d, MaxCrawlDelay)
+	}
+	if d := ParseRobotsTxt("User-agent: *\nCrawl-delay: .5\n", "edgefetch", exp).CrawlDelay; d != 500*time.Millisecond {
+		t.Fatalf("Crawl-delay: .5 = %s, want 500ms", d)
+	}
+}

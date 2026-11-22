@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 )
 
 var reTraceparent = regexp.MustCompile(`^00-([0-9a-fA-F]{32})-([0-9a-fA-F]{16})-([0-9a-fA-F]{2})$`)
@@ -196,70 +198,21 @@ func InjectHeaders(dst http.Header, tc TraceContext, requestID string) {
 	}
 }
 
-var (
-	reEmbeddedHTTPURL = regexp.MustCompile(`(?i)https?://[^\s"\\]+`)
-	reQuotedHTTPURL   = regexp.MustCompile(`(?i)"https?://(?:[^"\\]|\\.)*"`)
-)
+// SanitizeURL strips `user:pass@` credentials (including schemeless userinfo), query parameters, `#fragments`,
+// matrix parameters, and reset path tokens from `raw` for safe OTLP logging (`politeness.SanitizeURL` parity).
+func SanitizeURL(raw string) string {
+	return politeness.SanitizeURL(raw)
+}
 
 func scrubRawURL(raw string) string {
-	if idx := strings.IndexByte(raw, '#'); idx >= 0 {
-		raw = raw[:idx]
-	}
-	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
-		raw = raw[:idx]
-	}
-	if schemeEnd := strings.Index(raw, "://"); schemeEnd >= 0 {
-		rest := raw[schemeEnd+3:]
-		slash := strings.IndexByte(rest, '/')
-		auth := rest
-		pathPart := ""
-		if slash >= 0 {
-			auth = rest[:slash]
-			pathPart = rest[slash:]
-		}
-		if at := strings.LastIndexByte(auth, '@'); at >= 0 {
-			auth = auth[at+1:]
-			raw = raw[:schemeEnd+3] + auth + pathPart
-		}
-	}
-	return raw
+	return politeness.SanitizeURL(raw)
 }
 
-// SanitizeURL strips `user:pass@` credentials, query parameters, and `#fragment` from `raw` for safe OTLP logging.
-func SanitizeURL(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return ""
-	}
-	if u, err := url.Parse(trimmed); err == nil && (u.Scheme != "" || u.Path != "") {
-		u.User = nil
-		u.RawQuery = ""
-		u.ForceQuery = false
-		u.Fragment = ""
-		u.RawFragment = ""
-		return u.String()
-	}
-	return scrubRawURL(trimmed)
-}
-
-// RedactEmbeddedURLs scrubs query strings (`?...`), `#fragments`, and `user:pass@` credentials from any `http://` or
-// `https://` URL embedded inside an error or `Problem` string.
+// RedactEmbeddedURLs delegates directly to `politeness.RedactEmbeddedURLs` so OTLP span error strings have 100%
+// redaction parity across `http://`, `https://`, `ws://`, `wss://`, `ftp://`, schemeless userinfo, percent-encoded
+// credentials, JSON-escaped slashes, query strings, `#fragments`, and inline Bearer/Basic/token secrets.
 func RedactEmbeddedURLs(s string) string {
-	if s == "" {
-		return ""
-	}
-	lower := strings.ToLower(s)
-	if !strings.Contains(lower, "http://") && !strings.Contains(lower, "https://") {
-		return s
-	}
-	s = reQuotedHTTPURL.ReplaceAllStringFunc(s, func(q string) string {
-		raw, err := strconv.Unquote(q)
-		if err != nil {
-			raw = q[1 : len(q)-1]
-		}
-		return strconv.Quote(scrubRawURL(raw))
-	})
-	return reEmbeddedHTTPURL.ReplaceAllStringFunc(s, scrubRawURL)
+	return politeness.RedactEmbeddedURLs(s)
 }
 
 // ActiveSpan tracks an in-flight OTLP span and exports it once on `End`.
@@ -490,7 +443,7 @@ func newExporterFromEnv(
 		svc = "edgefetch-go"
 	}
 	if version == "" {
-		version = "2.7.0"
+		version = "2.7.1"
 	}
 	var client *http.Client
 	if tracesURL != "" || devTelURL != "" {

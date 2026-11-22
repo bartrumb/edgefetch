@@ -214,13 +214,24 @@ function isSafePublicTwinUrl(fetchUrl: string): boolean {
  * Returns `null` when standard HTML fetching should proceed.
  */
 export function resolveSiteExtractorTwin(urlStr: string): SiteExtractorTwin | null {
+  if (!urlStr || urlStr !== urlStr.trim() || /[\s\\\u0000-\u001f\u007f]/.test(urlStr)) {
+    return null;
+  }
   let u: URL;
   try {
     u = new URL(urlStr);
   } catch {
     return null;
   }
-  if (u.protocol !== 'https:') return null;
+  if (u.protocol !== 'https:' || u.username !== '' || u.password !== '') return null;
+  if (u.port !== '' && u.port !== '443') return null;
+  // Reject non-ASCII or percent-encoded/empty-label raw authority before WHATWG host normalization
+  const authSlice = urlStr.slice(8, urlStr.indexOf('/', 8) >= 0 ? urlStr.indexOf('/', 8) : urlStr.length);
+  const hostOnlyRaw = authSlice.split(/[?#]/)[0]!.replace(/:443$/, '');
+  if (!hostOnlyRaw || /[^\x21-\x7e%]/.test(hostOnlyRaw) || hostOnlyRaw.includes('%') || hostOnlyRaw.includes('..')) {
+    return null;
+  }
+  if (!isSafePublicTwinUrl(`https://${u.hostname}/`)) return null;
   const host = u.hostname.toLowerCase();
   const path = u.pathname;
   const parts = path.split('/').filter(Boolean);

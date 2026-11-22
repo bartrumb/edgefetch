@@ -5,6 +5,7 @@
  * extractors, `node:sqlite` FTS5 search, local `/data/artifacts` object store, `/agent/ws` Go worker fleet, and
  * vendor-agnostic OTLP trace export) with zero Cloudflare account, zero Postgres, and zero Redis!
  */
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { createServer, type IncomingMessage } from 'node:http';
 import net from 'node:net';
@@ -13,8 +14,10 @@ import { WebSocketServer } from 'ws';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
 import metaMultiUserSql from '../migrations/meta/0002_multiuser.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
-import { authorizeAgent } from '../src/auth';
+import { authorizeAgent, isValidSecretMatch } from '../src/auth';
+import { resolveSessionSecret } from '../src/github-auth';
 import hubWorker from '../src/index';
+import { ADMIN_COOKIE_NAME, verifyAdminSessionCookie, type OAuthTokenRecord } from '../src/oauth';
 import { normalizeClientRateLimitIp } from '../src/safe-input';
 import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './node-adapters';
 import { S3ArtifactBucket } from './s3-bucket';
@@ -25,8 +28,11 @@ export const MAX_INFLIGHT_PER_IP = 16;
 export const MAX_INFLIGHT_TOTAL = 128;
 export const MAX_CONNECTIONS_PER_IP = 32;
 export const MAX_CONNECTIONS_TOTAL = 512;
+export const MAX_PREHEADER_SOCKETS_PER_IP = 4;
+export const MAX_GLOBAL_PREHEADER_SOCKETS = 128;
 export const LOOPBACK_RESERVED_CONNECTIONS = 32;
 export const PRE_HEADER_TIMEOUT_MS = 10_000;
+export const FIRST_BYTE_PREHEADER_TIMEOUT_MS = 5_000;
 export const MAX_AGENT_WS_CONNECTIONS = 128;
 export const MAX_AGENT_WS_PER_SITE = 16;
 const MAX_BODY_STREAM_IDLE_OR_TOTAL_MS = 15_000;
@@ -49,6 +55,8 @@ export interface PortableHubOptions {
   maxInflightTotal?: number;
   maxConnectionsPerIp?: number;
   maxConnectionsTotal?: number;
+  maxPreHeaderSocketsPerIp?: number;
+  maxGlobalPreHeaderSockets?: number;
   headersTimeoutMs?: number;
 }
 
@@ -238,6 +246,7 @@ function safeNodeReqToWebStream(req: IncomingMessage): ReadableStream<Uint8Array
 
 const STRICT_SINGLE_HOST_RE =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::([1-9]\d{0,4}))?$/;
+const STRICT_FLY_APP_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 
 export function parseStrictSingleHost(raw: string | readonly string[] | undefined | null): string | null {
   if (Array.isArray(raw)) {
@@ -256,6 +265,58 @@ export function parseStrictSingleHost(raw: string | readonly string[] | undefine
     if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return null;
   }
   return lower;
+}
+
+/**
+ * Resolves explicit or platform-injected public origin across `EDGEFETCH_PUBLIC_ORIGIN`, Render (`RENDER_EXTERNAL_URL` /
+ * `RENDER_EXTERNAL_HOSTNAME`), Railway (`RAILWAY_PUBLIC_DOMAIN` / `RAILWAY_STATIC_URL`), and Fly.io (`FLY_APP_NAME`),
+ * so `/admin` CSRF origin checks and `Secure` session cookies work out-of-the-box on 1-click deploys without trusting
+ * client-spoofed `Host` headers!
+ */
+export function resolveConfiguredPublicOrigin(env: Record<string, string | undefined>): string | null {
+  const parseOriginCandidate = (rawUrl: string | undefined): string | null => {
+    const trimmed = (rawUrl ?? '').trim();
+    if (!trimmed) return null;
+    try {
+      const u = new URL(trimmed);
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+      if (u.username || u.password) return null;
+      if (parseStrictSingleHost(u.host) === null && !isLoopbackHostOnly(u.hostname)) return null;
+      return u.origin;
+    } catch {
+      return null;
+    }
+  };
+
+  const explicit = parseOriginCandidate(env.EDGEFETCH_PUBLIC_ORIGIN);
+  if (explicit) return explicit;
+
+  const renderUrl = parseOriginCandidate(env.RENDER_EXTERNAL_URL);
+  if (renderUrl) return renderUrl;
+
+  const renderHost = parseStrictSingleHost(env.RENDER_EXTERNAL_HOSTNAME);
+  if (renderHost && renderHost.includes('.')) {
+    return `https://${renderHost}`;
+  }
+
+  const railwayDomain = parseStrictSingleHost(env.RAILWAY_PUBLIC_DOMAIN);
+  if (railwayDomain && railwayDomain.includes('.')) {
+    return `https://${railwayDomain}`;
+  }
+
+  const railwayStaticUrl = parseOriginCandidate(env.RAILWAY_STATIC_URL);
+  if (railwayStaticUrl) return railwayStaticUrl;
+  const railwayStaticHost = parseStrictSingleHost(env.RAILWAY_STATIC_URL);
+  if (railwayStaticHost && railwayStaticHost.includes('.')) {
+    return `https://${railwayStaticHost}`;
+  }
+
+  const flyApp = (env.FLY_APP_NAME ?? '').trim();
+  if (flyApp && STRICT_FLY_APP_NAME_RE.test(flyApp)) {
+    return `https://${flyApp.toLowerCase()}.fly.dev`;
+  }
+
+  return null;
 }
 
 function isLoopbackHostOnly(hostname: string): boolean {
@@ -286,9 +347,32 @@ export function resolvePublicOrigin(params: {
     void new URL(`http://${params.hostHeader.trim()}/`);
   }
 
-  // M8: When `EDGEFETCH_PUBLIC_ORIGIN` is explicitly configured (or proxy headers are untrusted), strictly pin to `canonicalOrigin`.
-  if (params.hasExplicitPublicOrigin || !params.trustProxy) {
+  // When an explicit or platform public origin is configured, strictly pin to `canonicalOrigin`.
+  if (params.hasExplicitPublicOrigin) {
     return { origin: baseOriginUrl.origin, trustedForwardedHost: null };
+  }
+
+  const validHost = parseStrictSingleHost(params.hostHeader);
+  let samePortLoopbackAuthority: string | null = null;
+  if (validHost !== null && (isLoopbackHostOnly(baseOriginUrl.hostname) || baseOriginUrl.hostname === 'hub.local')) {
+    try {
+      const cand = new URL(`http://${validHost}`);
+      const basePort = baseOriginUrl.port || (baseOriginUrl.protocol === 'https:' ? '443' : '80');
+      const candPort = cand.port || '80';
+      if (isLoopbackHostOnly(cand.hostname) && candPort === basePort) {
+        samePortLoopbackAuthority = validHost;
+      }
+    } catch {
+      samePortLoopbackAuthority = null;
+    }
+  }
+
+  if (!params.trustProxy) {
+    const authority = samePortLoopbackAuthority ?? baseOriginUrl.host;
+    return {
+      origin: new URL(`${baseOriginUrl.protocol}//${authority}`).origin,
+      trustedForwardedHost: null,
+    };
   }
 
   let proto = baseOriginUrl.protocol.replace(/:$/, '');
@@ -307,10 +391,9 @@ export function resolvePublicOrigin(params: {
   // `R5-Low`: Even when `trustProxy === true` and `EDGEFETCH_PUBLIC_ORIGIN` is unset, NEVER let an arbitrary external
   // `Host: evil.test` override `baseOriginUrl.host` (preventing OAuth `/.well-known/oauth-authorization-server` issuer poisoning).
   // Only allow loopback-to-loopback authority substitution (`127.0.0.1` <-> `localhost`).
-  const validHost = parseStrictSingleHost(params.hostHeader);
   const validFwdHost = parseStrictSingleHost(params.forwardedHostHeader);
-  let allowLoopbackHostOverride = false;
-  if (validHost !== null && isLoopbackHostOnly(baseOriginUrl.hostname)) {
+  let allowLoopbackHostOverride = samePortLoopbackAuthority !== null;
+  if (!allowLoopbackHostOverride && validHost !== null && isLoopbackHostOnly(baseOriginUrl.hostname)) {
     try {
       allowLoopbackHostOverride = isLoopbackHostOnly(new URL(`http://${validHost}`).hostname);
     } catch {
@@ -333,6 +416,7 @@ function incomingToWebRequest(
   trustProxy: boolean,
   hasExplicitPublicOrigin = false,
   trustFlyClientIp = false,
+  verifiedCallerAuth = false,
 ): Request {
   const { origin, trustedForwardedHost } = resolvePublicOrigin({
     canonicalOrigin,
@@ -352,13 +436,15 @@ function incomingToWebRequest(
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) {
     const lower = k.toLowerCase();
-    // H4: Never trust client-supplied `cf-connecting-ip` / `x-real-ip` / `fly-client-ip` / `true-client-ip`,
+    // H4: Never trust client-supplied `cf-connecting-ip` / `cf-ray` / `x-real-ip` / `fly-client-ip` / `true-client-ip` / `x-ef-verified-auth`,
     // and strip `x-forwarded-*` unless `EDGEFETCH_TRUST_PROXY=1`.
     if (
       lower === 'cf-connecting-ip' ||
+      lower === 'cf-ray' ||
       lower === 'x-real-ip' ||
       lower === 'fly-client-ip' ||
-      lower === 'true-client-ip'
+      lower === 'true-client-ip' ||
+      lower === 'x-ef-verified-auth'
     ) {
       continue;
     }
@@ -373,6 +459,9 @@ function incomingToWebRequest(
   const resolvedIp = resolveTrustedClientIp(req, trustProxy, trustFlyClientIp);
   headers.set('cf-connecting-ip', resolvedIp);
   headers.set('x-real-ip', resolvedIp);
+  if (verifiedCallerAuth) {
+    headers.set('x-ef-verified-auth', '1');
+  }
 
   const method = (req.method ?? 'GET').toUpperCase();
   const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
@@ -381,6 +470,12 @@ function incomingToWebRequest(
     headers,
     ...(hasBody ? { body: safeNodeReqToWebStream(req), duplex: 'half' } : {}),
   } as RequestInit);
+}
+
+function singleHeaderString(val: string | string[] | undefined): string | null {
+  if (typeof val === 'string') return val;
+  if (Array.isArray(val) && val.length > 0) return val[0] ?? null;
+  return null;
 }
 
 export function startPortableHub(opts: PortableHubOptions = {}) {
@@ -399,6 +494,12 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const tursoToken = mergedEnv.TURSO_AUTH_TOKEN;
 
   const coordinator = new LocalAgentHubCoordinator(join(dataDir, 'hub.sqlite'));
+  const coordinatorNamespace = coordinator.asNamespace() as {
+    idFromName: (name: string) => unknown;
+    get: (id: unknown) => { oauthGetAccessToken?: (hash: string, now: number) => Promise<OAuthTokenRecord | null> | OAuthTokenRecord | null };
+  };
+  const coordinatorStub = coordinatorNamespace.get(coordinatorNamespace.idFromName('global'));
+
   const localMetaDb = (mergedEnv.META_TURSO_URL || tursoUrl)
     ? null
     : new NodeSqliteD1Database(
@@ -456,14 +557,28 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     allowExplicitLoopbackUrls: false,
   });
 
+  const callerTokenSecret =
+    mergedEnv.CALLER_TOKEN ?? mergedEnv.EDGEFETCH_CALLER_TOKEN ?? mergedEnv.EDGEFETCH_SERVER_TOKEN;
+  const mcpTokenSecret = mergedEnv.MCP_TOKEN;
+  const agentTokenSecret = mergedEnv.AGENT_TOKEN ?? mergedEnv.EDGEFETCH_AGENT_TOKEN;
+  const agentTokensMapRaw = mergedEnv.AGENT_TOKENS ?? mergedEnv.EDGEFETCH_AGENT_TOKENS;
+
+  let boundPort = port;
+  const explicitPublicOrigin = resolveConfiguredPublicOrigin(mergedEnv);
+  const resolveCanonicalOrigin = (): string => {
+    if (explicitPublicOrigin) return explicitPublicOrigin;
+    const defaultHost = host === '0.0.0.0' || host === '::' ? 'hub.local' : host;
+    return `http://${defaultHost}:${boundPort}`;
+  };
+
   const workerEnv: Record<string, unknown> = {
-    AGENT_HUB: coordinator.asNamespace(),
+    AGENT_HUB: coordinatorNamespace,
     META: metaDb,
     SEARCH: searchDb,
     ARTIFACTS: artifactsBucket,
     SAFE_FETCH: safeFetch,
     SAFE_PUBLIC_FETCH: safePublicFetch,
-    CALLER_TOKEN: mergedEnv.CALLER_TOKEN ?? mergedEnv.EDGEFETCH_CALLER_TOKEN ?? mergedEnv.EDGEFETCH_SERVER_TOKEN,
+    CALLER_TOKEN: callerTokenSecret,
     SESSION_SECRET: mergedEnv.SESSION_SECRET ?? mergedEnv.EDGEFETCH_SESSION_SECRET,
     GITHUB_CLIENT_ID: mergedEnv.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: mergedEnv.GITHUB_CLIENT_SECRET,
@@ -471,9 +586,9 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     GITHUB_OWNER_LOGIN: mergedEnv.GITHUB_OWNER_LOGIN,
     SIGNUP_MODE: mergedEnv.SIGNUP_MODE,
     VAULT_MASTER_KEY: mergedEnv.VAULT_MASTER_KEY ?? mergedEnv.EDGEFETCH_VAULT_MASTER_KEY,
-    MCP_TOKEN: mergedEnv.MCP_TOKEN,
-    AGENT_TOKEN: mergedEnv.AGENT_TOKEN ?? mergedEnv.EDGEFETCH_AGENT_TOKEN,
-    AGENT_TOKENS: mergedEnv.AGENT_TOKENS ?? mergedEnv.EDGEFETCH_AGENT_TOKENS,
+    MCP_TOKEN: mcpTokenSecret,
+    AGENT_TOKEN: agentTokenSecret,
+    AGENT_TOKENS: agentTokensMapRaw,
     USER_AGENT: mergedEnv.USER_AGENT ?? mergedEnv.EDGEFETCH_USER_AGENT,
     ROBOTS_BYPASS_HOSTS: mergedEnv.ROBOTS_BYPASS_HOSTS ?? mergedEnv.EDGEFETCH_ROBOTS_BYPASS_HOSTS,
     OAUTH_REDIRECT_ALLOWLIST: mergedEnv.OAUTH_REDIRECT_ALLOWLIST,
@@ -505,7 +620,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     OPENROUTER_API_KEY: mergedEnv.OPENROUTER_API_KEY,
     ANTHROPIC_API_KEY: mergedEnv.ANTHROPIC_API_KEY,
     GEMINI_API_KEY: mergedEnv.GEMINI_API_KEY,
-    EDGEFETCH_PUBLIC_ORIGIN: mergedEnv.EDGEFETCH_PUBLIC_ORIGIN,
+    EDGEFETCH_PUBLIC_ORIGIN: explicitPublicOrigin ?? mergedEnv.EDGEFETCH_PUBLIC_ORIGIN,
     EDGEFETCH_DISABLE_UPDATE_CHECK: mergedEnv.EDGEFETCH_DISABLE_UPDATE_CHECK,
     EDGEFETCH_DEV_TELEMETRY: mergedEnv.EDGEFETCH_DEV_TELEMETRY,
     EDGEFETCH_DEV_TELEMETRY_ENDPOINT: mergedEnv.EDGEFETCH_DEV_TELEMETRY_ENDPOINT,
@@ -513,19 +628,69 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     DO_NOT_TRACK: mergedEnv.DO_NOT_TRACK,
   };
 
-  let boundPort = port;
-  let explicitPublicOrigin: string | null = null;
-  if (mergedEnv.EDGEFETCH_PUBLIC_ORIGIN?.trim()) {
-    try {
-      explicitPublicOrigin = new URL(mergedEnv.EDGEFETCH_PUBLIC_ORIGIN.trim()).origin;
-    } catch {
-      explicitPublicOrigin = null;
+  const sessionSecret = resolveSessionSecret(workerEnv as {
+    SESSION_SECRET?: string;
+    CALLER_TOKEN?: string;
+    GITHUB_CLIENT_ID?: string;
+    GITHUB_CLIENT_SECRET?: string;
+  });
+
+  /**
+   * Cryptographically verifies caller/agent/session/OAuth credentials BEFORE granting reserved authenticated
+   * concurrency slots (`R7-M`), defeating `Authorization: Bearer bogus` slot starvation!
+   */
+  const hasVerifiedCallerCredentials = async (req: IncomingMessage, pathname: string): Promise<boolean> => {
+    const authHdr = singleHeaderString(req.headers.authorization);
+    const apiKeyHdr = singleHeaderString(req.headers['x-api-key']);
+    const agentTokHdr = singleHeaderString(req.headers['x-agent-token']);
+    const cookieHdr = singleHeaderString(req.headers.cookie);
+
+    if (!authHdr && !apiKeyHdr && !agentTokHdr && !cookieHdr) {
+      return false;
     }
-  }
-  const resolveCanonicalOrigin = (): string => {
-    if (explicitPublicOrigin) return explicitPublicOrigin;
-    const defaultHost = host === '0.0.0.0' || host === '::' ? 'hub.local' : host;
-    return `http://${defaultHost}:${boundPort}`;
+
+    const bearerMatch = authHdr ? /^bearer\s+(\S+)$/i.exec(authHdr.trim()) : null;
+    const bearerTok = bearerMatch?.[1] ?? null;
+    const cleanApiKey = apiKeyHdr && !/\s/.test(apiKeyHdr.trim()) ? apiKeyHdr.trim() : null;
+    const presentedCallerTok = bearerTok ?? cleanApiKey;
+
+    if (presentedCallerTok && isValidSecretMatch(presentedCallerTok, callerTokenSecret, mcpTokenSecret)) {
+      return true;
+    }
+
+    if (
+      bearerTok &&
+      bearerTok.startsWith('efa_') &&
+      bearerTok.length >= 24 &&
+      bearerTok.length <= 128 &&
+      typeof coordinatorStub?.oauthGetAccessToken === 'function'
+    ) {
+      const tokenHash = createHash('sha256').update(bearerTok).digest('base64url');
+      const rec = await coordinatorStub.oauthGetAccessToken(tokenHash, Date.now());
+      if (rec) return true;
+    }
+
+    if ((agentTokHdr || bearerTok) && pathname.startsWith('/agent/')) {
+      const probeHeaders = new Headers();
+      if (authHdr) probeHeaders.set('authorization', authHdr);
+      if (agentTokHdr) probeHeaders.set('x-agent-token', agentTokHdr);
+      const siteHdr = singleHeaderString(req.headers['x-agent-site']);
+      if (siteHdr) probeHeaders.set('x-agent-site', siteHdr);
+      const probeReq = new Request(`http://hub.local${pathname}`, {
+        method: (req.method ?? 'POST').toUpperCase(),
+        headers: probeHeaders,
+      });
+      if (authorizeAgent(probeReq, { AGENT_TOKEN: agentTokenSecret, AGENT_TOKENS: agentTokensMapRaw }).ok) {
+        return true;
+      }
+    }
+
+    if (cookieHdr && cookieHdr.includes(`${ADMIN_COOKIE_NAME}=`) && sessionSecret) {
+      const verifiedSession = await verifyAdminSessionCookie(cookieHdr, sessionSecret);
+      if (verifiedSession.ok) return true;
+    }
+
+    return false;
   };
 
   const ctx = {
@@ -562,6 +727,20 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       : Number.isFinite(envMaxConnTotal) && envMaxConnTotal > 0
         ? Math.floor(envMaxConnTotal)
         : MAX_CONNECTIONS_TOTAL;
+  const envMaxPreHeaderPerIp = Number(mergedEnv.EDGEFETCH_MAX_PREHEADER_SOCKETS_PER_IP);
+  const hasExplicitMaxPreHeaderPerIp =
+    (typeof opts.maxPreHeaderSocketsPerIp === 'number' && opts.maxPreHeaderSocketsPerIp > 0) ||
+    (Number.isFinite(envMaxPreHeaderPerIp) && envMaxPreHeaderPerIp > 0);
+  const maxPreHeaderPerIp =
+    typeof opts.maxPreHeaderSocketsPerIp === 'number' && opts.maxPreHeaderSocketsPerIp > 0
+      ? Math.floor(opts.maxPreHeaderSocketsPerIp)
+      : Number.isFinite(envMaxPreHeaderPerIp) && envMaxPreHeaderPerIp > 0
+        ? Math.floor(envMaxPreHeaderPerIp)
+        : MAX_PREHEADER_SOCKETS_PER_IP;
+  const maxGlobalPreHeaderSockets =
+    typeof opts.maxGlobalPreHeaderSockets === 'number' && opts.maxGlobalPreHeaderSockets > 0
+      ? Math.floor(opts.maxGlobalPreHeaderSockets)
+      : Math.max(16, Math.min(MAX_GLOBAL_PREHEADER_SOCKETS, maxConnectionsTotal));
   const headersTimeoutMs =
     typeof opts.headersTimeoutMs === 'number' && opts.headersTimeoutMs > 0
       ? Math.floor(opts.headersTimeoutMs)
@@ -573,13 +752,22 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const maxUnauthInflight =
     maxInflightTotal >= 8 ? maxInflightTotal - Math.min(32, Math.floor(maxInflightTotal / 4)) : maxInflightTotal;
 
-  // `R6-H4`: Track raw TCP connections & idle pre-header sockets per remote IP so 520 zero-byte sockets from one IP
-  // can NEVER exhaust `server.maxConnections` or starve loopback `/health` / `/readyz` probes and other client IPs!
+  // `R6-H4` & `R7-H8`:
+  //  1. Strict loopback (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`) has dedicated reserved socket & pre-header headroom,
+  //     completely isolated from remote connection/pre-header pools so orchestrator `/health` & `/readyz` probes ALWAYS succeed 100/100!
+  //  2. Remote pre-header (silent/unparsed) sockets are capped at `MAX_PREHEADER_SOCKETS_PER_IP = 4` per IPv6 `/64` / IPv4 bucket.
+  //  3. Active remote silent pre-header sockets are tracked in an ordered FIFO `Map` (`remotePreHeaderSockets`); when
+  //     `MAX_GLOBAL_PREHEADER_SOCKETS` is reached, the oldest silent pre-header socket is evicted (`socket.destroy()`)
+  //     synchronously instead of dropping newly arriving connections!
   const activeSocketsByIp = new Map<string, number>();
   const preHeaderSocketsByIp = new Map<string, number>();
+  const remotePreHeaderSockets = new Map<
+    net.Socket,
+    { bucket: string; connectedAt: number; finish: () => void }
+  >();
   const socketMarkHeaderReceived = new WeakMap<net.Socket, () => void>();
-  let totalActiveSockets = 0;
-  let totalPreHeaderSockets = 0;
+  let remoteActiveSockets = 0;
+  let loopbackActiveSockets = 0;
 
   const applyNodeSecurityHeaders = (res: import('node:http').ServerResponse, isHttps = false) => {
     for (const [k, v] of DEFAULT_SECURITY_HEADERS) {
@@ -610,8 +798,9 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     req.on('error', () => undefined);
     const rawPathname = (req.url ?? '/').split('?')[0] ?? '/';
     const methodUpper = (req.method ?? 'GET').toUpperCase();
-    const isHealthProbe = (methodUpper === 'GET' || methodUpper === 'HEAD') && (rawPathname === '/health' || rawPathname === '/readyz');
-    const hasCallerAuth = Boolean(req.headers.authorization || req.headers['x-api-key'] || req.headers.cookie);
+    const isHealthProbe =
+      (methodUpper === 'GET' || methodUpper === 'HEAD') && (rawPathname === '/health' || rawPathname === '/readyz');
+    const hasCallerAuth = isHealthProbe ? false : await hasVerifiedCallerCredentials(req, rawPathname);
 
     const clientBucket = normalizeClientRateLimitIp(resolveTrustedClientIp(req, trustProxy, trustFlyClientIp));
     const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
@@ -656,6 +845,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
           trustProxy,
           explicitPublicOrigin !== null,
           trustFlyClientIp,
+          hasCallerAuth,
         );
       } catch {
         res.statusCode = 400;
@@ -737,43 +927,123 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   server.headersTimeout = headersTimeoutMs;
   server.requestTimeout = 30_000;
   server.keepAliveTimeout = 5_000;
-  server.maxConnections = maxConnectionsTotal + LOOPBACK_RESERVED_CONNECTIONS;
+  server.maxConnections = maxConnectionsTotal + LOOPBACK_RESERVED_CONNECTIONS * 2;
 
   server.on('connection', (socket) => {
     socket.on('error', () => undefined);
     const sockIp = normalizeSocketIp(socket.remoteAddress);
     const sockBucket = normalizeClientRateLimitIp(sockIp);
-    const isStrictLoopbackProbe = sockIp === '127.0.0.1' || sockIp === '::1';
-    const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
-    const curPreHeaderForIp = preHeaderSocketsByIp.get(sockBucket) ?? 0;
+    const isStrictLoopbackProbe = sockBucket === '127.0.0.1';
     const effectiveRawPerIpCap =
       !trustProxy || hasExplicitMaxConnPerIp
         ? maxConnectionsPerIp
         : Math.max(maxConnectionsPerIp, maxInflightTotal + 32);
-    const globalSocketCap = isStrictLoopbackProbe
-      ? maxConnectionsTotal + LOOPBACK_RESERVED_CONNECTIONS
-      : maxConnectionsTotal;
-    const preHeaderGlobalCap = Math.max(64, Math.min(128, maxConnectionsTotal));
+
+    // Dedicated isolated loopback headroom (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`): never competes with remote pre-header sockets!
+    if (isStrictLoopbackProbe) {
+      const loopbackCap = Math.max(effectiveRawPerIpCap, LOOPBACK_RESERVED_CONNECTIONS) + LOOPBACK_RESERVED_CONNECTIONS;
+      if (loopbackActiveSockets >= loopbackCap) {
+        socket.destroy();
+        return;
+      }
+      loopbackActiveSockets++;
+      let lbHeaderDone = false;
+      let lbTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+        socket.destroy();
+      }, headersTimeoutMs);
+      lbTimer.unref?.();
+      const finishLbPreHeader = () => {
+        if (lbHeaderDone) return;
+        lbHeaderDone = true;
+        if (lbTimer) {
+          clearTimeout(lbTimer);
+          lbTimer = null;
+        }
+      };
+      socketMarkHeaderReceived.set(socket, finishLbPreHeader);
+      socket.once('end', () => {
+        if (!lbHeaderDone) socket.destroy();
+      });
+      let lbClosed = false;
+      socket.once('close', () => {
+        if (lbClosed) return;
+        lbClosed = true;
+        finishLbPreHeader();
+        loopbackActiveSockets = Math.max(0, loopbackActiveSockets - 1);
+      });
+      return;
+    }
+
+    const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
+    const curPreHeaderForIp = preHeaderSocketsByIp.get(sockBucket) ?? 0;
+    const effectivePreHeaderPerIpCap =
+      !trustProxy || hasExplicitMaxPreHeaderPerIp
+        ? maxPreHeaderPerIp
+        : Math.max(maxPreHeaderPerIp, Math.min(64, maxGlobalPreHeaderSockets));
 
     if (
-      totalActiveSockets >= globalSocketCap ||
+      remoteActiveSockets >= maxConnectionsTotal ||
       curActiveForIp >= effectiveRawPerIpCap ||
-      curPreHeaderForIp >= maxConnectionsPerIp ||
-      totalPreHeaderSockets >= preHeaderGlobalCap
+      curPreHeaderForIp >= effectivePreHeaderPerIpCap
     ) {
       socket.destroy();
       return;
     }
 
-    totalActiveSockets++;
-    activeSocketsByIp.set(sockBucket, curActiveForIp + 1);
-    totalPreHeaderSockets++;
-    preHeaderSocketsByIp.set(sockBucket, curPreHeaderForIp + 1);
+    // Global pre-header eviction: evict the oldest truly silent (`bytesRead === 0`) multi-socket or aged pre-header socket
+    // synchronously instead of dropping newly arriving connections or freshly accepted single-socket clients!
+    const nowConnMs = Date.now();
+    while (remotePreHeaderSockets.size >= maxGlobalPreHeaderSockets) {
+      let victimSocket: net.Socket | null = null;
+      let victimMeta: { bucket: string; connectedAt: number; finish: () => void } | null = null;
+
+      for (const [candSock, candMeta] of remotePreHeaderSockets) {
+        if (
+          candSock.bytesRead === 0 &&
+          ((preHeaderSocketsByIp.get(candMeta.bucket) ?? 0) >= 2 || nowConnMs - candMeta.connectedAt >= 50)
+        ) {
+          victimSocket = candSock;
+          victimMeta = candMeta;
+          break;
+        }
+      }
+      if (!victimSocket) {
+        for (const [candSock, candMeta] of remotePreHeaderSockets) {
+          if (candSock.bytesRead === 0) {
+            victimSocket = candSock;
+            victimMeta = candMeta;
+            break;
+          }
+        }
+      }
+      if (!victimSocket) {
+        const oldestIter = remotePreHeaderSockets.entries().next();
+        if (oldestIter.done) break;
+        [victimSocket, victimMeta] = oldestIter.value;
+      }
+      victimMeta!.finish();
+      victimSocket.destroy();
+    }
+
+    remoteActiveSockets++;
+    activeSocketsByIp.set(sockBucket, (activeSocketsByIp.get(sockBucket) ?? 0) + 1);
+    preHeaderSocketsByIp.set(sockBucket, (preHeaderSocketsByIp.get(sockBucket) ?? 0) + 1);
 
     let headerPhaseDone = false;
+    const firstByteDeadlineMs = Math.min(headersTimeoutMs, FIRST_BYTE_PREHEADER_TIMEOUT_MS);
     let preHeaderTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      socket.destroy();
-    }, headersTimeoutMs);
+      if (headerPhaseDone) return;
+      if (socket.bytesRead === 0 || headersTimeoutMs <= FIRST_BYTE_PREHEADER_TIMEOUT_MS) {
+        finishPreHeaderPhase();
+        socket.destroy();
+        return;
+      }
+      preHeaderTimer = setTimeout(() => {
+        finishPreHeaderPhase();
+        socket.destroy();
+      }, Math.max(1, headersTimeoutMs - firstByteDeadlineMs));
+      preHeaderTimer.unref?.();
+    }, firstByteDeadlineMs);
     preHeaderTimer.unref?.();
 
     const finishPreHeaderPhase = () => {
@@ -783,19 +1053,31 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         clearTimeout(preHeaderTimer);
         preHeaderTimer = null;
       }
-      totalPreHeaderSockets = Math.max(0, totalPreHeaderSockets - 1);
+      remotePreHeaderSockets.delete(socket);
       const remPre = preHeaderSocketsByIp.get(sockBucket) ?? 0;
       if (remPre <= 1) preHeaderSocketsByIp.delete(sockBucket);
       else preHeaderSocketsByIp.set(sockBucket, remPre - 1);
     };
+    remotePreHeaderSockets.set(socket, {
+      bucket: sockBucket,
+      connectedAt: nowConnMs,
+      finish: finishPreHeaderPhase,
+    });
     socketMarkHeaderReceived.set(socket, finishPreHeaderPhase);
+
+    socket.once('end', () => {
+      if (!headerPhaseDone) {
+        finishPreHeaderPhase();
+        socket.destroy();
+      }
+    });
 
     let socketClosed = false;
     socket.once('close', () => {
       if (socketClosed) return;
       socketClosed = true;
       finishPreHeaderPhase();
-      totalActiveSockets = Math.max(0, totalActiveSockets - 1);
+      remoteActiveSockets = Math.max(0, remoteActiveSockets - 1);
       const remSock = activeSocketsByIp.get(sockBucket) ?? 0;
       if (remSock <= 1) activeSocketsByIp.delete(sockBucket);
       else activeSocketsByIp.set(sockBucket, remSock - 1);

@@ -1,0 +1,492 @@
+# Shared Go + TypeScript Declarative Site Adapter: Y Combinator Directory & Work at a Startup
+id: ycombinator
+name: Y Combinator Directory & Work at a Startup
+category: finance
+description: Extracts YC company profiles, founders, batches, and open roles from ycombinator.com/companies/<slug> (and upgrades login-gated workatastartup.com company pages to their public YC mirror).
+domains:
+  - www.ycombinator.com
+  - ycombinator.com
+  - www.workatastartup.com
+  - workatastartup.com
+exampleUrls:
+  - https://www.ycombinator.com/companies/supabase
+  - https://www.workatastartup.com/companies/supabase
+
+# workatastartup.com/companies/<slug> gates job bodies behind login; mirror via public ycombinator.com Inertia page
+routes:
+  - match:
+      hosts:
+        - www.workatastartup.com
+        - workatastartup.com
+      exactSegments: false
+      pathSegments:
+        - companies
+        - param: slug
+          charset: alnum_dash
+          minLen: 1
+          maxLen: 80
+    twin:
+      id: workatastartup-yc-mirror
+      fetchUrl: "https://www.ycombinator.com/companies/{slug}/jobs"
+      kind: text
+      accept: text/html
+    extract:
+      jsonSource: inertia_data_page
+      rootPath: props
+      requireFields:
+        - company.name
+      vars:
+        name:
+          paths:
+            - company.name
+          trim: true
+        oneLiner:
+          paths:
+            - company.one_liner
+          trim: true
+        longDesc:
+          paths:
+            - company.long_description
+          trim: true
+        batch:
+          paths:
+            - company.batch_name
+            - company.batch
+        status:
+          paths:
+            - company.ycdc_status
+            - company.status
+        teamSize:
+          paths:
+            - company.team_size
+        location:
+          paths:
+            - company.location
+            - company.city
+        website:
+          paths:
+            - company.website
+        websiteHttps:
+          paths:
+            - company.website
+          requireHttps: true
+        yearFounded:
+          paths:
+            - company.year_founded
+        tags:
+          paths:
+            - company.tags
+          join: ", "
+        hasRootJobsArr:
+          paths:
+            - jobPostings
+          format: array_len
+      titleTemplate: "{name} (YC {batch})"
+      titleWhenVar: batch
+      titleFallbackTemplate: "{name} (Y Combinator)"
+      descriptionVar: oneLiner
+      blockquoteTemplate: "> {oneLiner}"
+      blockquoteWhenVar: oneLiner
+      bullets:
+        - label: YC Batch
+          template: "{batch}"
+          whenVar: batch
+        - label: Status
+          template: "{status}"
+          whenVar: status
+        - label: Founded
+          template: "{yearFounded}"
+          whenVar: yearFounded
+        - label: Team Size
+          template: "{teamSize}"
+          whenVar: teamSize
+        - label: Location
+          template: "{location}"
+          whenVar: location
+        - label: Website
+          template: "{website}"
+          whenVar: website
+        - label: Tags
+          template: "{tags}"
+          whenVar: tags
+      sections:
+        - heading: About
+          headingTemplate: "About {name}"
+          textVar: longDesc
+        - heading: Founders
+          listArrayPath: company.founders
+          requireItemVar: fName
+          collectLinkVars:
+            - linkedin
+          itemVars:
+            fName:
+              paths:
+                - full_name
+              trim: true
+            fTitle:
+              paths:
+                - title
+              trim: true
+              default: Founder
+            fBio:
+              paths:
+                - founder_bio
+              format: strip_tags
+            fBioSuffix:
+              template: " \u2014 {fBio}"
+              whenVars:
+                - fBio
+            linkedin:
+              paths:
+                - linkedin_url
+              requireHttps: true
+            fLabel:
+              template: "[{fName}]({linkedin})"
+              whenVars:
+                - fName
+                - linkedin
+              fallbackVar: fName
+          itemTemplate: "**{fLabel}** ({fTitle}){fBioSuffix}"
+        - heading: Open Roles
+          headingTemplate: "Open Roles ({count})"
+          arrayPath: jobPostings
+          limit: 30
+          requireItemVar: jTitle
+          collectLinkVars:
+            - jUrl
+          itemVars:
+            jTitle:
+              paths:
+                - title
+              trim: true
+            urlHttp:
+              paths:
+                - url
+              requireHttpPrefix: true
+            urlRelPart:
+              paths:
+                - url
+              stripPrefix: /
+            urlFromRel:
+              template: "https://www.ycombinator.com/{urlRelPart}"
+              whenVars:
+                - urlRelPart
+            urlDefault:
+              template: "https://www.ycombinator.com/companies/{slug}/jobs"
+            urlRelOrDefault:
+              template: "{urlFromRel}"
+              whenVars:
+                - urlFromRel
+              fallbackVar: urlDefault
+            jUrl:
+              template: "{urlHttp}"
+              whenVars:
+                - urlHttp
+              fallbackVar: urlRelOrDefault
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Location
+              paths:
+                - location
+                - pretty_location
+            - header: Salary
+              paths:
+                - salary_range
+                - pretty_salary_range
+            - header: Type
+              paths:
+                - role
+                - type
+        - heading: Open Roles
+          headingTemplate: "Open Roles ({count})"
+          unlessVar: hasRootJobsArr
+          arrayPath: company.jobPostings
+          limit: 30
+          requireItemVar: jTitle
+          collectLinkVars:
+            - jUrl
+          itemVars:
+            jTitle:
+              paths:
+                - title
+              trim: true
+            urlHttp:
+              paths:
+                - url
+              requireHttpPrefix: true
+            urlRelPart:
+              paths:
+                - url
+              stripPrefix: /
+            urlFromRel:
+              template: "https://www.ycombinator.com/{urlRelPart}"
+              whenVars:
+                - urlRelPart
+            urlDefault:
+              template: "https://www.ycombinator.com/companies/{slug}/jobs"
+            urlRelOrDefault:
+              template: "{urlFromRel}"
+              whenVars:
+                - urlFromRel
+              fallbackVar: urlDefault
+            jUrl:
+              template: "{urlHttp}"
+              whenVars:
+                - urlHttp
+              fallbackVar: urlRelOrDefault
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Location
+              paths:
+                - location
+                - pretty_location
+            - header: Salary
+              paths:
+                - salary_range
+                - pretty_salary_range
+            - header: Type
+              paths:
+                - role
+                - type
+      linksVars:
+        - websiteHttps
+
+# Post-fetch extractor for ycombinator.com/companies/<slug> Inertia data-page HTML
+htmlRoutes:
+  - match:
+      hosts:
+        - www.ycombinator.com
+        - ycombinator.com
+      exactSegments: false
+      pathSegments:
+        - companies
+        - param: slug
+          charset: alnum_dash
+          minLen: 1
+          maxLen: 80
+    mode: embedded_json
+    dataAttr: data-page
+    extract:
+      jsonSource: inertia_data_page
+      rootPath: props
+      requireFields:
+        - company.name
+      vars:
+        name:
+          paths:
+            - company.name
+          trim: true
+        oneLiner:
+          paths:
+            - company.one_liner
+          trim: true
+        longDesc:
+          paths:
+            - company.long_description
+          trim: true
+        batch:
+          paths:
+            - company.batch_name
+            - company.batch
+        status:
+          paths:
+            - company.ycdc_status
+            - company.status
+        teamSize:
+          paths:
+            - company.team_size
+        location:
+          paths:
+            - company.location
+            - company.city
+        website:
+          paths:
+            - company.website
+        websiteHttps:
+          paths:
+            - company.website
+          requireHttps: true
+        yearFounded:
+          paths:
+            - company.year_founded
+        tags:
+          paths:
+            - company.tags
+          join: ", "
+        hasRootJobsArr:
+          paths:
+            - jobPostings
+          format: array_len
+      titleTemplate: "{name} (YC {batch})"
+      titleWhenVar: batch
+      titleFallbackTemplate: "{name} (Y Combinator)"
+      descriptionVar: oneLiner
+      blockquoteTemplate: "> {oneLiner}"
+      blockquoteWhenVar: oneLiner
+      bullets:
+        - label: YC Batch
+          template: "{batch}"
+          whenVar: batch
+        - label: Status
+          template: "{status}"
+          whenVar: status
+        - label: Founded
+          template: "{yearFounded}"
+          whenVar: yearFounded
+        - label: Team Size
+          template: "{teamSize}"
+          whenVar: teamSize
+        - label: Location
+          template: "{location}"
+          whenVar: location
+        - label: Website
+          template: "{website}"
+          whenVar: website
+        - label: Tags
+          template: "{tags}"
+          whenVar: tags
+      sections:
+        - heading: About
+          headingTemplate: "About {name}"
+          textVar: longDesc
+        - heading: Founders
+          listArrayPath: company.founders
+          requireItemVar: fName
+          collectLinkVars:
+            - linkedin
+          itemVars:
+            fName:
+              paths:
+                - full_name
+              trim: true
+            fTitle:
+              paths:
+                - title
+              trim: true
+              default: Founder
+            fBio:
+              paths:
+                - founder_bio
+              format: strip_tags
+            fBioSuffix:
+              template: " \u2014 {fBio}"
+              whenVars:
+                - fBio
+            linkedin:
+              paths:
+                - linkedin_url
+              requireHttps: true
+            fLabel:
+              template: "[{fName}]({linkedin})"
+              whenVars:
+                - fName
+                - linkedin
+              fallbackVar: fName
+          itemTemplate: "**{fLabel}** ({fTitle}){fBioSuffix}"
+        - heading: Open Roles
+          headingTemplate: "Open Roles ({count})"
+          arrayPath: jobPostings
+          limit: 30
+          requireItemVar: jTitle
+          collectLinkVars:
+            - jUrl
+          itemVars:
+            jTitle:
+              paths:
+                - title
+              trim: true
+            urlHttp:
+              paths:
+                - url
+              requireHttpPrefix: true
+            urlRelPart:
+              paths:
+                - url
+              stripPrefix: /
+            urlFromRel:
+              template: "https://www.ycombinator.com/{urlRelPart}"
+              whenVars:
+                - urlRelPart
+            urlDefault:
+              template: "https://www.ycombinator.com/companies/{slug}/jobs"
+            urlRelOrDefault:
+              template: "{urlFromRel}"
+              whenVars:
+                - urlFromRel
+              fallbackVar: urlDefault
+            jUrl:
+              template: "{urlHttp}"
+              whenVars:
+                - urlHttp
+              fallbackVar: urlRelOrDefault
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Location
+              paths:
+                - location
+                - pretty_location
+            - header: Salary
+              paths:
+                - salary_range
+                - pretty_salary_range
+            - header: Type
+              paths:
+                - role
+                - type
+        - heading: Open Roles
+          headingTemplate: "Open Roles ({count})"
+          unlessVar: hasRootJobsArr
+          arrayPath: company.jobPostings
+          limit: 30
+          requireItemVar: jTitle
+          collectLinkVars:
+            - jUrl
+          itemVars:
+            jTitle:
+              paths:
+                - title
+              trim: true
+            urlHttp:
+              paths:
+                - url
+              requireHttpPrefix: true
+            urlRelPart:
+              paths:
+                - url
+              stripPrefix: /
+            urlFromRel:
+              template: "https://www.ycombinator.com/{urlRelPart}"
+              whenVars:
+                - urlRelPart
+            urlDefault:
+              template: "https://www.ycombinator.com/companies/{slug}/jobs"
+            urlRelOrDefault:
+              template: "{urlFromRel}"
+              whenVars:
+                - urlFromRel
+              fallbackVar: urlDefault
+            jUrl:
+              template: "{urlHttp}"
+              whenVars:
+                - urlHttp
+              fallbackVar: urlRelOrDefault
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Location
+              paths:
+                - location
+                - pretty_location
+            - header: Salary
+              paths:
+                - salary_range
+                - pretty_salary_range
+            - header: Type
+              paths:
+                - role
+                - type
+      linksVars:
+        - websiteHttps

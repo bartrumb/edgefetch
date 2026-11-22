@@ -1,0 +1,184 @@
+# Shared Go + TypeScript Declarative Site Adapter: Gem Job Boards (jobs.gem.com)
+id: gem-ats
+name: Gem Job Boards
+category: jobs
+description: "Upgrades jobs.gem.com/<org> boards and job posts to the keyless api.gem.com/job_board/v0/<org>/job_posts/ JSON feed."
+domains:
+  - jobs.gem.com
+exampleUrls:
+  - "https://jobs.gem.com/linear"
+
+routes:
+  # 1. Single job post (jobs.gem.com/<org>/<postId> -> api.gem.com/job_board/v0/<org>/job_posts/, falling back to board)
+  - match:
+      exactSegments: false
+      pathSegments:
+        - param: org
+          charset: slug
+          maxLen: 80
+        - param: postId
+          charset: pkg
+    twin:
+      id: gem-ats
+      fetchUrl: "https://api.gem.com/job_board/v0/{org}/job_posts/"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: posts
+      findInArray:
+        arrayPath: posts
+        matchFields:
+          - id
+          - public_id
+        matchTemplate: "{postId}"
+        endsWithField: absolute_url
+        endsWithTemplate: "/{postId}"
+      vars:
+        jobTitle:
+          paths: [title]
+          trim: true
+          default: "Job Posting"
+        loc:
+          paths: [location.name, location_type]
+          trim: true
+        depts:
+          paths: [departments]
+          subField: name
+          join: ", "
+        bodyHtml:
+          paths: [content]
+          format: html_to_md
+        bodyPlain:
+          paths: [content_plain]
+          trim: true
+        body:
+          template: "{bodyHtml}"
+          whenVars: [bodyHtml]
+          fallbackVar: bodyPlain
+      titleTemplate: "{jobTitle} @ {org}"
+      bullets:
+        - label: Company
+          template: "{org}"
+        - label: Location
+          template: "{loc}"
+          whenVar: loc
+        - label: Department
+          template: "{depts}"
+          whenVar: depts
+      bodyVar: body
+      fallbackExtract:
+        wrapRootArrayAs: posts
+        vars:
+          count:
+            paths: [posts]
+            format: array_len
+        requireVars:
+          - count
+        titleTemplate: "{org} — Gem Job Board ({count} open roles)"
+        sections:
+          - heading: ""
+            arrayPath: posts
+            limit: 100
+            emptyText: "No open positions currently listed."
+            itemVars:
+              pTitle:
+                paths: [title]
+                trim: true
+                default: Role
+              id:
+                paths: [id]
+              rawUrl:
+                paths: [absolute_url]
+                requireHttps: true
+              pUrl:
+                template: "{rawUrl}"
+                whenVars: [rawUrl]
+                fallbackTemplate: "https://jobs.gem.com/{org}/{id}"
+              loc:
+                paths: [location.name]
+                trim: true
+                default: "-"
+              wp:
+                paths: [location_type]
+                trim: true
+                default: "-"
+              created:
+                paths: [first_published_at, created_at]
+                sliceMax: 10
+                trim: true
+                default: "-"
+            collectLinkVars:
+              - pUrl
+            columns:
+              - header: Role
+                template: "[{pTitle}]({pUrl})"
+              - header: Location
+                template: "{loc}"
+              - header: Workplace
+                template: "{wp}"
+              - header: Published
+                template: "{created}"
+
+  # 2. Whole job board (jobs.gem.com/<org> -> api.gem.com/job_board/v0/<org>/job_posts/)
+  - match:
+      pathSegments:
+        - param: org
+          charset: slug
+          maxLen: 80
+    twin:
+      id: gem-ats
+      fetchUrl: "https://api.gem.com/job_board/v0/{org}/job_posts/"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: posts
+      vars:
+        count:
+          paths: [posts]
+          format: array_len
+      requireVars:
+        - count
+      titleTemplate: "{org} — Gem Job Board ({count} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: posts
+          limit: 100
+          emptyText: "No open positions currently listed."
+          itemVars:
+            pTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            id:
+              paths: [id]
+            rawUrl:
+              paths: [absolute_url]
+              requireHttps: true
+            pUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://jobs.gem.com/{org}/{id}"
+            loc:
+              paths: [location.name]
+              trim: true
+              default: "-"
+            wp:
+              paths: [location_type]
+              trim: true
+              default: "-"
+            created:
+              paths: [first_published_at, created_at]
+              sliceMax: 10
+              trim: true
+              default: "-"
+          collectLinkVars:
+            - pUrl
+          columns:
+            - header: Role
+              template: "[{pTitle}]({pUrl})"
+            - header: Location
+              template: "{loc}"
+            - header: Workplace
+              template: "{wp}"
+            - header: Published
+              template: "{created}"

@@ -6,16 +6,18 @@
  */
 
 import render from 'dom-serializer';
-import { type ChildNode, type Document, DomHandler, type Element, isTag, isText } from 'domhandler';
+import { type ChildNode, Document, Element, Text, isTag, isText } from 'domhandler';
+import { textContent } from 'domutils';
 import { Parser } from 'htmlparser2';
 
 const DEFAULT_MAX_HTML_DOC_CHARS = 2_097_152; // 2 MiB default input cap
-const HARD_MAX_HTML_DOC_CHARS = 4_194_304; // 4 MiB absolute ceiling
-const MAX_DOM_DEPTH = 256;
-const MAX_DOM_NODES = 24_000;
+const HARD_MAX_HTML_DOC_CHARS = 4_194_304; // 4 MiB absolute ceiling even when caller passes higher maxChars
+const MAX_DOM_DEPTH = 128;
+const MAX_DOM_NODES = 40_000;
+const MAX_OVERFLOW_TAG_EVENTS = 80_000;
 const MAX_DOC_TOTAL_VISITS = 90_000;
-const MAX_TEXT_NODES_PER_CALL = 20_000;
 const MAX_SERIALIZE_NODES_PER_CALL = 15_000;
+const MAX_DLMAP_VISITS = 4_000;
 const MAX_SELECTOR_CHARS = 256;
 const MAX_SELECTOR_GROUPS = 16;
 const MAX_COMBINATOR_STEPS = 8;
@@ -25,7 +27,34 @@ interface VisitBudget {
   remaining: number;
 }
 
-const STRIPPED_TEXT_TAGS: ReadonlySet<string> = new Set(['script', 'style', 'noscript', 'template']);
+const STRIPPED_TEXT_TAGS: ReadonlySet<string> = new Set([
+  'script',
+  'style',
+  'noscript',
+  'template',
+  'svg',
+  'xmp',
+  'plaintext',
+  'textarea',
+]);
+
+const VOID_HTML_TAGS: ReadonlySet<string> = new Set([
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'keygen',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr',
+]);
 
 const BLOCK_BOUNDARY_TAGS: ReadonlySet<string> = new Set([
   'address',
@@ -597,65 +626,252 @@ function collapseAndTrimWhitespace(raw: string): string {
   return out;
 }
 
-function extractCleanNodeText(node: Document | Element, budget: VisitBudget): string {
-  if (budget.remaining <= 0) return '';
+function isSimpleLeafTextElement(node: Document | Element): boolean {
+  if (!isTag(node)) return false;
+  if (STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) return false;
+  for (const child of node.children) {
+    if (!isText(child)) return false;
+  }
+  return true;
+}
+
+const CLEAN_NODE_TEXT_CACHE = new WeakMap<Document | Element, string>();
+const RAW_NODE_TEXT_CACHE = new WeakMap<Document | Element, string>();
+
+function computeRawNodeTextCached(
+  node: Document | Element,
+  rawCache: WeakMap<Document | Element, string>,
+  budget: VisitBudget,
+): string {
+  const hit = rawCache.get(node);
+  if (hit !== undefined) return hit;
+
   if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
+    rawCache.set(node, '');
     return '';
   }
 
-  const children = node.children;
-  if (children.length === 0) return '';
+  // Iterative post-order evaluation so deep subtrees never recurse and every Element is computed at most once.
+  const stack: Array<{ target: Document | Element; childIdx: number; chunks: string[] }> = [
+    { target: node, childIdx: 0, chunks: [] },
+  ];
 
-  // Fast leaf check without recursion
-  if (children.length === 1 && isText(children[0]!)) {
-    budget.remaining--;
-    return collapseAndTrimWhitespace(children[0]!.data);
-  }
-
-  const out: string[] = [];
-  const stack: Array<ChildNode | string> = [];
-  for (let i = children.length - 1; i >= 0; i--) {
-    stack.push(children[i]!);
-  }
-
-  let localVisits = 0;
   while (stack.length > 0) {
-    const item = stack.pop()!;
-    if (typeof item === 'string') {
-      out.push(item);
+    const top = stack[stack.length - 1]!;
+    const children = top.target.children;
+    if (top.childIdx >= children.length || budget.remaining <= 0) {
+      const joined = top.chunks.length === 0 ? '' : top.chunks.join('');
+      rawCache.set(top.target, joined);
+      stack.pop();
+      if (stack.length > 0) {
+        const parentFrame = stack[stack.length - 1]!;
+        const finishedTag = isTag(top.target) ? top.target.name.toLowerCase() : '';
+        const isBlock = finishedTag !== '' && BLOCK_BOUNDARY_TAGS.has(finishedTag);
+        if (isBlock) parentFrame.chunks.push(' ');
+        if (joined) parentFrame.chunks.push(joined);
+        if (isBlock) parentFrame.chunks.push(' ');
+      }
       continue;
     }
-    if (budget.remaining <= 0 || localVisits >= MAX_TEXT_NODES_PER_CALL) break;
+
     budget.remaining--;
-    localVisits++;
-
-    if (isText(item)) {
-      if (item.data) out.push(item.data);
+    const child = children[top.childIdx++]!;
+    if (isText(child)) {
+      if (child.data) top.chunks.push(child.data);
       continue;
     }
-    if (!isTag(item)) continue;
-
-    const tagLower = item.name.toLowerCase();
+    if (!isTag(child)) continue;
+    const tagLower = child.name.toLowerCase();
     if (STRIPPED_TEXT_TAGS.has(tagLower)) continue;
     if (tagLower === 'br' || tagLower === 'hr') {
-      out.push(' ');
+      top.chunks.push(' ');
       continue;
     }
-
-    const isBlock = BLOCK_BOUNDARY_TAGS.has(tagLower);
-    if (isBlock) out.push(' ');
-    if (item.children.length > 0) {
-      if (isBlock) stack.push(' ');
-      for (let i = item.children.length - 1; i >= 0; i--) {
-        stack.push(item.children[i]!);
-      }
-    } else if (isBlock) {
-      out.push(' ');
+    const cachedChild = rawCache.get(child);
+    if (cachedChild !== undefined) {
+      const isBlock = BLOCK_BOUNDARY_TAGS.has(tagLower);
+      if (isBlock) top.chunks.push(' ');
+      if (cachedChild) top.chunks.push(cachedChild);
+      if (isBlock) top.chunks.push(' ');
+      continue;
     }
+    stack.push({ target: child, childIdx: 0, chunks: [] });
   }
 
-  if (out.length === 0) return '';
-  return collapseAndTrimWhitespace(out.join(''));
+  return rawCache.get(node) ?? '';
+}
+
+function extractCleanNodeText(node: Document | Element, budget: VisitBudget): string {
+  const cached = CLEAN_NODE_TEXT_CACHE.get(node);
+  if (cached !== undefined) return cached;
+  if (budget.remaining <= 0) return '';
+  if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
+    CLEAN_NODE_TEXT_CACHE.set(node, '');
+    return '';
+  }
+  let clean: string;
+  if (isSimpleLeafTextElement(node)) {
+    budget.remaining--;
+    clean = collapseAndTrimWhitespace(textContent(node));
+  } else {
+    const raw = computeRawNodeTextCached(node, RAW_NODE_TEXT_CACHE, budget);
+    clean = raw ? collapseAndTrimWhitespace(raw) : '';
+  }
+  CLEAN_NODE_TEXT_CACHE.set(node, clean);
+  return clean;
+}
+
+function isVoidElementSpan(src: string, start: number, endIndex: number, inForeign: boolean): boolean {
+  const len = endIndex - start;
+  if (len < 2 || len > 6) return false;
+  // Fast non-allocating reject for `div`, `span`, `table`, `p`, `tr`, `td`, `th`, `ul`, `li`, `dl`, `dt`, `dd`
+  const c0 = src.charCodeAt(start) | 32;
+  if (c0 === 100 /* 'd' */ || c0 === 112 /* 'p' && len !== 5 */) {
+    if (c0 === 100) return false; // no HTML void element starts with 'd'
+    if (len !== 5) return false; // only 'param' starts with 'p'
+  }
+  const rawName = src.slice(start, endIndex).toLowerCase();
+  if (rawName === 'image') return !inForeign;
+  return VOID_HTML_TAGS.has(rawName);
+}
+
+class BoundedHtmlParser extends Parser {
+  private overflowDepth = 0;
+  private overflowEvents = 0;
+  private currentOpenOverflowed = false;
+  private readonly sourceHtml: string;
+  public overflowHalted = false;
+
+  constructor(
+    sourceHtml: string,
+    cbs: ConstructorParameters<typeof Parser>[0],
+    options: ConstructorParameters<typeof Parser>[1],
+  ) {
+    super(cbs, options);
+    this.sourceHtml = sourceHtml;
+  }
+
+  override onopentagname(start: number, endIndex: number): void {
+    const stackLen = (this as unknown as { stack: string[] }).stack.length;
+    if (stackLen >= MAX_DOM_DEPTH && !isVoidElementSpan(this.sourceHtml, start, endIndex, this.isInForeignContext())) {
+      this.endIndex = endIndex;
+      this.overflowDepth++;
+      this.overflowEvents++;
+      this.currentOpenOverflowed = true;
+      (this as unknown as { tagname: string }).tagname = '';
+      if (this.overflowEvents >= MAX_OVERFLOW_TAG_EVENTS) {
+        this.overflowHalted = true;
+        this.pause();
+      }
+      return;
+    }
+    this.currentOpenOverflowed = false;
+    super.onopentagname(start, endIndex);
+  }
+
+  override onselfclosingtag(endIndex: number): void {
+    if (this.currentOpenOverflowed) {
+      this.currentOpenOverflowed = false;
+      if (this.isInForeignContext()) {
+        this.overflowDepth = Math.max(0, this.overflowDepth - 1);
+      }
+      this.startIndex = endIndex + 1;
+      return;
+    }
+    super.onselfclosingtag(endIndex);
+  }
+
+  override onclosetag(start: number, endIndex: number): void {
+    this.currentOpenOverflowed = false;
+    if (this.overflowDepth > 0) {
+      this.endIndex = endIndex;
+      if (!isVoidElementSpan(this.sourceHtml, start, endIndex, this.isInForeignContext())) {
+        this.overflowDepth--;
+      }
+      this.startIndex = endIndex + 1;
+      return;
+    }
+    super.onclosetag(start, endIndex);
+  }
+}
+
+function buildBoundedDomDocument(html: string): Document {
+  const root = new Document([]);
+  const stack: Array<Document | Element> = [root];
+  let nodeCount = 0;
+  let halted = false;
+
+  const appendChildLinear = (parent: Document | Element, child: ChildNode) => {
+    const siblings = parent.children;
+    const prev = siblings.length > 0 ? siblings[siblings.length - 1]! : null;
+    child.parent = parent;
+    child.prev = prev;
+    child.next = null;
+    if (prev) prev.next = child;
+    siblings.push(child);
+  };
+
+  let parserRef: BoundedHtmlParser | null = null;
+  const haltParser = () => {
+    halted = true;
+    parserRef?.pause();
+  };
+
+  const parser = new BoundedHtmlParser(
+    html,
+    {
+      onopentag(name, attribs) {
+        if (halted) return;
+        if (nodeCount >= MAX_DOM_NODES) {
+          haltParser();
+          return;
+        }
+        if (stack.length - 1 < MAX_DOM_DEPTH) {
+          const el = new Element(name, attribs, []);
+          appendChildLinear(stack[stack.length - 1]!, el);
+          stack.push(el);
+          nodeCount++;
+        }
+      },
+      ontext(data) {
+        if (halted || !data) return;
+        const parent = stack[stack.length - 1]!;
+        const siblings = parent.children;
+        const last = siblings.length > 0 ? siblings[siblings.length - 1]! : null;
+        if (last && isText(last)) {
+          last.data += data;
+          return;
+        }
+        if (nodeCount >= MAX_DOM_NODES) {
+          haltParser();
+          return;
+        }
+        appendChildLinear(parent, new Text(data));
+        nodeCount++;
+      },
+      onclosetag() {
+        if (halted) return;
+        if (stack.length > 1) {
+          stack.pop();
+        }
+      },
+    },
+    {
+      decodeEntities: true,
+      lowerCaseTags: true,
+      lowerCaseAttributeNames: true,
+    },
+  );
+  parserRef = parser;
+
+  const PARSE_CHUNK_CHARS = 32_768;
+  for (let off = 0; off < html.length && !halted && !parser.overflowHalted; off += PARSE_CHUNK_CHARS) {
+    parser.write(html.slice(off, off + PARSE_CHUNK_CHARS));
+  }
+  if (!halted && !parser.overflowHalted) {
+    parser.end();
+  }
+  return root;
 }
 
 type WalkDirective = boolean | 'skip' | void;
@@ -703,68 +919,6 @@ function chargeSerializeBudget(nodes: readonly ChildNode[], budget: VisitBudget)
     }
   }
   return true;
-}
-
-class BoundedDomHandler extends DomHandler {
-  private nodeCount = 0;
-  private overflowDepth = 0;
-  private overflowNodes = 0;
-  private hostParser: Parser | null = null;
-  public halted = false;
-
-  attachParser(p: Parser): void {
-    this.hostParser = p;
-  }
-
-  private forceHalt(): void {
-    this.halted = true;
-    this.hostParser?.pause();
-  }
-
-  private haltIfExceeded(): boolean {
-    if (this.halted) return true;
-    if (this.nodeCount >= MAX_DOM_NODES) {
-      this.forceHalt();
-      return true;
-    }
-    return false;
-  }
-
-  override onopentag(name: string, attribs: { [key: string]: string }): void {
-    this.nodeCount++;
-    if (this.haltIfExceeded()) return;
-    if (this.overflowDepth > 0 || this.tagStack.length > MAX_DOM_DEPTH) {
-      this.overflowDepth++;
-      this.overflowNodes++;
-      if (this.overflowNodes >= 1_024) {
-        this.forceHalt();
-      }
-      return;
-    }
-    super.onopentag(name, attribs);
-  }
-
-  override onclosetag(): void {
-    if (this.halted) return;
-    if (this.overflowDepth > 0) {
-      this.overflowDepth--;
-      return;
-    }
-    super.onclosetag();
-  }
-
-  override ontext(data: string): void {
-    if (this.halted) return;
-    this.nodeCount++;
-    if (this.haltIfExceeded()) return;
-    super.ontext(data);
-  }
-
-  override oncomment(_data: string): void {
-    // Comments are unused by CSS selectors / text extraction; skip allocating Comment nodes.
-  }
-
-  override oncommentend(): void {}
 }
 
 export class HtmlNode {
@@ -863,10 +1017,15 @@ export class HtmlNode {
     const containers = subSelector !== undefined ? this.select(subSelector, 200) : [this];
     const out: Record<string, string> = {};
     let count = 0;
+    let visits = 0;
+    const seenElements = new Set<Element>();
 
     for (const container of containers) {
+      if (isTag(container.node) && seenElements.has(container.node)) continue;
       let pendingKey = '';
       walkSubtreeElements(container.node, this.budget, (el) => {
+        if (++visits > MAX_DLMAP_VISITS) return false;
+        seenElements.add(el);
         const t = el.name.toLowerCase();
         if (t === 'dt') {
           pendingKey = stripTrailingColonsAndWhitespace(
@@ -888,7 +1047,7 @@ export class HtmlNode {
         }
         return undefined;
       });
-      if (count >= 200 || this.budget.remaining <= 0) break;
+      if (count >= 200 || visits > MAX_DLMAP_VISITS || this.budget.remaining <= 0) break;
     }
 
     return out;
@@ -944,21 +1103,15 @@ export function parseHtmlDoc(rawHtml: string, maxChars = DEFAULT_MAX_HTML_DOC_CH
     Number.isFinite(maxChars) && maxChars > 0
       ? Math.min(HARD_MAX_HTML_DOC_CHARS, Math.floor(maxChars))
       : DEFAULT_MAX_HTML_DOC_CHARS;
-  const safeHtml =
+  let safeHtml =
     typeof rawHtml === 'string'
       ? rawHtml.length > effectiveMax
         ? rawHtml.slice(0, effectiveMax)
         : rawHtml
       : '';
-  const handler = new BoundedDomHandler();
-  const parser = new Parser(handler);
-  handler.attachParser(parser);
-  const PARSE_CHUNK_CHARS = 16_384;
-  for (let off = 0; off < safeHtml.length && !handler.halted; off += PARSE_CHUNK_CHARS) {
-    parser.write(safeHtml.slice(off, off + PARSE_CHUNK_CHARS));
+  if (safeHtml.includes('\0') || safeHtml.includes('&#')) {
+    safeHtml = safeHtml.replace(/\0|&#(?:0+|x0+);/gi, '');
   }
-  if (!handler.halted) {
-    parser.end();
-  }
-  return new HtmlDoc(handler.root);
+  const doc = buildBoundedDomDocument(safeHtml);
+  return new HtmlDoc(doc);
 }

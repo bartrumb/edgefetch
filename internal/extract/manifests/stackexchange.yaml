@@ -1,0 +1,148 @@
+# Shared Go + TypeScript Declarative Site Adapter: Stack Overflow & Stack Exchange Q&A
+id: stackexchange-qa
+name: "Stack Overflow & Stack Exchange Q&A"
+category: developer
+description: "Upgrades Stack Overflow / Stack Exchange URLs to keyless API v2.3 native Markdown (with HTML fallback), sorting the Accepted Answer first."
+domains:
+  - stackoverflow.com
+  - www.stackoverflow.com
+  - serverfault.com
+  - superuser.com
+  - askubuntu.com
+  - mathoverflow.net
+  - stackapps.com
+  - "*.stackexchange.com"
+exampleUrls:
+  - "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster-than-processing-an-unsorted-array"
+
+# Pre-fetch keyless Stack Exchange API v2.3 twin
+match:
+  hostMap:
+    param: siteParam
+    stripWww: true
+    exact:
+      stackoverflow.com: stackoverflow
+      serverfault.com: serverfault
+      superuser.com: superuser
+      askubuntu.com: askubuntu
+      mathoverflow.net: mathoverflow
+      stackapps.com: stackapps
+    suffixSubdomain: .stackexchange.com
+  exactSegments: false
+  pathSegments:
+    - param: qPrefix
+      allowValues:
+        - questions
+        - q
+    - param: qid
+      charset: digits
+
+twin:
+  fetchUrl: "https://api.stackexchange.com/2.3/questions/{qid}?site={siteParam}&filter=%2120aKG._8Oscv%2A6dguVOli"
+  kind: json
+  accept: application/json
+
+extract:
+  rootPath: "items.0"
+  requireFields:
+    - title
+  vars:
+    title:
+      paths:
+        - title
+      format: strip_tags
+    score:
+      paths:
+        - score
+      default: "0"
+    tags:
+      paths:
+        - tags
+      limit: 8
+      itemWrap: "`"
+      join: ", "
+    qMdRaw:
+      paths:
+        - body_markdown
+      format: se_markdown
+    qHtmlMd:
+      paths:
+        - body
+      format: html_to_md
+    qMd:
+      template: "{qMdRaw}"
+      whenVars:
+        - qMdRaw
+      fallbackVar: qHtmlMd
+    link:
+      paths:
+        - link
+      requireHttps: true
+  requireVars:
+    - qMd
+  titleTemplate: "{title}"
+  metaLine:
+    - label: Votes
+      template: "{score}"
+    - label: Tags
+      template: "{tags}"
+      whenVar: tags
+  sections:
+    - heading: Question
+      textVar: qMd
+    - heading: ""
+      subsectionsArrayPath: answers
+      sortBy:
+        boolDescField: is_accepted
+        numDescField: score
+      limit: 8
+      requireItemVar: ansMd
+      subsectionHeadingTemplate: "Answer {index1} (Score: {scoreLabel})"
+      subsectionAltWhenVar: acceptedFlag
+      subsectionAltHeadingTemplate: "\u2705 Accepted Answer (Score: {scoreLabel})"
+      subsectionBodyVar: ansMd
+      itemVars:
+        ansMdRaw:
+          paths:
+            - body_markdown
+          format: se_markdown
+        ansHtmlMd:
+          paths:
+            - body
+          format: html_to_md
+        ansMd:
+          template: "{ansMdRaw}"
+          whenVars:
+            - ansMdRaw
+          fallbackVar: ansHtmlMd
+        ansScore:
+          paths:
+            - score
+          default: "0"
+        ansAuthor:
+          paths:
+            - "owner.display_name"
+          format: strip_tags
+        scoreLabel:
+          template: "{ansScore} \u2014 by {ansAuthor}"
+          whenVars:
+            - ansAuthor
+          fallbackVar: ansScore
+        acceptedFlag:
+          paths:
+            - is_accepted
+          format: bool_map
+          trueValue: "1"
+          falseValue: ""
+  linksVars:
+    - link
+
+# Post-fetch HTML fallback when API quota/network is unavailable
+htmlRoutes:
+  - match:
+      exactSegments: false
+      pathSegments:
+        - questions
+        - param: qid
+          charset: digits
+    mode: stackexchange_html

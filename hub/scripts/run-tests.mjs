@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildSync } from 'esbuild';
 import { collectAndPrintCoverage } from './v8-coverage.mjs';
 
@@ -21,6 +22,9 @@ function resolveRealPath(p) {
   }
   return realpathSync(p);
 }
+
+const scriptsDir = dirname(fileURLToPath(import.meta.url));
+execFileSync(process.execPath, [join(scriptsDir, 'compile-manifests.mjs')], { stdio: 'inherit' });
 
 const dir = resolveRealPath(mkdtempSync(join(tmpdir(), 'edgefetch-hub-test-')));
 const unitOutfile = join(dir, 'hub.test.mjs');

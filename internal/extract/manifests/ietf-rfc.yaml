@@ -1,0 +1,30 @@
+# Shared Go + TypeScript Declarative Site Adapter: IETF Datatracker & RFC Editor
+id: ietf-rfc
+name: "IETF Datatracker & RFC Editor"
+category: developer
+description: "Strips ASCII RFC running page headers/footers ([Page N]) and promotes numbered section headings to Markdown headings."
+domains:
+  - datatracker.ietf.org
+  - rfc-editor.org
+  - www.rfc-editor.org
+exampleUrls:
+  - "https://datatracker.ietf.org/doc/html/rfc9421"
+  - "https://www.rfc-editor.org/rfc/rfc9110"
+
+# Post-fetch RFC page-break header/footer stripping and heading promotion
+htmlRoutes:
+  - match:
+      anyOf:
+        - hosts:
+            - datatracker.ietf.org
+          pathPrefix: /doc/html/rfc
+        - hosts:
+            - datatracker.ietf.org
+          pathPrefix: /doc/html/draft-
+        - hosts:
+            - rfc-editor.org
+            - www.rfc-editor.org
+          pathPrefix: /rfc/rfc
+          minSegments: 2
+    mode: markdown_clean
+    cleanPreset: ietf_rfc

@@ -1,0 +1,331 @@
+# Shared Go + TypeScript Declarative Site Adapter: Greenhouse & Lever Whole-Board + EU APIs
+id: greenhouse-lever-boards
+name: "Greenhouse & Lever Whole-Board + EU APIs"
+category: jobs
+description: "Upgrades Greenhouse (US & EU) and Lever (US & EU) board root URLs to their official JSON posting feeds with truncation metadata."
+domains:
+  - boards.greenhouse.io
+  - job-boards.greenhouse.io
+  - eu-boards.greenhouse.io
+  - job-boards.eu.greenhouse.io
+  - jobs.lever.co
+  - jobs.eu.lever.co
+exampleUrls:
+  - "https://job-boards.greenhouse.io/cloudflare"
+  - "https://eu-boards.greenhouse.io/celonis"
+  - "https://jobs.lever.co/mistral"
+
+routes:
+  # 1. Greenhouse US whole-board API
+  - match:
+      hosts:
+        - boards.greenhouse.io
+        - job-boards.greenhouse.io
+      pathSegments:
+        - param: org
+          charset: pkg
+          maxLen: 80
+          reserved:
+            - embed
+            - v1
+            - api
+            - static
+            - assets
+            - favicon.ico
+    twin:
+      id: greenhouse-board
+      fetchUrl: "https://boards-api.greenhouse.io/v1/boards/{org}/jobs"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+        total:
+          paths: [meta.total]
+          fallbackTemplate: "{jobCount}"
+      requireVars:
+        - jobCount
+      titleTemplate: "{org} — Greenhouse Job Board ({total} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 120
+          linkScanLimit: 2000
+          emptyText: "No open positions currently listed."
+          paginationMeta:
+            totalPath: meta.total
+            cursorMode: offset
+          itemVars:
+            jTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            id:
+              paths: [id]
+            rawUrl:
+              paths: [absolute_url]
+              requireHttps: true
+            jUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://{host}/{org}/jobs/{id}"
+            dept:
+              paths: [departments]
+              subField: name
+              join: ", "
+              default: "-"
+            loc:
+              paths: [location.name]
+              trim: true
+              default: "-"
+            updated:
+              paths: [updated_at]
+              sliceMax: 10
+              trim: true
+              default: "-"
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Department
+              template: "{dept}"
+            - header: Location
+              template: "{loc}"
+            - header: Updated
+              template: "{updated}"
+
+  # 2. Greenhouse EU whole-board API
+  - match:
+      hosts:
+        - eu-boards.greenhouse.io
+        - job-boards.eu.greenhouse.io
+      pathSegments:
+        - param: org
+          charset: pkg
+          maxLen: 80
+          reserved:
+            - embed
+            - v1
+            - api
+            - static
+            - assets
+            - favicon.ico
+    twin:
+      id: greenhouse-eu-board
+      fetchUrl: "https://boards-api.eu.greenhouse.io/v1/boards/{org}/jobs"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+        total:
+          paths: [meta.total]
+          fallbackTemplate: "{jobCount}"
+      requireVars:
+        - jobCount
+      titleTemplate: "{org} — Greenhouse Job Board ({total} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 120
+          linkScanLimit: 2000
+          emptyText: "No open positions currently listed."
+          paginationMeta:
+            totalPath: meta.total
+            cursorMode: offset
+          itemVars:
+            jTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            id:
+              paths: [id]
+            rawUrl:
+              paths: [absolute_url]
+              requireHttps: true
+            jUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://{host}/{org}/jobs/{id}"
+            dept:
+              paths: [departments]
+              subField: name
+              join: ", "
+              default: "-"
+            loc:
+              paths: [location.name]
+              trim: true
+              default: "-"
+            updated:
+              paths: [updated_at]
+              sliceMax: 10
+              trim: true
+              default: "-"
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Department
+              template: "{dept}"
+            - header: Location
+              template: "{loc}"
+            - header: Updated
+              template: "{updated}"
+
+  # 3. Lever US whole-board API
+  - match:
+      hosts:
+        - jobs.lever.co
+      pathSegments:
+        - param: org
+          charset: pkg
+          maxLen: 80
+          reserved:
+            - embed
+            - v1
+            - api
+            - static
+            - assets
+            - favicon.ico
+    twin:
+      id: lever-board
+      fetchUrl: "https://api.lever.co/v0/postings/{org}?mode=json"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: jobs
+      vars:
+        total:
+          paths: [jobs]
+          format: array_len
+      requireVars:
+        - total
+      titleTemplate: "{org} — Lever Job Board ({total} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 120
+          linkScanLimit: 2000
+          emptyText: "No open positions currently listed."
+          paginationMeta:
+            cursorMode: last_id
+            idField: id
+          itemVars:
+            jTitle:
+              paths: [text]
+              trim: true
+              default: Role
+            id:
+              paths: [id]
+            rawUrl:
+              paths: [hostedUrl]
+              requireHttps: true
+            jUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://{host}/{org}/{id}"
+            team:
+              paths: [categories.team, categories.department]
+              trim: true
+              default: "-"
+            loc:
+              paths: [categories.location]
+              trim: true
+              default: "-"
+            wp:
+              paths: [workplaceType]
+              trim: true
+              default: "-"
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Team
+              template: "{team}"
+            - header: Location
+              template: "{loc}"
+            - header: Workplace
+              template: "{wp}"
+
+  # 4. Lever EU whole-board API
+  - match:
+      hosts:
+        - jobs.eu.lever.co
+      pathSegments:
+        - param: org
+          charset: pkg
+          maxLen: 80
+          reserved:
+            - embed
+            - v1
+            - api
+            - static
+            - assets
+            - favicon.ico
+    twin:
+      id: lever-eu-board
+      fetchUrl: "https://api.eu.lever.co/v0/postings/{org}?mode=json"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: jobs
+      vars:
+        total:
+          paths: [jobs]
+          format: array_len
+      requireVars:
+        - total
+      titleTemplate: "{org} — Lever Job Board ({total} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 120
+          linkScanLimit: 2000
+          emptyText: "No open positions currently listed."
+          paginationMeta:
+            cursorMode: last_id
+            idField: id
+          itemVars:
+            jTitle:
+              paths: [text]
+              trim: true
+              default: Role
+            id:
+              paths: [id]
+            rawUrl:
+              paths: [hostedUrl]
+              requireHttps: true
+            jUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://{host}/{org}/{id}"
+            team:
+              paths: [categories.team, categories.department]
+              trim: true
+              default: "-"
+            loc:
+              paths: [categories.location]
+              trim: true
+              default: "-"
+            wp:
+              paths: [workplaceType]
+              trim: true
+              default: "-"
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Team
+              template: "{team}"
+            - header: Location
+              template: "{loc}"
+            - header: Workplace
+              template: "{wp}"

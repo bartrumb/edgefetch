@@ -8,21 +8,18 @@
  */
 
 import { runAdapterSyncInBulkhead } from '../adapter-sandbox';
-import { BUILTIN_SITE_ADAPTERS } from './providers/index';
 import {
   enrichShopifyProductFromJson,
+  enrichWooCommerceProductFromStoreApi,
   extractShopifyCurrencyFromHtml,
   isShopifyHtmlOrHeaders,
-  normalizeShopifyProductRecord,
-  resolveCustomDomainShopifyProductTwinUrl,
-} from './providers/commerce-social/shopify';
-import woocommerceAdapter, {
-  enrichWooCommerceProductFromStoreApi,
   isWooCommerceHtmlOrHeaders,
+  normalizeShopifyProductRecord,
   normalizeWooCommerceProductRecord,
+  resolveCustomDomainShopifyProductTwinUrl,
   resolveCustomDomainWooCommerceProductTwinUrl,
-} from './providers/commerce-social/woocommerce';
-import icimsAdapter from './providers/jobs/icims';
+} from './commerce-engine';
+import { DECLARATIVE_SITE_ADAPTERS } from './declarative';
 import type {
   AdapterCatalogEntry,
   AdapterCategory,
@@ -141,20 +138,22 @@ class AdapterRegistryIndex {
   }
 }
 
-const EXTRA_REGISTERED_ADAPTERS: SiteAdapter[] = [woocommerceAdapter, icimsAdapter];
-const ALL_REGISTERED_ADAPTERS: SiteAdapter[] = (() => {
-  const seenIds = new Set<string>();
-  const out: SiteAdapter[] = [];
-  for (const a of [...BUILTIN_SITE_ADAPTERS, ...EXTRA_REGISTERED_ADAPTERS]) {
-    if (!seenIds.has(a.id)) {
-      seenIds.add(a.id);
-      out.push(a);
-    }
-  }
-  return out;
-})();
+const ALL_REGISTERED_ADAPTERS: SiteAdapter[] = [...DECLARATIVE_SITE_ADAPTERS];
 
 const DEFAULT_INDEX = new AdapterRegistryIndex(ALL_REGISTERED_ADAPTERS);
+
+/** Looks up a registered declarative `SiteAdapter` by exact `id`. */
+export function getRegisteredAdapterById(id: string): SiteAdapter {
+  const found = DEFAULT_INDEX.all.find((a) => a.id === id);
+  if (!found) {
+    throw new Error(`Missing required declarative site adapter "${id}"`);
+  }
+  return found;
+}
+
+export const shopifyAdapter: SiteAdapter = getRegisteredAdapterById('shopify');
+export const woocommerceAdapter: SiteAdapter = getRegisteredAdapterById('woocommerce');
+export const icimsAdapter: SiteAdapter = getRegisteredAdapterById('icims');
 
 /** Go worker `classify.AcceptFor(KindText, ...)` strict MIME allowlist (`internal/classify/classify.go`). */
 export const GO_KIND_TEXT_ACCEPT_ALLOWLIST = new Set([
@@ -179,15 +178,31 @@ function normalizeTwinAcceptForGo(kind: string, rawAccept: string): string {
   return 'text/plain';
 }
 
-/** Validates that a twin target URL is strictly `https://` with no embedded credentials. */
+/** Validates that a twin target URL is strictly `https://` with no embedded credentials, fragments, or loopback/rebinding hosts. */
 function isSafePublicTwinUrl(fetchUrl: string): boolean {
   try {
     const u = new URL(fetchUrl);
-    if (u.protocol !== 'https:' || u.username || u.password) return false;
-    const h = u.hostname.toLowerCase();
-    if (!h || h === 'localhost' || h.endsWith('.local') || h.endsWith('.internal') || /^\d+\.\d+\.\d+\.\d+$/.test(h) || h.includes(':')) {
+    if (u.protocol !== 'https:' || u.username || u.password || u.hash) return false;
+    if (u.port && u.port !== '443') return false;
+    const rawHost = u.hostname.toLowerCase();
+    const h = rawHost.endsWith('.') ? rawHost.slice(0, -1) : rawHost;
+    if (
+      !h ||
+      !h.includes('.') ||
+      h === 'localhost' ||
+      h.endsWith('.localhost') ||
+      h.endsWith('.local') ||
+      h.endsWith('.internal') ||
+      h.endsWith('.nip.io') ||
+      h.endsWith('.sslip.io') ||
+      h.endsWith('.xip.io') ||
+      /^\d+\.\d+\.\d+\.\d+$/.test(h) ||
+      h.includes(':')
+    ) {
       return false;
     }
+    const lastLabel = h.slice(h.lastIndexOf('.') + 1);
+    if (!lastLabel || /^\d+$/.test(lastLabel)) return false;
     return true;
   } catch {
     return false;

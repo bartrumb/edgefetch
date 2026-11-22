@@ -1,0 +1,17 @@
+# Shared Go + TypeScript Declarative Site Adapter: Reddit Threads & Comments
+id: reddit-thread
+name: "Reddit Threads & Comments"
+category: commerce-social
+description: "Extracts shreddit-post prose, subreddit/author/score metadata, and nested shreddit-comment trees."
+domains:
+  - reddit.com
+  - "*.reddit.com"
+exampleUrls:
+  - https://www.reddit.com/r/golang/comments/1abc123/single_binary_deployments/
+
+# Post-fetch custom element extractor for <shreddit-post> and <shreddit-comment>
+htmlRoutes:
+  - id: reddit-thread
+    match:
+      pathContainsSegment: comments
+    mode: reddit_shreddit

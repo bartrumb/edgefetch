@@ -1,0 +1,78 @@
+# Shared Go + TypeScript Declarative Site Adapter: Hacker News (Algolia API)
+id: hackernews
+name: "Hacker News Stories & Who is Hiring (Algolia API)"
+category: commerce-social
+description: "Upgrades news.ycombinator.com/item?id=<id> threads (including monthly Who is Hiring threads) to hn.algolia.com/api/v1/items/<id> JSON."
+domains:
+  - news.ycombinator.com
+exampleUrls:
+  - "https://news.ycombinator.com/item?id=41000000"
+
+# Matches /item?id=<digits> up to 12 digits
+match:
+  exactSegments: true
+  pathSegments:
+    - item
+  queryParams:
+    - name: id
+      param: itemId
+      charset: digits
+      minLen: 1
+      maxLen: 12
+
+twin:
+  id: hackernews
+  fetchUrl: "https://hn.algolia.com/api/v1/items/{itemId}"
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - id
+  vars:
+    title:
+      paths: [title]
+      trim: true
+      fallbackTemplate: "HN Comment #{itemId}"
+    author:
+      paths: [author]
+    points:
+      paths: [points]
+    createdAt:
+      paths: [created_at]
+    postedDate:
+      paths: [created_at]
+      sliceMax: 10
+    storyUrl:
+      paths: [url]
+    storyText:
+      paths: [text]
+      format: html_to_md
+  titleTemplate: "{title}"
+  authorVar: author
+  publishedTimeVar: createdAt
+  metaLine:
+    - label: Points
+      template: "{points}"
+      whenVar: points
+    - label: By
+      template: "{author}"
+      whenVar: author
+    - label: Posted
+      template: "{postedDate}"
+      whenVar: postedDate
+    - label: URL
+      template: "{storyUrl}"
+      whenVar: storyUrl
+  bodyVar: storyText
+  linksVars:
+    - storyUrl
+  sections:
+    - heading: Comments
+      headingTemplate: "Comments ({topCount} top-level)"
+      treeComments:
+        childrenPath: children
+        authorPath: author
+        htmlTextPath: text
+        maxDepth: 2
+        maxItems: 60

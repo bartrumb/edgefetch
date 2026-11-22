@@ -1,0 +1,341 @@
+# Shared Go + TypeScript Declarative Site Adapter: npm Package Registry
+id: npm-registry
+name: npm Package Registry
+category: developer
+description: "Upgrades npmjs.com package pages to registry.npmjs.org JSON metadata, TypeScript declarations, dependency list, and README."
+domains:
+  - npmjs.com
+  - www.npmjs.com
+exampleUrls:
+  - "https://www.npmjs.com/package/@cloudflare/workers-types"
+
+routes:
+  # Route 1: Scoped npm package /package/@<scopeNoAt>/<pkg>[/v/<requestedVer>]
+  - match:
+      anyOf:
+        - pathPrefix: "/package/@"
+          exactSegments: false
+          pathSegments:
+            - package
+            - param: scopeNoAt
+              stripPrefix: "@"
+              charset: npm_pkg
+            - param: pkg
+              charset: npm_pkg
+            - v
+            - param: requestedVer
+              charset: url_seg
+        - pathPrefix: "/package/@"
+          exactSegments: false
+          pathSegments:
+            - package
+            - param: scopeNoAt
+              stripPrefix: "@"
+              charset: npm_pkg
+            - param: pkg
+              charset: npm_pkg
+    twin:
+      fetchUrl: "https://registry.npmjs.org/@{scopeNoAt}%2F{pkg}"
+      kind: json
+      accept: application/json
+    extract:
+      requireFields:
+        - name
+      vars:
+        name:
+          paths:
+            - name
+        latestTag:
+          paths:
+            - "dist-tags.latest"
+        ver:
+          template: "{requestedVer}"
+          whenVars:
+            - requestedVer
+          fallbackVar: latestTag
+        verDesc:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: description
+          trim: true
+        rootDesc:
+          paths:
+            - description
+          trim: true
+        desc:
+          template: "{verDesc}"
+          whenVars:
+            - verDesc
+          fallbackVar: rootDesc
+        verLicense:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: license
+        rootLicense:
+          paths:
+            - license
+        license:
+          template: "{verLicense}"
+          whenVars:
+            - verLicense
+          fallbackVar: rootLicense
+        verHomepage:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: homepage
+        rootHomepage:
+          paths:
+            - homepage
+        homepage:
+          template: "{verHomepage}"
+          whenVars:
+            - verHomepage
+          fallbackVar: rootHomepage
+        verRepoUrl:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: "repository.url"
+        verRepoStr:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: repository
+        verRepo:
+          template: "{verRepoUrl}"
+          whenVars:
+            - verRepoUrl
+          fallbackVar: verRepoStr
+        rootRepo:
+          paths:
+            - "repository.url"
+            - repository
+        repoClean:
+          template: "{verRepo}"
+          whenVars:
+            - verRepo
+          fallbackVar: rootRepo
+          stripPrefix: "git+"
+          stripSuffix: ".git"
+          requireHttpPrefix: true
+        verTypes:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: types
+        verTypings:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: typings
+        hasTypes:
+          template: "Bundled declarations included"
+          whenAnyVars:
+            - verTypes
+            - verTypings
+        depsDisplay:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: dependencies
+          format: object_keys
+          limit: 10
+          join: ", "
+          default: "0 (zero dependencies)"
+        readme:
+          paths:
+            - readme
+          excludeEquals: "ERROR: No README data found!"
+          format: strip_leading_h1
+          trim: true
+      titleTemplate: "{name}@{ver}"
+      titleWhenVar: ver
+      titleFallbackTemplate: "{name}"
+      descriptionVar: desc
+      introVar: desc
+      bullets:
+        - label: Install
+          template: "`npm install {name}`"
+        - label: Latest Version
+          template: "`{ver}`"
+          whenVar: ver
+        - label: License
+          template: "{license}"
+          whenVar: license
+        - label: TypeScript
+          template: "{hasTypes}"
+          whenVar: hasTypes
+        - label: Runtime Dependencies
+          template: "{depsDisplay}"
+          whenVar: depsDisplay
+        - label: Homepage
+          template: "{homepage}"
+          whenVar: homepage
+        - label: Repository
+          template: "{repoClean}"
+          whenVar: repoClean
+      bodyVar: readme
+
+  # Route 2: Unscoped npm package /package/<pkg>[/v/<requestedVer>]
+  - match:
+      anyOf:
+        - exactSegments: false
+          pathSegments:
+            - package
+            - param: pkg
+              charset: npm_pkg
+            - v
+            - param: requestedVer
+              charset: url_seg
+        - exactSegments: false
+          pathSegments:
+            - package
+            - param: pkg
+              charset: npm_pkg
+    twin:
+      fetchUrl: "https://registry.npmjs.org/{pkg}"
+      kind: json
+      accept: application/json
+    extract:
+      requireFields:
+        - name
+      vars:
+        name:
+          paths:
+            - name
+        latestTag:
+          paths:
+            - "dist-tags.latest"
+        ver:
+          template: "{requestedVer}"
+          whenVars:
+            - requestedVer
+          fallbackVar: latestTag
+        verDesc:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: description
+          trim: true
+        rootDesc:
+          paths:
+            - description
+          trim: true
+        desc:
+          template: "{verDesc}"
+          whenVars:
+            - verDesc
+          fallbackVar: rootDesc
+        verLicense:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: license
+        rootLicense:
+          paths:
+            - license
+        license:
+          template: "{verLicense}"
+          whenVars:
+            - verLicense
+          fallbackVar: rootLicense
+        verHomepage:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: homepage
+        rootHomepage:
+          paths:
+            - homepage
+        homepage:
+          template: "{verHomepage}"
+          whenVars:
+            - verHomepage
+          fallbackVar: rootHomepage
+        verRepoUrl:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: "repository.url"
+        verRepoStr:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: repository
+        verRepo:
+          template: "{verRepoUrl}"
+          whenVars:
+            - verRepoUrl
+          fallbackVar: verRepoStr
+        rootRepo:
+          paths:
+            - "repository.url"
+            - repository
+        repoClean:
+          template: "{verRepo}"
+          whenVars:
+            - verRepo
+          fallbackVar: rootRepo
+          stripPrefix: "git+"
+          stripSuffix: ".git"
+          requireHttpPrefix: true
+        verTypes:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: types
+        verTypings:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: typings
+        hasTypes:
+          template: "Bundled declarations included"
+          whenAnyVars:
+            - verTypes
+            - verTypings
+        depsDisplay:
+          dynamicKeyPath:
+            base: versions
+            keyVar: ver
+            subPath: dependencies
+          format: object_keys
+          limit: 10
+          join: ", "
+          default: "0 (zero dependencies)"
+        readme:
+          paths:
+            - readme
+          excludeEquals: "ERROR: No README data found!"
+          format: strip_leading_h1
+          trim: true
+      titleTemplate: "{name}@{ver}"
+      titleWhenVar: ver
+      titleFallbackTemplate: "{name}"
+      descriptionVar: desc
+      introVar: desc
+      bullets:
+        - label: Install
+          template: "`npm install {name}`"
+        - label: Latest Version
+          template: "`{ver}`"
+          whenVar: ver
+        - label: License
+          template: "{license}"
+          whenVar: license
+        - label: TypeScript
+          template: "{hasTypes}"
+          whenVar: hasTypes
+        - label: Runtime Dependencies
+          template: "{depsDisplay}"
+          whenVar: depsDisplay
+        - label: Homepage
+          template: "{homepage}"
+          whenVar: homepage
+        - label: Repository
+          template: "{repoClean}"
+          whenVar: repoClean
+      bodyVar: readme

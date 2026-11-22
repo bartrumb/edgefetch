@@ -6,12 +6,25 @@ import test from 'node:test';
 
 import {
   applyPostFetchSiteExtractor,
+  enrichShopifyProductFromJson,
+  enrichWooCommerceProductFromStoreApi,
+  extractShopifyCurrencyFromHtml,
   getCatalogAdapter,
   getRawRegisteredSiteAdapters,
+  getRegisteredAdapterById,
   GO_KIND_TEXT_ACCEPT_ALLOWLIST,
+  icimsAdapter,
+  isShopifyHtmlOrHeaders,
+  isWooCommerceHtmlOrHeaders,
   listCatalogAdapters,
   listRegisteredAdapters,
+  normalizeShopifyProductRecord,
+  normalizeWooCommerceProductRecord,
+  resolveCustomDomainShopifyProductTwinUrl,
+  resolveCustomDomainWooCommerceProductTwinUrl,
   resolveSiteExtractorTwin,
+  shopifyAdapter,
+  woocommerceAdapter,
 } from '../src/extractors/registry.ts';
 import {
   compileDeclarativeAdapter,
@@ -40,65 +53,52 @@ import {
   safeFence,
   unescapeHrefUrl,
 } from '../src/extractors/utils.ts';
-import hackernewsAdapter from '../src/extractors/providers/commerce-social/hackernews.ts';
-import openfoodfactsAdapter from '../src/extractors/providers/commerce-social/openfoodfacts.ts';
-import mastodonAdapter from '../src/extractors/providers/commerce-social/mastodon.ts';
-import redditAdapter from '../src/extractors/providers/commerce-social/reddit.ts';
-import blueskyAdapter from '../src/extractors/providers/commerce-social/bluesky.ts';
-import discourseAdapter from '../src/extractors/providers/commerce-social/discourse.ts';
-import mediawikiAdapter from '../src/extractors/providers/commerce-social/mediawiki.ts';
-import githubGistAdapter from '../src/extractors/providers/developer/github-gist.ts';
-import googlePlayAdapter from '../src/extractors/providers/developer/google-play.ts';
-import pkgGoDevAdapter from '../src/extractors/providers/developer/pkg-go-dev.ts';
-import stackexchangeAdapter from '../src/extractors/providers/developer/stackexchange.ts';
-import gitlabForgejoAdapter from '../src/extractors/providers/developer/gitlab-forgejo.ts';
-import cratesIoAdapter from '../src/extractors/providers/developer/crates-io.ts';
-import jsrIoAdapter from '../src/extractors/providers/developer/jsr-io.ts';
-import bamboohrAdapter from '../src/extractors/providers/jobs/bamboohr-breezy-recruitee.ts';
-import enterpriseAtsAdapter from '../src/extractors/providers/jobs/enterprise-ats.ts';
-import gemAtsAdapter from '../src/extractors/providers/jobs/gem-ats.ts';
-import greenhouseLeverAdapter from '../src/extractors/providers/jobs/greenhouse-lever.ts';
-import icimsAdapter from '../src/extractors/providers/jobs/icims.ts';
-import jazzhrAdapter from '../src/extractors/providers/jobs/jazzhr.ts';
-import pinpointAdapter from '../src/extractors/providers/jobs/pinpoint.ts';
-import publicJobFeedsAdapter from '../src/extractors/providers/jobs/public-job-feeds.ts';
-import ripplingAdapter from '../src/extractors/providers/jobs/rippling.ts';
-import sapRmkJibeAdapter from '../src/extractors/providers/jobs/sap-rmk-jibe.ts';
-import teamtailorAdapter from '../src/extractors/providers/jobs/teamtailor.ts';
-import workableAdapter from '../src/extractors/providers/jobs/workable.ts';
-import pubchemAdapter from '../src/extractors/providers/research-health/pubchem.ts';
-import openfdaAdapter from '../src/extractors/providers/research-health/openfda.ts';
-import pubmedPmcAdapter from '../src/extractors/providers/research-health/pubmed-pmc.ts';
-import clinicaltrialsAdapter from '../src/extractors/providers/research-health/clinicaltrials.ts';
-import legistarAdapter from '../src/extractors/providers/public-records/legistar.ts';
-import arcgisAdapter from '../src/extractors/providers/public-records/arcgis.ts';
-import ckanAdapter from '../src/extractors/providers/public-records/ckan.ts';
-import secEdgarAdapter from '../src/extractors/providers/finance/sec-edgar.ts';
-import ycombinatorAdapter from '../src/extractors/providers/finance/ycombinator.ts';
-import shopifyAdapter, {
-  enrichShopifyProductFromJson,
-  extractShopifyCurrencyFromHtml,
-  isShopifyHtmlOrHeaders,
-  normalizeShopifyProductRecord,
-  resolveCustomDomainShopifyProductTwinUrl,
-  shopifyCatalogSpec,
-} from '../src/extractors/providers/commerce-social/shopify.ts';
-import woocommerceAdapter, {
-  enrichWooCommerceProductFromStoreApi,
-  isWooCommerceHtmlOrHeaders,
-  normalizeWooCommerceProductRecord,
-  resolveCustomDomainWooCommerceProductTwinUrl,
-  woocommerceCatalogSpec,
-} from '../src/extractors/providers/commerce-social/woocommerce.ts';
-import pypiAdapter from '../src/extractors/providers/developer/pypi.ts';
-import appleAppStoreAdapter from '../src/extractors/providers/developer/apple-app-store.ts';
-import ietfRfcAdapter from '../src/extractors/providers/developer/ietf-rfc.ts';
-import nistNvdAdapter from '../src/extractors/providers/developer/nist-nvd.ts';
-import npmAdapter from '../src/extractors/providers/developer/npm.ts';
-import internetArchiveAdapter from '../src/extractors/providers/genai/internet-archive.ts';
-import socrataAdapter from '../src/extractors/providers/public-records/socrata.ts';
-import arxivAdapter from '../src/extractors/providers/research-health/arxiv.ts';
-import openalexAdapter from '../src/extractors/providers/research-health/openalex.ts';
+
+const hackernewsAdapter = getRegisteredAdapterById('hackernews');
+const openfoodfactsAdapter = getRegisteredAdapterById('openfoodfacts');
+const mastodonAdapter = getRegisteredAdapterById('mastodon-status');
+const redditAdapter = getRegisteredAdapterById('reddit-thread');
+const blueskyAdapter = getRegisteredAdapterById('bluesky-thread');
+const discourseAdapter = getRegisteredAdapterById('discourse-topic');
+const mediawikiAdapter = getRegisteredAdapterById('mediawiki');
+const githubGistAdapter = getRegisteredAdapterById('github-gist');
+const googlePlayAdapter = getRegisteredAdapterById('google-play');
+const pkgGoDevAdapter = getRegisteredAdapterById('pkg-go-dev');
+const stackexchangeAdapter = getRegisteredAdapterById('stackexchange-qa');
+const gitlabForgejoAdapter = getRegisteredAdapterById('gitlab-forgejo');
+const cratesIoAdapter = getRegisteredAdapterById('crates-io');
+const jsrIoAdapter = getRegisteredAdapterById('jsr-io');
+const bamboohrAdapter = getRegisteredAdapterById('bamboohr-breezy-recruitee');
+const enterpriseAtsAdapter = getRegisteredAdapterById('enterprise-ats');
+const gemAtsAdapter = getRegisteredAdapterById('gem-ats');
+const greenhouseLeverAdapter = getRegisteredAdapterById('greenhouse-lever-boards');
+const jazzhrAdapter = getRegisteredAdapterById('jazzhr');
+const pinpointAdapter = getRegisteredAdapterById('pinpoint');
+const publicJobFeedsAdapter = getRegisteredAdapterById('public-job-feeds');
+const ripplingAdapter = getRegisteredAdapterById('rippling');
+const sapRmkJibeAdapter = getRegisteredAdapterById('sap-rmk-jibe');
+const teamtailorAdapter = getRegisteredAdapterById('teamtailor');
+const workableAdapter = getRegisteredAdapterById('workable');
+const pubchemAdapter = getRegisteredAdapterById('pubchem');
+const openfdaAdapter = getRegisteredAdapterById('openfda');
+const pubmedPmcAdapter = getRegisteredAdapterById('pubmed-pmc');
+const clinicaltrialsAdapter = getRegisteredAdapterById('clinicaltrials');
+const legistarAdapter = getRegisteredAdapterById('legistar');
+const arcgisAdapter = getRegisteredAdapterById('arcgis');
+const ckanAdapter = getRegisteredAdapterById('ckan');
+const secEdgarAdapter = getRegisteredAdapterById('sec-edgar');
+const ycombinatorAdapter = getRegisteredAdapterById('ycombinator');
+const pypiAdapter = getRegisteredAdapterById('pypi-project');
+const appleAppStoreAdapter = getRegisteredAdapterById('apple-app-store');
+const ietfRfcAdapter = getRegisteredAdapterById('ietf-rfc');
+const nistNvdAdapter = getRegisteredAdapterById('nist-nvd');
+const npmAdapter = getRegisteredAdapterById('npm-registry');
+const internetArchiveAdapter = getRegisteredAdapterById('internet-archive');
+const socrataAdapter = getRegisteredAdapterById('socrata');
+const arxivAdapter = getRegisteredAdapterById('arxiv');
+const openalexAdapter = getRegisteredAdapterById('openalex');
+const shopifyCatalogSpec = shopifyAdapter.catalog!;
+const woocommerceCatalogSpec = woocommerceAdapter.catalog!;
 import worker from '../src/index.ts';
 import {
   analyzeUrlRedirect,
@@ -724,8 +724,8 @@ test('ADAPTER-8: Vetted DevEx Stack — parseHtmlDoc (htmlparser2), compileLinea
   const { parseHtmlDoc, compileLinearRegex } = await import('../src/extractors/utils.ts');
   const { DECLARATIVE_SITE_ADAPTERS } = await import('../src/extractors/declarative.ts');
 
-  // 1. At least 10 shared Go+TS declarative manifests compiled cleanly
-  assert.ok(DECLARATIVE_SITE_ADAPTERS.length >= 10, `expected >= 10 declarative adapters, got ${DECLARATIVE_SITE_ADAPTERS.length}`);
+  // 1. All 56+ shared Go+TS declarative YAML manifests compiled cleanly
+  assert.ok(DECLARATIVE_SITE_ADAPTERS.length >= 56, `expected >= 56 declarative adapters, got ${DECLARATIVE_SITE_ADAPTERS.length}`);
   const rubyTwin = resolveSiteExtractorTwin('https://rubygems.org/gems/rails');
   assert.equal(rubyTwin?.id, 'rubygems');
   assert.equal(rubyTwin?.fetchUrl, 'https://rubygems.org/api/v1/gems/rails.json');
@@ -1814,8 +1814,8 @@ extract:
       paths: ["meta.count"]
       format: int_comma
   titleTemplate: "Item {itemId} - {name}"
-  metaParts:
-    - "{count} items"
+  metaLine:
+    - template: "{count} items"
   bullets:
     - label: Name
       template: "{name}"
@@ -3299,8 +3299,25 @@ test('ADAPTER-17: M1-C Extractors Uncovered Lines & High-Impact Branch Closure',
   assert.equal(outerRows[0]![0], 'OuterH');
   assert.deepEqual(hdComplex.dlMap(), { key1: 'Val1', key2: 'Val2' });
 
-  // 4. declarative.ts: uncovered lines 240-242, 331-332, 409-410, 421-422, 425-426, 448-449, 460, 504-505, 768-769 + format branches
+  // 4. declarative.ts: compile-time M2 SSRF rejection + runtime declarative extractor branches
   assert.throws(() => parseDeclarativeManifest('- just a list'), /root must be a mapping/);
+  for (const unsafeFetchUrl of ['https://192.168.1.1/{id}', 'https://[bad-url/{id}', 'https://localhost/{id}']) {
+    assert.throws(
+      () =>
+        compileDeclarativeAdapter({
+          id: 'decl-unsafe-test',
+          name: 'Unsafe Decl',
+          category: 'developer',
+          description: 'Verifies compile-time M2 fetchUrl rejection',
+          domains: ['decl.example.com'],
+          exampleUrls: ['https://decl.example.com/a'],
+          match: { pathSegments: [{ param: 'id', charset: 'alnum' }] },
+          twin: { fetchUrl: unsafeFetchUrl, kind: 'json', accept: 'application/json' },
+          extract: { titleTemplate: '{id}' },
+        }),
+      /public HTTPS|fetchUrl/i,
+    );
+  }
   const declFull = compileDeclarativeAdapter({
     id: 'decl-full-test',
     name: 'Declarative Full Test',
@@ -3313,26 +3330,15 @@ test('ADAPTER-17: M1-C Extractors Uncovered Lines & High-Impact Branch Closure',
         match: {
           anyOf: [
             { pathSegments: ['doi', { param: 'd', charset: 'doi_rest', greedy: true }] },
-            { pathSegments: ['bad-charset', { param: 'x', charset: 'unknown_charset' as never }] },
             { pathSegments: ['v1', { param: 'slug', charset: 'pkg', stripSuffix: '.json', reserved: ['admin'], minLen: 0, maxLen: 0 }], exactSegments: false },
           ],
         },
         twin: {
-          fetchUrl: 'https://192.168.1.1/{slug}', // blocked IPv4 -> 409-410
+          fetchUrl: 'https://{host}/v1/{slug}{d}',
           kind: 'json',
           accept: 'application/json',
         },
-        extract: { titleTemplate: '{slug}' },
-      },
-      {
-        match: { pathSegments: ['badurl', { param: 'id', charset: 'alnum' }] },
-        twin: { fetchUrl: 'https://[bad-url/{id}', kind: 'json', accept: 'application/json' }, // catch -> 425-426
-        extract: { titleTemplate: '{id}' },
-      },
-      {
-        match: { pathSegments: ['local', { param: 'id', charset: 'alnum' }] },
-        twin: { fetchUrl: 'https://localhost/{id}', kind: 'json', accept: 'application/json' }, // 421-422
-        extract: { titleTemplate: '{id}' },
+        extract: { titleTemplate: '{slug}{d}' },
       },
       {
         match: { pathSegments: ['rawpath', { param: 'sub', charset: 'safe_subpath', greedy: true }] },
@@ -3407,12 +3413,10 @@ test('ADAPTER-17: M1-C Extractors Uncovered Lines & High-Impact Branch Closure',
       },
     ],
   });
-  assert.equal(declFull.resolveTwin!(mkTwinCtx('https://decl.example.com/doi/10.1234/abc')), null); // blocked IPv4
-  assert.equal(declFull.resolveTwin!(mkTwinCtx('https://decl.example.com/bad-charset/abc')), null);
+  assert.equal(declFull.resolveTwin!(mkTwinCtx('https://192.168.1.1/doi/10.1234/abc')), null); // runtime blocked IPv4 via {host}
+  assert.equal(declFull.resolveTwin!(mkTwinCtx('https://localhost/v1/pkg')), null); // runtime blocked localhost via {host}
   assert.equal(declFull.resolveTwin!(mkTwinCtx('https://decl.example.com/v1/admin')), null); // reserved
-  assert.equal(declFull.resolveTwin!(mkTwinCtx('https://decl.example.com/v1/pkg.json/extra')), null); // IPv4 blocked
-  assert.equal(declFull.resolveTwin!(mkTwinCtx('https://decl.example.com/badurl/abc1')), null);
-  assert.equal(declFull.resolveTwin!(mkTwinCtx('https://decl.example.com/local/abc1')), null);
+  assert.equal(declFull.resolveTwin!(mkTwinCtx('https://decl.example.com/v1/pkg.json/extra'))?.fetchUrl, 'https://decl.example.com/v1/pkg');
   const rawPathTwin = declFull.resolveTwin!(mkTwinCtx('https://decl.example.com/rawpath/dir/app.ts'))!;
   assert.equal(rawPathTwin.fetchUrl, 'https://api.decl.example.com/files/dir/app.ts?u={unclosed');
   assert.match(rawPathTwin.formatTwin('console.log(1);', 'https://decl.example.com/rawpath/dir/app.ts', simpleHtmlToMd)!.markdown, /```ts/);
@@ -4620,6 +4624,92 @@ test('ADAPTER-19: M1-C executeScrapeCall & executeInteractCall Pipeline Closure'
 });
 
 
+
+test('ADAPTER-20: Round 6 Hardening — 100% YAML Zero-TS Providers, M1 Selector Depth/Colon Bounds, M2 Host-Claim Guards & R6-H5 YAML Safety', async () => {
+  const { existsSync } = await import('node:fs');
+  const { parseHtmlDoc } = await import('../src/extractors/utils.ts');
+  const { compileValidatedManifestSet, parseDeclarativeManifest } = await import('../src/extractors/declarative.ts');
+
+  // 1. Zero TypeScript provider files remain under src/extractors/providers
+  const hubRoot = process.env.EDGEFETCH_HUB_ROOT ? resolve(process.env.EDGEFETCH_HUB_ROOT) : resolve('.');
+  const providersDir = join(hubRoot, 'src', 'extractors', 'providers');
+  assert.equal(existsSync(providersDir), false, 'src/extractors/providers directory must be completely removed');
+
+  // 2. M1: 50,000-deep nested <div> and 100,000 trailing colons in <dt> finish linearly in < 50ms without stack overflow
+  const deepHtml = `${'<div>'.repeat(50_000)}deep${'</div>'.repeat(50_000)}`;
+  const tDeep = performance.now();
+  const deepDoc = parseHtmlDoc(deepHtml);
+  assert.equal(deepDoc.text('div'), 'deep');
+  assert.ok(performance.now() - tDeep < 50, 'M1: 50,000-deep HTML DOM cap must finish in < 50ms');
+
+  const colonHtml = `<dl><dt>Key${':'.repeat(100_000)}   </dt><dd>Value</dd></dl>`;
+  const tColon = performance.now();
+  const colonDoc = parseHtmlDoc(colonHtml);
+  assert.deepEqual(colonDoc.dlMap(), { key: 'Value' });
+  assert.ok(performance.now() - tColon < 80, 'M1: dlMap trailing colon trim must run in O(N)');
+
+  // 3. R6-H5: YAML anchors, aliases, merge keys, explicit tags, and non-ASCII keys are rejected
+  assert.throws(() => parseDeclarativeManifest('id: &a foo\nname: *a\n'), /anchor|alias/i);
+  assert.throws(() => parseDeclarativeManifest('id: !!str foo\n'), /tag/i);
+  assert.throws(() => parseDeclarativeManifest('base:\n  k: v\nchild:\n  <<: *base\n'), /anchor|alias|merge/i);
+  assert.throws(() => parseDeclarativeManifest('id: bad\ndomain\u017f: [example.com]\n'), /non-ASCII/i);
+
+  // 4. M2: Broad TLD wildcards (*.com), cross-origin {host} exfiltration, and duplicate adapter/twin IDs are rejected
+  assert.throws(
+    () =>
+      parseDeclarativeManifest(
+        [
+          'id: broad-claim',
+          'name: Broad',
+          'category: developer',
+          'description: Attempt broad wildcard claim',
+          'domains: ["*.com"]',
+          'exampleUrls: ["https://example.com/a"]',
+          'match: { pathSegments: ["a"] }',
+          'twin: { fetchUrl: "https://api.example.com/a.json", kind: "json", accept: "application/json" }',
+          'extract: { titleTemplate: "x" }',
+        ].join('\n'),
+      ),
+    /broad|wildcard/i,
+  );
+
+  assert.throws(
+    () =>
+      parseDeclarativeManifest(
+        [
+          'id: leak-host',
+          'name: Leak',
+          'category: developer',
+          'description: Attempt cross-origin host interpolation',
+          'domains: ["*.example.org"]',
+          'exampleUrls: ["https://sub.example.org/a"]',
+          'match: { pathSegments: ["a"] }',
+          'twin: { fetchUrl: "https://collector.example.net/{host}/a.json", kind: "json", accept: "application/json" }',
+          'extract: { titleTemplate: "x" }',
+        ].join('\n'),
+      ),
+    /same-origin|host/i,
+  );
+
+  const validM = parseDeclarativeManifest(
+    [
+      'id: dup-check',
+      'name: Dup Check',
+      'category: developer',
+      'description: Valid manifest for duplicate check',
+      'domains: ["example.org"]',
+      'exampleUrls: ["https://example.org/a"]',
+      'match: { pathSegments: ["a"] }',
+      'twin: { id: "shared-twin", fetchUrl: "https://example.org/a.json", kind: "json", accept: "application/json" }',
+      'extract: { titleTemplate: "x" }',
+    ].join('\n'),
+  );
+  assert.throws(() => compileValidatedManifestSet([validM, validM]), /Duplicate declarative adapter manifest id/i);
+  assert.throws(
+    () => compileValidatedManifestSet([validM, { ...validM, id: 'dup-check-2' }]),
+    /Duplicate twin id/i,
+  );
+});
 
 
 

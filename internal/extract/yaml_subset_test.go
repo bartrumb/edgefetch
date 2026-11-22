@@ -30,9 +30,9 @@ func TestParseDeclarativeYAMLDocumentAndDepthLimits(t *testing.T) {
 		t.Fatal("expected top-level unclosed flow error")
 	}
 
-	// YAMLToJSON encode error via valid YAML number rejected by json.Number (`+123`)
-	if _, err := YAMLToJSON([]byte("n: +123\n")); err == nil {
-		t.Fatal("expected YAMLToJSON error on json.Number(\"+123\")")
+	// YAMLToJSON normalizes YAML 1.2 Core signed integers (+123 -> 123)
+	if jb, err := YAMLToJSON([]byte("n: +123\n")); err != nil || string(jb) != `{"n":123}` {
+		t.Fatalf("YAMLToJSON(+123) = (%s, %v), want {\"n\":123}", string(jb), err)
 	}
 
 	// Depth > maxYAMLDepth across block seq, block map, inline scalar/flow, and parseNode
@@ -65,8 +65,8 @@ func TestParseDeclarativeYAMLDocumentAndDepthLimits(t *testing.T) {
 		t.Fatal("expected deep parseNode error")
 	}
 
-	if isYAMLCoreNumber("") {
-		t.Fatal("expected isYAMLCoreNumber(\"\") == false")
+	if _, ok := parseYAMLCoreNumber(""); ok {
+		t.Fatal("expected parseYAMLCoreNumber(\"\") == false")
 	}
 
 	if _, err := parseYAMLInlineScalarOrFlow("1", 1, maxYAMLDepth+1); err == nil {
@@ -233,8 +233,8 @@ esc: "\"\\\/\b\f\n\r\t\0\u0041\uD83D\uDE00\U0001F600"
 	if arr[0] != "it's" || arr[1] != nil || arr[2] != nil || arr[3] != nil || arr[4] != json.Number("1.5e-2") || arr[5] != json.Number("1E+2") {
 		t.Fatalf("unexpected multi flow array: %#v", arr)
 	}
-	if mf["n3"] != "0123" || mf["n8"] != "1e999" {
-		t.Fatalf("non-core numbers should remain strings: %#v", mf)
+	if mf["n3"] != json.Number("123") || mf["n8"] != "1e999" {
+		t.Fatalf("unexpected YAML 1.2 Core number normalization: %#v", mf)
 	}
 	if mf["esc"] != "\"\\/\b\f\n\r\t\x00A😀😀" {
 		t.Fatalf("unexpected double-quoted escapes: %q", mf["esc"])

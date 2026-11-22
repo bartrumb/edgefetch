@@ -1,0 +1,71 @@
+# Shared Go + TypeScript Declarative Site Adapter: Mastodon & Fediverse Statuses
+id: mastodon-status
+name: "Mastodon & Fediverse Statuses (Universal Engine)"
+category: commerce-social
+description: "Upgrades Fediverse status permalinks (/@<user>/<numericId>) on any Mastodon instance to /api/v1/statuses/<id> JSON."
+domains:
+  - mastodon.social
+  - fosstodon.org
+  - hachyderm.io
+universalEngine: true
+exampleUrls:
+  - "https://fosstodon.org/@user/113456789012345678"
+
+# Matches /@<handle>/<15..24-digit statusId>, excluding non-Mastodon @handle platforms
+match:
+  excludeHosts:
+    - medium.com
+    - "*.medium.com"
+    - tiktok.com
+    - "*.tiktok.com"
+    - threads.net
+    - "*.threads.net"
+  exactSegments: true
+  pathSegments:
+    - param: userHandle
+      charset: at_handle
+    - param: statusId
+      charset: digits
+      minLen: 15
+      maxLen: 24
+
+twin:
+  id: mastodon-status
+  fetchUrl: "https://{host}/api/v1/statuses/{statusId}"
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - content
+    - account.acct
+  vars:
+    acct:
+      paths: [account.acct]
+    displayName:
+      paths: [account.display_name]
+      fallbackTemplate: "{acct}"
+    createdAt:
+      paths: [created_at]
+    spoiler:
+      paths: [spoiler_text]
+      trim: true
+    body:
+      paths: [content]
+      format: html_to_md
+  titleTemplate: "{displayName} (@{acct}@{host})"
+  authorTemplate: "@{acct}@{host}"
+  publishedTimeVar: createdAt
+  blockquoteTemplate: "> [!NOTE]\n> **Content Note**: {spoiler}"
+  blockquoteWhenVar: spoiler
+  bodyVar: body
+  sections:
+    - heading: ""
+      listArrayPath: media_attachments
+      limit: 16
+      requireItemVar: mediaDesc
+      itemVars:
+        mediaDesc:
+          paths: [description]
+          trim: true
+      itemTemplate: "*Media description*: {mediaDesc}"

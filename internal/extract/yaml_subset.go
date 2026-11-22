@@ -214,11 +214,12 @@ func (p *yamlParser) parseBlockSeq(seqIndent, depth int) ([]any, error) {
 
 		if isYAMLSeqIndicator(itemClean) || strings.HasPrefix(itemRaw, "- ") {
 			// Nested inline sequence `- - foo` — synthesize nested parse by rewriting current line temporarily
-			saved := p.lines[p.pos]
-			p.lines[p.pos] = yamlLine{lineNo: ln.lineNo, indent: itemIndent, raw: ln.raw, text: itemRaw}
+			savedPos := p.pos
+			saved := p.lines[savedPos]
+			p.lines[savedPos] = yamlLine{lineNo: ln.lineNo, indent: itemIndent, raw: ln.raw, text: itemRaw}
 			nested, err := p.parseBlockSeq(itemIndent, depth+1)
 			if err != nil {
-				p.lines[p.pos] = saved
+				p.lines[savedPos] = saved
 				return nil, err
 			}
 			out = append(out, nested)
@@ -497,6 +498,14 @@ func (p *yamlParser) collectContinuationFlowExpr(initial string, startLine, pare
 	}
 }
 
+func canStartYAMLQuote(s string, i int) bool {
+	if i == 0 {
+		return true
+	}
+	prev := s[i-1]
+	return prev == ' ' || prev == '\t' || prev == ':' || prev == '[' || prev == '{' || prev == ','
+}
+
 func checkYAMLFlowBalance(s string, lineNo int) (int, error) {
 	depth := 0
 	var quote byte
@@ -518,7 +527,9 @@ func checkYAMLFlowBalance(s string, lineNo int) (int, error) {
 		}
 		switch c {
 		case '"', '\'':
-			quote = c
+			if canStartYAMLQuote(s, i) {
+				quote = c
+			}
 		case '[', '{':
 			depth++
 			if depth > maxYAMLDepth {
@@ -555,7 +566,7 @@ func stripYAMLInlineComment(s string) string {
 			}
 			continue
 		}
-		if c == '"' || c == '\'' {
+		if (c == '"' || c == '\'') && canStartYAMLQuote(s, i) {
 			quote = c
 			continue
 		}
@@ -587,7 +598,9 @@ func findYAMLMappingColon(s string) int {
 		}
 		switch c {
 		case '"', '\'':
-			quote = c
+			if canStartYAMLQuote(s, i) {
+				quote = c
+			}
 		case '[', '{':
 			flowDepth++
 		case ']', '}':
@@ -607,13 +620,25 @@ func parseYAMLKey(rawKey string, lineNo int) (string, error) {
 	if rawKey == "" {
 		return "", fmt.Errorf("yaml line %d: empty mapping key", lineNo)
 	}
-	if rawKey[0] == '&' || rawKey[0] == '*' || rawKey[0] == '!' {
-		return "", fmt.Errorf("yaml line %d: YAML anchors, aliases, and tags are forbidden", lineNo)
+	if rawKey[0] == '&' || rawKey[0] == '*' || rawKey[0] == '!' || rawKey[0] == '?' {
+		return "", fmt.Errorf("yaml line %d: YAML anchors, aliases, complex keys, and tags are forbidden", lineNo)
 	}
+	var key string
+	var err error
 	if rawKey[0] == '"' || rawKey[0] == '\'' {
-		return parseYAMLQuotedString(rawKey, lineNo)
+		key, err = parseYAMLQuotedString(rawKey, lineNo)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		key = rawKey
 	}
-	return rawKey, nil
+	for i := 0; i < len(key); i++ {
+		if key[i] < 0x20 || key[i] > 0x7e {
+			return "", fmt.Errorf("yaml line %d: non-ASCII YAML key %q is forbidden", lineNo, key)
+		}
+	}
+	return key, nil
 }
 
 func parseYAMLInlineScalarOrFlow(s string, lineNo, depth int) (any, error) {
@@ -641,8 +666,8 @@ func parseYAMLInlineScalarOrFlow(s string, lineNo, depth int) (any, error) {
 	case "false", "False", "FALSE":
 		return false, nil
 	}
-	if isYAMLCoreNumber(trimmed) {
-		return json.Number(trimmed), nil
+	if numNorm, okNum := parseYAMLCoreNumber(trimmed); okNum {
+		return numNorm, nil
 	}
 	return trimmed, nil
 }
@@ -674,6 +699,9 @@ func parseYAMLFlowValue(expr string, lineNo, depth int) (any, error) {
 			pTrim := strings.TrimSpace(part)
 			if pTrim == "" {
 				continue
+			}
+			if pTrim[0] != '{' && pTrim[0] != '[' && pTrim[0] != '"' && pTrim[0] != '\'' && findYAMLMappingColon(pTrim) >= 0 {
+				return nil, fmt.Errorf("yaml line %d: compact mapping inside flow sequence is forbidden (%q); wrap in {...}", lineNo, pTrim)
 			}
 			v, vErr := parseYAMLInlineScalarOrFlow(pTrim, lineNo, depth+1)
 			if vErr != nil {
@@ -834,15 +862,18 @@ func parseYAMLQuotedString(s string, lineNo int) (string, error) {
 			}
 			r := rune(v)
 			i += 4
-			if utf16.IsSurrogate(r) && i+6 < len(inner) && inner[i+1] == '\\' && inner[i+2] == 'u' {
-				if v2, err2 := strconv.ParseUint(inner[i+3:i+7], 16, 16); err2 == nil {
-					comb := utf16.DecodeRune(r, rune(v2))
-					if comb != utf8.RuneError {
-						sb.WriteRune(comb)
-						i += 6
-						continue
+			if utf16.IsSurrogate(r) {
+				if i+6 < len(inner) && inner[i+1] == '\\' && inner[i+2] == 'u' {
+					if v2, err2 := strconv.ParseUint(inner[i+3:i+7], 16, 16); err2 == nil {
+						comb := utf16.DecodeRune(r, rune(v2))
+						if comb != utf8.RuneError {
+							sb.WriteRune(comb)
+							i += 6
+							continue
+						}
 					}
 				}
+				return "", fmt.Errorf("yaml line %d: unpaired UTF-16 surrogate in \\u escape", lineNo)
 			}
 			sb.WriteRune(r)
 		case 'U':
@@ -862,35 +893,53 @@ func parseYAMLQuotedString(s string, lineNo int) (string, error) {
 	return sb.String(), nil
 }
 
-func isYAMLCoreNumber(s string) bool {
+func parseYAMLCoreNumber(s string) (json.Number, bool) {
 	if s == "" {
-		return false
+		return "", false
+	}
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		if n, err := strconv.ParseInt(s[2:], 16, 64); err == nil {
+			return json.Number(strconv.FormatInt(n, 10)), true
+		}
+		return "", false
+	}
+	if strings.HasPrefix(s, "0o") || strings.HasPrefix(s, "0O") {
+		if n, err := strconv.ParseInt(s[2:], 8, 64); err == nil {
+			return json.Number(strconv.FormatInt(n, 10)), true
+		}
+		return "", false
 	}
 	idx := 0
+	hasPlus := false
 	if s[idx] == '-' || s[idx] == '+' {
+		hasPlus = s[idx] == '+'
 		idx++
 		if idx >= len(s) {
-			return false
+			return "", false
 		}
 	}
 	if s[idx] < '0' || s[idx] > '9' {
-		return false
+		return "", false
 	}
-	// YAML 1.2 Core Schema base-10 integer or float; avoid treating multi-digit leading-zero IDs like "0123" as int
-	if s[idx] == '0' && idx+1 < len(s) && s[idx+1] >= '0' && s[idx+1] <= '9' {
-		return false
-	}
+	// YAML 1.2 Core Schema base-10 integer or float: multi-digit leading-zero base-10 integers like 007 are integers in YAML 1.2 Core
 	for idx < len(s) && s[idx] >= '0' && s[idx] <= '9' {
 		idx++
 	}
+	norm := s
+	if hasPlus {
+		norm = s[1:]
+	}
 	if idx == len(s) {
-		_, err := strconv.ParseInt(s, 10, 64)
-		return err == nil
+		n, err := strconv.ParseInt(norm, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		return json.Number(strconv.FormatInt(n, 10)), true
 	}
 	if s[idx] == '.' {
 		idx++
 		if idx >= len(s) || s[idx] < '0' || s[idx] > '9' {
-			return false
+			return "", false
 		}
 		for idx < len(s) && s[idx] >= '0' && s[idx] <= '9' {
 			idx++
@@ -902,15 +951,33 @@ func isYAMLCoreNumber(s string) bool {
 			idx++
 		}
 		if idx >= len(s) || s[idx] < '0' || s[idx] > '9' {
-			return false
+			return "", false
 		}
 		for idx < len(s) && s[idx] >= '0' && s[idx] <= '9' {
 			idx++
 		}
 	}
 	if idx != len(s) {
-		return false
+		return "", false
 	}
-	_, err := strconv.ParseFloat(s, 64)
-	return err == nil
+	f, err := strconv.ParseFloat(norm, 64)
+	if err != nil {
+		return "", false
+	}
+	_ = f
+	// Normalize leading zeros before decimal if any (e.g. "00.5" -> "0.5")
+	if strings.HasPrefix(norm, "-0") && len(norm) > 2 && norm[2] >= '0' && norm[2] <= '9' {
+		trimmedZeros := strings.TrimLeft(norm[1:], "0")
+		if trimmedZeros == "" || trimmedZeros[0] == '.' || trimmedZeros[0] == 'e' || trimmedZeros[0] == 'E' {
+			trimmedZeros = "0" + trimmedZeros
+		}
+		norm = "-" + trimmedZeros
+	} else if strings.HasPrefix(norm, "0") && len(norm) > 1 && norm[1] >= '0' && norm[1] <= '9' {
+		trimmedZeros := strings.TrimLeft(norm, "0")
+		if trimmedZeros == "" || trimmedZeros[0] == '.' || trimmedZeros[0] == 'e' || trimmedZeros[0] == 'E' {
+			trimmedZeros = "0" + trimmedZeros
+		}
+		norm = trimmedZeros
+	}
+	return json.Number(norm), true
 }

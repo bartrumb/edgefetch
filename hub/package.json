@@ -5,15 +5,17 @@
   "license": "FSL-1.1-MIT",
   "description": "Cloudflare Hibernating WebSocket Durable Object coordinator, /admin Control Center, and Self-Hosted OAuth 2.1 /mcp server for EdgeFetch.",
   "scripts": {
-    "type-check": "tsc --noEmit -p tsconfig.json",
+    "adapter:compile": "node scripts/compile-manifests.mjs",
+    "adapter:check": "node scripts/compile-manifests.mjs --check",
+    "type-check": "node scripts/compile-manifests.mjs && tsc --noEmit -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
     "test:coverage": "node scripts/run-tests.mjs --coverage --include-sdk",
     "adapter:new": "node scripts/new-adapter.mjs",
     "adapter:test": "node scripts/test-adapter.mjs",
     "build:portable": "node scripts/build-portable.mjs",
     "start:portable": "node scripts/build-portable.mjs && node dist/portable-server.mjs",
-    "deploy:dry": "wrangler deploy --dry-run -c wrangler.toml --env=\"\" && wrangler deploy --dry-run -c wrangler.toml -e production",
-    "deploy": "wrangler deploy -c wrangler.toml -e production"
+    "deploy:dry": "node scripts/compile-manifests.mjs && wrangler deploy --dry-run -c wrangler.toml --env=\"\" && wrangler deploy --dry-run -c wrangler.toml -e production",
+    "deploy": "node scripts/compile-manifests.mjs && wrangler deploy -c wrangler.toml -e production"
   },
   "cloudflare": {
     "bindings": {

@@ -1,0 +1,183 @@
+# Shared Go + TypeScript Declarative Site Adapter: PubMed & PubMed Central (NCBI / Europe PMC)
+id: pubmed-pmc
+name: PubMed & PubMed Central (NCBI / Europe PMC)
+category: research-health
+description: Upgrades PubMed & PMC URLs to robots.txt-allowed Europe PMC REST JSON/JATS XML (with NCBI HTML fallback).
+domains:
+  - pubmed.ncbi.nlm.nih.gov
+  - pmc.ncbi.nlm.nih.gov
+exampleUrls:
+  - https://pubmed.ncbi.nlm.nih.gov/31452104/
+  - https://pmc.ncbi.nlm.nih.gov/articles/PMC7095418/
+
+routes:
+  # Route 1: PubMed numeric PMID -> Europe PMC core JSON
+  - match:
+      hosts:
+        - pubmed.ncbi.nlm.nih.gov
+      exactSegments: true
+      pathSegments:
+        - param: pmid
+          charset: digits
+    twin:
+      id: pubmed-europepmc
+      fetchUrl: "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID:{pmid}%20AND%20SRC:MED&resultType=core&format=json"
+      kind: json
+      accept: application/json
+    extract:
+      rootPath: resultList.result.0
+      requireFields:
+        - title
+      vars:
+        title:
+          paths:
+            - title
+          format: strip_tags
+          stripSuffix: "."
+          trim: true
+        authorString:
+          paths:
+            - authorString
+          trim: true
+        journalTitle:
+          paths:
+            - journalInfo.journal.title
+        pubYear:
+          paths:
+            - pubYear
+        journalFull:
+          template: "{journalTitle} ({pubYear})"
+          whenVars:
+            - journalTitle
+            - pubYear
+          fallbackVar: journalTitle
+        doi:
+          paths:
+            - doi
+        doiUrl:
+          template: "https://doi.org/{doi}"
+          whenVars:
+            - doi
+        pmcid:
+          paths:
+            - pmcid
+        pmcUrl:
+          template: "https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/"
+          whenVars:
+            - pmcid
+        citedBy:
+          paths:
+            - citedByCount
+          format: int_comma
+        abstractText:
+          paths:
+            - abstractText
+          format: strip_tags
+      titleTemplate: "{title}"
+      authorVar: authorString
+      publishedTimeVar: pubYear
+      bullets:
+        - label: PMID
+          template: "`{pmid}`"
+        - label: Authors
+          template: "{authorString}"
+          whenVar: authorString
+        - label: Journal
+          template: "{journalFull}"
+          whenVar: journalFull
+        - label: DOI
+          template: "`{doi}`"
+          whenVar: doi
+        - label: Full Text (PMC)
+          template: "[{pmcid}]({pmcUrl})"
+          whenVar: pmcid
+        - label: Cited By
+          template: "{citedBy}"
+          whenVar: citedBy
+      sections:
+        - heading: Abstract
+          textVar: abstractText
+      linksVars:
+        - doiUrl
+        - pmcUrl
+
+  # Route 2: PMC article -> Europe PMC JATS fullTextXML
+  - match:
+      hosts:
+        - pmc.ncbi.nlm.nih.gov
+      exactSegments: false
+      pathSegments:
+        - articles
+        - param: pmcid
+          charset: pmc_id
+          transform: upper
+    twin:
+      id: pmc-europepmc
+      fetchUrl: "https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
+      kind: text
+      accept: application/xml
+    extract:
+      xml:
+        mode: jats_article
+
+# Post-fetch DOM fallback for PubMed & PMC HTML pages
+htmlRoutes:
+  - match:
+      anyOf:
+        - hosts:
+            - pubmed.ncbi.nlm.nih.gov
+          exactSegments: true
+          pathSegments:
+            - param: pmid
+              charset: digits
+        - hosts:
+            - pmc.ncbi.nlm.nih.gov
+          exactSegments: false
+          pathSegments:
+            - articles
+            - param: pmcid
+              charset: pmc_id
+              transform: upper
+    mode: dom
+    requireVars:
+      - title
+      - body
+    vars:
+      title:
+        cssText:
+          - h1.heading-title
+          - h1
+      authors:
+        cssAllText:
+          selector: a.full-name
+          limit: 20
+          dedupe: true
+          join: ", "
+        limit: 15
+      authorsShort:
+        cssAllText:
+          selector: a.full-name
+          limit: 20
+          dedupe: true
+          join: ", "
+        limit: 4
+      doi:
+        cssText:
+          - span.citation-doi
+      body:
+        cssHtmlToMd:
+          - article.article
+          - "div#abstract"
+          - "div#eng-abstract"
+          - section.abstract
+    titleTemplate: "{title}"
+    authorVar: authorsShort
+    bullets:
+      - label: Authors
+        template: "{authors}"
+        whenVar: authors
+      - label: Citation
+        template: "{doi}"
+        whenVar: doi
+    bodyVar: body
+    bodyFallbackHeading: Abstract

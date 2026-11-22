@@ -1453,6 +1453,7 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 					Options: crawl.Options{
 						Concurrency:   1,
 						IncludeBody:   true,
+						MaxBytes:      8 << 20,
 						RespectRobots: crawl.Bool(true),
 					},
 					Requests: []crawl.Request{
@@ -1473,14 +1474,22 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 				if twinRep, viaStr, _, dErr := s.DispatchOrFallback(twinCtx, twinCall, p.Target, p.Site, hdr); dErr == nil && len(twinRep.Results) > 0 {
 					twinVia = viaStr
 					tRes := twinRep.Results[0]
-					if tRes.Status == http.StatusOK && tRes.Outcome == classify.OutcomeOK {
+					finalURL := tRes.FinalURL
+					if finalURL == "" {
+						finalURL = twin.FetchURL
+					}
+					if tRes.Status == http.StatusOK && tRes.Outcome == classify.OutcomeOK && isSameTwinOriginDomain(twinURL, finalURL) {
 						bodyBytes, decErr := tRes.DecodeBody()
 						bodyStr := tRes.Body
 						if decErr == nil && len(bodyBytes) > 0 {
 							bodyStr = string(bodyBytes)
 						}
 						if doc, fmtOK := twin.Format(bodyStr); fmtOK && doc != nil && strings.TrimSpace(doc.Markdown) != "" {
-							md := doc.Markdown
+							md := extract.SanitizeScrapedMarkdown(doc.Markdown)
+							cleanTitle := extract.SanitizeScrapedMeta(doc.Title)
+							cleanDesc := extract.SanitizeScrapedMeta(doc.Description)
+							cleanAuthor := extract.SanitizeScrapedMeta(doc.Author)
+							cleanPub := extract.SanitizeScrapedMeta(doc.PublishedTime)
 							if p.Query != "" {
 								md = extract.RerankPassages(md, p.Query, p.MaxChars)
 							} else if p.MaxChars > 0 && len(md) > p.MaxChars {
@@ -1490,22 +1499,18 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 								}
 								md = md[:cut]
 							}
-							finalURL := tRes.FinalURL
-							if finalURL == "" {
-								finalURL = twin.FetchURL
-							}
 							meta := map[string]any{
-								"title":     doc.Title,
+								"title":     cleanTitle,
 								"sourceURL": u,
 							}
-							if doc.Description != "" {
-								meta["description"] = doc.Description
+							if cleanDesc != "" {
+								meta["description"] = cleanDesc
 							}
-							if doc.Author != "" {
-								meta["author"] = doc.Author
+							if cleanAuthor != "" {
+								meta["author"] = cleanAuthor
 							}
-							if doc.PublishedTime != "" {
-								meta["publishedTime"] = doc.PublishedTime
+							if cleanPub != "" {
+								meta["publishedTime"] = cleanPub
 							}
 							out := map[string]any{
 								"ok":            true,
@@ -1516,8 +1521,8 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 								"outcome":       tRes.Outcome,
 								"extractorId":   twin.ID,
 								"contentSource": "twin:" + twin.ID,
-								"title":         doc.Title,
-								"description":   doc.Description,
+								"title":         cleanTitle,
+								"description":   cleanDesc,
 								"markdown":      md,
 								"text":          md,
 								"links":         doc.Links,
@@ -1525,11 +1530,11 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 								"rendered":      false,
 								"timing":        tRes.Timing,
 							}
-							if doc.Author != "" {
-								out["author"] = doc.Author
+							if cleanAuthor != "" {
+								out["author"] = cleanAuthor
 							}
-							if doc.PublishedTime != "" {
-								out["publishedTime"] = doc.PublishedTime
+							if cleanPub != "" {
+								out["publishedTime"] = cleanPub
 							}
 							twinSpan.SetAttribute("edgefetch.twin.hit", true)
 							twinSpan.SetAttribute("crawler.via", twinVia)
@@ -1588,7 +1593,9 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 		return map[string]any{"ok": false, "error": "empty_reply"}, via, http.StatusBadGateway
 	}
 	res := reply.Results[0]
-	md := res.Markdown
+	md := extract.SanitizeScrapedMarkdown(res.Markdown)
+	cleanTitle := extract.SanitizeScrapedMeta(res.Title)
+	cleanDesc := extract.SanitizeScrapedMeta(res.Description)
 	if p.MaxChars > 0 && len(md) > p.MaxChars {
 		cut := p.MaxChars
 		for cut > 0 && !utf8.RuneStart(md[cut]) {
@@ -1604,10 +1611,10 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 		"status":      res.Status,
 		"outcome":     res.Outcome,
 		"problem":     res.Problem,
-		"title":       res.Title,
-		"description": res.Description,
+		"title":       cleanTitle,
+		"description": cleanDesc,
 		"markdown":    md,
-		"text":        res.Text,
+		"text":        extract.SanitizeScrapedMarkdown(res.Text),
 		"links":       res.Links,
 		"images":      res.Images,
 		"llms":        res.Llms,
@@ -1618,6 +1625,25 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 		out["contentSource"] = res.ContentSource
 	}
 	return out, via, http.StatusOK
+}
+
+func isSameTwinOriginDomain(expected *url.URL, finalRaw string) bool {
+	if expected == nil || finalRaw == "" {
+		return true
+	}
+	fu, err := url.Parse(finalRaw)
+	if err != nil || fu.Scheme != "https" || fu.User != nil {
+		return false
+	}
+	eh := strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(expected.Hostname()), "."), "www.")
+	fh := strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(fu.Hostname()), "."), "www.")
+	if eh == "" || fh == "" {
+		return false
+	}
+	if eh == fh || strings.HasSuffix(fh, "."+eh) || strings.HasSuffix(eh, "."+fh) {
+		return true
+	}
+	return false
 }
 
 func (s *Server) handleCallerExtractors(w http.ResponseWriter, r *http.Request) {

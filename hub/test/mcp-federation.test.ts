@@ -1074,15 +1074,9 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
         });
       }
     }
-    return new Response('not found', { status: 404 });
-  };
-
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const reqUrl = input instanceof Request ? input.url : String(input);
-    const u = new URL(reqUrl);
     if (u.origin === 'https://github.com' && u.pathname === '/login/oauth/access_token') {
-      const bodyStr = input instanceof Request ? await input.text() : String(init?.body ?? '');
+      const req = input instanceof Request ? input : new Request(String(input), init);
+      const bodyStr = await req.text();
       const form = new URLSearchParams(bodyStr);
       const code = form.get('code') ?? '';
       const usersByCode: Record<string, { id: number; login: string }> = {
@@ -1098,14 +1092,17 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
       return Response.json({ access_token: ghTok, token_type: 'bearer', scope: 'read:user' });
     }
     if (u.origin === 'https://api.github.com' && u.pathname === '/user') {
-      const hdrs = new Headers(input instanceof Request ? input.headers : init?.headers);
-      const m = /^Bearer\s+(\S+)$/i.exec(hdrs.get('authorization') ?? '');
+      const req = input instanceof Request ? input : new Request(String(input), init);
+      const m = /^Bearer\s+(\S+)$/i.exec(req.headers.get('authorization') ?? '');
       const user = m?.[1] ? ghTokenToUser.get(m[1]) : undefined;
       if (!user) return Response.json({ message: 'Unauthorized' }, { status: 401 });
       return Response.json({ id: user.id, login: user.login, avatar_url: `https://avatars.githubusercontent.com/u/${user.id}` });
     }
-    return originalFetch(input, init);
-  }) as typeof fetch;
+    if (u.origin === 'https://api.github.com' && u.pathname === '/user/orgs') {
+      return Response.json([]);
+    }
+    return new Response('not found', { status: 404 });
+  };
 
   const env = {
     AGENT_HUB: coordinator.asNamespace(),
@@ -1126,25 +1123,35 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
     return await (hubWorker as { fetch(r: Request, e: unknown): Promise<Response> }).fetch(req, env);
   };
 
+  const extractCookies = (headers: Headers): string[] => {
+    const anyH = headers as unknown as { getSetCookie?: () => string[] };
+    if (typeof anyH.getSetCookie === 'function') {
+      const list = anyH.getSetCookie();
+      if (list.length > 0) return list;
+    }
+    const single = headers.get('set-cookie');
+    return single ? [single] : [];
+  };
+
   const signInGitHubUser = async (code: string): Promise<{ cookie: string; csrf: string; userId: string; role: string }> => {
     const startRes = await dispatch('/admin/auth/github');
     assert.equal(startRes.status, 302);
     const loc = new URL(startRes.headers.get('location')!);
     const state = loc.searchParams.get('state')!;
-    const setCookies = (startRes.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() ?? [
-      startRes.headers.get('set-cookie') ?? '',
-    ];
-    const bindCookie = setCookies.map((c) => c.split(';')[0]!).find((c) => c.startsWith('ef_gh_oauth='))!;
+    const setCookies = extractCookies(startRes.headers);
+    const bindCookie = setCookies
+      .map((c) => c.split(';')[0]!.trim())
+      .find((c) => c.startsWith('__Host-ef_gh_oauth=') || c.startsWith('ef_gh_oauth='))!;
     assert.ok(bindCookie);
 
     const cbRes = await dispatch(`/admin/auth/github/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`, {
       headers: { cookie: bindCookie },
     });
     assert.equal(cbRes.status, 302);
-    const cbCookies = (cbRes.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() ?? [
-      cbRes.headers.get('set-cookie') ?? '',
-    ];
-    const adminCookie = cbCookies.map((c) => c.split(';')[0]!).find((c) => c.startsWith('ef_admin_session='))!;
+    const cbCookies = extractCookies(cbRes.headers);
+    const adminCookie = cbCookies
+      .map((c) => c.split(';')[0]!.trim())
+      .find((c) => c.startsWith('ef_admin_session=') && c.length > 'ef_admin_session='.length)!;
     assert.ok(adminCookie);
     const verified = await verifyAdminSessionCookie(adminCookie, sessionSecret, Date.now());
     assert.equal(verified.ok, true);
@@ -1170,26 +1177,26 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
       { headers: { cookie: sessionCookie } },
     );
     assert.equal(authPage.status, 200);
+    const csrfCookie = extractCookies(authPage.headers)
+      .map((c) => c.split(';')[0]!.trim())
+      .find((c) => c.startsWith('ef_oauth_csrf='))!;
+    assert.ok(csrfCookie);
     const html = await authPage.text();
+    const sealedMatch = /name="sealed"\s+value="([^"]+)"/.exec(html);
     const csrfMatch = /name="csrf"\s+value="([^"]+)"/.exec(html);
-    assert.ok(csrfMatch?.[1]);
+    assert.ok(sealedMatch?.[1] && csrfMatch?.[1]);
 
     const approveRes = await dispatch('/oauth/authorize', {
       method: 'POST',
       headers: {
-        cookie: sessionCookie,
+        cookie: `${sessionCookie}; ${csrfCookie}`,
         origin: 'https://hub.example.com',
         'content-type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({
         decision: 'approve',
-        csrf: csrfMatch![1]!,
-        client_id,
-        redirect_uri: 'http://127.0.0.1:54321/callback',
-        scope: 'crawl:read crawl:fetch',
-        state: 'st1',
-        code_challenge: challenge,
-        code_challenge_method: 'S256',
+        sealed: sealedMatch[1],
+        csrf: csrfMatch[1],
       }).toString(),
     });
     assert.equal(approveRes.status, 302);
@@ -1306,14 +1313,14 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
     assert.equal(bobListJson.count, 0);
     assert.equal(bobListJson.servers.length, 0);
 
-    // 6. User B (`gh_2002`) trying to call, test, or disconnect User A's `linear` MCP gets `404 mcp_server_not_found` / `deleted: false`!
+    // 6. User B (`gh_2002`) trying to call, test, or disconnect User A's `linear` MCP gets `404 mcp_server_not_connected` / `deleted: false`!
     const bobCallRes = await dispatch('/v1/mcp/query', {
       method: 'POST',
       headers: { authorization: `Bearer ${bobToken}`, 'content-type': 'application/json' },
       body: JSON.stringify({ action: 'call_tool', server: 'linear', tool: 'list_my_issues', arguments: {} }),
     });
     assert.equal(bobCallRes.status, 404);
-    assert.equal(((await bobCallRes.json()) as { error: string }).error, 'mcp_server_not_found');
+    assert.equal(((await bobCallRes.json()) as { error: string }).error, 'mcp_server_not_connected');
     assert.equal(downstreamLinearCalls, 1, 'User B must never trigger an outbound request with User A credentials');
 
     const bobTestAdmin = await dispatch('/admin/api/mcp/test', {
@@ -1338,7 +1345,6 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
     assert.equal(aliceStillConnected.servers.length, 1);
     assert.equal(aliceStillConnected.servers[0]!.slug, 'linear');
   } finally {
-    globalThis.fetch = originalFetch;
     coordinator.close();
     rmSync(tmpDir, { recursive: true, force: true });
   }

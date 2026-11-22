@@ -421,7 +421,7 @@ async function connectMockAgent({
       ws.send(
         JSON.stringify({
           type: 'agent_hello',
-          version: '2.6.3',
+          version: '2.7.0',
           arch: 'amd64',
           goVersion: 'go1.27.4',
           capabilities,
@@ -580,7 +580,7 @@ async function connectHeaderMockAgent({
         'X-Agent-Site': siteId,
         'X-Agent-Capabilities': capabilities.join(','),
         'X-Agent-Arch': 'amd64',
-        'X-Agent-Version': '2.6.3',
+        'X-Agent-Version': '2.7.0',
       },
     });
     req.on('error', (err) => {
@@ -600,7 +600,7 @@ async function connectHeaderMockAgent({
         encodeWsClientTextFrame(
           JSON.stringify({
             type: 'agent_hello',
-            version: '2.6.3',
+            version: '2.7.0',
             arch: 'amd64',
             goVersion: 'go1.27.4',
             capabilities,
@@ -1747,7 +1747,7 @@ describe('Tier 1 — Area A: Portable Hub HTTP, MCP, Sub-Modules & Deno', () => 
 
       const list = await mcpPost({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} });
       assert.equal(list.res.status, 200);
-      assert.equal(list.json.result.tools.length, 15);
+      assert.equal(list.json.result.tools.length, 17);
       assertTraceHeaders(list.res, { expectedTraceId: list.traceId, tag: '[F2/M1 /mcp tools/list]' });
 
       const callHeaders = (name) => ({ 'mcp-protocol-version': '2026-07-28', 'mcp-method': 'tools/call', 'mcp-name': name });

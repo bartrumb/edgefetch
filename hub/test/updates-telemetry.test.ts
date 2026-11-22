@@ -19,6 +19,7 @@ import {
   validateDevErrorReport,
 } from '../src/dev-telemetry.ts';
 import hubWorker from '../src/index.ts';
+import { mintSessionJwt } from '../src/github-auth.ts';
 import { ADMIN_COOKIE_NAME, createAdminSessionValue, createMemoryOAuthStore, readCookie } from '../src/oauth.ts';
 import { RequestTracer } from '../src/otel.ts';
 import {
@@ -227,12 +228,13 @@ test('Pillar 4 & 5: /admin Update Pill + POST /admin/api/telemetry CSRF toggle +
     assert.equal(await coordinator.settings.getSetting(DEV_TELEMETRY_SETTING_KEY), '0');
 
     // Member user (`role: 'member'`) gets 403 on POST /admin/api/telemetry and never sees fleet metadata in /admin/api/state!
-    const memberMinted = await createAdminSessionValue(OWNER_SECRET, undefined, {
+    const memberMinted = await mintSessionJwt({
+      secret: OWNER_SECRET,
       userId: 'gh_2002',
       role: 'member',
       githubLogin: 'member-bob',
     });
-    const memberCookie = `${ADMIN_COOKIE_NAME}=${memberMinted.value}`;
+    const memberCookie = `${ADMIN_COOKIE_NAME}=${memberMinted.token}`;
     const memberStateRes = await hubWorker.fetch(
       new Request('https://hub.example.com/admin/api/state', { headers: { cookie: memberCookie } }),
       baseEnv,

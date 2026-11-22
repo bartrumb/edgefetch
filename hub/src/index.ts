@@ -190,7 +190,7 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv, GitHub
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const DEFAULT_UA = 'EdgeFetch/2.6 (bot@edgefetch.dev)';
+const DEFAULT_UA = 'EdgeFetch/2.7 (bot@edgefetch.dev)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;
@@ -1285,9 +1285,9 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const openApiRes = handleOpenApiRoute(request, url, '2.6.3');
+      const openApiRes = handleOpenApiRoute(request, url, '2.7.0');
       if (openApiRes) return openApiRes;
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.3');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.7.0');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1439,7 +1439,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.6.3',
+          serverVersion: '2.7.0',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1794,7 +1794,7 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
-          return Response.json(buildCapabilities(env, '2.6.3'), {
+          return Response.json(buildCapabilities(env, '2.7.0'), {
             status: 200,
             headers: { 'cache-control': 'no-store' },
           });

@@ -370,7 +370,7 @@ try {
   // Live polite test + optional `--record`
   if (liveUrlArg) {
     const safeFetch = createSafeOutboundFetch();
-    const userAgent = 'EdgeFetch/2.6 (+https://github.com/bartrumb/edgefetch)';
+    const userAgent = 'EdgeFetch/2.7 (+https://github.com/bartrumb/edgefetch)';
     const checkPoliteRobots = async (uStr) => {
       const u = new URL(uStr);
       const rob = await fetchOverflowRobots(u.origin, userAgent, safeFetch, Date.now() + 8_000);

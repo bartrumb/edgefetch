@@ -3,7 +3,7 @@
 # (e.g. via `wingetcreate update`) before opening a PR to microsoft/winget-pkgs.
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.9.0.schema.json
 PackageIdentifier: BartrumB.EdgeFetch
-PackageVersion: 2.6.3
+PackageVersion: 2.7.0
 PackageLocale: en-US
 Publisher: BartrumB
 PublisherUrl: https://github.com/bartrumb/edgefetch
@@ -28,7 +28,7 @@ Installers:
     NestedInstallerFiles:
       - RelativeFilePath: edgefetch.exe
         PortableCommandAlias: edgefetch
-    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.6.3/edgefetch_2.6.3_windows_amd64.zip
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.7.0/edgefetch_2.7.0_windows_amd64.zip
     InstallerSha256: <REPLACE_WITH_RELEASE_WINDOWS_AMD64_ZIP_SHA256>
   - Architecture: arm64
     InstallerType: zip
@@ -36,5 +36,5 @@ Installers:
     NestedInstallerFiles:
       - RelativeFilePath: edgefetch.exe
         PortableCommandAlias: edgefetch
-    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.6.3/edgefetch_2.6.3_windows_arm64.zip
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.7.0/edgefetch_2.7.0_windows_arm64.zip
     InstallerSha256: <REPLACE_WITH_RELEASE_WINDOWS_ARM64_ZIP_SHA256>

@@ -404,7 +404,7 @@ export function scrubSpanToDevErrorReport(
   }
 
   const detected = detectRuntimeEnvironment();
-  const rawVersion = (meta?.version ?? (typeof hubPkg?.version === 'string' ? hubPkg.version : '2.6.3')).replace(/^v/i, '');
+  const rawVersion = (meta?.version ?? (typeof hubPkg?.version === 'string' ? hubPkg.version : '2.7.0')).replace(/^v/i, '');
   const version = SAFE_VERSION_RE.test(rawVersion) ? rawVersion : 'unknown';
   const runtime = meta?.runtime && VALID_RUNTIMES.has(meta.runtime) ? meta.runtime : detected.runtime;
   const os = sanitizeStructuralField(meta?.os ?? detected.os, 24, false) || 'unknown';

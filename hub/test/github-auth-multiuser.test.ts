@@ -164,7 +164,7 @@ function createInProcessHubHarness(overrides: Record<string, unknown> = {}) {
           siteId: 'site-alpha',
           publicIp: '198.51.100.42',
           arch: 'amd64',
-          version: '2.6.3',
+          version: '2.7.0',
           connectedAt: now - 10_000,
           lastJobAt: now - 1_000,
         },

@@ -2,6 +2,26 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.0] - 2026-11-22
+
+### Added
+- **Sign in with GitHub & Multi-User Tenant Isolation (`hub/src/github-auth.ts`, `hub/src/oauth.ts`, `hub/migrations/meta/0002_multiuser.sql`):**
+  - Added standards-compliant GitHub OAuth 2.1 + PKCE (`S256`) login (`GET /admin/auth/github`, `GET /admin/auth/github/callback`, and `/oauth/authorize` consent flow) powered by `oauth4webapi@3.8.9` and `jose@6.2.18` (`HS256` `jti`-revocable `HttpOnly; SameSite=Lax` session cookies via `SESSION_SECRET`), while preserving zero-config headless `CALLER_TOKEN` (`owner`) compatibility.
+  - Added `invite_only` (default, `GITHUB_ALLOWED_USERS` + `GITHUB_OWNER_LOGIN` / first-user owner bootstrap) and `open` (`SIGNUP_MODE=open`) onboarding modes with `owner` vs `member` RBAC (`POST /admin/api/users/role` and fleet/telemetry mutations strictly `owner`-only).
+  - Enforced strict end-to-end `user_id` isolation across OAuth 2.1 grants, `visibility: "private"` R2 scrape caches (`cache:private-r2`), private R2 artifacts, `private:<userId>:<collectionId>` D1/SQLite `FTS5` search collections, `/v1/agent` runs/traces/threads, and retained `interact` browser session HMACs.
+- **Dual-Source MCP Registry Discovery & Per-User `AES-256-GCM` Connector Vault (`hub/src/mcp-registry.ts`, `hub/src/mcp-vault.ts`, `hub/src/admin.ts`):**
+  - Added live MCP discovery (`GET /v1/mcp/registry`, `/admin/api/mcp/registry`, and MCP `discover_mcps` tool) fusing Official MCP Registry (`registry.modelcontextprotocol.io/v0/servers`) and Glama MCP Directory (`glama.ai/api/mcp/v1/servers`) results with TTL caching, graceful partial-source fallback, SSRF URL filtering, prompt-injection scrubbing, and automatic domain/header inference.
+  - Added a per-user `AES-256-GCM` credential vault (`user_mcp_servers` + `mcp_oauth_states` in SQLite/Durable Object storage) deriving unique per-user, per-origin keys via WebCrypto `HKDF-SHA256` (`VAULT_MASTER_KEY`, 96-bit random IV, `AAD = "${userId}|${remoteOrigin}"`, write-only secret storage) plus 1-click downstream OAuth 2.1 + PKCE (`RFC 9728` / `RFC 8414` + Dynamic Client Registration + automatic `refresh_token` rotation) and interactive **MCP Registry & Encrypted Connectors** UI in `/admin`.
+- **Federated Agent-to-Agent MCP Routing (`hub/src/mcp-federation.ts`, `hub/src/agent-runner.ts`, `hub/src/mcp.ts`):**
+  - Added federated `query_mcp` (`list_connected`, `list_tools`, `call_tool`) and `POST /v1/mcp/query` over Streamable HTTP JSON-RPC and SSE (`text/event-stream`), expanding EdgeFetch's canonical MCP surface to `17/17` tools with zero prompt-schema bloat.
+  - Added Tier-1 MCP-First Domain Routing in `POST /v1/agent` (both BYO-LLM and deterministic zero-LLM modes) and `POST /v1/scrape` (`useConnectedMcp`), automatically invoking a user's authenticated official MCP connector for matching domains before falling back to keyless YAML adapters or HTML scraping, sanitizing remote MCP outputs (`stripInvisibleSmugglingChars` + `detectPromptInjection`), and enforcing `visibility: "private"` (`Cache-Control: private, no-store`, zero shared cache writes).
+- **Universal Ed25519 Self-Updater & Fork Auto-Sync (`cmd/edgefetch/update.go`, `hub/src/update-check.ts`, `.github/workflows/upstream-sync.yml`):**
+  - Added `edgefetch update` (`--check`, `--yes`) for Linux, macOS, and Windows binaries: verifies the GitHub release tag, downloads `checksums.txt` + `checksums.txt.sig`, verifies the raw Ed25519 signature against the compiled-in owner public key (`SPKI SHA-256: 2ed9e6f815d727738d51bc48c176f2b63d5176c92975f52943fefcf0afe03272`) BEFORE unpacking, verifies the archive SHA-256 digest, and atomically swaps the executable in place.
+  - Added non-blocking 24h-cached background update notices in `edgefetch mcp` (`stderr` only, honoring `EDGEFETCH_DISABLE_UPDATE_CHECK=1`), a 1h-cached owner-only `/admin` version & outdated-worker status pill, scheduled fork upstream sync (`.github/workflows/upstream-sync.yml`), and safe `wrangler d1 migrations apply` steps in `.github/workflows/deploy-hub.yml`.
+- **Strictly Opt-In, Zero-PII OTLP Structural Error Telemetry (`hub/src/dev-telemetry.ts`, `internal/otel/dev_telemetry.go`, `telemetry/`):**
+  - Added default-`OFF` (`0` unattended network calls; `DO_NOT_TRACK=1` hard disable override) structural error telemetry across TypeScript Hubs (`EDGEFETCH_DEV_TELEMETRY=1` or owner-only `/admin` toggle) and Go binaries (`EDGEFETCH_DEV_TELEMETRY=1`), scrubbing `ERROR` spans down to an 11-key structural allowlist (`schemaVersion`, `version`, `runtime`, `os`, `arch`, `mode`, `spanName`, `adapterId`, `wafVendor`, `httpStatus`, `errorClass`) with zero URLs, zero hostnames, zero paths, zero content, and zero secrets.
+  - Added standalone Cloudflare Collector Worker (`telemetry/src/index.ts` + `telemetry/migrations/0001_errors.sql`) enforcing an `8 KiB` body cap, IPv6 `/64` token-bucket rate limiting (`30 req/min`), `400` rejection of any payload containing `://` or unexpected keys, SHA-256 fingerprint deduplication in D1, and `TELEMETRY_ADMIN_TOKEN`-authenticated `GET /v1/dev-errors/summary`.
+
 ## [2.6.3] - 2026-11-21
 
 ### Security

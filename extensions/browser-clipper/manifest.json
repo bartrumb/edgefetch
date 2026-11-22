@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "EdgeFetch Tab Clipper & Browser Node",
-  "version": "2.6.3",
+  "version": "2.7.0",
   "description": "Clip your active browser tab as clean GFM Markdown into your private EdgeFetch FTS5 search index, or optionally contribute idle egress as an EdgeFetch node.",
   "permissions": [
     "activeTab",

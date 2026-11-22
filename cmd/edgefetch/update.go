@@ -265,7 +265,7 @@ func extractFromTarGz(archiveBytes []byte, wantBin string) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read tar entry: %w", err)
 		}
-		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
 		if !isSafeArchiveEntryPath(hdr.Name, wantBin) {

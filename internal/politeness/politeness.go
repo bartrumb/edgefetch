@@ -492,13 +492,8 @@ func (e *RobotsEntry) allowedSingle(target string) bool {
 	}
 
 	var targetMask [4]uint64
-	hasMask := len(comp) >= 8 || len(target) >= 256
-	if hasMask {
-		for i := 0; i < len(target); i++ {
-			b := target[i]
-			targetMask[b>>6] |= 1 << (b & 63)
-		}
-	}
+	maskEligible := len(comp) >= 8 || len(target) >= 256
+	maskBuilt := false
 
 	var scanned int64
 	for i := range comp {
@@ -506,7 +501,20 @@ func (e *RobotsEntry) allowedSingle(target string) bool {
 		if len(target) < r.minLen {
 			continue
 		}
-		if hasMask {
+		if r.firstLit != "" && !strings.HasPrefix(target, r.firstLit) {
+			continue
+		}
+		if r.anchoredEnd && !r.trailingStar && r.lastLit != "" && !strings.HasSuffix(target, r.lastLit) {
+			continue
+		}
+		if maskEligible {
+			if !maskBuilt {
+				for j := 0; j < len(target); j++ {
+					b := target[j]
+					targetMask[b>>6] |= 1 << (b & 63)
+				}
+				maskBuilt = true
+			}
 			if (r.reqBytes[0]&^targetMask[0])|(r.reqBytes[1]&^targetMask[1])|(r.reqBytes[2]&^targetMask[2])|(r.reqBytes[3]&^targetMask[3]) != 0 {
 				continue
 			}
@@ -533,21 +541,12 @@ func canonicalizeRobotsTarget(norm string) string {
 		queryPart = norm[q:]
 		hasQuery = true
 	}
-	// Fast check: if pathPart starts with '/', has no "//", no "/.", and no ';', nothing changes!
-	needsClean := pathPart == "" || pathPart[0] != '/'
-	if !needsClean {
-		for i := 0; i < len(pathPart); i++ {
-			c := pathPart[i]
-			if c == ';' {
-				needsClean = true
-				break
-			}
-			if c == '/' && i+1 < len(pathPart) && (pathPart[i+1] == '/' || pathPart[i+1] == '.') {
-				needsClean = true
-				break
-			}
-		}
-	}
+	// Fast SIMD check: if pathPart starts with '/', has no "//", no "/.", and no ';', nothing changes!
+	needsClean := pathPart == "" ||
+		pathPart[0] != '/' ||
+		strings.IndexByte(pathPart, ';') >= 0 ||
+		strings.Contains(pathPart, "//") ||
+		strings.Contains(pathPart, "/.")
 	if !needsClean {
 		return norm
 	}

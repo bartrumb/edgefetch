@@ -1737,19 +1737,19 @@ func TestR6RedactAll30VectorsLinearSpeed429HoldCapAndRobotsPathNorm(t *testing.T
 	long := "Get \"https://host.example/p?" + strings.Repeat("a=b&", n/4) + "api_key=SECRET\": EOF"
 	t0 := time.Now()
 	o1 := RedactEmbeddedURLs(long)
-	if d := time.Since(t0); strings.Contains(o1, "SECRET") || d > 250*time.Millisecond {
+	if d := time.Since(t0); strings.Contains(o1, "SECRET") || d > time.Duration(testRaceSlowdown)*250*time.Millisecond {
 		t.Fatalf("4 MiB quoted URL redaction: leak=%v elapsed=%v", strings.Contains(o1, "SECRET"), d)
 	}
 	many := strings.Repeat("\"https://h.example/p?k=S ", n/24)
 	t0 = time.Now()
 	o2 := RedactEmbeddedURLs(many)
-	if d := time.Since(t0); strings.Contains(o2, "k=S") || d > 500*time.Millisecond {
+	if d := time.Since(t0); strings.Contains(o2, "k=S") || d > time.Duration(testRaceSlowdown)*500*time.Millisecond {
 		t.Fatalf("4 MiB unterminated URLs redaction: leak=%v elapsed=%v", strings.Contains(o2, "k=S"), d)
 	}
 	esc := "\"https://h.example/p?" + strings.Repeat(`\\`, n/2)
 	t0 = time.Now()
 	o3 := RedactEmbeddedURLs(esc)
-	if d := time.Since(t0); len(o3) > 64 || d > 250*time.Millisecond {
+	if d := time.Since(t0); len(o3) > 64 || d > time.Duration(testRaceSlowdown)*250*time.Millisecond {
 		t.Fatalf("4 MiB backslash URL redaction: len=%d elapsed=%v", len(o3), d)
 	}
 

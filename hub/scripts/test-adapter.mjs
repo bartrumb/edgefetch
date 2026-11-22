@@ -191,16 +191,21 @@ try {
   // Warm up V8 JIT once before enforcing strict < 50ms per-case bulkhead wall-clock budget
   if (selected[0]?.extractHtml) {
     const warmUrl = new URL(selected[0].exampleUrls[0]);
-    selected[0].extractHtml({
-      url: warmUrl,
-      baseUrl: selected[0].exampleUrls[0],
-      host: warmUrl.hostname.toLowerCase(),
-      path: warmUrl.pathname,
-      parts: warmUrl.pathname.split('/').filter(Boolean),
-      rawHtml: '<!doctype html><html><body><h1>Warmup</h1></body></html>',
-      currentMd: '# Warmup',
-      htmlToMd: simpleHtmlToMd,
-    });
+    for (const warmHtml of [
+      '<!doctype html><html><body><h1>Warmup</h1></body></html>',
+      adversarialPayloads[6]?.body ?? '',
+    ]) {
+      selected[0].extractHtml({
+        url: warmUrl,
+        baseUrl: selected[0].exampleUrls[0],
+        host: warmUrl.hostname.toLowerCase(),
+        path: warmUrl.pathname,
+        parts: warmUrl.pathname.split('/').filter(Boolean),
+        rawHtml: warmHtml,
+        currentMd: '# Warmup',
+        htmlToMd: simpleHtmlToMd,
+      });
+    }
   }
 
   let totalFuzzed = 0;

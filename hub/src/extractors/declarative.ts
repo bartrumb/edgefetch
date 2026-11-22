@@ -3380,7 +3380,13 @@ function runDomHtmlRoute(
   extractorId: string,
 ): PostFetchSiteResult | null {
   const doc = parseHtmlDoc(ctx.rawHtml);
-  const cleanHtml = stripScriptsAndStyles(ctx.rawHtml);
+  let cachedCleanHtml: string | undefined;
+  const getCleanHtml = (): string => {
+    if (cachedCleanHtml === undefined) {
+      cachedCleanHtml = stripScriptsAndStyles(ctx.rawHtml);
+    }
+    return cachedCleanHtml;
+  };
 
   let ldObj: Record<string, unknown> | undefined;
   if (hr.jsonLdTypes && hr.jsonLdTypes.length > 0) {
@@ -3538,7 +3544,7 @@ function runDomHtmlRoute(
                   .select('img[alt]', 80)
                   .map((n) => n.attr('alt') ?? '')
                   .join(' ')}`
-              : cleanHtml.slice(0, 200_000);
+              : getCleanHtml().slice(0, 200_000);
           const m = re.exec(corpus);
           const grp = m?.[rx.group ?? 1] ?? '';
           if (grp) {
@@ -3580,10 +3586,10 @@ function runDomHtmlRoute(
     return val;
   };
 
-  for (const k of Object.keys(varsMap)) lookup(k);
   for (const rv of hr.requireVars ?? []) {
     if (!lookup(rv).trim()) return null;
   }
+  for (const k of Object.keys(varsMap)) lookup(k);
 
   let title = '';
   if (hr.titleWhenVar) {

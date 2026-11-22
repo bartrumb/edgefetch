@@ -726,8 +726,8 @@ func TestR6RobotsCanonicalPathBOMTruncationAndSub25msComplexity(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("%s: Allowed = %v, want %v", tc.name, got, tc.want)
 		}
-		// Allow generous margin for -race instrumentation while strictly enforcing < 25ms uninstrumented (< 100ms under -race).
-		if dur > 100*time.Millisecond {
+		// Strictly enforce < 100ms uninstrumented while accounting for ThreadSanitizer (-race) shadow-memory overhead on 2-core CI VMs.
+		if dur > time.Duration(testRaceSlowdown)*100*time.Millisecond {
 			t.Fatalf("%s: Allowed() took %s on 1 MiB path, want fast bounded execution", tc.name, dur)
 		}
 	}

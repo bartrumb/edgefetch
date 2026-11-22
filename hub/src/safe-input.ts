@@ -784,14 +784,22 @@ export function stripHtmlTagsLinear(
 ): string {
   const capped = rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
   let cur = stripStrayNulsPreservingEfSentinels(capped);
+  if (cur.indexOf('<') < 0 || tagNamesLower.length === 0) return cur;
   const targetSet = new Set(tagNamesLower.map((t) => asciiLower(t)));
   const deferSet = replacement === '' ? targetSet : undefined;
+  const initialLower = asciiLower(cur);
+  let changedAny = false;
 
   for (const tag of targetSet) {
-    cur = replaceHtmlTagBlocksLinear(cur, tag, () => replacement, maxChars, deferSet);
+    if (initialLower.indexOf(`<${tag}`) < 0) continue;
+    const next = replaceHtmlTagBlocksLinear(cur, tag, () => replacement, maxChars, deferSet);
+    if (next !== cur) {
+      cur = next;
+      changedAny = true;
+    }
   }
 
-  if (replacement === '' && targetSet.size > 0) {
+  if (changedAny && replacement === '' && targetSet.size > 0) {
     for (let pass = 0; pass < 8; pass++) {
       const prevLen = cur.length;
       const lower = asciiLower(cur);

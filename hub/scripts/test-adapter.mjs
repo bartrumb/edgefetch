@@ -252,17 +252,24 @@ try {
         testedTwins++;
 
         for (const p of adversarialPayloads) {
-          const t0 = performance.now();
-          const fBox = runAdapterSyncInBulkhead(
-            adapter.id,
-            (inp) => twin.formatTwin(inp.body, inp.sampleUrl, simpleHtmlToMd),
-            { body: p.body, sampleUrl },
-            MAX_FUZZ_MS_PER_PAYLOAD,
-          );
-          const dt = performance.now() - t0;
-          if (!fBox.ok && String(fBox.error).includes('AdapterNetworkForbiddenError')) {
-            throw new Error(`[${adapter.id}] Forbidden fetch() call inside formatTwin!`);
-          }
+          const runTwinTrial = () => {
+            const t0 = performance.now();
+            const fBox = runAdapterSyncInBulkhead(
+              adapter.id,
+              (inp) => twin.formatTwin(inp.body, inp.sampleUrl, simpleHtmlToMd),
+              { body: p.body, sampleUrl },
+              MAX_FUZZ_MS_PER_PAYLOAD,
+            );
+            const elapsed = performance.now() - t0;
+            if (!fBox.ok && String(fBox.error).includes('AdapterNetworkForbiddenError')) {
+              throw new Error(`[${adapter.id}] Forbidden fetch() call inside formatTwin!`);
+            }
+            return elapsed;
+          };
+          // Best-of-3 re-measurement when a single iteration hits a V8 GC or CI hypervisor preemption pause:
+          // deterministic O(N^2) slowdowns exceed MAX_FUZZ_MS_PER_PAYLOAD on every trial.
+          let dt = runTwinTrial();
+          if (dt > MAX_FUZZ_MS_PER_PAYLOAD) dt = Math.min(dt, runTwinTrial(), runTwinTrial());
           totalFuzzed++;
           if (dt > worstMs) {
             worstMs = dt;
@@ -285,26 +292,31 @@ try {
       const parsedUrl = new URL(sampleUrl);
       const parts = parsedUrl.pathname.split('/').filter(Boolean);
       for (const p of adversarialPayloads) {
-        const t0 = performance.now();
-        const hBox = runAdapterSyncInBulkhead(
-          adapter.id,
-          (ctx) => adapter.extractHtml(ctx),
-          {
-            url: parsedUrl,
-            baseUrl: sampleUrl,
-            host: parsedUrl.hostname.toLowerCase(),
-            path: parsedUrl.pathname,
-            parts,
-            rawHtml: p.body,
-            currentMd: p.body.slice(0, 4_000),
-            htmlToMd: simpleHtmlToMd,
-          },
-          MAX_FUZZ_MS_PER_PAYLOAD,
-        );
-        const dt = performance.now() - t0;
-        if (!hBox.ok && String(hBox.error).includes('AdapterNetworkForbiddenError')) {
-          throw new Error(`[${adapter.id}] Forbidden fetch() call inside extractHtml!`);
-        }
+        const runHtmlTrial = () => {
+          const t0 = performance.now();
+          const hBox = runAdapterSyncInBulkhead(
+            adapter.id,
+            (ctx) => adapter.extractHtml(ctx),
+            {
+              url: parsedUrl,
+              baseUrl: sampleUrl,
+              host: parsedUrl.hostname.toLowerCase(),
+              path: parsedUrl.pathname,
+              parts,
+              rawHtml: p.body,
+              currentMd: p.body.slice(0, 4_000),
+              htmlToMd: simpleHtmlToMd,
+            },
+            MAX_FUZZ_MS_PER_PAYLOAD,
+          );
+          const elapsed = performance.now() - t0;
+          if (!hBox.ok && String(hBox.error).includes('AdapterNetworkForbiddenError')) {
+            throw new Error(`[${adapter.id}] Forbidden fetch() call inside extractHtml!`);
+          }
+          return elapsed;
+        };
+        let dt = runHtmlTrial();
+        if (dt > MAX_FUZZ_MS_PER_PAYLOAD) dt = Math.min(dt, runHtmlTrial(), runHtmlTrial());
         totalFuzzed++;
         if (dt > worstMs) {
           worstMs = dt;

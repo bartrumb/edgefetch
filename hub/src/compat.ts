@@ -15,6 +15,7 @@ import {
 import { isValidSecretMatch } from './auth';
 import { resolveSessionSecret, type GitHubAuthEnv } from './github-auth';
 import type { LlmEnvBindings } from './llm';
+import type { McpVaultStore } from './mcp-vault';
 import {
   cancelBatchScrape,
   cancelCrawlJob,
@@ -38,13 +39,23 @@ import { executeSearchCall, type SearchBindings } from './web-search';
 export async function handleCompatRoutes(params: {
   request: Request;
   url: URL;
-  env: OptionalStorageBindings & SearchBindings & LlmEnvBindings & GitHubAuthEnv & { MCP_TOKEN?: string; WEBHOOK_SECRET?: string };
+  env: OptionalStorageBindings &
+    SearchBindings &
+    LlmEnvBindings &
+    GitHubAuthEnv & {
+      MCP_TOKEN?: string;
+      WEBHOOK_SECRET?: string;
+      VAULT_MASTER_KEY?: string;
+      SAFE_PUBLIC_FETCH?: typeof fetch;
+      SAFE_FETCH?: typeof fetch;
+    };
   oauthStore: OAuthStore;
+  vaultStore?: McpVaultStore;
   executeHubFetch: HubFetchExecutor;
   waitUntil?: (p: Promise<unknown>) => void;
   tracer?: RequestTracer | TraceContext;
 }): Promise<Response | null> {
-  const { request, url, env, oauthStore, executeHubFetch, waitUntil } = params;
+  const { request, url, env, oauthStore, vaultStore, executeHubFetch, waitUntil } = params;
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runCompat = async (): Promise<Response | null> => {
   const p = url.pathname;
@@ -311,6 +322,7 @@ export async function handleCompatRoutes(params: {
       principal: auth.ok ? auth.principal : 'compat',
       userId: callerUserId,
       ...(sessionSigningSecret ? { sessionSigningSecret } : {}),
+      ...(vaultStore ? { vaultStore } : {}),
       wantSseStream: wantSse,
       ...(waitUntil ? { waitUntil } : {}),
       ...(activeTracer ? { tracer: activeTracer } : {}),

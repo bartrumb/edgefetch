@@ -470,6 +470,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     GITHUB_ALLOWED_USERS: mergedEnv.GITHUB_ALLOWED_USERS,
     GITHUB_OWNER_LOGIN: mergedEnv.GITHUB_OWNER_LOGIN,
     SIGNUP_MODE: mergedEnv.SIGNUP_MODE,
+    VAULT_MASTER_KEY: mergedEnv.VAULT_MASTER_KEY ?? mergedEnv.EDGEFETCH_VAULT_MASTER_KEY,
     MCP_TOKEN: mergedEnv.MCP_TOKEN,
     AGENT_TOKEN: mergedEnv.AGENT_TOKEN ?? mergedEnv.EDGEFETCH_AGENT_TOKEN,
     AGENT_TOKENS: mergedEnv.AGENT_TOKENS ?? mergedEnv.EDGEFETCH_AGENT_TOKENS,

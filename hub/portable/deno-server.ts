@@ -31,6 +31,14 @@ import {
 import { authorizeAgent } from '../src/auth.ts';
 import hubWorker from '../src/index.ts';
 import {
+  createMemoryMcpVaultStore,
+  createSqliteMcpVaultStore,
+  MCP_VAULT_SQLITE_SCHEMA,
+  type McpVaultStore,
+  type PendingMcpOAuthStateRow,
+  type StoredMcpServerRow,
+} from '../src/mcp-vault.ts';
+import {
   createMemoryOAuthStore,
   createSqliteOAuthStore,
   OAUTH_SQLITE_SCHEMA,
@@ -92,6 +100,8 @@ const KNOWN_DENO_ENV_KEYS = [
   'GITHUB_ALLOWED_USERS',
   'GITHUB_OWNER_LOGIN',
   'SIGNUP_MODE',
+  'VAULT_MASTER_KEY',
+  'EDGEFETCH_VAULT_MASTER_KEY',
   'CALLER_TOKEN',
   'EDGEFETCH_CALLER_TOKEN',
   'EDGEFETCH_SERVER_TOKEN',
@@ -745,15 +755,17 @@ function sanitizeDenoInboundRequest(
 }
 
 const fallbackSharedOAuthStore: OAuthStore = createMemoryOAuthStore();
+const fallbackSharedMcpVaultStore: McpVaultStore = createMemoryMcpVaultStore();
 const fallbackSharedActivityStore: ActivityStore = createMemoryActivityStore();
 
 function openDenoPersistentStores(
   dataDir: string,
   ephemeralStores = false,
-): { oauth: OAuthStore; activity: ActivityStore; close: () => void } {
+): { oauth: OAuthStore; mcpVault: McpVaultStore; activity: ActivityStore; close: () => void } {
   if (ephemeralStores || dataDir.trim() === ':memory:') {
     return {
       oauth: createMemoryOAuthStore(),
+      mcpVault: createMemoryMcpVaultStore(),
       activity: createMemoryActivityStore(),
       close: () => {},
     };
@@ -765,7 +777,7 @@ function openDenoPersistentStores(
       mkdirSync(dirname(sqlitePath), { recursive: true });
     }
     const db = new DatabaseSync(sqlitePath);
-    db.exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; ${OAUTH_SQLITE_SCHEMA} ${ACTIVITY_SQLITE_SCHEMA}`);
+    db.exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; ${OAUTH_SQLITE_SCHEMA} ${MCP_VAULT_SQLITE_SCHEMA} ${ACTIVITY_SQLITE_SCHEMA}`);
     const sqlLike: SqlStorageLike = {
       exec: <T = Record<string, unknown>>(query: string, ...bindings: unknown[]) => {
         const stmt = db.prepare(query);
@@ -786,6 +798,7 @@ function openDenoPersistentStores(
     };
     return {
       oauth: createSqliteOAuthStore(sqlLike),
+      mcpVault: createSqliteMcpVaultStore(sqlLike),
       activity: createSqliteActivityStore(sqlLike),
       close: () => {
         try {
@@ -798,6 +811,7 @@ function openDenoPersistentStores(
   } catch {
     return {
       oauth: fallbackSharedOAuthStore,
+      mcpVault: fallbackSharedMcpVaultStore,
       activity: fallbackSharedActivityStore,
       close: () => {},
     };
@@ -880,6 +894,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     options.ephemeralStores,
   );
   const oauth: OAuthStore = persistentStores.oauth;
+  const mcpVault: McpVaultStore = persistentStores.mcpVault;
   const activity: ActivityStore = persistentStores.activity;
   const bus = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('edgefetch-hub-bus') : null;
 
@@ -974,6 +989,13 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     oauthCheckAuthLockout: (b: string, now: number, m?: number) => oauth.checkAuthLockout(b, now, m),
     oauthRecordAuthFailure: (b: string, now: number, w: number, m: number) => oauth.recordAuthFailure(b, now, w, m),
     oauthClearAuthFailures: (b: string) => oauth.clearAuthFailures(b),
+    vaultListServers: (userId: string) => mcpVault.listServers(userId),
+    vaultGetServer: (userId: string, slugOrDomain: string) => mcpVault.getServer(userId, slugOrDomain),
+    vaultUpsertServer: (row: StoredMcpServerRow) => mcpVault.upsertServer(row),
+    vaultDeleteServer: (userId: string, slug: string) => mcpVault.deleteServer(userId, slug),
+    vaultPutOAuthState: (row: PendingMcpOAuthStateRow) => mcpVault.putOAuthState(row),
+    vaultConsumeOAuthState: (stateHash: string, userId: string, now: number) =>
+      mcpVault.consumeOAuthState(stateHash, userId, now),
   };
 
   const workerEnv: Record<string, unknown> = {
@@ -987,6 +1009,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     GITHUB_ALLOWED_USERS: envMap.GITHUB_ALLOWED_USERS,
     GITHUB_OWNER_LOGIN: envMap.GITHUB_OWNER_LOGIN,
     SIGNUP_MODE: envMap.SIGNUP_MODE,
+    VAULT_MASTER_KEY: envMap.VAULT_MASTER_KEY ?? envMap.EDGEFETCH_VAULT_MASTER_KEY,
     MCP_TOKEN: envMap.MCP_TOKEN,
     AGENT_TOKEN: envMap.AGENT_TOKEN ?? envMap.EDGEFETCH_AGENT_TOKEN,
     AGENT_TOKENS: envMap.AGENT_TOKENS ?? envMap.EDGEFETCH_AGENT_TOKENS,

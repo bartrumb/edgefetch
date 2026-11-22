@@ -22,8 +22,28 @@ import {
   startGitHubOAuthFlow,
   type GitHubAuthEnv,
 } from './github-auth';
+import { testAndListRemoteMcpTools } from './mcp-federation';
+import { discoverMcps, inferAssociatedDomains, isSafePublicHttpsUrl, slugifyMcpServerName } from './mcp-registry';
+import {
+  buildMaskedAuthSummary,
+  completeDownstreamMcpOAuthCallback,
+  MCP_OAUTH_BIND_COOKIE,
+  probeRemoteMcpOAuthMetadata,
+  resolveCallerUserId,
+  sanitizeSecretHeadersInput,
+  sealVaultCredentials,
+  startDownstreamMcpOAuth,
+  toPublicMcpServerSummary,
+  unsealVaultCredentials,
+  validateVaultMasterKey,
+  type McpVaultStore,
+  type PublicMcpServerSummary,
+  type StoredMcpServerRow,
+  type VaultSecretPayload,
+} from './mcp-vault';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
+import { stripInvisibleSmugglingChars } from './scrape';
 import {
   ADMIN_COOKIE_NAME,
   createAdminSessionValue,
@@ -83,6 +103,10 @@ export interface AdminPortalDeps {
   ownerSecret?: string;
   githubAuthEnv?: GitHubAuthEnv;
   metaDb?: D1Database;
+  vaultMasterKey?: string;
+  vaultStore?: McpVaultStore;
+  safePublicFetch?: typeof fetch;
+  selfHost?: string;
   oauthStore: OAuthStore;
   allowedTargets: FetchTarget[];
   defaultTarget: FetchTarget;
@@ -258,7 +282,7 @@ function renderDashboardHtml(params: {
     .log-row.open .log-detail { display: block; }
     .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 10px; }
     label { display: block; font-size: 0.78rem; font-weight: 600; color: #cbd5e1; margin-bottom: 4px; }
-    input[type="text"], input[type="url"], input[type="number"], select { width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; }
+    input[type="text"], input[type="url"], input[type="number"], input[type="password"], select { width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; }
     table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
     th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid #334155; }
     th { color: #94a3b8; font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .03em; }
@@ -452,6 +476,90 @@ function renderDashboardHtml(params: {
       </section>
     </div>
 
+    <section class="card" id="mcp-connectors">
+      <h2>
+        <span>MCP Registry &amp; Encrypted Connectors (<span id="mcp-conn-count">0</span> connected)</span>
+        <span style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="pill" id="vault-status-pill" title="AES-256-GCM HKDF Vault Status">AES-256-GCM Vault</span>
+          <button type="button" class="primary" id="custom-mcp-btn" style="padding:4px 11px;font-size:0.78rem">+ Connect Custom HTTPS MCP</button>
+        </span>
+      </h2>
+      <p class="muted" style="margin:0 0 12px">Connect downstream Streamable HTTP / SSE MCP servers once in your per-user <code>AES-256-GCM</code> vault. EdgeFetch routes matching domains and <code>query_mcp</code> calls agent-to-agent with zero prompt schema bloat.</p>
+
+      <div style="margin-bottom:14px">
+        <table>
+          <thead><tr><th>Connector</th><th>Auth Vault</th><th>Domains</th><th>Tools</th><th>Verified</th><th>Actions</th></tr></thead>
+          <tbody id="mcp-conn-tbody"><tr><td colspan="6" class="muted">No downstream MCP connectors configured yet. Search the Registry below to add auth.</td></tr></tbody>
+        </table>
+      </div>
+
+      <div id="mcp-connect-panel" style="display:none;margin-bottom:16px;padding:16px;background:#0f172a;border:1px solid #3b82f6;border-radius:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px">
+          <strong id="mcp-form-title" style="color:#f8fafc">Connect Remote MCP Server</strong>
+          <button type="button" id="mcp-form-close-btn" style="padding:3px 9px;font-size:0.76rem">Close</button>
+        </div>
+        <div id="mcp-oauth-banner" style="display:none;margin-bottom:12px;padding:10px 12px;background:#064e3b;border:1px solid #059669;border-radius:8px;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+          <span style="font-size:0.83rem;color:#ecfdf5">OAuth 2.1 PKCE metadata detected on this remote MCP endpoint!</span>
+          <button type="button" class="primary" id="mcp-oauth-start-btn">1-Click Connect with OAuth 2.1 (PKCE)</button>
+        </div>
+        <form id="mcp-connect-form">
+          <div class="form-grid">
+            <div>
+              <label for="mc-name">Display Name</label>
+              <input id="mc-name" type="text" required placeholder="Linear MCP">
+            </div>
+            <div>
+              <label for="mc-slug">Connector Slug</label>
+              <input id="mc-slug" type="text" required placeholder="linear">
+            </div>
+            <div>
+              <label for="mc-transport">Transport</label>
+              <select id="mc-transport">
+                <option value="streamable-http" selected>streamable-http (JSON-RPC / SSE)</option>
+                <option value="sse">sse</option>
+              </select>
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <label for="mc-url">Remote HTTPS MCP Endpoint URL (port 443)</label>
+            <input id="mc-url" type="url" required placeholder="https://mcp.linear.app/mcp">
+          </div>
+          <div style="margin-top:10px">
+            <label for="mc-domains">Associated Domains (comma-separated, routed MCP-first in /v1/agent)</label>
+            <input id="mc-domains" type="text" placeholder="linear.app">
+          </div>
+          <div id="mc-manifest-headers" style="margin-top:10px"></div>
+          <div class="form-grid" style="margin-top:10px">
+            <div>
+              <label for="mc-bearer">Bearer Token (write-only, optional)</label>
+              <input id="mc-bearer" type="password" autocomplete="new-password" placeholder="Paste API / OAuth token...">
+            </div>
+            <div>
+              <label for="mc-hdr-name">Custom Header Name (optional)</label>
+              <input id="mc-hdr-name" type="text" placeholder="X-Api-Key">
+            </div>
+            <div>
+              <label for="mc-hdr-val">Custom Header Secret (write-only)</label>
+              <input id="mc-hdr-val" type="password" autocomplete="new-password" placeholder="Paste header secret...">
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px">
+            <button type="button" id="mc-test-btn">Test Connection (tools/list)</button>
+            <button type="submit" class="primary" id="mc-save-btn">Save to Encrypted Vault</button>
+            <span id="mc-status" class="muted"></span>
+          </div>
+        </form>
+        <pre class="out" id="mc-test-out" style="display:none"></pre>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+        <input id="mcp-reg-q" type="text" placeholder="Search Official MCP Registry + Glama (e.g. linear, notion, github, sentry, stripe)..." style="flex:1;min-width:240px">
+        <label style="display:inline-flex;align-items:center;gap:6px;margin:0;font-size:0.82rem"><input id="mcp-reg-remote" type="checkbox" checked> Remote HTTP/SSE only</label>
+        <button type="button" class="primary" id="mcp-reg-search-btn">Search Registry</button>
+      </div>
+      <div id="mcp-reg-grid" class="grid-3"><div class="muted">Click "Search Registry" to browse live remote MCP connectors from registry.modelcontextprotocol.io and glama.ai.</div></div>
+    </section>
+
     <section class="card">
       <h2><span>Cloudflare Workers Observability — Single Pane of Glass Filters</span></h2>
       <p class="muted" style="margin:0">Open <strong>Cloudflare Dashboard -&gt; Workers &amp; Pages -&gt; Observability (Traces &amp; Logs)</strong> for long-term retention &amp; OTel waterfall traces:</p>
@@ -631,8 +739,253 @@ function renderDashboardHtml(params: {
           ).join('')
         : '<tr><td colspan="4" class="muted">No OAuth 2.1 grants issued yet</td></tr>';
 
+      renderMcpConnectors(data.mcpServers || [], Boolean(data.vaultConfigured));
       renderLogs();
     }
+
+    let lastRegistryResults = [];
+    let currentManifestHeaders = [];
+
+    function renderMcpConnectors(servers, vaultConfigured) {
+      el('mcp-conn-count').textContent = servers.length;
+      const pill = el('vault-status-pill');
+      pill.textContent = vaultConfigured ? 'AES-256-GCM Ready' : 'VAULT_MASTER_KEY Unset';
+      pill.style.background = vaultConfigured ? '#064e3b' : '#78350f';
+      pill.style.borderColor = vaultConfigured ? '#059669' : '#d97706';
+      pill.style.color = vaultConfigured ? '#6ee7b7' : '#fde68a';
+
+      const tbody = el('mcp-conn-tbody');
+      if (!servers.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">No downstream MCP connectors configured yet. Search the Registry below to add auth.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = servers.map((s) => {
+        const badge = s.authSummary?.maskedBadge || s.authType;
+        const doms = (s.domains || []).map((d) => '<code>' + esc(d) + '</code>').join(', ') || '—';
+        return '<tr>' +
+          '<td><strong>' + esc(s.name) + '</strong><div class="muted"><code>' + esc(s.slug) + '</code> &middot; ' + esc(s.remoteOrigin) + '</div></td>' +
+          '<td><span class="badge lvl-info">' + esc(badge) + '</span></td>' +
+          '<td>' + doms + '</td>' +
+          '<td><strong>' + Number(s.toolCount || 0) + '</strong> tools</td>' +
+          '<td>' + esc(s.lastVerifiedAt ? relTime(s.lastVerifiedAt) : 'unverified') + '</td>' +
+          '<td style="display:flex;gap:6px;flex-wrap:wrap">' +
+            '<button type="button" data-mcp-retest="' + esc(s.slug) + '" style="padding:4px 8px;font-size:0.75rem">Test tools/list</button>' +
+            '<button type="button" data-mcp-rotate="' + esc(s.slug) + '" style="padding:4px 8px;font-size:0.75rem">Rotate Auth</button>' +
+            '<button type="button" class="danger" data-mcp-disconnect="' + esc(s.slug) + '">Disconnect</button>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    function openConnectPanel(opts) {
+      el('mcp-connect-panel').style.display = 'block';
+      el('mcp-form-title').textContent = opts.rotate ? ('Rotate Auth — ' + (opts.title || opts.slug)) : ('Connect / Add Auth — ' + (opts.title || 'Custom HTTPS MCP'));
+      el('mc-name').value = opts.title || '';
+      el('mc-slug').value = opts.slug || '';
+      el('mc-url').value = opts.remoteUrl || '';
+      el('mc-transport').value = opts.transport || 'streamable-http';
+      el('mc-domains').value = (opts.domains || []).join(', ');
+      el('mc-bearer').value = '';
+      el('mc-hdr-name').value = '';
+      el('mc-hdr-val').value = '';
+      el('mc-status').textContent = '';
+      el('mc-test-out').style.display = 'none';
+      el('mcp-oauth-banner').style.display = 'none';
+
+      currentManifestHeaders = Array.isArray(opts.headers) ? opts.headers : [];
+      const container = el('mc-manifest-headers');
+      if (currentManifestHeaders.length) {
+        container.innerHTML = '<div class="muted" style="margin-bottom:6px">Manifest-required authentication headers (write-only):</div>' +
+          '<div class="form-grid">' +
+          currentManifestHeaders.map((h, i) =>
+            '<div><label>' + esc(h.name) + (h.isRequired ? ' *' : '') + '</label>' +
+            '<input type="' + (h.isSecret === false ? 'text' : 'password') + '" data-manifest-hdr="' + i + '" autocomplete="new-password" placeholder="' + esc(h.placeholder || h.description || h.name) + '">' +
+            '</div>'
+          ).join('') + '</div>';
+      } else {
+        container.innerHTML = '';
+      }
+
+      if (opts.remoteUrl) {
+        fetch('/admin/api/mcp/probe', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+          body: JSON.stringify({ remoteUrl: opts.remoteUrl }),
+        }).then((r) => r.json()).then((probe) => {
+          if (probe && probe.supported) {
+            el('mcp-oauth-banner').style.display = 'flex';
+          }
+        }).catch(() => {});
+      }
+    }
+
+    function collectSecretHeadersFromForm() {
+      const headers = {};
+      document.querySelectorAll('[data-manifest-hdr]').forEach((inp) => {
+        const idx = Number(inp.getAttribute('data-manifest-hdr'));
+        const spec = currentManifestHeaders[idx];
+        if (spec && inp.value.trim()) headers[spec.name] = inp.value.trim();
+      });
+      const customName = el('mc-hdr-name').value.trim();
+      const customVal = el('mc-hdr-val').value.trim();
+      if (customName && customVal) headers[customName] = customVal;
+      return headers;
+    }
+
+    el('custom-mcp-btn').addEventListener('click', () => openConnectPanel({}));
+    el('mcp-form-close-btn').addEventListener('click', () => { el('mcp-connect-panel').style.display = 'none'; });
+
+    el('mcp-oauth-start-btn').addEventListener('click', async () => {
+      el('mc-status').textContent = 'Starting OAuth 2.1 PKCE...';
+      const res = await fetch('/admin/mcp/oauth/start', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+        body: JSON.stringify({
+          remoteUrl: el('mc-url').value.trim(),
+          slug: el('mc-slug').value.trim(),
+          name: el('mc-name').value.trim(),
+          transport: el('mc-transport').value,
+          domains: el('mc-domains').value.split(',').map((s) => s.trim()).filter(Boolean),
+        }),
+      });
+      const out = await res.json();
+      if (out.ok && out.authorizationUrl) {
+        location.href = out.authorizationUrl;
+      } else {
+        el('mc-status').textContent = out.message || out.error || 'OAuth start failed';
+      }
+    });
+
+    el('mc-test-btn').addEventListener('click', async () => {
+      el('mc-status').textContent = 'Testing initialize + tools/list...';
+      const res = await fetch('/admin/api/mcp/test', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+        body: JSON.stringify({
+          remoteUrl: el('mc-url').value.trim(),
+          transport: el('mc-transport').value,
+          bearerToken: el('mc-bearer').value.trim() || undefined,
+          headers: collectSecretHeadersFromForm(),
+        }),
+      });
+      const out = await res.json();
+      el('mc-test-out').style.display = 'block';
+      el('mc-test-out').textContent = JSON.stringify(out, null, 2);
+      el('mc-status').textContent = out.ok ? ('Verified ' + out.toolCount + ' tools!') : ('Error: ' + (out.message || out.error));
+    });
+
+    el('mcp-connect-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      el('mc-status').textContent = 'Encrypting & verifying...';
+      const res = await fetch('/admin/api/mcp/connect', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+        body: JSON.stringify({
+          name: el('mc-name').value.trim(),
+          slug: el('mc-slug').value.trim(),
+          remoteUrl: el('mc-url').value.trim(),
+          transport: el('mc-transport').value,
+          domains: el('mc-domains').value.split(',').map((s) => s.trim()).filter(Boolean),
+          bearerToken: el('mc-bearer').value.trim() || undefined,
+          headers: collectSecretHeadersFromForm(),
+        }),
+      });
+      const out = await res.json();
+      if (out.ok) {
+        el('mc-bearer').value = '';
+        el('mc-hdr-val').value = '';
+        el('mcp-connect-panel').style.display = 'none';
+        await loadState();
+      } else {
+        el('mc-status').textContent = out.message || out.error || 'Failed to save connector';
+      }
+    });
+
+    el('mcp-conn-tbody').addEventListener('click', async (ev) => {
+      const disc = ev.target.closest('[data-mcp-disconnect]');
+      if (disc) {
+        await fetch('/admin/api/mcp/disconnect', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+          body: JSON.stringify({ slug: disc.getAttribute('data-mcp-disconnect') }),
+        });
+        await loadState();
+        return;
+      }
+      const retest = ev.target.closest('[data-mcp-retest]');
+      if (retest) {
+        await fetch('/admin/api/mcp/test', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+          body: JSON.stringify({ slug: retest.getAttribute('data-mcp-retest') }),
+        });
+        await loadState();
+        return;
+      }
+      const rot = ev.target.closest('[data-mcp-rotate]');
+      if (rot) {
+        const slug = rot.getAttribute('data-mcp-rotate');
+        const srv = (lastStateData?.mcpServers || []).find((s) => s.slug === slug);
+        if (srv) {
+          openConnectPanel({
+            rotate: true,
+            title: srv.name,
+            slug: srv.slug,
+            remoteUrl: srv.remoteUrl,
+            transport: srv.transport,
+            domains: srv.domains,
+          });
+        }
+      }
+    });
+
+    async function searchMcpRegistry() {
+      const q = el('mcp-reg-q').value.trim();
+      const remOnly = el('mcp-reg-remote').checked;
+      const grid = el('mcp-reg-grid');
+      grid.innerHTML = '<div class="muted">Searching Official MCP Registry &amp; Glama...</div>';
+      const res = await fetch('/admin/api/mcp/registry?q=' + encodeURIComponent(q) + '&remoteOnly=' + (remOnly ? 'true' : 'false'));
+      const out = await res.json();
+      lastRegistryResults = out.servers || [];
+      if (!lastRegistryResults.length) {
+        grid.innerHTML = '<div class="muted">' + esc(out.error ? ('Registry error: ' + out.error) : 'No matching MCP servers found.') + '</div>';
+        return;
+      }
+      grid.innerHTML = lastRegistryResults.map((srv, idx) => {
+        const rem = (srv.remotes || [])[0];
+        const srcBadges = (srv.sources || []).map((s) => '<span class="arch">' + esc(s) + '</span>').join(' ');
+        const domText = (srv.domains || []).slice(0, 3).join(', ') || 'general';
+        return '<div class="site-card">' +
+          '<div class="site-top"><span class="site-name">' + esc(srv.title || srv.name) + '</span><span>' + srcBadges + '</span></div>' +
+          '<div class="muted" style="margin-bottom:8px;font-size:0.8rem">' + esc((srv.description || '').slice(0, 140)) + '</div>' +
+          '<div class="kv"><span>Domains</span><strong><code>' + esc(domText) + '</code></strong></div>' +
+          '<div class="kv"><span>Transport</span><strong>' + esc(rem ? rem.type : 'local-package') + '</strong></div>' +
+          '<div style="margin-top:10px;display:flex;justify-content:flex-end">' +
+            (rem
+              ? '<button type="button" class="primary" data-reg-connect="' + idx + '" style="padding:4px 10px;font-size:0.76rem">Connect / Add Auth</button>'
+              : '<span class="muted" style="font-size:0.75rem">Stdio package only</span>') +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    el('mcp-reg-search-btn').addEventListener('click', searchMcpRegistry);
+    el('mcp-reg-q').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); searchMcpRegistry(); } });
+    el('mcp-reg-grid').addEventListener('click', (ev) => {
+      const btn = ev.target.closest('[data-reg-connect]');
+      if (!btn) return;
+      const srv = lastRegistryResults[Number(btn.getAttribute('data-reg-connect'))];
+      if (!srv) return;
+      const rem = (srv.remotes || [])[0];
+      openConnectPanel({
+        title: srv.title || srv.name,
+        slug: srv.slug,
+        remoteUrl: rem ? rem.url : '',
+        transport: rem ? rem.type : 'streamable-http',
+        domains: srv.domains || [],
+        headers: rem ? rem.headers : [],
+      });
+    });
 
     async function loadState() {
       const res = await fetch('/admin/api/state', { headers: { 'accept': 'application/json' } });
@@ -820,12 +1173,27 @@ async function withAdminAuditSpan<T>(
     | 'affinity_clear'
     | 'grant_revoke'
     | 'user_role'
-    | 'fetch',
+    | 'fetch'
+    | 'mcp_connect'
+    | 'mcp_disconnect'
+    | 'mcp_test'
+    | 'mcp_oauth',
   fn: (span: AdminAuditSpan) => Promise<T>,
 ): Promise<T> {
   const tracer = getActiveRequestTracer();
   if (!tracer) return fn(NOOP_ADMIN_AUDIT_SPAN);
   return tracer.withSpan(`edgefetch.admin.${op}`, { kind: 1, attributes: { 'admin.op': op } }, (span) => fn(span));
+}
+
+function readCookieFromHeader(cookieHeader: string | null, targetName: string): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const k = part.slice(0, eq).trim();
+    if (k === targetName) return part.slice(eq + 1).trim();
+  }
+  return null;
 }
 
 export async function handleAdminRoute(request: Request, url: URL, deps: AdminPortalDeps): Promise<Response | null> {
@@ -1055,7 +1423,15 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
               ? ('user_role' as const)
               : path === '/admin/api/fetch'
                 ? ('fetch' as const)
-                : null
+                : path === '/admin/api/mcp/connect'
+                  ? ('mcp_connect' as const)
+                  : path === '/admin/api/mcp/disconnect'
+                    ? ('mcp_disconnect' as const)
+                    : path === '/admin/api/mcp/test'
+                      ? ('mcp_test' as const)
+                      : path === '/admin/mcp/oauth/start'
+                        ? ('mcp_oauth' as const)
+                        : null
       : null;
 
   if (!session.ok) {
@@ -1069,6 +1445,10 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     return adminJson({ error: 'unauthorized' }, 401);
   }
 
+  const userId = resolveCallerUserId(session as { userId?: string });
+  const safeFetch = deps.safePublicFetch ?? fetch;
+  const selfHost = deps.selfHost ?? url.hostname;
+
   if (path === '/admin/api/state' && request.method === 'GET') {
     const state = await deps.getState();
     const viewer = {
@@ -1077,11 +1457,18 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       ...(session.githubLogin ? { githubLogin: session.githubLogin } : {}),
       ...(session.avatarUrl ? { avatarUrl: session.avatarUrl } : {}),
     };
+    const mcpServers: PublicMcpServerSummary[] = deps.vaultStore
+      ? (await deps.vaultStore.listServers(userId)).map(toPublicMcpServerSummary)
+      : [];
+    const vaultConfigured = validateVaultMasterKey(deps.vaultMasterKey).ok;
     if (session.role !== 'owner') {
       const ownGrants = (state.grants ?? []).filter((g) => (g.userId ?? 'owner') === session.userId);
       return adminJson(
         {
           viewer,
+          userId,
+          vaultConfigured,
+          mcpServers,
           connected: state.connected,
           agents: [],
           affinities: [],
@@ -1094,7 +1481,136 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       );
     }
     const users = state.users ?? (await deps.oauthStore.listUsers?.()) ?? [];
-    return adminJson({ ...state, viewer, users }, 200);
+    return adminJson({ ...state, viewer, users, userId, vaultConfigured, mcpServers }, 200);
+  }
+
+  if (path === '/admin/api/mcp/registry' && request.method === 'GET') {
+    const q = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
+    const remoteOnly = url.searchParams.get('remoteOnly') === 'true' || url.searchParams.get('remoteOnly') === '1';
+    const rawLim = Number(url.searchParams.get('limit') ?? 20);
+    const out = await discoverMcps({
+      query: q,
+      remoteOnly,
+      ...(Number.isFinite(rawLim) ? { limit: rawLim } : {}),
+      fetchFn: safeFetch,
+      selfHost,
+    });
+    return adminJson(out, out.status);
+  }
+
+  if (path === '/admin/api/mcp/servers' && request.method === 'GET') {
+    if (!deps.vaultStore) {
+      return adminJson({ ok: true, userId, servers: [] }, 200);
+    }
+    const rows = await deps.vaultStore.listServers(userId);
+    return adminJson(
+      {
+        ok: true,
+        userId,
+        vaultConfigured: validateVaultMasterKey(deps.vaultMasterKey).ok,
+        servers: rows.map(toPublicMcpServerSummary),
+      },
+      200,
+    );
+  }
+
+  if (path === '/admin/mcp/oauth/start' && request.method === 'GET') {
+    return withAdminAuditSpan('mcp_oauth', async () => {
+      const qCsrf = url.searchParams.get('csrf') ?? '';
+      if (!qCsrf || !sameBytes(qCsrf, session.csrf)) {
+        return adminJson({ error: 'invalid_csrf' }, 403);
+      }
+      if (!deps.vaultStore) return adminJson({ error: 'vault_not_configured' }, 503);
+      const started = await startDownstreamMcpOAuth({
+        userId,
+        sessionCsrf: session.csrf,
+        hubOrigin: deps.publicOrigin ?? url.origin,
+        remoteUrl: url.searchParams.get('remoteUrl') ?? '',
+        slug: url.searchParams.get('slug') ?? undefined,
+        name: url.searchParams.get('name') ?? undefined,
+        clientId: url.searchParams.get('clientId') ?? undefined,
+        scope: url.searchParams.get('scope') ?? undefined,
+        vaultMasterKey: deps.vaultMasterKey,
+        vaultStore: deps.vaultStore,
+        fetchFn: safeFetch,
+        selfHost,
+      });
+      if (!started.ok) return adminJson(started, started.status);
+      const headers = new Headers({
+        location: started.authorizationUrl,
+        ...ADMIN_JSON_HEADERS,
+      });
+      headers.append(
+        'set-cookie',
+        formatCookie(MCP_OAUTH_BIND_COOKIE, started.bindCookieValue, {
+          maxAge: 600,
+          path: '/admin/mcp/oauth/callback',
+          sameSite: 'Lax',
+          secure: isSecure,
+        }),
+      );
+      return new Response(null, { status: 302, headers });
+    });
+  }
+
+  if (path === '/admin/mcp/oauth/callback' && request.method === 'GET') {
+    return withAdminAuditSpan('mcp_oauth', async () => {
+      if (!deps.vaultStore) return adminJson({ error: 'vault_not_configured' }, 503);
+      const bindCookie = readCookieFromHeader(request.headers.get('cookie'), MCP_OAUTH_BIND_COOKIE);
+      const completed = await completeDownstreamMcpOAuthCallback({
+        userId,
+        sessionCsrf: session.csrf,
+        bindCookieHeader: bindCookie,
+        code: url.searchParams.get('code') ?? '',
+        state: url.searchParams.get('state') ?? '',
+        vaultMasterKey: deps.vaultMasterKey,
+        vaultStore: deps.vaultStore,
+        fetchFn: safeFetch,
+        selfHost,
+      });
+      if (!completed.ok) {
+        return adminJson(completed, completed.status);
+      }
+      // Best-effort live `tools/list` populate right after OAuth connect
+      const unsealed = completed.server.encryptedCredentials
+        ? await unsealVaultCredentials({
+            vaultMasterKey: deps.vaultMasterKey,
+            userId,
+            remoteOrigin: completed.server.remoteOrigin,
+            ciphertext: completed.server.encryptedCredentials,
+          })
+        : null;
+      if (unsealed?.ok) {
+        const listed = await testAndListRemoteMcpTools({
+          remoteUrl: completed.server.remoteUrl,
+          secret: unsealed.payload,
+          fetchFn: safeFetch,
+          selfHost,
+        });
+        if (listed.ok) {
+          completed.server.cachedTools = listed.tools;
+          completed.server.toolCount = listed.tools.length;
+          await deps.vaultStore.upsertServer(completed.server);
+        }
+      }
+      const clearBindCookie = formatCookie(MCP_OAUTH_BIND_COOKIE, '', {
+        maxAge: 0,
+        path: '/admin/mcp/oauth/callback',
+        sameSite: 'Lax',
+        secure: isSecure,
+      });
+      if ((request.headers.get('accept') ?? '').toLowerCase().includes('application/json')) {
+        const headers = new Headers(ADMIN_JSON_HEADERS);
+        headers.append('set-cookie', clearBindCookie);
+        return Response.json({ ok: true, server: toPublicMcpServerSummary(completed.server) }, { status: 200, headers });
+      }
+      const headers = new Headers({
+        location: '/admin#mcp-connectors',
+        ...ADMIN_JSON_HEADERS,
+      });
+      headers.append('set-cookie', clearBindCookie);
+      return new Response(null, { status: 302, headers });
+    });
   }
 
   if (request.method === 'POST') {
@@ -1142,6 +1658,286 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           'http.response.status_code': 200,
         });
         return adminJson({ ok: true, revoked }, 200);
+      });
+    }
+
+    // Per-user MCP Registry & Encrypted Vault connectors (`user_id`-scoped): accessible to both `owner` and `member` users!
+    if (path === '/admin/api/mcp/probe') {
+      const capped = await readBodyTextCapped(request, 16_384);
+      if (!capped.ok) return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+      let body: { remoteUrl?: unknown } = {};
+      try {
+        body = JSON.parse(capped.text || '{}') as { remoteUrl?: unknown };
+      } catch {
+        return adminJson({ error: 'invalid_json' }, 400);
+      }
+      const check = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+      if (!check.ok) return adminJson({ ok: false, supported: false, error: 'invalid_remote_url', message: check.reason }, 400);
+      const probe = await probeRemoteMcpOAuthMetadata({ remoteUrl: check.normalized, fetchFn: safeFetch, selfHost });
+      return adminJson({ ok: true, ...probe }, 200);
+    }
+
+    if (path === '/admin/mcp/oauth/start') {
+      return withAdminAuditSpan('mcp_oauth', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 32_768);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+        const started = await startDownstreamMcpOAuth({
+          userId,
+          sessionCsrf: session.csrf,
+          hubOrigin: deps.publicOrigin ?? url.origin,
+          remoteUrl: typeof body.remoteUrl === 'string' ? body.remoteUrl : '',
+          slug: typeof body.slug === 'string' ? body.slug : undefined,
+          name: typeof body.name === 'string' ? body.name : undefined,
+          transport: body.transport === 'sse' ? 'sse' : 'streamable-http',
+          domains: Array.isArray(body.domains) ? body.domains.filter((d): d is string => typeof d === 'string') : undefined,
+          clientId: typeof body.clientId === 'string' ? body.clientId : undefined,
+          clientSecret: typeof body.clientSecret === 'string' ? body.clientSecret : undefined,
+          scope: typeof body.scope === 'string' ? body.scope : undefined,
+          vaultMasterKey: deps.vaultMasterKey,
+          vaultStore: deps.vaultStore,
+          fetchFn: safeFetch,
+          selfHost,
+        });
+        if (!started.ok) return adminJson(started, started.status);
+        const headers = new Headers(ADMIN_JSON_HEADERS);
+        headers.append(
+          'set-cookie',
+          formatCookie(MCP_OAUTH_BIND_COOKIE, started.bindCookieValue, {
+            maxAge: 600,
+            path: '/admin/mcp/oauth/callback',
+            sameSite: 'Lax',
+            secure: isSecure,
+          }),
+        );
+        return Response.json(
+          { ok: true, slug: started.slug, authorizationUrl: started.authorizationUrl },
+          { status: 200, headers },
+        );
+      });
+    }
+
+    if (path === '/admin/api/mcp/test') {
+      return withAdminAuditSpan('mcp_test', async () => {
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+
+        // Case 1: Re-test an already stored connector by `slug` using server-side decrypted credentials
+        if (typeof body.slug === 'string' && body.slug.trim() && !body.remoteUrl) {
+          if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+          const existing = await deps.vaultStore.getServer(userId, body.slug.trim());
+          if (!existing) return adminJson({ ok: false, error: 'mcp_server_not_found' }, 404);
+          let secret: VaultSecretPayload | null = { kind: 'none', pinnedOrigin: existing.remoteOrigin };
+          if (existing.encryptedCredentials && existing.authType !== 'none') {
+            const unsealed = await unsealVaultCredentials({
+              vaultMasterKey: deps.vaultMasterKey,
+              userId,
+              remoteOrigin: existing.remoteOrigin,
+              ciphertext: existing.encryptedCredentials,
+            });
+            if (!unsealed.ok) return adminJson({ ok: false, error: unsealed.error, message: unsealed.message }, 500);
+            secret = unsealed.payload;
+          }
+          const tested = await testAndListRemoteMcpTools({
+            remoteUrl: existing.remoteUrl,
+            secret,
+            fetchFn: safeFetch,
+            selfHost,
+          });
+          const now = Date.now();
+          if (!tested.ok) {
+            await deps.vaultStore.upsertServer({ ...existing, lastError: tested.message.slice(0, 240), updatedAt: now });
+            return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+          }
+          const updated: StoredMcpServerRow = {
+            ...existing,
+            cachedTools: tested.tools,
+            toolCount: tested.tools.length,
+            lastVerifiedAt: now,
+            lastError: null,
+            updatedAt: now,
+          };
+          await deps.vaultStore.upsertServer(updated);
+          return adminJson(
+            {
+              ok: true,
+              slug: updated.slug,
+              toolCount: tested.tools.length,
+              tools: tested.tools,
+              ...(tested.serverInfo ? { serverInfo: tested.serverInfo } : {}),
+            },
+            200,
+          );
+        }
+
+        // Case 2: Test unsaved form credentials before saving
+        const urlCheck = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+        if (!urlCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_remote_url', message: urlCheck.reason }, 400);
+        }
+        const hdrCheck = sanitizeSecretHeadersInput({ bearerToken: body.bearerToken, headers: body.headers });
+        if (!hdrCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_headers', message: hdrCheck.error }, 400);
+        }
+        const secret: VaultSecretPayload =
+          Object.keys(hdrCheck.headers).length > 0
+            ? { kind: 'headers', pinnedOrigin: urlCheck.origin, headers: hdrCheck.headers }
+            : { kind: 'none', pinnedOrigin: urlCheck.origin };
+
+        const tested = await testAndListRemoteMcpTools({
+          remoteUrl: urlCheck.normalized,
+          secret,
+          fetchFn: safeFetch,
+          selfHost,
+        });
+        if (!tested.ok) {
+          return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+        }
+        return adminJson(
+          {
+            ok: true,
+            remoteOrigin: urlCheck.origin,
+            toolCount: tested.tools.length,
+            tools: tested.tools,
+            ...(tested.serverInfo ? { serverInfo: tested.serverInfo } : {}),
+          },
+          200,
+        );
+      });
+    }
+
+    if (path === '/admin/api/mcp/connect') {
+      return withAdminAuditSpan('mcp_connect', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+
+        const urlCheck = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+        if (!urlCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_remote_url', message: urlCheck.reason }, 400);
+        }
+        const hdrCheck = sanitizeSecretHeadersInput({ bearerToken: body.bearerToken, headers: body.headers });
+        if (!hdrCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_headers', message: hdrCheck.error }, 400);
+        }
+
+        const hasSecrets = Object.keys(hdrCheck.headers).length > 0;
+        const secretPayload: VaultSecretPayload = hasSecrets
+          ? { kind: 'headers', pinnedOrigin: urlCheck.origin, headers: hdrCheck.headers }
+          : { kind: 'none', pinnedOrigin: urlCheck.origin };
+
+        let encryptedCredentials: string | null = null;
+        if (hasSecrets) {
+          const sealed = await sealVaultCredentials({
+            vaultMasterKey: deps.vaultMasterKey,
+            userId,
+            remoteOrigin: urlCheck.origin,
+            payload: secretPayload,
+          });
+          if (!sealed.ok) {
+            return adminJson(sealed, sealed.status);
+          }
+          encryptedCredentials = sealed.ciphertext;
+        }
+
+        const cleanName =
+          stripInvisibleSmugglingChars(typeof body.name === 'string' ? body.name : '').trim().slice(0, 120) ||
+          urlCheck.url.hostname;
+        const slug = slugifyMcpServerName(typeof body.slug === 'string' && body.slug.trim() ? body.slug : cleanName);
+        const explicitDomains = Array.isArray(body.domains)
+          ? body.domains
+              .filter((d): d is string => typeof d === 'string')
+              .map((d) => d.trim().toLowerCase().replace(/^www\./, ''))
+              .filter((d) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d))
+          : [];
+        const domains =
+          explicitDomains.length > 0
+            ? [...new Set(explicitDomains)].slice(0, 16)
+            : inferAssociatedDomains({ name: cleanName, remotes: [{ url: urlCheck.normalized }] });
+
+        const now = Date.now();
+        const existing = await deps.vaultStore.getServer(userId, slug);
+        let cachedTools = existing?.cachedTools ?? [];
+        let lastVerifiedAt = existing?.lastVerifiedAt ?? null;
+        let lastError: string | null = null;
+
+        if (body.skipVerify !== true) {
+          const tested = await testAndListRemoteMcpTools({
+            remoteUrl: urlCheck.normalized,
+            secret: secretPayload,
+            fetchFn: safeFetch,
+            selfHost,
+          });
+          if (tested.ok) {
+            cachedTools = tested.tools;
+            lastVerifiedAt = now;
+          } else {
+            lastError = tested.message.slice(0, 240);
+            if (body.requireVerify === true) {
+              return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+            }
+          }
+        }
+
+        const row: StoredMcpServerRow = {
+          id: existing?.id ?? `mcp_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`,
+          userId,
+          slug,
+          name: cleanName,
+          remoteUrl: urlCheck.normalized,
+          remoteOrigin: urlCheck.origin,
+          transport: body.transport === 'sse' ? 'sse' : 'streamable-http',
+          authType: hasSecrets ? 'headers' : 'none',
+          encryptedCredentials,
+          authSummary: buildMaskedAuthSummary(secretPayload),
+          domains,
+          cachedTools,
+          toolCount: cachedTools.length,
+          enabled: body.enabled !== false,
+          lastVerifiedAt,
+          lastError,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+        };
+
+        await deps.vaultStore.upsertServer(row);
+        return adminJson({ ok: true, server: toPublicMcpServerSummary(row) }, 200);
+      });
+    }
+
+    if (path === '/admin/api/mcp/disconnect') {
+      return withAdminAuditSpan('mcp_disconnect', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 16_384);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: { slug?: unknown } = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as { slug?: unknown };
+        } catch {
+          return adminJson({ error: 'invalid_json' }, 400);
+        }
+        const slug = typeof body.slug === 'string' ? body.slug.trim() : '';
+        if (!slug) return adminJson({ ok: false, error: 'missing_slug' }, 400);
+        const deleted = await deps.vaultStore.deleteServer(userId, slug);
+        return adminJson({ ok: true, deleted }, 200);
       });
     }
 
@@ -1315,6 +2111,285 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           // leave raw
         }
         return adminJson({ status: out.status, via: out.via, reply }, 200);
+      });
+    }
+
+    if (path === '/admin/api/mcp/probe') {
+      const capped = await readBodyTextCapped(request, 16_384);
+      if (!capped.ok) return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+      let body: { remoteUrl?: unknown } = {};
+      try {
+        body = JSON.parse(capped.text || '{}') as { remoteUrl?: unknown };
+      } catch {
+        return adminJson({ error: 'invalid_json' }, 400);
+      }
+      const check = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+      if (!check.ok) return adminJson({ ok: false, supported: false, error: 'invalid_remote_url', message: check.reason }, 400);
+      const probe = await probeRemoteMcpOAuthMetadata({ remoteUrl: check.normalized, fetchFn: safeFetch, selfHost });
+      return adminJson({ ok: true, ...probe }, 200);
+    }
+
+    if (path === '/admin/mcp/oauth/start') {
+      return withAdminAuditSpan('mcp_oauth', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 32_768);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+        const started = await startDownstreamMcpOAuth({
+          userId,
+          sessionCsrf: session.csrf,
+          hubOrigin: deps.publicOrigin ?? url.origin,
+          remoteUrl: typeof body.remoteUrl === 'string' ? body.remoteUrl : '',
+          slug: typeof body.slug === 'string' ? body.slug : undefined,
+          name: typeof body.name === 'string' ? body.name : undefined,
+          transport: body.transport === 'sse' ? 'sse' : 'streamable-http',
+          domains: Array.isArray(body.domains) ? body.domains.filter((d): d is string => typeof d === 'string') : undefined,
+          clientId: typeof body.clientId === 'string' ? body.clientId : undefined,
+          clientSecret: typeof body.clientSecret === 'string' ? body.clientSecret : undefined,
+          scope: typeof body.scope === 'string' ? body.scope : undefined,
+          vaultMasterKey: deps.vaultMasterKey,
+          vaultStore: deps.vaultStore,
+          fetchFn: safeFetch,
+          selfHost,
+        });
+        if (!started.ok) return adminJson(started, started.status);
+        const headers = new Headers(ADMIN_JSON_HEADERS);
+        headers.append(
+          'set-cookie',
+          formatCookie(MCP_OAUTH_BIND_COOKIE, started.bindCookieValue, {
+            maxAge: 600,
+            path: '/admin/mcp/oauth/callback',
+            sameSite: 'Lax',
+            secure: isSecure,
+          }),
+        );
+        return Response.json(
+          { ok: true, slug: started.slug, authorizationUrl: started.authorizationUrl },
+          { status: 200, headers },
+        );
+      });
+    }
+
+    if (path === '/admin/api/mcp/test') {
+      return withAdminAuditSpan('mcp_test', async () => {
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+
+        // Case 1: Re-test an already stored connector by `slug` using server-side decrypted credentials
+        if (typeof body.slug === 'string' && body.slug.trim() && !body.remoteUrl) {
+          if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+          const existing = await deps.vaultStore.getServer(userId, body.slug.trim());
+          if (!existing) return adminJson({ ok: false, error: 'mcp_server_not_found' }, 404);
+          let secret: VaultSecretPayload | null = { kind: 'none', pinnedOrigin: existing.remoteOrigin };
+          if (existing.encryptedCredentials && existing.authType !== 'none') {
+            const unsealed = await unsealVaultCredentials({
+              vaultMasterKey: deps.vaultMasterKey,
+              userId,
+              remoteOrigin: existing.remoteOrigin,
+              ciphertext: existing.encryptedCredentials,
+            });
+            if (!unsealed.ok) return adminJson({ ok: false, error: unsealed.error, message: unsealed.message }, 500);
+            secret = unsealed.payload;
+          }
+          const tested = await testAndListRemoteMcpTools({
+            remoteUrl: existing.remoteUrl,
+            secret,
+            fetchFn: safeFetch,
+            selfHost,
+          });
+          const now = Date.now();
+          if (!tested.ok) {
+            await deps.vaultStore.upsertServer({ ...existing, lastError: tested.message.slice(0, 240), updatedAt: now });
+            return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+          }
+          const updated: StoredMcpServerRow = {
+            ...existing,
+            cachedTools: tested.tools,
+            toolCount: tested.tools.length,
+            lastVerifiedAt: now,
+            lastError: null,
+            updatedAt: now,
+          };
+          await deps.vaultStore.upsertServer(updated);
+          return adminJson(
+            {
+              ok: true,
+              slug: updated.slug,
+              toolCount: tested.tools.length,
+              tools: tested.tools,
+              ...(tested.serverInfo ? { serverInfo: tested.serverInfo } : {}),
+            },
+            200,
+          );
+        }
+
+        // Case 2: Test unsaved form credentials before saving
+        const urlCheck = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+        if (!urlCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_remote_url', message: urlCheck.reason }, 400);
+        }
+        const hdrCheck = sanitizeSecretHeadersInput({ bearerToken: body.bearerToken, headers: body.headers });
+        if (!hdrCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_headers', message: hdrCheck.error }, 400);
+        }
+        const secret: VaultSecretPayload =
+          Object.keys(hdrCheck.headers).length > 0
+            ? { kind: 'headers', pinnedOrigin: urlCheck.origin, headers: hdrCheck.headers }
+            : { kind: 'none', pinnedOrigin: urlCheck.origin };
+
+        const tested = await testAndListRemoteMcpTools({
+          remoteUrl: urlCheck.normalized,
+          secret,
+          fetchFn: safeFetch,
+          selfHost,
+        });
+        if (!tested.ok) {
+          return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+        }
+        return adminJson(
+          {
+            ok: true,
+            remoteOrigin: urlCheck.origin,
+            toolCount: tested.tools.length,
+            tools: tested.tools,
+            ...(tested.serverInfo ? { serverInfo: tested.serverInfo } : {}),
+          },
+          200,
+        );
+      });
+    }
+
+    if (path === '/admin/api/mcp/connect') {
+      return withAdminAuditSpan('mcp_connect', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as Record<string, unknown>;
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+
+        const urlCheck = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
+        if (!urlCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_remote_url', message: urlCheck.reason }, 400);
+        }
+        const hdrCheck = sanitizeSecretHeadersInput({ bearerToken: body.bearerToken, headers: body.headers });
+        if (!hdrCheck.ok) {
+          return adminJson({ ok: false, error: 'invalid_headers', message: hdrCheck.error }, 400);
+        }
+
+        const hasSecrets = Object.keys(hdrCheck.headers).length > 0;
+        const secretPayload: VaultSecretPayload = hasSecrets
+          ? { kind: 'headers', pinnedOrigin: urlCheck.origin, headers: hdrCheck.headers }
+          : { kind: 'none', pinnedOrigin: urlCheck.origin };
+
+        let encryptedCredentials: string | null = null;
+        if (hasSecrets) {
+          const sealed = await sealVaultCredentials({
+            vaultMasterKey: deps.vaultMasterKey,
+            userId,
+            remoteOrigin: urlCheck.origin,
+            payload: secretPayload,
+          });
+          if (!sealed.ok) {
+            return adminJson(sealed, sealed.status);
+          }
+          encryptedCredentials = sealed.ciphertext;
+        }
+
+        const cleanName =
+          stripInvisibleSmugglingChars(typeof body.name === 'string' ? body.name : '').trim().slice(0, 120) ||
+          urlCheck.url.hostname;
+        const slug = slugifyMcpServerName(typeof body.slug === 'string' && body.slug.trim() ? body.slug : cleanName);
+        const explicitDomains = Array.isArray(body.domains)
+          ? body.domains
+              .filter((d): d is string => typeof d === 'string')
+              .map((d) => d.trim().toLowerCase().replace(/^www\./, ''))
+              .filter((d) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d))
+          : [];
+        const domains =
+          explicitDomains.length > 0
+            ? [...new Set(explicitDomains)].slice(0, 16)
+            : inferAssociatedDomains({ name: cleanName, remotes: [{ url: urlCheck.normalized }] });
+
+        const now = Date.now();
+        const existing = await deps.vaultStore.getServer(userId, slug);
+        let cachedTools = existing?.cachedTools ?? [];
+        let lastVerifiedAt = existing?.lastVerifiedAt ?? null;
+        let lastError: string | null = null;
+
+        if (body.skipVerify !== true) {
+          const tested = await testAndListRemoteMcpTools({
+            remoteUrl: urlCheck.normalized,
+            secret: secretPayload,
+            fetchFn: safeFetch,
+            selfHost,
+          });
+          if (tested.ok) {
+            cachedTools = tested.tools;
+            lastVerifiedAt = now;
+          } else {
+            lastError = tested.message.slice(0, 240);
+            if (body.requireVerify === true) {
+              return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
+            }
+          }
+        }
+
+        const row: StoredMcpServerRow = {
+          id: existing?.id ?? `mcp_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`,
+          userId,
+          slug,
+          name: cleanName,
+          remoteUrl: urlCheck.normalized,
+          remoteOrigin: urlCheck.origin,
+          transport: body.transport === 'sse' ? 'sse' : 'streamable-http',
+          authType: hasSecrets ? 'headers' : 'none',
+          encryptedCredentials,
+          authSummary: buildMaskedAuthSummary(secretPayload),
+          domains,
+          cachedTools,
+          toolCount: cachedTools.length,
+          enabled: body.enabled !== false,
+          lastVerifiedAt,
+          lastError,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now,
+        };
+
+        await deps.vaultStore.upsertServer(row);
+        return adminJson({ ok: true, server: toPublicMcpServerSummary(row) }, 200);
+      });
+    }
+
+    if (path === '/admin/api/mcp/disconnect') {
+      return withAdminAuditSpan('mcp_disconnect', async () => {
+        if (!deps.vaultStore) return adminJson({ ok: false, error: 'vault_not_configured' }, 503);
+        const capped = await readBodyTextCapped(request, 16_384);
+        if (!capped.ok) return adminJson({ ok: false, error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
+        let body: { slug?: unknown } = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as { slug?: unknown };
+        } catch {
+          return adminJson({ ok: false, error: 'invalid_json' }, 400);
+        }
+        const slug = typeof body.slug === 'string' ? body.slug.trim() : '';
+        if (!slug) return adminJson({ ok: false, error: 'missing_slug' }, 400);
+        const deleted = await deps.vaultStore.deleteServer(userId, slug);
+        return adminJson({ ok: true, deleted }, 200);
       });
     }
   }

@@ -432,14 +432,15 @@ func ParseHeaders(raw string) map[string]string {
 
 // Exporter batches and flushes OTLP/HTTP JSON spans asynchronously off the crawl critical path.
 type Exporter struct {
-	tracesURL      string
-	stdoutOut      io.Writer
-	stdoutMu       sync.Mutex
-	headers        map[string]string
-	serviceName    string
-	serviceVersion string
-	client         *http.Client
-	tickInterval   time.Duration
+	tracesURL       string
+	devTelemetryURL string
+	stdoutOut       io.Writer
+	stdoutMu        sync.Mutex
+	headers         map[string]string
+	serviceName     string
+	serviceVersion  string
+	client          *http.Client
+	tickInterval    time.Duration
 
 	ch     chan Span
 	stopCh chan struct{}
@@ -477,7 +478,8 @@ func newExporterFromEnv(
 	if !strings.EqualFold(rawEndpoint, "stdout") && !strings.EqualFold(rawEndpoint, "stderr") {
 		tracesURL = ResolveTracesURL(rawEndpoint)
 	}
-	if tracesURL == "" && !wantStdout {
+	devTelURL := ResolveDevTelemetryURL(getenv)
+	if tracesURL == "" && !wantStdout && devTelURL == "" {
 		return nil
 	}
 	svc := strings.TrimSpace(getenv("OTEL_SERVICE_NAME"))
@@ -491,7 +493,7 @@ func newExporterFromEnv(
 		version = "2.6.3"
 	}
 	var client *http.Client
-	if tracesURL != "" {
+	if tracesURL != "" || devTelURL != "" {
 		client = &http.Client{
 			Transport: transport,
 			Timeout:   5 * time.Second,
@@ -505,15 +507,16 @@ func newExporterFromEnv(
 		tickInterval = time.Second
 	}
 	e := &Exporter{
-		tracesURL:      tracesURL,
-		stdoutOut:      stdoutWriter,
-		headers:        ParseHeaders(getenv("OTEL_EXPORTER_OTLP_HEADERS")),
-		serviceName:    svc,
-		serviceVersion: version,
-		client:         client,
-		tickInterval:   tickInterval,
-		ch:             make(chan Span, 256),
-		stopCh:         make(chan struct{}),
+		tracesURL:       tracesURL,
+		devTelemetryURL: devTelURL,
+		stdoutOut:       stdoutWriter,
+		headers:         ParseHeaders(getenv("OTEL_EXPORTER_OTLP_HEADERS")),
+		serviceName:     svc,
+		serviceVersion:  version,
+		client:          client,
+		tickInterval:    tickInterval,
+		ch:              make(chan Span, 256),
+		stopCh:          make(chan struct{}),
 	}
 	e.wg.Add(1)
 	go e.loop()
@@ -613,6 +616,7 @@ func (e *Exporter) loop() {
 }
 
 func (e *Exporter) sendBatch(ctx context.Context, spans []Span) error {
+	e.sendDevErrorBatch(ctx, spans)
 	bodyBytes, err := BuildOTLPJSON(e.serviceName, e.serviceVersion, spans)
 	if err != nil {
 		return err

@@ -15,8 +15,10 @@
 import type { HubEventRecord, McpClientActivity } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { MIN_TOKEN_LENGTH, SITE_ID_PATTERN, sameBytes } from './auth';
+import type { DevTelemetrySettingsView } from './dev-telemetry';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
+import type { UpdateCheckStatus } from './update-check';
 import {
   ADMIN_COOKIE_NAME,
   createAdminSessionValue,
@@ -86,6 +88,9 @@ export interface AdminPortalDeps {
   clearAffinities: (siteId?: string) => Promise<void>;
   clearEvents?: () => Promise<void>;
   revokeGrant: (grantId: string) => Promise<boolean>;
+  getUpdateStatus?: (agents: AgentAttachment[]) => Promise<UpdateCheckStatus>;
+  getTelemetrySettings?: () => Promise<DevTelemetrySettingsView>;
+  setTelemetryOptIn?: (enabled: boolean) => Promise<DevTelemetrySettingsView>;
   executeFetch: (params: {
     target: FetchTarget;
     site?: string;
@@ -162,8 +167,10 @@ function renderDashboardHtml(params: {
     * { box-sizing: border-box; }
     body { font: 14px/1.5 system-ui, -apple-system, sans-serif; margin: 0; background: #0b1120; color: #e2e8f0; }
     header { background: #111827; border-bottom: 1px solid #1f2937; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-    header h1 { font-size: 1.1rem; margin: 0; display: flex; align-items: center; gap: 10px; color: #f8fafc; }
-    .pill { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #064e3b; color: #6ee7b7; border: 1px solid #059669; font-weight: 600; }
+    header h1 { font-size: 1.1rem; margin: 0; display: flex; align-items: center; gap: 10px; color: #f8fafc; flex-wrap: wrap; }
+    .pill { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; background: #064e3b; color: #6ee7b7; border: 1px solid #059669; font-weight: 600; text-decoration: none; }
+    .pill-warn { background: #78350f; color: #fde68a; border-color: #d97706; }
+    .pill-muted { background: #1e293b; color: #94a3b8; border-color: #475569; }
     .wrap { max-width: 1240px; margin: 0 auto; padding: 20px; display: grid; gap: 18px; }
     .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
     .kpi { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px 16px; }
@@ -229,7 +236,7 @@ function renderDashboardHtml(params: {
 </head>
 <body>
   <header>
-    <h1>${escapeHtml(params.serviceName)} <span class="pill" id="conn-pill">Loading...</span></h1>
+    <h1>${escapeHtml(params.serviceName)} <span class="pill" id="conn-pill">Loading...</span> <a class="pill" id="update-pill" href="https://github.com/bartrumb/edgefetch/releases" target="_blank" rel="noopener noreferrer" style="display:none"></a></h1>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <span class="chip" title="Cloudflare Content Signals in robots.txt">Content Signals: honored (ai-input)</span>
       <span class="muted" id="last-poll">Live (15s)</span>
@@ -407,6 +414,29 @@ function renderDashboardHtml(params: {
     </div>
 
     <section class="card">
+      <h2>
+        <span>Auto-Updates &amp; Opt-In Dev Error Telemetry</span>
+        <span style="display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="badge cat" id="telemetry-status-badge">OFF by default</span>
+          <button type="button" id="telemetry-toggle-btn" style="padding:5px 12px;font-size:0.78rem">Enable Opt-In Error Telemetry</button>
+        </span>
+      </h2>
+      <p class="muted" style="margin:0 0 8px" id="telemetry-desc">Unattended default is <strong>0 outbound telemetry</strong> (<code>DO_NOT_TRACK=1</code> acts as a hard disable override). When opted in, shares <strong>only</strong> structural adapter &amp; WAF error codes to help fix broken site extractors — <strong>zero URLs, zero hostnames, zero paths, zero content, zero tokens</strong>.</p>
+      <div class="chips" style="margin-top:6px">
+        <code class="chip">schemaVersion: 1</code>
+        <code class="chip">version</code>
+        <code class="chip">runtime</code>
+        <code class="chip">os / arch</code>
+        <code class="chip">spanName</code>
+        <code class="chip">adapterId</code>
+        <code class="chip">wafVendor</code>
+        <code class="chip">httpStatus</code>
+        <code class="chip">errorClass</code>
+      </div>
+      <div class="muted" id="update-fleet-hint" style="margin-top:8px;display:none"></div>
+    </section>
+
+    <section class="card">
       <h2><span>Cloudflare Workers Observability — Single Pane of Glass Filters</span></h2>
       <p class="muted" style="margin:0">Open <strong>Cloudflare Dashboard -&gt; Workers &amp; Pages -&gt; Observability (Traces &amp; Logs)</strong> for long-term retention &amp; OTel waterfall traces:</p>
       <div class="chips">
@@ -490,6 +520,67 @@ function renderDashboardHtml(params: {
       el('last-poll').textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour12: false });
       el('site-count').textContent = data.connected;
       el('conn-pill').textContent = data.connected + ' site' + (data.connected === 1 ? '' : 's') + ' online';
+
+      const upd = data.updateStatus;
+      const updPill = el('update-pill');
+      const updHint = el('update-fleet-hint');
+      if (upd && upd.pillLabel) {
+        updPill.style.display = 'inline-block';
+        updPill.textContent = upd.pillLabel;
+        updPill.href = upd.releaseUrl || 'https://github.com/bartrumb/edgefetch/releases';
+        updPill.className =
+          upd.pillStatus === 'update_available'
+            ? 'pill pill-warn'
+            : upd.pillStatus === 'up_to_date'
+              ? 'pill'
+              : 'pill pill-muted';
+        const outdatedNodes = Array.isArray(upd.outdatedAgents) ? upd.outdatedAgents : [];
+        if (upd.pillStatus === 'update_available') {
+          const parts = [];
+          if (upd.hubUpdateAvailable) parts.push('Hub ' + upd.currentVersion + ' -> ' + (upd.latestTag || upd.latestVersion));
+          if (outdatedNodes.length) {
+            parts.push('Run edgefetch update on: ' + outdatedNodes.map((n) => n.siteId + ' (' + n.version + ')').join(', '));
+          }
+          updPill.title = parts.join(' · ') || 'Signed GitHub Release available';
+          if (updHint) {
+            updHint.style.display = 'block';
+            updHint.textContent = parts.join(' · ');
+          }
+        } else {
+          updPill.title = 'Signed GitHub Release verified (' + (upd.currentVersion || '') + ')';
+          if (updHint) updHint.style.display = 'none';
+        }
+      } else {
+        updPill.style.display = 'none';
+        if (updHint) updHint.style.display = 'none';
+      }
+
+      const tel = data.devTelemetry;
+      const telBadge = el('telemetry-status-badge');
+      const telBtn = el('telemetry-toggle-btn');
+      if (tel && telBadge && telBtn) {
+        if (tel.doNotTrack) {
+          telBadge.className = 'badge lvl-warn';
+          telBadge.textContent = 'LOCKED OFF (DO_NOT_TRACK=1)';
+          telBtn.disabled = true;
+          telBtn.className = '';
+          telBtn.textContent = 'Disabled by DO_NOT_TRACK=1';
+        } else if (tel.enabled) {
+          telBadge.className = 'badge lvl-info';
+          telBadge.textContent = 'ON (' + (tel.source === 'env' ? 'ENV OPT-IN' : 'ADMIN OPT-IN') + ')';
+          telBtn.disabled = false;
+          telBtn.className = '';
+          telBtn.textContent = 'Disable Dev Error Telemetry';
+          telBtn.setAttribute('data-next-enabled', 'false');
+        } else {
+          telBadge.className = 'badge cat';
+          telBadge.textContent = 'OFF (' + (tel.source === 'admin_opt_out' ? 'OPTED OUT' : 'DEFAULT 0 TELEMETRY') + ')';
+          telBtn.disabled = false;
+          telBtn.className = 'primary';
+          telBtn.textContent = 'Enable Opt-In Error Telemetry';
+          telBtn.setAttribute('data-next-enabled', 'true');
+        }
+      }
 
       const totalOk = agents.reduce((s, a) => s + Number(a.jobsOk || 0), 0);
       const totalErr = agents.reduce((s, a) => s + Number(a.jobsErr || 0), 0);
@@ -634,6 +725,23 @@ function renderDashboardHtml(params: {
 
     el('refresh-btn').addEventListener('click', loadState);
 
+    el('telemetry-toggle-btn').addEventListener('click', async () => {
+      const btn = el('telemetry-toggle-btn');
+      if (btn.disabled) return;
+      const nextEnabled = btn.getAttribute('data-next-enabled') === 'true';
+      btn.disabled = true;
+      try {
+        await fetch('/admin/api/telemetry', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+          body: JSON.stringify({ enabled: nextEnabled }),
+        });
+        await loadState();
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
     el('clear-affinity-btn').addEventListener('click', async () => {
       await fetch('/admin/api/affinity/clear', { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF }, body: '{}' });
       await loadState();
@@ -765,7 +873,7 @@ const NOOP_ADMIN_AUDIT_SPAN: AdminAuditSpan = {
 };
 
 async function withAdminAuditSpan<T>(
-  op: 'login' | 'logout' | 'events_clear' | 'affinity_clear' | 'grant_revoke' | 'fetch',
+  op: 'login' | 'logout' | 'events_clear' | 'affinity_clear' | 'grant_revoke' | 'telemetry_toggle' | 'fetch',
   fn: (span: AdminAuditSpan) => Promise<T>,
 ): Promise<T> {
   const tracer = getActiveRequestTracer();
@@ -898,9 +1006,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           ? ('affinity_clear' as const)
           : path === '/admin/api/grants/revoke'
             ? ('grant_revoke' as const)
-            : path === '/admin/api/fetch'
-              ? ('fetch' as const)
-              : null
+            : path === '/admin/api/telemetry'
+              ? ('telemetry_toggle' as const)
+              : path === '/admin/api/fetch'
+                ? ('fetch' as const)
+                : null
       : null;
 
   if (!session.ok) {
@@ -916,7 +1026,18 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   if (path === '/admin/api/state' && request.method === 'GET') {
     const state = await deps.getState();
-    return adminJson(state, 200);
+    const [updateStatus, devTelemetry] = await Promise.all([
+      deps.getUpdateStatus ? deps.getUpdateStatus(state.agents).catch(() => undefined) : Promise.resolve(undefined),
+      deps.getTelemetrySettings ? deps.getTelemetrySettings().catch(() => undefined) : Promise.resolve(undefined),
+    ]);
+    return adminJson(
+      {
+        ...state,
+        ...(updateStatus ? { updateStatus } : {}),
+        ...(devTelemetry ? { devTelemetry } : {}),
+      },
+      200,
+    );
   }
 
   if (request.method === 'POST') {
@@ -997,6 +1118,43 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           'http.response.status_code': 200,
         });
         return adminJson({ ok: true, revoked }, 200);
+      });
+    }
+
+    if (path === '/admin/api/telemetry') {
+      return withAdminAuditSpan('telemetry_toggle', async (span) => {
+        if (!deps.setTelemetryOptIn) {
+          span.setAttributes({ 'admin.outcome': 'unsupported', 'http.response.status_code': 501 });
+          span.setStatus(false, 'unsupported');
+          return adminJson({ error: 'telemetry_settings_unavailable' }, 501);
+        }
+        const capped = await readBodyTextCapped(request, 4_096);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
+        }
+        let body: { enabled?: unknown } = {};
+        try {
+          body = JSON.parse(capped.text) as { enabled?: unknown };
+        } catch {
+          span.setAttributes({ 'admin.outcome': 'invalid_json', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_json');
+          return adminJson({ error: 'invalid_json' }, 400);
+        }
+        if (typeof body.enabled !== 'boolean') {
+          span.setAttributes({ 'admin.outcome': 'invalid_enabled_flag', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_enabled_flag');
+          return adminJson({ error: 'invalid_enabled_flag' }, 400);
+        }
+        const devTelemetry = await deps.setTelemetryOptIn(body.enabled);
+        span.setAttributes({
+          'admin.telemetry_enabled': devTelemetry.enabled,
+          'admin.outcome': 'updated',
+          'http.response.status_code': 200,
+        });
+        return adminJson({ ok: true, devTelemetry }, 200);
       });
     }
 

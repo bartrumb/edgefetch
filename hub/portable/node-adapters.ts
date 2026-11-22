@@ -35,6 +35,11 @@ import {
   type HostWindowStore,
   type HubSocketLike,
 } from '../src/agent-hub';
+import {
+  createSqliteHubSettingsStore,
+  HUB_SETTINGS_SQLITE_SCHEMA,
+  type HubSettingsStore,
+} from '../src/dev-telemetry';
 import { createSqliteOAuthStore, OAUTH_SQLITE_SCHEMA, type OAuthClientRecord, type OAuthCodeRecord, type OAuthStore, type RotateRefreshParams, type SqlStorageLike } from '../src/oauth';
 
 // Polyfill Cloudflare's streaming `crypto.DigestStream` on Node.js using zero-copy `node:crypto` `createHash`.
@@ -516,6 +521,7 @@ export class LocalAgentHubCoordinator {
   public readonly engine: AgentHubEngine;
   public readonly oauth: OAuthStore;
   public readonly activity: ActivityStore;
+  public readonly settings: HubSettingsStore;
 
   constructor(sqlitePath: string) {
     if (sqlitePath !== ':memory:') {
@@ -553,6 +559,7 @@ export class LocalAgentHubCoordinator {
       );
       ${OAUTH_SQLITE_SCHEMA}
       ${ACTIVITY_SQLITE_SCHEMA}
+      ${HUB_SETTINGS_SQLITE_SCHEMA}
     `);
 
     const sqlLike: SqlStorageLike = {
@@ -728,6 +735,7 @@ export class LocalAgentHubCoordinator {
     });
     this.oauth = createSqliteOAuthStore(sqlLike);
     this.activity = createSqliteActivityStore(sqlLike);
+    this.settings = createSqliteHubSettingsStore(sqlLike);
   }
 
   /** Registers an already-upgraded `ws` `WebSocket` client with `AgentHubEngine`. */
@@ -919,6 +927,8 @@ export class LocalAgentHubCoordinator {
       oauthCheckAuthLockout: (b: string, now: number, m?: number) => this.oauth.checkAuthLockout(b, now, m),
       oauthRecordAuthFailure: (b: string, now: number, w: number, m: number) => this.oauth.recordAuthFailure(b, now, w, m),
       oauthClearAuthFailures: (b: string) => this.oauth.clearAuthFailures(b),
+      getHubSetting: (k: string) => this.settings.getSetting(k),
+      setHubSetting: (k: string, v: string) => this.settings.setSetting(k, v),
     };
     return {
       idFromName: (name: string) => name,

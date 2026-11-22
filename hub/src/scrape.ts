@@ -9323,6 +9323,10 @@ export async function executeScrapeCall(params: {
       : errWaf
         ? 'challenge'
         : (item.outcome ?? 'error');
+    if (errWaf?.vendor) {
+      setActiveSpanAttribute('edgefetch.waf.vendor', errWaf.vendor, activeTracer ?? undefined);
+    }
+    setActiveSpanAttribute('edgefetch.outcome', String(effectiveOutcome), activeTracer ?? undefined);
     const effectiveProb = errWaf ? errWaf.summary : problemText;
     const robotsHint =
       /robots\.txt disallowed/i.test(effectiveProb) && !/^robots_unreachable\b/i.test(effectiveProb)
@@ -9461,6 +9465,8 @@ export async function executeScrapeCall(params: {
       ? classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 200, rawBody: wafSourceStr })
       : null);
   if (okWafMatch) {
+    setActiveSpanAttribute('edgefetch.waf.vendor', okWafMatch.vendor, activeTracer ?? undefined);
+    setActiveSpanAttribute('edgefetch.outcome', 'challenge', activeTracer ?? undefined);
     const blockedInfo = refineBlockedInfo({
       url: finalUrl,
       outcome: 'challenge',

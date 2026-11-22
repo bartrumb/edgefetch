@@ -295,6 +295,9 @@ func ExecuteCallWithTrace(ctx context.Context, c *Crawler, call FetchCall, trace
 			if r.botAuthSigned {
 				attrs["bot_auth.signed"] = true
 			}
+			if r.WAF != nil && r.WAF.Vendor != "" {
+				attrs["edgefetch.waf.vendor"] = r.WAF.Vendor
+			}
 			c.otelExp.Record(otel.Span{
 				TraceID:      tc.TraceID,
 				SpanID:       spanID,

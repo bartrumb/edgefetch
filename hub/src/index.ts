@@ -23,6 +23,15 @@ import {
 } from './activity-log';
 import { handleAdminRoute } from './admin';
 import {
+  createSqliteHubSettingsStore,
+  DEV_TELEMETRY_SETTING_KEY,
+  HUB_SETTINGS_SQLITE_SCHEMA,
+  isTruthyTelemetryFlag,
+  resolveDevTelemetryState,
+  type HubSettingsStore,
+} from './dev-telemetry';
+import { checkHubUpdateStatus, HUB_VERSION } from './update-check';
+import {
   AgentHubEngine,
   computeNextHostHealth,
   MAX_CALL_UTF8_BYTES,
@@ -151,6 +160,11 @@ interface Env extends OptionalStorageBindings, OtelEnvConfig, BotAuthEnv {
   TAVILY_API_KEY?: string;
   SEARXNG_URL?: string;
   WEBHOOK_SECRET?: string;
+  EDGEFETCH_DISABLE_UPDATE_CHECK?: string;
+  EDGEFETCH_DEV_TELEMETRY?: string;
+  EDGEFETCH_DEV_TELEMETRY_ENDPOINT?: string;
+  EDGEFETCH_DEV_TELEMETRY_URL?: string;
+  DO_NOT_TRACK?: string;
 }
 
 const JOB_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -165,6 +179,7 @@ export class AgentHubDO extends DurableObject<Env> {
   private readonly engine: AgentHubEngine;
   private readonly oauth: OAuthStore;
   private readonly activity: ActivityStore;
+  private readonly settings: HubSettingsStore;
   private readonly helloLogBySocket = new WeakMap<WebSocket, number>();
   private alarmScheduled = false;
 
@@ -202,6 +217,7 @@ export class AgentHubDO extends DurableObject<Env> {
         );
         ${OAUTH_SQLITE_SCHEMA}
         ${ACTIVITY_SQLITE_SCHEMA}
+        ${HUB_SETTINGS_SQLITE_SCHEMA}
       `);
       const existingAlarm = await this.ctx.storage.getAlarm();
       if (existingAlarm === null) {
@@ -433,6 +449,7 @@ export class AgentHubDO extends DurableObject<Env> {
     });
     this.oauth = createSqliteOAuthStore(this.ctx.storage.sql as unknown as SqlStorageLike);
     this.activity = createSqliteActivityStore(this.ctx.storage.sql as unknown as SqlStorageLike);
+    this.settings = createSqliteHubSettingsStore(this.ctx.storage.sql as unknown as SqlStorageLike);
   }
 
   override async alarm(): Promise<void> {
@@ -660,6 +677,12 @@ export class AgentHubDO extends DurableObject<Env> {
   async oauthClearAuthFailures(bucket: string): Promise<void> {
     await this.oauth.clearAuthFailures(bucket);
   }
+  async getHubSetting(key: string): Promise<string | null> {
+    return await this.settings.getSetting(key);
+  }
+  async setHubSetting(key: string, value: string): Promise<void> {
+    await this.settings.setSetting(key, value);
+  }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     if (typeof message !== 'string' || message === 'ping' || message.length > 2048) return;
@@ -818,25 +841,12 @@ function wrapSseResponseWithFlush(res: Response, onClose: () => void | Promise<u
   });
 }
 
+const devTelemetrySettingCache = new WeakMap<object, { value: string | null; expiresAt: number }>();
+
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const rootTracer = RequestTracer.fromRequest(request, { suppressWhenUnsampledHealth: true });
-    const trackedCtx: ExecutionContext | undefined = ctx
-      ? ({
-          waitUntil(promise: Promise<unknown>) {
-            const active = getActiveRequestTracer() ?? rootTracer;
-            const wrapped = active
-              .bindPromise(promise)
-              .catch(() => undefined)
-              .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
-            ctx.waitUntil(wrapped);
-          },
-          passThroughOnException() {
-            ctx.passThroughOnException?.();
-          },
-        } as unknown as ExecutionContext)
-      : undefined;
     const shardNames = (env.HUB_SHARDS ?? 'global')
       .split(',')
       .map((s) => s.trim())
@@ -844,6 +854,47 @@ export default {
     if (shardNames.length === 0) shardNames.push('global');
     const hubShard = (name = shardNames[0]!) => env.AGENT_HUB.get(env.AGENT_HUB.idFromName(name));
     const hub = () => hubShard(shardNames[0]!);
+
+    const getCachedDevTelemetrySetting = async (): Promise<string | null> => {
+      if (isTruthyTelemetryFlag(env.DO_NOT_TRACK)) return null;
+      const cacheKey = (env.AGENT_HUB as unknown as object | undefined) ?? null;
+      const now = Date.now();
+      if (cacheKey) {
+        const hit = devTelemetrySettingCache.get(cacheKey);
+        if (hit && hit.expiresAt > now) return hit.value;
+      }
+      try {
+        const stub = hub() as unknown as { getHubSetting?: (k: string) => Promise<string | null> };
+        const val = typeof stub.getHubSetting === 'function' ? await stub.getHubSetting(DEV_TELEMETRY_SETTING_KEY) : null;
+        if (cacheKey) {
+          devTelemetrySettingCache.set(cacheKey, { value: val, expiresAt: now + 30_000 });
+        }
+        return val;
+      } catch {
+        return null;
+      }
+    };
+
+    const flushTracerWithTelemetry = async (tracer: RequestTracer): Promise<boolean> => {
+      const devTelemetrySetting = await getCachedDevTelemetrySetting();
+      return tracer.flush({ env, fetchFn: env.SAFE_FETCH, devTelemetrySetting });
+    };
+
+    const trackedCtx: ExecutionContext | undefined = ctx
+      ? ({
+          waitUntil(promise: Promise<unknown>) {
+            const active = getActiveRequestTracer() ?? rootTracer;
+            const wrapped = active
+              .bindPromise(promise)
+              .catch(() => undefined)
+              .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
+            ctx.waitUntil(wrapped);
+          },
+          passThroughOnException() {
+            ctx.passThroughOnException?.();
+          },
+        } as unknown as ExecutionContext)
+      : undefined;
     const dispatchAcrossShards = async (
       rawBody: string,
       traceMap: Record<string, string>,
@@ -1104,7 +1155,7 @@ export default {
           );
 
           if (!activeParent && !localTracer.suppressed && localTracer.sampled) {
-            const flushPromise = localTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+            const flushPromise = flushTracerWithTelemetry(localTracer);
             if (ctx?.waitUntil) {
               ctx.waitUntil(flushPromise);
             } else {
@@ -1494,6 +1545,37 @@ export default {
         allowedTargets: ALLOWED_TARGETS,
         defaultTarget: 'auto',
         getState: () => hub().getPortalState(Date.now()),
+        getUpdateStatus: (agents) =>
+          checkHubUpdateStatus({
+            currentVersion: HUB_VERSION,
+            agents,
+            env,
+          }),
+        getTelemetrySettings: async () => {
+          const stub = hub() as unknown as { getHubSetting?: (k: string) => Promise<string | null> };
+          const dbSettingValue =
+            typeof stub.getHubSetting === 'function' ? await stub.getHubSetting(DEV_TELEMETRY_SETTING_KEY) : null;
+          return resolveDevTelemetryState({ env, dbSettingValue });
+        },
+        setTelemetryOptIn: async (enabled) => {
+          const val = enabled ? '1' : '0';
+          const stub = hub() as unknown as { setHubSetting?: (k: string, v: string) => Promise<void> };
+          if (typeof stub.setHubSetting === 'function') {
+            await stub.setHubSetting(DEV_TELEMETRY_SETTING_KEY, val);
+          }
+          const cacheKey = (env.AGENT_HUB as unknown as object | undefined) ?? null;
+          if (cacheKey) {
+            devTelemetrySettingCache.set(cacheKey, { value: val, expiresAt: Date.now() + 30_000 });
+          }
+          await activity.recordEvent({
+            level: 'info',
+            category: 'agent',
+            event: 'dev_telemetry_updated',
+            summary: `Opt-in dev error telemetry set to ${enabled ? 'ON' : 'OFF'} via /admin`,
+            details: { enabled },
+          });
+          return resolveDevTelemetryState({ env, dbSettingValue: val });
+        },
         clearAffinities: (siteId) => hub().clearAffinities(siteId),
         clearEvents: () => hub().clearHubEvents(),
         revokeGrant: async (grantId) => {
@@ -2690,7 +2772,7 @@ export default {
       );
     } finally {
       if (!rootTracer.suppressed && rootTracer.sampled) {
-        const flushPromise = rootTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+        const flushPromise = flushTracerWithTelemetry(rootTracer);
         if (ctx?.waitUntil) {
           ctx.waitUntil(flushPromise);
         } else {

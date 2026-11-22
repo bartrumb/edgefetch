@@ -29,6 +29,12 @@ import {
   type HubSocketLike,
 } from '../src/agent-hub.ts';
 import { authorizeAgent } from '../src/auth.ts';
+import {
+  createMemoryHubSettingsStore,
+  createSqliteHubSettingsStore,
+  HUB_SETTINGS_SQLITE_SCHEMA,
+  type HubSettingsStore,
+} from '../src/dev-telemetry.ts';
 import hubWorker from '../src/index.ts';
 import {
   createMemoryOAuthStore,
@@ -138,6 +144,11 @@ const KNOWN_DENO_ENV_KEYS = [
   'S3_ACCESS_KEY_ID',
   'S3_SECRET_ACCESS_KEY',
   'S3_REGION',
+  'EDGEFETCH_DISABLE_UPDATE_CHECK',
+  'EDGEFETCH_DEV_TELEMETRY',
+  'EDGEFETCH_DEV_TELEMETRY_ENDPOINT',
+  'EDGEFETCH_DEV_TELEMETRY_URL',
+  'DO_NOT_TRACK',
 ] as const;
 
 function readDenoEnvMap(overrides?: Record<string, string | undefined>): Record<string, string> {
@@ -746,6 +757,7 @@ function openDenoPersistentStores(
     return {
       oauth: createMemoryOAuthStore(),
       activity: createMemoryActivityStore(),
+      settings: createMemoryHubSettingsStore(),
       close: () => {},
     };
   }
@@ -756,7 +768,7 @@ function openDenoPersistentStores(
       mkdirSync(dirname(sqlitePath), { recursive: true });
     }
     const db = new DatabaseSync(sqlitePath);
-    db.exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; ${OAUTH_SQLITE_SCHEMA} ${ACTIVITY_SQLITE_SCHEMA}`);
+    db.exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; ${OAUTH_SQLITE_SCHEMA} ${ACTIVITY_SQLITE_SCHEMA} ${HUB_SETTINGS_SQLITE_SCHEMA}`);
     const sqlLike: SqlStorageLike = {
       exec: <T = Record<string, unknown>>(query: string, ...bindings: unknown[]) => {
         const stmt = db.prepare(query);
@@ -778,6 +790,7 @@ function openDenoPersistentStores(
     return {
       oauth: createSqliteOAuthStore(sqlLike),
       activity: createSqliteActivityStore(sqlLike),
+      settings: createSqliteHubSettingsStore(sqlLike),
       close: () => {
         try {
           db.close();
@@ -790,6 +803,7 @@ function openDenoPersistentStores(
     return {
       oauth: fallbackSharedOAuthStore,
       activity: fallbackSharedActivityStore,
+      settings: createMemoryHubSettingsStore(),
       close: () => {},
     };
   }
@@ -872,6 +886,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
   );
   const oauth: OAuthStore = persistentStores.oauth;
   const activity: ActivityStore = persistentStores.activity;
+  const settings: HubSettingsStore = persistentStores.settings;
   const bus = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('edgefetch-hub-bus') : null;
 
   const tursoUrl = envMap.TURSO_DATABASE_URL;
@@ -959,6 +974,8 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     oauthCheckAuthLockout: (b: string, now: number, m?: number) => oauth.checkAuthLockout(b, now, m),
     oauthRecordAuthFailure: (b: string, now: number, w: number, m: number) => oauth.recordAuthFailure(b, now, w, m),
     oauthClearAuthFailures: (b: string) => oauth.clearAuthFailures(b),
+    getHubSetting: (k: string) => settings.getSetting(k),
+    setHubSetting: (k: string, v: string) => settings.setSetting(k, v),
   };
 
   const workerEnv: Record<string, unknown> = {

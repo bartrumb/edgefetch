@@ -614,7 +614,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         liedRowCount: 0,
         bombRowCount: 0,
         expiredBlobSha: 'ee'.repeat(32),
-        derivedPipelineVersion: 29,
+        derivedPipelineVersion: 30,
         derivedR2Text: 'Verified stored article payload!',
         unverifiedDeriveStatus: 'unverified',
         capacityStopStatus: 'capacity_reached',
@@ -740,7 +740,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       const liveScrapeJson = await liveScrapeRes.json();
       assert.equal(liveScrapeJson.ok, true);
       assert.equal(liveScrapeJson.cached, false);
-      assert.equal(liveScrapeJson.pipelineVersion, 29);
+      assert.equal(liveScrapeJson.pipelineVersion, 30);
       assert.equal(liveScrapeJson.llms?.found, true);
       assert.deepEqual(liveScrapeJson.json, { name: 'Rear Axle', torqueNm: 35 });
       assert.match(liveScrapeJson.markdown, /# Torque Guide/);
@@ -760,7 +760,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(cachedScrapeRes.headers.get('x-crawler-via'), 'cache:r2-d1');
       const cachedScrapeJson = await cachedScrapeRes.json();
       assert.equal(cachedScrapeJson.cached, true);
-      assert.equal(cachedScrapeJson.pipelineVersion, 29);
+      assert.equal(cachedScrapeJson.pipelineVersion, 30);
       assert.match(cachedScrapeJson.markdown, /35 Nm/);
       assert.equal(scrapeAgentDispatches, 1);
 
@@ -1153,6 +1153,1481 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         // ignore
       }
     }
+    await mf.dispose();
+  }
+});
+
+function extractOtlpSpansFromPayload(payload) {
+  const out = [];
+  for (const rs of payload?.resourceSpans ?? []) {
+    const resourceAttrs = {};
+    for (const a of rs?.resource?.attributes ?? []) {
+      const v = a?.value;
+      resourceAttrs[a.key] =
+        v?.boolValue !== undefined
+          ? v.boolValue
+          : v?.intValue !== undefined
+            ? Number(v.intValue)
+            : v?.doubleValue !== undefined
+              ? v.doubleValue
+              : v?.stringValue;
+    }
+    for (const ss of rs?.scopeSpans ?? []) {
+      for (const s of ss?.spans ?? []) {
+        const attrs = {};
+        for (const a of s?.attributes ?? []) {
+          const v = a?.value;
+          attrs[a.key] =
+            v?.boolValue !== undefined
+              ? v.boolValue
+              : v?.intValue !== undefined
+                ? Number(v.intValue)
+                : v?.doubleValue !== undefined
+                  ? v.doubleValue
+                  : v?.stringValue;
+        }
+        out.push({ ...s, attrs, resourceAttrs });
+      }
+    }
+  }
+  return out;
+}
+
+test('F15.1 workerd E2E: /v1/scrape (SSR HTML, declarative YAML twin, 304 Not Modified) & multi-turn /v1/interact lifecycle', async () => {
+  const metaSql = readFileSync(new URL('../migrations/meta/0001_tracking.sql', import.meta.url), 'utf8');
+  const searchSql = readFileSync(new URL('../migrations/search/0001_fts.sql', import.meta.url), 'utf8');
+  const sha256Hex = (buf) => createHash('sha256').update(buf).digest('hex');
+
+  const outboundUrls = [];
+  const otlpPayloads = [];
+
+  const mf = new Miniflare(
+    convertV4MiniflareOptions({
+      workers: [
+        {
+          name: 'hub-f15-1',
+          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          compatibilityDate: '2026-10-01',
+          durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
+          r2Buckets: ['ARTIFACTS'],
+          d1Databases: ['META', 'SEARCH'],
+          bindings: {
+            CALLER_TOKEN: CALLER,
+            AGENT_TOKENS: JSON.stringify({ 'site-1': S1 }),
+            ROBOTS_BYPASS_HOSTS: 'ssr.example.com,rubygems.org,reval.example.com,spa.example.com',
+            OTEL_EXPORTER_OTLP_ENDPOINT: 'https://otel.example.com/v1/traces',
+            OTEL_SERVICE_NAME: 'edgefetch-workerd-f15-1',
+          },
+          outboundService: async (req) => {
+            const u = new URL(req.url);
+            if (u.origin === 'https://otel.example.com' && u.pathname === '/v1/traces') {
+              const txt = await req.text();
+              otlpPayloads.push(JSON.parse(txt));
+              return new MfResponse('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+            }
+            outboundUrls.push(req.url);
+            if (u.pathname === '/robots.txt') {
+              return new MfResponse('User-agent: *\nAllow: /\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+            }
+            if (u.hostname === 'ssr.example.com' && u.pathname === '/guide') {
+              return new MfResponse(
+                '<html lang="en"><head><title>Edge SSR Guide</title></head><body><nav>ignore-sidebar-nav</nav><main><h1>Edge SSR Guide</h1><p>Server-rendered HTML extracted cleanly inside workerd.</p></main></body></html>',
+                { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } },
+              );
+            }
+            if (u.hostname === 'ssr.example.com' && u.pathname === '/inertia') {
+              const pageJson = JSON.stringify({
+                component: 'Docs/Overview',
+                props: {
+                  title: 'Inertia SSR Overview',
+                  body: 'Hydrated directly from Inertia data-page props without launching headless Chromium.',
+                },
+                url: '/inertia',
+                version: '1',
+              }).replace(/"/g, '&quot;');
+              return new MfResponse(
+                `<html lang="en"><head><title>App</title></head><body><div id="app" data-page="${pageJson}"></div><script src="/app.js"></script></body></html>`,
+                { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } },
+              );
+            }
+            if (u.hostname === 'rubygems.org' && u.pathname === '/api/v1/gems/rack.json') {
+              return new MfResponse(
+                JSON.stringify({
+                  name: 'rack',
+                  version: '3.1.8',
+                  info: 'Rack provides a minimal, modular, and adaptable interface for developing web applications in Ruby.',
+                  licenses: ['MIT'],
+                  authors: 'Christian Neukirchen',
+                  source_code_uri: 'https://github.com/rack/rack',
+                  documentation_uri: 'https://rubydoc.info/gems/rack',
+                }),
+                { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } },
+              );
+            }
+            return new MfResponse('not found', { status: 404 });
+          },
+        },
+      ],
+    }),
+  );
+
+  const openSockets = [];
+  try {
+    const authz = { authorization: `Bearer ${CALLER}`, 'content-type': 'application/json' };
+    const migRes = await mf.dispatchFetch(`${ORIGIN}/__test_migrate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ metaSql, searchSql }),
+    });
+    assert.equal(migRes.status, 200);
+
+    // 1. SSR HTML scrape + Inertia SSR hydration recovery inside workerd
+    const ssrRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({ url: 'https://ssr.example.com/guide', formats: ['markdown'], discoverLlmsTxt: false }),
+    });
+    assert.equal(ssrRes.status, 200);
+    const ssrJson = await ssrRes.json();
+    assert.equal(ssrJson.ok, true);
+    assert.match(ssrJson.markdown, /# Edge SSR Guide/);
+    assert.match(ssrJson.markdown, /Server-rendered HTML extracted cleanly inside workerd\./);
+    assert.equal(ssrJson.markdown.includes('ignore-sidebar-nav'), false);
+
+    const inertiaRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({ url: 'https://ssr.example.com/inertia', formats: ['markdown'], discoverLlmsTxt: false }),
+    });
+    assert.equal(inertiaRes.status, 200);
+    const inertiaJson = await inertiaRes.json();
+    assert.equal(inertiaJson.ok, true);
+    assert.equal(inertiaJson.contentSource, 'ssr-hydration');
+    assert.match(inertiaJson.markdown, /Hydrated directly from Inertia data-page props/);
+
+    // 2. Declarative YAML manifest twin resolution (`rubygems` -> `edgefetch.adapter_id = "rubygems"`)
+    otlpPayloads.length = 0;
+    outboundUrls.length = 0;
+    const twinRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({ url: 'https://rubygems.org/gems/rack', formats: ['markdown'], discoverLlmsTxt: false }),
+    });
+    assert.equal(twinRes.status, 200);
+    const twinJson = await twinRes.json();
+    assert.equal(twinJson.ok, true);
+    assert.equal(twinJson.extractorId, 'rubygems');
+    assert.match(twinJson.markdown, /# rack 3\.1\.8 \(RubyGem\)/);
+    assert.match(twinJson.markdown, /`gem install rack`/);
+    assert.equal(
+      outboundUrls.some((u) => u === 'https://rubygems.org/api/v1/gems/rack.json'),
+      true,
+      'declarative rubygems YAML manifest must upgrade to /api/v1/gems/rack.json twin',
+    );
+    assert.equal(
+      outboundUrls.some((u) => u === 'https://rubygems.org/gems/rack'),
+      false,
+      'declarative twin upgrade must skip HTML page download',
+    );
+    await sleep(60);
+    const twinSpans = otlpPayloads.flatMap(extractOtlpSpansFromPayload);
+    const twinScrapeSpan = twinSpans.find((s) => s.name === 'edgefetch.scrape');
+    assert.ok(twinScrapeSpan, 'expected edgefetch.scrape OTLP span');
+    assert.equal(twinScrapeSpan.attrs['edgefetch.adapter_id'], 'rubygems');
+
+    // 3. `304 Not Modified` conditional cache hit + multi-turn `/v1/interact` session lifecycle via fat agent
+    const rWs = await mf.dispatchFetch(`${ORIGIN}/agent/ws`, {
+      headers: {
+        upgrade: 'websocket',
+        authorization: `Bearer ${S1}`,
+        'x-agent-site': 'site-1',
+        'x-agent-arch': 'amd64',
+        'x-agent-version': '2.7.0',
+        'x-agent-capabilities': 'artifacts-v1,browser-v1,pdf-v1',
+      },
+    });
+    assert.equal(rWs.status, 101);
+    const ws = rWs.webSocket;
+    ws.accept();
+    openSockets.push(ws);
+
+    const revalHtmlBytes = new TextEncoder().encode(
+      '<html lang="en"><head><title>Reval Spec</title></head><body><main><h1>Reval Spec</h1><p>Conditional ETag 304 revalidation verified inside workerd.</p></main></body></html>',
+    );
+    let sawIfNoneMatch = '';
+    let sawIfModifiedSince = '';
+    let wizardStep = 0;
+    let closedAgentSessionId = '';
+
+    ws.addEventListener('message', async (e) => {
+      const d = String(e.data);
+      if (!d.includes('"dispatch"')) return;
+      const msg = JSON.parse(d);
+      const callObj = typeof msg.call === 'string' ? JSON.parse(msg.call) : msg.call;
+      const req0 = callObj.requests[0];
+
+      // Multi-turn /v1/interact handler
+      if (req0.interact) {
+        if (req0.interact.closeSession) {
+          closedAgentSessionId = req0.interact.sessionId ?? '';
+        } else {
+          wizardStep++;
+        }
+        await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${S1}`,
+            'x-agent-site': 'site-1',
+            'x-job-id': msg.jobId,
+            'x-job-nonce': msg.jobNonce,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            results: [
+              {
+                id: req0.id,
+                url: req0.url || 'https://spa.example.com/wizard',
+                finalUrl: 'https://spa.example.com/wizard',
+                kind: 'render',
+                status: 200,
+                outcome: 'ok',
+                rendered: true,
+                sessionId: req0.interact.closeSession ? '' : 'efsess_f15_wiz77',
+                markdown: `# Wizard Step ${wizardStep}`,
+                body: `<html><head><title>Wizard</title></head><body><main><h1>Wizard Step ${wizardStep}</h1></main></body></html>`,
+                bodyEncoding: 'utf-8',
+              },
+            ],
+          }),
+        });
+        return;
+      }
+
+      // Conditional 304 Not Modified revalidation handler
+      if (req0.ifNoneMatch === '"etag-f15-v1"') {
+        sawIfNoneMatch = req0.ifNoneMatch;
+        sawIfModifiedSince = req0.ifModifiedSince ?? '';
+        await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${S1}`,
+            'x-agent-site': 'site-1',
+            'x-job-id': msg.jobId,
+            'x-job-nonce': msg.jobNonce,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            results: [
+              {
+                id: req0.id,
+                url: req0.url,
+                kind: req0.kind ?? 'scrape',
+                status: 304,
+                outcome: 'ok',
+              },
+            ],
+          }),
+        });
+        return;
+      }
+
+      // Initial 200 stored artifact upload with ETag + Last-Modified
+      const gz = gzipSync(revalHtmlBytes);
+      const blobSha = sha256Hex(gz);
+      const contentSha = sha256Hex(revalHtmlBytes);
+      const upRes = await mf.dispatchFetch(`${ORIGIN}/agent/artifacts/${blobSha}`, {
+        method: 'PUT',
+        headers: {
+          authorization: `Bearer ${S1}`,
+          'x-agent-site': 'site-1',
+          'x-job-id': msg.jobId,
+          'x-job-nonce': msg.jobNonce,
+          'x-request-id': req0.id,
+          'x-content-sha256': contentSha,
+          'x-content-bytes': String(revalHtmlBytes.byteLength),
+          'x-artifact-retention': 'stored',
+          'content-type': 'application/gzip',
+          'content-length': String(gz.byteLength),
+        },
+        body: gz,
+      });
+      assert.equal(upRes.status, 200);
+      await mf.dispatchFetch(`${ORIGIN}/agent/reply`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${S1}`,
+          'x-agent-site': 'site-1',
+          'x-job-id': msg.jobId,
+          'x-job-nonce': msg.jobNonce,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          results: [
+            {
+              id: req0.id,
+              url: req0.url,
+              kind: 'scrape',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              etag: '"etag-f15-v1"',
+              lastModified: 'Wed, 21 Oct 2026 07:28:00 GMT',
+              bytes: revalHtmlBytes.byteLength,
+              artifact: {
+                blobSha256: blobSha,
+                contentSha256: contentSha,
+                contentBytes: revalHtmlBytes.byteLength,
+                storedBytes: gz.byteLength,
+                encoding: 'gzip',
+                retention: 'stored',
+              },
+            },
+          ],
+        }),
+      });
+    });
+
+    const firstReval = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        url: 'https://reval.example.com/spec',
+        target: 'agent',
+        formats: ['markdown'],
+        discoverLlmsTxt: false,
+      }),
+    });
+    assert.equal(firstReval.status, 200);
+    const firstRevalJson = await firstReval.json();
+    assert.equal(firstRevalJson.cached, false);
+    assert.match(firstRevalJson.markdown, /Conditional ETag 304 revalidation verified inside workerd\./);
+
+    otlpPayloads.length = 0;
+    const secondReval = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        url: 'https://reval.example.com/spec',
+        target: 'agent',
+        formats: ['markdown'],
+        maxAgeMs: 0,
+        discoverLlmsTxt: false,
+      }),
+    });
+    assert.equal(secondReval.status, 200);
+    assert.equal(secondReval.headers.get('x-crawler-via'), 'agent:site-1+cache:304');
+    assert.equal(sawIfNoneMatch, '"etag-f15-v1"');
+    assert.equal(sawIfModifiedSince, 'Wed, 21 Oct 2026 07:28:00 GMT');
+    const secondRevalJson = await secondReval.json();
+    assert.equal(secondRevalJson.ok, true);
+    assert.equal(secondRevalJson.cached, true);
+    assert.equal(secondRevalJson.revalidated, true);
+    assert.equal(secondRevalJson.originStatus, 304);
+    assert.match(secondRevalJson.markdown, /Conditional ETag 304 revalidation verified inside workerd\./);
+
+    await sleep(60);
+    const revalSpans = otlpPayloads.flatMap(extractOtlpSpansFromPayload);
+    const cache304Span = revalSpans.find((s) => s.name === 'cache:r2-d1');
+    assert.ok(cache304Span, 'expected cache:r2-d1 OTLP span on 304 revalidation');
+    assert.equal(cache304Span.attrs['cache.hit'], true);
+    assert.equal(cache304Span.attrs['cache.revalidated'], true);
+    assert.equal(cache304Span.attrs['http.response.status_code'], 304);
+
+    // 4. Multi-turn `/v1/interact` session lifecycle: create -> follow-up action -> ownership check -> close teardown
+    const turn1 = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        url: 'https://spa.example.com/wizard',
+        keepSession: true,
+        actions: [{ type: 'wait', waitMs: 5 }],
+      }),
+    });
+    assert.equal(turn1.status, 200);
+    const turn1Json = await turn1.json();
+    assert.match(turn1Json.sessionId, /^site-1\.efsess_f15_wiz77\.[0-9a-f]{32}$/);
+    assert.match(turn1Json.markdown, /Wizard Step 1/);
+
+    const turn2 = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        sessionId: turn1Json.sessionId,
+        keepSession: true,
+        actions: [
+          { type: 'fill', selector: '#project', value: 'edgefetch' },
+          { type: 'click', selector: '#continue' },
+        ],
+      }),
+    });
+    assert.equal(turn2.status, 200);
+    const turn2Json = await turn2.json();
+    assert.equal(turn2Json.sessionId, turn1Json.sessionId);
+    assert.equal(turn2Json.actions.length, 2);
+    assert.match(turn2Json.markdown, /Wizard Step 2/);
+
+    // Forged session signature must be rejected with 403 session_principal_mismatch
+    const forgedSid = `${turn1Json.sessionId.slice(0, -4)}ffff`;
+    const forgedRes = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({ sessionId: forgedSid, closeSession: true }),
+    });
+    assert.equal(forgedRes.status, 403);
+    assert.equal((await forgedRes.json()).error, 'session_principal_mismatch');
+
+    // Teardown retained browser session cleanly (`closeSession: true`) and confirm unknown DELETE `/v1/scrape/:sessionId` returns clean 404 JSON
+    const turnClose = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({ sessionId: turn1Json.sessionId, closeSession: true }),
+    });
+    assert.equal(turnClose.status, 200);
+    const turnCloseJson = await turnClose.json();
+    assert.equal(turnCloseJson.closed, true);
+    assert.equal(closedAgentSessionId, 'efsess_f15_wiz77');
+
+    const delScrapeSidRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape/${encodeURIComponent(turn1Json.sessionId)}`, {
+      method: 'DELETE',
+      headers: authz,
+    });
+    assert.equal(delScrapeSidRes.status, 404);
+    assert.equal((await delScrapeSidRes.json()).error, 'not_found');
+  } finally {
+    for (const s of openSockets) {
+      try {
+        s.close(1000, 'cleanup');
+      } catch {
+        // ignore
+      }
+    }
+    await mf.dispose();
+  }
+});
+
+test('F15.2 workerd E2E: GET /v1/extractors, POST /v1/jobs, POST /v1/catalog, & POST /v1/batch/scrape', async () => {
+  const metaSql = readFileSync(new URL('../migrations/meta/0001_tracking.sql', import.meta.url), 'utf8');
+  const searchSql = readFileSync(new URL('../migrations/search/0001_fts.sql', import.meta.url), 'utf8');
+
+  const mf = new Miniflare(
+    convertV4MiniflareOptions({
+      workers: [
+        {
+          name: 'hub-f15-2',
+          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          compatibilityDate: '2026-10-01',
+          durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
+          r2Buckets: ['ARTIFACTS'],
+          d1Databases: ['META', 'SEARCH'],
+          bindings: {
+            CALLER_TOKEN: CALLER,
+            ROBOTS_BYPASS_HOSTS:
+              'acme.example.com,boards.greenhouse.io,boards-api.greenhouse.io,jobs.lever.co,api.lever.co,store.example.com,batch.example.com',
+          },
+          outboundService: async (req) => {
+            const u = new URL(req.url);
+            if (u.pathname === '/robots.txt') {
+              return new MfResponse('User-agent: *\nAllow: /\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+            }
+            if (u.hostname === 'acme.example.com' && u.pathname === '/careers') {
+              return new MfResponse(
+                '<html lang="en"><body><main><h1>Careers at Acme</h1><a href="https://boards.greenhouse.io/acme">Greenhouse Board</a><a href="https://jobs.lever.co/acme">Lever Board</a></main></body></html>',
+                { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } },
+              );
+            }
+            if (u.hostname === 'boards-api.greenhouse.io' && u.pathname === '/v1/boards/acme/jobs') {
+              return new MfResponse(
+                JSON.stringify({
+                  meta: { total: 2 },
+                  jobs: [
+                    {
+                      id: 501,
+                      title: 'Staff Systems Engineer',
+                      absolute_url: 'https://boards.greenhouse.io/acme/jobs/501',
+                      location: { name: 'Remote - US' },
+                      updated_at: new Date().toISOString(),
+                      content: '<p>Build global edge workers. Base salary range: $210,000 - $260,000 USD.</p>',
+                    },
+                    {
+                      id: 502,
+                      title: 'Facilities Coordinator',
+                      absolute_url: 'https://boards.greenhouse.io/acme/jobs/502',
+                      location: { name: 'Austin, TX (On-site)' },
+                      updated_at: new Date().toISOString(),
+                      content: '<p>In-office operations role.</p>',
+                    },
+                  ],
+                }),
+                { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } },
+              );
+            }
+            if (u.hostname === 'api.lever.co' && u.pathname === '/v0/postings/acme') {
+              return new MfResponse(
+                JSON.stringify([
+                  {
+                    id: '01234567-89ab-cdef-0123-456789abcdef',
+                    text: 'Principal Runtime Engineer',
+                    hostedUrl: 'https://jobs.lever.co/acme/01234567-89ab-cdef-0123-456789abcdef',
+                    applyUrl: 'https://jobs.lever.co/acme/01234567-89ab-cdef-0123-456789abcdef/apply',
+                    workplaceType: 'remote',
+                    categories: { location: 'Remote', allLocations: ['Remote'] },
+                    salaryDescriptionPlain: 'Compensation: $220K - $275K USD base',
+                    createdAt: Date.now(),
+                  },
+                ]),
+                { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } },
+              );
+            }
+            if (u.hostname === 'store.example.com' && u.pathname === '/products.json') {
+              const page = u.searchParams.get('page') ?? '1';
+              if (page === '1') {
+                return new MfResponse(
+                  JSON.stringify({
+                    products: [
+                      {
+                        id: 9001,
+                        title: 'Titanium Bolt Kit',
+                        handle: 'titanium-bolt-kit',
+                        vendor: 'EdgeHardware',
+                        product_type: 'Fasteners',
+                        tags: ['titanium', 'hardware'],
+                        variants: [
+                          { id: 9101, title: 'M5 Pack', sku: 'TI-M5', price: '29.00', available: true },
+                          { id: 9102, title: 'M6 Pack', sku: 'TI-M6', price: '34.00', available: false },
+                        ],
+                      },
+                      {
+                        id: 9002,
+                        title: 'Carbon Spacer Set',
+                        handle: 'carbon-spacer-set',
+                        vendor: 'AeroParts',
+                        product_type: 'Spacers',
+                        tags: ['carbon'],
+                        variants: [{ id: 9201, title: 'Default Title', sku: 'CB-SP', price: '19.50', available: false }],
+                      },
+                    ],
+                  }),
+                  { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } },
+                );
+              }
+              return new MfResponse(JSON.stringify({ products: [] }), {
+                status: 200,
+                headers: { 'content-type': 'application/json; charset=utf-8' },
+              });
+            }
+            if (u.hostname === 'batch.example.com' && (u.pathname === '/alpha' || u.pathname === '/beta')) {
+              const label = u.pathname === '/alpha' ? 'Alpha' : 'Beta';
+              return new MfResponse(
+                `<html lang="en"><head><title>${label} Document</title></head><body><main><h1>${label} Document</h1><p>Batch item ${label} body.</p></main></body></html>`,
+                { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } },
+              );
+            }
+            return new MfResponse('not found', { status: 404 });
+          },
+        },
+      ],
+    }),
+  );
+
+  try {
+    const authz = { authorization: `Bearer ${CALLER}`, 'content-type': 'application/json' };
+    const migRes = await mf.dispatchFetch(`${ORIGIN}/__test_migrate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ metaSql, searchSql }),
+    });
+    assert.equal(migRes.status, 200);
+
+    // 1. GET /v1/extractors: auth gate + YAML declarative manifests + category filter
+    const unauthExt = await mf.dispatchFetch(`${ORIGIN}/v1/extractors`);
+    assert.equal(unauthExt.status, 401);
+    assert.match(unauthExt.headers.get('www-authenticate') ?? '', /resource_metadata=/);
+
+    const extRes = await mf.dispatchFetch(`${ORIGIN}/v1/extractors`, { headers: authz });
+    assert.equal(extRes.status, 200);
+    const extJson = await extRes.json();
+    assert.equal(extJson.ok, true);
+    assert.ok(extJson.total >= 49, `expected >= 49 registered adapters, got ${extJson.total}`);
+    const ids = new Set(extJson.extractors.map((e) => e.id));
+    for (const yamlId of [
+      'rubygems',
+      'dev-to',
+      'polymarket',
+      'huggingface',
+      'openrouter',
+      'doi-crossref',
+      'usaspending',
+      'lobsters',
+      'packagist',
+      'hex-pm',
+    ]) {
+      assert.equal(ids.has(yamlId), true, `expected declarative YAML adapter "${yamlId}" in /v1/extractors`);
+      const entry = extJson.extractors.find((e) => e.id === yamlId);
+      assert.ok(entry.modes.includes('twin'), `expected "${yamlId}" to advertise twin mode`);
+    }
+
+    const jobsCatRes = await mf.dispatchFetch(`${ORIGIN}/v1/extractors?category=jobs`, { headers: authz });
+    assert.equal(jobsCatRes.status, 200);
+    const jobsCatJson = await jobsCatRes.json();
+    assert.ok(jobsCatJson.extractors.length >= 10);
+    assert.equal(jobsCatJson.extractors.every((e) => e.category === 'jobs'), true);
+
+    // 2. POST /v1/jobs: domain ATS board discovery (Greenhouse + Lever) + remote & minBase pay filtering
+    const jobsRes = await mf.dispatchFetch(`${ORIGIN}/v1/jobs`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        domains: ['acme.example.com'],
+        query: 'Engineer',
+        remote: true,
+        minBase: 200_000,
+      }),
+    });
+    assert.equal(jobsRes.status, 200);
+    const jobsJson = await jobsRes.json();
+    assert.equal(jobsJson.ok, true);
+    assert.equal(jobsJson.count, 2);
+    const platforms = jobsJson.discoveredBoards.map((b) => b.platform).sort();
+    assert.deepEqual(platforms, ['greenhouse', 'lever']);
+    assert.equal(jobsJson.jobs.every((j) => j.workplaceType === 'remote'), true);
+    assert.equal(jobsJson.jobs.every((j) => j.pay?.basis === 'base' && j.pay.min >= 210_000), true);
+
+    // 3. POST /v1/catalog (Shopify /products.json pagination -> R2 NDJSON) + GET status & filtered records
+    const catRes = await mf.dispatchFetch(`${ORIGIN}/v1/catalog`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        url: 'https://store.example.com',
+        platform: 'shopify',
+        sync: true,
+      }),
+    });
+    assert.equal(catRes.status, 200);
+    const catJson = await catRes.json();
+    assert.equal(catJson.ok, true);
+    assert.equal(catJson.status, 'complete');
+    assert.equal(catJson.platform, 'shopify');
+    assert.equal(catJson.products, 2);
+    assert.equal(catJson.variants, 3);
+    assert.equal(catJson.pagesRead, 2);
+    assert.match(catJson.artifactId ?? '', /^catalog\/cat_[A-Za-z0-9_-]+\.ndjson$/);
+
+    const catStatusRes = await mf.dispatchFetch(`${ORIGIN}/v1/catalog/${catJson.catalogId}`, { headers: authz });
+    assert.equal(catStatusRes.status, 200);
+    assert.equal((await catStatusRes.json()).status, 'complete');
+
+    const catRecsRes = await mf.dispatchFetch(
+      `${ORIGIN}/v1/catalog/${catJson.catalogId}/records?availableOnly=true&vendor=EdgeHardware`,
+      { headers: authz },
+    );
+    assert.equal(catRecsRes.status, 200);
+    const catRecsJson = await catRecsRes.json();
+    assert.equal(catRecsJson.ok, true);
+    assert.equal(catRecsJson.totalProducts, 2);
+    assert.equal(catRecsJson.matchedProducts, 1);
+    assert.equal(catRecsJson.records[0].handle, 'titanium-bolt-kit');
+
+    // 4. POST /v1/batch/scrape multi-URL execution + GET status + DELETE cancel
+    const batchRes = await mf.dispatchFetch(`${ORIGIN}/v1/batch/scrape`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        urls: ['https://batch.example.com/alpha', 'https://batch.example.com/beta'],
+        formats: ['markdown'],
+        sync: true,
+      }),
+    });
+    assert.equal(batchRes.status, 200);
+    const batchJson = await batchRes.json();
+    assert.equal(batchJson.ok, true);
+    assert.equal(batchJson.status, 'completed');
+    assert.equal(batchJson.total, 2);
+    assert.equal(batchJson.completed, 2);
+    assert.equal(batchJson.data.length, 2);
+    assert.match(batchJson.data[0].markdown, /# Alpha Document/);
+    assert.match(batchJson.data[1].markdown, /# Beta Document/);
+
+    const batchGetRes = await mf.dispatchFetch(`${ORIGIN}/v1/batch/scrape/${batchJson.id}`, { headers: authz });
+    assert.equal(batchGetRes.status, 200);
+    assert.equal((await batchGetRes.json()).completed, 2);
+
+    const batchDelRes = await mf.dispatchFetch(`${ORIGIN}/v1/batch/scrape/${batchJson.id}`, {
+      method: 'DELETE',
+      headers: authz,
+    });
+    assert.equal(batchDelRes.status, 200);
+    assert.equal((await batchDelRes.json()).status, 'cancelled');
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test('F15.3 workerd E2E: /v1/agent autonomous LLM loop, SSE streaming, GET /trace, & DELETE cancellation', async () => {
+  const metaSql = readFileSync(new URL('../migrations/meta/0001_tracking.sql', import.meta.url), 'utf8');
+  const searchSql = readFileSync(new URL('../migrations/search/0001_fts.sql', import.meta.url), 'utf8');
+  const OPENAI_CANARY = 'sk-workerd-agent-canary-secret-998877';
+
+  let releaseSlowTurn;
+  const slowTurnGate = new Promise((r) => {
+    releaseSlowTurn = r;
+  });
+  let sawBearerHeader = '';
+
+  const mf = new Miniflare(
+    convertV4MiniflareOptions({
+      workers: [
+        {
+          name: 'hub-f15-3',
+          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          compatibilityDate: '2026-10-01',
+          durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
+          r2Buckets: ['ARTIFACTS'],
+          d1Databases: ['META', 'SEARCH'],
+          bindings: {
+            CALLER_TOKEN: CALLER,
+            OPENAI_API_KEY: OPENAI_CANARY,
+            EDGEFETCH_LLM_PROVIDER: 'openai',
+            EDGEFETCH_LLM_MODEL: 'gpt-4o-mini',
+            ROBOTS_BYPASS_HOSTS: 'research.example.com',
+          },
+          outboundService: async (req) => {
+            const u = new URL(req.url);
+            if (u.pathname === '/robots.txt') {
+              return new MfResponse('User-agent: *\nAllow: /\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+            }
+            if (u.hostname === 'research.example.com' && u.pathname === '/metrics') {
+              return new MfResponse(
+                '<html lang="en"><head><title>Edge Benchmark v2.7</title></head><body><main><h1>Edge Benchmark v2.7</h1><p>Sustained throughput reached 48000 req/s with 3.2ms P99 latency.</p></main></body></html>',
+                { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } },
+              );
+            }
+            if (u.hostname === 'api.openai.com' && u.pathname === '/v1/chat/completions') {
+              sawBearerHeader = req.headers.get('authorization') ?? '';
+              const body = JSON.parse(await req.text());
+              const msgs = body.messages ?? [];
+              const userText = msgs.map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n');
+              if (userText.includes('SLOW_CANCEL_RUN')) {
+                await slowTurnGate;
+                return new MfResponse(
+                  JSON.stringify({
+                    choices: [{ message: { role: 'assistant', content: '{"cancelled":true}' } }],
+                  }),
+                  { status: 200, headers: { 'content-type': 'application/json' } },
+                );
+              }
+              const hasToolOutput = msgs.some((m) => m.role === 'tool');
+              if (!hasToolOutput) {
+                return new MfResponse(
+                  JSON.stringify({
+                    id: 'chatcmpl_step1',
+                    choices: [
+                      {
+                        index: 0,
+                        message: {
+                          role: 'assistant',
+                          content: null,
+                          tool_calls: [
+                            {
+                              id: 'call_scrape_1',
+                              type: 'function',
+                              function: {
+                                name: 'scrape_url',
+                                arguments: JSON.stringify({ url: 'https://research.example.com/metrics' }),
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                    usage: { prompt_tokens: 120, completion_tokens: 24, total_tokens: 144 },
+                  }),
+                  { status: 200, headers: { 'content-type': 'application/json' } },
+                );
+              }
+              const toolMsg = msgs.find((m) => m.role === 'tool');
+              assert.match(String(toolMsg?.content ?? ''), /48000 req\/s/);
+              return new MfResponse(
+                JSON.stringify({
+                  id: 'chatcmpl_step2',
+                  choices: [
+                    {
+                      index: 0,
+                      message: {
+                        role: 'assistant',
+                        content: JSON.stringify({
+                          version: '2.7',
+                          throughputRps: 48000,
+                          summary: 'Sustained 48000 req/s at 3.2ms P99.',
+                        }),
+                      },
+                    },
+                  ],
+                  usage: { prompt_tokens: 260, completion_tokens: 32, total_tokens: 292 },
+                }),
+                { status: 200, headers: { 'content-type': 'application/json' } },
+              );
+            }
+            return new MfResponse('not found', { status: 404 });
+          },
+        },
+      ],
+    }),
+  );
+
+  try {
+    const authz = { authorization: `Bearer ${CALLER}`, 'content-type': 'application/json' };
+    const migRes = await mf.dispatchFetch(`${ORIGIN}/__test_migrate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ metaSql, searchSql }),
+    });
+    assert.equal(migRes.status, 200);
+
+    // 1. Autonomous multi-step tool call + structured JSON schema answer + GET /v1/agent/:id + GET /v1/agent/:id/trace
+    const agentRes = await mf.dispatchFetch(`${ORIGIN}/v1/agent`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        prompt: 'Read the benchmark metrics page and extract version and throughputRps.',
+        urls: ['https://research.example.com/metrics'],
+        strictConstrainToURLs: true,
+        schema: {
+          type: 'object',
+          properties: {
+            version: { type: 'string' },
+            throughputRps: { type: 'number' },
+            summary: { type: 'string' },
+          },
+          required: ['version', 'throughputRps'],
+        },
+      }),
+    });
+    assert.equal(agentRes.status, 200);
+    assert.equal(sawBearerHeader, `Bearer ${OPENAI_CANARY}`);
+    const agentJson = await agentRes.json();
+    assert.equal(agentJson.status, 'completed');
+    assert.equal(agentJson.llmUsed, true);
+    assert.equal(agentJson.schemaValid, true);
+    assert.equal(agentJson.stepsUsed, 2);
+    assert.equal(agentJson.pagesRead, 1);
+    assert.equal(agentJson.data?.version, '2.7');
+    assert.equal(agentJson.data?.throughputRps, 48000);
+    assert.equal(agentJson.sources?.[0]?.url, 'https://research.example.com/metrics');
+    assert.equal(JSON.stringify(agentJson).includes(OPENAI_CANARY), false, 'agent response must never leak OPENAI_API_KEY');
+
+    const getRunRes = await mf.dispatchFetch(`${ORIGIN}/v1/agent/${agentJson.id}`, { headers: authz });
+    assert.equal(getRunRes.status, 200);
+    assert.equal((await getRunRes.json()).status, 'completed');
+
+    const traceRes = await mf.dispatchFetch(`${ORIGIN}/v1/agent/${agentJson.id}/trace`, { headers: authz });
+    assert.equal(traceRes.status, 200);
+    const traceJson = await traceRes.json();
+    assert.equal(traceJson.ok, true);
+    assert.ok(traceJson.spans.length >= 5);
+    for (let i = 0; i < traceJson.spans.length; i++) {
+      assert.equal(traceJson.spans[i].sequence, i + 1, 'agent trace sequence numbers must be strictly monotonic');
+    }
+    const traceKinds = new Set(traceJson.spans.map((s) => s.kind));
+    assert.equal(traceKinds.has('router'), true);
+    assert.equal(traceKinds.has('llm_turn'), true);
+    assert.equal(traceKinds.has('tool_call'), true);
+    assert.equal(traceKinds.has('synthesis'), true);
+    assert.equal(JSON.stringify(traceJson).includes(OPENAI_CANARY), false);
+
+    // 2. Real-time SSE streaming (`Accept: text/event-stream`)
+    const sseRes = await mf.dispatchFetch(`${ORIGIN}/v1/agent`, {
+      method: 'POST',
+      headers: { ...authz, accept: 'text/event-stream' },
+      body: JSON.stringify({
+        prompt: 'Stream the benchmark metrics summary.',
+        urls: ['https://research.example.com/metrics'],
+      }),
+    });
+    assert.equal(sseRes.status, 200);
+    assert.match(sseRes.headers.get('content-type') ?? '', /text\/event-stream/i);
+    const sseText = await sseRes.text();
+    const startedIdx = sseText.indexOf('event: agent.started');
+    const actionIdx = sseText.indexOf('event: agent.action');
+    const traceIdx = sseText.indexOf('event: agent.trace');
+    const completedIdx = sseText.indexOf('event: agent.completed');
+    assert.ok(startedIdx >= 0, 'SSE stream must emit agent.started');
+    assert.ok(actionIdx > startedIdx, 'SSE stream must emit agent.action after agent.started');
+    assert.ok(traceIdx > startedIdx, 'SSE stream must emit agent.trace');
+    assert.ok(completedIdx > actionIdx, 'SSE stream must emit agent.completed after tool action');
+    assert.match(sseText, /"tool":"scrape_url"/);
+
+    // 3. Async start + DELETE /v1/agent/:id cancellation
+    const asyncStartRes = await mf.dispatchFetch(`${ORIGIN}/v1/agent`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        prompt: 'SLOW_CANCEL_RUN: wait for cancellation',
+        urls: ['https://research.example.com/metrics'],
+        async: true,
+      }),
+    });
+    assert.equal(asyncStartRes.status, 202);
+    const asyncCreated = await asyncStartRes.json();
+    assert.match(asyncCreated.id, /^agt_/);
+    assert.equal(asyncCreated.status, 'processing');
+
+    const delRes = await mf.dispatchFetch(`${ORIGIN}/v1/agent/${asyncCreated.id}`, {
+      method: 'DELETE',
+      headers: authz,
+    });
+    assert.equal(delRes.status, 200);
+    const delJson = await delRes.json();
+    assert.equal(delJson.ok, true);
+    assert.equal(delJson.status, 'cancelled');
+
+    const cancelledGetRes = await mf.dispatchFetch(`${ORIGIN}/v1/agent/${asyncCreated.id}`, { headers: authz });
+    assert.equal(cancelledGetRes.status, 200);
+    assert.equal((await cancelledGetRes.json()).status, 'cancelled');
+
+    releaseSlowTurn();
+    await sleep(40);
+  } finally {
+    releaseSlowTurn?.();
+    await mf.dispose();
+  }
+});
+
+test('F15.4 workerd E2E: /v1/ingest-tab CORS & Auth + OAuth 2.1 PKCE S256 Full Lifecycle', async () => {
+  const metaSql = readFileSync(new URL('../migrations/meta/0001_tracking.sql', import.meta.url), 'utf8');
+  const searchSql = readFileSync(new URL('../migrations/search/0001_fts.sql', import.meta.url), 'utf8');
+
+  const mf = new Miniflare(
+    convertV4MiniflareOptions({
+      workers: [
+        {
+          name: 'hub-f15-4',
+          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          compatibilityDate: '2026-10-01',
+          durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
+          r2Buckets: ['ARTIFACTS'],
+          d1Databases: ['META', 'SEARCH'],
+          bindings: {
+            CALLER_TOKEN: CALLER,
+          },
+        },
+      ],
+    }),
+  );
+
+  try {
+    const authz = { authorization: `Bearer ${CALLER}`, 'content-type': 'application/json' };
+    const migRes = await mf.dispatchFetch(`${ORIGIN}/__test_migrate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ metaSql, searchSql }),
+    });
+    assert.equal(migRes.status, 200);
+
+    // 1. OPTIONS /v1/ingest-tab preflight & POST /v1/ingest-tab auth enforcement + valid tab ingest
+    const preflightRes = await mf.dispatchFetch(`${ORIGIN}/v1/ingest-tab`, {
+      method: 'OPTIONS',
+      headers: {
+        origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'Authorization, Content-Type',
+      },
+    });
+    assert.equal(preflightRes.status, 204);
+    assert.equal(preflightRes.headers.get('access-control-allow-origin'), '*');
+    assert.match(preflightRes.headers.get('access-control-allow-methods') ?? '', /POST/);
+    assert.match(preflightRes.headers.get('access-control-allow-headers') ?? '', /Authorization/i);
+
+    const unauthClipRes = await mf.dispatchFetch(`${ORIGIN}/v1/ingest-tab`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'https://wiki.example.com/page', markdown: '# Secret' }),
+    });
+    assert.equal(unauthClipRes.status, 401);
+    assert.equal(unauthClipRes.headers.get('access-control-allow-origin'), '*');
+    assert.match(unauthClipRes.headers.get('www-authenticate') ?? '', /Bearer/);
+
+    const badTokClipRes = await mf.dispatchFetch(`${ORIGIN}/v1/ingest-tab`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer wrong-token-value-1234567890', 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'https://wiki.example.com/page', markdown: '# Secret' }),
+    });
+    assert.equal(badTokClipRes.status, 401);
+
+    const validClipRes = await mf.dispatchFetch(`${ORIGIN}/v1/ingest-tab`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({
+        url: 'https://wiki.example.com/runbook#section-rotation',
+        title: 'Key Rotation Runbook',
+        html: '<html lang="en"><body><nav>top-nav-links</nav><main><h1>Key Rotation Runbook</h1><p>Rotate Ed25519 bot signing keys every thirty days.</p></main></body></html>',
+        collectionId: 'clipped-docs',
+      }),
+    });
+    assert.equal(validClipRes.status, 200);
+    assert.equal(validClipRes.headers.get('access-control-allow-origin'), '*');
+    const validClipJson = await validClipRes.json();
+    assert.equal(validClipJson.ok, true);
+    assert.equal(validClipJson.url, 'https://wiki.example.com/runbook');
+    assert.equal(validClipJson.collectionId, 'clipped-docs');
+    assert.ok(validClipJson.indexedChunks >= 1);
+    assert.match(validClipJson.markdown, /Rotate Ed25519 bot signing keys every thirty days\./);
+    assert.equal(validClipJson.markdown.includes('top-nav-links'), false);
+
+    const clipSearchRes = await mf.dispatchFetch(`${ORIGIN}/v1/collections/clipped-docs/search`, {
+      method: 'POST',
+      headers: authz,
+      body: JSON.stringify({ query: 'Ed25519 signing keys' }),
+    });
+    assert.equal(clipSearchRes.status, 200);
+    assert.equal((await clipSearchRes.json()).hits.length, 1);
+
+    // 2. OAuth 2.1 PKCE S256 Full Lifecycle: discovery -> register -> authorize -> token -> /mcp tools/list -> revoke
+    const metaDocRes = await mf.dispatchFetch(`${ORIGIN}/.well-known/oauth-authorization-server`);
+    assert.equal(metaDocRes.status, 200);
+    const metaDoc = await metaDocRes.json();
+    assert.equal(metaDoc.issuer, ORIGIN);
+    assert.equal(metaDoc.registration_endpoint, `${ORIGIN}/oauth/register`);
+    assert.equal(metaDoc.authorization_endpoint, `${ORIGIN}/oauth/authorize`);
+    assert.equal(metaDoc.token_endpoint, `${ORIGIN}/oauth/token`);
+    assert.equal(metaDoc.revocation_endpoint, `${ORIGIN}/oauth/revoke`);
+    assert.deepEqual(metaDoc.code_challenge_methods_supported, ['S256']);
+
+    const redirectUri = 'http://127.0.0.1:54321/callback';
+    const regRes = await mf.dispatchFetch(`${ORIGIN}/oauth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'cf-connecting-ip': '198.51.100.44' },
+      body: JSON.stringify({
+        client_name: 'Workerd PKCE Test Client',
+        redirect_uris: [redirectUri],
+        application_type: 'native',
+      }),
+    });
+    assert.equal(regRes.status, 201);
+    const regJson = await regRes.json();
+    assert.match(regJson.client_id, /^mcp_/);
+
+    const codeVerifier = randomBytes(32).toString('base64url');
+    const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+    const oauthState = 'state_pkce_workerd_1';
+
+    const authGetUrl = new URL(`${ORIGIN}/oauth/authorize`);
+    authGetUrl.searchParams.set('client_id', regJson.client_id);
+    authGetUrl.searchParams.set('redirect_uri', redirectUri);
+    authGetUrl.searchParams.set('response_type', 'code');
+    authGetUrl.searchParams.set('scope', 'crawl:read crawl:fetch');
+    authGetUrl.searchParams.set('state', oauthState);
+    authGetUrl.searchParams.set('code_challenge', codeChallenge);
+    authGetUrl.searchParams.set('code_challenge_method', 'S256');
+
+    const consentGetRes = await mf.dispatchFetch(authGetUrl.toString(), { redirect: 'manual' });
+    assert.equal(consentGetRes.status, 200);
+    const csrfCookie = consentGetRes.headers.get('set-cookie')?.split(';')[0] ?? '';
+    assert.match(csrfCookie, /^ef_oauth_csrf=/);
+    const consentHtml = await consentGetRes.text();
+    const sealedMatch = /name="sealed"\s+value="([^"]+)"/.exec(consentHtml);
+    const csrfMatch = /name="csrf"\s+value="([^"]+)"/.exec(consentHtml);
+    assert.ok(sealedMatch?.[1] && csrfMatch?.[1], 'consent HTML must include sealed state and csrf inputs');
+
+    const approveBody = new URLSearchParams({
+      sealed: sealedMatch[1],
+      csrf: csrfMatch[1],
+      owner_token: CALLER,
+      decision: 'approve',
+    });
+    const approveRes = await mf.dispatchFetch(`${ORIGIN}/oauth/authorize`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        cookie: csrfCookie,
+        'cf-connecting-ip': '198.51.100.44',
+      },
+      body: approveBody.toString(),
+    });
+    assert.equal(approveRes.status, 302);
+    const cbUrl = new URL(approveRes.headers.get('location') ?? '');
+    assert.equal(`${cbUrl.origin}${cbUrl.pathname}`, redirectUri);
+    assert.equal(cbUrl.searchParams.get('state'), oauthState);
+    assert.equal(cbUrl.searchParams.get('iss'), ORIGIN);
+    const authCode = cbUrl.searchParams.get('code') ?? '';
+    assert.match(authCode, /^efc_/);
+
+    const tokenRes = await mf.dispatchFetch(`${ORIGIN}/oauth/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: authCode,
+        client_id: regJson.client_id,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+      }).toString(),
+    });
+    assert.equal(tokenRes.status, 200);
+    const tokenJson = await tokenRes.json();
+    assert.match(tokenJson.access_token, /^efa_/);
+    assert.match(tokenJson.refresh_token, /^efr_/);
+    assert.equal(tokenJson.token_type, 'Bearer');
+
+    // Replaying the single-use authorization code must fail with 400 invalid_grant
+    const replayCodeRes = await mf.dispatchFetch(`${ORIGIN}/oauth/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: authCode,
+        client_id: regJson.client_id,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+      }).toString(),
+    });
+    assert.equal(replayCodeRes.status, 400);
+    assert.equal((await replayCodeRes.json()).error, 'invalid_grant');
+
+    // Authenticated /mcp tools/list using issued OAuth 2.1 access_token
+    const mcpRes = await mf.dispatchFetch(`${ORIGIN}/mcp`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${tokenJson.access_token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    assert.equal(mcpRes.status, 200);
+    const mcpJson = await mcpRes.json();
+    assert.equal(mcpJson.result.tools.length, 15);
+
+    // Revoke access_token via /oauth/revoke -> subsequent /mcp call returns 401
+    const revokeRes = await mf.dispatchFetch(`${ORIGIN}/oauth/revoke`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: tokenJson.access_token }).toString(),
+    });
+    assert.equal(revokeRes.status, 200);
+    assert.equal((await revokeRes.json()).ok, true);
+
+    const mcpAfterRevoke = await mf.dispatchFetch(`${ORIGIN}/mcp`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${tokenJson.access_token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+    });
+    assert.equal(mcpAfterRevoke.status, 401);
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test('F15.5 workerd E2E: End-to-End OTLP Span Capture, W3C traceparent propagation, child spans, & zero leaked secrets', async () => {
+  const metaSql = readFileSync(new URL('../migrations/meta/0001_tracking.sql', import.meta.url), 'utf8');
+  const searchSql = readFileSync(new URL('../migrations/search/0001_fts.sql', import.meta.url), 'utf8');
+
+  const OTLP_HEADER_SECRET = 'otlp-collector-ingest-tok-canary-4455';
+  const OPENAI_SECRET_CANARY = 'sk-otel-canary-secret-never-export-6677';
+  const URL_QUERY_CANARY = 'SUPER_SECRET_QUERY_TOKEN_8899';
+
+  const capturedOtlpRequests = [];
+
+  const mf = new Miniflare(
+    convertV4MiniflareOptions({
+      workers: [
+        {
+          name: 'hub-f15-5',
+          modules: [{ type: 'ESModule', path: 'entry.mjs', contents: readFileSync(workerBundlePath, 'utf8') }],
+          compatibilityDate: '2026-10-01',
+          durableObjects: { AGENT_HUB: { className: 'AgentHubDO', useSQLite: true } },
+          r2Buckets: ['ARTIFACTS'],
+          d1Databases: ['META', 'SEARCH'],
+          bindings: {
+            CALLER_TOKEN: CALLER,
+            AGENT_TOKENS: JSON.stringify({ 'site-1': S1 }),
+            OPENAI_API_KEY: OPENAI_SECRET_CANARY,
+            OTEL_EXPORTER_OTLP_ENDPOINT: 'https://otel.example.com/v1/traces',
+            OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer ${OTLP_HEADER_SECRET}`,
+            OTEL_SERVICE_NAME: 'edgefetch-workerd-e2e',
+            ROBOTS_BYPASS_HOSTS: 'rubygems.org,boards.greenhouse.io,boards-api.greenhouse.io,store.example.com',
+          },
+          outboundService: async (req) => {
+            const u = new URL(req.url);
+            if (u.origin === 'https://otel.example.com' && u.pathname === '/v1/traces') {
+              const rawText = await req.text();
+              capturedOtlpRequests.push({
+                authHeader: req.headers.get('authorization') ?? '',
+                contentType: req.headers.get('content-type') ?? '',
+                rawText,
+                payload: JSON.parse(rawText),
+              });
+              return new MfResponse('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+            }
+            if (u.pathname === '/robots.txt') {
+              return new MfResponse('User-agent: *\nAllow: /\n', { status: 200, headers: { 'content-type': 'text/plain' } });
+            }
+            if (u.hostname === 'rubygems.org' && u.pathname === '/api/v1/gems/sinatra.json') {
+              return new MfResponse(
+                JSON.stringify({
+                  name: 'sinatra',
+                  version: '4.1.1',
+                  info: 'Classy web-development dressed in a DSL.',
+                  licenses: ['MIT'],
+                  authors: 'Blake Mizerany',
+                }),
+                { status: 200, headers: { 'content-type': 'application/json' } },
+              );
+            }
+            if (u.hostname === 'boards-api.greenhouse.io' && u.pathname === '/v1/boards/acme/jobs/777') {
+              return new MfResponse(
+                JSON.stringify({
+                  id: 777,
+                  title: 'Staff Security Engineer',
+                  company_name: 'Acme',
+                  absolute_url: 'https://boards.greenhouse.io/acme/jobs/777',
+                  location: { name: 'Remote - US' },
+                  updated_at: new Date().toISOString(),
+                  pay_input_ranges: [{ currency_type: 'USD', min_cents: 22_000_000, max_cents: 27_000_000, title: 'Base Salary' }],
+                  content: '<p>Secure distributed edge runtimes.</p>',
+                }),
+                { status: 200, headers: { 'content-type': 'application/json' } },
+              );
+            }
+            if (u.hostname === 'store.example.com' && u.pathname === '/products.json') {
+              return new MfResponse(
+                JSON.stringify({
+                  products: [
+                    {
+                      id: 1,
+                      title: 'Edge Sensor',
+                      handle: 'edge-sensor',
+                      vendor: 'EdgeLab',
+                      product_type: 'Sensors',
+                      variants: [{ id: 11, title: 'Default Title', sku: 'ES-1', price: '49.00', available: true }],
+                    },
+                  ],
+                }),
+                { status: 200, headers: { 'content-type': 'application/json' } },
+              );
+            }
+            return new MfResponse('not found', { status: 404 });
+          },
+        },
+      ],
+    }),
+  );
+
+  try {
+    const migRes = await mf.dispatchFetch(`${ORIGIN}/__test_migrate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ metaSql, searchSql }),
+    });
+    assert.equal(migRes.status, 200);
+
+    const makeTraceHeaders = (traceHexByte, parentHexByte, extra = {}) => {
+      const traceId = traceHexByte.repeat(32);
+      const parentId = parentHexByte.repeat(16);
+      return {
+        traceId,
+        parentId,
+        headers: {
+          authorization: `Bearer ${CALLER}`,
+          'content-type': 'application/json',
+          traceparent: `00-${traceId}-${parentId}-01`,
+          ...extra,
+        },
+      };
+    };
+
+    const assertResponseTraceHeaders = (res, expectedTraceId) => {
+      assert.equal(res.headers.get('x-trace-id'), expectedTraceId);
+      assert.match(res.headers.get('traceparent') ?? '', new RegExp(`^00-${expectedTraceId}-[0-9a-f]{16}-01$`));
+    };
+
+    // 1. Traced POST /v1/scrape (with query-string secret canary that MUST be stripped from spans!)
+    const tScrape = makeTraceHeaders('a', '1');
+    const scRes = await mf.dispatchFetch(`${ORIGIN}/v1/scrape`, {
+      method: 'POST',
+      headers: tScrape.headers,
+      body: JSON.stringify({
+        url: `https://rubygems.org/gems/sinatra?api_key=${URL_QUERY_CANARY}`,
+        formats: ['markdown'],
+        discoverLlmsTxt: false,
+      }),
+    });
+    assert.equal(scRes.status, 200);
+    assertResponseTraceHeaders(scRes, tScrape.traceId);
+
+    // 2. Traced POST /v1/jobs (verify mode on Greenhouse job)
+    const tJobs = makeTraceHeaders('b', '2');
+    const jbRes = await mf.dispatchFetch(`${ORIGIN}/v1/jobs`, {
+      method: 'POST',
+      headers: tJobs.headers,
+      body: JSON.stringify({
+        verify: [`https://boards.greenhouse.io/acme/jobs/777?token=${URL_QUERY_CANARY}`],
+      }),
+    });
+    assert.equal(jbRes.status, 200);
+    assertResponseTraceHeaders(jbRes, tJobs.traceId);
+
+    // 3. Traced POST /v1/catalog (`maxPages: 1` for instant completion without inter-page sleep)
+    const tCat = makeTraceHeaders('c', '3');
+    const ctRes = await mf.dispatchFetch(`${ORIGIN}/v1/catalog`, {
+      method: 'POST',
+      headers: tCat.headers,
+      body: JSON.stringify({
+        url: 'https://store.example.com',
+        platform: 'shopify',
+        maxPages: 1,
+        sync: true,
+      }),
+    });
+    assert.equal(ctRes.status, 200);
+    assertResponseTraceHeaders(ctRes, tCat.traceId);
+
+    // 4. Traced OAuth 2.1 lifecycle (`register` -> `authorize` -> `token` -> `revoke`)
+    const tOAuth = makeTraceHeaders('d', '4');
+    const redirectUri = 'http://127.0.0.1:55111/cb';
+    const oaRegRes = await mf.dispatchFetch(`${ORIGIN}/oauth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', traceparent: `00-${tOAuth.traceId}-${tOAuth.parentId}-01`, 'cf-connecting-ip': '198.51.100.88' },
+      body: JSON.stringify({ client_name: 'OTLP OAuth Client', redirect_uris: [redirectUri] }),
+    });
+    assert.equal(oaRegRes.status, 201);
+    assertResponseTraceHeaders(oaRegRes, tOAuth.traceId);
+    const { client_id: oaClientId } = await oaRegRes.json();
+
+    const verifier = randomBytes(32).toString('base64url');
+    const challenge = createHash('sha256').update(verifier).digest('base64url');
+    const oaGetRes = await mf.dispatchFetch(
+      `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent(oaClientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&code_challenge=${challenge}&code_challenge_method=S256&state=st_otel`,
+      { headers: { traceparent: `00-${tOAuth.traceId}-${tOAuth.parentId}-01` }, redirect: 'manual' },
+    );
+    assert.equal(oaGetRes.status, 200);
+    assertResponseTraceHeaders(oaGetRes, tOAuth.traceId);
+    const oaCookie = oaGetRes.headers.get('set-cookie')?.split(';')[0] ?? '';
+    const oaHtml = await oaGetRes.text();
+    const oaSealed = /name="sealed"\s+value="([^"]+)"/.exec(oaHtml)?.[1] ?? '';
+    const oaCsrf = /name="csrf"\s+value="([^"]+)"/.exec(oaHtml)?.[1] ?? '';
+
+    const oaPostRes = await mf.dispatchFetch(`${ORIGIN}/oauth/authorize`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        cookie: oaCookie,
+        traceparent: `00-${tOAuth.traceId}-${tOAuth.parentId}-01`,
+        'cf-connecting-ip': '198.51.100.88',
+      },
+      body: new URLSearchParams({ sealed: oaSealed, csrf: oaCsrf, owner_token: CALLER, decision: 'approve' }).toString(),
+    });
+    assert.equal(oaPostRes.status, 302);
+    assertResponseTraceHeaders(oaPostRes, tOAuth.traceId);
+    const oaCode = new URL(oaPostRes.headers.get('location') ?? '').searchParams.get('code') ?? '';
+
+    const oaTokRes = await mf.dispatchFetch(`${ORIGIN}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        traceparent: `00-${tOAuth.traceId}-${tOAuth.parentId}-01`,
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: oaCode,
+        client_id: oaClientId,
+        redirect_uri: redirectUri,
+        code_verifier: verifier,
+      }).toString(),
+    });
+    assert.equal(oaTokRes.status, 200);
+    assertResponseTraceHeaders(oaTokRes, tOAuth.traceId);
+    const oaTokJson = await oaTokRes.json();
+
+    const oaRevRes = await mf.dispatchFetch(`${ORIGIN}/oauth/revoke`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        traceparent: `00-${tOAuth.traceId}-${tOAuth.parentId}-01`,
+      },
+      body: new URLSearchParams({ token: oaTokJson.access_token }).toString(),
+    });
+    assert.equal(oaRevRes.status, 200);
+    assertResponseTraceHeaders(oaRevRes, tOAuth.traceId);
+
+    // Allow ctx.waitUntil OTLP flushes to complete inside workerd
+    await sleep(100);
+
+    assert.ok(capturedOtlpRequests.length >= 7, `expected >= 7 OTLP trace flushes, got ${capturedOtlpRequests.length}`);
+    for (const reqItem of capturedOtlpRequests) {
+      assert.equal(reqItem.authHeader, `Bearer ${OTLP_HEADER_SECRET}`);
+      assert.match(reqItem.contentType, /application\/json/i);
+    }
+
+    const allSpans = capturedOtlpRequests.flatMap((r) => extractOtlpSpansFromPayload(r.payload));
+    assert.ok(allSpans.every((s) => s.resourceAttrs['service.name'] === 'edgefetch-workerd-e2e'));
+
+    // Verify scrape trace tree: inbound parentSpanId -> edgefetch.http -> edgefetch.scrape -> edgefetch.dispatch
+    const scrapeTraceSpans = allSpans.filter((s) => s.traceId === tScrape.traceId);
+    const scrapeHttp = scrapeTraceSpans.find((s) => s.name === 'edgefetch.http');
+    const scrapeChild = scrapeTraceSpans.find((s) => s.name === 'edgefetch.scrape');
+    const scrapeDispatch = scrapeTraceSpans.find((s) => s.name === 'edgefetch.dispatch');
+    assert.ok(scrapeHttp && scrapeChild && scrapeDispatch, 'expected edgefetch.http -> edgefetch.scrape -> edgefetch.dispatch hierarchy');
+    assert.equal(scrapeHttp.parentSpanId, tScrape.parentId);
+    assert.equal(scrapeChild.parentSpanId, scrapeHttp.spanId);
+    assert.equal(scrapeChild.attrs['edgefetch.adapter_id'], 'rubygems');
+    assert.equal(scrapeDispatch.parentSpanId, scrapeChild.spanId);
+
+    // Verify jobs trace tree: inbound parentSpanId -> edgefetch.http -> edgefetch.jobs
+    const jobsTraceSpans = allSpans.filter((s) => s.traceId === tJobs.traceId);
+    const jobsHttp = jobsTraceSpans.find((s) => s.name === 'edgefetch.http');
+    const jobsChild = jobsTraceSpans.find((s) => s.name === 'edgefetch.jobs');
+    assert.ok(jobsHttp && jobsChild, 'expected edgefetch.http -> edgefetch.jobs hierarchy');
+    assert.equal(jobsHttp.parentSpanId, tJobs.parentId);
+    assert.equal(jobsChild.parentSpanId, jobsHttp.spanId);
+
+    // Verify catalog trace tree: inbound parentSpanId -> edgefetch.http -> edgefetch.catalog
+    const catTraceSpans = allSpans.filter((s) => s.traceId === tCat.traceId);
+    const catHttp = catTraceSpans.find((s) => s.name === 'edgefetch.http');
+    const catChild = catTraceSpans.find((s) => s.name === 'edgefetch.catalog');
+    assert.ok(catHttp && catChild, 'expected edgefetch.http -> edgefetch.catalog hierarchy');
+    assert.equal(catHttp.parentSpanId, tCat.parentId);
+    assert.equal(catChild.parentSpanId, catHttp.spanId);
+    assert.equal(catChild.attrs['edgefetch.adapter_id'], 'shopify');
+
+    // Verify OAuth audit child spans (`edgefetch.oauth.register`, `authorize`, `token`, `revoke`)
+    const oauthSpanNames = new Set(allSpans.filter((s) => s.traceId === tOAuth.traceId).map((s) => s.name));
+    for (const expectedOAuthSpan of [
+      'edgefetch.http',
+      'edgefetch.oauth.register',
+      'edgefetch.oauth.authorize',
+      'edgefetch.oauth.token',
+      'edgefetch.oauth.revoke',
+    ]) {
+      assert.equal(oauthSpanNames.has(expectedOAuthSpan), true, `missing expected OAuth OTLP span ${expectedOAuthSpan}`);
+    }
+
+    // Zero leaked secrets across ALL exported OTLP JSON payloads!
+    const allRawOtlpText = capturedOtlpRequests.map((r) => r.rawText).join('\n');
+    for (const secretValue of [
+      CALLER,
+      S1,
+      OPENAI_SECRET_CANARY,
+      OTLP_HEADER_SECRET,
+      URL_QUERY_CANARY,
+      oaCode,
+      oaTokJson.access_token,
+      oaTokJson.refresh_token,
+      verifier,
+      oaSealed,
+      oaCsrf,
+    ]) {
+      assert.ok(secretValue && secretValue.length >= 8);
+      assert.equal(
+        allRawOtlpText.includes(secretValue),
+        false,
+        `OTLP exported spans MUST NEVER leak secret/token value (${secretValue.slice(0, 6)}...)`,
+      );
+    }
+  } finally {
     await mf.dispose();
   }
 });

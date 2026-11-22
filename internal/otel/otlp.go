@@ -117,6 +117,263 @@ func isHex(s string) bool {
 	return true
 }
 
+func isValidTraceID(id string) bool {
+	return len(id) == 32 && isHex(id) && id != zeroTraceID
+}
+
+func isValidSpanID(id string) bool {
+	return len(id) == 16 && isHex(id) && id != zeroSpanID
+}
+
+type traceContextKey struct{}
+
+// WithTraceContext attaches `tc` onto `ctx` (using `context.Background()` when `ctx == nil`).
+func WithTraceContext(ctx context.Context, tc TraceContext) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, traceContextKey{}, tc)
+}
+
+// TraceContextFromContext retrieves a valid `TraceContext` attached by `WithTraceContext`.
+func TraceContextFromContext(ctx context.Context) (TraceContext, bool) {
+	if ctx == nil {
+		return TraceContext{}, false
+	}
+	tc, ok := ctx.Value(traceContextKey{}).(TraceContext)
+	if !ok {
+		return TraceContext{}, false
+	}
+	tc.TraceID = strings.ToLower(strings.TrimSpace(tc.TraceID))
+	tc.SpanID = strings.ToLower(strings.TrimSpace(tc.SpanID))
+	tc.ParentSpanID = strings.ToLower(strings.TrimSpace(tc.ParentSpanID))
+	if !isValidTraceID(tc.TraceID) || !isValidSpanID(tc.SpanID) {
+		return TraceContext{}, false
+	}
+	return tc, true
+}
+
+// Child derives a child `TraceContext` preserving `TraceID` and `Sampled` while linking `ParentSpanID` to `tc.SpanID`.
+func (tc TraceContext) Child() TraceContext {
+	traceID := strings.ToLower(strings.TrimSpace(tc.TraceID))
+	if !isValidTraceID(traceID) {
+		traceID = RandomHex(16)
+	}
+	parentSpanID := strings.ToLower(strings.TrimSpace(tc.SpanID))
+	if !isValidSpanID(parentSpanID) {
+		parentSpanID = ""
+	}
+	return TraceContext{
+		TraceID:      traceID,
+		SpanID:       RandomHex(8),
+		ParentSpanID: parentSpanID,
+		Sampled:      tc.Sampled,
+	}
+}
+
+// InjectHeaders writes W3C `traceparent` and EdgeFetch correlation headers (`X-Trace-Id`, `X-Span-Id`, `X-Request-Id`) onto `dst`.
+func InjectHeaders(dst http.Header, tc TraceContext, requestID string) {
+	if dst == nil {
+		return
+	}
+	if !isValidTraceID(strings.ToLower(strings.TrimSpace(tc.TraceID))) {
+		tc.TraceID = RandomHex(16)
+	} else {
+		tc.TraceID = strings.ToLower(strings.TrimSpace(tc.TraceID))
+	}
+	if !isValidSpanID(strings.ToLower(strings.TrimSpace(tc.SpanID))) {
+		tc.SpanID = RandomHex(8)
+	} else {
+		tc.SpanID = strings.ToLower(strings.TrimSpace(tc.SpanID))
+	}
+	dst.Set("Traceparent", FormatTraceparent(tc))
+	dst.Set("X-Trace-Id", tc.TraceID)
+	dst.Set("X-Span-Id", tc.SpanID)
+	if reqID := strings.TrimSpace(requestID); reqID != "" {
+		dst.Set("X-Request-Id", reqID)
+	} else if strings.TrimSpace(dst.Get("X-Request-Id")) == "" {
+		dst.Set("X-Request-Id", tc.SpanID)
+	}
+}
+
+var (
+	reEmbeddedHTTPURL = regexp.MustCompile(`(?i)https?://[^\s"\\]+`)
+	reQuotedHTTPURL   = regexp.MustCompile(`(?i)"https?://(?:[^"\\]|\\.)*"`)
+)
+
+func scrubRawURL(raw string) string {
+	if idx := strings.IndexByte(raw, '#'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
+		raw = raw[:idx]
+	}
+	if schemeEnd := strings.Index(raw, "://"); schemeEnd >= 0 {
+		rest := raw[schemeEnd+3:]
+		slash := strings.IndexByte(rest, '/')
+		auth := rest
+		pathPart := ""
+		if slash >= 0 {
+			auth = rest[:slash]
+			pathPart = rest[slash:]
+		}
+		if at := strings.LastIndexByte(auth, '@'); at >= 0 {
+			auth = auth[at+1:]
+			raw = raw[:schemeEnd+3] + auth + pathPart
+		}
+	}
+	return raw
+}
+
+// SanitizeURL strips `user:pass@` credentials, query parameters, and `#fragment` from `raw` for safe OTLP logging.
+func SanitizeURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if u, err := url.Parse(trimmed); err == nil && (u.Scheme != "" || u.Path != "") {
+		u.User = nil
+		u.RawQuery = ""
+		u.ForceQuery = false
+		u.Fragment = ""
+		u.RawFragment = ""
+		return u.String()
+	}
+	return scrubRawURL(trimmed)
+}
+
+// RedactEmbeddedURLs scrubs query strings (`?...`), `#fragments`, and `user:pass@` credentials from any `http://` or
+// `https://` URL embedded inside an error or `Problem` string.
+func RedactEmbeddedURLs(s string) string {
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if !strings.Contains(lower, "http://") && !strings.Contains(lower, "https://") {
+		return s
+	}
+	s = reQuotedHTTPURL.ReplaceAllStringFunc(s, func(q string) string {
+		raw, err := strconv.Unquote(q)
+		if err != nil {
+			raw = q[1 : len(q)-1]
+		}
+		return strconv.Quote(scrubRawURL(raw))
+	})
+	return reEmbeddedHTTPURL.ReplaceAllStringFunc(s, scrubRawURL)
+}
+
+// ActiveSpan tracks an in-flight OTLP span and exports it once on `End`.
+type ActiveSpan struct {
+	mu    sync.Mutex
+	exp   *Exporter
+	tc    TraceContext
+	name  string
+	kind  int
+	start time.Time
+	attrs map[string]any
+	ended bool
+}
+
+// StartSpan begins an `ActiveSpan` using `tc`'s exact `TraceID`/`SpanID`/`ParentSpanID` (preserving `Sampled`).
+func StartSpan(exp *Exporter, tc TraceContext, name string, kind int, attrs map[string]any) *ActiveSpan {
+	if !isValidTraceID(strings.ToLower(strings.TrimSpace(tc.TraceID))) {
+		tc.TraceID = RandomHex(16)
+	} else {
+		tc.TraceID = strings.ToLower(strings.TrimSpace(tc.TraceID))
+	}
+	if !isValidSpanID(strings.ToLower(strings.TrimSpace(tc.SpanID))) {
+		tc.SpanID = RandomHex(8)
+	} else {
+		tc.SpanID = strings.ToLower(strings.TrimSpace(tc.SpanID))
+	}
+	var cloned map[string]any
+	if len(attrs) > 0 {
+		cloned = make(map[string]any, len(attrs))
+		for k, v := range attrs {
+			cloned[k] = v
+		}
+	}
+	return &ActiveSpan{
+		exp:   exp,
+		tc:    tc,
+		name:  name,
+		kind:  kind,
+		start: time.Now(),
+		attrs: cloned,
+	}
+}
+
+// StartChildSpan derives a child `TraceContext` from `ctx` (or mints a fresh root when absent), attaches it to the
+// returned `context.Context` even when `exp == nil` or `!Sampled`, and starts an `ActiveSpan`.
+func StartChildSpan(ctx context.Context, exp *Exporter, name string, kind int, attrs map[string]any) (context.Context, *ActiveSpan, TraceContext) {
+	var child TraceContext
+	if parentTC, ok := TraceContextFromContext(ctx); ok {
+		child = parentTC.Child()
+	} else {
+		child = ExtractOrNew(nil)
+	}
+	span := StartSpan(exp, child, name, kind, attrs)
+	return WithTraceContext(ctx, child), span, child
+}
+
+// SetAttribute attaches or updates an attribute on an active span prior to `End`.
+func (a *ActiveSpan) SetAttribute(k string, v any) {
+	if a == nil || k == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ended {
+		return
+	}
+	if a.attrs == nil {
+		a.attrs = make(map[string]any)
+	}
+	a.attrs[k] = v
+}
+
+// End finishes the span once and records it to the exporter when non-nil and sampled.
+func (a *ActiveSpan) End(statusOK bool, errMsg string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	if a.ended {
+		a.mu.Unlock()
+		return
+	}
+	a.ended = true
+	exp := a.exp
+	tc := a.tc
+	name := a.name
+	kind := a.kind
+	start := a.start
+	var attrs map[string]any
+	if len(a.attrs) > 0 {
+		attrs = make(map[string]any, len(a.attrs))
+		for k, v := range a.attrs {
+			attrs[k] = v
+		}
+	}
+	a.mu.Unlock()
+
+	if exp == nil || !tc.Sampled {
+		return
+	}
+	exp.Record(Span{
+		TraceID:      tc.TraceID,
+		SpanID:       tc.SpanID,
+		ParentSpanID: tc.ParentSpanID,
+		Name:         name,
+		Kind:         kind,
+		Start:        start,
+		End:          time.Now(),
+		StatusOK:     statusOK,
+		ErrorMessage: RedactEmbeddedURLs(errMsg),
+		Attributes:   attrs,
+	})
+}
+
 // Span represents one OpenTelemetry trace span ready for OTLP/HTTP JSON export.
 type Span struct {
 	TraceID      string
@@ -182,6 +439,7 @@ type Exporter struct {
 	serviceName    string
 	serviceVersion string
 	client         *http.Client
+	tickInterval   time.Duration
 
 	ch     chan Span
 	stopCh chan struct{}
@@ -200,6 +458,16 @@ func isTruthyEnv(v string) bool {
 // NewExporterFromEnv returns a live `*Exporter` when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured (or when
 // `EDGEFETCH_OTEL_STDOUT=1` / `OTEL_EXPORTER_OTLP_ENDPOINT=stdout` is set for local issue debugging), or `nil` when unset.
 func NewExporterFromEnv(getenv func(string) string, defaultService, version string, transport http.RoundTripper) *Exporter {
+	return newExporterFromEnv(getenv, defaultService, version, transport, os.Stderr, time.Second)
+}
+
+func newExporterFromEnv(
+	getenv func(string) string,
+	defaultService, version string,
+	transport http.RoundTripper,
+	stderrOut io.Writer,
+	tickInterval time.Duration,
+) *Exporter {
 	if getenv == nil {
 		return nil
 	}
@@ -220,7 +488,7 @@ func NewExporterFromEnv(getenv func(string) string, defaultService, version stri
 		svc = "edgefetch-go"
 	}
 	if version == "" {
-		version = "2.6.2"
+		version = "2.6.3"
 	}
 	var client *http.Client
 	if tracesURL != "" {
@@ -231,7 +499,10 @@ func NewExporterFromEnv(getenv func(string) string, defaultService, version stri
 	}
 	var stdoutWriter io.Writer
 	if wantStdout {
-		stdoutWriter = os.Stderr
+		stdoutWriter = stderrOut
+	}
+	if tickInterval <= 0 {
+		tickInterval = time.Second
 	}
 	e := &Exporter{
 		tracesURL:      tracesURL,
@@ -240,6 +511,7 @@ func NewExporterFromEnv(getenv func(string) string, defaultService, version stri
 		serviceName:    svc,
 		serviceVersion: version,
 		client:         client,
+		tickInterval:   tickInterval,
 		ch:             make(chan Span, 256),
 		stopCh:         make(chan struct{}),
 	}
@@ -281,9 +553,24 @@ func (e *Exporter) Shutdown(ctx context.Context) {
 	}
 }
 
+// Close flushes pending spans with a bounded 3-second timeout and stops the exporter (nil-safe).
+func (e *Exporter) Close() error {
+	if e == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	e.Shutdown(ctx)
+	return nil
+}
+
 func (e *Exporter) loop() {
 	defer e.wg.Done()
-	ticker := time.NewTicker(time.Second)
+	interval := e.tickInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	batch := make([]Span, 0, 64)

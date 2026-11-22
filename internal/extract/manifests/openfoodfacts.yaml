@@ -1,0 +1,74 @@
+# Shared Go + TypeScript Declarative Site Adapter: Open Food Facts Products
+id: openfoodfacts
+name: Open Food Facts Products
+category: commerce-social
+description: "Extracts barcode, brand, Nutri-Score, NOVA group, ingredients, and nutrition facts from world.openfoodfacts.org/product/<barcode> (respecting robots.txt on /api)."
+domains:
+  - world.openfoodfacts.org
+  - openfoodfacts.org
+  - "*.openfoodfacts.org"
+exampleUrls:
+  - https://world.openfoodfacts.org/product/3017620422003
+
+# Post-fetch DOM + JSON-LD Product extractor (respecting robots.txt disallow on /api)
+htmlRoutes:
+  - id: openfoodfacts
+    match:
+      exactSegments: false
+      pathSegments:
+        - product
+        - param: barcode
+          charset: digits
+          minLen: 6
+          maxLen: 16
+    mode: dom
+    jsonLdTypes:
+      - Product
+    requireVars:
+      - title
+    vars:
+      title:
+        jsonLdPaths: [name]
+        metaKeys: ["og:title"]
+        cssText: [h1]
+      brand:
+        jsonLdPaths: [brand.name, brand]
+      nutriscore:
+        regexExtract:
+          source: doc_text_and_img_alts
+          pattern: 'Nutri-Score\s*([A-E])\b'
+          group: 1
+          transform: upper
+      nova:
+        regexExtract:
+          source: doc_text_and_img_alts
+          pattern: 'NOVA\s*([1-4])\b'
+          group: 1
+      ingredientsLd:
+        jsonLdPaths: [description]
+      ingredients:
+        cssText: ["#panel_ingredients_content"]
+        fallbackVar: ingredientsLd
+      descShort:
+        fallbackVar: ingredients
+        sliceMax: 260
+    titleTemplate: "{title}"
+    descriptionVar: descShort
+    bullets:
+      - label: Barcode (GTIN)
+        template: "`{barcode}`"
+      - label: Brand
+        template: "{brand}"
+        whenVar: brand
+      - label: Nutri-Score
+        template: "**{nutriscore}**"
+        whenVar: nutriscore
+      - label: NOVA Food Processing Group
+        template: "{nova}"
+        whenVar: nova
+    sections:
+      - heading: "Ingredients & Summary"
+        textVar: ingredients
+    appendCurrentMdDelta:
+      baseVar: ingredients
+      minExtraChars: 120

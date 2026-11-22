@@ -8,6 +8,8 @@ FSL-1.1-MIT
 
 Copyright 2026 Brett Bartrum
 
+Scope note: All site adapters under `hub/src/extractors/` (alongside `internal/extract/manifests/`) are open source under the MIT License (see `hub/src/extractors/LICENSE`). All other files in `hub/` are governed by `FSL-1.1-MIT` below.
+
 ## Terms and Conditions
 
 ### Licensor ("We")

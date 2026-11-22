@@ -149,6 +149,14 @@ export function findTagOpenEndQuoteAware(
   fromIdx: number,
   deadRef?: ScannerDeadState,
 ): number {
+  if (deadRef?.nextGtPos === -1) return -1;
+  if (deadRef && (deadRef.nextGtPos === undefined || deadRef.nextGtPos < fromIdx)) {
+    const gt = src.indexOf('>', fromIdx);
+    deadRef.nextGtPos = gt;
+    if (gt < 0) return -1;
+  } else if (!deadRef && src.indexOf('>', fromIdx) < 0) {
+    return -1;
+  }
   const existingMask = deadRef?.mask;
   if (existingMask && fromIdx < existingMask.length && (existingMask[fromIdx]! & 1) !== 0) {
     return -1;
@@ -405,6 +413,7 @@ export function scanHtmlTagsLinear(
   const deadRef: ScannerDeadState = {};
   let pos = src.indexOf('<');
   while (pos >= 0 && pos < src.length) {
+    if (deadRef.nextGtPos === -1) break;
     const parsed = tryParseTagAt(src, pos, deadRef, allowDeclarations);
     if (!parsed) {
       if (deadRef.mask || deadRef.noCommentCloseFrom !== undefined || deadRef.noCdataCloseFrom !== undefined || deadRef.nextGtPos === -1) {
@@ -775,14 +784,22 @@ export function stripHtmlTagsLinear(
 ): string {
   const capped = rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml;
   let cur = stripStrayNulsPreservingEfSentinels(capped);
+  if (cur.indexOf('<') < 0 || tagNamesLower.length === 0) return cur;
   const targetSet = new Set(tagNamesLower.map((t) => asciiLower(t)));
   const deferSet = replacement === '' ? targetSet : undefined;
+  const initialLower = asciiLower(cur);
+  let changedAny = false;
 
   for (const tag of targetSet) {
-    cur = replaceHtmlTagBlocksLinear(cur, tag, () => replacement, maxChars, deferSet);
+    if (initialLower.indexOf(`<${tag}`) < 0) continue;
+    const next = replaceHtmlTagBlocksLinear(cur, tag, () => replacement, maxChars, deferSet);
+    if (next !== cur) {
+      cur = next;
+      changedAny = true;
+    }
   }
 
-  if (replacement === '' && targetSet.size > 0) {
+  if (changedAny && replacement === '' && targetSet.size > 0) {
     for (let pass = 0; pass < 8; pass++) {
       const prevLen = cur.length;
       const lower = asciiLower(cur);
@@ -820,6 +837,59 @@ export function escapeResidualHtmlTagsOutsideCode(
   const scannedTickTo = new Map<number, number>();
   let nextParaBreak = -2;
 
+  const isCodeSpanBreakingLineAt = (lineStart: number): boolean => {
+    let p = lineStart;
+    while (p < len && (src.charCodeAt(p) === 32 || src.charCodeAt(p) === 9)) p++;
+    if (p >= len || src.charCodeAt(p) === 10 || src.charCodeAt(p) === 13) return true; // blank line
+    const leadSpaces = p - lineStart;
+    const c = src.charCodeAt(p);
+    // Blockquote, ATX heading, code fence (`<= 3` spaces)
+    if (leadSpaces <= 3) {
+      if (c === 62 /* '>' */) return true;
+      if (c === 35 /* '#' */) {
+        let h = p;
+        while (h < len && src.charCodeAt(h) === 35 && h - p < 7) h++;
+        if (h - p <= 6 && (h >= len || src.charCodeAt(h) === 32 || src.charCodeAt(h) === 9 || src.charCodeAt(h) === 10 || src.charCodeAt(h) === 13)) {
+          return true;
+        }
+      }
+      if (c === 96 /* '`' */ || c === 126 /* '~' */) {
+        let f = p + 1;
+        while (f < len && src.charCodeAt(f) === c) f++;
+        if (f - p >= 3) return true;
+      }
+      // Setext underline (`===` / `---`) or thematic break (`***`, `---`, `___`)
+      if (c === 61 /* '=' */ || c === 45 /* '-' */ || c === 42 /* '*' */ || c === 95 /* '_' */) {
+        let q = p;
+        let sameCount = 0;
+        let onlyMarkerAndWs = true;
+        while (q < len && src.charCodeAt(q) !== 10 && src.charCodeAt(q) !== 13) {
+          const qc = src.charCodeAt(q);
+          if (qc === c) sameCount++;
+          else if ((c === 61 || qc !== 32) && qc !== 9) {
+            onlyMarkerAndWs = false;
+            break;
+          }
+          q++;
+        }
+        if (onlyMarkerAndWs && ((c === 61 || c === 45) ? sameCount >= 1 : sameCount >= 3)) {
+          return true;
+        }
+      }
+    }
+    // Unordered (`- `, `* `, `+ `) or ordered (`1. `, `1) `) list item
+    if (c === 45 /* '-' */ || c === 42 /* '*' */ || c === 43 /* '+' */) {
+      if (p + 1 < len && (src.charCodeAt(p + 1) === 32 || src.charCodeAt(p + 1) === 9)) return true;
+    } else if (c >= 48 && c <= 57) {
+      let d = p + 1;
+      while (d < len && d - p < 9 && src.charCodeAt(d) >= 48 && src.charCodeAt(d) <= 57) d++;
+      if (d < len && (src.charCodeAt(d) === 46 /* '.' */ || src.charCodeAt(d) === 41 /* ')' */)) {
+        if (d + 1 < len && (src.charCodeAt(d + 1) === 32 || src.charCodeAt(d + 1) === 9)) return true;
+      }
+    }
+    return false;
+  };
+
   const findParaBreakFrom = (fromIdx: number): number => {
     if (nextParaBreak !== -1 && nextParaBreak < fromIdx) {
       let search = fromIdx;
@@ -827,9 +897,7 @@ export function escapeResidualHtmlTagsOutsideCode(
       while (search < len) {
         const nl = src.indexOf('\n', search);
         if (nl < 0) break;
-        let p = nl + 1;
-        while (p < len && (src.charCodeAt(p) === 32 || src.charCodeAt(p) === 9 || src.charCodeAt(p) === 13)) p++;
-        if (p < len && src.charCodeAt(p) === 10) {
+        if (nl + 1 < len && isCodeSpanBreakingLineAt(nl + 1)) {
           nextParaBreak = nl;
           break;
         }
@@ -872,7 +940,7 @@ export function escapeResidualHtmlTagsOutsideCode(
       while (indent < 3 && i + indent < len && src.charCodeAt(i + indent) === 32) indent++;
       const fPos = i + indent;
       const fCh = fPos < len ? src.charCodeAt(fPos) : 0;
-      if (fCh === 96 /* '`' */ || fCh === 126 /* '~' */) {
+      if ((fCh === 96 /* '`' */ || fCh === 126 /* '~' */) && (fPos >= len || src.charCodeAt(fPos) !== 32)) {
         let fEnd = fPos + 1;
         while (fEnd < len && src.charCodeAt(fEnd) === fCh) fEnd++;
         const fenceLen = fEnd - fPos;
@@ -881,42 +949,53 @@ export function escapeResidualHtmlTagsOutsideCode(
           const infoEnd = lineEnd < 0 ? len : lineEnd;
           // In CommonMark, backtick fence info strings cannot contain backticks
           const validFenceOpen = fCh === 126 || src.slice(fEnd, infoEnd).indexOf('`') < 0;
-          if (validFenceOpen) {
-            if (lineEnd < 0) {
-              i = len;
-              break;
-            }
+          if (validFenceOpen && lineEnd >= 0) {
             let scanLine = lineEnd + 1;
-            let closedEnd = len;
+            let closedEnd = -1;
+            let dedentedAmbiguous = false;
             while (scanLine < len) {
               const nextNl = src.indexOf('\n', scanLine);
               const lEnd = nextNl < 0 ? len : nextNl;
-              let cIndent = 0;
-              while (cIndent < 3 && scanLine + cIndent < lEnd && src.charCodeAt(scanLine + cIndent) === 32) cIndent++;
-              let cPos = scanLine + cIndent;
-              let cTicks = 0;
-              while (cPos < lEnd && src.charCodeAt(cPos) === fCh) {
-                cTicks++;
-                cPos++;
+              let wsCols = 0;
+              let wsPos = scanLine;
+              while (wsPos < lEnd && src.charCodeAt(wsPos) === 32) {
+                wsCols++;
+                wsPos++;
               }
-              if (cTicks >= fenceLen) {
-                while (
-                  cPos < lEnd &&
-                  (src.charCodeAt(cPos) === 32 || src.charCodeAt(cPos) === 9 || src.charCodeAt(cPos) === 13)
-                ) {
+              const isBlankLine = wsPos === lEnd || (wsPos + 1 === lEnd && src.charCodeAt(wsPos) === 13);
+              if (!isBlankLine && indent > 0 && wsCols < indent) {
+                // Indented fence followed by dedented line may close container fence in nested CommonMark contexts; fail closed!
+                dedentedAmbiguous = true;
+                break;
+              }
+              if (wsCols <= 3) {
+                let cPos = scanLine + wsCols;
+                let cTicks = 0;
+                while (cPos < lEnd && src.charCodeAt(cPos) === fCh) {
+                  cTicks++;
                   cPos++;
                 }
-                if (cPos === lEnd) {
-                  closedEnd = nextNl < 0 ? len : nextNl + 1;
-                  break;
+                if (cTicks >= fenceLen) {
+                  while (
+                    cPos < lEnd &&
+                    (src.charCodeAt(cPos) === 32 || src.charCodeAt(cPos) === 9 || src.charCodeAt(cPos) === 13)
+                  ) {
+                    cPos++;
+                  }
+                  if (cPos === lEnd) {
+                    closedEnd = nextNl < 0 ? len : nextNl + 1;
+                    break;
+                  }
                 }
               }
               if (nextNl < 0) break;
               scanLine = nextNl + 1;
             }
-            i = closedEnd;
-            atLineStart = true;
-            continue;
+            if (!dedentedAmbiguous && closedEnd >= 0) {
+              i = closedEnd;
+              atLineStart = true;
+              continue;
+            }
           }
         }
       }
@@ -1082,6 +1161,264 @@ const MAX_LINEAR_REGEX_LEN = 512;
 const MAX_LINEAR_REGEX_SUBJECT_LEN = 32_768;
 const MAX_USER_REGEX_LEN = 256;
 const MAX_USER_REGEX_SUBJECT_LEN = 2048;
+const MAX_RE2_LRU_ENTRIES = 512;
+
+const JS_SPACE_RE2_RANGES =
+  '\\t\\n\\v\\f\\r \\x{00a0}\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}\\x{feff}';
+const JS_NOT_SPACE_RE2_RANGES =
+  '\\x00-\\x08\\x0e-\\x1f\\x21-\\x{009f}\\x{00a1}-\\x{167f}\\x{1681}-\\x{1fff}\\x{200b}-\\x{2027}\\x{202a}-\\x{202e}\\x{2030}-\\x{205e}\\x{2060}-\\x{2fff}\\x{3001}-\\x{fefe}\\x{ff00}-\\x{10ffff}';
+
+const re2InstanceLru = new Map<string, ReturnType<typeof RE2JS.compile> | null>();
+const linearRegexLru = new Map<string, RegExp | null>();
+const safeUserRegexLru = new Map<string, RegExp | null>();
+const safeUnionMatcherLru = new Map<string, ((subject: string) => boolean) | null>();
+
+function lruGet<V>(map: Map<string, V>, key: string): { hit: true; value: V } | { hit: false } {
+  if (!map.has(key)) return { hit: false };
+  const val = map.get(key) as V;
+  map.delete(key);
+  map.set(key, val);
+  return { hit: true, value: val };
+}
+
+function lruSet<V>(map: Map<string, V>, key: string, value: V, maxEntries = MAX_RE2_LRU_ENTRIES): void {
+  if (map.has(key)) map.delete(key);
+  else if (map.size >= maxEntries) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
+function translateJsPatternForRe2(effectivePattern: string, seenFlags: ReadonlySet<string>): string | null {
+  const dotAll = seenFlags.has('s');
+  const unicodeMode = seenFlags.has('u');
+  const base = RE2JS.translateRegExp(effectivePattern).replace(/\\0(?![0-7])/g, '\\x00');
+  let out = '';
+  let inClass = false;
+  let classStart = -1;
+  let i = 0;
+  const len = base.length;
+
+  while (i < len) {
+    const c = base[i]!;
+    if (c === '\\') {
+      if (i + 1 >= len) return null;
+      const next = base[i + 1]!;
+      if (next === 's') {
+        out += inClass ? JS_SPACE_RE2_RANGES : `[${JS_SPACE_RE2_RANGES}]`;
+        i += 2;
+        continue;
+      }
+      if (next === 'S') {
+        out += inClass ? JS_NOT_SPACE_RE2_RANGES : `[^${JS_SPACE_RE2_RANGES}]`;
+        i += 2;
+        continue;
+      }
+      if (next === 'A' || next === 'z' || next === 'Q' || next === 'E') {
+        if (unicodeMode) return null;
+        out += next;
+        i += 2;
+        continue;
+      }
+      if ((next === 'x' || next === 'p' || next === 'P') && base[i + 2] === '{') {
+        const closeBrace = base.indexOf('}', i + 3);
+        if (closeBrace > i + 2) {
+          out += base.slice(i, closeBrace + 1);
+          i = closeBrace + 1;
+          continue;
+        }
+      }
+      out += base.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+
+    if (!inClass) {
+      if (c === '[') {
+        inClass = true;
+        classStart = i;
+        out += '[';
+        i++;
+        continue;
+      }
+      if (c === '.' && !dotAll) {
+        out += '[^\\r\\n\\x{2028}\\x{2029}]';
+        i++;
+        continue;
+      }
+      out += c;
+      i++;
+      continue;
+    }
+
+    const isInitialCloseBracket =
+      i === classStart + 1 || (i === classStart + 2 && base[classStart + 1] === '^');
+    if (c === ']' && !isInitialCloseBracket) {
+      inClass = false;
+      classStart = -1;
+      out += ']';
+      i++;
+      continue;
+    }
+    if (c === '[' && base[i + 1] === ':') {
+      out += '[\\:';
+      i += 2;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+
+  return inClass ? null : out;
+}
+
+function extractMandatoryLiteralHint(effectivePattern: string, ignoreCase: boolean): string {
+  // Sound fast-path prefilter: extract longest unquantified top-level literal run when there is NO top-level `|` alternation.
+  let parenDepth = 0;
+  let inClass = false;
+  let classStart = -1;
+  let best = '';
+  let cur = '';
+
+  const commitCur = () => {
+    if (cur.length >= 2 && cur.length > best.length) {
+      if (!ignoreCase || !/[A-Za-z]/.test(cur)) {
+        best = cur;
+      }
+    }
+    cur = '';
+  };
+
+  const isFollowedByQuantifier = (afterIdx: number): boolean => {
+    if (afterIdx >= effectivePattern.length) return false;
+    const qc = effectivePattern[afterIdx]!;
+    if (qc === '*' || qc === '?' || qc === '+') return true;
+    if (qc === '{' && /^\{\d+(?:,\d*)?\}/.test(effectivePattern.slice(afterIdx))) return true;
+    return false;
+  };
+
+  for (let i = 0; i < effectivePattern.length; i++) {
+    const c = effectivePattern[i]!;
+    if (inClass) {
+      if (c === '\\') {
+        i++;
+        continue;
+      }
+      const initial = i === classStart + 1 || (i === classStart + 2 && effectivePattern[classStart + 1] === '^');
+      if (c === ']' && !initial) {
+        inClass = false;
+      }
+      continue;
+    }
+    if (c === '[') {
+      commitCur();
+      inClass = true;
+      classStart = i;
+      continue;
+    }
+    if (c === '(') {
+      commitCur();
+      parenDepth++;
+      continue;
+    }
+    if (c === ')') {
+      commitCur();
+      if (parenDepth > 0) parenDepth--;
+      continue;
+    }
+    if (parenDepth > 0) continue;
+    if (c === '|') return ''; // top-level alternation -> no mandatory global literal
+
+    if (c === '\\') {
+      if (i + 1 >= effectivePattern.length) break;
+      const esc = effectivePattern[i + 1]!;
+      i++;
+      if ('/.:=-_~@#%'.includes(esc) && !isFollowedByQuantifier(i + 1)) {
+        cur += esc;
+      } else {
+        commitCur();
+      }
+      continue;
+    }
+
+    if ('^$.*+?{}[]()\\'.includes(c)) {
+      commitCur();
+      continue;
+    }
+
+    const code = c.charCodeAt(0);
+    if (code >= 32 && code < 127 && !isFollowedByQuantifier(i + 1)) {
+      if (!ignoreCase || (code < 65 || (code > 90 && code < 97) || code > 122)) {
+        cur += c;
+      } else {
+        commitCur();
+      }
+    } else {
+      commitCur();
+    }
+  }
+  commitCur();
+  return best;
+}
+
+function hasExcessiveBoundedRepetition(pattern: string, maxExpandedUnits = 256): boolean {
+  let inClass = false;
+  let classStart = -1;
+  const groupCostStack: number[] = [0];
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i]!;
+    if (c === '\\') {
+      i++;
+      continue;
+    }
+    if (inClass) {
+      const initial = i === classStart + 1 || (i === classStart + 2 && pattern[classStart + 1] === '^');
+      if (c === ']' && !initial) inClass = false;
+      continue;
+    }
+    if (c === '[') {
+      inClass = true;
+      classStart = i;
+      groupCostStack[groupCostStack.length - 1]! += 1;
+      continue;
+    }
+    if (c === '(') {
+      groupCostStack.push(0);
+      continue;
+    }
+    if (c === ')') {
+      const innerCost = Math.max(1, groupCostStack.length > 1 ? groupCostStack.pop()! : 1);
+      const bm = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(i + 1));
+      if (bm) {
+        const minN = Number(bm[1]);
+        const maxN = bm[2] === undefined ? minN : bm[2] === '' ? minN : Number(bm[2]);
+        if (minN > 64 || maxN > 64) return true;
+        const prod = innerCost * Math.max(1, maxN);
+        if (prod > maxExpandedUnits) return true;
+        groupCostStack[groupCostStack.length - 1]! += prod;
+        i += bm[0].length;
+      } else {
+        groupCostStack[groupCostStack.length - 1]! += innerCost;
+      }
+      if (groupCostStack[groupCostStack.length - 1]! > maxExpandedUnits) return true;
+      continue;
+    }
+    if (c === '{') {
+      const bm = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(i));
+      if (bm) {
+        const minN = Number(bm[1]);
+        const maxN = bm[2] === undefined ? minN : bm[2] === '' ? minN : Number(bm[2]);
+        if (minN > 64 || maxN > 64) return true;
+        groupCostStack[groupCostStack.length - 1]! += Math.max(1, maxN);
+        if (groupCostStack[groupCostStack.length - 1]! > maxExpandedUnits) return true;
+        i += bm[0].length - 1;
+        continue;
+      }
+    }
+  }
+  return false;
+}
 
 function buildRe2RegExp(
   rawSource: string,
@@ -1091,19 +1428,38 @@ function buildRe2RegExp(
 ): RegExp | null {
   if (seenFlags.has('y')) return null;
   let re2Flags = 0;
-  if (seenFlags.has('i')) re2Flags |= RE2JS.CASE_INSENSITIVE;
+  const ignoreCase = seenFlags.has('i');
+  if (ignoreCase) re2Flags |= RE2JS.CASE_INSENSITIVE;
   if (seenFlags.has('m')) re2Flags |= RE2JS.MULTILINE;
   if (seenFlags.has('s')) re2Flags |= RE2JS.DOTALL;
 
+  const canonicalFlags = ['d', 'g', 'i', 'm', 's', 'u', 'y'].filter((f) => seenFlags.has(f)).join('');
+  const re2CacheKey = `${effectivePattern}\u0000${canonicalFlags}\u0000${maxSubjectLen}`;
+
   try {
-    const translated = RE2JS.translateRegExp(effectivePattern).replace(/\\0(?![0-7])/g, '\\x00');
-    const compiled = RE2JS.compile(translated, re2Flags);
-    const canonicalFlags = ['d', 'g', 'i', 'm', 's', 'u', 'y'].filter((f) => seenFlags.has(f)).join('');
+    let compiled: ReturnType<typeof RE2JS.compile> | null;
+    const cachedRe2 = lruGet(re2InstanceLru, re2CacheKey);
+    if (cachedRe2.hit) {
+      compiled = cachedRe2.value;
+    } else {
+      const translated = translateJsPatternForRe2(effectivePattern, seenFlags);
+      if (translated === null) {
+        lruSet(re2InstanceLru, re2CacheKey, null);
+        return null;
+      }
+      compiled = RE2JS.compile(translated, re2Flags);
+      lruSet(re2InstanceLru, re2CacheKey, compiled);
+    }
+    if (!compiled) return null;
+    const literalHint = extractMandatoryLiteralHint(effectivePattern, ignoreCase);
+    let lastSubj = '\u0000__UNSET__';
+    let lastRes = false;
+
     const regExpLike = {
       source: rawSource,
       flags: canonicalFlags,
       global: seenFlags.has('g'),
-      ignoreCase: seenFlags.has('i'),
+      ignoreCase,
       multiline: seenFlags.has('m'),
       dotAll: seenFlags.has('s'),
       unicode: seenFlags.has('u'),
@@ -1112,10 +1468,20 @@ function buildRe2RegExp(
       lastIndex: 0,
       test(subject: string): boolean {
         if (typeof subject !== 'string' || subject.length > maxSubjectLen) return false;
-        return compiled.matcher(subject).find();
+        if (subject === lastSubj) return lastRes;
+        if (literalHint && subject.indexOf(literalHint) < 0) {
+          lastSubj = subject;
+          lastRes = false;
+          return false;
+        }
+        const ok = compiled.test(subject);
+        lastSubj = subject;
+        lastRes = ok;
+        return ok;
       },
       exec(subject: string): RegExpExecArray | null {
         if (typeof subject !== 'string' || subject.length > maxSubjectLen) return null;
+        if (literalHint && subject.indexOf(literalHint) < 0) return null;
         return compiled.exec(subject) as RegExpExecArray | null;
       },
       toString(): string {
@@ -1129,29 +1495,103 @@ function buildRe2RegExp(
 }
 
 /**
- * Compiles a regular expression up to `512` chars using Google's Thompson NFA `RE2JS` engine (`O(N)` worst-case time,
- * `subject.length <= 32_768`, never invoking V8's backtracking `RegExp`).
+ * Compiles a regular expression up to `512` chars using Google's `RE2JS` DFA/NFA engine (`O(N)` worst-case time,
+ * `subject.length <= 32_768`, LRU-cached across calls, never invoking V8's backtracking `RegExp`).
  */
 export function compileLinearRegex(pattern: string, flags = ''): RegExp | null {
   if (typeof pattern !== 'string' || !pattern || pattern.length > MAX_LINEAR_REGEX_LEN) return null;
   if (typeof flags !== 'string' || flags.length > 8) return null;
-  if (/\\[1-9]|\\k<|\(\?<[=!]/i.test(pattern)) return null;
+
+  const cacheKey = `${pattern}\u0000${flags}`;
+  const cached = lruGet(linearRegexLru, cacheKey);
+  if (cached.hit) return cached.value;
+
+  if (/\\[1-9]|\\k<|\(\?<[=!]/i.test(pattern) || hasExcessiveBoundedRepetition(pattern, 256)) {
+    lruSet(linearRegexLru, cacheKey, null);
+    return null;
+  }
 
   let effectivePattern = pattern;
   let effectiveFlags = flags;
   if (effectivePattern.startsWith('(?i)')) {
     effectivePattern = effectivePattern.slice(4);
-    if (!effectivePattern) return null;
+    if (!effectivePattern) {
+      lruSet(linearRegexLru, cacheKey, null);
+      return null;
+    }
     if (!effectiveFlags.includes('i')) effectiveFlags += 'i';
   }
 
   const seenFlags = new Set<string>();
   for (const f of effectiveFlags) {
-    if (!'dgimsuy'.includes(f) || seenFlags.has(f)) return null;
+    if (!'dgimsuy'.includes(f) || seenFlags.has(f)) {
+      lruSet(linearRegexLru, cacheKey, null);
+      return null;
+    }
     seenFlags.add(f);
   }
 
-  return buildRe2RegExp(pattern, effectivePattern, seenFlags, MAX_LINEAR_REGEX_SUBJECT_LEN);
+  const built = buildRe2RegExp(pattern, effectivePattern, seenFlags, MAX_LINEAR_REGEX_SUBJECT_LEN);
+  lruSet(linearRegexLru, cacheKey, built);
+  return built;
+}
+
+/**
+ * Compiles an array of already-validated safe crawl regex patterns into a single `RE2JS` union DFA
+ * so `includePaths` / `excludePaths` evaluate 20+ patterns per URL in a single `O(N)` DFA pass (`M10`).
+ */
+export function compileSafeUserRegexUnion(
+  patterns: readonly string[],
+  maxSubjectLen = MAX_USER_REGEX_SUBJECT_LEN,
+): ((subject: string) => boolean) | null {
+  if (patterns.length === 0) return () => false;
+  if (patterns.length === 1) {
+    const single = compileSafeUserRegex(patterns[0]!);
+    if (!single) return null;
+    return (subject: string) => single.test(subject);
+  }
+  const cacheKey = `${maxSubjectLen}\u0000${patterns.join('\u0000')}`;
+  const cached = lruGet(safeUnionMatcherLru, cacheKey);
+  if (cached.hit) return cached.value;
+
+  const branches: string[] = [];
+  for (const raw of patterns) {
+    if (!compileSafeUserRegex(raw)) {
+      lruSet(safeUnionMatcherLru, cacheKey, null, 128);
+      return null;
+    }
+    let eff = raw;
+    const seen = new Set<string>();
+    if (eff.startsWith('(?i)')) {
+      eff = eff.slice(4);
+      seen.add('i');
+    }
+    const translated = translateJsPatternForRe2(eff, seen);
+    if (translated === null) {
+      lruSet(safeUnionMatcherLru, cacheKey, null, 128);
+      return null;
+    }
+    branches.push(seen.has('i') ? `(?i:${translated})` : `(?:${translated})`);
+  }
+
+  try {
+    const unionRe2 = RE2JS.compile(`(?:${branches.join('|')})`, 0);
+    const matcherFn = (subject: string): boolean => {
+      if (typeof subject !== 'string' || subject.length > maxSubjectLen) return false;
+      return unionRe2.test(subject);
+    };
+    lruSet(safeUnionMatcherLru, cacheKey, matcherFn, 128);
+    return matcherFn;
+  } catch {
+    const fallbackRefs = patterns.map((p) => compileSafeUserRegex(p)).filter((r): r is RegExp => r !== null);
+    if (fallbackRefs.length !== patterns.length) {
+      lruSet(safeUnionMatcherLru, cacheKey, null, 128);
+      return null;
+    }
+    const fallbackFn = (subject: string): boolean => fallbackRefs.some((r) => r.test(subject));
+    lruSet(safeUnionMatcherLru, cacheKey, fallbackFn, 128);
+    return fallbackFn;
+  }
 }
 
 // Validates and compiles a caller-supplied regular expression (`M4`, `M5`, `R3-H3`) via structural AST precheck +
@@ -1163,6 +1603,17 @@ export function compileLinearRegex(pattern: string, flags = ''): RegExp | null {
 //  - Bounded-quantifier & alternation towers (`a{0,32}` x 3+, `a*a?a?a?`, `(aa){1,32}` x 5, lookahead towers) via `branchProduct > 64`
 //  - Overlapping multi-wildcard polynomial patterns (`a*a*b`, `.*.*.*`, `\d+\d+\d+$`, `.*.{0,32}{4}X`).
 export function compileSafeUserRegex(pattern: string, flags = ''): RegExp | null {
+  if (typeof pattern !== 'string' || !pattern || pattern.length > MAX_USER_REGEX_LEN) return null;
+  if (typeof flags !== 'string' || flags.length > 8) return null;
+  const cacheKey = `${pattern}\u0000${flags}`;
+  const cached = lruGet(safeUserRegexLru, cacheKey);
+  if (cached.hit) return cached.value;
+  const built = compileSafeUserRegexUncached(pattern, flags);
+  lruSet(safeUserRegexLru, cacheKey, built);
+  return built;
+}
+
+function compileSafeUserRegexUncached(pattern: string, flags = ''): RegExp | null {
   if (typeof pattern !== 'string' || !pattern || pattern.length > MAX_USER_REGEX_LEN) return null;
   if (typeof flags !== 'string' || flags.length > 8) return null;
 

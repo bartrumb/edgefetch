@@ -3,9 +3,10 @@
 [![CI](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml/badge.svg)](https://github.com/bartrumb/edgefetch/actions/workflows/ci.yml)
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go)](go.mod)
 [![Go Reference](https://pkg.go.dev/badge/github.com/bartrumb/edgefetch/v2.svg)](https://pkg.go.dev/github.com/bartrumb/edgefetch/v2)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Worker, SDKs & Adapters: MIT](https://img.shields.io/badge/Worker%2C%20SDKs%20%26%20Adapters-MIT-blue.svg)](LICENSE)
+[![Hub: FSL-1.1-MIT](https://img.shields.io/badge/Hub-FSL--1.1--MIT%20(Fair%20Source)-0ea5e9.svg)](hub/LICENSE)
 
-**EdgeFetch** is a self-hosted, MIT-licensed web scraping and search server for AI agents. You run one ~8 MB Go binary on any box you own (a Raspberry Pi, your Home Assistant, a spare laptop), and your agents get clean Markdown and structured data through MCP — with **zero open ports**, **zero Redis or Postgres**, and **no per-page bill**.
+**EdgeFetch** is a self-hosted web scraping and search server for AI agents — **open-source worker, SDKs, and adapters ([MIT](LICENSE))** with a **fair-source hub ([FSL-1.1](hub/LICENSE), MIT after two years)**. You run one ~8 MB Go binary on any box you own (a Raspberry Pi, your Home Assistant, a spare laptop), and your agents get clean Markdown and structured data through MCP — with **zero open ports**, **zero Redis or Postgres**, and **no per-page bill**.
 
 > Built for the agent web: user-triggered, never trains, signs its requests with Web Bot Auth, asks for Markdown first, honours `robots.txt` and Content Signals, and treats `402` as a price, not an error.
 
@@ -56,10 +57,10 @@ edgefetch init && edgefetch doctor
 - **Polite by design — with actionable `blocked.suggestion` rerouting:** `robots.txt` and `Content-Signal: ai-input` are enforced on every hop (including `30x` redirects), `Retry-After` is honored per host, HTTP `402` (`x402`) halts immediately as `payment_required` without auto-paying, anti-bot challenges (Cloudflare, Akamai, DataDome, PerimeterX, AWS WAF, Imperva) halt on the first attempt, and IETF RFC 9421 Web Bot Auth (`Ed25519` HTTP Message Signatures) is built in. When a path is blocked by `robots.txt` or a WAF, EdgeFetch returns a structured **`blocked.suggestion`** steering your agent to official public JSON boards, registries, or APIs (e.g., Greenhouse/Ashby/Workday CXS instead of LinkedIn, or Overpass/Nominatim instead of OSM `/api/`).
 - **Clean Two-Plane Architecture (Pure Go Edge Engine & Hub + Serverless V8 Hub):**
   - **Go Data Plane & Standalone Hub (`cmd/`, `internal/` — 1 external Go module `coder/websocket`, `0` transitive deps, `~8 MB` static binary):** Runs 100% standalone with **zero TypeScript/Node** (`edgefetch scrape`, `edgefetch mcp` over `stdio`, or `edgefetch --mode=hub` with embedded declarative site adapters!) *or* as an outbound worker daemon, handling every untrusted socket, dial-time SSRF check, 100% RFC 9309 `robots.txt` check, streaming PDF parse, and CDP Chromium session.
-  - **Cloudflare / Portable Hub Plane (`hub/` — 3 vetted runtime packages: `re2js`, `htmlparser2`, `ws`):** Optional full-featured fleet coordinator running natively on Cloudflare Hibernating WebSocket Durable Objects + D1 FTS5 + R2 (`$0` idle) or self-hosted `node:sqlite` (`dist/portable-server.mjs`, `0` runtime `node_modules` in containers). Combines Google RE2 linear-time Thompson NFA regex safety (`re2js`), WHATWG HTML5 CSS-selector extraction (`parseHtmlDoc` via `htmlparser2`), RFC 6455 WebSocket framing (`ws`), shared Go+TS declarative JSON manifests (`internal/extract/manifests/*.json`), and 50+ hot-deployable site/ATS/commerce adapters.
+  - **Cloudflare / Portable Fair-Source Hub Plane (`hub/` — vetted runtime packages: `re2js`, `htmlparser2`, `ws`, `yaml`):** Optional full-featured fleet coordinator running natively on Cloudflare Hibernating WebSocket Durable Objects + D1 FTS5 + R2 (`$0` idle) or self-hosted `node:sqlite` (`dist/portable-server.mjs`, `0` runtime `node_modules` in containers). Combines Google RE2 linear-time Thompson NFA regex safety (`re2js`), WHATWG HTML5 CSS-selector extraction (`parseHtmlDoc` via `htmlparser2`), RFC 6455 WebSocket framing (`ws`), shared Go+TS declarative YAML manifests (`internal/extract/manifests/*.yaml`), and 56+ MIT-licensed hot-deployable site/ATS/commerce adapters (`hub/src/extractors/`).
 - **50+ keyless site, commerce, open-data & ATS adapters + Store `catalog` + Autonomous BYO-LLM `/v1/agent`:** 15 MCP tools (`agent`, `find_extractors`, `scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `catalog`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`), drop-in Firecrawl `/v2/*` compatibility, linear `64 KiB` framework detection, polite full-store **Shopify** (custom domains + `/products.json`) & **WooCommerce** inventory catalogs with variant diffs, and Claude-style dynamic adapter routing across **Workable**, **Greenhouse (US/EU)**, **Ashby**, **Lever (US/EU)**, **Workday CXS**, **iCIMS**, **Rippling**, **Gem**, **Pinpoint**, **Teamtailor**, **BambooHR**, **Oracle HCM**, **SmartRecruiters**, **SEC EDGAR**, **Y Combinator**, **Socrata / CKAN / ArcGIS / Legistar Open Data**, **DOI/Crossref**, **OpenAlex**, **arXiv**, **ClinicalTrials.gov**, **PubMed**, **NIST NVD**, **GitHub**, **Stack Overflow**, **npm**, **crates.io**, **Hugging Face**, **OpenRouter**, and **256 MiB streaming PDFs** — supporting offline local LLMs (**Ollama**, **LM Studio**, **vLLM**) or online BYO-LLM (**OpenAI**, **Anthropic**, **Gemini**, **OpenRouter**, **Workers AI**) with live SSE streaming and `$0` Zero Data Retention. Add a new adapter in one file via `npm run adapter:new` (**[docs/ADAPTERS.md](docs/ADAPTERS.md)**).
 
-> **Project status:** Young personal open-source project (started November 2026), running daily as the sole web/search layer on the author's 3-node fleet (Home Assistant OS `x86_64`, Windows VM, and `arm64`). MIT licensed; issues and PRs are **triaged weekly**. See **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)** for honest trade-offs.
+> **Project status:** Young personal project (started November 2026), running daily as the sole web/search layer on the author's 3-node fleet (Home Assistant OS `x86_64`, Windows VM, and `arm64`). Open-source worker, SDKs, and adapters ([MIT](LICENSE)); fair-source hub ([FSL-1.1-MIT](hub/LICENSE), MIT after two years). Issues and PRs are **triaged weekly**. See **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)** for honest trade-offs.
 
 ---
 
@@ -69,7 +70,7 @@ Full architectural & trade-off breakdown: **[docs/COMPARISON.md](docs/COMPARISON
 
 | Dimension | **EdgeFetch (`v2.6`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
 |---|---|---|---|---|---|
-| **License** | **MIT** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 |
+| **License** | **Open-source worker, SDKs & adapters (`MIT`); fair-source hub (`FSL-1.1`, `MIT` after 2 yrs)** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 |
 | **Minimum Self-Hosted Stack** | **1 `~8 MB` Go binary** *or* **1 container** (`node:sqlite` + `/data`, **0 Redis, 0 Postgres**) | Docker Compose + **Redis + PostgreSQL + RabbitMQ + Playwright** (`2–4 GB+` RAM) | Cloud API key | Python 3.10+ + Playwright (`600 MB–1.5 GB` RAM) | Node.js + Puppeteer |
 | **Worker Supply Chain** | **1 Go module (`coder/websocket`, 0 transitive deps)** | Dozens of npm + OS deps | Vendor SaaS | 40+ PyPI packages | Dozens of npm deps |
 | **Zero-Port Outbound Home/Edge Fleet (`WSS`)** | **Yes — Home Assistant OS, NAS, RPi, Mac/PC behind CGNAT/Starlink** | No (needs open ports, VPN, or paid residential proxies) | Paid proxy credits | No (single-host or DIY queue) | No |
@@ -225,9 +226,12 @@ Run `go test -bench=. -benchmem ./...` locally:
 - **Bot, WAF & MCP Registry Certification Guide:** **[docs/REGISTRATION.md](docs/REGISTRATION.md)**
 - **Contributing Rules & Code of Conduct:** **[CONTRIBUTING.md](CONTRIBUTING.md)** · **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)**
 
-## License
+## License & Trademarks
 
-EdgeFetch uses a clean two-boundary license model inside a single repository:
+EdgeFetch uses an **open-source worker, SDKs, and adapters / fair-source hub** license split:
 
-- **Go Edge Worker, CLI, Local `stdio` MCP, SDKs & Declarative YAML Site Adapters (`cmd/`, `internal/`, `sdk/`, `extensions/`):** **[MIT](LICENSE)** — permissive open source.
-- **TypeScript Multi-Node Coordinator, `/admin` Control Plane & Multi-User Hub (`hub/`):** **[FSL-1.1-MIT](hub/LICENSE)** (Functional Source License 1.1 with 2-year MIT conversion) — free to read, modify, and self-host personally or internally within your organization; third parties may not offer `hub/` as a competing commercial hosted/managed SaaS.
+- **Open-Source Worker, CLI, SDKs & All Site Adapters (`cmd/`, `internal/`, `sdk/`, `extensions/`, `internal/extract/manifests/`, `hub/src/extractors/`):** **[MIT](LICENSE)** (and [`hub/src/extractors/LICENSE`](hub/src/extractors/LICENSE)).
+- **Fair-Source Hub (`hub/`, excluding `hub/src/extractors/`):** **[FSL-1.1-MIT](hub/LICENSE)** (*Functional Source License 1.1, MIT after two years*) — free to read, modify, and self-host personally or internally within your organization; third parties may not offer the Hub as a competing commercial hosted/managed service, and each release converts to `MIT` two years after publication.
+- **Contributions:** Inbound = `MIT` + DCO sign-off (`git commit -s`), per **[CONTRIBUTING.md](CONTRIBUTING.md)**.
+
+**Trademarks:** **EdgeFetch™** and the EdgeFetch raven logo are trademarks of Brett Bartrum. Neither the MIT License nor the Functional Source License grants permission to use the EdgeFetch name, `edgefetch.dev` domain, or project logos to brand, endorse, or market a third-party product or hosted service.

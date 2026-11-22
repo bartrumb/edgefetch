@@ -21,7 +21,20 @@ import { TursoHttpD1Database } from './turso-d1';
 
 export const MAX_INFLIGHT_PER_IP = 16;
 export const MAX_INFLIGHT_TOTAL = 128;
+export const MAX_CONNECTIONS_PER_IP = 32;
+export const MAX_CONNECTIONS_TOTAL = 512;
+export const LOOPBACK_RESERVED_CONNECTIONS = 32;
+export const PRE_HEADER_TIMEOUT_MS = 10_000;
+export const MAX_AGENT_WS_CONNECTIONS = 128;
+export const MAX_AGENT_WS_PER_SITE = 16;
 const MAX_BODY_STREAM_IDLE_OR_TOTAL_MS = 15_000;
+
+const DEFAULT_SECURITY_HEADERS: ReadonlyArray<readonly [string, string]> = [
+  ['x-content-type-options', 'nosniff'],
+  ['x-frame-options', 'DENY'],
+  ['referrer-policy', 'no-referrer'],
+  ['content-security-policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"],
+];
 
 export interface PortableHubOptions {
   port?: number;
@@ -32,11 +45,14 @@ export interface PortableHubOptions {
   dnsResolver?: LookupResolverFn;
   maxInflightPerIp?: number;
   maxInflightTotal?: number;
+  maxConnectionsPerIp?: number;
+  maxConnectionsTotal?: number;
+  headersTimeoutMs?: number;
 }
 
 function isTruthyFlag(val: string | undefined): boolean {
   const clean = (val ?? '').trim().toLowerCase();
-  return clean === '1' || clean === 'true' || clean === 'yes' || clean === 'on';
+  return clean === '1' || clean === 'true' || clean === 'yes' || clean === 'on' || clean === 'fly';
 }
 
 function stripIpPortAndBrackets(addr: string | undefined): string {
@@ -65,8 +81,24 @@ function normalizeSocketIp(addr: string | undefined): string {
 
 const MAX_PORTABLE_REQ_BODY_BYTES = 20 * 1024 * 1024; // 20 MiB hard streaming ceiling on inbound Node HTTP bodies (`M8`)
 
-function resolveTrustedClientIp(req: IncomingMessage, trustProxy: boolean): string {
+export function resolveTrustedClientIp(
+  req: IncomingMessage,
+  trustProxy: boolean,
+  trustFlyClientIp = false,
+): string {
   if (trustProxy) {
+    // On Fly.io edge proxy (`fly.toml`), Fly Proxy overwrites `Fly-Client-IP` with the authoritative client IP
+    // (while appending Fly's own edge IP to `X-Forwarded-For`). Only trust `Fly-Client-IP` when Fly proxy mode is active.
+    if (trustFlyClientIp) {
+      const rawFlyIp = req.headers['fly-client-ip'];
+      const flyStr = Array.isArray(rawFlyIp) ? rawFlyIp[rawFlyIp.length - 1] : rawFlyIp;
+      if (typeof flyStr === 'string' && !flyStr.includes(',')) {
+        const flyCand = stripIpPortAndBrackets(flyStr);
+        if (flyCand && net.isIP(flyCand) !== 0) {
+          return flyCand;
+        }
+      }
+    }
     // M8 & R3-M4: Extract the RIGHTMOST comma-separated IP appended by the trusted reverse proxy, stripping `:port`
     // and falling back to socket IP if the rightmost token is malformed garbage (`X-Forwarded-For: 1.2.3.4, zz0`).
     const rawXff = req.headers['x-forwarded-for'];
@@ -298,6 +330,7 @@ function incomingToWebRequest(
   canonicalOrigin: string,
   trustProxy: boolean,
   hasExplicitPublicOrigin = false,
+  trustFlyClientIp = false,
 ): Request {
   const { origin, trustedForwardedHost } = resolvePublicOrigin({
     canonicalOrigin,
@@ -317,8 +350,16 @@ function incomingToWebRequest(
   const headers = new Headers();
   for (const [k, v] of Object.entries(req.headers)) {
     const lower = k.toLowerCase();
-    // H4: Never trust client-supplied `cf-connecting-ip`, and strip `x-forwarded-*` unless `EDGEFETCH_TRUST_PROXY=1`.
-    if (lower === 'cf-connecting-ip') continue;
+    // H4: Never trust client-supplied `cf-connecting-ip` / `x-real-ip` / `fly-client-ip` / `true-client-ip`,
+    // and strip `x-forwarded-*` unless `EDGEFETCH_TRUST_PROXY=1`.
+    if (
+      lower === 'cf-connecting-ip' ||
+      lower === 'x-real-ip' ||
+      lower === 'fly-client-ip' ||
+      lower === 'true-client-ip'
+    ) {
+      continue;
+    }
     if (!trustProxy && lower.startsWith('x-forwarded-')) continue;
     if (lower === 'x-forwarded-host' && trustedForwardedHost === null) continue;
     if (Array.isArray(v)) {
@@ -327,7 +368,9 @@ function incomingToWebRequest(
       headers.set(k, v);
     }
   }
-  headers.set('cf-connecting-ip', resolveTrustedClientIp(req, trustProxy));
+  const resolvedIp = resolveTrustedClientIp(req, trustProxy, trustFlyClientIp);
+  headers.set('cf-connecting-ip', resolvedIp);
+  headers.set('x-real-ip', resolvedIp);
 
   const method = (req.method ?? 'GET').toUpperCase();
   const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
@@ -345,6 +388,11 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
 
   const mergedEnv = { ...process.env, ...(opts.envOverrides ?? {}) };
   const trustProxy = isTruthyFlag(mergedEnv.EDGEFETCH_TRUST_PROXY);
+  const trustFlyClientIp =
+    trustProxy &&
+    ((mergedEnv.EDGEFETCH_TRUST_PROXY ?? '').trim().toLowerCase() === 'fly' ||
+      isTruthyFlag(mergedEnv.EDGEFETCH_TRUST_FLY_CLIENT_IP) ||
+      Boolean(mergedEnv.FLY_APP_NAME || mergedEnv.FLY_ALLOC_ID || mergedEnv.FLY_REGION));
   const tursoUrl = mergedEnv.TURSO_DATABASE_URL;
   const tursoToken = mergedEnv.TURSO_AUTH_TOKEN;
 
@@ -440,6 +488,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     OPENROUTER_API_KEY: mergedEnv.OPENROUTER_API_KEY,
     ANTHROPIC_API_KEY: mergedEnv.ANTHROPIC_API_KEY,
     GEMINI_API_KEY: mergedEnv.GEMINI_API_KEY,
+    EDGEFETCH_PUBLIC_ORIGIN: mergedEnv.EDGEFETCH_PUBLIC_ORIGIN,
   };
 
   let boundPort = port;
@@ -474,33 +523,102 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     typeof opts.maxInflightTotal === 'number' && opts.maxInflightTotal > 0
       ? Math.floor(opts.maxInflightTotal)
       : MAX_INFLIGHT_TOTAL;
+  const envMaxConnPerIp = Number(mergedEnv.EDGEFETCH_MAX_CONNECTIONS_PER_IP);
+  const hasExplicitMaxConnPerIp =
+    (typeof opts.maxConnectionsPerIp === 'number' && opts.maxConnectionsPerIp > 0) ||
+    (Number.isFinite(envMaxConnPerIp) && envMaxConnPerIp > 0);
+  const maxConnectionsPerIp =
+    typeof opts.maxConnectionsPerIp === 'number' && opts.maxConnectionsPerIp > 0
+      ? Math.floor(opts.maxConnectionsPerIp)
+      : Number.isFinite(envMaxConnPerIp) && envMaxConnPerIp > 0
+        ? Math.floor(envMaxConnPerIp)
+        : MAX_CONNECTIONS_PER_IP;
+  const envMaxConnTotal = Number(mergedEnv.EDGEFETCH_MAX_CONNECTIONS_TOTAL);
+  const maxConnectionsTotal =
+    typeof opts.maxConnectionsTotal === 'number' && opts.maxConnectionsTotal > 0
+      ? Math.floor(opts.maxConnectionsTotal)
+      : Number.isFinite(envMaxConnTotal) && envMaxConnTotal > 0
+        ? Math.floor(envMaxConnTotal)
+        : MAX_CONNECTIONS_TOTAL;
+  const headersTimeoutMs =
+    typeof opts.headersTimeoutMs === 'number' && opts.headersTimeoutMs > 0
+      ? Math.floor(opts.headersTimeoutMs)
+      : PRE_HEADER_TIMEOUT_MS;
+
   const inflightByIp = new Map<string, number>();
   let totalInflight = 0;
+  let unauthInflight = 0;
+  const maxUnauthInflight =
+    maxInflightTotal >= 8 ? maxInflightTotal - Math.min(32, Math.floor(maxInflightTotal / 4)) : maxInflightTotal;
+
+  // `R6-H4`: Track raw TCP connections & idle pre-header sockets per remote IP so 520 zero-byte sockets from one IP
+  // can NEVER exhaust `server.maxConnections` or starve loopback `/health` / `/readyz` probes and other client IPs!
+  const activeSocketsByIp = new Map<string, number>();
+  const preHeaderSocketsByIp = new Map<string, number>();
+  const socketMarkHeaderReceived = new WeakMap<net.Socket, () => void>();
+  let totalActiveSockets = 0;
+  let totalPreHeaderSockets = 0;
+
+  const applyNodeSecurityHeaders = (res: import('node:http').ServerResponse, isHttps = false) => {
+    for (const [k, v] of DEFAULT_SECURITY_HEADERS) {
+      if (!res.hasHeader(k)) {
+        res.setHeader(k, v);
+      }
+    }
+    if (isHttps && !res.hasHeader('strict-transport-security')) {
+      res.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
+    }
+  };
+
+  const forceDestroyReqSocket = (req: IncomingMessage, res: import('node:http').ServerResponse) => {
+    const tearDown = () => {
+      const sock = res.socket ?? req.socket;
+      req.destroy();
+      sock?.destroy();
+    };
+    res.once('finish', () => {
+      setImmediate(tearDown);
+    });
+    const fallback = setTimeout(tearDown, 500);
+    fallback.unref?.();
+  };
 
   const server = createServer(async (req, res) => {
+    if (req.socket) socketMarkHeaderReceived.get(req.socket)?.();
     req.on('error', () => undefined);
-    const clientBucket = normalizeClientRateLimitIp(resolveTrustedClientIp(req, trustProxy));
+    const rawPathname = (req.url ?? '/').split('?')[0] ?? '/';
+    const methodUpper = (req.method ?? 'GET').toUpperCase();
+    const isHealthProbe = (methodUpper === 'GET' || methodUpper === 'HEAD') && (rawPathname === '/health' || rawPathname === '/readyz');
+    const hasCallerAuth = Boolean(req.headers.authorization || req.headers['x-api-key'] || req.headers.cookie);
+
+    const clientBucket = normalizeClientRateLimitIp(resolveTrustedClientIp(req, trustProxy, trustFlyClientIp));
     const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
-    if (curIpInflight >= maxInflightPerIp || totalInflight >= maxInflightTotal) {
+    const hitPerIpLimit = curIpInflight >= maxInflightPerIp;
+    const hitGlobalLimit = isHealthProbe
+      ? totalInflight >= maxInflightTotal + 64
+      : totalInflight >= maxInflightTotal || (!hasCallerAuth && unauthInflight >= maxUnauthInflight);
+
+    if (hitPerIpLimit || hitGlobalLimit) {
       res.statusCode = 429;
       res.setHeader('content-type', 'application/json');
       res.setHeader('cache-control', 'no-store');
       res.setHeader('retry-after', '1');
       res.setHeader('connection', 'close');
-      res.once('finish', () => {
-        setImmediate(() => req.destroy());
-      });
+      applyNodeSecurityHeaders(res, explicitPublicOrigin?.startsWith('https://') ?? false);
+      forceDestroyReqSocket(req, res);
       res.end(JSON.stringify({ error: 'too_many_requests', message: 'Too many concurrent in-flight requests' }));
       return;
     }
 
     totalInflight++;
+    if (!hasCallerAuth && !isHealthProbe) unauthInflight++;
     inflightByIp.set(clientBucket, curIpInflight + 1);
     let slotReleased = false;
     const releaseInflightSlot = () => {
       if (slotReleased) return;
       slotReleased = true;
       totalInflight = Math.max(0, totalInflight - 1);
+      if (!hasCallerAuth && !isHealthProbe) unauthInflight = Math.max(0, unauthInflight - 1);
       const rem = inflightByIp.get(clientBucket) ?? 0;
       if (rem <= 1) inflightByIp.delete(clientBucket);
       else inflightByIp.set(clientBucket, rem - 1);
@@ -510,17 +628,42 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     try {
       let webReq: Request;
       try {
-        webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy, explicitPublicOrigin !== null);
+        webReq = incomingToWebRequest(
+          req,
+          resolveCanonicalOrigin(),
+          trustProxy,
+          explicitPublicOrigin !== null,
+          trustFlyClientIp,
+        );
       } catch {
         res.statusCode = 400;
         res.setHeader('content-type', 'application/json');
+        res.setHeader('cache-control', 'no-store');
         res.setHeader('connection', 'close');
-        res.once('finish', () => {
-          setImmediate(() => req.destroy());
-        });
+        applyNodeSecurityHeaders(res, explicitPublicOrigin?.startsWith('https://') ?? false);
+        forceDestroyReqSocket(req, res);
         res.end(JSON.stringify({ error: 'bad_request', message: 'Malformed HTTP request or Host header' }));
         return;
       }
+
+      const isHttpsReq = webReq.url.startsWith('https://');
+      const ignoredBodyFraming =
+        (methodUpper === 'GET' || methodUpper === 'HEAD' || methodUpper === 'OPTIONS') &&
+        Boolean(req.headers['transfer-encoding'] || (req.headers['content-length'] && req.headers['content-length'] !== '0'));
+
+      if (isHealthProbe) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        applyNodeSecurityHeaders(res, isHttpsReq);
+        if (ignoredBodyFraming) {
+          res.setHeader('connection', 'close');
+          forceDestroyReqSocket(req, res);
+        }
+        res.end(methodUpper === 'HEAD' ? undefined : '{"ok":true}');
+        return;
+      }
+
       try {
         const webRes = await (hubWorker as { fetch(r: Request, e: unknown, c?: ExecutionContext): Promise<Response> }).fetch(webReq, workerEnv, ctx);
         res.statusCode = webRes.status;
@@ -534,19 +677,14 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
           }
           res.setHeader(key, val);
         });
+        applyNodeSecurityHeaders(res, isHttpsReq);
         // `R3-M1`: Whenever an unauthenticated / over-limit / error response (`>= 400`) finishes while the client is still
         // streaming an unread request body (`!req.complete`), OR when a `GET`/`HEAD`/`OPTIONS` request includes unexpected body framing,
         // send `Connection: close` and destroy the socket after flush!
-        const methodUpper = (req.method ?? 'GET').toUpperCase();
-        const ignoredBodyFraming =
-          (methodUpper === 'GET' || methodUpper === 'HEAD' || methodUpper === 'OPTIONS') &&
-          Boolean(req.headers['transfer-encoding'] || (req.headers['content-length'] && req.headers['content-length'] !== '0'));
         const shouldDestroyAfterFlush = (!req.complete && webRes.status >= 400) || ignoredBodyFraming;
         if (shouldDestroyAfterFlush) {
           res.setHeader('connection', 'close');
-          res.once('finish', () => {
-            setImmediate(() => req.destroy());
-          });
+          forceDestroyReqSocket(req, res);
         }
         if (!webRes.body) {
           res.end();
@@ -562,11 +700,11 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       } catch (err) {
         res.statusCode = 500;
         res.setHeader('content-type', 'application/json');
+        res.setHeader('cache-control', 'no-store');
         res.setHeader('connection', 'close');
+        applyNodeSecurityHeaders(res, isHttpsReq);
         if (!req.complete) {
-          res.once('finish', () => {
-            setImmediate(() => req.destroy());
-          });
+          forceDestroyReqSocket(req, res);
         }
         res.end(JSON.stringify({ error: 'internal_error', message: err instanceof Error ? err.message : String(err) }));
       }
@@ -574,10 +712,87 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       releaseInflightSlot();
     }
   });
-  server.headersTimeout = 15_000;
+  server.headersTimeout = headersTimeoutMs;
   server.requestTimeout = 30_000;
   server.keepAliveTimeout = 5_000;
-  server.maxConnections = 512;
+  server.maxConnections = maxConnectionsTotal + LOOPBACK_RESERVED_CONNECTIONS;
+
+  server.on('connection', (socket) => {
+    socket.on('error', () => undefined);
+    const sockIp = normalizeSocketIp(socket.remoteAddress);
+    const sockBucket = normalizeClientRateLimitIp(sockIp);
+    const isStrictLoopbackProbe = sockIp === '127.0.0.1' || sockIp === '::1';
+    const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
+    const curPreHeaderForIp = preHeaderSocketsByIp.get(sockBucket) ?? 0;
+    const effectiveRawPerIpCap =
+      !trustProxy || hasExplicitMaxConnPerIp
+        ? maxConnectionsPerIp
+        : Math.max(maxConnectionsPerIp, maxInflightTotal + 32);
+    const globalSocketCap = isStrictLoopbackProbe
+      ? maxConnectionsTotal + LOOPBACK_RESERVED_CONNECTIONS
+      : maxConnectionsTotal;
+    const preHeaderGlobalCap = Math.max(64, Math.min(128, maxConnectionsTotal));
+
+    if (
+      totalActiveSockets >= globalSocketCap ||
+      curActiveForIp >= effectiveRawPerIpCap ||
+      curPreHeaderForIp >= maxConnectionsPerIp ||
+      totalPreHeaderSockets >= preHeaderGlobalCap
+    ) {
+      socket.destroy();
+      return;
+    }
+
+    totalActiveSockets++;
+    activeSocketsByIp.set(sockBucket, curActiveForIp + 1);
+    totalPreHeaderSockets++;
+    preHeaderSocketsByIp.set(sockBucket, curPreHeaderForIp + 1);
+
+    let headerPhaseDone = false;
+    let preHeaderTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      socket.destroy();
+    }, headersTimeoutMs);
+    preHeaderTimer.unref?.();
+
+    const finishPreHeaderPhase = () => {
+      if (headerPhaseDone) return;
+      headerPhaseDone = true;
+      if (preHeaderTimer) {
+        clearTimeout(preHeaderTimer);
+        preHeaderTimer = null;
+      }
+      totalPreHeaderSockets = Math.max(0, totalPreHeaderSockets - 1);
+      const remPre = preHeaderSocketsByIp.get(sockBucket) ?? 0;
+      if (remPre <= 1) preHeaderSocketsByIp.delete(sockBucket);
+      else preHeaderSocketsByIp.set(sockBucket, remPre - 1);
+    };
+    socketMarkHeaderReceived.set(socket, finishPreHeaderPhase);
+
+    let socketClosed = false;
+    socket.once('close', () => {
+      if (socketClosed) return;
+      socketClosed = true;
+      finishPreHeaderPhase();
+      totalActiveSockets = Math.max(0, totalActiveSockets - 1);
+      const remSock = activeSocketsByIp.get(sockBucket) ?? 0;
+      if (remSock <= 1) activeSocketsByIp.delete(sockBucket);
+      else activeSocketsByIp.set(sockBucket, remSock - 1);
+    });
+  });
+
+  server.on('clientError', (_err, socket) => {
+    socket.on('error', () => undefined);
+    if (socket instanceof net.Socket) {
+      socketMarkHeaderReceived.get(socket)?.();
+    }
+    if (socket.writable && !socket.destroyed) {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      const t = setTimeout(() => socket.destroy(), 250);
+      t.unref?.();
+    } else {
+      socket.destroy();
+    }
+  });
 
   const wss = new WebSocketServer({
     noServer: true,
@@ -585,33 +800,60 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     perMessageDeflate: false,
     handleProtocols: (protocols) => (protocols.has('edgefetch-agent') ? 'edgefetch-agent' : false),
   });
+  const activeWsBySite = new Map<string, number>();
 
   server.on('upgrade', (req, socket, head) => {
     socket.on('error', () => undefined);
+    if (socket instanceof net.Socket) {
+      socketMarkHeaderReceived.get(socket)?.();
+    }
     try {
       const pathname = (req.url ?? '/').split('?')[0];
       if (pathname !== '/agent/ws') {
-        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+        socket.write('HTTP/1.1 404 Not Found\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
         socket.destroy();
         return;
       }
       let webReq: Request;
       try {
-        webReq = incomingToWebRequest(req, resolveCanonicalOrigin(), trustProxy, explicitPublicOrigin !== null);
+        webReq = incomingToWebRequest(
+          req,
+          resolveCanonicalOrigin(),
+          trustProxy,
+          explicitPublicOrigin !== null,
+          trustFlyClientIp,
+        );
       } catch {
-        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+        socket.write('HTTP/1.1 400 Bad Request\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
         socket.destroy();
         return;
       }
       const auth = authorizeAgent(webReq, workerEnv as { AGENT_TOKEN?: string; AGENT_TOKENS?: string });
       const wsKey = req.headers['sec-websocket-key'];
       if (!auth.ok || typeof wsKey !== 'string' || !wsKey.trim()) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.write('HTTP/1.1 401 Unauthorized\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
         socket.destroy();
         return;
       }
-      const pubIp = resolveTrustedClientIp(req, trustProxy);
+      const curSiteWs = activeWsBySite.get(auth.siteId) ?? 0;
+      if (wss.clients.size >= MAX_AGENT_WS_CONNECTIONS || curSiteWs >= MAX_AGENT_WS_PER_SITE) {
+        socket.write(
+          'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+        );
+        socket.destroy();
+        return;
+      }
+      const pubIp = resolveTrustedClientIp(req, trustProxy, trustFlyClientIp);
       wss.handleUpgrade(req, socket, head, (wsClient) => {
+        activeWsBySite.set(auth.siteId, (activeWsBySite.get(auth.siteId) ?? 0) + 1);
+        let wsCountReleased = false;
+        wsClient.once('close', () => {
+          if (wsCountReleased) return;
+          wsCountReleased = true;
+          const rem = activeWsBySite.get(auth.siteId) ?? 0;
+          if (rem <= 1) activeWsBySite.delete(auth.siteId);
+          else activeWsBySite.set(auth.siteId, rem - 1);
+        });
         coordinator.acceptWebSocket({
           ws: wsClient,
           siteId: auth.siteId,

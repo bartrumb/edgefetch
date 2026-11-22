@@ -15,6 +15,7 @@ import { SITE_ID_PATTERN } from './auth';
 import { filterSafeResponseHeaders } from './framework-detect';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
+import { getActiveRequestTracer, type RequestTracer } from './otel';
 import { validatePublicHttpsTargetUrl } from './overflow';
 import { readBodyTextCapped } from './safe-input';
 import { classifyWafAndChallenge, refineBlockedInfo } from './waf';
@@ -222,6 +223,7 @@ export interface McpServerDeps {
     limit?: number;
   }) => Promise<{ ok: true; hits: Array<Record<string, unknown>> } | { ok: false; status: number; error: string }>;
   scheduleBackground?: (promise: Promise<unknown>) => void;
+  tracer?: RequestTracer;
   allowedOrigins?: readonly string[];
   selfHost?: string;
 }
@@ -359,9 +361,39 @@ export function sanitizeFleetForMcp(fleet: {
   };
 }
 
-function buildToolDefinitions(deps: McpServerDeps) {
-  const { allowedTargets, defaultTarget } = deps;
-  const allTools = [
+export const DEFAULT_ALLOWED_TARGETS: readonly FetchTarget[] = ['auto', 'agent', 'container'];
+
+export interface CanonicalMcpToolSchema {
+  type: 'object';
+  properties: Record<string, Record<string, unknown>>;
+  required?: string[];
+  additionalProperties?: boolean;
+}
+
+export interface CanonicalMcpToolDefinition {
+  name: string;
+  description: string;
+  annotations: {
+    title: string;
+    readOnlyHint: boolean;
+    destructiveHint: boolean;
+    idempotentHint: boolean;
+    openWorldHint: boolean;
+  };
+  inputSchema: CanonicalMcpToolSchema;
+}
+
+/**
+ * Canonical single-source-of-truth definitions for all 15 EdgeFetch MCP tools.
+ * Shared directly by `POST /mcp` (`tools/list`) and `GET /openapi.json` (`hub/src/openapi.ts`) so schemas never drift.
+ */
+export function buildCanonicalMcpToolSchemas(options?: {
+  allowedTargets?: readonly FetchTarget[];
+  defaultTarget?: FetchTarget;
+}): CanonicalMcpToolDefinition[] {
+  const allowedTargets = [...(options?.allowedTargets ?? DEFAULT_ALLOWED_TARGETS)];
+  const defaultTarget = options?.defaultTarget ?? 'auto';
+  return [
     {
       name: 'list_agents',
       description:
@@ -1127,6 +1159,17 @@ function buildToolDefinitions(deps: McpServerDeps) {
       },
     },
   ];
+}
+
+export const MCP_TOOL_SCHEMAS: Readonly<Record<string, CanonicalMcpToolSchema>> = Object.freeze(
+  Object.fromEntries(buildCanonicalMcpToolSchemas().map((tool) => [tool.name, tool.inputSchema])),
+);
+
+function buildToolDefinitions(deps: McpServerDeps) {
+  const allTools = buildCanonicalMcpToolSchemas({
+    allowedTargets: deps.allowedTargets,
+    defaultTarget: deps.defaultTarget,
+  });
   return allTools
     .filter((t) => {
       if (t.name === 'scrape') return Boolean(deps.executeScrape);
@@ -1849,7 +1892,31 @@ async function dispatchRpcMessage(
         await finishMcpTurn();
         return { body: jsonRpcError(id, -32602, 'Missing tool name') };
       }
-      const out = await handleToolCall(toolName, rawArgs, scopes, principal, deps);
+      const activeTracer = deps.tracer ?? getActiveRequestTracer();
+      const invokeTool = () => handleToolCall(toolName, rawArgs, scopes, principal, deps);
+      const out = activeTracer
+        ? await activeTracer.withSpan(
+            'edgefetch.mcp.tool',
+            {
+              kind: 1,
+              attributes: {
+                'rpc.system': 'jsonrpc',
+                'rpc.method': 'tools/call',
+                'mcp.tool.name': toolName,
+                'mcp.auth.type': authType,
+                'mcp.principal': principal,
+                'mcp.protocol_version': isModern ? '2026-07-28' : DEFAULT_PROTOCOL_VERSION,
+              },
+            },
+            async (span) => {
+              const res = await invokeTool();
+              const isErr = Boolean(res.isError);
+              span.setAttribute('mcp.is_error', isErr);
+              if (isErr) span.setStatus(false, 'mcp_tool_error');
+              return res;
+            },
+          )
+        : await invokeTool();
       const safeLogArgs: Record<string, unknown> = {};
       if (typeof rawArgs.url === 'string') safeLogArgs.url = redactUrlForLog(rawArgs.url);
       if (Array.isArray(rawArgs.urls)) {

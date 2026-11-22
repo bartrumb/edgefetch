@@ -215,8 +215,29 @@ func ExecuteCallWithTrace(ctx context.Context, c *Crawler, call FetchCall, trace
 	if secs > MaxMaxSeconds {
 		secs = MaxMaxSeconds
 	}
+	if len(call.Requests) > 1 && call.Options.GapMs <= 0 {
+		effPause := call.Options.PauseMs
+		if effPause <= 0 {
+			effPause = DefaultPauseMs
+		}
+		if effPause < 250 {
+			call.Options.GapMs = effPause
+		} else {
+			call.Options.GapMs = 250
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(secs)*time.Second)
 	defer cancel()
+
+	var tc otel.TraceContext
+	hasTrace := false
+	if c != nil && c.otelExp != nil {
+		tc = otel.ExtractOrNew(traceHdr)
+		hasTrace = tc.Sampled
+		if hasTrace {
+			cctx = otel.WithTraceContext(cctx, tc)
+		}
+	}
 
 	started := time.Now()
 	results := c.RunWithSink(cctx, call.Requests, call.Options, log, sink)
@@ -230,56 +251,62 @@ func ExecuteCallWithTrace(ctx context.Context, c *Crawler, call FetchCall, trace
 		slog.Int("requests", len(call.Requests)), slog.Int64("duration_ms", reply.DurationMs),
 		slog.Any("by_outcome", reply.Summary.ByOutcome), slog.Any("by_status", reply.Summary.ByStatus))
 
-	if c != nil && c.otelExp != nil {
-		tc := otel.ExtractOrNew(traceHdr)
-		if tc.Sampled {
-			c.otelExp.Record(otel.Span{
-				TraceID:      tc.TraceID,
-				SpanID:       tc.SpanID,
-				ParentSpanID: tc.ParentSpanID,
-				Name:         "edgefetch.go.batch",
-				Kind:         2,
-				Start:        started,
-				End:          ended,
-				StatusOK:     reply.Summary.ByOutcome[string(classify.OutcomeError)] == 0,
-				Attributes: map[string]any{
-					"crawler.requests":    len(call.Requests),
-					"crawler.duration_ms": reply.DurationMs,
-				},
-			})
-			for _, r := range results {
+	if hasTrace && c != nil && c.otelExp != nil {
+		c.otelExp.Record(otel.Span{
+			TraceID:      tc.TraceID,
+			SpanID:       tc.SpanID,
+			ParentSpanID: tc.ParentSpanID,
+			Name:         "edgefetch.go.batch",
+			Kind:         2,
+			Start:        started,
+			End:          ended,
+			StatusOK:     reply.Summary.ByOutcome[string(classify.OutcomeError)] == 0,
+			Attributes: map[string]any{
+				"crawler.requests":    len(call.Requests),
+				"crawler.duration_ms": reply.DurationMs,
+			},
+		})
+		for _, r := range results {
+			spanID := r.traceSpanID
+			if spanID == "" {
+				spanID = otel.RandomHex(8)
+			}
+			fStart, fEnd := r.traceStart, r.traceEnd
+			if fStart.IsZero() || fEnd.IsZero() {
 				dur := time.Duration(r.DurationMs) * time.Millisecond
 				if dur <= 0 {
 					dur = time.Millisecond
 				}
-				safeURL := r.URL
-				if u, err := url.Parse(r.URL); err == nil && u.Host != "" {
-					safeURL = u.Scheme + "://" + u.Host + u.Path
-				}
-				c.otelExp.Record(otel.Span{
-					TraceID:      tc.TraceID,
-					SpanID:       otel.RandomHex(8),
-					ParentSpanID: tc.SpanID,
-					Name:         "edgefetch.go.fetch." + string(r.Kind),
-					Kind:         3,
-					Start:        ended.Add(-dur),
-					End:          ended,
-					StatusOK:     r.Outcome == classify.OutcomeOK || r.Outcome == classify.OutcomeGone || r.Outcome == classify.OutcomeSkip,
-					ErrorMessage: RedactEmbeddedURLs(r.Problem),
-					Attributes: map[string]any{
-						"url.full":                  safeURL,
-						"http.response.status_code": r.Status,
-						"crawler.outcome":           string(r.Outcome),
-						"crawler.rendered":          r.Rendered,
-						"net.dns_ms":                r.Timing.DNSMs,
-						"net.connect_ms":            r.Timing.ConnectMs,
-						"net.tls_ms":                r.Timing.TLSMs,
-						"net.ttfb_ms":               r.Timing.TTFBMs,
-						"net.conn_reused":           r.Timing.Reused,
-						"network.protocol.name":     r.Timing.Proto,
-					},
-				})
+				fStart = ended.Add(-dur)
+				fEnd = ended
 			}
+			attrs := map[string]any{
+				"url.full":                  otel.SanitizeURL(r.URL),
+				"http.response.status_code": r.Status,
+				"crawler.outcome":           string(r.Outcome),
+				"crawler.rendered":          r.Rendered,
+				"net.dns_ms":                r.Timing.DNSMs,
+				"net.connect_ms":            r.Timing.ConnectMs,
+				"net.tls_ms":                r.Timing.TLSMs,
+				"net.ttfb_ms":               r.Timing.TTFBMs,
+				"net.conn_reused":           r.Timing.Reused,
+				"network.protocol.name":     r.Timing.Proto,
+			}
+			if r.botAuthSigned {
+				attrs["bot_auth.signed"] = true
+			}
+			c.otelExp.Record(otel.Span{
+				TraceID:      tc.TraceID,
+				SpanID:       spanID,
+				ParentSpanID: tc.SpanID,
+				Name:         "edgefetch.go.fetch." + string(r.Kind),
+				Kind:         3,
+				Start:        fStart,
+				End:          fEnd,
+				StatusOK:     r.Outcome == classify.OutcomeOK || r.Outcome == classify.OutcomeGone || r.Outcome == classify.OutcomeSkip,
+				ErrorMessage: otel.RedactEmbeddedURLs(r.Problem),
+				Attributes:   attrs,
+			})
 		}
 	}
 	return reply

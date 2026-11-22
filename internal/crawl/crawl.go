@@ -16,7 +16,6 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -148,6 +147,11 @@ type Result struct {
 	PDFEngine         string                         `json:"pdfEngine,omitempty"`
 	SHA256            string                         `json:"sha256,omitempty"`
 	BodyBase64        string                         `json:"bodyBase64,omitempty"`
+
+	traceSpanID   string
+	traceStart    time.Time
+	traceEnd      time.Time
+	botAuthSigned bool
 }
 
 // DecodeBody returns the exact raw response bytes for `r.Body`, decoding `"base64"` payloads losslessly when the origin
@@ -342,7 +346,7 @@ func NewCrawler(transport http.RoundTripper, allow func(*url.URL) error, userAge
 			return err
 		}
 		defer hs.Release()
-		allowed, _, reason := c.checkRobots(ctx, hs, rawURL)
+		allowed, _, _, reason := c.checkRobots(ctx, hs, rawURL)
 		if !allowed {
 			return errors.New(reason)
 		}
@@ -355,11 +359,17 @@ func NewCrawler(transport http.RoundTripper, allow func(*url.URL) error, userAge
 // SetRenderer replaces the browser renderer (used by unit tests with mock CDP WebSockets).
 func (c *Crawler) SetRenderer(r *browser.Renderer) {
 	c.renderer = r
+	if r != nil && c.otelExp != nil {
+		r.SetOtelExporter(c.otelExp)
+	}
 }
 
 // SetOtelExporter attaches an optional non-blocking OpenTelemetry OTLP/HTTP span exporter.
 func (c *Crawler) SetOtelExporter(exp *otel.Exporter) {
 	c.otelExp = exp
+	if c.renderer != nil {
+		c.renderer.SetOtelExporter(exp)
+	}
 }
 
 // SetBotSigner attaches an optional IETF RFC 9421 Ed25519 Web Bot Auth request signer.
@@ -486,7 +496,11 @@ func (c *Crawler) waitGlobalGap(ctx context.Context, gap time.Duration) error {
 	}
 	c.globalNext = start.Add(gap)
 	c.globalMu.Unlock()
-	return c.Sleep(ctx, start.Sub(now))
+	wait := start.Sub(now)
+	if wait <= 0 {
+		return ctx.Err()
+	}
+	return c.Sleep(ctx, wait)
 }
 
 func (c *Crawler) bumpGlobalThrottle(d time.Duration) {
@@ -590,7 +604,23 @@ func (c *Crawler) RunWithSink(ctx context.Context, reqs []Request, opts Options,
 					results[i] = notTried(r, stopped)
 					continue
 				}
-				res, cancelled := c.runRequestWithRedirects(ctx, r, opts, n > 0, minPause, maxJitter, gap, log)
+				reqCtx := ctx
+				var fetchSpanID string
+				if batchTC, ok := otel.TraceContextFromContext(ctx); ok && batchTC.Sampled {
+					fetchSpanID = otel.RandomHex(8)
+					reqCtx = otel.WithTraceContext(ctx, otel.TraceContext{
+						TraceID:      batchTC.TraceID,
+						SpanID:       fetchSpanID,
+						ParentSpanID: batchTC.SpanID,
+						Sampled:      true,
+					})
+				}
+				reqStart := time.Now()
+				res, cancelled := c.runRequestWithRedirects(reqCtx, r, opts, n > 0, minPause, maxJitter, gap, log)
+				reqEnd := time.Now()
+				res.traceSpanID = fetchSpanID
+				res.traceStart = reqStart
+				res.traceEnd = reqEnd
 				if sink != nil {
 					res = sink(i, res)
 				}
@@ -708,7 +738,8 @@ func (c *Crawler) runRequestWithRedirects(
 			return notTried(origReq, "crawl cancelled"), true
 		}
 		if c.shouldCheckRobots(curHost, opts) {
-			if allowed, distressed, reason := c.checkRobots(ctx, hs, origReq.URL); !allowed {
+			allowed, distressed, fetchedRob, reason := c.checkRobots(ctx, hs, origReq.URL)
+			if !allowed {
 				hs.Release()
 				outcome := classify.OutcomeError
 				if distressed {
@@ -722,6 +753,12 @@ func (c *Crawler) runRequestWithRedirects(
 					Problem:    reason,
 					DurationMs: c.Now().Sub(started).Milliseconds(),
 				}, false
+			}
+			if fetchedRob && gap > 0 {
+				if err := c.waitGlobalGap(ctx, gap); err != nil {
+					hs.Release()
+					return notTried(origReq, "crawl cancelled"), true
+				}
 			}
 		}
 		nextFloor := minPause
@@ -738,6 +775,7 @@ func (c *Crawler) runRequestWithRedirects(
 	curURLStr := origReq.URL
 	prevHost := ""
 	totalAttempts := 0
+	anyBotSigned := false
 
 	for hop := 0; hop <= MaxRedirects; hop++ {
 		parsedCur, err := url.Parse(curURLStr)
@@ -801,7 +839,7 @@ func (c *Crawler) runRequestWithRedirects(
 		var robotsElapsedMs int64
 		if c.shouldCheckRobots(curHost, opts) {
 			robStart := c.Now()
-			allowed, distressed, reason := c.checkRobots(ctx, hs, curURLStr)
+			allowed, distressed, fetchedRob, reason := c.checkRobots(ctx, hs, curURLStr)
 			robotsElapsedMs = c.Now().Sub(robStart).Milliseconds()
 			if !allowed {
 				hs.Release()
@@ -822,6 +860,15 @@ func (c *Crawler) runRequestWithRedirects(
 					Timing:     Timing{RobotsMs: robotsElapsedMs},
 				}, false
 			}
+			if fetchedRob && gap > 0 {
+				if err := c.waitGlobalGap(ctx, gap); err != nil {
+					hs.Release()
+					if remMs := hs.CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
+						return rateLimitedCooldownResult(origReq, remMs), true
+					}
+					return notTried(origReq, "crawl cancelled"), true
+				}
+			}
 		}
 
 		hopReq := origReq
@@ -837,6 +884,11 @@ func (c *Crawler) runRequestWithRedirects(
 			}
 		}
 		res, loc, rawBody := c.fetchSingleHop(ctx, hopReq, opts)
+		if res.botAuthSigned {
+			anyBotSigned = true
+		} else if anyBotSigned {
+			res.botAuthSigned = true
+		}
 		res.Timing.RobotsMs += robotsElapsedMs
 		totalAttempts += res.Attempts
 		res.ID = origReq.ID
@@ -908,6 +960,9 @@ func (c *Crawler) runRequestWithRedirects(
 				renderedRes.URL = origReq.URL
 				if len(renderedRes.ResponseHeaders) == 0 && len(res.ResponseHeaders) > 0 {
 					renderedRes.ResponseHeaders = res.ResponseHeaders
+				}
+				if res.botAuthSigned {
+					renderedRes.botAuthSigned = true
 				}
 				c.logResult(ctx, log, origReq, renderedRes)
 				return renderedRes, false
@@ -1067,8 +1122,11 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	var finalBody []byte
 	for attempt := 1; ; attempt++ {
 		res.Attempts = attempt
-		status, header, body, truncated, maxLimitUsed, pdfStream, timing, fetchErr := c.onceWithPDFStream(ctx, r, accept, opts)
+		status, header, body, truncated, maxLimitUsed, pdfStream, timing, botSigned, fetchErr := c.onceWithPDFStream(ctx, r, accept, opts)
 		res.Timing = timing
+		if botSigned {
+			res.botAuthSigned = true
+		}
 		if fetchErr != nil {
 			if ctx.Err() != nil {
 				res.Outcome, res.Problem = classify.OutcomeError, ctx.Err().Error()
@@ -1105,8 +1163,11 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 		}
 
 		// 3-Strikes Adaptive 429 Backoff ("3 strikes and you're out!"):
-		// Retry non-challenge HTTP 429 on Strike 1 and Strike 2 when enough caller budget remains.
-		if status == http.StatusTooManyRequests && res.CfMitigated == "" && classify.ClassifyWAF(status, header, body) == nil && attempt < 3 {
+		// Retry non-challenge HTTP 429 on Strike 1 and Strike 2 when Retry-After <= 30s and enough caller budget remains.
+		// Larger Retry-After windows (> 30s, e.g. 300s or 99999s) record the host cooldown and return immediately without
+		// pinning the worker goroutine for minutes.
+		const maxInline429RetryWait = 30 * time.Second
+		if status == http.StatusTooManyRequests && res.CfMitigated == "" && classify.ClassifyWAF(status, header, body) == nil && attempt < 3 && ra <= maxInline429RetryWait {
 			var wait time.Duration
 			if ra > 0 {
 				wait = ra + 250*time.Millisecond + c.Jitter(500*time.Millisecond)
@@ -1185,21 +1246,291 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	return res, redirectLoc, finalBody
 }
 
-var reEmbeddedHTTPURL = regexp.MustCompile(`(?i)https?://[^\s"\\]+`)
+type urlSepKind uint8
 
-// reQuotedHTTPURL matches a strconv.Quote'd URL exactly as net/url.Error prints it (`Get "https://...": ...`),
-// including escaped quotes/backslashes and raw spaces inside the query.
-var reQuotedHTTPURL = regexp.MustCompile(`(?i)"https?://(?:[^"\\]|\\.)*"`)
+const (
+	urlSepNone urlSepKind = iota
+	urlSepPlain
+	urlSepJSONSlash
+	urlSepPctEncoded
+	urlSepProtoRel
+)
+
+func asciiLower(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+func hasPrefixFoldASCII(s, lowerPrefix string) bool {
+	if len(s) < len(lowerPrefix) {
+		return false
+	}
+	for i := 0; i < len(lowerPrefix); i++ {
+		if asciiLower(s[i]) != lowerPrefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func isHostStartByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '['
+}
+
+func isProtoRelBoundary(b byte) bool {
+	switch b {
+	case ' ', '\t', '\r', '\n', '"', '\'', '=', '(', '<', ',':
+		return true
+	default:
+		return false
+	}
+}
+
+func matchURLSchemeAt(s string, i int) (sep urlSepKind, afterSep int) {
+	if i < 0 || i >= len(s) {
+		return urlSepNone, 0
+	}
+	if s[i] == '/' {
+		if i+2 < len(s) && s[i+1] == '/' && isHostStartByte(s[i+2]) && (i == 0 || isProtoRelBoundary(s[i-1])) {
+			return urlSepProtoRel, i + 2
+		}
+		return urlSepNone, 0
+	}
+	c0 := asciiLower(s[i])
+	if c0 != 'h' && c0 != 'w' && c0 != 'f' {
+		return urlSepNone, 0
+	}
+	// Avoid matching inside a longer identifier like "myhttp://", except known URI prefixes like "blob:https://".
+	if i > 0 {
+		prev := asciiLower(s[i-1])
+		if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') {
+			return urlSepNone, 0
+		}
+	}
+	schemeLen := 0
+	rem := s[i:]
+	switch {
+	case hasPrefixFoldASCII(rem, "https"):
+		schemeLen = 5
+	case hasPrefixFoldASCII(rem, "http"):
+		schemeLen = 4
+	case hasPrefixFoldASCII(rem, "wss"):
+		schemeLen = 3
+	case hasPrefixFoldASCII(rem, "ws"):
+		schemeLen = 2
+	case hasPrefixFoldASCII(rem, "ftps"):
+		schemeLen = 4
+	case hasPrefixFoldASCII(rem, "ftp"):
+		schemeLen = 3
+	default:
+		return urlSepNone, 0
+	}
+	tail := rem[schemeLen:]
+	switch {
+	case strings.HasPrefix(tail, "://"):
+		return urlSepPlain, i + schemeLen + 3
+	case strings.HasPrefix(tail, `:\/\/`):
+		return urlSepJSONSlash, i + schemeLen + 5
+	case hasPrefixFoldASCII(tail, "%3a%2f%2f"):
+		return urlSepPctEncoded, i + schemeLen + 9
+	default:
+		return urlSepNone, 0
+	}
+}
+
+func countPrecedingBackslashes(s string, pos int) int {
+	n := 0
+	for pos > 0 && s[pos-1] == '\\' {
+		n++
+		pos--
+	}
+	return n
+}
+
+func isAllDigitsASCII(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+var sensitivePathActionSegments = map[string]bool{
+	"reset":       true,
+	"verify":      true,
+	"confirm":     true,
+	"magic":       true,
+	"token":       true,
+	"invite":      true,
+	"activate":    true,
+	"unsubscribe": true,
+}
+
+func scrubPathMatrixAndResetTokens(pathPart string) string {
+	if pathPart == "" {
+		return ""
+	}
+	needsWork := strings.IndexByte(pathPart, ';') >= 0
+	if !needsWork {
+		// Quick check for sensitive action segments like /reset/<token>
+		lp := strings.ToLower(pathPart)
+		for k := range sensitivePathActionSegments {
+			if strings.Contains(lp, "/"+k+"/") {
+				needsWork = true
+				break
+			}
+		}
+	}
+	if !needsWork {
+		return pathPart
+	}
+	segs := strings.Split(pathPart, "/")
+	redactNext := false
+	for idx, seg := range segs {
+		if semi := strings.IndexByte(seg, ';'); semi >= 0 {
+			seg = seg[:semi]
+			segs[idx] = seg
+		}
+		if seg == "" {
+			continue
+		}
+		if redactNext {
+			segs[idx] = "[REDACTED]"
+			redactNext = false
+			continue
+		}
+		if sensitivePathActionSegments[strings.ToLower(seg)] {
+			redactNext = true
+		}
+	}
+	return strings.Join(segs, "/")
+}
+
+func cutEarliestFold(s string, markers ...string) string {
+	cutAt := len(s)
+	for _, m := range markers {
+		for i := 0; i+len(m) <= cutAt; i++ {
+			if hasPrefixFoldASCII(s[i:], m) {
+				cutAt = i
+				break
+			}
+		}
+	}
+	return s[:cutAt]
+}
 
 func scrubSingleURLToken(raw string) string {
+	return scrubMatchedURL(raw, urlSepPlain)
+}
+
+func scrubMatchedURL(raw string, kind urlSepKind) string {
+	if raw == "" {
+		return ""
+	}
+	if kind == urlSepPctEncoded {
+		raw = cutEarliestFold(raw, "?", "#", "%3f", "%23", "%3b")
+		sepIdx := -1
+		for i := 0; i+9 <= len(raw); i++ {
+			if hasPrefixFoldASCII(raw[i:], "%3a%2f%2f") {
+				sepIdx = i + 9
+				break
+			}
+		}
+		if sepIdx >= 0 {
+			rest := raw[sepIdx:]
+			slashIdx := len(rest)
+			for i := 0; i < len(rest); i++ {
+				if rest[i] == '/' || hasPrefixFoldASCII(rest[i:], "%2f") {
+					slashIdx = i
+					break
+				}
+			}
+			auth := rest[:slashIdx]
+			pathPart := rest[slashIdx:]
+			lastAtEnd := -1
+			for i := 0; i < len(auth); i++ {
+				if auth[i] == '@' {
+					lastAtEnd = i + 1
+				} else if hasPrefixFoldASCII(auth[i:], "%40") {
+					lastAtEnd = i + 3
+				}
+			}
+			if lastAtEnd >= 0 {
+				raw = raw[:sepIdx] + auth[lastAtEnd:] + pathPart
+			}
+		}
+		return raw
+	}
+
+	if kind == urlSepJSONSlash {
+		raw = cutEarliestFold(raw, "#", "?", `\u003f`, `\u0023`)
+		if idx := strings.Index(raw, `:\/\/`); idx >= 0 {
+			rest := raw[idx+5:]
+			slash := strings.Index(rest, `\/`)
+			auth := rest
+			pathPart := ""
+			if slash >= 0 {
+				auth = rest[:slash]
+				pathPart = rest[slash:]
+			}
+			if semi := strings.IndexByte(pathPart, ';'); semi >= 0 {
+				pathPart = pathPart[:semi]
+			}
+			if at := strings.LastIndexByte(auth, '@'); at >= 0 {
+				raw = raw[:idx+5] + auth[at+1:] + pathPart
+			} else {
+				raw = raw[:idx+5] + auth + pathPart
+			}
+		}
+		return raw
+	}
+
+	// Plain `scheme://...` or protocol-relative `//...`:
+	// Before stripping `?`/`#`, check if `?`/`#`/`/` is actually inside unescaped userinfo (`user:pa?ss@host/p` or `user:pa/ss@host/p`).
+	sepEnd := -1
+	if kind == urlSepProtoRel && strings.HasPrefix(raw, "//") {
+		sepEnd = 2
+	} else if idx := strings.Index(raw, "://"); idx >= 0 {
+		sepEnd = idx + 3
+	}
+	if sepEnd >= 0 {
+		rest := raw[sepEnd:]
+		delim := strings.IndexAny(rest, "/?#")
+		head := rest
+		if delim >= 0 {
+			head = rest[:delim]
+		}
+		if strings.IndexByte(head, '@') < 0 && !strings.HasPrefix(head, "[") {
+			if colon := strings.IndexByte(head, ':'); colon >= 0 && !isAllDigitsASCII(head[colon+1:]) {
+				// `head` has `user:non-numeric-password...`, so a later `@host` is the authority boundary!
+				if lastAt := strings.LastIndexByte(rest, '@'); lastAt >= 0 {
+					raw = raw[:sepEnd] + rest[lastAt+1:]
+				}
+			}
+		}
+	}
+
 	if idx := strings.IndexByte(raw, '#'); idx >= 0 {
 		raw = raw[:idx]
 	}
 	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
 		raw = raw[:idx]
 	}
-	if schemeEnd := strings.Index(raw, "://"); schemeEnd >= 0 {
-		rest := raw[schemeEnd+3:]
+	if idx := strings.Index(raw, `\u003f`); idx >= 0 {
+		raw = raw[:idx]
+	}
+	if idx := strings.Index(raw, `\u003F`); idx >= 0 {
+		raw = raw[:idx]
+	}
+
+	if sepEnd >= 0 && sepEnd <= len(raw) {
+		rest := raw[sepEnd:]
 		slash := strings.IndexByte(rest, '/')
 		auth := rest
 		pathPart := ""
@@ -1209,31 +1540,218 @@ func scrubSingleURLToken(raw string) string {
 		}
 		if at := strings.LastIndexByte(auth, '@'); at >= 0 {
 			auth = auth[at+1:]
-			raw = raw[:schemeEnd+3] + auth + pathPart
 		}
+		pathPart = scrubPathMatrixAndResetTokens(pathPart)
+		raw = raw[:sepEnd] + auth + pathPart
 	}
 	return raw
 }
 
-// RedactEmbeddedURLs scrubs query strings (`?...`), `#fragments`, and `user:pass@` credentials from any `http://` or
-// `https://` URL embedded inside an error or `Result.Problem` string (e.g. `Get "https://host/p?api_key=secret": timeout`
-// -> `Get "https://host/p": timeout`).
+func looksLikeSecretTokenValue(tok string) bool {
+	if len(tok) < 6 {
+		return false
+	}
+	hasDigit := false
+	hasUpper := false
+	hasSym := false
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c >= 'A' && c <= 'Z':
+			hasUpper = true
+		case c == '-' || c == '_' || c == '.' || c == '/' || c == '+':
+			hasSym = true
+		}
+	}
+	return hasDigit || (hasUpper && hasSym) || len(tok) >= 20
+}
+
+func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
+	sawQuery := false
+	j := start
+	for j < len(s) {
+		c := s[j]
+		if c == '?' || c == '#' || c == ';' {
+			sawQuery = true
+			j++
+			continue
+		}
+		if kind == urlSepPctEncoded && (hasPrefixFoldASCII(s[j:], "%3f") || hasPrefixFoldASCII(s[j:], "%23") || hasPrefixFoldASCII(s[j:], "%3b")) {
+			sawQuery = true
+			j += 3
+			continue
+		}
+		if c == '\r' || c == '\n' || c == '<' || c == '>' || c == '\'' {
+			break
+		}
+		// Unicode NEL (C2 85) and LS/PS (E2 80 A8 / E2 80 A9) terminate unquoted tokens.
+		if c == 0xc2 && j+1 < len(s) && s[j+1] == 0x85 {
+			break
+		}
+		if c == 0xe2 && j+2 < len(s) && s[j+1] == 0x80 && (s[j+2] == 0xa8 || s[j+2] == 0xa9) {
+			break
+		}
+		if kind == urlSepJSONSlash && c == '\\' && j+1 < len(s) && s[j+1] == '/' {
+			j += 2
+			continue
+		}
+		if !sawQuery && (c == '"' || c == '\\') {
+			break
+		}
+		if c == ' ' || c == '\t' {
+			if sawQuery {
+				k := j + 1
+				for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
+					k++
+				}
+				tokEnd := k
+				for tokEnd < len(s) && s[tokEnd] != ' ' && s[tokEnd] != '\t' && s[tokEnd] != '\r' && s[tokEnd] != '\n' {
+					tokEnd++
+				}
+				tok := s[k:tokEnd]
+				if tok != "" {
+					if nextKind, _ := matchURLSchemeAt(s, k); nextKind == urlSepNone && !strings.Contains(tok, "://") &&
+						(strings.IndexByte(tok, '=') >= 0 || strings.IndexByte(tok, '&') >= 0) {
+						j = tokEnd
+						continue
+					}
+				}
+			}
+			break
+		}
+		j++
+	}
+	// Trim trailing sentence punctuation (e.g. `,` in `http://[::1]:8080/p?k=SECRET, http://...`).
+	for j > start {
+		last := s[j-1]
+		if last == ',' || last == '.' {
+			j--
+			continue
+		}
+		break
+	}
+	return j
+}
+
+// RedactEmbeddedURLs scrubs query strings (`?...`), `#fragments`, matrix parameters (`;...`), `user:pass@` credentials,
+// reset path tokens, and inline bearer/token secrets from URLs embedded inside error or `Result.Problem` strings in a
+// single linear O(N) pass (handling `http`, `https`, `ws`, `wss`, `ftp`, JSON-escaped `\/`, `%3A%2F%2F`, multi-nested
+// escaped quotes, and truncated unterminated quotes).
 func RedactEmbeddedURLs(s string) string {
 	if s == "" {
 		return ""
 	}
-	lower := strings.ToLower(s)
-	if !strings.Contains(lower, "http://") && !strings.Contains(lower, "https://") {
+	needsCheck := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ':', '/', '%', 't', 'T', 'b', 'B':
+			needsCheck = true
+		}
+		if needsCheck {
+			break
+		}
+	}
+	if !needsCheck {
 		return s
 	}
-	s = reQuotedHTTPURL.ReplaceAllStringFunc(s, func(q string) string {
-		raw, err := strconv.Unquote(q)
-		if err != nil {
-			raw = q[1 : len(q)-1]
+
+	var out strings.Builder
+	copiedUpTo := 0
+	i := 0
+	for i < len(s) {
+		kind, afterSep := matchURLSchemeAt(s, i)
+		if kind != urlSepNone {
+			endIdx := afterSep
+			if i > 0 && s[i-1] == '"' {
+				openBS := countPrecedingBackslashes(s, i-1)
+				// Power-of-two modulus for recursive %q / JSON quote escaping (`openBS` in {0, 1, 3, 7, ...}).
+				step := (openBS + 1) * 2
+				foundClose := false
+				for j := afterSep; j < len(s); j++ {
+					if s[j] == '"' {
+						bs := countPrecedingBackslashes(s, j)
+						if (openBS == 0 && bs%2 == 0) || (openBS > 0 && bs >= openBS && bs%step == openBS) {
+							endIdx = j - openBS
+							foundClose = true
+							break
+						}
+					}
+				}
+				if !foundClose {
+					endIdx = len(s)
+				}
+			} else if i > 0 && s[i-1] == '\'' {
+				foundClose := false
+				for j := afterSep; j < len(s); j++ {
+					if s[j] == '\'' && countPrecedingBackslashes(s, j)%2 == 0 {
+						endIdx = j
+						foundClose = true
+						break
+					}
+				}
+				if !foundClose {
+					endIdx = len(s)
+				}
+			} else {
+				endIdx = findUnquotedURLEnd(s, afterSep, kind)
+			}
+
+			if endIdx < afterSep {
+				endIdx = afterSep
+			}
+			scrubbed := scrubMatchedURL(s[i:endIdx], kind)
+			if scrubbed != s[i:endIdx] || out.Cap() > 0 {
+				if out.Cap() == 0 {
+					out.Grow(len(s))
+				}
+				out.WriteString(s[copiedUpTo:i])
+				out.WriteString(scrubbed)
+				copiedUpTo = endIdx
+			}
+			i = endIdx
+			continue
 		}
-		return strconv.Quote(scrubSingleURLToken(raw))
-	})
-	return reEmbeddedHTTPURL.ReplaceAllStringFunc(s, scrubSingleURLToken)
+
+		// Redact inline "Bearer <secret>" / "token <secret>" fragments outside URLs.
+		c0 := asciiLower(s[i])
+		if (c0 == 't' || c0 == 'b') && (i == 0 || !((asciiLower(s[i-1]) >= 'a' && asciiLower(s[i-1]) <= 'z') || (s[i-1] >= '0' && s[i-1] <= '9'))) {
+			kwLen := 0
+			if hasPrefixFoldASCII(s[i:], "token") {
+				kwLen = 5
+			} else if hasPrefixFoldASCII(s[i:], "bearer") {
+				kwLen = 6
+			}
+			if kwLen > 0 && i+kwLen < len(s) && (s[i+kwLen] == ' ' || s[i+kwLen] == '=' || s[i+kwLen] == ':') {
+				valStart := i + kwLen + 1
+				for valStart < len(s) && s[valStart] == ' ' {
+					valStart++
+				}
+				valEnd := valStart
+				for valEnd < len(s) && s[valEnd] != ' ' && s[valEnd] != '\t' && s[valEnd] != '\r' && s[valEnd] != '\n' &&
+					s[valEnd] != '"' && s[valEnd] != '\'' && s[valEnd] != ',' && s[valEnd] != ';' && s[valEnd] != ')' {
+					valEnd++
+				}
+				if looksLikeSecretTokenValue(s[valStart:valEnd]) {
+					if out.Cap() == 0 {
+						out.Grow(len(s))
+					}
+					out.WriteString(s[copiedUpTo:valStart])
+					out.WriteString("[REDACTED]")
+					copiedUpTo = valEnd
+					i = valEnd
+					continue
+				}
+			}
+		}
+		i++
+	}
+	if copiedUpTo == 0 {
+		return s
+	}
+	out.WriteString(s[copiedUpTo:])
+	return out.String()
 }
 
 func redactURLForLog(raw string) string {
@@ -1244,6 +1762,8 @@ func redactURLForLog(raw string) string {
 	u.RawQuery = ""
 	u.Fragment = ""
 	u.User = nil
+	u.Path = scrubPathMatrixAndResetTokens(u.Path)
+	u.RawPath = ""
 	return u.String()
 }
 
@@ -1302,7 +1822,7 @@ func ms(from, to time.Time) int64 {
 	return to.Sub(from).Milliseconds()
 }
 
-func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept string, opts Options) (int, http.Header, []byte, bool, int, *streamedPDFResult, Timing, error) {
+func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept string, opts Options) (int, http.Header, []byte, bool, int, *streamedPDFResult, Timing, bool, error) {
 	var tm Timing
 	var dnsStart, dnsDone, connStart, connDone, tlsStart, tlsDone, wrote, firstByte time.Time
 	var mu sync.Mutex
@@ -1354,7 +1874,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	}
 	req, err := http.NewRequestWithContext(actx, method, r.URL, reqBodyReader)
 	if err != nil {
-		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, false, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", accept)
@@ -1375,14 +1895,17 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	if r.IfModifiedSince != "" {
 		req.Header.Set("If-Modified-Since", r.IfModifiedSince)
 	}
+	var botSigned bool
 	if c.botSigner != nil {
-		_ = c.botSigner.SignRequest(req, c.Now())
+		if signErr := c.botSigner.SignRequest(req, c.Now()); signErr == nil {
+			botSigned = true
+		}
 	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
 		phases()
-		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, botSigned, err
 	}
 	defer resp.Body.Close()
 	tm.Proto = resp.Proto
@@ -1400,14 +1923,14 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 		prefix, pErr = io.ReadAll(io.LimitReader(resp.Body, 1024))
 		if pErr != nil {
 			phases()
-			return 0, nil, nil, false, opts.MaxBytes, nil, tm, pErr
+			return 0, nil, nil, false, opts.MaxBytes, nil, tm, botSigned, pErr
 		}
 		ctLower := strings.ToLower(resp.Header.Get("content-type"))
 		if strings.Contains(ctLower, "application/pdf") || extract.IsPDFBytes(prefix) {
 			pdfMax := resolveMaxStreamingPDFBytes(opts)
 			if cl := resp.ContentLength; cl > int64(pdfMax) {
 				phases()
-				return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, nil
+				return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, botSigned, nil
 			}
 			if tmpFile, tmpErr := os.CreateTemp("", "edgefetch-pdf-*.pdf"); tmpErr == nil {
 				tmpPath := tmpFile.Name()
@@ -1423,7 +1946,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 					totalWritten += int64(n)
 					if wErr != nil {
 						phases()
-						return 0, nil, nil, false, pdfMax, nil, tm, wErr
+						return 0, nil, nil, false, pdfMax, nil, tm, botSigned, wErr
 					}
 				}
 				remLimit := int64(pdfMax) - totalWritten + 1
@@ -1435,10 +1958,10 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 				totalWritten += copied
 				phases()
 				if cErr != nil {
-					return 0, nil, nil, false, pdfMax, nil, tm, cErr
+					return 0, nil, nil, false, pdfMax, nil, tm, botSigned, cErr
 				}
 				if totalWritten > int64(pdfMax) {
-					return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, nil
+					return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, botSigned, nil
 				}
 				_ = tmpFile.Close()
 				sum := hasher.Sum(nil)
@@ -1449,7 +1972,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 					text:        txt,
 					usedPoppler: usedPoppler,
 					err:         extErr,
-				}, tm, nil
+				}, tm, botSigned, nil
 			}
 		}
 	}
@@ -1463,7 +1986,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	tail, err := io.ReadAll(io.LimitReader(resp.Body, remBytes))
 	phases()
 	if err != nil {
-		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, botSigned, err
 	}
 	limited := tail
 	if len(prefix) > 0 {
@@ -1475,7 +1998,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	if truncated {
 		limited = limited[:opts.MaxBytes]
 	}
-	return resp.StatusCode, resp.Header, limited, truncated, opts.MaxBytes, nil, tm, nil
+	return resp.StatusCode, resp.Header, limited, truncated, opts.MaxBytes, nil, tm, botSigned, nil
 }
 
 func parseRobotsCacheTTL(header http.Header) time.Duration {
@@ -1509,20 +2032,21 @@ func parseRobotsCacheTTL(header http.Header) time.Duration {
 	return politeness.RobotsCacheTTL
 }
 
-func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, rawURL string) (allowed, distressed bool, reason string) {
+func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, rawURL string) (allowed, distressed, fetched bool, reason string) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return false, false, err.Error()
+		return false, false, false, err.Error()
 	}
 	now := c.Now()
 	entry := hs.CachedRobots(now)
 	if entry == nil {
 		if ctx.Err() != nil {
-			return false, true, "robots_unreachable: caller context cancelled before /robots.txt fetch: " + ctx.Err().Error()
+			return false, true, false, "robots_unreachable: caller context cancelled before /robots.txt fetch: " + ctx.Err().Error()
 		}
 		var pause time.Duration
 		entry, pause = c.fetchRobots(ctx, u)
 		hs.SetRobots(c.Now(), entry, pause)
+		fetched = true
 	}
 	if entry.Distressed {
 		msg := entry.Reason
@@ -1531,15 +2055,15 @@ func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, raw
 		} else if !strings.HasPrefix(msg, "robots_unreachable: ") {
 			msg = "robots_unreachable: " + msg
 		}
-		return false, true, msg
+		return false, true, fetched, msg
 	}
 	if !entry.Allowed(u.RequestURI()) {
 		if entry.ContentSignalBlocked() {
-			return false, false, "disallowed by /robots.txt Content-Signal: ai-input=no"
+			return false, false, fetched, "disallowed by /robots.txt Content-Signal: ai-input=no"
 		}
-		return false, false, "robots.txt disallowed " + u.Path
+		return false, false, fetched, "robots.txt disallowed " + u.Path
 	}
-	return true, false, ""
+	return true, false, fetched, ""
 }
 
 // fetchRobots implements RFC 9309 §2.3.1 & §2.4 (following up to MaxRedirects = 5 validated redirects):

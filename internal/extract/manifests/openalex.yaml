@@ -1,0 +1,108 @@
+# Shared Go + TypeScript Declarative Site Adapter: OpenAlex Scholarly Works
+id: openalex
+name: OpenAlex Scholarly Works
+category: research-health
+description: Upgrades openalex.org work URLs to api.openalex.org JSON with reconstructed abstracts, citations, open-access PDF links, and topics.
+domains:
+  - openalex.org
+  - www.openalex.org
+  - api.openalex.org
+exampleUrls:
+  - https://openalex.org/W2741809807
+  - https://openalex.org/works/W2741809807
+
+# Match both /works/<workId> and /<workId> (W followed by 5..15 digits)
+match:
+  anyOf:
+    - exactSegments: false
+      pathSegments:
+        - works
+        - param: workId
+          charset: openalex_work
+          transform: upper
+    - exactSegments: false
+      pathSegments:
+        - param: workId
+          charset: openalex_work
+          transform: upper
+
+twin:
+  fetchUrl: "https://api.openalex.org/works/{workId}"
+  kind: json
+  accept: application/json
+
+extract:
+  requireAnyFields:
+    - display_name
+    - title
+  requireVars:
+    - title
+  vars:
+    title:
+      paths:
+        - display_name
+        - title
+      trim: true
+    pubDate:
+      paths:
+        - publication_date
+    citedBy:
+      paths:
+        - cited_by_count
+      format: int_comma
+    doi:
+      paths:
+        - doi
+    oaUrl:
+      paths:
+        - open_access.oa_url
+      requireHttps: true
+    authors:
+      paths:
+        - authorships
+      subField: author.display_name
+      limit: 15
+      join: ", "
+    authorsShort:
+      paths:
+        - authorships
+      subField: author.display_name
+      limit: 4
+      join: ", "
+    abstract:
+      paths:
+        - abstract_inverted_index
+      format: inverted_abstract
+    abstractShort:
+      paths:
+        - abstract_inverted_index
+      format: inverted_abstract
+      sliceMax: 260
+  titleTemplate: "{title}"
+  descriptionVar: abstractShort
+  authorVar: authorsShort
+  publishedTimeVar: pubDate
+  bullets:
+    - label: OpenAlex ID
+      template: "`{workId}`"
+    - label: Authors
+      template: "{authors}"
+      whenVar: authors
+    - label: Published
+      template: "{pubDate}"
+      whenVar: pubDate
+    - label: Citations
+      template: "{citedBy}"
+      whenVar: citedBy
+    - label: DOI
+      template: "{doi}"
+      whenVar: doi
+    - label: Open Access PDF
+      template: "{oaUrl}"
+      whenVar: oaUrl
+  sections:
+    - heading: Abstract
+      textVar: abstract
+  linksVars:
+    - doi
+    - oaUrl

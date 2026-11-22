@@ -13,6 +13,7 @@
 import { parseExactRetryAfterMs, recomputeSummary, type CrawlResultItem } from './agent-hub';
 import { signOutboundBotHeaders } from './bot-auth';
 import { filterSafeResponseHeaders } from './framework-detect';
+import { getActiveRequestTracer } from './otel';
 import { classifyWafAndChallenge } from './waf';
 
 export const ROBOTS_MAX_BYTES = 1024 * 1024; // 1 MiB >= RFC 9309 500 KiB minimum
@@ -23,6 +24,7 @@ const MAX_REDIRECT_HOPS = 5;
 const ROBOTS_CACHE_MIN_MS = 60_000;
 const ROBOTS_CACHE_MAX_MS = 86_400_000;
 const ROBOTS_CACHE_DEFAULT_MS = 3_600_000;
+export const ROBOTS_UNREACHABLE_CACHE_MAX_MS = 10_000; // <= 10s negative cache ceiling on transient `robots_unreachable`
 const MAX_ROBOTS_CACHE_ENTRIES = 512;
 export const MARKDOWN_FOR_AGENTS_ACCEPT =
   'text/markdown, text/html;q=0.9, application/xhtml+xml;q=0.8, */*;q=0.7';
@@ -41,6 +43,7 @@ export interface ParsedRobots {
   contentSignals?: ContentSignals;
   disallowAiInput?: boolean;
   cacheTtlMs?: number;
+  doNotCacheShared?: boolean;
 }
 
 function isUnreservedAsciiByte(b: number): boolean {
@@ -84,14 +87,18 @@ export function normalizeRobotsURI(raw: string): string {
 }
 
 function canonicalProductToken(raw: string): string {
-  const trimmed = raw.replace(/[\u200B-\u200F\u2060\uFEFF]/g, '').trim().toLowerCase();
-  if (!trimmed) return '';
-  if (trimmed === '*') return '*';
-  const slash = trimmed.indexOf('/');
-  const head = slash >= 0 ? trimmed.slice(0, slash) : trimmed;
-  const token = head.split(/\s+/)[0] ?? '';
-  const cleanMatch = /^[a-z_-]+/.exec(token);
-  return cleanMatch ? cleanMatch[0] : '';
+  let tok = trimAsciiSpaceTab(raw).toLowerCase();
+  if (!tok) return '';
+  if (tok === '*') return '*';
+  const slash = tok.indexOf('/');
+  if (slash >= 0) {
+    tok = trimAsciiSpaceTab(tok.slice(0, slash));
+  }
+  const sp = tok.search(/[ \t]/);
+  if (sp >= 0) {
+    tok = trimAsciiSpaceTab(tok.slice(0, sp));
+  }
+  return tok;
 }
 
 /** Iterative O(P*T) wildcard matcher (`*` and trailing `$`) with zero ReDoS surface. */
@@ -204,18 +211,18 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
   for (const rawLine of body.split('\n')) {
     const hashIdx = rawLine.indexOf('#');
     const noComment = hashIdx >= 0 ? rawLine.slice(0, hashIdx) : rawLine;
-    const line = noComment.trim();
+    // Match Go `politeness.ParseRobotsTxt` (`trimRobotsWS` trims ONLY ASCII space and tab `" \t"`).
+    const line = trimAsciiSpaceTab(noComment);
     if (!line) {
       // RFC 9309 §2.2.1: blank lines inside a group do NOT close the current User-agent group.
       continue;
     }
-    const colon = noComment.indexOf(':');
+    const colon = line.indexOf(':');
     if (colon <= 0) continue;
-    const rawField = noComment.slice(0, colon);
+    const rawField = line.slice(0, colon);
     if (rawField.includes('\0')) continue;
-    const field = rawField.trim().toLowerCase();
-    const rawValAfterColon = noComment.slice(colon + 1);
-    const val = rawValAfterColon.trim();
+    const field = trimAsciiSpaceTab(rawField).toLowerCase();
+    const val = trimAsciiSpaceTab(line.slice(colon + 1));
     if (field === 'user-agent') {
       seenAnyUserAgent = true;
       if (seenDirective && cur.agents.length > 0) {
@@ -224,22 +231,22 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
         seenDirective = false;
       }
       const parsedUa = canonicalProductToken(val);
-      if (!val || !parsedUa) {
+      if (!parsedUa) {
         // Match Go `politeness.ParseRobotsTxt`: empty `User-agent:` closes a preceding group that saw directives, without adding an agent.
         continue;
       }
       cur.agents.push(parsedUa);
-    } else if (field === 'allow' && cur.agents.length > 0 && val) {
+    } else if (field === 'allow' && cur.agents.length > 0) {
       seenDirective = true;
-      const norm = normalizeRobotsURI(val);
-      if (norm.startsWith('/') || norm.startsWith('*')) {
-        cur.rules.push({ pattern: norm, allow: true });
+      if (val !== '') {
+        const norm = normalizeRobotsURI(val);
+        if (norm.startsWith('/') || norm.startsWith('*')) {
+          cur.rules.push({ pattern: norm, allow: true });
+        }
       }
     } else if (field === 'disallow' && cur.agents.length > 0) {
       seenDirective = true;
-      if (val === '') {
-        cur.rules.push({ pattern: '/', allow: true });
-      } else {
+      if (val !== '') {
         const norm = normalizeRobotsURI(val);
         if (norm.startsWith('/') || norm.startsWith('*')) {
           cur.rules.push({ pattern: norm, allow: false });
@@ -247,19 +254,18 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
       }
     } else if (field === 'crawl-delay' && cur.agents.length > 0) {
       seenDirective = true;
-      const secs = Number(val);
-      if (Number.isFinite(secs) && secs > 0) {
-        cur.crawlDelayMs = Math.min(30_000, Math.round(secs * 1000));
+      if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(val)) {
+        const secs = Number(val);
+        if (Number.isFinite(secs) && secs > 0) {
+          cur.crawlDelayMs = Math.min(30_000, Math.floor((secs * 1e9) / 1e6));
+        }
       }
     } else if (field === 'content-signal') {
-      const csVal = trimAsciiSpaceTab(rawValAfterColon);
-      if (csVal) {
-        if (!seenAnyUserAgent && cur.agents.length === 0) {
-          parseContentSignalLine(csVal, preGroupSignals);
-        } else if (cur.agents.length > 0) {
-          seenDirective = true;
-          parseContentSignalLine(csVal, cur.signals);
-        }
+      if (cur.agents.length > 0) {
+        seenDirective = true;
+        if (val) parseContentSignalLine(val, cur.signals);
+      } else if (!seenAnyUserAgent && val) {
+        parseContentSignalLine(val, preGroupSignals);
       }
     }
   }
@@ -637,8 +643,11 @@ function readCachedHubRobots(cacheKey: string, now: number): ParsedRobots | unde
 }
 
 function storeCachedHubRobots(cacheKey: string, entry: ParsedRobots, now: number): void {
-  const ttl = entry.cacheTtlMs ?? (entry.unreachable ? ROBOTS_CACHE_MIN_MS : ROBOTS_CACHE_DEFAULT_MS);
-  const clampedTtl = Math.min(ROBOTS_CACHE_MAX_MS, Math.max(ROBOTS_CACHE_MIN_MS, ttl));
+  if (entry.doNotCacheShared) return;
+  if (entry.unreachable && (entry.cacheTtlMs ?? ROBOTS_UNREACHABLE_CACHE_MAX_MS) <= 0) return;
+  const clampedTtl = entry.unreachable
+    ? Math.min(ROBOTS_UNREACHABLE_CACHE_MAX_MS, Math.max(1_000, entry.cacheTtlMs ?? ROBOTS_UNREACHABLE_CACHE_MAX_MS))
+    : Math.min(ROBOTS_CACHE_MAX_MS, Math.max(ROBOTS_CACHE_MIN_MS, entry.cacheTtlMs ?? ROBOTS_CACHE_DEFAULT_MS));
   hubRobotsTtlCache.delete(cacheKey);
   hubRobotsTtlCache.set(cacheKey, { entry, expiresAt: now + clampedTtl });
   while (hubRobotsTtlCache.size > MAX_ROBOTS_CACHE_ENTRIES) {
@@ -678,9 +687,11 @@ export async function fetchOverflowRobots(
       reason: 'robots_unreachable: request budget exhausted before robots.txt check',
       crawlDelayMs: 0,
       rules: [],
-      cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+      cacheTtlMs: 0,
+      doNotCacheShared: true,
     };
   }
+  const callerBudgetConstrained = remMs < ROBOTS_TIMEOUT_MS;
   const signal = AbortSignal.timeout(Math.min(ROBOTS_TIMEOUT_MS, remMs));
   try {
     let curUrl = `${origin}/robots.txt`;
@@ -692,7 +703,7 @@ export async function fetchOverflowRobots(
           reason: 'robots_unreachable: robots.txt disallowed redirect target',
           crawlDelayMs: 15_000,
           rules: [],
-          cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+          cacheTtlMs: ROBOTS_UNREACHABLE_CACHE_MAX_MS,
         };
       }
       const resp = await fetchFn(curUrl, {
@@ -710,7 +721,7 @@ export async function fetchOverflowRobots(
             reason: `robots_unreachable: robots.txt redirect failed (HTTP ${resp.status})`,
             crawlDelayMs: 15_000,
             rules: [],
-            cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+            cacheTtlMs: ROBOTS_UNREACHABLE_CACHE_MAX_MS,
           };
         }
         let nextUrl: URL;
@@ -722,7 +733,7 @@ export async function fetchOverflowRobots(
             reason: `robots_unreachable: robots.txt invalid redirect location (HTTP ${resp.status})`,
             crawlDelayMs: 15_000,
             rules: [],
-            cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+            cacheTtlMs: ROBOTS_UNREACHABLE_CACHE_MAX_MS,
           };
         }
         if (isDisallowedOverflowUrl(nextUrl, canonicalSelf)) {
@@ -731,7 +742,7 @@ export async function fetchOverflowRobots(
             reason: 'robots_unreachable: robots.txt disallowed redirect target',
             crawlDelayMs: 15_000,
             rules: [],
-            cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+            cacheTtlMs: ROBOTS_UNREACHABLE_CACHE_MAX_MS,
           };
         }
         if (hop === MAX_REDIRECT_HOPS) {
@@ -749,7 +760,7 @@ export async function fetchOverflowRobots(
           reason: `robots_unreachable: robots.txt returned HTTP ${resp.status} (disallow assumed per RFC 9309)`,
           crawlDelayMs: 15_000,
           rules: [],
-          cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+          cacheTtlMs: ROBOTS_UNREACHABLE_CACHE_MAX_MS,
         };
       }
       if (resp.status >= 400 && resp.status < 500) {
@@ -770,25 +781,31 @@ export async function fetchOverflowRobots(
         reason: `robots_unreachable: robots.txt returned unexpected HTTP ${resp.status}`,
         crawlDelayMs: 15_000,
         rules: [],
-        cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+        cacheTtlMs: ROBOTS_UNREACHABLE_CACHE_MAX_MS,
       };
     }
     return { unreachable: false, crawlDelayMs: 0, rules: [], cacheTtlMs: ROBOTS_CACHE_DEFAULT_MS };
   } catch (e) {
+    // Never poison global `hubRobotsTtlCache` when a caller's own short `maxSeconds` budget caused the abort/timeout!
+    const abortedByShortCallerBudget = callerBudgetConstrained && (signal.aborted || Date.now() >= budgetDeadlineAt);
     return {
       unreachable: true,
       reason: `robots_unreachable: robots.txt unreachable (disallow assumed per RFC 9309): ${e instanceof Error ? e.message : String(e)}`,
-      crawlDelayMs: 15_000,
+      crawlDelayMs: abortedByShortCallerBudget ? 0 : 15_000,
       rules: [],
-      cacheTtlMs: ROBOTS_CACHE_MIN_MS,
+      cacheTtlMs: abortedByShortCallerBudget ? 0 : ROBOTS_UNREACHABLE_CACHE_MAX_MS,
+      ...(abortedByShortCallerBudget ? { doNotCacheShared: true } : {}),
     };
   }
 }
 
 export interface OverflowDeps {
   fetchFn?: typeof fetch;
+  useSharedRobotsCache?: boolean;
   sleepFn?: (ms: number) => Promise<void>;
   bypassAllowlist?: string[];
+  trace?: Record<string, string>;
+  onBotAuthSigned?: () => void;
   botAuth?: {
     privateKey: string;
     directoryUrl?: string;
@@ -802,9 +819,10 @@ export async function cloudflareOverflowFetch(
   deps: OverflowDeps = {},
 ): Promise<Response> {
   const fetchFn = deps.fetchFn ?? fetch;
-  const useSharedRobotsCache = deps.fetchFn === undefined;
+  const useSharedRobotsCache = deps.useSharedRobotsCache ?? (deps.fetchFn === undefined);
   const sleepFn = deps.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const bypassAllowlist = deps.bypassAllowlist ?? [];
+  let reportedBotAuthSigned = false;
 
   const started = Date.now();
   let call: {
@@ -1013,6 +1031,11 @@ export async function cloudflareOverflowFetch(
                 ...(deps.botAuth.directoryUrl ? { directoryUrl: deps.botAuth.directoryUrl } : {}),
               });
               for (const [sk, sv] of Object.entries(sigHdrs)) headers.set(sk, sv);
+              if (!reportedBotAuthSigned) {
+                reportedBotAuthSigned = true;
+                deps.onBotAuthSigned?.();
+                getActiveRequestTracer()?.setAttribute('bot_auth.signed', true);
+              }
             } catch {
               // Non-fatal if optional bot signing key is invalid.
             }

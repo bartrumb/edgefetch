@@ -76,6 +76,7 @@ import {
   type MapRequestPayload,
 } from './map-crawl';
 import { handleMcpRequest } from './mcp';
+import { handleOpenApiRoute } from './openapi';
 import { authorizeMcpRequest, createSqliteOAuthStore, handleOAuthRoute, OAUTH_SQLITE_SCHEMA } from './oauth';
 import type {
   OAuthClientRecord,
@@ -89,10 +90,12 @@ import type {
 } from './oauth';
 import {
   buildCrawlChildSpans,
-  createRequestTraceContext,
-  flushOtlpSpans,
+  getActiveRequestTracer,
+  injectTraceHeaders,
+  RequestTracer,
+  sanitizeUrlForSpan,
+  setActiveSpanAttribute,
   type OtelEnvConfig,
-  type OtlpSpanInput,
 } from './otel';
 import { cloudflareOverflowFetch, parseHostAllowlist, validateCallRobotsPolicy } from './overflow';
 import { readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
@@ -753,9 +756,87 @@ function hubActivityProxy(hub: () => DurableObjectStub<AgentHubDO>): ActivitySto
   };
 }
 
+function resolveCompatSpanMeta(pathname: string): { spanName: string; flavor: 'firecrawl_v2' | 'tavily' } | null {
+  if (pathname.startsWith('/compat/tavily/')) {
+    if (pathname === '/compat/tavily/search') return { spanName: 'edgefetch.search', flavor: 'tavily' };
+    if (pathname === '/compat/tavily/extract') return { spanName: 'edgefetch.extract', flavor: 'tavily' };
+    if (pathname === '/compat/tavily/map') return { spanName: 'edgefetch.map', flavor: 'tavily' };
+    return { spanName: 'edgefetch.compat', flavor: 'tavily' };
+  }
+  let sub: string | null = null;
+  if (pathname.startsWith('/v2/')) sub = pathname.slice('/v2'.length);
+  else if (pathname.startsWith('/compat/firecrawl/v2/')) sub = pathname.slice('/compat/firecrawl/v2'.length);
+  if (sub === null) return null;
+  if (sub === '/scrape') return { spanName: 'edgefetch.scrape', flavor: 'firecrawl_v2' };
+  if (sub === '/extract' || sub.startsWith('/extract/')) return { spanName: 'edgefetch.extract', flavor: 'firecrawl_v2' };
+  if (sub === '/map') return { spanName: 'edgefetch.map', flavor: 'firecrawl_v2' };
+  if (sub === '/crawl' || sub.startsWith('/crawl/')) return { spanName: 'edgefetch.crawl', flavor: 'firecrawl_v2' };
+  if (sub === '/batch/scrape' || sub.startsWith('/batch/scrape/')) return { spanName: 'edgefetch.batch_scrape', flavor: 'firecrawl_v2' };
+  if (sub === '/search') return { spanName: 'edgefetch.search', flavor: 'firecrawl_v2' };
+  if (sub === '/agent' || sub.startsWith('/agent/')) return { spanName: 'edgefetch.agent', flavor: 'firecrawl_v2' };
+  return { spanName: 'edgefetch.compat', flavor: 'firecrawl_v2' };
+}
+
+function wrapSseResponseWithFlush(res: Response, onClose: () => void | Promise<unknown>): Response {
+  const body = res.body;
+  if (!body) return res;
+  const reader = body.getReader();
+  let closed = false;
+  const finish = async () => {
+    if (closed) return;
+    closed = true;
+    await Promise.resolve(onClose()).catch(() => undefined);
+  };
+  const wrapped = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      let streamEnded = false;
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          streamEnded = true;
+          await finish();
+          controller.close();
+          return;
+        }
+        if (value) controller.enqueue(value);
+      } catch (err) {
+        streamEnded = true;
+        throw err;
+      } finally {
+        if (streamEnded) await finish();
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => undefined);
+      await finish();
+    },
+  });
+  return new Response(wrapped, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: new Headers(res.headers),
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const rootTracer = RequestTracer.fromRequest(request, { suppressWhenUnsampledHealth: true });
+    const trackedCtx: ExecutionContext | undefined = ctx
+      ? ({
+          waitUntil(promise: Promise<unknown>) {
+            const active = getActiveRequestTracer() ?? rootTracer;
+            const wrapped = active
+              .bindPromise(promise)
+              .catch(() => undefined)
+              .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
+            ctx.waitUntil(wrapped);
+          },
+          passThroughOnException() {
+            ctx.passThroughOnException?.();
+          },
+        } as unknown as ExecutionContext)
+      : undefined;
     const shardNames = (env.HUB_SHARDS ?? 'global')
       .split(',')
       .map((s) => s.trim())
@@ -843,8 +924,8 @@ export default {
               : undefined;
 
           const startedAtMs = Date.now();
-          const reqTrace = createRequestTraceContext(request);
-          const trace = reqTrace.headers;
+          const activeParent = getActiveRequestTracer();
+          const localTracer = activeParent ?? RequestTracer.fromRequest(request);
           const pendingEvents: HubEventInput[] = [];
           if (robotsCheck.bypassedHosts.length > 0) {
             pendingEvents.push({
@@ -855,174 +936,204 @@ export default {
               details: { hosts: robotsCheck.bypassedHosts.join(','), source },
             });
           }
-          const dispatchStartMs = Date.now();
-          const res = await routeFetchWithFailover({
-            target,
-            site,
-            body,
-            trace,
-            callAgent: (b, t, s) => dispatchAcrossShards(b, t, s, artifactPolicy),
-            callContainer: (b) =>
-              cloudflareOverflowFetch(b, ua, url.hostname, {
-                bypassAllowlist,
-                ...(env.SAFE_PUBLIC_FETCH ? { fetchFn: env.SAFE_PUBLIC_FETCH } : env.SAFE_FETCH ? { fetchFn: env.SAFE_FETCH } : {}),
-                ...(env.BOT_SIGNING_PRIVATE_KEY?.trim()
-                  ? {
-                      botAuth: {
-                        privateKey: env.BOT_SIGNING_PRIVATE_KEY.trim(),
-                        directoryUrl: `${url.origin}/.well-known/http-message-signatures-directory`,
-                      },
-                    }
-                  : {}),
-              }),
-            waitForHostWindow: (hosts, p, dl) =>
-              hub()
-                .waitForHostWindow(hosts, p, dl)
-                .catch(() => ({ ok: true as const })),
-            onFailover: ({ reason, siteId, count }) => {
-              pendingEvents.push({
-                level: 'warn',
-                category: 'failover',
-                event: 'cloudflare_overflow',
-                summary: `Cloudflare overflow triggered (${reason}, site=${siteId}, urls=${count})`,
-                details: { reason, siteId, count, source },
-              });
-            },
-          });
-          const dispatchMs = Date.now() - dispatchStartMs;
-          const via = res.headers.get('x-crawler-via') ?? target;
-          const retryAfter = res.headers.get('retry-after');
-          const rawCompletedBody = await res.text();
-          let bodyText = rawCompletedBody;
-          let hydrateR2Ms = 0;
-          if (res.status === 200 && env.ARTIFACTS && wantsIncludeBody && hydrateInline) {
-            const hydStart = Date.now();
-            bodyText = await hydrateReplyBodiesFromR2(rawCompletedBody, env.ARTIFACTS);
-            hydrateR2Ms = Date.now() - hydStart;
-          }
 
-          // P12 & S4: Move R2 manifest write + Cloudflare Workflows `INGEST.create(...)` + activity-log RPC off the
-          // synchronous HTTP response path into `ctx.waitUntil(...)` whenever `env.INGEST` and `ctx.waitUntil` are bound!
-          const runPostFetchPersistence = async () => {
-            if (res.status === 200 && effectiveRetentionPref !== 'off' && env.ARTIFACTS && env.META) {
-              const ingestJobId = `job_${crypto.randomUUID().replace(/-/g, '')}`;
-              const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(via);
-              try {
-                const written = await writeJobManifestToR2({
-                  bucket: env.ARTIFACTS,
-                  jobId: ingestJobId,
-                  via,
-                  ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
-                  ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
-                  ...(crawlId ? { crawlId } : {}),
-                  rawReplyText: rawCompletedBody,
-                });
-                if (written.ok) {
-                  const wfParams = {
-                    manifestKey: written.manifestKey,
-                    jobId: ingestJobId,
-                    ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
-                    ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
-                    via,
-                  };
-                  if (env.INGEST && !crawlId) {
-                    try {
-                      await env.INGEST.create({ id: `ingest-${ingestJobId}`, params: wfParams });
-                    } catch (wfErr) {
-                      const wfMsg = wfErr instanceof Error ? wfErr.message : String(wfErr);
-                      if (!/already exists|duplicate/i.test(wfMsg)) {
-                        pendingEvents.push({
-                          level: 'warn',
-                          category: 'crawl',
-                          event: 'ingest_workflow_error',
-                          summary: `Failed to enqueue IngestWorkflow for ${ingestJobId}: ${wfMsg.slice(0, 140)}`,
-                          details: { jobId: ingestJobId, manifestKey: written.manifestKey },
-                        });
-                      }
-                    }
-                  } else {
-                    await executeIngestPipeline(env, wfParams, undefined, {
-                      onArtifactRejected: ({ blobSha256, reason, siteId }) => {
-                        pendingEvents.push({
-                          level: 'warn',
-                          category: 'crawl',
-                          event: 'artifact_verification_failed',
-                          summary: `Rejected unverified artifact ${blobSha256.slice(0, 12)} (${reason})`,
-                          details: { jobId: ingestJobId, blobSha256, reason, siteId: siteId ?? null },
-                        });
-                      },
-                    });
-                  }
-                }
-              } catch (manifestErr) {
-                const mMsg = manifestErr instanceof Error ? manifestErr.message : String(manifestErr);
-                pendingEvents.push({
-                  level: 'warn',
-                  category: 'crawl',
-                  event: 'ingest_manifest_error',
-                  summary: `Failed to write R2 ingest manifest: ${mMsg.slice(0, 140)}`,
-                });
-              }
-            }
-            pendingEvents.push(...buildCrawlActivityEvents({ source, target, via, httpStatus: res.status, replyText: bodyText }));
-            await hub()
-              .recordHubEvents(pendingEvents)
-              .catch(() => undefined);
-          };
-
-          if (env.INGEST && !crawlId && !resolvedCollectionId && ctx?.waitUntil) {
-            ctx.waitUntil(runPostFetchPersistence());
-          } else {
-            await runPostFetchPersistence();
-          }
-
-          if (env.OTEL_EXPORTER_OTLP_ENDPOINT && reqTrace.context.sampled) {
-            const endedAtMs = Date.now();
-            const otlpSpans: OtlpSpanInput[] = [
+          const dispatchResult = await localTracer.run(() =>
+            localTracer.withSpan(
+              'edgefetch.dispatch',
               {
-                traceId: reqTrace.context.traceId,
-                spanId: reqTrace.context.spanId,
-                ...(reqTrace.context.parentSpanId ? { parentSpanId: reqTrace.context.parentSpanId } : {}),
-                name: 'edgefetch.dispatch',
                 kind: 2,
                 startTimeMs: startedAtMs,
-                endTimeMs: endedAtMs,
-                statusOk: res.status >= 200 && res.status < 400,
                 attributes: {
-                  'crawler.via': via,
                   'crawler.target': target,
                   'crawler.source': source,
-                  'http.response.status_code': res.status,
                 },
               },
-              ...buildCrawlChildSpans({
-                traceId: reqTrace.context.traceId,
-                parentSpanId: reqTrace.context.spanId,
-                via,
-                endTimeMs: endedAtMs,
-                replyText: bodyText,
-              }),
-            ];
-            const flushPromise = flushOtlpSpans({ env, spans: otlpSpans });
+              async (dispatchSpan) => {
+                const trace = getActiveRequestTracer()?.getTraceHeaders() ?? localTracer.getTraceHeaders();
+                let botAuthSigned = false;
+                const dispatchStartMs = Date.now();
+                const res = await routeFetchWithFailover({
+                  target,
+                  site,
+                  body,
+                  trace,
+                  callAgent: (b, t, s) => dispatchAcrossShards(b, t, s, artifactPolicy),
+                  callContainer: (b, t) =>
+                    cloudflareOverflowFetch(b, ua, url.hostname, {
+                      bypassAllowlist,
+                      trace: t,
+                      onBotAuthSigned: () => {
+                        botAuthSigned = true;
+                      },
+                      ...(env.SAFE_PUBLIC_FETCH ? { fetchFn: env.SAFE_PUBLIC_FETCH } : env.SAFE_FETCH ? { fetchFn: env.SAFE_FETCH } : {}),
+                      ...(env.BOT_SIGNING_PRIVATE_KEY?.trim()
+                        ? {
+                            botAuth: {
+                              privateKey: env.BOT_SIGNING_PRIVATE_KEY.trim(),
+                              directoryUrl: `${url.origin}/.well-known/http-message-signatures-directory`,
+                            },
+                          }
+                        : {}),
+                    }),
+                  waitForHostWindow: (hosts, p, dl) =>
+                    hub()
+                      .waitForHostWindow(hosts, p, dl)
+                      .catch(() => ({ ok: true as const })),
+                  onFailover: ({ reason, siteId, count }) => {
+                    pendingEvents.push({
+                      level: 'warn',
+                      category: 'failover',
+                      event: 'cloudflare_overflow',
+                      summary: `Cloudflare overflow triggered (${reason}, site=${siteId}, urls=${count})`,
+                      details: { reason, siteId, count, source },
+                    });
+                  },
+                });
+                const dispatchMs = Date.now() - dispatchStartMs;
+                const via = res.headers.get('x-crawler-via') ?? target;
+                const retryAfter = res.headers.get('retry-after');
+                const rawCompletedBody = await res.text();
+                let bodyText = rawCompletedBody;
+                let hydrateR2Ms = 0;
+                if (res.status === 200 && env.ARTIFACTS && wantsIncludeBody && hydrateInline) {
+                  const hydStart = Date.now();
+                  bodyText = await hydrateReplyBodiesFromR2(rawCompletedBody, env.ARTIFACTS);
+                  hydrateR2Ms = Date.now() - hydStart;
+                }
+
+                // P12 & S4: Move R2 manifest write + Cloudflare Workflows `INGEST.create(...)` + activity-log RPC off the
+                // synchronous HTTP response path into `ctx.waitUntil(...)` whenever `env.INGEST` and `ctx.waitUntil` are bound!
+                const runPostFetchPersistence = async () => {
+                  if (res.status === 200 && effectiveRetentionPref !== 'off' && env.ARTIFACTS && env.META) {
+                    const ingestJobId = `job_${crypto.randomUUID().replace(/-/g, '')}`;
+                    const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(via);
+                    try {
+                      const written = await writeJobManifestToR2({
+                        bucket: env.ARTIFACTS,
+                        jobId: ingestJobId,
+                        via,
+                        ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
+                        ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
+                        ...(crawlId ? { crawlId } : {}),
+                        rawReplyText: rawCompletedBody,
+                      });
+                      if (written.ok) {
+                        const wfParams = {
+                          manifestKey: written.manifestKey,
+                          jobId: ingestJobId,
+                          ...(siteMatch?.[1] ? { siteId: siteMatch[1] } : {}),
+                          ...(resolvedCollectionId ? { collectionId: resolvedCollectionId } : {}),
+                          via,
+                        };
+                        if (env.INGEST && !crawlId) {
+                          try {
+                            await env.INGEST.create({ id: `ingest-${ingestJobId}`, params: wfParams });
+                          } catch (wfErr) {
+                            const wfMsg = wfErr instanceof Error ? wfErr.message : String(wfErr);
+                            if (!/already exists|duplicate/i.test(wfMsg)) {
+                              pendingEvents.push({
+                                level: 'warn',
+                                category: 'crawl',
+                                event: 'ingest_workflow_error',
+                                summary: `Failed to enqueue IngestWorkflow for ${ingestJobId}: ${wfMsg.slice(0, 140)}`,
+                                details: { jobId: ingestJobId, manifestKey: written.manifestKey },
+                              });
+                            }
+                          }
+                        } else {
+                          await executeIngestPipeline(env, wfParams, undefined, {
+                            onArtifactRejected: ({ blobSha256, reason, siteId }) => {
+                              pendingEvents.push({
+                                level: 'warn',
+                                category: 'crawl',
+                                event: 'artifact_verification_failed',
+                                summary: `Rejected unverified artifact ${blobSha256.slice(0, 12)} (${reason})`,
+                                details: { jobId: ingestJobId, blobSha256, reason, siteId: siteId ?? null },
+                              });
+                            },
+                          });
+                        }
+                      }
+                    } catch (manifestErr) {
+                      const mMsg = manifestErr instanceof Error ? manifestErr.message : String(manifestErr);
+                      pendingEvents.push({
+                        level: 'warn',
+                        category: 'crawl',
+                        event: 'ingest_manifest_error',
+                        summary: `Failed to write R2 ingest manifest: ${mMsg.slice(0, 140)}`,
+                      });
+                    }
+                  }
+                  pendingEvents.push(...buildCrawlActivityEvents({ source, target, via, httpStatus: res.status, replyText: bodyText }));
+                  await hub()
+                    .recordHubEvents(pendingEvents)
+                    .catch(() => undefined);
+                };
+
+                if (env.INGEST && !crawlId && !resolvedCollectionId && trackedCtx?.waitUntil) {
+                  trackedCtx.waitUntil(runPostFetchPersistence());
+                } else {
+                  await runPostFetchPersistence();
+                }
+
+                dispatchSpan.setAttribute('crawler.via', via);
+                dispatchSpan.setAttribute('http.response.status_code', res.status);
+                if (botAuthSigned) {
+                  span.setAttribute('bot_auth.signed', true);
+                  dispatchSpan.setAttribute('bot_auth.signed', true);
+                }
+                dispatchSpan.setStatus(res.status >= 200 && res.status < 400);
+                if (!localTracer.suppressed && localTracer.sampled) {
+                  localTracer.recordSpans(
+                    buildCrawlChildSpans({
+                      traceId: localTracer.traceId,
+                      parentSpanId: dispatchSpan.spanId,
+                      via,
+                      endTimeMs: Date.now(),
+                      replyText: bodyText,
+                    }),
+                  );
+                }
+
+                const totalHubMs = Date.now() - startedAtMs;
+                const stageTimingsMs = { dispatchMs, hydrateR2Ms, totalHubMs };
+                span.setAttribute('edgefetch.via', via);
+                return { status: res.status, via, bodyText, stageTimingsMs, ...(retryAfter ? { retryAfter } : {}) };
+              },
+            ),
+          );
+
+          if (!activeParent && !localTracer.suppressed && localTracer.sampled) {
+            const flushPromise = localTracer.flush({ env, fetchFn: env.SAFE_FETCH });
             if (ctx?.waitUntil) {
               ctx.waitUntil(flushPromise);
             } else {
               await flushPromise;
             }
           }
-
-          const totalHubMs = Date.now() - startedAtMs;
-          const stageTimingsMs = { dispatchMs, hydrateR2Ms, totalHubMs };
-          span.setAttribute('edgefetch.via', via);
-          return { status: res.status, via, bodyText, stageTimingsMs, ...(retryAfter ? { retryAfter } : {}) };
+          return dispatchResult;
         },
       );
 
-    try {
+    const withRouteSpan = async (
+      name: string,
+      attrs: Record<string, string | number | boolean | undefined>,
+      fn: () => Promise<Response>,
+    ): Promise<Response> =>
+      (getActiveRequestTracer() ?? rootTracer).withSpan(name, { kind: 1, attributes: attrs }, async (routeSpan) => {
+        const res = await fn();
+        routeSpan.setAttribute('http.response.status_code', res.status);
+        routeSpan.setStatus(res.status < 500);
+        return res;
+      });
+
+    const routeRequest = async (): Promise<Response> => {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.2');
+      const openApiRes = handleOpenApiRoute(request, url, '2.6.3');
+      if (openApiRes) return openApiRes;
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.3');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1095,29 +1206,32 @@ export default {
       const oauthStore = hubOAuthStore(hub);
       const activity = hubActivityProxy(hub);
 
-      const makeCatalogHubFetch =
-        (sourceLabel: string): CatalogHubFetchFn =>
-        async ({ url: pageUrl, kind = 'json', accept = 'application/json', maxBytes, target: rawTgt, site: rawSite }) => {
+      const makeCatalogHubFetch = (sourceLabel: string): CatalogHubFetchFn => {
+        const boundTracer = getActiveRequestTracer();
+        return async ({ url: pageUrl, kind = 'json', accept = 'application/json', maxBytes, target: rawTgt, site: rawSite, tracer }) => {
           const tgt: FetchTarget = rawTgt === 'agent' || rawTgt === 'container' ? rawTgt : 'auto';
           const siteStr = typeof rawSite === 'string' && rawSite.trim() ? rawSite.trim() : undefined;
           const boundedMaxBytes =
             typeof maxBytes === 'number' && Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : undefined;
-          const hubOut = await executeHubFetch(
-            tgt,
-            JSON.stringify({
-              maxSeconds: 30,
-              options: {
-                includeBody: true,
-                respectRobots: true,
-                ...(boundedMaxBytes !== undefined ? { maxBytes: boundedMaxBytes } : {}),
-              },
-              requests: [{ id: 'cat-1', url: pageUrl, kind, accept }],
-            }),
-            siteStr,
-            sourceLabel,
-            'transient',
-            true,
-          );
+          const callTracer = getActiveRequestTracer(tracer) ?? boundTracer;
+          const doFetch = () =>
+            executeHubFetch(
+              tgt,
+              JSON.stringify({
+                maxSeconds: 30,
+                options: {
+                  includeBody: true,
+                  respectRobots: true,
+                  ...(boundedMaxBytes !== undefined ? { maxBytes: boundedMaxBytes } : {}),
+                },
+                requests: [{ id: 'cat-1', url: pageUrl, kind, accept }],
+              }),
+              siteStr,
+              sourceLabel,
+              'transient',
+              true,
+            );
+          const hubOut = await (callTracer ? callTracer.run(doFetch) : doFetch());
           if (hubOut.status !== 200) {
             return {
               status: hubOut.status,
@@ -1142,6 +1256,7 @@ export default {
             return { status: 502, outcome: 'error', problem: 'malformed hub reply', headers: {}, body: '' };
           }
         };
+      };
 
       const oauthRes = await handleOAuthRoute(request, url, {
         store: oauthStore,
@@ -1155,13 +1270,13 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.6.2',
+          serverVersion: '2.6.3',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
           activity,
           selfHost: url.hostname,
-          ...(ctx?.waitUntil ? { scheduleBackground: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
+          ...(trackedCtx?.waitUntil ? { scheduleBackground: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } : {}),
           allowedTargets: ALLOWED_TARGETS,
           defaultTarget: 'auto',
           listFleet: async () => {
@@ -1238,10 +1353,10 @@ export default {
               env,
               executeHubFetch,
               selfHost: url.hostname,
-              waitUntilBounded: Boolean(ctx?.waitUntil),
+              waitUntilBounded: Boolean(trackedCtx?.waitUntil),
             });
-            if (ctx?.waitUntil) {
-              ctx.waitUntil(jobPromise);
+            if (trackedCtx?.waitUntil) {
+              trackedCtx.waitUntil(jobPromise);
             } else {
               await jobPromise;
             }
@@ -1301,7 +1416,7 @@ export default {
               executeHubFetch: makeCatalogHubFetch(`mcp-catalog:${principal ?? 'client'}`),
               selfHost: url.hostname,
               principal: principal ?? 'mcp',
-              ...(ctx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } } : {}),
+              ...(trackedCtx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } } : {}),
             });
           },
           executeAgent: async ({ args, principal }) => {
@@ -1318,13 +1433,20 @@ export default {
               }
               return { status: 200, body: formatPublicAgentResponse(rec, false) };
             }
+            const mcpAgentWaitUntil = trackedCtx?.waitUntil
+              ? (p: Promise<unknown>) => trackedCtx.waitUntil(p)
+              : (p: Promise<unknown>) => {
+                  void p
+                    .catch(() => undefined)
+                    .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
+                };
             const out = await startOrExecuteAgentCall({
               payload: args,
               env,
               executeHubFetch,
               selfHost: url.hostname,
               principal: principal ?? 'mcp',
-              ...(ctx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
+              waitUntil: mcpAgentWaitUntil,
             });
             if (out.kind === 'sse') {
               return { status: 200, body: { ok: true, note: 'SSE stream completed' } };
@@ -1392,147 +1514,178 @@ export default {
       if (adminRes) return adminRes;
 
       if (request.method === 'GET' && url.pathname === '/v1/capabilities') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        return Response.json(buildCapabilities(env, '2.6.2'), {
-          status: 200,
-          headers: { 'cache-control': 'no-store' },
+        return withRouteSpan('edgefetch.capabilities', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          return Response.json(buildCapabilities(env, '2.6.3'), {
+            status: 200,
+            headers: { 'cache-control': 'no-store' },
+          });
         });
       }
 
       if (request.method === 'GET' && url.pathname === '/v1/extractors') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
+        return withRouteSpan('edgefetch.extractors', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const category = url.searchParams.get('category') ?? undefined;
+          const extractors = listRegisteredAdapters(category);
+          const categories: Record<string, number> = {};
+          for (const ex of extractors) {
+            categories[ex.category] = (categories[ex.category] ?? 0) + 1;
+          }
           return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            { ok: true, total: extractors.length, categories, extractors },
+            { status: 200, headers: { 'cache-control': 'no-store' } },
           );
-        }
-        const category = url.searchParams.get('category') ?? undefined;
-        const extractors = listRegisteredAdapters(category);
-        const categories: Record<string, number> = {};
-        for (const ex of extractors) {
-          categories[ex.category] = (categories[ex.category] ?? 0) + 1;
-        }
-        return Response.json(
-          { ok: true, total: extractors.length, categories, extractors },
-          { status: 200, headers: { 'cache-control': 'no-store' } },
-        );
+        });
       }
 
       if (request.method === 'GET' && url.pathname === '/v1/hosts') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
+        return withRouteSpan('edgefetch.hosts', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const rawLimit = Number(url.searchParams.get('limit') ?? 100);
+          const safeLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 100;
+          const hosts = await hub().listHostHealth(safeLimit);
+          return Response.json({ ok: true, hosts }, { status: 200, headers: { 'cache-control': 'no-store' } });
         });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const rawLimit = Number(url.searchParams.get('limit') ?? 100);
-        const safeLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 100;
-        const hosts = await hub().listHostHealth(safeLimit);
-        return Response.json({ ok: true, hosts }, { status: 200, headers: { 'cache-control': 'no-store' } });
       }
 
-      const compatRes = await handleCompatRoutes({
-        request,
-        url,
-        env,
-        oauthStore,
-        executeHubFetch,
-        ...(ctx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
-      });
-      if (compatRes) return compatRes;
+      const compatMeta = resolveCompatSpanMeta(url.pathname);
+      if (compatMeta) {
+        const compatRes = await withRouteSpan(compatMeta.spanName, { 'edgefetch.compat': compatMeta.flavor }, async () => {
+          const compatWaitUntil = trackedCtx?.waitUntil
+            ? (p: Promise<unknown>) => trackedCtx.waitUntil(p)
+            : (p: Promise<unknown>) => {
+                void p
+                  .catch(() => undefined)
+                  .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
+              };
+          const res = await handleCompatRoutes({
+            request,
+            url,
+            env,
+            oauthStore,
+            executeHubFetch,
+            waitUntil: compatWaitUntil,
+            tracer: getActiveRequestTracer() ?? rootTracer,
+          });
+          if (res && (res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
+            return wrapSseResponseWithFlush(res, () => {
+              const p = rootTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+              if (ctx?.waitUntil) ctx.waitUntil(p);
+              return p;
+            });
+          }
+          return res ?? Response.json({ success: false, error: 'not_found' }, { status: 404 });
+        });
+        if (compatRes) return compatRes;
+      }
 
       if (request.method === 'GET' && url.pathname.startsWith('/v1/artifacts/')) {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        const blobSha256 = url.pathname.slice('/v1/artifacts/'.length).trim().toLowerCase();
-        return await handleArtifactGetRequest({
-          request,
-          url,
-          blobSha256,
-          bucket: env.ARTIFACTS,
-          metaDb: env.META,
+        return withRouteSpan('edgefetch.artifacts', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const blobSha256 = url.pathname.slice('/v1/artifacts/'.length).trim().toLowerCase();
+          return await handleArtifactGetRequest({
+            request,
+            url,
+            blobSha256,
+            bucket: env.ARTIFACTS,
+            metaDb: env.META,
+          });
         });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/scrape') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedScrape = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedScrape.ok) {
-          return Response.json(
-            { error: cappedScrape.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedScrape.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: ScrapeRequestPayload;
-        try {
-          payload = JSON.parse(cappedScrape.text) as ScrapeRequestPayload;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const out = await executeScrapeCall({
-          payload,
-          env,
-          executeHubFetch,
-          selfHost: url.hostname,
-          source: `scrape:${auth.principal}`,
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: {
-            'cache-control': 'no-store',
-            'x-crawler-via': out.via,
-            ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
-          },
+        return withRouteSpan('edgefetch.scrape', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedScrape = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedScrape.ok) {
+            return Response.json(
+              { error: cappedScrape.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedScrape.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: ScrapeRequestPayload;
+          try {
+            payload = JSON.parse(cappedScrape.text) as ScrapeRequestPayload;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const out = await executeScrapeCall({
+            payload,
+            env,
+            executeHubFetch,
+            selfHost: url.hostname,
+            source: `scrape:${auth.principal}`,
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: {
+              'cache-control': 'no-store',
+              'x-crawler-via': out.via,
+              ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+            },
+          });
         });
       }
 
@@ -1546,866 +1699,921 @@ export default {
         if (request.method === 'OPTIONS') {
           return new Response(null, { status: 204, headers: corsHeaders });
         }
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { ...corsHeaders, 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: corsHeaders });
-        }
-        const cappedClip = await readBodyTextCapped(request, 4 * 1024 * 1024);
-        if (!cappedClip.ok) {
+        return withRouteSpan('edgefetch.ingest_tab', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { ...corsHeaders, 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: corsHeaders });
+          }
+          const cappedClip = await readBodyTextCapped(request, 4 * 1024 * 1024);
+          if (!cappedClip.ok) {
+            return Response.json(
+              {
+                error: cappedClip.error === 'too_large' ? 'payload_too_large' : 'bad_json',
+                ...(cappedClip.error === 'too_large' ? { message: 'Tab clip exceeds 4 MiB limit' } : {}),
+              },
+              { status: cappedClip.error === 'too_large' ? 413 : 400, headers: corsHeaders },
+            );
+          }
+          let clipPayload: {
+            url?: string;
+            title?: string;
+            html?: string;
+            markdown?: string;
+            collectionId?: string;
+            onlyMainContent?: boolean;
+          };
+          try {
+            clipPayload = JSON.parse(cappedClip.text) as typeof clipPayload;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400, headers: corsHeaders });
+          }
+          const tabUrl = typeof clipPayload.url === 'string' ? clipPayload.url.trim() : '';
+          let parsedTabUrl: URL;
+          try {
+            parsedTabUrl = new URL(tabUrl);
+            if (parsedTabUrl.protocol !== 'https:' && parsedTabUrl.protocol !== 'http:') {
+              throw new Error('scheme');
+            }
+          } catch {
+            return Response.json({ error: 'invalid_url', message: 'Valid http(s) tab url required' }, { status: 400, headers: corsHeaders });
+          }
+          parsedTabUrl.hash = '';
+          const cleanUrl = parsedTabUrl.toString();
+          const collectionId =
+            typeof clipPayload.collectionId === 'string' && COLLECTION_ID_RE.test(clipPayload.collectionId.trim())
+              ? clipPayload.collectionId.trim()
+              : 'browser-clips';
+          setActiveSpanAttribute('url.full', sanitizeUrlForSpan(cleanUrl));
+          setActiveSpanAttribute('edgefetch.collection_id', collectionId);
+
+          let markdown = typeof clipPayload.markdown === 'string' ? clipPayload.markdown.trim() : '';
+          let resolvedTitle = typeof clipPayload.title === 'string' ? clipPayload.title.trim() : '';
+          let description: string | undefined;
+          if (!markdown && typeof clipPayload.html === 'string' && clipPayload.html.trim()) {
+            const extracted = extractHtmlDocument(clipPayload.html, {
+              baseUrl: cleanUrl,
+              onlyMainContent: clipPayload.onlyMainContent !== false,
+            });
+            markdown = extracted.markdown.trim();
+            if (!resolvedTitle && extracted.title) resolvedTitle = extracted.title;
+            description = extracted.description;
+          }
+          if (!markdown) {
+            return Response.json({ error: 'empty_content', message: 'Clipped tab produced empty Markdown' }, { status: 400, headers: corsHeaders });
+          }
+
+          const contentSha256 = await sha256HexString(markdown);
+          const pageId = (await sha256HexString(cleanUrl)).slice(0, 32);
+          const documentId = `clip:${contentSha256.slice(0, 32)}`;
+          const nowMs = Date.now();
+
+          if (env.ARTIFACTS) {
+            await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256), markdown, {
+              httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+            }).catch(() => undefined);
+          }
+
+          let indexedChunks = 0;
+          if (env.SEARCH) {
+            const idx = new D1FtsSearchIndex(env.SEARCH);
+            const rep = await idx.replacePageChunks({
+              collectionId,
+              documentId,
+              pageId,
+              url: cleanUrl,
+              title: resolvedTitle || cleanUrl,
+              markdown,
+              fetchedAt: nowMs,
+            });
+            if (rep.status === 'indexed') indexedChunks = rep.chunkCount;
+          }
+          setActiveSpanAttribute('edgefetch.ingest_tab.indexed_chunks', indexedChunks);
+
           return Response.json(
             {
-              error: cappedClip.error === 'too_large' ? 'payload_too_large' : 'bad_json',
-              ...(cappedClip.error === 'too_large' ? { message: 'Tab clip exceeds 4 MiB limit' } : {}),
+              ok: true,
+              url: cleanUrl,
+              title: resolvedTitle || cleanUrl,
+              ...(description ? { description } : {}),
+              collectionId,
+              indexedChunks,
+              contentSha256,
+              pipelineVersion: SCRAPE_PIPELINE_VERSION,
+              markdown,
             },
-            { status: cappedClip.error === 'too_large' ? 413 : 400, headers: corsHeaders },
+            { status: 200, headers: corsHeaders },
           );
-        }
-        let clipPayload: {
-          url?: string;
-          title?: string;
-          html?: string;
-          markdown?: string;
-          collectionId?: string;
-          onlyMainContent?: boolean;
-        };
-        try {
-          clipPayload = JSON.parse(cappedClip.text) as typeof clipPayload;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400, headers: corsHeaders });
-        }
-        const tabUrl = typeof clipPayload.url === 'string' ? clipPayload.url.trim() : '';
-        let parsedTabUrl: URL;
-        try {
-          parsedTabUrl = new URL(tabUrl);
-          if (parsedTabUrl.protocol !== 'https:' && parsedTabUrl.protocol !== 'http:') {
-            throw new Error('scheme');
-          }
-        } catch {
-          return Response.json({ error: 'invalid_url', message: 'Valid http(s) tab url required' }, { status: 400, headers: corsHeaders });
-        }
-        parsedTabUrl.hash = '';
-        const cleanUrl = parsedTabUrl.toString();
-        const collectionId =
-          typeof clipPayload.collectionId === 'string' && COLLECTION_ID_RE.test(clipPayload.collectionId.trim())
-            ? clipPayload.collectionId.trim()
-            : 'browser-clips';
-
-        let markdown = typeof clipPayload.markdown === 'string' ? clipPayload.markdown.trim() : '';
-        let resolvedTitle = typeof clipPayload.title === 'string' ? clipPayload.title.trim() : '';
-        let description: string | undefined;
-        if (!markdown && typeof clipPayload.html === 'string' && clipPayload.html.trim()) {
-          const extracted = extractHtmlDocument(clipPayload.html, {
-            baseUrl: cleanUrl,
-            onlyMainContent: clipPayload.onlyMainContent !== false,
-          });
-          markdown = extracted.markdown.trim();
-          if (!resolvedTitle && extracted.title) resolvedTitle = extracted.title;
-          description = extracted.description;
-        }
-        if (!markdown) {
-          return Response.json({ error: 'empty_content', message: 'Clipped tab produced empty Markdown' }, { status: 400, headers: corsHeaders });
-        }
-
-        const contentSha256 = await sha256HexString(markdown);
-        const pageId = (await sha256HexString(cleanUrl)).slice(0, 32);
-        const documentId = `clip:${contentSha256.slice(0, 32)}`;
-        const nowMs = Date.now();
-
-        if (env.ARTIFACTS) {
-          await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256), markdown, {
-            httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-          }).catch(() => undefined);
-        }
-
-        let indexedChunks = 0;
-        if (env.SEARCH) {
-          const idx = new D1FtsSearchIndex(env.SEARCH);
-          const rep = await idx.replacePageChunks({
-            collectionId,
-            documentId,
-            pageId,
-            url: cleanUrl,
-            title: resolvedTitle || cleanUrl,
-            markdown,
-            fetchedAt: nowMs,
-          });
-          if (rep.status === 'indexed') indexedChunks = rep.chunkCount;
-        }
-
-        return Response.json(
-          {
-            ok: true,
-            url: cleanUrl,
-            title: resolvedTitle || cleanUrl,
-            ...(description ? { description } : {}),
-            collectionId,
-            indexedChunks,
-            contentSha256,
-            pipelineVersion: SCRAPE_PIPELINE_VERSION,
-            markdown,
-          },
-          { status: 200, headers: corsHeaders },
-        );
+        });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/extract') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedExtract = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedExtract.ok) {
-          return Response.json(
-            { error: cappedExtract.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedExtract.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: ExtractRequestPayload;
-        try {
-          payload = JSON.parse(cappedExtract.text) as ExtractRequestPayload;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const out = await executeExtractCall({
-          payload,
-          env,
-          executeHubFetch,
-          selfHost: url.hostname,
-          source: `extract:${auth.principal}`,
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+        return withRouteSpan('edgefetch.extract', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedExtract = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedExtract.ok) {
+            return Response.json(
+              { error: cappedExtract.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedExtract.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: ExtractRequestPayload;
+          try {
+            payload = JSON.parse(cappedExtract.text) as ExtractRequestPayload;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const out = await executeExtractCall({
+            payload,
+            env,
+            executeHubFetch,
+            selfHost: url.hostname,
+            source: `extract:${auth.principal}`,
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+          });
         });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/interact') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedInteract = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedInteract.ok) {
-          return Response.json(
-            { error: cappedInteract.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedInteract.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: InteractRequestPayload;
-        try {
-          payload = JSON.parse(cappedInteract.text) as InteractRequestPayload;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const out = await executeInteractCall({
-          payload,
-          env,
-          executeHubFetch,
-          selfHost: url.hostname,
-          source: `interact:${auth.principal}`,
-          principal: auth.principal,
-          sessionSigningSecret: env.CALLER_TOKEN,
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+        return withRouteSpan('edgefetch.interact', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedInteract = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedInteract.ok) {
+            return Response.json(
+              { error: cappedInteract.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedInteract.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: InteractRequestPayload;
+          try {
+            payload = JSON.parse(cappedInteract.text) as InteractRequestPayload;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const out = await executeInteractCall({
+            payload,
+            env,
+            executeHubFetch,
+            selfHost: url.hostname,
+            source: `interact:${auth.principal}`,
+            principal: auth.principal,
+            sessionSigningSecret: env.CALLER_TOKEN,
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+          });
         });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/map') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedMap = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedMap.ok) {
-          return Response.json(
-            { error: cappedMap.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedMap.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: MapRequestPayload;
-        try {
-          payload = JSON.parse(cappedMap.text) as MapRequestPayload;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const out = await executeMapCall({
-          payload,
-          executeHubFetch,
-          selfHost: url.hostname,
-          source: `map:${auth.principal}`,
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+        return withRouteSpan('edgefetch.map', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedMap = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedMap.ok) {
+            return Response.json(
+              { error: cappedMap.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedMap.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: MapRequestPayload;
+          try {
+            payload = JSON.parse(cappedMap.text) as MapRequestPayload;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const out = await executeMapCall({
+            payload,
+            executeHubFetch,
+            selfHost: url.hostname,
+            source: `map:${auth.principal}`,
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+          });
         });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/search') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedSearch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedSearch.ok) {
-          return Response.json(
-            { error: cappedSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedSearch.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: SearchRequestPayload;
-        try {
-          payload = JSON.parse(cappedSearch.text) as SearchRequestPayload;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const out = await executeSearchCall({
-          payload,
-          env,
-          executeHubFetch,
-          source: `search:${auth.principal}`,
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+        return withRouteSpan('edgefetch.search', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedSearch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedSearch.ok) {
+            return Response.json(
+              { error: cappedSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedSearch.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: SearchRequestPayload;
+          try {
+            payload = JSON.parse(cappedSearch.text) as SearchRequestPayload;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const out = await executeSearchCall({
+            payload,
+            env,
+            executeHubFetch,
+            source: `search:${auth.principal}`,
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+          });
         });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/crawl/params-preview') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
+        return withRouteSpan('edgefetch.crawl', { 'edgefetch.op': 'params_preview' }, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const cappedPreview = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedPreview.ok) {
+            return Response.json(
+              { error: cappedPreview.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedPreview.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: Record<string, unknown>;
+          try {
+            payload = JSON.parse(cappedPreview.text) as Record<string, unknown>;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const prev = previewCrawlParams(payload, url.hostname);
+          return Response.json(prev.body, { status: prev.status, headers: { 'cache-control': 'no-store' } });
         });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        const cappedPreview = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedPreview.ok) {
-          return Response.json(
-            { error: cappedPreview.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedPreview.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: Record<string, unknown>;
-        try {
-          payload = JSON.parse(cappedPreview.text) as Record<string, unknown>;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const prev = previewCrawlParams(payload, url.hostname);
-        return Response.json(prev.body, { status: prev.status, headers: { 'cache-control': 'no-store' } });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/batch/scrape') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
+        return withRouteSpan('edgefetch.batch_scrape', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedBatch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedBatch.ok) {
+            return Response.json(
+              { error: cappedBatch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedBatch.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: Record<string, unknown>;
+          try {
+            payload = JSON.parse(cappedBatch.text) as Record<string, unknown>;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const batchOut = await startOrExecuteBatchScrape({
+            payload,
+            selfHost: url.hostname,
+            executeScrape: async (scArgs) => {
+              const res = await executeScrapeCall({
+                payload: scArgs as ScrapeRequestPayload,
+                env,
+                executeHubFetch,
+                selfHost: url.hostname,
+                source: `batch-scrape:${auth.principal}`,
+              });
+              return { status: res.status, body: res.body };
+            },
+            ...(trackedCtx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } : {}),
+          });
+          if (!batchOut.ok) {
+            return Response.json({ ok: false, error: batchOut.error, message: batchOut.message }, { status: batchOut.status });
+          }
           return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            {
+              ok: true,
+              id: batchOut.job.id,
+              status: batchOut.job.status,
+              total: batchOut.job.total,
+              completed: batchOut.job.completed,
+              url: `${url.origin}/v1/batch/scrape/${batchOut.job.id}`,
+              ...(payload.sync === true ? { data: batchOut.job.data, errors: batchOut.job.errors } : {}),
+            },
+            { status: batchOut.status, headers: { 'cache-control': 'no-store' } },
           );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedBatch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedBatch.ok) {
-          return Response.json(
-            { error: cappedBatch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedBatch.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: Record<string, unknown>;
-        try {
-          payload = JSON.parse(cappedBatch.text) as Record<string, unknown>;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const batchOut = await startOrExecuteBatchScrape({
-          payload,
-          selfHost: url.hostname,
-          executeScrape: async (scArgs) => {
-            const res = await executeScrapeCall({
-              payload: scArgs as ScrapeRequestPayload,
-              env,
-              executeHubFetch,
-              selfHost: url.hostname,
-              source: `batch-scrape:${auth.principal}`,
-            });
-            return { status: res.status, body: res.body };
-          },
-          ...(ctx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
         });
-        if (!batchOut.ok) {
-          return Response.json({ ok: false, error: batchOut.error, message: batchOut.message }, { status: batchOut.status });
-        }
-        return Response.json(
-          {
-            ok: true,
-            id: batchOut.job.id,
-            status: batchOut.job.status,
-            total: batchOut.job.total,
-            completed: batchOut.job.completed,
-            url: `${url.origin}/v1/batch/scrape/${batchOut.job.id}`,
-            ...(payload.sync === true ? { data: batchOut.job.data, errors: batchOut.job.errors } : {}),
-          },
-          { status: batchOut.status, headers: { 'cache-control': 'no-store' } },
-        );
       }
 
       const batchRouteMatch = /^\/v1\/batch\/scrape\/([^/]+)$/.exec(url.pathname);
       if (batchRouteMatch) {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        const rawBatchId = safeDecodeURIComponent(batchRouteMatch[1] ?? '');
-        if (rawBatchId === null) {
-          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
-        }
-        const batchId = rawBatchId.trim();
-        if (request.method === 'GET') {
-          const job = getBatchScrapeStatus(batchId);
-          if (!job) return Response.json({ ok: false, error: 'batch_not_found' }, { status: 404 });
-          return Response.json({ ok: true, ...job }, { status: 200, headers: { 'cache-control': 'no-store' } });
-        }
-        if (request.method === 'DELETE') {
-          if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ ok: false, error: 'insufficient_scope' }, { status: 403 });
+        return withRouteSpan('edgefetch.batch_scrape', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
           }
-          const ok = cancelBatchScrape(batchId);
-          return Response.json({ ok, id: batchId, status: 'cancelled' }, { status: ok ? 200 : 404 });
-        }
+          const rawBatchId = safeDecodeURIComponent(batchRouteMatch[1] ?? '');
+          if (rawBatchId === null) {
+            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+          }
+          const batchId = rawBatchId.trim();
+          if (request.method === 'GET') {
+            const job = getBatchScrapeStatus(batchId);
+            if (!job) return Response.json({ ok: false, error: 'batch_not_found' }, { status: 404 });
+            return Response.json({ ok: true, ...job }, { status: 200, headers: { 'cache-control': 'no-store' } });
+          }
+          if (request.method === 'DELETE') {
+            if (!auth.scopes.includes('crawl:fetch')) {
+              return Response.json({ ok: false, error: 'insufficient_scope' }, { status: 403 });
+            }
+            const ok = cancelBatchScrape(batchId);
+            return Response.json({ ok, id: batchId, status: 'cancelled' }, { status: ok ? 200 : 404 });
+          }
+          return Response.json({ error: 'not_found' }, { status: 404 });
+        });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/agent') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
+        return withRouteSpan('edgefetch.agent', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedAgent = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedAgent.ok) {
+            return Response.json(
+              { error: cappedAgent.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedAgent.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: Record<string, unknown>;
+          try {
+            payload = JSON.parse(cappedAgent.text) as Record<string, unknown>;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const wantSse = (request.headers.get('accept') ?? '').toLowerCase().includes('text/event-stream');
+          const agentWaitUntil = trackedCtx?.waitUntil
+            ? (p: Promise<unknown>) => trackedCtx.waitUntil(p)
+            : (p: Promise<unknown>) => {
+                void p
+                  .catch(() => undefined)
+                  .finally(() => rootTracer.flush({ env, fetchFn: env.SAFE_FETCH }).catch(() => false));
+              };
+          const out = await startOrExecuteAgentCall({
+            payload,
+            env,
+            executeHubFetch,
+            selfHost: url.hostname,
+            principal: auth.principal,
+            wantSseStream: wantSse,
+            waitUntil: agentWaitUntil,
+          });
+          if (out.kind === 'sse') {
+            return wrapSseResponseWithFlush(out.response, () => {
+              const p = rootTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+              if (ctx?.waitUntil) ctx.waitUntil(p);
+              return p;
+            });
+          }
+          return Response.json(out.body, { status: out.status, headers: { 'cache-control': 'no-store' } });
         });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedAgent = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedAgent.ok) {
-          return Response.json(
-            { error: cappedAgent.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedAgent.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: Record<string, unknown>;
-        try {
-          payload = JSON.parse(cappedAgent.text) as Record<string, unknown>;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const wantSse = (request.headers.get('accept') ?? '').toLowerCase().includes('text/event-stream');
-        const out = await startOrExecuteAgentCall({
-          payload,
-          env,
-          executeHubFetch,
-          selfHost: url.hostname,
-          principal: auth.principal,
-          wantSseStream: wantSse,
-          ...(ctx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } : {}),
-        });
-        if (out.kind === 'sse') return out.response;
-        return Response.json(out.body, { status: out.status, headers: { 'cache-control': 'no-store' } });
       }
 
       const agentTraceMatch = /^\/v1\/agent\/([^/]+)\/trace$/.exec(url.pathname);
       if (agentTraceMatch && request.method === 'GET') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
+        return withRouteSpan('edgefetch.agent', { 'edgefetch.op': 'trace' }, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          const rawAgentId = safeDecodeURIComponent(agentTraceMatch[1] ?? '');
+          if (rawAgentId === null) {
+            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+          }
+          const agentId = rawAgentId.trim();
+          const rec = await loadAgentRun(agentId, env.META);
+          if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
           return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            {
+              ok: true,
+              success: true,
+              id: rec.id,
+              threadId: rec.threadId,
+              status: rec.status,
+              count: rec.trace.length,
+              spans: rec.trace,
+              trace: rec.trace,
+              events: rec.trace,
+            },
+            { status: 200, headers: { 'cache-control': 'no-store' } },
           );
-        }
-        const rawAgentId = safeDecodeURIComponent(agentTraceMatch[1] ?? '');
-        if (rawAgentId === null) {
-          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
-        }
-        const agentId = rawAgentId.trim();
-        const rec = await loadAgentRun(agentId, env.META);
-        if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
-        return Response.json(
-          {
-            ok: true,
-            success: true,
-            id: rec.id,
-            threadId: rec.threadId,
-            status: rec.status,
-            count: rec.trace.length,
-            spans: rec.trace,
-            trace: rec.trace,
-            events: rec.trace,
-          },
-          { status: 200, headers: { 'cache-control': 'no-store' } },
-        );
+        });
       }
 
       const agentRouteMatch = /^\/v1\/agent\/([^/]+)$/.exec(url.pathname);
       if (agentRouteMatch) {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        const rawAgentId = safeDecodeURIComponent(agentRouteMatch[1] ?? '');
-        if (rawAgentId === null) {
-          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
-        }
-        const agentId = rawAgentId.trim();
-        if (request.method === 'GET') {
-          const rec = await loadAgentRun(agentId, env.META);
-          if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
-          return Response.json(formatPublicAgentResponse(rec, false), { status: 200, headers: { 'cache-control': 'no-store' } });
-        }
-        if (request.method === 'DELETE') {
-          if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+        return withRouteSpan('edgefetch.agent', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
           }
-          const cRes = await cancelAgentRun(agentId, env.META);
-          return Response.json({ ok: cRes.ok, id: agentId, status: 'cancelled' }, { status: cRes.status });
-        }
+          const rawAgentId = safeDecodeURIComponent(agentRouteMatch[1] ?? '');
+          if (rawAgentId === null) {
+            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+          }
+          const agentId = rawAgentId.trim();
+          if (request.method === 'GET') {
+            const rec = await loadAgentRun(agentId, env.META);
+            if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
+            return Response.json(formatPublicAgentResponse(rec, false), { status: 200, headers: { 'cache-control': 'no-store' } });
+          }
+          if (request.method === 'DELETE') {
+            if (!auth.scopes.includes('crawl:fetch')) {
+              return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+            }
+            const cRes = await cancelAgentRun(agentId, env.META);
+            return Response.json({ ok: cRes.ok, id: agentId, status: 'cancelled' }, { status: cRes.status });
+          }
+          return Response.json({ error: 'not_found' }, { status: 404 });
+        });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/crawl') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
+        return withRouteSpan('edgefetch.crawl', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedCrawl = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedCrawl.ok) {
+            return Response.json(
+              { error: cappedCrawl.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedCrawl.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: Record<string, unknown>;
+          try {
+            payload = JSON.parse(cappedCrawl.text) as Record<string, unknown>;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const created = await createCrawlJob({ payload, metaDb: env.META, selfHost: url.hostname });
+          if (!created.ok) {
+            return Response.json(
+              { ok: false, error: created.error, message: created.message },
+              { status: created.status, headers: { 'cache-control': 'no-store' } },
+            );
+          }
+          const jobPromise = executeCrawlJob({
+            crawlId: created.crawlId,
+            rootUrl: created.rootUrl,
+            options: created.options,
+            env,
+            executeHubFetch,
+            selfHost: url.hostname,
+          });
+          if (payload.sync === true) {
+            await jobPromise;
+          } else if (trackedCtx?.waitUntil) {
+            trackedCtx.waitUntil(jobPromise);
+          } else {
+            await jobPromise;
+          }
+          return Response.json(
+            {
+              ok: true,
+              id: created.crawlId,
+              status: payload.sync === true ? 'completed' : 'queued',
+              collectionId: created.options.collectionId,
+              url: `${url.origin}/v1/crawl/${created.crawlId}`,
+            },
+            { status: payload.sync === true ? 200 : 202, headers: { 'cache-control': 'no-store' } },
+          );
         });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedCrawl = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedCrawl.ok) {
-          return Response.json(
-            { error: cappedCrawl.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedCrawl.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: Record<string, unknown>;
-        try {
-          payload = JSON.parse(cappedCrawl.text) as Record<string, unknown>;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const created = await createCrawlJob({ payload, metaDb: env.META, selfHost: url.hostname });
-        if (!created.ok) {
-          return Response.json(
-            { ok: false, error: created.error, message: created.message },
-            { status: created.status, headers: { 'cache-control': 'no-store' } },
-          );
-        }
-        const jobPromise = executeCrawlJob({
-          crawlId: created.crawlId,
-          rootUrl: created.rootUrl,
-          options: created.options,
-          env,
-          executeHubFetch,
-          selfHost: url.hostname,
-        });
-        if (payload.sync === true) {
-          await jobPromise;
-        } else if (ctx?.waitUntil) {
-          ctx.waitUntil(jobPromise);
-        } else {
-          await jobPromise;
-        }
-        return Response.json(
-          {
-            ok: true,
-            id: created.crawlId,
-            status: payload.sync === true ? 'completed' : 'queued',
-            collectionId: created.options.collectionId,
-            url: `${url.origin}/v1/crawl/${created.crawlId}`,
-          },
-          { status: payload.sync === true ? 200 : 202, headers: { 'cache-control': 'no-store' } },
-        );
       }
 
       const crawlRouteMatch = /^\/v1\/crawl\/([^/]+)$/.exec(url.pathname);
       if (crawlRouteMatch) {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        const rawCrawlId = safeDecodeURIComponent(crawlRouteMatch[1] ?? '');
-        if (rawCrawlId === null) {
-          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
-        }
-        const crawlId = rawCrawlId.trim();
-        if (request.method === 'GET') {
-          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403 });
-          }
-          const st = await getCrawlJobStatus({
-            crawlId,
-            metaDb: env.META,
-            bucket: env.ARTIFACTS,
-            offset: Number(url.searchParams.get('offset') ?? 0),
-            limit: Number(url.searchParams.get('limit') ?? 25),
+        return withRouteSpan('edgefetch.crawl', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
           });
-          if (!st.ok) return Response.json({ ok: false, error: st.error }, { status: st.status });
-          return Response.json({ ok: true, ...st.crawl }, { status: 200, headers: { 'cache-control': 'no-store' } });
-        }
-        if (request.method === 'DELETE') {
-          if (!auth.scopes.includes('crawl:fetch')) {
-            return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
           }
-          const cRes = await cancelCrawlJob(crawlId, env.META);
-          return Response.json({ ok: cRes.ok, id: crawlId, status: 'cancelled' }, { status: cRes.status });
-        }
+          const rawCrawlId = safeDecodeURIComponent(crawlRouteMatch[1] ?? '');
+          if (rawCrawlId === null) {
+            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+          }
+          const crawlId = rawCrawlId.trim();
+          if (request.method === 'GET') {
+            if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+              return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+            }
+            const st = await getCrawlJobStatus({
+              crawlId,
+              metaDb: env.META,
+              bucket: env.ARTIFACTS,
+              offset: Number(url.searchParams.get('offset') ?? 0),
+              limit: Number(url.searchParams.get('limit') ?? 25),
+            });
+            if (!st.ok) return Response.json({ ok: false, error: st.error }, { status: st.status });
+            return Response.json({ ok: true, ...st.crawl }, { status: 200, headers: { 'cache-control': 'no-store' } });
+          }
+          if (request.method === 'DELETE') {
+            if (!auth.scopes.includes('crawl:fetch')) {
+              return Response.json({ error: 'insufficient_scope' }, { status: 403 });
+            }
+            const cRes = await cancelCrawlJob(crawlId, env.META);
+            return Response.json({ ok: cRes.ok, id: crawlId, status: 'cancelled' }, { status: cRes.status });
+          }
+          return Response.json({ error: 'not_found' }, { status: 404 });
+        });
       }
 
       const collectionSearchMatch = /^\/v1\/collections\/([^/]+)\/search$/.exec(url.pathname);
       if (collectionSearchMatch && (request.method === 'POST' || request.method === 'GET')) {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        if (!env.SEARCH) {
-          return Response.json({ error: 'search_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
-        }
-        const rawCollectionId = safeDecodeURIComponent(collectionSearchMatch[1] ?? '');
-        if (rawCollectionId === null) {
-          return Response.json({ error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400, headers: { 'cache-control': 'no-store' } });
-        }
-        const collectionId = rawCollectionId.trim();
-        if (!COLLECTION_ID_RE.test(collectionId)) {
-          return Response.json({ error: 'invalid_collection_id' }, { status: 400, headers: { 'cache-control': 'no-store' } });
-        }
-        let query = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
-        let limit = Number(url.searchParams.get('limit') ?? 10);
-        if (request.method === 'POST') {
-          const cappedColSearch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-          if (!cappedColSearch.ok) {
+        return withRouteSpan('edgefetch.collection_search', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
             return Response.json(
-              { error: cappedColSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-              { status: cappedColSearch.error === 'too_large' ? 413 : 400, headers: { 'cache-control': 'no-store' } },
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
-          try {
-            const bodyJson = JSON.parse(cappedColSearch.text) as { query?: unknown; q?: unknown; limit?: unknown };
-            if (typeof bodyJson.query === 'string') query = bodyJson.query;
-            else if (typeof bodyJson.q === 'string') query = bodyJson.q;
-            if (typeof bodyJson.limit === 'number' && Number.isFinite(bodyJson.limit)) limit = bodyJson.limit;
-          } catch {
-            return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
           }
-        }
-        const idx = new D1FtsSearchIndex(env.SEARCH);
-        const hits = await idx.searchCollection({
-          collectionId,
-          query,
-          limit: Number.isFinite(limit) ? limit : 10,
+          if (!env.SEARCH) {
+            return Response.json({ error: 'search_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
+          }
+          const rawCollectionId = safeDecodeURIComponent(collectionSearchMatch[1] ?? '');
+          if (rawCollectionId === null) {
+            return Response.json({ error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+          }
+          const collectionId = rawCollectionId.trim();
+          if (!COLLECTION_ID_RE.test(collectionId)) {
+            return Response.json({ error: 'invalid_collection_id' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+          }
+          let query = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
+          let limit = Number(url.searchParams.get('limit') ?? 10);
+          if (request.method === 'POST') {
+            const cappedColSearch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+            if (!cappedColSearch.ok) {
+              return Response.json(
+                { error: cappedColSearch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+                { status: cappedColSearch.error === 'too_large' ? 413 : 400, headers: { 'cache-control': 'no-store' } },
+              );
+            }
+            try {
+              const bodyJson = JSON.parse(cappedColSearch.text) as { query?: unknown; q?: unknown; limit?: unknown };
+              if (typeof bodyJson.query === 'string') query = bodyJson.query;
+              else if (typeof bodyJson.q === 'string') query = bodyJson.q;
+              if (typeof bodyJson.limit === 'number' && Number.isFinite(bodyJson.limit)) limit = bodyJson.limit;
+            } catch {
+              return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
+            }
+          }
+          const idx = new D1FtsSearchIndex(env.SEARCH);
+          const hits = await idx.searchCollection({
+            collectionId,
+            query,
+            limit: Number.isFinite(limit) ? limit : 10,
+          });
+          return Response.json(
+            { ok: true, collectionId, query, hits },
+            { status: 200, headers: { 'cache-control': 'no-store' } },
+          );
         });
-        return Response.json(
-          { ok: true, collectionId, query, hits },
-          { status: 200, headers: { 'cache-control': 'no-store' } },
-        );
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/jobs') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedJobs = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedJobs.ok) {
-          return Response.json(
-            { error: cappedJobs.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedJobs.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: JobsToolPayload;
-        try {
-          payload = JSON.parse(cappedJobs.text) as JobsToolPayload;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const out = await executeJobsCall({
-          payload,
-          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-          executeSearch: async (sArgs) => {
-            const sOut = await executeSearchCall({
-              payload: sArgs as SearchRequestPayload,
-              env,
-              executeHubFetch,
-              source: `jobs-search:${auth.principal}`,
-            });
-            return { status: sOut.status, body: sOut.body };
-          },
-          executeScrape: async (scArgs) => {
-            const scOut = await executeScrapeCall({
-              payload: scArgs as ScrapeRequestPayload,
-              env,
-              executeHubFetch,
-              selfHost: url.hostname,
-              source: `jobs-scrape:${auth.principal}`,
-            });
-            return { status: scOut.status, body: scOut.body };
-          },
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: { 'cache-control': 'no-store' },
+        return withRouteSpan('edgefetch.jobs', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedJobs = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedJobs.ok) {
+            return Response.json(
+              { error: cappedJobs.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedJobs.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: JobsToolPayload;
+          try {
+            payload = JSON.parse(cappedJobs.text) as JobsToolPayload;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const out = await executeJobsCall({
+            payload,
+            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+            executeSearch: async (sArgs) => {
+              const sOut = await executeSearchCall({
+                payload: sArgs as SearchRequestPayload,
+                env,
+                executeHubFetch,
+                source: `jobs-search:${auth.principal}`,
+              });
+              return { status: sOut.status, body: sOut.body };
+            },
+            executeScrape: async (scArgs) => {
+              const scOut = await executeScrapeCall({
+                payload: scArgs as ScrapeRequestPayload,
+                env,
+                executeHubFetch,
+                selfHost: url.hostname,
+                source: `jobs-scrape:${auth.principal}`,
+              });
+              return { status: scOut.status, body: scOut.body };
+            },
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'no-store' },
+          });
         });
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/catalog') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const cappedCat = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedCat.ok) {
-          return Response.json(
-            { error: cappedCat.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedCat.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        let payload: CatalogCallPayload;
-        try {
-          payload = JSON.parse(cappedCat.text) as CatalogCallPayload;
-        } catch {
-          return Response.json({ error: 'bad_json' }, { status: 400 });
-        }
-        const out = await executeCatalogCall({
-          payload,
-          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-          executeHubFetch: makeCatalogHubFetch(`catalog:${auth.principal}`),
-          selfHost: url.hostname,
-          principal: auth.principal,
-          ...(ctx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => ctx.waitUntil(p) } } : {}),
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: { 'cache-control': 'no-store' },
+        return withRouteSpan('edgefetch.catalog', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const cappedCat = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedCat.ok) {
+            return Response.json(
+              { error: cappedCat.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedCat.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          let payload: CatalogCallPayload;
+          try {
+            payload = JSON.parse(cappedCat.text) as CatalogCallPayload;
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
+          }
+          const out = await executeCatalogCall({
+            payload,
+            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+            executeHubFetch: makeCatalogHubFetch(`catalog:${auth.principal}`),
+            selfHost: url.hostname,
+            principal: auth.principal,
+            ...(trackedCtx?.waitUntil ? { ctx: { waitUntil: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } } : {}),
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'no-store' },
+          });
         });
       }
 
       const catalogRecordsMatch = /^\/v1\/catalog\/([^/]+)\/records$/.exec(url.pathname);
       if (catalogRecordsMatch && request.method === 'GET') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const rawCatalogId = safeDecodeURIComponent(catalogRecordsMatch[1] ?? '');
-        if (rawCatalogId === null) {
-          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
-        }
-        const catalogId = rawCatalogId.trim();
-        const vendors = url.searchParams.getAll('vendor').filter(Boolean);
-        const productTypes = url.searchParams.getAll('productType').filter(Boolean);
-        const rawOffset = url.searchParams.get('offset');
-        const rawLimit = url.searchParams.get('limit');
-        const rawAvail = url.searchParams.get('availableOnly');
-        const query = url.searchParams.get('query') ?? url.searchParams.get('q') ?? undefined;
-        const out = await getCatalogRecords({
-          catalogId,
-          ...(rawOffset !== null && Number.isFinite(Number(rawOffset)) ? { offset: Number(rawOffset) } : {}),
-          ...(rawLimit !== null && Number.isFinite(Number(rawLimit)) ? { limit: Number(rawLimit) } : {}),
-          ...(vendors.length > 1 ? { vendor: vendors } : vendors.length === 1 ? { vendor: vendors[0] } : {}),
-          ...(productTypes.length > 1
-            ? { productType: productTypes }
-            : productTypes.length === 1
-              ? { productType: productTypes[0] }
-              : {}),
-          ...(rawAvail === 'true' || rawAvail === '1' ? { availableOnly: true } : {}),
-          ...(query ? { query } : {}),
-          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: { 'cache-control': 'no-store' },
+        return withRouteSpan('edgefetch.catalog', { 'edgefetch.op': 'records' }, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const rawCatalogId = safeDecodeURIComponent(catalogRecordsMatch[1] ?? '');
+          if (rawCatalogId === null) {
+            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+          }
+          const catalogId = rawCatalogId.trim();
+          const vendors = url.searchParams.getAll('vendor').filter(Boolean);
+          const productTypes = url.searchParams.getAll('productType').filter(Boolean);
+          const rawOffset = url.searchParams.get('offset');
+          const rawLimit = url.searchParams.get('limit');
+          const rawAvail = url.searchParams.get('availableOnly');
+          const query = url.searchParams.get('query') ?? url.searchParams.get('q') ?? undefined;
+          const out = await getCatalogRecords({
+            catalogId,
+            ...(rawOffset !== null && Number.isFinite(Number(rawOffset)) ? { offset: Number(rawOffset) } : {}),
+            ...(rawLimit !== null && Number.isFinite(Number(rawLimit)) ? { limit: Number(rawLimit) } : {}),
+            ...(vendors.length > 1 ? { vendor: vendors } : vendors.length === 1 ? { vendor: vendors[0] } : {}),
+            ...(productTypes.length > 1
+              ? { productType: productTypes }
+              : productTypes.length === 1
+                ? { productType: productTypes[0] }
+                : {}),
+            ...(rawAvail === 'true' || rawAvail === '1' ? { availableOnly: true } : {}),
+            ...(query ? { query } : {}),
+            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'no-store' },
+          });
         });
       }
 
       const catalogStatusMatch = /^\/v1\/catalog\/([^/]+)$/.exec(url.pathname);
       if (catalogStatusMatch && request.method === 'GET') {
-        const auth = await authorizeMcpRequest({
-          request,
-          origin: url.origin,
-          ownerSecret: env.CALLER_TOKEN,
-          store: oauthStore,
-        });
-        if (!auth.ok) {
-          return Response.json(
-            { error: 'unauthorized' },
-            { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
-          );
-        }
-        if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
-          return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-        }
-        const rawCatalogId = safeDecodeURIComponent(catalogStatusMatch[1] ?? '');
-        if (rawCatalogId === null) {
-          return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
-        }
-        const catalogId = rawCatalogId.trim();
-        const out = await getCatalogStatus({
-          catalogId,
-          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-        });
-        return Response.json(out.body, {
-          status: out.status,
-          headers: { 'cache-control': 'no-store' },
+        return withRouteSpan('edgefetch.catalog', { 'edgefetch.op': 'status' }, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const rawCatalogId = safeDecodeURIComponent(catalogStatusMatch[1] ?? '');
+          if (rawCatalogId === null) {
+            return Response.json({ ok: false, error: 'bad_request', message: 'Malformed URL path parameter' }, { status: 400 });
+          }
+          const catalogId = rawCatalogId.trim();
+          const out = await getCatalogStatus({
+            catalogId,
+            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+          });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: { 'cache-control': 'no-store' },
+          });
         });
       }
 
@@ -2413,50 +2621,84 @@ export default {
         return Response.json({ error: 'unauthorized' }, { status: 401 });
       }
       if (request.method === 'GET' && url.pathname === '/agents') {
-        return Response.json(await hub().listAgents());
+        return withRouteSpan('edgefetch.agents', {}, async () => Response.json(await hub().listAgents()));
       }
       if (request.method === 'POST' && url.pathname === '/fetch') {
-        const parsedTarget = parseFetchTarget(url);
-        if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
-        const cappedFetch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
-        if (!cappedFetch.ok) {
-          return Response.json(
-            { error: cappedFetch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
-            { status: cappedFetch.error === 'too_large' ? 413 : 400 },
-          );
-        }
-        const body = cappedFetch.text;
-        const rawRetention = url.searchParams.get('artifacts');
-        const artifactRetention: ArtifactRetention | 'off' | undefined =
-          rawRetention === 'stored'
-            ? 'stored'
-            : rawRetention === 'transient'
-              ? 'transient'
-              : rawRetention === 'off'
-                ? 'off'
-                : undefined;
-        const hydrateInline = url.searchParams.get('hydrate') !== 'false' && url.searchParams.get('hydrate') !== '0';
-        const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention, hydrateInline);
-        return new Response(out.bodyText, {
-          status: out.status,
-          headers: {
-            'content-type': 'application/json',
-            'x-crawler-via': out.via,
-            'cache-control': 'no-store',
-            ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
-          },
+        return withRouteSpan('edgefetch.fetch', {}, async () => {
+          const parsedTarget = parseFetchTarget(url);
+          if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
+          const cappedFetch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
+          if (!cappedFetch.ok) {
+            return Response.json(
+              { error: cappedFetch.error === 'too_large' ? 'payload_too_large' : 'bad_json' },
+              { status: cappedFetch.error === 'too_large' ? 413 : 400 },
+            );
+          }
+          const body = cappedFetch.text;
+          const rawRetention = url.searchParams.get('artifacts');
+          const artifactRetention: ArtifactRetention | 'off' | undefined =
+            rawRetention === 'stored'
+              ? 'stored'
+              : rawRetention === 'transient'
+                ? 'transient'
+                : rawRetention === 'off'
+                  ? 'off'
+                  : undefined;
+          const hydrateInline = url.searchParams.get('hydrate') !== 'false' && url.searchParams.get('hydrate') !== '0';
+          const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention, hydrateInline);
+          return new Response(out.bodyText, {
+            status: out.status,
+            headers: {
+              'content-type': 'application/json',
+              'x-crawler-via': out.via,
+              'cache-control': 'no-store',
+              ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+            },
+          });
         });
       }
       return Response.json({ error: 'not_found' }, { status: 404 });
+    };
+
+    let response!: Response;
+    try {
+      response = await rootTracer.run(() =>
+        rootTracer.withSpan(
+          'edgefetch.http',
+          {
+            kind: 2,
+            attributes: {
+              'http.request.method': request.method,
+              'url.path': url.pathname,
+            },
+          },
+          async (httpSpan) => {
+            const res = await routeRequest();
+            httpSpan.setAttribute('http.response.status_code', res.status);
+            httpSpan.setStatus(res.status < 500);
+            return res;
+          },
+        ),
+      );
     } catch (e) {
-      return Response.json(
+      response = Response.json(
         {
           error: 'hub_unavailable',
           message: e instanceof Error ? e.message : 'Coordinator temporarily unavailable; please retry',
         },
         { status: 503, headers: { 'cache-control': 'no-store' } },
       );
+    } finally {
+      if (!rootTracer.suppressed && rootTracer.sampled) {
+        const flushPromise = rootTracer.flush({ env, fetchFn: env.SAFE_FETCH });
+        if (ctx?.waitUntil) {
+          ctx.waitUntil(flushPromise);
+        } else {
+          await flushPromise;
+        }
+      }
     }
+    return injectTraceHeaders(response, rootTracer);
   },
 
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -313,6 +314,129 @@ type RobotsRule struct {
 	Allow   bool
 }
 
+const maxRobotsMatchScanBytes = 4 << 20 // 4 MiB total scan ceiling across rules per Allowed() call
+
+type compiledRobotsRule struct {
+	origLen      int
+	allow        bool
+	anchoredEnd  bool
+	hasStar      bool
+	trailingStar bool
+	cleanPat     string // collapsed consecutive '*' and stripped trailing '$'
+	firstLit     string
+	lastLit      string
+	minLen       int
+	reqBytes     [4]uint64
+}
+
+func compileRobotsRule(r RobotsRule) compiledRobotsRule {
+	pat := r.Pattern
+	c := compiledRobotsRule{
+		origLen: len(pat),
+		allow:   r.Allow,
+	}
+	if strings.HasSuffix(pat, "$") {
+		c.anchoredEnd = true
+		pat = pat[:len(pat)-1]
+	}
+	if strings.Contains(pat, "**") {
+		var sb strings.Builder
+		sb.Grow(len(pat))
+		prevStar := false
+		for i := 0; i < len(pat); i++ {
+			if pat[i] == '*' {
+				if prevStar {
+					continue
+				}
+				prevStar = true
+			} else {
+				prevStar = false
+			}
+			sb.WriteByte(pat[i])
+		}
+		pat = sb.String()
+	}
+	c.cleanPat = pat
+	if strings.IndexByte(pat, '*') < 0 {
+		c.firstLit = pat
+		c.lastLit = pat
+		c.minLen = len(pat)
+		for i := 0; i < len(pat); i++ {
+			b := pat[i]
+			c.reqBytes[b>>6] |= 1 << (b & 63)
+		}
+		return c
+	}
+	c.hasStar = true
+	c.trailingStar = strings.HasSuffix(pat, "*")
+	rem := pat
+	first := true
+	for {
+		part, rest, ok := strings.Cut(rem, "*")
+		if first {
+			c.firstLit = part
+			first = false
+		}
+		if part != "" {
+			c.lastLit = part
+			c.minLen += len(part)
+			for i := 0; i < len(part); i++ {
+				b := part[i]
+				c.reqBytes[b>>6] |= 1 << (b & 63)
+			}
+		}
+		if !ok {
+			break
+		}
+		rem = rest
+	}
+	return c
+}
+
+func compileAndSortRobotsRules(rules []RobotsRule) []compiledRobotsRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]compiledRobotsRule, 0, len(rules))
+	for _, r := range rules {
+		if r.Pattern == "" {
+			continue
+		}
+		out = append(out, compileRobotsRule(r))
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].origLen != out[j].origLen {
+			return out[i].origLen > out[j].origLen
+		}
+		return out[i].allow && !out[j].allow
+	})
+	return out
+}
+
+func deduplicateRobotsRules(rules []RobotsRule) []RobotsRule {
+	if len(rules) <= 1 {
+		return rules
+	}
+	type ruleKey struct {
+		pat   string
+		allow bool
+	}
+	seen := make(map[ruleKey]struct{}, len(rules))
+	out := make([]RobotsRule, 0, len(rules))
+	for _, r := range rules {
+		if r.Pattern == "" {
+			continue
+		}
+		k := ruleKey{pat: r.Pattern, allow: r.Allow}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, r)
+	}
+	return out
+}
+
 // RobotsEntry caches parsed `/robots.txt` rules, Content Signals, and `Crawl-delay` for one origin.
 // When `Distressed` is true (RFC 9309 §2.3.1.4 unreachable: network error, 429, or 5xx), all paths are treated as disallowed.
 // When `DisallowAIInput` is true (`Content-Signal: ai-input=no`), all paths are disallowed for user-triggered agent retrieval.
@@ -323,6 +447,7 @@ type RobotsEntry struct {
 	Distressed      bool
 	Reason          string
 	ExpiresAt       time.Time
+	compiled        []compiledRobotsRule
 }
 
 // ContentSignalBlocked reports whether `/robots.txt` disallowed agent retrieval via `Content-Signal: ai-input=no`.
@@ -331,8 +456,8 @@ func (e *RobotsEntry) ContentSignalBlocked() bool {
 }
 
 // Allowed evaluates RFC 9309 longest-match precedence: whichever matching `Allow` or `Disallow` rule has the longest
-// pattern wins; ties break in favor of `Allow`. If `/robots.txt` was unreachable (`Distressed`) or opted out of agent
-// retrieval via `Content-Signal: ai-input=no` (`DisallowAIInput`), returns false.
+// pattern wins; ties break in favor of `Allow`. Also evaluates dot-segment/collapsed-slash/matrix-stripped path
+// canonicalization (`/../`, `/./`, `//`, `;param`) so origin path normalization cannot bypass a `Disallow` rule.
 func (e *RobotsEntry) Allowed(pathAndQuery string) bool {
 	if e == nil {
 		return true
@@ -346,22 +471,128 @@ func (e *RobotsEntry) Allowed(pathAndQuery string) bool {
 	if pathAndQuery == "" {
 		pathAndQuery = "/"
 	}
-	pathAndQuery = NormalizeRobotsURI(pathAndQuery)
-	bestLen := -1
-	bestAllow := true
-	for _, r := range e.Rules {
-		if r.Pattern == "" {
+	normRaw := NormalizeRobotsURI(pathAndQuery)
+	if !e.allowedSingle(normRaw) {
+		return false
+	}
+	normCanon := canonicalizeRobotsTarget(normRaw)
+	if normCanon != normRaw && !e.allowedSingle(normCanon) {
+		return false
+	}
+	return true
+}
+
+func (e *RobotsEntry) allowedSingle(target string) bool {
+	comp := e.compiled
+	if len(comp) == 0 && len(e.Rules) > 0 {
+		comp = compileAndSortRobotsRules(deduplicateRobotsRules(e.Rules))
+	}
+	if len(comp) == 0 {
+		return true
+	}
+
+	var targetMask [4]uint64
+	maskEligible := len(comp) >= 8 || len(target) >= 256
+	maskBuilt := false
+
+	var scanned int64
+	for i := range comp {
+		r := &comp[i]
+		if len(target) < r.minLen {
 			continue
 		}
-		if robotsMatch(r.Pattern, pathAndQuery) {
-			l := len(r.Pattern)
-			if l > bestLen || (l == bestLen && r.Allow) {
-				bestLen = l
-				bestAllow = r.Allow
+		if r.firstLit != "" && !strings.HasPrefix(target, r.firstLit) {
+			continue
+		}
+		if r.anchoredEnd && !r.trailingStar && r.lastLit != "" && !strings.HasSuffix(target, r.lastLit) {
+			continue
+		}
+		if maskEligible {
+			if !maskBuilt {
+				for j := 0; j < len(target); j++ {
+					b := target[j]
+					targetMask[b>>6] |= 1 << (b & 63)
+				}
+				maskBuilt = true
+			}
+			if (r.reqBytes[0]&^targetMask[0])|(r.reqBytes[1]&^targetMask[1])|(r.reqBytes[2]&^targetMask[2])|(r.reqBytes[3]&^targetMask[3]) != 0 {
+				continue
 			}
 		}
+		matched, work := matchCompiledRobotsRule(r, target)
+		scanned += int64(work)
+		if matched {
+			return r.allow
+		}
+		if scanned > maxRobotsMatchScanBytes {
+			// Pathological rule × path complexity budget exceeded: fail closed.
+			return false
+		}
 	}
-	return bestAllow
+	return true
+}
+
+func canonicalizeRobotsTarget(norm string) string {
+	pathPart := norm
+	queryPart := ""
+	hasQuery := false
+	if q := strings.IndexByte(norm, '?'); q >= 0 {
+		pathPart = norm[:q]
+		queryPart = norm[q:]
+		hasQuery = true
+	}
+	// Fast SIMD check: if pathPart starts with '/', has no "//", no "/.", and no ';', nothing changes!
+	needsClean := pathPart == "" ||
+		pathPart[0] != '/' ||
+		strings.IndexByte(pathPart, ';') >= 0 ||
+		strings.Contains(pathPart, "//") ||
+		strings.Contains(pathPart, "/.")
+	if !needsClean {
+		return norm
+	}
+
+	trailingSlash := strings.HasSuffix(pathPart, "/") || strings.HasSuffix(pathPart, "/.") || strings.HasSuffix(pathPart, "/..")
+	var segs []string
+	rem := pathPart
+	for len(rem) > 0 {
+		var seg string
+		if sl := strings.IndexByte(rem, '/'); sl >= 0 {
+			seg = rem[:sl]
+			rem = rem[sl+1:]
+		} else {
+			seg = rem
+			rem = ""
+		}
+		if semi := strings.IndexByte(seg, ';'); semi >= 0 {
+			seg = seg[:semi]
+		}
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			if len(segs) > 0 {
+				segs = segs[:len(segs)-1]
+			}
+		default:
+			segs = append(segs, seg)
+		}
+	}
+	var b strings.Builder
+	b.Grow(len(norm))
+	b.WriteByte('/')
+	for i, s := range segs {
+		if i > 0 {
+			b.WriteByte('/')
+		}
+		b.WriteString(s)
+	}
+	if trailingSlash && len(segs) > 0 {
+		b.WriteByte('/')
+	}
+	if hasQuery {
+		b.WriteString(queryPart)
+	}
+	return b.String()
 }
 
 // NormalizeRobotsURI normalizes percent-encoding in `/robots.txt` patterns and target paths per RFC 9309 §2.2.2:
@@ -433,58 +664,51 @@ func isUnreservedURIByte(c byte) bool {
 		c == '-' || c == '.' || c == '_' || c == '~'
 }
 
-// robotsMatch evaluates `/robots.txt` `*` wildcards and trailing `$` anchors in guaranteed O(P * T) time with zero
-// heap allocations (`0 allocs/op` when no `*` wildcard splits are needed, or single small slice otherwise) and zero
-// catastrophic regex backtracking risk on untrusted `/robots.txt` input.
-func robotsMatch(pattern, target string) bool {
-	anchoredEnd := strings.HasSuffix(pattern, "$")
-	if anchoredEnd {
-		pattern = strings.TrimSuffix(pattern, "$")
-	}
-	// Fast path when pattern has no `*` wildcards: pure string prefix / exact check with 0 allocations!
-	if strings.IndexByte(pattern, '*') < 0 {
-		if anchoredEnd {
-			return target == pattern
+func matchCompiledRobotsRule(r *compiledRobotsRule, target string) (bool, int) {
+	if !r.hasStar {
+		if r.anchoredEnd {
+			return target == r.cleanPat, len(r.cleanPat)
 		}
-		return strings.HasPrefix(target, pattern)
+		return strings.HasPrefix(target, r.cleanPat), len(r.cleanPat)
+	}
+	if r.firstLit != "" && !strings.HasPrefix(target, r.firstLit) {
+		return false, len(r.firstLit)
+	}
+	if r.anchoredEnd && !r.trailingStar && r.lastLit != "" && !strings.HasSuffix(target, r.lastLit) {
+		return false, len(r.lastLit)
 	}
 
-	pos := 0
-	first := true
-	rem := pattern
-	var lastNonEmpty string
-	trailingStar := strings.HasSuffix(pattern, "*")
-
-	// Iterate `*`-separated segments using `strings.Cut` instead of `strings.Split` so wildcard matching allocates
-	// ZERO heap slices (`0 B/op`, `0 allocs/op` in `BenchmarkRobotsMatch`)!
-	for {
-		part, rest, hasStar := strings.Cut(rem, "*")
+	pos := len(r.firstLit)
+	work := pos
+	remLit := r.minLen - pos
+	_, rem, hasStar := strings.Cut(r.cleanPat, "*")
+	for hasStar {
+		if len(target)-pos < remLit {
+			return false, work
+		}
+		var part string
+		part, rem, hasStar = strings.Cut(rem, "*")
 		if part != "" {
-			lastNonEmpty = part
-			if first {
-				if !strings.HasPrefix(target, part) {
-					return false
-				}
-				pos = len(part)
-			} else {
-				idx := strings.Index(target[pos:], part)
-				if idx < 0 {
-					return false
-				}
-				pos += idx + len(part)
+			idx := strings.Index(target[pos:], part)
+			if idx < 0 {
+				work += len(target) - pos
+				return false, work
 			}
+			step := idx + len(part)
+			pos += step
+			work += step
+			remLit -= len(part)
 		}
-		first = false
-		if !hasStar {
-			break
-		}
-		rem = rest
 	}
+	return true, work
+}
 
-	if anchoredEnd && !trailingStar && lastNonEmpty != "" {
-		return strings.HasSuffix(target, lastNonEmpty)
-	}
-	return true
+// robotsMatch evaluates `/robots.txt` `*` wildcards and trailing `$` anchors in guaranteed O(P * T) time with zero
+// heap allocations (`0 allocs/op` when no `*` wildcard splits are needed) and zero catastrophic regex backtracking risk.
+func robotsMatch(pattern, target string) bool {
+	c := compileRobotsRule(RobotsRule{Pattern: pattern})
+	matched, _ := matchCompiledRobotsRule(&c, target)
+	return matched
 }
 
 var robotsLineReplacer = strings.NewReplacer(
@@ -502,6 +726,14 @@ func trimRobotsWS(s string) string {
 // ParseRobotsTxt extracts directives matching `agentToken` (lowercase product token, preferred per RFC 9309 specificity)
 // or fallback `*`, plus `Crawl-delay` clamped to `MaxCrawlDelay` and `Content-Signal` (`ai-input`).
 func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
+	if len(body) > RobotsMaxBytes {
+		body = body[:RobotsMaxBytes]
+		if nl := strings.LastIndexAny(body, "\r\n\u0085\u2028\u2029"); nl >= 0 {
+			body = body[:nl]
+		} else {
+			body = ""
+		}
+	}
 	// RFC 9309 §2.1: strip any leading UTF-8 BOMs (including repeated BOMs) so the first directive is never corrupted.
 	for strings.HasPrefix(body, "\xef\xbb\xbf") {
 		body = strings.TrimPrefix(body, "\xef\xbb\xbf")
@@ -525,6 +757,9 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 			rawLine = rawLine[:idx]
 		}
 		line := trimRobotsWS(rawLine)
+		for strings.HasPrefix(line, "\xef\xbb\xbf") {
+			line = trimRobotsWS(strings.TrimPrefix(line, "\xef\xbb\xbf"))
+		}
 		if line == "" {
 			// RFC 9309 §2.2.1: blank lines inside a group do NOT terminate the current User-agent group;
 			// a group only ends when a subsequent User-agent line appears after a rule directive.
@@ -540,6 +775,9 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 		}
 		field := strings.ToLower(trimRobotsWS(rawField))
 		val := trimRobotsWS(line[colon+1:])
+		if nul := strings.IndexByte(val, 0); nul >= 0 {
+			val = trimRobotsWS(val[:nul])
+		}
 		switch field {
 		case "user-agent":
 			seenAnyUserAgent = true
@@ -648,7 +886,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 
 	out := &RobotsEntry{ExpiresAt: expiresAt}
 	if matchedSpecific {
-		out.Rules = specificRules
+		out.Rules = deduplicateRobotsRules(specificRules)
 		out.CrawlDelay = specificDelay
 		if specificSetAI {
 			out.DisallowAIInput = specificDisallowAI
@@ -658,7 +896,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 			out.DisallowAIInput = *preGroupAiInput
 		}
 	} else if matchedWildcard {
-		out.Rules = wildcardRules
+		out.Rules = deduplicateRobotsRules(wildcardRules)
 		out.CrawlDelay = wildcardDelay
 		if wildcardSetAI {
 			out.DisallowAIInput = wildcardDisallowAI
@@ -668,6 +906,7 @@ func ParseRobotsTxt(body, agentToken string, expiresAt time.Time) *RobotsEntry {
 	} else if preGroupAiInput != nil {
 		out.DisallowAIInput = *preGroupAiInput
 	}
+	out.compiled = compileAndSortRobotsRules(out.Rules)
 	return out
 }
 

@@ -15,6 +15,10 @@ services:
       - "127.0.0.1:8787:8787"
     environment:
       PORT: "8787"
+      # Direct loopback stack: keep EDGEFETCH_TRUST_PROXY=0 (untrusted) by default so local callers cannot spoof X-Forwarded-For.
+      # Set EDGEFETCH_TRUST_PROXY=1 ONLY when placing this container behind a trusted reverse proxy (Caddy/Nginx/Traefik/ALB)
+      # that sanitizes or appends the real client IP as the rightmost X-Forwarded-For hop.
+      EDGEFETCH_TRUST_PROXY: ${EDGEFETCH_TRUST_PROXY:-0}
       EDGEFETCH_DISABLE_LOCAL_AGENT: "1"
       CALLER_TOKEN: ${CALLER_TOKEN:?Set CALLER_TOKEN (>=24 random chars), e.g. export CALLER_TOKEN=$(openssl rand -hex 24)}
       AGENT_TOKEN: ${AGENT_TOKEN:?Set AGENT_TOKEN (>=24 random chars), e.g. export AGENT_TOKEN=$(openssl rand -hex 24)}

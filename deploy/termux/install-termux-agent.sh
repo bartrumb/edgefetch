@@ -12,7 +12,7 @@
 #   bash install-termux-agent.sh
 set -euo pipefail
 
-VERSION="${EDGEFETCH_VERSION:-2.6.0}"
+VERSION="${EDGEFETCH_VERSION:-2.6.3}"
 if [[ -z "${EDGEFETCH_HUB_URL:-}" || -z "${EDGEFETCH_AGENT_TOKEN:-}" ]]; then
   echo "ERROR: Set EDGEFETCH_HUB_URL and EDGEFETCH_AGENT_TOKEN before running." >&2
   exit 1
@@ -53,7 +53,7 @@ BASE_URL="https://github.com/bartrumb/edgefetch/releases/download/v${VERSION}"
 
 cat >"$tmp_dir/release-signing-pub.pem" <<'EOF'
 -----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAeTr4Ryc8TmHsN8gDk0mC61tN3BFD2dHUfqCBrMeoex0=
+MCowBQYDK2VwAyEAv8+ZT9d/404KI0pY1PILOVBzsUvTHWaL0aLghciWy90=
 -----END PUBLIC KEY-----
 EOF
 

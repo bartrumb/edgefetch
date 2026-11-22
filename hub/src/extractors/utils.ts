@@ -167,6 +167,7 @@ function parseMetaTagAttrsLinear(attrChunk: string): Record<string, string> {
 
 /** Extracts `<meta name="..." content="...">` or `<meta property="..." content="...">` values from HTML in linear O(N) time (`H1`). */
 export function extractMetaContent(rawHtml: string, key: string): string {
+  if (!/<meta[\s/>]/i.test(rawHtml)) return '';
   const targetKey = key.toLowerCase();
   let found = '';
   scanHtmlTagsLinear(
@@ -192,6 +193,7 @@ export function extractMetaContent(rawHtml: string, key: string): string {
 
 /** Extracts all `<meta name="key" content="...">` values (e.g. multiple `citation_author` tags) in linear O(N) time (`H1`). */
 export function extractAllMetaContents(rawHtml: string, key: string): string[] {
+  if (!/<meta[\s/>]/i.test(rawHtml)) return [];
   const targetKey = key.toLowerCase();
   const out: string[] = [];
   scanHtmlTagsLinear(
@@ -213,6 +215,7 @@ export function extractAllMetaContents(rawHtml: string, key: string): string[] {
 
 /** Extracts flattened JSON-LD objects from `<script type="application/ld+json">` blocks in linear O(N) time (`H1`). */
 export function extractJsonLdObjects(rawHtml: string): Array<Record<string, unknown>> {
+  if (!/ld\+json/i.test(rawHtml)) return [];
   const results: Array<Record<string, unknown>> = [];
   replaceHtmlTagBlocksLinear(rawHtml, 'script', (_full, attrStr, inner) => {
     if (results.length >= 30) return '';

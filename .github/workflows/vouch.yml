@@ -3,9 +3,6 @@ name: Contributor DCO & Vouch Gate
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
-  pull_request:
-    branches: [main]
-    paths: ['.github/workflows/vouch.yml']
 
 permissions:
   contents: read
@@ -49,10 +46,50 @@ jobs:
             exit 1
           fi
           if [ "$author_lc" != "bartrumb" ] && [ "$author_lc" != "dependabot[bot]" ] && [ "$author_lc" != "github-actions[bot]" ]; then
-            missing_dco="$(git log --no-merges --format='%H %B' "${BASE_SHA}..FETCH_HEAD" | awk '/^[0-9a-f]{40} /{if (sha != "" && !ok) print sha; sha=$1; ok=0} /^Signed-off-by: .+ <.+@.+>/{ok=1} END{if (sha != "" && !ok) print sha}')"
+            commits="$(git rev-list "${BASE_SHA}..${HEAD_SHA}")"
+            missing_dco=""
+            if [ -n "$commits" ]; then
+              while IFS= read -r sha; do
+                [ -z "$sha" ] && continue
+                author_name="$(git log -1 --format='%an' "$sha" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                author_email="$(git log -1 --format='%ae' "$sha" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+                committer_name="$(git log -1 --format='%cn' "$sha" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                committer_email="$(git log -1 --format='%ce' "$sha" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+                msg_body="$(git log -1 --format='%B' "$sha" | tr -d '\r')"
+                trailers="$(printf '%s\n' "$msg_body" | awk '
+                  { lines[NR] = $0 }
+                  END {
+                    end = NR
+                    while (end > 0 && lines[end] ~ /^[[:space:]]*$/) end--
+                    if (end <= 1) exit
+                    start = end
+                    while (start > 1 && lines[start] !~ /^[[:space:]]*$/) start--
+                    if (start < 1 || lines[start] !~ /^[[:space:]]*$/) exit
+                    for (i = start + 1; i <= end; i++) print lines[i]
+                  }
+                ')"
+                commit_ok=0
+                if [ -n "$trailers" ]; then
+                  while IFS= read -r tline; do
+                    [ -z "$tline" ] && continue
+                    if [[ "$tline" =~ ^Signed-off-by:[[:space:]]+([^[:space:]<>][^<>]*)[[:space:]]+\<([^[:space:]<>@]+@[^[:space:]<>@.]+\.[^[:space:]<>@]+)\>[[:space:]]*$ ]]; then
+                      sname="$(printf '%s' "${BASH_REMATCH[1]}" | sed 's/[[:space:]]*$//')"
+                      semail="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
+                      if { [ "$sname" = "$author_name" ] && [ "$semail" = "$author_email" ]; } || \
+                         { [ "$semail" != "noreply@github.com" ] && [ "$sname" = "$committer_name" ] && [ "$semail" = "$committer_email" ]; }; then
+                        commit_ok=1
+                        break
+                      fi
+                    fi
+                  done <<< "$trailers"
+                fi
+                if [ "$commit_ok" -ne 1 ]; then
+                  missing_dco="${missing_dco}${missing_dco:+ }${sha}"
+                fi
+              done <<< "$commits"
+            fi
             if [ -n "$missing_dco" ]; then
-              missing_flat="$(printf '%s' "$missing_dco" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
-              echo "::error::External contributor commits must include a DCO sign-off ('git commit -s'). Missing on: ${missing_flat}"
+              echo "::error::External contributor commits (including merges) must include a valid DCO sign-off ('git commit -s') matching the commit author/committer. Missing on: ${missing_dco}"
               exit 1
             fi
           fi

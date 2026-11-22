@@ -26,7 +26,7 @@ import (
 
 // Version is the EdgeFetch binary/add-on release version reported in X-Agent-Version and agent_hello.
 // Overridable at build time via -ldflags="-X github.com/bartrumb/edgefetch/v2/internal/agent.Version=...".
-var Version = "2.6.2"
+var Version = "2.6.3"
 
 const (
 	DefaultPingInterval          = 30 * time.Second
@@ -96,6 +96,8 @@ func warmUpCrawlerBounded(ctx context.Context, crawler *crawl.Crawler) {
 	cancel()
 }
 
+var runHubFn = Run
+
 // RunAll maintains persistent outbound WebSocket sessions to every controller in `cfg.HubURLs` (falling back to
 // `cfg.HubURL`), sharing one `*crawl.Crawler` and `*politeness.Registry` across active-active controllers with zero
 // coordination overhead.
@@ -120,7 +122,7 @@ func RunAll(
 		if len(hubs) == 1 {
 			cfg.HubURL = hubs[0]
 		}
-		return Run(ctx, cfg, crawler, allow, hubTransport, log, rtOpts)
+		return runHubFn(ctx, cfg, crawler, allow, hubTransport, log, rtOpts)
 	}
 
 	var wg sync.WaitGroup
@@ -133,7 +135,7 @@ func RunAll(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := Run(ctx, subCfg, crawler, allow, hubTransport, subLog, rtOpts); err != nil {
+			if err := runHubFn(ctx, subCfg, crawler, allow, hubTransport, subLog, rtOpts); err != nil {
 				errCh <- err
 			}
 		}()
@@ -146,6 +148,119 @@ func RunAll(
 		}
 	}
 	return nil
+}
+
+const maxQueuedDispatches = 8
+
+type dispatchQueue struct {
+	mu             sync.Mutex
+	items          []controlMessage
+	wake           chan struct{}
+	closed         bool
+	latestNonce    map[string]string
+	inflightCancel map[string]context.CancelFunc
+}
+
+func newDispatchQueue() *dispatchQueue {
+	return &dispatchQueue{
+		items:          make([]controlMessage, 0, maxQueuedDispatches),
+		wake:           make(chan struct{}, 1),
+		latestNonce:    make(map[string]string),
+		inflightCancel: make(map[string]context.CancelFunc),
+	}
+}
+
+func (q *dispatchQueue) enqueue(msg controlMessage) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return false
+	}
+	for i := range q.items {
+		if q.items[i].JobID == msg.JobID {
+			prev := q.latestNonce[msg.JobID]
+			q.items[i] = msg
+			q.latestNonce[msg.JobID] = msg.JobNonce
+			if prev != "" && prev != msg.JobNonce {
+				if cancelFn := q.inflightCancel[msg.JobID]; cancelFn != nil {
+					cancelFn()
+				}
+			}
+			return true
+		}
+	}
+	if len(q.items) >= maxQueuedDispatches {
+		return false
+	}
+	prev := q.latestNonce[msg.JobID]
+	q.latestNonce[msg.JobID] = msg.JobNonce
+	if prev != "" && prev != msg.JobNonce {
+		if cancelFn := q.inflightCancel[msg.JobID]; cancelFn != nil {
+			cancelFn()
+		}
+	}
+	q.items = append(q.items, msg)
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (q *dispatchQueue) pop() (controlMessage, bool) {
+	for {
+		q.mu.Lock()
+		for len(q.items) > 0 {
+			msg := q.items[0]
+			q.items[0] = controlMessage{}
+			q.items = q.items[1:]
+			superseded := q.latestNonce[msg.JobID] != msg.JobNonce
+			q.mu.Unlock()
+			if superseded {
+				continue
+			}
+			return msg, true
+		}
+		if q.closed {
+			q.mu.Unlock()
+			return controlMessage{}, false
+		}
+		q.mu.Unlock()
+		<-q.wake
+	}
+}
+
+func (q *dispatchQueue) registerInflight(jobID, jobNonce string, cancelFn context.CancelFunc) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.latestNonce[jobID] != jobNonce {
+		return false
+	}
+	q.inflightCancel[jobID] = cancelFn
+	return true
+}
+
+func (q *dispatchQueue) finishInflight(jobID, jobNonce string) (superseded bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	delete(q.inflightCancel, jobID)
+	cur, exists := q.latestNonce[jobID]
+	if exists && cur != jobNonce {
+		return true
+	}
+	if cur == jobNonce {
+		delete(q.latestNonce, jobID)
+	}
+	return false
+}
+
+func (q *dispatchQueue) close() {
+	q.mu.Lock()
+	if !q.closed {
+		q.closed = true
+		close(q.wake)
+	}
+	q.mu.Unlock()
 }
 
 // Run maintains a persistent outbound WebSocket session to `cfg.HubURL/agent/ws`, automatically reconnecting with
@@ -170,17 +285,22 @@ func Run(
 		},
 	}
 
-	dispatchCh := make(chan controlMessage, 8)
+	queue := newDispatchQueue()
+	busySem := make(chan struct{}, maxQueuedDispatches)
 	var dispatchWG sync.WaitGroup
 	dispatchWG.Add(1)
 	go func() {
 		defer dispatchWG.Done()
-		for msg := range dispatchCh {
-			handleDispatchWithOpts(ctx, cfg, crawler, allow, replyClient, log, rtOpts, msg)
+		for {
+			msg, ok := queue.pop()
+			if !ok {
+				return
+			}
+			handleQueuedDispatch(ctx, cfg, crawler, allow, replyClient, log, rtOpts, msg, queue)
 		}
 	}()
 	defer func() {
-		close(dispatchCh)
+		queue.close()
 		dispatchWG.Wait()
 	}()
 
@@ -192,7 +312,7 @@ func Run(
 		}
 
 		connectedAt := time.Now()
-		err := runSession(ctx, cfg, crawler, allow, replyClient, log, rtOpts, attempt, lastErr, dispatchCh)
+		err := runSession(ctx, cfg, crawler, allow, replyClient, log, rtOpts, attempt, lastErr, queue, busySem, &dispatchWG)
 		if ctx.Err() != nil {
 			log.Info("agent_exit", slog.String("reason", "context_cancelled"))
 			return nil
@@ -232,7 +352,9 @@ func runSession(
 	rtOpts RuntimeOpts,
 	reconnectAttempt int,
 	lastError string,
-	dispatchCh chan<- controlMessage,
+	queue *dispatchQueue,
+	busySem chan struct{},
+	dispatchWG *sync.WaitGroup,
 ) error {
 	caps := crawler.Capabilities()
 	bVer, bSandbox := crawler.BrowserInfo()
@@ -284,21 +406,7 @@ func runSession(
 	stopClose := context.AfterFunc(sessionCtx, func() { _ = conn.CloseCleanly() })
 	defer stopClose()
 
-	go func() {
-		ticker := time.NewTicker(rtOpts.PingInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-sessionCtx.Done():
-				return
-			case <-ticker.C:
-				if werr := conn.WriteText("ping"); werr != nil {
-					_ = conn.CloseNow()
-					return
-				}
-			}
-		}
-	}()
+	go runPingLoop(sessionCtx, rtOpts.PingInterval, conn.WriteText, conn.CloseNow)
 
 	defer func() {
 		cancelSession()
@@ -331,14 +439,107 @@ func runSession(
 				log.Warn("agent_missing_job_id")
 				continue
 			}
-			select {
-			case dispatchCh <- msg:
-			case <-sessionCtx.Done():
-				return nil
+			if !queue.enqueue(msg) {
+				// Queue full: refuse immediately instead of blocking the WebSocket read loop so dead sockets are detected promptly.
+				log.Warn("agent_dispatch_queue_full", slog.String("job_id", msg.JobID))
+				select {
+				case busySem <- struct{}{}:
+					dispatchWG.Add(1)
+					go func(m controlMessage) {
+						defer dispatchWG.Done()
+						defer func() { <-busySem }()
+						bctx, bcancel := context.WithTimeout(context.Background(), rtOpts.ShutdownUploadTimeout)
+						stopOnShutdown := context.AfterFunc(ctx, func() {
+							time.AfterFunc(rtOpts.ShutdownDrain, bcancel)
+						})
+						defer func() {
+							stopOnShutdown()
+							bcancel()
+						}()
+						results := make([]crawl.Result, len(m.Call.Requests))
+						for i, r := range m.Call.Requests {
+							results[i] = crawl.Result{
+								ID:      r.ID,
+								URL:     r.URL,
+								Kind:    r.Kind,
+								Outcome: classify.OutcomeError,
+								Problem: "agent_busy: dispatch queue full",
+							}
+						}
+						_ = uploadReply(bctx, replyClient, cfg, m.JobID, m.JobNonce, crawl.FetchReply{
+							Results: results,
+							Summary: crawl.Summarize(results),
+						})
+					}(msg)
+				default:
+				}
 			}
 		default:
 			log.Warn("agent_unknown_type", slog.String("type", msg.Type))
 		}
+	}
+}
+
+func runPingLoop(ctx context.Context, interval time.Duration, writePing func(string) error, closeNow func() error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if werr := writePing("ping"); werr != nil {
+				_ = closeNow()
+				return
+			}
+		}
+	}
+}
+
+func newR2ArtifactSink(
+	replyClient *http.Client,
+	cfg Config,
+	jobID, jobNonce string,
+	retention string,
+	maxContent int,
+	uploadTimeout time.Duration,
+	jobLog *slog.Logger,
+) crawl.ResultSink {
+	var uploadMu sync.Mutex
+	return func(_ int, res crawl.Result) crawl.Result {
+		if res.Body == "" {
+			return res
+		}
+		rawBytes, decErr := res.DecodeBody()
+		// Always clear inline Body immediately so bodies never pass through AgentHubDO or accumulate in RAM.
+		res.Body = ""
+		res.BodyEncoding = ""
+		if decErr != nil {
+			res.BodyOmitted = true
+			res.ArtifactError = "decode body: " + decErr.Error()
+			return res
+		}
+		if len(rawBytes) > maxContent {
+			res.BodyOmitted = true
+			res.Truncated = true
+			res.ArtifactError = fmt.Sprintf("body (%d bytes) exceeds artifact maxContentBytes (%d)", len(rawBytes), maxContent)
+			return res
+		}
+		uploadMu.Lock()
+		upStart := time.Now()
+		artCtx, cancelArt := context.WithTimeout(context.Background(), uploadTimeout)
+		artRef, upErr := uploadArtifact(artCtx, replyClient, cfg, jobID, jobNonce, res.ID, retention, rawBytes)
+		cancelArt()
+		res.Timing.ArtifactUploadMs = time.Since(upStart).Milliseconds()
+		uploadMu.Unlock()
+		if upErr != nil {
+			res.BodyOmitted = true
+			res.ArtifactError = upErr.Error()
+			jobLog.Warn("agent_artifact_upload_failed", slog.String("request_id", res.ID), slog.String("error", upErr.Error()))
+			return res
+		}
+		res.Artifact = artRef
+		return res
 	}
 }
 
@@ -367,8 +568,27 @@ func handleDispatchWithOpts(
 	rtOpts RuntimeOpts,
 	msg controlMessage,
 ) {
+	handleQueuedDispatch(parentCtx, cfg, crawler, allow, replyClient, baseLog, rtOpts, msg, nil)
+}
+
+func handleQueuedDispatch(
+	parentCtx context.Context,
+	cfg Config,
+	crawler *crawl.Crawler,
+	allow func(*url.URL) error,
+	replyClient *http.Client,
+	baseLog *slog.Logger,
+	rtOpts RuntimeOpts,
+	msg controlMessage,
+	queue *dispatchQueue,
+) {
 	rtOpts = rtOpts.withDefaults()
 	jobBaseCtx, cancelDrain := context.WithCancel(context.Background())
+	if queue != nil && !queue.registerInflight(msg.JobID, msg.JobNonce, cancelDrain) {
+		cancelDrain()
+		baseLog.Warn("agent_stale_job_dropped", slog.String("job_id", msg.JobID))
+		return
+	}
 	stopForward := context.AfterFunc(parentCtx, func() {
 		time.AfterFunc(rtOpts.ShutdownDrain, cancelDrain)
 	})
@@ -424,44 +644,14 @@ func handleDispatchWithOpts(
 			if maxContent <= 0 || maxContent > crawl.MaxMaxBytes {
 				maxContent = crawl.MaxMaxBytes
 			}
-			var uploadMu sync.Mutex
-			sink = func(_ int, res crawl.Result) crawl.Result {
-				if res.Body == "" {
-					return res
-				}
-				rawBytes, decErr := res.DecodeBody()
-				// Always clear inline Body immediately so bodies never pass through AgentHubDO or accumulate in RAM.
-				res.Body = ""
-				res.BodyEncoding = ""
-				if decErr != nil {
-					res.BodyOmitted = true
-					res.ArtifactError = "decode body: " + decErr.Error()
-					return res
-				}
-				if len(rawBytes) > maxContent {
-					res.BodyOmitted = true
-					res.Truncated = true
-					res.ArtifactError = fmt.Sprintf("body (%d bytes) exceeds artifact maxContentBytes (%d)", len(rawBytes), maxContent)
-					return res
-				}
-				uploadMu.Lock()
-				upStart := time.Now()
-				artCtx, cancelArt := context.WithTimeout(context.Background(), rtOpts.UploadTimeout)
-				artRef, upErr := uploadArtifact(artCtx, replyClient, cfg, msg.JobID, msg.JobNonce, res.ID, retention, rawBytes)
-				cancelArt()
-				res.Timing.ArtifactUploadMs = time.Since(upStart).Milliseconds()
-				uploadMu.Unlock()
-				if upErr != nil {
-					res.BodyOmitted = true
-					res.ArtifactError = upErr.Error()
-					jobLog.Warn("agent_artifact_upload_failed", slog.String("request_id", res.ID), slog.String("error", upErr.Error()))
-					return res
-				}
-				res.Artifact = artRef
-				return res
-			}
+			sink = newR2ArtifactSink(replyClient, cfg, msg.JobID, msg.JobNonce, retention, maxContent, rtOpts.UploadTimeout, jobLog)
 		}
 		reply = crawl.ExecuteCallWithTrace(jobBaseCtx, crawler, call, hdr, jobLog, sink)
+	}
+
+	if queue != nil && queue.finishInflight(msg.JobID, msg.JobNonce) {
+		jobLog.Warn("agent_stale_reply_suppressed", slog.String("job_id", msg.JobID))
+		return
 	}
 
 	// Normal uploads get the full UploadTimeout (default 45s) across retries; only active SIGTERM shutdown drains

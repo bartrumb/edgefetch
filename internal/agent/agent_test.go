@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -438,9 +439,11 @@ func TestReconnectWatchdogClosesPreviousSocketImmediately(t *testing.T) {
 }
 
 func TestNormalUploadExceedsLegacyTenSecondCapWithoutLosingReply(t *testing.T) {
+	var replyReceived atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		time.Sleep(10200 * time.Millisecond)
+		replyReceived.Store(true)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -469,6 +472,9 @@ func TestNormalUploadExceedsLegacyTenSecondCapWithoutLosingReply(t *testing.T) {
 		},
 	)
 
+	if !replyReceived.Load() {
+		t.Fatal("expected /agent/reply server handler to receive upload")
+	}
 	if strings.Contains(logBuf.String(), "agent_reply_failed") {
 		t.Fatalf("A2 BUG: normal (non-shutdown) reply upload failed at >10s even within 45s client budget: %s", logBuf.String())
 	}
@@ -915,5 +921,234 @@ func TestSessionReconnectDoesNotBlockOnInFlightDispatch(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("Run error: %v", err)
+	}
+}
+
+func TestR6QueueFullNonBlockingReconnectAndSupersededNonceDrop(t *testing.T) {
+	originSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		hold := 250 * time.Millisecond
+		if strings.HasPrefix(r.Host, "hold.") {
+			hold = 3 * time.Second
+		}
+		select {
+		case <-time.After(hold):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("content-type", "text/html")
+		_, _ = w.Write([]byte("<html>ok</html>"))
+	}))
+	defer originSrv.Close()
+	originAddr := originSrv.Listener.Addr().String()
+
+	tr := &http.Transport{
+		TLSClientConfig: originSrv.Client().Transport.(*http.Transport).TLSClientConfig,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, originAddr)
+		},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	crawler := crawl.NewCrawler(tr, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	crawler.Jitter = func(time.Duration) time.Duration { return 250 * time.Millisecond }
+	defer crawler.Close()
+
+	makeMsg := func(job, host, nonce string) []byte {
+		raw, _ := json.Marshal(map[string]any{
+			"type":     "dispatch",
+			"jobId":    job,
+			"jobNonce": nonce,
+			"call": crawl.FetchCall{
+				Requests: []crawl.Request{{ID: "1", URL: "https://" + host + ".example.com/x", Kind: classify.KindPage}},
+				Options:  crawl.Options{TimeoutMs: 5000},
+			},
+		})
+		return raw
+	}
+
+	// Part 1: 12 dispatches (1 running + 8 queued + 3 busy-rejected) followed by socket drop MUST reconnect in <900ms!
+	{
+		var (
+			mu         sync.Mutex
+			sessCount  int
+			dropAt     time.Time
+			reconnAt   time.Time
+			busySeen   atomic.Int32
+			reconnDone = make(chan struct{})
+		)
+		mux := http.NewServeMux()
+		mux.HandleFunc("/agent/ws", func(w http.ResponseWriter, r *http.Request) {
+			sc, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer sc.CloseNow()
+			mu.Lock()
+			sessCount++
+			s := sessCount
+			if s == 2 {
+				reconnAt = time.Now()
+				close(reconnDone)
+			}
+			mu.Unlock()
+			for {
+				_, data, err := sc.Read(r.Context())
+				if err != nil {
+					return
+				}
+				if s == 1 && strings.Contains(string(data), `"agent_hello"`) {
+					for j := 0; j < 12; j++ {
+						_ = sc.Write(r.Context(), websocket.MessageText, makeMsg(fmt.Sprintf("qf-%d", j), "hold", "n1"))
+					}
+					time.Sleep(150 * time.Millisecond)
+					mu.Lock()
+					dropAt = time.Now()
+					mu.Unlock()
+					return
+				}
+			}
+		})
+		mux.HandleFunc("/agent/reply", func(w http.ResponseWriter, r *http.Request) {
+			gz, err := gzip.NewReader(r.Body)
+			if err == nil {
+				var rep crawl.FetchReply
+				if json.NewDecoder(gz).Decode(&rep) == nil && len(rep.Results) > 0 && strings.Contains(rep.Results[0].Problem, "agent_busy") {
+					busySeen.Add(1)
+				}
+				_ = gz.Close()
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		})
+		hub := httptest.NewServer(mux)
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		done := make(chan error, 1)
+		go func() {
+			done <- Run(ctx, Config{
+				HubURL:     hub.URL,
+				AgentToken: "agent-secret-token-0123456789-abcdef",
+				SiteID:     "site-r6",
+				UserAgent:  crawl.DefaultUserAgent,
+				PauseMs:    0,
+			}, crawler, crawl.PublicHTTPS, http.DefaultTransport, log, RuntimeOpts{ShutdownDrain: 50 * time.Millisecond})
+		}()
+		select {
+		case <-reconnDone:
+		case <-ctx.Done():
+			t.Fatal("read loop blocked on full dispatch queue; never reconnected after socket drop")
+		}
+		mu.Lock()
+		gap := reconnAt.Sub(dropAt)
+		mu.Unlock()
+		if gap > 950*time.Millisecond {
+			t.Fatalf("expected immediate reconnect (<950ms) when dispatch queue is full, took %s", gap)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for busySeen.Load() < 3 && time.Now().Before(deadline) {
+			time.Sleep(25 * time.Millisecond)
+		}
+		if busySeen.Load() < 3 {
+			t.Fatalf("expected >=3 agent_busy replies for overflow dispatches, got %d", busySeen.Load())
+		}
+		cancel()
+		<-done
+		hub.Close()
+	}
+
+	// Part 2: Re-dispatched jobs with a newer nonce supersede queued/in-flight session-1 jobs with zero stale replies!
+	{
+		var (
+			mu          sync.Mutex
+			sessCount   int
+			stalePosts  int
+			freshNonces = make(map[string]string)
+			allDone     = make(chan struct{})
+		)
+		mux := http.NewServeMux()
+		mux.HandleFunc("/agent/ws", func(w http.ResponseWriter, r *http.Request) {
+			sc, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer sc.CloseNow()
+			mu.Lock()
+			sessCount++
+			s := sessCount
+			mu.Unlock()
+			for {
+				_, data, err := sc.Read(r.Context())
+				if err != nil {
+					return
+				}
+				if !strings.Contains(string(data), `"agent_hello"`) {
+					continue
+				}
+				if s == 1 {
+					for j := 0; j < 6; j++ {
+						host := fmt.Sprintf("job%d", j)
+						if j == 0 {
+							host = "hold"
+						}
+						_ = sc.Write(r.Context(), websocket.MessageText, makeMsg(fmt.Sprintf("j%d", j), host, "nonce-s1"))
+					}
+					time.Sleep(120 * time.Millisecond)
+					return
+				}
+				if s == 2 {
+					for j := 0; j < 6; j++ {
+						_ = sc.Write(r.Context(), websocket.MessageText, makeMsg(fmt.Sprintf("j%d", j), fmt.Sprintf("s2job%d", j), "nonce-s2"))
+					}
+					_ = sc.Write(r.Context(), websocket.MessageText, makeMsg("fresh", "s2fresh", "nonce-s2"))
+				}
+			}
+		})
+		mux.HandleFunc("/agent/reply", func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			jid := r.Header.Get("X-Job-Id")
+			nonce := r.Header.Get("X-Job-Nonce")
+			mu.Lock()
+			if nonce == "nonce-s1" {
+				stalePosts++
+			} else if nonce == "nonce-s2" {
+				freshNonces[jid] = nonce
+				if len(freshNonces) == 7 {
+					select {
+					case <-allDone:
+					default:
+						close(allDone)
+					}
+				}
+			}
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		})
+		hub := httptest.NewServer(mux)
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		done := make(chan error, 1)
+		go func() {
+			done <- Run(ctx, Config{
+				HubURL:     hub.URL,
+				AgentToken: "agent-secret-token-0123456789-abcdef",
+				SiteID:     "site-r6",
+				UserAgent:  crawl.DefaultUserAgent,
+				PauseMs:    0,
+			}, crawler, crawl.PublicHTTPS, http.DefaultTransport, log, RuntimeOpts{ShutdownDrain: 50 * time.Millisecond})
+		}()
+		select {
+		case <-allDone:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for all 7 re-dispatched nonce-s2 replies (got %d)", len(freshNonces))
+		}
+		mu.Lock()
+		sp := stalePosts
+		mu.Unlock()
+		if sp != 0 {
+			t.Fatalf("SECURITY: expected 0 stale nonce-s1 replies after reconnect re-dispatch, got %d", sp)
+		}
+		cancel()
+		<-done
+		hub.Close()
 	}
 }

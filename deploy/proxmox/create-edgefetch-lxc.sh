@@ -18,7 +18,7 @@ STORAGE="${STORAGE:-local-lvm}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
 BRIDGE="${BRIDGE:-vmbr0}"
 PROFILE="${EDGEFETCH_PROFILE:-fat}" # "fat" (Chromium + Poppler, 512 MiB RAM) or "lite" (HTTP/2 + pure-Go PDF, 64 MiB RAM)
-VERSION="${EDGEFETCH_VERSION:-2.6.0}"
+VERSION="${EDGEFETCH_VERSION:-2.6.3}"
 
 if [[ -z "${EDGEFETCH_HUB_URL:-}" || -z "${EDGEFETCH_AGENT_TOKEN:-}" ]]; then
   echo "ERROR: EDGEFETCH_HUB_URL and EDGEFETCH_AGENT_TOKEN must be set." >&2
@@ -95,7 +95,7 @@ pct exec "$CTID" -- env PROFILE="$PROFILE" VERSION="$VERSION" GOARCH="$GOARCH" s
 
   cat >"$tmp_dir/release-signing-pub.pem" <<'\''PUBEOF'\''
 -----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEAeTr4Ryc8TmHsN8gDk0mC61tN3BFD2dHUfqCBrMeoex0=
+MCowBQYDK2VwAyEAv8+ZT9d/404KI0pY1PILOVBzsUvTHWaL0aLghciWy90=
 -----END PUBLIC KEY-----
 PUBEOF
 

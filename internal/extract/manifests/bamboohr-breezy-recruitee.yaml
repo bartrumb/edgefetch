@@ -1,0 +1,387 @@
+# Shared Go + TypeScript Declarative Site Adapter: BambooHR, Breezy HR, Recruitee & Personio
+id: bamboohr-breezy-recruitee
+name: "BambooHR, Breezy HR, Recruitee & Personio Boards"
+category: jobs
+description: "Upgrades BambooHR (/careers/list & /detail), Breezy HR (/json), Recruitee (/api/offers), and Personio (/xml) career boards to structured feeds."
+domains:
+  - "*.bamboohr.com"
+  - "*.breezy.hr"
+  - "*.recruitee.com"
+  - "*.jobs.personio.de"
+  - "*.jobs.personio.com"
+exampleUrls:
+  - "https://acme.bamboohr.com/careers"
+  - "https://acme.breezy.hr/"
+  - "https://acme.recruitee.com/"
+  - "https://acme.jobs.personio.de/"
+
+routes:
+  # 1. BambooHR whole-board listing (<org>.bamboohr.com/, /careers, /jobs -> /careers/list)
+  - match:
+      hosts:
+        - "*.bamboohr.com"
+      hostSubdomain:
+        suffix: .bamboohr.com
+        param: org
+        reserved:
+          - www
+          - resources
+          - help
+          - documentation
+          - developers
+          - blog
+          - status
+          - api
+      pathSegments:
+        - param: boardSection
+          charset: alnum
+          allowValues:
+            - careers
+            - jobs
+          optional: true
+    twin:
+      id: bamboohr-board
+      fetchUrl: "https://{host}/careers/list"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        count:
+          paths: [result]
+          format: array_len
+      requireVars:
+        - count
+      titleTemplate: "{org} — BambooHR Careers ({count} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: result
+          limit: 100
+          emptyText: "No open positions currently listed."
+          itemVars:
+            id:
+              paths: [id]
+            jTitle:
+              paths: [jobOpeningName]
+              trim: true
+              default: Role
+            jUrl:
+              template: "https://{host}/careers/{id}"
+            dept:
+              paths: [departmentLabel]
+              trim: true
+              default: "-"
+            city:
+              paths: [location.city]
+              trim: true
+            state:
+              paths: [location.state]
+              trim: true
+            bothLoc:
+              template: "{city}, {state}"
+              whenVars: [city, state]
+            oneLoc:
+              paths: [location.city, location.state]
+              trim: true
+            remoteLoc:
+              paths: [isRemote]
+              format: bool_map
+              trueValue: Remote
+              falseValue: "-"
+            loc:
+              template: "{bothLoc}"
+              whenVars: [bothLoc]
+              fallbackVar: oneLoc
+              fallbackTemplate: "{remoteLoc}"
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Department
+              template: "{dept}"
+            - header: Location
+              template: "{loc}"
+
+  # 2. BambooHR single job detail (<org>.bamboohr.com/careers/<jobId> -> /careers/<jobId>/detail)
+  - match:
+      hosts:
+        - "*.bamboohr.com"
+      hostSubdomain:
+        suffix: .bamboohr.com
+        param: org
+        reserved:
+          - www
+          - resources
+          - help
+          - documentation
+          - developers
+          - blog
+          - status
+          - api
+      exactSegments: false
+      pathSegments:
+        - careers
+        - param: jobId
+          charset: digits
+    twin:
+      id: bamboohr-job
+      fetchUrl: "https://{host}/careers/{jobId}/detail"
+      kind: json
+      accept: application/json
+    extract:
+      rootPath: result.jobOpening
+      requireFields:
+        - jobOpeningName
+      vars:
+        jobTitle:
+          paths: [jobOpeningName]
+          trim: true
+        body:
+          paths: [description]
+          format: html_to_md
+      titleTemplate: "{jobTitle} @ {org}"
+      bodyVar: body
+
+  # 3. Breezy HR whole-board JSON (<org>.breezy.hr/ -> /json)
+  - match:
+      hosts:
+        - "*.breezy.hr"
+      hostSubdomain:
+        suffix: .breezy.hr
+        param: org
+        reserved:
+          - www
+          - app
+      pathSegments: []
+    twin:
+      id: breezy-hr
+      fetchUrl: "https://{host}/json"
+      kind: json
+      accept: application/json
+    extract:
+      wrapRootArrayAs: jobs
+      vars:
+        count:
+          paths: [jobs]
+          format: array_len
+      requireVars:
+        - count
+      titleTemplate: "{org} — Breezy HR Board ({count} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 100
+          emptyText: "No open positions currently listed."
+          itemVars:
+            jTitle:
+              paths: [name]
+              trim: true
+              default: Role
+            rawUrl:
+              paths: [url]
+              requireHttps: true
+            jUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://{host}"
+            dept:
+              paths: [department]
+              trim: true
+              default: "-"
+            remoteLoc:
+              paths: [location.is_remote]
+              format: bool_map
+              trueValue: Remote
+              falseValue: "-"
+            loc:
+              paths: [location.name]
+              trim: true
+              fallbackTemplate: "{remoteLoc}"
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Department
+              template: "{dept}"
+            - header: Location
+              template: "{loc}"
+
+  # 4a. Recruitee single offer (<org>.recruitee.com/o/<targetSlug> -> /api/offers)
+  - match:
+      hosts:
+        - "*.recruitee.com"
+      hostSubdomain:
+        suffix: .recruitee.com
+        param: org
+        reserved:
+          - www
+          - app
+      exactSegments: false
+      pathSegments:
+        - o
+        - param: targetSlug
+          charset: pkg
+    twin:
+      id: recruitee
+      fetchUrl: "https://{host}/api/offers"
+      kind: json
+      accept: application/json
+    extract:
+      findInArray:
+        arrayPath: offers
+        matchField: slug
+        matchTemplate: "{targetSlug}"
+      vars:
+        jobTitle:
+          paths: [title]
+          trim: true
+          default: Role
+        desc:
+          paths: [description]
+          format: html_to_md
+        reqs:
+          paths: [requirements]
+          format: html_to_md
+      titleTemplate: "{jobTitle} @ {org}"
+      bodyVar: desc
+      sections:
+        - heading: Requirements
+          textVar: reqs
+
+  # 4b. Recruitee whole-board listing (<org>.recruitee.com/ -> /api/offers)
+  - match:
+      hosts:
+        - "*.recruitee.com"
+      hostSubdomain:
+        suffix: .recruitee.com
+        param: org
+        reserved:
+          - www
+          - app
+      pathSegments: []
+    twin:
+      id: recruitee
+      fetchUrl: "https://{host}/api/offers"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        count:
+          paths: [offers]
+          format: array_len
+      requireVars:
+        - count
+      titleTemplate: "{org} — Recruitee Job Board ({count} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: offers
+          limit: 100
+          emptyText: "No open positions currently listed."
+          itemVars:
+            oTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            slug:
+              paths: [slug]
+            rawUrl:
+              paths: [careers_url]
+              requireHttps: true
+            oUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://{host}/o/{slug}"
+            dept:
+              paths: [department]
+              trim: true
+              default: "-"
+            remoteLoc:
+              paths: [remote]
+              format: bool_map
+              trueValue: Remote
+              falseValue: "-"
+            loc:
+              paths: [location]
+              trim: true
+              fallbackTemplate: "{remoteLoc}"
+            isRemote:
+              paths: [remote]
+              format: bool_map
+              trueValue: Remote
+              falseValue: ""
+            hybridOrOnsite:
+              paths: [hybrid]
+              format: bool_map
+              trueValue: Hybrid
+              falseValue: On-site
+            workplace:
+              template: "{isRemote}"
+              whenVars: [isRemote]
+              fallbackVar: hybridOrOnsite
+          collectLinkVars:
+            - oUrl
+          columns:
+            - header: Role
+              template: "[{oTitle}]({oUrl})"
+            - header: Department
+              template: "{dept}"
+            - header: Location
+              template: "{loc}"
+            - header: Workplace
+              template: "{workplace}"
+
+  # 5. Personio XML feed (<org>.jobs.personio.de / .com -> /xml?language=en)
+  - match:
+      anyOf:
+        - hosts:
+            - "*.jobs.personio.de"
+          hostSubdomain:
+            suffix: .jobs.personio.de
+            param: org
+          pathSegments: []
+        - hosts:
+            - "*.jobs.personio.com"
+          hostSubdomain:
+            suffix: .jobs.personio.com
+            param: org
+          pathSegments: []
+    twin:
+      id: personio
+      fetchUrl: "https://{host}/xml?language=en"
+      kind: text
+      accept: application/xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags:
+          - workzag-jobs
+          - position
+        itemTag: position
+        titleTemplate: "{org} — Personio Job Board ({itemCount} open roles)"
+        emptyText: "No open positions currently listed."
+        limit: 100
+        itemVars:
+          id:
+            tags: [id]
+          pName:
+            tags: [name]
+            default: Role
+          dept:
+            tags: [department]
+            default: "-"
+          office:
+            tags: [office]
+            default: "-"
+          schedule:
+            tags: [schedule]
+            default: "-"
+        columns:
+          - header: Role
+            template: "[{pName}](https://{host}/job/{id})"
+          - header: Department
+            template: "{dept}"
+          - header: Office
+            template: "{office}"
+          - header: Schedule
+            template: "{schedule}"

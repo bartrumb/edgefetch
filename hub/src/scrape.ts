@@ -55,6 +55,7 @@ import {
 } from './jobs';
 import { computeMarkdownChanges } from './map-crawl';
 import { MARKDOWN_FOR_AGENTS_ACCEPT, validatePublicHttpsTargetUrl } from './overflow';
+import { getActiveRequestTracer, sanitizeUrlForSpan, setActiveSpanAttribute, type RequestTracer, type TraceContext } from './otel';
 import { chunkMarkdownForSearch, rankChunksInMemory } from './search-index';
 import {
   isValidSha256Hex,
@@ -97,7 +98,7 @@ import {
   splitPdfPagesAndMarkers,
 } from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 29;
+export const SCRAPE_PIPELINE_VERSION = 30;
 
 export interface ScrapedImage {
   url: string;
@@ -244,10 +245,344 @@ export function decodeHtmlEntities(input: string): string {
     });
 }
 
+function measureLeadingIndentCols(raw: string): { cols: number; bytePos: number; isBlank: boolean } {
+  let cols = 0;
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw.charCodeAt(i);
+    if (ch === 32 /* ' ' */) {
+      cols++;
+      i++;
+    } else if (ch === 9 /* '\t' */) {
+      cols += 4 - (cols % 4);
+      i++;
+    } else {
+      break;
+    }
+  }
+  return { cols, bytePos: i, isBlank: i >= raw.length };
+}
+
+function detectListItemContentCol(raw: string, leadCols: number, leadPos: number): number {
+  if (leadCols > 3 || leadPos >= raw.length) return 0;
+  const c = raw.charCodeAt(leadPos);
+  let markerEnd = -1;
+  let markerWidth = 0;
+  if (c === 45 /* '-' */ || c === 42 /* '*' */ || c === 43 /* '+' */) {
+    markerEnd = leadPos + 1;
+    markerWidth = 1;
+  } else if (c >= 48 && c <= 57) {
+    let d = leadPos + 1;
+    while (d < raw.length && d - leadPos < 9 && raw.charCodeAt(d) >= 48 && raw.charCodeAt(d) <= 57) d++;
+    if (d < raw.length && (raw.charCodeAt(d) === 46 /* '.' */ || raw.charCodeAt(d) === 41 /* ')' */)) {
+      markerEnd = d + 1;
+      markerWidth = markerEnd - leadPos;
+    }
+  }
+  if (markerEnd < 0 || markerEnd >= raw.length) return 0;
+  const after = raw.charCodeAt(markerEnd);
+  if (after !== 32 && after !== 9) return 0;
+
+  // Compute column where content starts after list marker + 1..4 spaces
+  let col = leadCols + markerWidth;
+  let p = markerEnd;
+  while (p < raw.length) {
+    const sc = raw.charCodeAt(p);
+    if (sc === 32) {
+      col++;
+      p++;
+    } else if (sc === 9) {
+      col += 4 - (col % 4);
+      p++;
+    } else {
+      break;
+    }
+  }
+  if (p >= raw.length || col - (leadCols + markerWidth) > 4) {
+    return leadCols + markerWidth + 1;
+  }
+  return col;
+}
+
+function scanContainerPrefixLinear(raw: string): { prefixLen: number; risky: boolean } {
+  let i = 0;
+  let risky = false;
+  let col = 0;
+  for (;;) {
+    const runStartCol = col;
+    while (i < raw.length && (raw.charCodeAt(i) === 32 || raw.charCodeAt(i) === 9)) {
+      if (raw.charCodeAt(i) === 9) {
+        col += 4 - (col % 4);
+        risky = true;
+      } else {
+        col++;
+      }
+      i++;
+    }
+    if (col - runStartCol >= 4) risky = true;
+    if (i >= raw.length) break;
+    const c = raw.charCodeAt(i);
+    if (c === 62 /* '>' */) {
+      risky = true;
+      i++;
+      col++;
+      continue;
+    }
+    if ((c === 45 || c === 42 || c === 43) && i + 1 < raw.length && (raw.charCodeAt(i + 1) === 32 || raw.charCodeAt(i + 1) === 9)) {
+      risky = true;
+      i++;
+      col++;
+      continue;
+    }
+    if (c >= 48 && c <= 57) {
+      let j = i;
+      while (j < raw.length && j - i < 9 && raw.charCodeAt(j) >= 48 && raw.charCodeAt(j) <= 57) j++;
+      if (j < raw.length) {
+        const d = raw.charCodeAt(j);
+        if ((d === 46 || d === 41) && j + 1 < raw.length && (raw.charCodeAt(j + 1) === 32 || raw.charCodeAt(j + 1) === 9)) {
+          risky = true;
+          col += j + 1 - i;
+          i = j + 1;
+          continue;
+        }
+      }
+    }
+    break;
+  }
+  return { prefixLen: i, risky };
+}
+
+function cleanFenceInfoStringLinear(rawInfo: string): string {
+  if (!rawInfo) return '';
+  // Bound info string to 200 chars in O(1) so 64K-tab/bracket fence headers (`fh.6.mjs`) run in <0.1ms!
+  const capped = rawInfo.length > 200 ? rawInfo.slice(0, 200) : rawInfo;
+  // Strip `theme={...}` and `[[...]]` linearly before removing stray brackets/angles
+  let s = capped;
+  while (s.includes('theme={')) {
+    const idx = s.indexOf('theme={');
+    let wsStart = idx;
+    while (wsStart > 0 && (s.charCodeAt(wsStart - 1) === 32 || s.charCodeAt(wsStart - 1) === 9)) wsStart--;
+    const closeBrace = s.indexOf('}', idx + 7);
+    s = closeBrace >= 0 ? s.slice(0, wsStart) + s.slice(closeBrace + 1) : s.slice(0, wsStart);
+  }
+  while (s.includes('[[')) {
+    const idx = s.indexOf('[[');
+    let wsStart = idx;
+    while (wsStart > 0 && (s.charCodeAt(wsStart - 1) === 32 || s.charCodeAt(wsStart - 1) === 9)) wsStart--;
+    const closeBrackets = s.indexOf(']]', idx + 2);
+    s = closeBrackets >= 0 ? s.slice(0, wsStart) + s.slice(closeBrackets + 2) : s.slice(0, wsStart);
+  }
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    // Strip `[`, `]`, `<`, `>` so `marked` never parses inline links or tags in fence info strings
+    if (c === 91 || c === 93 || c === 60 || c === 62) continue;
+    if (c === 9) {
+      out += ' ';
+      continue;
+    }
+    if (c < 32) continue;
+    out += s[i]!;
+  }
+  out = out.replace(/(?:^|[ \t]+)twoslash(?=[ \t]+|$)/gi, '').trimEnd();
+  // If truncation cut mid-token after huge whitespace (`'```js' + '\t'.repeat(65536) + 'x'`), collapse multi-space tail cleanly
+  const firstWordMatch = /^([ \t]*[^\s`~]{1,64})(?:[ \t]{8,}.*)?$/.exec(out);
+  if (firstWordMatch && out.length >= 100) {
+    return firstWordMatch[1]!.trimEnd();
+  }
+  return out;
+}
+
+/**
+ * Normalizes ambiguous indented, container-prefixed, Setext-adjacent, and EOF-unclosed code fences (`R6-H1` & `M9`)
+ * so `splitMarkdownByCodeFences`, CommonMark (`micromark`), and `marked` always agree 100% on prose vs code boundaries.
+ */
+function hardenMarkdownFenceStructure(md: string): string {
+  if (!md) return md;
+  const hasFenceChars = md.includes('```') || md.includes('~~~');
+  const hasBracketRef = md.includes('[');
+  if (!hasFenceChars && !hasBracketRef) return md;
+
+  const hasPotentialSetext = hasFenceChars && /(?:^|\n)[ ]{0,3}(?:=+|-+)[ \t]*(?:\r?\n|$)/.test(md);
+  const lines = md.split('\n');
+  const out: string[] = [];
+  let inFence = false;
+  let fenceChar = '';
+  let fenceLen = 0;
+  let fenceContainerIndent = 0;
+  let activeListIndent = 0;
+  let escapedRiskyFence: { ch: string; len: number; needBlockquote: boolean } | null = null;
+
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li]!;
+    const cr = line.endsWith('\r') ? '\r' : '';
+    const raw = cr ? line.slice(0, -1) : line;
+    const { cols, bytePos, isBlank } = measureLeadingIndentCols(raw);
+
+    if (inFence) {
+      // Container dedent MUST be checked BEFORE closing fence so `- item\n  ```\n``` ` emits an explicit close for the list fence first!
+      if (!isBlank && fenceContainerIndent > 0 && cols < fenceContainerIndent) {
+        out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(fenceLen)}`);
+        inFence = false;
+        fenceChar = '';
+        fenceLen = 0;
+        fenceContainerIndent = 0;
+        activeListIndent = 0;
+        // Fall through and process `raw` as prose / new block!
+      } else {
+        const maxCloseIndent = fenceContainerIndent > 0 ? fenceContainerIndent + 3 : 3;
+        if (cols <= maxCloseIndent && bytePos === cols) {
+          let p = bytePos;
+          const fcCode = fenceChar.charCodeAt(0);
+          while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
+          const runLen = p - bytePos;
+          if (runLen >= fenceLen) {
+            while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
+            if (p === raw.length) {
+              out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(runLen)}${cr}`);
+              inFence = false;
+              fenceChar = '';
+              fenceLen = 0;
+              fenceContainerIndent = 0;
+              continue;
+            }
+          }
+        }
+        out.push(line);
+        continue;
+      }
+    }
+
+    if (!isBlank && activeListIndent > 0 && cols < activeListIndent) {
+      activeListIndent = 0;
+      if (escapedRiskyFence && !escapedRiskyFence.needBlockquote) {
+        escapedRiskyFence = null;
+      }
+    }
+
+    const listCol = detectListItemContentCol(raw, cols, bytePos);
+    if (listCol > 0) {
+      activeListIndent = listCol;
+      escapedRiskyFence = null;
+    }
+
+    const { prefixLen, risky } = scanContainerPrefixLinear(raw);
+    const lineHasBlockquote = prefixLen > 0 && raw.slice(0, prefixLen).includes('>');
+    if (escapedRiskyFence?.needBlockquote && !lineHasBlockquote) {
+      escapedRiskyFence = null;
+    }
+
+    // If we previously escaped a container-prefixed fence opener (`- \`\`\` ` / `1. \`\`\` `) inside the current container,
+    // also escape its matching closing fence line (`  \`\`\` `) so it cannot invert polarity and open a new fence!
+    if (escapedRiskyFence && !escapedRiskyFence.needBlockquote && listCol === 0 && bytePos === cols && cols <= activeListIndent + 3) {
+      const escCode = escapedRiskyFence.ch.charCodeAt(0);
+      let p = bytePos;
+      while (p < raw.length && raw.charCodeAt(p) === escCode) p++;
+      const runLen = p - bytePos;
+      if (runLen >= escapedRiskyFence.len) {
+        while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
+        if (p === raw.length) {
+          const escapedRun = `\\${escapedRiskyFence.ch}`.repeat(runLen);
+          out.push(`${raw.slice(0, bytePos)}${escapedRun}${raw.slice(bytePos + runLen)}${cr}`);
+          escapedRiskyFence = null;
+          continue;
+        }
+      }
+    }
+
+    // Check valid fence opener (top-level `0..3` spaces when `activeListIndent === 0`, or list-item `activeListIndent .. activeListIndent + 3` spaces)
+    const allowedMinCols = activeListIndent > 0 ? activeListIndent : 0;
+    const allowedMaxCols = allowedMinCols + 3;
+    if (listCol === 0 && cols >= allowedMinCols && cols <= allowedMaxCols && bytePos === cols && bytePos + 3 <= raw.length) {
+      const c0 = raw.charCodeAt(bytePos);
+      if (c0 === 96 /* '`' */ || c0 === 126 /* '~' */) {
+        let fEnd = bytePos + 1;
+        while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
+        const fLen = fEnd - bytePos;
+        if (fLen >= 3) {
+          const infoRaw = raw.slice(fEnd);
+          if (!(c0 === 96 && infoRaw.includes('`'))) {
+            // Prevent `marked4` Setext `lheading` (`para\n```\n<img...>\n===`) from crossing into a col-0 fence
+            if (hasPotentialSetext && activeListIndent === 0 && out.length > 0 && out[out.length - 1]!.trim() !== '') {
+              out.push('');
+            }
+            inFence = true;
+            fenceChar = c0 === 96 ? '`' : '~';
+            fenceLen = fLen;
+            // Normalize top-level `1..3` space fences to col-0 so dedented lines inside top-level fences never cause desync
+            fenceContainerIndent = activeListIndent > 0 ? activeListIndent : 0;
+            const cleanInfo = cleanFenceInfoStringLinear(infoRaw);
+            out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(fLen)}${cleanInfo}${cr}`);
+            continue;
+          }
+        }
+      }
+    }
+
+    // Escape container-prefixed or tab/4-space fence openers (`- ``` `, `1. ~~~`, `> ``` `, `\t``` `, `    ``` `)
+    if (prefixLen > 0 && risky && prefixLen + 3 <= raw.length) {
+      const c0 = raw.charCodeAt(prefixLen);
+      if ((c0 === 96 || c0 === 126) && raw.charCodeAt(prefixLen + 1) === c0 && raw.charCodeAt(prefixLen + 2) === c0) {
+        let fEnd = prefixLen + 3;
+        while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
+        const fLen = fEnd - prefixLen;
+        const tailAfterFence = raw.slice(fEnd);
+        // Backtick runs with another backtick on the same line (`- ``` x ``` `) are inline code spans in CommonMark/marked, NEVER fences!
+        if (!(c0 === 96 && tailAfterFence.includes('`'))) {
+          const fChar = c0 === 96 ? '`' : '~';
+          if (escapedRiskyFence && escapedRiskyFence.ch === fChar && fLen >= escapedRiskyFence.len && tailAfterFence.trim() === '') {
+            escapedRiskyFence = null;
+          } else if (listCol > 0 || lineHasBlockquote) {
+            escapedRiskyFence = { ch: fChar, len: fLen, needBlockquote: lineHasBlockquote };
+          }
+          const escapedRun = `\\${fChar}`.repeat(fLen);
+          out.push(`${raw.slice(0, prefixLen)}${escapedRun}${tailAfterFence}${cr}`);
+          continue;
+        }
+      }
+    }
+
+    // Guard `marked` multi-line `[label\n~~~\n]: url` and empty-destination `[y]:\n``` ` swallowing fences (both top-level & in containers)
+    const checkPos = prefixLen > 0 ? prefixLen : bytePos <= 3 ? bytePos : -1;
+    if (checkPos >= 0 && checkPos < raw.length && raw.charCodeAt(checkPos) === 91 /* '[' */) {
+      const tail = raw.slice(checkPos);
+      let closeIdx = -1;
+      for (let q = 1; q < tail.length; q++) {
+        const qc = tail.charCodeAt(q);
+        if (qc === 92 /* '\\' */) {
+          q++;
+          continue;
+        }
+        if (qc === 93 /* ']' */) {
+          closeIdx = q;
+          break;
+        }
+      }
+      if (closeIdx < 0) {
+        out.push(`${raw.slice(0, checkPos)}\\${tail}${cr}`);
+        continue;
+      }
+      if (closeIdx + 1 < tail.length && tail.charCodeAt(closeIdx + 1) === 58 /* ':' */ && tail.slice(closeIdx + 2).trim() === '') {
+        out.push(`${raw.slice(0, checkPos)}${tail.slice(0, closeIdx + 1)}\\${tail.slice(closeIdx + 1)}${cr}`);
+        continue;
+      }
+    }
+
+    out.push(line);
+  }
+
+  // Never leave a code fence unclosed at EOF (`marked4` renders unclosed single-line EOF fences as inline prose!)
+  if (inFence) {
+    out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(fenceLen)}`);
+  }
+
+  return out.join('\n');
+}
+
 /**
  * Splits Markdown into alternating `[prose, codeFence, prose, codeFence, ...]` segments (`idx % 2 === 1` is always a
  * fenced code block) while honoring CommonMark variable-length backtick (```` ``` ````, ```` ```` ````) and tilde
- * (`~~~`, `~~~~`) fences so outer 4-char fences wrapping inner 3-backtick blocks never split prematurely.
+ * (`~~~`, `~~~~`) fences as well as list-container indentation boundaries (`R6-H1`).
  */
 export function splitMarkdownByCodeFences(md: string): string[] {
   if (!md || (!md.includes('```') && !md.includes('~~~'))) {
@@ -257,7 +592,8 @@ export function splitMarkdownByCodeFences(md: string): string[] {
   let inFence = false;
   let fenceChar = '';
   let fenceLen = 0;
-  let fenceIndent = 0;
+  let fenceContainerIndent = 0;
+  let activeListIndent = 0;
   let segStart = 0;
   let pos = 0;
   const len = md.length;
@@ -267,42 +603,59 @@ export function splitMarkdownByCodeFences(md: string): string[] {
     const nextPos = nl === -1 ? len : nl + 1;
     const lineRawEnd = nl === -1 ? len : nl > pos && md[nl - 1] === '\r' ? nl - 1 : nl;
     const rawLine = md.slice(pos, lineRawEnd);
-    const trimmedStart = rawLine.replace(/^[ ]{0,3}/, '');
+    const { cols, bytePos, isBlank } = measureLeadingIndentCols(rawLine);
 
-    if (!inFence) {
-      const openMatch = /^(`{3,}|~{3,})(.*)$/.exec(trimmedStart);
+    if (inFence) {
+      // Only a list-container fence (`fenceContainerIndent > 0`) closes on dedent (`cols < fenceContainerIndent`) in CommonMark!
+      if (!isBlank && fenceContainerIndent > 0 && cols < fenceContainerIndent) {
+        out.push(md.slice(segStart, pos));
+        inFence = false;
+        fenceChar = '';
+        fenceLen = 0;
+        fenceContainerIndent = 0;
+        activeListIndent = 0;
+        segStart = pos;
+        continue;
+      }
+      const maxCloseCols = fenceContainerIndent > 0 ? fenceContainerIndent + 3 : 3;
+      if (cols <= maxCloseCols && bytePos === cols) {
+        const rest = rawLine.slice(bytePos);
+        const closeMatch = /^(`{3,}|~{3,})[ \t]*$/.exec(rest);
+        if (closeMatch && closeMatch[1]![0] === fenceChar && closeMatch[1]!.length >= fenceLen) {
+          out.push(md.slice(segStart, lineRawEnd));
+          inFence = false;
+          fenceChar = '';
+          fenceLen = 0;
+          fenceContainerIndent = 0;
+          segStart = lineRawEnd;
+          pos = nextPos;
+          continue;
+        }
+      }
+      pos = nextPos;
+      continue;
+    }
+
+    if (!isBlank && activeListIndent > 0 && cols < activeListIndent) {
+      activeListIndent = 0;
+    }
+    const listCol = detectListItemContentCol(rawLine, cols, bytePos);
+    if (listCol > 0) {
+      activeListIndent = listCol;
+    }
+
+    const minOpenCols = activeListIndent > 0 ? activeListIndent : 0;
+    const maxOpenCols = minOpenCols + 3;
+    if (listCol === 0 && cols >= minOpenCols && cols <= maxOpenCols && bytePos === cols) {
+      const rest = rawLine.slice(bytePos);
+      const openMatch = /^(`{3,}|~{3,})(.*)$/.exec(rest);
       if (openMatch && !(openMatch[1]![0] === '`' && openMatch[2]!.includes('`'))) {
         out.push(md.slice(segStart, pos));
         inFence = true;
         fenceChar = openMatch[1]![0]!;
         fenceLen = openMatch[1]!.length;
-        fenceIndent = rawLine.length - trimmedStart.length;
+        fenceContainerIndent = activeListIndent > 0 ? activeListIndent : 0;
         segStart = pos;
-      }
-    } else {
-      const closeMatch = /^(`{3,}|~{3,})[ \t]*$/.exec(trimmedStart);
-      if (closeMatch && closeMatch[1]![0] === fenceChar && closeMatch[1]!.length >= fenceLen) {
-        out.push(md.slice(segStart, lineRawEnd));
-        inFence = false;
-        fenceChar = '';
-        fenceLen = 0;
-        segStart = lineRawEnd;
-      } else if (fenceIndent > 0 && rawLine.trim() !== '') {
-        let ind = 0;
-        for (let q = 0; q < rawLine.length; q++) {
-          const qc = rawLine.charCodeAt(q);
-          if (qc === 32) ind++;
-          else if (qc === 9) ind += 4;
-          else break;
-        }
-        if (ind < fenceIndent) {
-          out.push(md.slice(segStart, pos));
-          inFence = false;
-          fenceChar = '';
-          fenceLen = 0;
-          segStart = pos;
-          continue;
-        }
       }
     }
     pos = nextPos;
@@ -2954,6 +3307,9 @@ export function extractHtmlDocument(
       });
       if (siteExtracted) {
         matchedSiteExtracted = siteExtracted;
+        if (siteExtracted.extractorId) {
+          setActiveSpanAttribute('edgefetch.adapter_id', siteExtracted.extractorId);
+        }
         md = siteExtracted.markdown;
         if (siteExtracted.title) title = siteExtracted.title;
         if (siteExtracted.description && !description) description = siteExtracted.description;
@@ -3034,7 +3390,13 @@ export function extractHtmlDocument(
     md = redactPiiText(md);
     plainText = redactPiiText(plainText);
   }
-  md = escapeResidualHtmlOutsideCodeLinear(stripInvisibleSmugglingChars(md), false);
+  const strippedDocMd = hardenMarkdownFenceStructure(stripInvisibleSmugglingChars(md));
+  const detachedDocMd = strippedDocMd.includes('`')
+    ? splitMarkdownByCodeFences(strippedDocMd)
+        .map((part, idx) => (idx % 2 === 1 ? part : detachBareUrlsFromCodeSpansLinear(part)))
+        .join('')
+    : strippedDocMd;
+  md = escapeResidualHtmlOutsideCodeLinear(detachedDocMd, false);
   plainText = stripInvisibleSmugglingChars(plainText);
   const wordCount = countTextWords(md);
 
@@ -4156,15 +4518,71 @@ function decodeUriEntitiesForScheme(input: string): string {
 }
 
 
-/** R5: CommonMark code spans may continue across lines of one paragraph. Marks every line that follows an unmatched backtick run in the same paragraph; per-line code-span detection must not be trusted there. */
+function detectParagraphBreakKind(line: string): 'blank_or_atomic' | 'block_start' | 'atx_heading' | 'none' {
+  const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
+  if (isBlank) return 'blank_or_atomic';
+  const c = line.charCodeAt(bytePos);
+  if (cols <= 3) {
+    if (c === 35 /* '#' */) {
+      let h = bytePos;
+      while (h < line.length && line.charCodeAt(h) === 35 && h - bytePos < 7) h++;
+      if (
+        h - bytePos <= 6 &&
+        (h >= line.length || line.charCodeAt(h) === 32 || line.charCodeAt(h) === 9 || line.charCodeAt(h) === 13)
+      ) {
+        return 'atx_heading';
+      }
+    }
+    if (c === 62 /* '>' */) return 'block_start';
+    if (
+      (c === 96 || c === 126) &&
+      bytePos + 3 <= line.length &&
+      line.charCodeAt(bytePos + 1) === c &&
+      line.charCodeAt(bytePos + 2) === c
+    ) {
+      return 'blank_or_atomic';
+    }
+    if (c === 61 || c === 45 || c === 42 || c === 95) {
+      const rest = line.slice(bytePos);
+      if (/^(?:=+|-+)[ \t\r]*$/.test(rest) || /^(?:[-*_][ \t]*){3,}\r?$/.test(rest)) {
+        return 'blank_or_atomic';
+      }
+    }
+  }
+  if (
+    (c === 45 || c === 42 || c === 43) &&
+    bytePos + 1 < line.length &&
+    (line.charCodeAt(bytePos + 1) === 32 || line.charCodeAt(bytePos + 1) === 9)
+  ) {
+    return 'block_start';
+  }
+  if (c >= 48 && c <= 57) {
+    let d = bytePos + 1;
+    while (d < line.length && d - bytePos < 9 && line.charCodeAt(d) >= 48 && line.charCodeAt(d) <= 57) d++;
+    if (
+      d + 1 < line.length &&
+      (line.charCodeAt(d) === 46 || line.charCodeAt(d) === 41) &&
+      (line.charCodeAt(d + 1) === 32 || line.charCodeAt(d + 1) === 9)
+    ) {
+      return 'block_start';
+    }
+  }
+  return 'none';
+}
+
+/** R5/R6: CommonMark code spans may continue across lines of one paragraph, but NEVER cross blank lines, headings, fences, thematic breaks, blockquotes, or sibling list items (`CHANGELOG.md` false-positive fix). */
 function computeTickPoisonedLines(lines: string[]): Uint8Array {
   const poisoned = new Uint8Array(lines.length);
   let carry = false;
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]!;
-    if (line.trim() === '') {
+    const breakKind = detectParagraphBreakKind(line);
+    if (breakKind === 'blank_or_atomic') {
       carry = false;
       continue;
+    }
+    if (breakKind === 'block_start' || breakKind === 'atx_heading') {
+      carry = false;
     }
     if (carry) {
       poisoned[li] = 1;
@@ -4213,8 +4631,130 @@ function computeTickPoisonedLines(lines: string[]): Uint8Array {
       }
       i++;
     }
+    if (breakKind === 'atx_heading') {
+      carry = false;
+    }
   }
   return poisoned;
+}
+
+/**
+ * `R6-H3`: Detaches bare GFM autolink candidates (`https://`, `http://`, `ftp://`, `www.`, and glued email local-parts)
+ * from immediately following backticks outside existing code spans so GFM autolinkers (`marked`, `micromark+GFM`) NEVER
+ * swallow an opening code-span backtick into the URL and expose raw `<img onerror>` / `<script>` inside what our scanner
+ * thought was a code span. Also percent-encodes `` ` `` inside `<https://...>` angle-bracket autolinks.
+ */
+function detachBareUrlsFromCodeSpansLinear(prose: string): string {
+  if (!prose || !prose.includes('`')) return prose;
+  const lines = prose.split('\n');
+  const poisoned = computeTickPoisonedLines(lines);
+  let changed = false;
+
+  const startsBareGfmUrlAt = (s: string, pos: number): boolean => {
+    if (pos > 0) {
+      const prev = s.charCodeAt(pos - 1);
+      if ((prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) || (prev >= 97 && prev <= 122)) return false;
+    }
+    const rest = s.slice(pos, pos + 12);
+    if (/^(?:https?:\/\/|ftp:\/\/)/i.test(rest)) return true;
+    if (/^www\.[A-Za-z0-9]/i.test(rest)) return true;
+    return false;
+  };
+
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li]!;
+    if (!line.includes('`')) continue;
+    const cursors = createMarkdownLineScanCursors();
+    let out = '';
+    let last = 0;
+    let i = 0;
+
+    while (i < line.length) {
+      const ch = line.charCodeAt(i);
+
+      // 1. Angle-bracket autolinks `<https://...>` containing backticks (`<https://ok.example/`>`)
+      if (ch === 60 /* '<' */ && i + 4 < line.length && /^(?:https?|ftp|mailto):/i.test(line.slice(i + 1, i + 10))) {
+        const gtLimit = Math.min(line.length, i + 2049);
+        let gt = -1;
+        let hasTick = false;
+        for (let p = i + 1; p < gtLimit; p++) {
+          const pc = line.charCodeAt(p);
+          if (pc === 62 /* '>' */) {
+            gt = p;
+            break;
+          }
+          if (pc <= 32 || pc === 60) break;
+          if (pc === 96) hasTick = true;
+        }
+        if (gt > 0 && hasTick) {
+          out += `${line.slice(last, i + 1)}${line.slice(i + 1, gt).replace(/`/g, '%60')}>`;
+          i = gt + 1;
+          last = i;
+          changed = true;
+          continue;
+        }
+      }
+
+      // 2. Bare GFM URL (`https?://`, `ftp://`, `www.`) outside code spans: insert space before the first `` ` `` in/after it
+      if ((ch === 104 || ch === 72 || ch === 102 || ch === 70 || ch === 119 || ch === 87) && startsBareGfmUrlAt(line, i)) {
+        const urlLimit = Math.min(line.length, i + 2048);
+        let p = i + 4;
+        let detachedAt = -1;
+        while (p < urlLimit) {
+          const pc = line.charCodeAt(p);
+          if (pc <= 32 || pc === 60 || pc === 62) break;
+          if (pc === 96 /* '`' */) {
+            detachedAt = p;
+            break;
+          }
+          p++;
+        }
+        if (detachedAt >= 0) {
+          out += `${line.slice(last, detachedAt)} `;
+          last = detachedAt;
+          i = detachedAt;
+          changed = true;
+          // Fall through so the detached backtick at `i` is scanned as a normal code-span opener!
+        } else {
+          i = p;
+          continue;
+        }
+      }
+
+      // 3. Glued GFM email local-part (`a`b@c.com`) swallowing an opening backtick in `marked`
+      if (line.charCodeAt(i) === 96 && !isBackslashEscapedAt(line, i)) {
+        if (i > 0) {
+          const prev = line.charCodeAt(i - 1);
+          const isEmailLead =
+            (prev >= 48 && prev <= 57) ||
+            (prev >= 65 && prev <= 90) ||
+            (prev >= 97 && prev <= 122) ||
+            prev === 46 ||
+            prev === 95 ||
+            prev === 43 ||
+            prev === 45;
+          if (isEmailLead && /^[A-Za-z0-9.!#$%&'*+/=?^_{|}~-]{0,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/.test(line.slice(i + 1, i + 128))) {
+            out += `${line.slice(last, i)} `;
+            last = i;
+            changed = true;
+          }
+        }
+        if (poisoned[li] === 0) {
+          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+          i = spanEnd > 0 ? spanEnd : tickEnd;
+          continue;
+        }
+      }
+
+      i++;
+    }
+
+    if (last > 0) {
+      lines[li] = out + line.slice(last);
+    }
+  }
+
+  return changed ? lines.join('\n') : prose;
 }
 
 const DANGEROUS_SCHEME_PREFIXES = ['javascript:', 'vbscript:', 'data:', 'file:', 'blob:'];
@@ -4283,22 +4823,50 @@ function destinationStartsWithDangerousScheme(s: string, from: number, angle: bo
   return false;
 }
 
-/** R5 fail-closed pass: any `](` / `]:` outside trusted code spans that is followed (same or next line) by a dangerous scheme is broken with a backslash, whatever the precise link parser decided. */
+/** R5/R6 fail-closed pass: any `](` / `]:` outside trusted code spans (or after an earlier `[` on the paragraph, covering `marked16` `[a `](javascript:...) `x`) followed by a dangerous scheme is broken with `]\ (` / `]\:`. */
 function neutralizeResidualDangerousLinkDestinations(prose: string): string {
   if (!prose.includes('](') && !prose.includes(']:')) return prose;
   const lines = prose.split('\n');
   const poisoned = computeTickPoisonedLines(lines);
   let changed = false;
+  let sawBracketInPara = false;
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]!;
-    if (!line.includes('](') && !line.includes(']:')) continue;
+    const breakKind = detectParagraphBreakKind(line);
+    if (breakKind !== 'none') {
+      sawBracketInPara = false;
+    }
+    if (!line.includes('](') && !line.includes(']:')) {
+      if (line.includes('[')) {
+        const cursors = createMarkdownLineScanCursors();
+        let p = 0;
+        while (p < line.length) {
+          const pc = line.charCodeAt(p);
+          if (pc === 96 && poisoned[li] === 0 && !isBackslashEscapedAt(line, p)) {
+            const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, p, cursors);
+            p = spanEnd > 0 ? spanEnd : tickEnd;
+            continue;
+          }
+          if (pc === 91 && !isBackslashEscapedAt(line, p)) {
+            sawBracketInPara = true;
+            break;
+          }
+          p++;
+        }
+      }
+      continue;
+    }
     const cursors = createMarkdownLineScanCursors();
     let out = '';
     let last = 0;
     let i = 0;
     while (i < line.length) {
       const ch = line.charCodeAt(i);
-      if (ch === 96 && poisoned[li] === 0 && !isBackslashEscapedAt(line, i)) {
+      if (ch === 91 && !isBackslashEscapedAt(line, i)) {
+        sawBracketInPara = true;
+      }
+      // Only trust code spans to mask `](` / `]:` when NO unescaped `[` preceded them in the paragraph (`marked16` link-over-codespan bug)!
+      if (ch === 96 && poisoned[li] === 0 && !sawBracketInPara && !isBackslashEscapedAt(line, i)) {
         const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
         i = spanEnd > 0 ? spanEnd : tickEnd;
         continue;
@@ -4319,7 +4887,7 @@ function neutralizeResidualDangerousLinkDestinations(prose: string): string {
           }
           const angle = k < hay.length && hay.charCodeAt(k) === 60;
           if (destinationStartsWithDangerousScheme(hay, angle ? k + 1 : k, angle)) {
-            out += line.slice(last, i + 1) + '\\';
+            out += `${line.slice(last, i + 1)}\\ `;
             last = i + 1;
             changed = true;
           }
@@ -4328,6 +4896,7 @@ function neutralizeResidualDangerousLinkDestinations(prose: string): string {
       i++;
     }
     if (last > 0) lines[li] = out + line.slice(last);
+    if (breakKind === 'atx_heading') sawBracketInPara = false;
   }
   return changed ? lines.join('\n') : prose;
 }
@@ -5121,10 +5690,11 @@ function decodeMarkdownEntitiesPreservingLt(prose: string): string {
 
 function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): string {
   if (!prose || !prose.includes('`')) return prose;
-  return prose
-    .split('\n')
-    .map((line) => {
-      if (!line.includes('`')) return line;
+  const lines = prose.split('\n');
+  const poisoned = computeTickPoisonedLines(lines);
+  return lines
+    .map((line, lineIdx) => {
+      if (!line.includes('`') || poisoned[lineIdx] === 1) return line;
       const cursors = createMarkdownLineScanCursors();
       let out = '';
       let lastIdx = 0;
@@ -5154,26 +5724,36 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
 
 function cleanCodeFenceSegment(rawFenceBlock: string): string {
   let fenceBlock = rawFenceBlock;
-  {
-    const infoNl = fenceBlock.indexOf('\n');
-    const infoLine = infoNl === -1 ? fenceBlock : fenceBlock.slice(0, infoNl);
-    if (infoLine.includes('<')) fenceBlock = infoLine.replace(/</g, '&lt;') + (infoNl === -1 ? '' : fenceBlock.slice(infoNl));
-  }
   // Strip single-line minified `<script type="application/ld+json">` (`schema.org`) metadata blocks emitted by
   // edge HTML-to-Markdown converters, while leaving multi-line JSON-LD code examples in tutorials untouched.
-  if (/^`{3,}json[ \t]*\r?\n\{\s*"@context"\s*:\s*"https?:\/\/schema\.org"[^\r\n]{100,}\r?\n`{3,}$/i.test(fenceBlock.trim())) {
+  if (
+    fenceBlock.length < 32_768 &&
+    fenceBlock.includes('schema.org') &&
+    /^`{3,}json[ \t]*\r?\n\{\s*"@context"\s*:\s*"https?:\/\/schema\.org"[^\r\n]{100,}\r?\n`{3,}$/i.test(fenceBlock.trim())
+  ) {
     return '';
   }
   const nlIdx = fenceBlock.indexOf('\n');
-  if (nlIdx === -1) return fenceBlock;
+  if (nlIdx === -1) {
+    const m1 = /^([ ]{0,3}(?:`{3,}|~{3,}))(.*)$/.exec(fenceBlock.replace(/\r$/, ''));
+    return m1 ? `${m1[1]!}${cleanFenceInfoStringLinear(m1[2]!)}` : fenceBlock.replace(/</g, '&lt;');
+  }
   const rawHeader = fenceBlock.slice(0, nlIdx).replace(/\r$/, '');
-  if (rawHeader.length > 512) return fenceBlock;
+  const headerOpenMatch = /^([ ]{0,3}(?:`{3,}|~{3,}))(.*)$/.exec(rawHeader);
+  const fencePrefix = headerOpenMatch ? headerOpenMatch[1]! : '';
+  const rawInfo = headerOpenMatch ? headerOpenMatch[2]! : '';
+  const cleanHeader = fencePrefix ? `${fencePrefix}${cleanFenceInfoStringLinear(rawInfo)}` : rawHeader.slice(0, 256).replace(/</g, '&lt;');
+
   const closeMatch = /\r?\n([ ]{0,3}(?:`{3,}|~{3,})[ \t]*)$/.exec(fenceBlock);
-  if (!closeMatch) return fenceBlock;
+  if (!closeMatch) {
+    return `${cleanHeader}${fenceBlock.slice(nlIdx)}`;
+  }
   const closingFence = closeMatch[1]!;
   let innerCode = fenceBlock.slice(nlIdx + 1, closeMatch.index);
 
-  const isTwoslash = /\btwoslash\b/i.test(rawHeader) || /^[ \t]*\/\/[ \t]*---cut(?:-(?:before|after))?---[ \t]*$/m.test(innerCode);
+  const boundedHeaderPrefix = rawInfo.slice(0, 256);
+  const isTwoslash =
+    /\btwoslash\b/i.test(boundedHeaderPrefix) || /^[ \t]*\/\/[ \t]*---cut(?:-(?:before|after))?---[ \t]*$/m.test(innerCode);
   if (isTwoslash) {
     const cutLineMatch = /^[ \t]*\/\/[ \t]*---cut(?:-before)?---[ \t]*\r?\n/m.exec(innerCode);
     if (cutLineMatch) {
@@ -5189,16 +5769,10 @@ function cleanCodeFenceSegment(rawFenceBlock: string): string {
     );
   }
 
-  const cleanHeader = rawHeader
-    .replace(/[ \t]+theme=\{[^}\r\n]*\}/g, '')
-    .replace(/[ \t]+\[\[[^\r\n]*\]\]/g, '')
-    .replace(/[ \t]+\btwoslash\b/gi, '')
-    .replace(/[ \t]+$/, '');
-
   return `${cleanHeader}\n${innerCode}\n${closingFence}`;
 }
 
-export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
+function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
   if (!md) return '';
   let boundedInput = md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md;
   if (boundedInput.includes('\u0000')) boundedInput = boundedInput.replace(/\u0000/g, '');
@@ -5226,13 +5800,14 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allow
     }
   }
 
-  const parts = splitMarkdownByCodeFences(withoutMintlifyBanner);
+  const hardenedInput = hardenMarkdownFenceStructure(withoutMintlifyBanner);
+  const parts = splitMarkdownByCodeFences(hardenedInput);
   return parts
     .map((part, idx) => {
       if (idx % 2 === 1) {
         return cleanCodeFenceSegment(part);
       }
-      let proseWork = part;
+      let proseWork = detachBareUrlsFromCodeSpansLinear(part);
       // Strip JSX / MDX inline comments (`{/*reference*/}`, `{/* ... */}`) outside code fences in linear O(N) time.
       if (proseWork.includes('{/*')) {
         let outJsx = '';
@@ -5466,11 +6041,29 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allow
         }
       }
 
-      const resolvedProse = sanitizeAndResolveMarkdownProseLinksLinear(proseWork, { baseUrl, includeImages: true });
+      const detachedAfterRestore = detachBareUrlsFromCodeSpansLinear(proseWork);
+      const resolvedProse = sanitizeAndResolveMarkdownProseLinksLinear(detachedAfterRestore, { baseUrl, includeImages: true });
       return escapeResidualHtmlInMarkdownProseLinear(resolvedProse, allowPdfPageMarkers).replace(/\n{3,}/g, '\n\n');
     })
     .map((part, idx) => (idx % 2 === 1 ? part : dedupeConsecutiveStandaloneLinkParagraphs(part)))
     .join('');
+}
+
+export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
+  if (!md) return '';
+  let cur = sanitizeInlineHtmlInMarkdownSinglePass(md, baseUrl, allowPdfPageMarkers);
+  if (!cur) return '';
+  // Fast exit when output contains no constructs that could re-interact across passes
+  if (!cur.includes('<') && !cur.includes('](') && !cur.includes(']:') && !cur.includes('```') && !cur.includes('~~~')) {
+    return cur;
+  }
+  for (let pass = 0; pass < 3; pass++) {
+    const again = sanitizeInlineHtmlInMarkdownSinglePass(cur, baseUrl, allowPdfPageMarkers);
+    if (again === cur) return cur;
+    cur = again;
+  }
+  // Fail closed if adversarial input did not converge within 4 total passes
+  return escapeResidualHtmlOutsideCodeLinear(cur, allowPdfPageMarkers).replace(/\]\((?=[ \t]*[a-zA-Z]+:)/g, ']\\ (');
 }
 
 function sanitizeFrontmatterFieldText(raw: string): string {
@@ -5654,13 +6247,15 @@ function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
   const withoutSchemaFences = parts
     .map((part, idx) => {
       if (idx % 2 === 1) {
-        const trimmedFence = part.trim();
-        if (
-          /^`{3,}json[ \t]*\r?\n(?:\{\s*"@context"\s*:\s*"https?:\/\/schema\.org"[^\r\n]{80,}\r?\n)+\s*`{3,}$/i.test(
-            trimmedFence,
-          )
-        ) {
-          return '';
+        if (part.length < 32_768 && part.includes('schema.org')) {
+          const trimmedFence = part.trim();
+          if (
+            /^`{3,}json[ \t]*\r?\n(?:\{\s*"@context"\s*:\s*"https?:\/\/schema\.org"[^\r\n]{80,}\r?\n)+\s*`{3,}$/i.test(
+              trimmedFence,
+            )
+          ) {
+            return '';
+          }
         }
         return part;
       }
@@ -7354,7 +7949,10 @@ export async function executeScrapeCall(params: {
   source?: string;
   selfHost?: string;
   now?: number;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; body: Record<string, unknown>; via: string; retryAfter?: string }> {
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runScrape = async (): Promise<{ status: number; body: Record<string, unknown>; via: string; retryAfter?: string }> => {
   const { payload, env, executeHubFetch, source = 'scrape', selfHost, now = Date.now() } = params;
   const urlCheck = validatePublicHttpsTargetUrl(payload.url, selfHost);
   if (!urlCheck.ok) {
@@ -7588,6 +8186,7 @@ export async function executeScrapeCall(params: {
   }
 
   if (!needsLiveHtml && ocrMode !== 'always' && maxAgeMs > 0 && env.ARTIFACTS && env.META) {
+    const cacheStartMs = Date.now();
     const hit = await lookupCachedScrape({
       bucket: env.ARTIFACTS,
       metaDb: env.META,
@@ -7597,6 +8196,24 @@ export async function executeScrapeCall(params: {
       now,
     });
     if (hit) {
+      if (activeTracer) {
+        const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
+          kind: 1,
+          startTimeMs: cacheStartMs,
+          attributes: {
+            'cache.hit': true,
+            'cache.tier': 'r2-d1',
+            'cache.revalidated': false,
+            'url.full': sanitizeUrlForSpan(normalizedUrl),
+            'http.response.status_code': hit.status,
+            'edgefetch.pipeline_version': hit.pipelineVersion,
+          },
+        });
+        cacheSpan.setStatus(true);
+        cacheSpan.end();
+        activeTracer.setAttribute('edgefetch.via', 'cache:r2-d1');
+        activeTracer.setAttribute('edgefetch.cached', true);
+      }
       const fullCached = finalizeScrapedMarkdown(redactPii ? redactPiiText(hit.markdown) : hit.markdown, {
         isPdf: isLikelyPdfUrl(normalizedUrl),
         includeImages,
@@ -7878,6 +8495,7 @@ export async function executeScrapeCall(params: {
               atsMdArtifactId = `md:${mdSha}`;
             }
             const atsTitle = filteredBoard ? filteredBoard.title : formatted!.title;
+            setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
             return {
               status: 200,
               via: atsRes.via,
@@ -8174,6 +8792,7 @@ export async function executeScrapeCall(params: {
             return { markdown: sub.markdown, links: sub.links };
           });
           if (formatted && formatted.markdown.trim().length > 0) {
+            setActiveSpanAttribute('edgefetch.adapter_id', registryTwin.id, activeTracer ?? undefined);
             const rawMd = redactPii ? redactPiiText(formatted.markdown) : formatted.markdown;
             const twinShapedFull = finalizeScrapedMarkdown(rawMd, {
               isPdf: false,
@@ -8232,6 +8851,7 @@ export async function executeScrapeCall(params: {
                 markdown: twinShapedFull.markdown,
                 title: formatted.title,
                 llmConfig: twinLlmCfg,
+                ...(activeTracer ? { tracer: activeTracer } : {}),
               });
               twinSummaryOut = sumRes.summary;
             }
@@ -8257,6 +8877,7 @@ export async function executeScrapeCall(params: {
                   schema: jsonSchemaSpec.schema,
                   llmConfig: twinLlmCfg,
                   heuristicFallback: heuristic,
+                  ...(activeTracer ? { tracer: activeTracer } : {}),
                 });
                 twinJsonOut = llmJ.data;
               } else {
@@ -8522,6 +9143,7 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut) {
         return formatExternalSpaResponse(spaOut);
@@ -8623,6 +9245,7 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut) {
         return formatExternalSpaResponse(spaOut);
@@ -8745,7 +9368,27 @@ export async function executeScrapeCall(params: {
 
   // R5: `304 Not Modified` conditional revalidation hit — refresh `pages.last_fetched_at` in META D1 and serve verified R2 Markdown!
   if (item.status === 304 && revalCandidate && env.META) {
-    await touchRevalidatedPage(env.META, normalizedUrl, now);
+    if (activeTracer) {
+      await activeTracer.withSpan(
+        'cache:r2-d1',
+        {
+          kind: 1,
+          attributes: {
+            'cache.hit': true,
+            'cache.tier': 'r2-d1',
+            'cache.revalidated': true,
+            'http.response.status_code': 304,
+            'url.full': sanitizeUrlForSpan(normalizedUrl),
+            'edgefetch.pipeline_version': revalCandidate.pipelineVersion,
+          },
+        },
+        () => touchRevalidatedPage(env.META!, normalizedUrl, now),
+      );
+      activeTracer.setAttribute('edgefetch.cached', true);
+      activeTracer.setAttribute('edgefetch.revalidated', true);
+    } else {
+      await touchRevalidatedPage(env.META, normalizedUrl, now);
+    }
     const fullReval = finalizeScrapedMarkdown(
       redactPii ? redactPiiText(revalCandidate.markdown) : revalCandidate.markdown,
       { isPdf: isLikelyPdfUrl(normalizedUrl), includeImages },
@@ -8811,10 +9454,11 @@ export async function executeScrapeCall(params: {
   }
 
   // R2 & R3 (`R3-M3`): Guard against HTTP 200 WAF/CAPTCHA interstitials on BOTH HTML AND `origin-markdown` responses!
+  const wafSourceStr = rawBodyStr || (typeof item.markdown === 'string' ? item.markdown : '');
   const okWafMatch =
     (item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
-    (!isPdfResponse && rawBodyStr
-      ? classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 200, rawBody: rawBodyStr })
+    (!isPdfResponse && wafSourceStr
+      ? classifyWafAndChallenge({ status: typeof item.status === 'number' ? item.status : 200, rawBody: wafSourceStr })
       : null);
   if (okWafMatch) {
     const blockedInfo = refineBlockedInfo({
@@ -8878,6 +9522,7 @@ export async function executeScrapeCall(params: {
               ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd)
               : null;
           if (stubFormatted && stubFormatted.markdown.trim().length > 0) {
+            setActiveSpanAttribute('edgefetch.adapter_id', stubAts.id, activeTracer ?? undefined);
             const stubRedirect = analyzeUrlRedirect(normalizedUrl, wdStub.redirectUrl);
             const cleanStubMd = redactPii ? redactPiiText(stubFormatted.markdown) : stubFormatted.markdown;
             const stubShaped = finalizeScrapedMarkdown(cleanStubMd, { isPdf: false, includeImages, maxChars, baseUrl: wdStub.redirectUrl });
@@ -9589,6 +10234,7 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut && countTextWords(spaOut.markdown) > countTextWords(rawCleanMarkdown)) {
         const cleanSpaMd = redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown;
@@ -9797,6 +10443,7 @@ export async function executeScrapeCall(params: {
       markdown: rawCleanMarkdown.slice(0, 32_768),
       title: resolvedTitle,
       llmConfig: activeLlmConfig,
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     summaryOut = sumRes.summary;
   }
@@ -9861,6 +10508,7 @@ export async function executeScrapeCall(params: {
         schema: jsonSchemaSpec.schema,
         heuristicFallback: structuredJsonOut ?? {},
         llmConfig: activeLlmConfig,
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       structuredJsonOut = llmExt.data;
     }
@@ -9928,6 +10576,9 @@ export async function executeScrapeCall(params: {
   );
 
   const extractorIdOut = customCommerceId ?? extracted?.extractorId;
+  if (extractorIdOut) {
+    setActiveSpanAttribute('edgefetch.adapter_id', extractorIdOut, activeTracer ?? undefined);
+  }
   const adapterRecordsOut = customShopifyDoc?.records ?? extracted?.records;
   const adapterPaginationOut = customShopifyDoc?.pagination ?? extracted?.pagination;
   const adapterTotalOut = customShopifyDoc?.total ?? extracted?.total;
@@ -10059,6 +10710,8 @@ export async function executeScrapeCall(params: {
   };
 
   return { status: 200, via: viaOut, body: out };
+  };
+  return activeTracer ? activeTracer.run(runScrape) : runScrape();
 }
 
 export function extractYouTubeTranscriptFromHtml(rawHtml: string): string {
@@ -10204,7 +10857,10 @@ export async function executeInteractCall(params: {
   selfHost?: string;
   principal?: string;
   sessionSigningSecret?: string;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runInteract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
   const { payload, env, executeHubFetch, source = 'interact', selfHost, principal, sessionSigningSecret } = params;
   const effectivePrincipal = normalizeInteractPrincipal(principal, source);
   const signingSecret =
@@ -10236,6 +10892,8 @@ export async function executeInteractCall(params: {
         body: { ok: false, error: 'session_principal_mismatch', message: 'interact sessionId belongs to a different caller principal' },
       };
     }
+    const resumedSessionHash = await sha256HexString(`${parsedSession.siteId.toLowerCase()}:${parsedSession.agentSessionId}`);
+    setActiveSpanAttribute('edgefetch.interact.session_hash', resumedSessionHash, activeTracer ?? undefined);
   }
   const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
 
@@ -10264,6 +10922,10 @@ export async function executeInteractCall(params: {
   }
   const actions: Array<Record<string, unknown>> = parsedInteractActions.actions;
   const agentActions: Array<Record<string, unknown>> = [...parsedInteractActions.actions];
+  setActiveSpanAttribute('edgefetch.interact.action_count', actions.length, activeTracer ?? undefined);
+  if (normalizedUrl) {
+    setActiveSpanAttribute('url.full', sanitizeUrlForSpan(normalizedUrl), activeTracer ?? undefined);
+  }
 
   const topWaitForMs =
     typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
@@ -10426,6 +11088,10 @@ export async function executeInteractCall(params: {
     const errSiteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
     const errActualSite = (errSiteMatch?.[1] ?? pinnedSite ?? 'default').toLowerCase();
     const errAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
+    if (errAgentSid) {
+      const errSessionHash = await sha256HexString(`${errActualSite}:${errAgentSid}`);
+      setActiveSpanAttribute('edgefetch.interact.session_hash', errSessionHash, activeTracer ?? undefined);
+    }
     const errSig = errAgentSid
       ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, errActualSite, errAgentSid)
       : undefined;
@@ -10462,6 +11128,10 @@ export async function executeInteractCall(params: {
   const siteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
   const actualSite = (siteMatch?.[1] ?? pinnedSite ?? 'default').toLowerCase();
   const returnedAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
+  if (returnedAgentSid) {
+    const okSessionHash = await sha256HexString(`${actualSite}:${returnedAgentSid}`);
+    setActiveSpanAttribute('edgefetch.interact.session_hash', okSessionHash, activeTracer ?? undefined);
+  }
   const sessionSig = returnedAgentSid
     ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, actualSite, returnedAgentSid)
     : undefined;
@@ -10478,7 +11148,10 @@ export async function executeInteractCall(params: {
     extracted?.markdown ||
     (typeof item.markdown === 'string' && item.markdown ? sanitizeInlineHtmlInMarkdown(item.markdown, finalUrl || undefined).trim() : '');
   if (wantMarkdown && transcript && !/^#{2,3}\s*Transcript\b/im.test(markdown)) {
-    markdown = markdown ? `${markdown}\n\n## Transcript\n\n${transcript}` : `## Transcript\n\n${transcript}`;
+    const cleanTranscript = sanitizeInlineHtmlInMarkdown(transcript, finalUrl || undefined).trim();
+    if (cleanTranscript) {
+      markdown = markdown ? `${markdown}\n\n## Transcript\n\n${cleanTranscript}` : `## Transcript\n\n${cleanTranscript}`;
+    }
   }
   const fallbackTitle =
     !extracted && rawHtml
@@ -10525,4 +11198,6 @@ export async function executeInteractCall(params: {
       },
     },
   };
+  };
+  return activeTracer ? activeTracer.run(runInteract) : runInteract();
 }

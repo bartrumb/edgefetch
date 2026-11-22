@@ -2,8 +2,12 @@ package politeness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -385,6 +389,495 @@ func TestRegistryBoundsTrackedHostsWithLRUEviction(t *testing.T) {
 	}
 	if got := r.Get(hotHost, now); got != hotState {
 		t.Fatal("A8 BUG: hot host did not survive LRU eviction")
+	}
+}
+
+func TestHostStateWaitDelayRobotsCacheAndRateLimitEdges(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	hs := NewRegistry().Get("edges.example.com", now)
+
+	if hs.WaitDelay(now) != 0 || hs.CrawlDelay(now) != 0 || hs.CachedRobots(now) != nil {
+		t.Fatal("fresh HostState expected zero delays and nil cached robots")
+	}
+
+	entry := &RobotsEntry{CrawlDelay: 5 * time.Second, ExpiresAt: now.Add(time.Minute)}
+	hs.SetRobots(now, entry, 0)
+	if hs.WaitDelay(now) != 0 {
+		t.Fatalf("expected WaitDelay 0 after zero distressPause, got %s", hs.WaitDelay(now))
+	}
+	if hs.CrawlDelay(now) != 5*time.Second || hs.CrawlDelay(now.Add(time.Minute)) != 0 {
+		t.Fatal("CrawlDelay expiry boundary failed")
+	}
+	if hs.CachedRobots(now) != entry || hs.CachedRobots(now.Add(time.Minute)) != nil {
+		t.Fatal("CachedRobots expiry boundary failed")
+	}
+
+	hs.SetRobots(now, entry, 10*time.Second)
+	if hs.WaitDelay(now) != 10*time.Second {
+		t.Fatalf("WaitDelay = %s, want 10s", hs.WaitDelay(now))
+	}
+	// Smaller distressPause must not shorten nextAllowed
+	hs.SetRobots(now, entry, 2*time.Second)
+	if hs.WaitDelay(now) != 10*time.Second {
+		t.Fatalf("WaitDelay shortened to %s, want 10s", hs.WaitDelay(now))
+	}
+
+	hs.NoteRateLimit(now, 0)
+	hs.NoteRateLimit(now, -time.Second)
+	if hs.CoolingDownRetryAfterMs(now) != 0 {
+		t.Fatal("non-positive NoteRateLimit should not set cooldown")
+	}
+	hs.NoteRateLimit(now, 10*time.Second)
+	hs.NoteRateLimit(now, 2*time.Second)
+	if got := hs.CoolingDownRetryAfterMs(now); got != 10_000 {
+		t.Fatalf("CoolingDownRetryAfterMs = %d, want 10000", got)
+	}
+	if got := hs.CoolingDownRetryAfterMs(now.Add(10*time.Second - 500*time.Microsecond)); got != 1 {
+		t.Fatalf("sub-ms CoolingDownRetryAfterMs = %d, want 1", got)
+	}
+
+	for i := 0; i < CircuitFailureThreshold; i++ {
+		hs.RecordOutcome(now, time.Second, 0, 502, false, true)
+	}
+	why := hs.CheckCircuit(now.Add(CircuitOpenCooldown-400*time.Millisecond), "edges.example.com")
+	if !strings.Contains(why, "1s remaining") {
+		t.Fatalf("expected sub-second CheckCircuit clamp to 1s remaining, got %q", why)
+	}
+}
+
+func TestHostStateRecordOutcomeAllBranches(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0)
+	hs := NewRegistry().Get("outcome.example.com", now)
+
+	// 1. Robots CrawlDelay overrides smaller minPause, and expired robots uses minPause
+	hs.SetRobots(now, &RobotsEntry{CrawlDelay: 6 * time.Second, ExpiresAt: now.Add(time.Hour)}, 0)
+	hs.RecordOutcome(now, time.Second, 0, 200, false, false)
+	if hs.WaitDelay(now) != 6*time.Second {
+		t.Fatalf("WaitDelay = %s, want 6s", hs.WaitDelay(now))
+	}
+	tExp := now.Add(2 * time.Hour)
+	hs.RecordOutcome(tExp, 2*time.Second, 0, 200, false, false)
+	if hs.WaitDelay(tExp) != 2*time.Second {
+		t.Fatalf("expired robots WaitDelay = %s, want 2s", hs.WaitDelay(tExp))
+	}
+
+	// 2. retryAfter > pause & 429 rateLimitedUntil monotonic update
+	hs.RecordOutcome(tExp, time.Second, 45*time.Second, 429, true, false)
+	if hs.WaitDelay(tExp) != 45*time.Second || hs.CoolingDownRetryAfterMs(tExp) != 45_000 {
+		t.Fatalf("expected 45s wait and cooldown")
+	}
+	hs.RecordOutcome(tExp, time.Second, 5*time.Second, 429, true, false)
+	if hs.WaitDelay(tExp) != 45*time.Second || hs.CoolingDownRetryAfterMs(tExp) != 45_000 {
+		t.Fatalf("expected monotonic 45s retention")
+	}
+
+	// 3. throttled && DefaultThrottlePause > pause vs minPause > DefaultThrottlePause
+	t2 := tExp.Add(time.Minute)
+	hs.RecordOutcome(t2, time.Second, 0, 503, true, false)
+	if hs.WaitDelay(t2) != DefaultThrottlePause {
+		t.Fatalf("throttled WaitDelay = %s, want %s", hs.WaitDelay(t2), DefaultThrottlePause)
+	}
+	t3 := t2.Add(time.Minute)
+	hs.RecordOutcome(t3, 20*time.Second, 0, 503, true, false)
+	if hs.WaitDelay(t3) != 20*time.Second {
+		t.Fatalf("throttled WaitDelay with larger minPause = %s, want 20s", hs.WaitDelay(t3))
+	}
+
+	// 4. 404 does not clear rateLimitedUntil; 302 clears it
+	t4 := t3.Add(time.Minute)
+	hs.NoteRateLimit(t4, 10*time.Second)
+	hs.RecordOutcome(t4, time.Second, 0, 404, false, false)
+	if hs.CoolingDownRetryAfterMs(t4) != 10_000 {
+		t.Fatalf("404 should preserve rateLimitedUntil, got %d", hs.CoolingDownRetryAfterMs(t4))
+	}
+	hs.RecordOutcome(t4, time.Second, 0, 302, false, false)
+	if hs.CoolingDownRetryAfterMs(t4) != 0 {
+		t.Fatalf("302 should clear rateLimitedUntil, got %d", hs.CoolingDownRetryAfterMs(t4))
+	}
+
+	// 5. 429 never trips circuit breaker; CircuitFailureWindow resets streak; half-open probe failure re-opens
+	for i := 0; i < CircuitFailureThreshold+2; i++ {
+		hs.RecordOutcome(t4, time.Second, 0, 429, true, false)
+	}
+	if why := hs.CheckCircuit(t4, "outcome.example.com"); why != "" {
+		t.Fatalf("429 should not trip circuit: %q", why)
+	}
+	for i := 0; i < CircuitFailureThreshold-1; i++ {
+		hs.RecordOutcome(t4, time.Second, 0, 502, false, true)
+	}
+	tWin := t4.Add(CircuitFailureWindow + time.Second)
+	hs.RecordOutcome(tWin, time.Second, 0, 502, false, true)
+	if why := hs.CheckCircuit(tWin, "outcome.example.com"); why != "" {
+		t.Fatalf("streak after window expiry should reset to 1, got %q", why)
+	}
+	for i := 1; i < CircuitFailureThreshold; i++ {
+		hs.RecordOutcome(tWin, time.Second, 0, 502, false, true)
+	}
+	if hs.CheckCircuit(tWin, "outcome.example.com") == "" {
+		t.Fatal("expected circuit Open after threshold failures")
+	}
+	tHalfOpen := tWin.Add(CircuitOpenCooldown + time.Second)
+	if why := hs.CheckCircuit(tHalfOpen, "outcome.example.com"); why != "" {
+		t.Fatalf("expected Half-Open after cooldown, got %q", why)
+	}
+	hs.RecordOutcome(tHalfOpen, time.Second, 0, 502, false, true)
+	if hs.CheckCircuit(tHalfOpen.Add(time.Second), "outcome.example.com") == "" {
+		t.Fatal("expected failed Half-Open probe to re-open circuit")
+	}
+}
+
+func TestRegistryIdleEvictionAndAllLockedHosts(t *testing.T) {
+	// Pass-1 idle eviction (HostIdleTTL) while preserving locked host
+	r := NewRegistry()
+	t0 := time.Unix(1_700_000_000, 0)
+	lockedOld := r.Get("locked-old.example.com", t0)
+	if err := lockedOld.Acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < MaxTrackedHosts-1; i++ {
+		r.Get(fmt.Sprintf("idle-%d.example.com", i), t0)
+	}
+	tLater := t0.Add(HostIdleTTL + time.Second)
+	r.Get("fresh-after-idle.example.com", tLater)
+	if got := r.Get("locked-old.example.com", tLater); got != lockedOld {
+		t.Fatal("locked host must not be evicted during Pass-1 idle sweep")
+	}
+	if len(r.hosts) != 2 {
+		t.Fatalf("expected all 511 idle unlocked hosts evicted leaving 2, got %d", len(r.hosts))
+	}
+	lockedOld.Release()
+
+	// Pass-2 LRU skipping locked hosts and breaking when all 512 are locked
+	r2 := NewRegistry()
+	states := make([]*HostState, MaxTrackedHosts)
+	for i := 0; i < MaxTrackedHosts; i++ {
+		st := r2.Get(fmt.Sprintf("lock-%d.example.com", i), t0.Add(time.Duration(i)*time.Millisecond))
+		if err := st.Acquire(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		states[i] = st
+	}
+	// Release only index 1 (2nd oldest); index 0 (oldest) remains locked and must be skipped
+	states[1].Release()
+	r2.Get("extra-1.example.com", t0.Add(time.Second))
+	if err := states[1].Acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Now re-lock every entry in r2 (all 512 tracked hosts locked)
+	var extraHeld []*HostState
+	for _, st := range r2.hosts {
+		select {
+		case st.inFlight <- struct{}{}:
+			extraHeld = append(extraHeld, st)
+		default:
+		}
+	}
+	extra2 := r2.Get("extra-2.example.com", t0.Add(2*time.Second))
+	if extra2 == nil || len(r2.hosts) <= MaxTrackedHosts {
+		t.Fatalf("expected Registry.Get to return new state cleanly when all hosts are locked (len=%d)", len(r2.hosts))
+	}
+	for _, st := range extraHeld {
+		st.Release()
+	}
+	for i, st := range states {
+		if i == 1 {
+			// states[1] was evicted and re-acquired above
+			st.Release()
+			continue
+		}
+		st.Release()
+	}
+}
+
+func TestParseRetryAfterEdgeCases(t *testing.T) {
+	now := time.Unix(1_750_000_000, 0).UTC()
+	cases := []struct {
+		val  string
+		want time.Duration
+	}{
+		{"", 0},
+		{"   ", 0},
+		{"0", 0},
+		{"-10", 0},
+		{"30", 30 * time.Second},
+		{"300", MaxRetryAfter},
+		{"999999", MaxRetryAfter},
+		{"99999999999999999999999", MaxRetryAfter},
+		{"-99999999999999999999999", 0},
+		{now.Add(-10 * time.Second).Format(http.TimeFormat), 0},
+		{now.Format(http.TimeFormat), 0},
+		{now.Add(42 * time.Second).Format(http.TimeFormat), 42 * time.Second},
+		{now.Add(MaxRetryAfter + time.Minute).Format(http.TimeFormat), MaxRetryAfter},
+		{"soon", 0},
+	}
+	for _, tc := range cases {
+		if got := ParseRetryAfter(tc.val, now); got != tc.want {
+			t.Fatalf("ParseRetryAfter(%q) = %s, want %s", tc.val, got, tc.want)
+		}
+	}
+}
+
+func TestR6RobotsCanonicalPathBOMTruncationAndSub25msComplexity(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+
+	// 1. Dot-segment, double-slash, encoded dot, and matrix-parameter canonicalization against Disallow: /private.
+	entry := ParseRobotsTxt("User-agent: *\nAllow: /public\nDisallow: /private\n", "edgefetch", exp)
+	for _, blocked := range []string{
+		"/private",
+		"/private/x",
+		"/./private",
+		"/./private/x",
+		"//private/x",
+		"/%2e/private/x",
+		"/%2E/private/x",
+		"/public/../private/x",
+		"/public/%2e%2e/private/x",
+		"/;/private/x",
+		"/private;jsessionid=123/x",
+		"/%70rivate/x",
+		"/pri%76ate?x=1",
+	} {
+		if entry.Allowed(blocked) {
+			t.Fatalf("SECURITY: expected %q to be disallowed by Disallow: /private", blocked)
+		}
+	}
+	if !entry.Allowed("/Private") {
+		t.Fatal("expected case-sensitive /Private to remain allowed per RFC 9309")
+	}
+
+	// RFC 9309 §2.2.2: %2F vs literal '/' must stay distinct.
+	slEntry := ParseRobotsTxt("User-agent: *\nDisallow: /a%2Fb\n", "edgefetch", exp)
+	if !slEntry.Allowed("/a/b") || slEntry.Allowed("/a%2fb") {
+		t.Fatal("RFC 9309 %2F vs '/' distinction broken")
+	}
+	slEntry2 := ParseRobotsTxt("User-agent: *\nDisallow: /a/b\n", "edgefetch", exp)
+	if !slEntry2.Allowed("/a%2fb") || slEntry2.Allowed("/a/b") {
+		t.Fatal("RFC 9309 '/' vs %2f distinction broken")
+	}
+
+	// Longest-match precedence preserves original pattern length including wildcards (/x* len 3 > /x len 2).
+	prec := ParseRobotsTxt("User-agent: *\nDisallow: /x*\nAllow: /x\n", "edgefetch", exp)
+	if prec.Allowed("/x") {
+		t.Fatal("expected Disallow: /x* (len 3) to beat Allow: /x (len 2)")
+	}
+
+	// 2. BOM after blank/space, NUL in value, and partial-line truncation at RobotsMaxBytes.
+	if ParseRobotsTxt("\n  \xef\xbb\xbfUser-agent: *\nDisallow: /x\x00zzz\n", "edgefetch", exp).Allowed("/x/y") {
+		t.Fatal("expected BOM-after-blank and NUL-in-value Disallow: /x\\x00zzz to block /x/y")
+	}
+	hdr := "User-agent: *\nDisallow: /\n"
+	padLen := RobotsMaxBytes - len(hdr) - len("Allow: /")
+	truncBody := hdr + strings.Repeat("#", padLen-1) + "\nAllow: /public-docs"
+	if ParseRobotsTxt(truncBody, "edgefetch", exp).Allowed("/secret") {
+		t.Fatal("SECURITY: partial Allow line split across RobotsMaxBytes boundary turned into Allow: /")
+	}
+
+	// 3. Pathological 1 MiB robots.txt × 1 MiB target path MUST complete in < 25ms (previously 15.1s).
+	bigPath := "/" + strings.Repeat("a", 1<<20)
+	build1MiBRobots := func(makeRule func(i int) string) *RobotsEntry {
+		var sb strings.Builder
+		sb.Grow(RobotsMaxBytes)
+		sb.WriteString("User-agent: *\n")
+		for i := 0; ; i++ {
+			line := makeRule(i)
+			if sb.Len()+len(line) > RobotsMaxBytes {
+				break
+			}
+			sb.WriteString(line)
+		}
+		return ParseRobotsTxt(sb.String(), "edgefetch", exp)
+	}
+
+	cases := []struct {
+		name string
+		ent  *RobotsEntry
+		path string
+		want bool
+	}{
+		{
+			name: "400-star anchored",
+			ent:  build1MiBRobots(func(i int) string { return fmt.Sprintf("Disallow: /%d%sb$\n", i%500, strings.Repeat("*a", 200)) }),
+			path: bigPath,
+			want: true,
+		},
+		{
+			name: "11k distinct long needles",
+			ent:  build1MiBRobots(func(i int) string { return fmt.Sprintf("Disallow: /*%05d%sb\n", i, strings.Repeat("a", 75)) }),
+			path: bigPath,
+			want: true,
+		},
+		{
+			name: "74k tiny rules",
+			ent:  build1MiBRobots(func(i int) string { return "Disallow: /*b\n" }),
+			path: bigPath,
+			want: true,
+		},
+		{
+			name: "matching-alphabet budget cap",
+			ent:  build1MiBRobots(func(i int) string { return fmt.Sprintf("Disallow: /*%04d%sb\n", i, strings.Repeat("a", 75)) }),
+			path: "/0123456789b" + strings.Repeat("a", 1<<20),
+			want: false, // exceeds scan budget -> fails closed in < 25ms
+		},
+	}
+	for _, tc := range cases {
+		t0 := time.Now()
+		got := tc.ent.Allowed(tc.path)
+		dur := time.Since(t0)
+		if got != tc.want {
+			t.Fatalf("%s: Allowed = %v, want %v", tc.name, got, tc.want)
+		}
+		// Strictly enforce < 100ms uninstrumented while accounting for ThreadSanitizer (-race) shadow-memory overhead on 2-core CI VMs.
+		if dur > time.Duration(testRaceSlowdown)*100*time.Millisecond {
+			t.Fatalf("%s: Allowed() took %s on 1 MiB path, want fast bounded execution", tc.name, dur)
+		}
+	}
+}
+
+func TestRobotsEntryAndParserRemainingBranches(t *testing.T) {
+	var nilEntry *RobotsEntry
+	if !nilEntry.Allowed("/x") || nilEntry.ContentSignalBlocked() {
+		t.Fatal("nil RobotsEntry should allow and not be content-signal blocked")
+	}
+	if (&RobotsEntry{Distressed: true, DisallowAIInput: true}).ContentSignalBlocked() {
+		t.Fatal("distressed entry must report ContentSignalBlocked() == false")
+	}
+
+	rootDisallow := &RobotsEntry{Rules: []RobotsRule{{Pattern: "/", Allow: false}}}
+	if rootDisallow.Allowed("") {
+		t.Fatal("empty pathAndQuery must normalize to / and be disallowed")
+	}
+
+	skipEmptyPat := &RobotsEntry{Rules: []RobotsRule{{Pattern: "", Allow: false}, {Pattern: "/ok", Allow: true}}}
+	if !skipEmptyPat.Allowed("/ok") {
+		t.Fatal("empty rule pattern must be skipped")
+	}
+
+	exp := time.Now().Add(time.Hour)
+	tie1 := ParseRobotsTxt("User-agent: *\nDisallow: /same\nAllow: /same\n", "edgefetch", exp)
+	tie2 := ParseRobotsTxt("User-agent: *\nAllow: /same\nDisallow: /same\n", "edgefetch", exp)
+	if !tie1.Allowed("/same") || !tie2.Allowed("/same") {
+		t.Fatal("equal-length Allow/Disallow ties must break in favor of Allow regardless of order")
+	}
+
+	// NormalizeRobotsURI & fromHex invalid/short sequences
+	if got := NormalizeRobotsURI("/a%zz/b%2g/c%2"); got != "/a%zz/b%2g/c%2" {
+		t.Fatalf("NormalizeRobotsURI invalid hex = %q", got)
+	}
+
+	// Parser edge cases: no colon, leading colon, Crawl-delay clamping/invalid, multiple * delays,
+	// pre-group Content-Signal inherited by *, malformed Content-Signal, space/tab in product token, empty agentToken.
+	raw := strings.Join([]string{
+		"Content-Signal: malformed-no-eq, ai-input=maybe, ai-input=no",
+		"no-colon-line",
+		":leading-colon",
+		"User-agent: *",
+		"Crawl-delay: 120",
+		"Crawl-delay: 0",
+		"Crawl-delay: -2",
+		"Crawl-delay: abc",
+		"User-agent: *",
+		"Crawl-delay: 5",
+		"User-agent: EdgeFetch 2.0",
+		"Disallow: /sp",
+	}, "\n")
+	wildEntry := ParseRobotsTxt(raw, "otherbot", exp)
+	if wildEntry.CrawlDelay != MaxCrawlDelay || !wildEntry.DisallowAIInput {
+		t.Fatalf("wildcard entry = %+v, want CrawlDelay=%s and DisallowAIInput=true", wildEntry, MaxCrawlDelay)
+	}
+	multiWild := ParseRobotsTxt("User-agent: *\nCrawl-delay: 5\n\nUser-agent: *\nCrawl-delay: 2\n", "otherbot", exp)
+	if multiWild.CrawlDelay != 5*time.Second {
+		t.Fatalf("multiWild CrawlDelay = %s, want 5s", multiWild.CrawlDelay)
+	}
+	specTab := ParseRobotsTxt(raw, "EdgeFetch\t2.0", exp)
+	if specTab.Allowed("/sp") || !specTab.DisallowAIInput {
+		t.Fatalf("specific space/tab product token failed: %+v", specTab)
+	}
+	emptyTok := ParseRobotsTxt("User-agent: otherbot\nDisallow: /\n", "", exp)
+	if !emptyTok.Allowed("/") {
+		t.Fatal("empty agentToken with non-wildcard group should allow all")
+	}
+}
+
+func TestSSRFGuardEdgeCasesAndDialerControl(t *testing.T) {
+	if IsPublicIP(nil) || IsPublicIP(net.IP{1, 2, 3}) {
+		t.Fatal("invalid net.IP must return false")
+	}
+	if IsPublicAddr(netip.Addr{}) ||
+		IsPublicAddr(netip.MustParseAddr("fe80::1%eth0")) ||
+		IsPublicAddr(netip.MustParseAddr("2001:4860:4860::8888%eth0")) {
+		t.Fatal("invalid or zoned netip.Addr must return false")
+	}
+
+	moreBlocked := []string{
+		"192.0.0.1:443",
+		"192.0.2.1:443",
+		"198.18.0.1:443",
+		"198.51.100.1:443",
+		"203.0.113.1:443",
+		"240.0.0.1:443",
+		"[2001:2::1]:443",
+		"224.0.0.1:443",
+		"[ff02::1]:443",
+		"0.0.0.0:443",
+		"[::]:443",
+	}
+	for _, addr := range moreBlocked {
+		if err := CheckPublicPeerAddress(addr); !errors.Is(err, ErrNonPublicPeer) {
+			t.Fatalf("CheckPublicPeerAddress(%q) = %v, want ErrNonPublicPeer", addr, err)
+		}
+	}
+
+	for _, badSyntax := range []string{"1.1.1.1", "[::1"} {
+		err := CheckPublicPeerAddress(badSyntax)
+		if err == nil || errors.Is(err, ErrNonPublicPeer) {
+			t.Fatalf("CheckPublicPeerAddress(%q) = %v, want SplitHostPort error", badSyntax, err)
+		}
+	}
+	if err := CheckPublicPeerAddress("example.com:443"); !errors.Is(err, ErrNonPublicPeer) {
+		t.Fatalf("hostname in CheckPublicPeerAddress = %v, want ErrNonPublicPeer", err)
+	}
+
+	// Direct RejectNonPublicPeer calls
+	if err := RejectNonPublicPeer("tcp", "127.0.0.1:443", nil); !errors.Is(err, ErrNonPublicPeer) {
+		t.Fatalf("RejectNonPublicPeer(127.0.0.1) = %v, want ErrNonPublicPeer", err)
+	}
+	if err := RejectNonPublicPeer("tcp", "1.1.1.1:443", nil); err != nil {
+		t.Fatalf("RejectNonPublicPeer(1.1.1.1) = %v, want nil", err)
+	}
+	if err := RejectNonPublicPeer("tcp", "badaddr", nil); err == nil {
+		t.Fatal("RejectNonPublicPeer(badaddr) expected error")
+	}
+
+	// Live net.Dialer{Control: RejectNonPublicPeer} against local loopback listener (zero external dials)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer ln.Close()
+
+	var accepted atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted.Store(true)
+			_ = conn.Close()
+		}
+	}()
+
+	dialer := net.Dialer{Timeout: 2 * time.Second, Control: RejectNonPublicPeer}
+	conn, err := dialer.Dial("tcp", ln.Addr().String())
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if !errors.Is(err, ErrNonPublicPeer) {
+		t.Fatalf("live net.Dialer Control = %v, want ErrNonPublicPeer", err)
+	}
+	_ = ln.Close()
+	<-done
+	if accepted.Load() {
+		t.Fatal("loopback listener unexpectedly accepted a connection blocked by RejectNonPublicPeer")
 	}
 }
 

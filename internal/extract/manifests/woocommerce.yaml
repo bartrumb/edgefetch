@@ -1,0 +1,64 @@
+# Shared Go + TypeScript Declarative Site Adapter: WooCommerce Store API & Storefronts
+id: woocommerce
+name: "WooCommerce Store API & Storefronts"
+category: commerce-social
+description: "Formats public WooCommerce Store API (/wp-json/wc/store/v1/products) feeds, extracts WooCommerce product pages, and implements polite full-store catalog pulls."
+domains:
+  - woocommerce.com
+universalEngine: true
+exampleUrls:
+  - "https://woocommerce.com/wp-json/wc/store/v1/products?per_page=20&page=1"
+
+# Polite WooCommerce Store API v1 catalog pagination configuration
+catalog:
+  platform: woocommerce
+  pauseMs: 2000
+  pageCap: 200
+  firstPageTemplate: "{origin}/wp-json/wc/store/v1/products?per_page=100&page=1"
+  perPage: 100
+  maxVariantsPerProduct: 250
+  maxImagesPerProduct: 250
+
+routes:
+  # 1. Public Store API v1 product list feed (/wp-json/wc/store/v1/products)
+  - match:
+      exactSegments: true
+      pathSegments:
+        - wp-json
+        - wc
+        - store
+        - v1
+        - products
+    twin:
+      id: woocommerce-catalog-page
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      commerceMode: woocommerce_catalog_page
+
+  # 2. Public Store API v1 single product endpoint (/wp-json/wc/store/v1/products/<pid>)
+  - match:
+      exactSegments: true
+      pathSegments:
+        - wp-json
+        - wc
+        - store
+        - v1
+        - products
+        - param: pid
+          charset: digits
+    twin:
+      id: woocommerce-product
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      commerceMode: woocommerce_product
+
+# Post-fetch WooCommerce HTML storefront product extractor
+htmlRoutes:
+  - id: woocommerce
+    match:
+      exactSegments: false
+    mode: woocommerce_html

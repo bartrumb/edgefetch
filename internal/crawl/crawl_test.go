@@ -19,8 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bartrumb/edgefetch/v2/internal/botauth"
 	"github.com/bartrumb/edgefetch/v2/internal/browser"
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 	"github.com/coder/websocket"
 )
@@ -1338,5 +1340,456 @@ func TestRobotsSlowDripTarpitBoundedWithoutRetry(t *testing.T) {
 	elapsed2 := time.Since(start2)
 	if len(res2) != 1 || res2[0].Outcome != classify.OutcomeStop || robotsHits.Load() != 1 || elapsed2 > 250*time.Millisecond {
 		t.Fatalf("expected cached tarpit distress to fail fast without second /robots.txt hit (hits=%d, elapsed=%v, res=%+v)", robotsHits.Load(), elapsed2, res2)
+	}
+}
+
+func TestExecuteCallWithTraceBrowserRenderAndBotAuthSpans(t *testing.T) {
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		var writeMu sync.Mutex
+		send := func(v any) {
+			b, _ := json.Marshal(v)
+			writeMu.Lock()
+			_ = conn.Write(r.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID        int64  `json:"id"`
+				SessionID string `json:"sessionId"`
+				Method    string `json:"method"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				continue
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-crawl"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-crawl"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "s-crawl"}})
+			case "Page.navigate":
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "f-crawl"}})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Page.loadEventFired", "params": map[string]any{}})
+			case "Runtime.evaluate":
+				docJSON, _ := json.Marshal(map[string]string{
+					"url":  "http://spa.test/app?token=SECRET_CRAWL_TOKEN#frag",
+					"html": "<html><head><title>Hydrated SPA</title></head><body><main><h1>Hydrated SPA</h1><p>Browser render span verified.</p></main></body></html>",
+				})
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result":    map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}},
+				})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+
+	var (
+		mu        sync.Mutex
+		rawBodies []string
+	)
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		rawBodies = append(rawBodies, string(b))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+
+	newCollectorExp := func(svc string) *otel.Exporter {
+		return otel.NewExporterFromEnv(func(k string) string {
+			if k == "OTEL_EXPORTER_OTLP_ENDPOINT" {
+				return collector.URL
+			}
+			return ""
+		}, svc, "2.7.0", collector.Client().Transport)
+	}
+
+	var sawSigned atomic.Bool
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" || r.URL.Path == "/llms.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Signature") != "" && r.Header.Get("Signature-Input") != "" {
+			sawSigned.Store(true)
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><html><body><div id="root"></div><script type="module" src="/app.js"></script></body></html>`))
+	}))
+
+	// Verify order-independent wiring: SetRenderer BEFORE SetOtelExporter, and vice-versa.
+	c.SetRenderer(browser.NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, DefaultUserAgent))
+	exp := newCollectorExp("edgefetch-crawl-test")
+	c.SetOtelExporter(exp)
+
+	kp, err := botauth.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	signer, err := botauth.NewSigner(kp.PrivateKeySeedB64URL, "https://bot.example.com/.well-known/http-message-signatures-directory")
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+	c.SetBotSigner(signer)
+
+	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	const callerTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	const callerSpanID = "00f067aa0ba902b7"
+	hdr := http.Header{}
+	hdr.Set("Traceparent", "00-"+callerTraceID+"-"+callerSpanID+"-01")
+
+	// 1. KindScrape (RenderMode: "auto") + botSigner -> batch -> fetch.scrape (bot_auth.signed=true) -> browser.render
+	rep1 := ExecuteCallWithTrace(context.Background(), c, FetchCall{
+		MaxSeconds: 20,
+		Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+		Requests: []Request{{
+			ID:         "spa-auto",
+			URL:        "http://spa.test/app?token=SECRET_CRAWL_TOKEN#frag",
+			Kind:       classify.KindScrape,
+			RenderMode: "auto",
+		}},
+	}, hdr, silentLog, nil)
+	if len(rep1.Results) != 1 || rep1.Results[0].Outcome != classify.OutcomeOK || !rep1.Results[0].Rendered {
+		t.Fatalf("expected auto-rendered SPA result, got %+v", rep1.Results)
+	}
+	if !sawSigned.Load() {
+		t.Fatal("expected HTTP request signed with RFC 9421 Signature headers")
+	}
+
+	// 2. KindRender -> batch -> fetch.render -> browser.render (no bot_auth.signed because no HTTP hop)
+	rep2 := ExecuteCallWithTrace(context.Background(), c, FetchCall{
+		MaxSeconds: 20,
+		Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+		Requests: []Request{{
+			ID:         "explicit-render",
+			URL:        "http://spa.test/app?token=SECRET_RENDER#frag",
+			Kind:       classify.KindRender,
+			RenderMode: "always",
+		}},
+	}, hdr, silentLog, nil)
+	if len(rep2.Results) != 1 || rep2.Results[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected KindRender result ok, got %+v", rep2.Results)
+	}
+
+	// 3. KindScrape without botSigner -> no bot_auth.signed
+	c.SetBotSigner(nil)
+	rep3 := ExecuteCallWithTrace(context.Background(), c, FetchCall{
+		MaxSeconds: 20,
+		Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+		Requests: []Request{{
+			ID:         "unsigned-scrape",
+			URL:        "http://spa.test/app",
+			Kind:       classify.KindScrape,
+			RenderMode: "off",
+		}},
+	}, hdr, silentLog, nil)
+	if len(rep3.Results) != 1 || rep3.Results[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected unsigned scrape ok, got %+v", rep3.Results)
+	}
+
+	// 4. Unsampled traceparent (-00) emits 0 spans
+	unsampledHdr := http.Header{}
+	unsampledHdr.Set("Traceparent", "00-dddddddddddddddddddddddddddddddd-4444444444444444-00")
+	_ = ExecuteCallWithTrace(context.Background(), c, FetchCall{
+		MaxSeconds: 20,
+		Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+		Requests: []Request{{
+			ID:         "unsampled",
+			URL:        "http://spa.test/app",
+			Kind:       classify.KindRender,
+			RenderMode: "always",
+		}},
+	}, unsampledHdr, silentLog, nil)
+
+	_ = c.Close()
+
+	mu.Lock()
+	combined := strings.Join(rawBodies, "\n")
+	mu.Unlock()
+
+	if strings.Contains(combined, "SECRET_CRAWL_TOKEN") || strings.Contains(combined, "SECRET_RENDER") || strings.Contains(combined, "dddddddddddddddddddddddddddddddd") {
+		t.Fatalf("SECURITY/SAMPLING: secret or unsampled trace leaked into OTLP output:\n%s", combined)
+	}
+
+	type parsedSpan struct {
+		TraceID      string `json:"traceId"`
+		SpanID       string `json:"spanId"`
+		ParentSpanID string `json:"parentSpanId"`
+		Name         string `json:"name"`
+		StartUnix    string `json:"startTimeUnixNano"`
+		EndUnix      string `json:"endTimeUnixNano"`
+		Attributes   []struct {
+			Key   string         `json:"key"`
+			Value map[string]any `json:"value"`
+		} `json:"attributes"`
+	}
+	var allSpans []parsedSpan
+	for _, body := range rawBodies {
+		var p struct {
+			ResourceSpans []struct {
+				ScopeSpans []struct {
+					Spans []parsedSpan `json:"spans"`
+				} `json:"scopeSpans"`
+			} `json:"resourceSpans"`
+		}
+		_ = json.Unmarshal([]byte(body), &p)
+		for _, rs := range p.ResourceSpans {
+			for _, ss := range rs.ScopeSpans {
+				allSpans = append(allSpans, ss.Spans...)
+			}
+		}
+	}
+
+	var batches, fetchScrapes, fetchRenders, browserRenders []parsedSpan
+	hasAttr := func(sp parsedSpan, k string) (any, bool) {
+		for _, a := range sp.Attributes {
+			if a.Key == k {
+				if v, ok := a.Value["boolValue"]; ok {
+					return v, true
+				}
+				if v, ok := a.Value["stringValue"]; ok {
+					return v, true
+				}
+			}
+		}
+		return nil, false
+	}
+	for _, sp := range allSpans {
+		if sp.TraceID != callerTraceID {
+			t.Fatalf("unexpected traceId %q (want %q) on %q", sp.TraceID, callerTraceID, sp.Name)
+		}
+		switch sp.Name {
+		case "edgefetch.go.batch":
+			batches = append(batches, sp)
+		case "edgefetch.go.fetch.scrape":
+			fetchScrapes = append(fetchScrapes, sp)
+		case "edgefetch.go.fetch.render":
+			fetchRenders = append(fetchRenders, sp)
+		case "edgefetch.browser.render":
+			browserRenders = append(browserRenders, sp)
+		}
+	}
+	if len(batches) != 3 || len(fetchScrapes) != 2 || len(fetchRenders) != 1 || len(browserRenders) != 2 {
+		t.Fatalf("unexpected span counts: batches=%d fetchScrapes=%d fetchRenders=%d browserRenders=%d",
+			len(batches), len(fetchScrapes), len(fetchRenders), len(browserRenders))
+	}
+
+	// Check bot_auth.signed present on signed scrape, absent on unsigned scrape & explicit KindRender
+	signedCount := 0
+	fetchByID := make(map[string]parsedSpan)
+	for _, fs := range fetchScrapes {
+		fetchByID[fs.SpanID] = fs
+		if v, ok := hasAttr(fs, "bot_auth.signed"); ok && v == true {
+			signedCount++
+		}
+	}
+	if signedCount != 1 {
+		t.Fatalf("expected exactly 1 edgefetch.go.fetch.scrape with bot_auth.signed=true, got %d", signedCount)
+	}
+	if _, ok := hasAttr(fetchRenders[0], "bot_auth.signed"); ok {
+		t.Fatal("expected KindRender without HTTP hop not to carry bot_auth.signed")
+	}
+	fetchByID[fetchRenders[0].SpanID] = fetchRenders[0]
+
+	// Check each edgefetch.browser.render is parented under its fetch span and bounded within [fetchStart, fetchEnd]
+	for _, br := range browserRenders {
+		parent, ok := fetchByID[br.ParentSpanID]
+		if !ok {
+			t.Fatalf("expected edgefetch.browser.render parentSpanId=%q to match an edgefetch.go.fetch.* span", br.ParentSpanID)
+		}
+		if br.StartUnix < parent.StartUnix || br.EndUnix > parent.EndUnix {
+			t.Fatalf("expected render [%s..%s] inside fetch [%s..%s]", br.StartUnix, br.EndUnix, parent.StartUnix, parent.EndUnix)
+		}
+		if uVal, ok := hasAttr(br, "url.full"); !ok || uVal != "http://spa.test/app" {
+			t.Fatalf("expected sanitized url.full on browser.render, got %v (ok=%v)", uVal, ok)
+		}
+	}
+
+	// Verify reverse setter order: SetOtelExporter BEFORE SetRenderer also propagates exporter to renderer.
+	t.Run("SetOtelExporterBeforeSetRenderer", func(t *testing.T) {
+		mu.Lock()
+		beforeCount := len(rawBodies)
+		mu.Unlock()
+
+		c2, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		exp2 := newCollectorExp("edgefetch-crawl-test-order")
+		c2.SetOtelExporter(exp2)
+		c2.SetRenderer(browser.NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, DefaultUserAgent))
+
+		rep := ExecuteCallWithTrace(context.Background(), c2, FetchCall{
+			MaxSeconds: 20,
+			Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+			Requests: []Request{{
+				ID:         "reverse-order-render",
+				URL:        "http://spa.test/app?token=SECRET_ORDER#frag",
+				Kind:       classify.KindRender,
+				RenderMode: "always",
+			}},
+		}, hdr, silentLog, nil)
+		if len(rep.Results) != 1 || rep.Results[0].Outcome != classify.OutcomeOK {
+			t.Fatalf("expected KindRender ok, got %+v", rep.Results)
+		}
+		_ = c2.Close()
+
+		mu.Lock()
+		newBodies := append([]string(nil), rawBodies[beforeCount:]...)
+		mu.Unlock()
+		if strings.Contains(strings.Join(newBodies, "\n"), "SECRET_ORDER") {
+			t.Fatal("SECURITY: query secret leaked in SetOtelExporterBeforeSetRenderer OTLP output")
+		}
+
+		var fetchID, renderParent string
+		for _, body := range newBodies {
+			var p struct {
+				ResourceSpans []struct {
+					ScopeSpans []struct {
+						Spans []parsedSpan `json:"spans"`
+					} `json:"scopeSpans"`
+				} `json:"resourceSpans"`
+			}
+			_ = json.Unmarshal([]byte(body), &p)
+			for _, rs := range p.ResourceSpans {
+				for _, ss := range rs.ScopeSpans {
+					for _, sp := range ss.Spans {
+						if sp.Name == "edgefetch.go.fetch.render" {
+							fetchID = sp.SpanID
+						}
+						if sp.Name == "edgefetch.browser.render" {
+							renderParent = sp.ParentSpanID
+						}
+					}
+				}
+			}
+		}
+		if fetchID == "" || renderParent != fetchID {
+			t.Fatalf("expected edgefetch.browser.render parented under edgefetch.go.fetch.render when SetOtelExporter precedes SetRenderer; fetchID=%q renderParent=%q",
+				fetchID, renderParent)
+		}
+	})
+}
+
+func TestR6RedactAll30VectorsLinearSpeed429HoldCapAndRobotsPathNorm(t *testing.T) {
+	uerr := func(raw string) string { return (&url.Error{Op: "Get", URL: raw, Err: io.EOF}).Error() }
+	jsonWrap := func(s string) string {
+		b, _ := json.Marshal(map[string]string{"problem": s})
+		return string(b)
+	}
+
+	// 1. All 30 R6 redaction vectors (ws/wss, unquoted spaces/quotes/backslashes/tabs, slash-in-userinfo,
+	//    matrix params, JSON-escaped \/, percent-encoded %3A%2F%2F, nested %q, unterminated quotes, inline token).
+	cases := []string{
+		uerr("wss://host.example/agent/ws?token=SECRET-01"),
+		uerr("ws://user:SECRET-02@host.example/ws"),
+		"redirect to https://host.example/cb?next=1 2&code=SECRET-03 failed",
+		"redirect to https://host.example/cb?a=\"q\"&code=SECRET-04 failed",
+		"Location: https://host.example/cb?a=1\\&code=SECRET-05",
+		uerr("https://host.example/reset/SECRET-06/confirm?x=1"),
+		uerr("https://host.example/p#access_token=SECRET-07"),
+		uerr("https://host.example/p?a=#b&api_key=SECRET-08"),
+		uerr("https://user:pa@ss-SECRET-09@host.example/p"),
+		uerr("https://user:pa/ss-SECRET-10@host.example/p"),
+		uerr("https://user:pa?ss-SECRET-11@host.example/p"),
+		uerr("https://user:pa#ss-SECRET-12@host.example/p"),
+		jsonWrap(uerr("https://host.example/p?q=a b&api_key=SECRET-13")),
+		fmt.Sprintf("%q", uerr("https://host.example/p?q=a\"b&api_key=SECRET-14")),
+		fmt.Sprintf("outer: %q", fmt.Sprintf("%q", uerr("https://host.example/p?q=a b&api_key=SECRET-15"))),
+		"Get \"https://host.example/p?api_key=SECRET-16",
+		"Get \"https://host.example/p?q=a b&api_key=SECRET-17",
+		"Get \"https://host.example/p?q=a\\\" then space &api_key=SECRET-18",
+		"lookup https://host.example/p?x=1\tapi_key=SECRET-19",
+		"Get \"HTTPS://host.example/p?api_key=SECRET-20\": EOF; retry of \"hTTp://h2.example/q?t=SECRET-21 x\"",
+		"see http://[::1]:8080/p?k=SECRET-22, http://host.example/p;jsessionid=SECRET-23?x=1",
+		"blob:https://host.example/uuid?tok=SECRET-24 data:text/html,https://host.example/?k=SECRET-25",
+		`https:\/\/host.example\/p?api_key=SECRET-26`,
+		"url=https%3A%2F%2Fhost.example%2Fp%3Fapi_key%3DSECRET-27",
+		"Get \"https://host.example/p?q=\u2028api_key=SECRET-28\": EOF",
+		"<a href='https://host.example/p?api_key=SECRET-29'>",
+		"Get \"https://host.example/p\": remote said: token SECRET-30 invalid",
+		"//host.example/p?token=SECRET-31",
+		"ftp://user:SECRET-32@host.example/pub",
+	}
+	for idx, in := range cases {
+		out := RedactEmbeddedURLs(in)
+		if strings.Contains(out, "SECRET-") {
+			t.Fatalf("SECURITY (REDACT6 #%d): secret leaked!\n  in = %s\n  out= %s", idx+1, in, out)
+		}
+	}
+
+	// 2. Linear O(N) speed on 4 MiB inputs (quoted URL, 174k unterminated quotes, 4 MiB backslashes).
+	const n = 4 << 20
+	long := "Get \"https://host.example/p?" + strings.Repeat("a=b&", n/4) + "api_key=SECRET\": EOF"
+	t0 := time.Now()
+	o1 := RedactEmbeddedURLs(long)
+	if d := time.Since(t0); strings.Contains(o1, "SECRET") || d > time.Duration(testRaceSlowdown)*250*time.Millisecond {
+		t.Fatalf("4 MiB quoted URL redaction: leak=%v elapsed=%v", strings.Contains(o1, "SECRET"), d)
+	}
+	many := strings.Repeat("\"https://h.example/p?k=S ", n/24)
+	t0 = time.Now()
+	o2 := RedactEmbeddedURLs(many)
+	if d := time.Since(t0); strings.Contains(o2, "k=S") || d > time.Duration(testRaceSlowdown)*500*time.Millisecond {
+		t.Fatalf("4 MiB unterminated URLs redaction: leak=%v elapsed=%v", strings.Contains(o2, "k=S"), d)
+	}
+	esc := "\"https://h.example/p?" + strings.Repeat(`\\`, n/2)
+	t0 = time.Now()
+	o3 := RedactEmbeddedURLs(esc)
+	if d := time.Since(t0); len(o3) > 64 || d > time.Duration(testRaceSlowdown)*250*time.Millisecond {
+		t.Fatalf("4 MiB backslash URL redaction: len=%d elapsed=%v", len(o3), d)
+	}
+
+	// 3. 429 hold cap: Retry-After > 30s (e.g. 99999s) returns immediately on Strike 1 with 0 inline sleeps,
+	//    while recording full 300000ms host cooldown; and dot-segment URLs cannot bypass Disallow: /private.
+	var pageHits, holdHits atomic.Int32
+	c, sleeps := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Host {
+		case "hold429.test":
+			if r.URL.Path == "/robots.txt" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			holdHits.Add(1)
+			w.Header().Set("Retry-After", "99999")
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "norm.test":
+			if r.URL.Path == "/robots.txt" {
+				_, _ = w.Write([]byte("User-agent: *\nDisallow: /private\n"))
+				return
+			}
+			pageHits.Add(1)
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>should not be fetched</html>"))
+		}
+	}))
+
+	holdRes := c.Run(context.Background(), []Request{
+		{ID: "h1", URL: "http://hold429.test/items", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	if holdRes[0].Status != http.StatusTooManyRequests || holdRes[0].Attempts != 1 || holdHits.Load() != 1 || holdRes[0].RetryAfterMs != 300000 || len(sleeps.all) != 0 {
+		t.Fatalf("expected Retry-After: 99999 to stop on Strike 1 with 0 inline sleeps and 300000ms cooldown, got %+v (sleeps=%v)", holdRes[0], sleeps.all)
+	}
+
+	for _, rawPath := range []string{"/./private/x", "//private/x", "/%2e/private/x", "/public/../private/x"} {
+		nr := c.Run(context.Background(), []Request{
+			{ID: "n", URL: "http://norm.test" + rawPath, Kind: classify.KindPage},
+		}, Options{PauseMs: 1})
+		if nr[0].Outcome != classify.OutcomeSkip || pageHits.Load() != 0 {
+			t.Fatalf("SECURITY: path %q bypassed Disallow: /private: %+v (pageHits=%d)", rawPath, nr[0], pageHits.Load())
+		}
 	}
 }

@@ -11,6 +11,9 @@
  *   - `OTEL_SERVICE_NAME`           (default: `edgefetch-hub`)
  */
 
+// @ts-ignore: `hub/tsconfig.json` uses `@cloudflare/workers-types` without `@types/node`
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 export interface TraceContext {
   traceId: string; // 32 lowercase hex chars (16 bytes)
   spanId: string; // 16 lowercase hex chars (8 bytes)
@@ -31,10 +34,36 @@ export interface OtlpSpanInput {
   attributes?: Record<string, string | number | boolean | undefined>;
 }
 
+export type OtlpSpanRecord = OtlpSpanInput;
+export type SpanAttributes = Record<string, string | number | boolean | undefined>;
+
 export interface OtelEnvConfig {
   OTEL_EXPORTER_OTLP_ENDPOINT?: string;
   OTEL_EXPORTER_OTLP_HEADERS?: string;
   OTEL_SERVICE_NAME?: string;
+}
+
+interface AsyncLocalStorageLike<T> {
+  getStore(): T | undefined;
+  run<R>(store: T, callback: (...args: unknown[]) => R, ...args: unknown[]): R;
+}
+
+export interface SpanStartOptions {
+  kind?: 1 | 2 | 3;
+  attributes?: SpanAttributes;
+  startTimeMs?: number;
+}
+
+export interface ActiveSpanHandle {
+  readonly traceId: string;
+  readonly spanId: string;
+  readonly parentSpanId?: string;
+  readonly name: string;
+  readonly sampled: boolean;
+  setAttribute(key: string, value: string | number | boolean | undefined): void;
+  setAttributes(attrs: SpanAttributes): void;
+  setStatus(ok: boolean, errorMessage?: string): void;
+  end(endTimeMs?: number): void;
 }
 
 const TRACEPARENT_RE = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
@@ -154,7 +183,7 @@ export function buildOtlpTracePayload(params: {
   spans: OtlpSpanInput[];
 }): Record<string, unknown> {
   const serviceName = params.serviceName?.trim() || 'edgefetch-hub';
-  const serviceVersion = params.serviceVersion?.trim() || '2.6.2';
+  const serviceVersion = params.serviceVersion?.trim() || '2.6.3';
   return {
     resourceSpans: [
       {
@@ -195,6 +224,75 @@ export function buildOtlpTracePayload(params: {
   };
 }
 
+const SENSITIVE_ATTR_KEY_RE =
+  /(?:token|secret|password|authorization|cookie|api[_.-]?key|credential|private[_.-]?key|bearer|csrf|sealed|verifier|session[_.-]?id)/i;
+const URL_ATTR_KEY_RE = /^(?:url\.full|http\.url|url|target\.url|origin\.url)$/i;
+
+function redactInlineSecrets(raw: string): string {
+  const bounded = raw.length > 4096 ? raw.slice(0, 4096) : raw;
+  return bounded
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\bBasic\s+\S+/gi, 'Basic [redacted]')
+    .replace(/\b(?:efc|efa|efr)_[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+    .replace(/(\b[a-z0-9_.-]{0,32}(?:api[_.-]?key|token|secret)\s*=\s*["']?)([^\s&"'`,;]+)/gi, '$1[redacted]');
+}
+
+/** Strips URL query strings, fragments, userinfo, and inline secrets from span error messages. */
+export function sanitizeErrorMessageForSpan(errOrMsg: unknown, fallback = ''): string {
+  const raw =
+    errOrMsg instanceof Error
+      ? errOrMsg.message
+      : typeof errOrMsg === 'string'
+        ? errOrMsg
+        : errOrMsg === undefined || errOrMsg === null
+          ? ''
+          : String(errOrMsg);
+  const trimmed = raw.trim();
+  if (!trimmed) return redactInlineSecrets(fallback).slice(0, 256);
+  const strippedUrls = trimmed.replace(/https?:\/\/[^\s"'<>)\]]+/gi, (match) => sanitizeUrlForSpan(match));
+  return redactInlineSecrets(strippedUrls).slice(0, 256);
+}
+
+/** Strips query strings, fragments, and embedded credentials from URLs before attaching to spans. */
+export function sanitizeUrlForSpan(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  try {
+    const u = new URL(trimmed);
+    if (u.origin && u.origin !== 'null') {
+      return `${u.origin}${u.pathname}`;
+    }
+  } catch {
+    // Fallback for malformed URLs below
+  }
+  return redactInlineSecrets(trimmed)
+    .replace(/:\/\/[^/?#\s]+@/g, '://')
+    .replace(/[?#].*$/, '');
+}
+
+/** Sanitizes span attributes by redacting secret keys/values and stripping URL query/userinfo. */
+export function sanitizeSpanAttributes(attrs?: SpanAttributes): Record<string, string | number | boolean> {
+  const out: Record<string, string | number | boolean> = {};
+  if (!attrs) return out;
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === undefined) continue;
+    if (typeof value === 'string') {
+      if (SENSITIVE_ATTR_KEY_RE.test(key)) {
+        out[key] = '[redacted]';
+      } else if (URL_ATTR_KEY_RE.test(key)) {
+        out[key] = sanitizeUrlForSpan(value).slice(0, 512);
+      } else {
+        out[key] = redactInlineSecrets(value).slice(0, 512);
+      }
+    } else if (typeof value === 'number') {
+      if (Number.isFinite(value)) out[key] = value;
+    } else if (typeof value === 'boolean') {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
 /** Extracts child OTLP spans from a Go `FetchReply` JSON body so non-OTLP Go nodes still appear in Hub waterfalls. */
 export function buildCrawlChildSpans(params: {
   traceId: string;
@@ -226,13 +324,7 @@ export function buildCrawlChildSpans(params: {
     };
     for (const r of (parsed.results ?? []).slice(0, 32)) {
       const dur = Math.max(1, Number(r.durationMs ?? r.timing?.ttfbMs ?? 1));
-      let safeUrl = r.url ?? '';
-      try {
-        const u = new URL(safeUrl);
-        safeUrl = `${u.origin}${u.pathname}`;
-      } catch {
-        // leave as-is
-      }
+      const safeUrl = sanitizeUrlForSpan(r.url ?? '');
       out.push({
         traceId: params.traceId,
         spanId: randomHex(8),
@@ -242,7 +334,7 @@ export function buildCrawlChildSpans(params: {
         startTimeMs: Math.max(0, params.endTimeMs - dur),
         endTimeMs: params.endTimeMs,
         statusOk: r.outcome === 'ok' || r.outcome === 'gone' || r.outcome === 'skip',
-        attributes: {
+        attributes: sanitizeSpanAttributes({
           'url.full': safeUrl,
           'http.response.status_code': r.status ?? 0,
           'crawler.via': params.via,
@@ -254,7 +346,7 @@ export function buildCrawlChildSpans(params: {
           'net.ttfb_ms': r.timing?.ttfbMs ?? 0,
           'net.conn_reused': Boolean(r.timing?.reused),
           ...(r.timing?.proto ? { 'network.protocol.name': r.timing.proto } : {}),
-        },
+        }),
       });
     }
   } catch {
@@ -282,16 +374,379 @@ export async function flushOtlpSpans(params: {
     spans: params.spans,
   });
   const doFetch = params.fetchFn ?? fetch;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => {
+    ctrl.abort(new DOMException('OTLP export timed out', 'TimeoutError'));
+  }, 4_000);
+  (timer as { unref?: () => void }).unref?.();
   try {
     const res = await doFetch(tracesUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(4_000),
+      signal: ctrl.signal,
     });
     await res.body?.cancel().catch(() => undefined);
     return res.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+interface RequestTracerState {
+  rootContext: TraceContext;
+  requestId: string;
+  spans: OtlpSpanInput[];
+  openSpans: Set<ActiveSpanHandle>;
+  suppressed: boolean;
+  rootSpanClaimed: boolean;
+}
+
+function createRequestTracerStorage(): AsyncLocalStorageLike<RequestTracer> {
+  try {
+    if (typeof AsyncLocalStorage === 'function') {
+      return new (AsyncLocalStorage as new <T>() => AsyncLocalStorageLike<T>)<RequestTracer>();
+    }
+  } catch {
+    // fallback below when node:async_hooks is unavailable
+  }
+  let currentStore: RequestTracer | undefined;
+  return {
+    getStore: () => currentStore,
+    run: <R>(store: RequestTracer, callback: (...args: unknown[]) => R, ...args: unknown[]): R => {
+      const prev = currentStore;
+      currentStore = store;
+      try {
+        return callback(...args);
+      } finally {
+        currentStore = prev;
+      }
+    },
+  };
+}
+
+const requestTracerStorage = createRequestTracerStorage();
+
+export class RequestTracer {
+  private readonly state: RequestTracerState;
+  private readonly currentSpanId: string;
+  private readonly currentSpan?: ActiveSpanHandle;
+
+  private constructor(state: RequestTracerState, currentSpanId: string, currentSpan?: ActiveSpanHandle) {
+    this.state = state;
+    this.currentSpanId = currentSpanId;
+    this.currentSpan = currentSpan;
+  }
+
+  static fromRequest(
+    request: Request,
+    opts?: { suppress?: boolean; suppressWhenUnsampledHealth?: boolean },
+  ): RequestTracer {
+    const { context, headers } = createRequestTraceContext(request);
+    let suppress = Boolean(opts?.suppress);
+    if (!suppress && opts?.suppressWhenUnsampledHealth && request.method === 'GET' && !request.headers.get('traceparent')) {
+      try {
+        if (new URL(request.url).pathname === '/health') suppress = true;
+      } catch {
+        // ignore invalid URL
+      }
+    }
+    return new RequestTracer(
+      {
+        rootContext: context,
+        requestId: headers['x-request-id'] ?? context.spanId,
+        spans: [],
+        openSpans: new Set<ActiveSpanHandle>(),
+        suppressed: suppress,
+        rootSpanClaimed: false,
+      },
+      context.spanId,
+    );
+  }
+
+  static fromContext(context: TraceContext, requestId?: string, opts?: { suppress?: boolean }): RequestTracer {
+    const parentHandle: ActiveSpanHandle = {
+      traceId: context.traceId,
+      spanId: context.spanId,
+      ...(context.parentSpanId ? { parentSpanId: context.parentSpanId } : {}),
+      name: 'context',
+      sampled: context.sampled,
+      setAttribute() {},
+      setAttributes() {},
+      setStatus() {},
+      end() {},
+    };
+    return new RequestTracer(
+      {
+        rootContext: { ...context },
+        requestId: requestId ?? context.spanId,
+        spans: [],
+        openSpans: new Set<ActiveSpanHandle>(),
+        suppressed: Boolean(opts?.suppress),
+        rootSpanClaimed: true,
+      },
+      context.spanId,
+      parentHandle,
+    );
+  }
+
+  get traceId(): string {
+    return this.state.rootContext.traceId;
+  }
+
+  get rootSpanId(): string {
+    return this.state.rootContext.spanId;
+  }
+
+  get spanId(): string {
+    return this.currentSpanId;
+  }
+
+  get sampled(): boolean {
+    return this.state.rootContext.sampled;
+  }
+
+  get requestId(): string {
+    return this.state.requestId;
+  }
+
+  get suppressed(): boolean {
+    return this.state.suppressed;
+  }
+
+  get context(): TraceContext {
+    return {
+      traceId: this.traceId,
+      spanId: this.currentSpanId,
+      ...(this.currentSpan?.parentSpanId
+        ? { parentSpanId: this.currentSpan.parentSpanId }
+        : this.state.rootContext.parentSpanId
+          ? { parentSpanId: this.state.rootContext.parentSpanId }
+          : {}),
+      sampled: this.sampled,
+    };
+  }
+
+  setSuppressed(suppressed: boolean): void {
+    this.state.suppressed = suppressed;
+  }
+
+  run<T>(fn: () => T): T {
+    return requestTracerStorage.run(this, fn);
+  }
+
+  startSpan(name: string, opts?: SpanStartOptions): ActiveSpanHandle {
+    const claimRoot = this.currentSpan === undefined && !this.state.rootSpanClaimed;
+    if (claimRoot) {
+      this.state.rootSpanClaimed = true;
+    }
+    const spanId = claimRoot ? this.state.rootContext.spanId : randomHex(8);
+    const parentSpanId =
+      this.currentSpan !== undefined
+        ? this.currentSpan.spanId
+        : this.state.rootContext.parentSpanId;
+    const startTimeMs = opts?.startTimeMs ?? Date.now();
+    const kind = opts?.kind ?? 1;
+    const attributes: Record<string, string | number | boolean> = sanitizeSpanAttributes(opts?.attributes);
+    let statusOk = true;
+    let errorMessage: string | undefined;
+    let ended = false;
+    const state = this.state;
+
+    const handle: ActiveSpanHandle = {
+      traceId: state.rootContext.traceId,
+      spanId,
+      ...(parentSpanId ? { parentSpanId } : {}),
+      name,
+      sampled: state.rootContext.sampled,
+      setAttribute(key, value) {
+        if (ended) return;
+        const sanitized = sanitizeSpanAttributes({ [key]: value });
+        Object.assign(attributes, sanitized);
+      },
+      setAttributes(attrs) {
+        if (ended) return;
+        Object.assign(attributes, sanitizeSpanAttributes(attrs));
+      },
+      setStatus(ok, errMsg) {
+        if (ended) return;
+        statusOk = ok;
+        if (!ok && errMsg) {
+          const safeMsg = sanitizeErrorMessageForSpan(errMsg);
+          errorMessage = safeMsg || undefined;
+        } else if (ok) {
+          errorMessage = undefined;
+        }
+      },
+      end(endTimeMs = Date.now()) {
+        if (ended) return;
+        ended = true;
+        state.openSpans.delete(handle);
+        if (state.suppressed || !state.rootContext.sampled) return;
+        state.spans.push({
+          traceId: state.rootContext.traceId,
+          spanId,
+          ...(parentSpanId ? { parentSpanId } : {}),
+          name,
+          kind,
+          startTimeMs,
+          endTimeMs: Math.max(startTimeMs, endTimeMs),
+          statusOk,
+          ...(errorMessage ? { errorMessage } : {}),
+          attributes,
+        });
+      },
+    };
+    state.openSpans.add(handle);
+    return handle;
+  }
+
+  async withSpan<T>(
+    name: string,
+    optsOrFn: SpanStartOptions | undefined | ((span: ActiveSpanHandle, tracer: RequestTracer) => Promise<T> | T),
+    maybeFn?: (span: ActiveSpanHandle, tracer: RequestTracer) => Promise<T> | T,
+  ): Promise<T> {
+    const opts = typeof optsOrFn === 'function' ? undefined : optsOrFn;
+    const fn = typeof optsOrFn === 'function' ? optsOrFn : maybeFn!;
+    const span = this.startSpan(name, opts);
+    const childTracer = new RequestTracer(this.state, span.spanId, span);
+    try {
+      return await requestTracerStorage.run(childTracer, () => fn(span, childTracer));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      span.setStatus(false, msg);
+      throw err;
+    } finally {
+      span.end();
+    }
+  }
+
+  setAttribute(key: string, value: string | number | boolean | undefined): void {
+    if (this.currentSpan) {
+      this.currentSpan.setAttribute(key, value);
+    }
+  }
+
+  recordSpans(spans: OtlpSpanInput[]): void {
+    if (this.state.suppressed || !this.sampled || spans.length === 0) return;
+    for (const s of spans) {
+      this.state.spans.push({
+        ...s,
+        traceId: s.traceId || this.traceId,
+        attributes: sanitizeSpanAttributes(s.attributes),
+      });
+    }
+  }
+
+  getTraceHeaders(): Record<string, string> {
+    return {
+      traceparent: formatTraceparent({
+        traceId: this.traceId,
+        spanId: this.currentSpanId,
+        sampled: this.sampled,
+      }),
+      'x-trace-id': this.traceId,
+      'x-span-id': this.currentSpanId,
+      'x-request-id': this.requestId,
+    };
+  }
+
+  getRootTraceHeaders(): Record<string, string> {
+    return {
+      'x-trace-id': this.traceId,
+      traceparent: formatTraceparent({
+        traceId: this.traceId,
+        spanId: this.rootSpanId,
+        sampled: this.sampled,
+      }),
+    };
+  }
+
+  bindPromise<T>(promise: Promise<T>): Promise<T> {
+    return this.run(() => promise);
+  }
+
+  bindCallback<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+    return (...args: A) => this.run(() => fn(...args));
+  }
+
+  getRecordedSpans(): OtlpSpanInput[] {
+    return [...this.state.spans];
+  }
+
+  async flush(params: {
+    env: OtelEnvConfig & { SAFE_FETCH?: typeof fetch };
+    fetchFn?: typeof fetch;
+    ctx?: { waitUntil?: (p: Promise<unknown>) => void };
+  }): Promise<boolean> {
+    const batch = this.state.spans.splice(0, this.state.spans.length);
+    if (batch.length === 0 || this.state.suppressed || !this.sampled) {
+      return false;
+    }
+    const doFlush = flushOtlpSpans({
+      env: params.env,
+      spans: batch,
+      ...(params.fetchFn ?? params.env.SAFE_FETCH ? { fetchFn: params.fetchFn ?? params.env.SAFE_FETCH } : {}),
+    });
+    if (params.ctx?.waitUntil) {
+      params.ctx.waitUntil(doFlush);
+      return true;
+    }
+    return await doFlush;
+  }
+}
+
+export function getActiveRequestTracer(explicit?: RequestTracer | TraceContext): RequestTracer | null {
+  if (explicit instanceof RequestTracer) return explicit;
+  const fromAls = requestTracerStorage.getStore();
+  if (fromAls) return fromAls;
+  if (explicit) return RequestTracer.fromContext(explicit);
+  return null;
+}
+
+export function setActiveSpanAttribute(
+  key: string,
+  value: string | number | boolean | undefined,
+  explicit?: RequestTracer | TraceContext,
+): void {
+  const tracer = getActiveRequestTracer(explicit);
+  tracer?.setAttribute(key, value);
+}
+
+/** Attaches `x-trace-id` and `traceparent` headers to any HTTP Response safely (preserving `101` WebSocket upgrades and immutable redirects). */
+export function injectTraceHeaders(response: Response, trace: RequestTracer | TraceContext): Response {
+  const traceId = trace.traceId;
+  const spanId = trace instanceof RequestTracer ? trace.rootSpanId : trace.spanId;
+  const sampled = trace.sampled;
+  const traceparent = formatTraceparent({ traceId, spanId, sampled });
+  const isWebSocketUpgrade =
+    response.status === 101 ||
+    ('webSocket' in response && Boolean((response as { webSocket?: unknown }).webSocket));
+
+  if (isWebSocketUpgrade) {
+    try {
+      response.headers.set('x-trace-id', traceId);
+      response.headers.set('traceparent', traceparent);
+    } catch {
+      // Never reconstruct a 101 WebSocket response
+    }
+    return response;
+  }
+
+  try {
+    response.headers.set('x-trace-id', traceId);
+    response.headers.set('traceparent', traceparent);
+    return response;
+  } catch {
+    const headers = new Headers(response.headers);
+    headers.set('x-trace-id', traceId);
+    headers.set('traceparent', traceparent);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
   }
 }

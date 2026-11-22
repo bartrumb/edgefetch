@@ -1,0 +1,263 @@
+# Shared Go + TypeScript Declarative Site Adapter: Pinpoint ATS Job Boards
+id: pinpoint
+name: Pinpoint ATS Job Boards
+category: jobs
+description: "Upgrades <org>.pinpointhq.com career portals to /postings.json with compensation, responsibilities, and workplace types."
+domains:
+  - "*.pinpointhq.com"
+exampleUrls:
+  - "https://acme.pinpointhq.com/"
+
+routes:
+  # 1. Single posting (<org>.pinpointhq.com/postings/<postId> -> /postings.json, falling back to board)
+  - match:
+      hostSubdomain:
+        suffix: .pinpointhq.com
+        param: org
+        reserved:
+          - www
+          - app
+      exactSegments: false
+      pathSegments:
+        - postings
+        - param: postId
+          charset: pkg
+    twin:
+      id: pinpoint
+      fetchUrl: "https://{host}/postings.json"
+      kind: json
+      accept: application/json
+    extract:
+      findInArray:
+        arrayPath: data
+        matchField: id
+        matchTemplate: "{postId}"
+        endsWithField: url
+        endsWithTemplate: "{postId}"
+      vars:
+        jobTitle:
+          paths: [title]
+          trim: true
+          default: "Job Posting"
+        loc:
+          paths: [location.name]
+          trim: true
+        wp:
+          paths: [workplace_type_text, workplace_type]
+          trim: true
+        cur:
+          paths: [compensation_currency]
+          trim: true
+          default: USD
+        compMin:
+          paths: [compensation_minimum]
+          excludeEquals: "0"
+        compMax:
+          paths: [compensation_maximum]
+          excludeEquals: "0"
+        compRange:
+          template: "{cur} {compMin} – {compMax}"
+          whenVars: [compMin, compMax]
+        compMinOnly:
+          template: "{cur} {compMin}"
+          whenVars: [compMin]
+        compMaxOnly:
+          template: "{cur}  – {compMax}"
+          whenVars: [compMax]
+        compSub:
+          template: "{compRange}"
+          whenVars: [compRange]
+          fallbackVar: compMinOnly
+        comp:
+          template: "{compSub}"
+          whenVars: [compSub]
+          fallbackVar: compMaxOnly
+        desc:
+          paths: [description]
+          format: html_to_md
+        resp:
+          paths: [key_responsibilities]
+          format: html_to_md
+        skills:
+          paths: [skills_knowledge_expertise]
+          format: html_to_md
+        benefits:
+          paths: [benefits]
+          format: html_to_md
+      titleTemplate: "{jobTitle} @ {org}"
+      bullets:
+        - label: Company
+          template: "{org}"
+        - label: Location
+          template: "{loc}"
+          whenVar: loc
+        - label: Workplace
+          template: "{wp}"
+          whenVar: wp
+        - label: Compensation
+          template: "{comp}"
+          whenVar: comp
+      sections:
+        - heading: Description
+          textVar: desc
+        - heading: "Key Responsibilities"
+          textVar: resp
+        - heading: "Skills & Expertise"
+          textVar: skills
+        - heading: Benefits
+          textVar: benefits
+      fallbackExtract:
+        vars:
+          count:
+            paths: [data]
+            format: array_len
+        requireVars:
+          - count
+        titleTemplate: "{org} — Pinpoint Job Board ({count} open roles)"
+        sections:
+          - heading: ""
+            arrayPath: data
+            limit: 100
+            emptyText: "No open positions currently listed."
+            itemVars:
+              pTitle:
+                paths: [title]
+                trim: true
+                default: Role
+              id:
+                paths: [id]
+              rawUrl:
+                paths: [url]
+                requireHttps: true
+              pUrl:
+                template: "{rawUrl}"
+                whenVars: [rawUrl]
+                fallbackTemplate: "https://{host}/postings/{id}"
+              loc:
+                paths: [location.name]
+                trim: true
+                default: "-"
+              wp:
+                paths: [workplace_type_text, workplace_type]
+                trim: true
+                default: "-"
+              cur:
+                paths: [compensation_currency]
+                trim: true
+                default: USD
+              compMin:
+                paths: [compensation_minimum]
+                excludeEquals: "0"
+              compMax:
+                paths: [compensation_maximum]
+                excludeEquals: "0"
+              compRange:
+                template: "{cur} {compMin}–{compMax}"
+                whenVars: [compMin, compMax]
+              compMinOnly:
+                template: "{cur} {compMin}"
+                whenVars: [compMin]
+              comp:
+                template: "{compRange}"
+                whenVars: [compRange]
+                fallbackVar: compMinOnly
+                default: "-"
+            collectLinkVars:
+              - pUrl
+            columns:
+              - header: Role
+                template: "[{pTitle}]({pUrl})"
+              - header: Location
+                template: "{loc}"
+              - header: Workplace
+                template: "{wp}"
+              - header: Compensation
+                template: "{comp}"
+
+  # 2. Whole job board (<org>.pinpointhq.com/ -> /postings.json)
+  - match:
+      hostSubdomain:
+        suffix: .pinpointhq.com
+        param: org
+        reserved:
+          - www
+          - app
+      pathSegments:
+        - param: jobsLit
+          charset: alnum
+          allowValues:
+            - jobs
+            - postings
+          optional: true
+    twin:
+      id: pinpoint
+      fetchUrl: "https://{host}/postings.json"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        count:
+          paths: [data]
+          format: array_len
+      requireVars:
+        - count
+      titleTemplate: "{org} — Pinpoint Job Board ({count} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: data
+          limit: 100
+          emptyText: "No open positions currently listed."
+          itemVars:
+            pTitle:
+              paths: [title]
+              trim: true
+              default: Role
+            id:
+              paths: [id]
+            rawUrl:
+              paths: [url]
+              requireHttps: true
+            pUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://{host}/postings/{id}"
+            loc:
+              paths: [location.name]
+              trim: true
+              default: "-"
+            wp:
+              paths: [workplace_type_text, workplace_type]
+              trim: true
+              default: "-"
+            cur:
+              paths: [compensation_currency]
+              trim: true
+              default: USD
+            compMin:
+              paths: [compensation_minimum]
+              excludeEquals: "0"
+            compMax:
+              paths: [compensation_maximum]
+              excludeEquals: "0"
+            compRange:
+              template: "{cur} {compMin}–{compMax}"
+              whenVars: [compMin, compMax]
+            compMinOnly:
+              template: "{cur} {compMin}"
+              whenVars: [compMin]
+            comp:
+              template: "{compRange}"
+              whenVars: [compRange]
+              fallbackVar: compMinOnly
+              default: "-"
+          collectLinkVars:
+            - pUrl
+          columns:
+            - header: Role
+              template: "[{pTitle}]({pUrl})"
+            - header: Location
+              template: "{loc}"
+            - header: Workplace
+              template: "{wp}"
+            - header: Compensation
+              template: "{comp}"

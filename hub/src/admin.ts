@@ -15,12 +15,17 @@
 import type { HubEventRecord, McpClientActivity } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { MIN_TOKEN_LENGTH, SITE_ID_PATTERN, sameBytes } from './auth';
+import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
 import {
   ADMIN_COOKIE_NAME,
   createAdminSessionValue,
   escapeHtml,
   formatCookie,
+  isAdminSessionRevoked,
+  isEffectiveHttpsOrigin,
+  isSameOriginFormPost,
+  sha256Base64Url,
   verifyAdminSessionCookie,
   type OAuthGrantSummary,
   type OAuthStore,
@@ -42,7 +47,19 @@ const ADMIN_HTML_HEADERS: Record<string, string> = {
 const ADMIN_JSON_HEADERS: Record<string, string> = {
   'cache-control': 'no-store',
   'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
 };
+
+function safeJsonForInlineScript(val: unknown): string {
+  return JSON.stringify(val)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
 
 function adminJson(data: unknown, status = 200): Response {
   return Response.json(data, { status, headers: ADMIN_JSON_HEADERS });
@@ -52,6 +69,7 @@ export interface AdminPortalDeps {
   serviceName: string;
   mcpSlug: string;
   sampleUrl?: string;
+  publicOrigin?: string;
   ownerSecret?: string;
   oauthStore: OAuthStore;
   allowedTargets: FetchTarget[];
@@ -403,8 +421,8 @@ function renderDashboardHtml(params: {
   </div>
 
   <script>
-    const CSRF = ${JSON.stringify(params.csrf)};
-    const HUB_ORIGIN = ${JSON.stringify(params.origin)};
+    const CSRF = ${safeJsonForInlineScript(params.csrf)};
+    const HUB_ORIGIN = ${safeJsonForInlineScript(params.origin)};
     const el = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
     let latestEvents = [];
@@ -448,10 +466,11 @@ function renderDashboardHtml(params: {
       }
       box.innerHTML = filtered.map((ev) => {
         const isOpen = openEventIds.has(ev.id) ? ' open' : '';
+        const safeLvl = ev.level === 'warn' || ev.level === 'error' ? ev.level : 'info';
         return '<div class="log-row' + isOpen + '" data-ev-id="' + Number(ev.id) + '">' +
           '<div class="log-line">' +
             '<span class="log-ts">' + esc(fmtClock(ev.ts)) + '</span>' +
-            '<span class="badge lvl-' + esc(ev.level) + '">' + esc(ev.level) + '</span>' +
+            '<span class="badge lvl-' + safeLvl + '">' + esc(ev.level) + '</span>' +
             '<span class="badge cat">' + esc(ev.category) + '</span>' +
             '<span>' + esc(ev.summary) + '</span>' +
           '</div>' +
@@ -727,7 +746,7 @@ function renderDashboardHtml(params: {
     });
     const mcpEndpoint = HUB_ORIGIN + '/mcp';
     el('cursor-mcp-btn').href = 'cursor://anysphere.cursor-deeplink/mcp/install?name=${encodeURIComponent(params.mcpSlug)}&config=' + encodeURIComponent(btoa(JSON.stringify({ url: mcpEndpoint })));
-    el('vscode-mcp-btn').href = 'vscode:mcp/install?' + encodeURIComponent(JSON.stringify({ name: ${JSON.stringify(params.mcpSlug)}, type: 'http', url: mcpEndpoint }));
+    el('vscode-mcp-btn').href = 'vscode:mcp/install?' + encodeURIComponent(JSON.stringify({ name: ${safeJsonForInlineScript(params.mcpSlug)}, type: 'http', url: mcpEndpoint }));
 
     loadState();
     setInterval(() => {
@@ -738,21 +757,40 @@ function renderDashboardHtml(params: {
 </html>`;
 }
 
+type AdminAuditSpan = Pick<ActiveSpanHandle, 'setAttribute' | 'setAttributes' | 'setStatus'>;
+const NOOP_ADMIN_AUDIT_SPAN: AdminAuditSpan = {
+  setAttribute() {},
+  setAttributes() {},
+  setStatus() {},
+};
+
+async function withAdminAuditSpan<T>(
+  op: 'login' | 'logout' | 'events_clear' | 'affinity_clear' | 'grant_revoke' | 'fetch',
+  fn: (span: AdminAuditSpan) => Promise<T>,
+): Promise<T> {
+  const tracer = getActiveRequestTracer();
+  if (!tracer) return fn(NOOP_ADMIN_AUDIT_SPAN);
+  return tracer.withSpan(`edgefetch.admin.${op}`, { kind: 1, attributes: { 'admin.op': op } }, (span) => fn(span));
+}
+
 export async function handleAdminRoute(request: Request, url: URL, deps: AdminPortalDeps): Promise<Response | null> {
   const path = url.pathname;
   if (path !== '/admin' && !path.startsWith('/admin/')) return null;
 
-  const isSecure = url.protocol === 'https:';
-  if (!deps.ownerSecret || deps.ownerSecret.length < MIN_TOKEN_LENGTH) {
+  const isSecure = isEffectiveHttpsOrigin(url, deps.publicOrigin);
+  const ownerSecret = deps.ownerSecret;
+  if (!ownerSecret || ownerSecret.length < MIN_TOKEN_LENGTH) {
     return adminJson({ error: 'owner_secret_unconfigured' }, 503);
   }
 
-  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), deps.ownerSecret);
-  if (session.ok && typeof deps.oauthStore.checkAuthLockout === 'function') {
-    const revoked = await deps.oauthStore.checkAuthLockout(`revoked_admin:${session.csrf}`, Date.now(), 1);
-    if (!revoked.allowed) {
-      session = { ok: false };
-    }
+  const nowMs = Date.now();
+  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), ownerSecret, nowMs);
+  if (session.ok && (await isAdminSessionRevoked(deps.oauthStore, session.csrf, nowMs))) {
+    session = { ok: false };
+  }
+
+  if (request.method === 'POST' && !isSameOriginFormPost(request, url, deps.publicOrigin)) {
+    return adminJson({ error: 'invalid_origin' }, 403);
   }
 
   if (path === '/admin' && request.method === 'GET') {
@@ -774,62 +812,105 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   }
 
   if (path === '/admin/login' && request.method === 'POST') {
-    const now = Date.now();
-    const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
-    const cappedForm = await readBodyTextCapped(request, 8_192);
-    if (!cappedForm.ok) {
-      return new Response(renderLoginHtml(deps.serviceName, 'Login payload too large.'), {
-        status: 413,
-        headers: ADMIN_HTML_HEADERS,
-      });
-    }
-    const supplied = (new URLSearchParams(cappedForm.text).get('token') ?? '').trim();
-    // `R3-M4`: Verify constant-time `CALLER_TOKEN` match FIRST so an attacker spoofing `X-Forwarded-For` or sharing a
-    // reverse-proxy / IPv6 `/64` bucket can NEVER lock out the legitimate admin, while invalid tokens get `429` after 5 failures!
-    if (!supplied || !sameBytes(supplied, deps.ownerSecret)) {
-      const preLock = await deps.oauthStore.checkAuthLockout(`admin:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
-      if (!preLock.allowed) {
-        return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
-          status: 429,
-          headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+    return withAdminAuditSpan('login', async (span) => {
+      const now = Date.now();
+      const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
+      const cappedForm = await readBodyTextCapped(request, 8_192);
+      if (!cappedForm.ok) {
+        span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': 413 });
+        span.setStatus(false, 'payload_too_large');
+        return new Response(renderLoginHtml(deps.serviceName, 'Login payload too large.'), {
+          status: 413,
+          headers: ADMIN_HTML_HEADERS,
         });
       }
-      const rl = await deps.oauthStore.recordAuthFailure(`admin:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
-      if (!rl.allowed) {
-        return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
-          status: 429,
-          headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(rl.retryAfterSec) },
+      const supplied = (new URLSearchParams(cappedForm.text).get('token') ?? '').trim();
+      // `R3-M4`: Verify constant-time `CALLER_TOKEN` match FIRST so an attacker spoofing `X-Forwarded-For` or sharing a
+      // reverse-proxy / IPv6 `/64` bucket can NEVER lock out the legitimate admin, while invalid tokens get `429` after 5 failures!
+      if (!supplied || !sameBytes(supplied, ownerSecret)) {
+        const preLock = await deps.oauthStore.checkAuthLockout(`admin:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
+        if (!preLock.allowed) {
+          span.setAttributes({ 'admin.outcome': 'rate_limited', 'http.response.status_code': 429 });
+          span.setStatus(false, 'rate_limited');
+          return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
+            status: 429,
+            headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+          });
+        }
+        const rl = await deps.oauthStore.recordAuthFailure(`admin:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
+        if (!rl.allowed) {
+          span.setAttributes({ 'admin.outcome': 'rate_limited', 'http.response.status_code': 429 });
+          span.setStatus(false, 'rate_limited');
+          return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
+            status: 429,
+            headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(rl.retryAfterSec) },
+          });
+        }
+        span.setAttributes({ 'admin.outcome': 'unauthorized', 'http.response.status_code': 401 });
+        span.setStatus(false, 'unauthorized');
+        return new Response(renderLoginHtml(deps.serviceName, 'Invalid caller token.'), {
+          status: 401,
+          headers: ADMIN_HTML_HEADERS,
         });
       }
-      return new Response(renderLoginHtml(deps.serviceName, 'Invalid caller token.'), {
-        status: 401,
-        headers: ADMIN_HTML_HEADERS,
-      });
-    }
 
-    await deps.oauthStore.clearAuthFailures(`admin:${clientIp}`);
-    const minted = await createAdminSessionValue(deps.ownerSecret);
-    const headers = new Headers({ location: '/admin', 'cache-control': 'no-store' });
-    headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, minted.value, { maxAge: minted.maxAgeSec, path: '/', sameSite: 'Lax', secure: isSecure }));
-    return new Response(null, { status: 302, headers });
+      await deps.oauthStore.clearAuthFailures(`admin:${clientIp}`);
+      const minted = await createAdminSessionValue(ownerSecret);
+      const headers = new Headers({
+        location: '/admin',
+        ...ADMIN_JSON_HEADERS,
+      });
+      headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, minted.value, { maxAge: minted.maxAgeSec, path: '/', sameSite: 'Lax', secure: isSecure }));
+      span.setAttributes({ 'admin.outcome': 'authenticated', 'http.response.status_code': 302 });
+      return new Response(null, { status: 302, headers });
+    });
   }
 
   if (path === '/admin/logout' && request.method === 'POST') {
-    const cappedLogout = await readBodyTextCapped(request, 4_096);
-    const formCsrf = cappedLogout.ok ? new URLSearchParams(cappedLogout.text).get('csrf') ?? '' : '';
-    if (!session.ok || !sameBytes(formCsrf, session.csrf)) {
-      return adminJson({ error: 'invalid_csrf' }, 403);
-    }
-    // Server-side revocation of this exact admin session cookie (`Low`): replay of the logged-out cookie fails closed!
-    if (typeof deps.oauthStore.recordAuthFailure === 'function') {
-      await deps.oauthStore.recordAuthFailure(`revoked_admin:${session.csrf}`, Date.now(), 8 * 60 * 60_000, 1);
-    }
-    const headers = new Headers({ location: '/admin', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
-    headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: isSecure }));
-    return new Response(null, { status: 302, headers });
+    return withAdminAuditSpan('logout', async (span) => {
+      const cappedLogout = await readBodyTextCapped(request, 4_096);
+      const formCsrf = cappedLogout.ok ? new URLSearchParams(cappedLogout.text).get('csrf') ?? '' : '';
+      if (!session.ok || !sameBytes(formCsrf, session.csrf)) {
+        span.setAttributes({ 'admin.outcome': 'invalid_csrf', 'http.response.status_code': 403 });
+        span.setStatus(false, 'invalid_csrf');
+        return adminJson({ error: 'invalid_csrf' }, 403);
+      }
+      // Server-side revocation of this exact admin session cookie (`Low`): store SHA-256 hash so raw CSRF token is never stored in cleartext!
+      if (typeof deps.oauthStore.recordAuthFailure === 'function') {
+        const csrfHash = await sha256Base64Url(session.csrf);
+        await deps.oauthStore.recordAuthFailure(`revoked_admin:${csrfHash}`, Date.now(), 8 * 60 * 60_000, 1);
+      }
+      const headers = new Headers({
+        location: '/admin',
+        ...ADMIN_JSON_HEADERS,
+      });
+      headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: isSecure }));
+      span.setAttributes({ 'admin.outcome': 'logged_out', 'http.response.status_code': 302 });
+      return new Response(null, { status: 302, headers });
+    });
   }
 
+  const apiOp =
+    request.method === 'POST'
+      ? path === '/admin/api/events/clear'
+        ? ('events_clear' as const)
+        : path === '/admin/api/affinity/clear'
+          ? ('affinity_clear' as const)
+          : path === '/admin/api/grants/revoke'
+            ? ('grant_revoke' as const)
+            : path === '/admin/api/fetch'
+              ? ('fetch' as const)
+              : null
+      : null;
+
   if (!session.ok) {
+    if (apiOp) {
+      return withAdminAuditSpan(apiOp, async (span) => {
+        span.setAttributes({ 'admin.outcome': 'unauthorized', 'http.response.status_code': 401 });
+        span.setStatus(false, 'unauthorized');
+        return adminJson({ error: 'unauthorized' }, 401);
+      });
+    }
     return adminJson({ error: 'unauthorized' }, 401);
   }
 
@@ -841,117 +922,171 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   if (request.method === 'POST') {
     const hdrCsrf = request.headers.get('x-csrf-token') ?? '';
     if (!hdrCsrf || !sameBytes(hdrCsrf, session.csrf)) {
+      if (apiOp) {
+        return withAdminAuditSpan(apiOp, async (span) => {
+          span.setAttributes({ 'admin.outcome': 'invalid_csrf', 'http.response.status_code': 403 });
+          span.setStatus(false, 'invalid_csrf');
+          return adminJson({ error: 'invalid_csrf' }, 403);
+        });
+      }
       return adminJson({ error: 'invalid_csrf' }, 403);
     }
 
     if (path === '/admin/api/events/clear') {
-      await deps.clearEvents?.();
-      return adminJson({ ok: true }, 200);
+      return withAdminAuditSpan('events_clear', async (span) => {
+        await deps.clearEvents?.();
+        span.setAttributes({ 'admin.outcome': 'cleared', 'http.response.status_code': 200 });
+        return adminJson({ ok: true }, 200);
+      });
     }
 
     if (path === '/admin/api/affinity/clear') {
-      const capped = await readBodyTextCapped(request, 65_536);
-      if (!capped.ok) {
-        return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
-      }
-      let body: { siteId?: string } = {};
-      if (capped.text.trim()) {
-        try {
-          body = JSON.parse(capped.text) as { siteId?: string };
-        } catch {
-          body = {};
+      return withAdminAuditSpan('affinity_clear', async (span) => {
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
         }
-      }
-      await deps.clearAffinities(body.siteId);
-      return adminJson({ ok: true }, 200);
+        let body: { siteId?: string } = {};
+        if (capped.text.trim()) {
+          try {
+            body = JSON.parse(capped.text) as { siteId?: string };
+          } catch {
+            body = {};
+          }
+        }
+        await deps.clearAffinities(body.siteId);
+        span.setAttributes({
+          'admin.site_id': typeof body.siteId === 'string' && body.siteId.trim() ? body.siteId.trim() : 'all',
+          'admin.outcome': 'cleared',
+          'http.response.status_code': 200,
+        });
+        return adminJson({ ok: true }, 200);
+      });
     }
 
     if (path === '/admin/api/grants/revoke') {
-      const capped = await readBodyTextCapped(request, 65_536);
-      if (!capped.ok) {
-        return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
-      }
-      let body: { grantId?: string } = {};
-      if (capped.text.trim()) {
-        try {
-          body = JSON.parse(capped.text) as { grantId?: string };
-        } catch {
-          body = {};
+      return withAdminAuditSpan('grant_revoke', async (span) => {
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
         }
-      }
-      if (!body.grantId || typeof body.grantId !== 'string') {
-        return adminJson({ error: 'missing_grant_id' }, 400);
-      }
-      const revoked = await deps.revokeGrant(body.grantId);
-      return adminJson({ ok: true, revoked }, 200);
+        let body: { grantId?: string } = {};
+        if (capped.text.trim()) {
+          try {
+            body = JSON.parse(capped.text) as { grantId?: string };
+          } catch {
+            body = {};
+          }
+        }
+        if (!body.grantId || typeof body.grantId !== 'string') {
+          span.setAttributes({ 'admin.outcome': 'missing_grant_id', 'http.response.status_code': 400 });
+          span.setStatus(false, 'missing_grant_id');
+          return adminJson({ error: 'missing_grant_id' }, 400);
+        }
+        const revoked = await deps.revokeGrant(body.grantId);
+        span.setAttributes({
+          'admin.grant_id': body.grantId,
+          'admin.revoked': revoked,
+          'admin.outcome': revoked ? 'revoked' : 'not_found',
+          'http.response.status_code': 200,
+        });
+        return adminJson({ ok: true, revoked }, 200);
+      });
     }
 
     if (path === '/admin/api/fetch') {
-      const capped = await readBodyTextCapped(request, 65_536);
-      if (!capped.ok) {
-        return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
-      }
-      let body: {
-        url?: string;
-        kind?: string;
-        target?: string;
-        site?: string;
-        pauseMs?: number;
-        pauseJitterMs?: number;
-        respectRobots?: boolean;
-        robots?: boolean;
-        includeBody?: boolean;
-      } = {};
-      if (capped.text.trim()) {
-        try {
-          body = JSON.parse(capped.text) as typeof body;
-        } catch {
-          return adminJson({ error: 'invalid_json' }, 400);
+      return withAdminAuditSpan('fetch', async (span) => {
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
         }
-      }
-      if (!body.url || typeof body.url !== 'string') {
-        return adminJson({ error: 'missing_url' }, 400);
-      }
-      const target = (typeof body.target === 'string' ? body.target.toLowerCase() : deps.defaultTarget) as FetchTarget;
-      if (!deps.allowedTargets.includes(target)) {
-        return adminJson({ error: 'invalid_target' }, 400);
-      }
-      const site = typeof body.site === 'string' && body.site.trim() ? body.site.trim().toLowerCase() : undefined;
-      if (site && !SITE_ID_PATTERN.test(site)) {
-        return adminJson({ error: 'invalid_site' }, 400);
-      }
-
-      const respectRobots =
-        typeof body.respectRobots === 'boolean' ? body.respectRobots : body.robots !== false;
-
-      const allowedAdminKinds = new Set(['feed', 'page', 'scrape', 'render', 'pdf', 'json']);
-      const adminKind = typeof body.kind === 'string' && allowedAdminKinds.has(body.kind) ? body.kind : 'scrape';
-      const callPayload = JSON.stringify({
-        maxSeconds: 60,
-        options: {
-          includeBody: Boolean(body.includeBody),
-          respectRobots,
-          pauseMs: Math.min(30_000, Math.max(0, Math.floor(Number(body.pauseMs ?? 1500)))),
-          pauseJitterMs: Math.min(15_000, Math.max(0, Math.floor(Number(body.pauseJitterMs ?? 750)))),
-        },
-        requests: [{ id: 'admin-1', url: body.url.trim(), kind: adminKind }],
-      });
-
-      const out = await deps.executeFetch({ target, ...(site ? { site } : {}), body: callPayload });
-      let reply: unknown = out.bodyText;
-      try {
-        reply = JSON.parse(out.bodyText);
-        if (reply && typeof reply === 'object' && Array.isArray((reply as { results?: unknown[] }).results)) {
-          for (const r of (reply as { results: Array<Record<string, unknown>> }).results) {
-            if (typeof r.body === 'string' && r.body.length > 32_768) {
-              r.body = r.body.slice(0, 32_768) + '\n... [truncated in Admin UI preview]';
-            }
+        let body: {
+          url?: string;
+          kind?: string;
+          target?: string;
+          site?: string;
+          pauseMs?: number;
+          pauseJitterMs?: number;
+          respectRobots?: boolean;
+          robots?: boolean;
+          includeBody?: boolean;
+        } = {};
+        if (capped.text.trim()) {
+          try {
+            body = JSON.parse(capped.text) as typeof body;
+          } catch {
+            span.setAttributes({ 'admin.outcome': 'invalid_json', 'http.response.status_code': 400 });
+            span.setStatus(false, 'invalid_json');
+            return adminJson({ error: 'invalid_json' }, 400);
           }
         }
-      } catch {
-        // leave raw
-      }
-      return adminJson({ status: out.status, via: out.via, reply }, 200);
+        if (!body.url || typeof body.url !== 'string') {
+          span.setAttributes({ 'admin.outcome': 'missing_url', 'http.response.status_code': 400 });
+          span.setStatus(false, 'missing_url');
+          return adminJson({ error: 'missing_url' }, 400);
+        }
+        const sanitizedUrl = sanitizeUrlForSpan(body.url.trim());
+        span.setAttribute('url.full', sanitizedUrl);
+        const target = (typeof body.target === 'string' ? body.target.toLowerCase() : deps.defaultTarget) as FetchTarget;
+        if (!deps.allowedTargets.includes(target)) {
+          span.setAttributes({ 'admin.outcome': 'invalid_target', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_target');
+          return adminJson({ error: 'invalid_target' }, 400);
+        }
+        const site = typeof body.site === 'string' && body.site.trim() ? body.site.trim().toLowerCase() : undefined;
+        if (site && !SITE_ID_PATTERN.test(site)) {
+          span.setAttributes({ 'admin.outcome': 'invalid_site', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_site');
+          return adminJson({ error: 'invalid_site' }, 400);
+        }
+
+        const respectRobots =
+          typeof body.respectRobots === 'boolean' ? body.respectRobots : body.robots !== false;
+
+        const allowedAdminKinds = new Set(['feed', 'page', 'scrape', 'render', 'pdf', 'json']);
+        const adminKind = typeof body.kind === 'string' && allowedAdminKinds.has(body.kind) ? body.kind : 'scrape';
+        span.setAttributes({ 'crawler.target': target, 'crawler.kind': adminKind });
+        const callPayload = JSON.stringify({
+          maxSeconds: 60,
+          options: {
+            includeBody: Boolean(body.includeBody),
+            respectRobots,
+            pauseMs: Math.min(30_000, Math.max(0, Math.floor(Number(body.pauseMs ?? 1500)))),
+            pauseJitterMs: Math.min(15_000, Math.max(0, Math.floor(Number(body.pauseJitterMs ?? 750)))),
+          },
+          requests: [{ id: 'admin-1', url: body.url.trim(), kind: adminKind }],
+        });
+
+        const out = await deps.executeFetch({ target, ...(site ? { site } : {}), body: callPayload });
+        span.setAttributes({
+          'crawler.via': out.via,
+          'admin.outcome': 'ok',
+          'http.response.status_code': 200,
+        });
+        let reply: unknown = out.bodyText;
+        try {
+          reply = JSON.parse(out.bodyText);
+          if (reply && typeof reply === 'object' && Array.isArray((reply as { results?: unknown[] }).results)) {
+            for (const r of (reply as { results: Array<Record<string, unknown>> }).results) {
+              if (typeof r.body === 'string' && r.body.length > 32_768) {
+                r.body = r.body.slice(0, 32_768) + '\n... [truncated in Admin UI preview]';
+              }
+            }
+          }
+        } catch {
+          // leave raw
+        }
+        return adminJson({ status: out.status, via: out.via, reply }, 200);
+      });
     }
   }
 

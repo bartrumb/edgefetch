@@ -49,6 +49,8 @@ jobs:
       - name: Extract Add-on Version & Edge Tags
         id: meta
         env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
           REPO_OWNER: ${{ github.repository_owner }}
           ADDON_DIR: ${{ matrix.addon_dir }}
           IMAGE_PREFIX: ${{ matrix.image_prefix }}
@@ -56,9 +58,21 @@ jobs:
         run: |
           set -euo pipefail
           ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "${ADDON_DIR}/config.yaml")
-          if [ -z "$ver" ]; then
-            echo "Failed to read version from ${ADDON_DIR}/config.yaml"
+          agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
+          hub_ver=$(node -p "require('./hub/package.json').version")
+          if [ -z "$ver" ] || [ -z "$agent_ver" ] || [ -z "$hub_ver" ]; then
+            echo "::error::Failed to extract version strings (config.yaml='${ver}', agent.go='${agent_ver}', hub/package.json='${hub_ver}')"
             exit 1
+          fi
+          if [ "$ver" != "$agent_ver" ] || [ "$ver" != "$hub_ver" ]; then
+            echo "::error::Version lockstep mismatch: ${ADDON_DIR}/config.yaml='v${ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}'"
+            exit 1
+          fi
+          if [[ "$REF" == refs/tags/* ]]; then
+            if [ "$REF_NAME" != "v${ver}" ] || [ "$REF_NAME" != "v${agent_ver}" ] || [ "$REF_NAME" != "v${hub_ver}" ]; then
+              echo "::error::Tag '${REF_NAME}' does not match repository version 'v${ver}'"
+              exit 1
+            fi
           fi
           owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
           image="ghcr.io/${owner}/${IMAGE_PREFIX}-${HA_ARCH}"
@@ -130,18 +144,29 @@ jobs:
         id: meta
         env:
           REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
           REPO_OWNER: ${{ github.repository_owner }}
           ADDON_DIR: ${{ matrix.addon_dir }}
           IMAGE_PREFIX: ${{ matrix.image_prefix }}
           HA_ARCH: ${{ matrix.ha_arch }}
         run: |
           set -euo pipefail
-          ver="${REF#refs/tags/v}"
           cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "${ADDON_DIR}/config.yaml")
-          if [ -z "$cfg_ver" ]; then
-            echo "Failed to read version from ${ADDON_DIR}/config.yaml"
+          agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
+          hub_ver=$(node -p "require('./hub/package.json').version")
+          if [ -z "$cfg_ver" ] || [ -z "$agent_ver" ] || [ -z "$hub_ver" ]; then
+            echo "::error::Failed to extract version strings (config.yaml='${cfg_ver}', agent.go='${agent_ver}', hub/package.json='${hub_ver}')"
             exit 1
           fi
+          if [ "$cfg_ver" != "$agent_ver" ] || [ "$cfg_ver" != "$hub_ver" ]; then
+            echo "::error::Version lockstep mismatch: ${ADDON_DIR}/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}'"
+            exit 1
+          fi
+          if [ "$REF_NAME" != "v${cfg_ver}" ] || [ "$REF_NAME" != "v${agent_ver}" ] || [ "$REF_NAME" != "v${hub_ver}" ]; then
+            echo "::error::Tag '${REF_NAME}' does not match repository versions (config.yaml='v${cfg_ver}', agent.go='v${agent_ver}', hub/package.json='v${hub_ver}')"
+            exit 1
+          fi
+          ver="$cfg_ver"
           owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
           image="ghcr.io/${owner}/${IMAGE_PREFIX}-${HA_ARCH}"
           echo "tags=${image}:${ver},${image}:latest" >> "$GITHUB_OUTPUT"
@@ -196,14 +221,29 @@ jobs:
         id: meta
         env:
           REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+          agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
+          hub_ver=$(node -p "require('./hub/package.json').version")
+          if [ -z "$ver" ] || [ -z "$agent_ver" ] || [ -z "$hub_ver" ]; then
+            echo "::error::Failed to extract version strings (config.yaml='${ver}', agent.go='${agent_ver}', hub/package.json='${hub_ver}')"
+            exit 1
+          fi
+          if [ "$ver" != "$agent_ver" ] || [ "$ver" != "$hub_ver" ]; then
+            echo "::error::Version lockstep mismatch: edgefetch_fat/config.yaml='v${ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}'"
+            exit 1
+          fi
           owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
           image="ghcr.io/${owner}/edgefetch-agent"
           short_sha="${GITHUB_SHA::7}"
           if [[ "$REF" == refs/tags/v* ]]; then
+            if [ "$REF_NAME" != "v${ver}" ] || [ "$REF_NAME" != "v${agent_ver}" ] || [ "$REF_NAME" != "v${hub_ver}" ]; then
+              echo "::error::Tag '${REF_NAME}' does not match repository version 'v${ver}'"
+              exit 1
+            fi
             echo "fat_tags=${image}:latest,${image}:${ver}" >> "$GITHUB_OUTPUT"
             echo "lite_tags=${image}:lite,${image}:${ver}-lite" >> "$GITHUB_OUTPUT"
             echo "aio_tags=ghcr.io/${owner}/edgefetch:latest,ghcr.io/${owner}/edgefetch:${ver}" >> "$GITHUB_OUTPUT"

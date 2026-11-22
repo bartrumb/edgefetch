@@ -31,9 +31,11 @@ type SSRFProxy struct {
 	closed sync.Once
 }
 
+var proxyListen = net.Listen
+
 // NewSSRFProxy starts a loopback CONNECT proxy enforcing `allow` and `politeness.RejectNonPublicPeer` on every tunnel.
 func NewSSRFProxy(allow func(*url.URL) error, customDial func(ctx context.Context, network, addr string) (net.Conn, error)) (*SSRFProxy, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := proxyListen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen ssrf proxy: %w", err)
 	}

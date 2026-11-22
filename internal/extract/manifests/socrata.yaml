@@ -1,0 +1,135 @@
+# Shared Go + TypeScript Declarative Site Adapter: Socrata Open Data Portals (SODA)
+id: socrata
+name: Socrata Open Data Portals (SODA Universal Engine)
+category: public-records
+description: Upgrades city, state, and federal Socrata open-data dataset URLs (/d/<4x4-id> or /dataset/.../<4x4-id>) to /api/views/<id>.json column schemas and SODA endpoints.
+domains:
+  - data.cityofnewyork.us
+  - data.sfgov.org
+  - data.sf.gov
+  - data.seattle.gov
+  - data.cityofchicago.org
+  - data.lacity.org
+  - data.wa.gov
+  - data.nj.gov
+  - data.colorado.gov
+  - data.texas.gov
+  - data.ny.gov
+  - data.cdc.gov
+  - "*.socrata.com"
+universalEngine: true
+exampleUrls:
+  - https://data.cityofnewyork.us/Housing-Development/DOB-Job-Application-Filings/ic3t-wcy2
+  - https://data.sfgov.org/d/i98e-djp9
+
+# Match Socrata 4x4 view IDs under /d/<viewId> or trailing /<viewId>[/about_data]
+match:
+  socrataHost: true
+  minSegments: 2
+  anyOf:
+    - socrataHost: true
+      minSegments: 2
+      exactSegments: false
+      pathSegments:
+        - d
+        - param: viewId
+          charset: socrata_4x4
+          transform: lower
+    - socrataHost: true
+      minSegments: 2
+      scanSegment:
+        lastOrBeforeLiteral: about_data
+        param: viewId
+        charset: socrata_4x4
+        transform: lower
+
+twin:
+  fetchUrl: "https://{host}/api/views/{viewId}.json"
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - name
+    - id
+  vars:
+    name:
+      paths:
+        - name
+      trim: true
+    desc:
+      paths:
+        - description
+      trim: true
+    descShort:
+      paths:
+        - description
+      trim: true
+      sliceMax: 260
+    attribution:
+      paths:
+        - attribution
+    category:
+      paths:
+        - category
+    license:
+      paths:
+        - license.name
+    updatedDate:
+      paths:
+        - rowsUpdatedAt
+      format: epoch_sec_date
+    sodaJsonUrl:
+      template: "https://{host}/resource/{viewId}.json?$limit=50"
+    csvExportUrl:
+      template: "https://{host}/api/views/{viewId}/rows.csv?accessType=DOWNLOAD"
+  titleTemplate: "{name} ({host})"
+  descriptionVar: descShort
+  publishedTimeVar: updatedDate
+  bullets:
+    - label: Dataset ID
+      template: "`{viewId}` ({host})"
+    - label: SODA JSON API
+      template: "`{sodaJsonUrl}`"
+    - label: CSV Download
+      template: "{csvExportUrl}"
+    - label: Agency / Attribution
+      template: "{attribution}"
+      whenVar: attribution
+    - label: Category
+      template: "{category}"
+      whenVar: category
+    - label: Rows Last Updated
+      template: "{updatedDate}"
+      whenVar: updatedDate
+    - label: License
+      template: "{license}"
+      whenVar: license
+  sections:
+    - heading: Description
+      textVar: desc
+    - heading: Schema
+      headingTemplate: "Schema ({shownCount} Columns)"
+      arrayPath: columns
+      filter:
+        excludeFieldPrefix:
+          field: fieldName
+          prefix: ":@"
+      limit: 40
+      columns:
+        - header: Field Name
+          paths:
+            - fieldName
+          code: true
+        - header: Label
+          paths:
+            - name
+        - header: Type
+          paths:
+            - dataTypeName
+        - header: Description
+          paths:
+            - description
+  linksVars:
+    - sodaJsonUrl
+    - csvExportUrl

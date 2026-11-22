@@ -1,0 +1,275 @@
+# Shared Go + TypeScript Declarative Site Adapter: Workable Job Boards & Postings
+id: workable
+name: "Workable Job Boards & Postings"
+category: jobs
+description: "Upgrades apply.workable.com boards to /api/v1/widget/accounts/<org>?details=true (merging multi-location rows on shortcode) and single jobs to /api/v2/accounts/<org>/jobs/<code>."
+domains:
+  - apply.workable.com
+exampleUrls:
+  - "https://apply.workable.com/identiv/"
+  - "https://apply.workable.com/identiv/j/ABCD1234EF/"
+
+routes:
+  # 1. Single job posting (apply.workable.com/<org>/j/<code> -> /api/v2/accounts/<org>/jobs/<code>)
+  - match:
+      exactSegments: false
+      pathSegments:
+        - param: org
+          charset: slug
+          maxLen: 80
+          reserved:
+            - api
+            - j
+            - assets
+            - static
+            - favicon.ico
+            - robots.txt
+        - j
+        - param: code
+          charset: slug
+          minLen: 4
+          maxLen: 24
+    twin:
+      id: workable-job
+      fetchUrl: "https://apply.workable.com/api/v2/accounts/{org}/jobs/{code}"
+      kind: json
+      accept: application/json
+    extract:
+      requireFields:
+        - title
+      vars:
+        jobTitle:
+          paths: [title]
+          trim: true
+        city:
+          paths: [location.city]
+          trim: true
+        region:
+          paths: [location.region]
+          trim: true
+        country:
+          paths: [location.country]
+          trim: true
+        loc3:
+          template: "{city}, {region}, {country}"
+          whenVars: [city, region, country]
+        loc2a:
+          template: "{city}, {region}"
+          whenVars: [city, region]
+        loc2b:
+          template: "{city}, {country}"
+          whenVars: [city, country]
+        loc2c:
+          template: "{region}, {country}"
+          whenVars: [region, country]
+        loc1:
+          paths: [location.city, location.region, location.country]
+          trim: true
+        locSub1:
+          template: "{loc3}"
+          whenVars: [loc3]
+          fallbackVar: loc2a
+        locSub2:
+          template: "{locSub1}"
+          whenVars: [locSub1]
+          fallbackVar: loc2b
+        locSub3:
+          template: "{locSub2}"
+          whenVars: [locSub2]
+          fallbackVar: loc2c
+        locStr:
+          template: "{locSub3}"
+          whenVars: [locSub3]
+          fallbackVar: loc1
+        teleRemote:
+          paths: [location.telecommuting]
+          format: bool_map
+          trueValue: remote
+          falseValue: ""
+        workplace:
+          paths: [workplace]
+          trim: true
+          fallbackTemplate: "{teleRemote}"
+        dept:
+          paths: [department]
+          join: ", "
+          trim: true
+        empType:
+          paths: [type]
+          trim: true
+        published:
+          paths: [published]
+          sliceMax: 10
+          trim: true
+        salCur:
+          paths: [salary.salary_currency]
+          upper: true
+          trim: true
+          default: USD
+        salFrom:
+          paths: [salary.salary_from]
+          excludeEquals: "0"
+        salTo:
+          paths: [salary.salary_to]
+          excludeEquals: "0"
+        salRange:
+          template: "{salCur} {salFrom} – {salTo}"
+          whenVars: [salFrom, salTo]
+        salFromOnly:
+          template: "{salCur} {salFrom}"
+          whenVars: [salFrom]
+        salToOnly:
+          template: "{salCur}  – {salTo}"
+          whenVars: [salTo]
+        salSub:
+          template: "{salCur} {salFrom} – {salTo}"
+          whenVars: [salFrom, salTo]
+          fallbackVar: salFromOnly
+        salStr:
+          template: "{salSub}"
+          whenVars: [salSub]
+          fallbackVar: salToOnly
+        desc:
+          paths: [description]
+          format: html_to_md
+        reqs:
+          paths: [requirements]
+          format: html_to_md
+        benefits:
+          paths: [benefits]
+          format: html_to_md
+      titleTemplate: "{jobTitle} @ {org}"
+      publishedTimeVar: published
+      bullets:
+        - label: Company
+          template: "{org}"
+        - label: Location
+          template: "{locStr}"
+          whenVar: locStr
+        - label: Workplace
+          template: "{workplace}"
+          whenVar: workplace
+        - label: Department
+          template: "{dept}"
+          whenVar: dept
+        - label: Type
+          template: "{empType}"
+          whenVar: empType
+        - label: Salary
+          template: "{salStr}"
+          whenVar: salStr
+        - label: Published
+          template: "{published}"
+          whenVar: published
+      sections:
+        - heading: Description
+          textVar: desc
+        - heading: Requirements
+          textVar: reqs
+        - heading: Benefits
+          textVar: benefits
+      linkTemplates:
+        - "https://apply.workable.com/{org}/j/{code}/apply/"
+
+  # 2. Whole board (apply.workable.com/<org>[/] -> /api/v1/widget/accounts/<org>?details=true, merging on shortcode)
+  - match:
+      pathSegments:
+        - param: org
+          charset: slug
+          maxLen: 80
+          reserved:
+            - api
+            - j
+            - assets
+            - static
+            - favicon.ico
+            - robots.txt
+    twin:
+      id: workable-board
+      fetchUrl: "https://apply.workable.com/api/v1/widget/accounts/{org}?details=true"
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        rawCount:
+          paths: [jobs]
+          format: array_len
+        dedupCount:
+          default: "{dedupCount}"
+        orgName:
+          paths: [name]
+          trim: true
+          fallbackTemplate: "{org}"
+      requireVars:
+        - rawCount
+      titleTemplate: "{orgName} — Open Roles ({dedupCount})"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 100
+          linkScanLimit: 2000
+          emptyText: "No open positions are currently listed on this Workable board."
+          filter:
+            requireField: title
+          dedupeBy:
+            keyPaths:
+              - shortcode
+            mergeTextPaths:
+              - "city+state+country"
+            mergeTargetVar: _mergedLocs
+            mergeSep: "; "
+            mergeLimit: 4
+            orBoolPaths:
+              - telecommuting
+              - workplace_type
+            orBoolTargetField: _isRemote
+          itemVars:
+            code:
+              paths: [shortcode]
+              trim: true
+            jTitle:
+              paths: [title]
+              trim: true
+            rawUrl:
+              paths: [url]
+              requireHttps: true
+            jUrl:
+              template: "{rawUrl}"
+              whenVars: [rawUrl]
+              fallbackTemplate: "https://apply.workable.com/{org}/j/{code}/"
+            dept:
+              paths: [department]
+              trim: true
+              default: "-"
+            remoteLocFallback:
+              paths: [_isRemote]
+              format: bool_map
+              trueValue: Remote
+              falseValue: "-"
+            locs:
+              paths: [_mergedLocs]
+              trim: true
+              fallbackTemplate: "{remoteLocFallback}"
+            workplace:
+              paths: [_isRemote]
+              format: bool_map
+              trueValue: Remote
+              falseValue: "On-site / Hybrid"
+            published:
+              paths: [published_on]
+              sliceMax: 10
+              trim: true
+              default: "-"
+          collectLinkVars:
+            - jUrl
+          columns:
+            - header: Role
+              template: "[{jTitle}]({jUrl})"
+            - header: Department
+              template: "{dept}"
+            - header: Locations
+              template: "{locs}"
+            - header: Workplace
+              template: "{workplace}"
+            - header: Published
+              template: "{published}"

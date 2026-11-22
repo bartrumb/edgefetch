@@ -1,0 +1,166 @@
+# Shared Go + TypeScript Declarative Site Adapter: NIST National Vulnerability Database (NVD)
+id: nist-nvd
+name: "NIST National Vulnerability Database (NVD)"
+category: developer
+description: "Upgrades nvd.nist.gov CVE pages to the keyless NVD REST v2 JSON API with CVSS scores, CWEs, and vendor advisories."
+domains:
+  - nvd.nist.gov
+  - www.nvd.nist.gov
+exampleUrls:
+  - "https://nvd.nist.gov/vuln/detail/CVE-2024-3094"
+
+# Matches /vuln/detail/CVE-YYYY-NNNN...
+match:
+  exactSegments: false
+  pathSegments:
+    - vuln
+    - detail
+    - param: cveId
+      charset: cve_id
+      transform: upper
+
+twin:
+  fetchUrl: "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cveId}"
+  kind: json
+  accept: application/json
+
+extract:
+  rootPath: "vulnerabilities.0.cve"
+  requireFields:
+    - id
+  vars:
+    id:
+      paths:
+        - id
+    desc:
+      findInArrayLang:
+        arrayPath: descriptions
+        langField: lang
+        langValue: en
+        valueField: value
+      trim: true
+    descShort:
+      template: "{desc}"
+      whenVars:
+        - desc
+      sliceMax: 260
+    baseScore:
+      paths:
+        - "metrics.cvssMetricV40.0.cvssData.baseScore"
+        - "metrics.cvssMetricV31.0.cvssData.baseScore"
+        - "metrics.cvssMetricV30.0.cvssData.baseScore"
+    severity:
+      paths:
+        - "metrics.cvssMetricV40.0.cvssData.baseSeverity"
+        - "metrics.cvssMetricV40.0.baseSeverity"
+        - "metrics.cvssMetricV31.0.cvssData.baseSeverity"
+        - "metrics.cvssMetricV31.0.baseSeverity"
+        - "metrics.cvssMetricV30.0.cvssData.baseSeverity"
+        - "metrics.cvssMetricV30.0.baseSeverity"
+    vector:
+      paths:
+        - "metrics.cvssMetricV40.0.cvssData.vectorString"
+        - "metrics.cvssMetricV31.0.cvssData.vectorString"
+        - "metrics.cvssMetricV30.0.cvssData.vectorString"
+    titleWithScore:
+      template: "{id} ({severity} {baseScore})"
+      whenVars:
+        - severity
+        - baseScore
+    titleSevOnly:
+      template: "{id} ({severity})"
+      whenVars:
+        - severity
+    titleFull:
+      template: "{titleWithScore}"
+      whenVars:
+        - titleWithScore
+      fallbackVar: titleSevOnly
+    cvssScoreOnly:
+      template: "**{baseScore}**"
+      whenVars:
+        - baseScore
+    cvssScoreVec:
+      template: "**{baseScore}** \u2014 `{vector}`"
+      whenVars:
+        - baseScore
+        - vector
+      fallbackVar: cvssScoreOnly
+    cvssScoreSev:
+      template: "**{baseScore}** ({severity})"
+      whenVars:
+        - baseScore
+        - severity
+      fallbackVar: cvssScoreVec
+    cvssDisplay:
+      template: "**{baseScore}** ({severity}) \u2014 `{vector}`"
+      whenVars:
+        - baseScore
+        - severity
+        - vector
+      fallbackVar: cvssScoreSev
+    cwes:
+      nestedSubValues:
+        arrayPath: weaknesses
+        subArrayField: description
+        valueField: value
+        excludeValues:
+          - NVD-CWE-noinfo
+        join: ", "
+    published:
+      paths:
+        - published
+    publishedDate:
+      paths:
+        - published
+      sliceMax: 10
+    vulnStatus:
+      paths:
+        - vulnStatus
+    cisaExploit:
+      paths:
+        - cisaExploitAdd
+  titleTemplate: "{titleFull}"
+  titleWhenVar: severity
+  titleFallbackTemplate: "{id}"
+  descriptionVar: descShort
+  publishedTimeVar: published
+  bullets:
+    - label: CVSS Score
+      template: "{cvssDisplay}"
+      whenVar: cvssDisplay
+    - label: Status
+      template: "{vulnStatus}"
+      whenVar: vulnStatus
+    - label: Published
+      template: "{publishedDate}"
+      whenVar: publishedDate
+    - label: "Weaknesses (CWE)"
+      template: "{cwes}"
+      whenVar: cwes
+    - label: "CISA KEV (Known Exploited)"
+      template: "Added {cisaExploit}"
+      whenVar: cisaExploit
+  sections:
+    - heading: Summary
+      textVar: desc
+    - heading: "References & Advisories"
+      arrayPath: references
+      limit: 15
+      requireItemVar: refUrl
+      collectLinkVars:
+        - refUrl
+      itemVars:
+        refUrl:
+          paths:
+            - url
+          requireHttps: true
+        refTags:
+          paths:
+            - tags
+          join: ", "
+      columns:
+        - header: URL
+          template: "{refUrl}"
+        - header: Tags
+          template: "{refTags}"

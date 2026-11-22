@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,8 +25,8 @@ import (
 	"time"
 
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
-	"github.com/coder/websocket"
 )
 
 // ErrChallengeDetected is returned when a rendered DOM contains a CAPTCHA or anti-bot challenge;
@@ -41,6 +40,14 @@ const (
 	browserIdleTTL        = 3 * time.Minute
 	maxActiveSessions     = 8
 	maxRenderedDOMChars   = 16 << 20 // 16 MiB cap in JS prevents >24 MiB CDP frames from dropping shared connection
+)
+
+var (
+	idleReaperInterval = 30 * time.Second
+	navLoadTimeout     = 15 * time.Second
+	staleInFlightTTL   = 8 * time.Second
+	minIdleBudget      = 3500 * time.Millisecond
+	readProcFile       = os.ReadFile
 )
 
 // InteractAction describes a single deterministic browser interaction step (`firecrawl_interact` & `/scrape` inline `actions` parity).
@@ -117,6 +124,10 @@ type retainedSession struct {
 	targetID              string
 	cdpSessionID          string
 	mainFrameID           string
+	frameOrigins          map[string]string // frameId -> origin of the document currently COMMITTED in that frame
+	harnessNavURL         string            // URL the harness passed to Page.navigate and has not yet seen paused
+	navChainReqID         string            // Fetch requestId of the harness navigation (follows same-origin redirects)
+	injectedReqs          map[string]bool   // Fetch requestIds that received the task headers (redirect-chain provenance)
 	initialOrigin         string
 	redirectedCrossOrigin bool
 	lastCheckedURL        string
@@ -254,10 +265,15 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 			case <-cdp.closeCh:
 				return
 			case ev := <-fetchEvents:
-				if ev.SessionID != cdpSID || ev.Method != "Fetch.requestPaused" {
+				if ev.SessionID != cdpSID {
 					continue
 				}
-				s.handleRequestPaused(cdp, ev.Params)
+				switch ev.Method {
+				case "Page.frameNavigated":
+					s.noteFrameNavigated(ev.Params)
+				case "Fetch.requestPaused":
+					s.handleRequestPaused(cdp, ev.Params)
+				}
 			}
 		}
 	}()
@@ -268,7 +284,30 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 		s.stopFetch()
 		return fmt.Errorf("enable origin-scoped Fetch interception: %w", err)
 	}
+	s.seedFrameTree(ctx, cdp)
 	return nil
+}
+
+// hasPositiveSameOriginProof requires an Origin or Referer header naming the bound origin (and none naming another).
+func hasPositiveSameOriginProof(hdrs map[string]any, initOrigin string) bool {
+	proven := false
+	for k, rawV := range hdrs {
+		if rawV == nil {
+			continue
+		}
+		val := strings.TrimSpace(fmt.Sprint(rawV))
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "origin", "referer":
+			if val == "" {
+				continue
+			}
+			if canonicalURLOrigin(val) != initOrigin {
+				return false
+			}
+			proven = true
+		}
+	}
+	return proven
 }
 
 func isSameOriginInitiatorHeaders(hdrs map[string]any, initOrigin string) bool {
@@ -307,6 +346,127 @@ func isSameOriginInitiatorHeaders(hdrs map[string]any, initOrigin string) bool {
 		return hasProvenSameOrigin
 	}
 	return true
+}
+
+func sameNavigationURL(a, b string) bool {
+	strip := func(s string) string {
+		if i := strings.IndexByte(s, '#'); i >= 0 {
+			s = s[:i]
+		}
+		return s
+	}
+	a, b = strip(a), strip(b)
+	if a == b {
+		return true
+	}
+	ua, errA := url.Parse(a)
+	ub, errB := url.Parse(b)
+	if errA != nil || errB != nil || canonicalURLOrigin(a) == "" || canonicalURLOrigin(a) != canonicalURLOrigin(b) {
+		return false
+	}
+	pa, pb := ua.Path, ub.Path
+	if pa == "" {
+		pa = "/"
+	}
+	if pb == "" {
+		pb = "/"
+	}
+	return pa == pb && ua.Query().Encode() == ub.Query().Encode()
+}
+
+// noteFrameNavigated records the origin of the document that just committed in a frame (Page.frameNavigated).
+func (s *retainedSession) noteFrameNavigated(rawParams json.RawMessage) {
+	var ev struct {
+		Frame struct {
+			ID             string `json:"id"`
+			ParentID       string `json:"parentId"`
+			URL            string `json:"url"`
+			SecurityOrigin string `json:"securityOrigin"`
+		} `json:"frame"`
+	}
+	if json.Unmarshal(rawParams, &ev) != nil || ev.Frame.ID == "" {
+		return
+	}
+	origin := canonicalURLOrigin(ev.Frame.SecurityOrigin)
+	if origin == "" {
+		origin = canonicalURLOrigin(ev.Frame.URL)
+	}
+	s.mu.Lock()
+	if s.frameOrigins == nil {
+		s.frameOrigins = make(map[string]string)
+	}
+	s.frameOrigins[ev.Frame.ID] = origin // "" for opaque/about:/data: documents: never treated as bound
+	if ev.Frame.ParentID == "" {
+		s.mainFrameID = ev.Frame.ID
+	}
+	s.mu.Unlock()
+}
+
+func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
+	type node struct {
+		Frame struct {
+			ID             string `json:"id"`
+			URL            string `json:"url"`
+			SecurityOrigin string `json:"securityOrigin"`
+		} `json:"frame"`
+		ChildFrames []json.RawMessage `json:"childFrames"`
+	}
+	var out struct {
+		FrameTree json.RawMessage `json:"frameTree"`
+	}
+	if cdp.call(ctx, s.cdpSessionID, "Page.getFrameTree", nil, &out) != nil || len(out.FrameTree) == 0 {
+		return
+	}
+	var walk func(raw json.RawMessage, top bool)
+	walk = func(raw json.RawMessage, top bool) {
+		var n node
+		if json.Unmarshal(raw, &n) != nil || n.Frame.ID == "" {
+			return
+		}
+		origin := canonicalURLOrigin(n.Frame.SecurityOrigin)
+		if origin == "" {
+			origin = canonicalURLOrigin(n.Frame.URL)
+		}
+		s.mu.Lock()
+		if s.frameOrigins == nil {
+			s.frameOrigins = make(map[string]string)
+		}
+		if _, seen := s.frameOrigins[n.Frame.ID]; !seen {
+			s.frameOrigins[n.Frame.ID] = origin
+		}
+		if top && s.mainFrameID == "" {
+			s.mainFrameID = n.Frame.ID
+		}
+		s.mu.Unlock()
+		for _, c := range n.ChildFrames {
+			walk(c, false)
+		}
+	}
+	walk(out.FrameTree, true)
+}
+
+func (s *retainedSession) expectHarnessNavigation(targetURL string) {
+	if s == nil {
+		return
+	}
+	targetOrigin := canonicalURLOrigin(targetURL)
+	s.mu.Lock()
+	if s.initialOrigin != "" && targetOrigin == s.initialOrigin && !s.redirectedCrossOrigin {
+		s.harnessNavURL = targetURL
+	} else {
+		s.harnessNavURL = ""
+	}
+	s.navChainReqID = ""
+	s.mu.Unlock()
+}
+
+func (s *retainedSession) clearExpectedHarnessNavigation() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.harnessNavURL = ""
+	s.mu.Unlock()
 }
 
 func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMessage) {
@@ -351,12 +511,56 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 		}
 	}
 	crossTainted := s.redirectedCrossOrigin
-	s.mu.Unlock()
-
-	allowInject := initOrigin != "" && reqOrigin != "" && reqOrigin == initOrigin && !crossTainted
-	if allowInject && !isMainDoc {
-		allowInject = isSameOriginInitiatorHeaders(paused.Request.Headers, initOrigin)
+	sameOriginReq := initOrigin != "" && reqOrigin != "" && reqOrigin == initOrigin
+	isDocReq := strings.EqualFold(paused.ResourceType, "Document")
+	if isDocReq && paused.FrameID != "" && !sameOriginReq {
+		// A frame that starts loading a foreign document is no longer a bound frame (Page.frameNavigated is a
+		// renderer-side event and may arrive after the new document's first requests).
+		if s.frameOrigins == nil {
+			s.frameOrigins = make(map[string]string)
+		}
+		s.frameOrigins[paused.FrameID] = ""
 	}
+	frameCommitted, frameKnown := s.frameOrigins[paused.FrameID]
+	// A redirect hop is only as trustworthy as the hop before it: bound -> third party -> bound never gets headers.
+	chainOK := paused.RedirectedRequestID == "" || s.injectedReqs[paused.RedirectedRequestID]
+	harnessHop := false
+	if isMainDoc || paused.ResourceType == "" {
+		switch {
+		case paused.RedirectedRequestID == "" && s.harnessNavURL != "" && sameNavigationURL(paused.Request.URL, s.harnessNavURL):
+			harnessHop = true // the navigation the caller asked for
+			s.harnessNavURL = ""
+		case paused.RedirectedRequestID != "" && chainOK && sameOriginReq && paused.RedirectedRequestID == s.navChainReqID:
+			harnessHop = true // same-origin redirect hop of that navigation
+		}
+		if harnessHop {
+			s.navChainReqID = paused.RequestID
+		}
+	}
+	proof := hasPositiveSameOriginProof(paused.Request.Headers, initOrigin)
+	allowInject := false
+	switch {
+	case !sameOriginReq:
+	case harnessHop:
+		allowInject = true
+	case isMainDoc:
+		// Renderer-initiated top-level navigation (location=, <meta refresh>, form submit, link click, target=_top
+		// from a child frame): needs positive proof that a bound document started it. Referer can be suppressed by
+		// an attacker but never forged, so "absent" must mean "no headers".
+		allowInject = !crossTainted && chainOK && proof
+	default:
+		// Subresource / sub-frame document: positive proof, or (for no-referrer bound pages) a requesting frame whose
+		// committed document is known to be on the bound origin and no header naming another origin.
+		allowInject = !crossTainted && chainOK && isSameOriginInitiatorHeaders(paused.Request.Headers, initOrigin) &&
+			(proof || (frameKnown && frameCommitted == initOrigin))
+	}
+	if allowInject && len(extra) > 0 {
+		if s.injectedReqs == nil || len(s.injectedReqs) > 4096 {
+			s.injectedReqs = make(map[string]bool)
+		}
+		s.injectedReqs[paused.RequestID] = true
+	}
+	s.mu.Unlock()
 
 	params := map[string]any{"requestId": paused.RequestID}
 	if allowInject && len(extra) > 0 {
@@ -513,6 +717,7 @@ type Renderer struct {
 	browserVersion   string
 	lastUsedAt       time.Time
 	closed           bool
+	otelExp          *otel.Exporter
 }
 
 func isSandboxRequiredByEnv() bool {
@@ -568,6 +773,26 @@ func (r *Renderer) Available() bool {
 	disabled := r.disabledByPolicy
 	r.mu.Unlock()
 	return !disabled && (r.chromeBin != "" || r.dialOverrideWS != "")
+}
+
+// SetOtelExporter attaches an optional non-blocking OpenTelemetry OTLP/HTTP span exporter.
+func (r *Renderer) SetOtelExporter(exp *otel.Exporter) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.otelExp = exp
+	r.mu.Unlock()
+}
+
+func (r *Renderer) otelExporter() *otel.Exporter {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	exp := r.otelExp
+	r.mu.Unlock()
+	return exp
 }
 
 // BrowserInfo returns the detected Chromium product version and OS process sandbox state ("on", "off", or "unknown").
@@ -663,6 +888,36 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 	}
 	if !r.Available() {
 		return Output{}, ErrBrowserUnavailable
+	}
+
+	exp := r.otelExporter()
+	if tc, hasTrace := otel.TraceContextFromContext(ctx); exp != nil && hasTrace && tc.Sampled {
+		renderStart := time.Now()
+		defer func() {
+			errMsg := ""
+			if retErr != nil {
+				errMsg = otel.RedactEmbeddedURLs(retErr.Error())
+			}
+			exp.Record(otel.Span{
+				TraceID:      tc.TraceID,
+				SpanID:       otel.RandomHex(8),
+				ParentSpanID: tc.SpanID,
+				Name:         "edgefetch.browser.render",
+				Kind:         1, // INTERNAL
+				Start:        renderStart,
+				End:          time.Now(),
+				StatusOK:     retErr == nil,
+				ErrorMessage: errMsg,
+				Attributes: map[string]any{
+					"url.full":                otel.SanitizeURL(task.URL),
+					"browser.status":          out.Status,
+					"browser.rendered_bytes":  len(out.HTML),
+					"browser.actions_count":   len(task.Actions),
+					"browser.session_resumed": task.SessionID != "",
+					"browser.screenshot":      task.Screenshot,
+				},
+			})
+		}()
 	}
 
 	select {
@@ -1020,6 +1275,8 @@ func navigateAndWait(
 		FrameID   string `json:"frameId"`
 		ErrorText string `json:"errorText,omitempty"`
 	}
+	sess.expectHarnessNavigation(targetURL)
+	defer sess.clearExpectedHarnessNavigation()
 	if err := cdp.call(ctx, sessionID, "Page.navigate", map[string]any{"url": targetURL}, &navOut); err != nil {
 		return 0, nil, err
 	}
@@ -1087,7 +1344,7 @@ func navigateAndWait(
 		return false
 	}
 
-	loadWait := time.NewTimer(15 * time.Second)
+	loadWait := time.NewTimer(navLoadTimeout)
 	defer loadWait.Stop()
 	loaded := false
 	for !loaded {
@@ -1121,8 +1378,8 @@ func navigateAndWait(
 	}
 
 	maxIdleBudget := time.Duration(settle) * time.Millisecond
-	if maxIdleBudget < 3500*time.Millisecond {
-		maxIdleBudget = 3500 * time.Millisecond
+	if maxIdleBudget < minIdleBudget {
+		maxIdleBudget = minIdleBudget
 	}
 	quietWindow := 400 * time.Millisecond
 	if explicitWait && time.Duration(settle)*time.Millisecond < quietWindow {
@@ -1143,7 +1400,7 @@ func navigateAndWait(
 	for {
 		now := time.Now()
 		for id, started := range inFlight {
-			if now.Sub(started) > 8*time.Second {
+			if now.Sub(started) > staleInFlightTTL {
 				delete(inFlight, id)
 			}
 		}
@@ -1734,15 +1991,9 @@ func buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir string, useSandbox bo
 		"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
 		profileFlag,
 	)
-	if runtime.GOOS == "windows" {
-		args = append(args,
-			"--remote-debugging-address=127.0.0.1",
-			"--remote-debugging-port=0",
-		)
-	} else {
-		// R5-M6: Use inherited anonymous OS pipes (FD 3 / FD 4) on Linux & macOS so Chromium opens ZERO TCP ports!
-		args = append(args, "--remote-debugging-pipe")
-	}
+	// R6 Zero-TCP Pipe Transport: Use inherited OS pipes (FD 3 / FD 4) on Linux, macOS, and Windows so neither Go nor
+	// Chromium ever opens a listening TCP DevTools socket (eliminating loopback /json/version and bridge races).
+	args = append(args, "--remote-debugging-pipe")
 	if runtime.GOOS == "linux" {
 		args = append(args,
 			"--use-gl=angle",
@@ -1772,6 +2023,11 @@ func isSandboxStartupFailureText(s string) bool {
 		}
 	}
 	if !strings.Contains(lower, ":fatal:") {
+		return false
+	}
+	// Require EPERM/EACCES on :fatal: lines so transient EMFILE ("Too many open files") or ENOMEM in credentials.cc
+	// never permanently latches r.sandboxFallback = true (--no-sandbox).
+	if !strings.Contains(lower, "operation not permitted") && !strings.Contains(lower, "permission denied") {
 		return false
 	}
 	for _, marker := range []string{
@@ -1812,7 +2068,7 @@ func isLinuxProcessZombieOrDead(pid int) bool {
 	if runtime.GOOS != "linux" || pid <= 0 {
 		return false
 	}
-	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	raw, err := readProcFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
 		return true
 	}
@@ -1835,12 +2091,12 @@ func linuxSandboxBlockedByHostPolicy() bool {
 	if runtime.GOOS != "linux" {
 		return false
 	}
-	if attr, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+	if attr, err := readProcFile("/proc/self/attr/current"); err == nil {
 		if strings.Contains(strings.ToLower(strings.TrimSpace(string(attr))), "edgefetch_fat") {
 			return true
 		}
 	}
-	if cloneVal, err := os.ReadFile("/proc/sys/kernel/unprivileged_userns_clone"); err == nil {
+	if cloneVal, err := readProcFile("/proc/sys/kernel/unprivileged_userns_clone"); err == nil {
 		if strings.TrimSpace(string(cloneVal)) == "0" {
 			return true
 		}
@@ -1849,43 +2105,11 @@ func linuxSandboxBlockedByHostPolicy() bool {
 }
 
 func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, args []string, startupWait time.Duration) (*exec.Cmd, string, *cdpConn, error) {
-	toChromeRead, toChromeWrite, err := os.Pipe()
+	cmd, toChromeWrite, fromChromeRead, stderr, err := startBrowserPipeProcess(r.chromeBin, args, buildSanitizedChildEnv(userDir))
 	if err != nil {
 		_ = os.RemoveAll(userDir)
 		return nil, "", nil, err
 	}
-	fromChromeRead, fromChromeWrite, err := os.Pipe()
-	if err != nil {
-		_ = toChromeRead.Close()
-		_ = toChromeWrite.Close()
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, err
-	}
-
-	cmd := exec.Command(r.chromeBin, args...)
-	cmd.Env = buildSanitizedChildEnv(userDir)
-	cmd.ExtraFiles = []*os.File{toChromeRead, fromChromeWrite}
-	configureBrowserProcGroup(cmd)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = toChromeRead.Close()
-		_ = toChromeWrite.Close()
-		_ = fromChromeRead.Close()
-		_ = fromChromeWrite.Close()
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		_ = toChromeRead.Close()
-		_ = toChromeWrite.Close()
-		_ = fromChromeRead.Close()
-		_ = fromChromeWrite.Close()
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, fmt.Errorf("start chromium: %w", err)
-	}
-	// Close child-side pipe ends in the parent immediately so EOF propagates cleanly if Chromium exits.
-	_ = toChromeRead.Close()
-	_ = fromChromeWrite.Close()
 
 	var (
 		connHolder     atomic.Pointer[cdpConn]
@@ -1897,6 +2121,7 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 		closePipesOnce.Do(func() {
 			_ = toChromeWrite.Close()
 			_ = fromChromeRead.Close()
+			_ = stderr.Close()
 		})
 	}
 	stderrDone := make(chan struct{})
@@ -1912,139 +2137,43 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 				earlyCrash = startupReason(earlyCrash, txt)
 				earlyCrashMu.Unlock()
 				if strings.Contains(txt, ":FATAL:") || isSandboxStartupFailureText(txt) {
-					closePipes()
+					_ = toChromeWrite.Close()
+					_ = fromChromeRead.Close()
 				}
 			}
 		}
 		_, _ = io.Copy(io.Discard, stderr)
 	}()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		closePipes()
-		killBrowserProcessGroup(cmd)
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, err
-	}
-	secretPath := "/cdp/" + randomSessionID()
-	var accepted atomic.Bool
-
-	bridgeSrv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			if req.URL.Path != secretPath || !accepted.CompareAndSwap(false, true) {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
+	var teardownOnce sync.Once
+	conn := newPipeCDPConn(toChromeWrite, fromChromeRead, func() {
+		teardownOnce.Do(func() {
+			_ = toChromeWrite.Close()
+			_ = fromChromeRead.Close()
+			select {
+			case <-stderrDone:
+			case <-time.After(250 * time.Millisecond):
 			}
-			wsConn, aErr := websocket.Accept(w, req, nil)
-			if aErr != nil {
-				closePipes()
-				return
-			}
-			// Close the ephemeral listener immediately after the single in-process dial connects:
-			// ZERO TCP ports remain listening for CDP!
-			_ = ln.Close()
-			wsConn.SetReadLimit(maxCDPFrameBytes)
-
-			var bridgeDone sync.Once
-			teardown := func() {
-				bridgeDone.Do(func() {
-					closePipes()
-					select {
-					case <-stderrDone:
-					case <-time.After(250 * time.Millisecond):
-					}
-					if c := connHolder.Load(); c != nil {
-						earlyCrashMu.Lock()
-						ec := earlyCrash
-						earlyCrashMu.Unlock()
-						if ec != "" {
-							c.setCrashReason(ec)
-						}
-					}
-					_ = wsConn.CloseNow()
-				})
-			}
-			defer teardown()
-
-			go func() {
-				defer teardown()
-				var writeMu sync.Mutex
-				for {
-					typ, msg, rErr := wsConn.Read(context.Background())
-					if rErr != nil {
-						return
-					}
-					if typ != websocket.MessageText {
-						continue
-					}
-					framed := make([]byte, len(msg)+1)
-					copy(framed, msg)
-					framed[len(msg)] = 0
-					writeMu.Lock()
-					_, wErr := toChromeWrite.Write(framed)
-					writeMu.Unlock()
-					if wErr != nil {
-						return
-					}
-				}
-			}()
-
-			readBuf := make([]byte, 32*1024)
-			var pending []byte
-			for {
-				n, rErr := fromChromeRead.Read(readBuf)
-				if n > 0 {
-					chunk := readBuf[:n]
-					for {
-						nul := bytes.IndexByte(chunk, 0)
-						if nul < 0 {
-							pending = append(pending, chunk...)
-							if len(pending) > maxCDPFrameBytes {
-								return
-							}
-							break
-						}
-						var frame []byte
-						if len(pending) == 0 {
-							frame = chunk[:nul]
-						} else {
-							if len(pending)+nul > maxCDPFrameBytes {
-								return
-							}
-							frame = append(pending, chunk[:nul]...)
-							pending = pending[:0]
-						}
-						chunk = chunk[nul+1:]
-						if len(frame) > 0 {
-							if wErr := wsConn.Write(context.Background(), websocket.MessageText, frame); wErr != nil {
-								return
-							}
-						}
-					}
-				}
-				if rErr != nil {
-					return
+			closePipes()
+			if c := connHolder.Load(); c != nil {
+				earlyCrashMu.Lock()
+				ec := earlyCrash
+				earlyCrashMu.Unlock()
+				if ec != "" {
+					c.setCrashReason(ec)
 				}
 			}
-		}),
-	}
-	go func() { _ = bridgeSrv.Serve(ln) }()
-
-	wsURL := "ws://" + ln.Addr().String() + secretPath
-	conn, err := dialCDP(ctx, wsURL)
-	_ = ln.Close()
-	if err != nil {
-		closePipes()
-		killBrowserProcessGroup(cmd)
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, fmt.Errorf("dial chromium cdp pipe: %w", err)
-	}
+		})
+	})
 
 	probeCtx, probeCancel := context.WithTimeout(ctx, startupWait)
 	probeDone := make(chan struct{})
+	var probeWG sync.WaitGroup
 	if cmd.Process != nil {
 		pid := cmd.Process.Pid
+		probeWG.Add(1)
 		go func() {
+			defer probeWG.Done()
 			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
 			for {
@@ -2055,7 +2184,7 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 					return
 				case <-ticker.C:
 					if isLinuxProcessZombieOrDead(pid) {
-						closePipes()
+						_ = conn.close()
 						return
 					}
 				}
@@ -2068,9 +2197,10 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 	probeErr := conn.call(probeCtx, "", "Browser.getVersion", nil, &verOut)
 	close(probeDone)
 	probeCancel()
+	probeWG.Wait()
 	if probeErr != nil {
-		closePipes()
 		_ = conn.close()
+		closePipes()
 		killBrowserProcessGroup(cmd)
 		_ = os.RemoveAll(userDir)
 		if ctx.Err() != nil {
@@ -2086,7 +2216,7 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 		if errors.Is(probeErr, context.DeadlineExceeded) && reason == "" {
 			return nil, "", nil, errors.New("timed out waiting for chromium DevTools endpoint")
 		}
-		msg := "chromium exited before advertising DevTools ws://127.0.0.1 endpoint"
+		msg := "chromium exited before advertising DevTools pipe endpoint"
 		if reason != "" {
 			msg += ": " + reason
 		} else {
@@ -2112,104 +2242,13 @@ func (r *Renderer) launchAndDialLocked(ctx context.Context, proxyAddr string, us
 	if err != nil {
 		return nil, "", nil, err
 	}
-	if err := os.Chmod(userDir, 0o700); err != nil {
+	if err := hardenUserDataDir(userDir); err != nil {
 		_ = os.RemoveAll(userDir)
 		return nil, "", nil, err
 	}
 
 	args := buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir, useSandbox)
-	if runtime.GOOS != "windows" {
-		return r.launchAndDialPipeLocked(ctx, userDir, args, startupWait)
-	}
-	cmd := exec.Command(r.chromeBin, args...)
-	cmd.Env = buildSanitizedChildEnv(userDir)
-	configureBrowserProcGroup(cmd)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, fmt.Errorf("start chromium: %w", err)
-	}
-
-	var (
-		connHolder   atomic.Pointer[cdpConn]
-		earlyCrashMu sync.Mutex
-		earlyCrash   string
-	)
-	wsCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		const devToolsPrefix = "DevTools listening on "
-		sc := bufio.NewScanner(stderr)
-		reason := ""
-		for sc.Scan() {
-			line := sc.Text()
-			if idx := strings.Index(line, devToolsPrefix); idx >= 0 {
-				endpoint := strings.TrimSpace(line[idx+len(devToolsPrefix):])
-				if strings.HasPrefix(endpoint, "ws://127.0.0.1:") {
-					wsCh <- endpoint
-					// Continue draining stderr and capture any post-startup FATAL/crash line for CDP error reporting.
-					// If sc.Scan() stops early on a line >64 KiB, drain the remainder via io.Copy so Chromium never blocks!
-					for sc.Scan() {
-						txt := sc.Text()
-						if c := connHolder.Load(); c != nil {
-							c.setCrashReason(txt)
-						} else {
-							earlyCrashMu.Lock()
-							earlyCrash = startupReason(earlyCrash, txt)
-							earlyCrashMu.Unlock()
-						}
-					}
-					_, _ = io.Copy(io.Discard, stderr)
-					return
-				}
-			}
-			reason = startupReason(reason, line)
-		}
-		_, _ = io.Copy(io.Discard, stderr)
-		msg := "chromium exited before advertising DevTools ws://127.0.0.1 endpoint"
-		if reason != "" {
-			msg += ": " + reason
-		}
-		errCh <- errors.New(msg)
-	}()
-
-	var wsURL string
-	startTimer := time.NewTimer(startupWait)
-	defer startTimer.Stop()
-	select {
-	case wsURL = <-wsCh:
-	case e := <-errCh:
-		killBrowserProcessGroup(cmd)
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, e
-	case <-startTimer.C:
-		killBrowserProcessGroup(cmd)
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, errors.New("timed out waiting for chromium DevTools endpoint")
-	case <-ctx.Done():
-		killBrowserProcessGroup(cmd)
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, ctx.Err()
-	}
-
-	conn, err := dialCDP(ctx, wsURL)
-	if err != nil {
-		killBrowserProcessGroup(cmd)
-		_ = os.RemoveAll(userDir)
-		return nil, "", nil, fmt.Errorf("dial chromium cdp: %w", err)
-	}
-	_ = os.Remove(filepath.Join(userDir, "DevToolsActivePort"))
-	earlyCrashMu.Lock()
-	if earlyCrash != "" {
-		conn.setCrashReason(earlyCrash)
-	}
-	earlyCrashMu.Unlock()
-	connHolder.Store(conn)
-	return cmd, userDir, conn, nil
+	return r.launchAndDialPipeLocked(ctx, userDir, args, startupWait)
 }
 
 func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
@@ -2327,7 +2366,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 }
 
 func (r *Renderer) idleReaperLoop(target *cdpConn) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(idleReaperInterval)
 	defer ticker.Stop()
 	for {
 		select {

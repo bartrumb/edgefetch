@@ -23,6 +23,11 @@ export type ScrapeFormat =
   | { type: 'screenshot'; fullPage?: boolean; quality?: number; viewport?: { width?: number; height?: number } }
   | { type: 'changeTracking'; modes?: Array<'git-diff' | 'json'>; tag?: string };
 
+export interface EdgeFetchRequestOptions {
+  /** Optional W3C `traceparent` header overriding the client default for this request (`''` suppresses header). */
+  traceparent?: string;
+}
+
 export interface EdgeFetchClientOptions {
   /** Single Hub URL (e.g. `https://edgefetch.example.com`). */
   baseUrl?: string;
@@ -32,6 +37,8 @@ export interface EdgeFetchClientOptions {
   /** Allow cleartext `http://` Hub URLs for non-loopback hosts (default `false`; `127.0.0.1` / `localhost` / `[::1]` are always allowed). */
   allowInsecureHttp?: boolean;
   fetchFn?: typeof fetch;
+  /** Optional default W3C `traceparent` header forwarded on every request unless overridden per call. */
+  traceparent?: string;
 }
 
 export interface ScrapeParams {
@@ -142,14 +149,57 @@ export interface InteractParams {
 }
 
 export class EdgeFetchError extends Error {
-  constructor(
-    public readonly status: number,
-    public readonly code: string,
-    message: string,
-  ) {
+  public readonly status: number;
+  public readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
     super(message);
     this.name = 'EdgeFetchError';
+    this.status = status;
+    this.code = code;
   }
+}
+
+const TRACEPARENT_RE = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
+const ALL_ZERO_32 = '0'.repeat(32);
+const ALL_ZERO_16 = '0'.repeat(16);
+
+type HeaderLike = Headers | Record<string, unknown> | null | undefined;
+
+function sanitizeTraceparentHeader(raw?: string): string | undefined {
+  if (raw === undefined) return undefined;
+  if (/[\r\n\0]/.test(raw)) {
+    throw new Error('Invalid traceparent header: contains forbidden CR, LF, or NUL character');
+  }
+  const trimmed = raw.trim();
+  return trimmed || undefined;
+}
+
+function readHeader(headers: HeaderLike, name: string): string | null {
+  if (!headers || typeof headers !== 'object') return null;
+  if (typeof (headers as Headers).get === 'function') {
+    const val = (headers as Headers).get(name);
+    const cleaned = typeof val === 'string' ? val.trim() : '';
+    return cleaned || null;
+  }
+  const target = name.toLowerCase();
+  for (const [key, val] of Object.entries(headers)) {
+    if (key.toLowerCase() === target && typeof val === 'string') {
+      const cleaned = val.trim();
+      return cleaned || null;
+    }
+  }
+  return null;
+}
+
+function extractTraceIdFromTraceparent(headerValue: string | null): string | null {
+  if (!headerValue) return null;
+  const match = TRACEPARENT_RE.exec(headerValue.trim());
+  if (!match) return null;
+  const traceId = match[1]!.toLowerCase();
+  const spanId = match[2]!.toLowerCase();
+  if (traceId === ALL_ZERO_32 || spanId === ALL_ZERO_16) return null;
+  return traceId;
 }
 
 function isLoopbackHostname(hostname: string): boolean {
@@ -180,6 +230,9 @@ export class EdgeFetchClient {
   private readonly baseUrls: string[];
   private readonly token: string;
   private readonly fetchFn: typeof fetch;
+  private readonly defaultTraceparent: string | undefined;
+  public lastTraceId: string | null = null;
+  public lastTraceparent: string | null = null;
 
   constructor(options: EdgeFetchClientOptions) {
     const urls = [
@@ -195,15 +248,33 @@ export class EdgeFetchClient {
     this.baseUrls = [...new Set(urls)].map((u) => validateHubOrigin(u, allowInsecure));
     this.token = options.token;
     this.fetchFn = options.fetchFn ?? fetch;
+    this.defaultTraceparent = sanitizeTraceparentHeader(options.traceparent);
   }
 
-  private async requestJson<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private captureTraceHeaders(headers: HeaderLike): void {
+    const rawTraceparent = readHeader(headers, 'traceparent');
+    const rawTraceId = readHeader(headers, 'x-trace-id');
+    this.lastTraceparent = rawTraceparent;
+    this.lastTraceId = rawTraceId ?? extractTraceIdFromTraceparent(rawTraceparent);
+  }
+
+  private async requestJson<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    requestOptions?: EdgeFetchRequestOptions,
+  ): Promise<T> {
     let lastError: unknown;
     const serializedBody = body !== undefined ? JSON.stringify(body) : undefined;
+    const traceparent =
+      requestOptions?.traceparent !== undefined
+        ? sanitizeTraceparentHeader(requestOptions.traceparent)
+        : this.defaultTraceparent;
 
     for (let idx = 0; idx < this.baseUrls.length; idx++) {
+      this.lastTraceId = null;
+      this.lastTraceparent = null;
       const origin = this.baseUrls[idx]!;
-      const hasMore = idx + 1 < this.baseUrls.length;
       let res: Response;
       try {
         res = await this.fetchFn(`${origin}${path}`, {
@@ -211,80 +282,87 @@ export class EdgeFetchClient {
           headers: {
             authorization: `Bearer ${this.token}`,
             accept: 'application/json',
+            ...(traceparent ? { traceparent } : {}),
             ...(serializedBody !== undefined ? { 'content-type': 'application/json' } : {}),
           },
           ...(serializedBody !== undefined ? { body: serializedBody } : {}),
         });
       } catch (networkErr) {
         lastError = networkErr;
-        if (hasMore) continue;
-        throw networkErr;
+        continue;
       }
 
-      const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      this.captureTraceHeaders(res.headers as HeaderLike);
+      const rawJson: unknown = await res.json().catch(() => ({}));
       if (!res.ok) {
+        const json = rawJson !== null && typeof rawJson === 'object' ? (rawJson as Record<string, unknown>) : {};
         const efErr = new EdgeFetchError(
           res.status,
           typeof json.error === 'string' ? json.error : `http_${res.status}`,
           typeof json.message === 'string' ? json.message : `EdgeFetch HTTP ${res.status}`,
         );
         // Fail over to next standby controller on 502 / 503 / 504 gateway/hub unavailability.
-        if (hasMore && (res.status === 502 || res.status === 503 || res.status === 504)) {
+        if (res.status === 502 || res.status === 503 || res.status === 504) {
           lastError = efErr;
           continue;
         }
         throw efErr;
       }
-      return json as T;
+      return rawJson as T;
     }
 
     throw lastError instanceof Error ? lastError : new Error('All EdgeFetch Hub endpoints failed');
   }
 
-  capabilities(): Promise<Record<string, unknown>> {
-    return this.requestJson('GET', '/v1/capabilities');
+  capabilities(requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('GET', '/v1/capabilities', undefined, requestOptions);
   }
 
-  hosts(limit = 100): Promise<{ ok: boolean; hosts: Array<Record<string, unknown>> }> {
-    return this.requestJson('GET', `/v1/hosts?limit=${Math.max(1, Math.min(500, Math.floor(limit)))}`);
+  hosts(limit = 100, requestOptions?: EdgeFetchRequestOptions): Promise<{ ok: boolean; hosts: Array<Record<string, unknown>> }> {
+    return this.requestJson(
+      'GET',
+      `/v1/hosts?limit=${Math.max(1, Math.min(500, Math.floor(limit)))}`,
+      undefined,
+      requestOptions,
+    );
   }
 
-  extractors(category?: string): Promise<{
+  extractors(category?: string, requestOptions?: EdgeFetchRequestOptions): Promise<{
     ok: boolean;
     total: number;
     categories: Record<string, number>;
     extractors: Array<Record<string, unknown>>;
   }> {
     const qs = category ? `?category=${encodeURIComponent(category)}` : '';
-    return this.requestJson('GET', `/v1/extractors${qs}`);
+    return this.requestJson('GET', `/v1/extractors${qs}`, undefined, requestOptions);
   }
 
-  scrape(params: ScrapeParams): Promise<Record<string, unknown>> {
-    return this.requestJson('POST', '/v1/scrape', params);
+  scrape(params: ScrapeParams, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/scrape', params, requestOptions);
   }
 
-  extract(params: ExtractParams): Promise<Record<string, unknown>> {
-    return this.requestJson('POST', '/v1/extract', params);
+  extract(params: ExtractParams, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/extract', params, requestOptions);
   }
 
-  map(params: MapParams): Promise<{ ok: boolean; url: string; total: number; links: string[]; entries: unknown[] }> {
-    return this.requestJson('POST', '/v1/map', params);
+  map(params: MapParams, requestOptions?: EdgeFetchRequestOptions): Promise<{ ok: boolean; url: string; total: number; links: string[]; entries: unknown[] }> {
+    return this.requestJson('POST', '/v1/map', params, requestOptions);
   }
 
-  crawl(params: CrawlParams): Promise<{ ok: boolean; id: string; status: string; collectionId?: string; url: string }> {
-    return this.requestJson('POST', '/v1/crawl', params);
+  crawl(params: CrawlParams, requestOptions?: EdgeFetchRequestOptions): Promise<{ ok: boolean; id: string; status: string; collectionId?: string; url: string }> {
+    return this.requestJson('POST', '/v1/crawl', params, requestOptions);
   }
 
-  getCrawl(crawlId: string, offset = 0, limit = 25): Promise<Record<string, unknown>> {
-    return this.requestJson('GET', `/v1/crawl/${encodeURIComponent(crawlId)}?offset=${offset}&limit=${limit}`);
+  getCrawl(crawlId: string, offset = 0, limit = 25, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('GET', `/v1/crawl/${encodeURIComponent(crawlId)}?offset=${offset}&limit=${limit}`, undefined, requestOptions);
   }
 
-  cancelCrawl(crawlId: string): Promise<{ ok: boolean; id: string; status: string }> {
-    return this.requestJson('DELETE', `/v1/crawl/${encodeURIComponent(crawlId)}`);
+  cancelCrawl(crawlId: string, requestOptions?: EdgeFetchRequestOptions): Promise<{ ok: boolean; id: string; status: string }> {
+    return this.requestJson('DELETE', `/v1/crawl/${encodeURIComponent(crawlId)}`, undefined, requestOptions);
   }
 
-  search(params: SearchParams): Promise<{ ok: boolean; query: string; results: Array<Record<string, unknown>> }> {
-    return this.requestJson('POST', '/v1/search', params);
+  search(params: SearchParams, requestOptions?: EdgeFetchRequestOptions): Promise<{ ok: boolean; query: string; results: Array<Record<string, unknown>> }> {
+    return this.requestJson('POST', '/v1/search', params, requestOptions);
   }
 
   jobs(params: {
@@ -298,28 +376,28 @@ export class EdgeFetchClient {
     limit?: number;
     includeBuiltIn?: boolean;
     exclude?: Array<{ company?: string; title?: string; url?: string }>;
-  }): Promise<Record<string, unknown>> {
-    return this.requestJson('POST', '/v1/jobs', params);
+  }, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/jobs', params, requestOptions);
   }
 
-  interact(params: InteractParams): Promise<Record<string, unknown>> {
-    return this.requestJson('POST', '/v1/interact', params);
+  interact(params: InteractParams, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/interact', params, requestOptions);
   }
 
-  batchScrape(params: { urls: string[]; sync?: boolean; [key: string]: unknown }): Promise<Record<string, unknown>> {
-    return this.requestJson('POST', '/v1/batch/scrape', params);
+  batchScrape(params: { urls: string[]; sync?: boolean; [key: string]: unknown }, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/batch/scrape', params, requestOptions);
   }
 
-  getBatchScrape(batchId: string): Promise<Record<string, unknown>> {
-    return this.requestJson('GET', `/v1/batch/scrape/${encodeURIComponent(batchId)}`);
+  getBatchScrape(batchId: string, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('GET', `/v1/batch/scrape/${encodeURIComponent(batchId)}`, undefined, requestOptions);
   }
 
-  cancelBatchScrape(batchId: string): Promise<Record<string, unknown>> {
-    return this.requestJson('DELETE', `/v1/batch/scrape/${encodeURIComponent(batchId)}`);
+  cancelBatchScrape(batchId: string, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('DELETE', `/v1/batch/scrape/${encodeURIComponent(batchId)}`, undefined, requestOptions);
   }
 
-  previewCrawlParams(params: { url: string; prompt: string }): Promise<Record<string, unknown>> {
-    return this.requestJson('POST', '/v1/crawl/params-preview', params);
+  previewCrawlParams(params: { url: string; prompt: string }, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/crawl/params-preview', params, requestOptions);
   }
 
   agent(params: {
@@ -336,26 +414,34 @@ export class EdgeFetchClient {
     safe?: boolean;
     location?: { country?: string; languages?: string[] };
     llm?: { provider?: string; baseUrl?: string; model?: string; apiKey?: string };
-  }): Promise<Record<string, unknown>> {
-    return this.requestJson('POST', '/v1/agent', params);
+  }, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('POST', '/v1/agent', params, requestOptions);
   }
 
-  getAgent(agentId: string): Promise<Record<string, unknown>> {
-    return this.requestJson('GET', `/v1/agent/${encodeURIComponent(agentId)}`);
+  getAgent(agentId: string, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('GET', `/v1/agent/${encodeURIComponent(agentId)}`, undefined, requestOptions);
   }
 
-  getAgentTrace(agentId: string): Promise<Record<string, unknown>> {
-    return this.requestJson('GET', `/v1/agent/${encodeURIComponent(agentId)}/trace`);
+  getAgentTrace(agentId: string, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('GET', `/v1/agent/${encodeURIComponent(agentId)}/trace`, undefined, requestOptions);
   }
 
-  cancelAgent(agentId: string): Promise<Record<string, unknown>> {
-    return this.requestJson('DELETE', `/v1/agent/${encodeURIComponent(agentId)}`);
+  cancelAgent(agentId: string, requestOptions?: EdgeFetchRequestOptions): Promise<Record<string, unknown>> {
+    return this.requestJson('DELETE', `/v1/agent/${encodeURIComponent(agentId)}`, undefined, requestOptions);
   }
 
-  readArtifact(blobSha256: string, offset = 0, limit = 65_536, format: 'raw' | 'markdown' = 'raw'): Promise<Record<string, unknown>> {
+  readArtifact(
+    blobSha256: string,
+    offset = 0,
+    limit = 65_536,
+    format: 'raw' | 'markdown' = 'raw',
+    requestOptions?: EdgeFetchRequestOptions,
+  ): Promise<Record<string, unknown>> {
     return this.requestJson(
       'GET',
       `/v1/artifacts/${encodeURIComponent(blobSha256)}?format=${format === 'markdown' ? 'markdown' : 'json'}&offset=${offset}&limit=${limit}`,
+      undefined,
+      requestOptions,
     );
   }
 }

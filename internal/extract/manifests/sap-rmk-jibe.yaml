@@ -1,0 +1,170 @@
+# Shared Go + TypeScript Declarative Site Adapter: SAP SuccessFactors RMK & Jibe Career Feeds
+id: sap-rmk-jibe
+name: "SAP SuccessFactors RMK & Jibe Enterprise Career Feeds"
+category: jobs
+description: "Formats Jibe /api/jobs JSON feeds and SAP SuccessFactors Recruiting Marketing (RMK) /sitemap.xml RSS job feeds."
+domains:
+  - "careers.*.com"
+  - "jobs.*.com"
+universalEngine: true
+exampleUrls:
+  - "https://careers.rivian.com/api/jobs?page=1&limit=25"
+  - "https://jobs.sap.com/sitemap.xml"
+
+routes:
+  # Jibe enterprise career JSON (/api/jobs?page=...)
+  - match:
+      pathEquals:
+        - /api/jobs
+    twin:
+      id: jibe-careers
+      fetchUrl: "{requestUrl}"
+      kind: json
+      accept: application/json
+    extract:
+      requireArrayItemField:
+        arrayPath: jobs
+        field: data
+      vars:
+        jobCount:
+          paths: [jobs]
+          format: array_len
+        total:
+          paths: [totalCount]
+          fallbackTemplate: "{jobCount}"
+      requireVars:
+        - jobCount
+      titleTemplate: "{host} — Jibe Career Feed ({jobCount} of {total} open roles)"
+      sections:
+        - heading: ""
+          arrayPath: jobs
+          limit: 80
+          emptyText: "No open positions currently listed."
+          itemVars:
+            jTitle:
+              paths: [data.title, title]
+              trim: true
+              default: Role
+            reqId:
+              paths: [data.req_id, data.slug, req_id, slug]
+              trim: true
+            reqCell:
+              template: "`{reqId}`"
+              whenVars: [reqId]
+              default: "-"
+            catArr:
+              paths: [data.categories]
+              subField: name
+              join: ", "
+            catStr:
+              paths: [data.category, category]
+              trim: true
+            cat:
+              template: "{catArr}"
+              whenVars: [catArr]
+              fallbackVar: catStr
+              default: "-"
+            fullLoc:
+              paths: [data.full_location, full_location]
+              trim: true
+            city:
+              paths: [data.city, city]
+              trim: true
+            state:
+              paths: [data.state, state]
+              trim: true
+            country:
+              paths: [data.country, country]
+              trim: true
+            csc3:
+              template: "{city}, {state}, {country}"
+              whenVars: [city, state, country]
+            csc2a:
+              template: "{city}, {state}"
+              whenVars: [city, state]
+            csc2b:
+              template: "{city}, {country}"
+              whenVars: [city, country]
+            csc1:
+              paths: [data.city, data.state, data.country]
+              trim: true
+            locSub1:
+              template: "{csc3}"
+              whenVars: [csc3]
+              fallbackVar: csc2a
+            locSub2:
+              template: "{locSub1}"
+              whenVars: [locSub1]
+              fallbackVar: csc2b
+            locSub3:
+              template: "{locSub2}"
+              whenVars: [locSub2]
+              fallbackVar: csc1
+            loc:
+              template: "{fullLoc}"
+              whenVars: [fullLoc]
+              fallbackVar: locSub3
+              default: "-"
+            canonUrl:
+              paths: [data.meta_data.canonical_url]
+              requireHttps: true
+            appUrl:
+              paths: [data.apply_url, apply_url]
+              requireHttps: true
+            finalUrl:
+              template: "{canonUrl}"
+              whenVars: [canonUrl]
+              fallbackVar: appUrl
+            roleCell:
+              template: "[{jTitle}]({finalUrl})"
+              whenVars: [finalUrl]
+              fallbackVar: jTitle
+          collectLinkVars:
+            - finalUrl
+          columns:
+            - header: Role
+              template: "{roleCell}"
+            - header: "Req ID"
+              template: "{reqCell}"
+            - header: Category
+              template: "{cat}"
+            - header: Location
+              template: "{loc}"
+
+htmlRoutes:
+  # SAP SuccessFactors RMK /sitemap.xml RSS feed (<g:location> / <g:employer>)
+  - id: sap-rmk
+    mode: xml_items_table
+    match:
+      pathSuffix: sitemap.xml
+    xml:
+      mode: items_table
+      requireAnyTags:
+        - "g:location"
+        - "g:employer"
+      itemTag: item
+      firstItemVars:
+        employer:
+          - "g:employer"
+      titleTemplate: "{employer} — SAP RMK Job Feed ({itemCount} open roles)"
+      limit: 100
+      collectLinkVar: jLink
+      itemVars:
+        jTitle:
+          tags: [title]
+          default: Role
+        jLink:
+          tags: [link]
+        jId:
+          tags: ["g:id"]
+          default: "-"
+        loc:
+          tags: ["g:location"]
+          default: "-"
+      columns:
+        - header: Role
+          template: "[{jTitle}]({jLink})"
+        - header: "Req ID"
+          template: "{jId}"
+        - header: Location
+          template: "{loc}"

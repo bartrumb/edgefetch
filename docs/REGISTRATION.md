@@ -9,11 +9,11 @@ EdgeFetch participates in two trust ecosystems:
 
 ## Important Rule: Project Identity vs. Operator Signing Keys
 
-An open-source binary **must never** ship a shared bot-signing key inside the repository — anyone could abuse it and get the key revoked globally. Instead, registration separates cleanly into two layers:
+A public binary **must never** ship a shared bot-signing key inside the repository — anyone could abuse it and get the key revoked globally. Instead, registration separates cleanly into two layers:
 
 | Layer | Who Registers It | What Gets Registered |
 | --- | --- | --- |
-| **1. Open-Source Project Identity** | Project Maintainer (`@bartrumb`) | Public `EdgeFetch` User-Agent documentation, MCP Registry (`io.github.bartrumb/edgefetch`), Glama (`glama.json`), OpenSSF Best Practices, and official release signing (`keys/release-signing-pub.pem` + SLSA provenance). |
+| **1. Public Project Identity** | Project Maintainer (`@bartrumb`) | Public `EdgeFetch` User-Agent documentation, MCP Registry (`io.github.bartrumb/edgefetch`), Glama (`glama.json`), OpenSSF Best Practices, and official release signing (`keys/release-signing-pub.pem` + SLSA provenance). |
 | **2. Deployed Fleet Identity (Web Bot Auth)** | Each Self-Hosted Operator (including your own Hub domain) | Your own Ed25519 keypair minted via `edgefetch keygen-bot-auth`, served with self-signed RFC 9421 headers at `https://<your-hub>/.well-known/http-message-signatures-directory`, submitted to **Cloudflare Verified Bots**. |
 
 ---
@@ -82,7 +82,7 @@ EdgeFetch's keyless open-data adapters (`sec-edgar`, `openalex`, `crossref-doi`,
 
 ### 1. Official MCP Registry (`registry.modelcontextprotocol.io`)
 
-EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`, schema `2025-12-11`) pinned to `ghcr.io/bartrumb/edgefetch-agent:2.5.5` with the required `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"` OCI image label.
+EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`, schema `2025-12-11`) pinned to `ghcr.io/bartrumb/edgefetch-agent:2.6.3` with the required `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"` OCI image label.
 
 To validate and publish `io.github.bartrumb/edgefetch` in the Official MCP Registry:
 
@@ -118,14 +118,14 @@ EdgeFetch satisfies the OpenSSF Passing criteria out of the box:
 
 Every official `v*` release of EdgeFetch is protected by **two independent cryptographic guarantees**:
 
-1. **Owner-Only Ed25519 Signature (`checksums.txt.sig`):** Signed inside GitHub Actions on protected `v*` tags using `RELEASE_SIGNING_PRIVATE_KEY` (sealed in GitHub Secrets; never accessible to forks or pull requests) and verified against [`keys/release-signing-pub.pem`](../keys/release-signing-pub.pem) (`SPKI SHA-256: 5f54efa30a6652092df0c69fa0e97775fdf5836bdbff53c1c3804a3cfe63a3e9`).
+1. **Owner-Only Ed25519 Signature (`checksums.txt.sig`):** Signed inside GitHub Actions on protected, immutable `v*` tags (`can_admins_bypass: false`) using `RELEASE_SIGNING_PRIVATE_KEY` (sealed exclusively in the tag-gated `release` GitHub Actions environment; never accessible to forks, pull requests, or branch workflows) and verified against [`keys/release-signing-pub.pem`](../keys/release-signing-pub.pem) (`SPKI SHA-256: 2ed9e6f815d727738d51bc48c176f2b63d5176c92975f52943fefcf0afe03272`).
 2. **GitHub OIDC SLSA Build Provenance Attestations:** Proves the exact GitHub Actions workflow and commit SHA that built the binary archive or GHCR container image.
 
 ### Verify a Release Archive (`openssl` + `sha256sum` + `gh attestation`)
 
 ```bash
 # 1. Verify SLSA Build Provenance via GitHub CLI
-gh attestation verify edgefetch_2.5.5_linux_amd64.tar.gz --owner bartrumb
+gh attestation verify edgefetch_2.6.3_linux_amd64.tar.gz --owner bartrumb
 
 # 2. Verify the Owner Ed25519 Signature on checksums.txt
 openssl pkeyutl -verify -pubin \

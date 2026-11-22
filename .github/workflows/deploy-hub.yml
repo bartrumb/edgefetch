@@ -22,7 +22,7 @@ jobs:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: hub/package-lock.json
-      - run: npm ci --no-audit --no-fund
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm test
       - run: npm run type-check
       - run: npm run deploy:dry

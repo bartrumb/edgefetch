@@ -1,0 +1,129 @@
+# Shared Go + TypeScript Declarative Site Adapter: GitLab, Codeberg & Forgejo Twins
+# Note on robots.txt compliance:
+# - gitlab.com/robots.txt disallows /api/v*, /<path>/raw, and .patch, while explicitly allowing /-/blob/...
+#   Using /-/blob/...?format=json&viewer=simple gives 1-hop source & README retrieval with 100% compliance.
+# - codeberg.org/robots.txt and gitea.com/robots.txt disallow /api/, /raw/, /src/, and /commit/, while allowing
+#   /<owner>/<repo> SSR HTML pages containing <div class="markup ...">.
+id: gitlab-forgejo
+name: "GitLab, Codeberg & Forgejo Twins"
+category: developer
+description: "Upgrades GitLab repo roots and file blobs via robots.txt-allowed ?format=json&viewer=simple endpoints, and extracts clean README content from Codeberg/Gitea SSR repo pages."
+domains:
+  - gitlab.com
+  - "gitlab.*"
+  - codeberg.org
+  - gitea.com
+exampleUrls:
+  - "https://gitlab.com/gitlab-org/cli"
+  - "https://gitlab.com/inkscape/inkscape/-/blob/master/CMakeLists.txt"
+  - "https://codeberg.org/forgejo/forgejo"
+
+routes:
+  # Route 1: GitLab file blob -> ?format=json&viewer=simple
+  - match:
+      hosts:
+        - gitlab.com
+        - "gitlab.*"
+      splitOnSegment:
+        delimiter: "-"
+        leftParam: nsProj
+        leftMinSegs: 2
+        afterLiteral: blob
+        rightParam: rawTail
+        tailParam: filePath
+    twin:
+      id: gitlab-blob-json
+      fetchUrl: "https://{host}/{nsProj}/-/blob/{rawTail}?format=json&viewer=simple"
+      rawPathParams:
+        - nsProj
+        - rawTail
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        plain:
+          paths:
+            - html
+          format: gitlab_blob_html
+      requireVars:
+        - plain
+      titleTemplate: "{nsProj}/{filePath}"
+      codeByPath:
+        sourceVar: plain
+        pathParam: filePath
+        rawIfMarkdown: true
+
+  # Route 2: GitLab repository root -> /-/blob/HEAD/README.md?format=json&viewer=simple
+  - match:
+      hosts:
+        - gitlab.com
+        - "gitlab.*"
+      minSegments: 2
+      maxSegments: 5
+      allSegmentsCharset: pkg
+      reservedFirstSegment:
+        - explore
+        - groups
+        - users
+        - dashboard
+        - help
+        - topics
+        - orgs
+        - admin
+        - search
+        - abuse_reports
+        - oauth
+        - snippets
+        - "-"
+      excludeSegmentSuffixes:
+        - ".git"
+        - ".atom"
+    twin:
+      id: gitlab-readme-json
+      fetchUrl: "https://{host}/{joinedPath}/-/blob/HEAD/README.md?format=json&viewer=simple"
+      rawPathParams:
+        - joinedPath
+      kind: json
+      accept: application/json
+    extract:
+      vars:
+        readme:
+          paths:
+            - html
+          format: gitlab_blob_html
+          trim: true
+      requireVars:
+        - readme
+      titleTemplate: "{joinedPath}"
+      bodyVar: readme
+
+# Post-fetch SSR README extraction for Codeberg & Gitea /<owner>/<repo>
+htmlRoutes:
+  - match:
+      hosts:
+        - codeberg.org
+        - gitea.com
+      exactSegments: true
+      pathSegments:
+        - param: owner
+          charset: pkg
+        - param: repo
+          charset: pkg
+    mode: dom
+    vars:
+      desc:
+        metaKeys:
+          - "og:description"
+          - description
+      readme:
+        cssHtmlToMd:
+          - "div.markup"
+        minLen: 40
+    requireVars:
+      - readme
+    titleTemplate: "{owner}/{repo}"
+    descriptionVar: desc
+    blockquoteTemplate: "> **{owner}/{repo}** \u2014 {desc}"
+    blockquoteWhenVar: desc
+    bodyVar: readme
+    preserveBodyLinksFromVar: readme

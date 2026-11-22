@@ -9,11 +9,11 @@ Straight answers to common architectural, operational, and ethical questions abo
 | Question | **EdgeFetch** | **Firecrawl (Self-Hosted)** | **Crawl4AI** |
 |---|---|---|---|
 | **What do I have to run?** | **1 ~8 MB static Go binary** (`edgefetch mcp` or `--mode=hub,agent`) *or* **1 container** (`node:sqlite` + `/data` — **0 Redis, 0 Postgres, 0 RabbitMQ**) | Docker Compose with **Redis, PostgreSQL, RabbitMQ, Playwright, and API** (`2–4 GB+` RAM) | Python 3.10+ environment + Playwright (`600 MB–1.5 GB` RAM) |
-| **License** | **MIT** | AGPL-3.0 (core) | Apache-2.0 (+ attribution) |
+| **License** | **Open-source worker, SDKs & adapters (`MIT`); fair-source hub (`FSL-1.1`, `MIT` after 2 yrs)** | AGPL-3.0 (core) | Apache-2.0 (+ attribution) |
 | **Network model** | Workers dial **outbound** over `WSS /agent/ws` (**0 open inbound ports** on home/NAS/RPi boxes) | Inbound HTTP service + optional paid proxy pool | Local Python library or inbound Docker API |
 | **Anti-bot stance** | **Strictly respects `robots.txt` & `Retry-After`; halts immediately at CAPTCHAs** | Paid cloud tier offers stealth/proxy escalation | Optional stealth / undetected-browser plugins |
 
-If you want a managed SaaS that attempts to bypass anti-bot walls for a per-credit fee, or hosted vertical datasets (`Alexandria`), use Firecrawl Cloud. If you want an **MIT-licensed, zero-Redis/Postgres web + search MCP layer** you can run on hardware you already own for `$0–$5/mo`, EdgeFetch was built for that.
+If you want a managed SaaS that attempts to bypass anti-bot walls for a per-credit fee, or hosted vertical datasets (`Alexandria`), use Firecrawl Cloud. If you want a **self-hosted, zero-Redis/Postgres web + search MCP layer** (**open-source worker and adapters under `MIT`, fair-source hub under `FSL-1.1`**) that you can run on hardware you already own for `$0–$5/mo`, EdgeFetch was built for that.
 
 ---
 
@@ -58,9 +58,9 @@ Unthrottled, stealth-bypass scraping from residential proxy botnets is abusive �
 
 ## 6. How mature is EdgeFetch, and what is the support policy?
 
-EdgeFetch is a **young personal open-source project** (started in November 2026) built to replace paid per-page scraping APIs in daily AI-agent workflows.
+EdgeFetch is a **young personal project** (started in November 2026) built to replace paid per-page scraping APIs in daily AI-agent workflows.
 - It runs daily on the author's 3-node personal fleet (`arm64`, Home Assistant OS `x86_64`, and a Windows VM) and is gated by Go `-race`, fuzzing, `staticcheck`, `govulncheck`, and `workerd` E2E tests in CI.
-- **Support expectation:** MIT-licensed personal project; issues and pull requests are **triaged weekly**. Reproducible bug reports and new site extractor PRs are very welcome — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+- **Licensing & support expectation:** Open-source worker, SDKs, and adapters ([MIT](../LICENSE)); fair-source hub ([FSL-1.1-MIT](../hub/LICENSE), MIT after two years). Issues and pull requests are **triaged weekly**. Reproducible bug reports and new site extractor PRs are very welcome — see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ---
 

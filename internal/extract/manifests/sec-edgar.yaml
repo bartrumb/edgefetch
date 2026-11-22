@@ -1,0 +1,243 @@
+# Shared Go + TypeScript Declarative Site Adapter: SEC EDGAR Company Submissions & Filings
+id: sec-edgar
+name: SEC EDGAR Company Submissions & Filings
+category: finance
+description: Upgrades sec.gov EDGAR company browse pages and CIK URLs to keyless data.sec.gov JSON submissions (10-K, 10-Q, 8-K, DEF 14A, Form 4, 13F).
+domains:
+  - www.sec.gov
+  - sec.gov
+  - data.sec.gov
+exampleUrls:
+  - "https://www.sec.gov/edgar/browse/?CIK=0001477333"
+  - https://data.sec.gov/submissions/CIK0000320193.json
+
+# Match EDGAR browse URLs (?CIK=...) and direct data.sec.gov/submissions/CIK<10d>.json feeds
+match:
+  anyOf:
+    - hosts:
+        - www.sec.gov
+        - sec.gov
+      exactSegments: false
+      pathSegments:
+        - edgar
+        - browse
+      queryParams:
+        - names:
+            - CIK
+            - cik
+          param: rawCik
+          charset: digits
+          minLen: 1
+          maxLen: 10
+      derivedParams:
+        paddedCik:
+          fromParam: rawCik
+          transform: pad10_zero
+        numericCik:
+          fromParam: rawCik
+          transform: strip_leading_zeros
+    - hosts:
+        - www.sec.gov
+        - sec.gov
+      exactSegments: true
+      pathSegments:
+        - cgi-bin
+        - browse-edgar
+      queryParams:
+        - names:
+            - CIK
+            - cik
+          param: rawCik
+          charset: digits
+          minLen: 1
+          maxLen: 10
+      derivedParams:
+        paddedCik:
+          fromParam: rawCik
+          transform: pad10_zero
+        numericCik:
+          fromParam: rawCik
+          transform: strip_leading_zeros
+    - hosts:
+        - data.sec.gov
+      exactSegments: true
+      pathSuffix: .json
+      pathSegments:
+        - submissions
+        - param: rawCik
+          stripPrefix: CIK
+          stripSuffix: .json
+          charset: digits
+          minLen: 1
+          maxLen: 10
+      derivedParams:
+        paddedCik:
+          fromParam: rawCik
+          transform: pad10_zero
+        numericCik:
+          fromParam: rawCik
+          transform: strip_leading_zeros
+
+twin:
+  fetchUrl: "https://data.sec.gov/submissions/CIK{paddedCik}.json"
+  kind: json
+  accept: application/json
+
+extract:
+  requireFields:
+    - name
+  vars:
+    name:
+      paths:
+        - name
+      trim: true
+    tickersPlain:
+      paths:
+        - tickers
+      join: ", "
+    tickersCode:
+      paths:
+        - tickers
+      itemWrap: "`"
+      join: ", "
+    exchanges:
+      paths:
+        - exchanges
+      join: ", "
+    tickersBullet:
+      template: "{tickersCode} ({exchanges})"
+      whenVars:
+        - tickersCode
+        - exchanges
+      fallbackVar: tickersCode
+    sic:
+      paths:
+        - sic
+    sicDesc:
+      paths:
+        - sicDescription
+    sicOrDesc:
+      paths:
+        - sic
+        - sicDescription
+    sicFull:
+      template: "{sic} \u2014 {sicDesc}"
+      whenVars:
+        - sic
+        - sicDesc
+      fallbackVar: sicOrDesc
+    category:
+      paths:
+        - category
+    stateInc:
+      paths:
+        - stateOfIncorporation
+    fye:
+      paths:
+        - fiscalYearEnd
+      format: fiscal_mmdd
+    descTickerOrCik:
+      paths:
+        - tickers
+      join: ", "
+      fallbackTemplate: "CIK {paddedCik}"
+  titleTemplate: "{name} ({tickersPlain}) \u2014 SEC EDGAR"
+  titleWhenVar: tickersPlain
+  titleFallbackTemplate: "{name} (CIK {paddedCik}) \u2014 SEC EDGAR"
+  descriptionTemplate: "{name} SEC EDGAR filings ({descTickerOrCik})"
+  bullets:
+    - label: CIK
+      template: "`{paddedCik}`"
+    - label: Tickers
+      template: "{tickersBullet}"
+      whenVar: tickersBullet
+    - label: SIC Industry
+      template: "{sicFull}"
+      whenVar: sicFull
+    - label: Filer Category
+      template: "{category}"
+      whenVar: category
+    - label: Incorporation
+      template: "{stateInc}"
+      whenVar: stateInc
+    - label: Fiscal Year End
+      template: "{fye}"
+      whenVar: fye
+  sections:
+    - heading: Recent SEC Filings
+      parallelArrays:
+        basePath: filings.recent
+        fields:
+          form: form
+          filingDate: filingDate
+          reportDate: reportDate
+          accessionNumber: accessionNumber
+          primaryDocument: primaryDocument
+          items: items
+        priorityFilterAfter:
+          index: 12
+          field: form
+          allowValues:
+            - 10-K
+            - 10-K/A
+            - 10-Q
+            - 10-Q/A
+            - 8-K
+            - DEF 14A
+            - 20-F
+            - S-1
+            - 13F-HR
+            - "4"
+      limit: 25
+      requireItemVar: form
+      collectLinkVars:
+        - docUrl
+      itemVars:
+        form:
+          paths:
+            - form
+        accRaw:
+          paths:
+            - accessionNumber
+        accNoDash:
+          paths:
+            - accessionNumber
+          replaceAll:
+            from: "-"
+            to: ""
+        primaryDocument:
+          paths:
+            - primaryDocument
+        indexUrl:
+          template: "https://www.sec.gov/Archives/edgar/data/{numericCik}/{accNoDash}/{accRaw}-index.htm"
+          whenVars:
+            - accRaw
+            - accNoDash
+        docUrl:
+          template: "https://www.sec.gov/Archives/edgar/data/{numericCik}/{accNoDash}/{primaryDocument}"
+          whenVars:
+            - accNoDash
+            - primaryDocument
+          fallbackVar: indexUrl
+        formBold:
+          template: "**{form}**"
+          whenVars:
+            - form
+        formCell:
+          template: "[**{form}**]({docUrl})"
+          whenVars:
+            - form
+            - docUrl
+          fallbackVar: formBold
+      columns:
+        - header: Form
+          template: "{formCell}"
+        - header: Filed
+          paths:
+            - filingDate
+        - header: Period
+          paths:
+            - reportDate
+        - header: 8-K Items
+          paths:
+            - items

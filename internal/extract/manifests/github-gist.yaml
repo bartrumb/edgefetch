@@ -1,0 +1,15 @@
+# Shared Go + TypeScript Declarative Site Adapter: GitHub Gists
+id: github-gist
+name: GitHub Gists
+category: developer
+description: "Extracts multi-file GitHub Gist code blocks with fenced language tags and rendered Markdown."
+domains:
+  - gist.github.com
+exampleUrls:
+  - "https://gist.github.com/octocat/6cad326836d38bd3a7ae"
+
+# Post-fetch multi-file Gist code & Markdown extraction on /<user>/<gistId>
+htmlRoutes:
+  - match:
+      minSegments: 2
+    mode: gist_files

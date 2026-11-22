@@ -6,17 +6,55 @@
  */
 
 import render from 'dom-serializer';
-import { type ChildNode, type Document, type Element, isTag, isText } from 'domhandler';
+import { type ChildNode, Document, Element, Text, isTag, isText } from 'domhandler';
 import { textContent } from 'domutils';
-import { parseDocument } from 'htmlparser2';
+import { Parser } from 'htmlparser2';
 
 const DEFAULT_MAX_HTML_DOC_CHARS = 2_097_152; // 2 MiB default input cap
+const HARD_MAX_HTML_DOC_CHARS = 4_194_304; // 4 MiB absolute ceiling even when caller passes higher maxChars
+const MAX_DOM_DEPTH = 128;
+const MAX_DOM_NODES = 40_000;
+const MAX_OVERFLOW_TAG_EVENTS = 1_024;
+const MAX_DOC_TOTAL_VISITS = 90_000;
+const MAX_SERIALIZE_NODES_PER_CALL = 15_000;
+const MAX_DLMAP_VISITS = 4_000;
 const MAX_SELECTOR_CHARS = 256;
 const MAX_SELECTOR_GROUPS = 16;
 const MAX_COMBINATOR_STEPS = 8;
 const MAX_SELECT_LIMIT = 5_000;
 
-const STRIPPED_TEXT_TAGS: ReadonlySet<string> = new Set(['script', 'style', 'noscript', 'template']);
+interface VisitBudget {
+  remaining: number;
+}
+
+const STRIPPED_TEXT_TAGS: ReadonlySet<string> = new Set([
+  'script',
+  'style',
+  'noscript',
+  'template',
+  'svg',
+  'xmp',
+  'plaintext',
+  'textarea',
+]);
+
+const VOID_HTML_TAGS: ReadonlySet<string> = new Set([
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'keygen',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr',
+]);
 
 const BLOCK_BOUNDARY_TAGS: ReadonlySet<string> = new Set([
   'address',
@@ -438,65 +476,154 @@ function prevElementSibling(el: Element): Element | null {
   return null;
 }
 
+interface ChainMemo {
+  step: Array<Map<Element, boolean>>;
+  anc: Array<Map<Element, boolean>>;
+}
+
+function hasMatchingAncestor(
+  el: Element,
+  steps: SelectorStep[],
+  prevStepIdx: number,
+  scopeRoot: Document | Element,
+  memo: ChainMemo,
+): boolean {
+  let p = el.parent;
+  if (!p || p === scopeRoot.parent || !isTag(p)) return false;
+
+  const ancMap = memo.anc[prevStepIdx]!;
+  const hit = ancMap.get(p);
+  if (hit !== undefined) return hit;
+
+  const path: Element[] = [];
+  let res = false;
+  while (p && p !== scopeRoot.parent && isTag(p)) {
+    const cached = ancMap.get(p);
+    if (cached !== undefined) {
+      res = cached;
+      break;
+    }
+    path.push(p);
+    if (p === scopeRoot) break;
+    p = p.parent;
+  }
+
+  for (let i = path.length - 1; i >= 0; i--) {
+    const node = path[i]!;
+    if (!res) {
+      res = matchesChainAtStep(node, steps, prevStepIdx, scopeRoot, memo);
+    }
+    ancMap.set(node, res);
+  }
+  return res;
+}
+
 function matchesChainAtStep(
   el: Element,
   steps: SelectorStep[],
   stepIdx: number,
   scopeRoot: Document | Element,
-  failedMemo: Array<Set<Element>>,
+  memo: ChainMemo,
 ): boolean {
-  const memo = failedMemo[stepIdx]!;
-  if (memo.has(el)) return false;
+  const stepMap = memo.step[stepIdx]!;
+  const existing = stepMap.get(el);
+  if (existing !== undefined) return existing;
 
   const step = steps[stepIdx]!;
   if (!matchesCompound(el, step.compound)) {
-    memo.add(el);
+    stepMap.set(el, false);
     return false;
   }
 
   if (stepIdx === 0) {
-    if (step.combinatorFromPrev === '>') {
-      const ok = el.parent === scopeRoot;
-      if (!ok) memo.add(el);
-      return ok;
-    }
-    return true;
+    const ok = step.combinatorFromPrev === '>' ? el.parent === scopeRoot : true;
+    stepMap.set(el, ok);
+    return ok;
   }
 
   const comb = step.combinatorFromPrev;
   if (comb === '>') {
     const parent = el.parent;
     if (!parent || parent === scopeRoot.parent || !isTag(parent)) {
-      memo.add(el);
+      stepMap.set(el, false);
       return false;
     }
-    const ok = matchesChainAtStep(parent, steps, stepIdx - 1, scopeRoot, failedMemo);
-    if (!ok) memo.add(el);
+    const ok = matchesChainAtStep(parent, steps, stepIdx - 1, scopeRoot, memo);
+    stepMap.set(el, ok);
     return ok;
   }
 
   if (comb === '+') {
     const prev = prevElementSibling(el);
     if (!prev) {
-      memo.add(el);
+      stepMap.set(el, false);
       return false;
     }
-    const ok = matchesChainAtStep(prev, steps, stepIdx - 1, scopeRoot, failedMemo);
-    if (!ok) memo.add(el);
+    const ok = matchesChainAtStep(prev, steps, stepIdx - 1, scopeRoot, memo);
+    stepMap.set(el, ok);
     return ok;
   }
 
-  // Descendant combinator (`' '`): walk ancestor chain within `scopeRoot` with memoization (`O(K * N)` total!)
-  let anc = el.parent;
-  while (anc && anc !== scopeRoot.parent) {
-    if (isTag(anc) && matchesChainAtStep(anc, steps, stepIdx - 1, scopeRoot, failedMemo)) {
-      return true;
+  // Descendant combinator (`' '`): memoized `O(1)` amortized ancestor lookup (`O(K * N)` worst-case!)
+  const ok = hasMatchingAncestor(el, steps, stepIdx - 1, scopeRoot, memo);
+  stepMap.set(el, ok);
+  return ok;
+}
+
+function isAsciiOrUnicodeWhitespaceCode(ch: number): boolean {
+  return (
+    ch <= 32 ||
+    ch === 0x00a0 ||
+    ch === 0x1680 ||
+    (ch >= 0x2000 && ch <= 0x200a) ||
+    ch === 0x2028 ||
+    ch === 0x2029 ||
+    ch === 0x202f ||
+    ch === 0x205f ||
+    ch === 0x3000 ||
+    ch === 0xfeff
+  );
+}
+
+function stripTrailingColonsAndWhitespace(s: string): string {
+  let end = s.length;
+  while (end > 0) {
+    const ch = s.charCodeAt(end - 1);
+    if (ch === 58 /* ':' */ || ch === 0xff1a /* '：' */ || isAsciiOrUnicodeWhitespaceCode(ch)) {
+      end--;
+    } else {
+      break;
     }
-    if (anc === scopeRoot) break;
-    anc = anc.parent;
   }
-  memo.add(el);
-  return false;
+  let start = 0;
+  while (start < end && isAsciiOrUnicodeWhitespaceCode(s.charCodeAt(start))) {
+    start++;
+  }
+  return start === 0 && end === s.length ? s : s.slice(start, end);
+}
+
+function collapseAndTrimWhitespace(raw: string): string {
+  let out = '';
+  let inSpace = true;
+  let chunkStart = -1;
+  for (let i = 0; i < raw.length; i++) {
+    if (isAsciiOrUnicodeWhitespaceCode(raw.charCodeAt(i))) {
+      if (chunkStart >= 0) {
+        if (out.length > 0) out += ' ';
+        out += raw.slice(chunkStart, i);
+        chunkStart = -1;
+      }
+      inSpace = true;
+    } else if (inSpace) {
+      chunkStart = i;
+      inSpace = false;
+    }
+  }
+  if (chunkStart >= 0) {
+    if (out.length > 0) out += ' ';
+    out += raw.slice(chunkStart);
+  }
+  return out;
 }
 
 function isSimpleLeafTextElement(node: Document | Element): boolean {
@@ -508,78 +635,320 @@ function isSimpleLeafTextElement(node: Document | Element): boolean {
   return true;
 }
 
-function collectCleanTextChunks(children: readonly ChildNode[], out: string[]): void {
-  for (const child of children) {
+const CLEAN_NODE_TEXT_CACHE = new WeakMap<Document | Element, string>();
+const RAW_NODE_TEXT_CACHE = new WeakMap<Document | Element, string>();
+
+function computeRawNodeTextCached(
+  node: Document | Element,
+  rawCache: WeakMap<Document | Element, string>,
+  budget: VisitBudget,
+): string {
+  const hit = rawCache.get(node);
+  if (hit !== undefined) return hit;
+
+  if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
+    rawCache.set(node, '');
+    return '';
+  }
+
+  // Iterative post-order evaluation so deep subtrees never recurse and every Element is computed at most once.
+  const stack: Array<{ target: Document | Element; childIdx: number; chunks: string[] }> = [
+    { target: node, childIdx: 0, chunks: [] },
+  ];
+
+  while (stack.length > 0) {
+    const top = stack[stack.length - 1]!;
+    const children = top.target.children;
+    if (top.childIdx >= children.length || budget.remaining <= 0) {
+      const joined = top.chunks.length === 0 ? '' : top.chunks.join('');
+      rawCache.set(top.target, joined);
+      stack.pop();
+      if (stack.length > 0) {
+        const parentFrame = stack[stack.length - 1]!;
+        const finishedTag = isTag(top.target) ? top.target.name.toLowerCase() : '';
+        const isBlock = finishedTag !== '' && BLOCK_BOUNDARY_TAGS.has(finishedTag);
+        if (isBlock) parentFrame.chunks.push(' ');
+        if (joined) parentFrame.chunks.push(joined);
+        if (isBlock) parentFrame.chunks.push(' ');
+      }
+      continue;
+    }
+
+    budget.remaining--;
+    const child = children[top.childIdx++]!;
     if (isText(child)) {
-      if (child.data) out.push(child.data);
+      if (child.data) top.chunks.push(child.data);
       continue;
     }
     if (!isTag(child)) continue;
     const tagLower = child.name.toLowerCase();
     if (STRIPPED_TEXT_TAGS.has(tagLower)) continue;
     if (tagLower === 'br' || tagLower === 'hr') {
-      out.push(' ');
+      top.chunks.push(' ');
       continue;
     }
-    const isBlock = BLOCK_BOUNDARY_TAGS.has(tagLower);
-    if (isBlock) out.push(' ');
-    if (child.children.length > 0) {
-      collectCleanTextChunks(child.children, out);
+    const cachedChild = rawCache.get(child);
+    if (cachedChild !== undefined) {
+      const isBlock = BLOCK_BOUNDARY_TAGS.has(tagLower);
+      if (isBlock) top.chunks.push(' ');
+      if (cachedChild) top.chunks.push(cachedChild);
+      if (isBlock) top.chunks.push(' ');
+      continue;
     }
-    if (isBlock) out.push(' ');
+    stack.push({ target: child, childIdx: 0, chunks: [] });
   }
+
+  return rawCache.get(node) ?? '';
 }
 
-function extractCleanNodeText(node: Document | Element): string {
+function extractCleanNodeText(node: Document | Element, budget: VisitBudget): string {
+  const cached = CLEAN_NODE_TEXT_CACHE.get(node);
+  if (cached !== undefined) return cached;
+  if (budget.remaining <= 0) return '';
   if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
+    CLEAN_NODE_TEXT_CACHE.set(node, '');
     return '';
   }
+  let clean: string;
   if (isSimpleLeafTextElement(node)) {
-    return textContent(node).replace(/\s+/g, ' ').trim();
+    budget.remaining--;
+    clean = collapseAndTrimWhitespace(textContent(node));
+  } else {
+    const raw = computeRawNodeTextCached(node, RAW_NODE_TEXT_CACHE, budget);
+    clean = raw ? collapseAndTrimWhitespace(raw) : '';
   }
-  const chunks: string[] = [];
-  collectCleanTextChunks(node.children, chunks);
-  if (chunks.length === 0) return '';
-  return chunks.join('').replace(/\s+/g, ' ').trim();
+  CLEAN_NODE_TEXT_CACHE.set(node, clean);
+  return clean;
 }
 
-function walkSubtreeElements(root: Document | Element, visit: (el: Element) => boolean | void): void {
+function isVoidElementSpan(src: string, start: number, endIndex: number, inForeign: boolean): boolean {
+  const len = endIndex - start;
+  if (len < 2 || len > 6) return false;
+  // Fast non-allocating reject for `div`, `span`, `table`, `p`, `tr`, `td`, `th`, `ul`, `li`, `dl`, `dt`, `dd`
+  const c0 = src.charCodeAt(start) | 32;
+  if (c0 === 100 /* 'd' */ || c0 === 112 /* 'p' && len !== 5 */) {
+    if (c0 === 100) return false; // no HTML void element starts with 'd'
+    if (len !== 5) return false; // only 'param' starts with 'p'
+  }
+  const rawName = src.slice(start, endIndex).toLowerCase();
+  if (rawName === 'image') return !inForeign;
+  return VOID_HTML_TAGS.has(rawName);
+}
+
+class BoundedHtmlParser extends Parser {
+  private overflowDepth = 0;
+  private overflowEvents = 0;
+  private overflowInForeign = false;
+  private currentOpenOverflowed = false;
+  private readonly sourceHtml: string;
+  public overflowHalted = false;
+
+  constructor(
+    sourceHtml: string,
+    cbs: ConstructorParameters<typeof Parser>[0],
+    options: ConstructorParameters<typeof Parser>[1],
+  ) {
+    super(cbs, options);
+    this.sourceHtml = sourceHtml;
+  }
+
+  override onopentagname(start: number, endIndex: number): void {
+    if (this.overflowDepth > 0 || (this as unknown as { stack: string[] }).stack.length >= MAX_DOM_DEPTH) {
+      if (this.overflowDepth === 0) {
+        this.overflowInForeign = this.isInForeignContext();
+      }
+      if (!isVoidElementSpan(this.sourceHtml, start, endIndex, this.overflowInForeign)) {
+        this.endIndex = endIndex;
+        this.overflowDepth++;
+        this.overflowEvents++;
+        this.currentOpenOverflowed = true;
+        (this as unknown as { tagname: string }).tagname = '';
+        if (this.overflowEvents >= MAX_OVERFLOW_TAG_EVENTS) {
+          this.overflowHalted = true;
+          this.pause();
+        }
+        return;
+      }
+    }
+    this.currentOpenOverflowed = false;
+    super.onopentagname(start, endIndex);
+  }
+
+  override onselfclosingtag(endIndex: number): void {
+    if (this.currentOpenOverflowed) {
+      this.currentOpenOverflowed = false;
+      if (this.overflowInForeign) {
+        this.overflowDepth = Math.max(0, this.overflowDepth - 1);
+      }
+      this.startIndex = endIndex + 1;
+      return;
+    }
+    super.onselfclosingtag(endIndex);
+  }
+
+  override onclosetag(start: number, endIndex: number): void {
+    this.currentOpenOverflowed = false;
+    if (this.overflowDepth > 0) {
+      this.endIndex = endIndex;
+      if (!isVoidElementSpan(this.sourceHtml, start, endIndex, this.overflowInForeign)) {
+        this.overflowDepth--;
+      }
+      this.startIndex = endIndex + 1;
+      return;
+    }
+    super.onclosetag(start, endIndex);
+  }
+}
+
+function buildBoundedDomDocument(html: string): Document {
+  const root = new Document([]);
+  const stack: Array<Document | Element> = [root];
+  let nodeCount = 0;
+  let halted = false;
+
+  const appendChildLinear = (parent: Document | Element, child: ChildNode) => {
+    const siblings = parent.children;
+    const prev = siblings.length > 0 ? siblings[siblings.length - 1]! : null;
+    child.parent = parent;
+    child.prev = prev;
+    child.next = null;
+    if (prev) prev.next = child;
+    siblings.push(child);
+  };
+
+  let parserRef: BoundedHtmlParser | null = null;
+  const haltParser = () => {
+    halted = true;
+    parserRef?.pause();
+  };
+
+  const parser = new BoundedHtmlParser(
+    html,
+    {
+      onopentag(name, attribs) {
+        if (halted) return;
+        if (nodeCount >= MAX_DOM_NODES) {
+          haltParser();
+          return;
+        }
+        if (stack.length - 1 < MAX_DOM_DEPTH) {
+          const el = new Element(name, attribs, []);
+          appendChildLinear(stack[stack.length - 1]!, el);
+          stack.push(el);
+          nodeCount++;
+        }
+      },
+      ontext(data) {
+        if (halted || !data) return;
+        const parent = stack[stack.length - 1]!;
+        const siblings = parent.children;
+        const last = siblings.length > 0 ? siblings[siblings.length - 1]! : null;
+        if (last && isText(last)) {
+          last.data += data;
+          return;
+        }
+        if (nodeCount >= MAX_DOM_NODES) {
+          haltParser();
+          return;
+        }
+        appendChildLinear(parent, new Text(data));
+        nodeCount++;
+      },
+      onclosetag() {
+        if (halted) return;
+        if (stack.length > 1) {
+          stack.pop();
+        }
+      },
+    },
+    {
+      decodeEntities: true,
+      lowerCaseTags: true,
+      lowerCaseAttributeNames: true,
+    },
+  );
+  parserRef = parser;
+  parser.end(html);
+  return root;
+}
+
+type WalkDirective = boolean | 'skip' | void;
+
+function walkSubtreeElements(
+  root: Document | Element,
+  budget: VisitBudget,
+  visit: (el: Element) => WalkDirective,
+): void {
+  if (budget.remaining <= 0) return;
   const stack: ChildNode[] = [];
   for (let i = root.children.length - 1; i >= 0; i--) {
     stack.push(root.children[i]!);
   }
   while (stack.length > 0) {
+    if (budget.remaining <= 0) return;
     const cur = stack.pop()!;
     if (!isTag(cur)) continue;
-    if (visit(cur) === false) return;
+    budget.remaining--;
+    const res = visit(cur);
+    if (res === false) return;
+    if (res === 'skip') continue;
     for (let i = cur.children.length - 1; i >= 0; i--) {
       stack.push(cur.children[i]!);
     }
   }
 }
 
+function chargeSerializeBudget(nodes: readonly ChildNode[], budget: VisitBudget): boolean {
+  if (budget.remaining <= 0) return false;
+  const stack: ChildNode[] = [];
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    stack.push(nodes[i]!);
+  }
+  let count = 0;
+  while (stack.length > 0) {
+    if (budget.remaining <= 0 || count >= MAX_SERIALIZE_NODES_PER_CALL) return false;
+    const cur = stack.pop()!;
+    budget.remaining--;
+    count++;
+    if (isTag(cur)) {
+      for (let i = cur.children.length - 1; i >= 0; i--) {
+        stack.push(cur.children[i]!);
+      }
+    }
+  }
+  return true;
+}
+
 export class HtmlNode {
   public readonly tag: string;
+  protected readonly budget: VisitBudget;
 
-  constructor(protected readonly node: Document | Element) {
+  constructor(
+    protected readonly node: Document | Element,
+    budget?: VisitBudget,
+  ) {
     this.tag = isTag(node) ? node.name.toLowerCase() : '';
+    this.budget = budget ?? { remaining: MAX_DOC_TOTAL_VISITS };
   }
 
   /** Selects up to `limit` matching descendant `HtmlNode`s in DOM document order (`O(N)` bounded CSS engine). */
   select(selector: string, limit = 500): HtmlNode[] {
     const cappedLimit = Math.max(0, Math.min(MAX_SELECT_LIMIT, Math.floor(limit)));
-    if (cappedLimit === 0) return [];
+    if (cappedLimit === 0 || this.budget.remaining <= 0) return [];
     const chains = parseSelector(selector);
     if (!chains) return [];
 
-    const memosByChain = chains.map((c) => c.map(() => new Set<Element>()));
+    const memosByChain: ChainMemo[] = chains.map((c) => ({
+      step: c.map(() => new Map<Element, boolean>()),
+      anc: c.map(() => new Map<Element, boolean>()),
+    }));
     const results: HtmlNode[] = [];
 
-    walkSubtreeElements(this.node, (el) => {
+    walkSubtreeElements(this.node, this.budget, (el) => {
       for (let g = 0; g < chains.length; g++) {
         const steps = chains[g]!;
         if (matchesChainAtStep(el, steps, steps.length - 1, this.node, memosByChain[g]!)) {
-          results.push(new HtmlNode(el));
+          results.push(new HtmlNode(el, this.budget));
           if (results.length >= cappedLimit) return false;
           break;
         }
@@ -604,7 +973,7 @@ export class HtmlNode {
       const target = this.first(subSelector);
       return target ? target.text() : '';
     }
-    return extractCleanNodeText(this.node);
+    return extractCleanNodeText(this.node, this.budget);
   }
 
   /**
@@ -616,11 +985,14 @@ export class HtmlNode {
       const target = this.first(subSelector);
       return target ? target.html() : '';
     }
-    return this.node.children.length > 0 ? render(this.node.children) : '';
+    if (this.node.children.length === 0) return '';
+    if (!chargeSerializeBudget(this.node.children, this.budget)) return '';
+    return render(this.node.children);
   }
 
   /** Returns serialized outer HTML of this node via `dom-serializer`. */
   outerHtml(): string {
+    if (!chargeSerializeBudget([this.node as unknown as ChildNode], this.budget)) return '';
     return render(this.node);
   }
 
@@ -643,28 +1015,37 @@ export class HtmlNode {
     const containers = subSelector !== undefined ? this.select(subSelector, 200) : [this];
     const out: Record<string, string> = {};
     let count = 0;
+    let visits = 0;
+    const seenElements = new Set<Element>();
 
     for (const container of containers) {
+      if (isTag(container.node) && seenElements.has(container.node)) continue;
       let pendingKey = '';
-      walkSubtreeElements(container.node, (el) => {
+      walkSubtreeElements(container.node, this.budget, (el) => {
+        if (++visits > MAX_DLMAP_VISITS) return false;
+        seenElements.add(el);
         const t = el.name.toLowerCase();
         if (t === 'dt') {
-          pendingKey = extractCleanNodeText(el)
-            .toLowerCase()
-            .replace(/[:：\s]+$/, '')
-            .trim();
-        } else if (t === 'dd' && pendingKey) {
-          const val = extractCleanNodeText(el);
-          if (val && !(pendingKey in out)) {
-            out[pendingKey] = val;
-            count++;
-            if (count >= 200) return false;
+          pendingKey = stripTrailingColonsAndWhitespace(
+            extractCleanNodeText(el, this.budget).toLowerCase(),
+          );
+          return 'skip';
+        }
+        if (t === 'dd') {
+          if (pendingKey) {
+            const val = extractCleanNodeText(el, this.budget);
+            if (val && !(pendingKey in out)) {
+              out[pendingKey] = val;
+              count++;
+              if (count >= 200) return false;
+            }
+            pendingKey = '';
           }
-          pendingKey = '';
+          return 'skip';
         }
         return undefined;
       });
-      if (count >= 200) break;
+      if (count >= 200 || visits > MAX_DLMAP_VISITS || this.budget.remaining <= 0) break;
     }
 
     return out;
@@ -678,28 +1059,25 @@ export class HtmlNode {
     const rows: string[][] = [];
     const rootIsTable = isTag(target.node) && target.node.name.toLowerCase() === 'table';
 
-    walkSubtreeElements(target.node, (el) => {
-      if (el.name.toLowerCase() !== 'tr') return undefined;
-      if (rootIsTable) {
-        let p = el.parent;
-        while (p && p !== target.node) {
-          if (isTag(p) && p.name.toLowerCase() === 'table') return undefined;
-          p = p.parent;
-        }
+    walkSubtreeElements(target.node, this.budget, (el) => {
+      const tagLower = el.name.toLowerCase();
+      if (rootIsTable && tagLower === 'table') {
+        return 'skip';
       }
+      if (tagLower !== 'tr') return undefined;
       const cells: string[] = [];
       for (const child of el.children) {
         if (!isTag(child)) continue;
         const ct = child.name.toLowerCase();
         if (ct === 'td' || ct === 'th') {
-          cells.push(extractCleanNodeText(child));
+          cells.push(extractCleanNodeText(child, this.budget));
         }
       }
       if (cells.length > 0 && cells.some((c) => c.length > 0)) {
         rows.push(cells);
         if (rows.length >= 500) return false;
       }
-      return undefined;
+      return rootIsTable ? 'skip' : undefined;
     });
 
     return rows;
@@ -709,17 +1087,29 @@ export class HtmlNode {
 export class HtmlDoc extends HtmlNode {
   public readonly root: Document;
 
-  constructor(root: Document) {
-    super(root);
+  constructor(root: Document, budget?: VisitBudget) {
+    super(root, budget);
     this.root = root;
   }
 }
 
 /**
- * Parses `rawHtml` (capped to `maxChars`, default `2 MiB`) into a linear-time queryable `HtmlDoc`.
+ * Parses `rawHtml` (capped to `maxChars`, default `2 MiB`, hard ceiling `4 MiB`) into a linear-time queryable `HtmlDoc`.
  */
 export function parseHtmlDoc(rawHtml: string, maxChars = DEFAULT_MAX_HTML_DOC_CHARS): HtmlDoc {
-  const safeHtml =
-    typeof rawHtml === 'string' ? (rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml) : '';
-  return new HtmlDoc(parseDocument(safeHtml));
+  const effectiveMax =
+    Number.isFinite(maxChars) && maxChars > 0
+      ? Math.min(HARD_MAX_HTML_DOC_CHARS, Math.floor(maxChars))
+      : DEFAULT_MAX_HTML_DOC_CHARS;
+  let safeHtml =
+    typeof rawHtml === 'string'
+      ? rawHtml.length > effectiveMax
+        ? rawHtml.slice(0, effectiveMax)
+        : rawHtml
+      : '';
+  if (safeHtml.includes('\0') || safeHtml.includes('&#')) {
+    safeHtml = safeHtml.replace(/\0|&#(?:0+|x0+);/gi, '');
+  }
+  const doc = buildBoundedDomDocument(safeHtml);
+  return new HtmlDoc(doc);
 }

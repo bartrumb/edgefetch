@@ -1,0 +1,76 @@
+# Shared Go + TypeScript Declarative Site Adapter: Teamtailor Career Portals
+id: teamtailor
+name: Teamtailor Career Portals
+category: jobs
+description: "Upgrades <org>[.na].teamtailor.com career roots to their /jobs.rss feed with locations and departments."
+domains:
+  - "*.teamtailor.com"
+exampleUrls:
+  - "https://acme.teamtailor.com/"
+  - "https://acme.na.teamtailor.com/jobs"
+
+# Matches <org>[.<region>].teamtailor.com/ or /jobs while skipping www/app/career
+match:
+  hostSubdomain:
+    suffix: .teamtailor.com
+    param: org
+    stripOptional2LetterRegion: true
+    reserved:
+      - www
+      - app
+      - career
+  pathSegments:
+    - param: jobsLit
+      charset: alnum
+      allowValues:
+        - jobs
+      optional: true
+
+twin:
+  id: teamtailor
+  fetchUrl: "https://{host}/jobs.rss"
+  kind: text
+  accept: application/rss+xml
+
+extract:
+  xml:
+    mode: items_table
+    requireAnyTags:
+      - rss
+      - channel
+    itemTag: item
+    channelTitleFallbackParam: org
+    titleTemplate: "{channelTitle} — Open Roles ({itemCount})"
+    emptyText: "No open positions currently listed."
+    limit: 100
+    requireItemVar: jTitle
+    collectLinkVar: jLink
+    itemVars:
+      jTitle:
+        tags: [title]
+      jLink:
+        tags: [link]
+      dept:
+        tags:
+          - "tt:department"
+          - category
+        default: "-"
+      loc:
+        tags:
+          - "tt:location"
+          - "g:location"
+          - location
+        default: "-"
+      pubDate:
+        tags: [pubDate]
+        sliceMax: 16
+        default: "-"
+    columns:
+      - header: Role
+        template: "[{jTitle}]({jLink})"
+      - header: Department
+        template: "{dept}"
+      - header: Location
+        template: "{loc}"
+      - header: Published
+        template: "{pubDate}"

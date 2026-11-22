@@ -12,6 +12,15 @@
  */
 
 import { validatePublicHttpsTargetUrl } from './overflow';
+import {
+  getActiveRequestTracer,
+  sanitizeErrorMessageForSpan,
+  sanitizeUrlForSpan,
+  type ActiveSpanHandle,
+  type RequestTracer,
+  type SpanAttributes,
+  type TraceContext,
+} from './otel';
 import { asciiLower, safeDecodeURIComponent } from './safe-input';
 
 const MAX_LLM_RESPONSE_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on LLM API JSON responses (H5)
@@ -309,24 +318,180 @@ function isOfflineHost(urlStr: string): boolean {
   }
 }
 
-export function redactLlmConfigForLog(cfg: ResolvedLlmConfig | null): Record<string, unknown> | undefined {
-  if (!cfg) return undefined;
-  let safeBaseUrl = cfg.baseUrl;
-  if (!safeBaseUrl.startsWith('workers-ai://')) {
-    try {
-      const u = new URL(safeBaseUrl);
-      u.username = '';
-      u.password = '';
-      u.search = '';
-      u.hash = '';
-      safeBaseUrl = trimTrailingSlashes(u.toString());
-    } catch {
-      safeBaseUrl = safeBaseUrl.replace(/^(https?:\/\/)[^/@\s]+@/i, '$1').replace(/[?#].*$/, '');
+const SECRET_PRECEDING_PATH_SEGMENTS = new Set([
+  'tok',
+  'token',
+  'tokens',
+  'key',
+  'keys',
+  'apikey',
+  'api-key',
+  'api_key',
+  'secret',
+  'secrets',
+  'auth',
+  'bearer',
+  'sig',
+  'signature',
+]);
+
+const MULTI_SEGMENT_SECRET_ROOTS = new Set(['services', 'webhooks', 'webhook']);
+
+const SAFE_RPC_COLON_SUFFIXES = new Set([
+  'generatecontent',
+  'streamgeneratecontent',
+  'batchgeneratecontent',
+  'counttokens',
+  'embedcontent',
+  'batchembedcontents',
+  'predict',
+  'streamrawpredict',
+  'rawpredict',
+]);
+
+const SAFE_BENIGN_LONG_SEGMENTS = new Set([
+  'streamgeneratecontent',
+  'batchgeneratecontent',
+  'batchembedcontents',
+  'generatecontent',
+  'transcriptions',
+  'classifications',
+  'chatcompletions',
+  'fine_tuning',
+]);
+
+const KNOWN_KEY_PREFIX_RE =
+  /^(?:sk-[A-Za-z0-9_-]{4,}|AIza[A-Za-z0-9_-]{6,}|gsk_[A-Za-z0-9_-]{6,}|xox[abprs]-[A-Za-z0-9-]{6,}|gh[pousr]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}|glpat-[A-Za-z0-9_-]{6,}|hf_[A-Za-z0-9]{6,}|r8_[A-Za-z0-9]{6,}|ef[acr]_[A-Za-z0-9_-]{6,})$/;
+
+function redactSinglePathSegment(seg: string): string {
+  if (!seg) return seg;
+  const decoded = safeDecodeURIComponent(seg) ?? seg;
+
+  // Matrix/semicolon parameters (`v1;key=SECRET`)
+  if (decoded.includes(';')) {
+    const semiIdx = decoded.indexOf(';');
+    const head = decoded.slice(0, semiIdx);
+    return `${head ? redactSinglePathSegment(head) : ''};[REDACTED]`;
+  }
+
+  // Inline `key=SECRET` path segment
+  if (decoded.includes('=')) {
+    return '[REDACTED]';
+  }
+
+  // Colon suffix (`models/gemini-2.5-flash:generateContent` vs `:AIzaSecret` / `:key`)
+  const colonIdx = decoded.indexOf(':');
+  if (colonIdx >= 0) {
+    const lhs = decoded.slice(0, colonIdx);
+    const rhs = decoded.slice(colonIdx + 1);
+    if (rhs && SAFE_RPC_COLON_SUFFIXES.has(rhs.toLowerCase())) {
+      return `${lhs ? redactSinglePathSegment(lhs) : ''}:${rhs}`;
+    }
+    return lhs ? `${redactSinglePathSegment(lhs)}:[REDACTED]` : '[REDACTED]';
+  }
+
+  if (KNOWN_KEY_PREFIX_RE.test(decoded)) {
+    return '[REDACTED]';
+  }
+
+  const lower = decoded.toLowerCase();
+  if (SAFE_BENIGN_LONG_SEGMENTS.has(lower)) {
+    return seg;
+  }
+
+  // High-entropy or hex/base64url path tokens `>= 16` chars (e.g., `/v1beta/<32-char-token>`, `/acct/<hex-secret>`),
+  // while preserving lowercase model identifiers containing semver dots or hyphens (`gemini-2.5-flash`, `gpt-4o-2024-08-06`).
+  if (decoded.length >= 16 && !decoded.includes('.')) {
+    const isHex16 = /^[0-9a-fA-F]{16,}$/.test(decoded);
+    const hasUpperLowerDigit = /[0-9]/.test(decoded) && /[A-Z]/.test(decoded) && /[a-z]/.test(decoded);
+    const isLongCompactToken = decoded.length >= 24 && !decoded.includes('-') && /[A-Za-z]/.test(decoded) && /[0-9_]/.test(decoded);
+    if (isHex16 || hasUpperLowerDigit || isLongCompactToken) {
+      return '[REDACTED]';
     }
   }
+
+  return seg;
+}
+
+export function redactLlmUrlForLog(rawUrl: string): string {
+  if (!rawUrl || rawUrl.startsWith('workers-ai://')) return rawUrl;
+  try {
+    const u = new URL(rawUrl);
+    u.username = '';
+    u.password = '';
+    u.search = '';
+    u.hash = '';
+    const rawSegs = u.pathname.split('/');
+    const redactedSegs: string[] = [];
+    let redactNextSingle = false;
+    let redactRemainingWebhookTail = false;
+    for (let i = 0; i < rawSegs.length; i++) {
+      const seg = rawSegs[i]!;
+      if (i === 0 || seg === '') {
+        redactedSegs.push(seg);
+        continue;
+      }
+      const lowerSeg = (safeDecodeURIComponent(seg) ?? seg).toLowerCase();
+      if (redactRemainingWebhookTail) {
+        redactedSegs.push('[REDACTED]');
+        continue;
+      }
+      if (redactNextSingle) {
+        redactNextSingle = false;
+        redactedSegs.push('[REDACTED]');
+        continue;
+      }
+      if (MULTI_SEGMENT_SECRET_ROOTS.has(lowerSeg)) {
+        redactedSegs.push(seg);
+        redactRemainingWebhookTail = true;
+        continue;
+      }
+      if (SECRET_PRECEDING_PATH_SEGMENTS.has(lowerSeg)) {
+        redactedSegs.push(seg);
+        redactNextSingle = true;
+        continue;
+      }
+      redactedSegs.push(redactSinglePathSegment(seg));
+    }
+    const rebuiltPath = redactedSegs.join('/');
+    const originStr = u.origin;
+    return trimTrailingSlashes(`${originStr}${rebuiltPath}`);
+  } catch {
+    return rawUrl.replace(/^(https?:\/\/)[^/@\s]+@/i, '$1').replace(/[?#].*$/, '');
+  }
+}
+
+function redactHeadersForLog(rawHeaders: unknown): Record<string, string> | undefined {
+  if (!rawHeaders || typeof rawHeaders !== 'object') return undefined;
+  const out: Record<string, string> = {};
+  const entries: Array<[string, string]> = [];
+  if (typeof (rawHeaders as Headers).forEach === 'function') {
+    (rawHeaders as Headers).forEach((v, k) => entries.push([k, v]));
+  } else if (!Array.isArray(rawHeaders)) {
+    for (const [k, v] of Object.entries(rawHeaders as Record<string, unknown>)) {
+      if (v !== undefined && v !== null) entries.push([k, String(v)]);
+    }
+  }
+  const SENSITIVE_HDR_RE = /authorization|api[-_]?key|token|secret|cookie|sig|signature|password|credential/i;
+  const SENSITIVE_VAL_RE = /^(?:Bearer|Basic|Digest|Token)\s+|^(?:sk-|AIza|gsk_|gh[pousr]_|xox[abprs]-|glpat-|hf_)/i;
+  for (const [k, v] of entries) {
+    out[k] = SENSITIVE_HDR_RE.test(k) || SENSITIVE_VAL_RE.test(v.trim()) ? '[REDACTED]' : v;
+  }
+  return out;
+}
+
+export function redactLlmConfigForLog(
+  cfg: (ResolvedLlmConfig & { endpoint?: string; headers?: unknown }) | null,
+): Record<string, unknown> | undefined {
+  if (!cfg) return undefined;
+  const safeBaseUrl = redactLlmUrlForLog(cfg.baseUrl);
+  const safeEndpoint = typeof cfg.endpoint === 'string' ? redactLlmUrlForLog(cfg.endpoint) : undefined;
+  const safeHeaders = cfg.headers !== undefined ? redactHeadersForLog(cfg.headers) : undefined;
   return {
     provider: cfg.provider,
     baseUrl: safeBaseUrl,
+    ...(safeEndpoint !== undefined ? { endpoint: safeEndpoint } : {}),
+    ...(safeHeaders !== undefined ? { headers: safeHeaders } : {}),
     model: cfg.model,
     isOfflineLocal: cfg.isOfflineLocal,
     hasApiKey: Boolean(cfg.apiKey),
@@ -706,6 +871,8 @@ export async function completeLlmTurn(params: {
   maxTokens?: number;
   timeoutMs?: number;
   fetchFn?: typeof fetch;
+  tracer?: RequestTracer | TraceContext;
+  traceAttributes?: SpanAttributes;
 }): Promise<LlmChatCompletionResult> {
   const {
     config,
@@ -718,9 +885,12 @@ export async function completeLlmTurn(params: {
   } = params;
   const fetchFn = params.fetchFn ?? config.safeFetch ?? fetch;
   const allowedNames = new Set(tools.map((t) => t.name));
+  const activeTracer = getActiveRequestTracer(params.tracer);
 
+  const runTurn = async (span?: ActiveSpanHandle): Promise<LlmChatCompletionResult> => {
   // ── 1. Cloudflare Workers AI (`env.AI`) ──
   if (config.provider === 'workers-ai' && config.workersAi) {
+    span?.setAttribute('url.full', 'workers-ai://binding');
     try {
       const cfMessages = messages.map((m) => {
         if (m.role === 'tool') {
@@ -786,6 +956,8 @@ export async function completeLlmTurn(params: {
       }
     }
     const endpoint = appendEndpointToBaseUrl(config.baseUrl, '/messages', '/messages');
+    span?.setAttribute('url.full', sanitizeUrlForSpan(endpoint));
+    span?.setAttribute('http.request.method', 'POST');
     try {
       const res = await fetchFn(endpoint, {
         method: 'POST',
@@ -813,6 +985,7 @@ export async function completeLlmTurn(params: {
         redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
+      span?.setAttribute('http.response.status_code', res.status);
       if (res.status >= 300 && res.status < 400) {
         await res.body?.cancel().catch(() => undefined);
         return { ok: false, content: '', toolCalls: [], error: `Anthropic endpoint returned disallowed redirect HTTP ${res.status}` };
@@ -893,6 +1066,8 @@ export async function completeLlmTurn(params: {
     }
     const cleanModel = config.model.replace(/^models\//, '');
     const endpoint = appendEndpointToBaseUrl(config.baseUrl, `/models/${encodeURIComponent(cleanModel)}:generateContent`);
+    span?.setAttribute('url.full', sanitizeUrlForSpan(endpoint));
+    span?.setAttribute('http.request.method', 'POST');
     try {
       const res = await fetchFn(endpoint, {
         method: 'POST',
@@ -925,6 +1100,7 @@ export async function completeLlmTurn(params: {
         redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
+      span?.setAttribute('http.response.status_code', res.status);
       if (res.status >= 300 && res.status < 400) {
         await res.body?.cancel().catch(() => undefined);
         return { ok: false, content: '', toolCalls: [], error: `Gemini endpoint returned disallowed redirect HTTP ${res.status}` };
@@ -990,6 +1166,8 @@ export async function completeLlmTurn(params: {
   });
 
   const endpoint = appendEndpointToBaseUrl(config.baseUrl, '/chat/completions', '/chat/completions');
+  span?.setAttribute('url.full', sanitizeUrlForSpan(endpoint));
+  span?.setAttribute('http.request.method', 'POST');
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (config.apiKey) {
     headers.authorization = `Bearer ${config.apiKey}`;
@@ -1022,6 +1200,7 @@ export async function completeLlmTurn(params: {
       redirect: 'manual',
       signal: AbortSignal.timeout(timeoutMs),
     });
+    span?.setAttribute('http.response.status_code', res.status);
     if (res.status >= 300 && res.status < 400) {
       await res.body?.cancel().catch(() => undefined);
       return { ok: false, content: '', toolCalls: [], error: `${config.provider} endpoint returned disallowed redirect HTTP ${res.status}` };
@@ -1081,6 +1260,37 @@ export async function completeLlmTurn(params: {
   } catch (err) {
     return { ok: false, content: '', toolCalls: [], error: err instanceof Error ? err.message : String(err) };
   }
+  };
+
+  if (!activeTracer) {
+    return runTurn();
+  }
+  return activeTracer.withSpan(
+    'edgefetch.llm.turn',
+    {
+      kind: 3,
+      attributes: {
+        'gen_ai.system': config.provider,
+        'gen_ai.request.model': config.model,
+        'edgefetch.llm.is_offline_local': config.isOfflineLocal,
+        ...(params.traceAttributes ?? {}),
+      },
+    },
+    async (span) => {
+      const out = await runTurn(span);
+      span.setAttribute('edgefetch.llm.tool_call_count', out.toolCalls.length);
+      span.setAttribute('edgefetch.llm.has_text', Boolean(out.content));
+      if (out.usage) {
+        if (out.usage.promptTokens !== undefined) span.setAttribute('gen_ai.usage.input_tokens', out.usage.promptTokens);
+        if (out.usage.completionTokens !== undefined) span.setAttribute('gen_ai.usage.output_tokens', out.usage.completionTokens);
+        if (out.usage.totalTokens !== undefined) span.setAttribute('gen_ai.usage.total_tokens', out.usage.totalTokens);
+      }
+      if (!out.ok) {
+        span.setStatus(false, sanitizeErrorMessageForSpan(out.error, 'llm_error'));
+      }
+      return out;
+    },
+  );
 }
 
 /**
@@ -1160,8 +1370,9 @@ export async function summarizeMarkdownWithOptionalLlm(params: {
   title?: string;
   llmConfig: ResolvedLlmConfig | null;
   fetchFn?: typeof fetch;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ summary: string; viaLlm: boolean }> {
-  const { markdown, title, llmConfig, fetchFn } = params;
+  const { markdown, title, llmConfig, fetchFn, tracer } = params;
   if (llmConfig && markdown.trim().length > 0) {
     const res = await completeLlmTurn({
       config: llmConfig,
@@ -1180,6 +1391,7 @@ export async function summarizeMarkdownWithOptionalLlm(params: {
       temperature: 0.1,
       timeoutMs: 25_000,
       ...(fetchFn ? { fetchFn } : {}),
+      ...(tracer ? { tracer } : {}),
     });
     if (res.ok && res.content.trim().length >= 20) {
       return { summary: res.content.trim(), viaLlm: true };
@@ -1197,8 +1409,9 @@ export async function extractJsonWithOptionalLlm(params: {
   heuristicFallback: Record<string, unknown>;
   llmConfig: ResolvedLlmConfig | null;
   fetchFn?: typeof fetch;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ data: Record<string, unknown>; viaLlm: boolean }> {
-  const { markdown, title, url, prompt, schema, heuristicFallback, llmConfig, fetchFn } = params;
+  const { markdown, title, url, prompt, schema, heuristicFallback, llmConfig, fetchFn, tracer } = params;
   if (!llmConfig || !markdown.trim()) {
     return { data: heuristicFallback, viaLlm: false };
   }
@@ -1227,6 +1440,7 @@ export async function extractJsonWithOptionalLlm(params: {
     temperature: 0,
     timeoutMs: 30_000,
     ...(fetchFn ? { fetchFn } : {}),
+    ...(tracer ? { tracer } : {}),
   });
   if (res.ok) {
     const parsed = parseLooseJsonObject(res.content);

@@ -27,6 +27,7 @@ import {
   type HubFetchExecutor,
 } from './map-crawl';
 import { authorizeMcpRequest, type OAuthStore } from './oauth';
+import { getActiveRequestTracer, type RequestTracer, type TraceContext } from './otel';
 import { readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 import { executeScrapeCall } from './scrape';
 import { executeExtractCall } from './search-index';
@@ -40,8 +41,11 @@ export async function handleCompatRoutes(params: {
   oauthStore: OAuthStore;
   executeHubFetch: HubFetchExecutor;
   waitUntil?: (p: Promise<unknown>) => void;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<Response | null> {
   const { request, url, env, oauthStore, executeHubFetch, waitUntil } = params;
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runCompat = async (): Promise<Response | null> => {
   const p = url.pathname;
   const isDirectFirecrawlV2 = p.startsWith('/v2/');
   const isPrefixedFirecrawlV2 = p.startsWith('/compat/firecrawl/v2/');
@@ -113,6 +117,7 @@ export async function handleCompatRoutes(params: {
       executeHubFetch,
       selfHost: url.hostname,
       source: 'compat:firecrawl:scrape',
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     if (out.status !== 200) {
       return Response.json({ success: false, ...out.body }, { status: out.status });
@@ -126,6 +131,7 @@ export async function handleCompatRoutes(params: {
       executeHubFetch,
       selfHost: url.hostname,
       source: 'compat:firecrawl:map',
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     return Response.json(
       out.status === 200 ? { success: true, links: out.body.links, entries: out.body.entries } : { success: false, ...out.body },
@@ -151,6 +157,7 @@ export async function handleCompatRoutes(params: {
       executeHubFetch,
       selfHost: url.hostname,
       waitUntilBounded: Boolean(waitUntil) && bodyObj.sync !== true,
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     if (bodyObj.sync === true) {
       await jobPromise;
@@ -196,10 +203,12 @@ export async function handleCompatRoutes(params: {
           executeHubFetch,
           selfHost: url.hostname,
           source: 'compat:firecrawl:batch-scrape',
+          ...(activeTracer ? { tracer: activeTracer } : {}),
         });
         return { status: res.status, body: res.body };
       },
       ...(waitUntil ? { waitUntil } : {}),
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     if (!batchOut.ok) {
       return Response.json({ success: false, error: batchOut.error, message: batchOut.message }, { status: batchOut.status });
@@ -245,9 +254,28 @@ export async function handleCompatRoutes(params: {
       env,
       executeHubFetch,
       source: 'compat:firecrawl:search',
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     return Response.json(
       out.status === 200 ? { success: true, data: out.body.results, ...out.body } : { success: false, ...out.body },
+      { status: out.status },
+    );
+  }
+
+  if (fcSubpath === '/extract' && request.method === 'POST') {
+    const out = await executeExtractCall({
+      payload: {
+        ...bodyObj,
+        ...(typeof bodyObj.query !== 'string' && typeof bodyObj.prompt === 'string' ? { query: bodyObj.prompt } : {}),
+      },
+      env,
+      executeHubFetch,
+      selfHost: url.hostname,
+      source: 'compat:firecrawl:extract',
+      ...(activeTracer ? { tracer: activeTracer } : {}),
+    });
+    return Response.json(
+      out.status === 200 ? { success: true, data: out.body, ...out.body } : { success: false, ...out.body },
       { status: out.status },
     );
   }
@@ -268,6 +296,7 @@ export async function handleCompatRoutes(params: {
       principal: auth.ok ? auth.principal : 'compat',
       wantSseStream: wantSse,
       ...(waitUntil ? { waitUntil } : {}),
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     if (out.kind === 'sse') return out.response;
     return Response.json(out.body, { status: out.status });
@@ -313,6 +342,7 @@ export async function handleCompatRoutes(params: {
       env,
       executeHubFetch,
       source: 'compat:tavily:search',
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     return Response.json(out.body, { status: out.status });
   }
@@ -324,6 +354,7 @@ export async function handleCompatRoutes(params: {
       executeHubFetch,
       selfHost: url.hostname,
       source: 'compat:tavily:extract',
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     return Response.json(
       out.status === 200
@@ -339,6 +370,7 @@ export async function handleCompatRoutes(params: {
       executeHubFetch,
       selfHost: url.hostname,
       source: 'compat:tavily:map',
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     return Response.json(
       out.status === 200 ? { base_url: out.body.url, results: out.body.links } : out.body,
@@ -347,4 +379,6 @@ export async function handleCompatRoutes(params: {
   }
 
   return Response.json({ success: false, error: 'not_found' }, { status: 404 });
+  };
+  return activeTracer ? activeTracer.run(runCompat) : runCompat();
 }

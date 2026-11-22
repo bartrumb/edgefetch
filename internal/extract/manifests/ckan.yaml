@@ -1,0 +1,480 @@
+# Shared Go + TypeScript Declarative Site Adapter: CKAN Open Data Portals
+id: ckan
+name: CKAN Open Data Portals (Data.gov, UK, AU, Canada & City Portals)
+category: public-records
+description: Upgrades CKAN open-data portal dataset pages to /api/3/action/package_show JSON with organization, license, and downloadable resources.
+domains:
+  - catalog.data.gov
+  - data.boston.gov
+  - data.sanantonio.gov
+  - data.sanjoseca.gov
+  - data.wprdc.org
+  - data.gov.uk
+  - www.data.gov.uk
+  - data.gov.au
+  - open.canada.ca
+exampleUrls:
+  - https://catalog.data.gov/dataset/electric-vehicle-population-data
+  - https://data.boston.gov/dataset/building-permits
+
+# Four CKAN portal groups with portal-specific dataset prefixes and package_show endpoints
+routes:
+  - match:
+      hosts:
+        - catalog.data.gov
+        - data.boston.gov
+        - data.sanantonio.gov
+        - data.sanjoseca.gov
+        - data.wprdc.org
+      exactSegments: true
+      pathSegments:
+        - dataset
+        - param: pkgId
+          charset: pkg
+          minLen: 2
+          maxLen: 160
+    twin:
+      fetchUrl: "https://{host}/api/3/action/package_show?id={pkgId}"
+      kind: json
+      accept: application/json
+    extract:
+      requireFieldEquals:
+        path: success
+        value: "true"
+      requireAnyFields:
+        - result
+      vars:
+        title:
+          paths:
+            - result.title
+            - result.title.en
+          trim: true
+          fallbackTemplate: "{pkgId}"
+        orgTitle:
+          paths:
+            - result.organization.title
+        license:
+          paths:
+            - result.license_title
+        modified:
+          paths:
+            - result.metadata_modified
+          sliceMax: 10
+        notes:
+          paths:
+            - result.notes
+          format: strip_tags
+        notesShort:
+          paths:
+            - result.notes
+          format: strip_tags
+          sliceMax: 260
+        tags:
+          paths:
+            - result.tags
+          subFieldsJoin:
+            fields:
+              - display_name
+            sep: ""
+            fallbackField: name
+          limit: 12
+          join: ", "
+      titleTemplate: "{title}"
+      descriptionVar: notesShort
+      authorVar: orgTitle
+      publishedTimeVar: modified
+      bullets:
+        - label: Portal
+          template: "`{host}`"
+        - label: Publisher
+          template: "{orgTitle}"
+          whenVar: orgTitle
+        - label: License
+          template: "{license}"
+          whenVar: license
+        - label: Last Updated
+          template: "{modified}"
+          whenVar: modified
+        - label: Tags
+          template: "{tags}"
+          whenVar: tags
+      sections:
+        - heading: Description
+          textVar: notes
+        - heading: Data Resources
+          headingTemplate: "Data Resources ({count})"
+          arrayPath: result.resources
+          limit: 20
+          collectLinkVars:
+            - rUrl
+          itemVars:
+            rName:
+              paths:
+                - name
+                - description
+                - format
+              trim: true
+              default: Resource
+            rUrl:
+              paths:
+                - url
+              requireHttps: true
+            rCell:
+              template: "[{rName}]({rUrl})"
+              whenVars:
+                - rName
+                - rUrl
+              fallbackVar: rName
+            rFmt:
+              paths:
+                - format
+              upper: true
+              default: "-"
+          columns:
+            - header: Resource
+              template: "{rCell}"
+            - header: Format
+              template: "{rFmt}"
+
+  - match:
+      hosts:
+        - data.gov.uk
+        - www.data.gov.uk
+      exactSegments: true
+      pathSegments:
+        - dataset
+        - param: pkgId
+          charset: pkg
+          minLen: 2
+          maxLen: 160
+    twin:
+      fetchUrl: "https://data.gov.uk/api/action/package_show?id={pkgId}"
+      kind: json
+      accept: application/json
+    extract:
+      requireFieldEquals:
+        path: success
+        value: "true"
+      requireAnyFields:
+        - result
+      vars:
+        title:
+          paths:
+            - result.title
+            - result.title.en
+          trim: true
+          fallbackTemplate: "{pkgId}"
+        orgTitle:
+          paths:
+            - result.organization.title
+        license:
+          paths:
+            - result.license_title
+        modified:
+          paths:
+            - result.metadata_modified
+          sliceMax: 10
+        notes:
+          paths:
+            - result.notes
+          format: strip_tags
+        notesShort:
+          paths:
+            - result.notes
+          format: strip_tags
+          sliceMax: 260
+        tags:
+          paths:
+            - result.tags
+          subFieldsJoin:
+            fields:
+              - display_name
+            sep: ""
+            fallbackField: name
+          limit: 12
+          join: ", "
+      titleTemplate: "{title}"
+      descriptionVar: notesShort
+      authorVar: orgTitle
+      publishedTimeVar: modified
+      bullets:
+        - label: Portal
+          template: "`{host}`"
+        - label: Publisher
+          template: "{orgTitle}"
+          whenVar: orgTitle
+        - label: License
+          template: "{license}"
+          whenVar: license
+        - label: Last Updated
+          template: "{modified}"
+          whenVar: modified
+        - label: Tags
+          template: "{tags}"
+          whenVar: tags
+      sections:
+        - heading: Description
+          textVar: notes
+        - heading: Data Resources
+          headingTemplate: "Data Resources ({count})"
+          arrayPath: result.resources
+          limit: 20
+          collectLinkVars:
+            - rUrl
+          itemVars:
+            rName:
+              paths:
+                - name
+                - description
+                - format
+              trim: true
+              default: Resource
+            rUrl:
+              paths:
+                - url
+              requireHttps: true
+            rCell:
+              template: "[{rName}]({rUrl})"
+              whenVars:
+                - rName
+                - rUrl
+              fallbackVar: rName
+            rFmt:
+              paths:
+                - format
+              upper: true
+              default: "-"
+          columns:
+            - header: Resource
+              template: "{rCell}"
+            - header: Format
+              template: "{rFmt}"
+
+  - match:
+      hosts:
+        - data.gov.au
+      exactSegments: true
+      pathSegments:
+        - data
+        - dataset
+        - param: pkgId
+          charset: pkg
+          minLen: 2
+          maxLen: 160
+    twin:
+      fetchUrl: "https://data.gov.au/data/api/3/action/package_show?id={pkgId}"
+      kind: json
+      accept: application/json
+    extract:
+      requireFieldEquals:
+        path: success
+        value: "true"
+      requireAnyFields:
+        - result
+      vars:
+        title:
+          paths:
+            - result.title
+            - result.title.en
+          trim: true
+          fallbackTemplate: "{pkgId}"
+        orgTitle:
+          paths:
+            - result.organization.title
+        license:
+          paths:
+            - result.license_title
+        modified:
+          paths:
+            - result.metadata_modified
+          sliceMax: 10
+        notes:
+          paths:
+            - result.notes
+          format: strip_tags
+        notesShort:
+          paths:
+            - result.notes
+          format: strip_tags
+          sliceMax: 260
+        tags:
+          paths:
+            - result.tags
+          subFieldsJoin:
+            fields:
+              - display_name
+            sep: ""
+            fallbackField: name
+          limit: 12
+          join: ", "
+      titleTemplate: "{title}"
+      descriptionVar: notesShort
+      authorVar: orgTitle
+      publishedTimeVar: modified
+      bullets:
+        - label: Portal
+          template: "`{host}`"
+        - label: Publisher
+          template: "{orgTitle}"
+          whenVar: orgTitle
+        - label: License
+          template: "{license}"
+          whenVar: license
+        - label: Last Updated
+          template: "{modified}"
+          whenVar: modified
+        - label: Tags
+          template: "{tags}"
+          whenVar: tags
+      sections:
+        - heading: Description
+          textVar: notes
+        - heading: Data Resources
+          headingTemplate: "Data Resources ({count})"
+          arrayPath: result.resources
+          limit: 20
+          collectLinkVars:
+            - rUrl
+          itemVars:
+            rName:
+              paths:
+                - name
+                - description
+                - format
+              trim: true
+              default: Resource
+            rUrl:
+              paths:
+                - url
+              requireHttps: true
+            rCell:
+              template: "[{rName}]({rUrl})"
+              whenVars:
+                - rName
+                - rUrl
+              fallbackVar: rName
+            rFmt:
+              paths:
+                - format
+              upper: true
+              default: "-"
+          columns:
+            - header: Resource
+              template: "{rCell}"
+            - header: Format
+              template: "{rFmt}"
+
+  - match:
+      hosts:
+        - open.canada.ca
+      exactSegments: true
+      pathSegments:
+        - data
+        - en
+        - dataset
+        - param: pkgId
+          charset: pkg
+          minLen: 2
+          maxLen: 160
+    twin:
+      fetchUrl: "https://open.canada.ca/data/api/action/package_show?id={pkgId}"
+      kind: json
+      accept: application/json
+    extract:
+      requireFieldEquals:
+        path: success
+        value: "true"
+      requireAnyFields:
+        - result
+      vars:
+        title:
+          paths:
+            - result.title
+            - result.title.en
+          trim: true
+          fallbackTemplate: "{pkgId}"
+        orgTitle:
+          paths:
+            - result.organization.title
+        license:
+          paths:
+            - result.license_title
+        modified:
+          paths:
+            - result.metadata_modified
+          sliceMax: 10
+        notes:
+          paths:
+            - result.notes
+          format: strip_tags
+        notesShort:
+          paths:
+            - result.notes
+          format: strip_tags
+          sliceMax: 260
+        tags:
+          paths:
+            - result.tags
+          subFieldsJoin:
+            fields:
+              - display_name
+            sep: ""
+            fallbackField: name
+          limit: 12
+          join: ", "
+      titleTemplate: "{title}"
+      descriptionVar: notesShort
+      authorVar: orgTitle
+      publishedTimeVar: modified
+      bullets:
+        - label: Portal
+          template: "`{host}`"
+        - label: Publisher
+          template: "{orgTitle}"
+          whenVar: orgTitle
+        - label: License
+          template: "{license}"
+          whenVar: license
+        - label: Last Updated
+          template: "{modified}"
+          whenVar: modified
+        - label: Tags
+          template: "{tags}"
+          whenVar: tags
+      sections:
+        - heading: Description
+          textVar: notes
+        - heading: Data Resources
+          headingTemplate: "Data Resources ({count})"
+          arrayPath: result.resources
+          limit: 20
+          collectLinkVars:
+            - rUrl
+          itemVars:
+            rName:
+              paths:
+                - name
+                - description
+                - format
+              trim: true
+              default: Resource
+            rUrl:
+              paths:
+                - url
+              requireHttps: true
+            rCell:
+              template: "[{rName}]({rUrl})"
+              whenVars:
+                - rName
+                - rUrl
+              fallbackVar: rName
+            rFmt:
+              paths:
+                - format
+              upper: true
+              default: "-"
+          columns:
+            - header: Resource
+              template: "{rCell}"
+            - header: Format
+              template: "{rFmt}"

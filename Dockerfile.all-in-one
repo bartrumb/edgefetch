@@ -3,7 +3,7 @@
 # together with a local Go `edgefetch` worker + Headless Chromium + Poppler PDF — zero Postgres, zero Redis!
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS go-build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.6.2
+ARG BUILD_VERSION=2.6.3
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(go env GOARCH)} go build -tr
 FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS hub-build
 WORKDIR /app/hub
 COPY hub/package.json hub/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY sdk ../sdk
 COPY internal ../internal
 COPY hub/src ./src

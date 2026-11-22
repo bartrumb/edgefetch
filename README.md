@@ -24,7 +24,8 @@ docker compose up --build -d
 # Open http://127.0.0.1:8787/admin and sign in with $CALLER_TOKEN (or configure GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET)
 
 # Option 2 — Standalone ~8 MB Local Go Binary for Claude Code, Claude Desktop, Cursor, Windsurf, Gemini CLI & Codex (zero containers/ports):
-go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest
+brew install bartrumb/tap/edgefetch
+# or with Go: go install github.com/bartrumb/edgefetch/v2/cmd/edgefetch@latest
 edgefetch init && edgefetch doctor && edgefetch update --check
 ```
 

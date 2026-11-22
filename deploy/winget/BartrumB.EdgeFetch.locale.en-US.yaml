@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+PackageIdentifier: BartrumB.EdgeFetch
+PackageVersion: 2.7.0
+PackageLocale: en-US
+Publisher: BartrumB
+PublisherUrl: https://github.com/bartrumb/edgefetch
+PackageName: EdgeFetch
+PackageUrl: https://edgefetch.dev
+License: MIT
+LicenseUrl: https://github.com/bartrumb/edgefetch/blob/main/LICENSE
+ShortDescription: Single-binary polite HTTP/2 + OS-browser Web Scraper, Crawler & Local/Remote MCP Server for AI Agents.
+Tags:
+  - mcp
+  - web-scraping
+  - crawler
+  - markdown
+  - ai-agents
+  - golang
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

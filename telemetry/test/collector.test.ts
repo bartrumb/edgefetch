@@ -323,6 +323,7 @@ test('Collector enforces <= 30 req/min per-IP token-bucket rate limit (including
 
   try {
     // 1. 30 requests across rotating IPv6 interface IDs in the same 2001:db8:abcd:0001::/64 subnet succeed; 31st gets 429!
+    const validRotatingAdapters = ['ashby', 'lever', 'greenhouse', 'workday', 'rippling', 'gem'] as const;
     for (let i = 1; i <= 30; i++) {
       const r = await collectorWorker.fetch(
         new Request('https://telemetry.edgefetch.dev/v1/dev-errors', {
@@ -331,7 +332,7 @@ test('Collector enforces <= 30 req/min per-IP token-bucket rate limit (including
             'content-type': 'application/json',
             'cf-connecting-ip': `2001:db8:abcd:1::${i.toString(16)}`,
           },
-          body: JSON.stringify(sampleValidEvent({ adapterId: `adapter-${(i % 6) + 1}` })),
+          body: JSON.stringify(sampleValidEvent({ adapterId: validRotatingAdapters[i % validRotatingAdapters.length] })),
         }),
         env,
       );
@@ -357,7 +358,7 @@ test('Collector enforces <= 30 req/min per-IP token-bucket rate limit (including
       new Request('https://telemetry.edgefetch.dev/v1/dev-errors', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.77' },
-        body: JSON.stringify(sampleValidEvent({ adapterId: 'adapter-fresh' })),
+        body: JSON.stringify(sampleValidEvent({ adapterId: 'shopify' })),
       }),
       env,
     );

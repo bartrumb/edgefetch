@@ -3402,6 +3402,7 @@ describe('Tier 2 — Area A Boundaries: Portable Hub Tracing, MCP & Ingest', () 
           url: `${hub.baseUrl}/v1/hosts`,
           init: { method: 'GET', headers: {} },
           expectedStatus: 401,
+          unauthSuppressedOtlp: true,
         },
         {
           label: '403',
@@ -3437,6 +3438,18 @@ describe('Tier 2 — Area A Boundaries: Portable Hub Tracing, MCP & Ingest', () 
         });
         assert.equal(res.status, tc.expectedStatus, `expected ${tc.expectedStatus} for ${tc.label}, got ${res.status}`);
         assertTraceHeaders(res, { expectedTraceId: traceId, tag: `[F1/M1 error ${tc.label}]` });
+
+        if (tc.unauthSuppressedOtlp) {
+          // Round 7 H9: unauthenticated / pre-auth 401 & 403 gate rejections preserve response trace headers
+          // while suppressing outbound OTLP collector amplification.
+          await delay(80);
+          assert.equal(
+            collector.findByTraceId(traceId).length,
+            0,
+            `[H9] expected zero OTLP spans for unauthenticated/pre-auth HTTP ${tc.label}`,
+          );
+          continue;
+        }
 
         await collector.waitForSpans((e) => e.some((x) => x.span.traceId === traceId && x.span.name === 'edgefetch.http'));
         const httpSpan = collector.findByTraceId(traceId).find((x) => x.span.name === 'edgefetch.http');

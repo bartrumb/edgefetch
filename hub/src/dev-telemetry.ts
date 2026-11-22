@@ -150,6 +150,9 @@ export const KNOWN_TELEMETRY_MODES: ReadonlySet<string> = new Set([
   'hub',
   'agent',
   'server',
+  'serve',
+  'mcp',
+  'desktop',
   'cli',
   'portable',
   'worker',
@@ -295,6 +298,7 @@ export const KNOWN_TELEMETRY_ADAPTER_IDS: ReadonlySet<string> = new Set([
   'mcp-federated',
   'mediawiki',
   'mkdocs-material',
+  'news-feeds',
   'nextra',
   'nist-nvd',
   'notion',
@@ -386,7 +390,7 @@ export const KNOWN_TELEMETRY_ADAPTER_IDS: ReadonlySet<string> = new Set([
 
 const SAFE_SEMVER_RE = /^(?:\d{1,3}\.\d{1,3}\.\d{1,4}(?:-(?:alpha|beta|rc)(?:\.\d{1,3})?)?|dev|unknown)$/;
 const SAFE_SPAN_NAME_RE =
-  /^(?:edgefetch\.(?:http|scrape|fetch|extract|search|jobs|catalog|map|crawl|interact|agent|mcp|llm|dispatch|admin|oauth|artifacts|hub|spa_fallback|span|cache|overflow|ingest|webhook|capabilities|extractors|hosts)(?:\.[a-z0-9_]{1,24}){0,2}|cache:r2-d1)$/;
+  /^(?:edgefetch\.(?:go|http|scrape|batch_scrape|ingest_tab|fetch|extract|search|collection_search|jobs|catalog|map|crawl|interact|agent|agents|browser|bug_report|mcp|mcp_registry|mcp_query|llm|dispatch|admin|oauth|artifacts|hub|spa_fallback|span|cache|overflow|ingest|webhook|capabilities|extractors|hosts)(?:\.[a-z0-9_]{1,24}){0,2}|cache:(?:r2-d1|private-r2|304))$/;
 
 export function isTruthyTelemetryFlag(raw?: string | null): boolean {
   const clean = (raw ?? '').trim().toLowerCase();

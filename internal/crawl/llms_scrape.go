@@ -466,14 +466,26 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	if err != nil {
 		res.Status = out.Status
 		res.SessionID = out.SessionID
-		if errors.Is(err, browser.ErrChallengeDetected) {
+		res.ActionResults = out.ActionResults
+		switch {
+		case errors.Is(err, browser.ErrChallengeDetected):
 			res.FinalURL = out.FinalURL
 			res.Outcome = classify.OutcomeChallenge
 			res.WAF = classify.ClassifyWAF(http.StatusOK, out.Headers, []byte(out.HTML))
-		} else {
+			res.Problem = RedactEmbeddedURLs(err.Error())
+		case isSSRFBlockError(err):
+			res.Status = 0
+			res.Outcome = classify.OutcomeBlockedSSRF
+			res.BlockedReason = "ssrf"
+			res.Problem = "blocked by SSRF policy: non-public target address"
+		case isDNSNotFoundError(err) || strings.Contains(strings.ToUpper(err.Error()), "ERR_NAME_NOT_RESOLVED"):
+			res.Status = 0
+			res.Outcome = classify.OutcomeDNSNotFound
+			res.Problem = "domain does not exist (DNS NXDOMAIN)"
+		default:
 			res.Outcome = classify.OutcomeError
+			res.Problem = RedactEmbeddedURLs(err.Error())
 		}
-		res.Problem = err.Error()
 		res.DurationMs = c.Now().Sub(started).Milliseconds()
 		return res
 	}
@@ -485,8 +497,9 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 			res.DurationMs = c.Now().Sub(started).Milliseconds()
 			return res
 		} else if aErr := c.allow(finalParsed); aErr != nil {
-			res.Outcome = classify.OutcomeError
-			res.Problem = fmt.Sprintf("rendered finalUrl blocked by SSRF policy: %v", aErr)
+			res.Outcome = classify.OutcomeBlockedSSRF
+			res.BlockedReason = "ssrf"
+			res.Problem = ssrfProblemFromAllowErr(aErr)
 			res.DurationMs = c.Now().Sub(started).Milliseconds()
 			return res
 		}
@@ -523,6 +536,7 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	res.ActionScreenshots = out.ActionScreenshots
 	res.ActionScrapes = out.ActionScrapes
 	res.JavascriptReturns = out.JavascriptReturns
+	res.ActionResults = out.ActionResults
 	res.PDFBase64 = out.PDFBase64
 	res.WAF = classify.ClassifyWAF(res.Status, out.Headers, rawBody)
 	res.Outcome, res.Problem = classify.Classify(classify.KindRender, res.Status, out.Headers, rawBody)

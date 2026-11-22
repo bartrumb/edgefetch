@@ -2394,6 +2394,7 @@ describe('Tier 1 — Area B: Go --mode=hub, --mode=mcp, --mode=agent & Browser R
       env: {
         OTEL_EXPORTER_OTLP_ENDPOINT: collector.endpoint,
         OTEL_SERVICE_NAME: 'edgefetch-serve-render',
+        ...(process.platform === 'linux' ? { EDGEFETCH_ALLOW_NO_SANDBOX: '1' } : {}),
       },
       healthPath: '/health',
     });
@@ -4825,7 +4826,11 @@ print(c.last_trace_id)
       const goServe = await startGoHub({
         bin: goBin,
         args: ['serve', '--port={PORT}', '--allow-private'],
-        env: { OTEL_EXPORTER_OTLP_ENDPOINT: collector.endpoint, OTEL_SERVICE_NAME: 'edgefetch-serve-render' },
+        env: {
+          OTEL_EXPORTER_OTLP_ENDPOINT: collector.endpoint,
+          OTEL_SERVICE_NAME: 'edgefetch-serve-render',
+          ...(process.platform === 'linux' ? { EDGEFETCH_ALLOW_NO_SANDBOX: '1' } : {}),
+        },
         healthPath: '/health',
       });
       try {

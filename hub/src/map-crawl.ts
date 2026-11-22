@@ -4,7 +4,8 @@
  */
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
-import { isSafePublicHostname } from './overflow';
+import { getActiveCallerAuthContext } from './oauth';
+import { cloudflareOverflowFetch, isSafePublicHostname } from './overflow';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type RequestTracer, type TraceContext } from './otel';
 import {
   asciiLower,
@@ -38,7 +39,13 @@ import {
   tryParseJsonPayloadForScrape,
 } from './scrape';
 import { COLLECTION_ID_RE, INTERNAL_COLLECTION_ID_RE } from './search-index';
-import { r2DerivedKey, readVerifiedArtifactFromR2, type ArtifactRetention, type OptionalStorageBindings } from './storage';
+import {
+  r2DerivedKey,
+  readVerifiedArtifactFromR2,
+  sanitizeStorageUserId,
+  type ArtifactRetention,
+  type OptionalStorageBindings,
+} from './storage';
 
 export type HubFetchExecutor = (
   target: 'auto' | 'agent' | 'container',
@@ -1008,6 +1015,7 @@ export interface CrawlJobOptions {
 export interface CrawlWorkflowParams {
   crawlId: string;
   rootUrl: string;
+  options?: CrawlJobOptions;
   selfHost?: string;
 }
 
@@ -1162,16 +1170,56 @@ function pathAllowed(
   return getCompiledCrawlPatternListMatcher(includePaths)(subject);
 }
 
+const crawlsUserIdMigratedDbs = new WeakSet<object>();
+const memberJobRateWindows = new Map<string, { count: number; resetAt: number }>();
+const MAX_MEMBER_JOBS_PER_MINUTE = 20;
+const MAX_MEMBER_ACTIVE_CRAWLS = 4;
+
+async function ensureCrawlsUserIdColumn(metaDb: D1Database): Promise<void> {
+  const key = metaDb as unknown as object;
+  if (crawlsUserIdMigratedDbs.has(key)) return;
+  try {
+    await metaDb.prepare("ALTER TABLE crawls ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'").run();
+  } catch {
+    // Column already exists
+  }
+  await metaDb
+    .prepare('CREATE INDEX IF NOT EXISTS crawls_user_idx ON crawls(user_id, created_at DESC)')
+    .run()
+    .catch(() => undefined);
+  crawlsUserIdMigratedDbs.add(key);
+}
+
+function checkMemberJobRateQuota(bucketKey: string, now: number): boolean {
+  for (const [k, v] of memberJobRateWindows.entries()) {
+    if (v.resetAt <= now) memberJobRateWindows.delete(k);
+  }
+  const cur = memberJobRateWindows.get(bucketKey);
+  if (!cur) {
+    memberJobRateWindows.set(bucketKey, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (cur.count >= MAX_MEMBER_JOBS_PER_MINUTE) {
+    return false;
+  }
+  cur.count++;
+  return true;
+}
+
 export async function createCrawlJob(params: {
   payload: Record<string, unknown>;
   metaDb?: D1Database;
   selfHost?: string;
+  userId?: string;
   now?: number;
 }): Promise<
   | { ok: true; crawlId: string; rootUrl: string; options: CrawlJobOptions }
   | { ok: false; status: number; error: string; message: string }
 > {
   const { payload, metaDb, selfHost, now = Date.now() } = params;
+  const activeAuth = getActiveCallerAuthContext();
+  const effectiveUserId = sanitizeStorageUserId(params.userId ?? activeAuth?.userId ?? 'owner');
+  const isMemberCaller = activeAuth?.role === 'member' || (effectiveUserId !== 'owner' && activeAuth?.role !== 'owner');
   const urlCheck = validatePublicHttpsUrl(payload.url, selfHost);
   if (!urlCheck.ok) {
     return { ok: false, status: 400, error: 'invalid_url', message: urlCheck.message };
@@ -1186,6 +1234,31 @@ export async function createCrawlJob(params: {
   }
   if (!metaDb) {
     return { ok: false, status: 503, error: 'tracking_not_configured', message: 'Async crawl requires META D1 binding' };
+  }
+  await ensureCrawlsUserIdColumn(metaDb);
+
+  if (isMemberCaller) {
+    if (!checkMemberJobRateQuota(`crawl:${effectiveUserId}`, now)) {
+      return {
+        ok: false,
+        status: 429,
+        error: 'rate_limited',
+        message: 'Per-user crawl rate quota exceeded. Please wait before starting additional crawls.',
+      };
+    }
+    const activeRow = await metaDb
+      .prepare("SELECT COUNT(*) AS c FROM crawls WHERE user_id = ? AND status IN ('queued', 'running')")
+      .bind(effectiveUserId)
+      .first<{ c: number }>()
+      .catch(() => null);
+    if ((activeRow?.c ?? 0) >= MAX_MEMBER_ACTIVE_CRAWLS) {
+      return {
+        ok: false,
+        status: 429,
+        error: 'rate_limited',
+        message: `Per-user concurrent crawl limit (${MAX_MEMBER_ACTIVE_CRAWLS}) reached.`,
+      };
+    }
   }
 
   let webhook: WebhookConfig | undefined;
@@ -1254,10 +1327,10 @@ export async function createCrawlJob(params: {
 
   await metaDb
     .prepare(
-      `INSERT INTO crawls (id, root_url, status, options_json, discovered_count, fetched_count, failed_count, created_at, updated_at)
-       VALUES (?, ?, 'queued', ?, 1, 0, 0, ?, ?)`,
+      `INSERT INTO crawls (id, user_id, root_url, status, options_json, discovered_count, fetched_count, failed_count, created_at, updated_at)
+       VALUES (?, ?, ?, 'queued', ?, 1, 0, 0, ?, ?)`,
     )
-    .bind(crawlId, urlCheck.url.toString(), JSON.stringify(storedOptions), now, now)
+    .bind(crawlId, effectiveUserId, urlCheck.url.toString(), JSON.stringify(storedOptions), now, now)
     .run();
 
   return { ok: true, crawlId, rootUrl: urlCheck.url.toString(), options };
@@ -1593,21 +1666,25 @@ export async function getCrawlJobStatus(params: {
   crawlId: string;
   metaDb?: D1Database;
   bucket?: R2Bucket;
+  userId?: string;
   offset?: number;
   limit?: number;
   now?: number;
 }): Promise<{ ok: true; crawl: Record<string, unknown> } | { ok: false; status: number; error: string }> {
   const { crawlId, metaDb, bucket, offset = 0, limit = 25, now = Date.now() } = params;
   if (!metaDb) return { ok: false, status: 503, error: 'tracking_not_configured' };
+  await ensureCrawlsUserIdColumn(metaDb);
+  const effectiveUserId = sanitizeStorageUserId(params.userId ?? getActiveCallerAuthContext()?.userId ?? 'owner');
 
   const row = await metaDb
     .prepare(
-      `SELECT id, root_url, status, options_json, discovered_count, fetched_count, failed_count, created_at, updated_at, finished_at
-       FROM crawls WHERE id = ? LIMIT 1`,
+      `SELECT id, user_id, root_url, status, options_json, discovered_count, fetched_count, failed_count, created_at, updated_at, finished_at
+       FROM crawls WHERE id = ? AND user_id = ? LIMIT 1`,
     )
-    .bind(crawlId)
+    .bind(crawlId, effectiveUserId)
     .first<{
       id: string;
+      user_id?: string;
       root_url: string;
       status: string;
       options_json: string;
@@ -1822,19 +1899,24 @@ export async function getCrawlJobStatus(params: {
   };
 }
 
-export async function cancelCrawlJob(crawlId: string, metaDb?: D1Database): Promise<{ ok: boolean; status: number }> {
+export async function cancelCrawlJob(crawlId: string, metaDb?: D1Database, userId?: string): Promise<{ ok: boolean; status: number }> {
   if (!metaDb) return { ok: false, status: 503 };
+  await ensureCrawlsUserIdColumn(metaDb);
+  const effectiveUserId = sanitizeStorageUserId(userId ?? getActiveCallerAuthContext()?.userId ?? 'owner');
   const now = Date.now();
   const res = await metaDb
     .prepare(
       `UPDATE crawls
        SET status = 'cancelled', updated_at = ?, finished_at = COALESCE(finished_at, ?)
-       WHERE id = ? AND status IN ('queued', 'running')`,
+       WHERE id = ? AND user_id = ? AND status IN ('queued', 'running')`,
     )
-    .bind(now, now, crawlId)
+    .bind(now, now, crawlId, effectiveUserId)
     .run();
   if ((res.meta?.changes ?? 0) === 0) {
-    const exists = await metaDb.prepare('SELECT status FROM crawls WHERE id = ? LIMIT 1').bind(crawlId).first<{ status: string }>();
+    const exists = await metaDb
+      .prepare('SELECT status FROM crawls WHERE id = ? AND user_id = ? LIMIT 1')
+      .bind(crawlId, effectiveUserId)
+      .first<{ status: string }>();
     if (!exists) return { ok: false, status: 404 };
   }
   return { ok: true, status: 200 };
@@ -1850,6 +1932,23 @@ export class CrawlWorkflow extends WorkflowEntrypoint<OptionalStorageBindings, C
         .first<{ status: string }>();
       return row?.status ?? 'missing';
     });
+    if ((status === 'queued' || status === 'running') && event.payload.rootUrl && event.payload.options) {
+      const finalStatus = await step.do('execute-crawl-job', async () => {
+        const out = await executeCrawlJob({
+          crawlId: event.payload.crawlId,
+          rootUrl: event.payload.rootUrl,
+          options: event.payload.options!,
+          env: this.env,
+          ...(event.payload.selfHost ? { selfHost: event.payload.selfHost } : {}),
+          executeHubFetch: async (_target, body) => {
+            const res = await cloudflareOverflowFetch(body, 'EdgeFetch/2.7.1', event.payload.selfHost ?? 'localhost');
+            return { status: res.status, via: 'cf', bodyText: await res.text() };
+          },
+        });
+        return out.status;
+      });
+      return { crawlId: event.payload.crawlId, status: finalStatus };
+    }
     return { crawlId: event.payload.crawlId, status };
   }
 }
@@ -1916,6 +2015,7 @@ export function previewCrawlParams(payload: Record<string, unknown>, selfHost?: 
 
 export interface BatchScrapeJobRecord {
   id: string;
+  userId?: string;
   status: 'scraping' | 'completed' | 'cancelled' | 'failed';
   total: number;
   completed: number;
@@ -1929,21 +2029,55 @@ export interface BatchScrapeJobRecord {
 
 const inMemoryBatchJobs = new Map<string, BatchScrapeJobRecord>();
 const MAX_BATCH_JOBS = 128;
+const MAX_BATCH_JOBS_PER_MEMBER = 16;
+const MAX_ACTIVE_BATCHES_PER_MEMBER = 4;
 
 export async function startOrExecuteBatchScrape(params: {
   payload: Record<string, unknown>;
   selfHost?: string;
+  userId?: string;
   executeScrape: (scrapePayload: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
   waitUntil?: (p: Promise<unknown>) => void;
   tracer?: RequestTracer | TraceContext;
 }): Promise<{ ok: true; status: number; job: BatchScrapeJobRecord } | { ok: false; status: number; error: string; message: string }> {
   const { payload, selfHost, executeScrape, waitUntil } = params;
+  const activeAuth = getActiveCallerAuthContext();
+  const effectiveUserId = sanitizeStorageUserId(params.userId ?? activeAuth?.userId ?? 'owner');
+  const isMemberCaller = activeAuth?.role === 'member' || (effectiveUserId !== 'owner' && activeAuth?.role !== 'owner');
   const activeTracer = getActiveRequestTracer(params.tracer);
   if (!Array.isArray(payload.urls) || payload.urls.length === 0) {
     return { ok: false, status: 400, error: 'missing_urls', message: 'urls must be a non-empty array of public https:// URLs' };
   }
   if (payload.urls.length > 100) {
     return { ok: false, status: 400, error: 'too_many_urls', message: 'maximum 100 URLs per batch/scrape job' };
+  }
+
+  const now = Date.now();
+  for (const [k, existingJob] of inMemoryBatchJobs.entries()) {
+    if (existingJob.expiresAt <= now) inMemoryBatchJobs.delete(k);
+  }
+
+  if (isMemberCaller) {
+    if (!checkMemberJobRateQuota(`batch:${effectiveUserId}`, now)) {
+      return {
+        ok: false,
+        status: 429,
+        error: 'rate_limited',
+        message: 'Per-user batch scrape rate quota exceeded. Please wait before starting more batches.',
+      };
+    }
+    let activeForUser = 0;
+    for (const j of inMemoryBatchJobs.values()) {
+      if ((j.userId ?? 'owner') === effectiveUserId && j.status === 'scraping') activeForUser++;
+    }
+    if (activeForUser >= MAX_ACTIVE_BATCHES_PER_MEMBER) {
+      return {
+        ok: false,
+        status: 429,
+        error: 'rate_limited',
+        message: `Per-user concurrent batch scrape limit (${MAX_ACTIVE_BATCHES_PER_MEMBER}) reached.`,
+      };
+    }
   }
 
   const validUrls: string[] = [];
@@ -1962,9 +2096,16 @@ export async function startOrExecuteBatchScrape(params: {
     }
   }
 
-  const now = Date.now();
   const batchId = `bch_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-  const { urls: _omitUrls, sync: _omitSync, ignoreInvalidURLs: _omitIgnore, maxConcurrency, ...sharedScrapeOpts } = payload;
+  const {
+    urls: _omitUrls,
+    sync: _omitSync,
+    ignoreInvalidURLs: _omitIgnore,
+    interact: _omitInteract,
+    sessionId: _omitSessionId,
+    maxConcurrency,
+    ...sharedScrapeOpts
+  } = payload;
   const concurrency =
     typeof maxConcurrency === 'number' && Number.isFinite(maxConcurrency)
       ? Math.min(8, Math.max(1, Math.floor(maxConcurrency)))
@@ -1972,6 +2113,7 @@ export async function startOrExecuteBatchScrape(params: {
 
   const job: BatchScrapeJobRecord = {
     id: batchId,
+    userId: effectiveUserId,
     status: 'scraping',
     total: validUrls.length,
     completed: 0,
@@ -1983,9 +2125,38 @@ export async function startOrExecuteBatchScrape(params: {
     errors: invalidErrors,
   };
 
+  // Per-tenant batch job retention: evict ONLY this tenant's oldest job first so one user can NEVER evict another tenant's batch job!
+  if (effectiveUserId !== 'owner') {
+    const ownKeys: string[] = [];
+    for (const [k, j] of inMemoryBatchJobs.entries()) {
+      if ((j.userId ?? 'owner') === effectiveUserId) ownKeys.push(k);
+    }
+    while (ownKeys.length >= MAX_BATCH_JOBS_PER_MEMBER) {
+      const victim = ownKeys.shift();
+      if (victim) inMemoryBatchJobs.delete(victim);
+    }
+  }
   if (inMemoryBatchJobs.size >= MAX_BATCH_JOBS) {
-    const oldest = inMemoryBatchJobs.keys().next().value;
-    if (oldest) inMemoryBatchJobs.delete(oldest);
+    // Evict oldest job belonging to the tenant with the most retained jobs
+    const countsByUser = new Map<string, number>();
+    for (const j of inMemoryBatchJobs.values()) {
+      const uid = j.userId ?? 'owner';
+      countsByUser.set(uid, (countsByUser.get(uid) ?? 0) + 1);
+    }
+    let heaviestUser = effectiveUserId;
+    let maxCount = 0;
+    for (const [uid, cnt] of countsByUser.entries()) {
+      if (cnt > maxCount) {
+        maxCount = cnt;
+        heaviestUser = uid;
+      }
+    }
+    for (const [k, j] of inMemoryBatchJobs.entries()) {
+      if ((j.userId ?? 'owner') === heaviestUser) {
+        inMemoryBatchJobs.delete(k);
+        break;
+      }
+    }
   }
   inMemoryBatchJobs.set(batchId, job);
 
@@ -2031,19 +2202,27 @@ export async function startOrExecuteBatchScrape(params: {
   return { ok: true, status: 202, job };
 }
 
-export function getBatchScrapeStatus(batchId: string): BatchScrapeJobRecord | null {
+export function getBatchScrapeStatus(batchId: string, userId?: string): BatchScrapeJobRecord | null {
   const job = inMemoryBatchJobs.get(batchId);
   if (!job) return null;
   if (job.expiresAt <= Date.now()) {
     inMemoryBatchJobs.delete(batchId);
     return null;
   }
+  const effectiveUserId = sanitizeStorageUserId(userId ?? getActiveCallerAuthContext()?.userId ?? 'owner');
+  if ((job.userId ?? 'owner') !== effectiveUserId) {
+    return null;
+  }
   return job;
 }
 
-export function cancelBatchScrape(batchId: string): boolean {
+export function cancelBatchScrape(batchId: string, userId?: string): boolean {
   const job = inMemoryBatchJobs.get(batchId);
   if (!job) return false;
+  const effectiveUserId = sanitizeStorageUserId(userId ?? getActiveCallerAuthContext()?.userId ?? 'owner');
+  if ((job.userId ?? 'owner') !== effectiveUserId) {
+    return false;
+  }
   job.status = 'cancelled';
   job.updatedAt = Date.now();
   return true;

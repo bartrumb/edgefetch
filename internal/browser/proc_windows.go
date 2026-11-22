@@ -18,18 +18,25 @@ import (
 )
 
 var (
-	modKernel32                  = syscall.NewLazyDLL("kernel32.dll")
-	procCreateProcessW           = modKernel32.NewProc("CreateProcessW")
-	procCreateJobObjectW         = modKernel32.NewProc("CreateJobObjectW")
-	procSetInformationJobObject  = modKernel32.NewProc("SetInformationJobObject")
-	procAssignProcessToJobObject = modKernel32.NewProc("AssignProcessToJobObject")
+	modKernel32                           = syscall.NewLazyDLL("kernel32.dll")
+	procCreateProcessW                    = modKernel32.NewProc("CreateProcessW")
+	procResumeThread                      = modKernel32.NewProc("ResumeThread")
+	procInitializeProcThreadAttributeList = modKernel32.NewProc("InitializeProcThreadAttributeList")
+	procUpdateProcThreadAttribute         = modKernel32.NewProc("UpdateProcThreadAttribute")
+	procDeleteProcThreadAttributeList     = modKernel32.NewProc("DeleteProcThreadAttributeList")
+	procCreateJobObjectW                  = modKernel32.NewProc("CreateJobObjectW")
+	procSetInformationJobObject           = modKernel32.NewProc("SetInformationJobObject")
+	procAssignProcessToJobObject          = modKernel32.NewProc("AssignProcessToJobObject")
 
 	winJobHandles sync.Map // pid (int) -> syscall.Handle (JobObject)
 )
 
 const (
+	createSuspended                  = 0x00000004
 	createUnicodeEnvironment         = 0x00000400
+	extendedStartupInfoPresent       = 0x00080000
 	createNoWindow                   = 0x08000000
+	procThreadAttributeHandleList    = 0x00020002
 	jobObjectExtendedLimitInfoClass  = 9
 	jobObjectLimitKillOnJobCloseFlag = 0x00002000
 	ucrtFOpen                        = 0x01
@@ -56,6 +63,11 @@ type startupInfoW struct {
 	StdInput      syscall.Handle
 	StdOutput     syscall.Handle
 	StdErr        syscall.Handle
+}
+
+type startupInfoExW struct {
+	StartupInfo   startupInfoW
+	AttributeList uintptr
 }
 
 type jobObjectBasicLimitInformation struct {
@@ -133,14 +145,17 @@ func encodeWindowsEnvBlock(env []string) []uint16 {
 	return b
 }
 
-func attachKillOnCloseJob(procHandle syscall.Handle) syscall.Handle {
-	job, _, _ := procCreateJobObjectW.Call(0, 0)
+func attachKillOnCloseJob(procHandle syscall.Handle) (syscall.Handle, error) {
+	job, _, createErr := procCreateJobObjectW.Call(0, 0)
 	if job == 0 {
-		return 0
+		if createErr != nil {
+			return 0, fmt.Errorf("CreateJobObjectW: %w", createErr)
+		}
+		return 0, syscall.EINVAL
 	}
 	var info jobObjectExtendedLimitInformation
 	info.BasicLimitInformation.LimitFlags = jobObjectLimitKillOnJobCloseFlag
-	ok, _, _ := procSetInformationJobObject.Call(
+	ok, _, setErr := procSetInformationJobObject.Call(
 		job,
 		jobObjectExtendedLimitInfoClass,
 		uintptr(unsafe.Pointer(&info)),
@@ -148,19 +163,46 @@ func attachKillOnCloseJob(procHandle syscall.Handle) syscall.Handle {
 	)
 	if ok == 0 {
 		_ = syscall.CloseHandle(syscall.Handle(job))
-		return 0
+		if setErr != nil {
+			return 0, fmt.Errorf("SetInformationJobObject: %w", setErr)
+		}
+		return 0, syscall.EINVAL
 	}
-	assigned, _, _ := procAssignProcessToJobObject.Call(job, uintptr(procHandle))
+	assigned, _, assignErr := procAssignProcessToJobObject.Call(job, uintptr(procHandle))
 	if assigned == 0 {
 		_ = syscall.CloseHandle(syscall.Handle(job))
-		return 0
+		if assignErr != nil {
+			return 0, fmt.Errorf("AssignProcessToJobObject: %w", assignErr)
+		}
+		return 0, syscall.EINVAL
 	}
-	return syscall.Handle(job)
+	return syscall.Handle(job), nil
+}
+
+func deduplicateValidHandles(in []syscall.Handle) []syscall.Handle {
+	out := make([]syscall.Handle, 0, len(in))
+	for _, h := range in {
+		if h == 0 || h == syscall.InvalidHandle {
+			continue
+		}
+		dup := false
+		for _, existing := range out {
+			if existing == h {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // startBrowserPipeProcess spawns Chromium on Windows with `--remote-debugging-pipe` by populating UCRT's inherited
-// low-level file descriptor table (`STARTUPINFOW.lpReserved2`) for FDs 0..4 (FD 3 = CDP read, FD 4 = CDP write), so
-// Chromium opens ZERO listening TCP ports on Windows too (eliminating unauthenticated loopback `/json/version`).
+// low-level file descriptor table (`STARTUPINFOW.lpReserved2`) for FDs 0..4 (FD 3 = CDP read, FD 4 = CDP write),
+// scoping handle inheritance strictly to those exact handles via `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and attaching a
+// kill-on-close Job Object while `CREATE_SUSPENDED` BEFORE `ResumeThread` so zero child processes can escape the Job.
 func startBrowserPipeProcess(bin string, args []string, env []string) (*exec.Cmd, *os.File, *os.File, io.ReadCloser, error) {
 	var stderrRead, stderrWrite syscall.Handle
 	if err := syscall.CreatePipe(&stderrRead, &stderrWrite, nil, 0); err != nil {
@@ -191,13 +233,7 @@ func startBrowserPipeProcess(bin string, args []string, env []string) (*exec.Cmd
 		return nil, nil, nil, nil, err
 	}
 
-	var cmdParts []string
-	cmdParts = append(cmdParts, syscall.EscapeArg(bin))
-	for _, a := range args {
-		cmdParts = append(cmdParts, syscall.EscapeArg(a))
-	}
-	cmdLineUTF16, err := syscall.UTF16PtrFromString(strings.Join(cmdParts, " "))
-	if err != nil {
+	closeAllPipes := func() {
 		_ = syscall.CloseHandle(hNull)
 		_ = syscall.CloseHandle(stderrRead)
 		_ = syscall.CloseHandle(stderrWrite)
@@ -205,6 +241,16 @@ func startBrowserPipeProcess(bin string, args []string, env []string) (*exec.Cmd
 		_ = syscall.CloseHandle(toChromeWrite)
 		_ = syscall.CloseHandle(fromChromeRead)
 		_ = syscall.CloseHandle(fromChromeWrite)
+	}
+
+	var cmdParts []string
+	cmdParts = append(cmdParts, syscall.EscapeArg(bin))
+	for _, a := range args {
+		cmdParts = append(cmdParts, syscall.EscapeArg(a))
+	}
+	cmdLineUTF16, err := syscall.UTF16PtrFromString(strings.Join(cmdParts, " "))
+	if err != nil {
+		closeAllPipes()
 		return nil, nil, nil, nil, err
 	}
 	appUTF16, err := syscall.UTF16PtrFromString(bin)
@@ -227,20 +273,50 @@ func startBrowserPipeProcess(bin string, args []string, env []string) (*exec.Cmd
 		putUintptrLE(reserved2[off:off+ptrSize], uintptr(h))
 	}
 
-	var si startupInfoW
-	si.Cb = uint32(unsafe.Sizeof(si))
-	si.Flags = syscall.STARTF_USESTDHANDLES | syscall.STARTF_USESHOWWINDOW
-	si.ShowWindow = syscall.SW_HIDE
-	si.StdInput = hNull
-	si.StdOutput = hNull
-	si.StdErr = stderrWrite
-	si.CbReserved2 = uint16(len(reserved2))
-	si.LpReserved2 = &reserved2[0]
+	inheritList := deduplicateValidHandles([]syscall.Handle{hNull, stderrWrite, toChromeRead, fromChromeWrite})
+	var attrListSize uintptr
+	_, _, _ = procInitializeProcThreadAttributeList.Call(0, 1, 0, uintptr(unsafe.Pointer(&attrListSize)))
+	if attrListSize == 0 {
+		closeAllPipes()
+		return nil, nil, nil, nil, fmt.Errorf("InitializeProcThreadAttributeList returned zero size")
+	}
+	// Allocate pointer-aligned backing buffer for LPPROC_THREAD_ATTRIBUTE_LIST.
+	attrWords := make([]uintptr, (attrListSize+unsafe.Sizeof(uintptr(0))-1)/unsafe.Sizeof(uintptr(0)))
+	attrPtr := uintptr(unsafe.Pointer(&attrWords[0]))
+	if ok, _, initErr := procInitializeProcThreadAttributeList.Call(attrPtr, 1, 0, uintptr(unsafe.Pointer(&attrListSize))); ok == 0 {
+		closeAllPipes()
+		return nil, nil, nil, nil, fmt.Errorf("InitializeProcThreadAttributeList: %w", initErr)
+	}
+	defer procDeleteProcThreadAttributeList.Call(attrPtr)
+
+	if ok, _, updErr := procUpdateProcThreadAttribute.Call(
+		attrPtr,
+		0,
+		procThreadAttributeHandleList,
+		uintptr(unsafe.Pointer(&inheritList[0])),
+		uintptr(len(inheritList))*unsafe.Sizeof(inheritList[0]),
+		0,
+		0,
+	); ok == 0 {
+		closeAllPipes()
+		return nil, nil, nil, nil, fmt.Errorf("UpdateProcThreadAttribute(HANDLE_LIST): %w", updErr)
+	}
+
+	var siEx startupInfoExW
+	siEx.StartupInfo.Cb = uint32(unsafe.Sizeof(siEx))
+	siEx.StartupInfo.Flags = syscall.STARTF_USESTDHANDLES | syscall.STARTF_USESHOWWINDOW
+	siEx.StartupInfo.ShowWindow = syscall.SW_HIDE
+	siEx.StartupInfo.StdInput = hNull
+	siEx.StartupInfo.StdOutput = hNull
+	siEx.StartupInfo.StdErr = stderrWrite
+	siEx.StartupInfo.CbReserved2 = uint16(len(reserved2))
+	siEx.StartupInfo.LpReserved2 = &reserved2[0]
+	siEx.AttributeList = attrPtr
 
 	var pi syscall.ProcessInformation
 
 	syscall.ForkLock.Lock()
-	for _, h := range []syscall.Handle{hNull, stderrWrite, toChromeRead, fromChromeWrite} {
+	for _, h := range inheritList {
 		_ = syscall.SetHandleInformation(h, syscall.HANDLE_FLAG_INHERIT, syscall.HANDLE_FLAG_INHERIT)
 	}
 	for _, h := range []syscall.Handle{stderrRead, toChromeWrite, fromChromeRead} {
@@ -251,13 +327,15 @@ func startBrowserPipeProcess(bin string, args []string, env []string) (*exec.Cmd
 		uintptr(unsafe.Pointer(cmdLineUTF16)),
 		0,
 		0,
-		1, // bInheritHandles = TRUE
-		uintptr(createUnicodeEnvironment|createNoWindow),
+		1, // bInheritHandles = TRUE (strictly bounded to inheritList via PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
+		uintptr(createSuspended|extendedStartupInfoPresent|createUnicodeEnvironment|createNoWindow),
 		uintptr(unsafe.Pointer(&envBlock[0])),
 		0,
-		uintptr(unsafe.Pointer(&si)),
+		uintptr(unsafe.Pointer(&siEx)),
 		uintptr(unsafe.Pointer(&pi)),
 	)
+	// Keep `inheritList` alive past CreateProcessW so the GC cannot collect the backing slice early.
+	_ = inheritList[0]
 	var createErr error
 	if r1 == 0 {
 		if lastErr != nil {
@@ -278,13 +356,32 @@ func startBrowserPipeProcess(bin string, args []string, env []string) (*exec.Cmd
 		_ = syscall.CloseHandle(fromChromeRead)
 		return nil, nil, nil, nil, fmt.Errorf("start chromium: %w", createErr)
 	}
-	_ = syscall.CloseHandle(pi.Thread)
 
 	pid := int(pi.ProcessId)
-	if job := attachKillOnCloseJob(pi.Process); job != 0 {
-		winJobHandles.Store(pid, job)
+	job, jobErr := attachKillOnCloseJob(pi.Process)
+	if jobErr != nil {
+		_ = syscall.TerminateProcess(pi.Process, 1)
+		_ = syscall.CloseHandle(pi.Thread)
+		_ = syscall.CloseHandle(pi.Process)
+		_ = syscall.CloseHandle(stderrRead)
+		_ = syscall.CloseHandle(toChromeWrite)
+		_ = syscall.CloseHandle(fromChromeRead)
+		return nil, nil, nil, nil, fmt.Errorf("attach kill-on-close job before resume: %w", jobErr)
 	}
+	winJobHandles.Store(pid, job)
+
+	resumed, _, resumeErr := procResumeThread.Call(uintptr(pi.Thread))
+	_ = syscall.CloseHandle(pi.Thread)
 	_ = syscall.CloseHandle(pi.Process)
+	if uint32(resumed) == ^uint32(0) {
+		if v, ok := winJobHandles.LoadAndDelete(pid); ok {
+			_ = syscall.CloseHandle(v.(syscall.Handle))
+		}
+		_ = syscall.CloseHandle(stderrRead)
+		_ = syscall.CloseHandle(toChromeWrite)
+		_ = syscall.CloseHandle(fromChromeRead)
+		return nil, nil, nil, nil, fmt.Errorf("ResumeThread: %w", resumeErr)
+	}
 
 	proc, findErr := os.FindProcess(pid)
 	if findErr != nil {

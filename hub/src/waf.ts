@@ -1012,6 +1012,8 @@ export function isEligibleForWaybackFallback(params: {
   if (params.waf) return false;
   if (
     outcome === 'challenge' ||
+    outcome === 'blocked' ||
+    outcome === 'blocked_ssrf' ||
     outcome === 'robots_disallowed' ||
     outcome === 'robots_unreachable' ||
     outcome === 'content_signal_disallowed' ||
@@ -1158,6 +1160,29 @@ export function refineBlockedInfo(params: {
   }
   const outStr = typeof outcome === 'string' ? outcome.trim().toLowerCase() : '';
   const probStr = typeof problem === 'string' ? problem.trim() : '';
+
+  if (
+    outStr === 'dns_not_found' ||
+    /\b(?:enotfound|nxdomain|dns_not_found|eai_noname)\b|no such host|name or service not known|nodename nor servname provided|domain does not exist/i.test(
+      probStr,
+    )
+  ) {
+    return undefined;
+  }
+
+  if (
+    outStr === 'blocked_ssrf' ||
+    (outStr === 'blocked' && baseBlocked?.reason === 'ssrf') ||
+    /\b(?:blocked_ssrf|ssrf)\b|non-public(?:\s+ip|\s+peer|\s+address)?|metadata\s+(?:ip|endpoint|address|service)|private\s+(?:ip|network|address)|loopback\s+(?:ip|address)|link-local\s+(?:ip|address)|disallowed_url|resolved\s+to\s+(?:a\s+)?(?:private|loopback|link-local|reserved|non-public|internal)/i.test(
+      probStr,
+    )
+  ) {
+    return {
+      reason: 'ssrf',
+      retryable: false,
+      message: 'Target or redirect resolved to a non-public/metadata IP address and was blocked.',
+    };
+  }
 
   if (
     probStr.toLowerCase().startsWith('robots_unreachable') ||

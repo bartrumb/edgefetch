@@ -1793,3 +1793,194 @@ func TestR6RedactAll30VectorsLinearSpeed429HoldCapAndRobotsPathNorm(t *testing.T
 		}
 	}
 }
+
+func TestR7HTTP402And429OverMaxBytesCapAndRobotsTimeoutClamp(t *testing.T) {
+	var payHits, rateHits atomic.Int32
+	oversized := strings.Repeat("P", 16384)
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		switch r.Host {
+		case "pay402.test":
+			payHits.Add(1)
+			w.Header().Set("Content-Type", "text/html")
+			w.Header().Set("Payment-Required", "x402")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = w.Write([]byte(oversized))
+		case "over429.test":
+			rateHits.Add(1)
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(oversized))
+		}
+	}))
+	if politeness.RobotsTimeout <= 0 || politeness.RobotsTimeout > politeness.MaxRobotsFetchTimeout {
+		t.Fatalf("expected RobotsTimeout (%s) <= MaxRobotsFetchTimeout (%s)", politeness.RobotsTimeout, politeness.MaxRobotsFetchTimeout)
+	}
+
+	// 1. HTTP 402 with body > MaxBytes MUST preserve OutcomePaymentRequired (402) and halt subsequent same-host items!
+	payRes := c.Run(context.Background(), []Request{
+		{ID: "p1", URL: "http://pay402.test/article-1", Kind: classify.KindPage},
+		{ID: "p2", URL: "http://pay402.test/article-2", Kind: classify.KindPage},
+	}, Options{PauseMs: 1, MaxBytes: 1024})
+	if len(payRes) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(payRes))
+	}
+	if payRes[0].Status != http.StatusPaymentRequired || payRes[0].Outcome != classify.OutcomePaymentRequired {
+		t.Fatalf("expected HTTP 402 over MaxBytes to preserve OutcomePaymentRequired, got %+v", payRes[0])
+	}
+	if payHits.Load() != 1 || payRes[1].Outcome != classify.OutcomeNotTried || !strings.Contains(payRes[1].Problem, "payment_required") {
+		t.Fatalf("expected 402 StopsHost to halt second same-host request without hitting origin (hits=%d, p2=%+v)", payHits.Load(), payRes[1])
+	}
+
+	// 2. HTTP 429 with body > MaxBytes MUST preserve 429 Retry-After handling rather than body-cap skip!
+	r429 := c.Run(context.Background(), []Request{
+		{ID: "r1", URL: "http://over429.test/items", Kind: classify.KindPage},
+	}, Options{PauseMs: 1, MaxBytes: 1024})
+	if r429[0].Status != http.StatusTooManyRequests || r429[0].Outcome != classify.OutcomeStop || r429[0].RetryAfterMs != 60000 {
+		t.Fatalf("expected HTTP 429 over MaxBytes to preserve 429 cooldown stop, got %+v", r429[0])
+	}
+}
+
+func TestV271NXDOMAINNotFound404AndSSRFBlockedMetadata(t *testing.T) {
+	// 1. NXDOMAIN on /robots.txt AND direct page fetch -> OutcomeDNSNotFound ("dns_not_found"),
+	//    Status 0, Problem "domain does not exist (DNS NXDOMAIN)", zero 127.0.0.11:53 leak, zero retries!
+	var nxDials, timeoutDials atomic.Int32
+	dnsTr := &http.Transport{
+		DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+			host, _, _ := net.SplitHostPort(addr)
+			switch host {
+			case "nx-robots.invalid":
+				nxDials.Add(1)
+				return nil, &net.DNSError{
+					Err:        "no such host",
+					Name:       host,
+					Server:     "127.0.0.11:53",
+					IsNotFound: true,
+				}
+			case "nx-direct.invalid":
+				nxDials.Add(1)
+				return nil, fmt.Errorf("lookup %s on 127.0.0.11:53: no such host", host)
+			case "dns-timeout.invalid":
+				timeoutDials.Add(1)
+				return nil, &net.DNSError{
+					Err:       "read udp 172.17.0.2:49152->127.0.0.11:53: i/o timeout",
+					Name:      host,
+					Server:    "127.0.0.11:53",
+					IsTimeout: true,
+				}
+			case "rebind-ssrf.invalid":
+				return nil, politeness.CheckPublicPeerAddress("169.254.169.254:443")
+			default:
+				return nil, io.EOF
+			}
+		},
+	}
+	cDNS := NewCrawler(dnsTr, PublicHTTPS, DefaultUserAgent, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	cDNS.Sleep = func(context.Context, time.Duration) error { return nil }
+	cDNS.SetRobotsBypassHosts([]string{"nx-direct.invalid"})
+	defer cDNS.Close()
+
+	nxRobotsRes := cDNS.Run(context.Background(), []Request{
+		{ID: "nx-1", URL: "https://nx-robots.invalid/page1", Kind: classify.KindScrape},
+		{ID: "nx-2", URL: "https://nx-robots.invalid/page2", Kind: classify.KindPage},
+	}, Options{PauseMs: 1, Retries: 2})
+	for idx, r := range nxRobotsRes {
+		if r.Outcome != classify.OutcomeDNSNotFound || r.Status != 0 || r.Problem != "domain does not exist (DNS NXDOMAIN)" {
+			t.Fatalf("nxRobotsRes[%d] = %+v, want dns_not_found", idx, r)
+		}
+		if strings.Contains(r.Problem, "robots_unreachable") || strings.Contains(r.Problem, "127.0.0.11") {
+			t.Fatalf("SECURITY/UX: NXDOMAIN leaked robots_unreachable or resolver IP: %+v", r)
+		}
+	}
+	if nxDials.Load() != 1 {
+		t.Fatalf("expected NXDOMAIN on /robots.txt to dial once and cache without retry, got %d dials", nxDials.Load())
+	}
+
+	nxDirectRes := cDNS.Run(context.Background(), []Request{
+		{ID: "nx-dir", URL: "https://nx-direct.invalid/doc", Kind: classify.KindPage},
+	}, Options{PauseMs: 1, Retries: 2, RespectRobots: Bool(false)})
+	if nxDirectRes[0].Outcome != classify.OutcomeDNSNotFound || nxDirectRes[0].Status != 0 || nxDirectRes[0].Problem != "domain does not exist (DNS NXDOMAIN)" {
+		t.Fatalf("expected direct NXDOMAIN -> dns_not_found, got %+v", nxDirectRes[0])
+	}
+
+	// DNS timeout keeps robots_unreachable OutcomeStop while redacting 127.0.0.11:53 and 172.17.0.2!
+	toRes := cDNS.Run(context.Background(), []Request{
+		{ID: "dns-to", URL: "https://dns-timeout.invalid/doc", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	if toRes[0].Outcome != classify.OutcomeStop || !strings.HasPrefix(toRes[0].Problem, "robots_unreachable:") {
+		t.Fatalf("expected DNS timeout to remain robots_unreachable stop, got %+v", toRes[0])
+	}
+	if strings.Contains(toRes[0].Problem, "127.0.0.11") || strings.Contains(toRes[0].Problem, "172.17.0.2") || !strings.Contains(toRes[0].Problem, "[redacted-resolver]:53") {
+		t.Fatalf("SECURITY: DNS timeout leaked internal resolver IP: %q", toRes[0].Problem)
+	}
+
+	// DNS-rebinding to 169.254.169.254 -> OutcomeBlockedSSRF + BlockedReason: "ssrf"
+	rebindRes := cDNS.Run(context.Background(), []Request{
+		{ID: "rebind", URL: "https://rebind-ssrf.invalid/latest/meta-data/", Kind: classify.KindScrape},
+	}, Options{PauseMs: 1, Retries: 2})
+	if rebindRes[0].Outcome != classify.OutcomeBlockedSSRF || rebindRes[0].BlockedReason != "ssrf" || rebindRes[0].Status != 0 || rebindRes[0].Problem != "blocked by SSRF policy: non-public target address" {
+		t.Fatalf("expected DNS rebinding SSRF block metadata, got %+v", rebindRes[0])
+	}
+
+	// 2. HTTP 404 -> OutcomeNotFound ("not_found"), HTTP 410 -> OutcomeGone ("gone"), and 302 -> 169.254.169.254 SSRF redirect block with ZERO body leak!
+	cHTTP, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			w.WriteHeader(http.StatusNotFound)
+		case "/missing-404":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("<html>404 missing</html>"))
+		case "/removed-410":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte("<html>410 gone</html>"))
+		case "/redir-imds":
+			w.Header().Set("Location", "http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+			w.WriteHeader(http.StatusFound)
+			_, _ = w.Write([]byte("SECRET_REDIRECT_BODY_DO_NOT_LEAK"))
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("<html>ok</html>"))
+		}
+	}))
+	cHTTP.allow = func(u *url.URL) error {
+		if u.Hostname() == "public.example.com" {
+			return nil
+		}
+		return PublicHTTPS(u)
+	}
+
+	batchRes := cHTTP.Run(context.Background(), []Request{
+		{ID: "p404", URL: "http://public.example.com/missing-404", Kind: classify.KindPage},
+		{ID: "p410", URL: "http://public.example.com/removed-410", Kind: classify.KindPage},
+		{ID: "s404", URL: "http://public.example.com/missing-404", Kind: classify.KindScrape},
+		{ID: "imds", URL: "http://public.example.com/redir-imds", Kind: classify.KindScrape},
+		{ID: "direct-imds", URL: "http://169.254.169.254/latest/meta-data/", Kind: classify.KindScrape},
+	}, Options{PauseMs: 1, IncludeBody: true})
+
+	if batchRes[0].Outcome != classify.OutcomeNotFound || batchRes[0].Status != 404 {
+		t.Fatalf("expected 404 page -> not_found, got %+v", batchRes[0])
+	}
+	if batchRes[1].Outcome != classify.OutcomeGone || batchRes[1].Status != 410 {
+		t.Fatalf("expected 410 page -> gone, got %+v", batchRes[1])
+	}
+	if batchRes[2].Outcome != classify.OutcomeNotFound || batchRes[2].Status != 404 {
+		t.Fatalf("expected 404 scrape -> not_found, got %+v", batchRes[2])
+	}
+	for _, idx := range []int{3, 4} {
+		r := batchRes[idx]
+		if r.Outcome != classify.OutcomeBlockedSSRF || r.BlockedReason != "ssrf" || r.Status != 0 {
+			t.Fatalf("batchRes[%d] expected blocked_ssrf + blockedReason=ssrf + status=0, got %+v", idx, r)
+		}
+		if r.Body != "" || strings.Contains(r.Problem, "SECRET_REDIRECT_BODY") {
+			t.Fatalf("SECURITY: SSRF redirect leaked raw body or internal details: %+v", r)
+		}
+		if r.Problem != "blocked by SSRF policy: non-public target address" {
+			t.Fatalf("batchRes[%d] unexpected Problem: %q", idx, r.Problem)
+		}
+	}
+}

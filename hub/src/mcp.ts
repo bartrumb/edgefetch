@@ -17,7 +17,14 @@ import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
 import { resolveCallerUserId } from './mcp-vault';
 import { getActiveRequestTracer, type RequestTracer } from './otel';
-import { validatePublicHttpsTargetUrl } from './overflow';
+import {
+  DNS_NOT_FOUND_MESSAGE,
+  isDnsNotFoundError,
+  isSsrfBlockedError,
+  scrubResolverIpFromError,
+  SSRF_BLOCKED_INFO,
+  validatePublicHttpsTargetUrl,
+} from './overflow';
 import { readBodyTextCapped } from './safe-input';
 import { classifyWafAndChallenge, refineBlockedInfo } from './waf';
 
@@ -25,7 +32,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '
 const LEGACY_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
 const DEFAULT_PROTOCOL_VERSION = '2025-03-26';
 const MCP_INSTRUCTIONS =
-  'Use search for web & crawled-collection discovery (Serper/Tavily/Brave/SearXNG waterfall + edge-map + SEARCH D1), jobs for one-call structured ATS job search & batch posting verification across Greenhouse/Ashby/Lever/Workday/SmartRecruiters/Built In, catalog for polite full-store Shopify & WooCommerce catalog extraction & diffing, scrape / extract for clean Markdown, Jupyter .ipynb, OpenAPI, & PDFs (with optional PDF OCR and companion .md discovery), map / crawl for site discovery, interact for headless Chromium sessions & YouTube transcripts, read_artifact for large stored docs, and list_agents for fleet status.';
+  'Choose the right tool for the task: (1) Use scrape to read a single web page, article, documentation page, PDF, or RSS/Atom feed as clean Markdown with metadata. (2) Use extract to retrieve query-ranked passages across 1 to 20 URLs at once. (3) Use search for open-web, news (topic="news"), and indexed collection discovery. (4) Use interact when a page requires live browser actions (click, fill, press, scroll, screenshots, or video transcripts). (5) Use fetch_url or fetch_batch ONLY for raw unparsed HTTP bytes and response headers on JSON/XML APIs or raw text files — never for HTML articles or web pages. (6) Use map to list a site\'s URLs, crawl for multi-page site indexing, search_collection to query saved collections, read_artifact to page through large stored outputs, jobs for structured job-board search and verification, catalog for full Shopify/WooCommerce product catalogs, find_extractors to look up built-in site/API adapters, agent for multi-step LLM-guided research and semantic JSON-Schema extraction, discover_mcps / query_mcp for federated MCP servers, and list_agents for crawler node health.';
 const MAX_MCP_REQUEST_BYTES = 256 * 1024;
 const MAX_BODY_PREVIEW_CHARS = 64 * 1024;
 const DEFAULT_MCP_SCRAPE_MAX_CHARS = 100_000;
@@ -178,7 +185,7 @@ export interface McpServerDeps {
     offset?: number;
     limit?: number;
     userId?: string;
-  }) => Promise<{ ok: true; page: Record<string, unknown> } | { ok: false; status: number; error: string; message?: string }>;
+  }) => Promise<{ ok: true; page: Record<string, unknown> } | { ok: false; status: number; via?: string; error: string; message?: string }>;
   executeScrape?: (params: {
     args: Record<string, unknown>;
     principal?: string;
@@ -317,7 +324,8 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
     toolName === 'search' ||
     toolName === 'search_collection' ||
     toolName === 'find_extractors' ||
-    toolName === 'discover_mcps'
+    toolName === 'discover_mcps' ||
+    toolName === 'query_mcp'
   ) {
     return 'crawl:read';
   }
@@ -331,8 +339,7 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
     toolName === 'crawl' ||
     toolName === 'jobs' ||
     toolName === 'catalog' ||
-    toolName === 'agent' ||
-    toolName === 'query_mcp'
+    toolName === 'agent'
   ) {
     return 'crawl:fetch';
   }
@@ -341,7 +348,9 @@ function requiredScopeForTool(toolName: string): 'crawl:read' | 'crawl:fetch' | 
 
 function hasRequiredToolScope(scopes: string[], needed: 'crawl:read' | 'crawl:fetch' | null): boolean {
   if (!needed) return true;
-  if (needed === 'crawl:read') return scopes.includes('crawl:read') || scopes.includes('crawl:fetch');
+  if (needed === 'crawl:read') {
+    return scopes.includes('crawl:read') || scopes.includes('crawl:fetch') || scopes.includes('mcp:call');
+  }
   return scopes.includes('crawl:fetch');
 }
 
@@ -422,7 +431,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'list_agents',
       description:
-        'List connected Home Assistant OS / EdgeFetch standby crawler agents (LITE vs FAT browser/PDF tiers), CPU architectures, job counters, and active host-affinity pins.',
+        'Returns connected crawler worker nodes, their capabilities (HTTP vs headless browser and PDF support), CPU architectures, job counts, and active host routing pins.',
       annotations: {
         title: 'List Connected Crawler Agents',
         readOnlyHint: true,
@@ -439,9 +448,9 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'fetch_url',
       description:
-        'Fetch a public HTTPS URL politely through the EdgeFetch coordinator (enforcing robots.txt, per-host rate limits, SSRF blocks, and returning DNS/TLS/TTFB phase timings plus response content).',
+        'Fetches a single public HTTPS URL and returns raw, unparsed HTTP body bytes, status code, safe response headers, and timing. Use this ONLY for JSON/XML APIs, raw data files, or HTTP header inspection — NEVER for HTML web pages or articles (use scrape for 1 page or extract for multiple pages instead).',
       annotations: {
-        title: 'Fetch Public HTTPS URL',
+        title: 'Low-Level Raw HTTP Fetch (APIs/XML/Headers — Use scrape for Web Pages)',
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
@@ -455,34 +464,34 @@ export function buildCanonicalMcpToolSchemas(options?: {
             type: 'string',
             enum: ['feed', 'json', 'page', 'text'],
             description:
-              'Optional response kind ("page" for HTML, "text" for sitemaps/XML/RSS/Markdown/plain text, "json" for JSON APIs, "feed" for Shopify /products.json). Omit to auto-detect from URL.',
+              'Optional response kind ("json" for JSON APIs, "text" for XML/RSS/Markdown/plain text, "feed" for product JSON feeds, "page" for raw HTML). Omit to auto-detect from URL.',
           },
           accept: {
             type: 'string',
             enum: [...TEXT_ACCEPTS],
             description:
-              'Optional Accept media type override (e.g. "text/html" on kind="page" to request HTML instead of text/markdown; for kind="text", defaults from URL extension).',
+              'Optional Accept header media type override (defaults automatically based on the URL when omitted).',
           },
           target: {
             type: 'string',
             enum: allowedTargets,
             default: defaultTarget,
             description:
-              'Execution tier ("auto" = load-balance across remote HAOS nodes and reach out via Cloudflare only on 429, "agent", or "container").',
+              'Execution route ("auto" uses connected crawler nodes first with automatic overflow, "agent" forces a connected node, "container" forces cloud overflow).',
           },
           site: {
             type: 'string',
-            description: 'Optional standby site ID to pin (e.g. "site-arm64", "site-x86", "site-win-vm").',
+            description: 'Optional worker site ID to pin when target="agent".',
           },
-          respectRobots: { type: 'boolean', default: true, description: 'Respect /robots.txt Allow/Disallow and Crawl-delay.' },
+          respectRobots: { type: 'boolean', default: true, description: 'Respect /robots.txt Allow, Disallow, and Crawl-delay rules.' },
           robots: { type: 'boolean', description: 'Deprecated alias for respectRobots.' },
-          includeBody: { type: 'boolean', default: true, description: 'Include response body preview in tool output.' },
+          includeBody: { type: 'boolean', default: true, description: 'Include the response body preview in tool output.' },
           maxBytes: {
             type: 'integer',
             minimum: 256,
             maximum: 16777216,
             description:
-              'Maximum inline preview size in chars/bytes (256..16777216). Full untruncated body is always stored in R2 and readable via read_artifact.',
+              'Maximum inline preview size in characters/bytes (256..16777216). Larger bodies return an artifactId readable via read_artifact.',
           },
           ifNoneMatch: { type: 'string', description: 'Optional ETag for conditional 304 Not Modified checks.' },
           ifModifiedSince: { type: 'string', description: 'Optional Last-Modified timestamp for conditional 304 checks.' },
@@ -494,7 +503,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'fetch_batch',
       description:
-        'Politely fetch up to 25 public HTTPS URLs in one coordinated batch with per-host serialization, positive dwell jitter, robots.txt checks, and phase timing.',
+        'Fetches 1 to 25 public HTTPS URLs in one polite batch and returns per-URL HTTP status, outcome ("ok", "not_found" for 404, "gone" for 410, "dns_not_found", "blocked", or "rate_limited"), headers, and optional raw body previews. Use this for batch API/feed/status checks; prefer extract when you want clean readable passages from web pages.',
       annotations: {
         title: 'Batch Fetch Public HTTPS URLs',
         readOnlyHint: true,
@@ -515,26 +524,26 @@ export function buildCanonicalMcpToolSchemas(options?: {
           kind: {
             type: 'string',
             enum: ['feed', 'json', 'page', 'text'],
-            description: 'Optional kind applied to every URL; omit to auto-detect per URL (HTML -> "page", RSS/XML/Markdown/txt -> "text", .json -> "json").',
+            description: 'Optional kind applied to every URL; omit to auto-detect per URL.',
           },
           accept: {
             type: 'string',
             enum: [...TEXT_ACCEPTS],
-            description: 'For kind "text" only; applies to every URL. Default: picked from each URL.',
+            description: 'Optional Accept media type for text requests; omit to infer per URL.',
           },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
-          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
-          pauseMs: { type: 'integer', minimum: 0, maximum: 30000, default: 1000, description: 'Minimum per-host pause in ms.' },
-          pauseJitterMs: { type: 'integer', minimum: 0, maximum: 15000, default: 500, description: 'Random positive jitter added to pauseMs.' },
+          site: { type: 'string', description: 'Optional worker site ID when target="agent".' },
+          pauseMs: { type: 'integer', minimum: 0, maximum: 30000, default: 1000, description: 'Minimum per-host pause in milliseconds.' },
+          pauseJitterMs: { type: 'integer', minimum: 0, maximum: 15000, default: 500, description: 'Random positive jitter in milliseconds added to pauseMs.' },
           respectRobots: { type: 'boolean', default: true },
           robots: { type: 'boolean', description: 'Deprecated alias for respectRobots.' },
-          includeBody: { type: 'boolean', default: false, description: 'Set true to include truncated body previews per URL.' },
+          includeBody: { type: 'boolean', default: false, description: 'Set true to include truncated raw body previews per URL.' },
           previewBytes: {
             type: 'integer',
             minimum: 256,
             maximum: 65536,
             default: DEFAULT_BATCH_PREVIEW_CHARS,
-            description: 'Max inline body preview chars per URL when includeBody=true (default 3072; full body stays in R2 via read_artifact).',
+            description: 'Maximum inline body preview characters per URL when includeBody=true (default 3072; full body can be paged via read_artifact).',
           },
         },
         required: ['urls'],
@@ -544,7 +553,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'scrape',
       description:
-        'Scrape a public HTTPS URL into clean main-content Markdown, metadata, links, images, branding, changes diff, and /llms.txt + companion .md discovery (with verified META D1 + R2 maxAgeMs caching and optional Chromium rendering).',
+        'Reads a single public HTTPS web page, PDF, RSS/Atom feed, OpenAPI spec, or Jupyter notebook and returns clean main-content Markdown plus structured metadata (title, wordCount, favicon, canonicalUrl, contentType, links, and images). Prefer scrape for reading 1 URL, extract for query-focused passages across multiple URLs, and interact when clicking or typing in a browser is required.',
       annotations: {
         title: 'Scrape URL to Markdown & Metadata',
         readOnlyHint: true,
@@ -583,8 +592,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
                   type: 'object',
                   properties: {
                     type: { type: 'string', enum: ['json', 'attributes', 'screenshot', 'changeTracking'] },
-                    prompt: { type: 'string', description: 'Optional extraction instruction when type="json".' },
-                    schema: { type: 'object', description: 'Optional JSON Schema object when type="json".' },
+                    prompt: { type: 'string', description: 'Optional extraction instruction when type="json" (requires an LLM provider).' },
+                    schema: {
+                      type: 'object',
+                      description:
+                        'Optional JSON Schema object when type="json". Without an LLM configured, schema extraction is structural/heuristic (matching JSON-LD, headings, definition lists, and key-value lines, setting unmatched fields to null); use the agent tool for semantic LLM extraction.',
+                    },
                     selectors: {
                       type: 'array',
                       items: {
@@ -606,60 +619,68 @@ export function buildCanonicalMcpToolSchemas(options?: {
               ],
             },
             default: ['markdown'],
-            description: 'Desired output formats (string format names or { type: "json", schema } for structured extraction).',
+            description:
+              'Desired output formats (e.g. ["markdown", "links"] or [{ type: "json", schema }]). Note: keyless { type: "json", schema } extraction is structural/heuristic; prefer agent for semantic extraction.',
           },
           renderMode: {
             type: 'string',
             enum: ['off', 'auto', 'always', 'browser'],
             default: 'auto',
-            description: '"auto" (default) automatically switches thin/SPA pages to headless Chromium on edgefetch_fat nodes; "always" or "browser" forces Chromium.',
+            description:
+              '"auto" (default) fetches static HTML first and only launches a headless browser on thin JavaScript-driven pages; "off" never uses a browser; "always" or "browser" forces headless browser rendering.',
           },
-          waitForMs: { type: 'integer', minimum: 0, maximum: 15000, description: 'Extra JS settle wait in ms when rendering.' },
-          waitSelector: { type: 'string', description: 'Optional CSS selector to wait for when rendering.' },
-          maxPages: { type: 'integer', minimum: 1, maximum: 500, description: 'Max PDF pages to extract via Poppler pdftotext / PyMuPDF + Tesseract OCR.' },
+          waitForMs: { type: 'integer', minimum: 0, maximum: 15000, description: 'Extra JavaScript settle wait in milliseconds when rendering in a browser.' },
+          waitSelector: { type: 'string', description: 'Optional CSS selector to wait for when rendering in a browser.' },
+          maxPages: { type: 'integer', minimum: 1, maximum: 500, description: 'Maximum PDF pages to extract.' },
           ocr: {
             type: 'string',
             enum: ['auto', 'always', 'off'],
             default: 'auto',
-            description: 'PDF OCR mode via PyMuPDF + Tesseract 5.5.0: "auto" OCRs scanned/image-only PDFs; "always" forces OCR on image-based tables.',
+            description: 'PDF OCR mode: "auto" runs OCR only on scanned/image-only PDFs; "always" forces OCR; "off" disables OCR.',
           },
-          onlyMainContent: { type: 'boolean', default: true, description: 'Strip nav/footer/aside chrome and isolate main/article content.' },
+          onlyMainContent: { type: 'boolean', default: true, description: 'Strip navigation, footer, and sidebar chrome to keep primary article content.' },
           includeTags: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Optional HTML tag/ID/class selectors (e.g. ["article", "#content", ".post-body"]) to keep exclusively.',
+            description: 'Optional HTML tag, #id, or .class selectors (e.g. ["article", "#content"]) to keep exclusively. Heading-only matches automatically expand to include their section prose.',
           },
           excludeTags: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Optional HTML tag/ID/class selectors (e.g. [".comments", "#cookie-banner", "aside"]) to remove before Markdown conversion.',
+            description: 'Optional HTML tag, #id, or .class selectors (e.g. [".comments", "aside"]) to remove before Markdown conversion.',
           },
           includeImages: {
             type: 'boolean',
             default: true,
-            description: 'Include content images >=100px (set false to strip all images and inline ![...] tags).',
+            description: 'Include content images >=100px (set false to omit inline image links).',
           },
           maxChars: {
             type: 'integer',
             minimum: 500,
             maximum: 500000,
             description:
-              'Optional max Markdown character limit (default 100000 on MCP; truncates cleanly at paragraph/word boundary and returns markdownArtifactId + nextOffset for lossless paging via read_artifact).',
+              'Maximum Markdown characters returned inline (default 100000 on MCP; truncates cleanly and returns markdownArtifactId + nextOffset for paging via read_artifact).',
           },
-          discoverLlmsTxt: { type: 'boolean', default: true, description: 'Check /llms.txt and upgrade to companion .md when available.' },
+          discoverLlmsTxt: { type: 'boolean', default: true, description: 'Check /llms.txt and prefer publisher-provided companion .md files when available.' },
+          followCanonical: {
+            type: 'boolean',
+            default: false,
+            description:
+              'When true and a syndicated wrapper page declares a cross-origin canonical HTTPS URL, follows 1 hop (respecting robots.txt) to scrape the original article.',
+          },
           preferOriginMarkdown: {
             type: 'boolean',
             default: true,
-            description: 'Set false to negotiate text/html instead of text/markdown on origins supporting Markdown for Agents.',
+            description: 'Set false to request text/html instead of text/markdown from servers that negotiate Markdown directly.',
           },
-          maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
-          redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
+          maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Return a cached scrape result if fetched with the same options within maxAgeMs milliseconds.' },
+          redactPii: { type: 'boolean', default: false, description: 'Redact email addresses, phone numbers, and US SSNs from extracted text.' },
           checkPromptInjection: {
             type: 'boolean',
             default: false,
-            description: '$0 prompt-injection guard: fails fast with 403 SCRAPE_PROMPT_INJECTION_DETECTED when malicious override directives are found.',
+            description: 'When true, rejects pages containing prompt-injection override directives with HTTP 403.',
           },
-          mobile: { type: 'boolean', default: false, description: 'Emulate 390x844 mobile viewport in headless browser.' },
+          mobile: { type: 'boolean', default: false, description: 'Emulate a 390x844 mobile viewport in headless browser mode.' },
           location: {
             type: 'object',
             properties: {
@@ -670,42 +691,41 @@ export function buildCanonicalMcpToolSchemas(options?: {
           actions: {
             type: 'array',
             maxItems: 50,
-            description: 'Optional inline browser actions (wait, click, write, fill, press, scroll, screenshot, scrape, executeJavascript, pdf).',
+            description: 'Optional browser actions to run before scraping (wait, click, write, fill, press, scroll, screenshot, scrape, executeJavascript, pdf).',
             items: { type: 'object' },
           },
           parsers: {
             type: 'array',
-            description: 'Optional PDF/image parser controls (e.g. [{ type: "pdf", mode: "auto", pages: true, pageMarkers: true }] or [] for raw base64).',
+            description: 'Optional PDF parser controls (e.g. [{ type: "pdf", mode: "auto", pages: true, pageMarkers: true }] or [] for raw base64).',
             items: { anyOf: [{ type: 'string' }, { type: 'object' }] },
           },
-          query: { type: 'string', description: 'Optional focus query to rerank relevant passages.' },
+          query: { type: 'string', description: 'Optional focus query to surface only the most relevant passages.' },
           jsonFilter: {
             type: 'string',
-            description: 'Optional record filter for JSON array responses (e.g. `title~"Forward Deployed"` or `id=abc123`), emitting 1 chunk per record.',
+            description: 'Optional filter for JSON array responses (e.g. `title~"Engineer"` or `id=abc123`), emitting one chunk per matching record.',
           },
-          collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index the verified Markdown into.' },
+          collectionId: { type: 'string', description: 'Optional collection ID to index the extracted Markdown into for search_collection.' },
           visibility: {
             type: 'string',
             enum: ['public', 'private'],
             default: 'public',
-            description:
-              'Artifact & cache isolation mode ("private" stores R2 blobs/cache under private/<userId>/... and skips shared public cache).',
+            description: 'Cache and storage visibility ("private" isolates cached content to the current authenticated user).',
           },
           waybackFallback: {
             type: 'boolean',
             default: false,
             description:
-              'Opt-in Internet Archive Wayback fallback strictly on 5xx or network-unreachable link rot (never used on robots.txt, 401/403/429, or anti-bot challenges).',
+              'Opt-in Internet Archive Wayback Machine fallback strictly on 5xx errors or unreachable hosts (never used on robots.txt blocks, 401/403/429, or bot challenges).',
           },
           spaFallback: {
             type: 'string',
             enum: ['auto', 'off', 'crawl4ai', 'firecrawl'],
             default: 'auto',
             description:
-              'When CRAWL4AI_API_URL or FIRECRAWL_API_URL/KEY is configured on the Hub, ethically falls back on heavy/unhydrated SPAs or missing local browser nodes (never used on robots.txt, 403/429, or challenges).',
+              'Optional external SPA renderer fallback when configured on the server (never used on robots.txt blocks, 403/429, or bot challenges).',
           },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
-          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+          site: { type: 'string', description: 'Optional worker site ID when target="agent".' },
         },
         required: ['url'],
         additionalProperties: false,
@@ -714,7 +734,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'extract',
       description:
-        'Extract clean Markdown and BM25 query-ranked chunks across 1..20 public HTTPS URLs in one polite batch (with optional verified maxAgeMs cache and FTS5 collection indexing).',
+        'Extracts clean, query-ranked Markdown passages across 1 to 20 public HTTPS URLs in one batch. Returns top matching chunks per URL (or noRelevantMatch: true with empty chunks when zero query terms appear on a page). Prefer extract for multi-URL question answering and scrape for reading one full page.',
       annotations: {
         title: 'Extract Focused Passages from URLs',
         readOnlyHint: true,
@@ -730,44 +750,53 @@ export function buildCanonicalMcpToolSchemas(options?: {
             items: { type: 'string' },
             minItems: 1,
             maxItems: 20,
-            description: '1..20 public https:// URLs to extract from.',
+            description: '1 to 20 public https:// URLs to extract passages from.',
           },
-          query: { type: 'string', description: 'Focus query used to BM25-rank the top chunks per source.' },
+          query: {
+            type: 'string',
+            description:
+              'Keyword or question used to rank the most relevant passages per URL (heuristic BM25 keyword ranking; returns noRelevantMatch: true when zero query terms match).',
+          },
           jsonFilter: {
             type: 'string',
-            description: 'Optional record filter for JSON array responses (e.g. `title~"Forward Deployed"` or `id=abc123`), emitting 1 chunk per record.',
+            description: 'Optional filter for JSON array responses (e.g. `title~"Engineer"` or `id=abc123`), emitting one chunk per matching record.',
           },
           renderMode: {
             type: 'string',
             enum: ['off', 'auto', 'always', 'browser'],
             default: 'auto',
-            description: '"auto" (default) upgrades thin scripted pages to headless Chromium; "always" or "browser" forces Chromium.',
+            description: '"auto" (default) renders thin JavaScript-driven pages in a headless browser; "off" disables browser rendering; "always" forces it.',
           },
-          chunksPerSource: { type: 'integer', minimum: 1, maximum: 10, default: 3, description: 'Max chunks returned per URL.' },
-          maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
-          redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
-          collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index extracted pages into.' },
+          chunksPerSource: { type: 'integer', minimum: 1, maximum: 10, default: 3, description: 'Maximum ranked chunks returned per URL.' },
+          includeRawContent: {
+            type: 'boolean',
+            default: false,
+            description: 'Set true to also include combined Markdown in rawContent on each result (omitted by default to avoid duplicating chunk text).',
+          },
+          maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Reuse cached Markdown if fetched within maxAgeMs milliseconds.' },
+          redactPii: { type: 'boolean', default: false, description: 'Redact email addresses, phone numbers, and US SSNs.' },
+          collectionId: { type: 'string', description: 'Optional collection ID to index extracted pages into for search_collection.' },
           visibility: {
             type: 'string',
             enum: ['public', 'private'],
             default: 'public',
-            description: 'Artifact & cache isolation mode ("private" isolates R2 cache & FTS5 chunks to the authenticated user).',
+            description: 'Cache and index isolation mode ("private" isolates data to the authenticated user).',
           },
           waybackFallback: {
             type: 'boolean',
             default: false,
             description:
-              'Opt-in Internet Archive Wayback fallback strictly on 5xx or network-unreachable link rot (never used on robots.txt, 401/403/429, or anti-bot challenges).',
+              'Opt-in Internet Archive Wayback Machine fallback strictly on 5xx errors or unreachable hosts (never used on robots.txt blocks, 401/403/429, or bot challenges).',
           },
           spaFallback: {
             type: 'string',
             enum: ['auto', 'off', 'crawl4ai', 'firecrawl'],
             default: 'auto',
             description:
-              'When CRAWL4AI_API_URL or FIRECRAWL_API_URL/KEY is configured on the Hub, ethically falls back on heavy/unhydrated SPAs or missing local browser nodes (never used on robots.txt, 403/429, or challenges).',
+              'Optional external SPA renderer fallback when configured on the server (never used on robots.txt blocks, 403/429, or bot challenges).',
           },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
-          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+          site: { type: 'string', description: 'Optional worker site ID when target="agent".' },
         },
         required: ['urls'],
         additionalProperties: false,
@@ -776,7 +805,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'map',
       description:
-        'Discover URLs on a site rapidly and politely via robots.txt Sitemap:, sitemap.xml / .xml.gz, /llms.txt, and homepage links, with optional search filter.',
+        'Discovers public URLs on a website using sitemaps, /llms.txt, and homepage links, returning a filtered list of links without scraping every page.',
       annotations: {
         title: 'Map Site URLs',
         readOnlyHint: true,
@@ -787,18 +816,18 @@ export function buildCanonicalMcpToolSchemas(options?: {
       inputSchema: {
         type: 'object',
         properties: {
-          url: { type: 'string', description: 'Root public https:// URL of the site.' },
-          search: { type: 'string', description: 'Optional keyword filter to rank/filter matching URLs.' },
+          url: { type: 'string', description: 'Root public https:// URL of the site to map.' },
+          search: { type: 'string', description: 'Optional keyword filter to rank and narrow discovered URLs.' },
           limit: { type: 'integer', minimum: 1, maximum: 5000, default: 500 },
           includeSubdomains: { type: 'boolean', default: false },
           includeOutsidePath: {
             type: 'boolean',
             default: false,
-            description: 'When false (default), restricts discovered URLs to the root URL path prefix when url has a subpath.',
+            description: 'When false (default), restricts discovered URLs to the root URL path prefix when url includes a subpath.',
           },
           ignoreSitemap: { type: 'boolean', default: false },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
-          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+          site: { type: 'string', description: 'Optional worker site ID when target="agent".' },
         },
         required: ['url'],
         additionalProperties: false,
@@ -807,9 +836,9 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'crawl',
       description:
-        'Start an async multi-page breadth-first site crawl (with robots.txt, includePaths/excludePaths, SEARCH D1 FTS5 indexing, and HMAC webhooks), OR pass crawlId to poll status / cancel.',
+        'Crawls multiple pages of a website breadth-first (respecting robots.txt and path filters) and indexes them into a searchable collection. Small crawls (limit <= 5) wait up to 25 seconds to return completed pages directly; larger or background crawls return a crawlId that you can poll or cancel by calling crawl with { crawlId }.',
       annotations: {
-        title: 'Async Site Crawl (Start / Status / Cancel)',
+        title: 'Site Crawl (Run / Poll Status / Cancel)',
         readOnlyHint: false,
         destructiveHint: false,
         idempotentHint: false,
@@ -818,16 +847,17 @@ export function buildCanonicalMcpToolSchemas(options?: {
       inputSchema: {
         type: 'object',
         properties: {
-          url: { type: 'string', description: 'Root public https:// URL to start crawling (omit when checking/cancelling crawlId).' },
-          crawlId: { type: 'string', description: 'Existing crawl ID (`crw_...`) to check status or cancel.' },
+          url: { type: 'string', description: 'Root public https:// URL to start crawling (omit when polling or cancelling an existing crawlId).' },
+          crawlId: { type: 'string', description: 'Existing crawl ID (`crw_...`) to poll progress/results or cancel.' },
           cancel: { type: 'boolean', default: false, description: 'Set true with crawlId to cancel a running crawl.' },
-          limit: { type: 'integer', minimum: 1, maximum: 200, default: 25 },
-          maxDepth: { type: 'integer', minimum: 0, maximum: 5, default: 2 },
+          async: { type: 'boolean', description: 'Set true to run in the background immediately and return crawlId even when limit <= 5.' },
+          limit: { type: 'integer', minimum: 1, maximum: 200, default: 25, description: 'Maximum pages to crawl (1..200).' },
+          maxDepth: { type: 'integer', minimum: 0, maximum: 5, default: 2, description: 'Maximum link hop depth from the root URL.' },
           allowSubdomains: { type: 'boolean', default: false },
-          includePaths: { type: 'array', items: { type: 'string' } },
-          excludePaths: { type: 'array', items: { type: 'string' } },
-          collectionId: { type: 'string', description: 'Optional SEARCH D1 collection ID to index crawled pages into.' },
-          offset: { type: 'integer', minimum: 0, default: 0, description: 'Result offset when polling crawlId.' },
+          includePaths: { type: 'array', items: { type: 'string' }, description: 'Optional path prefixes or regexes to include.' },
+          excludePaths: { type: 'array', items: { type: 'string' }, description: 'Optional path prefixes or regexes to skip.' },
+          collectionId: { type: 'string', description: 'Optional collection ID to index crawled pages into for search_collection.' },
+          offset: { type: 'integer', minimum: 0, default: 0, description: 'Result offset when polling an existing crawlId.' },
         },
         additionalProperties: false,
       },
@@ -835,9 +865,9 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'search',
       description:
-        'Edge-first web & collection search: queries private SEARCH D1 FTS5 + HAOS edge-map (/llms.txt & sitemap.xml on site: queries) + 24h SERP cache + Serper (Google) waterfall (calling SearXNG/Brave only on <3 hits), with optional live HAOS page extraction.',
+        'Searches the web, news headlines (topic="news"), and optional indexed collections, returning ranked results with titles, URLs, snippets, and optional extracted page chunks when includeRawContent is true.',
       annotations: {
-        title: 'Search Web & Crawled Collections',
+        title: 'Search Web & News',
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
@@ -846,46 +876,55 @@ export function buildCanonicalMcpToolSchemas(options?: {
       inputSchema: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Search query (1..500 chars). Supports site:domain.com for $0 HAOS edge-map discovery.' },
-          max_results: { type: 'integer', minimum: 1, maximum: 20, default: 5 },
-          maxResults: { type: 'integer', minimum: 1, maximum: 20, description: 'Alias for max_results.' },
-          limit: { type: 'integer', minimum: 1, maximum: 20, description: 'Alias for max_results.' },
+          query: { type: 'string', description: 'Search query (1..500 characters). Supports site:domain.com filtering.' },
+          topic: {
+            type: 'string',
+            enum: ['auto', 'general', 'news'],
+            default: 'auto',
+            description:
+              'Search topic: "auto" (default) detects news queries automatically; "news" targets news headlines; "general" runs standard web search.',
+          },
+          maxResults: { type: 'integer', minimum: 1, maximum: 20, default: 5, description: 'Maximum search results to return (1..20).' },
+          timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'], description: 'Optional recency filter.' },
+          includeDomains: { type: 'array', items: { type: 'string' }, description: 'Restrict results to these domains.' },
+          excludeDomains: { type: 'array', items: { type: 'string' }, description: 'Exclude results from these domains.' },
+          includeRawContent: {
+            type: 'boolean',
+            default: false,
+            description: 'When true, fetches the top result URLs and attaches ranked Markdown chunks.',
+          },
+          chunksPerSource: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 10,
+            default: 3,
+            description: 'Maximum Markdown chunks attached per result when includeRawContent is true.',
+          },
           mode: {
             type: 'string',
             enum: ['waterfall', 'rrf', 'serper'],
             default: 'waterfall',
-            description: '"waterfall" (default) runs Serper alone first and calls SearXNG/Brave only if Serper returns <3 hits; "serper" skips Brave completely; "rrf" fuses active providers in parallel.',
+            description:
+              'Provider strategy: "waterfall" (default) queries the primary search provider first and falls back only when results are sparse; "rrf" queries configured providers in parallel; "serper" uses only Serper.',
           },
           providers: {
             type: 'array',
             items: { type: 'string', enum: ['serper', 'brave', 'searxng', 'tavily'] },
-            description: 'Optional explicit provider allowlist (e.g. ["serper"] or ["serper", "searxng"] to never call Brave).',
+            description: 'Optional allowlist of search providers to use.',
           },
-          include_domains: { type: 'array', items: { type: 'string' } },
-          includeDomains: { type: 'array', items: { type: 'string' }, description: 'Alias for include_domains.' },
-          exclude_domains: { type: 'array', items: { type: 'string' } },
-          excludeDomains: { type: 'array', items: { type: 'string' }, description: 'Alias for exclude_domains.' },
-          time_range: { type: 'string', enum: ['day', 'week', 'month', 'year'] },
-          timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'], description: 'Alias for time_range.' },
-          max_age_ms: { type: 'integer', minimum: 0, description: 'SERP cache max age in ms (default 86400000 = 24h; 0 bypasses cache).' },
-          maxAgeMs: { type: 'integer', minimum: 0, description: 'Alias for max_age_ms.' },
-          include_raw_content: { type: 'boolean', default: false, description: 'Fetch & chunk top results politely via EdgeFetch HAOS agents.' },
-          includeRawContent: { type: 'boolean', description: 'Alias for include_raw_content.' },
-          chunks_per_source: { type: 'integer', minimum: 1, maximum: 10, default: 3 },
-          chunksPerSource: { type: 'integer', minimum: 1, maximum: 10, description: 'Alias for chunks_per_source.' },
-          collections: { type: 'array', items: { type: 'string' }, description: 'Optional private SEARCH D1 collection IDs to fuse.' },
-          collectionId: { type: 'string', description: 'Optional single private SEARCH D1 collection ID to fuse.' },
+          collectionId: { type: 'string', description: 'Optional indexed collection ID to merge into search results.' },
+          noCache: { type: 'boolean', default: false, description: 'Set true to bypass cached search results and fetch fresh results.' },
         },
         required: ['query'],
-        additionalProperties: false,
+        additionalProperties: true,
       },
     },
     {
       name: 'search_collection',
       description:
-        'Search a private SEARCH D1 FTS5 collection populated by crawl, scrape, or extract (e.g. collectionId="default" or a crawlId `crw_...`) with BM25 ranking and snippets.',
+        'Searches pages previously indexed into a collection by scrape, extract, or crawl, returning BM25 relevance-scored chunks (with compact query excerpts on long passages and empty hits when no terms match).',
       annotations: {
-        title: 'Search Indexed Collection (D1 FTS5)',
+        title: 'Search Indexed Collection',
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
@@ -897,10 +936,10 @@ export function buildCanonicalMcpToolSchemas(options?: {
           collectionId: {
             type: 'string',
             default: 'default',
-            description: 'Target collection ID (`default` or a custom / `crw_...` collectionId).',
+            description: 'Target collection ID (e.g. "default" or a crawl ID `crw_...`).',
           },
-          query: { type: 'string', description: 'Keyword search query matched safely against FTS5 chunks.' },
-          limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+          query: { type: 'string', description: 'Keyword query to match against indexed document chunks.' },
+          limit: { type: 'integer', minimum: 1, maximum: 50, default: 10, description: 'Maximum matching chunks to return (1..50).' },
         },
         required: ['query'],
         additionalProperties: false,
@@ -909,7 +948,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'interact',
       description:
-        'Drive a sandboxed headless Chromium session on an edgefetch_fat (browser-v1) node (click, fill, press, scroll, wait, PNG screenshots) with SSRF CONNECT isolation, robots.txt pre-checks, and automatic stop on anti-bot challenges.',
+        'Opens a page in a sandboxed headless browser and executes interactive steps (click, fill, type, press, select, scroll, wait, navigate), returning rendered Markdown, per-action URL/DOM change telemetry, warnings when clicks have no effect, optional screenshots, and a sessionId when keepSession is true.',
       annotations: {
         title: 'Interact with Page in Sandboxed Headless Browser',
         readOnlyHint: false,
@@ -920,10 +959,10 @@ export function buildCanonicalMcpToolSchemas(options?: {
       inputSchema: {
         type: 'object',
         properties: {
-          url: { type: 'string', description: 'Initial public https:// URL (omit when resuming/closing sessionId).' },
-          sessionId: { type: 'string', description: 'Composite sessionId returned from a prior interact call with keepSession=true.' },
-          keepSession: { type: 'boolean', default: false, description: 'Keep the incognito browser tab open for follow-up interact calls.' },
-          closeSession: { type: 'boolean', default: false, description: 'Close the retained browser session after this turn.' },
+          url: { type: 'string', description: 'Initial public https:// URL (omit when resuming or closing an existing sessionId).' },
+          sessionId: { type: 'string', description: 'Session token returned from a prior interact call with keepSession=true.' },
+          keepSession: { type: 'boolean', default: false, description: 'Keep the isolated browser tab open for follow-up interact calls.' },
+          closeSession: { type: 'boolean', default: false, description: 'Close an open browser session after this call.' },
           actions: {
             type: 'array',
             maxItems: 25,
@@ -946,9 +985,21 @@ export function buildCanonicalMcpToolSchemas(options?: {
             items: { type: 'string', enum: ['markdown', 'html', 'rawHtml', 'screenshot', 'transcript'] },
             default: ['markdown'],
           },
-          waitForMs: { type: 'integer', minimum: 0, maximum: 15000 },
-          waitSelector: { type: 'string' },
-          site: { type: 'string', description: 'Optional specific edgefetch_fat site ID.' },
+          waitForMs: { type: 'integer', minimum: 0, maximum: 15000, description: 'Milliseconds to wait for page state to settle.' },
+          waitSelector: { type: 'string', description: 'Optional CSS selector to wait for before extracting output.' },
+          maxChars: {
+            type: 'integer',
+            minimum: 100,
+            maximum: 500000,
+            description: 'Maximum Markdown characters to return in this call (returns totalChars, remainingChars, and nextOffset when truncated).',
+          },
+          offset: {
+            type: 'integer',
+            minimum: 0,
+            default: 0,
+            description: 'Character offset into the rendered Markdown for paging large pages.',
+          },
+          site: { type: 'string', description: 'Optional browser-capable worker site ID.' },
         },
         additionalProperties: false,
       },
@@ -956,7 +1007,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'read_artifact',
       description:
-        'Read a slice of a stored R2 artifact by artifactId (64-char hex blobSha256 for raw fetch bodies, or md:<sha256> / format="markdown" for derived scrape Markdown) using character offset + limit paging.',
+        'Reads a character slice of a stored response artifact by artifactId (either a 64-character hex SHA-256 from fetch_url/fetch_batch/scrape, or an `md:<sha256>` markdownArtifactId from scrape) using offset and limit paging.',
       annotations: {
         title: 'Read Paged Crawl Artifact',
         readOnlyHint: true,
@@ -969,16 +1020,16 @@ export function buildCanonicalMcpToolSchemas(options?: {
         properties: {
           artifactId: {
             type: 'string',
-            description: '64-character hex blobSha256 (from fetch_url/fetch_batch/scrape) OR md:<sha256> (markdownArtifactId from scrape).',
+            description: '64-character hex SHA-256 artifact ID (from fetch_url/fetch_batch/scrape) OR `md:<sha256>` (markdownArtifactId from scrape).',
           },
           format: {
             type: 'string',
             enum: ['raw', 'markdown'],
-            description: 'Optional slice format ("raw" default for blobSha256; "markdown" reads derived clean Markdown when available).',
+            description: 'Optional output format ("raw" default for raw artifacts; "markdown" reads derived clean Markdown when available).',
           },
           retention: { type: 'string', enum: ['transient', 'stored'], description: 'Optional retention tier hint.' },
           offset: { type: 'integer', minimum: 0, default: 0, description: 'Character offset to start reading from.' },
-          limit: { type: 'integer', minimum: 1, maximum: 262144, default: 65536, description: 'Max characters to return in this page.' },
+          limit: { type: 'integer', minimum: 1, maximum: 262144, default: 65536, description: 'Maximum characters to return in this page.' },
         },
         required: ['artifactId'],
         additionalProperties: false,
@@ -987,9 +1038,9 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'jobs',
       description:
-        'One-call structured job search across official ATS boards (Greenhouse US/EU, Ashby, Lever US/EU, Workday CXS, Workable, Gem, Rippling, SmartRecruiters, company-domain -> ATS auto-discovery, and optional Built In): standardizes pay ({ min, max, currency, period, basis: "base"|"ote"|"total" }), workplaceType, and locations, deduplicates by (company, title), and filters by remote, locations, minBase, postedWithinDays, and exclude.',
+        'Searches official company job boards (Greenhouse, Ashby, Lever, Workday, Workable, Gem, Rippling, SmartRecruiters, company-domain career page discovery, and Built In) or batch-verifies saved job URLs, returning normalized compensation, workplaceType, locations, and posting status.',
       annotations: {
-        title: 'Search & Extract Structured Job Postings',
+        title: 'Search & Verify Structured Job Postings',
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
@@ -999,13 +1050,13 @@ export function buildCanonicalMcpToolSchemas(options?: {
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Role or keyword query (e.g. "Forward Deployed Engineer", "Solutions Architect").' },
-          company: { type: 'string', description: 'Optional company name or ATS org filter.' },
+          company: { type: 'string', description: 'Optional company name or job-board organization slug.' },
           domains: {
             type: 'array',
             items: { type: 'string' },
             maxItems: 10,
             description:
-              'Optional company domains (e.g. ["cloudflare.com", "stripe.com"]) to probe /careers and /jobs for automatic ATS board discovery across 16+ ATS platforms.',
+              'Optional company domains (e.g. ["cloudflare.com", "stripe.com"]) to probe /careers and /jobs for official job-board discovery.',
           },
           remote: { type: 'boolean', description: 'When true, keep only remote-eligible roles.' },
           locations: {
@@ -1016,37 +1067,37 @@ export function buildCanonicalMcpToolSchemas(options?: {
           minBase: {
             type: 'number',
             minimum: 0,
-            description: 'Minimum annual base salary floor (ignores total-target-cash / OTE unless basis === "base").',
+            description: 'Minimum annual base salary filter.',
           },
           minBaseMode: {
             type: 'string',
             enum: ['floor', 'ceiling'],
             default: 'floor',
-            description: 'How minBase evaluates salary ranges: "floor" (default, pay.min >= minBase) or "ceiling" (pay.max >= minBase).',
+            description: 'How minBase compares against salary ranges: "floor" (pay.min >= minBase) or "ceiling" (pay.max >= minBase).',
           },
           strictPay: {
             type: 'boolean',
             default: false,
-            description: 'When true and minBase is set, drop jobs with unlisted pay instead of keeping them with payUnknown: true.',
+            description: 'When true and minBase is set, exclude postings that do not list compensation.',
           },
-          postedWithinDays: { type: 'integer', minimum: 1, maximum: 365, description: 'Filter postings published within N days.' },
+          postedWithinDays: { type: 'integer', minimum: 1, maximum: 365, description: 'Keep postings published within the last N days.' },
           limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
-          includeBuiltIn: { type: 'boolean', default: true, description: 'Also check Built In remote job search (disabled by default when company or domains is set).' },
+          includeBuiltIn: { type: 'boolean', default: true, description: 'Include Built In job listings (disabled automatically when company or domains is set).' },
           includePublicFeeds: {
             type: 'boolean',
             default: false,
-            description: 'Opt-in to robots.txt-allowed public remote job feeds (We Work Remotely, Himalayas, Working Nomads).',
+            description: 'Opt in to public remote job feeds (We Work Remotely, Himalayas, Working Nomads).',
           },
           mode: {
             type: 'string',
             enum: ['search', 'verify'],
-            description: 'Execution mode ("search" default, or "verify" to batch-check saved job posting URLs).',
+            description: 'Execution mode ("search" default, or "verify" to batch-check whether saved job URLs are still live).',
           },
           verify: {
             type: 'array',
             items: { type: 'string' },
             maxItems: 50,
-            description: 'Optional list of saved https:// job posting URLs to batch-verify ("live" | "closed" | "board_gone" | "unknown") by grouping per ATS board.',
+            description: 'Saved https:// job posting URLs to batch-verify ("live" | "closed" | "board_gone" | "unknown").',
           },
           urls: {
             type: 'array',
@@ -1065,10 +1116,10 @@ export function buildCanonicalMcpToolSchemas(options?: {
               },
               additionalProperties: false,
             },
-            description: 'Optional list of already-applied roles to exclude.',
+            description: 'Optional list of roles to exclude from results.',
           },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
-          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+          site: { type: 'string', description: 'Optional worker site ID when target="agent".' },
         },
         additionalProperties: false,
       },
@@ -1076,7 +1127,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'find_extractors',
       description:
-        'On-demand dynamic search across EdgeFetch’s 49+ keyless built-in site/API adapters (SEC EDGAR, YC, Polymarket, Ashby/Greenhouse/Lever/Workday/Workable/Gem/Rippling ATS, arXiv, OpenAlex, DOI/Crossref, ClinicalTrials, openFDA, PubChem, Socrata, CKAN, ArcGIS, Legistar, USAspending, NIST NVD CVEs, npm, PyPI, Crates, Shopify, etc.) without context bloat.',
+        'Searches built-in keyless site and public-data adapters (such as SEC EDGAR, arXiv, OpenAlex, ClinicalTrials, openFDA, NIST NVD CVEs, npm, PyPI, Crates, job boards, and Shopify) and returns matching adapter URL patterns and capabilities.',
       annotations: {
         title: 'Search Built-In Keyless Site Adapters',
         readOnlyHint: true,
@@ -1101,7 +1152,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'catalog',
       description:
-        'Polite, single-host sequential full-store e-commerce catalog extraction (Shopify /products.json and WooCommerce Store API) with robots.txt + Content-Signal compliance, 3-strikes 429 cooldown, shrink guard, variant-level snapshot diffing, and paged record filtering via catalogId.',
+        'Extracts normalized product, variant, pricing, SKU, and availability records from a public Shopify or WooCommerce storefront (respecting robots.txt and rate limits), or pages and filters an existing catalog snapshot by catalogId.',
       annotations: {
         title: 'Extract & Diff Full Storefront Catalog',
         readOnlyHint: false,
@@ -1112,26 +1163,26 @@ export function buildCanonicalMcpToolSchemas(options?: {
       inputSchema: {
         type: 'object',
         properties: {
-          url: { type: 'string', description: 'Public https:// storefront or collection URL (omit when polling/paging an existing catalogId).' },
-          catalogId: { type: 'string', description: 'Existing catalog run ID (`cat_...`) to poll status or page/filter normalized records.' },
+          url: { type: 'string', description: 'Public https:// storefront or collection URL (omit when paging an existing catalogId).' },
+          catalogId: { type: 'string', description: 'Existing catalog run ID (`cat_...`) to poll status or page/filter product records.' },
           platform: {
             type: 'string',
             enum: ['auto', 'shopify', 'woocommerce'],
             default: 'auto',
             description: 'Storefront platform ("auto" detects Shopify vs WooCommerce).',
           },
-          collection: { type: 'string', description: 'Optional Shopify/WooCommerce collection or category slug.' },
+          collection: { type: 'string', description: 'Optional collection or category slug.' },
           fields: {
             type: 'string',
             enum: ['full', 'lean'],
             default: 'full',
-            description: '"full" includes descriptionText and images; "lean" keeps pricing/SKU/availability fields compact.',
+            description: '"full" includes descriptions and images; "lean" returns compact pricing, SKU, and availability fields.',
           },
           maxPages: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum catalog pages to fetch sequentially.' },
-          pauseMs: { type: 'integer', minimum: 500, maximum: 30000, description: 'Polite pause between sequential pages in ms (>= 2000ms on Shopify).' },
-          sync: { type: 'boolean', default: true, description: 'Set false to run asynchronously via waitUntil and poll with catalogId.' },
+          pauseMs: { type: 'integer', minimum: 500, maximum: 30000, description: 'Polite pause between sequential pages in milliseconds.' },
+          sync: { type: 'boolean', default: true, description: 'Set false to run in the background and poll with catalogId.' },
           offset: { type: 'integer', minimum: 0, description: 'Record offset when paging an existing catalogId.' },
-          limit: { type: 'integer', minimum: 1, maximum: 250, description: 'Max records to return when paging an existing catalogId (default 50).' },
+          limit: { type: 'integer', minimum: 1, maximum: 250, description: 'Maximum records to return when paging an existing catalogId (default 50).' },
           vendor: {
             anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
             description: 'Optional vendor/brand filter when paging catalogId records.',
@@ -1140,10 +1191,10 @@ export function buildCanonicalMcpToolSchemas(options?: {
             anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
             description: 'Optional productType filter when paging catalogId records.',
           },
-          availableOnly: { type: 'boolean', description: 'When true on catalogId record queries, keep only products with >=1 available variant.' },
-          query: { type: 'string', description: 'Optional keyword search across title, handle, vendor, tags, and SKUs when paging catalogId.' },
+          availableOnly: { type: 'boolean', description: 'When true, keep only products with at least one in-stock variant.' },
+          query: { type: 'string', description: 'Optional keyword filter across title, handle, vendor, tags, and SKUs when paging catalogId.' },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
-          site: { type: 'string', description: 'Optional standby site ID when target="agent".' },
+          site: { type: 'string', description: 'Optional worker site ID when target="agent".' },
         },
         additionalProperties: false,
       },
@@ -1151,7 +1202,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'agent',
       description:
-        'Autonomous multi-step web research & structured JSON extraction agent: works with offline local LLMs (Ollama, LM Studio, vLLM) or online BYO-LLM (OpenAI, Anthropic, Gemini, OpenRouter, Workers AI), dynamically routing across all 49+ keyless adapters with zero 3-source cap and $0 Zero Data Retention.',
+        'Runs a multi-step LLM-guided web research and semantic JSON-Schema extraction agent using either a configured server LLM or a caller-supplied BYO-LLM (OpenAI, Anthropic, Gemini, OpenRouter, Ollama, or Workers AI), returning synthesized answers or schema-validated JSON.',
       annotations: {
         title: 'Autonomous Research & Structured Data Agent',
         readOnlyHint: true,
@@ -1162,18 +1213,18 @@ export function buildCanonicalMcpToolSchemas(options?: {
       inputSchema: {
         type: 'object',
         properties: {
-          prompt: { type: 'string', description: 'Natural-language goal or research question (URLs optional).' },
-          agentId: { type: 'string', description: 'Existing agt_... ID to poll status, fetch trace, or cancel.' },
-          trace: { type: 'boolean', default: false, description: 'Return ordered execution spans when polling agentId.' },
+          prompt: { type: 'string', description: 'Natural-language research question or extraction goal.' },
+          agentId: { type: 'string', description: 'Existing `agt_...` run ID to poll status, fetch trace spans, or cancel.' },
+          trace: { type: 'boolean', default: false, description: 'Return execution trace spans when polling agentId.' },
           cancel: { type: 'boolean', default: false, description: 'Cancel a running agentId.' },
-          urls: { type: 'array', items: { type: 'string' }, description: 'Optional seed public https:// URLs.' },
-          strictConstrainToURLs: { type: 'boolean', default: false, description: 'Restrict navigation strictly to seed urls.' },
-          schema: { type: 'object', description: 'Optional JSON Schema for structured output validation.' },
+          urls: { type: 'array', items: { type: 'string' }, description: 'Optional starting public https:// URLs.' },
+          strictConstrainToURLs: { type: 'boolean', default: false, description: 'Restrict navigation strictly to the provided seed urls.' },
+          schema: { type: 'object', description: 'Optional JSON Schema for semantic structured output validation.' },
           effort: { type: 'string', enum: ['low', 'medium', 'high'], default: 'medium' },
           maxSteps: { type: 'integer', minimum: 1, maximum: 20 },
           maxPages: { type: 'integer', minimum: 1, maximum: 40 },
-          threadId: { type: 'string', description: 'Optional prior agt_... threadId for multi-turn continuation.' },
-          zeroDataRetention: { type: 'boolean', default: false, description: '$0 native Zero Data Retention (skips D1/R2 persistence).' },
+          threadId: { type: 'string', description: 'Optional prior `agt_...` threadId for multi-turn follow-up.' },
+          zeroDataRetention: { type: 'boolean', default: false, description: 'When true, skips persisting run history or cached artifacts.' },
           safe: { type: 'boolean', default: false },
           location: {
             type: 'object',
@@ -1184,7 +1235,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
           },
           llm: {
             type: 'object',
-            description: 'Optional BYO-LLM override (e.g. { provider: "ollama"|"openai"|"anthropic"|"gemini", model, baseUrl }).',
+            description: 'Optional BYO-LLM configuration (e.g. { provider: "openai"|"anthropic"|"gemini"|"ollama", model, baseUrl, apiKey }).',
             properties: {
               provider: { type: 'string' },
               baseUrl: { type: 'string' },
@@ -1199,7 +1250,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'discover_mcps',
       description:
-        'Search the Official Model Context Protocol Registry (registry.modelcontextprotocol.io) and Glama MCP Directory (glama.ai) to discover remote Streamable HTTP / SSE and local MCP servers, required auth headers, environment variables, and associated web domains.',
+        'Searches the Official Model Context Protocol Registry and Glama directory to find remote and local MCP servers, returning endpoint URLs, authentication requirements, and associated domains.',
       annotations: {
         title: 'Discover MCP Servers (Official Registry + Glama)',
         readOnlyHint: true,
@@ -1217,7 +1268,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
           remoteOnly: {
             type: 'boolean',
             default: false,
-            description: 'When true, keep only servers advertising remote streamable-http or sse endpoints.',
+            description: 'When true, return only servers offering remote HTTP or SSE endpoints.',
           },
           limit: {
             type: 'integer',
@@ -1233,7 +1284,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
     {
       name: 'query_mcp',
       description:
-        'List your user-isolated connected downstream MCP servers, inspect their cached or live tool schemas on demand (zero top-level context bloat), or execute an authenticated JSON-RPC tools/call against a connected remote MCP server.',
+        'Lists your connected downstream MCP servers, inspects their available tool schemas on demand, or invokes a tool on a connected downstream MCP server.',
       annotations: {
         title: 'Query Connected Federated MCP Server',
         readOnlyHint: false,
@@ -1249,11 +1300,11 @@ export function buildCanonicalMcpToolSchemas(options?: {
             enum: ['list_connected', 'list_tools', 'call_tool'],
             default: 'list_connected',
             description:
-              '"list_connected" lists your connected MCPs and domains; "list_tools" lists tools on server; "call_tool" executes tool on server.',
+              '"list_connected" lists connected MCP servers; "list_tools" inspects tools on a server; "call_tool" executes a tool on a server.',
           },
           server: {
             type: 'string',
-            description: 'Connected MCP server slug or associated domain (required for "list_tools" and "call_tool").',
+            description: 'Connected MCP server slug or domain (required for "list_tools" and "call_tool").',
           },
           tool: {
             type: 'string',
@@ -1266,7 +1317,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
           refresh: {
             type: 'boolean',
             default: false,
-            description: 'When true on action="list_tools", refreshes tools/list live from the remote MCP endpoint.',
+            description: 'When true on action="list_tools", fetches fresh tool definitions from the remote MCP server.',
           },
         },
         additionalProperties: false,
@@ -1311,11 +1362,20 @@ export function truncateResultBodies(
   autoInferredKind = false,
 ): Record<string, unknown> {
   if (!Array.isArray(parsed.results)) return parsed;
-  let promotedTruncatedErrors = 0;
-  let promotedAutoKindSkips = 0;
+  const outcomeDeltas = new Map<string, number>();
+  const recordOutcomeShift = (fromOutcome: unknown, toOutcome: string) => {
+    const prev = typeof fromOutcome === 'string' && fromOutcome ? fromOutcome : 'error';
+    if (prev === toOutcome) return;
+    outcomeDeltas.set(prev, (outcomeDeltas.get(prev) ?? 0) - 1);
+    outcomeDeltas.set(toOutcome, (outcomeDeltas.get(toOutcome) ?? 0) + 1);
+  };
   const results = parsed.results.map((item) => {
     if (!item || typeof item !== 'object') return item;
     const copy = { ...(item as Record<string, unknown>) };
+    const origOutcome = copy.outcome;
+    if (typeof copy.problem === 'string') {
+      copy.problem = scrubResolverIpFromError(copy.problem);
+    }
     if (copy.headers !== undefined) {
       const safeHdrs =
         copy.headers && typeof copy.headers === 'object' && !Array.isArray(copy.headers)
@@ -1332,6 +1392,11 @@ export function truncateResultBodies(
       copy.artifactId = art.blobSha256;
     }
 
+    // Normalize HTTP 404 to `not_found` while keeping HTTP 410 as `gone`.
+    if (copy.status === 404 && (copy.outcome === 'gone' || copy.outcome === 'error')) {
+      copy.outcome = 'not_found';
+    }
+
     // Finding #3: HTTP 2xx body size truncation is a truncated success (`outcome: "ok", truncated: true`), not an error.
     if (
       copy.truncated === true &&
@@ -1342,7 +1407,6 @@ export function truncateResultBodies(
     ) {
       copy.outcome = 'ok';
       delete copy.problem;
-      promotedTruncatedErrors++;
     }
 
     // When caller omitted `kind` (`autoInferredKind === true` or `copy.kindAuto === true`) and an extensionless URL returned HTTP 2xx with a valid
@@ -1361,7 +1425,6 @@ export function truncateResultBodies(
     ) {
       copy.outcome = 'ok';
       delete copy.problem;
-      promotedAutoKindSkips++;
     }
 
     // Finding #5: Always explain why a response was skipped (e.g. non-HTML content-type on `kind: "page"`).
@@ -1382,7 +1445,20 @@ export function truncateResultBodies(
         if (redir.filtersMayBeLost) copy.filtersMayBeLost = true;
       }
     }
-    if (copy.outcome !== 'ok' && typeof copy.url === 'string') {
+    if (copy.outcome !== 'ok' && isDnsNotFoundError(copy.outcome, copy.problem)) {
+      copy.outcome = 'dns_not_found';
+      copy.error = 'dns_not_found';
+      copy.retryable = false;
+      copy.message = DNS_NOT_FOUND_MESSAGE;
+      copy.problem = typeof copy.problem === 'string' && copy.problem ? copy.problem : DNS_NOT_FOUND_MESSAGE;
+      delete copy.blocked;
+      delete copy.body;
+    } else if (copy.outcome !== 'ok' && isSsrfBlockedError(copy.outcome, copy.problem)) {
+      copy.outcome = 'blocked';
+      copy.blocked = { ...SSRF_BLOCKED_INFO };
+      copy.problem = SSRF_BLOCKED_INFO.message;
+      delete copy.body;
+    } else if (copy.outcome !== 'ok' && typeof copy.url === 'string') {
       if (!copy.waf && typeof copy.status === 'number' && copy.status !== 402 && copy.outcome !== 'payment_required') {
         const inferredWaf = classifyWafAndChallenge({
           status: copy.status,
@@ -1413,6 +1489,9 @@ export function truncateResultBodies(
         copy.body = copy.body.replace(/(<span\b[^>]*\bid=["']?cf-footer-ip["']?[^>]*>)[^<]{1,80}(<\/span>)/gi, '$1[redacted]$2');
       }
     }
+    if (typeof copy.outcome === 'string' && copy.outcome !== origOutcome) {
+      recordOutcomeShift(origOutcome, copy.outcome);
+    }
 
     if (typeof copy.body === 'string' && copy.body.length > inlineMaxChars) {
       const totalChars = copy.body.length;
@@ -1431,18 +1510,15 @@ export function truncateResultBodies(
     return copy;
   });
 
-  if ((promotedTruncatedErrors > 0 || promotedAutoKindSkips > 0) && parsed.summary && typeof parsed.summary === 'object') {
+  if (outcomeDeltas.size > 0 && parsed.summary && typeof parsed.summary === 'object') {
     const sumCopy = { ...(parsed.summary as Record<string, unknown>) };
     if (sumCopy.byOutcome && typeof sumCopy.byOutcome === 'object') {
       const byOut = { ...(sumCopy.byOutcome as Record<string, number>) };
-      byOut.ok = (byOut.ok ?? 0) + promotedTruncatedErrors + promotedAutoKindSkips;
-      if (promotedTruncatedErrors > 0) {
-        byOut.error = Math.max(0, (byOut.error ?? 0) - promotedTruncatedErrors);
-        if (byOut.error === 0) delete byOut.error;
-      }
-      if (promotedAutoKindSkips > 0) {
-        byOut.skip = Math.max(0, (byOut.skip ?? 0) - promotedAutoKindSkips);
-        if (byOut.skip === 0) delete byOut.skip;
+      for (const [outKey, delta] of outcomeDeltas.entries()) {
+        if (delta === 0) continue;
+        const nextVal = Math.max(0, (byOut[outKey] ?? 0) + delta);
+        if (nextVal === 0) delete byOut[outKey];
+        else byOut[outKey] = nextVal;
       }
       sumCopy.byOutcome = byOut;
     }
@@ -1610,13 +1686,38 @@ async function handleToolCallInner(
     }
 
     let formatted: unknown = res.bodyText;
+    let singleDnsOrSsrfErr = false;
     try {
       const parsed = JSON.parse(res.bodyText) as Record<string, unknown>;
+      const truncatedObj = truncateResultBodies(parsed, inlineMaxChars, explicitKind === undefined);
+      const firstItem =
+        name === 'fetch_url' && Array.isArray(truncatedObj.results) && truncatedObj.results.length === 1
+          ? (truncatedObj.results[0] as Record<string, unknown> | undefined)
+          : undefined;
+      const topDnsFields =
+        firstItem?.outcome === 'dns_not_found'
+          ? {
+              ok: false,
+              error: 'dns_not_found',
+              retryable: false,
+              message: DNS_NOT_FOUND_MESSAGE,
+            }
+          : firstItem?.outcome === 'blocked' && firstItem.blocked
+            ? {
+                ok: false,
+                outcome: 'blocked',
+                blocked: firstItem.blocked,
+              }
+            : {};
+      if (firstItem?.outcome === 'dns_not_found' || firstItem?.outcome === 'blocked') {
+        singleDnsOrSsrfErr = true;
+      }
       formatted = {
+        ...topDnsFields,
         via: res.via,
-        httpStatus: res.status,
+        httpStatus: firstItem?.outcome === 'dns_not_found' ? 502 : res.status,
         ...(res.stageTimingsMs ? { stageTimingsMs: res.stageTimingsMs } : {}),
-        ...truncateResultBodies(parsed, inlineMaxChars, explicitKind === undefined),
+        ...truncatedObj,
       };
     } catch {
       formatted = {
@@ -1629,7 +1730,7 @@ async function handleToolCallInner(
 
     return {
       content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
-      ...(res.status >= 400 ? { isError: true } : {}),
+      ...(res.status >= 400 || singleDnsOrSsrfErr ? { isError: true } : {}),
     };
   }
 
@@ -1638,7 +1739,7 @@ async function handleToolCallInner(
       return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
     }
     if (!deps.readArtifact) {
-      return { content: [{ type: 'text', text: 'R2 artifact storage is not configured on this hub.' }], isError: true };
+      return { content: [{ type: 'text', text: 'Artifact storage is not configured on this hub.' }], isError: true };
     }
     const blobSha256 = typeof args.artifactId === 'string' ? args.artifactId.trim().toLowerCase() : '';
     const retention = args.retention === 'stored' ? 'stored' : args.retention === 'transient' ? 'transient' : undefined;
@@ -1656,11 +1757,31 @@ async function handleToolCallInner(
       userId,
     });
     if (!out.ok) {
+      const isMissing =
+        out.error === 'artifact_not_found' ||
+        out.error === 'artifact_expired' ||
+        out.status === 404 ||
+        out.status === 410;
+      const errBody = isMissing
+        ? {
+            ok: false,
+            status: 404,
+            via: 'hub',
+            error: 'artifact_not_found',
+            message: 'Artifact was not found or has expired.',
+          }
+        : {
+            ok: false,
+            status: out.status,
+            via: 'hub',
+            error: out.error,
+            ...(out.message ? { message: out.message } : {}),
+          };
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ error: out.error, status: out.status, ...(out.message ? { message: out.message } : {}) }),
+            text: JSON.stringify(errBody, null, 2),
           },
         ],
         isError: true,
@@ -1852,10 +1973,26 @@ async function handleToolCallInner(
   if (name === 'query_mcp') {
     const action = typeof args.action === 'string' ? args.action : 'list_connected';
     if (action === 'call_tool') {
-      if (!scopes.includes('crawl:fetch')) {
-        return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:fetch is required.' }], isError: true };
+      if (!scopes.includes('mcp:call')) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  ok: false,
+                  error: 'insufficient_scope',
+                  message: 'OAuth scope mcp:call is required for action="call_tool"',
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
       }
-    } else if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
+    } else if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch') && !scopes.includes('mcp:call')) {
       return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
     }
     if (!deps.executeQueryMcp) {
@@ -1980,7 +2117,7 @@ async function dispatchRpcMessage(
         body: jsonRpcResult(id, {
           resultType: 'complete',
           supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
-          capabilities: { tools: {} },
+          capabilities: { tools: { listChanged: true } },
           _meta: {
             'io.modelcontextprotocol/serverInfo': { name: deps.serverName, version: deps.serverVersion },
           },
@@ -2006,7 +2143,7 @@ async function dispatchRpcMessage(
       return {
         body: jsonRpcResult(id, {
           protocolVersion,
-          capabilities: { tools: {} },
+          capabilities: { tools: { listChanged: true } },
           serverInfo: { name: deps.serverName, version: deps.serverVersion },
           instructions: MCP_INSTRUCTIONS,
         }),

@@ -569,8 +569,8 @@ func TestCrawlRunWithSinkRedirectsRenderAndErrorPaths(t *testing.T) {
 	}
 	// hop>0 allow rejection.
 	rHopAllow := cAuto.Run(context.Background(), []Request{{ID: "ha", URL: "http://a.test/to-blocked", Kind: classify.KindPage}}, Options{PauseMs: 1})
-	if rHopAllow[0].Outcome != classify.OutcomeError || !strings.Contains(rHopAllow[0].Problem, "loopback blocked") {
-		t.Fatalf("expected redirect allow err, got %+v", rHopAllow[0])
+	if rHopAllow[0].Outcome != classify.OutcomeBlockedSSRF || rHopAllow[0].BlockedReason != "ssrf" || !strings.Contains(rHopAllow[0].Problem, "loopback blocked") {
+		t.Fatalf("expected redirect allow SSRF block, got %+v", rHopAllow[0])
 	}
 	// >5 redirects & invalid redirect Location.
 	rMore5 := cAuto.Run(context.Background(), []Request{{ID: "m5", URL: "http://a.test/loop?n=0", Kind: classify.KindPage}}, Options{PauseMs: 1})
@@ -1183,7 +1183,7 @@ func TestCrawlLLMsScrapeAndServerHandlers(t *testing.T) {
 	}{
 		{"challenge", "", classify.OutcomeChallenge, 4096},
 		{"err", "https://b.test/", classify.OutcomeError, 4096},
-		{"blocked_final", "", classify.OutcomeError, 4096},
+		{"blocked_final", "", classify.OutcomeBlockedSSRF, 4096},
 		{"huge", "", classify.OutcomeError, 32},
 		{"empty", "", classify.OutcomeOK, 4096},
 	} {

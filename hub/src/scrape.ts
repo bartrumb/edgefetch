@@ -49,12 +49,21 @@ import {
   detectWorkdayRedirectStub,
   extractJobPostingJsonLd,
   formatJobPostingHeaderMarkdown,
+  hasExecutableScriptTag,
   isThinScriptedPage,
   resolveAtsPreFetchSpec,
   type StructuredJobPosting,
 } from './jobs';
 import { computeMarkdownChanges } from './map-crawl';
-import { MARKDOWN_FOR_AGENTS_ACCEPT, validatePublicHttpsTargetUrl } from './overflow';
+import {
+  DNS_NOT_FOUND_MESSAGE,
+  isDnsNotFoundError,
+  isSsrfBlockedError,
+  MARKDOWN_FOR_AGENTS_ACCEPT,
+  scrubResolverIpFromError,
+  SSRF_BLOCKED_INFO,
+  validatePublicHttpsTargetUrl,
+} from './overflow';
 import { getActiveRequestTracer, sanitizeUrlForSpan, setActiveSpanAttribute, type RequestTracer, type TraceContext } from './otel';
 import {
   chunkMarkdownForSearch,
@@ -152,6 +161,7 @@ export interface ExtractedDocument {
   wordCount?: number;
   language?: string;
   canonicalUrl?: string;
+  isVideoPage?: boolean;
   markdownAlternateUrl?: string;
   favicon?: string;
   extractorId?: string;
@@ -162,6 +172,8 @@ export interface ExtractedDocument {
   truncated?: boolean;
   nextCursor?: string;
   inertiaHydrated?: boolean;
+  sectionExpandedFromHeading?: boolean;
+  warnings?: string[];
   markdown: string;
   text: string;
   links: string[];
@@ -419,6 +431,10 @@ function hardenMarkdownFenceStructure(md: string): string {
   let inFence = false;
   let fenceChar = '';
   let fenceLen = 0;
+  let effectiveFenceLen = 0;
+  let fenceOpenOutIdx = -1;
+  let fenceOpenInfo = '';
+  let fenceOpenCr = '';
   let fenceContainerIndent = 0;
   let activeListIndent = 0;
   let escapedRiskyFence: { ch: string; len: number; needBlockquote: boolean } | null = null;
@@ -432,10 +448,12 @@ function hardenMarkdownFenceStructure(md: string): string {
     if (inFence) {
       // Container dedent MUST be checked BEFORE closing fence so `- item\n  ```\n``` ` emits an explicit close for the list fence first!
       if (!isBlank && fenceContainerIndent > 0 && cols < fenceContainerIndent) {
-        out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(fenceLen)}`);
+        out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(effectiveFenceLen)}`);
         inFence = false;
         fenceChar = '';
         fenceLen = 0;
+        effectiveFenceLen = 0;
+        fenceOpenOutIdx = -1;
         fenceContainerIndent = 0;
         activeListIndent = 0;
         // Fall through and process `raw` as prose / new block!
@@ -449,12 +467,21 @@ function hardenMarkdownFenceStructure(md: string): string {
           if (runLen >= fenceLen) {
             while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
             if (p === raw.length) {
-              out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(runLen)}${cr}`);
+              const closeLen = Math.max(runLen, effectiveFenceLen);
+              out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(closeLen)}${cr}`);
               inFence = false;
               fenceChar = '';
               fenceLen = 0;
+              effectiveFenceLen = 0;
+              fenceOpenOutIdx = -1;
               fenceContainerIndent = 0;
               continue;
+            }
+            // Inner line has `>= effectiveFenceLen` fence chars followed by non-whitespace (` ```~ ` or ` ~~~` `):
+            // lengthen the outer fence (`effectiveFenceLen = runLen + 1`) so `marked` can never close prematurely on it!
+            if (runLen >= effectiveFenceLen && fenceOpenOutIdx >= 0) {
+              effectiveFenceLen = runLen + 1;
+              out[fenceOpenOutIdx] = `${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(effectiveFenceLen)}${fenceOpenInfo}${fenceOpenCr}`;
             }
           }
         }
@@ -519,9 +546,13 @@ function hardenMarkdownFenceStructure(md: string): string {
             inFence = true;
             fenceChar = c0 === 96 ? '`' : '~';
             fenceLen = fLen;
+            effectiveFenceLen = fLen;
             // Normalize top-level `1..3` space fences to col-0 so dedented lines inside top-level fences never cause desync
             fenceContainerIndent = activeListIndent > 0 ? activeListIndent : 0;
             const cleanInfo = cleanFenceInfoStringLinear(infoRaw);
+            fenceOpenInfo = cleanInfo;
+            fenceOpenCr = cr;
+            fenceOpenOutIdx = out.length;
             out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(fLen)}${cleanInfo}${cr}`);
             continue;
           }
@@ -583,7 +614,7 @@ function hardenMarkdownFenceStructure(md: string): string {
 
   // Never leave a code fence unclosed at EOF (`marked4` renders unclosed single-line EOF fences as inline prose!)
   if (inFence) {
-    out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(fenceLen)}`);
+    out.push(`${' '.repeat(fenceContainerIndent)}${fenceChar.repeat(effectiveFenceLen)}`);
   }
 
   return out.join('\n');
@@ -931,7 +962,9 @@ function inferCodeFenceLang(preAttrStr: string, codeAttrStr = ''): string {
 function cleanHeadingPermalinks(headingText: string): string {
   return headingText
     .replace(/^§\s+/, '')
+    .replace(/\s*\[\s*(?:edit|edit\s+source)(?:\s*\|\s*(?:edit|edit\s+source))?\s*\]\s*$/i, '')
     .replace(/\s+¶\s+(added in\s+\S+)$/i, ' ($1)')
+    .replace(/\s*\[[§¶#]\]\([^)]*\)\s*$/g, '')
     .replace(/\s+[§¶#]+$/, '')
     .trim();
 }
@@ -953,6 +986,10 @@ export function redactPiiText(text: string): string {
       out = out.replace(PII_SSN_RE, '[REDACTED_SSN]');
     }
     out = out.replace(PII_PHONE_RE, '[REDACTED_PHONE]');
+  }
+  if (out.includes('[REDACTED_')) {
+    // Prevent `[REDACTED_...]` replacement tokens from completing Markdown links, images, or reference definitions (`[REDACTED_EMAIL](javascript:...)`)
+    out = out.replace(/(\[REDACTED_(?:EMAIL|SSN|PHONE)\][ \t]*)([([:])/g, '$1\\$2');
   }
   return out;
 }
@@ -988,6 +1025,10 @@ const ALWAYS_HIDDEN_OR_CHROME_CLASSES = new Set([
   'doc-anchor',
   'documentation-idlink',
   'headerlink',
+  'pilcrow',
+  'mw-editsection',
+  'mw-editsection-bracket',
+  'mw-editsection-divider',
   'sphinxsidebar',
   'katex-html',
   'mwe-math-fallback-image-inline',
@@ -1247,12 +1288,26 @@ function extractSchemaMetadataAndBody(entities: Array<Record<string, unknown>>):
   modifiedTime?: string;
   siteName?: string;
   articleBody?: string;
+  hasVideoObject?: boolean;
+  videoName?: string;
+  videoDescription?: string;
+  videoTranscript?: string;
 } {
   let author: string | undefined;
   let publishedTime: string | undefined;
   let modifiedTime: string | undefined;
   let siteName: string | undefined;
   let articleBody: string | undefined;
+  let hasVideoObject = false;
+  let videoName: string | undefined;
+  let videoDescription: string | undefined;
+  let videoTranscript: string | undefined;
+
+  const hasVideoType = (rawType: unknown): boolean => {
+    if (typeof rawType === 'string') return /\bvideoobject\b/i.test(rawType);
+    if (Array.isArray(rawType)) return rawType.some((t) => typeof t === 'string' && /\bvideoobject\b/i.test(t));
+    return false;
+  };
 
   const extractAuthorNames = (rawAuthor: unknown): string[] => {
     if (!rawAuthor) return [];
@@ -1300,6 +1355,24 @@ function extractSchemaMetadataAndBody(entities: Array<Record<string, unknown>>):
     if (bodyCand && (!articleBody || bodyCand.length > articleBody.length)) {
       articleBody = bodyCand;
     }
+    if (hasVideoType(ent['@type'])) {
+      hasVideoObject = true;
+      if (!videoName && typeof ent.name === 'string' && !isPlaceholderMetaValue(ent.name)) {
+        videoName = cleanInlineHtml(ent.name);
+      }
+      if (typeof ent.description === 'string' && !isPlaceholderMetaValue(ent.description)) {
+        const cleanVd = cleanInlineHtml(ent.description);
+        if (cleanVd && (!videoDescription || cleanVd.length > videoDescription.length)) {
+          videoDescription = cleanVd;
+        }
+      }
+      if (typeof ent.transcript === 'string' && !isPlaceholderMetaValue(ent.transcript)) {
+        const cleanVt = cleanInlineHtml(ent.transcript);
+        if (cleanVt && (!videoTranscript || cleanVt.length > videoTranscript.length)) {
+          videoTranscript = cleanVt;
+        }
+      }
+    }
   }
   return {
     ...(author ? { author } : {}),
@@ -1307,6 +1380,10 @@ function extractSchemaMetadataAndBody(entities: Array<Record<string, unknown>>):
     ...(modifiedTime ? { modifiedTime } : {}),
     ...(siteName ? { siteName } : {}),
     ...(articleBody ? { articleBody } : {}),
+    ...(hasVideoObject ? { hasVideoObject: true } : {}),
+    ...(videoName ? { videoName } : {}),
+    ...(videoDescription ? { videoDescription } : {}),
+    ...(videoTranscript ? { videoTranscript } : {}),
   };
 }
 
@@ -1360,11 +1437,12 @@ function applyIncludeAndExcludeTagSelectors(
   html: string,
   includeTags?: readonly string[],
   excludeTags?: readonly string[],
+  metaOut?: { sectionExpandedFromHeading?: boolean; warnings?: string[] },
 ): string {
   let out = html.length > MAX_HTML_SCAN_CHARS ? html.slice(0, MAX_HTML_SCAN_CHARS) : html;
   const parsedInclude = parseSimpleSelectorList(includeTags);
   if (parsedInclude.length > 0) {
-    const kept: string[] = [];
+    const matchedRanges: Array<{ tagLower: string; startIdx: number; endIdx: number }> = [];
     let matchTag = '';
     let matchDepth = 0;
     let matchStart = 0;
@@ -1380,7 +1458,7 @@ function applyIncludeAndExcludeTagSelectors(
             if (isClosing) {
               matchDepth--;
               if (matchDepth === 0) {
-                kept.push(src.slice(matchStart, tag.end));
+                matchedRanges.push({ tagLower: matchTag, startIdx: matchStart, endIdx: tag.end });
               }
             } else if (!isSelfClosing) {
               matchDepth++;
@@ -1390,7 +1468,7 @@ function applyIncludeAndExcludeTagSelectors(
         }
         if (!isClosing && tagMatchesSimpleSelectors(tagLower, tag.attrs, parsedInclude)) {
           if (isSelfClosing) {
-            kept.push(tag.rawTag);
+            matchedRanges.push({ tagLower, startIdx: tag.index, endIdx: tag.end });
           } else {
             matchTag = tagLower;
             matchDepth = 1;
@@ -1401,9 +1479,72 @@ function applyIncludeAndExcludeTagSelectors(
       MAX_HTML_SCAN_CHARS,
       false,
     );
-    if (matchDepth > 0) kept.push(src.slice(matchStart));
-    if (kept.length > 0) {
-      out = kept.join('\n\n');
+    if (matchDepth > 0) {
+      matchedRanges.push({ tagLower: matchTag, startIdx: matchStart, endIdx: src.length });
+    }
+    if (matchedRanges.length > 0) {
+      const allHeadingsOnly = matchedRanges.every((m) => /^h[1-6]$/.test(m.tagLower));
+      if (allHeadingsOnly) {
+        const expandedKept: string[] = [];
+        let anyExpanded = false;
+        const sectionCloseTags = new Set(['section', 'article', 'main', 'body', 'html']);
+        for (const m of matchedRanges) {
+          const matchedLevel = Number(m.tagLower.slice(1));
+          const tail = src.slice(m.endIdx);
+          let stopRelIdx = tail.length;
+          let containerDepth = 0;
+          scanHtmlTagsLinear(
+            tail,
+            (t) => {
+              const tl = t.tagNameLower;
+              if (!t.isClosing && /^h[1-6]$/.test(tl)) {
+                const lvl = Number(tl.slice(1));
+                if (lvl <= matchedLevel) {
+                  stopRelIdx = t.index;
+                  return false;
+                }
+              }
+              if (sectionCloseTags.has(tl)) {
+                if (!t.isClosing && !t.isSelfClosing) {
+                  containerDepth++;
+                } else if (t.isClosing) {
+                  if (containerDepth === 0) {
+                    stopRelIdx = t.index;
+                    return false;
+                  }
+                  containerDepth--;
+                }
+              }
+              return undefined;
+            },
+            MAX_HTML_SCAN_CHARS,
+            false,
+          );
+          const extraSlice = tail.slice(0, stopRelIdx);
+          if (cleanInlineHtml(extraSlice).length > 0) {
+            anyExpanded = true;
+            expandedKept.push(src.slice(m.startIdx, m.endIdx + stopRelIdx));
+          } else {
+            expandedKept.push(src.slice(m.startIdx, m.endIdx));
+          }
+        }
+        out = expandedKept.join('\n\n');
+        if (metaOut) {
+          metaOut.warnings ??= [];
+          if (anyExpanded) {
+            metaOut.sectionExpandedFromHeading = true;
+            metaOut.warnings.push(
+              'includeTags selector matched a heading element only; included section content up to the next heading of same or higher rank.',
+            );
+          } else {
+            metaOut.warnings.push(
+              'includeTags selector matched a heading element only with no following sibling prose; pass a container selector for full prose.',
+            );
+          }
+        }
+      } else {
+        out = matchedRanges.map((m) => src.slice(m.startIdx, m.endIdx)).join('\n\n');
+      }
     }
   }
 
@@ -2418,6 +2559,7 @@ export function extractHtmlDocument(
   let modifiedTime: string | undefined;
   let siteName: string | undefined;
   let ogImage: string | undefined;
+  let ogType: string | undefined;
   let themeColor: string | undefined;
   let firstDatetimeAttr: string | undefined;
   let canonicalUrl: string | undefined;
@@ -2447,6 +2589,7 @@ export function extractHtmlDocument(
         if ((key === 'description' || key === 'og:description') && !description) description = content;
         if (key === 'og:title' && !title) title = content;
         if ((key === 'og:image' || key === 'twitter:image') && !ogImage) ogImage = resolveHttpsHref(content, baseUrl);
+        if (key === 'og:type' && !ogType) ogType = content.toLowerCase();
         if (key === 'theme-color' && !themeColor) themeColor = content;
         if ((key === 'og:site_name' || key === 'application-name') && !siteName) siteName = content;
         if (
@@ -2682,9 +2825,36 @@ export function extractHtmlDocument(
   );
   let work = withoutCommentsAndScripts;
 
+  let primaryH1Text = '';
+  if (onlyMainContent && (!includeTags || includeTags.length === 0) && /<h1\b/i.test(work)) {
+    const h1ScanSrc = stripHtmlTagsLinear(work, ['nav', 'footer', 'aside', 'dialog', 'menu'], '', MAX_HTML_SCAN_CHARS);
+    replacePairedHtmlElementsLinear(
+      h1ScanSrc,
+      ['h1'],
+      (_hf, _ht, _ha, hInner) => {
+        if (!primaryH1Text) {
+          const cleaned = cleanHeadingPermalinks(
+            cleanInlineHtml(
+              replacePairedHtmlElementsLinear(hInner, ['span', 'a'], (sf, st, sa, si) => {
+                if (st === 'span' && /\bmw-editsection(?:-bracket|-divider)?\b/i.test(sa)) return '';
+                if (st === 'a' && (/[?&](?:ve)?action=edit\b/i.test(sa) || /\b(?:pilcrow|headerlink|doc-anchor)\b/i.test(sa))) return '';
+                if (st === 'a' && /^[¶§#]$/.test(cleanInlineHtml(si))) return '';
+                return sf;
+              }),
+            ),
+          );
+          if (cleaned) primaryH1Text = cleaned;
+        }
+        return '';
+      },
+      { maxChars: MAX_HTML_SCAN_CHARS, maxInnerChars: 2_048 },
+    );
+  }
+
+  const selectorMeta: { sectionExpandedFromHeading?: boolean; warnings?: string[] } = {};
   let extractedMarkdownBodyOnly = false;
   if (includeTags && includeTags.length > 0) {
-    work = applyIncludeAndExcludeTagSelectors(work, includeTags, excludeTags);
+    work = applyIncludeAndExcludeTagSelectors(work, includeTags, excludeTags, selectorMeta);
   } else if (onlyMainContent) {
     work = stripHtmlTagsLinear(work, ['nav', 'footer', 'aside', 'dialog', 'menu'], '', MAX_HTML_SCAN_CHARS);
     // Substack rendered post body (`<div class="body markup">`) or `window._preloads` `body_html`
@@ -2753,13 +2923,16 @@ export function extractHtmlDocument(
     work = stripHtmlTagsLinear(stripHiddenAndChromeSubtrees(work), ['nav', 'footer', 'aside'], '', MAX_HTML_SCAN_CHARS);
     work = replacePairedHtmlElementsLinear(work, ['span', 'a', 'label', 'ul', 'form', 'button', 'details'], (full, tag, attrStr, inner) => {
       if (tag === 'span') {
-        if (/\bmw-editsection-bracket\b/i.test(attrStr)) return '';
-        if (/\bmw-editsection\b/i.test(attrStr) && !inner.trim()) return '';
+        if (/\bmw-editsection(?:-bracket|-divider)?\b/i.test(attrStr)) return '';
         return full;
       }
       if (tag === 'a') {
+        const anchorLabel = cleanInlineHtml(inner);
         if (
-          /[?&]action=edit\b/i.test(attrStr) ||
+          /[?&](?:ve)?action=edit\b/i.test(attrStr) ||
+          /\b(?:pilcrow|headerlink|doc-anchor)\b/i.test(attrStr) ||
+          anchorLabel === '¶' ||
+          anchorLabel === '[¶]' ||
           /href=(?:"https:\/\/www\.wikidata\.org\/wiki\/Special:EntityPage\/[^"]*"|'https:\/\/www\.wikidata\.org\/wiki\/Special:EntityPage\/[^']*')/i.test(
             attrStr,
           )
@@ -2798,6 +2971,24 @@ export function extractHtmlDocument(
     work = pruneHighLinkDensityBlocks(work);
   } else if (excludeTags && excludeTags.length > 0) {
     work = applyIncludeAndExcludeTagSelectors(work, undefined, excludeTags);
+  }
+  if (!onlyMainContent || (includeTags && includeTags.length > 0)) {
+    // Strip MediaWiki edit chrome & standalone pilcrow permalink anchors even when `onlyMainContent: false` or `includeTags` is used.
+    work = replacePairedHtmlElementsLinear(work, ['span', 'a'], (full, tag, attrStr, inner) => {
+      if (tag === 'span' && /\bmw-editsection(?:-bracket|-divider)?\b/i.test(attrStr)) return '';
+      if (tag === 'a') {
+        const lbl = cleanInlineHtml(inner);
+        if (
+          /[?&](?:ve)?action=edit\b/i.test(attrStr) ||
+          /\b(?:pilcrow|headerlink|doc-anchor)\b/i.test(attrStr) ||
+          lbl === '¶' ||
+          lbl === '[¶]'
+        ) {
+          return '';
+        }
+      }
+      return full;
+    });
   }
 
   const codeStash: string[] = [];
@@ -3261,7 +3452,10 @@ export function extractHtmlDocument(
           if (listIndent) {
             return `${listIndent[1]}${collapseTagBoundaryPunctuation(listIndent[2]!.replace(/[ \t]{2,}/g, ' ').trim())}`;
           }
-          return collapseTagBoundaryPunctuation(normalizedTask.replace(/[ \t]{2,}/g, ' ').trim());
+          const cleanedLine = collapseTagBoundaryPunctuation(normalizedTask.replace(/[ \t]{2,}/g, ' ').trim())
+            .replace(/[ \t]*\[¶\]\([^)]*\)[ \t]*$/g, '')
+            .replace(/[ \t]+¶$/, '');
+          return cleanedLine;
         })
         .filter(
           (line) =>
@@ -3284,6 +3478,17 @@ export function extractHtmlDocument(
     md = md.replace(/\n+##[ \t]+Help improve MDN\b[\s\S]{0,600}$/i, '');
   }
   md = md.replace(/\n{3,}/g, '\n\n').trim();
+  if (
+    primaryH1Text &&
+    onlyMainContent &&
+    (!includeTags || includeTags.length === 0) &&
+    !ytMeta &&
+    !hnExtracted &&
+    md &&
+    !/^#[ \t]+\S/m.test(md)
+  ) {
+    md = `# ${primaryH1Text}\n\n${md}`;
+  }
 
   let matchedSiteExtracted: PostFetchSiteResult | null = null;
   let inertiaHydrated = false;
@@ -3389,11 +3594,42 @@ export function extractHtmlDocument(
     }
   }
 
+  // Field Issue #5: Video-Only Bulletin Detection & `VideoObject` Description/Transcript Rescue
+  let isVideoPage = false;
+  const hasVideoPathSignal = Boolean(baseUrl && /\/videos?(?:\/|$)/i.test(baseUrl));
+  const hasVideoSignal = Boolean((ogType && ogType.startsWith('video')) || schemaMeta.hasVideoObject || hasVideoPathSignal);
+  if (hasVideoSignal) {
+    const nonEmptyMdLines = md
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const linkHeavyLineCount = nonEmptyMdLines.filter((l) => /^(?:[-*+]\s+)?\[[^\]]+\]\([^)]+\)$|^#{1,6}\s+/.test(l)).length;
+    const isMostlyHeadlineLinks =
+      nonEmptyMdLines.length > 0 && linkHeavyLineCount / nonEmptyMdLines.length >= 0.65;
+    const proseWithoutLinks = md.replace(/\[([^\]]*)\]\([^)]*\)/g, '').trim();
+    const isThinVideoBody = md.trim().length < 400 || proseWithoutLinks.length < 240 || isMostlyHeadlineLinks;
+    if (isThinVideoBody) {
+      isVideoPage = true;
+      const vHeading = schemaMeta.videoName || title;
+      const vDesc = schemaMeta.videoDescription || description;
+      const vTranscript = schemaMeta.videoTranscript;
+      if (vDesc || vTranscript) {
+        const videoParts: string[] = [];
+        if (vHeading) videoParts.push(`# ${vHeading}`);
+        if (vDesc) videoParts.push(vDesc);
+        if (vTranscript && vTranscript !== vDesc) {
+          videoParts.push(`## Transcript\n\n${vTranscript}`);
+        }
+        md = videoParts.join('\n\n');
+      }
+    }
+  }
+
   let plainText = ytMeta
     ? ytMeta.markdown
     : hnExtracted
       ? hnExtracted.markdown
-      : inertiaHydrated
+      : inertiaHydrated || isVideoPage
         ? md
         : cleanInlineHtml(work);
   if (redactPii) {
@@ -3420,6 +3656,7 @@ export function extractHtmlDocument(
     ...(wordCount > 0 ? { wordCount } : {}),
     ...(language ? { language } : {}),
     ...(canonicalUrl ? { canonicalUrl } : {}),
+    ...(isVideoPage ? { isVideoPage: true } : {}),
     ...(markdownAlternateUrl ? { markdownAlternateUrl } : {}),
     ...(favicon ? { favicon } : {}),
     ...(matchedSiteExtracted?.extractorId ? { extractorId: matchedSiteExtracted.extractorId } : {}),
@@ -3430,6 +3667,8 @@ export function extractHtmlDocument(
     ...(matchedSiteExtracted?.truncated !== undefined ? { truncated: matchedSiteExtracted.truncated } : {}),
     ...(matchedSiteExtracted?.nextCursor !== undefined ? { nextCursor: matchedSiteExtracted.nextCursor } : {}),
     ...(inertiaHydrated ? { inertiaHydrated: true } : {}),
+    ...(selectorMeta.sectionExpandedFromHeading ? { sectionExpandedFromHeading: true } : {}),
+    ...(selectorMeta.warnings && selectorMeta.warnings.length > 0 ? { warnings: selectorMeta.warnings } : {}),
     markdown: md,
     text: plainText,
     links,
@@ -3730,23 +3969,65 @@ export function parseLlmsTxt(raw: string, sourceUrl: string): ParsedLlmsTxt | nu
  * Deterministic schema-guided structured JSON extractor (`formats: [{ type: 'json', schema }]`).
  * Inspects JSON-LD (`application/ld+json`), meta tags, and Markdown key/value lines without calling external LLMs.
  */
-export function extractStructuredJsonFromPage(
+const HEURISTIC_BOILERPLATE_ITEM_RE =
+  /^(?:see full compatibility|learn more|specifications?|browser compatibility|see also|help improve mdn|report a problem(?: with this content)?|view on github|edit this page|skip to (?:main content|search|select language)|table of contents|in this article|on this page|back to top|read more|cookie preferences|privacy policy|terms of (?:use|service))$/i;
+
+function extractPrimaryEntityNameForSchema(rawHtml: string, doc: ExtractedDocument, propNameLower: string): string | undefined {
+  const mdHeadMatch = doc.markdown ? /^#[ \t]+(.+)$/m.exec(doc.markdown) : null;
+  let candidate = mdHeadMatch?.[1]
+    ? cleanHeadingPermalinks(stripMarkdownLinksToLabelsLinear(mdHeadMatch[1]).replace(/`/g, '').trim())
+    : '';
+  if (!candidate && rawHtml && /<h1\b/i.test(rawHtml)) {
+    replacePairedHtmlElementsLinear(
+      rawHtml,
+      ['h1'],
+      (_f, _t, _a, inner) => {
+        if (!candidate) candidate = cleanHeadingPermalinks(cleanInlineHtml(inner).replace(/`/g, '').trim());
+        return '';
+      },
+      { maxChars: 65_536, maxInnerChars: 1_024 },
+    );
+  }
+  if (!candidate && doc.title) {
+    candidate = doc.title.split(/\s+(?:[-–—|:]|·)\s+/)[0]?.trim() ?? '';
+  }
+  if (!candidate) return undefined;
+  if (propNameLower === 'headername') {
+    const headerTok = /^([A-Za-z][A-Za-z0-9-]+)(?:\b|\s|$)/.exec(candidate);
+    if (headerTok?.[1]) return headerTok[1];
+  }
+  return candidate;
+}
+
+function singularizeSchemaStem(word: string): string {
+  if (word.endsWith('ies') && word.length > 4) return `${word.slice(0, -3)}y`;
+  if (word.endsWith('ses') && word.length > 4) return word.slice(0, -2);
+  if (word.endsWith('s') && !word.endsWith('ss') && word.length > 3) return word.slice(0, -1);
+  return word;
+}
+
+export function extractStructuredJsonFromPageWithDiagnostics(
   rawHtml: string,
   doc: ExtractedDocument,
   schema?: Record<string, unknown>,
-): Record<string, unknown> {
+): { data: Record<string, unknown>; unmatchedFields: string[]; warnings: string[] } {
   const jsonLdObjects = flattenJsonLdEntities(rawHtml);
 
   const props = (schema?.properties ?? undefined) as Record<string, { type?: string }> | undefined;
   if (!props || typeof props !== 'object') {
     return {
-      ...(doc.title ? { title: doc.title } : {}),
-      ...(doc.description ? { description: doc.description } : {}),
-      ...(jsonLdObjects.length > 0 ? { jsonLd: jsonLdObjects } : {}),
+      data: {
+        ...(doc.title ? { title: doc.title } : {}),
+        ...(doc.description ? { description: doc.description } : {}),
+        ...(jsonLdObjects.length > 0 ? { jsonLd: jsonLdObjects } : {}),
+      },
+      unmatchedFields: [],
+      warnings: [],
     };
   }
 
   const out: Record<string, unknown> = {};
+  const unmatchedFields: string[] = [];
   for (const [propName, propSpec] of Object.entries(props)) {
     const lowerProp = propName.toLowerCase();
     let val: unknown;
@@ -3768,8 +4049,15 @@ export function extractStructuredJsonFromPage(
             .join('')
         : '';
       const mdScanSlice = doc.markdown ? doc.markdown.slice(0, 65_536) : '';
-      if (lowerProp === 'title' || lowerProp === 'name' || lowerProp === 'headline') val = doc.title;
-      else if (lowerProp === 'description' || lowerProp === 'summary' || lowerProp === 'overview') {
+      if (lowerProp === 'title' || lowerProp === 'name' || lowerProp === 'headline') {
+        val = doc.title ?? extractPrimaryEntityNameForSchema(rawHtml, doc, lowerProp);
+      } else if (
+        /^(?:headername|directivename|packagename|modulename|libraryname|apiname|methodname|functionname|classname|interfacename|elementname|tagname|propertyname|attributename|eventname|commandname|toolname|productname|topic|subject)$/i.test(
+          lowerProp,
+        )
+      ) {
+        val = extractPrimaryEntityNameForSchema(rawHtml, doc, lowerProp);
+      } else if (lowerProp === 'description' || lowerProp === 'summary' || lowerProp === 'overview') {
         val = doc.description;
         if (!val && mdWithoutFences) {
           const proseBlocks = mdWithoutFences
@@ -3787,46 +4075,132 @@ export function extractStructuredJsonFromPage(
       } else if (lowerProp === 'url' || lowerProp === 'canonicalurl') val = doc.canonicalUrl;
       else if (lowerProp === 'links') val = doc.links;
       else if (lowerProp === 'images') val = doc.images.map((i) => i.url);
-      else if (propSpec?.type === 'array' && mdWithoutFences) {
+      else if (propSpec?.type === 'array' && (mdWithoutFences || rawHtml)) {
         const cleanMd = mdWithoutFences;
         if (/headings|sections|topics/i.test(propName)) {
           const headings = [...cleanMd.matchAll(/^#{2,3}[ \t]+(.+)$/gm)]
             .map((m) => stripMarkdownLinksToLabelsLinear(m[1]!).trim())
-            .filter(Boolean)
+            .filter((s) => Boolean(s) && !HEURISTIC_BOILERPLATE_ITEM_RE.test(s))
             .slice(0, 20);
           if (headings.length > 0) val = headings;
         } else {
-          const propWords = propName
+          const rawPropWords = propName
             .replace(/([a-z])([A-Z])/g, '$1 $2')
             .toLowerCase()
             .split(/[^a-z0-9]+/)
-            .filter((w) => w.length >= 3 && w !== 'key' && w !== 'main' && w !== 'all');
+            .filter((w) => w.length >= 3 && w !== 'key' && w !== 'main' && w !== 'all' && w !== 'list' && w !== 'items');
+          const propStems = [...new Set(rawPropWords.flatMap((w) => [w, singularizeSchemaStem(w)]))];
           const lines = cleanMd.split(/\r?\n/);
-          const collectBullets = (subset: string[]): string[] =>
-            subset
+          const cleanCandidateItem = (rawItem: string): string =>
+            stripMarkdownLinksToLabelsLinear(rawItem)
+              .replace(/^\*{1,2}`?([^`*\n]+)`?\*{1,2}$/, '$1')
+              .replace(/^`([^`\n]+)`$/, '$1')
+              .replace(/\*{1,2}([^*\n]+)\*{1,2}/g, '$1')
+              .trim();
+          const isAcceptableItem = (s: string): boolean =>
+            s.length >= 2 && s.length <= 240 && !HEURISTIC_BOILERPLATE_ITEM_RE.test(s);
+
+          const collectSectionItems = (subset: string[]): string[] => {
+            // 1) `<dt>` terms converted to `**term**` / ``**`term`**`` paragraphs or `### \`term\`` subheadings
+            const dtOrSubItems: string[] = [];
+            for (const rawLine of subset) {
+              const t = rawLine.trim();
+              const subHm = /^#{3,4}[ \t]+(.+)$/.exec(t);
+              if (subHm?.[1]) {
+                const cleaned = cleanCandidateItem(subHm[1]);
+                if (isAcceptableItem(cleaned) && !/\b(?:directives?|examples?|syntax|specifications?|compatibility)\b/i.test(cleaned)) {
+                  dtOrSubItems.push(cleaned);
+                }
+                continue;
+              }
+              const dtMatch = /^\*\*(?:`([^`\n]+)`|([^*:\n]{2,80}))\*\*$/.exec(t);
+              if (dtMatch) {
+                const cleaned = cleanCandidateItem(dtMatch[1] ?? dtMatch[2] ?? '');
+                if (isAcceptableItem(cleaned)) dtOrSubItems.push(cleaned);
+              }
+            }
+            if (dtOrSubItems.length >= 2) {
+              return [...new Set(dtOrSubItems)].slice(0, 30);
+            }
+            // 2) Bullet / numbered list items inside the matched section
+            const bullets = subset
               .map((l) => /^(?:[-*]|\d+\.)[ \t]+(.+)$/.exec(l.trim())?.[1] ?? '')
-              .map((s) => stripMarkdownLinksToLabelsLinear(s).replace(/\*{1,2}([^*\n]+)\*{1,2}/g, '$1').trim())
-              .filter((s) => s.length >= 4)
-              .slice(0, 15);
-          if (propWords.length > 0) {
+              .map((s) => cleanCandidateItem(s))
+              .filter((s) => s.length >= 3 && isAcceptableItem(s));
+            return [...new Set([...dtOrSubItems, ...bullets])].slice(0, 25);
+          };
+
+          if (propStems.length > 0) {
+            const collectedAcrossMatchingSections: string[] = [];
             for (let i = 0; i < lines.length; i++) {
-              const hm = /^#{1,4}[ \t]+(.+)$/.exec(lines[i]!.trim());
-              if (hm && propWords.some((w) => hm[1]!.toLowerCase().includes(w))) {
+              const hm = /^(#{1,4})[ \t]+(.+)$/.exec(lines[i]!.trim());
+              if (!hm) continue;
+              const matchedRank = hm[1]!.length;
+              const headingLower = stripMarkdownLinksToLabelsLinear(hm[2]!).toLowerCase();
+              if (HEURISTIC_BOILERPLATE_ITEM_RE.test(headingLower)) continue;
+              if (propStems.some((w) => headingLower.includes(w))) {
                 const sectionLines: string[] = [];
                 for (let j = i + 1; j < lines.length; j++) {
-                  if (/^#{1,3}[ \t]+/.test(lines[j]!.trim())) break;
+                  const nextHm = /^(#{1,4})[ \t]+(.+)$/.exec(lines[j]!.trim());
+                  if (nextHm && nextHm[1]!.length <= matchedRank) break;
                   sectionLines.push(lines[j]!);
                 }
-                const secBullets = collectBullets(sectionLines);
-                if (secBullets.length > 0) {
-                  val = secBullets;
-                  break;
+                for (const item of collectSectionItems(sectionLines)) {
+                  if (!collectedAcrossMatchingSections.includes(item)) {
+                    collectedAcrossMatchingSections.push(item);
+                  }
                 }
               }
             }
-          }
-          if (val === undefined) {
-            const allBullets = collectBullets(lines);
+            if (collectedAcrossMatchingSections.length > 0) {
+              val = collectedAcrossMatchingSections.slice(0, 30);
+            } else if (rawHtml && /<dl\b/i.test(rawHtml) && /<(?:dt|code)\b/i.test(rawHtml)) {
+              // Check `<dl><dt><code>...</code></dt></dl>` under HTML headings matching `propStems`
+              const htmlSectionTerms: string[] = [];
+              const headingAndDlRe = /<h([1-4])\b[^>]*>([\s\S]{0,400}?)<\/h\1>/gi;
+              let hmHtml: RegExpExecArray | null;
+              while ((hmHtml = headingAndDlRe.exec(rawHtml)) !== null) {
+                const hRank = Number(hmHtml[1]);
+                const hText = cleanInlineHtml(hmHtml[2]!).toLowerCase();
+                if (!propStems.some((w) => hText.includes(w))) continue;
+                const afterIdx = hmHtml.index + hmHtml[0].length;
+                const nextSameRankRe = new RegExp(`<h[1-${hRank}]\\b`, 'i');
+                const nextMatch = nextSameRankRe.exec(rawHtml.slice(afterIdx));
+                const secHtml = rawHtml.slice(afterIdx, nextMatch ? afterIdx + nextMatch.index : Math.min(rawHtml.length, afterIdx + 65_536));
+                replacePairedHtmlElementsLinear(
+                  secHtml,
+                  ['dt'],
+                  (_df, _dt, _da, dInner) => {
+                    let codeTxt = '';
+                    replacePairedHtmlElementsLinear(
+                      dInner,
+                      ['code'],
+                      (_cf, _ct, _ca, cInner) => {
+                        if (!codeTxt) codeTxt = cleanInlineHtml(cInner);
+                        return '';
+                      },
+                      { maxChars: 2_048, maxInnerChars: 512 },
+                    );
+                    const term = (codeTxt || cleanHeadingPermalinks(cleanInlineHtml(dInner))).trim();
+                    if (isAcceptableItem(term) && !htmlSectionTerms.includes(term)) {
+                      htmlSectionTerms.push(term);
+                    }
+                    return '';
+                  },
+                  { maxChars: 65_536, maxInnerChars: 2_048 },
+                );
+              }
+              if (htmlSectionTerms.length > 0) {
+                val = htmlSectionTerms.slice(0, 30);
+              }
+            }
+          } else {
+            // Generic stemless array name (e.g. `items`, `list`): collect non-boilerplate bullets
+            const allBullets = lines
+              .map((l) => /^(?:[-*]|\d+\.)[ \t]+(.+)$/.exec(l.trim())?.[1] ?? '')
+              .map((s) => cleanCandidateItem(s))
+              .filter((s) => s.length >= 4 && isAcceptableItem(s))
+              .slice(0, 15);
             if (allBullets.length > 0) val = allBullets;
           }
         }
@@ -3881,9 +4255,30 @@ export function extractStructuredJsonFromPage(
         val = /^(true|yes|1)$/i.test(val.trim());
       }
       out[propName] = val;
+    } else if (propSpec?.type === 'array') {
+      out[propName] = [];
+      unmatchedFields.push(propName);
+    } else {
+      out[propName] = null;
+      unmatchedFields.push(propName);
     }
   }
-  return out;
+
+  const warnings: string[] = [];
+  if (unmatchedFields.length > 0) {
+    warnings.push(
+      `Keyless heuristic schema extraction could not match [${unmatchedFields.join(', ')}] from page structure; use the 'agent' tool (BYO-LLM) or configure an LLM provider for semantic JSON-Schema extraction.`,
+    );
+  }
+  return { data: out, unmatchedFields, warnings };
+}
+
+export function extractStructuredJsonFromPage(
+  rawHtml: string,
+  doc: ExtractedDocument,
+  schema?: Record<string, unknown>,
+): Record<string, unknown> {
+  return extractStructuredJsonFromPageWithDiagnostics(rawHtml, doc, schema).data;
 }
 
 export type DeriveDocumentResult =
@@ -4276,15 +4671,116 @@ export async function lookupCachedScrape(params: {
 
 export interface PrivateCachedScrapeRecord {
   url: string;
+  finalUrl?: string;
   markdown: string;
   contentSha256: string;
   blobSha256?: string;
   documentId: string;
   pipelineVersion: number;
   title?: string;
+  description?: string;
   language?: string;
+  favicon?: string;
+  canonicalUrl?: string;
+  contentType?: string;
+  wordCount?: number;
+  rendered?: boolean;
+  renderedVia?: string;
+  contentState?: string;
+  links?: string[];
+  images?: ScrapedImage[];
   status: number;
   lastFetchedAt: number;
+  optionsHash?: string;
+}
+
+function defaultFaviconForUrl(urlStr: string): string | undefined {
+  try {
+    const u = new URL(urlStr);
+    return `${u.origin}/favicon.ico`;
+  } catch {
+    return undefined;
+  }
+}
+
+function r2PublicOptionsScrapeCacheKey(pipelineVersion: number, cacheKeySha256: string): string {
+  return `derived/${pipelineVersion}/scrape-cache/${cacheKeySha256}.json`;
+}
+
+async function lookupOptionsScrapeCache(params: {
+  bucket: R2Bucket;
+  isPrivate: boolean;
+  userId: string;
+  url: string;
+  optionsHash: string;
+  maxAgeMs: number;
+  pipelineVersion: number;
+  metaDb?: D1Database;
+  now: number;
+}): Promise<PrivateCachedScrapeRecord | null> {
+  const { bucket, isPrivate, userId, url, optionsHash, maxAgeMs, pipelineVersion, metaDb, now } = params;
+  if (!(maxAgeMs > 0)) return null;
+  const combinedHash = await sha256HexString(`${url}|${optionsHash}`);
+  const r2Key = isPrivate
+    ? r2PrivateScrapeCacheKey(userId, pipelineVersion, combinedHash)
+    : r2PublicOptionsScrapeCacheKey(pipelineVersion, combinedHash);
+  const obj = await bucket.get(r2Key).catch(() => null);
+  if (!obj) return null;
+  try {
+    const parsed = (await obj.json()) as PrivateCachedScrapeRecord;
+    if (
+      !parsed ||
+      parsed.url !== url ||
+      parsed.optionsHash !== optionsHash ||
+      typeof parsed.markdown !== 'string' ||
+      typeof parsed.lastFetchedAt !== 'number' ||
+      now - parsed.lastFetchedAt > maxAgeMs
+    ) {
+      return null;
+    }
+    if (!isPrivate && metaDb) {
+      const pageRow = await metaDb
+        .prepare('SELECT last_fetched_at, latest_outcome FROM pages WHERE url = ? LIMIT 1')
+        .bind(url)
+        .first<{ last_fetched_at: number | null; latest_outcome: string | null }>()
+        .catch(() => null);
+      if (
+        pageRow &&
+        typeof pageRow.last_fetched_at === 'number' &&
+        pageRow.last_fetched_at > parsed.lastFetchedAt + 50
+      ) {
+        return null;
+      }
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function writeOptionsScrapeCache(params: {
+  bucket: R2Bucket;
+  isPrivate: boolean;
+  userId: string;
+  optionsHash: string;
+  record: PrivateCachedScrapeRecord;
+}): Promise<void> {
+  const { bucket, isPrivate, userId, optionsHash, record } = params;
+  const combinedHash = await sha256HexString(`${record.url}|${optionsHash}`);
+  const r2Key = isPrivate
+    ? r2PrivateScrapeCacheKey(userId, record.pipelineVersion, combinedHash)
+    : r2PublicOptionsScrapeCacheKey(record.pipelineVersion, combinedHash);
+  await bucket.put(r2Key, JSON.stringify({ ...record, optionsHash }), {
+    httpMetadata: { contentType: 'application/json' },
+    ...(isPrivate
+      ? {
+          customMetadata: {
+            userId: sanitizeStorageUserId(userId),
+            visibility: 'private',
+          },
+        }
+      : {}),
+  });
 }
 
 export async function lookupPrivateCachedScrape(params: {
@@ -4529,6 +5025,8 @@ export interface ScrapeRequestPayload {
   ocr?: unknown;
   waybackFallback?: unknown;
   spaFallback?: unknown;
+  followCanonical?: unknown;
+  _followedCanonicalHop?: boolean;
   noCache?: unknown;
   ephemeral?: unknown;
   visibility?: unknown;
@@ -4577,6 +5075,8 @@ interface MarkdownLineScanCursors {
   nextCloseParen: number;
   noCloseParen: boolean;
   noTickMask: number;
+  runsByLen?: Map<number, number[]>;
+  tickMissCount: number;
 }
 
 interface ParsedMarkdownLinkToken {
@@ -4594,6 +5094,7 @@ function createMarkdownLineScanCursors(): MarkdownLineScanCursors {
     nextCloseParen: -1,
     noCloseParen: false,
     noTickMask: 0,
+    tickMissCount: 0,
   };
 }
 
@@ -4607,6 +5108,39 @@ function isBackslashEscapedAt(str: string, idx: number): boolean {
   return (bs & 1) === 1;
 }
 
+let lastCachedBacktickLine = '';
+let lastCachedBacktickMap: Map<number, number[]> | null = null;
+
+function ensureLineBacktickIndex(line: string, cursors: MarkdownLineScanCursors): Map<number, number[]> {
+  if (cursors.runsByLen) return cursors.runsByLen;
+  if (line.length > 512 && line === lastCachedBacktickLine && lastCachedBacktickMap) {
+    cursors.runsByLen = lastCachedBacktickMap;
+    return lastCachedBacktickMap;
+  }
+  const map = new Map<number, number[]>();
+  let pos = 0;
+  while (pos < line.length) {
+    const idx = line.indexOf('`', pos);
+    if (idx < 0) break;
+    let runEnd = idx + 1;
+    while (runEnd < line.length && line.charCodeAt(runEnd) === 96) runEnd++;
+    const len = runEnd - idx;
+    let list = map.get(len);
+    if (!list) {
+      list = [];
+      map.set(len, list);
+    }
+    list.push(runEnd);
+    pos = runEnd;
+  }
+  if (line.length > 512) {
+    lastCachedBacktickLine = line;
+    lastCachedBacktickMap = map;
+  }
+  cursors.runsByLen = map;
+  return map;
+}
+
 function scanCodeSpanEndLinear(line: string, start: number, cursors: MarkdownLineScanCursors): { tickEnd: number; spanEnd: number } {
   let tickEnd = start + 1;
   while (tickEnd < line.length && line.charCodeAt(tickEnd) === 96) tickEnd++;
@@ -4614,7 +5148,29 @@ function scanCodeSpanEndLinear(line: string, start: number, cursors: MarkdownLin
   if (tickLen < 31 && (cursors.noTickMask & (1 << tickLen)) !== 0) {
     return { tickEnd, spanEnd: -1 };
   }
+  if (cursors.runsByLen || (line.length > 512 && (tickLen >= 31 || cursors.tickMissCount >= 2))) {
+    const map = ensureLineBacktickIndex(line, cursors);
+    const list = map.get(tickLen);
+    if (!list) {
+      if (tickLen < 31) cursors.noTickMask |= 1 << tickLen;
+      return { tickEnd, spanEnd: -1 };
+    }
+    // Binary search for first `runEnd` whose start `runEnd - tickLen >= tickEnd`
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (list[mid]! - tickLen >= tickEnd) hi = mid;
+      else lo = mid + 1;
+    }
+    if (lo < list.length) {
+      return { tickEnd, spanEnd: list[lo]! };
+    }
+    if (tickLen < 31) cursors.noTickMask |= 1 << tickLen;
+    return { tickEnd, spanEnd: -1 };
+  }
   let pos = tickEnd;
+  let steps = 0;
   while (pos < line.length) {
     const idx = line.indexOf('`', pos);
     if (idx < 0) break;
@@ -4624,7 +5180,12 @@ function scanCodeSpanEndLinear(line: string, start: number, cursors: MarkdownLin
       return { tickEnd, spanEnd: runEnd };
     }
     pos = runEnd;
+    if (++steps >= 16 && line.length > 512) {
+      cursors.tickMissCount = 2;
+      return scanCodeSpanEndLinear(line, start, cursors);
+    }
   }
+  cursors.tickMissCount++;
   if (tickLen < 31) cursors.noTickMask |= 1 << tickLen;
   return { tickEnd, spanEnd: -1 };
 }
@@ -4651,7 +5212,10 @@ function decodeUriEntitiesForScheme(input: string): string {
 }
 
 
-function detectParagraphBreakKind(line: string): 'blank_or_atomic' | 'block_start' | 'atx_heading' | 'none' {
+function detectParagraphBreakKind(
+  line: string,
+  prevContext: { inBlockquote: boolean; inList: boolean } = { inBlockquote: false, inList: false },
+): 'blank_or_atomic' | 'block_start' | 'atx_heading' | 'none' {
   const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
   if (isBlank) return 'blank_or_atomic';
   const c = line.charCodeAt(bytePos);
@@ -4659,43 +5223,56 @@ function detectParagraphBreakKind(line: string): 'blank_or_atomic' | 'block_star
     if (c === 35 /* '#' */) {
       let h = bytePos;
       while (h < line.length && line.charCodeAt(h) === 35 && h - bytePos < 7) h++;
+      // Require ASCII space `' '` or EOL after `#` (`marked4` does NOT treat `#\t` as an ATX heading!)
       if (
         h - bytePos <= 6 &&
-        (h >= line.length || line.charCodeAt(h) === 32 || line.charCodeAt(h) === 9 || line.charCodeAt(h) === 13)
+        (h >= line.length || line.charCodeAt(h) === 32 || line.charCodeAt(h) === 13)
       ) {
         return 'atx_heading';
       }
     }
-    if (c === 62 /* '>' */) return 'block_start';
+    if (c === 62 /* '>' */) {
+      // Blank blockquote line (`>   `) interrupts the blockquote paragraph; otherwise continuing `>` stays in the SAME paragraph!
+      let q = bytePos;
+      while (q < line.length && (line.charCodeAt(q) === 62 || line.charCodeAt(q) === 32 || line.charCodeAt(q) === 9 || line.charCodeAt(q) === 13)) q++;
+      if (q === line.length) return 'blank_or_atomic';
+      return prevContext.inBlockquote ? 'none' : 'block_start';
+    }
     if (
+      bytePos === cols &&
       (c === 96 || c === 126) &&
       bytePos + 3 <= line.length &&
       line.charCodeAt(bytePos + 1) === c &&
       line.charCodeAt(bytePos + 2) === c
     ) {
-      return 'blank_or_atomic';
-    }
-    if (c === 61 || c === 45 || c === 42 || c === 95) {
-      const rest = line.slice(bytePos);
-      if (/^(?:=+|-+)[ \t\r]*$/.test(rest) || /^(?:[-*_][ \t]*){3,}\r?$/.test(rest)) {
+      let fEnd = bytePos + 3;
+      while (fEnd < line.length && line.charCodeAt(fEnd) === c) fEnd++;
+      // CommonMark: backtick fence info string MUST NOT contain another backtick (` ``` ` ` is an inline code span, NOT a fence!)
+      if (!(c === 96 && line.slice(fEnd).includes('`'))) {
         return 'blank_or_atomic';
       }
     }
-  }
-  if (
-    (c === 45 || c === 42 || c === 43) &&
-    bytePos + 1 < line.length &&
-    (line.charCodeAt(bytePos + 1) === 32 || line.charCodeAt(bytePos + 1) === 9)
-  ) {
-    return 'block_start';
-  }
-  if (c >= 48 && c <= 57) {
-    let d = bytePos + 1;
-    while (d < line.length && d - bytePos < 9 && line.charCodeAt(d) >= 48 && line.charCodeAt(d) <= 57) d++;
+    if (c === 61 || c === 45 || c === 42 || c === 95) {
+      const rest = line.slice(bytePos);
+      // Thematic breaks MUST use 3+ of the SAME character (`---`, `***`, `___`); mixed `*_*` / `-_-` is prose!
+      if (/^(?:-[ \t]*){3,}\r?$/.test(rest) || /^(?:\*[ \t]*){3,}\r?$/.test(rest) || /^(?:_[ \t]*){3,}\r?$/.test(rest)) {
+        return 'blank_or_atomic';
+      }
+      // Setext heading underline (`===` / `---`) only closes a plain paragraph, NEVER lazy continuation after `>` or list item!
+      if (!prevContext.inBlockquote && !prevContext.inList && /^(?:=+|-+)[ \t\r]*$/.test(rest)) {
+        return 'blank_or_atomic';
+      }
+    }
+    // Unordered list marker (`- `, `* `, `+ ` followed by ASCII space — `+\t` does NOT interrupt a paragraph in `marked4`!)
+    if ((c === 45 || c === 42 || c === 43) && bytePos + 1 < line.length && line.charCodeAt(bytePos + 1) === 32) {
+      return 'block_start';
+    }
+    // CommonMark §5.2: ONLY ordered list marker `1.` or `1)` followed by space interrupts a paragraph (`2. ` stays in the paragraph!)
     if (
-      d + 1 < line.length &&
-      (line.charCodeAt(d) === 46 || line.charCodeAt(d) === 41) &&
-      (line.charCodeAt(d + 1) === 32 || line.charCodeAt(d + 1) === 9)
+      c === 49 /* '1' */ &&
+      bytePos + 2 < line.length &&
+      (line.charCodeAt(bytePos + 1) === 46 || line.charCodeAt(bytePos + 1) === 41) &&
+      line.charCodeAt(bytePos + 2) === 32
     ) {
       return 'block_start';
     }
@@ -4703,20 +5280,50 @@ function detectParagraphBreakKind(line: string): 'blank_or_atomic' | 'block_star
   return 'none';
 }
 
-/** R5/R6: CommonMark code spans may continue across lines of one paragraph, but NEVER cross blank lines, headings, fences, thematic breaks, blockquotes, or sibling list items (`CHANGELOG.md` false-positive fix). */
+function isRiskyAdjacentCodeSpanAt(line: string, start: number, spanEnd: number, sawBracketInPara: boolean): boolean {
+  const inner = line.slice(start, spanEnd);
+  if (sawBracketInPara && inner.includes(']')) return true;
+  if (start > 0) {
+    const prev = line.charCodeAt(start - 1);
+    if ((prev === 95 /* '_' */ || prev === 42 /* '*' */) && inner.includes(prev === 95 ? '_' : '*')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** R5/R6/R7: CommonMark code spans may continue across lines of one paragraph, and any unmatched backtick on a line poisons THAT line too (`H7`). */
 function computeTickPoisonedLines(lines: string[]): Uint8Array {
   const poisoned = new Uint8Array(lines.length);
   let carry = false;
+  let inBlockquote = false;
+  let inList = false;
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]!;
-    const breakKind = detectParagraphBreakKind(line);
+    const breakKind = detectParagraphBreakKind(line, { inBlockquote, inList });
+    const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
+    const leadChar = !isBlank && bytePos < line.length ? line.charCodeAt(bytePos) : 0;
+    const lineStartsWithQuote = !isBlank && cols <= 3 && leadChar === 62;
+    const lineStartsList =
+      !isBlank &&
+      cols <= 3 &&
+      (((leadChar === 45 || leadChar === 42 || leadChar === 43) && bytePos + 1 < line.length && line.charCodeAt(bytePos + 1) === 32) ||
+        (leadChar >= 48 &&
+          leadChar <= 57 &&
+          /^\d{1,9}[.)] /.test(line.slice(bytePos, bytePos + 12))));
+
     if (breakKind === 'blank_or_atomic') {
       carry = false;
+      inBlockquote = false;
+      inList = false;
       continue;
     }
     if (breakKind === 'block_start' || breakKind === 'atx_heading') {
       carry = false;
     }
+    inBlockquote = lineStartsWithQuote;
+    if (lineStartsList) inList = true;
+
     if (carry) {
       poisoned[li] = 1;
       continue;
@@ -4734,6 +5341,7 @@ function computeTickPoisonedLines(lines: string[]): Uint8Array {
         }
         const { spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
         if (spanEnd < 0) {
+          poisoned[li] = 1;
           carry = true;
           break;
         }
@@ -4772,32 +5380,29 @@ function computeTickPoisonedLines(lines: string[]): Uint8Array {
 }
 
 /**
- * `R6-H3`: Detaches bare GFM autolink candidates (`https://`, `http://`, `ftp://`, `www.`, and glued email local-parts)
- * from immediately following backticks outside existing code spans so GFM autolinkers (`marked`, `micromark+GFM`) NEVER
- * swallow an opening code-span backtick into the URL and expose raw `<img onerror>` / `<script>` inside what our scanner
- * thought was a code span. Also percent-encodes `` ` `` inside `<https://...>` angle-bracket autolinks.
+ * `R6-H3` & `R7-H7`: Detaches bare GFM autolink candidates (`https://`, `http://`, `ftp://`, `www.`, including alnum-prefixed
+ * and `>2048`-char URLs or URLs containing `>`), glued email local-parts, and GFM single-tilde `~` strikethrough markers
+ * adjacent to backticks outside code spans so `marked` / `micromark+GFM` NEVER swallow an opening code-span backtick.
  */
 function detachBareUrlsFromCodeSpansLinear(prose: string): string {
   if (!prose || !prose.includes('`')) return prose;
+  if (!prose.includes('://') && !prose.includes('www.') && !prose.includes('WWW.') && !prose.includes('@') && !prose.includes('~')) {
+    return prose;
+  }
   const lines = prose.split('\n');
   const poisoned = computeTickPoisonedLines(lines);
   let changed = false;
 
   const startsBareGfmUrlAt = (s: string, pos: number): boolean => {
-    if (pos > 0) {
-      const prev = s.charCodeAt(pos - 1);
-      if ((prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) || (prev >= 97 && prev <= 122)) return false;
-    }
-    const rest = s.slice(pos, pos + 12);
-    if (/^(?:https?:\/\/|ftp:\/\/)/i.test(rest)) return true;
-    if (/^www\.[A-Za-z0-9]/i.test(rest)) return true;
-    return false;
+    const rest = s.slice(pos, pos + 10);
+    return /^(?:https?:\/\/|ftp:\/\/|www\.)/i.test(rest);
   };
 
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]!;
     if (!line.includes('`')) continue;
     const cursors = createMarkdownLineScanCursors();
+    const firstTildeIdx = line.indexOf('~');
     let out = '';
     let last = 0;
     let i = 0;
@@ -4807,10 +5412,10 @@ function detachBareUrlsFromCodeSpansLinear(prose: string): string {
 
       // 1. Angle-bracket autolinks `<https://...>` containing backticks (`<https://ok.example/`>`)
       if (ch === 60 /* '<' */ && i + 4 < line.length && /^(?:https?|ftp|mailto):/i.test(line.slice(i + 1, i + 10))) {
-        const gtLimit = Math.min(line.length, i + 2049);
         let gt = -1;
         let hasTick = false;
-        for (let p = i + 1; p < gtLimit; p++) {
+        let p = i + 1;
+        while (p < line.length) {
           const pc = line.charCodeAt(p);
           if (pc === 62 /* '>' */) {
             gt = p;
@@ -4818,6 +5423,7 @@ function detachBareUrlsFromCodeSpansLinear(prose: string): string {
           }
           if (pc <= 32 || pc === 60) break;
           if (pc === 96) hasTick = true;
+          p++;
         }
         if (gt > 0 && hasTick) {
           out += `${line.slice(last, i + 1)}${line.slice(i + 1, gt).replace(/`/g, '%60')}>`;
@@ -4830,12 +5436,11 @@ function detachBareUrlsFromCodeSpansLinear(prose: string): string {
 
       // 2. Bare GFM URL (`https?://`, `ftp://`, `www.`) outside code spans: insert space before the first `` ` `` in/after it
       if ((ch === 104 || ch === 72 || ch === 102 || ch === 70 || ch === 119 || ch === 87) && startsBareGfmUrlAt(line, i)) {
-        const urlLimit = Math.min(line.length, i + 2048);
         let p = i + 4;
         let detachedAt = -1;
-        while (p < urlLimit) {
+        while (p < line.length) {
           const pc = line.charCodeAt(p);
-          if (pc <= 32 || pc === 60 || pc === 62) break;
+          if (pc <= 32 || pc === 60) break;
           if (pc === 96 /* '`' */) {
             detachedAt = p;
             break;
@@ -4854,27 +5459,43 @@ function detachBareUrlsFromCodeSpansLinear(prose: string): string {
         }
       }
 
-      // 3. Glued GFM email local-part (`a`b@c.com`) swallowing an opening backtick in `marked`
+      // 3. Tilde `~` adjacent to opening `` ` `` (`marked` single-tilde strikethrough swallows `` ` ``) + glued GFM email local-part
       if (line.charCodeAt(i) === 96 && !isBackslashEscapedAt(line, i)) {
-        if (i > 0) {
+        if (i > 0 && last < i) {
           const prev = line.charCodeAt(i - 1);
-          const isEmailLead =
-            (prev >= 48 && prev <= 57) ||
-            (prev >= 65 && prev <= 90) ||
-            (prev >= 97 && prev <= 122) ||
-            prev === 46 ||
-            prev === 95 ||
-            prev === 43 ||
-            prev === 45;
-          if (isEmailLead && /^[A-Za-z0-9.!#$%&'*+/=?^_{|}~-]{0,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/.test(line.slice(i + 1, i + 128))) {
+          if (prev === 126 /* '~' */) {
             out += `${line.slice(last, i)} `;
             last = i;
             changed = true;
+          } else {
+            const isEmailLead =
+              (prev >= 48 && prev <= 57) ||
+              (prev >= 65 && prev <= 90) ||
+              (prev >= 97 && prev <= 122) ||
+              prev === 46 ||
+              prev === 95 ||
+              prev === 43 ||
+              prev === 45;
+            if (isEmailLead && /^[A-Za-z0-9.!#$%&'*+/=?^_{|}~-]{0,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/.test(line.slice(i + 1, i + 128))) {
+              out += `${line.slice(last, i)} `;
+              last = i;
+              changed = true;
+            }
           }
         }
         if (poisoned[li] === 0) {
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
-          i = spanEnd > 0 ? spanEnd : tickEnd;
+          if (spanEnd > 0) {
+            // Also detach `~` immediately following closing backtick when `~` appeared earlier on the line (`~`~ `<img...>`)
+            if (firstTildeIdx >= 0 && firstTildeIdx < i && spanEnd < line.length && line.charCodeAt(spanEnd) === 126) {
+              out += `${line.slice(last, spanEnd)} `;
+              last = spanEnd;
+              changed = true;
+            }
+            i = spanEnd;
+          } else {
+            i = tickEnd;
+          }
           continue;
         }
       }
@@ -5536,10 +6157,10 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
   opts: { baseUrl?: string; includeImages?: boolean; spaceAdjacentAlnum?: boolean } = {},
 ): string {
   if (!prose) return prose;
-  if (!prose.includes('](') && !prose.includes('<') && !prose.includes('`') && !prose.includes(']:')) {
+  const { baseUrl, includeImages = true, spaceAdjacentAlnum = false } = opts;
+  if (!prose.includes('](') && !prose.includes('<') && !prose.includes(']:') && (!spaceAdjacentAlnum || !prose.includes('`'))) {
     return prose;
   }
-  const { baseUrl, includeImages = true, spaceAdjacentAlnum = false } = opts;
   const rawBounded = prose.length > MAX_HTML_SCAN_CHARS ? prose.slice(0, MAX_HTML_SCAN_CHARS) : prose;
   const bounded = stripDangerousMultilineMarkdownLinksLinear(rawBounded);
   const proseLines = bounded.split('\n');
@@ -5753,9 +6374,51 @@ function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMark
   if (!prose || !prose.includes('<')) return prose;
   const residualLines = prose.split('\n');
   const residualPoisoned = computeTickPoisonedLines(residualLines);
+  let sawBracketInPara = false;
+  let inBlockquote = false;
+  let inList = false;
   return residualLines
     .map((line, lineIdx) => {
-      if (!line.includes('<')) return line;
+      const breakKind = detectParagraphBreakKind(line, { inBlockquote, inList });
+      const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
+      const leadChar = !isBlank && bytePos < line.length ? line.charCodeAt(bytePos) : 0;
+      if (breakKind === 'blank_or_atomic') {
+        sawBracketInPara = false;
+        inBlockquote = false;
+        inList = false;
+      } else {
+        if (breakKind === 'block_start' || breakKind === 'atx_heading') sawBracketInPara = false;
+        inBlockquote = !isBlank && cols <= 3 && leadChar === 62;
+        if (
+          !isBlank &&
+          cols <= 3 &&
+          (((leadChar === 45 || leadChar === 42 || leadChar === 43) && bytePos + 1 < line.length && line.charCodeAt(bytePos + 1) === 32) ||
+            (leadChar >= 48 && leadChar <= 57 && /^\d{1,9}[.)] /.test(line.slice(bytePos, bytePos + 12))))
+        ) {
+          inList = true;
+        }
+      }
+      if (!line.includes('<')) {
+        if (line.includes('[')) {
+          const cursors = createMarkdownLineScanCursors();
+          let p = 0;
+          while (p < line.length) {
+            const pc = line.charCodeAt(p);
+            if (pc === 96 && residualPoisoned[lineIdx] === 0 && !isBackslashEscapedAt(line, p)) {
+              const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, p, cursors);
+              p = spanEnd > 0 ? spanEnd : tickEnd;
+              continue;
+            }
+            if (pc === 91 && !isBackslashEscapedAt(line, p)) {
+              sawBracketInPara = true;
+              break;
+            }
+            p++;
+          }
+        }
+        if (breakKind === 'atx_heading') sawBracketInPara = false;
+        return line;
+      }
       if (allowPdfPageMarkers && /^<!-- page \d{1,6} -->$/.test(line.trim())) {
         return line;
       }
@@ -5768,13 +6431,24 @@ function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMark
       let i = 0;
       while (i < line.length) {
         const ch = line.charCodeAt(i);
+        if (ch === 91 && !isBackslashEscapedAt(line, i)) {
+          sawBracketInPara = true;
+        }
         if (ch === 96 && residualPoisoned[lineIdx] === 0) {
           if (isBackslashEscapedAt(line, i)) {
             i++;
             continue;
           }
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
-          i = spanEnd > 0 && !(isTableRow && line.slice(i, spanEnd).includes('|')) ? spanEnd : tickEnd;
+          if (
+            spanEnd > 0 &&
+            !(isTableRow && line.slice(i, spanEnd).includes('|')) &&
+            !isRiskyAdjacentCodeSpanAt(line, i, spanEnd, sawBracketInPara)
+          ) {
+            i = spanEnd;
+          } else {
+            i = tickEnd;
+          }
           continue;
         }
         if (ch === 60 && i + 1 < line.length) {
@@ -5802,6 +6476,7 @@ function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMark
         }
         i++;
       }
+      if (breakKind === 'atx_heading') sawBracketInPara = false;
       return lastIdx === 0 ? line : out + line.slice(lastIdx);
     })
     .join('\n');
@@ -5825,21 +6500,51 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
   if (!prose || !prose.includes('`')) return prose;
   const lines = prose.split('\n');
   const poisoned = computeTickPoisonedLines(lines);
+  let sawBracketInPara = false;
+  let inBlockquote = false;
+  let inList = false;
   return lines
     .map((line, lineIdx) => {
-      if (!line.includes('`') || poisoned[lineIdx] === 1) return line;
+      const breakKind = detectParagraphBreakKind(line, { inBlockquote, inList });
+      const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
+      const leadChar = !isBlank && bytePos < line.length ? line.charCodeAt(bytePos) : 0;
+      if (breakKind === 'blank_or_atomic') {
+        sawBracketInPara = false;
+        inBlockquote = false;
+        inList = false;
+      } else {
+        if (breakKind === 'block_start' || breakKind === 'atx_heading') sawBracketInPara = false;
+        inBlockquote = !isBlank && cols <= 3 && leadChar === 62;
+        if (
+          !isBlank &&
+          cols <= 3 &&
+          (((leadChar === 45 || leadChar === 42 || leadChar === 43) && bytePos + 1 < line.length && line.charCodeAt(bytePos + 1) === 32) ||
+            (leadChar >= 48 && leadChar <= 57 && /^\d{1,9}[.)] /.test(line.slice(bytePos, bytePos + 12))))
+        ) {
+          inList = true;
+        }
+      }
+      if (!line.includes('`') || poisoned[lineIdx] === 1) {
+        if (line.includes('[')) sawBracketInPara = true;
+        if (breakKind === 'atx_heading') sawBracketInPara = false;
+        return line;
+      }
       const cursors = createMarkdownLineScanCursors();
       let out = '';
       let lastIdx = 0;
       let i = 0;
       while (i < line.length) {
-        if (line.charCodeAt(i) === 96) {
+        const ch = line.charCodeAt(i);
+        if (ch === 91 && !isBackslashEscapedAt(line, i)) {
+          sawBracketInPara = true;
+        }
+        if (ch === 96) {
           if (isBackslashEscapedAt(line, i)) {
             i++;
             continue;
           }
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
-          if (spanEnd > 0) {
+          if (spanEnd > 0 && !isRiskyAdjacentCodeSpanAt(line, i, spanEnd, sawBracketInPara)) {
             out += `${line.slice(lastIdx, i)}\u0000EFMDINLINE${stash.push(line.slice(i, spanEnd)) - 1}\u0000`;
             i = spanEnd;
             lastIdx = i;
@@ -5850,6 +6555,7 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
         }
         i++;
       }
+      if (breakKind === 'atx_heading') sawBracketInPara = false;
       return lastIdx === 0 ? line : out + line.slice(lastIdx);
     })
     .join('\n');
@@ -5964,7 +6670,9 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
 
       // Stash inline backtick code spans (`...`) BEFORE HTML sanitization so `<script>` / `<T>` inside backticks stay untouched.
       const inlineCodeStash: string[] = [];
-      proseWork = stashMarkdownInlineCodeSpansLinear(proseWork, inlineCodeStash);
+      if (proseWork.includes('<') || proseWork.includes(':::')) {
+        proseWork = stashMarkdownInlineCodeSpansLinear(proseWork, inlineCodeStash);
+      }
 
       // Strip HTML comments, dangerous active/script/style/svg/form subtrees, and hidden (`display:none` / `[hidden]`) subtrees linearly.
       if (proseWork.includes('<!--')) {
@@ -6186,8 +6894,8 @@ export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allow
   if (!md) return '';
   let cur = sanitizeInlineHtmlInMarkdownSinglePass(md, baseUrl, allowPdfPageMarkers);
   if (!cur) return '';
-  // Fast exit when output contains no constructs that could re-interact across passes
-  if (!cur.includes('<') && !cur.includes('](') && !cur.includes(']:') && !cur.includes('```') && !cur.includes('~~~')) {
+  // Fast exit when output contains no HTML/link/entity constructs that could re-interact across passes (`ticks-inc` 2 MiB `< 15 ms`!)
+  if (!cur.includes('<') && !cur.includes('](') && !cur.includes(']:') && !cur.includes('&')) {
     return cur;
   }
   for (let pass = 0; pass < 3; pass++) {
@@ -6399,6 +7107,172 @@ function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
   return sanitizeInlineHtmlInMarkdown(withoutSchemaFences, baseUrl);
 }
 
+export function closeUnclosedCodeAfterSlice(sliced: string, allowPdfPageMarkers = false): string {
+  return closeTruncatedMarkdownStructures(sliced, allowPdfPageMarkers);
+}
+
+export function sliceMarkdownWithOffsetAndMaxChars(
+  fullMd: string,
+  offset = 0,
+  maxChars?: number,
+  allowPdfPageMarkers = false,
+): {
+  markdown: string;
+  truncated: boolean;
+  offset: number;
+  totalChars: number;
+  nextOffset: number | null;
+  remainingChars: number;
+} {
+  const totalChars = fullMd.length;
+  const safeOffset = Math.min(totalChars, Math.max(0, Math.floor(offset)));
+  const windowSrc = safeOffset > 0 ? fullMd.slice(safeOffset) : fullMd;
+  if (maxChars !== undefined && windowSrc.length > maxChars) {
+    let cut = maxChars;
+    const minCut = Math.floor(maxChars * 0.6);
+    const paraBreak = windowSrc.lastIndexOf('\n\n', cut);
+    const lineBreak = windowSrc.lastIndexOf('\n', cut);
+    const spaceBreak = windowSrc.lastIndexOf(' ', cut);
+    if (paraBreak >= minCut) cut = paraBreak;
+    else if (lineBreak >= minCut) cut = lineBreak;
+    else if (spaceBreak >= minCut) cut = spaceBreak;
+    const rawSliced = windowSrc.slice(0, cut).replace(/[ \t\r\n]+$/g, '');
+    const nextOffset = safeOffset + rawSliced.length;
+    const remainingChars = Math.max(0, totalChars - nextOffset);
+    const closed = closeUnclosedCodeAfterSlice(rawSliced, allowPdfPageMarkers);
+    return {
+      markdown: closed,
+      truncated: true,
+      offset: safeOffset,
+      totalChars,
+      nextOffset,
+      remainingChars,
+    };
+  }
+  const cleanSlice = safeOffset > 0 ? closeUnclosedCodeAfterSlice(windowSrc, allowPdfPageMarkers) : windowSrc;
+  return {
+    markdown: cleanSlice,
+    truncated: false,
+    offset: safeOffset,
+    totalChars,
+    nextOffset: null,
+    remainingChars: 0,
+  };
+}
+
+function closeTruncatedMarkdownStructures(sliced: string, allowPdfPageMarkers = false): string {
+  // 1. Check CommonMark fenced code block state across `sliced` (honoring backtick info-string rule & list container indent)
+  let inFence = false;
+  let fenceChar = '';
+  let fenceLen = 0;
+  let fenceIndent = 0;
+  let activeListIndent = 0;
+  const lines = sliced.split('\n');
+  for (let li = 0; li < lines.length; li++) {
+    const raw = lines[li]!.endsWith('\r') ? lines[li]!.slice(0, -1) : lines[li]!;
+    const { cols, bytePos, isBlank } = measureLeadingIndentCols(raw);
+    if (inFence) {
+      if (!isBlank && fenceIndent > 0 && cols < fenceIndent) {
+        inFence = false;
+        fenceChar = '';
+        fenceLen = 0;
+        fenceIndent = 0;
+        activeListIndent = 0;
+      } else {
+        const maxCloseIndent = fenceIndent > 0 ? fenceIndent + 3 : 3;
+        if (cols <= maxCloseIndent && bytePos === cols) {
+          let p = bytePos;
+          const fcCode = fenceChar.charCodeAt(0);
+          while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
+          const runLen = p - bytePos;
+          if (runLen >= fenceLen) {
+            while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
+            if (p === raw.length) {
+              inFence = false;
+              fenceChar = '';
+              fenceLen = 0;
+              fenceIndent = 0;
+              continue;
+            }
+          }
+        }
+        continue;
+      }
+    }
+    if (!isBlank && activeListIndent > 0 && cols < activeListIndent) {
+      activeListIndent = 0;
+    }
+    const listCol = detectListItemContentCol(raw, cols, bytePos);
+    if (listCol > 0) activeListIndent = listCol;
+    const minCols = activeListIndent > 0 ? activeListIndent : 0;
+    const maxCols = minCols + 3;
+    if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos === cols && bytePos + 3 <= raw.length) {
+      const c0 = raw.charCodeAt(bytePos);
+      if (c0 === 96 || c0 === 126) {
+        let fEnd = bytePos + 1;
+        while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
+        const fLen = fEnd - bytePos;
+        if (fLen >= 3 && !(c0 === 96 && raw.slice(fEnd).includes('`'))) {
+          inFence = true;
+          fenceChar = c0 === 96 ? '`' : '~';
+          fenceLen = fLen;
+          fenceIndent = activeListIndent > 0 ? activeListIndent : 0;
+        }
+      }
+    }
+  }
+
+  if (inFence) {
+    return `${sliced}\n${' '.repeat(fenceIndent)}${fenceChar.repeat(fenceLen)}`;
+  }
+
+  // 2. Outside fenced code blocks, detect any unclosed inline backtick code span in the final prose paragraph (`A1` truncation fix)
+  const parts = splitMarkdownByCodeFences(sliced);
+  const tailProse = parts[parts.length - 1] ?? '';
+  let closed = sliced;
+  if (tailProse.includes('`')) {
+    const tailLines = tailProse.split('\n');
+    let paraStart = 0;
+    let inBq = false;
+    let inLst = false;
+    for (let li = 0; li < tailLines.length; li++) {
+      const line = tailLines[li]!;
+      const bk = detectParagraphBreakKind(line, { inBlockquote: inBq, inList: inLst });
+      const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
+      const lc = !isBlank && bytePos < line.length ? line.charCodeAt(bytePos) : 0;
+      if (bk !== 'none') paraStart = li + (bk === 'blank_or_atomic' ? 1 : 0);
+      inBq = !isBlank && cols <= 3 && lc === 62;
+      if (!isBlank && cols <= 3 && ((lc === 45 || lc === 42 || lc === 43) || (lc >= 48 && lc <= 57))) inLst = true;
+    }
+    const lastPara = tailLines.slice(paraStart).join('\n');
+    if (lastPara.includes('`')) {
+      const paraCursors = createMarkdownLineScanCursors();
+      let openTickLen = 0;
+      let p = 0;
+      while (p < lastPara.length) {
+        if (lastPara.charCodeAt(p) === 96 && !isBackslashEscapedAt(lastPara, p)) {
+          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(lastPara, p, paraCursors);
+          if (spanEnd < 0) {
+            openTickLen = tickEnd - p;
+            break;
+          }
+          p = spanEnd;
+          continue;
+        }
+        p++;
+      }
+      if (openTickLen > 0) {
+        const pad = closed.endsWith('`') ? ' ' : '';
+        closed = `${closed}${pad}${'`'.repeat(openTickLen)}`;
+      }
+    }
+  }
+  const safeHtml = escapeResidualHtmlOutsideCodeLinear(closed, allowPdfPageMarkers);
+  return splitMarkdownByCodeFences(safeHtml)
+    .map((part, idx) => (idx % 2 === 1 ? part : neutralizeResidualDangerousLinkDestinations(part)))
+    .join('');
+}
+
 export function finalizeScrapedMarkdown(
   rawMd: string,
   opts: {
@@ -6414,15 +7288,18 @@ export function finalizeScrapedMarkdown(
   truncated?: boolean;
   totalChars?: number;
   nextOffset?: number;
+  remainingChars?: number;
   frontmatterTitle?: string;
   frontmatterDescription?: string;
 } {
   const deadlineAt = Date.now() + 2_500;
   const boundedInput = rawMd.length > MAX_HTML_SCAN_CHARS ? rawMd.slice(0, MAX_HTML_SCAN_CHARS) : rawMd;
   const fm = opts.isPdf ? { body: boundedInput } : parseMarkdownFrontmatter(boundedInput);
+  // Trim Unicode whitespace BEFORE fence hardening (`A_nbsp`, `A_emsp_link`, `A_fm`), NEVER after!
+  const bodyTrimmed = fm.body.trim();
   let md = opts.preserveOriginMarkdown
-    ? stripInvisibleSmugglingChars(cleanOriginNegotiatedMarkdown(fm.body, opts.baseUrl))
-    : stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(fm.body, opts.baseUrl, Boolean(opts.allowPdfPageMarkers)));
+    ? stripInvisibleSmugglingChars(cleanOriginNegotiatedMarkdown(bodyTrimmed, opts.baseUrl))
+    : stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(bodyTrimmed, opts.baseUrl, Boolean(opts.allowPdfPageMarkers)));
   if (opts.isPdf && Date.now() <= deadlineAt) {
     md = cleanPdfMarkdown(md);
   }
@@ -6435,7 +7312,7 @@ export function finalizeScrapedMarkdown(
   }
   md = escapeResidualHtmlOutsideCodeLinear(md, Boolean(opts.allowPdfPageMarkers))
     .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '');
   const fmMeta = {
     ...(fm.title ? { frontmatterTitle: fm.title } : {}),
     ...(fm.description ? { frontmatterDescription: fm.description } : {}),
@@ -6450,21 +7327,11 @@ export function finalizeScrapedMarkdown(
     if (paraBreak >= minCut) cut = paraBreak;
     else if (lineBreak >= minCut) cut = lineBreak;
     else if (spaceBreak >= minCut) cut = spaceBreak;
-    let sliced = md.slice(0, cut).trimEnd();
-    const nextOffset = sliced.length;
-    // Close any open fenced code block so truncated previews never leave unbalanced Markdown fences.
-    let openFence = '';
-    for (const line of sliced.split('\n')) {
-      const fmLine = /^(`{3,}|~{3,})/.exec(line.trim());
-      if (fmLine?.[1]) {
-        if (!openFence) openFence = fmLine[1][0]!.repeat(fmLine[1].length);
-        else if (fmLine[1][0] === openFence[0] && fmLine[1].length >= openFence.length && /^[`~]+\s*$/.test(line.trim())) openFence = '';
-      }
-    }
-    if (openFence) {
-      sliced = `${sliced}\n${openFence}`;
-    }
-    return { markdown: sliced, truncated: true, totalChars, nextOffset, ...fmMeta };
+    const rawSliced = md.slice(0, cut).replace(/[ \t\r\n]+$/g, '');
+    const nextOffset = rawSliced.length;
+    const remainingChars = Math.max(0, totalChars - nextOffset);
+    const sliced = closeTruncatedMarkdownStructures(rawSliced, Boolean(opts.allowPdfPageMarkers));
+    return { markdown: sliced, truncated: true, totalChars, nextOffset, remainingChars, ...fmMeta };
   }
   return { markdown: md, ...fmMeta };
 }
@@ -7060,7 +7927,10 @@ export function formatFeedXmlToMarkdown(
         if (/^https?:\/\//i.test(guid)) rawLink = guid;
       }
     }
-    const resolvedLink = resolveHttpsHref(rawLink, baseUrl);
+    let resolvedLink = resolveHttpsHref(rawLink, baseUrl);
+    if (resolvedLink && (!validatePublicHttpsTargetUrl(resolvedLink).ok || /[\s<>()]/.test(resolvedLink))) {
+      resolvedLink = undefined;
+    }
     if (resolvedLink && !seenLinks.has(resolvedLink)) {
       seenLinks.add(resolvedLink);
       links.push(resolvedLink);
@@ -8268,6 +9138,40 @@ export async function executeScrapeCall(params: {
   };
 
   const preferOriginMarkdown = payload.preferOriginMarkdown !== false;
+  const rawRenderModeStrEarly = typeof payload.renderMode === 'string' ? payload.renderMode.trim().toLowerCase() : '';
+  const requestedRenderModeEarly: 'always' | 'auto' | 'off' =
+    inlineActions.length > 0 || mobileEmulation || Boolean(screenshotSpec) || stringFormats.has('screenshot')
+      ? 'always'
+      : rawRenderModeStrEarly === 'always' || rawRenderModeStrEarly === 'browser'
+        ? 'always'
+        : rawRenderModeStrEarly === 'off'
+          ? 'off'
+          : 'auto';
+  const sortedFormatsForCache = [...stringFormats].sort();
+  const hasNonDefaultCacheOptions =
+    !onlyMainContent ||
+    requestedRenderModeEarly === 'always' ||
+    (rawRenderModeStrEarly !== '' && rawRenderModeStrEarly !== 'auto') ||
+    includeTags.length > 0 ||
+    excludeTags.length > 0 ||
+    waitForMsOpt !== undefined ||
+    Boolean(waitSelectorOpt) ||
+    !includeImages ||
+    sortedFormatsForCache.join(',') !== 'markdown';
+  const scrapeOptionsHash = await sha256HexString(
+    JSON.stringify({
+      v: SCRAPE_PIPELINE_VERSION,
+      onlyMainContent,
+      renderMode: rawRenderModeStrEarly || requestedRenderModeEarly,
+      formats: sortedFormatsForCache,
+      includeTags: [...includeTags],
+      excludeTags: [...excludeTags],
+      waitForMs: waitForMsOpt ?? 0,
+      waitSelector: waitSelectorOpt ?? '',
+      includeImages,
+      preferOriginMarkdown,
+    }),
+  );
 
   // Serve from verified META D1 + ARTIFACTS R2 cache when maxAgeMs is satisfied and only markdown/metadata are requested.
   const needsLiveHtml =
@@ -8289,6 +9193,24 @@ export async function executeScrapeCall(params: {
     excludeTags.length > 0 ||
     Boolean(jsonSchemaSpec) ||
     Boolean(attributesSpec);
+
+  const canUseOptionsR2Cache =
+    preferOriginMarkdown &&
+    !stringFormats.has('html') &&
+    !stringFormats.has('rawHtml') &&
+    !stringFormats.has('rawBase64') &&
+    !stringFormats.has('product') &&
+    !stringFormats.has('branding') &&
+    !stringFormats.has('screenshot') &&
+    !stringFormats.has('llmsTxt') &&
+    !stringFormats.has('changes') &&
+    !stringFormats.has('summary') &&
+    !checkPromptInjection &&
+    !callerExplicitAccept &&
+    inlineActions.length === 0 &&
+    !pdfParserOpts.skipPdfParsing &&
+    !jsonSchemaSpec &&
+    !attributesSpec;
 
   const needsDomForTwin =
     stringFormats.has('html') ||
@@ -8331,25 +9253,42 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  if (!needsLiveHtml && ocrMode !== 'always' && maxAgeMs > 0 && env.ARTIFACTS && (isPrivateScrape || env.META)) {
+  if (canUseOptionsR2Cache && ocrMode !== 'always' && maxAgeMs > 0 && env.ARTIFACTS && (isPrivateScrape || env.META || hasNonDefaultCacheOptions)) {
     const cacheStartMs = Date.now();
-    const hit = isPrivateScrape
-      ? await lookupPrivateCachedScrape({
-          bucket: env.ARTIFACTS,
-          userId,
-          url: normalizedUrl,
-          maxAgeMs,
-          pipelineVersion: SCRAPE_PIPELINE_VERSION,
-          now,
-        })
-      : await lookupCachedScrape({
-          bucket: env.ARTIFACTS,
-          metaDb: env.META!,
-          url: normalizedUrl,
-          maxAgeMs,
-          pipelineVersion: SCRAPE_PIPELINE_VERSION,
-          now,
-        });
+    const optHit = await lookupOptionsScrapeCache({
+      bucket: env.ARTIFACTS,
+      isPrivate: isPrivateScrape,
+      userId,
+      url: normalizedUrl,
+      optionsHash: scrapeOptionsHash,
+      maxAgeMs,
+      pipelineVersion: SCRAPE_PIPELINE_VERSION,
+      ...(env.META ? { metaDb: env.META } : {}),
+      now,
+    });
+    const hit: (PrivateCachedScrapeRecord | Awaited<ReturnType<typeof lookupCachedScrape>>) =
+      optHit ??
+      (!needsLiveHtml && !hasNonDefaultCacheOptions
+        ? isPrivateScrape
+          ? await lookupPrivateCachedScrape({
+              bucket: env.ARTIFACTS,
+              userId,
+              url: normalizedUrl,
+              maxAgeMs,
+              pipelineVersion: SCRAPE_PIPELINE_VERSION,
+              now,
+            })
+          : env.META
+            ? await lookupCachedScrape({
+                bucket: env.ARTIFACTS,
+                metaDb: env.META,
+                url: normalizedUrl,
+                maxAgeMs,
+                pipelineVersion: SCRAPE_PIPELINE_VERSION,
+                now,
+              })
+            : null
+        : null);
     if (hit) {
       const cacheVia = isPrivateScrape ? 'cache:private-r2' : 'cache:r2-d1';
       if (activeTracer) {
@@ -8380,7 +9319,14 @@ export async function executeScrapeCall(params: {
         includeImages,
         maxChars,
       });
+      const richHit = hit as Partial<PrivateCachedScrapeRecord>;
+      const cachedFinalUrl = richHit.finalUrl || normalizedUrl;
       const cachedTitle = hit.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullCached, normalizedUrl) : undefined);
+      const cachedWordCount = richHit.wordCount ?? (fullCached ? countTextWords(fullCached) : 0);
+      const cachedFavicon = richHit.favicon ?? defaultFaviconForUrl(cachedFinalUrl);
+      const cachedContentType =
+        richHit.contentType ?? (isLikelyPdfUrl(normalizedUrl) ? 'application/pdf' : 'text/html; charset=utf-8');
+      const cachedRendered = Boolean(richHit.rendered);
       const privBlobSha = 'blobSha256' in hit ? hit.blobSha256 : undefined;
       return {
         status: 200,
@@ -8394,20 +9340,38 @@ export async function executeScrapeCall(params: {
           contentSha256: hit.contentSha256,
           ...(privBlobSha ? { artifactId: privBlobSha } : {}),
           url: normalizedUrl,
+          finalUrl: cachedFinalUrl,
+          ...(cachedTitle ? { title: cachedTitle } : {}),
           status: hit.status,
-          markdown: shaped.markdown,
+          via: cacheVia,
+          contentState: richHit.contentState ?? 'active',
+          rendered: cachedRendered,
+          ...(richHit.renderedVia ? { renderedVia: richHit.renderedVia } : {}),
+          ...(cachedWordCount > 0 ? { wordCount: cachedWordCount } : {}),
+          ...(cachedFavicon ? { favicon: cachedFavicon } : {}),
+          contentType: cachedContentType,
+          ...(stringFormats.has('markdown') ? { markdown: shaped.markdown } : {}),
+          ...(stringFormats.has('text') ? { text: shaped.markdown } : {}),
+          ...(stringFormats.has('links') && richHit.links ? { links: richHit.links } : {}),
+          ...(stringFormats.has('images') && richHit.images ? { images: richHit.images } : {}),
           ...(focused.queryFiltered ? { queryFiltered: true, chunks: focused.chunks } : {}),
           ...(shaped.truncated
             ? {
                 truncated: true,
                 totalChars: shaped.totalChars,
                 nextOffset: shaped.nextOffset ?? shaped.markdown.length,
+                remainingChars: shaped.remainingChars ?? Math.max(0, (shaped.totalChars ?? 0) - (shaped.nextOffset ?? shaped.markdown.length)),
                 markdownArtifactId: `md:${hit.contentSha256}`,
               }
             : {}),
           metadata: {
             ...(cachedTitle ? { title: cachedTitle } : {}),
+            ...(richHit.description ? { description: richHit.description } : {}),
+            ...(cachedWordCount > 0 ? { wordCount: cachedWordCount } : {}),
             ...(hit.language ? { language: hit.language } : {}),
+            ...(cachedFavicon ? { favicon: cachedFavicon } : {}),
+            canonicalUrl: richHit.canonicalUrl ?? cachedFinalUrl,
+            contentType: cachedContentType,
             lastFetchedAt: hit.lastFetchedAt,
           },
         },
@@ -8457,7 +9421,12 @@ export async function executeScrapeCall(params: {
           ...(stringFormats.has('markdown') ? { markdown: shaped.markdown } : {}),
           ...(stringFormats.has('text') ? { text: shaped.markdown } : {}),
           ...(shaped.truncated
-            ? { truncated: true, totalChars: shaped.totalChars, nextOffset: shaped.nextOffset ?? shaped.markdown.length }
+            ? {
+                truncated: true,
+                totalChars: shaped.totalChars,
+                nextOffset: shaped.nextOffset ?? shaped.markdown.length,
+                remainingChars: shaped.remainingChars ?? Math.max(0, (shaped.totalChars ?? 0) - (shaped.nextOffset ?? shaped.markdown.length)),
+              }
             : {}),
           pdfEngine: forcedOcr.pdfEngine,
           ...(forcedOcr.ocr ? { ocr: forcedOcr.ocr } : {}),
@@ -8557,7 +9526,7 @@ export async function executeScrapeCall(params: {
         redactPii,
         ...(revalCandidate?.etag ? { ifNoneMatch: revalCandidate.etag } : {}),
         ...(revalCandidate?.lastModified ? { ifModifiedSince: revalCandidate.lastModified } : {}),
-        ...(renderMode ? { renderMode } : {}),
+        renderMode: renderMode === 'always' ? 'always' : 'off',
         ...(mobileEmulation ? { mobile: true } : {}),
         ...(screenshotSpec?.fullPage ? { screenshotFullPage: true } : {}),
         ...(screenshotSpec?.quality ? { screenshotQuality: screenshotSpec.quality } : {}),
@@ -8701,6 +9670,7 @@ export async function executeScrapeCall(params: {
                       truncated: true,
                       totalChars: atsShaped.totalChars,
                       nextOffset: atsShaped.nextOffset ?? atsShaped.markdown.length,
+                      remainingChars: atsShaped.remainingChars ?? Math.max(0, (atsShaped.totalChars ?? 0) - (atsShaped.nextOffset ?? atsShaped.markdown.length)),
                     }
                   : formatted?.truncated !== undefined && !filteredBoard
                     ? { truncated: formatted.truncated }
@@ -8820,6 +9790,7 @@ export async function executeScrapeCall(params: {
                     truncated: true,
                     totalChars: ghShaped.totalChars,
                     nextOffset: ghShaped.nextOffset ?? ghShaped.markdown.length,
+                    remainingChars: ghShaped.remainingChars ?? Math.max(0, (ghShaped.totalChars ?? 0) - (ghShaped.nextOffset ?? ghShaped.markdown.length)),
                   }
                 : {}),
               metadata: {
@@ -8910,6 +9881,7 @@ export async function executeScrapeCall(params: {
                       truncated: true,
                       totalChars: patchShaped.totalChars,
                       nextOffset: patchShaped.nextOffset ?? patchShaped.markdown.length,
+                      remainingChars: patchShaped.remainingChars ?? Math.max(0, (patchShaped.totalChars ?? 0) - (patchShaped.nextOffset ?? patchShaped.markdown.length)),
                     }
                   : {}),
                 metadata: {
@@ -9024,6 +9996,8 @@ export async function executeScrapeCall(params: {
               twinSummaryOut = sumRes.summary;
             }
             let twinJsonOut: Record<string, unknown> | undefined;
+            let twinJsonExtractionMode: 'heuristic' | 'llm' | undefined;
+            const twinWarnings: string[] = [];
             if (jsonSchemaSpec) {
               const twinDoc: ExtractedDocument = {
                 markdown: twinShapedFull.markdown,
@@ -9035,7 +10009,7 @@ export async function executeScrapeCall(params: {
                 images: [],
                 branding: { title: formatted.title, description: formatted.description, canonicalUrl: normalizedUrl },
               };
-              const heuristic = extractStructuredJsonFromPage(twinBody, twinDoc, jsonSchemaSpec.schema);
+              const heuristicDiag = extractStructuredJsonFromPageWithDiagnostics(twinBody, twinDoc, jsonSchemaSpec.schema);
               if (twinLlmCfg && (jsonSchemaSpec.prompt || jsonSchemaSpec.schema)) {
                 const llmJ = await extractJsonWithOptionalLlm({
                   markdown: twinShapedFull.markdown,
@@ -9044,12 +10018,20 @@ export async function executeScrapeCall(params: {
                   prompt: jsonSchemaSpec.prompt,
                   schema: jsonSchemaSpec.schema,
                   llmConfig: twinLlmCfg,
-                  heuristicFallback: heuristic,
+                  heuristicFallback: heuristicDiag.data,
                   ...(activeTracer ? { tracer: activeTracer } : {}),
                 });
                 twinJsonOut = llmJ.data;
+                twinJsonExtractionMode = llmJ.viaLlm ? 'llm' : 'heuristic';
+                if (!llmJ.viaLlm && heuristicDiag.warnings.length > 0) {
+                  twinWarnings.push(...heuristicDiag.warnings);
+                }
               } else {
-                twinJsonOut = heuristic;
+                twinJsonOut = heuristicDiag.data;
+                twinJsonExtractionMode = 'heuristic';
+                if (heuristicDiag.warnings.length > 0) {
+                  twinWarnings.push(...heuristicDiag.warnings);
+                }
               }
             }
             const twinProductOut = stringFormats.has('product')
@@ -9103,6 +10085,8 @@ export async function executeScrapeCall(params: {
                 ...(twinProductOut ? { product: twinProductOut } : {}),
                 ...(twinRawBase64Out ? { rawBase64: twinRawBase64Out } : {}),
                 ...(twinJsonOut ? { json: twinJsonOut } : {}),
+                ...(twinJsonExtractionMode ? { jsonExtractionMode: twinJsonExtractionMode } : {}),
+                ...(twinWarnings.length > 0 ? { warnings: twinWarnings } : {}),
                 ...(stringFormats.has('links') && formatted.links ? { links: formatted.links } : {}),
                 ...(twinFocused.queryFiltered ? { queryFiltered: true, chunks: twinFocused.chunks } : {}),
                 ...(twinShaped.truncated
@@ -9110,6 +10094,7 @@ export async function executeScrapeCall(params: {
                       truncated: true,
                       totalChars: twinShaped.totalChars,
                       nextOffset: twinShaped.nextOffset ?? twinShaped.markdown.length,
+                      remainingChars: twinShaped.remainingChars ?? Math.max(0, (twinShaped.totalChars ?? 0) - (twinShaped.nextOffset ?? twinShaped.markdown.length)),
                     }
                   : formatted.truncated !== undefined
                     ? { truncated: formatted.truncated }
@@ -9213,6 +10198,7 @@ export async function executeScrapeCall(params: {
                     truncated: true,
                     totalChars: compShaped.totalChars,
                     nextOffset: compShaped.nextOffset ?? compShaped.markdown.length,
+                    remainingChars: compShaped.remainingChars ?? Math.max(0, (compShaped.totalChars ?? 0) - (compShaped.nextOffset ?? compShaped.markdown.length)),
                   }
                 : {}),
               llms: {
@@ -9274,7 +10260,12 @@ export async function executeScrapeCall(params: {
         ...(stringFormats.has('links') && spa.links ? { links: spa.links } : {}),
         ...(spaFocused.queryFiltered ? { queryFiltered: true, chunks: spaFocused.chunks } : {}),
         ...(spaShaped.truncated
-          ? { truncated: true, totalChars: spaShaped.totalChars, nextOffset: spaShaped.nextOffset ?? spaShaped.markdown.length }
+          ? {
+              truncated: true,
+              totalChars: spaShaped.totalChars,
+              nextOffset: spaShaped.nextOffset ?? spaShaped.markdown.length,
+              remainingChars: spaShaped.remainingChars ?? Math.max(0, (spaShaped.totalChars ?? 0) - (spaShaped.nextOffset ?? spaShaped.markdown.length)),
+            }
           : {}),
         metadata: {
           ...(spa.title ? { title: spa.title } : {}),
@@ -9486,16 +10477,54 @@ export async function executeScrapeCall(params: {
       }
     }
 
+    const scrubbedProblem = scrubResolverIpFromError(problemText);
+    if (!isPaymentRequiredErr && !errWaf && isDnsNotFoundError(item.outcome, scrubbedProblem)) {
+      setActiveSpanAttribute('edgefetch.outcome', 'dns_not_found', activeTracer ?? undefined);
+      return {
+        status: 502,
+        via: fetchResUsed.via,
+        body: {
+          ok: false,
+          url: normalizedUrl,
+          outcome: 'dns_not_found',
+          error: 'dns_not_found',
+          retryable: false,
+          status: 502,
+          message: DNS_NOT_FOUND_MESSAGE,
+          problem: scrubbedProblem || DNS_NOT_FOUND_MESSAGE,
+        },
+      };
+    }
+    if (!isPaymentRequiredErr && !errWaf && isSsrfBlockedError(item.outcome, scrubbedProblem)) {
+      setActiveSpanAttribute('edgefetch.outcome', 'blocked', activeTracer ?? undefined);
+      return {
+        status: 403,
+        via: fetchResUsed.via,
+        body: {
+          ok: false,
+          url: normalizedUrl,
+          outcome: 'blocked',
+          error: 'blocked',
+          retryable: false,
+          status: item.status ?? 403,
+          message: SSRF_BLOCKED_INFO.message,
+          blocked: { ...SSRF_BLOCKED_INFO },
+        },
+      };
+    }
+
     const effectiveOutcome = isPaymentRequiredErr
       ? 'payment_required'
       : errWaf
         ? 'challenge'
-        : (item.outcome ?? 'error');
+        : item.status === 404 && (item.outcome === 'gone' || item.outcome === 'error')
+          ? 'not_found'
+          : (item.outcome ?? 'error');
     if (errWaf?.vendor) {
       setActiveSpanAttribute('edgefetch.waf.vendor', errWaf.vendor, activeTracer ?? undefined);
     }
     setActiveSpanAttribute('edgefetch.outcome', String(effectiveOutcome), activeTracer ?? undefined);
-    const effectiveProb = errWaf ? errWaf.summary : problemText;
+    const effectiveProb = errWaf ? errWaf.summary : scrubbedProblem;
     const robotsHint =
       /robots\.txt disallowed/i.test(effectiveProb) && !/^robots_unreachable\b/i.test(effectiveProb)
         ? buildRobotsAlternativeHint(normalizedUrl)
@@ -9568,6 +10597,9 @@ export async function executeScrapeCall(params: {
     const revalFocused = applyQueryFocus(fullReval);
     const revalShaped = finalizeScrapedMarkdown(revalFocused.markdown, { isPdf: false, includeImages, maxChars });
     const revalTitle = revalCandidate.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullReval, normalizedUrl) : undefined);
+    const revalWordCount = fullReval ? countTextWords(fullReval) : 0;
+    const revalFavicon = defaultFaviconForUrl(normalizedUrl);
+    const revalContentType = isLikelyPdfUrl(normalizedUrl) ? 'application/pdf' : 'text/html; charset=utf-8';
     return {
       status: 200,
       via: `${fetchResUsed.via}+cache:304`,
@@ -9581,8 +10613,14 @@ export async function executeScrapeCall(params: {
         contentSha256: revalCandidate.contentSha256,
         url: normalizedUrl,
         finalUrl: normalizedUrl,
+        ...(revalTitle ? { title: revalTitle } : {}),
         status: 200,
         via: `${fetchResUsed.via}+cache:304`,
+        contentState: 'active',
+        rendered: false,
+        ...(revalWordCount > 0 ? { wordCount: revalWordCount } : {}),
+        ...(revalFavicon ? { favicon: revalFavicon } : {}),
+        contentType: revalContentType,
         ...(stringFormats.has('markdown') ? { markdown: revalShaped.markdown } : {}),
         ...(stringFormats.has('text') ? { text: revalShaped.markdown } : {}),
         ...(revalFocused.queryFiltered ? { queryFiltered: true, chunks: revalFocused.chunks } : {}),
@@ -9591,12 +10629,17 @@ export async function executeScrapeCall(params: {
               truncated: true,
               totalChars: revalShaped.totalChars,
               nextOffset: revalShaped.nextOffset ?? revalShaped.markdown.length,
+              remainingChars: revalShaped.remainingChars ?? Math.max(0, (revalShaped.totalChars ?? 0) - (revalShaped.nextOffset ?? revalShaped.markdown.length)),
               markdownArtifactId: `md:${revalCandidate.contentSha256}`,
             }
           : {}),
         metadata: {
           ...(revalTitle ? { title: revalTitle } : {}),
+          ...(revalWordCount > 0 ? { wordCount: revalWordCount } : {}),
           ...(revalCandidate.language ? { language: revalCandidate.language } : {}),
+          ...(revalFavicon ? { favicon: revalFavicon } : {}),
+          canonicalUrl: normalizedUrl,
+          contentType: revalContentType,
           lastFetchedAt: now,
         },
       },
@@ -9606,7 +10649,11 @@ export async function executeScrapeCall(params: {
   let rawBodyStr = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
   let finalUrl = typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : normalizedUrl;
   let renderedViaOut: 'browser' | 'browser-auto' | SpaFallbackProvider | undefined =
-    renderMode === 'always' ? 'browser' : item.rendered === true ? 'browser-auto' : undefined;
+    renderMode === 'always'
+      ? 'browser'
+      : item.rendered === true && (!rawBodyStr || hasExecutableScriptTag(rawBodyStr) || hasExternalOrWidgetIframeLinear(rawBodyStr).found)
+        ? 'browser-auto'
+        : undefined;
 
   const rawTrimmedHead = rawBodyStr ? rawBodyStr.trimStart().slice(0, 64) : '';
   const looksLikeHtmlDocument = /^(?:<!doctype\b|<html\b)/i.test(rawTrimmedHead);
@@ -9727,6 +10774,7 @@ export async function executeScrapeCall(params: {
                       truncated: true,
                       totalChars: stubShaped.totalChars,
                       nextOffset: stubShaped.nextOffset ?? stubShaped.markdown.length,
+                      remainingChars: stubShaped.remainingChars ?? Math.max(0, (stubShaped.totalChars ?? 0) - (stubShaped.nextOffset ?? stubShaped.markdown.length)),
                     }
                   : stubFormatted.truncated !== undefined
                     ? { truncated: stubFormatted.truncated }
@@ -10005,6 +11053,63 @@ export async function executeScrapeCall(params: {
           };
         }
       }
+    }
+  }
+
+  // Field Issue #4: Cross-domain syndicated `<link rel="canonical" href="https://...">` detection & optional 1-hop `followCanonical`
+  let safeCanonicalUrl: string | undefined;
+  let crossOriginCanonical = false;
+  if (extracted?.canonicalUrl) {
+    const canonVal = validatePublicHttpsTargetUrl(extracted.canonicalUrl);
+    if (canonVal.ok) {
+      safeCanonicalUrl = canonVal.url.toString();
+      try {
+        const finalHostNorm = new URL(finalUrl).hostname.toLowerCase().replace(/^www\./, '');
+        const canonHostNorm = canonVal.url.hostname.toLowerCase().replace(/^www\./, '');
+        if (canonHostNorm && finalHostNorm && canonHostNorm !== finalHostNorm) {
+          crossOriginCanonical = true;
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  if (
+    Boolean(payload.followCanonical) &&
+    !payload._followedCanonicalHop &&
+    crossOriginCanonical &&
+    safeCanonicalUrl
+  ) {
+    const canonHopRes = await executeScrapeCall({
+      ...params,
+      payload: {
+        ...payload,
+        url: safeCanonicalUrl,
+        followCanonical: false,
+        _followedCanonicalHop: true,
+      },
+      source: `${source}:canonical-hop`,
+    });
+    if (canonHopRes.status === 200 && canonHopRes.body?.ok === true) {
+      const hopMeta =
+        canonHopRes.body.metadata && typeof canonHopRes.body.metadata === 'object'
+          ? (canonHopRes.body.metadata as Record<string, unknown>)
+          : {};
+      return {
+        ...canonHopRes,
+        body: {
+          ...canonHopRes.body,
+          url: normalizedUrl,
+          syndicatedFromUrl: finalUrl,
+          canonicalUrl: safeCanonicalUrl,
+          followedCanonical: true,
+          metadata: {
+            ...hopMeta,
+            canonicalUrl: safeCanonicalUrl,
+            crossOriginCanonical: true,
+          },
+        },
+      };
     }
   }
 
@@ -10335,7 +11440,13 @@ export async function executeScrapeCall(params: {
     baseUrl: finalUrl,
     preserveOriginMarkdown: isOriginMarkdown,
   });
-  let rawCleanMarkdown = fullShaped.markdown;
+  if (isOriginMarkdown && fullShaped.frontmatterTitle && fullShaped.markdown && !/^#[ \t]+\S/m.test(fullShaped.markdown)) {
+    fullShaped = {
+      ...fullShaped,
+      markdown: `# ${fullShaped.frontmatterTitle}\n\n${fullShaped.markdown}`,
+    };
+  }
+  let rawCleanMarkdown = redactPii ? redactPiiText(fullShaped.markdown) : fullShaped.markdown;
   const mdAssets = !isHtmlBody && !isPdfResponse ? extractMarkdownLinksAndImages(rawCleanMarkdown, finalUrl, includeImages) : undefined;
 
   // P1: Short-term / general fallback — when extracted HTML Markdown has < 50 words and `<meta name="description">` / `og:description`
@@ -10657,8 +11768,12 @@ export async function executeScrapeCall(params: {
     : undefined;
 
   let structuredJsonOut: Record<string, unknown> | undefined;
+  let jsonExtractionModeOut: 'heuristic' | 'llm' | undefined;
+  const scrapeWarnings: string[] = [...(extracted?.warnings ?? [])];
   if (jsonSchemaSpec && docForJson) {
-    structuredJsonOut = extractStructuredJsonFromPage(rawBodyStr, docForJson, jsonSchemaSpec.schema);
+    const heuristicDiag = extractStructuredJsonFromPageWithDiagnostics(rawBodyStr, docForJson, jsonSchemaSpec.schema);
+    structuredJsonOut = heuristicDiag.data;
+    const pickedKeys = new Set<string>();
     if (jsonFormatted?.parsed && typeof jsonFormatted.parsed === 'object' && !Array.isArray(jsonFormatted.parsed)) {
       const srcObj = jsonFormatted.parsed as Record<string, unknown>;
       const props =
@@ -10669,10 +11784,12 @@ export async function executeScrapeCall(params: {
       for (const k of props) {
         if (k in srcObj && srcObj[k] !== undefined) {
           directPicked[k] = srcObj[k];
+          pickedKeys.add(k);
         }
       }
       structuredJsonOut = { ...structuredJsonOut, ...directPicked };
     }
+    const remainingUnmatched = heuristicDiag.unmatchedFields.filter((f) => !pickedKeys.has(f));
     if (activeLlmConfig && (jsonSchemaSpec.prompt || jsonSchemaSpec.schema)) {
       const llmExt = await extractJsonWithOptionalLlm({
         markdown: rawCleanMarkdown,
@@ -10685,6 +11802,19 @@ export async function executeScrapeCall(params: {
         ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       structuredJsonOut = llmExt.data;
+      jsonExtractionModeOut = llmExt.viaLlm ? 'llm' : 'heuristic';
+      if (!llmExt.viaLlm && remainingUnmatched.length > 0) {
+        scrapeWarnings.push(
+          `Keyless heuristic schema extraction could not match [${remainingUnmatched.join(', ')}] from page structure; use the 'agent' tool (BYO-LLM) or configure an LLM provider for semantic JSON-Schema extraction.`,
+        );
+      }
+    } else {
+      jsonExtractionModeOut = 'heuristic';
+      if (remainingUnmatched.length > 0) {
+        scrapeWarnings.push(
+          `Keyless heuristic schema extraction could not match [${remainingUnmatched.join(', ')}] from page structure; use the 'agent' tool (BYO-LLM) or configure an LLM provider for semantic JSON-Schema extraction.`,
+        );
+      }
     }
   }
 
@@ -10807,6 +11937,47 @@ export async function executeScrapeCall(params: {
   const resolvedAuthor = customShopifyDoc?.author ?? extracted?.author;
   const resolvedPublishedTime = customShopifyDoc?.publishedTime ?? extracted?.publishedTime ?? htmlJobPosting?.datePosted;
 
+  const resolvedFavicon = (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon || defaultFaviconForUrl(finalUrl);
+  const resolvedContentType = isPdfResponse ? 'application/pdf' : extracted?.isVideoPage ? 'video' : (typeof item.contentType === 'string' ? item.contentType : undefined);
+  const resolvedWordCount = rawCleanMarkdown ? countTextWords(rawCleanMarkdown) : undefined;
+  const resolvedRendered = Boolean(renderMode === 'always' || renderedViaOut !== undefined);
+
+  if (canUseOptionsR2Cache && payload.ephemeral !== true && !Boolean(payload.noCache) && env.ARTIFACTS && rawCleanMarkdown) {
+    const contentShaForCache = art?.contentSha256 && isValidSha256Hex(art.contentSha256)
+      ? art.contentSha256
+      : await sha256HexString(rawCleanMarkdown);
+    const docIdForCache = `doc_${(await sha256HexString(`${contentShaForCache}:${SCRAPE_PIPELINE_VERSION}:${scrapeOptionsHash}`)).slice(0, 32)}`;
+    await writeOptionsScrapeCache({
+      bucket: env.ARTIFACTS,
+      isPrivate: isPrivateScrape,
+      userId,
+      optionsHash: scrapeOptionsHash,
+      record: {
+        url: normalizedUrl,
+        finalUrl,
+        markdown: rawCleanMarkdown,
+        contentSha256: contentShaForCache,
+        ...(art?.blobSha256 ? { blobSha256: art.blobSha256 } : {}),
+        documentId: docIdForCache,
+        pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        ...(resolvedTitle ? { title: resolvedTitle } : {}),
+        ...(resolvedDescription ? { description: resolvedDescription } : {}),
+        ...(extracted?.language ? { language: extracted.language } : {}),
+        ...(resolvedFavicon ? { favicon: resolvedFavicon } : {}),
+        canonicalUrl: safeCanonicalUrl ?? extracted?.canonicalUrl ?? finalUrl,
+        ...(resolvedContentType ? { contentType: resolvedContentType } : {}),
+        ...(resolvedWordCount !== undefined ? { wordCount: resolvedWordCount } : {}),
+        rendered: resolvedRendered,
+        ...(renderedViaOut ? { renderedVia: renderedViaOut } : {}),
+        contentState: contentStateCheck.state,
+        ...(stringFormats.has('links') ? { links: resolvedLinks } : {}),
+        ...(stringFormats.has('images') ? { images: resolvedImages } : {}),
+        status: typeof item.status === 'number' ? item.status : 200,
+        lastFetchedAt: now,
+      },
+    }).catch(() => undefined);
+  }
+
   const out: Record<string, unknown> = {
     ok: true,
     cached: false,
@@ -10814,6 +11985,9 @@ export async function executeScrapeCall(params: {
     pipelineVersion: SCRAPE_PIPELINE_VERSION,
     url: normalizedUrl,
     finalUrl,
+    ...(resolvedTitle ? { title: resolvedTitle } : {}),
+    ...(safeCanonicalUrl && safeCanonicalUrl !== finalUrl ? { canonicalUrl: safeCanonicalUrl } : {}),
+    ...(crossOriginCanonical ? { crossOriginCanonical: true } : {}),
     ...(redirectAnalysis.redirected ? redirectAnalysis : {}),
     status: item.status ?? 200,
     via: viaOut,
@@ -10822,7 +11996,13 @@ export async function executeScrapeCall(params: {
     contentState: contentStateCheck.state,
     ...(contentStateCheck.reason ? { contentStateReason: contentStateCheck.reason } : {}),
     ...(contentSourceOut ? { contentSource: contentSourceOut } : {}),
+    rendered: resolvedRendered,
     ...(renderedViaOut ? { renderedVia: renderedViaOut } : {}),
+    ...(resolvedWordCount !== undefined ? { wordCount: resolvedWordCount } : {}),
+    ...(resolvedFavicon ? { favicon: resolvedFavicon } : {}),
+    ...(resolvedContentType ? { contentType: resolvedContentType } : {}),
+    ...(extracted?.sectionExpandedFromHeading ? { sectionExpandedFromHeading: true } : {}),
+    ...(scrapeWarnings.length > 0 ? { warnings: scrapeWarnings } : {}),
     ...(htmlJobPosting ? { jobPosting: htmlJobPosting } : {}),
     ...(adapterRecordsOut !== undefined ? { records: adapterRecordsOut } : {}),
     ...(adapterPaginationOut !== undefined ? { pagination: adapterPaginationOut } : {}),
@@ -10851,11 +12031,16 @@ export async function executeScrapeCall(params: {
           }
         : {}),
     ...(shaped.truncated || originMdCapTruncated
-      ? {
-          truncated: true,
-          totalChars: shaped.totalChars ?? originMdOriginalChars,
-          nextOffset: shaped.nextOffset ?? markdown.length,
-        }
+      ? (() => {
+          const effTotal = shaped.totalChars ?? originMdOriginalChars;
+          const effNext = shaped.nextOffset ?? markdown.length;
+          return {
+            truncated: true,
+            totalChars: effTotal,
+            nextOffset: effNext,
+            remainingChars: shaped.remainingChars ?? Math.max(0, effTotal - effNext),
+          };
+        })()
       : adapterTruncatedOut === true
         ? { truncated: true }
         : {}),
@@ -10889,10 +12074,10 @@ export async function executeScrapeCall(params: {
         }
       : {}),
     ...(structuredJsonOut ? { json: structuredJsonOut } : {}),
+    ...(jsonExtractionModeOut ? { jsonExtractionMode: jsonExtractionModeOut } : {}),
     ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64
       ? { screenshotBase64: item.screenshotBase64, screenshot: `data:image/png;base64,${item.screenshotBase64}` }
       : {}),
-    ...(item.rendered === true || renderedViaOut !== undefined ? { rendered: true } : {}),
     ...(pdfEngineOut ? { pdfEngine: pdfEngineOut } : {}),
     ...(ocrReportOut ? { ocr: ocrReportOut } : {}),
     ...(computedChanges
@@ -10911,21 +12096,22 @@ export async function executeScrapeCall(params: {
       : {}),
     ...(llmsPayload ? { llms: llmsPayload, ...(stringFormats.has('llmsTxt') ? { llmsTxt: llmsPayload } : {}) } : {}),
     metadata: {
-      title: resolvedTitle,
-      description: resolvedDescription,
+      ...(resolvedTitle ? { title: resolvedTitle } : {}),
+      ...(resolvedDescription ? { description: resolvedDescription } : {}),
       ...(resolvedAuthor ? { author: resolvedAuthor } : {}),
       ...(resolvedPublishedTime ? { publishedTime: resolvedPublishedTime } : {}),
       ...(extracted?.modifiedTime ? { modifiedTime: extracted.modifiedTime } : {}),
       ...(extracted?.siteName || htmlJobPosting?.hiringOrganization
         ? { siteName: extracted?.siteName ?? htmlJobPosting?.hiringOrganization }
         : {}),
-      ...(rawCleanMarkdown ? { wordCount: countTextWords(rawCleanMarkdown) } : {}),
-      language: extracted?.language,
-      favicon: (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon,
-      canonicalUrl: extracted?.canonicalUrl,
+      ...(resolvedWordCount !== undefined ? { wordCount: resolvedWordCount } : {}),
+      ...(extracted?.language ? { language: extracted.language } : {}),
+      ...(resolvedFavicon ? { favicon: resolvedFavicon } : {}),
+      ...((safeCanonicalUrl ?? extracted?.canonicalUrl) ? { canonicalUrl: safeCanonicalUrl ?? extracted?.canonicalUrl } : {}),
+      ...(crossOriginCanonical ? { crossOriginCanonical: true } : {}),
       ...(alternateMarkdownUrl ? { alternateMarkdownUrl } : {}),
       ...(contentSourceOut ? { contentSource: contentSourceOut } : {}),
-      contentType: isPdfResponse ? 'application/pdf' : item.contentType,
+      ...(resolvedContentType ? { contentType: resolvedContentType } : {}),
     },
   };
 
@@ -10995,7 +12181,24 @@ export interface InteractRequestPayload {
   formats?: unknown;
   waitForMs?: unknown;
   waitSelector?: unknown;
+  maxChars?: unknown;
+  offset?: unknown;
   site?: unknown;
+}
+
+const interactSessionSnapshotCache = new Map<string, { url: string; markdownSha: string; updatedAt: number }>();
+
+function rememberInteractSessionSnapshot(key: string, url: string, markdownSha: string): void {
+  const now = Date.now();
+  for (const [k, v] of interactSessionSnapshotCache.entries()) {
+    if (now - v.updatedAt > 30 * 60_000) interactSessionSnapshotCache.delete(k);
+  }
+  interactSessionSnapshotCache.delete(key);
+  interactSessionSnapshotCache.set(key, { url, markdownSha, updatedAt: now });
+  if (interactSessionSnapshotCache.size > 256) {
+    const oldest = interactSessionSnapshotCache.keys().next().value;
+    if (oldest !== undefined) interactSessionSnapshotCache.delete(oldest);
+  }
 }
 
 function splitCompositeSessionId(raw: unknown): { siteId?: string; agentSessionId?: string; sigHex?: string; malformed?: boolean } {
@@ -11177,6 +12380,15 @@ export async function executeInteractCall(params: {
   const formats = Array.isArray(payload.formats)
     ? payload.formats.filter((f): f is string => typeof f === 'string')
     : ['markdown'];
+  const interactMaxChars =
+    typeof payload.maxChars === 'number' && Number.isFinite(payload.maxChars) && payload.maxChars > 0
+      ? Math.min(500_000, Math.max(100, Math.floor(payload.maxChars)))
+      : undefined;
+  const interactOffset =
+    typeof payload.offset === 'number' && Number.isFinite(payload.offset) && payload.offset >= 0
+      ? Math.floor(payload.offset)
+      : 0;
+  const hasInteractSlicePaging = interactMaxChars !== undefined || interactOffset > 0;
   const keepSession = Boolean(payload.keepSession);
   const closeSession = Boolean(payload.closeSession);
   const explicitSite = typeof payload.site === 'string' && payload.site.trim() ? payload.site.trim().toLowerCase() : undefined;
@@ -11266,6 +12478,7 @@ export async function executeInteractCall(params: {
           const ytTranscript = extractYouTubeTranscriptFromHtml(ytRawHtml);
           const requestedTranscript = formats.includes('transcript');
           const wantMarkdown = formats.includes('markdown');
+          const ytPaged = sliceMarkdownWithOffsetAndMaxChars(ytDoc.markdown, interactOffset, interactMaxChars);
           return {
             status: 200,
             via: ytFallback.via,
@@ -11276,7 +12489,16 @@ export async function executeInteractCall(params: {
               status: ytItem.status ?? 200,
               rendered: false,
               actions: [],
-              ...(wantMarkdown || (requestedTranscript && !ytTranscript) ? { markdown: ytDoc.markdown } : {}),
+              ...(wantMarkdown || (requestedTranscript && !ytTranscript) ? { markdown: ytPaged.markdown } : {}),
+              ...(hasInteractSlicePaging || ytPaged.truncated
+                ? {
+                    truncated: ytPaged.truncated,
+                    offset: ytPaged.offset,
+                    totalChars: ytPaged.totalChars,
+                    nextOffset: ytPaged.nextOffset,
+                    remainingChars: ytPaged.remainingChars,
+                  }
+                : {}),
               ...(requestedTranscript ? { transcript: ytTranscript || null } : {}),
               ...(requestedTranscript && !ytTranscript
                 ? {
@@ -11293,7 +12515,40 @@ export async function executeInteractCall(params: {
       }
     }
 
-    const prob = String(item.problem ?? 'Browser interact step failed');
+    const rawProb = String(item.problem ?? 'Browser interact step failed');
+    const prob = scrubResolverIpFromError(rawProb);
+    if (isDnsNotFoundError(item.outcome, prob)) {
+      return {
+        status: 502,
+        via: fetchRes.via,
+        body: {
+          ok: false,
+          ...(normalizedUrl ? { url: normalizedUrl } : {}),
+          outcome: 'dns_not_found',
+          error: 'dns_not_found',
+          retryable: false,
+          status: 502,
+          message: DNS_NOT_FOUND_MESSAGE,
+          problem: prob || DNS_NOT_FOUND_MESSAGE,
+        },
+      };
+    }
+    if (isSsrfBlockedError(item.outcome, prob)) {
+      return {
+        status: 403,
+        via: fetchRes.via,
+        body: {
+          ok: false,
+          ...(normalizedUrl ? { url: normalizedUrl } : {}),
+          outcome: 'blocked',
+          error: 'blocked',
+          retryable: false,
+          status: item.status ?? 403,
+          message: SSRF_BLOCKED_INFO.message,
+          blocked: { ...SSRF_BLOCKED_INFO },
+        },
+      };
+    }
     const actFail = /interact action (\d+) \(([^)]+)\):\s*(.+)/i.exec(prob);
     const failedIdx = actFail ? Number(actFail[1]) : -1;
     const failedDetail = actFail?.[3]?.trim() ?? prob;
@@ -11398,11 +12653,87 @@ export async function executeInteractCall(params: {
           return t;
         })()
       : undefined;
-  const actionResults = actions.map((a, idx) => describeAction(a, idx, 'ok'));
+  const rawGoActionResults: Array<Record<string, unknown>> | undefined = Array.isArray(item.actionResults)
+    ? (item.actionResults as Array<Record<string, unknown>>)
+    : Array.isArray((item.interact as Record<string, unknown> | undefined)?.actionResults)
+      ? ((item.interact as Record<string, unknown>).actionResults as Array<Record<string, unknown>>)
+      : Array.isArray(item.actions)
+        ? (item.actions as Array<Record<string, unknown>>)
+        : undefined;
+
+  const interactWarnings: string[] = [];
+  const actionResults = actions.map((a, idx) => {
+    const base = describeAction(a, idx, 'ok') as Record<string, unknown>;
+    const goAct = rawGoActionResults?.[idx];
+    if (goAct && typeof goAct === 'object') {
+      if (typeof goAct.urlChanged === 'boolean') base.urlChanged = goAct.urlChanged;
+      if (typeof goAct.domChanged === 'boolean') base.domChanged = goAct.domChanged;
+      if (typeof goAct.beforeUrl === 'string') base.beforeUrl = goAct.beforeUrl;
+      if (typeof goAct.afterUrl === 'string') base.afterUrl = goAct.afterUrl;
+      if (typeof goAct.effect === 'string') base.effect = goAct.effect;
+      if (typeof goAct.warning === 'string' && goAct.warning.trim()) interactWarnings.push(goAct.warning.trim());
+    }
+    const actType = String(a.type ?? '').toLowerCase();
+    if ((actType === 'click' || actType === 'press') && base.urlChanged === false && base.domChanged === false) {
+      base.effect = 'no_effect';
+      const selDesc = typeof a.selector === 'string' ? ` on "${a.selector}"` : typeof a.key === 'string' ? ` ("${a.key}")` : '';
+      interactWarnings.push(
+        `Action ${idx} (${actType}${selDesc}) produced no URL or DOM change (no_effect). Verify the selector, element interactivity, or wait condition.`,
+      );
+    }
+    return base;
+  });
+
+  const hasClickOrPress = actions.some((a) => {
+    const t = String(a.type ?? '').toLowerCase();
+    return t === 'click' || t === 'press';
+  });
+  const currentMdSha = await sha256HexString(markdown);
+  const resumedCacheKey = parsedSession.agentSessionId && parsedSession.siteId ? `${parsedSession.siteId}:${parsedSession.agentSessionId}` : undefined;
+  const prevSnap = resumedCacheKey ? interactSessionSnapshotCache.get(resumedCacheKey) : undefined;
+
+  if (hasClickOrPress && interactWarnings.length === 0) {
+    const beforeHtml =
+      typeof item.beforeBody === 'string'
+        ? item.beforeBody
+        : typeof item.initialBody === 'string'
+          ? item.initialBody
+          : undefined;
+    const beforeMd =
+      typeof item.beforeMarkdown === 'string'
+        ? item.beforeMarkdown.trim()
+        : typeof item.initialMarkdown === 'string'
+          ? item.initialMarkdown.trim()
+          : beforeHtml
+            ? extractHtmlDocument(beforeHtml, { baseUrl: normalizedUrl || finalUrl || undefined, onlyMainContent: true }).markdown.trim()
+            : undefined;
+    const topNoDomChange = item.domChanged === false && item.urlChanged === false;
+    const sameAsBeforeTurn =
+      prevSnap !== undefined &&
+      (!finalUrl || finalUrl === prevSnap.url) &&
+      currentMdSha === prevSnap.markdownSha;
+    const sameAsInitialInSingleTurn =
+      beforeMd !== undefined &&
+      (!normalizedUrl || finalUrl === normalizedUrl) &&
+      beforeMd === markdown.trim();
+    if (topNoDomChange || sameAsBeforeTurn || sameAsInitialInSingleTurn) {
+      interactWarnings.push(
+        'Click/press actions completed, but neither finalUrl nor extracted Markdown changed. The target element may be non-interactive, hidden, or require a longer waitForMs/waitSelector.',
+      );
+    }
+  }
+
+  if (returnedAgentSid && !closeSession) {
+    rememberInteractSessionSnapshot(`${actualSite}:${returnedAgentSid}`, finalUrl || normalizedUrl, currentMdSha);
+  } else if (resumedCacheKey && closeSession) {
+    interactSessionSnapshotCache.delete(resumedCacheKey);
+  }
+
   const formatWarnings: Record<string, string> = {};
   if (requestedTranscript && !transcript) {
     formatWarnings.transcript = 'No timed caption/transcript segments found on page; returning extracted page Markdown.';
   }
+  const pagedMd = sliceMarkdownWithOffsetAndMaxChars(markdown, interactOffset, interactMaxChars);
 
   return {
     status: 200,
@@ -11417,7 +12748,17 @@ export async function executeInteractCall(params: {
       ...(publicSessionId ? { sessionId: publicSessionId } : {}),
       ...(closeSession ? { closed: true } : {}),
       actions: actionResults,
-      ...(wantMarkdown || (requestedTranscript && !transcript) ? { markdown } : {}),
+      ...(interactWarnings.length > 0 ? { warnings: [...new Set(interactWarnings)] } : {}),
+      ...(wantMarkdown || (requestedTranscript && !transcript) ? { markdown: pagedMd.markdown } : {}),
+      ...(hasInteractSlicePaging || pagedMd.truncated
+        ? {
+            truncated: pagedMd.truncated,
+            offset: pagedMd.offset,
+            totalChars: pagedMd.totalChars,
+            nextOffset: pagedMd.nextOffset,
+            remainingChars: pagedMd.remainingChars,
+          }
+        : {}),
       ...(requestedTranscript ? { transcript: transcript || null } : transcript ? { transcript } : {}),
       ...(Object.keys(formatWarnings).length > 0 ? { formatWarnings } : {}),
       ...(formats.includes('html') || formats.includes('rawHtml') ? { html: rawHtml } : {}),

@@ -47,7 +47,7 @@ type FetchReply struct {
 // IP literal, localhost, or credentialed user:pass@ URL). Paired with politeness.RejectNonPublicPeer at dial time.
 func PublicHTTPS(u *url.URL) error {
 	if u.Scheme != "https" {
-		return fmt.Errorf("only https URLs: %s", u.Redacted())
+		return fmt.Errorf("only https URLs: %s", politeness.SanitizeURL(u.String()))
 	}
 	if u.User != nil {
 		return errors.New("URL with user info")
@@ -306,7 +306,7 @@ func ExecuteCallWithTrace(ctx context.Context, c *Crawler, call FetchCall, trace
 				Kind:         3,
 				Start:        fStart,
 				End:          fEnd,
-				StatusOK:     r.Outcome == classify.OutcomeOK || r.Outcome == classify.OutcomeGone || r.Outcome == classify.OutcomeSkip,
+				StatusOK:     r.Outcome == classify.OutcomeOK || r.Outcome == classify.OutcomeNotFound || r.Outcome == classify.OutcomeGone || r.Outcome == classify.OutcomeSkip,
 				ErrorMessage: otel.RedactEmbeddedURLs(r.Problem),
 				Attributes:   attrs,
 			})

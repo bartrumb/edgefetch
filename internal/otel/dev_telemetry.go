@@ -183,6 +183,10 @@ func ClassifyErrorClass(httpStatus int, outcome, wafVendor, errMsg string) strin
 		return "rate_limited"
 	case "payment_required":
 		return "payment_required"
+	case "blocked_ssrf":
+		return "ssrf_blocked"
+	case "dns_not_found":
+		return "dns_error"
 	case "blocked":
 		if strings.Contains(msgLower, "robots") {
 			return "robots_disallowed"

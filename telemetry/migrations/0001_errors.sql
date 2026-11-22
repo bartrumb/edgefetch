@@ -27,3 +27,6 @@ CREATE INDEX IF NOT EXISTS idx_error_fingerprints_adapter
 
 CREATE INDEX IF NOT EXISTS idx_error_fingerprints_last_seen
   ON error_fingerprints (last_seen_at DESC, count DESC);
+
+CREATE INDEX IF NOT EXISTS idx_error_fingerprints_evict
+  ON error_fingerprints (count ASC, last_seen_at ASC);

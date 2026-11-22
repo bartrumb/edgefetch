@@ -12,14 +12,24 @@
  */
 
 import { MIN_TOKEN_LENGTH, sameBytes } from './auth';
-import { inferAssociatedDomains, isSafePublicHttpsUrl, slugifyMcpServerName, stripMcpSmugglingChars } from './mcp-registry';
+import {
+  extractRegistrableDomain,
+  isJsonDepthWithinLimit,
+  isSafePublicHttpsUrl,
+  slugifyMcpServerName,
+  stripMcpSmugglingChars,
+  validateConnectorDomains,
+} from './mcp-registry';
 import { sha256Base64Url, type SqlStorageLike } from './oauth';
 
 export const MCP_OAUTH_STATE_TTL_MS = 10 * 60_000; // 10m single-use PKCE state lifetime
-export const MCP_OAUTH_BIND_COOKIE = 'ef_mcp_oauth_bind';
+export const MCP_OAUTH_BIND_COOKIE = '__Host-ef_mcp_oauth_bind';
+export const MCP_OAUTH_BIND_COOKIE_DEV = 'ef_mcp_oauth_bind';
 const MAX_OAUTH_META_BYTES = 256 * 1024;
 const OAUTH_META_TIMEOUT_MS = 10_000;
 const MAX_VAULT_SERVERS_PER_USER = 64;
+const MAX_PENDING_OAUTH_STATES_PER_USER = 16;
+const MAX_SECRET_HEADERS_TOTAL_BYTES = 32 * 1024;
 
 const FORBIDDEN_SECRET_HEADER_NAMES = new Set([
   'host',
@@ -35,8 +45,27 @@ const FORBIDDEN_SECRET_HEADER_NAMES = new Set([
   'te',
   'trailer',
   'proxy-connection',
+  'proxy-authorization',
   'content-type',
+  'content-encoding',
   'accept',
+  'accept-encoding',
+  'user-agent',
+  'origin',
+  'referer',
+  'expect',
+  'forwarded',
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-real-ip',
+  'cf-connecting-ip',
+  'true-client-ip',
+  'fly-client-ip',
+  'x-http-method-override',
+  'last-event-id',
+  'cookie',
+  'cookie2',
   'mcp-session-id',
   'mcp-protocol-version',
 ]);
@@ -47,11 +76,13 @@ export interface CachedMcpToolSchema {
   description?: string;
   inputSchema: Record<string, unknown>;
   readOnlyHint?: boolean;
+  destructiveHint?: boolean;
 }
 
 export interface VaultSecretPayload {
   kind: 'headers' | 'oauth2' | 'none';
   pinnedOrigin: string;
+  pinnedUrl?: string;
   headers?: Record<string, string>;
   oauth?: {
     accessToken: string;
@@ -59,6 +90,8 @@ export interface VaultSecretPayload {
     tokenType?: string;
     expiresAt?: number;
     scope?: string;
+    issuer?: string;
+    resource?: string;
     tokenEndpoint: string;
     clientId: string;
     clientSecret?: string;
@@ -85,6 +118,7 @@ export interface StoredMcpServerRow {
   encryptedCredentials: string | null;
   authSummary: MaskedAuthSummary;
   domains: string[];
+  autoRouteScrape?: boolean;
   cachedTools: CachedMcpToolSchema[];
   toolCount: number;
   enabled: boolean;
@@ -106,6 +140,7 @@ export interface PublicMcpServerSummary {
   authType: 'oauth2' | 'headers' | 'none';
   authSummary: MaskedAuthSummary;
   domains: string[];
+  autoRouteScrape: boolean;
   tools: CachedMcpToolSchema[];
   toolCount: number;
   enabled: boolean;
@@ -124,6 +159,7 @@ export interface PendingMcpOAuthStateRow {
   remoteOrigin: string;
   transport: 'streamable-http' | 'sse';
   domains: string[];
+  autoRouteScrape?: boolean;
   encryptedPkceBlob: string;
   expiresAt: number;
 }
@@ -150,6 +186,7 @@ export const MCP_VAULT_SQLITE_SCHEMA = `
     encrypted_credentials TEXT,
     auth_summary_json TEXT NOT NULL DEFAULT '{}',
     domains_json TEXT NOT NULL DEFAULT '[]',
+    auto_route_scrape INTEGER NOT NULL DEFAULT 0,
     cached_tools_json TEXT NOT NULL DEFAULT '[]',
     tool_count INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 1,
@@ -212,6 +249,7 @@ export function toPublicMcpServerSummary(row: StoredMcpServerRow): PublicMcpServ
     authType: row.authType,
     authSummary: row.authSummary,
     domains: row.domains,
+    autoRouteScrape: Boolean(row.autoRouteScrape),
     tools: row.cachedTools,
     toolCount: row.toolCount,
     enabled: row.enabled,
@@ -278,9 +316,11 @@ async function derivePerUserOriginAesKey(params: {
     false,
     ['deriveKey'],
   );
+  const originLower = params.remoteOrigin.toLowerCase();
+  const scopedPair = `${params.userId.length}:${params.userId}|${originLower.length}:${originLower}`;
   const infoLabel = params.purpose
-    ? `edgefetch-mcp-vault-v1:${params.purpose}:${params.userId}:${params.remoteOrigin.toLowerCase()}`
-    : `edgefetch-mcp-vault-v1:${params.userId}:${params.remoteOrigin.toLowerCase()}`;
+    ? `edgefetch-mcp-vault-v1:${params.purpose}:${scopedPair}`
+    : `edgefetch-mcp-vault-v1:${scopedPair}`;
   return await crypto.subtle.deriveKey(
     {
       name: 'HKDF',
@@ -320,7 +360,9 @@ export async function sealVaultCredentials(params: {
     remoteOrigin: canonicalOrigin,
   });
 
-  const aad = new TextEncoder().encode(`${params.userId}|${canonicalOrigin}`);
+  const aad = new TextEncoder().encode(
+    `${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+  );
   const plaintext = new TextEncoder().encode(
     JSON.stringify({
       ...params.payload,
@@ -347,6 +389,7 @@ export async function unsealVaultCredentials(params: {
   vaultMasterKey: string | undefined;
   userId: string;
   remoteOrigin: string;
+  remoteUrl?: string;
   ciphertext: string;
 }): Promise<
   | { ok: true; payload: VaultSecretPayload }
@@ -368,6 +411,9 @@ export async function unsealVaultCredentials(params: {
   }
 
   const canonicalOrigin = params.remoteOrigin.trim().toLowerCase();
+  if (params.remoteOrigin !== canonicalOrigin) {
+    return { ok: false, error: 'vault_decryption_failed', message: 'Non-canonical origin supplied to vault decryption' };
+  }
   try {
     const aesKey = await derivePerUserOriginAesKey({
       vaultMasterKey: keyCheck.key,
@@ -375,7 +421,9 @@ export async function unsealVaultCredentials(params: {
       userId: params.userId,
       remoteOrigin: canonicalOrigin,
     });
-    const aad = new TextEncoder().encode(`${params.userId}|${canonicalOrigin}`);
+    const aad = new TextEncoder().encode(
+    `${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+  );
     const plainBuf = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
       aesKey,
@@ -384,6 +432,11 @@ export async function unsealVaultCredentials(params: {
     const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plainBuf)) as VaultSecretPayload;
     if (!parsed || typeof parsed !== 'object' || parsed.pinnedOrigin?.toLowerCase() !== canonicalOrigin) {
       return { ok: false, error: 'vault_decryption_failed', message: 'Pinned origin mismatch during vault decryption' };
+    }
+    if (params.remoteUrl && typeof parsed.pinnedUrl === 'string' && parsed.pinnedUrl) {
+      if (params.remoteUrl.trim().replace(/\/+$/, '') !== parsed.pinnedUrl.trim().replace(/\/+$/, '')) {
+        return { ok: false, error: 'vault_decryption_failed', message: 'Pinned endpoint URL path mismatch during vault decryption' };
+      }
     }
     return { ok: true, payload: parsed };
   } catch {
@@ -451,17 +504,24 @@ async function unsealPkceStateBlob(params: {
   }
 }
 
+const HEADER_CONTROL_BYTE_RE = /[\x00-\x08\x0a-\x1f\x7f]/;
+
 export function sanitizeSecretHeadersInput(params: {
   bearerToken?: unknown;
   headers?: unknown;
 }): { ok: true; headers: Record<string, string> } | { ok: false; error: string } {
   const cleaned: Record<string, string> = {};
+  const seenLowerKeys = new Set<string>();
+  let totalBytes = 0;
+
   if (typeof params.bearerToken === 'string' && params.bearerToken.trim()) {
     const tok = params.bearerToken.trim().replace(/^Bearer\s+/i, '').trim();
-    if (!tok || /[\r\n\0]/.test(tok) || tok.length > 4_096) {
-      return { ok: false, error: 'Invalid Bearer token format' };
+    if (!tok || HEADER_CONTROL_BYTE_RE.test(tok) || tok.length > 4_096) {
+      return { ok: false, error: 'Invalid Bearer token format or control characters' };
     }
     cleaned['Authorization'] = `Bearer ${tok}`;
+    seenLowerKeys.add('authorization');
+    totalBytes += 'Authorization'.length + cleaned['Authorization'].length;
   }
 
   if (params.headers !== undefined && params.headers !== null) {
@@ -481,14 +541,23 @@ export function sanitizeSecretHeadersInput(params: {
       if (!key || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,80}$/.test(key)) {
         return { ok: false, error: `Invalid HTTP header name "${rawKey}"` };
       }
-      if (FORBIDDEN_SECRET_HEADER_NAMES.has(key.toLowerCase())) {
+      const lowerKey = key.toLowerCase();
+      if (FORBIDDEN_SECRET_HEADER_NAMES.has(lowerKey)) {
         return { ok: false, error: `Disallowed reserved HTTP header "${key}"` };
       }
       const val = rawVal.trim();
       if (!val) continue;
-      if (/[\r\n\0]/.test(val) || val.length > 8_192) {
+      if (HEADER_CONTROL_BYTE_RE.test(val) || val.length > 8_192) {
         return { ok: false, error: `Header "${key}" contains control characters or exceeds 8 KiB` };
       }
+      if (seenLowerKeys.has(lowerKey)) {
+        return { ok: false, error: `Duplicate HTTP header "${key}" (case-insensitive collision)` };
+      }
+      totalBytes += key.length + val.length;
+      if (totalBytes > MAX_SECRET_HEADERS_TOTAL_BYTES) {
+        return { ok: false, error: 'Combined custom headers exceed 32 KiB limit' };
+      }
+      seenLowerKeys.add(lowerKey);
       cleaned[key] = val;
     }
   }
@@ -571,6 +640,7 @@ function parseStoredRow(r: Record<string, unknown>): StoredMcpServerRow {
     encryptedCredentials: typeof r.encrypted_credentials === 'string' && r.encrypted_credentials ? r.encrypted_credentials : null,
     authSummary,
     domains,
+    autoRouteScrape: Number(r.auto_route_scrape ?? 0) !== 0,
     cachedTools,
     toolCount: Number(r.tool_count ?? cachedTools.length),
     enabled: Number(r.enabled ?? 1) !== 0,
@@ -598,6 +668,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
          encrypted_credentials TEXT,
          auth_summary_json TEXT NOT NULL DEFAULT '{}',
          domains_json TEXT NOT NULL DEFAULT '[]',
+         auto_route_scrape INTEGER NOT NULL DEFAULT 0,
          cached_tools_json TEXT NOT NULL DEFAULT '[]',
          tool_count INTEGER NOT NULL DEFAULT 0,
          enabled INTEGER NOT NULL DEFAULT 1,
@@ -609,6 +680,11 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
        )`,
     );
     sql.exec('CREATE INDEX IF NOT EXISTS idx_user_mcp_servers_user ON user_mcp_servers(user_id)');
+    try {
+      sql.exec('ALTER TABLE user_mcp_servers ADD COLUMN auto_route_scrape INTEGER NOT NULL DEFAULT 0');
+    } catch {
+      // Column already exists
+    }
     sql.exec(
       `CREATE TABLE IF NOT EXISTS mcp_oauth_states (
          state_hash TEXT PRIMARY KEY,
@@ -619,10 +695,16 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
          remote_origin TEXT NOT NULL,
          transport TEXT NOT NULL,
          domains_json TEXT NOT NULL,
+         auto_route_scrape INTEGER NOT NULL DEFAULT 0,
          encrypted_pkce_blob TEXT NOT NULL,
          expires_at INTEGER NOT NULL
        )`,
     );
+    try {
+      sql.exec('ALTER TABLE mcp_oauth_states ADD COLUMN auto_route_scrape INTEGER NOT NULL DEFAULT 0');
+    } catch {
+      // Column already exists
+    }
     initialized = true;
   };
 
@@ -657,9 +739,8 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
       return (
         all.find(
           (s) =>
-            s.name.toLowerCase() === needle ||
             s.remoteOrigin.replace(/^https:\/\//, '') === cleanHost ||
-            s.domains.some((d) => cleanHost === d || cleanHost.endsWith(`.${d}`)),
+            (Boolean(s.autoRouteScrape) && s.domains.some((d) => cleanHost === d || cleanHost.endsWith(`.${d}`))),
         ) ?? null
       );
     },
@@ -679,9 +760,9 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
       sql.exec(
         `INSERT INTO user_mcp_servers (
            id, user_id, slug, name, remote_url, remote_origin, transport, auth_type,
-           encrypted_credentials, auth_summary_json, domains_json, cached_tools_json,
+           encrypted_credentials, auth_summary_json, domains_json, auto_route_scrape, cached_tools_json,
            tool_count, enabled, last_verified_at, last_error, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, slug) DO UPDATE SET
            name = excluded.name,
            remote_url = excluded.remote_url,
@@ -691,6 +772,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
            encrypted_credentials = excluded.encrypted_credentials,
            auth_summary_json = excluded.auth_summary_json,
            domains_json = excluded.domains_json,
+           auto_route_scrape = excluded.auto_route_scrape,
            cached_tools_json = excluded.cached_tools_json,
            tool_count = excluded.tool_count,
            enabled = excluded.enabled,
@@ -708,6 +790,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
         row.encryptedCredentials,
         JSON.stringify(row.authSummary),
         JSON.stringify(row.domains),
+        row.autoRouteScrape ? 1 : 0,
         JSON.stringify(row.cachedTools),
         row.toolCount,
         row.enabled ? 1 : 0,
@@ -730,38 +813,50 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
     },
     putOAuthState(row) {
       ensureTables();
+      const uid = row.userId.trim() || 'owner';
       sql.exec('DELETE FROM mcp_oauth_states WHERE expires_at <= ?', row.expiresAt - MCP_OAUTH_STATE_TTL_MS);
+      // Evict ONLY this user's oldest pending states so one tenant cannot evict another user's in-flight OAuth state!
       sql.exec(
         `DELETE FROM mcp_oauth_states
-         WHERE state_hash IN (SELECT state_hash FROM mcp_oauth_states ORDER BY expires_at DESC LIMIT -1 OFFSET 255)`,
+         WHERE user_id = ? AND state_hash IN (
+           SELECT state_hash FROM mcp_oauth_states WHERE user_id = ? ORDER BY expires_at DESC LIMIT -1 OFFSET ?
+         )`,
+        uid,
+        uid,
+        MAX_PENDING_OAUTH_STATES_PER_USER - 1,
       );
       sql.exec(
         `INSERT OR REPLACE INTO mcp_oauth_states (
-           state_hash, user_id, slug, name, remote_url, remote_origin, transport, domains_json, encrypted_pkce_blob, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           state_hash, user_id, slug, name, remote_url, remote_origin, transport, domains_json, auto_route_scrape, encrypted_pkce_blob, expires_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         row.stateHash,
-        row.userId,
+        uid,
         row.slug,
         row.name,
         row.remoteUrl,
         row.remoteOrigin,
         row.transport,
         JSON.stringify(row.domains),
+        row.autoRouteScrape ? 1 : 0,
         row.encryptedPkceBlob,
         row.expiresAt,
       );
     },
     consumeOAuthState(stateHash, userId, now) {
       ensureTables();
+      const uid = userId.trim() || 'owner';
       const rows = sql
-        .exec<Record<string, unknown>>('SELECT * FROM mcp_oauth_states WHERE state_hash = ? LIMIT 1', stateHash)
+        .exec<Record<string, unknown>>(
+          'SELECT * FROM mcp_oauth_states WHERE state_hash = ? AND user_id = ? LIMIT 1',
+          stateHash,
+          uid,
+        )
         .toArray();
-      // Always delete immediately so authorization state is strictly single-use!
-      sql.exec('DELETE FROM mcp_oauth_states WHERE state_hash = ? OR expires_at <= ?', stateHash, now);
+      // Delete ONLY matching `(state_hash, user_id)` or expired rows so another user cannot burn a victim's pending state!
+      sql.exec('DELETE FROM mcp_oauth_states WHERE (state_hash = ? AND user_id = ?) OR expires_at <= ?', stateHash, uid, now);
       const r = rows[0];
       if (!r) return null;
       if (Number(r.expires_at ?? 0) <= now) return null;
-      if (String(r.user_id ?? 'owner') !== (userId.trim() || 'owner')) return null;
       let domains: string[] = [];
       try {
         const parsed = JSON.parse(String(r.domains_json ?? '[]'));
@@ -778,6 +873,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
         remoteOrigin: String(r.remote_origin),
         transport: String(r.transport) === 'sse' ? 'sse' : 'streamable-http',
         domains,
+        autoRouteScrape: Number(r.auto_route_scrape ?? 0) !== 0,
         encryptedPkceBlob: String(r.encrypted_pkce_blob),
         expiresAt: Number(r.expires_at),
       };
@@ -807,9 +903,8 @@ export function createMemoryMcpVaultStore(): McpVaultStore {
       for (const s of servers.values()) {
         if (s.userId !== uid) continue;
         if (
-          s.name.toLowerCase() === needle ||
           s.remoteOrigin.replace(/^https:\/\//, '') === cleanHost ||
-          s.domains.some((d) => cleanHost === d || cleanHost.endsWith(`.${d}`))
+          (Boolean(s.autoRouteScrape) && s.domains.some((d) => cleanHost === d || cleanHost.endsWith(`.${d}`)))
         ) {
           return structuredClone(s);
         }
@@ -818,18 +913,42 @@ export function createMemoryMcpVaultStore(): McpVaultStore {
     },
     upsertServer(row) {
       const uid = row.userId.trim() || 'owner';
+      const userRows = [...servers.entries()].filter(([, v]) => v.userId === uid && v.slug.toLowerCase() !== row.slug.toLowerCase());
+      if (userRows.length >= MAX_VAULT_SERVERS_PER_USER) {
+        userRows.sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+        for (let i = 0; i <= userRows.length - MAX_VAULT_SERVERS_PER_USER; i++) {
+          servers.delete(userRows[i]![0]);
+        }
+      }
       servers.set(keyOf(uid, row.slug), structuredClone({ ...row, userId: uid }));
     },
     deleteServer(userId, slug) {
       return servers.delete(keyOf(userId, slug));
     },
     putOAuthState(row) {
-      states.set(row.stateHash, structuredClone(row));
+      const uid = row.userId.trim() || 'owner';
+      const approxNow = row.expiresAt - MCP_OAUTH_STATE_TTL_MS;
+      for (const [k, v] of states.entries()) {
+        if (v.expiresAt <= approxNow) states.delete(k);
+      }
+      const userStates = [...states.entries()].filter(([, v]) => v.userId === uid);
+      if (userStates.length >= MAX_PENDING_OAUTH_STATES_PER_USER) {
+        userStates.sort((a, b) => a[1].expiresAt - b[1].expiresAt);
+        for (let i = 0; i <= userStates.length - MAX_PENDING_OAUTH_STATES_PER_USER; i++) {
+          states.delete(userStates[i]![0]);
+        }
+      }
+      states.set(row.stateHash, structuredClone({ ...row, userId: uid }));
     },
     consumeOAuthState(stateHash, userId, now) {
+      const uid = userId.trim() || 'owner';
+      for (const [k, v] of states.entries()) {
+        if (v.expiresAt <= now) states.delete(k);
+      }
       const hit = states.get(stateHash);
+      if (!hit || hit.userId !== uid) return null;
       states.delete(stateHash);
-      if (!hit || hit.expiresAt <= now || hit.userId !== (userId.trim() || 'owner')) return null;
+      if (hit.expiresAt <= now) return null;
       return structuredClone(hit);
     },
   };
@@ -889,7 +1008,8 @@ async function fetchJsonSafeBounded(
   const text = new TextDecoder('utf-8', { fatal: false }).decode(merged);
   let json: Record<string, unknown> | null = null;
   try {
-    const parsed = text.trim() ? JSON.parse(text) : null;
+    const trimmed = text.trim();
+    const parsed = trimmed && isJsonDepthWithinLimit(trimmed, 32) ? JSON.parse(trimmed) : null;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       json = parsed as Record<string, unknown>;
     }
@@ -897,6 +1017,24 @@ async function fetchJsonSafeBounded(
     json = null;
   }
   return { status: resp.status, headers: resp.headers, json };
+}
+
+async function computeMcpOAuthBindHmac(
+  vaultMasterKey: string,
+  userId: string,
+  state: string,
+  sessionCsrf: string,
+): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(`edgefetch-mcp-oauth-bind:${vaultMasterKey}`),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${userId}|${state}|${sessionCsrf}`));
+  return bytesToBase64Url(new Uint8Array(sig));
 }
 
 export interface DiscoveredRemoteOAuthMetadata {
@@ -924,13 +1062,15 @@ export async function probeRemoteMcpOAuthMetadata(params: {
 
   const fetchFn = params.fetchFn ?? fetch;
   const origin = urlCheck.url.origin;
+  const canonicalRemoteNoSlash = urlCheck.normalized.replace(/\/+$/, '');
   const pathSuffix = urlCheck.url.pathname && urlCheck.url.pathname !== '/' ? urlCheck.url.pathname.replace(/\/+$/, '') : '';
+  const remoteBaseDomain = extractRegistrableDomain(urlCheck.url.hostname);
 
-  let resourceUri: string | undefined;
+  let resourceUri = urlCheck.normalized;
   let authIssuerUrl = origin;
   let scopesSupported: string[] | undefined;
 
-  // 1. RFC 9728 Protected Resource Metadata probe
+  // 1. RFC 9728 Protected Resource Metadata probe (strict §3.3 `resource` match against `remoteUrl`!)
   const prCandidates = pathSuffix
     ? [`${origin}/.well-known/oauth-protected-resource${pathSuffix}`, `${origin}/.well-known/oauth-protected-resource`]
     : [`${origin}/.well-known/oauth-protected-resource`];
@@ -941,33 +1081,58 @@ export async function probeRemoteMcpOAuthMetadata(params: {
         method: 'GET',
         headers: { accept: 'application/json' },
       });
-      if (pr.status === 200 && pr.json) {
-        if (typeof pr.json.resource === 'string') {
-          const rc = isSafePublicHttpsUrl(pr.json.resource, params.selfHost);
-          if (rc.ok) resourceUri = rc.normalized;
+      if (pr.status === 200) {
+        if (!pr.json || typeof pr.json.resource !== 'string') {
+          // RFC 9728 §3.3: `resource` is REQUIRED and MUST match the connector's canonical URL!
+          return { supported: false };
         }
-        if (Array.isArray(pr.json.authorization_servers) && typeof pr.json.authorization_servers[0] === 'string') {
+        const rc = isSafePublicHttpsUrl(pr.json.resource, params.selfHost);
+        if (!rc.ok || rc.url.search) {
+          return { supported: false };
+        }
+        const prResourceNoSlash = rc.normalized.replace(/\/+$/, '');
+        const matchesExactUrl = prResourceNoSlash === canonicalRemoteNoSlash;
+        const matchesPathlessOrigin = !pathSuffix && prResourceNoSlash === origin.toLowerCase();
+        if (!matchesExactUrl && !matchesPathlessOrigin) {
+          return { supported: false };
+        }
+        resourceUri = rc.normalized;
+
+        if (pr.json.authorization_servers !== undefined) {
+          if (!Array.isArray(pr.json.authorization_servers) || typeof pr.json.authorization_servers[0] !== 'string') {
+            return { supported: false };
+          }
           const asCheck = isSafePublicHttpsUrl(pr.json.authorization_servers[0], params.selfHost);
-          if (asCheck.ok) authIssuerUrl = asCheck.normalized.replace(/\/+$/, '');
+          if (!asCheck.ok || asCheck.url.search) {
+            return { supported: false };
+          }
+          // Confused-deputy defense (H2): downstream AS must share registrable domain (or exact origin) with the MCP resource!
+          const asBaseDomain = extractRegistrableDomain(asCheck.url.hostname);
+          if (asCheck.origin !== origin.toLowerCase() && (!remoteBaseDomain || asBaseDomain !== remoteBaseDomain)) {
+            return { supported: false };
+          }
+          authIssuerUrl = asCheck.normalized.replace(/\/+$/, '');
         }
         if (Array.isArray(pr.json.scopes_supported)) {
-          scopesSupported = pr.json.scopes_supported.filter((s): s is string => typeof s === 'string').slice(0, 20);
+          scopesSupported = pr.json.scopes_supported
+            .filter((s): s is string => typeof s === 'string' && /^[\x21-\x7e]{1,80}$/.test(s))
+            .slice(0, 20);
         }
         break;
       }
     } catch {
-      // continue to fallback
+      // continue to fallback only on 404/network error before 200 PRM
     }
   }
 
-  // 2. RFC 8414 Authorization Server Metadata probe
+  // 2. RFC 8414 Authorization Server Metadata probe (strict `issuer` & same-origin endpoint verification!)
+  const expectedIssuerNorm = authIssuerUrl.replace(/\/+$/, '');
   const issuerParsed = new URL(authIssuerUrl);
   const issuerPath = issuerParsed.pathname && issuerParsed.pathname !== '/' ? issuerParsed.pathname.replace(/\/+$/, '') : '';
   const asCandidates = issuerPath
     ? [
         `${issuerParsed.origin}/.well-known/oauth-authorization-server${issuerPath}`,
         `${issuerParsed.origin}${issuerPath}/.well-known/openid-configuration`,
-        `${issuerParsed.origin}/.well-known/oauth-authorization-server`,
       ]
     : [
         `${issuerParsed.origin}/.well-known/oauth-authorization-server`,
@@ -981,24 +1146,45 @@ export async function probeRemoteMcpOAuthMetadata(params: {
         headers: { accept: 'application/json' },
       });
       if (asRes.status === 200 && asRes.json) {
+        if (typeof asRes.json.issuer !== 'string') continue;
+        const issCheck = isSafePublicHttpsUrl(asRes.json.issuer, params.selfHost);
+        if (!issCheck.ok || issCheck.url.search) continue;
+        const reportedIssuerNorm = issCheck.normalized.replace(/\/+$/, '');
+        if (reportedIssuerNorm !== expectedIssuerNorm) continue;
+
         const authEpCheck = isSafePublicHttpsUrl(asRes.json.authorization_endpoint, params.selfHost);
         const tokenEpCheck = isSafePublicHttpsUrl(asRes.json.token_endpoint, params.selfHost);
         if (!authEpCheck.ok || !tokenEpCheck.ok) continue;
+        if (authEpCheck.origin !== issCheck.origin || tokenEpCheck.origin !== issCheck.origin) {
+          continue;
+        }
 
-        const regEpCheck = isSafePublicHttpsUrl(asRes.json.registration_endpoint, params.selfHost);
+        let validatedRegistrationEndpoint: string | undefined;
+        if (asRes.json.registration_endpoint !== undefined && asRes.json.registration_endpoint !== null) {
+          const regEpCheck = isSafePublicHttpsUrl(asRes.json.registration_endpoint, params.selfHost);
+          if (!regEpCheck.ok || regEpCheck.origin !== issCheck.origin) {
+            return { supported: false };
+          }
+          validatedRegistrationEndpoint = regEpCheck.normalized;
+        }
+
         const methods = Array.isArray(asRes.json.code_challenge_methods_supported)
           ? asRes.json.code_challenge_methods_supported.filter((m): m is string => typeof m === 'string')
           : ['S256'];
+        if (!methods.includes('S256')) continue;
+
         if (!scopesSupported && Array.isArray(asRes.json.scopes_supported)) {
-          scopesSupported = asRes.json.scopes_supported.filter((s): s is string => typeof s === 'string').slice(0, 20);
+          scopesSupported = asRes.json.scopes_supported
+            .filter((s): s is string => typeof s === 'string' && /^[\x21-\x7e]{1,80}$/.test(s))
+            .slice(0, 20);
         }
         return {
           supported: true,
-          ...(resourceUri ? { resource: resourceUri } : {}),
-          issuer: typeof asRes.json.issuer === 'string' ? asRes.json.issuer : authIssuerUrl,
+          resource: resourceUri,
+          issuer: reportedIssuerNorm,
           authorizationEndpoint: authEpCheck.normalized,
           tokenEndpoint: tokenEpCheck.normalized,
-          ...(regEpCheck.ok ? { registrationEndpoint: regEpCheck.normalized } : {}),
+          ...(validatedRegistrationEndpoint ? { registrationEndpoint: validatedRegistrationEndpoint } : {}),
           ...(scopesSupported ? { scopesSupported } : {}),
           codeChallengeMethods: methods,
         };
@@ -1024,6 +1210,7 @@ export async function startDownstreamMcpOAuth(params: {
   name?: string;
   transport?: 'streamable-http' | 'sse';
   domains?: string[];
+  autoRouteScrape?: boolean;
   clientId?: string;
   clientSecret?: string;
   scope?: string;
@@ -1105,18 +1292,22 @@ export async function startDownstreamMcpOAuth(params: {
     clientId = `${params.hubOrigin.replace(/\/+$/, '')}/.well-known/edgefetch-bot.json`;
   }
 
+  const autoRouteScrape = params.autoRouteScrape === true;
+  const domValidation = validateConnectorDomains(params.domains, urlCheck.origin, autoRouteScrape);
+  if (!domValidation.ok) {
+    return { ok: false, status: 400, error: 'invalid_domains', message: domValidation.error };
+  }
+
   const codeVerifier = randomBase64Url(32);
   const codeChallenge = await sha256Base64Url(codeVerifier);
   const state = randomBase64Url(32);
   const stateHash = await sha256Base64Url(state);
-  const bindCookieValue = await sha256Base64Url(`${state}:${params.sessionCsrf}`);
+  const bindCookieValue = await computeMcpOAuthBindHmac(keyCheck.key, params.userId, state, params.sessionCsrf);
 
   const cleanName = stripMcpSmugglingChars(params.name ?? '').trim().slice(0, 120) || urlCheck.url.hostname;
   const slug = slugifyMcpServerName(params.slug?.trim() || cleanName);
-  const domains =
-    params.domains && params.domains.length > 0
-      ? params.domains.map((d) => d.trim().toLowerCase()).filter(Boolean)
-      : inferAssociatedDomains({ name: cleanName, remotes: [{ url: urlCheck.normalized }] });
+  const domains = domValidation.domains;
+  const canonicalResource = meta.resource ?? urlCheck.normalized;
 
   const encryptedPkceBlob = await sealPkceStateBlob({
     vaultMasterKey: keyCheck.key,
@@ -1124,11 +1315,12 @@ export async function startDownstreamMcpOAuth(params: {
     remoteOrigin: urlCheck.origin,
     blob: {
       codeVerifier,
+      issuer: meta.issuer,
       tokenEndpoint: meta.tokenEndpoint,
       clientId,
       ...(clientSecret ? { clientSecret } : {}),
       redirectUri,
-      ...(meta.resource ? { resource: meta.resource } : {}),
+      resource: canonicalResource,
     },
   });
 
@@ -1142,6 +1334,7 @@ export async function startDownstreamMcpOAuth(params: {
     remoteOrigin: urlCheck.origin,
     transport: params.transport === 'sse' ? 'sse' : 'streamable-http',
     domains,
+    autoRouteScrape,
     encryptedPkceBlob,
     expiresAt: now + MCP_OAUTH_STATE_TTL_MS,
   });
@@ -1157,9 +1350,7 @@ export async function startDownstreamMcpOAuth(params: {
   if (effectiveScope) {
     authUrl.searchParams.set('scope', effectiveScope);
   }
-  if (meta.resource) {
-    authUrl.searchParams.set('resource', meta.resource);
-  }
+  authUrl.searchParams.set('resource', canonicalResource);
 
   return {
     ok: true,
@@ -1179,6 +1370,7 @@ export async function completeDownstreamMcpOAuthCallback(params: {
   bindCookieHeader: string | null;
   code: string;
   state: string;
+  iss?: string | null;
   vaultMasterKey: string | undefined;
   vaultStore: McpVaultStore;
   fetchFn?: typeof fetch;
@@ -1195,7 +1387,7 @@ export async function completeDownstreamMcpOAuthCallback(params: {
     return { ok: false, status: 400, error: 'missing_code_or_state', message: 'Missing OAuth authorization code or state.' };
   }
 
-  const expectedBind = await sha256Base64Url(`${params.state}:${params.sessionCsrf}`);
+  const expectedBind = await computeMcpOAuthBindHmac(keyCheck.key, params.userId, params.state, params.sessionCsrf);
   if (!params.bindCookieHeader || !sameBytes(params.bindCookieHeader, expectedBind)) {
     return { ok: false, status: 403, error: 'invalid_oauth_state_binding', message: 'OAuth state cookie binding mismatch.' };
   }
@@ -1217,9 +1409,23 @@ export async function completeDownstreamMcpOAuthCallback(params: {
     return { ok: false, status: 400, error: 'corrupt_pkce_state', message: 'Unable to unseal PKCE verifier.' };
   }
 
+  const expectedIssuer = typeof pkce.issuer === 'string' ? pkce.issuer.trim().replace(/\/+$/, '') : '';
+  if (params.iss !== undefined && params.iss !== null && params.iss.trim() !== '') {
+    const callbackIss = params.iss.trim().replace(/\/+$/, '');
+    if (!expectedIssuer || callbackIss !== expectedIssuer) {
+      return { ok: false, status: 400, error: 'oauth_issuer_mismatch', message: 'Authorization callback iss parameter did not match expected issuer.' };
+    }
+  }
+
   const tokenEpCheck = isSafePublicHttpsUrl(pkce.tokenEndpoint, params.selfHost);
   if (!tokenEpCheck.ok) {
     return { ok: false, status: 400, error: 'unsafe_token_endpoint', message: tokenEpCheck.reason };
+  }
+  if (expectedIssuer) {
+    const issCheck = isSafePublicHttpsUrl(expectedIssuer, params.selfHost);
+    if (!issCheck.ok || tokenEpCheck.origin !== issCheck.origin) {
+      return { ok: false, status: 400, error: 'unsafe_token_endpoint', message: 'Token endpoint origin does not match expected issuer origin.' };
+    }
   }
 
   const form = new URLSearchParams({
@@ -1284,12 +1490,15 @@ export async function completeDownstreamMcpOAuthCallback(params: {
   const secretPayload: VaultSecretPayload = {
     kind: 'oauth2',
     pinnedOrigin: pending.remoteOrigin,
+    pinnedUrl: pending.remoteUrl,
     oauth: {
       accessToken,
       ...(refreshToken ? { refreshToken } : {}),
       tokenType: 'Bearer',
       ...(expiresAt ? { expiresAt } : {}),
       ...(scopeStr ? { scope: scopeStr } : {}),
+      ...(expectedIssuer ? { issuer: expectedIssuer } : {}),
+      resource: typeof pkce.resource === 'string' && pkce.resource ? pkce.resource : pending.remoteUrl,
       tokenEndpoint: tokenEpCheck.normalized,
       clientId: pkce.clientId,
       ...(typeof pkce.clientSecret === 'string' && pkce.clientSecret ? { clientSecret: pkce.clientSecret } : {}),
@@ -1317,6 +1526,7 @@ export async function completeDownstreamMcpOAuthCallback(params: {
     encryptedCredentials: sealed.ciphertext,
     authSummary: buildMaskedAuthSummary(secretPayload),
     domains: pending.domains,
+    autoRouteScrape: Boolean(pending.autoRouteScrape),
     cachedTools: existing?.cachedTools ?? [],
     toolCount: existing?.toolCount ?? 0,
     enabled: true,

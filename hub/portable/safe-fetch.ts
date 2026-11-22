@@ -1,8 +1,9 @@
 /**
- * Dial-Time SSRF-Safe Outbound Fetch for Portable Node.js Hub (`hub/portable/safe-fetch.ts` — `H5`).
+ * Dial-Time SSRF-Safe Outbound Fetch for Portable Node.js & Deno Hubs (`hub/portable/safe-fetch.ts` — `H5` / `R7`).
  *
- * Enforces `net.BlockList` + full IPv4/IPv6 public-unicast validation inside Node's `dns.lookup` callback
- * right before `http.request` / `https.request` opens a socket — closing DNS-rebinding and split-horizon
+ * Enforces `net.BlockList` + full IPv4/IPv6 public-unicast validation inside a single DNS resolution pass
+ * right before `http.request` / `https.request` opens a socket to the pinned IP literal (with TLS SNI + X.509
+ * `tls.checkServerIdentity` bound to the original hostname) — closing DNS-rebinding TOCTOU and split-horizon
  * internal-DNS (`*.plex.direct`, corporate split-DNS, Home Assistant DuckDNS -> `192.168.x.x`) bypasses on Hub-side
  * overflow fetches, webhooks, SPA-fallback robots checks, and remote LLM calls!
  */
@@ -10,6 +11,7 @@ import dns from 'node:dns';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import tls from 'node:tls';
 
 const IPV4_BLOCKLIST = (() => {
   const bl = new net.BlockList();
@@ -55,6 +57,21 @@ const IPV6_BLOCKLIST = (() => {
   return bl;
 })();
 
+const SENSITIVE_CROSS_ORIGIN_HEADER_RE =
+  /(?:^authorization$|^proxy-authorization$|^cookie$|^set-cookie$|^x-api-key$|^api-key$|^apikey$|^x-goog-api-key$|^x-auth-token$|^x-access-token$|^private-token$|^x-csrf-token$|^x-amz-security-token$|token|secret|api[-_]?key|credential)/i;
+
+export function stripSensitiveCrossOriginHeaders(headers: Headers): void {
+  const toDelete: string[] = [];
+  headers.forEach((_val, key) => {
+    if (SENSITIVE_CROSS_ORIGIN_HEADER_RE.test(key)) {
+      toDelete.push(key);
+    }
+  });
+  for (const k of toDelete) {
+    headers.delete(k);
+  }
+}
+
 function expandIpv6ToWords(addr: string): number[] | null {
   const zoneIdx = addr.indexOf('%');
   let clean = (zoneIdx >= 0 ? addr.slice(0, zoneIdx) : addr).toLowerCase();
@@ -89,10 +106,14 @@ function expandIpv6ToWords(addr: string): number[] | null {
  */
 export function isPublicIpAddress(rawIp: string): boolean {
   if (typeof rawIp !== 'string') return false;
-  const clean = rawIp.trim().replace(/^\[|\]$/g, '');
-  if (!clean || clean.includes('%')) return false;
+  const trimmed = rawIp.trim();
+  if (!trimmed || trimmed !== rawIp || trimmed.includes('%')) return false;
+  const clean = trimmed.replace(/^\[|\]$/g, '');
+  if (!clean) return false;
   const ver = net.isIP(clean);
   if (ver === 4) {
+    // Reject leading-zero octal-looking octets (`010.0.0.1`)
+    if (clean.split('.').some((part) => part.length > 1 && part.startsWith('0'))) return false;
     return !IPV4_BLOCKLIST.check(clean, 'ipv4');
   }
   if (ver === 6) {
@@ -141,11 +162,11 @@ export function createPublicOnlyLookup(resolver: LookupResolverFn = dns.lookup):
       }
       // Every resolved A/AAAA record must be a valid public unicast IP string (defeating round-robin `[public, 127.0.0.1]` DNS rebinding!).
       for (const entry of addresses) {
-        const addrStr = entry && typeof entry === 'object' && typeof entry.address === 'string' ? entry.address.trim() : '';
+        const rawStr = entry && typeof entry === 'object' && typeof entry.address === 'string' ? entry.address : '';
         const fam = entry && typeof entry === 'object' && (entry.family === 4 || entry.family === 6) ? entry.family : 4;
-        if (!addrStr || !isPublicIpAddress(addrStr)) {
+        if (!rawStr || !isPublicIpAddress(rawStr)) {
           failLookup(
-            new Error(`SSRF blocked: refusing connection to non-public IP ${addrStr || String(entry)} resolved for ${hostname}`),
+            new Error(`SSRF blocked: refusing connection to non-public IP ${rawStr || String(entry)} resolved for ${hostname}`),
             fam,
           );
           return;
@@ -189,6 +210,39 @@ export function createPublicOnlyLookup(resolver: LookupResolverFn = dns.lookup):
   };
 }
 
+/**
+ * Resolves `hostname` in a SINGLE pass via `safeLookup` and returns the validated public IP literal + family,
+ * so the caller can dial the exact resolved IP directly without ANY second OS/runtime DNS lookup!
+ */
+export function resolvePinnedPublicAddress(
+  hostname: string,
+  safeLookup: net.LookupFunction,
+): Promise<{ address: string; family: 4 | 6 }> {
+  const bare = hostname.replace(/^\[|\]$/g, '');
+  const literalVer = net.isIP(bare);
+  if (literalVer === 4 || literalVer === 6) {
+    if (!isPublicIpAddress(bare)) {
+      return Promise.reject(new Error(`SSRF blocked: refusing connection to non-public IP literal ${hostname}`));
+    }
+    return Promise.resolve({ address: bare, family: literalVer });
+  }
+  return new Promise<{ address: string; family: 4 | 6 }>((resolve, reject) => {
+    safeLookup(hostname, { all: false, verbatim: true }, (err, address, family) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      const addrStr = typeof address === 'string' ? address : '';
+      const fam: 4 | 6 = family === 6 ? 6 : 4;
+      if (!addrStr || !isPublicIpAddress(addrStr)) {
+        reject(new Error(`SSRF blocked: refusing connection to non-public IP ${addrStr} resolved for ${hostname}`));
+        return;
+      }
+      resolve({ address: addrStr, family: fam });
+    });
+  });
+}
+
 export const DEFAULT_SAFE_FETCH_TIMEOUT_MS = 30_000;
 export const MAX_SAFE_FETCH_TIMEOUT_MS = 60_000;
 export const MAX_SAFE_FETCH_RESPONSE_BYTES = 32 * 1024 * 1024; // 32 MiB hard streamed response ceiling
@@ -196,6 +250,8 @@ export const MAX_SAFE_FETCH_RESPONSE_BYTES = 32 * 1024 * 1024; // 32 MiB hard st
 export interface SafeOutboundFetchOptions {
   /** Custom DNS resolver hook for deterministic unit tests (`H5`). */
   resolver?: LookupResolverFn;
+  /** Pre-resolve and pin the target IP literal before invoking `http.request`/`https.request` (used by Deno single-pass transport). */
+  pinResolvedIp?: boolean;
   /** Allow explicit operator-configured loopback HTTP URLs (e.g. local Ollama `http://127.0.0.1:11434`). */
   allowExplicitLoopbackUrls?: boolean;
   /** Default request timeout in milliseconds when caller omits a tighter `AbortSignal` (default `30_000`). */
@@ -205,19 +261,17 @@ export interface SafeOutboundFetchOptions {
 }
 
 /**
- * Builds a Web-API-compatible `typeof fetch` backed by `node:https` / `node:http` with dial-time
- * `createPublicOnlyLookup` IP filtering and `redirect: 'manual'` enforcement (`H5`).
+ * Validates strict literal loopback authority BEFORE WHATWG `new URL(...)` normalization
+ * so decimal/hex/octal/short IPv4 (`2130706433`, `0x7f000001`, `0177.0.0.1`, `127.1`),
+ * non-canonical IPv6 (`[0:0:0:0:0:0:0:1]`), trailing dots, and invalid ports are rejected.
  */
-function validateExplicitLoopbackTargetUrl(raw: string): URL | null {
+export function validateExplicitLoopbackTargetUrl(raw: string): URL | null {
   const trimmed = raw.trim();
   const authorityMatch = /^https?:\/\/([^/?#]+)/i.exec(trimmed);
   if (!authorityMatch) return null;
   const rawAuthority = authorityMatch[1]!;
   if (!rawAuthority || rawAuthority.includes('@')) return null;
 
-  // Enforce strict literal authority allowlist BEFORE WHATWG `new URL(...)` normalization
-  // so decimal/hex/octal/short IPv4 (e.g. 2130706433, 0x7f000001, 0177.0.0.1, 127.1),
-  // non-canonical IPv6 (e.g. [0:0:0:0:0:0:0:1]), trailing dots, and invalid ports are rejected.
   const literalMatch = /^(127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$/i.exec(rawAuthority);
   if (!literalMatch) return null;
   if (literalMatch[2] !== undefined) {
@@ -238,6 +292,11 @@ function validateExplicitLoopbackTargetUrl(raw: string): URL | null {
   return u;
 }
 
+/**
+ * Builds a Web-API-compatible `typeof fetch` backed by `node:https` / `node:http` with single-resolution
+ * IP-pinned dialing (`resolvePinnedPublicAddress` + TLS SNI `servername` + `tls.checkServerIdentity`) and
+ * `redirect: 'manual'` enforcement (`H5` / `R7`).
+ */
 export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): typeof fetch {
   const safeLookup = createPublicOnlyLookup(opts.resolver);
   const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 32, lookup: safeLookup });
@@ -252,38 +311,64 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
       ? opts.maxResponseBytes
       : MAX_SAFE_FETCH_RESPONSE_BYTES;
 
-  const executeSingleRequest = (
+  const executeSingleRequest = async (
     targetUrl: URL,
     init: RequestInit | undefined,
     bodyBytes: Buffer | null,
     allowLoopbackThisHop: boolean,
     onBodySettled?: () => void,
-  ): Promise<Response> =>
-    new Promise<Response>((resolve, reject) => {
+  ): Promise<Response> => {
+    if (init?.signal?.aborted) {
+      onBodySettled?.();
+      throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
+    }
+    const isHttps = targetUrl.protocol === 'https:';
+    const isHttp = targetUrl.protocol === 'http:';
+    if (!isHttps && !isHttp) {
+      onBodySettled?.();
+      throw new Error(`Unsupported protocol: ${targetUrl.protocol}`);
+    }
+    const reqMethod = (init?.method ?? 'GET').toUpperCase();
+    if (reqMethod === 'CONNECT' || reqMethod === 'TRACE' || reqMethod === 'TRACK') {
+      onBodySettled?.();
+      throw new Error(`HTTP ${reqMethod} is not allowed`);
+    }
+
+    const isExplicitLoopback =
+      allowLoopbackThisHop &&
+      (targetUrl.hostname === '127.0.0.1' || targetUrl.hostname === 'localhost' || targetUrl.hostname === '[::1]');
+
+    if (!isExplicitLoopback && targetUrl.hostname.endsWith('.')) {
+      onBodySettled?.();
+      throw new Error(`SSRF blocked: trailing-dot FQDN hostname is not allowed (${targetUrl.hostname})`);
+    }
+
+    const rawHostNoBrackets = targetUrl.hostname.replace(/^\[|\]$/g, '');
+    if (!isExplicitLoopback && net.isIP(rawHostNoBrackets) !== 0) {
+      if (!isPublicIpAddress(targetUrl.hostname)) {
+        onBodySettled?.();
+        throw new Error(`SSRF blocked: refusing connection to non-public IP literal ${targetUrl.hostname}`);
+      }
+    }
+
+    let dialHost: string | undefined;
+    let dialFamily: 4 | 6 | undefined;
+    if (!isExplicitLoopback && opts.pinResolvedIp === true) {
+      try {
+        const pinned = await resolvePinnedPublicAddress(rawHostNoBrackets, safeLookup);
+        dialHost = pinned.address;
+        dialFamily = pinned.family;
+      } catch (err) {
+        onBodySettled?.();
+        throw err;
+      }
       if (init?.signal?.aborted) {
         onBodySettled?.();
-        reject(init.signal.reason ?? new DOMException('Aborted', 'AbortError'));
-        return;
+        throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
       }
-      const isHttps = targetUrl.protocol === 'https:';
-      const isHttp = targetUrl.protocol === 'http:';
-      if (!isHttps && !isHttp) {
-        onBodySettled?.();
-        reject(new Error(`Unsupported protocol: ${targetUrl.protocol}`));
-        return;
-      }
-      const isExplicitLoopback =
-        allowLoopbackThisHop &&
-        (targetUrl.hostname === '127.0.0.1' || targetUrl.hostname === 'localhost' || targetUrl.hostname === '[::1]');
+    }
 
-      if (!isExplicitLoopback && net.isIP(targetUrl.hostname.replace(/^\[|\]$/g, '')) !== 0) {
-        if (!isPublicIpAddress(targetUrl.hostname)) {
-          onBodySettled?.();
-          reject(new Error(`SSRF blocked: refusing connection to non-public IP literal ${targetUrl.hostname}`));
-          return;
-        }
-      }
-
+    return new Promise<Response>((resolve, reject) => {
       const DISALLOWED_CALLER_HEADERS = new Set([
         'host',
         ':authority',
@@ -296,7 +381,9 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         'trailer',
         'proxy-connection',
       ]);
-      const hdrObj: Record<string, string> = {};
+      const hdrObj: Record<string, string> = {
+        host: targetUrl.host,
+      };
       if (init?.headers) {
         const h = new Headers(init.headers);
         h.forEach((v, k) => {
@@ -313,12 +400,24 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
 
       const mod = isHttps ? https : http;
       const agent = isExplicitLoopback && isHttp ? loopbackHttpAgent : isHttps ? httpsAgent : httpAgent;
-      const reqMethod = (init?.method ?? 'GET').toUpperCase();
-      if (reqMethod === 'CONNECT' || reqMethod === 'TRACE' || reqMethod === 'TRACK') {
-        onBodySettled?.();
-        reject(new Error(`HTTP ${reqMethod} is not allowed`));
-        return;
-      }
+      const originalHostname = targetUrl.hostname.replace(/^\[|\]$/g, '');
+      const isIpTarget = net.isIP(originalHostname) !== 0;
+      const portNum = targetUrl.port ? Number(targetUrl.port) : isHttps ? 443 : 80;
+      const reqPath = `${targetUrl.pathname || '/'}${targetUrl.search}`;
+
+      const pinnedLookup: net.LookupFunction | undefined =
+        !isExplicitLoopback && dialHost !== undefined && dialFamily !== undefined
+          ? (_h, lOpts, cb) => {
+              const wantAll = typeof lOpts === 'object' && lOpts !== null && Boolean((lOpts as { all?: boolean }).all);
+              if (wantAll) {
+                (cb as unknown as (e: null, a: dns.LookupAddress[]) => void)(null, [
+                  { address: dialHost, family: dialFamily! },
+                ]);
+              } else {
+                cb(null, dialHost, dialFamily!);
+              }
+            }
+          : undefined;
 
       let settled = false;
       let activeRes: http.IncomingMessage | null = null;
@@ -353,7 +452,25 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
             method: reqMethod,
             headers: hdrObj,
             agent,
-            ...(isExplicitLoopback ? {} : { lookup: safeLookup }),
+            ...(dialHost !== undefined
+              ? {
+                  hostname: dialHost,
+                  host: dialHost,
+                  port: portNum,
+                  path: reqPath,
+                  ...(dialFamily ? { family: dialFamily } : {}),
+                  ...(pinnedLookup ? { lookup: pinnedLookup } : {}),
+                  ...(isHttps && !isIpTarget
+                    ? {
+                        servername: originalHostname,
+                        checkServerIdentity: (_host: string, cert: tls.PeerCertificate) =>
+                          tls.checkServerIdentity(originalHostname, cert),
+                      }
+                    : {}),
+                }
+              : isExplicitLoopback
+                ? {}
+                : { lookup: safeLookup }),
           },
           (res) => {
             activeRes = res;
@@ -568,6 +685,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
       }
       req.end();
     });
+  };
 
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     if (init?.signal?.aborted) {
@@ -677,11 +795,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
           throw new Error(`Refusing redirect to non-HTTPS URL: ${nextUrl.protocol}`);
         }
         if (nextUrl.origin !== currentUrl.origin) {
-          currentHeaders.delete('authorization');
-          currentHeaders.delete('cookie');
-          currentHeaders.delete('proxy-authorization');
-          currentHeaders.delete('x-api-key');
-          currentHeaders.delete('x-goog-api-key');
+          stripSensitiveCrossOriginHeaders(currentHeaders);
         }
         if (res.status === 301 || res.status === 302 || res.status === 303) {
           currentMethod = 'GET';

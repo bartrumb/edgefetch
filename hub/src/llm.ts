@@ -335,8 +335,6 @@ const SECRET_PRECEDING_PATH_SEGMENTS = new Set([
   'signature',
 ]);
 
-const MULTI_SEGMENT_SECRET_ROOTS = new Set(['services', 'webhooks', 'webhook']);
-
 const SAFE_RPC_COLON_SUFFIXES = new Set([
   'generatecontent',
   'streamgeneratecontent',
@@ -349,68 +347,85 @@ const SAFE_RPC_COLON_SUFFIXES = new Set([
   'rawpredict',
 ]);
 
-const SAFE_BENIGN_LONG_SEGMENTS = new Set([
-  'streamgeneratecontent',
-  'batchgeneratecontent',
-  'batchembedcontents',
-  'generatecontent',
+/**
+ * Strict allowlist of non-sensitive API route/version path segments permitted in logged LLM URLs.
+ * Every non-allowlisted path segment (e.g. gateway path tokens, UUIDs, passphrases, tenant IDs, Slack/Discord webhook IDs)
+ * is replaced with `[REDACTED]` so path-embedded secrets can never leak to logs or `/v1/agent` `llmInfo`.
+ */
+const ALLOWED_LLM_PATH_SEGMENTS = new Set([
+  'v1',
+  'v1beta',
+  'v1alpha',
+  'v1beta1',
+  'v1beta2',
+  'v2',
+  'v3',
+  'v4',
+  'api',
+  'openai',
+  'anthropic',
+  'gemini',
+  'vertex',
+  'compat',
+  'chat',
+  'completions',
+  'messages',
+  'responses',
+  'embeddings',
+  'models',
+  'generate',
+  'tags',
   'transcriptions',
   'classifications',
   'chatcompletions',
   'fine_tuning',
 ]);
 
-const KNOWN_KEY_PREFIX_RE =
-  /^(?:sk-[A-Za-z0-9_-]{4,}|AIza[A-Za-z0-9_-]{6,}|gsk_[A-Za-z0-9_-]{6,}|xox[abprs]-[A-Za-z0-9-]{6,}|gh[pousr]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}|glpat-[A-Za-z0-9_-]{6,}|hf_[A-Za-z0-9]{6,}|r8_[A-Za-z0-9]{6,}|ef[acr]_[A-Za-z0-9_-]{6,})$/;
+const SAFE_MODEL_SEGMENT_RE =
+  /^(?:gemini|gpt|claude|llama|mistral|mixtral|codestral|qwen|deepseek|o1|o3|o4|text-embedding|embedding|embed|command|phi|gemma|yi|sonar)[a-z0-9._-]{0,64}$/i;
 
-function redactSinglePathSegment(seg: string): string {
+function redactAllowlistedPathSegment(seg: string, prevLowerSeg: string): string {
   if (!seg) return seg;
   const decoded = safeDecodeURIComponent(seg) ?? seg;
+  if (decoded !== seg) {
+    // Percent-encoded path segments (`%73%6b-live-...`) are always treated as untrusted secrets.
+    return '[REDACTED]';
+  }
 
-  // Matrix/semicolon parameters (`v1;key=SECRET`)
+  // Matrix/semicolon parameters (`v1;token=SECRET` -> `v1;[REDACTED]`)
   if (decoded.includes(';')) {
     const semiIdx = decoded.indexOf(';');
     const head = decoded.slice(0, semiIdx);
-    return `${head ? redactSinglePathSegment(head) : ''};[REDACTED]`;
+    const safeHead = head ? redactAllowlistedPathSegment(head, prevLowerSeg) : '';
+    return `${safeHead};[REDACTED]`;
   }
 
-  // Inline `key=SECRET` path segment
   if (decoded.includes('=')) {
     return '[REDACTED]';
   }
 
-  // Colon suffix (`models/gemini-2.5-flash:generateContent` vs `:AIzaSecret` / `:key`)
+  // Colon suffix (`models/gemini-2.5-flash:generateContent` vs `:AIzaSecret` or `user:pass`)
   const colonIdx = decoded.indexOf(':');
   if (colonIdx >= 0) {
     const lhs = decoded.slice(0, colonIdx);
     const rhs = decoded.slice(colonIdx + 1);
-    if (rhs && SAFE_RPC_COLON_SUFFIXES.has(rhs.toLowerCase())) {
-      return `${lhs ? redactSinglePathSegment(lhs) : ''}:${rhs}`;
+    const safeLhs = lhs ? redactAllowlistedPathSegment(lhs, prevLowerSeg) : '';
+    if (rhs && safeLhs && safeLhs !== '[REDACTED]' && SAFE_RPC_COLON_SUFFIXES.has(rhs.toLowerCase())) {
+      return `${safeLhs}:${rhs}`;
     }
-    return lhs ? `${redactSinglePathSegment(lhs)}:[REDACTED]` : '[REDACTED]';
-  }
-
-  if (KNOWN_KEY_PREFIX_RE.test(decoded)) {
-    return '[REDACTED]';
+    return safeLhs && safeLhs !== '[REDACTED]' ? `${safeLhs}:[REDACTED]` : '[REDACTED]';
   }
 
   const lower = decoded.toLowerCase();
-  if (SAFE_BENIGN_LONG_SEGMENTS.has(lower)) {
+  if (ALLOWED_LLM_PATH_SEGMENTS.has(lower)) {
     return seg;
   }
 
-  // High-entropy or hex/base64url path tokens `>= 16` chars (e.g., `/v1beta/<32-char-token>`, `/acct/<hex-secret>`),
-  // while preserving lowercase model identifiers containing semver dots or hyphens (`gemini-2.5-flash`, `gpt-4o-2024-08-06`).
-  if (decoded.length >= 16 && !decoded.includes('.')) {
-    const isHex16 = /^[0-9a-fA-F]{16,}$/.test(decoded);
-    const hasUpperLowerDigit = /[0-9]/.test(decoded) && /[A-Z]/.test(decoded) && /[a-z]/.test(decoded);
-    const isLongCompactToken = decoded.length >= 24 && !decoded.includes('-') && /[A-Za-z]/.test(decoded) && /[0-9_]/.test(decoded);
-    if (isHex16 || hasUpperLowerDigit || isLongCompactToken) {
-      return '[REDACTED]';
-    }
+  if (prevLowerSeg === 'models' && SAFE_MODEL_SEGMENT_RE.test(decoded)) {
+    return seg;
   }
 
-  return seg;
+  return '[REDACTED]';
 }
 
 export function redactLlmUrlForLog(rawUrl: string): string {
@@ -423,8 +438,7 @@ export function redactLlmUrlForLog(rawUrl: string): string {
     u.hash = '';
     const rawSegs = u.pathname.split('/');
     const redactedSegs: string[] = [];
-    let redactNextSingle = false;
-    let redactRemainingWebhookTail = false;
+    let prevLowerSeg = '';
     for (let i = 0; i < rawSegs.length; i++) {
       const seg = rawSegs[i]!;
       if (i === 0 || seg === '') {
@@ -432,26 +446,8 @@ export function redactLlmUrlForLog(rawUrl: string): string {
         continue;
       }
       const lowerSeg = (safeDecodeURIComponent(seg) ?? seg).toLowerCase();
-      if (redactRemainingWebhookTail) {
-        redactedSegs.push('[REDACTED]');
-        continue;
-      }
-      if (redactNextSingle) {
-        redactNextSingle = false;
-        redactedSegs.push('[REDACTED]');
-        continue;
-      }
-      if (MULTI_SEGMENT_SECRET_ROOTS.has(lowerSeg)) {
-        redactedSegs.push(seg);
-        redactRemainingWebhookTail = true;
-        continue;
-      }
-      if (SECRET_PRECEDING_PATH_SEGMENTS.has(lowerSeg)) {
-        redactedSegs.push(seg);
-        redactNextSingle = true;
-        continue;
-      }
-      redactedSegs.push(redactSinglePathSegment(seg));
+      redactedSegs.push(redactAllowlistedPathSegment(seg, prevLowerSeg));
+      prevLowerSeg = lowerSeg;
     }
     const rebuiltPath = redactedSegs.join('/');
     const originStr = u.origin;

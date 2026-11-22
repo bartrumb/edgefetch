@@ -596,35 +596,90 @@ const VALID_CATEGORIES = new Set<string>([
 ]);
 
 const FORBIDDEN_BROAD_SUFFIXES = new Set([
-  'com',
-  'org',
-  'net',
-  'io',
-  'gov',
-  'edu',
-  'mil',
-  'int',
-  'uk',
-  'de',
-  'fr',
-  'jp',
-  'au',
-  'ca',
-  'us',
-  'eu',
-  'ai',
-  'co',
-  'app',
-  'dev',
-  'co.uk',
-  'org.uk',
-  'gov.uk',
-  'ac.uk',
-  'com.au',
-  'org.au',
-  'gov.au',
-  'co.jp',
-  'com.br',
+  'com', 'org', 'net', 'io', 'gov', 'edu', 'mil', 'int',
+  'uk', 'de', 'fr', 'jp', 'au', 'ca', 'us', 'eu', 'ai', 'co', 'app', 'dev',
+  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'me.uk', 'net.uk', 'plc.uk', 'ltd.uk', 'sch.uk',
+  'com.au', 'org.au', 'gov.au', 'edu.au', 'net.au', 'asn.au', 'id.au',
+  'co.jp', 'or.jp', 'ne.jp', 'ac.jp', 'ad.jp', 'ed.jp', 'go.jp', 'gr.jp', 'lg.jp',
+  'com.br', 'org.br', 'gov.br', 'edu.br', 'net.br', 'mil.br',
+  'co.nz', 'org.nz', 'govt.nz', 'ac.nz', 'net.nz',
+  'co.za', 'org.za', 'gov.za', 'ac.za', 'net.za',
+  'co.in', 'org.in', 'gov.in', 'ac.in', 'net.in', 'res.in', 'edu.in',
+  'com.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn', 'net.cn',
+  'com.sg', 'org.sg', 'gov.sg', 'edu.sg', 'net.sg',
+  'com.hk', 'org.hk', 'gov.hk', 'edu.hk', 'net.hk',
+  'com.tw', 'org.tw', 'gov.tw', 'edu.tw', 'net.tw',
+  'co.kr', 'or.kr', 'go.kr', 'ac.kr', 'ne.kr',
+  'com.mx', 'org.mx', 'gob.mx', 'edu.mx', 'net.mx',
+  'com.ar', 'org.ar', 'gob.ar', 'gov.ar', 'edu.ar',
+  'com.tr', 'org.tr', 'gov.tr', 'edu.tr',
+  'co.il', 'org.il', 'gov.il', 'ac.il',
+  'co.id', 'or.id', 'go.id', 'ac.id',
+  'com.my', 'org.my', 'gov.my', 'edu.my',
+  'com.ph', 'org.ph', 'gov.ph', 'edu.ph',
+  'com.vn', 'org.vn', 'gov.vn', 'edu.vn',
+  'co.th', 'or.th', 'go.th', 'ac.th',
+  // Shared multi-tenant PaaS / static-hosting public suffixes (PSL private section)
+  'github.io', 'gitlab.io', 'bitbucket.io', 'pages.dev', 'workers.dev', 'cloudflarepages.com', 'r2.dev',
+  'vercel.app', 'now.sh', 'netlify.app', 'herokuapp.com', 'herokudns.com', 'fly.dev', 'onrender.com',
+  'railway.app', 'surge.sh', 'web.app', 'firebaseapp.com', 'appspot.com', 'cloudfunctions.net', 'run.app',
+  'amazonaws.com', 'cloudfront.net', 'azurewebsites.net', 'azurestaticapps.net', 'trafficmanager.net',
+  'blogspot.com', 'wordpress.com', 'substack.com', 'ghost.io', 'ngrok.io', 'ngrok-free.app', 'trycloudflare.com',
+]);
+
+const MULTI_PART_PSL_SLD_RE =
+  /^(?:co|com|org|net|gov|edu|ac|mil|or|ne|go|lg|gob|gouv|govt|nic|nom|sch|asn|id|med|res|jus|leg|ind)\.[a-z]{2,3}$/;
+const US_CA_STATE_PSL_RE = /^[a-z]{2}\.(?:us|ca|gov|edu)$/;
+
+function isForbiddenPublicOrHostingSuffix(rest: string): boolean {
+  if (!rest || !rest.includes('.')) return true;
+  if (FORBIDDEN_BROAD_SUFFIXES.has(rest)) return true;
+  if (MULTI_PART_PSL_SLD_RE.test(rest) || US_CA_STATE_PSL_RE.test(rest)) return true;
+  for (const hs of [
+    '.amazonaws.com',
+    '.cloudfront.net',
+    '.azurewebsites.net',
+    '.herokuapp.com',
+    '.pages.dev',
+    '.workers.dev',
+    '.github.io',
+    '.gitlab.io',
+    '.vercel.app',
+    '.netlify.app',
+  ]) {
+    if (rest.endsWith(hs)) return true;
+  }
+  return false;
+}
+
+const APPROVED_WILDCARD_DOMAIN_PATTERNS = new Set([
+  '*.arcgis.com',
+  '*.bamboohr.com',
+  '*.breezy.hr',
+  '*.recruitee.com',
+  '*.jobs.personio.de',
+  '*.jobs.personio.com',
+  '*.oraclecloud.com',
+  'gitlab.*',
+  '*.icims.com',
+  '*.applytojob.com',
+  '*.legistar.com',
+  '*.wikipedia.org',
+  '*.openfoodfacts.org',
+  '*.pinpointhq.com',
+  '*.reddit.com',
+  'careers.*.com',
+  'jobs.*.com',
+  '*.myshopify.com',
+  '*.socrata.com',
+  '*.stackexchange.com',
+  '*.teamtailor.com',
+]);
+
+const RESERVED_CORE_ATS_DOMAINS = new Set([
+  'jobs.ashbyhq.com',
+  '*.myworkdayjobs.com',
+  '*.myworkdaysite.com',
 ]);
 
 const KNOWN_SOCRATA_HOSTS = new Set([
@@ -671,6 +726,7 @@ function isAsciiPrintableKey(s: string): boolean {
 
 function stripInvisibleAndNul(s: string): string {
   if (!s) return '';
+  if (!/[\x00\u202a-\u202e\u2066-\u2069\u{E0000}-\u{E007F}]/u.test(s)) return s;
   let clean = '';
   for (const ch of s) {
     const cp = ch.codePointAt(0) ?? 0;
@@ -687,15 +743,119 @@ function stripInvisibleAndNul(s: string): string {
   return clean;
 }
 
+/**
+ * Strictly linear **O(N)** dangerous Markdown link-destination neutralizer (`H9`):
+ * eliminates quadratic `O(N^2)` regex backtracking on unclosed `](javascript:a` sequences (`51 s` at `977 KB` -> `< 1 ms`),
+ * while also catching entity/backslash-obfuscated schemes (`java&Tab;script:`, `javascript\:`, `file:`, `blob:`).
+ */
+function neutralizeDangerousLinksLinear(s: string): string {
+  if (!s.includes('](') && !s.includes(']:')) return s;
+  let out = '';
+  let last = 0;
+  let pos = 0;
+  let nextCloseParen = -2;
+  const n = s.length;
+
+  const startsDangerousAt = (fromIdx: number): { dangerous: boolean; scanStart: number } => {
+    let p = fromIdx;
+    while (p < n && (s.charCodeAt(p) === 32 || s.charCodeAt(p) === 9)) p++;
+    const angle = p < n && s.charCodeAt(p) === 60 /* '<' */;
+    if (angle) p++;
+    const scanStart = p;
+    let acc = '';
+    let steps = 0;
+    while (p < n && steps++ < 256) {
+      const c = s.charCodeAt(p);
+      if (angle ? c === 62 || c === 10 || c === 13 : c === 32 || c === 9 || c === 10 || c === 13 || c === 41) break;
+      let piece = '';
+      if (c === 92 /* '\\' */ && p + 1 < n) {
+        piece = s[p + 1]!;
+        p += 2;
+      } else if (c === 38 /* '&' */) {
+        const m = /^&(?:#(\d{1,7});?|#[xX]([0-9a-fA-F]{1,6});?|([A-Za-z][A-Za-z0-9]{1,15});)/.exec(s.slice(p, p + 20));
+        if (m) {
+          if (m[3]) {
+            const low = m[3].toLowerCase();
+            piece = low === 'colon' ? ':' : low === 'tab' || low === 'newline' || low === 'nbsp' ? '' : '&';
+            p += piece === '&' ? 1 : m[0].length;
+          } else {
+            const cp = m[1] ? Number(m[1]) : parseInt(m[2]!, 16);
+            piece = cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+            p += m[0].length;
+          }
+        } else {
+          piece = '&';
+          p++;
+        }
+      } else {
+        piece = s[p]!;
+        p++;
+      }
+      for (let k = 0; k < piece.length; k++) {
+        const pc = piece.charCodeAt(k);
+        if (pc <= 0x20 || pc === 0x7f || pc === 0xa0 || pc === 0xad || (pc >= 0x200b && pc <= 0x200f) || pc === 0xfeff) {
+          continue;
+        }
+        acc += piece[k]!.toLowerCase();
+        let viable = false;
+        for (const sc of ['javascript:', 'vbscript:', 'data:', 'file:', 'blob:']) {
+          if (sc === acc) return { dangerous: true, scanStart };
+          if (sc.startsWith(acc)) viable = true;
+        }
+        if (!viable) return { dangerous: false, scanStart };
+      }
+    }
+    return { dangerous: false, scanStart };
+  };
+
+  while (pos < n) {
+    const bp = s.indexOf(']', pos);
+    if (bp < 0 || bp + 1 >= n) break;
+    const nx = s.charCodeAt(bp + 1);
+    if (nx === 40 /* '(' */) {
+      const chk = startsDangerousAt(bp + 2);
+      if (chk.dangerous) {
+        if (nextCloseParen !== -1 && nextCloseParen < bp + 2) {
+          nextCloseParen = s.indexOf(')', bp + 2);
+        }
+        const nlIdx = s.indexOf('\n', bp + 2);
+        const hasBoundedClose =
+          nextCloseParen >= bp + 2 &&
+          nextCloseParen - bp <= 2_048 &&
+          (nlIdx < 0 || nextCloseParen < nlIdx);
+        if (hasBoundedClose) {
+          out += `${s.slice(last, bp)}](#)`;
+          last = nextCloseParen + 1;
+          pos = nextCloseParen + 1;
+          continue;
+        }
+        out += `${s.slice(last, bp + 1)}\\ (`;
+        last = bp + 2;
+        pos = bp + 2;
+        continue;
+      }
+    } else if (nx === 58 /* ':' */) {
+      const chk = startsDangerousAt(bp + 2);
+      if (chk.dangerous) {
+        out += `${s.slice(last, bp + 1)}\\:`;
+        last = bp + 2;
+        pos = bp + 2;
+        continue;
+      }
+    }
+    pos = bp + 1;
+  }
+
+  return last === 0 ? s : out + s.slice(last);
+}
+
 function sanitizeSingleLineMeta(s: string): string {
   if (!s) return '';
-  const clean = stripInvisibleAndNul(s)
+  const bounded = s.length > 4_096 ? s.slice(0, 4_096) : s;
+  const stripped = stripInvisibleAndNul(bounded)
     .replace(/[\r\n\t]+/g, ' ')
-    .replace(/<(?=[A-Za-z/!?])/g, '&lt;')
-    .replace(/\]\(\s*(?:javascript|vbscript|data):[^)]*\)/gi, '](#)')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return clean;
+    .replace(/<(?=[A-Za-z/!?])/g, '&lt;');
+  return neutralizeDangerousLinksLinear(stripped).replace(/\s+/g, ' ').trim();
 }
 
 const DANGEROUS_HTML_TAG_NAMES = new Set([
@@ -793,24 +953,43 @@ function escapeDangerousRawHtmlInLineLinear(line: string): string {
     out += line[i]!;
     i++;
   }
-  if (out.includes('](')) {
-    out = out.replace(/\]\(\s*(?:javascript|vbscript|data):[^)\r\n]*\)/gi, '](#)');
+  if (out.includes('](') || out.includes(']:')) {
+    out = neutralizeDangerousLinksLinear(out);
   }
   return out;
 }
 
 function escapeDangerousRawHtmlOutsideFences(s: string): string {
-  if (!s || (!s.includes('<') && !s.includes('\0') && !s.includes(']('))) return s;
+  if (!s || (!s.includes('<') && !s.includes('\0') && !s.includes('](') && !s.includes(']:'))) return s;
   const noNul = stripInvisibleAndNul(s);
-  if (!noNul.includes('<') && !noNul.includes('](')) return noNul;
+  if (!noNul.includes('<') && !noNul.includes('](') && !noNul.includes(']:')) return noNul;
   const lines = noNul.split('\n');
   let inFence = false;
+  let fenceCh = '';
+  let fenceLen = 0;
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i]!;
-    const trimmed = ln.trimStart();
-    if (trimmed.startsWith('```') || trimmed.startsWith('~~~')) {
-      inFence = !inFence;
-      continue;
+    let lead = 0;
+    while (lead < ln.length && lead < 4 && ln.charCodeAt(lead) === 32) lead++;
+    if (lead <= 3 && lead + 3 <= ln.length) {
+      const c0 = ln.charCodeAt(lead);
+      if (c0 === 96 /* '`' */ || c0 === 126 /* '~' */) {
+        let p = lead;
+        while (p < ln.length && ln.charCodeAt(p) === c0) p++;
+        const rLen = p - lead;
+        if (!inFence && rLen >= 3 && !(c0 === 96 && ln.slice(p).includes('`'))) {
+          inFence = true;
+          fenceCh = c0 === 96 ? '`' : '~';
+          fenceLen = rLen;
+          continue;
+        }
+        if (inFence && (c0 === 96 ? '`' : '~') === fenceCh && rLen >= fenceLen && /^[ \t\r]*$/.test(ln.slice(p))) {
+          inFence = false;
+          fenceCh = '';
+          fenceLen = 0;
+          continue;
+        }
+      }
     }
     if (inFence) continue;
     lines[i] = escapeDangerousRawHtmlInLineLinear(ln);
@@ -1907,7 +2086,7 @@ function formatXmlTwinOrHtml(
 
     if (xmlSpec.collectLinkVar) {
       const linkVal = (rowVars[xmlSpec.collectLinkVar] ?? '').trim();
-      if (linkVal.startsWith('https://')) links.push(linkVal);
+      if (isSafeDeclarativeFeedLinkUrl(linkVal)) links.push(linkVal);
     }
 
     if (xmlSpec.recordFields) {
@@ -1922,7 +2101,7 @@ function formatXmlTwinOrHtml(
     rows.push(
       (xmlSpec.columns ?? []).map((c) => {
         if (c.template.includes('[{') && c.template.includes(']({')) {
-          // If link URL is not https://, fall back to plain label
+          // Enforce strict public `https://` URLs on feed item links; fall back to plain label otherwise
           const openBr = c.template.indexOf('[{');
           const midBr = c.template.indexOf('}]({', openBr);
           const endBr = c.template.indexOf('})', midBr);
@@ -1930,8 +2109,8 @@ function formatXmlTwinOrHtml(
             const labelVar = c.template.slice(2, midBr);
             const urlVar = c.template.slice(midBr + 4, endBr);
             const lTxt = rowVars[labelVar] ?? '';
-            const uTxt = rowVars[urlVar] ?? '';
-            return uTxt.startsWith('https://') ? `[${lTxt}](${uTxt})` : lTxt || '-';
+            const uTxt = (rowVars[urlVar] ?? '').trim();
+            return isSafeDeclarativeFeedLinkUrl(uTxt) ? `[${lTxt}](${uTxt})` : lTxt || '-';
           }
         }
         return expandTemplate(c.template, (k) => rowVars[k] ?? '').trim() || '-';
@@ -2249,18 +2428,33 @@ export function formatJsonWithExtractSpec(
   htmlToMd: HtmlFragmentConverter = defaultHtmlToMd,
 ): TwinFormattedDoc | null {
   if (ext.commerceMode) {
+    let commDoc: TwinFormattedDoc | null = null;
     switch (ext.commerceMode) {
       case 'shopify_product':
-        return enrichShopifyProductFromJson({ rawJson: rawBody, productUrl: origUrl, htmlToMd, isAjaxJs: false });
+        commDoc = enrichShopifyProductFromJson({ rawJson: rawBody, productUrl: origUrl, htmlToMd, isAjaxJs: false });
+        break;
       case 'shopify_product_js':
-        return enrichShopifyProductFromJson({ rawJson: rawBody, productUrl: origUrl, htmlToMd, isAjaxJs: true });
+        commDoc = enrichShopifyProductFromJson({ rawJson: rawBody, productUrl: origUrl, htmlToMd, isAjaxJs: true });
+        break;
       case 'shopify_catalog_page':
-        return formatShopifyProductsFeedTwin(rawBody, origUrl);
+        commDoc = formatShopifyProductsFeedTwin(rawBody, origUrl);
+        break;
       case 'woocommerce_catalog_page':
-        return formatWcStoreApiListTwin(rawBody, origUrl);
+        commDoc = formatWcStoreApiListTwin(rawBody, origUrl);
+        break;
       case 'woocommerce_product':
-        return formatWcStoreApiProductTwin(rawBody, origUrl, htmlToMd);
+        commDoc = formatWcStoreApiProductTwin(rawBody, origUrl, htmlToMd);
+        break;
     }
+    if (!commDoc) return null;
+    return {
+      ...commDoc,
+      title: sanitizeSingleLineMeta(commDoc.title),
+      ...(commDoc.description ? { description: sanitizeSingleLineMeta(commDoc.description) } : {}),
+      ...(commDoc.author ? { author: sanitizeSingleLineMeta(commDoc.author) } : {}),
+      markdown: escapeDangerousRawHtmlOutsideFences(commDoc.markdown),
+      ...(commDoc.links ? { links: commDoc.links.filter((l) => isSafeDeclarativeFeedLinkUrl(l.trim())) } : {}),
+    };
   }
 
   const parsed = ext.jsonSource === 'inertia_data_page' ? parseInertiaDataPageJson(rawBody) : parseJsonValue(rawBody);
@@ -2549,7 +2743,7 @@ function formatParsedJsonWithSpec(
   const collectedLinks: string[] = [];
   const pushLink = (uStr: string) => {
     const clean = uStr.trim();
-    if (clean.startsWith('https://') && !/[\s<>]/.test(clean) && !collectedLinks.includes(clean) && collectedLinks.length < 2_000) {
+    if (isSafeDeclarativeFeedLinkUrl(clean) && !collectedLinks.includes(clean) && collectedLinks.length < 2_000) {
       collectedLinks.push(clean);
     }
   };
@@ -2583,8 +2777,8 @@ function formatParsedJsonWithSpec(
     const linksObj = getByDotPath(rootObj, ext.objectLinksPath);
     if (linksObj && typeof linksObj === 'object' && !Array.isArray(linksObj)) {
       for (const [label, href] of Object.entries(linksObj as Record<string, unknown>).slice(0, 50)) {
-        if (typeof href === 'string' && href.startsWith('https://') && !/[\s<>]/.test(href)) {
-          bulletLines.push(`- **${sanitizeSingleLineMeta(label)}**: ${href}`);
+        if (typeof href === 'string' && isSafeDeclarativeFeedLinkUrl(href.trim())) {
+          bulletLines.push(`- **${sanitizeSingleLineMeta(label)}**: ${href.trim()}`);
         }
       }
     }
@@ -3182,7 +3376,7 @@ function runMarkdownCleanPreset(
     return null;
   }
 
-  // `mediawiki`
+  // `mediawiki`: strictly linear **O(N)** line-by-line cleanup (`< 5 ms` on `2 MiB` inputs; zero backtracking!)
   if (
     !ctx.host.endsWith('.wikipedia.org') &&
     ctx.host !== 'wiki.archlinux.org' &&
@@ -3190,13 +3384,53 @@ function runMarkdownCleanPreset(
   ) {
     return null;
   }
-  const cleaned = ctx.currentMd
-    .replace(/\s*\[(?:edit|citation needed|clarification needed|when\?|who\?|dubious\s*[–-]\s*discuss)\]/gi, '')
-    .replace(/^\s*\^\s+(?:\[\^[a-z0-9]+\]\s*|(?:[a-z]\s+){2,})/gim, '^ ')
-    .replace(/\n+(?:##+\s+)?(?:Navigation menu|Namespaces|Views|Personal tools)\b[\s\S]*$/i, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-  if (cleaned && cleaned !== ctx.currentMd) {
+  const boundedWikiMd = ctx.currentMd.length > 2 * 1024 * 1024 ? ctx.currentMd.slice(0, 2 * 1024 * 1024) : ctx.currentMd;
+  const wikiLines = boundedWikiMd.split('\n');
+  const outWikiLines: string[] = [];
+  for (let wi = 0; wi < wikiLines.length; wi++) {
+    let ln = wikiLines[wi]!;
+    const trimmedLn = ln.trim();
+    // Cut trailing MediaWiki chrome footer from the first matching heading/chrome line onward
+    if (/^(?:##+[ \t]+)?(?:Navigation menu|Namespaces|Views|Personal tools)\b/i.test(trimmedLn)) {
+      break;
+    }
+    if (ln.includes('[')) {
+      ln = ln.replace(/[ \t]*\[(?:edit|citation needed|clarification needed|when\?|who\?|dubious[ \t]*[–-][ \t]*discuss)\]/gi, '');
+    }
+    if (trimmedLn.startsWith('^')) {
+      const caretIdx = ln.indexOf('^');
+      let p = caretIdx + 1;
+      while (p < ln.length && (ln.charCodeAt(p) === 32 || ln.charCodeAt(p) === 9)) p++;
+      if (p > caretIdx + 1) {
+        const restAfterCaret = ln.slice(p);
+        const fnBracket = /^\[\^[a-z0-9]{1,32}\][ \t]*/i.exec(restAfterCaret);
+        if (fnBracket) {
+          ln = `^ ${restAfterCaret.slice(fnBracket[0].length)}`;
+        } else {
+          // Linear scan for `a b c ` backlink letter prefixes (`(?:[a-z][ \t]+){2,}`)
+          let k = 0;
+          let letterCount = 0;
+          while (k + 1 < restAfterCaret.length) {
+            const lc = restAfterCaret.charCodeAt(k) | 32;
+            const sc = restAfterCaret.charCodeAt(k + 1);
+            if (lc >= 97 && lc <= 122 && (sc === 32 || sc === 9)) {
+              letterCount++;
+              k += 2;
+              while (k < restAfterCaret.length && (restAfterCaret.charCodeAt(k) === 32 || restAfterCaret.charCodeAt(k) === 9)) k++;
+            } else {
+              break;
+            }
+          }
+          if (letterCount >= 2) {
+            ln = `^ ${restAfterCaret.slice(k)}`;
+          }
+        }
+      }
+    }
+    outWikiLines.push(ln);
+  }
+  const cleaned = outWikiLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (cleaned && cleaned !== boundedWikiMd) {
     return { extractorId, markdown: escapeDangerousRawHtmlOutsideFences(cleaned) };
   }
   return null;
@@ -3671,12 +3905,12 @@ function runDomHtmlRoute(
   const links: string[] = [];
   if (hr.preserveBodyLinksFromVar) {
     for (const l of bodyLinksByVar.get(hr.preserveBodyLinksFromVar) ?? []) {
-      if (l.startsWith('https://') && !links.includes(l)) links.push(l);
+      if (isSafeDeclarativeFeedLinkUrl(l) && !links.includes(l)) links.push(l);
     }
   }
   for (const lt of hr.linkTemplates ?? []) {
     const uStr = expandTemplate(lt, lookup).trim();
-    if (uStr.startsWith('https://') && !links.includes(uStr)) links.push(uStr);
+    if (isSafeDeclarativeFeedLinkUrl(uStr) && !links.includes(uStr)) links.push(uStr);
   }
 
   const description = sanitizeSingleLineMeta(hr.descriptionVar ? lookup(hr.descriptionVar) : '');
@@ -3703,15 +3937,27 @@ function executeDeclarativeHtmlRoute(
   if (!params) return null;
   const extractorId = hr.id || manifest.id;
 
+  const sanitizePostFetchOut = (out: PostFetchSiteResult | null): PostFetchSiteResult | null => {
+    if (!out) return null;
+    return {
+      ...out,
+      ...(out.title ? { title: sanitizeSingleLineMeta(out.title) } : {}),
+      ...(out.description ? { description: sanitizeSingleLineMeta(out.description) } : {}),
+      ...(out.author ? { author: sanitizeSingleLineMeta(out.author) } : {}),
+      markdown: escapeDangerousRawHtmlOutsideFences(out.markdown),
+      ...(out.links ? { links: out.links.filter((l) => isSafeDeclarativeFeedLinkUrl(l.trim())) } : {}),
+    };
+  };
+
   switch (hr.mode) {
     case 'shopify_html':
-      return extractShopifyProductHtml(ctx, extractorId);
+      return sanitizePostFetchOut(extractShopifyProductHtml(ctx, extractorId));
     case 'woocommerce_html':
-      return extractWooCommerceProductHtml(ctx, extractorId);
+      return sanitizePostFetchOut(extractWooCommerceProductHtml(ctx, extractorId));
     case 'icims_portal': {
       const formatted = parseIcimsPortalHtml(ctx.rawHtml, ctx.url.toString(), ctx.htmlToMd);
       if (!formatted) return null;
-      return {
+      return sanitizePostFetchOut({
         extractorId,
         title: formatted.title,
         ...(formatted.publishedTime ? { publishedTime: formatted.publishedTime } : {}),
@@ -3722,7 +3968,7 @@ function executeDeclarativeHtmlRoute(
         ...(formatted.returned !== undefined ? { returned: formatted.returned } : {}),
         ...(formatted.truncated !== undefined ? { truncated: formatted.truncated } : {}),
         ...(formatted.nextCursor !== undefined ? { nextCursor: formatted.nextCursor } : {}),
-      };
+      });
     }
     case 'xml_items_table': {
       if (!hr.xml) return null;
@@ -3840,8 +4086,8 @@ function assertValidDomainPattern(manifestId: string, rawPat: string): void {
   }
   if (pat.startsWith('*.')) {
     const rest = pat.slice(2);
-    if (!rest.includes('.') || FORBIDDEN_BROAD_SUFFIXES.has(rest)) {
-      throw new Error(`[${manifestId}] overly broad TLD/eTLD wildcard "${rawPat}" is forbidden (M2)`);
+    if (isForbiddenPublicOrHostingSuffix(rest)) {
+      throw new Error(`[${manifestId}] overly broad TLD/eTLD/hosting wildcard "${rawPat}" is forbidden (M2)`);
     }
   }
   if (pat.endsWith('.*')) {
@@ -3849,6 +4095,37 @@ function assertValidDomainPattern(manifestId: string, rawPat: string): void {
     if (!pre || pre.includes('*') || pre.length < 3) {
       throw new Error(`[${manifestId}] invalid prefix wildcard "${rawPat}" (M2)`);
     }
+  }
+}
+
+function isSafeDeclarativeFeedLinkUrl(uStr: string): boolean {
+  if (!uStr || !uStr.startsWith('https://') || /[\s\\<>()]/.test(uStr)) return false;
+  try {
+    const u = new URL(uStr);
+    if (u.protocol !== 'https:' || u.username !== '' || u.password !== '') return false;
+    if (u.port !== '' && u.port !== '443') return false;
+    const h = u.hostname.toLowerCase().replace(/\.+$/, '');
+    if (
+      !h ||
+      h === 'localhost' ||
+      h.endsWith('.localhost') ||
+      h.endsWith('.local') ||
+      h.endsWith('.internal') ||
+      h.endsWith('.nip.io') ||
+      h.endsWith('.sslip.io') ||
+      h.endsWith('.xip.io') ||
+      !h.includes('.') ||
+      h.includes(':')
+    ) {
+      return false;
+    }
+    const labels = h.split('.');
+    if (labels.some((l) => !l)) return false;
+    const tld = labels[labels.length - 1]!;
+    if (/^\d+$/.test(tld)) return false;
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -4043,6 +4320,8 @@ export function compileDeclarativeAdapter(manifestOrYaml: DeclarativeAdapterMani
 export function compileValidatedManifestSet(manifests: readonly DeclarativeAdapterManifest[]): SiteAdapter[] {
   const seenManifestIds = new Set<string>();
   const twinOwnerById = new Map<string, string>();
+  const domainOwnerByPattern = new Map<string, string>();
+  const catalogOwnerByPlatform = new Map<string, string>();
   const compiled: SiteAdapter[] = [];
 
   for (const m of manifests) {
@@ -4050,6 +4329,7 @@ export function compileValidatedManifestSet(manifests: readonly DeclarativeAdapt
       throw new Error(`Duplicate declarative adapter manifest id "${m.id}" (M2)`);
     }
     seenManifestIds.add(m.id);
+
     const routes =
       m.routes && m.routes.length > 0
         ? m.routes
@@ -4064,6 +4344,31 @@ export function compileValidatedManifestSet(manifests: readonly DeclarativeAdapt
       }
       twinOwnerById.set(tid, m.id);
     }
+
+    for (const rawDomain of m.domains ?? []) {
+      const normDomain = String(rawDomain).trim().toLowerCase();
+      if (normDomain.includes('*') && !APPROVED_WILDCARD_DOMAIN_PATTERNS.has(normDomain)) {
+        throw new Error(`[${m.id}] Unapproved wildcard domain pattern "${rawDomain}" — must be allowlisted in APPROVED_WILDCARD_DOMAIN_PATTERNS (M2)`);
+      }
+      if (RESERVED_CORE_ATS_DOMAINS.has(normDomain)) {
+        throw new Error(`[${m.id}] Domain "${rawDomain}" is reserved by a built-in core ATS adapter and cannot be hijacked (M2)`);
+      }
+      const prevDomOwner = domainOwnerByPattern.get(normDomain);
+      if (prevDomOwner && prevDomOwner !== m.id) {
+        throw new Error(`[${m.id}] Duplicate domain "${normDomain}" already claimed by "${prevDomOwner}" (M2)`);
+      }
+      domainOwnerByPattern.set(normDomain, m.id);
+    }
+
+    if (m.catalog?.platform) {
+      const normPlat = String(m.catalog.platform).trim().toLowerCase();
+      const prevCatOwner = catalogOwnerByPlatform.get(normPlat);
+      if (prevCatOwner && prevCatOwner !== m.id) {
+        throw new Error(`[${m.id}] Duplicate catalog platform "${normPlat}" already claimed by "${prevCatOwner}" (M2)`);
+      }
+      catalogOwnerByPlatform.set(normPlat, m.id);
+    }
+
     compiled.push(compileDeclarativeAdapter(m));
   }
 

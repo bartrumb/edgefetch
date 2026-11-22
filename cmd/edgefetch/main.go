@@ -606,6 +606,9 @@ func main() {
 }
 
 func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps mainDeps) int {
+	if selfExe, err := os.Executable(); err == nil {
+		_ = RecoverInterruptedUpdate(selfExe)
+	}
 	if deps.getenv == nil {
 		deps.getenv = os.Getenv
 	}

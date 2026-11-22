@@ -61,6 +61,11 @@ fallthrough = true
 # [workflows.concurrency]
 # limit = 10
 #
+# [[workflows]]
+# name = "edgefetch-crawl"
+# binding = "CRAWL"
+# class_name = "CrawlWorkflow"
+#
 # # Optional 90-day fetch history retention cron (`scheduled()` in `src/index.ts`):
 # # [triggers]
 # # crons = ["0 4 * * *"]
@@ -109,3 +114,8 @@ migrations_dir = "migrations/search"
 name = "edgefetch-ingest"
 binding = "INGEST"
 class_name = "IngestWorkflow"
+
+[[env.production.workflows]]
+name = "edgefetch-crawl"
+binding = "CRAWL"
+class_name = "CrawlWorkflow"

@@ -1652,6 +1652,16 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 	if res.ContentSource != "" {
 		out["contentSource"] = res.ContentSource
 	}
+	if len(res.ActionResults) > 0 {
+		out["actionResults"] = res.ActionResults
+	}
+	if res.BlockedReason != "" {
+		out["blockedReason"] = res.BlockedReason
+		out["blocked"] = map[string]any{
+			"reason":    res.BlockedReason,
+			"retryable": false,
+		}
+	}
 	return out, via, http.StatusOK
 }
 

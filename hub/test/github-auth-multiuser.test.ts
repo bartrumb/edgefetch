@@ -359,7 +359,14 @@ async function loginViaGitHub(
     headers: { cookie: ghStateCookie },
   });
   const setCookies = extractSetCookies(r2.headers);
-  const sessionPair = setCookies.map((c) => c.split(';')[0]?.trim() ?? '').find((c) => c.startsWith('ef_admin_session=') && c.length > 'ef_admin_session='.length) ?? null;
+  const sessionPair =
+    setCookies
+      .map((c) => c.split(';')[0]?.trim() ?? '')
+      .find(
+        (c) =>
+          (c.startsWith('__Host-ef_admin_session=') && c.length > '__Host-ef_admin_session='.length) ||
+          (c.startsWith('ef_admin_session=') && c.length > 'ef_admin_session='.length),
+      ) ?? null;
   return {
     status: r2.status,
     location: r2.headers.get('location'),
@@ -1129,6 +1136,7 @@ test('Pillar 1D: OTLP span hygiene & real Cloudflare workerd (Miniflare) E2E for
     const allOtlp = otlpPayloads.join('\n');
     assert.ok(allOtlp.includes('edgefetch.admin.github_login'));
     assert.ok(allOtlp.includes('edgefetch.admin.github_callback'));
+    const wkAliceCookieVal = wkAlice.sessionCookie!.slice(wkAlice.sessionCookie!.indexOf('=') + 1);
     for (const secretValue of [
       ghSecret,
       callerSecret,
@@ -1136,7 +1144,7 @@ test('Pillar 1D: OTLP span hygiene & real Cloudflare workerd (Miniflare) E2E for
       'gho_wk_secret_',
       'wk_alice',
       aliceOauth.accessToken,
-      wkAlice.sessionCookie!.slice('ef_admin_session='.length),
+      wkAliceCookieVal,
     ]) {
       assert.equal(allOtlp.includes(secretValue), false, `OTLP trace leaked sensitive value: ${secretValue.slice(0, 12)}...`);
     }

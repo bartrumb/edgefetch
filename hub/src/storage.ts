@@ -7,6 +7,7 @@
  */
 
 import type { LlmEnvBindings } from './llm';
+import { getActiveCallerAuthContext } from './oauth';
 import { encodeBodyForWire } from './overflow';
 import { listConfiguredSpaFallbacks, type SpaFallbackEnv, type SpaFallbackProvider } from './spa-fallback';
 
@@ -27,6 +28,9 @@ export interface OptionalStorageBindings extends SpaFallbackEnv, LlmEnvBindings 
   SEARCH?: D1Database;
   INGEST?: {
     create(options?: { id?: string; params?: IngestWorkflowParams }): Promise<{ id: string }>;
+  };
+  CRAWL?: {
+    create(options?: { id?: string; params?: unknown }): Promise<{ id: string }>;
   };
   /** Optional Service Binding (`PdfOcrService` for optional external worker) for PyMuPDF + Tesseract 5.5.0 PDF OCR. */
   PDF_OCR?: {
@@ -106,26 +110,66 @@ export function sanitizeStorageUserId(userId?: string): string {
   return cleaned || 'owner';
 }
 
-const SENSITIVE_REQUEST_HEADER_NAMES = new Set([
-  'authorization',
-  'cookie',
-  'proxy-authorization',
-  'x-api-key',
-  'x-auth-token',
-]);
+export interface NormalizeVisibilityOptions {
+  cookies?: unknown;
+  preferMcp?: unknown;
+  hasAuthContext?: boolean;
+  userId?: string;
+}
 
-export function normalizeVisibility(raw: unknown, headers?: unknown): ArtifactVisibility {
-  if (typeof raw === 'string') {
-    const lower = raw.trim().toLowerCase();
-    if (lower === 'private') return 'private';
-    if (lower === 'public') return 'public';
+function hasAnyCallerHeader(headers: unknown): boolean {
+  if (!headers || typeof headers !== 'object') return false;
+  if (typeof (headers as Headers).forEach === 'function') {
+    let found = false;
+    (headers as Headers).forEach((v) => {
+      if (typeof v === 'string' && v.trim().length > 0) found = true;
+    });
+    return found;
   }
-  if (headers && typeof headers === 'object' && !Array.isArray(headers)) {
-    for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
-      if (SENSITIVE_REQUEST_HEADER_NAMES.has(k.trim().toLowerCase()) && typeof v === 'string' && v.trim().length > 0) {
-        return 'private';
-      }
+  if (Array.isArray(headers)) {
+    return headers.length > 0;
+  }
+  for (const [, v] of Object.entries(headers as Record<string, unknown>)) {
+    if (v !== undefined && v !== null && String(v).trim().length > 0) {
+      return true;
     }
+  }
+  return false;
+}
+
+function hasAnyCallerCookies(cookies: unknown): boolean {
+  if (cookies === undefined || cookies === null) return false;
+  if (typeof cookies === 'string') return cookies.trim().length > 0;
+  if (Array.isArray(cookies)) return cookies.length > 0;
+  if (typeof cookies === 'object') return Object.keys(cookies as Record<string, unknown>).length > 0;
+  return false;
+}
+
+/**
+ * Determines storage/cache visibility (`'public' | 'private'`).
+ * Security Invariant (H4): ANY caller-supplied request header, custom cookie, `preferMcp`, explicit auth context,
+ * or non-owner multi-user tenant (`userId !== 'owner'`) ALWAYS forces `'private'`, even if `raw === 'public'`.
+ */
+export function normalizeVisibility(
+  raw: unknown,
+  headers?: unknown,
+  opts?: NormalizeVisibilityOptions,
+): ArtifactVisibility {
+  if (typeof raw === 'string' && raw.trim().toLowerCase() === 'private') {
+    return 'private';
+  }
+  if (hasAnyCallerHeader(headers)) {
+    return 'private';
+  }
+  if (opts && (opts.preferMcp === true || opts.hasAuthContext === true || hasAnyCallerCookies(opts.cookies))) {
+    return 'private';
+  }
+  const effectiveUser = opts?.userId ?? getActiveCallerAuthContext()?.userId;
+  if (effectiveUser && sanitizeStorageUserId(effectiveUser) !== 'owner') {
+    return 'private';
+  }
+  if (typeof raw === 'string' && raw.trim().toLowerCase() === 'public') {
+    return 'public';
   }
   return 'public';
 }
@@ -255,7 +299,7 @@ export function buildCapabilities(
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
-  version = '2.7.0',
+  version = '2.7.1',
 ): HubCapabilities {
   const searchProviders: string[] = ['edge-map'];
   if (env.SEARCH) searchProviders.push('d1-fts5');
@@ -741,11 +785,16 @@ export async function readArtifactPage(params: {
   userId?: string;
   visibility?: ArtifactVisibility;
   deriveMarkdownFromRaw?: (bytes: Uint8Array) => string | null;
-}): Promise<{ ok: true; page: ArtifactPageSlice } | { ok: false; status: number; error: string; message?: string }> {
+}): Promise<{ ok: true; page: ArtifactPageSlice } | { ok: false; status: number; via?: 'hub'; error: string; message?: string }> {
   const rawId = params.blobSha256.trim().toLowerCase();
   const isMdPrefixed = rawId.startsWith('md:');
   const cleanHex = isMdPrefixed ? rawId.slice(3) : rawId;
-  const privateOnly = params.visibility === 'private';
+  const activeAuth = getActiveCallerAuthContext();
+  const effectiveUserId = params.userId ?? activeAuth?.userId;
+  const isNonOwnerMember =
+    (effectiveUserId && sanitizeStorageUserId(effectiveUserId) !== 'owner' && activeAuth?.role !== 'owner') || false;
+  const privateOnly = params.visibility === 'private' || isNonOwnerMember;
+  const effectiveVisibility: ArtifactVisibility | undefined = privateOnly ? 'private' : params.visibility;
   if (!isValidSha256Hex(cleanHex)) {
     return {
       ok: false,
@@ -808,8 +857,8 @@ export async function readArtifactPage(params: {
         bucket: params.bucket,
         blobSha256: cleanHex,
         preferredRetention: params.retention,
-        ...(params.userId ? { userId: params.userId } : {}),
-        ...(params.visibility ? { visibility: params.visibility } : {}),
+        ...(effectiveUserId ? { userId: effectiveUserId } : {}),
+        ...(effectiveVisibility ? { visibility: effectiveVisibility } : {}),
       });
       return rawLoadedCache;
     };
@@ -832,9 +881,9 @@ export async function readArtifactPage(params: {
         ];
 
     const checkCachedMarkdownForSha = async (sha: string): Promise<string | null> => {
-      if (params.userId) {
+      if (effectiveUserId) {
         for (const ver of versionsToTry) {
-          const privMdObj = await params.bucket.get(r2PrivateDerivedKey(params.userId, ver, 'markdown', sha));
+          const privMdObj = await params.bucket.get(r2PrivateDerivedKey(effectiveUserId, ver, 'markdown', sha));
           if (privMdObj) return await privMdObj.text();
         }
       }
@@ -880,8 +929,8 @@ export async function readArtifactPage(params: {
         const derivedMd = params.deriveMarkdownFromRaw(rawFallback.bytes);
         if (derivedMd !== null) {
           const targetDerivedKey =
-            privateOnly && params.userId
-              ? r2PrivateDerivedKey(params.userId, topVer, 'markdown', rawFallback.contentSha256)
+            privateOnly && effectiveUserId
+              ? r2PrivateDerivedKey(effectiveUserId, topVer, 'markdown', rawFallback.contentSha256)
               : r2DerivedKey(topVer, 'markdown', rawFallback.contentSha256);
           await params.bucket
             .put(targetDerivedKey, derivedMd, {
@@ -897,8 +946,9 @@ export async function readArtifactPage(params: {
       return {
         ok: false,
         status: 404,
-        error: 'artifact_expired',
-        message: 'Derived Markdown artifact not found or expired in R2; re-scrape the URL to regenerate it.',
+        via: 'hub',
+        error: 'artifact_not_found',
+        message: 'Artifact was not found or has expired.',
       };
     }
   }
@@ -924,25 +974,24 @@ export async function readArtifactPage(params: {
     blobSha256: cleanHex,
     preferredRetention: params.retention ?? dbRetention,
     ...(expectedContentSha256 ? { expectedContentSha256 } : {}),
-    ...(params.userId ? { userId: params.userId } : {}),
-    ...(params.visibility ? { visibility: params.visibility } : {}),
+    ...(effectiveUserId ? { userId: effectiveUserId } : {}),
+    ...(effectiveVisibility ? { visibility: effectiveVisibility } : {}),
   });
   if (!loaded.ok) {
-    if (loaded.error === 'artifact_expired' && expectedContentSha256) {
+    if (loaded.error === 'artifact_expired') {
       return {
         ok: false,
-        status: 410,
-        error: 'artifact_expired',
-        message: 'Artifact retention window has expired in R2; re-fetch the target URL to regenerate it.',
+        status: 404,
+        via: 'hub',
+        error: 'artifact_not_found',
+        message: 'Artifact was not found or has expired.',
       };
     }
     return {
       ok: false,
       status: loaded.status,
+      via: 'hub',
       error: loaded.error,
-      ...(loaded.error === 'artifact_expired'
-        ? { message: 'Artifact not found or expired in R2.' }
-        : {}),
     };
   }
 
@@ -1021,7 +1070,7 @@ export async function handleArtifactGetRequest(params: {
   });
   if (!out.ok) {
     return Response.json(
-      { error: out.error, ...(out.message ? { message: out.message } : {}) },
+      { ok: false, status: out.status, via: 'hub', error: out.error, ...(out.message ? { message: out.message } : {}) },
       { status: out.status, headers: { 'cache-control': 'no-store' } },
     );
   }

@@ -35,7 +35,7 @@ func TestClassifyOutcomes(t *testing.T) {
 		{"page 200 x-markdown", KindPage, 200, "text/x-markdown", "", "# Origin Markdown\n", OutcomeOK, ""},
 		{"page 200 non-html skipped", KindPage, 200, "image/png", "", "\x89PNG", OutcomeSkip, ""},
 		{"page 402 payment required", KindPage, 402, "application/json", "", `{"x402Version":1}`, OutcomePaymentRequired, "http 402 payment required"},
-		{"page 404 gone", KindPage, 404, "text/html", "", "not found", OutcomeGone, ""},
+		{"page 404 not_found", KindPage, 404, "text/html", "", "not found", OutcomeNotFound, ""},
 		{"page 410 gone", KindPage, 410, "text/html", "", "gone", OutcomeGone, ""},
 		{"page 429 stops host", KindPage, 429, "text/plain", "", "slow down", OutcomeStop, "HTTP 429"},
 		{"page 500 skipped", KindPage, 500, "text/html", "", "oops", OutcomeSkip, ""},
@@ -47,9 +47,10 @@ func TestClassifyOutcomes(t *testing.T) {
 		{"scrape 200 ok", KindScrape, 200, "text/html", "", "<main>hi</main>", OutcomeOK, ""},
 		{"scrape 402 x402 payment required", KindScrape, 402, "application/json", "", `{"accepts":[{"maxAmountRequired":"2000"}]}`, OutcomePaymentRequired, "http 402 payment required"},
 		{"scrape 429 stop", KindScrape, 429, "text/plain", "", "rate limited", OutcomeStop, "HTTP 429"},
-		{"scrape 404 gone", KindScrape, 404, "text/html", "", "missing", OutcomeGone, "HTTP 404"},
+		{"scrape 404 not_found", KindScrape, 404, "text/html", "", "missing", OutcomeNotFound, "HTTP 404"},
 		{"scrape 500 error", KindScrape, 500, "text/html", "", "err", OutcomeError, "HTTP 500"},
 		{"render 200 ok", KindRender, 200, "text/html", "", "<html></html>", OutcomeOK, ""},
+		{"render 404 not_found", KindRender, 404, "text/html", "", "missing", OutcomeNotFound, "HTTP 404"},
 		{"pdf 200 content-type pdf", KindPDF, 200, "application/pdf", "", "binary", OutcomeOK, ""},
 		{"pdf 200 magic bytes octet-stream", KindPDF, 200, "application/octet-stream", "", "%PDF-1.7 ...", OutcomeOK, ""},
 		{"pdf 200 html soft-404 error", KindPDF, 200, "text/html", "", "<html>login</html>", OutcomeError, "not a PDF (text/html)"},
@@ -58,7 +59,7 @@ func TestClassifyOutcomes(t *testing.T) {
 		{"pdf 502 error", KindPDF, 502, "text/plain", "", "bad gateway", OutcomeError, "HTTP 502"},
 		{"binary 200 ok", KindBinary, 200, "application/octet-stream", "", "\x00\x01\x02", OutcomeOK, ""},
 		{"binary 429 stop", KindBinary, 429, "text/plain", "", "slow", OutcomeStop, "HTTP 429"},
-		{"binary 404 gone", KindBinary, 404, "text/plain", "", "missing", OutcomeGone, "HTTP 404"},
+		{"binary 404 not_found", KindBinary, 404, "text/plain", "", "missing", OutcomeNotFound, "HTTP 404"},
 		{"binary 410 gone", KindBinary, 410, "text/plain", "", "gone", OutcomeGone, "HTTP 410"},
 		{"binary 403 stop", KindBinary, 403, "text/plain", "", "denied", OutcomeStop, "HTTP 403"},
 		{"binary 503 stop", KindBinary, 503, "text/plain", "", "busy", OutcomeStop, "HTTP 503"},
@@ -79,7 +80,7 @@ func TestClassifyOutcomes(t *testing.T) {
 		{"render 410 gone", KindRender, 410, "text/html", "", "gone", OutcomeGone, "HTTP 410"},
 		{"pdf 429 stop", KindPDF, 429, "text/plain", "", "slow", OutcomeStop, "HTTP 429"},
 		{"pdf 503 stop", KindPDF, 503, "text/plain", "", "busy", OutcomeStop, "HTTP 503"},
-		{"pdf 404 gone", KindPDF, 404, "text/plain", "", "missing", OutcomeGone, "HTTP 404"},
+		{"pdf 404 not_found", KindPDF, 404, "text/plain", "", "missing", OutcomeNotFound, "HTTP 404"},
 		{"pdf 200 >1024 prefix match ok", KindPDF, 200, "application/octet-stream", "", "%PDF-1.7 " + strings.Repeat("x", 2040), OutcomeOK, ""},
 		{"pdf 200 >1024 magic past cap error", KindPDF, 200, "application/octet-stream", "", strings.Repeat("x", 1100) + "%PDF-1.7", OutcomeError, "not a PDF (application/octet-stream)"},
 		{"feed products non-array string", KindFeed, 200, "application/json", "", `{"products":"bad"}`, OutcomeError, "no products array"},
@@ -158,8 +159,8 @@ func TestAcceptForAndStopsHost(t *testing.T) {
 	if !StopsHost(KindFeed, OutcomeError) || !StopsHost(KindJSON, OutcomeError) || !StopsHost(KindCatalog, OutcomeError) {
 		t.Fatal("OutcomeError on Feed/JSON/Catalog must stop host")
 	}
-	if StopsHost(KindPage, OutcomeError) || StopsHost(KindScrape, OutcomeGone) {
-		t.Fatal("OutcomeError on Page or OutcomeGone on Scrape must not stop host")
+	if StopsHost(KindPage, OutcomeError) || StopsHost(KindScrape, OutcomeGone) || StopsHost(KindScrape, OutcomeNotFound) || StopsHost(KindScrape, OutcomeDNSNotFound) || StopsHost(KindScrape, OutcomeBlockedSSRF) {
+		t.Fatal("OutcomeError on Page or NotFound/Gone/DNSNotFound/BlockedSSRF on Scrape must not stop host")
 	}
 
 	autoOKTypes := []string{

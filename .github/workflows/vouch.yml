@@ -45,6 +45,13 @@ jobs:
             echo "::error::Fetched PR head (${fetched_sha}) did not match event HEAD_SHA (${HEAD_SHA}); re-run check on latest commit."
             exit 1
           fi
+          if [ "$author_lc" != "bartrumb" ] && [ "$author_lc" != "dependabot[bot]" ]; then
+            protected_touched="$({ git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- .github/ keys/; git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" -- .github/ keys/; } | sort -u)"
+            if [ -n "$protected_touched" ]; then
+              echo "::error::External pull requests may not modify .github/ workflows or keys/ (Rule 8 of CONTRIBUTING.md)."
+              exit 1
+            fi
+          fi
           if [ "$author_lc" != "bartrumb" ] && [ "$author_lc" != "dependabot[bot]" ] && [ "$author_lc" != "github-actions[bot]" ]; then
             commits="$(git rev-list "${BASE_SHA}..${HEAD_SHA}")"
             missing_dco=""

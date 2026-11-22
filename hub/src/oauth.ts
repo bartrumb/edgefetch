@@ -7,14 +7,82 @@
  * box with full consent-screen protection, PKCE S256 verification, audience (`resource`) binding, and instant grant
  * revocation in `/admin`.
  */
+// @ts-ignore: `hub/tsconfig.json` uses `@cloudflare/workers-types` without `@types/node`
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { callerToken, isValidSecretMatch, MIN_TOKEN_LENGTH, sameBytes } from './auth';
-import { verifySessionJwt } from './github-auth';
+import { isGitHubAuthConfigured, isGitHubUserDeAllowlisted, verifySessionJwt, type GitHubAuthEnv } from './github-auth';
 import { getActiveRequestTracer, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 
 export const MCP_SCOPES = ['crawl:read', 'crawl:fetch'] as const;
-export type McpScope = (typeof MCP_SCOPES)[number];
+export const SUPPORTED_MCP_SCOPES = ['crawl:read', 'crawl:fetch', 'mcp:call'] as const;
+export type McpScope = (typeof SUPPORTED_MCP_SCOPES)[number];
 export type UserRole = 'owner' | 'member';
+
+export interface ActiveCallerAuthContext {
+  userId: string;
+  role: UserRole;
+  scopes: string[];
+  principal: string;
+}
+
+interface CallerAuthSlot {
+  current?: ActiveCallerAuthContext;
+  githubAuthEnv?: GitHubAuthEnv;
+}
+
+interface AsyncLocalStorageLike<T> {
+  getStore(): T | undefined;
+  run<R>(store: T, callback: () => R): R;
+}
+
+const callerAuthAls: AsyncLocalStorageLike<CallerAuthSlot> = (() => {
+  try {
+    if (typeof AsyncLocalStorage === 'function') {
+      return new (AsyncLocalStorage as unknown as new () => AsyncLocalStorageLike<CallerAuthSlot>)();
+    }
+  } catch {
+    // fallback when async_hooks is unavailable
+  }
+  let fallbackSlot: CallerAuthSlot | undefined;
+  return {
+    getStore: () => fallbackSlot,
+    run<T>(slot: CallerAuthSlot, fn: () => T): T {
+      const prev = fallbackSlot;
+      fallbackSlot = slot;
+      try {
+        return fn();
+      } finally {
+        fallbackSlot = prev;
+      }
+    },
+  };
+})();
+
+export function runWithCallerAuthContext<T>(
+  fn: () => T,
+  initial?: ActiveCallerAuthContext,
+  githubAuthEnv?: GitHubAuthEnv,
+): T {
+  return callerAuthAls.run(
+    {
+      ...(initial ? { current: initial } : {}),
+      ...(githubAuthEnv ? { githubAuthEnv } : {}),
+    },
+    fn,
+  );
+}
+
+export function setActiveCallerAuthContext(ctx: ActiveCallerAuthContext): void {
+  const slot = callerAuthAls.getStore();
+  if (slot) {
+    slot.current = ctx;
+  }
+}
+
+export function getActiveCallerAuthContext(): ActiveCallerAuthContext | undefined {
+  return callerAuthAls.getStore()?.current;
+}
 
 export interface HubUserRecord {
   userId: string;
@@ -22,6 +90,8 @@ export interface HubUserRecord {
   githubLogin?: string;
   avatarUrl?: string;
   role: UserRole;
+  sessionEpoch?: number;
+  disabled?: boolean;
   createdAt: number;
   lastLoginAt: number;
 }
@@ -31,6 +101,7 @@ export interface AdminPrincipal {
   role: UserRole;
   authMethod: 'github' | 'owner_token';
   csrf: string;
+  epoch?: number;
   jti?: string;
   githubLogin?: string;
   avatarUrl?: string;
@@ -46,7 +117,8 @@ const RATE_LIMIT_MAX_FAILURES = 5;
 const REGISTER_RATE_LIMIT_MAX = 20; // Max 20 anonymous client registrations per 5m per IP (H-S1)
 const MAX_AUTH_FAILURE_BUCKETS = 100; // Bounds SQLite auth_failures against spoofed IPv6 sprays (H-S5)
 
-export const ADMIN_COOKIE_NAME = 'ef_admin_session';
+export const ADMIN_COOKIE_NAME = '__Host-ef_admin_session';
+export const ADMIN_COOKIE_NAME_DEV = 'ef_admin_session';
 const CONSENT_CSRF_COOKIE = 'ef_oauth_csrf';
 
 export interface OAuthClientRecord {
@@ -208,6 +280,8 @@ export const OAUTH_SQLITE_SCHEMA = `
     github_login TEXT NOT NULL,
     avatar_url TEXT,
     role TEXT NOT NULL DEFAULT 'member',
+    session_epoch INTEGER NOT NULL DEFAULT 1,
+    disabled INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     last_login_at INTEGER NOT NULL
   );
@@ -240,6 +314,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         "ALTER TABLE oauth_codes ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
         "ALTER TABLE oauth_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
         "ALTER TABLE oauth_tokens ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
+        'ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1',
+        'ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0',
       ];
       for (const ddl of alterStatements) {
         try {
@@ -249,6 +325,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         }
       }
       sql.exec('SELECT user_id FROM oauth_tokens LIMIT 1');
+      sql.exec('SELECT session_epoch, disabled FROM users LIMIT 1');
       multiUserMigrated = true;
     } catch {
       // Schema not yet initialized; will run on first query
@@ -509,7 +586,17 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       }
 
       const userId = r.user_id || 'owner';
-      const userRole = normalizeRoleForUser(userId, r.user_role);
+      let userRole = normalizeRoleForUser(userId, r.user_role);
+      if (userId !== 'owner') {
+        const liveRow = sql
+          .exec<{ role: string; disabled?: number }>('SELECT role, disabled FROM users WHERE user_id = ? LIMIT 1', userId)
+          .toArray()[0];
+        if (!liveRow || Number(liveRow.disabled ?? 0) !== 0) {
+          sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
+          return { ok: false, error: 'invalid_grant' };
+        }
+        userRole = normalizeRoleForUser(userId, liveRow.role);
+      }
 
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', params.now);
       sql.exec("DELETE FROM oauth_tokens WHERE grant_id = ? AND kind = 'access'", r.grant_id);
@@ -640,24 +727,57 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     },
     upsertUser(user) {
       ensureMultiUserColumns();
-      sql.exec(
-        `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, created_at, last_login_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET
-           github_id = COALESCE(excluded.github_id, users.github_id),
-           github_login = excluded.github_login,
-           avatar_url = excluded.avatar_url,
-           role = excluded.role,
-           last_login_at = excluded.last_login_at`,
-        user.userId,
-        user.githubId ?? null,
-        user.githubLogin ?? user.userId,
-        user.avatarUrl ?? null,
-        user.role,
-        user.createdAt,
-        user.lastLoginAt,
-      );
-      return { ...user };
+      const epoch = typeof user.sessionEpoch === 'number' && Number.isInteger(user.sessionEpoch) && user.sessionEpoch >= 1 ? user.sessionEpoch : undefined;
+      const disabledInt = user.disabled ? 1 : 0;
+      if (epoch !== undefined) {
+        sql.exec(
+          `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, session_epoch, disabled, created_at, last_login_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             github_id = COALESCE(excluded.github_id, users.github_id),
+             github_login = excluded.github_login,
+             avatar_url = excluded.avatar_url,
+             role = excluded.role,
+             session_epoch = excluded.session_epoch,
+             disabled = excluded.disabled,
+             last_login_at = excluded.last_login_at`,
+          user.userId,
+          user.githubId ?? null,
+          user.githubLogin ?? user.userId,
+          user.avatarUrl ?? null,
+          user.role,
+          epoch,
+          disabledInt,
+          user.createdAt,
+          user.lastLoginAt,
+        );
+      } else {
+        sql.exec(
+          `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, session_epoch, disabled, created_at, last_login_at)
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             github_id = COALESCE(excluded.github_id, users.github_id),
+             github_login = excluded.github_login,
+             avatar_url = excluded.avatar_url,
+             role = excluded.role,
+             disabled = excluded.disabled,
+             last_login_at = excluded.last_login_at`,
+          user.userId,
+          user.githubId ?? null,
+          user.githubLogin ?? user.userId,
+          user.avatarUrl ?? null,
+          user.role,
+          disabledInt,
+          user.createdAt,
+          user.lastLoginAt,
+        );
+      }
+      if (disabledInt !== 0) {
+        sql.exec('DELETE FROM oauth_tokens WHERE user_id = ?', user.userId);
+        sql.exec('DELETE FROM oauth_codes WHERE user_id = ?', user.userId);
+      }
+      const stored = this.getUser!(user.userId) as HubUserRecord | null;
+      return stored ?? { ...user, sessionEpoch: epoch ?? 1, disabled: Boolean(user.disabled) };
     },
     getUser(userId) {
       ensureMultiUserColumns();
@@ -668,6 +788,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           github_login: string;
           avatar_url: string | null;
           role: string;
+          session_epoch?: number;
+          disabled?: number;
           created_at: number;
           last_login_at: number;
         }>('SELECT * FROM users WHERE user_id = ? LIMIT 1', userId)
@@ -679,6 +801,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         githubLogin: r.github_login,
         ...(r.avatar_url ? { avatarUrl: r.avatar_url } : {}),
         role: normalizeRoleForUser(r.user_id, r.role),
+        sessionEpoch: typeof r.session_epoch === 'number' && r.session_epoch >= 1 ? r.session_epoch : 1,
+        disabled: Number(r.disabled ?? 0) !== 0,
         createdAt: r.created_at,
         lastLoginAt: r.last_login_at,
       };
@@ -692,9 +816,11 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           github_login: string;
           avatar_url: string | null;
           role: string;
+          session_epoch?: number;
+          disabled?: number;
           created_at: number;
           last_login_at: number;
-        }>('SELECT * FROM users ORDER BY last_login_at DESC LIMIT 500')
+        }>('SELECT * FROM users WHERE COALESCE(disabled, 0) = 0 ORDER BY last_login_at DESC LIMIT 500')
         .toArray()
         .map((r) => ({
           userId: r.user_id,
@@ -702,6 +828,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           githubLogin: r.github_login,
           ...(r.avatar_url ? { avatarUrl: r.avatar_url } : {}),
           role: normalizeRoleForUser(r.user_id, r.role),
+          sessionEpoch: typeof r.session_epoch === 'number' && r.session_epoch >= 1 ? r.session_epoch : 1,
+          disabled: false,
           createdAt: r.created_at,
           lastLoginAt: r.last_login_at,
         }));
@@ -716,11 +844,12 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     updateUserRole(userId, role) {
       ensureMultiUserColumns();
       const existing = sql
-        .exec<{ c: number }>('SELECT COUNT(*) AS c FROM users WHERE user_id = ?', userId)
+        .exec<{ c: number }>('SELECT COUNT(*) AS c FROM users WHERE user_id = ? AND COALESCE(disabled, 0) = 0', userId)
         .toArray()[0];
       if (!existing || existing.c <= 0) return false;
-      sql.exec('UPDATE users SET role = ? WHERE user_id = ?', role, userId);
+      sql.exec('UPDATE users SET role = ?, session_epoch = COALESCE(session_epoch, 1) + 1 WHERE user_id = ?', role, userId);
       sql.exec('UPDATE oauth_tokens SET user_role = ? WHERE user_id = ?', role, userId);
+      sql.exec('UPDATE oauth_codes SET user_role = ? WHERE user_id = ?', role, userId);
       return true;
     },
     checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
@@ -913,11 +1042,19 @@ export function createMemoryOAuthStore(): OAuthStore {
       if (!params.clientId || t.clientId !== params.clientId) {
         return { ok: false, error: 'invalid_grant' };
       }
+      const userId = t.userId ?? 'owner';
+      let userRole = normalizeRoleForUser(userId, t.userRole);
+      if (userId !== 'owner') {
+        const liveUser = users.get(userId);
+        if (!liveUser || liveUser.disabled) {
+          for (const [h, row] of tokens.entries()) if (row.grantId === t.grantId) tokens.delete(h);
+          return { ok: false, error: 'invalid_grant' };
+        }
+        userRole = normalizeRoleForUser(userId, liveUser.role);
+      }
       for (const [h, row] of tokens.entries()) {
         if (row.grantId === t.grantId && row.kind === 'access') tokens.delete(h);
       }
-      const userId = t.userId ?? 'owner';
-      const userRole = normalizeRoleForUser(userId, t.userRole);
       t.used = true;
       t.expiresAt = Math.max(t.expiresAt, params.refreshExpiresAt);
       tokens.set(params.nextAccessHash, {
@@ -999,8 +1136,24 @@ export function createMemoryOAuthStore(): OAuthStore {
       }
     },
     upsertUser(user) {
-      const copy: HubUserRecord = { ...user };
+      const prev = users.get(user.userId);
+      const copy: HubUserRecord = {
+        ...user,
+        sessionEpoch:
+          typeof user.sessionEpoch === 'number' && user.sessionEpoch >= 1
+            ? user.sessionEpoch
+            : (prev?.sessionEpoch ?? 1),
+        disabled: Boolean(user.disabled),
+      };
       users.set(user.userId, copy);
+      if (copy.disabled) {
+        for (const [h, t] of tokens.entries()) {
+          if ((t.userId ?? 'owner') === user.userId) tokens.delete(h);
+        }
+        for (const [ch, cd] of codes.entries()) {
+          if ((cd.userId ?? 'owner') === user.userId) codes.delete(ch);
+        }
+      }
       return { ...copy };
     },
     getUser(userId) {
@@ -1008,7 +1161,10 @@ export function createMemoryOAuthStore(): OAuthStore {
       return u ? { ...u } : null;
     },
     listUsers() {
-      return [...users.values()].map((u) => ({ ...u })).sort((a, b) => b.lastLoginAt - a.lastLoginAt);
+      return [...users.values()]
+        .filter((u) => !u.disabled)
+        .map((u) => ({ ...u }))
+        .sort((a, b) => b.lastLoginAt - a.lastLoginAt);
     },
     countUsers() {
       let c = 0;
@@ -1019,10 +1175,14 @@ export function createMemoryOAuthStore(): OAuthStore {
     },
     updateUserRole(userId, role) {
       const u = users.get(userId);
-      if (!u) return false;
+      if (!u || u.disabled) return false;
       u.role = role;
+      u.sessionEpoch = (u.sessionEpoch ?? 1) + 1;
       for (const t of tokens.values()) {
         if ((t.userId ?? 'owner') === userId) t.userRole = role;
+      }
+      for (const cd of codes.values()) {
+        if ((cd.userId ?? 'owner') === userId) cd.userRole = role;
       }
       return true;
     },
@@ -1228,13 +1388,40 @@ export async function createAdminSessionValue(
   };
 }
 
+export function resolveAdminCookieAttrs(url: URL, publicOrigin?: string): { name: string; secure: boolean; strictHostPrefix: boolean } {
+  const isSecure = isEffectiveHttpsOrigin(url, publicOrigin);
+  if (!isSecure) {
+    return { name: ADMIN_COOKIE_NAME_DEV, secure: false, strictHostPrefix: false };
+  }
+  return { name: ADMIN_COOKIE_NAME, secure: true, strictHostPrefix: true };
+}
+
 export async function verifyAdminSessionCookie(
   cookieHeader: string | null,
   secret: string | undefined,
   now = Date.now(),
+  opts?: { strictHostPrefix?: boolean; githubAuthEnabled?: boolean },
 ): Promise<({ ok: true } & AdminPrincipal) | { ok: false }> {
   if (!secret) return { ok: false };
-  const raw = readCookie(cookieHeader, ADMIN_COOKIE_NAME);
+  const hostPrefixedVal = readCookie(cookieHeader, ADMIN_COOKIE_NAME);
+  let raw: string | null = null;
+  if (hostPrefixedVal !== null) {
+    // Never fall back to unprefixed `ef_admin_session` when `__Host-ef_admin_session` is present in the Cookie header!
+    raw = hostPrefixedVal;
+  } else {
+    const devVal = readCookie(cookieHeader, ADMIN_COOKIE_NAME_DEV);
+    if (devVal !== null) {
+      if (opts?.strictHostPrefix) {
+        // On HTTPS / non-loopback origins, never accept tossed GitHub (`gh_*`) JWTs from unprefixed cookies;
+        // allow only legacy `v1.` owner-token HMAC cookies when GitHub multi-user OAuth is disabled.
+        if (!opts.githubAuthEnabled && devVal.startsWith('v1.')) {
+          raw = devVal;
+        }
+      } else {
+        raw = devVal;
+      }
+    }
+  }
   if (!raw) return { ok: false };
   const parts = raw.split('.');
   if (parts.length === 3 && !raw.startsWith('v1.')) {
@@ -1251,6 +1438,57 @@ export async function verifyAdminSessionCookie(
   const expected = await hmacSha256Base64Url(`admin-cookie:${secret}`, `v1.${expiresAt}.${csrf}`);
   if (!sameBytes(sig, expected)) return { ok: false };
   return { ok: true, userId: 'owner', role: 'owner', authMethod: 'owner_token', csrf, expiresAt };
+}
+
+/**
+ * Verifies an admin session cookie against BOTH server-side `jti`/`csrf` revocations AND the live `users` table
+ * (`disabled`, `sessionEpoch`, live `role`, and `GITHUB_ALLOWED_USERS` de-allowlisting).
+ */
+export async function verifyLiveAdminSession(params: {
+  cookieHeader: string | null;
+  signingSecret: string | undefined;
+  store: OAuthStore;
+  now?: number;
+  strictHostPrefix?: boolean;
+  githubAuthEnv?: GitHubAuthEnv;
+}): Promise<({ ok: true } & AdminPrincipal) | { ok: false }> {
+  const now = params.now ?? Date.now();
+  const githubEnabled = Boolean(params.githubAuthEnv && isGitHubAuthConfigured(params.githubAuthEnv));
+  const session = await verifyAdminSessionCookie(params.cookieHeader, params.signingSecret, now, {
+    strictHostPrefix: params.strictHostPrefix,
+    githubAuthEnabled: githubEnabled,
+  });
+  if (!session.ok) return { ok: false };
+  if (await isAdminSessionRevoked(params.store, session.csrf, now, session.jti)) {
+    return { ok: false };
+  }
+  if (session.authMethod === 'github' || session.userId !== 'owner') {
+    const liveUser = (await params.store.getUser?.(session.userId)) ?? null;
+    if (!liveUser) {
+      const userCount = (await params.store.countUsers?.()) ?? 0;
+      if (githubEnabled || userCount > 0 || session.role === 'owner') {
+        return { ok: false };
+      }
+      return session;
+    }
+    if (liveUser.disabled) {
+      return { ok: false };
+    }
+    const expectedEpoch = liveUser.sessionEpoch ?? 1;
+    if ((session.epoch ?? 1) !== expectedEpoch) {
+      return { ok: false };
+    }
+    if (isGitHubUserDeAllowlisted(liveUser, params.githubAuthEnv)) {
+      return { ok: false };
+    }
+    return {
+      ...session,
+      role: liveUser.role,
+      ...(liveUser.githubLogin ? { githubLogin: liveUser.githubLogin } : {}),
+      ...(liveUser.avatarUrl ? { avatarUrl: liveUser.avatarUrl } : {}),
+    };
+  }
+  return session;
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -1341,7 +1579,7 @@ export function parseRequestedScopes(
     .map((s) => s.trim())
     .filter((s) => Boolean(s) && s !== 'offline_access');
   if (tokens.length === 0) return { ok: true, scopes: [...MCP_SCOPES] };
-  const invalid = tokens.filter((s) => !(MCP_SCOPES as readonly string[]).includes(s));
+  const invalid = tokens.filter((s) => !(SUPPORTED_MCP_SCOPES as readonly string[]).includes(s));
   if (invalid.length > 0) {
     return { ok: false, invalid };
   }
@@ -1567,7 +1805,11 @@ function renderAuthorizePage(params: {
     .map(
       (s) =>
         `<li><code>${escapeHtml(s)}</code> — ${
-          s === 'crawl:fetch' ? 'Trigger polite HTTPS fetches across container &amp; standby sites' : 'Inspect connected standby sites &amp; affinity pins'
+          s === 'mcp:call'
+            ? '<strong>Invoke external tools</strong> on your connected federated MCP servers'
+            : s === 'crawl:fetch'
+              ? 'Trigger polite HTTPS fetches across container &amp; standby sites'
+              : 'Inspect connected standby sites &amp; affinity pins'
         }</li>`,
     )
     .join('');
@@ -1724,6 +1966,7 @@ export interface OAuthHandlerDeps {
   mcpToken?: string;
   sessionSecret?: string;
   githubAuthEnabled?: boolean;
+  githubAuthEnv?: GitHubAuthEnv;
   serviceName: string;
   publicOrigin?: string;
   redirectAllowlist?: readonly string[];
@@ -1785,7 +2028,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         resource: `${origin}/mcp`,
         authorization_servers: [origin],
         bearer_methods_supported: ['header'],
-        scopes_supported: [...MCP_SCOPES],
+        scopes_supported: [...SUPPORTED_MCP_SCOPES],
         resource_name: deps.serviceName,
       },
       200,
@@ -1810,7 +2053,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         code_challenge_methods_supported: ['S256'],
         authorization_response_iss_parameter_supported: true,
         client_id_metadata_document_supported: true,
-        scopes_supported: [...MCP_SCOPES],
+        scopes_supported: [...SUPPORTED_MCP_SCOPES],
       },
       200,
       cors,
@@ -1934,10 +2177,15 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   if (path === '/oauth/authorize') {
     return withOAuthAuditSpan('authorize', async (span) => {
       const isSecure = isEffectiveHttpsOrigin(url, deps.publicOrigin);
-      let adminSession = await verifyAdminSessionCookie(request.headers.get('cookie'), signingSecret, now);
-      if (adminSession.ok && (await isAdminSessionRevoked(deps.store, adminSession.csrf, now, adminSession.jti))) {
-        adminSession = { ok: false };
-      }
+      const cookieAttrs = resolveAdminCookieAttrs(url, deps.publicOrigin);
+      const adminSession = await verifyLiveAdminSession({
+        cookieHeader: request.headers.get('cookie'),
+        signingSecret,
+        store: deps.store,
+        now,
+        strictHostPrefix: cookieAttrs.strictHostPrefix,
+        githubAuthEnv: deps.githubAuthEnv,
+      });
 
       if (request.method === 'GET') {
         const clientId = (url.searchParams.get('client_id') ?? '').trim();
@@ -2283,11 +2531,20 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           }
         }
 
+        const grantUserId = record.userId ?? 'owner';
+        let grantUserRole = normalizeRoleForUser(grantUserId, record.userRole);
+        if (grantUserId !== 'owner') {
+          const liveUser = (await deps.store.getUser?.(grantUserId)) ?? null;
+          if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, deps.githubAuthEnv)) {
+            span.setAttributes({ 'oauth.outcome': 'user_revoked', 'http.response.status_code': 400 });
+            span.setStatus(false, 'user_revoked');
+            return oauthJson({ error: 'invalid_grant', error_description: 'Authorized user account is disabled or no longer permitted' }, 400, cors);
+          }
+          grantUserRole = liveUser.role;
+        }
         const accessToken = `efa_${randomUrlToken(32)}`;
         const refreshToken = `efr_${randomUrlToken(32)}`;
         const grantId = `grant_${randomUrlToken(12)}`;
-        const grantUserId = record.userId ?? 'owner';
-        const grantUserRole = normalizeRoleForUser(grantUserId, record.userRole);
         await deps.store.putTokenPair({
           grantId,
           accessHash: await sha256Base64Url(accessToken),
@@ -2376,6 +2633,20 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           return oauthJson({ error: 'invalid_grant', error_description: 'Refresh token is invalid, expired, or revoked' }, 400, cors);
         }
 
+        if (rotated.userId !== 'owner') {
+          const liveUser = (await deps.store.getUser?.(rotated.userId)) ?? null;
+          if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, deps.githubAuthEnv)) {
+            await deps.store.revokeGrant(rotated.grantId);
+            span.setAttributes({
+              'oauth.grant_id': rotated.grantId,
+              'oauth.outcome': 'user_revoked',
+              'http.response.status_code': 400,
+            });
+            span.setStatus(false, 'user_revoked');
+            return oauthJson({ error: 'invalid_grant', error_description: 'Account access has been revoked' }, 400, cors);
+          }
+        }
+
         span.setAttributes({
           'oauth.grant_id': rotated.grantId,
           'oauth.scopes': rotated.scopes.join(' '),
@@ -2451,6 +2722,7 @@ export async function authorizeMcpRequest(params: {
   origin: string;
   ownerSecret?: string;
   mcpToken?: string;
+  githubAuthEnv?: GitHubAuthEnv;
   store: OAuthStore;
   now?: number;
 }): Promise<McpAuthResult> {
@@ -2459,10 +2731,26 @@ export async function authorizeMcpRequest(params: {
   if (!tok) return { ok: false, status: 401, wwwAuthenticate };
 
   if (isValidSecretMatch(tok, params.ownerSecret)) {
-    return { ok: true, scopes: [...MCP_SCOPES], principal: 'owner_token', userId: 'owner', role: 'owner' };
+    const res: McpAuthResult = {
+      ok: true,
+      scopes: [...SUPPORTED_MCP_SCOPES],
+      principal: 'owner_token',
+      userId: 'owner',
+      role: 'owner',
+    };
+    setActiveCallerAuthContext(res);
+    return res;
   }
   if (isValidSecretMatch(tok, params.mcpToken)) {
-    return { ok: true, scopes: [...MCP_SCOPES], principal: 'mcp_token', userId: 'owner', role: 'owner' };
+    const res: McpAuthResult = {
+      ok: true,
+      scopes: [...SUPPORTED_MCP_SCOPES],
+      principal: 'mcp_token',
+      userId: 'owner',
+      role: 'owner',
+    };
+    setActiveCallerAuthContext(res);
+    return res;
   }
 
   const record = await params.store.getAccessToken(await sha256Base64Url(tok), params.now ?? Date.now());
@@ -2470,6 +2758,17 @@ export async function authorizeMcpRequest(params: {
     return { ok: false, status: 401, wwwAuthenticate };
   }
   const userId = record.userId ?? 'owner';
-  const role = normalizeRoleForUser(userId, record.userRole);
-  return { ok: true, scopes: record.scopes, principal: `oauth:${record.clientId}`, userId, role };
+  let role = normalizeRoleForUser(userId, record.userRole);
+  if (userId !== 'owner') {
+    const effectiveGhEnv = params.githubAuthEnv ?? callerAuthAls.getStore()?.githubAuthEnv;
+    const liveUser = (await params.store.getUser?.(userId)) ?? null;
+    if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, effectiveGhEnv)) {
+      await params.store.revokeGrant(record.grantId);
+      return { ok: false, status: 401, wwwAuthenticate };
+    }
+    role = liveUser.role;
+  }
+  const res: McpAuthResult = { ok: true, scopes: record.scopes, principal: `oauth:${record.clientId}`, userId, role };
+  setActiveCallerAuthContext(res);
+  return res;
 }

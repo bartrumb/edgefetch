@@ -11,7 +11,7 @@
 import { buildCanonicalMcpToolSchemas, MCP_TOOL_SCHEMAS, TEXT_ACCEPTS } from './mcp';
 
 export const DEFAULT_OPENAPI_ORIGIN = 'https://edgefetch.dev';
-export const DEFAULT_OPENAPI_VERSION = '2.7.0';
+export const DEFAULT_OPENAPI_VERSION = '2.7.1';
 
 export interface BuildOpenApiOptions {
   origin?: string;
@@ -68,6 +68,10 @@ function authFetchSecurity() {
   return [{ bearerAuth: [] }, { oauth2Pkce: ['crawl:fetch'] }];
 }
 
+function authMcpQuerySecurity() {
+  return [{ bearerAuth: [] }, { oauth2Pkce: ['crawl:read', 'mcp:call'] }];
+}
+
 function jsonContent(schemaRefOrObj: Record<string, unknown>) {
   return {
     'application/json': {
@@ -97,7 +101,7 @@ function standardAuthErrorResponses() {
       content: jsonContent(schemaRef('ErrorResponse')),
     },
     '403': {
-      description: 'Insufficient OAuth 2.1 scope (`crawl:read` or `crawl:fetch`) or policy block.',
+      description: 'Insufficient OAuth 2.1 scope (`crawl:read`, `crawl:fetch`, or `mcp:call`) or policy block.',
       content: jsonContent(schemaRef('ErrorResponse')),
     },
   };
@@ -274,7 +278,7 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           tags: ['Discovery'],
           operationId: 'getOAuthProtectedResource',
           summary: 'Get RFC 9728 OAuth 2.1 Protected Resource metadata',
-          description: 'Advertises protected MCP resource URI, authorization server issuer, and supported scopes (`crawl:read`, `crawl:fetch`).',
+          description: 'Advertises protected MCP resource URI, authorization server issuer, and supported scopes (`crawl:read`, `crawl:fetch`, `mcp:call`).',
           security: [],
           responses: {
             '200': {
@@ -1167,8 +1171,8 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           operationId: 'queryConnectedMcp',
           summary: 'List or invoke tools on a user-connected federated MCP server',
           description:
-            'Executes `list_connected`, `list_tools`, or `call_tool` over Streamable HTTP / SSE against a user-isolated `AES-256-GCM` vault connector, auto-refreshing OAuth 2.1 tokens and scrubbing indirect prompt injections (`visibility: "private"`).',
-          security: authFetchSecurity(),
+            'Executes `list_connected`, `list_tools`, or `call_tool` over Streamable HTTP / SSE against a user-isolated `AES-256-GCM` vault connector, auto-refreshing OAuth 2.1 tokens and scrubbing indirect prompt injections (`visibility: "private"`). Requires OAuth scope `mcp:call` (or `CALLER_TOKEN` / `MCP_TOKEN`) when `action` is `"call_tool"`.',
+          security: authMcpQuerySecurity(),
           requestBody: {
             required: true,
             content: jsonContent(schemaRef('McpTool_QueryMcpInput')),
@@ -1255,7 +1259,7 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           summary: 'Streamable HTTP Model Context Protocol (MCP) JSON-RPC endpoint',
           description:
             'Stateless Streamable HTTP MCP endpoint supporting protocol versions `2026-07-28` through `2024-11-05` (`initialize`, `tools/list`, `tools/call`, `server/discover`, `ping`) across all 17 canonical EdgeFetch tools.',
-          security: [{ bearerAuth: [] }, { oauth2Pkce: ['crawl:read', 'crawl:fetch'] }],
+          security: [{ bearerAuth: [] }, { oauth2Pkce: ['crawl:read', 'crawl:fetch', 'mcp:call'] }],
           requestBody: {
             required: true,
             content: jsonContent(schemaRef('McpJsonRpcRequest')),
@@ -1419,6 +1423,8 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
                   'Read capabilities, keyless site adapters, host health, connected worker status, stored R2 artifacts, and search indexes.',
                 'crawl:fetch':
                   'Execute polite outbound scrapes, crawls, URL maps, browser interactions, job/catalog extractions, and autonomous agent runs.',
+                'mcp:call':
+                  'Invoke tools (`action: "call_tool"`) on user-connected federated MCP servers via `POST /v1/mcp/query` or MCP `query_mcp`.',
               },
             },
           },
@@ -1760,13 +1766,22 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           type: 'object',
           properties: {
             ok: { type: 'boolean' },
+            cached: { type: 'boolean' },
             url: { type: 'string' },
             finalUrl: { type: 'string' },
             status: { type: 'integer' },
             via: { type: 'string' },
+            rendered: { type: 'boolean' },
             title: { type: 'string' },
             description: { type: 'string' },
+            wordCount: { type: 'integer' },
+            favicon: { type: 'string' },
+            contentType: { type: 'string' },
             markdown: { type: 'string' },
+            json: { type: 'object' },
+            jsonExtractionMode: { type: 'string', enum: ['heuristic', 'llm'] },
+            sectionExpandedFromHeading: { type: 'boolean' },
+            warnings: { type: 'array', items: { type: 'string' } },
             links: { type: 'array', items: { type: 'string' } },
             metadata: { type: 'object' },
             blocked: { type: ['object', 'null'] },
@@ -1799,7 +1814,15 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             sessionId: { type: 'string' },
             url: { type: 'string' },
             finalUrl: { type: 'string' },
+            rendered: { type: 'boolean' },
+            actions: { type: 'array', items: { type: 'object' } },
+            warnings: { type: 'array', items: { type: 'string' } },
             markdown: { type: 'string' },
+            truncated: { type: 'boolean' },
+            offset: { type: 'integer' },
+            totalChars: { type: 'integer' },
+            remainingChars: { type: 'integer' },
+            nextOffset: { type: ['integer', 'null'] },
             screenshotBase64: { type: 'string' },
           },
         },

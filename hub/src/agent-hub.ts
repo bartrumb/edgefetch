@@ -547,6 +547,7 @@ export function recomputeSummary(results: CrawlResultItem[]) {
   const byOutcome: Record<string, number> = {};
   const byStatus: Record<string, number> = {};
   for (const r of results) {
+    if (!r || typeof r !== 'object') continue;
     const outcome = String(r.outcome ?? 'error');
     const status = String(r.status ?? 0);
     byOutcome[outcome] = (byOutcome[outcome] ?? 0) + 1;

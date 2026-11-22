@@ -2,10 +2,11 @@
 # Joins any Linux, macOS, Windows, NAS, Raspberry Pi, or VPS to your EdgeFetch Hub with zero inbound ports.
 services:
   edgefetch-agent:
-    image: ghcr.io/bartrumb/edgefetch-agent:2.7.0
+    image: ghcr.io/bartrumb/edgefetch-agent:2.7.1
     container_name: edgefetch-agent
     restart: unless-stopped
     security_opt:
+      - seccomp=./deploy/seccomp/chromium-sandbox.json
       - no-new-privileges:true
     environment:
       EDGEFETCH_HUB_URL: ${EDGEFETCH_HUB_URL:?Set EDGEFETCH_HUB_URL (e.g. https://edgefetch.example.com)}

@@ -1,6 +1,6 @@
 {
   "name": "@bartrumb/edgefetch-deno-hub",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "tasks": {
     "start": "deno run --allow-net --allow-env hub/portable/deno-server.ts"
   },

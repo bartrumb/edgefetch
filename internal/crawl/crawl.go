@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -106,6 +107,7 @@ type Result struct {
 	URL               string                         `json:"url"`
 	Kind              classify.Kind                  `json:"kind"`
 	Outcome           classify.Outcome               `json:"outcome"`
+	BlockedReason     string                         `json:"blockedReason,omitempty"`
 	Problem           string                         `json:"problem,omitempty"`
 	Status            int                            `json:"status"`
 	ContentType       string                         `json:"contentType,omitempty"`
@@ -143,6 +145,7 @@ type Result struct {
 	ActionScreenshots []string                       `json:"actionScreenshots,omitempty"`
 	ActionScrapes     []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
 	JavascriptReturns []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
+	ActionResults     []browser.ActionResult         `json:"actionResults,omitempty"`
 	PDFBase64         string                         `json:"pdfBase64,omitempty"`
 	PDFEngine         string                         `json:"pdfEngine,omitempty"`
 	SHA256            string                         `json:"sha256,omitempty"`
@@ -692,8 +695,29 @@ func (c *Crawler) runRequestWithRedirects(
 	}
 
 	// Explicit headless browser render (`KindRender`, `renderMode: "always"`, or `Interact != nil`):
-	// Enforce per-host pacing AND check `/robots.txt` BEFORE launching/navigating Chromium!
+	// Enforce URL SSRF policy (`c.allow`), per-host pacing, AND `/robots.txt` BEFORE launching/navigating Chromium!
 	if origReq.Kind == classify.KindRender || strings.EqualFold(origReq.RenderMode, "always") || origReq.Interact != nil {
+		parsedOrig, parseErr := url.Parse(origReq.URL)
+		if parseErr != nil {
+			res := Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: RedactEmbeddedURLs(parseErr.Error())}
+			c.logResult(ctx, log, origReq, res)
+			return res, false
+		}
+		if c.allow != nil {
+			if allowErr := c.allow(parsedOrig); allowErr != nil {
+				res := Result{
+					ID:            origReq.ID,
+					URL:           origReq.URL,
+					Kind:          origReq.Kind,
+					Outcome:       classify.OutcomeBlockedSSRF,
+					BlockedReason: "ssrf",
+					Problem:       ssrfProblemFromAllowErr(allowErr),
+					DurationMs:    c.Now().Sub(started).Milliseconds(),
+				}
+				c.logResult(ctx, log, origReq, res)
+				return res, false
+			}
+		}
 		curHost := hostOf(origReq.URL)
 		hs := c.hostStateFor(curHost)
 		if err := hs.Acquire(ctx); err != nil {
@@ -738,23 +762,33 @@ func (c *Crawler) runRequestWithRedirects(
 			return notTried(origReq, "crawl cancelled"), true
 		}
 		if c.shouldCheckRobots(curHost, opts) {
-			allowed, distressed, fetchedRob, reason := c.checkRobots(ctx, hs, origReq.URL)
-			if !allowed {
+			robRes := c.checkRobotsDetailed(ctx, hs, origReq.URL)
+			if !robRes.allowed {
 				hs.Release()
 				outcome := classify.OutcomeError
-				if distressed {
+				blockedReason := ""
+				switch {
+				case robRes.dnsNotFound:
+					outcome = classify.OutcomeDNSNotFound
+				case robRes.ssrfBlocked:
+					outcome = classify.OutcomeBlockedSSRF
+					blockedReason = "ssrf"
+				case robRes.distressed:
 					outcome = classify.OutcomeStop
 				}
-				return Result{
-					ID:         origReq.ID,
-					URL:        origReq.URL,
-					Kind:       origReq.Kind,
-					Outcome:    outcome,
-					Problem:    reason,
-					DurationMs: c.Now().Sub(started).Milliseconds(),
-				}, false
+				res := Result{
+					ID:            origReq.ID,
+					URL:           origReq.URL,
+					Kind:          origReq.Kind,
+					Outcome:       outcome,
+					BlockedReason: blockedReason,
+					Problem:       robRes.reason,
+					DurationMs:    c.Now().Sub(started).Milliseconds(),
+				}
+				c.logResult(ctx, log, origReq, res)
+				return res, false
 			}
-			if fetchedRob && gap > 0 {
+			if robRes.fetched && gap > 0 {
 				if err := c.waitGlobalGap(ctx, gap); err != nil {
 					hs.Release()
 					return notTried(origReq, "crawl cancelled"), true
@@ -780,11 +814,22 @@ func (c *Crawler) runRequestWithRedirects(
 	for hop := 0; hop <= MaxRedirects; hop++ {
 		parsedCur, err := url.Parse(curURLStr)
 		if err != nil {
-			return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: err.Error()}, false
+			return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: RedactEmbeddedURLs(err.Error())}, false
 		}
-		if hop > 0 && c.allow != nil {
+		if c.allow != nil {
 			if err := c.allow(parsedCur); err != nil {
-				return Result{ID: origReq.ID, URL: origReq.URL, Kind: origReq.Kind, Outcome: classify.OutcomeError, Problem: err.Error()}, false
+				res := Result{
+					ID:            origReq.ID,
+					URL:           origReq.URL,
+					Kind:          origReq.Kind,
+					Outcome:       classify.OutcomeBlockedSSRF,
+					BlockedReason: "ssrf",
+					Problem:       ssrfProblemFromAllowErr(err),
+					Attempts:      totalAttempts,
+					DurationMs:    c.Now().Sub(started).Milliseconds(),
+				}
+				c.logResult(ctx, log, origReq, res)
+				return res, false
 			}
 		}
 
@@ -839,28 +884,38 @@ func (c *Crawler) runRequestWithRedirects(
 		var robotsElapsedMs int64
 		if c.shouldCheckRobots(curHost, opts) {
 			robStart := c.Now()
-			allowed, distressed, fetchedRob, reason := c.checkRobots(ctx, hs, curURLStr)
+			robRes := c.checkRobotsDetailed(ctx, hs, curURLStr)
 			robotsElapsedMs = c.Now().Sub(robStart).Milliseconds()
-			if !allowed {
+			if !robRes.allowed {
 				hs.Release()
 				outcome := classify.OutcomeError
-				if distressed {
+				blockedReason := ""
+				switch {
+				case robRes.dnsNotFound:
+					outcome = classify.OutcomeDNSNotFound
+				case robRes.ssrfBlocked:
+					outcome = classify.OutcomeBlockedSSRF
+					blockedReason = "ssrf"
+				case robRes.distressed:
 					outcome = classify.OutcomeStop
-				} else if origReq.Kind == classify.KindPage || origReq.Kind == classify.KindText {
+				case origReq.Kind == classify.KindPage || origReq.Kind == classify.KindText:
 					outcome = classify.OutcomeSkip
 				}
-				return Result{
-					ID:         origReq.ID,
-					URL:        origReq.URL,
-					Kind:       origReq.Kind,
-					Outcome:    outcome,
-					Problem:    reason,
-					Attempts:   totalAttempts,
-					DurationMs: c.Now().Sub(started).Milliseconds(),
-					Timing:     Timing{RobotsMs: robotsElapsedMs},
-				}, false
+				res := Result{
+					ID:            origReq.ID,
+					URL:           origReq.URL,
+					Kind:          origReq.Kind,
+					Outcome:       outcome,
+					BlockedReason: blockedReason,
+					Problem:       robRes.reason,
+					Attempts:      totalAttempts,
+					DurationMs:    c.Now().Sub(started).Milliseconds(),
+					Timing:        Timing{RobotsMs: robotsElapsedMs},
+				}
+				c.logResult(ctx, log, origReq, res)
+				return res, false
 			}
-			if fetchedRob && gap > 0 {
+			if robRes.fetched && gap > 0 {
 				if err := c.waitGlobalGap(ctx, gap); err != nil {
 					hs.Release()
 					if remMs := hs.CoolingDownRetryAfterMs(c.Now()); remMs > 0 {
@@ -1017,11 +1072,59 @@ func retriableStatus(status int) bool {
 	return status == 500 || status == 502 || status == 504
 }
 
-func isPermanentFetchError(err error) bool {
+func isDNSNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		if dnsErr.IsTimeout || dnsErr.IsTemporary {
+			return false
+		}
+		if dnsErr.IsNotFound {
+			return true
+		}
+		return strings.Contains(strings.ToLower(dnsErr.Err), "no such host")
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out") || strings.Contains(lower, "temporary") {
+		return false
+	}
+	return strings.Contains(lower, "no such host")
+}
+
+func isSSRFBlockError(err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, politeness.ErrNonPublicPeer) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "refusing connection to non-public ip") ||
+		strings.Contains(lower, "blocked by ssrf policy") ||
+		strings.Contains(lower, "non-public peer ip")
+}
+
+func ssrfProblemFromAllowErr(err error) string {
+	if err == nil || isSSRFBlockError(err) {
+		return "blocked by SSRF policy: non-public target address"
+	}
+	clean := strings.TrimSpace(RedactEmbeddedURLs(err.Error()))
+	lower := strings.ToLower(clean)
+	if clean == "" ||
+		strings.Contains(lower, "not allowed") ||
+		strings.Contains(lower, "only https") {
+		return "blocked by SSRF policy: non-public target address"
+	}
+	return "blocked by SSRF policy: " + clean
+}
+
+func isPermanentFetchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isSSRFBlockError(err) || isDNSNotFoundError(err) {
 		return true
 	}
 	var certVerErr *tls.CertificateVerificationError
@@ -1129,14 +1232,25 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 		}
 		if fetchErr != nil {
 			if ctx.Err() != nil {
-				res.Outcome, res.Problem = classify.OutcomeError, ctx.Err().Error()
+				res.Outcome, res.Problem = classify.OutcomeError, RedactEmbeddedURLs(ctx.Err().Error())
 				break
 			}
 			if !isPermanentFetchError(fetchErr) && attempt <= opts.Retries {
 				c.backoff(ctx, attempt)
 				continue
 			}
-			res.Outcome, res.Problem = classify.OutcomeError, fetchErr.Error()
+			switch {
+			case isDNSNotFoundError(fetchErr):
+				res.Outcome = classify.OutcomeDNSNotFound
+				res.Problem = "domain does not exist (DNS NXDOMAIN)"
+			case isSSRFBlockError(fetchErr):
+				res.Outcome = classify.OutcomeBlockedSSRF
+				res.BlockedReason = "ssrf"
+				res.Problem = "blocked by SSRF policy: non-public target address"
+			default:
+				res.Outcome = classify.OutcomeError
+				res.Problem = RedactEmbeddedURLs(fetchErr.Error())
+			}
 			break
 		}
 		if retriableStatus(status) && header.Get("cf-mitigated") == "" && attempt <= opts.Retries {
@@ -1189,9 +1303,10 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 		}
 
 		if truncated {
-			res.Outcome, res.Problem = classify.OutcomeError, fmt.Sprintf("body over %d bytes", maxLimitUsed)
-			if header.Get("cf-mitigated") != "" {
-				res.Outcome, res.Problem = classify.Classify(r.Kind, status, header, nil)
+			if status == http.StatusPaymentRequired || status == http.StatusTooManyRequests || header.Get("cf-mitigated") != "" {
+				res.Outcome, res.Problem = classify.Classify(r.Kind, status, header, body)
+			} else {
+				res.Outcome, res.Problem = classify.OutcomeError, fmt.Sprintf("body over %d bytes", maxLimitUsed)
 			}
 		} else if pdfStream != nil {
 			res.Bytes = pdfStream.rawBytes
@@ -1246,525 +1361,14 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	return res, redirectLoc, finalBody
 }
 
-type urlSepKind uint8
-
-const (
-	urlSepNone urlSepKind = iota
-	urlSepPlain
-	urlSepJSONSlash
-	urlSepPctEncoded
-	urlSepProtoRel
-)
-
-func asciiLower(b byte) byte {
-	if b >= 'A' && b <= 'Z' {
-		return b + ('a' - 'A')
-	}
-	return b
-}
-
-func hasPrefixFoldASCII(s, lowerPrefix string) bool {
-	if len(s) < len(lowerPrefix) {
-		return false
-	}
-	for i := 0; i < len(lowerPrefix); i++ {
-		if asciiLower(s[i]) != lowerPrefix[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func isHostStartByte(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '['
-}
-
-func isProtoRelBoundary(b byte) bool {
-	switch b {
-	case ' ', '\t', '\r', '\n', '"', '\'', '=', '(', '<', ',':
-		return true
-	default:
-		return false
-	}
-}
-
-func matchURLSchemeAt(s string, i int) (sep urlSepKind, afterSep int) {
-	if i < 0 || i >= len(s) {
-		return urlSepNone, 0
-	}
-	if s[i] == '/' {
-		if i+2 < len(s) && s[i+1] == '/' && isHostStartByte(s[i+2]) && (i == 0 || isProtoRelBoundary(s[i-1])) {
-			return urlSepProtoRel, i + 2
-		}
-		return urlSepNone, 0
-	}
-	c0 := asciiLower(s[i])
-	if c0 != 'h' && c0 != 'w' && c0 != 'f' {
-		return urlSepNone, 0
-	}
-	// Avoid matching inside a longer identifier like "myhttp://", except known URI prefixes like "blob:https://".
-	if i > 0 {
-		prev := asciiLower(s[i-1])
-		if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') {
-			return urlSepNone, 0
-		}
-	}
-	schemeLen := 0
-	rem := s[i:]
-	switch {
-	case hasPrefixFoldASCII(rem, "https"):
-		schemeLen = 5
-	case hasPrefixFoldASCII(rem, "http"):
-		schemeLen = 4
-	case hasPrefixFoldASCII(rem, "wss"):
-		schemeLen = 3
-	case hasPrefixFoldASCII(rem, "ws"):
-		schemeLen = 2
-	case hasPrefixFoldASCII(rem, "ftps"):
-		schemeLen = 4
-	case hasPrefixFoldASCII(rem, "ftp"):
-		schemeLen = 3
-	default:
-		return urlSepNone, 0
-	}
-	tail := rem[schemeLen:]
-	switch {
-	case strings.HasPrefix(tail, "://"):
-		return urlSepPlain, i + schemeLen + 3
-	case strings.HasPrefix(tail, `:\/\/`):
-		return urlSepJSONSlash, i + schemeLen + 5
-	case hasPrefixFoldASCII(tail, "%3a%2f%2f"):
-		return urlSepPctEncoded, i + schemeLen + 9
-	default:
-		return urlSepNone, 0
-	}
-}
-
-func countPrecedingBackslashes(s string, pos int) int {
-	n := 0
-	for pos > 0 && s[pos-1] == '\\' {
-		n++
-		pos--
-	}
-	return n
-}
-
-func isAllDigitsASCII(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-var sensitivePathActionSegments = map[string]bool{
-	"reset":       true,
-	"verify":      true,
-	"confirm":     true,
-	"magic":       true,
-	"token":       true,
-	"invite":      true,
-	"activate":    true,
-	"unsubscribe": true,
-}
-
-func scrubPathMatrixAndResetTokens(pathPart string) string {
-	if pathPart == "" {
-		return ""
-	}
-	needsWork := strings.IndexByte(pathPart, ';') >= 0
-	if !needsWork {
-		// Quick check for sensitive action segments like /reset/<token>
-		lp := strings.ToLower(pathPart)
-		for k := range sensitivePathActionSegments {
-			if strings.Contains(lp, "/"+k+"/") {
-				needsWork = true
-				break
-			}
-		}
-	}
-	if !needsWork {
-		return pathPart
-	}
-	segs := strings.Split(pathPart, "/")
-	redactNext := false
-	for idx, seg := range segs {
-		if semi := strings.IndexByte(seg, ';'); semi >= 0 {
-			seg = seg[:semi]
-			segs[idx] = seg
-		}
-		if seg == "" {
-			continue
-		}
-		if redactNext {
-			segs[idx] = "[REDACTED]"
-			redactNext = false
-			continue
-		}
-		if sensitivePathActionSegments[strings.ToLower(seg)] {
-			redactNext = true
-		}
-	}
-	return strings.Join(segs, "/")
-}
-
-func cutEarliestFold(s string, markers ...string) string {
-	cutAt := len(s)
-	for _, m := range markers {
-		for i := 0; i+len(m) <= cutAt; i++ {
-			if hasPrefixFoldASCII(s[i:], m) {
-				cutAt = i
-				break
-			}
-		}
-	}
-	return s[:cutAt]
-}
-
-func scrubSingleURLToken(raw string) string {
-	return scrubMatchedURL(raw, urlSepPlain)
-}
-
-func scrubMatchedURL(raw string, kind urlSepKind) string {
-	if raw == "" {
-		return ""
-	}
-	if kind == urlSepPctEncoded {
-		raw = cutEarliestFold(raw, "?", "#", "%3f", "%23", "%3b")
-		sepIdx := -1
-		for i := 0; i+9 <= len(raw); i++ {
-			if hasPrefixFoldASCII(raw[i:], "%3a%2f%2f") {
-				sepIdx = i + 9
-				break
-			}
-		}
-		if sepIdx >= 0 {
-			rest := raw[sepIdx:]
-			slashIdx := len(rest)
-			for i := 0; i < len(rest); i++ {
-				if rest[i] == '/' || hasPrefixFoldASCII(rest[i:], "%2f") {
-					slashIdx = i
-					break
-				}
-			}
-			auth := rest[:slashIdx]
-			pathPart := rest[slashIdx:]
-			lastAtEnd := -1
-			for i := 0; i < len(auth); i++ {
-				if auth[i] == '@' {
-					lastAtEnd = i + 1
-				} else if hasPrefixFoldASCII(auth[i:], "%40") {
-					lastAtEnd = i + 3
-				}
-			}
-			if lastAtEnd >= 0 {
-				raw = raw[:sepIdx] + auth[lastAtEnd:] + pathPart
-			}
-		}
-		return raw
-	}
-
-	if kind == urlSepJSONSlash {
-		raw = cutEarliestFold(raw, "#", "?", `\u003f`, `\u0023`)
-		if idx := strings.Index(raw, `:\/\/`); idx >= 0 {
-			rest := raw[idx+5:]
-			slash := strings.Index(rest, `\/`)
-			auth := rest
-			pathPart := ""
-			if slash >= 0 {
-				auth = rest[:slash]
-				pathPart = rest[slash:]
-			}
-			if semi := strings.IndexByte(pathPart, ';'); semi >= 0 {
-				pathPart = pathPart[:semi]
-			}
-			if at := strings.LastIndexByte(auth, '@'); at >= 0 {
-				raw = raw[:idx+5] + auth[at+1:] + pathPart
-			} else {
-				raw = raw[:idx+5] + auth + pathPart
-			}
-		}
-		return raw
-	}
-
-	// Plain `scheme://...` or protocol-relative `//...`:
-	// Before stripping `?`/`#`, check if `?`/`#`/`/` is actually inside unescaped userinfo (`user:pa?ss@host/p` or `user:pa/ss@host/p`).
-	sepEnd := -1
-	if kind == urlSepProtoRel && strings.HasPrefix(raw, "//") {
-		sepEnd = 2
-	} else if idx := strings.Index(raw, "://"); idx >= 0 {
-		sepEnd = idx + 3
-	}
-	if sepEnd >= 0 {
-		rest := raw[sepEnd:]
-		delim := strings.IndexAny(rest, "/?#")
-		head := rest
-		if delim >= 0 {
-			head = rest[:delim]
-		}
-		if strings.IndexByte(head, '@') < 0 && !strings.HasPrefix(head, "[") {
-			if colon := strings.IndexByte(head, ':'); colon >= 0 && !isAllDigitsASCII(head[colon+1:]) {
-				// `head` has `user:non-numeric-password...`, so a later `@host` is the authority boundary!
-				if lastAt := strings.LastIndexByte(rest, '@'); lastAt >= 0 {
-					raw = raw[:sepEnd] + rest[lastAt+1:]
-				}
-			}
-		}
-	}
-
-	if idx := strings.IndexByte(raw, '#'); idx >= 0 {
-		raw = raw[:idx]
-	}
-	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
-		raw = raw[:idx]
-	}
-	if idx := strings.Index(raw, `\u003f`); idx >= 0 {
-		raw = raw[:idx]
-	}
-	if idx := strings.Index(raw, `\u003F`); idx >= 0 {
-		raw = raw[:idx]
-	}
-
-	if sepEnd >= 0 && sepEnd <= len(raw) {
-		rest := raw[sepEnd:]
-		slash := strings.IndexByte(rest, '/')
-		auth := rest
-		pathPart := ""
-		if slash >= 0 {
-			auth = rest[:slash]
-			pathPart = rest[slash:]
-		}
-		if at := strings.LastIndexByte(auth, '@'); at >= 0 {
-			auth = auth[at+1:]
-		}
-		pathPart = scrubPathMatrixAndResetTokens(pathPart)
-		raw = raw[:sepEnd] + auth + pathPart
-	}
-	return raw
-}
-
-func looksLikeSecretTokenValue(tok string) bool {
-	if len(tok) < 6 {
-		return false
-	}
-	hasDigit := false
-	hasUpper := false
-	hasSym := false
-	for i := 0; i < len(tok); i++ {
-		c := tok[i]
-		switch {
-		case c >= '0' && c <= '9':
-			hasDigit = true
-		case c >= 'A' && c <= 'Z':
-			hasUpper = true
-		case c == '-' || c == '_' || c == '.' || c == '/' || c == '+':
-			hasSym = true
-		}
-	}
-	return hasDigit || (hasUpper && hasSym) || len(tok) >= 20
-}
-
-func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
-	sawQuery := false
-	j := start
-	for j < len(s) {
-		c := s[j]
-		if c == '?' || c == '#' || c == ';' {
-			sawQuery = true
-			j++
-			continue
-		}
-		if kind == urlSepPctEncoded && (hasPrefixFoldASCII(s[j:], "%3f") || hasPrefixFoldASCII(s[j:], "%23") || hasPrefixFoldASCII(s[j:], "%3b")) {
-			sawQuery = true
-			j += 3
-			continue
-		}
-		if c == '\r' || c == '\n' || c == '<' || c == '>' || c == '\'' {
-			break
-		}
-		// Unicode NEL (C2 85) and LS/PS (E2 80 A8 / E2 80 A9) terminate unquoted tokens.
-		if c == 0xc2 && j+1 < len(s) && s[j+1] == 0x85 {
-			break
-		}
-		if c == 0xe2 && j+2 < len(s) && s[j+1] == 0x80 && (s[j+2] == 0xa8 || s[j+2] == 0xa9) {
-			break
-		}
-		if kind == urlSepJSONSlash && c == '\\' && j+1 < len(s) && s[j+1] == '/' {
-			j += 2
-			continue
-		}
-		if !sawQuery && (c == '"' || c == '\\') {
-			break
-		}
-		if c == ' ' || c == '\t' {
-			if sawQuery {
-				k := j + 1
-				for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
-					k++
-				}
-				tokEnd := k
-				for tokEnd < len(s) && s[tokEnd] != ' ' && s[tokEnd] != '\t' && s[tokEnd] != '\r' && s[tokEnd] != '\n' {
-					tokEnd++
-				}
-				tok := s[k:tokEnd]
-				if tok != "" {
-					if nextKind, _ := matchURLSchemeAt(s, k); nextKind == urlSepNone && !strings.Contains(tok, "://") &&
-						(strings.IndexByte(tok, '=') >= 0 || strings.IndexByte(tok, '&') >= 0) {
-						j = tokEnd
-						continue
-					}
-				}
-			}
-			break
-		}
-		j++
-	}
-	// Trim trailing sentence punctuation (e.g. `,` in `http://[::1]:8080/p?k=SECRET, http://...`).
-	for j > start {
-		last := s[j-1]
-		if last == ',' || last == '.' {
-			j--
-			continue
-		}
-		break
-	}
-	return j
-}
-
-// RedactEmbeddedURLs scrubs query strings (`?...`), `#fragments`, matrix parameters (`;...`), `user:pass@` credentials,
-// reset path tokens, and inline bearer/token secrets from URLs embedded inside error or `Result.Problem` strings in a
-// single linear O(N) pass (handling `http`, `https`, `ws`, `wss`, `ftp`, JSON-escaped `\/`, `%3A%2F%2F`, multi-nested
-// escaped quotes, and truncated unterminated quotes).
+// RedactEmbeddedURLs delegates to `politeness.RedactEmbeddedURLs` so crawl logs, `Result.Problem`, and OTel spans
+// share 100% identical linear-time URL and credential redaction.
 func RedactEmbeddedURLs(s string) string {
-	if s == "" {
-		return ""
-	}
-	needsCheck := false
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case ':', '/', '%', 't', 'T', 'b', 'B':
-			needsCheck = true
-		}
-		if needsCheck {
-			break
-		}
-	}
-	if !needsCheck {
-		return s
-	}
-
-	var out strings.Builder
-	copiedUpTo := 0
-	i := 0
-	for i < len(s) {
-		kind, afterSep := matchURLSchemeAt(s, i)
-		if kind != urlSepNone {
-			endIdx := afterSep
-			if i > 0 && s[i-1] == '"' {
-				openBS := countPrecedingBackslashes(s, i-1)
-				// Power-of-two modulus for recursive %q / JSON quote escaping (`openBS` in {0, 1, 3, 7, ...}).
-				step := (openBS + 1) * 2
-				foundClose := false
-				for j := afterSep; j < len(s); j++ {
-					if s[j] == '"' {
-						bs := countPrecedingBackslashes(s, j)
-						if (openBS == 0 && bs%2 == 0) || (openBS > 0 && bs >= openBS && bs%step == openBS) {
-							endIdx = j - openBS
-							foundClose = true
-							break
-						}
-					}
-				}
-				if !foundClose {
-					endIdx = len(s)
-				}
-			} else if i > 0 && s[i-1] == '\'' {
-				foundClose := false
-				for j := afterSep; j < len(s); j++ {
-					if s[j] == '\'' && countPrecedingBackslashes(s, j)%2 == 0 {
-						endIdx = j
-						foundClose = true
-						break
-					}
-				}
-				if !foundClose {
-					endIdx = len(s)
-				}
-			} else {
-				endIdx = findUnquotedURLEnd(s, afterSep, kind)
-			}
-
-			if endIdx < afterSep {
-				endIdx = afterSep
-			}
-			scrubbed := scrubMatchedURL(s[i:endIdx], kind)
-			if scrubbed != s[i:endIdx] || out.Cap() > 0 {
-				if out.Cap() == 0 {
-					out.Grow(len(s))
-				}
-				out.WriteString(s[copiedUpTo:i])
-				out.WriteString(scrubbed)
-				copiedUpTo = endIdx
-			}
-			i = endIdx
-			continue
-		}
-
-		// Redact inline "Bearer <secret>" / "token <secret>" fragments outside URLs.
-		c0 := asciiLower(s[i])
-		if (c0 == 't' || c0 == 'b') && (i == 0 || !((asciiLower(s[i-1]) >= 'a' && asciiLower(s[i-1]) <= 'z') || (s[i-1] >= '0' && s[i-1] <= '9'))) {
-			kwLen := 0
-			if hasPrefixFoldASCII(s[i:], "token") {
-				kwLen = 5
-			} else if hasPrefixFoldASCII(s[i:], "bearer") {
-				kwLen = 6
-			}
-			if kwLen > 0 && i+kwLen < len(s) && (s[i+kwLen] == ' ' || s[i+kwLen] == '=' || s[i+kwLen] == ':') {
-				valStart := i + kwLen + 1
-				for valStart < len(s) && s[valStart] == ' ' {
-					valStart++
-				}
-				valEnd := valStart
-				for valEnd < len(s) && s[valEnd] != ' ' && s[valEnd] != '\t' && s[valEnd] != '\r' && s[valEnd] != '\n' &&
-					s[valEnd] != '"' && s[valEnd] != '\'' && s[valEnd] != ',' && s[valEnd] != ';' && s[valEnd] != ')' {
-					valEnd++
-				}
-				if looksLikeSecretTokenValue(s[valStart:valEnd]) {
-					if out.Cap() == 0 {
-						out.Grow(len(s))
-					}
-					out.WriteString(s[copiedUpTo:valStart])
-					out.WriteString("[REDACTED]")
-					copiedUpTo = valEnd
-					i = valEnd
-					continue
-				}
-			}
-		}
-		i++
-	}
-	if copiedUpTo == 0 {
-		return s
-	}
-	out.WriteString(s[copiedUpTo:])
-	return out.String()
+	return politeness.RedactEmbeddedURLs(s)
 }
 
 func redactURLForLog(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return scrubSingleURLToken(raw)
-	}
-	u.RawQuery = ""
-	u.Fragment = ""
-	u.User = nil
-	u.Path = scrubPathMatrixAndResetTokens(u.Path)
-	u.RawPath = ""
-	return u.String()
+	return politeness.SanitizeURL(raw)
 }
 
 func resolveMaxStreamingPDFBytes(opts Options) int {
@@ -1791,7 +1395,7 @@ func resolveMaxStreamingPDFBytes(opts Options) int {
 func (c *Crawler) logResult(ctx context.Context, log *slog.Logger, r Request, res Result) {
 	level := slog.LevelInfo
 	switch res.Outcome {
-	case classify.OutcomeChallenge, classify.OutcomeStop, classify.OutcomeRateLimited, classify.OutcomePaymentRequired:
+	case classify.OutcomeChallenge, classify.OutcomeStop, classify.OutcomeRateLimited, classify.OutcomePaymentRequired, classify.OutcomeBlockedSSRF:
 		level = slog.LevelWarn
 	case classify.OutcomeError:
 		level = slog.LevelError
@@ -2032,21 +1636,53 @@ func parseRobotsCacheTTL(header http.Header) time.Duration {
 	return politeness.RobotsCacheTTL
 }
 
+type robotsCheckResult struct {
+	allowed     bool
+	distressed  bool
+	dnsNotFound bool
+	ssrfBlocked bool
+	fetched     bool
+	reason      string
+}
+
 func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, rawURL string) (allowed, distressed, fetched bool, reason string) {
+	r := c.checkRobotsDetailed(ctx, hs, rawURL)
+	return r.allowed, r.distressed, r.fetched, r.reason
+}
+
+func (c *Crawler) checkRobotsDetailed(ctx context.Context, hs *politeness.HostState, rawURL string) robotsCheckResult {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return false, false, false, err.Error()
+		return robotsCheckResult{reason: RedactEmbeddedURLs(err.Error())}
 	}
 	now := c.Now()
 	entry := hs.CachedRobots(now)
+	fetched := false
 	if entry == nil {
 		if ctx.Err() != nil {
-			return false, true, false, "robots_unreachable: caller context cancelled before /robots.txt fetch: " + ctx.Err().Error()
+			return robotsCheckResult{
+				distressed: true,
+				reason:     "robots_unreachable: caller context cancelled before /robots.txt fetch: " + RedactEmbeddedURLs(ctx.Err().Error()),
+			}
 		}
 		var pause time.Duration
 		entry, pause = c.fetchRobots(ctx, u)
 		hs.SetRobots(c.Now(), entry, pause)
 		fetched = true
+	}
+	if entry.DNSNotFound {
+		return robotsCheckResult{
+			dnsNotFound: true,
+			fetched:     fetched,
+			reason:      "domain does not exist (DNS NXDOMAIN)",
+		}
+	}
+	if entry.SSRFBlocked {
+		return robotsCheckResult{
+			ssrfBlocked: true,
+			fetched:     fetched,
+			reason:      "blocked by SSRF policy: non-public target address",
+		}
 	}
 	if entry.Distressed {
 		msg := entry.Reason
@@ -2055,31 +1691,46 @@ func (c *Crawler) checkRobots(ctx context.Context, hs *politeness.HostState, raw
 		} else if !strings.HasPrefix(msg, "robots_unreachable: ") {
 			msg = "robots_unreachable: " + msg
 		}
-		return false, true, fetched, msg
+		return robotsCheckResult{
+			distressed: true,
+			fetched:    fetched,
+			reason:     RedactEmbeddedURLs(msg),
+		}
 	}
 	if !entry.Allowed(u.RequestURI()) {
 		if entry.ContentSignalBlocked() {
-			return false, false, fetched, "disallowed by /robots.txt Content-Signal: ai-input=no"
+			return robotsCheckResult{
+				fetched: fetched,
+				reason:  "disallowed by /robots.txt Content-Signal: ai-input=no",
+			}
 		}
-		return false, false, fetched, "robots.txt disallowed " + u.Path
+		return robotsCheckResult{
+			fetched: fetched,
+			reason:  "robots.txt disallowed " + u.Path,
+		}
 	}
-	return true, false, fetched, ""
+	return robotsCheckResult{allowed: true, fetched: fetched}
 }
 
 // fetchRobots implements RFC 9309 §2.3.1 & §2.4 (following up to MaxRedirects = 5 validated redirects):
 //   - 3xx (up to 5 consecutive public redirects): validate Location via `c.allow` and follow; > 5 valid redirects -> unavailable (allow all).
 //   - 2xx: parse rules and cache for Cache-Control max-age clamped to [60s, RobotsCacheTTL (24h)].
 //   - 4xx except 429 (e.g. 404, 403, 410): "unavailable" -> allow all for clamped Cache-Control max-age / RobotsCacheTTL (24h).
+//   - NXDOMAIN (`IsNotFound` / `"no such host"` without timeout): `DNSNotFound: true` -> `"dns_not_found"` (never `robots_unreachable`).
 //   - Network/timeout error, SSRF redirect failure, body read error, 429, or 5xx: "unreachable" -> disallow all for RobotsDistressTTL (60s).
 func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness.RobotsEntry, time.Duration) {
 	if ctx.Err() != nil {
 		return &politeness.RobotsEntry{
 			Distressed: true,
-			Reason:     "robots_unreachable: caller context cancelled: " + ctx.Err().Error(),
+			Reason:     "robots_unreachable: caller context cancelled: " + RedactEmbeddedURLs(ctx.Err().Error()),
 			ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 		}, 0
 	}
-	robotsCtx, cancelAll := context.WithTimeout(context.WithoutCancel(ctx), politeness.RobotsTimeout)
+	robTimeout := politeness.RobotsTimeout
+	if robTimeout <= 0 || robTimeout > politeness.MaxRobotsFetchTimeout {
+		robTimeout = politeness.MaxRobotsFetchTimeout
+	}
+	robotsCtx, cancelAll := context.WithTimeout(context.WithoutCancel(ctx), robTimeout)
 	defer cancelAll()
 	curURL := &url.URL{Scheme: target.Scheme, Host: target.Host, Path: "/robots.txt"}
 
@@ -2088,7 +1739,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			if err := c.allow(curURL); err != nil {
 				return &politeness.RobotsEntry{
 					Distressed: true,
-					Reason:     "robots_unreachable: robots.txt disallowed redirect target: " + err.Error(),
+					Reason:     "robots_unreachable: robots.txt disallowed redirect target: " + RedactEmbeddedURLs(err.Error()),
 					ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 				}, politeness.DefaultThrottlePause
 			}
@@ -2101,7 +1752,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			if reqErr != nil {
 				return &politeness.RobotsEntry{
 					Distressed: true,
-					Reason:     "robots_unreachable: robots.txt request invalid: " + reqErr.Error(),
+					Reason:     "robots_unreachable: robots.txt request invalid: " + RedactEmbeddedURLs(reqErr.Error()),
 					ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 				}, politeness.DefaultThrottlePause
 			}
@@ -2121,13 +1772,29 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			}
 		}
 		if err != nil {
+			if isDNSNotFoundError(err) {
+				return &politeness.RobotsEntry{
+					Distressed:  true,
+					DNSNotFound: true,
+					Reason:      "domain does not exist (DNS NXDOMAIN)",
+					ExpiresAt:   c.Now().Add(politeness.RobotsDistressTTL),
+				}, 0
+			}
+			if hop == 0 && isSSRFBlockError(err) {
+				return &politeness.RobotsEntry{
+					Distressed:  true,
+					SSRFBlocked: true,
+					Reason:      "blocked by SSRF policy: non-public target address",
+					ExpiresAt:   c.Now().Add(politeness.RobotsDistressTTL),
+				}, 0
+			}
 			prefixMsg := "robots_unreachable: robots.txt unreachable (disallow assumed per RFC 9309): "
 			if errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") {
 				prefixMsg = "robots_unreachable: timed out fetching /robots.txt (disallow assumed per RFC 9309): "
 			}
 			return &politeness.RobotsEntry{
 				Distressed: true,
-				Reason:     prefixMsg + err.Error(),
+				Reason:     prefixMsg + RedactEmbeddedURLs(err.Error()),
 				ExpiresAt:  c.Now().Add(politeness.RobotsDistressTTL),
 			}, politeness.DefaultThrottlePause
 		}
@@ -2148,7 +1815,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			if parseErr != nil {
 				return &politeness.RobotsEntry{
 					Distressed: true,
-					Reason:     "robots_unreachable: robots.txt invalid redirect Location: " + parseErr.Error(),
+					Reason:     "robots_unreachable: robots.txt invalid redirect Location: " + RedactEmbeddedURLs(parseErr.Error()),
 					ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 				}, politeness.DefaultThrottlePause
 			}
@@ -2157,7 +1824,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 				if err := c.allow(nextURL); err != nil {
 					return &politeness.RobotsEntry{
 						Distressed: true,
-						Reason:     "robots_unreachable: robots.txt disallowed redirect target: " + err.Error(),
+						Reason:     "robots_unreachable: robots.txt disallowed redirect target: " + RedactEmbeddedURLs(err.Error()),
 						ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 					}, politeness.DefaultThrottlePause
 				}
@@ -2200,7 +1867,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 		if err != nil {
 			return &politeness.RobotsEntry{
 				Distressed: true,
-				Reason:     "robots_unreachable: /robots.txt read failed (disallow assumed per RFC 9309): " + err.Error(),
+				Reason:     "robots_unreachable: /robots.txt read failed (disallow assumed per RFC 9309): " + RedactEmbeddedURLs(err.Error()),
 				ExpiresAt:  now.Add(politeness.RobotsDistressTTL),
 			}, politeness.DefaultThrottlePause
 		}

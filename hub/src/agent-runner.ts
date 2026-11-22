@@ -19,10 +19,13 @@ import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
   executeFederatedMcpQuery,
   matchConnectedMcpsForContext,
+  sanitizeMcpMarkdownOutput,
+  sanitizeRemoteMcpText,
   tryScrapeViaConnectedMcp,
   type QueryMcpCallInput,
 } from './mcp-federation';
 import { resolveCallerUserId, type McpVaultStore, type StoredMcpServerRow } from './mcp-vault';
+import { getActiveCallerAuthContext } from './oauth';
 import {
   completeLlmTurn,
   extractJsonWithOptionalLlm,
@@ -720,11 +723,26 @@ export async function startOrExecuteAgentCall(params: {
   const agentId = `agt_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const threadId = priorThread?.threadId ?? (requestedThreadId && priorThread ? requestedThreadId : agentId);
 
+  const activeAuth = getActiveCallerAuthContext();
+  const canInvokeFederatedMcp =
+    !activeAuth || !activeAuth.principal.startsWith('oauth:') || activeAuth.scopes.includes('mcp:call');
+  const preferMcpRequested = payload.preferMcp === true;
+  const allowlistedMcpSlugs = Array.isArray(payload.mcpServers)
+    ? new Set(
+        payload.mcpServers
+          .filter((s): s is string => typeof s === 'string' && /^[a-z0-9_-]{1,48}$/i.test(s.trim()))
+          .map((s) => s.trim().toLowerCase()),
+      )
+    : null;
+
   // Tier-1 MCP-First Domain Router + Tier-2 `<1 ms` BM25 Keyless Adapter Router
   const routerStart = Date.now();
-  const userConnectedMcps = vaultStore
-    ? (await vaultStore.listServers(effectiveUserId)).filter((s) => s.enabled)
-    : [];
+  const userConnectedMcps =
+    vaultStore && canInvokeFederatedMcp
+      ? (await vaultStore.listServers(effectiveUserId)).filter(
+          (s) => s.enabled && (!allowlistedMcpSlugs || allowlistedMcpSlugs.has(s.slug.toLowerCase())),
+        )
+      : [];
   const matchedMcps = matchConnectedMcpsForContext({
     servers: userConnectedMcps,
     query: prompt,
@@ -1183,6 +1201,12 @@ export async function startOrExecuteAgentCall(params: {
       if (toolName === 'query_mcp' && vaultStore) {
         return withToolSpan(async (toolSpan) => {
           const actionRaw = typeof args.action === 'string' ? args.action : 'call_tool';
+          if (actionRaw === 'call_tool' && !canInvokeFederatedMcp) {
+            return {
+              ok: false,
+              summaryForLlm: JSON.stringify({ error: 'insufficient_scope', message: 'OAuth scope mcp:call is required to invoke connected MCP tools.' }),
+            };
+          }
           const qInput: QueryMcpCallInput = {
             action:
               actionRaw === 'list_connected' || actionRaw === 'list_tools' || actionRaw === 'call_tool'
@@ -1207,12 +1231,14 @@ export async function startOrExecuteAgentCall(params: {
           record.visibility = 'private';
           record.userId = effectiveUserId;
 
-          const srvSlug = typeof mOut.body.server === 'string' ? mOut.body.server : String(args.server ?? 'mcp');
+          const srvSlugRaw = typeof mOut.body.server === 'string' ? mOut.body.server : String(args.server ?? 'mcp');
+          const srvSlug = srvSlugRaw.replace(/[^a-z0-9_-]/gi, '').slice(0, 48) || 'mcp';
           const toolCalled = typeof mOut.body.tool === 'string' ? mOut.body.tool : undefined;
-          const mdText =
+          const rawMdText =
             typeof mOut.body.markdown === 'string' && mOut.body.markdown
               ? mOut.body.markdown
               : JSON.stringify(mOut.body, null, 2);
+          const sanitizedMcpMd = sanitizeMcpMarkdownOutput(sanitizeRemoteMcpText(rawMdText).text);
 
           toolSpan?.setAttribute('mcp.server', srvSlug);
           if (toolCalled) toolSpan?.setAttribute('mcp.tool', toolCalled);
@@ -1225,14 +1251,14 @@ export async function startOrExecuteAgentCall(params: {
                 : `https://${srvSlug}.mcp.local`;
             addSource(
               originUrl,
-              `${String(mOut.body.serverName ?? srvSlug)}${toolCalled ? ` (${toolCalled})` : ''}`,
+              `${srvSlug}${toolCalled ? ` (${toolCalled})` : ''}`,
               `mcp:${srvSlug}`,
               `mcp:${srvSlug}`,
             );
             gatheredEvidence.push({
               url: originUrl,
-              title: `${String(mOut.body.serverName ?? srvSlug)}${toolCalled ? ` — ${toolCalled}` : ''}`,
-              markdown: mdText.slice(0, 12_000),
+              title: `${srvSlug}${toolCalled ? ` — ${toolCalled}` : ''}`,
+              markdown: sanitizedMcpMd.slice(0, 12_000),
               ...(mOut.body.structuredContent &&
               typeof mOut.body.structuredContent === 'object' &&
               !Array.isArray(mOut.body.structuredContent)
@@ -1248,12 +1274,14 @@ export async function startOrExecuteAgentCall(params: {
             startedAt: t0,
             durationMs: Date.now() - t0,
             input: { action: qInput.action, server: qInput.server, tool: qInput.tool },
-            outputPreview: { status: mOut.status, server: srvSlug, tool: toolCalled, chars: mdText.length },
+            outputPreview: { status: mOut.status, server: srvSlug, tool: toolCalled, chars: sanitizedMcpMd.length },
           });
 
+          // Wrap federated MCP tool output in an explicit untrusted-data boundary envelope for the LLM!
+          const boundedEnvelope = `<untrusted_mcp_tool_output server="${srvSlug}"${toolCalled ? ` tool="${toolCalled.replace(/[^A-Za-z0-9_.:-]/g, '')}"` : ''}>\n${sanitizedMcpMd.slice(0, 7_600)}\n</untrusted_mcp_tool_output>`;
           return {
             ok: mOut.status === 200,
-            summaryForLlm: mdText.slice(0, 8_000),
+            summaryForLlm: boundedEnvelope,
           };
         });
       }
@@ -1272,12 +1300,13 @@ export async function startOrExecuteAgentCall(params: {
       record.pagesRead++;
 
       return withToolSpan(async (toolSpan) => {
-        // Tier-1 MCP-First Domain Check before HTML scraping
-        if (vaultStore && userConnectedMcps.length > 0) {
+        // Tier-1 MCP-First Domain Check before HTML scraping (opt-in via `preferMcp` or `autoRouteScrape`)
+        if (vaultStore && userConnectedMcps.length > 0 && canInvokeFederatedMcp) {
           const mcpDirect = await tryScrapeViaConnectedMcp({
             userId: effectiveUserId,
             targetUrl,
             ...(typeof args.query === 'string' && args.query.trim() ? { query: args.query.trim() } : {}),
+            preferMcp: preferMcpRequested,
             vaultStore,
             vaultMasterKey: env.VAULT_MASTER_KEY,
             fetchFn: env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch,
@@ -1306,7 +1335,7 @@ export async function startOrExecuteAgentCall(params: {
             });
             return {
               ok: true,
-              summaryForLlm: `URL: ${targetUrl}\nVia: ${mcpDirect.via}\n\n${mcpMd.slice(0, 6_500)}`,
+              summaryForLlm: `<untrusted_mcp_tool_output url="${targetUrl}" via="${mcpDirect.via}">\n${mcpMd.slice(0, 6_500)}\n</untrusted_mcp_tool_output>`,
             };
           }
         }
@@ -1382,25 +1411,37 @@ export async function startOrExecuteAgentCall(params: {
 
       if (llmConfig) {
         // ── Autonomous Multi-Step BYO-LLM Agent Loop ──
+        // H3: Never interpolate raw untrusted downstream JSON or descriptions into `/v1/agent` system prompts!
+        // Emit ONLY regex-verified identifiers (`slug`, `domains`, `tool.name`, and safe `propKeys`).
+        const SAFE_SLUG_ID_RE = /^[a-z0-9_-]{1,48}$/;
+        const SAFE_TOOL_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+        const SAFE_PROP_ID_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+        const SAFE_DOM_ID_RE = /^[a-z0-9.-]{1,128}$/;
+
         const connectedMcpHints = (matchedMcps.length > 0 ? matchedMcps.map((m) => m.server) : userConnectedMcps.map((s) => ({
           slug: s.slug,
-          name: s.name,
           domains: s.domains,
           tools: s.cachedTools,
         })))
           .slice(0, 8)
+          .filter((srv) => SAFE_SLUG_ID_RE.test(srv.slug))
           .map((srv) => {
+            const safeDoms = (srv.domains ?? []).filter((d) => SAFE_DOM_ID_RE.test(d)).slice(0, 8);
             const toolList = (srv.tools ?? [])
               .slice(0, 10)
+              .filter((t) => SAFE_TOOL_ID_RE.test(t.name))
               .map((t) => {
                 const propKeys =
                   t.inputSchema?.properties && typeof t.inputSchema.properties === 'object'
-                    ? Object.keys(t.inputSchema.properties as Record<string, unknown>).slice(0, 6).join(', ')
+                    ? Object.keys(t.inputSchema.properties as Record<string, unknown>)
+                        .filter((k) => SAFE_PROP_ID_RE.test(k))
+                        .slice(0, 6)
+                        .join(', ')
                     : '';
-                return `${t.name}(${propKeys})${t.description ? `: ${t.description.slice(0, 100)}` : ''}`;
+                return `${t.name}(${propKeys})`;
               })
               .join('; ');
-            return `- server="${srv.slug}" (${srv.name}) [domains: ${srv.domains.join(', ') || 'n/a'}] -> tools: ${toolList || 'call query_mcp(action="list_tools")'}`;
+            return `- server="${srv.slug}" [domains: ${safeDoms.join(', ') || 'n/a'}] -> tools: ${toolList || 'call query_mcp(action="list_tools")'}`;
           })
           .join('\n');
 
@@ -1621,30 +1662,35 @@ export async function startOrExecuteAgentCall(params: {
         // ── Zero-Key Deterministic Research Mode (works offline with 0 LLM keys configured!) ──
         record.stepsUsed = 1;
 
-        // Tier-1 MCP-First Routing in deterministic mode when a connected MCP matches the prompt/URLs!
-        for (const matched of matchedMcps.slice(0, 2)) {
-          if (isCancelled()) break;
-          const mcpTool = matched.server.tools.find((t) => {
-            if (t.readOnlyHint === false) return false;
-            return true;
-          });
-          if (mcpTool) {
-            const props =
-              mcpTool.inputSchema?.properties && typeof mcpTool.inputSchema.properties === 'object'
-                ? (mcpTool.inputSchema.properties as Record<string, unknown>)
-                : {};
-            const autoArgs: Record<string, unknown> = {};
-            if ('url' in props && seedUrls[0]) autoArgs.url = seedUrls[0];
-            else if ('uri' in props && seedUrls[0]) autoArgs.uri = seedUrls[0];
-            if ('query' in props) autoArgs.query = prompt;
-            else if ('q' in props) autoArgs.q = prompt;
-            else if ('search' in props) autoArgs.search = prompt;
-            await executeSingleTool('query_mcp', {
-              action: 'call_tool',
-              server: matched.server.slug,
-              tool: mcpTool.name,
-              arguments: autoArgs,
-            });
+        // Keyless/heuristic `/v1/agent` safety: NEVER auto-invoke connected MCP tools unless explicitly opted in
+        // (`preferMcp === true` or explicit `mcpServers` allowlist) AND `tool.readOnlyHint === true && tool.destructiveHint !== true`!
+        const allowKeylessMcpAutoCall =
+          canInvokeFederatedMcp && (preferMcpRequested || (allowlistedMcpSlugs !== null && allowlistedMcpSlugs.size > 0));
+        if (allowKeylessMcpAutoCall) {
+          for (const matched of matchedMcps.slice(0, 2)) {
+            if (isCancelled()) break;
+            if (allowlistedMcpSlugs && !allowlistedMcpSlugs.has(matched.server.slug.toLowerCase())) continue;
+            const mcpTool = matched.server.tools.find(
+              (t) => t.readOnlyHint === true && t.destructiveHint !== true,
+            );
+            if (mcpTool) {
+              const props =
+                mcpTool.inputSchema?.properties && typeof mcpTool.inputSchema.properties === 'object'
+                  ? (mcpTool.inputSchema.properties as Record<string, unknown>)
+                  : {};
+              const autoArgs: Record<string, unknown> = {};
+              if ('url' in props && seedUrls[0]) autoArgs.url = seedUrls[0];
+              else if ('uri' in props && seedUrls[0]) autoArgs.uri = seedUrls[0];
+              if ('query' in props) autoArgs.query = prompt;
+              else if ('q' in props) autoArgs.q = prompt;
+              else if ('search' in props) autoArgs.search = prompt;
+              await executeSingleTool('query_mcp', {
+                action: 'call_tool',
+                server: matched.server.slug,
+                tool: mcpTool.name,
+                arguments: autoArgs,
+              });
+            }
           }
         }
 

@@ -34,7 +34,84 @@ const VALID_CATEGORIES = new Set([
 const FORBIDDEN_BROAD_SUFFIXES = new Set([
   'com', 'org', 'net', 'io', 'gov', 'edu', 'mil', 'int',
   'uk', 'de', 'fr', 'jp', 'au', 'ca', 'us', 'eu', 'ai', 'co', 'app', 'dev',
-  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'com.au', 'org.au', 'gov.au', 'co.jp', 'com.br',
+  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'me.uk', 'net.uk', 'plc.uk', 'ltd.uk', 'sch.uk',
+  'com.au', 'org.au', 'gov.au', 'edu.au', 'net.au', 'asn.au', 'id.au',
+  'co.jp', 'or.jp', 'ne.jp', 'ac.jp', 'ad.jp', 'ed.jp', 'go.jp', 'gr.jp', 'lg.jp',
+  'com.br', 'org.br', 'gov.br', 'edu.br', 'net.br', 'mil.br',
+  'co.nz', 'org.nz', 'govt.nz', 'ac.nz', 'net.nz',
+  'co.za', 'org.za', 'gov.za', 'ac.za', 'net.za',
+  'co.in', 'org.in', 'gov.in', 'ac.in', 'net.in', 'res.in', 'edu.in',
+  'com.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn', 'net.cn',
+  'com.sg', 'org.sg', 'gov.sg', 'edu.sg', 'net.sg',
+  'com.hk', 'org.hk', 'gov.hk', 'edu.hk', 'net.hk',
+  'com.tw', 'org.tw', 'gov.tw', 'edu.tw', 'net.tw',
+  'co.kr', 'or.kr', 'go.kr', 'ac.kr', 'ne.kr',
+  'com.mx', 'org.mx', 'gob.mx', 'edu.mx', 'net.mx',
+  'com.ar', 'org.ar', 'gob.ar', 'gov.ar', 'edu.ar',
+  'com.tr', 'org.tr', 'gov.tr', 'edu.tr',
+  'co.il', 'org.il', 'gov.il', 'ac.il',
+  'co.id', 'or.id', 'go.id', 'ac.id',
+  'com.my', 'org.my', 'gov.my', 'edu.my',
+  'com.ph', 'org.ph', 'gov.ph', 'edu.ph',
+  'com.vn', 'org.vn', 'gov.vn', 'edu.vn',
+  'co.th', 'or.th', 'go.th', 'ac.th',
+  // Shared multi-tenant PaaS / static-hosting public suffixes (PSL private section)
+  'github.io', 'gitlab.io', 'bitbucket.io', 'pages.dev', 'workers.dev', 'cloudflarepages.com', 'r2.dev',
+  'vercel.app', 'now.sh', 'netlify.app', 'herokuapp.com', 'herokudns.com', 'fly.dev', 'onrender.com',
+  'railway.app', 'surge.sh', 'web.app', 'firebaseapp.com', 'appspot.com', 'cloudfunctions.net', 'run.app',
+  'amazonaws.com', 'cloudfront.net', 'azurewebsites.net', 'azurestaticapps.net', 'trafficmanager.net',
+  'blogspot.com', 'wordpress.com', 'substack.com', 'ghost.io', 'ngrok.io', 'ngrok-free.app', 'trycloudflare.com',
+]);
+
+const MULTI_PART_PSL_SLD_RE =
+  /^(?:co|com|org|net|gov|edu|ac|mil|or|ne|go|lg|gob|gouv|govt|nic|nom|sch|asn|id|med|res|jus|leg|ind)\.[a-z]{2,3}$/;
+const US_CA_STATE_PSL_RE = /^[a-z]{2}\.(?:us|ca|gov|edu)$/;
+
+function isForbiddenPublicOrHostingSuffix(rest) {
+  if (!rest || !rest.includes('.')) return true;
+  if (FORBIDDEN_BROAD_SUFFIXES.has(rest)) return true;
+  if (MULTI_PART_PSL_SLD_RE.test(rest) || US_CA_STATE_PSL_RE.test(rest)) return true;
+  for (const hs of [
+    '.amazonaws.com', '.cloudfront.net', '.azurewebsites.net', '.herokuapp.com',
+    '.pages.dev', '.workers.dev', '.github.io', '.gitlab.io', '.vercel.app', '.netlify.app',
+  ]) {
+    if (rest.endsWith(hs)) return true;
+  }
+  return false;
+}
+
+/**
+ * Explicit allowlist of vetted multi-tenant platform wildcard patterns permitted in compiled manifests.
+ * No new manifest may claim an arbitrary wildcard suffix without updating this security-reviewed allowlist.
+ */
+const APPROVED_WILDCARD_DOMAIN_PATTERNS = new Set([
+  '*.arcgis.com',
+  '*.bamboohr.com',
+  '*.breezy.hr',
+  '*.recruitee.com',
+  '*.jobs.personio.de',
+  '*.jobs.personio.com',
+  '*.oraclecloud.com',
+  'gitlab.*',
+  '*.icims.com',
+  '*.applytojob.com',
+  '*.legistar.com',
+  '*.wikipedia.org',
+  '*.openfoodfacts.org',
+  '*.pinpointhq.com',
+  '*.reddit.com',
+  'careers.*.com',
+  'jobs.*.com',
+  '*.myshopify.com',
+  '*.socrata.com',
+  '*.stackexchange.com',
+  '*.teamtailor.com',
+]);
+
+const RESERVED_CORE_ATS_DOMAINS = new Set([
+  'jobs.ashbyhq.com',
+  '*.myworkdayjobs.com',
+  '*.myworkdaysite.com',
 ]);
 
 const SCHEMA_KEYS = {
@@ -340,8 +417,8 @@ function validateManifest(m, fileLabel) {
     }
     if (pat.startsWith('*.')) {
       const rest = pat.slice(2);
-      if (!rest.includes('.') || FORBIDDEN_BROAD_SUFFIXES.has(rest)) {
-        throw new Error(`${fileLabel}: overly broad TLD/eTLD wildcard "${rawPat}" (M2)`);
+      if (isForbiddenPublicOrHostingSuffix(rest)) {
+        throw new Error(`${fileLabel}: overly broad TLD/eTLD/hosting wildcard "${rawPat}" (M2)`);
       }
     }
     if (pat.endsWith('.*')) {
@@ -349,6 +426,12 @@ function validateManifest(m, fileLabel) {
       if (!pre || pre.includes('*') || pre.length < 3) {
         throw new Error(`${fileLabel}: invalid prefix wildcard "${rawPat}" (M2)`);
       }
+    }
+    if (pat.includes('*') && !APPROVED_WILDCARD_DOMAIN_PATTERNS.has(pat)) {
+      throw new Error(`${fileLabel}: unapproved wildcard domain "${rawPat}" — must be explicitly allowlisted in APPROVED_WILDCARD_DOMAIN_PATTERNS`);
+    }
+    if (RESERVED_CORE_ATS_DOMAINS.has(pat)) {
+      throw new Error(`${fileLabel}: domain "${rawPat}" is reserved by a built-in core ATS adapter and cannot be hijacked`);
     }
   }
   if (!Array.isArray(m.exampleUrls) || m.exampleUrls.length === 0 || !m.exampleUrls.every((u) => typeof u === 'string' && u.startsWith('https://'))) {
@@ -412,6 +495,8 @@ if (yamlFiles.length === 0) {
 
 const seenIds = new Set();
 const twinOwnerById = new Map();
+const domainOwnerByPattern = new Map();
+const catalogOwnerByPlatform = new Map();
 const manifests = [];
 
 for (const file of yamlFiles) {
@@ -435,6 +520,24 @@ for (const file of yamlFiles) {
   }
   seenIds.add(obj.id);
 
+  for (const rawDomain of obj.domains) {
+    const normDomain = rawDomain.trim().toLowerCase();
+    const prevDomOwner = domainOwnerByPattern.get(normDomain);
+    if (prevDomOwner && prevDomOwner !== obj.id) {
+      throw new Error(`${file}: domain "${normDomain}" already claimed by manifest "${prevDomOwner}" (cross-manifest collision)`);
+    }
+    domainOwnerByPattern.set(normDomain, obj.id);
+  }
+
+  if (obj.catalog?.platform) {
+    const plat = String(obj.catalog.platform).trim().toLowerCase();
+    const prevCatOwner = catalogOwnerByPlatform.get(plat);
+    if (prevCatOwner && prevCatOwner !== obj.id) {
+      throw new Error(`${file}: catalog platform "${plat}" already claimed by manifest "${prevCatOwner}"`);
+    }
+    catalogOwnerByPlatform.set(plat, obj.id);
+  }
+
   const routes = obj.routes?.length ? obj.routes : obj.match && obj.twin && obj.extract ? [{ twin: obj.twin }] : [];
   for (const r of routes) {
     const tid = r.twin.id || obj.id;
@@ -451,14 +554,14 @@ for (const file of yamlFiles) {
 const canonicalJson = `${JSON.stringify({ version: 2, manifests }, null, 2)}\n`;
 
 if (checkOnly) {
-  const existing = existsSync(outPath) ? readFileSync(outPath, 'utf8') : '';
+  const existing = existsSync(outPath) ? readFileSync(outPath, 'utf8').replace(/\r\n/g, '\n') : '';
   if (existing !== canonicalJson) {
     console.error('internal/extract/manifests/compiled.json is out of date. Run: npm run adapter:compile');
     process.exit(1);
   }
   console.log(`✔ Verified ${manifests.length} declarative YAML manifests match compiled.json.`);
 } else {
-  const existing = existsSync(outPath) ? readFileSync(outPath, 'utf8') : '';
+  const existing = existsSync(outPath) ? readFileSync(outPath, 'utf8').replace(/\r\n/g, '\n') : '';
   if (existing !== canonicalJson) {
     writeFileSync(outPath, canonicalJson, 'utf8');
   }

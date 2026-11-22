@@ -24,28 +24,63 @@ import {
 const INJECTION_PATTERNS: Array<{ id: string; re: RegExp; weight: number }> = [
   {
     id: 'ignore_previous_instructions',
-    re: /\b(?:ignore|disregard|forget|override)[ \t\r\n]{1,20}(?:all[ \t\r\n]{1,20})?(?:previous|prior|above|earlier|system|developer)[ \t\r\n]{1,20}(?:instructions?|prompts?|rules?|directives?|guidelines?)\b/i,
+    re: /\b(?:ignore|disregard|forget|override)\s+(?:(?:all|any|each|every)(?:\s+of)?\s+)?(?:(?:the|your|these|those|my|our)\s+)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)\s+(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)\b/i,
     weight: 3,
   },
   {
     id: 'new_system_role_override',
-    re: /(?:^|\n)[ \t]{0,20}(?:\[?[ \t]{0,10}system[ \t]{0,10}(?:prompt|override|instruction)[ \t]{0,10}\]?|<[ \t]{0,10}system[ \t]{0,10}>|###[ \t]{0,10}system[ \t]{1,10}instruction)[ \t]{0,10}:/i,
+    re: /(?:^|\n)[ \t>]{0,20}(?:\[?[ \t]{0,10}system(?:[ \t]{1,10}(?:prompt|override|instruction|message|role))?[ \t]{0,10}\]?|<[ \t]{0,10}system[ \t]{0,10}>|#{1,6}[ \t]{0,10}system(?:[ \t]{1,10}instruction)?)[ \t]{0,10}:/i,
     weight: 3,
   },
   {
     id: 'exfiltrate_secrets_or_tools',
-    re: /\b(?:send|post|upload|exfiltrate|transmit|forward)[ \t\r\n]{1,20}(?:the[ \t\r\n]{1,20})?(?:api[_\s-]?key|token|secret|password|conversation|system[ \t\r\n]{1,10}prompt|ssh|env)[ \t\r\n]{1,20}(?:to|via)[ \t\r\n]{1,20}https?:\/\//i,
+    re: /\b(?:send|post|upload|exfiltrate|transmit|forward|leak)\s+(?:(?:the|your|all|my|our)\s+)?(?:api[_\s-]?keys?|tokens?|secrets?|passwords?|credentials?|conversation|system\s+prompt|ssh|env)\s+(?:to|via)\s+(?:https?:\/\/|\[[^\]]{1,80}\]\(\s*https?:\/\/|[a-z0-9-]+(?:\.[a-z0-9-]+)+\b|this\b|here\b)/i,
     weight: 4,
   },
   {
     id: 'tool_invocation_hijack',
-    re: /\b(?:immediately[ \t\r\n]{1,20}call|you[ \t\r\n]{1,20}must[ \t\r\n]{1,20}now[ \t\r\n]{1,20}execute|invoke[ \t\r\n]{1,20}the[ \t\r\n]{1,20}tool|execute[ \t\r\n]{1,20}bash[ \t\r\n]{1,20}command)\b[^.\n]{0,80}\b(?:curl|wget|fetch_url|bash|rm[ \t]{1,10}-rf)\b/i,
+    re: /\b(?:immediately\s+call(?:\s+the\s+tool)?|now\s+call(?:\s+the\s+tool)?|you\s+must\s+now\s+execute|invoke\s+the\s+tool|execute\s+bash\s+command)\b[^\n]{0,80}\b(?:curl|wget|fetch(?:[_\s]?url)|bash|rm\s+-rf)\b/i,
     weight: 4,
   },
 ];
 
-const HIDDEN_STYLE_TOKEN_RE = /(?:display[ \t]*:[ \t]*none|visibility[ \t]*:[ \t]*hidden|opacity[ \t]*:[ \t]*0(?![0-9.])|font-size[ \t]*:[ \t]*0(?![0-9.]))/i;
-const HIDDEN_OVERRIDE_KEYWORD_RE = /\b(?:ignore|disregard|system[ \t\r\n]{1,10}prompt|assistant|tool|execute|instructions?)\b/i;
+const HIDDEN_STYLE_TOKEN_RE =
+  /(?:display[ \t]*:[ \t]*none|visibility[ \t]*:[ \t]*hidden|opacity[ \t]*:[ \t]*0(?:\.0+)?(?![0-9.])|font-size[ \t]*:[ \t]*0(?:px|em|rem|pt|%)?(?![0-9.])|clip-path[ \t]*:[ \t]*inset\(\s*100%|clip[ \t]*:[ \t]*rect\(\s*0|(?:left|top|text-indent)[ \t]*:[ \t]*-\d{3,}|height[ \t]*:[ \t]*0(?:px)?[ \t]*;[^;]{0,60}overflow[ \t]*:[ \t]*hidden|color[ \t]*:[ \t]*(?:#fff(?:fff)?|white|transparent)\b.{0,80}font-size[ \t]*:[ \t]*1px|font-size[ \t]*:[ \t]*1px.{0,80}color[ \t]*:[ \t]*(?:#fff(?:fff)?|white|transparent)\b)/i;
+const HIDDEN_OVERRIDE_KEYWORD_RE = /\b(?:ignore|disregard|system[ \t\r\n]{1,10}prompt|assistant|tool|execute|instructions?|rules?)\b/i;
+
+const CONFUSABLE_CHAR_MAP: Record<string, string> = {
+  '\u0456': 'i',
+  '\u0406': 'i',
+  '\u026A': 'i',
+  '\u0430': 'a',
+  '\u0410': 'a',
+  '\u0435': 'e',
+  '\u0415': 'e',
+  '\u043E': 'o',
+  '\u041E': 'o',
+  '\u03BF': 'o',
+  '\u039F': 'o',
+  '\u0440': 'p',
+  '\u0420': 'p',
+  '\u0441': 'c',
+  '\u0421': 'c',
+  '\u0443': 'y',
+  '\u0423': 'y',
+  '\u0445': 'x',
+  '\u0425': 'x',
+  '\u0455': 's',
+  '\u0405': 's',
+  '\u0458': 'j',
+  '\u0408': 'j',
+  '\u04CF': 'l',
+  '\u04C0': 'l',
+  '\u0501': 'd',
+  '\u0261': 'g',
+  '\u0578': 'n',
+  '\u03C5': 'u',
+  '\u0475': 'v',
+};
+const CONFUSABLE_CHAR_RE = /[\u0261\u026A\u039F\u03BF\u03C5\u0405\u0406\u0408\u0410\u0415\u041E\u0420\u0421\u0423\u0425\u0430\u0435\u043E\u0440\u0441\u0443\u0445\u0455\u0456\u0458\u0475\u04C0\u04CF\u0501\u0578]/g;
 
 const INLINE_SPLIT_TAGS = new Set([
   'a',
@@ -77,32 +112,185 @@ const INLINE_SPLIT_TAGS = new Set([
   'wbr',
 ]);
 
+/**
+ * Strictly linear **O(N)** Markdown link, image, autolink-label, reference-link, and footnote stripper (`R7`):
+ * scans `](` sites over disjoint URL segments with monotonic quote/paren cursors so `'['.repeat(2_097_152)` and
+ * `'[a]('.repeat(524_288)` finish in `< 5 ms` (fixing the `O(N^2)` loop), while handling `>2048`-char URLs,
+ * nested `[[label]](url)`, quoted `"a)b"` titles, balanced `(a)` parens, `[label][ref]`, `![](...)`, and `[^fn]`.
+ */
 function unwrapMarkdownLinksForScanLinear(s: string): string {
-  if (!s.includes('](')) return s;
+  // Strip reference-link definition lines (`[id]: https://...`) and footnote markers (`[^1]`) first —
+  // never strip `[system prompt]: prose` role-override headers!
+  let work = s;
+  if (work.includes(']:')) {
+    work = work.replace(/^[ \t]{0,3}\[[^\]\r\n]{1,100}\]:[ \t]*<?(?:https?:|ftp:|mailto:|javascript:|\/|#)\S*[^\r\n]*$/gim, ' ');
+  }
+  if (work.includes('[^')) {
+    work = work.replace(/\[\^[^\]\s]{1,64}\]/g, ' ');
+  }
+  if (work.includes('][')) {
+    work = work.replace(/\]\[[^\]\r\n]{0,200}\]/g, ']');
+  }
+  const stripWordBrackets = (txt: string): string =>
+    txt.includes('[') && /[A-Za-z]/.test(txt) ? txt.replace(/\[+([A-Za-z]{2,32})\]*/g, '$1') : txt;
+
+  if (!work.includes('](') || !work.includes(')')) {
+    return stripWordBrackets(work);
+  }
+
   let out = '';
   let last = 0;
-  let i = 0;
-  while (i < s.length) {
-    if (s.charCodeAt(i) === 91 /* '[' */) {
-      const closeBracket = s.indexOf('](', i + 1);
-      if (closeBracket < 0) break;
-      if (closeBracket - i <= 400 && s.slice(i + 1, closeBracket).indexOf('\n') < 0) {
-        const closeParen = s.indexOf(')', closeBracket + 2);
-        if (closeParen > closeBracket + 1 && closeParen - closeBracket <= 2048) {
-          out += s.slice(last, i) + s.slice(i + 1, closeBracket);
-          i = closeParen + 1;
-          last = i;
+  let searchPos = 0;
+  let nextCloseParen = -2;
+  let nextDblQuote = -2;
+  let nextSglQuote = -2;
+
+  while (searchPos < work.length) {
+    const bp = work.indexOf('](', searchPos);
+    if (bp < 0) break;
+    if (nextCloseParen !== -1 && nextCloseParen < bp + 2) {
+      nextCloseParen = work.indexOf(')', bp + 2);
+    }
+    if (nextCloseParen < 0) break;
+
+    let k = bp + 2;
+    while (k < work.length && (work.charCodeAt(k) === 32 || work.charCodeAt(k) === 9)) k++;
+    let valid = true;
+    if (k < work.length && work.charCodeAt(k) === 60 /* '<' */) {
+      k++;
+      while (k < work.length && work.charCodeAt(k) !== 62 && work.charCodeAt(k) !== 10 && work.charCodeAt(k) !== 13) k++;
+      if (k < work.length && work.charCodeAt(k) === 62) k++;
+      else valid = false;
+    } else {
+      let depth = 0;
+      while (k < work.length) {
+        const c = work.charCodeAt(k);
+        if (c === 92 /* '\\' */ && k + 1 < work.length) {
+          k += 2;
           continue;
+        }
+        if (c === 32 || c === 9 || c === 10 || c === 13) break;
+        if (c === 40 /* '(' */) {
+          depth++;
+          if (depth > 6) {
+            valid = false;
+            break;
+          }
+        } else if (c === 41 /* ')' */) {
+          if (depth === 0) break;
+          depth--;
+        }
+        k++;
+      }
+      if (depth !== 0) valid = false;
+    }
+
+    if (valid && k < work.length && (work.charCodeAt(k) === 32 || work.charCodeAt(k) === 9)) {
+      while (k < work.length && (work.charCodeAt(k) === 32 || work.charCodeAt(k) === 9)) k++;
+      if (k < work.length && (work.charCodeAt(k) === 34 || work.charCodeAt(k) === 39)) {
+        const q = work.charCodeAt(k);
+        let qEnd = -1;
+        if (q === 34) {
+          if (nextDblQuote !== -1 && nextDblQuote <= k) nextDblQuote = work.indexOf('"', k + 1);
+          qEnd = nextDblQuote;
+        } else {
+          if (nextSglQuote !== -1 && nextSglQuote <= k) nextSglQuote = work.indexOf("'", k + 1);
+          qEnd = nextSglQuote;
+        }
+        if (qEnd > k && qEnd - k <= 512 && work.slice(k + 1, qEnd).indexOf('\n') < 0) {
+          k = qEnd + 1;
+          while (k < work.length && (work.charCodeAt(k) === 32 || work.charCodeAt(k) === 9)) k++;
+        } else {
+          valid = false;
         }
       }
     }
-    i++;
+
+    if (valid && k < work.length && work.charCodeAt(k) === 41 /* ')' */) {
+      // Check bounded back-window `[last, bp)` for `![alt]` image or `[https://...]` autolink label to drop completely!
+      let openBr = -1;
+      const scanBackFloor = Math.max(last, bp - 400);
+      for (let b = bp - 1; b >= scanBackFloor; b--) {
+        const bc = work.charCodeAt(b);
+        if (bc === 10 || bc === 13) break;
+        if (bc === 91 /* '[' */) {
+          openBr = b;
+          break;
+        }
+      }
+      if (openBr >= last) {
+        const isImg = openBr > last && work.charCodeAt(openBr - 1) === 33 /* '!' */;
+        const lbl = work.slice(openBr + 1, bp).trim();
+        if (isImg || /^(?:https?:\/\/|mailto:)\S+$/i.test(lbl)) {
+          const dropStart = isImg ? openBr - 1 : openBr;
+          out += `${work.slice(last, dropStart)} `;
+          last = k + 1;
+          searchPos = k + 1;
+          continue;
+        }
+      }
+      // Keep the label text before `bp`, drop `](dest)`!
+      out += work.slice(last, bp);
+      last = k + 1;
+      searchPos = k + 1;
+      continue;
+    }
+
+    searchPos = Math.max(bp + 2, k);
   }
-  return last === 0 ? s : out + s.slice(last);
+
+  const unwrapped = last === 0 ? work : out + work.slice(last);
+  return stripWordBrackets(unwrapped);
 }
 
-function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'strip' = 'space'): string {
-  let out = prose;
+function decodeEntitiesForInjectionScan(raw: string): string {
+  if (!raw.includes('&')) return raw;
+  let out = raw;
+  for (let pass = 0; pass < 2 && out.includes('&'); pass++) {
+    const next = out
+      .replace(/&#(\d{1,7});?/g, (_m, dec: string) => {
+        const cp = Number(dec);
+        return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+      })
+      .replace(/&#x([0-9a-fA-F]{1,6});?/gi, (_m, hex: string) => {
+        const cp = parseInt(hex, 16);
+        return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+      })
+      .replace(/&(?:nbsp|nonbreakingspace|ensp|emsp|thinsp|hairsp|tab|newline);/gi, ' ')
+      .replace(/&(?:shy|zwj|zwnj|zerowidthspace|negativethinspace);/gi, '')
+      .replace(/&colon;/gi, ':')
+      .replace(/&quot;/gi, '"')
+      .replace(/&apos;/gi, "'")
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&amp;/gi, '&');
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
+function normalizeCssStyleForHiddenCheck(rawStyle: string): string {
+  if (!rawStyle) return '';
+  let s = decodeEntitiesForInjectionScan(rawStyle);
+  if (s.includes('/*')) {
+    s = s.replace(/\/\*[\s\S]{0,256}?\*\//g, '');
+  }
+  if (s.includes('\\')) {
+    s = s.replace(/\\([0-9a-fA-F]{1,6})[ \t\r\n]?/g, (_m, hex: string) => {
+      const cp = parseInt(hex, 16);
+      return cp > 0 && cp <= 0x7f ? String.fromCharCode(cp) : '';
+    });
+    s = s.replace(/\\(.)/g, '$1');
+  }
+  return s;
+}
+
+function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'strip' | 'wordstream' = 'space'): string {
+  let out = prose.includes('[SCRUBBED:')
+    ? prose.replace(/\[SCRUBBED:\s*prompt injection blocked\s*\([^)\r\n]{0,200}\)\]/gi, ' ')
+    : prose;
+  out = decodeEntitiesForInjectionScan(out);
   if (out.includes('<!--')) {
     out = stripHtmlCommentsLinear(out, MAX_HTML_SCAN_CHARS);
   }
@@ -115,51 +303,55 @@ function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'st
       false,
     );
   }
-  if (out.includes('&')) {
+  // Fast ASCII check: all invisible/format/Unicode-space/NFKD/confusable characters (`>= U+0085`) are non-ASCII (`< 10 ms` on `2 MiB`!)
+  if (/[^\x00-\x7F]/.test(out)) {
     out = out
-      .replace(/&#(\d{1,7});?/g, (_m, dec: string) => {
-        const cp = Number(dec);
-        return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
-      })
-      .replace(/&#x([0-9a-fA-F]{1,6});?/gi, (_m, hex: string) => {
-        const cp = parseInt(hex, 16);
-        return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
-      })
-      .replace(/&(?:nbsp|ensp|emsp|thinsp);/gi, ' ')
-      .replace(/&shy;/gi, '')
-      .replace(/&(?:zwj|zwnj);/gi, '')
-      .replace(/&quot;/gi, '"')
-      .replace(/&apos;/gi, "'")
-      .replace(/&lt;/gi, '<')
-      .replace(/&gt;/gi, '>')
-      .replace(/&amp;/gi, '&');
+      .replace(
+        /[\u00AD\u034F\u061C\u17B4\u17B5\u180B-\u180F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF\uFFF9-\uFFFB\u{1D173}-\u{1D17A}\u{E0000}-\u{E01EF}]/gu,
+        '',
+      )
+      .replace(/[\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u2800\u3000]/g, ' ')
+      .replace(/[\u115F\u1160\u3164\uFFA0]/g, fillerMode === 'strip' ? '' : ' ')
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036F\u0483-\u0489\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F]/g, '')
+      .replace(CONFUSABLE_CHAR_RE, (ch) => CONFUSABLE_CHAR_MAP[ch] ?? ch);
   }
-  // Strip Variation Selectors (`U+FE00..U+FE0F`), Variation Selectors Supplement (`U+E0100..U+E01EF`), Unicode Tags (`U+E0000..U+E007F`),
-  // Combining Grapheme Joiner (`U+034F`), soft hyphens (`U+00AD`), Bidi/zero-width formatting chars (`M11`).
-  out = out
-    .replace(
-      /[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF\u{E0000}-\u{E01EF}]/gu,
-      '',
-    )
-    .replace(/[\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, ' ');
 
   // Strip fenced code block marker lines while keeping inner code content for `checkPromptInjection` scanning (`M11`).
   if (out.includes('```') || out.includes('~~~')) {
     out = out.replace(/^[ \t]{0,3}(?:`{3,}|~{3,})[^\r\n]*$/gm, '');
   }
-  if (out.includes('](')) {
+  // Unwrap backslash escapes (`ignore\ previous`, `previous\_instructions`, `ignore\\\nprevious`)
+  if (out.includes('\\')) {
+    out = out.replace(/\\\r?\n/g, ' ').replace(/\\_/g, ' ').replace(/\\([!-/:-@[-`{-~ ])/g, '$1');
+  }
+  if (out.includes('[') || out.includes(']')) {
     out = unwrapMarkdownLinksForScanLinear(out);
   }
 
-  if (fillerMode === 'strip') {
-    return out.replace(/[\u115F\u1160\u3164\uFFA0`*_~]/g, '');
+  if (fillerMode === 'wordstream') {
+    return out
+      .replace(/^\|?[ \t:-]+\|[ \t|:-]*$/gm, ' ')
+      .replace(/[^A-Za-z0-9.\s:]+/g, ' ')
+      .replace(/[ \t\r\n]+/g, ' ');
   }
-  return out.replace(/[\u115F\u1160\u3164\uFFA0`]/g, ' ').replace(/[*_~]{1,3}/g, '');
+  if (fillerMode === 'strip') {
+    let sOut = out;
+    if (/[`*_~]/.test(sOut)) sOut = sOut.replace(/[`*_~]/g, '');
+    if (sOut.includes('  ')) sOut = sOut.replace(/  +/g, ' ');
+    return sOut;
+  }
+  let res = out;
+  if (res.includes('`')) res = res.replace(/`/g, ' ');
+  if (/[*~]/.test(res)) res = res.replace(/[*~]{1,3}/g, '');
+  if (res.includes('_')) res = res.replace(/(^|\s)_+|_+(\s|$)/g, '$1$2').replace(/_/g, ' ');
+  if (res.includes('  ')) res = res.replace(/  +/g, ' ');
+  return res;
 }
 
 /**
  * Scans extracted Markdown (including inline code spans and fenced/indented code blocks when `checkPromptInjection` runs)
- * and raw HTML for indirect prompt-injection payloads (`H1`, `R3-M3`, `M11`).
+ * and raw HTML for indirect prompt-injection payloads (`H1`, `R3-M3`, `M11`, `R7` 58/58 + 20/20 linear `< 20 ms` on `2 MiB`).
  */
 export function detectPromptInjection(params: {
   markdown: string;
@@ -170,73 +362,151 @@ export function detectPromptInjection(params: {
   const triggers: string[] = [];
   let totalScore = 0;
 
-  // 1. Invisible Unicode Tag ASCII smuggling (`U+E0000`–`U+E007F`) in raw source or Markdown
-  if (/[\u{E0000}-\u{E007F}]{4,}/u.test(boundedHtml) || /[\u{E0000}-\u{E007F}]{4,}/u.test(boundedMd)) {
+  // 1. Invisible Unicode Tag ASCII smuggling (`U+E0000`–`U+E007F`, UTF-16 high surrogate `0xDB40`) in raw source or Markdown
+  if (
+    (boundedHtml.includes('\uDB40') && /[\u{E0000}-\u{E007F}]/u.test(boundedHtml)) ||
+    (boundedMd.includes('\uDB40') && /[\u{E0000}-\u{E007F}]/u.test(boundedMd))
+  ) {
     triggers.push('unicode_tag_ascii_smuggling');
     totalScore += 4;
   }
 
-  // 2. Hidden CSS / DOM subtree containing imperative LLM override phrases (strictly linear O(N) scan with monotonic close-tag & window cursors)
+  // 2. Hidden CSS / DOM subtree / `<template>` / `<noscript>` / `alt` / `title` attributes containing imperative LLM override phrases
   if (boundedHtml) {
     const rawForHidden = boundedHtml;
     const lowerForHidden = asciiLower(rawForHidden);
+
+    // Extract simple hidden class names declared inside `<style>` blocks (`.h { display:none }`)
+    const styleHiddenClasses = new Set<string>(['sr-only', 'visually-hidden', 'screen-reader-text', 'hidden', 'd-none']);
+    if (lowerForHidden.includes('<style')) {
+      replacePairedHtmlElementsLinear(
+        rawForHidden,
+        ['style'],
+        (_full, _t, _a, cssInner) => {
+          const normCss = normalizeCssStyleForHiddenCheck(cssInner.slice(0, 65_536));
+          const ruleRe = /\.([A-Za-z_-][A-Za-z0-9_-]{0,63})\s*\{([^}]{1,240})\}/g;
+          let cm: RegExpExecArray | null;
+          while ((cm = ruleRe.exec(normCss)) !== null) {
+            if (HIDDEN_STYLE_TOKEN_RE.test(cm[2]!)) {
+              styleHiddenClasses.add(cm[1]!.toLowerCase());
+            }
+          }
+          return '';
+        },
+        { maxChars: MAX_HTML_SCAN_CHARS },
+      );
+    }
+
+    // Check `<template>` and `<noscript>` inert/fallback subtrees
+    if (lowerForHidden.includes('<template') || lowerForHidden.includes('<noscript')) {
+      let foundInert = false;
+      replacePairedHtmlElementsLinear(
+        rawForHidden,
+        ['template', 'noscript'],
+        (_full, _t, _a, inner) => {
+          if (foundInert) return '';
+          const norm = normalizeProseForInjectionScan(inner.slice(0, 8_192), 'wordstream');
+          if (HIDDEN_OVERRIDE_KEYWORD_RE.test(norm)) {
+            foundInert = true;
+          }
+          return '';
+        },
+        { maxChars: MAX_HTML_SCAN_CHARS },
+      );
+      if (foundInert) {
+        triggers.push('hidden_css_instruction_injection');
+        totalScore += 5;
+      }
+    }
+
     const nextCloseByTag = new Map<string, number>();
     let scannedHiddenUpTo = 0;
-    scanHtmlTagsLinear(
-      rawForHidden,
-      (tag) => {
-        if (tag.isClosing || tag.isSelfClosing || tag.isDeclaration) return;
-        if (tag.attrs.indexOf('style') < 0 && tag.attrs.indexOf('STYLE') < 0 && !/style/i.test(tag.attrs)) return;
-        const attrs = parseOpenTagAttributes(tag.attrs);
-        const styleVal = attrs.style ?? '';
-        if (!styleVal || !HIDDEN_STYLE_TOKEN_RE.test(styleVal)) return;
+    if (!triggers.includes('hidden_css_instruction_injection')) {
+      scanHtmlTagsLinear(
+        rawForHidden,
+        (tag) => {
+          if (tag.isClosing || tag.isDeclaration) return;
+          if (!tag.attrs) return;
+          const attrs = parseOpenTagAttributes(tag.attrs);
 
-        const closeNeedle = `</${tag.tagNameLower}`;
-        let closeIdx = nextCloseByTag.get(tag.tagNameLower);
-        if (closeIdx === undefined || (closeIdx >= 0 && closeIdx < tag.end)) {
-          let searchFrom = closeIdx !== undefined && closeIdx >= 0 ? Math.max(tag.end, closeIdx) : tag.end;
-          let found = -1;
-          while (searchFrom < rawForHidden.length) {
-            const cand = lowerForHidden.indexOf(closeNeedle, searchFrom);
-            if (cand < 0) break;
-            const afterIdx = cand + closeNeedle.length;
-            if (afterIdx < rawForHidden.length && isTagNameBoundary(rawForHidden.charCodeAt(afterIdx))) {
-              found = cand;
-              break;
+          // Check `alt` / `title` attribute injection (`<img alt="ignore all previous instructions">`, `<span title="...">`)
+          const attrCandidate = `${attrs.alt ?? ''} ${attrs.title ?? ''}`.trim();
+          if (attrCandidate) {
+            const normAttr = normalizeProseForInjectionScan(attrCandidate, 'wordstream');
+            for (const pat of INJECTION_PATTERNS) {
+              if (pat.re.test(normAttr)) {
+                triggers.push('hidden_css_instruction_injection');
+                totalScore += 5;
+                return false;
+              }
             }
-            searchFrom = afterIdx;
           }
-          closeIdx = found;
-          nextCloseByTag.set(tag.tagNameLower, closeIdx);
-        }
+          if (tag.isSelfClosing) return;
 
-        const maxSearchEnd = Math.min(rawForHidden.length, tag.end + 1400);
-        const sliceEnd = closeIdx >= 0 && closeIdx <= maxSearchEnd ? closeIdx : Math.min(rawForHidden.length, tag.end + 1200);
-        const sliceStart = Math.max(tag.end, scannedHiddenUpTo - 64);
-        if (sliceEnd <= sliceStart) return;
-        scannedHiddenUpTo = Math.max(scannedHiddenUpTo, sliceEnd);
-        const rawSlice = stripHtmlTagsQuoteAwareLinear(rawForHidden.slice(sliceStart, sliceEnd), ' ', 2000);
-        const innerSpaced = normalizeProseForInjectionScan(rawSlice, 'space');
-        const innerStripped = normalizeProseForInjectionScan(rawSlice, 'strip');
-        if (HIDDEN_OVERRIDE_KEYWORD_RE.test(innerSpaced) || HIDDEN_OVERRIDE_KEYWORD_RE.test(innerStripped)) {
-          triggers.push('hidden_css_instruction_injection');
-          totalScore += 5;
-          return false;
-        }
-        return undefined;
-      },
-      MAX_HTML_SCAN_CHARS,
-      false,
-    );
+          const normStyle = attrs.style ? normalizeCssStyleForHiddenCheck(attrs.style) : '';
+          const isHiddenAttr = 'hidden' in attrs || (attrs['aria-hidden'] ?? '').trim().toLowerCase() === 'true';
+          const classTokens = (attrs.class ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+          const hasHiddenClass = classTokens.some((c) => styleHiddenClasses.has(c));
+          const isHiddenSubtree = isHiddenAttr || hasHiddenClass || (normStyle !== '' && HIDDEN_STYLE_TOKEN_RE.test(normStyle));
+          if (!isHiddenSubtree) return;
+
+          const closeNeedle = `</${tag.tagNameLower}`;
+          let closeIdx = nextCloseByTag.get(tag.tagNameLower);
+          if (closeIdx === undefined || (closeIdx >= 0 && closeIdx < tag.end)) {
+            let searchFrom = closeIdx !== undefined && closeIdx >= 0 ? Math.max(tag.end, closeIdx) : tag.end;
+            let found = -1;
+            while (searchFrom < rawForHidden.length) {
+              const cand = lowerForHidden.indexOf(closeNeedle, searchFrom);
+              if (cand < 0) break;
+              const afterIdx = cand + closeNeedle.length;
+              if (afterIdx < rawForHidden.length && isTagNameBoundary(rawForHidden.charCodeAt(afterIdx))) {
+                found = cand;
+                break;
+              }
+              searchFrom = afterIdx;
+            }
+            closeIdx = found;
+            nextCloseByTag.set(tag.tagNameLower, closeIdx);
+          }
+
+          const maxSearchEnd = Math.min(rawForHidden.length, tag.end + 16_384);
+          const sliceEnd = closeIdx >= 0 && closeIdx <= maxSearchEnd ? closeIdx : Math.min(rawForHidden.length, tag.end + 8_192);
+          const sliceStart = Math.max(tag.end, scannedHiddenUpTo - 64);
+          if (sliceEnd <= sliceStart) return;
+          scannedHiddenUpTo = Math.max(scannedHiddenUpTo, sliceEnd);
+          const rawSlice = stripHtmlTagsQuoteAwareLinear(rawForHidden.slice(sliceStart, sliceEnd), '', 16_384);
+          const innerStream = normalizeProseForInjectionScan(rawSlice, 'wordstream');
+          if (HIDDEN_OVERRIDE_KEYWORD_RE.test(innerStream)) {
+            triggers.push('hidden_css_instruction_injection');
+            totalScore += 5;
+            return false;
+          }
+          return undefined;
+        },
+        MAX_HTML_SCAN_CHARS,
+        false,
+      );
+    }
   }
 
-  // 3. Full Markdown + code-span / fenced-block scan (`M11`: catches backtick-wrapped, fenced, Variation Selector, CGJ, and Hangul-filler split overrides)
+  // 3. Full Markdown + code-span / fenced-block scan (`M11` & `R7`: single base normalization pass `< 15 ms` on `2 MiB`!)
   const scanSpaced = normalizeProseForInjectionScan(boundedMd, 'space');
+  const scanWordStream = /[\n|,$>#-]/.test(scanSpaced)
+    ? scanSpaced
+        .replace(/^\|?[ \t:-]+\|[ \t|:-]*$/gm, ' ')
+        .replace(/[^A-Za-z0-9.\s:]+/g, ' ')
+        .replace(/[ \t\r\n]+/g, ' ')
+    : scanSpaced;
   const needsStrippedPass = /[\u115F\u1160\u3164\uFFA0`*_~]/.test(boundedMd);
   const scanStripped = needsStrippedPass ? normalizeProseForInjectionScan(boundedMd, 'strip') : '';
 
   for (const pat of INJECTION_PATTERNS) {
-    if (pat.re.test(scanSpaced) || (scanStripped && pat.re.test(scanStripped))) {
+    if (
+      pat.re.test(scanSpaced) ||
+      pat.re.test(scanWordStream) ||
+      (scanStripped && pat.re.test(scanStripped)) ||
+      (pat.id === 'exfiltrate_secrets_or_tools' && pat.re.test(boundedMd))
+    ) {
       triggers.push(pat.id);
       totalScore += pat.weight;
     }

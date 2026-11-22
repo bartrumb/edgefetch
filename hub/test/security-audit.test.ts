@@ -5790,7 +5790,7 @@ test('SEC-R2-B3: framework-detect.ts and overflow.ts full line and branch closur
   assert.equal(byId['pay-402']?.outcome, 'payment_required');
   assert.equal(byId['notmod-304']?.outcome, 'ok');
   assert.equal(byId['bin-skip']?.outcome, 'skip');
-  assert.equal(byId['gone-404']?.outcome, 'gone');
+  assert.equal(byId['gone-404']?.outcome, 'not_found');
   assert.equal(byId['stop-403']?.outcome, 'stop');
   assert.equal(byId['trunc']?.outcome, 'error');
   assert.equal(byId['throw-err']?.outcome, 'error');

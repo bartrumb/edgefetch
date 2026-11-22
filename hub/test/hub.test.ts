@@ -2004,6 +2004,7 @@ test('V2-12: v2.3.0 Handoff Regression Suite (P1-P12 + structured jobs tool)', a
     payload: {
       urls: ['https://jobs.ashbyhq.com/elevenlabs/43f91b57-5c4e-4d4a-9450-3591f2a79923'],
       query: 'compensation WebSocket voice agents',
+      includeRawContent: true,
     },
     env: {},
     executeHubFetch: async () => ({
@@ -3194,7 +3195,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.7.0');
+    assert.equal(caps.version, '2.7.1');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);
@@ -8577,9 +8578,12 @@ test('M1-C-R2 Batch 1: turso-d1, activity-log, admin, compat, storage, ingest, n
       .prepare('INSERT OR REPLACE INTO artifacts (blob_sha256, content_sha256, r2_key, retention, encoding, stored_bytes, content_bytes, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .bind(expRowSha, goodContentSha, r2ArtifactKey('stored', expRowSha), 'stored', 'gzip', 10, 10, 1, 1)
       .run();
-    const exp410 = await readArtifactPage({ bucket: bucket as unknown as R2Bucket, metaDb: metaDb as unknown as D1Database, blobSha256: expRowSha });
-    assert.equal(exp410.ok, false);
-    if (!exp410.ok) assert.equal(exp410.status, 410);
+    const exp404 = await readArtifactPage({ bucket: bucket as unknown as R2Bucket, metaDb: metaDb as unknown as D1Database, blobSha256: expRowSha });
+    assert.equal(exp404.ok, false);
+    if (!exp404.ok) {
+      assert.equal(exp404.status, 404);
+      assert.equal(exp404.error, 'artifact_not_found');
+    }
     assert.equal((await handleArtifactGetRequest({ request: new Request('https://hub/v1/artifacts/' + expRowSha), url: new URL('https://hub/v1/artifacts/' + expRowSha), blobSha256: expRowSha })).status, 503);
     assert.equal(
       (await handleArtifactGetRequest({
@@ -8598,7 +8602,7 @@ test('M1-C-R2 Batch 1: turso-d1, activity-log, admin, compat, storage, ingest, n
         bucket: bucket as unknown as R2Bucket,
         metaDb: metaDb as unknown as D1Database,
       })).status,
-      410,
+      404,
     );
 
     // ingest.ts remaining branches: writeJobManifestToR2 errors, loadManifestFromR2 errors, >25 items multi-chunk, corrupt/bomb/mismatch rejections + capacity limit

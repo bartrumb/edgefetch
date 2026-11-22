@@ -1,0 +1,14 @@
+{
+  "adapterId": "news-feeds",
+  "mode": "twin",
+  "inputUrl": "https://www.npr.org/",
+  "expectedFetchUrl": "https://feeds.npr.org/1001/rss.xml",
+  "mockPayload": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><rss version=\"2.0\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><channel><title>NPR Topics: News</title><link>https://www.npr.org/sections/news/</link><description>NPR news, audio, and podcasts.</description><item><title><![CDATA[Grid Modernization Expands Transmission Capacity Across Midwest]]></title><description><![CDATA[Federal regulators approved high-voltage transmission upgrades connecting wind and solar corridors.]]></description><pubDate>Sun, 22 Nov 2026 14:15:00 -0500</pubDate><link>https://www.npr.org/2026/11/22/nx-s1-5210101/grid-modernization-midwest-transmission</link><dc:creator>NPR Energy Desk</dc:creator></item><item><title>Oceanic Buoy Network Sharpens Seasonal Monsoon Forecasts</title><description>New deep-water autonomous sensors cut storm track uncertainty by 22 percent.</description><pubDate>Sun, 22 Nov 2026 12:40:00 -0500</pubDate><link>https://www.npr.org/2026/11/22/nx-s1-5210102/oceanic-buoy-monsoon-forecasts</link><dc:creator>NPR Science Desk</dc:creator></item></channel></rss>",
+  "expectTitleIncludes": "NPR Topics: News (2 stories)",
+  "expectMarkdownIncludes": [
+    "# NPR Topics: News (2 stories)",
+    "[Grid Modernization Expands Transmission Capacity Across Midwest](https://www.npr.org/2026/11/22/nx-s1-5210101/grid-modernization-midwest-transmission)",
+    "Federal regulators approved high-voltage transmission upgrades",
+    "[Oceanic Buoy Network Sharpens Seasonal Monsoon Forecasts](https://www.npr.org/2026/11/22/nx-s1-5210102/oceanic-buoy-monsoon-forecasts)"
+  ]
+}

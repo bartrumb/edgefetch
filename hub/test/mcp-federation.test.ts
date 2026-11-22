@@ -140,7 +140,7 @@ test('MCP-FED-1: Dual-source Official MCP Registry + Glama fusion, manifest head
   assert.equal(full.sourceStatus.glama, 'ok');
   assert.equal(full.count, 3);
 
-  // Verify Linear entry fused both Official Registry and Glama without duplicating, stripped SSRF remote, and inferred linear.app
+  // Verify Linear entry fused both Official Registry and Glama without duplicating, stripped SSRF remote, and never heuristically claims third-party domains (H1)
   const linear = full.servers.find((s) => s.slug === 'app-linear-linear-mcp');
   assert.ok(linear);
   assert.deepEqual(linear.sources.sort(), ['glama', 'official-registry']);
@@ -148,13 +148,13 @@ test('MCP-FED-1: Dual-source Official MCP Registry + Glama fusion, manifest head
   assert.equal(linear.remotes[0]!.url, 'https://mcp.linear.app/mcp');
   assert.equal(linear.remotes[0]!.headers[0]!.name, 'Authorization');
   assert.equal(linear.remotes[0]!.headers[0]!.isSecret, true);
-  assert.ok(linear.domains.includes('linear.app'));
+  assert.deepEqual(linear.domains, []);
   assert.equal(linear.packages[0]!.environmentVariables[0]!.name, 'LINEAR_API_KEY');
 
-  // Verify Notion inferred notion.so & notion.com
+  // Verify Notion never claims notion.so/notion.com from untrusted manifest strings (H1)
   const notion = full.servers.find((s) => s.name.includes('notion'));
   assert.ok(notion);
-  assert.ok(notion.domains.includes('notion.so'));
+  assert.deepEqual(notion.domains, []);
   assert.equal(notion.packages[0]!.environmentVariables[0]!.name, 'NOTION_API_TOKEN');
 
   // Verify poisoned manifest description was scrubbed by detectPromptInjection
@@ -590,7 +590,7 @@ test('MCP-FED-3: /admin Registry, Add Auth, Test Connection, Write-Only Secrets,
     );
     assert.equal(oauthStartRes?.status, 200);
     const bindCookie = (oauthStartRes?.headers.get('set-cookie') ?? '').split(';')[0]!;
-    assert.match(bindCookie, /^ef_mcp_oauth_bind=/);
+    assert.match(bindCookie, /^__Host-ef_mcp_oauth_bind=/);
     const startJson = (await oauthStartRes!.json()) as { ok: boolean; authorizationUrl: string };
     const authUrlObj = new URL(startJson.authorizationUrl);
     assert.equal(authUrlObj.searchParams.get('code_challenge_method'), 'S256');
@@ -601,7 +601,7 @@ test('MCP-FED-3: /admin Registry, Add Auth, Test Connection, Write-Only Secrets,
     const badBindCb = await handleAdminRoute(
       new Request(
         `https://hub.edgefetch.dev/admin/mcp/oauth/callback?code=auth_code_pkce_123&state=${encodeURIComponent(oauthState)}`,
-        { headers: { cookie: `${cookiePair}; ef_mcp_oauth_bind=wrong`, accept: 'application/json' } },
+        { headers: { cookie: `${cookiePair}; __Host-ef_mcp_oauth_bind=wrong`, accept: 'application/json' } },
       ),
       new URL(`https://hub.edgefetch.dev/admin/mcp/oauth/callback?code=auth_code_pkce_123&state=${encodeURIComponent(oauthState)}`),
       adminDeps,
@@ -927,11 +927,12 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
     assert.equal(await loadAgentRun(runId, undefined, 'user_bob'), null);
   }
 
-  // 2. Deterministic Zero-LLM `/v1/agent` run ALSO routes MCP-first with `visibility: 'private'`!
+  // 2. Deterministic Zero-LLM `/v1/agent` run ALSO routes MCP-first when explicitly opted in (`preferMcp: true`) with `visibility: 'private'`!
   const detAgent = await startOrExecuteAgentCall({
     payload: {
       prompt: 'Summarize Linear issue ENG-101 on linear.app',
       urls: ['https://linear.app/acme/issue/ENG-101'],
+      preferMcp: true,
     },
     env: {
       ARTIFACTS: fakeR2,
@@ -1151,7 +1152,11 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
     const cbCookies = extractCookies(cbRes.headers);
     const adminCookie = cbCookies
       .map((c) => c.split(';')[0]!.trim())
-      .find((c) => c.startsWith('ef_admin_session=') && c.length > 'ef_admin_session='.length)!;
+      .find(
+        (c) =>
+          (c.startsWith('__Host-ef_admin_session=') && c.length > '__Host-ef_admin_session='.length) ||
+          (c.startsWith('ef_admin_session=') && c.length > 'ef_admin_session='.length),
+      )!;
     assert.ok(adminCookie);
     const verified = await verifyAdminSessionCookie(adminCookie, sessionSecret, Date.now());
     assert.equal(verified.ok, true);
@@ -1159,7 +1164,11 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
     return { cookie: adminCookie, csrf: verified.csrf, userId: verified.userId, role: verified.role };
   };
 
-  const mintOAuthBearerForSession = async (sessionCookie: string, clientName: string): Promise<string> => {
+  const mintOAuthBearerForSession = async (
+    sessionCookie: string,
+    clientName: string,
+    scopes = 'crawl:read crawl:fetch mcp:call',
+  ): Promise<string> => {
     const regRes = await dispatch('/oauth/register', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1173,7 +1182,7 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
     const verifier = 'pkce_verifier_' + crypto.randomUUID().replace(/-/g, '') + '_0123456789abcdef';
     const challenge = await sha256Base64Url(verifier);
     const authPage = await dispatch(
-      `/oauth/authorize?response_type=code&client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent('http://127.0.0.1:54321/callback')}&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256&scope=${encodeURIComponent('crawl:read crawl:fetch')}&state=st1`,
+      `/oauth/authorize?response_type=code&client_id=${encodeURIComponent(client_id)}&redirect_uri=${encodeURIComponent('http://127.0.0.1:54321/callback')}&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256&scope=${encodeURIComponent(scopes)}&state=st1`,
       { headers: { cookie: sessionCookie } },
     );
     assert.equal(authPage.status, 200);

@@ -289,17 +289,30 @@ export function formatYamlFrontmatterCard(rawMd: string, fallbackTitle: string):
   description?: string;
   markdown: string;
 } {
-  const normalized = rawMd.replace(/\r\n/g, '\n');
-  const fmMatch = /^---\n([\s\S]{1,8000}?)\n---\n+([\s\S]*)$/.exec(normalized);
-  if (!fmMatch) {
-    const h1 = /^#\s+(.+)$/m.exec(normalized)?.[1]?.trim();
+  const boundedRaw = rawMd.length > 2 * 1024 * 1024 ? rawMd.slice(0, 2 * 1024 * 1024) : rawMd;
+  const normalized = boundedRaw.includes('\r') ? boundedRaw.replace(/\r\n/g, '\n') : boundedRaw;
+  let yamlBlock = '';
+  let body = '';
+  let hasFrontmatter = false;
+  if (normalized.startsWith('---\n')) {
+    const headWindow = normalized.slice(0, 8_200);
+    const closeMarker = headWindow.indexOf('\n---\n', 4);
+    if (closeMarker >= 4 && closeMarker <= 8_004) {
+      yamlBlock = normalized.slice(4, closeMarker);
+      let bodyStart = closeMarker + 5;
+      while (bodyStart < normalized.length && normalized.charCodeAt(bodyStart) === 10) bodyStart++;
+      body = normalized.slice(bodyStart).trim();
+      hasFrontmatter = true;
+    }
+  }
+  if (!hasFrontmatter) {
+    const h1Window = normalized.slice(0, 4_096);
+    const h1 = /^#[ \t]+([^\n]{1,500})$/m.exec(h1Window)?.[1]?.trim();
     const title = h1 || fallbackTitle;
-    const md = normalized.trimStart().startsWith('# ') ? normalized.trim() : `# ${title}\n\n${normalized.trim()}`;
+    const trimmedNorm = normalized.trim();
+    const md = trimmedNorm.startsWith('# ') ? trimmedNorm : `# ${title}\n\n${trimmedNorm}`;
     return { title, markdown: md };
   }
-
-  const yamlBlock = fmMatch[1]!;
-  const body = fmMatch[2]!.trim();
   const kvPairs: Array<[string, string]> = [];
   let currentKey = '';
   let listItems: string[] = [];

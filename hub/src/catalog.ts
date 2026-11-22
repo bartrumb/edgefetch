@@ -17,9 +17,10 @@ import {
   type CatalogVariantRecord,
 } from './extractors/registry';
 import { buildBlockedInfo, type BlockedSuggestion } from './jobs';
+import { getActiveCallerAuthContext } from './oauth';
 import { isSafePublicHostname } from './overflow';
 import { getActiveRequestTracer, type OtelEnvConfig, type RequestTracer, type TraceContext } from './otel';
-import type { OptionalStorageBindings } from './storage';
+import { sanitizeStorageUserId, type OptionalStorageBindings } from './storage';
 
 export type CatalogRunStatus = 'running' | 'cooling_down' | 'complete' | 'partial' | 'challenged';
 
@@ -154,6 +155,7 @@ interface SnapshotHashBundle {
 }
 
 interface StoredCatalogRun {
+  userId: string;
   summary: CatalogStatusSummary;
   hashes: SnapshotHashBundle | null;
   hashesBytes: number;
@@ -167,6 +169,7 @@ export const MAX_GLOBAL_CATALOG_BYTES = 32 * 1024 * 1024;
 export const MAX_CACHED_CATALOG_RUNS = 8;
 export const MAX_CONCURRENT_CATALOG_PER_PRINCIPAL = 2;
 export const MAX_CONCURRENT_CATALOG_GLOBAL = 8;
+export const MAX_CONCURRENT_CATALOG_NON_OWNER_GLOBAL = 6; // Reserves 2 global slots for `owner` so members cannot starve owner!
 export const MAX_CONCURRENT_R2_RELOADS = 2;
 export const MAX_CATALOG_TOTAL_SLEEP_MS = 120_000;
 export const MAX_CATALOG_WALL_MS = 120_000;
@@ -188,7 +191,47 @@ const r2ReloadWaitQueue: Array<() => void> = [];
 
 const ACTIVE_CATALOG_BY_PRINCIPAL = new Map<string, number>();
 let activeCatalogGlobal = 0;
+let activeCatalogNonOwnerGlobal = 0;
 const D1_INIT_CACHE = new WeakSet<object>();
+
+function resolveCatalogTenantKey(params?: { userId?: string; principal?: string }): {
+  ownerKey: string;
+  concurrencyBucketKey: string;
+  isOwner: boolean;
+} {
+  const activeAuth = getActiveCallerAuthContext();
+  if (typeof params?.userId === 'string' && params.userId.trim()) {
+    const cleanUid = sanitizeStorageUserId(params.userId.trim());
+    const isOwner = activeAuth ? activeAuth.role === 'owner' : cleanUid === 'owner';
+    return { ownerKey: cleanUid, concurrencyBucketKey: cleanUid, isOwner };
+  }
+  if (activeAuth) {
+    const cleanUid = sanitizeStorageUserId(activeAuth.userId);
+    return {
+      ownerKey: cleanUid,
+      concurrencyBucketKey: cleanUid,
+      isOwner: activeAuth.role === 'owner',
+    };
+  }
+  const rawPrincipal = (params?.principal ?? '').trim();
+  if (rawPrincipal === 'anonymous') {
+    return { ownerKey: 'anonymous', concurrencyBucketKey: 'anonymous', isOwner: false };
+  }
+  if (!rawPrincipal || rawPrincipal === 'owner_token' || rawPrincipal === 'mcp_token' || rawPrincipal === 'owner') {
+    return { ownerKey: 'owner', concurrencyBucketKey: 'owner', isOwner: true };
+  }
+  // When invoked directly with `oauth:<client>` without an explicit `userId`, group multi-client member prefixes
+  // (`oauth:member-client-1..N` -> `oauth:member`) so multi-client rotation cannot multiply per-user concurrency!
+  let bucket = rawPrincipal;
+  if (rawPrincipal.startsWith('oauth:')) {
+    const clientPart = rawPrincipal.slice('oauth:'.length);
+    const dashPrefix = /^([a-z0-9_]+)-client-\d+$/i.exec(clientPart);
+    if (dashPrefix?.[1]) {
+      bucket = `oauth:${dashPrefix[1].toLowerCase()}`;
+    }
+  }
+  return { ownerKey: rawPrincipal.slice(0, 128), concurrencyBucketKey: bucket.slice(0, 128), isOwner: false };
+}
 
 function withR2ReloadSemaphore<T>(fn: () => Promise<T>): Promise<T> {
   return new Promise<T>((resolveSlot, rejectSlot) => {
@@ -276,6 +319,7 @@ export function resetCatalogStateForTests(): void {
   INFLIGHT_R2_RELOADS.clear();
   ACTIVE_CATALOG_BY_PRINCIPAL.clear();
   activeCatalogGlobal = 0;
+  activeCatalogNonOwnerGlobal = 0;
   peakR2ReloadsSeen = 0;
 }
 
@@ -436,6 +480,7 @@ async function ensureCatalogRunsTable(db: D1DatabaseLike): Promise<void> {
     .prepare(
       `CREATE TABLE IF NOT EXISTS catalog_runs (
         catalog_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL DEFAULT 'owner',
         origin TEXT NOT NULL,
         platform TEXT NOT NULL,
         collection TEXT NOT NULL DEFAULT '',
@@ -452,12 +497,36 @@ async function ensureCatalogRunsTable(db: D1DatabaseLike): Promise<void> {
     )
     .run();
   await db
+    .prepare("ALTER TABLE catalog_runs ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'")
+    .run()
+    .catch(() => null);
+  await db
     .prepare(
       `CREATE INDEX IF NOT EXISTS idx_catalog_runs_origin_status ON catalog_runs(origin, collection, status, created_at)`,
     )
     .run()
     .catch(() => null);
+  await db
+    .prepare(`CREATE INDEX IF NOT EXISTS idx_catalog_runs_user ON catalog_runs(user_id, created_at DESC)`)
+    .run()
+    .catch(() => null);
   D1_INIT_CACHE.add(key);
+}
+
+function parseStoredCatalogSummary(rawJson: string): { summary: CatalogStatusSummary; ownerUserId: string } | null {
+  try {
+    const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const ownerUserId =
+      typeof parsed._ownerUserId === 'string' && parsed._ownerUserId.trim() ? parsed._ownerUserId.trim() : 'owner';
+    const { _ownerUserId: _omitOwner, ...cleanSummary } = parsed;
+    return {
+      summary: cleanSummary as unknown as CatalogStatusSummary,
+      ownerUserId,
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function persistCatalogRun(
@@ -470,6 +539,7 @@ async function persistCatalogRun(
   try {
     await ensureCatalogRunsTable(db);
     const s = entry.summary;
+    const persistedSummaryJson = JSON.stringify({ ...s, _ownerUserId: entry.userId });
     await db
       .prepare(
         `INSERT OR REPLACE INTO catalog_runs (
@@ -489,11 +559,16 @@ async function persistCatalogRun(
         s.pagesRead,
         s.artifactId ?? null,
         entry.hashes ? JSON.stringify(entry.hashes) : null,
-        JSON.stringify(s),
+        persistedSummaryJson,
         s.createdAt,
         s.updatedAt,
       )
       .run();
+    await db
+      .prepare(`UPDATE catalog_runs SET user_id = ? WHERE catalog_id = ?`)
+      .bind(entry.userId, s.catalogId)
+      .run()
+      .catch(() => null);
   } catch {
     // Non-fatal fallback to in-memory store
   }
@@ -501,6 +576,7 @@ async function persistCatalogRun(
 
 async function findPreviousCompleteCatalogRun(
   env: (OptionalStorageBindings & Record<string, unknown>) | undefined,
+  userId: string,
   origin: string,
   collection: string,
   excludeCatalogId: string,
@@ -515,20 +591,17 @@ async function findPreviousCompleteCatalogRun(
            FROM catalog_runs
            WHERE origin = ? AND collection = ? AND status = 'complete' AND catalog_id != ?
            ORDER BY created_at DESC
-           LIMIT 5`,
+           LIMIT 10`,
         )
         .bind(origin, collection, excludeCatalogId)
         .all<{ catalog_id: string; products_count: number; hashes_json: string | null; summary_json: string }>();
       const rows = rowsRes.results ?? [];
       for (const row of rows) {
-        let parsedSummary: Record<string, unknown> | null = null;
-        try {
-          parsedSummary = JSON.parse(row.summary_json) as Record<string, unknown>;
-        } catch {
-          parsedSummary = null;
-        }
+        const parsedEntry = parseStoredCatalogSummary(row.summary_json);
+        if (parsedEntry && parsedEntry.ownerUserId !== userId) continue;
+        if (!parsedEntry && userId !== 'owner') continue;
         // Never use an already shrink-warned snapshot as the trusted baseline
-        if (parsedSummary?.warning === 'shrink') continue;
+        if (parsedEntry?.summary.warning === 'shrink') continue;
         let hashes: SnapshotHashBundle | null = null;
         if (row.hashes_json) {
           try {
@@ -547,6 +620,7 @@ async function findPreviousCompleteCatalogRun(
   const memEntries = [...MEMORY_CATALOG_RUNS.values()].reverse();
   for (const item of memEntries) {
     if (
+      item.userId === userId &&
       item.summary.catalogId !== excludeCatalogId &&
       item.summary.origin === origin &&
       (item.summary.collection ?? '') === collection &&
@@ -1024,6 +1098,8 @@ function awaitWithDeadline<T>(
  */
 export async function getCatalogStatus(params: {
   catalogId: string;
+  userId?: string;
+  principal?: string;
   env?: OptionalStorageBindings & Record<string, unknown>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const catalogId = params.catalogId.trim();
@@ -1033,9 +1109,16 @@ export async function getCatalogStatus(params: {
   if (!VALID_CATALOG_ID_RE.test(catalogId)) {
     return { status: 400, body: { ok: false, error: 'invalid_catalog_id', message: 'Malformed `catalogId`.' } };
   }
+  const { ownerKey } = resolveCatalogTenantKey({ userId: params.userId, principal: params.principal });
 
   const mem = MEMORY_CATALOG_RUNS.get(catalogId);
   if (mem) {
+    if (mem.userId !== ownerKey) {
+      return {
+        status: 404,
+        body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` },
+      };
+    }
     return { status: 200, body: { ...mem.summary } };
   }
 
@@ -1048,8 +1131,10 @@ export async function getCatalogStatus(params: {
         .bind(catalogId)
         .first<{ summary_json: string }>();
       if (row?.summary_json) {
-        const parsed = JSON.parse(row.summary_json) as CatalogStatusSummary;
-        return { status: 200, body: { ...parsed } };
+        const parsed = parseStoredCatalogSummary(row.summary_json);
+        if (parsed && parsed.ownerUserId === ownerKey) {
+          return { status: 200, body: { ...parsed.summary } };
+        }
       }
     } catch {
       // ignore
@@ -1068,6 +1153,8 @@ export async function getCatalogStatus(params: {
  */
 export async function getCatalogRecords(params: {
   catalogId: string;
+  userId?: string;
+  principal?: string;
   offset?: number;
   limit?: number;
   vendor?: string | string[];
@@ -1083,12 +1170,19 @@ export async function getCatalogRecords(params: {
   if (!VALID_CATALOG_ID_RE.test(catalogId)) {
     return { status: 400, body: { ok: false, error: 'invalid_catalog_id', message: 'Malformed `catalogId`.' } };
   }
+  const { ownerKey } = resolveCatalogTenantKey({ userId: params.userId, principal: params.principal });
 
   let summary: CatalogStatusSummary | null = null;
   let records: CatalogRecord[] | null = null;
 
   const mem = MEMORY_CATALOG_RUNS.get(catalogId);
   if (mem) {
+    if (mem.userId !== ownerKey) {
+      return {
+        status: 404,
+        body: { ok: false, error: 'catalog_not_found', message: `No catalog run found with id "${catalogId}".` },
+      };
+    }
     summary = mem.summary;
     records = mem.records;
   }
@@ -1102,7 +1196,10 @@ export async function getCatalogRecords(params: {
         .bind(catalogId)
         .first<{ summary_json: string }>();
       if (row?.summary_json) {
-        summary = JSON.parse(row.summary_json) as CatalogStatusSummary;
+        const parsed = parseStoredCatalogSummary(row.summary_json);
+        if (parsed && parsed.ownerUserId === ownerKey) {
+          summary = parsed.summary;
+        }
       }
     } catch {
       // ignore
@@ -1202,6 +1299,8 @@ export async function executeCatalogCall(params: {
   executeHubFetch: CatalogHubFetchFn;
   selfHost?: string;
   principal?: string;
+  userId?: string;
+  devTelemetrySetting?: string | boolean | null | (() => Promise<string | boolean | null>);
   ctx?: { waitUntil?: (promise: Promise<unknown>) => void };
   sleepFn?: (ms: number) => Promise<void>;
   tracer?: RequestTracer | TraceContext;
@@ -1229,6 +1328,8 @@ export async function executeCatalogCall(params: {
     if (wantsRecords) {
       return getCatalogRecords({
         catalogId: existingId,
+        userId: params.userId,
+        principal: params.principal,
         offset: typeof payload.offset === 'number' ? payload.offset : undefined,
         limit: typeof payload.limit === 'number' ? payload.limit : undefined,
         vendor:
@@ -1244,7 +1345,12 @@ export async function executeCatalogCall(params: {
         env,
       });
     }
-    return getCatalogStatus({ catalogId: existingId, env });
+    return getCatalogStatus({
+      catalogId: existingId,
+      userId: params.userId,
+      principal: params.principal,
+      env,
+    });
   }
 
   const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
@@ -1303,10 +1409,18 @@ export async function executeCatalogCall(params: {
     };
   }
 
-  // `R5-M4`: Per-principal (`2`) and global (`8`) active catalog pull concurrency guard
-  const principalKey = (params.principal ?? 'anonymous').trim() || 'anonymous';
-  const activeForPrincipal = ACTIVE_CATALOG_BY_PRINCIPAL.get(principalKey) ?? 0;
-  if (activeCatalogGlobal >= MAX_CONCURRENT_CATALOG_GLOBAL || activeForPrincipal >= MAX_CONCURRENT_CATALOG_PER_PRINCIPAL) {
+  // `R5-M4` & Round 7: Per-user (`2`), non-owner aggregate (`6` of `8` — reserving `2` for `owner`), and global (`8`) concurrency guard!
+  const { ownerKey, concurrencyBucketKey, isOwner } = resolveCatalogTenantKey({
+    userId: params.userId,
+    principal: params.principal,
+  });
+  const activeForPrincipal = ACTIVE_CATALOG_BY_PRINCIPAL.get(concurrencyBucketKey) ?? 0;
+  const nonOwnerPoolFull = !isOwner && activeCatalogNonOwnerGlobal >= MAX_CONCURRENT_CATALOG_NON_OWNER_GLOBAL;
+  if (
+    activeCatalogGlobal >= MAX_CONCURRENT_CATALOG_GLOBAL ||
+    nonOwnerPoolFull ||
+    activeForPrincipal >= MAX_CONCURRENT_CATALOG_PER_PRINCIPAL
+  ) {
     return {
       status: 429,
       body: {
@@ -1317,15 +1431,17 @@ export async function executeCatalogCall(params: {
     };
   }
   activeCatalogGlobal++;
-  ACTIVE_CATALOG_BY_PRINCIPAL.set(principalKey, activeForPrincipal + 1);
+  if (!isOwner) activeCatalogNonOwnerGlobal++;
+  ACTIVE_CATALOG_BY_PRINCIPAL.set(concurrencyBucketKey, activeForPrincipal + 1);
   let releasedConcurrencySlot = false;
   const releaseConcurrencySlot = () => {
     if (releasedConcurrencySlot) return;
     releasedConcurrencySlot = true;
     activeCatalogGlobal = Math.max(0, activeCatalogGlobal - 1);
-    const curCount = ACTIVE_CATALOG_BY_PRINCIPAL.get(principalKey) ?? 0;
-    if (curCount <= 1) ACTIVE_CATALOG_BY_PRINCIPAL.delete(principalKey);
-    else ACTIVE_CATALOG_BY_PRINCIPAL.set(principalKey, curCount - 1);
+    if (!isOwner) activeCatalogNonOwnerGlobal = Math.max(0, activeCatalogNonOwnerGlobal - 1);
+    const curCount = ACTIVE_CATALOG_BY_PRINCIPAL.get(concurrencyBucketKey) ?? 0;
+    if (curCount <= 1) ACTIVE_CATALOG_BY_PRINCIPAL.delete(concurrencyBucketKey);
+    else ACTIVE_CATALOG_BY_PRINCIPAL.set(concurrencyBucketKey, curCount - 1);
   };
 
   const wantAsync = payload.sync === false && typeof params.ctx?.waitUntil === 'function';
@@ -1354,6 +1470,7 @@ export async function executeCatalogCall(params: {
   const createdAt = new Date(startedAtMs).toISOString();
 
   const currentEntry: StoredCatalogRun = {
+    userId: ownerKey,
     summary: {
       ok: true,
       catalogId,
@@ -1724,12 +1841,16 @@ export async function executeCatalogCall(params: {
       }
     }
 
-    // Write NDJSON + SnapshotHashBundle artifacts to R2 when `ARTIFACTS` is bound
+    // Write NDJSON + SnapshotHashBundle artifacts to R2 when `ARTIFACTS` is bound (tenant-isolated under `private/<userId>/...` for non-owners!)
     let artifactId: string | undefined;
     let hashesArtifactId: string | undefined;
     const r2 = getArtifactsR2(env);
+    const r2Prefix =
+      ownerKey !== 'owner' && ownerKey !== 'anonymous'
+        ? `private/${sanitizeStorageUserId(ownerKey)}/catalog`
+        : 'catalog';
     if (r2 && finalRecords.length > 0) {
-      const key = `catalog/${catalogId}.ndjson`;
+      const key = `${r2Prefix}/${catalogId}.ndjson`;
       const ndjson = `${finalRecords.map((r) => JSON.stringify(r)).join('\n')}\n`;
       try {
         await r2.put(key, ndjson, {
@@ -1739,7 +1860,7 @@ export async function executeCatalogCall(params: {
       } catch {
         // Non-fatal if R2 put fails
       }
-      const hashesKey = `catalog/${catalogId}.hashes.json`;
+      const hashesKey = `${r2Prefix}/${catalogId}.hashes.json`;
       try {
         await r2.put(hashesKey, JSON.stringify(currHashes), {
           httpMetadata: { contentType: 'application/json; charset=utf-8' },
@@ -1750,12 +1871,12 @@ export async function executeCatalogCall(params: {
       }
     }
 
-    // Shrink Guard & Variant-Level Snapshot Diff against last trusted `complete` run for `(origin, collection)`
+    // Shrink Guard & Variant-Level Snapshot Diff against last trusted `complete` run for `(userId, origin, collection)`
     let shrinkWarning: 'shrink' | undefined;
     let previousProducts: number | undefined;
     let diff: CatalogSnapshotDiff | null = null;
 
-    const prevRun = await findPreviousCompleteCatalogRun(env, parsedUrl.origin, collection, catalogId);
+    const prevRun = await findPreviousCompleteCatalogRun(env, ownerKey, parsedUrl.origin, collection, catalogId);
     if (prevRun) {
       if (prevRun.productsCount > 0 && finalRecords.length < prevRun.productsCount * 0.5) {
         shrinkWarning = 'shrink';
@@ -1831,9 +1952,23 @@ export async function executeCatalogCall(params: {
           : runPull();
       return execPull().finally(async () => {
         if (activeTracer && env) {
-          const otelEnv = env as OtelEnvConfig & { SAFE_FETCH?: typeof fetch };
+          const otelEnv = env as OtelEnvConfig & { SAFE_FETCH?: typeof fetch; SAFE_PUBLIC_FETCH?: typeof fetch };
+          let resolvedDevTel: string | boolean | null | undefined;
+          if (typeof params.devTelemetrySetting === 'function') {
+            try {
+              resolvedDevTel = await params.devTelemetrySetting();
+            } catch {
+              resolvedDevTel = null;
+            }
+          } else {
+            resolvedDevTel = params.devTelemetrySetting;
+          }
           await activeTracer
-            .flush({ env: otelEnv, ...(otelEnv.SAFE_FETCH ? { fetchFn: otelEnv.SAFE_FETCH } : {}) })
+            .flush({
+              env: otelEnv,
+              devTelemetrySetting: resolvedDevTel,
+              ...(otelEnv.SAFE_FETCH ? { fetchFn: otelEnv.SAFE_FETCH } : {}),
+            })
             .catch(() => false);
         }
       });

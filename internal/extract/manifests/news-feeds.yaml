@@ -1,0 +1,1703 @@
+# Shared Go + TypeScript Declarative Site Adapter: Top News & Public Broadcaster Syndication Feeds
+# Upgrades homepage and section hub URLs (strictly exact path segments so individual article URLs still scrape
+# article HTML directly) to robots.txt-permitted HTTPS RSS 2.0 / RDF XML feeds.
+id: news-feeds
+name: "Top News & Public Broadcaster Feeds (NPR, BBC, CBS, NBC, ABC, Guardian, Al Jazeera, DW & Ars Technica)"
+category: commerce-social
+description: "Upgrades homepage and section landing URLs on NPR (including text.npr.org), BBC News, CBS News, NBC News, ABC News, The Guardian, Al Jazeera, DW, and Ars Technica to official robots.txt-allowed HTTPS RSS/RDF XML feeds."
+domains:
+  - www.npr.org
+  - npr.org
+  - text.npr.org
+  - feeds.npr.org
+  - www.bbc.com
+  - bbc.com
+  - www.bbc.co.uk
+  - bbc.co.uk
+  - feeds.bbci.co.uk
+  - www.cbsnews.com
+  - cbsnews.com
+  - www.nbcnews.com
+  - nbcnews.com
+  - feeds.nbcnews.com
+  - abcnews.go.com
+  - www.theguardian.com
+  - theguardian.com
+  - www.aljazeera.com
+  - aljazeera.com
+  - www.dw.com
+  - dw.com
+  - rss.dw.com
+  - arstechnica.com
+  - www.arstechnica.com
+  - feeds.arstechnica.com
+exampleUrls:
+  - "https://www.npr.org/"
+  - "https://text.npr.org/"
+  - "https://www.npr.org/sections/technology"
+  - "https://www.bbc.com/news"
+  - "https://www.bbc.co.uk/news/world"
+  - "https://www.cbsnews.com/"
+  - "https://www.nbcnews.com/news"
+  - "https://abcnews.go.com/US"
+  - "https://www.theguardian.com/world"
+  - "https://www.aljazeera.com/news"
+  - "https://www.dw.com/en"
+  - "https://arstechnica.com/"
+
+routes:
+  # ── 1. NPR (www.npr.org, npr.org, text.npr.org -> feeds.npr.org) ───────────────────────────────
+  - match:
+      anyOf:
+        - hosts: [www.npr.org, npr.org, text.npr.org]
+          exactSegments: true
+          maxSegments: 0
+          defaults:
+            feedLabel: "NPR Top News"
+            feedSource: npr
+        - hosts: [www.npr.org, npr.org, text.npr.org]
+          exactSegments: true
+          maxSegments: 2
+          pathEquals: [/sections/news, /sections/news/]
+          defaults:
+            feedLabel: "NPR News"
+            feedSource: npr
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.npr.org/1001/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline:
+            tags: [title]
+            sliceMax: 200
+          storyUrl:
+            tags: [link, guid]
+          summary:
+            tags: [description, "content:encoded", summary]
+            sliceMax: 280
+            default: "-"
+          published:
+            tags: [pubDate, "dc:date", published, updated]
+            sliceMax: 25
+            default: "-"
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - header: Story
+            template: "[{headline}]({storyUrl})"
+          - header: Summary
+            template: "{summary}"
+          - header: Published
+            template: "{published}"
+
+  - match:
+      hosts: [www.npr.org, npr.org, text.npr.org]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/sections/national, /sections/national/]
+      defaults:
+        feedLabel: "NPR National"
+        feedSource: npr
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.npr.org/1003/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.npr.org, npr.org, text.npr.org]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/sections/world, /sections/world/]
+      defaults:
+        feedLabel: "NPR World"
+        feedSource: npr
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.npr.org/1004/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.npr.org, npr.org, text.npr.org]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/sections/politics, /sections/politics/]
+      defaults:
+        feedLabel: "NPR Politics"
+        feedSource: npr
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.npr.org/1014/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.npr.org, npr.org, text.npr.org]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/sections/business, /sections/business/]
+      defaults:
+        feedLabel: "NPR Business"
+        feedSource: npr
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.npr.org/1006/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.npr.org, npr.org, text.npr.org]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/sections/technology, /sections/technology/]
+      defaults:
+        feedLabel: "NPR Technology"
+        feedSource: npr
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.npr.org/1019/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.npr.org, npr.org, text.npr.org]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/sections/science, /sections/science/]
+      defaults:
+        feedLabel: "NPR Science"
+        feedSource: npr
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.npr.org/1007/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.npr.org, npr.org, text.npr.org]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/sections/health, /sections/health/]
+      defaults:
+        feedLabel: "NPR Health"
+        feedSource: npr
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.npr.org/1128/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 2. BBC News (www.bbc.com, bbc.com, www.bbc.co.uk, bbc.co.uk -> feeds.bbci.co.uk) ────────────
+  - match:
+      hosts: [www.bbc.com, bbc.com, www.bbc.co.uk, bbc.co.uk]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/news, /news/]
+      defaults:
+        feedLabel: "BBC News"
+        feedSource: bbc
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.bbci.co.uk/news/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.bbc.com, bbc.com, www.bbc.co.uk, bbc.co.uk]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/news/world, /news/world/]
+      defaults:
+        feedLabel: "BBC News World"
+        feedSource: bbc
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.bbci.co.uk/news/world/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.bbc.com, bbc.com, www.bbc.co.uk, bbc.co.uk]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/news/business, /news/business/]
+      defaults:
+        feedLabel: "BBC News Business"
+        feedSource: bbc
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.bbci.co.uk/news/business/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.bbc.com, bbc.com, www.bbc.co.uk, bbc.co.uk]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/news/technology, /news/technology/]
+      defaults:
+        feedLabel: "BBC News Technology"
+        feedSource: bbc
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.bbci.co.uk/news/technology/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.bbc.com, bbc.com, www.bbc.co.uk, bbc.co.uk]
+      exactSegments: true
+      maxSegments: 2
+      pathEquals: [/news/science_and_environment, /news/science_and_environment/]
+      defaults:
+        feedLabel: "BBC News Science & Environment"
+        feedSource: bbc
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 3. CBS News (www.cbsnews.com, cbsnews.com) ──────────────────────────────────────────────────
+  - match:
+      hosts: [www.cbsnews.com, cbsnews.com]
+      exactSegments: true
+      maxSegments: 0
+      defaults:
+        feedLabel: "CBS News Latest"
+        feedSource: cbsnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.cbsnews.com/latest/rss/main"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.cbsnews.com, cbsnews.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/us, /us/]
+      defaults:
+        feedLabel: "CBS News U.S."
+        feedSource: cbsnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.cbsnews.com/latest/rss/us"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.cbsnews.com, cbsnews.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/world, /world/]
+      defaults:
+        feedLabel: "CBS News World"
+        feedSource: cbsnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.cbsnews.com/latest/rss/world"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.cbsnews.com, cbsnews.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/politics, /politics/]
+      defaults:
+        feedLabel: "CBS News Politics"
+        feedSource: cbsnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.cbsnews.com/latest/rss/politics"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.cbsnews.com, cbsnews.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/moneywatch, /moneywatch/]
+      defaults:
+        feedLabel: "CBS News MoneyWatch"
+        feedSource: cbsnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.cbsnews.com/latest/rss/moneywatch"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.cbsnews.com, cbsnews.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/technology, /technology/]
+      defaults:
+        feedLabel: "CBS News Technology"
+        feedSource: cbsnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.cbsnews.com/latest/rss/technology"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.cbsnews.com, cbsnews.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/science, /science/]
+      defaults:
+        feedLabel: "CBS News Science"
+        feedSource: cbsnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.cbsnews.com/latest/rss/science"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.cbsnews.com, cbsnews.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/health, /health/]
+      defaults:
+        feedLabel: "CBS News Health"
+        feedSource: cbsnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.cbsnews.com/latest/rss/health"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 4. NBC News (www.nbcnews.com, nbcnews.com -> feeds.nbcnews.com) ─────────────────────────────
+  - match:
+      anyOf:
+        - hosts: [www.nbcnews.com, nbcnews.com]
+          exactSegments: true
+          maxSegments: 0
+          defaults:
+            feedLabel: "NBC News Top Stories"
+            feedSource: nbcnews
+        - hosts: [www.nbcnews.com, nbcnews.com]
+          exactSegments: true
+          maxSegments: 1
+          pathEquals: [/news, /news/, /us-news, /us-news/, /world, /world/]
+          defaults:
+            feedLabel: "NBC News Top Stories"
+            feedSource: nbcnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.nbcnews.com/nbcnews/public/news"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 5. ABC News (abcnews.go.com; case-insensitive pathEquals handles /US & /us) ─────────────────
+  - match:
+      hosts: [abcnews.go.com]
+      exactSegments: true
+      maxSegments: 0
+      defaults:
+        feedLabel: "ABC News Top Stories"
+        feedSource: abcnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://abcnews.go.com/abcnews/topstories"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [abcnews.go.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/US, /US/]
+      defaults:
+        feedLabel: "ABC News U.S."
+        feedSource: abcnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://abcnews.go.com/abcnews/usheadlines"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [abcnews.go.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/International, /International/]
+      defaults:
+        feedLabel: "ABC News International"
+        feedSource: abcnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://abcnews.go.com/abcnews/internationalheadlines"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [abcnews.go.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/Politics, /Politics/]
+      defaults:
+        feedLabel: "ABC News Politics"
+        feedSource: abcnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://abcnews.go.com/abcnews/politicsheadlines"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [abcnews.go.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/Technology, /Technology/]
+      defaults:
+        feedLabel: "ABC News Technology"
+        feedSource: abcnews
+    twin:
+      id: news-feeds
+      fetchUrl: "https://abcnews.go.com/abcnews/technologyheadlines"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 6. The Guardian (www.theguardian.com, theguardian.com) ──────────────────────────────────────
+  - match:
+      anyOf:
+        - hosts: [www.theguardian.com, theguardian.com]
+          exactSegments: true
+          maxSegments: 0
+          defaults:
+            feedLabel: "The Guardian International"
+            feedSource: theguardian
+        - hosts: [www.theguardian.com, theguardian.com]
+          exactSegments: true
+          maxSegments: 1
+          pathEquals: [/international, /international/]
+          defaults:
+            feedLabel: "The Guardian International"
+            feedSource: theguardian
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.theguardian.com/international/rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.theguardian.com, theguardian.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/us, /us/, /us-news, /us-news/]
+      defaults:
+        feedLabel: "The Guardian US News"
+        feedSource: theguardian
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.theguardian.com/us-news/rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.theguardian.com, theguardian.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/uk, /uk/, /uk-news, /uk-news/]
+      defaults:
+        feedLabel: "The Guardian UK News"
+        feedSource: theguardian
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.theguardian.com/uk-news/rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.theguardian.com, theguardian.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/world, /world/]
+      defaults:
+        feedLabel: "The Guardian World"
+        feedSource: theguardian
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.theguardian.com/world/rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.theguardian.com, theguardian.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/politics, /politics/]
+      defaults:
+        feedLabel: "The Guardian Politics"
+        feedSource: theguardian
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.theguardian.com/politics/rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.theguardian.com, theguardian.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/business, /business/]
+      defaults:
+        feedLabel: "The Guardian Business"
+        feedSource: theguardian
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.theguardian.com/business/rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.theguardian.com, theguardian.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/technology, /technology/]
+      defaults:
+        feedLabel: "The Guardian Technology"
+        feedSource: theguardian
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.theguardian.com/technology/rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  - match:
+      hosts: [www.theguardian.com, theguardian.com]
+      exactSegments: true
+      maxSegments: 1
+      pathEquals: [/science, /science/]
+      defaults:
+        feedLabel: "The Guardian Science"
+        feedSource: theguardian
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.theguardian.com/science/rss"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 7. Al Jazeera (www.aljazeera.com, aljazeera.com) ────────────────────────────────────────────
+  - match:
+      anyOf:
+        - hosts: [www.aljazeera.com, aljazeera.com]
+          exactSegments: true
+          maxSegments: 0
+          defaults:
+            feedLabel: "Al Jazeera English"
+            feedSource: aljazeera
+        - hosts: [www.aljazeera.com, aljazeera.com]
+          exactSegments: true
+          maxSegments: 1
+          pathEquals: [/news, /news/]
+          defaults:
+            feedLabel: "Al Jazeera News"
+            feedSource: aljazeera
+    twin:
+      id: news-feeds
+      fetchUrl: "https://www.aljazeera.com/xml/rss/all.xml"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 8. DW / Deutsche Welle (www.dw.com, dw.com -> rss.dw.com RDF) ───────────────────────────────
+  - match:
+      anyOf:
+        - hosts: [www.dw.com, dw.com]
+          exactSegments: true
+          maxSegments: 0
+          defaults:
+            feedLabel: "DW Top Stories"
+            feedSource: dw
+        - hosts: [www.dw.com, dw.com]
+          exactSegments: true
+          maxSegments: 1
+          pathEquals: [/en, /en/]
+          defaults:
+            feedLabel: "DW English"
+            feedSource: dw
+    twin:
+      id: news-feeds
+      fetchUrl: "https://rss.dw.com/rdf/rss-en-all"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 9. Ars Technica (arstechnica.com, www.arstechnica.com -> feeds.arstechnica.com) ─────────────
+  - match:
+      hosts: [arstechnica.com, www.arstechnica.com]
+      exactSegments: true
+      maxSegments: 0
+      defaults:
+        feedLabel: "Ars Technica"
+        feedSource: arstechnica
+    twin:
+      id: news-feeds
+      fetchUrl: "https://feeds.arstechnica.com/arstechnica/index"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }
+
+  # ── 10. Direct Official Syndication Feed Pass-Through (feeds.npr.org, feeds.bbci.co.uk, etc.) ───
+  - match:
+      hosts:
+        - feeds.npr.org
+        - feeds.bbci.co.uk
+        - feeds.nbcnews.com
+        - rss.dw.com
+        - feeds.arstechnica.com
+      minSegments: 1
+      defaults:
+        feedLabel: "Syndicated News Feed"
+        feedSource: rss
+    twin:
+      id: news-feeds
+      fetchUrl: "{requestUrl}"
+      kind: text
+      accept: application/rss+xml
+    extract:
+      xml:
+        mode: items_table
+        requireAnyTags: [rss, channel, "rdf:rdf", feed]
+        itemTag: item
+        channelTitleFallbackParam: feedLabel
+        titleTemplate: "{channelTitle} ({itemCount} stories)"
+        emptyText: "No stories currently listed in feed."
+        limit: 40
+        requireItemVar: headline
+        collectLinkVar: storyUrl
+        emitTotals: true
+        itemVars:
+          headline: { tags: [title], sliceMax: 200 }
+          storyUrl: { tags: [link, guid] }
+          summary: { tags: [description, "content:encoded", summary], sliceMax: 280, default: "-" }
+          published: { tags: [pubDate, "dc:date", published, updated], sliceMax: 25, default: "-" }
+        recordFields:
+          title: "{headline}"
+          url: "{storyUrl}"
+          summary: "{summary}"
+          publishedAt: "{published}"
+          source: "{feedSource}"
+        columns:
+          - { header: Story, template: "[{headline}]({storyUrl})" }
+          - { header: Summary, template: "{summary}" }
+          - { header: Published, template: "{published}" }

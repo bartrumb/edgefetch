@@ -553,12 +553,12 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(sliceText.length, 32);
       assert.equal(sliceText.startsWith('<html>R2BatchData!'), true);
 
-      // Expired / missing artifact returns 404 artifact_expired.
+      // Expired / missing artifact returns 404 artifact_not_found.
       const missingRes = await mf.dispatchFetch(`${ORIGIN}/v1/artifacts/${'dd'.repeat(32)}`, {
         headers: { authorization: `Bearer ${CALLER}` },
       });
       assert.equal(missingRes.status, 404);
-      assert.equal((await missingRes.json()).error, 'artifact_expired');
+      assert.equal((await missingRes.json()).error, 'artifact_not_found');
 
       // S3: MCP read_artifact tool pages stored content by artifactId + offset!
       const mcpPageRes = await mf.dispatchFetch(`${ORIGIN}/mcp`, {
@@ -620,13 +620,13 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         capacityStopStatus: 'capacity_reached',
       });
 
-      // Known META D1 artifact whose R2 object expired returns 410 Gone with clear `artifact_expired` error + message!
+      // Known META D1 artifact whose R2 object expired returns 404 with consistent `artifact_not_found` error + message!
       const expiredGetRes = await mf.dispatchFetch(`${ORIGIN}/v1/artifacts/${s5Out.expiredBlobSha}`, {
         headers: { authorization: `Bearer ${CALLER}` },
       });
-      assert.equal(expiredGetRes.status, 410);
+      assert.equal(expiredGetRes.status, 404);
       const expiredGetJson = await expiredGetRes.json();
-      assert.equal(expiredGetJson.error, 'artifact_expired');
+      assert.equal(expiredGetJson.error, 'artifact_not_found');
       assert.match(expiredGetJson.message ?? '', /expired/i);
 
       // S6 + S7: End-to-end POST /v1/scrape + FTS5 collection indexing + atomic page replacement + POST /v1/extract!
@@ -774,7 +774,8 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       const v1SearchJson = await v1SearchRes.json();
       assert.equal(v1SearchJson.hits.length, 1);
       assert.ok(v1SearchJson.hits[0].score > 0);
-      assert.match(v1SearchJson.hits[0].snippet, /cadmium|axle/i);
+      assert.equal(v1SearchJson.hits[0].snippet, undefined);
+      assert.match(v1SearchJson.hits[0].text, /cadmium|axle/i);
 
       for (const hostileQuery of ['NEAR/3 "unclosed (OR AND NOT * ^ : --- ???', '🚀🔥!!!', '', '日本語 cadmium 48V']) {
         const qRes = await mf.dispatchFetch(`${ORIGIN}/v1/collections/ebike-kb/search`, {
@@ -834,7 +835,8 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(extractJson.ok, true);
       assert.equal(extractJson.results.length, 1);
       assert.equal(extractJson.results[0].cached, true);
-      assert.match(extractJson.results[0].rawContent, /titanium stem bolts to 6 Nm/);
+      assert.equal(extractJson.results[0].rawContent, undefined);
+      assert.match(extractJson.results[0].chunks[0].text, /titanium stem bolts to 6 Nm/);
 
       // V2-1: POST /v1/interact returns 503 fat_agent_required when only a Lite (non-browser-v1) node is connected!
       const noFatRes = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {

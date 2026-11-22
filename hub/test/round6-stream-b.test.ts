@@ -1002,23 +1002,58 @@ await t.test('R6-STREAM-B-7 (cs5.mjs & pct.mjs): overflow.ts achieves 153/153 Go
     for (let lb of lineBuffers) {
       const hashIdx = lb.indexOf(0x23);
       if (hashIdx >= 0) lb = lb.subarray(0, hashIdx);
-      let s = 0;
-      let e = lb.length;
-      while (s < e && (lb[s] === 0x20 || lb[s] === 0x09)) s++;
-      while (e > s && (lb[e - 1] === 0x20 || lb[e - 1] === 0x09)) e--;
-      const trimmedLb = lb.subarray(s, e);
+      const trimDir = (s: string) => s.replace(/^[ \t\uFEFF\u200B\u200C\u200D\u2060]+|[ \t\uFEFF\u200B\u200C\u200D\u2060]+$/g, '');
+      const stripUtf8Zw = (buf: Buffer): Buffer => {
+        let lo = 0;
+        let hi = buf.length;
+        while (lo < hi) {
+          if (buf[lo] === 0x20 || buf[lo] === 0x09) {
+            lo++;
+          } else if (lo + 3 <= hi && buf[lo] === 0xef && buf[lo + 1] === 0xbb && buf[lo + 2] === 0xbf) {
+            lo += 3;
+          } else if (
+            lo + 3 <= hi &&
+            buf[lo] === 0xe2 &&
+            buf[lo + 1] === 0x80 &&
+            (buf[lo + 2] === 0x8b || buf[lo + 2] === 0x8c || buf[lo + 2] === 0x8d || buf[lo + 2] === 0xa0)
+          ) {
+            lo += 3;
+          } else {
+            break;
+          }
+        }
+        while (hi > lo) {
+          if (buf[hi - 1] === 0x20 || buf[hi - 1] === 0x09) {
+            hi--;
+          } else if (hi - 3 >= lo && buf[hi - 3] === 0xef && buf[hi - 2] === 0xbb && buf[hi - 1] === 0xbf) {
+            hi -= 3;
+          } else if (
+            hi - 3 >= lo &&
+            buf[hi - 3] === 0xe2 &&
+            buf[hi - 2] === 0x80 &&
+            (buf[hi - 1] === 0x8b || buf[hi - 1] === 0x8c || buf[hi - 1] === 0x8d || buf[hi - 1] === 0xa0)
+          ) {
+            hi -= 3;
+          } else {
+            break;
+          }
+        }
+        return buf.subarray(lo, hi);
+      };
+      const trimmedLb = stripUtf8Zw(lb);
       if (trimmedLb.length === 0) continue;
       const colon = trimmedLb.indexOf(0x3a);
       if (colon <= 0) continue;
       const rawFieldLb = trimmedLb.subarray(0, colon);
       if (rawFieldLb.indexOf(0x00) >= 0) continue;
-      const field = trimGoWS(new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(rawFieldLb)).toLowerCase();
-      let vs = colon + 1;
-      let ve = trimmedLb.length;
-      while (vs < ve && (trimmedLb[vs] === 0x20 || trimmedLb[vs] === 0x09)) vs++;
-      while (ve > vs && (trimmedLb[ve - 1] === 0x20 || trimmedLb[ve - 1] === 0x09)) ve--;
-      const valLb = trimmedLb.subarray(vs, ve);
-      const valText = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(valLb);
+      const field = trimDir(new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(rawFieldLb))
+        .replace(/\u0130/g, 'i')
+        .replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) | 32));
+      let rawValSlice = trimmedLb.subarray(colon + 1);
+      const nulIdx = rawValSlice.indexOf(0x00);
+      if (nulIdx >= 0) rawValSlice = rawValSlice.subarray(0, nulIdx);
+      const valLb = stripUtf8Zw(rawValSlice);
+      const valText = trimDir(new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(valLb));
 
       if (field === 'user-agent') {
         seenAnyUa = true;

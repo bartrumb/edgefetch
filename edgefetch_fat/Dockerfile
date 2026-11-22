@@ -3,7 +3,7 @@
 # Every Chromium subresource socket is forced through EdgeFetch's in-process loopback `SSRFProxy` (`MAP * ~NOTFOUND`).
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.7.0
+ARG BUILD_VERSION=2.7.1
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -34,7 +34,11 @@ RUN apk add --no-cache \
 COPY --from=build /out/edgefetch /edgefetch
 # The real binary, not /usr/bin/chromium-browser: on Alpine that is a /bin/sh launcher script, and the AppArmor
 # profile lets no shell run, so every launch failed with "permission denied" (2.0.0).
+# Home Assistant OS confines add-on containers under the `edgefetch_fat` AppArmor profile + Docker's default seccomp
+# (which blocks unprivileged `CLONE_NEWUSER` namespaces), so explicitly opt into `--no-sandbox` inside HAOS while
+# keeping AppArmor + UID 65532 + PR_SET_NO_NEW_PRIVS=1 + PR_SET_DUMPABLE=0 + SSRFProxy active.
 ENV EDGEFETCH_CHROME_BIN=/usr/lib/chromium/chromium \
+    EDGEFETCH_ALLOW_NO_SANDBOX=1 \
     GOMEMLIMIT=384MiB \
     HOME=/tmp
 ENTRYPOINT ["/edgefetch", "--mode=agent"]

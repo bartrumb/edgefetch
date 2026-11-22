@@ -4,7 +4,7 @@
 Package `agent` implements the outbound-only WebSocket worker loop connecting EdgeFetch standby nodes to a remote or self-hosted coordination hub (`AgentHubDO` or `internal/hub`), executing dispatched crawl batches, streaming optional out-of-band gzipped artifacts, and draining active jobs gracefully on shutdown.
 
 ## Interface
-- `[agent.go:Version]`: `var Version = "2.7.0"` — build-overridable release string advertised in `X-Agent-Version` and `agent_hello`.
+- `[agent.go:Version]`: `var Version = "2.7.1"` — build-overridable release string advertised in `X-Agent-Version` and `agent_hello`.
 - `[agent.go:DefaultPingInterval]`, `[agent.go:DefaultReadWatchdog]`, `[agent.go:DefaultHealthyResetDur]`, `[agent.go:DefaultShutdownDrain]`, `[agent.go:DefaultUploadTimeout]`, `[agent.go:DefaultShutdownUploadTimeout]`: Default session timing constants (`30s`, `50s`, `30s`, `25s`, `45s`, `10s`).
 - `[agent.go:RuntimeOpts]`: `struct` configuring `PingInterval`, `ReadWatchdog`, `HealthyResetDur`, `ShutdownDrain`, `UploadTimeout`, `ShutdownUploadTimeout`, and `OnConnected` callback.
 - `[agent.go:RunAll]`: `func RunAll(ctx context.Context, cfg Config, crawler *crawl.Crawler, allow func(*url.URL) error, hubTransport http.RoundTripper, log *slog.Logger, rtOpts RuntimeOpts) error` — warms `crawler` (`6s` bounded timeout) and runs concurrent outbound sessions across all configured `cfg.HubURLs` (or `cfg.HubURL`).

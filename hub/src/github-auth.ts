@@ -18,12 +18,13 @@ import { SignJWT, jwtVerify } from 'jose';
 import * as oauth from 'oauth4webapi';
 import { MIN_TOKEN_LENGTH, sameBytes } from './auth';
 import {
-  ADMIN_COOKIE_NAME,
   escapeHtml,
   formatCookie,
   isEffectiveHttpsOrigin,
   randomUrlToken,
   readCookie,
+  resolveAdminCookieAttrs,
+  sha256Base64Url,
   type HubUserRecord,
   type OAuthStore,
   type UserRole,
@@ -32,6 +33,7 @@ import { normalizeClientRateLimitIp } from './safe-input';
 
 export const GITHUB_STATE_COOKIE_SECURE = '__Host-ef_gh_oauth';
 export const GITHUB_STATE_COOKIE_DEV = 'ef_gh_oauth';
+export const PINNED_OWNER_GITHUB_ID_SETTING_KEY = 'pinned_owner_github_id';
 const GITHUB_STATE_TTL_MS = 10 * 60_000; // 10m PKCE + state flow window
 const ADMIN_JWT_TTL_MS = 8 * 60 * 60_000; // 8h browser session
 const CALLBACK_RATE_LIMIT_WINDOW_MS = 5 * 60_000;
@@ -41,6 +43,7 @@ const JWT_ISSUER = 'urn:edgefetch:hub';
 const JWT_AUDIENCE = 'urn:edgefetch:admin';
 
 const GITHUB_LOGIN_RE = /^[a-z0-9](?:[a-z0-9-]{0,38})$/i;
+const GITHUB_NUMERIC_ID_RE = /^[1-9][0-9]{0,19}$/;
 
 const GITHUB_AS: oauth.AuthorizationServer = {
   issuer: 'https://github.com',
@@ -75,6 +78,7 @@ export interface GitHubAuthEnv {
   GITHUB_CLIENT_SECRET?: string;
   GITHUB_ALLOWED_USERS?: string;
   GITHUB_OWNER_LOGIN?: string;
+  GITHUB_OWNER_ID?: string;
   SIGNUP_MODE?: string;
   SAFE_PUBLIC_FETCH?: typeof fetch;
   SAFE_FETCH?: typeof fetch;
@@ -85,6 +89,7 @@ export interface VerifiedSessionJwt {
   userId: string;
   role: UserRole;
   authMethod: 'github' | 'owner_token';
+  epoch: number;
   jti: string;
   csrf: string;
   githubLogin?: string;
@@ -99,16 +104,22 @@ export function isGitHubAuthConfigured(env: Pick<GitHubAuthEnv, 'GITHUB_CLIENT_I
 }
 
 /**
- * Resolves the canonical Hub session/HMAC signing secret (`SESSION_SECRET ?? CALLER_TOKEN ?? GITHUB_CLIENT_SECRET`).
+ * Resolves the canonical Hub session/HMAC signing secret:
+ *  - If `SESSION_SECRET` is configured, it MUST be `>= MIN_TOKEN_LENGTH` (fails closed as `undefined` if too short — never silently falling back to `CALLER_TOKEN`!).
+ *  - When `SESSION_SECRET` is omitted and GitHub OAuth is configured, mixes `GITHUB_CLIENT_SECRET` with `CALLER_TOKEN` so `CALLER_TOKEN` alone cannot forge GitHub user JWTs.
  */
 export function resolveSessionSecret(env: Pick<GitHubAuthEnv, 'SESSION_SECRET' | 'CALLER_TOKEN' | 'GITHUB_CLIENT_ID' | 'GITHUB_CLIENT_SECRET'>): string | undefined {
-  const sessionSec = (env.SESSION_SECRET ?? '').trim();
-  if (sessionSec.length >= MIN_TOKEN_LENGTH) return sessionSec;
-  const callerTok = (env.CALLER_TOKEN ?? '').trim();
-  if (callerTok.length >= MIN_TOKEN_LENGTH) return callerTok;
-  if (isGitHubAuthConfigured(env)) {
-    return (env.GITHUB_CLIENT_SECRET ?? '').trim();
+  const rawSessionSec = env.SESSION_SECRET;
+  if (typeof rawSessionSec === 'string' && rawSessionSec.trim().length > 0) {
+    const sessionSec = rawSessionSec.trim();
+    return sessionSec.length >= MIN_TOKEN_LENGTH ? sessionSec : undefined;
   }
+  const callerTok = (env.CALLER_TOKEN ?? '').trim();
+  if (isGitHubAuthConfigured(env)) {
+    const ghSecret = (env.GITHUB_CLIENT_SECRET ?? '').trim();
+    return callerTok.length >= MIN_TOKEN_LENGTH ? `gh-sess:${callerTok}:${ghSecret}` : ghSecret;
+  }
+  if (callerTok.length >= MIN_TOKEN_LENGTH) return callerTok;
   return undefined;
 }
 
@@ -120,21 +131,42 @@ export function normalizeSignupMode(raw?: string): SignupMode {
   return 'invite_only';
 }
 
-export function parseGitHubAllowlist(raw?: string): { users: Set<string>; orgs: Set<string> } {
+export function parseGitHubAllowlist(raw?: string): { users: Set<string>; userIds: Set<string>; orgs: Set<string> } {
   const users = new Set<string>();
+  const userIds = new Set<string>();
   const orgs = new Set<string>();
-  if (!raw || !raw.trim()) return { users, orgs };
+  if (!raw || !raw.trim()) return { users, userIds, orgs };
   for (const part of raw.split(/[\s,]+/)) {
     const trimmed = part.trim().toLowerCase();
     if (!trimmed) continue;
     if (trimmed.startsWith('@')) {
       const org = trimmed.slice(1);
       if (GITHUB_LOGIN_RE.test(org)) orgs.add(org);
+    } else if (trimmed.startsWith('id:') && GITHUB_NUMERIC_ID_RE.test(trimmed.slice(3))) {
+      userIds.add(trimmed.slice(3));
+    } else if (GITHUB_NUMERIC_ID_RE.test(trimmed)) {
+      userIds.add(trimmed);
+      users.add(trimmed);
     } else if (GITHUB_LOGIN_RE.test(trimmed)) {
       users.add(trimmed);
     }
   }
-  return { users, orgs };
+  return { users, userIds, orgs };
+}
+
+export function isGitHubUserDeAllowlisted(user: HubUserRecord, env?: GitHubAuthEnv): boolean {
+  if (!env || !isGitHubAuthConfigured(env)) return false;
+  if (user.role === 'owner' || user.userId === 'owner') return false;
+  const mode = normalizeSignupMode(env.SIGNUP_MODE);
+  if (mode === 'open') return false;
+  const allowlist = parseGitHubAllowlist(env.GITHUB_ALLOWED_USERS);
+  if (allowlist.orgs.size > 0) return false;
+  if (mode === 'allowlist' || mode === 'invite_only') {
+    const loginOk = Boolean(user.githubLogin && allowlist.users.has(user.githubLogin.toLowerCase()));
+    const idOk = Boolean(user.githubId && allowlist.userIds.has(String(user.githubId)));
+    return !loginOk && !idOk;
+  }
+  return false;
 }
 
 export function sanitizeRelativeReturnTo(raw: string | null | undefined): string {
@@ -144,11 +176,16 @@ export function sanitizeRelativeReturnTo(raw: string | null | undefined): string
     return '/admin';
   }
   if (/[\r\n\0]/.test(trimmed)) return '/admin';
-  const pathPart = trimmed.split('?')[0] ?? '';
-  if (pathPart !== '/admin' && pathPart !== '/oauth/authorize') {
+  const qIdx = trimmed.indexOf('?');
+  const pathPart = qIdx >= 0 ? trimmed.slice(0, qIdx) : trimmed;
+  if (pathPart === '/admin') {
+    // Strip arbitrary query parameters (`/admin?next=...`) to prevent post-login open-redirect gadget chains.
     return '/admin';
   }
-  return trimmed.slice(0, 1_024);
+  if (pathPart === '/oauth/authorize') {
+    return trimmed.slice(0, 1_024);
+  }
+  return '/admin';
 }
 
 const hkdfKeyCache = new Map<string, Uint8Array>();
@@ -181,15 +218,17 @@ export async function mintSessionJwt(params: {
   secret: string;
   userId: string;
   role: UserRole;
+  epoch?: number;
   authMethod?: 'github' | 'owner_token';
   githubLogin?: string;
   avatarUrl?: string;
   now?: number;
   ttlMs?: number;
-}): Promise<{ token: string; jti: string; csrf: string; maxAgeSec: number; expiresAt: number }> {
+}): Promise<{ token: string; jti: string; csrf: string; epoch: number; maxAgeSec: number; expiresAt: number }> {
   const now = params.now ?? Date.now();
   const ttlMs = params.ttlMs ?? ADMIN_JWT_TTL_MS;
   const expiresAt = now + ttlMs;
+  const epoch = typeof params.epoch === 'number' && Number.isInteger(params.epoch) && params.epoch >= 1 ? params.epoch : 1;
   const jti = `jti_${randomUrlToken(18)}`;
   const csrf = randomUrlToken(24);
   const key = await deriveAdminJwtKey(params.secret);
@@ -197,6 +236,7 @@ export async function mintSessionJwt(params: {
   const token = await new SignJWT({
     csrf,
     role: params.role,
+    ep: epoch,
     auth: params.authMethod ?? 'github',
     ...(params.githubLogin ? { login: params.githubLogin } : {}),
     ...(params.avatarUrl ? { avatar: params.avatarUrl } : {}),
@@ -214,6 +254,7 @@ export async function mintSessionJwt(params: {
     token,
     jti,
     csrf,
+    epoch,
     maxAgeSec: Math.floor(ttlMs / 1_000),
     expiresAt,
   };
@@ -240,6 +281,7 @@ export async function verifySessionJwt(
     const jti = typeof payload.jti === 'string' ? payload.jti.trim() : '';
     const csrf = typeof payload.csrf === 'string' ? payload.csrf.trim() : '';
     const role: UserRole | null = payload.role === 'owner' ? 'owner' : payload.role === 'member' ? 'member' : null;
+    const epoch = typeof payload.ep === 'number' && Number.isInteger(payload.ep) && payload.ep >= 1 ? payload.ep : 1;
     const expSec = typeof payload.exp === 'number' ? payload.exp : 0;
     if (!sub || !jti || csrf.length < 16 || !role || !Number.isFinite(expSec) || expSec * 1_000 <= now) {
       return { ok: false };
@@ -250,6 +292,7 @@ export async function verifySessionJwt(
       userId: sub,
       role,
       authMethod,
+      epoch,
       jti,
       csrf,
       ...(typeof payload.login === 'string' && payload.login ? { githubLogin: payload.login } : {}),
@@ -263,6 +306,7 @@ export async function verifySessionJwt(
 
 interface SealedGitHubState {
   state: string;
+  nonce: string;
   codeVerifier: string;
   returnTo: string;
   exp: number;
@@ -303,6 +347,8 @@ async function unsealGitHubState(secret: string, raw: string, now: number): Prom
     if (
       !parsed ||
       typeof parsed.state !== 'string' ||
+      typeof parsed.nonce !== 'string' ||
+      parsed.nonce.length < 16 ||
       typeof parsed.codeVerifier !== 'string' ||
       typeof parsed.exp !== 'number' ||
       parsed.exp <= now
@@ -359,20 +405,26 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
            github_login TEXT NOT NULL,
            avatar_url TEXT,
            role TEXT NOT NULL DEFAULT 'member',
+           session_epoch INTEGER NOT NULL DEFAULT 1,
+           disabled INTEGER NOT NULL DEFAULT 0,
            created_at INTEGER NOT NULL,
            last_login_at INTEGER NOT NULL
          )`,
       )
       .run();
+    await metaDb.prepare('ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1').run().catch(() => undefined);
+    await metaDb.prepare('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0').run().catch(() => undefined);
     await metaDb
       .prepare(
-        `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, created_at, last_login_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, session_epoch, disabled, created_at, last_login_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
            github_id = COALESCE(excluded.github_id, users.github_id),
            github_login = excluded.github_login,
            avatar_url = excluded.avatar_url,
            role = excluded.role,
+           session_epoch = excluded.session_epoch,
+           disabled = excluded.disabled,
            last_login_at = excluded.last_login_at`,
       )
       .bind(
@@ -381,6 +433,8 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
         user.githubLogin ?? user.userId,
         user.avatarUrl ?? null,
         user.role,
+        user.sessionEpoch ?? 1,
+        user.disabled ? 1 : 0,
         user.createdAt,
         user.lastLoginAt,
       )
@@ -388,6 +442,26 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
   } catch {
     // Non-fatal mirror when optional META D1 is unmigrated or read-only in tests
   }
+}
+
+function resolveCanonicalCallbackOrigin(url: URL, publicOrigin?: string): string {
+  if (typeof publicOrigin === 'string' && publicOrigin.trim()) {
+    try {
+      return new URL(publicOrigin.trim()).origin;
+    } catch {
+      // fall back to url.origin
+    }
+  }
+  return url.origin;
+}
+
+function resolveGitHubStateCookieAttrs(url: URL, publicOrigin?: string): { name: string; secure: boolean; strictHostPrefix: boolean } {
+  const adminAttrs = resolveAdminCookieAttrs(url, publicOrigin);
+  return {
+    name: adminAttrs.strictHostPrefix ? GITHUB_STATE_COOKIE_SECURE : GITHUB_STATE_COOKIE_DEV,
+    secure: adminAttrs.secure,
+    strictHostPrefix: adminAttrs.strictHostPrefix,
+  };
 }
 
 export async function startGitHubOAuthFlow(params: {
@@ -407,16 +481,17 @@ export async function startGitHubOAuthFlow(params: {
   }
 
   const clientId = env.GITHUB_CLIENT_ID!.trim();
-  const isSecure = isEffectiveHttpsOrigin(url, publicOrigin);
-  const cookieName = isSecure ? GITHUB_STATE_COOKIE_SECURE : GITHUB_STATE_COOKIE_DEV;
+  const stateCookieAttrs = resolveGitHubStateCookieAttrs(url, publicOrigin);
   const returnTo = sanitizeRelativeReturnTo(url.searchParams.get('return_to'));
 
   const codeVerifier = oauth.generateRandomCodeVerifier();
   const codeChallenge = await oauth.calculatePKCECodeChallenge(codeVerifier);
   const state = oauth.generateRandomState();
+  const nonce = randomUrlToken(24);
 
   const sealedCookie = await sealGitHubState(signingSecret, {
     state,
+    nonce,
     codeVerifier,
     returnTo,
     exp: now + GITHUB_STATE_TTL_MS,
@@ -424,7 +499,8 @@ export async function startGitHubOAuthFlow(params: {
 
   const allowlist = parseGitHubAllowlist(env.GITHUB_ALLOWED_USERS);
   const ghScope = allowlist.orgs.size > 0 ? 'read:user read:org' : 'read:user';
-  const redirectUri = `${url.origin}/admin/auth/github/callback`;
+  const callbackOrigin = resolveCanonicalCallbackOrigin(url, publicOrigin);
+  const redirectUri = `${callbackOrigin}/admin/auth/github/callback`;
 
   const authorizeUrl = new URL(GITHUB_AS.authorization_endpoint!);
   authorizeUrl.searchParams.set('client_id', clientId);
@@ -441,11 +517,11 @@ export async function startGitHubOAuthFlow(params: {
   });
   headers.append(
     'set-cookie',
-    formatCookie(cookieName, sealedCookie, {
+    formatCookie(stateCookieAttrs.name, sealedCookie, {
       maxAge: Math.floor(GITHUB_STATE_TTL_MS / 1_000),
       path: '/',
       sameSite: 'Lax',
-      secure: isSecure,
+      secure: stateCookieAttrs.secure,
     }),
   );
   return {
@@ -462,6 +538,8 @@ export async function handleGitHubOAuthCallback(params: {
   metaDb?: D1Database;
   serviceName: string;
   publicOrigin?: string;
+  getHubSetting?: (key: string) => Promise<string | null>;
+  setHubSetting?: (key: string, value: string) => Promise<void>;
   now?: number;
   onEvent?: (ev: {
     level: 'info' | 'warn' | 'error';
@@ -471,7 +549,7 @@ export async function handleGitHubOAuthCallback(params: {
     details?: Record<string, unknown>;
   }) => Promise<void> | void;
 }): Promise<{ response: Response; outcome: string; userId?: string; role?: UserRole }> {
-  const { request, url, env, oauthStore, metaDb, serviceName, publicOrigin, now = Date.now(), onEvent } = params;
+  const { request, url, env, oauthStore, metaDb, serviceName, publicOrigin, getHubSetting, setHubSetting, now = Date.now(), onEvent } = params;
   const signingSecret = resolveSessionSecret(env);
   if (!isGitHubAuthConfigured(env) || !signingSecret) {
     return {
@@ -480,13 +558,13 @@ export async function handleGitHubOAuthCallback(params: {
     };
   }
 
-  const isSecure = isEffectiveHttpsOrigin(url, publicOrigin);
-  const cookieName = isSecure ? GITHUB_STATE_COOKIE_SECURE : GITHUB_STATE_COOKIE_DEV;
-  const clearStateCookieHeader = formatCookie(cookieName, '', {
+  const stateCookieAttrs = resolveGitHubStateCookieAttrs(url, publicOrigin);
+  const adminCookieAttrs = resolveAdminCookieAttrs(url, publicOrigin);
+  const clearStateCookieHeader = formatCookie(stateCookieAttrs.name, '', {
     maxAge: 0,
     path: '/',
     sameSite: 'Lax',
-    secure: isSecure,
+    secure: stateCookieAttrs.secure,
   });
 
   const makeErrorResponse = (status: number, outcome: string, title: string, message: string, extraHeaders?: Record<string, string>) => {
@@ -510,10 +588,12 @@ export async function handleGitHubOAuthCallback(params: {
     );
   }
 
+  // Login CSRF hardening: on HTTPS / non-loopback origins, read STRICTLY `__Host-ef_gh_oauth` and NEVER fall back to
+  // an unprefixed `ef_gh_oauth` cookie that a sibling subdomain could toss!
   const rawCookieHeader = request.headers.get('cookie');
-  const rawStateCookie =
-    readCookie(rawCookieHeader, cookieName) ??
-    (cookieName !== GITHUB_STATE_COOKIE_DEV ? readCookie(rawCookieHeader, GITHUB_STATE_COOKIE_DEV) : null);
+  const rawStateCookie = stateCookieAttrs.strictHostPrefix
+    ? readCookie(rawCookieHeader, GITHUB_STATE_COOKIE_SECURE)
+    : (readCookie(rawCookieHeader, GITHUB_STATE_COOKIE_DEV) ?? readCookie(rawCookieHeader, GITHUB_STATE_COOKIE_SECURE));
   if (!rawStateCookie) {
     await oauthStore.recordAuthFailure(`gh_cb:${clientIp}`, now, CALLBACK_RATE_LIMIT_WINDOW_MS, CALLBACK_RATE_LIMIT_MAX_FAILURES);
     return makeErrorResponse(400, 'missing_state_cookie', 'Sign-In Session Expired', 'Missing or expired OAuth state cookie. Please start sign-in again.');
@@ -528,7 +608,8 @@ export async function handleGitHubOAuthCallback(params: {
   const clientId = env.GITHUB_CLIENT_ID!.trim();
   const clientSecret = env.GITHUB_CLIENT_SECRET!.trim();
   const oauthClient: oauth.Client = { client_id: clientId };
-  const redirectUri = `${url.origin}/admin/auth/github/callback`;
+  const callbackOrigin = resolveCanonicalCallbackOrigin(url, publicOrigin);
+  const redirectUri = `${callbackOrigin}/admin/auth/github/callback`;
   const customFetch = resolveGitHubSafeFetch(env);
 
   let validatedParams: URLSearchParams;
@@ -541,6 +622,16 @@ export async function handleGitHubOAuthCallback(params: {
     }
     return makeErrorResponse(400, 'state_mismatch', 'Invalid OAuth Callback', 'State parameter mismatch or malformed callback parameters.');
   }
+
+  // Strictly single-use state nonce check BEFORE exchanging authorization code (prevents state cookie replay!).
+  const stateNonceHash = await sha256Base64Url(`${sealed.state}:${sealed.nonce}`);
+  const replayKey = `revoked_admin:gh_state:${stateNonceHash}`;
+  const stateFresh = await oauthStore.checkAuthLockout(replayKey, now, 1);
+  if (!stateFresh.allowed) {
+    await oauthStore.recordAuthFailure(`gh_cb:${clientIp}`, now, CALLBACK_RATE_LIMIT_WINDOW_MS, CALLBACK_RATE_LIMIT_MAX_FAILURES);
+    return makeErrorResponse(400, 'replayed_state_cookie', 'Sign-In State Already Used', 'This OAuth sign-in state has already been consumed. Please start sign-in again.');
+  }
+  await oauthStore.recordAuthFailure(replayKey, now, GITHUB_STATE_TTL_MS + 60_000, 1);
 
   let accessToken: string;
   try {
@@ -608,28 +699,104 @@ export async function handleGitHubOAuthCallback(params: {
     return makeErrorResponse(502, 'github_user_error', 'GitHub Profile Fetch Failed', 'Unable to verify GitHub account profile.');
   }
 
-  const userId = `gh_${ghId}`;
+  const ghIdStr = String(ghId);
+  const userId = `gh_${ghIdStr}`;
   const loginLower = ghLogin.toLowerCase();
   const ownerLoginLower = (env.GITHUB_OWNER_LOGIN ?? '').trim().toLowerCase();
+  const rawConfiguredOwnerId = (env.GITHUB_OWNER_ID ?? '').trim();
+  if (rawConfiguredOwnerId && !GITHUB_NUMERIC_ID_RE.test(rawConfiguredOwnerId)) {
+    return makeErrorResponse(500, 'invalid_owner_id_config', 'Invalid Owner Configuration', 'GITHUB_OWNER_ID must be a positive numeric GitHub user ID.');
+  }
   const signupMode = normalizeSignupMode(env.SIGNUP_MODE);
   const allowlist = parseGitHubAllowlist(env.GITHUB_ALLOWED_USERS);
 
   const existingUser = (await oauthStore.getUser?.(userId)) ?? null;
-  const totalUsers = (await oauthStore.countUsers?.()) ?? 0;
+  if (existingUser?.disabled) {
+    await onEvent?.({
+      level: 'warn',
+      category: 'oauth',
+      event: 'github_disabled_user_denied',
+      summary: `Blocked sign-in for removed/disabled GitHub user @${ghLogin} (${userId})`,
+      details: { userId, githubLogin: ghLogin },
+    });
+    return makeErrorResponse(
+      403,
+      'account_disabled',
+      'Account Removed',
+      `GitHub account @${ghLogin} has been disabled or removed from this Hub.`,
+    );
+  }
+
+  const activeUsers = (await oauthStore.listUsers?.()) ?? [];
+  const totalUsers = (await oauthStore.countUsers?.()) ?? activeUsers.length;
+
+  // Block recycled/squatted GitHub logins claiming an active Hub member/owner's handle with a different numeric `github_id`!
+  const collidingUser = activeUsers.find(
+    (u) => u.userId !== userId && !u.disabled && (u.githubLogin ?? '').toLowerCase() === loginLower,
+  );
+  if (collidingUser) {
+    await onEvent?.({
+      level: 'warn',
+      category: 'oauth',
+      event: 'github_login_collision_blocked',
+      summary: `Blocked recycled GitHub handle @${ghLogin} (${userId}) colliding with existing ${collidingUser.userId}`,
+      details: { userId, existingUserId: collidingUser.userId, githubLogin: ghLogin },
+    });
+    return makeErrorResponse(
+      403,
+      'login_collision',
+      'Account Handle Conflict',
+      `GitHub login @${ghLogin} is already bound to a different immutable GitHub numeric ID on this Hub.`,
+    );
+  }
+
+  // H6: Resolve immutable numeric owner GitHub ID (`GITHUB_OWNER_ID` env OR `pinned_owner_github_id` in `hub_settings` / existing owner row).
+  const storedPinnedOwnerId = (await getHubSetting?.(PINNED_OWNER_GITHUB_ID_SETTING_KEY))?.trim() || '';
+  const fallbackExistingOwner = activeUsers
+    .filter((u) => u.role === 'owner' && !u.disabled && u.githubId && GITHUB_NUMERIC_ID_RE.test(u.githubId))
+    .sort((a, b) => a.createdAt - b.createdAt)[0];
+  const pinnedOwnerGithubId =
+    rawConfiguredOwnerId ||
+    (GITHUB_NUMERIC_ID_RE.test(storedPinnedOwnerId) ? storedPinnedOwnerId : '') ||
+    (fallbackExistingOwner?.githubId ?? '');
+
+  // If `GITHUB_OWNER_LOGIN` is claimed by a DIFFERENT numeric GitHub ID after an account rename, REJECT immediately!
+  if (ownerLoginLower && loginLower === ownerLoginLower && pinnedOwnerGithubId && ghIdStr !== pinnedOwnerGithubId) {
+    await onEvent?.({
+      level: 'warn',
+      category: 'oauth',
+      event: 'github_owner_impersonation_blocked',
+      summary: `Blocked GitHub login @${ghLogin} (${userId}) from claiming owner handle pinned to gh_${pinnedOwnerGithubId}`,
+      details: { userId, pinnedOwnerGithubId, githubLogin: ghLogin },
+    });
+    return makeErrorResponse(
+      403,
+      'owner_id_mismatch',
+      'Owner Identity Mismatch',
+      'This GitHub handle does not match the Hub’s pinned immutable numeric owner ID.',
+    );
+  }
 
   let allowed = false;
   let assignedRole: UserRole = existingUser?.role ?? 'member';
+  let shouldPinOwnerId = false;
 
-  if (ownerLoginLower && loginLower === ownerLoginLower) {
+  if (pinnedOwnerGithubId && ghIdStr === pinnedOwnerGithubId) {
     allowed = true;
     assignedRole = 'owner';
-  } else if (signupMode === 'bootstrap_first' && totalUsers === 0 && !ownerLoginLower) {
+    if (!storedPinnedOwnerId) shouldPinOwnerId = true;
+  } else if (!pinnedOwnerGithubId && ownerLoginLower && loginLower === ownerLoginLower) {
     allowed = true;
     assignedRole = 'owner';
+    shouldPinOwnerId = true;
+  } else if (!pinnedOwnerGithubId && signupMode === 'bootstrap_first' && totalUsers === 0 && !ownerLoginLower) {
+    allowed = true;
+    assignedRole = 'owner';
+    shouldPinOwnerId = true;
   } else if (existingUser?.role === 'owner') {
     allowed = true;
     assignedRole = 'owner';
-  } else if (allowlist.users.has(loginLower)) {
+  } else if (allowlist.userIds.has(ghIdStr) || allowlist.users.has(loginLower)) {
     allowed = true;
   } else if (allowlist.orgs.size > 0) {
     try {
@@ -690,22 +857,30 @@ export async function handleGitHubOAuthCallback(params: {
 
   await oauthStore.clearAuthFailures(`gh_cb:${clientIp}`);
 
+  if (shouldPinOwnerId) {
+    await setHubSetting?.(PINNED_OWNER_GITHUB_ID_SETTING_KEY, ghIdStr);
+  }
+
+  const sessionEpoch = existingUser?.sessionEpoch ?? 1;
   const userRecord: HubUserRecord = {
     userId,
-    githubId: String(ghId),
+    githubId: ghIdStr,
     githubLogin: ghLogin,
     ...(ghAvatarUrl ? { avatarUrl: ghAvatarUrl } : {}),
     role: assignedRole,
+    sessionEpoch,
+    disabled: false,
     createdAt: existingUser?.createdAt ?? now,
     lastLoginAt: now,
   };
-  await oauthStore.upsertUser?.(userRecord);
-  await mirrorUserToMetaD1(metaDb, userRecord);
+  const savedUser = (await oauthStore.upsertUser?.(userRecord)) ?? userRecord;
+  await mirrorUserToMetaD1(metaDb, savedUser);
 
   const minted = await mintSessionJwt({
     secret: signingSecret,
     userId,
-    role: assignedRole,
+    role: savedUser.role,
+    epoch: savedUser.sessionEpoch ?? sessionEpoch,
     authMethod: 'github',
     githubLogin: ghLogin,
     ...(ghAvatarUrl ? { avatarUrl: ghAvatarUrl } : {}),
@@ -716,8 +891,8 @@ export async function handleGitHubOAuthCallback(params: {
     level: 'info',
     category: 'oauth',
     event: 'github_login_ok',
-    summary: `GitHub user @${ghLogin} (${userId}, role=${assignedRole}) signed in`,
-    details: { userId, githubLogin: ghLogin, role: assignedRole },
+    summary: `GitHub user @${ghLogin} (${userId}, role=${savedUser.role}) signed in`,
+    details: { userId, githubLogin: ghLogin, role: savedUser.role },
   });
 
   const redirectHeaders = new Headers({
@@ -727,18 +902,18 @@ export async function handleGitHubOAuthCallback(params: {
   redirectHeaders.append('set-cookie', clearStateCookieHeader);
   redirectHeaders.append(
     'set-cookie',
-    formatCookie(ADMIN_COOKIE_NAME, minted.token, {
+    formatCookie(adminCookieAttrs.name, minted.token, {
       maxAge: minted.maxAgeSec,
       path: '/',
       sameSite: 'Lax',
-      secure: isSecure,
+      secure: adminCookieAttrs.secure,
     }),
   );
 
   return {
     outcome: 'authenticated',
     userId,
-    role: assignedRole,
+    role: savedUser.role,
     response: new Response(null, { status: 302, headers: redirectHeaders }),
   };
 }

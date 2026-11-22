@@ -948,6 +948,8 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         'find_extractors',
         'catalog',
         'agent',
+        'discover_mcps',
+        'query_mcp',
       ]);
 
       // V2-2: Verify RRF multi-provider search (Brave + SearXNG + FTS5) + HMAC-SHA256 webhook signing + SSRF webhook block!
@@ -2295,7 +2297,7 @@ test('F15.4 workerd E2E: /v1/ingest-tab CORS & Auth + OAuth 2.1 PKCE S256 Full L
     });
     assert.equal(mcpRes.status, 200);
     const mcpJson = await mcpRes.json();
-    assert.equal(mcpJson.result.tools.length, 15);
+    assert.equal(mcpJson.result.tools.length, 17);
 
     // Revoke access_token via /oauth/revoke -> subsequent /mcp call returns 401
     const revokeRes = await mf.dispatchFetch(`${ORIGIN}/oauth/revoke`, {

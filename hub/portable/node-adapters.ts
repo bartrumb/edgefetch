@@ -36,6 +36,13 @@ import {
   type HubSocketLike,
 } from '../src/agent-hub';
 import { createSqliteOAuthStore, OAUTH_SQLITE_SCHEMA, type OAuthClientRecord, type OAuthCodeRecord, type OAuthStore, type RotateRefreshParams, type SqlStorageLike } from '../src/oauth';
+import {
+  createSqliteMcpVaultStore,
+  MCP_VAULT_SQLITE_SCHEMA,
+  type McpVaultStore,
+  type PendingMcpOAuthStateRow,
+  type StoredMcpServerRow,
+} from '../src/mcp-vault';
 
 // Polyfill Cloudflare's streaming `crypto.DigestStream` on Node.js using zero-copy `node:crypto` `createHash`.
 if (typeof (globalThis.crypto as unknown as { DigestStream?: unknown }).DigestStream !== 'function') {
@@ -515,6 +522,7 @@ export class LocalAgentHubCoordinator {
   private readonly lastConnectLogByKey = new Map<string, number>();
   public readonly engine: AgentHubEngine;
   public readonly oauth: OAuthStore;
+  public readonly mcpVault: McpVaultStore;
   public readonly activity: ActivityStore;
 
   constructor(sqlitePath: string) {
@@ -552,6 +560,7 @@ export class LocalAgentHubCoordinator {
         updated_at INTEGER NOT NULL
       );
       ${OAUTH_SQLITE_SCHEMA}
+      ${MCP_VAULT_SQLITE_SCHEMA}
       ${ACTIVITY_SQLITE_SCHEMA}
     `);
 
@@ -727,6 +736,7 @@ export class LocalAgentHubCoordinator {
       hostHealth,
     });
     this.oauth = createSqliteOAuthStore(sqlLike);
+    this.mcpVault = createSqliteMcpVaultStore(sqlLike);
     this.activity = createSqliteActivityStore(sqlLike);
   }
 
@@ -919,6 +929,13 @@ export class LocalAgentHubCoordinator {
       oauthCheckAuthLockout: (b: string, now: number, m?: number) => this.oauth.checkAuthLockout(b, now, m),
       oauthRecordAuthFailure: (b: string, now: number, w: number, m: number) => this.oauth.recordAuthFailure(b, now, w, m),
       oauthClearAuthFailures: (b: string) => this.oauth.clearAuthFailures(b),
+      vaultListServers: (userId: string) => this.mcpVault.listServers(userId),
+      vaultGetServer: (userId: string, slugOrDomain: string) => this.mcpVault.getServer(userId, slugOrDomain),
+      vaultUpsertServer: (row: StoredMcpServerRow) => this.mcpVault.upsertServer(row),
+      vaultDeleteServer: (userId: string, slug: string) => this.mcpVault.deleteServer(userId, slug),
+      vaultPutOAuthState: (row: PendingMcpOAuthStateRow) => this.mcpVault.putOAuthState(row),
+      vaultConsumeOAuthState: (stateHash: string, userId: string, now: number) =>
+        this.mcpVault.consumeOAuthState(stateHash, userId, now),
     };
     return {
       idFromName: (name: string) => name,

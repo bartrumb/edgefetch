@@ -2677,6 +2677,198 @@
         }
       }
     },
+    "/v1/mcp/registry": {
+      "get": {
+        "tags": [
+          "Coordinator & MCP"
+        ],
+        "operationId": "discoverMcpRegistry",
+        "summary": "Search Official MCP Registry and Glama MCP Directory",
+        "description": "Queries both `registry.modelcontextprotocol.io` and `glama.ai` via `SAFE_PUBLIC_FETCH`, fusing server manifests, remote Streamable HTTP/SSE endpoints, required auth headers, and associated web domains.",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "oauth2Pkce": [
+              "crawl:read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Search keyword, service name, or domain.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "description": "Alias for `q`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "remoteOnly",
+            "in": "query",
+            "required": false,
+            "description": "When `true`, return only servers advertising remote `streamable-http` or `sse` endpoints.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum registry entries to return (`1..50`, default `20`).",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 20
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Normalized dual-source MCP registry search results.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericOkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed JSON body or invalid request parameters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Bearer token / OAuth 2.1 access token.",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "RFC 9728 OAuth 2.1 Protected Resource challenge header.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient OAuth 2.1 scope (`crawl:read` or `crawl:fetch`) or policy block.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/mcp/query": {
+      "post": {
+        "tags": [
+          "Coordinator & MCP"
+        ],
+        "operationId": "queryConnectedMcp",
+        "summary": "List or invoke tools on a user-connected federated MCP server",
+        "description": "Executes `list_connected`, `list_tools`, or `call_tool` over Streamable HTTP / SSE against a user-isolated `AES-256-GCM` vault connector, auto-refreshing OAuth 2.1 tokens and scrubbing indirect prompt injections (`visibility: \"private\"`).",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "oauth2Pkce": [
+              "crawl:fetch"
+            ]
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpTool_QueryMcpInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sanitized private federated MCP result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericOkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed JSON body or invalid request parameters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Bearer token / OAuth 2.1 access token.",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "RFC 9728 OAuth 2.1 Protected Resource challenge header.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient OAuth 2.1 scope (`crawl:read` or `crawl:fetch`) or policy block.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/agents": {
       "get": {
         "tags": [
@@ -2872,7 +3064,7 @@
         ],
         "operationId": "handleMcpJsonRpc",
         "summary": "Streamable HTTP Model Context Protocol (MCP) JSON-RPC endpoint",
-        "description": "Stateless Streamable HTTP MCP endpoint supporting protocol versions `2026-07-28` through `2024-11-05` (`initialize`, `tools/list`, `tools/call`, `server/discover`, `ping`) across all 15 canonical EdgeFetch tools.",
+        "description": "Stateless Streamable HTTP MCP endpoint supporting protocol versions `2026-07-28` through `2024-11-05` (`initialize`, `tools/list`, `tools/call`, `server/discover`, `ping`) across all 17 canonical EdgeFetch tools.",
         "security": [
           {
             "bearerAuth": []
@@ -6866,6 +7058,65 @@
                 "type": "string"
               }
             }
+          }
+        },
+        "additionalProperties": false
+      },
+      "McpTool_DiscoverMcpsInput": {
+        "title": "Discover MCP Servers (Official Registry + Glama) (MCP discover_mcps)",
+        "description": "Search the Official Model Context Protocol Registry (registry.modelcontextprotocol.io) and Glama MCP Directory (glama.ai) to discover remote Streamable HTTP / SSE and local MCP servers, required auth headers, environment variables, and associated web domains.",
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search keyword, service name, or domain (e.g. \"linear\", \"notion\", \"github\", \"sentry\", \"stripe\")."
+          },
+          "remoteOnly": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, keep only servers advertising remote streamable-http or sse endpoints."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "default": 20,
+            "description": "Maximum registry entries to return (1..50)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "McpTool_QueryMcpInput": {
+        "title": "Query Connected Federated MCP Server (MCP query_mcp)",
+        "description": "List your user-isolated connected downstream MCP servers, inspect their cached or live tool schemas on demand (zero top-level context bloat), or execute an authenticated JSON-RPC tools/call against a connected remote MCP server.",
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list_connected",
+              "list_tools",
+              "call_tool"
+            ],
+            "default": "list_connected",
+            "description": "\"list_connected\" lists your connected MCPs and domains; \"list_tools\" lists tools on server; \"call_tool\" executes tool on server."
+          },
+          "server": {
+            "type": "string",
+            "description": "Connected MCP server slug or associated domain (required for \"list_tools\" and \"call_tool\")."
+          },
+          "tool": {
+            "type": "string",
+            "description": "Downstream MCP tool name to execute (required when action=\"call_tool\")."
+          },
+          "arguments": {
+            "type": "object",
+            "description": "JSON object arguments passed to the downstream MCP tool when action=\"call_tool\"."
+          },
+          "refresh": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true on action=\"list_tools\", refreshes tools/list live from the remote MCP endpoint."
           }
         },
         "additionalProperties": false

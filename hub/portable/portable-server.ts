@@ -454,6 +454,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     SAFE_FETCH: safeFetch,
     SAFE_PUBLIC_FETCH: safePublicFetch,
     CALLER_TOKEN: mergedEnv.CALLER_TOKEN ?? mergedEnv.EDGEFETCH_CALLER_TOKEN ?? mergedEnv.EDGEFETCH_SERVER_TOKEN,
+    VAULT_MASTER_KEY: mergedEnv.VAULT_MASTER_KEY ?? mergedEnv.EDGEFETCH_VAULT_MASTER_KEY,
     MCP_TOKEN: mergedEnv.MCP_TOKEN,
     AGENT_TOKEN: mergedEnv.AGENT_TOKEN ?? mergedEnv.EDGEFETCH_AGENT_TOKEN,
     AGENT_TOKENS: mergedEnv.AGENT_TOKENS ?? mergedEnv.EDGEFETCH_AGENT_TOKENS,

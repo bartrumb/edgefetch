@@ -1635,7 +1635,7 @@ test('V2-9: Portable Node 22+ Hub (startPortableHub) serves /health, /admin, /v1
     });
     assert.equal(mcpTools.status, 200);
     const mcpJson = (await mcpTools.json()) as { result: { tools: Array<{ name: string }> } };
-    assert.equal(mcpJson.result.tools.length, 15);
+    assert.equal(mcpJson.result.tools.length, 17);
   } finally {
     await started.close();
     rmSync(dataDir, { recursive: true, force: true });
@@ -14401,9 +14401,9 @@ test('OpenAPI 3.1.0 endpoint, anti-drift /v1/* route & MCP schema contract, scra
     );
   }
 
-  // Also verify zero-drift sharing with all 15 canonical MCP tool schemas
+  // Also verify zero-drift sharing with all 17 canonical MCP tool schemas
   const canonicalTools = buildCanonicalMcpToolSchemas();
-  assert.equal(canonicalTools.length, 15);
+  assert.equal(canonicalTools.length, 17);
   assert.deepEqual(components.schemas.ScrapeRequest, MCP_TOOL_SCHEMAS.scrape);
   assert.deepEqual(components.schemas.ExtractRequest, MCP_TOOL_SCHEMAS.extract);
   assert.deepEqual(components.schemas.InteractRequest, MCP_TOOL_SCHEMAS.interact);

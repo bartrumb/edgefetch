@@ -4878,6 +4878,7 @@ test('M1-B Sub-module bridges: cache:r2-d1 (scrape/extract/304, no false hit on 
     assert.equal(changesSpans.filter((s) => s.name === 'cache:r2-d1').length, 0, 'changes prevMarkdown lookup must NOT emit cache:r2-d1');
 
     // 5. 304 conditional revalidation hit -> emits cache:r2-d1 with cache.revalidated=true & status=304
+    await new Promise((r) => setTimeout(r, 15));
     otlpBatches.length = 0;
     return304 = true;
     const revalRes = await hubWorker.fetch(

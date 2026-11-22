@@ -2165,7 +2165,6 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 			}
 		})
 	})
-	connHolder.Store(conn)
 
 	probeCtx, probeCancel := context.WithTimeout(ctx, startupWait)
 	probeDone := make(chan struct{})
@@ -2234,6 +2233,7 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 		conn.setCrashReason(earlyCrash)
 	}
 	earlyCrashMu.Unlock()
+	connHolder.Store(conn)
 	return cmd, userDir, conn, nil
 }
 

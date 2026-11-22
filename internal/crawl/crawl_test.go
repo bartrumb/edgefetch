@@ -1684,3 +1684,112 @@ func TestExecuteCallWithTraceBrowserRenderAndBotAuthSpans(t *testing.T) {
 		}
 	})
 }
+
+func TestR6RedactAll30VectorsLinearSpeed429HoldCapAndRobotsPathNorm(t *testing.T) {
+	uerr := func(raw string) string { return (&url.Error{Op: "Get", URL: raw, Err: io.EOF}).Error() }
+	jsonWrap := func(s string) string {
+		b, _ := json.Marshal(map[string]string{"problem": s})
+		return string(b)
+	}
+
+	// 1. All 30 R6 redaction vectors (ws/wss, unquoted spaces/quotes/backslashes/tabs, slash-in-userinfo,
+	//    matrix params, JSON-escaped \/, percent-encoded %3A%2F%2F, nested %q, unterminated quotes, inline token).
+	cases := []string{
+		uerr("wss://host.example/agent/ws?token=SECRET-01"),
+		uerr("ws://user:SECRET-02@host.example/ws"),
+		"redirect to https://host.example/cb?next=1 2&code=SECRET-03 failed",
+		"redirect to https://host.example/cb?a=\"q\"&code=SECRET-04 failed",
+		"Location: https://host.example/cb?a=1\\&code=SECRET-05",
+		uerr("https://host.example/reset/SECRET-06/confirm?x=1"),
+		uerr("https://host.example/p#access_token=SECRET-07"),
+		uerr("https://host.example/p?a=#b&api_key=SECRET-08"),
+		uerr("https://user:pa@ss-SECRET-09@host.example/p"),
+		uerr("https://user:pa/ss-SECRET-10@host.example/p"),
+		uerr("https://user:pa?ss-SECRET-11@host.example/p"),
+		uerr("https://user:pa#ss-SECRET-12@host.example/p"),
+		jsonWrap(uerr("https://host.example/p?q=a b&api_key=SECRET-13")),
+		fmt.Sprintf("%q", uerr("https://host.example/p?q=a\"b&api_key=SECRET-14")),
+		fmt.Sprintf("outer: %q", fmt.Sprintf("%q", uerr("https://host.example/p?q=a b&api_key=SECRET-15"))),
+		"Get \"https://host.example/p?api_key=SECRET-16",
+		"Get \"https://host.example/p?q=a b&api_key=SECRET-17",
+		"Get \"https://host.example/p?q=a\\\" then space &api_key=SECRET-18",
+		"lookup https://host.example/p?x=1\tapi_key=SECRET-19",
+		"Get \"HTTPS://host.example/p?api_key=SECRET-20\": EOF; retry of \"hTTp://h2.example/q?t=SECRET-21 x\"",
+		"see http://[::1]:8080/p?k=SECRET-22, http://host.example/p;jsessionid=SECRET-23?x=1",
+		"blob:https://host.example/uuid?tok=SECRET-24 data:text/html,https://host.example/?k=SECRET-25",
+		`https:\/\/host.example\/p?api_key=SECRET-26`,
+		"url=https%3A%2F%2Fhost.example%2Fp%3Fapi_key%3DSECRET-27",
+		"Get \"https://host.example/p?q=\u2028api_key=SECRET-28\": EOF",
+		"<a href='https://host.example/p?api_key=SECRET-29'>",
+		"Get \"https://host.example/p\": remote said: token SECRET-30 invalid",
+		"//host.example/p?token=SECRET-31",
+		"ftp://user:SECRET-32@host.example/pub",
+	}
+	for idx, in := range cases {
+		out := RedactEmbeddedURLs(in)
+		if strings.Contains(out, "SECRET-") {
+			t.Fatalf("SECURITY (REDACT6 #%d): secret leaked!\n  in = %s\n  out= %s", idx+1, in, out)
+		}
+	}
+
+	// 2. Linear O(N) speed on 4 MiB inputs (quoted URL, 174k unterminated quotes, 4 MiB backslashes).
+	const n = 4 << 20
+	long := "Get \"https://host.example/p?" + strings.Repeat("a=b&", n/4) + "api_key=SECRET\": EOF"
+	t0 := time.Now()
+	o1 := RedactEmbeddedURLs(long)
+	if d := time.Since(t0); strings.Contains(o1, "SECRET") || d > 250*time.Millisecond {
+		t.Fatalf("4 MiB quoted URL redaction: leak=%v elapsed=%v", strings.Contains(o1, "SECRET"), d)
+	}
+	many := strings.Repeat("\"https://h.example/p?k=S ", n/24)
+	t0 = time.Now()
+	o2 := RedactEmbeddedURLs(many)
+	if d := time.Since(t0); strings.Contains(o2, "k=S") || d > 500*time.Millisecond {
+		t.Fatalf("4 MiB unterminated URLs redaction: leak=%v elapsed=%v", strings.Contains(o2, "k=S"), d)
+	}
+	esc := "\"https://h.example/p?" + strings.Repeat(`\\`, n/2)
+	t0 = time.Now()
+	o3 := RedactEmbeddedURLs(esc)
+	if d := time.Since(t0); len(o3) > 64 || d > 250*time.Millisecond {
+		t.Fatalf("4 MiB backslash URL redaction: len=%d elapsed=%v", len(o3), d)
+	}
+
+	// 3. 429 hold cap: Retry-After > 30s (e.g. 99999s) returns immediately on Strike 1 with 0 inline sleeps,
+	//    while recording full 300000ms host cooldown; and dot-segment URLs cannot bypass Disallow: /private.
+	var pageHits, holdHits atomic.Int32
+	c, sleeps := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Host {
+		case "hold429.test":
+			if r.URL.Path == "/robots.txt" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			holdHits.Add(1)
+			w.Header().Set("Retry-After", "99999")
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "norm.test":
+			if r.URL.Path == "/robots.txt" {
+				_, _ = w.Write([]byte("User-agent: *\nDisallow: /private\n"))
+				return
+			}
+			pageHits.Add(1)
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html>should not be fetched</html>"))
+		}
+	}))
+
+	holdRes := c.Run(context.Background(), []Request{
+		{ID: "h1", URL: "http://hold429.test/items", Kind: classify.KindPage},
+	}, Options{PauseMs: 1})
+	if holdRes[0].Status != http.StatusTooManyRequests || holdRes[0].Attempts != 1 || holdHits.Load() != 1 || holdRes[0].RetryAfterMs != 300000 || len(sleeps.all) != 0 {
+		t.Fatalf("expected Retry-After: 99999 to stop on Strike 1 with 0 inline sleeps and 300000ms cooldown, got %+v (sleeps=%v)", holdRes[0], sleeps.all)
+	}
+
+	for _, rawPath := range []string{"/./private/x", "//private/x", "/%2e/private/x", "/public/../private/x"} {
+		nr := c.Run(context.Background(), []Request{
+			{ID: "n", URL: "http://norm.test" + rawPath, Kind: classify.KindPage},
+		}, Options{PauseMs: 1})
+		if nr[0].Outcome != classify.OutcomeSkip || pageHits.Load() != 0 {
+			t.Fatalf("SECURITY: path %q bypassed Disallow: /private: %+v (pageHits=%d)", rawPath, nr[0], pageHits.Load())
+		}
+	}
+}

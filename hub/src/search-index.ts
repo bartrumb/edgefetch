@@ -1268,6 +1268,7 @@ export async function executeExtractCall(params: {
           });
           if (spaOut) {
             via = spaOut.via;
+            const cleanSpaMd = sanitizeInlineHtmlInMarkdown(spaOut.markdown, spaOut.finalUrl || item.url).trim();
             byUrl.set(item.url, {
               url: item.url,
               finalUrl: spaOut.finalUrl,
@@ -1277,7 +1278,7 @@ export async function executeExtractCall(params: {
               ...(spaOut.title ? { title: spaOut.title } : {}),
               contentState: 'active',
               renderedVia: spaOut.provider,
-              markdown: redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown,
+              markdown: redactPii ? redactPiiText(cleanSpaMd) : cleanSpaMd,
             });
             continue;
           }
@@ -1301,7 +1302,8 @@ export async function executeExtractCall(params: {
           });
           if (wb) {
             const wbExt = extractHtmlDocument(wb.rawBody, { baseUrl: item.url, onlyMainContent: true, redactPii });
-            const wbMd = (wbExt.markdown.trim() || wb.rawBody.trim());
+            const rawWbMd = wbExt.markdown.trim() || wb.rawBody.trim();
+            const wbMd = sanitizeInlineHtmlInMarkdown(rawWbMd, item.url).trim();
             byUrl.set(item.url, {
               url: item.url,
               finalUrl: item.url,
@@ -1385,7 +1387,14 @@ export async function executeExtractCall(params: {
               ? {
                   preChunkedRecords: filteredBoard.chunks.map((c) => {
                     const sanitizedChunk = sanitizeInlineHtmlInMarkdown(c.text, item.url).trim();
-                    return { ...c, text: redactPii ? redactPiiText(sanitizedChunk) : sanitizedChunk };
+                    const sanitizedHeading = c.heading
+                      ? sanitizeInlineHtmlInMarkdown(c.heading, item.url).replace(/\s+/g, ' ').trim()
+                      : c.heading;
+                    return {
+                      ...c,
+                      ...(sanitizedHeading !== undefined ? { heading: sanitizedHeading } : {}),
+                      text: redactPii ? redactPiiText(sanitizedChunk) : sanitizedChunk,
+                    };
                   }),
                   recordCount: filteredBoard.matchedRecords,
                   totalRecords: filteredBoard.totalRecords,
@@ -1540,7 +1549,14 @@ export async function executeExtractCall(params: {
           markdown: cleanJsonMd,
           preChunkedRecords: jsonRecordsDoc.chunks.map((c) => {
             const sanitizedChunk = sanitizeInlineHtmlInMarkdown(c.text, finalUrl).trim();
-            return { ...c, text: redactPii ? redactPiiText(sanitizedChunk) : sanitizedChunk };
+            const sanitizedHeading = c.heading
+              ? sanitizeInlineHtmlInMarkdown(c.heading, finalUrl).replace(/\s+/g, ' ').trim()
+              : c.heading;
+            return {
+              ...c,
+              ...(sanitizedHeading !== undefined ? { heading: sanitizedHeading } : {}),
+              text: redactPii ? redactPiiText(sanitizedChunk) : sanitizedChunk,
+            };
           }),
           recordCount: jsonRecordsDoc.matchedRecords,
           totalRecords: jsonRecordsDoc.totalRecords,
@@ -1672,8 +1688,13 @@ export async function executeExtractCall(params: {
         if (jobPosting) {
           const jpHdr = formatJobPostingHeaderMarkdown(jobPosting);
           if (jpHdr && !/\*\*Compensation\*\*:/.test(md.slice(0, 400))) {
+            const safeJpTitle = sanitizeInlineHtmlInMarkdown(jobPosting.title, finalUrl).replace(/\s+/g, ' ').trim();
+            const safeJpHdr = sanitizeInlineHtmlInMarkdown(jpHdr, finalUrl).trim();
             const topH = /^(#\s+[^\n]+)\n+([\s\S]*)$/.exec(md);
-            md = topH ? `${topH[1]}\n\n${jpHdr}\n\n${topH[2]}` : `# ${jobPosting.title}\n\n${jpHdr}\n\n${md}`;
+            const assembledJpMd = topH
+              ? `${topH[1]}\n\n${safeJpHdr}\n\n${topH[2]}`
+              : `# ${safeJpTitle}\n\n${safeJpHdr}\n\n${md}`;
+            md = sanitizeInlineHtmlInMarkdown(assembledJpMd, finalUrl).trim();
           }
         }
 
@@ -1682,8 +1703,9 @@ export async function executeExtractCall(params: {
         const mdWords = countExtractWords(md);
         const descWords = desc ? countExtractWords(desc) : 0;
         if (isHtml && !isPdf && mdWords < 50 && desc && descWords >= 18 && descWords > mdWords * 2) {
-          const cleanDesc = redactPii ? redactPiiText(desc) : desc;
-          md = [title ? `# ${title}` : '', cleanDesc].filter(Boolean).join('\n\n');
+          const rawRescued = [title ? `# ${title}` : '', desc].filter(Boolean).join('\n\n');
+          const sanitizedRescued = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(rawRescued), finalUrl).trim();
+          md = redactPii ? redactPiiText(sanitizedRescued) : sanitizedRescued;
           contentSource = 'meta-description';
         }
       }
@@ -1722,7 +1744,8 @@ export async function executeExtractCall(params: {
           ...(activeTracer ? { tracer: activeTracer } : {}),
         });
         if (spaOut && countExtractWords(spaOut.markdown) > countExtractWords(md)) {
-          md = redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown;
+          const sanitizedSpaMd = sanitizeInlineHtmlInMarkdown(spaOut.markdown, spaOut.finalUrl || finalUrl).trim();
+          md = redactPii ? redactPiiText(sanitizedSpaMd) : sanitizedSpaMd;
           finalUrl = spaOut.finalUrl;
           if (spaOut.title) title = spaOut.title;
           via = spaOut.via;
@@ -1762,10 +1785,29 @@ export async function executeExtractCall(params: {
       });
       continue;
     }
+    const effectiveBase = entry.finalUrl || u;
     const allChunks = entry.preChunkedRecords ?? chunkMarkdownForSearch(entry.markdown ?? '');
-    const selectedChunks = query
+    const rawSelectedChunks = query
       ? rankChunksInMemory(allChunks, query, chunksPerSource)
       : allChunks.slice(0, chunksPerSource).map((c) => ({ ...c, score: 1 }));
+    const selectedChunks = rawSelectedChunks.map((c) => {
+      const cleanText = sanitizeInlineHtmlInMarkdown(c.text, effectiveBase).trim();
+      const cleanHeading = c.heading
+        ? sanitizeInlineHtmlInMarkdown(c.heading, effectiveBase).replace(/\s+/g, ' ').trim()
+        : c.heading;
+      return {
+        ...c,
+        ...(cleanHeading !== undefined ? { heading: cleanHeading } : {}),
+        text: redactPii ? redactPiiText(cleanText) : cleanText,
+      };
+    });
+    const assembledRawContent = query
+      ? [...selectedChunks]
+          .sort((a, b) => a.ordinal - b.ordinal)
+          .map((c) => (c.heading && !/^#{1,6}\s/.test(c.text.trimStart()) ? `## ${c.heading}\n${c.text}` : c.text))
+          .join('\n\n...\n\n')
+      : (entry.markdown ?? '');
+    const safeRawContent = sanitizeInlineHtmlInMarkdown(assembledRawContent, effectiveBase).trim();
     results.push({
       url: u,
       ...(entry.finalUrl && entry.finalUrl !== u ? { finalUrl: entry.finalUrl } : {}),
@@ -1779,12 +1821,7 @@ export async function executeExtractCall(params: {
       ...(entry.renderedVia ? { renderedVia: entry.renderedVia } : {}),
       ...(entry.jobPosting ? { jobPosting: entry.jobPosting } : {}),
       ...(entry.recordCount !== undefined ? { recordCount: entry.recordCount, totalRecords: entry.totalRecords } : {}),
-      rawContent: query
-        ? [...selectedChunks]
-            .sort((a, b) => a.ordinal - b.ordinal)
-            .map((c) => (c.heading && !/^#{1,6}\s/.test(c.text.trimStart()) ? `## ${c.heading}\n${c.text}` : c.text))
-            .join('\n\n...\n\n')
-        : (entry.markdown ?? ''),
+      rawContent: redactPii ? redactPiiText(safeRawContent) : safeRawContent,
       chunks: selectedChunks,
     });
   }

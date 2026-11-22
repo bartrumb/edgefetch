@@ -22,6 +22,10 @@ import {
   createAdminSessionValue,
   escapeHtml,
   formatCookie,
+  isAdminSessionRevoked,
+  isEffectiveHttpsOrigin,
+  isSameOriginFormPost,
+  sha256Base64Url,
   verifyAdminSessionCookie,
   type OAuthGrantSummary,
   type OAuthStore,
@@ -43,7 +47,19 @@ const ADMIN_HTML_HEADERS: Record<string, string> = {
 const ADMIN_JSON_HEADERS: Record<string, string> = {
   'cache-control': 'no-store',
   'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
 };
+
+function safeJsonForInlineScript(val: unknown): string {
+  return JSON.stringify(val)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
 
 function adminJson(data: unknown, status = 200): Response {
   return Response.json(data, { status, headers: ADMIN_JSON_HEADERS });
@@ -53,6 +69,7 @@ export interface AdminPortalDeps {
   serviceName: string;
   mcpSlug: string;
   sampleUrl?: string;
+  publicOrigin?: string;
   ownerSecret?: string;
   oauthStore: OAuthStore;
   allowedTargets: FetchTarget[];
@@ -404,8 +421,8 @@ function renderDashboardHtml(params: {
   </div>
 
   <script>
-    const CSRF = ${JSON.stringify(params.csrf)};
-    const HUB_ORIGIN = ${JSON.stringify(params.origin)};
+    const CSRF = ${safeJsonForInlineScript(params.csrf)};
+    const HUB_ORIGIN = ${safeJsonForInlineScript(params.origin)};
     const el = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
     let latestEvents = [];
@@ -449,10 +466,11 @@ function renderDashboardHtml(params: {
       }
       box.innerHTML = filtered.map((ev) => {
         const isOpen = openEventIds.has(ev.id) ? ' open' : '';
+        const safeLvl = ev.level === 'warn' || ev.level === 'error' ? ev.level : 'info';
         return '<div class="log-row' + isOpen + '" data-ev-id="' + Number(ev.id) + '">' +
           '<div class="log-line">' +
             '<span class="log-ts">' + esc(fmtClock(ev.ts)) + '</span>' +
-            '<span class="badge lvl-' + esc(ev.level) + '">' + esc(ev.level) + '</span>' +
+            '<span class="badge lvl-' + safeLvl + '">' + esc(ev.level) + '</span>' +
             '<span class="badge cat">' + esc(ev.category) + '</span>' +
             '<span>' + esc(ev.summary) + '</span>' +
           '</div>' +
@@ -728,7 +746,7 @@ function renderDashboardHtml(params: {
     });
     const mcpEndpoint = HUB_ORIGIN + '/mcp';
     el('cursor-mcp-btn').href = 'cursor://anysphere.cursor-deeplink/mcp/install?name=${encodeURIComponent(params.mcpSlug)}&config=' + encodeURIComponent(btoa(JSON.stringify({ url: mcpEndpoint })));
-    el('vscode-mcp-btn').href = 'vscode:mcp/install?' + encodeURIComponent(JSON.stringify({ name: ${JSON.stringify(params.mcpSlug)}, type: 'http', url: mcpEndpoint }));
+    el('vscode-mcp-btn').href = 'vscode:mcp/install?' + encodeURIComponent(JSON.stringify({ name: ${safeJsonForInlineScript(params.mcpSlug)}, type: 'http', url: mcpEndpoint }));
 
     loadState();
     setInterval(() => {
@@ -759,18 +777,20 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
   const path = url.pathname;
   if (path !== '/admin' && !path.startsWith('/admin/')) return null;
 
-  const isSecure = url.protocol === 'https:';
+  const isSecure = isEffectiveHttpsOrigin(url, deps.publicOrigin);
   const ownerSecret = deps.ownerSecret;
   if (!ownerSecret || ownerSecret.length < MIN_TOKEN_LENGTH) {
     return adminJson({ error: 'owner_secret_unconfigured' }, 503);
   }
 
-  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), ownerSecret);
-  if (session.ok && typeof deps.oauthStore.checkAuthLockout === 'function') {
-    const revoked = await deps.oauthStore.checkAuthLockout(`revoked_admin:${session.csrf}`, Date.now(), 1);
-    if (!revoked.allowed) {
-      session = { ok: false };
-    }
+  const nowMs = Date.now();
+  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), ownerSecret, nowMs);
+  if (session.ok && (await isAdminSessionRevoked(deps.oauthStore, session.csrf, nowMs))) {
+    session = { ok: false };
+  }
+
+  if (request.method === 'POST' && !isSameOriginFormPost(request, url, deps.publicOrigin)) {
+    return adminJson({ error: 'invalid_origin' }, 403);
   }
 
   if (path === '/admin' && request.method === 'GET') {
@@ -836,7 +856,10 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
       await deps.oauthStore.clearAuthFailures(`admin:${clientIp}`);
       const minted = await createAdminSessionValue(ownerSecret);
-      const headers = new Headers({ location: '/admin', 'cache-control': 'no-store' });
+      const headers = new Headers({
+        location: '/admin',
+        ...ADMIN_JSON_HEADERS,
+      });
       headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, minted.value, { maxAge: minted.maxAgeSec, path: '/', sameSite: 'Lax', secure: isSecure }));
       span.setAttributes({ 'admin.outcome': 'authenticated', 'http.response.status_code': 302 });
       return new Response(null, { status: 302, headers });
@@ -852,11 +875,15 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         span.setStatus(false, 'invalid_csrf');
         return adminJson({ error: 'invalid_csrf' }, 403);
       }
-      // Server-side revocation of this exact admin session cookie (`Low`): replay of the logged-out cookie fails closed!
+      // Server-side revocation of this exact admin session cookie (`Low`): store SHA-256 hash so raw CSRF token is never stored in cleartext!
       if (typeof deps.oauthStore.recordAuthFailure === 'function') {
-        await deps.oauthStore.recordAuthFailure(`revoked_admin:${session.csrf}`, Date.now(), 8 * 60 * 60_000, 1);
+        const csrfHash = await sha256Base64Url(session.csrf);
+        await deps.oauthStore.recordAuthFailure(`revoked_admin:${csrfHash}`, Date.now(), 8 * 60 * 60_000, 1);
       }
-      const headers = new Headers({ location: '/admin', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      const headers = new Headers({
+        location: '/admin',
+        ...ADMIN_JSON_HEADERS,
+      });
       headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: isSecure }));
       span.setAttributes({ 'admin.outcome': 'logged_out', 'http.response.status_code': 302 });
       return new Response(null, { status: 302, headers });

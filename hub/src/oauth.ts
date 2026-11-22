@@ -216,6 +216,12 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     putCode(code) {
       sql.exec('DELETE FROM oauth_codes WHERE expires_at <= ?', code.expiresAt - AUTH_CODE_TTL_MS);
       sql.exec(
+        `DELETE FROM oauth_codes
+         WHERE code_hash IN (
+           SELECT code_hash FROM oauth_codes ORDER BY expires_at DESC LIMIT -1 OFFSET 2047
+         )`,
+      );
+      sql.exec(
         `INSERT OR REPLACE INTO oauth_codes
          (code_hash, client_id, client_name, redirect_uri, code_challenge, scopes_json, resource, expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -258,6 +264,12 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     },
     putTokenPair(p) {
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', p.createdAt);
+      sql.exec(
+        `DELETE FROM oauth_tokens
+         WHERE token_hash IN (
+           SELECT token_hash FROM oauth_tokens ORDER BY expires_at DESC LIMIT -1 OFFSET 4093
+         )`,
+      );
       const scopesJson = JSON.stringify(p.scopes);
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
@@ -564,6 +576,15 @@ export function createMemoryOAuthStore(): OAuthStore {
       return c ? { ...c, redirectUris: [...c.redirectUris] } : null;
     },
     putCode(code) {
+      const approxNow = code.expiresAt - AUTH_CODE_TTL_MS;
+      for (const [k, v] of codes.entries()) {
+        if (v.expiresAt <= approxNow) codes.delete(k);
+      }
+      while (codes.size >= 2048) {
+        const oldest = codes.keys().next().value;
+        if (oldest === undefined) break;
+        codes.delete(oldest);
+      }
       codes.set(code.codeHash, { ...code, scopes: [...code.scopes] });
     },
     consumeCode(codeHash, now) {
@@ -573,6 +594,14 @@ export function createMemoryOAuthStore(): OAuthStore {
       return c;
     },
     putTokenPair(p) {
+      for (const [k, v] of tokens.entries()) {
+        if (v.expiresAt <= p.createdAt) tokens.delete(k);
+      }
+      while (tokens.size >= 4094) {
+        const oldest = tokens.keys().next().value;
+        if (oldest === undefined) break;
+        tokens.delete(oldest);
+      }
       tokens.set(p.accessHash, {
         grantId: p.grantId,
         kind: 'access',
@@ -721,6 +750,11 @@ export function createMemoryOAuthStore(): OAuthStore {
         for (const [k, exp] of adminRevocations.entries()) {
           if (exp <= now) adminRevocations.delete(k);
         }
+        while (adminRevocations.size >= 4096) {
+          const oldest = adminRevocations.keys().next().value;
+          if (oldest === undefined) break;
+          adminRevocations.delete(oldest);
+        }
         adminRevocations.set(bucket, now + windowMs);
         return { allowed: false, retryAfterSec: Math.max(1, Math.ceil(windowMs / 1_000)) };
       }
@@ -799,6 +833,60 @@ export function readCookie(cookieHeader: string | null, name: string): string | 
     }
   }
   return null;
+}
+
+export function isEffectiveHttpsOrigin(url: URL, publicOrigin?: string): boolean {
+  if (url.protocol === 'https:') return true;
+  if (typeof publicOrigin === 'string' && publicOrigin.trim().toLowerCase().startsWith('https://')) {
+    return true;
+  }
+  return false;
+}
+
+export async function isAdminSessionRevoked(
+  store: Pick<OAuthStore, 'checkAuthLockout'> | undefined,
+  csrf: string,
+  now: number,
+): Promise<boolean> {
+  if (!store || typeof store.checkAuthLockout !== 'function') return false;
+  const csrfHash = await sha256Base64Url(csrf);
+  const hashedCheck = await store.checkAuthLockout(`revoked_admin:${csrfHash}`, now, 1);
+  if (!hashedCheck.allowed) return true;
+  const legacyCheck = await store.checkAuthLockout(`revoked_admin:${csrf}`, now, 1);
+  return !legacyCheck.allowed;
+}
+
+export function isSameOriginFormPost(request: Request, url: URL, publicOrigin?: string): boolean {
+  const secFetchSite = (request.headers.get('sec-fetch-site') ?? '').trim().toLowerCase();
+  if (secFetchSite === 'cross-site') return false;
+  const rawOrigin = request.headers.get('origin');
+  if (!rawOrigin || !rawOrigin.trim()) return true;
+  if (rawOrigin.trim().toLowerCase() === 'null') return false;
+  try {
+    const reqOriginUrl = new URL(rawOrigin.trim());
+    if (reqOriginUrl.origin.toLowerCase() === url.origin.toLowerCase()) return true;
+    if (publicOrigin?.trim()) {
+      try {
+        const pubUrl = new URL(publicOrigin.trim());
+        if (reqOriginUrl.origin.toLowerCase() === pubUrl.origin.toLowerCase()) return true;
+      } catch {
+        // ignore invalid publicOrigin
+      }
+    }
+    // Allow loopback equivalence (`127.0.0.1:<port>` <-> `localhost:<port>` <-> `hub.local:<port>`) when Hub runs over local HTTP
+    if (
+      url.protocol === 'http:' &&
+      reqOriginUrl.protocol === 'http:' &&
+      isLoopbackHost(reqOriginUrl.hostname.toLowerCase()) &&
+      (isLoopbackHost(url.hostname.toLowerCase()) || url.hostname.toLowerCase() === 'hub.local') &&
+      (reqOriginUrl.port || '80') === (url.port || '80')
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 export function formatCookie(
@@ -1104,6 +1192,24 @@ export function oauthCorsHeaders(
   }
 }
 
+const OAUTH_SECURITY_HEADERS: Record<string, string> = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+};
+
+function oauthRedirect(targetUrl: string): Response {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: targetUrl,
+      'cache-control': 'no-store',
+      ...OAUTH_SECURITY_HEADERS,
+    },
+  });
+}
+
 function oauthJson(body: unknown, status: number, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -1111,6 +1217,7 @@ function oauthJson(body: unknown, status: number, extraHeaders: Record<string, s
       'content-type': 'application/json',
       'cache-control': 'no-store',
       pragma: 'no-cache',
+      ...OAUTH_SECURITY_HEADERS,
       ...extraHeaders,
     },
   });
@@ -1285,6 +1392,7 @@ export interface OAuthHandlerDeps {
   ownerSecret?: string;
   mcpToken?: string;
   serviceName: string;
+  publicOrigin?: string;
   redirectAllowlist?: readonly string[];
   now?: () => number;
   onEvent?: (ev: {
@@ -1483,13 +1591,10 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
   // 4. OAuth 2.1 Authorization & Consent (`GET` & `POST /oauth/authorize`)
   if (path === '/oauth/authorize') {
     return withOAuthAuditSpan('authorize', async (span) => {
-      const isSecure = url.protocol === 'https:';
+      const isSecure = isEffectiveHttpsOrigin(url, deps.publicOrigin);
       let adminSession = await verifyAdminSessionCookie(request.headers.get('cookie'), ownerSecret, now);
-      if (adminSession.ok && typeof deps.store.checkAuthLockout === 'function') {
-        const revoked = await deps.store.checkAuthLockout(`revoked_admin:${adminSession.csrf}`, now, 1);
-        if (!revoked.allowed) {
-          adminSession = { ok: false };
-        }
+      if (adminSession.ok && (await isAdminSessionRevoked(deps.store, adminSession.csrf, now))) {
+        adminSession = { ok: false };
       }
 
       if (request.method === 'GET') {
@@ -1537,7 +1642,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           errUrl.searchParams.set('iss', origin);
           span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'unsupported_response_type', 'http.response.status_code': 302 });
           span.setStatus(false, 'unsupported_response_type');
-          return Response.redirect(errUrl.toString(), 302);
+          return oauthRedirect(errUrl.toString());
         }
         if (!scopeCheck.ok) {
           const errUrl = new URL(redirectUri);
@@ -1546,7 +1651,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           errUrl.searchParams.set('iss', origin);
           span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_scope', 'http.response.status_code': 302 });
           span.setStatus(false, 'invalid_scope');
-          return Response.redirect(errUrl.toString(), 302);
+          return oauthRedirect(errUrl.toString());
         }
         const scopes = scopeCheck.scopes;
         if (codeChallengeMethod !== 'S256' || !/^[A-Za-z0-9_-]{43,128}$/.test(codeChallenge)) {
@@ -1557,7 +1662,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           errUrl.searchParams.set('iss', origin);
           span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_request', 'http.response.status_code': 302 });
           span.setStatus(false, 'invalid_request');
-          return Response.redirect(errUrl.toString(), 302);
+          return oauthRedirect(errUrl.toString());
         }
         if (!resCheck.ok) {
           const errUrl = new URL(redirectUri);
@@ -1566,7 +1671,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           errUrl.searchParams.set('iss', origin);
           span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_target', 'http.response.status_code': 302 });
           span.setStatus(false, 'invalid_target');
-          return Response.redirect(errUrl.toString(), 302);
+          return oauthRedirect(errUrl.toString());
         }
 
         const isExternalRedirect = !isLoopbackRedirectUri(redirectUri);
@@ -1609,6 +1714,14 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
       }
 
       if (request.method === 'POST') {
+        if (!isSameOriginFormPost(request, url, deps.publicOrigin)) {
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_origin', 'http.response.status_code': 403 });
+          span.setStatus(false, 'invalid_origin');
+          return new Response('Cross-origin authorization submission rejected.', {
+            status: 403,
+            headers: CONSENT_PAGE_HEADERS,
+          });
+        }
         const form = await parseFormOrJson(request);
         if (!form) {
           span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'payload_too_large', 'http.response.status_code': 413 });
@@ -1637,9 +1750,18 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           denyUrl.searchParams.set('error', 'access_denied');
           if (sealed.state) denyUrl.searchParams.set('state', sealed.state);
           denyUrl.searchParams.set('iss', origin);
+          const denyHeaders = new Headers({
+            location: denyUrl.toString(),
+            'cache-control': 'no-store',
+            ...OAUTH_SECURITY_HEADERS,
+          });
+          denyHeaders.append(
+            'set-cookie',
+            formatCookie(CONSENT_CSRF_COOKIE, '', { maxAge: 0, path: '/oauth/authorize', sameSite: 'Lax', secure: isSecure }),
+          );
           span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'access_denied', 'http.response.status_code': 302 });
           span.setStatus(false, 'access_denied');
-          return Response.redirect(denyUrl.toString(), 302);
+          return new Response(null, { status: 302, headers: denyHeaders });
         }
 
         const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
@@ -1705,7 +1827,11 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         if (sealed.state) cb.searchParams.set('state', sealed.state);
         cb.searchParams.set('iss', origin);
 
-        const headers = new Headers({ location: cb.toString(), 'cache-control': 'no-store' });
+        const headers = new Headers({
+          location: cb.toString(),
+          'cache-control': 'no-store',
+          ...OAUTH_SECURITY_HEADERS,
+        });
         headers.append('set-cookie', formatCookie(CONSENT_CSRF_COOKIE, '', { maxAge: 0, path: '/oauth/authorize', sameSite: 'Lax', secure: isSecure }));
         span.setAttributes({
           'oauth.phase': 'code_issued',

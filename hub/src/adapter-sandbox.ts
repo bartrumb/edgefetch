@@ -30,10 +30,56 @@ export interface DynamicWorkerLoaderLike {
   };
 }
 
+export const MAX_ADAPTER_ISOLATE_OUTPUT_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on dynamic Worker isolate outputs
+
+function deepFreezePlainData<T>(val: T, depth = 0): T {
+  if (val === null || typeof val !== 'object' || depth > 6) return val;
+  if (Object.isFrozen(val)) return val;
+  if (Array.isArray(val)) {
+    const copy = val.map((item) => deepFreezePlainData(item, depth + 1));
+    return Object.freeze(copy) as unknown as T;
+  }
+  const proto = Object.getPrototypeOf(val);
+  if (proto !== Object.prototype && proto !== null) {
+    return val;
+  }
+  const clone: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+    clone[k] = deepFreezePlainData(v, depth + 1);
+  }
+  return Object.freeze(clone) as T;
+}
+
+async function readIsolateJsonCapped(res: Response, maxBytes = MAX_ADAPTER_ISOLATE_OUTPUT_BYTES): Promise<unknown> {
+  if (!res.body) return null;
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value && value.byteLength > 0) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel('Adapter isolate output exceeds byte cap').catch(() => undefined);
+        throw new Error(`Adapter isolate output exceeds ${maxBytes} bytes limit`);
+      }
+      chunks.push(value);
+    }
+  }
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(merged));
+}
+
 /**
  * Executes a synchronous site-adapter hook (`extractHtml` or `formatTwin`) inside a zero-network, frozen-input bulkhead
- * with wall-clock timing telemetry. Temporarily replaces `globalThis.fetch` for the duration of the synchronous turn so
- * contributed adapter code cannot initiate covert network requests even if it references `globalThis.fetch`.
+ * with wall-clock timing telemetry. Temporarily replaces `globalThis.fetch` and `globalThis.WebSocket` for the duration of
+ * the synchronous turn so contributed adapter code cannot initiate covert network requests.
  */
 export function runAdapterSyncInBulkhead<TInput extends object, TResult>(
   adapterId: string,
@@ -41,10 +87,12 @@ export function runAdapterSyncInBulkhead<TInput extends object, TResult>(
   input: TInput,
   maxBudgetMs = 250,
 ): { ok: true; value: TResult; durationMs: number; overBudget: boolean } | { ok: false; error: string; durationMs: number } {
-  const frozenInput = Object.freeze({ ...input });
+  const frozenInput = deepFreezePlainData(input);
   const origFetch = globalThis.fetch;
+  const origWebSocket = (globalThis as { WebSocket?: unknown }).WebSocket;
   const started = Date.now();
   let fetchDescriptorRestorable = true;
+  let wsDescriptorRestorable = true;
   try {
     globalThis.fetch = (() => {
       throw new AdapterNetworkForbiddenError();
@@ -52,9 +100,30 @@ export function runAdapterSyncInBulkhead<TInput extends object, TResult>(
   } catch {
     fetchDescriptorRestorable = false;
   }
+  try {
+    if (origWebSocket !== undefined) {
+      (globalThis as { WebSocket?: unknown }).WebSocket = function ForbiddenAdapterWebSocket() {
+        throw new AdapterNetworkForbiddenError();
+      };
+    }
+  } catch {
+    wsDescriptorRestorable = false;
+  }
 
   try {
     const value = fn(frozenInput);
+    if (
+      value !== null &&
+      (typeof value === 'object' || typeof value === 'function') &&
+      typeof (value as { then?: unknown }).then === 'function'
+    ) {
+      const durationMs = Date.now() - started;
+      return {
+        ok: false,
+        error: `adapter[${adapterId}] failed: synchronous bulkhead forbids async/Promise return values`,
+        durationMs,
+      };
+    }
     const durationMs = Date.now() - started;
     return {
       ok: true,
@@ -76,6 +145,13 @@ export function runAdapterSyncInBulkhead<TInput extends object, TResult>(
         globalThis.fetch = origFetch;
       } catch {
         // Ignore if runtime freezes globalThis.fetch
+      }
+    }
+    if (wsDescriptorRestorable && origWebSocket !== undefined) {
+      try {
+        (globalThis as { WebSocket?: unknown }).WebSocket = origWebSocket;
+      } catch {
+        // Ignore if runtime freezes globalThis.WebSocket
       }
     }
   }
@@ -123,9 +199,10 @@ export default {
       signal: AbortSignal.timeout(Math.max(50, Math.min(2_000, params.timeoutMs ?? 500))),
     });
     if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
       return { ok: false, error: `isolate HTTP ${res.status}` };
     }
-    const body = (await res.json()) as { ok?: boolean; output?: TOutput; error?: string };
+    const body = (await readIsolateJsonCapped(res)) as { ok?: boolean; output?: TOutput; error?: string };
     return body?.ok ? { ok: true, output: body.output as TOutput } : { ok: false, error: body?.error ?? 'isolate error' };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };

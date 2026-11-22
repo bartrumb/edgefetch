@@ -547,28 +547,34 @@ func TestRunSessionDispatchBackpressureAndPingLoop(t *testing.T) {
 		t.Fatal("expected runPingLoop to call closeNow when writePing fails")
 	}
 
-	// 2. dispatchCh backpressure (cap 8) hitting `case <-sessionCtx.Done(): return nil`.
+	// 2. dispatchQueue full (cap 8) hitting immediate agent_busy uploadReply + clean sessionCtx cancel.
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	cr := crawl.NewCrawler(http.DefaultTransport, crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
-	dispatchCh := make(chan controlMessage, 8)
-	// Pre-fill dispatchCh with 8 items so the first dispatch sent by server blocks on `dispatchCh <- msg`.
-	for i := 0; i < 8; i++ {
-		dispatchCh <- controlMessage{Type: "dispatch", JobID: "prefill", JobNonce: "n"}
+	queue := newDispatchQueue()
+	for i := 0; i < maxQueuedDispatches; i++ {
+		queue.enqueue(controlMessage{Type: "dispatch", JobID: "prefill-" + string(rune('a'+i)), JobNonce: "n"})
 	}
+	busySem := make(chan struct{}, maxQueuedDispatches)
+	var dispatchWG sync.WaitGroup
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var gotBusyReply atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/agent/reply" {
+			gotBusyReply.Store(true)
+			w.WriteHeader(http.StatusOK)
+			cancel()
+			return
+		}
 		sc, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer sc.CloseNow()
 		_, _, _ = sc.Read(r.Context()) // read hello
-		_ = sc.Write(r.Context(), websocket.MessageText, []byte(`{"type":"dispatch","jobId":"j-block","jobNonce":"n-block"}`))
-		time.Sleep(40 * time.Millisecond)
-		cancel()
+		_ = sc.Write(r.Context(), websocket.MessageText, []byte(`{"type":"dispatch","jobId":"j-block","jobNonce":"n-block","call":{"requests":[{"id":"1","url":"https://example.com/","kind":"page"}]}}`))
 		_, _, _ = sc.Read(r.Context())
 	}))
 	defer srv.Close()
@@ -581,9 +587,13 @@ func TestRunSessionDispatchBackpressureAndPingLoop(t *testing.T) {
 	}, cr, crawl.PublicHTTPS, srv.Client(), log, RuntimeOpts{
 		PingInterval: time.Second,
 		ReadWatchdog: 2 * time.Second,
-	}.withDefaults(), 0, "", dispatchCh)
+	}.withDefaults(), 0, "", queue, busySem, &dispatchWG)
+	dispatchWG.Wait()
 	if err != nil {
-		t.Fatalf("expected nil on context cancel during dispatchCh backpressure, got %v", err)
+		t.Fatalf("expected nil on context cancel during dispatchQueue backpressure, got %v", err)
+	}
+	if !gotBusyReply.Load() {
+		t.Fatal("expected immediate agent_busy reply upload when dispatchQueue is full")
 	}
 }
 

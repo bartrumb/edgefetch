@@ -261,12 +261,13 @@ export function classifyWafAndChallenge(params: {
         : full,
     98_304,
   );
-  const scrubbed = stripHtmlTagsLinear(
+  const scrubbedDom = stripHtmlTagsLinear(
     noDataScripts,
     ['pre', 'code', 'blockquote', 'textarea', 'svg', 'style'],
     ' ',
     98_304,
   );
+  const scrubbed = stripMarkdownFencesAndBlockquotesForWaf(scrubbedDom);
   const scrubbedLower = asciiLower(scrubbed);
   let title = '';
   replacePairedHtmlElementsLinear(
@@ -281,16 +282,56 @@ export function classifyWafAndChallenge(params: {
     { maxChars: 98_304, maxInnerChars: 4096 },
   );
 
+  // Also extract primary `<h1>` or Markdown ATX `#` heading when `<title>` is absent (e.g. `origin-markdown` or headless prose WAF challenges, `M11`).
+  let headingTitle = '';
+  if (!title && visibleWords < 80) {
+    replacePairedHtmlElementsLinear(
+      scrubbed,
+      ['h1'],
+      (_full, _t, _a, inner) => {
+        if (!headingTitle) {
+          headingTitle = stripHtmlTagsQuoteAwareLinear(inner, ' ', 1024).replace(/\s+/g, ' ').trim();
+        }
+        return '';
+      },
+      { maxChars: 98_304, maxInnerChars: 1024 },
+    );
+    if (!headingTitle) {
+      const mdH1 = /^(?:\s*\r?\n)*[ \t]{0,3}#{1,2}[ \t]+([^\r\n]{1,200})/.exec(scrubbed);
+      if (mdH1?.[1]) {
+        headingTitle = mdH1[1].replace(/[ \t#*]+$/, '').trim();
+      }
+    }
+  }
+  const effectiveTitle = title || headingTitle;
+
   const serverHdr = readHeaderCaseInsensitive(headers, 'server').toLowerCase();
   const setCookie = readHeaderCaseInsensitive(headers, 'set-cookie').toLowerCase();
   const isGenericChallengeTitle =
-    /^(?:verify you are human|human verification|pardon our interruption|access to this page has been denied|bot verification|security check)$/i.test(
-      title,
+    /^(?:verify you are human|human verification|pardon our interruption|access to this page has been denied|bot verification|security check|vercel security checkpoint)$/i.test(
+      effectiveTitle,
     );
+  const hasCloudflareProseSignals =
+    scrubbedLower.includes('enable javascript and cookies to continue') ||
+    scrubbedLower.includes('needs to review the security of your connection') ||
+    scrubbedLower.includes('verify you are human') ||
+    scrubbedLower.includes('why do i have to complete a captcha') ||
+    scrubbedLower.includes('performance & security by cloudflare') ||
+    scrubbedLower.includes('checking if the site connection is secure');
 
-  // 1. Cloudflare
+  // 1. Cloudflare (HTML DOM & `origin-markdown` / thin prose interstitials, `M11`)
   if (
     /^(?:just a moment\.{0,3}|attention required!\s*\|\s*cloudflare|ddos-guard|checking your browser)$/i.test(title) ||
+    (visibleWords < 80 &&
+      /^(?:just a moment\.{0,3}|attention required!\s*\|\s*cloudflare|ddos-guard|checking your browser)$/i.test(effectiveTitle) &&
+      (hasCloudflareProseSignals || visibleWords < 25)) ||
+    (visibleWords < 60 &&
+      (scrubbedLower.includes('enable javascript and cookies to continue') ||
+        (scrubbedLower.includes('just a moment') && hasCloudflareProseSignals) ||
+        (scrubbedLower.includes('verify you are human') && scrubbedLower.includes('needs to review the security of your connection')) ||
+        (scrubbedLower.includes('attention required') &&
+          scrubbedLower.includes('cloudflare') &&
+          (scrubbedLower.includes('security check') || scrubbedLower.includes('captcha'))))) ||
     (scrubbedLower.includes('_cf_chl_opt') && scrubbedLower.includes('/cdn-cgi/challenge-platform/')) ||
     (visibleWords < 80 && scrubbedLower.includes('challenges.cloudflare.com/turnstile') && isGenericChallengeTitle)
   ) {
@@ -298,13 +339,17 @@ export function classifyWafAndChallenge(params: {
       vendor: 'cloudflare',
       category: 'challenge',
       confidence: 0.95,
-      signals: ['dom:cloudflare-challenge'],
+      signals: [title ? 'dom:cloudflare-challenge' : 'prose:cloudflare-challenge'],
       summary: 'Cloudflare anti-bot challenge page',
     };
   }
 
   // 2. DataDome
-  if (scrubbedLower.includes('geo.captcha-delivery.com') || scrubbedLower.includes('ct.captcha-delivery.com')) {
+  if (
+    scrubbedLower.includes('geo.captcha-delivery.com') ||
+    scrubbedLower.includes('ct.captcha-delivery.com') ||
+    (visibleWords < 60 && scrubbedLower.includes('please enable js and disable any ad blocker'))
+  ) {
     return {
       vendor: 'datadome',
       category: 'challenge',
@@ -389,18 +434,35 @@ export function classifyWafAndChallenge(params: {
     };
   }
 
-  // 8. Generic interstitial shell (CAPTCHA widget, NCBI JS browser check, or Anubis PoW gate on < 80-word shell)
+  // 8. Generic interstitial shell (CAPTCHA widget, Vercel Security Checkpoint, NCBI JS browser check, or Anubis PoW gate on < 80-word shell)
   if (visibleWords < 80) {
     if (
+      scrubbedLower.includes('vercel security checkpoint') ||
+      ((scrubbedLower.includes("we're verifying your browser") || scrubbedLower.includes('we are verifying your browser')) &&
+        scrubbedLower.includes('vercel'))
+    ) {
+      return {
+        vendor: 'vercel',
+        category: 'challenge',
+        confidence: 0.94,
+        signals: ['prose:vercel-security-checkpoint'],
+        summary: 'Vercel Security Checkpoint challenge page',
+      };
+    }
+    if (
       isGenericChallengeTitle &&
-      (scrubbedLower.includes('g-recaptcha') || scrubbedLower.includes('h-captcha') || scrubbedLower.includes('cf-turnstile'))
+      (scrubbedLower.includes('g-recaptcha') ||
+        scrubbedLower.includes('h-captcha') ||
+        scrubbedLower.includes('cf-turnstile') ||
+        scrubbedLower.includes('complete the security check') ||
+        scrubbedLower.includes('why do i have to complete a captcha'))
     ) {
       return {
         vendor: 'generic',
         category: 'challenge',
         confidence: 0.88,
-        signals: [`title:${title}`],
-        summary: `anti-bot challenge page (${title})`,
+        signals: [`title:${effectiveTitle}`],
+        summary: `anti-bot challenge page (${effectiveTitle})`,
       };
     }
     if (
@@ -419,6 +481,34 @@ export function classifyWafAndChallenge(params: {
   }
 
   return null;
+}
+
+function stripMarkdownFencesAndBlockquotesForWaf(text: string): string {
+  if (!text.includes('```') && !text.includes('~~~') && !text.includes('>')) return text;
+  const lines = text.split('\n');
+  const kept: string[] = [];
+  let fenceChar = '';
+  let fenceLen = 0;
+  for (const line of lines) {
+    const trimmedStart = line.replace(/^[ \t]{0,3}/, '');
+    if (!fenceChar) {
+      const m = /^(`{3,}|~{3,})(.*)$/.exec(trimmedStart);
+      if (m && !(m[1]![0] === '`' && m[2]!.includes('`'))) {
+        fenceChar = m[1]![0]!;
+        fenceLen = m[1]!.length;
+        continue;
+      }
+      if (trimmedStart.startsWith('>')) continue;
+      kept.push(line);
+    } else {
+      const cm = /^(`{3,}|~{3,})[ \t\r]*$/.exec(trimmedStart);
+      if (cm && cm[1]![0] === fenceChar && cm[1]!.length >= fenceLen) {
+        fenceChar = '';
+        fenceLen = 0;
+      }
+    }
+  }
+  return kept.join('\n');
 }
 
 const NON_CONTENT_IFRAME_HOST_RE =

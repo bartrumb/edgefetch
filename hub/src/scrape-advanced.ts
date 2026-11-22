@@ -47,83 +47,6 @@ const INJECTION_PATTERNS: Array<{ id: string; re: RegExp; weight: number }> = [
 const HIDDEN_STYLE_TOKEN_RE = /(?:display[ \t]*:[ \t]*none|visibility[ \t]*:[ \t]*hidden|opacity[ \t]*:[ \t]*0(?![0-9.])|font-size[ \t]*:[ \t]*0(?![0-9.]))/i;
 const HIDDEN_OVERRIDE_KEYWORD_RE = /\b(?:ignore|disregard|system[ \t\r\n]{1,10}prompt|assistant|tool|execute|instructions?)\b/i;
 
-/**
- * Strips fenced code blocks (supporting 3+ backticks or tildes per CommonMark so 4-backtick fences cannot be broken out
- * of by inner 3-backtick lines!) and inline code spans in linear O(N) time (`H1`).
- */
-function stripMarkdownCodeBlocksAndSpansLinear(md: string): string {
-  const lines = md.split('\n');
-  const proseLines: string[] = [];
-  let openFenceChar = '';
-  let openFenceLen = 0;
-
-  for (const line of lines) {
-    if (!openFenceChar) {
-      const m = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(line);
-      if (m) {
-        const fence = m[1]!;
-        const ch = fence[0]!;
-        // Info string for backtick fences cannot contain backticks in CommonMark
-        if (ch !== '`' || !line.slice(m[0].length).includes('`')) {
-          openFenceChar = ch;
-          openFenceLen = fence.length;
-          continue;
-        }
-      }
-      proseLines.push(line);
-    } else {
-      const closeRe = openFenceChar === '`' ? /^[ \t]{0,3}(`{3,})[ \t\r]*$/ : /^[ \t]{0,3}(~{3,})[ \t\r]*$/;
-      const cm = closeRe.exec(line);
-      if (cm && cm[1]!.length >= openFenceLen) {
-        openFenceChar = '';
-        openFenceLen = 0;
-      }
-    }
-  }
-
-  // Strip inline code spans line-by-line (linear scan matching equal-length backtick runs)
-  return proseLines
-    .map((ln) => {
-      if (ln.indexOf('`') < 0) return ln;
-      let out = '';
-      let i = 0;
-      while (i < ln.length) {
-        const tick = ln.indexOf('`', i);
-        if (tick < 0) {
-          out += ln.slice(i);
-          break;
-        }
-        out += ln.slice(i, tick);
-        let runEnd = tick + 1;
-        while (runEnd < ln.length && ln.charCodeAt(runEnd) === 96) runEnd++;
-        const runLen = runEnd - tick;
-        // Find matching run of exact `runLen` backticks on this line
-        let search = runEnd;
-        let matchedEnd = -1;
-        while (search < ln.length) {
-          const nextTick = ln.indexOf('`', search);
-          if (nextTick < 0) break;
-          let nextEnd = nextTick + 1;
-          while (nextEnd < ln.length && ln.charCodeAt(nextEnd) === 96) nextEnd++;
-          if (nextEnd - nextTick === runLen) {
-            matchedEnd = nextEnd;
-            break;
-          }
-          search = nextEnd;
-        }
-        if (matchedEnd >= 0) {
-          out += ' ';
-          i = matchedEnd;
-        } else {
-          out += ln.slice(tick, runEnd);
-          i = runEnd;
-        }
-      }
-      return out;
-    })
-    .join('\n');
-}
-
 const INLINE_SPLIT_TAGS = new Set([
   'a',
   'abbr',
@@ -154,7 +77,31 @@ const INLINE_SPLIT_TAGS = new Set([
   'wbr',
 ]);
 
-function normalizeProseForInjectionScan(prose: string): string {
+function unwrapMarkdownLinksForScanLinear(s: string): string {
+  if (!s.includes('](')) return s;
+  let out = '';
+  let last = 0;
+  let i = 0;
+  while (i < s.length) {
+    if (s.charCodeAt(i) === 91 /* '[' */) {
+      const closeBracket = s.indexOf('](', i + 1);
+      if (closeBracket < 0) break;
+      if (closeBracket - i <= 400 && s.slice(i + 1, closeBracket).indexOf('\n') < 0) {
+        const closeParen = s.indexOf(')', closeBracket + 2);
+        if (closeParen > closeBracket + 1 && closeParen - closeBracket <= 2048) {
+          out += s.slice(last, i) + s.slice(i + 1, closeBracket);
+          i = closeParen + 1;
+          last = i;
+          continue;
+        }
+      }
+    }
+    i++;
+  }
+  return last === 0 ? s : out + s.slice(last);
+}
+
+function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'strip' = 'space'): string {
   let out = prose;
   if (out.includes('<!--')) {
     out = stripHtmlCommentsLinear(out, MAX_HTML_SCAN_CHARS);
@@ -163,18 +110,18 @@ function normalizeProseForInjectionScan(prose: string): string {
     out = stripHtmlTagsLinear(out, ['script', 'style', 'noscript', 'template'], ' ', MAX_HTML_SCAN_CHARS);
     out = replaceHtmlTagsQuoteAwareLinear(
       out,
-      (tag) => (INLINE_SPLIT_TAGS.has(tag.tagNameLower) ? '' : ' '),
+      (tag) => (INLINE_SPLIT_TAGS.has(tag.tagNameLower) || tag.tagNameLower === 'code' ? '' : ' '),
       MAX_HTML_SCAN_CHARS,
       false,
     );
   }
   if (out.includes('&')) {
     out = out
-      .replace(/&#(\d{1,7});/g, (_m, dec: string) => {
+      .replace(/&#(\d{1,7});?/g, (_m, dec: string) => {
         const cp = Number(dec);
         return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
       })
-      .replace(/&#x([0-9a-fA-F]{1,6});/g, (_m, hex: string) => {
+      .replace(/&#x([0-9a-fA-F]{1,6});?/gi, (_m, hex: string) => {
         const cp = parseInt(hex, 16);
         return Number.isFinite(cp) && cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
       })
@@ -187,12 +134,32 @@ function normalizeProseForInjectionScan(prose: string): string {
       .replace(/&gt;/gi, '>')
       .replace(/&amp;/gi, '&');
   }
-  return out.replace(/[\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]/gu, '');
+  // Strip Variation Selectors (`U+FE00..U+FE0F`), Variation Selectors Supplement (`U+E0100..U+E01EF`), Unicode Tags (`U+E0000..U+E007F`),
+  // Combining Grapheme Joiner (`U+034F`), soft hyphens (`U+00AD`), Bidi/zero-width formatting chars (`M11`).
+  out = out
+    .replace(
+      /[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF\u{E0000}-\u{E01EF}]/gu,
+      '',
+    )
+    .replace(/[\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, ' ');
+
+  // Strip fenced code block marker lines while keeping inner code content for `checkPromptInjection` scanning (`M11`).
+  if (out.includes('```') || out.includes('~~~')) {
+    out = out.replace(/^[ \t]{0,3}(?:`{3,}|~{3,})[^\r\n]*$/gm, '');
+  }
+  if (out.includes('](')) {
+    out = unwrapMarkdownLinksForScanLinear(out);
+  }
+
+  if (fillerMode === 'strip') {
+    return out.replace(/[\u115F\u1160\u3164\uFFA0`*_~]/g, '');
+  }
+  return out.replace(/[\u115F\u1160\u3164\uFFA0`]/g, ' ').replace(/[*_~]{1,3}/g, '');
 }
 
 /**
- * Scans extracted prose and raw HTML for indirect prompt-injection payloads while stripping fenced code blocks and
- * `<code>`/`<pre>` elements so security documentation discussing prompt injection does not false-positive (`H1`, `R3-M3`).
+ * Scans extracted Markdown (including inline code spans and fenced/indented code blocks when `checkPromptInjection` runs)
+ * and raw HTML for indirect prompt-injection payloads (`H1`, `R3-M3`, `M11`).
  */
 export function detectPromptInjection(params: {
   markdown: string;
@@ -211,12 +178,12 @@ export function detectPromptInjection(params: {
 
   // 2. Hidden CSS / DOM subtree containing imperative LLM override phrases (strictly linear O(N) scan with monotonic close-tag & window cursors)
   if (boundedHtml) {
-    const rawWithoutCode = stripHtmlTagsLinear(boundedHtml, ['pre', 'code'], ' ', MAX_HTML_SCAN_CHARS);
-    const lowerWithoutCode = asciiLower(rawWithoutCode);
+    const rawForHidden = boundedHtml;
+    const lowerForHidden = asciiLower(rawForHidden);
     const nextCloseByTag = new Map<string, number>();
     let scannedHiddenUpTo = 0;
     scanHtmlTagsLinear(
-      rawWithoutCode,
+      rawForHidden,
       (tag) => {
         if (tag.isClosing || tag.isSelfClosing || tag.isDeclaration) return;
         if (tag.attrs.indexOf('style') < 0 && tag.attrs.indexOf('STYLE') < 0 && !/style/i.test(tag.attrs)) return;
@@ -229,11 +196,11 @@ export function detectPromptInjection(params: {
         if (closeIdx === undefined || (closeIdx >= 0 && closeIdx < tag.end)) {
           let searchFrom = closeIdx !== undefined && closeIdx >= 0 ? Math.max(tag.end, closeIdx) : tag.end;
           let found = -1;
-          while (searchFrom < rawWithoutCode.length) {
-            const cand = lowerWithoutCode.indexOf(closeNeedle, searchFrom);
+          while (searchFrom < rawForHidden.length) {
+            const cand = lowerForHidden.indexOf(closeNeedle, searchFrom);
             if (cand < 0) break;
             const afterIdx = cand + closeNeedle.length;
-            if (afterIdx < rawWithoutCode.length && isTagNameBoundary(rawWithoutCode.charCodeAt(afterIdx))) {
+            if (afterIdx < rawForHidden.length && isTagNameBoundary(rawForHidden.charCodeAt(afterIdx))) {
               found = cand;
               break;
             }
@@ -243,15 +210,15 @@ export function detectPromptInjection(params: {
           nextCloseByTag.set(tag.tagNameLower, closeIdx);
         }
 
-        const maxSearchEnd = Math.min(rawWithoutCode.length, tag.end + 1400);
-        const sliceEnd = closeIdx >= 0 && closeIdx <= maxSearchEnd ? closeIdx : Math.min(rawWithoutCode.length, tag.end + 1200);
+        const maxSearchEnd = Math.min(rawForHidden.length, tag.end + 1400);
+        const sliceEnd = closeIdx >= 0 && closeIdx <= maxSearchEnd ? closeIdx : Math.min(rawForHidden.length, tag.end + 1200);
         const sliceStart = Math.max(tag.end, scannedHiddenUpTo - 64);
         if (sliceEnd <= sliceStart) return;
         scannedHiddenUpTo = Math.max(scannedHiddenUpTo, sliceEnd);
-        const innerTxt = normalizeProseForInjectionScan(
-          stripHtmlTagsQuoteAwareLinear(rawWithoutCode.slice(sliceStart, sliceEnd), ' ', 2000),
-        );
-        if (HIDDEN_OVERRIDE_KEYWORD_RE.test(innerTxt)) {
+        const rawSlice = stripHtmlTagsQuoteAwareLinear(rawForHidden.slice(sliceStart, sliceEnd), ' ', 2000);
+        const innerSpaced = normalizeProseForInjectionScan(rawSlice, 'space');
+        const innerStripped = normalizeProseForInjectionScan(rawSlice, 'strip');
+        if (HIDDEN_OVERRIDE_KEYWORD_RE.test(innerSpaced) || HIDDEN_OVERRIDE_KEYWORD_RE.test(innerStripped)) {
           triggers.push('hidden_css_instruction_injection');
           totalScore += 5;
           return false;
@@ -263,11 +230,13 @@ export function detectPromptInjection(params: {
     );
   }
 
-  // 3. Prose scan (excluding fenced code blocks and inline code spans, stripping zero-width chars, entities, and inline HTML tags)
-  const proseWithoutCode = normalizeProseForInjectionScan(stripMarkdownCodeBlocksAndSpansLinear(boundedMd));
+  // 3. Full Markdown + code-span / fenced-block scan (`M11`: catches backtick-wrapped, fenced, Variation Selector, CGJ, and Hangul-filler split overrides)
+  const scanSpaced = normalizeProseForInjectionScan(boundedMd, 'space');
+  const needsStrippedPass = /[\u115F\u1160\u3164\uFFA0`*_~]/.test(boundedMd);
+  const scanStripped = needsStrippedPass ? normalizeProseForInjectionScan(boundedMd, 'strip') : '';
 
   for (const pat of INJECTION_PATTERNS) {
-    if (pat.re.test(proseWithoutCode)) {
+    if (pat.re.test(scanSpaced) || (scanStripped && pat.re.test(scanStripped))) {
       triggers.push(pat.id);
       totalScore += pat.weight;
     }

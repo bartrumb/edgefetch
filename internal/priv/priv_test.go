@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 )
@@ -129,13 +131,13 @@ func TestLockDownSecretPathsBranchesAndPublicEntrypoints(t *testing.T) {
 		t.Fatalf("missing dataDir unexpected error: %v", err)
 	}
 
-	// 3. dataDir lstat non-ErrNotExist error (ENOTDIR via child under regular file).
+	// 3. dataDir openNoFollowSecretFD non-ENOENT error (ENOTDIR via child under regular file).
 	regFile := filepath.Join(tmp, "regfile")
 	if err := os.WriteFile(regFile, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write regFile: %v", err)
 	}
-	if err := lockDownSecretPathsWith(0, filepath.Join(regFile, "child"), noopChown, realChmod); err == nil || !strings.Contains(err.Error(), "lstat") {
-		t.Fatalf("expected lstat ENOTDIR error on dataDir, got %v", err)
+	if err := lockDownSecretPathsWith(0, filepath.Join(regFile, "child"), noopChown, realChmod); !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("expected ENOTDIR error on dataDir, got %v", err)
 	}
 
 	// 4. dataDir is symlink -> fail closed.
@@ -158,12 +160,12 @@ func TestLockDownSecretPathsBranchesAndPublicEntrypoints(t *testing.T) {
 		t.Fatalf("expected dataDir chmod error, got %v", err)
 	}
 
-	// 7. paths duplicate of dataDir skipped, and paths lstat non-ErrNotExist error (ENOTDIR).
+	// 7. paths duplicate of dataDir skipped, and paths openNoFollowSecretFD non-ENOENT error (ENOTDIR).
 	if err := lockDownSecretPathsWith(0, subDir, noopChown, realChmod, subDir); err != nil {
 		t.Fatalf("duplicate dataDir in paths unexpected error: %v", err)
 	}
-	if err := lockDownSecretPathsWith(0, subDir, noopChown, realChmod, filepath.Join(regFile, "child")); err == nil || !strings.Contains(err.Error(), "lstat") {
-		t.Fatalf("expected paths lstat ENOTDIR error, got %v", err)
+	if err := lockDownSecretPathsWith(0, subDir, noopChown, realChmod, filepath.Join(regFile, "child")); !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("expected paths ENOTDIR error, got %v", err)
 	}
 
 	// 8. paths chown and chmod failures (succeed on dataDir, fail on path).
@@ -298,4 +300,77 @@ func TestDropRootWithOrderingAndFailClosedVerification(t *testing.T) {
 	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "supplementary group 0") {
 		t.Fatalf("expected supplementary group 0 error, got %v", err)
 	}
+}
+
+func TestLockDownSecretPathsRefusesHardlinksFIFOsAndSymlinkTOCTOU(t *testing.T) {
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	victim := filepath.Join(tmp, "victim.json")
+	if err := os.WriteFile(victim, []byte(`{"victim":true}`), 0o644); err != nil {
+		t.Fatalf("write victim: %v", err)
+	}
+	optsPath := filepath.Join(dataDir, "options.json")
+
+	// 1. Hardlink (nlink == 2) MUST be refused before chown/chmod so victim mode stays 0644.
+	if err := os.Link(victim, optsPath); err != nil {
+		t.Fatalf("hardlink: %v", err)
+	}
+	noopChown := func(string, int, int) error { return nil }
+	err := lockDownSecretPathsWith(0, dataDir, noopChown, nil, optsPath)
+	if err == nil || !strings.Contains(err.Error(), "hardlinked") {
+		t.Fatalf("SECURITY: expected hardlinked secret path to fail closed, got %v", err)
+	}
+	if vst, sErr := os.Stat(victim); sErr != nil || vst.Mode().Perm() != 0o644 {
+		t.Fatalf("SECURITY: victim mode altered via hardlink: %v (err=%v)", vst.Mode().Perm(), sErr)
+	}
+	_ = os.Remove(optsPath)
+
+	// 2. Named pipe (FIFO) MUST be refused without blocking (O_NONBLOCK).
+	fifoPath := filepath.Join(dataDir, "fifo-secret")
+	if err := syscall.Mkfifo(fifoPath, 0o644); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	if err := lockDownSecretPathsWith(0, dataDir, noopChown, nil, fifoPath); err == nil || !strings.Contains(err.Error(), "non-regular") {
+		t.Fatalf("SECURITY: expected FIFO secret path to fail closed without blocking, got %v", err)
+	}
+	_ = os.Remove(fifoPath)
+
+	// 3. Symlinked dataDir MUST be refused.
+	symData := filepath.Join(tmp, "sym-data")
+	if err := os.Symlink(dataDir, symData); err != nil {
+		t.Fatalf("symlink dataDir: %v", err)
+	}
+	if err := lockDownSecretPathsWith(0, symData, noopChown, nil); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("SECURITY: expected symlink dataDir to fail closed, got %v", err)
+	}
+
+	// 4. Tight file<->symlink TOCTOU swap race: using real Fchmod (chmodFn == nil), victim MUST NEVER become 0600!
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tmpReal := filepath.Join(dataDir, ".swap-real")
+		tmpLink := filepath.Join(dataDir, ".swap-link")
+		for !stop.Load() {
+			_ = os.WriteFile(tmpReal, []byte("{}"), 0o644)
+			_ = os.Rename(tmpReal, optsPath)
+			_ = os.Remove(tmpLink)
+			_ = os.Symlink(victim, tmpLink)
+			_ = os.Rename(tmpLink, optsPath)
+		}
+	}()
+	for i := 0; i < 400; i++ {
+		_ = lockDownSecretPathsWith(0, "", noopChown, nil, optsPath)
+		if vst, sErr := os.Stat(victim); sErr != nil || vst.Mode().Perm() != 0o644 {
+			stop.Store(true)
+			wg.Wait()
+			t.Fatalf("SECURITY (TOCTOU): victim chmod'ed on trial %d (mode=%o err=%v)", i, vst.Mode().Perm(), sErr)
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
 }

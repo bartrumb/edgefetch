@@ -21,7 +21,7 @@ import type { ArtifactRetention, OptionalStorageBindings } from './storage';
 export type PayPeriod = 'year' | 'month' | 'week' | 'day' | 'hour';
 export type PayBasis = 'base' | 'ote' | 'total';
 export type WorkplaceType = 'remote' | 'hybrid' | 'onsite' | 'unknown';
-export type AtsBoardStatus = 'ok' | 'empty_board' | 'wrong_slug' | 'blocked_or_down' | 'not_found';
+export type AtsBoardStatus = 'ok' | 'empty_board' | 'wrong_slug' | 'blocked_or_down' | 'not_found' | 'budget_exhausted';
 
 export interface DiscoveredAtsBoard {
   domain?: string;
@@ -468,10 +468,13 @@ export function extractJobPostingJsonLd(rawHtml: string, baseUrl?: string, fallb
       : inferWorkplaceType(wpText));
 
   const empRaw = jp.employmentType;
-  const employmentType = Array.isArray(empRaw) ? empRaw.map(String).join(', ') : typeof empRaw === 'string' ? empRaw : undefined;
-  const datePosted = typeof jp.datePosted === 'string' ? jp.datePosted : undefined;
-  const validThrough = typeof jp.validThrough === 'string' ? jp.validThrough : undefined;
-  const applyUrl = typeof jp.url === 'string' && jp.url.startsWith('http') ? jp.url : baseUrl;
+  const rawEmpStr = Array.isArray(empRaw) ? empRaw.map(String).join(', ') : typeof empRaw === 'string' ? empRaw : '';
+  const cleanEmp = rawEmpStr ? stripTagsPlain(rawEmpStr).slice(0, 160).trim() : '';
+  const employmentType = cleanEmp || undefined;
+  const datePosted = typeof jp.datePosted === 'string' ? stripTagsPlain(jp.datePosted).slice(0, 64).trim() || undefined : undefined;
+  const validThrough = typeof jp.validThrough === 'string' ? stripTagsPlain(jp.validThrough).slice(0, 64).trim() || undefined : undefined;
+  const rawJpUrl = typeof jp.url === 'string' ? jp.url.trim() : '';
+  const applyUrl = /^https?:\/\/[^\s<>()"`]{1,2048}$/i.test(rawJpUrl) ? rawJpUrl : baseUrl;
 
   return {
     title,
@@ -2042,20 +2045,20 @@ function tryDecodePaymentHeaderJson(raw: string): Record<string, unknown> | null
   return null;
 }
 
-const KNOWN_USDC_CONTRACTS = new Set([
-  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // Base mainnet USDC
-  '0x036cbd53842c5426634e7929541ec2318f3dcf7e', // Base Sepolia USDC
-  '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', // Ethereum mainnet USDC
-  '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', // Ethereum Sepolia USDC
-  '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', // Polygon mainnet USDC
-  '0x2791bca1f2de4661ed88a30c99a7a9449aa84174', // Polygon USDC.e
-  '0xaf88d065e77c8cc2239327c5edb3a432268e5831', // Arbitrum mainnet USDC
-  '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', // Arbitrum USDC.e
-  '0x0b2c639c533813f4aa9d7837caf62653d097ff85', // Optimism mainnet USDC
-  '0x7f5c764cbc14f9669b88837ca1490cca17c31607', // Optimism USDC.e
-  '0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e', // Avalanche mainnet USDC
-  'epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwytdt1v', // Solana mainnet USDC mint
+const KNOWN_MAINNET_USDC_CONTRACTS = new Map<string, readonly string[]>([
+  ['0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', ['base', 'base-mainnet', 'eip155:8453']],
+  ['0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', ['ethereum', 'eth', 'mainnet', 'eip155:1']],
+  ['0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', ['polygon', 'matic', 'eip155:137']],
+  ['0x2791bca1f2de4661ed88a30c99a7a9449aa84174', ['polygon', 'matic', 'eip155:137']],
+  ['0xaf88d065e77c8cc2239327c5edb3a432268e5831', ['arbitrum', 'arbitrum-one', 'eip155:42161']],
+  ['0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', ['arbitrum', 'arbitrum-one', 'eip155:42161']],
+  ['0x0b2c639c533813f4aa9d7837caf62653d097ff85', ['optimism', 'op-mainnet', 'eip155:10']],
+  ['0x7f5c764cbc14f9669b88837ca1490cca17c31607', ['optimism', 'op-mainnet', 'eip155:10']],
+  ['0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e', ['avalanche', 'avax', 'eip155:43114']],
+  ['epjfwdd5aufqssqem2qn1xzybapc8g4weggkzwytdt1v', ['solana', 'solana-mainnet']],
 ]);
+
+const TESTNET_NETWORK_RE = /(?:sepolia|goerli|holesky|testnet|devnet|mumbai|amoy|fuji)/i;
 
 const X402_FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -2063,20 +2066,27 @@ function hasOwnProp(obj: Record<string, unknown>, key: string): boolean {
   return !X402_FORBIDDEN_KEYS.has(key) && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
-const DECEPTIVE_402_TOKEN_RE = /(?:\b(?:gratis|free|trial|complimentary)\b|free|gratis|complimentary|ok2fetch|freetrial)/i;
+const DECEPTIVE_402_TOKEN_RE =
+  /(?:\b(?:gratis|free|trial|complimentary|paid|prepaid|waived|comped|zero|refunded|settled|included|authorized|authorised|allowed|bypass|exempt|sponsored|covered|ok|go|yes)\b|free|gratis|complimentary|ok2fetch|oktofetch|freetrial|nocost|nofee|nocharge|prepaid|already[-_.: ]*paid|fr33|f2ee)/i;
+const X402_INJECTION_PROSE_RE =
+  /\b(?:ignore|disregard|forget|override|system[ \t]+prompt|assistant[ \t]*:|pre-?authori[sz]ed|already[ \t]+settled|fetch_url|bearer[ \t]+token|rm[ \t]+-rf|instructions?)\b/i;
 const ZERO_VALUE_402_PRICE_RE = /^[$€£]?\s*0+(?:\.0+)?(?:\b|\s|$)/;
 
 /**
  * Strips ANSI CSI/OSC escape sequences, ASCII C0/C1 control characters, CR/LF newlines, DEL, zero-width / soft-hyphen,
- * Unicode Tag smuggling (`U+E0000`–`U+E01EF`), and Unicode BiDi override/isolate controls, collapsing whitespace and capping at `maxLen` chars.
+ * Variation Selectors (`U+FE00`–`U+FE0F`), Combining Grapheme Joiner (`U+034F`), Hangul fillers, Unicode Tag smuggling (`U+E0000`–`U+E01EF`),
+ * and Unicode BiDi override/isolate controls, normalizing Unicode whitespace to `' '` and capping at `maxLen` chars.
  */
 function sanitizeX402String(raw: unknown, maxLen = 256): string | undefined {
   if (typeof raw !== 'string') return undefined;
   const cleaned = raw
     .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
-    .replace(/[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u{e0000}-\u{e01ef}]+/gu, '')
-    .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, ' ')
+    .replace(
+      /[\u00ad\u034f\u061c\u115f\u1160\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\u{e0000}-\u{e01ef}]+/gu,
+      '',
+    )
+    .replace(/[\x00-\x1f\x7f-\x9f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/g, ' ')
     .replace(/[ \t]+/g, ' ')
     .trim();
   if (!cleaned) return undefined;
@@ -2084,27 +2094,23 @@ function sanitizeX402String(raw: unknown, maxLen = 256): string | undefined {
 }
 
 /**
- * Strips Markdown inline/image/reference links (`[label](dest)` -> `label`, `![alt](dest)` -> `''`), angle-bracket
- * autolinks/HTML tags (`<...>`), plus control / zero-width / BiDi characters in guaranteed linear O(N) time.
+ * Strips Markdown inline/image/reference links (`[label](dest)` -> `label`, `![alt](dest)` -> `''`, including unbalanced
+ * `[label](https://...`), bare `https?://` / `javascript:` URLs, angle-bracket tags (`<...>`), and prompt-injection prose in O(N) time.
  */
-function sanitizeX402PlainField(raw: unknown, maxLen = 256, strictIdentifier = false): string | undefined {
+function sanitizeX402PlainField(raw: unknown, maxLen = 140, strictIdentifier = false): string | undefined {
   const base = sanitizeX402String(raw, 2_048);
   if (!base) return undefined;
   let out = '';
   let i = 0;
   while (i < base.length) {
     const ch = base.charCodeAt(i);
-    // Strip `<...>` angle-bracket autolinks or inline HTML tags
+    // Strip `<...>` angle-bracket autolinks or inline HTML tags (if unclosed `<`, skip `<` itself!)
     if (ch === 60 /* '<' */) {
       const gt = base.indexOf('>', i + 1);
-      if (gt > i) {
-        i = gt + 1;
-        continue;
-      }
-      i++;
+      i = gt > i ? gt + 1 : i + 1;
       continue;
     }
-    // Strip `![alt](dest)` or `[label](dest)` / `[label][ref]`
+    // Strip `![alt](dest)` (closed or unclosed)
     if (ch === 33 /* '!' */ && i + 1 < base.length && base.charCodeAt(i + 1) === 91 /* '[' */) {
       const closeBr = base.indexOf(']', i + 2);
       if (closeBr >= 0 && closeBr + 1 < base.length && base.charCodeAt(closeBr + 1) === 40 /* '(' */) {
@@ -2116,15 +2122,16 @@ function sanitizeX402PlainField(raw: unknown, maxLen = 256, strictIdentifier = f
             p += 2;
             continue;
           }
+          if (pc === 32 && depth === 1) break;
           if (pc === 40) depth++;
           else if (pc === 41) depth--;
           p++;
         }
-        if (depth === 0) {
-          i = p;
-          continue;
-        }
+        i = p;
+        continue;
       }
+      i += 2;
+      continue;
     }
     if (ch === 91 /* '[' */) {
       const closeBr = base.indexOf(']', i + 1);
@@ -2139,16 +2146,16 @@ function sanitizeX402PlainField(raw: unknown, maxLen = 256, strictIdentifier = f
               p += 2;
               continue;
             }
+            if (pc === 32 && depth === 1) break;
             if (pc === 40) depth++;
             else if (pc === 41) depth--;
             p++;
           }
-          if (depth === 0) {
-            out += label;
-            i = p;
-            continue;
-          }
-        } else if (closeBr + 1 < base.length && base.charCodeAt(closeBr + 1) === 91 /* '[' */) {
+          out += label;
+          i = p;
+          continue;
+        }
+        if (closeBr + 1 < base.length && base.charCodeAt(closeBr + 1) === 91 /* '[' */) {
           const refClose = base.indexOf(']', closeBr + 2);
           if (refClose >= 0) {
             out += label;
@@ -2157,31 +2164,73 @@ function sanitizeX402PlainField(raw: unknown, maxLen = 256, strictIdentifier = f
           }
         }
       }
+      // Drop stray `[` so `60000` unclosed `[` cannot clutter terms
       i++;
       continue;
     }
-    if (ch === 93 /* ']' */ || ch === 62 /* '>' */) {
+    if (ch === 93 /* ']' */ || ch === 62 /* '>' */ || ch === 96 /* '`' */) {
       i++;
       continue;
     }
-    if (strictIdentifier && (ch === 40 /* '(' */ || ch === 41 /* ')' */ || ch === 96 /* '`' */)) {
+    if (strictIdentifier && (ch === 40 /* '(' */ || ch === 41 /* ')' */)) {
       i++;
       continue;
     }
     out += base[i]!;
     i++;
   }
-  const normalized = out.replace(/[ \t]+/g, ' ').trim();
-  if (!normalized) return undefined;
-  return normalized.length > maxLen ? normalized.slice(0, maxLen) : normalized;
+  const withoutUrls = out
+    .replace(/\b(?:https?|ftp|javascript|vbscript|data|file|blob):[^\s)]*/gi, '')
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+  if (!withoutUrls) return undefined;
+  if (X402_INJECTION_PROSE_RE.test(withoutUrls)) return undefined;
+  return withoutUrls.length > maxLen ? withoutUrls.slice(0, maxLen).trim() : withoutUrls;
 }
 
-function sanitizeX402HttpsResource(raw: unknown): string | undefined {
+function sanitizeX402Identifier(raw: unknown, re: RegExp, maxLen: number): string | undefined {
+  const s = sanitizeX402String(raw, maxLen + 8);
+  if (!s || s.length > maxLen) return undefined;
+  if (/^(?:https?|ftp|javascript|vbscript|data|file|blob):/i.test(s)) return undefined;
+  if (!re.test(s) || X402_INJECTION_PROSE_RE.test(s)) return undefined;
+  return s;
+}
+
+function isSafeX402AssetLabel(rawLabel: string): boolean {
+  if (!rawLabel || /[^\x21-\x7e]/.test(rawLabel)) return false;
+  if (DECEPTIVE_402_TOKEN_RE.test(rawLabel) || X402_INJECTION_PROSE_RE.test(rawLabel)) return false;
+  // Hex contract/token ID (`0xDeadBeefToken`, `0x8335...`), Solana base58 mint, or short clean ticker (`USDC`, `USDT`, `USDC.e`, `CUSTOM`)
+  if (/^0x[A-Za-z0-9]{4,64}$/.test(rawLabel)) return true;
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(rawLabel)) return true;
+  if (/^[A-Za-z0-9]{2,10}(?:\.[A-Za-z0-9]{1,4})?$/.test(rawLabel)) return true;
+  return false;
+}
+
+const KNOWN_MAINNET_USDC_NETWORKS: ReadonlySet<string> = new Set(
+  Array.from(KNOWN_MAINNET_USDC_CONTRACTS.values()).flat(),
+);
+
+function isKnownUsdcAsset(assetRaw: string, network?: string): boolean {
+  const trimmed = assetRaw.trim();
+  if (!trimmed || /[^\x21-\x7e]/.test(trimmed)) return false;
+  if (network && TESTNET_NETWORK_RE.test(network)) return false;
+  if (trimmed.toUpperCase() === 'USDC') {
+    return !network || KNOWN_MAINNET_USDC_NETWORKS.has(network.trim().toLowerCase());
+  }
+  const chains = KNOWN_MAINNET_USDC_CONTRACTS.get(trimmed.toLowerCase());
+  if (!chains) return false;
+  if (!network) return true;
+  const normNet = network.trim().toLowerCase();
+  return chains.includes(normNet);
+}
+
+function sanitizeX402HttpsResource(raw: unknown, expectedHost?: string): string | undefined {
   const s = sanitizeX402String(raw, 512);
-  if (!s || !/^https:\/\//i.test(s) || /[\s<>[\]`]/.test(s)) return undefined;
+  if (!s || !/^https:\/\//i.test(s) || /[\s<>[\]`]/.test(s) || X402_INJECTION_PROSE_RE.test(s)) return undefined;
   try {
     const u = new URL(s);
     if (u.protocol !== 'https:' || u.username || u.password || !u.hostname) return undefined;
+    if (expectedHost && u.hostname.toLowerCase() !== expectedHost.toLowerCase()) return undefined;
     return s.startsWith('https://') ? s : u.toString();
   } catch {
     return undefined;
@@ -2233,8 +2282,9 @@ function validateX402StandalonePrice(raw: unknown, fallbackCurrency?: string): s
     s = String(raw);
   } else if (typeof raw === 'string') {
     if (
-      /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(raw) ||
+      /[\x00-\x1f\x7f-\x9f\u00a0\u1680\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\ufeff]/.test(raw) ||
       DECEPTIVE_402_TOKEN_RE.test(raw) ||
+      X402_INJECTION_PROSE_RE.test(raw) ||
       ZERO_VALUE_402_PRICE_RE.test(raw.trim())
     ) {
       return undefined;
@@ -2249,40 +2299,40 @@ function validateX402StandalonePrice(raw: unknown, fallbackCurrency?: string): s
   const numPart = /^\$?(\d{1,12}(?:\.\d{1,8})?)/.exec(s);
   if (!numPart || !(Number(numPart[1]) > 0)) return undefined;
   if (s.startsWith('$') || / [A-Z0-9]{2,10}$/.test(s)) return s;
-  if (fallbackCurrency && DECEPTIVE_402_TOKEN_RE.test(fallbackCurrency)) return undefined;
+  if (fallbackCurrency && (DECEPTIVE_402_TOKEN_RE.test(fallbackCurrency) || !isSafeX402AssetLabel(fallbackCurrency))) return undefined;
   const curRaw = (fallbackCurrency ?? 'USD').trim().toUpperCase();
   const cur = /^[A-Z0-9]{2,10}$/.test(curRaw) && !DECEPTIVE_402_TOKEN_RE.test(curRaw) ? curRaw : 'USD';
   return cur === 'USD' ? `$${s}` : `$${s} ${cur}`;
 }
 
-function isKnownUsdcAsset(assetRaw: string): boolean {
-  const trimmed = assetRaw.trim();
-  if (!trimmed) return false;
-  return trimmed.toUpperCase() === 'USDC' || KNOWN_USDC_CONTRACTS.has(trimmed.toLowerCase());
-}
-
-function formatX402PriceString(terms: X402PaymentTerms, sawDeceptiveCurrency = false): string | undefined {
+function formatX402PriceString(
+  terms: X402PaymentTerms,
+  sawDeceptiveCurrency = false,
+  rawUntrustedAssetPresent = false,
+): string | undefined {
   const assetRaw = typeof terms.asset === 'string' ? terms.asset.trim() : '';
   const currencyRaw = typeof terms.currency === 'string' ? terms.currency.trim() : '';
-  const isUsdc = isKnownUsdcAsset(assetRaw) || (!assetRaw && isKnownUsdcAsset(currencyRaw));
-  const rawLabel = isUsdc ? 'USDC' : assetRaw || currencyRaw;
-  const assetLabel =
-    isUsdc
-      ? 'USDC'
-      : /^[A-Za-z0-9._:-]{1,68}$/.test(rawLabel) && !DECEPTIVE_402_TOKEN_RE.test(rawLabel)
-        ? rawLabel
-        : '';
+  const networkRaw = typeof terms.network === 'string' ? terms.network.trim() : undefined;
+  const isUsdc =
+    isKnownUsdcAsset(assetRaw, networkRaw) ||
+    (!assetRaw && !rawUntrustedAssetPresent && isKnownUsdcAsset(currencyRaw, networkRaw));
+  const rawLabel = isUsdc ? 'USDC' : assetRaw || (!rawUntrustedAssetPresent ? currencyRaw : '');
+  const assetLabel = isUsdc ? 'USDC' : isSafeX402AssetLabel(rawLabel) ? rawLabel : '';
 
   const normMax = normalizeX402AtomicAmount(terms.maxAmountRequired);
   const normAmt = normalizeX402AtomicAmount(terms.amount);
   const maxBig = normMax !== undefined ? BigInt(normMax) : null;
   const amtBigCandidate = normAmt !== undefined ? BigInt(normAmt) : null;
   const validAmt =
-    maxBig !== null && maxBig > 0n
-      ? normMax
-      : amtBigCandidate !== null && amtBigCandidate > 0n
-        ? normAmt
-        : normMax ?? normAmt;
+    maxBig !== null && maxBig > 0n && amtBigCandidate !== null && amtBigCandidate > 0n
+      ? maxBig >= amtBigCandidate
+        ? normMax
+        : normAmt
+      : maxBig !== null && maxBig > 0n
+        ? normMax
+        : amtBigCandidate !== null && amtBigCandidate > 0n
+          ? normAmt
+          : normMax ?? normAmt;
 
   if (validAmt !== undefined) {
     const amtBig = BigInt(validAmt);
@@ -2291,7 +2341,7 @@ function formatX402PriceString(terms: X402PaymentTerms, sawDeceptiveCurrency = f
       return undefined;
     }
     if (isUsdc) {
-      // Force `decimals = 6` on USDC / `KNOWN_USDC_CONTRACTS` so `extra.decimals: 18` can NEVER understate a USDC price by 10^12!
+      // Force `decimals = 6` on verified mainnet USDC so `extra.decimals: 18` or `9` can NEVER understate a USDC price!
       const decStr = formatAtomicAmountDecimalString(validAmt, 6);
       return `$${decStr} USDC`;
     }
@@ -2412,25 +2462,58 @@ function parseWwwAuthenticateLinear(rawWwwAuth: string): { scheme?: string; pair
   return { ...(scheme ? { scheme } : {}), pairs };
 }
 
+function mergeHigherAtomicAmount(existing: string | undefined, incoming: string | undefined): string | undefined {
+  if (incoming === undefined) return existing;
+  if (existing === undefined) return incoming;
+  const exBig = BigInt(existing);
+  const inBig = BigInt(incoming);
+  return inBig > exBig ? incoming : existing;
+}
+
 /**
- * `G3` (`R3-M5` Hardened): Parses HTTP `402 Payment Required` (`x402` v1/v2 `PAYMENT-REQUIRED` / `X-Payment-Required`
+ * `G3` (`R3-M5` + `R6` Hardened): Parses HTTP `402 Payment Required` (`x402` v1/v2 `PAYMENT-REQUIRED` / `X-Payment-Required`
  * JSON or base64 headers, `WWW-Authenticate: x402` / `L402`, and JSON `402` response bodies) into sanitized `{ price, terms }` —
- * NEVER paying automatically, NEVER calling `Number.toFixed` on untrusted `decimals`, and blocking prompt injection.
+ * NEVER paying automatically, NEVER calling `Number.toFixed` on untrusted `decimals`, choosing maximum positive `accepts`
+ * requirement against cheap decoys, and strictly allowlisting `asset` / `currency` / `payTo` / `network` / `scheme` identifiers.
  */
 export function parseX402PaymentTerms(
   status: unknown,
   headers?: Headers | Record<string, string | undefined>,
   rawBody?: string,
+  expectedHost?: string,
 ): { price?: string; terms: X402PaymentTerms } | null {
   if (status !== 402) return null;
 
   const terms: X402PaymentTerms = {};
   let rawCandidatePrice: unknown;
   let sawDeceptiveCurrency = false;
+  let sawRawAssetField = false;
 
   const payHdr =
     readPaymentHeader(headers, 'payment-required') || readPaymentHeader(headers, 'x-payment-required');
   const wwwAuth = readPaymentHeader(headers, 'www-authenticate');
+
+  const pickBestAcceptEntry = (accepts: unknown[]): Record<string, unknown> | null => {
+    let bestObj: Record<string, unknown> | null = null;
+    let bestAmt = -1n;
+    const limit = Math.min(accepts.length, 32);
+    for (let i = 0; i < limit; i++) {
+      const cand = accepts[i];
+      if (!cand || typeof cand !== 'object' || Array.isArray(cand)) continue;
+      const obj = cand as Record<string, unknown>;
+      if (bestObj === null) bestObj = obj;
+      const mAmt = normalizeX402AtomicAmount(hasOwnProp(obj, 'maxAmountRequired') ? obj.maxAmountRequired : undefined);
+      const aAmt = normalizeX402AtomicAmount(hasOwnProp(obj, 'amount') ? obj.amount : undefined);
+      const mBig = mAmt !== undefined ? BigInt(mAmt) : -1n;
+      const aBig = aAmt !== undefined ? BigInt(aAmt) : -1n;
+      const topBig = mBig > aBig ? mBig : aBig;
+      if (topBig > bestAmt) {
+        bestAmt = topBig;
+        bestObj = obj;
+      }
+    }
+    return bestObj;
+  };
 
   const applyRequirementObj = (root: Record<string, unknown>) => {
     if (
@@ -2444,10 +2527,11 @@ export function parseX402PaymentTerms(
     }
 
     const accepts = hasOwnProp(root, 'accepts') && Array.isArray(root.accepts) ? root.accepts : [];
-    const primary =
-      accepts.length > 0 && accepts[0] && typeof accepts[0] === 'object' && !Array.isArray(accepts[0])
-        ? (accepts[0] as Record<string, unknown>)
-        : root;
+    const chosenAccept = accepts.length > 0 ? pickBestAcceptEntry(accepts) : null;
+    if (accepts.length > 1) {
+      terms.acceptsCount = Math.min(accepts.length, 32);
+    }
+    const primary = chosenAccept ?? root;
 
     const readOwn = (k: string): unknown => {
       if (hasOwnProp(primary, k) && primary[k] !== undefined && primary[k] !== null) return primary[k];
@@ -2455,36 +2539,53 @@ export function parseX402PaymentTerms(
       return undefined;
     };
 
-    const scheme = sanitizeX402String(readOwn('scheme'), 256);
-    const assetRaw = sanitizeX402String(readOwn('asset'), 256);
-    const currency = sanitizeX402String(readOwn('currency'), 256);
-    const network = sanitizeX402PlainField(readOwn('network'), 256, true);
-    const payTo = sanitizeX402PlainField(readOwn('payTo') ?? readOwn('recipient'), 256, true);
-    const resource = sanitizeX402HttpsResource(readOwn('resource'));
-    const description = sanitizeX402PlainField(readOwn('description'), 256, false);
+    const scheme = sanitizeX402Identifier(readOwn('scheme'), /^[A-Za-z0-9._-]{1,32}$/, 32);
+    const rawAssetVal = readOwn('asset');
+    if (rawAssetVal !== undefined && rawAssetVal !== null && String(rawAssetVal).trim() !== '') {
+      sawRawAssetField = true;
+    }
+    const assetRaw = sanitizeX402String(rawAssetVal, 128);
+    const currency = sanitizeX402String(readOwn('currency'), 64);
+    const network = sanitizeX402Identifier(readOwn('network'), /^[A-Za-z0-9:._-]{1,48}$/, 48);
+    const payTo = sanitizeX402Identifier(readOwn('payTo') ?? readOwn('recipient'), /^[A-Za-z0-9:._@-]{1,128}$/, 128);
+    const resource = sanitizeX402HttpsResource(readOwn('resource'), expectedHost);
+    const rawDescVal = readOwn('description');
+    if (typeof rawDescVal === 'string' && DECEPTIVE_402_TOKEN_RE.test(sanitizeX402String(rawDescVal, 512) ?? '')) {
+      sawDeceptiveCurrency = true;
+    }
+    const description = sanitizeX402PlainField(rawDescVal, 140, false);
     const amount = normalizeX402AtomicAmount(readOwn('amount'));
     const maxAmountRequired = normalizeX402AtomicAmount(readOwn('maxAmountRequired'));
     const candPrice = readOwn('price');
 
     if (scheme) terms.scheme = scheme;
     if (candPrice !== undefined) rawCandidatePrice = candPrice;
-    if (amount !== undefined) terms.amount = amount;
-    if (maxAmountRequired !== undefined) terms.maxAmountRequired = maxAmountRequired;
+    terms.amount = mergeHigherAtomicAmount(terms.amount, amount);
+    terms.maxAmountRequired = mergeHigherAtomicAmount(terms.maxAmountRequired, maxAmountRequired);
+
+    const effectiveNet = network ?? terms.network;
+    if (network) terms.network = network;
+
     if (assetRaw) {
       if (DECEPTIVE_402_TOKEN_RE.test(assetRaw)) {
         sawDeceptiveCurrency = true;
+      } else if (isKnownUsdcAsset(assetRaw, effectiveNet)) {
+        terms.asset = 'USDC';
+      } else if (isSafeX402AssetLabel(assetRaw)) {
+        terms.asset = assetRaw;
       } else {
-        terms.asset = isKnownUsdcAsset(assetRaw) ? 'USDC' : assetRaw;
+        sawDeceptiveCurrency = true;
       }
     }
     if (currency) {
       if (DECEPTIVE_402_TOKEN_RE.test(currency)) {
         sawDeceptiveCurrency = true;
-      } else {
+      } else if (isSafeX402AssetLabel(currency)) {
         terms.currency = currency;
+      } else {
+        sawDeceptiveCurrency = true;
       }
     }
-    if (network) terms.network = network;
     if (payTo) terms.payTo = payTo;
     if (resource) terms.resource = resource;
     if (description) {
@@ -2495,25 +2596,25 @@ export function parseX402PaymentTerms(
       }
     }
 
-    // Shallow depth-1 allowlisted `extra` (`{ name?, version?, decimals? }`) — never copies `__proto__` or deep trees!
+    // Shallow depth-1 allowlisted `extra` (`{ name?, version?, decimals? }`) — never copies `__proto__` or unverified `decimals`!
     const rawExtra = hasOwnProp(primary, 'extra') ? primary.extra : undefined;
     if (rawExtra && typeof rawExtra === 'object' && !Array.isArray(rawExtra)) {
       const eo = rawExtra as Record<string, unknown>;
       const safeExtra: X402ExtraMetadata = {};
-      const extraName = hasOwnProp(eo, 'name') ? sanitizeX402PlainField(eo.name, 256, false) : undefined;
-      const extraVer = hasOwnProp(eo, 'version') ? sanitizeX402String(eo.version, 256) : undefined;
+      const extraName = hasOwnProp(eo, 'name') ? sanitizeX402PlainField(eo.name, 80, false) : undefined;
+      const extraVer = hasOwnProp(eo, 'version')
+        ? sanitizeX402Identifier(eo.version, /^[A-Za-z0-9._-]{1,32}$/, 32)
+        : undefined;
       if (extraName && !DECEPTIVE_402_TOKEN_RE.test(extraName)) safeExtra.name = extraName;
       if (extraVer) safeExtra.version = extraVer;
 
-      const effectiveIsUsdc = isKnownUsdcAsset(assetRaw ?? currency ?? terms.asset ?? terms.currency ?? '');
-      if (hasOwnProp(eo, 'decimals') && typeof eo.decimals === 'number' && Number.isInteger(eo.decimals) && eo.decimals >= 0 && eo.decimals <= 18) {
-        if (effectiveIsUsdc) {
-          safeExtra.decimals = 6;
-        } else if (eo.decimals === 0) {
-          safeExtra.decimals = 0;
-        }
-      } else if (effectiveIsUsdc && hasOwnProp(eo, 'decimals') && typeof eo.decimals === 'number') {
+      const effectiveIsUsdc =
+        isKnownUsdcAsset(assetRaw ?? '', effectiveNet) ||
+        (!sawRawAssetField && isKnownUsdcAsset(currency ?? terms.currency ?? '', effectiveNet));
+      if (effectiveIsUsdc && hasOwnProp(eo, 'decimals') && typeof eo.decimals === 'number') {
         safeExtra.decimals = 6;
+      } else if (hasOwnProp(eo, 'decimals') && eo.decimals === 0) {
+        safeExtra.decimals = 0;
       }
       if (Object.keys(safeExtra).length > 0) {
         terms.extra = safeExtra;
@@ -2536,50 +2637,57 @@ export function parseX402PaymentTerms(
   if (wwwAuth) {
     const parsedAuth = parseWwwAuthenticateLinear(wwwAuth);
     if (parsedAuth.scheme && !terms.scheme) {
-      const sc = sanitizeX402String(parsedAuth.scheme, 256);
+      const sc = sanitizeX402Identifier(parsedAuth.scheme, /^[A-Za-z0-9._-]{1,32}$/, 32);
       if (sc) terms.scheme = sc;
     }
     for (const [k, rawV] of parsedAuth.pairs) {
       if (k === 'price' && rawCandidatePrice === undefined) {
         rawCandidatePrice = rawV;
-      } else if (k === 'amount' && terms.amount === undefined) {
+      } else if (k === 'amount') {
         const a = normalizeX402AtomicAmount(rawV);
-        if (a !== undefined) terms.amount = a;
-      } else if (k === 'maxamountrequired' && terms.maxAmountRequired === undefined) {
+        terms.amount = mergeHigherAtomicAmount(terms.amount, a);
+      } else if (k === 'maxamountrequired') {
         const m = normalizeX402AtomicAmount(rawV);
-        if (m !== undefined) terms.maxAmountRequired = m;
+        terms.maxAmountRequired = mergeHigherAtomicAmount(terms.maxAmountRequired, m);
       } else if (k === 'asset' && !terms.asset) {
-        const as = sanitizeX402String(rawV, 256);
+        sawRawAssetField = true;
+        const as = sanitizeX402String(rawV, 128);
         if (as) {
           if (DECEPTIVE_402_TOKEN_RE.test(as)) sawDeceptiveCurrency = true;
-          else terms.asset = isKnownUsdcAsset(as) ? 'USDC' : as;
+          else if (isKnownUsdcAsset(as, terms.network)) terms.asset = 'USDC';
+          else if (isSafeX402AssetLabel(as)) terms.asset = as;
+          else sawDeceptiveCurrency = true;
         }
       } else if (k === 'currency' && !terms.currency) {
-        const cu = sanitizeX402String(rawV, 256);
+        const cu = sanitizeX402String(rawV, 64);
         if (cu) {
           if (DECEPTIVE_402_TOKEN_RE.test(cu)) sawDeceptiveCurrency = true;
-          else terms.currency = cu;
+          else if (isSafeX402AssetLabel(cu)) terms.currency = cu;
+          else sawDeceptiveCurrency = true;
         }
       } else if (k === 'network' && !terms.network) {
-        const nw = sanitizeX402PlainField(rawV, 256, true);
+        const nw = sanitizeX402Identifier(rawV, /^[A-Za-z0-9:._-]{1,48}$/, 48);
         if (nw) terms.network = nw;
       } else if ((k === 'payto' || k === 'recipient') && !terms.payTo) {
-        const pt = sanitizeX402PlainField(rawV, 256, true);
+        const pt = sanitizeX402Identifier(rawV, /^[A-Za-z0-9:._@-]{1,128}$/, 128);
         if (pt) terms.payTo = pt;
       } else if (k === 'resource' && !terms.resource) {
-        const rs = sanitizeX402HttpsResource(rawV);
+        const rs = sanitizeX402HttpsResource(rawV, expectedHost);
         if (rs) terms.resource = rs;
       } else if (k === 'description' && !terms.description) {
-        const ds = sanitizeX402PlainField(rawV, 256, false);
+        if (DECEPTIVE_402_TOKEN_RE.test(sanitizeX402String(rawV, 512) ?? '')) {
+          sawDeceptiveCurrency = true;
+        }
+        const ds = sanitizeX402PlainField(rawV, 140, false);
         if (ds) {
           if (DECEPTIVE_402_TOKEN_RE.test(ds)) sawDeceptiveCurrency = true;
           else terms.description = ds;
         }
       } else if (k === 'invoice') {
-        const inv = sanitizeX402String(rawV, 256);
+        const inv = sanitizeX402Identifier(rawV, /^[A-Za-z0-9+/=_.:-]{1,512}$/, 512);
         if (inv) terms.invoice = inv;
       } else if (k === 'macaroon') {
-        const mac = sanitizeX402String(rawV, 256);
+        const mac = !rawV.includes('://') ? sanitizeX402Identifier(rawV, /^[A-Za-z0-9+/=_."':-]{1,512}$/, 512) : undefined;
         if (mac) terms.macaroon = mac;
       }
     }
@@ -2596,7 +2704,7 @@ export function parseX402PaymentTerms(
     terms.price = validStandalone;
   }
 
-  const formattedPrice = formatX402PriceString(terms, sawDeceptiveCurrency);
+  const formattedPrice = formatX402PriceString(terms, sawDeceptiveCurrency, sawRawAssetField);
   if (formattedPrice) {
     terms.price = formattedPrice;
   } else {
@@ -2636,7 +2744,7 @@ export function buildBlockedInfo(
 
   // G3: HTTP 402 Payment Required / x402
   if (status === 402 || outStr === 'payment_required') {
-    const parsedPayment = parseX402PaymentTerms(402, paymentContext?.headers, paymentContext?.rawBody);
+    const parsedPayment = parseX402PaymentTerms(402, paymentContext?.headers, paymentContext?.rawBody, host || undefined);
     const price = parsedPayment?.price;
     const terms = parsedPayment?.terms;
     return {
@@ -2725,6 +2833,7 @@ export interface VerifiedJobResult {
   status: VerifiedPostingStatus;
   platform?: string;
   slug?: string;
+  boardStatus?: AtsBoardStatus;
   similarOpenRoles?: Array<{ title: string; url: string }>;
 }
 
@@ -2974,8 +3083,11 @@ function inferCompanyFromAtsUrl(urlStr: string): string {
     }
     const wd = /^([a-z0-9-]+)\.(?:wd\d+\.)?myworkday(?:jobs|site)\.com$/i.exec(host);
     if (wd?.[1]) return wd[1];
-    const subAts = /^([a-z0-9-]+)\.(?:pinpointhq\.com|bamboohr\.com|breezy\.hr|recruitee\.com|applytojob\.com|teamtailor\.com)$/i.exec(host);
-    if (subAts?.[1]) return subAts[1];
+    const subAts =
+      /^(?:careers-|jobs-)?([a-z0-9-]+)\.(?:pinpointhq\.com|bamboohr\.com|breezy\.hr|recruitee\.com|applytojob\.com|(?:[a-z]{2}\.)?teamtailor\.com|icims\.com|(?:jobs\.)?personio\.(?:de|com))$/i.exec(
+        host,
+      );
+    if (subAts?.[1] && !/^(?:www|jobs|careers)$/i.test(subAts[1])) return subAts[1];
     return host.replace(/^(?:www|jobs|careers)\./, '');
   } catch {
     return 'unknown';
@@ -3020,11 +3132,11 @@ const GENERIC_ROLE_TOKENS = new Set([
 function tokenizeRoleSlug(slugOrPath: string, excludeSlug?: string): string[] {
   const stop = new Set(['job', 'jobs', 'apply', 'application', 'careers', 'postings', 'senior', 'lead', 'the', 'and', 'for']);
   if (excludeSlug) {
-    for (const part of excludeSlug.toLowerCase().split(/[^a-z0-9]+/)) {
+    for (const part of excludeSlug.slice(0, 256).toLowerCase().split(/[^a-z0-9]+/)) {
       if (part.length >= 2) stop.add(part);
     }
   }
-  return (slugOrPath.toLowerCase().match(/[a-z]{3,}/g) ?? []).filter((w) => !stop.has(w));
+  return (slugOrPath.slice(0, 512).toLowerCase().match(/[a-z]{3,}/g) ?? []).filter((w) => !stop.has(w)).slice(0, 32);
 }
 
 /**
@@ -3209,10 +3321,11 @@ function findSimilarRoles(
   if (openRoles.length === 0 || roleTokens.length === 0) {
     return [];
   }
-  const uniqueTokens = [...new Set(roleTokens)];
-  const scored = openRoles
+  const uniqueTokens = [...new Set(roleTokens)].slice(0, 32);
+  const boundedRoles = openRoles.length > 500 ? openRoles.slice(0, 500) : openRoles;
+  const scored = boundedRoles
     .map((r) => {
-      const titleWords = new Set(r.title.toLowerCase().match(/[a-z0-9]{2,}/g) ?? []);
+      const titleWords = new Set(r.title.slice(0, 256).toLowerCase().match(/[a-z0-9]{2,}/g) ?? []);
       let distinctiveHits = 0;
       let genericHits = 0;
       for (const tok of uniqueTokens) {
@@ -3242,8 +3355,9 @@ async function executeJobsVerifyMode(params: {
   payload: JobsToolPayload;
   executeScrape: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
   tracer?: RequestTracer | TraceContext;
+  didExhaustBudget?: () => boolean;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
-  const { urls, payload, executeScrape } = params;
+  const { urls, payload, executeScrape, didExhaustBudget } = params;
   const activeTracer = getActiveRequestTracer(params.tracer);
   const resolvedAdapterIds = new Set<string>();
   const parsedItems = urls.slice(0, 100).map((rawUrl) => ({
@@ -3294,14 +3408,17 @@ async function executeJobsVerifyMode(params: {
       const [key, grp] = batch[j]!;
       const sc = outs[j];
       if (!sc || sc.status !== 200 || sc.body?.ok !== true) {
+        const hitBudget = sc?.body?.error === 'jobs_scrape_budget_exceeded';
         const upstreamStatus =
           typeof sc?.body?.status === 'number' && sc.body.status > 0 ? sc.body.status : (sc?.status ?? 0);
         boardSnapshots.set(key, {
-          boardStatus: classifyAtsBoardStatus({
-            httpStatus: upstreamStatus,
-            requestedUrl: grp.boardUrl,
-            finalUrl: typeof sc?.body?.finalUrl === 'string' ? sc.body.finalUrl : undefined,
-          }),
+          boardStatus: hitBudget
+            ? 'budget_exhausted'
+            : classifyAtsBoardStatus({
+                httpStatus: upstreamStatus,
+                requestedUrl: grp.boardUrl,
+                finalUrl: typeof sc?.body?.finalUrl === 'string' ? sc.body.finalUrl : undefined,
+              }),
           truncated: false,
           boardIncomplete: false,
           openLinksLower: [],
@@ -3393,12 +3510,13 @@ async function executeJobsVerifyMode(params: {
 
     const key = `${item.identity.platform}:${item.identity.slug.toLowerCase()}`;
     const snap = boardSnapshots.get(key);
-    if (!snap || snap.boardStatus === 'blocked_or_down') {
+    if (!snap || snap.boardStatus === 'blocked_or_down' || snap.boardStatus === 'budget_exhausted') {
       results.push({
         url: item.url,
         status: 'unknown',
         platform: item.identity.platform,
         slug: item.identity.slug,
+        ...(snap?.boardStatus === 'budget_exhausted' ? { boardStatus: 'budget_exhausted' as const } : {}),
       });
       continue;
     }
@@ -3440,6 +3558,16 @@ async function executeJobsVerifyMode(params: {
         ...(payload.target ? { target: payload.target } : {}),
         ...(payload.site ? { site: payload.site } : {}),
       }).catch(() => null);
+      if (wdCheck?.body?.error === 'jobs_scrape_budget_exceeded') {
+        results.push({
+          url: item.url,
+          status: 'unknown',
+          platform: item.identity.platform,
+          slug: item.identity.slug,
+          boardStatus: 'budget_exhausted',
+        });
+        continue;
+      }
       if (wdCheck?.status === 200 && wdCheck.body?.ok === true && wdCheck.body?.contentState !== 'closed_posting' && wdCheck.body?.contentState !== 'soft_404') {
         const wdExtId = typeof wdCheck.body.extractorId === 'string' ? wdCheck.body.extractorId : resolveAtsPreFetchSpec(item.url)?.id;
         if (wdExtId) resolvedAdapterIds.add(wdExtId);
@@ -3470,6 +3598,7 @@ async function executeJobsVerifyMode(params: {
     activeTracer?.setAttribute('edgefetch.adapter_id', [...resolvedAdapterIds].join(','));
   }
 
+  const verifyHitBudget = Boolean(didExhaustBudget?.());
   return {
     status: 200,
     body: {
@@ -3477,11 +3606,18 @@ async function executeJobsVerifyMode(params: {
       mode: 'verify',
       boardsFetched: boardGroups.size,
       checked: results.length,
+      ...(verifyHitBudget
+        ? {
+            budgetExhausted: true,
+            notes: [`Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before all postings could be verified.`],
+          }
+        : {}),
       results,
     },
   };
 }
 
+const MAX_JOBS_QUERY_CHARS = 256;
 const QUERY_STOP_WORDS = new Set(['the', 'and', 'for', 'with', 'from', 'into', 'role', 'job', 'jobs', 'open', 'position']);
 const REMOTE_LOCATION_TOKENS = new Set(['remote', 'anywhere', 'work from home', 'wfh']);
 
@@ -3490,14 +3626,16 @@ function matchesJobQueryRelevance(
   snippet: string | undefined,
   query: string,
 ): 'phrase' | 'all_tokens' | null {
-  const normPhrase = query.toLowerCase().replace(/\s+/g, ' ').trim();
+  const cappedQuery = query.length > MAX_JOBS_QUERY_CHARS ? query.slice(0, MAX_JOBS_QUERY_CHARS) : query;
+  const normPhrase = cappedQuery.toLowerCase().replace(/\s+/g, ' ').trim();
   if (!normPhrase) return 'phrase';
-  const titleLower = title.toLowerCase().replace(/\s+/g, ' ');
+  const cappedTitle = title.length > 1024 ? title.slice(0, 1024) : title;
+  const titleLower = cappedTitle.toLowerCase().replace(/\s+/g, ' ');
   if (titleLower.includes(normPhrase)) return 'phrase';
 
-  const qTokens = (normPhrase.match(/[\p{L}\p{N}+#]+/gu) ?? []).filter(
-    (t) => t.length >= 2 && !QUERY_STOP_WORDS.has(t),
-  );
+  const qTokens = (normPhrase.match(/[\p{L}\p{N}+#]+/gu) ?? [])
+    .filter((t) => t.length >= 2 && !QUERY_STOP_WORDS.has(t))
+    .slice(0, 32);
   if (qTokens.length === 0) {
     return titleLower.includes(normPhrase) ? 'phrase' : null;
   }
@@ -3506,7 +3644,8 @@ function matchesJobQueryRelevance(
   }
   const distinctiveQ = qTokens.filter((qt) => !GENERIC_ROLE_TOKENS.has(qt));
   if (distinctiveQ.length > 0 && distinctiveQ.every((qt) => titleLower.includes(qt))) {
-    const fullHay = `${titleLower} ${(snippet ?? '').toLowerCase()}`;
+    const cappedSnippet = snippet ? (snippet.length > 2048 ? snippet.slice(0, 2048) : snippet) : '';
+    const fullHay = `${titleLower} ${cappedSnippet.toLowerCase()}`;
     if (qTokens.every((qt) => fullHay.includes(qt))) {
       return 'all_tokens';
     }
@@ -3525,26 +3664,34 @@ function matchesSingleGeoLocation(locStr: string, filterTerm: string): boolean {
     return locStr.includes(filterTerm);
   }
   const hasExplicitUsCountryOrCity =
-    /\b(?:united states|usa|u\.s\.a?\.?|us\b|americas?\s*\(us\)|us-[a-z]{2}\b|california|new york|texas|washington|massachusetts|virginia|colorado|illinois|georgia|florida|san francisco|nyc|seattle|austin|boston|chicago|los angeles|denver|atlanta|menlo park|mountain view|palo alto|sunnyvale|santa clara|san jose|redmond|bellevue|mclean|reston)\b/i.test(
+    /\b(?:united states|usa|u\.s\.a?\.?|us\b|americas?[ \t]{0,8}\(us\)|us-[a-z]{2}\b|california|new york|texas|washington|massachusetts|virginia|colorado|illinois|georgia|florida|san francisco|nyc|seattle|austin|boston|chicago|los angeles|denver|atlanta|menlo park|mountain view|palo alto|sunnyvale|santa clara|san jose|redmond|bellevue|mclean|reston)\b/i.test(
       locStr,
     );
   if (hasExplicitUsCountryOrCity) return true;
 
   // Match `, CA` / `, NY` / `, WA` state abbreviations unless `, ON, CA` / `Canada` ISO country code
-  const hasCanadianProvinceOrCountry = /\b(?:canada|toronto|vancouver|montreal|ottawa|calgary|ontario|quebec|british columbia)\b|,\s*(?:on|bc|qc|ab),\s*ca\b/i.test(
-    locStr,
-  );
+  const hasCanadianProvinceOrCountry =
+    /\b(?:canada|toronto|vancouver|montreal|ottawa|calgary|ontario|quebec|british columbia)\b|,[ \t]{0,8}(?:on|bc|qc|ab),[ \t]{0,8}ca\b/i.test(
+      locStr,
+    );
   if (hasCanadianProvinceOrCountry) return false;
 
-  return /,\s*(?:al|ak|az|ar|ca|co|ct|de|dc|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|wi|wy)\b/i.test(
+  return /,[ \t]{0,8}(?:al|ak|az|ar|ca|co|ct|de|dc|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|wi|wy)\b/i.test(
     locStr,
   );
 }
 
 function matchesGeoLocationsFilter(jobLocations: string[], geoFilters: string[]): boolean {
-  const locStr = jobLocations.join(' | ').toLowerCase().trim();
+  if (jobLocations.length === 0 || geoFilters.length === 0) return false;
+  const locStr = jobLocations
+    .slice(0, 32)
+    .map((s) => (s.length > 256 ? s.slice(0, 256) : s))
+    .join(' | ')
+    .toLowerCase()
+    .trim();
   if (!locStr) return false;
-  return geoFilters.some((gf) => matchesSingleGeoLocation(locStr, gf));
+  const boundedFilters = geoFilters.slice(0, 32).map((gf) => (gf.length > 128 ? gf.slice(0, 128) : gf));
+  return boundedFilters.some((gf) => matchesSingleGeoLocation(locStr, gf));
 }
 
 const COMPANY_CORPORATE_SUFFIXES = new Set([
@@ -3566,12 +3713,45 @@ const COMPANY_CORPORATE_SUFFIXES = new Set([
   'technologies',
   'group',
   'holdings',
+  'plc',
+  'gmbh',
+  'ag',
 ]);
 
+const COMPANY_NEGATION_WORDS = new Set([
+  'not',
+  'non',
+  'anti',
+  'ex',
+  'former',
+  'unlike',
+  'never',
+  'no',
+  'without',
+  'vs',
+  'versus',
+  'fake',
+  'clone',
+  'mock',
+  'phish',
+  'scam',
+  'spoof',
+  'parody',
+]);
+
+const CONCAT_NEGATION_PREFIX_RE = /^(?:not|non|anti|ex|former|unlike|fake|clone|mock|spoof)/;
+
 function matchesCompanyCandidateAgainstToken(rawCandidate: string, tok: string): boolean {
-  if (!rawCandidate || !tok) return false;
-  const words: string[] = rawCandidate.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  if (!rawCandidate || !tok || tok.length > 128) return false;
+  const bounded = rawCandidate.length > 256 ? rawCandidate.slice(0, 256) : rawCandidate;
+  const words: string[] = bounded.toLowerCase().match(/[a-z0-9]+/g) ?? [];
   if (words.length === 0) return false;
+
+  // Reject negation / impersonation modifiers (`"not stripe"`, `"anti-stripe"`, `"ex-stripe"`, `"former stripe"`, `"stripe-fake"`, `"stripe-clone"`, `M12`)
+  for (let i = 0; i < words.length; i++) {
+    if (COMPANY_NEGATION_WORDS.has(words[i]!)) return false;
+  }
+
   const clean = words.join('');
   if (clean.length < 3) {
     // Short 2-char company names (e.g. "f5") require exact canonical token equality — never substring ("st" in "stripe").
@@ -3579,12 +3759,23 @@ function matchesCompanyCandidateAgainstToken(rawCandidate: string, tok: string):
   }
   if (clean === tok) return true;
   if (tok.length < 3) return false;
-  if (words.includes(tok)) return true;
-  // Adjacent hyphen/space-split words joining to `tok` (e.g. "Open AI" <-> "openai")
-  for (let i = 0; i + 1 < words.length; i++) {
-    if (words[i]! + words[i + 1]! === tok) return true;
+  if (CONCAT_NEGATION_PREFIX_RE.test(clean) && clean !== tok) return false;
+
+  // Exact leading token followed ONLY by recognized corporate/board suffixes (`"Stripe Inc."`, `"stripe-careers"`, `"stripe-jobs"` — NEVER `"stripe-fake"`, `"stripe-clone"`, or `"stripe-careers-apply-now"`)
+  if (words[0] === tok && words.slice(1).every((w) => COMPANY_CORPORATE_SUFFIXES.has(w))) {
+    return true;
   }
-  // Canonical ATS board slug suffix (e.g. "stripehq", "stripejobs", "stripeinc") — never prefix "notstripe" or "striper"!
+
+  // Adjacent hyphen/space-split words at the start joining to `tok` (`"Open AI"`, `"Open AI Inc."` <-> `"openai"`)
+  if (
+    words.length >= 2 &&
+    words[0]! + words[1]! === tok &&
+    words.slice(2).every((w) => COMPANY_CORPORATE_SUFFIXES.has(w))
+  ) {
+    return true;
+  }
+
+  // Canonical concatenated ATS board slug suffix (e.g. `"stripehq"`, `"stripejobs"`, `"stripeinc"`) — never `"notstripe"`, `"striper"`, or `"stripefake"`!
   if (clean.startsWith(tok)) {
     const suffix = clean.slice(tok.length);
     if (COMPANY_CORPORATE_SUFFIXES.has(suffix)) return true;
@@ -3597,11 +3788,14 @@ export function matchesAllowedCompanyOrDomain(
   allowedTokens: Set<string>,
   allowedBoardPrefixes: string[],
 ): boolean {
-  const urlLower = job.url.toLowerCase();
+  const rawUrl = typeof job.url === 'string' ? (job.url.length > 2048 ? job.url.slice(0, 2048) : job.url) : '';
+  const urlLower = rawUrl.toLowerCase();
   if (allowedBoardPrefixes.some((p) => p && urlLower.startsWith(p))) return true;
-  const inferred = inferCompanyFromAtsUrl(job.url);
+  const inferred = inferCompanyFromAtsUrl(rawUrl);
+  let checked = 0;
   for (const tok of allowedTokens) {
     if (!tok) continue;
+    if (++checked > 128) break;
     if (
       matchesCompanyCandidateAgainstToken(job.company, tok) ||
       matchesCompanyCandidateAgainstToken(inferred, tok)
@@ -3638,17 +3832,20 @@ export async function executeJobsCall(params: {
   // Enforce hard `<= 5` concurrent scrapes and `<= 40` total scrapes per `executeJobsCall` across discovery, verify & boards.
   let activeScrapes = 0;
   let totalScrapesUsed = 0;
+  let budgetExhausted = false;
   const scrapeWaitQueue: Array<() => void> = [];
   const executeScrape = async (
     args: Record<string, unknown>,
   ): Promise<{ status: number; body: Record<string, unknown> }> => {
     while (activeScrapes >= MAX_JOBS_CONCURRENT_SCRAPES) {
       if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+        budgetExhausted = true;
         return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
       }
       await new Promise<void>((resolve) => scrapeWaitQueue.push(resolve));
     }
     if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+      budgetExhausted = true;
       while (scrapeWaitQueue.length > 0) {
         scrapeWaitQueue.shift()?.();
       }
@@ -3698,11 +3895,24 @@ export async function executeJobsCall(params: {
       payload,
       executeScrape,
       ...(activeTracer ? { tracer: activeTracer } : {}),
+      didExhaustBudget: () => budgetExhausted,
     });
   }
 
-  const query = typeof payload.query === 'string' ? payload.query.trim() : '';
-  const companyFilter = typeof payload.company === 'string' ? payload.company.trim() : '';
+  const rawQueryTrimmed = typeof payload.query === 'string' ? payload.query.trim() : '';
+  if (rawQueryTrimmed.length > MAX_JOBS_QUERY_CHARS) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        error: 'invalid_query',
+        message: `\`query\` must be at most ${MAX_JOBS_QUERY_CHARS} characters.`,
+      },
+    };
+  }
+  const query = rawQueryTrimmed;
+  const rawCompanyTrimmed = typeof payload.company === 'string' ? payload.company.trim() : '';
+  const companyFilter = rawCompanyTrimmed.length > 128 ? rawCompanyTrimmed.slice(0, 128) : rawCompanyTrimmed;
   const domainsInput = Array.isArray(payload.domains)
     ? payload.domains
         .filter((d): d is string => typeof d === 'string' && d.trim().length > 0)
@@ -3762,6 +3972,7 @@ export async function executeJobsCall(params: {
       domainsInput.map(async (dom) => {
         const tried: string[] = [];
         const foundForDom: DiscoveredAtsBoard[] = [];
+        let domHitBudgetCap = false;
         for (const probePath of ['/careers', '/jobs', '/about/careers']) {
           const probeUrl = `https://${dom}${probePath}`;
           tried.push(probeUrl);
@@ -3773,6 +3984,10 @@ export async function executeJobsCall(params: {
             ...(payload.target ? { target: payload.target } : {}),
             ...(payload.site ? { site: payload.site } : {}),
           }).catch(() => null);
+          if (res?.body?.error === 'jobs_scrape_budget_exceeded') {
+            domHitBudgetCap = true;
+            break;
+          }
           if (!res || res.status !== 200 || res.body?.ok !== true) continue;
           const boards = discoverAtsBoardsFromHtml({
             sourceUrl: probeUrl,
@@ -3792,7 +4007,7 @@ export async function executeJobsCall(params: {
         }
         // Fallback when company uses a custom SPA careers portal (e.g. Eightfold/AEM): probe canonical domain slug across Greenhouse, Ashby, Lever & Workday CXS
         const baseSlug = dom.split('.')[0]?.toLowerCase() ?? '';
-        if (isValidAtsSlug(baseSlug)) {
+        if (isValidAtsSlug(baseSlug) && !domHitBudgetCap) {
           const upperSlug = baseSlug.toUpperCase();
           const slugProbes: Array<{ platform: string; slug: string; boardUrl: string }> = [
             { platform: 'greenhouse', slug: baseSlug, boardUrl: `https://boards.greenhouse.io/${baseSlug}` },
@@ -3828,6 +4043,9 @@ export async function executeJobsCall(params: {
                 ...(payload.target ? { target: payload.target } : {}),
                 ...(payload.site ? { site: payload.site } : {}),
               }).catch(() => null);
+              if (r?.body?.error === 'jobs_scrape_budget_exceeded') {
+                domHitBudgetCap = true;
+              }
               return { sp, r };
             }),
           );
@@ -3865,10 +4083,10 @@ export async function executeJobsCall(params: {
                 sourceUrl: `search:${dom}`,
                 links: hitLinks,
               });
+              const normBase = baseSlug.replace(/[^a-z0-9]+/g, '');
               for (const sb of searchBoards) {
-                const normBoardSlug = sb.slug.toLowerCase().replace(/[^a-z0-9]+/g, '');
-                const normBase = baseSlug.replace(/[^a-z0-9]+/g, '');
-                if (normBase && (normBoardSlug.includes(normBase) || normBase.includes(normBoardSlug))) {
+                const rootBoardSlug = sb.slug.split('/')[0] ?? '';
+                if (normBase && matchesCompanyCandidateAgainstToken(rootBoardSlug, normBase)) {
                   const entry: DiscoveredAtsBoard = { ...sb, domain: dom };
                   foundForDom.push(entry);
                   discoveredBoards.push(entry);
@@ -3880,16 +4098,21 @@ export async function executeJobsCall(params: {
         }
 
         if (foundForDom.length === 0) {
+          const finalStatus: AtsBoardStatus = domHitBudgetCap ? 'budget_exhausted' : 'not_found';
           discoveredBoards.push({
             domain: dom,
             platform: 'unknown',
             slug: baseSlug || dom,
             boardUrl: '',
             discoveredFrom: 'none',
-            boardStatus: 'not_found',
+            boardStatus: finalStatus,
             tried,
           });
-          notes.push(`No ATS job board discovered for "${dom}" after probing ${tried.length} candidates.`);
+          notes.push(
+            domHitBudgetCap
+              ? `Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before completing ATS board discovery for "${dom}".`
+              : `No ATS job board discovered for "${dom}" after probing ${tried.length} candidates.`,
+          );
         }
       }),
     );
@@ -4024,13 +4247,17 @@ export async function executeJobsCall(params: {
       const discEntry = discoveredBoards.find((b) => b.boardUrl === origU);
       if (!sc || sc.status !== 200 || sc.body?.ok !== true) {
         if (discEntry) {
-          const upstreamStatus =
-            typeof sc?.body?.status === 'number' && sc.body.status > 0 ? sc.body.status : (sc?.status ?? 0);
-          discEntry.boardStatus = classifyAtsBoardStatus({
-            httpStatus: upstreamStatus,
-            requestedUrl: origU,
-            finalUrl: typeof sc?.body?.finalUrl === 'string' ? sc.body.finalUrl : undefined,
-          });
+          if (sc?.body?.error === 'jobs_scrape_budget_exceeded') {
+            discEntry.boardStatus = 'budget_exhausted';
+          } else {
+            const upstreamStatus =
+              typeof sc?.body?.status === 'number' && sc.body.status > 0 ? sc.body.status : (sc?.status ?? 0);
+            discEntry.boardStatus = classifyAtsBoardStatus({
+              httpStatus: upstreamStatus,
+              requestedUrl: origU,
+              finalUrl: typeof sc?.body?.finalUrl === 'string' ? sc.body.finalUrl : undefined,
+            });
+          }
         }
         continue;
       }
@@ -4198,13 +4425,13 @@ export async function executeJobsCall(params: {
     if (ds) allowedCompanyTokens.add(ds);
   }
   for (const db of discoveredBoards) {
-    if (db.boardStatus !== 'not_found' && db.slug) {
+    if (db.boardStatus !== 'not_found' && db.boardStatus !== 'budget_exhausted' && db.slug) {
       const rootSlug = (db.slug.split('/')[0] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
       if (rootSlug) allowedCompanyTokens.add(rootSlug);
     }
   }
   const allowedBoardPrefixes = discoveredBoards
-    .filter((b) => b.boardStatus !== 'not_found' && b.boardUrl)
+    .filter((b) => b.boardStatus !== 'not_found' && b.boardStatus !== 'budget_exhausted' && b.boardUrl)
     .map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase());
 
   const nowMs = Date.now();
@@ -4292,6 +4519,9 @@ export async function executeJobsCall(params: {
   const finalJobs = matchedJobs.slice(0, limit);
   const payUnknownCount = minBase !== undefined ? finalJobs.filter((j) => j.payUnknown === true).length : undefined;
 
+  if (budgetExhausted && !notes.some((n) => n.includes('Scrape budget'))) {
+    notes.push(`Scrape budget (${MAX_JOBS_TOTAL_SCRAPES}) exhausted before all candidate boards could be checked.`);
+  }
   if (candidateUrls.size === 0 && collected.length === 0 && domainsInput.length === 0) {
     notes.push('No ATS search results returned; ensure SERPER_API_KEY or SEARXNG_URL is configured on the Hub.');
   }
@@ -4312,6 +4542,7 @@ export async function executeJobsCall(params: {
       ...(companyFilter ? { company: companyFilter } : {}),
       ...(domainsInput.length > 0 ? { domains: domainsInput, discoveredBoards } : {}),
       ...(minBase !== undefined ? { minBaseMode, strictPay, payUnknownCount } : {}),
+      ...(budgetExhausted ? { budgetExhausted: true } : {}),
       sourcesUsed: [...sourcesUsed],
       count: finalJobs.length,
       candidatesChecked: candidateUrls.size,

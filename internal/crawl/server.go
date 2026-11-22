@@ -215,6 +215,17 @@ func ExecuteCallWithTrace(ctx context.Context, c *Crawler, call FetchCall, trace
 	if secs > MaxMaxSeconds {
 		secs = MaxMaxSeconds
 	}
+	if len(call.Requests) > 1 && call.Options.GapMs <= 0 {
+		effPause := call.Options.PauseMs
+		if effPause <= 0 {
+			effPause = DefaultPauseMs
+		}
+		if effPause < 250 {
+			call.Options.GapMs = effPause
+		} else {
+			call.Options.GapMs = 250
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(secs)*time.Second)
 	defer cancel()
 

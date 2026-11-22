@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -463,12 +464,19 @@ func TestRendererHelpersHeadersEnvSnapAndHostPolicy(t *testing.T) {
 		}
 	})
 
-	// isSandboxStartupFailureText :FATAL: with & without matching marker.
-	if !isSandboxStartupFailureText("ERROR:FATAL:credentials.cc(10) failed") {
-		t.Fatal("expected :FATAL: credentials.cc to match")
+	// isSandboxStartupFailureText :FATAL: with & without matching EPERM/EACCES and marker.
+	if !isSandboxStartupFailureText("ERROR:FATAL:credentials.cc(10) Operation not permitted") {
+		t.Fatal("expected :FATAL: credentials.cc with Operation not permitted to match")
 	}
-	if isSandboxStartupFailureText("ERROR:FATAL:oom.cc(10) out of memory") {
+	if isSandboxStartupFailureText("ERROR:FATAL:credentials.cc(10) failed") {
+		t.Fatal("expected :FATAL: credentials.cc without EPERM/EACCES not to match")
+	}
+	if isSandboxStartupFailureText("ERROR:FATAL:oom.cc(10) Operation not permitted") {
 		t.Fatal("expected :FATAL: oom.cc not to match sandbox failure")
+	}
+
+	if runtime.GOOS != "linux" {
+		return
 	}
 
 	// isLinuxSnapWrapper cases.
@@ -1296,6 +1304,10 @@ func TestRendererProbeStartupPipeLaunchAndSandboxFallback(t *testing.T) {
 	NewMockRenderer("ws://127.0.0.1:1", nil, "UA").ProbeStartup(context.Background())
 	cancelledCtx, cancelNow := context.WithCancel(context.Background())
 	cancelNow()
+
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux-specific sandbox fallback & /proc helper test")
+	}
 
 	// 2. Helper script: fallback_ok (fails without --no-sandbox, succeeds with --no-sandbox + split-frame pipe response!).
 	fallbackBin := makeChromeHelperWrapper(t, "fallback_ok")

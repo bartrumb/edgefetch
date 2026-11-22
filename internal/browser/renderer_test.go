@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -152,7 +153,7 @@ func TestOriginScopedExtraHeadersViaCDPFetchAndWarmBrowserRecycle(t *testing.T) 
 								"requestId": "pause-same-origin-xhr",
 								"request": map[string]any{
 									"url":     "https://APP.Example.com./api/v1/items",
-									"headers": map[string]string{"Accept": "application/json"},
+									"headers": map[string]string{"Accept": "application/json", "Referer": "https://app.example.com/dashboard"},
 								},
 							},
 						})
@@ -372,7 +373,7 @@ func TestOriginScopedHeadersStrictSchemeHostPortAndSandboxClassifier(t *testing.
 								"requestId": sub.id,
 								"request": map[string]any{
 									"url":     sub.url,
-									"headers": map[string]string{"Accept": "*/*"},
+									"headers": map[string]string{"Accept": "*/*", "Referer": "https://victim.test:50995/page"},
 								},
 							},
 						})
@@ -425,9 +426,12 @@ func TestOriginScopedHeadersStrictSchemeHostPortAndSandboxClassifier(t *testing.
 		t.Fatalf("SECURITY: different-scheme request (http vs https) received task.Headers: %+v", hasOverride)
 	}
 
-	// 2. Verify isSandboxStartupFailure matches only genuine Linux Chromium sandbox diagnostics, never timeouts or unrelated errors.
+	// 2. Verify isSandboxStartupFailure matches only genuine Linux Chromium sandbox policy diagnostics (EPERM/EACCES),
+	//    never timeouts, shared-library errors, or transient EMFILE/ENOMEM resource exhaustion in credentials.cc!
 	for _, msg := range []string{
 		"[0101/000000:FATAL:zygote_host_impl_linux.cc(127)] No usable sandbox!",
+		"[13:13:1121/215424.490003:FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc:211] Check failed: . : Operation not permitted (1)",
+		"[9:9:1121/000000:FATAL:credentials.cc(131)] Check failed: . : Permission denied (13)",
 		"Failed to move to new namespace: sandbox_linux.cc:374",
 		"The setuid sandbox is not running as root",
 		"namespace sandbox failed to initialize",
@@ -444,9 +448,11 @@ func TestOriginScopedHeadersStrictSchemeHostPortAndSandboxClassifier(t *testing.
 		errors.New("error while loading shared libraries: libnss3.so: cannot open shared object file"),
 		errors.New("[23:23:ERROR:sandbox_linux.cc(380)] InitializeSandbox() called with multiple threads in process gpu-process."),
 		errors.New("[9:9:ERROR:process_singleton_posix.cc(340)] Failed to create /data/namespace sandbox/SingletonLock: No space left on device"),
+		errors.New("[9:9:1121/000000.000000:FATAL:credentials.cc(131)] Check failed: . : Too many open files (24)"),
+		errors.New("[9:9:1121/000000.000000:FATAL:sandbox_linux.cc(200)] Check failed: . : Cannot allocate memory (12)"),
 	} {
 		if isSandboxStartupFailure(nonSandbox) {
-			t.Fatalf("SECURITY: expected isSandboxStartupFailure(%v) == false so timeouts/unrelated errors never downgrade to --no-sandbox", nonSandbox)
+			t.Fatalf("SECURITY: expected isSandboxStartupFailure(%v) == false so transient/EMFILE/unrelated errors never downgrade to --no-sandbox", nonSandbox)
 		}
 	}
 }
@@ -738,22 +744,16 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 			sawPort = true
 		}
 	}
-	if runtime.GOOS == "windows" {
-		if sawPipe || !sawPort {
-			t.Fatalf("expected --remote-debugging-port=0 on windows, got %v", args)
-		}
-	} else {
-		if !sawPipe || sawPort {
-			t.Fatalf("expected --remote-debugging-pipe (and zero --remote-debugging-port) on %s, got %v", runtime.GOOS, args)
-		}
+	if !sawPipe || sawPort {
+		t.Fatalf("expected --remote-debugging-pipe (and zero --remote-debugging-port) on %s, got %v", runtime.GOOS, args)
 	}
 
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
 		return
 	}
 	bin := FindChromeBinary()
 	if bin == "" {
-		t.Skip("no headless Chromium/Chrome binary installed; skipping live R5-M6 pipe transport check")
+		t.Skip("no headless Chromium/Chrome binary installed; skipping live R6 pipe transport check")
 	}
 
 	r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch/2.6.2", 1, nil)
@@ -781,8 +781,26 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 	if err != nil {
 		t.Fatalf("stat userDataDir: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("expected userDataDir mode 0700, got %04o", perm)
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("expected userDataDir mode 0700, got %04o", perm)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(userDataDir, "DevToolsActivePort")); err == nil {
+		t.Fatal("SECURITY: DevToolsActivePort file must not exist under --remote-debugging-pipe")
+	}
+	if runtime.GOOS == "windows" {
+		out, nErr := exec.Command("netstat", "-ano", "-p", "TCP").CombinedOutput()
+		if nErr == nil {
+			pidStr := strconv.Itoa(pid)
+			for _, l := range strings.Split(string(out), "\n") {
+				f := strings.Fields(l)
+				if len(f) >= 5 && f[3] == "LISTENING" && f[4] == pidStr {
+					t.Fatalf("SECURITY (R6): Windows Chromium pid %d opened listening TCP socket %s under --remote-debugging-pipe!", pid, f[1])
+				}
+			}
+		}
+		return
 	}
 
 	// Collect listening socket inodes from /proc/net/tcp and /proc/net/tcp6 (state 0A == TCP_LISTEN).
@@ -968,5 +986,360 @@ func TestMockRendererEmitsBrowserRenderChildSpan(t *testing.T) {
 		!strings.Contains(combined, `"https://app.example.com/dashboard"`) ||
 		!strings.Contains(combined, `"code":2`) {
 		t.Fatalf("expected edgefetch.browser.render parented spans with sanitized URL and error code, got:\n%s", combined)
+	}
+}
+
+func TestR6InitiatorProvenHeaderScopingAndRedirectChainProvenance(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		hasOverride = make(map[string]bool)
+	)
+	waitSeen := func(id string) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			_, ok := hasOverride[id]
+			mu.Unlock()
+			if ok {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for Fetch.continueRequest(%q)", id)
+	}
+
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		var writeMu sync.Mutex
+		send := func(v any) {
+			b, _ := json.Marshal(v)
+			writeMu.Lock()
+			_ = conn.Write(r.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+
+		sig := make(map[string]chan struct{})
+		var sigMu sync.Mutex
+		chFor := func(id string) chan struct{} {
+			sigMu.Lock()
+			defer sigMu.Unlock()
+			c, ok := sig[id]
+			if !ok {
+				c = make(chan struct{})
+				sig[id] = c
+			}
+			return c
+		}
+
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				continue
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-m4"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-m4"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "s-m4"}})
+			case "Page.getFrameTree":
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result": map[string]any{
+						"frameTree": map[string]any{
+							"frame": map[string]any{"id": "main-f", "url": "about:blank", "securityOrigin": "://"},
+						},
+					},
+				})
+			case "Fetch.continueRequest":
+				var p struct {
+					RequestID string `json:"requestId"`
+				}
+				var rawMap map[string]json.RawMessage
+				_ = json.Unmarshal(req.Params, &p)
+				_ = json.Unmarshal(req.Params, &rawMap)
+				_, overridden := rawMap["headers"]
+				mu.Lock()
+				hasOverride[p.RequestID] = overridden
+				mu.Unlock()
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+				select {
+				case <-chFor(p.RequestID):
+				default:
+					close(chFor(p.RequestID))
+				}
+			case "Page.navigate":
+				navID := req.ID
+				navSID := req.SessionID
+				go func() {
+					// 1. Harness navigation hop 0 -> 302 same-origin redirect hop 1 (both MUST receive headers).
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "nav-hop0",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://victim.test/login",
+								"headers": map[string]string{"Accept": "text/html"},
+							},
+						},
+					})
+					<-chFor("nav-hop0")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":           "nav-hop1-sameorigin",
+							"frameId":             "main-f",
+							"resourceType":        "Document",
+							"redirectStatusCode":  302,
+							"redirectedRequestId": "nav-hop0",
+							"request": map[string]any{
+								"url":     "https://victim.test/app",
+								"headers": map[string]string{"Accept": "text/html"},
+							},
+						},
+					})
+					<-chFor("nav-hop1-sameorigin")
+
+					// 2. Before Page.frameNavigated commits, a no-referrer subrequest from an uncommitted/foreign frame MUST be rejected!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "noref-from-foreign-iframe",
+							"frameId":      "evil-subframe",
+							"resourceType": "Fetch",
+							"request": map[string]any{
+								"url":     "https://victim.test/api/delete",
+								"headers": map[string]string{"Accept": "*/*"},
+							},
+						},
+					})
+					<-chFor("noref-from-foreign-iframe")
+
+					// 3. Commit main-f on https://victim.test via Page.frameNavigated; no-referrer fetch from main-f NOW gets headers!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameNavigated",
+						"params": map[string]any{
+							"frame": map[string]any{
+								"id":             "main-f",
+								"url":            "https://victim.test/app",
+								"securityOrigin": "https://victim.test",
+							},
+						},
+					})
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "noref-from-committed-bound-frame",
+							"frameId":      "main-f",
+							"resourceType": "Fetch",
+							"request": map[string]any{
+								"url":     "https://victim.test/api/me",
+								"headers": map[string]string{"Accept": "application/json"},
+							},
+						},
+					})
+					<-chFor("noref-from-committed-bound-frame")
+
+					// 4. Scenario 38: bound page loads 3P attacker image which 302-redirects back to victim.test/api/delete!
+					//    Hop 0 (attacker) did NOT receive headers, so Hop 1 (victim) MUST NOT receive headers even with Referer=victim.test!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "3p-img-hop0",
+							"frameId":      "main-f",
+							"resourceType": "Image",
+							"request": map[string]any{
+								"url":     "https://attacker.test/redir",
+								"headers": map[string]string{"Referer": "https://victim.test/app"},
+							},
+						},
+					})
+					<-chFor("3p-img-hop0")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":           "3p-img-hop1-back-to-victim",
+							"frameId":             "main-f",
+							"resourceType":        "Image",
+							"redirectStatusCode":  302,
+							"redirectedRequestId": "3p-img-hop0",
+							"request": map[string]any{
+								"url":     "https://victim.test/api/delete-via-3p-redirect",
+								"headers": map[string]string{"Referer": "https://victim.test/app"},
+							},
+						},
+					})
+					<-chFor("3p-img-hop1-back-to-victim")
+
+					// 5. Renderer-initiated top-level Document navigation without Referer (e.g. child frame target=_top or meta refresh) MUST be rejected!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "renderer-top-nav-no-referer",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://victim.test/api/logout",
+								"headers": map[string]string{"Accept": "text/html"},
+							},
+						},
+					})
+					<-chFor("renderer-top-nav-no-referer")
+
+					send(map[string]any{"id": navID, "sessionId": navSID, "result": map[string]any{"frameId": "main-f"}})
+					send(map[string]any{"sessionId": navSID, "method": "Page.loadEventFired", "params": map[string]any{}})
+				}()
+			case "Runtime.evaluate":
+				docJSON, _ := json.Marshal(map[string]string{
+					"url":  "https://victim.test/app",
+					"html": "<html><body><main>ok</main></body></html>",
+				})
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result":    map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}},
+				})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+
+	r := NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, "EdgeFetchTest/1.0")
+	defer r.Close()
+
+	if _, err := r.Execute(context.Background(), Task{
+		URL:       "https://victim.test/login",
+		Headers:   map[string]string{"Authorization": "Bearer m4-secret"},
+		WaitForMs: 20,
+	}); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	waitSeen("renderer-top-nav-no-referer")
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, mustAllow := range []string{"nav-hop0", "nav-hop1-sameorigin", "noref-from-committed-bound-frame"} {
+		if !hasOverride[mustAllow] {
+			t.Fatalf("expected %q to receive bound headers, got %+v", mustAllow, hasOverride)
+		}
+	}
+	for _, mustDeny := range []string{"noref-from-foreign-iframe", "3p-img-hop0", "3p-img-hop1-back-to-victim", "renderer-top-nav-no-referer"} {
+		if hasOverride[mustDeny] {
+			t.Fatalf("SECURITY (M4): %q must NOT receive bound headers! got %+v", mustDeny, hasOverride)
+		}
+	}
+}
+
+func TestR6DirectPipeCDPTransportFramingAndCaps(t *testing.T) {
+	// 1. Multi-frame + byte-by-byte + escaped \u0000 + empty \0\0\0 handling.
+	{
+		toChromeR, toChromeW, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fromChromeR, fromChromeW, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn := newPipeCDPConn(toChromeW, fromChromeR, func() {
+			_ = toChromeR.Close()
+			_ = fromChromeW.Close()
+		})
+		defer conn.close()
+
+		evCh, unsub := conn.subscribe()
+		defer unsub()
+
+		go func() {
+			buf := make([]byte, 4096)
+			n, rErr := toChromeR.Read(buf)
+			if rErr != nil || n == 0 || buf[n-1] != 0 {
+				return
+			}
+			var req cdpRequest
+			_ = json.Unmarshal(buf[:n-1], &req)
+			combined := `{"method":"Page.loadEventFired","params":{}}` + "\x00\x00" +
+				`{"id":` + strconv.FormatInt(req.ID, 10) + `,"result":{"val":"ok\u0000byte"}}` + "\x00"
+			for i := 0; i < len(combined); i++ {
+				_, _ = fromChromeW.Write([]byte{combined[i]})
+			}
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		var out struct {
+			Val string `json:"val"`
+		}
+		if err := conn.call(ctx, "", "Test.echo", nil, &out); err != nil {
+			t.Fatalf("pipe call failed: %v", err)
+		}
+		if out.Val != "ok\x00byte" {
+			t.Fatalf("unexpected decoded JSON value: %q", out.Val)
+		}
+		select {
+		case ev := <-evCh:
+			if ev.Method != "Page.loadEventFired" {
+				t.Fatalf("unexpected event: %+v", ev)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("missing async event from combined pipe read")
+		}
+	}
+
+	// 2. Oversized frame (> maxCDPFrameBytes without NUL) closes pipe immediately and unblocks call().
+	{
+		toChromeR, toChromeW, _ := os.Pipe()
+		fromChromeR, fromChromeW, _ := os.Pipe()
+		conn := newPipeCDPConn(toChromeW, fromChromeR, func() {
+			_ = toChromeR.Close()
+			_ = fromChromeW.Close()
+		})
+		go func() {
+			buf := make([]byte, 1024)
+			_, _ = toChromeR.Read(buf)
+			blk := make([]byte, 1<<20)
+			for i := range blk {
+				blk[i] = 'A'
+			}
+			for i := 0; i < 30; i++ {
+				if _, wErr := fromChromeW.Write(blk); wErr != nil {
+					return
+				}
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := conn.call(ctx, "", "Test.big", nil, nil)
+		if err == nil || !conn.isClosed() {
+			t.Fatalf("expected oversized non-NUL stream to close pipe cdpConn, got err=%v closed=%v", err, conn.isClosed())
+		}
 	}
 }

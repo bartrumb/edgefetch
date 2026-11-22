@@ -118,6 +118,7 @@ export interface CatalogHubFetchParams {
   kind?: 'json' | 'text';
   accept?: string;
   maxBytes?: number;
+  timeoutMs?: number;
   target?: unknown;
   site?: unknown;
   tracer?: RequestTracer | TraceContext;
@@ -137,11 +138,13 @@ interface D1DatabaseLike {
 }
 
 interface R2ObjectBodyLike {
+  body?: ReadableStream<Uint8Array>;
+  arrayBuffer?(): Promise<ArrayBuffer>;
   text(): Promise<string>;
 }
 
 interface R2BucketLike {
-  put(key: string, value: string, options?: Record<string, unknown>): Promise<unknown>;
+  put(key: string, value: string | Uint8Array | ArrayBuffer, options?: Record<string, unknown>): Promise<unknown>;
   get(key: string): Promise<R2ObjectBodyLike | null>;
 }
 
@@ -152,7 +155,9 @@ interface SnapshotHashBundle {
 
 interface StoredCatalogRun {
   summary: CatalogStatusSummary;
-  hashes: SnapshotHashBundle;
+  hashes: SnapshotHashBundle | null;
+  hashesBytes: number;
+  hashesArtifactId?: string;
   records: CatalogRecord[] | null;
   retainedBytes: number;
 }
@@ -162,17 +167,117 @@ export const MAX_GLOBAL_CATALOG_BYTES = 32 * 1024 * 1024;
 export const MAX_CACHED_CATALOG_RUNS = 8;
 export const MAX_CONCURRENT_CATALOG_PER_PRINCIPAL = 2;
 export const MAX_CONCURRENT_CATALOG_GLOBAL = 8;
+export const MAX_CONCURRENT_R2_RELOADS = 2;
 export const MAX_CATALOG_TOTAL_SLEEP_MS = 120_000;
-export const MAX_CATALOG_WALL_MS = 180_000;
+export const MAX_CATALOG_WALL_MS = 120_000;
+const MAX_R2_DECOMPRESSED_BYTES = 32 * 1024 * 1024;
+const MAX_R2_CACHEABLE_ARTIFACT_BYTES = 8 * 1024 * 1024;
+const MAX_VARIANTS_PER_CATALOG_RUN = 50_000;
 const MAX_RECORD_SERIALIZED_BYTES = 64 * 1024;
 const MAX_IMAGES_PER_CATALOG_RECORD = 250;
 const MAX_VARIANTS_PER_CATALOG_RECORD = 250;
 const MAX_COMPACT_HISTORY_RUNS = 32;
+const VALID_CATALOG_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 
 const MEMORY_CATALOG_RUNS = new Map<string, StoredCatalogRun>();
+const R2_RELOAD_LRU_CACHE = new Map<string, { records: CatalogRecord[]; bytes: number }>();
+const INFLIGHT_R2_RELOADS = new Map<string, Promise<unknown>>();
+let activeR2Reloads = 0;
+let peakR2ReloadsSeen = 0;
+const r2ReloadWaitQueue: Array<() => void> = [];
+
 const ACTIVE_CATALOG_BY_PRINCIPAL = new Map<string, number>();
 let activeCatalogGlobal = 0;
 const D1_INIT_CACHE = new WeakSet<object>();
+
+function withR2ReloadSemaphore<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolveSlot, rejectSlot) => {
+    const runTask = () => {
+      activeR2Reloads++;
+      if (activeR2Reloads > peakR2ReloadsSeen) {
+        peakR2ReloadsSeen = activeR2Reloads;
+      }
+      Promise.resolve()
+        .then(fn)
+        .then(resolveSlot, rejectSlot)
+        .finally(() => {
+          activeR2Reloads = Math.max(0, activeR2Reloads - 1);
+          const next = r2ReloadWaitQueue.shift();
+          if (next) next();
+        });
+    };
+    if (activeR2Reloads < MAX_CONCURRENT_R2_RELOADS) {
+      runTask();
+    } else {
+      r2ReloadWaitQueue.push(runTask);
+    }
+  });
+}
+
+function coalesceSingleflightR2Reload<T>(key: string, loader: () => Promise<T>): Promise<T> {
+  const existing = INFLIGHT_R2_RELOADS.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+  const p = withR2ReloadSemaphore(loader).finally(() => {
+    if (INFLIGHT_R2_RELOADS.get(key) === p) {
+      INFLIGHT_R2_RELOADS.delete(key);
+    }
+  });
+  INFLIGHT_R2_RELOADS.set(key, p);
+  return p;
+}
+
+export function approxHashBundleBytes(hashes: SnapshotHashBundle | null): number {
+  if (!hashes) return 0;
+  let total = 64;
+  for (const [k, v] of Object.entries(hashes.products)) {
+    total += approxUtf8Bytes(k) + approxUtf8Bytes(v) + 48;
+  }
+  for (const [vk, vv] of Object.entries(hashes.variants)) {
+    total += approxUtf8Bytes(vk) + approxUtf8Bytes(vv) + 48;
+  }
+  return total;
+}
+
+export function getCatalogMemoryUsageForTests(): {
+  runsCount: number;
+  recordsBytes: number;
+  hashesBytes: number;
+  reloadCacheBytes: number;
+  totalBytes: number;
+  maxBytes: number;
+  activeR2Reloads: number;
+  peakR2ReloadsSeen: number;
+} {
+  let recordsBytes = 0;
+  let hashesBytes = 0;
+  for (const v of MEMORY_CATALOG_RUNS.values()) {
+    if (v.records !== null) recordsBytes += v.retainedBytes;
+    if (v.hashes !== null) hashesBytes += v.hashesBytes;
+  }
+  let reloadCacheBytes = 0;
+  for (const c of R2_RELOAD_LRU_CACHE.values()) {
+    reloadCacheBytes += c.bytes;
+  }
+  return {
+    runsCount: MEMORY_CATALOG_RUNS.size,
+    recordsBytes,
+    hashesBytes,
+    reloadCacheBytes,
+    totalBytes: recordsBytes + hashesBytes + reloadCacheBytes,
+    maxBytes: MAX_GLOBAL_CATALOG_BYTES,
+    activeR2Reloads,
+    peakR2ReloadsSeen,
+  };
+}
+
+export function resetCatalogStateForTests(): void {
+  MEMORY_CATALOG_RUNS.clear();
+  R2_RELOAD_LRU_CACHE.clear();
+  INFLIGHT_R2_RELOADS.clear();
+  ACTIVE_CATALOG_BY_PRINCIPAL.clear();
+  activeCatalogGlobal = 0;
+  peakR2ReloadsSeen = 0;
+}
 
 function approxUtf8Bytes(s: string): number {
   let bytes = 0;
@@ -228,13 +333,7 @@ function clampCatalogRecord(rec: CatalogRecord): { record: CatalogRecord; bytes:
   return { record: clamped, bytes };
 }
 
-function rememberRunInMemory(catalogId: string, entry: StoredCatalogRun): void {
-  if (MEMORY_CATALOG_RUNS.has(catalogId)) {
-    MEMORY_CATALOG_RUNS.delete(catalogId);
-  }
-  MEMORY_CATALOG_RUNS.set(catalogId, entry);
-
-  // Enforce LRU cap on full in-memory record bodies (`MAX_CACHED_CATALOG_RUNS = 8`, `MAX_GLOBAL_CATALOG_BYTES = 32 MiB`)
+function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
   let cachedBodyRuns = 0;
   let globalBytes = 0;
   for (const v of MEMORY_CATALOG_RUNS.values()) {
@@ -242,10 +341,27 @@ function rememberRunInMemory(catalogId: string, entry: StoredCatalogRun): void {
       cachedBodyRuns++;
       globalBytes += v.retainedBytes;
     }
+    if (v.hashes !== null) {
+      globalBytes += v.hashesBytes;
+    }
   }
+  for (const c of R2_RELOAD_LRU_CACHE.values()) {
+    globalBytes += c.bytes;
+  }
+
+  // 1. Evict oldest R2 reload LRU entries first when over global 32 MiB budget
+  if (globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
+    for (const [rk, rv] of R2_RELOAD_LRU_CACHE.entries()) {
+      globalBytes -= rv.bytes;
+      R2_RELOAD_LRU_CACHE.delete(rk);
+      if (globalBytes <= MAX_GLOBAL_CATALOG_BYTES) break;
+    }
+  }
+
+  // 2. Evict full in-memory record bodies (`v.records`) from oldest runs
   if (cachedBodyRuns > MAX_CACHED_CATALOG_RUNS || globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
     for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
-      if (k === catalogId || v.records === null) continue;
+      if (k === protectedCatalogId || v.records === null) continue;
       globalBytes -= v.retainedBytes;
       cachedBodyRuns--;
       v.records = null;
@@ -256,11 +372,51 @@ function rememberRunInMemory(catalogId: string, entry: StoredCatalogRun): void {
     }
   }
 
+  // 3. `M3`: Evict retained `variantHashes` / `SnapshotHashBundle` (`v.hashes`) from oldest runs so hash bundles
+  // can NEVER exceed `MAX_GLOBAL_CATALOG_BYTES` (`32 MiB`) across tenants/sources!
+  if (globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
+    for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+      if (k === protectedCatalogId || v.hashes === null) continue;
+      globalBytes -= v.hashesBytes;
+      v.hashes = null;
+      v.hashesBytes = 0;
+      if (globalBytes <= MAX_GLOBAL_CATALOG_BYTES) {
+        break;
+      }
+    }
+  }
+
+  // 4. Hard guard if even `protectedCatalogId` alone exceeds `32 MiB` (`records` + `hashes` combined)
+  if (globalBytes > MAX_GLOBAL_CATALOG_BYTES && protectedCatalogId) {
+    const prot = MEMORY_CATALOG_RUNS.get(protectedCatalogId);
+    if (prot) {
+      if (prot.records !== null && prot.summary.artifactId) {
+        globalBytes -= prot.retainedBytes;
+        prot.records = null;
+        prot.retainedBytes = 0;
+      }
+      if (globalBytes > MAX_GLOBAL_CATALOG_BYTES && prot.hashes !== null) {
+        globalBytes -= prot.hashesBytes;
+        prot.hashes = null;
+        prot.hashesBytes = 0;
+      }
+    }
+  }
+
   while (MEMORY_CATALOG_RUNS.size > MAX_COMPACT_HISTORY_RUNS) {
     const oldestKey = MEMORY_CATALOG_RUNS.keys().next().value;
     if (oldestKey === undefined) break;
     MEMORY_CATALOG_RUNS.delete(oldestKey);
   }
+}
+
+function rememberRunInMemory(catalogId: string, entry: StoredCatalogRun): void {
+  entry.hashesBytes = approxHashBundleBytes(entry.hashes);
+  if (MEMORY_CATALOG_RUNS.has(catalogId)) {
+    MEMORY_CATALOG_RUNS.delete(catalogId);
+  }
+  MEMORY_CATALOG_RUNS.set(catalogId, entry);
+  enforceGlobalCatalogMemoryBudget(catalogId);
 }
 
 function getMetaD1(env?: OptionalStorageBindings & Record<string, unknown>): D1DatabaseLike | null {
@@ -332,7 +488,7 @@ async function persistCatalogRun(
         s.variants,
         s.pagesRead,
         s.artifactId ?? null,
-        JSON.stringify(entry.hashes),
+        entry.hashes ? JSON.stringify(entry.hashes) : null,
         JSON.stringify(s),
         s.createdAt,
         s.updatedAt,
@@ -397,9 +553,16 @@ async function findPreviousCompleteCatalogRun(
       item.summary.status === 'complete' &&
       item.summary.warning !== 'shrink'
     ) {
+      let hashes = item.hashes;
+      if (!hashes && item.hashesArtifactId) {
+        const r2 = getArtifactsR2(env);
+        if (r2) {
+          hashes = await reloadHashBundleFromR2(r2, item.hashesArtifactId);
+        }
+      }
       return {
         productsCount: item.summary.products,
-        hashes: item.hashes,
+        hashes,
       };
     }
   }
@@ -597,50 +760,54 @@ function normalizeHeadersMap(raw: unknown): Record<string, string> {
 }
 
 function normalizeHubPageResponse(raw: unknown): NormalizedHubPageResponse | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const obj = raw as Record<string, unknown>;
+  try {
+    if (!raw || typeof raw !== 'object') return null;
+    const obj = raw as Record<string, unknown>;
 
-  // Unwrap `{ status, body: { results: [item] } }` from `fetch_url` / `fetch_batch` style responses if needed
-  const nestedBody = obj.body && typeof obj.body === 'object' && !Array.isArray(obj.body)
-    ? (obj.body as Record<string, unknown>)
-    : null;
-  const firstResult =
-    nestedBody && Array.isArray(nestedBody.results) && nestedBody.results[0] && typeof nestedBody.results[0] === 'object'
-      ? (nestedBody.results[0] as Record<string, unknown>)
-      : Array.isArray(obj.results) && obj.results[0] && typeof obj.results[0] === 'object'
-        ? (obj.results[0] as Record<string, unknown>)
-        : null;
+    // Unwrap `{ status, body: { results: [item] } }` from `fetch_url` / `fetch_batch` style responses if needed
+    const nestedBody = obj.body && typeof obj.body === 'object' && !Array.isArray(obj.body)
+      ? (obj.body as Record<string, unknown>)
+      : null;
+    const firstResult =
+      nestedBody && Array.isArray(nestedBody.results) && nestedBody.results[0] && typeof nestedBody.results[0] === 'object'
+        ? (nestedBody.results[0] as Record<string, unknown>)
+        : Array.isArray(obj.results) && obj.results[0] && typeof obj.results[0] === 'object'
+          ? (obj.results[0] as Record<string, unknown>)
+          : null;
 
-  const target = firstResult ?? (nestedBody && typeof nestedBody.status === 'number' ? nestedBody : obj);
-  const status = typeof target.status === 'number' ? target.status : typeof obj.status === 'number' ? obj.status : 0;
-  const outcome = typeof target.outcome === 'string' ? target.outcome : typeof obj.outcome === 'string' ? obj.outcome : undefined;
-  const problem = typeof target.problem === 'string' ? target.problem : typeof obj.problem === 'string' ? obj.problem : undefined;
-  const headers = normalizeHeadersMap(target.headers ?? obj.headers);
+    const target = firstResult ?? (nestedBody && typeof nestedBody.status === 'number' ? nestedBody : obj);
+    const status = typeof target.status === 'number' ? target.status : typeof obj.status === 'number' ? obj.status : 0;
+    const outcome = typeof target.outcome === 'string' ? target.outcome : typeof obj.outcome === 'string' ? obj.outcome : undefined;
+    const problem = typeof target.problem === 'string' ? target.problem : typeof obj.problem === 'string' ? obj.problem : undefined;
+    const headers = normalizeHeadersMap(target.headers ?? obj.headers);
 
-  let bodyStr = '';
-  if (typeof target.body === 'string') {
-    bodyStr = target.bodyEncoding === 'base64' ? decodeBase64Utf8(target.body) : target.body;
-  } else if (typeof target.rawBody === 'string') {
-    bodyStr = target.rawBody;
-  } else if (target.body && typeof target.body === 'object') {
-    bodyStr = JSON.stringify(target.body);
+    let bodyStr = '';
+    if (typeof target.body === 'string') {
+      bodyStr = target.bodyEncoding === 'base64' ? decodeBase64Utf8(target.body) : target.body;
+    } else if (typeof target.rawBody === 'string') {
+      bodyStr = target.rawBody;
+    } else if (target.body && typeof target.body === 'object') {
+      bodyStr = JSON.stringify(target.body);
+    }
+
+    const retryAfterMs =
+      typeof target.retryAfterMs === 'number' && Number.isFinite(target.retryAfterMs)
+        ? target.retryAfterMs
+        : undefined;
+    const finalUrl = typeof target.finalUrl === 'string' ? target.finalUrl : undefined;
+
+    return {
+      status,
+      ...(outcome ? { outcome } : {}),
+      ...(problem ? { problem } : {}),
+      headers,
+      body: bodyStr,
+      ...(finalUrl ? { finalUrl } : {}),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+    };
+  } catch {
+    return null;
   }
-
-  const retryAfterMs =
-    typeof target.retryAfterMs === 'number' && Number.isFinite(target.retryAfterMs)
-      ? target.retryAfterMs
-      : undefined;
-  const finalUrl = typeof target.finalUrl === 'string' ? target.finalUrl : undefined;
-
-  return {
-    status,
-    ...(outcome ? { outcome } : {}),
-    ...(problem ? { problem } : {}),
-    headers,
-    body: bodyStr,
-    ...(finalUrl ? { finalUrl } : {}),
-    ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
-  };
 }
 
 function parseRetryAfterMs(resp: NormalizedHubPageResponse, defaultMs: number): number {
@@ -671,8 +838,13 @@ function isChallengeResponse(resp: NormalizedHubPageResponse): boolean {
   const prob = resp.problem ?? '';
   if (/challenge|cf-mitigated|turnstile|captcha|verify you are human/i.test(prob)) return true;
   const bodyHead = resp.body.slice(0, 4096);
+  const trimmedHead = bodyHead.trimStart();
+  const isJsonPayload =
+    (resp.headers['content-type'] ?? '').toLowerCase().includes('json') ||
+    trimmedHead.startsWith('{') ||
+    trimmedHead.startsWith('[');
   if (
-    (resp.status === 403 || resp.status === 503 || resp.status === 200) &&
+    (resp.status === 403 || resp.status === 503 || (resp.status === 200 && !isJsonPayload)) &&
     /cf-mitigated|_cf_chl_opt|challenge-platform|turnstile|verify you are human/i.test(bodyHead)
   ) {
     return true;
@@ -704,6 +876,149 @@ function generateCatalogId(): string {
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function readStreamUtf8Bounded(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value && value.byteLength > 0) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel('R2 artifact exceeds decompressed byte limit').catch(() => undefined);
+        throw new Error(`Catalog R2 artifact exceeds ${maxBytes} bytes limit`);
+      }
+      chunks.push(value);
+    }
+  }
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.byteLength;
+  }
+  return new TextDecoder('utf-8', { fatal: false }).decode(merged);
+}
+
+async function readR2ObjectTextBounded(obj: R2ObjectBodyLike, key: string): Promise<string> {
+  if (typeof obj.arrayBuffer === 'function') {
+    const ab = await obj.arrayBuffer();
+    const bytes = new Uint8Array(ab);
+    const isGzip = (bytes.byteLength >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) || key.endsWith('.gz');
+    if (isGzip && typeof DecompressionStream === 'function') {
+      const ds = new DecompressionStream('gzip') as unknown as ReadableWritablePair<Uint8Array, Uint8Array>;
+      const gunzipped = (new Blob([bytes]).stream() as ReadableStream<Uint8Array>).pipeThrough(ds);
+      return readStreamUtf8Bounded(gunzipped, MAX_R2_DECOMPRESSED_BYTES);
+    }
+    if (bytes.byteLength > MAX_R2_DECOMPRESSED_BYTES) {
+      throw new Error(`Catalog R2 artifact exceeds ${MAX_R2_DECOMPRESSED_BYTES} bytes limit`);
+    }
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  }
+  if (obj.body && key.endsWith('.gz') && typeof DecompressionStream === 'function') {
+    const ds = new DecompressionStream('gzip') as unknown as ReadableWritablePair<Uint8Array, Uint8Array>;
+    const gunzipped = obj.body.pipeThrough(ds);
+    return readStreamUtf8Bounded(gunzipped, MAX_R2_DECOMPRESSED_BYTES);
+  }
+  const txt = await obj.text();
+  if (approxUtf8Bytes(txt) > MAX_R2_DECOMPRESSED_BYTES) {
+    throw new Error(`Catalog R2 artifact exceeds ${MAX_R2_DECOMPRESSED_BYTES} bytes limit`);
+  }
+  return txt;
+}
+
+async function reloadCatalogRecordsFromR2(r2: R2BucketLike, artifactId: string): Promise<CatalogRecord[]> {
+  const cached = R2_RELOAD_LRU_CACHE.get(artifactId);
+  if (cached) {
+    R2_RELOAD_LRU_CACHE.delete(artifactId);
+    R2_RELOAD_LRU_CACHE.set(artifactId, cached);
+    return cached.records;
+  }
+  return coalesceSingleflightR2Reload(`records:${artifactId}`, async () => {
+    const hitAfterWait = R2_RELOAD_LRU_CACHE.get(artifactId);
+    if (hitAfterWait) return hitAfterWait.records;
+    const loaded: CatalogRecord[] = [];
+    let approxBytes = 64;
+    try {
+      const obj = await r2.get(artifactId);
+      if (obj) {
+        const ndjson = await readR2ObjectTextBounded(obj, artifactId);
+        for (const line of ndjson.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const parsed = JSON.parse(trimmed) as CatalogRecord;
+            loaded.push(parsed);
+            approxBytes += approxUtf8Bytes(trimmed) + (Array.isArray(parsed.variants) ? parsed.variants.length * 64 : 64);
+          } catch {
+            // skip malformed line
+          }
+        }
+      }
+    } catch {
+      // ignore R2 read/decompression errors -> return partial/empty cleanly
+    }
+    if (loaded.length > 0 && approxBytes <= MAX_R2_CACHEABLE_ARTIFACT_BYTES) {
+      R2_RELOAD_LRU_CACHE.delete(artifactId);
+      R2_RELOAD_LRU_CACHE.set(artifactId, { records: loaded, bytes: approxBytes });
+      enforceGlobalCatalogMemoryBudget();
+    }
+    return loaded;
+  });
+}
+
+async function reloadHashBundleFromR2(r2: R2BucketLike, hashesArtifactId: string): Promise<SnapshotHashBundle | null> {
+  return coalesceSingleflightR2Reload(`hashes:${hashesArtifactId}`, async () => {
+    try {
+      const obj = await r2.get(hashesArtifactId);
+      if (!obj) return null;
+      const txt = await readR2ObjectTextBounded(obj, hashesArtifactId);
+      const parsed = JSON.parse(txt) as SnapshotHashBundle;
+      if (parsed && typeof parsed === 'object' && parsed.products && parsed.variants) {
+        return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+}
+
+function awaitWithDeadline<T>(
+  promise: Promise<T>,
+  deadlineAt: number,
+): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
+  const rem = deadlineAt - Date.now();
+  if (rem <= 0) {
+    promise.catch(() => undefined);
+    return Promise.resolve({ timedOut: true });
+  }
+  return new Promise((resolveRace, rejectRace) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolveRace({ timedOut: true });
+    }, rem);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    promise.then(
+      (value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolveRace({ timedOut: false, value });
+      },
+      (err) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        rejectRace(err);
+      },
+    );
+  });
+}
+
 /**
  * Retrieves the live or completed status of a catalog job (`running`, `cooling_down`, `complete`, `partial`, `challenged`).
  */
@@ -714,6 +1029,9 @@ export async function getCatalogStatus(params: {
   const catalogId = params.catalogId.trim();
   if (!catalogId) {
     return { status: 400, body: { ok: false, error: 'missing_catalog_id', message: 'Provide `catalogId`.' } };
+  }
+  if (!VALID_CATALOG_ID_RE.test(catalogId)) {
+    return { status: 400, body: { ok: false, error: 'invalid_catalog_id', message: 'Malformed `catalogId`.' } };
   }
 
   const mem = MEMORY_CATALOG_RUNS.get(catalogId);
@@ -762,6 +1080,9 @@ export async function getCatalogRecords(params: {
   if (!catalogId) {
     return { status: 400, body: { ok: false, error: 'missing_catalog_id', message: 'Provide `catalogId`.' } };
   }
+  if (!VALID_CATALOG_ID_RE.test(catalogId)) {
+    return { status: 400, body: { ok: false, error: 'invalid_catalog_id', message: 'Malformed `catalogId`.' } };
+  }
 
   let summary: CatalogStatusSummary | null = null;
   let records: CatalogRecord[] | null = null;
@@ -796,26 +1117,11 @@ export async function getCatalogRecords(params: {
   }
 
   if (!records) {
-    records = [];
     const r2 = getArtifactsR2(params.env);
     if (r2 && summary.artifactId) {
-      try {
-        const obj = await r2.get(summary.artifactId);
-        if (obj) {
-          const ndjson = await obj.text();
-          for (const line of ndjson.split('\n')) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              records.push(JSON.parse(trimmed) as CatalogRecord);
-            } catch {
-              // skip malformed line
-            }
-          }
-        }
-      } catch {
-        // ignore R2 read errors
-      }
+      records = await reloadCatalogRecordsFromR2(r2, summary.artifactId);
+    } else {
+      records = [];
     }
   }
 
@@ -899,6 +1205,7 @@ export async function executeCatalogCall(params: {
   ctx?: { waitUntil?: (promise: Promise<unknown>) => void };
   sleepFn?: (ms: number) => Promise<void>;
   tracer?: RequestTracer | TraceContext;
+  maxWallMs?: number;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { payload, env, executeHubFetch } = params;
   const activeTracer = getActiveRequestTracer(params.tracer);
@@ -1039,6 +1346,11 @@ export async function executeCatalogCall(params: {
 
   const catalogId = generateCatalogId();
   const startedAtMs = Date.now();
+  const effectiveMaxWallMs =
+    typeof params.maxWallMs === 'number' && Number.isFinite(params.maxWallMs) && params.maxWallMs > 0
+      ? Math.min(MAX_CATALOG_WALL_MS, Math.floor(params.maxWallMs))
+      : MAX_CATALOG_WALL_MS;
+  const syncDeadlineAt = startedAtMs + effectiveMaxWallMs;
   const createdAt = new Date(startedAtMs).toISOString();
 
   const currentEntry: StoredCatalogRun = {
@@ -1059,6 +1371,7 @@ export async function executeCatalogCall(params: {
       updatedAt: createdAt,
     },
     hashes: { products: {}, variants: {} },
+    hashesBytes: 64,
     records: [],
     retainedBytes: 0,
   };
@@ -1071,6 +1384,7 @@ export async function executeCatalogCall(params: {
     const byProductId = new Map<string, CatalogRecord>();
     const bytesByProductId = new Map<string, number>();
     let accumulatedBytes = 0;
+    let totalVariantsCount = 0;
     let totalSleptMs = 0;
     let truncatedByBudget = false;
     let pagesRead = 0;
@@ -1082,7 +1396,7 @@ export async function executeCatalogCall(params: {
     let triedAutoFallbackToWc = rawPlatform !== 'auto' || activeSpec.platform === 'woocommerce';
 
     while (currentUrl && pagesRead < maxPages) {
-      if (Date.now() - startedAtMs > MAX_CATALOG_WALL_MS) {
+      if (Date.now() >= syncDeadlineAt) {
         stopReason = 'time_budget_exceeded';
         truncatedByBudget = true;
         break;
@@ -1093,31 +1407,59 @@ export async function executeCatalogCall(params: {
           truncatedByBudget = true;
           break;
         }
+        if (Date.now() + effectivePauseMs >= syncDeadlineAt) {
+          stopReason = 'time_budget_exceeded';
+          truncatedByBudget = true;
+          break;
+        }
         totalSleptMs += effectivePauseMs;
-        await sleep(effectivePauseMs);
+        const sleepOut = await awaitWithDeadline(sleep(effectivePauseMs), syncDeadlineAt);
+        if (sleepOut.timedOut || Date.now() >= syncDeadlineAt) {
+          stopReason = 'time_budget_exceeded';
+          truncatedByBudget = true;
+          break;
+        }
       }
 
       let strikes = 0;
       let pageResp: NormalizedHubPageResponse | null = null;
 
       while (true) {
+        const remBeforeFetchMs = syncDeadlineAt - Date.now();
+        if (remBeforeFetchMs <= 0) {
+          stopReason = 'time_budget_exceeded';
+          truncatedByBudget = true;
+          pageResp = null;
+          break;
+        }
         const callFetchPage = () =>
           executeHubFetch({
             url: currentUrl!,
             kind: 'json',
             accept: 'application/json',
             maxBytes: 16_777_216,
+            timeoutMs: Math.min(30_000, remBeforeFetchMs),
             ...(payload.target !== undefined ? { target: payload.target } : {}),
             ...(payload.site !== undefined ? { site: payload.site } : {}),
             ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
           });
-        const rawFetchOut = await (resolvedPullTracer ? resolvedPullTracer.run(callFetchPage) : callFetchPage()).catch((err: unknown) => ({
-          status: 0,
-          outcome: 'network_error',
-          problem: err instanceof Error ? err.message : String(err),
-          headers: {},
-          body: '',
-        }));
+        const fetchPromise = Promise.resolve()
+          .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callFetchPage) : callFetchPage()))
+          .catch((err: unknown) => ({
+            status: 0,
+            outcome: 'network_error',
+            problem: err instanceof Error ? err.message : String(err),
+            headers: {},
+            body: '',
+          }));
+        const fetchRace = await awaitWithDeadline(fetchPromise, syncDeadlineAt);
+        if (fetchRace.timedOut) {
+          stopReason = 'time_budget_exceeded';
+          truncatedByBudget = true;
+          pageResp = null;
+          break;
+        }
+        const rawFetchOut = fetchRace.value;
 
         pageResp = normalizeHubPageResponse(rawFetchOut);
         if (!pageResp) {
@@ -1163,8 +1505,15 @@ export async function executeCatalogCall(params: {
           }
           const defaultCooldownMs = activeSpec.platform === 'shopify' ? 60_000 : 30_000;
           const waitMs = parseRetryAfterMs(pageResp, defaultCooldownMs);
-          if (totalSleptMs + waitMs > MAX_CATALOG_TOTAL_SLEEP_MS || Date.now() - startedAtMs + waitMs > MAX_CATALOG_WALL_MS) {
+          if (totalSleptMs + waitMs > MAX_CATALOG_TOTAL_SLEEP_MS) {
             stopReason = 'sleep_budget_exceeded';
+            truncatedByBudget = true;
+            pageResp = null;
+            break;
+          }
+          if (Date.now() + waitMs >= syncDeadlineAt) {
+            // Preserve `sleep_budget_exceeded` when virtual `sleepFn` tests pass `Retry-After > 120s` while real wall clock hasn't advanced
+            stopReason = waitMs > MAX_CATALOG_TOTAL_SLEEP_MS ? 'sleep_budget_exceeded' : 'time_budget_exceeded';
             truncatedByBudget = true;
             pageResp = null;
             break;
@@ -1181,7 +1530,13 @@ export async function executeCatalogCall(params: {
             updatedAt: new Date().toISOString(),
           };
           await persistCatalogRun(env, currentEntry);
-          await sleep(waitMs);
+          const coolSleep = await awaitWithDeadline(sleep(waitMs), syncDeadlineAt);
+          if (coolSleep.timedOut || Date.now() >= syncDeadlineAt) {
+            stopReason = 'time_budget_exceeded';
+            truncatedByBudget = true;
+            pageResp = null;
+            break;
+          }
           const { resumeAt: _cleared, ...restSummary } = currentEntry.summary;
           currentEntry.summary = {
             ...restSummary,
@@ -1256,16 +1611,24 @@ export async function executeCatalogCall(params: {
       let hitByteBudget = false;
       for (const rec of parsedPage.records) {
         const key = rec.productId || rec.handle || rec.url;
-        const { record: clampedRec, bytes: recBytes } = clampCatalogRecord(rec);
+        const { record: clampedRec, bytes: rawRecBytes } = clampCatalogRecord(rec);
+        // Account V8 object + variant-hash overhead (`96 B` per variant) so minimal-variant bombs stop well within `16 MiB`!
+        const recFootprintBytes = rawRecBytes + clampedRec.variants.length * 96;
+        const prevRec = byProductId.get(key);
+        const prevVariants = prevRec ? prevRec.variants.length : 0;
         const prevBytes = bytesByProductId.get(key) ?? 0;
-        if (accumulatedBytes - prevBytes + recBytes > MAX_CATALOG_IN_MEMORY_BYTES) {
+        if (
+          accumulatedBytes - prevBytes + recFootprintBytes > MAX_CATALOG_IN_MEMORY_BYTES ||
+          totalVariantsCount - prevVariants + clampedRec.variants.length > MAX_VARIANTS_PER_CATALOG_RUN
+        ) {
           hitByteBudget = true;
           truncatedByBudget = true;
           stopReason = 'byte_budget';
           break;
         }
-        accumulatedBytes = accumulatedBytes - prevBytes + recBytes;
-        bytesByProductId.set(key, recBytes);
+        accumulatedBytes = accumulatedBytes - prevBytes + recFootprintBytes;
+        totalVariantsCount = totalVariantsCount - prevVariants + clampedRec.variants.length;
+        bytesByProductId.set(key, recFootprintBytes);
         byProductId.set(key, clampedRec);
       }
 
@@ -1285,6 +1648,12 @@ export async function executeCatalogCall(params: {
       await persistCatalogRun(env, currentEntry);
 
       if (hitByteBudget) {
+        break;
+      }
+
+      if (Date.now() >= syncDeadlineAt) {
+        stopReason = 'time_budget_exceeded';
+        truncatedByBudget = true;
         break;
       }
 
@@ -1327,26 +1696,37 @@ export async function executeCatalogCall(params: {
     const currHashes = buildSnapshotHashBundle(finalRecords);
 
     // Optional lightweight `robots.txt` check for Shopify UCP / MCP endpoint advertisement
+    // (skipped if wall-clock deadline has expired or < 1s remains so total wall time NEVER exceeds `syncDeadlineAt`!).
     let ucpMeta: CatalogUcpMetadata | undefined;
-    if (finalStatus === 'complete' || pagesRead > 0) {
+    const remForUcpMs = syncDeadlineAt - Date.now();
+    if ((finalStatus === 'complete' || pagesRead > 0) && !truncatedByBudget && remForUcpMs >= 1_000) {
       const callRobotsCheck = () =>
         executeHubFetch({
           url: `${parsedUrl.origin}/robots.txt`,
           kind: 'text',
           accept: 'text/plain',
+          timeoutMs: Math.min(5_000, remForUcpMs),
           ...(payload.target !== undefined ? { target: payload.target } : {}),
           ...(payload.site !== undefined ? { site: payload.site } : {}),
           ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
         });
-      const robotsOut = await (resolvedPullTracer ? resolvedPullTracer.run(callRobotsCheck) : callRobotsCheck()).catch(() => null);
-      const normRobots = normalizeHubPageResponse(robotsOut);
-      if (normRobots && normRobots.status === 200 && normRobots.body) {
-        ucpMeta = discoverUcpEndpointFromRobots(parsedUrl.origin, normRobots.body) ?? undefined;
+      const ucpRace = await awaitWithDeadline(
+        Promise.resolve()
+          .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callRobotsCheck) : callRobotsCheck()))
+          .catch(() => null),
+        syncDeadlineAt,
+      );
+      if (!ucpRace.timedOut) {
+        const normRobots = normalizeHubPageResponse(ucpRace.value);
+        if (normRobots && normRobots.status === 200 && normRobots.body) {
+          ucpMeta = discoverUcpEndpointFromRobots(parsedUrl.origin, normRobots.body) ?? undefined;
+        }
       }
     }
 
-    // Write NDJSON artifact to R2 when `ARTIFACTS` is bound
+    // Write NDJSON + SnapshotHashBundle artifacts to R2 when `ARTIFACTS` is bound
     let artifactId: string | undefined;
+    let hashesArtifactId: string | undefined;
     const r2 = getArtifactsR2(env);
     if (r2 && finalRecords.length > 0) {
       const key = `catalog/${catalogId}.ndjson`;
@@ -1356,6 +1736,15 @@ export async function executeCatalogCall(params: {
           httpMetadata: { contentType: 'application/x-ndjson; charset=utf-8' },
         });
         artifactId = key;
+      } catch {
+        // Non-fatal if R2 put fails
+      }
+      const hashesKey = `catalog/${catalogId}.hashes.json`;
+      try {
+        await r2.put(hashesKey, JSON.stringify(currHashes), {
+          httpMetadata: { contentType: 'application/json; charset=utf-8' },
+        });
+        hashesArtifactId = hashesKey;
       } catch {
         // Non-fatal if R2 put fails
       }
@@ -1402,6 +1791,10 @@ export async function executeCatalogCall(params: {
 
     currentEntry.summary = finalSummary;
     currentEntry.hashes = currHashes;
+    currentEntry.hashesBytes = approxHashBundleBytes(currHashes);
+    if (hashesArtifactId) {
+      currentEntry.hashesArtifactId = hashesArtifactId;
+    }
     // Flush full in-memory record bodies once persisted to `ARTIFACTS` R2 (`getCatalogRecords` reloads from R2 `artifactId`)
     if (artifactId) {
       currentEntry.records = null;

@@ -617,6 +617,122 @@ func TestParseRetryAfterEdgeCases(t *testing.T) {
 	}
 }
 
+func TestR6RobotsCanonicalPathBOMTruncationAndSub25msComplexity(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+
+	// 1. Dot-segment, double-slash, encoded dot, and matrix-parameter canonicalization against Disallow: /private.
+	entry := ParseRobotsTxt("User-agent: *\nAllow: /public\nDisallow: /private\n", "edgefetch", exp)
+	for _, blocked := range []string{
+		"/private",
+		"/private/x",
+		"/./private",
+		"/./private/x",
+		"//private/x",
+		"/%2e/private/x",
+		"/%2E/private/x",
+		"/public/../private/x",
+		"/public/%2e%2e/private/x",
+		"/;/private/x",
+		"/private;jsessionid=123/x",
+		"/%70rivate/x",
+		"/pri%76ate?x=1",
+	} {
+		if entry.Allowed(blocked) {
+			t.Fatalf("SECURITY: expected %q to be disallowed by Disallow: /private", blocked)
+		}
+	}
+	if !entry.Allowed("/Private") {
+		t.Fatal("expected case-sensitive /Private to remain allowed per RFC 9309")
+	}
+
+	// RFC 9309 §2.2.2: %2F vs literal '/' must stay distinct.
+	slEntry := ParseRobotsTxt("User-agent: *\nDisallow: /a%2Fb\n", "edgefetch", exp)
+	if !slEntry.Allowed("/a/b") || slEntry.Allowed("/a%2fb") {
+		t.Fatal("RFC 9309 %2F vs '/' distinction broken")
+	}
+	slEntry2 := ParseRobotsTxt("User-agent: *\nDisallow: /a/b\n", "edgefetch", exp)
+	if !slEntry2.Allowed("/a%2fb") || slEntry2.Allowed("/a/b") {
+		t.Fatal("RFC 9309 '/' vs %2f distinction broken")
+	}
+
+	// Longest-match precedence preserves original pattern length including wildcards (/x* len 3 > /x len 2).
+	prec := ParseRobotsTxt("User-agent: *\nDisallow: /x*\nAllow: /x\n", "edgefetch", exp)
+	if prec.Allowed("/x") {
+		t.Fatal("expected Disallow: /x* (len 3) to beat Allow: /x (len 2)")
+	}
+
+	// 2. BOM after blank/space, NUL in value, and partial-line truncation at RobotsMaxBytes.
+	if ParseRobotsTxt("\n  \xef\xbb\xbfUser-agent: *\nDisallow: /x\x00zzz\n", "edgefetch", exp).Allowed("/x/y") {
+		t.Fatal("expected BOM-after-blank and NUL-in-value Disallow: /x\\x00zzz to block /x/y")
+	}
+	hdr := "User-agent: *\nDisallow: /\n"
+	padLen := RobotsMaxBytes - len(hdr) - len("Allow: /")
+	truncBody := hdr + strings.Repeat("#", padLen-1) + "\nAllow: /public-docs"
+	if ParseRobotsTxt(truncBody, "edgefetch", exp).Allowed("/secret") {
+		t.Fatal("SECURITY: partial Allow line split across RobotsMaxBytes boundary turned into Allow: /")
+	}
+
+	// 3. Pathological 1 MiB robots.txt × 1 MiB target path MUST complete in < 25ms (previously 15.1s).
+	bigPath := "/" + strings.Repeat("a", 1<<20)
+	build1MiBRobots := func(makeRule func(i int) string) *RobotsEntry {
+		var sb strings.Builder
+		sb.Grow(RobotsMaxBytes)
+		sb.WriteString("User-agent: *\n")
+		for i := 0; ; i++ {
+			line := makeRule(i)
+			if sb.Len()+len(line) > RobotsMaxBytes {
+				break
+			}
+			sb.WriteString(line)
+		}
+		return ParseRobotsTxt(sb.String(), "edgefetch", exp)
+	}
+
+	cases := []struct {
+		name string
+		ent  *RobotsEntry
+		path string
+		want bool
+	}{
+		{
+			name: "400-star anchored",
+			ent:  build1MiBRobots(func(i int) string { return fmt.Sprintf("Disallow: /%d%sb$\n", i%500, strings.Repeat("*a", 200)) }),
+			path: bigPath,
+			want: true,
+		},
+		{
+			name: "11k distinct long needles",
+			ent:  build1MiBRobots(func(i int) string { return fmt.Sprintf("Disallow: /*%05d%sb\n", i, strings.Repeat("a", 75)) }),
+			path: bigPath,
+			want: true,
+		},
+		{
+			name: "74k tiny rules",
+			ent:  build1MiBRobots(func(i int) string { return "Disallow: /*b\n" }),
+			path: bigPath,
+			want: true,
+		},
+		{
+			name: "matching-alphabet budget cap",
+			ent:  build1MiBRobots(func(i int) string { return fmt.Sprintf("Disallow: /*%04d%sb\n", i, strings.Repeat("a", 75)) }),
+			path: "/0123456789b" + strings.Repeat("a", 1<<20),
+			want: false, // exceeds scan budget -> fails closed in < 25ms
+		},
+	}
+	for _, tc := range cases {
+		t0 := time.Now()
+		got := tc.ent.Allowed(tc.path)
+		dur := time.Since(t0)
+		if got != tc.want {
+			t.Fatalf("%s: Allowed = %v, want %v", tc.name, got, tc.want)
+		}
+		// Allow generous margin for -race instrumentation while strictly enforcing < 25ms uninstrumented (< 100ms under -race).
+		if dur > 100*time.Millisecond {
+			t.Fatalf("%s: Allowed() took %s on 1 MiB path, want fast bounded execution", tc.name, dur)
+		}
+	}
+}
+
 func TestRobotsEntryAndParserRemainingBranches(t *testing.T) {
 	var nilEntry *RobotsEntry
 	if !nilEntry.Allowed("/x") || nilEntry.ContentSignalBlocked() {

@@ -237,14 +237,15 @@ func TestCrawlHelpersNormalizationCapabilitiesAndCheckRobots(t *testing.T) {
 		t.Fatalf("unexpected globalNext: %v", cGap.globalNext)
 	}
 	cGap.globalNext = time.Time{}
+	_ = cGap.waitGlobalGap(context.Background(), 0)
 	_ = cGap.waitGlobalGap(context.Background(), 50*time.Millisecond)
 	_ = cGap.waitGlobalGap(context.Background(), 50*time.Millisecond)
-	if len(gapSleeps) != 2 || gapSleeps[0] != 0 || gapSleeps[1] != 50*time.Millisecond {
-		t.Fatalf("expected [0, 50ms] gap sleeps, got %v", gapSleeps)
+	if len(gapSleeps) != 1 || gapSleeps[0] != 50*time.Millisecond {
+		t.Fatalf("expected [50ms] gap sleeps, got %v", gapSleeps)
 	}
 	cGap.backoff(context.Background(), 5)
-	if gapSleeps[2] != 2500*time.Millisecond+(7500*time.Millisecond)/2 {
-		t.Fatalf("expected backoff attempt 5 clamped to 10s base, got %v", gapSleeps[2])
+	if gapSleeps[1] != 2500*time.Millisecond+(7500*time.Millisecond)/2 {
+		t.Fatalf("expected backoff attempt 5 clamped to 10s base, got %v", gapSleeps[1])
 	}
 
 	if nt := notTried(Request{ID: "a"}, "why"); nt.Kind != classify.KindPage || nt.Outcome != classify.OutcomeNotTried {
@@ -865,20 +866,20 @@ func TestCrawlFetchSingleHopPDFStreamDNSAndRobotsEdges(t *testing.T) {
 		return nil
 	}, DefaultUserAgent, silentLog)
 	hsR := cRob.hostStateFor("r.test")
-	if ok, _, _ := cRob.checkRobots(context.Background(), hsR, "://bad"); ok {
+	if ok, _, _, _ := cRob.checkRobots(context.Background(), hsR, "://bad"); ok {
 		t.Fatal("expected url.Parse failure in checkRobots")
 	}
 	cCancel, cancelRob := context.WithCancel(context.Background())
 	cancelRob()
-	if ok, dist, _ := cRob.checkRobots(cCancel, hsR, "https://r.test/a"); ok || !dist {
+	if ok, dist, _, _ := cRob.checkRobots(cCancel, hsR, "https://r.test/a"); ok || !dist {
 		t.Fatal("expected pre-cancelled checkRobots distressed")
 	}
 	hsR.SetRobots(cRob.Now(), &politeness.RobotsEntry{Distressed: true, Reason: "", ExpiresAt: cRob.Now().Add(time.Minute)}, 0)
-	if _, _, msg := cRob.checkRobots(context.Background(), hsR, "https://r.test/a"); !strings.Contains(msg, "robots_unreachable:") {
+	if _, _, _, msg := cRob.checkRobots(context.Background(), hsR, "https://r.test/a"); !strings.Contains(msg, "robots_unreachable:") {
 		t.Fatalf("expected default robots_unreachable msg, got %q", msg)
 	}
 	hsR.SetRobots(cRob.Now(), &politeness.RobotsEntry{Distressed: true, Reason: "503", ExpiresAt: cRob.Now().Add(time.Minute)}, 0)
-	if _, _, msg := cRob.checkRobots(context.Background(), hsR, "https://r.test/a"); msg != "robots_unreachable: 503" {
+	if _, _, _, msg := cRob.checkRobots(context.Background(), hsR, "https://r.test/a"); msg != "robots_unreachable: 503" {
 		t.Fatalf("expected prefixed msg, got %q", msg)
 	}
 

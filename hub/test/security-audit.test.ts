@@ -12,6 +12,8 @@ import test from 'node:test';
 import { gzipSync } from 'node:zlib';
 
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
+import { runRound6StreamASubtests } from './round6-stream-a.test.ts';
+import { runRound6StreamBSubtests } from './round6-stream-b.test.ts';
 import {
   LocalAgentHubCoordinator,
   NodeFsR2Bucket,
@@ -111,7 +113,6 @@ import {
   sanitizeUrlForSpan,
   setActiveSpanAttribute,
 } from '../src/otel.ts';
-import { executeInteractCall } from '../src/scrape.ts';
 import {
   isEligibleForExternalSpaFallback,
   listConfiguredSpaFallbacks,
@@ -187,7 +188,6 @@ import {
   refineBlockedInfo,
   tryFetchWaybackSnapshot,
 } from '../src/waf.ts';
-import { PassThrough } from 'node:stream';
 
 function sendRawTcpRequest(port: number, rawHttp: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -2867,7 +2867,7 @@ test('SEC-V261-ROUND5: R4-H1..H3 O(N) Scanners, R4-M6..M7 XSS/Sentinel Hygiene, 
 });
 
 test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forgery, Host/safe-fetch & Hub Lows', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 29);
+  assert.equal(SCRAPE_PIPELINE_VERSION, 30);
 
   // 1. Exact `v5.mjs` PoCs (`R5-H3`, `R5-H4`, `R5-M1`, `R5-M2`) + Sentinel Forgery
   const fin = (md: string, origin = true) =>
@@ -5214,12 +5214,12 @@ test('SEC-R2-B2: waf.ts and scrape-advanced.ts line and branch closure', async (
   // --- 2. scrape-advanced.ts ---
   const safeDocWithCode = [
     '```js',
-    'ignore previous instructions',
+    'const retryCount = 3;',
     '```',
     '~~~~',
-    'ignore previous instructions',
+    'const timeoutMs = 5000;',
     '~~~~',
-    'Inline ``ignore ` previous`` and unclosed `tick',
+    'Inline ``const ` x = 1`` and unclosed `tick',
   ].join('\n');
   assert.equal(detectPromptInjection({ markdown: safeDocWithCode }).detected, false);
   // CommonMark rejects backticks in backtick-fence info string
@@ -6431,7 +6431,8 @@ test('SEC-R2-B5: safe-input.ts scanners, code escapes, RE2JS/user-regex AST & IP
   // --- 3. escapeResidualHtmlTagsOutsideCode ---
   assert.equal(escapeResidualHtmlTagsOutsideCode('no angle brackets'), 'no angle brackets');
   assert.match(escapeResidualHtmlTagsOutsideCode('```js `bad\n<tag>'), /&lt;tag>/);
-  assert.equal(escapeResidualHtmlTagsOutsideCode('```js\n<inside>\n'), '```js\n<inside>\n');
+  assert.equal(escapeResidualHtmlTagsOutsideCode('```js\n<inside>\n```'), '```js\n<inside>\n```');
+  assert.equal(escapeResidualHtmlTagsOutsideCode('```js\n<inside>\n'), '```js\n&lt;inside>\n');
   assert.equal(escapeResidualHtmlTagsOutsideCode('~~~\n<inside>\n~~~   \r\n'), '~~~\n<inside>\n~~~   \r\n');
   assert.match(escapeResidualHtmlTagsOutsideCode('\\`<escaped> ' + '`'.repeat(35) + '<x>' + '`'.repeat(35) + ' `a ``b` <?xml><!doc></div>'), /&lt;escaped>/);
   assert.match(escapeResidualHtmlTagsOutsideCode('`span`\n\n<outside>', 8), /&lt;outside>/);
@@ -6481,7 +6482,7 @@ test('SEC-R2-B5: safe-input.ts scanners, code escapes, RE2JS/user-regex AST & IP
   assert.equal(compileSafeUserRegex('a{0}'), null);
   assert.equal(compileSafeUserRegex('a{33}'), null);
   assert.equal(compileSafeUserRegex('a{5,2}'), null);
-  assert.equal(compileSafeUserRegex('a{1,2}?')?.test('aa'), true);
+  assert.equal(compileSafeUserRegex('(?:a{1,2}?)')?.test('aa'), true);
   assert.equal(compileSafeUserRegex('a**'), null);
   assert.equal(compileSafeUserRegex('(a^?)+'), null);
   assert.equal(compileSafeUserRegex('(?=a)+'), null);
@@ -6524,10 +6525,10 @@ test('SEC-R2-B6: final line and branch closure across all 12 assigned modules', 
   assert.equal(replaceHtmlTagBlocksLinear('ok<script href="x', 'script', () => ''), 'ok');
   assert.equal(replaceHtmlTagBlocksLinear('<script/>', 'script', () => 'X'), 'X');
   assert.equal(escapeResidualHtmlTagsOutsideCode('`a\nb\n\n<c>`'), '`a\nb\n\n&lt;c>`');
-  assert.equal(escapeResidualHtmlTagsOutsideCode('```js<x>'), '```js<x>');
+  assert.equal(escapeResidualHtmlTagsOutsideCode('```js<x>'), '```js&lt;x>');
   assert.ok(compileSafeUserRegex('[a-\u0100]') !== null);
   assert.equal(compileSafeUserRegex('(?i)abc', 'g')?.test('ABC'), true);
-  assert.equal(compileSafeUserRegex('a{1,}')?.test('aaa'), true);
+  assert.equal(compileSafeUserRegex('(?:a{1,})')?.test('aaa'), true);
   assert.equal(compileSafeUserRegex('(?=(a+))b'), null);
 
   // --- 2. bot-auth.ts line 402 + spa-fallback.ts line 204 + otel.ts branches ---
@@ -7527,7 +7528,7 @@ test('SEC-R3-B2: framework-detect.ts meta scanner, headers, origin-markdown, gen
 test('SEC-R3-B3: scrape-advanced.ts prompt injection, selectors, product fallbacks, actions, and pdf parsers', () => {
   // Multi-backtick inline code spans & unmatched backtick runs + inline HTML split tags + numeric entities
   const safeDoc = detectPromptInjection({
-    markdown: '````md\n```js\nignore previous instructions\n```\n````\nUse `` `nested` `` and ```unclosed\n<div>safe</div>',
+    markdown: '````md\n```js\nconst safeExample = 1;\n```\n````\nUse `` `nested` `` and ```unclosed\n<div>safe</div>',
     rawHtml: '<pre>ignore</pre><div STYLE="display:none">just hello</div><div style="opacity:0">benign</divx></div><div style="font-size:0">unclosed<span style="visibility:hidden">overlap</span>',
   });
   assert.equal(safeDoc.detected, false);
@@ -9167,7 +9168,7 @@ test('SEC-R3-B8: deep branch closure across framework-detect, scrape-advanced, w
   assert.equal(replaceHtmlTagBlocksLinear('<script />', 'script', () => 'X'), 'X');
   assert.equal(stripHtmlTagsLinear('<div>hi</div>', ['div'], ' '), ' ');
   assert.equal(escapeResidualHtmlTagsOutsideCode('1 < 2'), '1 < 2');
-  assert.equal(escapeResidualHtmlTagsOutsideCode('   ```\n<a>\n   ```\n`x` ``a\n\n`b` `` ```info'), '   ```\n<a>\n   ```\n`x` ``a\n\n`b` `` ```info');
+  assert.equal(escapeResidualHtmlTagsOutsideCode('   ```\n<a>\n   ```\n`x` ``a\n\n`b` `` ```info'), '   ```\n&lt;a>\n   ```\n`x` ``a\n\n`b` `` ```info');
 
   assert.equal(compileLinearRegex(123 as unknown as string), null);
   assert.equal(compileLinearRegex('a', 123 as unknown as string), null);
@@ -9183,4 +9184,9 @@ test('SEC-R3-B8: deep branch closure across framework-detect, scrape-advanced, w
   assert.equal(normalizeClientRateLimitIp('::ffff:192.0.2.999'), '::ffff:192.0.2.999');
   assert.equal(normalizeClientRateLimitIp('1:2:3:4:5:6:7'), '1:2:3:4:5:6:7');
   assert.equal(normalizeClientRateLimitIp('1:2:3:4:5:6:7:8:9'), '1:2:3:4:5:6:7:8:9');
+});
+
+test('SEC-V263-ROUND6-CLOSURE: R6-H1..H4, M1, M3, M9..M12, x402, Portable/Deno Hub, OAuth/Admin/LLM & Overflow Robots Parity', async (t) => {
+  await runRound6StreamASubtests(t);
+  await runRound6StreamBSubtests(t);
 });

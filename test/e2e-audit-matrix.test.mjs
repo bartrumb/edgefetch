@@ -421,7 +421,7 @@ async function connectMockAgent({
       ws.send(
         JSON.stringify({
           type: 'agent_hello',
-          version: '2.6.2',
+          version: '2.6.3',
           arch: 'amd64',
           goVersion: 'go1.27.4',
           capabilities,
@@ -580,7 +580,7 @@ async function connectHeaderMockAgent({
         'X-Agent-Site': siteId,
         'X-Agent-Capabilities': capabilities.join(','),
         'X-Agent-Arch': 'amd64',
-        'X-Agent-Version': '2.6.2',
+        'X-Agent-Version': '2.6.3',
       },
     });
     req.on('error', (err) => {
@@ -600,7 +600,7 @@ async function connectHeaderMockAgent({
         encodeWsClientTextFrame(
           JSON.stringify({
             type: 'agent_hello',
-            version: '2.6.2',
+            version: '2.6.3',
             arch: 'amd64',
             goVersion: 'go1.27.4',
             capabilities,

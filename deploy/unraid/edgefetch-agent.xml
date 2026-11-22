@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>EdgeFetch-Agent</Name>
-  <Repository>ghcr.io/bartrumb/edgefetch-agent:2.6.0</Repository>
+  <Repository>ghcr.io/bartrumb/edgefetch-agent:2.6.3</Repository>
   <Registry>https://github.com/bartrumb/edgefetch/pkgs/container/edgefetch-agent</Registry>
   <Network>bridge</Network>
   <Privileged>false</Privileged>

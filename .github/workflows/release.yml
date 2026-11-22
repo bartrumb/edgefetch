@@ -32,12 +32,14 @@ jobs:
           cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
           agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
           hub_ver=$(node -p "require('./hub/package.json').version")
-          if [ -z "$cfg_ver" ] || [ -z "$agent_ver" ] || [ -z "$hub_ver" ]; then
-            echo "::error::Failed to extract version strings (config.yaml='${cfg_ver}', agent.go='${agent_ver}', hub/package.json='${hub_ver}')"
+          mcp_ver=$(node -p "require('./server.json').version")
+          mcp_pkg=$(node -p "require('./server.json').packages[0].identifier")
+          if [ -z "$cfg_ver" ] || [ -z "$agent_ver" ] || [ -z "$hub_ver" ] || [ -z "$mcp_ver" ] || [ -z "$mcp_pkg" ]; then
+            echo "::error::Failed to extract version strings (config.yaml='${cfg_ver}', agent.go='${agent_ver}', hub/package.json='${hub_ver}', server.json='${mcp_ver}')"
             exit 1
           fi
-          if [ "$cfg_ver" != "$agent_ver" ] || [ "$cfg_ver" != "$hub_ver" ]; then
-            echo "::error::Version lockstep mismatch: edgefetch_fat/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}'"
+          if [ "$cfg_ver" != "$agent_ver" ] || [ "$cfg_ver" != "$hub_ver" ] || [ "$mcp_ver" != "$cfg_ver" ] || [ "$mcp_pkg" != "ghcr.io/bartrumb/edgefetch-agent:${cfg_ver}" ]; then
+            echo "::error::Version lockstep mismatch: edgefetch_fat/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}', server.json='v${mcp_ver}' (${mcp_pkg})"
             exit 1
           fi
           if [ "$REF_NAME" != "v${cfg_ver}" ] || [ "$REF_NAME" != "v${agent_ver}" ] || [ "$REF_NAME" != "v${hub_ver}" ]; then
@@ -117,12 +119,14 @@ jobs:
           cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
           agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
           hub_ver=$(node -p "require('./hub/package.json').version")
-          if [ -z "$cfg_ver" ] || [ -z "$agent_ver" ] || [ -z "$hub_ver" ]; then
-            echo "::error::Failed to extract version strings (config.yaml='${cfg_ver}', agent.go='${agent_ver}', hub/package.json='${hub_ver}')"
+          mcp_ver=$(node -p "require('./server.json').version")
+          mcp_pkg=$(node -p "require('./server.json').packages[0].identifier")
+          if [ -z "$cfg_ver" ] || [ -z "$agent_ver" ] || [ -z "$hub_ver" ] || [ -z "$mcp_ver" ] || [ -z "$mcp_pkg" ]; then
+            echo "::error::Failed to extract version strings (config.yaml='${cfg_ver}', agent.go='${agent_ver}', hub/package.json='${hub_ver}', server.json='${mcp_ver}')"
             exit 1
           fi
-          if [ "$cfg_ver" != "$agent_ver" ] || [ "$cfg_ver" != "$hub_ver" ]; then
-            echo "::error::Version lockstep mismatch: edgefetch_fat/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}'"
+          if [ "$cfg_ver" != "$agent_ver" ] || [ "$cfg_ver" != "$hub_ver" ] || [ "$mcp_ver" != "$cfg_ver" ] || [ "$mcp_pkg" != "ghcr.io/bartrumb/edgefetch-agent:${cfg_ver}" ]; then
+            echo "::error::Version lockstep mismatch: edgefetch_fat/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}', server.json='v${mcp_ver}' (${mcp_pkg})"
             exit 1
           fi
           owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
@@ -207,3 +211,17 @@ jobs:
           subject-name: ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch
           subject-digest: ${{ steps.push-aio.outputs.digest }}
           push-to-registry: true
+
+      - name: Publish server.json to Official MCP Registry (GitHub OIDC)
+        if: github.repository == 'bartrumb/edgefetch' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          curl -fsSL -o "$tmp/mcp-publisher.tar.gz" https://github.com/modelcontextprotocol/registry/releases/download/v1.8.11/mcp-publisher_linux_amd64.tar.gz
+          echo "99fbd857ae2277e5e4a4a2cddc7f4d3e64612c6f90950f44584c3539c9df854f  $tmp/mcp-publisher.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/mcp-publisher.tar.gz" -C "$tmp" mcp-publisher
+          chmod +x "$tmp/mcp-publisher"
+          "$tmp/mcp-publisher" validate server.json
+          "$tmp/mcp-publisher" login github-oidc
+          "$tmp/mcp-publisher" publish

@@ -14,7 +14,7 @@ const DEFAULT_MAX_HTML_DOC_CHARS = 2_097_152; // 2 MiB default input cap
 const HARD_MAX_HTML_DOC_CHARS = 4_194_304; // 4 MiB absolute ceiling even when caller passes higher maxChars
 const MAX_DOM_DEPTH = 128;
 const MAX_DOM_NODES = 40_000;
-const MAX_OVERFLOW_TAG_EVENTS = 80_000;
+const MAX_OVERFLOW_TAG_EVENTS = 1_024;
 const MAX_DOC_TOTAL_VISITS = 90_000;
 const MAX_SERIALIZE_NODES_PER_CALL = 15_000;
 const MAX_DLMAP_VISITS = 4_000;
@@ -738,6 +738,7 @@ function isVoidElementSpan(src: string, start: number, endIndex: number, inForei
 class BoundedHtmlParser extends Parser {
   private overflowDepth = 0;
   private overflowEvents = 0;
+  private overflowInForeign = false;
   private currentOpenOverflowed = false;
   private readonly sourceHtml: string;
   public overflowHalted = false;
@@ -752,18 +753,22 @@ class BoundedHtmlParser extends Parser {
   }
 
   override onopentagname(start: number, endIndex: number): void {
-    const stackLen = (this as unknown as { stack: string[] }).stack.length;
-    if (stackLen >= MAX_DOM_DEPTH && !isVoidElementSpan(this.sourceHtml, start, endIndex, this.isInForeignContext())) {
-      this.endIndex = endIndex;
-      this.overflowDepth++;
-      this.overflowEvents++;
-      this.currentOpenOverflowed = true;
-      (this as unknown as { tagname: string }).tagname = '';
-      if (this.overflowEvents >= MAX_OVERFLOW_TAG_EVENTS) {
-        this.overflowHalted = true;
-        this.pause();
+    if (this.overflowDepth > 0 || (this as unknown as { stack: string[] }).stack.length >= MAX_DOM_DEPTH) {
+      if (this.overflowDepth === 0) {
+        this.overflowInForeign = this.isInForeignContext();
       }
-      return;
+      if (!isVoidElementSpan(this.sourceHtml, start, endIndex, this.overflowInForeign)) {
+        this.endIndex = endIndex;
+        this.overflowDepth++;
+        this.overflowEvents++;
+        this.currentOpenOverflowed = true;
+        (this as unknown as { tagname: string }).tagname = '';
+        if (this.overflowEvents >= MAX_OVERFLOW_TAG_EVENTS) {
+          this.overflowHalted = true;
+          this.pause();
+        }
+        return;
+      }
     }
     this.currentOpenOverflowed = false;
     super.onopentagname(start, endIndex);
@@ -772,7 +777,7 @@ class BoundedHtmlParser extends Parser {
   override onselfclosingtag(endIndex: number): void {
     if (this.currentOpenOverflowed) {
       this.currentOpenOverflowed = false;
-      if (this.isInForeignContext()) {
+      if (this.overflowInForeign) {
         this.overflowDepth = Math.max(0, this.overflowDepth - 1);
       }
       this.startIndex = endIndex + 1;
@@ -785,7 +790,7 @@ class BoundedHtmlParser extends Parser {
     this.currentOpenOverflowed = false;
     if (this.overflowDepth > 0) {
       this.endIndex = endIndex;
-      if (!isVoidElementSpan(this.sourceHtml, start, endIndex, this.isInForeignContext())) {
+      if (!isVoidElementSpan(this.sourceHtml, start, endIndex, this.overflowInForeign)) {
         this.overflowDepth--;
       }
       this.startIndex = endIndex + 1;
@@ -863,14 +868,7 @@ function buildBoundedDomDocument(html: string): Document {
     },
   );
   parserRef = parser;
-
-  const PARSE_CHUNK_CHARS = 32_768;
-  for (let off = 0; off < html.length && !halted && !parser.overflowHalted; off += PARSE_CHUNK_CHARS) {
-    parser.write(html.slice(off, off + PARSE_CHUNK_CHARS));
-  }
-  if (!halted && !parser.overflowHalted) {
-    parser.end();
-  }
+  parser.end(html);
   return root;
 }
 

@@ -67,6 +67,7 @@ interface DenoRuntimeLike {
   ): DenoServerHandle;
   upgradeWebSocket?(req: Request, options?: { protocol?: string }): { socket: WebSocket; response: Response };
   resolveDns?(query: string, recordType: 'A' | 'AAAA'): Promise<string[]>;
+  unrefTimer?(id: number): void;
 }
 
 function getDenoRuntime(): DenoRuntimeLike | undefined {
@@ -241,64 +242,72 @@ function capWebReadableStream(
 ): ReadableStream<Uint8Array> {
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let total = 0;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  let startedAt = 0;
   let finished = false;
-  const clearTimer = () => {
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-  };
-  return new ReadableStream<Uint8Array>({
-    async pull(ctrl) {
-      if (finished) return;
-      if (!reader) {
-        reader = src.getReader();
-        timer = setTimeout(() => {
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(ctrl) {
+        if (finished) return;
+        if (!reader) {
+          reader = src.getReader();
+          startedAt = Date.now();
+        }
+        const remainingMs = Math.max(1, idleOrTotalMs - (Date.now() - startedAt));
+        let readTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
           if (finished) return;
           finished = true;
-          clearTimer();
+          readTimer = null;
           void reader?.cancel('Body stream timed out').catch(() => undefined);
           try {
             ctrl.error(new Error('Stream read timed out'));
           } catch {
             // ignore
           }
-        }, idleOrTotalMs);
-        timer.unref?.();
-      }
-      try {
-        const { done, value } = await reader.read();
-        if (done) {
-          finished = true;
-          clearTimer();
-          ctrl.close();
-          return;
-        }
-        if (value) {
-          total += value.byteLength;
-          if (total > maxBytes) {
+        }, remainingMs);
+        readTimer.unref?.();
+        getDenoRuntime()?.unrefTimer?.(readTimer as unknown as number);
+        try {
+          const { done, value } = await reader.read();
+          if (finished) return;
+          if (done) {
             finished = true;
-            clearTimer();
-            onCapExceeded?.();
-            await reader.cancel('Stream exceeds byte limit').catch(() => undefined);
-            ctrl.error(new DenoPayloadTooLargeError(maxBytes));
+            ctrl.close();
             return;
           }
-          ctrl.enqueue(value);
+          if (value) {
+            total += value.byteLength;
+            if (total > maxBytes) {
+              finished = true;
+              onCapExceeded?.();
+              await reader.cancel('Stream exceeds byte limit').catch(() => undefined);
+              ctrl.error(new DenoPayloadTooLargeError(maxBytes));
+              return;
+            }
+            ctrl.enqueue(value);
+          }
+        } catch (err) {
+          if (!finished) {
+            finished = true;
+            ctrl.error(err);
+          }
+        } finally {
+          if (readTimer !== null) {
+            clearTimeout(readTimer);
+            readTimer = null;
+          }
         }
-      } catch (err) {
+      },
+      async cancel(reason) {
         finished = true;
-        clearTimer();
-        ctrl.error(err);
-      }
+        if (reader) {
+          await reader.cancel(reason).catch(() => undefined);
+        } else {
+          await src.cancel(reason).catch(() => undefined);
+        }
+      },
     },
-    async cancel(reason) {
-      finished = true;
-      clearTimer();
-      await reader?.cancel(reason).catch(() => undefined);
-    },
-  });
+    { highWaterMark: 0 },
+  );
 }
 
 export interface DenoSafeFetchOptions {
@@ -459,14 +468,25 @@ export function createDenoSafeFetch(
         hopHeaders.delete('x-goog-api-key');
       }
 
-      const res = await doFetch(validatedUrl.toString(), {
-        ...init,
-        method,
-        headers: hopHeaders,
-        body: method === 'GET' || method === 'HEAD' || method === 'OPTIONS' ? undefined : body,
-        redirect: 'manual',
-        signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
-      });
+      const hopCtrl = new AbortController();
+      const hopTimer = setTimeout(() => {
+        hopCtrl.abort(new DOMException('The operation timed out.', 'TimeoutError'));
+      }, 30_000);
+      hopTimer.unref?.();
+      getDenoRuntime()?.unrefTimer?.(hopTimer as unknown as number);
+      let res: Response;
+      try {
+        res = await doFetch(validatedUrl.toString(), {
+          ...init,
+          method,
+          headers: hopHeaders,
+          body: method === 'GET' || method === 'HEAD' || method === 'OPTIONS' ? undefined : body,
+          redirect: 'manual',
+          signal: init?.signal ? AbortSignal.any([init.signal, hopCtrl.signal]) : hopCtrl.signal,
+        });
+      } finally {
+        clearTimeout(hopTimer);
+      }
 
       if (res.status >= 100 && res.status < 200) {
         await res.body?.cancel().catch(() => undefined);

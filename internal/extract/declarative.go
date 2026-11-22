@@ -669,12 +669,6 @@ var knownSocrataHostsGo = map[string]bool{
 	"data.cdc.gov": true, "data.cms.gov": true, "data.medicare.gov": true,
 }
 
-var topLevelManifestKeysGo = map[string]bool{
-	"id": true, "name": true, "category": true, "description": true, "domains": true,
-	"universalEngine": true, "exampleUrls": true, "match": true, "twin": true,
-	"extract": true, "routes": true, "htmlRoutes": true, "catalog": true,
-}
-
 func isValidAdapterIDGo(s string) bool {
 	if len(s) == 0 || len(s) > 64 {
 		return false

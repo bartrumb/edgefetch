@@ -96,7 +96,9 @@ jobs:
           cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
           agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
           hub_ver=$(node -p "require('./hub/package.json').version")
-          test -n "$cfg_ver" && test "$cfg_ver" = "$agent_ver" && test "$cfg_ver" = "$hub_ver"
+          mcp_ver=$(node -p "require('./server.json').version")
+          mcp_pkg=$(node -p "require('./server.json').packages[0].identifier")
+          test -n "$cfg_ver" && test "$cfg_ver" = "$agent_ver" && test "$cfg_ver" = "$hub_ver" && test "$mcp_ver" = "$cfg_ver" && test "$mcp_pkg" = "ghcr.io/bartrumb/edgefetch-agent:${cfg_ver}"
       - run: npm run build:portable
       - run: npm run adapter:test
       - name: Run Hub, Miniflare workerd E2E & TypeScript SDK tests with V8 coverage

@@ -2,6 +2,29 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.6.3] - 2026-11-21
+
+### Security
+- **Round 6 Security Closure (`R6-H1`..`R6-H6`, `R6-M1`..`R6-M12`, `SCRAPE_PIPELINE_VERSION = 30`):**
+  - **Markdown & `/v1/extract` sanitizer closure (`R6-H1`, `R6-H2`, `R6-H3`):** Hardened `splitMarkdownByCodeFences` against indented (`> 3` spaces) and list-nested code-fence state smuggling (`R6-H1`), applied full Markdown/HTML/dangerous-URI sanitization after JSON-LD/meta rescue paths in `/v1/extract` (`R6-H2`), and inserted safe delimiter spacing before inline backticks immediately following bare GFM autolinks (`R6-H3`).
+  - **Portable/Deno Hub raw TCP caps & proxy trust (`R6-H4`):** Enforced per-IP raw TCP and pre-header idle socket caps (`destroy()` on `429` before body reads), isolated `/health` and `/readyz` liveness probes, enforced malformed `Host` `400` + full security headers on Deno, and set explicit `EDGEFETCH_TRUST_PROXY` in cloud reverse-proxy blueprints.
+  - **Single-compiler YAML IR, host-claim bounds & Go sanitizer (`R6-H5`, `R6-M2`, `R6-M6`..`R6-M8`):** Compiled all YAML manifests through a single checked compiler (`hub/scripts/compile-manifests.mjs`) rejecting anchors (`&`), aliases (`*`), merge keys (`<<`), explicit tags (`!`), non-ASCII keys, and broad TLD wildcards (`*.com`), verified exact case-sensitive ASCII struct keys in Go (`DisallowUnknownFields`), blocked cross-domain twin redirects, and added linear $O(N)$ `SanitizeScrapedMarkdown` / `SanitizeScrapedMeta` in Go.
+  - **Ed25519 release-signing key rotation & tag-gated isolation (`R6-H6`, `R5-M7`):** Rotated the owner Ed25519 release-signing keypair (`SPKI SHA-256: 2ed9e6f815d727738d51bc48c176f2b63d5176c92975f52943fefcf0afe03272`), sealed `RELEASE_SIGNING_PRIVATE_KEY` exclusively inside the tag-gated `release` GitHub Actions environment, and enforced zero-bypass (`can_admins_bypass: false`) immutable `v*` tag rulesets.
+  - **Zero-TCP direct pipe CDP, initiator-proven headers & runtime bounds (`R6-M1`, `R6-M3`, `R6-M9`..`R6-M12`):** Enabled zero-TCP direct OS pipe CDP transport across Linux, macOS, and Windows (`0` listening Chromium ports), required top-level document initiator provenance before attaching caller headers in `Fetch.requestPaused`, added bounded $O(N)$ CSS selector memoization (`ChainMemo` + depth/visit caps) in `parseHtmlDoc`, added an LRU cache + bounded-repetition guard around linear `re2js` NFA compilation, capped `catalog` `variantHashes` inside the `32 MiB` global LRU with a `120s` wall-clock ceiling and `<= 2` gunzip semaphore, and achieved `153/153` TypeScript-Go `robots.txt` + `Content-Signal` parity.
+
+### Added
+- **100% Declarative YAML Site Adapters (`56/56`, `internal/extract/manifests/*.yaml`, `compiled.json`):**
+  - Converted all remaining TypeScript provider files into `#`-commented, `MIT`-licensed declarative `.yaml` manifests (`56/56` total across 7 categories, `0` `.ts` files under `providers/`) compiled into `internal/extract/manifests/compiled.json` (`//go:embed`) with reusable storefront normalization in `hub/src/extractors/commerce-engine.ts` for 1:1 Go + TypeScript parity.
+- **OpenAPI `3.1.0` Specification (`GET /openapi.json`, `docs/openapi.json`):**
+  - Added unauthenticated `GET /openapi.json` (`application/json` and `application/openapi+json` content negotiation, strict `Host`/`Origin` sanitization) across Cloudflare Worker, Node.js Portable Hub, Deno Deploy, and pure-Go `--mode=hub`, sharing canonical JSON Schema 2020-12 definitions directly with `MCP_TOOL_SCHEMAS` (`15/15` tools) and guarded by automated `/v1/*` route-parity contract tests.
+- **Full-Stack OpenTelemetry (`OTLP/HTTP` + W3C `traceparent`) & E2E Audit Matrix:**
+  - Wired request-scoped `AsyncLocalStorage` `RequestTracer` (`x-trace-id` + `traceparent` headers, `edgefetch.adapter_id` tags, zero-secret span attribute scrubbing) across Cloudflare/Node/Deno Hubs, Go `--mode=hub` / `--mode=mcp` / Chromium CDP renderer, and the official TypeScript (`sdk/ts`) & Python (`sdk/py`) `EdgeFetchClient` SDKs (`traceparent` + `lastTraceId`), backed by Miniflare `workerd`, Deno `v2.2.4`, cross-process OTLP + RFC 9421, and opaque-box E2E suites.
+  - Automated Official MCP Registry (`registry.modelcontextprotocol.io`) `server.json` validation and GitHub OIDC publishing in `.github/workflows/release.yml`.
+
+### Changed
+- **Licensing & Governance Clarity (`LICENSE`, `hub/LICENSE`, `CONTRIBUTING.md`, `docs/ADAPTERS.md`):**
+  - Unified documentation around *"open-source worker, SDKs, and adapters (`MIT`), fair-source hub (`FSL-1.1`, `MIT` after two years)"*, `Inbound = MIT + DCO` (`git commit -s`), and explicit `EdgeFetch™` trademark notice.
+
 ## [2.6.2] - 2026-11-21
 
 ### Security

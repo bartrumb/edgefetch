@@ -4635,11 +4635,14 @@ test('ADAPTER-20: Round 6 Hardening — 100% YAML Zero-TS Providers, M1 Selector
   const providersDir = join(hubRoot, 'src', 'extractors', 'providers');
   assert.equal(existsSync(providersDir), false, 'src/extractors/providers directory must be completely removed');
 
-  // 2. M1: 50,000-deep nested <div> and 100,000 trailing colons in <dt> finish linearly in < 50ms without stack overflow
+  // 2. M1: Beyond-MAX_DOM_DEPTH flattening (500-deep) + 50,000-deep overflow halt + 100,000 trailing colons in <dt> finish in < 50ms
+  const midDeepDoc = parseHtmlDoc(`${'<div>'.repeat(500)}deep${'</div>'.repeat(500)}`);
+  assert.equal(midDeepDoc.text('div'), 'deep');
+
   const deepHtml = `${'<div>'.repeat(50_000)}deep${'</div>'.repeat(50_000)}`;
   const tDeep = performance.now();
   const deepDoc = parseHtmlDoc(deepHtml);
-  assert.equal(deepDoc.text('div'), 'deep');
+  assert.ok(deepDoc.select('div').length <= 128);
   assert.ok(performance.now() - tDeep < 50, 'M1: 50,000-deep HTML DOM cap must finish in < 50ms');
 
   const colonHtml = `<dl><dt>Key${':'.repeat(100_000)}   </dt><dd>Value</dd></dl>`;
@@ -4710,6 +4713,3 @@ test('ADAPTER-20: Round 6 Hardening — 100% YAML Zero-TS Providers, M1 Selector
     /Duplicate twin id/i,
   );
 });
-
-
-

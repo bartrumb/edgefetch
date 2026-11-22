@@ -183,7 +183,7 @@ export function buildOtlpTracePayload(params: {
   spans: OtlpSpanInput[];
 }): Record<string, unknown> {
   const serviceName = params.serviceName?.trim() || 'edgefetch-hub';
-  const serviceVersion = params.serviceVersion?.trim() || '2.6.2';
+  const serviceVersion = params.serviceVersion?.trim() || '2.6.3';
   return {
     resourceSpans: [
       {
@@ -374,17 +374,24 @@ export async function flushOtlpSpans(params: {
     spans: params.spans,
   });
   const doFetch = params.fetchFn ?? fetch;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => {
+    ctrl.abort(new DOMException('OTLP export timed out', 'TimeoutError'));
+  }, 4_000);
+  (timer as { unref?: () => void }).unref?.();
   try {
     const res = await doFetch(tracesUrl, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(4_000),
+      signal: ctrl.signal,
     });
     await res.body?.cancel().catch(() => undefined);
     return res.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

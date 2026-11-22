@@ -1131,9 +1131,9 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return Response.json({ ok: true });
       }
-      const openApiRes = handleOpenApiRoute(request, url, '2.6.2');
+      const openApiRes = handleOpenApiRoute(request, url, '2.6.3');
       if (openApiRes) return openApiRes;
-      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.2');
+      const botRes = await handleBotTransparencyRoutes(request, url, env, '2.6.3');
       if (botRes) return botRes;
       if (url.pathname === '/agent/ws') {
         const auth = authorizeAgent(request, env);
@@ -1270,7 +1270,7 @@ export default {
       if (url.pathname === '/mcp') {
         return await handleMcpRequest(request, url, {
           serverName: 'edgefetch-hub',
-          serverVersion: '2.6.2',
+          serverVersion: '2.6.3',
           ownerSecret: env.CALLER_TOKEN,
           ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
           oauthStore,
@@ -1527,7 +1527,7 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
-          return Response.json(buildCapabilities(env, '2.6.2'), {
+          return Response.json(buildCapabilities(env, '2.6.3'), {
             status: 200,
             headers: { 'cache-control': 'no-store' },
           });

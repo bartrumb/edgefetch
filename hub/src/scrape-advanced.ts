@@ -132,7 +132,7 @@ function unwrapMarkdownLinksForScanLinear(s: string): string {
     work = work.replace(/\]\[[^\]\r\n]{0,200}\]/g, ']');
   }
   const stripWordBrackets = (txt: string): string =>
-    txt.includes('[') && /[A-Za-z]/.test(txt) ? txt.replace(/\[+([A-Za-z]{2,32})\]*/g, '$1') : txt;
+    txt.includes('[') && /\[[A-Za-z]{2}/.test(txt) ? txt.replace(/\[+([A-Za-z]{2,32})\]*/g, '$1') : txt;
 
   if (!work.includes('](') || !work.includes(')')) {
     return stripWordBrackets(work);
@@ -491,24 +491,26 @@ export function detectPromptInjection(params: {
 
   // 3. Full Markdown + code-span / fenced-block scan (`M11` & `R7`: single base normalization pass `< 15 ms` on `2 MiB`!)
   const scanSpaced = normalizeProseForInjectionScan(boundedMd, 'space');
-  const scanWordStream = /[\n|,$>#-]/.test(scanSpaced)
-    ? scanSpaced
-        .replace(/^\|?[ \t:-]+\|[ \t|:-]*$/gm, ' ')
-        .replace(/[^A-Za-z0-9.\s:]+/g, ' ')
-        .replace(/[ \t\r\n]+/g, ' ')
-    : scanSpaced;
-  const needsStrippedPass = /[\u115F\u1160\u3164\uFFA0`*_~]/.test(boundedMd);
-  const scanStripped = needsStrippedPass ? normalizeProseForInjectionScan(boundedMd, 'strip') : '';
+  if (/[A-Za-z]/.test(scanSpaced)) {
+    const scanWordStream = /[\n|,$>#-]/.test(scanSpaced)
+      ? scanSpaced
+          .replace(/^\|?[ \t:-]+\|[ \t|:-]*$/gm, ' ')
+          .replace(/[^A-Za-z0-9.\s:]+/g, ' ')
+          .replace(/[ \t\r\n]+/g, ' ')
+      : scanSpaced;
+    const needsStrippedPass = /[\u115F\u1160\u3164\uFFA0`*_~]/.test(boundedMd);
+    const scanStripped = needsStrippedPass ? normalizeProseForInjectionScan(boundedMd, 'strip') : '';
 
-  for (const pat of INJECTION_PATTERNS) {
-    if (
-      pat.re.test(scanSpaced) ||
-      pat.re.test(scanWordStream) ||
-      (scanStripped && pat.re.test(scanStripped)) ||
-      (pat.id === 'exfiltrate_secrets_or_tools' && pat.re.test(boundedMd))
-    ) {
-      triggers.push(pat.id);
-      totalScore += pat.weight;
+    for (const pat of INJECTION_PATTERNS) {
+      if (
+        pat.re.test(scanSpaced) ||
+        (scanWordStream !== scanSpaced && pat.re.test(scanWordStream)) ||
+        (scanStripped && pat.re.test(scanStripped)) ||
+        (pat.id === 'exfiltrate_secrets_or_tools' && pat.re.test(boundedMd))
+      ) {
+        triggers.push(pat.id);
+        totalScore += pat.weight;
+      }
     }
   }
 

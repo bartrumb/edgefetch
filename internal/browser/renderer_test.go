@@ -734,6 +734,32 @@ func TestResumedNavigateOriginScopingAndCrossOrigin302HeaderStripping(t *testing
 	}
 }
 
+func allowNoSandboxInTestOnRestrictedLinuxHost(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return
+	}
+	if linuxSandboxBlockedByHostPolicy() {
+		t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
+		return
+	}
+	for _, sysctlPath := range []string{
+		"/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+		"/proc/sys/user/max_user_namespaces",
+	} {
+		raw, err := os.ReadFile(sysctlPath)
+		if err != nil {
+			continue
+		}
+		val := strings.TrimSpace(string(raw))
+		if (strings.HasSuffix(sysctlPath, "apparmor_restrict_unprivileged_userns") && val == "1") ||
+			(strings.HasSuffix(sysctlPath, "max_user_namespaces") && val == "0") {
+			t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
+			return
+		}
+	}
+}
+
 func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *testing.T) {
 	args := buildChromiumLaunchArgsWithSandbox("127.0.0.1:8888", "/tmp/ef-prof", true)
 	var sawPipe, sawPort bool
@@ -756,6 +782,7 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live R6 pipe transport check")
 	}
+	allowNoSandboxInTestOnRestrictedLinuxHost(t)
 
 	r := NewRenderer(bin, func(*url.URL) error { return nil }, "EdgeFetch/2.7.0", 1, nil)
 	defer r.Close()
@@ -1595,9 +1622,7 @@ func TestR7LiveHeadlessChromeNestedSubframeNoReferrerAndPositiveControls(t *test
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live R7 nested subframe CDP test")
 	}
-	if runtime.GOOS == "linux" && linuxSandboxBlockedByHostPolicy() {
-		t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
-	}
+	allowNoSandboxInTestOnRestrictedLinuxHost(t)
 
 	type hitRecord struct {
 		Host   string
@@ -1853,9 +1878,7 @@ func TestV271LiveHeadlessChromeFormEnterSubmitClickNavSSRFAndNoEffect(t *testing
 	if bin == "" {
 		t.Skip("no headless Chromium/Chrome binary installed; skipping live v2.7.1 form Enter + ActionResult test")
 	}
-	if runtime.GOOS == "linux" && linuxSandboxBlockedByHostPolicy() {
-		t.Setenv("EDGEFETCH_ALLOW_NO_SANDBOX", "1")
-	}
+	allowNoSandboxInTestOnRestrictedLinuxHost(t)
 
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

@@ -488,7 +488,8 @@ test('R7-PI: Prompt-injection scanner catches all 58/58 Markdown & 20/20 HTML ev
     false,
   );
 
-  // 2 MiB linear CPU timing checks (formerly 100s O(N^2) -> < 25ms!)
+  // 2 MiB linear CPU timing checks (formerly 100s O(N^2) -> < 25ms; allow V8 coverage instrumentation overhead in CI)
+  const maxPiScanMs = process.env.NODE_V8_COVERAGE ? 80 : 40;
   for (const [label, payload] of [
     ['2MiB-brackets', '['.repeat(2 * 1024 * 1024)],
     ['2MiB-unclosed-links', '[a]('.repeat(524_288)],
@@ -496,7 +497,7 @@ test('R7-PI: Prompt-injection scanner catches all 58/58 Markdown & 20/20 HTML ev
     const t0 = performance.now();
     detectPromptInjection({ markdown: payload, rawHtml: '' });
     const dt = performance.now() - t0;
-    assert.ok(dt < 40, `Expected ${label} prompt-injection scan in < 40ms, took ${dt.toFixed(1)}ms`);
+    assert.ok(dt < maxPiScanMs, `Expected ${label} prompt-injection scan in < ${maxPiScanMs}ms, took ${dt.toFixed(1)}ms`);
   }
 });
 

@@ -480,8 +480,11 @@ export async function flushOtlpSpans(params: {
 
 const PROTECTED_ROUTE_SPAN_NAMES: ReadonlySet<string> = new Set([
   'edgefetch.scrape',
+  'edgefetch.batch_scrape',
+  'edgefetch.ingest_tab',
   'edgefetch.extract',
   'edgefetch.search',
+  'edgefetch.collection_search',
   'edgefetch.jobs',
   'edgefetch.catalog',
   'edgefetch.map',
@@ -492,6 +495,8 @@ const PROTECTED_ROUTE_SPAN_NAMES: ReadonlySet<string> = new Set([
   'edgefetch.fetch',
   'edgefetch.capabilities',
   'edgefetch.extractors',
+  'edgefetch.mcp_registry',
+  'edgefetch.mcp_query',
   'edgefetch.hosts',
   'edgefetch.artifacts',
   'edgefetch.mcp.tool',

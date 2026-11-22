@@ -88,6 +88,7 @@ func TestRendererLoopbackProxyBypassBlockedLiveIfChromeInstalled(t *testing.T) {
 	if chromeBin == "" {
 		t.Skip("Chromium/Chrome binary not installed on host; live container smoke runs in docker-multiarch CI")
 	}
+	allowNoSandboxInTestOnRestrictedLinuxHost(t)
 
 	var victimHits atomic.Int32
 	victim := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

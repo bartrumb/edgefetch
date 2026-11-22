@@ -15,6 +15,13 @@
 import type { HubEventRecord, McpClientActivity } from './activity-log';
 import type { AffinityPin, AgentAttachment, FetchTarget } from './agent-hub';
 import { MIN_TOKEN_LENGTH, SITE_ID_PATTERN, sameBytes } from './auth';
+import {
+  handleGitHubOAuthCallback,
+  isGitHubAuthConfigured,
+  resolveSessionSecret,
+  startGitHubOAuthFlow,
+  type GitHubAuthEnv,
+} from './github-auth';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
 import {
@@ -27,8 +34,11 @@ import {
   isSameOriginFormPost,
   sha256Base64Url,
   verifyAdminSessionCookie,
+  type AdminPrincipal,
+  type HubUserRecord,
   type OAuthGrantSummary,
   type OAuthStore,
+  type UserRole,
 } from './oauth';
 
 const RATE_LIMIT_WINDOW_MS = 5 * 60_000;
@@ -71,21 +81,31 @@ export interface AdminPortalDeps {
   sampleUrl?: string;
   publicOrigin?: string;
   ownerSecret?: string;
+  githubAuthEnv?: GitHubAuthEnv;
+  metaDb?: D1Database;
   oauthStore: OAuthStore;
   allowedTargets: FetchTarget[];
   defaultTarget: FetchTarget;
+  onEvent?: (ev: {
+    level: 'info' | 'warn' | 'error';
+    category: 'oauth';
+    event: string;
+    summary: string;
+    details?: Record<string, unknown>;
+  }) => Promise<void> | void;
   getState: () => Promise<{
     connected: number;
     distinctPublicIps?: number;
     agents: AgentAttachment[];
     affinities: AffinityPin[];
     grants: OAuthGrantSummary[];
+    users?: HubUserRecord[];
     mcpClients?: McpClientActivity[];
     events?: HubEventRecord[];
   }>;
   clearAffinities: (siteId?: string) => Promise<void>;
   clearEvents?: () => Promise<void>;
-  revokeGrant: (grantId: string) => Promise<boolean>;
+  revokeGrant: (grantId: string, userId?: string) => Promise<boolean>;
   executeFetch: (params: {
     target: FetchTarget;
     site?: string;
@@ -93,8 +113,26 @@ export interface AdminPortalDeps {
   }) => Promise<{ status: number; via: string; bodyText: string }>;
 }
 
-function renderLoginHtml(serviceName: string, errorMsg?: string): string {
+function renderLoginHtml(
+  serviceName: string,
+  errorMsg?: string,
+  opts: { githubEnabled?: boolean; ownerTokenEnabled?: boolean } = {},
+): string {
   const err = errorMsg ? `<div class="err">${escapeHtml(errorMsg)}</div>` : '';
+  const githubEnabled = Boolean(opts.githubEnabled);
+  const ownerTokenEnabled = opts.ownerTokenEnabled !== false;
+  const ghBlock = githubEnabled
+    ? `<a class="gh-btn" href="/admin/auth/github"><svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>Sign in with GitHub</a>`
+    : '';
+  const divider = githubEnabled && ownerTokenEnabled ? `<div class="divider"><span>or use owner token</span></div>` : '';
+  const tokenForm = ownerTokenEnabled
+    ? `<form method="post" action="/admin/login">
+      <label for="token">Caller Token</label>
+      <input id="token" name="token" type="password" required${githubEnabled ? '' : ' autofocus'} autocomplete="current-password" placeholder="Paste bearer token...">
+      <button type="submit">Open Control Center</button>
+    </form>`
+    : '';
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -111,19 +149,25 @@ function renderLoginHtml(serviceName: string, errorMsg?: string): string {
     input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font: inherit; margin-bottom: 16px; }
     button { width: 100%; padding: 10px 16px; border-radius: 8px; border: 1px solid #3b82f6; background: #2563eb; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
     button:hover { background: #1d4ed8; }
+    .gh-btn { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; box-sizing: border-box; padding: 10px 16px; border-radius: 8px; border: 1px solid #475569; background: #24292f; color: #fff; text-decoration: none; font-weight: 600; margin-bottom: 14px; }
+    .gh-btn:hover { background: #32383f; }
+    .divider { display: flex; align-items: center; gap: 10px; color: #94a3b8; font-size: 0.8rem; margin: 4px 0 14px; }
+    .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid #334155; }
     .err { background: #450a0a; border: 1px solid #dc2626; color: #fecaca; padding: 10px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 0.88rem; }
   </style>
 </head>
 <body>
   <main>
     <h1>${escapeHtml(serviceName)}</h1>
-    <p>Sign in with your hub caller token (<code>CALLER_TOKEN</code>) to view live crawl &amp; MCP logs, inspect remote sites, and manage OAuth grants.</p>
+    <p>${
+      githubEnabled
+        ? 'Sign in with GitHub or your hub caller token (<code>CALLER_TOKEN</code>) to manage MCP OAuth grants and view hub telemetry.'
+        : 'Sign in with your hub caller token (<code>CALLER_TOKEN</code>) to view live crawl &amp; MCP logs, inspect remote sites, and manage OAuth grants.'
+    }</p>
     ${err}
-    <form method="post" action="/admin/login">
-      <label for="token">Caller Token</label>
-      <input id="token" name="token" type="password" required autofocus autocomplete="current-password" placeholder="Paste bearer token...">
-      <button type="submit">Open Control Center</button>
-    </form>
+    ${ghBlock}
+    ${divider}
+    ${tokenForm}
   </main>
 </body>
 </html>`;
@@ -135,6 +179,7 @@ function renderDashboardHtml(params: {
   sampleUrl: string;
   origin: string;
   csrf: string;
+  principal?: Pick<AdminPrincipal, 'userId' | 'role' | 'githubLogin'>;
   allowedTargets: FetchTarget[];
   defaultTarget: FetchTarget;
 }): string {
@@ -231,6 +276,7 @@ function renderDashboardHtml(params: {
   <header>
     <h1>${escapeHtml(params.serviceName)} <span class="pill" id="conn-pill">Loading...</span></h1>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span class="chip" id="viewer-pill">${escapeHtml(params.principal?.githubLogin ? `@${params.principal.githubLogin} (${params.principal.role})` : `${params.principal?.userId ?? 'owner'} (${params.principal?.role ?? 'owner'})`)}</span>
       <span class="chip" title="Cloudflare Content Signals in robots.txt">Content Signals: honored (ai-input)</span>
       <span class="muted" id="last-poll">Live (15s)</span>
       <button type="button" id="refresh-btn">Refresh</button>
@@ -580,7 +626,7 @@ function renderDashboardHtml(params: {
 
       el('grants-tbody').innerHTML = grants.length
         ? grants.map((g) =>
-            '<tr><td><strong>' + esc(g.clientName) + '</strong></td><td><code>' + esc(g.scopes.join(' ')) + '</code></td><td>' + esc(relTime(g.expiresAt)) + '</td>' +
+            '<tr><td><strong>' + esc(g.clientName) + '</strong>' + (g.userId ? ' <span class="muted">(' + esc(g.userId) + ')</span>' : '') + '</td><td><code>' + esc(g.scopes.join(' ')) + '</code></td><td>' + esc(relTime(g.expiresAt)) + '</td>' +
             '<td><button type="button" class="danger" data-revoke="' + esc(g.grantId) + '">Revoke</button></td></tr>'
           ).join('')
         : '<tr><td colspan="4" class="muted">No OAuth 2.1 grants issued yet</td></tr>';
@@ -765,7 +811,16 @@ const NOOP_ADMIN_AUDIT_SPAN: AdminAuditSpan = {
 };
 
 async function withAdminAuditSpan<T>(
-  op: 'login' | 'logout' | 'events_clear' | 'affinity_clear' | 'grant_revoke' | 'fetch',
+  op:
+    | 'login'
+    | 'logout'
+    | 'github_login'
+    | 'github_callback'
+    | 'events_clear'
+    | 'affinity_clear'
+    | 'grant_revoke'
+    | 'user_role'
+    | 'fetch',
   fn: (span: AdminAuditSpan) => Promise<T>,
 ): Promise<T> {
   const tracer = getActiveRequestTracer();
@@ -779,13 +834,65 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   const isSecure = isEffectiveHttpsOrigin(url, deps.publicOrigin);
   const ownerSecret = deps.ownerSecret;
-  if (!ownerSecret || ownerSecret.length < MIN_TOKEN_LENGTH) {
+  const hasOwnerSecret = Boolean(ownerSecret && ownerSecret.length >= MIN_TOKEN_LENGTH);
+  const ghEnv: GitHubAuthEnv = {
+    ...(deps.githubAuthEnv ?? {}),
+    ...(ownerSecret ? { CALLER_TOKEN: ownerSecret } : {}),
+  };
+  const githubEnabled = isGitHubAuthConfigured(ghEnv);
+  const signingSecret = resolveSessionSecret(ghEnv) ?? (hasOwnerSecret ? ownerSecret : undefined);
+
+  if (path === '/admin/auth/github' && request.method === 'GET') {
+    return withAdminAuditSpan('github_login', async (span) => {
+      const started = await startGitHubOAuthFlow({
+        request,
+        url,
+        env: ghEnv,
+        publicOrigin: deps.publicOrigin,
+      });
+      span.setAttributes({
+        'admin.outcome': started.outcome,
+        'http.response.status_code': started.response.status,
+      });
+      if (started.response.status >= 400) {
+        span.setStatus(false, started.outcome);
+      }
+      return started.response;
+    });
+  }
+
+  if (path === '/admin/auth/github/callback' && request.method === 'GET') {
+    return withAdminAuditSpan('github_callback', async (span) => {
+      const cb = await handleGitHubOAuthCallback({
+        request,
+        url,
+        env: ghEnv,
+        oauthStore: deps.oauthStore,
+        ...(deps.metaDb ? { metaDb: deps.metaDb } : {}),
+        serviceName: deps.serviceName,
+        publicOrigin: deps.publicOrigin,
+        ...(deps.onEvent ? { onEvent: deps.onEvent } : {}),
+      });
+      span.setAttributes({
+        'admin.outcome': cb.outcome,
+        ...(cb.userId ? { 'admin.user_id': cb.userId } : {}),
+        ...(cb.role ? { 'admin.role': cb.role } : {}),
+        'http.response.status_code': cb.response.status,
+      });
+      if (cb.response.status >= 400) {
+        span.setStatus(false, cb.outcome);
+      }
+      return cb.response;
+    });
+  }
+
+  if (!signingSecret) {
     return adminJson({ error: 'owner_secret_unconfigured' }, 503);
   }
 
   const nowMs = Date.now();
-  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), ownerSecret, nowMs);
-  if (session.ok && (await isAdminSessionRevoked(deps.oauthStore, session.csrf, nowMs))) {
+  let session = await verifyAdminSessionCookie(request.headers.get('cookie'), signingSecret, nowMs);
+  if (session.ok && (await isAdminSessionRevoked(deps.oauthStore, session.csrf, nowMs, session.jti))) {
     session = { ok: false };
   }
 
@@ -795,7 +902,10 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   if (path === '/admin' && request.method === 'GET') {
     if (!session.ok) {
-      return new Response(renderLoginHtml(deps.serviceName), { status: 200, headers: ADMIN_HTML_HEADERS });
+      return new Response(
+        renderLoginHtml(deps.serviceName, undefined, { githubEnabled, ownerTokenEnabled: hasOwnerSecret }),
+        { status: 200, headers: ADMIN_HTML_HEADERS },
+      );
     }
     return new Response(
       renderDashboardHtml({
@@ -804,6 +914,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         sampleUrl: deps.sampleUrl ?? 'https://example.com/',
         origin: url.origin,
         csrf: session.csrf,
+        principal: {
+          userId: session.userId,
+          role: session.role,
+          ...(session.githubLogin ? { githubLogin: session.githubLogin } : {}),
+        },
         allowedTargets: deps.allowedTargets,
         defaultTarget: deps.defaultTarget,
       }),
@@ -813,16 +928,30 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   if (path === '/admin/login' && request.method === 'POST') {
     return withAdminAuditSpan('login', async (span) => {
+      if (!hasOwnerSecret || !ownerSecret) {
+        span.setAttributes({ 'admin.outcome': 'owner_token_disabled', 'http.response.status_code': 403 });
+        span.setStatus(false, 'owner_token_disabled');
+        return new Response(
+          renderLoginHtml(deps.serviceName, 'Caller token login is disabled; sign in with GitHub.', {
+            githubEnabled,
+            ownerTokenEnabled: false,
+          }),
+          { status: 403, headers: ADMIN_HTML_HEADERS },
+        );
+      }
       const now = Date.now();
       const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
       const cappedForm = await readBodyTextCapped(request, 8_192);
       if (!cappedForm.ok) {
         span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': 413 });
         span.setStatus(false, 'payload_too_large');
-        return new Response(renderLoginHtml(deps.serviceName, 'Login payload too large.'), {
-          status: 413,
-          headers: ADMIN_HTML_HEADERS,
-        });
+        return new Response(
+          renderLoginHtml(deps.serviceName, 'Login payload too large.', { githubEnabled, ownerTokenEnabled: hasOwnerSecret }),
+          {
+            status: 413,
+            headers: ADMIN_HTML_HEADERS,
+          },
+        );
       }
       const supplied = (new URLSearchParams(cappedForm.text).get('token') ?? '').trim();
       // `R3-M4`: Verify constant-time `CALLER_TOKEN` match FIRST so an attacker spoofing `X-Forwarded-For` or sharing a
@@ -832,36 +961,51 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (!preLock.allowed) {
           span.setAttributes({ 'admin.outcome': 'rate_limited', 'http.response.status_code': 429 });
           span.setStatus(false, 'rate_limited');
-          return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
-            status: 429,
-            headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
-          });
+          return new Response(
+            renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.', {
+              githubEnabled,
+              ownerTokenEnabled: hasOwnerSecret,
+            }),
+            {
+              status: 429,
+              headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+            },
+          );
         }
         const rl = await deps.oauthStore.recordAuthFailure(`admin:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
         if (!rl.allowed) {
           span.setAttributes({ 'admin.outcome': 'rate_limited', 'http.response.status_code': 429 });
           span.setStatus(false, 'rate_limited');
-          return new Response(renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.'), {
-            status: 429,
-            headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(rl.retryAfterSec) },
-          });
+          return new Response(
+            renderLoginHtml(deps.serviceName, 'Too many failed attempts. Try again in 5 minutes.', {
+              githubEnabled,
+              ownerTokenEnabled: hasOwnerSecret,
+            }),
+            {
+              status: 429,
+              headers: { ...ADMIN_HTML_HEADERS, 'retry-after': String(rl.retryAfterSec) },
+            },
+          );
         }
         span.setAttributes({ 'admin.outcome': 'unauthorized', 'http.response.status_code': 401 });
         span.setStatus(false, 'unauthorized');
-        return new Response(renderLoginHtml(deps.serviceName, 'Invalid caller token.'), {
-          status: 401,
-          headers: ADMIN_HTML_HEADERS,
-        });
+        return new Response(
+          renderLoginHtml(deps.serviceName, 'Invalid caller token.', { githubEnabled, ownerTokenEnabled: hasOwnerSecret }),
+          {
+            status: 401,
+            headers: ADMIN_HTML_HEADERS,
+          },
+        );
       }
 
       await deps.oauthStore.clearAuthFailures(`admin:${clientIp}`);
-      const minted = await createAdminSessionValue(ownerSecret);
+      const minted = await createAdminSessionValue(signingSecret);
       const headers = new Headers({
         location: '/admin',
         ...ADMIN_JSON_HEADERS,
       });
       headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, minted.value, { maxAge: minted.maxAgeSec, path: '/', sameSite: 'Lax', secure: isSecure }));
-      span.setAttributes({ 'admin.outcome': 'authenticated', 'http.response.status_code': 302 });
+      span.setAttributes({ 'admin.outcome': 'authenticated', 'admin.user_id': 'owner', 'http.response.status_code': 302 });
       return new Response(null, { status: 302, headers });
     });
   }
@@ -875,17 +1019,26 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         span.setStatus(false, 'invalid_csrf');
         return adminJson({ error: 'invalid_csrf' }, 403);
       }
-      // Server-side revocation of this exact admin session cookie (`Low`): store SHA-256 hash so raw CSRF token is never stored in cleartext!
+      // Server-side revocation of this exact admin session cookie (`Low`): revoke both `csrf` AND JWT `jti`!
       if (typeof deps.oauthStore.recordAuthFailure === 'function') {
+        const nowRevoke = Date.now();
         const csrfHash = await sha256Base64Url(session.csrf);
-        await deps.oauthStore.recordAuthFailure(`revoked_admin:${csrfHash}`, Date.now(), 8 * 60 * 60_000, 1);
+        await deps.oauthStore.recordAuthFailure(`revoked_admin:${csrfHash}`, nowRevoke, 8 * 60 * 60_000, 1);
+        if (session.jti) {
+          const jtiHash = await sha256Base64Url(session.jti);
+          await deps.oauthStore.recordAuthFailure(`revoked_admin:jti:${jtiHash}`, nowRevoke, 8 * 60 * 60_000, 1);
+        }
       }
       const headers = new Headers({
         location: '/admin',
         ...ADMIN_JSON_HEADERS,
       });
       headers.append('set-cookie', formatCookie(ADMIN_COOKIE_NAME, '', { maxAge: 0, path: '/', sameSite: 'Lax', secure: isSecure }));
-      span.setAttributes({ 'admin.outcome': 'logged_out', 'http.response.status_code': 302 });
+      span.setAttributes({
+        'admin.outcome': 'logged_out',
+        'admin.user_id': session.userId,
+        'http.response.status_code': 302,
+      });
       return new Response(null, { status: 302, headers });
     });
   }
@@ -898,9 +1051,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           ? ('affinity_clear' as const)
           : path === '/admin/api/grants/revoke'
             ? ('grant_revoke' as const)
-            : path === '/admin/api/fetch'
-              ? ('fetch' as const)
-              : null
+            : path === '/admin/api/users/role'
+              ? ('user_role' as const)
+              : path === '/admin/api/fetch'
+                ? ('fetch' as const)
+                : null
       : null;
 
   if (!session.ok) {
@@ -916,7 +1071,30 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
   if (path === '/admin/api/state' && request.method === 'GET') {
     const state = await deps.getState();
-    return adminJson(state, 200);
+    const viewer = {
+      userId: session.userId,
+      role: session.role,
+      ...(session.githubLogin ? { githubLogin: session.githubLogin } : {}),
+      ...(session.avatarUrl ? { avatarUrl: session.avatarUrl } : {}),
+    };
+    if (session.role !== 'owner') {
+      const ownGrants = (state.grants ?? []).filter((g) => (g.userId ?? 'owner') === session.userId);
+      return adminJson(
+        {
+          viewer,
+          connected: state.connected,
+          agents: [],
+          affinities: [],
+          grants: ownGrants,
+          mcpClients: [],
+          events: [],
+          users: [],
+        },
+        200,
+      );
+    }
+    const users = state.users ?? (await deps.oauthStore.listUsers?.()) ?? [];
+    return adminJson({ ...state, viewer, users }, 200);
   }
 
   if (request.method === 'POST') {
@@ -930,6 +1108,90 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         });
       }
       return adminJson({ error: 'invalid_csrf' }, 403);
+    }
+
+    if (path === '/admin/api/grants/revoke') {
+      return withAdminAuditSpan('grant_revoke', async (span) => {
+        const capped = await readBodyTextCapped(request, 65_536);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
+        }
+        let body: { grantId?: string } = {};
+        if (capped.text.trim()) {
+          try {
+            body = JSON.parse(capped.text) as { grantId?: string };
+          } catch {
+            body = {};
+          }
+        }
+        if (!body.grantId || typeof body.grantId !== 'string') {
+          span.setAttributes({ 'admin.outcome': 'missing_grant_id', 'http.response.status_code': 400 });
+          span.setStatus(false, 'missing_grant_id');
+          return adminJson({ error: 'missing_grant_id' }, 400);
+        }
+        const scopedUserId = session.role === 'owner' ? undefined : session.userId;
+        const revoked = await deps.revokeGrant(body.grantId, scopedUserId);
+        span.setAttributes({
+          'admin.grant_id': body.grantId,
+          'admin.user_id': session.userId,
+          'admin.revoked': revoked,
+          'admin.outcome': revoked ? 'revoked' : 'not_found',
+          'http.response.status_code': 200,
+        });
+        return adminJson({ ok: true, revoked }, 200);
+      });
+    }
+
+    // All remaining `/admin/api/*` mutations (`events/clear`, `affinity/clear`, `users/role`, `fetch`) are owner-only!
+    if (session.role !== 'owner') {
+      if (apiOp) {
+        return withAdminAuditSpan(apiOp, async (span) => {
+          span.setAttributes({
+            'admin.user_id': session.userId,
+            'admin.outcome': 'forbidden_role',
+            'http.response.status_code': 403,
+          });
+          span.setStatus(false, 'forbidden_role');
+          return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
+        });
+      }
+      return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
+    }
+
+    if (path === '/admin/api/users/role') {
+      return withAdminAuditSpan('user_role', async (span) => {
+        const capped = await readBodyTextCapped(request, 16_384);
+        if (!capped.ok) {
+          const st = capped.error === 'too_large' ? 413 : 400;
+          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
+          span.setStatus(false, 'payload_too_large');
+          return adminJson({ error: 'payload_too_large' }, st);
+        }
+        let body: { userId?: string; role?: string } = {};
+        try {
+          body = JSON.parse(capped.text || '{}') as typeof body;
+        } catch {
+          body = {};
+        }
+        const targetUserId = typeof body.userId === 'string' ? body.userId.trim() : '';
+        const targetRole: UserRole | null = body.role === 'owner' ? 'owner' : body.role === 'member' ? 'member' : null;
+        if (!targetUserId || !targetRole) {
+          span.setAttributes({ 'admin.outcome': 'invalid_params', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_params');
+          return adminJson({ error: 'invalid_params' }, 400);
+        }
+        const updated = (await deps.oauthStore.updateUserRole?.(targetUserId, targetRole)) ?? false;
+        span.setAttributes({
+          'admin.target_user_id': targetUserId,
+          'admin.target_role': targetRole,
+          'admin.outcome': updated ? 'updated' : 'not_found',
+          'http.response.status_code': updated ? 200 : 404,
+        });
+        return adminJson({ ok: updated, userId: targetUserId, role: targetRole }, updated ? 200 : 404);
+      });
     }
 
     if (path === '/admin/api/events/clear') {
@@ -964,39 +1226,6 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           'http.response.status_code': 200,
         });
         return adminJson({ ok: true }, 200);
-      });
-    }
-
-    if (path === '/admin/api/grants/revoke') {
-      return withAdminAuditSpan('grant_revoke', async (span) => {
-        const capped = await readBodyTextCapped(request, 65_536);
-        if (!capped.ok) {
-          const st = capped.error === 'too_large' ? 413 : 400;
-          span.setAttributes({ 'admin.outcome': 'payload_too_large', 'http.response.status_code': st });
-          span.setStatus(false, 'payload_too_large');
-          return adminJson({ error: 'payload_too_large' }, st);
-        }
-        let body: { grantId?: string } = {};
-        if (capped.text.trim()) {
-          try {
-            body = JSON.parse(capped.text) as { grantId?: string };
-          } catch {
-            body = {};
-          }
-        }
-        if (!body.grantId || typeof body.grantId !== 'string') {
-          span.setAttributes({ 'admin.outcome': 'missing_grant_id', 'http.response.status_code': 400 });
-          span.setStatus(false, 'missing_grant_id');
-          return adminJson({ error: 'missing_grant_id' }, 400);
-        }
-        const revoked = await deps.revokeGrant(body.grantId);
-        span.setAttributes({
-          'admin.grant_id': body.grantId,
-          'admin.revoked': revoked,
-          'admin.outcome': revoked ? 'revoked' : 'not_found',
-          'http.response.status_code': 200,
-        });
-        return adminJson({ ok: true, revoked }, 200);
       });
     }
 

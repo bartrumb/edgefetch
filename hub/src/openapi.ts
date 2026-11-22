@@ -290,13 +290,60 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           operationId: 'getOAuthAuthorizationServer',
           summary: 'Get RFC 8414 OAuth 2.1 Authorization Server metadata',
           description:
-            'Advertises `/oauth/authorize`, `/oauth/token`, `/oauth/register` (RFC 7591 Dynamic Client Registration), `/oauth/revoke`, and mandatory `S256` PKCE support.',
+            'Advertises `/oauth/authorize`, `/oauth/token`, `/oauth/register` (RFC 7591 Dynamic Client Registration), `/oauth/revoke`, and mandatory `S256` PKCE support (with optional multi-user Sign in with GitHub).',
           security: [],
           responses: {
             '200': {
               description: 'OAuth 2.1 Authorization Server metadata.',
               content: jsonContent(schemaRef('OAuthAuthorizationServerMetadata')),
             },
+          },
+        },
+      },
+      '/admin/auth/github': {
+        get: {
+          tags: ['Discovery'],
+          operationId: 'startGitHubOAuthLogin',
+          summary: 'Start Sign in with GitHub OAuth 2.0 + PKCE S256 login',
+          description:
+            'Initiates an `oauth4webapi` OAuth 2.0 + PKCE (`S256`) + sealed `state` cookie redirect to GitHub (`https://github.com/login/oauth/authorize`) for `/admin` and `/oauth/authorize` multi-user authentication.',
+          security: [],
+          parameters: [
+            {
+              name: 'return_to',
+              in: 'query',
+              required: false,
+              description: 'Optional relative Hub path (`/admin` or `/oauth/authorize?...`) to return to after sign-in.',
+              schema: { type: 'string' },
+            },
+          ],
+          responses: {
+            '302': {
+              description: 'Redirect to GitHub OAuth 2.0 authorization endpoint.',
+            },
+            '503': {
+              description: 'GitHub OAuth (`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`) is not configured on this Hub.',
+              content: jsonContent(schemaRef('ErrorResponse')),
+            },
+          },
+        },
+      },
+      '/admin/auth/github/callback': {
+        get: {
+          tags: ['Discovery'],
+          operationId: 'completeGitHubOAuthCallback',
+          summary: 'Complete Sign in with GitHub OAuth 2.0 callback',
+          description:
+            'Validates OAuth `state` + PKCE `S256`, verifies `SIGNUP_MODE` (`invite_only` default) + `GITHUB_ALLOWED_USERS` (`login` or `@org`) + `GITHUB_OWNER_LOGIN`, and issues an `HS256` `jose` session JWT cookie.',
+          security: [],
+          parameters: [
+            { name: 'code', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'state', in: 'query', required: false, schema: { type: 'string' } },
+          ],
+          responses: {
+            '302': { description: 'Authenticated session cookie issued; redirecting back to Hub UI.' },
+            '400': { description: 'Missing/invalid state cookie or OAuth callback error.' },
+            '403': { description: 'GitHub account is not authorized under `SIGNUP_MODE` / `GITHUB_ALLOWED_USERS`.' },
           },
         },
       },
@@ -397,6 +444,13 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
               in: 'query',
               required: false,
               schema: { type: 'string', enum: ['transient', 'stored'] },
+            },
+            {
+              name: 'visibility',
+              in: 'query',
+              required: false,
+              description: 'Set to `private` to read strictly from the authenticated user’s `private/<userId>/...` R2 namespace.',
+              schema: { type: 'string', enum: ['public', 'private'] },
             },
             {
               name: 'offset',
@@ -1406,6 +1460,11 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             html: { type: 'string', description: 'Captured DOM HTML (up to 4 MiB).' },
             markdown: { type: 'string', description: 'Pre-extracted Markdown when HTML is omitted.' },
             collectionId: { type: 'string', default: 'default', description: 'Target SEARCH D1 FTS5 collection ID.' },
+            visibility: {
+              type: 'string',
+              enum: ['public', 'private'],
+              description: 'Artifact & FTS5 collection isolation (`private` namespaces R2 & FTS5 under the authenticated `userId`).',
+            },
             onlyMainContent: { type: 'boolean', default: true },
           },
           required: ['url'],

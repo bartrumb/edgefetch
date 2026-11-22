@@ -40,7 +40,7 @@ import {
   type TraceContext,
 } from './otel';
 import { executeInteractCall, executeScrapeCall, extractStructuredJsonFromPage, type ScrapeRequestPayload } from './scrape';
-import { D1FtsSearchIndex } from './search-index';
+import { D1FtsSearchIndex, resolveUserCollectionId } from './search-index';
 import type { OptionalStorageBindings } from './storage';
 import { executeSearchCall, type SearchBindings, type SearchRequestPayload } from './web-search';
 
@@ -62,6 +62,7 @@ export interface AgentTraceSpan {
 
 export interface AgentRunRecord {
   id: string;
+  userId?: string;
   threadId: string;
   status: AgentStatus;
   stopReason?: AgentStopReason;
@@ -224,12 +225,15 @@ export function findRelevantAdapters(params: {
   return scored.slice(0, Math.max(1, Math.min(50, limit)));
 }
 
+const migratedAgentDbs = new WeakSet<D1Database>();
+
 async function ensureAgentRunsTable(metaDb?: D1Database): Promise<void> {
   if (!metaDb) return;
   await metaDb
     .prepare(
       `CREATE TABLE IF NOT EXISTS agent_runs (
          id TEXT PRIMARY KEY,
+         user_id TEXT NOT NULL DEFAULT 'owner',
          thread_id TEXT NOT NULL,
          status TEXT NOT NULL,
          record_json TEXT NOT NULL,
@@ -240,6 +244,13 @@ async function ensureAgentRunsTable(metaDb?: D1Database): Promise<void> {
     )
     .run()
     .catch(() => undefined);
+  if (!migratedAgentDbs.has(metaDb)) {
+    migratedAgentDbs.add(metaDb);
+    await metaDb
+      .prepare("ALTER TABLE agent_runs ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'")
+      .run()
+      .catch(() => undefined);
+  }
 }
 
 async function persistAgentRun(record: AgentRunRecord, metaDb?: D1Database): Promise<void> {
@@ -256,8 +267,8 @@ async function persistAgentRun(record: AgentRunRecord, metaDb?: D1Database): Pro
     await ensureAgentRunsTable(metaDb);
     await metaDb
       .prepare(
-        `INSERT OR REPLACE INTO agent_runs (id, thread_id, status, record_json, created_at, updated_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO agent_runs (id, thread_id, status, record_json, created_at, updated_at, expires_at, user_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         record.id,
@@ -267,19 +278,23 @@ async function persistAgentRun(record: AgentRunRecord, metaDb?: D1Database): Pro
         record.createdAt,
         record.updatedAt,
         record.expiresAt,
+        record.userId ?? 'owner',
       )
       .run()
       .catch(() => undefined);
   }
 }
 
-export async function loadAgentRun(agentId: string, metaDb?: D1Database): Promise<AgentRunRecord | null> {
+export async function loadAgentRun(agentId: string, metaDb?: D1Database, callerUserId?: string): Promise<AgentRunRecord | null> {
   const now = Date.now();
   const mem = inMemoryAgentRuns.get(agentId);
   if (mem) {
     if (mem.expiresAt <= now) {
       inMemoryAgentRuns.delete(agentId);
     } else {
+      if (callerUserId !== undefined && (mem.userId ?? 'owner') !== callerUserId) {
+        return null;
+      }
       return mem;
     }
   }
@@ -294,18 +309,25 @@ export async function loadAgentRun(agentId: string, metaDb?: D1Database): Promis
   try {
     const parsed = JSON.parse(row.record_json) as AgentRunRecord;
     inMemoryAgentRuns.set(agentId, parsed);
+    if (callerUserId !== undefined && (parsed.userId ?? 'owner') !== callerUserId) {
+      return null;
+    }
     return parsed;
   } catch {
     return null;
   }
 }
 
-export async function cancelAgentRun(agentId: string, metaDb?: D1Database): Promise<{ ok: boolean; status: number }> {
-  cancelledAgentIds.add(agentId);
-  const existing = await loadAgentRun(agentId, metaDb);
+export async function cancelAgentRun(
+  agentId: string,
+  metaDb?: D1Database,
+  callerUserId?: string,
+): Promise<{ ok: boolean; status: number }> {
+  const existing = await loadAgentRun(agentId, metaDb, callerUserId);
   if (!existing) {
     return { ok: false, status: 404 };
   }
+  cancelledAgentIds.add(agentId);
   if (existing.status === 'queued' || existing.status === 'processing') {
     existing.status = 'cancelled';
     existing.stopReason = 'cancelled';
@@ -521,6 +543,8 @@ export async function startOrExecuteAgentCall(params: {
   executeHubFetch: HubFetchExecutor;
   selfHost?: string;
   principal?: string;
+  userId?: string;
+  sessionSigningSecret?: string;
   waitUntil?: (p: Promise<unknown>) => void;
   wantSseStream?: boolean;
   llmFetchFn?: typeof fetch;
@@ -529,7 +553,18 @@ export async function startOrExecuteAgentCall(params: {
   | { kind: 'json'; status: number; body: Record<string, unknown> }
   | { kind: 'sse'; response: Response }
 > {
-  const { payload, env, executeHubFetch, selfHost, principal = 'api', waitUntil, wantSseStream = false, llmFetchFn } = params;
+  const {
+    payload,
+    env,
+    executeHubFetch,
+    selfHost,
+    principal = 'api',
+    userId = 'owner',
+    sessionSigningSecret,
+    waitUntil,
+    wantSseStream = false,
+    llmFetchFn,
+  } = params;
   const agentTracer = getActiveRequestTracer(params.tracer);
 
   const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
@@ -629,11 +664,11 @@ export async function startOrExecuteAgentCall(params: {
   const acceptLanguageHeader = languages.length > 0 ? languages.join(', ') : undefined;
 
   const requestedThreadId = typeof payload.threadId === 'string' && payload.threadId.trim() ? payload.threadId.trim() : undefined;
-  const priorThread = requestedThreadId && !zeroDataRetention ? await loadAgentRun(requestedThreadId, env.META) : null;
+  const priorThread = requestedThreadId && !zeroDataRetention ? await loadAgentRun(requestedThreadId, env.META, userId) : null;
 
   const now = Date.now();
   const agentId = `agt_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-  const threadId = priorThread?.threadId ?? requestedThreadId ?? agentId;
+  const threadId = priorThread?.threadId ?? (requestedThreadId && priorThread ? requestedThreadId : agentId);
 
   // Route initial relevant adapters via `<1 ms` BM25 + domain + category router
   const routerStart = Date.now();
@@ -657,6 +692,7 @@ export async function startOrExecuteAgentCall(params: {
 
   const record: AgentRunRecord = {
     id: agentId,
+    userId,
     threadId,
     status: 'processing',
     prompt,
@@ -836,6 +872,7 @@ export async function startOrExecuteAgentCall(params: {
             env,
             executeHubFetch,
             source: `agent:${principal}:search`,
+            userId,
             ...(sTracer ? { tracer: sTracer } : {}),
           });
           const results = Array.isArray(sOut.body.results) ? (sOut.body.results as Array<Record<string, unknown>>) : [];
@@ -894,6 +931,7 @@ export async function startOrExecuteAgentCall(params: {
                 env,
                 executeHubFetch,
                 source: `agent:${principal}:jobs-search`,
+                userId,
                 ...(getLoopTracer() ? { tracer: getLoopTracer()! } : {}),
               });
               return { status: sRes.status, body: sRes.body };
@@ -907,6 +945,7 @@ export async function startOrExecuteAgentCall(params: {
                 env: zeroDataRetention ? {} : env,
                 executeHubFetch,
                 selfHost,
+                userId,
                 source: `agent:${principal}:jobs-scrape`,
                 ...(getLoopTracer() ? { tracer: getLoopTracer()! } : {}),
               });
@@ -1013,6 +1052,9 @@ export async function startOrExecuteAgentCall(params: {
             env: zeroDataRetention ? {} : env,
             executeHubFetch,
             selfHost,
+            principal,
+            userId,
+            ...(sessionSigningSecret ? { sessionSigningSecret } : {}),
             source: `agent:${principal}:interact`,
             ...(iTracer ? { tracer: iTracer } : {}),
           });
@@ -1044,7 +1086,12 @@ export async function startOrExecuteAgentCall(params: {
       }
 
       if (toolName === 'search_collection' && env.SEARCH) {
-        const collId = typeof args.collectionId === 'string' && args.collectionId.trim() ? args.collectionId.trim() : 'default';
+        const rawCollId = typeof args.collectionId === 'string' && args.collectionId.trim() ? args.collectionId.trim() : 'default';
+        const resolvedColl = resolveUserCollectionId(rawCollId, userId);
+        if (!resolvedColl.ok) {
+          return { ok: false, summaryForLlm: JSON.stringify({ error: resolvedColl.error }) };
+        }
+        const collId = resolvedColl.scopedId;
         const q = typeof args.query === 'string' ? args.query : prompt;
         return withToolSpan(async (toolSpan) => {
           const idx = new D1FtsSearchIndex(env.SEARCH!);
@@ -1063,7 +1110,7 @@ export async function startOrExecuteAgentCall(params: {
             status: 'ok',
             startedAt: t0,
             durationMs: Date.now() - t0,
-            input: { collectionId: collId, query: q },
+            input: { collectionId: resolvedColl.displayId, query: q },
             outputPreview: { hitCount: hits.length },
           });
           return { ok: true, summaryForLlm: JSON.stringify(hits, null, 2).slice(0, 6_000) };
@@ -1097,6 +1144,7 @@ export async function startOrExecuteAgentCall(params: {
           env: zeroDataRetention ? {} : env,
           executeHubFetch,
           selfHost,
+          userId,
           source: `agent:${principal}:scrape`,
           ...(scTracer ? { tracer: scTracer } : {}),
         });

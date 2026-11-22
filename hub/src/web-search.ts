@@ -31,7 +31,7 @@ import {
   type TraceContext,
 } from './otel';
 import { decodeHtmlEntities } from './scrape';
-import { COLLECTION_ID_RE, D1FtsSearchIndex, executeExtractCall } from './search-index';
+import { D1FtsSearchIndex, executeExtractCall, resolveUserCollectionId } from './search-index';
 import type { OptionalStorageBindings } from './storage';
 
 const RRF_K = 60;
@@ -805,11 +805,12 @@ export async function executeSearchCall(params: {
   executeHubFetch: HubFetchExecutor;
   providerFetchFn?: typeof fetch;
   source?: string;
+  userId?: string;
   tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runSearchCall = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
-  const { payload, env, executeHubFetch, source = 'search' } = params;
+  const { payload, env, executeHubFetch, source = 'search', userId = 'owner' } = params;
   const providerFetchFn = params.providerFetchFn ?? fetch;
   const enforcePacing = params.providerFetchFn === undefined;
 
@@ -859,13 +860,23 @@ export async function executeSearchCall(params: {
 
   const explicitCollectionsPassed = payload.collectionId !== undefined || Array.isArray(payload.collections) || payload.collections === false;
   const requestedCollections: string[] = [];
-  if (typeof payload.collectionId === 'string' && COLLECTION_ID_RE.test(payload.collectionId.trim())) {
-    requestedCollections.push(payload.collectionId.trim());
+  if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {
+    const resolved = resolveUserCollectionId(payload.collectionId, userId);
+    if (!resolved.ok && resolved.status === 403) {
+      return { status: 403, via: 'hub', body: { ok: false, error: 'forbidden_collection', message: 'Unauthorized collectionId' } };
+    }
+    if (resolved.ok) requestedCollections.push(resolved.scopedId);
   }
   if (Array.isArray(payload.collections)) {
     for (const c of payload.collections) {
-      if (typeof c === 'string' && COLLECTION_ID_RE.test(c.trim()) && !requestedCollections.includes(c.trim())) {
-        requestedCollections.push(c.trim());
+      if (typeof c === 'string' && c.trim()) {
+        const resolved = resolveUserCollectionId(c, userId);
+        if (!resolved.ok && resolved.status === 403) {
+          return { status: 403, via: 'hub', body: { ok: false, error: 'forbidden_collection', message: 'Unauthorized collectionId' } };
+        }
+        if (resolved.ok && !requestedCollections.includes(resolved.scopedId)) {
+          requestedCollections.push(resolved.scopedId);
+        }
       }
     }
   }
@@ -882,7 +893,8 @@ export async function executeSearchCall(params: {
 
   // Always consult the Edge-crawled default D1 FTS5 collection at $0 when SEARCH D1 is bound unless disabled/overridden.
   if (hasD1Search && !explicitCollectionsPassed) {
-    requestedCollections.push('default');
+    const defColl = resolveUserCollectionId('default', userId);
+    if (defColl.ok) requestedCollections.push(defColl.scopedId);
   }
 
   const edgeMapSpec = extractEdgeMapDomains(query, includeDomains);

@@ -12,6 +12,14 @@ AGENT_TOKENS={"site-1":"replace-with-32-char-random-secret"}
 # TAVILY_API_KEY=
 # SEARXNG_URL=
 
+# Optional: Multi-User Sign in with GitHub (/admin & /oauth/authorize)
+# GITHUB_CLIENT_ID=
+# GITHUB_CLIENT_SECRET=
+# GITHUB_OWNER_LOGIN=
+# GITHUB_ALLOWED_USERS=octocat,@your-org
+# SIGNUP_MODE=invite_only
+# SESSION_SECRET=
+
 # Optional: Vendor-Agnostic OpenTelemetry Collector (Honeycomb, Grafana Tempo, Jaeger, Axiom, SigNoz)
 # OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io
 # OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=replace-with-key

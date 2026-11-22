@@ -37,7 +37,7 @@ import {
   SCRAPE_PIPELINE_VERSION,
   tryParseJsonPayloadForScrape,
 } from './scrape';
-import { COLLECTION_ID_RE } from './search-index';
+import { COLLECTION_ID_RE, INTERNAL_COLLECTION_ID_RE } from './search-index';
 import { r2DerivedKey, readVerifiedArtifactFromR2, type ArtifactRetention, type OptionalStorageBindings } from './storage';
 
 export type HubFetchExecutor = (
@@ -1237,7 +1237,7 @@ export async function createCrawlJob(params: {
     ...(delayMs !== undefined ? { delayMs } : {}),
     includePaths: incCheck.patterns,
     excludePaths: excCheck.patterns,
-    ...(COLLECTION_ID_RE.test(rawColl) ? { collectionId: rawColl } : {}),
+    ...(COLLECTION_ID_RE.test(rawColl) || INTERNAL_COLLECTION_ID_RE.test(rawColl) ? { collectionId: rawColl } : {}),
     ...(payload.renderMode === 'auto' || payload.renderMode === 'always' || payload.renderMode === 'off'
       ? { renderMode: payload.renderMode }
       : {}),

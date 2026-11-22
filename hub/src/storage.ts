@@ -11,6 +11,7 @@ import { encodeBodyForWire } from './overflow';
 import { listConfiguredSpaFallbacks, type SpaFallbackEnv, type SpaFallbackProvider } from './spa-fallback';
 
 export type ArtifactRetention = 'transient' | 'stored';
+export type ArtifactVisibility = 'public' | 'private';
 
 export interface IngestWorkflowParams {
   manifestKey: string;
@@ -96,6 +97,102 @@ export function r2DerivedKey(pipelineVersion: number, format: string, contentSha
     throw new Error('invalid contentSha256');
   }
   return `derived/${pipelineVersion}/${format}/${contentSha256}`;
+}
+
+export function sanitizeStorageUserId(userId?: string): string {
+  const trimmed = typeof userId === 'string' ? userId.trim() : '';
+  if (!trimmed) return 'owner';
+  const cleaned = trimmed.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
+  return cleaned || 'owner';
+}
+
+const SENSITIVE_REQUEST_HEADER_NAMES = new Set([
+  'authorization',
+  'cookie',
+  'proxy-authorization',
+  'x-api-key',
+  'x-auth-token',
+]);
+
+export function normalizeVisibility(raw: unknown, headers?: unknown): ArtifactVisibility {
+  if (typeof raw === 'string') {
+    const lower = raw.trim().toLowerCase();
+    if (lower === 'private') return 'private';
+    if (lower === 'public') return 'public';
+  }
+  if (headers && typeof headers === 'object' && !Array.isArray(headers)) {
+    for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+      if (SENSITIVE_REQUEST_HEADER_NAMES.has(k.trim().toLowerCase()) && typeof v === 'string' && v.trim().length > 0) {
+        return 'private';
+      }
+    }
+  }
+  return 'public';
+}
+
+export function r2PrivateArtifactKey(userId: string, retention: ArtifactRetention, blobSha256: string): string {
+  if (!isValidSha256Hex(blobSha256)) {
+    throw new Error('invalid blobSha256 (expected 64 lowercase hex characters)');
+  }
+  const safeUser = sanitizeStorageUserId(userId);
+  const prefix = retention === 'stored' ? 'raw' : 'tmp';
+  return `private/${safeUser}/${prefix}/sha256/${blobSha256.slice(0, 2)}/${blobSha256}.gz`;
+}
+
+export function r2PrivateDerivedKey(
+  userId: string,
+  pipelineVersion: number,
+  format: string,
+  contentSha256: string,
+): string {
+  if (!Number.isInteger(pipelineVersion) || pipelineVersion < 1) {
+    throw new Error('invalid pipelineVersion');
+  }
+  if (!/^[a-z0-9_-]{1,24}$/.test(format)) {
+    throw new Error('invalid derived format');
+  }
+  if (!isValidSha256Hex(contentSha256)) {
+    throw new Error('invalid contentSha256');
+  }
+  const safeUser = sanitizeStorageUserId(userId);
+  return `private/${safeUser}/derived/${pipelineVersion}/${format}/${contentSha256}`;
+}
+
+export function r2PrivateScrapeCacheKey(userId: string, pipelineVersion: number, urlSha256: string): string {
+  if (!Number.isInteger(pipelineVersion) || pipelineVersion < 1) {
+    throw new Error('invalid pipelineVersion');
+  }
+  if (!isValidSha256Hex(urlSha256)) {
+    throw new Error('invalid urlSha256');
+  }
+  const safeUser = sanitizeStorageUserId(userId);
+  return `private/${safeUser}/cache/${pipelineVersion}/${urlSha256}.json`;
+}
+
+export async function writePrivateArtifactToR2(params: {
+  bucket: R2Bucket;
+  userId: string;
+  rawBytes: Uint8Array;
+  retention?: ArtifactRetention;
+}): Promise<{ blobSha256: string; contentSha256: string; key: string }> {
+  const { bucket, userId, rawBytes, retention = 'stored' } = params;
+  const contentSha256 = bytesToHex(await crypto.subtle.digest('SHA-256', rawBytes as unknown as BufferSource));
+  const gzStream = new Blob([rawBytes as unknown as BlobPart]).stream().pipeThrough(new CompressionStream('gzip') as unknown as TransformStream<Uint8Array, Uint8Array>);
+  const gzBytes = new Uint8Array(await new Response(gzStream).arrayBuffer());
+  const blobSha256 = bytesToHex(await crypto.subtle.digest('SHA-256', gzBytes));
+  const key = r2PrivateArtifactKey(userId, retention, blobSha256);
+  await bucket.put(key, gzBytes, {
+    sha256: blobSha256,
+    httpMetadata: { contentType: 'application/gzip' },
+    customMetadata: {
+      contentSha256,
+      contentBytes: String(rawBytes.byteLength),
+      retention,
+      userId: sanitizeStorageUserId(userId),
+      visibility: 'private',
+    },
+  });
+  return { blobSha256, contentSha256, key };
 }
 
 /**
@@ -448,8 +545,18 @@ export async function readVerifiedArtifactFromR2(params: {
   preferredRetention?: ArtifactRetention;
   expectedContentSha256?: string;
   maxContentBytes?: number;
+  userId?: string;
+  visibility?: ArtifactVisibility;
 }): Promise<ReadArtifactResult> {
-  const { bucket, blobSha256, preferredRetention, expectedContentSha256, maxContentBytes = MAX_ARTIFACT_CONTENT_BYTES } = params;
+  const {
+    bucket,
+    blobSha256,
+    preferredRetention,
+    expectedContentSha256,
+    maxContentBytes = MAX_ARTIFACT_CONTENT_BYTES,
+    userId,
+    visibility,
+  } = params;
   if (!isValidSha256Hex(blobSha256)) {
     return { ok: false, status: 400, error: 'artifact_expired' };
   }
@@ -462,12 +569,24 @@ export async function readVerifiedArtifactFromR2(params: {
 
   let obj: R2ObjectBody | null = null;
   let foundRetention: ArtifactRetention = order[0]!;
-  for (const ret of order) {
-    const candidate = await bucket.get(r2ArtifactKey(ret, blobSha256));
-    if (candidate) {
-      obj = candidate;
-      foundRetention = ret;
-      break;
+  if (userId) {
+    for (const ret of order) {
+      const privCandidate = await bucket.get(r2PrivateArtifactKey(userId, ret, blobSha256));
+      if (privCandidate) {
+        obj = privCandidate;
+        foundRetention = ret;
+        break;
+      }
+    }
+  }
+  if (!obj && visibility !== 'private') {
+    for (const ret of order) {
+      const candidate = await bucket.get(r2ArtifactKey(ret, blobSha256));
+      if (candidate) {
+        obj = candidate;
+        foundRetention = ret;
+        break;
+      }
     }
   }
   if (!obj) {
@@ -619,11 +738,14 @@ export async function readArtifactPage(params: {
   pipelineVersion?: number;
   offset?: number;
   limit?: number;
+  userId?: string;
+  visibility?: ArtifactVisibility;
   deriveMarkdownFromRaw?: (bytes: Uint8Array) => string | null;
 }): Promise<{ ok: true; page: ArtifactPageSlice } | { ok: false; status: number; error: string; message?: string }> {
   const rawId = params.blobSha256.trim().toLowerCase();
   const isMdPrefixed = rawId.startsWith('md:');
   const cleanHex = isMdPrefixed ? rawId.slice(3) : rawId;
+  const privateOnly = params.visibility === 'private';
   if (!isValidSha256Hex(cleanHex)) {
     return {
       ok: false,
@@ -665,10 +787,10 @@ export async function readArtifactPage(params: {
 
   const wantsMarkdown = isMdPrefixed || params.format === 'markdown';
   if (wantsMarkdown) {
-    const topVer = params.pipelineVersion ?? 11;
+    const topVer = params.pipelineVersion ?? 30;
     const candidateShas: string[] = [];
     if (isMdPrefixed) candidateShas.push(cleanHex);
-    if (params.metaDb) {
+    if (params.metaDb && !privateOnly) {
       const row = await params.metaDb
         .prepare('SELECT content_sha256 FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
         .bind(cleanHex)
@@ -686,6 +808,8 @@ export async function readArtifactPage(params: {
         bucket: params.bucket,
         blobSha256: cleanHex,
         preferredRetention: params.retention,
+        ...(params.userId ? { userId: params.userId } : {}),
+        ...(params.visibility ? { visibility: params.visibility } : {}),
       });
       return rawLoadedCache;
     };
@@ -697,16 +821,24 @@ export async function readArtifactPage(params: {
       }
     }
 
-    const versionsToTry = params.metaDb
+    const maxKnownVer = Math.max(MAX_KNOWN_PIPELINE_VERSION, topVer);
+    const versionsToTry = params.metaDb && !privateOnly && !params.userId
       ? [...new Set([topVer, Math.max(1, topVer - 1)])]
       : [
           topVer,
-          ...Array.from({ length: MAX_KNOWN_PIPELINE_VERSION }, (_, idx) => MAX_KNOWN_PIPELINE_VERSION - idx).filter(
+          ...Array.from({ length: maxKnownVer }, (_, idx) => maxKnownVer - idx).filter(
             (v) => v !== topVer,
           ),
         ];
 
     const checkCachedMarkdownForSha = async (sha: string): Promise<string | null> => {
+      if (params.userId) {
+        for (const ver of versionsToTry) {
+          const privMdObj = await params.bucket.get(r2PrivateDerivedKey(params.userId, ver, 'markdown', sha));
+          if (privMdObj) return await privMdObj.text();
+        }
+      }
+      if (privateOnly) return null;
       if (params.metaDb) {
         const docRow = await params.metaDb
           .prepare(
@@ -747,8 +879,12 @@ export async function readArtifactPage(params: {
       if (params.deriveMarkdownFromRaw) {
         const derivedMd = params.deriveMarkdownFromRaw(rawFallback.bytes);
         if (derivedMd !== null) {
+          const targetDerivedKey =
+            privateOnly && params.userId
+              ? r2PrivateDerivedKey(params.userId, topVer, 'markdown', rawFallback.contentSha256)
+              : r2DerivedKey(topVer, 'markdown', rawFallback.contentSha256);
           await params.bucket
-            .put(r2DerivedKey(topVer, 'markdown', rawFallback.contentSha256), derivedMd, {
+            .put(targetDerivedKey, derivedMd, {
               httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
             })
             .catch(() => undefined);
@@ -769,7 +905,7 @@ export async function readArtifactPage(params: {
 
   let expectedContentSha256: string | undefined;
   let dbRetention: ArtifactRetention | undefined;
-  if (params.metaDb) {
+  if (params.metaDb && !privateOnly) {
     const row = await params.metaDb
       .prepare('SELECT content_sha256, retention FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
       .bind(cleanHex)
@@ -788,6 +924,8 @@ export async function readArtifactPage(params: {
     blobSha256: cleanHex,
     preferredRetention: params.retention ?? dbRetention,
     ...(expectedContentSha256 ? { expectedContentSha256 } : {}),
+    ...(params.userId ? { userId: params.userId } : {}),
+    ...(params.visibility ? { visibility: params.visibility } : {}),
   });
   if (!loaded.ok) {
     if (loaded.error === 'artifact_expired' && expectedContentSha256) {
@@ -846,10 +984,11 @@ export async function handleArtifactGetRequest(params: {
   blobSha256: string;
   bucket?: R2Bucket;
   metaDb?: D1Database;
+  userId?: string;
   pipelineVersion?: number;
   deriveMarkdownFromRaw?: (bytes: Uint8Array) => string | null;
 }): Promise<Response> {
-  const { request, url, blobSha256, bucket, metaDb, pipelineVersion, deriveMarkdownFromRaw } = params;
+  const { request, url, blobSha256, bucket, metaDb, userId, pipelineVersion, deriveMarkdownFromRaw } = params;
   if (!bucket) {
     return Response.json({ error: 'artifacts_not_configured' }, { status: 503, headers: { 'cache-control': 'no-store' } });
   }
@@ -860,6 +999,8 @@ export async function handleArtifactGetRequest(params: {
 
   const rawRet = url.searchParams.get('retention');
   const retention: ArtifactRetention | undefined = rawRet === 'stored' ? 'stored' : rawRet === 'transient' ? 'transient' : undefined;
+  const rawVis = url.searchParams.get('visibility');
+  const visibility: ArtifactVisibility | undefined = rawVis === 'private' ? 'private' : rawVis === 'public' ? 'public' : undefined;
   const contentFormat: 'raw' | 'markdown' | undefined =
     url.searchParams.get('content') === 'markdown' || url.searchParams.get('format') === 'markdown' ? 'markdown' : undefined;
   const offset = url.searchParams.has('offset') ? Number(url.searchParams.get('offset')) : 0;
@@ -871,6 +1012,8 @@ export async function handleArtifactGetRequest(params: {
     blobSha256,
     ...(retention ? { retention } : {}),
     ...(contentFormat ? { format: contentFormat } : {}),
+    ...(userId ? { userId } : {}),
+    ...(visibility ? { visibility } : {}),
     ...(pipelineVersion !== undefined ? { pipelineVersion } : {}),
     ...(deriveMarkdownFromRaw ? { deriveMarkdownFromRaw } : {}),
     offset: Number.isFinite(offset) ? offset : 0,

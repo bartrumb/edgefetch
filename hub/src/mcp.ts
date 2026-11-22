@@ -173,44 +173,55 @@ export interface McpServerDeps {
     blobSha256: string;
     retention?: 'transient' | 'stored';
     format?: 'raw' | 'markdown';
+    visibility?: 'public' | 'private';
     offset?: number;
     limit?: number;
+    userId?: string;
   }) => Promise<{ ok: true; page: Record<string, unknown> } | { ok: false; status: number; error: string; message?: string }>;
   executeScrape?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeExtract?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeInteract?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeMap?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeCrawl?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeSearch?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeJobs?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeCatalog?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeAgent?: (params: {
     args: Record<string, unknown>;
     principal?: string;
+    userId?: string;
   }) => Promise<{ status: number; body: Record<string, unknown> }>;
   findExtractors?: (params: {
     query: string;
@@ -221,6 +232,7 @@ export interface McpServerDeps {
     collectionId: string;
     query: string;
     limit?: number;
+    userId?: string;
   }) => Promise<{ ok: true; hits: Array<Record<string, unknown>> } | { ok: false; status: number; error: string }>;
   scheduleBackground?: (promise: Promise<unknown>) => void;
   tracer?: RequestTracer;
@@ -659,6 +671,13 @@ export function buildCanonicalMcpToolSchemas(options?: {
             description: 'Optional record filter for JSON array responses (e.g. `title~"Forward Deployed"` or `id=abc123`), emitting 1 chunk per record.',
           },
           collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index the verified Markdown into.' },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description:
+              'Artifact & cache isolation mode ("private" stores R2 blobs/cache under private/<userId>/... and skips shared public cache).',
+          },
           waybackFallback: {
             type: 'boolean',
             default: false,
@@ -715,6 +734,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
           maxAgeMs: { type: 'integer', minimum: 0, default: 0, description: 'Serve cached verified Markdown if fetched within maxAgeMs.' },
           redactPii: { type: 'boolean', default: false, description: 'Redact emails, phone numbers, and SSNs.' },
           collectionId: { type: 'string', description: 'Optional FTS5 collection ID to index extracted pages into.' },
+          visibility: {
+            type: 'string',
+            enum: ['public', 'private'],
+            default: 'public',
+            description: 'Artifact & cache isolation mode ("private" isolates R2 cache & FTS5 chunks to the authenticated user).',
+          },
           waybackFallback: {
             type: 'boolean',
             default: false,
@@ -1342,6 +1367,7 @@ async function handleToolCallInner(
   scopes: string[],
   principal: string,
   deps: McpServerDeps,
+  userId = 'owner',
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   if (name === 'list_agents') {
     if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
@@ -1526,14 +1552,17 @@ async function handleToolCallInner(
     const blobSha256 = typeof args.artifactId === 'string' ? args.artifactId.trim().toLowerCase() : '';
     const retention = args.retention === 'stored' ? 'stored' : args.retention === 'transient' ? 'transient' : undefined;
     const format = args.format === 'markdown' ? 'markdown' : args.format === 'raw' ? 'raw' : undefined;
+    const visibility = args.visibility === 'private' ? 'private' : args.visibility === 'public' ? 'public' : undefined;
     const offset = typeof args.offset === 'number' ? Math.max(0, Math.floor(args.offset)) : 0;
     const limit = typeof args.limit === 'number' ? Math.min(262_144, Math.max(1, Math.floor(args.limit))) : MAX_BODY_PREVIEW_CHARS;
     const out = await deps.readArtifact({
       blobSha256,
       ...(retention ? { retention } : {}),
       ...(format ? { format } : {}),
+      ...(visibility ? { visibility } : {}),
       offset,
       limit,
+      userId,
     });
     if (!out.ok) {
       return {
@@ -1558,7 +1587,7 @@ async function handleToolCallInner(
     }
     const scrapeArgs =
       args.maxChars === undefined ? { ...args, defaultMaxChars: DEFAULT_MCP_SCRAPE_MAX_CHARS } : args;
-    const res = await deps.executeScrape({ args: scrapeArgs, principal });
+    const res = await deps.executeScrape({ args: scrapeArgs, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1572,7 +1601,7 @@ async function handleToolCallInner(
     if (!deps.executeExtract) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'extract_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeExtract({ args, principal });
+    const res = await deps.executeExtract({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1589,7 +1618,7 @@ async function handleToolCallInner(
     const collectionId = typeof args.collectionId === 'string' && args.collectionId.trim() ? args.collectionId.trim() : 'default';
     const query = typeof args.query === 'string' ? args.query : '';
     const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : 10;
-    const res = await deps.searchCollection({ collectionId, query, limit });
+    const res = await deps.searchCollection({ collectionId, query, limit, userId });
     if (!res.ok) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: res.error }) }], isError: true };
     }
@@ -1605,7 +1634,7 @@ async function handleToolCallInner(
     if (!deps.executeInteract) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'interact_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeInteract({ args, principal });
+    const res = await deps.executeInteract({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1619,7 +1648,7 @@ async function handleToolCallInner(
     if (!deps.executeMap) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'map_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeMap({ args, principal });
+    const res = await deps.executeMap({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1633,7 +1662,7 @@ async function handleToolCallInner(
     if (!deps.executeCrawl) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'crawl_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeCrawl({ args, principal });
+    const res = await deps.executeCrawl({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status >= 400 ? { isError: true } : {}),
@@ -1647,7 +1676,7 @@ async function handleToolCallInner(
     if (!deps.executeSearch) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'search_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeSearch({ args, principal });
+    const res = await deps.executeSearch({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1661,7 +1690,7 @@ async function handleToolCallInner(
     if (!deps.executeJobs) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'jobs_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeJobs({ args, principal });
+    const res = await deps.executeJobs({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
@@ -1675,7 +1704,7 @@ async function handleToolCallInner(
     if (!deps.executeCatalog) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'catalog_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeCatalog({ args, principal });
+    const res = await deps.executeCatalog({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status >= 400 ? { isError: true } : {}),
@@ -1705,7 +1734,7 @@ async function handleToolCallInner(
     if (!deps.executeAgent) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'agent_not_configured' }) }], isError: true };
     }
-    const res = await deps.executeAgent({ args, principal });
+    const res = await deps.executeAgent({ args, principal, userId });
     return {
       content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
       ...(res.status >= 400 ? { isError: true } : {}),
@@ -1721,9 +1750,10 @@ async function handleToolCall(
   scopes: string[],
   principal: string,
   deps: McpServerDeps,
+  userId = 'owner',
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   try {
-    return await handleToolCallInner(name, args, scopes, principal, deps);
+    return await handleToolCallInner(name, args, scopes, principal, deps, userId);
   } catch (err) {
     return {
       content: [
@@ -1748,6 +1778,7 @@ async function dispatchRpcMessage(
   userAgent: string,
   deps: McpServerDeps,
   isModern = false,
+  userId = 'owner',
 ): Promise<{ body: Record<string, unknown>; status?: number } | null> {
   const isNotification = msg.id === undefined;
   const id = msg.id ?? null;
@@ -1893,7 +1924,7 @@ async function dispatchRpcMessage(
         return { body: jsonRpcError(id, -32602, 'Missing tool name') };
       }
       const activeTracer = deps.tracer ?? getActiveRequestTracer();
-      const invokeTool = () => handleToolCall(toolName, rawArgs, scopes, principal, deps);
+      const invokeTool = () => handleToolCall(toolName, rawArgs, scopes, principal, deps, userId);
       const out = activeTracer
         ? await activeTracer.withSpan(
             'edgefetch.mcp.tool',
@@ -2104,7 +2135,7 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
     }
     const replies: Array<Record<string, unknown>> = [];
     for (const item of parsed) {
-      const out = await dispatchRpcMessage((item ?? {}) as JsonRpcRequest, auth.scopes, auth.principal, userAgent, resolvedDeps, false);
+      const out = await dispatchRpcMessage((item ?? {}) as JsonRpcRequest, auth.scopes, auth.principal, userAgent, resolvedDeps, false, auth.userId);
       if (out) replies.push(out.body);
     }
     if (replies.length === 0) return new Response(null, { status: 202, headers: cors });
@@ -2139,7 +2170,7 @@ export async function handleMcpRequest(request: Request, url: URL, deps: McpServ
     }
   }
 
-  const single = await dispatchRpcMessage(msg, auth.scopes, auth.principal, userAgent, resolvedDeps, era.isModern);
+  const single = await dispatchRpcMessage(msg, auth.scopes, auth.principal, userAgent, resolvedDeps, era.isModern, auth.userId);
   if (!single) {
     return new Response(null, { status: 202, headers: cors });
   }

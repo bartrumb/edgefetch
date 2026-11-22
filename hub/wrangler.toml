@@ -30,8 +30,12 @@ globs = ["**/*.yaml", "**/*.yml"]
 fallthrough = true
 
 # Configure separate least-privilege secrets via Wrangler (never commit values):
-#   npx wrangler secret put CALLER_TOKEN   # >= 24 random chars (used by upstream callers on POST /fetch & GET /agents)
+#   npx wrangler secret put CALLER_TOKEN   # >= 24 random chars (optional owner/CI API token alongside GitHub OAuth)
 #   npx wrangler secret put AGENT_TOKENS   # JSON map {"site-1":"<24+ random chars>","site-2":"..."} for outbound agents
+#   npx wrangler secret put GITHUB_CLIENT_ID     # Optional GitHub OAuth App Client ID ("Sign in with GitHub")
+#   npx wrangler secret put GITHUB_CLIENT_SECRET # Optional GitHub OAuth App Client Secret
+#   npx wrangler secret put SESSION_SECRET       # Optional >= 24 char HS256 JWT signing secret (falls back to CALLER_TOKEN)
+#   # Optional GitHub access control vars: GITHUB_ALLOWED_USERS="alice,@my-org", GITHUB_OWNER_LOGIN="alice", SIGNUP_MODE="invite_only"
 #
 # Optional v2 storage, tracking & FTS5 search bindings (keep commented until resources & migrations are approved):
 # [[r2_buckets]]

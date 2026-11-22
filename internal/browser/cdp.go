@@ -1,10 +1,12 @@
 package browser
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,9 +41,153 @@ type cdpEvent struct {
 	Params    json.RawMessage
 }
 
-// cdpConn multiplexes Chrome DevTools Protocol JSON-RPC 2.0 calls and async events over a single loopback WebSocket.
+type cdpTransport interface {
+	readFrame() ([]byte, error)
+	writeFrame(ctx context.Context, payload []byte) error
+	close() error
+}
+
+type wsCDPTransport struct {
+	ws *ws.Conn
+}
+
+func (t *wsCDPTransport) readFrame() ([]byte, error) {
+	raw, err := t.ws.ReadText(120 * time.Second)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(raw), nil
+}
+
+func (t *wsCDPTransport) writeFrame(_ context.Context, payload []byte) error {
+	return t.ws.WriteText(string(payload))
+}
+
+func (t *wsCDPTransport) close() error {
+	return t.ws.CloseCleanly()
+}
+
+// pipeCDPTransport speaks Chromium's native `--remote-debugging-pipe` NUL-delimited JSON-RPC framing directly over
+// anonymous OS pipes (FD 3 / FD 4), opening zero listening TCP ports in either Go or Chromium.
+type pipeCDPTransport struct {
+	r         *os.File
+	w         *os.File
+	onClose   func()
+	writeCh   chan []byte
+	closedCh  chan struct{}
+	closeOnce sync.Once
+	readBuf   [32 * 1024]byte
+	chunk     []byte
+	pending   []byte
+}
+
+func newPipeCDPTransport(toChrome, fromChrome *os.File, onClose func()) *pipeCDPTransport {
+	pt := &pipeCDPTransport{
+		r:        fromChrome,
+		w:        toChrome,
+		onClose:  onClose,
+		writeCh:  make(chan []byte, 16),
+		closedCh: make(chan struct{}),
+	}
+	go pt.writeLoop()
+	return pt
+}
+
+func (t *pipeCDPTransport) writeLoop() {
+	for {
+		select {
+		case <-t.closedCh:
+			return
+		case framed, ok := <-t.writeCh:
+			if !ok {
+				return
+			}
+			_ = t.w.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := t.w.Write(framed); err != nil {
+				_ = t.close()
+				return
+			}
+		}
+	}
+}
+
+func (t *pipeCDPTransport) writeFrame(ctx context.Context, payload []byte) error {
+	framed := make([]byte, len(payload)+1)
+	copy(framed, payload)
+	framed[len(payload)] = 0
+	select {
+	case <-t.closedCh:
+		return errors.New("cdp pipe closed")
+	case <-ctx.Done():
+		return ctx.Err()
+	case t.writeCh <- framed:
+		return nil
+	}
+}
+
+func (t *pipeCDPTransport) readFrame() ([]byte, error) {
+	for {
+		for len(t.chunk) > 0 {
+			nul := bytes.IndexByte(t.chunk, 0)
+			if nul >= 0 {
+				if len(t.pending)+nul > maxCDPFrameBytes {
+					_ = t.close()
+					return nil, errors.New("cdp pipe frame exceeds maxCDPFrameBytes")
+				}
+				var frame []byte
+				if len(t.pending) == 0 {
+					frame = make([]byte, nul)
+					copy(frame, t.chunk[:nul])
+				} else {
+					frame = append(t.pending, t.chunk[:nul]...)
+					t.pending = nil
+				}
+				t.chunk = t.chunk[nul+1:]
+				if len(frame) == 0 {
+					continue
+				}
+				return frame, nil
+			}
+			if len(t.pending)+len(t.chunk) > maxCDPFrameBytes {
+				_ = t.close()
+				return nil, errors.New("cdp pipe frame exceeds maxCDPFrameBytes")
+			}
+			t.pending = append(t.pending, t.chunk...)
+			t.chunk = nil
+		}
+		n, err := t.r.Read(t.readBuf[:])
+		if n > 0 {
+			t.chunk = t.readBuf[:n]
+			continue
+		}
+		if err != nil {
+			_ = t.close()
+			return nil, err
+		}
+	}
+}
+
+func (t *pipeCDPTransport) close() error {
+	t.closeOnce.Do(func() {
+		close(t.closedCh)
+		if t.w != nil {
+			_ = t.w.SetDeadline(time.Now())
+			_ = t.w.Close()
+		}
+		if t.r != nil {
+			_ = t.r.SetDeadline(time.Now())
+			_ = t.r.Close()
+		}
+		if t.onClose != nil {
+			t.onClose()
+		}
+	})
+	return nil
+}
+
+// cdpConn multiplexes Chrome DevTools Protocol JSON-RPC 2.0 calls and async events over a pipe or WebSocket transport.
 type cdpConn struct {
-	ws     *ws.Conn
+	tr     cdpTransport
 	nextID atomic.Int64
 
 	mu      sync.Mutex
@@ -53,6 +199,21 @@ type cdpConn struct {
 
 	crashMu  sync.Mutex
 	crashMsg string
+}
+
+func newCDPConn(tr cdpTransport) *cdpConn {
+	c := &cdpConn{
+		tr:      tr,
+		pending: make(map[int64]chan cdpEnvelope),
+		subs:    make(map[int]chan cdpEvent),
+		closeCh: make(chan struct{}),
+	}
+	go c.readLoop()
+	return c
+}
+
+func newPipeCDPConn(toChrome, fromChrome *os.File, onClose func()) *cdpConn {
+	return newCDPConn(newPipeCDPTransport(toChrome, fromChrome, onClose))
 }
 
 func (c *cdpConn) setCrashReason(line string) {
@@ -81,15 +242,7 @@ func dialCDP(ctx context.Context, wsURL string) (*cdpConn, error) {
 		return nil, err
 	}
 	conn.SetReadLimit(maxCDPFrameBytes)
-
-	c := &cdpConn{
-		ws:      conn,
-		pending: make(map[int64]chan cdpEnvelope),
-		subs:    make(map[int]chan cdpEvent),
-		closeCh: make(chan struct{}),
-	}
-	go c.readLoop()
-	return c, nil
+	return newCDPConn(&wsCDPTransport{ws: conn}), nil
 }
 
 func (c *cdpConn) readLoop() {
@@ -105,12 +258,12 @@ func (c *cdpConn) readLoop() {
 	}()
 
 	for {
-		raw, err := c.ws.ReadText(120 * time.Second)
+		raw, err := c.tr.readFrame()
 		if err != nil {
 			return
 		}
 		var env cdpEnvelope
-		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		if err := json.Unmarshal(raw, &env); err != nil {
 			continue
 		}
 		if env.ID != 0 {
@@ -176,7 +329,7 @@ func (c *cdpConn) call(ctx context.Context, sessionID, method string, params any
 		return err
 	}
 
-	if err := c.ws.WriteText(string(payload)); err != nil {
+	if err := c.tr.writeFrame(ctx, payload); err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
@@ -213,5 +366,5 @@ func (c *cdpConn) isClosed() bool {
 }
 
 func (c *cdpConn) close() error {
-	return c.ws.CloseCleanly()
+	return c.tr.close()
 }

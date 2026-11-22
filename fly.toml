@@ -10,6 +10,8 @@ primary_region = "iad"
   PORT = "8787"
   EDGEFETCH_DATA_DIR = "/data"
   EDGEFETCH_SITE_ID = "fly-edge-1"
+  EDGEFETCH_TRUST_PROXY = "1"
+  EDGEFETCH_TRUST_FLY_CLIENT_IP = "1"
 
 [[mounts]]
   source = "edgefetch_data"

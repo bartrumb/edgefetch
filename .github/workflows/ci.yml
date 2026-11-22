@@ -85,7 +85,14 @@ jobs:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: hub/package-lock.json
-      - run: npm ci --no-audit --no-fund
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify cross-component version lockstep
+        working-directory: .
+        run: |
+          cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+          agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
+          hub_ver=$(node -p "require('./hub/package.json').version")
+          test -n "$cfg_ver" && test "$cfg_ver" = "$agent_ver" && test "$cfg_ver" = "$hub_ver"
       - run: npm run build:portable
       - run: npm run adapter:test
       - run: npm test
@@ -140,18 +147,21 @@ jobs:
           echo "${ef_status}" | grep -Eq '^Uid:[[:space:]]+65532([[:space:]]+65532){3}$'
           echo "${ef_status}" | grep -Eq '^NoNewPrivs:[[:space:]]+1$'
           test "${ef_env_owner}" = "0:0"
-          if sudo -u '#65532' cat "/proc/${ef_pid}/environ" >/dev/null 2>&1; then
+          # Positive control: prove setpriv executes as numeric UID 65532 (unlike `sudo -u '#65532'`, which fails when 65532 is absent from /etc/passwd).
+          test "$(sudo setpriv --reuid=65532 --regid=65532 --clear-groups id -u)" = "65532"
+          sudo setpriv --reuid=65532 --regid=65532 --clear-groups cat /etc/hostname >/dev/null
+          if sudo setpriv --reuid=65532 --regid=65532 --clear-groups cat "/proc/${ef_pid}/environ" >/dev/null 2>&1; then
             echo "ERROR: environ readable by 65532"
             exit 1
           fi
-          if sudo -u '#65532' cat "/proc/${ef_pid}/task/${ef_pid}/environ" >/dev/null 2>&1; then
+          if sudo setpriv --reuid=65532 --regid=65532 --clear-groups cat "/proc/${ef_pid}/task/${ef_pid}/environ" >/dev/null 2>&1; then
             echo "ERROR: task environ readable by 65532"
             exit 1
           fi
           # Verify LockDownSecretPaths locked /data (0700 0:0) and /data/options.json (0600 0:0) so UID 65532 cannot read it!
           test "$(sudo stat -c '%a %u:%g' /tmp/ef-ha-data)" = "700 0:0"
           test "$(sudo stat -c '%a %u:%g' /tmp/ef-ha-data/options.json)" = "600 0:0"
-          if sudo -u '#65532' cat /tmp/ef-ha-data/options.json >/dev/null 2>&1; then
+          if sudo setpriv --reuid=65532 --regid=65532 --clear-groups cat /tmp/ef-ha-data/options.json >/dev/null 2>&1; then
             echo "SECURITY FAILURE: UID 65532 was able to read /data/options.json!"
             exit 1
           fi
@@ -160,7 +170,10 @@ jobs:
             -d '{"maxSeconds":45,"options":{"includeBody":false,"timeoutMs":35000},"requests":[{"id":"smoke","url":"https://example.com/","kind":"render","formats":["markdown"],"interact":{"actions":[{"type":"wait","selector":"p","waitMs":5000}]}},{"id":"webgl","url":"https://get.webgl.org/","kind":"render","formats":["markdown"],"waitForMs":2500}]}' \
             http://127.0.0.1:18080/fetch)
           echo "$resp"
-          sudo dmesg | grep -i 'apparmor="DENIED".*edgefetch_fat' && exit 1 || true
+          if sudo dmesg | grep -qi 'apparmor="DENIED".*edgefetch_fat'; then
+            sudo dmesg | grep -i 'edgefetch_fat' || true
+            exit 1
+          fi
           echo "$resp" | grep -q '"id":"smoke".*"outcome":"ok"'
           echo "$resp" | grep -q '"id":"webgl".*"outcome":"ok"'
 
@@ -187,6 +200,7 @@ jobs:
           docker exec ef-aio-smoke grep -E '^(Uid|Gid|NoNewPrivs):' "/proc/${agent_pid}/status"
           docker exec ef-aio-smoke grep -Eq '^Uid:[[:space:]]+1000([[:space:]]+1000){3}$' "/proc/${hub_pid}/status"
           docker exec ef-aio-smoke grep -Eq '^Uid:[[:space:]]+65532([[:space:]]+65532){3}$' "/proc/${agent_pid}/status"
+          test "$(docker exec -u 65532:65532 ef-aio-smoke id -u)" = "65532"
           if docker exec -u 65532:65532 ef-aio-smoke cat "/proc/${hub_pid}/environ" >/dev/null 2>&1; then exit 1; fi
           if docker exec -u 65532:65532 ef-aio-smoke ls /data >/dev/null 2>&1; then exit 1; fi
           if docker exec -u 65532:65532 ef-aio-smoke ls /data/hub >/dev/null 2>&1; then exit 1; fi

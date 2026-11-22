@@ -8,6 +8,7 @@ import { isSafePublicHostname } from './overflow';
 import {
   asciiLower,
   compileSafeUserRegex,
+  compileSafeUserRegexUnion,
   isTagNameBoundary,
   MAX_HTML_SCAN_CHARS,
   replacePairedHtmlElementsLinear,
@@ -1022,17 +1023,92 @@ export function validateCrawlPathPatterns(
   return { ok: true, patterns };
 }
 
+let lastCrawlSubject = '\u0000__UNSET__';
+const lastCrawlSubjectCache = new Map<string, boolean>();
+const crawlPatternSetWeakCache = new WeakMap<readonly string[], (subject: string) => boolean>();
+
+function isPlainSlashPrefixPattern(p: string): boolean {
+  if (!p.startsWith('/')) return false;
+  for (let i = 1; i < p.length; i++) {
+    const c = p.charCodeAt(i);
+    if (
+      c === 92 /* '\\' */ ||
+      c === 94 /* '^' */ ||
+      c === 36 /* '$' */ ||
+      c === 42 /* '*' */ ||
+      c === 43 /* '+' */ ||
+      c === 63 /* '?' */ ||
+      c === 40 /* '(' */ ||
+      c === 41 /* ')' */ ||
+      c === 91 /* '[' */ ||
+      c === 93 /* ']' */ ||
+      c === 123 /* '{' */ ||
+      c === 125 /* '}' */ ||
+      c === 124 /* '|' */
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function matchesSafeCrawlPattern(target: string, pattern: string): boolean {
   if (!pattern || pattern.length > 160) return false;
   const boundedTarget = target.length > 2048 ? target.slice(0, 2048) : target;
-  if (pattern.startsWith('/') && !/[\\^$*+?()[\]{}|]/.test(pattern)) {
-    return boundedTarget.startsWith(pattern);
+  if (boundedTarget !== lastCrawlSubject) {
+    lastCrawlSubject = boundedTarget;
+    lastCrawlSubjectCache.clear();
+  } else {
+    const hit = lastCrawlSubjectCache.get(pattern);
+    if (hit !== undefined) return hit;
   }
-  const safeRe = compileSafeUserRegex(pattern);
-  if (!safeRe) {
+
+  let matched: boolean;
+  if (isPlainSlashPrefixPattern(pattern)) {
+    matched = boundedTarget.startsWith(pattern);
+  } else {
+    const safeRe = compileSafeUserRegex(pattern);
+    matched = safeRe ? safeRe.test(boundedTarget) : false;
+  }
+
+  if (lastCrawlSubjectCache.size < 128) {
+    lastCrawlSubjectCache.set(pattern, matched);
+  }
+  return matched;
+}
+
+function getCompiledCrawlPatternListMatcher(patterns: readonly string[]): (subject: string) => boolean {
+  if (patterns.length === 0) return () => false;
+  const cached = crawlPatternSetWeakCache.get(patterns);
+  if (cached) return cached;
+
+  const plainPrefixes: string[] = [];
+  const regexPatterns: string[] = [];
+  const seen = new Set<string>();
+  for (const p of patterns) {
+    if (!p || p.length > 160 || seen.has(p)) continue;
+    seen.add(p);
+    if (isPlainSlashPrefixPattern(p)) {
+      plainPrefixes.push(p);
+    } else {
+      regexPatterns.push(p);
+    }
+  }
+
+  const unionFn = regexPatterns.length > 0 ? compileSafeUserRegexUnion(regexPatterns, 2048) : null;
+  const matcher = (rawSubject: string): boolean => {
+    const bounded = rawSubject.length > 2048 ? rawSubject.slice(0, 2048) : rawSubject;
+    for (let i = 0; i < plainPrefixes.length; i++) {
+      if (bounded.startsWith(plainPrefixes[i]!)) return true;
+    }
+    if (unionFn) return unionFn(bounded);
+    for (let i = 0; i < regexPatterns.length; i++) {
+      if (matchesSafeCrawlPattern(bounded, regexPatterns[i]!)) return true;
+    }
     return false;
-  }
-  return safeRe.test(boundedTarget);
+  };
+  crawlPatternSetWeakCache.set(patterns, matcher);
+  return matcher;
 }
 
 function pathAllowed(
@@ -1042,11 +1118,11 @@ function pathAllowed(
   regexOnFullURL: boolean,
 ): boolean {
   const subject = regexOnFullURL ? candidateUrl.toString() : candidateUrl.pathname;
-  for (const ex of excludePaths) {
-    if (matchesSafeCrawlPattern(subject, ex)) return false;
+  if (excludePaths.length > 0 && getCompiledCrawlPatternListMatcher(excludePaths)(subject)) {
+    return false;
   }
   if (includePaths.length === 0) return true;
-  return includePaths.some((inc) => matchesSafeCrawlPattern(subject, inc));
+  return getCompiledCrawlPatternListMatcher(includePaths)(subject);
 }
 
 export async function createCrawlJob(params: {

@@ -5,6 +5,7 @@
     "dockerfilePath": "Dockerfile.all-in-one"
   },
   "deploy": {
+    "startCommand": "EDGEFETCH_TRUST_PROXY=1 /usr/local/bin/all-in-one-entrypoint.sh",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE",

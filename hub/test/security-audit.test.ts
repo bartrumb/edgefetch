@@ -9,6 +9,8 @@ import test from 'node:test';
 import { gzipSync } from 'node:zlib';
 
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
+import { runRound6StreamASubtests } from './round6-stream-a.test.ts';
+import { runRound6StreamBSubtests } from './round6-stream-b.test.ts';
 import {
   LocalAgentHubCoordinator,
   NodeFsR2Bucket,
@@ -2771,7 +2773,7 @@ test('SEC-V261-ROUND5: R4-H1..H3 O(N) Scanners, R4-M6..M7 XSS/Sentinel Hygiene, 
 });
 
 test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forgery, Host/safe-fetch & Hub Lows', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 29);
+  assert.equal(SCRAPE_PIPELINE_VERSION, 30);
 
   // 1. Exact `v5.mjs` PoCs (`R5-H3`, `R5-H4`, `R5-M1`, `R5-M2`) + Sentinel Forgery
   const fin = (md: string, origin = true) =>
@@ -3238,4 +3240,9 @@ test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forge
     isOfflineLocal: false,
   });
   assert.equal(redactedLlm?.baseUrl, 'https://generativelanguage.googleapis.com/v1beta/openai');
+});
+
+test('SEC-V263-ROUND6-CLOSURE: R6-H1..H4, M1, M3, M9..M12, x402, Portable/Deno Hub, OAuth/Admin/LLM & Overflow Robots Parity', async (t) => {
+  await runRound6StreamASubtests(t);
+  await runRound6StreamBSubtests(t);
 });

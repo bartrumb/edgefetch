@@ -254,13 +254,26 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         }
       }
 
+      const DISALLOWED_CALLER_HEADERS = new Set([
+        'host',
+        ':authority',
+        'content-length',
+        'transfer-encoding',
+        'connection',
+        'keep-alive',
+        'upgrade',
+        'te',
+        'trailer',
+        'proxy-connection',
+      ]);
       const hdrObj: Record<string, string> = {};
       if (init?.headers) {
         const h = new Headers(init.headers);
         h.forEach((v, k) => {
           const lower = k.trim().toLowerCase();
-          // Strip caller-supplied Host/:authority and content-length so exact byte length is always computed from `bodyBytes`.
-          if (lower === 'host' || lower === ':authority' || lower === 'content-length') return;
+          // Strip caller-supplied Host/:authority, hop-by-hop, and framing headers (`Transfer-Encoding` / `Content-Length`)
+          // so exact byte length is always computed solely from `bodyBytes` (preventing CL.TE / TE.CL smuggling on pooled sockets).
+          if (DISALLOWED_CALLER_HEADERS.has(lower)) return;
           hdrObj[lower] = v;
         });
       }
@@ -271,6 +284,11 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
       const mod = isHttps ? https : http;
       const agent = isExplicitLoopback && isHttp ? loopbackHttpAgent : isHttps ? httpsAgent : httpAgent;
       const reqMethod = (init?.method ?? 'GET').toUpperCase();
+      if (reqMethod === 'CONNECT' || reqMethod === 'TRACE' || reqMethod === 'TRACK') {
+        onBodySettled?.();
+        reject(new Error(`HTTP ${reqMethod} is not allowed`));
+        return;
+      }
 
       let settled = false;
       let activeRes: http.IncomingMessage | null = null;
@@ -528,6 +546,15 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
     const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     let currentUrl = new URL(rawUrl);
     let currentMethod = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    if (currentMethod === 'CONNECT' || currentMethod === 'TRACE' || currentMethod === 'TRACK') {
+      throw new Error(`HTTP ${currentMethod} is not allowed`);
+    }
+    const hasExplicitBody =
+      (init?.body !== undefined && init.body !== null) ||
+      (init?.body === undefined && input instanceof Request && input.body !== null);
+    if ((currentMethod === 'GET' || currentMethod === 'HEAD') && hasExplicitBody) {
+      throw new TypeError(`Request with ${currentMethod} method cannot have body`);
+    }
     let bodyBytes: Buffer | null = null;
     if (init?.body !== undefined && init.body !== null) {
       if (typeof init.body === 'string') {
@@ -540,12 +567,26 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         const ab = await new Response(init.body as BodyInit).arrayBuffer();
         bodyBytes = Buffer.from(ab);
       }
+    } else if (input instanceof Request && input.body !== null) {
+      const ab = await input.arrayBuffer();
+      bodyBytes = Buffer.from(ab);
     }
 
     const redirectMode = init?.redirect ?? 'manual';
-    let currentHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-    currentHeaders.delete('host');
-    currentHeaders.delete('content-length');
+    const currentHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    for (const forbidden of [
+      'host',
+      'content-length',
+      'transfer-encoding',
+      'connection',
+      'keep-alive',
+      'upgrade',
+      'te',
+      'trailer',
+      'proxy-connection',
+    ]) {
+      currentHeaders.delete(forbidden);
+    }
 
     // Respect caller-provided `AbortSignal` up to `MAX_SAFE_FETCH_TIMEOUT_MS` (`60_000ms`, e.g. `45s` LLM timeouts),
     // while keeping `defaultTimeoutMs` (`30_000ms` or explicit `opts.defaultTimeoutMs`) when caller omits `init.signal`.

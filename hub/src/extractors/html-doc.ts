@@ -6,15 +6,24 @@
  */
 
 import render from 'dom-serializer';
-import { type ChildNode, type Document, type Element, isTag, isText } from 'domhandler';
-import { textContent } from 'domutils';
-import { parseDocument } from 'htmlparser2';
+import { type ChildNode, type Document, DomHandler, type Element, isTag, isText } from 'domhandler';
+import { Parser } from 'htmlparser2';
 
 const DEFAULT_MAX_HTML_DOC_CHARS = 2_097_152; // 2 MiB default input cap
+const HARD_MAX_HTML_DOC_CHARS = 4_194_304; // 4 MiB absolute ceiling
+const MAX_DOM_DEPTH = 256;
+const MAX_DOM_NODES = 24_000;
+const MAX_DOC_TOTAL_VISITS = 90_000;
+const MAX_TEXT_NODES_PER_CALL = 20_000;
+const MAX_SERIALIZE_NODES_PER_CALL = 15_000;
 const MAX_SELECTOR_CHARS = 256;
 const MAX_SELECTOR_GROUPS = 16;
 const MAX_COMBINATOR_STEPS = 8;
 const MAX_SELECT_LIMIT = 5_000;
+
+interface VisitBudget {
+  remaining: number;
+}
 
 const STRIPPED_TEXT_TAGS: ReadonlySet<string> = new Set(['script', 'style', 'noscript', 'template']);
 
@@ -438,148 +447,356 @@ function prevElementSibling(el: Element): Element | null {
   return null;
 }
 
+interface ChainMemo {
+  step: Array<Map<Element, boolean>>;
+  anc: Array<Map<Element, boolean>>;
+}
+
+function hasMatchingAncestor(
+  el: Element,
+  steps: SelectorStep[],
+  prevStepIdx: number,
+  scopeRoot: Document | Element,
+  memo: ChainMemo,
+): boolean {
+  let p = el.parent;
+  if (!p || p === scopeRoot.parent || !isTag(p)) return false;
+
+  const ancMap = memo.anc[prevStepIdx]!;
+  const hit = ancMap.get(p);
+  if (hit !== undefined) return hit;
+
+  const path: Element[] = [];
+  let res = false;
+  while (p && p !== scopeRoot.parent && isTag(p)) {
+    const cached = ancMap.get(p);
+    if (cached !== undefined) {
+      res = cached;
+      break;
+    }
+    path.push(p);
+    if (p === scopeRoot) break;
+    p = p.parent;
+  }
+
+  for (let i = path.length - 1; i >= 0; i--) {
+    const node = path[i]!;
+    if (!res) {
+      res = matchesChainAtStep(node, steps, prevStepIdx, scopeRoot, memo);
+    }
+    ancMap.set(node, res);
+  }
+  return res;
+}
+
 function matchesChainAtStep(
   el: Element,
   steps: SelectorStep[],
   stepIdx: number,
   scopeRoot: Document | Element,
-  failedMemo: Array<Set<Element>>,
+  memo: ChainMemo,
 ): boolean {
-  const memo = failedMemo[stepIdx]!;
-  if (memo.has(el)) return false;
+  const stepMap = memo.step[stepIdx]!;
+  const existing = stepMap.get(el);
+  if (existing !== undefined) return existing;
 
   const step = steps[stepIdx]!;
   if (!matchesCompound(el, step.compound)) {
-    memo.add(el);
+    stepMap.set(el, false);
     return false;
   }
 
   if (stepIdx === 0) {
-    if (step.combinatorFromPrev === '>') {
-      const ok = el.parent === scopeRoot;
-      if (!ok) memo.add(el);
-      return ok;
-    }
-    return true;
+    const ok = step.combinatorFromPrev === '>' ? el.parent === scopeRoot : true;
+    stepMap.set(el, ok);
+    return ok;
   }
 
   const comb = step.combinatorFromPrev;
   if (comb === '>') {
     const parent = el.parent;
     if (!parent || parent === scopeRoot.parent || !isTag(parent)) {
-      memo.add(el);
+      stepMap.set(el, false);
       return false;
     }
-    const ok = matchesChainAtStep(parent, steps, stepIdx - 1, scopeRoot, failedMemo);
-    if (!ok) memo.add(el);
+    const ok = matchesChainAtStep(parent, steps, stepIdx - 1, scopeRoot, memo);
+    stepMap.set(el, ok);
     return ok;
   }
 
   if (comb === '+') {
     const prev = prevElementSibling(el);
     if (!prev) {
-      memo.add(el);
+      stepMap.set(el, false);
       return false;
     }
-    const ok = matchesChainAtStep(prev, steps, stepIdx - 1, scopeRoot, failedMemo);
-    if (!ok) memo.add(el);
+    const ok = matchesChainAtStep(prev, steps, stepIdx - 1, scopeRoot, memo);
+    stepMap.set(el, ok);
     return ok;
   }
 
-  // Descendant combinator (`' '`): walk ancestor chain within `scopeRoot` with memoization (`O(K * N)` total!)
-  let anc = el.parent;
-  while (anc && anc !== scopeRoot.parent) {
-    if (isTag(anc) && matchesChainAtStep(anc, steps, stepIdx - 1, scopeRoot, failedMemo)) {
-      return true;
+  // Descendant combinator (`' '`): memoized `O(1)` amortized ancestor lookup (`O(K * N)` worst-case!)
+  const ok = hasMatchingAncestor(el, steps, stepIdx - 1, scopeRoot, memo);
+  stepMap.set(el, ok);
+  return ok;
+}
+
+function isAsciiOrUnicodeWhitespaceCode(ch: number): boolean {
+  return (
+    ch <= 32 ||
+    ch === 0x00a0 ||
+    ch === 0x1680 ||
+    (ch >= 0x2000 && ch <= 0x200a) ||
+    ch === 0x2028 ||
+    ch === 0x2029 ||
+    ch === 0x202f ||
+    ch === 0x205f ||
+    ch === 0x3000 ||
+    ch === 0xfeff
+  );
+}
+
+function stripTrailingColonsAndWhitespace(s: string): string {
+  let end = s.length;
+  while (end > 0) {
+    const ch = s.charCodeAt(end - 1);
+    if (ch === 58 /* ':' */ || ch === 0xff1a /* '：' */ || isAsciiOrUnicodeWhitespaceCode(ch)) {
+      end--;
+    } else {
+      break;
     }
-    if (anc === scopeRoot) break;
-    anc = anc.parent;
   }
-  memo.add(el);
-  return false;
+  let start = 0;
+  while (start < end && isAsciiOrUnicodeWhitespaceCode(s.charCodeAt(start))) {
+    start++;
+  }
+  return start === 0 && end === s.length ? s : s.slice(start, end);
 }
 
-function isSimpleLeafTextElement(node: Document | Element): boolean {
-  if (!isTag(node)) return false;
-  if (STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) return false;
-  for (const child of node.children) {
-    if (!isText(child)) return false;
+function collapseAndTrimWhitespace(raw: string): string {
+  let out = '';
+  let inSpace = true;
+  let chunkStart = -1;
+  for (let i = 0; i < raw.length; i++) {
+    if (isAsciiOrUnicodeWhitespaceCode(raw.charCodeAt(i))) {
+      if (chunkStart >= 0) {
+        if (out.length > 0) out += ' ';
+        out += raw.slice(chunkStart, i);
+        chunkStart = -1;
+      }
+      inSpace = true;
+    } else if (inSpace) {
+      chunkStart = i;
+      inSpace = false;
+    }
   }
-  return true;
+  if (chunkStart >= 0) {
+    if (out.length > 0) out += ' ';
+    out += raw.slice(chunkStart);
+  }
+  return out;
 }
 
-function collectCleanTextChunks(children: readonly ChildNode[], out: string[]): void {
-  for (const child of children) {
-    if (isText(child)) {
-      if (child.data) out.push(child.data);
+function extractCleanNodeText(node: Document | Element, budget: VisitBudget): string {
+  if (budget.remaining <= 0) return '';
+  if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
+    return '';
+  }
+
+  const children = node.children;
+  if (children.length === 0) return '';
+
+  // Fast leaf check without recursion
+  if (children.length === 1 && isText(children[0]!)) {
+    budget.remaining--;
+    return collapseAndTrimWhitespace(children[0]!.data);
+  }
+
+  const out: string[] = [];
+  const stack: Array<ChildNode | string> = [];
+  for (let i = children.length - 1; i >= 0; i--) {
+    stack.push(children[i]!);
+  }
+
+  let localVisits = 0;
+  while (stack.length > 0) {
+    const item = stack.pop()!;
+    if (typeof item === 'string') {
+      out.push(item);
       continue;
     }
-    if (!isTag(child)) continue;
-    const tagLower = child.name.toLowerCase();
+    if (budget.remaining <= 0 || localVisits >= MAX_TEXT_NODES_PER_CALL) break;
+    budget.remaining--;
+    localVisits++;
+
+    if (isText(item)) {
+      if (item.data) out.push(item.data);
+      continue;
+    }
+    if (!isTag(item)) continue;
+
+    const tagLower = item.name.toLowerCase();
     if (STRIPPED_TEXT_TAGS.has(tagLower)) continue;
     if (tagLower === 'br' || tagLower === 'hr') {
       out.push(' ');
       continue;
     }
+
     const isBlock = BLOCK_BOUNDARY_TAGS.has(tagLower);
     if (isBlock) out.push(' ');
-    if (child.children.length > 0) {
-      collectCleanTextChunks(child.children, out);
+    if (item.children.length > 0) {
+      if (isBlock) stack.push(' ');
+      for (let i = item.children.length - 1; i >= 0; i--) {
+        stack.push(item.children[i]!);
+      }
+    } else if (isBlock) {
+      out.push(' ');
     }
-    if (isBlock) out.push(' ');
   }
+
+  if (out.length === 0) return '';
+  return collapseAndTrimWhitespace(out.join(''));
 }
 
-function extractCleanNodeText(node: Document | Element): string {
-  if (isTag(node) && STRIPPED_TEXT_TAGS.has(node.name.toLowerCase())) {
-    return '';
-  }
-  if (isSimpleLeafTextElement(node)) {
-    return textContent(node).replace(/\s+/g, ' ').trim();
-  }
-  const chunks: string[] = [];
-  collectCleanTextChunks(node.children, chunks);
-  if (chunks.length === 0) return '';
-  return chunks.join('').replace(/\s+/g, ' ').trim();
-}
+type WalkDirective = boolean | 'skip' | void;
 
-function walkSubtreeElements(root: Document | Element, visit: (el: Element) => boolean | void): void {
+function walkSubtreeElements(
+  root: Document | Element,
+  budget: VisitBudget,
+  visit: (el: Element) => WalkDirective,
+): void {
+  if (budget.remaining <= 0) return;
   const stack: ChildNode[] = [];
   for (let i = root.children.length - 1; i >= 0; i--) {
     stack.push(root.children[i]!);
   }
   while (stack.length > 0) {
+    if (budget.remaining <= 0) return;
     const cur = stack.pop()!;
     if (!isTag(cur)) continue;
-    if (visit(cur) === false) return;
+    budget.remaining--;
+    const res = visit(cur);
+    if (res === false) return;
+    if (res === 'skip') continue;
     for (let i = cur.children.length - 1; i >= 0; i--) {
       stack.push(cur.children[i]!);
     }
   }
 }
 
+function chargeSerializeBudget(nodes: readonly ChildNode[], budget: VisitBudget): boolean {
+  if (budget.remaining <= 0) return false;
+  const stack: ChildNode[] = [];
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    stack.push(nodes[i]!);
+  }
+  let count = 0;
+  while (stack.length > 0) {
+    if (budget.remaining <= 0 || count >= MAX_SERIALIZE_NODES_PER_CALL) return false;
+    const cur = stack.pop()!;
+    budget.remaining--;
+    count++;
+    if (isTag(cur)) {
+      for (let i = cur.children.length - 1; i >= 0; i--) {
+        stack.push(cur.children[i]!);
+      }
+    }
+  }
+  return true;
+}
+
+class BoundedDomHandler extends DomHandler {
+  private nodeCount = 0;
+  private overflowDepth = 0;
+  private overflowNodes = 0;
+  private hostParser: Parser | null = null;
+  public halted = false;
+
+  attachParser(p: Parser): void {
+    this.hostParser = p;
+  }
+
+  private forceHalt(): void {
+    this.halted = true;
+    this.hostParser?.pause();
+  }
+
+  private haltIfExceeded(): boolean {
+    if (this.halted) return true;
+    if (this.nodeCount >= MAX_DOM_NODES) {
+      this.forceHalt();
+      return true;
+    }
+    return false;
+  }
+
+  override onopentag(name: string, attribs: { [key: string]: string }): void {
+    this.nodeCount++;
+    if (this.haltIfExceeded()) return;
+    if (this.overflowDepth > 0 || this.tagStack.length > MAX_DOM_DEPTH) {
+      this.overflowDepth++;
+      this.overflowNodes++;
+      if (this.overflowNodes >= 1_024) {
+        this.forceHalt();
+      }
+      return;
+    }
+    super.onopentag(name, attribs);
+  }
+
+  override onclosetag(): void {
+    if (this.halted) return;
+    if (this.overflowDepth > 0) {
+      this.overflowDepth--;
+      return;
+    }
+    super.onclosetag();
+  }
+
+  override ontext(data: string): void {
+    if (this.halted) return;
+    this.nodeCount++;
+    if (this.haltIfExceeded()) return;
+    super.ontext(data);
+  }
+
+  override oncomment(_data: string): void {
+    // Comments are unused by CSS selectors / text extraction; skip allocating Comment nodes.
+  }
+
+  override oncommentend(): void {}
+}
+
 export class HtmlNode {
   public readonly tag: string;
+  protected readonly budget: VisitBudget;
 
-  constructor(protected readonly node: Document | Element) {
+  constructor(
+    protected readonly node: Document | Element,
+    budget?: VisitBudget,
+  ) {
     this.tag = isTag(node) ? node.name.toLowerCase() : '';
+    this.budget = budget ?? { remaining: MAX_DOC_TOTAL_VISITS };
   }
 
   /** Selects up to `limit` matching descendant `HtmlNode`s in DOM document order (`O(N)` bounded CSS engine). */
   select(selector: string, limit = 500): HtmlNode[] {
     const cappedLimit = Math.max(0, Math.min(MAX_SELECT_LIMIT, Math.floor(limit)));
-    if (cappedLimit === 0) return [];
+    if (cappedLimit === 0 || this.budget.remaining <= 0) return [];
     const chains = parseSelector(selector);
     if (!chains) return [];
 
-    const memosByChain = chains.map((c) => c.map(() => new Set<Element>()));
+    const memosByChain: ChainMemo[] = chains.map((c) => ({
+      step: c.map(() => new Map<Element, boolean>()),
+      anc: c.map(() => new Map<Element, boolean>()),
+    }));
     const results: HtmlNode[] = [];
 
-    walkSubtreeElements(this.node, (el) => {
+    walkSubtreeElements(this.node, this.budget, (el) => {
       for (let g = 0; g < chains.length; g++) {
         const steps = chains[g]!;
         if (matchesChainAtStep(el, steps, steps.length - 1, this.node, memosByChain[g]!)) {
-          results.push(new HtmlNode(el));
+          results.push(new HtmlNode(el, this.budget));
           if (results.length >= cappedLimit) return false;
           break;
         }
@@ -604,7 +821,7 @@ export class HtmlNode {
       const target = this.first(subSelector);
       return target ? target.text() : '';
     }
-    return extractCleanNodeText(this.node);
+    return extractCleanNodeText(this.node, this.budget);
   }
 
   /**
@@ -616,11 +833,14 @@ export class HtmlNode {
       const target = this.first(subSelector);
       return target ? target.html() : '';
     }
-    return this.node.children.length > 0 ? render(this.node.children) : '';
+    if (this.node.children.length === 0) return '';
+    if (!chargeSerializeBudget(this.node.children, this.budget)) return '';
+    return render(this.node.children);
   }
 
   /** Returns serialized outer HTML of this node via `dom-serializer`. */
   outerHtml(): string {
+    if (!chargeSerializeBudget([this.node as unknown as ChildNode], this.budget)) return '';
     return render(this.node);
   }
 
@@ -646,25 +866,29 @@ export class HtmlNode {
 
     for (const container of containers) {
       let pendingKey = '';
-      walkSubtreeElements(container.node, (el) => {
+      walkSubtreeElements(container.node, this.budget, (el) => {
         const t = el.name.toLowerCase();
         if (t === 'dt') {
-          pendingKey = extractCleanNodeText(el)
-            .toLowerCase()
-            .replace(/[:：\s]+$/, '')
-            .trim();
-        } else if (t === 'dd' && pendingKey) {
-          const val = extractCleanNodeText(el);
-          if (val && !(pendingKey in out)) {
-            out[pendingKey] = val;
-            count++;
-            if (count >= 200) return false;
+          pendingKey = stripTrailingColonsAndWhitespace(
+            extractCleanNodeText(el, this.budget).toLowerCase(),
+          );
+          return 'skip';
+        }
+        if (t === 'dd') {
+          if (pendingKey) {
+            const val = extractCleanNodeText(el, this.budget);
+            if (val && !(pendingKey in out)) {
+              out[pendingKey] = val;
+              count++;
+              if (count >= 200) return false;
+            }
+            pendingKey = '';
           }
-          pendingKey = '';
+          return 'skip';
         }
         return undefined;
       });
-      if (count >= 200) break;
+      if (count >= 200 || this.budget.remaining <= 0) break;
     }
 
     return out;
@@ -678,28 +902,25 @@ export class HtmlNode {
     const rows: string[][] = [];
     const rootIsTable = isTag(target.node) && target.node.name.toLowerCase() === 'table';
 
-    walkSubtreeElements(target.node, (el) => {
-      if (el.name.toLowerCase() !== 'tr') return undefined;
-      if (rootIsTable) {
-        let p = el.parent;
-        while (p && p !== target.node) {
-          if (isTag(p) && p.name.toLowerCase() === 'table') return undefined;
-          p = p.parent;
-        }
+    walkSubtreeElements(target.node, this.budget, (el) => {
+      const tagLower = el.name.toLowerCase();
+      if (rootIsTable && tagLower === 'table') {
+        return 'skip';
       }
+      if (tagLower !== 'tr') return undefined;
       const cells: string[] = [];
       for (const child of el.children) {
         if (!isTag(child)) continue;
         const ct = child.name.toLowerCase();
         if (ct === 'td' || ct === 'th') {
-          cells.push(extractCleanNodeText(child));
+          cells.push(extractCleanNodeText(child, this.budget));
         }
       }
       if (cells.length > 0 && cells.some((c) => c.length > 0)) {
         rows.push(cells);
         if (rows.length >= 500) return false;
       }
-      return undefined;
+      return rootIsTable ? 'skip' : undefined;
     });
 
     return rows;
@@ -709,17 +930,35 @@ export class HtmlNode {
 export class HtmlDoc extends HtmlNode {
   public readonly root: Document;
 
-  constructor(root: Document) {
-    super(root);
+  constructor(root: Document, budget?: VisitBudget) {
+    super(root, budget);
     this.root = root;
   }
 }
 
 /**
- * Parses `rawHtml` (capped to `maxChars`, default `2 MiB`) into a linear-time queryable `HtmlDoc`.
+ * Parses `rawHtml` (capped to `maxChars`, default `2 MiB`, hard ceiling `4 MiB`) into a linear-time queryable `HtmlDoc`.
  */
 export function parseHtmlDoc(rawHtml: string, maxChars = DEFAULT_MAX_HTML_DOC_CHARS): HtmlDoc {
+  const effectiveMax =
+    Number.isFinite(maxChars) && maxChars > 0
+      ? Math.min(HARD_MAX_HTML_DOC_CHARS, Math.floor(maxChars))
+      : DEFAULT_MAX_HTML_DOC_CHARS;
   const safeHtml =
-    typeof rawHtml === 'string' ? (rawHtml.length > maxChars ? rawHtml.slice(0, maxChars) : rawHtml) : '';
-  return new HtmlDoc(parseDocument(safeHtml));
+    typeof rawHtml === 'string'
+      ? rawHtml.length > effectiveMax
+        ? rawHtml.slice(0, effectiveMax)
+        : rawHtml
+      : '';
+  const handler = new BoundedDomHandler();
+  const parser = new Parser(handler);
+  handler.attachParser(parser);
+  const PARSE_CHUNK_CHARS = 16_384;
+  for (let off = 0; off < safeHtml.length && !handler.halted; off += PARSE_CHUNK_CHARS) {
+    parser.write(safeHtml.slice(off, off + PARSE_CHUNK_CHARS));
+  }
+  if (!handler.halted) {
+    parser.end();
+  }
+  return new HtmlDoc(handler.root);
 }

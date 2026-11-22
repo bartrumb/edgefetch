@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -534,5 +535,130 @@ func TestR7UpdateDowngradeGuardAndAtomicCrashRecovery(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(winExe); string(got) != "updated-win-exe" {
 		t.Fatalf("unexpected winExe content: %q", string(got))
+	}
+}
+
+func TestMCPBackgroundUpdateCheckDefaultOffAndOptInInvariants(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/repos/bartrumb/edgefetch/releases/latest" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"tag_name":"v9.9.9"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	srvAddr := srv.Listener.Addr().String()
+	tlsTr := &http.Transport{
+		TLSClientConfig: srv.Client().Transport.(*http.Transport).TLSClientConfig,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, srvAddr)
+		},
+	}
+
+	tmpDir := t.TempDir()
+	cachePath := filepath.Join(tmpDir, "update-check.json")
+	pingFrame := `{"jsonrpc":"2.0","id":1,"method":"ping"}` + "\n"
+
+	// 1. Default (`EDGEFETCH_CHECK_UPDATES` unset): ZERO background phone-home calls!
+	var stdout, stderr bytes.Buffer
+	rc := runOneShotCLI(context.Background(), []string{"mcp"}, &stdout, &stderr, cliDeps{
+		getenv:          func(string) string { return "" },
+		transport:       tlsTr,
+		allow:           func(*url.URL) error { return nil },
+		stdin:           strings.NewReader(pingFrame),
+		updateAPIBase:   srv.URL,
+		updateCachePath: cachePath,
+	})
+	if rc != 0 {
+		t.Fatalf("default mcp failed: rc=%d stderr=%s", rc, stderr.String())
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("PRIVACY: expected 0 GitHub API calls when EDGEFETCH_CHECK_UPDATES is unset, got %d", hits.Load())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected empty stderr by default, got %q", stderr.String())
+	}
+
+	// 2. `EDGEFETCH_CHECK_UPDATES=1` + `DO_NOT_TRACK=1` OR `EDGEFETCH_DISABLE_UPDATE_CHECK=1`: ZERO calls!
+	for _, overrideKey := range []string{"DO_NOT_TRACK", "EDGEFETCH_DISABLE_UPDATE_CHECK"} {
+		stdout.Reset()
+		stderr.Reset()
+		rc = runOneShotCLI(context.Background(), []string{"mcp"}, &stdout, &stderr, cliDeps{
+			getenv: func(k string) string {
+				if k == "EDGEFETCH_CHECK_UPDATES" || k == overrideKey {
+					return "1"
+				}
+				return ""
+			},
+			transport:       tlsTr,
+			allow:           func(*url.URL) error { return nil },
+			stdin:           strings.NewReader(pingFrame),
+			updateAPIBase:   srv.URL,
+			updateCachePath: cachePath,
+		})
+		if rc != 0 || hits.Load() != 0 {
+			t.Fatalf("PRIVACY: expected 0 GitHub API calls when %s=1, got hits=%d rc=%d", overrideKey, hits.Load(), rc)
+		}
+	}
+
+	// 3. Explicit opt-in `EDGEFETCH_CHECK_UPDATES=true`: checks once, writes notice strictly to stderr (never stdout), and caches 24h!
+	donePing, releaseStdin := net.Pipe()
+	go func() {
+		_, _ = releaseStdin.Write([]byte(pingFrame))
+		_ = releaseStdin.Close()
+	}()
+	stdout.Reset()
+	stderr.Reset()
+	rc = runOneShotCLI(context.Background(), []string{"mcp"}, &stdout, &stderr, cliDeps{
+		getenv: func(k string) string {
+			if k == "EDGEFETCH_CHECK_UPDATES" {
+				return "true"
+			}
+			return ""
+		},
+		transport:       tlsTr,
+		allow:           func(*url.URL) error { return nil },
+		stdin:           donePing,
+		updateAPIBase:   srv.URL,
+		updateCachePath: cachePath,
+	})
+	if rc != 0 {
+		t.Fatalf("opt-in mcp failed: rc=%d stderr=%s", rc, stderr.String())
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected 1 GitHub API call with EDGEFETCH_CHECK_UPDATES=true, got %d", hits.Load())
+	}
+	if strings.Contains(stdout.String(), "Update available") {
+		t.Fatalf("update notice must NEVER pollute MCP JSON-RPC stdout: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "v9.9.9") {
+		t.Fatalf("expected update notice on stderr, got %q", stderr.String())
+	}
+
+	// Second launch within 24h reads cache without making a network request!
+	stdout.Reset()
+	stderr.Reset()
+	rc = runOneShotCLI(context.Background(), []string{"mcp"}, &stdout, &stderr, cliDeps{
+		getenv: func(k string) string {
+			if k == "EDGEFETCH_CHECK_UPDATES" {
+				return "1"
+			}
+			return ""
+		},
+		transport:       tlsTr,
+		allow:           func(*url.URL) error { return nil },
+		stdin:           strings.NewReader(pingFrame),
+		updateAPIBase:   srv.URL,
+		updateCachePath: cachePath,
+	})
+	if rc != 0 || hits.Load() != 1 {
+		t.Fatalf("expected 24h cache hit (still 1 network call), got hits=%d rc=%d", hits.Load(), rc)
+	}
+	if !strings.Contains(stderr.String(), "v9.9.9") {
+		t.Fatalf("expected cached update notice on stderr, got %q", stderr.String())
 	}
 }

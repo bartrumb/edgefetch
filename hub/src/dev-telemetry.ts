@@ -298,6 +298,7 @@ export const KNOWN_TELEMETRY_ADAPTER_IDS: ReadonlySet<string> = new Set([
   'mcp-federated',
   'mediawiki',
   'mkdocs-material',
+  'news-feeds',
   'nextra',
   'nist-nvd',
   'notion',
@@ -772,7 +773,7 @@ export function scrubSpanToDevErrorReport(
   }
 
   const detected = detectRuntimeEnvironment();
-  const version = normalizeSafeVersion(meta?.version ?? (typeof hubPkg?.version === 'string' ? hubPkg.version : '2.7.1'));
+  const version = normalizeSafeVersion(meta?.version ?? (typeof hubPkg?.version === 'string' ? hubPkg.version : '2.7.2'));
   const runtime = meta?.runtime && VALID_RUNTIMES.has(meta.runtime) ? meta.runtime : detected.runtime;
   const os = meta?.os ? meta.os.trim().toLowerCase() : detected.os;
   const arch = meta?.arch ? meta.arch.trim().toLowerCase() : detected.arch;

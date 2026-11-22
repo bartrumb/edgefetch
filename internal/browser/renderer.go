@@ -2764,7 +2764,12 @@ func linuxSandboxBlockedByHostPolicy() bool {
 		return false
 	}
 	if attr, err := readProcFile("/proc/self/attr/current"); err == nil {
-		if strings.Contains(strings.ToLower(strings.TrimSpace(string(attr))), "edgefetch_fat") {
+		attrLower := strings.ToLower(strings.TrimSpace(string(attr)))
+		if strings.Contains(attrLower, "edgefetch_fat") ||
+			strings.HasPrefix(attrLower, "edgefetch ") ||
+			strings.Contains(attrLower, "_edgefetch ") ||
+			strings.HasSuffix(attrLower, "_edgefetch") ||
+			attrLower == "edgefetch" {
 			return true
 		}
 	}

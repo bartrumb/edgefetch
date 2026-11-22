@@ -19,6 +19,7 @@
  *     & PDF content (`include_raw_content`) fetched politely through HAOS EdgeFetch nodes first (`target: "auto"`).
  */
 
+import { listRegisteredAdapters } from './extractors/registry';
 import { sha256HexString } from './ingest';
 import { executeMapCall, type HubFetchExecutor } from './map-crawl';
 import {
@@ -40,6 +41,17 @@ const BRAVE_MIN_GAP_MS = 1_050; // Polite 1 req/s pacing for Brave Search API
 const DEFAULT_PROVIDER_GAP_MS = 50;
 const DEFAULT_429_COOLDOWN_MS = 15_000;
 const MAX_429_COOLDOWN_MS = 300_000;
+const MAX_SCOPED_QUERY_CHARS = 480;
+
+export type SearchTopic = 'general' | 'news' | 'auto';
+export type SearchQualityTier = 'adapter' | 'known_good' | 'standard' | 'demoted';
+
+export interface SearchHostHealthSnapshot {
+  okCount: number;
+  challengeCount: number;
+  rateLimitCount: number;
+  error5xxCount: number;
+}
 
 const TRACKING_QUERY_PARAMS = new Set([
   'utm_source',
@@ -74,6 +86,7 @@ export interface SearchResultEntry {
   score: number;
   provider: string;
   providers: string[];
+  qualityTier?: SearchQualityTier;
   rawContent?: string;
   chunks?: unknown[];
 }
@@ -81,6 +94,7 @@ export interface SearchResultEntry {
 export interface SearchRequestPayload {
   query?: unknown;
   q?: unknown;
+  topic?: unknown;
   max_results?: unknown;
   maxResults?: unknown;
   limit?: unknown;
@@ -441,20 +455,406 @@ function mapStandardTimeRange(timeRange: string): 'day' | 'week' | 'month' | 'ye
   }
 }
 
+export function buildDomainScopedQuery(
+  query: string,
+  includeDomains: string[] = [],
+  excludeDomains: string[] = [],
+): string {
+  const trimmed = query.trim();
+  const hasInlineSite = /\bsite:/i.test(trimmed);
+  let scoped = trimmed;
+
+  if (!hasInlineSite) {
+    if (includeDomains.length === 1) {
+      const candidate = `site:${includeDomains[0]} ${trimmed}`;
+      if (candidate.length <= MAX_SCOPED_QUERY_CHARS) {
+        scoped = candidate;
+      }
+    } else if (includeDomains.length >= 2 && includeDomains.length <= 10) {
+      const fullOr = `(${includeDomains.map((d) => `site:${d}`).join(' OR ')}) ${trimmed}`;
+      if (fullOr.length <= MAX_SCOPED_QUERY_CHARS) {
+        scoped = fullOr;
+      } else {
+        const fitted: string[] = [];
+        for (const d of includeDomains) {
+          const next = [...fitted, d];
+          const cand =
+            next.length === 1
+              ? `site:${next[0]} ${trimmed}`
+              : `(${next.map((x) => `site:${x}`).join(' OR ')}) ${trimmed}`;
+          if (cand.length <= MAX_SCOPED_QUERY_CHARS) {
+            fitted.push(d);
+            scoped = cand;
+          } else {
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  for (const ex of excludeDomains.slice(0, 5)) {
+    if (!ex) continue;
+    const tok = `-site:${ex}`;
+    if (scoped.toLowerCase().includes(tok.toLowerCase())) continue;
+    if (scoped.length + 1 + tok.length <= MAX_SCOPED_QUERY_CHARS) {
+      scoped = `${scoped} ${tok}`;
+    }
+  }
+
+  return scoped;
+}
+
+const TECHNICAL_NON_NEWS_RE =
+  /\b(?:hacker\s+news\s+api|news\s+api\s+docs?|rss\s+spec|atom\s+spec|release\s+notes)\b/i;
+const EXPLICIT_NEWS_INTENT_RE =
+  /\b(?:top\s+news|breaking\s+news|latest\s+news|news\s+today|today'?s\s+news|headlines\s+today|today'?s\s+headlines|top\s+headlines|latest\s+headlines|breaking\s+headlines|daily\s+news|local\s+news|world\s+news|national\s+news|news\s+headlines|current\s+events|[a-z0-9._-]+\s+news\s+today)\b/i;
+const FRESH_HEADLINES_RE = /\b(?:headlines|top\s+stories|news\s+stories|breaking\s+stories)\b/i;
+
+export function normalizeSearchTopic(raw: unknown): SearchTopic {
+  if (typeof raw !== 'string') return 'auto';
+  const v = raw.trim().toLowerCase();
+  if (v === 'news') return 'news';
+  if (v === 'general') return 'general';
+  return 'auto';
+}
+
+export function detectNewsSearchIntent(
+  query: string,
+  timeRange = '',
+  topic: SearchTopic = 'auto',
+): boolean {
+  if (topic === 'news') return true;
+  if (topic === 'general') return false;
+  const q = query.trim();
+  if (!q) return false;
+  if (TECHNICAL_NON_NEWS_RE.test(q) && !/\b(?:breaking\s+news|news\s+today|headlines\s+today)\b/i.test(q)) {
+    return false;
+  }
+  if (EXPLICIT_NEWS_INTENT_RE.test(q)) return true;
+  const tr = timeRange.trim().toLowerCase();
+  if ((tr === 'day' || tr === 'd') && FRESH_HEADLINES_RE.test(q)) {
+    return true;
+  }
+  return false;
+}
+
+const BUILTIN_NEWS_FEED_ADAPTER_DOMAINS = [
+  'npr.org',
+  'feeds.npr.org',
+  'bbc.com',
+  'bbc.co.uk',
+  'bbci.co.uk',
+  'cbsnews.com',
+  'nbcnews.com',
+  'abcnews.go.com',
+  'theguardian.com',
+  'aljazeera.com',
+  'dw.com',
+  'arstechnica.com',
+];
+
+const KNOWN_OPEN_PUBLIC_DOMAINS = [
+  'pbs.org',
+  'wikipedia.org',
+  'wikimedia.org',
+  'arxiv.org',
+  'nih.gov',
+  'cdc.gov',
+  'fda.gov',
+  'sec.gov',
+  'nasa.gov',
+  'noaa.gov',
+  'nist.gov',
+  'who.int',
+  'europa.eu',
+  'ietf.org',
+  'rfc-editor.org',
+  'w3.org',
+  'mozilla.org',
+  'stlpr.org',
+];
+
+const SOCIAL_LOGIN_WALL_DOMAINS = [
+  'facebook.com',
+  'm.facebook.com',
+  'instagram.com',
+  'threads.net',
+  'tiktok.com',
+  'pinterest.com',
+  'x.com',
+  'twitter.com',
+];
+
+const VIDEO_HUB_DOMAINS = ['youtube.com', 'youtu.be'];
+
+const HARD_ANTIBOT_PAYWALL_DOMAINS = [
+  'apnews.com',
+  'reuters.com',
+  'wsj.com',
+  'nytimes.com',
+  'bloomberg.com',
+  'ft.com',
+];
+
+const VIDEO_WRAPPER_PATH_RE = /\/(?:videos?|watch|live-stream|shorts)(?:\/|$)/i;
+
+const GENERIC_NEWS_HUB_SEGMENTS = new Set([
+  'news',
+  'us',
+  'uk',
+  'world',
+  'international',
+  'national',
+  'politics',
+  'business',
+  'technology',
+  'tech',
+  'science',
+  'science_and_environment',
+  'health',
+  'en',
+  'latest',
+  'top-news',
+  'breaking-news',
+  'us-news',
+  'uk-news',
+  'world-news',
+  'local',
+  'moneywatch',
+  'sections',
+]);
+
+let cachedAdapterExactDomains: Set<string> | null = null;
+let cachedAdapterSuffixes: string[] | null = null;
+
+function ensureAdapterDomainLookup(): { exact: Set<string>; suffixes: string[] } {
+  if (cachedAdapterExactDomains && cachedAdapterSuffixes) {
+    return { exact: cachedAdapterExactDomains, suffixes: cachedAdapterSuffixes };
+  }
+  const exact = new Set<string>(BUILTIN_NEWS_FEED_ADAPTER_DOMAINS);
+  const suffixes: string[] = [];
+  try {
+    for (const entry of listRegisteredAdapters()) {
+      for (const rawDom of entry.domains) {
+        const d = rawDom.trim().toLowerCase().replace(/\.+$/, '');
+        if (!d) continue;
+        if (d.startsWith('*.') && !d.slice(2).includes('*')) {
+          suffixes.push(d.slice(1)); // `.wikipedia.org`
+        } else if (!d.includes('*')) {
+          exact.add(d);
+          if (d.startsWith('www.') && d.indexOf('.', 4) > 4) {
+            exact.add(d.slice(4));
+          }
+        }
+      }
+    }
+  } catch {
+    // Fallback to built-in domains if registry unavailable
+  }
+  cachedAdapterExactDomains = exact;
+  cachedAdapterSuffixes = suffixes;
+  return { exact, suffixes };
+}
+
+function hostMatchesRegisteredAdapter(normHost: string): boolean {
+  const { exact, suffixes } = ensureAdapterDomainLookup();
+  if (exact.has(normHost)) return true;
+  if (normHost.startsWith('www.') && exact.has(normHost.slice(4))) return true;
+  for (const d of BUILTIN_NEWS_FEED_ADAPTER_DOMAINS) {
+    if (normHost === d || normHost.endsWith(`.${d}`)) return true;
+  }
+  return suffixes.some((suf) => normHost.endsWith(suf) && normHost.length > suf.length);
+}
+
+function isGovEduMilHost(normHost: string): boolean {
+  return (
+    normHost.endsWith('.gov') ||
+    normHost.endsWith('.mil') ||
+    normHost.endsWith('.edu') ||
+    normHost.endsWith('.gov.uk') ||
+    normHost.endsWith('.ac.uk') ||
+    normHost.endsWith('.gov.au') ||
+    normHost.endsWith('.edu.au')
+  );
+}
+
+export function isGenericNewsHubUrl(urlStr: string): boolean {
+  try {
+    const u = new URL(urlStr);
+    const segs = u.pathname
+      .split('/')
+      .filter(Boolean)
+      .map((s) => s.toLowerCase());
+    if (segs.length === 0) return true;
+    if (segs.length === 1) {
+      return GENERIC_NEWS_HUB_SEGMENTS.has(segs[0]!);
+    }
+    if (
+      segs.length === 2 &&
+      (segs[0] === 'news' || segs[0] === 'sections' || segs[0] === 'category' || segs[0] === 'topics') &&
+      GENERIC_NEWS_HUB_SEGMENTS.has(segs[1]!)
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function isNonArticleUtilityWidgetInNewsMode(urlStr: string, normHost: string, queryLower: string): boolean {
+  try {
+    const u = new URL(urlStr);
+    const pathLower = u.pathname.toLowerCase();
+    // Static NWS point-forecast widget when user asked for general/local news rather than weather/storms
+    if (
+      (normHost === 'forecast.weather.gov' || (normHost.endsWith('weather.gov') && /\/(?:mapclick|zipcity)\.php$/i.test(pathLower))) &&
+      !/\b(?:weather|forecast|storm|tornado|flood|hurricane|blizzard|warning|temperature|snow|rain)\b/.test(queryLower)
+    ) {
+      return true;
+    }
+    // High-school / league schedule & roster directories when query did not ask for sports schedules/rosters
+    if (
+      (hostMatchesDomainRule(normHost, ['maxpreps.com', 'hudl.com']) ||
+        /\/(?:schedule|standings|roster|scoreboard)(?:\/|$)/i.test(pathLower)) &&
+      !/\b(?:schedule|standings|roster|scores?|volleyball|football|basketball|baseball|soccer|hockey|athletics)\b/.test(queryLower)
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export interface HostQualityOptions {
+  isExplicitDomainTarget?: boolean;
+  isNewsTopic?: boolean;
+  getHostHealth?: ((hostname: string) => SearchHostHealthSnapshot | null) | undefined;
+  snippetLength?: number;
+  hasDeeperArticleUrls?: boolean;
+  query?: string;
+}
+
+export function classifySearchResultQuality(
+  urlStr: string,
+  hostname: string,
+  options: HostQualityOptions = {},
+): { factor: number; qualityTier: SearchQualityTier } {
+  const normHost = hostname.toLowerCase().replace(/\.+$/, '');
+  const isExplicit = Boolean(options.isExplicitDomainTarget);
+  const isNews = Boolean(options.isNewsTopic);
+  let factor = 1.0;
+  let qualityTier: SearchQualityTier = 'standard';
+
+  let pathname = '/';
+  try {
+    pathname = new URL(urlStr).pathname || '/';
+  } catch {
+    // ignore
+  }
+
+  // 1. Base host tier (before explicit-domain floor and path adjustments)
+  if (hostMatchesDomainRule(normHost, SOCIAL_LOGIN_WALL_DOMAINS)) {
+    factor = 0.28;
+    qualityTier = 'demoted';
+  } else if (hostMatchesDomainRule(normHost, VIDEO_HUB_DOMAINS)) {
+    factor = isNews ? 0.35 : 0.45;
+    qualityTier = 'demoted';
+  } else if (hostMatchesDomainRule(normHost, HARD_ANTIBOT_PAYWALL_DOMAINS)) {
+    factor = 0.4;
+    qualityTier = 'demoted';
+  } else if (hostMatchesRegisteredAdapter(normHost)) {
+    factor = 1.38;
+    qualityTier = 'adapter';
+  } else if (hostMatchesDomainRule(normHost, KNOWN_OPEN_PUBLIC_DOMAINS) || isGovEduMilHost(normHost)) {
+    factor = 1.32;
+    qualityTier = 'known_good';
+  }
+
+  // 2. Dynamic host-health telemetry boost / challenge demotion
+  if (options.getHostHealth) {
+    try {
+      const health = options.getHostHealth(normHost) ?? (normHost.startsWith('www.') ? options.getHostHealth(normHost.slice(4)) : null);
+      if (health) {
+        if (health.challengeCount >= 2 && health.okCount === 0) {
+          factor = 0.35;
+          qualityTier = 'demoted';
+        } else if (health.okCount >= 2 && health.challengeCount === 0) {
+          if (factor === 1.0) {
+            factor = 1.2;
+            qualityTier = 'known_good';
+          } else if (factor > 1.0) {
+            factor = Math.min(1.4, Number((factor * 1.04).toFixed(4)));
+          }
+        }
+      }
+    } catch {
+      // Host health callback is strictly best-effort
+    }
+  }
+
+  // 3. Explicit caller domain target (`site:` or `includeDomains`) waives domain-level penalties
+  if (isExplicit && factor < 1.0) {
+    factor = 1.0;
+    qualityTier = 'standard';
+  }
+
+  // 4. Path-level adjustments (prefer article paths over `/video/` wrappers, utility widgets, or bare empty hubs)
+  if (VIDEO_WRAPPER_PATH_RE.test(pathname) && (isNews || isExplicit)) {
+    factor = Number((factor * 0.45).toFixed(4));
+    if (factor < 0.7) qualityTier = 'demoted';
+  } else if (isNews && isNonArticleUtilityWidgetInNewsMode(urlStr, normHost, (options.query ?? '').toLowerCase())) {
+    factor = 0.55;
+    qualityTier = 'demoted';
+  }
+
+  if (
+    isNews &&
+    (options.hasDeeperArticleUrls ?? false) &&
+    options.snippetLength !== undefined &&
+    options.snippetLength < 25 &&
+    isGenericNewsHubUrl(urlStr)
+  ) {
+    factor = Number((factor * 0.55).toFixed(4));
+    if (factor < 0.7 && qualityTier === 'standard') qualityTier = 'demoted';
+  }
+
+  return { factor, qualityTier };
+}
+
+export function computeHostQualityFactor(
+  urlStr: string,
+  hostname: string,
+  options: HostQualityOptions = {},
+): number {
+  return classifySearchResultQuality(urlStr, hostname, options).factor;
+}
+
+function formatNewsAttributionPrefix(sourceRaw?: string, dateRaw?: string): string {
+  const src = cleanProviderText(sourceRaw);
+  const dt = cleanProviderText(dateRaw);
+  if (src && dt) return `[${src} · ${dt}] `;
+  if (src) return `[${src}] `;
+  if (dt) return `[${dt}] `;
+  return '';
+}
+
 async function querySerperWebSearch(params: {
   apiKey: string;
   query: string;
   includeDomains: string[];
+  excludeDomains: string[];
   timeRange: string;
+  isNewsTopic: boolean;
   fetchFn: typeof fetch;
   tracer?: RequestTracer | null;
 }): Promise<RawSearchHit[]> {
-  const { apiKey, query, includeDomains, timeRange, fetchFn, tracer } = params;
-  const hasInlineSite = /\bsite:/i.test(query);
-  const effectiveQuery =
-    !hasInlineSite && includeDomains.length === 1 ? `site:${includeDomains[0]} ${query}` : query;
+  const { apiKey, query, includeDomains, excludeDomains, timeRange, isNewsTopic, fetchFn, tracer } = params;
+  const effectiveQuery = buildDomainScopedQuery(query, includeDomains, excludeDomains);
   const tbs = mapSerperTbs(timeRange);
-  const endpoint = 'https://google.serper.dev/search';
+  const endpoint = isNewsTopic ? 'https://google.serper.dev/news' : 'https://google.serper.dev/search';
 
   return runWithProviderSpan({
     tracer,
@@ -469,7 +869,7 @@ async function querySerperWebSearch(params: {
           'content-type': 'application/json',
           'x-api-key': apiKey,
         },
-        // Strictly cap `num: 10` so every Serper query consumes 1 credit ($0.001) instead of 2 credits!
+        // Strictly cap `num: 10` so every Serper `/search` or `/news` query consumes 1 credit ($0.001) instead of 2 credits!
         body: JSON.stringify({
           q: effectiveQuery,
           num: 10,
@@ -490,12 +890,15 @@ async function querySerperWebSearch(params: {
 
       const json = (await resp.json()) as {
         knowledgeGraph?: { title?: string; website?: string; description?: string };
-        organic?: Array<{ link?: string; title?: string; snippet?: string }>;
+        news?: Array<{ link?: string; title?: string; snippet?: string; date?: string; source?: string }>;
+        organic?: Array<{ link?: string; title?: string; snippet?: string; date?: string; source?: string }>;
       };
       const out: RawSearchHit[] = [];
-      if (typeof json.knowledgeGraph?.website === 'string') {
+      const seen = new Set<string>();
+      if (!isNewsTopic && typeof json.knowledgeGraph?.website === 'string') {
         const canon = canonicalizeSearchResultUrl(json.knowledgeGraph.website);
         if (canon) {
+          seen.add(canon);
           out.push({
             url: canon,
             title: cleanProviderText(json.knowledgeGraph.title) || humanizeUrlTitle(canon),
@@ -503,14 +906,42 @@ async function querySerperWebSearch(params: {
           });
         }
       }
-      for (const r of json.organic ?? []) {
+      for (const r of json.news ?? []) {
         if (typeof r.link !== 'string') continue;
         const canon = canonicalizeSearchResultUrl(r.link);
-        if (!canon) continue;
+        if (!canon || seen.has(canon)) continue;
+        seen.add(canon);
+        const cleanSnippet = cleanProviderText(r.snippet);
+        const attrPrefix = formatNewsAttributionPrefix(r.source, r.date);
+        const fullSnippet =
+          attrPrefix && !cleanSnippet.startsWith('[')
+            ? cleanSnippet
+              ? `${attrPrefix}${cleanSnippet}`
+              : attrPrefix.trim()
+            : cleanSnippet;
         out.push({
           url: canon,
           title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
-          snippet: cleanProviderText(r.snippet),
+          snippet: fullSnippet,
+        });
+      }
+      for (const r of json.organic ?? []) {
+        if (typeof r.link !== 'string') continue;
+        const canon = canonicalizeSearchResultUrl(r.link);
+        if (!canon || seen.has(canon)) continue;
+        seen.add(canon);
+        const cleanSnippet = cleanProviderText(r.snippet);
+        const attrPrefix = isNewsTopic ? formatNewsAttributionPrefix(r.source, r.date) : '';
+        const fullSnippet =
+          attrPrefix && !cleanSnippet.startsWith('[')
+            ? cleanSnippet
+              ? `${attrPrefix}${cleanSnippet}`
+              : attrPrefix.trim()
+            : cleanSnippet;
+        out.push({
+          url: canon,
+          title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
+          snippet: fullSnippet,
         });
       }
       span?.setAttribute('search.result_count', out.length);
@@ -522,14 +953,22 @@ async function querySerperWebSearch(params: {
 async function queryBraveWebSearch(params: {
   apiKey: string;
   query: string;
+  includeDomains: string[];
+  excludeDomains: string[];
   count: number;
   timeRange: string;
+  isNewsTopic: boolean;
   fetchFn: typeof fetch;
   tracer?: RequestTracer | null;
 }): Promise<RawSearchHit[]> {
-  const { apiKey, query, count, timeRange, fetchFn, tracer } = params;
-  const u = new URL('https://api.search.brave.com/res/v1/web/search');
-  u.searchParams.set('q', query);
+  const { apiKey, query, includeDomains, excludeDomains, count, timeRange, isNewsTopic, fetchFn, tracer } = params;
+  const effectiveQuery = buildDomainScopedQuery(query, includeDomains, excludeDomains);
+  const u = new URL(
+    isNewsTopic
+      ? 'https://api.search.brave.com/res/v1/news/search'
+      : 'https://api.search.brave.com/res/v1/web/search',
+  );
+  u.searchParams.set('q', effectiveQuery);
   u.searchParams.set('count', String(Math.min(20, Math.max(1, count))));
   const freshness = mapBraveFreshness(timeRange);
   if (freshness) u.searchParams.set('freshness', freshness);
@@ -560,13 +999,51 @@ async function queryBraveWebSearch(params: {
         throw new Error(`brave_http_${resp.status}`);
       }
       const json = (await resp.json()) as {
-        web?: { results?: Array<{ url?: string; title?: string; description?: string }> };
+        results?: Array<{
+          url?: string;
+          title?: string;
+          description?: string;
+          age?: string;
+          meta_url?: { hostname?: string; netloc?: string };
+        }>;
+        news?: {
+          results?: Array<{
+            url?: string;
+            title?: string;
+            description?: string;
+            age?: string;
+            meta_url?: { hostname?: string; netloc?: string };
+          }>;
+        };
+        web?: { results?: Array<{ url?: string; title?: string; description?: string; age?: string }> };
       };
       const out: RawSearchHit[] = [];
+      const seen = new Set<string>();
+      for (const r of json.results ?? json.news?.results ?? []) {
+        if (typeof r.url !== 'string') continue;
+        const canon = canonicalizeSearchResultUrl(r.url);
+        if (!canon || seen.has(canon)) continue;
+        seen.add(canon);
+        const cleanDesc = cleanProviderText(r.description);
+        const sourceLabel = r.meta_url?.netloc || r.meta_url?.hostname;
+        const attrPrefix = isNewsTopic ? formatNewsAttributionPrefix(sourceLabel, r.age) : '';
+        const fullSnippet =
+          attrPrefix && !cleanDesc.startsWith('[')
+            ? cleanDesc
+              ? `${attrPrefix}${cleanDesc}`
+              : attrPrefix.trim()
+            : cleanDesc;
+        out.push({
+          url: canon,
+          title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
+          snippet: fullSnippet,
+        });
+      }
       for (const r of json.web?.results ?? []) {
         if (typeof r.url !== 'string') continue;
         const canon = canonicalizeSearchResultUrl(r.url);
-        if (!canon) continue;
+        if (!canon || seen.has(canon)) continue;
+        seen.add(canon);
         out.push({
           url: canon,
           title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
@@ -586,10 +1063,11 @@ async function queryTavilyWebSearch(params: {
   includeDomains: string[];
   excludeDomains: string[];
   timeRange: string;
+  isNewsTopic: boolean;
   fetchFn: typeof fetch;
   tracer?: RequestTracer | null;
 }): Promise<RawSearchHit[]> {
-  const { apiKey, query, count, includeDomains, excludeDomains, timeRange, fetchFn, tracer } = params;
+  const { apiKey, query, count, includeDomains, excludeDomains, timeRange, isNewsTopic, fetchFn, tracer } = params;
   const tr = mapStandardTimeRange(timeRange);
   const endpoint = 'https://api.tavily.com/search';
 
@@ -611,6 +1089,7 @@ async function queryTavilyWebSearch(params: {
           query,
           max_results: Math.min(10, Math.max(1, count)),
           search_depth: 'basic',
+          ...(isNewsTopic ? { topic: 'news' } : {}),
           ...(includeDomains.length > 0 ? { include_domains: includeDomains } : {}),
           ...(excludeDomains.length > 0 ? { exclude_domains: excludeDomains } : {}),
           ...(tr ? { time_range: tr } : {}),
@@ -650,19 +1129,24 @@ async function queryTavilyWebSearch(params: {
 async function querySearxngSearch(params: {
   searxngBaseUrl: string;
   query: string;
+  includeDomains: string[];
+  excludeDomains: string[];
   count: number;
   timeRange: string;
+  isNewsTopic: boolean;
   fetchFn: typeof fetch;
   tracer?: RequestTracer | null;
 }): Promise<RawSearchHit[]> {
-  const { searxngBaseUrl, query, count, timeRange, fetchFn, tracer } = params;
+  const { searxngBaseUrl, query, includeDomains, excludeDomains, count, timeRange, isNewsTopic, fetchFn, tracer } = params;
+  const effectiveQuery = buildDomainScopedQuery(query, includeDomains, excludeDomains);
   const base = new URL(searxngBaseUrl);
   if (base.protocol !== 'https:' && base.protocol !== 'http:') {
     throw new Error('invalid_searxng_url');
   }
   const searchUrl = new URL('/search', base);
-  searchUrl.searchParams.set('q', query);
+  searchUrl.searchParams.set('q', effectiveQuery);
   searchUrl.searchParams.set('format', 'json');
+  if (isNewsTopic) searchUrl.searchParams.set('categories', 'news');
   const tr = mapStandardTimeRange(timeRange);
   if (tr) searchUrl.searchParams.set('time_range', tr);
   const requestUrl = searchUrl.toString();
@@ -804,13 +1288,14 @@ export async function executeSearchCall(params: {
   env: SearchBindings;
   executeHubFetch: HubFetchExecutor;
   providerFetchFn?: typeof fetch;
+  getHostHealth?: (hostname: string) => SearchHostHealthSnapshot | null;
   source?: string;
   userId?: string;
   tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runSearchCall = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
-  const { payload, env, executeHubFetch, source = 'search', userId = 'owner' } = params;
+  const { payload, env, executeHubFetch, getHostHealth, source = 'search', userId = 'owner' } = params;
   const providerFetchFn = params.providerFetchFn ?? fetch;
   const enforcePacing = params.providerFetchFn === undefined;
 
@@ -826,6 +1311,9 @@ export async function executeSearchCall(params: {
   const excludeDomains = normalizeDomainList(payload.exclude_domains ?? payload.excludeDomains);
   const rawTimeRange = payload.time_range ?? payload.timeRange;
   const timeRange = typeof rawTimeRange === 'string' ? rawTimeRange.trim().toLowerCase() : '';
+  const requestedTopic = normalizeSearchTopic(payload.topic);
+  const isNewsTopic = detectNewsSearchIntent(query, timeRange, requestedTopic);
+  const effectiveTopic: 'news' | 'general' = isNewsTopic ? 'news' : 'general';
   const includeRawContent = Boolean(payload.include_raw_content ?? payload.includeRawContent);
   const rawChunksPer = payload.chunks_per_source ?? payload.chunksPerSource ?? 3;
   const chunksPerSource =
@@ -1081,8 +1569,9 @@ export async function executeSearchCall(params: {
       env.META && cacheMaxAgeMs > 0 && enforcePacing
         ? await sha256HexString(
             JSON.stringify({
-              v: 2,
+              v: 3,
               p: activeProviderSig,
+              topic: effectiveTopic,
               q: query.toLowerCase(),
               tr: timeRange,
               inc: includeDomains,
@@ -1129,7 +1618,9 @@ export async function executeSearchCall(params: {
             apiKey: env.SERPER_API_KEY!.trim(),
             query,
             includeDomains,
+            excludeDomains,
             timeRange,
+            isNewsTopic,
             fetchFn: providerFetchFn,
             tracer: providerTracer,
           }),
@@ -1147,8 +1638,11 @@ export async function executeSearchCall(params: {
           queryBraveWebSearch({
             apiKey: env.BRAVE_API_KEY!.trim(),
             query,
+            includeDomains,
+            excludeDomains,
             count: maxResults * 2,
             timeRange,
+            isNewsTopic,
             fetchFn: providerFetchFn,
             tracer: providerTracer,
           }),
@@ -1166,8 +1660,11 @@ export async function executeSearchCall(params: {
           querySearxngSearch({
             searxngBaseUrl: env.SEARXNG_URL!.trim(),
             query,
+            includeDomains,
+            excludeDomains,
             count: maxResults * 2,
             timeRange,
+            isNewsTopic,
             fetchFn: providerFetchFn,
             tracer: providerTracer,
           }),
@@ -1204,6 +1701,7 @@ export async function executeSearchCall(params: {
             includeDomains,
             excludeDomains,
             timeRange,
+            isNewsTopic,
             fetchFn: providerFetchFn,
             tracer: providerTracer,
           }),
@@ -1339,7 +1837,33 @@ export async function executeSearchCall(params: {
     });
   }
 
-  let fusedEntries = [...fused.values()];
+  let fusedEntries = [...fused.values()].map((e) => ({
+    ...e,
+    qualityTier: 'standard' as SearchQualityTier,
+  }));
+  const hasDeeperArticleUrls = isNewsTopic && fusedEntries.some((e) => !isGenericNewsHubUrl(e.url));
+
+  for (const entry of fusedEntries) {
+    let entryHost = '';
+    try {
+      entryHost = new URL(entry.url).hostname;
+    } catch {
+      continue;
+    }
+    const isExplicitDomainTarget =
+      effectiveIncludeDomains.length > 0 && hostMatchesDomainRule(entryHost, effectiveIncludeDomains);
+    const { factor, qualityTier } = classifySearchResultQuality(entry.url, entryHost, {
+      isExplicitDomainTarget,
+      isNewsTopic,
+      getHostHealth,
+      snippetLength: entry.content.trim().length,
+      hasDeeperArticleUrls,
+      query,
+    });
+    entry.rrfScore *= factor;
+    entry.qualityTier = qualityTier;
+  }
+
   if (preferEnglishCanonical && fusedEntries.length > 1) {
     const englishCanonicalKeys = new Set<string>();
     const annotated = fusedEntries.map((entry) => {
@@ -1373,6 +1897,7 @@ export async function executeSearchCall(params: {
     score: Number(Math.min(1, (r.rrfScore / Math.max(maxRrf, 1e-6)) * 0.95).toFixed(4)),
     provider: r.providers[0]!,
     providers: r.providers,
+    qualityTier: r.qualityTier,
   }));
 
   let via = viaParts.join('+') || providerLists.map((p) => p.provider).join('+') || 'search';
@@ -1413,6 +1938,7 @@ export async function executeSearchCall(params: {
 
   const cachedFlag = Boolean(viaParts.some((v) => v.startsWith('cache:d1')));
   setActiveSpanAttribute('search.mode', waterfallMode ? 'waterfall' : 'rrf', activeTracer ?? undefined);
+  setActiveSpanAttribute('search.topic', effectiveTopic, activeTracer ?? undefined);
   setActiveSpanAttribute('search.query_length', query.length, activeTracer ?? undefined);
   setActiveSpanAttribute('search.cached', cachedFlag, activeTracer ?? undefined);
   setActiveSpanAttribute('search.result_count', results.length, activeTracer ?? undefined);
@@ -1423,6 +1949,7 @@ export async function executeSearchCall(params: {
     body: {
       ok: true,
       query,
+      topic: effectiveTopic,
       cached: cachedFlag,
       results,
       ...(unhonoredOptions.length > 0 ? { unhonoredOptions } : {}),

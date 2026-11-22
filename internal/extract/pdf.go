@@ -39,7 +39,7 @@ func sanitizedPopplerEnv() []string {
 	return env
 }
 
-// HasPDFToText reports whether `pdftotext` (`poppler-utils`, bundled in `edgefetch_fat`) is available in $PATH.
+// HasPDFToText reports whether `pdftotext` (`poppler-utils`, bundled in the browser/PDF worker image) is available in $PATH.
 func HasPDFToText() bool {
 	_, err := exec.LookPath("pdftotext")
 	return err == nil
@@ -99,14 +99,14 @@ func ExtractPDFFileText(ctx context.Context, pdfPath string, maxPages int) (text
 	}
 	fallback := extractPDFTextPureGo(buf, maxPages)
 	if fallback == "" {
-		return "", false, fmt.Errorf("PDF contains no extractable text streams (install edgefetch_fat for poppler pdftotext layout extraction)")
+		return "", false, fmt.Errorf("PDF contains no extractable text streams (install poppler-utils pdftotext for layout extraction)")
 	}
 	return fallback, false, nil
 }
 
 // ExtractPDFText extracts UTF-8 text from `pdfBytes` up to `maxPages` (default 60).
-// On Fat nodes (`edgefetch_fat`), it streams `pdfBytes` directly over stdin into `pdftotext -layout` (`poppler-utils`,
-// zero temporary files on disk). On distroless Lite nodes without `pdftotext`, it falls back to a pure-Go FlateDecode
+// When `pdftotext` (`poppler-utils`) is installed, it streams `pdfBytes` directly over stdin into `pdftotext -layout`
+// (zero temporary files on disk). On distroless Lite nodes without `pdftotext`, it falls back to a pure-Go FlateDecode
 // content-stream text reader so PDF fetches remain functional everywhere.
 func ExtractPDFText(ctx context.Context, pdfBytes []byte, maxPages int) (text string, usedPoppler bool, err error) {
 	if !IsPDFBytes(pdfBytes) {
@@ -151,7 +151,7 @@ func ExtractPDFText(ctx context.Context, pdfBytes []byte, maxPages int) (text st
 
 	fallback := extractPDFTextPureGo(pdfBytes, maxPages)
 	if fallback == "" {
-		return "", false, fmt.Errorf("PDF contains no extractable text streams (install edgefetch_fat for poppler pdftotext layout extraction)")
+		return "", false, fmt.Errorf("PDF contains no extractable text streams (install poppler-utils pdftotext for layout extraction)")
 	}
 	return fallback, false, nil
 }

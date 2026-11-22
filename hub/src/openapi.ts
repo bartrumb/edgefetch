@@ -11,7 +11,7 @@
 import { buildCanonicalMcpToolSchemas, MCP_TOOL_SCHEMAS, TEXT_ACCEPTS } from './mcp';
 
 export const DEFAULT_OPENAPI_ORIGIN = 'https://edgefetch.dev';
-export const DEFAULT_OPENAPI_VERSION = '2.7.1';
+export const DEFAULT_OPENAPI_VERSION = '2.7.2';
 
 export interface BuildOpenApiOptions {
   origin?: string;
@@ -610,7 +610,7 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           operationId: 'interactBrowser',
           summary: 'Drive a sandboxed Headless Chromium session',
           description:
-            'Executes browser actions (`click`, `fill`, `type`, `press`, `wait`, `scroll`, `select`, `navigate`) inside an incognito Chromium context on an `edgefetch_fat` worker node with dial-time SSRF isolation and automatic halt on anti-bot challenges.',
+            'Executes browser actions (`click`, `fill`, `type`, `press`, `wait`, `scroll`, `select`, `navigate`) inside an incognito Chromium context on a `browser-v1` worker node with dial-time SSRF isolation and automatic halt on anti-bot challenges.',
           security: authFetchSecurity(),
           requestBody: {
             required: true,

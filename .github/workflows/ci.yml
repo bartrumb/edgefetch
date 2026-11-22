@@ -93,7 +93,7 @@ jobs:
       - name: Verify cross-component version lockstep
         working-directory: .
         run: |
-          cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+          cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' addon/config.yaml)
           agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
           hub_ver=$(node -p "require('./hub/package.json').version")
           mcp_ver=$(node -p "require('./server.json').version")
@@ -149,13 +149,13 @@ jobs:
       - name: Verify Home Assistant Add-on CHANGELOG.md sync & version header
         working-directory: .
         run: |
-          if ! cmp -s CHANGELOG.md edgefetch_fat/CHANGELOG.md; then
-            echo "ERROR: edgefetch_fat/CHANGELOG.md is out of sync with root CHANGELOG.md (run: cp CHANGELOG.md edgefetch_fat/CHANGELOG.md)"
+          if ! cmp -s CHANGELOG.md addon/CHANGELOG.md; then
+            echo "ERROR: addon/CHANGELOG.md is out of sync with root CHANGELOG.md (run: cp CHANGELOG.md addon/CHANGELOG.md)"
             exit 1
           fi
-          ha_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
-          if ! grep -Fq "## [${ha_ver}]" edgefetch_fat/CHANGELOG.md; then
-            echo "ERROR: edgefetch_fat/CHANGELOG.md is missing release heading '## [${ha_ver}]' for config.yaml version ${ha_ver}"
+          ha_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' addon/config.yaml)
+          if ! grep -Fq "## [${ha_ver}]" addon/CHANGELOG.md; then
+            echo "ERROR: addon/CHANGELOG.md is missing release heading '## [${ha_ver}]' for config.yaml version ${ha_ver}"
             exit 1
           fi
 
@@ -170,15 +170,15 @@ jobs:
           docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile .
           docker buildx build --load --platform linux/amd64 -t edgefetch-agent:smoke -f Dockerfile.agent .
           docker buildx build --load --platform linux/amd64 -t edgefetch-aio:smoke -f Dockerfile.all-in-one .
-          docker buildx build --load --platform linux/amd64 -t edgefetch-ci:smoke -f edgefetch_fat/Dockerfile .
-          sed 's/^profile edgefetch_fat/profile c3b8e9a1_edgefetch_fat/' edgefetch_fat/apparmor.txt > /tmp/haos_edgefetch_fat.apparmor
-          sudo apparmor_parser -r /tmp/haos_edgefetch_fat.apparmor
+          docker buildx build --load --platform linux/amd64 -t edgefetch-ci:smoke -f addon/Dockerfile .
+          sed 's/^profile edgefetch/profile c3b8e9a1_edgefetch/' addon/apparmor.txt > /tmp/haos_edgefetch.apparmor
+          sudo apparmor_parser -r /tmp/haos_edgefetch.apparmor
           mkdir -p /tmp/ef-ha-data /tmp/ef-aio-data
           chmod 0755 /tmp/ef-ha-data
           printf '{"hub_url":"https://example.com","agent_token":"0123456789abcdef0123456789abcdef","site_id":"ci-node"}' > /tmp/ef-ha-data/options.json
           chmod 0644 /tmp/ef-ha-data/options.json
           docker run -d --rm --name ef-smoke \
-            --security-opt apparmor=c3b8e9a1_edgefetch_fat \
+            --security-opt apparmor=c3b8e9a1_edgefetch \
             --security-opt no-new-privileges:false \
             -v /tmp/ef-ha-data:/data \
             -e EDGEFETCH_ALLOW_NO_SANDBOX=1 \
@@ -186,7 +186,7 @@ jobs:
             -p 127.0.0.1:18080:8080 \
             --entrypoint /edgefetch \
             edgefetch-ci:smoke --mode=server --addr=0.0.0.0:8080
-          trap 'sudo dmesg | grep -i edgefetch_fat || true; docker logs ef-smoke || true; docker stop ef-smoke || true; docker logs ef-seccomp-smoke 2>/dev/null || true; docker stop ef-seccomp-smoke 2>/dev/null || true; docker logs ef-aio-smoke 2>/dev/null || true; docker stop ef-aio-smoke 2>/dev/null || true' EXIT
+          trap 'sudo dmesg | grep -i edgefetch || true; docker logs ef-smoke || true; docker stop ef-smoke || true; docker logs ef-seccomp-smoke 2>/dev/null || true; docker stop ef-seccomp-smoke 2>/dev/null || true; docker logs ef-aio-smoke 2>/dev/null || true; docker stop ef-aio-smoke 2>/dev/null || true' EXIT
           for i in $(seq 1 20); do
             curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
             sleep 0.5
@@ -198,7 +198,7 @@ jobs:
           ef_env_owner=$(sudo stat -c '%u:%g' "/proc/${ef_pid}/environ")
           echo "=== ef-smoke /proc/1/attr/current: ${ef_attr} | environ owner: ${ef_env_owner} ==="
           echo "${ef_status}"
-          echo "${ef_attr}" | grep -q 'edgefetch_fat (enforce)'
+          echo "${ef_attr}" | grep -q 'edgefetch (enforce)'
           echo "${ef_status}" | grep -Eq '^Uid:[[:space:]]+65532([[:space:]]+65532){3}$'
           echo "${ef_status}" | grep -Eq '^NoNewPrivs:[[:space:]]+1$'
           test "${ef_env_owner}" = "0:0"
@@ -225,8 +225,8 @@ jobs:
             -d '{"maxSeconds":45,"options":{"includeBody":false,"timeoutMs":35000},"requests":[{"id":"smoke","url":"https://example.com/","kind":"render","formats":["markdown"],"interact":{"actions":[{"type":"wait","selector":"p","waitMs":5000}]}},{"id":"webgl","url":"https://get.webgl.org/","kind":"render","formats":["markdown"],"waitForMs":2500}]}' \
             http://127.0.0.1:18080/fetch)
           echo "$resp"
-          if sudo dmesg | grep -qi 'apparmor="DENIED".*edgefetch_fat'; then
-            sudo dmesg | grep -i 'edgefetch_fat' || true
+          if sudo dmesg | grep -qi 'apparmor="DENIED".*edgefetch'; then
+            sudo dmesg | grep -i 'edgefetch' || true
             exit 1
           fi
           echo "$resp" | grep -q '"id":"smoke".*"outcome":"ok"'

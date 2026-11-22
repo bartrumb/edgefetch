@@ -26,10 +26,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bartrumb/edgefetch/v2/internal/agent"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 )
 
 // ReleaseSigningPublicKeyPEM is the pinned Ed25519 SPKI public key (`keys/release-signing-pub.pem`)
@@ -715,4 +717,106 @@ func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Wri
 	}
 	_, _ = fmt.Fprintf(stdout, "Updated edgefetch v%s -> %s (%s)\n", curVer, targetTag, exePath)
 	return 0
+}
+
+const mcpBackgroundUpdateCacheTTL = 24 * time.Hour
+
+// ShouldCheckBackgroundUpdates enforces zero default phone-home in `edgefetch mcp`:
+// background GitHub release checks run ONLY when `EDGEFETCH_CHECK_UPDATES=1` (or `true`)
+// is explicitly set, and remain disabled whenever `EDGEFETCH_DISABLE_UPDATE_CHECK=1`
+// or `DO_NOT_TRACK=1` is set.
+func ShouldCheckBackgroundUpdates(getenv func(string) string) bool {
+	if getenv == nil {
+		return false
+	}
+	if otel.IsDoNotTrack(getenv("DO_NOT_TRACK")) {
+		return false
+	}
+	if isTruthyEnv(getenv("EDGEFETCH_DISABLE_UPDATE_CHECK")) {
+		return false
+	}
+	return isTruthyEnv(getenv("EDGEFETCH_CHECK_UPDATES"))
+}
+
+func resolveUpdateNoticeCachePath(customPath string) string {
+	if trimmed := strings.TrimSpace(customPath); trimmed != "" {
+		return trimmed
+	}
+	if dir, err := os.UserCacheDir(); err == nil && strings.TrimSpace(dir) != "" {
+		return filepath.Join(dir, "edgefetch", "update-check.json")
+	}
+	return ""
+}
+
+type cachedUpdateNotice struct {
+	CheckedAtUnix int64  `json:"checkedAtUnix"`
+	LatestTag     string `json:"latestTag"`
+}
+
+func startOptInMCPUpdateNotice(ctx context.Context, stderr io.Writer, deps cliDeps) func() {
+	if !ShouldCheckBackgroundUpdates(deps.getenv) {
+		return func() {}
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runOptInMCPUpdateNoticeOnce(checkCtx, stderr, deps)
+	}()
+	return func() {
+		cancel()
+		wg.Wait()
+	}
+}
+
+func runOptInMCPUpdateNoticeOnce(ctx context.Context, stderr io.Writer, deps cliDeps) {
+	curVer := strings.TrimPrefix(agent.Version, "v")
+	cachePath := resolveUpdateNoticeCachePath(deps.updateCachePath)
+	now := time.Now()
+
+	if cachePath != "" {
+		if raw, err := os.ReadFile(cachePath); err == nil {
+			var cached cachedUpdateNotice
+			if json.Unmarshal(raw, &cached) == nil && cached.CheckedAtUnix > 0 {
+				age := now.Sub(time.Unix(cached.CheckedAtUnix, 0))
+				if age >= 0 && age < mcpBackgroundUpdateCacheTTL {
+					if tag, _, tErr := normalizeReleaseTag(cached.LatestTag); tErr == nil && compareSemverTags(tag, "v"+curVer) > 0 && stderr != nil {
+						_, _ = fmt.Fprintf(stderr, "[edgefetch] Update available: v%s -> %s (run 'edgefetch update' to verify Ed25519 signature & install)\n", curVer, tag)
+					}
+					return
+				}
+			}
+		}
+	}
+
+	apiBase := strings.TrimRight(firstNonEmpty(deps.updateAPIBase, defaultGitHubAPIBaseURL), "/")
+	client := newUpdateHTTPClient(deps.allow, deps.transport)
+	relURL := fmt.Sprintf("%s/repos/%s/releases/latest", apiBase, githubReleaseRepo)
+	relBytes, err := fetchBytesBounded(ctx, client, deps.allow, relURL, maxReleaseJSONBytes, "application/vnd.github+json")
+	if err != nil {
+		return
+	}
+	var relMeta struct {
+		TagName string `json:"tag_name"`
+	}
+	if json.Unmarshal(relBytes, &relMeta) != nil {
+		return
+	}
+	latestTag, _, err := normalizeReleaseTag(relMeta.TagName)
+	if err != nil {
+		return
+	}
+
+	if cachePath != "" {
+		if mkErr := os.MkdirAll(filepath.Dir(cachePath), 0o700); mkErr == nil {
+			if b, mErr := json.Marshal(cachedUpdateNotice{CheckedAtUnix: now.Unix(), LatestTag: latestTag}); mErr == nil {
+				_ = os.WriteFile(cachePath, b, 0o600)
+			}
+		}
+	}
+
+	if compareSemverTags(latestTag, "v"+curVer) > 0 && stderr != nil {
+		_, _ = fmt.Fprintf(stderr, "[edgefetch] Update available: v%s -> %s (run 'edgefetch update' to verify Ed25519 signature & install)\n", curVer, latestTag)
+	}
 }

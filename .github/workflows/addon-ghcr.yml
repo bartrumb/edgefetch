@@ -8,7 +8,7 @@ on:
     paths:
       - 'cmd/**'
       - 'internal/**'
-      - 'edgefetch_fat/**'
+      - 'addon/**'
       - 'Dockerfile'
       - 'Dockerfile.agent'
       - 'go.mod'
@@ -22,7 +22,7 @@ permissions:
 jobs:
   verify-tests:
     name: Gate Release Add-on Images on Go & Hub Test Suites
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -67,13 +67,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - addon_dir: edgefetch_fat
-            image_prefix: edgefetch-fat-addon
+          - addon_dir: addon
+            image_prefix: edgefetch-addon
             platform: linux/amd64
             ha_arch: amd64
-            runner: ubuntu-latest
-          - addon_dir: edgefetch_fat
-            image_prefix: edgefetch-fat-addon
+            runner: ubuntu-24.04
+          - addon_dir: addon
+            image_prefix: edgefetch-addon
             platform: linux/arm64
             ha_arch: aarch64
             runner: ubuntu-24.04-arm
@@ -162,13 +162,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - addon_dir: edgefetch_fat
-            image_prefix: edgefetch-fat-addon
+          - addon_dir: addon
+            image_prefix: edgefetch-addon
             platform: linux/amd64
             ha_arch: amd64
-            runner: ubuntu-latest
-          - addon_dir: edgefetch_fat
-            image_prefix: edgefetch-fat-addon
+            runner: ubuntu-24.04
+          - addon_dir: addon
+            image_prefix: edgefetch-addon
             platform: linux/arm64
             ha_arch: aarch64
             runner: ubuntu-24.04-arm
@@ -242,7 +242,7 @@ jobs:
 
   publish-standalone-multiarch:
     name: Publish Multi-Arch OCI Agent Images (edge)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: "!startsWith(github.ref, 'refs/tags/v')"
     permissions:
       contents: read
@@ -260,7 +260,7 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+          ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' addon/config.yaml)
           agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
           hub_ver=$(node -p "require('./hub/package.json').version")
           if [ -z "$ver" ] || [ -z "$agent_ver" ] || [ -z "$hub_ver" ]; then
@@ -268,7 +268,7 @@ jobs:
             exit 1
           fi
           if [ "$ver" != "$agent_ver" ] || [ "$ver" != "$hub_ver" ]; then
-            echo "::error::Version lockstep mismatch: edgefetch_fat/config.yaml='v${ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}'"
+            echo "::error::Version lockstep mismatch: addon/config.yaml='v${ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}'"
             exit 1
           fi
           owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
@@ -279,11 +279,11 @@ jobs:
               echo "::error::Tag '${REF_NAME}' does not match repository version 'v${ver}'"
               exit 1
             fi
-            echo "fat_tags=${image}:latest,${image}:${ver}" >> "$GITHUB_OUTPUT"
+            echo "browser_tags=${image}:latest,${image}:${ver}" >> "$GITHUB_OUTPUT"
             echo "lite_tags=${image}:lite,${image}:${ver}-lite" >> "$GITHUB_OUTPUT"
             echo "aio_tags=ghcr.io/${owner}/edgefetch:latest,ghcr.io/${owner}/edgefetch:${ver}" >> "$GITHUB_OUTPUT"
           else
-            echo "fat_tags=${image}:edge,${image}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+            echo "browser_tags=${image}:edge,${image}:sha-${short_sha}" >> "$GITHUB_OUTPUT"
             echo "lite_tags=${image}:edge-lite,${image}:sha-${short_sha}-lite" >> "$GITHUB_OUTPUT"
             echo "aio_tags=ghcr.io/${owner}/edgefetch:edge,ghcr.io/${owner}/edgefetch:sha-${short_sha}" >> "$GITHUB_OUTPUT"
           fi
@@ -300,8 +300,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push Multi-Arch Fat Agent (amd64 + arm64)
-        id: push-fat
+      - name: Build & Push Multi-Arch Browser Agent (amd64 + arm64)
+        id: push-browser
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -309,13 +309,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
           push: true
-          tags: ${{ steps.meta.outputs.fat_tags }}
+          tags: ${{ steps.meta.outputs.browser_tags }}
 
-      - name: Attest Multi-Arch Fat Agent
+      - name: Attest Multi-Arch Browser Agent
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.meta.outputs.image }}
-          subject-digest: ${{ steps.push-fat.outputs.digest }}
+          subject-digest: ${{ steps.push-browser.outputs.digest }}
           push-to-registry: true
 
       - name: Build & Push Multi-Arch Distroless Lite Agent (amd64 + arm64)

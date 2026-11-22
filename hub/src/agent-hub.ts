@@ -1046,8 +1046,8 @@ export class AgentHubEngine {
           status: 503,
           error: 'fat_agent_required',
           message: wantSite
-            ? `HAOS site '${wantSite}' is offline or does not advertise browser-v1 (deploy edgefetch_fat)`
-            : 'Headless browser rendering / interact requires at least one connected edgefetch_fat (browser-v1) node',
+            ? `Worker node '${wantSite}' is offline or does not advertise browser-v1`
+            : 'Headless browser rendering / interact requires at least one connected browser-v1 worker node',
         };
       }
       const msg = wantSite

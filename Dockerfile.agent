@@ -1,9 +1,9 @@
-# Standalone Multi-Arch (`linux/amd64` + `linux/arm64`) EdgeFetch Fat Worker (`ghcr.io/bartrumb/edgefetch-agent:latest`).
+# Standalone Multi-Arch (`linux/amd64` + `linux/arm64`) EdgeFetch Browser Worker (`ghcr.io/bartrumb/edgefetch-agent:latest`).
 # Runs as unprivileged `65532:65532` (`nonroot`) on any Linux, macOS, Windows, NAS, Raspberry Pi, or VPS — no Home
 # Assistant OS required. Bundles static Go HTTP/2 binary + SSRF-proxied Headless Chromium + SwiftShader + Poppler PDF.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.7.1
+ARG BUILD_VERSION=2.7.2
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-$(go env GOARCH)} go build -tr
       -o /out/edgefetch ./cmd/edgefetch
 
 FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
-LABEL org.opencontainers.image.title="EdgeFetch Agent (Fat)" \
+LABEL org.opencontainers.image.title="EdgeFetch Agent" \
       org.opencontainers.image.description="Multi-arch outbound Go HTTP/2 + SSRF-proxied Headless Chromium + Poppler PDF worker" \
       org.opencontainers.image.source="https://github.com/bartrumb/edgefetch" \
       org.opencontainers.image.licenses="MIT" \

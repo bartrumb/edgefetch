@@ -1155,7 +1155,7 @@ test('V2-3: EdgeFetchClient TypeScript SDK formats requests and surfaces typed E
       const hdrs = new Headers(init?.headers);
       seen.push({ method: init?.method ?? 'GET', url: String(input), auth: hdrs.get('authorization') ?? '' });
       if (String(input).endsWith('/v1/interact')) {
-        return Response.json({ error: 'fat_agent_required', message: 'Deploy edgefetch_fat' }, { status: 503 });
+        return Response.json({ error: 'fat_agent_required', message: 'Connect a browser-v1 worker node' }, { status: 503 });
       }
       return Response.json({ ok: true, markdown: '# Hello SDK' }, { status: 200 });
     },
@@ -3195,7 +3195,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.7.1');
+    assert.equal(caps.version, '2.7.2');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);

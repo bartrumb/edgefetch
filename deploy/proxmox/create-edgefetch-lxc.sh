@@ -18,7 +18,7 @@ STORAGE="${STORAGE:-local-lvm}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
 BRIDGE="${BRIDGE:-vmbr0}"
 PROFILE="${EDGEFETCH_PROFILE:-fat}" # "fat" (Chromium + Poppler, 512 MiB RAM) or "lite" (HTTP/2 + pure-Go PDF, 64 MiB RAM)
-VERSION="${EDGEFETCH_VERSION:-2.7.1}"
+VERSION="${EDGEFETCH_VERSION:-2.7.2}"
 
 if [[ -z "${EDGEFETCH_HUB_URL:-}" || -z "${EDGEFETCH_AGENT_TOKEN:-}" ]]; then
   echo "ERROR: EDGEFETCH_HUB_URL and EDGEFETCH_AGENT_TOKEN must be set." >&2

@@ -12135,7 +12135,7 @@ function constantTimeHexEqual(a: string, b: string): boolean {
 }
 
 /**
- * Executes `POST /v1/interact` + MCP `interact` (`firecrawl_interact` parity) against a `browser-v1` (`edgefetch_fat`)
+ * Executes `POST /v1/interact` + MCP `interact` (`firecrawl_interact` parity) against a `browser-v1` worker
  * node. Composite `<siteId>.<efsess_id>[.<hmac32>]` tokens ensure follow-up turns route back to the exact node holding
  * the tab AND prevent cross-caller session hijacking on multi-client OAuth Hubs.
  */

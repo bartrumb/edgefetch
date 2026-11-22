@@ -6,7 +6,7 @@
 // Chromium's native OS process sandbox (AppContainer/Restricted Token on Windows, Seatbelt on macOS, and
 // user/PID/network namespaces + seccomp-bpf on Linux) is enabled by default. On Linux, [Renderer.ProbeStartup]
 // and `ensureBrowser` probe native sandbox support first and automatically fall back to container-isolated flags
-// when container MAC profiles (such as AppArmor `edgefetch_fat`), `NO_NEW_PRIVS`, or restricted user namespaces
+// when container MAC profiles (such as AppArmor `edgefetch`), `NO_NEW_PRIVS`, or restricted user namespaces
 // block unprivileged namespace creation — unless `EDGEFETCH_REQUIRE_BROWSER_SANDBOX=1` is set, in which case
 // browser rendering fails closed (`Available() == false`). Active browser version and sandbox state (`"on"`,
 // `"off"`, or `"unknown"`) are reported via [Renderer.BrowserInfo].

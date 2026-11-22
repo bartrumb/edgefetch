@@ -1,6 +1,6 @@
 #include <tunables/global>
 
-profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
+profile edgefetch flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
   #include <abstractions/nameservice>
   #include <abstractions/ssl_certs>
@@ -15,7 +15,7 @@ profile edgefetch_fat flags=(attach_disconnected,mediate_deleted) {
   network unix dgram,
   unix (create, bind, listen, accept, connect, send, receive, getattr, setattr, setopt, getopt, shutdown),
   # Unrestricted peer label so signals continue working after Home Assistant Supervisor rewrites
-  # `profile edgefetch_fat` -> `profile <repo_slug>_edgefetch_fat` via `adjust_profile()`.
+  # `profile edgefetch` -> `profile <repo_slug>_edgefetch` via `adjust_profile()`.
   signal (send, receive),
   deny network raw,
   deny network packet,

@@ -12,7 +12,7 @@ permissions:
 jobs:
   verify-tests:
     name: Gate Release on Go & Hub Test Suites
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,7 +46,7 @@ jobs:
 
   release:
     name: Build, Sign & Attest Release Archives (GoReleaser + Ed25519 + SLSA)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [verify-tests]
     if: startsWith(github.ref, 'refs/tags/v')
     environment: release
@@ -64,7 +64,7 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+          cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' addon/config.yaml)
           agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
           hub_ver=$(node -p "require('./hub/package.json').version")
           mcp_ver=$(node -p "require('./server.json').version")
@@ -74,7 +74,7 @@ jobs:
             exit 1
           fi
           if [ "$cfg_ver" != "$agent_ver" ] || [ "$cfg_ver" != "$hub_ver" ] || [ "$mcp_ver" != "$cfg_ver" ] || [ "$mcp_pkg" != "ghcr.io/bartrumb/edgefetch-agent:${cfg_ver}" ]; then
-            echo "::error::Version lockstep mismatch: edgefetch_fat/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}', server.json='v${mcp_ver}' (${mcp_pkg})"
+            echo "::error::Version lockstep mismatch: addon/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}', server.json='v${mcp_ver}' (${mcp_pkg})"
             exit 1
           fi
           if [ "$REF_NAME" != "v${cfg_ver}" ] || [ "$REF_NAME" != "v${agent_ver}" ] || [ "$REF_NAME" != "v${hub_ver}" ]; then
@@ -146,7 +146,7 @@ jobs:
 
   ghcr-release:
     name: Publish & Attest GHCR Images (agent:latest, agent:lite & all-in-one)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [release]
     if: startsWith(github.ref, 'refs/tags/v')
     environment: release
@@ -166,7 +166,7 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+          cfg_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' addon/config.yaml)
           agent_ver=$(sed -n 's/^var[[:space:]]\+Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' internal/agent/agent.go)
           hub_ver=$(node -p "require('./hub/package.json').version")
           mcp_ver=$(node -p "require('./server.json').version")
@@ -176,7 +176,7 @@ jobs:
             exit 1
           fi
           if [ "$cfg_ver" != "$agent_ver" ] || [ "$cfg_ver" != "$hub_ver" ] || [ "$mcp_ver" != "$cfg_ver" ] || [ "$mcp_pkg" != "ghcr.io/bartrumb/edgefetch-agent:${cfg_ver}" ]; then
-            echo "::error::Version lockstep mismatch: edgefetch_fat/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}', server.json='v${mcp_ver}' (${mcp_pkg})"
+            echo "::error::Version lockstep mismatch: addon/config.yaml='v${cfg_ver}', internal/agent/agent.go='v${agent_ver}', hub/package.json='v${hub_ver}', server.json='v${mcp_ver}' (${mcp_pkg})"
             exit 1
           fi
           owner=$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
@@ -186,13 +186,13 @@ jobs:
               exit 1
             fi
             ver="$cfg_ver"
-            echo "fat_tags=ghcr.io/${owner}/edgefetch-agent:latest,ghcr.io/${owner}/edgefetch-agent:${ver}" >> "$GITHUB_OUTPUT"
+            echo "browser_tags=ghcr.io/${owner}/edgefetch-agent:latest,ghcr.io/${owner}/edgefetch-agent:${ver}" >> "$GITHUB_OUTPUT"
             echo "lite_tags=ghcr.io/${owner}/edgefetch-agent:lite,ghcr.io/${owner}/edgefetch-agent:${ver}-lite" >> "$GITHUB_OUTPUT"
             echo "aio_tags=ghcr.io/${owner}/edgefetch:latest,ghcr.io/${owner}/edgefetch:${ver}" >> "$GITHUB_OUTPUT"
           else
             ver="$cfg_ver"
             short_sha="${GITHUB_SHA::7}"
-            echo "fat_tags=ghcr.io/${owner}/edgefetch-agent:edge,ghcr.io/${owner}/edgefetch-agent:sha-${short_sha}" >> "$GITHUB_OUTPUT"
+            echo "browser_tags=ghcr.io/${owner}/edgefetch-agent:edge,ghcr.io/${owner}/edgefetch-agent:sha-${short_sha}" >> "$GITHUB_OUTPUT"
             echo "lite_tags=ghcr.io/${owner}/edgefetch-agent:edge-lite,ghcr.io/${owner}/edgefetch-agent:sha-${short_sha}-lite" >> "$GITHUB_OUTPUT"
             echo "aio_tags=ghcr.io/${owner}/edgefetch:edge,ghcr.io/${owner}/edgefetch:sha-${short_sha}" >> "$GITHUB_OUTPUT"
           fi
@@ -208,8 +208,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push Fat Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent)
-        id: push-fat
+      - name: Build & Push Browser Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent)
+        id: push-browser
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -217,13 +217,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: BUILD_VERSION=${{ steps.meta.outputs.version }}
           push: true
-          tags: ${{ steps.meta.outputs.fat_tags }}
+          tags: ${{ steps.meta.outputs.browser_tags }}
 
-      - name: Attest Fat Agent OCI Image
+      - name: Attest Browser Agent OCI Image
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent
-          subject-digest: ${{ steps.push-fat.outputs.digest }}
+          subject-digest: ${{ steps.push-browser.outputs.digest }}
           push-to-registry: true
 
       - name: Build & Push Distroless Lite Agent (ghcr.io/${{ steps.meta.outputs.owner }}/edgefetch-agent:lite)

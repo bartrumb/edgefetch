@@ -1941,7 +1941,7 @@ export class CrawlWorkflow extends WorkflowEntrypoint<OptionalStorageBindings, C
           env: this.env,
           ...(event.payload.selfHost ? { selfHost: event.payload.selfHost } : {}),
           executeHubFetch: async (_target, body) => {
-            const res = await cloudflareOverflowFetch(body, 'EdgeFetch/2.7.1', event.payload.selfHost ?? 'localhost');
+            const res = await cloudflareOverflowFetch(body, 'EdgeFetch/2.7.2', event.payload.selfHost ?? 'localhost');
             return { status: res.status, via: 'cf', bodyText: await res.text() };
           },
         });

@@ -1780,7 +1780,6 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             markdown: { type: 'string' },
             json: { type: 'object' },
             jsonExtractionMode: { type: 'string', enum: ['heuristic', 'llm'] },
-            sectionExpandedFromHeading: { type: 'boolean' },
             warnings: { type: 'array', items: { type: 'string' } },
             links: { type: 'array', items: { type: 'string' } },
             metadata: { type: 'object' },

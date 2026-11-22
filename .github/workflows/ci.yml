@@ -168,7 +168,7 @@ jobs:
       - name: Build server, all-in-one & HAOS add-on images + live AppArmor, Dumpable & UID-isolation smoke tests
         run: |
           docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile .
-          docker buildx build --platform linux/amd64 -f Dockerfile.agent .
+          docker buildx build --load --platform linux/amd64 -t edgefetch-agent:smoke -f Dockerfile.agent .
           docker buildx build --load --platform linux/amd64 -t edgefetch-aio:smoke -f Dockerfile.all-in-one .
           docker buildx build --load --platform linux/amd64 -t edgefetch-ci:smoke -f edgefetch_fat/Dockerfile .
           sed 's/^profile edgefetch_fat/profile c3b8e9a1_edgefetch_fat/' edgefetch_fat/apparmor.txt > /tmp/haos_edgefetch_fat.apparmor
@@ -181,11 +181,12 @@ jobs:
             --security-opt apparmor=c3b8e9a1_edgefetch_fat \
             --security-opt no-new-privileges:false \
             -v /tmp/ef-ha-data:/data \
+            -e EDGEFETCH_ALLOW_NO_SANDBOX=1 \
             -e EDGEFETCH_SERVER_TOKEN=ci-smoke-token-0123456789abcdef \
             -p 127.0.0.1:18080:8080 \
             --entrypoint /edgefetch \
             edgefetch-ci:smoke --mode=server --addr=0.0.0.0:8080
-          trap 'sudo dmesg | grep -i edgefetch_fat || true; docker logs ef-smoke || true; docker stop ef-smoke || true; docker logs ef-aio-smoke 2>/dev/null || true; docker stop ef-aio-smoke 2>/dev/null || true' EXIT
+          trap 'sudo dmesg | grep -i edgefetch_fat || true; docker logs ef-smoke || true; docker stop ef-smoke || true; docker logs ef-seccomp-smoke 2>/dev/null || true; docker stop ef-seccomp-smoke 2>/dev/null || true; docker logs ef-aio-smoke 2>/dev/null || true; docker stop ef-aio-smoke 2>/dev/null || true' EXIT
           for i in $(seq 1 20); do
             curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
             sleep 0.5
@@ -230,6 +231,29 @@ jobs:
           fi
           echo "$resp" | grep -q '"id":"smoke".*"outcome":"ok"'
           echo "$resp" | grep -q '"id":"webgl".*"outcome":"ok"'
+
+          # Exercise REAL Chromium OS namespace + seccomp sandbox (`browserSandbox: "on"`, ZERO EDGEFETCH_ALLOW_NO_SANDBOX)!
+          docker run -d --rm --name ef-seccomp-smoke \
+            --security-opt seccomp=./deploy/seccomp/chromium-sandbox.json \
+            --security-opt no-new-privileges:true \
+            -e EDGEFETCH_REQUIRE_BROWSER_SANDBOX=1 \
+            -e EDGEFETCH_SERVER_TOKEN=ci-smoke-token-0123456789abcdef \
+            -p 127.0.0.1:18081:8080 \
+            --entrypoint /edgefetch \
+            edgefetch-agent:smoke --mode=server --addr=0.0.0.0:8080
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:18081/healthz >/dev/null && break
+            sleep 0.5
+          done
+          sb_resp=$(curl -fsS -H "Authorization: Bearer ci-smoke-token-0123456789abcdef" \
+            -H "Content-Type: application/json" \
+            -d '{"maxSeconds":30,"options":{"includeBody":false,"timeoutMs":25000},"requests":[{"id":"sb-smoke","url":"https://example.com/","kind":"render","formats":["markdown"]}]}' \
+            http://127.0.0.1:18081/fetch)
+          echo "${sb_resp}"
+          echo "${sb_resp}" | grep -q '"id":"sb-smoke".*"outcome":"ok"'
+          echo "${sb_resp}" | grep -q '"rendered":true'
+          docker logs ef-seccomp-smoke 2>&1 | grep -q '"sandbox":"on"'
+          docker stop ef-seccomp-smoke
 
           # Smoke-test Dockerfile.all-in-one H3 UID isolation: Hub runs as node (1000), worker runs as 65532,
           # and UID 65532 gets Permission denied reading /proc/<hub_pid>/environ and /data/hub!

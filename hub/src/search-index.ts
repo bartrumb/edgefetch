@@ -1205,7 +1205,13 @@ export async function executeExtractCall(params: {
   const redactPii = Boolean(payload.redactPii);
   const waybackFallback = Boolean(payload.waybackFallback);
   const spaFallbackMode = normalizeSpaFallbackMode(payload.spaFallback);
-  const visibility = normalizeVisibility(payload.visibility, payload.headers);
+  const visibility = normalizeVisibility(payload.visibility, payload.headers, {
+    cookies: (payload as { cookies?: unknown }).cookies,
+    preferMcp:
+      (payload as { useConnectedMcp?: unknown }).useConnectedMcp === true ||
+      (payload as { preferMcp?: unknown }).preferMcp === true,
+    userId,
+  });
   const isPrivateExtract = visibility === 'private';
   let collectionId: string | undefined;
   if (typeof payload.collectionId === 'string' && payload.collectionId.trim()) {

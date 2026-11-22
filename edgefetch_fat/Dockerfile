@@ -34,11 +34,7 @@ RUN apk add --no-cache \
 COPY --from=build /out/edgefetch /edgefetch
 # The real binary, not /usr/bin/chromium-browser: on Alpine that is a /bin/sh launcher script, and the AppArmor
 # profile lets no shell run, so every launch failed with "permission denied" (2.0.0).
-# Home Assistant OS confines add-on containers under the `edgefetch_fat` AppArmor profile + Docker's default seccomp
-# (which blocks unprivileged `CLONE_NEWUSER` namespaces), so explicitly opt into `--no-sandbox` inside HAOS while
-# keeping AppArmor + UID 65532 + PR_SET_NO_NEW_PRIVS=1 + PR_SET_DUMPABLE=0 + SSRFProxy active.
 ENV EDGEFETCH_CHROME_BIN=/usr/lib/chromium/chromium \
-    EDGEFETCH_ALLOW_NO_SANDBOX=1 \
     GOMEMLIMIT=384MiB \
     HOME=/tmp
 ENTRYPOINT ["/edgefetch", "--mode=agent"]

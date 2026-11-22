@@ -428,6 +428,72 @@ test('A.3: scrape cache key includes output-affecting options and preserves cons
   });
   assert.equal(fetchCalls, 3);
   assert.equal(String(includeTagScrape.body.markdown).trim(), 'Extra box details.');
+
+  // 5) H4 + OptionsScrapeCache tenant & credential isolation:
+  //    - Custom cookies/headers or non-owner userId MUST force visibility: 'private'
+  //    - MUST NOT read the public OptionsScrapeCache populated above
+  //    - MUST NOT poison public OptionsScrapeCache, and truncated cached markdownArtifactId stays tenant-scoped!
+  const privCookieScrape = await executeScrapeCall({
+    payload: {
+      url: 'https://cache-test.example.com/doc',
+      onlyMainContent: false,
+      cookies: [{ name: 'session', value: 'secret-cookie' }],
+      maxAgeMs: 60_000,
+    },
+    env: { ARTIFACTS: bucket, META: metaDb },
+    executeHubFetch: async () => {
+      fetchCalls++;
+      return {
+        status: 200,
+        via: 'agent:site-1',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-priv-1',
+              url: 'https://cache-test.example.com/doc',
+              finalUrl: 'https://cache-test.example.com/doc',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              body: '<!doctype html><html><body><main><p>' + 'Private authenticated secret paragraph. '.repeat(20) + '</p></main></body></html>',
+            },
+          ],
+        }),
+      };
+    },
+    userId: 'gh_42',
+  });
+  assert.equal(privCookieScrape.body.cached, false);
+  assert.equal(privCookieScrape.body.visibility, 'private');
+  assert.equal(fetchCalls, 4, 'Authenticated/tenant scrape must never read public OptionsScrapeCache');
+
+  // Truncated private cache hit for gh_42 resolves readArtifactPage for gh_42 ONLY (404 for gh_99 and owner public):
+  const privCachedTrunc = await executeScrapeCall({
+    payload: {
+      url: 'https://cache-test.example.com/doc',
+      onlyMainContent: false,
+      cookies: [{ name: 'session', value: 'secret-cookie' }],
+      maxChars: 120,
+      maxAgeMs: 60_000,
+    },
+    env: { ARTIFACTS: bucket, META: metaDb },
+    executeHubFetch: mockHubFetch,
+    userId: 'gh_42',
+  });
+  assert.equal(privCachedTrunc.body.cached, true);
+  assert.equal(privCachedTrunc.body.visibility, 'private');
+  assert.equal(privCachedTrunc.body.truncated, true);
+  const privMdId = String(privCachedTrunc.body.markdownArtifactId);
+  assert.match(privMdId, /^md:[0-9a-f]{64}$/);
+
+  const gh42Art = await readArtifactPage({ bucket, blobSha256: privMdId, userId: 'gh_42' });
+  assert.equal(gh42Art.ok, true);
+  const gh99Art = await readArtifactPage({ bucket, blobSha256: privMdId, userId: 'gh_99' });
+  assert.equal(gh99Art.ok, false);
+  assert.equal(gh99Art.status, 404);
+  const publicArt = await readArtifactPage({ bucket, blobSha256: privMdId, userId: 'owner' });
+  assert.equal(publicArt.ok, false);
+  assert.equal(publicArt.status, 404);
 });
 
 test('A.4: heuristic JSON-Schema extraction matches headerName + <dl> directives, never omits properties, and warns on unmatched fields', async () => {
@@ -505,7 +571,7 @@ test('A.4: heuristic JSON-Schema extraction matches headerName + <dl> directives
   assert.ok(Array.isArray(scrapeJsonRes.body.warnings) && (scrapeJsonRes.body.warnings as string[]).length > 0);
 });
 
-test('A.5: wrangler.toml binds CRAWL CrawlWorkflow in production, and MCP crawl completes <=5 limit inline without leaking principal/pollUrl', async () => {
+test('A.5: wrangler.toml binds CRAWL CrawlWorkflow in production, and MCP crawl dispatches asynchronously to env.CRAWL without leaking principal/pollUrl', async () => {
   const wranglerToml = readFileSync(resolve('wrangler.toml'), 'utf8');
   assert.match(wranglerToml, /\[\[env\.production\.workflows\]\][\s\S]*?binding\s*=\s*"CRAWL"[\s\S]*?class_name\s*=\s*"CrawlWorkflow"/);
 
@@ -513,7 +579,7 @@ test('A.5: wrangler.toml binds CRAWL CrawlWorkflow in production, and MCP crawl 
   const searchDb = createSqliteD1(SEARCH_SQL);
   const bucket = createMemoryR2Bucket();
   const coordinator = new LocalAgentHubCoordinator(':memory:');
-  let workflowCreatedId: string | undefined;
+  const workflowCreatedIds: string[] = [];
 
   const env = {
     AGENT_HUB: coordinator.asNamespace() as never,
@@ -523,7 +589,7 @@ test('A.5: wrangler.toml binds CRAWL CrawlWorkflow in production, and MCP crawl 
     ARTIFACTS: bucket,
     CRAWL: {
       async create(opts?: { id?: string }) {
-        workflowCreatedId = opts?.id;
+        if (opts?.id) workflowCreatedIds.push(opts.id);
         return { id: opts?.id ?? 'wf_1' };
       },
     },
@@ -538,59 +604,36 @@ test('A.5: wrangler.toml binds CRAWL CrawlWorkflow in production, and MCP crawl 
     }) as typeof fetch,
   };
 
-  // 1) Small interactive MCP crawl (`limit: 2 <= 5`) completes inline in 1 call (status 200, completed)!
-  const inlineMcpReq = new Request('https://hub.example.com/mcp', {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${env.CALLER_TOKEN}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tools/call',
-      params: {
-        name: 'crawl',
-        arguments: { url: 'https://iana.example.org/', limit: 2, maxDepth: 1 },
+  for (const [idx, limit] of [2, 10].entries()) {
+    const mcpReq = new Request('https://hub.example.com/mcp', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${env.CALLER_TOKEN}`,
+        'content-type': 'application/json',
       },
-    }),
-  });
-  const inlineRes = await hubWorker.fetch(inlineMcpReq, env as never, { waitUntil() {}, passThroughOnException() {} } as never);
-  assert.equal(inlineRes.status, 200);
-  const inlineRpc = (await inlineRes.json()) as { result: { content: Array<{ text: string }> } };
-  const inlineCrawlBody = JSON.parse(inlineRpc.result.content[0]!.text) as Record<string, unknown>;
-  assert.equal(inlineCrawlBody.status, 'completed');
-  assert.equal(inlineCrawlBody.principal, undefined);
-  assert.equal(inlineCrawlBody.pollUrl, undefined);
-
-  // 2) Larger async MCP crawl (`limit: 10 > 5`) dispatches to env.CRAWL workflow and omits principal & pollUrl!
-  const asyncMcpReq = new Request('https://hub.example.com/mcp', {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${env.CALLER_TOKEN}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'tools/call',
-      params: {
-        name: 'crawl',
-        arguments: { url: 'https://iana.example.org/', limit: 10, maxDepth: 2 },
-      },
-    }),
-  });
-  const asyncRes = await hubWorker.fetch(asyncMcpReq, env as never, { waitUntil() {}, passThroughOnException() {} } as never);
-  const asyncRpc = (await asyncRes.json()) as { result: { content: Array<{ text: string }> } };
-  const asyncCrawlBody = JSON.parse(asyncRpc.result.content[0]!.text) as Record<string, unknown>;
-  assert.equal(asyncCrawlBody.status, 'queued');
-  assert.equal(asyncCrawlBody.crawlId, workflowCreatedId);
-  assert.equal(asyncCrawlBody.principal, undefined);
-  assert.equal(asyncCrawlBody.pollUrl, undefined);
-  assert.match(String(asyncCrawlBody.pollHint), /crawlId/);
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: idx + 1,
+        method: 'tools/call',
+        params: {
+          name: 'crawl',
+          arguments: { url: 'https://iana.example.org/', limit, maxDepth: 1 },
+        },
+      }),
+    });
+    const mcpRes = await hubWorker.fetch(mcpReq, env as never, { waitUntil() {}, passThroughOnException() {} } as never);
+    assert.equal(mcpRes.status, 200);
+    const rpc = (await mcpRes.json()) as { result: { content: Array<{ text: string }> } };
+    const crawlBody = JSON.parse(rpc.result.content[0]!.text) as Record<string, unknown>;
+    assert.equal(crawlBody.status, 'queued');
+    assert.equal(crawlBody.crawlId, workflowCreatedIds[idx]);
+    assert.equal(crawlBody.principal, undefined);
+    assert.equal(crawlBody.pollUrl, undefined);
+    assert.match(String(crawlBody.pollHint), /crawlId/);
+  }
 });
 
-test('B.1, B.2 & B.7: scriptless static HTML never triggers browser-auto, preserves primary <h1>, strips Wikipedia edit chrome & RFC pilcrows, and expands heading-only includeTags', async () => {
+test('B.1 & B.2: scriptless static HTML never triggers browser-auto, preserves primary <h1>, and strips Wikipedia edit chrome & RFC pilcrows', async () => {
   // B.1: example.com pure static HTML (zero <script> tags) + <header><h1>Example Domain</h1></header>
   const exampleHtml =
     '<!doctype html><html><head><title>Example Domain</title></head>' +
@@ -649,33 +692,6 @@ test('B.1, B.2 & B.7: scriptless static HTML never triggers browser-auto, preser
   assert.equal(cleanedDoc.markdown.includes('¶'), false);
   assert.match(cleanedDoc.markdown, /## History/);
   assert.match(cleanedDoc.markdown, /### Crawl-delay directive/);
-
-  // B.7: includeTags matching heading element only (`#Crawl-delay_directive`) automatically expands section prose
-  const rfcSectionHtml =
-    '<!doctype html><html><body><main>' +
-    '<h2 id="Overview">Overview</h2><p>General intro.</p>' +
-    '<h3 id="Crawl-delay_directive">Crawl-delay directive</h3>' +
-    '<p>Specifies how many seconds a crawler should wait between requests to the same host.</p>' +
-    '<ul><li>Measured in seconds.</li></ul>' +
-    '<h3 id="Sitemap_directive">Sitemap directive</h3><p>Points to XML sitemaps.</p>' +
-    '</main></body></html>';
-  const incScrape = await executeScrapeCall({
-    payload: { url: 'https://datatracker.example.org/doc/robots', includeTags: ['#Crawl-delay_directive'] },
-    env: {},
-    executeHubFetch: async () => ({
-      status: 200,
-      via: 'agent:site-1',
-      bodyText: JSON.stringify({
-        results: [{ id: 'scrape-1', url: 'https://datatracker.example.org/doc/robots', status: 200, outcome: 'ok', contentType: 'text/html', body: rfcSectionHtml }],
-      }),
-    }),
-  });
-  assert.equal(incScrape.status, 200);
-  assert.equal(incScrape.body.sectionExpandedFromHeading, true);
-  assert.match(String(incScrape.body.markdown), /Crawl-delay directive/);
-  assert.match(String(incScrape.body.markdown), /wait between requests/);
-  assert.equal(String(incScrape.body.markdown).includes('Points to XML sitemaps'), false);
-  assert.ok(Array.isArray(incScrape.body.warnings) && (incScrape.body.warnings as string[]).length > 0);
 });
 
 test('B.3 & B.4: extract omits duplicate rawContent by default + flags 0-match queries; search_collection computes distinct BM25 scores, handles unbalanced syntax, and deduplicates snippet', async () => {

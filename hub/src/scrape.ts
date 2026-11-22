@@ -171,7 +171,6 @@ export interface ExtractedDocument {
   truncated?: boolean;
   nextCursor?: string;
   inertiaHydrated?: boolean;
-  sectionExpandedFromHeading?: boolean;
   warnings?: string[];
   markdown: string;
   text: string;
@@ -1400,7 +1399,6 @@ function applyIncludeAndExcludeTagSelectors(
   html: string,
   includeTags?: readonly string[],
   excludeTags?: readonly string[],
-  metaOut?: { sectionExpandedFromHeading?: boolean; warnings?: string[] },
 ): string {
   let out = html.length > MAX_HTML_SCAN_CHARS ? html.slice(0, MAX_HTML_SCAN_CHARS) : html;
   const parsedInclude = parseSimpleSelectorList(includeTags);
@@ -1446,68 +1444,7 @@ function applyIncludeAndExcludeTagSelectors(
       matchedRanges.push({ tagLower: matchTag, startIdx: matchStart, endIdx: src.length });
     }
     if (matchedRanges.length > 0) {
-      const allHeadingsOnly = matchedRanges.every((m) => /^h[1-6]$/.test(m.tagLower));
-      if (allHeadingsOnly) {
-        const expandedKept: string[] = [];
-        let anyExpanded = false;
-        const sectionCloseTags = new Set(['section', 'article', 'main', 'body', 'html']);
-        for (const m of matchedRanges) {
-          const matchedLevel = Number(m.tagLower.slice(1));
-          const tail = src.slice(m.endIdx);
-          let stopRelIdx = tail.length;
-          let containerDepth = 0;
-          scanHtmlTagsLinear(
-            tail,
-            (t) => {
-              const tl = t.tagNameLower;
-              if (!t.isClosing && /^h[1-6]$/.test(tl)) {
-                const lvl = Number(tl.slice(1));
-                if (lvl <= matchedLevel) {
-                  stopRelIdx = t.index;
-                  return false;
-                }
-              }
-              if (sectionCloseTags.has(tl)) {
-                if (!t.isClosing && !t.isSelfClosing) {
-                  containerDepth++;
-                } else if (t.isClosing) {
-                  if (containerDepth === 0) {
-                    stopRelIdx = t.index;
-                    return false;
-                  }
-                  containerDepth--;
-                }
-              }
-              return undefined;
-            },
-            MAX_HTML_SCAN_CHARS,
-            false,
-          );
-          const extraSlice = tail.slice(0, stopRelIdx);
-          if (cleanInlineHtml(extraSlice).length > 0) {
-            anyExpanded = true;
-            expandedKept.push(src.slice(m.startIdx, m.endIdx + stopRelIdx));
-          } else {
-            expandedKept.push(src.slice(m.startIdx, m.endIdx));
-          }
-        }
-        out = expandedKept.join('\n\n');
-        if (metaOut) {
-          metaOut.warnings ??= [];
-          if (anyExpanded) {
-            metaOut.sectionExpandedFromHeading = true;
-            metaOut.warnings.push(
-              'includeTags selector matched a heading element only; included section content up to the next heading of same or higher rank.',
-            );
-          } else {
-            metaOut.warnings.push(
-              'includeTags selector matched a heading element only with no following sibling prose; pass a container selector for full prose.',
-            );
-          }
-        }
-      } else {
-        out = matchedRanges.map((m) => src.slice(m.startIdx, m.endIdx)).join('\n\n');
-      }
+      out = matchedRanges.map((m) => src.slice(m.startIdx, m.endIdx)).join('\n\n');
     }
   }
 
@@ -2814,10 +2751,9 @@ export function extractHtmlDocument(
     );
   }
 
-  const selectorMeta: { sectionExpandedFromHeading?: boolean; warnings?: string[] } = {};
   let extractedMarkdownBodyOnly = false;
   if (includeTags && includeTags.length > 0) {
-    work = applyIncludeAndExcludeTagSelectors(work, includeTags, excludeTags, selectorMeta);
+    work = applyIncludeAndExcludeTagSelectors(work, includeTags, excludeTags);
   } else if (onlyMainContent) {
     work = stripHtmlTagsLinear(work, ['nav', 'footer', 'aside', 'dialog', 'menu'], '', MAX_HTML_SCAN_CHARS);
     // Substack rendered post body (`<div class="body markup">`) or `window._preloads` `body_html`
@@ -3598,8 +3534,6 @@ export function extractHtmlDocument(
     ...(matchedSiteExtracted?.truncated !== undefined ? { truncated: matchedSiteExtracted.truncated } : {}),
     ...(matchedSiteExtracted?.nextCursor !== undefined ? { nextCursor: matchedSiteExtracted.nextCursor } : {}),
     ...(inertiaHydrated ? { inertiaHydrated: true } : {}),
-    ...(selectorMeta.sectionExpandedFromHeading ? { sectionExpandedFromHeading: true } : {}),
-    ...(selectorMeta.warnings && selectorMeta.warnings.length > 0 ? { warnings: selectorMeta.warnings } : {}),
     markdown: md,
     text: plainText,
     links,
@@ -9077,10 +9011,15 @@ export async function executeScrapeCall(params: {
           ? 'off'
           : 'auto';
   const sortedFormatsForCache = [...stringFormats].sort();
+  const locationCacheKey = locationObj
+    ? `${typeof locationObj.country === 'string' ? locationObj.country.trim().toUpperCase() : ''}|${locationLanguages.join(',')}`
+    : '';
   const hasNonDefaultCacheOptions =
     !onlyMainContent ||
     requestedRenderModeEarly === 'always' ||
     (rawRenderModeStrEarly !== '' && rawRenderModeStrEarly !== 'auto') ||
+    Boolean(mobileEmulation) ||
+    Boolean(locationCacheKey) ||
     includeTags.length > 0 ||
     excludeTags.length > 0 ||
     waitForMsOpt !== undefined ||
@@ -9092,6 +9031,8 @@ export async function executeScrapeCall(params: {
       v: SCRAPE_PIPELINE_VERSION,
       onlyMainContent,
       renderMode: rawRenderModeStrEarly || requestedRenderModeEarly,
+      mobile: Boolean(mobileEmulation),
+      location: locationCacheKey,
       formats: sortedFormatsForCache,
       includeTags: [...includeTags],
       excludeTags: [...excludeTags],
@@ -9155,7 +9096,13 @@ export async function executeScrapeCall(params: {
     excludeTags.length > 0 ||
     Boolean(attributesSpec);
 
-  const visibility = normalizeVisibility(payload.visibility, payload.headers);
+  const visibility = normalizeVisibility(payload.visibility, payload.headers, {
+    cookies: (payload as { cookies?: unknown }).cookies,
+    preferMcp:
+      (payload as { useConnectedMcp?: unknown }).useConnectedMcp === true ||
+      (payload as { preferMcp?: unknown }).preferMcp === true,
+    userId,
+  });
   const isPrivateScrape = visibility === 'private';
 
   let prevMarkdownForChanges: string | null = null;
@@ -9248,6 +9195,30 @@ export async function executeScrapeCall(params: {
         includeImages,
         maxChars,
       });
+      let cachedMarkdownArtifactId: string | undefined;
+      if (shaped.truncated && fullCached) {
+        const cachedMdSha = await sha256HexString(fullCached);
+        const derivedMdKey = isPrivateScrape
+          ? r2PrivateDerivedKey(userId, hit.pipelineVersion, 'markdown', cachedMdSha)
+          : r2DerivedKey(hit.pipelineVersion, 'markdown', cachedMdSha);
+        const existingMd = await env.ARTIFACTS.head(derivedMdKey).catch(() => null);
+        if (!existingMd) {
+          await env.ARTIFACTS
+            .put(derivedMdKey, fullCached, {
+              httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+              ...(isPrivateScrape
+                ? {
+                    customMetadata: {
+                      userId: sanitizeStorageUserId(userId),
+                      visibility: 'private',
+                    },
+                  }
+                : {}),
+            })
+            .catch(() => undefined);
+        }
+        cachedMarkdownArtifactId = `md:${cachedMdSha}`;
+      }
       const richHit = hit as Partial<PrivateCachedScrapeRecord>;
       const cachedFinalUrl = richHit.finalUrl || normalizedUrl;
       const cachedTitle = hit.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullCached, normalizedUrl) : undefined);
@@ -9290,7 +9261,7 @@ export async function executeScrapeCall(params: {
                 totalChars: shaped.totalChars,
                 nextOffset: shaped.nextOffset ?? shaped.markdown.length,
                 remainingChars: shaped.remainingChars ?? Math.max(0, (shaped.totalChars ?? 0) - (shaped.nextOffset ?? shaped.markdown.length)),
-                markdownArtifactId: `md:${hit.contentSha256}`,
+                ...(cachedMarkdownArtifactId ? { markdownArtifactId: cachedMarkdownArtifactId } : {}),
               }
             : {}),
           metadata: {
@@ -9328,8 +9299,14 @@ export async function executeScrapeCall(params: {
       let ocrMdArtifactId: string | undefined;
       if (shaped.truncated && env.ARTIFACTS && fullOcrMd) {
         const mdSha = await sha256HexString(fullOcrMd);
-        await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), fullOcrMd, {
+        const ocrDerivedKey = isPrivateScrape
+          ? r2PrivateDerivedKey(userId, SCRAPE_PIPELINE_VERSION, 'markdown', mdSha)
+          : r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha);
+        await env.ARTIFACTS.put(ocrDerivedKey, fullOcrMd, {
           httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+          ...(isPrivateScrape
+            ? { customMetadata: { userId: sanitizeStorageUserId(userId), visibility: 'private' } }
+            : {}),
         }).catch(() => undefined);
         ocrMdArtifactId = `md:${mdSha}`;
       }
@@ -9339,6 +9316,7 @@ export async function executeScrapeCall(params: {
         body: {
           ok: true,
           cached: false,
+          ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
           pipelineVersion: SCRAPE_PIPELINE_VERSION,
           url: normalizedUrl,
           finalUrl: forcedOcr.finalUrl,
@@ -11891,7 +11869,6 @@ export async function executeScrapeCall(params: {
     ...(resolvedWordCount !== undefined ? { wordCount: resolvedWordCount } : {}),
     ...(resolvedFavicon ? { favicon: resolvedFavicon } : {}),
     ...(resolvedContentType ? { contentType: resolvedContentType } : {}),
-    ...(extracted?.sectionExpandedFromHeading ? { sectionExpandedFromHeading: true } : {}),
     ...(scrapeWarnings.length > 0 ? { warnings: scrapeWarnings } : {}),
     ...(htmlJobPosting ? { jobPosting: htmlJobPosting } : {}),
     ...(adapterRecordsOut !== undefined ? { records: adapterRecordsOut } : {}),

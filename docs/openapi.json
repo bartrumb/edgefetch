@@ -5560,9 +5560,6 @@
               "llm"
             ]
           },
-          "sectionExpandedFromHeading": {
-            "type": "boolean"
-          },
           "warnings": {
             "type": "array",
             "items": {

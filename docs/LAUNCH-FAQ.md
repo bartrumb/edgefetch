@@ -42,7 +42,7 @@ Unthrottled, stealth-bypass scraping from residential proxy botnets is abusive �
 **You run your own Hub — there is no shared vendor cloud, and Cloudflare is completely optional.** Pick whichever fits your setup:
 
 1. **Zero-daemon Desktop `stdio` MCP (`edgefetch mcp`):** No Hub or Docker needed — Claude Code, Claude Desktop, Cursor, or VS Code spawns `edgefetch mcp` locally over `stdio` (`0` open ports), exposing 5 local tools (`scrape`, `fetch_url`, `fetch_batch`, `map`, `doctor`).
-2. **Single Docker Container (`docker compose up -d` or Fly.io / Railway / Render):** Runs the full **12-tool Hub** (`scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`), **49+ site/ATS adapters**, `/admin` UI, and `node:sqlite` FTS5 + `/data` disk artifacts with zero external cloud accounts.
+2. **Single Docker Container (`docker compose up -d` or Fly.io / Railway / Render):** Runs the full **17-tool Hub** (`agent`, `discover_mcps`, `query_mcp`, `find_extractors`, `scrape`, `extract`, `map`, `crawl`, `search`, `jobs`, `catalog`, `search_collection`, `interact`, `read_artifact`, `fetch_url`, `fetch_batch`, `list_agents`), **56 declarative YAML site/ATS adapters**, `/admin` UI, and `node:sqlite` FTS5 + `/data` disk artifacts with zero external cloud accounts.
 3. **Single Go Binary Hub (`edgefetch --mode=hub` or `--mode=hub,agent`):** Runs on any `$4` Linux/BSD VPS or Tailscale node.
 4. **Cloudflare Workers (`hub/`):** Uses a Hibernating WebSocket Durable Object (`AgentHubDO`) that sleeps at `$0` idle while keeping outbound home worker WebSockets connected via edge auto-ping/pong, with optional R2 + D1 FTS5 storage.
 
@@ -64,11 +64,11 @@ EdgeFetch is a **young personal project** (started in November 2026) built to re
 
 ---
 
-## 7. Aren't 49+ site adapters brittle whack-a-mole, and do I have to recompile Go nodes when a site changes?
+## 7. Aren't 56 site adapters brittle whack-a-mole, and do I have to recompile Go nodes when a site changes?
 
 No on both counts:
-1. **Zero adapters compiled into Go workers:** Go edge nodes (`edgefetch`) contain **0% of site or ATS adapters** — they are pure transport, SSRF, CDP, and PDF engines. All 49+ adapters live on the Hub (`hub/src/extractors/providers/`), so updating an adapter is a 3-second Hub deploy with **zero redeploys** on your Raspberry Pi, Home Assistant, or VM nodes.
-2. **Fault-isolated fail-open fallback:** Every adapter runs inside an isolated `try / catch` bulkhead. If a site renames a JSON field or DOM class tomorrow, `formatTwin()` / `extractHtml()` returns `null` and EdgeFetch **automatically falls back** to standard HTML / Schema.org JSON-LD / SSR Hydration / Headless CDP extraction instead of failing the call.
+1. **Declarative YAML manifests (`internal/extract/manifests/*.yaml`):** All 56 adapters live in auditable declarative YAML specs compiled into `compiled.json` (shared between `hub/` and standalone `edgefetch --mode=hub`). Outbound Go fleet workers (`--mode=agent`) are pure transport, SSRF, CDP, and PDF engines, so updating an adapter on your Hub requires **zero redeploys** on remote Raspberry Pi, Home Assistant, or VM worker nodes.
+2. **Fault-isolated fail-open fallback:** Every adapter runs inside an isolated `try / catch` bulkhead. If a site renames a JSON field or DOM class tomorrow, the adapter returns `null` and EdgeFetch **automatically falls back** to standard HTML / Schema.org JSON-LD / SSR Hydration / Headless CDP extraction instead of failing the call.
 3. **Public APIs over brittle DOM selectors:** Most adapters upgrade noisy web URLs to stable, official keyless APIs (`data.sec.gov`, `registry.npmjs.org`, `crates.io/api/v1`, `api.crossref.org`, `api.openalex.org`, Socrata SODA, CKAN, Workable, Greenhouse, Ashby, Lever) rather than scraping fragile CSS classes.
 
 ---
@@ -83,7 +83,7 @@ Any tool that feeds live web content into an LLM must treat web pages as untrust
 
 ---
 
-## 9. Why a zero-dependency HTML-to-Markdown parser instead of JSDOM + Readability + Turndown?
+## 9. Why a custom linear HTML-to-Markdown pipeline instead of JSDOM + Readability + Turndown?
 
-- **WinterCG Isolate Portability & Zero Supply-Chain Bloat:** `hub/` runs identically on Cloudflare Workers (`workerd`), Deno, and Node.js with **0 runtime `npm` dependencies** (no JSDOM memory overhead or transitive vulnerability churn).
+- **WinterCG Isolate Portability & Minimal Supply Chain:** `hub/` runs identically on Cloudflare Workers (`workerd`), Deno, and Node.js with only 6 vetted runtime packages (`re2js`, `htmlparser2`, `jose`, `oauth4webapi`, `ws`, `yaml` — bundled into a single `dist/portable-server.mjs` with `0` `node_modules` in containers, and `1` Go dependency `coder/websocket` in the Go binary).
 - **Code & Technical Fidelity:** Naive HTML sanitizers strip `<T>` or `<Array<string>>` inside TypeScript, Rust, Go, and C++ prose/code blocks as "unknown HTML tags". EdgeFetch stashes code spans/fences first, preserves variable-length CommonMark fences, converts KaTeX/MathML to LaTeX, and runs in `<2 ms` per document (`node bench/run-bench.mjs`).

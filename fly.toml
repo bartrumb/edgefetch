@@ -14,8 +14,6 @@ primary_region = "iad"
   EDGEFETCH_TRUST_FLY_CLIENT_IP = "1"
   # Update EDGEFETCH_PUBLIC_ORIGIN if you change `app` or attach a custom domain (required for `/admin` CSRF origin checks behind Fly TLS).
   EDGEFETCH_PUBLIC_ORIGIN = "https://edgefetch-hub.fly.dev"
-  # Managed Fly Machines hypervisors do not load custom seccomp profiles for Chromium `CLONE_NEWUSER`; opt in explicitly.
-  EDGEFETCH_ALLOW_NO_SANDBOX = "1"
 
 [[mounts]]
   source = "edgefetch_data"

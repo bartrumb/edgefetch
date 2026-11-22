@@ -132,7 +132,7 @@ function unwrapMarkdownLinksForScanLinear(s: string): string {
     work = work.replace(/\]\[[^\]\r\n]{0,200}\]/g, ']');
   }
   const stripWordBrackets = (txt: string): string =>
-    txt.includes('[') && /\[[A-Za-z]{2}/.test(txt) ? txt.replace(/\[+([A-Za-z]{2,32})\]*/g, '$1') : txt;
+    txt.includes('[') ? txt.replace(/\[{1,4}([A-Za-z]{2,32})\]*/g, '$1') : txt;
 
   if (!work.includes('](') || !work.includes(')')) {
     return stripWordBrackets(work);
@@ -287,9 +287,6 @@ function normalizeCssStyleForHiddenCheck(rawStyle: string): string {
 }
 
 function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'strip' | 'wordstream' = 'space'): string {
-  if (!prose.includes('&') && !/[^\x00-\x7F]/.test(prose) && !/[A-Za-z]/.test(prose)) {
-    return '';
-  }
   let out = prose.includes('[SCRUBBED:')
     ? prose.replace(/\[SCRUBBED:\s*prompt injection blocked\s*\([^)\r\n]{0,200}\)\]/gi, ' ')
     : prose;

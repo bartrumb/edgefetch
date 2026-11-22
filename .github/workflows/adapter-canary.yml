@@ -1,0 +1,69 @@
+name: Daily Declarative Adapter Canary
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adapter-canary:
+    name: Polite Ring 1 YAML Adapter Canary (robots.txt + SSRF + Zero-Prose Diagnostics)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: hub/package-lock.json
+
+      - name: Install Hub dependencies (zero lifecycle scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify canonical YAML manifest compilation
+        run: npm run adapter:check
+
+      - name: Run polite live Ring 1 adapter canary & publish step summary
+        run: |
+          set -euo pipefail
+          node scripts/canary-adapters.mjs --live --out ../docs/adapter-health.json
+          node -e '
+            const fs = require("node:fs");
+            const report = JSON.parse(fs.readFileSync("../docs/adapter-health.json", "utf8"));
+            const s = report.summary;
+            const lines = [
+              "## EdgeFetch Ring 1 Declarative YAML Adapter Canary",
+              "",
+              `- **Generated at:** \`${report.generatedAt}\` (\`${report.canaryUserAgent}\`)`,
+              `- **Total manifests:** ${s.total} | **Healthy:** ${s.healthy} | **Robots-protected:** ${s.robotsDisallowed} | **Upstream blocked/WAF:** ${s.upstreamBlocked} | **Broken (schema drift):** ${s.broken}`,
+              "",
+              "| Adapter | Category | Mode | Status | HTTP | Words | Records | Structural Keys |",
+              "|---|---|---|---|---:|---:|---:|---|",
+            ];
+            for (const a of report.adapters) {
+              const keys = (a.structuralDiagnostic?.topLevelJsonKeys ?? []).slice(0, 6).map((k) => `\`${k}\``).join(", ") || "—";
+              lines.push(
+                `| \`${a.id}\` | \`${a.category}\` | \`${a.modes.join("+")}\` | **${a.status}** | ${a.httpStatus ?? "—"} | ${a.structuralDiagnostic?.wordCount ?? 0} | ${a.structuralDiagnostic?.recordCount ?? 0} | ${keys} |`
+              );
+            }
+            lines.push("");
+            if (process.env.GITHUB_STEP_SUMMARY) {
+              fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n", "utf8");
+            } else {
+              console.log(lines.join("\n"));
+            }
+            if (s.broken > 0) {
+              console.error(`::error::${s.broken} declarative YAML adapter(s) returned empty/null extraction on HTTP 200 (upstream schema drift).`);
+              process.exit(1);
+            }
+          '

@@ -1,0 +1,1775 @@
+{
+  "schemaVersion": 1,
+  "mode": "offline",
+  "generatedAt": "2026-11-22T04:59:27.000Z",
+  "canaryUserAgent": "EdgeFetch-Canary/2.7 (+https://edgefetch.dev/adapters/status/)",
+  "policy": {
+    "robotsCheckedOnEveryHop": true,
+    "minHostGapMs": 1200,
+    "requestTimeoutMs": 15000,
+    "zeroUntrustedProseStored": true,
+    "ring1DiffGate": "hub/scripts/verify-adapter-only-diff.mjs"
+  },
+  "summary": {
+    "total": 56,
+    "healthy": 56,
+    "robotsDisallowed": 0,
+    "upstreamBlocked": 0,
+    "broken": 0,
+    "fixturesVerified": 6,
+    "ring1PolicyLocked": 56
+  },
+  "adapters": [
+    {
+      "id": "apple-app-store",
+      "name": "Apple App Store",
+      "category": "developer",
+      "manifestFile": "apple-app-store.yaml",
+      "domains": [
+        "apps.apple.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://apps.apple.com/us/app/cloudflare-one-agent/id6443476492",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 30,
+        "recordCount": 0,
+        "rootTagCount": 11
+      }
+    },
+    {
+      "id": "arcgis",
+      "name": "ArcGIS REST FeatureServer & MapServer Layers",
+      "category": "public-records",
+      "manifestFile": "arcgis.yaml",
+      "domains": [
+        "services.arcgis.com",
+        "*.arcgis.com"
+      ],
+      "universalEngine": true,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/USA_States_Generalized/FeatureServer/0",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "name",
+          "description",
+          "geometryType",
+          "maxRecordCount",
+          "capabilities",
+          "extent",
+          "baseClean",
+          "fields",
+          "layers"
+        ],
+        "wordCount": 162,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "arxiv",
+      "name": "arXiv Preprints",
+      "category": "research-health",
+      "manifestFile": "arxiv.yaml",
+      "domains": [
+        "arxiv.org",
+        "www.arxiv.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://arxiv.org/abs/1706.03762",
+      "fixtureVerified": true,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 62,
+        "recordCount": 0,
+        "rootTagCount": 10
+      }
+    },
+    {
+      "id": "bamboohr-breezy-recruitee",
+      "name": "BambooHR, Breezy HR, Recruitee & Personio Boards",
+      "category": "jobs",
+      "manifestFile": "bamboohr-breezy-recruitee.yaml",
+      "domains": [
+        "*.bamboohr.com",
+        "*.breezy.hr",
+        "*.recruitee.com",
+        "*.jobs.personio.de",
+        "*.jobs.personio.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://acme.bamboohr.com/careers",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "result"
+        ],
+        "wordCount": 150,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "bluesky-thread",
+      "name": "Bluesky ATProto Post Threads",
+      "category": "commerce-social",
+      "manifestFile": "bluesky.yaml",
+      "domains": [
+        "bsky.app",
+        "staging.bsky.app"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://bsky.app/profile/golang.org/post/3lbxyz123",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "thread"
+        ],
+        "wordCount": 84,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "ckan",
+      "name": "CKAN Open Data Portals (Data.gov, UK, AU, Canada & City Portals)",
+      "category": "public-records",
+      "manifestFile": "ckan.yaml",
+      "domains": [
+        "catalog.data.gov",
+        "data.boston.gov",
+        "data.sanantonio.gov",
+        "data.sanjoseca.gov",
+        "data.wprdc.org",
+        "data.gov.uk",
+        "www.data.gov.uk",
+        "data.gov.au",
+        "open.canada.ca"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://catalog.data.gov/dataset/electric-vehicle-population-data",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "result",
+          "success"
+        ],
+        "wordCount": 112,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "clinicaltrials",
+      "name": "ClinicalTrials.gov Studies",
+      "category": "research-health",
+      "manifestFile": "clinicaltrials.yaml",
+      "domains": [
+        "clinicaltrials.gov",
+        "www.clinicaltrials.gov"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://clinicaltrials.gov/study/NCT04280705",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 21,
+        "recordCount": 0,
+        "rootTagCount": 11
+      }
+    },
+    {
+      "id": "crates-io",
+      "name": "Rust Crates.io",
+      "category": "developer",
+      "manifestFile": "crates-io.yaml",
+      "domains": [
+        "crates.io",
+        "www.crates.io"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://crates.io/crates/serde",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "crate",
+          "versions",
+          "categories",
+          "keywords"
+        ],
+        "wordCount": 173,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "dev-to",
+      "name": "DEV Community Articles (dev.to)",
+      "category": "commerce-social",
+      "manifestFile": "dev-to.yaml",
+      "domains": [
+        "dev.to",
+        "www.dev.to"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://dev.to/gopher/writing-fuzz-tests",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "title",
+          "body_markdown",
+          "description",
+          "user",
+          "published_timestamp"
+        ],
+        "wordCount": 20,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "discourse-topic",
+      "name": "Discourse Forum Threads (Universal Engine)",
+      "category": "commerce-social",
+      "manifestFile": "discourse.yaml",
+      "domains": [
+        "meta.discourse.org",
+        "community.home-assistant.io",
+        "users.rust-lang.org",
+        "discuss.python.org"
+      ],
+      "universalEngine": true,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://community.home-assistant.io/t/websocket-reconnect-backoff/712345",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "title",
+          "post_stream",
+          "tags",
+          "accepted_answer"
+        ],
+        "wordCount": 21,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "doi-crossref",
+      "name": "DOI.org & Crossref Bibliographic Resolver",
+      "category": "research-health",
+      "manifestFile": "doi-crossref.yaml",
+      "domains": [
+        "doi.org",
+        "www.doi.org",
+        "dx.doi.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://doi.org/10.1038/s41586-021-03819-2",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "message"
+        ],
+        "wordCount": 67,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "enterprise-ats",
+      "name": "SmartRecruiters, Oracle HCM Cloud & Jobvite",
+      "category": "jobs",
+      "manifestFile": "enterprise-ats.yaml",
+      "domains": [
+        "jobs.smartrecruiters.com",
+        "*.oraclecloud.com",
+        "jobs.jobvite.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://jobs.smartrecruiters.com/Visa/744000012345678-senior-software-engineer",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 16,
+        "recordCount": 0,
+        "rootTagCount": 13
+      }
+    },
+    {
+      "id": "gem-ats",
+      "name": "Gem Job Boards",
+      "category": "jobs",
+      "manifestFile": "gem-ats.yaml",
+      "domains": [
+        "jobs.gem.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://jobs.gem.com/linear",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "title",
+          "location",
+          "departments",
+          "content",
+          "content_plain",
+          "body",
+          "id",
+          "public_id"
+        ],
+        "wordCount": 43,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "github-gist",
+      "name": "GitHub Gists",
+      "category": "developer",
+      "manifestFile": "github-gist.yaml",
+      "domains": [
+        "gist.github.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://gist.github.com/octocat/6cad326836d38bd3a7ae",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 20,
+        "recordCount": 0,
+        "rootTagCount": 11
+      }
+    },
+    {
+      "id": "gitlab-forgejo",
+      "name": "GitLab, Codeberg & Forgejo Twins",
+      "category": "developer",
+      "manifestFile": "gitlab-forgejo.yaml",
+      "domains": [
+        "gitlab.com",
+        "gitlab.*",
+        "codeberg.org",
+        "gitea.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://gitlab.com/gitlab-org/cli",
+      "fixtureVerified": true,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 20,
+        "recordCount": 0,
+        "rootTagCount": 8
+      }
+    },
+    {
+      "id": "google-play",
+      "name": "Google Play Store",
+      "category": "developer",
+      "manifestFile": "google-play.yaml",
+      "domains": [
+        "play.google.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://play.google.com/store/apps/details?id=com.cloudflare.onedotonedotonedotone",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 38,
+        "recordCount": 0,
+        "rootTagCount": 10
+      }
+    },
+    {
+      "id": "greenhouse-lever-boards",
+      "name": "Greenhouse & Lever Whole-Board + EU APIs",
+      "category": "jobs",
+      "manifestFile": "greenhouse-lever.yaml",
+      "domains": [
+        "boards.greenhouse.io",
+        "job-boards.greenhouse.io",
+        "eu-boards.greenhouse.io",
+        "job-boards.eu.greenhouse.io",
+        "jobs.lever.co",
+        "jobs.eu.lever.co"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://job-boards.greenhouse.io/cloudflare",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "meta",
+          "jobs"
+        ],
+        "wordCount": 84,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "hackernews",
+      "name": "Hacker News Stories & Who is Hiring (Algolia API)",
+      "category": "commerce-social",
+      "manifestFile": "hackernews.yaml",
+      "domains": [
+        "news.ycombinator.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://news.ycombinator.com/item?id=41000000",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "id",
+          "title",
+          "author",
+          "points",
+          "created_at",
+          "url",
+          "text"
+        ],
+        "wordCount": 50,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "hex-pm",
+      "name": "Hex.pm Elixir & Erlang Registry",
+      "category": "developer",
+      "manifestFile": "hex-pm.yaml",
+      "domains": [
+        "hex.pm",
+        "www.hex.pm"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://hex.pm/packages/phoenix",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "name",
+          "meta",
+          "releases",
+          "docs_html_url"
+        ],
+        "wordCount": 79,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face Models, Datasets & Spaces",
+      "category": "genai",
+      "manifestFile": "huggingface.yaml",
+      "domains": [
+        "huggingface.co",
+        "www.huggingface.co"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "text",
+        "topLevelJsonKeys": [],
+        "wordCount": 13,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "icims",
+      "name": "iCIMS Enterprise Career Portals",
+      "category": "jobs",
+      "manifestFile": "icims.yaml",
+      "domains": [
+        "*.icims.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://careers-acme.icims.com/jobs/search?ss=1",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "text",
+        "topLevelJsonKeys": [],
+        "wordCount": 30,
+        "recordCount": 1,
+        "rootTagCount": 9
+      }
+    },
+    {
+      "id": "ietf-rfc",
+      "name": "IETF Datatracker & RFC Editor",
+      "category": "developer",
+      "manifestFile": "ietf-rfc.yaml",
+      "domains": [
+        "datatracker.ietf.org",
+        "rfc-editor.org",
+        "www.rfc-editor.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://datatracker.ietf.org/doc/html/rfc9421",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 20,
+        "recordCount": 0,
+        "rootTagCount": 6
+      }
+    },
+    {
+      "id": "internet-archive",
+      "name": "Internet Archive Items (archive.org)",
+      "category": "genai",
+      "manifestFile": "internet-archive.yaml",
+      "domains": [
+        "archive.org",
+        "www.archive.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://archive.org/details/apollo11-audio",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "metadata",
+          "files"
+        ],
+        "wordCount": 146,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "jazzhr",
+      "name": "JazzHR Career Boards (applytojob.com)",
+      "category": "jobs",
+      "manifestFile": "jazzhr.yaml",
+      "domains": [
+        "*.applytojob.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://acme.applytojob.com/apply",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "text",
+        "topLevelJsonKeys": [],
+        "wordCount": 168,
+        "recordCount": 0,
+        "rootTagCount": 34
+      }
+    },
+    {
+      "id": "jsr-io",
+      "name": "JSR JavaScript Registry",
+      "category": "developer",
+      "manifestFile": "jsr-io.yaml",
+      "domains": [
+        "jsr.io"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://jsr.io/@std/path",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 13,
+        "recordCount": 0,
+        "rootTagCount": 4
+      }
+    },
+    {
+      "id": "legistar",
+      "name": "Legistar Municipal Council Legislation & Meetings",
+      "category": "public-records",
+      "manifestFile": "legistar.yaml",
+      "domains": [
+        "*.legistar.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://nyc.legistar.com/Legislation.aspx",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "id",
+          "parent_id",
+          "depth",
+          "title",
+          "name",
+          "text",
+          "body",
+          "url",
+          "EventDate",
+          "EventBodyName",
+          "EventLocation",
+          "EventInSiteURL"
+        ],
+        "wordCount": 31,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "lobsters",
+      "name": "Lobste.rs Computing Stories",
+      "category": "commerce-social",
+      "manifestFile": "lobsters.yaml",
+      "domains": [
+        "lobste.rs"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://lobste.rs/s/abc123/zero_alloc_go_parsers",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "title",
+          "url",
+          "score",
+          "submitter_user",
+          "created_at",
+          "tags",
+          "description_plain",
+          "comments"
+        ],
+        "wordCount": 59,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "mastodon-status",
+      "name": "Mastodon & Fediverse Statuses (Universal Engine)",
+      "category": "commerce-social",
+      "manifestFile": "mastodon.yaml",
+      "domains": [
+        "mastodon.social",
+        "fosstodon.org",
+        "hachyderm.io"
+      ],
+      "universalEngine": true,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://fosstodon.org/@user/113456789012345678",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "content",
+          "account",
+          "created_at",
+          "spoiler_text",
+          "media_attachments"
+        ],
+        "wordCount": 45,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "mediawiki",
+      "name": "Wikipedia & MediaWiki Encyclopedias",
+      "category": "commerce-social",
+      "manifestFile": "mediawiki.yaml",
+      "domains": [
+        "*.wikipedia.org",
+        "wiki.archlinux.org"
+      ],
+      "universalEngine": true,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://en.wikipedia.org/wiki/HTTP/2",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 14,
+        "recordCount": 0,
+        "rootTagCount": 6
+      }
+    },
+    {
+      "id": "nist-nvd",
+      "name": "NIST National Vulnerability Database (NVD)",
+      "category": "developer",
+      "manifestFile": "nist-nvd.yaml",
+      "domains": [
+        "nvd.nist.gov",
+        "www.nvd.nist.gov"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://nvd.nist.gov/vuln/detail/CVE-2024-3094",
+      "fixtureVerified": true,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "vulnerabilities"
+        ],
+        "wordCount": 73,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "npm-registry",
+      "name": "npm Package Registry",
+      "category": "developer",
+      "manifestFile": "npm.yaml",
+      "domains": [
+        "npmjs.com",
+        "www.npmjs.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://www.npmjs.com/package/@cloudflare/workers-types",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "name",
+          "dist-tags",
+          "ver",
+          "verDesc",
+          "description",
+          "desc",
+          "verLicense",
+          "license",
+          "verHomepage",
+          "homepage",
+          "verRepoUrl",
+          "verRepoStr",
+          "verRepo",
+          "repository",
+          "repoClean"
+        ],
+        "wordCount": 99,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "openalex",
+      "name": "OpenAlex Scholarly Works",
+      "category": "research-health",
+      "manifestFile": "openalex.yaml",
+      "domains": [
+        "openalex.org",
+        "www.openalex.org",
+        "api.openalex.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://openalex.org/W2741809807",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "display_name",
+          "title",
+          "publication_date",
+          "cited_by_count",
+          "doi",
+          "open_access",
+          "authorships",
+          "abstract_inverted_index"
+        ],
+        "wordCount": 52,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "openfda",
+      "name": "openFDA Recalls, Labels & Adverse Events API",
+      "category": "research-health",
+      "manifestFile": "openfda.yaml",
+      "domains": [
+        "api.fda.gov"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://api.fda.gov/food/enforcement.json?limit=5",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "results",
+          "meta"
+        ],
+        "wordCount": 9,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "openfoodfacts",
+      "name": "Open Food Facts Products",
+      "category": "commerce-social",
+      "manifestFile": "openfoodfacts.yaml",
+      "domains": [
+        "world.openfoodfacts.org",
+        "openfoodfacts.org",
+        "*.openfoodfacts.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://world.openfoodfacts.org/product/3017620422003",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 20,
+        "recordCount": 0,
+        "rootTagCount": 11
+      }
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter AI Model Catalog",
+      "category": "genai",
+      "manifestFile": "openrouter.yaml",
+      "domains": [
+        "openrouter.ai"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://openrouter.ai/anthropic/claude-3.7-sonnet",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "id",
+          "name",
+          "context_length",
+          "top_provider",
+          "pricing",
+          "architecture",
+          "supported_parameters",
+          "description",
+          "data"
+        ],
+        "wordCount": 80,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "packagist",
+      "name": "Packagist PHP Composer Registry",
+      "category": "developer",
+      "manifestFile": "packagist.yaml",
+      "domains": [
+        "packagist.org",
+        "www.packagist.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://packagist.org/packages/symfony/console",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "package"
+        ],
+        "wordCount": 41,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "pinpoint",
+      "name": "Pinpoint ATS Job Boards",
+      "category": "jobs",
+      "manifestFile": "pinpoint.yaml",
+      "domains": [
+        "*.pinpointhq.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://acme.pinpointhq.com/",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "title",
+          "location",
+          "workplace_type_text",
+          "compensation_currency",
+          "compensation_minimum",
+          "compensation_maximum",
+          "compRange",
+          "compMinOnly",
+          "compMaxOnly",
+          "compSub",
+          "comp",
+          "description",
+          "key_responsibilities",
+          "skills_knowledge_expertise",
+          "benefits"
+        ],
+        "wordCount": 71,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "pkg-go-dev",
+      "name": "Go Packages (pkg.go.dev)",
+      "category": "developer",
+      "manifestFile": "pkg-go-dev.yaml",
+      "domains": [
+        "pkg.go.dev"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://pkg.go.dev/github.com/coder/websocket",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 27,
+        "recordCount": 0,
+        "rootTagCount": 10
+      }
+    },
+    {
+      "id": "polymarket",
+      "name": "Polymarket Prediction Markets",
+      "category": "finance",
+      "manifestFile": "polymarket.yaml",
+      "domains": [
+        "polymarket.com",
+        "www.polymarket.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://polymarket.com/event/fed-decision-in-december",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "title",
+          "description",
+          "volume",
+          "liquidity",
+          "endDate",
+          "closed",
+          "markets"
+        ],
+        "wordCount": 103,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "pubchem",
+      "name": "PubChem Chemical Compounds (NCBI)",
+      "category": "research-health",
+      "manifestFile": "pubchem.yaml",
+      "domains": [
+        "pubchem.ncbi.nlm.nih.gov"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://pubchem.ncbi.nlm.nih.gov/compound/2244",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "Record"
+        ],
+        "wordCount": 35,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "public-job-feeds",
+      "name": "Public Open Job Feeds (WWR, Himalayas, Working Nomads, The Muse, Jobicy, Arbeitnow & RemoteOK)",
+      "category": "jobs",
+      "manifestFile": "public-job-feeds.yaml",
+      "domains": [
+        "weworkremotely.com",
+        "www.weworkremotely.com",
+        "himalayas.app",
+        "www.himalayas.app",
+        "www.workingnomads.com",
+        "workingnomads.com",
+        "www.themuse.com",
+        "themuse.com",
+        "jobicy.com",
+        "www.arbeitnow.com",
+        "arbeitnow.com",
+        "remoteok.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://weworkremotely.com/remote-jobs.rss",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "text",
+        "topLevelJsonKeys": [],
+        "wordCount": 85,
+        "recordCount": 3,
+        "rootTagCount": 34
+      }
+    },
+    {
+      "id": "pubmed-pmc",
+      "name": "PubMed & PubMed Central (NCBI / Europe PMC)",
+      "category": "research-health",
+      "manifestFile": "pubmed-pmc.yaml",
+      "domains": [
+        "pubmed.ncbi.nlm.nih.gov",
+        "pmc.ncbi.nlm.nih.gov"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://pubmed.ncbi.nlm.nih.gov/31452104/",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "resultList"
+        ],
+        "wordCount": 107,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "pypi-project",
+      "name": "PyPI Python Package Index",
+      "category": "developer",
+      "manifestFile": "pypi.yaml",
+      "domains": [
+        "pypi.org",
+        "www.pypi.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://pypi.org/project/httpx/",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 46,
+        "recordCount": 0,
+        "rootTagCount": 17
+      }
+    },
+    {
+      "id": "reddit-thread",
+      "name": "Reddit Threads & Comments",
+      "category": "commerce-social",
+      "manifestFile": "reddit.yaml",
+      "domains": [
+        "reddit.com",
+        "*.reddit.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "html"
+      ],
+      "exampleUrl": "https://www.reddit.com/r/golang/comments/1abc123/single_binary_deployments/",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 28,
+        "recordCount": 0,
+        "rootTagCount": 8
+      }
+    },
+    {
+      "id": "rippling",
+      "name": "Rippling ATS Career Boards",
+      "category": "jobs",
+      "manifestFile": "rippling.yaml",
+      "domains": [
+        "ats.rippling.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://ats.rippling.com/rippling/jobs",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "id",
+          "parent_id",
+          "depth",
+          "title",
+          "name",
+          "text",
+          "body",
+          "url",
+          "uuid",
+          "department",
+          "_mergedLocs"
+        ],
+        "wordCount": 30,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "rubygems",
+      "name": "RubyGems Registry",
+      "category": "developer",
+      "manifestFile": "rubygems.yaml",
+      "domains": [
+        "rubygems.org",
+        "www.rubygems.org"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://rubygems.org/gems/rails",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "name",
+          "version",
+          "info",
+          "licenses",
+          "authors",
+          "source_code_uri",
+          "documentation_uri"
+        ],
+        "wordCount": 100,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "sap-rmk-jibe",
+      "name": "SAP SuccessFactors RMK & Jibe Enterprise Career Feeds",
+      "category": "jobs",
+      "manifestFile": "sap-rmk-jibe.yaml",
+      "domains": [
+        "careers.*.com",
+        "jobs.*.com"
+      ],
+      "universalEngine": true,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://careers.rivian.com/api/jobs?page=1&limit=25",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "totalCount",
+          "jobs"
+        ],
+        "wordCount": 116,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "sec-edgar",
+      "name": "SEC EDGAR Company Submissions & Filings",
+      "category": "finance",
+      "manifestFile": "sec-edgar.yaml",
+      "domains": [
+        "www.sec.gov",
+        "sec.gov",
+        "data.sec.gov"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://www.sec.gov/edgar/browse/?CIK=0001477333",
+      "fixtureVerified": true,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "name",
+          "tickers",
+          "exchanges",
+          "sic",
+          "sicDescription",
+          "stateOfIncorporation",
+          "fiscalYearEnd",
+          "filings"
+        ],
+        "wordCount": 70,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "shopify",
+      "name": "Shopify Universal Storefront & Catalogs",
+      "category": "commerce-social",
+      "manifestFile": "shopify.yaml",
+      "domains": [
+        "*.myshopify.com"
+      ],
+      "universalEngine": true,
+      "modes": [
+        "twin",
+        "html",
+        "catalog"
+      ],
+      "exampleUrl": "https://allbirds.myshopify.com/products/mens-tree-runners",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "product",
+          "products"
+        ],
+        "wordCount": 38,
+        "recordCount": 1
+      }
+    },
+    {
+      "id": "socrata",
+      "name": "Socrata Open Data Portals (SODA Universal Engine)",
+      "category": "public-records",
+      "manifestFile": "socrata.yaml",
+      "domains": [
+        "data.cityofnewyork.us",
+        "data.sfgov.org",
+        "data.sf.gov",
+        "data.seattle.gov",
+        "data.cityofchicago.org",
+        "data.lacity.org",
+        "data.wa.gov",
+        "data.nj.gov",
+        "data.colorado.gov",
+        "data.texas.gov",
+        "data.ny.gov",
+        "data.cdc.gov",
+        "*.socrata.com"
+      ],
+      "universalEngine": true,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://data.cityofnewyork.us/Housing-Development/DOB-Job-Application-Filings/ic3t-wcy2",
+      "fixtureVerified": true,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "id",
+          "name",
+          "description",
+          "attribution",
+          "rowsUpdatedAt",
+          "columns"
+        ],
+        "wordCount": 85,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "stackexchange-qa",
+      "name": "Stack Overflow & Stack Exchange Q&A",
+      "category": "developer",
+      "manifestFile": "stackexchange.yaml",
+      "domains": [
+        "stackoverflow.com",
+        "www.stackoverflow.com",
+        "serverfault.com",
+        "superuser.com",
+        "askubuntu.com",
+        "mathoverflow.net",
+        "stackapps.com",
+        "*.stackexchange.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster-than-processing-an-unsorted-array",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "items"
+        ],
+        "wordCount": 43,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "teamtailor",
+      "name": "Teamtailor Career Portals",
+      "category": "jobs",
+      "manifestFile": "teamtailor.yaml",
+      "domains": [
+        "*.teamtailor.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://acme.teamtailor.com/",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "text",
+        "topLevelJsonKeys": [],
+        "wordCount": 109,
+        "recordCount": 0,
+        "rootTagCount": 28
+      }
+    },
+    {
+      "id": "usaspending",
+      "name": "USAspending.gov Federal Awards",
+      "category": "public-records",
+      "manifestFile": "usaspending.yaml",
+      "domains": [
+        "www.usaspending.gov",
+        "usaspending.gov"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://www.usaspending.gov/award/CONT_AWD_NNK17MA01B_8000_-NONE-_-NONE-",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "generated_unique_award_id",
+          "piid",
+          "fain",
+          "category",
+          "recipient",
+          "awarding_agency",
+          "funding_agency",
+          "total_obligation",
+          "description",
+          "period_of_performance"
+        ],
+        "wordCount": 123,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "woocommerce",
+      "name": "WooCommerce Store API & Storefronts",
+      "category": "commerce-social",
+      "manifestFile": "woocommerce.yaml",
+      "domains": [
+        "woocommerce.com"
+      ],
+      "universalEngine": true,
+      "modes": [
+        "twin",
+        "html",
+        "catalog"
+      ],
+      "exampleUrl": "https://woocommerce.com/wp-json/wc/store/v1/products?per_page=20&page=1",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "id",
+          "title",
+          "handle",
+          "name",
+          "permalink",
+          "short_description",
+          "prices",
+          "variants",
+          "images"
+        ],
+        "wordCount": 32,
+        "recordCount": 1
+      }
+    },
+    {
+      "id": "workable",
+      "name": "Workable Job Boards & Postings",
+      "category": "jobs",
+      "manifestFile": "workable.yaml",
+      "domains": [
+        "apply.workable.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin"
+      ],
+      "exampleUrl": "https://apply.workable.com/identiv/",
+      "fixtureVerified": true,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "json",
+        "topLevelJsonKeys": [
+          "name",
+          "jobs"
+        ],
+        "wordCount": 35,
+        "recordCount": 0
+      }
+    },
+    {
+      "id": "ycombinator",
+      "name": "Y Combinator Directory & Work at a Startup",
+      "category": "finance",
+      "manifestFile": "ycombinator.yaml",
+      "domains": [
+        "www.ycombinator.com",
+        "ycombinator.com",
+        "www.workatastartup.com",
+        "workatastartup.com"
+      ],
+      "universalEngine": false,
+      "modes": [
+        "twin",
+        "html"
+      ],
+      "exampleUrl": "https://www.ycombinator.com/companies/supabase",
+      "fixtureVerified": false,
+      "ring1Locked": true,
+      "status": "healthy",
+      "httpStatus": null,
+      "latencyMs": 0,
+      "structuralDiagnostic": {
+        "kind": "html",
+        "topLevelJsonKeys": [],
+        "wordCount": 263,
+        "recordCount": 0,
+        "rootTagCount": 3
+      }
+    }
+  ]
+}

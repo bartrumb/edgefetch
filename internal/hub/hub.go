@@ -406,6 +406,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": "hub", "version": agent.Version, "connectedAgents": n})
 		return
 
+	case r.URL.Path == "/openapi.json":
+		s.handleOpenAPI(w, r)
+		return
+
 	case (r.URL.Path == "/.well-known/http-message-signatures-directory" || r.URL.Path == "/.well-known/edgefetch-bot.json") &&
 		(r.Method == http.MethodGet || r.Method == http.MethodHead):
 		s.handleBotTransparencyRoutes(w, r)

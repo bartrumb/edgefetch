@@ -361,9 +361,39 @@ export function sanitizeFleetForMcp(fleet: {
   };
 }
 
-function buildToolDefinitions(deps: McpServerDeps) {
-  const { allowedTargets, defaultTarget } = deps;
-  const allTools = [
+export const DEFAULT_ALLOWED_TARGETS: readonly FetchTarget[] = ['auto', 'agent', 'container'];
+
+export interface CanonicalMcpToolSchema {
+  type: 'object';
+  properties: Record<string, Record<string, unknown>>;
+  required?: string[];
+  additionalProperties?: boolean;
+}
+
+export interface CanonicalMcpToolDefinition {
+  name: string;
+  description: string;
+  annotations: {
+    title: string;
+    readOnlyHint: boolean;
+    destructiveHint: boolean;
+    idempotentHint: boolean;
+    openWorldHint: boolean;
+  };
+  inputSchema: CanonicalMcpToolSchema;
+}
+
+/**
+ * Canonical single-source-of-truth definitions for all 15 EdgeFetch MCP tools.
+ * Shared directly by `POST /mcp` (`tools/list`) and `GET /openapi.json` (`hub/src/openapi.ts`) so schemas never drift.
+ */
+export function buildCanonicalMcpToolSchemas(options?: {
+  allowedTargets?: readonly FetchTarget[];
+  defaultTarget?: FetchTarget;
+}): CanonicalMcpToolDefinition[] {
+  const allowedTargets = [...(options?.allowedTargets ?? DEFAULT_ALLOWED_TARGETS)];
+  const defaultTarget = options?.defaultTarget ?? 'auto';
+  return [
     {
       name: 'list_agents',
       description:
@@ -1129,6 +1159,17 @@ function buildToolDefinitions(deps: McpServerDeps) {
       },
     },
   ];
+}
+
+export const MCP_TOOL_SCHEMAS: Readonly<Record<string, CanonicalMcpToolSchema>> = Object.freeze(
+  Object.fromEntries(buildCanonicalMcpToolSchemas().map((tool) => [tool.name, tool.inputSchema])),
+);
+
+function buildToolDefinitions(deps: McpServerDeps) {
+  const allTools = buildCanonicalMcpToolSchemas({
+    allowedTargets: deps.allowedTargets,
+    defaultTarget: deps.defaultTarget,
+  });
   return allTools
     .filter((t) => {
       if (t.name === 'scrape') return Boolean(deps.executeScrape);

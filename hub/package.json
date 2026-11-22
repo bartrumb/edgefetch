@@ -10,6 +10,7 @@
     "type-check": "node scripts/compile-manifests.mjs && tsc --noEmit -p tsconfig.json",
     "test": "node scripts/run-tests.mjs",
     "test:coverage": "node scripts/run-tests.mjs --coverage --include-sdk",
+    "openapi:generate": "node scripts/generate-openapi.mjs",
     "adapter:new": "node scripts/new-adapter.mjs",
     "adapter:test": "node scripts/test-adapter.mjs",
     "build:portable": "node scripts/build-portable.mjs",

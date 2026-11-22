@@ -262,6 +262,24 @@ export async function handleCompatRoutes(params: {
     );
   }
 
+  if (fcSubpath === '/extract' && request.method === 'POST') {
+    const out = await executeExtractCall({
+      payload: {
+        ...bodyObj,
+        ...(typeof bodyObj.query !== 'string' && typeof bodyObj.prompt === 'string' ? { query: bodyObj.prompt } : {}),
+      },
+      env,
+      executeHubFetch,
+      selfHost: url.hostname,
+      source: 'compat:firecrawl:extract',
+      ...(activeTracer ? { tracer: activeTracer } : {}),
+    });
+    return Response.json(
+      out.status === 200 ? { success: true, data: out.body, ...out.body } : { success: false, ...out.body },
+      { status: out.status },
+    );
+  }
+
   // ── Firecrawl `/v2/agent` Drop-In Compatibility (with SSE + BYO-LLM + Dynamic Adapter Router) ──
   if (fcSubpath === '/agent' && request.method === 'POST') {
     const wantSse = (request.headers.get('accept') ?? '').toLowerCase().includes('text/event-stream');

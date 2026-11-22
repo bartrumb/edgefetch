@@ -556,3 +556,89 @@ func TestGoHubTwinSanitizationAndCrossDomainRedirectBlock(t *testing.T) {
 		t.Fatalf("expected cross-domain twin redirect to reject spoofed JSON and fall back to HTML, got: %s", redirMd)
 	}
 }
+
+func TestGoHubOpenAPISpecAndHostSanitization(t *testing.T) {
+	srv := NewServer(Config{
+		CallerToken: "caller-secret-token-0123456789ab",
+		AgentToken:  "agent-shared-token-0123456789abc",
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// 1. OPTIONS /openapi.json CORS preflight works without authentication.
+	optReq, _ := http.NewRequest(http.MethodOptions, ts.URL+"/openapi.json", nil)
+	optResp, err := http.DefaultClient.Do(optReq)
+	if err != nil {
+		t.Fatalf("OPTIONS /openapi.json failed: %v", err)
+	}
+	_ = optResp.Body.Close()
+	if optResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 on OPTIONS /openapi.json, got %d", optResp.StatusCode)
+	}
+	if optResp.Header.Get("Access-Control-Allow-Origin") != "*" || optResp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("missing CORS or nosniff headers on OPTIONS /openapi.json: %+v", optResp.Header)
+	}
+
+	// 2. GET /openapi.json returns OpenAPI 3.1.0 spec with loopback server origin.
+	getResp, err := http.Get(ts.URL + "/openapi.json")
+	if err != nil {
+		t.Fatalf("GET /openapi.json failed: %v", err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on GET /openapi.json, got %d", getResp.StatusCode)
+	}
+	if getResp.Header.Get("X-Content-Type-Options") != "nosniff" || getResp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("missing security/CORS headers on GET /openapi.json: %+v", getResp.Header)
+	}
+	var spec struct {
+		OpenAPI string `json:"openapi"`
+		Info    struct {
+			Title   string `json:"title"`
+			Version string `json:"version"`
+		} `json:"info"`
+		Servers []struct {
+			URL string `json:"url"`
+		} `json:"servers"`
+		Paths map[string]any `json:"paths"`
+	}
+	if err := json.NewDecoder(getResp.Body).Decode(&spec); err != nil {
+		_ = getResp.Body.Close()
+		t.Fatalf("invalid JSON from GET /openapi.json: %v", err)
+	}
+	_ = getResp.Body.Close()
+
+	if spec.OpenAPI != "3.1.0" || spec.Info.Version != agent.Version {
+		t.Fatalf("unexpected OpenAPI header fields: %+v", spec)
+	}
+	if len(spec.Servers) != 1 || spec.Servers[0].URL != ts.URL {
+		t.Fatalf("expected loopback server URL %q, got %+v", ts.URL, spec.Servers)
+	}
+	for _, wantPath := range []string{"/health", "/openapi.json", "/v1/capabilities", "/v1/extractors", "/v1/scrape", "/v1/map", "/fetch", "/mcp", "/agents"} {
+		if _, ok := spec.Paths[wantPath]; !ok {
+			t.Fatalf("missing expected route %q in Go Hub OpenAPI spec", wantPath)
+		}
+	}
+
+	// 3. Untrusted plain-HTTP Host header falls back strictly to https://edgefetch.dev (Host poisoning prevention).
+	poisonReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/openapi.json", nil)
+	poisonReq.Host = "evil.attacker.example:8080"
+	poisonReq.Header.Set("Accept", "application/openapi+json")
+	poisonResp, err := http.DefaultClient.Do(poisonReq)
+	if err != nil {
+		t.Fatalf("poisoned Host GET /openapi.json failed: %v", err)
+	}
+	if !strings.HasPrefix(poisonResp.Header.Get("Content-Type"), "application/openapi+json") {
+		t.Fatalf("expected application/openapi+json content-type, got %q", poisonResp.Header.Get("Content-Type"))
+	}
+	var poisonSpec struct {
+		Servers []struct {
+			URL string `json:"url"`
+		} `json:"servers"`
+	}
+	_ = json.NewDecoder(poisonResp.Body).Decode(&poisonSpec)
+	_ = poisonResp.Body.Close()
+	if len(poisonSpec.Servers) != 1 || poisonSpec.Servers[0].URL != "https://edgefetch.dev" {
+		t.Fatalf("expected poisoned Host to fall back to https://edgefetch.dev, got %+v", poisonSpec.Servers)
+	}
+}

@@ -19,8 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bartrumb/edgefetch/v2/internal/botauth"
 	"github.com/bartrumb/edgefetch/v2/internal/browser"
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 	"github.com/coder/websocket"
 )
@@ -1339,4 +1341,346 @@ func TestRobotsSlowDripTarpitBoundedWithoutRetry(t *testing.T) {
 	if len(res2) != 1 || res2[0].Outcome != classify.OutcomeStop || robotsHits.Load() != 1 || elapsed2 > 250*time.Millisecond {
 		t.Fatalf("expected cached tarpit distress to fail fast without second /robots.txt hit (hits=%d, elapsed=%v, res=%+v)", robotsHits.Load(), elapsed2, res2)
 	}
+}
+
+func TestExecuteCallWithTraceBrowserRenderAndBotAuthSpans(t *testing.T) {
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		var writeMu sync.Mutex
+		send := func(v any) {
+			b, _ := json.Marshal(v)
+			writeMu.Lock()
+			_ = conn.Write(r.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID        int64  `json:"id"`
+				SessionID string `json:"sessionId"`
+				Method    string `json:"method"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				continue
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-crawl"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-crawl"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "s-crawl"}})
+			case "Page.navigate":
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "f-crawl"}})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Page.loadEventFired", "params": map[string]any{}})
+			case "Runtime.evaluate":
+				docJSON, _ := json.Marshal(map[string]string{
+					"url":  "http://spa.test/app?token=SECRET_CRAWL_TOKEN#frag",
+					"html": "<html><head><title>Hydrated SPA</title></head><body><main><h1>Hydrated SPA</h1><p>Browser render span verified.</p></main></body></html>",
+				})
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result":    map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}},
+				})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+
+	var (
+		mu        sync.Mutex
+		rawBodies []string
+	)
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		rawBodies = append(rawBodies, string(b))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+
+	newCollectorExp := func(svc string) *otel.Exporter {
+		return otel.NewExporterFromEnv(func(k string) string {
+			if k == "OTEL_EXPORTER_OTLP_ENDPOINT" {
+				return collector.URL
+			}
+			return ""
+		}, svc, "2.7.0", collector.Client().Transport)
+	}
+
+	var sawSigned atomic.Bool
+	c, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" || r.URL.Path == "/llms.txt" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Signature") != "" && r.Header.Get("Signature-Input") != "" {
+			sawSigned.Store(true)
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><html><body><div id="root"></div><script type="module" src="/app.js"></script></body></html>`))
+	}))
+
+	// Verify order-independent wiring: SetRenderer BEFORE SetOtelExporter, and vice-versa.
+	c.SetRenderer(browser.NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, DefaultUserAgent))
+	exp := newCollectorExp("edgefetch-crawl-test")
+	c.SetOtelExporter(exp)
+
+	kp, err := botauth.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	signer, err := botauth.NewSigner(kp.PrivateKeySeedB64URL, "https://bot.example.com/.well-known/http-message-signatures-directory")
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+	c.SetBotSigner(signer)
+
+	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	const callerTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	const callerSpanID = "00f067aa0ba902b7"
+	hdr := http.Header{}
+	hdr.Set("Traceparent", "00-"+callerTraceID+"-"+callerSpanID+"-01")
+
+	// 1. KindScrape (RenderMode: "auto") + botSigner -> batch -> fetch.scrape (bot_auth.signed=true) -> browser.render
+	rep1 := ExecuteCallWithTrace(context.Background(), c, FetchCall{
+		MaxSeconds: 20,
+		Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+		Requests: []Request{{
+			ID:         "spa-auto",
+			URL:        "http://spa.test/app?token=SECRET_CRAWL_TOKEN#frag",
+			Kind:       classify.KindScrape,
+			RenderMode: "auto",
+		}},
+	}, hdr, silentLog, nil)
+	if len(rep1.Results) != 1 || rep1.Results[0].Outcome != classify.OutcomeOK || !rep1.Results[0].Rendered {
+		t.Fatalf("expected auto-rendered SPA result, got %+v", rep1.Results)
+	}
+	if !sawSigned.Load() {
+		t.Fatal("expected HTTP request signed with RFC 9421 Signature headers")
+	}
+
+	// 2. KindRender -> batch -> fetch.render -> browser.render (no bot_auth.signed because no HTTP hop)
+	rep2 := ExecuteCallWithTrace(context.Background(), c, FetchCall{
+		MaxSeconds: 20,
+		Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+		Requests: []Request{{
+			ID:         "explicit-render",
+			URL:        "http://spa.test/app?token=SECRET_RENDER#frag",
+			Kind:       classify.KindRender,
+			RenderMode: "always",
+		}},
+	}, hdr, silentLog, nil)
+	if len(rep2.Results) != 1 || rep2.Results[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected KindRender result ok, got %+v", rep2.Results)
+	}
+
+	// 3. KindScrape without botSigner -> no bot_auth.signed
+	c.SetBotSigner(nil)
+	rep3 := ExecuteCallWithTrace(context.Background(), c, FetchCall{
+		MaxSeconds: 20,
+		Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+		Requests: []Request{{
+			ID:         "unsigned-scrape",
+			URL:        "http://spa.test/app",
+			Kind:       classify.KindScrape,
+			RenderMode: "off",
+		}},
+	}, hdr, silentLog, nil)
+	if len(rep3.Results) != 1 || rep3.Results[0].Outcome != classify.OutcomeOK {
+		t.Fatalf("expected unsigned scrape ok, got %+v", rep3.Results)
+	}
+
+	// 4. Unsampled traceparent (-00) emits 0 spans
+	unsampledHdr := http.Header{}
+	unsampledHdr.Set("Traceparent", "00-dddddddddddddddddddddddddddddddd-4444444444444444-00")
+	_ = ExecuteCallWithTrace(context.Background(), c, FetchCall{
+		MaxSeconds: 20,
+		Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+		Requests: []Request{{
+			ID:         "unsampled",
+			URL:        "http://spa.test/app",
+			Kind:       classify.KindRender,
+			RenderMode: "always",
+		}},
+	}, unsampledHdr, silentLog, nil)
+
+	_ = c.Close()
+
+	mu.Lock()
+	combined := strings.Join(rawBodies, "\n")
+	mu.Unlock()
+
+	if strings.Contains(combined, "SECRET_CRAWL_TOKEN") || strings.Contains(combined, "SECRET_RENDER") || strings.Contains(combined, "dddddddddddddddddddddddddddddddd") {
+		t.Fatalf("SECURITY/SAMPLING: secret or unsampled trace leaked into OTLP output:\n%s", combined)
+	}
+
+	type parsedSpan struct {
+		TraceID      string `json:"traceId"`
+		SpanID       string `json:"spanId"`
+		ParentSpanID string `json:"parentSpanId"`
+		Name         string `json:"name"`
+		StartUnix    string `json:"startTimeUnixNano"`
+		EndUnix      string `json:"endTimeUnixNano"`
+		Attributes   []struct {
+			Key   string         `json:"key"`
+			Value map[string]any `json:"value"`
+		} `json:"attributes"`
+	}
+	var allSpans []parsedSpan
+	for _, body := range rawBodies {
+		var p struct {
+			ResourceSpans []struct {
+				ScopeSpans []struct {
+					Spans []parsedSpan `json:"spans"`
+				} `json:"scopeSpans"`
+			} `json:"resourceSpans"`
+		}
+		_ = json.Unmarshal([]byte(body), &p)
+		for _, rs := range p.ResourceSpans {
+			for _, ss := range rs.ScopeSpans {
+				allSpans = append(allSpans, ss.Spans...)
+			}
+		}
+	}
+
+	var batches, fetchScrapes, fetchRenders, browserRenders []parsedSpan
+	hasAttr := func(sp parsedSpan, k string) (any, bool) {
+		for _, a := range sp.Attributes {
+			if a.Key == k {
+				if v, ok := a.Value["boolValue"]; ok {
+					return v, true
+				}
+				if v, ok := a.Value["stringValue"]; ok {
+					return v, true
+				}
+			}
+		}
+		return nil, false
+	}
+	for _, sp := range allSpans {
+		if sp.TraceID != callerTraceID {
+			t.Fatalf("unexpected traceId %q (want %q) on %q", sp.TraceID, callerTraceID, sp.Name)
+		}
+		switch sp.Name {
+		case "edgefetch.go.batch":
+			batches = append(batches, sp)
+		case "edgefetch.go.fetch.scrape":
+			fetchScrapes = append(fetchScrapes, sp)
+		case "edgefetch.go.fetch.render":
+			fetchRenders = append(fetchRenders, sp)
+		case "edgefetch.browser.render":
+			browserRenders = append(browserRenders, sp)
+		}
+	}
+	if len(batches) != 3 || len(fetchScrapes) != 2 || len(fetchRenders) != 1 || len(browserRenders) != 2 {
+		t.Fatalf("unexpected span counts: batches=%d fetchScrapes=%d fetchRenders=%d browserRenders=%d",
+			len(batches), len(fetchScrapes), len(fetchRenders), len(browserRenders))
+	}
+
+	// Check bot_auth.signed present on signed scrape, absent on unsigned scrape & explicit KindRender
+	signedCount := 0
+	fetchByID := make(map[string]parsedSpan)
+	for _, fs := range fetchScrapes {
+		fetchByID[fs.SpanID] = fs
+		if v, ok := hasAttr(fs, "bot_auth.signed"); ok && v == true {
+			signedCount++
+		}
+	}
+	if signedCount != 1 {
+		t.Fatalf("expected exactly 1 edgefetch.go.fetch.scrape with bot_auth.signed=true, got %d", signedCount)
+	}
+	if _, ok := hasAttr(fetchRenders[0], "bot_auth.signed"); ok {
+		t.Fatal("expected KindRender without HTTP hop not to carry bot_auth.signed")
+	}
+	fetchByID[fetchRenders[0].SpanID] = fetchRenders[0]
+
+	// Check each edgefetch.browser.render is parented under its fetch span and bounded within [fetchStart, fetchEnd]
+	for _, br := range browserRenders {
+		parent, ok := fetchByID[br.ParentSpanID]
+		if !ok {
+			t.Fatalf("expected edgefetch.browser.render parentSpanId=%q to match an edgefetch.go.fetch.* span", br.ParentSpanID)
+		}
+		if br.StartUnix < parent.StartUnix || br.EndUnix > parent.EndUnix {
+			t.Fatalf("expected render [%s..%s] inside fetch [%s..%s]", br.StartUnix, br.EndUnix, parent.StartUnix, parent.EndUnix)
+		}
+		if uVal, ok := hasAttr(br, "url.full"); !ok || uVal != "http://spa.test/app" {
+			t.Fatalf("expected sanitized url.full on browser.render, got %v (ok=%v)", uVal, ok)
+		}
+	}
+
+	// Verify reverse setter order: SetOtelExporter BEFORE SetRenderer also propagates exporter to renderer.
+	t.Run("SetOtelExporterBeforeSetRenderer", func(t *testing.T) {
+		mu.Lock()
+		beforeCount := len(rawBodies)
+		mu.Unlock()
+
+		c2, _ := newTestCrawler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		exp2 := newCollectorExp("edgefetch-crawl-test-order")
+		c2.SetOtelExporter(exp2)
+		c2.SetRenderer(browser.NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, DefaultUserAgent))
+
+		rep := ExecuteCallWithTrace(context.Background(), c2, FetchCall{
+			MaxSeconds: 20,
+			Options:    Options{PauseMs: 1, RespectRobots: Bool(true)},
+			Requests: []Request{{
+				ID:         "reverse-order-render",
+				URL:        "http://spa.test/app?token=SECRET_ORDER#frag",
+				Kind:       classify.KindRender,
+				RenderMode: "always",
+			}},
+		}, hdr, silentLog, nil)
+		if len(rep.Results) != 1 || rep.Results[0].Outcome != classify.OutcomeOK {
+			t.Fatalf("expected KindRender ok, got %+v", rep.Results)
+		}
+		_ = c2.Close()
+
+		mu.Lock()
+		newBodies := append([]string(nil), rawBodies[beforeCount:]...)
+		mu.Unlock()
+		if strings.Contains(strings.Join(newBodies, "\n"), "SECRET_ORDER") {
+			t.Fatal("SECURITY: query secret leaked in SetOtelExporterBeforeSetRenderer OTLP output")
+		}
+
+		var fetchID, renderParent string
+		for _, body := range newBodies {
+			var p struct {
+				ResourceSpans []struct {
+					ScopeSpans []struct {
+						Spans []parsedSpan `json:"spans"`
+					} `json:"scopeSpans"`
+				} `json:"resourceSpans"`
+			}
+			_ = json.Unmarshal([]byte(body), &p)
+			for _, rs := range p.ResourceSpans {
+				for _, ss := range rs.ScopeSpans {
+					for _, sp := range ss.Spans {
+						if sp.Name == "edgefetch.go.fetch.render" {
+							fetchID = sp.SpanID
+						}
+						if sp.Name == "edgefetch.browser.render" {
+							renderParent = sp.ParentSpanID
+						}
+					}
+				}
+			}
+		}
+		if fetchID == "" || renderParent != fetchID {
+			t.Fatalf("expected edgefetch.browser.render parented under edgefetch.go.fetch.render when SetOtelExporter precedes SetRenderer; fetchID=%q renderParent=%q",
+				fetchID, renderParent)
+		}
+	})
 }

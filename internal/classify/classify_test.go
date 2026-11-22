@@ -2,6 +2,7 @@ package classify
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -58,7 +59,32 @@ func TestClassifyOutcomes(t *testing.T) {
 		{"binary 200 ok", KindBinary, 200, "application/octet-stream", "", "\x00\x01\x02", OutcomeOK, ""},
 		{"binary 429 stop", KindBinary, 429, "text/plain", "", "slow", OutcomeStop, "HTTP 429"},
 		{"binary 404 gone", KindBinary, 404, "text/plain", "", "missing", OutcomeGone, "HTTP 404"},
+		{"binary 410 gone", KindBinary, 410, "text/plain", "", "gone", OutcomeGone, "HTTP 410"},
+		{"binary 403 stop", KindBinary, 403, "text/plain", "", "denied", OutcomeStop, "HTTP 403"},
+		{"binary 503 stop", KindBinary, 503, "text/plain", "", "busy", OutcomeStop, "HTTP 503"},
 		{"binary 500 error", KindBinary, 500, "text/plain", "", "boom", OutcomeError, "HTTP 500"},
+		{"text 429 stop", KindText, 429, "text/plain", "", "slow", OutcomeStop, "HTTP 429"},
+		{"text 503 stop", KindText, 503, "text/plain", "", "busy", OutcomeStop, "HTTP 503"},
+		{"page 403 stop", KindPage, 403, "text/html", "", "denied", OutcomeStop, "HTTP 403"},
+		{"page 503 stop", KindPage, 503, "text/html", "", "busy", OutcomeStop, "HTTP 503"},
+		{"page 199 skip", KindPage, 199, "text/html", "", "", OutcomeSkip, ""},
+		{"page 300 skip", KindPage, 300, "text/html", "", "", OutcomeSkip, ""},
+		{"page 204 html ok", KindPage, 204, "text/html", "", "", OutcomeOK, ""},
+		{"json empty body error", KindJSON, 200, "application/json", "", "", OutcomeError, "not JSON (application/json)"},
+		{"scrape 403 stop", KindScrape, 403, "text/html", "", "denied", OutcomeStop, "HTTP 403"},
+		{"scrape 503 stop", KindScrape, 503, "text/html", "", "busy", OutcomeStop, "HTTP 503"},
+		{"scrape 410 gone", KindScrape, 410, "text/html", "", "gone", OutcomeGone, "HTTP 410"},
+		{"render 403 stop", KindRender, 403, "text/html", "", "denied", OutcomeStop, "HTTP 403"},
+		{"render 503 stop", KindRender, 503, "text/html", "", "busy", OutcomeStop, "HTTP 503"},
+		{"render 410 gone", KindRender, 410, "text/html", "", "gone", OutcomeGone, "HTTP 410"},
+		{"pdf 429 stop", KindPDF, 429, "text/plain", "", "slow", OutcomeStop, "HTTP 429"},
+		{"pdf 503 stop", KindPDF, 503, "text/plain", "", "busy", OutcomeStop, "HTTP 503"},
+		{"pdf 404 gone", KindPDF, 404, "text/plain", "", "missing", OutcomeGone, "HTTP 404"},
+		{"pdf 200 >1024 prefix match ok", KindPDF, 200, "application/octet-stream", "", "%PDF-1.7 " + strings.Repeat("x", 2040), OutcomeOK, ""},
+		{"pdf 200 >1024 magic past cap error", KindPDF, 200, "application/octet-stream", "", strings.Repeat("x", 1100) + "%PDF-1.7", OutcomeError, "not a PDF (application/octet-stream)"},
+		{"feed products non-array string", KindFeed, 200, "application/json", "", `{"products":"bad"}`, OutcomeError, "no products array"},
+		{"feed products null", KindFeed, 200, "application/json", "", `{"products":null}`, OutcomeError, "no products array"},
+		{"unknown kind defaults to feed", Kind("custom"), 200, "application/json", "", `{"products":[{"id":1}]}`, OutcomeOK, ""},
 	}
 
 	for _, tc := range cases {
@@ -98,9 +124,17 @@ func TestAcceptForAndStopsHost(t *testing.T) {
 		{KindPDF, "", "application/pdf,*/*;q=0.8", false},
 		{KindBinary, "", "*/*", false},
 		{KindBinary, "image/webp", "image/webp", false},
+		{KindText, "text/html", "text/html", false},
 		{KindText, "text/markdown", "text/markdown", false},
+		{KindText, "text/x-markdown", "text/x-markdown", false},
 		{KindText, "application/xml", "application/xml", false},
+		{KindText, "text/xml", "text/xml", false},
+		{KindText, "application/rss+xml", "application/rss+xml", false},
+		{KindText, "application/atom+xml", "application/atom+xml", false},
+		{KindText, "application/json", "application/json", false},
+		{KindText, "text/calendar", "text/calendar", false},
 		{KindText, "text/plain", "text/plain", false},
+		{KindText, "", "", true},
 		{KindText, "*/*", "", true},
 		{"", "", "", true},
 		{Kind("bogus"), "", "", true},
@@ -151,6 +185,21 @@ func TestAcceptForAndStopsHost(t *testing.T) {
 	imgH := http.Header{"Content-Type": []string{"image/png"}}
 	if got, _ := ClassifyAuto(KindPage, true, 200, imgH, []byte("\x89PNG")); got != OutcomeSkip {
 		t.Fatalf("ClassifyAuto(KindPage, true, 200, image/png) = %q, want %q", got, OutcomeSkip)
+	}
+	jsonH := http.Header{"Content-Type": []string{"application/json"}}
+	if got, _ := ClassifyAuto(KindPage, false, 200, jsonH, []byte("{}")); got != OutcomeSkip {
+		t.Fatalf("ClassifyAuto(KindPage, false, 200, json) = %q, want %q", got, OutcomeSkip)
+	}
+	if got, _ := ClassifyAuto(KindPage, true, 500, jsonH, []byte("{}")); got != OutcomeSkip {
+		t.Fatalf("ClassifyAuto(KindPage, true, 500, json) = %q, want %q", got, OutcomeSkip)
+	}
+	if got, _ := ClassifyAuto(KindFeed, true, 200, jsonH, []byte("{}")); got != OutcomeError {
+		t.Fatalf("ClassifyAuto(KindFeed, true, 200, json) = %q, want %q", got, OutcomeError)
+	}
+	for _, nonAuto := range []string{"", "image/png", "application/octet-stream", "text/plain+json"} {
+		if IsAutoPageContentType(nonAuto) {
+			t.Fatalf("expected IsAutoPageContentType(%q) == false", nonAuto)
+		}
 	}
 }
 

@@ -31,6 +31,14 @@ import {
 } from './llm';
 import { deliverSignedWebhook, executeMapCall, type HubFetchExecutor, type WebhookConfig } from './map-crawl';
 import { validatePublicHttpsTargetUrl } from './overflow';
+import {
+  getActiveRequestTracer,
+  sanitizeErrorMessageForSpan,
+  sanitizeUrlForSpan,
+  type ActiveSpanHandle,
+  type RequestTracer,
+  type TraceContext,
+} from './otel';
 import { executeInteractCall, executeScrapeCall, extractStructuredJsonFromPage, type ScrapeRequestPayload } from './scrape';
 import { D1FtsSearchIndex } from './search-index';
 import type { OptionalStorageBindings } from './storage';
@@ -516,11 +524,13 @@ export async function startOrExecuteAgentCall(params: {
   waitUntil?: (p: Promise<unknown>) => void;
   wantSseStream?: boolean;
   llmFetchFn?: typeof fetch;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<
   | { kind: 'json'; status: number; body: Record<string, unknown> }
   | { kind: 'sse'; response: Response }
 > {
   const { payload, env, executeHubFetch, selfHost, principal = 'api', waitUntil, wantSseStream = false, llmFetchFn } = params;
+  const agentTracer = getActiveRequestTracer(params.tracer);
 
   const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
   if (!prompt) {
@@ -629,6 +639,21 @@ export async function startOrExecuteAgentCall(params: {
   const routerStart = Date.now();
   const initialMatches = findRelevantAdapters({ query: prompt, urls: seedUrls, limit: 8 });
   const routedSet = new Set<string>(initialMatches.map((m) => m.id));
+  if (agentTracer) {
+    const initRouterSpan = agentTracer.startSpan('edgefetch.agent.router', {
+      kind: 1,
+      startTimeMs: routerStart,
+      attributes: {
+        'agent.id': agentId,
+        'agent.router.name': 'dynamic_adapter_router',
+        'agent.router.match_count': initialMatches.length,
+        'agent.router.matches': initialMatches.map((m) => m.id).join(','),
+        'agent.seed_url_count': seedUrls.length,
+      },
+    });
+    initRouterSpan.setStatus(true);
+    initRouterSpan.end();
+  }
 
   const record: AgentRunRecord = {
     id: agentId,
@@ -668,6 +693,7 @@ export async function startOrExecuteAgentCall(params: {
   await persistAgentRun(record, env.META);
 
   const runLoop = async (emitEvent?: (event: string, data: Record<string, unknown>) => void): Promise<AgentRunRecord> => {
+    const getLoopTracer = () => getActiveRequestTracer() ?? agentTracer;
     let seq = record.trace.length;
     const pushSpan = (span: Omit<AgentTraceSpan, 'sequence' | 'spanId'>): AgentTraceSpan => {
       seq++;
@@ -693,6 +719,7 @@ export async function startOrExecuteAgentCall(params: {
     });
 
     if (webhook) {
+      const whTracer = getLoopTracer();
       await deliverSignedWebhook({
         webhook,
         defaultSecret: env.WEBHOOK_SECRET,
@@ -701,6 +728,7 @@ export async function startOrExecuteAgentCall(params: {
         data: { agentId: record.id, status: 'processing', prompt: prompt.slice(0, 200) },
         selfHost,
         ...(env.SAFE_PUBLIC_FETCH ? { fetchFn: env.SAFE_PUBLIC_FETCH } : env.SAFE_FETCH ? { fetchFn: env.SAFE_FETCH } : {}),
+        ...(whTracer ? { tracer: whTracer } : {}),
       }).catch(() => undefined);
     }
 
@@ -736,70 +764,114 @@ export async function startOrExecuteAgentCall(params: {
       args: Record<string, unknown>,
     ): Promise<{ ok: boolean; summaryForLlm: string; budgetExhausted?: boolean }> => {
       const t0 = Date.now();
+      const toolTracer = getLoopTracer();
       if (toolName === 'find_extractors') {
         const q = typeof args.query === 'string' ? args.query : prompt;
         const cat = typeof args.category === 'string' ? args.category : undefined;
-        const matches = findRelevantAdapters({ query: q, category: cat, limit: 10 });
-        for (const m of matches) routedSet.add(m.id);
-        record.routedAdapters = [...routedSet];
-        pushSpan({
-          kind: 'router',
-          name: 'find_extractors',
-          status: 'ok',
-          startedAt: t0,
-          durationMs: Date.now() - t0,
-          input: { query: q, ...(cat ? { category: cat } : {}) },
-          outputPreview: matches.map((m) => m.id),
-        });
-        return { ok: true, summaryForLlm: JSON.stringify({ matches }, null, 2) };
+        const runRouter = (span?: ActiveSpanHandle) => {
+          const matches = findRelevantAdapters({ query: q, category: cat, limit: 10 });
+          for (const m of matches) routedSet.add(m.id);
+          record.routedAdapters = [...routedSet];
+          span?.setAttribute('agent.router.match_count', matches.length);
+          span?.setAttribute('agent.router.matches', matches.map((m) => m.id).join(','));
+          pushSpan({
+            kind: 'router',
+            name: 'find_extractors',
+            status: 'ok',
+            startedAt: t0,
+            durationMs: Date.now() - t0,
+            input: { query: q, ...(cat ? { category: cat } : {}) },
+            outputPreview: matches.map((m) => m.id),
+          });
+          return { ok: true, summaryForLlm: JSON.stringify({ matches }, null, 2) };
+        };
+        if (toolTracer) {
+          return toolTracer.withSpan(
+            'edgefetch.agent.router',
+            {
+              kind: 1,
+              attributes: {
+                'agent.id': record.id,
+                'agent.router.name': 'find_extractors',
+                ...(cat ? { 'agent.router.category': cat } : {}),
+              },
+            },
+            (span) => runRouter(span),
+          );
+        }
+        return runRouter();
       }
+
+      const withToolSpan = <T>(fn: (toolSpan?: ActiveSpanHandle) => Promise<T>): Promise<T> => {
+        if (!toolTracer) return fn();
+        return toolTracer.withSpan(
+          'edgefetch.agent.tool_call',
+          {
+            kind: 1,
+            attributes: {
+              'agent.id': record.id,
+              'agent.tool.name': toolName,
+            },
+          },
+          (span) => fn(span),
+        );
+      };
 
       if (toolName === 'web_search') {
         if (strictConstrainToURLs) {
           return { ok: false, summaryForLlm: JSON.stringify({ error: 'strictConstrainToURLs is active; web_search is disabled.' }) };
         }
-        const qBase = typeof args.query === 'string' && args.query.trim() ? args.query.trim() : prompt;
-        const qEffective = safeSearch ? `${qBase} -nsfw -adult` : qBase;
-        const sPayload: SearchRequestPayload = {
-          query: qEffective,
-          max_results: typeof args.maxResults === 'number' ? Math.min(10, Math.max(1, Math.floor(args.maxResults))) : 6,
-          ...(country ? { country } : {}),
-          ...(languages[0] ? { language: languages[0] } : {}),
-        } as SearchRequestPayload;
-        const sOut = await executeSearchCall({
-          payload: sPayload,
-          env,
-          executeHubFetch,
-          source: `agent:${principal}:search`,
+        return withToolSpan(async (toolSpan) => {
+          const qBase = typeof args.query === 'string' && args.query.trim() ? args.query.trim() : prompt;
+          const qEffective = safeSearch ? `${qBase} -nsfw -adult` : qBase;
+          const sPayload: SearchRequestPayload = {
+            query: qEffective,
+            max_results: typeof args.maxResults === 'number' ? Math.min(10, Math.max(1, Math.floor(args.maxResults))) : 6,
+            ...(country ? { country } : {}),
+            ...(languages[0] ? { language: languages[0] } : {}),
+          } as SearchRequestPayload;
+          const sTracer = getLoopTracer();
+          const sOut = await executeSearchCall({
+            payload: sPayload,
+            env,
+            executeHubFetch,
+            source: `agent:${principal}:search`,
+            ...(sTracer ? { tracer: sTracer } : {}),
+          });
+          const results = Array.isArray(sOut.body.results) ? (sOut.body.results as Array<Record<string, unknown>>) : [];
+          // Dynamically re-route any newly discovered result domains!
+          const discoveredUrls = results.map((r) => (typeof r.url === 'string' ? r.url : '')).filter(Boolean);
+          for (const dyn of findRelevantAdapters({ query: qBase, urls: discoveredUrls, limit: 5 })) {
+            routedSet.add(dyn.id);
+          }
+          record.routedAdapters = [...routedSet];
+          toolSpan?.setAttribute('search.result_count', results.length);
+          toolSpan?.setAttribute('http.response.status_code', sOut.status);
+          if (sOut.status !== 200) {
+            toolSpan?.setStatus(false, `search_http_${sOut.status}`);
+          }
+          pushSpan({
+            kind: 'tool_call',
+            name: 'web_search',
+            status: sOut.status === 200 ? 'ok' : 'error',
+            startedAt: t0,
+            durationMs: Date.now() - t0,
+            input: { query: qEffective },
+            outputPreview: { resultCount: results.length, topUrls: discoveredUrls.slice(0, 5) },
+          });
+          return {
+            ok: sOut.status === 200,
+            summaryForLlm: JSON.stringify(
+              results.slice(0, 8).map((r) => ({
+                title: r.title,
+                url: r.url,
+                snippet: typeof r.content === 'string' ? r.content.slice(0, 360) : r.snippet,
+              })),
+              null,
+              2,
+            ),
+          };
         });
-        const results = Array.isArray(sOut.body.results) ? (sOut.body.results as Array<Record<string, unknown>>) : [];
-        // Dynamically re-route any newly discovered result domains!
-        const discoveredUrls = results.map((r) => (typeof r.url === 'string' ? r.url : '')).filter(Boolean);
-        for (const dyn of findRelevantAdapters({ query: qBase, urls: discoveredUrls, limit: 5 })) {
-          routedSet.add(dyn.id);
-        }
-        record.routedAdapters = [...routedSet];
-        pushSpan({
-          kind: 'tool_call',
-          name: 'web_search',
-          status: sOut.status === 200 ? 'ok' : 'error',
-          startedAt: t0,
-          durationMs: Date.now() - t0,
-          input: { query: qEffective },
-          outputPreview: { resultCount: results.length, topUrls: discoveredUrls.slice(0, 5) },
-        });
-        return {
-          ok: sOut.status === 200,
-          summaryForLlm: JSON.stringify(
-            results.slice(0, 8).map((r) => ({
-              title: r.title,
-              url: r.url,
-              snippet: typeof r.content === 'string' ? r.content.slice(0, 360) : r.snippet,
-            })),
-            null,
-            2,
-          ),
-        };
       }
 
       if (toolName === 'search_jobs') {
@@ -810,48 +882,66 @@ export async function startOrExecuteAgentCall(params: {
           return { ok: false, budgetExhausted: true, summaryForLlm: JSON.stringify({ error: 'maxPages budget reached' }) };
         }
         record.pagesRead++;
-        const jOut = await executeJobsCall({
-          payload: args as JobsToolPayload,
-          env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-          executeSearch: async (sArgs) => {
-            const sRes = await executeSearchCall({
-              payload: sArgs as SearchRequestPayload,
-              env,
-              executeHubFetch,
-              source: `agent:${principal}:jobs-search`,
-            });
-            return { status: sRes.status, body: sRes.body };
-          },
-          executeScrape: async (scArgs) => {
-            const scRes = await executeScrapeCall({
-              payload: {
-                ...(scArgs as ScrapeRequestPayload),
-                ...(zeroDataRetention ? { ephemeral: true } : {}),
-              },
-              env: zeroDataRetention ? {} : env,
-              executeHubFetch,
-              selfHost,
-              source: `agent:${principal}:jobs-scrape`,
-            });
-            return { status: scRes.status, body: scRes.body };
-          },
+        return withToolSpan(async (toolSpan) => {
+          const jTracer = getLoopTracer();
+          const jOut = await executeJobsCall({
+            payload: args as JobsToolPayload,
+            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+            ...(jTracer ? { tracer: jTracer } : {}),
+            executeSearch: async (sArgs) => {
+              const sRes = await executeSearchCall({
+                payload: sArgs as SearchRequestPayload,
+                env,
+                executeHubFetch,
+                source: `agent:${principal}:jobs-search`,
+                ...(getLoopTracer() ? { tracer: getLoopTracer()! } : {}),
+              });
+              return { status: sRes.status, body: sRes.body };
+            },
+            executeScrape: async (scArgs) => {
+              const scRes = await executeScrapeCall({
+                payload: {
+                  ...(scArgs as ScrapeRequestPayload),
+                  ...(zeroDataRetention ? { ephemeral: true } : {}),
+                },
+                env: zeroDataRetention ? {} : env,
+                executeHubFetch,
+                selfHost,
+                source: `agent:${principal}:jobs-scrape`,
+                ...(getLoopTracer() ? { tracer: getLoopTracer()! } : {}),
+              });
+              return { status: scRes.status, body: scRes.body };
+            },
+          });
+          const jobsList = Array.isArray(jOut.body.jobs) ? (jOut.body.jobs as Array<Record<string, unknown>>) : [];
+          const atsSources = new Set<string>();
+          for (const j of jobsList.slice(0, 15)) {
+            if (typeof j.source === 'string' && j.source) atsSources.add(j.source);
+            if (typeof j.url === 'string') addSource(j.url, typeof j.title === 'string' ? j.title : undefined, 'jobs', typeof j.source === 'string' ? j.source : undefined);
+          }
+          toolSpan?.setAttribute('edgefetch.jobs.jobs_returned', jobsList.length);
+          toolSpan?.setAttribute('http.response.status_code', jOut.status);
+          if (atsSources.size > 0) {
+            const joined = [...atsSources].join(',');
+            toolSpan?.setAttribute('edgefetch.adapter_id', joined);
+            agentTracer?.setAttribute('edgefetch.adapter_id', joined);
+          }
+          if (jOut.status !== 200) {
+            toolSpan?.setStatus(false, `jobs_http_${jOut.status}`);
+          }
+          const mdSummary = JSON.stringify({ count: jobsList.length, jobs: jobsList.slice(0, 15) }, null, 2);
+          gatheredEvidence.push({ url: 'edgefetch://jobs', title: 'Structured ATS Jobs', markdown: mdSummary });
+          pushSpan({
+            kind: 'tool_call',
+            name: 'search_jobs',
+            status: jOut.status === 200 ? 'ok' : 'error',
+            startedAt: t0,
+            durationMs: Date.now() - t0,
+            input: args,
+            outputPreview: { count: jobsList.length },
+          });
+          return { ok: jOut.status === 200, summaryForLlm: mdSummary.slice(0, 8_000) };
         });
-        const jobsList = Array.isArray(jOut.body.jobs) ? (jOut.body.jobs as Array<Record<string, unknown>>) : [];
-        for (const j of jobsList.slice(0, 15)) {
-          if (typeof j.url === 'string') addSource(j.url, typeof j.title === 'string' ? j.title : undefined, 'jobs', typeof j.source === 'string' ? j.source : undefined);
-        }
-        const mdSummary = JSON.stringify({ count: jobsList.length, jobs: jobsList.slice(0, 15) }, null, 2);
-        gatheredEvidence.push({ url: 'edgefetch://jobs', title: 'Structured ATS Jobs', markdown: mdSummary });
-        pushSpan({
-          kind: 'tool_call',
-          name: 'search_jobs',
-          status: jOut.status === 200 ? 'ok' : 'error',
-          startedAt: t0,
-          durationMs: Date.now() - t0,
-          input: args,
-          outputPreview: { count: jobsList.length },
-        });
-        return { ok: jOut.status === 200, summaryForLlm: mdSummary.slice(0, 8_000) };
       }
 
       if (toolName === 'map_site') {
@@ -862,28 +952,38 @@ export async function startOrExecuteAgentCall(params: {
             summaryForLlm: JSON.stringify({ error: 'url_outside_strict_constraint', allowedUrls: seedUrls }),
           };
         }
-        const mOut = await executeMapCall({
-          payload: {
-            url: targetUrl,
-            search: args.search,
-            limit: typeof args.limit === 'number' ? Math.min(60, Math.max(1, Math.floor(args.limit))) : 30,
-          },
-          executeHubFetch,
-          selfHost,
-          source: `agent:${principal}:map`,
+        return withToolSpan(async (toolSpan) => {
+          const mTracer = getLoopTracer();
+          const mOut = await executeMapCall({
+            payload: {
+              url: targetUrl,
+              search: args.search,
+              limit: typeof args.limit === 'number' ? Math.min(60, Math.max(1, Math.floor(args.limit))) : 30,
+            },
+            executeHubFetch,
+            selfHost,
+            source: `agent:${principal}:map`,
+            ...(mTracer ? { tracer: mTracer } : {}),
+          });
+          const rawLinks = Array.isArray(mOut.body.links) ? (mOut.body.links as string[]) : [];
+          const links = rawLinks.filter((l) => isUrlAllowedByConstraint(l, seedUrls, strictConstrainToURLs));
+          toolSpan?.setAttribute('url.full', sanitizeUrlForSpan(targetUrl));
+          toolSpan?.setAttribute('map.link_count', links.length);
+          toolSpan?.setAttribute('http.response.status_code', mOut.status);
+          if (mOut.status !== 200) {
+            toolSpan?.setStatus(false, `map_http_${mOut.status}`);
+          }
+          pushSpan({
+            kind: 'tool_call',
+            name: 'map_site',
+            status: mOut.status === 200 ? 'ok' : 'error',
+            startedAt: t0,
+            durationMs: Date.now() - t0,
+            input: { url: targetUrl, search: args.search },
+            outputPreview: { total: links.length, sample: links.slice(0, 8) },
+          });
+          return { ok: mOut.status === 200, summaryForLlm: JSON.stringify({ url: targetUrl, links: links.slice(0, 40) }, null, 2) };
         });
-        const rawLinks = Array.isArray(mOut.body.links) ? (mOut.body.links as string[]) : [];
-        const links = rawLinks.filter((l) => isUrlAllowedByConstraint(l, seedUrls, strictConstrainToURLs));
-        pushSpan({
-          kind: 'tool_call',
-          name: 'map_site',
-          status: mOut.status === 200 ? 'ok' : 'error',
-          startedAt: t0,
-          durationMs: Date.now() - t0,
-          input: { url: targetUrl, search: args.search },
-          outputPreview: { total: links.length, sample: links.slice(0, 8) },
-        });
-        return { ok: mOut.status === 200, summaryForLlm: JSON.stringify({ url: targetUrl, links: links.slice(0, 40) }, null, 2) };
       }
 
       if (toolName === 'interact_browser') {
@@ -906,49 +1006,68 @@ export async function startOrExecuteAgentCall(params: {
             })
           : [];
         record.pagesRead++;
-        const iOut = await executeInteractCall({
-          payload: { url: targetUrl, actions: filteredActions, formats: ['markdown'] },
-          env: zeroDataRetention ? {} : env,
-          executeHubFetch,
-          selfHost,
-          source: `agent:${principal}:interact`,
+        return withToolSpan(async (toolSpan) => {
+          const iTracer = getLoopTracer();
+          const iOut = await executeInteractCall({
+            payload: { url: targetUrl, actions: filteredActions, formats: ['markdown'] },
+            env: zeroDataRetention ? {} : env,
+            executeHubFetch,
+            selfHost,
+            source: `agent:${principal}:interact`,
+            ...(iTracer ? { tracer: iTracer } : {}),
+          });
+          const md = typeof iOut.body.markdown === 'string' ? iOut.body.markdown : '';
+          const title = (iOut.body.metadata as { title?: string } | undefined)?.title;
+          toolSpan?.setAttribute('url.full', sanitizeUrlForSpan(targetUrl));
+          toolSpan?.setAttribute('http.response.status_code', iOut.status);
+          if (iOut.status !== 200) {
+            toolSpan?.setStatus(false, `interact_http_${iOut.status}`);
+          }
+          if (iOut.status === 200 && md) {
+            addSource(targetUrl, title, iOut.via);
+            gatheredEvidence.push({ url: targetUrl, ...(title ? { title } : {}), markdown: md.slice(0, 12_000) });
+          }
+          pushSpan({
+            kind: 'tool_call',
+            name: 'interact_browser',
+            status: iOut.status === 200 ? 'ok' : 'error',
+            startedAt: t0,
+            durationMs: Date.now() - t0,
+            input: { url: targetUrl },
+            outputPreview: { status: iOut.status, chars: md.length },
+          });
+          return {
+            ok: iOut.status === 200,
+            summaryForLlm: iOut.status === 200 ? md.slice(0, 6_000) : JSON.stringify(iOut.body),
+          };
         });
-        const md = typeof iOut.body.markdown === 'string' ? iOut.body.markdown : '';
-        const title = (iOut.body.metadata as { title?: string } | undefined)?.title;
-        if (iOut.status === 200 && md) {
-          addSource(targetUrl, title, iOut.via);
-          gatheredEvidence.push({ url: targetUrl, ...(title ? { title } : {}), markdown: md.slice(0, 12_000) });
-        }
-        pushSpan({
-          kind: 'tool_call',
-          name: 'interact_browser',
-          status: iOut.status === 200 ? 'ok' : 'error',
-          startedAt: t0,
-          durationMs: Date.now() - t0,
-          input: { url: targetUrl },
-          outputPreview: { status: iOut.status, chars: md.length },
-        });
-        return {
-          ok: iOut.status === 200,
-          summaryForLlm: iOut.status === 200 ? md.slice(0, 6_000) : JSON.stringify(iOut.body),
-        };
       }
 
       if (toolName === 'search_collection' && env.SEARCH) {
         const collId = typeof args.collectionId === 'string' && args.collectionId.trim() ? args.collectionId.trim() : 'default';
         const q = typeof args.query === 'string' ? args.query : prompt;
-        const idx = new D1FtsSearchIndex(env.SEARCH);
-        const hits = await idx.searchCollection({ collectionId: collId, query: q, limit: 8 });
-        pushSpan({
-          kind: 'tool_call',
-          name: 'search_collection',
-          status: 'ok',
-          startedAt: t0,
-          durationMs: Date.now() - t0,
-          input: { collectionId: collId, query: q },
-          outputPreview: { hitCount: hits.length },
+        return withToolSpan(async (toolSpan) => {
+          const idx = new D1FtsSearchIndex(env.SEARCH!);
+          const scTracer = getLoopTracer();
+          const hits = await idx.searchCollection({
+            collectionId: collId,
+            query: q,
+            limit: 8,
+            ...(scTracer ? { tracer: scTracer } : {}),
+          });
+          toolSpan?.setAttribute('search.collection_id', collId);
+          toolSpan?.setAttribute('search.hit_count', hits.length);
+          pushSpan({
+            kind: 'tool_call',
+            name: 'search_collection',
+            status: 'ok',
+            startedAt: t0,
+            durationMs: Date.now() - t0,
+            input: { collectionId: collId, query: q },
+            outputPreview: { hitCount: hits.length },
+          });
+          return { ok: true, summaryForLlm: JSON.stringify(hits, null, 2).slice(0, 6_000) };
         });
-        return { ok: true, summaryForLlm: JSON.stringify(hits, null, 2).slice(0, 6_000) };
       }
 
       // Default: `scrape_url`
@@ -964,54 +1083,68 @@ export async function startOrExecuteAgentCall(params: {
       }
       record.pagesRead++;
 
-      const scOut = await executeScrapeCall({
-        payload: {
-          url: targetUrl,
-          formats: schema ? ['markdown', { type: 'json', schema }] : ['markdown'],
-          ...(typeof args.query === 'string' && args.query.trim() ? { query: args.query.trim() } : {}),
-          ...(typeof args.renderMode === 'string' ? { renderMode: args.renderMode } : {}),
-          ...(acceptLanguageHeader ? { headers: { 'Accept-Language': acceptLanguageHeader } } : {}),
-          maxChars: 14_000,
-        },
-        env: zeroDataRetention ? {} : env,
-        executeHubFetch,
-        selfHost,
-        source: `agent:${principal}:scrape`,
-      });
-      const md = typeof scOut.body.markdown === 'string' ? scOut.body.markdown : '';
-      const meta = (scOut.body.metadata as Record<string, unknown> | undefined) ?? {};
-      const title = typeof meta.title === 'string' ? meta.title : undefined;
-      const extractorId = typeof scOut.body.extractorId === 'string' ? scOut.body.extractorId : undefined;
-      const pageJson =
-        scOut.body.json && typeof scOut.body.json === 'object' && !Array.isArray(scOut.body.json)
-          ? (scOut.body.json as Record<string, unknown>)
-          : undefined;
-
-      if (scOut.status === 200 && md) {
-        addSource(targetUrl, title, scOut.via, extractorId);
-        gatheredEvidence.push({
-          url: targetUrl,
-          ...(title ? { title } : {}),
-          markdown: md,
-          ...(pageJson ? { json: pageJson } : {}),
+      return withToolSpan(async (toolSpan) => {
+        const scTracer = getLoopTracer();
+        const scOut = await executeScrapeCall({
+          payload: {
+            url: targetUrl,
+            formats: schema ? ['markdown', { type: 'json', schema }] : ['markdown'],
+            ...(typeof args.query === 'string' && args.query.trim() ? { query: args.query.trim() } : {}),
+            ...(typeof args.renderMode === 'string' ? { renderMode: args.renderMode } : {}),
+            ...(acceptLanguageHeader ? { headers: { 'Accept-Language': acceptLanguageHeader } } : {}),
+            maxChars: 14_000,
+          },
+          env: zeroDataRetention ? {} : env,
+          executeHubFetch,
+          selfHost,
+          source: `agent:${principal}:scrape`,
+          ...(scTracer ? { tracer: scTracer } : {}),
         });
-      }
-      pushSpan({
-        kind: 'tool_call',
-        name: 'scrape_url',
-        status: scOut.status === 200 ? 'ok' : 'error',
-        startedAt: t0,
-        durationMs: Date.now() - t0,
-        input: { url: targetUrl, ...(extractorId ? { extractorId } : {}) },
-        outputPreview: { status: scOut.status, title, chars: md.length, ...(scOut.body.problem ? { problem: scOut.body.problem } : {}) },
+        const md = typeof scOut.body.markdown === 'string' ? scOut.body.markdown : '';
+        const meta = (scOut.body.metadata as Record<string, unknown> | undefined) ?? {};
+        const title = typeof meta.title === 'string' ? meta.title : undefined;
+        const extractorId = typeof scOut.body.extractorId === 'string' ? scOut.body.extractorId : undefined;
+        const pageJson =
+          scOut.body.json && typeof scOut.body.json === 'object' && !Array.isArray(scOut.body.json)
+            ? (scOut.body.json as Record<string, unknown>)
+            : undefined;
+
+        toolSpan?.setAttribute('url.full', sanitizeUrlForSpan(targetUrl));
+        toolSpan?.setAttribute('http.response.status_code', scOut.status);
+        if (extractorId) {
+          toolSpan?.setAttribute('edgefetch.adapter_id', extractorId);
+          agentTracer?.setAttribute('edgefetch.adapter_id', extractorId);
+        }
+        if (scOut.status !== 200) {
+          toolSpan?.setStatus(false, `scrape_http_${scOut.status}`);
+        }
+
+        if (scOut.status === 200 && md) {
+          addSource(targetUrl, title, scOut.via, extractorId);
+          gatheredEvidence.push({
+            url: targetUrl,
+            ...(title ? { title } : {}),
+            markdown: md,
+            ...(pageJson ? { json: pageJson } : {}),
+          });
+        }
+        pushSpan({
+          kind: 'tool_call',
+          name: 'scrape_url',
+          status: scOut.status === 200 ? 'ok' : 'error',
+          startedAt: t0,
+          durationMs: Date.now() - t0,
+          input: { url: targetUrl, ...(extractorId ? { extractorId } : {}) },
+          outputPreview: { status: scOut.status, title, chars: md.length, ...(scOut.body.problem ? { problem: scOut.body.problem } : {}) },
+        });
+        return {
+          ok: scOut.status === 200,
+          summaryForLlm:
+            scOut.status === 200
+              ? `URL: ${targetUrl}${title ? `\nTitle: ${title}` : ''}${extractorId ? `\nAdapter: ${extractorId}` : ''}\n\n${md.slice(0, 6_500)}`
+              : JSON.stringify({ ok: false, status: scOut.status, problem: scOut.body.problem, blocked: scOut.body.blocked }),
+        };
       });
-      return {
-        ok: scOut.status === 200,
-        summaryForLlm:
-          scOut.status === 200
-            ? `URL: ${targetUrl}${title ? `\nTitle: ${title}` : ''}${extractorId ? `\nAdapter: ${extractorId}` : ''}\n\n${md.slice(0, 6_500)}`
-            : JSON.stringify({ ok: false, status: scOut.status, problem: scOut.body.problem, blocked: scOut.body.blocked }),
-      };
     };
 
     try {
@@ -1059,6 +1192,7 @@ export async function startOrExecuteAgentCall(params: {
           }
           record.stepsUsed = step + 1;
           const turnStart = Date.now();
+          const turnTracer = getLoopTracer();
           const llmRes = await completeLlmTurn({
             config: llmConfig,
             messages,
@@ -1066,6 +1200,12 @@ export async function startOrExecuteAgentCall(params: {
             temperature: 0.1,
             maxTokens: 2_048,
             ...(llmFetchFn ? { fetchFn: llmFetchFn } : {}),
+            ...(turnTracer ? { tracer: turnTracer } : {}),
+            traceAttributes: {
+              'agent.id': record.id,
+              'agent.step': step + 1,
+              'agent.tool_count': tools.length,
+            },
           });
           pushSpan({
             kind: 'llm_turn',
@@ -1101,11 +1241,15 @@ export async function startOrExecuteAgentCall(params: {
           });
 
           const callsSlice = llmRes.toolCalls.slice(0, 6);
+          const stepTracer = getLoopTracer();
           const toolOutputs = await Promise.all(
-            callsSlice.map(async (tc) => {
-              emitEvent?.('agent.action', { step: step + 1, tool: tc.name, arguments: tc.arguments });
-              const out = await executeSingleTool(tc.name, tc.arguments);
-              return { tc, out };
+            callsSlice.map((tc) => {
+              const runTool = async () => {
+                emitEvent?.('agent.action', { step: step + 1, tool: tc.name, arguments: tc.arguments });
+                const out = await executeSingleTool(tc.name, tc.arguments);
+                return { tc, out };
+              };
+              return stepTracer ? stepTracer.run(runTool) : runTool();
             }),
           );
 
@@ -1133,52 +1277,77 @@ export async function startOrExecuteAgentCall(params: {
 
         if (record.status !== 'cancelled' && record.status !== 'failed') {
           const synthStart = Date.now();
-          if (schema) {
-            const directParsed = finalAssistantText ? parseLooseJsonObject(finalAssistantText) : null;
-            if (directParsed && Object.keys(directParsed).length > 0 && !hitBudget) {
-              record.data = directParsed;
+          const synthTracer = getLoopTracer();
+          const runSynthesis = async (synthSpan?: ActiveSpanHandle) => {
+            if (schema) {
+              const directParsed = finalAssistantText ? parseLooseJsonObject(finalAssistantText) : null;
+              if (directParsed && Object.keys(directParsed).length > 0 && !hitBudget) {
+                record.data = directParsed;
+              } else {
+                const combinedMd = gatheredEvidence
+                  .map((e) => `## Source: ${e.title ?? e.url} (${e.url})\n\n${e.markdown.slice(0, 5_000)}`)
+                  .join('\n\n---\n\n');
+                const extracted = await extractJsonWithOptionalLlm({
+                  markdown: combinedMd || finalAssistantText,
+                  url: seedUrls[0] ?? 'https://edgefetch.local/agent',
+                  prompt,
+                  schema,
+                  heuristicFallback: gatheredEvidence.find((e) => e.json)?.json ?? {},
+                  llmConfig,
+                  ...(llmFetchFn ? { fetchFn: llmFetchFn } : {}),
+                  ...(getLoopTracer() ? { tracer: getLoopTracer()! } : {}),
+                });
+                record.data = extracted.data;
+              }
+              const val = validateDataAgainstJsonSchema(record.data, schema);
+              record.schemaValid = val.valid;
+              if (hitBudget) {
+                record.partial = true;
+                record.partialSchemaValid = val.partialValid;
+              }
             } else {
-              const combinedMd = gatheredEvidence
-                .map((e) => `## Source: ${e.title ?? e.url} (${e.url})\n\n${e.markdown.slice(0, 5_000)}`)
-                .join('\n\n---\n\n');
-              const extracted = await extractJsonWithOptionalLlm({
-                markdown: combinedMd || finalAssistantText,
-                url: seedUrls[0] ?? 'https://edgefetch.local/agent',
-                prompt,
-                schema,
-                heuristicFallback: gatheredEvidence.find((e) => e.json)?.json ?? {},
-                llmConfig,
-                ...(llmFetchFn ? { fetchFn: llmFetchFn } : {}),
-              });
-              record.data = extracted.data;
+              if (!finalAssistantText && gatheredEvidence.length > 0) {
+                const combinedMd = gatheredEvidence
+                  .map((e) => `## ${e.title ?? e.url}\nURL: ${e.url}\n\n${e.markdown.slice(0, 4_000)}`)
+                  .join('\n\n---\n\n');
+                const sum = await summarizeMarkdownWithOptionalLlm({
+                  markdown: combinedMd,
+                  title: prompt.slice(0, 120),
+                  llmConfig,
+                  ...(llmFetchFn ? { fetchFn: llmFetchFn } : {}),
+                  ...(getLoopTracer() ? { tracer: getLoopTracer()! } : {}),
+                });
+                finalAssistantText = sum.summary;
+              }
+              record.markdown = finalAssistantText;
+              record.data = {
+                answer: finalAssistantText,
+                sources: record.sources,
+              };
+              if (hitBudget) {
+                record.partial = true;
+              }
             }
-            const val = validateDataAgainstJsonSchema(record.data, schema);
-            record.schemaValid = val.valid;
-            if (hitBudget) {
-              record.partial = true;
-              record.partialSchemaValid = val.partialValid;
+            synthSpan?.setAttribute('agent.partial', Boolean(record.partial));
+            if (record.schemaValid !== undefined) {
+              synthSpan?.setAttribute('agent.schema_valid', record.schemaValid);
             }
+          };
+          if (synthTracer) {
+            await synthTracer.withSpan(
+              'edgefetch.agent.synthesis',
+              {
+                kind: 1,
+                attributes: {
+                  'agent.id': record.id,
+                  'agent.has_schema': Boolean(schema),
+                  'agent.llm_used': true,
+                },
+              },
+              (synthSpan) => runSynthesis(synthSpan),
+            );
           } else {
-            if (!finalAssistantText && gatheredEvidence.length > 0) {
-              const combinedMd = gatheredEvidence
-                .map((e) => `## ${e.title ?? e.url}\nURL: ${e.url}\n\n${e.markdown.slice(0, 4_000)}`)
-                .join('\n\n---\n\n');
-              const sum = await summarizeMarkdownWithOptionalLlm({
-                markdown: combinedMd,
-                title: prompt.slice(0, 120),
-                llmConfig,
-                ...(llmFetchFn ? { fetchFn: llmFetchFn } : {}),
-              });
-              finalAssistantText = sum.summary;
-            }
-            record.markdown = finalAssistantText;
-            record.data = {
-              answer: finalAssistantText,
-              sources: record.sources,
-            };
-            if (hitBudget) {
-              record.partial = true;
-            }
+            await runSynthesis();
           }
           pushSpan({
             kind: 'synthesis',
@@ -1215,60 +1384,80 @@ export async function startOrExecuteAgentCall(params: {
           await executeSingleTool('scrape_url', { url: u, query: prompt });
         }
 
-        const combinedMd = gatheredEvidence
-          .map((e) => `### [${e.title ?? e.url}](${e.url})\n\n${e.markdown.slice(0, 3_500)}`)
-          .join('\n\n---\n\n');
-        record.markdown = combinedMd;
-        if (schema) {
-          const allLinks = record.sources.map((s) => s.url);
-          const mergedHeuristic = extractStructuredJsonFromPage(
-            '',
-            {
-              markdown: combinedMd,
-              text: combinedMd,
-              title: gatheredEvidence.map((e) => e.title).filter(Boolean).join(' | ') || prompt.slice(0, 100),
-              links: allLinks,
-              images: [],
-              branding: { title: prompt.slice(0, 100) },
-            },
-            schema,
-          );
-          for (const ev of gatheredEvidence) {
-            if (ev.json) {
-              for (const [k, v] of Object.entries(ev.json)) {
-                if (mergedHeuristic[k] === undefined || mergedHeuristic[k] === '') {
-                  mergedHeuristic[k] = v;
+        const detSynthTracer = getLoopTracer();
+        const runDeterministicSynthesis = async (synthSpan?: ActiveSpanHandle) => {
+          const combinedMd = gatheredEvidence
+            .map((e) => `### [${e.title ?? e.url}](${e.url})\n\n${e.markdown.slice(0, 3_500)}`)
+            .join('\n\n---\n\n');
+          record.markdown = combinedMd;
+          if (schema) {
+            const allLinks = record.sources.map((s) => s.url);
+            const mergedHeuristic = extractStructuredJsonFromPage(
+              '',
+              {
+                markdown: combinedMd,
+                text: combinedMd,
+                title: gatheredEvidence.map((e) => e.title).filter(Boolean).join(' | ') || prompt.slice(0, 100),
+                links: allLinks,
+                images: [],
+                branding: { title: prompt.slice(0, 100) },
+              },
+              schema,
+            );
+            for (const ev of gatheredEvidence) {
+              if (ev.json) {
+                for (const [k, v] of Object.entries(ev.json)) {
+                  if (mergedHeuristic[k] === undefined || mergedHeuristic[k] === '') {
+                    mergedHeuristic[k] = v;
+                  }
                 }
               }
             }
-          }
-          const schemaProps =
-            schema.properties && typeof schema.properties === 'object' ? (schema.properties as Record<string, unknown>) : {};
-          if ('sources' in schemaProps && (!Array.isArray(mergedHeuristic.sources) || mergedHeuristic.sources.length === 0)) {
-            mergedHeuristic.sources = allLinks;
-          }
-          if ('summary' in schemaProps && combinedMd) {
-            const sumRes = await summarizeMarkdownWithOptionalLlm({
+            const schemaProps =
+              schema.properties && typeof schema.properties === 'object' ? (schema.properties as Record<string, unknown>) : {};
+            if ('sources' in schemaProps && (!Array.isArray(mergedHeuristic.sources) || mergedHeuristic.sources.length === 0)) {
+              mergedHeuristic.sources = allLinks;
+            }
+            if ('summary' in schemaProps && combinedMd) {
+              const sumRes = await summarizeMarkdownWithOptionalLlm({
+                markdown: combinedMd,
+                title: prompt.slice(0, 100),
+                llmConfig: null,
+              });
+              if (sumRes.summary) mergedHeuristic.summary = sumRes.summary;
+            }
+            record.data = mergedHeuristic;
+            const val = validateDataAgainstJsonSchema(record.data, schema);
+            record.schemaValid = val.valid;
+            synthSpan?.setAttribute('agent.schema_valid', val.valid);
+          } else {
+            const detSummary = await summarizeMarkdownWithOptionalLlm({
               markdown: combinedMd,
               title: prompt.slice(0, 100),
               llmConfig: null,
             });
-            if (sumRes.summary) mergedHeuristic.summary = sumRes.summary;
+            record.data = {
+              answer: detSummary.summary,
+              markdown: combinedMd,
+              sources: record.sources,
+            };
           }
-          record.data = mergedHeuristic;
-          const val = validateDataAgainstJsonSchema(record.data, schema);
-          record.schemaValid = val.valid;
+        };
+        if (detSynthTracer) {
+          await detSynthTracer.withSpan(
+            'edgefetch.agent.synthesis',
+            {
+              kind: 1,
+              attributes: {
+                'agent.id': record.id,
+                'agent.has_schema': Boolean(schema),
+                'agent.llm_used': false,
+              },
+            },
+            (synthSpan) => runDeterministicSynthesis(synthSpan),
+          );
         } else {
-          const detSummary = await summarizeMarkdownWithOptionalLlm({
-            markdown: combinedMd,
-            title: prompt.slice(0, 100),
-            llmConfig: null,
-          });
-          record.data = {
-            answer: detSummary.summary,
-            markdown: combinedMd,
-            sources: record.sources,
-          };
+          await runDeterministicSynthesis();
         }
         record.status = isCancelled() ? 'cancelled' : 'completed';
         record.stopReason = isCancelled() ? 'cancelled' : 'completed';
@@ -1277,6 +1466,15 @@ export async function startOrExecuteAgentCall(params: {
       record.status = 'failed';
       record.stopReason = 'failed';
       record.error = err instanceof Error ? err.message : String(err);
+      const errTracer = getLoopTracer();
+      if (errTracer) {
+        const errSpan = errTracer.startSpan('edgefetch.agent.error', {
+          kind: 1,
+          attributes: { 'agent.id': record.id },
+        });
+        errSpan.setStatus(false, sanitizeErrorMessageForSpan(err, 'unhandled_agent_exception'));
+        errSpan.end();
+      }
       pushSpan({
         kind: 'error',
         name: 'unhandled_agent_exception',
@@ -1303,6 +1501,7 @@ export async function startOrExecuteAgentCall(params: {
     cancelledAgentIds.delete(record.id);
 
     if (webhook) {
+      const whEndTracer = getLoopTracer();
       await deliverSignedWebhook({
         webhook,
         defaultSecret: env.WEBHOOK_SECRET,
@@ -1316,6 +1515,7 @@ export async function startOrExecuteAgentCall(params: {
         data: formatPublicAgentResponse(record, false),
         selfHost,
         ...(env.SAFE_PUBLIC_FETCH ? { fetchFn: env.SAFE_PUBLIC_FETCH } : env.SAFE_FETCH ? { fetchFn: env.SAFE_FETCH } : {}),
+        ...(whEndTracer ? { tracer: whEndTracer } : {}),
       }).catch(() => undefined);
     }
 
@@ -1336,7 +1536,7 @@ export async function startOrExecuteAgentCall(params: {
           }
         };
         try {
-          await runLoop(send);
+          await (agentTracer ? agentTracer.run(() => runLoop(send)) : runLoop(send));
         } finally {
           try {
             controller.close();
@@ -1362,11 +1562,11 @@ export async function startOrExecuteAgentCall(params: {
   // 2. Async polling mode (`async: true` when not `zeroDataRetention` — Firecrawl startAgent parity)
   const runAsync = payload.async === true && !zeroDataRetention;
   if (runAsync) {
-    const bgPromise = runLoop();
+    const bgPromise = agentTracer ? agentTracer.run(() => runLoop()) : runLoop();
     if (waitUntil) {
       waitUntil(bgPromise);
     } else {
-      void bgPromise;
+      void bgPromise.catch(() => undefined);
     }
     return {
       kind: 'json',
@@ -1385,7 +1585,7 @@ export async function startOrExecuteAgentCall(params: {
   }
 
   // 3. Synchronous completion (default for MCP `agent` & `zeroDataRetention: true`)
-  const completed = await runLoop();
+  const completed = await (agentTracer ? agentTracer.run(() => runLoop()) : runLoop());
   return {
     kind: 'json',
     status: completed.status === 'failed' ? 502 : 200,

@@ -6,9 +6,9 @@ This document compares **EdgeFetch (`v2.5`)** against the leading open-source an
 
 ## 1. Executive Architecture Face-Off
 
-| Capability / Architecture | **EdgeFetch (`v2.5`)** | **Firecrawl (Self-Hosted & `firecrawl-local`)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader (`reader`)** | **Defuddle / Trafilatura** |
+| Capability / Architecture | **EdgeFetch (`v2.6`)** | **Firecrawl (Self-Hosted & `firecrawl-local`)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader (`reader`)** | **Defuddle / Trafilatura** |
 |---|---|---|---|---|---|---|
-| **License** | **MIT** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 | MIT / Apache-2.0 |
+| **License** | **Open-source worker, SDKs & adapters (`MIT`); fair-source hub (`FSL-1.1`, `MIT` after 2 yrs)** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 | MIT / Apache-2.0 |
 | **Minimum Self-Hosted Stack** | **1 ~8 MB static Go binary** *or* **1 container** (`node:sqlite` + `/data`, **0 Redis, 0 Postgres, 0 Node/Rust toolchain**) | Full stack: **Redis + PostgreSQL + RabbitMQ + Playwright + API** (`2–4 GB+` RAM); `firecrawl-local`: requires **Rust + C compiler + Node 22 `npx` + telemetry install ID** | Cloud API key only | Python 3.10+ + Playwright (`~600 MB–1.5 GB` RAM) | Node.js + Puppeteer / Firebase deps | Library / CLI only (no crawler fleet or MCP server) |
 | **Go Worker External Dependencies** | **1 (`coder/websocket`, 0 transitive deps)** | Dozens of npm + Rust + system packages | N/A | 40+ Python / PyPI packages | Dozens of npm packages | 0–5 library packages |
 | **Outbound-Only Residential / Edge Fleet (Zero Open Ports)** | **Yes — native outbound `WSS /agent/ws` (works behind CGNAT, Starlink, Home Assistant OS, NAS)** | No (requires inbound ports, VPN tunnel, or paid proxy service) | Managed proxy pool (billed per credit) | No (single-host or DIY queue) | No | N/A |

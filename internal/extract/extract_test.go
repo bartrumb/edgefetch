@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -183,5 +185,196 @@ func TestResolveHrefPreservesSemicolonlessQueryParams(t *testing.T) {
 	gotDup := ExtractHTML(printDup, ExtractOptions{OnlyMainContent: true})
 	if strings.Contains(gotDup.Markdown, ")(https://clinicaltrials.gov/about-site/disclaimer)") {
 		t.Fatalf("expected duplicate print-stylesheet URL collapsed, got: %s", gotDup.Markdown)
+	}
+}
+
+func TestNeedsBrowserRenderAndExtractHTMLBranches(t *testing.T) {
+	// NeedsBrowserRender branches
+	if NeedsBrowserRender("") || NeedsBrowserRender("   \n\t ") {
+		t.Fatal("empty HTML must not need browser render")
+	}
+	longBody := "<html><body><p>" + strings.Repeat("content ", 50) + "</p><script>x()</script></body></html>"
+	if NeedsBrowserRender(longBody) {
+		t.Fatal(">=240 char plain text must not need browser render")
+	}
+	if NeedsBrowserRender(`<html><body><div id="root"></div></body></html>`) {
+		t.Fatal("HTML without <script must not need browser render")
+	}
+	if !NeedsBrowserRender(`<html><head><script type="module" src="/app.js"></script></head><body><div id="mount"></div></body></html>`) {
+		t.Fatal("type=module with <80 chars text should trigger NeedsBrowserRender")
+	}
+	if NeedsBrowserRender(`<html><head><script type="module" src="/app.js"></script></head><body>` + strings.Repeat("word ", 20) + `</body></html>`) {
+		t.Fatal(">=80 chars text without #root shell should not trigger NeedsBrowserRender")
+	}
+	if !NeedsBrowserRender(`<html><head><script src="/_next/static/app.js"></script></head><body></body></html>`) {
+		t.Fatal("/_next/static/ with empty body should trigger NeedsBrowserRender")
+	}
+	if !NeedsBrowserRender(`<html><head><script src="/@vite/client"></script></head><body></body></html>`) {
+		t.Fatal("vite with empty body should trigger NeedsBrowserRender")
+	}
+
+	// <article> fallback, Query with MaxChars==0 (16_000 limit), and MaxChars truncation
+	artHTML := `<html><head><title>Article Title</title><meta property="og:description" content="OG Desc"><meta name="twitter:image" content="/img/og.png"></head>` +
+		`<body><nav><a href="/x">X</a></nav><article><p>This article contains more than thirty-two characters of real body text.</p></article></body></html>`
+	artOut := ExtractHTML(artHTML, ExtractOptions{
+		BaseURL:         "https://example.com/post",
+		OnlyMainContent: true,
+		IncludeBranding: true,
+		Query:           "article body",
+		MaxChars:        0,
+	})
+	if !strings.Contains(artOut.Markdown, "thirty-two characters") || artOut.Description != "OG Desc" || artOut.Branding.OGImage != "https://example.com/img/og.png" {
+		t.Fatalf("unexpected article extraction: %+v", artOut)
+	}
+	truncOut := ExtractHTML(artHTML, ExtractOptions{OnlyMainContent: true, MaxChars: 12})
+	if len(truncOut.Markdown) != 12 || len(truncOut.Text) != 12 {
+		t.Fatalf("expected MaxChars=12 truncation, got md=%d txt=%d", len(truncOut.Markdown), len(truncOut.Text))
+	}
+
+	// HTML -> Markdown edge cases: ec-line, nested fence, empty code, backtick-edge inline code,
+	// empty/jagged tables, data: img, empty/javascript/# links, empty h2, <b>/<em>/<i>/<blockquote>/<li>/<hr>/<br>,
+	// unequal reDupLink & reDupInLink.
+	richHTML := `<html><head>
+		<meta property="og:title" content="OG Fallback Title">
+		<meta name="description" content="">
+		<link rel="icon" href="">
+		<style>
+			body { color: #ffffff; background: #000000; border-color: #111111; outline-color: #222222; }
+			.c { color: #333333; background: #444444; fill: #555555; stroke: #666666; }
+			.d { color: #777777; background: #888888; border-color: #999999; }
+			.f { font-family: "VeryLongFontNameThatExceedsFortyEightCharactersInLengthLimit", 'Roboto Mono', sans-serif; }
+		</style>
+		<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400">
+	</head><body><main>
+		<pre><code><div class="ec-line">lineA</div><div class="ec-line">lineB</div></code></pre>
+		<pre><code>` + "```" + `nested` + "```" + `</code></pre>
+		<p>Empty code: <code>   </code> and padded: <code>` + "`x`" + `</code>.</p>
+		<table><p>no rows</p></table>
+		<table><tr></tr></table>
+		<table><tr><th>A</th><th>B</th></tr><tr><td>only1</td></tr></table>
+		<img src="data:image/png;base64,AAAA" alt="inline">
+		<a href="https://example.com/empty"><span></span></a>
+		<a href="javascript:void(0)">JS Link</a>
+		<a href="#sec">Anchor Link</a>
+		<h2><span></span></h2>
+		<p><b>Bold</b><b> </b> <em>Em</em> <i>Italic</i><i> </i></p>
+		<blockquote>Quoted line</blockquote>
+		<blockquote>   </blockquote>
+		<ul><li>Item 1</li><li>   </li></ul>
+		<hr><br>
+		<p><a href="https://a.com">Different</a>(https://b.com)</p>
+		<p><a href="https://a.com">Same (https://a.com)</a> and <a href="https://b.com">Other (https://a.com)</a></p>
+		<div data-single='one' data-unquoted=two></div>
+	</main></body></html>`
+	richOut := ExtractHTML(richHTML, ExtractOptions{
+		BaseURL:         "https://example.com",
+		OnlyMainContent: true,
+		IncludeBranding: true,
+	})
+	for _, want := range []string{
+		"# OG Fallback Title",
+		"lineA\nlineB",
+		"````\n```nested```\n````",
+		"`` `x` ``",
+		"| only1 |  |",
+		"**Bold**",
+		"*Em* *Italic*",
+		"> Quoted line",
+		"- Item 1",
+		"---",
+		"[Different](https://a.com)(https://b.com)",
+		"[Same](https://a.com)",
+		"[Other (https://a.com)](https://b.com)",
+	} {
+		if !strings.Contains(richOut.Markdown, want) {
+			t.Fatalf("expected Markdown to contain %q, got:\n%s", want, richOut.Markdown)
+		}
+	}
+	if len(richOut.Branding.Colors) != 8 {
+		t.Fatalf("expected 8 capped non-bw colors, got %v", richOut.Branding.Colors)
+	}
+	if len(richOut.Branding.Fonts) != 2 || richOut.Branding.Fonts[0] != "Space Grotesk" || richOut.Branding.Fonts[1] != "Roboto Mono" {
+		t.Fatalf("unexpected fonts: %v", richOut.Branding.Fonts)
+	}
+
+	// Single-quoted & unquoted attributes + missing firstAttr + resolveHref/resolveHTTPSLink edge cases
+	attrs := parseAttrs(`<div a='sq' b=uq>`)
+	if attrs["a"] != "sq" || attrs["b"] != "uq" || firstAttr(attrs, "missing", "nope") != "" {
+		t.Fatalf("unexpected parseAttrs/firstAttr result: %+v", attrs)
+	}
+	base, _ := url.Parse("https://example.com/dir/")
+	if resolveHref("", base) != "" || resolveHref("://bad", base) != "" {
+		t.Fatal("resolveHref should reject empty and malformed URLs")
+	}
+	if resolveHTTPSLink("", base) != "" || resolveHTTPSLink("ftp://files.example.com/a", base) != "" {
+		t.Fatal("resolveHTTPSLink should reject empty and ftp URLs")
+	}
+
+	// Link (250) and Image (60) extraction caps
+	var bigHTML strings.Builder
+	bigHTML.WriteString("<html><body><main>")
+	for i := 0; i < 260; i++ {
+		fmt.Fprintf(&bigHTML, `<a href="https://example.com/l/%d">L%d</a>`, i, i)
+	}
+	bigHTML.WriteString(`<img src="https://example.com/i/0.png" alt="dup">`)
+	for i := 0; i < 65; i++ {
+		fmt.Fprintf(&bigHTML, `<img src="https://example.com/i/%d.png" alt="I%d">`, i, i)
+	}
+	bigHTML.WriteString("</main></body></html>")
+	cappedOut := ExtractHTML(bigHTML.String(), ExtractOptions{
+		BaseURL:       "https://example.com",
+		IncludeLinks:  true,
+		IncludeImages: true,
+	})
+	if len(cappedOut.Links) != 250 || len(cappedOut.Images) != 60 {
+		t.Fatalf("expected 250 links & 60 images, got links=%d images=%d", len(cappedOut.Links), len(cappedOut.Images))
+	}
+}
+
+func TestRerankPassagesAndRedactPIIBranches(t *testing.T) {
+	if RerankPassages("", "query", 100) != "" || RerankPassages("hello", "   ", 100) != "hello" {
+		t.Fatal("RerankPassages empty query/doc failed")
+	}
+	if RerankPassages("hello world", "the and for", 5) != "hello" {
+		t.Fatal("stopword-only query with maxChars=5 should truncate to 5")
+	}
+	if RerankPassages("hello", "the and for", 20) != "hello" {
+		t.Fatal("stopword-only query within maxChars should return doc")
+	}
+	if RerankPassages("single block text", "block", 6) != "single" || RerankPassages("single", "single", 0) != "single" {
+		t.Fatal("single-chunk RerankPassages branches failed")
+	}
+
+	// Multi-chunk: blank blocks, out-of-order higher-scored chunk sorted back, skipping oversized chunk to fit smaller one, exact budget break
+	doc := "Alpha intro paragraph.\n\n\n\n" +
+		"Unrelated filler block " + strings.Repeat("filler ", 15) + "\n\n" +
+		"## Target\n\nTarget torque spec 42 Nm here.\n\n" +
+		"Small target note."
+	got := RerankPassages(doc, "target", 60)
+	if !strings.Contains(got, "## Target") {
+		t.Fatalf("expected target chunk selected, got %q", got)
+	}
+
+	// Reading-order preservation across >= 2 selected chunks where later chunk scores higher
+	doc2 := "alpha mention\n\n\n\nalpha alpha alpha exact match\n\nomega unrelated"
+	got2 := RerankPassages(doc2, "alpha", 200)
+	idxFirst := strings.Index(got2, "alpha mention")
+	idxSecond := strings.Index(got2, "alpha alpha alpha")
+	if idxFirst < 0 || idxSecond < 0 || idxFirst > idxSecond {
+		t.Fatalf("expected reading order preserved across selected chunks, got %q", got2)
+	}
+	// Exact budget break: first chunk len 13 + 2 = 15 >= maxChars 15
+	got3 := RerankPassages("alpha chunk01\n\nalpha chunk02", "alpha", 15)
+	if got3 != "alpha chunk01" {
+		t.Fatalf("expected budget break after first chunk, got %q", got3)
+	}
+
+	// RedactPII Luhn-valid (including >9 doubled digits) vs Luhn-invalid & isLuhnCard bounds
+	redacted := RedactPII("Valid: 5555-5555-5555-4444 Invalid: 4111-1111-1111-1112")
+	if !strings.Contains(redacted, "Valid: [REDACTED_CARD]") || !strings.Contains(redacted, "Invalid: 4111-1111-1111-1112") {
+		t.Fatalf("unexpected RedactPII card handling: %q", redacted)
+	}
+	if isLuhnCard("123") || isLuhnCard("12345678901234567890") {
+		t.Fatal("isLuhnCard length bounds failed")
 	}
 }

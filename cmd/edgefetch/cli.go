@@ -34,6 +34,7 @@ type cliDeps struct {
 	transport http.RoundTripper
 	allow     func(*url.URL) error
 	haPath    string
+	stdin     io.Reader
 }
 
 func isOneShotCLI(args []string) bool {
@@ -57,7 +58,7 @@ func isOneShotCLI(args []string) bool {
 		"help", "--help", "-h":
 		return true
 	}
-	return false
+	return isMCPModeFlag(args)
 }
 
 func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliDeps) int {
@@ -82,6 +83,10 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 		printUsage(stdout)
 		return 0
 	}
+	stdin := deps.stdin
+	if stdin == nil {
+		stdin = os.Stdin
+	}
 
 	switch args[0] {
 	case "help", "--help", "-h":
@@ -98,7 +103,7 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 	case "crawl":
 		return runCrawlCLI(ctx, args[1:], stdout, stderr, deps)
 	case "mcp":
-		return runMCPStdio(ctx, os.Stdin, stdout, stderr, deps)
+		return runMCPStdio(ctx, stdin, stdout, stderr, deps)
 	case "init", "install-mcp":
 		return runInstallMCP(args[1:], stdout, stderr)
 	case "install-service":
@@ -108,10 +113,13 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 	case "bug-report":
 		return runBugReportCLI(ctx, args[1:], stdout, stderr, deps)
 	case "serve":
-		return runServeMode(ctx, args[1:], stdout, stderr)
+		return runServeModeWithDeps(ctx, args[1:], stdout, stderr, deps)
 	case "desktop":
-		return runDesktopMode(ctx, args[1:], stdout, stderr)
+		return runDesktopModeWithDeps(ctx, args[1:], stdout, stderr, deps)
 	default:
+		if isMCPModeFlag(args) {
+			return runMCPStdio(ctx, stdin, stdout, stderr, deps)
+		}
 		_, _ = fmt.Fprintf(stderr, "unknown subcommand %q (try 'edgefetch help')\n", args[0])
 		return 2
 	}
@@ -540,8 +548,8 @@ func runMapCLI(ctx context.Context, args []string, stdout, stderr io.Writer, dep
 		MaxSeconds: 30,
 		Options:    crawl.Options{Concurrency: 2, IncludeBody: true, RespectRobots: crawl.Bool(true)},
 		Requests: []crawl.Request{
-			{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText},
-			{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText},
+			{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText, Accept: "text/plain"},
+			{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText, Accept: "application/xml"},
 			{ID: "home", URL: targetURL, Kind: classify.KindScrape, Formats: []string{"links"}},
 		},
 	}

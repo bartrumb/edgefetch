@@ -96,6 +96,8 @@ func warmUpCrawlerBounded(ctx context.Context, crawler *crawl.Crawler) {
 	cancel()
 }
 
+var runHubFn = Run
+
 // RunAll maintains persistent outbound WebSocket sessions to every controller in `cfg.HubURLs` (falling back to
 // `cfg.HubURL`), sharing one `*crawl.Crawler` and `*politeness.Registry` across active-active controllers with zero
 // coordination overhead.
@@ -120,7 +122,7 @@ func RunAll(
 		if len(hubs) == 1 {
 			cfg.HubURL = hubs[0]
 		}
-		return Run(ctx, cfg, crawler, allow, hubTransport, log, rtOpts)
+		return runHubFn(ctx, cfg, crawler, allow, hubTransport, log, rtOpts)
 	}
 
 	var wg sync.WaitGroup
@@ -133,7 +135,7 @@ func RunAll(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := Run(ctx, subCfg, crawler, allow, hubTransport, subLog, rtOpts); err != nil {
+			if err := runHubFn(ctx, subCfg, crawler, allow, hubTransport, subLog, rtOpts); err != nil {
 				errCh <- err
 			}
 		}()
@@ -284,21 +286,7 @@ func runSession(
 	stopClose := context.AfterFunc(sessionCtx, func() { _ = conn.CloseCleanly() })
 	defer stopClose()
 
-	go func() {
-		ticker := time.NewTicker(rtOpts.PingInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-sessionCtx.Done():
-				return
-			case <-ticker.C:
-				if werr := conn.WriteText("ping"); werr != nil {
-					_ = conn.CloseNow()
-					return
-				}
-			}
-		}
-	}()
+	go runPingLoop(sessionCtx, rtOpts.PingInterval, conn.WriteText, conn.CloseNow)
 
 	defer func() {
 		cancelSession()
@@ -339,6 +327,69 @@ func runSession(
 		default:
 			log.Warn("agent_unknown_type", slog.String("type", msg.Type))
 		}
+	}
+}
+
+func runPingLoop(ctx context.Context, interval time.Duration, writePing func(string) error, closeNow func() error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if werr := writePing("ping"); werr != nil {
+				_ = closeNow()
+				return
+			}
+		}
+	}
+}
+
+func newR2ArtifactSink(
+	replyClient *http.Client,
+	cfg Config,
+	jobID, jobNonce string,
+	retention string,
+	maxContent int,
+	uploadTimeout time.Duration,
+	jobLog *slog.Logger,
+) crawl.ResultSink {
+	var uploadMu sync.Mutex
+	return func(_ int, res crawl.Result) crawl.Result {
+		if res.Body == "" {
+			return res
+		}
+		rawBytes, decErr := res.DecodeBody()
+		// Always clear inline Body immediately so bodies never pass through AgentHubDO or accumulate in RAM.
+		res.Body = ""
+		res.BodyEncoding = ""
+		if decErr != nil {
+			res.BodyOmitted = true
+			res.ArtifactError = "decode body: " + decErr.Error()
+			return res
+		}
+		if len(rawBytes) > maxContent {
+			res.BodyOmitted = true
+			res.Truncated = true
+			res.ArtifactError = fmt.Sprintf("body (%d bytes) exceeds artifact maxContentBytes (%d)", len(rawBytes), maxContent)
+			return res
+		}
+		uploadMu.Lock()
+		upStart := time.Now()
+		artCtx, cancelArt := context.WithTimeout(context.Background(), uploadTimeout)
+		artRef, upErr := uploadArtifact(artCtx, replyClient, cfg, jobID, jobNonce, res.ID, retention, rawBytes)
+		cancelArt()
+		res.Timing.ArtifactUploadMs = time.Since(upStart).Milliseconds()
+		uploadMu.Unlock()
+		if upErr != nil {
+			res.BodyOmitted = true
+			res.ArtifactError = upErr.Error()
+			jobLog.Warn("agent_artifact_upload_failed", slog.String("request_id", res.ID), slog.String("error", upErr.Error()))
+			return res
+		}
+		res.Artifact = artRef
+		return res
 	}
 }
 
@@ -424,42 +475,7 @@ func handleDispatchWithOpts(
 			if maxContent <= 0 || maxContent > crawl.MaxMaxBytes {
 				maxContent = crawl.MaxMaxBytes
 			}
-			var uploadMu sync.Mutex
-			sink = func(_ int, res crawl.Result) crawl.Result {
-				if res.Body == "" {
-					return res
-				}
-				rawBytes, decErr := res.DecodeBody()
-				// Always clear inline Body immediately so bodies never pass through AgentHubDO or accumulate in RAM.
-				res.Body = ""
-				res.BodyEncoding = ""
-				if decErr != nil {
-					res.BodyOmitted = true
-					res.ArtifactError = "decode body: " + decErr.Error()
-					return res
-				}
-				if len(rawBytes) > maxContent {
-					res.BodyOmitted = true
-					res.Truncated = true
-					res.ArtifactError = fmt.Sprintf("body (%d bytes) exceeds artifact maxContentBytes (%d)", len(rawBytes), maxContent)
-					return res
-				}
-				uploadMu.Lock()
-				upStart := time.Now()
-				artCtx, cancelArt := context.WithTimeout(context.Background(), rtOpts.UploadTimeout)
-				artRef, upErr := uploadArtifact(artCtx, replyClient, cfg, msg.JobID, msg.JobNonce, res.ID, retention, rawBytes)
-				cancelArt()
-				res.Timing.ArtifactUploadMs = time.Since(upStart).Milliseconds()
-				uploadMu.Unlock()
-				if upErr != nil {
-					res.BodyOmitted = true
-					res.ArtifactError = upErr.Error()
-					jobLog.Warn("agent_artifact_upload_failed", slog.String("request_id", res.ID), slog.String("error", upErr.Error()))
-					return res
-				}
-				res.Artifact = artRef
-				return res
-			}
+			sink = newR2ArtifactSink(replyClient, cfg, msg.JobID, msg.JobNonce, retention, maxContent, rtOpts.UploadTimeout, jobLog)
 		}
 		reply = crawl.ExecuteCallWithTrace(jobBaseCtx, crawler, call, hdr, jobLog, sink)
 	}

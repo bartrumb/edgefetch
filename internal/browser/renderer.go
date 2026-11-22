@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/bartrumb/edgefetch/v2/internal/politeness"
 	"github.com/coder/websocket"
 )
@@ -41,6 +42,14 @@ const (
 	browserIdleTTL        = 3 * time.Minute
 	maxActiveSessions     = 8
 	maxRenderedDOMChars   = 16 << 20 // 16 MiB cap in JS prevents >24 MiB CDP frames from dropping shared connection
+)
+
+var (
+	idleReaperInterval = 30 * time.Second
+	navLoadTimeout     = 15 * time.Second
+	staleInFlightTTL   = 8 * time.Second
+	minIdleBudget      = 3500 * time.Millisecond
+	readProcFile       = os.ReadFile
 )
 
 // InteractAction describes a single deterministic browser interaction step (`firecrawl_interact` & `/scrape` inline `actions` parity).
@@ -513,6 +522,7 @@ type Renderer struct {
 	browserVersion   string
 	lastUsedAt       time.Time
 	closed           bool
+	otelExp          *otel.Exporter
 }
 
 func isSandboxRequiredByEnv() bool {
@@ -568,6 +578,26 @@ func (r *Renderer) Available() bool {
 	disabled := r.disabledByPolicy
 	r.mu.Unlock()
 	return !disabled && (r.chromeBin != "" || r.dialOverrideWS != "")
+}
+
+// SetOtelExporter attaches an optional non-blocking OpenTelemetry OTLP/HTTP span exporter.
+func (r *Renderer) SetOtelExporter(exp *otel.Exporter) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.otelExp = exp
+	r.mu.Unlock()
+}
+
+func (r *Renderer) otelExporter() *otel.Exporter {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	exp := r.otelExp
+	r.mu.Unlock()
+	return exp
 }
 
 // BrowserInfo returns the detected Chromium product version and OS process sandbox state ("on", "off", or "unknown").
@@ -663,6 +693,36 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 	}
 	if !r.Available() {
 		return Output{}, ErrBrowserUnavailable
+	}
+
+	exp := r.otelExporter()
+	if tc, hasTrace := otel.TraceContextFromContext(ctx); exp != nil && hasTrace && tc.Sampled {
+		renderStart := time.Now()
+		defer func() {
+			errMsg := ""
+			if retErr != nil {
+				errMsg = otel.RedactEmbeddedURLs(retErr.Error())
+			}
+			exp.Record(otel.Span{
+				TraceID:      tc.TraceID,
+				SpanID:       otel.RandomHex(8),
+				ParentSpanID: tc.SpanID,
+				Name:         "edgefetch.browser.render",
+				Kind:         1, // INTERNAL
+				Start:        renderStart,
+				End:          time.Now(),
+				StatusOK:     retErr == nil,
+				ErrorMessage: errMsg,
+				Attributes: map[string]any{
+					"url.full":                otel.SanitizeURL(task.URL),
+					"browser.status":          out.Status,
+					"browser.rendered_bytes":  len(out.HTML),
+					"browser.actions_count":   len(task.Actions),
+					"browser.session_resumed": task.SessionID != "",
+					"browser.screenshot":      task.Screenshot,
+				},
+			})
+		}()
 	}
 
 	select {
@@ -1087,7 +1147,7 @@ func navigateAndWait(
 		return false
 	}
 
-	loadWait := time.NewTimer(15 * time.Second)
+	loadWait := time.NewTimer(navLoadTimeout)
 	defer loadWait.Stop()
 	loaded := false
 	for !loaded {
@@ -1121,8 +1181,8 @@ func navigateAndWait(
 	}
 
 	maxIdleBudget := time.Duration(settle) * time.Millisecond
-	if maxIdleBudget < 3500*time.Millisecond {
-		maxIdleBudget = 3500 * time.Millisecond
+	if maxIdleBudget < minIdleBudget {
+		maxIdleBudget = minIdleBudget
 	}
 	quietWindow := 400 * time.Millisecond
 	if explicitWait && time.Duration(settle)*time.Millisecond < quietWindow {
@@ -1143,7 +1203,7 @@ func navigateAndWait(
 	for {
 		now := time.Now()
 		for id, started := range inFlight {
-			if now.Sub(started) > 8*time.Second {
+			if now.Sub(started) > staleInFlightTTL {
 				delete(inFlight, id)
 			}
 		}
@@ -1812,7 +1872,7 @@ func isLinuxProcessZombieOrDead(pid int) bool {
 	if runtime.GOOS != "linux" || pid <= 0 {
 		return false
 	}
-	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	raw, err := readProcFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
 		return true
 	}
@@ -1835,12 +1895,12 @@ func linuxSandboxBlockedByHostPolicy() bool {
 	if runtime.GOOS != "linux" {
 		return false
 	}
-	if attr, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+	if attr, err := readProcFile("/proc/self/attr/current"); err == nil {
 		if strings.Contains(strings.ToLower(strings.TrimSpace(string(attr))), "edgefetch_fat") {
 			return true
 		}
 	}
-	if cloneVal, err := os.ReadFile("/proc/sys/kernel/unprivileged_userns_clone"); err == nil {
+	if cloneVal, err := readProcFile("/proc/sys/kernel/unprivileged_userns_clone"); err == nil {
 		if strings.TrimSpace(string(cloneVal)) == "0" {
 			return true
 		}
@@ -2042,9 +2102,12 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 
 	probeCtx, probeCancel := context.WithTimeout(ctx, startupWait)
 	probeDone := make(chan struct{})
+	var probeWG sync.WaitGroup
 	if cmd.Process != nil {
 		pid := cmd.Process.Pid
+		probeWG.Add(1)
 		go func() {
+			defer probeWG.Done()
 			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
 			for {
@@ -2068,6 +2131,7 @@ func (r *Renderer) launchAndDialPipeLocked(ctx context.Context, userDir string, 
 	probeErr := conn.call(probeCtx, "", "Browser.getVersion", nil, &verOut)
 	close(probeDone)
 	probeCancel()
+	probeWG.Wait()
 	if probeErr != nil {
 		closePipes()
 		_ = conn.close()
@@ -2327,7 +2391,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 }
 
 func (r *Renderer) idleReaperLoop(target *cdpConn) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(idleReaperInterval)
 	defer ticker.Stop()
 	for {
 		select {

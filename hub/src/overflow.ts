@@ -13,6 +13,7 @@
 import { parseExactRetryAfterMs, recomputeSummary, type CrawlResultItem } from './agent-hub';
 import { signOutboundBotHeaders } from './bot-auth';
 import { filterSafeResponseHeaders } from './framework-detect';
+import { getActiveRequestTracer } from './otel';
 import { classifyWafAndChallenge } from './waf';
 
 export const ROBOTS_MAX_BYTES = 1024 * 1024; // 1 MiB >= RFC 9309 500 KiB minimum
@@ -789,6 +790,8 @@ export interface OverflowDeps {
   fetchFn?: typeof fetch;
   sleepFn?: (ms: number) => Promise<void>;
   bypassAllowlist?: string[];
+  trace?: Record<string, string>;
+  onBotAuthSigned?: () => void;
   botAuth?: {
     privateKey: string;
     directoryUrl?: string;
@@ -805,6 +808,7 @@ export async function cloudflareOverflowFetch(
   const useSharedRobotsCache = deps.fetchFn === undefined;
   const sleepFn = deps.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const bypassAllowlist = deps.bypassAllowlist ?? [];
+  let reportedBotAuthSigned = false;
 
   const started = Date.now();
   let call: {
@@ -1013,6 +1017,11 @@ export async function cloudflareOverflowFetch(
                 ...(deps.botAuth.directoryUrl ? { directoryUrl: deps.botAuth.directoryUrl } : {}),
               });
               for (const [sk, sv] of Object.entries(sigHdrs)) headers.set(sk, sv);
+              if (!reportedBotAuthSigned) {
+                reportedBotAuthSigned = true;
+                deps.onBotAuthSigned?.();
+                getActiveRequestTracer()?.setAttribute('bot_auth.signed', true);
+              }
             } catch {
               // Non-fatal if optional bot signing key is invalid.
             }

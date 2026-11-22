@@ -14,6 +14,7 @@
  *  - `Section 4`: First-class `executeJobsCall` (`POST /v1/jobs` & MCP `jobs` tool).
  */
 
+import { getActiveRequestTracer, type RequestTracer, type TraceContext } from './otel';
 import { compileSafeUserRegex, replaceHtmlTagBlocksLinear, stripHtmlTagsQuoteAwareLinear } from './safe-input';
 import type { ArtifactRetention, OptionalStorageBindings } from './storage';
 
@@ -3240,8 +3241,11 @@ async function executeJobsVerifyMode(params: {
   urls: string[];
   payload: JobsToolPayload;
   executeScrape: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { urls, payload, executeScrape } = params;
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const resolvedAdapterIds = new Set<string>();
   const parsedItems = urls.slice(0, 100).map((rawUrl) => ({
     url: rawUrl,
     identity: parseAtsPostingIdentity(rawUrl),
@@ -3336,6 +3340,8 @@ async function executeJobsVerifyMode(params: {
       });
       const totalNum = typeof sc.body.total === 'number' && Number.isFinite(sc.body.total) ? sc.body.total : undefined;
       const extId = typeof sc.body.extractorId === 'string' ? sc.body.extractorId : '';
+      const resolvedAts = extId || resolveAtsPreFetchSpec(grp.boardUrl)?.id || grp.platform;
+      if (resolvedAts) resolvedAdapterIds.add(resolvedAts);
       const linksCoverFullBoard =
         totalNum !== undefined &&
         rawLinks.length >= totalNum &&
@@ -3375,6 +3381,9 @@ async function executeJobsVerifyMode(params: {
       ) {
         results.push({ url: item.url, status: 'closed' });
       } else if (direct.status === 200 && direct.body?.ok === true) {
+        if (typeof direct.body.extractorId === 'string' && direct.body.extractorId) {
+          resolvedAdapterIds.add(direct.body.extractorId);
+        }
         results.push({ url: item.url, status: 'live' });
       } else {
         results.push({ url: item.url, status: 'unknown' });
@@ -3432,6 +3441,8 @@ async function executeJobsVerifyMode(params: {
         ...(payload.site ? { site: payload.site } : {}),
       }).catch(() => null);
       if (wdCheck?.status === 200 && wdCheck.body?.ok === true && wdCheck.body?.contentState !== 'closed_posting' && wdCheck.body?.contentState !== 'soft_404') {
+        const wdExtId = typeof wdCheck.body.extractorId === 'string' ? wdCheck.body.extractorId : resolveAtsPreFetchSpec(item.url)?.id;
+        if (wdExtId) resolvedAdapterIds.add(wdExtId);
         results.push({
           url: item.url,
           status: 'live',
@@ -3450,6 +3461,13 @@ async function executeJobsVerifyMode(params: {
       slug: item.identity.slug,
       ...(similar.length > 0 ? { similarOpenRoles: similar } : {}),
     });
+  }
+
+  activeTracer?.setAttribute('edgefetch.jobs.mode', 'verify');
+  activeTracer?.setAttribute('edgefetch.jobs.boards_discovered', boardGroups.size);
+  activeTracer?.setAttribute('edgefetch.jobs.jobs_returned', results.length);
+  if (resolvedAdapterIds.size > 0) {
+    activeTracer?.setAttribute('edgefetch.adapter_id', [...resolvedAdapterIds].join(','));
   }
 
   return {
@@ -3607,8 +3625,14 @@ export async function executeJobsCall(params: {
   env: OptionalStorageBindings & Record<string, unknown>;
   executeSearch: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeScrape: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
-  const { payload, executeSearch } = params;
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runJobs = async (): Promise<{ status: number; body: Record<string, unknown> }> => {
+  const { payload } = params;
+  const rawExecuteSearch = params.executeSearch;
+  const executeSearch = (args: Record<string, unknown>) =>
+    activeTracer ? activeTracer.run(() => rawExecuteSearch(args)) : rawExecuteSearch(args);
   const rawExecuteScrape = params.executeScrape;
 
   // Enforce hard `<= 5` concurrent scrapes and `<= 40` total scrapes per `executeJobsCall` across discovery, verify & boards.
@@ -3633,7 +3657,7 @@ export async function executeJobsCall(params: {
     activeScrapes++;
     totalScrapesUsed++;
     try {
-      return await rawExecuteScrape(args);
+      return await (activeTracer ? activeTracer.run(() => rawExecuteScrape(args)) : rawExecuteScrape(args));
     } finally {
       activeScrapes--;
       if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
@@ -3657,6 +3681,9 @@ export async function executeJobsCall(params: {
       .filter((u): u is string => typeof u === 'string' && u.trim().startsWith('https://'))
       .map((u) => u.trim());
     if (cleanVerifyUrls.length === 0) {
+      activeTracer?.setAttribute('edgefetch.jobs.mode', 'verify');
+      activeTracer?.setAttribute('edgefetch.jobs.boards_discovered', 0);
+      activeTracer?.setAttribute('edgefetch.jobs.jobs_returned', 0);
       return {
         status: 400,
         body: {
@@ -3666,7 +3693,12 @@ export async function executeJobsCall(params: {
         },
       };
     }
-    return executeJobsVerifyMode({ urls: cleanVerifyUrls, payload, executeScrape });
+    return executeJobsVerifyMode({
+      urls: cleanVerifyUrls,
+      payload,
+      executeScrape,
+      ...(activeTracer ? { tracer: activeTracer } : {}),
+    });
   }
 
   const query = typeof payload.query === 'string' ? payload.query.trim() : '';
@@ -3680,6 +3712,9 @@ export async function executeJobsCall(params: {
     : [];
 
   if (!query && !companyFilter && domainsInput.length === 0) {
+    activeTracer?.setAttribute('edgefetch.jobs.mode', 'search');
+    activeTracer?.setAttribute('edgefetch.jobs.boards_discovered', 0);
+    activeTracer?.setAttribute('edgefetch.jobs.jobs_returned', 0);
     return {
       status: 400,
       body: { ok: false, error: 'missing_query', message: 'Provide at least `query`, `company`, or `domains`.' },
@@ -3719,6 +3754,7 @@ export async function executeJobsCall(params: {
   const notes: string[] = [];
   const discoveredBoards: DiscoveredAtsBoard[] = [];
   const sourcesUsed = new Set<string>();
+  const resolvedAdapterIds = new Set<string>();
 
   // 1. Company Domain -> ATS Board Auto-Discovery (`domains: ["stripe.com", "nvidia.com", "f5.com"]`)
   if (domainsInput.length > 0) {
@@ -4014,6 +4050,11 @@ export async function executeJobsCall(params: {
 
       // If board returned multiple `jobs` directly (e.g. Ashby / Workday / Greenhouse / Lever / Workable / Gem / Rippling board URL)
       if (Array.isArray(sc.body.jobs)) {
+        const boardExtId =
+          typeof sc.body.extractorId === 'string' && sc.body.extractorId
+            ? sc.body.extractorId
+            : resolveAtsPreFetchSpec(origU)?.id;
+        if (boardExtId) resolvedAdapterIds.add(boardExtId);
         const boardJobs = [...(sc.body.jobs as StructuredJobRecord[])];
         let boardTotal = typeof sc.body.total === 'number' ? sc.body.total : boardJobs.length;
         let boardTruncated = sc.body.truncated === true;
@@ -4072,7 +4113,10 @@ export async function executeJobsCall(params: {
           }
         }
         for (const br of boardJobs) {
-          if (br.source) sourcesUsed.add(`ats:${br.source}`);
+          if (br.source) {
+            sourcesUsed.add(`ats:${br.source}`);
+            resolvedAdapterIds.add(br.source);
+          }
           collected.push(br);
         }
         continue;
@@ -4081,6 +4125,7 @@ export async function executeJobsCall(params: {
       // Support twin-extracted job boards (`icims` `records[]`) in `jobs` search mode
       if (Array.isArray(sc.body.records) && sc.body.extractorId === 'icims') {
         sourcesUsed.add('ats:icims');
+        resolvedAdapterIds.add('icims');
         const icimsRecs = sc.body.records as Array<Record<string, unknown>>;
         const icimsCo = inferCompanyFromAtsUrl(origU);
         for (const rc of icimsRecs) {
@@ -4122,6 +4167,11 @@ export async function executeJobsCall(params: {
       const applyUrl = jp?.applyUrl || origU;
       const jobSource = jp?.source || String(sc.body.extractorId ?? 'ats');
       sourcesUsed.add(`ats:${jobSource}`);
+      const postExtId =
+        typeof sc.body.extractorId === 'string' && sc.body.extractorId
+          ? sc.body.extractorId
+          : resolveAtsPreFetchSpec(origU)?.id ?? (jobSource !== 'ats' ? jobSource : undefined);
+      if (postExtId) resolvedAdapterIds.add(postExtId);
 
       collected.push({
         title: rawTitle,
@@ -4246,6 +4296,14 @@ export async function executeJobsCall(params: {
     notes.push('No ATS search results returned; ensure SERPER_API_KEY or SEARXNG_URL is configured on the Hub.');
   }
 
+  const boardsDiscoveredCount = discoveredBoards.filter((b) => b.boardStatus !== 'not_found' && Boolean(b.boardUrl)).length;
+  activeTracer?.setAttribute('edgefetch.jobs.mode', 'search');
+  activeTracer?.setAttribute('edgefetch.jobs.boards_discovered', boardsDiscoveredCount);
+  activeTracer?.setAttribute('edgefetch.jobs.jobs_returned', finalJobs.length);
+  if (resolvedAdapterIds.size > 0) {
+    activeTracer?.setAttribute('edgefetch.adapter_id', [...resolvedAdapterIds].join(','));
+  }
+
   return {
     status: 200,
     body: {
@@ -4261,4 +4319,6 @@ export async function executeJobsCall(params: {
       ...(notes.length > 0 ? { notes } : {}),
     },
   };
+  };
+  return activeTracer ? activeTracer.run(runJobs) : runJobs();
 }

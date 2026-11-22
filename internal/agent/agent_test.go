@@ -438,9 +438,11 @@ func TestReconnectWatchdogClosesPreviousSocketImmediately(t *testing.T) {
 }
 
 func TestNormalUploadExceedsLegacyTenSecondCapWithoutLosingReply(t *testing.T) {
+	var replyReceived atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		time.Sleep(10200 * time.Millisecond)
+		replyReceived.Store(true)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -469,6 +471,9 @@ func TestNormalUploadExceedsLegacyTenSecondCapWithoutLosingReply(t *testing.T) {
 		},
 	)
 
+	if !replyReceived.Load() {
+		t.Fatal("expected /agent/reply server handler to receive upload")
+	}
 	if strings.Contains(logBuf.String(), "agent_reply_failed") {
 		t.Fatalf("A2 BUG: normal (non-shutdown) reply upload failed at >10s even within 45s client budget: %s", logBuf.String())
 	}

@@ -24,7 +24,7 @@ All notable changes to EdgeFetch are documented in this file. This project adher
   - Added `npm run adapter:test [<id>] [<https://url>] [--record]` for `robots.txt`-checked live previews, fixture recording, and 390-case `100 KB+` linear-time bulkhead fuzzing, plus `.yaml`-by-default scaffolding in `npm run adapter:new`.
 
 ### Changed
-- **Dual-Boundary SaaS-Protective Hub Licensing (`LICENSE`, `hub/LICENSE`):** Kept the Go worker, CLI, `stdio` MCP, SDKs, and declarative YAML site manifests (`cmd/`, `internal/`, `sdk/`, `extensions/`) under `MIT`, while licensing the TypeScript Hub coordinator plane (`hub/`) under `FSL-1.1-MIT` (free to self-host personally or internally; prohibits competing third-party hosted SaaS; converts to `MIT` after 2 years).
+- **Open-Source Worker & Adapters / Fair-Source Hub Licensing (`LICENSE`, `hub/src/extractors/LICENSE`, `hub/LICENSE`):** Kept the Go worker, CLI, `stdio` MCP, SDKs, and **all** site adapters (`cmd/`, `internal/`, `sdk/`, `extensions/`, `internal/extract/manifests/`, `hub/src/extractors/`) open source under `MIT`, while licensing the rest of the Hub coordinator plane (`hub/`) as fair source under `FSL-1.1-MIT` (free to self-host personally or internally; prohibits competing third-party hosted SaaS; converts to `MIT` after two years). Inbound contributions remain `MIT` + DCO (`git commit -s`), with explicit `EdgeFetch™` trademark notice in `README.md`.
 
 ## [2.6.1] - 2026-11-21
 

@@ -12,6 +12,15 @@
  */
 
 import { validatePublicHttpsTargetUrl } from './overflow';
+import {
+  getActiveRequestTracer,
+  sanitizeErrorMessageForSpan,
+  sanitizeUrlForSpan,
+  type ActiveSpanHandle,
+  type RequestTracer,
+  type SpanAttributes,
+  type TraceContext,
+} from './otel';
 import { asciiLower, safeDecodeURIComponent } from './safe-input';
 
 const MAX_LLM_RESPONSE_BYTES = 4 * 1024 * 1024; // 4 MiB ceiling on LLM API JSON responses (H5)
@@ -706,6 +715,8 @@ export async function completeLlmTurn(params: {
   maxTokens?: number;
   timeoutMs?: number;
   fetchFn?: typeof fetch;
+  tracer?: RequestTracer | TraceContext;
+  traceAttributes?: SpanAttributes;
 }): Promise<LlmChatCompletionResult> {
   const {
     config,
@@ -718,9 +729,12 @@ export async function completeLlmTurn(params: {
   } = params;
   const fetchFn = params.fetchFn ?? config.safeFetch ?? fetch;
   const allowedNames = new Set(tools.map((t) => t.name));
+  const activeTracer = getActiveRequestTracer(params.tracer);
 
+  const runTurn = async (span?: ActiveSpanHandle): Promise<LlmChatCompletionResult> => {
   // ── 1. Cloudflare Workers AI (`env.AI`) ──
   if (config.provider === 'workers-ai' && config.workersAi) {
+    span?.setAttribute('url.full', 'workers-ai://binding');
     try {
       const cfMessages = messages.map((m) => {
         if (m.role === 'tool') {
@@ -786,6 +800,8 @@ export async function completeLlmTurn(params: {
       }
     }
     const endpoint = appendEndpointToBaseUrl(config.baseUrl, '/messages', '/messages');
+    span?.setAttribute('url.full', sanitizeUrlForSpan(endpoint));
+    span?.setAttribute('http.request.method', 'POST');
     try {
       const res = await fetchFn(endpoint, {
         method: 'POST',
@@ -813,6 +829,7 @@ export async function completeLlmTurn(params: {
         redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
+      span?.setAttribute('http.response.status_code', res.status);
       if (res.status >= 300 && res.status < 400) {
         await res.body?.cancel().catch(() => undefined);
         return { ok: false, content: '', toolCalls: [], error: `Anthropic endpoint returned disallowed redirect HTTP ${res.status}` };
@@ -893,6 +910,8 @@ export async function completeLlmTurn(params: {
     }
     const cleanModel = config.model.replace(/^models\//, '');
     const endpoint = appendEndpointToBaseUrl(config.baseUrl, `/models/${encodeURIComponent(cleanModel)}:generateContent`);
+    span?.setAttribute('url.full', sanitizeUrlForSpan(endpoint));
+    span?.setAttribute('http.request.method', 'POST');
     try {
       const res = await fetchFn(endpoint, {
         method: 'POST',
@@ -925,6 +944,7 @@ export async function completeLlmTurn(params: {
         redirect: 'manual',
         signal: AbortSignal.timeout(timeoutMs),
       });
+      span?.setAttribute('http.response.status_code', res.status);
       if (res.status >= 300 && res.status < 400) {
         await res.body?.cancel().catch(() => undefined);
         return { ok: false, content: '', toolCalls: [], error: `Gemini endpoint returned disallowed redirect HTTP ${res.status}` };
@@ -990,6 +1010,8 @@ export async function completeLlmTurn(params: {
   });
 
   const endpoint = appendEndpointToBaseUrl(config.baseUrl, '/chat/completions', '/chat/completions');
+  span?.setAttribute('url.full', sanitizeUrlForSpan(endpoint));
+  span?.setAttribute('http.request.method', 'POST');
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (config.apiKey) {
     headers.authorization = `Bearer ${config.apiKey}`;
@@ -1022,6 +1044,7 @@ export async function completeLlmTurn(params: {
       redirect: 'manual',
       signal: AbortSignal.timeout(timeoutMs),
     });
+    span?.setAttribute('http.response.status_code', res.status);
     if (res.status >= 300 && res.status < 400) {
       await res.body?.cancel().catch(() => undefined);
       return { ok: false, content: '', toolCalls: [], error: `${config.provider} endpoint returned disallowed redirect HTTP ${res.status}` };
@@ -1081,6 +1104,37 @@ export async function completeLlmTurn(params: {
   } catch (err) {
     return { ok: false, content: '', toolCalls: [], error: err instanceof Error ? err.message : String(err) };
   }
+  };
+
+  if (!activeTracer) {
+    return runTurn();
+  }
+  return activeTracer.withSpan(
+    'edgefetch.llm.turn',
+    {
+      kind: 3,
+      attributes: {
+        'gen_ai.system': config.provider,
+        'gen_ai.request.model': config.model,
+        'edgefetch.llm.is_offline_local': config.isOfflineLocal,
+        ...(params.traceAttributes ?? {}),
+      },
+    },
+    async (span) => {
+      const out = await runTurn(span);
+      span.setAttribute('edgefetch.llm.tool_call_count', out.toolCalls.length);
+      span.setAttribute('edgefetch.llm.has_text', Boolean(out.content));
+      if (out.usage) {
+        if (out.usage.promptTokens !== undefined) span.setAttribute('gen_ai.usage.input_tokens', out.usage.promptTokens);
+        if (out.usage.completionTokens !== undefined) span.setAttribute('gen_ai.usage.output_tokens', out.usage.completionTokens);
+        if (out.usage.totalTokens !== undefined) span.setAttribute('gen_ai.usage.total_tokens', out.usage.totalTokens);
+      }
+      if (!out.ok) {
+        span.setStatus(false, sanitizeErrorMessageForSpan(out.error, 'llm_error'));
+      }
+      return out;
+    },
+  );
 }
 
 /**
@@ -1160,8 +1214,9 @@ export async function summarizeMarkdownWithOptionalLlm(params: {
   title?: string;
   llmConfig: ResolvedLlmConfig | null;
   fetchFn?: typeof fetch;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ summary: string; viaLlm: boolean }> {
-  const { markdown, title, llmConfig, fetchFn } = params;
+  const { markdown, title, llmConfig, fetchFn, tracer } = params;
   if (llmConfig && markdown.trim().length > 0) {
     const res = await completeLlmTurn({
       config: llmConfig,
@@ -1180,6 +1235,7 @@ export async function summarizeMarkdownWithOptionalLlm(params: {
       temperature: 0.1,
       timeoutMs: 25_000,
       ...(fetchFn ? { fetchFn } : {}),
+      ...(tracer ? { tracer } : {}),
     });
     if (res.ok && res.content.trim().length >= 20) {
       return { summary: res.content.trim(), viaLlm: true };
@@ -1197,8 +1253,9 @@ export async function extractJsonWithOptionalLlm(params: {
   heuristicFallback: Record<string, unknown>;
   llmConfig: ResolvedLlmConfig | null;
   fetchFn?: typeof fetch;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ data: Record<string, unknown>; viaLlm: boolean }> {
-  const { markdown, title, url, prompt, schema, heuristicFallback, llmConfig, fetchFn } = params;
+  const { markdown, title, url, prompt, schema, heuristicFallback, llmConfig, fetchFn, tracer } = params;
   if (!llmConfig || !markdown.trim()) {
     return { data: heuristicFallback, viaLlm: false };
   }
@@ -1227,6 +1284,7 @@ export async function extractJsonWithOptionalLlm(params: {
     temperature: 0,
     timeoutMs: 30_000,
     ...(fetchFn ? { fetchFn } : {}),
+    ...(tracer ? { tracer } : {}),
   });
   if (res.ok) {
     const parsed = parseLooseJsonObject(res.content);

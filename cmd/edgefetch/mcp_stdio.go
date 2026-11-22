@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -25,6 +27,7 @@ import (
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 	"github.com/bartrumb/edgefetch/v2/internal/crawl"
 	"github.com/bartrumb/edgefetch/v2/internal/hub"
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 )
 
 // runMCPStdio implements a zero-daemon, zero-port, zero-token Model Context Protocol (MCP) server over stdin/stdout
@@ -48,6 +51,8 @@ func runMCPStdio(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer,
 	// Never log to stdout in stdio MCP mode; stdout belongs strictly to newline-delimited JSON-RPC 2.0 frames.
 	silentLog := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	crawler := crawl.NewCrawler(deps.transport, deps.allow, ua, silentLog)
+	otelExp := otel.NewExporterFromEnv(deps.getenv, "edgefetch-mcp-stdio", agent.Version, newHubTransport())
+	crawler.SetOtelExporter(otelExp)
 	defer func() { _ = crawler.Close() }()
 
 	scanner := bufio.NewScanner(stdin)
@@ -186,6 +191,11 @@ func runMCPStdio(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer,
 			var cp struct {
 				Name      string          `json:"name"`
 				Arguments json.RawMessage `json:"arguments"`
+				Meta      struct {
+					Traceparent string `json:"traceparent"`
+					TraceID     string `json:"x-trace-id"`
+					SpanID      string `json:"x-span-id"`
+				} `json:"_meta"`
 			}
 			if err := json.Unmarshal(req.Params, &cp); err != nil {
 				writeRPC(map[string]any{
@@ -195,204 +205,20 @@ func runMCPStdio(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer,
 				})
 				continue
 			}
-
-			switch cp.Name {
-			case "doctor":
-				var docOut bytes.Buffer
-				_ = runDoctor([]string{"--json"}, &docOut, io.Discard, deps)
-				writeRPC(stdioToolResult(req.ID, strings.TrimSpace(docOut.String()), false))
-
-			case "scrape":
-				var sp struct {
-					URL      string `json:"url"`
-					Render   bool   `json:"render"`
-					Query    string `json:"query"`
-					MaxChars int    `json:"maxChars"`
+			var metaHdr http.Header
+			if cp.Meta.Traceparent != "" || cp.Meta.TraceID != "" || cp.Meta.SpanID != "" {
+				metaHdr = http.Header{}
+				if cp.Meta.Traceparent != "" {
+					metaHdr.Set("Traceparent", cp.Meta.Traceparent)
 				}
-				_ = json.Unmarshal(cp.Arguments, &sp)
-				kind := classify.KindScrape
-				renderMode := "auto"
-				if browser.FindChromeBinary() == "" {
-					renderMode = "off"
+				if cp.Meta.TraceID != "" {
+					metaHdr.Set("X-Trace-Id", cp.Meta.TraceID)
 				}
-				if sp.Render {
-					kind = classify.KindRender
-					renderMode = "always"
+				if cp.Meta.SpanID != "" {
+					metaHdr.Set("X-Span-Id", cp.Meta.SpanID)
 				}
-				call := crawl.FetchCall{
-					MaxSeconds: 45,
-					Options: crawl.Options{
-						Concurrency:   1,
-						RespectRobots: crawl.Bool(true),
-						DiscoverLlms:  crawl.Bool(true),
-					},
-					Requests: []crawl.Request{{
-						ID:              "stdio-1",
-						URL:             strings.TrimSpace(sp.URL),
-						Kind:            kind,
-						Formats:         []string{"markdown", "links"},
-						OnlyMainContent: crawl.Bool(true),
-						DiscoverLlms:    crawl.Bool(true),
-						Query:           sp.Query,
-						RenderMode:      renderMode,
-					}},
-				}
-				if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
-					writeRPC(stdioToolResult(req.ID, code+": "+msg, true))
-					continue
-				}
-				rep := crawl.ExecuteCall(ctx, crawler, call, silentLog)
-				if len(rep.Results) == 0 {
-					writeRPC(stdioToolResult(req.ID, "empty_reply", true))
-					continue
-				}
-				res := rep.Results[0]
-				if sp.MaxChars > 0 {
-					res.Markdown = truncateUTF8Safe(res.Markdown, sp.MaxChars)
-				}
-				txt := marshalJSONNoEscapeHTML(res, "  ")
-				writeRPC(stdioToolResult(req.ID, txt, res.Outcome != classify.OutcomeOK))
-
-			case "fetch_url":
-				var fp struct {
-					URL  string `json:"url"`
-					Kind string `json:"kind"`
-				}
-				_ = json.Unmarshal(cp.Arguments, &fp)
-				k := classify.Kind(fp.Kind)
-				if k == "" {
-					k = classify.KindScrape
-				}
-				call := crawl.FetchCall{
-					MaxSeconds: 45,
-					Options:    crawl.Options{Concurrency: 1, IncludeBody: true, RespectRobots: crawl.Bool(true)},
-					Requests:   []crawl.Request{{ID: "stdio-1", URL: strings.TrimSpace(fp.URL), Kind: k}},
-				}
-				if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
-					writeRPC(stdioToolResult(req.ID, code+": "+msg, true))
-					continue
-				}
-				rep := crawl.ExecuteCall(ctx, crawler, call, silentLog)
-				txt := marshalJSONNoEscapeHTML(rep, "  ")
-				writeRPC(stdioToolResult(req.ID, txt, false))
-
-			case "fetch_batch":
-				var bp struct {
-					URLs        []string `json:"urls"`
-					IncludeBody bool     `json:"includeBody"`
-					Kind        string   `json:"kind"`
-				}
-				_ = json.Unmarshal(cp.Arguments, &bp)
-				if len(bp.URLs) == 0 || len(bp.URLs) > 25 {
-					writeRPC(stdioToolResult(req.ID, "invalid_urls: provide 1 to 25 https:// URLs", true))
-					continue
-				}
-				k := classify.Kind(bp.Kind)
-				if k == "" {
-					k = classify.KindPage
-				}
-				reqs := make([]crawl.Request, 0, len(bp.URLs))
-				for i, rawU := range bp.URLs {
-					reqs = append(reqs, crawl.Request{
-						ID:   fmt.Sprintf("batch-%d", i+1),
-						URL:  strings.TrimSpace(rawU),
-						Kind: k,
-					})
-				}
-				call := crawl.FetchCall{
-					MaxSeconds: 60,
-					Options:    crawl.Options{Concurrency: 2, IncludeBody: bp.IncludeBody, RespectRobots: crawl.Bool(true)},
-					Requests:   reqs,
-				}
-				if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
-					writeRPC(stdioToolResult(req.ID, code+": "+msg, true))
-					continue
-				}
-				rep := crawl.ExecuteCall(ctx, crawler, call, silentLog)
-				if bp.IncludeBody {
-					for i := range rep.Results {
-						rep.Results[i].Body = truncateUTF8Safe(rep.Results[i].Body, 3072)
-					}
-				}
-				txt := marshalJSONNoEscapeHTML(rep, "  ")
-				writeRPC(stdioToolResult(req.ID, txt, false))
-
-			case "map":
-				var mp struct {
-					URL    string `json:"url"`
-					Search string `json:"search"`
-					Limit  int    `json:"limit"`
-				}
-				_ = json.Unmarshal(cp.Arguments, &mp)
-				uParsed, err := url.Parse(strings.TrimSpace(mp.URL))
-				if err != nil || uParsed.Scheme != "https" || uParsed.Host == "" {
-					writeRPC(stdioToolResult(req.ID, "invalid_url: provide a valid https:// URL", true))
-					continue
-				}
-				if mp.Limit <= 0 || mp.Limit > 500 {
-					mp.Limit = 100
-				}
-				origin := "https://" + uParsed.Host
-				call := crawl.FetchCall{
-					MaxSeconds: 30,
-					Options:    crawl.Options{Concurrency: 2, IncludeBody: true, RespectRobots: crawl.Bool(true)},
-					Requests: []crawl.Request{
-						{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText},
-						{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText},
-						{ID: "home", URL: strings.TrimSpace(mp.URL), Kind: classify.KindScrape, Formats: []string{"links"}},
-					},
-				}
-				if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
-					writeRPC(stdioToolResult(req.ID, code+": "+msg, true))
-					continue
-				}
-				rep := crawl.ExecuteCall(ctx, crawler, call, silentLog)
-				seen := map[string]struct{}{}
-				var links []string
-				filterLower := strings.ToLower(strings.TrimSpace(mp.Search))
-				addCandidate := func(cand string) {
-					cand = strings.TrimSpace(cand)
-					if !strings.HasPrefix(cand, "https://") || len(links) >= mp.Limit {
-						return
-					}
-					if filterLower != "" && !strings.Contains(strings.ToLower(cand), filterLower) {
-						return
-					}
-					if _, exists := seen[cand]; !exists {
-						seen[cand] = struct{}{}
-						links = append(links, cand)
-					}
-				}
-				for _, r := range rep.Results {
-					for _, l := range r.Links {
-						addCandidate(l)
-					}
-					for _, m := range reSitemapLocURL.FindAllStringSubmatch(r.Body, 500) {
-						if len(m) > 1 {
-							addCandidate(m[1])
-						}
-					}
-					for _, m := range reMarkdownHTTPURL.FindAllStringSubmatch(r.Body, 500) {
-						if len(m) > 1 {
-							addCandidate(m[1])
-						}
-					}
-				}
-				out := map[string]any{
-					"ok":    true,
-					"url":   origin,
-					"total": len(links),
-					"links": links,
-				}
-				writeRPC(stdioToolResult(req.ID, marshalJSONNoEscapeHTML(out, "  "), false))
-
-			default:
-				writeRPC(map[string]any{
-					"jsonrpc": "2.0",
-					"id":      req.ID,
-					"error":   map[string]any{"code": -32601, "message": "Unknown tool: " + cp.Name},
-				})
 			}
+			writeRPC(executeMCPStdioToolCall(ctx, req.ID, cp.Name, cp.Arguments, metaHdr, crawler, otelExp, deps, silentLog))
 
 		default:
 			writeRPC(map[string]any{
@@ -404,6 +230,262 @@ func runMCPStdio(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer,
 	}
 	_ = stderr
 	return 0
+}
+
+func executeMCPStdioToolCall(
+	ctx context.Context,
+	id any,
+	name string,
+	arguments json.RawMessage,
+	metaHdr http.Header,
+	crawler *crawl.Crawler,
+	otelExp *otel.Exporter,
+	deps cliDeps,
+	silentLog *slog.Logger,
+) map[string]any {
+	tc := otel.ExtractOrNew(metaHdr)
+	toolSpan := otel.StartSpan(otelExp, tc, "edgefetch.mcp.tool", 2, map[string]any{
+		"mcp.tool.name": name,
+		"mcp.transport": "stdio",
+	})
+	traceHdr := http.Header{}
+	otel.InjectHeaders(traceHdr, tc, tc.SpanID)
+	callCtx := otel.WithTraceContext(ctx, tc)
+
+	isErr := false
+	errMsg := ""
+	defer func() {
+		toolSpan.End(!isErr, errMsg)
+	}()
+
+	switch name {
+	case "doctor":
+		var docOut bytes.Buffer
+		rc := runDoctor([]string{"--json"}, &docOut, io.Discard, deps)
+		if rc != 0 {
+			isErr = true
+			errMsg = "doctor failed"
+		}
+		return stdioToolResult(id, strings.TrimSpace(docOut.String()), false)
+
+	case "scrape":
+		var sp struct {
+			URL      string `json:"url"`
+			Render   bool   `json:"render"`
+			Query    string `json:"query"`
+			MaxChars int    `json:"maxChars"`
+		}
+		_ = json.Unmarshal(arguments, &sp)
+		if sp.URL != "" {
+			toolSpan.SetAttribute("url.full", otel.SanitizeURL(sp.URL))
+		}
+		kind := classify.KindScrape
+		renderMode := "auto"
+		if browser.FindChromeBinary() == "" {
+			renderMode = "off"
+		}
+		if sp.Render {
+			kind = classify.KindRender
+			renderMode = "always"
+		}
+		call := crawl.FetchCall{
+			MaxSeconds: 45,
+			Options: crawl.Options{
+				Concurrency:   1,
+				RespectRobots: crawl.Bool(true),
+				DiscoverLlms:  crawl.Bool(true),
+			},
+			Requests: []crawl.Request{{
+				ID:              "stdio-1",
+				URL:             strings.TrimSpace(sp.URL),
+				Kind:            kind,
+				Formats:         []string{"markdown", "links"},
+				OnlyMainContent: crawl.Bool(true),
+				DiscoverLlms:    crawl.Bool(true),
+				Query:           sp.Query,
+				RenderMode:      renderMode,
+			}},
+		}
+		if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
+			isErr = true
+			errMsg = code + ": " + msg
+			return stdioToolResult(id, errMsg, true)
+		}
+		rep := crawl.ExecuteCallWithTrace(callCtx, crawler, call, traceHdr, silentLog, nil)
+		if len(rep.Results) == 0 {
+			isErr = true
+			errMsg = "empty_reply"
+			return stdioToolResult(id, "empty_reply", true)
+		}
+		res := rep.Results[0]
+		if sp.MaxChars > 0 {
+			res.Markdown = truncateUTF8Safe(res.Markdown, sp.MaxChars)
+		}
+		txt := marshalJSONNoEscapeHTML(res, "  ")
+		isErr = res.Outcome != classify.OutcomeOK
+		if isErr {
+			errMsg = res.Problem
+			if errMsg == "" {
+				errMsg = string(res.Outcome)
+			}
+		}
+		return stdioToolResult(id, txt, isErr)
+
+	case "fetch_url":
+		var fp struct {
+			URL  string `json:"url"`
+			Kind string `json:"kind"`
+		}
+		_ = json.Unmarshal(arguments, &fp)
+		if fp.URL != "" {
+			toolSpan.SetAttribute("url.full", otel.SanitizeURL(fp.URL))
+		}
+		k := classify.Kind(fp.Kind)
+		if k == "" {
+			k = classify.KindScrape
+		}
+		call := crawl.FetchCall{
+			MaxSeconds: 45,
+			Options:    crawl.Options{Concurrency: 1, IncludeBody: true, RespectRobots: crawl.Bool(true)},
+			Requests:   []crawl.Request{{ID: "stdio-1", URL: strings.TrimSpace(fp.URL), Kind: k}},
+		}
+		if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
+			isErr = true
+			errMsg = code + ": " + msg
+			return stdioToolResult(id, errMsg, true)
+		}
+		rep := crawl.ExecuteCallWithTrace(callCtx, crawler, call, traceHdr, silentLog, nil)
+		txt := marshalJSONNoEscapeHTML(rep, "  ")
+		return stdioToolResult(id, txt, false)
+
+	case "fetch_batch":
+		var bp struct {
+			URLs        []string `json:"urls"`
+			IncludeBody bool     `json:"includeBody"`
+			Kind        string   `json:"kind"`
+		}
+		_ = json.Unmarshal(arguments, &bp)
+		toolSpan.SetAttribute("crawler.requests", len(bp.URLs))
+		if len(bp.URLs) == 0 || len(bp.URLs) > 25 {
+			isErr = true
+			errMsg = "invalid_urls: provide 1 to 25 https:// URLs"
+			return stdioToolResult(id, errMsg, true)
+		}
+		toolSpan.SetAttribute("url.full", otel.SanitizeURL(bp.URLs[0]))
+		k := classify.Kind(bp.Kind)
+		if k == "" {
+			k = classify.KindPage
+		}
+		reqs := make([]crawl.Request, 0, len(bp.URLs))
+		for i, rawU := range bp.URLs {
+			reqs = append(reqs, crawl.Request{
+				ID:   fmt.Sprintf("batch-%d", i+1),
+				URL:  strings.TrimSpace(rawU),
+				Kind: k,
+			})
+		}
+		call := crawl.FetchCall{
+			MaxSeconds: 60,
+			Options:    crawl.Options{Concurrency: 2, IncludeBody: bp.IncludeBody, RespectRobots: crawl.Bool(true)},
+			Requests:   reqs,
+		}
+		if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
+			isErr = true
+			errMsg = code + ": " + msg
+			return stdioToolResult(id, errMsg, true)
+		}
+		rep := crawl.ExecuteCallWithTrace(callCtx, crawler, call, traceHdr, silentLog, nil)
+		if bp.IncludeBody {
+			for i := range rep.Results {
+				rep.Results[i].Body = truncateUTF8Safe(rep.Results[i].Body, 3072)
+			}
+		}
+		txt := marshalJSONNoEscapeHTML(rep, "  ")
+		return stdioToolResult(id, txt, false)
+
+	case "map":
+		var mp struct {
+			URL    string `json:"url"`
+			Search string `json:"search"`
+			Limit  int    `json:"limit"`
+		}
+		_ = json.Unmarshal(arguments, &mp)
+		if mp.URL != "" {
+			toolSpan.SetAttribute("url.full", otel.SanitizeURL(mp.URL))
+		}
+		uParsed, err := url.Parse(strings.TrimSpace(mp.URL))
+		if err != nil || uParsed.Scheme != "https" || uParsed.Host == "" {
+			isErr = true
+			errMsg = "invalid_url: provide a valid https:// URL"
+			return stdioToolResult(id, errMsg, true)
+		}
+		if mp.Limit <= 0 || mp.Limit > 500 {
+			mp.Limit = 100
+		}
+		origin := "https://" + uParsed.Host
+		call := crawl.FetchCall{
+			MaxSeconds: 30,
+			Options:    crawl.Options{Concurrency: 2, IncludeBody: true, RespectRobots: crawl.Bool(true)},
+			Requests: []crawl.Request{
+				{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText, Accept: "text/plain"},
+				{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText, Accept: "application/xml"},
+				{ID: "home", URL: strings.TrimSpace(mp.URL), Kind: classify.KindScrape, Formats: []string{"links"}},
+			},
+		}
+		if code, msg, ok := crawl.ValidateCallWithCrawler(crawler, call, deps.allow); !ok {
+			isErr = true
+			errMsg = code + ": " + msg
+			return stdioToolResult(id, errMsg, true)
+		}
+		rep := crawl.ExecuteCallWithTrace(callCtx, crawler, call, traceHdr, silentLog, nil)
+		seen := map[string]struct{}{}
+		var links []string
+		filterLower := strings.ToLower(strings.TrimSpace(mp.Search))
+		addCandidate := func(cand string) {
+			cand = strings.TrimSpace(cand)
+			if !strings.HasPrefix(cand, "https://") || len(links) >= mp.Limit {
+				return
+			}
+			if filterLower != "" && !strings.Contains(strings.ToLower(cand), filterLower) {
+				return
+			}
+			if _, exists := seen[cand]; !exists {
+				seen[cand] = struct{}{}
+				links = append(links, cand)
+			}
+		}
+		for _, r := range rep.Results {
+			for _, l := range r.Links {
+				addCandidate(l)
+			}
+			for _, m := range reSitemapLocURL.FindAllStringSubmatch(r.Body, 500) {
+				if len(m) > 1 {
+					addCandidate(m[1])
+				}
+			}
+			for _, m := range reMarkdownHTTPURL.FindAllStringSubmatch(r.Body, 500) {
+				if len(m) > 1 {
+					addCandidate(m[1])
+				}
+			}
+		}
+		out := map[string]any{
+			"ok":    true,
+			"url":   origin,
+			"total": len(links),
+			"links": links,
+		}
+		return stdioToolResult(id, marshalJSONNoEscapeHTML(out, "  "), false)
+
+	default:
+		isErr = true
+		errMsg = "Unknown tool: " + name
+		return map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"error":   map[string]any{"code": -32601, "message": errMsg},
+		}
+	}
 }
 
 var (
@@ -614,48 +696,64 @@ func runInstallMCP(args []string, stdout, stderr io.Writer) int {
 // Unlike `firecrawl-local` (which disables private-network SSRF protection by default in local MCP mode), EdgeFetch
 // enforces public-only dial-time SSRF protection by default unless `--allow-private` is explicitly passed.
 func runServeMode(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return runServeModeWithDeps(ctx, args, stdout, stderr, cliDeps{getenv: os.Getenv})
+}
+
+func runServeModeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	if deps.getenv == nil {
+		deps.getenv = os.Getenv
+	}
 	port := flagValue(args, "--port=")
 	if port == "" {
 		port = "3002"
 	}
 	allowPrivate := hasFlag(args, "--allow-private")
 	addr := "127.0.0.1:" + port
-	urlStr := "http://" + addr
 
-	allowFn := crawl.PublicHTTPS
-	transport := newCrawlTransport(60*time.Second, 2)
-	if allowPrivate {
-		allowFn = func(u *url.URL) error {
-			if u.Scheme != "https" && u.Scheme != "http" {
-				return fmt.Errorf("only http/https URLs permitted: %s", u.Redacted())
-			}
-			if u.User != nil {
-				return errors.New("URL with user info")
-			}
-			return nil
+	allowFn, transport := resolveCrawlPolicy(allowPrivate, 60*time.Second, 2)
+	var rt http.RoundTripper = transport
+	if !allowPrivate {
+		if deps.allow != nil {
+			allowFn = deps.allow
 		}
-		transport = newHubTransport()
+		if deps.transport != nil {
+			rt = deps.transport
+		}
 	}
 
+	ln, listenErr := net.Listen("tcp", addr)
+	if listenErr != nil {
+		_, _ = fmt.Fprintf(stderr, "serve failed: %v\n", listenErr)
+		return 1
+	}
+	boundPort := port
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
+		boundPort = strconv.Itoa(tcpAddr.Port)
+	}
+	urlStr := "http://127.0.0.1:" + boundPort
+
 	log := slog.New(slog.NewJSONHandler(stdout, nil))
-	crawler := crawl.NewCrawler(transport, allowFn, crawl.DefaultUserAgent, log)
+	crawler := crawl.NewCrawler(rt, allowFn, crawl.DefaultUserAgent, log)
+	otelExp := otel.NewExporterFromEnv(deps.getenv, "edgefetch-serve", agent.Version, newHubTransport())
+	crawler.SetOtelExporter(otelExp)
 	defer func() { _ = crawler.Close() }()
 
 	goHub := hub.NewServer(hub.Config{
 		FallbackCrawler:     crawler,
-		AllowedLoopbackPort: port,
+		AllowedLoopbackPort: boundPort,
 		Allow:               allowFn,
 		Logger:              log,
+		OtelExporter:        otelExp,
 	})
 	defer func() { _ = goHub.Close() }()
 
-	srv := newHTTPServer(addr, goHub)
+	srv := newHTTPServer(ln.Addr().String(), goHub)
 	srv.ReadTimeout = 0
 
 	errCh := make(chan error, 1)
 	go func() {
 		_, _ = fmt.Fprintf(stdout, "EdgeFetch local API server listening on %s (/v1/scrape, /v2/scrape, /v2/map, /mcp; public-only SSRF=%v)\n", urlStr, !allowPrivate)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -673,33 +771,62 @@ func runServeMode(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func runDesktopMode(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	return runDesktopModeWithDeps(ctx, args, stdout, stderr, cliDeps{getenv: os.Getenv})
+}
+
+func runDesktopModeWithDeps(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliDeps) int {
+	if deps.getenv == nil {
+		deps.getenv = os.Getenv
+	}
 	port := flagValue(args, "--port=")
 	if port == "" {
 		port = "8787"
 	}
 	noOpen := hasFlag(args, "--no-open")
 	addr := "127.0.0.1:" + port
-	urlStr := "http://" + addr
+
+	allowFn := crawl.PublicHTTPS
+	var rt http.RoundTripper = newCrawlTransport(60*time.Second, 2)
+	if deps.allow != nil {
+		allowFn = deps.allow
+	}
+	if deps.transport != nil {
+		rt = deps.transport
+	}
+
+	ln, listenErr := net.Listen("tcp", addr)
+	if listenErr != nil {
+		_, _ = fmt.Fprintf(stderr, "desktop server failed: %v\n", listenErr)
+		return 1
+	}
+	boundPort := port
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
+		boundPort = strconv.Itoa(tcpAddr.Port)
+	}
+	urlStr := "http://127.0.0.1:" + boundPort
 
 	log := slog.New(slog.NewJSONHandler(stdout, nil))
-	crawler := crawl.NewCrawler(newCrawlTransport(60*time.Second, 2), crawl.PublicHTTPS, crawl.DefaultUserAgent, log)
+	crawler := crawl.NewCrawler(rt, allowFn, crawl.DefaultUserAgent, log)
+	otelExp := otel.NewExporterFromEnv(deps.getenv, "edgefetch-desktop", agent.Version, newHubTransport())
+	crawler.SetOtelExporter(otelExp)
 	defer func() { _ = crawler.Close() }()
 
 	goHub := hub.NewServer(hub.Config{
 		FallbackCrawler:     crawler,
-		AllowedLoopbackPort: port,
-		Allow:               crawl.PublicHTTPS,
+		AllowedLoopbackPort: boundPort,
+		Allow:               allowFn,
 		Logger:              log,
+		OtelExporter:        otelExp,
 	})
 	defer func() { _ = goHub.Close() }()
 
-	srv := newHTTPServer(addr, goHub)
+	srv := newHTTPServer(ln.Addr().String(), goHub)
 	srv.ReadTimeout = 0
 
 	errCh := make(chan error, 1)
 	go func() {
 		_, _ = fmt.Fprintf(stdout, "EdgeFetch Desktop MCP Launchpad listening on %s (MCP endpoint: %s/mcp)\n", urlStr, urlStr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()

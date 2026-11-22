@@ -1,63 +1,69 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { buildSync } from 'esbuild';
+import { collectAndPrintCoverage } from './v8-coverage.mjs';
 
-const dir = mkdtempSync(join(tmpdir(), 'edgefetch-hub-test-'));
+const args = process.argv.slice(2);
+const coverageEnabled = args.includes('--coverage') || process.env.EDGEFETCH_COVERAGE === '1';
+const includeSdk = args.includes('--include-sdk');
+const jsonArg = args.find((a) => a.startsWith('--coverage-json='));
+const jsonOutPath = jsonArg ? jsonArg.slice('--coverage-json='.length) : process.env.EDGEFETCH_COVERAGE_JSON || null;
+
+function resolveRealPath(p) {
+  if (typeof realpathSync.native === 'function') {
+    try {
+      return realpathSync.native(p);
+    } catch {
+      return realpathSync(p);
+    }
+  }
+  return realpathSync(p);
+}
+
+const dir = resolveRealPath(mkdtempSync(join(tmpdir(), 'edgefetch-hub-test-')));
 const unitOutfile = join(dir, 'hub.test.mjs');
 const adaptersOutfile = join(dir, 'adapters.test.mjs');
 const agentAdvOutfile = join(dir, 'agent-advanced.test.mjs');
 const secAuditOutfile = join(dir, 'security-audit.test.mjs');
+const sdkTsTestFile = resolve('test/sdk-ts.test.ts');
+const hasSdkTsTest = existsSync(sdkTsTestFile);
+const sdkTsOutfile = join(dir, 'sdk-ts.test.mjs');
 const workerOutfile = join(dir, 'workerd-entry.mjs');
 const e2eTestFile = resolve('test/workerd.e2e.test.mjs');
 
 const textAssetLoaders = { '.sql': 'text', '.yaml': 'text', '.yml': 'text' };
+const nodeBanner = {
+  js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);",
+};
+
+function buildNodeTestBundle(entryPoint, outfile) {
+  buildSync({
+    entryPoints: [entryPoint],
+    bundle: true,
+    ...(coverageEnabled ? { treeShaking: false } : {}),
+    platform: 'node',
+    format: 'esm',
+    banner: nodeBanner,
+    alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
+    loader: textAssetLoaders,
+    sourcemap: coverageEnabled ? 'inline' : false,
+    outfile,
+  });
+}
 
 try {
-  buildSync({
-    entryPoints: ['test/hub.test.ts'],
-    bundle: true,
-    platform: 'node',
-    format: 'esm',
-    banner: { js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);" },
-    alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
-    loader: textAssetLoaders,
-    outfile: unitOutfile,
-  });
+  buildNodeTestBundle('test/hub.test.ts', unitOutfile);
+  buildNodeTestBundle('test/adapters.test.ts', adaptersOutfile);
+  buildNodeTestBundle('test/agent-advanced.test.ts', agentAdvOutfile);
+  buildNodeTestBundle('test/security-audit.test.ts', secAuditOutfile);
 
-  buildSync({
-    entryPoints: ['test/adapters.test.ts'],
-    bundle: true,
-    platform: 'node',
-    format: 'esm',
-    banner: { js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);" },
-    alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
-    loader: textAssetLoaders,
-    outfile: adaptersOutfile,
-  });
-
-  buildSync({
-    entryPoints: ['test/agent-advanced.test.ts'],
-    bundle: true,
-    platform: 'node',
-    format: 'esm',
-    banner: { js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);" },
-    alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
-    loader: textAssetLoaders,
-    outfile: agentAdvOutfile,
-  });
-
-  buildSync({
-    entryPoints: ['test/security-audit.test.ts'],
-    bundle: true,
-    platform: 'node',
-    format: 'esm',
-    banner: { js: "import { createRequire as __efCreateRequire } from 'node:module'; const require = __efCreateRequire(import.meta.url);" },
-    alias: { 'cloudflare:workers': './test/cloudflare-workers-stub.ts' },
-    loader: textAssetLoaders,
-    outfile: secAuditOutfile,
-  });
+  const nodeTestFiles = [unitOutfile, adaptersOutfile, agentAdvOutfile, secAuditOutfile];
+  if (hasSdkTsTest) {
+    buildNodeTestBundle('test/sdk-ts.test.ts', sdkTsOutfile);
+    nodeTestFiles.push(sdkTsOutfile);
+  }
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],
@@ -71,10 +77,47 @@ try {
     outfile: workerOutfile,
   });
 
-  execFileSync(process.execPath, ['--test', '--test-force-exit', unitOutfile, adaptersOutfile, agentAdvOutfile, secAuditOutfile, e2eTestFile], {
-    stdio: 'inherit',
-    env: { ...process.env, EDGEFETCH_WORKERD_BUNDLE: workerOutfile, EDGEFETCH_HUB_ROOT: resolve('.') },
-  });
+  const covDir = join(dir, 'v8-coverage');
+  if (coverageEnabled) {
+    mkdirSync(covDir, { recursive: true });
+  }
+
+  const childEnv = {
+    ...process.env,
+    EDGEFETCH_WORKERD_BUNDLE: workerOutfile,
+    EDGEFETCH_HUB_ROOT: resolve('.'),
+  };
+  if (coverageEnabled) {
+    childEnv.NODE_V8_COVERAGE = covDir;
+  }
+
+  let testErr = null;
+  try {
+    execFileSync(
+      process.execPath,
+      ['--test', '--test-force-exit', ...nodeTestFiles, e2eTestFile],
+      {
+        stdio: 'inherit',
+        env: childEnv,
+      },
+    );
+  } catch (err) {
+    testErr = err;
+  }
+
+  if (coverageEnabled) {
+    collectAndPrintCoverage({
+      hubRoot: resolve('.'),
+      bundles: nodeTestFiles,
+      covDir,
+      jsonOutPath,
+      includeSdk,
+    });
+  }
+
+  if (testErr) {
+    throw testErr;
+  }
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }

@@ -117,3 +117,353 @@ window._cf_chl_opt = { chlPageData: "demo" }; // Verify you are human</code></pr
 		}
 	})
 }
+
+func TestClassifyWAFLayer1HeadersAndBodyCaps(t *testing.T) {
+	t.Run("layer 1 header variants and negative cases", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			status   int
+			headers  http.Header
+			body     string
+			wantNil  bool
+			wantVend string
+			wantCat  string
+		}{
+			{
+				name:     "cf-mitigated whitespace defaults to challenge",
+				status:   403,
+				headers:  http.Header{"Cf-Mitigated": []string{"   "}},
+				wantVend: "cloudflare",
+				wantCat:  "challenge",
+			},
+			{
+				name:     "cf-mitigated block",
+				status:   403,
+				headers:  http.Header{"Cf-Mitigated": []string{"block"}},
+				wantVend: "cloudflare",
+				wantCat:  "waf_block",
+			},
+			{
+				name:     "aws-waf challenge",
+				status:   403,
+				headers:  http.Header{"X-Amzn-Waf-Action": []string{"challenge"}},
+				wantVend: "aws-waf",
+				wantCat:  "challenge",
+			},
+			{
+				name:     "aws-waf block",
+				status:   403,
+				headers:  http.Header{"X-Amzn-Waf-Action": []string{"block"}},
+				wantVend: "aws-waf",
+				wantCat:  "waf_block",
+			},
+			{
+				name:    "aws-waf allow does not match",
+				status:  200,
+				headers: http.Header{"X-Amzn-Waf-Action": []string{"allow"}},
+				wantNil: true,
+			},
+			{
+				name:     "vercel deny",
+				status:   403,
+				headers:  http.Header{"X-Vercel-Mitigated": []string{"deny"}},
+				wantVend: "vercel",
+				wantCat:  "waf_block",
+			},
+			{
+				name:     "vercel block",
+				status:   403,
+				headers:  http.Header{"X-Vercel-Mitigated": []string{"block"}},
+				wantVend: "vercel",
+				wantCat:  "waf_block",
+			},
+			{
+				name:     "datadome x-dd-b on 401",
+				status:   401,
+				headers:  http.Header{"X-Dd-B": []string{"1"}},
+				wantVend: "datadome",
+				wantCat:  "challenge",
+			},
+			{
+				name:    "datadome header ignored on 200",
+				status:  200,
+				headers: http.Header{"X-Datadome": []string{"protected"}},
+				wantNil: true,
+			},
+			{
+				name:     "kasada 429",
+				status:   429,
+				headers:  http.Header{"X-Kpsdk-Ct": []string{"token-abc"}},
+				wantVend: "kasada",
+				wantCat:  "challenge",
+			},
+			{
+				name:     "kasada 403",
+				status:   403,
+				headers:  http.Header{"X-Kpsdk-Ct": []string{"token-abc"}},
+				wantVend: "kasada",
+				wantCat:  "challenge",
+			},
+			{
+				name:    "kasada ignored on 200",
+				status:  200,
+				headers: http.Header{"X-Kpsdk-Ct": []string{"token-abc"}},
+				wantNil: true,
+			},
+			{
+				name:     "perimeterx x-px-blocked",
+				status:   403,
+				headers:  http.Header{"X-Px-Blocked": []string{"1"}},
+				wantVend: "perimeterx",
+				wantCat:  "challenge",
+			},
+			{
+				name:    "nil headers and empty body",
+				status:  403,
+				headers: nil,
+				body:    "",
+				wantNil: true,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got := ClassifyWAF(tc.status, tc.headers, []byte(tc.body))
+				if tc.wantNil {
+					if got != nil {
+						t.Fatalf("expected nil, got %+v", got)
+					}
+					return
+				}
+				if got == nil || got.Vendor != tc.wantVend || got.Category != tc.wantCat {
+					t.Fatalf("got %+v, want vendor=%q category=%q", got, tc.wantVend, tc.wantCat)
+				}
+			})
+		}
+	})
+
+	t.Run("body length caps and structural content vetos", func(t *testing.T) {
+		// 200 OK > 49,152 bytes exits before Layer 3 scan
+		big200 := "<title>Just a moment...</title>" + strings.Repeat("a", 50_000)
+		if got := ClassifyWAF(200, http.Header{}, []byte(big200)); got != nil {
+			t.Fatalf("expected 200 >48KiB body to skip WAF DOM scan, got %+v", got)
+		}
+
+		// Non-2xx > 98,304 bytes caps sample at 98,304 bytes
+		cleanPrefix := strings.Repeat("word ", 19_800) // 99,000 bytes
+		if got := ClassifyWAF(403, http.Header{}, []byte(cleanPrefix+"<title>Just a moment...</title>")); got != nil {
+			t.Fatalf("expected signature past 96KiB cap to be ignored, got %+v", got)
+		}
+		if got := ClassifyWAF(403, http.Header{}, []byte("<title>Just a moment...</title>"+cleanPrefix)); got == nil || got.Vendor != "cloudflare" {
+			t.Fatalf("expected signature within first 96KiB of large 403 to match cloudflare, got %+v", got)
+		}
+
+		// >= 250 plain words without <main>/<article>/<h2>/<nav>/JSON-LD triggers hasStructuralContentVeto line 73
+		prose250 := "<html><head><title>Verify you are human</title></head><body><p>" +
+			strings.Repeat("documentation ", 255) +
+			`</p><div class="cf-turnstile"></div></body></html>`
+		if got := ClassifyWAF(200, http.Header{}, []byte(prose250)); got != nil {
+			t.Fatalf("expected >=250 visibleWords veto on 200 OK, got %+v", got)
+		}
+
+		// >= 2 <h2>/<h3> subheadings and >= 100 visible words (< 250) triggers veto line 76
+		subheadingsVeto := "<html><head><title>Verify you are human</title></head><body>" +
+			"<h2>Overview</h2><h3>Details</h3><p>" + strings.Repeat("guide ", 105) +
+			`</p><div class="cf-turnstile"></div></body></html>`
+		if got := ClassifyWAF(200, http.Header{}, []byte(subheadingsVeto)); got != nil {
+			t.Fatalf("expected >=2 subheadings + >=100 words veto on 200 OK, got %+v", got)
+		}
+
+		// 120..249 plain words on 200 OK without structural vetos triggers visibleWords >= 120 guard line 184
+		words130 := "<html><head><title>Verify you are human</title></head><body><p>" +
+			strings.Repeat("article ", 130) +
+			`</p><div class="cf-turnstile"></div></body></html>`
+		if got := ClassifyWAF(200, http.Header{}, []byte(words130)); got != nil {
+			t.Fatalf("expected >=120 visibleWords on 200 OK to suppress WAF match, got %+v", got)
+		}
+	})
+}
+
+func TestClassifyWAFLayer3DOMDetectors(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		headers  http.Header
+		body     string
+		wantNil  bool
+		wantVend string
+		wantCat  string
+	}{
+		{
+			name:     "cloudflare title just a moment",
+			status:   403,
+			body:     `<html><head><title>Just a moment...</title></head><body>Loading</body></html>`,
+			wantVend: "cloudflare",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "cloudflare _cf_chl_opt + challenge-platform",
+			status:   403,
+			body:     `<html><body><script>window._cf_chl_opt={};</script><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1"></script></body></html>`,
+			wantVend: "cloudflare",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "cloudflare generic title + turnstile",
+			status:   403,
+			body:     `<html><head><title>Verify you are human</title></head><body><script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></body></html>`,
+			wantVend: "cloudflare",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "datadome geo.captcha-delivery.com without header",
+			status:   403,
+			body:     `<html><body><iframe src="https://geo.captcha-delivery.com/captcha/"></iframe></body></html>`,
+			wantVend: "datadome",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "datadome ct.captcha-delivery.com without header",
+			status:   200,
+			body:     `<html><body><script src="https://ct.captcha-delivery.com/c.js"></script></body></html>`,
+			wantVend: "datadome",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "perimeterx appId + blockScript",
+			status:   403,
+			body:     `<html><body><script>window.px={"appId":"PX12345","blockScript":"/abc/captcha.js"};</script></body></html>`,
+			wantVend: "perimeterx",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "akamai _abck cookie + 403 + edgesuite.net",
+			status:   403,
+			headers:  http.Header{"Set-Cookie": []string{"_abck=xyz; Path=/"}},
+			body:     `<html><body>Access Denied via a123.edgesuite.net</body></html>`,
+			wantVend: "akamai",
+			wantCat:  "waf_block",
+		},
+		{
+			name:     "aws-waf awswafintegration DOM without header",
+			status:   202,
+			body:     `<html><body><script>AwsWafIntegration.forceRefreshToken()</script></body></html>`,
+			wantVend: "aws-waf",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "aws-waf aws-waf-token DOM without header",
+			status:   405,
+			body:     `<html><body><div data-token="aws-waf-token"></div></body></html>`,
+			wantVend: "aws-waf",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "imperva visid_incap + incident id",
+			status:   200,
+			headers:  http.Header{"Set-Cookie": []string{"visid_incap_1=abc"}},
+			body:     `<html><body>Incapsula incident ID: 12345-67890</body></html>`,
+			wantVend: "imperva",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "fastly 403 block page with server fastly",
+			status:   403,
+			headers:  http.Header{"Server": []string{"fastly"}},
+			body:     `<html><body>Request blocked by edge policy.</body></html>`,
+			wantVend: "fastly",
+			wantCat:  "waf_block",
+		},
+		{
+			name:     "fastly 403 block page with x-served-by",
+			status:   403,
+			headers:  http.Header{"X-Served-By": []string{"cache-iad-kiad70001"}},
+			body:     `<html><body>Request blocked.</body></html>`,
+			wantVend: "fastly",
+			wantCat:  "waf_block",
+		},
+		{
+			name:    "fastly unknown domain is not WAF block",
+			status:  403,
+			headers: http.Header{"Server": []string{"fastly"}},
+			body:    `<html><body>Fastly error: unknown domain example.com. Request blocked.</body></html>`,
+			wantNil: true,
+		},
+		{
+			name:    "fastly 200 is not fastly 403 block",
+			status:  200,
+			headers: http.Header{"Server": []string{"fastly"}},
+			body:    `<html><body>Request blocked.</body></html>`,
+			wantNil: true,
+		},
+		{
+			name:     "generic title + g-recaptcha",
+			status:   403,
+			body:     `<html><head><title>Verify you are human</title></head><body><div class="g-recaptcha"></div></body></html>`,
+			wantVend: "generic",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "generic title + h-captcha",
+			status:   200,
+			body:     `<html><head><title>Human Verification</title></head><body><div class="h-captcha"></div></body></html>`,
+			wantVend: "generic",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "generic title + cf-turnstile",
+			status:   403,
+			body:     `<html><head><title>Security Check</title></head><body><div class="cf-turnstile"></div></body></html>`,
+			wantVend: "generic",
+			wantCat:  "challenge",
+		},
+		{
+			name:    "generic title + captcha >= 80 words suppressed",
+			status:  403,
+			body:    `<html><head><title>Security Check</title></head><body><p>` + strings.Repeat("word ", 85) + `</p><div class="g-recaptcha"></div></body></html>`,
+			wantNil: true,
+		},
+		{
+			name:     "generic js check checking your browser before accessing",
+			status:   200,
+			body:     `<html><body>Checking your browser before accessing example.com</body></html>`,
+			wantVend: "generic",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "generic js check please wait while we check your browser",
+			status:   200,
+			body:     `<html><body>Please wait while we check your browser...</body></html>`,
+			wantVend: "generic",
+			wantCat:  "challenge",
+		},
+		{
+			name:     "generic anubis pow interstitial",
+			status:   200,
+			body:     `<html><body>Making sure you're not a bot! Powered by Anubis.</body></html>`,
+			wantVend: "generic",
+			wantCat:  "challenge",
+		},
+		{
+			name:    "anubis mention alone does not trigger",
+			status:  200,
+			body:    `<html><body>Anubis documentation page</body></html>`,
+			wantNil: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ClassifyWAF(tc.status, tc.headers, []byte(tc.body))
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil, got %+v", got)
+				}
+				return
+			}
+			if got == nil || got.Vendor != tc.wantVend || got.Category != tc.wantCat {
+				t.Fatalf("got %+v, want vendor=%q category=%q", got, tc.wantVend, tc.wantCat)
+			}
+		})
+	}
+}

@@ -55,6 +55,7 @@ import {
 } from './jobs';
 import { computeMarkdownChanges } from './map-crawl';
 import { MARKDOWN_FOR_AGENTS_ACCEPT, validatePublicHttpsTargetUrl } from './overflow';
+import { getActiveRequestTracer, sanitizeUrlForSpan, setActiveSpanAttribute, type RequestTracer, type TraceContext } from './otel';
 import { chunkMarkdownForSearch, rankChunksInMemory } from './search-index';
 import {
   isValidSha256Hex,
@@ -2954,6 +2955,9 @@ export function extractHtmlDocument(
       });
       if (siteExtracted) {
         matchedSiteExtracted = siteExtracted;
+        if (siteExtracted.extractorId) {
+          setActiveSpanAttribute('edgefetch.adapter_id', siteExtracted.extractorId);
+        }
         md = siteExtracted.markdown;
         if (siteExtracted.title) title = siteExtracted.title;
         if (siteExtracted.description && !description) description = siteExtracted.description;
@@ -7354,7 +7358,10 @@ export async function executeScrapeCall(params: {
   source?: string;
   selfHost?: string;
   now?: number;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; body: Record<string, unknown>; via: string; retryAfter?: string }> {
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runScrape = async (): Promise<{ status: number; body: Record<string, unknown>; via: string; retryAfter?: string }> => {
   const { payload, env, executeHubFetch, source = 'scrape', selfHost, now = Date.now() } = params;
   const urlCheck = validatePublicHttpsTargetUrl(payload.url, selfHost);
   if (!urlCheck.ok) {
@@ -7588,6 +7595,7 @@ export async function executeScrapeCall(params: {
   }
 
   if (!needsLiveHtml && ocrMode !== 'always' && maxAgeMs > 0 && env.ARTIFACTS && env.META) {
+    const cacheStartMs = Date.now();
     const hit = await lookupCachedScrape({
       bucket: env.ARTIFACTS,
       metaDb: env.META,
@@ -7597,6 +7605,24 @@ export async function executeScrapeCall(params: {
       now,
     });
     if (hit) {
+      if (activeTracer) {
+        const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
+          kind: 1,
+          startTimeMs: cacheStartMs,
+          attributes: {
+            'cache.hit': true,
+            'cache.tier': 'r2-d1',
+            'cache.revalidated': false,
+            'url.full': sanitizeUrlForSpan(normalizedUrl),
+            'http.response.status_code': hit.status,
+            'edgefetch.pipeline_version': hit.pipelineVersion,
+          },
+        });
+        cacheSpan.setStatus(true);
+        cacheSpan.end();
+        activeTracer.setAttribute('edgefetch.via', 'cache:r2-d1');
+        activeTracer.setAttribute('edgefetch.cached', true);
+      }
       const fullCached = finalizeScrapedMarkdown(redactPii ? redactPiiText(hit.markdown) : hit.markdown, {
         isPdf: isLikelyPdfUrl(normalizedUrl),
         includeImages,
@@ -7878,6 +7904,7 @@ export async function executeScrapeCall(params: {
               atsMdArtifactId = `md:${mdSha}`;
             }
             const atsTitle = filteredBoard ? filteredBoard.title : formatted!.title;
+            setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
             return {
               status: 200,
               via: atsRes.via,
@@ -8174,6 +8201,7 @@ export async function executeScrapeCall(params: {
             return { markdown: sub.markdown, links: sub.links };
           });
           if (formatted && formatted.markdown.trim().length > 0) {
+            setActiveSpanAttribute('edgefetch.adapter_id', registryTwin.id, activeTracer ?? undefined);
             const rawMd = redactPii ? redactPiiText(formatted.markdown) : formatted.markdown;
             const twinShapedFull = finalizeScrapedMarkdown(rawMd, {
               isPdf: false,
@@ -8232,6 +8260,7 @@ export async function executeScrapeCall(params: {
                 markdown: twinShapedFull.markdown,
                 title: formatted.title,
                 llmConfig: twinLlmCfg,
+                ...(activeTracer ? { tracer: activeTracer } : {}),
               });
               twinSummaryOut = sumRes.summary;
             }
@@ -8257,6 +8286,7 @@ export async function executeScrapeCall(params: {
                   schema: jsonSchemaSpec.schema,
                   llmConfig: twinLlmCfg,
                   heuristicFallback: heuristic,
+                  ...(activeTracer ? { tracer: activeTracer } : {}),
                 });
                 twinJsonOut = llmJ.data;
               } else {
@@ -8522,6 +8552,7 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut) {
         return formatExternalSpaResponse(spaOut);
@@ -8623,6 +8654,7 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut) {
         return formatExternalSpaResponse(spaOut);
@@ -8745,7 +8777,27 @@ export async function executeScrapeCall(params: {
 
   // R5: `304 Not Modified` conditional revalidation hit — refresh `pages.last_fetched_at` in META D1 and serve verified R2 Markdown!
   if (item.status === 304 && revalCandidate && env.META) {
-    await touchRevalidatedPage(env.META, normalizedUrl, now);
+    if (activeTracer) {
+      await activeTracer.withSpan(
+        'cache:r2-d1',
+        {
+          kind: 1,
+          attributes: {
+            'cache.hit': true,
+            'cache.tier': 'r2-d1',
+            'cache.revalidated': true,
+            'http.response.status_code': 304,
+            'url.full': sanitizeUrlForSpan(normalizedUrl),
+            'edgefetch.pipeline_version': revalCandidate.pipelineVersion,
+          },
+        },
+        () => touchRevalidatedPage(env.META!, normalizedUrl, now),
+      );
+      activeTracer.setAttribute('edgefetch.cached', true);
+      activeTracer.setAttribute('edgefetch.revalidated', true);
+    } else {
+      await touchRevalidatedPage(env.META, normalizedUrl, now);
+    }
     const fullReval = finalizeScrapedMarkdown(
       redactPii ? redactPiiText(revalCandidate.markdown) : revalCandidate.markdown,
       { isPdf: isLikelyPdfUrl(normalizedUrl), includeImages },
@@ -8878,6 +8930,7 @@ export async function executeScrapeCall(params: {
               ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd)
               : null;
           if (stubFormatted && stubFormatted.markdown.trim().length > 0) {
+            setActiveSpanAttribute('edgefetch.adapter_id', stubAts.id, activeTracer ?? undefined);
             const stubRedirect = analyzeUrlRedirect(normalizedUrl, wdStub.redirectUrl);
             const cleanStubMd = redactPii ? redactPiiText(stubFormatted.markdown) : stubFormatted.markdown;
             const stubShaped = finalizeScrapedMarkdown(cleanStubMd, { isPdf: false, includeImages, maxChars, baseUrl: wdStub.redirectUrl });
@@ -9589,6 +9642,7 @@ export async function executeScrapeCall(params: {
         waitForMs: waitForMsOpt,
         waitSelector: waitSelectorOpt,
         noCache: Boolean(payload.noCache),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       if (spaOut && countTextWords(spaOut.markdown) > countTextWords(rawCleanMarkdown)) {
         const cleanSpaMd = redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown;
@@ -9797,6 +9851,7 @@ export async function executeScrapeCall(params: {
       markdown: rawCleanMarkdown.slice(0, 32_768),
       title: resolvedTitle,
       llmConfig: activeLlmConfig,
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     summaryOut = sumRes.summary;
   }
@@ -9861,6 +9916,7 @@ export async function executeScrapeCall(params: {
         schema: jsonSchemaSpec.schema,
         heuristicFallback: structuredJsonOut ?? {},
         llmConfig: activeLlmConfig,
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
       structuredJsonOut = llmExt.data;
     }
@@ -9928,6 +9984,9 @@ export async function executeScrapeCall(params: {
   );
 
   const extractorIdOut = customCommerceId ?? extracted?.extractorId;
+  if (extractorIdOut) {
+    setActiveSpanAttribute('edgefetch.adapter_id', extractorIdOut, activeTracer ?? undefined);
+  }
   const adapterRecordsOut = customShopifyDoc?.records ?? extracted?.records;
   const adapterPaginationOut = customShopifyDoc?.pagination ?? extracted?.pagination;
   const adapterTotalOut = customShopifyDoc?.total ?? extracted?.total;
@@ -10059,6 +10118,8 @@ export async function executeScrapeCall(params: {
   };
 
   return { status: 200, via: viaOut, body: out };
+  };
+  return activeTracer ? activeTracer.run(runScrape) : runScrape();
 }
 
 export function extractYouTubeTranscriptFromHtml(rawHtml: string): string {
@@ -10204,7 +10265,10 @@ export async function executeInteractCall(params: {
   selfHost?: string;
   principal?: string;
   sessionSigningSecret?: string;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runInteract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
   const { payload, env, executeHubFetch, source = 'interact', selfHost, principal, sessionSigningSecret } = params;
   const effectivePrincipal = normalizeInteractPrincipal(principal, source);
   const signingSecret =
@@ -10236,6 +10300,8 @@ export async function executeInteractCall(params: {
         body: { ok: false, error: 'session_principal_mismatch', message: 'interact sessionId belongs to a different caller principal' },
       };
     }
+    const resumedSessionHash = await sha256HexString(`${parsedSession.siteId.toLowerCase()}:${parsedSession.agentSessionId}`);
+    setActiveSpanAttribute('edgefetch.interact.session_hash', resumedSessionHash, activeTracer ?? undefined);
   }
   const rawUrl = typeof payload.url === 'string' ? payload.url.trim() : '';
 
@@ -10264,6 +10330,10 @@ export async function executeInteractCall(params: {
   }
   const actions: Array<Record<string, unknown>> = parsedInteractActions.actions;
   const agentActions: Array<Record<string, unknown>> = [...parsedInteractActions.actions];
+  setActiveSpanAttribute('edgefetch.interact.action_count', actions.length, activeTracer ?? undefined);
+  if (normalizedUrl) {
+    setActiveSpanAttribute('url.full', sanitizeUrlForSpan(normalizedUrl), activeTracer ?? undefined);
+  }
 
   const topWaitForMs =
     typeof payload.waitForMs === 'number' && Number.isFinite(payload.waitForMs)
@@ -10426,6 +10496,10 @@ export async function executeInteractCall(params: {
     const errSiteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
     const errActualSite = (errSiteMatch?.[1] ?? pinnedSite ?? 'default').toLowerCase();
     const errAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
+    if (errAgentSid) {
+      const errSessionHash = await sha256HexString(`${errActualSite}:${errAgentSid}`);
+      setActiveSpanAttribute('edgefetch.interact.session_hash', errSessionHash, activeTracer ?? undefined);
+    }
     const errSig = errAgentSid
       ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, errActualSite, errAgentSid)
       : undefined;
@@ -10462,6 +10536,10 @@ export async function executeInteractCall(params: {
   const siteMatch = /^agent:(?:[a-z0-9_-]+\+)*([a-z0-9_-]+)/i.exec(fetchRes.via);
   const actualSite = (siteMatch?.[1] ?? pinnedSite ?? 'default').toLowerCase();
   const returnedAgentSid = typeof item.sessionId === 'string' && item.sessionId ? item.sessionId : undefined;
+  if (returnedAgentSid) {
+    const okSessionHash = await sha256HexString(`${actualSite}:${returnedAgentSid}`);
+    setActiveSpanAttribute('edgefetch.interact.session_hash', okSessionHash, activeTracer ?? undefined);
+  }
   const sessionSig = returnedAgentSid
     ? await computeInteractSessionMacHex(signingSecret, effectivePrincipal, actualSite, returnedAgentSid)
     : undefined;
@@ -10525,4 +10603,6 @@ export async function executeInteractCall(params: {
       },
     },
   };
+  };
+  return activeTracer ? activeTracer.run(runInteract) : runInteract();
 }

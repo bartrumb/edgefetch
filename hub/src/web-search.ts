@@ -21,6 +21,15 @@
 
 import { sha256HexString } from './ingest';
 import { executeMapCall, type HubFetchExecutor } from './map-crawl';
+import {
+  getActiveRequestTracer,
+  sanitizeErrorMessageForSpan,
+  sanitizeUrlForSpan,
+  setActiveSpanAttribute,
+  type ActiveSpanHandle,
+  type RequestTracer,
+  type TraceContext,
+} from './otel';
 import { decodeHtmlEntities } from './scrape';
 import { COLLECTION_ID_RE, D1FtsSearchIndex, executeExtractCall } from './search-index';
 import type { OptionalStorageBindings } from './storage';
@@ -220,8 +229,10 @@ async function runWithProviderPoliteness<T>(
   enforcePacing: boolean,
   fn: () => Promise<T>,
 ): Promise<T> {
+  const activeTracer = getActiveRequestTracer();
+  const runInTrace = () => (activeTracer ? activeTracer.run(fn) : fn());
   if (!enforcePacing) {
-    return fn();
+    return runInTrace();
   }
   const nowCheck = Date.now();
   const cooldownUntil = providerNextAllowedAt.get(`${provider}:cooldown`) ?? 0;
@@ -250,7 +261,7 @@ async function runWithProviderPoliteness<T>(
     }
     providerNextAllowedAt.set(provider, Date.now() + minGapMs);
     try {
-      return await fn();
+      return await runInTrace();
     } catch (e) {
       if (e instanceof SearchProviderRateLimitError) {
         providerNextAllowedAt.set(`${provider}:cooldown`, Date.now() + e.retryAfterMs);
@@ -263,6 +274,36 @@ async function runWithProviderPoliteness<T>(
       providerLocks.delete(provider);
     }
   }
+}
+
+async function runWithProviderSpan<T>(params: {
+  tracer?: RequestTracer | null;
+  provider: 'serper' | 'brave' | 'tavily' | 'searxng';
+  method: 'GET' | 'POST';
+  requestUrl: string;
+  fn: (span?: ActiveSpanHandle) => Promise<T>;
+}): Promise<T> {
+  const { tracer, provider, method, requestUrl, fn } = params;
+  if (!tracer) return fn();
+  return tracer.withSpan(
+    `edgefetch.search.${provider}`,
+    {
+      kind: 3,
+      attributes: {
+        'search.provider': provider,
+        'http.request.method': method,
+        'url.full': sanitizeUrlForSpan(requestUrl),
+      },
+    },
+    async (span) => {
+      try {
+        return await fn(span);
+      } catch (err) {
+        span.setStatus(false, sanitizeErrorMessageForSpan(err, `${provider}_error`));
+        throw err;
+      }
+    },
+  );
 }
 
 export function canonicalizeSearchResultUrl(rawUrl: string): string | null {
@@ -406,64 +447,76 @@ async function querySerperWebSearch(params: {
   includeDomains: string[];
   timeRange: string;
   fetchFn: typeof fetch;
+  tracer?: RequestTracer | null;
 }): Promise<RawSearchHit[]> {
-  const { apiKey, query, includeDomains, timeRange, fetchFn } = params;
+  const { apiKey, query, includeDomains, timeRange, fetchFn, tracer } = params;
   const hasInlineSite = /\bsite:/i.test(query);
   const effectiveQuery =
     !hasInlineSite && includeDomains.length === 1 ? `site:${includeDomains[0]} ${query}` : query;
   const tbs = mapSerperTbs(timeRange);
+  const endpoint = 'https://google.serper.dev/search';
 
-  const resp = await fetchFn('https://google.serper.dev/search', {
+  return runWithProviderSpan({
+    tracer,
+    provider: 'serper',
     method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-    },
-    // Strictly cap `num: 10` so every Serper query consumes 1 credit ($0.001) instead of 2 credits!
-    body: JSON.stringify({
-      q: effectiveQuery,
-      num: 10,
-      ...(tbs ? { tbs } : {}),
-    }),
-    signal: AbortSignal.timeout(12_000),
-  });
-  if (resp.status === 429) {
-    const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
-    await resp.body?.cancel().catch(() => undefined);
-    throw new SearchProviderRateLimitError('serper', retryMs);
-  }
-  if (!resp.ok) {
-    await resp.body?.cancel().catch(() => undefined);
-    throw new Error(`serper_http_${resp.status}`);
-  }
-
-  const json = (await resp.json()) as {
-    knowledgeGraph?: { title?: string; website?: string; description?: string };
-    organic?: Array<{ link?: string; title?: string; snippet?: string }>;
-  };
-  const out: RawSearchHit[] = [];
-  if (typeof json.knowledgeGraph?.website === 'string') {
-    const canon = canonicalizeSearchResultUrl(json.knowledgeGraph.website);
-    if (canon) {
-      out.push({
-        url: canon,
-        title: cleanProviderText(json.knowledgeGraph.title) || humanizeUrlTitle(canon),
-        snippet: cleanProviderText(json.knowledgeGraph.description),
+    requestUrl: endpoint,
+    fn: async (span) => {
+      const resp = await fetchFn(endpoint, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+          'x-api-key': apiKey,
+        },
+        // Strictly cap `num: 10` so every Serper query consumes 1 credit ($0.001) instead of 2 credits!
+        body: JSON.stringify({
+          q: effectiveQuery,
+          num: 10,
+          ...(tbs ? { tbs } : {}),
+        }),
+        signal: AbortSignal.timeout(12_000),
       });
-    }
-  }
-  for (const r of json.organic ?? []) {
-    if (typeof r.link !== 'string') continue;
-    const canon = canonicalizeSearchResultUrl(r.link);
-    if (!canon) continue;
-    out.push({
-      url: canon,
-      title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
-      snippet: cleanProviderText(r.snippet),
-    });
-  }
-  return out;
+      span?.setAttribute('http.response.status_code', resp.status);
+      if (resp.status === 429) {
+        const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+        await resp.body?.cancel().catch(() => undefined);
+        throw new SearchProviderRateLimitError('serper', retryMs);
+      }
+      if (!resp.ok) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new Error(`serper_http_${resp.status}`);
+      }
+
+      const json = (await resp.json()) as {
+        knowledgeGraph?: { title?: string; website?: string; description?: string };
+        organic?: Array<{ link?: string; title?: string; snippet?: string }>;
+      };
+      const out: RawSearchHit[] = [];
+      if (typeof json.knowledgeGraph?.website === 'string') {
+        const canon = canonicalizeSearchResultUrl(json.knowledgeGraph.website);
+        if (canon) {
+          out.push({
+            url: canon,
+            title: cleanProviderText(json.knowledgeGraph.title) || humanizeUrlTitle(canon),
+            snippet: cleanProviderText(json.knowledgeGraph.description),
+          });
+        }
+      }
+      for (const r of json.organic ?? []) {
+        if (typeof r.link !== 'string') continue;
+        const canon = canonicalizeSearchResultUrl(r.link);
+        if (!canon) continue;
+        out.push({
+          url: canon,
+          title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
+          snippet: cleanProviderText(r.snippet),
+        });
+      }
+      span?.setAttribute('search.result_count', out.length);
+      return out;
+    },
+  });
 }
 
 async function queryBraveWebSearch(params: {
@@ -472,46 +525,58 @@ async function queryBraveWebSearch(params: {
   count: number;
   timeRange: string;
   fetchFn: typeof fetch;
+  tracer?: RequestTracer | null;
 }): Promise<RawSearchHit[]> {
-  const { apiKey, query, count, timeRange, fetchFn } = params;
+  const { apiKey, query, count, timeRange, fetchFn, tracer } = params;
   const u = new URL('https://api.search.brave.com/res/v1/web/search');
   u.searchParams.set('q', query);
   u.searchParams.set('count', String(Math.min(20, Math.max(1, count))));
   const freshness = mapBraveFreshness(timeRange);
   if (freshness) u.searchParams.set('freshness', freshness);
+  const requestUrl = u.toString();
 
-  const resp = await fetchFn(u.toString(), {
+  return runWithProviderSpan({
+    tracer,
+    provider: 'brave',
     method: 'GET',
-    headers: {
-      accept: 'application/json',
-      'x-subscription-token': apiKey,
+    requestUrl,
+    fn: async (span) => {
+      const resp = await fetchFn(requestUrl, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          'x-subscription-token': apiKey,
+        },
+        signal: AbortSignal.timeout(12_000),
+      });
+      span?.setAttribute('http.response.status_code', resp.status);
+      if (resp.status === 429) {
+        const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+        await resp.body?.cancel().catch(() => undefined);
+        throw new SearchProviderRateLimitError('brave', retryMs);
+      }
+      if (!resp.ok) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new Error(`brave_http_${resp.status}`);
+      }
+      const json = (await resp.json()) as {
+        web?: { results?: Array<{ url?: string; title?: string; description?: string }> };
+      };
+      const out: RawSearchHit[] = [];
+      for (const r of json.web?.results ?? []) {
+        if (typeof r.url !== 'string') continue;
+        const canon = canonicalizeSearchResultUrl(r.url);
+        if (!canon) continue;
+        out.push({
+          url: canon,
+          title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
+          snippet: cleanProviderText(r.description),
+        });
+      }
+      span?.setAttribute('search.result_count', out.length);
+      return out;
     },
-    signal: AbortSignal.timeout(12_000),
   });
-  if (resp.status === 429) {
-    const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
-    await resp.body?.cancel().catch(() => undefined);
-    throw new SearchProviderRateLimitError('brave', retryMs);
-  }
-  if (!resp.ok) {
-    await resp.body?.cancel().catch(() => undefined);
-    throw new Error(`brave_http_${resp.status}`);
-  }
-  const json = (await resp.json()) as {
-    web?: { results?: Array<{ url?: string; title?: string; description?: string }> };
-  };
-  const out: RawSearchHit[] = [];
-  for (const r of json.web?.results ?? []) {
-    if (typeof r.url !== 'string') continue;
-    const canon = canonicalizeSearchResultUrl(r.url);
-    if (!canon) continue;
-    out.push({
-      url: canon,
-      title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
-      snippet: cleanProviderText(r.description),
-    });
-  }
-  return out;
 }
 
 async function queryTavilyWebSearch(params: {
@@ -522,51 +587,64 @@ async function queryTavilyWebSearch(params: {
   excludeDomains: string[];
   timeRange: string;
   fetchFn: typeof fetch;
+  tracer?: RequestTracer | null;
 }): Promise<RawSearchHit[]> {
-  const { apiKey, query, count, includeDomains, excludeDomains, timeRange, fetchFn } = params;
+  const { apiKey, query, count, includeDomains, excludeDomains, timeRange, fetchFn, tracer } = params;
   const tr = mapStandardTimeRange(timeRange);
-  const resp = await fetchFn('https://api.tavily.com/search', {
+  const endpoint = 'https://api.tavily.com/search';
+
+  return runWithProviderSpan({
+    tracer,
+    provider: 'tavily',
     method: 'POST',
-    headers: {
-      accept: 'application/json',
-      authorization: `Bearer ${apiKey}`,
-      'content-type': 'application/json',
+    requestUrl: endpoint,
+    fn: async (span) => {
+      const resp = await fetchFn(endpoint, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          authorization: `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+        },
+        // Strictly `search_depth: "basic"` (1 credit) so fallback queries cost half of `advanced` (2 credits).
+        body: JSON.stringify({
+          query,
+          max_results: Math.min(10, Math.max(1, count)),
+          search_depth: 'basic',
+          ...(includeDomains.length > 0 ? { include_domains: includeDomains } : {}),
+          ...(excludeDomains.length > 0 ? { exclude_domains: excludeDomains } : {}),
+          ...(tr ? { time_range: tr } : {}),
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      span?.setAttribute('http.response.status_code', resp.status);
+      if (resp.status === 429) {
+        const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+        await resp.body?.cancel().catch(() => undefined);
+        throw new SearchProviderRateLimitError('tavily', retryMs);
+      }
+      if (!resp.ok) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new Error(`tavily_http_${resp.status}`);
+      }
+      const json = (await resp.json()) as {
+        results?: Array<{ url?: string; title?: string; content?: string }>;
+      };
+      const out: RawSearchHit[] = [];
+      for (const r of json.results ?? []) {
+        if (typeof r.url !== 'string') continue;
+        const canon = canonicalizeSearchResultUrl(r.url);
+        if (!canon) continue;
+        out.push({
+          url: canon,
+          title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
+          snippet: cleanProviderText(r.content),
+        });
+      }
+      span?.setAttribute('search.result_count', out.length);
+      return out;
     },
-    // Strictly `search_depth: "basic"` (1 credit) so fallback queries cost half of `advanced` (2 credits).
-    body: JSON.stringify({
-      query,
-      max_results: Math.min(10, Math.max(1, count)),
-      search_depth: 'basic',
-      ...(includeDomains.length > 0 ? { include_domains: includeDomains } : {}),
-      ...(excludeDomains.length > 0 ? { exclude_domains: excludeDomains } : {}),
-      ...(tr ? { time_range: tr } : {}),
-    }),
-    signal: AbortSignal.timeout(15_000),
   });
-  if (resp.status === 429) {
-    const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
-    await resp.body?.cancel().catch(() => undefined);
-    throw new SearchProviderRateLimitError('tavily', retryMs);
-  }
-  if (!resp.ok) {
-    await resp.body?.cancel().catch(() => undefined);
-    throw new Error(`tavily_http_${resp.status}`);
-  }
-  const json = (await resp.json()) as {
-    results?: Array<{ url?: string; title?: string; content?: string }>;
-  };
-  const out: RawSearchHit[] = [];
-  for (const r of json.results ?? []) {
-    if (typeof r.url !== 'string') continue;
-    const canon = canonicalizeSearchResultUrl(r.url);
-    if (!canon) continue;
-    out.push({
-      url: canon,
-      title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
-      snippet: cleanProviderText(r.content),
-    });
-  }
-  return out;
 }
 
 async function querySearxngSearch(params: {
@@ -575,8 +653,9 @@ async function querySearxngSearch(params: {
   count: number;
   timeRange: string;
   fetchFn: typeof fetch;
+  tracer?: RequestTracer | null;
 }): Promise<RawSearchHit[]> {
-  const { searxngBaseUrl, query, count, timeRange, fetchFn } = params;
+  const { searxngBaseUrl, query, count, timeRange, fetchFn, tracer } = params;
   const base = new URL(searxngBaseUrl);
   if (base.protocol !== 'https:' && base.protocol !== 'http:') {
     throw new Error('invalid_searxng_url');
@@ -586,36 +665,47 @@ async function querySearxngSearch(params: {
   searchUrl.searchParams.set('format', 'json');
   const tr = mapStandardTimeRange(timeRange);
   if (tr) searchUrl.searchParams.set('time_range', tr);
+  const requestUrl = searchUrl.toString();
 
-  const resp = await fetchFn(searchUrl.toString(), {
+  return runWithProviderSpan({
+    tracer,
+    provider: 'searxng',
     method: 'GET',
-    headers: { accept: 'application/json' },
-    signal: AbortSignal.timeout(12_000),
+    requestUrl,
+    fn: async (span) => {
+      const resp = await fetchFn(requestUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(12_000),
+      });
+      span?.setAttribute('http.response.status_code', resp.status);
+      if (resp.status === 429) {
+        const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
+        await resp.body?.cancel().catch(() => undefined);
+        throw new SearchProviderRateLimitError('searxng', retryMs);
+      }
+      if (!resp.ok) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new Error(`searxng_http_${resp.status}`);
+      }
+      const json = (await resp.json()) as {
+        results?: Array<{ url?: string; title?: string; content?: string }>;
+      };
+      const out: RawSearchHit[] = [];
+      for (const r of (json.results ?? []).slice(0, count * 2)) {
+        if (typeof r.url !== 'string') continue;
+        const canon = canonicalizeSearchResultUrl(r.url);
+        if (!canon) continue;
+        out.push({
+          url: canon,
+          title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
+          snippet: cleanProviderText(r.content),
+        });
+      }
+      span?.setAttribute('search.result_count', out.length);
+      return out;
+    },
   });
-  if (resp.status === 429) {
-    const retryMs = parseRetryAfterHeaderMs(resp.headers.get('retry-after'));
-    await resp.body?.cancel().catch(() => undefined);
-    throw new SearchProviderRateLimitError('searxng', retryMs);
-  }
-  if (!resp.ok) {
-    await resp.body?.cancel().catch(() => undefined);
-    throw new Error(`searxng_http_${resp.status}`);
-  }
-  const json = (await resp.json()) as {
-    results?: Array<{ url?: string; title?: string; content?: string }>;
-  };
-  const out: RawSearchHit[] = [];
-  for (const r of (json.results ?? []).slice(0, count * 2)) {
-    if (typeof r.url !== 'string') continue;
-    const canon = canonicalizeSearchResultUrl(r.url);
-    if (!canon) continue;
-    out.push({
-      url: canon,
-      title: cleanProviderText(r.title) || humanizeUrlTitle(canon),
-      snippet: cleanProviderText(r.content),
-    });
-  }
-  return out;
 }
 
 const initializedSearchCacheDbs = new WeakSet<D1Database>();
@@ -715,7 +805,10 @@ export async function executeSearchCall(params: {
   executeHubFetch: HubFetchExecutor;
   providerFetchFn?: typeof fetch;
   source?: string;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runSearchCall = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
   const { payload, env, executeHubFetch, source = 'search' } = params;
   const providerFetchFn = params.providerFetchFn ?? fetch;
   const enforcePacing = params.providerFetchFn === undefined;
@@ -830,10 +923,17 @@ export async function executeSearchCall(params: {
     if (!hasD1Search || requestedCollections.length === 0) return;
     const idx = new D1FtsSearchIndex(env.SEARCH!);
     const ftsQuery = edgeMapSpec.filterTerms || query;
+    const collTracer = getActiveRequestTracer() ?? activeTracer;
     await Promise.all(
-      requestedCollections.slice(0, 5).map(async (coll) => {
-        try {
-          const hits = await idx.searchCollection({ collectionId: coll, query: ftsQuery, limit: maxResults * 3 });
+      requestedCollections.slice(0, 5).map((coll) => {
+        const execColl = async () => {
+          try {
+            const hits = await idx.searchCollection({
+              collectionId: coll,
+              query: ftsQuery,
+              limit: maxResults * 3,
+              ...(collTracer ? { tracer: collTracer } : {}),
+            });
           const seenCollUrls = new Set<string>();
           const filteredItems: RawSearchHit[] = [];
           for (const h of hits) {
@@ -863,6 +963,8 @@ export async function executeSearchCall(params: {
         } catch {
           // Ignore empty/uninitialized collection tables
         }
+        };
+        return collTracer ? collTracer.run(execColl) : execColl();
       }),
     );
   };
@@ -870,9 +972,11 @@ export async function executeSearchCall(params: {
   // Tier 0b ($0): Direct HAOS Edge-Node Domain Map (`/llms.txt` + `/sitemap.xml`) when 1-2 domains are targeted!
   const runEdgeMapSearch = async () => {
     if (!canEdgeMap) return;
+    const mapTracer = getActiveRequestTracer() ?? activeTracer;
     const mapTargets = edgeMapSpec.siteUrls.length > 0 ? edgeMapSpec.siteUrls : edgeMapSpec.domains.map((d) => `https://${d}/`);
     await Promise.all(
-      mapTargets.map(async (targetMapUrl) => {
+      mapTargets.map((targetMapUrl) => {
+        const execMap = async () => {
         const domain = (() => {
           try {
             return new URL(targetMapUrl).hostname;
@@ -892,6 +996,7 @@ export async function executeSearchCall(params: {
             },
             executeHubFetch,
             source: `${source}:edge-map`,
+            ...(mapTracer ? { tracer: mapTracer } : {}),
           });
           if (mapOut.status === 200 && Array.isArray(mapOut.body.entries) && mapOut.body.entries.length > 0) {
             const queryTokens = [
@@ -941,6 +1046,8 @@ export async function executeSearchCall(params: {
         } catch (e) {
           providerErrors.push({ provider: `edge-map:${domain}`, error: e instanceof Error ? e.message : String(e) });
         }
+        };
+        return mapTracer ? mapTracer.run(execMap) : execMap();
       }),
     );
   };
@@ -972,17 +1079,35 @@ export async function executeSearchCall(params: {
           )
         : '';
 
+    const cacheStartMs = Date.now();
     const cachedExternal = cacheKey && env.META ? await readCachedExternalLists(env.META, cacheKey, now) : null;
     if (cachedExternal && cachedExternal.length > 0) {
       for (const list of cachedExternal) {
         externalLists.push(list);
       }
       externalVia.push(`cache:d1(${cachedExternal.map((c) => c.provider).join('+')})`);
+      const extTracer = getActiveRequestTracer() ?? activeTracer;
+      if (extTracer) {
+        const cacheSpan = extTracer.startSpan('edgefetch.search.cache', {
+          kind: 1,
+          startTimeMs: cacheStartMs,
+          attributes: {
+            'db.system': 'sqlite',
+            'cache.hit': true,
+            'cache.tier': 'd1-search-cache',
+            'search.cache.providers': cachedExternal.map((c) => c.provider).join(','),
+            'search.hit_count': cachedExternal.reduce((acc, c) => acc + c.items.length, 0),
+          },
+        });
+        cacheSpan.setStatus(true);
+        cacheSpan.end();
+      }
       return;
     }
 
     const freshExternal: Array<{ provider: string; items: RawSearchHit[] }> = [];
     const minSatisfiedHits = Math.min(3, maxResults);
+    const providerTracer = getActiveRequestTracer() ?? activeTracer;
 
     const callSerper = async () => {
       if (!hasSerper) return;
@@ -994,6 +1119,7 @@ export async function executeSearchCall(params: {
             includeDomains,
             timeRange,
             fetchFn: providerFetchFn,
+            tracer: providerTracer,
           }),
         );
         freshExternal.push({ provider: 'serper', items });
@@ -1012,6 +1138,7 @@ export async function executeSearchCall(params: {
             count: maxResults * 2,
             timeRange,
             fetchFn: providerFetchFn,
+            tracer: providerTracer,
           }),
         );
         freshExternal.push({ provider: 'brave', items });
@@ -1030,6 +1157,7 @@ export async function executeSearchCall(params: {
             count: maxResults * 2,
             timeRange,
             fetchFn: providerFetchFn,
+            tracer: providerTracer,
           }),
         );
         freshExternal.push({ provider: 'searxng', items });
@@ -1065,6 +1193,7 @@ export async function executeSearchCall(params: {
             excludeDomains,
             timeRange,
             fetchFn: providerFetchFn,
+            tracer: providerTracer,
           }),
         );
         freshExternal.push({ provider: 'tavily', items });
@@ -1251,6 +1380,7 @@ export async function executeSearchCall(params: {
       env,
       executeHubFetch,
       source: `${source}:enrich`,
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
     if (extractOut.status === 200 && Array.isArray(extractOut.body.results)) {
       via = `${via}+${extractOut.via}`;
@@ -1268,16 +1398,24 @@ export async function executeSearchCall(params: {
     }
   }
 
+  const cachedFlag = Boolean(viaParts.some((v) => v.startsWith('cache:d1')));
+  setActiveSpanAttribute('search.mode', waterfallMode ? 'waterfall' : 'rrf', activeTracer ?? undefined);
+  setActiveSpanAttribute('search.query_length', query.length, activeTracer ?? undefined);
+  setActiveSpanAttribute('search.cached', cachedFlag, activeTracer ?? undefined);
+  setActiveSpanAttribute('search.result_count', results.length, activeTracer ?? undefined);
+
   return {
     status: 200,
     via,
     body: {
       ok: true,
       query,
-      cached: Boolean(viaParts.some((v) => v.startsWith('cache:d1'))),
+      cached: cachedFlag,
       results,
       ...(unhonoredOptions.length > 0 ? { unhonoredOptions } : {}),
       ...(providerErrors.length > 0 ? { providerErrors } : {}),
     },
   };
+  };
+  return activeTracer ? activeTracer.run(runSearchCall) : runSearchCall();
 }

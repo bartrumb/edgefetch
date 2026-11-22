@@ -15,6 +15,7 @@ import { SITE_ID_PATTERN } from './auth';
 import { filterSafeResponseHeaders } from './framework-detect';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
+import { getActiveRequestTracer, type RequestTracer } from './otel';
 import { validatePublicHttpsTargetUrl } from './overflow';
 import { readBodyTextCapped } from './safe-input';
 import { classifyWafAndChallenge, refineBlockedInfo } from './waf';
@@ -222,6 +223,7 @@ export interface McpServerDeps {
     limit?: number;
   }) => Promise<{ ok: true; hits: Array<Record<string, unknown>> } | { ok: false; status: number; error: string }>;
   scheduleBackground?: (promise: Promise<unknown>) => void;
+  tracer?: RequestTracer;
   allowedOrigins?: readonly string[];
   selfHost?: string;
 }
@@ -1849,7 +1851,31 @@ async function dispatchRpcMessage(
         await finishMcpTurn();
         return { body: jsonRpcError(id, -32602, 'Missing tool name') };
       }
-      const out = await handleToolCall(toolName, rawArgs, scopes, principal, deps);
+      const activeTracer = deps.tracer ?? getActiveRequestTracer();
+      const invokeTool = () => handleToolCall(toolName, rawArgs, scopes, principal, deps);
+      const out = activeTracer
+        ? await activeTracer.withSpan(
+            'edgefetch.mcp.tool',
+            {
+              kind: 1,
+              attributes: {
+                'rpc.system': 'jsonrpc',
+                'rpc.method': 'tools/call',
+                'mcp.tool.name': toolName,
+                'mcp.auth.type': authType,
+                'mcp.principal': principal,
+                'mcp.protocol_version': isModern ? '2026-07-28' : DEFAULT_PROTOCOL_VERSION,
+              },
+            },
+            async (span) => {
+              const res = await invokeTool();
+              const isErr = Boolean(res.isError);
+              span.setAttribute('mcp.is_error', isErr);
+              if (isErr) span.setStatus(false, 'mcp_tool_error');
+              return res;
+            },
+          )
+        : await invokeTool();
       const safeLogArgs: Record<string, unknown> = {};
       if (typeof rawArgs.url === 'string') safeLogArgs.url = redactUrlForLog(rawArgs.url);
       if (Array.isArray(rawArgs.urls)) {

@@ -44,6 +44,24 @@ export default {
       await stub.__testAbort().catch(() => undefined);
       return Response.json({ aborted: true });
     }
+    if (url.pathname === '/__test_migrate' && request.method === 'POST') {
+      const { metaSql, searchSql } = (await request.json()) as { metaSql?: string; searchSql?: string };
+      const splitStatements = (sql: string) =>
+        sql
+          .replace(/\r\n/g, '\n')
+          .split(/\n\s*\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+      if (metaSql && env.META) {
+        const meta = env.META as D1Database;
+        for (const s of splitStatements(metaSql)) await meta.prepare(s).run();
+      }
+      if (searchSql && env.SEARCH) {
+        const search = env.SEARCH as D1Database;
+        for (const s of splitStatements(searchSql)) await search.prepare(s).run();
+      }
+      return Response.json({ migrated: true });
+    }
     if (url.pathname === '/__test_s4_idempotency' && request.method === 'POST') {
       const storageEnv = env as unknown as OptionalStorageBindings;
       const sampleReply = JSON.stringify({

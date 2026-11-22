@@ -80,6 +80,10 @@ jobs:
         working-directory: hub
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.27.x'
+          cache: true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
@@ -88,15 +92,59 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run build:portable
       - run: npm run adapter:test
-      - run: npm test
+      - name: Run Hub, Miniflare workerd E2E & TypeScript SDK tests with V8 coverage
+        run: node scripts/run-tests.mjs --coverage --include-sdk
       - run: npm run type-check
       - run: npm run deploy:dry
+      - name: Run Deno Deploy Hub OTLP & SafeFetch smoke tests (SHA-256 verified Deno v2.2.4)
+        run: |
+          set -euo pipefail
+          tmp_dir=$(mktemp -d)
+          trap 'rm -rf "$tmp_dir"' EXIT
+          curl -fsSL -o "$tmp_dir/deno.zip" https://github.com/denoland/deno/releases/download/v2.2.4/deno-x86_64-unknown-linux-gnu.zip
+          echo "9a260a624cab6e61f7603957f94f638d68739d8c6ac8c38bc337521266603a7c  $tmp_dir/deno.zip" | sha256sum -c -
+          python3 -m zipfile -e "$tmp_dir/deno.zip" "$tmp_dir"
+          chmod +x "$tmp_dir/deno"
+          node --input-type=module -e '
+            import { buildSync } from "esbuild";
+            buildSync({
+              entryPoints: ["test/deno-server.test.ts"],
+              bundle: true,
+              platform: "node",
+              target: "es2022",
+              format: "esm",
+              banner: { js: "import { createRequire as __efCR } from \"node:module\"; const require = __efCR(import.meta.url);" },
+              alias: { "cloudflare:workers": "./portable/cloudflare-shim.ts" },
+              loader: { ".sql": "text", ".yaml": "text", ".yml": "text" },
+              external: ["node:*"],
+              outfile: process.argv[1],
+            });
+          ' "$tmp_dir/deno-server.test.mjs"
+          "$tmp_dir/deno" test --no-check -A "$tmp_dir/deno-server.test.mjs"
       - name: Run Extraction & Token-Efficiency Fidelity Benchmark
         working-directory: .
         run: node bench/run-bench.mjs
       - name: Run Python SDK unit tests
         working-directory: sdk/py
         run: python3 test_edgefetch_client.py
+      - name: Run Cross-Process Full-Stack OTLP & RFC 9421 E2E
+        working-directory: .
+        run: node --test --test-force-exit test/fullstack-otel.e2e.mjs
+      - name: Run Opaque-Box Requirement E2E Audit Matrix
+        working-directory: .
+        run: node --test --test-force-exit test/e2e-audit-matrix.test.mjs
+      - name: Verify Home Assistant Add-on CHANGELOG.md sync & version header
+        working-directory: .
+        run: |
+          if ! cmp -s CHANGELOG.md edgefetch_fat/CHANGELOG.md; then
+            echo "ERROR: edgefetch_fat/CHANGELOG.md is out of sync with root CHANGELOG.md (run: cp CHANGELOG.md edgefetch_fat/CHANGELOG.md)"
+            exit 1
+          fi
+          ha_ver=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' edgefetch_fat/config.yaml)
+          if ! grep -Fq "## [${ha_ver}]" edgefetch_fat/CHANGELOG.md; then
+            echo "ERROR: edgefetch_fat/CHANGELOG.md is missing release heading '## [${ha_ver}]' for config.yaml version ${ha_ver}"
+            exit 1
+          fi
 
   docker-multiarch:
     name: Verify Multi-Arch Distroless Builds (amd64 & arm64)

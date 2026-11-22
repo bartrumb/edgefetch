@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
 	"math"
 	"net"
 	"net/url"
@@ -322,76 +323,79 @@ func ParseDeclarativeYAMLManifest(raw []byte) (*DeclarativeAdapterManifest, erro
 
 func loadRegistry() *declarativeRegistry {
 	regOnce.Do(func() {
-		reg := &declarativeRegistry{
-			byHost: make(map[string][]*DeclarativeAdapterManifest),
-		}
-		entries, err := embeddedManifestFS.ReadDir("manifests")
-		if err != nil {
-			regInitErr = err
-			defaultReg = reg
-			return
-		}
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-		seenIDs := make(map[string]bool)
-		for _, ent := range entries {
-			if ent.IsDir() {
-				continue
-			}
-			nameLower := strings.ToLower(ent.Name())
-			isYAML := strings.HasSuffix(nameLower, ".yaml") || strings.HasSuffix(nameLower, ".yml")
-			isJSON := strings.HasSuffix(nameLower, ".json")
-			if !isYAML && !isJSON {
-				continue
-			}
-			raw, rErr := embeddedManifestFS.ReadFile("manifests/" + ent.Name())
-			if rErr != nil {
-				regInitErr = rErr
-				continue
-			}
-			var m *DeclarativeAdapterManifest
-			var pErr error
-			if isYAML {
-				m, pErr = ParseDeclarativeYAMLManifest(raw)
-			} else {
-				m, pErr = ParseDeclarativeManifest(raw)
-			}
-			if pErr != nil {
-				regInitErr = fmt.Errorf("%s: %w", ent.Name(), pErr)
-				continue
-			}
-			if seenIDs[m.ID] {
-				regInitErr = fmt.Errorf("duplicate declarative manifest id %q", m.ID)
-				continue
-			}
-			seenIDs[m.ID] = true
-			reg.manifests = append(reg.manifests, m)
-			reg.summaries = append(reg.summaries, DeclarativeAdapterSummary{
-				ID:              m.ID,
-				Name:            m.Name,
-				Category:        m.Category,
-				Description:     m.Description,
-				Modes:           []string{"twin"},
-				Domains:         append([]string(nil), m.Domains...),
-				UniversalEngine: false,
-				ExampleURLs:     append([]string(nil), m.ExampleURLs...),
-			})
-			for _, d := range m.Domains {
-				pat := strings.ToLower(strings.TrimSpace(d))
-				if pat == "" {
-					continue
-				}
-				if strings.HasPrefix(pat, "*.") && !strings.Contains(pat[2:], "*") {
-					reg.wildcards = append(reg.wildcards, declarativeWildcard{kind: "suffix", pattern: pat[1:], adapter: m})
-				} else if strings.HasSuffix(pat, ".*") && !strings.Contains(pat[:len(pat)-2], "*") {
-					reg.wildcards = append(reg.wildcards, declarativeWildcard{kind: "prefix", pattern: pat[:len(pat)-1], adapter: m})
-				} else {
-					reg.byHost[pat] = append(reg.byHost[pat], m)
-				}
-			}
-		}
-		defaultReg = reg
+		defaultReg, regInitErr = loadRegistryFromFS(embeddedManifestFS)
 	})
 	return defaultReg
+}
+
+func loadRegistryFromFS(fsys fs.ReadDirFS) (*declarativeRegistry, error) {
+	reg := &declarativeRegistry{
+		byHost: make(map[string][]*DeclarativeAdapterManifest),
+	}
+	entries, err := fsys.ReadDir("manifests")
+	if err != nil {
+		return reg, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	var initErr error
+	seenIDs := make(map[string]bool)
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		nameLower := strings.ToLower(ent.Name())
+		isYAML := strings.HasSuffix(nameLower, ".yaml") || strings.HasSuffix(nameLower, ".yml")
+		isJSON := strings.HasSuffix(nameLower, ".json")
+		if !isYAML && !isJSON {
+			continue
+		}
+		raw, rErr := fs.ReadFile(fsys, "manifests/"+ent.Name())
+		if rErr != nil {
+			initErr = rErr
+			continue
+		}
+		var m *DeclarativeAdapterManifest
+		var pErr error
+		if isYAML {
+			m, pErr = ParseDeclarativeYAMLManifest(raw)
+		} else {
+			m, pErr = ParseDeclarativeManifest(raw)
+		}
+		if pErr != nil {
+			initErr = fmt.Errorf("%s: %w", ent.Name(), pErr)
+			continue
+		}
+		if seenIDs[m.ID] {
+			initErr = fmt.Errorf("duplicate declarative manifest id %q", m.ID)
+			continue
+		}
+		seenIDs[m.ID] = true
+		reg.manifests = append(reg.manifests, m)
+		reg.summaries = append(reg.summaries, DeclarativeAdapterSummary{
+			ID:              m.ID,
+			Name:            m.Name,
+			Category:        m.Category,
+			Description:     m.Description,
+			Modes:           []string{"twin"},
+			Domains:         append([]string(nil), m.Domains...),
+			UniversalEngine: false,
+			ExampleURLs:     append([]string(nil), m.ExampleURLs...),
+		})
+		for _, d := range m.Domains {
+			pat := strings.ToLower(strings.TrimSpace(d))
+			if pat == "" {
+				continue
+			}
+			if strings.HasPrefix(pat, "*.") && !strings.Contains(pat[2:], "*") {
+				reg.wildcards = append(reg.wildcards, declarativeWildcard{kind: "suffix", pattern: pat[1:], adapter: m})
+			} else if strings.HasSuffix(pat, ".*") && !strings.Contains(pat[:len(pat)-2], "*") {
+				reg.wildcards = append(reg.wildcards, declarativeWildcard{kind: "prefix", pattern: pat[:len(pat)-1], adapter: m})
+			} else {
+				reg.byHost[pat] = append(reg.byHost[pat], m)
+			}
+		}
+	}
+	return reg, initErr
 }
 
 // ListDeclarativeAdapters returns metadata summaries for all embedded declarative site adapters.
@@ -476,6 +480,10 @@ func FindDeclarativeAdapters(query, category string, limit int) []DeclarativeAda
 
 // ResolveDeclarativeTwin checks if `rawURL` matches any embedded declarative adapter and returns its 1-hop twin descriptor.
 func ResolveDeclarativeTwin(rawURL string) (*DeclarativeTwinMatch, bool) {
+	return resolveDeclarativeTwinWithRegistry(loadRegistry(), rawURL)
+}
+
+func resolveDeclarativeTwinWithRegistry(reg *declarativeRegistry, rawURL string) (*DeclarativeTwinMatch, bool) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || u.Scheme != "https" || u.User != nil {
 		return nil, false
@@ -484,7 +492,6 @@ func ResolveDeclarativeTwin(rawURL string) (*DeclarativeTwinMatch, bool) {
 	if host == "" {
 		return nil, false
 	}
-	reg := loadRegistry()
 	var candidates []*DeclarativeAdapterManifest
 	seen := make(map[*DeclarativeAdapterManifest]bool)
 	for _, a := range reg.byHost[host] {

@@ -74,6 +74,7 @@ type Config struct {
 	Logger              *slog.Logger
 	DispatchTimeout     time.Duration
 	MaxArtifactMemory   int
+	OtelExporter        *otel.Exporter
 }
 
 type agentSession struct {
@@ -240,6 +241,9 @@ func (s *Server) Close() error {
 	for _, sess := range sessions {
 		_ = sess.conn.Close(websocket.StatusGoingAway, "hub_shutdown")
 	}
+	if s.cfg.OtelExporter != nil {
+		_ = s.cfg.OtelExporter.Close()
+	}
 	return nil
 }
 
@@ -326,8 +330,74 @@ func (s *Server) handleBotTransparencyRoutes(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *statusResponseWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.status = code
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.status = http.StatusOK
+		w.wroteHeader = true
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func requestFullURL(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	if r.URL.IsAbs() {
+		return r.URL.String()
+	}
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	host := r.Host
+	if host == "" {
+		return r.URL.Path
+	}
+	return scheme + "://" + host + r.URL.RequestURI()
+}
+
 // ServeHTTP routes control-plane (`/agent/*`) and caller-plane (`/health`, `/agents`, `/fetch`, `/v1/*`, `/mcp`) requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rootTC := otel.ExtractOrNew(r.Header)
+	w.Header().Set("X-Trace-Id", rootTC.TraceID)
+	w.Header().Set("Traceparent", otel.FormatTraceparent(rootTC))
+	r = r.WithContext(otel.WithTraceContext(r.Context(), rootTC))
+
+	if r.URL.Path == "/agent/ws" {
+		s.handleAgentWS(w, r)
+		return
+	}
+
+	sw := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
+	httpSpan := otel.StartSpan(s.cfg.OtelExporter, rootTC, "edgefetch.http", 2, map[string]any{
+		"http.request.method": r.Method,
+		"url.path":            r.URL.Path,
+		"url.full":            otel.SanitizeURL(requestFullURL(r)),
+	})
+	defer func() {
+		httpSpan.SetAttribute("http.response.status_code", sw.status)
+		httpSpan.End(sw.status >= 200 && sw.status < 400, "")
+	}()
+	w = sw
+
 	switch {
 	case (r.URL.Path == "/health" || r.URL.Path == "/healthz") && r.Method == http.MethodGet:
 		s.mu.Lock()
@@ -339,10 +409,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case (r.URL.Path == "/.well-known/http-message-signatures-directory" || r.URL.Path == "/.well-known/edgefetch-bot.json") &&
 		(r.Method == http.MethodGet || r.Method == http.MethodHead):
 		s.handleBotTransparencyRoutes(w, r)
-		return
-
-	case r.URL.Path == "/agent/ws":
-		s.handleAgentWS(w, r)
 		return
 
 	case strings.HasPrefix(r.URL.Path, "/agent/artifacts/") && r.Method == http.MethodPut:
@@ -912,6 +978,19 @@ func (s *Server) ListAgents() map[string]any {
 	}
 }
 
+func cloneHeaderWithTrace(src http.Header, traceMap map[string]string) http.Header {
+	dst := http.Header{}
+	if src != nil {
+		dst = src.Clone()
+	}
+	for k, v := range traceMap {
+		if v != "" {
+			dst.Set(k, v)
+		}
+	}
+	return dst
+}
+
 // DispatchOrFallback routes `call` to a connected WebSocket agent (failing over on 429/disconnect), or falls back to
 // the Hub's in-process `FallbackCrawler` when `target` is `"auto"` or `"container"`.
 func (s *Server) DispatchOrFallback(
@@ -923,13 +1002,38 @@ func (s *Server) DispatchOrFallback(
 	if target == "" {
 		target = "auto"
 	}
-	tc := otel.ExtractOrNew(traceHdr)
-	traceMap := map[string]string{
-		"traceparent":  otel.FormatTraceparent(tc),
-		"x-trace-id":   tc.TraceID,
-		"x-span-id":    tc.SpanID,
-		"x-request-id": firstNonEmpty(traceHdr.Get("x-request-id"), tc.SpanID),
+	if _, hasParent := otel.TraceContextFromContext(ctx); !hasParent {
+		ctx = otel.WithTraceContext(ctx, otel.ExtractOrNew(traceHdr))
 	}
+	dispAttrs := map[string]any{
+		"crawler.target":   target,
+		"crawler.requests": len(call.Requests),
+	}
+	if len(call.Requests) > 0 {
+		dispAttrs["url.full"] = otel.SanitizeURL(call.Requests[0].URL)
+	}
+	dispCtx, dispSpan, dispTC := otel.StartChildSpan(ctx, s.cfg.OtelExporter, "edgefetch.dispatch", 3, dispAttrs)
+	defer func() {
+		dispSpan.SetAttribute("crawler.via", via)
+		dispSpan.SetAttribute("http.response.status_code", status)
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		dispSpan.End(err == nil && status >= 200 && status < 400, errMsg)
+	}()
+
+	reqID := ""
+	if traceHdr != nil {
+		reqID = traceHdr.Get("x-request-id")
+	}
+	traceMap := map[string]string{
+		"traceparent":  otel.FormatTraceparent(dispTC),
+		"x-trace-id":   dispTC.TraceID,
+		"x-span-id":    dispTC.SpanID,
+		"x-request-id": firstNonEmpty(reqID, dispTC.SpanID),
+	}
+	derivedHdr := cloneHeaderWithTrace(traceHdr, traceMap)
 
 	needsBrowser := false
 	primaryHost := ""
@@ -954,7 +1058,7 @@ func (s *Server) DispatchOrFallback(
 				break
 			}
 			triedSites[sess.siteID] = true
-			rep, dispErr := s.dispatchToSession(ctx, sess, call, traceMap)
+			rep, dispErr := s.dispatchToSession(dispCtx, sess, call, traceMap)
 			if dispErr != nil {
 				if preferredSite != "" {
 					break
@@ -966,7 +1070,10 @@ func (s *Server) DispatchOrFallback(
 			}
 			// If agent hit HTTP 429/403 stop and another peer exists, fail over automatically!
 			if replyHitStopOrChallenge(rep) && preferredSite == "" {
-				if s.pickAgent(primaryHost, "", needsBrowser, triedSites) != nil {
+				if next := s.pickAgent(primaryHost, "", needsBrowser, triedSites); next != nil {
+					next.mu.Lock()
+					next.busy = false
+					next.mu.Unlock()
 					continue
 				}
 				if !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
@@ -986,7 +1093,7 @@ func (s *Server) DispatchOrFallback(
 	// Tailscale / WireGuard Peer-to-Peer Egress Handoff (`EDGEFETCH_PEERS`):
 	// When local agents hit 429/challenge (or before local fallback if local fallback hits 429), forward 1 hop to healthy peers.
 	if lastAgentReply != nil && !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
-		if peerRep, peerVia, ok := s.tryPeerHandoff(ctx, call, primaryHost, traceMap); ok {
+		if peerRep, peerVia, ok := s.tryPeerHandoff(dispCtx, call, primaryHost, traceMap); ok {
 			return peerRep, peerVia, http.StatusOK, nil
 		}
 		return *lastAgentReply, lastAgentVia, http.StatusOK, nil
@@ -994,15 +1101,15 @@ func (s *Server) DispatchOrFallback(
 
 	if s.cfg.FallbackCrawler == nil {
 		if !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
-			if peerRep, peerVia, ok := s.tryPeerHandoff(ctx, call, primaryHost, traceMap); ok {
+			if peerRep, peerVia, ok := s.tryPeerHandoff(dispCtx, call, primaryHost, traceMap); ok {
 				return peerRep, peerVia, http.StatusOK, nil
 			}
 		}
 		return crawl.FetchReply{}, "hub", http.StatusServiceUnavailable, errors.New("no remote agents connected and local fallback crawler disabled")
 	}
-	rep := crawl.ExecuteCallWithTrace(ctx, s.cfg.FallbackCrawler, call, traceHdr, crawl.CallLogger(s.log, traceHdr), nil)
+	rep := crawl.ExecuteCallWithTrace(dispCtx, s.cfg.FallbackCrawler, call, derivedHdr, crawl.CallLogger(s.log, derivedHdr), nil)
 	if replyHitStopOrChallenge(rep) && !alreadyHopped && len(s.cfg.PeerURLs) > 0 {
-		if peerRep, peerVia, ok := s.tryPeerHandoff(ctx, call, primaryHost, traceMap); ok {
+		if peerRep, peerVia, ok := s.tryPeerHandoff(dispCtx, call, primaryHost, traceMap); ok {
 			return peerRep, peerVia, http.StatusOK, nil
 		}
 	}
@@ -1295,6 +1402,9 @@ type scrapePayload struct {
 }
 
 func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.Header) (map[string]any, string, int) {
+	if _, ok := otel.TraceContextFromContext(ctx); !ok {
+		ctx = otel.WithTraceContext(ctx, otel.ExtractOrNew(hdr))
+	}
 	u := strings.TrimSpace(p.URL)
 	if u == "" {
 		return map[string]any{"ok": false, "error": "missing_url"}, "hub", http.StatusBadRequest
@@ -1354,7 +1464,14 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 						},
 					},
 				}
-				if twinRep, twinVia, _, dErr := s.DispatchOrFallback(ctx, twinCall, p.Target, p.Site, hdr); dErr == nil && len(twinRep.Results) > 0 {
+				twinCtx, twinSpan, _ := otel.StartChildSpan(ctx, s.cfg.OtelExporter, "edgefetch.hub.twin", 1, map[string]any{
+					"edgefetch.adapter_id": firstNonEmpty(twin.AdapterID, twin.ID),
+					"url.full":             otel.SanitizeURL(twin.FetchURL),
+				})
+				twinVia := ""
+				twinErrMsg := ""
+				if twinRep, viaStr, _, dErr := s.DispatchOrFallback(twinCtx, twinCall, p.Target, p.Site, hdr); dErr == nil && len(twinRep.Results) > 0 {
+					twinVia = viaStr
 					tRes := twinRep.Results[0]
 					if tRes.Status == http.StatusOK && tRes.Outcome == classify.OutcomeOK {
 						bodyBytes, decErr := tRes.DecodeBody()
@@ -1414,10 +1531,20 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 							if doc.PublishedTime != "" {
 								out["publishedTime"] = doc.PublishedTime
 							}
+							twinSpan.SetAttribute("edgefetch.twin.hit", true)
+							twinSpan.SetAttribute("crawler.via", twinVia)
+							twinSpan.End(true, "")
 							return out, twinVia, http.StatusOK
 						}
 					}
+				} else if dErr != nil {
+					twinErrMsg = dErr.Error()
 				}
+				twinSpan.SetAttribute("edgefetch.twin.hit", false)
+				if twinVia != "" {
+					twinSpan.SetAttribute("crawler.via", twinVia)
+				}
+				twinSpan.End(false, twinErrMsg)
 			}
 		}
 	}
@@ -1573,8 +1700,8 @@ func (s *Server) handleCallerMap(w http.ResponseWriter, r *http.Request, v2Envel
 		MaxSeconds: 30,
 		Options:    crawl.Options{Concurrency: 2, IncludeBody: true, RespectRobots: crawl.Bool(true)},
 		Requests: []crawl.Request{
-			{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText},
-			{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText},
+			{ID: "llms", URL: origin + "/llms.txt", Kind: classify.KindText, Accept: "text/plain"},
+			{ID: "sitemap", URL: origin + "/sitemap.xml", Kind: classify.KindText, Accept: "application/xml"},
 			{ID: "home", URL: parsedURL.String(), Kind: classify.KindScrape, Formats: []string{"links"}},
 		},
 	}
@@ -1745,9 +1872,13 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		toolCtx, toolSpan, _ := otel.StartChildSpan(r.Context(), s.cfg.OtelExporter, "edgefetch.mcp.tool", 1, map[string]any{
+			"mcp.tool.name": callParams.Name,
+		})
 		switch callParams.Name {
 		case "list_agents":
 			txt, _ := json.MarshalIndent(s.ListAgents(), "", "  ")
+			toolSpan.End(true, "")
 			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), false))
 			return
 		case "find_extractors":
@@ -1764,14 +1895,29 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 				"runtime":    "go-declarative",
 				"extractors": matches,
 			}, "", "  ")
+			toolSpan.End(true, "")
 			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), false))
 			return
 		case "scrape":
 			var sp scrapePayload
 			_ = json.Unmarshal(callParams.Arguments, &sp)
-			out, _, status := s.executeScrape(r.Context(), sp, r.Header)
+			if sp.URL != "" {
+				toolSpan.SetAttribute("url.full", otel.SanitizeURL(sp.URL))
+			}
+			out, _, status := s.executeScrape(toolCtx, sp, r.Header)
 			txt, _ := json.MarshalIndent(out, "", "  ")
 			isErr := status >= 400 || out["ok"] == false
+			errMsg := ""
+			if isErr {
+				if pStr, ok := out["problem"].(string); ok && pStr != "" {
+					errMsg = pStr
+				} else if eStr, ok := out["error"].(string); ok && eStr != "" {
+					errMsg = eStr
+				} else {
+					errMsg = "scrape failed"
+				}
+			}
+			toolSpan.End(!isErr, errMsg)
 			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), isErr))
 			return
 		case "fetch_url":
@@ -1781,6 +1927,9 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 				Target string `json:"target"`
 			}
 			_ = json.Unmarshal(callParams.Arguments, &fp)
+			if fp.URL != "" {
+				toolSpan.SetAttribute("url.full", otel.SanitizeURL(fp.URL))
+			}
 			k := classify.Kind(fp.Kind)
 			if k == "" {
 				k = classify.KindScrape
@@ -1791,18 +1940,22 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 				Requests:   []crawl.Request{{ID: "mcp-1", URL: strings.TrimSpace(fp.URL), Kind: k}},
 			}
 			if code, msg, ok := crawl.ValidateCall(fc, s.allow); !ok {
+				toolSpan.End(false, code+": "+msg)
 				writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, code+": "+msg, true))
 				return
 			}
-			rep, via, _, err := s.DispatchOrFallback(r.Context(), fc, fp.Target, "", r.Header)
+			rep, via, _, err := s.DispatchOrFallback(toolCtx, fc, fp.Target, "", r.Header)
 			if err != nil {
+				toolSpan.End(false, err.Error())
 				writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, err.Error(), true))
 				return
 			}
+			toolSpan.End(true, "")
 			txt, _ := json.MarshalIndent(map[string]any{"via": via, "reply": rep}, "", "  ")
 			writeJSON(w, http.StatusOK, mcpTextResult(rpc.ID, string(txt), false))
 			return
 		default:
+			toolSpan.End(false, "unknown tool: "+callParams.Name)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"jsonrpc": "2.0",
 				"id":      rpc.ID,

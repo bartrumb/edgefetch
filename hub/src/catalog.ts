@@ -18,6 +18,7 @@ import {
 } from './extractors/registry';
 import { buildBlockedInfo, type BlockedSuggestion } from './jobs';
 import { isSafePublicHostname } from './overflow';
+import { getActiveRequestTracer, type OtelEnvConfig, type RequestTracer, type TraceContext } from './otel';
 import type { OptionalStorageBindings } from './storage';
 
 export type CatalogRunStatus = 'running' | 'cooling_down' | 'complete' | 'partial' | 'challenged';
@@ -119,6 +120,7 @@ export interface CatalogHubFetchParams {
   maxBytes?: number;
   target?: unknown;
   site?: unknown;
+  tracer?: RequestTracer | TraceContext;
 }
 
 export type CatalogHubFetchFn = (args: CatalogHubFetchParams) => Promise<unknown>;
@@ -896,8 +898,10 @@ export async function executeCatalogCall(params: {
   principal?: string;
   ctx?: { waitUntil?: (promise: Promise<unknown>) => void };
   sleepFn?: (ms: number) => Promise<void>;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { payload, env, executeHubFetch } = params;
+  const activeTracer = getActiveRequestTracer(params.tracer);
   const sleep = params.sleepFn ?? defaultSleep;
 
   const existingId =
@@ -1017,7 +1021,12 @@ export async function executeCatalogCall(params: {
     else ACTIVE_CATALOG_BY_PRINCIPAL.set(principalKey, curCount - 1);
   };
 
+  const wantAsync = payload.sync === false && typeof params.ctx?.waitUntil === 'function';
   let activeSpec: CatalogSpec = initialAdapter.catalog;
+  if (!wantAsync || rawPlatform !== 'auto' || initialPlatform === 'woocommerce') {
+    activeTracer?.setAttribute('edgefetch.adapter_id', activeSpec.platform);
+  }
+  activeTracer?.setAttribute('edgefetch.catalog.sync', payload.sync !== false);
   const reqPause = typeof payload.pauseMs === 'number' && Number.isFinite(payload.pauseMs) ? Math.floor(payload.pauseMs) : activeSpec.pauseMs;
   const computeEffectivePauseMs = (spec: CatalogSpec): number =>
     Math.min(30_000, Math.max(spec.platform === 'shopify' ? 2000 : spec.pauseMs, reqPause));
@@ -1056,7 +1065,8 @@ export async function executeCatalogCall(params: {
 
   await persistCatalogRun(env, currentEntry);
 
-  const runPull = async (): Promise<CatalogStatusSummary> => {
+  const runPull = async (pullTracer?: RequestTracer | TraceContext): Promise<CatalogStatusSummary> => {
+    const resolvedPullTracer = getActiveRequestTracer(pullTracer);
     try {
     const byProductId = new Map<string, CatalogRecord>();
     const bytesByProductId = new Map<string, number>();
@@ -1091,14 +1101,17 @@ export async function executeCatalogCall(params: {
       let pageResp: NormalizedHubPageResponse | null = null;
 
       while (true) {
-        const rawFetchOut = await executeHubFetch({
-          url: currentUrl,
-          kind: 'json',
-          accept: 'application/json',
-          maxBytes: 16_777_216,
-          ...(payload.target !== undefined ? { target: payload.target } : {}),
-          ...(payload.site !== undefined ? { site: payload.site } : {}),
-        }).catch((err: unknown) => ({
+        const callFetchPage = () =>
+          executeHubFetch({
+            url: currentUrl!,
+            kind: 'json',
+            accept: 'application/json',
+            maxBytes: 16_777_216,
+            ...(payload.target !== undefined ? { target: payload.target } : {}),
+            ...(payload.site !== undefined ? { site: payload.site } : {}),
+            ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
+          });
+        const rawFetchOut = await (resolvedPullTracer ? resolvedPullTracer.run(callFetchPage) : callFetchPage()).catch((err: unknown) => ({
           status: 0,
           outcome: 'network_error',
           problem: err instanceof Error ? err.message : String(err),
@@ -1196,6 +1209,7 @@ export async function executeCatalogCall(params: {
         const wcAdapter = getCatalogAdapter('woocommerce');
         if (wcAdapter?.catalog) {
           activeSpec = wcAdapter.catalog;
+          resolvedPullTracer?.setAttribute('edgefetch.adapter_id', activeSpec.platform);
           effectivePauseMs = computeEffectivePauseMs(activeSpec);
           currentEntry.summary.platform = activeSpec.platform;
           currentEntry.summary.pauseMs = effectivePauseMs;
@@ -1225,6 +1239,7 @@ export async function executeCatalogCall(params: {
           const wcAdapter = getCatalogAdapter('woocommerce');
           if (wcAdapter?.catalog) {
             activeSpec = wcAdapter.catalog;
+            resolvedPullTracer?.setAttribute('edgefetch.adapter_id', activeSpec.platform);
             effectivePauseMs = computeEffectivePauseMs(activeSpec);
             currentEntry.summary.platform = activeSpec.platform;
             currentEntry.summary.pauseMs = effectivePauseMs;
@@ -1314,13 +1329,16 @@ export async function executeCatalogCall(params: {
     // Optional lightweight `robots.txt` check for Shopify UCP / MCP endpoint advertisement
     let ucpMeta: CatalogUcpMetadata | undefined;
     if (finalStatus === 'complete' || pagesRead > 0) {
-      const robotsOut = await executeHubFetch({
-        url: `${parsedUrl.origin}/robots.txt`,
-        kind: 'text',
-        accept: 'text/plain',
-        ...(payload.target !== undefined ? { target: payload.target } : {}),
-        ...(payload.site !== undefined ? { site: payload.site } : {}),
-      }).catch(() => null);
+      const callRobotsCheck = () =>
+        executeHubFetch({
+          url: `${parsedUrl.origin}/robots.txt`,
+          kind: 'text',
+          accept: 'text/plain',
+          ...(payload.target !== undefined ? { target: payload.target } : {}),
+          ...(payload.site !== undefined ? { site: payload.site } : {}),
+          ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
+        });
+      const robotsOut = await (resolvedPullTracer ? resolvedPullTracer.run(callRobotsCheck) : callRobotsCheck()).catch(() => null);
       const normRobots = normalizeHubPageResponse(robotsOut);
       if (normRobots && normRobots.status === 200 && normRobots.body) {
         ucpMeta = discoverUcpEndpointFromRobots(parsedUrl.origin, normRobots.body) ?? undefined;
@@ -1393,22 +1411,48 @@ export async function executeCatalogCall(params: {
       currentEntry.retainedBytes = accumulatedBytes;
     }
     await persistCatalogRun(env, currentEntry);
+    resolvedPullTracer?.setAttribute('edgefetch.catalog.status', finalStatus);
+    resolvedPullTracer?.setAttribute('edgefetch.catalog.pages_read', pagesRead);
+    resolvedPullTracer?.setAttribute('edgefetch.catalog.products', finalRecords.length);
     return finalSummary;
     } finally {
       releaseConcurrencySlot();
     }
   };
 
-  const wantAsync = payload.sync === false && typeof params.ctx?.waitUntil === 'function';
   if (wantAsync) {
-    params.ctx!.waitUntil!(runPull());
+    const runWithTrace = () => {
+      const execPull = () =>
+        activeTracer
+          ? activeTracer.withSpan(
+              'edgefetch.catalog.run',
+              {
+                kind: 1,
+                attributes: {
+                  'edgefetch.adapter_id': activeSpec.platform,
+                  'edgefetch.catalog.sync': false,
+                },
+              },
+              (_runSpan, runTracer) => runPull(runTracer),
+            )
+          : runPull();
+      return execPull().finally(async () => {
+        if (activeTracer && env) {
+          const otelEnv = env as OtelEnvConfig & { SAFE_FETCH?: typeof fetch };
+          await activeTracer
+            .flush({ env: otelEnv, ...(otelEnv.SAFE_FETCH ? { fetchFn: otelEnv.SAFE_FETCH } : {}) })
+            .catch(() => false);
+        }
+      });
+    };
+    params.ctx!.waitUntil!(runWithTrace());
     return {
       status: 202,
       body: { ...currentEntry.summary },
     };
   }
 
-  const completedSummary = await runPull();
+  const completedSummary = await (activeTracer ? activeTracer.run(() => runPull(activeTracer)) : runPull());
   return {
     status: 200,
     body: { ...completedSummary },

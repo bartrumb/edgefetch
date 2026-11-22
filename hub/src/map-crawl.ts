@@ -5,6 +5,7 @@
 
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloudflare:workers';
 import { isSafePublicHostname } from './overflow';
+import { getActiveRequestTracer, sanitizeUrlForSpan, type RequestTracer, type TraceContext } from './otel';
 import {
   asciiLower,
   compileSafeUserRegex,
@@ -290,8 +291,10 @@ export async function executeMapCall(params: {
   executeHubFetch: HubFetchExecutor;
   selfHost?: string;
   source?: string;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
   const { payload, executeHubFetch, selfHost, source = 'map' } = params;
+  const activeTracer = getActiveRequestTracer(params.tracer);
   const check = validatePublicHttpsUrl(payload.url, selfHost);
   if (!check.ok) {
     return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: check.message } };
@@ -356,18 +359,20 @@ export async function executeMapCall(params: {
     );
   }
 
-  const seedRes = await executeHubFetch(
-    target,
-    JSON.stringify({
-      maxSeconds: fastEdgeMap ? 10 : 30,
-      options: { includeBody: true, respectRobots: true, pauseMs: 250, pauseJitterMs: 0 },
-      requests: seedRequests,
-    }),
-    site,
-    source,
-    'off',
-    false,
-  );
+  const callSeed = () =>
+    executeHubFetch(
+      target,
+      JSON.stringify({
+        maxSeconds: fastEdgeMap ? 10 : 30,
+        options: { includeBody: true, respectRobots: true, pauseMs: 250, pauseJitterMs: 0 },
+        requests: seedRequests,
+      }),
+      site,
+      source,
+      'off',
+      false,
+    );
+  const seedRes = await (activeTracer ? activeTracer.run(callSeed) : callSeed());
   if (seedRes.status !== 200) {
     return { status: seedRes.status, via: seedRes.via, body: { ok: false, error: 'map_fetch_failed' } };
   }
@@ -608,23 +613,25 @@ export async function executeMapCall(params: {
       .map((x) => x.url);
 
     if (toFetchSitemaps.length > 0 && (Boolean(searchFilter) || pathHintTokens.length > 0 || discovered.size < limit)) {
-      const subRes = await executeHubFetch(
-        target,
-        JSON.stringify({
-          maxSeconds: 25,
-          options: { includeBody: true, respectRobots: true, pauseMs: 200, pauseJitterMs: 0 },
-          requests: toFetchSitemaps.map((u, idx) => ({
-            id: `csm-${idx}`,
-            url: u,
-            kind: 'text',
-            accept: 'application/xml',
-          })),
-        }),
-        site,
-        `${source}:child-sitemaps`,
-        'off',
-        false,
-      );
+      const callSub = () =>
+        executeHubFetch(
+          target,
+          JSON.stringify({
+            maxSeconds: 25,
+            options: { includeBody: true, respectRobots: true, pauseMs: 200, pauseJitterMs: 0 },
+            requests: toFetchSitemaps.map((u, idx) => ({
+              id: `csm-${idx}`,
+              url: u,
+              kind: 'text',
+              accept: 'application/xml',
+            })),
+          }),
+          site,
+          `${source}:child-sitemaps`,
+          'off',
+          false,
+        );
+      const subRes = await (activeTracer ? activeTracer.run(callSub) : callSub());
       if (subRes.status === 200) {
         const subParsed = JSON.parse(subRes.bodyText) as { results?: Array<Record<string, unknown>> };
         for (const sr of subParsed.results ?? []) {
@@ -901,6 +908,7 @@ export async function deliverSignedWebhook(params: {
   data: Record<string, unknown>;
   selfHost?: string;
   fetchFn?: typeof fetch;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ delivered: boolean; status?: number }> {
   const { webhook, defaultSecret, event, crawlId, data, selfHost, fetchFn = fetch } = params;
   if (Array.isArray(webhook.events) && webhook.events.length > 0 && !webhook.events.includes(event)) {
@@ -911,40 +919,69 @@ export async function deliverSignedWebhook(params: {
     return { delivered: false };
   }
 
-  const tsSec = Math.floor(Date.now() / 1000);
-  const bodyJson = JSON.stringify({
-    event,
-    crawlId,
-    timestamp: tsSec,
-    ...(webhook.metadata ? { metadata: webhook.metadata } : {}),
-    data,
-  });
-
   const signingSecret = (webhook.secret ?? defaultSecret ?? '').trim();
-  const headers = new Headers({
-    'content-type': 'application/json',
-    'user-agent': 'EdgeFetch-Webhook/2.0',
-    'x-edgefetch-event': event,
-    'x-edgefetch-timestamp': String(tsSec),
-  });
-  if (signingSecret) {
-    const sigHex = await signWebhookPayload(signingSecret, tsSec, bodyJson);
-    headers.set('x-edgefetch-signature', `sha256=${sigHex}`);
-  }
+  const activeTracer = getActiveRequestTracer(params.tracer);
 
-  try {
-    const res = await fetchFn(urlCheck.url.toString(), {
-      method: 'POST',
-      headers,
-      body: bodyJson,
-      redirect: 'manual',
-      signal: AbortSignal.timeout(10_000),
+  const runDelivery = async (): Promise<{ delivered: boolean; status?: number }> => {
+    const tsSec = Math.floor(Date.now() / 1000);
+    const bodyJson = JSON.stringify({
+      event,
+      crawlId,
+      timestamp: tsSec,
+      ...(webhook.metadata ? { metadata: webhook.metadata } : {}),
+      data,
     });
-    await res.body?.cancel().catch(() => undefined);
-    return { delivered: res.status >= 200 && res.status < 300, status: res.status };
-  } catch {
-    return { delivered: false };
+
+    const headers = new Headers({
+      'content-type': 'application/json',
+      'user-agent': 'EdgeFetch-Webhook/2.0',
+      'x-edgefetch-event': event,
+      'x-edgefetch-timestamp': String(tsSec),
+    });
+    if (signingSecret) {
+      const sigHex = await signWebhookPayload(signingSecret, tsSec, bodyJson);
+      headers.set('x-edgefetch-signature', `sha256=${sigHex}`);
+    }
+
+    try {
+      const res = await fetchFn(urlCheck.url.toString(), {
+        method: 'POST',
+        headers,
+        body: bodyJson,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(10_000),
+      });
+      await res.body?.cancel().catch(() => undefined);
+      return { delivered: res.status >= 200 && res.status < 300, status: res.status };
+    } catch {
+      return { delivered: false };
+    }
+  };
+
+  if (!activeTracer) {
+    return runDelivery();
   }
+  return activeTracer.withSpan(
+    'edgefetch.webhook',
+    {
+      kind: 3,
+      attributes: {
+        'webhook.event': event,
+        'crawl.id': crawlId,
+        'url.full': sanitizeUrlForSpan(urlCheck.url.toString()),
+        'webhook.signed': Boolean(signingSecret),
+      },
+    },
+    async (whSpan) => {
+      const out = await runDelivery();
+      if (out.status !== undefined) {
+        whSpan.setAttribute('http.response.status_code', out.status);
+      }
+      whSpan.setAttribute('webhook.delivered', out.delivered);
+      whSpan.setStatus(out.delivered);
+      return out;
+    },
+  );
 }
 
 export interface CrawlJobOptions {
@@ -1160,7 +1197,10 @@ export async function executeCrawlJob(params: {
   webhookFetchFn?: typeof fetch;
   waitUntilBounded?: boolean;
   maxRuntimeMs?: number;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: 'completed' | 'cancelled' | 'failed'; fetchedCount: number; failedCount: number; discoveredCount: number }> {
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runCrawl = async (): Promise<{ status: 'completed' | 'cancelled' | 'failed'; fetchedCount: number; failedCount: number; discoveredCount: number }> => {
   const { crawlId, rootUrl, options, env, executeHubFetch, selfHost } = params;
   const envFetch = env as { SAFE_PUBLIC_FETCH?: typeof fetch; SAFE_FETCH?: typeof fetch };
   const webhookFetchFn = params.webhookFetchFn ?? envFetch.SAFE_PUBLIC_FETCH ?? envFetch.SAFE_FETCH;
@@ -1197,6 +1237,7 @@ export async function executeCrawlJob(params: {
       data: { rootUrl, limit: options.limit, maxDepth: options.maxDepth },
       selfHost,
       ...(webhookFetchFn ? { fetchFn: webhookFetchFn } : {}),
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     });
   }
 
@@ -1215,6 +1256,7 @@ export async function executeCrawlJob(params: {
       executeHubFetch,
       selfHost,
       source: `crawl-sitemap:${crawlId}`,
+      ...(activeTracer ? { tracer: activeTracer } : {}),
     }).catch(() => null);
     const seedLinks = Array.isArray(mapSeed?.body?.links) ? (mapSeed!.body.links as string[]) : [];
     for (const sl of seedLinks) {
@@ -1265,16 +1307,18 @@ export async function executeCrawlJob(params: {
         })),
       };
 
-      const fetchOut = await executeHubFetch(
-        options.target,
-        JSON.stringify(call),
-        options.site,
-        `crawl:${crawlId}`,
-        retention,
-        true,
-        options.collectionId,
-        crawlId,
-      );
+      const callWaveFetch = () =>
+        executeHubFetch(
+          options.target,
+          JSON.stringify(call),
+          options.site,
+          `crawl:${crawlId}`,
+          retention,
+          true,
+          options.collectionId,
+          crawlId,
+        );
+      const fetchOut = await (activeTracer ? activeTracer.run(callWaveFetch) : callWaveFetch());
 
       if (fetchOut.status !== 200) {
         failedCount += wave.length;
@@ -1327,6 +1371,7 @@ export async function executeCrawlJob(params: {
               },
               selfHost,
               ...(webhookFetchFn ? { fetchFn: webhookFetchFn } : {}),
+              ...(activeTracer ? { tracer: activeTracer } : {}),
             });
           }
 
@@ -1438,6 +1483,7 @@ export async function executeCrawlJob(params: {
         data: { rootUrl, discoveredCount: visited.size, fetchedCount, failedCount, collectionId: options.collectionId },
         selfHost,
         ...(webhookFetchFn ? { fetchFn: webhookFetchFn } : {}),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
     }
 
@@ -1458,10 +1504,13 @@ export async function executeCrawlJob(params: {
         data: { rootUrl, error: e instanceof Error ? e.message : String(e) },
         selfHost,
         ...(webhookFetchFn ? { fetchFn: webhookFetchFn } : {}),
+        ...(activeTracer ? { tracer: activeTracer } : {}),
       });
     }
     return { status: 'failed', fetchedCount, failedCount, discoveredCount: visited.size };
   }
+  };
+  return activeTracer ? activeTracer.run(runCrawl) : runCrawl();
 }
 
 export async function getCrawlJobStatus(params: {
@@ -1810,8 +1859,10 @@ export async function startOrExecuteBatchScrape(params: {
   selfHost?: string;
   executeScrape: (scrapePayload: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
   waitUntil?: (p: Promise<unknown>) => void;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ ok: true; status: number; job: BatchScrapeJobRecord } | { ok: false; status: number; error: string; message: string }> {
   const { payload, selfHost, executeScrape, waitUntil } = params;
+  const activeTracer = getActiveRequestTracer(params.tracer);
   if (!Array.isArray(payload.urls) || payload.urls.length === 0) {
     return { ok: false, status: 400, error: 'missing_urls', message: 'urls must be a non-empty array of public https:// URLs' };
   }
@@ -1862,14 +1913,17 @@ export async function startOrExecuteBatchScrape(params: {
   }
   inMemoryBatchJobs.set(batchId, job);
 
-  const runBatch = async () => {
+  const runBatchCore = async () => {
     for (let i = 0; i < validUrls.length; i += concurrency) {
       if (job.status === 'cancelled') break;
       const chunk = validUrls.slice(i, i + concurrency);
       const results = await Promise.all(
-        chunk.map(async (u) => {
-          const out = await executeScrape({ ...sharedScrapeOpts, url: u });
-          return { u, out };
+        chunk.map((u) => {
+          const runOne = async () => {
+            const out = await executeScrape({ ...sharedScrapeOpts, url: u });
+            return { u, out };
+          };
+          return activeTracer ? activeTracer.run(runOne) : runOne();
         }),
       );
       for (const { u, out } of results) {
@@ -1891,6 +1945,7 @@ export async function startOrExecuteBatchScrape(params: {
       job.updatedAt = Date.now();
     }
   };
+  const runBatch = () => (activeTracer ? activeTracer.run(runBatchCore) : runBatchCore());
 
   if (payload.sync === true || !waitUntil) {
     await runBatch();

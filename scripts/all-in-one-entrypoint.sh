@@ -1,6 +1,63 @@
 #!/bin/sh
 set -eu
 
+validate_otel_endpoint() {
+  _val="${1:-}"
+  [ -n "$_val" ] || return 1
+  _clean="$(printf '%sX' "$_val" | LC_ALL=C tr -d '\001-\040\177')"
+  [ "$_clean" = "${_val}X" ] || return 1
+  case "$_val" in
+    stdout|stderr) return 0 ;;
+    http://*|https://*)
+      _rest="${_val#https://}"
+      [ "$_rest" = "$_val" ] && _rest="${_val#http://}"
+      _host="${_rest%%[/?#]*}"
+      [ -n "$_host" ] && return 0
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_otel_headers() {
+  _raw="${1:-}"
+  [ -n "$_raw" ] || return 1
+  _clean="$(printf '%sX' "$_raw" | LC_ALL=C tr -d '\001-\037\177')"
+  [ "$_clean" = "${_raw}X" ] || return 1
+  case "$_raw" in
+    ,*|*,|*,,*) return 1 ;;
+  esac
+  _rest="$_raw"
+  while :; do
+    case "$_rest" in
+      *,*)
+        _item="${_rest%%,*}"
+        _rest="${_rest#*,}"
+        ;;
+      *)
+        _item="$_rest"
+        _rest=""
+        ;;
+    esac
+    case "$_item" in
+      *=*) ;;
+      *) return 1 ;;
+    esac
+    _key="${_item%%=*}"
+    while :; do case "$_key" in ' '*) _key="${_key# }" ;; *) break ;; esac; done
+    while :; do case "$_key" in *' ') _key="${_key% }" ;; *) break ;; esac; done
+    [ -n "$_key" ] || return 1
+    _bad_key="$(printf '%s' "$_key" | LC_ALL=C tr -d 'A-Za-z0-9!#$%&*+.^_`|~\047-')"
+    [ -z "$_bad_key" ] || return 1
+    [ -n "$_rest" ] || break
+  done
+  return 0
+}
+
+if [ "${EDGEFETCH_ENTRYPOINT_LIB_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 PORT="${PORT:-8787}"
 export PORT
 
@@ -77,10 +134,23 @@ if [ "${EDGEFETCH_DISABLE_LOCAL_AGENT:-0}" != "1" ]; then
     EDGEFETCH_REQUIRE_BROWSER_SANDBOX="${EDGEFETCH_REQUIRE_BROWSER_SANDBOX:-}" \
     EDGEFETCH_USER_AGENT="${EDGEFETCH_USER_AGENT:-}" \
     EDGEFETCH_PAUSE_MS="${EDGEFETCH_PAUSE_MS:-}" \
-    EDGEFETCH_PAUSE_JITTER_MS="${EDGEFETCH_PAUSE_JITTER_MS:-}" \
-    OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+    EDGEFETCH_PAUSE_JITTER_MS="${EDGEFETCH_PAUSE_JITTER_MS:-}"
   [ -n "${TZ:-}" ] && set -- "$@" TZ="$TZ"
   [ -n "${SSL_CERT_FILE:-}" ] && set -- "$@" SSL_CERT_FILE="$SSL_CERT_FILE"
+  if [ -n "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]; then
+    if validate_otel_endpoint "$OTEL_EXPORTER_OTLP_ENDPOINT"; then
+      set -- "$@" OTEL_EXPORTER_OTLP_ENDPOINT="$OTEL_EXPORTER_OTLP_ENDPOINT"
+    else
+      echo "WARN: ignoring invalid OTEL_EXPORTER_OTLP_ENDPOINT for isolated worker" >&2
+    fi
+  fi
+  if [ -n "${OTEL_EXPORTER_OTLP_HEADERS:-}" ]; then
+    if validate_otel_headers "$OTEL_EXPORTER_OTLP_HEADERS"; then
+      set -- "$@" OTEL_EXPORTER_OTLP_HEADERS="$OTEL_EXPORTER_OTLP_HEADERS"
+    else
+      echo "WARN: ignoring invalid OTEL_EXPORTER_OTLP_HEADERS for isolated worker" >&2
+    fi
+  fi
 
   if [ "$CUR_UID" = "0" ]; then
     su-exec 65532:65532 env -i "$@" /usr/local/bin/edgefetch --mode=agent &

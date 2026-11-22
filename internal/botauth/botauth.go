@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -68,7 +69,11 @@ func ComputeJWKThumbprint(pub ed25519.PublicKey) (string, error) {
 
 // GenerateKeyPair mints a new cryptographically random Ed25519 keypair for RFC 9421 Web Bot Auth.
 func GenerateKeyPair() (KeyPair, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	return generateKeyPair(rand.Reader)
+}
+
+func generateKeyPair(rng io.Reader) (KeyPair, error) {
+	pub, priv, err := ed25519.GenerateKey(rng)
 	if err != nil {
 		return KeyPair{}, err
 	}

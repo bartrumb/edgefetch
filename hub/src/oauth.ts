@@ -8,6 +8,7 @@
  * revocation in `/admin`.
  */
 import { callerToken, isValidSecretMatch, MIN_TOKEN_LENGTH, sameBytes } from './auth';
+import { getActiveRequestTracer, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 
 export const MCP_SCOPES = ['crawl:read', 'crawl:fetch'] as const;
@@ -1299,6 +1300,22 @@ export interface OAuthHandlerDeps {
  * Handles all RFC 9728 / RFC 8414 / RFC 7591 / OAuth 2.1 routes (`/.well-known/*` and `/oauth/*`).
  * Returns `null` when `url.pathname` is not an OAuth/discovery route.
  */
+type OAuthAuditSpan = Pick<ActiveSpanHandle, 'setAttribute' | 'setAttributes' | 'setStatus'>;
+const NOOP_OAUTH_AUDIT_SPAN: OAuthAuditSpan = {
+  setAttribute() {},
+  setAttributes() {},
+  setStatus() {},
+};
+
+async function withOAuthAuditSpan<T>(
+  op: 'register' | 'authorize' | 'token' | 'refresh' | 'revoke',
+  fn: (span: OAuthAuditSpan) => Promise<T>,
+): Promise<T> {
+  const tracer = getActiveRequestTracer();
+  if (!tracer) return fn(NOOP_OAUTH_AUDIT_SPAN);
+  return tracer.withSpan(`edgefetch.oauth.${op}`, { kind: 1, attributes: { 'oauth.op': op } }, (span) => fn(span));
+}
+
 export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHandlerDeps): Promise<Response | null> {
   const path = url.pathname;
   const isDiscovery =
@@ -1359,411 +1376,563 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
     );
   }
 
-  if (!deps.ownerSecret || deps.ownerSecret.length < MIN_TOKEN_LENGTH) {
+  const ownerSecret = deps.ownerSecret;
+  if (!ownerSecret || ownerSecret.length < MIN_TOKEN_LENGTH) {
     return oauthJson({ error: 'server_error', error_description: 'Owner token secret is not configured on hub' }, 503, cors);
   }
 
   // 3. RFC 7591 Dynamic Client Registration (`POST /oauth/register`)
   if (path === '/oauth/register') {
-    if (request.method !== 'POST') return oauthJson({ error: 'method_not_allowed' }, 405, cors);
-    const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
-    const regLock = await deps.store.checkAuthLockout(`reg:${clientIp}`, now, REGISTER_RATE_LIMIT_MAX);
-    if (!regLock.allowed) {
-      await request.body?.cancel().catch(() => undefined);
-      return oauthJson(
-        { error: 'too_many_requests', error_description: 'Too many client registrations from this IP' },
-        429,
-        { ...cors, 'retry-after': String(regLock.retryAfterSec) },
-      );
-    }
-    const regCount = await deps.store.recordAuthFailure(`reg:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, REGISTER_RATE_LIMIT_MAX);
-    if (!regCount.allowed) {
-      await request.body?.cancel().catch(() => undefined);
-      return oauthJson(
-        { error: 'too_many_requests', error_description: 'Too many client registrations from this IP' },
-        429,
-        { ...cors, 'retry-after': String(regCount.retryAfterSec) },
-      );
-    }
-    const cappedBody = await readBodyTextCapped(request, 16_384);
-    if (!cappedBody.ok) return oauthJson({ error: 'invalid_client_metadata' }, 413, cors);
-    const bodyText = cappedBody.text;
-    let body: { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
-    try {
-      body = JSON.parse(bodyText) as { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
-    } catch {
-      return oauthJson({ error: 'invalid_client_metadata', error_description: 'Invalid JSON' }, 400, cors);
-    }
-    if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0 || body.redirect_uris.length > 10) {
-      return oauthJson({ error: 'invalid_redirect_uri', error_description: 'redirect_uris must be a 1-10 item array' }, 400, cors);
-    }
-    const redirectUris: string[] = [];
-    for (const u of body.redirect_uris) {
-      if (typeof u !== 'string' || !isValidRedirectUri(u, origin, deps.redirectAllowlist)) {
+    return withOAuthAuditSpan('register', async (span) => {
+      if (request.method !== 'POST') {
+        span.setAttributes({ 'oauth.outcome': 'method_not_allowed', 'http.response.status_code': 405 });
+        span.setStatus(false, 'method_not_allowed');
+        return oauthJson({ error: 'method_not_allowed' }, 405, cors);
+      }
+      const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
+      const regLock = await deps.store.checkAuthLockout(`reg:${clientIp}`, now, REGISTER_RATE_LIMIT_MAX);
+      if (!regLock.allowed) {
+        await request.body?.cancel().catch(() => undefined);
+        span.setAttributes({ 'oauth.outcome': 'rate_limited', 'http.response.status_code': 429 });
+        span.setStatus(false, 'rate_limited');
         return oauthJson(
-          {
-            error: 'invalid_redirect_uri',
-            error_description: 'Only loopback http:// or owner-allowlisted external https:// redirect URIs are allowed',
-          },
-          400,
-          cors,
+          { error: 'too_many_requests', error_description: 'Too many client registrations from this IP' },
+          429,
+          { ...cors, 'retry-after': String(regLock.retryAfterSec) },
         );
       }
-      redirectUris.push(u);
-    }
-    const clientName =
-      typeof body.client_name === 'string' && body.client_name.trim()
-        ? body.client_name.trim().slice(0, 80)
-        : 'MCP Client';
-    const applicationType = body.application_type === 'native' || body.application_type === 'web' ? body.application_type : undefined;
-    const clientId = `mcp_${randomUrlToken(18)}`;
-    // Do NOT write an info ring event on anonymous /oauth/register so attackers cannot flush hub_events (H-S1).
-    await deps.store.putClient({ clientId, clientName, redirectUris, createdAt: now });
-    return oauthJson(
-      {
-        client_id: clientId,
-        client_id_issued_at: Math.floor(now / 1_000),
-        client_name: clientName,
-        redirect_uris: redirectUris,
-        grant_types: ['authorization_code', 'refresh_token'],
-        response_types: ['code'],
-        token_endpoint_auth_method: 'none',
-        ...(applicationType ? { application_type: applicationType } : {}),
-      },
-      201,
-      cors,
-    );
+      const regCount = await deps.store.recordAuthFailure(`reg:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, REGISTER_RATE_LIMIT_MAX);
+      if (!regCount.allowed) {
+        await request.body?.cancel().catch(() => undefined);
+        span.setAttributes({ 'oauth.outcome': 'rate_limited', 'http.response.status_code': 429 });
+        span.setStatus(false, 'rate_limited');
+        return oauthJson(
+          { error: 'too_many_requests', error_description: 'Too many client registrations from this IP' },
+          429,
+          { ...cors, 'retry-after': String(regCount.retryAfterSec) },
+        );
+      }
+      const cappedBody = await readBodyTextCapped(request, 16_384);
+      if (!cappedBody.ok) {
+        span.setAttributes({ 'oauth.outcome': 'payload_too_large', 'http.response.status_code': 413 });
+        span.setStatus(false, 'payload_too_large');
+        return oauthJson({ error: 'invalid_client_metadata' }, 413, cors);
+      }
+      const bodyText = cappedBody.text;
+      let body: { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
+      try {
+        body = JSON.parse(bodyText) as { client_name?: unknown; redirect_uris?: unknown; application_type?: unknown };
+      } catch {
+        span.setAttributes({ 'oauth.outcome': 'invalid_client_metadata', 'http.response.status_code': 400 });
+        span.setStatus(false, 'invalid_client_metadata');
+        return oauthJson({ error: 'invalid_client_metadata', error_description: 'Invalid JSON' }, 400, cors);
+      }
+      if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0 || body.redirect_uris.length > 10) {
+        span.setAttributes({ 'oauth.outcome': 'invalid_redirect_uri', 'http.response.status_code': 400 });
+        span.setStatus(false, 'invalid_redirect_uri');
+        return oauthJson({ error: 'invalid_redirect_uri', error_description: 'redirect_uris must be a 1-10 item array' }, 400, cors);
+      }
+      const redirectUris: string[] = [];
+      for (const u of body.redirect_uris) {
+        if (typeof u !== 'string' || !isValidRedirectUri(u, origin, deps.redirectAllowlist)) {
+          span.setAttributes({ 'oauth.outcome': 'invalid_redirect_uri', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_redirect_uri');
+          return oauthJson(
+            {
+              error: 'invalid_redirect_uri',
+              error_description: 'Only loopback http:// or owner-allowlisted external https:// redirect URIs are allowed',
+            },
+            400,
+            cors,
+          );
+        }
+        redirectUris.push(u);
+      }
+      const clientName =
+        typeof body.client_name === 'string' && body.client_name.trim()
+          ? body.client_name.trim().slice(0, 80)
+          : 'MCP Client';
+      const applicationType = body.application_type === 'native' || body.application_type === 'web' ? body.application_type : undefined;
+      const clientId = `mcp_${randomUrlToken(18)}`;
+      // Do NOT write an info ring event on anonymous /oauth/register so attackers cannot flush hub_events (H-S1).
+      await deps.store.putClient({ clientId, clientName, redirectUris, createdAt: now });
+      span.setAttributes({
+        'oauth.client_id': clientId,
+        'oauth.redirect_uri_count': redirectUris.length,
+        ...(applicationType ? { 'oauth.application_type': applicationType } : {}),
+        'oauth.outcome': 'registered',
+        'http.response.status_code': 201,
+      });
+      return oauthJson(
+        {
+          client_id: clientId,
+          client_id_issued_at: Math.floor(now / 1_000),
+          client_name: clientName,
+          redirect_uris: redirectUris,
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+          token_endpoint_auth_method: 'none',
+          ...(applicationType ? { application_type: applicationType } : {}),
+        },
+        201,
+        cors,
+      );
+    });
   }
 
   // 4. OAuth 2.1 Authorization & Consent (`GET` & `POST /oauth/authorize`)
   if (path === '/oauth/authorize') {
-    const isSecure = url.protocol === 'https:';
-    let adminSession = await verifyAdminSessionCookie(request.headers.get('cookie'), deps.ownerSecret, now);
-    if (adminSession.ok && typeof deps.store.checkAuthLockout === 'function') {
-      const revoked = await deps.store.checkAuthLockout(`revoked_admin:${adminSession.csrf}`, now, 1);
-      if (!revoked.allowed) {
-        adminSession = { ok: false };
-      }
-    }
-
-    if (request.method === 'GET') {
-      const clientId = (url.searchParams.get('client_id') ?? '').trim();
-      const redirectUri = (url.searchParams.get('redirect_uri') ?? '').trim();
-      const responseType = (url.searchParams.get('response_type') ?? '').trim();
-      const state = url.searchParams.get('state') ?? '';
-      const codeChallenge = (url.searchParams.get('code_challenge') ?? '').trim();
-      const codeChallengeMethod = (url.searchParams.get('code_challenge_method') ?? '').trim();
-      const scopeCheck = parseRequestedScopes(url.searchParams.get('scope'));
-      const resCheck = normalizeResource(url.searchParams.get('resource'), origin);
-
-      let client = clientId ? await deps.store.getClient(clientId) : null;
-      if (!client && clientId.startsWith('https://')) {
-        client = await resolveCimdClient({
-          clientId,
-          selfOrigin: origin,
-          redirectAllowlist: deps.redirectAllowlist ?? [],
-          store: deps.store,
-          now,
-        });
-      }
-      if (!client) {
-        return new Response('Unknown client_id. Register via POST /oauth/register or use an allowlisted Client ID Metadata Document URL.', {
-          status: 400,
-          headers: CONSENT_PAGE_HEADERS,
-        });
-      }
-      if (
-        !redirectUri ||
-        !isValidRedirectUri(redirectUri, origin, deps.redirectAllowlist) ||
-        !matchesRegisteredRedirectUri(redirectUri, client.redirectUris)
-      ) {
-        return new Response('Unregistered or disallowed redirect_uri for this client_id.', { status: 400, headers: CONSENT_PAGE_HEADERS });
-      }
-      if (responseType !== 'code') {
-        const errUrl = new URL(redirectUri);
-        errUrl.searchParams.set('error', 'unsupported_response_type');
-        if (state) errUrl.searchParams.set('state', state);
-        errUrl.searchParams.set('iss', origin);
-        return Response.redirect(errUrl.toString(), 302);
-      }
-      if (!scopeCheck.ok) {
-        const errUrl = new URL(redirectUri);
-        errUrl.searchParams.set('error', 'invalid_scope');
-        if (state) errUrl.searchParams.set('state', state);
-        errUrl.searchParams.set('iss', origin);
-        return Response.redirect(errUrl.toString(), 302);
-      }
-      const scopes = scopeCheck.scopes;
-      if (codeChallengeMethod !== 'S256' || !/^[A-Za-z0-9_-]{43,128}$/.test(codeChallenge)) {
-        const errUrl = new URL(redirectUri);
-        errUrl.searchParams.set('error', 'invalid_request');
-        errUrl.searchParams.set('error_description', 'PKCE code_challenge with S256 is required');
-        if (state) errUrl.searchParams.set('state', state);
-        errUrl.searchParams.set('iss', origin);
-        return Response.redirect(errUrl.toString(), 302);
-      }
-      if (!resCheck.ok) {
-        const errUrl = new URL(redirectUri);
-        errUrl.searchParams.set('error', 'invalid_target');
-        if (state) errUrl.searchParams.set('state', state);
-        errUrl.searchParams.set('iss', origin);
-        return Response.redirect(errUrl.toString(), 302);
-      }
-
-      const isExternalRedirect = !isLoopbackRedirectUri(redirectUri);
-      const csrf = randomUrlToken(24);
-      const sealedState = await sealConsent(deps.ownerSecret, {
-        clientId: client.clientId,
-        clientName: client.clientName,
-        redirectUri,
-        state,
-        codeChallenge,
-        scopes,
-        resource: resCheck.resource,
-        csrf,
-        exp: now + 10 * 60_000,
-      });
-
-      const headers = new Headers(CONSENT_PAGE_HEADERS);
-      headers.append('set-cookie', formatCookie(CONSENT_CSRF_COOKIE, csrf, { maxAge: 600, path: '/oauth/authorize', sameSite: 'Lax', secure: isSecure }));
-      return new Response(
-        renderAuthorizePage({
-          serviceName: deps.serviceName,
-          clientName: client.clientName,
-          redirectUri,
-          scopes,
-          sealedState,
-          csrf,
-          // Non-loopback external redirects ALWAYS require explicit CALLER_TOKEN entry even if signed into /admin (H-S2).
-          alreadySignedIn: adminSession.ok && !isExternalRedirect,
-        }),
-        { status: 200, headers },
-      );
-    }
-
-    if (request.method === 'POST') {
-      const form = await parseFormOrJson(request);
-      if (!form) {
-        return new Response('Request payload too large.', { status: 413, headers: CONSENT_PAGE_HEADERS });
-      }
-      const sealed = await unsealConsent(deps.ownerSecret, form.sealed ?? '', now);
-      const cookieCsrf = readCookie(request.headers.get('cookie'), CONSENT_CSRF_COOKIE) ?? '';
-      if (!sealed || !cookieCsrf || !sameBytes(cookieCsrf, sealed.csrf) || !sameBytes(form.csrf ?? '', sealed.csrf)) {
-        return new Response('Authorization session expired or invalid CSRF token. Please retry from your MCP client.', {
-          status: 400,
-          headers: CONSENT_PAGE_HEADERS,
-        });
-      }
-      if (!isValidRedirectUri(sealed.redirectUri, origin, deps.redirectAllowlist)) {
-        return new Response('Disallowed redirect_uri.', { status: 400, headers: CONSENT_PAGE_HEADERS });
-      }
-
-      if (form.decision !== 'approve') {
-        const denyUrl = new URL(sealed.redirectUri);
-        denyUrl.searchParams.set('error', 'access_denied');
-        if (sealed.state) denyUrl.searchParams.set('state', sealed.state);
-        denyUrl.searchParams.set('iss', origin);
-        return Response.redirect(denyUrl.toString(), 302);
-      }
-
-      const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
-      const isExternalRedirect = !isLoopbackRedirectUri(sealed.redirectUri);
-      if (!adminSession.ok || isExternalRedirect) {
-        const supplied = (form.owner_token ?? '').trim();
-        // Verify constant-time secret match FIRST (`R3-M4`): a valid owner/MCP token succeeds and clears any spoofed/shared-IP
-        // lockout bucket, while invalid guesses are rejected with `429` once the bucket reaches `RATE_LIMIT_MAX_FAILURES`!
-        if (isValidSecretMatch(supplied, deps.ownerSecret, deps.mcpToken)) {
-          await deps.store.clearAuthFailures(`oauth:${clientIp}`);
-        } else {
-          const preLock = await deps.store.checkAuthLockout(`oauth:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
-          if (!preLock.allowed) {
-            return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
-              status: 429,
-              headers: { ...CONSENT_PAGE_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
-            });
-          }
-          const rl = await deps.store.recordAuthFailure(`oauth:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
-          if (!rl.allowed) {
-            return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
-              status: 429,
-              headers: { ...CONSENT_PAGE_HEADERS, 'retry-after': String(rl.retryAfterSec) },
-            });
-          }
-          return new Response(
-            renderAuthorizePage({
-              serviceName: deps.serviceName,
-              clientName: sealed.clientName,
-              redirectUri: sealed.redirectUri,
-              scopes: sealed.scopes,
-              sealedState: form.sealed ?? '',
-              csrf: sealed.csrf,
-              alreadySignedIn: false,
-              errorMessage: 'Invalid token. Paste your MCP_TOKEN or CRAWLER_TOKEN.',
-            }),
-            { status: 401, headers: CONSENT_PAGE_HEADERS },
-          );
+    return withOAuthAuditSpan('authorize', async (span) => {
+      const isSecure = url.protocol === 'https:';
+      let adminSession = await verifyAdminSessionCookie(request.headers.get('cookie'), ownerSecret, now);
+      if (adminSession.ok && typeof deps.store.checkAuthLockout === 'function') {
+        const revoked = await deps.store.checkAuthLockout(`revoked_admin:${adminSession.csrf}`, now, 1);
+        if (!revoked.allowed) {
+          adminSession = { ok: false };
         }
       }
 
-      const rawCode = `efc_${randomUrlToken(32)}`;
-      const codeHash = await sha256Base64Url(rawCode);
-      await deps.store.putCode({
-        codeHash,
-        clientId: sealed.clientId,
-        clientName: sealed.clientName,
-        redirectUri: sealed.redirectUri,
-        codeChallenge: sealed.codeChallenge,
-        scopes: sealed.scopes,
-        resource: sealed.resource,
-        expiresAt: now + AUTH_CODE_TTL_MS,
-      });
+      if (request.method === 'GET') {
+        const clientId = (url.searchParams.get('client_id') ?? '').trim();
+        const redirectUri = (url.searchParams.get('redirect_uri') ?? '').trim();
+        const responseType = (url.searchParams.get('response_type') ?? '').trim();
+        const state = url.searchParams.get('state') ?? '';
+        const codeChallenge = (url.searchParams.get('code_challenge') ?? '').trim();
+        const codeChallengeMethod = (url.searchParams.get('code_challenge_method') ?? '').trim();
+        const scopeCheck = parseRequestedScopes(url.searchParams.get('scope'));
+        const resCheck = normalizeResource(url.searchParams.get('resource'), origin);
 
-      const cb = new URL(sealed.redirectUri);
-      cb.searchParams.set('code', rawCode);
-      if (sealed.state) cb.searchParams.set('state', sealed.state);
-      cb.searchParams.set('iss', origin);
+        let client = clientId ? await deps.store.getClient(clientId) : null;
+        if (!client && clientId.startsWith('https://')) {
+          client = await resolveCimdClient({
+            clientId,
+            selfOrigin: origin,
+            redirectAllowlist: deps.redirectAllowlist ?? [],
+            store: deps.store,
+            now,
+          });
+        }
+        if (!client) {
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'unknown_client', 'http.response.status_code': 400 });
+          span.setStatus(false, 'unknown_client');
+          return new Response('Unknown client_id. Register via POST /oauth/register or use an allowlisted Client ID Metadata Document URL.', {
+            status: 400,
+            headers: CONSENT_PAGE_HEADERS,
+          });
+        }
+        span.setAttribute('oauth.client_id', client.clientId);
+        if (
+          !redirectUri ||
+          !isValidRedirectUri(redirectUri, origin, deps.redirectAllowlist) ||
+          !matchesRegisteredRedirectUri(redirectUri, client.redirectUris)
+        ) {
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_redirect_uri', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_redirect_uri');
+          return new Response('Unregistered or disallowed redirect_uri for this client_id.', { status: 400, headers: CONSENT_PAGE_HEADERS });
+        }
+        if (responseType !== 'code') {
+          const errUrl = new URL(redirectUri);
+          errUrl.searchParams.set('error', 'unsupported_response_type');
+          if (state) errUrl.searchParams.set('state', state);
+          errUrl.searchParams.set('iss', origin);
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'unsupported_response_type', 'http.response.status_code': 302 });
+          span.setStatus(false, 'unsupported_response_type');
+          return Response.redirect(errUrl.toString(), 302);
+        }
+        if (!scopeCheck.ok) {
+          const errUrl = new URL(redirectUri);
+          errUrl.searchParams.set('error', 'invalid_scope');
+          if (state) errUrl.searchParams.set('state', state);
+          errUrl.searchParams.set('iss', origin);
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_scope', 'http.response.status_code': 302 });
+          span.setStatus(false, 'invalid_scope');
+          return Response.redirect(errUrl.toString(), 302);
+        }
+        const scopes = scopeCheck.scopes;
+        if (codeChallengeMethod !== 'S256' || !/^[A-Za-z0-9_-]{43,128}$/.test(codeChallenge)) {
+          const errUrl = new URL(redirectUri);
+          errUrl.searchParams.set('error', 'invalid_request');
+          errUrl.searchParams.set('error_description', 'PKCE code_challenge with S256 is required');
+          if (state) errUrl.searchParams.set('state', state);
+          errUrl.searchParams.set('iss', origin);
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_request', 'http.response.status_code': 302 });
+          span.setStatus(false, 'invalid_request');
+          return Response.redirect(errUrl.toString(), 302);
+        }
+        if (!resCheck.ok) {
+          const errUrl = new URL(redirectUri);
+          errUrl.searchParams.set('error', 'invalid_target');
+          if (state) errUrl.searchParams.set('state', state);
+          errUrl.searchParams.set('iss', origin);
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_target', 'http.response.status_code': 302 });
+          span.setStatus(false, 'invalid_target');
+          return Response.redirect(errUrl.toString(), 302);
+        }
 
-      const headers = new Headers({ location: cb.toString(), 'cache-control': 'no-store' });
-      headers.append('set-cookie', formatCookie(CONSENT_CSRF_COOKIE, '', { maxAge: 0, path: '/oauth/authorize', sameSite: 'Lax', secure: isSecure }));
-      return new Response(null, { status: 302, headers });
-    }
+        const isExternalRedirect = !isLoopbackRedirectUri(redirectUri);
+        const csrf = randomUrlToken(24);
+        const sealedState = await sealConsent(ownerSecret, {
+          clientId: client.clientId,
+          clientName: client.clientName,
+          redirectUri,
+          state,
+          codeChallenge,
+          scopes,
+          resource: resCheck.resource,
+          csrf,
+          exp: now + 10 * 60_000,
+        });
 
-    return oauthJson({ error: 'method_not_allowed' }, 405, cors);
+        const headers = new Headers(CONSENT_PAGE_HEADERS);
+        headers.append('set-cookie', formatCookie(CONSENT_CSRF_COOKIE, csrf, { maxAge: 600, path: '/oauth/authorize', sameSite: 'Lax', secure: isSecure }));
+        span.setAttributes({
+          'oauth.phase': 'consent_render',
+          'oauth.scopes': scopes.join(' '),
+          'oauth.external_redirect': isExternalRedirect,
+          'oauth.admin_session': adminSession.ok,
+          'oauth.outcome': 'consent_rendered',
+          'http.response.status_code': 200,
+        });
+        return new Response(
+          renderAuthorizePage({
+            serviceName: deps.serviceName,
+            clientName: client.clientName,
+            redirectUri,
+            scopes,
+            sealedState,
+            csrf,
+            // Non-loopback external redirects ALWAYS require explicit CALLER_TOKEN entry even if signed into /admin (H-S2).
+            alreadySignedIn: adminSession.ok && !isExternalRedirect,
+          }),
+          { status: 200, headers },
+        );
+      }
+
+      if (request.method === 'POST') {
+        const form = await parseFormOrJson(request);
+        if (!form) {
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'payload_too_large', 'http.response.status_code': 413 });
+          span.setStatus(false, 'payload_too_large');
+          return new Response('Request payload too large.', { status: 413, headers: CONSENT_PAGE_HEADERS });
+        }
+        const sealed = await unsealConsent(ownerSecret, form.sealed ?? '', now);
+        const cookieCsrf = readCookie(request.headers.get('cookie'), CONSENT_CSRF_COOKIE) ?? '';
+        if (!sealed || !cookieCsrf || !sameBytes(cookieCsrf, sealed.csrf) || !sameBytes(form.csrf ?? '', sealed.csrf)) {
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_csrf', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_csrf');
+          return new Response('Authorization session expired or invalid CSRF token. Please retry from your MCP client.', {
+            status: 400,
+            headers: CONSENT_PAGE_HEADERS,
+          });
+        }
+        span.setAttribute('oauth.client_id', sealed.clientId);
+        if (!isValidRedirectUri(sealed.redirectUri, origin, deps.redirectAllowlist)) {
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'invalid_redirect_uri', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_redirect_uri');
+          return new Response('Disallowed redirect_uri.', { status: 400, headers: CONSENT_PAGE_HEADERS });
+        }
+
+        if (form.decision !== 'approve') {
+          const denyUrl = new URL(sealed.redirectUri);
+          denyUrl.searchParams.set('error', 'access_denied');
+          if (sealed.state) denyUrl.searchParams.set('state', sealed.state);
+          denyUrl.searchParams.set('iss', origin);
+          span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'access_denied', 'http.response.status_code': 302 });
+          span.setStatus(false, 'access_denied');
+          return Response.redirect(denyUrl.toString(), 302);
+        }
+
+        const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
+        const isExternalRedirect = !isLoopbackRedirectUri(sealed.redirectUri);
+        if (!adminSession.ok || isExternalRedirect) {
+          const supplied = (form.owner_token ?? '').trim();
+          // Verify constant-time secret match FIRST (`R3-M4`): a valid owner/MCP token succeeds and clears any spoofed/shared-IP
+          // lockout bucket, while invalid guesses are rejected with `429` once the bucket reaches `RATE_LIMIT_MAX_FAILURES`!
+          if (isValidSecretMatch(supplied, deps.ownerSecret, deps.mcpToken)) {
+            await deps.store.clearAuthFailures(`oauth:${clientIp}`);
+          } else {
+            const preLock = await deps.store.checkAuthLockout(`oauth:${clientIp}`, now, RATE_LIMIT_MAX_FAILURES);
+            if (!preLock.allowed) {
+              span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'rate_limited', 'http.response.status_code': 429 });
+              span.setStatus(false, 'rate_limited');
+              return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
+                status: 429,
+                headers: { ...CONSENT_PAGE_HEADERS, 'retry-after': String(preLock.retryAfterSec) },
+              });
+            }
+            const rl = await deps.store.recordAuthFailure(`oauth:${clientIp}`, now, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_FAILURES);
+            if (!rl.allowed) {
+              span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'rate_limited', 'http.response.status_code': 429 });
+              span.setStatus(false, 'rate_limited');
+              return new Response('Too many failed authorization attempts. Please wait 5 minutes.', {
+                status: 429,
+                headers: { ...CONSENT_PAGE_HEADERS, 'retry-after': String(rl.retryAfterSec) },
+              });
+            }
+            span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'unauthorized', 'http.response.status_code': 401 });
+            span.setStatus(false, 'unauthorized');
+            return new Response(
+              renderAuthorizePage({
+                serviceName: deps.serviceName,
+                clientName: sealed.clientName,
+                redirectUri: sealed.redirectUri,
+                scopes: sealed.scopes,
+                sealedState: form.sealed ?? '',
+                csrf: sealed.csrf,
+                alreadySignedIn: false,
+                errorMessage: 'Invalid token. Paste your MCP_TOKEN or CRAWLER_TOKEN.',
+              }),
+              { status: 401, headers: CONSENT_PAGE_HEADERS },
+            );
+          }
+        }
+
+        const rawCode = `efc_${randomUrlToken(32)}`;
+        const codeHash = await sha256Base64Url(rawCode);
+        await deps.store.putCode({
+          codeHash,
+          clientId: sealed.clientId,
+          clientName: sealed.clientName,
+          redirectUri: sealed.redirectUri,
+          codeChallenge: sealed.codeChallenge,
+          scopes: sealed.scopes,
+          resource: sealed.resource,
+          expiresAt: now + AUTH_CODE_TTL_MS,
+        });
+
+        const cb = new URL(sealed.redirectUri);
+        cb.searchParams.set('code', rawCode);
+        if (sealed.state) cb.searchParams.set('state', sealed.state);
+        cb.searchParams.set('iss', origin);
+
+        const headers = new Headers({ location: cb.toString(), 'cache-control': 'no-store' });
+        headers.append('set-cookie', formatCookie(CONSENT_CSRF_COOKIE, '', { maxAge: 0, path: '/oauth/authorize', sameSite: 'Lax', secure: isSecure }));
+        span.setAttributes({
+          'oauth.phase': 'code_issued',
+          'oauth.scopes': sealed.scopes.join(' '),
+          'oauth.external_redirect': isExternalRedirect,
+          'oauth.admin_session': adminSession.ok,
+          'oauth.outcome': 'approved',
+          'http.response.status_code': 302,
+        });
+        return new Response(null, { status: 302, headers });
+      }
+
+      span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'method_not_allowed', 'http.response.status_code': 405 });
+      span.setStatus(false, 'method_not_allowed');
+      return oauthJson({ error: 'method_not_allowed' }, 405, cors);
+    });
   }
 
   // 5. OAuth 2.1 Token Endpoint (`POST /oauth/token`)
   if (path === '/oauth/token') {
-    if (request.method !== 'POST') return oauthJson({ error: 'method_not_allowed' }, 405, cors);
+    if (request.method !== 'POST') {
+      return withOAuthAuditSpan('token', async (span) => {
+        span.setAttributes({ 'oauth.outcome': 'method_not_allowed', 'http.response.status_code': 405 });
+        span.setStatus(false, 'method_not_allowed');
+        return oauthJson({ error: 'method_not_allowed' }, 405, cors);
+      });
+    }
     const params = await parseFormOrJson(request);
-    if (!params) return oauthJson({ error: 'invalid_request', error_description: 'Request payload too large' }, 413, cors);
+    if (!params) {
+      return withOAuthAuditSpan('token', async (span) => {
+        span.setAttributes({ 'oauth.outcome': 'payload_too_large', 'http.response.status_code': 413 });
+        span.setStatus(false, 'payload_too_large');
+        return oauthJson({ error: 'invalid_request', error_description: 'Request payload too large' }, 413, cors);
+      });
+    }
     const grantType = params.grant_type ?? '';
 
     if (grantType === 'authorization_code') {
-      const code = params.code ?? '';
-      const verifier = params.code_verifier ?? '';
-      const clientId = (params.client_id ?? '').trim();
-      const redirectUri = (params.redirect_uri ?? '').trim();
-      if (!code || !clientId || !redirectUri || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) {
+      return withOAuthAuditSpan('token', async (span) => {
+        span.setAttribute('oauth.grant_type', 'authorization_code');
+        const code = params.code ?? '';
+        const verifier = params.code_verifier ?? '';
+        const clientId = (params.client_id ?? '').trim();
+        const redirectUri = (params.redirect_uri ?? '').trim();
+        if (clientId) span.setAttribute('oauth.client_id', clientId);
+        if (!code || !clientId || !redirectUri || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) {
+          span.setAttributes({ 'oauth.outcome': 'invalid_request', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_request');
+          return oauthJson(
+            { error: 'invalid_request', error_description: 'code, client_id, redirect_uri, and PKCE code_verifier are required' },
+            400,
+            cors,
+          );
+        }
+
+        const codeHash = await sha256Base64Url(code);
+        const record = await deps.store.consumeCode(codeHash, now);
+        if (!record) {
+          span.setAttributes({ 'oauth.outcome': 'invalid_grant', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_grant');
+          return oauthJson({ error: 'invalid_grant', error_description: 'Authorization code is invalid, expired, or already used' }, 400, cors);
+        }
+        if (clientId !== record.clientId || redirectUri !== record.redirectUri) {
+          span.setAttributes({ 'oauth.outcome': 'client_mismatch', 'http.response.status_code': 400 });
+          span.setStatus(false, 'client_mismatch');
+          return oauthJson({ error: 'invalid_grant', error_description: 'client_id or redirect_uri mismatch' }, 400, cors);
+        }
+        const computedChallenge = await sha256Base64Url(verifier);
+        if (!sameBytes(computedChallenge, record.codeChallenge)) {
+          span.setAttributes({ 'oauth.outcome': 'pkce_failed', 'http.response.status_code': 400 });
+          span.setStatus(false, 'pkce_failed');
+          return oauthJson({ error: 'invalid_grant', error_description: 'PKCE S256 verification failed' }, 400, cors);
+        }
+        if (params.resource) {
+          const resCheck = normalizeResource(params.resource, origin);
+          if (!resCheck.ok || resCheck.resource !== record.resource) {
+            span.setAttributes({ 'oauth.outcome': 'invalid_target', 'http.response.status_code': 400 });
+            span.setStatus(false, 'invalid_target');
+            return oauthJson({ error: 'invalid_target', error_description: 'Resource mismatch' }, 400, cors);
+          }
+        }
+
+        const accessToken = `efa_${randomUrlToken(32)}`;
+        const refreshToken = `efr_${randomUrlToken(32)}`;
+        const grantId = `grant_${randomUrlToken(12)}`;
+        await deps.store.putTokenPair({
+          grantId,
+          accessHash: await sha256Base64Url(accessToken),
+          refreshHash: await sha256Base64Url(refreshToken),
+          clientId: record.clientId,
+          clientName: record.clientName,
+          scopes: record.scopes,
+          resource: record.resource,
+          createdAt: now,
+          accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
+          refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
+        });
+        await deps.onEvent?.({
+          level: 'info',
+          category: 'oauth',
+          event: 'oauth_token_issued',
+          summary: `Issued OAuth 2.1 access + refresh tokens for "${record.clientName}" (${grantId})`,
+          details: { grantId, clientId: record.clientId, clientName: record.clientName, scopes: record.scopes },
+        });
+        span.setAttributes({
+          'oauth.client_id': record.clientId,
+          'oauth.grant_id': grantId,
+          'oauth.scopes': record.scopes.join(' '),
+          'oauth.outcome': 'issued',
+          'http.response.status_code': 200,
+        });
+
         return oauthJson(
-          { error: 'invalid_request', error_description: 'code, client_id, redirect_uri, and PKCE code_verifier are required' },
-          400,
+          {
+            access_token: accessToken,
+            token_type: 'Bearer',
+            expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1_000),
+            refresh_token: refreshToken,
+            scope: record.scopes.join(' '),
+            resource: record.resource,
+          },
+          200,
           cors,
         );
-      }
-
-      const codeHash = await sha256Base64Url(code);
-      const record = await deps.store.consumeCode(codeHash, now);
-      if (!record) {
-        return oauthJson({ error: 'invalid_grant', error_description: 'Authorization code is invalid, expired, or already used' }, 400, cors);
-      }
-      if (clientId !== record.clientId || redirectUri !== record.redirectUri) {
-        return oauthJson({ error: 'invalid_grant', error_description: 'client_id or redirect_uri mismatch' }, 400, cors);
-      }
-      const computedChallenge = await sha256Base64Url(verifier);
-      if (!sameBytes(computedChallenge, record.codeChallenge)) {
-        return oauthJson({ error: 'invalid_grant', error_description: 'PKCE S256 verification failed' }, 400, cors);
-      }
-      if (params.resource) {
-        const resCheck = normalizeResource(params.resource, origin);
-        if (!resCheck.ok || resCheck.resource !== record.resource) {
-          return oauthJson({ error: 'invalid_target', error_description: 'Resource mismatch' }, 400, cors);
-        }
-      }
-
-      const accessToken = `efa_${randomUrlToken(32)}`;
-      const refreshToken = `efr_${randomUrlToken(32)}`;
-      const grantId = `grant_${randomUrlToken(12)}`;
-      await deps.store.putTokenPair({
-        grantId,
-        accessHash: await sha256Base64Url(accessToken),
-        refreshHash: await sha256Base64Url(refreshToken),
-        clientId: record.clientId,
-        clientName: record.clientName,
-        scopes: record.scopes,
-        resource: record.resource,
-        createdAt: now,
-        accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
-        refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
       });
-      await deps.onEvent?.({
-        level: 'info',
-        category: 'oauth',
-        event: 'oauth_token_issued',
-        summary: `Issued OAuth 2.1 access + refresh tokens for "${record.clientName}" (${grantId})`,
-        details: { grantId, clientId: record.clientId, clientName: record.clientName, scopes: record.scopes },
-      });
-
-      return oauthJson(
-        {
-          access_token: accessToken,
-          token_type: 'Bearer',
-          expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1_000),
-          refresh_token: refreshToken,
-          scope: record.scopes.join(' '),
-          resource: record.resource,
-        },
-        200,
-        cors,
-      );
     }
 
     if (grantType === 'refresh_token') {
-      const refreshToken = params.refresh_token ?? '';
-      const clientId = (params.client_id ?? '').trim();
-      if (!refreshToken || !clientId) {
-        return oauthJson({ error: 'invalid_request', error_description: 'refresh_token and client_id are required' }, 400, cors);
-      }
-
-      const nextAccess = `efa_${randomUrlToken(32)}`;
-      const nextRefresh = `efr_${randomUrlToken(32)}`;
-      const rotated = await deps.store.rotateRefreshToken({
-        refreshHash: await sha256Base64Url(refreshToken),
-        clientId,
-        nextAccessHash: await sha256Base64Url(nextAccess),
-        nextRefreshHash: await sha256Base64Url(nextRefresh),
-        now,
-        accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
-        refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
-      });
-      if (!rotated.ok) {
-        if (rotated.replayDetected) {
-          await deps.onEvent?.({
-            level: 'warn',
-            category: 'oauth',
-            event: 'oauth_refresh_replay_revoked',
-            summary: `Detected replay of rotated refresh token; revoked entire grant ${rotated.grantId ?? ''}`,
-            details: { grantId: rotated.grantId ?? '', clientId: rotated.clientId ?? clientId },
-          });
+      return withOAuthAuditSpan('refresh', async (span) => {
+        span.setAttribute('oauth.grant_type', 'refresh_token');
+        const refreshToken = params.refresh_token ?? '';
+        const clientId = (params.client_id ?? '').trim();
+        if (clientId) span.setAttribute('oauth.client_id', clientId);
+        if (!refreshToken || !clientId) {
+          span.setAttributes({ 'oauth.outcome': 'invalid_request', 'http.response.status_code': 400 });
+          span.setStatus(false, 'invalid_request');
+          return oauthJson({ error: 'invalid_request', error_description: 'refresh_token and client_id are required' }, 400, cors);
         }
-        return oauthJson({ error: 'invalid_grant', error_description: 'Refresh token is invalid, expired, or revoked' }, 400, cors);
-      }
 
-      return oauthJson(
-        {
-          access_token: nextAccess,
-          token_type: 'Bearer',
-          expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1_000),
-          refresh_token: nextRefresh,
-          scope: rotated.scopes.join(' '),
-          resource: rotated.resource,
-        },
-        200,
-        cors,
-      );
+        const nextAccess = `efa_${randomUrlToken(32)}`;
+        const nextRefresh = `efr_${randomUrlToken(32)}`;
+        const rotated = await deps.store.rotateRefreshToken({
+          refreshHash: await sha256Base64Url(refreshToken),
+          clientId,
+          nextAccessHash: await sha256Base64Url(nextAccess),
+          nextRefreshHash: await sha256Base64Url(nextRefresh),
+          now,
+          accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
+          refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
+        });
+        if (!rotated.ok) {
+          if (rotated.replayDetected) {
+            await deps.onEvent?.({
+              level: 'warn',
+              category: 'oauth',
+              event: 'oauth_refresh_replay_revoked',
+              summary: `Detected replay of rotated refresh token; revoked entire grant ${rotated.grantId ?? ''}`,
+              details: { grantId: rotated.grantId ?? '', clientId: rotated.clientId ?? clientId },
+            });
+          }
+          span.setAttributes({
+            ...(rotated.grantId ? { 'oauth.grant_id': rotated.grantId } : {}),
+            ...(rotated.replayDetected ? { 'oauth.replay_detected': true } : {}),
+            'oauth.outcome': rotated.replayDetected ? 'replay_detected' : 'invalid_grant',
+            'http.response.status_code': 400,
+          });
+          span.setStatus(false, rotated.replayDetected ? 'replay_detected' : 'invalid_grant');
+          return oauthJson({ error: 'invalid_grant', error_description: 'Refresh token is invalid, expired, or revoked' }, 400, cors);
+        }
+
+        span.setAttributes({
+          'oauth.grant_id': rotated.grantId,
+          'oauth.scopes': rotated.scopes.join(' '),
+          'oauth.outcome': 'rotated',
+          'http.response.status_code': 200,
+        });
+        return oauthJson(
+          {
+            access_token: nextAccess,
+            token_type: 'Bearer',
+            expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1_000),
+            refresh_token: nextRefresh,
+            scope: rotated.scopes.join(' '),
+            resource: rotated.resource,
+          },
+          200,
+          cors,
+        );
+      });
     }
 
-    return oauthJson({ error: 'unsupported_grant_type' }, 400, cors);
+    return withOAuthAuditSpan('token', async (span) => {
+      span.setAttributes({
+        ...(grantType ? { 'oauth.grant_type': grantType.slice(0, 64) } : {}),
+        'oauth.outcome': 'unsupported_grant_type',
+        'http.response.status_code': 400,
+      });
+      span.setStatus(false, 'unsupported_grant_type');
+      return oauthJson({ error: 'unsupported_grant_type' }, 400, cors);
+    });
   }
 
   // 6. RFC 7009 Token Revocation (`POST /oauth/revoke`)
   if (path === '/oauth/revoke') {
-    if (request.method !== 'POST') return oauthJson({ error: 'method_not_allowed' }, 405, cors);
-    const params = await parseFormOrJson(request);
-    if (!params) return oauthJson({ error: 'invalid_request' }, 413, cors);
-    if (params.token) {
-      await deps.store.revokeByTokenHash(await sha256Base64Url(params.token));
-    }
-    return oauthJson({ ok: true }, 200, cors);
+    return withOAuthAuditSpan('revoke', async (span) => {
+      if (request.method !== 'POST') {
+        span.setAttributes({ 'oauth.outcome': 'method_not_allowed', 'http.response.status_code': 405 });
+        span.setStatus(false, 'method_not_allowed');
+        return oauthJson({ error: 'method_not_allowed' }, 405, cors);
+      }
+      const params = await parseFormOrJson(request);
+      if (!params) {
+        span.setAttributes({ 'oauth.outcome': 'payload_too_large', 'http.response.status_code': 413 });
+        span.setStatus(false, 'payload_too_large');
+        return oauthJson({ error: 'invalid_request' }, 413, cors);
+      }
+      const hasToken = Boolean(params.token);
+      if (params.token) {
+        await deps.store.revokeByTokenHash(await sha256Base64Url(params.token));
+      }
+      span.setAttributes({
+        'oauth.token_present': hasToken,
+        'oauth.outcome': hasToken ? 'revoked' : 'noop',
+        'http.response.status_code': 200,
+      });
+      return oauthJson({ ok: true }, 200, cors);
+    });
   }
 
   return null;

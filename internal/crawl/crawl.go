@@ -16,7 +16,6 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -148,6 +147,11 @@ type Result struct {
 	PDFEngine         string                         `json:"pdfEngine,omitempty"`
 	SHA256            string                         `json:"sha256,omitempty"`
 	BodyBase64        string                         `json:"bodyBase64,omitempty"`
+
+	traceSpanID   string
+	traceStart    time.Time
+	traceEnd      time.Time
+	botAuthSigned bool
 }
 
 // DecodeBody returns the exact raw response bytes for `r.Body`, decoding `"base64"` payloads losslessly when the origin
@@ -355,11 +359,17 @@ func NewCrawler(transport http.RoundTripper, allow func(*url.URL) error, userAge
 // SetRenderer replaces the browser renderer (used by unit tests with mock CDP WebSockets).
 func (c *Crawler) SetRenderer(r *browser.Renderer) {
 	c.renderer = r
+	if r != nil && c.otelExp != nil {
+		r.SetOtelExporter(c.otelExp)
+	}
 }
 
 // SetOtelExporter attaches an optional non-blocking OpenTelemetry OTLP/HTTP span exporter.
 func (c *Crawler) SetOtelExporter(exp *otel.Exporter) {
 	c.otelExp = exp
+	if c.renderer != nil {
+		c.renderer.SetOtelExporter(exp)
+	}
 }
 
 // SetBotSigner attaches an optional IETF RFC 9421 Ed25519 Web Bot Auth request signer.
@@ -590,7 +600,23 @@ func (c *Crawler) RunWithSink(ctx context.Context, reqs []Request, opts Options,
 					results[i] = notTried(r, stopped)
 					continue
 				}
-				res, cancelled := c.runRequestWithRedirects(ctx, r, opts, n > 0, minPause, maxJitter, gap, log)
+				reqCtx := ctx
+				var fetchSpanID string
+				if batchTC, ok := otel.TraceContextFromContext(ctx); ok && batchTC.Sampled {
+					fetchSpanID = otel.RandomHex(8)
+					reqCtx = otel.WithTraceContext(ctx, otel.TraceContext{
+						TraceID:      batchTC.TraceID,
+						SpanID:       fetchSpanID,
+						ParentSpanID: batchTC.SpanID,
+						Sampled:      true,
+					})
+				}
+				reqStart := time.Now()
+				res, cancelled := c.runRequestWithRedirects(reqCtx, r, opts, n > 0, minPause, maxJitter, gap, log)
+				reqEnd := time.Now()
+				res.traceSpanID = fetchSpanID
+				res.traceStart = reqStart
+				res.traceEnd = reqEnd
 				if sink != nil {
 					res = sink(i, res)
 				}
@@ -738,6 +764,7 @@ func (c *Crawler) runRequestWithRedirects(
 	curURLStr := origReq.URL
 	prevHost := ""
 	totalAttempts := 0
+	anyBotSigned := false
 
 	for hop := 0; hop <= MaxRedirects; hop++ {
 		parsedCur, err := url.Parse(curURLStr)
@@ -837,6 +864,11 @@ func (c *Crawler) runRequestWithRedirects(
 			}
 		}
 		res, loc, rawBody := c.fetchSingleHop(ctx, hopReq, opts)
+		if res.botAuthSigned {
+			anyBotSigned = true
+		} else if anyBotSigned {
+			res.botAuthSigned = true
+		}
 		res.Timing.RobotsMs += robotsElapsedMs
 		totalAttempts += res.Attempts
 		res.ID = origReq.ID
@@ -908,6 +940,9 @@ func (c *Crawler) runRequestWithRedirects(
 				renderedRes.URL = origReq.URL
 				if len(renderedRes.ResponseHeaders) == 0 && len(res.ResponseHeaders) > 0 {
 					renderedRes.ResponseHeaders = res.ResponseHeaders
+				}
+				if res.botAuthSigned {
+					renderedRes.botAuthSigned = true
 				}
 				c.logResult(ctx, log, origReq, renderedRes)
 				return renderedRes, false
@@ -1067,8 +1102,11 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	var finalBody []byte
 	for attempt := 1; ; attempt++ {
 		res.Attempts = attempt
-		status, header, body, truncated, maxLimitUsed, pdfStream, timing, fetchErr := c.onceWithPDFStream(ctx, r, accept, opts)
+		status, header, body, truncated, maxLimitUsed, pdfStream, timing, botSigned, fetchErr := c.onceWithPDFStream(ctx, r, accept, opts)
 		res.Timing = timing
+		if botSigned {
+			res.botAuthSigned = true
+		}
 		if fetchErr != nil {
 			if ctx.Err() != nil {
 				res.Outcome, res.Problem = classify.OutcomeError, ctx.Err().Error()
@@ -1185,66 +1223,15 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 	return res, redirectLoc, finalBody
 }
 
-var reEmbeddedHTTPURL = regexp.MustCompile(`(?i)https?://[^\s"\\]+`)
-
-// reQuotedHTTPURL matches a strconv.Quote'd URL exactly as net/url.Error prints it (`Get "https://...": ...`),
-// including escaped quotes/backslashes and raw spaces inside the query.
-var reQuotedHTTPURL = regexp.MustCompile(`(?i)"https?://(?:[^"\\]|\\.)*"`)
-
-func scrubSingleURLToken(raw string) string {
-	if idx := strings.IndexByte(raw, '#'); idx >= 0 {
-		raw = raw[:idx]
-	}
-	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
-		raw = raw[:idx]
-	}
-	if schemeEnd := strings.Index(raw, "://"); schemeEnd >= 0 {
-		rest := raw[schemeEnd+3:]
-		slash := strings.IndexByte(rest, '/')
-		auth := rest
-		pathPart := ""
-		if slash >= 0 {
-			auth = rest[:slash]
-			pathPart = rest[slash:]
-		}
-		if at := strings.LastIndexByte(auth, '@'); at >= 0 {
-			auth = auth[at+1:]
-			raw = raw[:schemeEnd+3] + auth + pathPart
-		}
-	}
-	return raw
-}
-
 // RedactEmbeddedURLs scrubs query strings (`?...`), `#fragments`, and `user:pass@` credentials from any `http://` or
 // `https://` URL embedded inside an error or `Result.Problem` string (e.g. `Get "https://host/p?api_key=secret": timeout`
 // -> `Get "https://host/p": timeout`).
 func RedactEmbeddedURLs(s string) string {
-	if s == "" {
-		return ""
-	}
-	lower := strings.ToLower(s)
-	if !strings.Contains(lower, "http://") && !strings.Contains(lower, "https://") {
-		return s
-	}
-	s = reQuotedHTTPURL.ReplaceAllStringFunc(s, func(q string) string {
-		raw, err := strconv.Unquote(q)
-		if err != nil {
-			raw = q[1 : len(q)-1]
-		}
-		return strconv.Quote(scrubSingleURLToken(raw))
-	})
-	return reEmbeddedHTTPURL.ReplaceAllStringFunc(s, scrubSingleURLToken)
+	return otel.RedactEmbeddedURLs(s)
 }
 
 func redactURLForLog(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return scrubSingleURLToken(raw)
-	}
-	u.RawQuery = ""
-	u.Fragment = ""
-	u.User = nil
-	return u.String()
+	return otel.SanitizeURL(raw)
 }
 
 func resolveMaxStreamingPDFBytes(opts Options) int {
@@ -1302,7 +1289,7 @@ func ms(from, to time.Time) int64 {
 	return to.Sub(from).Milliseconds()
 }
 
-func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept string, opts Options) (int, http.Header, []byte, bool, int, *streamedPDFResult, Timing, error) {
+func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept string, opts Options) (int, http.Header, []byte, bool, int, *streamedPDFResult, Timing, bool, error) {
 	var tm Timing
 	var dnsStart, dnsDone, connStart, connDone, tlsStart, tlsDone, wrote, firstByte time.Time
 	var mu sync.Mutex
@@ -1354,7 +1341,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	}
 	req, err := http.NewRequestWithContext(actx, method, r.URL, reqBodyReader)
 	if err != nil {
-		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, false, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", accept)
@@ -1375,14 +1362,17 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	if r.IfModifiedSince != "" {
 		req.Header.Set("If-Modified-Since", r.IfModifiedSince)
 	}
+	var botSigned bool
 	if c.botSigner != nil {
-		_ = c.botSigner.SignRequest(req, c.Now())
+		if signErr := c.botSigner.SignRequest(req, c.Now()); signErr == nil {
+			botSigned = true
+		}
 	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
 		phases()
-		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, botSigned, err
 	}
 	defer resp.Body.Close()
 	tm.Proto = resp.Proto
@@ -1400,14 +1390,14 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 		prefix, pErr = io.ReadAll(io.LimitReader(resp.Body, 1024))
 		if pErr != nil {
 			phases()
-			return 0, nil, nil, false, opts.MaxBytes, nil, tm, pErr
+			return 0, nil, nil, false, opts.MaxBytes, nil, tm, botSigned, pErr
 		}
 		ctLower := strings.ToLower(resp.Header.Get("content-type"))
 		if strings.Contains(ctLower, "application/pdf") || extract.IsPDFBytes(prefix) {
 			pdfMax := resolveMaxStreamingPDFBytes(opts)
 			if cl := resp.ContentLength; cl > int64(pdfMax) {
 				phases()
-				return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, nil
+				return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, botSigned, nil
 			}
 			if tmpFile, tmpErr := os.CreateTemp("", "edgefetch-pdf-*.pdf"); tmpErr == nil {
 				tmpPath := tmpFile.Name()
@@ -1423,7 +1413,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 					totalWritten += int64(n)
 					if wErr != nil {
 						phases()
-						return 0, nil, nil, false, pdfMax, nil, tm, wErr
+						return 0, nil, nil, false, pdfMax, nil, tm, botSigned, wErr
 					}
 				}
 				remLimit := int64(pdfMax) - totalWritten + 1
@@ -1435,10 +1425,10 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 				totalWritten += copied
 				phases()
 				if cErr != nil {
-					return 0, nil, nil, false, pdfMax, nil, tm, cErr
+					return 0, nil, nil, false, pdfMax, nil, tm, botSigned, cErr
 				}
 				if totalWritten > int64(pdfMax) {
-					return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, nil
+					return resp.StatusCode, resp.Header, nil, true, pdfMax, nil, tm, botSigned, nil
 				}
 				_ = tmpFile.Close()
 				sum := hasher.Sum(nil)
@@ -1449,7 +1439,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 					text:        txt,
 					usedPoppler: usedPoppler,
 					err:         extErr,
-				}, tm, nil
+				}, tm, botSigned, nil
 			}
 		}
 	}
@@ -1463,7 +1453,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	tail, err := io.ReadAll(io.LimitReader(resp.Body, remBytes))
 	phases()
 	if err != nil {
-		return 0, nil, nil, false, opts.MaxBytes, nil, tm, err
+		return 0, nil, nil, false, opts.MaxBytes, nil, tm, botSigned, err
 	}
 	limited := tail
 	if len(prefix) > 0 {
@@ -1475,7 +1465,7 @@ func (c *Crawler) onceWithPDFStream(ctx context.Context, r Request, accept strin
 	if truncated {
 		limited = limited[:opts.MaxBytes]
 	}
-	return resp.StatusCode, resp.Header, limited, truncated, opts.MaxBytes, nil, tm, nil
+	return resp.StatusCode, resp.Header, limited, truncated, opts.MaxBytes, nil, tm, botSigned, nil
 }
 
 func parseRobotsCacheTTL(header http.Header) time.Duration {

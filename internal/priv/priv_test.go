@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -91,5 +92,210 @@ func TestLockDownSecretPathsDataFirstSymlinkAndErrorFailClosed(t *testing.T) {
 	}
 	if err := lockDownSecretPathsWith(0, dataDir, chownRec, func(string, os.FileMode) error { return boom }, optsPath); err == nil {
 		t.Fatal("expected chmod failure to return error")
+	}
+}
+
+func TestLockDownSecretPathsBranchesAndPublicEntrypoints(t *testing.T) {
+	if os.Geteuid() != 0 {
+		if err := LockDownSecretPaths("/nonexistent-edgefetch-test"); err != nil {
+			t.Fatalf("LockDownSecretPaths non-root unexpected error: %v", err)
+		}
+		if err := LockDownSecretPathsStrict("/nonexistent-edgefetch-test"); err != nil {
+			t.Fatalf("LockDownSecretPathsStrict non-root unexpected error: %v", err)
+		}
+	}
+
+	tmp := t.TempDir()
+	noopChown := func(string, int, int) error { return nil }
+	noopChmod := func(string, os.FileMode) error { return os.Chmod(tmp, 0o700) }
+	realChmod := func(p string, m os.FileMode) error { return os.Chmod(p, m) }
+	_ = noopChmod
+
+	// 1. dataDir == "" skips dataDir check, processes empty path, subdir (0700), and missing path.
+	subDir := filepath.Join(tmp, "secrets-dir")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir subDir: %v", err)
+	}
+	if err := lockDownSecretPathsWith(0, "", noopChown, realChmod, "", subDir, filepath.Join(tmp, "missing")); err != nil {
+		t.Fatalf("dataDir=\"\" unexpected error: %v", err)
+	}
+	if st, err := os.Stat(subDir); err != nil || st.Mode().Perm() != 0o700 {
+		t.Fatalf("expected subDir mode 0700, got %o (err=%v)", st.Mode().Perm(), err)
+	}
+
+	// 2. dataDir missing (os.ErrNotExist) is tolerated cleanly.
+	missingDir := filepath.Join(tmp, "no-such-data")
+	if err := lockDownSecretPathsWith(0, missingDir, noopChown, realChmod, missingDir); err != nil {
+		t.Fatalf("missing dataDir unexpected error: %v", err)
+	}
+
+	// 3. dataDir lstat non-ErrNotExist error (ENOTDIR via child under regular file).
+	regFile := filepath.Join(tmp, "regfile")
+	if err := os.WriteFile(regFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write regFile: %v", err)
+	}
+	if err := lockDownSecretPathsWith(0, filepath.Join(regFile, "child"), noopChown, realChmod); err == nil || !strings.Contains(err.Error(), "lstat") {
+		t.Fatalf("expected lstat ENOTDIR error on dataDir, got %v", err)
+	}
+
+	// 4. dataDir is symlink -> fail closed.
+	symDir := filepath.Join(tmp, "sym-data")
+	if err := os.Symlink(subDir, symDir); err != nil {
+		t.Fatalf("symlink symDir: %v", err)
+	}
+	if err := lockDownSecretPathsWith(0, symDir, noopChown, realChmod); err == nil || !strings.Contains(err.Error(), "refusing symlink secret directory") {
+		t.Fatalf("expected symlink dataDir error, got %v", err)
+	}
+
+	// 5. dataDir is not a directory -> fail closed.
+	if err := lockDownSecretPathsWith(0, regFile, noopChown, realChmod); err == nil || !strings.Contains(err.Error(), "is not a directory") {
+		t.Fatalf("expected non-directory dataDir error, got %v", err)
+	}
+
+	// 6. dataDir chmod failure -> fail closed.
+	boom := errors.New("simulated EPERM")
+	if err := lockDownSecretPathsWith(0, subDir, noopChown, func(string, os.FileMode) error { return boom }); err == nil || !strings.Contains(err.Error(), "chmod") {
+		t.Fatalf("expected dataDir chmod error, got %v", err)
+	}
+
+	// 7. paths duplicate of dataDir skipped, and paths lstat non-ErrNotExist error (ENOTDIR).
+	if err := lockDownSecretPathsWith(0, subDir, noopChown, realChmod, subDir); err != nil {
+		t.Fatalf("duplicate dataDir in paths unexpected error: %v", err)
+	}
+	if err := lockDownSecretPathsWith(0, subDir, noopChown, realChmod, filepath.Join(regFile, "child")); err == nil || !strings.Contains(err.Error(), "lstat") {
+		t.Fatalf("expected paths lstat ENOTDIR error, got %v", err)
+	}
+
+	// 8. paths chown and chmod failures (succeed on dataDir, fail on path).
+	secretFile := filepath.Join(subDir, "secret.json")
+	if err := os.WriteFile(secretFile, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write secretFile: %v", err)
+	}
+	if err := lockDownSecretPathsWith(0, subDir, func(p string, _, _ int) error {
+		if p == secretFile {
+			return boom
+		}
+		return nil
+	}, realChmod, secretFile); err == nil || !strings.Contains(err.Error(), "chown") {
+		t.Fatalf("expected paths chown error, got %v", err)
+	}
+	if err := lockDownSecretPathsWith(0, subDir, noopChown, func(p string, m os.FileMode) error {
+		if p == secretFile {
+			return boom
+		}
+		return os.Chmod(p, m)
+	}, secretFile); err == nil || !strings.Contains(err.Error(), "chmod") {
+		t.Fatalf("expected paths chmod error, got %v", err)
+	}
+}
+
+func TestDropRootWithOrderingAndFailClosedVerification(t *testing.T) {
+	if os.Geteuid() != 0 {
+		if err := DropRoot(); err != nil {
+			t.Fatalf("DropRoot non-root unexpected error: %v", err)
+		}
+	}
+
+	newBaseDeps := func(ops *[]string) privDeps {
+		curUID, curEUID, curGID, curEGID := 0, 0, 0, 0
+		curGroups := []int{0}
+		return privDeps{
+			geteuid:   func() int { return curEUID },
+			getuid:    func() int { return curUID },
+			getegid:   func() int { return curEGID },
+			getgid:    func() int { return curGID },
+			getgroups: func() ([]int, error) { *ops = append(*ops, "getgroups"); return curGroups, nil },
+			setNoNewPrivs: func() syscall.Errno {
+				*ops = append(*ops, "prctl:NO_NEW_PRIVS")
+				return 0
+			},
+			setgroups: func(g []int) error {
+				*ops = append(*ops, "setgroups")
+				curGroups = g
+				return nil
+			},
+			setgid: func(id int) error {
+				*ops = append(*ops, "setgid")
+				curGID, curEGID = id, id
+				return nil
+			},
+			setuid: func(id int) error {
+				*ops = append(*ops, "setuid")
+				curUID, curEUID = id, id
+				return nil
+			},
+			setDumpableZero: func() syscall.Errno {
+				*ops = append(*ops, "prctl:DUMPABLE=0")
+				return 0
+			},
+		}
+	}
+
+	// 1. Happy path verifies exact call order and non-0 supplementary group acceptance.
+	var ops []string
+	deps := newBaseDeps(&ops)
+	deps.getgroups = func() ([]int, error) {
+		ops = append(ops, "getgroups")
+		return []int{nonrootUID}, nil
+	}
+	if err := dropRootWith(deps); err != nil {
+		t.Fatalf("dropRootWith happy path failed: %v", err)
+	}
+	wantOps := "prctl:NO_NEW_PRIVS,setgroups,setgid,setuid,prctl:DUMPABLE=0,getgroups"
+	if got := strings.Join(ops, ","); got != wantOps {
+		t.Fatalf("dropRootWith order = %q, want %q", got, wantOps)
+	}
+
+	// 2. Each step fails closed.
+	boom := errors.New("boom")
+
+	d := newBaseDeps(&ops)
+	d.setNoNewPrivs = func() syscall.Errno { return syscall.EPERM }
+	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "PR_SET_NO_NEW_PRIVS") {
+		t.Fatalf("expected PR_SET_NO_NEW_PRIVS error, got %v", err)
+	}
+
+	d = newBaseDeps(&ops)
+	d.setgroups = func([]int) error { return boom }
+	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "setgroups") {
+		t.Fatalf("expected setgroups error, got %v", err)
+	}
+
+	d = newBaseDeps(&ops)
+	d.setgid = func(int) error { return boom }
+	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "setgid") {
+		t.Fatalf("expected setgid error, got %v", err)
+	}
+
+	d = newBaseDeps(&ops)
+	d.setuid = func(int) error { return boom }
+	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "setuid") {
+		t.Fatalf("expected setuid error, got %v", err)
+	}
+
+	d = newBaseDeps(&ops)
+	d.setDumpableZero = func() syscall.Errno { return syscall.EINVAL }
+	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "PR_SET_DUMPABLE") {
+		t.Fatalf("expected PR_SET_DUMPABLE error, got %v", err)
+	}
+
+	// 3. Post-drop UID/GID verification failures.
+	d = newBaseDeps(&ops)
+	d.setuid = func(int) error { return nil } // leaves uid/euid at 0
+	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "did not transition to 65532") {
+		t.Fatalf("expected uid/euid verification error, got %v", err)
+	}
+
+	// 4. getgroups error and group 0 still present error.
+	d = newBaseDeps(&ops)
+	d.getgroups = func() ([]int, error) { return nil, boom }
+	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "verify supplementary groups") {
+		t.Fatalf("expected getgroups error, got %v", err)
+	}
+
+	d = newBaseDeps(&ops)
+	d.getgroups = func() ([]int, error) { return []int{nonrootUID, 0}, nil }
+	if err := dropRootWith(d); err == nil || !strings.Contains(err.Error(), "supplementary group 0") {
+		t.Fatalf("expected supplementary group 0 error, got %v", err)
 	}
 }

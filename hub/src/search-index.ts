@@ -26,6 +26,14 @@ import {
 } from './jobs';
 import { validatePublicHttpsTargetUrl } from './overflow';
 import {
+  getActiveRequestTracer,
+  sanitizeUrlForSpan,
+  setActiveSpanAttribute,
+  type ActiveSpanHandle,
+  type RequestTracer,
+  type TraceContext,
+} from './otel';
+import {
   cleanPdfMarkdown,
   decodeHtmlEntities,
   decodeMarkdownEntities,
@@ -650,18 +658,23 @@ export class D1FtsSearchIndex implements SearchIndex {
     title: string;
     markdown: string;
     fetchedAt: number;
+    tracer?: RequestTracer | TraceContext;
   }): Promise<ReplacePageChunksResult> {
     const { collectionId, documentId, pageId, url, title, markdown, fetchedAt } = params;
     if (!COLLECTION_ID_RE.test(collectionId)) {
       throw new Error(`invalid collectionId: ${collectionId}`);
     }
 
+    const activeTracer = getActiveRequestTracer(params.tracer);
+    const runReplace = async (span?: ActiveSpanHandle): Promise<ReplacePageChunksResult> => {
     // Probe current D1 database size via a lightweight no-op metadata read if unknown, and enforce the 9 GB stop ceiling.
     if (this.lastKnownDbSizeBytes === 0) {
       const probe = await this.db.prepare('SELECT 1 AS ok').run();
       await this.observeMeta(probe.meta);
     }
     if (this.lastKnownDbSizeBytes >= this.maxBytes) {
+      span?.setAttribute('edgefetch.fts5.status', 'capacity_reached');
+      span?.setAttribute('edgefetch.fts5.capacity_warning', true);
       return {
         status: 'capacity_reached',
         error: 'search_capacity_reached',
@@ -697,6 +710,8 @@ export class D1FtsSearchIndex implements SearchIndex {
 
     for (let offset = SEARCH_BATCH_INSERT_LIMIT; offset < chunks.length; offset += SEARCH_BATCH_INSERT_LIMIT) {
       if (this.lastKnownDbSizeBytes >= this.maxBytes) {
+        span?.setAttribute('edgefetch.fts5.status', 'capacity_reached');
+        span?.setAttribute('edgefetch.fts5.capacity_warning', true);
         return {
           status: 'capacity_reached',
           error: 'search_capacity_reached',
@@ -726,22 +741,50 @@ export class D1FtsSearchIndex implements SearchIndex {
       }
     }
 
+    const capacityWarning = this.lastKnownDbSizeBytes >= this.warnBytes;
+    span?.setAttribute('edgefetch.fts5.status', 'indexed');
+    span?.setAttribute('edgefetch.fts5.chunk_count', chunks.length);
+    span?.setAttribute('edgefetch.fts5.rows_written', rowsWritten);
+    span?.setAttribute('edgefetch.fts5.capacity_warning', capacityWarning);
     return {
       status: 'indexed',
       chunkCount: chunks.length,
       rowsWritten,
       dbSizeBytes: this.lastKnownDbSizeBytes,
-      capacityWarning: this.lastKnownDbSizeBytes >= this.warnBytes,
+      capacityWarning,
     };
+    };
+
+    if (!activeTracer) return runReplace();
+    return activeTracer.withSpan(
+      'edgefetch.fts5.index',
+      {
+        kind: 3,
+        attributes: {
+          'db.system': 'sqlite',
+          'db.operation': 'replace_page_chunks',
+          'edgefetch.collection_id': collectionId,
+          'url.full': sanitizeUrlForSpan(url),
+        },
+      },
+      (span) => runReplace(span),
+    );
   }
 
-  async searchCollection(params: { collectionId: string; query: string; limit?: number }): Promise<SearchChunkHit[]> {
+  async searchCollection(params: {
+    collectionId: string;
+    query: string;
+    limit?: number;
+    tracer?: RequestTracer | TraceContext;
+  }): Promise<SearchChunkHit[]> {
     const { collectionId, query, limit = 10 } = params;
     if (!COLLECTION_ID_RE.test(collectionId)) return [];
     const safeMatch = sanitizeFtsQuery(query);
     if (!safeMatch) return [];
 
     const safeLimit = Math.min(50, Math.max(1, Math.floor(limit)));
+    const activeTracer = getActiveRequestTracer(params.tracer);
+    const runSearch = async (span?: ActiveSpanHandle): Promise<SearchChunkHit[]> => {
     const rows = await this.db
       .prepare(
         `SELECT c.page_id,
@@ -776,7 +819,7 @@ export class D1FtsSearchIndex implements SearchIndex {
       }>();
 
     await this.observeMeta(rows.meta);
-    return (rows.results ?? []).map((r) => ({
+    const hits = (rows.results ?? []).map((r) => ({
       collectionId,
       pageId: r.page_id,
       documentId: r.document_id,
@@ -789,6 +832,27 @@ export class D1FtsSearchIndex implements SearchIndex {
       score: bm25RankToScore(r.rank),
       fetchedAt: r.fetched_at,
     }));
+    span?.setAttribute('edgefetch.fts5.hit_count', hits.length);
+    span?.setAttribute('search.hit_count', hits.length);
+    return hits;
+    };
+
+    if (!activeTracer) return runSearch();
+    return activeTracer.withSpan(
+      'edgefetch.search.fts5',
+      {
+        kind: 3,
+        attributes: {
+          'db.system': 'sqlite',
+          'db.operation': 'search',
+          'edgefetch.collection_id': collectionId,
+          'search.collection_id': collectionId,
+          'edgefetch.fts5.limit': safeLimit,
+          'edgefetch.fts5.term_count': safeMatch.split(' OR ').length,
+        },
+      },
+      (span) => runSearch(span),
+    );
   }
 }
 
@@ -900,7 +964,10 @@ export async function executeExtractCall(params: {
   source?: string;
   selfHost?: string;
   now?: number;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> }> {
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const runExtract = async (): Promise<{ status: number; via: string; body: Record<string, unknown> }> => {
   const { payload, env, executeHubFetch, source = 'extract', selfHost, now = Date.now() } = params;
   if (!Array.isArray(payload.urls) || payload.urls.length === 0 || payload.urls.length > 20) {
     return {
@@ -984,6 +1051,7 @@ export async function executeExtractCall(params: {
   for (let i = 0; i < normalizedUrls.length; i++) {
     const u = normalizedUrls[i]!;
     if (maxAgeMs > 0 && env.ARTIFACTS && env.META && !jsonFilterStr) {
+      const cacheStartMs = Date.now();
       const hit = await lookupCachedScrape({
         bucket: env.ARTIFACTS,
         metaDb: env.META,
@@ -993,6 +1061,22 @@ export async function executeExtractCall(params: {
         now,
       });
       if (hit) {
+        if (activeTracer) {
+          const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
+            kind: 1,
+            startTimeMs: cacheStartMs,
+            attributes: {
+              'cache.hit': true,
+              'cache.tier': 'r2-d1',
+              'cache.revalidated': false,
+              'url.full': sanitizeUrlForSpan(u),
+              'http.response.status_code': hit.status,
+              'edgefetch.pipeline_version': hit.pipelineVersion,
+            },
+          });
+          cacheSpan.setStatus(true);
+          cacheSpan.end();
+        }
         const strippedCached = stripYamlFrontmatter(hit.markdown);
         const cleanCachedMd = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(strippedCached.body), u);
         byUrl.set(u, {
@@ -1009,6 +1093,10 @@ export async function executeExtractCall(params: {
   }
 
   let via = 'cache:r2-d1';
+  if (toFetch.length === 0 && activeTracer) {
+    setActiveSpanAttribute('edgefetch.via', via, activeTracer);
+    setActiveSpanAttribute('edgefetch.cached', true, activeTracer);
+  }
   if (toFetch.length > 0) {
     const isEphemeral = Boolean(payload.ephemeral) && !collectionId;
     const retentionMode: ArtifactRetention | 'off' | undefined = isEphemeral
@@ -1176,6 +1264,7 @@ export async function executeExtractCall(params: {
             robotsAlreadyVerified: false,
             onlyMainContent: true,
             noCache: Boolean(payload.noCache),
+            ...(activeTracer ? { tracer: activeTracer } : {}),
           });
           if (spaOut) {
             via = spaOut.via;
@@ -1278,6 +1367,7 @@ export async function executeExtractCall(params: {
             : null;
         const formatted = atsSpec.format(rawBodyStr, item.url, htmlFragToMd);
         if ((jsonFilterStr && filteredBoard) || (formatted && formatted.markdown.trim())) {
+          setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
           const mdRaw = sanitizeInlineHtmlInMarkdown(
             jsonFilterStr && filteredBoard ? filteredBoard.markdown : formatted!.markdown,
             item.url,
@@ -1311,6 +1401,7 @@ export async function executeExtractCall(params: {
       if (twinSpec && rawBodyStr) {
         const twinOut = twinSpec.formatTwin(rawBodyStr, item.url, htmlFragToMd);
         if (twinOut && twinOut.markdown.trim()) {
+          setActiveSpanAttribute('edgefetch.adapter_id', twinSpec.id, activeTracer ?? undefined);
           const sanitizedTwin = sanitizeInlineHtmlInMarkdown(twinOut.markdown, item.url).trim();
           byUrl.set(item.url, {
             url: item.url,
@@ -1359,6 +1450,7 @@ export async function executeExtractCall(params: {
               const stubBody = typeof stubItem?.body === 'string' && stubItem.bodyEncoding !== 'base64' ? stubItem.body : '';
               const stubFmt = stubItem?.outcome === 'ok' && stubBody ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd) : null;
               if (stubFmt && stubFmt.markdown.trim()) {
+                setActiveSpanAttribute('edgefetch.adapter_id', stubAts.id, activeTracer ?? undefined);
                 const sanitizedStub = sanitizeInlineHtmlInMarkdown(stubFmt.markdown, wdStub.redirectUrl).trim();
                 byUrl.set(item.url, {
                   url: item.url,
@@ -1627,6 +1719,7 @@ export async function executeExtractCall(params: {
           robotsAlreadyVerified: true,
           onlyMainContent: true,
           noCache: Boolean(payload.noCache),
+          ...(activeTracer ? { tracer: activeTracer } : {}),
         });
         if (spaOut && countExtractWords(spaOut.markdown) > countExtractWords(md)) {
           md = redactPii ? redactPiiText(spaOut.markdown) : spaOut.markdown;
@@ -1708,4 +1801,6 @@ export async function executeExtractCall(params: {
       failedResults,
     },
   };
+  };
+  return activeTracer ? activeTracer.run(runExtract) : runExtract();
 }

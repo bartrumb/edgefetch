@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bartrumb/edgefetch/v2/internal/otel"
 	"github.com/coder/websocket"
 )
 
@@ -829,5 +831,142 @@ func TestRemoteDebuggingPipeExposesZeroListeningTCPPortsIfChromeInstalled(t *tes
 				t.Fatalf("SECURITY (R5-M6): Chromium pid %d opened listening TCP socket %s (%s) under --remote-debugging-pipe!", checkPID, target, localHex)
 			}
 		}
+	}
+}
+
+func TestMockRendererEmitsBrowserRenderChildSpan(t *testing.T) {
+	var challengeMode atomic.Bool
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		var writeMu sync.Mutex
+		send := func(v any) {
+			b, _ := json.Marshal(v)
+			writeMu.Lock()
+			_ = conn.Write(r.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+		for {
+			_, raw, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID        int64  `json:"id"`
+				SessionID string `json:"sessionId"`
+				Method    string `json:"method"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				continue
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-otel"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-otel"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "s-otel"}})
+			case "Page.navigate":
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "f-otel"}})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Page.loadEventFired", "params": map[string]any{}})
+			case "Runtime.evaluate":
+				htmlBody := "<html><head><title>App</title></head><body><main>Rendered DOM</main></body></html>"
+				if challengeMode.Load() {
+					htmlBody = "<html><head><title>Just a moment...</title></head><body>Checking your browser before accessing</body></html>"
+				}
+				docJSON, _ := json.Marshal(map[string]string{
+					"url":  "https://app.example.com/dashboard?token=SECRET_BROWSER_TOKEN#frag",
+					"html": htmlBody,
+				})
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result":    map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}},
+				})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+
+	var (
+		mu        sync.Mutex
+		rawBodies []string
+	)
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		rawBodies = append(rawBodies, string(b))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+
+	exp := otel.NewExporterFromEnv(func(k string) string {
+		if k == "OTEL_EXPORTER_OTLP_ENDPOINT" {
+			return collector.URL
+		}
+		return ""
+	}, "edgefetch-browser-test", "2.7.0", collector.Client().Transport)
+
+	r := NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, "EdgeFetchTest/1.0")
+	r.SetOtelExporter(exp)
+	defer r.Close()
+
+	parentTC := otel.TraceContext{
+		TraceID: "4bf92f3577b34da6a3ce929d0e0e4736",
+		SpanID:  "1122334455667788",
+		Sampled: true,
+	}
+	ctx := otel.WithTraceContext(context.Background(), parentTC)
+
+	// 1. Success render emits child edgefetch.browser.render span with sanitized URL.
+	out, err := r.Execute(ctx, Task{
+		URL:       "https://app.example.com/dashboard?token=SECRET_BROWSER_TOKEN#frag",
+		WaitForMs: 10,
+	})
+	if err != nil || !strings.Contains(out.HTML, "Rendered DOM") {
+		t.Fatalf("expected successful mock render, got out=%+v err=%v", out, err)
+	}
+
+	// 2. Error render (ErrChallengeDetected) emits status.code == 2 on edgefetch.browser.render.
+	challengeMode.Store(true)
+	_, chErr := r.Execute(ctx, Task{
+		URL:       "https://app.example.com/blocked?api_key=SECRET_2",
+		WaitForMs: 10,
+	})
+	if !errors.Is(chErr, ErrChallengeDetected) {
+		t.Fatalf("expected ErrChallengeDetected, got %v", chErr)
+	}
+
+	// 3. Unsampled TraceContext (-00) emits 0 spans.
+	challengeMode.Store(false)
+	unsampledCtx := otel.WithTraceContext(context.Background(), otel.TraceContext{
+		TraceID: "cccccccccccccccccccccccccccccccc",
+		SpanID:  "3333333333333333",
+		Sampled: false,
+	})
+	if _, uErr := r.Execute(unsampledCtx, Task{URL: "https://app.example.com/unsampled", WaitForMs: 10}); uErr != nil {
+		t.Fatalf("unsampled execute failed: %v", uErr)
+	}
+
+	_ = exp.Close()
+
+	mu.Lock()
+	combined := strings.Join(rawBodies, "\n")
+	mu.Unlock()
+
+	if strings.Contains(combined, "SECRET_BROWSER_TOKEN") || strings.Contains(combined, "SECRET_2") || strings.Contains(combined, "#frag") || strings.Contains(combined, "cccccccccccccccccccccccccccccccc") {
+		t.Fatalf("SECURITY/SAMPLING: secret or unsampled trace leaked into OTLP output:\n%s", combined)
+	}
+	if !strings.Contains(combined, `"edgefetch.browser.render"`) ||
+		!strings.Contains(combined, `"parentSpanId":"1122334455667788"`) ||
+		!strings.Contains(combined, `"https://app.example.com/dashboard"`) ||
+		!strings.Contains(combined, `"code":2`) {
+		t.Fatalf("expected edgefetch.browser.render parented spans with sanitized URL and error code, got:\n%s", combined)
 	}
 }

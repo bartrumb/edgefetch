@@ -122,8 +122,14 @@ func TestRendererLoopbackProxyBypassBlockedLiveIfChromeInstalled(t *testing.T) {
 	if victimHits.Load() != 0 {
 		t.Fatalf("SECURITY (H1): Chromium bypassed SSRFProxy and hit loopback victim %d time(s)!", victimHits.Load())
 	}
-	if err == nil && strings.Contains(out.HTML, "TOP_SECRET_LOOPBACK_TOKEN") {
+	if err == nil {
+		t.Fatalf("SECURITY (H1): expected error when navigating to blocked loopback target, got out=%+v", out)
+	}
+	if strings.Contains(out.HTML, "TOP_SECRET_LOOPBACK_TOKEN") {
 		t.Fatalf("SECURITY (H1): loopback response body leaked into rendered output")
+	}
+	if ver, sb := r.BrowserInfo(); ver == "" || sb == "" {
+		t.Fatalf("expected non-empty BrowserInfo after live Execute, got version=%q sandbox=%q", ver, sb)
 	}
 
 	// 2. Live WebRTC STUN UDP loopback leak check (M2): zero STUN UDP packets may reach 127.0.0.1.
@@ -163,9 +169,15 @@ func TestRendererLoopbackProxyBypassBlockedLiveIfChromeInstalled(t *testing.T) {
 		}
 	})()`, udpPort)
 
-	_, _ = r.Execute(ctx, Task{
+	webrtcOut, webrtcErr := r.Execute(ctx, Task{
 		Actions: []InteractAction{{Type: "executeJavascript", Script: webrtcScript, WaitMs: 100}},
 	})
+	if webrtcErr != nil {
+		t.Fatalf("WebRTC probe Execute failed: %v", webrtcErr)
+	}
+	if len(webrtcOut.JavascriptReturns) != 1 || (webrtcOut.JavascriptReturns[0].Value != "probed" && webrtcOut.JavascriptReturns[0].Value != "no_webrtc") {
+		t.Fatalf("unexpected WebRTC probe return: %+v", webrtcOut.JavascriptReturns)
+	}
 	if stunPackets.Load() != 0 {
 		t.Fatalf("SECURITY (M2): Chromium leaked %d WebRTC STUN UDP packet(s) to 127.0.0.1:%d", stunPackets.Load(), udpPort)
 	}

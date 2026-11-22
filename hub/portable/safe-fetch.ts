@@ -208,6 +208,36 @@ export interface SafeOutboundFetchOptions {
  * Builds a Web-API-compatible `typeof fetch` backed by `node:https` / `node:http` with dial-time
  * `createPublicOnlyLookup` IP filtering and `redirect: 'manual'` enforcement (`H5`).
  */
+function validateExplicitLoopbackTargetUrl(raw: string): URL | null {
+  const trimmed = raw.trim();
+  const authorityMatch = /^https?:\/\/([^/?#]+)/i.exec(trimmed);
+  if (!authorityMatch) return null;
+  const rawAuthority = authorityMatch[1]!;
+  if (!rawAuthority || rawAuthority.includes('@')) return null;
+
+  // Enforce strict literal authority allowlist BEFORE WHATWG `new URL(...)` normalization
+  // so decimal/hex/octal/short IPv4 (e.g. 2130706433, 0x7f000001, 0177.0.0.1, 127.1),
+  // non-canonical IPv6 (e.g. [0:0:0:0:0:0:0:1]), trailing dots, and invalid ports are rejected.
+  const literalMatch = /^(127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$/i.exec(rawAuthority);
+  if (!literalMatch) return null;
+  if (literalMatch[2] !== undefined) {
+    const port = Number(literalMatch[2]);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  }
+
+  let u: URL;
+  try {
+    u = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (u.username || u.password) return null;
+  const h = u.hostname.toLowerCase();
+  if (h !== '127.0.0.1' && h !== 'localhost' && h !== '[::1]') return null;
+  return u;
+}
+
 export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): typeof fetch {
   const safeLookup = createPublicOnlyLookup(opts.resolver);
   const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 32, lookup: safeLookup });
@@ -526,7 +556,9 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
       throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
     }
     const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-    let currentUrl = new URL(rawUrl);
+    const explicitLoopbackHop0Url =
+      opts.allowExplicitLoopbackUrls === true ? validateExplicitLoopbackTargetUrl(rawUrl) : null;
+    let currentUrl = explicitLoopbackHop0Url ?? new URL(rawUrl);
     let currentMethod = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
     let bodyBytes: Buffer | null = null;
     if (init?.body !== undefined && init.body !== null) {
@@ -570,7 +602,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
           currentUrl,
           { ...init, method: currentMethod, headers: currentHeaders, signal: effectiveSignal },
           bodyBytes,
-          hop === 0 && opts.allowExplicitLoopbackUrls === true,
+          hop === 0 && explicitLoopbackHop0Url !== null,
           () => {
             if (isLastReturnedHop.kept) clearRequestTimer();
           },
@@ -606,6 +638,7 @@ export function createSafeOutboundFetch(opts: SafeOutboundFetchOptions = {}): ty
         if (nextUrl.origin !== currentUrl.origin) {
           currentHeaders.delete('authorization');
           currentHeaders.delete('cookie');
+          currentHeaders.delete('proxy-authorization');
           currentHeaders.delete('x-api-key');
           currentHeaders.delete('x-goog-api-key');
         }

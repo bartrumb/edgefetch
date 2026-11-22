@@ -14,6 +14,7 @@
  */
 
 import { fetchOverflowRobots, isRobotsAllowed } from './overflow';
+import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle, type RequestTracer, type TraceContext } from './otel';
 import { classifyWafAndChallenge, type ContentState, type WafClassification } from './waf';
 
 export type SpaFallbackProvider = 'crawl4ai' | 'firecrawl';
@@ -312,6 +313,7 @@ export async function tryExternalSpaFallback(params: {
   waitForMs?: number;
   waitSelector?: string;
   noCache?: boolean;
+  tracer?: RequestTracer | TraceContext;
 }): Promise<SpaFallbackSuccess | null> {
   const mode = params.mode ?? 'auto';
   if (mode === 'off') return null;
@@ -320,42 +322,79 @@ export async function tryExternalSpaFallback(params: {
   const candidates = mode === 'auto' ? configured : configured.filter((p) => p === mode);
   if (candidates.length === 0) return null;
 
-  const fetchFn = params.env.SPA_FALLBACK_FETCH ?? params.env.SAFE_FETCH ?? fetch;
-  const robotsFetchFn = params.env.SPA_FALLBACK_FETCH ?? params.env.SAFE_PUBLIC_FETCH ?? fetchFn;
-  const ua = params.env.USER_AGENT?.trim() || 'EdgeFetch/2.6 (bot@edgefetch.dev)';
+  const activeTracer = getActiveRequestTracer(params.tracer);
+  const executeFallback = async (span?: ActiveSpanHandle): Promise<SpaFallbackSuccess | null> => {
+    const fetchFn = params.env.SPA_FALLBACK_FETCH ?? params.env.SAFE_FETCH ?? fetch;
+    const robotsFetchFn = params.env.SPA_FALLBACK_FETCH ?? params.env.SAFE_PUBLIC_FETCH ?? fetchFn;
+    const ua = params.env.USER_AGENT?.trim() || 'EdgeFetch/2.6 (bot@edgefetch.dev)';
 
-  if (!params.robotsAlreadyVerified) {
-    const allowed = await verifyRobotsBeforeExternalFallback(params.url, ua, robotsFetchFn);
-    if (!allowed) return null;
-  }
-
-  for (const provider of candidates) {
-    try {
-      if (provider === 'crawl4ai' && params.env.CRAWL4AI_API_URL?.trim()) {
-        const out = await callCrawl4AiProvider({
-          url: params.url,
-          baseUrl: params.env.CRAWL4AI_API_URL,
-          token: params.env.CRAWL4AI_API_TOKEN,
-          waitSelector: params.waitSelector,
-          noCache: params.noCache,
-          fetchFn,
-        });
-        if (out && out.markdown.trim().length > 0) return out;
-      } else if (provider === 'firecrawl' && (params.env.FIRECRAWL_API_URL?.trim() || params.env.FIRECRAWL_API_KEY?.trim())) {
-        const out = await callFirecrawlProvider({
-          url: params.url,
-          baseUrl: params.env.FIRECRAWL_API_URL,
-          apiKey: params.env.FIRECRAWL_API_KEY,
-          onlyMainContent: params.onlyMainContent,
-          waitForMs: params.waitForMs,
-          noCache: params.noCache,
-          fetchFn,
-        });
-        if (out && out.markdown.trim().length > 0) return out;
+    if (!params.robotsAlreadyVerified) {
+      const allowed = await verifyRobotsBeforeExternalFallback(params.url, ua, robotsFetchFn);
+      span?.setAttribute('edgefetch.spa_fallback.robots_allowed', allowed);
+      if (!allowed) {
+        span?.setAttribute('edgefetch.spa_fallback.succeeded', false);
+        return null;
       }
-    } catch {
-      // Fail over to next configured SPA provider cleanly if first is unreachable.
     }
+
+    for (const provider of candidates) {
+      try {
+        if (provider === 'crawl4ai' && params.env.CRAWL4AI_API_URL?.trim()) {
+          const out = await callCrawl4AiProvider({
+            url: params.url,
+            baseUrl: params.env.CRAWL4AI_API_URL,
+            token: params.env.CRAWL4AI_API_TOKEN,
+            waitSelector: params.waitSelector,
+            noCache: params.noCache,
+            fetchFn,
+          });
+          if (out && out.markdown.trim().length > 0) {
+            span?.setAttribute('edgefetch.spa_fallback.provider', out.provider);
+            span?.setAttribute('edgefetch.spa_fallback.via', out.via);
+            span?.setAttribute('http.response.status_code', out.status);
+            span?.setAttribute('edgefetch.spa_fallback.succeeded', true);
+            return out;
+          }
+        } else if (provider === 'firecrawl' && (params.env.FIRECRAWL_API_URL?.trim() || params.env.FIRECRAWL_API_KEY?.trim())) {
+          const out = await callFirecrawlProvider({
+            url: params.url,
+            baseUrl: params.env.FIRECRAWL_API_URL,
+            apiKey: params.env.FIRECRAWL_API_KEY,
+            onlyMainContent: params.onlyMainContent,
+            waitForMs: params.waitForMs,
+            noCache: params.noCache,
+            fetchFn,
+          });
+          if (out && out.markdown.trim().length > 0) {
+            span?.setAttribute('edgefetch.spa_fallback.provider', out.provider);
+            span?.setAttribute('edgefetch.spa_fallback.via', out.via);
+            span?.setAttribute('http.response.status_code', out.status);
+            span?.setAttribute('edgefetch.spa_fallback.succeeded', true);
+            return out;
+          }
+        }
+      } catch {
+        // Fail over to next configured SPA provider cleanly if first is unreachable.
+      }
+    }
+    span?.setAttribute('edgefetch.spa_fallback.succeeded', false);
+    return null;
+  };
+
+  if (!activeTracer) {
+    return executeFallback();
   }
-  return null;
+  return activeTracer.withSpan(
+    'edgefetch.spa_fallback',
+    {
+      kind: 3,
+      attributes: {
+        'url.full': sanitizeUrlForSpan(params.url),
+        'edgefetch.spa_fallback.mode': mode,
+        'edgefetch.spa_fallback.candidates': candidates.join(','),
+        'edgefetch.spa_fallback.robots_preverified': params.robotsAlreadyVerified,
+      },
+    },
+    (span) => executeFallback(span),
+  );
 }

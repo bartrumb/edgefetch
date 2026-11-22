@@ -1,6 +1,6 @@
 # Writing & Contributing Site Adapters
 
-EdgeFetch ships a modular **Site, Commerce & ATS Adapter Library** covering **50+ keyless public platforms** across 7 categories, designed so contributors and coding agents can add a new platform in minutes with zero regex pitfalls.
+EdgeFetch ships an **open-source (`MIT`) Site, Commerce & ATS Adapter Library** covering **56+ keyless public platforms** across 7 categories (`internal/extract/manifests/*.yaml` and [`hub/src/extractors/`](../hub/src/extractors/LICENSE)), designed so contributors and coding agents can add a new platform in minutes with zero regex pitfalls.
 
 ## 1. Two Authoring Tiers (Pick the Simplest One That Fits)
 

@@ -1,8 +1,14 @@
 package extract
 
 import (
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"math"
+	"net/url"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/bartrumb/edgefetch/v2/internal/classify"
 )
@@ -309,4 +315,519 @@ func FuzzDeclarativeFormat(f *testing.F) {
 			}
 		}
 	})
+}
+
+type errorReadDirFS struct {
+	err error
+}
+
+func (e errorReadDirFS) Open(string) (fs.File, error)          { return nil, e.err }
+func (e errorReadDirFS) ReadDir(string) ([]fs.DirEntry, error) { return nil, e.err }
+
+type readFileErrorFS struct {
+	inner fstest.MapFS
+	fail  string
+}
+
+func (r readFileErrorFS) Open(name string) (fs.File, error) {
+	if name == r.fail {
+		return nil, errors.New("read failed")
+	}
+	return r.inner.Open(name)
+}
+
+func (r readFileErrorFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	return r.inner.ReadDir(name)
+}
+
+func TestDeclarativeRegistryFSAndWildcardMatching(t *testing.T) {
+	if _, err := loadRegistryFromFS(errorReadDirFS{err: errors.New("dir boom")}); err == nil {
+		t.Fatal("expected ReadDir error from loadRegistryFromFS")
+	}
+
+	validJSON := `{"id":"json-ad","name":"JSON Adapter","category":"developer","description":"desc","domains":["","*.wild.example.com","prefix.*","exact.example.com"],"exampleUrls":["https://exact.example.com/a"],"match":{"pathSegments":["a"]},"twin":{"fetchUrl":"https://api.example.com/{host}","kind":"json","accept":""},"extract":{"vars":{"t":{"paths":["t"]}},"titleTemplate":"{t}"}}`
+	mapFS := fstest.MapFS{
+		"manifests/subdir/file.yaml": &fstest.MapFile{Mode: fs.ModeDir, Data: nil},
+		"manifests/notes.txt":        &fstest.MapFile{Data: []byte("ignored")},
+		"manifests/bad.yaml":         &fstest.MapFile{Data: []byte("id: bad\n")},
+		"manifests/good.json":        &fstest.MapFile{Data: []byte(validJSON)},
+		"manifests/dup.json":         &fstest.MapFile{Data: []byte(validJSON)},
+		"manifests/unreadable.yaml":  &fstest.MapFile{Data: []byte("id: x")},
+	}
+	// Make manifests/subdir an actual directory entry
+	mapFS["manifests/subdir"] = &fstest.MapFile{Mode: fs.ModeDir}
+	delete(mapFS, "manifests/subdir/file.yaml")
+
+	reg, err := loadRegistryFromFS(readFileErrorFS{inner: mapFS, fail: "manifests/unreadable.yaml"})
+	if err == nil {
+		t.Fatal("expected initErr when manifests include bad/dup/unreadable files")
+	}
+	if len(reg.manifests) != 1 || reg.manifests[0].ID != "json-ad" {
+		t.Fatalf("expected 1 valid json-ad manifest loaded, got %+v", reg.manifests)
+	}
+
+	// Wildcard suffix (*.wild.example.com) and prefix (prefix.*) resolution + {host} expansion
+	mSuf, ok := resolveDeclarativeTwinWithRegistry(reg, "https://sub.wild.example.com/a")
+	if !ok || mSuf.FetchURL != "https://api.example.com/sub.wild.example.com" || mSuf.Accept != "application/json" {
+		t.Fatalf("wildcard suffix twin failed: ok=%v m=%+v", ok, mSuf)
+	}
+	mPre, ok := resolveDeclarativeTwinWithRegistry(reg, "https://prefix.org/a")
+	if !ok || mPre.FetchURL != "https://api.example.com/prefix.org" {
+		t.Fatalf("wildcard prefix twin failed: ok=%v m=%+v", ok, mPre)
+	}
+	if _, ok := resolveDeclarativeTwinWithRegistry(reg, "https:///a"); ok {
+		t.Fatal("empty host URL must return false")
+	}
+}
+
+func TestDeclarativeParsingSearchAndRealManifestBranches(t *testing.T) {
+	// DeclarativeSegmentSpec.UnmarshalJSON error cases
+	var seg DeclarativeSegmentSpec
+	if err := json.Unmarshal([]byte(`"\x"`), &seg); err == nil {
+		t.Fatal("expected invalid JSON string segment error")
+	}
+	if err := seg.UnmarshalJSON([]byte(`"bad`)); err == nil {
+		t.Fatal("expected direct UnmarshalJSON malformed string error")
+	}
+	if err := json.Unmarshal([]byte(`{"param":123}`), &seg); err == nil {
+		t.Fatal("expected invalid object segment error")
+	}
+	if err := json.Unmarshal([]byte(`{}`), &seg); err == nil {
+		t.Fatal("expected missing param name error")
+	}
+
+	// ParseDeclarativeManifest validation branches
+	badManifests := []string{
+		`{"unknownField":1}`,
+		`{"id":"","name":"X","domains":["a.com"],"category":"developer"}`,
+		`{"id":"x","name":"X","domains":["a.com"],"category":"invalid"}`,
+		`{"id":"x","name":"X","domains":["a.com"],"category":"developer"}`,
+		`{"id":"x","name":"X","domains":["a.com"],"category":"developer","match":{},"twin":{"kind":"xml","fetchUrl":"https://a.com"},"extract":{"titleTemplate":"t"}}`,
+		`{"id":"x","name":"X","domains":["a.com"],"category":"developer","match":{},"twin":{"kind":"json","fetchUrl":"http://a.com"},"extract":{"titleTemplate":"t"}}`,
+	}
+	for _, raw := range badManifests {
+		if _, err := ParseDeclarativeManifest([]byte(raw)); err == nil {
+			t.Fatalf("expected ParseDeclarativeManifest error for %s", raw)
+		}
+	}
+
+	// FindDeclarativeAdapters scoring, exact ID/name match, and limit
+	exact := FindDeclarativeAdapters("rubygems", "", 0)
+	if len(exact) == 0 || exact[0].ID != "rubygems" {
+		t.Fatalf("expected rubygems exact match, got %+v", exact)
+	}
+	limited := FindDeclarativeAdapters("com", "", 2)
+	if len(limited) != 2 {
+		t.Fatalf("expected limit=2, got %d", len(limited))
+	}
+
+	// Real manifest edge branches:
+	// 1. doi-crossref with publisher (whenVars=[venue, publisher]) and author fallbackField (name)
+	doiTwin, _ := ResolveDeclarativeTwin("https://doi.org/10.1038/s41586-021-03819-2")
+	doiDoc, ok := doiTwin.Format(`{"message":{"title":["Paper"],"publisher":"Springer","container-title":["Nature"],"author":[{"name":"Consortium"}]}}`)
+	if !ok || !strings.Contains(doiDoc.Markdown, "Nature (Springer)") || !strings.Contains(doiDoc.Markdown, "Consortium") {
+		t.Fatalf("doi-crossref publisher/fallback mismatch: ok=%v doc=%+v", ok, doiDoc)
+	}
+
+	// 2. polymarket closed=true, empty array unwrap, empty outcomes -> "-"
+	polyTwin, _ := ResolveDeclarativeTwin("https://polymarket.com/event/test-ev")
+	if _, ok := polyTwin.Format(`[]`); ok {
+		t.Fatal("empty array unwrap must return false")
+	}
+	polyClosed, ok := polyTwin.Format(`[{"title":"Closed Event","closed":true,"markets":[{"question":"Q1","outcomes":123,"outcomePrices":"bad"}]}]`)
+	if !ok || !strings.Contains(polyClosed.Markdown, "**Status**: Closed") || !strings.Contains(polyClosed.Markdown, "| - |") {
+		t.Fatalf("polymarket closed/empty outcomes mismatch: ok=%v doc=%+v", ok, polyClosed)
+	}
+
+	// 3. packagist only dev-main -> fallback to keys[0], and empty versions: {}
+	pkgTwin, _ := ResolveDeclarativeTwin("https://packagist.org/packages/vendor/pkg")
+	pkgDev, ok := pkgTwin.Format(`{"package":{"name":"vendor/pkg","versions":{"dev-main":{"license":["MIT"]}}}}`)
+	if !ok || pkgDev.Title != "vendor/pkg dev-main (Composer)" {
+		t.Fatalf("packagist dev-main fallback mismatch: ok=%v doc=%+v", ok, pkgDev)
+	}
+	pkgEmpty, ok := pkgTwin.Format(`{"package":{"name":"vendor/pkg","versions":{}}}`)
+	if !ok || !strings.Contains(pkgEmpty.Title, "vendor/pkg") {
+		t.Fatalf("packagist empty versions mismatch: ok=%v doc=%+v", ok, pkgEmpty)
+	}
+
+	// 4. huggingface blob: .md, Makefile, Dockerfile, unknown ext, and card frontmatter edge cases
+	hfMDTwin, _ := ResolveDeclarativeTwin("https://huggingface.co/org/model/blob/main/docs/GUIDE.md")
+	hfMDDoc, ok := hfMDTwin.Format("---\npretty_name: Pretty Model\ndescription: Short summary\n---\n\nBody without H1")
+	if !ok || hfMDDoc.Title != "Pretty Model" || hfMDDoc.Description != "Short summary" {
+		t.Fatalf("huggingface .md blob mismatch: ok=%v doc=%+v", ok, hfMDDoc)
+	}
+	for _, tc := range []struct {
+		url  string
+		want string
+	}{
+		{"https://huggingface.co/org/model/blob/main/Makefile", "```makefile"},
+		{"https://huggingface.co/org/model/blob/main/Dockerfile.prod", "```dockerfile"},
+		{"https://huggingface.co/org/model/blob/main/noext", "```\n"},
+		{"https://huggingface.co/org/model/blob/main/data.xyz", "```xyz"},
+	} {
+		bt, _ := ResolveDeclarativeTwin(tc.url)
+		bdoc, bok := bt.Format("hello\n")
+		if !bok || !strings.Contains(bdoc.Markdown, tc.want) {
+			t.Fatalf("blob %s got (%v, %+v), want %q", tc.url, bok, bdoc, tc.want)
+		}
+	}
+	hfCardTwin, _ := ResolveDeclarativeTwin("https://huggingface.co/org/model")
+	// >8012 bytes unclosed frontmatter + no H1
+	longUnclosedFM := "---\nkey: " + strings.Repeat("a", 8100) + "\nBody text"
+	if doc, ok := hfCardTwin.Format(longUnclosedFM); !ok || doc.Title != "org/model" {
+		t.Fatalf("huggingface long unclosed frontmatter mismatch: ok=%v doc=%+v", ok, doc)
+	}
+	// >12 tags + invalid key + >10 keepKeys
+	manyPropsFM := "---\n" +
+		"bad key: ignored\n" +
+		"license: mit\npipeline_tag: text-generation\nlibrary_name: transformers\nbase_model: base\n" +
+		"language: en\ndatasets: ds\nsdk: gradio\ntask_categories: tc\nsize_categories: 1B\n" +
+		"tags:\n" + strings.Repeat("  - t\n", 14) +
+		"---\nBody only"
+	if doc, ok := hfCardTwin.Format(manyPropsFM); !ok || !strings.Contains(doc.Markdown, "# org/model") {
+		t.Fatalf("huggingface manyPropsFM mismatch: ok=%v doc=%+v", ok, doc)
+	}
+
+	// 5. lobsters: indent_level <0 and >maxInd, non-object comment item, empty comment skipped
+	lobTwin, _ := ResolveDeclarativeTwin("https://lobste.rs/s/abc123/post")
+	lobDoc, ok := lobTwin.Format(`{"title":"T","comments":["bad-item",{"commenting_user":"x","comment_plain":"   "},{"commenting_user":"a","score":1,"indent_level":-5,"comment_plain":"neg"},{"commenting_user":"b","score":2,"indent_level":99,"comment_plain":"deep\n\nline2"}]}`)
+	if !ok || !strings.Contains(lobDoc.Markdown, "- **@a**") || !strings.Contains(lobDoc.Markdown, strings.Repeat("  ", 6)+"- **@b**") {
+		t.Fatalf("lobsters edge comments mismatch: ok=%v doc=%+v", ok, lobDoc)
+	}
+
+	// 6. openrouter: zero and negative pricing, non-object item, non-matching model
+	orTwin, _ := ResolveDeclarativeTwin("https://openrouter.ai/org/model-a")
+	orDoc, ok := orTwin.Format(`{"data":["skip",{"id":"org/model-a","name":"Model A","pricing":{"prompt":"0","completion":"-1"}}]}`)
+	if !ok || !strings.Contains(orDoc.Markdown, "$0.00 / 1M tokens") {
+		t.Fatalf("openrouter pricing mismatch: ok=%v doc=%+v", ok, orDoc)
+	}
+	if _, ok := orTwin.Format(`{"data":[{"id":"other/model"}]}`); ok {
+		t.Fatal("openrouter non-matching model must return false")
+	}
+}
+
+func TestDeclarativeHelpersAndSyntheticTwinCoverage(t *testing.T) {
+	// Nil match Format
+	var nilMatch *DeclarativeTwinMatch
+	if doc, ok := nilMatch.Format("{}"); ok || doc != nil {
+		t.Fatal("nil DeclarativeTwinMatch.Format must return nil, false")
+	}
+
+	// isLikelyHTMLSoft404 empty
+	if !isLikelyHTMLSoft404("   \t\n") {
+		t.Fatal("whitespace-only body should be treated as soft404")
+	}
+
+	// isSafePublicTwinURL all rejection branches
+	for _, bad := range []string{
+		"http://api.example.com/a",
+		"https://user:pass@api.example.com/a",
+		"https://api.example.com:8443/a",
+		"https://localhost/a",
+		"https://svc.local/a",
+		"https://db.internal/a",
+		"https://singlelabel/a",
+		"https://1.2.3.4/a",
+	} {
+		if isSafePublicTwinURL(bad) {
+			t.Fatalf("expected isSafePublicTwinURL(%q) == false", bad)
+		}
+	}
+
+	// normalizeDeclarativeAccept unknown text accept -> text/plain
+	if got := normalizeDeclarativeAccept("text", "application/octet-stream"); got != "text/plain" {
+		t.Fatalf("normalizeDeclarativeAccept(text, unknown) = %q", got)
+	}
+
+	// validateDeclarativeParam all branches
+	if validateDeclarativeParam("ab", "alnum", nil, nil, 3, 10) {
+		t.Fatal("minLen violation should fail")
+	}
+	if validateDeclarativeParam("abc", "alnum", []string{"xyz"}, nil, 1, 10) {
+		t.Fatal("allowValues mismatch should fail")
+	}
+	if !validateDeclarativeParam("xyz", "", []string{"xyz"}, nil, 1, 10) {
+		t.Fatal("allowValues match with default pkg charset should pass")
+	}
+	if validateDeclarativeParam("a-b", "alnum", nil, nil, 1, 10) ||
+		validateDeclarativeParam("a.b", "slug", nil, nil, 1, 10) ||
+		validateDeclarativeParam("a:b", "pkg", nil, nil, 1, 10) ||
+		validateDeclarativeParam("a/b", "model_slug", nil, nil, 1, 10) ||
+		validateDeclarativeParam("abc", "unknown_charset", nil, nil, 1, 10) {
+		t.Fatal("invalid charset inputs should fail")
+	}
+	for _, badDOI := range []string{"11.1000/1", "10.12/1", "10.12ab/1", "10.1000/", "10.1000/a b"} {
+		if isValidDOIRest(badDOI) {
+			t.Fatalf("isValidDOIRest(%q) should fail", badDOI)
+		}
+	}
+	for _, badSub := range []string{"", "a/../b", "a?x=1", "a#frag", `a\b`, "a\x01b"} {
+		if isValidSafeSubpath(badSub) {
+			t.Fatalf("isValidSafeSubpath(%q) should fail", badSub)
+		}
+	}
+
+	// matchDeclarativeRoute: ExactSegments=false short path, literal mismatch, bad percent escape, StripSuffix, QueryParams
+	exactFalse := false
+	spec := DeclarativeMatchSpec{
+		ExactSegments: &exactFalse,
+		PathSegments: []DeclarativeSegmentSpec{
+			{IsLiteral: true, Literal: "v1"},
+			{ParamSpec: DeclarativeParamSegment{Param: "id", Charset: "slug", StripSuffix: ".json"}},
+		},
+		QueryParams: []DeclarativeQueryParamSpec{
+			{Name: "q", Param: "q", Charset: "alnum"},
+		},
+	}
+	uShort, _ := url.Parse("https://ex.com/v1?q=ok")
+	if _, ok := matchDeclarativeRoute(spec, uShort, "ex.com", splitNonEmptyEscapedSegments(uShort.EscapedPath())); ok {
+		t.Fatal("short path with exactSegments=false should fail")
+	}
+	uLitBad, _ := url.Parse("https://ex.com/v2/item?q=ok")
+	if _, ok := matchDeclarativeRoute(spec, uLitBad, "ex.com", splitNonEmptyEscapedSegments(uLitBad.EscapedPath())); ok {
+		t.Fatal("literal mismatch should fail")
+	}
+	if _, ok := matchDeclarativeRoute(spec, uLitBad, "ex.com", []string{"v1", "%ZZ"}); ok {
+		t.Fatal("bad percent escape in segment should fail")
+	}
+	greedySpec := DeclarativeMatchSpec{
+		PathSegments: []DeclarativeSegmentSpec{
+			{ParamSpec: DeclarativeParamSegment{Param: "rest", Charset: "safe_subpath", Greedy: true}},
+		},
+	}
+	if _, ok := matchDeclarativeRoute(greedySpec, uShort, "ex.com", []string{"a", "%ZZ"}); ok {
+		t.Fatal("bad percent escape in greedy segment should fail")
+	}
+	uBadQ, _ := url.Parse("https://ex.com/v1/item.json/extra?q=bad!")
+	if _, ok := matchDeclarativeRoute(spec, uBadQ, "ex.com", splitNonEmptyEscapedSegments(uBadQ.EscapedPath())); ok {
+		t.Fatal("invalid query param should fail")
+	}
+	uGoodQ, _ := url.Parse("https://ex.com/v1/item.json/extra?q=ok123")
+	params, ok := matchDeclarativeRoute(spec, uGoodQ, "ex.com", splitNonEmptyEscapedSegments(uGoodQ.EscapedPath()))
+	if !ok || params["id"] != "item" || params["q"] != "ok123" {
+		t.Fatalf("unexpected matchDeclarativeRoute result: ok=%v params=%+v", ok, params)
+	}
+
+	// resolveManifestTwinOnParsedURL with unsafe fetchUrl
+	unsafeAdapter := &DeclarativeAdapterManifest{
+		ID: "unsafe",
+		Routes: []DeclarativeRouteSpec{{
+			Match: DeclarativeMatchSpec{PathSegments: []DeclarativeSegmentSpec{{IsLiteral: true, Literal: "a"}}},
+			Twin:  DeclarativeTwinSpec{FetchURL: "https://localhost/a", Kind: "json"},
+		}},
+	}
+	uA, _ := url.Parse("https://ex.com/a")
+	if _, ok := resolveManifestTwinOnParsedURL(unsafeAdapter, uA, "ex.com", []string{"a"}); ok {
+		t.Fatal("unsafe twin fetchUrl must be rejected")
+	}
+
+	// Default text twin formatting (empty, without H1, and with H1)
+	textMatch := &DeclarativeTwinMatch{
+		ID:     "txt",
+		Kind:   classify.KindText,
+		route:  DeclarativeRouteSpec{Twin: DeclarativeTwinSpec{Kind: "text"}, Extract: DeclarativeExtractSpec{TitleTemplate: "Custom Title"}},
+		params: map[string]string{},
+	}
+	if _, ok := textMatch.Format("   \n"); ok {
+		t.Fatal("empty default text twin should return false")
+	}
+	if doc, ok := textMatch.Format("Plain body"); !ok || !strings.HasPrefix(doc.Markdown, "# Custom Title") {
+		t.Fatalf("default text twin without H1 = (%v, %+v)", ok, doc)
+	}
+	if doc, ok := textMatch.Format("# Existing H1\n\nBody"); !ok || strings.HasPrefix(doc.Markdown, "# Custom Title") {
+		t.Fatalf("default text twin with H1 = (%v, %+v)", ok, doc)
+	}
+	textNoTitle := &DeclarativeTwinMatch{
+		ID:     "txt2",
+		Kind:   classify.KindText,
+		route:  DeclarativeRouteSpec{Twin: DeclarativeTwinSpec{Kind: "text"}, Extract: DeclarativeExtractSpec{TitleTemplate: ""}},
+		params: map[string]string{},
+	}
+	if doc, ok := textNoTitle.Format("Plain body without title"); !ok || doc.Markdown != "Plain body without title" {
+		t.Fatalf("default text twin empty title = (%v, %+v)", ok, doc)
+	}
+	if _, ok := textNoTitle.Format("\u202e\U000E0049"); ok {
+		t.Fatal("invisible-smuggling-only body should return false after stripping")
+	}
+
+	// Synthetic JSON twin exercising cyclic vars, DynamicKeyPath non-map entry, RequireHTTPS strip,
+	// RequireVars fail, TitleFallbackTemplate, empty title fail, table int_comma/strip_tags/SliceMax/Code/non-obj row,
+	// list MaxIndent<=0 and outer lookup, SubField, Join=="", date_parts empty/non-numeric.
+	jsonMatch := &DeclarativeTwinMatch{
+		ID:     "syn",
+		Kind:   classify.KindJSON,
+		params: map[string]string{"outer": "OUT"},
+		route: DeclarativeRouteSpec{
+			Twin: DeclarativeTwinSpec{Kind: "json"},
+			Extract: DeclarativeExtractSpec{
+				UnwrapFirstArrayElement: true,
+				RequireVars:             []string{"reqv"},
+				TitleTemplate:           "{missing}",
+				TitleFallbackTemplate:   "{fallbackTitle}",
+				ObjectLinksPath:         "links",
+				Vars: map[string]DeclarativeVarSpec{
+					"cycA":          {Template: "{cycB}"},
+					"cycB":          {Template: "{cycA}"},
+					"reqv":          {Paths: []string{"req"}},
+					"fallbackTitle": {Paths: []string{"title"}},
+					"badURL":        {Paths: []string{"url"}, RequireHTTPS: true},
+					"dynScalar":     {DynamicKeyPath: &DeclarativeDynamicKeyPath{Base: "map", KeyVar: "reqv", SubPath: "sub"}},
+					"dynNested":     {DynamicKeyPath: &DeclarativeDynamicKeyPath{Base: "mapNested", KeyVar: "reqv", SubPath: "sub"}},
+					"subf":          {Paths: []string{"objs"}, SubField: "k"},
+					"firstOnly":     {Paths: []string{"arr"}},
+					"emptyItems":    {Paths: []string{"emptyStrArr"}},
+					"emptyDate":     {Paths: []string{"emptyArr"}, Format: "date_parts"},
+					"badDate":       {Paths: []string{"badDateArr"}, Format: "date_parts"},
+					"badInt":        {Paths: []string{"nonNum"}, Format: "int_comma"},
+				},
+				Bullets: []DeclarativeBulletSpec{
+					{Label: "First", Template: "{firstOnly}"},
+					{Label: "Sub", Template: "{subf}"},
+				},
+				Sections: []DeclarativeSectionSpec{
+					{
+						Heading:   "Tbl",
+						ArrayPath: "rows",
+						Columns: []DeclarativeTableColumn{
+							{Header: "N", Paths: []string{"n"}, Format: "int_comma"},
+							{Header: "H", Paths: []string{"h"}, Format: "strip_tags", SliceMax: 5, Code: true},
+							{Header: "P", Format: "paired_percent", OutcomesField: "out", PricesField: "pr"},
+						},
+					},
+					{
+						Heading:       "Lst",
+						ListArrayPath: "items",
+						MaxIndent:     0,
+						ItemVars:      map[string]DeclarativeVarSpec{"txt": {Paths: []string{"t"}}},
+						ItemTemplate:  "{txt} {outer}",
+					},
+				},
+			},
+		},
+	}
+	if _, ok := jsonMatch.Format(`[{"req":""}]`); ok {
+		t.Fatal("RequireVars empty should fail")
+	}
+	if _, ok := jsonMatch.Format(`[{"req":"ok","title":""}]`); ok {
+		t.Fatal("empty title should fail")
+	}
+	synPayload := `[{"req":"ok","title":"Syn","url":"http://bad","links":{"Docs":"https://docs.example.com"},"map":{"ok":"scalar"},"mapNested":{"ok":{"sub":"nestedVal"}},"objs":[{"k":"v1"}],"arr":["only0"],"emptyStrArr":[""],"emptyArr":[],"badDateArr":["nope"],"nonNum":"abc","rows":["skip",{"n":1234,"h":"<b>123456</b>","out":[],"pr":[]}],"items":["skip",{"t":"hi"}]}]`
+	synDoc, ok := jsonMatch.Format(synPayload)
+	if !ok || !strings.Contains(synDoc.Markdown, "1,234") || !strings.Contains(synDoc.Markdown, "`12345`") || !strings.Contains(synDoc.Markdown, "- hi OUT") {
+		t.Fatalf("synthetic JSON twin mismatch: ok=%v doc=%+v", ok, synDoc)
+	}
+
+	// orderedKeysFor with RootPath + FindInArray fallback (sorted keys & non-object ObjectLinksPath)
+	orderedMatch := &DeclarativeTwinMatch{
+		ID:     "ord",
+		Kind:   classify.KindJSON,
+		params: map[string]string{"want": "x"},
+		route: DeclarativeRouteSpec{
+			Twin: DeclarativeTwinSpec{Kind: "json"},
+			Extract: DeclarativeExtractSpec{
+				RootPath:        "wrap",
+				FindInArray:     &DeclarativeFindInArray{ArrayPath: "items", MatchField: "id", MatchTemplate: "{want}"},
+				TitleTemplate:   "Ordered",
+				ObjectLinksPath: "links",
+				Vars: map[string]DeclarativeVarSpec{
+					"picked": {Paths: []string{"vers"}, FirstNonMatchingKey: "dev-"},
+				},
+			},
+		},
+	}
+	if odoc, ook := orderedMatch.Format(`{"wrap":{"items":[{"id":"x","vers":{"b":1,"a":2},"links":{"Z":"https://z.example.com","A":"https://a.example.com"}}]}}`); !ook || !strings.Contains(odoc.Markdown, "- **A**: https://a.example.com") {
+		t.Fatalf("orderedKeysFor FindInArray fallback mismatch: %v %+v", ook, odoc)
+	}
+	if _, ook := orderedMatch.Format(`{"wrap":{"items":[{"id":"x","vers":"not-obj","links":"not-obj"}]}}`); !ook {
+		t.Fatal("orderedKeysFor non-object links/vers should still succeed")
+	}
+
+	// Standalone helper coverage
+	if formatExtractedJSONValue(nil, DeclarativeVarSpec{}, "") != "" {
+		t.Fatal("formatExtractedJSONValue(nil) should return empty")
+	}
+	if ordered := extractOrderedObjectKeys([]byte(`[{"links":{"a":1,"b":2}}]`), []string{"0", "links"}); len(ordered) != 2 {
+		t.Fatalf("extractOrderedObjectKeys array index = %v", ordered)
+	}
+	if ordered := extractOrderedObjectKeys([]byte(`[{"x":1},{"a":1,"b":2}]`), []string{"1"}); len(ordered) != 2 {
+		t.Fatalf("extractOrderedObjectKeys second element = %v", ordered)
+	}
+	if ordered := extractOrderedObjectKeys([]byte(`[{"a":1}]`), []string{"badidx"}); ordered != nil {
+		t.Fatalf("extractOrderedObjectKeys bad array index = %v", ordered)
+	}
+	for _, trunc := range [][]byte{
+		[]byte(``),
+		[]byte(`{`),
+		[]byte(`{"a":`),
+		[]byte(`{"a":1,"b":`),
+		[]byte(`[`),
+		[]byte(`[{"a":1},`),
+		[]byte(`{"x":[1`),
+		[]byte(`{"a":1}`),
+	} {
+		_ = extractOrderedObjectKeys(trunc, []string{"a"})
+	}
+	_ = extractOrderedObjectKeys([]byte(`{"a":1`), nil)
+	_ = extractOrderedObjectKeys([]byte(`{"a"`), nil)
+	_ = extractOrderedObjectKeys([]byte(`[{"a":`), []string{"0"})
+	_ = extractOrderedObjectKeys([]byte(`[{"a":`), []string{"5"})
+	if getByDotPath(nil, "a") != nil || getByDotPath(map[string]any{}, "") == nil {
+		t.Fatal("getByDotPath nil/empty checks failed")
+	}
+	if ordered := extractOrderedObjectKeys([]byte(`"str"`), nil); ordered != nil {
+		t.Fatalf("extractOrderedObjectKeys non-delim = %v", ordered)
+	}
+	if ordered := extractOrderedObjectKeys([]byte(`[1,2]`), nil); ordered != nil {
+		t.Fatalf("extractOrderedObjectKeys array at root = %v", ordered)
+	}
+	if getByDotPath(map[string]any{"a": nil}, "a.b") != nil || getByDotPath(map[string]any{"x": "str"}, "x.y") != nil || getByDotPath([]any{1}, "bad") != nil {
+		t.Fatal("getByDotPath invalid array index / nil / scalar traversal should return nil")
+	}
+	if jsonScalarToString(nil) != "" || jsonScalarToString(float64(3.5)) != "3.5" || jsonScalarToString(true) != "true" || jsonScalarToString(false) != "false" || jsonScalarToString([]int{1}) != "" {
+		t.Fatal("jsonScalarToString branches failed")
+	}
+	if _, ok := jsonValueToFloat(float64(2.5)); !ok {
+		t.Fatal("jsonValueToFloat(float64) failed")
+	}
+	if _, ok := jsonValueToFloat("   "); ok {
+		t.Fatal("jsonValueToFloat(blank) should fail")
+	}
+	if _, ok := jsonValueToFloat(true); ok {
+		t.Fatal("jsonValueToFloat(bool) should fail")
+	}
+	if !isJSONTruthy(true) || isJSONTruthy(false) || !isJSONTruthy(json.Number("1")) || !isJSONTruthy(float64(2)) || !isJSONTruthy([]any{}) {
+		t.Fatal("isJSONTruthy branches failed")
+	}
+	if formatIntComma(42) != "42" || formatIntComma(math.MinInt64) != "-9223372036854775808" || formatIntComma(-42) != "-42" || formatIntComma(-12345) != "-12,345" {
+		t.Fatal("formatIntComma negative/boundary cases failed")
+	}
+	if formatUSDCompact("bad") != "" || formatUSDCompact(-2e9) != "-$2.00B" || formatUSDCompact(12.5) != "$12.50" {
+		t.Fatal("formatUSDCompact branches failed")
+	}
+	if applyStringFormat("  x  ", "trim") != "x" || applyStringFormat("x", "unknown") != "x" {
+		t.Fatal("applyStringFormat branches failed")
+	}
+	if stripTagsInlineLinear("") != "" || stripTagsInlineLinear(`<a title="x>y">hi</a>`) != "hi" {
+		t.Fatal("stripTagsInlineLinear branches failed")
+	}
+	if stripLeadingYAMLFrontmatter("no fm") != "no fm" ||
+		stripLeadingYAMLFrontmatter("---\n"+strings.Repeat("x", 1600)+"\n---\n") == "" ||
+		stripLeadingYAMLFrontmatter("---\na: 1\n---") != "---\na: 1\n---" {
+		t.Fatal("stripLeadingYAMLFrontmatter branches failed")
+	}
+	if collapseNewlinesWithIndent("\n\r\na\n\nb", "  ") != "\n  a\n  b" {
+		t.Fatal("collapseNewlinesWithIndent branch failed")
+	}
+	if sliceRunesMax("😀abc", 3) != "😀a" || sliceRunesMax("éé", 3) != "éé" {
+		t.Fatal("sliceRunesMax surrogate/multibyte branches failed")
+	}
+	if escapeDeclarativeGFMCell("", 0) != "-" || escapeDeclarativeGFMCell("abcdef", 4) != "abc…" {
+		t.Fatal("escapeDeclarativeGFMCell branches failed")
+	}
+	if formatDeclarativeGFMTable(nil, nil) != "" {
+		t.Fatal("formatDeclarativeGFMTable empty should return empty")
+	}
+	if !strings.HasPrefix(safeDeclarativeFence("```hi```", "md"), "````md") {
+		t.Fatal("safeDeclarativeFence nested backticks failed")
+	}
 }

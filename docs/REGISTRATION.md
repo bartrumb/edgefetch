@@ -9,11 +9,11 @@ EdgeFetch participates in two trust ecosystems:
 
 ## Important Rule: Project Identity vs. Operator Signing Keys
 
-An open-source binary **must never** ship a shared bot-signing key inside the repository — anyone could abuse it and get the key revoked globally. Instead, registration separates cleanly into two layers:
+A public binary **must never** ship a shared bot-signing key inside the repository — anyone could abuse it and get the key revoked globally. Instead, registration separates cleanly into two layers:
 
 | Layer | Who Registers It | What Gets Registered |
 | --- | --- | --- |
-| **1. Open-Source Project Identity** | Project Maintainer (`@bartrumb`) | Public `EdgeFetch` User-Agent documentation, MCP Registry (`io.github.bartrumb/edgefetch`), Glama (`glama.json`), OpenSSF Best Practices, and official release signing (`keys/release-signing-pub.pem` + SLSA provenance). |
+| **1. Public Project Identity** | Project Maintainer (`@bartrumb`) | Public `EdgeFetch` User-Agent documentation, MCP Registry (`io.github.bartrumb/edgefetch`), Glama (`glama.json`), OpenSSF Best Practices, and official release signing (`keys/release-signing-pub.pem` + SLSA provenance). |
 | **2. Deployed Fleet Identity (Web Bot Auth)** | Each Self-Hosted Operator (including your own Hub domain) | Your own Ed25519 keypair minted via `edgefetch keygen-bot-auth`, served with self-signed RFC 9421 headers at `https://<your-hub>/.well-known/http-message-signatures-directory`, submitted to **Cloudflare Verified Bots**. |
 
 ---

@@ -100,40 +100,74 @@ func lockDownSecretPathsWith(
 	return nil
 }
 
+type privDeps struct {
+	geteuid         func() int
+	getuid          func() int
+	getegid         func() int
+	getgid          func() int
+	getgroups       func() ([]int, error)
+	setNoNewPrivs   func() syscall.Errno
+	setgroups       func([]int) error
+	setgid          func(int) error
+	setuid          func(int) error
+	setDumpableZero func() syscall.Errno
+}
+
 // DropRoot permanently transitions UID/GID 0 down to unprivileged `65532:65532` (`nonroot`), sets `NO_NEW_PRIVS`,
 // and marks the process non-dumpable (`PR_SET_DUMPABLE=0`).
 func DropRoot() error {
-	if os.Geteuid() != 0 {
+	return dropRootWith(privDeps{
+		geteuid:   os.Geteuid,
+		getuid:    os.Getuid,
+		getegid:   os.Getegid,
+		getgid:    os.Getgid,
+		getgroups: os.Getgroups,
+		setNoNewPrivs: func() syscall.Errno {
+			_, _, errno := syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetNoNewPriv, 1, 0, 0, 0, 0)
+			return errno
+		},
+		setgroups: syscall.Setgroups,
+		setgid:    syscall.Setgid,
+		setuid:    syscall.Setuid,
+		setDumpableZero: func() syscall.Errno {
+			_, _, errno := syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0)
+			return errno
+		},
+	})
+}
+
+func dropRootWith(d privDeps) error {
+	if d.geteuid() != 0 {
 		// Best-effort hardening when started directly as unprivileged UID (e.g. USER 65532 or su-exec 65532:65532);
 		// ignores ENOTSUP when running under `go test -race` (CGO_ENABLED=1).
-		_, _, _ = syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetNoNewPriv, 1, 0, 0, 0, 0)
-		_, _, _ = syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0)
+		_ = d.setNoNewPrivs()
+		_ = d.setDumpableZero()
 		return nil
 	}
 	// Prevent any future `execve` across ALL Go runtime OS threads from gaining privileges via setuid/file-cap bits.
 	// Note: Linux kernel `prctl(PR_SET_NO_NEW_PRIVS)` requires arg3..arg5 == 0 (`AllThreadsSyscall6`).
-	if _, _, errno := syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetNoNewPriv, 1, 0, 0, 0, 0); errno != 0 {
+	if errno := d.setNoNewPrivs(); errno != 0 {
 		return fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS): %w", errno)
 	}
 	// Clear supplementary root groups BEFORE dropping GID/UID (once UID is non-zero, `setgroups` is no longer permitted).
-	if err := syscall.Setgroups([]int{}); err != nil {
+	if err := d.setgroups([]int{}); err != nil {
 		return fmt.Errorf("setgroups([]): %w", err)
 	}
-	if err := syscall.Setgid(nonrootUID); err != nil {
+	if err := d.setgid(nonrootUID); err != nil {
 		return fmt.Errorf("setgid(%d): %w", nonrootUID, err)
 	}
-	if err := syscall.Setuid(nonrootUID); err != nil {
+	if err := d.setuid(nonrootUID); err != nil {
 		return fmt.Errorf("setuid(%d): %w", nonrootUID, err)
 	}
 	// Apply PR_SET_DUMPABLE=0 AFTER setgid/setuid because Linux commit_creds resets mm->dumpable to fs.suid_dumpable
 	// during UID/GID transitions (which may be 2 on hosts with apport/coredumpd).
-	if _, _, errno := syscall.AllThreadsSyscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0); errno != 0 {
+	if errno := d.setDumpableZero(); errno != 0 {
 		return fmt.Errorf("prctl(PR_SET_DUMPABLE): %w", errno)
 	}
-	if os.Geteuid() != nonrootUID || os.Getuid() != nonrootUID || os.Getegid() != nonrootUID || os.Getgid() != nonrootUID {
+	if d.geteuid() != nonrootUID || d.getuid() != nonrootUID || d.getegid() != nonrootUID || d.getgid() != nonrootUID {
 		return errors.New("privilege drop verification failed: uid/euid/gid/egid did not transition to 65532")
 	}
-	if groups, gErr := os.Getgroups(); gErr != nil {
+	if groups, gErr := d.getgroups(); gErr != nil {
 		return fmt.Errorf("verify supplementary groups: %w", gErr)
 	} else {
 		for _, g := range groups {

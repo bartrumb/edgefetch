@@ -45,18 +45,166 @@ import { isPublicIpAddress } from './safe-fetch.ts';
 import { S3ArtifactBucket } from './s3-bucket.ts';
 import { TursoHttpD1Database } from './turso-d1.ts';
 
-declare const Deno: {
-  env: { get(key: string): string | undefined; toObject(): Record<string, string> };
-  serve(
-    options: { port?: number; hostname?: string },
+interface DenoServerHandle {
+  addr?: { port?: number; hostname?: string };
+  finished?: Promise<void>;
+  shutdown?(): Promise<void>;
+}
+
+interface DenoRuntimeLike {
+  env?: {
+    get(key: string): string | undefined;
+    toObject(): Record<string, string>;
+  };
+  serve?(
+    options: {
+      port?: number;
+      hostname?: string;
+      onListen?: (addr: { port: number; hostname: string }) => void;
+    },
     handler: (req: Request, info: { remoteAddr?: { hostname?: string } }) => Response | Promise<Response>,
-  ): unknown;
-  upgradeWebSocket(req: Request, options?: { protocol?: string }): { socket: WebSocket; response: Response };
+  ): DenoServerHandle;
+  upgradeWebSocket?(req: Request, options?: { protocol?: string }): { socket: WebSocket; response: Response };
   resolveDns?(query: string, recordType: 'A' | 'AAAA'): Promise<string[]>;
-};
+}
+
+function getDenoRuntime(): DenoRuntimeLike | undefined {
+  return (globalThis as { Deno?: DenoRuntimeLike }).Deno;
+}
+
+const KNOWN_DENO_ENV_KEYS = [
+  'PORT',
+  'EDGEFETCH_DATA_DIR',
+  'EDGEFETCH_TRUST_PROXY',
+  'EDGEFETCH_PUBLIC_ORIGIN',
+  'CALLER_TOKEN',
+  'EDGEFETCH_CALLER_TOKEN',
+  'EDGEFETCH_SERVER_TOKEN',
+  'MCP_TOKEN',
+  'AGENT_TOKEN',
+  'EDGEFETCH_AGENT_TOKEN',
+  'AGENT_TOKENS',
+  'EDGEFETCH_AGENT_TOKENS',
+  'USER_AGENT',
+  'EDGEFETCH_USER_AGENT',
+  'ROBOTS_BYPASS_HOSTS',
+  'EDGEFETCH_ROBOTS_BYPASS_HOSTS',
+  'OAUTH_REDIRECT_ALLOWLIST',
+  'OTEL_EXPORTER_OTLP_ENDPOINT',
+  'OTEL_EXPORTER_OTLP_HEADERS',
+  'OTEL_SERVICE_NAME',
+  'BOT_SIGNING_PRIVATE_KEY',
+  'EDGEFETCH_BOT_SIGNING_KEY',
+  'BOT_SIGNING_PUBLIC_KEY',
+  'BOT_CONTACT_URL',
+  'BOT_KEY_NBF',
+  'EDGEFETCH_BOT_KEY_NBF',
+  'BOT_KEY_EXP',
+  'EDGEFETCH_BOT_KEY_EXP',
+  'SERPER_API_KEY',
+  'BRAVE_API_KEY',
+  'TAVILY_API_KEY',
+  'SEARXNG_URL',
+  'WEBHOOK_SECRET',
+  'CRAWL4AI_API_URL',
+  'CRAWL4AI_API_TOKEN',
+  'FIRECRAWL_API_URL',
+  'FIRECRAWL_API_KEY',
+  'SPA_FALLBACK_ORDER',
+  'EDGEFETCH_LLM_PROVIDER',
+  'EDGEFETCH_LLM_BASE_URL',
+  'EDGEFETCH_LLM_API_KEY',
+  'EDGEFETCH_LLM_MODEL',
+  'EDGEFETCH_ALLOW_LOCAL_LLM_OVERRIDE',
+  'OLLAMA_HOST',
+  'OPENAI_API_KEY',
+  'OPENROUTER_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'GEMINI_API_KEY',
+  'TURSO_DATABASE_URL',
+  'TURSO_AUTH_TOKEN',
+  'META_TURSO_URL',
+  'META_TURSO_AUTH_TOKEN',
+  'SEARCH_TURSO_URL',
+  'SEARCH_TURSO_AUTH_TOKEN',
+  'S3_ENDPOINT',
+  'S3_BUCKET',
+  'S3_ACCESS_KEY_ID',
+  'S3_SECRET_ACCESS_KEY',
+  'S3_REGION',
+] as const;
+
+function readDenoEnvMap(overrides?: Record<string, string | undefined>): Record<string, string> {
+  const base: Record<string, string> = {};
+  const denoEnv = getDenoRuntime()?.env;
+  if (denoEnv) {
+    let loadedAll = false;
+    if (typeof denoEnv.toObject === 'function') {
+      try {
+        Object.assign(base, denoEnv.toObject());
+        loadedAll = true;
+      } catch {
+        // Fallback below when `--allow-env` is scoped to specific keys
+      }
+    }
+    if (!loadedAll && typeof denoEnv.get === 'function') {
+      for (const k of KNOWN_DENO_ENV_KEYS) {
+        try {
+          const val = denoEnv.get(k);
+          if (val !== undefined) base[k] = val;
+        } catch {
+          // ignore denied key
+        }
+      }
+    }
+  }
+  if (overrides) {
+    for (const [k, v] of Object.entries(overrides)) {
+      if (v === undefined) delete base[k];
+      else base[k] = v;
+    }
+  }
+  return base;
+}
 
 const MAX_DENO_WS_FRAME_BYTES = 1 * 1024 * 1024; // 1 MiB (`M6`)
 const MAX_DENO_SAFE_HOPS = 5;
+
+export interface DenoSafeFetchOptions {
+  allowExplicitLoopbackUrls?: boolean;
+  fetchImpl?: typeof fetch;
+  resolveDns?: (query: string, recordType: 'A' | 'AAAA') => Promise<string[]>;
+}
+
+function validateExplicitLoopbackTargetUrl(raw: string): URL | null {
+  const trimmed = raw.trim();
+  const authorityMatch = /^https?:\/\/([^/?#]+)/i.exec(trimmed);
+  if (!authorityMatch) return null;
+  const rawAuthority = authorityMatch[1]!;
+  if (!rawAuthority || rawAuthority.includes('@')) return null;
+
+  // Enforce strict literal authority allowlist BEFORE WHATWG `new URL(...)` normalization
+  // so decimal/hex/octal/short IPv4 (e.g. 2130706433, 0x7f000001, 0177.0.0.1, 127.1),
+  // non-canonical IPv6 (e.g. [0:0:0:0:0:0:0:1]), trailing dots, and invalid ports are rejected.
+  const literalMatch = /^(127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$/i.exec(rawAuthority);
+  if (!literalMatch) return null;
+  if (literalMatch[2] !== undefined) {
+    const port = Number(literalMatch[2]);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  }
+
+  let u: URL;
+  try {
+    u = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (u.username || u.password) return null;
+  const h = u.hostname.toLowerCase();
+  if (h !== '127.0.0.1' && h !== 'localhost' && h !== '[::1]') return null;
+  return u;
+}
 
 class DenoHubSocket implements HubSocketLike {
   private attachment: AgentAttachment | null = null;
@@ -87,11 +235,14 @@ class DenoHubSocket implements HubSocketLike {
   }
 }
 
-async function assertDenoResolvedPublicIp(hostname: string): Promise<void> {
-  if (typeof Deno === 'undefined' || typeof Deno.resolveDns !== 'function') return;
+async function assertDenoResolvedPublicIp(
+  hostname: string,
+  resolveDnsFn: ((query: string, recordType: 'A' | 'AAAA') => Promise<string[]>) | undefined = getDenoRuntime()?.resolveDns,
+): Promise<void> {
+  if (typeof resolveDnsFn !== 'function') return;
   const [v4, v6] = await Promise.all([
-    Deno.resolveDns(hostname, 'A').catch(() => [] as string[]),
-    Deno.resolveDns(hostname, 'AAAA').catch(() => [] as string[]),
+    resolveDnsFn(hostname, 'A').catch(() => [] as string[]),
+    resolveDnsFn(hostname, 'AAAA').catch(() => [] as string[]),
   ]);
   const ips = [...v4, ...v6];
   if (ips.length === 0) {
@@ -104,26 +255,39 @@ async function assertDenoResolvedPublicIp(hostname: string): Promise<void> {
   }
 }
 
-function createDenoSafeFetch(selfHost?: string): typeof fetch {
+export function createDenoSafeFetch(selfHost?: string, opts: DenoSafeFetchOptions = {}): typeof fetch {
+  const doFetch = opts.fetchImpl ?? fetch;
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const reqObj = input instanceof Request ? input : null;
     let currentUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const callerRedirect = init?.redirect ?? reqObj?.redirect ?? 'follow';
     let method = (init?.method ?? reqObj?.method ?? 'GET').toUpperCase();
     let body = init?.body ?? (reqObj ? reqObj.body : undefined);
-    const baseHeaders = new Headers(init?.headers ?? reqObj?.headers);
-    const initialOrigin = new URL(currentUrl).origin;
+    const currentHeaders = new Headers(init?.headers ?? reqObj?.headers);
+    let initialOrigin = '';
 
     for (let hop = 0; hop <= MAX_DENO_SAFE_HOPS; hop++) {
-      const check = validatePublicHttpsTargetUrl(currentUrl, selfHost);
-      if (!check.ok) {
-        throw new Error(`SSRF blocked outbound URL: ${check.message}`);
+      const allowLoopbackThisHop = hop === 0 && opts.allowExplicitLoopbackUrls === true;
+      const loopbackUrl = allowLoopbackThisHop ? validateExplicitLoopbackTargetUrl(currentUrl) : null;
+      let validatedUrl: URL;
+      if (loopbackUrl) {
+        validatedUrl = loopbackUrl;
+      } else {
+        const check = validatePublicHttpsTargetUrl(currentUrl, selfHost);
+        if (!check.ok) {
+          throw new Error(`SSRF blocked outbound URL: ${check.message}`);
+        }
+        validatedUrl = check.url;
+        await assertDenoResolvedPublicIp(validatedUrl.hostname, opts.resolveDns);
       }
-      await assertDenoResolvedPublicIp(check.url.hostname);
 
-      const hopHeaders = new Headers(baseHeaders);
+      if (hop === 0) {
+        initialOrigin = validatedUrl.origin;
+      }
+
+      const hopHeaders = new Headers(currentHeaders);
       hopHeaders.delete('host');
-      if (check.url.origin !== initialOrigin) {
+      if (validatedUrl.origin !== initialOrigin) {
         hopHeaders.delete('authorization');
         hopHeaders.delete('cookie');
         hopHeaders.delete('proxy-authorization');
@@ -131,7 +295,7 @@ function createDenoSafeFetch(selfHost?: string): typeof fetch {
         hopHeaders.delete('x-goog-api-key');
       }
 
-      const res = await fetch(check.url.toString(), {
+      const res = await doFetch(validatedUrl.toString(), {
         ...init,
         method,
         headers: hopHeaders,
@@ -148,12 +312,14 @@ function createDenoSafeFetch(selfHost?: string): typeof fetch {
         }
         const loc = res.headers.get('location');
         if (!loc || hop === MAX_DENO_SAFE_HOPS) {
-          throw new Error(`Too many or invalid redirects from ${check.url.origin}`);
+          throw new Error(`Too many or invalid redirects from ${validatedUrl.origin}`);
         }
-        currentUrl = new URL(loc, check.url).toString();
+        currentUrl = new URL(loc, validatedUrl).toString();
         if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === 'POST')) {
           method = 'GET';
           body = undefined;
+          currentHeaders.delete('content-type');
+          currentHeaders.delete('content-length');
         }
         continue;
       }
@@ -326,10 +492,17 @@ function sanitizeDenoInboundRequest(
   } as RequestInit);
 }
 
-const fallbackSharedOAuthStore: OAuthStore = createMemoryOAuthStore();
-const fallbackSharedActivityStore: ActivityStore = createMemoryActivityStore();
-
-function openDenoPersistentStores(dataDir: string): { oauth: OAuthStore; activity: ActivityStore } {
+function openDenoPersistentStores(
+  dataDir: string,
+  ephemeralStores = false,
+): { oauth: OAuthStore; activity: ActivityStore; close: () => void } {
+  if (ephemeralStores || dataDir === ':memory:') {
+    return {
+      oauth: createMemoryOAuthStore(),
+      activity: createMemoryActivityStore(),
+      close: () => {},
+    };
+  }
   try {
     const sqlitePath = join(resolve(dataDir), 'hub.sqlite');
     mkdirSync(dirname(sqlitePath), { recursive: true });
@@ -356,17 +529,55 @@ function openDenoPersistentStores(dataDir: string): { oauth: OAuthStore; activit
     return {
       oauth: createSqliteOAuthStore(sqlLike),
       activity: createSqliteActivityStore(sqlLike),
+      close: () => {
+        try {
+          db.close();
+        } catch {
+          // ignore close errors
+        }
+      },
     };
   } catch {
     return {
-      oauth: fallbackSharedOAuthStore,
-      activity: fallbackSharedActivityStore,
+      oauth: createMemoryOAuthStore(),
+      activity: createMemoryActivityStore(),
+      close: () => {},
     };
   }
 }
 
-export function startDenoHub() {
-  const envMap = Deno.env.toObject();
+export interface DenoHubOptions {
+  port?: number;
+  hostname?: string;
+  dataDir?: string;
+  envOverrides?: Record<string, string | undefined>;
+  ephemeralStores?: boolean;
+  fetchImpl?: typeof fetch;
+  resolveDns?: (query: string, recordType: 'A' | 'AAAA') => Promise<string[]>;
+}
+
+export interface DenoHubHandlerHandle {
+  handler: (req: Request, info?: { remoteAddr?: { hostname?: string } }) => Promise<Response>;
+  workerEnv: Record<string, unknown>;
+  port: number;
+  getBoundPort: () => number;
+  setBoundPort: (port: number) => void;
+  canonicalOrigin: () => string;
+  flushPending: () => Promise<void>;
+  close: () => Promise<void>;
+}
+
+export interface DenoHubInstance {
+  server: DenoServerHandle;
+  readonly port: number;
+  workerEnv: Record<string, unknown>;
+  handler: (req: Request, info?: { remoteAddr?: { hostname?: string } }) => Promise<Response>;
+  flushPending: () => Promise<void>;
+  close: () => Promise<void>;
+}
+
+export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandlerHandle {
+  const envMap = readDenoEnvMap(options.envOverrides);
   const trustProxy = isTruthyDenoFlag(envMap.EDGEFETCH_TRUST_PROXY);
   const sockets = new Set<DenoHubSocket>();
   const lastHelloLogBySite = new Map<string, number>();
@@ -380,19 +591,21 @@ export function startDenoHub() {
     affinities: createMemoryAffinityStore(),
     hostHealth: createMemoryHostHealthStore(),
   });
-  const persistentStores = openDenoPersistentStores(envMap.EDGEFETCH_DATA_DIR || './.edgefetch-deno-data');
+  const persistentStores = openDenoPersistentStores(
+    options.dataDir ?? envMap.EDGEFETCH_DATA_DIR ?? './.edgefetch-deno-data',
+    options.ephemeralStores,
+  );
   const oauth: OAuthStore = persistentStores.oauth;
   const activity: ActivityStore = persistentStores.activity;
   const bus = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('edgefetch-hub-bus') : null;
-  void bus;
 
   const tursoUrl = envMap.TURSO_DATABASE_URL;
   const tursoToken = envMap.TURSO_AUTH_TOKEN;
   const metaDb = (envMap.META_TURSO_URL || tursoUrl)
-    ? new TursoHttpD1Database({ url: envMap.META_TURSO_URL || tursoUrl!, authToken: tursoToken }).asD1Database()
+    ? new TursoHttpD1Database({ url: envMap.META_TURSO_URL || tursoUrl!, authToken: envMap.META_TURSO_AUTH_TOKEN ?? tursoToken }).asD1Database()
     : undefined;
   const searchDb = (envMap.SEARCH_TURSO_URL || tursoUrl)
-    ? new TursoHttpD1Database({ url: envMap.SEARCH_TURSO_URL || tursoUrl!, authToken: tursoToken }).asD1Database()
+    ? new TursoHttpD1Database({ url: envMap.SEARCH_TURSO_URL || tursoUrl!, authToken: envMap.SEARCH_TURSO_AUTH_TOKEN ?? tursoToken }).asD1Database()
     : undefined;
   const s3Bucket =
     envMap.S3_ENDPOINT && envMap.S3_BUCKET && envMap.S3_ACCESS_KEY_ID && envMap.S3_SECRET_ACCESS_KEY
@@ -417,7 +630,16 @@ export function startDenoHub() {
       selfHost = undefined;
     }
   }
-  const safePublicFetch = createDenoSafeFetch(selfHost);
+  const safeFetch = createDenoSafeFetch(selfHost, {
+    allowExplicitLoopbackUrls: true,
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.resolveDns ? { resolveDns: options.resolveDns } : {}),
+  });
+  const safePublicFetch = createDenoSafeFetch(selfHost, {
+    allowExplicitLoopbackUrls: false,
+    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.resolveDns ? { resolveDns: options.resolveDns } : {}),
+  });
 
   const stub = {
     fetch: async () => new Response('use deno upgrade handler', { status: 426 }),
@@ -466,8 +688,22 @@ export function startDenoHub() {
 
   const workerEnv: Record<string, unknown> = {
     ...envMap,
-    SAFE_FETCH: safePublicFetch,
+    SAFE_FETCH: safeFetch,
     SAFE_PUBLIC_FETCH: safePublicFetch,
+    CALLER_TOKEN: envMap.CALLER_TOKEN ?? envMap.EDGEFETCH_CALLER_TOKEN ?? envMap.EDGEFETCH_SERVER_TOKEN,
+    MCP_TOKEN: envMap.MCP_TOKEN,
+    AGENT_TOKEN: envMap.AGENT_TOKEN ?? envMap.EDGEFETCH_AGENT_TOKEN,
+    AGENT_TOKENS: envMap.AGENT_TOKENS ?? envMap.EDGEFETCH_AGENT_TOKENS,
+    USER_AGENT: envMap.USER_AGENT ?? envMap.EDGEFETCH_USER_AGENT,
+    ROBOTS_BYPASS_HOSTS: envMap.ROBOTS_BYPASS_HOSTS ?? envMap.EDGEFETCH_ROBOTS_BYPASS_HOSTS,
+    OTEL_EXPORTER_OTLP_ENDPOINT: envMap.OTEL_EXPORTER_OTLP_ENDPOINT,
+    OTEL_EXPORTER_OTLP_HEADERS: envMap.OTEL_EXPORTER_OTLP_HEADERS,
+    OTEL_SERVICE_NAME: envMap.OTEL_SERVICE_NAME,
+    BOT_SIGNING_PRIVATE_KEY: envMap.BOT_SIGNING_PRIVATE_KEY ?? envMap.EDGEFETCH_BOT_SIGNING_KEY,
+    BOT_SIGNING_PUBLIC_KEY: envMap.BOT_SIGNING_PUBLIC_KEY,
+    BOT_CONTACT_URL: envMap.BOT_CONTACT_URL,
+    BOT_KEY_NBF: envMap.BOT_KEY_NBF ?? envMap.EDGEFETCH_BOT_KEY_NBF,
+    BOT_KEY_EXP: envMap.BOT_KEY_EXP ?? envMap.EDGEFETCH_BOT_KEY_EXP,
     AGENT_HUB: {
       idFromName: () => ({ toString: () => 'deno-global' }),
       get: () => stub,
@@ -477,29 +713,42 @@ export function startDenoHub() {
     ...(s3Bucket ? { ARTIFACTS: s3Bucket } : {}),
   };
 
+  const pendingWaitUntil = new Set<Promise<unknown>>();
   const ctx = {
     waitUntil(p: Promise<unknown>) {
-      p.catch(() => undefined);
+      const tracked = Promise.resolve(p)
+        .catch(() => undefined)
+        .finally(() => {
+          pendingWaitUntil.delete(tracked);
+        });
+      pendingWaitUntil.add(tracked);
     },
     passThroughOnException() {},
   } as unknown as ExecutionContext;
 
-  const port = Number(envMap.PORT || 8787);
-  const canonicalOrigin = explicitPublicOrigin ?? `http://hub.local:${port}`;
-  return Deno.serve({ port }, (req, info) => {
-    const cleanReq = sanitizeDenoInboundRequest(req, info, trustProxy, canonicalOrigin, explicitPublicOrigin !== null);
+  const rawEnvPort = envMap.PORT !== undefined && envMap.PORT !== '' ? Number(envMap.PORT) : 8787;
+  const port = options.port ?? (Number.isFinite(rawEnvPort) ? rawEnvPort : 8787);
+  let boundPort = port;
+  const canonicalOrigin = () => explicitPublicOrigin ?? `http://hub.local:${boundPort}`;
+
+  const handler = async (req: Request, info?: { remoteAddr?: { hostname?: string } }): Promise<Response> => {
+    const cleanReq = sanitizeDenoInboundRequest(req, info, trustProxy, canonicalOrigin(), explicitPublicOrigin !== null);
     const url = new URL(cleanReq.url);
     if (url.pathname === '/agent/ws' && cleanReq.headers.get('upgrade')?.toLowerCase() === 'websocket') {
       const auth = authorizeAgent(cleanReq, workerEnv as never);
       if (!auth.ok) {
         return Response.json({ error: 'unauthorized' }, { status: 401 });
       }
+      const deno = getDenoRuntime();
+      if (!deno || typeof deno.upgradeWebSocket !== 'function') {
+        return Response.json({ error: 'websocket_upgrade_unavailable' }, { status: 501 });
+      }
       const offeredProtocols = (cleanReq.headers.get('sec-websocket-protocol') ?? '')
         .split(',')
         .map((p) => p.trim())
         .filter(Boolean);
       const chosenSubprotocol = offeredProtocols.includes('edgefetch-agent') ? 'edgefetch-agent' : undefined;
-      const { socket, response } = Deno.upgradeWebSocket(
+      const { socket, response } = deno.upgradeWebSocket(
         req,
         chosenSubprotocol ? { protocol: chosenSubprotocol } : undefined,
       );
@@ -576,9 +825,76 @@ export function startDenoHub() {
       return response;
     }
     return (hubWorker as { fetch(r: Request, e: unknown, c?: ExecutionContext): Promise<Response> }).fetch(cleanReq, workerEnv, ctx);
-  });
+  };
+
+  const flushPending = async (): Promise<void> => {
+    while (pendingWaitUntil.size > 0) {
+      await Promise.allSettled([...pendingWaitUntil]);
+    }
+  };
+
+  const close = async (): Promise<void> => {
+    await flushPending();
+    for (const sock of sockets) {
+      sock.close(1001, 'shutdown');
+    }
+    sockets.clear();
+    try {
+      bus?.close();
+    } catch {
+      // ignore
+    }
+    persistentStores.close();
+  };
+
+  return {
+    handler,
+    workerEnv,
+    port,
+    getBoundPort: () => boundPort,
+    setBoundPort: (p: number) => {
+      if (Number.isFinite(p) && p > 0) boundPort = p;
+    },
+    canonicalOrigin,
+    flushPending,
+    close,
+  };
 }
 
-if (typeof Deno !== 'undefined') {
+export function startDenoHub(options: DenoHubOptions = {}): DenoHubInstance {
+  const deno = getDenoRuntime();
+  if (!deno || typeof deno.serve !== 'function') {
+    throw new Error('Deno.serve is unavailable in this runtime; use createDenoHubHandler() instead.');
+  }
+  const created = createDenoHubHandler(options);
+  const server = deno.serve(
+    {
+      port: created.port,
+      ...(options.hostname ? { hostname: options.hostname } : {}),
+      onListen: (addr) => {
+        if (addr?.port) created.setBoundPort(addr.port);
+      },
+    },
+    (req, info) => created.handler(req, info),
+  );
+  if (server.addr?.port) {
+    created.setBoundPort(server.addr.port);
+  }
+  return {
+    server,
+    get port(): number {
+      return server.addr?.port ?? created.getBoundPort();
+    },
+    workerEnv: created.workerEnv,
+    handler: created.handler,
+    flushPending: created.flushPending,
+    close: async () => {
+      await server.shutdown?.().catch(() => undefined);
+      await created.close();
+    },
+  };
+}
+
+if (getDenoRuntime() !== undefined && (import.meta as { main?: boolean }).main === true) {
   startDenoHub();
 }

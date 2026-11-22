@@ -54,7 +54,7 @@ Even if a caller token were compromised, an agent cannot be used to probe local 
 ### 6. Cryptographic Release Signing, SLSA Provenance & Contributor Secret Isolation
 - **Owner-Only Ed25519 Release Signatures (`checksums.txt.sig`):** Official `v*` GitHub Releases sign `checksums.txt` using an owner-only Ed25519 private key stored exclusively in GitHub Actions Sealed Secrets (`RELEASE_SIGNING_PRIVATE_KEY`) and verified against [`keys/release-signing-pub.pem`](keys/release-signing-pub.pem). Fork pull requests never receive repository secrets, and GitHub Repository Rulesets restrict `v*` tag creation/mutation and `main` force-pushes to the repository owner.
 - **GitHub SLSA Build Provenance Attestations:** Every release archive (`*.tar.gz`, `*.zip`, `checksums.txt`) and multi-arch GHCR container digest (`ghcr.io/bartrumb/edgefetch-agent`, `ghcr.io/bartrumb/edgefetch`) publishes cryptographic SLSA provenance attestations verifiable via `gh attestation verify --owner bartrumb`.
-- **Operator-Level Web Bot Auth Isolation (`BOT_SIGNING_PRIVATE_KEY`):** Open-source builds never embed a shared bot-signing private key. Each self-hosted operator mints a dedicated Ed25519 keypair (`edgefetch keygen-bot-auth`) for their own Hub domain (`/.well-known/http-message-signatures-directory`), preventing third-party key abuse.
+- **Operator-Level Web Bot Auth Isolation (`BOT_SIGNING_PRIVATE_KEY`):** Public builds never embed a shared bot-signing private key. Each self-hosted operator mints a dedicated Ed25519 keypair (`edgefetch keygen-bot-auth`) for their own Hub domain (`/.well-known/http-message-signatures-directory`), preventing third-party key abuse.
 
 ## Safe Deployment Checklist
 

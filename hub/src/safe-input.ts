@@ -149,6 +149,14 @@ export function findTagOpenEndQuoteAware(
   fromIdx: number,
   deadRef?: ScannerDeadState,
 ): number {
+  if (deadRef?.nextGtPos === -1) return -1;
+  if (deadRef && (deadRef.nextGtPos === undefined || deadRef.nextGtPos < fromIdx)) {
+    const gt = src.indexOf('>', fromIdx);
+    deadRef.nextGtPos = gt;
+    if (gt < 0) return -1;
+  } else if (!deadRef && src.indexOf('>', fromIdx) < 0) {
+    return -1;
+  }
   const existingMask = deadRef?.mask;
   if (existingMask && fromIdx < existingMask.length && (existingMask[fromIdx]! & 1) !== 0) {
     return -1;
@@ -405,6 +413,7 @@ export function scanHtmlTagsLinear(
   const deadRef: ScannerDeadState = {};
   let pos = src.indexOf('<');
   while (pos >= 0 && pos < src.length) {
+    if (deadRef.nextGtPos === -1) break;
     const parsed = tryParseTagAt(src, pos, deadRef, allowDeclarations);
     if (!parsed) {
       if (deadRef.mask || deadRef.noCommentCloseFrom !== undefined || deadRef.noCdataCloseFrom !== undefined || deadRef.nextGtPos === -1) {

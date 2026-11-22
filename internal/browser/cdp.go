@@ -53,6 +53,8 @@ type cdpConn struct {
 
 	crashMu  sync.Mutex
 	crashMsg string
+
+	writeOverride func(string) error
 }
 
 func (c *cdpConn) setCrashReason(line string) {
@@ -176,7 +178,11 @@ func (c *cdpConn) call(ctx context.Context, sessionID, method string, params any
 		return err
 	}
 
-	if err := c.ws.WriteText(string(payload)); err != nil {
+	writeFn := c.ws.WriteText
+	if c.writeOverride != nil {
+		writeFn = c.writeOverride
+	}
+	if err := writeFn(string(payload)); err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()

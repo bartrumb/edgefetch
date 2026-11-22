@@ -832,144 +832,6 @@ export function computeHostQualityFactor(
   return classifySearchResultQuality(urlStr, hostname, options).factor;
 }
 
-interface UsStateSpec {
-  name: string;
-  abbr: string;
-  ambiguousWordAbbr?: boolean;
-  metros?: string[];
-  domains?: string[];
-}
-
-const US_STATES: readonly UsStateSpec[] = [
-  { name: 'west virginia', abbr: 'WV', metros: ['charleston, wv', 'morgantown'] },
-  { name: 'north carolina', abbr: 'NC', metros: ['charlotte', 'raleigh'], domains: ['wral.com', 'charlotteobserver.com'] },
-  { name: 'south carolina', abbr: 'SC', metros: ['charleston, sc', 'columbia, sc'], domains: ['postandcourier.com'] },
-  { name: 'north dakota', abbr: 'ND', metros: ['fargo', 'bismarck'] },
-  { name: 'south dakota', abbr: 'SD', metros: ['sioux falls', 'rapid city'] },
-  { name: 'new hampshire', abbr: 'NH', metros: ['manchester, nh', 'concord, nh'], domains: ['wmur.com'] },
-  { name: 'new jersey', abbr: 'NJ', metros: ['newark', 'trenton', 'jersey city'], domains: ['nj.com'] },
-  { name: 'new mexico', abbr: 'NM', metros: ['albuquerque', 'santa fe'], domains: ['abqjournal.com', 'kob.com'] },
-  { name: 'new york', abbr: 'NY', metros: ['nyc', 'manhattan', 'brooklyn', 'albany', 'buffalo'] },
-  { name: 'rhode island', abbr: 'RI', metros: ['providence'], domains: ['providencejournal.com', 'wpri.com'] },
-  { name: 'alabama', abbr: 'AL', metros: ['birmingham', 'montgomery', 'huntsville'], domains: ['al.com'] },
-  { name: 'alaska', abbr: 'AK', metros: ['anchorage', 'juneau'], domains: ['adn.com'] },
-  { name: 'arizona', abbr: 'AZ', metros: ['phoenix', 'tucson', 'maricopa'], domains: ['azcentral.com', 'abc15.com'] },
-  { name: 'arkansas', abbr: 'AR', metros: ['little rock', 'fayetteville, ar'], domains: ['arkansasonline.com'] },
-  { name: 'california', abbr: 'CA', metros: ['los angeles', 'san francisco', 'san diego', 'sacramento'] },
-  { name: 'colorado', abbr: 'CO', ambiguousWordAbbr: true, metros: ['denver', 'boulder'], domains: ['denverpost.com', '9news.com'] },
-  { name: 'connecticut', abbr: 'CT', metros: ['hartford', 'new haven'], domains: ['ctinsider.com', 'courant.com'] },
-  { name: 'delaware', abbr: 'DE', ambiguousWordAbbr: true, metros: ['wilmington, de', 'dover, de'], domains: ['delawareonline.com'] },
-  { name: 'florida', abbr: 'FL', metros: ['miami', 'orlando', 'tampa', 'jacksonville'], domains: ['tampabay.com', 'miamiherald.com'] },
-  { name: 'georgia', abbr: 'GA', metros: ['atlanta', 'savannah'], domains: ['ajc.com', '11alive.com', 'wsbtv.com'] },
-  { name: 'hawaii', abbr: 'HI', ambiguousWordAbbr: true, metros: ['honolulu', 'maui'], domains: ['staradvertiser.com', 'hawaiinewsnow.com'] },
-  { name: 'idaho', abbr: 'ID', ambiguousWordAbbr: true, metros: ['boise'], domains: ['idahostatesman.com', 'ktvb.com'] },
-  {
-    name: 'illinois',
-    abbr: 'IL',
-    metros: ['chicago', 'chicagoland', 'kane county', 'dupage county', 'cook county', 'naperville', 'elgin'],
-    domains: ['dailyherald.com', 'chicagotribune.com', 'suntimes.com', 'abc7chicago.com', 'nbcchicago.com', 'wgntv.com', 'cbschicago.com', 'capitolnewsillinois.com'],
-  },
-  { name: 'indiana', abbr: 'IN', ambiguousWordAbbr: true, metros: ['indianapolis'], domains: ['indystar.com', 'wthr.com'] },
-  { name: 'iowa', abbr: 'IA', metros: ['des moines', 'cedar rapids'], domains: ['desmoinesregister.com', 'kcci.com'] },
-  { name: 'kansas', abbr: 'KS', metros: ['wichita', 'topeka', 'overland park', 'johnson county, ks'], domains: ['kansas.com', 'cjonline.com'] },
-  { name: 'kentucky', abbr: 'KY', metros: ['louisville', 'lexington, ky'], domains: ['courier-journal.com', 'kentucky.com'] },
-  { name: 'louisiana', abbr: 'LA', ambiguousWordAbbr: true, metros: ['new orleans', 'baton rouge'], domains: ['nola.com', 'theadvocate.com'] },
-  { name: 'maine', abbr: 'ME', ambiguousWordAbbr: true, metros: ['portland, me', 'bangor, me'], domains: ['pressherald.com', 'bangordailynews.com'] },
-  { name: 'maryland', abbr: 'MD', metros: ['baltimore', 'annapolis', 'charles county, md', 'waldorf, md'], domains: ['baltimoresun.com', 'thebaynet.com', 'somdnews.com'] },
-  { name: 'massachusetts', abbr: 'MA', ambiguousWordAbbr: true, metros: ['boston', 'worcester'], domains: ['bostonglobe.com', 'masslive.com', 'wcvb.com'] },
-  { name: 'michigan', abbr: 'MI', metros: ['detroit', 'grand rapids', 'lansing'], domains: ['freep.com', 'mlive.com', 'detroitnews.com'] },
-  { name: 'minnesota', abbr: 'MN', metros: ['minneapolis', 'st. paul', 'twin cities'], domains: ['startribune.com', 'kare11.com', 'mprnews.org'] },
-  { name: 'mississippi', abbr: 'MS', ambiguousWordAbbr: true, metros: ['jackson, ms', 'biloxi'], domains: ['clarionledger.com'] },
-  {
-    name: 'missouri',
-    abbr: 'MO',
-    metros: ['st. louis', 'saint louis', 'st louis', 'wentzville', 'o\'fallon, mo', 'st. peters', 'jefferson city'],
-    domains: ['stltoday.com', 'ksdk.com', 'kmov.com', 'firstalert4.com', 'fox2now.com', 'kmox.com', 'stlpr.org', 'missouriindependent.com', 'komu.com', 'ky3.com', 'kfvs12.com', 'kshb.com', 'kmbc.com'],
-  },
-  { name: 'montana', abbr: 'MT', metros: ['billings', 'bozeman', 'missoula'] },
-  { name: 'nebraska', abbr: 'NE', metros: ['omaha', 'lincoln, ne'], domains: ['omaha.com', 'ketv.com'] },
-  { name: 'nevada', abbr: 'NV', metros: ['las vegas', 'reno'], domains: ['reviewjournal.com', 'rgj.com'] },
-  { name: 'ohio', abbr: 'OH', ambiguousWordAbbr: true, metros: ['columbus, oh', 'cleveland', 'cincinnati'], domains: ['cleveland.com', 'dispatch.com', 'wcpo.com'] },
-  { name: 'oklahoma', abbr: 'OK', ambiguousWordAbbr: true, metros: ['oklahoma city', 'tulsa'], domains: ['oklahoman.com', 'tulsaworld.com', 'koco.com'] },
-  { name: 'oregon', abbr: 'OR', ambiguousWordAbbr: true, metros: ['portland, or', 'eugene', 'salem, or'], domains: ['oregonlive.com', 'kgw.com', 'opb.org'] },
-  { name: 'pennsylvania', abbr: 'PA', ambiguousWordAbbr: true, metros: ['philadelphia', 'pittsburgh', 'harrisburg'], domains: ['inquirer.com', 'post-gazette.com', 'pennlive.com'] },
-  { name: 'tennessee', abbr: 'TN', metros: ['nashville', 'memphis', 'knoxville'], domains: ['tennessean.com', 'wsmv.com'] },
-  { name: 'texas', abbr: 'TX', metros: ['houston', 'dallas', 'austin', 'san antonio'], domains: ['texastribune.org', 'dallasnews.com', 'houstonchronicle.com'] },
-  { name: 'utah', abbr: 'UT', metros: ['salt lake city', 'provo'], domains: ['sltrib.com', 'ksl.com'] },
-  { name: 'vermont', abbr: 'VT', metros: ['burlington, vt', 'montpelier'], domains: ['vtdigger.org'] },
-  { name: 'virginia', abbr: 'VA', metros: ['richmond, va', 'norfolk, va', 'virginia beach', 'roanoke'], domains: ['virginiamercury.com', 'richmond.com', 'pilotonline.com'] },
-  { name: 'washington', abbr: 'WA', metros: ['seattle', 'spokane', 'tacoma'], domains: ['seattletimes.com', 'king5.com', 'komonews.com'] },
-  { name: 'wisconsin', abbr: 'WI', metros: ['milwaukee', 'madison, wi', 'green bay'], domains: ['jsonline.com', 'wisn.com'] },
-  { name: 'wyoming', abbr: 'WY', metros: ['cheyenne', 'casper'] },
-];
-
-function textMentionsStateFullName(textLower: string, stateName: string): boolean {
-  if (stateName === 'virginia') {
-    return /(?<!west\s)\bvirginia\b/.test(textLower);
-  }
-  if (stateName === 'washington') {
-    if (/\bwashington\s*,?\s*d\.?c\.?\b/.test(textLower) && !/\bwashington\s+state\b/.test(textLower)) {
-      return false;
-    }
-  }
-  const escaped = stateName.replace(/\s+/g, '\\s+');
-  return new RegExp(`\\b${escaped}\\b`).test(textLower);
-}
-
-function hitMatchesUsState(
-  state: UsStateSpec,
-  titleAndSnippet: string,
-  titleSnippetUrlLower: string,
-  normHost: string,
-): boolean {
-  if (textMentionsStateFullName(titleSnippetUrlLower, state.name)) return true;
-  if (state.domains && hostMatchesDomainRule(normHost, state.domains)) return true;
-  if (state.metros?.some((m) => titleSnippetUrlLower.includes(m))) return true;
-  const commaAbbrRe = new RegExp(`,\\s*${state.abbr}(?:\\b|\\.)`, 'i');
-  if (commaAbbrRe.test(titleAndSnippet)) return true;
-  if (!state.ambiguousWordAbbr) {
-    const upperAbbrRe = new RegExp(`\\b${state.abbr}\\b`);
-    if (upperAbbrRe.test(titleAndSnippet)) return true;
-  }
-  return false;
-}
-
-export function extractExplicitQueryUsStates(query: string): UsStateSpec[] {
-  const qLower = query.toLowerCase();
-  const matched: UsStateSpec[] = [];
-  for (const st of US_STATES) {
-    if (textMentionsStateFullName(qLower, st.name)) {
-      matched.push(st);
-    }
-  }
-  return matched;
-}
-
-export function computeUsStateDisambiguationFactor(
-  queryStates: readonly UsStateSpec[],
-  hit: { title: string; snippet: string; url: string; hostname: string },
-): number {
-  if (queryStates.length === 0 || queryStates.length > 2) return 1.0;
-  const normHost = hit.hostname.toLowerCase().replace(/\.+$/, '');
-  const titleAndSnippet = `${hit.title} ${hit.snippet}`;
-  const fullCombinedLower = `${titleAndSnippet} ${hit.url}`.toLowerCase();
-
-  if (queryStates.some((st) => hitMatchesUsState(st, titleAndSnippet, fullCombinedLower, normHost))) {
-    return 1.25;
-  }
-
-  const targetNames = new Set(queryStates.map((s) => s.name));
-  const titleSnippetLower = titleAndSnippet.toLowerCase();
-  for (const other of US_STATES) {
-    if (targetNames.has(other.name)) continue;
-    if (hitMatchesUsState(other, titleAndSnippet, titleSnippetLower, normHost)) {
-      return 0.4;
-    }
-  }
-
-  return 1.0;
-}
-
 function formatNewsAttributionPrefix(sourceRaw?: string, dateRaw?: string): string {
   const src = cleanProviderText(sourceRaw);
   const dt = cleanProviderText(dateRaw);
@@ -1980,7 +1842,6 @@ export async function executeSearchCall(params: {
     qualityTier: 'standard' as SearchQualityTier,
   }));
   const hasDeeperArticleUrls = isNewsTopic && fusedEntries.some((e) => !isGenericNewsHubUrl(e.url));
-  const queryUsStates = extractExplicitQueryUsStates(query);
 
   for (const entry of fusedEntries) {
     let entryHost = '';
@@ -1999,17 +1860,8 @@ export async function executeSearchCall(params: {
       hasDeeperArticleUrls,
       query,
     });
-    const stateFactor =
-      queryUsStates.length > 0
-        ? computeUsStateDisambiguationFactor(queryUsStates, {
-            title: entry.title,
-            snippet: entry.content,
-            url: entry.url,
-            hostname: entryHost,
-          })
-        : 1.0;
-    entry.rrfScore *= factor * stateFactor;
-    entry.qualityTier = stateFactor < 0.7 && qualityTier === 'standard' ? 'demoted' : qualityTier;
+    entry.rrfScore *= factor;
+    entry.qualityTier = qualityTier;
   }
 
   if (preferEnglishCanonical && fusedEntries.length > 1) {

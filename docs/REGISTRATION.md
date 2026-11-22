@@ -74,15 +74,23 @@ Public `robots.txt` governance platforms track open-source agent `User-Agent` to
 EdgeFetch's keyless open-data adapters (`sec-edgar`, `openalex`, `crossref-doi`, `pubmed-pmc`, `clinicaltrials`, `europe-pmc`, `semantic-scholar`) automatically benefit from polite-pool routing when your `USER_AGENT` includes a real contact email or URL:
 
 - **SEC EDGAR (`data.sec.gov` / `www.sec.gov`):** Requires a descriptive `CompanyOrProjectName/Version (contact@yourdomain.com)` `User-Agent` (no registration form needed; EdgeFetch paces requests politely and includes contact metadata automatically).
-- **OpenAlex, Crossref & NCBI E-utilities:** Setting `USER_AGENT="EdgeFetch/2.5 (mailto:you@yourdomain.com)"` places your Hub/nodes into their prioritized "Polite Pool" without API keys.
+- **OpenAlex, Crossref & NCBI E-utilities:** Setting `USER_AGENT="EdgeFetch/2.7 (mailto:you@yourdomain.com)"` places your Hub/nodes into their prioritized "Polite Pool" without API keys.
 
 ---
 
-## Part 2: Registering in Official MCP & Open-Source Directories
+## Part 2: Official MCP, Homebrew & Open-Source Directories
 
-### 1. Official MCP Registry (`registry.modelcontextprotocol.io`)
+### 1. Official MCP Registry (`registry.modelcontextprotocol.io` — **LIVE**)
 
-EdgeFetch includes a validated [`server.json`](../server.json) manifest at the repository root (`io.github.bartrumb/edgefetch`, schema `2025-12-11`) pinned to `ghcr.io/bartrumb/edgefetch-agent:2.7.0` with the required `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"` OCI image label.
+EdgeFetch is **live (`active`, `v2.7.0`)** on the [Official MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=edgefetch) as **`io.github.bartrumb/edgefetch`**, published automatically via GitHub OIDC inside `.github/workflows/release.yml` on every signed `v*` tag using [`server.json`](../server.json) (schema `2025-12-11`, pinned to `ghcr.io/bartrumb/edgefetch-agent:2.7.0` with `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"`).
+
+### 1b. Official Homebrew Tap (`bartrumb/homebrew-tap` — **LIVE**)
+
+macOS (`arm64` / `amd64`) and Linux (`arm64` / `amd64`) users can install EdgeFetch directly via [`bartrumb/homebrew-tap`](https://github.com/bartrumb/homebrew-tap):
+
+```bash
+brew install bartrumb/tap/edgefetch
+```
 
 To validate and publish `io.github.bartrumb/edgefetch` in the Official MCP Registry:
 

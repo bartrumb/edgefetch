@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+PackageIdentifier: BartrumB.EdgeFetch
+PackageVersion: 2.7.0
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: edgefetch.exe
+        PortableCommandAlias: edgefetch
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.7.0/edgefetch_2.7.0_windows_amd64.zip
+    InstallerSha256: C5C1F3E77F524F00A784CE103DF822E8D86016667FD635F3F160E981F8F9C65C
+  - Architecture: arm64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: edgefetch.exe
+        PortableCommandAlias: edgefetch
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.7.0/edgefetch_2.7.0_windows_arm64.zip
+    InstallerSha256: 8E56F7D7C1CB633A9A9DB23DE21D846D33FF7EA28E00C945780336FDC4EDEB51
+ManifestType: installer
+ManifestVersion: 1.9.0

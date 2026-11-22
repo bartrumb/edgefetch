@@ -468,6 +468,7 @@ await t.test('M1: Selector engine dlMap linear colon trim & DOM depth/visit cap 
   assert.ok(deepMs < 30 * covMul, `M1 2 MiB deep DOM parse + select + text + outerHtml must run in < 30ms, took ${deepMs.toFixed(2)}ms`);
 
   // 3. Nested `<table>` inside `tableRows()` skips nested tables in linear time (< 30ms), and 2,000-deep tables halt safely (< 30ms)
+  parseHtmlDoc('<table><tr><td>warmup</td></tr></table>').first('table')!.tableRows();
   const nestedTablesHtml =
     '<table><tr><td>OuterCell<table>' +
     '<tr><td>Inner</td></tr>'.repeat(2_000) +

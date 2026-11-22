@@ -28,6 +28,8 @@ import { detectPromptInjection } from '../src/scrape-advanced.ts';
 import { executeExtractCall } from '../src/search-index.ts';
 import { classifyWafAndChallenge } from '../src/waf.ts';
 
+const covMul = process.env.NODE_V8_COVERAGE ? 4 : 1;
+
 const fin = (md: string, origin = true) =>
   finalizeScrapedMarkdown(md, {
     isPdf: false,
@@ -249,7 +251,7 @@ await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash 
   const t0 = performance.now();
   const fhOut = fin(bigFenceInfo);
   const fhElapsed = performance.now() - t0;
-  assert.ok(fhElapsed < 20, `64K fence info header must run in < 20ms, took ${fhElapsed.toFixed(2)}ms`);
+  assert.ok(fhElapsed < 20 * covMul, `64K fence info header must run in < 20ms, took ${fhElapsed.toFixed(2)}ms`);
   assert.ok(fhOut.includes('const x = 1;'));
 });
 
@@ -450,7 +452,7 @@ await t.test('M1: Selector engine dlMap linear colon trim & DOM depth/visit cap 
   const map = dlDoc.dlMap();
   const dlMs = performance.now() - tDl0;
   assert.equal(map.key, 'Value-1');
-  assert.ok(dlMs < 30, `M1 dlMap 105K colons/spaces must complete in < 30ms, took ${dlMs.toFixed(2)}ms`);
+  assert.ok(dlMs < 30 * covMul, `M1 dlMap 105K colons/spaces must complete in < 30ms, took ${dlMs.toFixed(2)}ms`);
 
   // 2. `2 MiB` deeply nested `<div>` chain (`419,000` tags) + `select('x div')` + `text()` + `outerHtml()` (`r6A/hd1..hd6.mjs`)
   const deepDomHtml = '<div>'.repeat(419_000);
@@ -463,7 +465,7 @@ await t.test('M1: Selector engine dlMap linear colon trim & DOM depth/visit cap 
   assert.equal(missMatches.length, 0);
   assert.equal(txt, '');
   assert.ok(serialized.length > 0);
-  assert.ok(deepMs < 30, `M1 2 MiB deep DOM parse + select + text + outerHtml must run in < 30ms, took ${deepMs.toFixed(2)}ms`);
+  assert.ok(deepMs < 30 * covMul, `M1 2 MiB deep DOM parse + select + text + outerHtml must run in < 30ms, took ${deepMs.toFixed(2)}ms`);
 
   // 3. Nested `<table>` inside `tableRows()` skips nested tables in linear time (< 30ms), and 2,000-deep tables halt safely (< 30ms)
   const nestedTablesHtml =
@@ -476,14 +478,14 @@ await t.test('M1: Selector engine dlMap linear colon trim & DOM depth/visit cap 
   const tblMs = performance.now() - tTbl0;
   assert.equal(rows.length, 1);
   assert.equal(rows[0]?.[1], 'Col2');
-  assert.ok(tblMs < 30, `M1 nested tableRows must run in < 30ms, took ${tblMs.toFixed(2)}ms`);
+  assert.ok(tblMs < 30 * covMul, `M1 nested tableRows must run in < 30ms, took ${tblMs.toFixed(2)}ms`);
 
   const deepTablesHtml = '<table><tr><td>'.repeat(2_000) + 'Leaf' + '</td></tr></table>'.repeat(2_000);
   const tDeepTbl0 = performance.now();
   const deepTblRows = parseHtmlDoc(deepTablesHtml).first('table')!.tableRows();
   const deepTblMs = performance.now() - tDeepTbl0;
   assert.ok(Array.isArray(deepTblRows));
-  assert.ok(deepTblMs < 30, `M1 2000-deep tableRows must run in < 30ms, took ${deepTblMs.toFixed(2)}ms`);
+  assert.ok(deepTblMs < 30 * covMul, `M1 2000-deep tableRows must run in < 30ms, took ${deepTblMs.toFixed(2)}ms`);
 });
 
 await t.test('M10: RE2JS LRU cache, JS \\s / \\S Unicode whitespace parity, bounded-repetition guard, and 40x2000 URL filter < 50ms', async () => {
@@ -554,7 +556,7 @@ await t.test('M10: RE2JS LRU cache, JS \\s / \\S Unicode whitespace parity, boun
   const benchMs = performance.now() - tBench0;
   assert.equal(allowedCount, 1600);
   assert.ok(
-    benchMs < 50,
+    benchMs < 50 * covMul,
     `M10 40 patterns × 2,000 URLs union matcher must complete in < 50ms, took ${benchMs.toFixed(2)}ms`,
   );
 
@@ -593,7 +595,7 @@ await t.test('M10: RE2JS LRU cache, JS \\s / \\S Unicode whitespace parity, boun
   const mapMs = performance.now() - tMap0;
   assert.equal(mapRes.status, 200);
   assert.equal((mapRes.body.links as unknown[]).length, 1600);
-  assert.ok(mapMs < 150, `End-to-end executeMapCall on 2,000 URLs × 40 patterns took ${mapMs.toFixed(2)}ms`);
+  assert.ok(mapMs < 150 * covMul, `End-to-end executeMapCall on 2,000 URLs × 40 patterns took ${mapMs.toFixed(2)}ms`);
 
   // Verify `matchesSafeCrawlPattern` per-URL memoization on a 2048-char `[ab]*a[ab]{32}` subject (`r6A/re2b.mjs`)
   const long2048 = '/' + 'b'.repeat(2040);
@@ -602,7 +604,7 @@ await t.test('M10: RE2JS LRU cache, JS \\s / \\S Unicode whitespace parity, boun
     assert.equal(matchesSafeCrawlPattern(long2048, '[ab]*a[ab]{32}'), false);
   }
   const singleMs = performance.now() - tSingle0;
-  assert.ok(singleMs < 50, `2,000 calls on 2048-char [ab]*a[ab]{32} must take < 50ms, took ${singleMs.toFixed(2)}ms`);
+  assert.ok(singleMs < 50 * covMul, `2,000 calls on 2048-char [ab]*a[ab]{32} must take < 50ms, took ${singleMs.toFixed(2)}ms`);
 });
 
 await t.test('M11: Prompt-injection guard (Variation Selectors, U+034F, Hangul fillers, code spans/fences) & prose WAF challenge classification', async () => {
@@ -788,7 +790,7 @@ await t.test('M12, Low jobs fixes, budget_exhausted boardStatus, query cap, and 
   const tHuge0 = performance.now();
   assert.equal(matchesAllowedCompanyOrDomain(makeJob(hugeCompany), stripeTokens, ['stripe.com']), false);
   const hugeMs = performance.now() - tHuge0;
-  assert.ok(hugeMs < 20, `262K-char company check must run in < 20ms, took ${hugeMs.toFixed(2)}ms`);
+  assert.ok(hugeMs < 20 * covMul, `262K-char company check must run in < 20ms, took ${hugeMs.toFixed(2)}ms`);
 
   // 3. `40`-scrape budget exhaustion reports `boardStatus: "budget_exhausted"` (NEVER `"not_found"`!) (`r6B/jobs6.mjs`)
   let scrapeCount = 0;

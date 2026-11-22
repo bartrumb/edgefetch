@@ -13,6 +13,8 @@
     "openapi:generate": "node scripts/generate-openapi.mjs",
     "adapter:new": "node scripts/new-adapter.mjs",
     "adapter:test": "node scripts/test-adapter.mjs",
+    "adapter:canary": "node scripts/canary-adapters.mjs",
+    "adapter:verify-diff": "node scripts/verify-adapter-only-diff.mjs",
     "build:portable": "node scripts/build-portable.mjs",
     "start:portable": "node scripts/build-portable.mjs && node dist/portable-server.mjs",
     "deploy:dry": "node scripts/compile-manifests.mjs && wrangler deploy --dry-run -c wrangler.toml --env=\"\" && wrangler deploy --dry-run -c wrangler.toml -e production",

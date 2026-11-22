@@ -103,7 +103,7 @@ curl -X POST "https://<your-hub>.workers.dev/fetch?site=site-arm64" \
 | `requests[].kind` | `"page"` \| `"json"` \| `"text"` \| `"feed"` | `"page"` for HTML documents (`text/html`), `"json"` for any valid 2xx JSON API, `"text"` for plain text/XML/sitemaps, or `"feed"` for product feeds requiring a top-level `"products"` array. |
 | `requests[].ifNoneMatch` / `ifModifiedSince` | optional | Conditional `304 Not Modified` headers — saves bandwidth when upstream content hasn't changed. |
 | `options.includeBody` | `false` | Set `true` to return response bodies alongside `bodyEncoding` (`"utf-8"` or lossless `"base64"` for non-UTF-8 responses). |
-| `options.respectRobots` | **`true` (locked on by default)** | Enforces 100% RFC 9309 `/robots.txt` (`1 MiB` parse cap, §2.2.1 group combining, §2.3.1.2 `5`-redirect follow, §2.4 `Cache-Control: max-age` up to 24h, `60s` `robots_unreachable` retry cache, and `Content-Signal: ai-input=no`) on the initial URL **and every redirect hop**. Passing `false` is rejected (`400 robots_required`) unless the target host is in the owner's `ROBOTS_BYPASS_HOSTS` + `EDGEFETCH_ROBOTS_BYPASS_HOSTS` allowlist. |
+| `options.respectRobots` | **`true` (locked on by default)** | Enforces RFC 9309 `/robots.txt` (`1 MiB` parse cap, §2.2.1 group combining, §2.3.1.2 `5`-redirect follow, §2.4 `Cache-Control: max-age` up to 24h, `10s` `robots_unreachable` retry cache, and `Content-Signal: ai-input=no`) on the initial URL **and every redirect hop**. Passing `false` is rejected (`400 robots_required`) unless the target host is in the owner's `ROBOTS_BYPASS_HOSTS` + `EDGEFETCH_ROBOTS_BYPASS_HOSTS` allowlist. |
 | `options.maxBytes` / `maxTotalBytes` | `8 MiB` (`16 MiB` max) / `16 MiB` (`18 MiB` max) | Per-URL streaming cap (`io.LimitReader(maxBytes + 1)`) plus per-batch retained body budget (`bodyOmitted: true` + `truncated: true` beyond budget). |
 | `options.retries` | `0` (max `3`) | Retries transient transport/`500`/`502`/`504` errors (`>= 25%` jitter floor). HTTP `429` uses dedicated 3-strikes adaptive `Retry-After` backoff; permanent SSRF/TLS refusals, `403`, `503`, and challenges are **never** retried on the node. |
 
@@ -144,11 +144,15 @@ claude mcp add --transport http edgefetch https://<your-hub>.workers.dev/mcp
 
 When Claude Code connects for the first time, it discovers `/.well-known/oauth-protected-resource`, registers dynamically, and opens your browser to `/oauth/authorize`. Paste your `CALLER_TOKEN` once (or click **Approve** immediately if already signed into `/admin`) — **no raw bearer tokens are ever saved in `.claude.json` or shell history**.
 
-### Exposed MCP Tools (12-Tool v2.4 Surface)
+### Exposed MCP Tools (17-Tool Surface)
 
 | Tool | Required Scope | Description |
 |---|---|---|
-| `list_agents` | `crawl:read` | Lists connected standby agents (`siteId`, `LITE`/`FAT` tier, `capabilities`, `version`, `arch`) and active `429` cooldowns. |
+| `list_agents` | `crawl:read` | Lists connected standby agents (`siteId`, `lite`/`browser` capability tier, `capabilities`, `version`, `arch`) and active `429` cooldowns. |
+| `agent` | `crawl:fetch` | Runs multi-step web research using optional BYO-LLM (`Ollama`, `OpenAI`, `Anthropic`, `Gemini`, `Workers AI`) or deterministic adapter/search routing. |
+| `discover_mcps` | `crawl:read` | Queries the Official MCP Registry and Glama directory for matching remote MCP connectors. |
+| `query_mcp` | `mcp:call` | Lists or invokes tools on a user's connected downstream MCP servers stored in the `AES-256-GCM` connector vault. |
+| `find_extractors` | `crawl:read` | Searches the `57` built-in declarative YAML site, commerce, open-data, and ATS adapters by domain or topic. |
 | `scrape` | `crawl:fetch` | Scrapes a public `https://` URL to clean GFM Markdown, Jupyter `.ipynb`, OpenAPI 3.x, CSV, `.ics`, metadata, `contentState`, `waf` diagnostics, SSR hydration recovery, `304` `ETag` revalidation, and optional `waybackFallback`. |
 | `extract` | `crawl:fetch` | Fetches 1..20 URLs politely and returns BM25 query-ranked ~1,500-char chunks (`chunksPerSource`) or full documents (`mode: "full"`), with `jsonFilter` and optional `waybackFallback`. |
 | `map` | `crawl:fetch` | Discovers site URLs across `robots.txt` `Sitemap:`, `sitemap.xml` / `.xml.gz`, `/llms.txt`, and homepage links with anchor titles. |
@@ -164,7 +168,7 @@ When Claude Code connects for the first time, it discovers `/.well-known/oauth-p
 
 ---
 
-## 6. v2.4 REST Endpoints, Verified Bot Auth, Storage Layers & Compatibility Routes
+## 6. REST Endpoints, Verified Bot Auth, Storage Layers & Compatibility Routes
 
 | Endpoint | Description |
 |---|---|
@@ -178,7 +182,7 @@ When Claude Code connects for the first time, it discovers `/.well-known/oauth-p
 | `POST /v1/map` | Rapid polite URL discovery (`robots.txt`, sitemaps, `/llms.txt`, homepage links, `search` filter). |
 | `POST /v1/crawl`, `GET\|DELETE /v1/crawl/:id` | Async site crawl tracked in `META` D1 `crawls` + indexed in `SEARCH` D1 FTS5 + HMAC-SHA256 webhooks (`X-EdgeFetch-Signature`). |
 | `POST /v1/search` & `POST /v1/collections/:id/search` | Waterfall / RRF web + private D1 FTS5 search (`SERPER_API_KEY`, `BRAVE_API_KEY`, `SEARXNG_URL`, `collections`, `include_raw_content`). |
-| `POST /v1/interact` | Stateful headless browser interaction routed to `browser-v1` worker nodes. |
+| `POST /v1/interact` | Stateful headless browser interaction routed to browser-capable (`browser-v1`) worker nodes (`ghcr.io/bartrumb/edgefetch-agent:2.7.2` or native desktop/VM workers). |
 | `GET /v1/artifacts/:blobSha256` | Authenticated offset-paged artifact reader (`text/plain; charset=utf-8`, `nosniff`, `CSP: sandbox`, `410 Gone` when expired). |
 | `/compat/firecrawl/v2/*` & `/compat/tavily/*` | Drop-in compatibility routes for existing Firecrawl v2 and Tavily SDK clients. |
 

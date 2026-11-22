@@ -97,6 +97,9 @@ try {
   const liveMcpAuditOutfile = join(dir, 'live-mcp-audit.test.mjs');
   buildNodeTestBundle('test/live-mcp-audit.test.ts', liveMcpAuditOutfile);
   nodeTestFiles.push(liveMcpAuditOutfile);
+  const ring1CanaryOutfile = join(dir, 'ring1-adapter-canary.test.mjs');
+  buildNodeTestBundle('test/ring1-adapter-canary.test.ts', ring1CanaryOutfile);
+  nodeTestFiles.push(ring1CanaryOutfile);
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],

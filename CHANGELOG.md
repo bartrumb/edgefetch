@@ -9,9 +9,14 @@ All notable changes to EdgeFetch are documented in this file. This project adher
 - **Zero Default Phone-Home in `edgefetch mcp` (`cmd/edgefetch/cli.go`, `cmd/edgefetch/update.go`):** Made the 24h background GitHub release check in `edgefetch mcp` strictly opt-in behind `EDGEFETCH_CHECK_UPDATES=1` (default `OFF`, honoring `EDGEFETCH_DISABLE_UPDATE_CHECK=1` and `DO_NOT_TRACK=1`), while keeping on-demand Ed25519-verified `edgefetch update` and `edgefetch update --check` available anytime.
 
 ### Added
+- **Ring 1 Autonomous Adapter Canary & Domain-Locked Diff Gate (`hub/scripts/canary-adapters.mjs`, `hub/scripts/verify-adapter-only-diff.mjs`, `.github/workflows/adapter-canary.yml`, `docs/adapter-health.json`):**
+  - Added a daily read-only, `robots.txt`-checked adapter health canary (`npm run adapter:canary`) emitting prompt-injection-free structural diagnostics (`docs/adapter-health.json` and `/adapters/status/` on `edgefetch.dev`).
+  - Added `npm run adapter:verify-diff`, a deterministic Ring 1 policy gate restricting automated adapter repairs to existing `internal/extract/manifests/*.yaml` files with zero `domains[]` widening and zero `twin.fetchUrl` host changes.
 - **News-Feeds Declarative YAML Adapter & `topic: "news"` Search Routing (`internal/extract/manifests/news-feeds.yaml`, `hub/src/web-search.ts`, `hub/src/mcp.ts`):**
   - Added the `news-feeds` declarative YAML adapter (`57/57` total YAML site adapters), automatically upgrading public broadcaster/news hub URLs (`npr.org`, `cbsnews.com`, `nbcnews.com`, `bbc.com`, `bbc.co.uk`, `theguardian.com`, `dw.com`, `pbs.org`, `arstechnica.com`) to official RSS/RDF feeds while leaving article URLs untouched.
   - Added `topic: "auto" | "general" | "news"` SERP routing across Serper (`/news`), Brave (`/res/v1/news/search`), SearXNG (`categories=news`), and Tavily (`topic: "news"`), multi-domain `(site:d1 OR site:d2 ...)` query construction, and `host_health` RRF quality scoring.
+- **Engineering Security Log & Reproducible Extraction Benchmark (`docs/SECURITY-LOG.md`, `bench/compare.mjs`, `README.md`):**
+  - Documented the Two-Ring ("Built by AI, for AI") governance model and Rounds 1–8 security findings & fixes in `docs/SECURITY-LOG.md`, and added `node bench/compare.mjs` (`--offline` and `robots.txt`-checked `--live` modes) comparing raw HTML, naive tag-stripping, and EdgeFetch Markdown extraction.
 
 ### Fixed
 - **CI Runner Pinning & Coverage-Jitter Stability (`.github/workflows/addon-ghcr.yml`, `.github/workflows/release.yml`, `hub/test/*`):** Pinned release and GHCR workflow runners to `ubuntu-24.04` (avoiding Ubuntu 26.04 Snap-confined Chromium pipe issues) and warmed up $O(N)$ prompt-injection and HTML selector timing checks under parallel V8 `--coverage` load.

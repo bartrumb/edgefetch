@@ -1049,17 +1049,17 @@ func RedactEmbeddedURLs(s string) string {
 	hasDotOrBracket := strings.IndexByte(s, '.') >= 0 || strings.IndexByte(s, '[') >= 0
 	hasResolver := hasColon && hasDotOrBracket
 	hasScheme := hasPct ||
-		strings.Index(s, "//") >= 0 ||
+		strings.Contains(s, "//") ||
 		((hasColon || hasSlash) && strings.IndexByte(s, '\\') >= 0) ||
-		(hasColon && strings.ContainsAny(s, "mM") && (strings.Index(s, "mailto:") >= 0 || strings.ContainsAny(s, "MAILTO")))
+		(hasColon && strings.ContainsAny(s, "mM") && (strings.Contains(s, "mailto:") || strings.ContainsAny(s, "MAILTO")))
 	hasBare := (hasColon || hasSlash) &&
-		(hasDotOrBracket || strings.Index(s, "localhost") >= 0 || strings.ContainsAny(s, "LOCALHOST"))
+		(hasDotOrBracket || strings.Contains(s, "localhost") || strings.ContainsAny(s, "LOCALHOST"))
 	hasSecretKw := (hasColon || strings.IndexByte(s, ' ') >= 0 || strings.IndexByte(s, '=') >= 0) &&
-		(strings.Index(s, "bearer") >= 0 ||
-			strings.Index(s, "basic") >= 0 ||
-			strings.Index(s, "token") >= 0 ||
-			strings.Index(s, "api_key") >= 0 ||
-			strings.Index(s, "apikey") >= 0 ||
+		(strings.Contains(s, "bearer") ||
+			strings.Contains(s, "basic") ||
+			strings.Contains(s, "token") ||
+			strings.Contains(s, "api_key") ||
+			strings.Contains(s, "apikey") ||
 			(strings.ContainsAny(s, "BTA") && strings.ContainsAny(s, "eEiIoO")))
 	if !hasResolver && !hasScheme && !hasAt && !hasBare && !hasSecretKw {
 		return s

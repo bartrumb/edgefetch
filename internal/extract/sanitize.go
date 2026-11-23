@@ -275,59 +275,6 @@ func trimASCIIWhitespaceLinearGo(s string) string {
 	return s[start:end]
 }
 
-func isJSTrimSpaceRune(r rune) bool {
-	switch r {
-	case ' ', '\t', '\n', '\r', '\v', '\f', 0x00A0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF:
-		return true
-	}
-	return r >= 0x2000 && r <= 0x200A
-}
-
-func trimJSSpace(s string) string {
-	n := len(s)
-	if n == 0 {
-		return ""
-	}
-	if s[0] > ' ' && s[0] < 0x7F && s[n-1] > ' ' && s[n-1] < 0x7F {
-		return s
-	}
-	start := 0
-	for start < n {
-		if s[start] < 0x80 {
-			c := s[start]
-			if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f' {
-				start++
-				continue
-			}
-			break
-		}
-		r, w := utf8.DecodeRuneInString(s[start:])
-		if isJSTrimSpaceRune(r) {
-			start += w
-			continue
-		}
-		break
-	}
-	end := n
-	for end > start {
-		if s[end-1] < 0x80 {
-			c := s[end-1]
-			if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f' {
-				end--
-				continue
-			}
-			break
-		}
-		r, w := utf8.DecodeLastRuneInString(s[start:end])
-		if isJSTrimSpaceRune(r) {
-			end -= w
-			continue
-		}
-		break
-	}
-	return s[start:end]
-}
-
 func isSafePrintableASCIIByte(b byte) bool {
 	return (b >= 0x20 && b <= 0x7E) || b == '\n' || b == '\t' || b == '\r'
 }

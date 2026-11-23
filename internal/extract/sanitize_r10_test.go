@@ -135,19 +135,19 @@ func TestR10S5TabIndentedFenceClosersAndOpenersInsideListItems(t *testing.T) {
 	cases := map[string]string{
 		// Classic S5 exploit: `- item` has content col 2; `\t```` advances to tab stop col 4;
 		// remaining indent is 4 - 2 = 2 (<= 3), closing the fence in CommonMark!
-		"ul_2col_tab_closer": "- item\n  ```\n\t```\n<img src=x onerror=alert(1)>",
-		"ul_2col_tab_closer_indented_xss": "- item\n  ```\n\t```\n  <img src=x onerror=alert(1)>\n  [p](javascript:alert(1))",
-		"ol_3col_tab_closer": "1. item\n   ```\n\t```\n<script>alert(1)</script>",
-		"ol_3col_tab_closer_list_cont": "1. item\n   ~~~html\n\t~~~\n   <svg onload=alert(1)>",
-		"ul_spaces_plus_tab_closer": "- item\n  ```\n  \t```\n<img src=x onerror=alert(1)>",
-		"ul_1space_plus_tab_closer": "- item\n  ```\n \t```\n<img src=x onerror=alert(1)>",
-		"nested_ul_tab_closer": "- outer\n  - inner\n    ```\n\t  ```\n    <img src=x onerror=alert(1)>",
-		"nested_ul_dedent_to_outer_tab": "- outer\n  - inner\n  para\n  ```\n\t```\n  <img src=x onerror=alert(1)>",
-		"ul_tab_opener_and_closer": "- item\n\t```html\n\t<b>in-fence</b>\n\t```\n<img src=x onerror=alert(1)>",
-		"ol_tab_opener_and_space_closer": "1. item\n\t```html\n\t<b>in-fence</b>\n   ```\n   <img src=x onerror=alert(1)>",
-		"double_tab_inner_fence_lengthened": "- item\n  ```\n\t\t```\n  <img src=x onerror=alert(1)>\n  ```",
+		"ul_2col_tab_closer":                   "- item\n  ```\n\t```\n<img src=x onerror=alert(1)>",
+		"ul_2col_tab_closer_indented_xss":      "- item\n  ```\n\t```\n  <img src=x onerror=alert(1)>\n  [p](javascript:alert(1))",
+		"ol_3col_tab_closer":                   "1. item\n   ```\n\t```\n<script>alert(1)</script>",
+		"ol_3col_tab_closer_list_cont":         "1. item\n   ~~~html\n\t~~~\n   <svg onload=alert(1)>",
+		"ul_spaces_plus_tab_closer":            "- item\n  ```\n  \t```\n<img src=x onerror=alert(1)>",
+		"ul_1space_plus_tab_closer":            "- item\n  ```\n \t```\n<img src=x onerror=alert(1)>",
+		"nested_ul_tab_closer":                 "- outer\n  - inner\n    ```\n\t  ```\n    <img src=x onerror=alert(1)>",
+		"nested_ul_dedent_to_outer_tab":        "- outer\n  - inner\n  para\n  ```\n\t```\n  <img src=x onerror=alert(1)>",
+		"ul_tab_opener_and_closer":             "- item\n\t```html\n\t<b>in-fence</b>\n\t```\n<img src=x onerror=alert(1)>",
+		"ol_tab_opener_and_space_closer":       "1. item\n\t```html\n\t<b>in-fence</b>\n   ```\n   <img src=x onerror=alert(1)>",
+		"double_tab_inner_fence_lengthened":    "- item\n  ```\n\t\t```\n  <img src=x onerror=alert(1)>\n  ```",
 		"top_level_tab_inner_fence_lengthened": "```\n\t```\n<img src=x onerror=alert(1)>\n```",
-		"blockquote_plus_list_tab_closer": "> - item\n>   ```\n>\t```\n> <img src=x onerror=alert(1)>",
+		"blockquote_plus_list_tab_closer":      "> - item\n>   ```\n>\t```\n> <img src=x onerror=alert(1)>",
 	}
 
 	for name, md := range cases {

@@ -844,14 +844,26 @@ func isSchemelessPrevBlocked(prev byte) bool {
 const schemelessTermChars = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \"'<>),{}\\`|"
 
 func clampAtUTF8LineBreak(s string, from, end int) int {
-	for k := from; k < end; k++ {
-		c := s[k]
-		if c == 0xc2 && k+1 < end && s[k+1] == 0x85 {
-			return k
+	// Fast SIMD scan via strings.IndexByte so 1 MiB pure-ASCII inputs pay O(1) calls (zero per-byte -race/-coverprofile overhead).
+	for k := from; k < end; {
+		relC2 := strings.IndexByte(s[k:end], 0xc2)
+		relE2 := strings.IndexByte(s[k:end], 0xe2)
+		if relC2 < 0 && relE2 < 0 {
+			return end
 		}
-		if c == 0xe2 && k+2 < end && s[k+1] == 0x80 && (s[k+2] == 0xa8 || s[k+2] == 0xa9) {
-			return k
+		nextRel := relC2
+		if nextRel < 0 || (relE2 >= 0 && relE2 < nextRel) {
+			nextRel = relE2
 		}
+		pos := k + nextRel
+		if s[pos] == 0xc2 {
+			if pos+1 < end && s[pos+1] == 0x85 {
+				return pos
+			}
+		} else if pos+2 < end && s[pos+1] == 0x80 && (s[pos+2] == 0xa8 || s[pos+2] == 0xa9) {
+			return pos
+		}
+		k = pos + 1
 	}
 	return end
 }

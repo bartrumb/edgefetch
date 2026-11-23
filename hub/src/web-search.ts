@@ -33,6 +33,13 @@ import {
 import { decodeHtmlEntities } from './scrape';
 import { D1FtsSearchIndex, executeExtractCall, resolveUserCollectionId } from './search-index';
 import type { OptionalStorageBindings } from './storage';
+import {
+  buildWikipediaDirectTitleGuessUrl,
+  extractWikipediaLangFromHost,
+  isWikipediaHost,
+  normalizeWikipediaLang,
+  parseWikipediaArticleUrl,
+} from './wikipedia';
 
 const RRF_K = 60;
 const DEFAULT_SEARCH_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000; // 24h SERP cache
@@ -74,6 +81,8 @@ export interface SearchResultEntry {
   score: number;
   provider: string;
   providers: string[];
+  canonicalTitle?: string;
+  lang?: string;
   rawContent?: string;
   chunks?: unknown[];
 }
@@ -81,6 +90,8 @@ export interface SearchResultEntry {
 export interface SearchRequestPayload {
   query?: unknown;
   q?: unknown;
+  wikipedia?: unknown;
+  lang?: unknown;
   max_results?: unknown;
   maxResults?: unknown;
   limit?: unknown;
@@ -898,8 +909,31 @@ export async function executeSearchCall(params: {
   }
 
   const edgeMapSpec = extractEdgeMapDomains(query, includeDomains);
-  const canEdgeMap = edgeMapSpec.domains.length > 0;
-  const effectiveIncludeDomains = includeDomains.length > 0 ? includeDomains : edgeMapSpec.siteDomains;
+  const explicitWikipediaMode = payload.wikipedia === true;
+  const implicitWikipediaDomain =
+    (edgeMapSpec.domains.length > 0 && edgeMapSpec.domains.every((d) => isWikipediaHost(d))) ||
+    (includeDomains.length > 0 && includeDomains.every((d) => isWikipediaHost(d)));
+  const isWikipediaResolver = explicitWikipediaMode || implicitWikipediaDomain;
+  const resolvedWikiLang = normalizeWikipediaLang(
+    payload.lang,
+    extractWikipediaLangFromHost(edgeMapSpec.domains[0] ?? includeDomains[0] ?? '') ?? 'en',
+  );
+  const resolvedWikiHost = `${resolvedWikiLang}.wikipedia.org`;
+  // Never run `edge-map` on Wikipedia during `search` (never fetch sitemap, `/llms.txt`, `Special:`, `/w/`, or `/api/` on article discovery).
+  const canEdgeMap = edgeMapSpec.domains.length > 0 && !isWikipediaResolver && !edgeMapSpec.domains.some((d) => isWikipediaHost(d));
+  const effectiveIncludeDomains = isWikipediaResolver
+    ? explicitWikipediaMode && includeDomains.length === 0 && edgeMapSpec.siteDomains.length === 0
+      ? [resolvedWikiHost]
+      : includeDomains.length > 0
+        ? includeDomains
+        : edgeMapSpec.siteDomains.length > 0
+          ? edgeMapSpec.siteDomains.map((d) => (d === 'wikipedia.org' ? resolvedWikiHost : d))
+          : [resolvedWikiHost]
+    : includeDomains.length > 0
+      ? includeDomains
+      : edgeMapSpec.siteDomains;
+  const effectiveSerpQuery =
+    isWikipediaResolver && !/\bsite:/i.test(query) ? `site:${resolvedWikiHost} ${query}` : query;
 
   const unhonoredOptions: string[] = [];
   if (wantsAnswer) {
@@ -909,7 +943,7 @@ export async function executeSearchCall(params: {
     unhonoredOptions.push('time_range');
   }
 
-  if (!hasExternalProvider && !canEdgeMap && (!hasD1Search || requestedCollections.length === 0)) {
+  if (!hasExternalProvider && !canEdgeMap && !isWikipediaResolver && (!hasD1Search || requestedCollections.length === 0)) {
     return {
       status: 503,
       via: 'hub',
@@ -1083,9 +1117,9 @@ export async function executeSearchCall(params: {
             JSON.stringify({
               v: 2,
               p: activeProviderSig,
-              q: query.toLowerCase(),
+              q: effectiveSerpQuery.toLowerCase(),
               tr: timeRange,
-              inc: includeDomains,
+              inc: effectiveIncludeDomains,
               exc: excludeDomains,
             }),
           )
@@ -1127,8 +1161,8 @@ export async function executeSearchCall(params: {
         const items = await runWithProviderPoliteness('serper', DEFAULT_PROVIDER_GAP_MS, enforcePacing, () =>
           querySerperWebSearch({
             apiKey: env.SERPER_API_KEY!.trim(),
-            query,
-            includeDomains,
+            query: effectiveSerpQuery,
+            includeDomains: isWikipediaResolver ? [] : includeDomains,
             timeRange,
             fetchFn: providerFetchFn,
             tracer: providerTracer,
@@ -1146,7 +1180,7 @@ export async function executeSearchCall(params: {
         const items = await runWithProviderPoliteness('brave', BRAVE_MIN_GAP_MS, enforcePacing, () =>
           queryBraveWebSearch({
             apiKey: env.BRAVE_API_KEY!.trim(),
-            query,
+            query: effectiveSerpQuery,
             count: maxResults * 2,
             timeRange,
             fetchFn: providerFetchFn,
@@ -1165,7 +1199,7 @@ export async function executeSearchCall(params: {
         const items = await runWithProviderPoliteness('searxng', DEFAULT_PROVIDER_GAP_MS, enforcePacing, () =>
           querySearxngSearch({
             searxngBaseUrl: env.SEARXNG_URL!.trim(),
-            query,
+            query: effectiveSerpQuery,
             count: maxResults * 2,
             timeRange,
             fetchFn: providerFetchFn,
@@ -1199,9 +1233,9 @@ export async function executeSearchCall(params: {
         const items = await runWithProviderPoliteness('tavily', DEFAULT_PROVIDER_GAP_MS, enforcePacing, () =>
           queryTavilyWebSearch({
             apiKey: env.TAVILY_API_KEY!.trim(),
-            query,
+            query: effectiveSerpQuery,
             count: maxResults * 2,
-            includeDomains,
+            includeDomains: isWikipediaResolver ? effectiveIncludeDomains : includeDomains,
             excludeDomains,
             timeRange,
             fetchFn: providerFetchFn,
@@ -1304,6 +1338,58 @@ export async function executeSearchCall(params: {
   };
 
   // Reciprocal Rank Fusion (RRF, k = 60) across all active providers + domain allow/block filtering.
+  // Tier 2 Wikipedia Direct-Title Guess fallback: if targeting Wikipedia and SERP/collections returned 0 valid `/wiki/<Title>`
+  // article hits (e.g. keyless self-hosted Hub), try at most ONE `/wiki/<Title_Cased_Query>` fetch (never touching Special:, /w/, or /api/).
+  if (isWikipediaResolver) {
+    const preWikiArticles = [...externalLists, ...collectionLists].reduce(
+      (acc, l) => acc + l.items.filter((it) => parseWikipediaArticleUrl(it.url) !== null).length,
+      0,
+    );
+    if (preWikiArticles === 0) {
+      const bareTerms = edgeMapSpec.filterTerms || query.replace(/\bsite:\S+/gi, '').trim();
+      const guessUrl = buildWikipediaDirectTitleGuessUrl(bareTerms, resolvedWikiLang);
+      if (guessUrl) {
+        try {
+          const guessRes = await executeHubFetch(
+            (payload.target === 'agent' || payload.target === 'container' ? payload.target : 'auto'),
+            JSON.stringify({
+              maxSeconds: 20,
+              options: { includeBody: true, respectRobots: true },
+              requests: [{ id: 'wiki-guess-1', url: guessUrl, kind: 'page' }],
+            }),
+            typeof payload.site === 'string' && payload.site.trim() ? payload.site.trim() : undefined,
+            `${source}:wiki-direct`,
+            'off',
+            false,
+          );
+          if (guessRes.status === 200) {
+            const parsedGuess = JSON.parse(guessRes.bodyText) as { results?: Array<Record<string, unknown>> };
+            const gItem = parsedGuess.results?.[0];
+            if (gItem?.outcome === 'ok' && (typeof gItem.status !== 'number' || (gItem.status >= 200 && gItem.status < 300))) {
+              const finalStr = typeof gItem.finalUrl === 'string' && gItem.finalUrl ? gItem.finalUrl : guessUrl;
+              const parsedArt = parseWikipediaArticleUrl(finalStr);
+              if (parsedArt) {
+                providerLists.push({
+                  provider: `wikipedia-direct:${guessRes.via}`,
+                  items: [
+                    {
+                      url: parsedArt.canonicalUrl,
+                      title: `${parsedArt.canonicalTitle} — Wikipedia`,
+                      snippet: `Wikipedia (${parsedArt.lang}) article: ${parsedArt.canonicalTitle}`,
+                    },
+                  ],
+                });
+                viaParts.push(`wikipedia-direct:${guessRes.via}`);
+              }
+            }
+          }
+        } catch {
+          // Non-fatal fallback
+        }
+      }
+    }
+  }
+
   const fused = new Map<
     string,
     {
@@ -1313,24 +1399,40 @@ export async function executeSearchCall(params: {
       rrfScore: number;
       providers: string[];
       isFiller: boolean;
+      canonicalTitle?: string;
+      lang?: string;
     }
   >();
 
   for (const { provider, items } of providerLists) {
     items.forEach((item, rankIdx) => {
+      let itemUrl = item.url;
+      let wikiMeta: ReturnType<typeof parseWikipediaArticleUrl> = null;
       let host = '';
       try {
-        host = new URL(item.url).hostname;
+        host = new URL(itemUrl).hostname;
       } catch {
+        return;
+      }
+      if (isWikipediaHost(host)) {
+        wikiMeta = parseWikipediaArticleUrl(itemUrl);
+        // Strictly drop Special:, Talk:, User:, Wikipedia:, File:, /w/*, /api/*, and non-article paths on Wikipedia!
+        if (!wikiMeta) {
+          if (isWikipediaResolver) return;
+        } else {
+          itemUrl = wikiMeta.canonicalUrl;
+          host = wikiMeta.host;
+        }
+      } else if (isWikipediaResolver) {
         return;
       }
       if (effectiveIncludeDomains.length > 0 && !hostMatchesDomainRule(host, effectiveIncludeDomains)) return;
       if (excludeDomains.length > 0 && hostMatchesDomainRule(host, excludeDomains)) return;
-      if (!urlMatchesSitePrefixes(item.url, edgeMapSpec.sitePrefixes)) return;
+      if (!urlMatchesSitePrefixes(itemUrl, edgeMapSpec.sitePrefixes)) return;
 
       const isSyntheticMapSnippet = (s: string) => /^Listed in \S+ on \S+$/i.test(s);
       const rrfAdd = (item.rrfWeight ?? 1) / (RRF_K + rankIdx + 1);
-      const existing = fused.get(item.url);
+      const existing = fused.get(itemUrl);
       if (existing) {
         existing.rrfScore += rrfAdd;
         if (!existing.providers.includes(provider)) existing.providers.push(provider);
@@ -1345,13 +1447,14 @@ export async function executeSearchCall(params: {
           if (item.title) existing.title = item.title;
         }
       } else {
-        fused.set(item.url, {
-          url: item.url,
-          title: item.title,
+        fused.set(itemUrl, {
+          url: itemUrl,
+          title: item.title || (wikiMeta ? `${wikiMeta.canonicalTitle} — Wikipedia` : ''),
           content: item.snippet,
           rrfScore: rrfAdd,
           providers: [provider],
           isFiller: Boolean(item.isFiller),
+          ...(wikiMeta ? { canonicalTitle: wikiMeta.canonicalTitle, lang: wikiMeta.lang } : {}),
         });
       }
     });
@@ -1391,6 +1494,8 @@ export async function executeSearchCall(params: {
     score: Number(Math.min(1, (r.rrfScore / Math.max(maxRrf, 1e-6)) * 0.95).toFixed(4)),
     provider: r.providers[0]!,
     providers: r.providers,
+    ...(r.canonicalTitle ? { canonicalTitle: r.canonicalTitle } : {}),
+    ...(r.lang ? { lang: r.lang } : {}),
   }));
 
   let via = viaParts.join('+') || providerLists.map((p) => p.provider).join('+') || 'search';

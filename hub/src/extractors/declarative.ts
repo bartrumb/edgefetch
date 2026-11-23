@@ -32,6 +32,7 @@ import {
   VALID_CATALOG_PLATFORMS,
   type DeclarativeCatalogConfig,
 } from './commerce-engine';
+import { cleanMediaWikiMarkdownLinear } from '../wikipedia';
 import {
   attrHasTokenLinear,
   extractXmlTagTextLinear,
@@ -3402,53 +3403,8 @@ function runMarkdownCleanPreset(
   ) {
     return null;
   }
-  const boundedWikiMd = ctx.currentMd.length > 2 * 1024 * 1024 ? ctx.currentMd.slice(0, 2 * 1024 * 1024) : ctx.currentMd;
-  const wikiLines = boundedWikiMd.split('\n');
-  const outWikiLines: string[] = [];
-  for (let wi = 0; wi < wikiLines.length; wi++) {
-    let ln = wikiLines[wi]!;
-    const trimmedLn = ln.trim();
-    // Cut trailing MediaWiki chrome footer from the first matching heading/chrome line onward
-    if (/^(?:##+[ \t]+)?(?:Navigation menu|Namespaces|Views|Personal tools)\b/i.test(trimmedLn)) {
-      break;
-    }
-    if (ln.includes('[')) {
-      ln = ln.replace(/[ \t]*\[(?:edit|citation needed|clarification needed|when\?|who\?|dubious[ \t]*[–-][ \t]*discuss)\]/gi, '');
-    }
-    if (trimmedLn.startsWith('^')) {
-      const caretIdx = ln.indexOf('^');
-      let p = caretIdx + 1;
-      while (p < ln.length && (ln.charCodeAt(p) === 32 || ln.charCodeAt(p) === 9)) p++;
-      if (p > caretIdx + 1) {
-        const restAfterCaret = ln.slice(p);
-        const fnBracket = /^\[\^[a-z0-9]{1,32}\][ \t]*/i.exec(restAfterCaret);
-        if (fnBracket) {
-          ln = `^ ${restAfterCaret.slice(fnBracket[0].length)}`;
-        } else {
-          // Linear scan for `a b c ` backlink letter prefixes (`(?:[a-z][ \t]+){2,}`)
-          let k = 0;
-          let letterCount = 0;
-          while (k + 1 < restAfterCaret.length) {
-            const lc = restAfterCaret.charCodeAt(k) | 32;
-            const sc = restAfterCaret.charCodeAt(k + 1);
-            if (lc >= 97 && lc <= 122 && (sc === 32 || sc === 9)) {
-              letterCount++;
-              k += 2;
-              while (k < restAfterCaret.length && (restAfterCaret.charCodeAt(k) === 32 || restAfterCaret.charCodeAt(k) === 9)) k++;
-            } else {
-              break;
-            }
-          }
-          if (letterCount >= 2) {
-            ln = `^ ${restAfterCaret.slice(k)}`;
-          }
-        }
-      }
-    }
-    outWikiLines.push(ln);
-  }
-  const cleaned = outWikiLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-  if (cleaned && cleaned !== boundedWikiMd) {
+  const cleaned = cleanMediaWikiMarkdownLinear(ctx.currentMd);
+  if (cleaned && cleaned !== ctx.currentMd.trim()) {
     return { extractorId, markdown: escapeDangerousRawHtmlOutsideFences(cleaned) };
   }
   return null;

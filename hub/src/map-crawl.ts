@@ -53,6 +53,7 @@ import {
   type ArtifactRetention,
   type OptionalStorageBindings,
 } from './storage';
+import { getCachedWikipediaSitemapUrls, isWikipediaHost, setCachedWikipediaSitemapUrls } from './wikipedia';
 
 export const MAX_CONCURRENT_MAPS_PER_USER = 4;
 export const MAX_CONCURRENT_EXTRACTS_PER_USER = 4;
@@ -421,21 +422,33 @@ export async function executeMapCall(params: {
     (subpathSegments.length === 1 || /\b(docs?|api|reference|guides?|manual|sdk|dev|developers)\b/i.test(trimmedSubpath));
   const subLlmsUrl = shouldProbeSubpathLlms ? `${origin}${trimmedSubpath}/llms.txt` : '';
 
+  const isWikiRootHost = isWikipediaHost(rootHost);
+  const cachedWikiSitemapUrls = !ignoreSitemap && isWikiRootHost ? getCachedWikipediaSitemapUrls(rootHost) : null;
+  const wikiAllowedSitemapUrl = `${origin}/w/rest.php/site/v1/sitemap/0`;
+
   const seedRequests: Array<Record<string, unknown>> = sitemapOnly
     ? []
     : isGitHubRepoSubpath
       ? [{ id: 'home', url: rootUrl.toString(), kind: 'page' }]
-      : [
-          { id: 'home', url: rootUrl.toString(), kind: 'page' },
-          { id: 'llms', url: `${origin}/llms.txt`, kind: 'text', accept: 'text/plain' },
-          ...(subLlmsUrl ? [{ id: 'llms-sub', url: subLlmsUrl, kind: 'text', accept: 'text/plain' }] : []),
-        ];
+      : isWikiRootHost
+        ? [{ id: 'home', url: rootUrl.toString(), kind: 'page' }]
+        : [
+            { id: 'home', url: rootUrl.toString(), kind: 'page' },
+            { id: 'llms', url: `${origin}/llms.txt`, kind: 'text', accept: 'text/plain' },
+            ...(subLlmsUrl ? [{ id: 'llms-sub', url: subLlmsUrl, kind: 'text', accept: 'text/plain' }] : []),
+          ];
   if (!ignoreSitemap && !isGitHubRepoSubpath) {
-    seedRequests.push(
-      { id: 'robots', url: `${origin}/robots.txt`, kind: 'text', accept: 'text/plain' },
-      { id: 'sitemap', url: `${origin}/sitemap.xml`, kind: 'text', accept: 'application/xml' },
-      { id: 'sitemap-index', url: `${origin}/sitemap-index.xml`, kind: 'text', accept: 'application/xml' },
-    );
+    if (isWikiRootHost) {
+      if (!cachedWikiSitemapUrls) {
+        seedRequests.push({ id: 'wiki-sitemap', url: wikiAllowedSitemapUrl, kind: 'text', accept: 'application/xml' });
+      }
+    } else {
+      seedRequests.push(
+        { id: 'robots', url: `${origin}/robots.txt`, kind: 'text', accept: 'text/plain' },
+        { id: 'sitemap', url: `${origin}/sitemap.xml`, kind: 'text', accept: 'application/xml' },
+        { id: 'sitemap-index', url: `${origin}/sitemap-index.xml`, kind: 'text', accept: 'application/xml' },
+      );
+    }
   }
 
   const seedPayloadJson = JSON.stringify({
@@ -620,6 +633,49 @@ export async function executeMapCall(params: {
       });
     }
 
+    if (isWikiRootHost) {
+      if (cachedWikiSitemapUrls) {
+        let found = 0;
+        for (const loc of cachedWikiSitemapUrls) {
+          if (addUrl(loc, 'sitemap')) found++;
+        }
+        sourcesReport.push({
+          source: 'wikipedia-sitemap-cache',
+          url: wikiAllowedSitemapUrl,
+          status: 200,
+          outcome: 'ok',
+          urlsFound: found,
+        });
+      } else {
+        const wikiSmItem = byId.get('wiki-sitemap');
+        if (wikiSmItem) {
+          let found = 0;
+          if (wikiSmItem.outcome === 'ok' && typeof wikiSmItem.body === 'string') {
+            const xml = await decodeXmlOrGzipBody(wikiSmItem.body, wikiSmItem.bodyEncoding as string | undefined, wikiAllowedSitemapUrl);
+            const parsedSm = parseSitemapXml(xml);
+            if (parsedSm.isIndex) {
+              for (const loc of parsedSm.locs) {
+                childSitemaps.add(loc);
+                found++;
+              }
+            } else {
+              setCachedWikipediaSitemapUrls(rootHost, parsedSm.locs);
+              for (const loc of parsedSm.locs) {
+                if (addUrl(loc, 'sitemap')) found++;
+              }
+            }
+          }
+          sourcesReport.push({
+            source: 'wikipedia-sitemap',
+            url: wikiAllowedSitemapUrl,
+            status: typeof wikiSmItem.status === 'number' ? wikiSmItem.status : 0,
+            outcome: String(wikiSmItem.outcome ?? 'unknown'),
+            urlsFound: found,
+          });
+        }
+      }
+    }
+
     for (const [smId, smUrl] of [
       ['sitemap', `${origin}/sitemap.xml`],
       ['sitemap-index', `${origin}/sitemap-index.xml`],
@@ -726,6 +782,7 @@ export async function executeMapCall(params: {
       const subRes = await (activeTracer ? activeTracer.run(callSub) : callSub());
       if (subRes.status === 200) {
         const subParsed = JSON.parse(subRes.bodyText) as { results?: Array<Record<string, unknown>> };
+        const wikiCollectedChildLocs: string[] = [];
         for (const sr of subParsed.results ?? []) {
           const srUrl = typeof sr.url === 'string' ? sr.url : '';
           let found = 0;
@@ -734,6 +791,7 @@ export async function executeMapCall(params: {
             const p = parseSitemapXml(xml);
             if (!p.isIndex) {
               for (const loc of p.locs) {
+                if (isWikiRootHost && wikiCollectedChildLocs.length < 5_000) wikiCollectedChildLocs.push(loc);
                 if (addUrl(loc, 'sitemap')) found++;
               }
             }
@@ -747,6 +805,9 @@ export async function executeMapCall(params: {
               urlsFound: found,
             });
           }
+        }
+        if (isWikiRootHost && !cachedWikiSitemapUrls && wikiCollectedChildLocs.length > 0) {
+          setCachedWikipediaSitemapUrls(rootHost, wikiCollectedChildLocs);
         }
       }
     }

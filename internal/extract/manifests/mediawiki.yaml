@@ -2,7 +2,7 @@
 id: mediawiki
 name: "Wikipedia & MediaWiki Encyclopedias"
 category: commerce-social
-description: "Strips [edit], [citation needed], reference back-link noise, and trailing MediaWiki navigation menus."
+description: "Robots-compliant Wikipedia & MediaWiki adapter: strips [ ], Edit links, [n] citation markers, [edit], and navigation chrome with 24h article caching; pair with search({ query, wikipedia: true, lang }) for Special:Search-free article discovery and Wikimedia Enterprise or dumps.wikimedia.org for bulk corpus access."
 domains:
   - "*.wikipedia.org"
   - wiki.archlinux.org

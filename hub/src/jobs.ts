@@ -17,6 +17,7 @@
 import { getActiveRequestTracer, type RequestTracer, type TraceContext } from './otel';
 import { compileSafeUserRegex, replaceHtmlTagBlocksLinear, stripHtmlTagsQuoteAwareLinear } from './safe-input';
 import type { ArtifactRetention, OptionalStorageBindings } from './storage';
+import { buildWikimediaRobotsSuggestion, isWikimediaHost } from './wikipedia';
 
 export type PayPeriod = 'year' | 'month' | 'week' | 'day' | 'hour';
 export type PayBasis = 'base' | 'ote' | 'total';
@@ -3081,6 +3082,14 @@ export function buildBlockedInfo(
   if (!isRobots && !isChallenge) return null;
 
   const reason: 'robots' | 'challenge' = isRobots ? 'robots' : 'challenge';
+
+  if (reason === 'robots' && isWikimediaHost(host)) {
+    return {
+      reason: 'robots',
+      host,
+      suggestion: buildWikimediaRobotsSuggestion(host),
+    };
+  }
 
   if (/api\.smartrecruiters\.com/i.test(host)) {
     return {

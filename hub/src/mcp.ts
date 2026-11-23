@@ -31,6 +31,7 @@ import {
 } from './overflow';
 import { readBodyTextCapped } from './safe-input';
 import { classifyWafAndChallenge, refineBlockedInfo } from './waf';
+import { checkAndRecordWikipediaArticleQuota, parseWikipediaArticleUrl } from './wikipedia';
 
 const SUPPORTED_PROTOCOL_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
 const LEGACY_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'] as const;
@@ -877,7 +878,11 @@ export function buildCanonicalMcpToolSchemas(options?: {
       inputSchema: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Search query (1..500 characters). Supports site:domain.com filtering.' },
+          query: {
+            type: 'string',
+            description:
+              'Search query (1..500 characters). Supports site:domain.com filtering (including site:<lang>.wikipedia.org or wikipedia=true for robots-compliant Wikipedia article discovery).',
+          },
           maxResults: { type: 'integer', minimum: 1, maximum: 20, default: 5, description: 'Maximum search results to return (1..20).' },
           timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'], description: 'Optional recency filter.' },
           includeDomains: { type: 'array', items: { type: 'string' }, description: 'Restrict results to these domains.' },
@@ -1644,6 +1649,19 @@ async function handleToolCallInner(
       const kind = explicitKind ?? inferKindForUrl(check.url);
       const accept = textAcceptFor(kind, check.url, args.accept);
       if (!accept.ok) return { content: [{ type: 'text', text: accept.error }], isError: true };
+      const singleWikiArt = parseWikipediaArticleUrl(check.url);
+      if (singleWikiArt) {
+        const wikiQuota = checkAndRecordWikipediaArticleQuota({
+          callerKey: userId || principal,
+          host: singleWikiArt.host,
+        });
+        if (!wikiQuota.allowed) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify(wikiQuota.block, null, 2) }],
+            isError: true,
+          };
+        }
+      }
       requests = [
         {
           id: 'mcp-1',
@@ -1691,6 +1709,22 @@ async function handleToolCallInner(
         const kind = itemExplicitKind ?? inferKindForUrl(check.url);
         const accept = textAcceptFor(kind, check.url, entryObj?.accept ?? args.accept);
         if (!accept.ok) return { content: [{ type: 'text', text: accept.error }], isError: true };
+        const wikiArt = parseWikipediaArticleUrl(check.url);
+        if (wikiArt) {
+          const wikiQuota = checkAndRecordWikipediaArticleQuota({
+            callerKey: userId || principal,
+            host: wikiArt.host,
+          });
+          if (!wikiQuota.allowed) {
+            preBlockedByIndex.set(i, {
+              id: `mcp-${i + 1}`,
+              url: check.url,
+              status: 429,
+              ...wikiQuota.block,
+            });
+            continue;
+          }
+        }
         requests.push({
           id: `mcp-${i + 1}`,
           url: check.url,
@@ -1848,7 +1882,11 @@ async function handleToolCallInner(
                 outcome: 'blocked',
                 blocked: firstItem.blocked,
               }
-            : {};
+            : firstItem?.outcome === 'skip' && firstItem.blocked
+              ? {
+                  blocked: firstItem.blocked,
+                }
+              : {};
       if (firstItem?.outcome === 'dns_not_found' || firstItem?.outcome === 'blocked') {
         singleDnsOrSsrfErr = true;
       }

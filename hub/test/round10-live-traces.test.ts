@@ -17,7 +17,9 @@ import {
 import { executeCrawlJob } from '../src/map-crawl.ts';
 import { sanitizeErrorMessageForSpan, sanitizeSpanAttributes } from '../src/otel.ts';
 import { handleMcpRequest } from '../src/mcp.ts';
-import { executeInteractCall } from '../src/scrape.ts';
+import { executeInteractCall, executeScrapeCall } from '../src/scrape.ts';
+import { executeSearchCall, resetSearchProviderPacingForTests } from '../src/web-search.ts';
+import { resetWikipediaStateForTests } from '../src/wikipedia.ts';
 import {
   computeMarkdownSliceCheckpoints,
   sanitizeFullMarkdownDocumentForArtifact,
@@ -1178,6 +1180,8 @@ test('Blind Audit Closure (EF-BLIND-02, EF-BLIND-04, EF-BLIND-05) & Catalog Stor
     new URL('https://hub.example/mcp'),
     {
       ownerSecret: 'test-caller-secret-0123456789abcdef',
+      allowedTargets: ['auto', 'agent', 'container'],
+      defaultTarget: 'auto',
       executeFetch: async () => ({ status: 200, via: 'hub', bodyText: '{}' }),
       executeInteract: async () => interactRes,
     },
@@ -1189,4 +1193,319 @@ test('Blind Audit Closure (EF-BLIND-02, EF-BLIND-04, EF-BLIND-05) & Catalog Stor
   const parsedMcpInteract = JSON.parse(mcpText) as Record<string, unknown>;
   assert.equal(parsedMcpInteract.screenshotArtifactId, shotArtId);
   assert.equal(parsedMcpInteract.screenshotBase64, undefined, 'MCP interact text must omit 188K inline screenshotBase64');
+});
+
+test('Wikipedia Spec Acceptance Suite (#1..#7): mediawiki cleanup, detected.adapter, redirects, de.wikipedia, Tier 2 resolver, robots suggestion, 24h cache & 201st use_bulk_channel', async () => {
+  resetWikipediaStateForTests();
+  resetSearchProviderPacingForTests();
+
+  const wikiR2Map = new Map<string, { bytes: Uint8Array; customMetadata?: Record<string, string>; uploaded: Date }>();
+  const wikiBucket = {
+    get: async (k: string) => {
+      const found = wikiR2Map.get(k);
+      if (!found) return null;
+      return {
+        key: k,
+        size: found.bytes.byteLength,
+        uploaded: found.uploaded,
+        customMetadata: found.customMetadata,
+        body: new Blob([found.bytes]).stream(),
+        arrayBuffer: async () => found.bytes.slice().buffer,
+        text: async () => new TextDecoder().decode(found.bytes),
+        json: async () => JSON.parse(new TextDecoder().decode(found.bytes)),
+      };
+    },
+    head: async (k: string) => {
+      const found = wikiR2Map.get(k);
+      return found ? { key: k, size: found.bytes.byteLength, uploaded: found.uploaded, customMetadata: found.customMetadata } : null;
+    },
+    put: async (k: string, val: string | Uint8Array, opts?: { customMetadata?: Record<string, string> }) => {
+      const bytes = typeof val === 'string' ? new TextEncoder().encode(val) : new Uint8Array(val);
+      const rec = { bytes, customMetadata: opts?.customMetadata, uploaded: new Date() };
+      wikiR2Map.set(k, rec);
+      return rec;
+    },
+    delete: async (k: string) => {
+      wikiR2Map.delete(k);
+    },
+  };
+
+  let outboundFetches = 0;
+  const http2WikiHtml = `<!doctype html>
+<html lang="en">
+<head>
+  <meta name="generator" content="MediaWiki 1.48.0-wmf.5">
+  <link rel="canonical" href="https://en.wikipedia.org/wiki/HTTP/2">
+  <title>HTTP/2 - Wikipedia</title>
+</head>
+<body>
+  <main>
+    <p>[Jump to content](#bodyContent)</p>
+    <p>[ ] Toggle the table of contents</p>
+    <h1>HTTP/2</h1>
+    <p>38 languages</p>
+    <p><a href="https://www.wikidata.org/wiki/Special:EntityPage/Q18691915#sitelinks-wikipedia">Edit links</a></p>
+    <p>From Wikipedia, the free encyclopedia</p>
+    <table class="infobox">
+      <tr><th>Communication protocol</th><td>HTTP/2</td></tr>
+      <tr><th>RFC</th><td>RFC 9113</td></tr>
+    </table>
+    <p><b>HTTP/2</b> is a major revision of the HTTP network protocol<sup class="reference"><a href="#cite_note-1">[1]</a></sup><sup class="reference"><a href="#cite_note-2">[2]</a></sup>.</p>
+    <h2>History <span class="mw-editsection"><a href="/w/index.php?title=HTTP/2&amp;action=edit&amp;section=1">[edit]</a></span></h2>
+    <p>Standardized in May 2015 [ ] with multiplexing support [3].</p>
+    <h2>Navigation menu</h2>
+    <p>Personal tools</p>
+  </main>
+</body>
+</html>`;
+
+  // #1 & #6: Scrape `/wiki/HTTP/2` -> clean Markdown (no `[ ]`, no `Edit links`, no `[1]`/`[2]`, infobox table kept, `detected.adapter == "mediawiki"`),
+  // AND immediate re-scrape hits default 24h cache (`cached: true`, 0 new outbound requests)!
+  const t1 = await executeScrapeCall({
+    payload: { url: 'https://en.wikipedia.org/wiki/HTTP/2' },
+    env: { ARTIFACTS: wikiBucket as unknown as R2Bucket },
+    executeHubFetch: async () => {
+      outboundFetches++;
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: 'https://en.wikipedia.org/wiki/HTTP/2',
+              finalUrl: 'https://en.wikipedia.org/wiki/HTTP/2',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              headers: { etag: 'W/"wiki-http2-v1"' },
+              body: http2WikiHtml,
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(t1.status, 200);
+  assert.equal(outboundFetches, 1);
+  const md1 = String(t1.body.markdown ?? '');
+  assert.ok(!md1.includes('[ ]'), `Expected no stray [ ] in: ${md1}`);
+  assert.ok(!md1.includes('Edit links'), `Expected no Edit links in: ${md1}`);
+  assert.ok(!/\[\d+\]/.test(md1), `Expected no [n] citation markers in: ${md1}`);
+  assert.ok(!md1.includes('[edit]'), `Expected no [edit] in: ${md1}`);
+  assert.ok(md1.includes('RFC 9113'), `Expected infobox table preserved in: ${md1}`);
+  assert.equal((t1.body.detected as { adapter?: string })?.adapter, 'mediawiki');
+
+  // #6: Re-scrape within default 24h maxAgeMs -> `cached: true`, ZERO outbound fetches!
+  const t6 = await executeScrapeCall({
+    payload: { url: 'https://en.wikipedia.org/wiki/HTTP/2' },
+    env: { ARTIFACTS: wikiBucket as unknown as R2Bucket },
+    executeHubFetch: async () => {
+      outboundFetches++;
+      throw new Error('Should NOT make an outbound fetch on cached Wikipedia re-scrape!');
+    },
+  });
+  assert.equal(t6.status, 200);
+  assert.equal(t6.body.cached, true);
+  assert.equal(outboundFetches, 1);
+  assert.equal((t6.body.detected as { adapter?: string })?.adapter, 'mediawiki');
+
+  // #2: Internal MediaWiki HTTP-200 `#REDIRECT [[HTTP/2]]` (`/wiki/HTTP2` -> `<link rel="canonical" href=".../wiki/HTTP/2">`)
+  // promotes `finalUrl` to `"https://en.wikipedia.org/wiki/HTTP/2"`
+  const t2 = await executeScrapeCall({
+    payload: { url: 'https://en.wikipedia.org/wiki/HTTP2' },
+    env: {},
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-arm64',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'scrape-1',
+            url: 'https://en.wikipedia.org/wiki/HTTP2',
+            finalUrl: 'https://en.wikipedia.org/wiki/HTTP2',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html; charset=utf-8',
+            body: http2WikiHtml,
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(t2.status, 200);
+  assert.equal(t2.body.finalUrl, 'https://en.wikipedia.org/wiki/HTTP/2');
+
+  // Conditional GET (`If-None-Match`) on Wikipedia refresh (`maxAgeMs: 0`) sends `ifNoneMatch` and handles `304 Not Modified`
+  const tReval = await executeScrapeCall({
+    payload: { url: 'https://en.wikipedia.org/wiki/HTTP/2', maxAgeMs: 0 },
+    env: { ARTIFACTS: wikiBucket as unknown as R2Bucket },
+    executeHubFetch: async (_target, rawBody) => {
+      const reqObj = JSON.parse(rawBody) as { requests: Array<{ ifNoneMatch?: string }> };
+      assert.equal(reqObj.requests[0]?.ifNoneMatch, 'W/"wiki-http2-v1"');
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [{ id: 'scrape-1', url: 'https://en.wikipedia.org/wiki/HTTP/2', status: 304, outcome: 'ok' }],
+        }),
+      };
+    },
+  });
+  assert.equal(tReval.status, 200);
+  assert.equal(tReval.body.cached, true);
+  assert.equal(tReval.body.revalidated, true);
+  assert.equal((tReval.body.detected as { adapter?: string })?.adapter, 'mediawiki');
+
+  // #3: Non-English wiki (`de.wikipedia.org`) strips German `Links bearbeiten` & `[Bearbeiten]`
+  const t3 = await executeScrapeCall({
+    payload: { url: 'https://de.wikipedia.org/wiki/Hypertext%20Transfer%20Protocol' },
+    env: {},
+    executeHubFetch: async (_target, rawBody) => {
+      const parsedReq = JSON.parse(rawBody) as { requests: Array<{ url: string }> };
+      assert.equal(parsedReq.requests[0]?.url, 'https://de.wikipedia.org/wiki/Hypertext_Transfer_Protocol');
+      return {
+        status: 200,
+        via: 'agent:site-win-vm',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: 'https://de.wikipedia.org/wiki/Hypertext_Transfer_Protocol',
+              finalUrl: 'https://de.wikipedia.org/wiki/Hypertext_Transfer_Protocol',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              body: `<!doctype html><html lang="de"><head><meta name="generator" content="MediaWiki 1.48.0"></head><body><main><h1>Hypertext Transfer Protocol</h1><p><a href="https://www.wikidata.org/wiki/Special:EntityPage/Q8777#sitelinks-wikipedia">Links bearbeiten</a></p><p>Das HTTP Protokoll<a href="#cite_note-1">[1]</a>.</p><h2>Geschichte <a href="/w/index.php?title=HTTP&amp;action=edit">[Bearbeiten | Quelltext bearbeiten]</a></h2></main></body></html>`,
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(t3.status, 200);
+  assert.equal((t3.body.detected as { adapter?: string })?.adapter, 'mediawiki');
+  assert.ok(!String(t3.body.markdown).includes('Links bearbeiten'));
+  assert.ok(!String(t3.body.markdown).includes('Bearbeiten'));
+
+  // #4: Tier 2 resolver (`wikipedia: true`) returns `/wiki/Robots.txt` in top 3, drops Special:/Talk:/w/:/api/, and makes ZERO origin/map requests!
+  let hubFetchDuringWikiSearch = 0;
+  const t4 = await executeSearchCall({
+    payload: { query: 'polite web crawler robots.txt', wikipedia: true, lang: 'en', maxResults: 5 },
+    env: { SERPER_API_KEY: 'serper-test-key' },
+    executeHubFetch: async () => {
+      hubFetchDuringWikiSearch++;
+      return { status: 200, via: 'agent', bodyText: '{"results":[]}' };
+    },
+    providerFetchFn: async (_url, init) => {
+      const reqBody = JSON.parse(String(init?.body ?? '{}')) as { q: string };
+      assert.match(reqBody.q, /^site:en\.wikipedia\.org\b/);
+      return new Response(
+        JSON.stringify({
+          organic: [
+            { title: 'Search results - Wikipedia', link: 'https://en.wikipedia.org/wiki/Special:Search?search=robots.txt', snippet: 'Special search' },
+            { title: 'Robots.txt - Wikipedia', link: 'https://en.wikipedia.org/wiki/Robots.txt#Examples', snippet: 'Robots Exclusion Protocol standard' },
+            { title: 'Talk:Robots.txt - Wikipedia', link: 'https://en.wikipedia.org/wiki/Talk:Robots.txt', snippet: 'Talk page' },
+            { title: 'API - Wikipedia', link: 'https://en.wikipedia.org/w/api.php?action=query', snippet: 'Action API' },
+            { title: 'Web crawler - Wikipedia', link: 'https://en.wikipedia.org/wiki/Web%20crawler', snippet: 'Internet bot that systematically browses' },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    },
+  });
+  assert.equal(t4.status, 200);
+  assert.equal(hubFetchDuringWikiSearch, 0, 'Tier 2 search with SERP hits must make 0 requests to Wikipedia');
+  const t4Urls = (t4.body.results as Array<{ url: string; canonicalTitle?: string }>).map((r) => r.url);
+  assert.deepEqual(t4Urls, ['https://en.wikipedia.org/wiki/Robots.txt', 'https://en.wikipedia.org/wiki/Web_crawler']);
+
+  // #5: `fetch_url https://en.wikipedia.org/w/api.php?action=query&titles=HTTP/2` -> `blocked.reason == "robots"` with Wikipedia suggestion
+  const t5Resp = await handleMcpRequest(
+    new Request('https://hub.example/mcp', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer test-caller-secret-0123456789abcdef',
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2025-03-26',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 88,
+        method: 'tools/call',
+        params: {
+          name: 'fetch_url',
+          arguments: { url: 'https://en.wikipedia.org/w/api.php?action=query&titles=HTTP/2' },
+        },
+      }),
+    }),
+    new URL('https://hub.example/mcp'),
+    {
+      ownerSecret: 'test-caller-secret-0123456789abcdef',
+      allowedTargets: ['auto', 'agent', 'container'],
+      defaultTarget: 'auto',
+      executeFetch: async () => ({
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'mcp-1',
+              url: 'https://en.wikipedia.org/w/api.php?action=query&titles=HTTP/2',
+              status: 0,
+              outcome: 'skip',
+              problem: 'disallowed by robots.txt',
+            },
+          ],
+          summary: { total: 1, byOutcome: { skip: 1 } },
+        }),
+      }),
+    },
+  );
+  const t5Json = JSON.parse(((await t5Resp.json()) as { result: { content: Array<{ text: string }> } }).result.content[0]!.text) as {
+    blocked?: { reason: string; suggestion: string };
+  };
+  assert.equal(t5Json.blocked?.reason, 'robots');
+  assert.match(t5Json.blocked?.suggestion ?? '', /Wikipedia search and API paths are robots-disallowed/);
+  assert.match(t5Json.blocked?.suggestion ?? '', /site:en\.wikipedia\.org/);
+
+  // #7: 201st live article request in an hour from one caller -> `outcome: "use_bulk_channel"`
+  resetWikipediaStateForTests();
+  for (let i = 1; i <= 200; i++) {
+    const okRes = await executeScrapeCall({
+      payload: { url: `https://en.wikipedia.org/wiki/Topic_${i}`, noCache: true },
+      env: {},
+      userId: 'caller_bulk_test',
+      executeHubFetch: async () => ({
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: `https://en.wikipedia.org/wiki/Topic_${i}`,
+              finalUrl: `https://en.wikipedia.org/wiki/Topic_${i}`,
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html',
+              body: '<html><body><main><h1>Topic</h1><p>Body</p></main></body></html>',
+            },
+          ],
+        }),
+      }),
+    });
+    assert.equal(okRes.status, 200);
+  }
+  const bulkBlocked = await executeScrapeCall({
+    payload: { url: 'https://en.wikipedia.org/wiki/Topic_201', noCache: true },
+    env: {},
+    userId: 'caller_bulk_test',
+    executeHubFetch: async () => {
+      throw new Error('201st request must NOT hit origin!');
+    },
+  });
+  assert.equal(bulkBlocked.status, 429);
+  assert.equal(bulkBlocked.body.outcome, 'use_bulk_channel');
+  assert.ok(String((bulkBlocked.body.bulkChannels as { wikimediaEnterprise: string })?.wikimediaEnterprise).includes('enterprise.wikimedia.com'));
+  resetWikipediaStateForTests();
 });

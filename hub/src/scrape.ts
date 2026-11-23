@@ -108,6 +108,14 @@ import {
   type SpaFallbackSuccess,
 } from './spa-fallback';
 import {
+  checkAndRecordWikipediaArticleQuota,
+  cleanMediaWikiMarkdownLinear,
+  DEFAULT_WIKIPEDIA_MAX_AGE_MS,
+  isWikipediaHost,
+  parseWikipediaArticleUrl,
+  resolveWikipediaCanonicalFinalUrl,
+} from './wikipedia';
+import {
   extractJsonWithOptionalLlm,
   resolveLlmConfig,
   summarizeMarkdownWithOptionalLlm,
@@ -5333,6 +5341,10 @@ export interface PrivateCachedScrapeRecord {
   rendered?: boolean;
   renderedVia?: string;
   contentState?: string;
+  extractorId?: string;
+  detected?: Record<string, unknown>;
+  etag?: string;
+  lastModified?: string;
   links?: string[];
   images?: ScrapedImage[];
   status: number;
@@ -9862,8 +9874,14 @@ export async function executeScrapeCall(params: {
   if (!urlCheck.ok) {
     return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: urlCheck.message } };
   }
-  const parsedUrl = urlCheck.url;
-  const normalizedUrl = urlCheck.normalized;
+  let parsedUrl = urlCheck.url;
+  let normalizedUrl = urlCheck.normalized;
+  const prelimWikiArticle = parseWikipediaArticleUrl(normalizedUrl);
+  if (prelimWikiArticle && (/%20/i.test(parsedUrl.pathname) || /\s/.test(parsedUrl.pathname))) {
+    normalizedUrl = prelimWikiArticle.canonicalUrl;
+    parsedUrl = new URL(normalizedUrl);
+  }
+  const parsedWikiArticle = prelimWikiArticle ? parseWikipediaArticleUrl(normalizedUrl) : null;
 
   const rawFormats = Array.isArray(payload.formats) && payload.formats.length > 0 ? payload.formats : ['markdown'];
   const stringFormats = new Set<string>();
@@ -9991,7 +10009,9 @@ export async function executeScrapeCall(params: {
       ? payload.maxAgeMs
       : typeof payload.maxAge === 'number' && Number.isFinite(payload.maxAge)
         ? payload.maxAge
-        : 0;
+        : parsedWikiArticle
+          ? DEFAULT_WIKIPEDIA_MAX_AGE_MS
+          : 0;
   const maxAgeMs = payload.noCache === true ? 0 : Math.max(0, Math.floor(rawMaxAge));
   const timeoutMsOpt =
     typeof payload.timeout === 'number' && Number.isFinite(payload.timeout)
@@ -10079,6 +10099,7 @@ export async function executeScrapeCall(params: {
       includeImages,
       preferOriginMarkdown,
       redactPii: Boolean(payload.redactPii),
+      ...(parsedWikiArticle ? { mwClean: 2 } : {}),
     }),
   );
 
@@ -10193,7 +10214,7 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  if (canUseOptionsR2Cache && ocrMode !== 'always' && maxAgeMs > 0 && env.ARTIFACTS && (isPrivateScrape || env.META || hasNonDefaultCacheOptions)) {
+  if (canUseOptionsR2Cache && ocrMode !== 'always' && maxAgeMs > 0 && env.ARTIFACTS && (isPrivateScrape || env.META || hasNonDefaultCacheOptions || parsedWikiArticle !== null)) {
     const cacheStartMs = Date.now();
     const optHit = await lookupOptionsScrapeCache({
       bucket: env.ARTIFACTS,
@@ -10251,7 +10272,8 @@ export async function executeScrapeCall(params: {
         activeTracer.setAttribute('edgefetch.via', cacheVia);
         activeTracer.setAttribute('edgefetch.cached', true);
       }
-      const fullCached = finalizeScrapedMarkdown(redactPii ? redactPiiText(hit.markdown) : hit.markdown, {
+      const rawHitMd = parsedWikiArticle ? cleanMediaWikiMarkdownLinear(hit.markdown) : hit.markdown;
+      const fullCached = finalizeScrapedMarkdown(redactPii ? redactPiiText(rawHitMd) : rawHitMd, {
         isPdf: isLikelyPdfUrl(normalizedUrl),
         includeImages,
       }).markdown;
@@ -10268,8 +10290,15 @@ export async function executeScrapeCall(params: {
         cachedMarkdownArtifactId = `md:${cachedMdSha}`;
       }
       const richHit = hit as Partial<PrivateCachedScrapeRecord>;
-      const cachedFinalUrl = richHit.finalUrl || normalizedUrl;
       const rawCachedTitle = hit.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullCached, normalizedUrl) : undefined);
+      const cachedFinalUrl = parsedWikiArticle
+        ? resolveWikipediaCanonicalFinalUrl({
+            requestedUrl: normalizedUrl,
+            storedFinalUrl: richHit.finalUrl,
+            title: rawCachedTitle,
+            markdown: fullCached,
+          })
+        : richHit.finalUrl || normalizedUrl;
       const cachedTitle = sanitizeScrapedMetadataField(
         rawCachedTitle ? (redactPii ? redactPiiText(rawCachedTitle) : rawCachedTitle) : undefined,
         512,
@@ -10283,6 +10312,11 @@ export async function executeScrapeCall(params: {
       const cachedContentType =
         richHit.contentType ?? (isLikelyPdfUrl(normalizedUrl) ? 'application/pdf' : 'text/html; charset=utf-8');
       const cachedRendered = Boolean(richHit.rendered);
+      const cachedWikiFinal = parseWikipediaArticleUrl(cachedFinalUrl) ?? parsedWikiArticle;
+      const cachedExtractorId = richHit.extractorId ?? (cachedWikiFinal ? 'mediawiki' : undefined);
+      const cachedDetected =
+        richHit.detected ??
+        (cachedWikiFinal ? { generators: ['MediaWiki'], adapter: 'mediawiki' } : undefined);
       const privBlobSha = 'blobSha256' in hit ? hit.blobSha256 : undefined;
       return {
         status: 200,
@@ -10300,6 +10334,8 @@ export async function executeScrapeCall(params: {
           ...(cachedTitle ? { title: cachedTitle } : {}),
           status: hit.status,
           via: cacheVia,
+          ...(cachedExtractorId ? { extractorId: cachedExtractorId } : {}),
+          ...(cachedDetected ? { detected: cachedDetected } : {}),
           contentState: richHit.contentState ?? 'active',
           rendered: cachedRendered,
           ...(richHit.renderedVia ? { renderedVia: richHit.renderedVia } : {}),
@@ -10442,8 +10478,23 @@ export async function executeScrapeCall(params: {
           ? 'transient'
           : undefined;
 
-  // R5: Look up stored ETag / Last-Modified validators in META D1 when a verified derived document already exists (and caller isn't updating a collection).
-  const revalCandidate =
+  if (parsedWikiArticle) {
+    const wikiQuota = checkAndRecordWikipediaArticleQuota({
+      callerKey: userId || source,
+      host: parsedWikiArticle.host,
+      now,
+    });
+    if (!wikiQuota.allowed) {
+      return {
+        status: 429,
+        via: 'policy',
+        body: { ...wikiQuota.block },
+      };
+    }
+  }
+
+  // R5: Look up stored ETag / Last-Modified validators in META D1 (or options-scoped R2 cache on Wikipedia refresh) when a verified derived document already exists.
+  const d1RevalCandidate =
     !isPrivateScrape && !needsLiveHtml && ocrMode !== 'always' && renderMode !== 'always' && !scopedUserCollectionId && env.ARTIFACTS && env.META
       ? await lookupRevalidationCandidate({
           bucket: env.ARTIFACTS,
@@ -10452,6 +10503,26 @@ export async function executeScrapeCall(params: {
           pipelineVersion: SCRAPE_PIPELINE_VERSION,
         })
       : null;
+  const optRevalCandidate =
+    !d1RevalCandidate &&
+    parsedWikiArticle !== null &&
+    canUseOptionsR2Cache &&
+    ocrMode !== 'always' &&
+    renderMode !== 'always' &&
+    !scopedUserCollectionId &&
+    env.ARTIFACTS
+      ? await lookupOptionsScrapeCache({
+          bucket: env.ARTIFACTS,
+          isPrivate: isPrivateScrape,
+          userId,
+          url: normalizedUrl,
+          optionsHash: scrapeOptionsHash,
+          maxAgeMs: 365 * 24 * 60 * 60_000,
+          pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          now,
+        }).then((rec) => (rec && (rec.etag || rec.lastModified) ? rec : null))
+      : null;
+  const revalCandidate = d1RevalCandidate ?? optRevalCandidate;
 
   const fetchCall = {
     maxSeconds: Math.max(30, Math.ceil(timeoutMsOpt / 1_000) + 15),
@@ -11591,8 +11662,45 @@ export async function executeScrapeCall(params: {
     };
   }
 
-  // R5: `304 Not Modified` conditional revalidation hit — refresh `pages.last_fetched_at` in META D1 and serve verified R2 Markdown!
-  if (item.status === 304 && revalCandidate && env.META) {
+  // R5: `304 Not Modified` conditional revalidation hit — refresh `pages.last_fetched_at` in META D1 (or options R2 cache) and serve verified R2 Markdown!
+  if (item.status === 304 && revalCandidate && (env.META || optRevalCandidate)) {
+    const touchReval = async (): Promise<void> => {
+      if (d1RevalCandidate && env.META) {
+        await touchRevalidatedPage(env.META, normalizedUrl, now);
+      }
+      if (optRevalCandidate && env.ARTIFACTS && payload.ephemeral !== true) {
+        await writeOptionsScrapeCache({
+          bucket: env.ARTIFACTS,
+          isPrivate: isPrivateScrape,
+          userId,
+          optionsHash: scrapeOptionsHash,
+          record: { ...optRevalCandidate, lastFetchedAt: now },
+        }).catch(() => undefined);
+      } else if (d1RevalCandidate && parsedWikiArticle && env.ARTIFACTS && payload.ephemeral !== true) {
+        await writeOptionsScrapeCache({
+          bucket: env.ARTIFACTS,
+          isPrivate: isPrivateScrape,
+          userId,
+          optionsHash: scrapeOptionsHash,
+          record: {
+            url: normalizedUrl,
+            finalUrl: normalizedUrl,
+            markdown: cleanMediaWikiMarkdownLinear(d1RevalCandidate.markdown),
+            contentSha256: d1RevalCandidate.contentSha256,
+            documentId: d1RevalCandidate.documentId,
+            pipelineVersion: d1RevalCandidate.pipelineVersion,
+            ...(d1RevalCandidate.title ? { title: d1RevalCandidate.title } : {}),
+            ...(d1RevalCandidate.language ? { language: d1RevalCandidate.language } : {}),
+            ...(d1RevalCandidate.etag ? { etag: d1RevalCandidate.etag } : {}),
+            ...(d1RevalCandidate.lastModified ? { lastModified: d1RevalCandidate.lastModified } : {}),
+            extractorId: 'mediawiki',
+            detected: { generators: ['MediaWiki'], adapter: 'mediawiki' },
+            status: 200,
+            lastFetchedAt: now,
+          },
+        }).catch(() => undefined);
+      }
+    };
     if (activeTracer) {
       await activeTracer.withSpan(
         'cache:r2-d1',
@@ -11600,22 +11708,23 @@ export async function executeScrapeCall(params: {
           kind: 1,
           attributes: {
             'cache.hit': true,
-            'cache.tier': 'r2-d1',
+            'cache.tier': isPrivateScrape ? 'private-r2' : 'r2-d1',
             'cache.revalidated': true,
             'http.response.status_code': 304,
             'url.full': sanitizeUrlForSpan(normalizedUrl),
             'edgefetch.pipeline_version': revalCandidate.pipelineVersion,
           },
         },
-        () => touchRevalidatedPage(env.META!, normalizedUrl, now),
+        touchReval,
       );
       activeTracer.setAttribute('edgefetch.cached', true);
       activeTracer.setAttribute('edgefetch.revalidated', true);
     } else {
-      await touchRevalidatedPage(env.META, normalizedUrl, now);
+      await touchReval();
     }
+    const rawRevalMd = parsedWikiArticle ? cleanMediaWikiMarkdownLinear(revalCandidate.markdown) : revalCandidate.markdown;
     const fullReval = finalizeScrapedMarkdown(
-      redactPii ? redactPiiText(revalCandidate.markdown) : revalCandidate.markdown,
+      redactPii ? redactPiiText(rawRevalMd) : rawRevalMd,
       { isPdf: isLikelyPdfUrl(normalizedUrl), includeImages },
     ).markdown;
     const revalFocused = applyQueryFocus(fullReval);
@@ -11626,7 +11735,14 @@ export async function executeScrapeCall(params: {
       512,
     );
     const revalWordCount = fullReval ? countTextWords(fullReval) : 0;
-    const revalFavicon = defaultFaviconForUrl(normalizedUrl);
+    const revalFinalUrl = parsedWikiArticle
+      ? resolveWikipediaCanonicalFinalUrl({
+          requestedUrl: normalizedUrl,
+          title: rawRevalTitle,
+          markdown: fullReval,
+        })
+      : normalizedUrl;
+    const revalFavicon = defaultFaviconForUrl(revalFinalUrl);
     const revalContentType = isLikelyPdfUrl(normalizedUrl) ? 'application/pdf' : 'text/html; charset=utf-8';
     return {
       status: 200,
@@ -11640,10 +11756,16 @@ export async function executeScrapeCall(params: {
         documentId: revalCandidate.documentId,
         contentSha256: revalCandidate.contentSha256,
         url: normalizedUrl,
-        finalUrl: normalizedUrl,
+        finalUrl: revalFinalUrl,
         ...(revalTitle ? { title: revalTitle } : {}),
         status: 200,
         via: `${fetchResUsed.via}+cache:304`,
+        ...(parsedWikiArticle
+          ? {
+              extractorId: 'mediawiki',
+              detected: { generators: ['MediaWiki'], adapter: 'mediawiki' },
+            }
+          : {}),
         contentState: 'active',
         rendered: false,
         ...(revalWordCount > 0 ? { wordCount: revalWordCount } : {}),
@@ -12092,10 +12214,18 @@ export async function executeScrapeCall(params: {
     if (canonVal.ok) {
       safeCanonicalUrl = canonVal.url.toString();
       try {
-        const finalHostNorm = new URL(finalUrl).hostname.toLowerCase().replace(/^www\./, '');
+        const finalHostLower = new URL(finalUrl).hostname.toLowerCase();
+        const finalHostNorm = finalHostLower.replace(/^www\./, '');
         const canonHostNorm = canonVal.url.hostname.toLowerCase().replace(/^www\./, '');
         if (canonHostNorm && finalHostNorm && canonHostNorm !== finalHostNorm) {
           crossOriginCanonical = true;
+        } else if (isWikipediaHost(finalHostLower)) {
+          // MediaWiki resolves internal `#REDIRECT [[Target]]` pages (e.g. `/wiki/HTTP2` -> `/wiki/HTTP/2`)
+          // via HTTP 200 + `<link rel="canonical" href="https://<lang>.wikipedia.org/wiki/HTTP/2">`.
+          const canonWiki = parseWikipediaArticleUrl(safeCanonicalUrl);
+          if (canonWiki && canonWiki.host === finalHostLower) {
+            finalUrl = canonWiki.canonicalUrl;
+          }
         }
       } catch {
         // ignore
@@ -12951,7 +13081,19 @@ export async function executeScrapeCall(params: {
         (detectedStack.contentFlags && detectedStack.contentFlags.length > 0)),
   );
 
-  const extractorIdOut = customCommerceId ?? extracted?.extractorId;
+  const parsedFinalWiki = parseWikipediaArticleUrl(finalUrl);
+  const extractorIdOut = customCommerceId ?? extracted?.extractorId ?? (parsedFinalWiki ? 'mediawiki' : undefined);
+  const detectedWithAdapter: Record<string, unknown> | null = detectedStack
+    ? {
+        ...detectedStack,
+        ...(extractorIdOut ? { adapter: extractorIdOut } : {}),
+      }
+    : extractorIdOut
+      ? { generators: [], adapter: extractorIdOut }
+      : null;
+  const hasDetectedOut = Boolean(
+    hasDetectedStack || Boolean(extractorIdOut),
+  );
   if (extractorIdOut) {
     setActiveSpanAttribute('edgefetch.adapter_id', extractorIdOut, activeTracer ?? undefined);
   }
@@ -13005,6 +13147,10 @@ export async function executeScrapeCall(params: {
         rendered: resolvedRendered,
         ...(renderedViaOut ? { renderedVia: renderedViaOut } : {}),
         contentState: contentStateCheck.state,
+        ...(extractorIdOut ? { extractorId: extractorIdOut } : {}),
+        ...(hasDetectedOut && detectedWithAdapter ? { detected: detectedWithAdapter } : {}),
+        ...(finalHeadersForDetect?.etag ? { etag: finalHeadersForDetect.etag } : {}),
+        ...(finalHeadersForDetect?.['last-modified'] ? { lastModified: finalHeadersForDetect['last-modified'] } : {}),
         ...(stringFormats.has('links') ? { links: resolvedLinks } : {}),
         ...(stringFormats.has('images') ? { images: resolvedImages } : {}),
         status: typeof item.status === 'number' ? item.status : 200,
@@ -13037,7 +13183,7 @@ export async function executeScrapeCall(params: {
     status: item.status ?? 200,
     via: viaOut,
     ...(extractorIdOut ? { extractorId: extractorIdOut } : {}),
-    ...(hasDetectedStack && detectedStack ? { detected: detectedStack } : {}),
+    ...(hasDetectedOut && detectedWithAdapter ? { detected: detectedWithAdapter } : {}),
     contentState: contentStateCheck.state,
     ...(contentStateCheck.reason ? { contentStateReason: contentStateCheck.reason } : {}),
     ...(contentSourceOut ? { contentSource: contentSourceOut } : {}),

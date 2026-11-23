@@ -702,7 +702,7 @@ func TestR8TopNavAndSubresourceSecFetchSiteHeaderResidual(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := NewMockRenderer("ws://"+strings.TrimPrefix(srv.URL, "http://"), nil, "EdgeFetchTest/2.7.2")
+	r := NewMockRenderer("ws://"+strings.TrimPrefix(srv.URL, "http://"), nil, "EdgeFetchTest/2.7.3")
 	defer r.Close()
 
 	if _, err := r.Execute(context.Background(), Task{
@@ -789,7 +789,7 @@ func TestR8LiveChromeNestedGrandchildTopNavBlocked(t *testing.T) {
 	defer srv.Close()
 
 	srvAddr := srv.Listener.Addr().String()
-	r := NewRenderer(bin, func(u *url.URL) error { return nil }, "EdgeFetchTest/2.7.2", 1, nil)
+	r := NewRenderer(bin, func(u *url.URL) error { return nil }, "EdgeFetchTest/2.7.3", 1, nil)
 	r.extraFlags = []string{"--ignore-certificate-errors"}
 	r.proxyDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, srvAddr)

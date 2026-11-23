@@ -29,6 +29,8 @@ jobs:
           cache-dependency-path: hub/package-lock.json
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run adapter:compile
+      - run: npm run psl:check
+      - run: npm run build:portable
       - run: npm test
       - run: npm run type-check
       - run: npm run deploy:dry

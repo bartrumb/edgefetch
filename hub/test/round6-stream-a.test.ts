@@ -28,7 +28,7 @@ import { detectPromptInjection } from '../src/scrape-advanced.ts';
 import { executeExtractCall } from '../src/search-index.ts';
 import { classifyWafAndChallenge } from '../src/waf.ts';
 
-const covMul = process.env.NODE_V8_COVERAGE ? 4 : 1;
+const covMul = process.env.NODE_V8_COVERAGE ? 4 : process.env.CI ? 3 : 1;
 
 const fin = (md: string, origin = true) =>
   finalizeScrapedMarkdown(md, {

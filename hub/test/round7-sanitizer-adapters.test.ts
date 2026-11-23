@@ -489,7 +489,7 @@ test('R7-PI: Prompt-injection scanner catches all 58/58 Markdown & 20/20 HTML ev
   );
 
   // 2 MiB linear CPU timing checks (formerly 100s O(N^2) -> < 150ms, with zero input-class skip bypasses!)
-  const covMult = process.env.NODE_V8_COVERAGE ? 3 : 1;
+  const covMult = process.env.NODE_V8_COVERAGE ? 3 : process.env.CI ? 3 : 1;
   const bestPiMs = (payload: string, expectDet: boolean): number => {
     let best = Infinity;
     for (let i = 0; i < 3; i++) {

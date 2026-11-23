@@ -799,7 +799,7 @@ test('Round 8 [Robots Parity + Redirect-to-NXDOMAIN Low]: /robots.txt redirect t
 
   const robRedirectNx = await fetchOverflowRobots(
     'https://spa-origin.example',
-    'EdgeFetch/2.7.2',
+    'EdgeFetch/2.7.3',
     mockPublicFetch,
     Date.now() + 5_000,
   );
@@ -812,7 +812,7 @@ test('Round 8 [Robots Parity + Redirect-to-NXDOMAIN Low]: /robots.txt redirect t
       requests: [{ id: 'r1', url: 'https://spa-origin.example/app', kind: 'page' }],
       options: { includeBody: true, respectRobots: true },
     }),
-    'EdgeFetch/2.7.2',
+    'EdgeFetch/2.7.3',
     'hub.local',
     { fetchFn: mockPublicFetch, useSharedRobotsCache: false },
   );

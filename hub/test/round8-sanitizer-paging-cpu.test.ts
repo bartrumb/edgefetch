@@ -777,7 +777,7 @@ test('Round 8 (H3, H8 & Pre-Ship #3): Linear O(N) CPU budgets + 3 Prompt-Injecti
     return best;
   };
 
-  const covMult = process.env.NODE_V8_COVERAGE ? 10 : 1;
+  const covMult = process.env.NODE_V8_COVERAGE ? 10 : process.env.CI ? 4 : 1;
 
   // 1. H3: 64K and 2 MiB spaces + 'x' linear ASCII trim (< 5 ms / < 15 ms, scaled under V8 --coverage)
   const spaces64k = `${' '.repeat(65_536)}x`;

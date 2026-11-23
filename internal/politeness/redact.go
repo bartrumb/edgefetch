@@ -447,6 +447,14 @@ func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 	sawQuery := false
 	j := start
 	for j < len(s) {
+		if sawQuery && kind != urlSepPctEncoded && kind != urlSepJSONSlash {
+			rel := strings.IndexAny(s[j:], " \t\r\n<>'\xc2\xe2")
+			if rel < 0 {
+				j = len(s)
+				break
+			}
+			j += rel
+		}
 		c := s[j]
 		if c == '?' || c == '#' || c == ';' {
 			sawQuery = true
@@ -538,9 +546,7 @@ func isSchemelessPrevBlocked(prev byte) bool {
 		prev == '/' || prev == ':' || prev == '@' || prev == '.' || prev == '_' || prev == '-'
 }
 
-func isSchemelessTokenTerminator(c byte) bool {
-	return c <= ' ' || c == '"' || c == '\'' || c == '<' || c == '>' || c == ')' || c == ','
-}
+const schemelessTermChars = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \"'<>),"
 
 type schemelessSpanCache struct {
 	tokEnd            int
@@ -549,21 +555,18 @@ type schemelessSpanCache struct {
 	hostValid         bool
 	hasPathOrQuery    bool
 	afterChanged      bool
+	canMatchAny       bool
 	cleanAfter        string
 }
 
 func (sc *schemelessSpanCache) refresh(s string, from int) {
-	tokEnd := from
+	tokEnd := len(s)
+	if rel := strings.IndexAny(s[from:], schemelessTermChars); rel >= 0 {
+		tokEnd = from + rel
+	}
 	lastAt := -1
-	for tokEnd < len(s) {
-		c := s[tokEnd]
-		if isSchemelessTokenTerminator(c) {
-			break
-		}
-		if c == '@' {
-			lastAt = tokEnd
-		}
-		tokEnd++
+	if relAt := strings.LastIndexByte(s[from:tokEnd], '@'); relAt >= 0 {
+		lastAt = from + relAt
 	}
 	sc.tokEnd = tokEnd
 	sc.lastAt = lastAt
@@ -571,6 +574,7 @@ func (sc *schemelessSpanCache) refresh(s string, from int) {
 	sc.hostValid = false
 	sc.hasPathOrQuery = false
 	sc.afterChanged = false
+	sc.canMatchAny = false
 	sc.cleanAfter = ""
 
 	if lastAt <= from {
@@ -591,12 +595,28 @@ func (sc *schemelessSpanCache) refresh(s string, from int) {
 	sc.afterChanged = sc.cleanAfter != afterAt
 
 	lastColon := -1
-	for p := from; p < lastAt; p++ {
-		if s[p] == ':' || (p+3 <= lastAt && hasPrefixFoldASCII(s[p:], "%3a")) {
-			lastColon = p
+	if relCol := strings.LastIndexByte(s[from:lastAt], ':'); relCol >= 0 {
+		lastColon = from + relCol
+	}
+	pctFloor := from
+	if lastColon >= pctFloor {
+		pctFloor = lastColon + 1
+	}
+	for pctFloor+3 <= lastAt {
+		relPct := strings.IndexByte(s[pctFloor:lastAt], '%')
+		if relPct < 0 {
+			break
+		}
+		pos := pctFloor + relPct
+		if pos+3 <= lastAt && hasPrefixFoldASCII(s[pos:], "%3a") {
+			lastColon = pos
+			pctFloor = pos + 3
+		} else {
+			pctFloor = pos + 1
 		}
 	}
 	sc.lastColonBeforeAt = lastColon
+	sc.canMatchAny = lastColon >= from || (sc.hasPathOrQuery && sc.afterChanged)
 }
 
 func (sc *schemelessSpanCache) matchAt(s string, i int) (endIdx int, scrubbed string, ok bool) {
@@ -607,7 +627,7 @@ func (sc *schemelessSpanCache) matchAt(s string, i int) (endIdx int, scrubbed st
 	if i >= sc.tokEnd {
 		sc.refresh(s, i)
 	}
-	if sc.lastAt <= i || !sc.hostValid {
+	if !sc.canMatchAny || sc.lastAt <= i || !sc.hostValid {
 		return 0, "", false
 	}
 	hasColon := sc.lastColonBeforeAt >= i
@@ -749,17 +769,13 @@ func RedactEmbeddedURLs(s string) string {
 	if s == "" {
 		return ""
 	}
-	needsCheck := false
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case ':', '/', '%', '@', '=', 't', 'T', 'b', 'B', 'a', 'A':
-			needsCheck = true
-		}
-		if needsCheck {
-			break
-		}
-	}
-	if !needsCheck {
+	hasColon := strings.IndexByte(s, ':') >= 0
+	hasSlash := strings.IndexByte(s, '/') >= 0
+	hasPct := strings.IndexByte(s, '%') >= 0
+	hasAt := strings.IndexByte(s, '@') >= 0
+	hasSecretKw := (hasColon || strings.IndexByte(s, ' ') >= 0 || strings.IndexByte(s, '=') >= 0) &&
+		strings.IndexAny(s, "eEiIoO") >= 0
+	if !hasColon && !hasSlash && !hasPct && !hasAt && !hasSecretKw {
 		return s
 	}
 
@@ -769,121 +785,133 @@ func RedactEmbeddedURLs(s string) string {
 	seenLookup := false
 	i := 0
 	for i < len(s) {
-		if asciiLowerByte(s[i]) == 'l' &&
-			(i == 0 || !((asciiLowerByte(s[i-1]) >= 'a' && asciiLowerByte(s[i-1]) <= 'z') || (s[i-1] >= '0' && s[i-1] <= '9'))) &&
-			hasPrefixFoldASCII(s[i:], "lookup ") {
-			seenLookup = true
-		}
-		if addrStart, addrEnd, matched := tryMatchDNSResolverAddr(s, i, seenLookup); matched {
-			if out.Cap() == 0 {
-				out.Grow(len(s) + 16)
+		if hasColon {
+			if asciiLowerByte(s[i]) == 'l' &&
+				(i == 0 || !((asciiLowerByte(s[i-1]) >= 'a' && asciiLowerByte(s[i-1]) <= 'z') || (s[i-1] >= '0' && s[i-1] <= '9'))) &&
+				hasPrefixFoldASCII(s[i:], "lookup ") {
+				seenLookup = true
 			}
-			out.WriteString(s[copiedUpTo:addrStart])
-			out.WriteString("[redacted-resolver]:53")
-			copiedUpTo = addrEnd
-			i = addrEnd
-			continue
+			if addrStart, addrEnd, matched := tryMatchDNSResolverAddr(s, i, seenLookup); matched {
+				if out.Cap() == 0 {
+					out.Grow(len(s) + 16)
+				}
+				out.WriteString(s[copiedUpTo:addrStart])
+				out.WriteString("[redacted-resolver]:53")
+				copiedUpTo = addrEnd
+				i = addrEnd
+				continue
+			}
 		}
-		kind, afterSep := matchURLSchemeAt(s, i)
-		if kind != urlSepNone {
-			endIdx := afterSep
-			if i > 0 && s[i-1] == '"' {
-				openBS := countPrecedingBackslashes(s, i-1)
-				// Power-of-two modulus for recursive %q / JSON quote escaping (`openBS` in {0, 1, 3, 7, ...}).
-				step := (openBS + 1) * 2
-				foundClose := false
-				for j := afterSep; j < len(s); j++ {
-					if s[j] == '"' {
-						bs := countPrecedingBackslashes(s, j)
-						if (openBS == 0 && bs%2 == 0) || (openBS > 0 && bs >= openBS && bs%step == openBS) {
-							endIdx = j - openBS
+		if hasColon || hasSlash || hasPct {
+			kind, afterSep := matchURLSchemeAt(s, i)
+			if kind != urlSepNone {
+				endIdx := afterSep
+				if i > 0 && s[i-1] == '"' {
+					openBS := countPrecedingBackslashes(s, i-1)
+					// Power-of-two modulus for recursive %q / JSON quote escaping (`openBS` in {0, 1, 3, 7, ...}).
+					step := (openBS + 1) * 2
+					foundClose := false
+					for j := afterSep; j < len(s); j++ {
+						if s[j] == '"' {
+							bs := countPrecedingBackslashes(s, j)
+							if (openBS == 0 && bs%2 == 0) || (openBS > 0 && bs >= openBS && bs%step == openBS) {
+								endIdx = j - openBS
+								foundClose = true
+								break
+							}
+						}
+					}
+					if !foundClose {
+						endIdx = len(s)
+					}
+				} else if i > 0 && s[i-1] == '\'' {
+					foundClose := false
+					for j := afterSep; j < len(s); j++ {
+						if s[j] == '\'' && countPrecedingBackslashes(s, j)%2 == 0 {
+							endIdx = j
 							foundClose = true
 							break
 						}
 					}
-				}
-				if !foundClose {
-					endIdx = len(s)
-				}
-			} else if i > 0 && s[i-1] == '\'' {
-				foundClose := false
-				for j := afterSep; j < len(s); j++ {
-					if s[j] == '\'' && countPrecedingBackslashes(s, j)%2 == 0 {
-						endIdx = j
-						foundClose = true
-						break
+					if !foundClose {
+						endIdx = len(s)
 					}
+				} else {
+					endIdx = findUnquotedURLEnd(s, afterSep, kind)
 				}
-				if !foundClose {
-					endIdx = len(s)
-				}
-			} else {
-				endIdx = findUnquotedURLEnd(s, afterSep, kind)
-			}
 
-			if endIdx < afterSep {
-				endIdx = afterSep
+				if endIdx < afterSep {
+					endIdx = afterSep
+				}
+				scrubbed := scrubMatchedURL(s[i:endIdx], kind)
+				if scrubbed != s[i:endIdx] || out.Cap() > 0 {
+					if out.Cap() == 0 {
+						out.Grow(len(s))
+					}
+					out.WriteString(s[copiedUpTo:i])
+					out.WriteString(scrubbed)
+					copiedUpTo = endIdx
+				}
+				i = endIdx
+				continue
 			}
-			scrubbed := scrubMatchedURL(s[i:endIdx], kind)
-			if scrubbed != s[i:endIdx] || out.Cap() > 0 {
+		}
+
+		// Schemeless `user:secret@host/path` or `user@host/path?token=...`
+		if hasAt {
+			if endIdx, scrubbed, ok := spanCache.matchAt(s, i); ok {
 				if out.Cap() == 0 {
 					out.Grow(len(s))
 				}
 				out.WriteString(s[copiedUpTo:i])
 				out.WriteString(scrubbed)
 				copiedUpTo = endIdx
+				i = endIdx
+				continue
 			}
-			i = endIdx
-			continue
-		}
-
-		// Schemeless `user:secret@host/path` or `user@host/path?token=...`
-		if endIdx, scrubbed, ok := spanCache.matchAt(s, i); ok {
-			if out.Cap() == 0 {
-				out.Grow(len(s))
+			if !hasColon && !hasSlash && !hasPct && !hasSecretKw && i < spanCache.tokEnd && !spanCache.canMatchAny {
+				i = spanCache.tokEnd
+				continue
 			}
-			out.WriteString(s[copiedUpTo:i])
-			out.WriteString(scrubbed)
-			copiedUpTo = endIdx
-			i = endIdx
-			continue
 		}
 
 		// Redact inline "Bearer <secret>", "Basic <secret>", "token=<secret>", "api_key=<secret>", "apikey=<secret>" fragments outside URLs.
-		c0 := asciiLowerByte(s[i])
-		if (c0 == 't' || c0 == 'b' || c0 == 'a') && (i == 0 || !((asciiLowerByte(s[i-1]) >= 'a' && asciiLowerByte(s[i-1]) <= 'z') || (s[i-1] >= '0' && s[i-1] <= '9'))) {
-			kwLen := 0
-			switch {
-			case hasPrefixFoldASCII(s[i:], "bearer"):
-				kwLen = 6
-			case hasPrefixFoldASCII(s[i:], "basic"):
-				kwLen = 5
-			case hasPrefixFoldASCII(s[i:], "token"):
-				kwLen = 5
-			case hasPrefixFoldASCII(s[i:], "api_key"):
-				kwLen = 7
-			case hasPrefixFoldASCII(s[i:], "apikey"):
-				kwLen = 6
-			}
-			if kwLen > 0 && i+kwLen < len(s) && (s[i+kwLen] == ' ' || s[i+kwLen] == '=' || s[i+kwLen] == ':') {
-				valStart := i + kwLen + 1
-				for valStart < len(s) && s[valStart] == ' ' {
-					valStart++
+		if hasSecretKw {
+			c0 := asciiLowerByte(s[i])
+			if (c0 == 't' || c0 == 'b' || c0 == 'a') && (i == 0 || !((asciiLowerByte(s[i-1]) >= 'a' && asciiLowerByte(s[i-1]) <= 'z') || (s[i-1] >= '0' && s[i-1] <= '9'))) {
+				kwLen := 0
+				switch {
+				case hasPrefixFoldASCII(s[i:], "bearer"):
+					kwLen = 6
+				case hasPrefixFoldASCII(s[i:], "basic"):
+					kwLen = 5
+				case hasPrefixFoldASCII(s[i:], "token"):
+					kwLen = 5
+				case hasPrefixFoldASCII(s[i:], "api_key"):
+					kwLen = 7
+				case hasPrefixFoldASCII(s[i:], "apikey"):
+					kwLen = 6
 				}
-				valEnd := valStart
-				for valEnd < len(s) && s[valEnd] != ' ' && s[valEnd] != '\t' && s[valEnd] != '\r' && s[valEnd] != '\n' &&
-					s[valEnd] != '"' && s[valEnd] != '\'' && s[valEnd] != ',' && s[valEnd] != ';' && s[valEnd] != ')' {
-					valEnd++
-				}
-				if looksLikeSecretTokenValue(s[valStart:valEnd]) {
-					if out.Cap() == 0 {
-						out.Grow(len(s))
+				if kwLen > 0 && i+kwLen < len(s) && (s[i+kwLen] == ' ' || s[i+kwLen] == '=' || s[i+kwLen] == ':') {
+					valStart := i + kwLen + 1
+					for valStart < len(s) && s[valStart] == ' ' {
+						valStart++
 					}
-					out.WriteString(s[copiedUpTo:valStart])
-					out.WriteString("[REDACTED]")
-					copiedUpTo = valEnd
-					i = valEnd
-					continue
+					valEnd := valStart
+					for valEnd < len(s) && s[valEnd] != ' ' && s[valEnd] != '\t' && s[valEnd] != '\r' && s[valEnd] != '\n' &&
+						s[valEnd] != '"' && s[valEnd] != '\'' && s[valEnd] != ',' && s[valEnd] != ';' && s[valEnd] != ')' {
+						valEnd++
+					}
+					if looksLikeSecretTokenValue(s[valStart:valEnd]) {
+						if out.Cap() == 0 {
+							out.Grow(len(s))
+						}
+						out.WriteString(s[copiedUpTo:valStart])
+						out.WriteString("[REDACTED]")
+						copiedUpTo = valEnd
+						i = valEnd
+						continue
+					}
 				}
 			}
 		}

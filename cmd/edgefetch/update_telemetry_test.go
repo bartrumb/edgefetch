@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func buildTestTarGz(t *testing.T, entryName string, content []byte) []byte {
@@ -609,6 +610,13 @@ func TestMCPBackgroundUpdateCheckDefaultOffAndOptInInvariants(t *testing.T) {
 	donePing, releaseStdin := net.Pipe()
 	go func() {
 		_, _ = releaseStdin.Write([]byte(pingFrame))
+		deadline := time.Now().Add(2500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if _, statErr := os.Stat(cachePath); statErr == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		_ = releaseStdin.Close()
 	}()
 	stdout.Reset()

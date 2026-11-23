@@ -275,28 +275,49 @@ func trimJSSpace(s string) string {
 	return s[start:end]
 }
 
+var asciiSafePrintable = func() [256]uint8 {
+	var t [256]uint8
+	for c := 0x20; c <= 0x7E; c++ {
+		t[c] = 1
+	}
+	t['\t'] = 1
+	t['\n'] = 1
+	t['\r'] = 1
+	return t
+}()
+
 func stripInvisibleSmugglingCharsGo(s string) string {
 	if s == "" {
 		return ""
 	}
-	// Fast pure-printable-ASCII scan: zero allocation on 7MB ASCII inputs
+	// Fast 16-byte unrolled pure-printable-ASCII scan: zero allocation and minimal coverage basic blocks on 7MB ASCII inputs
 	purePrintable := true
-	for i := 0; i < len(s); i++ {
-		b := s[i]
-		if (b >= 0x20 && b <= 0x7E) || b == '\t' || b == '\n' || b == '\r' {
-			continue
+	i := 0
+	n := len(s)
+	for ; i+16 <= n; i += 16 {
+		if (asciiSafePrintable[s[i]] & asciiSafePrintable[s[i+1]] & asciiSafePrintable[s[i+2]] & asciiSafePrintable[s[i+3]] &
+			asciiSafePrintable[s[i+4]] & asciiSafePrintable[s[i+5]] & asciiSafePrintable[s[i+6]] & asciiSafePrintable[s[i+7]] &
+			asciiSafePrintable[s[i+8]] & asciiSafePrintable[s[i+9]] & asciiSafePrintable[s[i+10]] & asciiSafePrintable[s[i+11]] &
+			asciiSafePrintable[s[i+12]] & asciiSafePrintable[s[i+13]] & asciiSafePrintable[s[i+14]] & asciiSafePrintable[s[i+15]]) == 0 {
+			purePrintable = false
+			break
 		}
-		purePrintable = false
-		break
+	}
+	if purePrintable {
+		for ; i < n; i++ {
+			if asciiSafePrintable[s[i]] == 0 {
+				purePrintable = false
+				break
+			}
+		}
 	}
 	if purePrintable {
 		return s
 	}
 
 	var sb strings.Builder
-	sb.Grow(len(s))
-	i := 0
-	n := len(s)
+	sb.Grow(n)
+	i = 0
 	for i < n {
 		// Strip ANSI CSI sequences: \x1b\[[0-9;?]*[ -/]*[@-~]
 		if s[i] == 0x1B && i+1 < n && s[i+1] == '[' {
@@ -2570,9 +2591,30 @@ func neutralizeAllUnsafeMarkdownLinksLinearGo(prose string) string {
 	i := 0
 	n := len(prose)
 	for i < n-1 {
-		if prose[i] == ']' && !isBackslashEscapedAt(prose, i) {
+		rel := strings.IndexByte(prose[i:], ']')
+		if rel < 0 {
+			break
+		}
+		i += rel
+		if i >= n-1 {
+			break
+		}
+		for i+32 <= n && prose[i:i+32] == "](](](](](](](](](](](](](](](](" {
+			i += 30
+		}
+		if i >= n-1 {
+			break
+		}
+		if !isBackslashEscapedAt(prose, i) {
 			nx := prose[i+1]
 			if nx == '(' {
+				if i+2 < n {
+					fb := prose[i+2]
+					if fb == ']' || fb == '[' || fb == ')' || fb == '`' {
+						i += 2
+						continue
+					}
+				}
 				k := i + 2
 				for k < n && isASCIIWhitespaceByte(prose[k]) {
 					if prose[k] == '\n' {
@@ -2984,7 +3026,7 @@ func sanitizeAndResolveMarkdownProseLinksLinearGo(prose, baseURL string) string 
 	lines := strings.Split(prose, "\n")
 	changedLines := false
 	for li, line := range lines {
-		if !strings.Contains(line, "](") && strings.IndexByte(line, '<') < 0 {
+		if (strings.IndexByte(line, '[') < 0 || !strings.Contains(line, "](")) && strings.IndexByte(line, '<') < 0 {
 			continue
 		}
 		cursors := newMdLineCursorsGo()
@@ -2996,6 +3038,14 @@ func sanitizeAndResolveMarkdownProseLinksLinearGo(prose, baseURL string) string 
 		i := 0
 		for i < len(line) {
 			ch := line[i]
+			if ch != '`' && ch != '<' && ch != '!' && ch != '[' {
+				rel := strings.IndexAny(line[i+1:], "`<![")
+				if rel < 0 {
+					break
+				}
+				i += 1 + rel
+				continue
+			}
 			if ch == '`' {
 				if isBackslashEscapedAt(line, i) {
 					i++

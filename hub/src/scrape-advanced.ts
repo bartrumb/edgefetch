@@ -1333,6 +1333,77 @@ export function stripMarkdownTableDividerLinesLinear(s: string): string {
   return lastCopy === 0 ? s : out + s.slice(lastCopy);
 }
 
+const WORD_STREAM_LATIN1_DECODER = new TextDecoder('latin1');
+const WORD_STREAM_KEEP = (() => {
+  const tbl = new Uint8Array(128);
+  for (let c = 48; c <= 57; c++) tbl[c] = 1; // 0-9
+  for (let c = 65; c <= 90; c++) tbl[c] = 1; // A-Z
+  for (let c = 97; c <= 122; c++) tbl[c] = 1; // a-z
+  tbl[46] = 1; // .
+  tbl[58] = 1; // :
+  return tbl;
+})();
+
+/**
+ * Single-allocation **O(N)** word-stream builder (`R8`): replaces table divider lines, non-`[A-Za-z0-9.:]` runs,
+ * and whitespace runs with single spaces using one `Uint8Array` buffer (avoiding 1M+ `String.prototype.replace`
+ * heap slice allocations & GC spikes on `2 MiB` punctuation-dense inputs like `'[a]('.repeat(524_288)`).
+ */
+function toWordStreamLinear(raw: string): string {
+  const s = stripMarkdownTableDividerLinesLinear(raw);
+  const n = s.length;
+  if (n === 0) return '';
+  const out = new Uint8Array(n);
+  let w = 0;
+  let prevSpace = false;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (WORD_STREAM_KEEP[c] === 1) {
+      out[w++] = c;
+      prevSpace = false;
+    } else if (!prevSpace) {
+      out[w++] = 32;
+      prevSpace = true;
+    }
+  }
+  return WORD_STREAM_LATIN1_DECODER.decode(out.subarray(0, w));
+}
+
+function stripWordBracketsLinear(txt: string): string {
+  let firstOpen = txt.indexOf('[');
+  if (firstOpen < 0 || txt.indexOf(']', firstOpen + 1) < 0) return txt;
+  const n = txt.length;
+  let out = '';
+  let last = 0;
+  let i = firstOpen;
+  while (i < n) {
+    const openPos = txt.indexOf('[', i);
+    if (openPos < 0) break;
+    let openEnd = openPos + 1;
+    while (openEnd < n && txt.charCodeAt(openEnd) === 91 /* '[' */) openEnd++;
+    const openLen = openEnd - openPos;
+    if (openLen <= 4 && openEnd < n) {
+      let wordEnd = openEnd;
+      while (wordEnd < n && wordEnd - openEnd <= 32) {
+        const wc = txt.charCodeAt(wordEnd);
+        if ((wc >= 65 && wc <= 90) || (wc >= 97 && wc <= 122)) wordEnd++;
+        else break;
+      }
+      const wordLen = wordEnd - openEnd;
+      if (wordLen >= 2 && wordLen <= 32 && wordEnd < n && txt.charCodeAt(wordEnd) === 93 /* ']' */) {
+        let closeEnd = wordEnd + 1;
+        while (closeEnd < n && txt.charCodeAt(closeEnd) === 93 /* ']' */) closeEnd++;
+        out += txt.slice(last, openPos) + txt.slice(openEnd, wordEnd);
+        last = closeEnd;
+        i = closeEnd;
+        continue;
+      }
+    }
+    i = openEnd;
+  }
+  return last === 0 ? txt : out + txt.slice(last);
+}
+
 /**
  * Strictly linear **O(N)** Markdown link, image, autolink-label, reference-link, and footnote stripper (`R7`/`R8`):
  * scans `](` sites over disjoint URL segments with monotonic quote/paren cursors so `'['.repeat(2_097_152)` and
@@ -1355,11 +1426,9 @@ function unwrapMarkdownLinksForScanLinear(s: string): string {
   if (work.includes('][')) {
     work = work.replace(/\]\[[^\]\r\n]{0,200}\]/g, ']');
   }
-  const stripWordBrackets = (txt: string): string =>
-    txt.includes('[') ? txt.replace(/(?<!\[)\[{1,4}([A-Za-z]{2,32})\]+/g, '$1') : txt;
 
   if (!work.includes('](') || !work.includes(')')) {
-    return stripWordBrackets(work);
+    return stripWordBracketsLinear(work);
   }
 
   let out = '';
@@ -1470,7 +1539,7 @@ function unwrapMarkdownLinksForScanLinear(s: string): string {
   }
 
   const unwrapped = last === 0 ? work : out + work.slice(last);
-  return stripWordBrackets(unwrapped);
+  return stripWordBracketsLinear(unwrapped);
 }
 
 function decodeEntitiesForInjectionScan(raw: string): string {
@@ -1516,7 +1585,22 @@ function normalizeCssStyleForHiddenCheck(rawStyle: string): string {
   return s;
 }
 
-function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'strip' | 'wordstream' = 'space'): string {
+function finishFillerPass(base: string, mode: 'space' | 'strip'): string {
+  if (mode === 'strip') {
+    let sOut = base;
+    if (/[`*_~]/.test(sOut)) sOut = sOut.replace(/[`*_~]+/g, '');
+    if (sOut.includes('  ')) sOut = sOut.replace(/  +/g, ' ');
+    return sOut;
+  }
+  let res = base;
+  if (res.includes('`')) res = res.replace(/`+/g, ' ');
+  if (/[*~]/.test(res)) res = res.replace(/[*~]+/g, '');
+  if (res.includes('_')) res = res.replace(/_+/g, ' ');
+  if (res.includes('  ')) res = res.replace(/  +/g, ' ');
+  return res;
+}
+
+function normalizeProseBaseForInjectionScan(prose: string, fillerMode: 'space' | 'strip'): string {
   let out = decodeEntitiesForInjectionScan(prose);
   if (out.includes('<!--')) {
     out = stripHtmlCommentsLinear(out, MAX_HTML_SCAN_CHARS);
@@ -1555,33 +1639,30 @@ function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'st
   if (out.includes('[') || out.includes(']')) {
     out = unwrapMarkdownLinksForScanLinear(out);
   }
+  return out;
+}
 
+function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'strip' | 'wordstream' = 'space'): string {
+  const out = normalizeProseBaseForInjectionScan(prose, fillerMode === 'strip' ? 'strip' : 'space');
   if (fillerMode === 'wordstream') {
-    const withoutAlign = stripMarkdownTableDividerLinesLinear(out);
-    return withoutAlign
-      .replace(/[^A-Za-z0-9.\s:]+/g, ' ')
-      .replace(/[ \t\r\n]+/g, ' ');
+    return toWordStreamLinear(out);
   }
-  if (fillerMode === 'strip') {
-    let sOut = out;
-    if (/[`*_~]/.test(sOut)) sOut = sOut.replace(/[`*_~]+/g, '');
-    if (sOut.includes('  ')) sOut = sOut.replace(/  +/g, ' ');
-    return sOut;
-  }
-  let res = out;
-  if (res.includes('`')) res = res.replace(/`+/g, ' ');
-  if (/[*~]/.test(res)) res = res.replace(/[*~]+/g, '');
-  if (res.includes('_')) res = res.replace(/_+/g, ' ');
-  if (res.includes('  ')) res = res.replace(/  +/g, ' ');
-  return res;
+  return finishFillerPass(out, fillerMode);
+}
+
+function normalizeProsePairForInjectionScan(prose: string): { spaced: string; stripped: string } {
+  const baseSpaced = normalizeProseBaseForInjectionScan(prose, 'space');
+  const spaced = finishFillerPass(baseSpaced, 'space');
+  const baseStripped = /[\u115F\u1160\u3164\uFFA0]/.test(prose)
+    ? normalizeProseBaseForInjectionScan(prose, 'strip')
+    : baseSpaced;
+  const stripped = finishFillerPass(baseStripped, 'strip');
+  return { spaced, stripped };
 }
 
 function matchesHiddenSubtreeInjection(rawFragment: string): boolean {
-  const spaced = normalizeProseForInjectionScan(rawFragment, 'space');
-  const wordStream = stripMarkdownTableDividerLinesLinear(spaced)
-    .replace(/[^A-Za-z0-9.\s:]+/g, ' ')
-    .replace(/[ \t\r\n]+/g, ' ');
-  const stripped = normalizeProseForInjectionScan(rawFragment, 'strip');
+  const { spaced, stripped } = normalizeProsePairForInjectionScan(rawFragment);
+  const wordStream = toWordStreamLinear(spaced);
   if (HIDDEN_OVERRIDE_KEYWORD_RE.test(wordStream)) return true;
   for (const pat of INJECTION_PATTERNS) {
     if (pat.re.test(spaced) || pat.re.test(wordStream) || pat.re.test(stripped)) {
@@ -1859,9 +1940,7 @@ export function detectPromptInjection(params: {
       if (attrCandidates.length > 0) {
         const joinedAttrs = attrCandidates.join('\n.\n').slice(0, MAX_HTML_SCAN_CHARS);
         const spacedAttrs = normalizeProseForInjectionScan(joinedAttrs, 'space');
-        const wordAttrs = stripMarkdownTableDividerLinesLinear(spacedAttrs)
-          .replace(/[^A-Za-z0-9.\s:]+/g, ' ')
-          .replace(/[ \t\r\n]+/g, ' ');
+        const wordAttrs = toWordStreamLinear(spacedAttrs);
         for (const pat of INJECTION_PATTERNS) {
           if (pat.re.test(spacedAttrs) || pat.re.test(wordAttrs)) {
             triggers.push('hidden_css_instruction_injection');
@@ -1894,11 +1973,8 @@ export function detectPromptInjection(params: {
   }
 
   // 3. Full Markdown + code-span / fenced-block scan (`M11` & `R7`/`R8`: zero character-class skip gates, unconditional passes, `< 35 ms` on `2 MiB`!)
-  const scanSpaced = normalizeProseForInjectionScan(boundedMd, 'space');
-  const scanWordStream = stripMarkdownTableDividerLinesLinear(scanSpaced)
-    .replace(/[^A-Za-z0-9.\s:]+/g, ' ')
-    .replace(/[ \t\r\n]+/g, ' ');
-  const scanStripped = normalizeProseForInjectionScan(boundedMd, 'strip');
+  const { spaced: scanSpaced, stripped: scanStripped } = normalizeProsePairForInjectionScan(boundedMd);
+  const scanWordStream = toWordStreamLinear(scanSpaced);
 
   for (const pat of INJECTION_PATTERNS) {
     if (

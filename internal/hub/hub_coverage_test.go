@@ -755,10 +755,10 @@ func TestHubArtifactPutEvictionHydrationAndReplyErrors(t *testing.T) {
 }
 
 func TestHubCallerConcurrencyGate503(t *testing.T) {
-	inFlight := make(chan struct{})
+	inFlight := make(chan struct{}, 1)
 	release := make(chan struct{})
 	rt := hubRTFunc(func(r *http.Request) (*http.Response, error) {
-		if strings.HasSuffix(r.URL.Path, "/robots.txt") {
+		if strings.HasSuffix(r.URL.Path, "/robots.txt") || strings.HasSuffix(r.URL.Path, "/llms.txt") {
 			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(""))}, nil
 		}
 		select {

@@ -4099,7 +4099,9 @@ func convertInlineHTMLInProseGo(s string, baseURL string, inlineCodeStash *[]str
 			if tag.isClosing {
 				firstPos = 2
 			}
-			if firstPos < len(tag.rawTag) && tag.rawTag[firstPos] >= 'A' && tag.rawTag[firstPos] <= 'Z' {
+			if firstPos < len(tag.rawTag) && tag.rawTag[firstPos] >= 'A' && tag.rawTag[firstPos] <= 'Z' &&
+				strings.IndexByte(tag.tagLower, ':') < 0 &&
+				!(tag.start >= 2 && s[tag.start-2] == ']' && s[tag.start-1] == '(') {
 				rep = ""
 				replaceIt = true
 			} else if wrapperStrip[tag.tagLower] {

@@ -6557,7 +6557,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
         proseWork = replaceHtmlTagsQuoteAwareLinear(
           proseWork,
           (tag) => {
-            if (tag.attrs && !/^\s/.test(tag.attrs)) {
+            if ((tag.attrs && !/^\s/.test(tag.attrs)) || !/^[a-z][a-z0-9:-]*$/.test(tag.tagNameLower)) {
               return tag.rawTag;
             }
             if (tag.tagNameLower === 'br') {
@@ -6576,7 +6576,12 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
               return `![${alt}](${resolvedSrc})`;
             }
             const firstRawCode = tag.rawTag.charCodeAt(tag.isClosing ? 2 : 1);
-            if (firstRawCode >= 65 && firstRawCode <= 90) {
+            if (
+              firstRawCode >= 65 &&
+              firstRawCode <= 90 &&
+              !tag.tagNameLower.includes(':') &&
+              !(tag.index >= 2 && proseWork.charCodeAt(tag.index - 2) === 93 && proseWork.charCodeAt(tag.index - 1) === 40)
+            ) {
               if (!tag.isClosing && !tag.isSelfClosing && tag.attrs && (tag.attrs.includes('title') || tag.attrs.includes('TITLE'))) {
                 syncLineBounds(tag.index);
                 if (

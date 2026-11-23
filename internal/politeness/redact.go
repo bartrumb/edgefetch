@@ -448,7 +448,7 @@ func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 	j := start
 	for j < len(s) {
 		if sawQuery && kind != urlSepPctEncoded && kind != urlSepJSONSlash {
-			rel := strings.IndexAny(s[j:], " \t\r\n<>'\xc2\xe2")
+			rel := strings.IndexAny(s[j:], " \t\r\n<>'\u0085\u2028\u2029")
 			if rel < 0 {
 				j = len(s)
 				break
@@ -774,7 +774,7 @@ func RedactEmbeddedURLs(s string) string {
 	hasPct := strings.IndexByte(s, '%') >= 0
 	hasAt := strings.IndexByte(s, '@') >= 0
 	hasSecretKw := (hasColon || strings.IndexByte(s, ' ') >= 0 || strings.IndexByte(s, '=') >= 0) &&
-		strings.IndexAny(s, "eEiIoO") >= 0
+		strings.ContainsAny(s, "eEiIoO")
 	if !hasColon && !hasSlash && !hasPct && !hasAt && !hasSecretKw {
 		return s
 	}

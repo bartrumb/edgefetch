@@ -207,8 +207,7 @@ test('R7-H7: Sanitizer & Markdown differential hardening (ordered-list 2., fence
   const sanitizedTicks = sanitizeInlineHtmlInMarkdown(ticksInc, 'https://example.com/');
   const dtTicks = performance.now() - t0;
   assert.equal(sanitizedTicks.length, 2_000_000);
-  const tickBudgetMs = process.env.NODE_V8_COVERAGE || process.env.CI ? 150 : 60;
-  assert.ok(dtTicks < tickBudgetMs, `Expected 2 MiB increasing-backticks scan in < ${tickBudgetMs}ms, took ${dtTicks.toFixed(1)}ms`);
+  assert.ok(dtTicks < 50, `Expected 2 MiB increasing-backticks scan in < 50ms, took ${dtTicks.toFixed(1)}ms`);
 });
 
 test('R7-H9: Declarative adapter linear link sanitization, MediaWiki 2 MiB linear preset, RSS https:// rule, URL parity & PSL/allowlist guards', () => {

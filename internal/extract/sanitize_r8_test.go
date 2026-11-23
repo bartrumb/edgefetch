@@ -150,13 +150,13 @@ func TestRound8H8LinearCPUBudgetsUnder40ms(t *testing.T) {
 				break
 			}
 		}
-		t.Logf("[H8 Go benchmark] %s (raceSlowdown=%d) -> len=%d best=%v", bm.name, extractRaceSlowdown, outLen, best)
-		// Verify `<` was escaped on 2M `<` (`outLen == 8_000_000`) and enforce a flat <150ms budget
-		// even under `go test -race` (zero race-slowdown multiplier).
+		t.Logf("[H8 Go benchmark] %s -> len=%d best=%v", bm.name, outLen, best)
+		// Under `go test -race`, race instrumentation adds ~2-3x overhead; enforce <40ms normal / <120ms if -race is active,
+		// and verify `<` was escaped on 2M `<` (`outLen == 8_000_000`).
 		if bm.name == "2M_raw_lt" && outLen != 8_000_000 {
 			t.Fatalf("expected 2M `<` -> 8M `&lt;`, got len=%d", outLen)
 		}
-		const budget = 150 * time.Millisecond
+		budget := time.Duration(extractRaceSlowdown) * 40 * time.Millisecond
 		if best > budget {
 			t.Fatalf("[H8 Go benchmark] %s exceeded linear CPU budget (%v): %v", bm.name, budget, best)
 		}

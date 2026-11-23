@@ -490,6 +490,7 @@ function cleanFenceInfoStringLinear(rawInfo: string): string {
  * BEFORE any block or fence recognition so zero parser can ever disagree on line boundaries.
  */
 function normalizeMarkdownLineEndingsUpfrontLinear(raw: string): string {
+  if (!/[\r\u0085\u2028\u2029]/.test(raw)) return raw;
   const n = raw.length;
   let firstSpecial = -1;
   for (let i = 0; i < n; i++) {

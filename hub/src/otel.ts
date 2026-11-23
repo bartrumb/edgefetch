@@ -178,14 +178,8 @@ function hasHeaderValue(headers: Headers | undefined, name: string): boolean {
   return typeof val === 'string' && val.trim().length > 0;
 }
 
-function isNonSuppressibleAuditRequest(request: Request, preVerified = false): boolean {
-  if (preVerified) return true;
-  if (
-    hasHeaderValue(request.headers, 'authorization') ||
-    hasHeaderValue(request.headers, 'x-api-key') ||
-    hasHeaderValue(request.headers, 'cookie') ||
-    hasHeaderValue(request.headers, 'x-agent-token')
-  ) {
+function isNonSuppressibleAuditRequest(request: Request): boolean {
+  if (hasHeaderValue(request.headers, 'x-agent-token')) {
     return true;
   }
   try {
@@ -196,8 +190,6 @@ function isNonSuppressibleAuditRequest(request: Request, preVerified = false): b
       pathname.startsWith('/oauth/') ||
       pathname === '/mcp' ||
       pathname.startsWith('/mcp/') ||
-      pathname === '/fetch' ||
-      pathname === '/agents' ||
       pathname.startsWith('/agent/')
     ) {
       return true;
@@ -215,7 +207,6 @@ function isNonSuppressibleAuditSpanName(name: string): boolean {
     name === 'edgefetch.mcp.tool' ||
     name === 'edgefetch.mcp_query' ||
     name === 'edgefetch.mcp_registry' ||
-    name === 'edgefetch.dispatch' ||
     name.startsWith('edgefetch.agent.')
   );
 }
@@ -226,7 +217,7 @@ export function createRequestTraceContext(request: Request): {
   headers: Record<string, string>;
 } {
   const parsed = parseTraceparent(request.headers?.get?.('traceparent'));
-  const forceSampled = isNonSuppressibleAuditRequest(request, isRequestVerifiedInProcess(request));
+  const forceSampled = isNonSuppressibleAuditRequest(request);
   const context: TraceContext = parsed
     ? {
         ...parsed,
@@ -726,9 +717,6 @@ export class RequestTracer {
       }
     }
     const preVerified = Boolean(opts?.authenticated) || isRequestVerifiedInProcess(request);
-    if (preVerified && !context.sampled) {
-      context.sampled = true;
-    }
     return new RequestTracer(
       {
         rootContext: context,
@@ -804,9 +792,6 @@ export class RequestTracer {
 
   markAuthenticated(authenticated = true): void {
     this.state.authenticated = authenticated;
-    if (authenticated) {
-      this.state.rootContext.sampled = true;
-    }
   }
 
   get context(): TraceContext {

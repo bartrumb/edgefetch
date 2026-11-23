@@ -665,7 +665,11 @@ func TestR10P2LiveChromiumRetainedSessionSlowStepHeaderIsolationIfInstalled(t *t
 				<iframe src="about:blank"></iframe>
 				<script>
 					fetch('/api/from-a-initial');
-					setInterval(() => { fetch('/api/from-a-timer').catch(() => {}); }, 25);
+					let ticks = 0;
+					const iv = setInterval(() => {
+						if (++ticks > 16) { clearInterval(iv); return; }
+						fetch('/api/from-a-timer').catch(() => {});
+					}, 25);
 					window.addEventListener('pagehide', () => { fetch('/api/from-a-unload', {keepalive: true}).catch(() => {}); });
 				</script>
 				<main>Page A</main>

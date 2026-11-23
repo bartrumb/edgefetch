@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSync } from 'esbuild';
@@ -157,11 +157,12 @@ try {
     childEnv.NODE_V8_COVERAGE = covDir;
   }
 
+  const testConcurrency = coverageEnabled ? Math.min(2, availableParallelism()) : Math.min(4, availableParallelism());
   let testErr = null;
   try {
     execFileSync(
       process.execPath,
-      ['--test', '--test-concurrency=4', '--test-force-exit', ...nodeTestFiles, e2eTestFile],
+      ['--test', `--test-concurrency=${testConcurrency}`, '--test-force-exit', ...nodeTestFiles, e2eTestFile],
       {
         stdio: 'inherit',
         env: childEnv,

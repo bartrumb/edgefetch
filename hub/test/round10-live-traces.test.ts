@@ -733,4 +733,123 @@ test('R10-4: postedWithinDays <= 30 parity, 5-min LRU + 6-way parallel coalescin
     directMonetaryJp?.pay && { min: directMonetaryJp.pay.min, max: directMonetaryJp.pay.max },
     { min: 215_000, max: 285_000 },
   );
+
+  // 5. Lever HTML `additional` pay when `lists` is non-empty & `additionalPlain === ""`, plus `company: "Spotify"` board probe when `ats_search` returns unrelated startups (`candidateUrls.size > 1`)
+  const spotifyHtmlAdditionalFmt = leverBoardSpec.format(
+    JSON.stringify([
+      {
+        id: 'b24fe5e5-dcb2-4238-a883-5fdb6bd404db',
+        text: 'Accounting Analyst, Content Accounting',
+        hostedUrl: 'https://jobs.lever.co/spotify/b24fe5e5-dcb2-4238-a883-5fdb6bd404db',
+        workplaceType: 'hybrid',
+        categories: { location: 'New York, NY', allLocations: ['New York, NY'] },
+        createdAt: Date.now() - 86_400_000,
+        descriptionPlain: '',
+        description: '<div>Content accounting team.</div>',
+        lists: [{ text: "What You'll Do", content: '<li>Close monthly accounting.</li>' }],
+        additionalPlain: '',
+        additional: '<div><p>The United States base range for this position is 75,645 - 94,556 USD plus equity.</p></div>',
+      },
+    ]),
+    'https://jobs.lever.co/spotify',
+    htmlToMd,
+  )!;
+  assert.deepEqual(
+    spotifyHtmlAdditionalFmt.jobs?.[0]?.pay && {
+      min: spotifyHtmlAdditionalFmt.jobs[0].pay.min,
+      max: spotifyHtmlAdditionalFmt.jobs[0].pay.max,
+    },
+    { min: 75_645, max: 94_556 },
+  );
+
+  const spotifyCompanyRes = await executeJobsCall({
+    payload: { company: 'Spotify', locations: ['New York'], limit: 5 },
+    env: {},
+    executeSearch: async () => ({
+      status: 200,
+      body: {
+        // 5 unrelated startups mentioning "ex-Spotify" on Ashby/Greenhouse (`candidateUrls.size > 1`)
+        results: [1, 2, 3, 4, 5].map((n) => ({ url: `https://jobs.ashbyhq.com/otherstartup${n}` })),
+      },
+    }),
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      if (u === 'https://jobs.lever.co/spotify') {
+        return {
+          status: 200,
+          body: { ok: true, extractorId: 'lever-board', jobs: spotifyHtmlAdditionalFmt.jobs },
+        };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(spotifyCompanyRes.status, 200);
+  const spotifyMatched = spotifyCompanyRes.body.jobs as Array<{ title: string; pay: { min: number; max: number } | null }>;
+  assert.equal(spotifyMatched.length, 1);
+  assert.deepEqual(
+    spotifyMatched[0]?.pay && { min: spotifyMatched[0].pay.min, max: spotifyMatched[0].pay.max },
+    { min: 75_645, max: 94_556 },
+  );
+
+  // 6. Workday relative `postedOn` ("Posted Today" vs "Posted 30+ Days Ago") & single-posting -> Workday board promotion
+  const wdBoardSpec = resolveAtsPreFetchSpec('https://visa.wd5.myworkdayjobs.com/Visa?q=Engineer')!;
+  const wdBoardFmt = wdBoardSpec.format(
+    JSON.stringify({
+      total: 2,
+      jobPostings: [
+        {
+          title: 'Software Engineer, Agentic Developer',
+          externalPath: '/job/US---Denver-CO/Software-Engineer--Agentic-Developer_REF090196W',
+          locationsText: 'US - Denver, CO',
+          postedOn: 'Posted Today',
+        },
+        {
+          title: 'Legacy Systems Engineer',
+          externalPath: '/job/US---Austin-TX/Legacy-Systems-Engineer_REF010000W',
+          locationsText: 'US - Austin, TX',
+          postedOn: 'Posted 30+ Days Ago',
+        },
+      ],
+    }),
+    'https://visa.wd5.myworkdayjobs.com/Visa?q=Engineer',
+    htmlToMd,
+  )!;
+  assert.match(wdBoardFmt.jobs?.[0]?.postedAt ?? '', /^\d{4}-\d{2}-\d{2}$/);
+  assert.match(wdBoardFmt.jobs?.[1]?.postedAt ?? '', /^\d{4}-\d{2}-\d{2}$/);
+
+  const seenVisaSearchQueries: string[] = [];
+  const visaBoardPromoRes = await executeJobsCall({
+    payload: { company: 'Visa', query: 'Engineer', postedWithinDays: 14, limit: 10 },
+    env: {},
+    executeSearch: async ({ query: q }) => {
+      const qs = String(q);
+      seenVisaSearchQueries.push(qs);
+      if (qs.includes('site:jobs.smartrecruiters.com/visa')) {
+        return {
+          status: 200,
+          body: { results: [{ url: 'https://jobs.smartrecruiters.com/Visa/744000088811122-staff-ai-platform-engineer' }] },
+        };
+      }
+      return {
+        status: 200,
+        body: { results: [{ url: 'https://visa.wd5.myworkdayjobs.com/en-US/Visa/job/SW-Engineer_REF089359W' }] },
+      };
+    },
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      if (u === 'https://visa.wd5.myworkdayjobs.com/Visa?q=Engineer') {
+        return { status: 200, body: { ok: true, extractorId: 'workday-board', jobs: wdBoardFmt.jobs } };
+      }
+      if (u === 'https://jobs.smartrecruiters.com/Visa/744000088811122-staff-ai-platform-engineer') {
+        const jp = extractJobPostingJsonLd(visaPostingHtml, u)!;
+        return { status: 200, body: { ok: true, jobPosting: jp, markdown: '# Staff AI Platform Engineer' } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.ok(seenVisaSearchQueries.some((q) => q.includes('site:jobs.smartrecruiters.com/visa')));
+  const promoTitles = (visaBoardPromoRes.body.jobs as Array<{ title: string }>).map((j) => j.title);
+  assert.ok(promoTitles.includes('Software Engineer, Agentic Developer'), 'Promoted Workday board must include Posted Today job');
+  assert.ok(!promoTitles.includes('Legacy Systems Engineer'), 'postedWithinDays=14 must exclude Posted 30+ Days Ago Workday job');
+  assert.ok(promoTitles.includes('Staff AI Platform Engineer'), 'Path-scoped SmartRecruiters search must include Visa SR job');
 });

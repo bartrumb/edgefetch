@@ -759,10 +759,11 @@ function parseLeverPay(job: Record<string, unknown>, extraProse = ''): Normalize
       if (lText || lContent) textChunks.push(`${lText} ${lContent}`);
     }
   }
-  for (const htmlField of ['description', 'additional']) {
-    if (textChunks.length === 0 && typeof job[htmlField] === 'string') {
-      textChunks.push(stripTagsPlain(String(job[htmlField]).slice(0, 32_000)));
-    }
+  if (!job.descriptionPlain && typeof job.description === 'string') {
+    textChunks.push(stripTagsPlain(String(job.description).slice(0, 32_000)));
+  }
+  if (!job.additionalPlain && typeof job.additional === 'string') {
+    textChunks.push(stripTagsPlain(String(job.additional).slice(0, 32_000)));
   }
   if (extraProse) textChunks.push(extraProse);
   const combined = textChunks.join('\n');
@@ -1035,7 +1036,8 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const allLocs = [loc, ...addLocs].filter(Boolean);
             const remoteType = typeof info.remoteType === 'string' ? info.remoteType : '';
             const timeType = typeof info.timeType === 'string' ? info.timeType : undefined;
-            const postedOn = typeof info.startDate === 'string' ? info.startDate : typeof info.postedOn === 'string' ? info.postedOn : undefined;
+            const rawPostedOn = typeof info.startDate === 'string' ? info.startDate : typeof info.postedOn === 'string' ? info.postedOn : undefined;
+            const postedOn = normalizeWorkdayPostedAt(rawPostedOn) ?? undefined;
             const descHtml = typeof info.jobDescription === 'string' ? info.jobDescription : '';
             const bodyMd = descHtml ? htmlToMd(descHtml, origUrl).markdown.trim() : '';
             const pay = parsePayFromText(bodyMd);
@@ -1094,7 +1096,8 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const extPath = typeof p.externalPath === 'string' ? p.externalPath : '';
             const fullUrl = extPath ? `https://${host}/${site}${extPath.startsWith('/') ? '' : '/'}${extPath}` : `https://${host}/${site}`;
             const locTxt = typeof p.locationsText === 'string' ? p.locationsText.trim() : '';
-            const postedOn = typeof p.postedOn === 'string' ? p.postedOn.trim() : null;
+            const rawPostedOn = typeof p.postedOn === 'string' ? p.postedOn.trim() : null;
+            const postedOn = normalizeWorkdayPostedAt(rawPostedOn);
             const bullets = Array.isArray(p.bulletFields) ? p.bulletFields.map(String).filter(Boolean).join(', ') : '';
             const wp = inferWorkdayWorkplaceType(String(p.remoteType ?? ''), locTxt, pTitle);
             links.push(fullUrl);
@@ -5330,6 +5333,24 @@ function isClosedSchemeDowngradeResult(urlStr: string, res: JobsScrapeResponse |
   return /rippling\.com/i.test(urlStr) || Boolean(parseAtsPostingIdentity(urlStr));
 }
 
+function normalizeWorkdayPostedAt(rawPostedOn: string | null | undefined, nowMs = Date.now()): string | null {
+  if (!rawPostedOn) return null;
+  const trimmed = rawPostedOn.trim();
+  if (!trimmed) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed;
+  if (/^posted\s+today\b/i.test(trimmed)) return new Date(nowMs).toISOString().slice(0, 10);
+  if (/^posted\s+yesterday\b/i.test(trimmed)) return new Date(nowMs - 86_400_000).toISOString().slice(0, 10);
+  const daysMatch = /^posted\s+(\d+)(\+)?\s+days?\s+ago\b/i.exec(trimmed);
+  if (daysMatch) {
+    const baseDays = parseInt(daysMatch[1]!, 10);
+    if (Number.isFinite(baseDays) && baseDays >= 0) {
+      const effectiveDays = daysMatch[2] ? baseDays + 5 : baseDays;
+      return new Date(nowMs - effectiveDays * 86_400_000).toISOString().slice(0, 10);
+    }
+  }
+  return trimmed;
+}
+
 function classifyFullBoardKey(urlStr: string): { key: string; platform: string; slug: string; isBoard: boolean; boardUrl: string } | null {
   try {
     const u = new URL(urlStr);
@@ -5405,6 +5426,30 @@ function classifyFullBoardKey(urlStr: string): { key: string; platform: string; 
         isBoard: parts.length === 1,
         boardUrl: `https://jobs.gem.com/${parts[0]!}`,
       };
+    }
+    const wdMatch = /^([a-z0-9-]+)\.wd\d+\.myworkday(?:jobs|site)\.com$/i.exec(host);
+    if (wdMatch && parts.length >= 1) {
+      let tenant = wdMatch[1]!.toLowerCase();
+      let site = '';
+      let rest: string[] = [];
+      if (parts[0]?.toLowerCase() === 'wday' && parts[1]?.toLowerCase() === 'cxs' && parts.length >= 4) {
+        tenant = (parts[2] || tenant).toLowerCase();
+        site = parts[3]!;
+        rest = parts.slice(4);
+      } else {
+        const idx = /^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(parts[0]!) && parts.length >= 2 ? 1 : 0;
+        site = parts[idx] ?? '';
+        rest = parts.slice(idx + 1);
+      }
+      if (site && site.toLowerCase() !== 'wday' && /^[A-Za-z0-9_.-]{1,120}$/.test(site)) {
+        return {
+          key: `workday:${tenant}:${site.toLowerCase()}`,
+          platform: 'workday',
+          slug: `${tenant}/${site}`,
+          isBoard: rest.length === 0,
+          boardUrl: `https://${host}/${site}`,
+        };
+      }
     }
   } catch {
     return null;
@@ -5947,6 +5992,9 @@ export async function executeJobsCall(params: {
     );
   }
 
+  const companyTokensForSearch = companyFilter ? expandCompanyFilterTokens(companyFilter) : [];
+  const primaryCompanySlug = companyTokensForSearch[0] && isValidAtsSlug(companyTokensForSearch[0]) ? companyTokensForSearch[0] : '';
+
   const atsGroups = [
     '(site:job-boards.greenhouse.io OR site:boards.greenhouse.io OR site:jobs.ashbyhq.com)',
     '(site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.smartrecruiters.com)',
@@ -5955,6 +6003,13 @@ export async function executeJobsCall(params: {
   const coreTerms = [companyFilter ? `"${companyFilter}"` : '', query ? `"${query}"` : '', wantRemote ? 'remote' : '']
     .filter(Boolean)
     .join(' ');
+  const scopedQueries = atsGroups.map((grp) => `${grp} ${coreTerms}`.trim());
+  if (primaryCompanySlug) {
+    const nonCompanyTerms = [query ? `"${query}"` : '', wantRemote ? 'remote' : ''].filter(Boolean).join(' ');
+    scopedQueries.push(
+      `(site:jobs.smartrecruiters.com/${primaryCompanySlug} OR site:${primaryCompanySlug}.wd5.myworkdayjobs.com OR site:${primaryCompanySlug}.wd1.myworkdayjobs.com) ${nonCompanyTerms}`.trim(),
+    );
+  }
 
   // Never pass `timeRange` (`qdr:w`/`qdr:m`) on ATS `site:` queries — Google omits indexed publish dates on ATS SPA/board URLs
   // and returns 0 results for `postedWithinDays <= 30`; `maxAgeCutoffMs` filters accurately using authoritative ATS `postedAt`!
@@ -5963,9 +6018,9 @@ export async function executeJobsCall(params: {
     const searchCandidateCap =
       postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(35, limit * 2);
     const searchResponses = await Promise.all(
-      atsGroups.map((grp) =>
+      scopedQueries.map((sq) =>
         executeSearch({
-          query: `${grp} ${coreTerms}`.trim(),
+          query: sq,
           maxResults: searchMaxResults,
         }).catch(() => ({ status: 500, body: {} as Record<string, unknown> })),
       ),
@@ -5985,22 +6040,34 @@ export async function executeJobsCall(params: {
     if (addedSearchHits > 0) sourcesUsed.add('ats_search');
   }
 
-  // Direct company board discovery when `company` is provided without `domains` (e.g. `company: "Visa"` -> `jobs.smartrecruiters.com/Visa`
-  // with `respectRobots: true` — NEVER `api.smartrecruiters.com`!)
+  // Direct company board discovery when `company` is provided without `domains` (e.g. `company: "Visa"` -> `jobs.smartrecruiters.com/Visa`,
+  // `company: "Spotify"` -> `jobs.lever.co/spotify`, with `respectRobots: true` — NEVER `api.smartrecruiters.com`!)
   if (companyFilter && domainsInput.length === 0) {
-    const coTokens = expandCompanyFilterTokens(companyFilter);
-    const primarySlug = coTokens[0] ?? '';
-    if (primarySlug && isValidAtsSlug(primarySlug)) {
+    const primarySlug = primaryCompanySlug;
+    if (primarySlug) {
+      const lowerSlug = primarySlug.toLowerCase();
       const rawTrimmedSlug = companyFilter.replace(/[^A-Za-z0-9_-]+/g, '');
       const srDisplaySlug =
-        rawTrimmedSlug && rawTrimmedSlug.toLowerCase() === primarySlug ? rawTrimmedSlug : primarySlug;
-      const hasSmartRecruitersHit = [...candidateUrls].some((u) => /jobs\.smartrecruiters\.com\//i.test(u));
-      if (!hasSmartRecruitersHit) {
+        rawTrimmedSlug && rawTrimmedSlug.toLowerCase() === lowerSlug ? rawTrimmedSlug : primarySlug;
+      const existingBoardKeys = new Set(
+        [...candidateUrls]
+          .map((u) => classifyFullBoardKey(u))
+          .filter((x): x is NonNullable<typeof x> => Boolean(x?.isBoard))
+          .map((x) => x.key),
+      );
+      const hasSmartRecruitersForCompany = [...candidateUrls].some((u) =>
+        new RegExp(`^https://jobs\\.smartrecruiters\\.com/${lowerSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:/|$)`, 'i').test(u),
+      );
+      if (!hasSmartRecruitersForCompany) {
         candidateUrls.add(`https://jobs.smartrecruiters.com/${srDisplaySlug}`);
       }
-      if (candidateUrls.size <= 1) {
+      if (!existingBoardKeys.has(`greenhouse:${lowerSlug}`)) {
         candidateUrls.add(`https://boards.greenhouse.io/${primarySlug}`);
+      }
+      if (!existingBoardKeys.has(`ashby:${lowerSlug}`)) {
         candidateUrls.add(`https://jobs.ashbyhq.com/${primarySlug}`);
+      }
+      if (!existingBoardKeys.has(`lever:${lowerSlug}`)) {
         candidateUrls.add(`https://jobs.lever.co/${primarySlug}`);
       }
     }
@@ -6083,7 +6150,16 @@ export async function executeJobsCall(params: {
   }
   const promotedBoardUrls: string[] = [];
   for (const [bKey, meta] of postingCountByBoard.entries()) {
-    if (!meta.hasBoard && meta.count >= 2 && (bKey.startsWith('ashby:') || bKey.startsWith('rippling:'))) {
+    const isWorkdayCompanyMatch =
+      bKey.startsWith('workday:') &&
+      hasCompanyOrDomainScope &&
+      meta.count >= 1 &&
+      (!primaryCompanySlug || bKey.startsWith(`workday:${primaryCompanySlug.toLowerCase()}:`));
+    if (
+      !meta.hasBoard &&
+      (isWorkdayCompanyMatch ||
+        (meta.count >= 2 && (bKey.startsWith('ashby:') || bKey.startsWith('rippling:') || bKey.startsWith('workday:'))))
+    ) {
       promotedBoardUrls.push(meta.boardUrl);
     }
   }

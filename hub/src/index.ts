@@ -1456,6 +1456,7 @@ export default {
           blobSha256,
           siteId: auth.siteId,
           bucket: env.ARTIFACTS,
+          metaDb: env.META,
           authorizeJobUpload: async (p) => {
             let lastAuth: AuthorizeArtifactUploadResult | undefined;
             for (const sName of shardNames) {

@@ -78,6 +78,9 @@ export async function handleCompatRoutes(params: {
   });
   if (auth.ok && auth.scopes.includes('crawl:fetch')) {
     authorized = true;
+  } else if (auth.ok && !isTavily) {
+    await request.body?.cancel().catch(() => undefined);
+    return Response.json({ success: false, error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
   } else if (!isTavily || request.method !== 'POST') {
     await request.body?.cancel().catch(() => undefined);
     return Response.json({ success: false, error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
@@ -111,6 +114,9 @@ export async function handleCompatRoutes(params: {
   }
 
   if (!authorized) {
+    if (auth.ok) {
+      return Response.json({ success: false, error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+    }
     return Response.json({ success: false, error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
   }
   const callerUserId = auth.ok ? auth.userId : 'owner';
@@ -168,7 +174,7 @@ export async function handleCompatRoutes(params: {
       }
       crawlPayload.collectionId = scoped.scopedId;
     }
-    const created = await createCrawlJob({ payload: crawlPayload, metaDb: env.META, selfHost: url.hostname });
+    const created = await createCrawlJob({ payload: crawlPayload, metaDb: env.META, selfHost: url.hostname, userId: callerUserId });
     if (!created.ok) {
       return Response.json({ success: false, error: created.error, message: created.message }, { status: created.status });
     }
@@ -205,12 +211,13 @@ export async function handleCompatRoutes(params: {
         bucket: env.ARTIFACTS,
         offset: Number.isFinite(rawOffset) ? rawOffset : 0,
         limit: Number.isFinite(rawLimit) ? rawLimit : 25,
+        userId: callerUserId,
       });
       if (!st.ok) return Response.json({ success: false, error: st.error }, { status: st.status });
       return Response.json({ success: true, ...st.crawl });
     }
     if (request.method === 'DELETE') {
-      const del = await cancelCrawlJob(crawlId, env.META);
+      const del = await cancelCrawlJob(crawlId, env.META, callerUserId);
       return Response.json({ success: del.ok, status: 'cancelled' }, { status: del.status });
     }
   }
@@ -219,6 +226,7 @@ export async function handleCompatRoutes(params: {
     const batchOut = await startOrExecuteBatchScrape({
       payload: bodyObj,
       selfHost: url.hostname,
+      userId: callerUserId,
       executeScrape: async (scArgs) => {
         const res = await executeScrapeCall({
           payload: scArgs,
@@ -253,7 +261,7 @@ export async function handleCompatRoutes(params: {
     const batchId = safeDecodeURIComponent(fcBatchMatch[1] ?? '');
     if (batchId === null) return Response.json({ success: false, error: 'bad_request' }, { status: 400 });
     if (request.method === 'GET') {
-      const job = getBatchScrapeStatus(batchId);
+      const job = getBatchScrapeStatus(batchId, callerUserId);
       if (!job) return Response.json({ success: false, error: 'batch_not_found' }, { status: 404 });
       return Response.json({
         success: true,
@@ -267,7 +275,7 @@ export async function handleCompatRoutes(params: {
       });
     }
     if (request.method === 'DELETE') {
-      const ok = cancelBatchScrape(batchId);
+      const ok = cancelBatchScrape(batchId, callerUserId);
       return Response.json({ success: ok, message: ok ? 'Batch scrape job cancelled' : 'Batch not found' }, { status: ok ? 200 : 404 });
     }
   }

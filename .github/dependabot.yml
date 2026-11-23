@@ -30,6 +30,6 @@ updates:
       interval: "weekly"
 
   - package-ecosystem: "docker"
-    directory: "/edgefetch_fat"
+    directory: "/addon"
     schedule:
       interval: "weekly"

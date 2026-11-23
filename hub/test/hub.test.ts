@@ -1155,7 +1155,7 @@ test('V2-3: EdgeFetchClient TypeScript SDK formats requests and surfaces typed E
       const hdrs = new Headers(init?.headers);
       seen.push({ method: init?.method ?? 'GET', url: String(input), auth: hdrs.get('authorization') ?? '' });
       if (String(input).endsWith('/v1/interact')) {
-        return Response.json({ error: 'fat_agent_required', message: 'Deploy edgefetch_fat' }, { status: 503 });
+        return Response.json({ error: 'fat_agent_required', message: 'Connect a browser-v1 worker node' }, { status: 503 });
       }
       return Response.json({ ok: true, markdown: '# Hello SDK' }, { status: 200 });
     },
@@ -1446,7 +1446,7 @@ int main(void) { return 0; }</code></pre>
     </main></body></html>`,
     { baseUrl: 'https://docs.example.com/generics', onlyMainContent: true },
   );
-  assert.match(extracted.markdown, /`Promise<Array<number>>`/);
+  assert.match(extracted.markdown, /`Promise&lt;Array&lt;number>>`/);
   assert.match(extracted.markdown, /`` use `tick` span ``/);
   assert.match(extracted.markdown, /```c\n#include <stdio\.h>/);
 
@@ -1768,7 +1768,7 @@ test('V2-10: Modular Site Extractor Registry (18+ platforms: npm, crates.io, HF,
   </body></html>`;
   const soOut = extractHtmlDocument(soHtml, { baseUrl: 'https://stackoverflow.com/questions/99999/how-to-type-promise' });
   assert.match(soOut.markdown, /## ✅ Accepted Answer \(Score: 88\)/);
-  assert.match(soOut.markdown, /`Promise<Result<T>>`/);
+  assert.match(soOut.markdown, /`Promise&lt;Result&lt;T>>`/);
   assert.match(soOut.markdown, /type Unwrap<T> = Awaited<T>;/);
   assert.equal(soOut.markdown.includes('Noise question 1'), false);
 
@@ -3195,7 +3195,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.7.1');
+    assert.equal(caps.version, '2.7.2');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);
@@ -11191,7 +11191,7 @@ test('M1-C-R2 Batch 5: index.ts, oauth.ts, mcp.ts, storage.ts, ingest.ts, scrape
     await bucket.put(docR2Key, '# Precomputed Document Markdown');
     await metaDb
       .prepare('INSERT OR REPLACE INTO documents (id, content_sha256, format, pipeline_version, r2_key, title, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind('doc_b5_1', artContentSha, 'markdown', 29, docR2Key, 'Doc Title', 30, nowStorage)
+      .bind('doc_b5_1', artContentSha, 'markdown', SCRAPE_PIPELINE_VERSION, docR2Key, 'Doc Title', 30, nowStorage)
       .run();
     const docHit = await readArtifactPage({
       bucket: bucket as unknown as R2Bucket,
@@ -12834,7 +12834,7 @@ test('M1-C-R3 Group 1: src/mcp.ts batch scope enforcement & helpers, src/storage
     const mdRawGz = gzipSync(mdRawHtml);
     const mdRawBlobSha = createHash('sha256').update(mdRawGz).digest('hex');
     await bucket.put(r2ArtifactKey('stored', mdRawBlobSha), mdRawGz);
-    await bucket.put(r2DerivedKey(11, 'markdown', mdRawContentSha), '# MD Fallback\n\nCached markdown');
+    await bucket.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdRawContentSha), '# MD Fallback\n\nCached markdown');
     const mdFallbackPage = await readArtifactPage({
       bucket: bucket as unknown as R2Bucket,
       blobSha256: `md:${mdRawBlobSha}`,

@@ -4801,8 +4801,8 @@ test('AGENT-19: M1-C Iter3 jobs.ts remaining lines and branches', async () => {
     {
       title: 'Eng',
       company: 'Acme Inc',
-      url: 'https://example.com/j/1',
-      applyUrl: 'https://example.com/j/1',
+      url: 'https://acme.com/j/1',
+      applyUrl: 'https://acme.com/j/1',
       workplaceType: 'remote',
       locations: [],
       pay: null,
@@ -5116,7 +5116,25 @@ test('AGENT-21: M1-C Iter3 jobs.ts remaining lines and branches', async () => {
         title: 'Eng',
         company: 'Acme Labs',
         url: 'not-a-url',
-        applyUrl: 'https://example.com/1',
+        applyUrl: 'https://acme.com/1',
+        workplaceType: 'remote',
+        locations: [],
+        pay: null,
+        postedAt: null,
+        source: 'ats',
+      },
+      new Set(['acme']),
+      [],
+    ),
+    false,
+  );
+  assert.equal(
+    matchesAllowedCompanyOrDomain(
+      {
+        title: 'Eng',
+        company: 'Acme Labs',
+        url: 'https://acme.com/1',
+        applyUrl: 'https://acme.com/1',
         workplaceType: 'remote',
         locations: [],
         pay: null,

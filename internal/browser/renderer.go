@@ -141,9 +141,11 @@ type retainedSession struct {
 	cdpSessionID          string
 	mainFrameID           string
 	frameOrigins          map[string]string // frameId -> origin of the document currently COMMITTED in that frame
-	harnessNavURL         string            // URL the harness passed to Page.navigate and has not yet seen paused
-	navChainReqID         string            // Fetch requestId of the harness navigation (follows same-origin redirects)
-	injectedReqs          map[string]bool   // Fetch requestIds that received the task headers (redirect-chain provenance)
+	sawUninjectedSubdoc   bool              // true once any subframe Document loaded without header injection (until harnessHop)
+	inHarnessAction       bool
+	harnessNavURL         string          // URL the harness passed to Page.navigate and has not yet seen paused
+	navChainReqID         string          // Fetch requestId of the harness navigation (follows same-origin redirects)
+	injectedReqs          map[string]bool // Fetch requestIds that received the task headers (redirect-chain provenance)
 	initialOrigin         string
 	redirectedCrossOrigin bool
 	lastCheckedURL        string
@@ -306,8 +308,33 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 	return nil
 }
 
-// hasPositiveSameOriginProof requires an Origin or Referer header naming the bound origin (and none naming another).
+// hasExplicitSameOriginSecFetchSite requires Sec-Fetch-Site to be explicitly present and equal to "same-origin".
+func hasExplicitSameOriginSecFetchSite(hdrs map[string]any) bool {
+	if len(hdrs) == 0 {
+		return false
+	}
+	found := false
+	for k, rawV := range hdrs {
+		if rawV == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(k), "sec-fetch-site") {
+			val := strings.ToLower(strings.TrimSpace(fmt.Sprint(rawV)))
+			if val != "same-origin" {
+				return false
+			}
+			found = true
+		}
+	}
+	return found
+}
+
+// hasPositiveSameOriginProof requires an Origin or Referer header naming the bound origin (and none naming another),
+// and rejects immediately if Sec-Fetch-Site is present and anything other than "same-origin".
 func hasPositiveSameOriginProof(hdrs map[string]any, initOrigin string) bool {
+	if initOrigin == "" {
+		return false
+	}
 	proven := false
 	for k, rawV := range hdrs {
 		if rawV == nil {
@@ -315,11 +342,15 @@ func hasPositiveSameOriginProof(hdrs map[string]any, initOrigin string) bool {
 		}
 		val := strings.TrimSpace(fmt.Sprint(rawV))
 		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "sec-fetch-site":
+			if !strings.EqualFold(val, "same-origin") {
+				return false
+			}
 		case "origin", "referer":
 			if val == "" {
 				continue
 			}
-			if canonicalURLOrigin(val) != initOrigin {
+			if strings.EqualFold(val, "null") || canonicalURLOrigin(val) != initOrigin {
 				return false
 			}
 			proven = true
@@ -333,6 +364,7 @@ func isSameOriginInitiatorHeaders(hdrs map[string]any, initOrigin string) bool {
 		return true
 	}
 	var originHdr, refererHdr, secFetchSite string
+	hasSecFetchSite := false
 	for k, rawV := range hdrs {
 		if rawV == nil {
 			continue
@@ -344,24 +376,22 @@ func isSameOriginInitiatorHeaders(hdrs map[string]any, initOrigin string) bool {
 		case "referer":
 			refererHdr = val
 		case "sec-fetch-site":
+			hasSecFetchSite = true
 			secFetchSite = strings.ToLower(val)
 		}
 	}
-	hasProvenSameOrigin := false
+	if hasSecFetchSite && secFetchSite != "same-origin" {
+		return false
+	}
 	if originHdr != "" {
 		if strings.EqualFold(originHdr, "null") || canonicalURLOrigin(originHdr) != initOrigin {
 			return false
 		}
-		hasProvenSameOrigin = true
 	}
 	if refererHdr != "" {
 		if canonicalURLOrigin(refererHdr) != initOrigin {
 			return false
 		}
-		hasProvenSameOrigin = true
-	}
-	if secFetchSite != "" && secFetchSite != "same-origin" && secFetchSite != "none" {
-		return hasProvenSameOrigin
 	}
 	return true
 }
@@ -392,7 +422,7 @@ func sameNavigationURL(a, b string) bool {
 	return pa == pb && ua.Query().Encode() == ub.Query().Encode()
 }
 
-// noteFrameNavigated records the origin of the document that just committed in a frame (Page.frameNavigated).
+// noteFrameNavigated records the committed origin of a frame (Page.frameNavigated).
 func (s *retainedSession) noteFrameNavigated(rawParams json.RawMessage) {
 	var ev struct {
 		Frame struct {
@@ -447,8 +477,8 @@ func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 	if cdp.call(ctx, s.cdpSessionID, "Page.getFrameTree", nil, &out) != nil || len(out.FrameTree) == 0 {
 		return
 	}
-	var walk func(raw json.RawMessage, top bool)
-	walk = func(raw json.RawMessage, top bool) {
+	var walk func(raw json.RawMessage, isRoot bool)
+	walk = func(raw json.RawMessage, isRoot bool) {
 		var n node
 		if json.Unmarshal(raw, &n) != nil || n.Frame.ID == "" {
 			return
@@ -464,7 +494,7 @@ func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 		if _, seen := s.frameOrigins[n.Frame.ID]; !seen {
 			s.frameOrigins[n.Frame.ID] = origin
 		}
-		if top && s.mainFrameID == "" {
+		if isRoot && s.mainFrameID == "" {
 			s.mainFrameID = n.Frame.ID
 		}
 		s.mu.Unlock()
@@ -473,6 +503,15 @@ func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 		}
 	}
 	walk(out.FrameTree, true)
+}
+
+func (s *retainedSession) setInHarnessAction(active bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.inHarnessAction = active
+	s.mu.Unlock()
 }
 
 func (s *retainedSession) expectHarnessNavigation(targetURL string) {
@@ -524,13 +563,12 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	cdpSID := s.cdpSessionID
 	initOrigin := s.initialOrigin
 	extra := s.extraHeaders
-	isMainDoc := strings.EqualFold(paused.ResourceType, "Document") &&
-		(s.mainFrameID == "" || paused.FrameID == "" || paused.FrameID == s.mainFrameID)
+	isDocReq := strings.EqualFold(paused.ResourceType, "Document")
+	isMainDoc := isDocReq && (s.mainFrameID == "" || paused.FrameID == "" || paused.FrameID == s.mainFrameID)
 	if isMainDoc && s.mainFrameID == "" && paused.FrameID != "" {
 		s.mainFrameID = paused.FrameID
 	}
 	sameOriginReq := initOrigin != "" && reqOrigin != "" && reqOrigin == initOrigin
-	isDocReq := strings.EqualFold(paused.ResourceType, "Document")
 	// A redirect hop is only as trustworthy as the hop before it: bound -> third party -> bound never gets headers.
 	chainOK := paused.RedirectedRequestID == "" || s.injectedReqs[paused.RedirectedRequestID]
 	harnessHop := false
@@ -548,18 +586,15 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	}
 	if isMainDoc && initOrigin != "" {
 		if reqOrigin != initOrigin {
-			// Top-level document navigated or 30x-redirected away from initialOrigin:
-			// mark session cross-origin so subsequent subrequests back to initialOrigin never carry extraHeaders!
 			s.redirectedCrossOrigin = true
 		} else if harnessHop && paused.RedirectedRequestID == "" && paused.RedirectStatusCode == 0 {
-			// Only a harness-initiated top-level navigation clears cross-origin taint (never an attacker-initiated location= bounce).
+			// Only an explicit harness navigation clears cross-origin / uninjected-document taint.
 			s.redirectedCrossOrigin = false
+			s.sawUninjectedSubdoc = false
 		}
 	}
 	crossTainted := s.redirectedCrossOrigin
 	if isDocReq && paused.FrameID != "" && (!sameOriginReq || harnessHop || crossTainted) {
-		// Clear the frame's committed origin as soon as a new non-bound, harness, or cross-tainted document load starts
-		// so the outgoing document cannot rely on a stale frameOrigins entry while the navigation is in flight.
 		if s.frameOrigins == nil {
 			s.frameOrigins = make(map[string]string)
 		}
@@ -573,16 +608,22 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	case harnessHop:
 		allowInject = true
 	case isMainDoc:
-		// Renderer-initiated top-level navigation (location=, <meta refresh>, form submit, link click, target=_top
-		// from a child frame): needs positive proof that a bound document started it. Referer can be suppressed by
-		// an attacker but never forged, so "absent" must mean "no headers".
-		allowInject = !crossTainted && chainOK && proof
+		// Once any Document in the tab loaded without header injection, block autonomous top-level Document injection
+		// (e.g. A -> B -> A grandchild top.location bounce) unless the harness itself initiated an action or explicit
+		// Sec-Fetch-Site: same-origin proof is present.
+		allowInject = !crossTainted && chainOK && proof &&
+			isSameOriginInitiatorHeaders(paused.Request.Headers, initOrigin) &&
+			(!s.sawUninjectedSubdoc || s.inHarnessAction || hasExplicitSameOriginSecFetchSite(paused.Request.Headers))
 	default:
-		// Subresource / sub-frame document: positive proof, or (strictly for non-document subresources on no-referrer
-		// bound pages) a requesting frame whose committed document is known to be on the bound origin and no header
-		// naming another origin. Never trust paused.FrameID on Document requests (it names the target frame, not the initiator!).
 		allowInject = !crossTainted && chainOK && isSameOriginInitiatorHeaders(paused.Request.Headers, initOrigin) &&
 			(proof || (!isDocReq && frameKnown && frameCommitted == initOrigin))
+	}
+	if isDocReq && !allowInject && initOrigin != "" {
+		s.sawUninjectedSubdoc = true
+		if isMainDoc {
+			// Top-level Document loaded without header injection: block ALL subsequent main-doc and subresource injection until harnessHop!
+			s.redirectedCrossOrigin = true
+		}
 	}
 	if allowInject && len(extra) > 0 {
 		if s.injectedReqs == nil || len(s.injectedReqs) > 4096 {
@@ -2009,6 +2050,8 @@ func (r *Renderer) runActionStep(
 	var beforeSnap actionDOMSnapshot
 	if kind == "click" || kind == "press" {
 		beforeSnap = captureActionDOMState(ctx, cdp, sess.cdpSessionID)
+		sess.setInHarnessAction(true)
+		defer sess.setInHarnessAction(false)
 	}
 
 	switch kind {
@@ -2764,7 +2807,12 @@ func linuxSandboxBlockedByHostPolicy() bool {
 		return false
 	}
 	if attr, err := readProcFile("/proc/self/attr/current"); err == nil {
-		if strings.Contains(strings.ToLower(strings.TrimSpace(string(attr))), "edgefetch_fat") {
+		attrLower := strings.ToLower(strings.TrimSpace(string(attr)))
+		if strings.Contains(attrLower, "edgefetch_fat") ||
+			strings.HasPrefix(attrLower, "edgefetch ") ||
+			strings.Contains(attrLower, "_edgefetch ") ||
+			strings.HasSuffix(attrLower, "_edgefetch") ||
+			attrLower == "edgefetch" {
 			return true
 		}
 	}
@@ -2990,7 +3038,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		return nil, err
 	}
 
-	waitBudget := 15 * time.Second
+	waitBudget := 25 * time.Second
 	firstAttemptWait := waitBudget
 	if useSandbox && runtime.GOOS == "linux" {
 		if dl, ok := ctx.Deadline(); ok {
@@ -3000,7 +3048,8 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		}
 	}
 	cmd, userDir, conn, launchErr := r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, firstAttemptWait)
-	if launchErr != nil && runtime.GOOS == "linux" && useSandbox && ctx.Err() == nil && isSandboxStartupFailure(launchErr) {
+	if launchErr != nil && runtime.GOOS == "linux" && useSandbox && ctx.Err() == nil &&
+		(isSandboxStartupFailure(launchErr) || (r.canFallbackToNoSandboxLocked() && strings.Contains(launchErr.Error(), "before advertising DevTools"))) {
 		if !r.canFallbackToNoSandboxLocked() {
 			r.sandboxState = "off"
 			r.disabledByPolicy = true

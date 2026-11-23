@@ -1,39 +1,42 @@
-# Writing & Contributing Declarative YAML Site Adapters
+# Declarative YAML Site Adapters (`internal/extract/manifests/`)
 
-EdgeFetch ships an **open-source (`MIT`) 100% Declarative YAML Site, Commerce & ATS Adapter Library** covering **56+ keyless public platforms** across 7 categories (`developer`, `genai`, `jobs`, `finance`, `public-records`, `research-health`, `commerce-social`), aligned with EdgeFetch's licensing model: *open-source worker, SDKs, and adapters (`MIT`), fair-source hub (`FSL-1.1`, `MIT` after two years)*.
+EdgeFetch includes **`57` open-source (`MIT`) declarative YAML site, commerce, open-data, and ATS adapters** across 7 categories (`developer`, `genai`, `jobs`, `finance`, `public-records`, `research-health`, `commerce-social`), aligned with EdgeFetch's license split: *open-source worker, SDKs, and adapters (`MIT`), fair-source hub (`FSL-1.1`, `MIT` after two years)*.
 
-Every built-in and community site adapter is authored as a `#`-commented YAML 1.2 Core manifest in `internal/extract/manifests/<slug>.yaml` (`MIT`-licensed) and compiled by `npm run adapter:compile` (`hub/scripts/compile-manifests.mjs`) into the checked canonical IR `internal/extract/manifests/compiled.json` embedded in **both** the Cloudflare/Node TypeScript Hub and the pure-Go Hub (`//go:embed manifests/compiled.json`).
-
----
-
-## 1. Security & Architecture Guarantees (Zero TypeScript Adapter Code)
-
-1. **Zero Arbitrary Code Execution & Zero Network Escape:**
-   - Adapters contain **zero executable TypeScript/JavaScript**, **zero `eval`/`Function`**, **zero `fetch()` calls**, and **zero backtracking regular expressions** (any `regexExtract` pattern is compiled strictly via `re2js` linear-time Thompson NFA).
-2. **Single Checked Canonical IR (Zero Go-vs-TS YAML Differentials):**
-   - Contributors write clean `#`-commented `.yaml` files in `internal/extract/manifests/*.yaml`.
-   - `npm run adapter:compile` parses every manifest with `yaml` (`maxAliasCount: 0, merge: false, uniqueKeys: true`), rejects anchors (`&`), aliases (`*`), merge keys (`<<`), explicit tags (`!`), non-ASCII keys, and unknown/case-mismatched schema keys, and emits deterministic `internal/extract/manifests/compiled.json`.
-   - Go decodes `compiled.json` with `json.Decoder.DisallowUnknownFields()` and strict ASCII key verification.
-3. **Host-Claim & SSRF Hardening:**
-   - Duplicate manifest `id`s and cross-manifest duplicate `twin.id`s are rejected at compile and load time.
-   - Broad TLD/eTLD wildcards (`*`, `*.com`, `*.org`, `*.co.uk`) are forbidden; wildcard or `universalEngine: true` routes may only interpolate `{host}` / `{origin}` into same-origin `https://{host}/...` URLs.
-   - All resolved `fetchUrl` targets are validated as public `https://` URLs with no credentials, fragments, non-443 ports, or loopback/rebinding suffixes.
-4. **100% Keyless, Polite & `robots.txt`-Compliant:**
-   - Target public APIs, feeds, registries, and structured HTML (never paid B2B API keys).
-   - When `/api` is disallowed by `robots.txt` (e.g., `openfoodfacts`, `arxiv`, `clinicaltrials`, `icims`), use declarative `htmlRoutes` over `robots.txt`-permitted public HTML instead of `twin`.
+Every site adapter is authored as a `#`-commented YAML 1.2 Core manifest in [`internal/extract/manifests/<slug>.yaml`](../internal/extract/manifests) and compiled by `npm run adapter:compile` ([`hub/scripts/compile-manifests.mjs`](../hub/scripts/compile-manifests.mjs)) into the canonical IR `internal/extract/manifests/compiled.json`, which is shared by both the TypeScript Hub and the standalone Go Hub (`//go:embed manifests/compiled.json`).
 
 ---
 
-## 2. Quickstart Workflow (`adapter:new` + `adapter:test --record`)
+## 1. Ring 1 Governance, Canary Monitoring & Security Guarantees
 
-### Option A — Declarative Pre-Fetch JSON / XML / Markdown Twin (`routes` or `match`+`twin`+`extract`)
+Site adapters sit in **Ring 1** of EdgeFetch's two-ring security model (see **[docs/SECURITY-LOG.md](SECURITY-LOG.md)** and **[CONTRIBUTING.md](../CONTRIBUTING.md)**):
+
+1. **Pure Data — Zero Executable Adapter Code:**
+   - Adapters contain **no executable TypeScript, JavaScript, or Go**, **no `eval`/`Function`**, **no direct `fetch()` calls**, and **no backtracking regular expressions** (any `regexExtract` pattern compiles strictly through `re2js` linear-time Thompson NFAs).
+   - Post-fetch adapters execute inside a zero-secret, zero-network bulkhead (`runAdapterSyncInBulkhead`) and fail open to standard HTML extraction if an upstream field changes.
+2. **Single Schema-Checked Compiler (`compile-manifests.mjs`):**
+   - `npm run adapter:compile` parses every manifest with `yaml` (`maxAliasCount: 0, merge: false, uniqueKeys: true`), rejecting YAML anchors (`&`), aliases (`*`), merge keys (`<<`), explicit tags (`!`), non-ASCII keys, and unknown schema fields.
+   - Go decodes `compiled.json` with `json.Decoder.DisallowUnknownFields()` and strict ASCII key verification so Go and TypeScript never disagree on YAML edge cases.
+3. **Domain-Claim Bounds, Diff Gate & Daily Read-Only Canary:**
+   - Duplicate manifest `id`s, cross-manifest domain collisions, and Public Suffix List (PSL) broad wildcards (`*`, `*.com`, `*.org`, `*.co.uk`) are rejected at compile time; all resolved `fetchUrl` targets must be public `https://:443` URLs with no credentials, fragments, or loopback/rebinding suffixes.
+   - CI enforces [`hub/scripts/verify-adapter-only-diff.mjs`](../hub/scripts/verify-adapter-only-diff.mjs), blocking any domain widening or `fetchUrl` host change without explicit human sign-off.
+   - Live adapter health against upstream public endpoints is checked daily by a read-only canary published at **[`edgefetch.dev/adapters/status/`](https://edgefetch.dev/adapters/status/)**.
+4. **Keyless, Polite & `robots.txt`-Checked:**
+   - Built-in adapters target keyless public APIs, feeds, registries, and structured HTML pages — never paid B2B API keys or undocumented private endpoints.
+   - `robots.txt` and `Content-Signal: ai-input` are verified on every hop; when `/api` is disallowed by `robots.txt` (e.g., `openfoodfacts`, `arxiv`, `clinicaltrials`, `icims`), adapters use declarative `htmlRoutes` over `robots.txt`-permitted public HTML instead of `twin`.
+   - **Contributor policy:** Broken-adapter reports and new adapter requests are welcome via GitHub Issues; code PRs require maintainer invitation via [`.github/VOUCHED.td`](../.github/VOUCHED.td) (`Inbound = MIT + DCO`, `git commit -s`).
+
+---
+
+## 2. Authoring Workflow (`adapter:new` + `adapter:test --record`)
+
+### Option A — Pre-Fetch Public JSON / XML / Markdown Twin (`match` + `twin` + `extract`)
 
 ```bash
 cd hub
 npm run adapter:new developer/my-registry
 ```
 
-This creates `internal/extract/manifests/my-registry.yaml`, creates `hub/test/fixtures/adapters/my-registry.json`, and compiles `internal/extract/manifests/compiled.json`:
+This scaffolds `internal/extract/manifests/my-registry.yaml`, creates `hub/test/fixtures/adapters/my-registry.json`, and updates `internal/extract/manifests/compiled.json`:
 
 ```yaml
 # Shared Go + TypeScript Declarative Site Adapter: RubyGems Registry
@@ -47,7 +50,6 @@ domains:
 exampleUrls:
   - https://rubygems.org/gems/rails
 
-# Matches /gems/<gem> (allowing optional trailing version subpaths)
 match:
   exactSegments: false
   pathSegments:
@@ -85,7 +87,7 @@ extract:
       whenVar: version
 ```
 
-### Option B — Declarative Post-Fetch HTML CSS-Selector / Schema.org JSON-LD (`htmlRoutes`)
+### Option B — Post-Fetch HTML CSS-Selector / Schema.org JSON-LD (`htmlRoutes`)
 
 ```bash
 cd hub
@@ -132,17 +134,17 @@ htmlRoutes:
 
 ---
 
-## 3. Compile, Polite Live-Record & Fuzz in 1 Command
+## 3. Compile, Polite Live-Record & Bulkhead Fuzz
 
 ```bash
 cd hub
 
-# Compile & strictly validate all internal/extract/manifests/*.yaml -> compiled.json:
+# Compile & validate all 57 manifests in internal/extract/manifests/*.yaml -> compiled.json:
 npm run adapter:compile
 
-# Polite live test (verifies /robots.txt + Content-Signal, previews Markdown & token savings, and writes fixture JSON):
+# Polite live test (checks /robots.txt + Content-Signal first, previews Markdown, and writes fixture JSON):
 npm run adapter:test rubygems https://rubygems.org/gems/rails --record
 
-# Run schema validation + fixture checks + >100 KB linear-time (< 50ms/case) bulkhead fuzzer across all 56+ adapters:
+# Run schema validation + fixture checks + >100 KB linear-time (< 50ms/case) bulkhead fuzzer across all 57 adapters:
 npm run adapter:test
 ```

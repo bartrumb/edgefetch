@@ -18,7 +18,7 @@ const (
 	KindText    Kind = "text"    // Auxiliary HTML, Markdown, or XML document (e.g., sitemap or llms.txt)
 	KindCatalog Kind = "catalog" // Full-catalog HTML page where non-2xx fails the host batch
 	KindScrape  Kind = "scrape"  // Universal smart scrape (HTML, Markdown, PDF, JSON, or XML -> Markdown + metadata)
-	KindRender  Kind = "render"  // Headless Chromium JS-rendered HTML document (`edgefetch_fat`)
+	KindRender  Kind = "render"  // Headless Chromium JS-rendered HTML document (`browser-v1`)
 	KindPDF     Kind = "pdf"     // PDF document (`%PDF-` extracted via poppler `pdftotext` or pure-Go fallback)
 	KindBinary  Kind = "binary"  // Binary resource returned as `bodyBase64` + `sha256`
 )

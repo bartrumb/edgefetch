@@ -19,6 +19,7 @@
 import { isAlias, isMap, isPair, isScalar, isSeq, parseDocument as parseYamlDocument } from 'yaml';
 
 import compiledBundleJson from '../../../internal/extract/manifests/compiled.json';
+import { getRegistrableDomain, hasPrivateSharedHostingSuffix, isPublicOrPrivateSuffix } from '../psl';
 
 import {
   buildDeclarativeCatalogSpec,
@@ -28,6 +29,7 @@ import {
   formatShopifyProductsFeedTwin,
   formatWcStoreApiListTwin,
   formatWcStoreApiProductTwin,
+  VALID_CATALOG_PLATFORMS,
   type DeclarativeCatalogConfig,
 } from './commerce-engine';
 import {
@@ -595,62 +597,28 @@ const VALID_CATEGORIES = new Set<string>([
   'commerce-social',
 ]);
 
-const FORBIDDEN_BROAD_SUFFIXES = new Set([
-  'com', 'org', 'net', 'io', 'gov', 'edu', 'mil', 'int',
-  'uk', 'de', 'fr', 'jp', 'au', 'ca', 'us', 'eu', 'ai', 'co', 'app', 'dev',
-  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'me.uk', 'net.uk', 'plc.uk', 'ltd.uk', 'sch.uk',
-  'com.au', 'org.au', 'gov.au', 'edu.au', 'net.au', 'asn.au', 'id.au',
-  'co.jp', 'or.jp', 'ne.jp', 'ac.jp', 'ad.jp', 'ed.jp', 'go.jp', 'gr.jp', 'lg.jp',
-  'com.br', 'org.br', 'gov.br', 'edu.br', 'net.br', 'mil.br',
-  'co.nz', 'org.nz', 'govt.nz', 'ac.nz', 'net.nz',
-  'co.za', 'org.za', 'gov.za', 'ac.za', 'net.za',
-  'co.in', 'org.in', 'gov.in', 'ac.in', 'net.in', 'res.in', 'edu.in',
-  'com.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn', 'net.cn',
-  'com.sg', 'org.sg', 'gov.sg', 'edu.sg', 'net.sg',
-  'com.hk', 'org.hk', 'gov.hk', 'edu.hk', 'net.hk',
-  'com.tw', 'org.tw', 'gov.tw', 'edu.tw', 'net.tw',
-  'co.kr', 'or.kr', 'go.kr', 'ac.kr', 'ne.kr',
-  'com.mx', 'org.mx', 'gob.mx', 'edu.mx', 'net.mx',
-  'com.ar', 'org.ar', 'gob.ar', 'gov.ar', 'edu.ar',
-  'com.tr', 'org.tr', 'gov.tr', 'edu.tr',
-  'co.il', 'org.il', 'gov.il', 'ac.il',
-  'co.id', 'or.id', 'go.id', 'ac.id',
-  'com.my', 'org.my', 'gov.my', 'edu.my',
-  'com.ph', 'org.ph', 'gov.ph', 'edu.ph',
-  'com.vn', 'org.vn', 'gov.vn', 'edu.vn',
-  'co.th', 'or.th', 'go.th', 'ac.th',
-  // Shared multi-tenant PaaS / static-hosting public suffixes (PSL private section)
-  'github.io', 'gitlab.io', 'bitbucket.io', 'pages.dev', 'workers.dev', 'cloudflarepages.com', 'r2.dev',
-  'vercel.app', 'now.sh', 'netlify.app', 'herokuapp.com', 'herokudns.com', 'fly.dev', 'onrender.com',
-  'railway.app', 'surge.sh', 'web.app', 'firebaseapp.com', 'appspot.com', 'cloudfunctions.net', 'run.app',
-  'amazonaws.com', 'cloudfront.net', 'azurewebsites.net', 'azurestaticapps.net', 'trafficmanager.net',
-  'blogspot.com', 'wordpress.com', 'substack.com', 'ghost.io', 'ngrok.io', 'ngrok-free.app', 'trycloudflare.com',
-]);
-
-const MULTI_PART_PSL_SLD_RE =
-  /^(?:co|com|org|net|gov|edu|ac|mil|or|ne|go|lg|gob|gouv|govt|nic|nom|sch|asn|id|med|res|jus|leg|ind)\.[a-z]{2,3}$/;
-const US_CA_STATE_PSL_RE = /^[a-z]{2}\.(?:us|ca|gov|edu)$/;
-
-function isForbiddenPublicOrHostingSuffix(rest: string): boolean {
-  if (!rest || !rest.includes('.')) return true;
-  if (FORBIDDEN_BROAD_SUFFIXES.has(rest)) return true;
-  if (MULTI_PART_PSL_SLD_RE.test(rest) || US_CA_STATE_PSL_RE.test(rest)) return true;
-  for (const hs of [
-    '.amazonaws.com',
-    '.cloudfront.net',
-    '.azurewebsites.net',
-    '.herokuapp.com',
-    '.pages.dev',
-    '.workers.dev',
-    '.github.io',
-    '.gitlab.io',
-    '.vercel.app',
-    '.netlify.app',
-  ]) {
-    if (rest.endsWith(hs)) return true;
+function claimedRegistrableDomains(domains: readonly string[]): Set<string> {
+  const regs = new Set<string>();
+  for (const raw of domains) {
+    const d = String(raw ?? '').trim().toLowerCase();
+    if (!d) continue;
+    const probe = d.startsWith('*.') && !d.slice(2).includes('*') ? d.slice(2) : d.includes('*') ? '' : d;
+    if (!probe) continue;
+    const reg = getRegistrableDomain(probe);
+    if (reg) regs.add(reg);
   }
-  return false;
+  return regs;
 }
+
+const APPROVED_CROSS_DOMAIN_TWIN_HOSTS: ReadonlyMap<string, ReadonlySet<string>> = Object.freeze(
+  new Map<string, ReadonlySet<string>>([
+    ['doi-crossref', Object.freeze(new Set(['api.crossref.org']))],
+    ['hackernews', Object.freeze(new Set(['hn.algolia.com', 'hacker-news.firebaseio.com']))],
+    ['jazzhr', Object.freeze(new Set(['app.jazz.co']))],
+    ['npm-registry', Object.freeze(new Set(['registry.npmjs.org']))],
+    ['pubmed-pmc', Object.freeze(new Set(['www.ebi.ac.uk']))],
+  ]),
+);
 
 const APPROVED_WILDCARD_DOMAIN_PATTERNS = new Set([
   '*.arcgis.com',
@@ -681,6 +649,55 @@ const RESERVED_CORE_ATS_DOMAINS = new Set([
   '*.myworkdayjobs.com',
   '*.myworkdaysite.com',
 ]);
+
+const CATALOG_CONFIG_KEYS = new Set([
+  'platform',
+  'pauseMs',
+  'pageCap',
+  'firstPageTemplate',
+  'collectionPageTemplate',
+  'perPage',
+  'maxVariantsPerProduct',
+  'maxImagesPerProduct',
+]);
+
+export function matchesApprovedWildcard(rawWildcard: string, rawCandidate: string): boolean {
+  const w = String(rawWildcard ?? '').trim().toLowerCase();
+  const c = String(rawCandidate ?? '').trim().toLowerCase();
+  if (!w || !c || !w.includes('*')) return false;
+  if (w === c) return true;
+  if (w.startsWith('*.') && !w.slice(2).includes('*')) {
+    const suf = w.slice(2);
+    return c !== suf && c.endsWith(`.${suf}`);
+  }
+  if (w.endsWith('.*') && !w.slice(0, -2).includes('*')) {
+    const pre = w.slice(0, -2);
+    return c.startsWith(`${pre}.`) && c.length > pre.length + 1;
+  }
+  const star = w.indexOf('*');
+  if (star > 0 && w.lastIndexOf('*') === star) {
+    const head = w.slice(0, star);
+    const tail = w.slice(star + 1);
+    return c.startsWith(head) && c.endsWith(tail) && c.length > head.length + tail.length;
+  }
+  return false;
+}
+
+const APPROVED_SAP_ATS_EXACT_EXEMPTIONS = Object.freeze(
+  new Set([
+    'enterprise-ats:jobs.smartrecruiters.com',
+    'enterprise-ats:jobs.jobvite.com',
+    'gem-ats:jobs.gem.com',
+  ]),
+);
+
+function isExemptSapAtsExactClaim(wildOwnerId: string, wildPat: string, exactOwnerId: string, exactDom: string): boolean {
+  return (
+    wildOwnerId === 'sap-rmk-jibe' &&
+    wildPat === 'jobs.*.com' &&
+    APPROVED_SAP_ATS_EXACT_EXEMPTIONS.has(`${exactOwnerId}:${exactDom}`)
+  );
+}
 
 const KNOWN_SOCRATA_HOSTS = new Set([
   'data.cityofnewyork.us',
@@ -4084,17 +4101,27 @@ function assertValidDomainPattern(manifestId: string, rawPat: string): void {
   if (pat === '*' || pat === '*.*') {
     throw new Error(`[${manifestId}] overly broad wildcard domain "${rawPat}" is forbidden (M2)`);
   }
-  if (pat.startsWith('*.')) {
-    const rest = pat.slice(2);
-    if (isForbiddenPublicOrHostingSuffix(rest)) {
-      throw new Error(`[${manifestId}] overly broad TLD/eTLD/hosting wildcard "${rawPat}" is forbidden (M2)`);
-    }
+  if (RESERVED_CORE_ATS_DOMAINS.has(pat)) {
+    throw new Error(`[${manifestId}] Domain "${rawPat}" is reserved by a built-in core ATS adapter and cannot be hijacked (M2)`);
   }
-  if (pat.endsWith('.*')) {
-    const pre = pat.slice(0, -2);
-    if (!pre || pre.includes('*') || pre.length < 3) {
-      throw new Error(`[${manifestId}] invalid prefix wildcard "${rawPat}" (M2)`);
+  if (pat.includes('*')) {
+    if (pat.startsWith('*.') && !pat.slice(2).includes('*')) {
+      const rest = pat.slice(2);
+      const isBuiltInShopify = manifestId === 'shopify' && pat === '*.myshopify.com';
+      if (!isBuiltInShopify && (isPublicOrPrivateSuffix(rest) || hasPrivateSharedHostingSuffix(rest))) {
+        throw new Error(`[${manifestId}] overly broad TLD/eTLD/hosting wildcard "${rawPat}" is forbidden (M2)`);
+      }
     }
+    if (pat.endsWith('.*')) {
+      const pre = pat.slice(0, -2);
+      if (!pre || pre.includes('*') || pre.length < 3) {
+        throw new Error(`[${manifestId}] invalid prefix wildcard "${rawPat}" is forbidden (M2)`);
+      }
+    }
+  } else if (isPublicOrPrivateSuffix(pat) || hasPrivateSharedHostingSuffix(pat)) {
+    throw new Error(
+      `[${manifestId}] public or private shared-hosting suffix in domain "${rawPat}" is forbidden (H7)`,
+    );
   }
 }
 
@@ -4153,6 +4180,31 @@ function assertValidTwinFetchUrlM2(manifest: DeclarativeAdapterManifest, fetchUr
     if (!isSafeDeclarativeTwinUrl(sampleCheck)) {
       throw new Error(`[${manifest.id}] route ${routeIdx} fetchUrl failed public HTTPS safety validation: "${fetchUrl}"`);
     }
+    const targetHost = new URL(sampleCheck).hostname.toLowerCase().replace(/\.+$/, '');
+    if (isPublicOrPrivateSuffix(targetHost) || hasPrivateSharedHostingSuffix(targetHost)) {
+      throw new Error(
+        `[${manifest.id}] route ${routeIdx} fetchUrl shared-hosting or suffix target "${targetHost}" is forbidden (H7)`,
+      );
+    }
+  }
+}
+
+function assertAuthorizedCrossDomainTwinHost(manifest: DeclarativeAdapterManifest, fetchUrl: string, routeIdx: number): void {
+  if (fetchUrl === '{requestUrl}' || fetchUrl.startsWith('https://{host}') || fetchUrl.startsWith('{origin}')) {
+    return;
+  }
+  const sampleCheck = expandTemplate(fetchUrl, () => 'sample');
+  const targetHost = new URL(sampleCheck).hostname.toLowerCase().replace(/\.+$/, '');
+  const targetReg = getRegistrableDomain(targetHost);
+  const manifestRegs = claimedRegistrableDomains(manifest.domains ?? []);
+  const approvedCross = APPROVED_CROSS_DOMAIN_TWIN_HOSTS.get(manifest.id);
+  if (
+    (!targetReg || !manifestRegs.has(targetReg)) &&
+    !(approvedCross && approvedCross.has(targetHost))
+  ) {
+    throw new Error(
+      `[${manifest.id}] route ${routeIdx} cross-domain twin host "${targetHost}" does not match manifest registrable domains and is not allowlisted (H7)`,
+    );
   }
 }
 
@@ -4229,9 +4281,34 @@ export function validateDeclarativeManifestObject(m: DeclarativeAdapterManifest)
     }
   });
 
+  for (const rawDom of m.domains) {
+    const normDom = String(rawDom).trim().toLowerCase();
+    if (normDom.includes('*') && !APPROVED_WILDCARD_DOMAIN_PATTERNS.has(normDom)) {
+      throw new Error(
+        `[${m.id}] Unapproved wildcard domain pattern "${rawDom}" is forbidden — must be allowlisted in APPROVED_WILDCARD_DOMAIN_PATTERNS (M2)`,
+      );
+    }
+  }
+
   for (const hr of m.htmlRoutes ?? []) {
     if (hr.id !== undefined && !VALID_ID_RE.test(hr.id)) {
       throw new Error(`[${m.id}] invalid htmlRoute id "${String(hr.id)}"`);
+    }
+  }
+
+  if (m.catalog !== undefined) {
+    if (!m.catalog || typeof m.catalog !== 'object' || Array.isArray(m.catalog)) {
+      throw new Error(`[${m.id}] catalog must be a valid object`);
+    }
+    for (const ck of Object.keys(m.catalog)) {
+      if (!isAsciiPrintableKey(ck) || !CATALOG_CONFIG_KEYS.has(ck)) {
+        throw new Error(`[${m.id}] unknown catalog key "${ck}"`);
+      }
+    }
+    if (typeof m.catalog.platform !== 'string' || !VALID_CATALOG_PLATFORMS.has(m.catalog.platform)) {
+      throw new Error(
+        `[${m.id}] unsupported catalog.platform "${String((m.catalog as { platform?: unknown }).platform)}" (expected "shopify" or "woocommerce")`,
+      );
     }
   }
 
@@ -4320,11 +4397,14 @@ export function compileDeclarativeAdapter(manifestOrYaml: DeclarativeAdapterMani
 export function compileValidatedManifestSet(manifests: readonly DeclarativeAdapterManifest[]): SiteAdapter[] {
   const seenManifestIds = new Set<string>();
   const twinOwnerById = new Map<string, string>();
-  const domainOwnerByPattern = new Map<string, string>();
+  const exactOwners = new Map<string, string>();
+  const wildcardOwners = new Map<string, string>();
+  const wildcardClaims: Array<{ id: string; pattern: string }> = [];
   const catalogOwnerByPlatform = new Map<string, string>();
   const compiled: SiteAdapter[] = [];
 
-  for (const m of manifests) {
+  for (const rawManifest of manifests) {
+    const m = validateDeclarativeManifestObject(rawManifest);
     if (seenManifestIds.has(m.id)) {
       throw new Error(`Duplicate declarative adapter manifest id "${m.id}" (M2)`);
     }
@@ -4336,32 +4416,63 @@ export function compileValidatedManifestSet(manifests: readonly DeclarativeAdapt
         : m.match && m.twin && m.extract
           ? [{ match: m.match, twin: m.twin, extract: m.extract }]
           : [];
-    for (const r of routes) {
+    routes.forEach((r, idx) => {
       const tid = r.twin.id || m.id;
       const prevOwner = twinOwnerById.get(tid);
       if (prevOwner && prevOwner !== m.id) {
         throw new Error(`Duplicate twin id "${tid}" claimed by both "${prevOwner}" and "${m.id}" (M2)`);
       }
       twinOwnerById.set(tid, m.id);
-    }
+      assertAuthorizedCrossDomainTwinHost(m, r.twin.fetchUrl, idx);
+    });
 
     for (const rawDomain of m.domains ?? []) {
       const normDomain = String(rawDomain).trim().toLowerCase();
-      if (normDomain.includes('*') && !APPROVED_WILDCARD_DOMAIN_PATTERNS.has(normDomain)) {
-        throw new Error(`[${m.id}] Unapproved wildcard domain pattern "${rawDomain}" — must be allowlisted in APPROVED_WILDCARD_DOMAIN_PATTERNS (M2)`);
+      if (normDomain.includes('*')) {
+        const prevWildOwner = wildcardOwners.get(normDomain);
+        if (prevWildOwner && prevWildOwner !== m.id) {
+          throw new Error(`[${m.id}] Duplicate domain "${normDomain}" already claimed by "${prevWildOwner}" (M2)`);
+        }
+        for (const [prevExact, prevOwner] of exactOwners.entries()) {
+          if (prevOwner === m.id) continue;
+          if (matchesApprovedWildcard(normDomain, prevExact) && !isExemptSapAtsExactClaim(m.id, normDomain, prevOwner, prevExact)) {
+            throw new Error(
+              `[${m.id}] Overlapping domain "${normDomain}" collides with "${prevExact}" already claimed by "${prevOwner}" (H7)`,
+            );
+          }
+        }
+        for (const prevWild of wildcardClaims) {
+          if (prevWild.id === m.id) continue;
+          if (matchesApprovedWildcard(normDomain, prevWild.pattern) || matchesApprovedWildcard(prevWild.pattern, normDomain)) {
+            throw new Error(
+              `[${m.id}] Overlapping domain "${normDomain}" collides with "${prevWild.pattern}" already claimed by "${prevWild.id}" (H7)`,
+            );
+          }
+        }
+        wildcardOwners.set(normDomain, m.id);
+        wildcardClaims.push({ id: m.id, pattern: normDomain });
+      } else {
+        const prevOwner = exactOwners.get(normDomain);
+        if (prevOwner && prevOwner !== m.id) {
+          throw new Error(`[${m.id}] Duplicate domain "${normDomain}" already claimed by "${prevOwner}" (M2)`);
+        }
+        for (const prevWild of wildcardClaims) {
+          if (prevWild.id === m.id) continue;
+          if (matchesApprovedWildcard(prevWild.pattern, normDomain) && !isExemptSapAtsExactClaim(prevWild.id, prevWild.pattern, m.id, normDomain)) {
+            throw new Error(
+              `[${m.id}] Overlapping domain "${normDomain}" collides with "${prevWild.pattern}" already claimed by "${prevWild.id}" (H7)`,
+            );
+          }
+        }
+        exactOwners.set(normDomain, m.id);
       }
-      if (RESERVED_CORE_ATS_DOMAINS.has(normDomain)) {
-        throw new Error(`[${m.id}] Domain "${rawDomain}" is reserved by a built-in core ATS adapter and cannot be hijacked (M2)`);
-      }
-      const prevDomOwner = domainOwnerByPattern.get(normDomain);
-      if (prevDomOwner && prevDomOwner !== m.id) {
-        throw new Error(`[${m.id}] Duplicate domain "${normDomain}" already claimed by "${prevDomOwner}" (M2)`);
-      }
-      domainOwnerByPattern.set(normDomain, m.id);
     }
 
-    if (m.catalog?.platform) {
-      const normPlat = String(m.catalog.platform).trim().toLowerCase();
+    if (m.catalog !== undefined) {
+      const normPlat = String(m.catalog.platform ?? '').trim().toLowerCase();
+      if (!VALID_CATALOG_PLATFORMS.has(normPlat)) {
+        throw new Error(`[${m.id}] Unsupported catalog platform "${String(m.catalog.platform)}" (H7)`);
+      }
       const prevCatOwner = catalogOwnerByPlatform.get(normPlat);
       if (prevCatOwner && prevCatOwner !== m.id) {
         throw new Error(`[${m.id}] Duplicate catalog platform "${normPlat}" already claimed by "${prevCatOwner}" (M2)`);

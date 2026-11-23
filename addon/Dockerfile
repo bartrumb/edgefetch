@@ -1,9 +1,9 @@
-# Multi-arch (`linux/amd64` + `linux/arm64`) Home Assistant OS "Fat" Add-on Dockerfile:
+# Multi-arch (`linux/amd64` + `linux/arm64`) Home Assistant OS Add-on Dockerfile:
 # Static Go binary + Headless Chromium (`browser-v1`) + Poppler `pdftotext` (`pdf-v1`) on minimal Alpine 3.24.
 # Every Chromium subresource socket is forced through EdgeFetch's in-process loopback `SSRFProxy` (`MAP * ~NOTFOUND`).
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 ARG TARGETARCH
-ARG BUILD_VERSION=2.7.1
+ARG BUILD_VERSION=2.7.2
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify

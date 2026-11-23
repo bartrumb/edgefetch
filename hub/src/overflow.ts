@@ -127,8 +127,21 @@ export function normalizeRobotsURI(raw: string): string {
   return out;
 }
 
+function asciiLowerRobotsString(raw: string): string {
+  let hasUpper = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw.charCodeAt(i);
+    if (c >= 0x41 && c <= 0x5a) {
+      hasUpper = true;
+      break;
+    }
+  }
+  if (!hasUpper) return raw;
+  return raw.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) | 32));
+}
+
 function canonicalProductToken(raw: string): string {
-  let tok = trimAsciiSpaceTab(raw).toLowerCase();
+  let tok = asciiLowerRobotsString(trimAsciiSpaceTab(raw));
   if (!tok) return '';
   if (tok === '*') return '*';
   const slash = tok.indexOf('/');
@@ -142,34 +155,64 @@ function canonicalProductToken(raw: string): string {
   return tok;
 }
 
-/** Iterative O(P*T) wildcard matcher (`*` and trailing `$`) with zero ReDoS surface. */
-export function matchRobotsPattern(rawPattern: string, target: string): boolean {
+const MAX_ROBOTS_MATCH_SCAN_BYTES = 4 * 1024 * 1024; // 4 MiB complexity ceiling matching `politeness.go`
+
+function matchRobotsPatternWithWork(rawPattern: string, target: string): { matched: boolean; work: number } {
   const anchoredEnd = rawPattern.endsWith('$');
-  const pattern = anchoredEnd ? rawPattern.slice(0, -1) : rawPattern;
+  let pattern = anchoredEnd ? rawPattern.slice(0, -1) : rawPattern;
+  if (pattern.includes('**')) {
+    pattern = pattern.replace(/\*{2,}/g, '*');
+  }
   if (!pattern.includes('*')) {
-    return anchoredEnd ? target === pattern : target.startsWith(pattern);
+    return {
+      matched: anchoredEnd ? target === pattern : target.startsWith(pattern),
+      work: pattern.length,
+    };
   }
   const trailingStar = pattern.endsWith('*');
   const parts = pattern.split('*');
-  let pos = 0;
+  let minLen = 0;
   let lastNonEmpty = '';
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i]!;
-    if (!part) continue;
-    lastNonEmpty = part;
-    if (i === 0) {
-      if (!target.startsWith(part)) return false;
-      pos = part.length;
-    } else {
-      const idx = target.indexOf(part, pos);
-      if (idx < 0) return false;
-      pos = idx + part.length;
+  for (const p of parts) {
+    if (p) {
+      minLen += p.length;
+      lastNonEmpty = p;
     }
   }
-  if (anchoredEnd && !trailingStar && lastNonEmpty) {
-    return target.endsWith(lastNonEmpty);
+  if (target.length < minLen) {
+    return { matched: false, work: 0 };
   }
-  return true;
+  const firstLit = parts[0]!;
+  if (firstLit && !target.startsWith(firstLit)) {
+    return { matched: false, work: firstLit.length };
+  }
+  if (anchoredEnd && !trailingStar && lastNonEmpty && !target.endsWith(lastNonEmpty)) {
+    return { matched: false, work: lastNonEmpty.length };
+  }
+  let pos = firstLit.length;
+  let work = pos;
+  let remLit = minLen - pos;
+  for (let i = 1; i < parts.length; i++) {
+    if (target.length - pos < remLit) {
+      return { matched: false, work };
+    }
+    const part = parts[i]!;
+    if (!part) continue;
+    const idx = target.indexOf(part, pos);
+    if (idx < 0) {
+      return { matched: false, work: work + (target.length - pos) };
+    }
+    const step = idx - pos + part.length;
+    pos = idx + part.length;
+    work += step;
+    remLit -= part.length;
+  }
+  return { matched: true, work };
+}
+
+/** Iterative O(P*T) wildcard matcher (`*` and trailing `$`) with zero ReDoS surface. */
+export function matchRobotsPattern(rawPattern: string, target: string): boolean {
+  return matchRobotsPatternWithWork(rawPattern, target).matched;
 }
 
 function trimAsciiSpaceTab(s: string): string {
@@ -181,13 +224,13 @@ function trimAsciiSpaceTab(s: string): string {
 }
 
 function applySingleContentSignalPair(rawKey: string, rawValue: string, target: ContentSignals): boolean {
-  const k = trimAsciiSpaceTab(rawKey).toLowerCase();
+  const k = asciiLowerRobotsString(trimAsciiSpaceTab(rawKey));
   if (k !== 'search' && k !== 'ai-input' && k !== 'ai-train') return false;
   let v = trimAsciiSpaceTab(rawValue);
   if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
     v = trimAsciiSpaceTab(v.slice(1, -1));
   }
-  v = v.toLowerCase();
+  v = asciiLowerRobotsString(v);
   if (v !== 'yes' && v !== 'no') return false;
   const allowed = v === 'yes';
   if (k === 'search') target.search = allowed;
@@ -199,6 +242,7 @@ function applySingleContentSignalPair(rawKey: string, rawValue: string, target: 
 function parseContentSignalLine(rawVal: string, target: ContentSignals): void {
   const bounded = rawVal.length > 524_288 ? rawVal.slice(0, 524_288) : rawVal;
   for (const seg of bounded.split(/[,;]/)) {
+    if (!seg || seg.includes('\0')) continue;
     const eq = seg.indexOf('=');
     if (eq <= 0) continue;
     applySingleContentSignalPair(seg.slice(0, eq), seg.slice(eq + 1), target);
@@ -227,39 +271,30 @@ export function parseRobotsCacheControlTtlMs(cacheControlHeader: string | null |
   return Math.min(ROBOTS_CACHE_MAX_MS, Math.max(ROBOTS_CACHE_MIN_MS, defaultMs));
 }
 
-function trimRobotsDirectiveLine(s: string): string {
-  // Trim ASCII space/tab plus leading/trailing BOM & zero-width format characters (`\uFEFF`, `\u200B`, `\u200C`, `\u200D`, `\u2060`)
+function trimRobotsWSAndZeroWidth(s: string): string {
   return s.replace(/^[ \t\uFEFF\u200B\u200C\u200D\u2060]+|[ \t\uFEFF\u200B\u200C\u200D\u2060]+$/g, '');
 }
 
-function lowerRobotsFieldName(rawField: string): string {
-  // Match Go `strings.ToLower` on ASCII + `\u0130` (`İ` -> `'i'`, whereas JS `'İ'.toLowerCase()` expands to `'i\u0307'`)
-  return rawField
-    .replace(/\u0130/g, 'i')
-    .replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) | 32));
+function trimLeftRobotsWSAndZeroWidthRightAsciiWS(s: string): string {
+  const leftTrimmed = s.replace(/^[ \t\uFEFF\u200B\u200C\u200D\u2060]+/, '');
+  return trimAsciiSpaceTab(leftTrimmed);
 }
 
-function canonicalizeRobotsTarget(rawTarget: string): string {
-  let s = rawTarget || '/';
-  const hashIdx = s.indexOf('#');
-  if (hashIdx >= 0) s = s.slice(0, hashIdx);
-  if (!s) return '/';
-  const norm = normalizeRobotsURI(s);
+function canonicalizeNormalizedRobotsTarget(norm: string): string {
   const qIdx = norm.indexOf('?');
   const pathPart = qIdx >= 0 ? norm.slice(0, qIdx) : norm;
   const queryPart = qIdx >= 0 ? norm.slice(qIdx) : '';
-  // Fast path when canonical single-slash path has no `//`, `/./`, `/../`, `;`, or missing leading `/`
   if (
     pathPart.startsWith('/') &&
     !pathPart.includes('//') &&
     !pathPart.includes('/.') &&
     !pathPart.includes(';')
   ) {
-    return `${pathPart}${queryPart}`;
+    return norm;
   }
   const trailingSlash =
     pathPart.endsWith('/') || pathPart.endsWith('/.') || pathPart.endsWith('/..');
-  const rawSegs = pathPart.replace(/^\/+/, '').split('/');
+  const rawSegs = pathPart.split('/');
   const segs: string[] = [];
   for (let seg of rawSegs) {
     const semi = seg.indexOf(';');
@@ -275,10 +310,48 @@ function canonicalizeRobotsTarget(rawTarget: string): string {
   return `${builtPath}${queryPart}`;
 }
 
+function truncateRobotsBodyAtMaxBytes(rawBody: string): string {
+  // Fast skip when UTF-16 code unit count guarantees `<= 1 MiB` UTF-8 (`max 3 bytes/unit` for non-surrogate, `4 bytes/pair` -> `2 bytes/unit`).
+  if (rawBody.length <= 340_000) {
+    return rawBody;
+  }
+  const utf8 = new TextEncoder().encode(rawBody);
+  if (utf8.byteLength <= ROBOTS_MAX_BYTES) {
+    return rawBody;
+  }
+  const sliced = new TextDecoder('utf-8', { fatal: false }).decode(utf8.subarray(0, ROBOTS_MAX_BYTES));
+  let lastNl = -1;
+  for (let i = sliced.length - 1; i >= 0; i--) {
+    const c = sliced.charCodeAt(i);
+    if (c === 10 || c === 13 || c === 0x0085 || c === 0x2028 || c === 0x2029) {
+      lastNl = i;
+      break;
+    }
+  }
+  return lastNl >= 0 ? sliced.slice(0, lastNl) : '';
+}
+
+function deduplicateParsedRules(rules: Array<{ pattern: string; allow: boolean }>): Array<{ pattern: string; allow: boolean }> {
+  if (rules.length <= 1) return rules;
+  const seen = new Set<string>();
+  const out: Array<{ pattern: string; allow: boolean }> = [];
+  for (const r of rules) {
+    if (!r.pattern) continue;
+    const key = `${r.allow ? '1' : '0'}:${r.pattern}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
+const STRICT_CRAWL_DELAY_DECIMAL_RE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2.6.0'): ParsedRobots {
-  // Strip repeated UTF-8 BOMs (decoded U+FEFF or byte-decoded \xEF\xBB\xBF) and normalize all Unicode/ASCII line breaks.
-  const body = rawBody
-    .replace(/^(?:\uFEFF|\xEF\xBB\xBF)+/, '')
+  const cappedBody = truncateRobotsBodyAtMaxBytes(rawBody);
+  // Match Go `politeness.ParseRobotsTxt`: strip leading zero-width/BOM runes (`\uFEFF`, `\u200B`..`\u200D`, `\u2060`) and normalize line breaks.
+  const body = cappedBody
+    .replace(/^[\uFEFF\u200B\u200C\u200D\u2060]+/, '')
     .replace(/\r\n|\r|\u0085|\u2028|\u2029/g, '\n');
   const uaToken = canonicalProductToken(userAgent);
   const preGroupSignals: ContentSignals = {};
@@ -300,8 +373,8 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
   for (const rawLine of body.split('\n')) {
     const hashIdx = rawLine.indexOf('#');
     const noComment = hashIdx >= 0 ? rawLine.slice(0, hashIdx) : rawLine;
-    // Strip leading/trailing ASCII space/tab + BOM/zero-width chars (`\uFEFF`, `\u200B`..`\u200D`, `\u2060`) on directive lines.
-    const line = trimRobotsDirectiveLine(noComment);
+    // Match Go `politeness.ParseRobotsTxt`: left-trim zero-width + ASCII space/tab; right-trim ASCII space/tab only!
+    const line = trimLeftRobotsWSAndZeroWidthRightAsciiWS(noComment);
     if (!line) {
       // RFC 9309 §2.2.1: blank lines inside a group do NOT close the current User-agent group.
       continue;
@@ -310,12 +383,10 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
     if (colon <= 0) continue;
     const rawField = line.slice(0, colon);
     if (rawField.includes('\0')) continue;
-    const field = lowerRobotsFieldName(trimRobotsDirectiveLine(rawField));
-    let rawValSlice = line.slice(colon + 1);
-    // Match Go `politeness.ParseRobotsTxt`: truncate directive value at first NUL byte (`ai-input=no\0` -> `ai-input=no`)
-    const nulIdx = rawValSlice.indexOf('\0');
-    if (nulIdx >= 0) rawValSlice = rawValSlice.slice(0, nulIdx);
-    const val = trimRobotsDirectiveLine(rawValSlice);
+    const field = asciiLowerRobotsString(trimRobotsWSAndZeroWidth(rawField));
+    const rawVal = trimAsciiSpaceTab(line.slice(colon + 1));
+    const nulIdx = rawVal.indexOf('\0');
+    const val = nulIdx >= 0 ? trimAsciiSpaceTab(rawVal.slice(0, nulIdx)) : rawVal;
     if (field === 'user-agent') {
       seenAnyUserAgent = true;
       if (seenDirective && cur.agents.length > 0) {
@@ -325,7 +396,6 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
       }
       const parsedUa = canonicalProductToken(val);
       if (!parsedUa) {
-        // Match Go `politeness.ParseRobotsTxt`: empty `User-agent:` closes a preceding group that saw directives, without adding an agent.
         continue;
       }
       cur.agents.push(parsedUa);
@@ -347,18 +417,18 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
       }
     } else if (field === 'crawl-delay' && cur.agents.length > 0) {
       seenDirective = true;
-      if (/^[+-]?(?:\d+(?:_\d+)*(?:\.\d+(?:_\d+)*|\.)?|\.\d+(?:_\d+)*)(?:e[+-]?\d+(?:_\d+)*)?$/i.test(val)) {
-        const secs = Number(val.replace(/_/g, ''));
+      if (STRICT_CRAWL_DELAY_DECIMAL_RE.test(val)) {
+        const secs = Number(val);
         if (Number.isFinite(secs) && secs > 0) {
-          cur.crawlDelayMs = Math.min(30_000, Math.floor((secs * 1e9) / 1e6));
+          cur.crawlDelayMs = secs >= 30 ? 30_000 : Math.floor((secs * 1e9) / 1e6);
         }
       }
     } else if (field === 'content-signal') {
       if (cur.agents.length > 0) {
         seenDirective = true;
-        if (val) parseContentSignalLine(val, cur.signals);
-      } else if (!seenAnyUserAgent && val) {
-        parseContentSignalLine(val, preGroupSignals);
+        if (rawVal) parseContentSignalLine(rawVal, cur.signals);
+      } else if (!seenAnyUserAgent && rawVal) {
+        parseContentSignalLine(rawVal, preGroupSignals);
       }
     }
   }
@@ -405,32 +475,53 @@ export function parseOverflowRobotsTxt(rawBody: string, userAgent = 'EdgeFetch/2
   const hasAnySignal =
     winningSignals.search !== undefined || winningSignals.aiInput !== undefined || winningSignals.aiTrain !== undefined;
   const disallowAiInput = winningSignals.aiInput === false;
+  const chosenRules = deduplicateParsedRules(hasSpecific ? specific : wildcard);
 
   return {
     unreachable: false,
     ...(disallowAiInput ? { reason: 'content-signal: ai-input=no in robots.txt', disallowAiInput: true } : {}),
     ...(hasAnySignal ? { contentSignals: winningSignals } : {}),
     crawlDelayMs: hasSpecific ? specificDelay : wildcardDelay,
-    rules: hasSpecific ? specific : wildcard,
+    rules: chosenRules,
   };
 }
 
-export function isRobotsAllowed(entry: ParsedRobots, rawPathAndQuery: string): boolean {
-  if (entry.unreachable || entry.disallowAiInput) return false;
-  if (entry.rules.length === 0) return true;
-  const target = canonicalizeRobotsTarget(rawPathAndQuery || '/');
-  let bestLen = -1;
-  let bestAllow = true;
-  for (const r of entry.rules) {
-    if (!r.pattern) continue;
-    if (matchRobotsPattern(r.pattern, target)) {
-      if (r.pattern.length > bestLen || (r.pattern.length === bestLen && r.allow)) {
-        bestLen = r.pattern.length;
-        bestAllow = r.allow;
-      }
+function isSingleNormalizedTargetAllowed(rules: Array<{ pattern: string; allow: boolean }>, target: string): boolean {
+  const ordered = [...rules]
+    .filter((r) => Boolean(r.pattern))
+    .sort((a, b) => {
+      if (a.pattern.length !== b.pattern.length) return b.pattern.length - a.pattern.length;
+      if (a.allow !== b.allow) return a.allow ? -1 : 1;
+      return 0;
+    });
+  let scanned = 0;
+  for (const r of ordered) {
+    const { matched, work } = matchRobotsPatternWithWork(r.pattern, target);
+    scanned += work;
+    if (matched) return r.allow;
+    if (scanned > MAX_ROBOTS_MATCH_SCAN_BYTES) {
+      return false;
     }
   }
-  return bestAllow;
+  return true;
+}
+
+export function isRobotsAllowed(entry: ParsedRobots, rawPathAndQuery: string): boolean {
+  if (entry.unreachable || entry.dnsNotFound || entry.disallowAiInput) return false;
+  if (entry.rules.length === 0) return true;
+  let pathOnly = rawPathAndQuery || '/';
+  const hashIdx = pathOnly.indexOf('#');
+  if (hashIdx >= 0) pathOnly = pathOnly.slice(0, hashIdx);
+  if (!pathOnly) pathOnly = '/';
+  const normRaw = normalizeRobotsURI(pathOnly);
+  if (!isSingleNormalizedTargetAllowed(entry.rules, normRaw)) {
+    return false;
+  }
+  const normCanon = canonicalizeNormalizedRobotsTarget(normRaw);
+  if (normCanon !== normRaw && !isSingleNormalizedTargetAllowed(entry.rules, normCanon)) {
+    return false;
+  }
+  return true;
 }
 
 export function parseHostAllowlist(raw?: string): string[] {
@@ -800,10 +891,12 @@ export async function fetchOverflowRobots(
     }, hardTimeoutMs);
   });
 
+  let currentRobotsHop = 0;
   const runRobotsFetch = async (): Promise<ParsedRobots> => {
     let curUrl = `${origin}/robots.txt`;
     let retriedTransient5xx = false;
     for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+      currentRobotsHop = hop;
       const parsedCur = new URL(curUrl);
       if (isDisallowedOverflowUrl(parsedCur, canonicalSelf)) {
         return {
@@ -930,9 +1023,12 @@ export async function fetchOverflowRobots(
     return await Promise.race([runRobotsFetch(), deadlinePromise]);
   } catch (e) {
     const rawMsg = scrubResolverIpFromError(e instanceof Error ? e.message : String(e));
-    if (isDnsNotFoundError(undefined, rawMsg)) {
+    // Only report origin `dnsNotFound` when hop 0 (`${origin}/robots.txt`) fails DNS! When `/robots.txt` redirects (`301`/`302`)
+    // to a broken/NXDOMAIN third-party host (`currentRobotsHop > 0`), RFC 9309 §2.3.1.4 requires `unreachable: true` (disallow all)!
+    // Even on hop 0 `dnsNotFound`, keep `unreachable: true` so `isRobotsAllowed(parsed)` (e.g. external SPA fallback) NEVER allows!
+    if (currentRobotsHop === 0 && isDnsNotFoundError(undefined, rawMsg)) {
       return {
-        unreachable: false,
+        unreachable: true,
         dnsNotFound: true,
         reason: DNS_NOT_FOUND_MESSAGE,
         crawlDelayMs: 0,

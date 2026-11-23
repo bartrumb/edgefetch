@@ -11,10 +11,12 @@
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isAlias, isMap, isPair, isScalar, isSeq, parseDocument } from 'yaml';
 
-const hubRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const hubRoot = process.env.EDGEFETCH_HUB_ROOT
+  ? resolve(process.env.EDGEFETCH_HUB_ROOT)
+  : resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repoRoot = resolve(hubRoot, '..');
 const manifestsDir = join(repoRoot, 'internal', 'extract', 'manifests');
 const outPath = join(manifestsDir, 'compiled.json');
@@ -30,55 +32,115 @@ const VALID_CATEGORIES = new Set([
   'research-health',
   'commerce-social',
 ]);
+export const VALID_CATALOG_PLATFORMS = new Set(['shopify', 'woocommerce']);
 
-const FORBIDDEN_BROAD_SUFFIXES = new Set([
-  'com', 'org', 'net', 'io', 'gov', 'edu', 'mil', 'int',
-  'uk', 'de', 'fr', 'jp', 'au', 'ca', 'us', 'eu', 'ai', 'co', 'app', 'dev',
-  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'me.uk', 'net.uk', 'plc.uk', 'ltd.uk', 'sch.uk',
-  'com.au', 'org.au', 'gov.au', 'edu.au', 'net.au', 'asn.au', 'id.au',
-  'co.jp', 'or.jp', 'ne.jp', 'ac.jp', 'ad.jp', 'ed.jp', 'go.jp', 'gr.jp', 'lg.jp',
-  'com.br', 'org.br', 'gov.br', 'edu.br', 'net.br', 'mil.br',
-  'co.nz', 'org.nz', 'govt.nz', 'ac.nz', 'net.nz',
-  'co.za', 'org.za', 'gov.za', 'ac.za', 'net.za',
-  'co.in', 'org.in', 'gov.in', 'ac.in', 'net.in', 'res.in', 'edu.in',
-  'com.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn', 'net.cn',
-  'com.sg', 'org.sg', 'gov.sg', 'edu.sg', 'net.sg',
-  'com.hk', 'org.hk', 'gov.hk', 'edu.hk', 'net.hk',
-  'com.tw', 'org.tw', 'gov.tw', 'edu.tw', 'net.tw',
-  'co.kr', 'or.kr', 'go.kr', 'ac.kr', 'ne.kr',
-  'com.mx', 'org.mx', 'gob.mx', 'edu.mx', 'net.mx',
-  'com.ar', 'org.ar', 'gob.ar', 'gov.ar', 'edu.ar',
-  'com.tr', 'org.tr', 'gov.tr', 'edu.tr',
-  'co.il', 'org.il', 'gov.il', 'ac.il',
-  'co.id', 'or.id', 'go.id', 'ac.id',
-  'com.my', 'org.my', 'gov.my', 'edu.my',
-  'com.ph', 'org.ph', 'gov.ph', 'edu.ph',
-  'com.vn', 'org.vn', 'gov.vn', 'edu.vn',
-  'co.th', 'or.th', 'go.th', 'ac.th',
-  // Shared multi-tenant PaaS / static-hosting public suffixes (PSL private section)
-  'github.io', 'gitlab.io', 'bitbucket.io', 'pages.dev', 'workers.dev', 'cloudflarepages.com', 'r2.dev',
-  'vercel.app', 'now.sh', 'netlify.app', 'herokuapp.com', 'herokudns.com', 'fly.dev', 'onrender.com',
-  'railway.app', 'surge.sh', 'web.app', 'firebaseapp.com', 'appspot.com', 'cloudfunctions.net', 'run.app',
-  'amazonaws.com', 'cloudfront.net', 'azurewebsites.net', 'azurestaticapps.net', 'trafficmanager.net',
-  'blogspot.com', 'wordpress.com', 'substack.com', 'ghost.io', 'ngrok.io', 'ngrok-free.app', 'trycloudflare.com',
-]);
-
-const MULTI_PART_PSL_SLD_RE =
-  /^(?:co|com|org|net|gov|edu|ac|mil|or|ne|go|lg|gob|gouv|govt|nic|nom|sch|asn|id|med|res|jus|leg|ind)\.[a-z]{2,3}$/;
-const US_CA_STATE_PSL_RE = /^[a-z]{2}\.(?:us|ca|gov|edu)$/;
-
-function isForbiddenPublicOrHostingSuffix(rest) {
-  if (!rest || !rest.includes('.')) return true;
-  if (FORBIDDEN_BROAD_SUFFIXES.has(rest)) return true;
-  if (MULTI_PART_PSL_SLD_RE.test(rest) || US_CA_STATE_PSL_RE.test(rest)) return true;
-  for (const hs of [
-    '.amazonaws.com', '.cloudfront.net', '.azurewebsites.net', '.herokuapp.com',
-    '.pages.dev', '.workers.dev', '.github.io', '.gitlab.io', '.vercel.app', '.netlify.app',
-  ]) {
-    if (rest.endsWith(hs)) return true;
+const pslDatPath = join(manifestsDir, 'public_suffix_list.dat');
+const pslExact = new Map();
+const pslWildcards = new Map();
+const pslExceptions = new Map();
+{
+  let inPrivate = false;
+  for (const rawLine of readFileSync(pslDatPath, 'utf8').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('//')) {
+      if (line.includes('===BEGIN PRIVATE DOMAINS===')) inPrivate = true;
+      else if (line.includes('===END PRIVATE DOMAINS===')) inPrivate = false;
+      continue;
+    }
+    if (line.startsWith('!')) pslExceptions.set(line.slice(1), inPrivate);
+    else if (line.startsWith('*.')) pslWildcards.set(line.slice(2), inPrivate);
+    else pslExact.set(line, inPrivate);
   }
-  return false;
 }
+
+function normalizeHostLabels(rawHost) {
+  let clean = String(rawHost ?? '').trim().toLowerCase();
+  if (!clean || clean.startsWith('.')) return null;
+  clean = clean.replace(/\.+$/, '');
+  if (!clean || /[\s/*\\:?#@[\]]/.test(clean)) return null;
+  if (/[^\x20-\x7e]/.test(clean)) {
+    try {
+      clean = new URL(`http://${clean}`).hostname.toLowerCase();
+    } catch {
+      return null;
+    }
+  }
+  const labels = clean.split('.');
+  for (const l of labels) {
+    if (!l || l.length > 63 || l.startsWith('-') || l.endsWith('-') || !/^[a-z0-9-]+$/.test(l)) {
+      return null;
+    }
+  }
+  const tld = labels[labels.length - 1];
+  if (tld.charCodeAt(0) >= 48 && tld.charCodeAt(0) <= 57) return null;
+  return labels;
+}
+
+function matchPsl(labels) {
+  let suffixLen = 1;
+  let isPrivate = false;
+  for (let i = 0; i < labels.length; i++) {
+    const cand = labels.slice(i).join('.');
+    const rem = labels.length - i;
+    if (pslExceptions.has(cand)) return { suffixLen: rem - 1, isPrivate: pslExceptions.get(cand) };
+    if (pslExact.has(cand) && rem > suffixLen) {
+      suffixLen = rem;
+      isPrivate = pslExact.get(cand);
+    }
+    if (i > 0 && pslWildcards.has(cand) && rem + 1 > suffixLen) {
+      suffixLen = rem + 1;
+      isPrivate = pslWildcards.get(cand);
+    }
+  }
+  return { suffixLen, isPrivate };
+}
+
+export function getRegistrableDomain(host) {
+  const labels = normalizeHostLabels(host);
+  if (!labels) return null;
+  const { suffixLen } = matchPsl(labels);
+  if (labels.length <= suffixLen) return null;
+  return labels.slice(labels.length - suffixLen - 1).join('.');
+}
+
+export function isPublicOrPrivateSuffix(host) {
+  return getRegistrableDomain(host) === null;
+}
+
+export function hasPrivateSharedHostingSuffix(host) {
+  const labels = normalizeHostLabels(host);
+  if (!labels) return false;
+  const { isPrivate } = matchPsl(labels);
+  return isPrivate || pslWildcards.get(labels.join('.')) === true;
+}
+
+function claimedRegistrableDomains(domains) {
+  const regs = new Set();
+  for (const raw of domains ?? []) {
+    const d = String(raw ?? '').trim().toLowerCase();
+    if (!d) continue;
+    const probe = d.startsWith('*.') && !d.slice(2).includes('*') ? d.slice(2) : d.includes('*') ? '' : d;
+    if (!probe) continue;
+    const reg = getRegistrableDomain(probe);
+    if (reg) regs.add(reg);
+  }
+  return regs;
+}
+
+/**
+ * Frozen 5-entry built-in public-archive map for existing cross-domain public APIs.
+ * No new or contributor manifest can point `twin.fetchUrl` to another registrable domain.
+ */
+const APPROVED_CROSS_DOMAIN_TWIN_HOSTS = Object.freeze(
+  new Map([
+    ['doi-crossref', Object.freeze(new Set(['api.crossref.org']))],
+    ['hackernews', Object.freeze(new Set(['hn.algolia.com', 'hacker-news.firebaseio.com']))],
+    ['jazzhr', Object.freeze(new Set(['app.jazz.co']))],
+    ['npm-registry', Object.freeze(new Set(['registry.npmjs.org']))],
+    ['pubmed-pmc', Object.freeze(new Set(['www.ebi.ac.uk']))],
+  ]),
+);
 
 /**
  * Explicit allowlist of vetted multi-tenant platform wildcard patterns permitted in compiled manifests.
@@ -113,6 +175,43 @@ const RESERVED_CORE_ATS_DOMAINS = new Set([
   '*.myworkdayjobs.com',
   '*.myworkdaysite.com',
 ]);
+
+/**
+ * Simple, auditable wildcard matcher for the 3 allowlisted shapes (`*.suffix`, `gitlab.*`, `careers.*.com` / `jobs.*.com`).
+ */
+export function matchesApprovedWildcard(rawWildcard, rawCandidate) {
+  const w = String(rawWildcard ?? '').trim().toLowerCase();
+  const c = String(rawCandidate ?? '').trim().toLowerCase();
+  if (!w || !c || !w.includes('*')) return false;
+  if (w === c) return true;
+  if (w.startsWith('*.') && !w.slice(2).includes('*')) {
+    const suf = w.slice(2);
+    return c !== suf && c.endsWith(`.${suf}`);
+  }
+  if (w.endsWith('.*') && !w.slice(0, -2).includes('*')) {
+    const pre = w.slice(0, -2);
+    return c.startsWith(`${pre}.`) && c.length > pre.length + 1;
+  }
+  const star = w.indexOf('*');
+  if (star > 0 && w.lastIndexOf('*') === star) {
+    const head = w.slice(0, star);
+    const tail = w.slice(star + 1);
+    return c.startsWith(head) && c.endsWith(tail) && c.length > head.length + tail.length;
+  }
+  return false;
+}
+
+const APPROVED_SAP_ATS_EXACT_EXEMPTIONS = Object.freeze(
+  new Set([
+    'enterprise-ats:jobs.smartrecruiters.com',
+    'enterprise-ats:jobs.jobvite.com',
+    'gem-ats:jobs.gem.com',
+  ]),
+);
+
+function isExemptSapAtsExactClaim(wildOwnerId, wildPat, exactOwnerId, exactDom) {
+  return wildOwnerId === 'sap-rmk-jibe' && wildPat === 'jobs.*.com' && APPROVED_SAP_ATS_EXACT_EXEMPTIONS.has(`${exactOwnerId}:${exactDom}`);
+}
 
 const SCHEMA_KEYS = {
   manifest: new Set([
@@ -345,7 +444,8 @@ function isSafePublicHost(fetchUrl) {
     if (
       !h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') ||
       h.endsWith('.internal') || h.endsWith('.nip.io') || h.endsWith('.sslip.io') ||
-      h.endsWith('.xip.io') || !h.includes('.') || h.includes(':')
+      h.endsWith('.xip.io') || !h.includes('.') || h.includes(':') ||
+      isPublicOrPrivateSuffix(h) || hasPrivateSharedHostingSuffix(h)
     ) {
       return false;
     }
@@ -389,6 +489,18 @@ function validateTwin(manifest, twin, ctxPath) {
       if (!isSafePublicHost(sample)) {
         throw new Error(`${ctxPath}.fetchUrl: failed public HTTPS host check ("${fu}")`);
       }
+      const targetHost = new URL(sample).hostname.toLowerCase().replace(/\.+$/, '');
+      const targetReg = getRegistrableDomain(targetHost);
+      const manifestRegs = claimedRegistrableDomains(manifest.domains);
+      const approvedCross = APPROVED_CROSS_DOMAIN_TWIN_HOSTS.get(manifest.id);
+      if (
+        (!targetReg || !manifestRegs.has(targetReg)) &&
+        !(approvedCross && approvedCross.has(targetHost))
+      ) {
+        throw new Error(
+          `${ctxPath}.fetchUrl: cross-domain twin host "${targetHost}" does not match manifest registrable domains and is not in APPROVED_CROSS_DOMAIN_TWIN_HOSTS (H7)`,
+        );
+      }
     }
   }
 }
@@ -415,23 +527,24 @@ function validateManifest(m, fileLabel) {
     if (!isAsciiPrintable(pat) || /[\s/\\:?#@]/.test(pat) || pat === '*' || pat === '*.*') {
       throw new Error(`${fileLabel}: invalid or overly broad domain "${rawPat}" (M2)`);
     }
-    if (pat.startsWith('*.')) {
-      const rest = pat.slice(2);
-      if (isForbiddenPublicOrHostingSuffix(rest)) {
-        throw new Error(`${fileLabel}: overly broad TLD/eTLD/hosting wildcard "${rawPat}" (M2)`);
-      }
-    }
-    if (pat.endsWith('.*')) {
-      const pre = pat.slice(0, -2);
-      if (!pre || pre.includes('*') || pre.length < 3) {
-        throw new Error(`${fileLabel}: invalid prefix wildcard "${rawPat}" (M2)`);
-      }
-    }
-    if (pat.includes('*') && !APPROVED_WILDCARD_DOMAIN_PATTERNS.has(pat)) {
-      throw new Error(`${fileLabel}: unapproved wildcard domain "${rawPat}" — must be explicitly allowlisted in APPROVED_WILDCARD_DOMAIN_PATTERNS`);
-    }
     if (RESERVED_CORE_ATS_DOMAINS.has(pat)) {
       throw new Error(`${fileLabel}: domain "${rawPat}" is reserved by a built-in core ATS adapter and cannot be hijacked`);
+    }
+    if (pat.includes('*')) {
+      if (pat.startsWith('*.') && !pat.slice(2).includes('*')) {
+        const suffix = pat.slice(2);
+        const isBuiltInShopify = m.id === 'shopify' && pat === '*.myshopify.com';
+        if (!isBuiltInShopify && (isPublicOrPrivateSuffix(suffix) || hasPrivateSharedHostingSuffix(suffix))) {
+          throw new Error(`${fileLabel}: overly broad TLD/eTLD/hosting wildcard "${rawPat}" is forbidden (M2)`);
+        }
+      }
+      if (!APPROVED_WILDCARD_DOMAIN_PATTERNS.has(pat)) {
+        throw new Error(
+          `${fileLabel}: unapproved wildcard domain "${rawPat}" is forbidden — must be explicitly allowlisted in APPROVED_WILDCARD_DOMAIN_PATTERNS`,
+        );
+      }
+    } else if (isPublicOrPrivateSuffix(pat) || hasPrivateSharedHostingSuffix(pat)) {
+      throw new Error(`${fileLabel}: public or private shared-hosting suffix in domain "${rawPat}" is forbidden (H7)`);
     }
   }
   if (!Array.isArray(m.exampleUrls) || m.exampleUrls.length === 0 || !m.exampleUrls.every((u) => typeof u === 'string' && u.startsWith('https://'))) {
@@ -476,6 +589,11 @@ function validateManifest(m, fileLabel) {
   }
   if (m.catalog) {
     assertAllowedKeys(m.catalog, SCHEMA_KEYS.catalog, `${fileLabel}.catalog`);
+    if (typeof m.catalog.platform !== 'string' || !VALID_CATALOG_PLATFORMS.has(m.catalog.platform)) {
+      throw new Error(
+        `${fileLabel}.catalog.platform: must be "shopify" or "woocommerce" (got "${String(m.catalog.platform)}")`,
+      );
+    }
   }
 
   const totalRoutes = (hasSingle ? 1 : 0) + (m.routes?.length ?? 0) + (m.htmlRoutes?.length ?? 0) + (m.catalog ? 1 : 0);
@@ -484,86 +602,141 @@ function validateManifest(m, fileLabel) {
   }
 }
 
-const yamlFiles = readdirSync(manifestsDir)
-  .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'))
-  .sort((a, b) => a.localeCompare(b));
+export function validateManifestSet(manifestEntries) {
+  const seenIds = new Set();
+  const twinOwnerById = new Map();
+  const exactOwners = new Map();
+  const wildcardOwners = new Map();
+  const wildcardClaims = [];
+  const catalogOwnerByPlatform = new Map();
 
-if (yamlFiles.length === 0) {
-  console.error(`No .yaml manifests found in ${manifestsDir}`);
-  process.exit(1);
+  for (const { obj, label } of manifestEntries) {
+    validateManifest(obj, label);
+
+    if (seenIds.has(obj.id)) {
+      throw new Error(`${label}: duplicate manifest id "${obj.id}" (M2)`);
+    }
+    seenIds.add(obj.id);
+
+    for (const rawDomain of obj.domains) {
+      const normDomain = rawDomain.trim().toLowerCase();
+      if (normDomain.includes('*')) {
+        const prevWildOwner = wildcardOwners.get(normDomain);
+        if (prevWildOwner && prevWildOwner !== obj.id) {
+          throw new Error(
+            `${label}: wildcard domain "${normDomain}" overlaps "${normDomain}" already claimed by manifest "${prevWildOwner}" (H7)`,
+          );
+        }
+        for (const [prevExact, prevOwner] of exactOwners.entries()) {
+          if (prevOwner === obj.id) continue;
+          if (matchesApprovedWildcard(normDomain, prevExact) && !isExemptSapAtsExactClaim(obj.id, normDomain, prevOwner, prevExact)) {
+            throw new Error(
+              `${label}: wildcard "${normDomain}" overlaps exact domain "${prevExact}" already claimed by manifest "${prevOwner}" (H7)`,
+            );
+          }
+        }
+        for (const prevWild of wildcardClaims) {
+          if (prevWild.id === obj.id) continue;
+          if (matchesApprovedWildcard(normDomain, prevWild.pattern) || matchesApprovedWildcard(prevWild.pattern, normDomain)) {
+            throw new Error(
+              `${label}: wildcard "${normDomain}" overlaps "${prevWild.pattern}" already claimed by manifest "${prevWild.id}" (H7)`,
+            );
+          }
+        }
+        wildcardOwners.set(normDomain, obj.id);
+        wildcardClaims.push({ id: obj.id, pattern: normDomain });
+      } else {
+        const prevExactOwner = exactOwners.get(normDomain);
+        if (prevExactOwner && prevExactOwner !== obj.id) {
+          throw new Error(
+            `${label}: duplicate domain "${normDomain}" overlaps claim by manifest "${prevExactOwner}" (M2)`,
+          );
+        }
+        for (const prevWild of wildcardClaims) {
+          if (prevWild.id === obj.id) continue;
+          if (matchesApprovedWildcard(prevWild.pattern, normDomain) && !isExemptSapAtsExactClaim(prevWild.id, prevWild.pattern, obj.id, normDomain)) {
+            throw new Error(
+              `${label}: domain "${normDomain}" overlaps "${prevWild.pattern}" already claimed by manifest "${prevWild.id}" (H7 cross-manifest collision)`,
+            );
+          }
+        }
+        exactOwners.set(normDomain, obj.id);
+      }
+    }
+
+    if (obj.catalog !== undefined) {
+      const plat = String(obj.catalog.platform ?? '').trim().toLowerCase();
+      if (!VALID_CATALOG_PLATFORMS.has(plat)) {
+        throw new Error(`${label}: unsupported catalog platform "${String(obj.catalog.platform)}"`);
+      }
+      const prevCatOwner = catalogOwnerByPlatform.get(plat);
+      if (prevCatOwner && prevCatOwner !== obj.id) {
+        throw new Error(`${label}: catalog platform "${plat}" already claimed by manifest "${prevCatOwner}"`);
+      }
+      catalogOwnerByPlatform.set(plat, obj.id);
+    }
+
+    const routes = obj.routes?.length ? obj.routes : obj.match && obj.twin && obj.extract ? [{ twin: obj.twin }] : [];
+    for (const r of routes) {
+      const tid = r.twin.id || obj.id;
+      const prev = twinOwnerById.get(tid);
+      if (prev && prev !== obj.id) {
+        throw new Error(`${label}: duplicate twin id "${tid}" already owned by "${prev}" (M2)`);
+      }
+      twinOwnerById.set(tid, obj.id);
+    }
+  }
 }
 
-const seenIds = new Set();
-const twinOwnerById = new Map();
-const domainOwnerByPattern = new Map();
-const catalogOwnerByPlatform = new Map();
-const manifests = [];
+const isMainModule =
+  Boolean(process.argv[1]) &&
+  resolve(process.argv[1]).replace(/\\/g, '/').endsWith('/compile-manifests.mjs') &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 
-for (const file of yamlFiles) {
-  const fullPath = join(manifestsDir, file);
-  const raw = readFileSync(fullPath, 'utf8');
-  const doc = parseDocument(raw, {
-    maxAliasCount: 0,
-    merge: false,
-    uniqueKeys: true,
-    schema: 'core',
-  });
-  if (doc.errors.length > 0) {
-    throw new Error(`${file}: YAML syntax error: ${doc.errors[0].message}`);
-  }
-  checkAstSafety(doc.contents, file);
-  const obj = doc.toJS({ maxAliasCount: 0 });
-  validateManifest(obj, file);
+if (isMainModule) {
+  const yamlFiles = readdirSync(manifestsDir)
+    .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'))
+    .sort((a, b) => a.localeCompare(b));
 
-  if (seenIds.has(obj.id)) {
-    throw new Error(`${file}: duplicate manifest id "${obj.id}" (M2)`);
-  }
-  seenIds.add(obj.id);
-
-  for (const rawDomain of obj.domains) {
-    const normDomain = rawDomain.trim().toLowerCase();
-    const prevDomOwner = domainOwnerByPattern.get(normDomain);
-    if (prevDomOwner && prevDomOwner !== obj.id) {
-      throw new Error(`${file}: domain "${normDomain}" already claimed by manifest "${prevDomOwner}" (cross-manifest collision)`);
-    }
-    domainOwnerByPattern.set(normDomain, obj.id);
-  }
-
-  if (obj.catalog?.platform) {
-    const plat = String(obj.catalog.platform).trim().toLowerCase();
-    const prevCatOwner = catalogOwnerByPlatform.get(plat);
-    if (prevCatOwner && prevCatOwner !== obj.id) {
-      throw new Error(`${file}: catalog platform "${plat}" already claimed by manifest "${prevCatOwner}"`);
-    }
-    catalogOwnerByPlatform.set(plat, obj.id);
-  }
-
-  const routes = obj.routes?.length ? obj.routes : obj.match && obj.twin && obj.extract ? [{ twin: obj.twin }] : [];
-  for (const r of routes) {
-    const tid = r.twin.id || obj.id;
-    const prev = twinOwnerById.get(tid);
-    if (prev && prev !== obj.id) {
-      throw new Error(`${file}: duplicate twin id "${tid}" already owned by "${prev}" (M2)`);
-    }
-    twinOwnerById.set(tid, obj.id);
-  }
-
-  manifests.push(obj);
-}
-
-const canonicalJson = `${JSON.stringify({ version: 2, manifests }, null, 2)}\n`;
-
-if (checkOnly) {
-  const existing = existsSync(outPath) ? readFileSync(outPath, 'utf8').replace(/\r\n/g, '\n') : '';
-  if (existing !== canonicalJson) {
-    console.error('internal/extract/manifests/compiled.json is out of date. Run: npm run adapter:compile');
+  if (yamlFiles.length === 0) {
+    console.error(`No .yaml manifests found in ${manifestsDir}`);
     process.exit(1);
   }
-  console.log(`✔ Verified ${manifests.length} declarative YAML manifests match compiled.json.`);
-} else {
-  const existing = existsSync(outPath) ? readFileSync(outPath, 'utf8').replace(/\r\n/g, '\n') : '';
-  if (existing !== canonicalJson) {
-    writeFileSync(outPath, canonicalJson, 'utf8');
+
+  const parsedEntries = [];
+  for (const file of yamlFiles) {
+    const fullPath = join(manifestsDir, file);
+    const raw = readFileSync(fullPath, 'utf8');
+    const doc = parseDocument(raw, {
+      maxAliasCount: 0,
+      merge: false,
+      uniqueKeys: true,
+      schema: 'core',
+    });
+    if (doc.errors.length > 0) {
+      throw new Error(`${file}: YAML syntax error: ${doc.errors[0].message}`);
+    }
+    checkAstSafety(doc.contents, file);
+    const obj = doc.toJS({ maxAliasCount: 0 });
+    parsedEntries.push({ obj, label: file });
   }
-  console.log(`✔ Compiled ${manifests.length} declarative YAML manifests -> internal/extract/manifests/compiled.json`);
+
+  validateManifestSet(parsedEntries);
+  const manifests = parsedEntries.map((e) => e.obj);
+  const canonicalJson = `${JSON.stringify({ version: 2, manifests }, null, 2)}\n`;
+
+  if (checkOnly) {
+    const existing = existsSync(outPath) ? readFileSync(outPath, 'utf8').replace(/\r\n/g, '\n') : '';
+    if (existing !== canonicalJson) {
+      console.error('internal/extract/manifests/compiled.json is out of date. Run: npm run adapter:compile');
+      process.exit(1);
+    }
+    console.log(`✔ Verified ${manifests.length} declarative YAML manifests match compiled.json.`);
+  } else {
+    const existing = existsSync(outPath) ? readFileSync(outPath, 'utf8').replace(/\r\n/g, '\n') : '';
+    if (existing !== canonicalJson) {
+      writeFileSync(outPath, canonicalJson, 'utf8');
+    }
+    console.log(`✔ Compiled ${manifests.length} declarative YAML manifests -> internal/extract/manifests/compiled.json`);
+  }
 }

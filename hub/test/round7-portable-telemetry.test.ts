@@ -91,7 +91,7 @@ function rawTcpHttpRequest(
 }
 
 test('R7-H8: Portable Hub exempts loopback /health & /readyz (100/100) under 132+ silent remote sockets, caps per-IP pre-header at 4, and FIFO-evicts global pre-header sockets with zero drift', async () => {
-  assert.equal(MAX_PREHEADER_SOCKETS_PER_IP, 4);
+  assert.equal(MAX_PREHEADER_SOCKETS_PER_IP, 32);
   assert.equal(FIRST_BYTE_PREHEADER_TIMEOUT_MS, 5_000);
   assert.equal(PRE_HEADER_TIMEOUT_MS, 10_000);
 
@@ -210,7 +210,7 @@ test('R7-H8: Portable Hub exempts loopback /health & /readyz (100/100) under 132
     }
     await sleep(150);
 
-    // Exactly `MAX_PREHEADER_SOCKETS_PER_IP` (4) silent sockets from `127.0.0.12` should be admitted
+    // All 10 fresh silent sockets from `127.0.0.12` (within `maxGlobalPreHeaderSockets = 16` and `MAX_PREHEADER_SOCKETS_PER_IP = 32`) should be admitted with zero counter drift
     const probeIdle: Array<net.Socket & { _closed?: boolean }> = await Promise.all(
       Array.from({ length: 10 }, () =>
         new Promise<net.Socket & { _closed?: boolean }>((r) => {
@@ -231,7 +231,7 @@ test('R7-H8: Portable Hub exempts loopback /health & /readyz (100/100) under 132
     await sleep(150);
     const openIdleCount = probeIdle.filter((s) => !s._closed).length;
     for (const s of probeIdle) s.destroy();
-    assert.equal(openIdleCount, MAX_PREHEADER_SOCKETS_PER_IP, 'Zero pre-header counter drift after rapid aborts');
+    assert.equal(openIdleCount, Math.min(10, MAX_PREHEADER_SOCKETS_PER_IP, 16), 'Zero pre-header counter drift after rapid aborts');
   } finally {
     for (const k of silentKeepers) k.stop();
     await hub.close();

@@ -166,7 +166,9 @@ interface StoredCatalogRun {
 
 export const MAX_CATALOG_IN_MEMORY_BYTES = 16 * 1024 * 1024;
 export const MAX_GLOBAL_CATALOG_BYTES = 32 * 1024 * 1024;
-export const MAX_CACHED_CATALOG_RUNS = 8;
+export const MAX_PER_USER_CATALOG_BYTES = 8 * 1024 * 1024;
+export const MAX_CACHED_CATALOG_RUNS = 16;
+export const MAX_CACHED_CATALOG_RUNS_PER_USER = 4;
 export const MAX_CONCURRENT_CATALOG_PER_PRINCIPAL = 2;
 export const MAX_CONCURRENT_CATALOG_GLOBAL = 8;
 export const MAX_CONCURRENT_CATALOG_NON_OWNER_GLOBAL = 6; // Reserves 2 global slots for `owner` so members cannot starve owner!
@@ -179,7 +181,8 @@ const MAX_VARIANTS_PER_CATALOG_RUN = 50_000;
 const MAX_RECORD_SERIALIZED_BYTES = 64 * 1024;
 const MAX_IMAGES_PER_CATALOG_RECORD = 250;
 const MAX_VARIANTS_PER_CATALOG_RECORD = 250;
-const MAX_COMPACT_HISTORY_RUNS = 32;
+const MAX_COMPACT_HISTORY_RUNS = 256;
+const MAX_COMPACT_HISTORY_RUNS_PER_USER = 32;
 const VALID_CATALOG_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 
 const MEMORY_CATALOG_RUNS = new Map<string, StoredCatalogRun>();
@@ -378,15 +381,72 @@ function clampCatalogRecord(rec: CatalogRecord): { record: CatalogRecord; bytes:
 }
 
 function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
+  const protectedEntry = protectedCatalogId ? MEMORY_CATALOG_RUNS.get(protectedCatalogId) : undefined;
+  const activeUserId = protectedEntry?.userId;
+
+  // 0. Per-user fair-share isolation (`R8-Catalog`): BEFORE touching any other user's runs, enforce the calling user's
+  // own per-user compact history cap, per-user cached-body cap, and per-user memory byte cap so one tenant in memory-only
+  // mode can NEVER wipe another tenant's catalog runs, records, or diff baselines!
+  if (activeUserId) {
+    const perUserCachedCap = activeUserId === 'owner' ? MAX_CACHED_CATALOG_RUNS_PER_USER * 2 : MAX_CACHED_CATALOG_RUNS_PER_USER;
+    const perUserByteCap = activeUserId === 'owner' ? MAX_GLOBAL_CATALOG_BYTES : MAX_PER_USER_CATALOG_BYTES;
+    let userRunCount = 0;
+    let userCachedBodyRuns = 0;
+    let userBytes = 0;
+    for (const v of MEMORY_CATALOG_RUNS.values()) {
+      if (v.userId !== activeUserId) continue;
+      userRunCount++;
+      if (v.records !== null) {
+        userCachedBodyRuns++;
+        userBytes += v.retainedBytes;
+      }
+      if (v.hashes !== null) {
+        userBytes += v.hashesBytes;
+      }
+    }
+    if (userCachedBodyRuns > perUserCachedCap || userBytes > perUserByteCap) {
+      for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+        if (k === protectedCatalogId || v.userId !== activeUserId || v.records === null) continue;
+        userBytes -= v.retainedBytes;
+        userCachedBodyRuns--;
+        v.records = null;
+        v.retainedBytes = 0;
+        if (userCachedBodyRuns <= perUserCachedCap && userBytes <= perUserByteCap) break;
+      }
+    }
+    if (userBytes > perUserByteCap) {
+      for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+        if (k === protectedCatalogId || v.userId !== activeUserId || v.hashes === null) continue;
+        userBytes -= v.hashesBytes;
+        v.hashes = null;
+        v.hashesBytes = 0;
+        if (userBytes <= perUserByteCap) break;
+      }
+    }
+    if (userRunCount > MAX_COMPACT_HISTORY_RUNS_PER_USER) {
+      for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+        if (k === protectedCatalogId || v.userId !== activeUserId) continue;
+        MEMORY_CATALOG_RUNS.delete(k);
+        userRunCount--;
+        if (userRunCount <= MAX_COMPACT_HISTORY_RUNS_PER_USER) break;
+      }
+    }
+  }
+
   let cachedBodyRuns = 0;
   let globalBytes = 0;
+  const cachedRunsByUser = new Map<string, number>();
+  const bytesByUser = new Map<string, number>();
   for (const v of MEMORY_CATALOG_RUNS.values()) {
     if (v.records !== null) {
       cachedBodyRuns++;
       globalBytes += v.retainedBytes;
+      cachedRunsByUser.set(v.userId, (cachedRunsByUser.get(v.userId) ?? 0) + 1);
+      bytesByUser.set(v.userId, (bytesByUser.get(v.userId) ?? 0) + v.retainedBytes);
     }
     if (v.hashes !== null) {
       globalBytes += v.hashesBytes;
+      bytesByUser.set(v.userId, (bytesByUser.get(v.userId) ?? 0) + v.hashesBytes);
     }
   }
   for (const c of R2_RELOAD_LRU_CACHE.values()) {
@@ -402,32 +462,68 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
     }
   }
 
-  // 2. Evict full in-memory record bodies (`v.records`) from oldest runs
-  if (cachedBodyRuns > MAX_CACHED_CATALOG_RUNS || globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
+  // 2. Evict full in-memory record bodies (`v.records`) from heaviest tenant (`cachedRuns >= 2` / largest byte user) first
+  while (cachedBodyRuns > MAX_CACHED_CATALOG_RUNS || globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
+    let heaviestUser: string | null = null;
+    let maxUserCached = 1;
+    for (const [uid, cnt] of cachedRunsByUser) {
+      if (cnt > maxUserCached) {
+        maxUserCached = cnt;
+        heaviestUser = uid;
+      }
+    }
+    let victimRun: StoredCatalogRun | null = null;
     for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
       if (k === protectedCatalogId || v.records === null) continue;
-      globalBytes -= v.retainedBytes;
-      cachedBodyRuns--;
-      v.records = null;
-      v.retainedBytes = 0;
-      if (cachedBodyRuns <= MAX_CACHED_CATALOG_RUNS && globalBytes <= MAX_GLOBAL_CATALOG_BYTES) {
+      if (heaviestUser !== null && v.userId !== heaviestUser) continue;
+      victimRun = v;
+      break;
+    }
+    if (!victimRun) {
+      for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+        if (k === protectedCatalogId || v.records === null) continue;
+        victimRun = v;
         break;
       }
     }
+    if (!victimRun) break;
+    globalBytes -= victimRun.retainedBytes;
+    cachedBodyRuns--;
+    cachedRunsByUser.set(victimRun.userId, Math.max(0, (cachedRunsByUser.get(victimRun.userId) ?? 1) - 1));
+    bytesByUser.set(victimRun.userId, Math.max(0, (bytesByUser.get(victimRun.userId) ?? 0) - victimRun.retainedBytes));
+    victimRun.records = null;
+    victimRun.retainedBytes = 0;
   }
 
-  // 3. `M3`: Evict retained `variantHashes` / `SnapshotHashBundle` (`v.hashes`) from oldest runs so hash bundles
-  // can NEVER exceed `MAX_GLOBAL_CATALOG_BYTES` (`32 MiB`) across tenants/sources!
-  if (globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
+  // 3. `M3`: Evict retained `variantHashes` / `SnapshotHashBundle` (`v.hashes`) from heaviest byte tenant first
+  while (globalBytes > MAX_GLOBAL_CATALOG_BYTES) {
+    let heaviestByteUser: string | null = null;
+    let maxBytes = 0;
+    for (const [uid, b] of bytesByUser) {
+      if (b > maxBytes) {
+        maxBytes = b;
+        heaviestByteUser = uid;
+      }
+    }
+    let victimHashRun: StoredCatalogRun | null = null;
     for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
       if (k === protectedCatalogId || v.hashes === null) continue;
-      globalBytes -= v.hashesBytes;
-      v.hashes = null;
-      v.hashesBytes = 0;
-      if (globalBytes <= MAX_GLOBAL_CATALOG_BYTES) {
+      if (heaviestByteUser !== null && v.userId !== heaviestByteUser) continue;
+      victimHashRun = v;
+      break;
+    }
+    if (!victimHashRun) {
+      for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+        if (k === protectedCatalogId || v.hashes === null) continue;
+        victimHashRun = v;
         break;
       }
     }
+    if (!victimHashRun) break;
+    globalBytes -= victimHashRun.hashesBytes;
+    bytesByUser.set(victimHashRun.userId, Math.max(0, (bytesByUser.get(victimHashRun.userId) ?? 0) - victimHashRun.hashesBytes));
+    victimHashRun.hashes = null;
+    victimHashRun.hashesBytes = 0;
   }
 
   // 4. Hard guard if even `protectedCatalogId` alone exceeds `32 MiB` (`records` + `hashes` combined)
@@ -448,9 +544,37 @@ function enforceGlobalCatalogMemoryBudget(protectedCatalogId?: string): void {
   }
 
   while (MEMORY_CATALOG_RUNS.size > MAX_COMPACT_HISTORY_RUNS) {
-    const oldestKey = MEMORY_CATALOG_RUNS.keys().next().value;
-    if (oldestKey === undefined) break;
-    MEMORY_CATALOG_RUNS.delete(oldestKey);
+    const totalByUser = new Map<string, number>();
+    for (const v of MEMORY_CATALOG_RUNS.values()) {
+      totalByUser.set(v.userId, (totalByUser.get(v.userId) ?? 0) + 1);
+    }
+    let heaviestUser: string | null = null;
+    let heaviestCnt = 1;
+    for (const [uid, cnt] of totalByUser) {
+      if (cnt > heaviestCnt) {
+        heaviestCnt = cnt;
+        heaviestUser = uid;
+      }
+    }
+    let victimKey: string | undefined;
+    if (heaviestUser !== null) {
+      for (const [k, v] of MEMORY_CATALOG_RUNS.entries()) {
+        if (k !== protectedCatalogId && v.userId === heaviestUser) {
+          victimKey = k;
+          break;
+        }
+      }
+    }
+    if (victimKey === undefined) {
+      for (const k of MEMORY_CATALOG_RUNS.keys()) {
+        if (k !== protectedCatalogId) {
+          victimKey = k;
+          break;
+        }
+      }
+    }
+    if (victimKey === undefined) break;
+    MEMORY_CATALOG_RUNS.delete(victimKey);
   }
 }
 

@@ -94,6 +94,18 @@ try {
   const liveMcpAuditOutfile = join(dir, 'live-mcp-audit.test.mjs');
   buildNodeTestBundle('test/live-mcp-audit.test.ts', liveMcpAuditOutfile);
   nodeTestFiles.push(liveMcpAuditOutfile);
+  const round8PortTelOpenapiOutfile = join(dir, 'round8-portable-telemetry-openapi.test.mjs');
+  buildNodeTestBundle('test/round8-portable-telemetry-openapi.test.ts', round8PortTelOpenapiOutfile);
+  nodeTestFiles.push(round8PortTelOpenapiOutfile);
+  const round8SanitizerOutfile = join(dir, 'round8-sanitizer-paging-cpu.test.mjs');
+  buildNodeTestBundle('test/round8-sanitizer-paging-cpu.test.ts', round8SanitizerOutfile);
+  nodeTestFiles.push(round8SanitizerOutfile);
+  const round8AuthMcpOutfile = join(dir, 'round8-auth-mcp-isolation.test.mjs');
+  buildNodeTestBundle('test/round8-auth-mcp-isolation.test.ts', round8AuthMcpOutfile);
+  nodeTestFiles.push(round8AuthMcpOutfile);
+  const round8ManifestsOutfile = join(dir, 'round8-manifests-commerce.test.mjs');
+  buildNodeTestBundle('test/round8-manifests-commerce.test.ts', round8ManifestsOutfile);
+  nodeTestFiles.push(round8ManifestsOutfile);
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],

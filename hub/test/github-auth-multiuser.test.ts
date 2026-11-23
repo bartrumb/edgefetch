@@ -285,6 +285,7 @@ function createInProcessHubHarness(overrides: Record<string, unknown> = {}) {
     GITHUB_CLIENT_ID: 'Iv23liMockGitHubClientId01',
     GITHUB_CLIENT_SECRET: 'ghs_mock_client_secret_value_0123456789',
     GITHUB_OWNER_LOGIN: 'founder',
+    GITHUB_OWNER_ID: '7',
     GITHUB_ALLOWED_USERS: 'alice,bob,@trusted-org',
     SIGNUP_MODE: 'invite_only',
     ROBOTS_BYPASS_HOSTS: 'docs.example.com,app.example.com',
@@ -550,6 +551,7 @@ test('Pillar 1A: GitHub OAuth PKCE S256 login, SIGNUP_MODE=invite_only, @org mem
   const hBoot = createInProcessHubHarness({
     SAFE_PUBLIC_FETCH: bootSafeFetch,
     GITHUB_OWNER_LOGIN: '',
+    GITHUB_OWNER_ID: '501',
     GITHUB_ALLOWED_USERS: '',
     SIGNUP_MODE: 'bootstrap_first',
     CALLER_TOKEN: undefined, // GitHub-only Hub without CALLER_TOKEN!
@@ -1046,6 +1048,7 @@ test('Pillar 1D: OTLP span hygiene & real Cloudflare workerd (Miniflare) E2E for
             GITHUB_CLIENT_ID: 'Iv23liWorkerdClientId',
             GITHUB_CLIENT_SECRET: ghSecret,
             GITHUB_OWNER_LOGIN: 'octo-owner',
+            GITHUB_OWNER_ID: '1',
             GITHUB_ALLOWED_USERS: 'alice,bob',
             SIGNUP_MODE: 'invite_only',
             OTEL_EXPORTER_OTLP_ENDPOINT: 'https://otel.example.com/v1/traces',

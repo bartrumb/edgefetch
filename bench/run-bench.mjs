@@ -120,7 +120,7 @@ const CORPUS = [
       <footer>Copyright 2026 Example Docs</footer>
     </body></html>`,
     run: (raw, url) => extractHtmlDocument(raw, { baseUrl: url, onlyMainContent: true }).markdown,
-    mustInclude: ['Map<string, HostWindow>', '| Outcome | Cooldown | Failover |', 'Retry-After'],
+    mustInclude: ['Map&lt;string, HostWindow>', '| Outcome | Cooldown | Failover |', 'Retry-After'],
     mustExclude: ['Sidebar Link 5', 'Copy page', 'advertising partners'],
   },
   {

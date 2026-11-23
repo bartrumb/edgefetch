@@ -1,35 +1,48 @@
 # Contributing to EdgeFetch
 
-Thanks for checking out EdgeFetch! EdgeFetch combines an **open-source worker, SDKs, and site adapters ([MIT](LICENSE))** with a **fair-source hub ([FSL-1.1-MIT](hub/LICENSE), MIT after two years)**. Issues and pull requests are **triaged weekly** and governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
+Thanks for checking out EdgeFetch! EdgeFetch combines an **open-source worker, SDKs, and adapters ([MIT](LICENSE)), fair-source hub ([FSL-1.1](hub/LICENSE), `MIT` after two years)**. Participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ---
 
-## Non-Negotiable Project Invariants (Contributor Rules)
+## Contributor Model: Issues Welcome, Code PRs by Invitation (`VOUCHED.td`)
 
-Every pull request must preserve EdgeFetch's ethical, security, and supply-chain invariants:
+EdgeFetch is a maintainer-driven, AI-built system with strict privilege boundaries between declarative YAML site adapters and core engine/security code:
+
+- **Welcome from everyone (no invitation needed):**
+  - **Bug reports & reproducible regressions** (`edgefetch bug-report <url>` emits a token-scrubbed diagnostic bundle).
+  - **Broken-adapter reports & new site adapter requests** (include sample public URLs and `https://<domain>/robots.txt` rules).
+  - **WAF false-positive / false-negative HTML samples** for [`internal/classify/waf_test.go`](internal/classify/waf_test.go) and [`hub/src/waf.ts`](hub/src/waf.ts).
+  - **Hardware / platform verification reports** (macOS, FreeBSD/OPNsense, OpenWrt, NAS appliances, Raspberry Pi).
+- **Code pull requests are by invitation ([`.github/VOUCHED.td`](.github/VOUCHED.td)):**
+  - Pull requests from unvouched GitHub accounts are blocked by `.github/workflows/vouch.yml` (reading `.github/VOUCHED.td` from `BASE_SHA`) before privileged CI workflows run, ensuring untrusted inputs never steer privileged runners or release gates.
+  - If you would like to contribute an adapter or fix directly, open an issue first with the proposed target/approach so the maintainer can coordinate and vouch your GitHub handle.
+- **Security vulnerabilities:** Report privately via **[SECURITY.md](SECURITY.md)** (never in public issues). Past security and parser-differential bugs caught across our 8-round audit loop are documented in **[docs/SECURITY-LOG.md](docs/SECURITY-LOG.md)**.
+
+---
+
+## Non-Negotiable Project Invariants
+
+Every change in EdgeFetch must preserve these ethical, security, and supply-chain invariants:
 
 1. **Politeness & Ethics First:**
-   - **Never weaken `robots.txt` enforcement** (`internal/politeness/robots.go`, `hub/src/robots.ts`), `Crawl-delay` / `Retry-After` handling, or dial-time SSRF peer checks (`internal/politeness/ssrf.go`).
-   - **Verify `robots.txt` for every new adapter:** Before adding or modifying a `twin` endpoint (`internal/extract/manifests/*.yaml`), check `https://<domain>/robots.txt` and ensure `User-agent: *` permits the twin path. If an API/raw path is disallowed (e.g., `api.smartrecruiters.com` or `gitlab.com/*/raw`), use `robots.txt`-allowed paths or `htmlRoutes` on the public HTML page instead.
-   - **Zero anti-bot, TLS/browser fingerprinting, or CAPTCHA bypasses (Permanently Out of Scope):** Anti-bot evasion, TLS/JA3/JA4/HTTP2 fingerprint spoofing, stealth browser patches, Turnstile/reCAPTCHA/hCaptcha clickers or solvers, and residential proxy rotation marketplaces are **permanently out of scope**. EdgeFetch classifies challenges (`outcome: "challenge"`) and halts immediately on the first attempt. Pull requests introducing stealth or fingerprinting features will be closed without review.
-   - **Every outbound request must carry an explicit deadline:** Every `fetch` / `http.Client.Do` call in Hub or Go code must attach a bounded `AbortSignal` or `context.WithTimeout` deadline and drain or cancel unread response bodies.
-2. **Contributor Sign-Off (DCO) & Vouch Gate:**
-   - Sign off every commit with `git commit -s` (`Signed-off-by: Your Name <you@example.com>`) certifying the [Developer Certificate of Origin](https://developercertificate.org/) under the [MIT License](LICENSE).
-   - Pull requests from first-time external accounts are gated by [`.github/VOUCHED.td`](.github/VOUCHED.td) (`vouch.yml`) before CI runs untrusted workflows. Comment on your issue or PR with test output and `robots.txt` verification so a maintainer can vouch your GitHub handle.
-   - Contributed declarative YAML site adapters (`internal/extract/manifests/*.yaml`) contain zero executable code and run inside a zero-secret, zero-network bulkhead (`runAdapterSyncInBulkhead`) with no access to Hub environment bindings, tokens, or `fetch`.
+   - **Never weaken `robots.txt` enforcement** (`internal/politeness/robots.go`, `hub/src/overflow.ts`), `Crawl-delay` / `Retry-After` handling, or dial-time SSRF peer checks (`internal/politeness/ssrf.go`).
+   - **Verify `robots.txt` for every site adapter:** Before adding or modifying a `twin` endpoint (`internal/extract/manifests/*.yaml`), check `https://<domain>/robots.txt` and ensure `User-agent: *` permits the path. When an `/api` or `/raw` path is disallowed, use `robots.txt`-allowed paths or `htmlRoutes` on the public HTML page instead.
+   - **No anti-bot, TLS/browser fingerprinting, or CAPTCHA bypasses:** Anti-bot evasion, TLS/JA3/JA4/HTTP2 fingerprint spoofing, stealth browser patches, Turnstile/reCAPTCHA/hCaptcha solvers, and residential proxy rotation pools are permanently out of scope. EdgeFetch classifies challenges (`outcome: "challenge"`) and stops immediately on the first attempt.
+   - **Zero default background phone-home:** `edgefetch scrape` and `edgefetch mcp` must make **zero** background telemetry or update-check calls by default (`EDGEFETCH_DEV_TELEMETRY` and `EDGEFETCH_CHECK_UPDATES` are strictly opt-in, and `DO_NOT_TRACK=1` hard-disables both).
+   - **Explicit deadlines on every outbound request:** Every `fetch` / `http.Client.Do` call in Hub or Go code must attach a bounded `AbortSignal` or `context.WithTimeout` deadline and drain or cancel unread response bodies.
+2. **Two-Ring Change Isolation & Adapter Diff Gate:**
+   - **Ring 1 (`internal/extract/manifests/*.yaml`):** All `57` built-in site adapters are pure declarative YAML compiled via [`hub/scripts/compile-manifests.mjs`](hub/scripts/compile-manifests.mjs) into `internal/extract/manifests/compiled.json`, running inside a zero-secret, zero-network bulkhead (`runAdapterSyncInBulkhead`). Adapter-only changes are verified by [`hub/scripts/verify-adapter-only-diff.mjs`](hub/scripts/verify-adapter-only-diff.mjs), which blocks any domain widening or `fetchUrl` host change without explicit human review.
+   - **Ring 0 (`cmd/`, `internal/`, `hub/src/`, `.github/`, `keys/`):** Core engine, auth, vault, sanitizer, SSRF, and workflow files require direct maintainer review and human-gated `release` environment approval before Ed25519 binary signing.
 3. **Minimal, Auditable Supply Chain:**
-   - **Go (`go.mod`):** Strictly **one external dependency** (`github.com/coder/websocket`, zero transitive dependencies) with `CGO_ENABLED=0`. CI fails automatically if `go mod graph` gains any unexpected module.
-   - **TypeScript Hub (`hub/package.json`):** Keeps runtime dependencies restricted strictly to 4 pinned, maintainer-vetted packages (`htmlparser2`, `re2js`, `ws`, `yaml`). Do not add new runtime npm packages without prior maintainer sign-off.
-4. **Keyless Built-In Adapters Only (`MIT`):**
-   - Built-in site and ATS adapters under [`internal/extract/manifests/`](internal/extract/manifests/) and [`hub/src/extractors/`](hub/src/extractors/) are **open-source (`MIT`)** and must work out of the box with **zero paid B2B API keys** (public JSON/XML twins, JSON-LD, SSR metadata, or HTML cleanup). Paid fallbacks belong strictly to optional operator-configured `FIRECRAWL_API_KEY` / BYO-LLM settings.
-5. **Release Signing, Provenance & Secret Isolation:**
-   - Official release checksum manifests (`checksums.txt.sig`) are cryptographically signed with an owner-only Ed25519 key (`RELEASE_SIGNING_PRIVATE_KEY` sealed exclusively in the tag-gated `release` GitHub Actions environment with `can_admins_bypass: false` and immutable `v*` tag rulesets, verified against [`keys/release-signing-pub.pem`](keys/release-signing-pub.pem)), and all release archives plus GHCR OCI images carry GitHub SLSA Build Provenance attestations (`gh attestation verify`).
-   - Fork pull requests and branch workflows **never** receive access to `release` environment secrets, and `main` + immutable `v*` release tags (`can_admins_bypass: false`) are enforced by GitHub Repository Rulesets and [`.github/CODEOWNERS`](.github/CODEOWNERS). Never modify `.github/workflows/release.yml` or `keys/` in contributor PRs unless explicitly coordinated with the maintainer.
-6. **Licensing (`Inbound = MIT + DCO`) & AI-Assisted Contributions:**
-   - **Inbound = `MIT` + DCO Sign-Off (`git commit -s`):** By submitting a pull request (whether to the `MIT` worker, SDKs, and adapters or to the fair-source `FSL-1.1-MIT` Hub), you confirm that you have the right to license and do license your contribution inbound under the [MIT License](LICENSE), alongside your DCO sign-off (`Signed-off-by:`), so contributions may be distributed in both the `MIT` components and the `FSL-1.1-MIT` Hub (which converts to `MIT` after two years). No separate CLA is required.
-   - AI-assisted PRs are welcome **only** if you have personally reviewed every line, verified live `robots.txt` behavior, and run the local test suite below before opening the PR.
-7. **Tests & Deterministic Fixtures Required:**
-   - Every bug fix or new declarative YAML adapter (`internal/extract/manifests/<slug>.yaml`) must include a deterministic JSON fixture in `hub/test/fixtures/adapters/<slug>.json` (auto-discovered by `npm test`) or unit tests. See **[docs/ADAPTERS.md](docs/ADAPTERS.md)** for the `npm run adapter:new <category>/<slug>` scaffold.
+   - **Go (`go.mod`):** Strictly **`1` external dependency** (`github.com/coder/websocket`, `0` transitive dependencies) with `CGO_ENABLED=0`. CI fails if `go list -m all` gains any unexpected module.
+   - **TypeScript Hub (`hub/package.json`):** Runtime dependencies are restricted to **`6` pinned packages** (`htmlparser2`, `jose`, `oauth4webapi`, `re2js`, `ws`, `yaml`). Do not add runtime npm packages without maintainer approval.
+4. **Keyless Built-In Adapters (`MIT`):**
+   - Built-in site and ATS adapters under [`internal/extract/manifests/`](internal/extract/manifests/) and [`hub/src/extractors/`](hub/src/extractors/) are open-source (`MIT`) and work with public JSON/XML endpoints, feeds, JSON-LD, or HTML selectors — never requiring paid B2B API keys.
+5. **Licensing (`Inbound = MIT + DCO`):**
+   - Sign off every commit with `git commit -s` (`Signed-off-by: Your Name <you@example.com>`) certifying the [Developer Certificate of Origin](https://developercertificate.org/).
+   - By submitting a pull request (whether to the `MIT` worker, SDKs, and adapters or to the fair-source `FSL-1.1` Hub), you license your contribution inbound under the [MIT License](LICENSE) alongside your DCO sign-off so it may be distributed in both the `MIT` components and the `FSL-1.1-MIT` Hub (`MIT` after two years). No separate CLA is required.
+6. **Deterministic Fixtures & Tests:**
+   - Every bug fix or declarative YAML adapter (`internal/extract/manifests/<slug>.yaml`) must include a deterministic fixture in `hub/test/fixtures/adapters/<slug>.json` or unit tests. See **[docs/ADAPTERS.md](docs/ADAPTERS.md)**.
 
 ---
 
@@ -48,23 +61,16 @@ go test -race ./...
 ```bash
 cd hub
 npm ci
+npm run adapter:check
 npm run build:portable
 npm run type-check
 npm test
 npm run deploy:dry
 ```
 
-### Extraction Fidelity Benchmark
+### Reproducible Extraction & Comparison Benchmarks
 
 ```bash
+node bench/compare.mjs
 node bench/run-bench.mjs
 ```
-
----
-
-## High-Impact Contributions Welcome
-
-- **Site, Open-Data & ATS Adapters:** Scaffold a keyless declarative YAML adapter with `cd hub && npm run adapter:new <category>/<slug>` under [`internal/extract/manifests/`](internal/extract/manifests/) — full walkthrough in **[docs/ADAPTERS.md](docs/ADAPTERS.md)**.
-- **WAF False-Positive Fixtures:** Sharing HTML fixtures where a normal page was misclassified (or a new WAF interstitial slipped through) in [`internal/classify/waf_test.go`](internal/classify/waf_test.go) and [`hub/src/waf.ts`](hub/src/waf.ts).
-- **Platform Reports:** Verifying binaries or deployment manifests on hardware in the README platform table (FreeBSD/OPNsense, OpenWrt routers, NAS appliances, macOS, Raspberry Pi) so we can promote rows from *Build Verified* to *Live-Tested*.
-- **Security Issues:** Please report vulnerabilities privately via [SECURITY.md](SECURITY.md) rather than opening a public issue.

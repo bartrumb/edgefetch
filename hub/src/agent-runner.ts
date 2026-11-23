@@ -24,7 +24,13 @@ import {
   tryScrapeViaConnectedMcp,
   type QueryMcpCallInput,
 } from './mcp-federation';
-import { resolveCallerUserId, type McpVaultStore, type StoredMcpServerRow } from './mcp-vault';
+import {
+  filterSafeCachedMcpTools,
+  resolveCallerUserId,
+  SAFE_MCP_IDENTIFIER_RE,
+  type McpVaultStore,
+  type StoredMcpServerRow,
+} from './mcp-vault';
 import { getActiveCallerAuthContext } from './oauth';
 import {
   completeLlmTurn,
@@ -115,10 +121,12 @@ export interface RankedAdapterMatch {
   score: number;
 }
 
+export const MAX_CONCURRENT_AGENTS_PER_USER = 4;
 const MAX_IN_MEMORY_AGENT_RUNS = 256;
 const AGENT_RUN_TTL_MS = 24 * 60 * 60_000;
 const inMemoryAgentRuns = new Map<string, AgentRunRecord>();
 const cancelledAgentIds = new Set<string>();
+const activeAgentRunsByUser = new Map<string, number>();
 
 const CATEGORY_INTENT_KEYWORDS: Record<AdapterCategory, readonly string[]> = {
   jobs: ['job', 'jobs', 'career', 'careers', 'hiring', 'salary', 'compensation', 'role', 'roles', 'engineer', 'ashby', 'greenhouse', 'lever', 'workday', 'workable', 'rippling', 'ats', 'remote'],
@@ -362,16 +370,16 @@ function buildAgentTools(
   connectedMcps: readonly StoredMcpServerRow[] = [],
 ): LlmToolDefinition[] {
   const tools: LlmToolDefinition[] = [];
-  if (connectedMcps.length > 0) {
-    const serverSlugs = connectedMcps.map((s) => s.slug);
+  const safeServerSlugs = connectedMcps.map((s) => s.slug).filter((slug) => /^[a-z0-9_-]{1,48}$/i.test(slug));
+  if (safeServerSlugs.length > 0) {
     tools.push({
       name: 'query_mcp',
-      description: `Tier-1 Connected MCP Federation: Query your user-authenticated official MCP servers (${serverSlugs.join(', ')}) FIRST before scraping HTML. Use action="list_tools" to inspect tools or action="call_tool" to invoke a structured MCP tool directly.`,
+      description: `Tier-1 Connected MCP Federation: Query your user-authenticated official MCP servers (${safeServerSlugs.join(', ')}) FIRST before scraping HTML. Use action="list_tools" to inspect tools or action="call_tool" to invoke a structured MCP tool directly.`,
       parameters: {
         type: 'object',
         properties: {
           action: { type: 'string', enum: ['list_connected', 'list_tools', 'call_tool'] },
-          server: { type: 'string', enum: serverSlugs, description: 'Connected MCP server slug.' },
+          server: { type: 'string', enum: safeServerSlugs, description: 'Connected MCP server slug.' },
           tool: { type: 'string', description: 'Tool name on the connected MCP server (for action="call_tool").' },
           arguments: { type: 'object', description: 'JSON object arguments for the downstream MCP tool.' },
         },
@@ -724,9 +732,55 @@ export async function startOrExecuteAgentCall(params: {
   const threadId = priorThread?.threadId ?? (requestedThreadId && priorThread ? requestedThreadId : agentId);
 
   const activeAuth = getActiveCallerAuthContext();
-  const canInvokeFederatedMcp =
-    !activeAuth || !activeAuth.principal.startsWith('oauth:') || activeAuth.scopes.includes('mcp:call');
+  const effectivePrincipal = activeAuth?.principal ?? principal;
+  const canInvokeFederatedMcp = effectivePrincipal.startsWith('oauth:')
+    ? Boolean(activeAuth?.scopes.includes('mcp:call'))
+    : true;
   const preferMcpRequested = payload.preferMcp === true;
+  const useConnectedMcpRequested = (payload as Record<string, unknown>).useConnectedMcp === true;
+  const wantsConnectedMcps =
+    (Array.isArray(payload.mcpServers) && payload.mcpServers.length > 0) ||
+    preferMcpRequested ||
+    useConnectedMcpRequested;
+
+  if (wantsConnectedMcps && !canInvokeFederatedMcp) {
+    return {
+      kind: 'json',
+      status: 403,
+      body: {
+        ok: false,
+        success: false,
+        error: 'insufficient_scope',
+        message: 'Scope mcp:call is required to use connected MCP servers in /v1/agent.',
+      },
+    };
+  }
+
+  const userQuotaKey = effectiveUserId.trim() || 'owner';
+  const currentActiveRuns = activeAgentRunsByUser.get(userQuotaKey) ?? 0;
+  if (currentActiveRuns >= MAX_CONCURRENT_AGENTS_PER_USER) {
+    return {
+      kind: 'json',
+      status: 429,
+      body: {
+        ok: false,
+        success: false,
+        error: 'user_quota_exceeded',
+        message: `Per-user concurrent agent limit (${MAX_CONCURRENT_AGENTS_PER_USER}) exceeded. Please wait for an active run to finish.`,
+      },
+    };
+  }
+  activeAgentRunsByUser.set(userQuotaKey, currentActiveRuns + 1);
+  let agentQuotaReleased = false;
+  const releaseAgentQuotaSlot = () => {
+    if (agentQuotaReleased) return;
+    agentQuotaReleased = true;
+    const cur = activeAgentRunsByUser.get(userQuotaKey) ?? 0;
+    if (cur <= 1) activeAgentRunsByUser.delete(userQuotaKey);
+    else activeAgentRunsByUser.set(userQuotaKey, cur - 1);
+  };
+
+  try {
   const allowlistedMcpSlugs = Array.isArray(payload.mcpServers)
     ? new Set(
         payload.mcpServers
@@ -735,13 +789,16 @@ export async function startOrExecuteAgentCall(params: {
       )
     : null;
 
-  // Tier-1 MCP-First Domain Router + Tier-2 `<1 ms` BM25 Keyless Adapter Router
+  // Tier-1 Opt-In MCP-First Domain Router + Tier-2 `<1 ms` BM25 Keyless Adapter Router
   const routerStart = Date.now();
   const userConnectedMcps =
-    vaultStore && canInvokeFederatedMcp
-      ? (await vaultStore.listServers(effectiveUserId)).filter(
-          (s) => s.enabled && (!allowlistedMcpSlugs || allowlistedMcpSlugs.has(s.slug.toLowerCase())),
-        )
+    vaultStore && wantsConnectedMcps && canInvokeFederatedMcp
+      ? (await vaultStore.listServers(effectiveUserId))
+          .filter((s) => s.enabled && (!allowlistedMcpSlugs || allowlistedMcpSlugs.has(s.slug.toLowerCase())))
+          .map((s) => {
+            const safeTools = filterSafeCachedMcpTools(s.cachedTools);
+            return { ...s, cachedTools: safeTools, toolCount: safeTools.length };
+          })
       : [];
   const matchedMcps = matchConnectedMcpsForContext({
     servers: userConnectedMcps,
@@ -1199,6 +1256,15 @@ export async function startOrExecuteAgentCall(params: {
       }
 
       if (toolName === 'query_mcp' && vaultStore) {
+        if (!wantsConnectedMcps || userConnectedMcps.length === 0) {
+          return {
+            ok: false,
+            summaryForLlm: JSON.stringify({
+              error: 'mcp_not_enabled_for_run',
+              message: 'Connected MCP servers were not opted into for this agent run.',
+            }),
+          };
+        }
         return withToolSpan(async (toolSpan) => {
           const actionRaw = typeof args.action === 'string' ? args.action : 'call_tool';
           if (actionRaw === 'call_tool' && !canInvokeFederatedMcp) {
@@ -1207,13 +1273,36 @@ export async function startOrExecuteAgentCall(params: {
               summaryForLlm: JSON.stringify({ error: 'insufficient_scope', message: 'OAuth scope mcp:call is required to invoke connected MCP tools.' }),
             };
           }
+          if (typeof args.server === 'string' && args.server.trim()) {
+            const reqSrvLower = args.server.trim().toLowerCase();
+            const allowedForRun = userConnectedMcps.some(
+              (s) =>
+                s.slug.toLowerCase() === reqSrvLower ||
+                s.domains.some((d) => reqSrvLower === d.toLowerCase() || reqSrvLower.endsWith(`.${d.toLowerCase()}`)),
+            );
+            if (!allowedForRun) {
+              return {
+                ok: false,
+                summaryForLlm: JSON.stringify({ error: 'mcp_server_not_allowed', message: 'Server is not enabled for this agent run.' }),
+              };
+            }
+          }
+          if (actionRaw === 'call_tool') {
+            const candidateToolName = typeof args.tool === 'string' ? args.tool.trim() : '';
+            if (!candidateToolName || !SAFE_MCP_IDENTIFIER_RE.test(candidateToolName)) {
+              return {
+                ok: false,
+                summaryForLlm: JSON.stringify({ error: 'invalid_tool_identifier', message: 'Invalid MCP tool identifier.' }),
+              };
+            }
+          }
           const qInput: QueryMcpCallInput = {
             action:
               actionRaw === 'list_connected' || actionRaw === 'list_tools' || actionRaw === 'call_tool'
                 ? actionRaw
                 : 'call_tool',
             ...(typeof args.server === 'string' ? { server: args.server } : {}),
-            ...(typeof args.tool === 'string' ? { tool: args.tool } : {}),
+            ...(typeof args.tool === 'string' ? { tool: args.tool.trim() } : {}),
             ...(args.arguments && typeof args.arguments === 'object' && !Array.isArray(args.arguments)
               ? { arguments: args.arguments as Record<string, unknown> }
               : {}),
@@ -1278,7 +1367,8 @@ export async function startOrExecuteAgentCall(params: {
           });
 
           // Wrap federated MCP tool output in an explicit untrusted-data boundary envelope for the LLM!
-          const boundedEnvelope = `<untrusted_mcp_tool_output server="${srvSlug}"${toolCalled ? ` tool="${toolCalled.replace(/[^A-Za-z0-9_.:-]/g, '')}"` : ''}>\n${sanitizedMcpMd.slice(0, 7_600)}\n</untrusted_mcp_tool_output>`;
+          const safeToolAttr = toolCalled && SAFE_MCP_IDENTIFIER_RE.test(toolCalled) ? ` tool="${toolCalled}"` : '';
+          const boundedEnvelope = `<untrusted_mcp_tool_output server="${srvSlug}"${safeToolAttr}>\n${sanitizedMcpMd.slice(0, 7_600)}\n</untrusted_mcp_tool_output>`;
           return {
             ok: mOut.status === 200,
             summaryForLlm: boundedEnvelope,
@@ -1414,8 +1504,8 @@ export async function startOrExecuteAgentCall(params: {
         // H3: Never interpolate raw untrusted downstream JSON or descriptions into `/v1/agent` system prompts!
         // Emit ONLY regex-verified identifiers (`slug`, `domains`, `tool.name`, and safe `propKeys`).
         const SAFE_SLUG_ID_RE = /^[a-z0-9_-]{1,48}$/;
-        const SAFE_TOOL_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
-        const SAFE_PROP_ID_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+        const SAFE_TOOL_ID_RE = SAFE_MCP_IDENTIFIER_RE;
+        const SAFE_PROP_ID_RE = SAFE_MCP_IDENTIFIER_RE;
         const SAFE_DOM_ID_RE = /^[a-z0-9.-]{1,128}$/;
 
         const connectedMcpHints = (matchedMcps.length > 0 ? matchedMcps.map((m) => m.server) : userConnectedMcps.map((s) => ({
@@ -1665,13 +1755,13 @@ export async function startOrExecuteAgentCall(params: {
         // Keyless/heuristic `/v1/agent` safety: NEVER auto-invoke connected MCP tools unless explicitly opted in
         // (`preferMcp === true` or explicit `mcpServers` allowlist) AND `tool.readOnlyHint === true && tool.destructiveHint !== true`!
         const allowKeylessMcpAutoCall =
-          canInvokeFederatedMcp && (preferMcpRequested || (allowlistedMcpSlugs !== null && allowlistedMcpSlugs.size > 0));
+          canInvokeFederatedMcp && wantsConnectedMcps;
         if (allowKeylessMcpAutoCall) {
           for (const matched of matchedMcps.slice(0, 2)) {
             if (isCancelled()) break;
             if (allowlistedMcpSlugs && !allowlistedMcpSlugs.has(matched.server.slug.toLowerCase())) continue;
-            const mcpTool = matched.server.tools.find(
-              (t) => t.readOnlyHint === true && t.destructiveHint !== true,
+            const mcpTool = filterSafeCachedMcpTools(matched.server.tools).find(
+              (t) => SAFE_MCP_IDENTIFIER_RE.test(t.name) && t.readOnlyHint === true && t.destructiveHint !== true,
             );
             if (mcpTool) {
               const props =
@@ -1854,6 +1944,16 @@ export async function startOrExecuteAgentCall(params: {
     return record;
   };
 
+  const runLoopWithQuotaRelease = async (
+    emitEvent?: (event: string, data: Record<string, unknown>) => void,
+  ): Promise<AgentRunRecord> => {
+    try {
+      return await runLoop(emitEvent);
+    } finally {
+      releaseAgentQuotaSlot();
+    }
+  };
+
   // 1. Real-Time Server-Sent Events (`stream: true` or `Accept: text/event-stream`)
   if (wantSseStream || payload.stream === true) {
     const encoder = new TextEncoder();
@@ -1867,14 +1967,19 @@ export async function startOrExecuteAgentCall(params: {
           }
         };
         try {
-          await (agentTracer ? agentTracer.run(() => runLoop(send)) : runLoop(send));
+          await (agentTracer ? agentTracer.run(() => runLoopWithQuotaRelease(send)) : runLoopWithQuotaRelease(send));
         } finally {
+          releaseAgentQuotaSlot();
           try {
             controller.close();
           } catch {
             // ignore
           }
         }
+      },
+      cancel() {
+        cancelledAgentIds.add(record.id);
+        releaseAgentQuotaSlot();
       },
     });
     return {
@@ -1893,7 +1998,7 @@ export async function startOrExecuteAgentCall(params: {
   // 2. Async polling mode (`async: true` when not `zeroDataRetention` — Firecrawl startAgent parity)
   const runAsync = payload.async === true && !zeroDataRetention;
   if (runAsync) {
-    const bgPromise = agentTracer ? agentTracer.run(() => runLoop()) : runLoop();
+    const bgPromise = agentTracer ? agentTracer.run(() => runLoopWithQuotaRelease()) : runLoopWithQuotaRelease();
     if (waitUntil) {
       waitUntil(bgPromise);
     } else {
@@ -1916,10 +2021,14 @@ export async function startOrExecuteAgentCall(params: {
   }
 
   // 3. Synchronous completion (default for MCP `agent` & `zeroDataRetention: true`)
-  const completed = await (agentTracer ? agentTracer.run(() => runLoop()) : runLoop());
+  const completed = await (agentTracer ? agentTracer.run(() => runLoopWithQuotaRelease()) : runLoopWithQuotaRelease());
   return {
     kind: 'json',
     status: completed.status === 'failed' ? 502 : 200,
     body: formatPublicAgentResponse(completed, Boolean(payload.includeTrace)),
   };
+  } catch (setupErr) {
+    releaseAgentQuotaSlot();
+    throw setupErr;
+  }
 }

@@ -1772,7 +1772,7 @@ func (c *Crawler) fetchRobots(ctx context.Context, target *url.URL) (*politeness
 			}
 		}
 		if err != nil {
-			if isDNSNotFoundError(err) {
+			if hop == 0 && isDNSNotFoundError(err) {
 				return &politeness.RobotsEntry{
 					Distressed:  true,
 					DNSNotFound: true,

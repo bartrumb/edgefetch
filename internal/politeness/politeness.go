@@ -472,6 +472,9 @@ func (e *RobotsEntry) Allowed(pathAndQuery string) bool {
 	if len(e.Rules) == 0 {
 		return true
 	}
+	if h := strings.IndexByte(pathAndQuery, '#'); h >= 0 {
+		pathAndQuery = pathAndQuery[:h]
+	}
 	if pathAndQuery == "" {
 		pathAndQuery = "/"
 	}

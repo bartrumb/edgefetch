@@ -1245,13 +1245,21 @@ function readHeaderNumber(headers: Record<string, string> | undefined, key: stri
   return null;
 }
 
+export const VALID_CATALOG_PLATFORMS: ReadonlySet<string> = new Set(['shopify', 'woocommerce']);
+
 export function buildDeclarativeCatalogSpec(cfg: DeclarativeCatalogConfig): CatalogSpec {
+  const rawPlatform = typeof cfg?.platform === 'string' ? cfg.platform.trim().toLowerCase() : '';
+  if (!VALID_CATALOG_PLATFORMS.has(rawPlatform)) {
+    throw new Error(
+      `Unsupported declarative catalog platform "${String((cfg as { platform?: unknown })?.platform)}" (expected "shopify" or "woocommerce")`,
+    );
+  }
   const pauseMs = Math.max(250, cfg.pauseMs || 2000);
   const pageCap = Math.max(1, Math.min(1000, cfg.pageCap || 200));
   const maxImages = Math.min(250, Math.max(1, cfg.maxImagesPerProduct ?? DEFAULT_MAX_IMAGES_PER_PRODUCT));
   const maxVariants = Math.min(250, Math.max(1, cfg.maxVariantsPerProduct ?? DEFAULT_MAX_VARIANTS_PER_PRODUCT));
 
-  if (cfg.platform === 'shopify') {
+  if (rawPlatform === 'shopify') {
     const perPage = Math.min(250, Math.max(1, cfg.perPage ?? 250));
     const firstTpl = cfg.firstPageTemplate || `{origin}/products.json?limit=${perPage}&page=1`;
     const colTpl =

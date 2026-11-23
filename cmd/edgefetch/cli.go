@@ -30,12 +30,14 @@ import (
 )
 
 type cliDeps struct {
-	getenv     func(string) string
-	transport  http.RoundTripper
-	allow      func(*url.URL) error
-	haPath     string
-	stdin      io.Reader
-	stdinIsTTY *bool
+	getenv          func(string) string
+	transport       http.RoundTripper
+	allow           func(*url.URL) error
+	haPath          string
+	stdin           io.Reader
+	stdinIsTTY      *bool
+	updateAPIBase   string
+	updateCachePath string
 }
 
 func isOneShotCLI(args []string) bool {
@@ -107,6 +109,8 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 	case "crawl":
 		return runCrawlCLI(ctx, args[1:], stdout, stderr, deps)
 	case "mcp":
+		stopUpdateCheck := startOptInMCPUpdateNotice(ctx, stderr, deps)
+		defer stopUpdateCheck()
 		return runMCPStdio(ctx, stdin, stdout, stderr, deps)
 	case "init", "install-mcp":
 		return runInstallMCPWithDeps(args[1:], stdin, stdout, stderr, deps)
@@ -122,6 +126,8 @@ func runOneShotCLI(ctx context.Context, args []string, stdout, stderr io.Writer,
 		return runDesktopModeWithDeps(ctx, args[1:], stdout, stderr, deps)
 	default:
 		if isMCPModeFlag(args) {
+			stopUpdateCheck := startOptInMCPUpdateNotice(ctx, stderr, deps)
+			defer stopUpdateCheck()
 			return runMCPStdio(ctx, stdin, stdout, stderr, deps)
 		}
 		_, _ = fmt.Fprintf(stderr, "unknown subcommand %q (try 'edgefetch help')\n", args[0])
@@ -157,10 +163,11 @@ Scrape Flags:
   --max-chars=<n>      Truncate output Markdown to <n> characters
   --timeout-ms=<n>     Per-request timeout in milliseconds (default: 30000)
 
-Environment Variables (Agent Mode):
+Environment Variables (Agent & MCP Modes):
   EDGEFETCH_HUB_URL       Cloudflare Hub origin or wss:// endpoint (e.g. https://edgefetch.example.com)
   EDGEFETCH_AGENT_TOKEN   Shared secret (>= 24 characters) matching AGENT_SHARED_SECRET on Hub
   EDGEFETCH_SITE_ID       Unique lowercase node identifier (e.g. site-mac-mini-1)
+  EDGEFETCH_CHECK_UPDATES Opt-in (=1) 24h background update notice on stderr in 'edgefetch mcp' (default: off)
 `, agent.Version)
 }
 

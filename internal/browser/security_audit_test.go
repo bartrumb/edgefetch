@@ -419,3 +419,421 @@ func TestFailedKeepSessionDisposesSlotAndExtraHeadersClearedAfterNavigate(t *tes
 		t.Fatalf("expected X-Api-Version on same-origin doc only: docHdrs=%+v crossOverridden=%v", docHdrs, crossOverridden)
 	}
 }
+
+func TestR8TopNavAndSubresourceSecFetchSiteHeaderResidual(t *testing.T) {
+	const boundOrigin = "https://victim.example.com:443"
+
+	// 1. Unit checks on hasPositiveSameOriginProof, isSameOriginInitiatorHeaders & hasExplicitSameOriginSecFetchSite:
+	//    Sec-Fetch-Site != "same-origin" MUST reject IMMEDIATELY even when Referer & Origin match boundOrigin!
+	for _, badSFS := range []string{"cross-site", "same-site", "none", ""} {
+		hdrs := map[string]any{
+			"Origin":         "https://victim.example.com",
+			"Referer":        "https://victim.example.com/start",
+			"Sec-Fetch-Site": badSFS,
+		}
+		if hasPositiveSameOriginProof(hdrs, boundOrigin) {
+			t.Fatalf("SECURITY: hasPositiveSameOriginProof allowed Sec-Fetch-Site=%q with bound Origin/Referer", badSFS)
+		}
+		if isSameOriginInitiatorHeaders(hdrs, boundOrigin) {
+			t.Fatalf("SECURITY: isSameOriginInitiatorHeaders allowed Sec-Fetch-Site=%q with bound Origin/Referer", badSFS)
+		}
+		if hasExplicitSameOriginSecFetchSite(hdrs) {
+			t.Fatalf("SECURITY: hasExplicitSameOriginSecFetchSite allowed Sec-Fetch-Site=%q", badSFS)
+		}
+	}
+	if hasExplicitSameOriginSecFetchSite(map[string]any{"Referer": "https://victim.example.com/start"}) {
+		t.Fatal("hasExplicitSameOriginSecFetchSite must return false when Sec-Fetch-Site is absent")
+	}
+	validSameOrigin := map[string]any{
+		"Referer":        "https://victim.example.com/start",
+		"Sec-Fetch-Site": "same-origin",
+	}
+	if !hasPositiveSameOriginProof(validSameOrigin, boundOrigin) ||
+		!isSameOriginInitiatorHeaders(validSameOrigin, boundOrigin) ||
+		!hasExplicitSameOriginSecFetchSite(validSameOrigin) {
+		t.Fatal("expected valid Sec-Fetch-Site: same-origin + bound Referer to pass all three checks")
+	}
+
+	// 2. End-to-end Mock-CDP handleRequestPaused simulation for A -> B -> A grandchild top-level navigation
+	//    and cross-site/same-site/none subresources carrying Referer: <boundOrigin>.
+	var (
+		mu          sync.Mutex
+		hasOverride = make(map[string]bool)
+		sig         = make(map[string]chan struct{})
+	)
+	chFor := func(id string) chan struct{} {
+		mu.Lock()
+		defer mu.Unlock()
+		c, ok := sig[id]
+		if !ok {
+			c = make(chan struct{})
+			sig[id] = c
+		}
+		return c
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := websocket.Accept(w, req, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		var writeMu sync.Mutex
+		send := func(obj any) {
+			b, _ := json.Marshal(obj)
+			writeMu.Lock()
+			_ = conn.Write(req.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+
+		for {
+			_, rawMsg, err := conn.Read(req.Context())
+			if err != nil {
+				return
+			}
+			var rpc struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(rawMsg, &rpc) != nil {
+				continue
+			}
+
+			switch rpc.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": rpc.ID, "result": map[string]any{"browserContextId": "bc-r8"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": rpc.ID, "result": map[string]any{"targetId": "tgt-r8"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": rpc.ID, "result": map[string]any{"sessionId": "sess-r8"}})
+			case "Fetch.continueRequest":
+				var p struct {
+					RequestID string `json:"requestId"`
+				}
+				var rawMap map[string]json.RawMessage
+				_ = json.Unmarshal(rpc.Params, &p)
+				_ = json.Unmarshal(rpc.Params, &rawMap)
+				_, overridden := rawMap["headers"]
+				mu.Lock()
+				hasOverride[p.RequestID] = overridden
+				mu.Unlock()
+				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{}})
+				select {
+				case <-chFor(p.RequestID):
+				default:
+					close(chFor(p.RequestID))
+				}
+			case "Page.navigate":
+				navID := rpc.ID
+				navSID := rpc.SessionID
+				go func() {
+					// Initial harness top-level navigation (Sec-Fetch-Site: none is valid ONLY on harnessHop).
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "harness-doc",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://victim.example.com/start",
+								"headers": map[string]string{"Accept": "text/html", "Sec-Fetch-Site": "none"},
+							},
+						},
+					})
+					<-chFor("harness-doc")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameNavigated",
+						"params":    map[string]any{"frame": map[string]any{"id": "main-f", "url": "https://victim.example.com/start", "securityOrigin": "https://victim.example.com"}},
+					})
+
+					// Positive control FIRST (before any uninjected Document taints the session!):
+					// Legitimate top-frame link click with Referer == boundOrigin AND Sec-Fetch-Site: same-origin.
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "legit-top-nav-same-origin",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url": "https://victim.example.com/account",
+								"headers": map[string]string{
+									"Accept":         "text/html",
+									"Referer":        "https://victim.example.com/start",
+									"Sec-Fetch-Site": "same-origin",
+								},
+							},
+						},
+					})
+					<-chFor("legit-top-nav-same-origin")
+
+					// Attack 0 (Simple Tab-Taint Rule): Once an uninjected subframe Document loads (e.g. evil.other.test/mid),
+					// an autonomous top-level navigation lacking Sec-Fetch-Site: same-origin is IMMEDIATELY blocked!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "uninjected-mid-subdoc",
+							"frameId":      "mid-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url":     "https://evil.other.test/mid",
+								"headers": map[string]string{"Accept": "text/html", "Referer": "https://victim.example.com/start"},
+							},
+						},
+					})
+					<-chFor("uninjected-mid-subdoc")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "main-top-nav-after-uninjected-subdoc",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url": "https://victim.example.com/steal-after-subdoc",
+								"headers": map[string]string{
+									"Accept":  "text/html",
+									"Referer": "https://victim.example.com/grandchild",
+								},
+							},
+						},
+					})
+					<-chFor("main-top-nav-after-uninjected-subdoc")
+
+					// Attack A: Nested A -> B (cross-site) -> A grandchild executes `top.location = "https://victim.example.com/steal"`.
+					// Chromium sends Referer: https://victim.example.com/child AND Sec-Fetch-Site: cross-site!
+					for _, sfs := range []string{"cross-site", "same-site", "none"} {
+						reqID := "main-top-nav-sfs-" + sfs
+						send(map[string]any{
+							"sessionId": navSID,
+							"method":    "Fetch.requestPaused",
+							"params": map[string]any{
+								"requestId":    reqID,
+								"frameId":      "main-f",
+								"resourceType": "Document",
+								"request": map[string]any{
+									"url": "https://victim.example.com/steal-" + sfs,
+									"headers": map[string]string{
+										"Accept":         "text/html",
+										"Referer":        "https://victim.example.com/grandchild",
+										"Sec-Fetch-Site": sfs,
+									},
+								},
+							},
+						})
+						<-chFor(reqID)
+					}
+
+					// Attack B: Real-Chromium A -> B -> A grandchild top-navigation where Fetch.requestPaused fires BEFORE
+					// network::SetFetchMetadataHeaders (so Sec-Fetch-Site is absent in paused.Request.Headers!), testing both
+					// full grandchild Referer and <meta name="referrer" content="origin"> truncated Referer!
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameNavigated",
+						"params":    map[string]any{"frame": map[string]any{"id": "mid-f", "parentId": "main-f", "url": "https://evil.other.test/mid", "securityOrigin": "https://evil.other.test"}},
+					})
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameNavigated",
+						"params":    map[string]any{"frame": map[string]any{"id": "gc-f", "parentId": "mid-f", "url": "https://victim.example.com/grandchild", "securityOrigin": "https://victim.example.com"}},
+					})
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "main-top-nav-gc-full-ref",
+							"frameId":      "main-f",
+							"resourceType": "Document",
+							"request": map[string]any{
+								"url": "https://victim.example.com/steal-gc-ref",
+								"headers": map[string]string{
+									"Accept":  "text/html",
+									"Referer": "https://victim.example.com/grandchild",
+								},
+							},
+						},
+					})
+					<-chFor("main-top-nav-gc-full-ref")
+					// Reset cross-taint via simulated Page.frameDetached on gc-f after testing origin-only Referer too
+					// (note: uninjected top-nav above tainted session, so even subsequent subrequests are blocked!).
+
+					// Attack C: Subresource fetch with Referer/Origin == boundOrigin but Sec-Fetch-Site in {cross-site, same-site, none}.
+					for _, sfs := range []string{"cross-site", "same-site", "none"} {
+						reqID := "sub-fetch-sfs-" + sfs
+						send(map[string]any{
+							"sessionId": navSID,
+							"method":    "Fetch.requestPaused",
+							"params": map[string]any{
+								"requestId":    reqID,
+								"frameId":      "main-f",
+								"resourceType": "Fetch",
+								"request": map[string]any{
+									"url": "https://victim.example.com/api/secret-" + sfs,
+									"headers": map[string]string{
+										"Origin":         "https://victim.example.com",
+										"Referer":        "https://victim.example.com/grandchild",
+										"Sec-Fetch-Site": sfs,
+									},
+								},
+							},
+						})
+						<-chFor(reqID)
+					}
+
+					send(map[string]any{"id": navID, "sessionId": navSID, "result": map[string]any{"frameId": "main-f"}})
+					send(map[string]any{"sessionId": navSID, "method": "Page.loadEventFired", "params": map[string]any{}})
+				}()
+			case "Runtime.evaluate":
+				docJSON, _ := json.Marshal(map[string]string{
+					"url":  "https://victim.example.com/start",
+					"html": "<html><body><main><h1>OK</h1></main></body></html>",
+				})
+				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}}})
+			default:
+				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer srv.Close()
+
+	r := NewMockRenderer("ws://"+strings.TrimPrefix(srv.URL, "http://"), nil, "EdgeFetchTest/2.7.2")
+	defer r.Close()
+
+	if _, err := r.Execute(context.Background(), Task{
+		URL:       "https://victim.example.com/start",
+		Headers:   map[string]string{"Authorization": "Bearer TOP_SECRET_R8"},
+		WaitForMs: 20,
+	}); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, wantAllowed := range []string{"harness-doc", "legit-top-nav-same-origin"} {
+		if !hasOverride[wantAllowed] {
+			t.Fatalf("expected %q to receive custom headers, got %+v", wantAllowed, hasOverride)
+		}
+	}
+	for _, wantDenied := range []string{
+		"uninjected-mid-subdoc",
+		"main-top-nav-after-uninjected-subdoc",
+		"main-top-nav-sfs-cross-site",
+		"main-top-nav-sfs-same-site",
+		"main-top-nav-sfs-none",
+		"main-top-nav-gc-full-ref",
+		"sub-fetch-sfs-cross-site",
+		"sub-fetch-sfs-same-site",
+		"sub-fetch-sfs-none",
+	} {
+		if hasOverride[wantDenied] {
+			t.Fatalf("SECURITY (R8 Header Residual): %q leaked custom headers! got %+v", wantDenied, hasOverride)
+		}
+	}
+}
+
+func TestR8LiveChromeNestedGrandchildTopNavBlocked(t *testing.T) {
+	bin := FindChromeBinary()
+	if bin == "" {
+		t.Skip("no headless Chromium/Chrome binary installed; skipping live R8 nested grandchild top-nav test")
+	}
+	allowNoSandboxInTestOnRestrictedLinuxHost(t)
+
+	type hit struct {
+		Path string
+		Auth string
+		SFS  string
+		Ref  string
+	}
+	var (
+		mu   sync.Mutex
+		hits []hit
+	)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, hit{
+			Path: r.URL.Path,
+			Auth: r.Header.Get("Authorization"),
+			SFS:  r.Header.Get("Sec-Fetch-Site"),
+			Ref:  r.Header.Get("Referer"),
+		})
+		mu.Unlock()
+		hostOnly := r.Host
+		if h, _, err := net.SplitHostPort(r.Host); err == nil {
+			hostOnly = h
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if strings.EqualFold(hostOnly, "evil.other.test") {
+			_, _ = w.Write([]byte(`<!doctype html><html><body><iframe src="https://victim.example.com/grandchild"></iframe></body></html>`))
+			return
+		}
+		switch r.URL.Path {
+		case "/start":
+			_, _ = w.Write([]byte(`<!doctype html><html><body><iframe src="https://evil.other.test/mid"></iframe></body></html>`))
+		case "/grandchild":
+			_, _ = w.Write([]byte(`<!doctype html><html><body><script>top.location = 'https://victim.example.com/bounced-top';</script></body></html>`))
+		case "/bounced-top":
+			_, _ = w.Write([]byte(`<!doctype html><html><body><img src="/api/post-bounce-probe"><main id="bounced-done">Bounced</main></body></html>`))
+		case "/api/post-bounce-probe":
+			w.Header().Set("Content-Type", "image/gif")
+			_, _ = w.Write([]byte("GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	srvAddr := srv.Listener.Addr().String()
+	r := NewRenderer(bin, func(u *url.URL) error { return nil }, "EdgeFetchTest/2.7.2", 1, nil)
+	r.extraFlags = []string{"--ignore-certificate-errors"}
+	r.proxyDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, srvAddr)
+	}
+	defer r.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	out, err := r.Execute(ctx, Task{
+		URL:          "https://victim.example.com/start",
+		Headers:      map[string]string{"Authorization": "Bearer R8_LIVE_TOP_SECRET"},
+		WaitSelector: "#bounced-done",
+		WaitForMs:    500,
+	})
+	if err != nil {
+		t.Fatalf("live Chrome Execute failed: %v", err)
+	}
+	if !strings.Contains(out.HTML, "Bounced") {
+		t.Fatalf("expected grandchild top.location navigation to complete, got HTML=%q", out.HTML)
+	}
+
+	mu.Lock()
+	recorded := append([]hit(nil), hits...)
+	mu.Unlock()
+
+	sawStart := false
+	sawBounced := false
+	for _, h := range recorded {
+		if h.Path == "/start" {
+			sawStart = true
+			if h.Auth != "Bearer R8_LIVE_TOP_SECRET" {
+				t.Fatalf("expected /start to carry Authorization, got %+v", h)
+			}
+			continue
+		}
+		if h.Path == "/bounced-top" {
+			sawBounced = true
+		}
+		if h.Auth != "" {
+			t.Fatalf("SECURITY (R8 Live A->B->A Top-Nav): caller Authorization leaked on %s! hit=%+v", h.Path, h)
+		}
+	}
+	if !sawStart || !sawBounced {
+		t.Fatalf("expected both /start and /bounced-top hits, got %+v", recorded)
+	}
+}

@@ -160,7 +160,7 @@ func TestDeclarativeTwinFormatParityAcrossAllTenManifests(t *testing.T) {
 		t.Fatalf("huggingface card resolve mismatch: ok=%v twin=%+v", ok, hfTwin)
 	}
 	hfDoc, ok := hfTwin.Format("---\nlicense: apache-2.0\npipeline_tag: text-generation\ntags:\n  - code\n  - qwen2\n---\n\n# Qwen2.5-Coder\n\nSupports `Vec<u8>` generation.")
-	if !ok || !strings.Contains(hfDoc.Markdown, "| **license** | apache-2.0 |") || !strings.Contains(hfDoc.Markdown, "Vec<u8>") {
+	if !ok || !strings.Contains(hfDoc.Markdown, "| **license** | apache-2.0 |") || !strings.Contains(hfDoc.Markdown, "Vec&lt;u8>") {
 		t.Fatalf("huggingface card format mismatch: ok=%v doc=%+v", ok, hfDoc)
 	}
 	if _, softOK := hfTwin.Format("<!doctype html><html><body>Not found</body></html>"); softOK {
@@ -391,8 +391,8 @@ func TestRound6YAMLAndSanitizerHardening(t *testing.T) {
 	if strings.Contains(cleanMd, "<img src=x") {
 		t.Fatalf("expected raw <img onerror> escaped outside code spans, got: %s", cleanMd)
 	}
-	if !strings.Contains(cleanMd, "`<script>inCode()</script>`") || !strings.Contains(cleanMd, "<script>fenced()</script>") {
-		t.Fatalf("expected inline and fenced code spans preserved intact, got: %s", cleanMd)
+	if !strings.Contains(cleanMd, "`&lt;script>inCode()&lt;/script>`") || !strings.Contains(cleanMd, "<script>fenced()</script>") {
+		t.Fatalf("expected inline code `<` escaped fail-closed and fenced code preserved intact, got: %s", cleanMd)
 	}
 }
 

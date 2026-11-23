@@ -163,5 +163,5 @@ func (p *SSRFProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = upstream.Close()
 }
 
-// ErrBrowserUnavailable indicates no headless Chromium binary is installed in the current runtime (e.g. distroless Lite).
-var ErrBrowserUnavailable = errors.New("headless Chromium is not installed on this node (deploy edgefetch_fat to enable browser rendering)")
+// ErrBrowserUnavailable indicates no headless Chromium binary is available in the current runtime (e.g. distroless Lite).
+var ErrBrowserUnavailable = errors.New("headless Chromium is not available on this node (connect a browser-capable worker node)")

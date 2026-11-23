@@ -38,9 +38,10 @@ import {
   SCRAPE_PIPELINE_VERSION,
   tryParseJsonPayloadForScrape,
 } from './scrape';
-import { COLLECTION_ID_RE, INTERNAL_COLLECTION_ID_RE } from './search-index';
+import { COLLECTION_ID_RE, D1FtsSearchIndex, INTERNAL_COLLECTION_ID_RE, resolveUserCollectionId } from './search-index';
 import {
   r2DerivedKey,
+  r2PrivateDerivedKey,
   readVerifiedArtifactFromR2,
   sanitizeStorageUserId,
   type ArtifactRetention,
@@ -993,6 +994,7 @@ export async function deliverSignedWebhook(params: {
 }
 
 export interface CrawlJobOptions {
+  userId?: string;
   limit: number;
   maxDepth: number;
   allowSubdomains: boolean;
@@ -1015,6 +1017,7 @@ export interface CrawlJobOptions {
 export interface CrawlWorkflowParams {
   crawlId: string;
   rootUrl: string;
+  userId?: string;
   options?: CrawlJobOptions;
   selfHost?: string;
 }
@@ -1171,9 +1174,15 @@ function pathAllowed(
 }
 
 const crawlsUserIdMigratedDbs = new WeakSet<object>();
+const privateCrawlPagesMigratedDbs = new WeakSet<object>();
 const memberJobRateWindows = new Map<string, { count: number; resetAt: number }>();
 const MAX_MEMBER_JOBS_PER_MINUTE = 20;
 const MAX_MEMBER_ACTIVE_CRAWLS = 4;
+
+async function sha256HexLocal(input: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 async function ensureCrawlsUserIdColumn(metaDb: D1Database): Promise<void> {
   const key = metaDb as unknown as object;
@@ -1188,6 +1197,34 @@ async function ensureCrawlsUserIdColumn(metaDb: D1Database): Promise<void> {
     .run()
     .catch(() => undefined);
   crawlsUserIdMigratedDbs.add(key);
+}
+
+async function ensurePrivateCrawlPagesTable(metaDb: D1Database): Promise<void> {
+  const key = metaDb as unknown as object;
+  if (privateCrawlPagesMigratedDbs.has(key)) return;
+  await metaDb
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS private_crawl_pages (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         crawl_id TEXT NOT NULL,
+         user_id TEXT NOT NULL,
+         url TEXT NOT NULL,
+         status INTEGER NOT NULL,
+         outcome TEXT NOT NULL,
+         title TEXT,
+         content_sha256 TEXT,
+         r2_key TEXT,
+         markdown_inline TEXT,
+         fetched_at INTEGER NOT NULL
+       )`,
+    )
+    .run()
+    .catch(() => undefined);
+  await metaDb
+    .prepare('CREATE INDEX IF NOT EXISTS private_crawl_pages_idx ON private_crawl_pages(crawl_id, user_id, fetched_at ASC)')
+    .run()
+    .catch(() => undefined);
+  privateCrawlPagesMigratedDbs.add(key);
 }
 
 function checkMemberJobRateQuota(bucketKey: string, now: number): boolean {
@@ -1298,6 +1335,7 @@ export async function createCrawlJob(params: {
       : undefined;
 
   const options: CrawlJobOptions = {
+    userId: effectiveUserId,
     limit: typeof payload.limit === 'number' && Number.isFinite(payload.limit) ? Math.min(200, Math.max(1, Math.floor(payload.limit))) : 25,
     maxDepth: Math.min(8, Math.max(0, Math.floor(rawMaxDepth))),
     allowSubdomains: Boolean(payload.allowSubdomains),
@@ -1340,6 +1378,7 @@ export async function executeCrawlJob(params: {
   crawlId: string;
   rootUrl: string;
   options: CrawlJobOptions;
+  userId?: string;
   env: OptionalStorageBindings & { WEBHOOK_SECRET?: string };
   executeHubFetch: HubFetchExecutor;
   selfHost?: string;
@@ -1354,6 +1393,7 @@ export async function executeCrawlJob(params: {
   const envFetch = env as { SAFE_PUBLIC_FETCH?: typeof fetch; SAFE_FETCH?: typeof fetch };
   const webhookFetchFn = params.webhookFetchFn ?? envFetch.SAFE_PUBLIC_FETCH ?? envFetch.SAFE_FETCH;
   const metaDb = env.META!;
+  await ensureCrawlsUserIdColumn(metaDb);
   const rootParsed = new URL(rootUrl);
   const startedAt = Date.now();
   const runtimeBudgetMs =
@@ -1363,12 +1403,25 @@ export async function executeCrawlJob(params: {
         ? 23_000
         : 120_000;
 
+  const initialRow = await metaDb
+    .prepare('SELECT status, user_id FROM crawls WHERE id = ? LIMIT 1')
+    .bind(crawlId)
+    .first<{ status: string; user_id?: string }>()
+    .catch(() => null);
+  const effectiveUserId = sanitizeStorageUserId(
+    params.userId ?? options.userId ?? initialRow?.user_id ?? getActiveCallerAuthContext()?.userId ?? 'owner',
+  );
+  const isPrivateCrawl = effectiveUserId !== 'owner';
+  if (isPrivateCrawl) {
+    await ensurePrivateCrawlPagesTable(metaDb);
+  }
+
   const isCancelled = async (): Promise<boolean> => {
     const row = await metaDb.prepare('SELECT status FROM crawls WHERE id = ? LIMIT 1').bind(crawlId).first<{ status: string }>();
     return row?.status === 'cancelled';
   };
 
-  if (await isCancelled()) {
+  if (initialRow?.status === 'cancelled') {
     return { status: 'cancelled', fetchedCount: 0, failedCount: 0, discoveredCount: 1 };
   }
 
@@ -1440,7 +1493,13 @@ export async function executeCrawlJob(params: {
       const wave = frontier.slice(0, Math.min(remainingBudget, 15));
       const nextFrontier: string[] = [];
 
-      const retention: ArtifactRetention | undefined = env.ARTIFACTS ? 'stored' : undefined;
+      // Multi-user crawl isolation: when `effectiveUserId !== 'owner'`, NEVER trigger shared R2 raw artifact uploads,
+      // shared R2 `r2DerivedKey` writes, or shared `META` `artifacts`/`pages`/`documents` ingest rows!
+      const retention: ArtifactRetention | 'off' | undefined = isPrivateCrawl
+        ? 'off'
+        : env.ARTIFACTS
+          ? 'stored'
+          : undefined;
       const remainingRuntimeSec = Math.max(8, Math.min(45, Math.floor(Math.max(8_000, runtimeBudgetMs - (Date.now() - startedAt)) / 1_000)));
       const effectivePauseMs = options.delayMs !== undefined ? options.delayMs : 800;
       const call = {
@@ -1464,8 +1523,8 @@ export async function executeCrawlJob(params: {
           `crawl:${crawlId}`,
           retention,
           true,
-          options.collectionId,
-          crawlId,
+          isPrivateCrawl ? undefined : options.collectionId,
+          isPrivateCrawl ? undefined : crawlId,
         );
       const fetchOut = await (activeTracer ? activeTracer.run(callWaveFetch) : callWaveFetch());
 
@@ -1502,6 +1561,64 @@ export async function executeCrawlJob(params: {
               ? itemLinks
               : (mdAssets?.links ?? []);
 
+          const resolvedPageTitle =
+            ext?.title ||
+            fm.title ||
+            mdAssets?.title ||
+            (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined);
+
+          if (isPrivateCrawl && itemUrl) {
+            const pageFetchedAt = Date.now();
+            const contentSha256 = md ? await sha256HexLocal(md) : null;
+            let privateR2Key: string | null = null;
+            if (env.ARTIFACTS && md && contentSha256) {
+              privateR2Key = r2PrivateDerivedKey(effectiveUserId, SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256);
+              await env.ARTIFACTS.put(privateR2Key, md, {
+                httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+              }).catch(() => {
+                privateR2Key = null;
+              });
+            }
+            await metaDb
+              .prepare(
+                `INSERT INTO private_crawl_pages
+                 (crawl_id, user_id, url, status, outcome, title, content_sha256, r2_key, markdown_inline, fetched_at)
+                 VALUES (?, ?, ?, ?, 'ok', ?, ?, ?, ?, ?)`,
+              )
+              .bind(
+                crawlId,
+                effectiveUserId,
+                itemUrl,
+                typeof item.status === 'number' ? item.status : 200,
+                resolvedPageTitle ?? null,
+                contentSha256,
+                privateR2Key,
+                privateR2Key ? null : md.slice(0, 262_144),
+                pageFetchedAt,
+              )
+              .run()
+              .catch(() => undefined);
+
+            if (env.SEARCH && options.collectionId && md && contentSha256) {
+              const scopedColl = resolveUserCollectionId(options.collectionId, effectiveUserId, 'private');
+              if (scopedColl.ok) {
+                const pageId = (await sha256HexLocal(`${effectiveUserId}:${itemUrl}`)).slice(0, 32);
+                const idx = new D1FtsSearchIndex(env.SEARCH);
+                await idx
+                  .replacePageChunks({
+                    collectionId: scopedColl.scopedId,
+                    documentId: `privcrawl:${contentSha256.slice(0, 32)}`,
+                    pageId,
+                    url: itemUrl,
+                    title: resolvedPageTitle || itemUrl,
+                    markdown: md,
+                    fetchedAt: pageFetchedAt,
+                  })
+                  .catch(() => undefined);
+              }
+            }
+          }
+
           if (options.webhook) {
             await deliverSignedWebhook({
               webhook: options.webhook,
@@ -1511,11 +1628,7 @@ export async function executeCrawlJob(params: {
               data: {
                 url: itemUrl,
                 status: item.status ?? 200,
-                title:
-                  ext?.title ||
-                  fm.title ||
-                  mdAssets?.title ||
-                  (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined),
+                title: resolvedPageTitle,
                 markdownPreview: md.slice(0, 2_000),
               },
               selfHost,
@@ -1582,6 +1695,24 @@ export async function executeCrawlJob(params: {
           }
         } else {
           failedCount++;
+          if (isPrivateCrawl && itemUrl) {
+            await metaDb
+              .prepare(
+                `INSERT INTO private_crawl_pages
+                 (crawl_id, user_id, url, status, outcome, title, content_sha256, r2_key, markdown_inline, fetched_at)
+                 VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)`,
+              )
+              .bind(
+                crawlId,
+                effectiveUserId,
+                itemUrl,
+                typeof item.status === 'number' ? item.status : 0,
+                typeof item.outcome === 'string' && item.outcome ? item.outcome : 'error',
+                Date.now(),
+              )
+              .run()
+              .catch(() => undefined);
+          }
         }
       }
 
@@ -1708,20 +1839,38 @@ export async function getCrawlJobStatus(params: {
       ? Math.floor(parsedOpts.limit)
       : 25;
 
-  // Reconcile live fetch counts from `fetches` so `fetchedCount` and `status` self-heal automatically even if
-  // Cloudflare Workers' 30s `ctx.waitUntil` cap terminated a background crawl right after its last wave ingested.
-  const aggRow = await metaDb
-    .prepare(
-      `SELECT
-         SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok_cnt,
-         SUM(CASE WHEN outcome != 'ok' THEN 1 ELSE 0 END) AS fail_cnt,
-         MAX(fetched_at) AS last_fetched_at
-       FROM fetches
-       WHERE crawl_id = ?`,
-    )
-    .bind(crawlId)
-    .first<{ ok_cnt: number | null; fail_cnt: number | null; last_fetched_at: number | null }>()
-    .catch(() => null);
+  const isPrivateCrawl = effectiveUserId !== 'owner';
+  if (isPrivateCrawl) {
+    await ensurePrivateCrawlPagesTable(metaDb);
+  }
+
+  // Reconcile live fetch counts from `fetches` (or `private_crawl_pages` for non-owner tenants) so `fetchedCount` and
+  // `status` self-heal automatically even if Cloudflare Workers' 30s `ctx.waitUntil` cap terminated a background crawl.
+  const aggRow = isPrivateCrawl
+    ? await metaDb
+        .prepare(
+          `SELECT
+             SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok_cnt,
+             SUM(CASE WHEN outcome != 'ok' THEN 1 ELSE 0 END) AS fail_cnt,
+             MAX(fetched_at) AS last_fetched_at
+           FROM private_crawl_pages
+           WHERE crawl_id = ? AND user_id = ?`,
+        )
+        .bind(crawlId, effectiveUserId)
+        .first<{ ok_cnt: number | null; fail_cnt: number | null; last_fetched_at: number | null }>()
+        .catch(() => null)
+    : await metaDb
+        .prepare(
+          `SELECT
+             SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok_cnt,
+             SUM(CASE WHEN outcome != 'ok' THEN 1 ELSE 0 END) AS fail_cnt,
+             MAX(fetched_at) AS last_fetched_at
+           FROM fetches
+           WHERE crawl_id = ?`,
+        )
+        .bind(crawlId)
+        .first<{ ok_cnt: number | null; fail_cnt: number | null; last_fetched_at: number | null }>()
+        .catch(() => null);
 
   const liveOk = Number(aggRow?.ok_cnt ?? 0);
   const liveFail = Number(aggRow?.fail_cnt ?? 0);
@@ -1761,120 +1910,171 @@ export async function getCrawlJobStatus(params: {
 
   const safeOffset = Math.max(0, Math.floor(offset));
   const safeLimit = Math.min(50, Math.max(1, Math.floor(limit)));
-  const rawPageRows = (
-    await metaDb
-      .prepare(
-        `SELECT p.url, f.status, f.outcome, f.content_sha256, f.blob_sha256, f.fetched_at, d.title, d.r2_key
-         FROM fetches f
-         JOIN pages p ON p.id = f.page_id
-         LEFT JOIN documents d ON d.id = (
-           SELECT id FROM documents
-           WHERE content_sha256 = f.content_sha256 AND format = 'markdown'
-           ORDER BY pipeline_version DESC
-           LIMIT 1
-         )
-         WHERE f.crawl_id = ?
-         ORDER BY f.fetched_at ASC
-         LIMIT ? OFFSET ?`,
-      )
-      .bind(crawlId, safeLimit + 1, safeOffset)
-      .all<{
-        url: string;
-        status: number;
-        outcome: string;
-        content_sha256: string | null;
-        blob_sha256: string | null;
-        fetched_at: number;
-        title: string | null;
-        r2_key: string | null;
-      }>()
-  ).results ?? [];
-  const hasMoreRows = rawPageRows.length > safeLimit;
-  const pageRows = hasMoreRows ? rawPageRows.slice(0, safeLimit) : rawPageRows;
-
-  const pdfCandidatePipelines = [...new Set([SCRAPE_PIPELINE_VERSION, 1])];
   const data: Array<Record<string, unknown>> = [];
-  for (const pr of pageRows ?? []) {
-    let markdown: string | undefined;
-    let derivedTitle: string | undefined;
-    const isPdfPage = pr.url.toLowerCase().endsWith('.pdf');
-    if (bucket && pr.content_sha256) {
-      let mdObj: R2ObjectBody | null = null;
-      if (pr.r2_key) {
-        mdObj = await bucket.get(pr.r2_key);
-      } else if (isPdfPage) {
-        for (const pv of pdfCandidatePipelines) {
-          mdObj = await bucket.get(r2DerivedKey(pv, 'markdown', pr.content_sha256));
-          if (mdObj) break;
+  let hasMoreRows = false;
+
+  if (isPrivateCrawl) {
+    const rawPrivRows =
+      (
+        await metaDb
+          .prepare(
+            `SELECT url, status, outcome, title, content_sha256, r2_key, markdown_inline, fetched_at
+             FROM private_crawl_pages
+             WHERE crawl_id = ? AND user_id = ?
+             ORDER BY fetched_at ASC, id ASC
+             LIMIT ? OFFSET ?`,
+          )
+          .bind(crawlId, effectiveUserId, safeLimit + 1, safeOffset)
+          .all<{
+            url: string;
+            status: number;
+            outcome: string;
+            title: string | null;
+            content_sha256: string | null;
+            r2_key: string | null;
+            markdown_inline: string | null;
+            fetched_at: number;
+          }>()
+      ).results ?? [];
+    hasMoreRows = rawPrivRows.length > safeLimit;
+    const privRows = hasMoreRows ? rawPrivRows.slice(0, safeLimit) : rawPrivRows;
+    const expectedPrivPrefix = `private/${effectiveUserId}/`;
+    for (const pr of privRows) {
+      let markdown: string | undefined;
+      if (bucket && pr.r2_key && pr.r2_key.startsWith(expectedPrivPrefix)) {
+        const mdObj = await bucket.get(pr.r2_key);
+        if (mdObj) {
+          markdown = await mdObj.text();
         }
       }
-      if (mdObj) {
-        markdown = await mdObj.text();
-      } else if (pr.blob_sha256 && pr.outcome === 'ok') {
-        // Fallback when Crawl is polled immediately before IngestWorkflow finishes or on older vCard/text rows.
-        const rawLoaded = await readVerifiedArtifactFromR2({
-          bucket,
-          blobSha256: pr.blob_sha256,
-          preferredRetention: 'stored',
-          expectedContentSha256: pr.content_sha256,
-        });
-        if (rawLoaded.ok && rawLoaded.bytes.byteLength > 0 && rawLoaded.bytes.byteLength <= 262_144) {
-          const rawText = new TextDecoder('utf-8', { fatal: false }).decode(rawLoaded.bytes);
-          if (!rawText.slice(0, 64).includes('%PDF-')) {
-            if (/^\s*<!doctype\s+html|^\s*<html/i.test(rawText)) {
-              const ext = extractHtmlDocument(rawText, { baseUrl: pr.url, onlyMainContent: true });
-              markdown = ext.markdown;
-              derivedTitle = ext.title;
-            } else if (/^BEGIN:VCARD\b/im.test(rawText.trim())) {
-              const vc = formatVcardToMarkdown(rawText);
-              markdown = vc.markdown;
-              derivedTitle = vc.title;
-            } else if (/^BEGIN:VCALENDAR\b/im.test(rawText.trim())) {
-              const ics = formatIcalendarToMarkdown(rawText);
-              markdown = ics ? ics.markdown : rawText.trim();
-              derivedTitle = ics?.title;
-            } else {
-              const structuredFallback =
-                formatFeedXmlToMarkdown(rawText, pr.url) ??
-                tryParseJsonPayloadForScrape(rawText, undefined, pr.url) ??
-                formatDelimitedTableToMarkdown(rawText, undefined, pr.url) ??
-                formatGitPatchToMarkdown(rawText, undefined, pr.url) ??
-                formatSourceCodeUrlToMarkdown(rawText, undefined, pr.url);
-              if (structuredFallback) {
-                markdown = structuredFallback.markdown;
-                derivedTitle = structuredFallback.title;
+      if (markdown === undefined && typeof pr.markdown_inline === 'string') {
+        markdown = pr.markdown_inline;
+      }
+      data.push({
+        url: pr.url,
+        status: pr.status,
+        outcome: pr.outcome,
+        visibility: 'private',
+        ...(pr.title ? { title: pr.title } : {}),
+        ...(markdown !== undefined ? { markdown } : {}),
+        fetchedAt: pr.fetched_at,
+      });
+    }
+  } else {
+    const rawPageRows = (
+      await metaDb
+        .prepare(
+          `SELECT p.url, f.status, f.outcome, f.content_sha256, f.blob_sha256, f.fetched_at, d.title, d.r2_key
+           FROM fetches f
+           JOIN pages p ON p.id = f.page_id
+           LEFT JOIN documents d ON d.id = (
+             SELECT id FROM documents
+             WHERE content_sha256 = f.content_sha256 AND format = 'markdown'
+             ORDER BY pipeline_version DESC
+             LIMIT 1
+           )
+           WHERE f.crawl_id = ?
+           ORDER BY f.fetched_at ASC
+           LIMIT ? OFFSET ?`,
+        )
+        .bind(crawlId, safeLimit + 1, safeOffset)
+        .all<{
+          url: string;
+          status: number;
+          outcome: string;
+          content_sha256: string | null;
+          blob_sha256: string | null;
+          fetched_at: number;
+          title: string | null;
+          r2_key: string | null;
+        }>()
+    ).results ?? [];
+    hasMoreRows = rawPageRows.length > safeLimit;
+    const pageRows = hasMoreRows ? rawPageRows.slice(0, safeLimit) : rawPageRows;
+
+    const pdfCandidatePipelines = [...new Set([SCRAPE_PIPELINE_VERSION, 1])];
+    for (const pr of pageRows ?? []) {
+      let markdown: string | undefined;
+      let derivedTitle: string | undefined;
+      const isPdfPage = pr.url.toLowerCase().endsWith('.pdf');
+      if (bucket && pr.content_sha256) {
+        let mdObj: R2ObjectBody | null = null;
+        if (pr.r2_key) {
+          mdObj = await bucket.get(pr.r2_key);
+        } else if (isPdfPage) {
+          for (const pv of pdfCandidatePipelines) {
+            mdObj = await bucket.get(r2DerivedKey(pv, 'markdown', pr.content_sha256));
+            if (mdObj) break;
+          }
+        }
+        if (mdObj) {
+          markdown = await mdObj.text();
+        } else if (pr.blob_sha256 && pr.outcome === 'ok') {
+          // Fallback when Crawl is polled immediately before IngestWorkflow finishes or on older vCard/text rows.
+          const rawLoaded = await readVerifiedArtifactFromR2({
+            bucket,
+            blobSha256: pr.blob_sha256,
+            preferredRetention: 'stored',
+            expectedContentSha256: pr.content_sha256,
+          });
+          if (rawLoaded.ok && rawLoaded.bytes.byteLength > 0 && rawLoaded.bytes.byteLength <= 262_144) {
+            const rawText = new TextDecoder('utf-8', { fatal: false }).decode(rawLoaded.bytes);
+            if (!rawText.slice(0, 64).includes('%PDF-')) {
+              if (/^\s*<!doctype\s+html|^\s*<html/i.test(rawText)) {
+                const ext = extractHtmlDocument(rawText, { baseUrl: pr.url, onlyMainContent: true });
+                markdown = ext.markdown;
+                derivedTitle = ext.title;
+              } else if (/^BEGIN:VCARD\b/im.test(rawText.trim())) {
+                const vc = formatVcardToMarkdown(rawText);
+                markdown = vc.markdown;
+                derivedTitle = vc.title;
+              } else if (/^BEGIN:VCALENDAR\b/im.test(rawText.trim())) {
+                const ics = formatIcalendarToMarkdown(rawText);
+                markdown = ics ? ics.markdown : rawText.trim();
+                derivedTitle = ics?.title;
               } else {
-                markdown = rawText.trim();
+                const structuredFallback =
+                  formatFeedXmlToMarkdown(rawText, pr.url) ??
+                  tryParseJsonPayloadForScrape(rawText, undefined, pr.url) ??
+                  formatDelimitedTableToMarkdown(rawText, undefined, pr.url) ??
+                  formatGitPatchToMarkdown(rawText, undefined, pr.url) ??
+                  formatSourceCodeUrlToMarkdown(rawText, undefined, pr.url);
+                if (structuredFallback) {
+                  markdown = structuredFallback.markdown;
+                  derivedTitle = structuredFallback.title;
+                } else {
+                  markdown = rawText.trim();
+                }
               }
             }
           }
         }
       }
-    }
-    if (markdown !== undefined) {
-      const fm = isPdfPage ? { body: markdown } : parseMarkdownFrontmatter(markdown);
-      if (!derivedTitle && fm.title) derivedTitle = fm.title;
-      let cleaned = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), pr.url);
-      if (isPdfPage) {
-        cleaned = cleanPdfMarkdown(cleaned);
+      if (markdown !== undefined) {
+        const fm = isPdfPage ? { body: markdown } : parseMarkdownFrontmatter(markdown);
+        if (!derivedTitle && fm.title) derivedTitle = fm.title;
+        let cleaned = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(fm.body), pr.url);
+        if (isPdfPage) {
+          cleaned = cleanPdfMarkdown(cleaned);
+        }
+        markdown = cleaned.trim();
+        if (!derivedTitle && !pr.title && markdown) {
+          derivedTitle = isPdfPage
+            ? extractPdfTitle(markdown, pr.url)
+            : extractMarkdownLinksAndImages(markdown, pr.url, false).title;
+        }
       }
-      markdown = cleaned.trim();
-      if (!derivedTitle && !pr.title && markdown) {
-        derivedTitle = isPdfPage
-          ? extractPdfTitle(markdown, pr.url)
-          : extractMarkdownLinksAndImages(markdown, pr.url, false).title;
-      }
+      const resolvedTitle = pr.title ? decodeHtmlEntities(pr.title) : derivedTitle;
+      data.push({
+        url: pr.url,
+        status: pr.status,
+        outcome: pr.outcome,
+        ...(resolvedTitle ? { title: resolvedTitle } : {}),
+        ...(pr.blob_sha256 ? { artifactId: pr.blob_sha256 } : {}),
+        ...(markdown !== undefined ? { markdown } : {}),
+        fetchedAt: pr.fetched_at,
+      });
     }
-    const resolvedTitle = pr.title ? decodeHtmlEntities(pr.title) : derivedTitle;
-    data.push({
-      url: pr.url,
-      status: pr.status,
-      outcome: pr.outcome,
-      ...(resolvedTitle ? { title: resolvedTitle } : {}),
-      ...(pr.blob_sha256 ? { artifactId: pr.blob_sha256 } : {}),
-      ...(markdown !== undefined ? { markdown } : {}),
-      fetchedAt: pr.fetched_at,
-    });
   }
 
   return {
@@ -1934,14 +2134,16 @@ export class CrawlWorkflow extends WorkflowEntrypoint<OptionalStorageBindings, C
     });
     if ((status === 'queued' || status === 'running') && event.payload.rootUrl && event.payload.options) {
       const finalStatus = await step.do('execute-crawl-job', async () => {
+        const resolvedUserId = event.payload.userId ?? event.payload.options?.userId;
         const out = await executeCrawlJob({
           crawlId: event.payload.crawlId,
           rootUrl: event.payload.rootUrl,
           options: event.payload.options!,
+          ...(resolvedUserId ? { userId: resolvedUserId } : {}),
           env: this.env,
           ...(event.payload.selfHost ? { selfHost: event.payload.selfHost } : {}),
           executeHubFetch: async (_target, body) => {
-            const res = await cloudflareOverflowFetch(body, 'EdgeFetch/2.7.1', event.payload.selfHost ?? 'localhost');
+            const res = await cloudflareOverflowFetch(body, 'EdgeFetch/2.7.2', event.payload.selfHost ?? 'localhost');
             return { status: res.status, via: 'cf', bodyText: await res.text() };
           },
         });

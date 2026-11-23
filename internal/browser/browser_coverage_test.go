@@ -425,8 +425,8 @@ func TestRendererHelpersHeadersEnvSnapAndHostPolicy(t *testing.T) {
 	if isSameOriginInitiatorHeaders(map[string]any{"Sec-Fetch-Site": "cross-site"}, initOrigin) {
 		t.Fatal("Sec-Fetch-Site: cross-site without proven same-origin must fail")
 	}
-	if !isSameOriginInitiatorHeaders(map[string]any{"Sec-Fetch-Site": "cross-site", "Origin": "https://victim.test"}, initOrigin) {
-		t.Fatal("Sec-Fetch-Site: cross-site with proven same-origin Origin must allow")
+	if isSameOriginInitiatorHeaders(map[string]any{"Sec-Fetch-Site": "cross-site", "Origin": "https://victim.test"}, initOrigin) {
+		t.Fatal("Sec-Fetch-Site: cross-site must reject even when Origin/Referer names initOrigin")
 	}
 
 	// handleRequestPaused invalid JSON / empty RequestID.
@@ -613,14 +613,16 @@ func TestRendererHelpersHeadersEnvSnapAndHostPolicy(t *testing.T) {
 	if !isLinuxProcessZombieOrDead(123) {
 		t.Fatal("zombie Z stat should return true")
 	}
-	readProcFile = func(path string) ([]byte, error) {
-		if strings.HasSuffix(path, "attr/current") {
-			return []byte("edgefetch_fat (enforce)"), nil
+	for _, prof := range []string{"c3b8e9a1_edgefetch (enforce)", "edgefetch (enforce)", "edgefetch_fat (enforce)"} {
+		readProcFile = func(path string) ([]byte, error) {
+			if strings.HasSuffix(path, "attr/current") {
+				return []byte(prof), nil
+			}
+			return nil, os.ErrNotExist
 		}
-		return nil, os.ErrNotExist
-	}
-	if !linuxSandboxBlockedByHostPolicy() {
-		t.Fatal("expected edgefetch_fat attr to trigger host policy block")
+		if !linuxSandboxBlockedByHostPolicy() {
+			t.Fatalf("expected %q attr to trigger host policy block", prof)
+		}
 	}
 	readProcFile = func(path string) ([]byte, error) {
 		if strings.HasSuffix(path, "unprivileged_userns_clone") {
@@ -1461,7 +1463,7 @@ func TestRendererProbeStartupPipeLaunchAndSandboxFallback(t *testing.T) {
 	t.Cleanup(func() { readProcFile = origReadProc })
 	readProcFile = func(path string) ([]byte, error) {
 		if strings.HasSuffix(path, "attr/current") {
-			return []byte("edgefetch_fat"), nil
+			return []byte("edgefetch"), nil
 		}
 		return nil, os.ErrNotExist
 	}

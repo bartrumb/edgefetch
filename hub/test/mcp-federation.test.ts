@@ -20,6 +20,7 @@ import {
   createMemoryMcpVaultStore,
   resolveCallerUserId,
   sealVaultCredentials,
+  startDownstreamMcpOAuth,
   unsealVaultCredentials,
 } from '../src/mcp-vault.ts';
 import { createSqliteOAuthStore, OAUTH_SQLITE_SCHEMA, sha256Base64Url } from '../src/oauth.ts';
@@ -550,7 +551,7 @@ test('MCP-FED-3: /admin Registry, Add Auth, Test Connection, Write-Only Secrets,
     assert.ok(!stateText.includes('static_pat_SUPER_SECRET_999'));
     assert.match(stateText, /"vaultConfigured":true/);
 
-    // 4. Downstream OAuth 2.1 PKCE Probe -> Start -> Callback -> Auto-Refresh!
+    // 4. Downstream OAuth 2.1 PKCE Probe -> Unconfirmed Cross-Origin AS Rejection -> Confirmed Start -> Callback -> Auto-Refresh!
     const probeRes = await handleAdminRoute(
       new Request('https://hub.edgefetch.dev/admin/api/mcp/probe', {
         method: 'POST',
@@ -565,11 +566,18 @@ test('MCP-FED-3: /admin Registry, Add Auth, Test Connection, Write-Only Secrets,
       new URL('https://hub.edgefetch.dev/admin/api/mcp/probe'),
       adminDeps,
     );
-    const probeJson = (await probeRes!.json()) as { supported: boolean; authorizationEndpoint: string };
-    assert.equal(probeJson.supported, true);
-    assert.equal(probeJson.authorizationEndpoint, 'https://auth.acme.example/oauth/authorize');
+    const probeJson = (await probeRes!.json()) as {
+      supported: boolean;
+      error?: string;
+      authOrigin?: string;
+      connectorOrigin?: string;
+    };
+    assert.equal(probeJson.supported, false, 'Cross-origin AS must require explicit host confirmation');
+    assert.equal(probeJson.error, 'cross_origin_auth_confirmation_required');
+    assert.equal(probeJson.authOrigin, 'https://auth.acme.example');
+    assert.equal(probeJson.connectorOrigin, 'https://mcp.acme.example');
 
-    const oauthStartRes = await handleAdminRoute(
+    const unconfirmedOAuthStartRes = await handleAdminRoute(
       new Request('https://hub.edgefetch.dev/admin/mcp/oauth/start', {
         method: 'POST',
         headers: {
@@ -588,11 +596,36 @@ test('MCP-FED-3: /admin Registry, Add Auth, Test Connection, Write-Only Secrets,
       new URL('https://hub.edgefetch.dev/admin/mcp/oauth/start'),
       adminDeps,
     );
-    assert.equal(oauthStartRes?.status, 200);
-    const bindCookie = (oauthStartRes?.headers.get('set-cookie') ?? '').split(';')[0]!;
-    assert.match(bindCookie, /^__Host-ef_mcp_oauth_bind=/);
-    const startJson = (await oauthStartRes!.json()) as { ok: boolean; authorizationUrl: string };
-    const authUrlObj = new URL(startJson.authorizationUrl);
+    assert.equal(unconfirmedOAuthStartRes?.status, 409);
+    const unconfirmedStartJson = (await unconfirmedOAuthStartRes!.json()) as {
+      ok: boolean;
+      error: string;
+      authOrigin: string;
+      connectorOrigin: string;
+    };
+    assert.equal(unconfirmedStartJson.ok, false);
+    assert.equal(unconfirmedStartJson.error, 'cross_origin_auth_confirmation_required');
+    assert.equal(unconfirmedStartJson.authOrigin, 'https://auth.acme.example');
+    assert.equal(unconfirmedStartJson.connectorOrigin, 'https://mcp.acme.example');
+
+    const confirmedStart = await startDownstreamMcpOAuth({
+      userId: 'owner',
+      sessionCsrf: csrf,
+      hubOrigin: 'https://hub.edgefetch.dev',
+      remoteUrl: 'https://mcp.acme.example/mcp',
+      confirmedAuthOrigin: 'https://auth.acme.example',
+      slug: 'acme-oauth',
+      name: 'Acme OAuth MCP',
+      domains: ['acme.example'],
+      vaultMasterKey: TEST_VAULT_KEY,
+      vaultStore,
+      fetchFn: mockSafeFetch,
+      selfHost: 'hub.edgefetch.dev',
+    });
+    assert.equal(confirmedStart.ok, true);
+    if (!confirmedStart.ok) throw new Error('expected confirmed OAuth start to succeed');
+    const bindCookie = `__Host-ef_mcp_oauth_bind=${confirmedStart.bindCookieValue}`;
+    const authUrlObj = new URL(confirmedStart.authorizationUrl);
     assert.equal(authUrlObj.searchParams.get('code_challenge_method'), 'S256');
     assert.equal(authUrlObj.searchParams.get('client_id'), 'dcr_client_acme_1');
     const oauthState = authUrlObj.searchParams.get('state')!;
@@ -885,11 +918,12 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
     });
   };
 
-  // 1. BYO-LLM `/v1/agent` run with connected Linear MCP
+  // 1. BYO-LLM `/v1/agent` run with connected Linear MCP (explicitly opted in)
   const agentOut = await startOrExecuteAgentCall({
     payload: {
       prompt: 'Check status and priority of https://linear.app/acme/issue/ENG-101',
       urls: ['https://linear.app/acme/issue/ENG-101'],
+      useConnectedMcp: true,
     },
     env: {
       ARTIFACTS: fakeR2,
@@ -1113,6 +1147,7 @@ test('MCP-FED-5: Cross-pillar GitHub Multi-User + AES-256-GCM Vault isolation (g
     GITHUB_CLIENT_ID: 'Iv23liCrossPillarTest',
     GITHUB_CLIENT_SECRET: ghClientSecret,
     GITHUB_OWNER_LOGIN: 'platform-owner',
+    GITHUB_OWNER_ID: '1',
     GITHUB_ALLOWED_USERS: 'alice-dev,bob-dev',
     SIGNUP_MODE: 'invite_only',
     SAFE_PUBLIC_FETCH: mockSafePublicFetch,

@@ -1,5 +1,6 @@
 {
   "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
   "archMap": [
     {
       "architecture": "SCMP_ARCH_X86_64",
@@ -17,35 +18,86 @@
   ],
   "syscalls": [
     {
+      "comment": "Explicitly deny high-risk kernel-attack-surface, mount, module, BPF, io_uring, keyring, and debugging syscalls",
       "names": [
+        "acct",
+        "add_key",
+        "adjtimex",
+        "bpf",
+        "clock_adjtime",
+        "clock_adjtime64",
+        "delete_module",
+        "fanotify_init",
+        "fanotify_mark",
+        "finit_module",
+        "fsconfig",
+        "fsmount",
+        "fsopen",
+        "fspick",
+        "init_module",
+        "io_uring_enter",
+        "io_uring_register",
+        "io_uring_setup",
+        "kcmp",
+        "kexec_file_load",
+        "kexec_load",
+        "keyctl",
+        "lookup_dcookie",
+        "mknod",
+        "mknodat",
+        "mount",
+        "mount_setattr",
+        "move_mount",
+        "name_to_handle_at",
+        "open_by_handle_at",
+        "open_tree",
+        "perf_event_open",
+        "pivot_root",
+        "process_vm_readv",
+        "process_vm_writev",
+        "ptrace",
+        "quotactl",
+        "quotactl_fd",
+        "reboot",
+        "remap_file_pages",
+        "request_key",
+        "setdomainname",
+        "sethostname",
+        "settimeofday",
+        "swapoff",
+        "swapon",
+        "syslog",
+        "umount",
+        "umount2",
+        "uselib",
+        "userfaultfd",
+        "ustat",
+        "vhangup",
+        "vmsplice"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "Core unprivileged POSIX I/O, Go runtime, epoll/futex, sockets, shared memory, and Chromium renderer/SwiftShader IPC",
+      "names": [
+        "_llseek",
+        "_newselect",
         "accept",
         "accept4",
         "access",
-        "adjtimex",
         "alarm",
-        "arch_prctl",
-        "arm_fadvise64_64",
-        "arm_sync_file_range",
         "bind",
         "brk",
         "cachestat",
-        "capget",
-        "capset",
         "chdir",
         "chmod",
-        "chown",
-        "chown32",
-        "chroot",
-        "clock_adjtime",
-        "clock_adjtime64",
         "clock_getres",
         "clock_getres_time64",
         "clock_gettime",
         "clock_gettime64",
         "clock_nanosleep",
         "clock_nanosleep_time64",
-        "clone",
-        "clone3",
         "close",
         "close_range",
         "connect",
@@ -73,14 +125,10 @@
         "fadvise64",
         "fadvise64_64",
         "fallocate",
-        "fanotify_mark",
         "fchdir",
         "fchmod",
         "fchmodat",
         "fchmodat2",
-        "fchown",
-        "fchown32",
-        "fchownat",
         "fcntl",
         "fcntl64",
         "fdatasync",
@@ -106,7 +154,6 @@
         "futex_wake",
         "futimesat",
         "get_robust_list",
-        "get_thread_area",
         "getcpu",
         "getcwd",
         "getdents",
@@ -145,23 +192,10 @@
         "inotify_init",
         "inotify_init1",
         "inotify_rm_watch",
-        "io_cancel",
-        "io_destroy",
-        "io_getevents",
-        "io_pgetevents",
-        "io_pgetevents_time64",
-        "io_setup",
-        "io_submit",
         "ioctl",
         "ioprio_get",
-        "ioprio_set",
         "ipc",
         "kill",
-        "landlock_add_rule",
-        "landlock_create_ruleset",
-        "landlock_restrict_self",
-        "lchown",
-        "lchown32",
         "lgetxattr",
         "link",
         "linkat",
@@ -170,34 +204,21 @@
         "llistxattr",
         "lremovexattr",
         "lseek",
-        "_llseek",
         "lsetxattr",
         "lstat",
         "lstat64",
         "madvise",
-        "map_shadow_stack",
         "membarrier",
         "memfd_create",
-        "memfd_secret",
         "mincore",
         "mkdir",
         "mkdirat",
-        "mknod",
-        "mknodat",
         "mlock",
         "mlock2",
         "mlockall",
         "mmap",
         "mmap2",
         "mprotect",
-        "mq_getsetattr",
-        "mq_notify",
-        "mq_open",
-        "mq_timedreceive",
-        "mq_timedreceive_time64",
-        "mq_timedsend",
-        "mq_timedsend_time64",
-        "mq_unlink",
         "mremap",
         "msgctl",
         "msgget",
@@ -246,7 +267,6 @@
         "recvmmsg",
         "recvmmsg_time64",
         "recvmsg",
-        "remap_file_pages",
         "removexattr",
         "rename",
         "renameat",
@@ -278,7 +298,6 @@
         "sched_yield",
         "seccomp",
         "select",
-        "_newselect",
         "semctl",
         "semget",
         "semop",
@@ -291,33 +310,13 @@
         "sendmsg",
         "sendto",
         "set_robust_list",
-        "set_thread_area",
         "set_tid_address",
-        "setfsgid",
-        "setfsgid32",
-        "setfsuid",
-        "setfsuid32",
-        "setgid",
-        "setgid32",
-        "setgroups",
-        "setgroups32",
         "setitimer",
-        "setns",
         "setpgid",
         "setpriority",
-        "setregid",
-        "setregid32",
-        "setresgid",
-        "setresgid32",
-        "setresuid",
-        "setresuid32",
-        "setreuid",
-        "setreuid32",
         "setrlimit",
         "setsid",
         "setsockopt",
-        "setuid",
-        "setuid32",
         "setxattr",
         "shmat",
         "shmctl",
@@ -368,13 +367,11 @@
         "uname",
         "unlink",
         "unlinkat",
-        "unshare",
         "utime",
         "utimensat",
         "utimensat_time64",
         "utimes",
         "vfork",
-        "vmsplice",
         "wait4",
         "waitid",
         "waitpid",
@@ -382,6 +379,141 @@
         "writev"
       ],
       "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Privilege-drop & Chromium user-namespace UID/GID/capability drop syscalls (priv.DropRoot + credentials.cc)",
+      "names": [
+        "capget",
+        "capset",
+        "setfsgid",
+        "setfsgid32",
+        "setfsuid",
+        "setfsuid32",
+        "setgid",
+        "setgid32",
+        "setgroups",
+        "setgroups32",
+        "setregid",
+        "setregid32",
+        "setresgid",
+        "setresgid32",
+        "setresuid",
+        "setresuid32",
+        "setreuid",
+        "setreuid32",
+        "setuid",
+        "setuid32"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "Chromium Linux namespace sandbox (namespace_sandbox.cc: CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET + ChrootToSafeEmptyDir; no mount/pivot_root)",
+      "names": [
+        "chroot",
+        "clone",
+        "clone3",
+        "setns",
+        "unshare"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "comment": "x86_64 / x32 TLS and shadow-stack syscalls gated strictly to amd64/x32",
+      "names": [
+        "arch_prctl",
+        "get_thread_area",
+        "map_shadow_stack",
+        "set_thread_area"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "arches": [
+          "amd64",
+          "x32"
+        ]
+      }
+    },
+    {
+      "comment": "ARM64 / ARMv7 syscalls gated strictly to arm64/arm",
+      "names": [
+        "arm_fadvise64_64",
+        "arm_sync_file_range",
+        "cacheflush",
+        "set_tls"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "includes": {
+        "arches": [
+          "arm",
+          "arm64"
+        ]
+      }
+    },
+    {
+      "comment": "Restrict personality strictly to safe flags (PER_LINUX, PER_LINUX32, UNAME26, query 0xffffffff) — blocks READ_IMPLIES_EXEC & ADDR_NO_RANDOMIZE",
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 0,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 8,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 131072,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 131080,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "personality"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 4294967295,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
     }
   ]
 }

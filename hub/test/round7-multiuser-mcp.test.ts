@@ -830,6 +830,7 @@ test('R7-H4, H5, H6 & Multi-User Isolation: Founder ID pinning, live session_epo
     GITHUB_CLIENT_ID: 'Iv23liRound7Suite',
     GITHUB_CLIENT_SECRET: 'ghs_round7_client_secret_0123456789abcdef',
     GITHUB_OWNER_LOGIN: 'founder-login',
+    GITHUB_OWNER_ID: '100',
     GITHUB_ALLOWED_USERS: 'alice-coowner,bob-member',
     SIGNUP_MODE: 'invite_only',
     SAFE_PUBLIC_FETCH: mockSafeFetch,

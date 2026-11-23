@@ -246,6 +246,34 @@ export async function writePrivateArtifactToR2(params: {
   return { blobSha256, contentSha256, key };
 }
 
+export async function writeArtifactToR2(params: {
+  bucket: R2Bucket;
+  rawBytes: Uint8Array;
+  retention?: ArtifactRetention;
+  userId?: string;
+  privateOnly?: boolean;
+}): Promise<{ blobSha256: string; contentSha256: string; key: string }> {
+  const { bucket, rawBytes, retention = 'transient', userId = 'owner', privateOnly = false } = params;
+  if (privateOnly || sanitizeStorageUserId(userId) !== 'owner') {
+    return writePrivateArtifactToR2({ bucket, userId, rawBytes, retention });
+  }
+  const contentSha256 = bytesToHex(await crypto.subtle.digest('SHA-256', rawBytes as unknown as BufferSource));
+  const gzStream = new Blob([rawBytes as unknown as BlobPart]).stream().pipeThrough(new CompressionStream('gzip') as unknown as TransformStream<Uint8Array, Uint8Array>);
+  const gzBytes = new Uint8Array(await new Response(gzStream).arrayBuffer());
+  const blobSha256 = bytesToHex(await crypto.subtle.digest('SHA-256', gzBytes));
+  const key = r2ArtifactKey(retention, blobSha256);
+  await bucket.put(key, gzBytes, {
+    sha256: blobSha256,
+    httpMetadata: { contentType: 'application/gzip' },
+    customMetadata: {
+      contentSha256,
+      contentBytes: String(rawBytes.byteLength),
+      retention,
+    },
+  });
+  return { blobSha256, contentSha256, key };
+}
+
 /**
  * R2 prefix lifecycle expiration starts at upload time, so content-addressed deduplication must refresh an existing
  * object whenever `head()` shows it is older than half its retention window (12h for `transient`, 15d for `stored`).
@@ -306,7 +334,7 @@ export function buildCapabilities(
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
-  version = '2.7.6',
+  version = '2.7.7',
 ): HubCapabilities {
   const searchProviders: string[] = ['edge-map'];
   if (env.SEARCH) searchProviders.push('d1-fts5');
@@ -360,6 +388,10 @@ export interface AuthorizeArtifactUploadCallback {
 
 const MAX_RECENT_UPLOAD_CACHE = 1_024;
 const recentArtifactUploads = new Map<string, number>();
+
+export function resetRecentArtifactUploadsForTests(): void {
+  recentArtifactUploads.clear();
+}
 
 function rememberUploadedArtifact(key: string, uploadedAtMs: number): void {
   recentArtifactUploads.delete(key);
@@ -493,7 +525,48 @@ export async function handleAgentArtifactUpload(params: {
     return Response.json({ error: 'blob_sha256_mismatch' }, { status: 400 });
   }
 
-  // Record `blobSha256` on the pending job ONLY after proof-of-possession succeeded!
+  // Cryptographically verify gunzipped payload length (`contentBytes`) and `SHA-256(gunzipped) === contentSha256` BEFORE
+  // confirming on the job or writing/updating R2 metadata (`EF-BLIND-02` — prevents `customMetadata.contentSha256` poisoning!).
+  let gunzippedTotal = 0;
+  const gunzipChunks: Uint8Array[] = [];
+  try {
+    const gzStream = new Blob([fullPayload])
+      .stream()
+      .pipeThrough(new DecompressionStream('gzip') as unknown as TransformStream<Uint8Array, Uint8Array>);
+    const gzReader = gzStream.getReader();
+    for (;;) {
+      const { done, value } = await gzReader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        gunzippedTotal += value.byteLength;
+        if (gunzippedTotal > MAX_ARTIFACT_CONTENT_BYTES || gunzippedTotal > contentBytes) {
+          await gzReader.cancel('uncompressed size exceeded').catch(() => undefined);
+          return Response.json(
+            { error: gunzippedTotal > MAX_ARTIFACT_CONTENT_BYTES ? 'content_bytes_exceeds_limit' : 'content_bytes_mismatch' },
+            { status: gunzippedTotal > MAX_ARTIFACT_CONTENT_BYTES ? 413 : 400 },
+          );
+        }
+        gunzipChunks.push(value);
+      }
+    }
+  } catch {
+    return Response.json({ error: 'corrupt_gzip' }, { status: 400 });
+  }
+  if (gunzippedTotal !== contentBytes) {
+    return Response.json({ error: 'content_bytes_mismatch' }, { status: 400 });
+  }
+  const gunzippedPayload = new Uint8Array(gunzippedTotal);
+  let gzOff = 0;
+  for (const chunk of gunzipChunks) {
+    gunzippedPayload.set(chunk, gzOff);
+    gzOff += chunk.byteLength;
+  }
+  const actualContentSha = bytesToHex(await crypto.subtle.digest('SHA-256', gunzippedPayload));
+  if (actualContentSha !== contentSha256) {
+    return Response.json({ error: 'content_sha256_mismatch' }, { status: 400 });
+  }
+
+  // Record `blobSha256` on the pending job ONLY after compressed + uncompressed proof-of-possession succeeded!
   await authorizeJobUpload({
     jobId,
     jobNonce,
@@ -516,20 +589,32 @@ export async function handleAgentArtifactUpload(params: {
   let knownNewInMeta = false;
   if (metaDb) {
     const metaRow = await metaDb
-      .prepare('SELECT last_seen_at FROM artifacts WHERE blob_sha256 = ? AND retention = ? LIMIT 1')
-      .bind(blobSha256, rawRetention)
-      .first<{ last_seen_at: number | null }>()
+      .prepare('SELECT retention, last_seen_at FROM artifacts WHERE blob_sha256 = ? LIMIT 1')
+      .bind(blobSha256)
+      .first<{ retention?: string | null; last_seen_at: number | null }>()
       .catch(() => null);
-    if (metaRow?.last_seen_at && !shouldRefreshDedupedObject(metaRow.last_seen_at, rawRetention, now)) {
+    const metaRet: ArtifactRetention = metaRow?.retention === 'stored' ? 'stored' : rawRetention;
+    const canSatisfyRetention = metaRow?.retention === rawRetention || (rawRetention === 'transient' && metaRow?.retention === 'stored');
+    if (canSatisfyRetention && metaRow?.last_seen_at && !shouldRefreshDedupedObject(metaRow.last_seen_at, metaRet, now)) {
+      const checkKey = metaRet === 'stored' ? r2ArtifactKey('stored', blobSha256) : key;
+      existing = await bucket.head(checkKey);
+      if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), metaRet, now)) {
+        rememberUploadedArtifact(key, existing.uploaded.getTime());
+        return Response.json({ ok: true, stored: false, deduplicated: true, key: checkKey }, { status: 200 });
+      }
+      if (checkKey !== key) {
+        existing = null;
+      }
+    } else if (!metaRow) {
+      // Brand-new content-addressed upload: skip `bucket.head(key)` so Cloudflare OTEL never
+      // emits `r2_head ERROR: The specified key does not exist.` on every new page crawl.
+      knownNewInMeta = true;
+    } else {
       existing = await bucket.head(key);
       if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
         rememberUploadedArtifact(key, existing.uploaded.getTime());
         return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
       }
-    } else {
-      // Brand-new or due-for-refresh content-addressed upload: skip `bucket.head(key)` so Cloudflare OTEL never
-      // emits `r2_head ERROR: The specified key does not exist.` on every new page crawl.
-      knownNewInMeta = true;
     }
   } else {
     existing = await bucket.head(key);

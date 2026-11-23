@@ -74,6 +74,7 @@ import {
 } from './search-index';
 import {
   isValidSha256Hex,
+  MAX_ARTIFACT_CONTENT_BYTES,
   normalizeVisibility,
   primeSanitizedMarkdownCache,
   r2ArtifactKey,
@@ -83,6 +84,7 @@ import {
   readVerifiedArtifactFromR2,
   sanitizeStorageUserId,
   SCRAPE_PIPELINE_VERSION,
+  writeArtifactToR2,
   writePrivateArtifactToR2,
   type ArtifactRetention,
   type OptionalStorageBindings,
@@ -13011,6 +13013,16 @@ export async function executeScrapeCall(params: {
     }).catch(() => undefined);
   }
 
+  const screenshotArtifactMeta =
+    typeof item.screenshotBase64 === 'string' && item.screenshotBase64 && env.ARTIFACTS && payload.ephemeral !== true
+      ? await storeScreenshotArtifactIfEnabled({
+          screenshotBase64: item.screenshotBase64,
+          bucket: env.ARTIFACTS,
+          userId,
+          privateOnly: isPrivateScrape,
+        })
+      : undefined;
+
   const out: Record<string, unknown> = {
     ok: true,
     cached: false,
@@ -13108,7 +13120,11 @@ export async function executeScrapeCall(params: {
     ...(structuredJsonOut ? { json: structuredJsonOut } : {}),
     ...(jsonExtractionModeOut ? { jsonExtractionMode: jsonExtractionModeOut } : {}),
     ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64
-      ? { screenshotBase64: item.screenshotBase64, screenshot: `data:image/png;base64,${item.screenshotBase64}` }
+      ? {
+          screenshotBase64: item.screenshotBase64,
+          screenshot: `data:image/png;base64,${item.screenshotBase64}`,
+          ...(screenshotArtifactMeta ?? {}),
+        }
       : {}),
     ...(pdfEngineOut ? { pdfEngine: pdfEngineOut } : {}),
     ...(ocrReportOut ? { ocr: ocrReportOut } : {}),
@@ -13271,6 +13287,42 @@ function normalizeInteractPrincipal(principal?: string, source?: string): string
 }
 
 const DEFAULT_INTERACT_HMAC_KEY_FALLBACK = 'edgefetch-default-interact-key';
+
+async function storeScreenshotArtifactIfEnabled(params: {
+  screenshotBase64: string;
+  bucket?: R2Bucket;
+  userId: string;
+  privateOnly: boolean;
+}): Promise<{ screenshotArtifactId: string; screenshotMimeType: 'image/png'; screenshotBytes: number } | undefined> {
+  const { screenshotBase64, bucket, userId, privateOnly } = params;
+  if (!bucket || !screenshotBase64) return undefined;
+  const trimmed = screenshotBase64.trim();
+  if (!trimmed || trimmed.length > Math.ceil((MAX_ARTIFACT_CONTENT_BYTES * 4) / 3) + 16) {
+    return undefined;
+  }
+  try {
+    const bin = atob(trimmed);
+    if (bin.length === 0 || bin.length > MAX_ARTIFACT_CONTENT_BYTES) return undefined;
+    const pngBytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      pngBytes[i] = bin.charCodeAt(i);
+    }
+    const stored = await writeArtifactToR2({
+      bucket,
+      rawBytes: pngBytes,
+      retention: 'transient',
+      userId,
+      privateOnly,
+    });
+    return {
+      screenshotArtifactId: stored.blobSha256,
+      screenshotMimeType: 'image/png',
+      screenshotBytes: pngBytes.byteLength,
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 async function computeInteractSessionMacHex(
   secret: string,
@@ -13764,6 +13816,15 @@ export async function executeInteractCall(params: {
     formatWarnings.transcript = 'No timed caption/transcript segments found on page; returning extracted page Markdown.';
   }
   const pagedMd = sliceMarkdownWithOffsetAndMaxChars(markdown, interactOffset, interactMaxChars);
+  const interactScreenshotArtifact =
+    typeof item.screenshotBase64 === 'string' && item.screenshotBase64 && env.ARTIFACTS
+      ? await storeScreenshotArtifactIfEnabled({
+          screenshotBase64: item.screenshotBase64,
+          bucket: env.ARTIFACTS,
+          userId,
+          privateOnly: true,
+        })
+      : undefined;
 
   return {
     status: 200,
@@ -13792,7 +13853,12 @@ export async function executeInteractCall(params: {
       ...(requestedTranscript ? { transcript: transcript || null } : transcript ? { transcript } : {}),
       ...(Object.keys(formatWarnings).length > 0 ? { formatWarnings } : {}),
       ...(formats.includes('html') || formats.includes('rawHtml') ? { html: rawHtml } : {}),
-      ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64 ? { screenshotBase64: item.screenshotBase64 } : {}),
+      ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64
+        ? {
+            screenshotBase64: item.screenshotBase64,
+            ...(interactScreenshotArtifact ?? {}),
+          }
+        : {}),
       metadata: {
         title: sanitizeScrapedMetadataField(
           extracted?.title || (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined) || fallbackTitle,

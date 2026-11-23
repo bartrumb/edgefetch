@@ -1311,6 +1311,58 @@ export async function getCatalogStatus(params: {
  * Pages and filters normalized `CatalogRecord` rows from an in-memory or R2 NDJSON catalog artifact
  * without pulling multi-megabyte raw JSON pages into agent context.
  */
+const SHOPIFY_ORIGIN_CURRENCY_CACHE = new Map<string, { currency: string | null; expiresAt: number }>();
+const SHOPIFY_ORIGIN_CURRENCY_TTL_MS = 30 * 60_000;
+
+async function resolveShopifyOriginCurrency(
+  origin: string,
+  executeHubFetch: CatalogHubFetchFn,
+  timeoutMs = 3_500,
+): Promise<string | null> {
+  const now = Date.now();
+  const cached = SHOPIFY_ORIGIN_CURRENCY_CACHE.get(origin);
+  if (cached && now < cached.expiresAt) return cached.currency;
+  for (const probePath of ['/meta.json', '/cart.js']) {
+    try {
+      const rawResp = await executeHubFetch({
+        url: `${origin.replace(/\/+$/, '')}${probePath}`,
+        kind: 'json',
+        accept: 'application/json',
+        maxBytes: 65_536,
+        timeoutMs,
+      });
+      const normCurr = normalizeHubPageResponse(rawResp);
+      if (normCurr && normCurr.status === 200 && normCurr.body) {
+        const parsedCurr = JSON.parse(normCurr.body) as { currency?: unknown; active?: unknown };
+        const cand =
+          typeof parsedCurr?.currency === 'string'
+            ? parsedCurr.currency.trim().toUpperCase()
+            : parsedCurr?.currency &&
+                typeof parsedCurr.currency === 'object' &&
+                typeof (parsedCurr.currency as { active?: unknown }).active === 'string'
+              ? (parsedCurr.currency as { active: string }).active.trim().toUpperCase()
+              : '';
+        if (/^[A-Z]{3}$/.test(cand)) {
+          if (SHOPIFY_ORIGIN_CURRENCY_CACHE.size >= 256) {
+            const oldestKey = SHOPIFY_ORIGIN_CURRENCY_CACHE.keys().next().value;
+            if (oldestKey !== undefined) SHOPIFY_ORIGIN_CURRENCY_CACHE.delete(oldestKey);
+          }
+          SHOPIFY_ORIGIN_CURRENCY_CACHE.set(origin, { currency: cand, expiresAt: now + SHOPIFY_ORIGIN_CURRENCY_TTL_MS });
+          return cand;
+        }
+      }
+    } catch {
+      // ignore failed probe
+    }
+  }
+  if (SHOPIFY_ORIGIN_CURRENCY_CACHE.size >= 256) {
+    const oldestKey = SHOPIFY_ORIGIN_CURRENCY_CACHE.keys().next().value;
+    if (oldestKey !== undefined) SHOPIFY_ORIGIN_CURRENCY_CACHE.delete(oldestKey);
+  }
+  SHOPIFY_ORIGIN_CURRENCY_CACHE.set(origin, { currency: null, expiresAt: now + 5 * 60_000 });
+  return null;
+}
+
 export async function getCatalogRecords(params: {
   catalogId: string;
   userId?: string;
@@ -1323,6 +1375,7 @@ export async function getCatalogRecords(params: {
   query?: string;
   fields?: 'full' | 'lean';
   env?: OptionalStorageBindings & Record<string, unknown>;
+  executeHubFetch?: CatalogHubFetchFn;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const catalogId = params.catalogId.trim();
   if (!catalogId) {
@@ -1432,7 +1485,21 @@ export async function getCatalogRecords(params: {
     return true;
   });
 
-  const sliced = filtered.slice(offset, offset + limit);
+  let sliced = filtered.slice(offset, offset + limit);
+  if (
+    summary.platform === 'shopify' &&
+    summary.origin &&
+    params.executeHubFetch &&
+    sliced.some((rec) => rec.variants.some((v) => !v.currency))
+  ) {
+    const fallbackCurr = await resolveShopifyOriginCurrency(summary.origin, params.executeHubFetch);
+    if (fallbackCurr) {
+      sliced = sliced.map((rec) => ({
+        ...rec,
+        variants: rec.variants.map((v) => (v.currency ? v : { ...v, currency: fallbackCurr })),
+      }));
+    }
+  }
   const effectiveFields = params.fields ?? summary.fields ?? 'full';
   const projectedRecords = effectiveFields === 'lean' ? sliced.map(projectLeanCatalogRecord) : sliced;
   const result: CatalogRecordsResult = {
@@ -1509,6 +1576,7 @@ export async function executeCatalogCall(params: {
         query: typeof payload.query === 'string' ? payload.query : undefined,
         fields: payload.fields === 'lean' ? 'lean' : payload.fields === 'full' ? 'full' : undefined,
         env,
+        executeHubFetch,
       });
     }
     return getCatalogStatus({
@@ -1983,7 +2051,7 @@ export async function executeCatalogCall(params: {
     const remForCartCurrencyMs = syncDeadlineAt - Date.now();
     if (hasNullShopifyVariantCurrency && !truncatedByBudget && remForCartCurrencyMs >= 1_500) {
       let detectedCurrency: string | null = null;
-      for (const probePath of ['/cart.js', '/meta.json']) {
+      for (const probePath of ['/meta.json', '/cart.js']) {
         const remProbeMs = syncDeadlineAt - Date.now();
         if (remProbeMs < 1_000) break;
         const callCurrProbe = () =>

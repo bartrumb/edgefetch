@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { gzipSync } from 'node:zlib';
 import { AgentHubEngine, createMemoryCooldownStore, routeFetchWithFailover, type HubSocketLike } from '../src/agent-hub.ts';
-import { executeCatalogCall, resetCatalogStateForTests } from '../src/catalog.ts';
+import { executeCatalogCall, getCatalogRecords, resetCatalogStateForTests } from '../src/catalog.ts';
 import {
   discoverAtsBoardsFromHtml,
   executeJobsCall,
@@ -13,8 +15,17 @@ import {
   resolveAtsPreFetchSpec,
 } from '../src/jobs.ts';
 import { executeCrawlJob } from '../src/map-crawl.ts';
+import { sanitizeErrorMessageForSpan, sanitizeSpanAttributes } from '../src/otel.ts';
+import { handleMcpRequest } from '../src/mcp.ts';
+import { executeInteractCall } from '../src/scrape.ts';
+import {
+  computeMarkdownSliceCheckpoints,
+  sanitizeFullMarkdownDocumentForArtifact,
+  sanitizeMarkdownPageSlice,
+} from '../src/scrape-advanced.ts';
 import { ensureD1ColumnIfMissing, executeExtractCall } from '../src/search-index.ts';
 import { isEligibleForExternalSpaFallback } from '../src/spa-fallback.ts';
+import { handleAgentArtifactUpload, resetRecentArtifactUploadsForTests } from '../src/storage.ts';
 
 function createSqliteD1Tracker(sqlite: DatabaseSync) {
   const executedSql: string[] = [];
@@ -852,4 +863,330 @@ test('R10-4: postedWithinDays <= 30 parity, 5-min LRU + 6-way parallel coalescin
   assert.ok(promoTitles.includes('Software Engineer, Agentic Developer'), 'Promoted Workday board must include Posted Today job');
   assert.ok(!promoTitles.includes('Legacy Systems Engineer'), 'postedWithinDays=14 must exclude Posted 30+ Days Ago Workday job');
   assert.ok(promoTitles.includes('Staff AI Platform Engineer'), 'Path-scoped SmartRecruiters search must include Visa SR job');
+
+  // 7. J5 Word-Boundary Matching ("Engineer" matches "Software Engineer" / "Staff Engineers", NEVER "Engineering Manager" / "Engineering Director") + `minBaseMode: "overlap"`
+  const wordBoundaryRes = await executeJobsCall({
+    payload: {
+      company: 'Temporal',
+      query: 'Engineer',
+      minBase: 240_000,
+      minBaseMode: 'overlap',
+      includeBuiltIn: false,
+    },
+    env: {},
+    executeSearch: async () => ({ status: 200, body: { results: [] } }),
+    executeScrape: async (args) => {
+      if (String(args.url) === 'https://jobs.ashbyhq.com/temporal') {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            extractorId: 'ashby-board',
+            jobs: [
+              {
+                title: 'Engineering Manager, Core Runtime',
+                company: 'Temporal',
+                url: 'https://jobs.ashbyhq.com/temporal/em-1',
+                applyUrl: 'https://jobs.ashbyhq.com/temporal/em-1/application',
+                workplaceType: 'remote',
+                locations: ['Remote - US'],
+                pay: { min: 250_000, max: 310_000, currency: 'USD', period: 'year', basis: 'base' },
+                postedAt: twoDaysAgoIso,
+                source: 'ashby',
+              },
+              {
+                title: 'Engineering Director, Cloud',
+                company: 'Temporal',
+                url: 'https://jobs.ashbyhq.com/temporal/ed-1',
+                applyUrl: 'https://jobs.ashbyhq.com/temporal/ed-1/application',
+                workplaceType: 'remote',
+                locations: ['Remote - US'],
+                pay: { min: 280_000, max: 350_000, currency: 'USD', period: 'year', basis: 'base' },
+                postedAt: twoDaysAgoIso,
+                source: 'ashby',
+              },
+              {
+                title: 'Staff Software Engineer',
+                company: 'Temporal',
+                url: 'https://jobs.ashbyhq.com/temporal/swe-1',
+                applyUrl: 'https://jobs.ashbyhq.com/temporal/swe-1/application',
+                workplaceType: 'remote',
+                locations: ['Remote - US'],
+                pay: { min: 208_000, max: 341_000, currency: 'USD', period: 'year', basis: 'base' },
+                postedAt: twoDaysAgoIso,
+                source: 'ashby',
+              },
+            ],
+          },
+        };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(wordBoundaryRes.status, 200);
+  const wbTitles = (wordBoundaryRes.body.jobs as Array<{ title: string }>).map((j) => j.title);
+  assert.deepEqual(wbTitles, ['Staff Software Engineer']);
+});
+
+test('Blind Audit Closure (EF-BLIND-02, EF-BLIND-04, EF-BLIND-05) & Catalog Stored-Snapshot Currency Backfill', async () => {
+  // EF-BLIND-02: `handleAgentArtifactUpload` cryptographically verifies `x-content-sha256` + `x-content-bytes` against gunzipped payload
+  // and deduplicates `'transient'` uploads after `META.artifacts` promotes `retention = 'stored'`.
+  resetRecentArtifactUploadsForTests();
+  const rawBytes = new TextEncoder().encode('verified payload for EF-BLIND-02');
+  const gzBytes = gzipSync(rawBytes);
+  const blobSha = createHash('sha256').update(gzBytes).digest('hex');
+  const realContentSha = createHash('sha256').update(rawBytes).digest('hex');
+  const poisonedSha = '0'.repeat(64);
+
+  const sqlite = new DatabaseSync(':memory:');
+  sqlite.exec(`CREATE TABLE artifacts (blob_sha256 TEXT PRIMARY KEY, retention TEXT, last_seen_at INTEGER);`);
+  const { db: metaDb } = createSqliteD1Tracker(sqlite);
+
+  let putCalls = 0;
+  let headCalls = 0;
+  const r2Map = new Map<string, { bytes: Uint8Array; customMetadata?: Record<string, string>; uploaded: Date }>();
+  const mockBucket = {
+    head: async (k: string) => {
+      headCalls++;
+      const found = r2Map.get(k);
+      return found ? { key: k, size: found.bytes.byteLength, uploaded: found.uploaded, customMetadata: found.customMetadata } : null;
+    },
+    put: async (k: string, val: Uint8Array, opts?: { customMetadata?: Record<string, string> }) => {
+      putCalls++;
+      const rec = { bytes: new Uint8Array(val), customMetadata: opts?.customMetadata, uploaded: new Date() };
+      r2Map.set(k, rec);
+      return rec;
+    },
+  };
+
+  // Poisoned `x-content-sha256` MUST be rejected with 400 BEFORE touching R2!
+  const poisonedRes = await handleAgentArtifactUpload({
+    request: new Request(`https://hub.example/agent/artifacts/${blobSha}`, {
+      method: 'PUT',
+      headers: {
+        'content-length': String(gzBytes.byteLength),
+        'x-content-sha256': poisonedSha,
+        'x-content-bytes': String(rawBytes.byteLength),
+        'x-artifact-retention': 'transient',
+        'x-job-id': 'j_poison',
+        'x-job-nonce': 'n_poison',
+        'x-request-id': 'r_poison',
+      },
+      body: new Uint8Array(gzBytes),
+    }),
+    blobSha256: blobSha,
+    siteId: 's1',
+    bucket: mockBucket as unknown as R2Bucket,
+    metaDb: metaDb as unknown as D1Database,
+    authorizeJobUpload: async () => ({ ok: true }),
+  });
+  assert.equal(poisonedRes.status, 400);
+  assert.equal(((await poisonedRes.json()) as { error: string }).error, 'content_sha256_mismatch');
+  assert.equal(putCalls, 0);
+
+  // Valid `'stored'` upload + `META.artifacts` `'stored'` row -> subsequent `'transient'` upload deduplicates cleanly (`putCalls === 1`)!
+  const storedRes = await handleAgentArtifactUpload({
+    request: new Request(`https://hub.example/agent/artifacts/${blobSha}`, {
+      method: 'PUT',
+      headers: {
+        'content-length': String(gzBytes.byteLength),
+        'x-content-sha256': realContentSha,
+        'x-content-bytes': String(rawBytes.byteLength),
+        'x-artifact-retention': 'stored',
+        'x-job-id': 'j_ok',
+        'x-job-nonce': 'n_ok',
+        'x-request-id': 'r_ok',
+      },
+      body: new Uint8Array(gzBytes),
+    }),
+    blobSha256: blobSha,
+    siteId: 's1',
+    bucket: mockBucket as unknown as R2Bucket,
+    metaDb: metaDb as unknown as D1Database,
+    authorizeJobUpload: async () => ({ ok: true }),
+  });
+  assert.equal(storedRes.status, 200);
+  assert.equal(putCalls, 1);
+  sqlite.prepare(`INSERT INTO artifacts (blob_sha256, retention, last_seen_at) VALUES (?, 'stored', ?)`).run(blobSha, Date.now());
+  resetRecentArtifactUploadsForTests();
+
+  const transientAfterPromo = await handleAgentArtifactUpload({
+    request: new Request(`https://hub.example/agent/artifacts/${blobSha}`, {
+      method: 'PUT',
+      headers: {
+        'content-length': String(gzBytes.byteLength),
+        'x-content-sha256': realContentSha,
+        'x-content-bytes': String(rawBytes.byteLength),
+        'x-artifact-retention': 'transient',
+        'x-job-id': 'j_tr',
+        'x-job-nonce': 'n_tr',
+        'x-request-id': 'r_tr',
+      },
+      body: new Uint8Array(gzBytes),
+    }),
+    blobSha256: blobSha,
+    siteId: 's1',
+    bucket: mockBucket as unknown as R2Bucket,
+    metaDb: metaDb as unknown as D1Database,
+    authorizeJobUpload: async () => ({ ok: true }),
+  });
+  assert.equal(transientAfterPromo.status, 200);
+  assert.equal(((await transientAfterPromo.json()) as { deduplicated: boolean }).deduplicated, true);
+  assert.equal(putCalls, 1, 'Transient upload after stored promotion must deduplicate without re-PUTting');
+  assert.equal(headCalls, 1);
+
+  // EF-BLIND-04: `sanitizeErrorMessageForSpan` & `sanitizeSpanAttributes` scrub ws://, wss://, JSON-escaped https:\/\/, schemeless userinfo, colon tokens, and password=
+  const secretSamples = [
+    'WebSocket dial failed wss://agent:TEST_SECRET_123@hub.example.com/agent/ws?token=TEST_SECRET_456',
+    'connect ws://user:TEST_SECRET_123@198.51.100.10:8080/ws?sig=TEST_SECRET_456 refused',
+    'proxy connect user:TEST_SECRET_123@proxy.example.com:8080 failed',
+    'upstream body: {"url":"https:\\/\\/user:TEST_SECRET_123@example.com\\/cb?code=TEST_SECRET_456"}',
+    'auth header rejected: api_key: TEST_SECRET_123, access_token: "TEST_SECRET_456"',
+    'login error password=TEST_SECRET_123',
+  ];
+  for (const sample of secretSamples) {
+    const cleanErr = sanitizeErrorMessageForSpan(sample);
+    const cleanAttrs = sanitizeSpanAttributes({ detail: sample });
+    assert.ok(!cleanErr.includes('TEST_SECRET_'), `sanitizeErrorMessageForSpan leaked secret in: ${cleanErr}`);
+    assert.ok(!String(cleanAttrs.detail).includes('TEST_SECRET_'), `sanitizeSpanAttributes leaked secret in: ${String(cleanAttrs.detail)}`);
+  }
+
+  // EF-BLIND-05: Nested-list dedent before fenced code block preserves fence state across `computeMarkdownSliceCheckpoints` & `sanitizeMarkdownPageSlice`
+  const docC2 = [
+    '1. first',
+    '   - nested',
+    `   prose in first ${'z'.repeat(80)}`,
+    '     ```html',
+    '   <b>RAW_HTML_MARKER</b>',
+    '   ```',
+    '',
+    'Normal prose outside code block.',
+  ].join('\n');
+  const cleanFull = sanitizeFullMarkdownDocumentForArtifact(docC2);
+  const cps = computeMarkdownSliceCheckpoints(cleanFull, 32);
+  const markerIdx = cleanFull.indexOf('   <b>RAW_HTML_MARKER</b>');
+  assert.ok(markerIdx > 0);
+  const slicedMd = sanitizeMarkdownPageSlice(cleanFull, markerIdx, cleanFull.slice(markerIdx), false, cps);
+  assert.ok(slicedMd.includes('<b>RAW_HTML_MARKER</b>'), `Literal code inside reopened fence should not be escaped: ${slicedMd}`);
+  const afterProse = slicedMd.slice(slicedMd.indexOf('Normal prose outside code block.'));
+  assert.ok(!afterProse.includes('```'), `Trailing prose outside code block must NOT be wrapped in an inverted fence: ${slicedMd}`);
+
+  // Stored Shopify catalog snapshot with `currency: null` backfills currency via `/meta.json` on `getCatalogRecords`
+  resetCatalogStateForTests();
+  const catCreate = await executeCatalogCall({
+    payload: { url: 'https://www.allbirds.example.com/', maxPages: 1, fields: 'lean' },
+    executeHubFetch: async ({ url: u }) => {
+      if (u.includes('/products.json')) {
+        return {
+          status: 200,
+          body: JSON.stringify({
+            products: [
+              {
+                id: 101,
+                title: 'Wool Runner',
+                handle: 'wool-runner',
+                vendor: 'Allbirds',
+                product_type: 'Shoes',
+                tags: ['wool'],
+                variants: [{ id: 201, title: '10', price: '98.00', available: true }],
+              },
+            ],
+          }),
+        };
+      }
+      // Simulate initial run when /meta.json temporarily failed so stored snapshot has `currency: null`
+      return { status: 503, body: '' };
+    },
+  });
+  const catId = String(catCreate.body.catalogId);
+  const pagedBackfill = await getCatalogRecords({
+    catalogId: catId,
+    fields: 'lean',
+    executeHubFetch: async ({ url: u }) => {
+      assert.ok(!u.endsWith('/cart.js'), 'Should hit /meta.json first without needing /cart.js');
+      if (u.endsWith('/meta.json')) {
+        return { status: 200, body: JSON.stringify({ currency: 'USD' }) };
+      }
+      return { status: 404, body: '' };
+    },
+  });
+  assert.equal(pagedBackfill.status, 200);
+  const leanRecs = pagedBackfill.body.records as Array<{ currency: string | null }>;
+  assert.equal(leanRecs[0]?.currency, 'USD');
+
+  // B1: `interact` stores PNG screenshots in R2 (`private/<userId>/...`) returning `screenshotArtifactId`,
+  // and MCP `tools/call` `interact` strips inline 188K `screenshotBase64` from text output while REST preserves `screenshotBase64`.
+  const bigPngBytes = Buffer.alloc(140_000, 0x89);
+  const bigPngB64 = bigPngBytes.toString('base64');
+  assert.ok(bigPngB64.length > 180_000);
+  const interactRes = await executeInteractCall({
+    payload: {
+      url: 'https://news.ycombinator.com/',
+      formats: ['markdown', 'screenshot'],
+    },
+    env: { ARTIFACTS: mockBucket as unknown as R2Bucket },
+    userId: 'user_alice',
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-win-vm',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'interact-1',
+            url: 'https://news.ycombinator.com/',
+            finalUrl: 'https://news.ycombinator.com/',
+            status: 200,
+            outcome: 'ok',
+            contentType: 'text/html',
+            body: '<html><head><title>Hacker News</title></head><body><main><h1>Hacker News</h1></main></body></html>',
+            screenshotBase64: bigPngB64,
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(interactRes.status, 200);
+  const shotArtId = String(interactRes.body.screenshotArtifactId ?? '');
+  assert.match(shotArtId, /^[0-9a-f]{64}$/);
+  assert.equal(interactRes.body.screenshotBytes, bigPngBytes.byteLength);
+  assert.equal(interactRes.body.screenshotMimeType, 'image/png');
+  assert.equal(interactRes.body.screenshotBase64, bigPngB64, 'REST /v1/interact retains screenshotBase64 for SDK compatibility');
+  assert.ok(
+    [...r2Map.keys()].some((k) => k.startsWith('private/user_alice/tmp/sha256/') && k.includes(shotArtId)),
+    'Interact screenshot artifact must be stored under private/<userId>/tmp/sha256/',
+  );
+
+  const mcpResp = await handleMcpRequest(
+    new Request('https://hub.example/mcp', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer test-caller-secret-0123456789abcdef',
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        'mcp-protocol-version': '2025-03-26',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 77,
+        method: 'tools/call',
+        params: {
+          name: 'interact',
+          arguments: { url: 'https://news.ycombinator.com/', formats: ['markdown', 'screenshot'] },
+        },
+      }),
+    }),
+    new URL('https://hub.example/mcp'),
+    {
+      ownerSecret: 'test-caller-secret-0123456789abcdef',
+      executeFetch: async () => ({ status: 200, via: 'hub', bodyText: '{}' }),
+      executeInteract: async () => interactRes,
+    },
+  );
+  assert.equal(mcpResp.status, 200);
+  const mcpJson = (await mcpResp.json()) as { result: { content: Array<{ type: string; text: string }> } };
+  const mcpText = mcpJson.result.content[0]!.text;
+  assert.ok(mcpText.length < 2_000, `Expected compact MCP interact JSON (< 2 KB), got ${mcpText.length} chars`);
+  const parsedMcpInteract = JSON.parse(mcpText) as Record<string, unknown>;
+  assert.equal(parsedMcpInteract.screenshotArtifactId, shotArtId);
+  assert.equal(parsedMcpInteract.screenshotBase64, undefined, 'MCP interact text must omit 188K inline screenshotBase64');
 });

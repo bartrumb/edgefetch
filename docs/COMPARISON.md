@@ -1,12 +1,12 @@
 # EdgeFetch vs. Other AI Web Crawlers & MCP Servers
 
-This document compares **EdgeFetch (`v2.7.6`)** against common open-source and commercial web-data stacks for AI agents across architecture, supply chain, security boundaries, extraction fidelity, observability, and cost — including honest guidance on when another tool is a better fit.
+This document compares **EdgeFetch (`v2.7.7`)** against common open-source and commercial web-data stacks for AI agents across architecture, supply chain, security boundaries, extraction fidelity, observability, and cost — including honest guidance on when another tool is a better fit.
 
 ---
 
 ## 1. Architecture & Operational Comparison
 
-| Capability / Architecture | **EdgeFetch (`v2.7.6`)** | **Firecrawl (Self-Hosted & `firecrawl-local`)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader (`reader`)** | **Defuddle / Trafilatura** |
+| Capability / Architecture | **EdgeFetch (`v2.7.7`)** | **Firecrawl (Self-Hosted & `firecrawl-local`)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader (`reader`)** | **Defuddle / Trafilatura** |
 |---|---|---|---|---|---|---|
 | **License** | **Open-source worker, SDKs, and adapters (`MIT`), fair-source hub (`FSL-1.1`, `MIT` after two years)** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 | MIT / Apache-2.0 |
 | **Minimum Self-Hosted Stack** | **1 `~8 MB` static Go binary** *or* **1 container** (`node:sqlite` + `/data`, no Redis, Postgres, or RabbitMQ) | Full stack: Redis + PostgreSQL + RabbitMQ + Playwright + API (`2–4 GB+` RAM); `firecrawl-local` requires Node 22 `npx` + Rust/C toolchain | Cloud API key only | Python 3.10+ + Playwright (`~600 MB–1.5 GB` RAM) | Node.js + Puppeteer / Firebase deps | Library / CLI only (no crawler fleet or MCP server) |
@@ -25,7 +25,7 @@ This document compares **EdgeFetch (`v2.7.6`)** against common open-source and c
 
 Reproduce HTML-to-Markdown extraction, `<T>` generic preservation, code-fence balance, and latency locally in `< 3` seconds via `node bench/compare.mjs` (**[bench/RESULTS.md](../bench/RESULTS.md)**).
 
-| Content / RAG Capability | **EdgeFetch (`v2.7.6`)** | **Firecrawl** | **Crawl4AI** | **Jina Reader** | **Tavily** |
+| Content / RAG Capability | **EdgeFetch (`v2.7.7`)** | **Firecrawl** | **Crawl4AI** | **Jina Reader** | **Tavily** |
 |---|:---:|:---:|:---:|:---:|:---:|
 | **`<code>` & Generic `<T>` Preservation (`Promise<Array<string>>`)** | **Yes** | Yes | Partial | Yes | Partial |
 | **CommonMark/GFM Sanitizer Differential Suite (278 vectors vs `marked` + `micromark`)** | **Yes ([docs/SECURITY-LOG.md](SECURITY-LOG.md))** | N/A | N/A | N/A | N/A |
@@ -44,7 +44,7 @@ Reproduce HTML-to-Markdown extraction, `<T>` generic preservation, code-fence ba
 ### 1. Outbound-Only Edge Workers (Your Own Hardware, Zero Open Ports)
 Self-hosted crawlers usually force a choice between datacenter VPS IPs (which frequently hit `429` rate limits on documentation CDNs and storefronts) or opening inbound ports / tunnels into a home network.
 - EdgeFetch workers (`edgefetch --mode=agent`) dial **outbound** over TLS `WSS /agent/ws` to **your own Hub** using your private `AGENT_TOKEN` (there is never a shared third-party proxy pool).
-- On **Home Assistant OS** (`addon/`, `slug: "edgefetch"`), Protection Mode stays **ON** (`hassio_api: false`, `homeassistant_api: false`, `host_network: false`), handling HTTP/2 and pure-Go PDF jobs while delegating headless Chromium jobs to sandboxed Docker (`ghcr.io/bartrumb/edgefetch-agent:2.7.6` with `--security-opt seccomp=./deploy/seccomp/chromium-sandbox.json`) or desktop/VM nodes.
+- On **Home Assistant OS** (`addon/`, `slug: "edgefetch"`), Protection Mode stays **ON** (`hassio_api: false`, `homeassistant_api: false`, `host_network: false`), handling HTTP/2 and pure-Go PDF jobs while delegating headless Chromium jobs to sandboxed Docker (`ghcr.io/bartrumb/edgefetch-agent:2.7.7` with `--security-opt seccomp=./deploy/seccomp/chromium-sandbox.json`) or desktop/VM nodes.
 
 ### 2. Minimal Dependency Surface
 Running Firecrawl self-hosted requires operating Redis, PostgreSQL, RabbitMQ, Playwright, and a Node API under AGPL-3.0.

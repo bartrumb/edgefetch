@@ -4029,6 +4029,36 @@ const MAX_JOBS_QUERY_CHARS = 256;
 const QUERY_STOP_WORDS = new Set(['the', 'and', 'for', 'with', 'from', 'into', 'role', 'job', 'jobs', 'open', 'position']);
 const REMOTE_LOCATION_TOKENS = new Set(['remote', 'anywhere', 'work from home', 'wfh']);
 
+function extractJobWordTokens(text: string): string[] {
+  return text.match(/[\p{L}\p{N}+#]+/gu) ?? [];
+}
+
+function jobWordTokensMatch(hayToken: string, queryToken: string): boolean {
+  if (hayToken === queryToken) return true;
+  if (queryToken.length >= 3) {
+    if (hayToken === `${queryToken}s` || hayToken === `${queryToken}es`) return true;
+    if (queryToken.endsWith('s') && queryToken.slice(0, -1) === hayToken) return true;
+    if (queryToken.endsWith('es') && queryToken.length >= 4 && queryToken.slice(0, -2) === hayToken) return true;
+  }
+  return false;
+}
+
+function containsJobTokenSequence(hayTokens: readonly string[], querySeq: readonly string[]): boolean {
+  if (querySeq.length === 0 || hayTokens.length < querySeq.length) return false;
+  const maxStart = hayTokens.length - querySeq.length;
+  for (let i = 0; i <= maxStart; i++) {
+    let ok = true;
+    for (let j = 0; j < querySeq.length; j++) {
+      if (!jobWordTokensMatch(hayTokens[i + j]!, querySeq[j]!)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
 function matchesJobQueryRelevance(
   title: string,
   snippet: string | undefined,
@@ -4039,22 +4069,27 @@ function matchesJobQueryRelevance(
   if (!normPhrase) return 'phrase';
   const cappedTitle = title.length > 1024 ? title.slice(0, 1024) : title;
   const titleLower = cappedTitle.toLowerCase().replace(/\s+/g, ' ');
-  if (titleLower.includes(normPhrase)) return 'phrase';
-
-  const qTokens = (normPhrase.match(/[\p{L}\p{N}+#]+/gu) ?? [])
-    .filter((t) => t.length >= 2 && !QUERY_STOP_WORDS.has(t))
-    .slice(0, 32);
-  if (qTokens.length === 0) {
-    return titleLower.includes(normPhrase) ? 'phrase' : null;
+  const rawQueryWords = extractJobWordTokens(normPhrase).slice(0, 32);
+  const titleWords = extractJobWordTokens(titleLower);
+  if (rawQueryWords.length > 0 && containsJobTokenSequence(titleWords, rawQueryWords)) {
+    return 'phrase';
   }
-  if (qTokens.every((qt) => titleLower.includes(qt))) {
+  if (rawQueryWords.length === 0 && titleLower.includes(normPhrase)) {
+    return 'phrase';
+  }
+
+  const qTokens = rawQueryWords.filter((t) => t.length >= 2 && !QUERY_STOP_WORDS.has(t));
+  if (qTokens.length === 0) {
+    return rawQueryWords.length > 0 ? (containsJobTokenSequence(titleWords, rawQueryWords) ? 'phrase' : null) : null;
+  }
+  if (qTokens.every((qt) => titleWords.some((tw) => jobWordTokensMatch(tw, qt)))) {
     return 'all_tokens';
   }
   const distinctiveQ = qTokens.filter((qt) => !GENERIC_ROLE_TOKENS.has(qt));
-  if (distinctiveQ.length > 0 && distinctiveQ.every((qt) => titleLower.includes(qt))) {
+  if (distinctiveQ.length > 0 && distinctiveQ.every((qt) => titleWords.some((tw) => jobWordTokensMatch(tw, qt)))) {
     const cappedSnippet = snippet ? (snippet.length > 2048 ? snippet.slice(0, 2048) : snippet) : '';
-    const fullHay = `${titleLower} ${cappedSnippet.toLowerCase()}`;
-    if (qTokens.every((qt) => fullHay.includes(qt))) {
+    const fullWords = [...titleWords, ...extractJobWordTokens(cappedSnippet.toLowerCase())];
+    if (qTokens.every((qt) => fullWords.some((fw) => jobWordTokensMatch(fw, qt)))) {
       return 'all_tokens';
     }
   }
@@ -5791,7 +5826,8 @@ export async function executeJobsCall(params: {
   const wantRemote = rawWantRemote !== undefined ? rawWantRemote : hasRemoteInLocations ? true : undefined;
 
   const minBase = typeof payload.minBase === 'number' && Number.isFinite(payload.minBase) && payload.minBase > 0 ? payload.minBase : undefined;
-  const minBaseMode: 'floor' | 'ceiling' = payload.minBaseMode === 'ceiling' ? 'ceiling' : 'floor';
+  const minBaseMode: 'floor' | 'ceiling' | 'overlap' =
+    payload.minBaseMode === 'ceiling' ? 'ceiling' : payload.minBaseMode === 'overlap' ? 'overlap' : 'floor';
   const strictPay = payload.strictPay === true;
   const postedWithinDays =
     typeof payload.postedWithinDays === 'number' && Number.isFinite(payload.postedWithinDays) && payload.postedWithinDays > 0
@@ -6562,7 +6598,7 @@ export async function executeJobsCall(params: {
         // P11: Never treat `total` / `ote` target cash as meeting `minBase` unless basis === 'base'
         if (rawJob.pay.basis !== 'base') continue;
         const comparedPay =
-          minBaseMode === 'ceiling'
+          minBaseMode === 'ceiling' || minBaseMode === 'overlap'
             ? (rawJob.pay.max ?? rawJob.pay.min ?? 0)
             : (rawJob.pay.min ?? rawJob.pay.max ?? 0);
         if (comparedPay < minBase) continue;

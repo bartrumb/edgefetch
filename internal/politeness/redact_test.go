@@ -220,10 +220,27 @@ func TestR9RedactEmbeddedURLs90DiverseLeakVectorsAndLinear1MiB(t *testing.T) {
 		{"86_unquoted_space_in_query", "Get https://api.example.com/p?filter=a b&secret=" + canary + " failed"},
 		{"87_unicode_ls_ps_nel_terminators", "https://api.example.com/p?k=" + canary + "\u2028next https://b.example/p?k=" + canary + "\u0085end"},
 		{"88_dns_resolver_plus_url_combo", `Get "https://u:` + canary + `@missing.example:8443/secret?k=` + canary + `": lookup missing.example on 10.0.0.53:53: no such host`},
+
+		// 89-101: EF-BLIND-03 schemeless bracket/brace/semicolon/backslash/UTF-8 line-break terminators & HTAB inline auth
+		{"89_schemeless_bracket_port", "[user:" + canary + "@example.com]:443"},
+		{"90_schemeless_bracket_only", "[user:" + canary + "@example.com]"},
+		{"91_schemeless_json_brace", `{"target":user:` + canary + `@example.com}`},
+		{"92_schemeless_semicolon", "user:" + canary + "@example.com; status=500"},
+		{"93_schemeless_backslash_newline", `user:` + canary + `@example.com\n`},
+		{"94_schemeless_nel_u0085", "user:" + canary + "@example.com\u0085next"},
+		{"95_schemeless_ls_u2028", "user:" + canary + "@example.com\u2028next"},
+		{"96_schemeless_ps_u2029", "user:" + canary + "@example.com\u2029next"},
+		{"97_bearer_htab", "Authorization:\tBearer\t" + canary},
+		{"98_bearer_colon_htab", "Bearer:\t" + canary},
+		{"99_basic_htab", "Proxy-Authorization:\tBasic\t" + canary},
+		{"100_token_eq_htab", "token=\t" + canary},
+		{"101_api_key_colon_htab", "api_key:\t" + canary},
+		{"102_schemeless_bracket_ipv6_port", "[user:" + canary + "@[::1]]:443"},
+		{"103_schemeless_semicolon_no_space", "user:" + canary + "@example.com;next"},
 	}
 
-	if len(vectors) < 85 {
-		t.Fatalf("expected >= 85 leak test vectors, got %d", len(vectors))
+	if len(vectors) < 100 {
+		t.Fatalf("expected >= 100 leak test vectors, got %d", len(vectors))
 	}
 	for _, tc := range vectors {
 		got := RedactEmbeddedURLs(tc.in)

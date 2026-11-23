@@ -1,7 +1,7 @@
 name: edgefetch
 services:
   edgefetch:
-    image: ghcr.io/bartrumb/edgefetch-agent:2.7.6
+    image: ghcr.io/bartrumb/edgefetch-agent:2.7.7
     container_name: edgefetch-agent
     restart: unless-stopped
     security_opt:

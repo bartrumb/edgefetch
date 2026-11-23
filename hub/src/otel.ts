@@ -307,7 +307,7 @@ export function buildOtlpTracePayload(params: {
   spans: OtlpSpanInput[];
 }): Record<string, unknown> {
   const serviceName = params.serviceName?.trim() || 'edgefetch-hub';
-  const serviceVersion = params.serviceVersion?.trim() || '2.7.6';
+  const serviceVersion = params.serviceVersion?.trim() || '2.7.7';
   return {
     resourceSpans: [
       {
@@ -356,13 +356,33 @@ const SENSITIVE_ATTR_KEY_RE =
   /(?:token|secret|password|authorization|cookie|api[_.-]?key|credential|private[_.-]?key|bearer|csrf|sealed|verifier|session[_.-]?id)/i;
 const URL_ATTR_KEY_RE = /^(?:url\.full|http\.url|url|target\.url|origin\.url)$/i;
 
-function redactInlineSecrets(raw: string): string {
+function scrubFreeTextUrlsAndSecrets(raw: string): string {
   const bounded = raw.length > 4096 ? raw.slice(0, 4096) : raw;
-  return bounded
-    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
-    .replace(/\bBasic\s+\S+/gi, 'Basic [redacted]')
+  const withScrubbedUrls = bounded.replace(
+    /(?:blob:)?(?:https?|wss?|ftps?):(?:\/\/|\\\/\\\/)[^\s"'<>)\]}]+/gi,
+    (match) => {
+      const hadEscapedSlashes = match.includes('\\/');
+      const unescaped = hadEscapedSlashes ? match.replace(/\\\//g, '/') : match;
+      const cleaned = sanitizeUrlForSpan(unescaped);
+      return hadEscapedSlashes ? cleaned.replace(/\//g, '\\/') : cleaned;
+    },
+  );
+  const withScrubbedSchemeless = withScrubbedUrls.replace(
+    /(^|[\s"'([{,;])([A-Za-z0-9_.+-]{1,64}):([^\s/@"'<>()[\]{};,\\]{1,256})@(\[[0-9a-fA-F:]+\]|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+|localhost)(?::\d{1,5})?/g,
+    (_m, pre: string, _user: string, _pass: string, host: string) => `${pre}[redacted]@${host}`,
+  );
+  return withScrubbedSchemeless
+    .replace(/\bBearer(?:[ \t]+|[ \t]*:[ \t]*)\S+/gi, 'Bearer [redacted]')
+    .replace(/\bBasic(?:[ \t]+|[ \t]*:[ \t]*)\S+/gi, 'Basic [redacted]')
     .replace(/\b(?:efc|efa|efr)_[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
-    .replace(/(\b[a-z0-9_.-]{0,32}(?:api[_.-]?key|token|secret)\s*=\s*["']?)([^\s&"'`,;]+)/gi, '$1[redacted]');
+    .replace(
+      /(\b[a-z0-9_.-]{0,32}(?:api[_.-]?key|access[_.-]?token|refresh[_.-]?token|client[_.-]?secret|token|secret|password|passwd|pwd|signature|sig|code)[ \t]*[:=][ \t]*["']?)([^\s&"'`,;)\]}]+)/gi,
+      '$1[redacted]',
+    );
+}
+
+function redactInlineSecrets(raw: string): string {
+  return scrubFreeTextUrlsAndSecrets(raw);
 }
 
 /** Strips URL query strings, fragments, userinfo, and inline secrets from span error messages. */
@@ -377,13 +397,12 @@ export function sanitizeErrorMessageForSpan(errOrMsg: unknown, fallback = ''): s
           : String(errOrMsg);
   const trimmed = raw.trim();
   if (!trimmed) return redactInlineSecrets(fallback).slice(0, 256);
-  const strippedUrls = trimmed.replace(/https?:\/\/[^\s"'<>)\]]+/gi, (match) => sanitizeUrlForSpan(match));
-  return redactInlineSecrets(strippedUrls).slice(0, 256);
+  return scrubFreeTextUrlsAndSecrets(trimmed).slice(0, 256);
 }
 
 /** Strips query strings, fragments, and embedded credentials from URLs before attaching to spans. */
 export function sanitizeUrlForSpan(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
+  const trimmed = rawUrl.trim().replace(/\\\//g, '/');
   if (!trimmed) return '';
   if (trimmed.toLowerCase().startsWith('blob:')) {
     const inner = sanitizeUrlForSpan(trimmed.slice(5));
@@ -391,15 +410,22 @@ export function sanitizeUrlForSpan(rawUrl: string): string {
   }
   try {
     const u = new URL(trimmed);
+    if (u.protocol && u.host) {
+      return `${u.protocol}//${u.host}${u.pathname}`.slice(0, 512);
+    }
     if (u.origin && u.origin !== 'null') {
       return `${u.origin}${u.pathname}`.slice(0, 512);
     }
   } catch {
     // Fallback for malformed URLs below
   }
-  return redactInlineSecrets(trimmed)
+  return trimmed
     .replace(/:\/\/[^/?#\s]+@/g, '://')
     .replace(/[?#].*$/, '')
+    .replace(
+      /(\b[a-z0-9_.-]{0,32}(?:api[_.-]?key|access[_.-]?token|refresh[_.-]?token|client[_.-]?secret|token|secret|password|passwd|pwd|signature|sig|code)[ \t]*[:=][ \t]*["']?)([^\s&"'`,;)\]}]+)/gi,
+      '$1[redacted]',
+    )
     .slice(0, 512);
 }
 

@@ -1355,6 +1355,7 @@ export interface MarkdownSliceCheckpoint {
   fenceLen: number;
   fenceIndent: number;
   activeListIndent: number;
+  listIndents?: readonly number[];
   prevLineWasParagraph: boolean;
 }
 
@@ -1366,7 +1367,7 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
   let fenceChar = '';
   let fenceLen = 0;
   let fenceIndent = 0;
-  let activeListIndent = 0;
+  const listIndents: number[] = [];
   let prevLineWasParagraph = false;
   let nextCheckpointAt = stepChars;
   let pos = 0;
@@ -1374,6 +1375,7 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
 
   while (pos < n) {
     if (pos >= nextCheckpointAt) {
+      const activeListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
       checkpoints.push({
         pos,
         inFence,
@@ -1381,6 +1383,7 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
         fenceLen,
         fenceIndent,
         activeListIndent,
+        listIndents: [...listIndents],
         prevLineWasParagraph,
       });
       nextCheckpointAt = pos + stepChars;
@@ -1401,7 +1404,7 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
         fenceChar = '';
         fenceLen = 0;
         fenceIndent = 0;
-        activeListIndent = 0;
+        listIndents.length = 0;
       } else {
         const maxClose = fenceIndent > 0 ? fenceIndent + 3 : 3;
         if (!isBlank && cols >= fenceIndent && cols <= maxClose && bytePos < rawLine.length) {
@@ -1417,15 +1420,18 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
     }
 
     if (!inFence && !lineClosedFenceExplicit) {
-      if (!isBlank && activeListIndent > 0 && cols < activeListIndent && !prevLineWasParagraph) {
-        activeListIndent = 0;
+      if (!isBlank && listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
+        while (listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
+          listIndents.pop();
+        }
       }
-      const listInfo = detectSliceListItemInfo(rawLine, cols, bytePos, prevLineWasParagraph);
+      const parentListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
+      const listInfo = detectSliceListItemInfo(rawLine, cols, bytePos, prevLineWasParagraph, parentListIndent);
       const listCol = listInfo.contentCol;
       if (listCol > 0) {
-        activeListIndent = listCol;
-        prevLineWasParagraph = false;
+        listIndents.push(listCol);
       }
+      const activeListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
       const minCols = activeListIndent > 0 ? activeListIndent : 0;
       const maxCols = minCols + 3;
       if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos + 3 <= rawLine.length) {
@@ -1444,30 +1450,16 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
         }
       }
       if (!lineOpenedFence) {
-        if (isBlank || isThematicBreakForSlice(rawLine, cols, bytePos)) {
-          prevLineWasParagraph = false;
-        } else if (listCol > 0) {
-          prevLineWasParagraph = listInfo.hasContent;
-        } else {
-          const leadC = rawLine.charCodeAt(bytePos);
-          let isAtx = false;
-          if (cols <= 3 && leadC === 35) {
-            let h = bytePos;
-            while (h < rawLine.length && h - bytePos < 7 && rawLine.charCodeAt(h) === 35) h++;
-            if (h - bytePos <= 6 && (h === rawLine.length || rawLine.charCodeAt(h) === 32 || rawLine.charCodeAt(h) === 9)) {
-              isAtx = true;
-            }
-          }
-          if (isAtx || (!prevLineWasParagraph && activeListIndent === 0 && cols >= 4)) {
-            prevLineWasParagraph = false;
-          } else if (cols <= 3 && leadC === 62) {
-            let q = bytePos;
-            while (q < rawLine.length && (rawLine.charCodeAt(q) === 62 || rawLine.charCodeAt(q) === 32 || rawLine.charCodeAt(q) === 9)) q++;
-            prevLineWasParagraph = q < rawLine.length;
-          } else {
-            prevLineWasParagraph = true;
-          }
-        }
+        prevLineWasParagraph = computeNextSliceParagraphState(
+          rawLine,
+          cols,
+          bytePos,
+          isBlank,
+          listCol,
+          listInfo.hasContent,
+          activeListIndent,
+          prevLineWasParagraph,
+        );
       }
     }
 
@@ -1504,7 +1496,7 @@ export function sanitizeMarkdownPageSlice(
   let fenceChar = '';
   let fenceLen = 0;
   let fenceIndent = 0;
-  let activeListIndent = 0;
+  let listIndents: number[] = [];
   let prevLineWasParagraph = false;
 
   let reconstructed = rawSlice;
@@ -1535,7 +1527,7 @@ export function sanitizeMarkdownPageSlice(
         fenceChar = cp.fenceChar;
         fenceLen = cp.fenceLen;
         fenceIndent = cp.fenceIndent;
-        activeListIndent = cp.activeListIndent;
+        listIndents = cp.listIndents ? [...cp.listIndents] : cp.activeListIndent > 0 ? [cp.activeListIndent] : [];
         prevLineWasParagraph = cp.prevLineWasParagraph;
       }
     }
@@ -1560,7 +1552,7 @@ export function sanitizeMarkdownPageSlice(
           fenceChar = '';
           fenceLen = 0;
           fenceIndent = 0;
-          activeListIndent = 0;
+          listIndents.length = 0;
         } else {
           const maxClose = fenceIndent > 0 ? fenceIndent + 3 : 3;
           if (!isBlank && cols >= fenceIndent && cols <= maxClose && bytePos < rawLine.length) {
@@ -1576,15 +1568,18 @@ export function sanitizeMarkdownPageSlice(
       }
 
       if (!inFence && !lineClosedFenceExplicit) {
-        if (!isBlank && activeListIndent > 0 && cols < activeListIndent && !prevLineWasParagraph) {
-          activeListIndent = 0;
+        if (!isBlank && listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
+          while (listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
+            listIndents.pop();
+          }
         }
-        const listInfo = detectSliceListItemInfo(rawLine, cols, bytePos, prevLineWasParagraph);
+        const parentListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
+        const listInfo = detectSliceListItemInfo(rawLine, cols, bytePos, prevLineWasParagraph, parentListIndent);
         const listCol = listInfo.contentCol;
         if (listCol > 0) {
-          activeListIndent = listCol;
-          prevLineWasParagraph = false;
+          listIndents.push(listCol);
         }
+        const activeListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
         const minCols = activeListIndent > 0 ? activeListIndent : 0;
         const maxCols = minCols + 3;
         if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos + 3 <= rawLine.length) {
@@ -1603,30 +1598,16 @@ export function sanitizeMarkdownPageSlice(
           }
         }
         if (!lineOpenedFence && (!containsOffset || clampedOffset === lineEnd)) {
-          if (isBlank || isThematicBreakForSlice(rawLine, cols, bytePos)) {
-            prevLineWasParagraph = false;
-          } else if (listCol > 0) {
-            prevLineWasParagraph = listInfo.hasContent;
-          } else {
-            const leadC = rawLine.charCodeAt(bytePos);
-            let isAtx = false;
-            if (cols <= 3 && leadC === 35) {
-              let h = bytePos;
-              while (h < rawLine.length && h - bytePos < 7 && rawLine.charCodeAt(h) === 35) h++;
-              if (h - bytePos <= 6 && (h === rawLine.length || rawLine.charCodeAt(h) === 32 || rawLine.charCodeAt(h) === 9)) {
-                isAtx = true;
-              }
-            }
-            if (isAtx || (!prevLineWasParagraph && activeListIndent === 0 && cols >= 4)) {
-              prevLineWasParagraph = false;
-            } else if (cols <= 3 && leadC === 62) {
-              let q = bytePos;
-              while (q < rawLine.length && (rawLine.charCodeAt(q) === 62 || rawLine.charCodeAt(q) === 32 || rawLine.charCodeAt(q) === 9)) q++;
-              prevLineWasParagraph = q < rawLine.length;
-            } else {
-              prevLineWasParagraph = true;
-            }
-          }
+          prevLineWasParagraph = computeNextSliceParagraphState(
+            rawLine,
+            cols,
+            bytePos,
+            isBlank,
+            listCol,
+            listInfo.hasContent,
+            activeListIndent,
+            prevLineWasParagraph,
+          );
         }
       }
 

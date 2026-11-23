@@ -12,7 +12,7 @@ metadata:
   namespace: edgefetch
   labels:
     app.kubernetes.io/name: edgefetch-agent
-    app.kubernetes.io/version: "2.7.6"
+    app.kubernetes.io/version: "2.7.7"
 spec:
   replicas: 2
   selector:
@@ -32,7 +32,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agent
-          image: ghcr.io/bartrumb/edgefetch-agent:2.7.6
+          image: ghcr.io/bartrumb/edgefetch-agent:2.7.7
           args: ["--mode=agent"]
           securityContext:
             allowPrivilegeEscalation: false

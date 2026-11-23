@@ -3577,6 +3577,7 @@ export default {
             ...(query ? { query } : {}),
             userId: auth.userId,
             env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+            ...(auth.scopes.includes('crawl:fetch') ? { executeHubFetch: makeCatalogHubFetch('catalog_records') } : {}),
           });
           return Response.json(out.body, {
             status: out.status,

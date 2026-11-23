@@ -670,7 +670,12 @@ func TestR10P2LiveChromiumRetainedSessionSlowStepHeaderIsolationIfInstalled(t *t
 						if (++ticks > 16) { clearInterval(iv); return; }
 						fetch('/api/from-a-timer').catch(() => {});
 					}, 25);
-					window.addEventListener('pagehide', () => { fetch('/api/from-a-unload', {keepalive: true}).catch(() => {}); });
+					window.addEventListener('pagehide', () => {
+						fetch('/api/from-a-unload', {keepalive: true}).catch(() => {});
+						fetch('/api/from-a-pagehide-noref', {method: 'POST', body: 'x', keepalive: true, referrerPolicy: 'no-referrer'}).catch(() => {});
+						fetch('/api/from-a-pagehide-origin', {method: 'POST', body: 'x', keepalive: true, referrerPolicy: 'origin'}).catch(() => {});
+						fetch('/api/from-a-spoofed-referrer', {method: 'POST', body: 'spoof', keepalive: true, referrer: 'https://r10-live.example.com/page-b'}).catch(() => {});
+					});
 				</script>
 				<main>Page A</main>
 			</body></html>`))
@@ -679,9 +684,44 @@ func TestR10P2LiveChromiumRetainedSessionSlowStepHeaderIsolationIfInstalled(t *t
 			time.Sleep(180 * time.Millisecond)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write([]byte(`<!doctype html><html><body>
-				<script>fetch('/api/from-b-committed');</script>
+				<script>
+					Promise.all([
+						fetch('/api/from-b-committed'),
+						fetch('/api/from-b-post-noref', {method: 'POST', body: 'ok', referrerPolicy: 'no-referrer'}),
+					]).then(() => {
+						const f = document.createElement('iframe');
+						f.src = 'about:blank';
+						document.body.appendChild(f);
+					});
+					window.addEventListener('pagehide', () => {
+						fetch('/api/from-b-origin-to-root', {method: 'POST', body: 'root', keepalive: true, referrerPolicy: 'origin'}).catch(() => {});
+						fetch('/api/from-b-spoofed-root', {method: 'POST', body: 'spoof-root', keepalive: true, referrer: 'https://r10-live.example.com/'}).catch(() => {});
+					});
+				</script>
 				<main>Page B</main>
 			</body></html>`))
+		case "/":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			if sec == "SECRET_C_ROOT" {
+				_, _ = w.Write([]byte(`<!doctype html><html><body>
+					<script>
+						fetch('/api/from-root-step3').then(() => {
+							const f = document.createElement('iframe');
+							f.src = 'about:blank';
+							document.body.appendChild(f);
+						});
+						window.addEventListener('pagehide', () => {
+							fetch('/api/from-root-same-url-pagehide', {method: 'POST', body: 'same', keepalive: true, referrer: 'https://r10-live.example.com/'}).catch(() => {});
+						});
+					</script>
+					<main>Root Step 3</main>
+				</body></html>`))
+			} else {
+				_, _ = w.Write([]byte(`<!doctype html><html><body>
+					<script>fetch('/api/from-root-step4');</script>
+					<main>Root Step 4</main>
+				</body></html>`))
+			}
 		default:
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"ok":true}`))
@@ -711,23 +751,59 @@ func TestR10P2LiveChromiumRetainedSessionSlowStepHeaderIsolationIfInstalled(t *t
 	}
 
 	out2, err := r.Execute(ctx, Task{
-		SessionID: out1.SessionID,
-		URL:       "https://r10-live.example.com/page-b",
-		Headers:   map[string]string{"X-R10-Step-Secret": "SECRET_B"},
-		WaitForMs: 200,
+		SessionID:   out1.SessionID,
+		URL:         "https://r10-live.example.com/page-b",
+		Headers:     map[string]string{"X-R10-Step-Secret": "SECRET_B"},
+		KeepSession: true,
+		WaitForMs:   200,
 	})
 	if err != nil || !strings.Contains(out2.HTML, "Page B") {
 		t.Fatalf("live Step 2 failed: err=%v html=%q", err, out2.HTML)
 	}
 
+	out3, err := r.Execute(ctx, Task{
+		SessionID:   out1.SessionID,
+		URL:         "https://r10-live.example.com/",
+		Headers:     map[string]string{"X-R10-Step-Secret": "SECRET_C_ROOT"},
+		KeepSession: true,
+		WaitForMs:   150,
+	})
+	if err != nil || !strings.Contains(out3.HTML, "Root Step 3") {
+		t.Fatalf("live Step 3 failed: err=%v html=%q", err, out3.HTML)
+	}
+
+	out4, err := r.Execute(ctx, Task{
+		SessionID: out1.SessionID,
+		URL:       "https://r10-live.example.com/",
+		Headers:   map[string]string{"X-R10-Step-Secret": "SECRET_D_SAME_URL"},
+		WaitForMs: 150,
+	})
+	if err != nil || !strings.Contains(out4.HTML, "Root Step 4") {
+		t.Fatalf("live Step 4 failed: err=%v html=%q", err, out4.HTML)
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
-	if seenHeader["/page-b"] != "SECRET_B" || seenHeader["/api/from-b-committed"] != "SECRET_B" {
-		t.Fatalf("expected /page-b and /api/from-b-committed to receive SECRET_B, got seenHeader=%+v", seenHeader)
+	if seenHeader["/page-b"] != "SECRET_B" || seenHeader["/api/from-b-committed"] != "SECRET_B" || seenHeader["/api/from-b-post-noref"] != "SECRET_B" {
+		t.Fatalf("expected /page-b, /api/from-b-committed, and /api/from-b-post-noref to receive SECRET_B, got seenHeader=%+v", seenHeader)
 	}
-	for _, fromAPath := range []string{"/api/from-a-timer", "/api/from-a-unload"} {
-		if seenHeader[fromAPath] == "SECRET_B" {
-			t.Fatalf("SECURITY (P2): live Chromium leaked Step 2 SECRET_B to Page A request %s! seenHeader=%+v", fromAPath, seenHeader)
+	if seenHeader["/api/from-root-step3"] != "SECRET_C_ROOT" || seenHeader["/api/from-root-step4"] != "SECRET_D_SAME_URL" {
+		t.Fatalf("expected Step 3 & Step 4 root fetches to receive their respective headers, got seenHeader=%+v", seenHeader)
+	}
+	if seenHeader["/api/from-a-timer"] == "SECRET_B" || seenHeader["/api/from-a-timer"] == "SECRET_C_ROOT" || seenHeader["/api/from-a-timer"] == "SECRET_D_SAME_URL" {
+		t.Fatalf("SECURITY (P2): live Chromium leaked subsequent step header %q to /api/from-a-timer! seenHeader=%+v", seenHeader["/api/from-a-timer"], seenHeader)
+	}
+	for _, fromAPath := range []string{"/api/from-a-unload", "/api/from-a-pagehide-noref", "/api/from-a-pagehide-origin", "/api/from-a-spoofed-referrer"} {
+		if seenHeader[fromAPath] != "" {
+			t.Fatalf("SECURITY (P2 / EF-BLIND-01): live Chromium leaked header %q to tainted Page A pagehide request %s! seenHeader=%+v", seenHeader[fromAPath], fromAPath, seenHeader)
 		}
+	}
+	for _, fromBPath := range []string{"/api/from-b-origin-to-root", "/api/from-b-spoofed-root"} {
+		if seenHeader[fromBPath] != "" {
+			t.Fatalf("SECURITY (EF-BLIND-01-R1): live Chromium leaked header %q to tainted Page B pagehide request %s! seenHeader=%+v", seenHeader[fromBPath], fromBPath, seenHeader)
+		}
+	}
+	if seenHeader["/api/from-root-same-url-pagehide"] != "" {
+		t.Fatalf("SECURITY (EF-BLIND-01-R1): live Chromium leaked header %q on same-URL re-navigation pagehide! seenHeader=%+v", seenHeader["/api/from-root-same-url-pagehide"], seenHeader)
 	}
 }

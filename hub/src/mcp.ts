@@ -1065,9 +1065,9 @@ export function buildCanonicalMcpToolSchemas(options?: {
           },
           minBaseMode: {
             type: 'string',
-            enum: ['floor', 'ceiling'],
+            enum: ['floor', 'ceiling', 'overlap'],
             default: 'floor',
-            description: 'How minBase compares against salary ranges: "floor" (pay.min >= minBase) or "ceiling" (pay.max >= minBase).',
+            description: 'How minBase compares against salary ranges: "floor" (pay.min >= minBase) or "overlap" / "ceiling" (pay.max >= minBase).',
           },
           strictPay: {
             type: 'boolean',
@@ -1539,6 +1539,20 @@ export function truncateResultBodies(
   return { ...parsed, results };
 }
 
+function compactMcpScreenshotBody(body: Record<string, unknown>): Record<string, unknown> {
+  if (typeof body.screenshotArtifactId !== 'string' || !body.screenshotArtifactId) {
+    return body;
+  }
+  const copy: Record<string, unknown> = { ...body };
+  delete copy.screenshotBase64;
+  delete copy.screenshot;
+  if (!copy.screenshotNote) {
+    copy.screenshotNote =
+      'PNG screenshot stored as an R2 artifact; call read_artifact({ artifactId: screenshotArtifactId, format: "raw" }) on demand.';
+  }
+  return copy;
+}
+
 async function handleToolCallInner(
   name: string,
   args: Record<string, unknown>,
@@ -1934,7 +1948,7 @@ async function handleToolCallInner(
       args.maxChars === undefined ? { ...args, defaultMaxChars: DEFAULT_MCP_SCRAPE_MAX_CHARS } : args;
     const res = await deps.executeScrape({ args: scrapeArgs, principal, userId });
     return {
-      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(compactMcpScreenshotBody(res.body), null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
     };
   }
@@ -1981,7 +1995,7 @@ async function handleToolCallInner(
     }
     const res = await deps.executeInteract({ args, principal, userId });
     return {
-      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(compactMcpScreenshotBody(res.body), null, 2) }],
       ...(res.status !== 200 ? { isError: true } : {}),
     };
   }

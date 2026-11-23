@@ -152,8 +152,10 @@ type retainedSession struct {
 	hasCommittedDoc       bool              // true once a document committed on mainFrameID (or session was resumed from an earlier step)
 	committedLoaderID     string            // loaderId of the currently committed top-level document on mainFrameID
 	committedDocURL       string            // canonical fragment-stripped URL of the currently committed top-level document
+	stepRotated           bool              // true once a second or later top-level navigation begins/commits on this session
 	staleStepDocURLs      map[string]bool   // retired committedDocURLs from prior session steps (blocks late pagehide/unload beacons)
 	reqDocURLs            map[string]string // Network.RequestId -> fragment-stripped documentURL from Network.requestWillBeSent
+	netNotifyCh           chan struct{}     // closed & nilled on Network.requestWillBeSent to wake paused subresources awaiting loaderId proof
 	pendingNavLoaderID    string            // loaderId of the in-flight harness Page.navigate before commit
 	pendingStepHeaders    map[string]string // staged next-step headers promoted to extraHeaders ONLY when Page.frameNavigated commits
 	pendingNavCrossOrigin bool              // true if the in-flight harness navigation took a cross-origin redirect before commit
@@ -530,6 +532,9 @@ func (s *retainedSession) noteFrameNavigated(rawParams json.RawMessage) {
 		return
 	}
 	s.mainFrameID = ev.Frame.ID
+	if s.hasCommittedDoc || s.committedDocURL != "" {
+		s.stepRotated = true
+	}
 	if s.committedDocURL != "" {
 		newClean := stripURLFragment(ev.Frame.URL)
 		if newClean != "" && !sameNavigationURL(s.committedDocURL, newClean) {
@@ -663,6 +668,10 @@ func (s *retainedSession) noteNetworkRequestWillBeSent(rawParams json.RawMessage
 			s.taintedNetReqs[ev.RequestID] = true
 		}
 	}
+	if s.netNotifyCh != nil {
+		close(s.netNotifyCh)
+		s.netNotifyCh = nil
+	}
 	s.mu.Unlock()
 }
 
@@ -791,6 +800,9 @@ func (s *retainedSession) expectHarnessNavigation(targetURL string) {
 	s.mu.Lock()
 	// IMPORTANT: Never clear s.frameTainted or s.redirectedCrossOrigin here when a step begins;
 	// taint is cleared ONLY in noteFrameNavigated once the new top-level document actually commits!
+	if s.hasCommittedDoc || s.committedDocURL != "" {
+		s.stepRotated = true
+	}
 	if s.committedDocURL != "" && targetURL != "" && !sameNavigationURL(s.committedDocURL, targetURL) {
 		if s.staleStepDocURLs == nil || len(s.staleStepDocURLs) >= 64 {
 			s.staleStepDocURLs = make(map[string]bool)
@@ -945,33 +957,34 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	preCommitOldDoc := s.hasCommittedDoc && s.awaitingHarnessCommit
 	staleLoader := s.committedLoaderID != "" && reqLoader != "" && reqLoader != s.committedLoaderID
 	stalePrevStepDoc := false
-	if len(s.staleStepDocURLs) > 0 {
-		isRetiredURL := func(u string) bool {
-			clean := stripURLFragment(u)
-			if clean == "" {
-				return false
-			}
-			if s.committedDocURL != "" && sameNavigationURL(clean, s.committedDocURL) {
-				return false
-			}
-			if s.staleStepDocURLs[clean] {
-				return true
-			}
-			for prevU := range s.staleStepDocURLs {
-				if sameNavigationURL(clean, prevU) {
-					return true
-				}
-			}
+	isRetiredURL := func(u string) bool {
+		clean := stripURLFragment(u)
+		if clean == "" {
 			return false
 		}
-		for hk, hv := range paused.Request.Headers {
-			if hv != nil && strings.EqualFold(strings.TrimSpace(hk), "referer") {
-				if isRetiredURL(fmt.Sprint(hv)) {
-					stalePrevStepDoc = true
-				}
-				break
+		if s.committedDocURL != "" && sameNavigationURL(clean, s.committedDocURL) {
+			return false
+		}
+		if s.staleStepDocURLs[clean] {
+			return true
+		}
+		for prevU := range s.staleStepDocURLs {
+			if sameNavigationURL(clean, prevU) {
+				return true
 			}
 		}
+		return false
+	}
+	for hk, hv := range paused.Request.Headers {
+		if hv != nil && strings.EqualFold(strings.TrimSpace(hk), "referer") {
+			refStr := strings.TrimSpace(fmt.Sprint(hv))
+			if len(s.staleStepDocURLs) > 0 && isRetiredURL(refStr) {
+				stalePrevStepDoc = true
+			}
+			break
+		}
+	}
+	if len(s.staleStepDocURLs) > 0 {
 		if !stalePrevStepDoc && paused.Initiator != nil && paused.Initiator.URL != "" && isRetiredURL(paused.Initiator.URL) {
 			stalePrevStepDoc = true
 		}
@@ -991,6 +1004,7 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	isPingOrBeacon := strings.EqualFold(paused.ResourceType, "Ping") || strings.EqualFold(paused.ResourceType, "CSPViolationReport")
 
 	allowInject := false
+	needsAsyncLoaderProof := false
 	switch {
 	case !sameOriginReq:
 		allowInject = false
@@ -1004,9 +1018,19 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	default:
 		// Subresources: require committed target document (never pre-commit or retired previous page), matching loaderId,
 		// untainted tab & frame, non-Ping, redirect-chain provenance, and positive Origin/Referer proof.
-		allowInject = !preCommitOldDoc && !staleLoader && !stalePrevStepDoc && !badCommittedOrigin &&
+		baseAllow := !preCommitOldDoc && !staleLoader && !stalePrevStepDoc && !badCommittedOrigin &&
 			!tabTainted && !frameUntrusted && !netTainted && !isPingOrBeacon && chainOK &&
 			hasPositiveSameOriginProof(paused.Request.Headers, initOrigin)
+		if baseAllow && (s.stepRotated || len(s.staleStepDocURLs) > 0) && reqLoader == "" {
+			// EF-BLIND-01 / EF-BLIND-01-R1: After any step rotation (`s.stepRotated`, including same-URL re-navigation),
+			// neither `Origin:` nor caller-JS-controllable `Referer:` (`RequestInit.referrer` or `referrerPolicy: "origin"` to `/`)
+			// can distinguish the newly committed document from an unloading prior document's `pagehide` `keepalive` fetch before
+			// `Network.requestWillBeSent` arrives. Always defer briefly off the CDP read loop until unforgeable `loaderId` arrives!
+			needsAsyncLoaderProof = true
+			allowInject = false
+		} else {
+			allowInject = baseAllow
+		}
 	}
 
 	if allowInject && len(extra) > 0 {
@@ -1017,11 +1041,62 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	}
 	s.mu.Unlock()
 
-	params := map[string]any{"requestId": paused.RequestID}
-	if allowInject && len(extra) > 0 {
-		params["headers"] = mergeCDPRequestHeaders(paused.Request.Headers, extra)
-	}
 	go func() {
+		if needsAsyncLoaderProof {
+			deadline := time.Now().Add(25 * time.Millisecond)
+			for {
+				s.mu.Lock()
+				lateLoader := s.lookupReqLoaderLocked(paused.NetworkID, paused.RequestID)
+				if lateLoader != "" || time.Now().After(deadline) {
+					lateNetTainted := (paused.NetworkID != "" && s.taintedNetReqs[paused.NetworkID]) ||
+						(paused.RequestID != "" && s.taintedNetReqs[paused.RequestID])
+					lateDocURL := ""
+					if paused.NetworkID != "" {
+						lateDocURL = s.reqDocURLs[paused.NetworkID]
+					}
+					if lateDocURL == "" && paused.RequestID != "" {
+						lateDocURL = s.reqDocURLs[paused.RequestID]
+					}
+					lateDocOK := lateDocURL == "" || (s.committedDocURL != "" && sameNavigationURL(lateDocURL, s.committedDocURL))
+					lateFrameUntrusted := paused.FrameID == "" || s.childFrames[paused.FrameID] != "" ||
+						s.frameTainted[paused.FrameID] || (s.mainFrameID != "" && paused.FrameID != s.mainFrameID)
+					if lateLoader != "" && s.committedLoaderID != "" && lateLoader == s.committedLoaderID &&
+						lateDocOK && !lateNetTainted && !lateFrameUntrusted &&
+						!s.redirectedCrossOrigin && !s.awaitingHarnessCommit && len(s.extraHeaders) > 0 {
+						allowInject = true
+						extra = s.extraHeaders
+						if s.injectedReqs == nil || len(s.injectedReqs) >= maxSessionNetEntries {
+							s.injectedReqs = make(map[string]bool)
+						}
+						s.injectedReqs[paused.RequestID] = true
+					}
+					s.mu.Unlock()
+					break
+				}
+				if s.netNotifyCh == nil {
+					s.netNotifyCh = make(chan struct{})
+				}
+				waitCh := s.netNotifyCh
+				s.mu.Unlock()
+				rem := time.Until(deadline)
+				if rem <= 0 {
+					continue
+				}
+				timer := time.NewTimer(rem)
+				select {
+				case <-waitCh:
+					timer.Stop()
+				case <-timer.C:
+				case <-s.stopFetchCh:
+					timer.Stop()
+					return
+				}
+			}
+		}
+		params := map[string]any{"requestId": paused.RequestID}
+		if allowInject && len(extra) > 0 {
+			params["headers"] = mergeCDPRequestHeaders(paused.Request.Headers, extra)
+		}
 		cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = cdp.call(cctx, cdpSID, "Fetch.continueRequest", params, nil)
@@ -3102,7 +3177,8 @@ func buildChromiumLaunchArgsWithSandbox(proxyAddr, userDir string, useSandbox bo
 		"--disable-default-apps",
 		"--disable-quic",
 		"--media-router=0",
-		"--disable-features=TranslateUI,MediaRouter,DialMediaRouteProvider,CastMediaRouteProvider,CastStreamingWin,GlobalMediaControls,NetworkTimeServiceQuerying,OptimizationHints",
+		"--bwsi",
+		"--disable-features=TranslateUI,MediaRouter,DialMediaRouteProvider,CastMediaRouteProvider,CastStreamingWin,GlobalMediaControls,NetworkTimeServiceQuerying,OptimizationHints,OptimizationGuideModelDownloading,OptimizationHintsFetching,PrivacySandboxSettings4",
 		"--webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--enforce-webrtc-ip-permission-check",

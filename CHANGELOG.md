@@ -2,6 +2,22 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.7] - 2026-11-23
+
+### Security
+- **Blind Security Audit Hardening (`EF-BLIND-01`–`06`, `internal/browser/renderer.go`, `internal/politeness/redact.go`, `hub/src/storage.ts`, `hub/src/otel.ts`, `hub/src/scrape-advanced.ts`):**
+  - Enforced mandatory post-rotation `Network.requestWillBeSent` `loaderId` proof (`stepRotated` + `needsAsyncLoaderProof`) on retained Chromium sessions in `internal/browser/renderer.go`, eliminating late `pagehide` `{keepalive: true}` header leaks across `referrerPolicy: "no-referrer"`, `referrerPolicy: "origin"` (including root `/` navigations), same-origin `RequestInit.referrer` spoofing, and same-URL re-navigations (`EF-BLIND-01`), and added `--bwsi` plus Optimization Guide / Privacy Sandbox feature disables (`EF-BLIND-06`).
+  - Added streaming `DecompressionStream('gzip')` uncompressed byte-length and `SHA-256` verification in `handleAgentArtifactUpload` prior to deduplication or R2 writes and deduplicated `'transient'` uploads cleanly after `'stored'` promotion in `META.artifacts` (`EF-BLIND-02`).
+  - Hardened schemeless `user:secret@host` terminator clamping (preserving IPv6 `@[::1]` literals while clamping outer `]`, `{`, `}`, `;`, `\`, `` ` ``, `|`, and UTF-8 `U+0085`/`U+2028`/`U+2029` line breaks) and HTAB-delimited inline auth redaction in Go (`EF-BLIND-03`) and unified `scrubFreeTextUrlsAndSecrets` across `sanitizeErrorMessageForSpan` and `sanitizeSpanAttributes` in Hub OTel (`EF-BLIND-04`).
+  - Replaced scalar `activeListIndent` tracking in `computeMarkdownSliceCheckpoints` and `sanitizeMarkdownPageSlice` with a `listIndents` stack so nested-list dedents never invert CommonMark fence state (`EF-BLIND-05`).
+
+### Fixed
+- **Live MCP Observability, Jobs, Catalog Currency & Screenshot Artifacts (`hub/src/index.ts`, `hub/src/otel.ts`, `hub/src/jobs.ts`, `hub/src/catalog.ts`, `hub/src/scrape.ts`, `hub/src/mcp.ts`):**
+  - Wired `metaDb: env.META` into `handleAgentArtifactUpload` (eliminating unnecessary `r2_head` spans on deduplicated uploads) and preserved caller W3C TraceContext `-00` unsampled flags on data-plane routes.
+  - Added `screenshotArtifactId` (`private/<userId>/tmp/sha256/...` R2 storage) on `interact` and `scrape` screenshots while stripping 188K-char inline `screenshotBase64` payloads from MCP `tools/call` text responses so browser screenshots never overflow agent context windows.
+  - Switched Shopify currency resolution to probe `/meta.json` (permitted by Shopify `robots.txt`) before `/cart.js` with bounded 256-origin positive/negative caching and `crawl:fetch`-gated lazy currency backfill on stored `catalogId` snapshots.
+  - Tightened `jobs` query relevance to word-boundary token matching (so `"Engineer"` no longer matches `"Engineering Manager"`), added `minBaseMode: "overlap"`, promoted Workday board discovery + path-scoped SmartRecruiters search, extracted Lever multi-location NY salary ranges, and capped test runner concurrency via `os.availableParallelism()`.
+
 ## [2.7.6] - 2026-11-23
 
 ### Security

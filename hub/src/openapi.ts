@@ -11,7 +11,7 @@
 import { buildCanonicalMcpToolSchemas, MCP_TOOL_SCHEMAS, TEXT_ACCEPTS } from './mcp';
 
 export const DEFAULT_OPENAPI_ORIGIN = 'https://edgefetch.dev';
-export const DEFAULT_OPENAPI_VERSION = '2.7.6';
+export const DEFAULT_OPENAPI_VERSION = '2.7.7';
 
 export interface BuildOpenApiOptions {
   origin?: string;
@@ -1830,6 +1830,9 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             remainingChars: { type: 'integer' },
             nextOffset: { type: ['integer', 'null'] },
             screenshotBase64: { type: 'string' },
+            screenshotArtifactId: { type: 'string' },
+            screenshotMimeType: { type: 'string' },
+            screenshotBytes: { type: 'integer' },
           },
         },
         MapResponse: {

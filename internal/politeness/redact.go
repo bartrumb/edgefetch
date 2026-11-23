@@ -466,7 +466,13 @@ func scrubSchemelessAuthorityAndPath(raw string) string {
 		raw = raw[:idx]
 	}
 	if slash := strings.IndexByte(raw, '/'); slash >= 0 {
-		raw = raw[:slash] + scrubPathMatrixAndResetTokens(raw[slash:])
+		if semi := strings.IndexByte(raw[:slash], ';'); semi >= 0 {
+			raw = raw[:semi] + scrubPathMatrixAndResetTokens(raw[slash:])
+		} else {
+			raw = raw[:slash] + scrubPathMatrixAndResetTokens(raw[slash:])
+		}
+	} else if semi := strings.IndexByte(raw, ';'); semi >= 0 {
+		raw = raw[:semi]
 	}
 	return raw
 }
@@ -835,7 +841,45 @@ func isSchemelessPrevBlocked(prev byte) bool {
 		prev == '/' || prev == ':' || prev == '@' || prev == '.' || prev == '_' || prev == '-'
 }
 
-const schemelessTermChars = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \"'<>),"
+const schemelessTermChars = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \"'<>),{}\\`|"
+
+func clampAtUTF8LineBreak(s string, from, end int) int {
+	for k := from; k < end; k++ {
+		c := s[k]
+		if c == 0xc2 && k+1 < end && s[k+1] == 0x85 {
+			return k
+		}
+		if c == 0xe2 && k+2 < end && s[k+1] == 0x80 && (s[k+2] == 0xa8 || s[k+2] == 0xa9) {
+			return k
+		}
+	}
+	return end
+}
+
+func clampSchemelessOuterBracketAndPunct(s string, lastAt, tokEnd int) int {
+	k := lastAt + 1
+	// Allow a single IPv6 bracketed host literal immediately following `@` (`@[::1]:8080/...`).
+	if k < tokEnd && s[k] == '[' {
+		k++
+		for k < tokEnd && s[k] != ']' {
+			k++
+		}
+		if k < tokEnd && s[k] == ']' {
+			k++
+		}
+	}
+	// Any subsequent `]` is an enclosing bracket delimiter (`[user:secret@example.com]:443` or `[user:secret@[::1]]:443`).
+	for ; k < tokEnd; k++ {
+		if s[k] == ']' {
+			tokEnd = k
+			break
+		}
+	}
+	for tokEnd > lastAt+1 && (s[tokEnd-1] == ';' || s[tokEnd-1] == ',') {
+		tokEnd--
+	}
+	return tokEnd
+}
 
 type schemelessSpanCache struct {
 	tokEnd            int
@@ -853,9 +897,13 @@ func (sc *schemelessSpanCache) refresh(s string, from int) {
 	if rel := strings.IndexAny(s[from:], schemelessTermChars); rel >= 0 {
 		tokEnd = from + rel
 	}
+	tokEnd = clampAtUTF8LineBreak(s, from, tokEnd)
 	lastAt := -1
 	if relAt := strings.LastIndexByte(s[from:tokEnd], '@'); relAt >= 0 {
 		lastAt = from + relAt
+	}
+	if lastAt > from {
+		tokEnd = clampSchemelessOuterBracketAndPunct(s, lastAt, tokEnd)
 	}
 	sc.tokEnd = tokEnd
 	sc.lastAt = lastAt
@@ -874,6 +922,17 @@ func (sc *schemelessSpanCache) refresh(s string, from int) {
 	hostPart := afterAt
 	if slashOrQ >= 0 {
 		hostPart = afterAt[:slashOrQ]
+	}
+	if semi := strings.IndexByte(hostPart, ';'); semi >= 0 {
+		if strings.IndexByte(hostPart[semi+1:], '=') < 0 {
+			tokEnd = lastAt + 1 + semi
+			sc.tokEnd = tokEnd
+			afterAt = s[lastAt+1 : tokEnd]
+			slashOrQ = -1
+			hostPart = afterAt
+		} else {
+			hostPart = hostPart[:semi]
+		}
 	}
 	if !isHostTokenBytes(hostPart) {
 		return
@@ -1070,7 +1129,7 @@ func RedactEmbeddedURLs(s string) string {
 		(hasColon && strings.ContainsAny(s, "mM") && (strings.Contains(s, "mailto:") || strings.ContainsAny(s, "MAILTO")))
 	hasBare := (hasColon || hasSlash) &&
 		(hasDotOrBracket || strings.Contains(s, "localhost") || strings.ContainsAny(s, "LOCALHOST"))
-	hasSecretKw := (hasColon || strings.IndexByte(s, ' ') >= 0 || strings.IndexByte(s, '=') >= 0) &&
+	hasSecretKw := (hasColon || strings.IndexByte(s, ' ') >= 0 || strings.IndexByte(s, '\t') >= 0 || strings.IndexByte(s, '=') >= 0) &&
 		(strings.Contains(s, "bearer") ||
 			strings.Contains(s, "basic") ||
 			strings.Contains(s, "token") ||
@@ -1244,14 +1303,21 @@ func RedactEmbeddedURLs(s string) string {
 				case hasPrefixFoldASCII(s[i:], "apikey"):
 					kwLen = 6
 				}
-				if kwLen > 0 && i+kwLen < len(s) && (s[i+kwLen] == ' ' || s[i+kwLen] == '=' || s[i+kwLen] == ':') {
+				if kwLen > 0 && i+kwLen < len(s) && (s[i+kwLen] == ' ' || s[i+kwLen] == '\t' || s[i+kwLen] == '=' || s[i+kwLen] == ':') {
 					valStart := i + kwLen + 1
-					for valStart < len(s) && s[valStart] == ' ' {
+					for valStart < len(s) && (s[valStart] == ' ' || s[valStart] == '\t') {
 						valStart++
 					}
 					valEnd := valStart
 					for valEnd < len(s) && s[valEnd] != ' ' && s[valEnd] != '\t' && s[valEnd] != '\r' && s[valEnd] != '\n' &&
-						s[valEnd] != '"' && s[valEnd] != '\'' && s[valEnd] != ',' && s[valEnd] != ';' && s[valEnd] != ')' {
+						s[valEnd] != '"' && s[valEnd] != '\'' && s[valEnd] != ',' && s[valEnd] != ';' && s[valEnd] != ')' &&
+						s[valEnd] != ']' && s[valEnd] != '}' && s[valEnd] != '\\' && s[valEnd] != '`' && s[valEnd] != '|' {
+						if s[valEnd] == 0xc2 && valEnd+1 < len(s) && s[valEnd+1] == 0x85 {
+							break
+						}
+						if s[valEnd] == 0xe2 && valEnd+2 < len(s) && s[valEnd+1] == 0x80 && (s[valEnd+2] == 0xa8 || s[valEnd+2] == 0xa9) {
+							break
+						}
 						valEnd++
 					}
 					if looksLikeSecretTokenValue(s[valStart:valEnd]) {

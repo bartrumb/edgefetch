@@ -5,7 +5,7 @@
 [![Worker, SDKs & Adapters: MIT](https://img.shields.io/badge/Worker%2C%20SDKs%20%26%20Adapters-MIT-blue.svg)](LICENSE)
 [![Hub: FSL-1.1-MIT](https://img.shields.io/badge/Hub-FSL--1.1--MIT%20(Fair%20Source)-0ea5e9.svg)](hub/LICENSE)
 
-**EdgeFetch** turns URLs into clean Markdown and structured JSON for AI agents via CLI, `stdio` MCP, or HTTP — combining an **open-source worker, SDKs, and adapters ([MIT](LICENSE)), fair-source hub ([FSL-1.1](hub/LICENSE), `MIT` after two years)**. The worker and CLI ship as a single static Go binary with `1` external Go dependency ([`github.com/coder/websocket`](go.mod)), enforce `robots.txt` (RFC 9309) and `Content-Signal: ai-input` on every hop including redirects, stop immediately on the first CAPTCHA or anti-bot challenge, and pair with `57` readable declarative YAML site adapters in [`internal/extract/manifests/`](internal/extract/manifests) targeting public APIs, feeds, and pages.
+**EdgeFetch** turns URLs into clean Markdown and structured JSON for AI agents via CLI, `stdio` MCP, or HTTP — combining an **open-source worker, SDKs, and adapters ([MIT](LICENSE)), fair-source hub ([FSL-1.1](hub/LICENSE), `MIT` after two years)**. The worker and CLI ship as a single static Go binary with `1` external Go dependency ([`github.com/coder/websocket`](go.mod)), enforce `robots.txt` (RFC 9309) and `Content-Signal: ai-input` on every hop including redirects, stop immediately on the first CAPTCHA or anti-bot challenge, and pair with `56` readable declarative YAML site adapters in [`internal/extract/manifests/`](internal/extract/manifests) targeting public APIs, feeds, and pages.
 
 > Polite by default: enforces `robots.txt` and `Content-Signal` on every hop, identifies itself honestly (with optional RFC 9421 Web Bot Auth signatures), stops on anti-bot challenges instead of bypassing them, and makes **zero** background telemetry or update-check calls unless explicitly opted in (`DO_NOT_TRACK=1` hard-disables both).
 
@@ -70,7 +70,7 @@ docker compose up --build -d
 - **Single-dependency Go data plane (`cmd/`, `internal/`):** `go list -m all` lists `1` external Go module (`github.com/coder/websocket`, `0` transitive dependencies, `CGO_ENABLED=0`). Handles HTTP/2 fetching, RFC 9309 `robots.txt` + `Content-Signal` checks, dial-time SSRF socket verification, streaming PDF parsing, local `stdio` MCP (`edgefetch mcp`), and standalone Go Hub mode (`edgefetch --mode=hub`).
 - **Dial-time SSRF & browser subresource isolation:** `politeness.RejectNonPublicPeer` inspects resolved peer IPs inside Go's `net.Dialer.Control` immediately before `connect()` (blocking DNS-rebinding TOCTOU against RFC 1918 LANs, loopback, CGNAT/Tailscale `100.64.0.0/10`, and `169.254.169.254`), while headless Chromium subresources are forced through an in-process loopback `CONNECT` proxy (`--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"`).
 - **Your own hardware, never a shared proxy pool:** Outbound workers (`edgefetch --mode=agent`) dial *only* your own Hub URL using your private `AGENT_TOKEN` over TLS WebSockets (`WSS /agent/ws`), opening zero inbound ports on your LAN. Outbound requests originate from your worker's WAN IP (or Cloudflare's edge when using overflow) and serialize per host with `Retry-After` compliance.
-- **57 readable YAML site adapters ([`internal/extract/manifests/`](internal/extract/manifests)):** Pure-data YAML manifests (`MIT`) upgrade noisy HTML pages to public JSON/XML endpoints, registries, ATS job boards (Greenhouse, Ashby, Lever, Workday CXS), and structured HTML selectors while enforcing `robots.txt` on every hop and failing open to standard HTML extraction if an upstream schema changes. When a site blocks automated access via `robots.txt` or an anti-bot challenge, EdgeFetch stops immediately and returns a structured `blocked.suggestion` pointing to official public APIs or feeds.
+- **56 readable YAML site adapters ([`internal/extract/manifests/`](internal/extract/manifests)):** Pure-data YAML manifests (`MIT`) upgrade noisy HTML pages to public JSON/XML endpoints, registries, ATS job boards (Greenhouse, Ashby, Lever, Workday CXS), and structured HTML selectors while enforcing `robots.txt` on every hop and failing open to standard HTML extraction if an upstream schema changes. When a site blocks automated access via `robots.txt` or an anti-bot challenge, EdgeFetch stops immediately and returns a structured `blocked.suggestion` pointing to official public APIs or feeds.
 - **Optional Hub coordinator (`hub/`):** For multi-node fleets, remote HTTP `/mcp`, FTS5 search collections, encrypted downstream MCP connector credentials (`AES-256-GCM` via WebCrypto `HKDF-SHA256`), and optional BYO-LLM `/v1/agent` workflows, the Hub runs on Cloudflare Workers (Hibernating Durable Objects + D1 + R2) or self-hosted `node:sqlite` (`dist/portable-server.mjs`) with `6` runtime npm packages in [`hub/package.json`](hub/package.json) (`htmlparser2`, `jose`, `oauth4webapi`, `re2js`, `ws`, `yaml`). Multi-user GitHub OAuth sign-in is disabled by default until explicitly configured by the operator.
 
 <p align="center">
@@ -83,7 +83,7 @@ docker compose up --build -d
 
 EdgeFetch was built with coding agents and hardened across 8 adversarial security review rounds (using independent LLM reviewers paired with executed local proof-of-concept exploits). Rather than hiding AI authorship, the repository enforces hard privilege boundaries between declarative site rules and privileged engine code:
 
-- **Ring 1 — Declarative YAML Site Adapters ([`internal/extract/manifests/*.yaml`](internal/extract/manifests)):** Pure data with zero executable TypeScript/Go code, zero `eval`, and linear `re2js` regular expressions. Every manifest compiles through a single strict schema compiler ([`compile-manifests.mjs`](hub/scripts/compile-manifests.mjs)), is checked daily by a read-only live canary ([`edgefetch.dev/adapters/status/`](https://edgefetch.dev/adapters/status/)), and is gated in CI by [`verify-adapter-only-diff.mjs`](hub/scripts/verify-adapter-only-diff.mjs), which blocks any domain widening or `fetchUrl` host change without explicit human sign-off.
+- **Ring 1 — Declarative YAML Site Adapters ([`internal/extract/manifests/*.yaml`](internal/extract/manifests)):** Pure data with zero executable TypeScript/Go code, zero `eval`, and linear `re2js` regular expressions. Every manifest compiles through a single strict schema compiler ([`compile-manifests.mjs`](hub/scripts/compile-manifests.mjs)), which enforces domain pattern validation, prevents wildcard/subdomain overlap, and rejects unapproved cross-domain `fetchUrl` hosts.
 - **Ring 0 — Core Engine, Auth, Vault, Sanitizer & SSRF (`cmd/`, `internal/`, `hub/src/`, `.github/`):** Protected by human-approved merges, immutable `v*` tag rulesets, and a human-gated GitHub `release` environment before Ed25519 binary signing (`keys/release-signing-pub.pem`). Real sanitizer differentials, auth edge cases, ReDoS vectors, and SSRF bypasses caught and fixed across Rounds 1–8 are documented candidly in **[docs/SECURITY-LOG.md](docs/SECURITY-LOG.md)**.
 - **Contributor model:** EdgeFetch is a maintainer-driven system. **Issues, reproducible bug reports, WAF false-positive samples, and adapter requests are welcome; code pull requests are by invitation ([`.github/VOUCHED.td`](.github/VOUCHED.td))** so untrusted inputs never steer privileged workflows. See **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
@@ -162,17 +162,10 @@ EDGEFETCH_CALLER_TOKEN="<32-char-secret>" EDGEFETCH_AGENT_TOKEN="<32-char-secret
 Anyone with Node.js 22+ (`cd hub && npm ci`) or Go 1.26+ can reproduce both extraction fidelity and hot-path benchmarks locally in under 3 seconds with zero API keys or running servers:
 
 ```bash
-# 1. Offline HTML -> Markdown fidelity, <T> generic safety, code-fence balance & latency (< 1s):
-node bench/compare.mjs
-
-# 2. Optional polite live check (verifies /robots.txt first) on public technical docs:
-node bench/compare.mjs --live
-node bench/compare.mjs --live --with-jina
-
-# 3. Multi-format synthetic regression gate (HTML, .ipynb, OpenAPI 3.1, YAML frontmatter):
+# 1. Multi-format synthetic regression gate (HTML, .ipynb, OpenAPI 3.1, YAML frontmatter):
 node bench/run-bench.mjs
 
-# 4. Go hot-path microbenchmarks:
+# 2. Go hot-path microbenchmarks:
 go test -bench=. -benchmem ./...
 ```
 
@@ -183,7 +176,7 @@ go test -bench=. -benchmem ./...
 | `BenchmarkIsPublicIP` (IPv4 + NAT64 IPv6 check) | `155.50 ns/op` | `0 B/op` (`0 allocs/op`) |
 | `BenchmarkClassifyFeedJSON` | `1,229 ns/op` | `1,416 B/op` (`28 allocs/op`) |
 
-Full offline and live tables: **[bench/RESULTS.md](bench/RESULTS.md)**.
+Full extraction benchmark tables: **[bench/RESULTS.md](bench/RESULTS.md)**.
 
 ---
 
@@ -193,8 +186,8 @@ Full offline and live tables: **[bench/RESULTS.md](bench/RESULTS.md)**.
 - **Security Policy, Threat Model & SSRF Controls:** **[SECURITY.md](SECURITY.md)**
 - **Launch & Design Trade-Off FAQ:** **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)**
 - **Detailed Comparison & When Not to Use EdgeFetch:** **[docs/COMPARISON.md](docs/COMPARISON.md)**
-- **Extraction & Live Comparison Benchmarks:** **[bench/RESULTS.md](bench/RESULTS.md)**
-- **Declarative YAML Site Adapter Guide (`57` manifests):** **[docs/ADAPTERS.md](docs/ADAPTERS.md)**
+- **Extraction & Token-Efficiency Benchmarks:** **[bench/RESULTS.md](bench/RESULTS.md)**
+- **Declarative YAML Site Adapter Guide (`56` manifests):** **[docs/ADAPTERS.md](docs/ADAPTERS.md)**
 - **Operations, OTLP Tracing, HA Mesh & MCP Reference:** **[docs/USAGE.md](docs/USAGE.md)**
 - **Hub ↔ Go Worker Wire Protocol:** **[docs/PROTOCOL.md](docs/PROTOCOL.md)**
 - **Go Concurrency & Internals:** **[docs/INTERNALS.md](docs/INTERNALS.md)**

@@ -375,15 +375,15 @@ func TestR7SanitizeScrapedMarkdownAllCorpusVectorsAndIdempotency(t *testing.T) {
 		assertSanitizedMarkdownSafeAndIdempotent(t, name, input)
 	}
 
-	// Ensure legitimate code generics and fenced code blocks remain intact!
-	if got := SanitizeScrapedMarkdown("Returns `Promise<void>` over HTTP/2."); !strings.Contains(got, "`Promise<void>`") {
-		t.Fatalf("expected `Promise<void>` preserved in inline code span, got %q", got)
+	// H1 fail-closed rule: inline code spans escape `<` to `&lt;`, while recognized fenced code blocks preserve `<` verbatim!
+	if got := SanitizeScrapedMarkdown("Returns `Promise<void>` over HTTP/2."); !strings.Contains(got, "`Promise&lt;void>`") {
+		t.Fatalf("expected `Promise&lt;void>` escaped fail-closed in inline code span, got %q", got)
 	}
 	if got := SanitizeScrapedMarkdown("```html\n<script>const ok = true;</script>\n```"); !strings.Contains(got, "<script>const ok = true;</script>") {
 		t.Fatalf("expected fenced code block contents preserved verbatim, got %q", got)
 	}
-	if got := SanitizeScrapedMarkdown("| Col | Type |\n|---|---|\n| ret | `Promise<void>` |"); !strings.Contains(got, "`Promise<void>`") {
-		t.Fatalf("expected single-cell table code span `Promise<void>` preserved, got %q", got)
+	if got := SanitizeScrapedMarkdown("| Col | Type |\n|---|---|\n| ret | `Promise<void>` |"); !strings.Contains(got, "`Promise&lt;void>`") {
+		t.Fatalf("expected single-cell table code span `Promise&lt;void>` escaped fail-closed, got %q", got)
 	}
 
 	if inPath := os.Getenv("EDGEFETCH_R7_SAN_IN"); inPath != "" {

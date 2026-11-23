@@ -10,7 +10,14 @@
 // @ts-ignore: `hub/tsconfig.json` uses `@cloudflare/workers-types` without `@types/node`
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { callerToken, isValidSecretMatch, MIN_TOKEN_LENGTH, sameBytes } from './auth';
-import { isGitHubAuthConfigured, isGitHubUserDeAllowlisted, verifySessionJwt, type GitHubAuthEnv } from './github-auth';
+import {
+  GITHUB_ORG_REVERIFY_TTL_MS,
+  isGitHubAuthConfigured,
+  isGitHubUserDeAllowlisted,
+  reverifyGitHubOrgAdmission,
+  verifySessionJwt,
+  type GitHubAuthEnv,
+} from './github-auth';
 import { getActiveRequestTracer, type ActiveSpanHandle } from './otel';
 import { normalizeClientRateLimitIp, readBodyTextCapped, safeDecodeURIComponent } from './safe-input';
 
@@ -84,6 +91,8 @@ export function getActiveCallerAuthContext(): ActiveCallerAuthContext | undefine
   return callerAuthAls.getStore()?.current;
 }
 
+export type UserAdmissionMethod = 'owner' | 'allowlist_id' | 'allowlist_login' | 'org' | 'open';
+
 export interface HubUserRecord {
   userId: string;
   githubId?: string;
@@ -92,6 +101,10 @@ export interface HubUserRecord {
   role: UserRole;
   sessionEpoch?: number;
   disabled?: boolean;
+  admittedVia?: UserAdmissionMethod;
+  admittedOrg?: string;
+  encryptedGhToken?: string;
+  orgVerifiedAt?: number;
   createdAt: number;
   lastLoginAt: number;
 }
@@ -282,6 +295,10 @@ export const OAUTH_SQLITE_SCHEMA = `
     role TEXT NOT NULL DEFAULT 'member',
     session_epoch INTEGER NOT NULL DEFAULT 1,
     disabled INTEGER NOT NULL DEFAULT 0,
+    admitted_via TEXT,
+    admitted_org TEXT,
+    encrypted_gh_token TEXT,
+    org_verified_at INTEGER,
     created_at INTEGER NOT NULL,
     last_login_at INTEGER NOT NULL
   );
@@ -316,6 +333,10 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         "ALTER TABLE oauth_tokens ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
         'ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1',
         'ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0',
+        'ALTER TABLE users ADD COLUMN admitted_via TEXT',
+        'ALTER TABLE users ADD COLUMN admitted_org TEXT',
+        'ALTER TABLE users ADD COLUMN encrypted_gh_token TEXT',
+        'ALTER TABLE users ADD COLUMN org_verified_at INTEGER',
       ];
       for (const ddl of alterStatements) {
         try {
@@ -325,7 +346,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         }
       }
       sql.exec('SELECT user_id FROM oauth_tokens LIMIT 1');
-      sql.exec('SELECT session_epoch, disabled FROM users LIMIT 1');
+      sql.exec('SELECT session_epoch, disabled, admitted_via, admitted_org, encrypted_gh_token, org_verified_at FROM users LIMIT 1');
       multiUserMigrated = true;
     } catch {
       // Schema not yet initialized; will run on first query
@@ -729,10 +750,17 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       ensureMultiUserColumns();
       const epoch = typeof user.sessionEpoch === 'number' && Number.isInteger(user.sessionEpoch) && user.sessionEpoch >= 1 ? user.sessionEpoch : undefined;
       const disabledInt = user.disabled ? 1 : 0;
+      const admittedViaVal = user.admittedVia ?? null;
+      const admittedOrgVal = user.admittedOrg ? user.admittedOrg.toLowerCase() : null;
+      const encryptedGhTokenVal = disabledInt !== 0 ? null : (user.encryptedGhToken ?? null);
+      const orgVerifiedAtVal = typeof user.orgVerifiedAt === 'number' && Number.isFinite(user.orgVerifiedAt) ? user.orgVerifiedAt : null;
       if (epoch !== undefined) {
         sql.exec(
-          `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, session_epoch, disabled, created_at, last_login_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO users (
+             user_id, github_id, github_login, avatar_url, role, session_epoch, disabled,
+             admitted_via, admitted_org, encrypted_gh_token, org_verified_at, created_at, last_login_at
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET
              github_id = COALESCE(excluded.github_id, users.github_id),
              github_login = excluded.github_login,
@@ -740,6 +768,10 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
              role = excluded.role,
              session_epoch = excluded.session_epoch,
              disabled = excluded.disabled,
+             admitted_via = excluded.admitted_via,
+             admitted_org = excluded.admitted_org,
+             encrypted_gh_token = excluded.encrypted_gh_token,
+             org_verified_at = excluded.org_verified_at,
              last_login_at = excluded.last_login_at`,
           user.userId,
           user.githubId ?? null,
@@ -748,19 +780,30 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           user.role,
           epoch,
           disabledInt,
+          admittedViaVal,
+          admittedOrgVal,
+          encryptedGhTokenVal,
+          orgVerifiedAtVal,
           user.createdAt,
           user.lastLoginAt,
         );
       } else {
         sql.exec(
-          `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, session_epoch, disabled, created_at, last_login_at)
-           VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+          `INSERT INTO users (
+             user_id, github_id, github_login, avatar_url, role, session_epoch, disabled,
+             admitted_via, admitted_org, encrypted_gh_token, org_verified_at, created_at, last_login_at
+           )
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET
              github_id = COALESCE(excluded.github_id, users.github_id),
              github_login = excluded.github_login,
              avatar_url = excluded.avatar_url,
              role = excluded.role,
              disabled = excluded.disabled,
+             admitted_via = excluded.admitted_via,
+             admitted_org = excluded.admitted_org,
+             encrypted_gh_token = excluded.encrypted_gh_token,
+             org_verified_at = excluded.org_verified_at,
              last_login_at = excluded.last_login_at`,
           user.userId,
           user.githubId ?? null,
@@ -768,6 +811,10 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           user.avatarUrl ?? null,
           user.role,
           disabledInt,
+          admittedViaVal,
+          admittedOrgVal,
+          encryptedGhTokenVal,
+          orgVerifiedAtVal,
           user.createdAt,
           user.lastLoginAt,
         );
@@ -790,11 +837,23 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           role: string;
           session_epoch?: number;
           disabled?: number;
+          admitted_via?: string | null;
+          admitted_org?: string | null;
+          encrypted_gh_token?: string | null;
+          org_verified_at?: number | null;
           created_at: number;
           last_login_at: number;
         }>('SELECT * FROM users WHERE user_id = ? LIMIT 1', userId)
         .toArray()[0];
       if (!r) return null;
+      const validVia =
+        r.admitted_via === 'owner' ||
+        r.admitted_via === 'allowlist_id' ||
+        r.admitted_via === 'allowlist_login' ||
+        r.admitted_via === 'org' ||
+        r.admitted_via === 'open'
+          ? r.admitted_via
+          : undefined;
       return {
         userId: r.user_id,
         ...(r.github_id ? { githubId: r.github_id } : {}),
@@ -803,6 +862,10 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         role: normalizeRoleForUser(r.user_id, r.role),
         sessionEpoch: typeof r.session_epoch === 'number' && r.session_epoch >= 1 ? r.session_epoch : 1,
         disabled: Number(r.disabled ?? 0) !== 0,
+        ...(validVia ? { admittedVia: validVia } : {}),
+        ...(r.admitted_org ? { admittedOrg: r.admitted_org } : {}),
+        ...(r.encrypted_gh_token ? { encryptedGhToken: r.encrypted_gh_token } : {}),
+        ...(typeof r.org_verified_at === 'number' ? { orgVerifiedAt: r.org_verified_at } : {}),
         createdAt: r.created_at,
         lastLoginAt: r.last_login_at,
       };
@@ -818,21 +881,41 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           role: string;
           session_epoch?: number;
           disabled?: number;
+          admitted_via?: string | null;
+          admitted_org?: string | null;
+          org_verified_at?: number | null;
           created_at: number;
           last_login_at: number;
-        }>('SELECT * FROM users WHERE COALESCE(disabled, 0) = 0 ORDER BY last_login_at DESC LIMIT 500')
+        }>(
+          `SELECT user_id, github_id, github_login, avatar_url, role, session_epoch, disabled,
+                  admitted_via, admitted_org, org_verified_at, created_at, last_login_at
+           FROM users WHERE COALESCE(disabled, 0) = 0 ORDER BY last_login_at DESC LIMIT 500`,
+        )
         .toArray()
-        .map((r) => ({
-          userId: r.user_id,
-          ...(r.github_id ? { githubId: r.github_id } : {}),
-          githubLogin: r.github_login,
-          ...(r.avatar_url ? { avatarUrl: r.avatar_url } : {}),
-          role: normalizeRoleForUser(r.user_id, r.role),
-          sessionEpoch: typeof r.session_epoch === 'number' && r.session_epoch >= 1 ? r.session_epoch : 1,
-          disabled: false,
-          createdAt: r.created_at,
-          lastLoginAt: r.last_login_at,
-        }));
+        .map((r) => {
+          const validVia =
+            r.admitted_via === 'owner' ||
+            r.admitted_via === 'allowlist_id' ||
+            r.admitted_via === 'allowlist_login' ||
+            r.admitted_via === 'org' ||
+            r.admitted_via === 'open'
+              ? r.admitted_via
+              : undefined;
+          return {
+            userId: r.user_id,
+            ...(r.github_id ? { githubId: r.github_id } : {}),
+            githubLogin: r.github_login,
+            ...(r.avatar_url ? { avatarUrl: r.avatar_url } : {}),
+            role: normalizeRoleForUser(r.user_id, r.role),
+            sessionEpoch: typeof r.session_epoch === 'number' && r.session_epoch >= 1 ? r.session_epoch : 1,
+            disabled: false,
+            ...(validVia ? { admittedVia: validVia } : {}),
+            ...(r.admitted_org ? { admittedOrg: r.admitted_org } : {}),
+            ...(typeof r.org_verified_at === 'number' ? { orgVerifiedAt: r.org_verified_at } : {}),
+            createdAt: r.created_at,
+            lastLoginAt: r.last_login_at,
+          };
+        });
     },
     countUsers() {
       ensureMultiUserColumns();
@@ -843,6 +926,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     },
     updateUserRole(userId, role) {
       ensureMultiUserColumns();
+      if (userId === 'owner' && role !== 'owner') return false;
       const existing = sql
         .exec<{ c: number }>('SELECT COUNT(*) AS c FROM users WHERE user_id = ? AND COALESCE(disabled, 0) = 0', userId)
         .toArray()[0];
@@ -1137,14 +1221,20 @@ export function createMemoryOAuthStore(): OAuthStore {
     },
     upsertUser(user) {
       const prev = users.get(user.userId);
+      const isDisabled = Boolean(user.disabled);
       const copy: HubUserRecord = {
         ...user,
+        ...(user.admittedOrg ? { admittedOrg: user.admittedOrg.toLowerCase() } : {}),
+        ...(isDisabled ? { encryptedGhToken: undefined } : {}),
         sessionEpoch:
           typeof user.sessionEpoch === 'number' && user.sessionEpoch >= 1
             ? user.sessionEpoch
             : (prev?.sessionEpoch ?? 1),
-        disabled: Boolean(user.disabled),
+        disabled: isDisabled,
       };
+      if (isDisabled) {
+        delete copy.encryptedGhToken;
+      }
       users.set(user.userId, copy);
       if (copy.disabled) {
         for (const [h, t] of tokens.entries()) {
@@ -1163,7 +1253,7 @@ export function createMemoryOAuthStore(): OAuthStore {
     listUsers() {
       return [...users.values()]
         .filter((u) => !u.disabled)
-        .map((u) => ({ ...u }))
+        .map(({ encryptedGhToken: _omitSecret, ...u }) => ({ ...u }))
         .sort((a, b) => b.lastLoginAt - a.lastLoginAt);
     },
     countUsers() {
@@ -1174,6 +1264,7 @@ export function createMemoryOAuthStore(): OAuthStore {
       return c;
     },
     updateUserRole(userId, role) {
+      if (userId === 'owner' && role !== 'owner') return false;
       const u = users.get(userId);
       if (!u || u.disabled) return false;
       u.role = role;
@@ -1480,6 +1571,24 @@ export async function verifyLiveAdminSession(params: {
     }
     if (isGitHubUserDeAllowlisted(liveUser, params.githubAuthEnv)) {
       return { ok: false };
+    }
+    if (
+      liveUser.admittedVia === 'org' &&
+      liveUser.role !== 'owner' &&
+      params.githubAuthEnv &&
+      isGitHubAuthConfigured(params.githubAuthEnv) &&
+      (!liveUser.orgVerifiedAt || now - liveUser.orgVerifiedAt > GITHUB_ORG_REVERIFY_TTL_MS)
+    ) {
+      const orgCheck = await reverifyGitHubOrgAdmission({
+        user: liveUser,
+        env: params.githubAuthEnv,
+        sessionSecret: params.signingSecret,
+        store: params.store,
+        now,
+      });
+      if (!orgCheck.ok) {
+        return { ok: false };
+      }
     }
     return {
       ...session,
@@ -2540,6 +2649,26 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
             span.setStatus(false, 'user_revoked');
             return oauthJson({ error: 'invalid_grant', error_description: 'Authorized user account is disabled or no longer permitted' }, 400, cors);
           }
+          if (
+            liveUser.admittedVia === 'org' &&
+            liveUser.role !== 'owner' &&
+            deps.githubAuthEnv &&
+            isGitHubAuthConfigured(deps.githubAuthEnv) &&
+            (!liveUser.orgVerifiedAt || now - liveUser.orgVerifiedAt > GITHUB_ORG_REVERIFY_TTL_MS)
+          ) {
+            const orgCheck = await reverifyGitHubOrgAdmission({
+              user: liveUser,
+              env: deps.githubAuthEnv,
+              sessionSecret: signingSecret,
+              store: deps.store,
+              now,
+            });
+            if (!orgCheck.ok) {
+              span.setAttributes({ 'oauth.outcome': 'org_membership_revoked', 'http.response.status_code': 400 });
+              span.setStatus(false, 'org_membership_revoked');
+              return oauthJson({ error: 'invalid_grant', error_description: 'GitHub organization membership is no longer active' }, 400, cors);
+            }
+          }
           grantUserRole = liveUser.role;
         }
         const accessToken = `efa_${randomUrlToken(32)}`;
@@ -2644,6 +2773,30 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
             });
             span.setStatus(false, 'user_revoked');
             return oauthJson({ error: 'invalid_grant', error_description: 'Account access has been revoked' }, 400, cors);
+          }
+          if (
+            liveUser.admittedVia === 'org' &&
+            liveUser.role !== 'owner' &&
+            deps.githubAuthEnv &&
+            isGitHubAuthConfigured(deps.githubAuthEnv)
+          ) {
+            const orgCheck = await reverifyGitHubOrgAdmission({
+              user: liveUser,
+              env: deps.githubAuthEnv,
+              sessionSecret: signingSecret,
+              store: deps.store,
+              now,
+            });
+            if (!orgCheck.ok) {
+              await deps.store.revokeGrant(rotated.grantId);
+              span.setAttributes({
+                'oauth.grant_id': rotated.grantId,
+                'oauth.outcome': 'org_membership_revoked',
+                'http.response.status_code': 400,
+              });
+              span.setStatus(false, 'org_membership_revoked');
+              return oauthJson({ error: 'invalid_grant', error_description: 'GitHub organization membership is no longer active' }, 400, cors);
+            }
           }
         }
 
@@ -2761,10 +2914,29 @@ export async function authorizeMcpRequest(params: {
   let role = normalizeRoleForUser(userId, record.userRole);
   if (userId !== 'owner') {
     const effectiveGhEnv = params.githubAuthEnv ?? callerAuthAls.getStore()?.githubAuthEnv;
+    const nowMs = params.now ?? Date.now();
     const liveUser = (await params.store.getUser?.(userId)) ?? null;
     if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, effectiveGhEnv)) {
       await params.store.revokeGrant(record.grantId);
       return { ok: false, status: 401, wwwAuthenticate };
+    }
+    if (
+      liveUser.admittedVia === 'org' &&
+      liveUser.role !== 'owner' &&
+      effectiveGhEnv &&
+      isGitHubAuthConfigured(effectiveGhEnv) &&
+      (!liveUser.orgVerifiedAt || nowMs - liveUser.orgVerifiedAt > GITHUB_ORG_REVERIFY_TTL_MS)
+    ) {
+      const orgCheck = await reverifyGitHubOrgAdmission({
+        user: liveUser,
+        env: effectiveGhEnv,
+        store: params.store,
+        now: nowMs,
+      });
+      if (!orgCheck.ok) {
+        await params.store.revokeGrant(record.grantId);
+        return { ok: false, status: 401, wwwAuthenticate };
+      }
     }
     role = liveUser.role;
   }

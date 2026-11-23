@@ -9,6 +9,7 @@
 import type { LlmEnvBindings } from './llm';
 import { getActiveCallerAuthContext } from './oauth';
 import { encodeBodyForWire } from './overflow';
+import { sanitizeFullMarkdownDocumentForArtifact, sanitizeMarkdownPageSlice } from './scrape-advanced';
 import { listConfiguredSpaFallbacks, type SpaFallbackEnv, type SpaFallbackProvider } from './spa-fallback';
 
 export type ArtifactRetention = 'transient' | 'stored';
@@ -41,6 +42,7 @@ export interface OptionalStorageBindings extends SpaFallbackEnv, LlmEnvBindings 
   PDF_OCR_TOKEN?: string;
 }
 
+export const SCRAPE_PIPELINE_VERSION = 31;
 export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 export const TRANSIENT_RETENTION_MS = 24 * 60 * 60_000; // 1 day (`tmp/` prefix lifecycle)
 export const STORED_RETENTION_MS = 30 * 24 * 60 * 60_000; // 30 days (`raw/` prefix lifecycle)
@@ -771,8 +773,6 @@ export interface ArtifactPageSlice {
   content: string;
 }
 
-const MAX_KNOWN_PIPELINE_VERSION = 25;
-
 export async function readArtifactPage(params: {
   bucket: R2Bucket;
   metaDb?: D1Database;
@@ -813,7 +813,8 @@ export async function readArtifactPage(params: {
       Math.max(1, Math.floor(params.limit ?? DEFAULT_ARTIFACT_PAGE_LIMIT)),
     );
     const end = Math.min(totalChars, safeOffset + safeLimit);
-    const slice = mdText.slice(safeOffset, end);
+    const rawSlice = mdText.slice(safeOffset, end);
+    const slice = sanitizeMarkdownPageSlice(mdText, safeOffset, rawSlice, false);
     const hasMore = end < totalChars;
     return {
       ok: true,
@@ -836,7 +837,7 @@ export async function readArtifactPage(params: {
 
   const wantsMarkdown = isMdPrefixed || params.format === 'markdown';
   if (wantsMarkdown) {
-    const topVer = params.pipelineVersion ?? 30;
+    const requiredVer = params.pipelineVersion ?? SCRAPE_PIPELINE_VERSION;
     const candidateShas: string[] = [];
     if (isMdPrefixed) candidateShas.push(cleanHex);
     if (params.metaDb && !privateOnly) {
@@ -870,30 +871,18 @@ export async function readArtifactPage(params: {
       }
     }
 
-    const maxKnownVer = Math.max(MAX_KNOWN_PIPELINE_VERSION, topVer);
-    const versionsToTry = params.metaDb && !privateOnly && !params.userId
-      ? [...new Set([topVer, Math.max(1, topVer - 1)])]
-      : [
-          topVer,
-          ...Array.from({ length: maxKnownVer }, (_, idx) => maxKnownVer - idx).filter(
-            (v) => v !== topVer,
-          ),
-        ];
-
     const checkCachedMarkdownForSha = async (sha: string): Promise<string | null> => {
       if (effectiveUserId) {
-        for (const ver of versionsToTry) {
-          const privMdObj = await params.bucket.get(r2PrivateDerivedKey(effectiveUserId, ver, 'markdown', sha));
-          if (privMdObj) return await privMdObj.text();
-        }
+        const privMdObj = await params.bucket.get(r2PrivateDerivedKey(effectiveUserId, requiredVer, 'markdown', sha));
+        if (privMdObj) return await privMdObj.text();
       }
       if (privateOnly) return null;
       if (params.metaDb) {
         const docRow = await params.metaDb
           .prepare(
-            `SELECT r2_key FROM documents WHERE content_sha256 = ? AND format = 'markdown' ORDER BY pipeline_version DESC LIMIT 1`,
+            `SELECT r2_key FROM documents WHERE content_sha256 = ? AND format = 'markdown' AND pipeline_version >= ? ORDER BY pipeline_version DESC LIMIT 1`,
           )
-          .bind(sha)
+          .bind(sha, requiredVer)
           .first<{ r2_key: string }>()
           .catch(() => null);
         if (docRow?.r2_key) {
@@ -901,43 +890,44 @@ export async function readArtifactPage(params: {
           if (obj) return await obj.text();
         }
       }
-      for (const ver of versionsToTry) {
-        const mdObj = await params.bucket.get(r2DerivedKey(ver, 'markdown', sha));
-        if (mdObj) return await mdObj.text();
-      }
+      const mdObj = await params.bucket.get(r2DerivedKey(requiredVer, 'markdown', sha));
+      if (mdObj) return await mdObj.text();
       return null;
     };
 
     for (const sha of candidateShas) {
       const foundMd = await checkCachedMarkdownForSha(sha);
       if (foundMd !== null) {
-        return sliceMarkdownPage(foundMd, sha, 'stored');
+        const cleanFullMd = sanitizeFullMarkdownDocumentForArtifact(foundMd);
+        return sliceMarkdownPage(cleanFullMd, sha, 'stored');
       }
     }
 
     // If caller passed `md:<blobSha256>` (the scrape `artifactId`) or `format="markdown"` on a non-truncated scrape
-    // whose derived Markdown wasn't materialized yet, load the raw R2 artifact and derive clean Markdown on demand.
+    // whose derived Markdown wasn't materialized at `>= requiredVer`, load the raw R2 artifact and derive clean Markdown at `requiredVer`.
     const rawFallback = await loadRawOnce();
     if (rawFallback.ok) {
       if (!candidateShas.includes(rawFallback.contentSha256)) {
         const foundByRawContentSha = await checkCachedMarkdownForSha(rawFallback.contentSha256);
         if (foundByRawContentSha !== null) {
-          return sliceMarkdownPage(foundByRawContentSha, rawFallback.contentSha256, rawFallback.retention);
+          const cleanFullMd = sanitizeFullMarkdownDocumentForArtifact(foundByRawContentSha);
+          return sliceMarkdownPage(cleanFullMd, rawFallback.contentSha256, rawFallback.retention);
         }
       }
       if (params.deriveMarkdownFromRaw) {
         const derivedMd = params.deriveMarkdownFromRaw(rawFallback.bytes);
         if (derivedMd !== null) {
+          const cleanDerivedMd = sanitizeFullMarkdownDocumentForArtifact(derivedMd);
           const targetDerivedKey =
             privateOnly && effectiveUserId
-              ? r2PrivateDerivedKey(effectiveUserId, topVer, 'markdown', rawFallback.contentSha256)
-              : r2DerivedKey(topVer, 'markdown', rawFallback.contentSha256);
+              ? r2PrivateDerivedKey(effectiveUserId, requiredVer, 'markdown', rawFallback.contentSha256)
+              : r2DerivedKey(requiredVer, 'markdown', rawFallback.contentSha256);
           await params.bucket
-            .put(targetDerivedKey, derivedMd, {
+            .put(targetDerivedKey, cleanDerivedMd, {
               httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
             })
             .catch(() => undefined);
-          return sliceMarkdownPage(derivedMd, rawFallback.contentSha256, rawFallback.retention);
+          return sliceMarkdownPage(cleanDerivedMd, rawFallback.contentSha256, rawFallback.retention);
         }
       }
     }

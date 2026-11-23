@@ -593,6 +593,9 @@ type DeclarativeAdapterManifest struct {
 	Catalog         *DeclarativeCatalogConfig  `json:"catalog,omitempty"`
 }
 
+// DeclarativeManifest is an alias for DeclarativeAdapterManifest.
+type DeclarativeManifest = DeclarativeAdapterManifest
+
 type compiledManifestBundle struct {
 	Version   int                          `json:"version"`
 	Manifests []DeclarativeAdapterManifest `json:"manifests"`
@@ -628,9 +631,11 @@ type DeclarativeTwinMatch struct {
 	Kind      classify.Kind
 	Accept    string
 
-	route   DeclarativeRouteSpec
-	params  map[string]string
-	origURL string
+	route           DeclarativeRouteSpec
+	params          map[string]string
+	origURL         string
+	domains         []string
+	universalEngine bool
 }
 
 type declarativeWildcard struct {
@@ -653,12 +658,103 @@ var (
 	regInitErr error
 )
 
-var forbiddenBroadSuffixesGo = map[string]bool{
-	"com": true, "org": true, "net": true, "io": true, "gov": true, "edu": true, "mil": true, "int": true,
-	"uk": true, "de": true, "fr": true, "jp": true, "au": true, "ca": true, "us": true, "eu": true,
-	"ai": true, "co": true, "app": true, "dev": true,
-	"co.uk": true, "org.uk": true, "gov.uk": true, "ac.uk": true,
-	"com.au": true, "org.au": true, "gov.au": true, "co.jp": true, "com.br": true,
+var approvedWildcardDomainPatternsGo = map[string]bool{
+	"*.arcgis.com":        true,
+	"*.bamboohr.com":      true,
+	"*.breezy.hr":         true,
+	"*.recruitee.com":     true,
+	"*.jobs.personio.de":  true,
+	"*.jobs.personio.com": true,
+	"*.oraclecloud.com":   true,
+	"gitlab.*":            true,
+	"*.icims.com":         true,
+	"*.applytojob.com":    true,
+	"*.legistar.com":      true,
+	"*.wikipedia.org":     true,
+	"*.openfoodfacts.org": true,
+	"*.pinpointhq.com":    true,
+	"*.reddit.com":        true,
+	"careers.*.com":       true,
+	"jobs.*.com":          true,
+	"*.myshopify.com":     true,
+	"*.socrata.com":       true,
+	"*.stackexchange.com": true,
+	"*.teamtailor.com":    true,
+}
+
+var reservedCoreATSDomainsGo = map[string]bool{
+	"jobs.ashbyhq.com":    true,
+	"*.myworkdayjobs.com": true,
+	"*.myworkdaysite.com": true,
+}
+
+var approvedCrossDomainTwinHostsGo = map[string]map[string]bool{
+	"doi-crossref": {"api.crossref.org": true},
+	"hackernews":   {"hn.algolia.com": true, "hacker-news.firebaseio.com": true},
+	"jazzhr":       {"app.jazz.co": true},
+	"npm-registry": {"registry.npmjs.org": true},
+	"pubmed-pmc":   {"www.ebi.ac.uk": true},
+}
+
+var approvedSAPATSExactExemptionsGo = map[string]bool{
+	"enterprise-ats:jobs.smartrecruiters.com": true,
+	"enterprise-ats:jobs.jobvite.com":         true,
+	"gem-ats:jobs.gem.com":                    true,
+}
+
+func claimedRegistrableDomainsGo(domains []string) map[string]bool {
+	regs := make(map[string]bool, len(domains))
+	for _, raw := range domains {
+		d := strings.ToLower(strings.TrimSpace(raw))
+		if d == "" {
+			continue
+		}
+		probe := ""
+		if strings.HasPrefix(d, "*.") && !strings.Contains(d[2:], "*") {
+			probe = d[2:]
+		} else if !strings.Contains(d, "*") {
+			probe = d
+		}
+		if probe == "" {
+			continue
+		}
+		if reg := GetRegistrableDomain(probe); reg != "" {
+			regs[reg] = true
+		}
+	}
+	return regs
+}
+
+// MatchesApprovedWildcard reports whether candidate (an exact domain or wildcard pattern) matches
+// one of the 3 allowlisted wildcard shapes (`*.suffix`, `gitlab.*`, `careers.*.com` / `jobs.*.com`).
+func MatchesApprovedWildcard(rawWildcard, rawCandidate string) bool {
+	w := strings.ToLower(strings.TrimSpace(rawWildcard))
+	c := strings.ToLower(strings.TrimSpace(rawCandidate))
+	if w == "" || c == "" || !strings.Contains(w, "*") {
+		return false
+	}
+	if w == c {
+		return true
+	}
+	if strings.HasPrefix(w, "*.") && !strings.Contains(w[2:], "*") {
+		suf := w[2:]
+		return c != suf && strings.HasSuffix(c, "."+suf)
+	}
+	if strings.HasSuffix(w, ".*") && !strings.Contains(w[:len(w)-2], "*") {
+		pre := w[:len(w)-2]
+		return strings.HasPrefix(c, pre+".") && len(c) > len(pre)+1
+	}
+	star := strings.IndexByte(w, '*')
+	if star > 0 && strings.LastIndexByte(w, '*') == star {
+		head := w[:star]
+		tail := w[star+1:]
+		return strings.HasPrefix(c, head) && strings.HasSuffix(c, tail) && len(c) > len(head)+len(tail)
+	}
+	return false
+}
+
+func isExemptSAPATSExactClaimGo(wildOwnerID, wildPat, exactOwnerID, exactDom string) bool {
+	return wildOwnerID == "sap-rmk-jibe" && wildPat == "jobs.*.com" && approvedSAPATSExactExemptionsGo[exactOwnerID+":"+exactDom]
 }
 
 var knownSocrataHostsGo = map[string]bool{
@@ -827,22 +923,42 @@ func validateManifestRulesGo(m *DeclarativeAdapterManifest) error {
 		if pat == "" || pat == "*" || pat == "*.*" || strings.ContainsAny(pat, " \t\r\n/\\:?#@") {
 			return fmt.Errorf("manifest %q has invalid or overly broad domain %q (M2)", m.ID, rawDom)
 		}
-		if strings.HasPrefix(pat, "*.") {
-			rest := pat[2:]
-			if !strings.Contains(rest, ".") || forbiddenBroadSuffixesGo[rest] {
-				return fmt.Errorf("manifest %q has overly broad TLD/eTLD wildcard %q (M2)", m.ID, rawDom)
+		for idx := 0; idx < len(pat); idx++ {
+			if pat[idx] < 0x20 || pat[idx] > 0x7e {
+				return fmt.Errorf("manifest %q has non-ASCII domain %q", m.ID, rawDom)
 			}
 		}
-		if strings.HasSuffix(pat, ".*") {
-			pre := pat[:len(pat)-2]
-			if len(pre) < 3 || strings.Contains(pre, "*") {
-				return fmt.Errorf("manifest %q has invalid prefix wildcard %q (M2)", m.ID, rawDom)
+		if strings.Contains(pat, "*") {
+			if strings.HasPrefix(pat, "*.") && !strings.Contains(pat[2:], "*") {
+				rest := pat[2:]
+				isBuiltInShopify := m.ID == "shopify" && pat == "*.myshopify.com"
+				if !isBuiltInShopify && (IsPublicOrPrivateSuffix(rest) || HasPrivateSharedHostingSuffix(rest)) {
+					return fmt.Errorf("manifest %q has overly broad TLD/eTLD/hosting wildcard %q (M2)", m.ID, rawDom)
+				}
 			}
+			if strings.HasSuffix(pat, ".*") {
+				pre := pat[:len(pat)-2]
+				if len(pre) < 3 || strings.Contains(pre, "*") {
+					return fmt.Errorf("manifest %q has invalid prefix wildcard %q (M2)", m.ID, rawDom)
+				}
+			}
+		} else if IsPublicOrPrivateSuffix(pat) || HasPrivateSharedHostingSuffix(pat) {
+			return fmt.Errorf("manifest %q claims forbidden public or private shared-hosting suffix in domain %q (H7)", m.ID, rawDom)
 		}
 	}
 	for _, ex := range m.ExampleURLs {
-		if !strings.HasPrefix(ex, "https://") {
-			return fmt.Errorf("manifest %q exampleUrl %q must use https://", m.ID, ex)
+		exNoFrag := ex
+		if hashIdx := strings.IndexByte(exNoFrag, '#'); hashIdx >= 0 {
+			exNoFrag = exNoFrag[:hashIdx]
+		}
+		if !isSafePublicTwinURL(exNoFrag) {
+			return fmt.Errorf("manifest %q exampleUrl %q must be a safe public https:// URL", m.ID, ex)
+		}
+	}
+	if m.Catalog != nil {
+		plat := strings.ToLower(strings.TrimSpace(m.Catalog.Platform))
+		if plat != "shopify" && plat != "woocommerce" {
+			return fmt.Errorf("manifest %q has unsupported catalog.platform %q (expected \"shopify\" or \"woocommerce\")", m.ID, m.Catalog.Platform)
 		}
 	}
 
@@ -891,6 +1007,12 @@ func validateManifestRulesGo(m *DeclarativeAdapterManifest) error {
 				if !isSafePublicTwinURL(sample) {
 					return fmt.Errorf("manifest %q route %d fetchUrl failed public HTTPS check: %q", m.ID, i, fu)
 				}
+				if parsedSample, err := url.Parse(sample); err == nil {
+					h := strings.TrimSuffix(strings.ToLower(parsedSample.Hostname()), ".")
+					if IsPublicOrPrivateSuffix(h) || HasPrivateSharedHostingSuffix(h) {
+						return fmt.Errorf("manifest %q route %d fetchUrl targets forbidden public or shared-hosting suffix: %q", m.ID, i, fu)
+					}
+				}
 			}
 		}
 	}
@@ -926,6 +1048,118 @@ func ParseDeclarativeYAMLManifest(raw []byte) (*DeclarativeAdapterManifest, erro
 		return nil, err
 	}
 	return ParseDeclarativeManifest(jsonBytes)
+}
+
+// ValidateDeclarativeManifests enforces full compiler-equivalent security invariants across a manifest slice:
+// per-manifest schema/host/twin/catalog validation, approved wildcard allowlist, reserved core ATS domains,
+// exactOwners uniqueness + MatchesApprovedWildcard collision rejection, and same-registrable-domain twin.fetchUrl checks (H7).
+func ValidateDeclarativeManifests(manifests []DeclarativeAdapterManifest) error {
+	seenIDs := make(map[string]bool, len(manifests))
+	twinOwners := make(map[string]string, len(manifests))
+	exactOwners := make(map[string]string, len(manifests)*2)
+	wildcardOwners := make(map[string]string, 32)
+	catalogOwners := make(map[string]string, 2)
+	type domainClaim struct {
+		id      string
+		pattern string
+	}
+	wildcardClaims := make([]domainClaim, 0, 32)
+
+	for i := range manifests {
+		m := manifests[i]
+		if err := validateManifestRulesGo(&m); err != nil {
+			return err
+		}
+		if seenIDs[m.ID] {
+			return fmt.Errorf("duplicate declarative manifest id %q (M2)", m.ID)
+		}
+		seenIDs[m.ID] = true
+
+		if m.Catalog != nil {
+			plat := strings.ToLower(strings.TrimSpace(m.Catalog.Platform))
+			if plat != "shopify" && plat != "woocommerce" {
+				return fmt.Errorf("manifest %q has unsupported catalog.platform %q (H7)", m.ID, m.Catalog.Platform)
+			}
+			if prev, exists := catalogOwners[plat]; exists && prev != m.ID {
+				return fmt.Errorf("duplicate catalog platform %q claimed by both %q and %q (H7)", plat, prev, m.ID)
+			}
+			catalogOwners[plat] = m.ID
+		}
+
+		manifestRegs := claimedRegistrableDomainsGo(m.Domains)
+		for _, rawDom := range m.Domains {
+			normDom := strings.ToLower(strings.TrimSpace(rawDom))
+			if reservedCoreATSDomainsGo[normDom] {
+				return fmt.Errorf("manifest %q claims reserved core ATS domain %q (M2)", m.ID, rawDom)
+			}
+			if strings.Contains(normDom, "*") {
+				if !approvedWildcardDomainPatternsGo[normDom] {
+					return fmt.Errorf("manifest %q claims unapproved wildcard domain %q (H7)", m.ID, rawDom)
+				}
+				if prev, exists := wildcardOwners[normDom]; exists && prev != m.ID {
+					return fmt.Errorf("manifest %q domain %q overlaps %q already claimed by %q (H7)", m.ID, normDom, normDom, prev)
+				}
+				for prevExact, prevOwner := range exactOwners {
+					if prevOwner == m.ID {
+						continue
+					}
+					if MatchesApprovedWildcard(normDom, prevExact) && !isExemptSAPATSExactClaimGo(m.ID, normDom, prevOwner, prevExact) {
+						return fmt.Errorf("manifest %q domain %q overlaps %q already claimed by %q (H7)", m.ID, normDom, prevExact, prevOwner)
+					}
+				}
+				for _, prevWild := range wildcardClaims {
+					if prevWild.id == m.ID {
+						continue
+					}
+					if MatchesApprovedWildcard(normDom, prevWild.pattern) || MatchesApprovedWildcard(prevWild.pattern, normDom) {
+						return fmt.Errorf("manifest %q domain %q overlaps %q already claimed by %q (H7)", m.ID, normDom, prevWild.pattern, prevWild.id)
+					}
+				}
+				wildcardOwners[normDom] = m.ID
+				wildcardClaims = append(wildcardClaims, domainClaim{id: m.ID, pattern: normDom})
+			} else {
+				if prev, exists := exactOwners[normDom]; exists && prev != m.ID {
+					return fmt.Errorf("manifest %q duplicate domain %q overlaps claim by %q (H7)", m.ID, normDom, prev)
+				}
+				for _, prevWild := range wildcardClaims {
+					if prevWild.id == m.ID {
+						continue
+					}
+					if MatchesApprovedWildcard(prevWild.pattern, normDom) && !isExemptSAPATSExactClaimGo(prevWild.id, prevWild.pattern, m.ID, normDom) {
+						return fmt.Errorf("manifest %q domain %q overlaps %q already claimed by %q (H7)", m.ID, normDom, prevWild.pattern, prevWild.id)
+					}
+				}
+				exactOwners[normDom] = m.ID
+			}
+		}
+
+		for rIdx, r := range m.Routes {
+			tid := r.Twin.ID
+			if tid == "" {
+				tid = m.ID
+			}
+			if prev, exists := twinOwners[tid]; exists && prev != m.ID {
+				return fmt.Errorf("duplicate twin id %q claimed by both %q and %q (M2)", tid, prev, m.ID)
+			}
+			twinOwners[tid] = m.ID
+
+			fu := r.Twin.FetchURL
+			if fu != "{requestUrl}" && !strings.HasPrefix(fu, "https://{host}") && !strings.HasPrefix(fu, "{origin}") {
+				sample := expandTemplate(fu, func(string) string { return "sample" })
+				parsedSample, pErr := url.Parse(sample)
+				if pErr != nil {
+					return fmt.Errorf("manifest %q route %d invalid fetchUrl %q: %w", m.ID, rIdx, fu, pErr)
+				}
+				targetHost := strings.TrimSuffix(strings.ToLower(parsedSample.Hostname()), ".")
+				targetReg := GetRegistrableDomain(targetHost)
+				approvedCross := approvedCrossDomainTwinHostsGo[m.ID]
+				if (targetReg == "" || !manifestRegs[targetReg]) && (approvedCross == nil || !approvedCross[targetHost]) {
+					return fmt.Errorf("manifest %q route %d cross-domain twin host %q does not match manifest registrable domains and is not allowlisted (H7)", m.ID, rIdx, targetHost)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func registerManifestInRegistry(reg *declarativeRegistry, m *DeclarativeAdapterManifest, seenIDs map[string]bool, twinOwners map[string]string) error {
@@ -1021,6 +1255,10 @@ func loadRegistry() *declarativeRegistry {
 			regInitErr = fmt.Errorf("decode manifests/compiled.json: %w", dErr)
 			panic("extract: " + regInitErr.Error())
 		}
+		if vSetErr := ValidateDeclarativeManifests(bundle.Manifests); vSetErr != nil {
+			regInitErr = vSetErr
+			panic("extract: " + regInitErr.Error())
+		}
 		for i := range bundle.Manifests {
 			m := bundle.Manifests[i]
 			if vErr := validateManifestRulesGo(&m); vErr != nil {
@@ -1051,6 +1289,7 @@ func loadRegistryFromFS(fsys fs.ReadDirFS) (*declarativeRegistry, error) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	var initErr error
+	var parsedManifests []DeclarativeAdapterManifest
 	seenIDs := make(map[string]bool)
 	twinOwners := make(map[string]string)
 	for _, ent := range entries {
@@ -1082,7 +1321,16 @@ func loadRegistryFromFS(fsys fs.ReadDirFS) (*declarativeRegistry, error) {
 			initErr = fmt.Errorf("%s: %w", ent.Name(), pErr)
 			continue
 		}
-		if regErr := registerManifestInRegistry(reg, m, seenIDs, twinOwners); regErr != nil {
+		parsedManifests = append(parsedManifests, *m)
+	}
+	if initErr == nil {
+		if vErr := ValidateDeclarativeManifests(parsedManifests); vErr != nil {
+			return reg, vErr
+		}
+	}
+	for i := range parsedManifests {
+		mCopy := parsedManifests[i]
+		if regErr := registerManifestInRegistry(reg, &mCopy, seenIDs, twinOwners); regErr != nil {
 			initErr = regErr
 			continue
 		}
@@ -1297,17 +1545,75 @@ func resolveManifestTwinOnParsedURL(adapter *DeclarativeAdapterManifest, u *url.
 		cleanOrig.Fragment = ""
 		cleanOrig.User = nil
 		return &DeclarativeTwinMatch{
-			ID:        twinID,
-			AdapterID: adapter.ID,
-			FetchURL:  fetchURL,
-			Kind:      kind,
-			Accept:    normalizeDeclarativeAccept(route.Twin.Kind, route.Twin.Accept),
-			route:     route,
-			params:    params,
-			origURL:   cleanOrig.String(),
+			ID:              twinID,
+			AdapterID:       adapter.ID,
+			FetchURL:        fetchURL,
+			Kind:            kind,
+			Accept:          normalizeDeclarativeAccept(route.Twin.Kind, route.Twin.Accept),
+			route:           route,
+			params:          params,
+			origURL:         cleanOrig.String(),
+			domains:         append([]string(nil), adapter.Domains...),
+			universalEngine: adapter.UniversalEngine,
 		}, true
 	}
 	return nil, false
+}
+
+// ValidateRedirectTarget verifies that a twin HTTP redirect destination remains a safe public HTTPS URL
+// and does not escape the initial FetchURL host/registrable domain or declared manifest domains (nor cross
+// tenant subdomains on wildcard/universal adapters).
+func (m *DeclarativeTwinMatch) ValidateRedirectTarget(finalURL string) bool {
+	if m == nil {
+		return false
+	}
+	if finalURL == "" {
+		return true
+	}
+	cleanFinal := finalURL
+	if hash := strings.IndexByte(cleanFinal, '#'); hash >= 0 {
+		cleanFinal = cleanFinal[:hash]
+	}
+	if !isSafePublicTwinURL(cleanFinal) {
+		return false
+	}
+	initParsed, err1 := url.Parse(m.FetchURL)
+	finalParsed, err2 := url.Parse(cleanFinal)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	initHost := strings.TrimSuffix(strings.ToLower(initParsed.Hostname()), ".")
+	finalHost := strings.TrimSuffix(strings.ToLower(finalParsed.Hostname()), ".")
+	if finalHost == initHost {
+		return true
+	}
+	if IsPublicOrPrivateSuffix(finalHost) || HasPrivateSharedHostingSuffix(finalHost) {
+		return false
+	}
+	normInit := strings.TrimPrefix(initHost, "www.")
+	normFinal := strings.TrimPrefix(finalHost, "www.")
+	if normInit == normFinal {
+		return true
+	}
+	hasWildcard := m.universalEngine
+	for _, d := range m.domains {
+		if strings.Contains(d, "*") {
+			hasWildcard = true
+			break
+		}
+	}
+	if hasWildcard {
+		// On multi-tenant wildcard / universal adapters (e.g. *.myshopify.com), never follow redirects across tenants.
+		return false
+	}
+	for _, d := range m.domains {
+		if matchesHostPatternLinearGo(finalHost, d) {
+			return true
+		}
+	}
+	initReg := GetRegistrableDomain(initHost)
+	finalReg := GetRegistrableDomain(finalHost)
+	return initReg != "" && initReg == finalReg
 }
 
 func buildResolvedTwinURLGo(route DeclarativeRouteSpec, u *url.URL, host string, params map[string]string) (string, bool) {

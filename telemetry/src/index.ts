@@ -52,8 +52,14 @@ export interface ValidatedDevErrorEvent {
 export const MAX_INGEST_BODY_BYTES = 8_192; // Strict 8 KiB cap
 export const RATE_LIMIT_CAPACITY = 30; // <= 30 req/min per IPv4 or IPv6 `/64`
 export const IPV6_PREFIX48_RATE_LIMIT_CAPACITY = 60; // <= 60 req/min aggregate across an entire IPv6 `/48`
-export const GLOBAL_NEW_FINGERPRINTS_PER_MIN = 250; // Bounds brand-new D1 row churn across distributed IPs
+export const GLOBAL_NEW_FINGERPRINTS_PER_MIN = 500; // Bounds brand-new D1 row churn across distributed IPs while admitting 200+ genuine bursts
+export const PER_IP_NEW_FINGERPRINTS_BURST = 24; // Per-IPv4 / IPv6 `/64` immediate new-fingerprint burst
+export const PER_IP_NEW_FINGERPRINTS_PER_HOUR = 48; // Per-IPv4 / IPv6 `/64` sustained new-fingerprint creation ceiling (3 IPs -> <= 168 rows in 40m!)
+export const IPV6_PREFIX48_NEW_FINGERPRINTS_BURST = 48;
+export const IPV6_PREFIX48_NEW_FINGERPRINTS_PER_HOUR = 96;
+export const FRESH_FINGERPRINT_PROTECTION_MS = 300_000; // 5m protection window preventing count=1 thrashing against stale count>=2 rows
 export const RATE_LIMIT_WINDOW_MS = 60_000;
+const HOUR_WINDOW_MS = 3_600_000;
 export const DEFAULT_MAX_FINGERPRINT_ROWS = 10_000;
 export const MIN_ADMIN_TOKEN_LENGTH = 24;
 export const MAX_EVENTS_PER_POST = 8;
@@ -84,11 +90,15 @@ interface TokenBucket {
 
 const ipBuckets = new Map<string, TokenBucket>();
 const ipv6Slash48Buckets = new Map<string, TokenBucket>();
+const ipNewFpBuckets = new Map<string, TokenBucket>();
+const ipv6Slash48NewFpBuckets = new Map<string, TokenBucket>();
 let globalNewFpBucket: TokenBucket = { tokens: GLOBAL_NEW_FINGERPRINTS_PER_MIN, lastRefillMs: Date.now() };
 
 export function resetCollectorRateLimiters(): void {
   ipBuckets.clear();
   ipv6Slash48Buckets.clear();
+  ipNewFpBuckets.clear();
+  ipv6Slash48NewFpBuckets.clear();
   globalNewFpBucket = { tokens: GLOBAL_NEW_FINGERPRINTS_PER_MIN, lastRefillMs: Date.now() };
 }
 
@@ -257,7 +267,66 @@ export function consumeIpRateLimit(
   return { allowed: true, remaining };
 }
 
-function consumeGlobalNewFingerprintBudget(nowMs: number): boolean {
+function tryAcquireCustomWindowToken(
+  map: Map<string, TokenBucket>,
+  key: string,
+  burstCapacity: number,
+  sustainedPerWindow: number,
+  windowMs: number,
+  nowMs: number,
+): TokenBucket | null {
+  const refillPerMs = sustainedPerWindow / windowMs;
+  const existing = map.get(key);
+  if (existing) {
+    const elapsed = Math.max(0, nowMs - existing.lastRefillMs);
+    existing.tokens = Math.min(burstCapacity, existing.tokens + elapsed * refillPerMs);
+    existing.lastRefillMs = nowMs;
+    if (existing.tokens < 1) return null;
+    return existing;
+  }
+  if (map.size >= MAX_IP_BUCKETS) {
+    for (const [k, b] of map) {
+      if (nowMs - b.lastRefillMs >= windowMs || b.tokens >= burstCapacity - 1) {
+        map.delete(k);
+        if (map.size < MAX_IP_BUCKETS) break;
+      }
+    }
+    if (map.size >= MAX_IP_BUCKETS) return null;
+  }
+  const created: TokenBucket = { tokens: burstCapacity, lastRefillMs: nowMs };
+  map.set(key, created);
+  return created;
+}
+
+export function consumeNewFingerprintBudget(rawIp: string | null | undefined, nowMs: number): boolean {
+  const { primaryKey, ipv6Prefix48Key } = normalizeClientIpBuckets(rawIp);
+
+  // 1. Check per-IPv4 / IPv6 `/64` hourly new-fingerprint budget BEFORE consuming global budget
+  const ipFpBkt = tryAcquireCustomWindowToken(
+    ipNewFpBuckets,
+    primaryKey,
+    PER_IP_NEW_FINGERPRINTS_BURST,
+    PER_IP_NEW_FINGERPRINTS_PER_HOUR,
+    HOUR_WINDOW_MS,
+    nowMs,
+  );
+  if (!ipFpBkt) return false;
+
+  // 2. Check IPv6 `/48` hourly new-fingerprint budget when IPv6
+  let p48FpBkt: TokenBucket | null = null;
+  if (ipv6Prefix48Key !== null) {
+    p48FpBkt = tryAcquireCustomWindowToken(
+      ipv6Slash48NewFpBuckets,
+      ipv6Prefix48Key,
+      IPV6_PREFIX48_NEW_FINGERPRINTS_BURST,
+      IPV6_PREFIX48_NEW_FINGERPRINTS_PER_HOUR,
+      HOUR_WINDOW_MS,
+      nowMs,
+    );
+    if (!p48FpBkt) return false;
+  }
+
+  // 3. Check global per-minute new-fingerprint creation ceiling
   const refillPerMs = GLOBAL_NEW_FINGERPRINTS_PER_MIN / RATE_LIMIT_WINDOW_MS;
   const elapsed = Math.max(0, nowMs - globalNewFpBucket.lastRefillMs);
   globalNewFpBucket.tokens = Math.min(
@@ -266,6 +335,9 @@ function consumeGlobalNewFingerprintBudget(nowMs: number): boolean {
   );
   globalNewFpBucket.lastRefillMs = nowMs;
   if (globalNewFpBucket.tokens < 1) return false;
+
+  ipFpBkt.tokens -= 1;
+  if (p48FpBkt) p48FpBkt.tokens -= 1;
   globalNewFpBucket.tokens -= 1;
   return true;
 }
@@ -784,7 +856,12 @@ export default {
       }
 
       const clientIp = request.headers.get('cf-connecting-ip') ?? 'unknown';
-      const rl = consumeIpRateLimit(clientIp);
+      const nowHeaderRaw = request.headers.get('x-ef-test-now-ms');
+      const nowMs =
+        nowHeaderRaw !== null && process.env.EDGEFETCH_ALLOW_TEST_CLOCK === '1' && Number.isFinite(Number(nowHeaderRaw))
+          ? Math.floor(Number(nowHeaderRaw))
+          : Date.now();
+      const rl = consumeIpRateLimit(clientIp, nowMs);
       if (!rl.allowed) {
         return jsonResponse(
           { ok: false, error: 'rate_limited', retryAfterSec: rl.retryAfterSec },
@@ -810,7 +887,6 @@ export default {
         return jsonResponse({ ok: false, error: 'invalid_schema', detail: validated.error }, 400);
       }
 
-      const nowMs = Date.now();
       const rawMaxRows = Number(env.MAX_ERROR_FINGERPRINTS ?? DEFAULT_MAX_FINGERPRINT_ROWS);
       const maxRows =
         Number.isFinite(rawMaxRows) && rawMaxRows >= 1 ? Math.min(100_000, Math.floor(rawMaxRows)) : DEFAULT_MAX_FINGERPRINT_ROWS;
@@ -845,7 +921,7 @@ export default {
           continue;
         }
 
-        if (!consumeGlobalNewFingerprintBudget(nowMs)) {
+        if (!consumeNewFingerprintBudget(clientIp, nowMs)) {
           continue;
         }
 
@@ -855,16 +931,23 @@ export default {
         }
 
         if (cachedRowCount >= maxRows) {
-          // Evict ONLY the lowest-value stale row (`count = 1` oldest first, falling back to `count ASC, last_seen_at ASC`)
-          // so multi-hit real regressions (`count >= 2`) are NEVER evicted by single-hit noise!
+          // `R8-M2`: Protect newly arrived errors (`first_seen_at > staleCutoffMs`) from 1-slot thrashing while evicting
+          // stale low-count (`count <= 10`) rows oldest-first (`last_seen_at ASC`), so `count = 2` fake rows can NEVER
+          // pin the table or evict freshly reported genuine errors!
+          const staleCutoffMs = nowMs - FRESH_FINGERPRINT_PROTECTION_MS;
           await env.DB.prepare(
             `DELETE FROM error_fingerprints
              WHERE fingerprint IN (
                SELECT fingerprint FROM error_fingerprints
-               ORDER BY count ASC, last_seen_at ASC
+               ORDER BY
+                 CASE WHEN first_seen_at <= ? THEN 0 ELSE 1 END ASC,
+                 CASE WHEN count <= 10 AND first_seen_at <= ? THEN 0 ELSE count END ASC,
+                 last_seen_at ASC
                LIMIT 1
              )`,
-          ).run();
+          )
+            .bind(staleCutoffMs, staleCutoffMs)
+            .run();
           cachedRowCount = Math.max(0, cachedRowCount - 1);
         }
 

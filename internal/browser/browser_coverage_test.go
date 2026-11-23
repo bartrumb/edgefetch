@@ -425,8 +425,8 @@ func TestRendererHelpersHeadersEnvSnapAndHostPolicy(t *testing.T) {
 	if isSameOriginInitiatorHeaders(map[string]any{"Sec-Fetch-Site": "cross-site"}, initOrigin) {
 		t.Fatal("Sec-Fetch-Site: cross-site without proven same-origin must fail")
 	}
-	if !isSameOriginInitiatorHeaders(map[string]any{"Sec-Fetch-Site": "cross-site", "Origin": "https://victim.test"}, initOrigin) {
-		t.Fatal("Sec-Fetch-Site: cross-site with proven same-origin Origin must allow")
+	if isSameOriginInitiatorHeaders(map[string]any{"Sec-Fetch-Site": "cross-site", "Origin": "https://victim.test"}, initOrigin) {
+		t.Fatal("Sec-Fetch-Site: cross-site must reject even when Origin/Referer names initOrigin")
 	}
 
 	// handleRequestPaused invalid JSON / empty RequestID.

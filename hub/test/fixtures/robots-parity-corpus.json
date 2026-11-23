@@ -1,0 +1,286 @@
+[
+  {
+    "id": "basic-wildcard-disallow-root",
+    "robots": "User-agent: *\nDisallow: /\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": false },
+      { "path": "/docs/index.html", "allowed": false }
+    ]
+  },
+  {
+    "id": "specific-overrides-wildcard",
+    "robots": "User-agent: *\nDisallow: /admin\nCrawl-delay: 5\n\nUser-agent: EdgeFetch/2.7.2\nDisallow: /private\nCrawl-delay: 2\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 2000,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/admin", "allowed": true },
+      { "path": "/private/doc", "allowed": false }
+    ]
+  },
+  {
+    "id": "longest-match-and-tie-break",
+    "robots": "User-agent: *\nDisallow: /same\nAllow: /same\nDisallow: /x*\nAllow: /x\nDisallow: /*.php$\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/same", "allowed": true },
+      { "path": "/x", "allowed": false },
+      { "path": "/login.php", "allowed": false },
+      { "path": "/login.php?next=1", "allowed": true },
+      { "path": "/login.php#frag", "allowed": false },
+      { "path": "/public#login.php", "allowed": true }
+    ]
+  },
+  {
+    "id": "turkish-dotted-i-in-directive-field",
+    "robots": "User-agent: *\nD\u0130sallow: /\nCONTENT-S\u0130GNAL: ai-input=no\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": true },
+      { "path": "/secret", "allowed": true }
+    ]
+  },
+  {
+    "id": "unicode-long-s-and-kelvin-case-folding",
+    "robots": "U\u017fer-agent: *\nDisallow: /\n\nUser-agent: edge\u017fetch\nDisallow: /sub\n\nUser-agent: *\nContent-Signal: a\u0130-input=no, ai-input=y\u017fe\nAllow: /ok\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": true },
+      { "path": "/sub", "allowed": true },
+      { "path": "/ok", "allowed": true }
+    ]
+  },
+  {
+    "id": "nul-in-content-signal-item-vs-subsequent-item",
+    "robots": "User-agent: *\nContent-Signal: ai-input=no\u0000\nAllow: /\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/docs", "allowed": true }
+    ]
+  },
+  {
+    "id": "nul-in-first-content-signal-item-preserves-second-item",
+    "robots": "User-agent: *\nContent-Signal: search=yes\u0000, ai-input=no\nAllow: /\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": true,
+    "checks": [
+      { "path": "/docs", "allowed": false }
+    ]
+  },
+  {
+    "id": "nul-in-disallow-truncates-path-value",
+    "robots": "User-agent: *\nDisallow: /secret\u0000/ignored\nDisallow\u0000: /\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/secret/page", "allowed": false },
+      { "path": "/public", "allowed": true }
+    ]
+  },
+  {
+    "id": "zero-width-before-directive-vs-inside-uri-value",
+    "robots": "\ufeff\u200bUser-agent: *\n  \u200cDisallow: /\u200b\n\u200dDisallow: \u200b/ignored\n\u2060Crawl-delay: 2.5\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 2500,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/public", "allowed": true },
+      { "path": "/\u200b", "allowed": false },
+      { "path": "/%E2%80%8B/x", "allowed": false },
+      { "path": "/ignored", "allowed": true }
+    ]
+  },
+  {
+    "id": "zero-width-in-user-agent-value-not-stripped",
+    "robots": "User-agent: \u200b*\nDisallow: /\n\nUser-agent: edgefetch\u200b\nDisallow: /all\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": true },
+      { "path": "/all", "allowed": true }
+    ]
+  },
+  {
+    "id": "latin1-mojibake-bom-not-stripped-as-utf8-bom",
+    "robots": "\u00ef\u00bb\u00bfUser-agent: *\nDisallow: /\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": true }
+    ]
+  },
+  {
+    "id": "crawl-delay-underscore-inf-nan-scientific-and-decimal",
+    "robots": "User-agent: bot1\nCrawl-delay: 1_0\n\nUser-agent: bot2\nCrawl-delay: .5\n\nUser-agent: bot3\nCrawl-delay: 1e2\n\nUser-agent: bot4\nCrawl-delay: +Inf\n",
+    "ua": "bot1",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": true }
+    ]
+  },
+  {
+    "id": "crawl-delay-leading-dot",
+    "robots": "User-agent: *\nCrawl-delay: .5\n",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 500,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": true }
+    ]
+  },
+  {
+    "id": "crawl-delay-scientific-clamped-to-30s",
+    "robots": "User-agent: *\nCrawl-delay: 1e2\n",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 30000,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": true }
+    ]
+  },
+  {
+    "id": "crawl-delay-trailing-dot",
+    "robots": "User-agent: *\nCrawl-delay: 3.\n",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 3000,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": true }
+    ]
+  },
+  {
+    "id": "dual-normraw-and-normcanon-checks",
+    "robots": "User-agent: *\nDisallow: /a//b\nDisallow: /m;v=1\nDisallow: /private\nAllow: /public\n",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/a//b", "allowed": false },
+      { "path": "/a/b", "allowed": true },
+      { "path": "/m;v=1", "allowed": false },
+      { "path": "/m", "allowed": true },
+      { "path": "/public/../private", "allowed": false },
+      { "path": "/private/../public", "allowed": false },
+      { "path": "/./private", "allowed": false },
+      { "path": "/%2e/private", "allowed": false },
+      { "path": "/private;jsessionid=9/doc", "allowed": false },
+      { "path": "//private/doc", "allowed": false }
+    ]
+  },
+  {
+    "id": "disallow-root-with-allow-public-blocks-traversal-via-normraw",
+    "robots": "User-agent: *\nDisallow: /\nAllow: /public\n",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/public/doc", "allowed": true },
+      { "path": "/secret/../public/doc", "allowed": false },
+      { "path": "/public/../secret/doc", "allowed": false }
+    ]
+  },
+  {
+    "id": "percent-encoding-rfc9309-2-2-2",
+    "robots": "User-agent: *\nDisallow: /caf%C3%A9\nDisallow: /~admin\nDisallow: /a%2Fb\n",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/caf%c3%a9/menu", "allowed": false },
+      { "path": "/café/menu", "allowed": false },
+      { "path": "/%7eadmin/x", "allowed": false },
+      { "path": "/%7Eadmin/x", "allowed": false },
+      { "path": "/a%2fb", "allowed": false },
+      { "path": "/a/b", "allowed": true },
+      { "path": "/a%zz", "allowed": true }
+    ]
+  },
+  {
+    "id": "content-signal-inheritance-and-conflicts",
+    "robots": "Content-Signal: ai-input=no\n\nUser-agent: *\nContent-Signal: ai-input=yes\nDisallow: /wild\n\nUser-agent: edgefetch\nDisallow: /spec\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/wild", "allowed": true },
+      { "path": "/spec", "allowed": false }
+    ]
+  },
+  {
+    "id": "content-signal-multi-group-same-specificity-deny-wins",
+    "robots": "User-agent: edgefetch\nContent-Signal: ai-input=yes\nAllow: /\n\nUser-agent: edgefetch\nContent-Signal: 'ai-input'=no, ai-input='NO'\nDisallow: /x\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": true,
+    "checks": [
+      { "path": "/", "allowed": false }
+    ]
+  },
+  {
+    "id": "empty-user-agent-and-non-group-sitemap-lines",
+    "robots": "User-agent: googlebot\nSitemap: https://example.com/sitemap.xml\nUser-agent: edgefetch\nDisallow: /only-bots\n\nUser-agent:\nDisallow: /\n",
+    "ua": "EdgeFetch/2.7.2",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/only-bots/a", "allowed": false },
+      { "path": "/public", "allowed": true }
+    ]
+  },
+  {
+    "id": "wildcards-stars-and-anchors",
+    "robots": "User-agent: *\nDisallow: /*/secret/*.json$\nAllow: /*/secret/public.json$\nDisallow: *$?\nDisallow: /lit$mid/x\n",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/v1/secret/private.json", "allowed": false },
+      { "path": "/v1/secret/public.json", "allowed": true },
+      { "path": "/v1/secret/private.json?dl=1", "allowed": true },
+      { "path": "/page$?a=1", "allowed": false },
+      { "path": "/lit$mid/x/y", "allowed": false },
+      { "path": "/lit/x/y", "allowed": true }
+    ]
+  },
+  {
+    "id": "star-dollar-blocks-all",
+    "robots": "User-agent: *\nDisallow: *$\n",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/", "allowed": false },
+      { "path": "/anything?q=1", "allowed": false }
+    ]
+  },
+  {
+    "id": "unicode-line-separators-nel-ls-ps",
+    "robots": "User-agent: *\u0085Disallow: /nel\u2028Disallow: /ls\u2029Allow: /nel/open\r\nDisallow: /crlf\rDisallow: /cr",
+    "ua": "EdgeFetch",
+    "crawlDelayMs": 0,
+    "disallowAiInput": false,
+    "checks": [
+      { "path": "/nel/closed", "allowed": false },
+      { "path": "/nel/open", "allowed": true },
+      { "path": "/ls", "allowed": false },
+      { "path": "/crlf", "allowed": false },
+      { "path": "/cr", "allowed": false }
+    ]
+  }
+]

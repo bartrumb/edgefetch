@@ -1,5 +1,5 @@
 /**
- * Markdown derivation pipeline (`SCRAPE_PIPELINE_VERSION = 1`), `llms.txt` parser, `maxAgeMs` verified cache lookup,
+ * Markdown derivation pipeline (`SCRAPE_PIPELINE_VERSION` imported from `./storage`), `llms.txt` parser, `maxAgeMs` verified cache lookup,
  * and `POST /v1/scrape` + MCP `scrape` execution (`PR S6`).
  *
  * Security Invariants:
@@ -13,6 +13,7 @@ import {
   enrichShopifyProductFromJson,
   enrichWooCommerceProductFromStoreApi,
   extractShopifyCurrencyFromHtml,
+  getRegisteredAdapterById,
   isShopifyHtmlOrHeaders,
   isWooCommerceHtmlOrHeaders,
   resolveCustomDomainShopifyProductTwinUrl,
@@ -74,11 +75,13 @@ import {
 import {
   isValidSha256Hex,
   normalizeVisibility,
+  r2ArtifactKey,
   r2DerivedKey,
   r2PrivateDerivedKey,
   r2PrivateScrapeCacheKey,
   readVerifiedArtifactFromR2,
   sanitizeStorageUserId,
+  SCRAPE_PIPELINE_VERSION,
   writePrivateArtifactToR2,
   type ArtifactRetention,
   type OptionalStorageBindings,
@@ -110,14 +113,22 @@ import {
 import {
   detectPromptInjection,
   encodeBodyToRawBase64,
+  escapeAllResidualLtInProseLinear,
+  escapeGfmTaskListCheckboxesLinear,
   extractHtmlAttributesBySelectors,
   extractStructuredProduct,
+  isDisallowedMarkdownLinkDestination,
+  neutralizeAllUnsafeMarkdownLinksLinear,
   normalizeInlineBrowserActions,
   parsePdfParserOptions,
+  sanitizeMarkdownPageSlice,
   splitPdfPagesAndMarkers,
+  trimAsciiWhitespaceLinear,
+  trimTrailingAsciiWhitespaceLinear,
 } from './scrape-advanced';
 
-export const SCRAPE_PIPELINE_VERSION = 30;
+export { sanitizeMarkdownPageSlice } from './scrape-advanced';
+export { SCRAPE_PIPELINE_VERSION } from './storage';
 
 export interface ScrapedImage {
   url: string;
@@ -420,10 +431,9 @@ function cleanFenceInfoStringLinear(rawInfo: string): string {
 function hardenMarkdownFenceStructure(md: string): string {
   if (!md) return md;
   const hasFenceChars = md.includes('```') || md.includes('~~~');
-  const hasBracketRef = md.includes('[');
-  if (!hasFenceChars && !hasBracketRef) return md;
+  if (!hasFenceChars) return md;
 
-  const hasPotentialSetext = hasFenceChars && /(?:^|\n)[ ]{0,3}(?:=+|-+)[ \t]*(?:\r?\n|$)/.test(md);
+  const hasPotentialSetext = /(?:^|\n)[ ]{0,3}(?:=+|-+)[ \t]*(?:\r?\n|$)/.test(md);
   const lines = md.split('\n');
   const out: string[] = [];
   let inFence = false;
@@ -585,8 +595,9 @@ function hardenMarkdownFenceStructure(md: string): string {
     const checkPos = prefixLen > 0 ? prefixLen : bytePos <= 3 ? bytePos : -1;
     if (checkPos >= 0 && checkPos < raw.length && raw.charCodeAt(checkPos) === 91 /* '[' */) {
       const tail = raw.slice(checkPos);
+      const qLimit = Math.min(tail.length, 1024);
       let closeIdx = -1;
-      for (let q = 1; q < tail.length; q++) {
+      for (let q = 1; q < qLimit; q++) {
         const qc = tail.charCodeAt(q);
         if (qc === 92 /* '\\' */) {
           q++;
@@ -597,11 +608,11 @@ function hardenMarkdownFenceStructure(md: string): string {
           break;
         }
       }
-      if (closeIdx < 0) {
+      if (closeIdx < 0 && tail.length < 1024) {
         out.push(`${raw.slice(0, checkPos)}\\${tail}${cr}`);
         continue;
       }
-      if (closeIdx + 1 < tail.length && tail.charCodeAt(closeIdx + 1) === 58 /* ':' */ && tail.slice(closeIdx + 2).trim() === '') {
+      if (closeIdx >= 0 && closeIdx + 1 < tail.length && tail.charCodeAt(closeIdx + 1) === 58 /* ':' */ && tail.slice(closeIdx + 2).trim() === '') {
         out.push(`${raw.slice(0, checkPos)}${tail.slice(0, closeIdx + 1)}\\${tail.slice(closeIdx + 1)}${cr}`);
         continue;
       }
@@ -846,19 +857,30 @@ function formatInlineCodeSpan(raw: string): string {
 
 function resolveHttpsHref(rawHref: string | undefined, baseUrl?: string, preserveHash = false): string | undefined {
   if (!rawHref) return undefined;
-  const trimmed = rawHref.trim();
+  const trimmedRaw = rawHref.trim();
+  if (!trimmedRaw) return undefined;
+  const decoded = decodeHtmlEntities(trimmedRaw).trim();
   if (
-    !trimmed ||
-    trimmed.startsWith('#') ||
-    trimmed.startsWith('javascript:') ||
-    trimmed.startsWith('mailto:') ||
-    trimmed.startsWith('tel:') ||
-    trimmed.startsWith('data:')
+    !decoded ||
+    decoded.startsWith('#') ||
+    decoded.startsWith('//') ||
+    decoded.startsWith('/\\') ||
+    isDisallowedMarkdownLinkDestination(trimmedRaw) ||
+    isDisallowedMarkdownLinkDestination(decoded)
+  ) {
+    return undefined;
+  }
+  const lower = decoded.toLowerCase();
+  if (
+    lower.startsWith('javascript:') ||
+    lower.startsWith('mailto:') ||
+    lower.startsWith('tel:') ||
+    lower.startsWith('data:')
   ) {
     return undefined;
   }
   try {
-    const u = baseUrl ? new URL(trimmed, baseUrl) : new URL(trimmed);
+    const u = baseUrl ? new URL(decoded, baseUrl) : new URL(decoded);
     if (u.protocol !== 'https:' && u.protocol !== 'http:') return undefined;
     if (!preserveHash || /[\s<>()]/.test(u.hash)) {
       u.hash = '';
@@ -4689,6 +4711,7 @@ export async function writePrivateCachedScrape(params: {
   language?: string;
   status?: number;
   pipelineVersion?: number;
+  optionsHash?: string;
   now?: number;
 }): Promise<{ blobSha256?: string; contentSha256: string; markdownSha256: string; documentId: string }> {
   const {
@@ -4701,6 +4724,7 @@ export async function writePrivateCachedScrape(params: {
     language,
     status = 200,
     pipelineVersion = SCRAPE_PIPELINE_VERSION,
+    optionsHash,
     now = Date.now(),
   } = params;
   const markdownSha256 = await sha256HexString(markdown);
@@ -4746,6 +4770,7 @@ export async function writePrivateCachedScrape(params: {
     ...(language ? { language } : {}),
     status,
     lastFetchedAt: now,
+    ...(optionsHash ? { optionsHash } : {}),
   };
   await bucket.put(r2PrivateScrapeCacheKey(userId, pipelineVersion, urlSha), JSON.stringify(cacheEntry), {
     httpMetadata: { contentType: 'application/json' },
@@ -4918,6 +4943,7 @@ function isTinyOrAvatarImageUrl(urlStr: string, alt = ''): boolean {
 }
 
 function dedupeConsecutiveStandaloneLinkParagraphs(prose: string): string {
+  if (!prose || !prose.includes('\n\n')) return prose;
   const blocks = prose.split(/\n{2,}/);
   if (blocks.length < 2) return prose;
   const out: string[] = [];
@@ -5440,109 +5466,12 @@ function destinationStartsWithDangerousScheme(s: string, from: number, angle: bo
   return false;
 }
 
-/** R5/R6 fail-closed pass: any `](` / `]:` outside trusted code spans (or after an earlier `[` on the paragraph, covering `marked16` `[a `](javascript:...) `x`) followed by a dangerous scheme is broken with `]\ (` / `]\:`. */
 function neutralizeResidualDangerousLinkDestinations(prose: string): string {
-  if (!prose.includes('](') && !prose.includes(']:')) return prose;
-  const lines = prose.split('\n');
-  const poisoned = computeTickPoisonedLines(lines);
-  let changed = false;
-  let sawBracketInPara = false;
-  for (let li = 0; li < lines.length; li++) {
-    const line = lines[li]!;
-    const breakKind = detectParagraphBreakKind(line);
-    if (breakKind !== 'none') {
-      sawBracketInPara = false;
-    }
-    if (!line.includes('](') && !line.includes(']:')) {
-      if (line.includes('[')) {
-        const cursors = createMarkdownLineScanCursors();
-        let p = 0;
-        while (p < line.length) {
-          const pc = line.charCodeAt(p);
-          if (pc === 96 && poisoned[li] === 0 && !isBackslashEscapedAt(line, p)) {
-            const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, p, cursors);
-            p = spanEnd > 0 ? spanEnd : tickEnd;
-            continue;
-          }
-          if (pc === 91 && !isBackslashEscapedAt(line, p)) {
-            sawBracketInPara = true;
-            break;
-          }
-          p++;
-        }
-      }
-      continue;
-    }
-    const cursors = createMarkdownLineScanCursors();
-    let out = '';
-    let last = 0;
-    let i = 0;
-    while (i < line.length) {
-      const ch = line.charCodeAt(i);
-      if (ch === 91 && !isBackslashEscapedAt(line, i)) {
-        sawBracketInPara = true;
-      }
-      // Only trust code spans to mask `](` / `]:` when NO unescaped `[` preceded them in the paragraph (`marked16` link-over-codespan bug)!
-      if (ch === 96 && poisoned[li] === 0 && !sawBracketInPara && !isBackslashEscapedAt(line, i)) {
-        const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
-        i = spanEnd > 0 ? spanEnd : tickEnd;
-        continue;
-      }
-      if (ch === 93 && i + 1 < line.length) {
-        const nx = line.charCodeAt(i + 1);
-        if (nx === 40 || nx === 58) {
-          let hay = line;
-          let k = i + 2;
-          while (k < hay.length && (hay.charCodeAt(k) === 32 || hay.charCodeAt(k) === 9 || hay.charCodeAt(k) === 13)) k++;
-          if (k >= hay.length && li + 1 < lines.length) {
-            hay = lines[li + 1]!;
-            k = 0;
-            let skipped = 0;
-            while (k < hay.length && skipped++ < 64 && (hay.charCodeAt(k) === 32 || hay.charCodeAt(k) === 9 || hay.charCodeAt(k) === 62)) k++;
-            const lm = /^(?:[-*+][ \t]{1,8}|\d{1,9}[.)][ \t]{1,8})/.exec(hay.slice(k, k + 24));
-            if (lm) k += lm[0].length;
-          }
-          const angle = k < hay.length && hay.charCodeAt(k) === 60;
-          if (destinationStartsWithDangerousScheme(hay, angle ? k + 1 : k, angle)) {
-            out += `${line.slice(last, i + 1)}\\ `;
-            last = i + 1;
-            changed = true;
-          }
-        }
-      }
-      i++;
-    }
-    if (last > 0) lines[li] = out + line.slice(last);
-    if (breakKind === 'atx_heading') sawBracketInPara = false;
-  }
-  return changed ? lines.join('\n') : prose;
+  return neutralizeAllUnsafeMarkdownLinksLinear(prose);
 }
 
 function hasDangerousUriScheme(rawHref: string): boolean {
-  if (!rawHref) return false;
-  const unescaped = rawHref.replace(/\\([!-/:-@[-`{-~])/g, '$1');
-  const decoded = decodeUriEntitiesForScheme(unescaped)
-    .replace(
-      /[\u0000-\u0020\u007F-\u009F\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]+/gu,
-      '',
-    )
-    .trim();
-  if (/^(?:javascript|vbscript|data|file|blob):/i.test(decoded)) {
-    return true;
-  }
-  let stopIdx = decoded.length;
-  for (let i = 0; i < decoded.length; i++) {
-    const c = decoded.charCodeAt(i);
-    if (c === 47 /* '/' */ || c === 63 /* '?' */ || c === 35 /* '#' */) {
-      stopIdx = i;
-      break;
-    }
-  }
-  const beforePath = decoded.slice(0, stopIdx);
-  if (beforePath.includes('&') && /&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});?/.test(beforePath)) {
-    return true;
-  }
-  return false;
+  return isDisallowedMarkdownLinkDestination(rawHref);
 }
 
 function tryParseMarkdownLinkOrImageAt(
@@ -6015,6 +5944,8 @@ function stripDangerousMultilineMarkdownLinksLinear(prose: string): string {
  * relative URL resolution, dangerous URI scheme stripping (`javascript:`, `vbscript:`, `data:`, `file:`, `blob:`),
  * autolink conversion (`<https://...>` -> `[https://...](https://...)`), and decorative/optional image stripping in O(N) time.
  */
+const MAX_MARKDOWN_SANITIZE_CHARS = 8 * 1024 * 1024;
+
 function sanitizeAndResolveMarkdownProseLinksLinear(
   prose: string,
   opts: { baseUrl?: string; includeImages?: boolean; spaceAdjacentAlnum?: boolean } = {},
@@ -6022,89 +5953,91 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
   if (!prose) return prose;
   const { baseUrl, includeImages = true, spaceAdjacentAlnum = false } = opts;
   if (!prose.includes('](') && !prose.includes('<') && !prose.includes(']:') && (!spaceAdjacentAlnum || !prose.includes('`'))) {
-    return prose;
+    return prose.includes('//') ? neutralizeAllUnsafeMarkdownLinksLinear(prose) : prose;
   }
-  const rawBounded = prose.length > MAX_HTML_SCAN_CHARS ? prose.slice(0, MAX_HTML_SCAN_CHARS) : prose;
-  const bounded = stripDangerousMultilineMarkdownLinksLinear(rawBounded);
-  const proseLines = bounded.split('\n');
-  const tickPoisoned = computeTickPoisonedLines(proseLines);
-  const resolvedLines = proseLines
-    .map((line, lineIdx) => {
-      // Strip dangerous reference-link definitions (`[id]: javascript:alert(1)`) in O(1) fast-path + bounded linear check.
-      const trimmedLead = line.trimStart();
-      if (trimmedLead.startsWith('[') && line.includes(']:')) {
-        const closeDef = trimmedLead.indexOf(']:');
-        if (closeDef > 1 && closeDef <= 205) {
-          const rhs = trimmedLead.slice(closeDef + 2).trim();
-          const destToken = rhs.startsWith('<') ? rhs.slice(1, rhs.indexOf('>') > 0 ? rhs.indexOf('>') : rhs.length) : (rhs.split(/\s+/)[0] ?? '');
-          if (hasDangerousUriScheme(destToken)) {
-            return '';
-          }
-        }
-      }
-      if (!line.includes('](') && !line.includes('<') && !line.includes('`')) {
-        return line;
-      }
+  const rawBounded = prose.length > MAX_MARKDOWN_SANITIZE_CHARS ? prose.slice(0, MAX_MARKDOWN_SANITIZE_CHARS) : prose;
+  const proseLines = rawBounded.split('\n');
+  const resolvedLines = proseLines.map((line) => {
+    if (!line.includes('](') && !line.includes('<') && (!spaceAdjacentAlnum || !line.includes('`'))) {
+      return line;
+    }
 
-      const cursors = createMarkdownLineScanCursors();
-      let out = '';
-      let lastEmittedCode = 0;
-      const emit = (chunk: string) => {
-        if (!chunk) return;
-        out += chunk;
-        lastEmittedCode = chunk.charCodeAt(chunk.length - 1);
-      };
-      let checkedNoLtOrTick = false;
-      let lastCopyIdx = 0;
-      let i = 0;
-      while (i < line.length) {
-        const ch = line.charCodeAt(i);
-        // 1. Preserve inline backtick code spans untouched (spacing adjacent single-backtick spans when requested).
-        if (ch === 96 && tickPoisoned[lineIdx] === 0) {
-          if (isBackslashEscapedAt(line, i)) {
-            i++;
-            continue;
-          }
-          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
-          if (spanEnd > 0) {
-            if (spaceAdjacentAlnum && spanEnd < line.length && line.charCodeAt(spanEnd) === 96) {
-              emit(`${line.slice(lastCopyIdx, spanEnd)} `);
-              lastCopyIdx = spanEnd;
-            }
-            i = spanEnd;
-          } else {
-            i = tickEnd;
-          }
+    const cursors = createMarkdownLineScanCursors();
+    let out = '';
+    let lastEmittedCode = 0;
+    const emit = (chunk: string) => {
+      if (!chunk) return;
+      out += chunk;
+      lastEmittedCode = chunk.charCodeAt(chunk.length - 1);
+    };
+    let checkedNoLtOrTick = false;
+    let nextGtOnLine = -1;
+    let noGtOnLine = false;
+    let lastCopyIdx = 0;
+    let i = 0;
+    while (i < line.length) {
+      const ch = line.charCodeAt(i);
+      // 1. Step over paired inline backtick code spans during relative-URL / autolink formatting;
+      // the trailing `neutralizeAllUnsafeMarkdownLinksLinear` pass still inspects ALL code spans fail-closed!
+      if (ch === 96) {
+        if (isBackslashEscapedAt(line, i)) {
+          i++;
           continue;
         }
+        const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+        if (spanEnd > 0) {
+          if (spaceAdjacentAlnum && spanEnd < line.length && line.charCodeAt(spanEnd) === 96) {
+            emit(`${line.slice(lastCopyIdx, spanEnd)} `);
+            lastCopyIdx = spanEnd;
+          }
+          i = spanEnd;
+        } else {
+          i = tickEnd;
+        }
+        continue;
+      }
 
-        // 2. Handle angle-bracket autolinks (`<https://...>`, `<mailto:...>`, `<javascript:...>`).
-        if (ch === 60 && i + 3 < line.length) {
-          const gtLimit = Math.min(line.length, i + 2_049);
+      // 2. Handle angle-bracket autolinks (`<https://...>`, `<mailto:...>`, `<javascript:...>`).
+      if (ch === 60 && !noGtOnLine && i + 3 < line.length && !isBackslashEscapedAt(line, i)) {
+        if (nextGtOnLine <= i) {
+          nextGtOnLine = line.indexOf('>', i + 1);
+          if (nextGtOnLine < 0) {
+            noGtOnLine = true;
+            if (!line.includes('](') && (!spaceAdjacentAlnum || !line.includes('`'))) {
+              break;
+            }
+          }
+        }
+        if (!noGtOnLine && nextGtOnLine - i <= 2_048) {
           let gt = -1;
-          for (let p = i + 1; p < gtLimit; p++) {
+          let hasUnsafeAutoChar = false;
+          for (let p = i + 1; p <= nextGtOnLine; p++) {
             const pc = line.charCodeAt(p);
             if (pc === 62) {
               gt = p;
               break;
             }
-            if (pc <= 32 || pc === 60) break;
+            if (pc <= 32 || pc === 60 || pc === 34 || pc === 39) {
+              hasUnsafeAutoChar = true;
+              break;
+            }
           }
-          if (gt > i + 2) {
-            const innerAuto = line.slice(i + 1, gt);
+          if (!hasUnsafeAutoChar && gt > i + 2) {
+            const innerAutoRaw = line.slice(i + 1, gt);
+            const innerAuto = innerAutoRaw.includes('`') ? innerAutoRaw.replace(/`/g, '%60') : innerAutoRaw;
             if (hasDangerousUriScheme(innerAuto)) {
               emit(line.slice(lastCopyIdx, i));
               i = gt + 1;
               lastCopyIdx = i;
               continue;
             }
-            if (/^https?:\/\/\S+$/i.test(innerAuto)) {
+            if (/^https?:\/\/[^\s<>()]+$/i.test(innerAuto)) {
               emit(`${line.slice(lastCopyIdx, i)}[${innerAuto}](${innerAuto})`);
               i = gt + 1;
               lastCopyIdx = i;
               continue;
             }
-            if (/^mailto:[^\s@]+@[^\s@]+\.[^\s@]+$/i.test(innerAuto)) {
+            if (/^mailto:[^\s<>()@]+@[^\s<>()@]+\.[^\s<>()@]+$/i.test(innerAuto)) {
               const addr = innerAuto.slice(7);
               emit(`${line.slice(lastCopyIdx, i)}[${addr}](${innerAuto})`);
               i = gt + 1;
@@ -6113,249 +6046,160 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
             }
           }
         }
+      }
 
-        // 3. Handle Markdown links `[label](url)` and images `![alt](url)`.
-        if ((ch === 33 || ch === 91) && !isBackslashEscapedAt(line, i)) {
-          if (cursors.noCloseBracket || cursors.noCloseParen) {
-            // Neither links nor images can match anywhere later on this line; check once if no `<` or `` ` `` remains to finish in O(1)!
-            if (!checkedNoLtOrTick) {
-              checkedNoLtOrTick = true;
-              if (line.indexOf('<', i + 1) < 0 && line.indexOf('`', i + 1) < 0) {
-                break;
-              }
+      // 3. Handle Markdown links `[label](url)` and images `![alt](url)`.
+      if ((ch === 33 || ch === 91) && !isBackslashEscapedAt(line, i)) {
+        if (cursors.noCloseBracket || cursors.noCloseParen) {
+          if (!checkedNoLtOrTick) {
+            checkedNoLtOrTick = true;
+            if (line.indexOf('<', i + 1) < 0 && (!spaceAdjacentAlnum || line.indexOf('`', i + 1) < 0)) {
+              break;
             }
-            i++;
-            continue;
           }
-          const tok = tryParseMarkdownLinkOrImageAt(line, i, cursors, true);
-          if (tok) {
-            let href = tok.rawUrl.trim();
-            let nextIdx = tok.end;
+          i++;
+          continue;
+        }
+        const tok = tryParseMarkdownLinkOrImageAt(line, i, cursors, true);
+        if (tok) {
+          let href = tok.rawUrl.trim();
+          let nextIdx = tok.end;
 
-            if (!href || hasDangerousUriScheme(href)) {
-              emit(line.slice(lastCopyIdx, i));
-              if (!tok.isImage) {
-                const cleanLbl = tok.rawLabel.includes('](')
-                  ? sanitizeAndResolveMarkdownProseLinksLinear(tok.rawLabel, { baseUrl, includeImages })
-                  : tok.rawLabel;
-                emit(cleanLbl);
-              }
-              i = nextIdx;
-              lastCopyIdx = i;
-              continue;
-            }
-
-            if (baseUrl && /^(?:\/(?!\/)|\.{1,2}\/)/.test(href)) {
-              try {
-                const resolved = new URL(href, baseUrl);
-                if (resolved.protocol === 'https:' || resolved.protocol === 'http:') {
-                  href = resolved.toString();
-                }
-              } catch {
-                // keep relative href when baseUrl cannot parse
-              }
-            }
-
-            if (tok.isImage) {
-              emit(line.slice(lastCopyIdx, i));
-              if (!includeImages || isTinyOrAvatarImageUrl(href, tok.rawLabel)) {
-                i = nextIdx;
-                lastCopyIdx = i;
-                continue;
-              }
-              emit(`![${tok.rawLabel}](${href}${tok.titleSuffix})`);
-              // Separate consecutive inline images (`![a](u1) ![b](u2)`) onto distinct paragraphs.
-              let wsAfter = nextIdx;
-              while (wsAfter < line.length && (line.charCodeAt(wsAfter) === 32 || line.charCodeAt(wsAfter) === 9)) wsAfter++;
-              if (wsAfter < line.length - 1 && line.charCodeAt(wsAfter) === 33 && line.charCodeAt(wsAfter + 1) === 91) {
-                emit('\n\n');
-                nextIdx = wsAfter;
-              }
-              i = nextIdx;
-              lastCopyIdx = i;
-              continue;
-            }
-
-            // Skip `[Skip to content](#...)` anchor boilerplate.
-            if (href.startsWith('#') && /^skip to (?:main )?content$/i.test(tok.rawLabel.trim())) {
-              emit(line.slice(lastCopyIdx, i));
-              while (nextIdx < line.length && (line.charCodeAt(nextIdx) === 32 || line.charCodeAt(nextIdx) === 9)) nextIdx++;
-              i = nextIdx;
-              lastCopyIdx = i;
-              continue;
-            }
-
-            let labelOut = tok.rawLabel;
-            if (labelOut.includes('](') || labelOut.includes('<')) {
-              labelOut = sanitizeAndResolveMarkdownProseLinksLinear(labelOut, { baseUrl, includeImages });
-            }
-            // Strip redundant `(https://same-url)` suffix inside `[label (https://same-url)](https://same-url)`.
-            if (/^https?:\/\//i.test(href) && labelOut.endsWith(`(${href})`)) {
-              const trimmedPrefix = labelOut.slice(0, labelOut.length - href.length - 2).trimEnd();
-              if (trimmedPrefix) labelOut = trimmedPrefix;
-            }
-            // Strip redundant trailing `(https://same-url)` immediately after `[label](https://same-url)(https://same-url)`.
-            if (/^https?:\/\//i.test(href)) {
-              let trail = nextIdx;
-              while (trail < line.length && (line.charCodeAt(trail) === 32 || line.charCodeAt(trail) === 9)) trail++;
-              if (line.charCodeAt(trail) === 40 && line.startsWith(href, trail + 1) && line.charCodeAt(trail + 1 + href.length) === 41) {
-                nextIdx = trail + 2 + href.length;
-              }
-            }
-
-            const prevCharCode = i > lastCopyIdx ? line.charCodeAt(i - 1) : lastEmittedCode;
+          if (!href) {
             emit(line.slice(lastCopyIdx, i));
-            if (spaceAdjacentAlnum && /^https?:\/\//i.test(href) && prevCharCode > 0 && isAsciiAlnumCode(prevCharCode)) {
-              emit(' ');
-            }
-            emit(`[${labelOut}](${href}${tok.titleSuffix})`);
-            if (spaceAdjacentAlnum && /^https?:\/\//i.test(href) && nextIdx < line.length && isAsciiAlnumCode(line.charCodeAt(nextIdx))) {
-              emit(' ');
+            if (!tok.isImage) {
+              const cleanLbl = tok.rawLabel.includes('](')
+                ? sanitizeAndResolveMarkdownProseLinksLinear(tok.rawLabel, { baseUrl, includeImages })
+                : tok.rawLabel;
+              emit(cleanLbl);
             }
             i = nextIdx;
             lastCopyIdx = i;
             continue;
           }
+
+          if (hasDangerousUriScheme(href)) {
+            emit(line.slice(lastCopyIdx, i));
+            const cleanLbl = tok.rawLabel.includes('](')
+              ? sanitizeAndResolveMarkdownProseLinksLinear(tok.rawLabel, { baseUrl, includeImages })
+              : tok.rawLabel;
+            emit(`[${cleanLbl}](#)`);
+            i = nextIdx;
+            lastCopyIdx = i;
+            continue;
+          }
+
+          if (baseUrl && /^(?:\/(?!\/)|\.{1,2}\/)/.test(href)) {
+            try {
+              const resolved = new URL(href, baseUrl);
+              if (resolved.protocol === 'https:' || resolved.protocol === 'http:') {
+                href = resolved.toString();
+              }
+            } catch {
+              // keep relative href when baseUrl cannot parse
+            }
+          }
+          if (href.includes(' ') || href.includes('<') || href.includes('>') || href.includes('`')) {
+            href = href
+              .replace(/ /g, '%20')
+              .replace(/</g, '%3C')
+              .replace(/>/g, '%3E')
+              .replace(/`/g, '%60');
+          }
+
+          if (tok.isImage) {
+            emit(line.slice(lastCopyIdx, i));
+            if (!includeImages || isTinyOrAvatarImageUrl(href, tok.rawLabel)) {
+              i = nextIdx;
+              lastCopyIdx = i;
+              continue;
+            }
+            emit(`![${tok.rawLabel}](${href}${tok.titleSuffix})`);
+            let wsAfter = nextIdx;
+            while (wsAfter < line.length && (line.charCodeAt(wsAfter) === 32 || line.charCodeAt(wsAfter) === 9)) wsAfter++;
+            if (wsAfter < line.length - 1 && line.charCodeAt(wsAfter) === 33 && line.charCodeAt(wsAfter + 1) === 91) {
+              emit('\n\n');
+              nextIdx = wsAfter;
+            }
+            i = nextIdx;
+            lastCopyIdx = i;
+            continue;
+          }
+
+          if (href.startsWith('#') && /^skip to (?:main )?content$/i.test(tok.rawLabel.trim())) {
+            emit(line.slice(lastCopyIdx, i));
+            while (nextIdx < line.length && (line.charCodeAt(nextIdx) === 32 || line.charCodeAt(nextIdx) === 9)) nextIdx++;
+            i = nextIdx;
+            lastCopyIdx = i;
+            continue;
+          }
+
+          let labelOut = tok.rawLabel;
+          if (labelOut.includes('](') || labelOut.includes('<')) {
+            labelOut = sanitizeAndResolveMarkdownProseLinksLinear(labelOut, { baseUrl, includeImages });
+          }
+          if (/^https?:\/\//i.test(href) && labelOut.endsWith(`(${href})`)) {
+            const trimmedPrefix = labelOut.slice(0, labelOut.length - href.length - 2).trimEnd();
+            if (trimmedPrefix) labelOut = trimmedPrefix;
+          }
+          if (/^https?:\/\//i.test(href)) {
+            let trail = nextIdx;
+            while (trail < line.length && (line.charCodeAt(trail) === 32 || line.charCodeAt(trail) === 9)) trail++;
+            if (line.charCodeAt(trail) === 40 && line.startsWith(href, trail + 1) && line.charCodeAt(trail + 1 + href.length) === 41) {
+              nextIdx = trail + 2 + href.length;
+            }
+          }
+
+          const prevCharCode = i > lastCopyIdx ? line.charCodeAt(i - 1) : lastEmittedCode;
+          emit(line.slice(lastCopyIdx, i));
+          if (spaceAdjacentAlnum && /^https?:\/\//i.test(href) && prevCharCode > 0 && isAsciiAlnumCode(prevCharCode)) {
+            emit(' ');
+          }
+          emit(`[${labelOut}](${href}${tok.titleSuffix})`);
+          if (spaceAdjacentAlnum && /^https?:\/\//i.test(href) && nextIdx < line.length && isAsciiAlnumCode(line.charCodeAt(nextIdx))) {
+            emit(' ');
+          }
+          i = nextIdx;
+          lastCopyIdx = i;
+          continue;
         }
-
-        i++;
       }
-      return lastCopyIdx === 0 ? line : out + line.slice(lastCopyIdx);
-    });
-  return neutralizeResidualDangerousLinkDestinations(resolvedLines.join('\n'));
-}
 
-function isResidualHtmlStartChar(c: number): boolean {
-  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 47 || c === 33 || c === 63;
+      i++;
+    }
+    return lastCopyIdx === 0 ? line : out + line.slice(lastCopyIdx);
+  });
+  return neutralizeAllUnsafeMarkdownLinksLinear(resolvedLines.join('\n'));
 }
 
 /**
- * `R3-H2` defense-in-depth: escapes any residual raw `<tag`, `</tag`, `<!--`, `<!`, or `<?` outside fenced code blocks
- * and inline backtick code spans so raw HTML/XSS tags can never survive into final Markdown prose.
+ * `H1` Fail-Closed Rule: outside recognized CommonMark fenced code blocks, escape EVERY `<` to `&lt;` —
+ * **including inside inline backtick code spans `` `...` ``** — so parser disagreements can NEVER materialize live HTML tags!
  */
 function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMarkers = false): string {
-  if (!prose || !prose.includes('<')) return prose;
-  const residualLines = prose.split('\n');
-  const residualPoisoned = computeTickPoisonedLines(residualLines);
-  let sawBracketInPara = false;
-  let inBlockquote = false;
-  let inList = false;
-  return residualLines
-    .map((line, lineIdx) => {
-      const breakKind = detectParagraphBreakKind(line, { inBlockquote, inList });
-      const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
-      const leadChar = !isBlank && bytePos < line.length ? line.charCodeAt(bytePos) : 0;
-      if (breakKind === 'blank_or_atomic') {
-        sawBracketInPara = false;
-        inBlockquote = false;
-        inList = false;
-      } else {
-        if (breakKind === 'block_start' || breakKind === 'atx_heading') sawBracketInPara = false;
-        inBlockquote = !isBlank && cols <= 3 && leadChar === 62;
-        if (
-          !isBlank &&
-          cols <= 3 &&
-          (((leadChar === 45 || leadChar === 42 || leadChar === 43) && bytePos + 1 < line.length && line.charCodeAt(bytePos + 1) === 32) ||
-            (leadChar >= 48 && leadChar <= 57 && /^\d{1,9}[.)] /.test(line.slice(bytePos, bytePos + 12))))
-        ) {
-          inList = true;
-        }
-      }
-      if (!line.includes('<')) {
-        if (line.includes('[')) {
-          const cursors = createMarkdownLineScanCursors();
-          let p = 0;
-          while (p < line.length) {
-            const pc = line.charCodeAt(p);
-            if (pc === 96 && residualPoisoned[lineIdx] === 0 && !isBackslashEscapedAt(line, p)) {
-              const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, p, cursors);
-              p = spanEnd > 0 ? spanEnd : tickEnd;
-              continue;
-            }
-            if (pc === 91 && !isBackslashEscapedAt(line, p)) {
-              sawBracketInPara = true;
-              break;
-            }
-            p++;
-          }
-        }
-        if (breakKind === 'atx_heading') sawBracketInPara = false;
-        return line;
-      }
-      if (allowPdfPageMarkers && /^<!-- page \d{1,6} -->$/.test(line.trim())) {
-        return line;
-      }
-      const isTableRow = line.trimStart().startsWith('|');
-      const cursors = createMarkdownLineScanCursors();
-      let nextGtIdx = -1;
-      let noGtAfter = false;
-      let out = '';
-      let lastIdx = 0;
-      let i = 0;
-      while (i < line.length) {
-        const ch = line.charCodeAt(i);
-        if (ch === 91 && !isBackslashEscapedAt(line, i)) {
-          sawBracketInPara = true;
-        }
-        if (ch === 96 && residualPoisoned[lineIdx] === 0) {
-          if (isBackslashEscapedAt(line, i)) {
-            i++;
-            continue;
-          }
-          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
-          if (
-            spanEnd > 0 &&
-            !(isTableRow && line.slice(i, spanEnd).includes('|')) &&
-            !isRiskyAdjacentCodeSpanAt(line, i, spanEnd, sawBracketInPara)
-          ) {
-            i = spanEnd;
-          } else {
-            i = tickEnd;
-          }
-          continue;
-        }
-        if (ch === 60 && i + 1 < line.length) {
-          const nextCode = line.charCodeAt(i + 1);
-          if (isResidualHtmlStartChar(nextCode)) {
-            // Preserve valid `<https://...>` and `<mailto:...>` autolinks if not already converted (monotonic `>` cursor).
-            if (!noGtAfter && (nextCode === 104 || nextCode === 72 || nextCode === 109 || nextCode === 77)) {
-              if (nextGtIdx <= i) {
-                nextGtIdx = line.indexOf('>', i + 1);
-                if (nextGtIdx < 0) noGtAfter = true;
-              }
-              if (!noGtAfter && nextGtIdx > i + 2 && nextGtIdx - i <= 2_048) {
-                const candidate = line.slice(i + 1, nextGtIdx);
-                if (/^(?:https?:\/\/\S+|mailto:[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)$/i.test(candidate)) {
-                  i = nextGtIdx + 1;
-                  continue;
-                }
-              }
-            }
-            out += `${line.slice(lastIdx, i)}&lt;`;
-            i++;
-            lastIdx = i;
-            continue;
-          }
-        }
-        i++;
-      }
-      if (breakKind === 'atx_heading') sawBracketInPara = false;
-      return lastIdx === 0 ? line : out + line.slice(lastIdx);
-    })
-    .join('\n');
+  return escapeAllResidualLtInProseLinear(prose, allowPdfPageMarkers);
 }
 
 function escapeResidualHtmlOutsideCodeLinear(md: string, allowPdfPageMarkers = false): string {
-  if (!md || !md.includes('<')) return md;
+  if (!md) return md;
+  const needsLt = md.includes('<');
+  const needsLinks = md.includes('](') || md.includes(']:');
+  if (!needsLt && !needsLinks) return md;
   return splitMarkdownByCodeFences(md)
-    .map((part, idx) => (idx % 2 === 1 ? part : escapeResidualHtmlInMarkdownProseLinear(part, allowPdfPageMarkers)))
+    .map((part, idx) => {
+      if (idx % 2 === 1) return part;
+      const safeLinks = needsLinks ? neutralizeAllUnsafeMarkdownLinksLinear(part) : part;
+      return needsLt ? escapeAllResidualLtInProseLinear(safeLinks, allowPdfPageMarkers) : safeLinks;
+    })
     .join('');
 }
 
-/** Decodes HTML entities in Markdown prose EXCEPT `<` (`&lt;`, `&#60;`, `&#x3c;`) so escaped tag examples never re-materialize as raw HTML. */
+/** Decodes HTML entities in Markdown prose EXCEPT `<` (`&lt;`, `&#60;`, `&#x3c;`) in 1 idempotent O(N) pass. */
 function decodeMarkdownEntitiesPreservingLt(prose: string): string {
   if (!prose || !prose.includes('&')) return prose;
-  const guarded = prose.replace(/&(?:lt|LT|#0*60|#[xX]0*3[cC]);/g, '\u0000EFLT\u0000');
+  if (!/&(?!lt;|LT;)/.test(prose)) return prose;
+  const collapsedAmp = prose.replace(/&(?:amp;|#0*38;?|#[xX]0*26;?)+(?=(?:#\d|#[xX][0-9a-fA-F]|[a-zA-Z][a-zA-Z0-9]{1,15};))/gi, '&');
+  const guarded = collapsedAmp.replace(/&(?:lt;|LT;|#0*60;?|#[xX]0*3[cC];?)/g, '\u0000EFLT\u0000');
   return decodeHtmlEntities(guarded).replace(/\u0000EFLT\u0000/g, '&lt;');
 }
 
@@ -6431,22 +6275,22 @@ function cleanCodeFenceSegment(rawFenceBlock: string): string {
   if (
     fenceBlock.length < 32_768 &&
     fenceBlock.includes('schema.org') &&
-    /^`{3,}json[ \t]*\r?\n\{\s*"@context"\s*:\s*"https?:\/\/schema\.org"[^\r\n]{100,}\r?\n`{3,}$/i.test(fenceBlock.trim())
+    /^`{3,}json[ \t]*\r?\n\{\s*"@context"\s*:\s*"https?:\/\/schema\.org"[^\r\n]{80,}\r?\n`{3,}$/i.test(fenceBlock.trim())
   ) {
     return '';
   }
   const nlIdx = fenceBlock.indexOf('\n');
   if (nlIdx === -1) {
-    const m1 = /^([ ]{0,3}(?:`{3,}|~{3,}))(.*)$/.exec(fenceBlock.replace(/\r$/, ''));
+    const m1 = /^([ ]{0,16}(?:`{3,}|~{3,}))(.*)$/.exec(fenceBlock.replace(/\r$/, ''));
     return m1 ? `${m1[1]!}${cleanFenceInfoStringLinear(m1[2]!)}` : fenceBlock.replace(/</g, '&lt;');
   }
   const rawHeader = fenceBlock.slice(0, nlIdx).replace(/\r$/, '');
-  const headerOpenMatch = /^([ ]{0,3}(?:`{3,}|~{3,}))(.*)$/.exec(rawHeader);
+  const headerOpenMatch = /^([ ]{0,16}(?:`{3,}|~{3,}))(.*)$/.exec(rawHeader);
   const fencePrefix = headerOpenMatch ? headerOpenMatch[1]! : '';
   const rawInfo = headerOpenMatch ? headerOpenMatch[2]! : '';
   const cleanHeader = fencePrefix ? `${fencePrefix}${cleanFenceInfoStringLinear(rawInfo)}` : rawHeader.slice(0, 256).replace(/</g, '&lt;');
 
-  const closeMatch = /\r?\n([ ]{0,3}(?:`{3,}|~{3,})[ \t]*)$/.exec(fenceBlock);
+  const closeMatch = /\r?\n([ ]{0,16}(?:`{3,}|~{3,})[ \t]*)$/.exec(fenceBlock);
   if (!closeMatch) {
     return `${cleanHeader}${fenceBlock.slice(nlIdx)}`;
   }
@@ -6476,10 +6320,19 @@ function cleanCodeFenceSegment(rawFenceBlock: string): string {
 
 function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
   if (!md) return '';
-  let boundedInput = md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md;
-  if (boundedInput.includes('\u0000')) boundedInput = boundedInput.replace(/\u0000/g, '');
+  let boundedInput = md;
+  if (boundedInput.length > MAX_MARKDOWN_SANITIZE_CHARS) {
+    let cut = MAX_MARKDOWN_SANITIZE_CHARS;
+    const prev = boundedInput.charCodeAt(cut - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) cut--;
+    boundedInput = boundedInput.slice(0, cut);
+  }
   let withoutMintlifyBanner = stripInvisibleSmugglingChars(boundedInput);
-  if (withoutMintlifyBanner.includes('\r')) withoutMintlifyBanner = withoutMintlifyBanner.replace(/\r(?!\n)/g, '\n');
+  if (withoutMintlifyBanner.includes('\r')) {
+    withoutMintlifyBanner = withoutMintlifyBanner.replace(/\r\n?/g, '\n');
+  }
+  withoutMintlifyBanner = parseMarkdownFrontmatter(withoutMintlifyBanner).body.trim();
+  if (!withoutMintlifyBanner) return '';
   if (withoutMintlifyBanner.slice(0, 256).includes('Documentation Index')) {
     withoutMintlifyBanner = withoutMintlifyBanner.replace(
       /^\s*>\s*##\s*Documentation Index[ \t]*\r?\n>\s*Fetch the complete documentation index at:\s*\S+[ \t]*\r?\n>\s*Use this file to discover all available pages before exploring further\.[ \t]*\r?\n+/i,
@@ -6504,12 +6357,12 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
 
   const hardenedInput = hardenMarkdownFenceStructure(withoutMintlifyBanner);
   const parts = splitMarkdownByCodeFences(hardenedInput);
-  return parts
+  const joined = parts
     .map((part, idx) => {
       if (idx % 2 === 1) {
         return cleanCodeFenceSegment(part);
       }
-      let proseWork = detachBareUrlsFromCodeSpansLinear(part);
+      let proseWork = escapeGfmTaskListCheckboxesLinear(detachBareUrlsFromCodeSpansLinear(part));
       // Strip JSX / MDX inline comments (`{/*reference*/}`, `{/* ... */}`) outside code fences in linear O(N) time.
       if (proseWork.includes('{/*')) {
         let outJsx = '';
@@ -6531,20 +6384,21 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
         proseWork = outJsx;
       }
 
-      // Stash inline backtick code spans (`...`) BEFORE HTML sanitization so `<script>` / `<T>` inside backticks stay untouched.
+      // Stash inline backtick code spans (`...`) ONLY across HTML tag conversion so `<script>` inside backticks
+      // becomes `&lt;script>` in the final fail-closed pass rather than being erased to empty backticks `` ``.
       const inlineCodeStash: string[] = [];
-      if (proseWork.includes('<') || proseWork.includes(':::')) {
+      if (proseWork.includes('<') || proseWork.includes(':::') || proseWork.includes('&')) {
         proseWork = stashMarkdownInlineCodeSpansLinear(proseWork, inlineCodeStash);
       }
 
       // Strip HTML comments, dangerous active/script/style/svg/form subtrees, and hidden (`display:none` / `[hidden]`) subtrees linearly.
       if (proseWork.includes('<!--')) {
         if (allowPdfPageMarkers) {
-          proseWork = proseWork.replace(/^([ \t]*)<!-- page (\d{1,6}) -->([ \t]*)$/gm, '$1\u0000EFPDFPAGE$2\u0000$3');
+          proseWork = proseWork.replace(/^([ \t]*)<!-- (page |pdf-page: )(\d{1,6}) -->([ \t]*)$/gm, '$1\u0000EFPDFPAGE:$2:$3\u0000$4');
         }
-        proseWork = stripHtmlCommentsLinear(proseWork, MAX_HTML_SCAN_CHARS);
-        if (allowPdfPageMarkers && proseWork.includes('\u0000EFPDFPAGE')) {
-          proseWork = proseWork.replace(/\u0000EFPDFPAGE(\d{1,6})\u0000/g, '<!-- page $1 -->');
+        proseWork = stripHtmlCommentsLinear(proseWork, MAX_MARKDOWN_SANITIZE_CHARS);
+        if (allowPdfPageMarkers && proseWork.includes('\u0000EFPDFPAGE:')) {
+          proseWork = proseWork.replace(/\u0000EFPDFPAGE:(page |pdf-page: ):(\d{1,6})\u0000/g, '<!-- $1$2 -->');
         }
       }
       if (proseWork.includes('<') && proseWork.includes('>')) {
@@ -6553,7 +6407,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
             proseWork,
             ['script', 'style', 'iframe', 'object', 'embed', 'applet', 'svg', 'math', 'form', 'noscript', 'template', 'head', 'meta', 'link', 'base'],
             '',
-            MAX_HTML_SCAN_CHARS,
+            MAX_MARKDOWN_SANITIZE_CHARS,
           );
         }
         if (/(?:hidden|style|role|class)/i.test(proseWork)) {
@@ -6563,7 +6417,6 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
 
       if (proseWork.includes(':::')) {
         proseWork = proseWork
-          // Convert VitePress / Docusaurus `:::` / `::::` admonition containers into clean bold callout headers and strip layout containers.
           .replace(
             /^[ \t]*:{3,}[ \t]*(info|tip|note|warning|caution|danger|important|details)(?:[ \t]+([^\r\n]{1,200}))?[ \t]*$/gim,
             (_m, kindRaw: string, customTitle?: string) => {
@@ -6586,6 +6439,41 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
             if (!label || hasDangerousUriScheme(rawHref)) return label;
             return `\n\n${'#'.repeat(Number(lvl))} [${label}](${rawHref})\n\n`;
           });
+        }
+
+        if (proseWork.includes('</') && asciiLower(proseWork).includes('<table')) {
+          proseWork = replacePairedHtmlElementsLinear(
+            proseWork,
+            ['table'],
+            (full, _tag, _attrStr, inner) => {
+              const lowInner = asciiLower(inner);
+              if (inner.length > 16_384 || lowInner.includes('<table') || lowInner.includes('<pre')) {
+                return full;
+              }
+              const rows: string[][] = [];
+              replacePairedHtmlElementsLinear(inner, ['tr'], (_rf, _rt, _ra, rowInner) => {
+                const cells: string[] = [];
+                replacePairedHtmlElementsLinear(rowInner, ['th', 'td'], (_cf, _ct, _ca, cellInner) => {
+                  const cellTxt = cleanInlineHtml(cellInner).replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim();
+                  cells.push(cellTxt);
+                  return '';
+                });
+                if (cells.length > 0) rows.push(cells);
+                return '';
+              });
+              if (rows.length === 0 || rows[0]!.length === 0) return full;
+              const colCount = rows[0]!.length;
+              const fmtRow = (r: string[]) => {
+                const padded: string[] = [];
+                for (let ci = 0; ci < colCount; ci++) padded.push(r[ci] ?? '');
+                return `| ${padded.join(' | ')} |`;
+              };
+              const lines = [fmtRow(rows[0]!), `| ${Array.from({ length: colCount }, () => '---').join(' | ')} |`];
+              for (let ri = 1; ri < rows.length; ri++) lines.push(fmtRow(rows[ri]!));
+              return `\n\n${lines.join('\n')}\n\n`;
+            },
+            { maxChars: MAX_MARKDOWN_SANITIZE_CHARS },
+          );
         }
 
         if (proseWork.includes('</')) {
@@ -6616,7 +6504,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
               if (!label) return '';
               return href ? `[${label}](${href})` : label;
             },
-            { maxChars: MAX_HTML_SCAN_CHARS },
+            { maxChars: MAX_MARKDOWN_SANITIZE_CHARS },
           );
 
           proseWork = replacePairedHtmlElementsLinear(
@@ -6638,11 +6526,10 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
               if (tag === 'em' || tag === 'i') return `*${txt}*`;
               return /^[\d,\s-]+$/.test(txt) ? ` [${txt}]` : `^${txt}`;
             },
-            { maxChars: MAX_HTML_SCAN_CHARS },
+            { maxChars: MAX_MARKDOWN_SANITIZE_CHARS },
           );
         }
 
-        // Single linear quote-aware tag pass with monotonic O(1) amortized line-bounds cursor (`< 5 ms` on `<br>`.repeat(100k) and `<A HREF="x">`.repeat(50k)).
         let curLineStart = 0;
         const firstNl = proseWork.indexOf('\n');
         let curLineEnd = firstNl < 0 ? proseWork.length : firstNl;
@@ -6672,6 +6559,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
               return '\n\n---\n\n';
             }
             if (tag.tagNameLower === 'img' && !tag.isClosing) {
+              if (/\bon[a-z]+\s*=/i.test(tag.attrs)) return '';
               const attrs = parseTagAttrs(tag.attrs);
               const resolvedSrc = resolveHttpsHref(attrs.src ?? attrs['data-src'], baseUrl);
               const alt = cleanInlineHtml(attrs.alt ?? '');
@@ -6697,6 +6585,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
             }
             if (
               tag.tagNameLower === 'u' ||
+              tag.tagNameLower === 'sub' ||
               tag.tagNameLower === 'details' ||
               tag.tagNameLower === 'span' ||
               tag.tagNameLower === 'div' ||
@@ -6714,7 +6603,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
             }
             return tag.rawTag;
           },
-          MAX_HTML_SCAN_CHARS,
+          MAX_MARKDOWN_SANITIZE_CHARS,
           false,
         );
       }
@@ -6727,7 +6616,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
         proseWork = proseWork.replace(/\u0000EFMDINLINE(\d+)\u0000/g, (_m, sIdx: string) => inlineCodeStash[Number(sIdx)] ?? '');
       }
 
-      if (proseWork.toLowerCase().includes('helpful?')) {
+      if (proseWork.includes('?') && proseWork.toLowerCase().includes('helpful?')) {
         proseWork = proseWork.replace(
           /(?:^|\n)Was this (?:page )?helpful\?[ \t]*(?:\n+(?:Yes[ \t]*No|Yes[ \t]*\/[ \t]*No))?[ \t]*(?=\n|$)/gi,
           '\n',
@@ -6745,29 +6634,20 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
         }
       }
 
-      const detachedAfterRestore = detachBareUrlsFromCodeSpansLinear(proseWork);
+      const detachedAfterRestore = escapeGfmTaskListCheckboxesLinear(detachBareUrlsFromCodeSpansLinear(proseWork));
       const resolvedProse = sanitizeAndResolveMarkdownProseLinksLinear(detachedAfterRestore, { baseUrl, includeImages: true });
-      return escapeResidualHtmlInMarkdownProseLinear(resolvedProse, allowPdfPageMarkers).replace(/\n{3,}/g, '\n\n');
+      const escapedProse = escapeAllResidualLtInProseLinear(resolvedProse, allowPdfPageMarkers);
+      return escapedProse.includes('\n\n\n') ? escapedProse.replace(/\n{3,}/g, '\n\n') : escapedProse;
     })
     .map((part, idx) => (idx % 2 === 1 ? part : dedupeConsecutiveStandaloneLinkParagraphs(part)))
     .join('');
+
+  return trimAsciiWhitespaceLinear(joined);
 }
 
 export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
   if (!md) return '';
-  let cur = sanitizeInlineHtmlInMarkdownSinglePass(md, baseUrl, allowPdfPageMarkers);
-  if (!cur) return '';
-  // Fast exit when output contains no HTML/link/entity constructs that could re-interact across passes (`ticks-inc` 2 MiB `< 15 ms`!)
-  if (!cur.includes('<') && !cur.includes('](') && !cur.includes(']:') && !cur.includes('&')) {
-    return cur;
-  }
-  for (let pass = 0; pass < 3; pass++) {
-    const again = sanitizeInlineHtmlInMarkdownSinglePass(cur, baseUrl, allowPdfPageMarkers);
-    if (again === cur) return cur;
-    cur = again;
-  }
-  // Fail closed if adversarial input did not converge within 4 total passes
-  return escapeResidualHtmlOutsideCodeLinear(cur, allowPdfPageMarkers).replace(/\]\((?=[ \t]*[a-zA-Z]+:)/g, ']\\ (');
+  return sanitizeInlineHtmlInMarkdownSinglePass(md, baseUrl, allowPdfPageMarkers);
 }
 
 function sanitizeFrontmatterFieldText(raw: string): string {
@@ -6790,11 +6670,15 @@ export function parseMarkdownFrontmatter(md: string): { title?: string; descript
   while (afterClose < head.length && head.charCodeAt(afterClose) === 10) afterClose++;
 
   const fmBlock = head.slice(4, closeIdx);
+  let hasYamlKv = false;
   let title: string | undefined;
   let description: string | undefined;
   for (const line of fmBlock.split('\n')) {
-    const kv = /^([a-zA-Z0-9_-]{1,64})[ \t]*:[ \t]*(.+)$/.exec(line.trim());
+    const trimmedLine = line.trim();
+    if (!trimmedLine || trimmedLine.startsWith('#')) continue;
+    const kv = /^([a-zA-Z0-9_-]{1,64})[ \t]*:[ \t]*(.*)$/.exec(trimmedLine);
     if (!kv) continue;
+    hasYamlKv = true;
     const k = kv[1]!.toLowerCase();
     const v = kv[2]!.trim().replace(/^(['"])([\s\S]*)\1$/, '$2').trim();
     if (k === 'title' && v && !title) {
@@ -6806,6 +6690,7 @@ export function parseMarkdownFrontmatter(md: string): { title?: string; descript
       if (cleanDesc) description = cleanDesc;
     }
   }
+  if (!hasYamlKv) return { body: md };
 
   // Advance past the matching `---` + blank lines in the original string (handling `\r\n` cleanly).
   const rawCloseMatch = /^---\r?\n[\s\S]{1,4004}?\r?\n---(?:\r?\n+|$)/.exec(md.slice(0, 4_300));
@@ -6936,7 +6821,7 @@ export function extractMarkdownLinksAndImages(
  * Bidi overrides/isolates, zero-width / soft-hyphen characters, ANSI CSI sequences, and raw ASCII C0/DEL control bytes.
  */
 export function stripInvisibleSmugglingChars(s: string): string {
-  if (!s) return s;
+  if (!s || !/[^\x09\x0A\x0D\x20-\x7E]/.test(s)) return s;
   return s
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
     .replace(
@@ -6946,7 +6831,7 @@ export function stripInvisibleSmugglingChars(s: string): string {
 }
 
 function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
-  const bounded = md.length > MAX_HTML_SCAN_CHARS ? md.slice(0, MAX_HTML_SCAN_CHARS) : md;
+  const bounded = md.length > MAX_MARKDOWN_SANITIZE_CHARS ? md.slice(0, MAX_MARKDOWN_SANITIZE_CHARS) : md;
   const parts = splitMarkdownByCodeFences(bounded);
   const withoutSchemaFences = parts
     .map((part, idx) => {
@@ -6966,7 +6851,7 @@ function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
       return part;
     })
     .join('');
-  // `R3-M3`: Always run full `sanitizeInlineHtmlInMarkdown` + dangerous link scheme stripping + residual `<tag` escaping on `origin-markdown`!
+  // `R3-M3`: Always run full `sanitizeInlineHtmlInMarkdown` + dangerous link scheme stripping + residual `<` escaping on `origin-markdown`!
   return sanitizeInlineHtmlInMarkdown(withoutSchemaFences, baseUrl);
 }
 
@@ -6999,10 +6884,11 @@ export function sliceMarkdownWithOffsetAndMaxChars(
     if (paraBreak >= minCut) cut = paraBreak;
     else if (lineBreak >= minCut) cut = lineBreak;
     else if (spaceBreak >= minCut) cut = spaceBreak;
-    const rawSliced = windowSrc.slice(0, cut).replace(/[ \t\r\n]+$/g, '');
-    const nextOffset = safeOffset + rawSliced.length;
+    const rawSliced = trimTrailingAsciiWhitespaceLinear(windowSrc.slice(0, cut));
+    const step = rawSliced.length > 0 ? rawSliced.length : cut;
+    const nextOffset = Math.min(totalChars, safeOffset + step);
     const remainingChars = Math.max(0, totalChars - nextOffset);
-    const closed = closeUnclosedCodeAfterSlice(rawSliced, allowPdfPageMarkers);
+    const closed = sanitizeMarkdownPageSlice(fullMd, safeOffset, rawSliced, allowPdfPageMarkers);
     return {
       markdown: closed,
       truncated: true,
@@ -7012,7 +6898,7 @@ export function sliceMarkdownWithOffsetAndMaxChars(
       remainingChars,
     };
   }
-  const cleanSlice = safeOffset > 0 ? closeUnclosedCodeAfterSlice(windowSrc, allowPdfPageMarkers) : windowSrc;
+  const cleanSlice = sanitizeMarkdownPageSlice(fullMd, safeOffset, windowSrc, allowPdfPageMarkers);
   return {
     markdown: cleanSlice,
     truncated: false,
@@ -7024,116 +6910,7 @@ export function sliceMarkdownWithOffsetAndMaxChars(
 }
 
 function closeTruncatedMarkdownStructures(sliced: string, allowPdfPageMarkers = false): string {
-  // 1. Check CommonMark fenced code block state across `sliced` (honoring backtick info-string rule & list container indent)
-  let inFence = false;
-  let fenceChar = '';
-  let fenceLen = 0;
-  let fenceIndent = 0;
-  let activeListIndent = 0;
-  const lines = sliced.split('\n');
-  for (let li = 0; li < lines.length; li++) {
-    const raw = lines[li]!.endsWith('\r') ? lines[li]!.slice(0, -1) : lines[li]!;
-    const { cols, bytePos, isBlank } = measureLeadingIndentCols(raw);
-    if (inFence) {
-      if (!isBlank && fenceIndent > 0 && cols < fenceIndent) {
-        inFence = false;
-        fenceChar = '';
-        fenceLen = 0;
-        fenceIndent = 0;
-        activeListIndent = 0;
-      } else {
-        const maxCloseIndent = fenceIndent > 0 ? fenceIndent + 3 : 3;
-        if (cols <= maxCloseIndent && bytePos === cols) {
-          let p = bytePos;
-          const fcCode = fenceChar.charCodeAt(0);
-          while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
-          const runLen = p - bytePos;
-          if (runLen >= fenceLen) {
-            while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
-            if (p === raw.length) {
-              inFence = false;
-              fenceChar = '';
-              fenceLen = 0;
-              fenceIndent = 0;
-              continue;
-            }
-          }
-        }
-        continue;
-      }
-    }
-    if (!isBlank && activeListIndent > 0 && cols < activeListIndent) {
-      activeListIndent = 0;
-    }
-    const listCol = detectListItemContentCol(raw, cols, bytePos);
-    if (listCol > 0) activeListIndent = listCol;
-    const minCols = activeListIndent > 0 ? activeListIndent : 0;
-    const maxCols = minCols + 3;
-    if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos === cols && bytePos + 3 <= raw.length) {
-      const c0 = raw.charCodeAt(bytePos);
-      if (c0 === 96 || c0 === 126) {
-        let fEnd = bytePos + 1;
-        while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
-        const fLen = fEnd - bytePos;
-        if (fLen >= 3 && !(c0 === 96 && raw.slice(fEnd).includes('`'))) {
-          inFence = true;
-          fenceChar = c0 === 96 ? '`' : '~';
-          fenceLen = fLen;
-          fenceIndent = activeListIndent > 0 ? activeListIndent : 0;
-        }
-      }
-    }
-  }
-
-  if (inFence) {
-    return `${sliced}\n${' '.repeat(fenceIndent)}${fenceChar.repeat(fenceLen)}`;
-  }
-
-  // 2. Outside fenced code blocks, detect any unclosed inline backtick code span in the final prose paragraph (`A1` truncation fix)
-  const parts = splitMarkdownByCodeFences(sliced);
-  const tailProse = parts[parts.length - 1] ?? '';
-  let closed = sliced;
-  if (tailProse.includes('`')) {
-    const tailLines = tailProse.split('\n');
-    let paraStart = 0;
-    let inBq = false;
-    let inLst = false;
-    for (let li = 0; li < tailLines.length; li++) {
-      const line = tailLines[li]!;
-      const bk = detectParagraphBreakKind(line, { inBlockquote: inBq, inList: inLst });
-      const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
-      const lc = !isBlank && bytePos < line.length ? line.charCodeAt(bytePos) : 0;
-      if (bk !== 'none') paraStart = li + (bk === 'blank_or_atomic' ? 1 : 0);
-      inBq = !isBlank && cols <= 3 && lc === 62;
-      if (!isBlank && cols <= 3 && ((lc === 45 || lc === 42 || lc === 43) || (lc >= 48 && lc <= 57))) inLst = true;
-    }
-    const lastPara = tailLines.slice(paraStart).join('\n');
-    if (lastPara.includes('`')) {
-      const paraCursors = createMarkdownLineScanCursors();
-      let openTickLen = 0;
-      let p = 0;
-      while (p < lastPara.length) {
-        if (lastPara.charCodeAt(p) === 96 && !isBackslashEscapedAt(lastPara, p)) {
-          const { tickEnd, spanEnd } = scanCodeSpanEndLinear(lastPara, p, paraCursors);
-          if (spanEnd < 0) {
-            openTickLen = tickEnd - p;
-            break;
-          }
-          p = spanEnd;
-          continue;
-        }
-        p++;
-      }
-      if (openTickLen > 0) {
-        const pad = closed.endsWith('`') ? ' ' : '';
-        closed = `${closed}${pad}${'`'.repeat(openTickLen)}`;
-      }
-    }
-  }
-  const safeHtml = escapeResidualHtmlOutsideCodeLinear(closed, allowPdfPageMarkers);
-  return splitMarkdownByCodeFences(safeHtml)
-    .map((part, idx) => (idx % 2 === 1 ? part : neutralizeResidualDangerousLinkDestinations(part)))
-    .join('');
+  return sanitizeMarkdownPageSlice(sliced, 0, sliced, allowPdfPageMarkers);
 }
 
 export function finalizeScrapedMarkdown(
@@ -7156,7 +6933,7 @@ export function finalizeScrapedMarkdown(
   frontmatterDescription?: string;
 } {
   const deadlineAt = Date.now() + 2_500;
-  const boundedInput = rawMd.length > MAX_HTML_SCAN_CHARS ? rawMd.slice(0, MAX_HTML_SCAN_CHARS) : rawMd;
+  const boundedInput = rawMd.length > MAX_MARKDOWN_SANITIZE_CHARS ? rawMd.slice(0, MAX_MARKDOWN_SANITIZE_CHARS) : rawMd;
   const fm = opts.isPdf ? { body: boundedInput } : parseMarkdownFrontmatter(boundedInput);
   // Trim Unicode whitespace BEFORE fence hardening (`A_nbsp`, `A_emsp_link`, `A_fm`), NEVER after!
   const bodyTrimmed = fm.body.trim();
@@ -7173,9 +6950,9 @@ export function finalizeScrapedMarkdown(
       )
       .join('');
   }
-  md = escapeResidualHtmlOutsideCodeLinear(md, Boolean(opts.allowPdfPageMarkers))
-    .replace(/\n{3,}/g, '\n\n')
-    .replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '');
+  md = trimAsciiWhitespaceLinear(
+    escapeResidualHtmlOutsideCodeLinear(md, Boolean(opts.allowPdfPageMarkers)).replace(/\n{3,}/g, '\n\n'),
+  );
   const fmMeta = {
     ...(fm.title ? { frontmatterTitle: fm.title } : {}),
     ...(fm.description ? { frontmatterDescription: fm.description } : {}),
@@ -7190,10 +6967,10 @@ export function finalizeScrapedMarkdown(
     if (paraBreak >= minCut) cut = paraBreak;
     else if (lineBreak >= minCut) cut = lineBreak;
     else if (spaceBreak >= minCut) cut = spaceBreak;
-    const rawSliced = md.slice(0, cut).replace(/[ \t\r\n]+$/g, '');
-    const nextOffset = rawSliced.length;
+    const rawSliced = trimTrailingAsciiWhitespaceLinear(md.slice(0, cut));
+    const nextOffset = rawSliced.length > 0 ? rawSliced.length : cut;
     const remainingChars = Math.max(0, totalChars - nextOffset);
-    const sliced = closeTruncatedMarkdownStructures(rawSliced, Boolean(opts.allowPdfPageMarkers));
+    const sliced = sanitizeMarkdownPageSlice(md, 0, rawSliced, Boolean(opts.allowPdfPageMarkers));
     return { markdown: sliced, truncated: true, totalChars, nextOffset, remainingChars, ...fmMeta };
   }
   return { markdown: md, ...fmMeta };
@@ -8605,6 +8382,62 @@ export function extractYouTubeWatchMetadataFromHtml(
   };
 }
 
+function matchesAdapterDomainPattern(hostLower: string, patternRaw: string): boolean {
+  const pat = patternRaw.trim().toLowerCase().replace(/\.$/, '');
+  if (!pat) return false;
+  if (pat.startsWith('*.')) {
+    const suffix = pat.slice(1); // e.g. ".legistar.com"
+    return suffix.length > 1 && hostLower.length > suffix.length && hostLower.endsWith(suffix);
+  }
+  return hostLower === pat;
+}
+
+function isTrustedTwinRedirectUrl(
+  twinId: string | undefined,
+  initialFetchUrl: string,
+  item: Record<string, unknown>,
+  selfHost?: string,
+): boolean {
+  const rawFinal =
+    typeof item.finalUrl === 'string' && item.finalUrl.trim()
+      ? item.finalUrl.trim()
+      : typeof item.url === 'string' && item.url.trim()
+        ? item.url.trim()
+        : '';
+  if (!rawFinal) return true;
+  const checked = validatePublicHttpsTargetUrl(rawFinal, selfHost);
+  if (!checked.ok) return false;
+  const finalHost = checked.url.hostname.toLowerCase().replace(/\.$/, '');
+  let initHost = '';
+  try {
+    initHost = new URL(initialFetchUrl).hostname.toLowerCase().replace(/\.$/, '');
+  } catch {
+    return false;
+  }
+  if (finalHost === initHost) return true;
+  if (!twinId) return false;
+  const adapterMeta = getRegisteredAdapterById(twinId);
+  if (!adapterMeta || !Array.isArray(adapterMeta.domains)) return false;
+  return adapterMeta.domains.some((dom) => matchesAdapterDomainPattern(finalHost, dom));
+}
+
+function parsePolite5xxRetryDelayMs(rawRetryAfter: string | undefined, nowMs: number): number | null {
+  if (!rawRetryAfter || !rawRetryAfter.trim()) return 200;
+  const trimmed = rawRetryAfter.trim();
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const sec = Number(trimmed);
+    if (!Number.isFinite(sec) || sec > 2) return null;
+    return Math.min(2_000, Math.max(0, Math.round(sec * 1_000)));
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (Number.isFinite(parsedDate)) {
+    const deltaMs = parsedDate - nowMs;
+    if (deltaMs > 2_000) return null;
+    return Math.min(2_000, Math.max(0, deltaMs));
+  }
+  return 200;
+}
+
 async function runPdfOcrFallback(params: {
   url: string;
   ocrParam: 'auto' | 'always';
@@ -8614,6 +8447,9 @@ async function runPdfOcrFallback(params: {
   target: 'auto' | 'agent' | 'container';
   site?: string;
   source: string;
+  isPrivate?: boolean;
+  userId?: string;
+  ephemeral?: boolean;
   env: OptionalStorageBindings;
   executeHubFetch: (
     target: 'auto' | 'agent' | 'container',
@@ -8642,7 +8478,7 @@ async function runPdfOcrFallback(params: {
       error: string;
     }
 > {
-  const { url, ocrParam, maxOcrPages, redactPii, headers, target, site, source, env, executeHubFetch } = params;
+  const { url, ocrParam, maxOcrPages, redactPii, headers, target, site, source, isPrivate, userId, ephemeral, env, executeHubFetch } = params;
   const hasService = Boolean(env.PDF_OCR);
   const ocrUrlBase = env.PDF_OCR_URL?.trim().replace(/\/+$/, '') ?? '';
   const ocrToken = env.PDF_OCR_TOKEN?.trim() ?? '';
@@ -8669,14 +8505,16 @@ async function runPdfOcrFallback(params: {
     ],
   };
 
-  const retention: ArtifactRetention | 'off' = env.ARTIFACTS ? 'transient' : 'off';
+  const privatePdf = Boolean(isPrivate) || Boolean(ephemeral) || (userId !== undefined && sanitizeStorageUserId(userId) !== 'owner');
+  const retention: ArtifactRetention | 'off' = !privatePdf && env.ARTIFACTS ? 'transient' : 'off';
+  const hydrateInline = privatePdf || !env.ARTIFACTS;
   const fetchRes = await executeHubFetch(
     target,
     JSON.stringify(rawFetchCall),
     site,
     `${source}:pdf-bytes`,
     retention,
-    !env.ARTIFACTS,
+    hydrateInline,
   );
   if (fetchRes.status !== 200) {
     let errJson: Record<string, unknown> = { ok: false, error: 'scrape_failed' };
@@ -8718,8 +8556,9 @@ async function runPdfOcrFallback(params: {
   }
 
   let pdfBytes: Uint8Array | null = null;
-  const art = item.artifact as { blobSha256?: string; contentSha256?: string; retention?: string } | undefined;
-  if (art?.blobSha256 && env.ARTIFACTS) {
+  const rawArt = item.artifact as { blobSha256?: string; contentSha256?: string; retention?: string } | undefined;
+  const art = !privatePdf ? rawArt : undefined;
+  if (!privatePdf && art?.blobSha256 && env.ARTIFACTS) {
     const loaded = await readVerifiedArtifactFromR2({
       bucket: env.ARTIFACTS,
       blobSha256: art.blobSha256,
@@ -8736,8 +8575,38 @@ async function runPdfOcrFallback(params: {
   if (!pdfBytes && typeof item.body === 'string' && item.body.length > 0) {
     pdfBytes = item.bodyEncoding === 'base64' ? decodeBase64ToBytes(item.body) : new TextEncoder().encode(item.body);
   }
+  if (!pdfBytes && privatePdf && rawArt?.blobSha256 && env.ARTIFACTS) {
+    const rawRet: ArtifactRetention = rawArt.retention === 'stored' ? 'stored' : 'transient';
+    const loaded = await readVerifiedArtifactFromR2({
+      bucket: env.ARTIFACTS,
+      blobSha256: rawArt.blobSha256,
+      preferredRetention: rawRet,
+      expectedContentSha256: rawArt.contentSha256,
+    });
+    await env.ARTIFACTS.delete(r2ArtifactKey(rawRet, rawArt.blobSha256)).catch(() => {});
+    if (loaded.ok) {
+      pdfBytes = loaded.bytes;
+    }
+  }
   if (!pdfBytes || pdfBytes.byteLength === 0 || !hasPdfMagicHeader(pdfBytes)) {
     return { ok: false, error: 'not_a_pdf_payload' };
+  }
+
+  let privateBlobSha: string | undefined;
+  let privateContentSha: string | undefined;
+  if (Boolean(isPrivate) && !Boolean(ephemeral) && env.ARTIFACTS && userId) {
+    try {
+      const writtenPriv = await writePrivateArtifactToR2({
+        bucket: env.ARTIFACTS,
+        userId,
+        rawBytes: pdfBytes,
+        retention: 'stored',
+      });
+      privateBlobSha = writtenPriv.blobSha256;
+      privateContentSha = writtenPriv.contentSha256;
+    } catch {
+      // non-fatal
+    }
   }
 
   const qs = new URLSearchParams({
@@ -8792,8 +8661,8 @@ async function runPdfOcrFallback(params: {
     via: `${fetchRes.via}+pdf-ocr`,
     finalUrl: typeof item.finalUrl === 'string' && item.finalUrl ? item.finalUrl : url,
     status: typeof item.status === 'number' ? item.status : 200,
-    contentSha256: ocrJson.sha256 ?? art?.contentSha256,
-    artifactId: art?.blobSha256,
+    contentSha256: privateContentSha ?? ocrJson.sha256 ?? art?.contentSha256,
+    artifactId: privatePdf ? privateBlobSha : art?.blobSha256,
     markdown: finalMd,
     pdfEngine: pagesOcred > 0 ? 'pymupdf-tesseract-ocr' : 'pymupdf',
     ocr: ocrJson.ocr,
@@ -8816,11 +8685,21 @@ export async function executeScrapeCall(params: {
   selfHost?: string;
   userId?: string;
   now?: number;
+  sleepFn?: (ms: number) => Promise<void>;
   tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; body: Record<string, unknown>; via: string; retryAfter?: string }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
   const runScrape = async (): Promise<{ status: number; body: Record<string, unknown>; via: string; retryAfter?: string }> => {
-  const { payload, env, executeHubFetch, source = 'scrape', selfHost, userId = 'owner', now = Date.now() } = params;
+  const {
+    payload,
+    env,
+    executeHubFetch,
+    source = 'scrape',
+    selfHost,
+    userId = 'owner',
+    now = Date.now(),
+    sleepFn = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+  } = params;
   const urlCheck = validatePublicHttpsTargetUrl(payload.url, selfHost);
   if (!urlCheck.ok) {
     return { status: 400, via: 'hub', body: { ok: false, error: 'invalid_url', message: urlCheck.message } };
@@ -9025,6 +8904,7 @@ export async function executeScrapeCall(params: {
     waitForMsOpt !== undefined ||
     Boolean(waitSelectorOpt) ||
     !includeImages ||
+    Boolean(redactPii) ||
     sortedFormatsForCache.join(',') !== 'markdown';
   const scrapeOptionsHash = await sha256HexString(
     JSON.stringify({
@@ -9040,6 +8920,7 @@ export async function executeScrapeCall(params: {
       waitSelector: waitSelectorOpt ?? '',
       includeImages,
       preferOriginMarkdown,
+      redactPii: Boolean(payload.redactPii),
     }),
   );
 
@@ -9103,7 +8984,26 @@ export async function executeScrapeCall(params: {
       (payload as { preferMcp?: unknown }).preferMcp === true,
     userId,
   });
-  const isPrivateScrape = visibility === 'private';
+  const isPrivateScrape = visibility === 'private' || sanitizeStorageUserId(userId) !== 'owner';
+  const putDerivedMarkdownForScrape = async (mdSha: string, mdContent: string, ver = SCRAPE_PIPELINE_VERSION): Promise<void> => {
+    if (!env.ARTIFACTS || payload.ephemeral === true) return;
+    const derivedKey = isPrivateScrape
+      ? r2PrivateDerivedKey(userId, ver, 'markdown', mdSha)
+      : r2DerivedKey(ver, 'markdown', mdSha);
+    await env.ARTIFACTS
+      .put(derivedKey, mdContent, {
+        httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+        ...(isPrivateScrape
+          ? {
+              customMetadata: {
+                userId: sanitizeStorageUserId(userId),
+                visibility: 'private',
+              },
+            }
+          : {}),
+      })
+      .catch(() => undefined);
+  };
 
   let prevMarkdownForChanges: string | null = null;
   if (stringFormats.has('changes') && env.ARTIFACTS && (isPrivateScrape || env.META)) {
@@ -9144,7 +9044,7 @@ export async function executeScrapeCall(params: {
     });
     const hit: (PrivateCachedScrapeRecord | Awaited<ReturnType<typeof lookupCachedScrape>>) =
       optHit ??
-      (!needsLiveHtml && !hasNonDefaultCacheOptions
+      (!needsLiveHtml && (!hasNonDefaultCacheOptions || redactPii)
         ? isPrivateScrape
           ? await lookupPrivateCachedScrape({
               bucket: env.ARTIFACTS,
@@ -9153,8 +9053,10 @@ export async function executeScrapeCall(params: {
               maxAgeMs,
               pipelineVersion: SCRAPE_PIPELINE_VERSION,
               now,
-            })
-          : env.META
+            }).then((privHit) =>
+              privHit && (!privHit.optionsHash || privHit.optionsHash === scrapeOptionsHash) ? privHit : null,
+            )
+          : env.META && (!hasNonDefaultCacheOptions || redactPii)
             ? await lookupCachedScrape({
                 bucket: env.ARTIFACTS,
                 metaDb: env.META,
@@ -9196,33 +9098,23 @@ export async function executeScrapeCall(params: {
         maxChars,
       });
       let cachedMarkdownArtifactId: string | undefined;
-      if (shaped.truncated && fullCached) {
+      if (shaped.truncated && fullCached && payload.ephemeral !== true) {
         const cachedMdSha = await sha256HexString(fullCached);
         const derivedMdKey = isPrivateScrape
           ? r2PrivateDerivedKey(userId, hit.pipelineVersion, 'markdown', cachedMdSha)
           : r2DerivedKey(hit.pipelineVersion, 'markdown', cachedMdSha);
         const existingMd = await env.ARTIFACTS.head(derivedMdKey).catch(() => null);
         if (!existingMd) {
-          await env.ARTIFACTS
-            .put(derivedMdKey, fullCached, {
-              httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-              ...(isPrivateScrape
-                ? {
-                    customMetadata: {
-                      userId: sanitizeStorageUserId(userId),
-                      visibility: 'private',
-                    },
-                  }
-                : {}),
-            })
-            .catch(() => undefined);
+          await putDerivedMarkdownForScrape(cachedMdSha, fullCached, hit.pipelineVersion);
         }
         cachedMarkdownArtifactId = `md:${cachedMdSha}`;
       }
       const richHit = hit as Partial<PrivateCachedScrapeRecord>;
       const cachedFinalUrl = richHit.finalUrl || normalizedUrl;
-      const cachedTitle = hit.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullCached, normalizedUrl) : undefined);
-      const cachedWordCount = richHit.wordCount ?? (fullCached ? countTextWords(fullCached) : 0);
+      const rawCachedTitle = hit.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullCached, normalizedUrl) : undefined);
+      const cachedTitle = rawCachedTitle ? (redactPii ? redactPiiText(rawCachedTitle) : rawCachedTitle) : undefined;
+      const cachedDesc = richHit.description ? (redactPii ? redactPiiText(richHit.description) : richHit.description) : undefined;
+      const cachedWordCount = redactPii ? (fullCached ? countTextWords(fullCached) : 0) : (richHit.wordCount ?? (fullCached ? countTextWords(fullCached) : 0));
       const cachedFavicon = richHit.favicon ?? defaultFaviconForUrl(cachedFinalUrl);
       const cachedContentType =
         richHit.contentType ?? (isLikelyPdfUrl(normalizedUrl) ? 'application/pdf' : 'text/html; charset=utf-8');
@@ -9266,7 +9158,7 @@ export async function executeScrapeCall(params: {
             : {}),
           metadata: {
             ...(cachedTitle ? { title: cachedTitle } : {}),
-            ...(richHit.description ? { description: richHit.description } : {}),
+            ...(cachedDesc ? { description: cachedDesc } : {}),
             ...(cachedWordCount > 0 ? { wordCount: cachedWordCount } : {}),
             ...(hit.language ? { language: hit.language } : {}),
             ...(cachedFavicon ? { favicon: cachedFavicon } : {}),
@@ -9290,6 +9182,9 @@ export async function executeScrapeCall(params: {
       target,
       site,
       source,
+      isPrivate: isPrivateScrape,
+      userId,
+      ephemeral: Boolean(payload.ephemeral),
       env,
       executeHubFetch,
     });
@@ -9297,18 +9192,10 @@ export async function executeScrapeCall(params: {
       const fullOcrMd = finalizeScrapedMarkdown(forcedOcr.markdown, { isPdf: true, includeImages }).markdown;
       const shaped = finalizeScrapedMarkdown(fullOcrMd, { isPdf: false, includeImages, maxChars });
       let ocrMdArtifactId: string | undefined;
-      if (shaped.truncated && env.ARTIFACTS && fullOcrMd) {
+      if (env.ARTIFACTS && fullOcrMd && payload.ephemeral !== true && (shaped.truncated || isPrivateScrape)) {
         const mdSha = await sha256HexString(fullOcrMd);
-        const ocrDerivedKey = isPrivateScrape
-          ? r2PrivateDerivedKey(userId, SCRAPE_PIPELINE_VERSION, 'markdown', mdSha)
-          : r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha);
-        await env.ARTIFACTS.put(ocrDerivedKey, fullOcrMd, {
-          httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-          ...(isPrivateScrape
-            ? { customMetadata: { userId: sanitizeStorageUserId(userId), visibility: 'private' } }
-            : {}),
-        }).catch(() => undefined);
-        ocrMdArtifactId = `md:${mdSha}`;
+        await putDerivedMarkdownForScrape(mdSha, fullOcrMd);
+        if (shaped.truncated) ocrMdArtifactId = `md:${mdSha}`;
       }
       return {
         status: 200,
@@ -9499,7 +9386,12 @@ export async function executeScrapeCall(params: {
         const atsParsed = JSON.parse(atsRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const atsItem = atsParsed.results?.[0];
         const atsBody = typeof atsItem?.body === 'string' && atsItem.bodyEncoding !== 'base64' ? atsItem.body : '';
-        if ((atsItem?.outcome === 'ok' || (atsItem?.truncated === true && atsItem?.status === 200)) && atsBody.trim().length > 0) {
+        if (
+          atsItem &&
+          isTrustedTwinRedirectUrl(atsSpec.id, atsSpec.fetchUrl, atsItem, selfHost) &&
+          (atsItem.outcome === 'ok' || (atsItem.truncated === true && atsItem.status === 200)) &&
+          atsBody.trim().length > 0
+        ) {
           const filteredBoard =
             jsonFilterStr && atsSpec.id.endsWith('-board')
               ? chunkJsonRecords({
@@ -9529,13 +9421,11 @@ export async function executeScrapeCall(params: {
                     baseUrl: normalizedUrl,
                   })
                 : atsShapedFull;
-            const atsArt = atsItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+            const atsArt = !isPrivateScrape ? (atsItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
             let atsMdArtifactId: string | undefined;
-            if (atsShaped.truncated && env.ARTIFACTS && atsShapedFull.markdown) {
+            if (atsShaped.truncated && env.ARTIFACTS && atsShapedFull.markdown && payload.ephemeral !== true) {
               const mdSha = await sha256HexString(atsShapedFull.markdown);
-              await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), atsShapedFull.markdown, {
-                httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-              }).catch(() => undefined);
+              await putDerivedMarkdownForScrape(mdSha, atsShapedFull.markdown);
               atsMdArtifactId = `md:${mdSha}`;
             }
             const atsTitle = filteredBoard ? filteredBoard.title : formatted!.title;
@@ -9666,13 +9556,11 @@ export async function executeScrapeCall(params: {
                   baseUrl: directGhBlob.rawUrl,
                 })
               : ghShapedFull;
-          const ghArt = ghItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+          const ghArt = !isPrivateScrape ? (ghItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
           let ghMdArtifactId: string | undefined;
-          if (ghShaped.truncated && env.ARTIFACTS && ghShapedFull.markdown) {
+          if (ghShaped.truncated && env.ARTIFACTS && ghShapedFull.markdown && payload.ephemeral !== true) {
             const mdSha = await sha256HexString(ghShapedFull.markdown);
-            await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), ghShapedFull.markdown, {
-              httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-            }).catch(() => undefined);
+            await putDerivedMarkdownForScrape(mdSha, ghShapedFull.markdown);
             ghMdArtifactId = `md:${mdSha}`;
           }
           return {
@@ -9757,13 +9645,11 @@ export async function executeScrapeCall(params: {
                     baseUrl: normalizedUrl,
                   })
                 : patchShapedFull;
-            const ghPatchArt = ghPatchItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+            const ghPatchArt = !isPrivateScrape ? (ghPatchItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
             let patchMdArtifactId: string | undefined;
-            if (patchShaped.truncated && env.ARTIFACTS && patchShapedFull.markdown) {
+            if (patchShaped.truncated && env.ARTIFACTS && patchShapedFull.markdown && payload.ephemeral !== true) {
               const mdSha = await sha256HexString(patchShapedFull.markdown);
-              await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), patchShapedFull.markdown, {
-                httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-              }).catch(() => undefined);
+              await putDerivedMarkdownForScrape(mdSha, patchShapedFull.markdown);
               patchMdArtifactId = `md:${mdSha}`;
             }
             return {
@@ -9829,7 +9715,12 @@ export async function executeScrapeCall(params: {
         const twinParsed = JSON.parse(twinRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const twinItem = twinParsed.results?.[0];
         const twinBody = typeof twinItem?.body === 'string' && twinItem.bodyEncoding !== 'base64' ? twinItem.body : '';
-        if (twinItem?.outcome === 'ok' && twinBody.trim().length > 0) {
+        if (
+          twinItem &&
+          twinItem.outcome === 'ok' &&
+          twinBody.trim().length > 0 &&
+          isTrustedTwinRedirectUrl(registryTwin.id, registryTwin.fetchUrl, twinItem, selfHost)
+        ) {
           const formatted = registryTwin.formatTwin(twinBody, normalizedUrl, (frag, fragBase) => {
             const sub = extractHtmlDocument(frag, {
               baseUrl: fragBase,
@@ -9856,13 +9747,11 @@ export async function executeScrapeCall(params: {
                     baseUrl: normalizedUrl,
                   })
                 : twinShapedFull;
-            const twinArt = twinItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+            const twinArt = !isPrivateScrape ? (twinItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
             let twinMdArtifactId: string | undefined;
-            if (twinShaped.truncated && env.ARTIFACTS && twinShapedFull.markdown) {
+            if (twinShaped.truncated && env.ARTIFACTS && twinShapedFull.markdown && payload.ephemeral !== true) {
               const mdSha = await sha256HexString(twinShapedFull.markdown);
-              await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), twinShapedFull.markdown, {
-                httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-              }).catch(() => undefined);
+              await putDerivedMarkdownForScrape(mdSha, twinShapedFull.markdown);
               twinMdArtifactId = `md:${mdSha}`;
             }
             if (checkPromptInjection) {
@@ -10071,13 +9960,11 @@ export async function executeScrapeCall(params: {
                   baseUrl: normalizedUrl,
                 })
               : compShapedFull;
-          const compArt = compItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+          const compArt = !isPrivateScrape ? (compItem.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
           let compMdArtifactId: string | undefined;
-          if (compShaped.truncated && env.ARTIFACTS && compShapedFull.markdown) {
+          if (compShaped.truncated && env.ARTIFACTS && compShapedFull.markdown && payload.ephemeral !== true) {
             const mdSha = await sha256HexString(compShapedFull.markdown);
-            await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), compShapedFull.markdown, {
-              httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-            }).catch(() => undefined);
+            await putDerivedMarkdownForScrape(mdSha, compShapedFull.markdown);
             compMdArtifactId = `md:${mdSha}`;
           }
           const compTitle = compShapedFull.frontmatterTitle || compAssets.title;
@@ -10224,10 +10111,61 @@ export async function executeScrapeCall(params: {
   }
 
   let fetchResUsed = fetchRes;
-  const parsedReply = JSON.parse(fetchResUsed.bodyText) as {
+  let parsedReply = JSON.parse(fetchResUsed.bodyText) as {
     results?: Array<Record<string, unknown>>;
   };
   let item: Record<string, unknown> = parsedReply.results?.[0] ?? {};
+
+  // Polite 1-retry on transient origin HTTP `502`/`503`/`504` (NEVER on WAF challenges, robots/SSRF/DNS blocks, or Retry-After > 2s!)
+  if (
+    item.outcome !== 'ok' &&
+    (item.status === 502 || item.status === 503 || item.status === 504) &&
+    timeoutMsOpt > 1_000
+  ) {
+    const firstProb = String(item.problem ?? '');
+    const firstRawBody = typeof item.body === 'string' && item.bodyEncoding !== 'base64' ? item.body : '';
+    const firstWaf =
+      (item.waf && typeof item.waf === 'object' ? (item.waf as WafClassification) : null) ??
+      classifyWafAndChallenge({ status: Number(item.status), rawBody: firstRawBody });
+    const isRobotsOrPolicyBlock =
+      item.outcome === 'challenge' ||
+      item.outcome === 'robots_disallowed' ||
+      item.outcome === 'content_signal_disallowed' ||
+      item.outcome === 'skip' ||
+      Boolean(firstWaf) ||
+      /robots\.txt|content-signal/i.test(firstProb) ||
+      isDnsNotFoundError(item.outcome, firstProb) ||
+      isSsrfBlockedError(item.outcome, firstProb);
+    const itemHdrs =
+      item.headers && typeof item.headers === 'object' && !Array.isArray(item.headers)
+        ? (item.headers as Record<string, string | undefined>)
+        : undefined;
+    const rawRetryAfterHdr =
+      typeof item.retryAfter === 'string' && item.retryAfter.trim()
+        ? item.retryAfter
+        : (itemHdrs?.['retry-after'] ?? itemHdrs?.['Retry-After'] ?? fetchResUsed.retryAfter);
+    const retryDelayMs = !isRobotsOrPolicyBlock ? parsePolite5xxRetryDelayMs(rawRetryAfterHdr, now) : null;
+    if (retryDelayMs !== null) {
+      if (retryDelayMs > 0) {
+        await sleepFn(retryDelayMs);
+      }
+      const retryRes = await executeHubFetch(
+        target,
+        JSON.stringify(fetchCall),
+        site,
+        `${source}:retry-5xx`,
+        retentionMode,
+        true,
+        collectionId,
+      );
+      if (retryRes.status === 200) {
+        fetchResUsed = retryRes;
+        parsedReply = JSON.parse(fetchResUsed.bodyText) as { results?: Array<Record<string, unknown>> };
+        item = parsedReply.results?.[0] ?? {};
+      }
+    }
+  }
+
   const isPdfResponse =
     typeof item.pdfEngine === 'string' ||
     (typeof item.contentType === 'string' && item.contentType.toLowerCase().includes('application/pdf')) ||
@@ -10244,6 +10182,9 @@ export async function executeScrapeCall(params: {
         target,
         site,
         source,
+        isPrivate: isPrivateScrape,
+        userId,
+        ephemeral: Boolean(payload.ephemeral),
         env,
         executeHubFetch,
       });
@@ -10251,12 +10192,10 @@ export async function executeScrapeCall(params: {
         const fullRescuedMd = finalizeScrapedMarkdown(rescued.markdown, { isPdf: true, includeImages }).markdown;
         const shaped = finalizeScrapedMarkdown(fullRescuedMd, { isPdf: false, includeImages, maxChars });
         let rescuedMdArtifactId: string | undefined;
-        if (shaped.truncated && env.ARTIFACTS && fullRescuedMd) {
+        if (env.ARTIFACTS && fullRescuedMd && payload.ephemeral !== true && (shaped.truncated || isPrivateScrape)) {
           const mdSha = await sha256HexString(fullRescuedMd);
-          await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdSha), fullRescuedMd, {
-            httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-          }).catch(() => undefined);
-          rescuedMdArtifactId = `md:${mdSha}`;
+          await putDerivedMarkdownForScrape(mdSha, fullRescuedMd);
+          if (shaped.truncated) rescuedMdArtifactId = `md:${mdSha}`;
         }
         return {
           status: 200,
@@ -10264,6 +10203,7 @@ export async function executeScrapeCall(params: {
           body: {
             ok: true,
             cached: false,
+            ...(isPrivateScrape ? { visibility: 'private' as const } : {}),
             pipelineVersion: SCRAPE_PIPELINE_VERSION,
             url: normalizedUrl,
             finalUrl: rescued.finalUrl,
@@ -10503,7 +10443,8 @@ export async function executeScrapeCall(params: {
     ).markdown;
     const revalFocused = applyQueryFocus(fullReval);
     const revalShaped = finalizeScrapedMarkdown(revalFocused.markdown, { isPdf: false, includeImages, maxChars });
-    const revalTitle = revalCandidate.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullReval, normalizedUrl) : undefined);
+    const rawRevalTitle = revalCandidate.title || (isLikelyPdfUrl(normalizedUrl) ? extractPdfTitle(fullReval, normalizedUrl) : undefined);
+    const revalTitle = rawRevalTitle ? (redactPii ? redactPiiText(rawRevalTitle) : rawRevalTitle) : undefined;
     const revalWordCount = fullReval ? countTextWords(fullReval) : 0;
     const revalFavicon = defaultFaviconForUrl(normalizedUrl);
     const revalContentType = isLikelyPdfUrl(normalizedUrl) ? 'application/pdf' : 'text/html; charset=utf-8';
@@ -10827,7 +10768,7 @@ export async function executeScrapeCall(params: {
   } catch {
     prelimHostLower = '';
   }
-  const fetchCommerceTwinBody = async (epUrl: string, tag: string): Promise<string> => {
+  const fetchCommerceTwinBody = async (epUrl: string, tag: string, adapterId: 'shopify' | 'woocommerce'): Promise<string> => {
     const epRes = await executeHubFetch(
       target,
       JSON.stringify({
@@ -10844,7 +10785,8 @@ export async function executeScrapeCall(params: {
     if (epRes.status !== 200) return '';
     const epParsed = JSON.parse(epRes.bodyText) as { results?: Array<Record<string, unknown>> };
     const epItem = epParsed.results?.[0];
-    return epItem?.outcome === 'ok' && typeof epItem.body === 'string' && epItem.bodyEncoding !== 'base64'
+    if (!epItem || !isTrustedTwinRedirectUrl(adapterId, epUrl, epItem, selfHost)) return '';
+    return epItem.outcome === 'ok' && typeof epItem.body === 'string' && epItem.bodyEncoding !== 'base64'
       ? epItem.body
       : '';
   };
@@ -10860,7 +10802,7 @@ export async function executeScrapeCall(params: {
     if (shopTwin) {
       try {
         const htmlCurrency = extractShopifyCurrencyFromHtml(rawBodyStr);
-        const jsonBody = await fetchCommerceTwinBody(shopTwin.jsonUrl, 'shopify-product-json');
+        const jsonBody = await fetchCommerceTwinBody(shopTwin.jsonUrl, 'shopify-product-json', 'shopify');
         if (jsonBody.trim()) {
           let needsJsEnrich = true;
           try {
@@ -10876,7 +10818,7 @@ export async function executeScrapeCall(params: {
             needsJsEnrich = false;
           }
           const jsBody = needsJsEnrich
-            ? await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js').catch(() => '')
+            ? await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js', 'shopify').catch(() => '')
             : '';
           customShopifyDoc = enrichShopifyProductFromJson({
             rawJson: jsonBody,
@@ -10887,7 +10829,7 @@ export async function executeScrapeCall(params: {
           });
           if (customShopifyDoc) customCommerceId = 'shopify';
         } else {
-          const jsBody = await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js').catch(() => '');
+          const jsBody = await fetchCommerceTwinBody(shopTwin.jsUrl, 'shopify-product-js', 'shopify').catch(() => '');
           if (jsBody.trim()) {
             customShopifyDoc = enrichShopifyProductFromJson({
               rawJson: jsBody,
@@ -10913,7 +10855,7 @@ export async function executeScrapeCall(params: {
     const wooTwin = resolveCustomDomainWooCommerceProductTwinUrl(finalUrl);
     if (wooTwin) {
       try {
-        const wcJsonBody = await fetchCommerceTwinBody(wooTwin.storeApiUrl, 'woocommerce-product-json');
+        const wcJsonBody = await fetchCommerceTwinBody(wooTwin.storeApiUrl, 'woocommerce-product-json', 'woocommerce');
         if (wcJsonBody.trim()) {
           customShopifyDoc = enrichWooCommerceProductFromStoreApi({
             rawJson: wcJsonBody,
@@ -11091,7 +11033,7 @@ export async function executeScrapeCall(params: {
         }),
         site,
         `${source}:github-raw`,
-        'transient',
+        retentionMode ?? (env.ARTIFACTS ? 'transient' : 'off'),
         true,
       );
       if (ghRawRes.status === 200) {
@@ -11123,7 +11065,7 @@ export async function executeScrapeCall(params: {
           }),
           site,
           `${source}:alt-md`,
-          'transient',
+          retentionMode ?? (env.ARTIFACTS ? 'transient' : 'off'),
           true,
         );
         if (altRes.status === 200) {
@@ -11285,6 +11227,9 @@ export async function executeScrapeCall(params: {
       target,
       site,
       source,
+      isPrivate: isPrivateScrape,
+      userId,
+      ephemeral: Boolean(payload.ephemeral),
       env,
       executeHubFetch,
     });
@@ -11456,7 +11401,7 @@ export async function executeScrapeCall(params: {
         }),
         site,
         `${source}:llms`,
-        'transient',
+        retentionMode ?? (env.ARTIFACTS ? 'transient' : 'off'),
         true,
       );
       if (llmsRes.status === 200) {
@@ -11686,12 +11631,19 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  let art = item.artifact as { blobSha256?: string; contentSha256?: string } | undefined;
+  let art = !isPrivateScrape ? (item.artifact as { blobSha256?: string; contentSha256?: string } | undefined) : undefined;
   let markdownArtifactId: string | undefined;
   if (isPrivateScrape && payload.ephemeral !== true && rawCleanMarkdown) {
     if (env.ARTIFACTS) {
       try {
-        const rawBytesForPrivate = rawBodyStr ? new TextEncoder().encode(rawBodyStr) : new TextEncoder().encode(rawCleanMarkdown);
+        const rawBytesForPrivate =
+          typeof item.bodyBase64 === 'string' && item.bodyBase64.length > 0
+            ? decodeBase64ToBytes(item.bodyBase64)
+            : typeof item.body === 'string' && item.bodyEncoding === 'base64' && item.body.length > 0
+              ? decodeBase64ToBytes(item.body)
+              : rawBodyStr
+                ? new TextEncoder().encode(rawBodyStr)
+                : new TextEncoder().encode(rawCleanMarkdown);
         const privStored = await writePrivateCachedScrape({
           bucket: env.ARTIFACTS,
           userId,
@@ -11702,6 +11654,7 @@ export async function executeScrapeCall(params: {
           ...(extracted?.language ? { language: extracted.language } : {}),
           status: typeof item.status === 'number' ? item.status : 200,
           pipelineVersion: SCRAPE_PIPELINE_VERSION,
+          optionsHash: scrapeOptionsHash,
           now,
         });
         art = {
@@ -11733,7 +11686,7 @@ export async function executeScrapeCall(params: {
         // Non-fatal if FTS5 indexing fails
       }
     }
-  } else if (shaped.truncated && env.ARTIFACTS && rawCleanMarkdown) {
+  } else if (!isPrivateScrape && payload.ephemeral !== true && shaped.truncated && env.ARTIFACTS && rawCleanMarkdown) {
     const usesUpgradedBody = Boolean(alternateMarkdownBody || ocrReportOut || structuredTextFormatted || contentSourceOut || htmlJobPosting);
     const mdContentSha =
       !usesUpgradedBody && art?.contentSha256 && isValidSha256Hex(art.contentSha256)

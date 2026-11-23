@@ -12,8 +12,9 @@ primary_region = "iad"
   EDGEFETCH_SITE_ID = "fly-edge-1"
   EDGEFETCH_TRUST_PROXY = "1"
   EDGEFETCH_TRUST_FLY_CLIENT_IP = "1"
-  # Update EDGEFETCH_PUBLIC_ORIGIN if you change `app` or attach a custom domain (required for `/admin` CSRF origin checks behind Fly TLS).
-  EDGEFETCH_PUBLIC_ORIGIN = "https://edgefetch-hub.fly.dev"
+  # Public origin defaults automatically to `https://${FLY_APP_NAME}.fly.dev` so renaming `app` works out of the box.
+  # Uncomment EDGEFETCH_PUBLIC_ORIGIN only when attaching a custom domain:
+  # EDGEFETCH_PUBLIC_ORIGIN = "https://hub.example.com"
 
 [[mounts]]
   source = "edgefetch_data"

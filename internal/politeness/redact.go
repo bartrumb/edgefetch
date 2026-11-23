@@ -533,50 +533,95 @@ func isHostTokenBytes(h string) bool {
 	return true
 }
 
-func tryMatchSchemelessUserinfoToken(s string, i int) (endIdx int, scrubbed string, ok bool) {
-	// Match schemeless `user:secret@host.tld[/path][?query][#frag]` at word/quote boundary.
-	if i > 0 {
-		prev := s[i-1]
-		if (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') ||
-			prev == '/' || prev == ':' || prev == '@' || prev == '.' || prev == '_' || prev == '-' {
-			return 0, "", false
-		}
-	}
-	tokEnd := i
+func isSchemelessPrevBlocked(prev byte) bool {
+	return (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') ||
+		prev == '/' || prev == ':' || prev == '@' || prev == '.' || prev == '_' || prev == '-'
+}
+
+func isSchemelessTokenTerminator(c byte) bool {
+	return c <= ' ' || c == '"' || c == '\'' || c == '<' || c == '>' || c == ')' || c == ','
+}
+
+type schemelessSpanCache struct {
+	tokEnd            int
+	lastAt            int
+	lastColonBeforeAt int
+	hostValid         bool
+	hasPathOrQuery    bool
+	afterChanged      bool
+	cleanAfter        string
+}
+
+func (sc *schemelessSpanCache) refresh(s string, from int) {
+	tokEnd := from
+	lastAt := -1
 	for tokEnd < len(s) {
 		c := s[tokEnd]
-		if c <= ' ' || c == '"' || c == '\'' || c == '<' || c == '>' || c == ')' || c == ',' {
+		if isSchemelessTokenTerminator(c) {
 			break
+		}
+		if c == '@' {
+			lastAt = tokEnd
 		}
 		tokEnd++
 	}
-	tok := s[i:tokEnd]
-	at := strings.LastIndexByte(tok, '@')
-	if at <= 0 {
-		return 0, "", false
+	sc.tokEnd = tokEnd
+	sc.lastAt = lastAt
+	sc.lastColonBeforeAt = -1
+	sc.hostValid = false
+	sc.hasPathOrQuery = false
+	sc.afterChanged = false
+	sc.cleanAfter = ""
+
+	if lastAt <= from {
+		return
 	}
-	userPart := tok[:at]
-	// Require `user:pass@` (or `:pass@`) in embedded free-form strings so plain email addresses `alice@example.com` are untouched unless they carry `?query`.
-	afterAt := tok[at+1:]
+	afterAt := s[lastAt+1 : tokEnd]
 	slashOrQ := strings.IndexAny(afterAt, "/?#")
 	hostPart := afterAt
 	if slashOrQ >= 0 {
 		hostPart = afterAt[:slashOrQ]
 	}
 	if !isHostTokenBytes(hostPart) {
+		return
+	}
+	sc.hostValid = true
+	sc.hasPathOrQuery = slashOrQ >= 0
+	sc.cleanAfter = scrubSchemelessAuthorityAndPath(afterAt)
+	sc.afterChanged = sc.cleanAfter != afterAt
+
+	lastColon := -1
+	for p := from; p < lastAt; p++ {
+		if s[p] == ':' || (p+3 <= lastAt && hasPrefixFoldASCII(s[p:], "%3a")) {
+			lastColon = p
+		}
+	}
+	sc.lastColonBeforeAt = lastColon
+}
+
+func (sc *schemelessSpanCache) matchAt(s string, i int) (endIdx int, scrubbed string, ok bool) {
+	// Match schemeless `user:secret@host.tld[/path][?query][#frag]` at word/quote boundary in O(1) amortized time.
+	if i > 0 && isSchemelessPrevBlocked(s[i-1]) {
 		return 0, "", false
 	}
-	hasColon := strings.IndexByte(userPart, ':') >= 0 || indexFoldASCII(userPart, "%3a") >= 0
-	hasPathOrQuery := slashOrQ >= 0
-	if !hasColon && !hasPathOrQuery {
+	if i >= sc.tokEnd {
+		sc.refresh(s, i)
+	}
+	if sc.lastAt <= i || !sc.hostValid {
 		return 0, "", false
 	}
-	cleanAfter := scrubSchemelessAuthorityAndPath(afterAt)
+	hasColon := sc.lastColonBeforeAt >= i
+	if !hasColon && !sc.hasPathOrQuery {
+		return 0, "", false
+	}
 	if !hasColon {
+		if !sc.afterChanged {
+			return 0, "", false
+		}
 		// Preserve `user@host/path` when no password is present, while still stripping `?query`, `#frag`, `;matrix`, `/reset/<tok>`.
-		return tokEnd, userPart + "@" + cleanAfter, userPart+"@"+cleanAfter != tok
+		return sc.tokEnd, s[i:sc.lastAt] + "@" + sc.cleanAfter, true
 	}
-	return tokEnd, cleanAfter, true
+	return sc.tokEnd, sc.cleanAfter, true
 }
 
 func isIPPortTerminator(b byte) bool {
@@ -719,6 +764,7 @@ func RedactEmbeddedURLs(s string) string {
 	}
 
 	var out strings.Builder
+	var spanCache schemelessSpanCache
 	copiedUpTo := 0
 	seenLookup := false
 	i := 0
@@ -792,7 +838,7 @@ func RedactEmbeddedURLs(s string) string {
 		}
 
 		// Schemeless `user:secret@host/path` or `user@host/path?token=...`
-		if endIdx, scrubbed, ok := tryMatchSchemelessUserinfoToken(s, i); ok {
+		if endIdx, scrubbed, ok := spanCache.matchAt(s, i); ok {
 			if out.Cap() == 0 {
 				out.Grow(len(s))
 			}

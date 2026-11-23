@@ -995,6 +995,13 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
               description: 'Keyword filter across title, handle, vendor, tags, and SKUs.',
               schema: { type: 'string' },
             },
+            {
+              name: 'q',
+              in: 'query',
+              required: false,
+              description: 'Short alias for `query` keyword filter.',
+              schema: { type: 'string' },
+            },
           ],
           responses: {
             '200': {

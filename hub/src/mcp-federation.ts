@@ -18,6 +18,8 @@
 import { isJsonDepthWithinLimit, isSafePublicHttpsUrl, stripMcpSmugglingChars } from './mcp-registry';
 import {
   buildMaskedAuthSummary,
+  filterSafeCachedMcpTools,
+  SAFE_MCP_IDENTIFIER_RE,
   sealVaultCredentials,
   toPublicMcpServerSummary,
   unsealVaultCredentials,
@@ -27,6 +29,7 @@ import {
   type StoredMcpServerRow,
   type VaultSecretPayload,
 } from './mcp-vault';
+import { getActiveCallerAuthContext } from './oauth';
 import { sanitizeInlineHtmlInMarkdown } from './scrape';
 import { detectPromptInjection } from './scrape-advanced';
 
@@ -131,11 +134,7 @@ export function sanitizeRemoteMcpText(raw: string, maxChars = MAX_REMOTE_MCP_RES
       lineDirective ||
       /<\s*[a-z][^>]*\bstyle\s*=\s*["'][^"']*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0)/i.test(line)
     ) {
-      const reasons = [
-        ...lineCheck.triggers,
-        ...(lineDirective ? ['mcp_assistant_directive_smuggling'] : []),
-      ];
-      return `[SCRUBBED: prompt injection blocked (${reasons.join(', ') || allTriggers.join(', ')})]`;
+      return '[SCRUBBED: prompt injection blocked]';
     }
     return line;
   });
@@ -148,7 +147,7 @@ export function sanitizeRemoteMcpText(raw: string, maxChars = MAX_REMOTE_MCP_RES
   });
   if (verifyScan.detected || MCP_DIRECTIVE_INJECTION_RE.test(candidate)) {
     const mergedTriggers = [...new Set([...allTriggers, ...verifyScan.triggers])];
-    candidate = `[SCRUBBED: prompt injection blocked (${mergedTriggers.join(', ')})]`;
+    candidate = '[SCRUBBED: prompt injection blocked]';
     return { text: candidate, detected: true, scrubbed: true, triggers: mergedTriggers };
   }
 
@@ -156,7 +155,7 @@ export function sanitizeRemoteMcpText(raw: string, maxChars = MAX_REMOTE_MCP_RES
 }
 
 const ALLOWED_JSON_SCHEMA_TYPES = new Set(['object', 'string', 'number', 'integer', 'boolean', 'array', 'null']);
-const SAFE_SCHEMA_PROP_KEY_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+const SAFE_SCHEMA_PROP_KEY_RE = SAFE_MCP_IDENTIFIER_RE;
 const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function utf8ByteLength(s: string): number {
@@ -328,7 +327,15 @@ export function sanitizeRemoteMcpToolDefs(rawTools: unknown): {
       return { tools: [], promptInjectionScrubbed: false, oversizedRejected: true };
     }
     const rawName = typeof t.name === 'string' ? stripMcpSmugglingChars(t.name).trim() : '';
-    if (!rawName || !/^[A-Za-z0-9_.:-]{1,64}$/.test(rawName)) continue;
+    if (!rawName || !SAFE_MCP_IDENTIFIER_RE.test(rawName) || FORBIDDEN_PROTO_KEYS.has(rawName)) {
+      promptInjectionScrubbed = true;
+      continue;
+    }
+    const nameInj = sanitizeRemoteMcpText(rawName, 64);
+    if (nameInj.detected) {
+      promptInjectionScrubbed = true;
+      continue;
+    }
 
     const titleSan = typeof t.title === 'string' ? sanitizeRemoteMcpText(t.title, 120) : null;
     const descSan = typeof t.description === 'string' ? sanitizeRemoteMcpText(t.description, 240) : null;
@@ -547,13 +554,22 @@ async function refreshDownstreamOAuthIfNeeded(params: {
     return { ok: true, secret, refreshed: false };
   }
 
+  const allowedAuthOrigin = secret.oauth.confirmedAuthOrigin
+    ? secret.oauth.confirmedAuthOrigin.trim().toLowerCase()
+    : server.remoteOrigin.toLowerCase();
   const tokenEpCheck = isSafePublicHttpsUrl(secret.oauth.tokenEndpoint, params.selfHost);
   if (!tokenEpCheck.ok) {
     return { ok: false, error: `Unsafe OAuth token_endpoint: ${tokenEpCheck.reason}` };
   }
+  if (tokenEpCheck.origin !== allowedAuthOrigin) {
+    return {
+      ok: false,
+      error: `Unsafe OAuth token_endpoint: cross-origin authorization server ${tokenEpCheck.origin} is not confirmed for ${server.remoteOrigin}`,
+    };
+  }
   if (secret.oauth.issuer) {
     const issCheck = isSafePublicHttpsUrl(secret.oauth.issuer, params.selfHost);
-    if (!issCheck.ok || tokenEpCheck.origin !== issCheck.origin) {
+    if (!issCheck.ok || issCheck.origin !== allowedAuthOrigin || tokenEpCheck.origin !== issCheck.origin) {
       return { ok: false, error: 'Unsafe OAuth token_endpoint: origin mismatch with recorded issuer' };
     }
   }
@@ -1004,6 +1020,8 @@ export interface QueryMcpCallOutput {
 async function resolveDecryptedServerSecret(params: {
   server: StoredMcpServerRow;
   vaultMasterKey: string | undefined;
+  vaultStore?: McpVaultStore;
+  now?: number;
 }): Promise<{ ok: true; secret: VaultSecretPayload | null } | { ok: false; status: number; error: string; message: string }> {
   if (!params.server.encryptedCredentials || params.server.authType === 'none') {
     return { ok: true, secret: { kind: 'none', pinnedOrigin: params.server.remoteOrigin } };
@@ -1022,6 +1040,16 @@ async function resolveDecryptedServerSecret(params: {
       error: unsealed.error,
       message: unsealed.message,
     };
+  }
+  if (unsealed.resealedCiphertext && params.vaultStore) {
+    const rotatedAt = params.now ?? Date.now();
+    params.server.encryptedCredentials = unsealed.resealedCiphertext;
+    params.server.updatedAt = rotatedAt;
+    await params.vaultStore.upsertServer({
+      ...params.server,
+      encryptedCredentials: unsealed.resealedCiphertext,
+      updatedAt: rotatedAt,
+    });
   }
   return { ok: true, secret: unsealed.payload };
 }
@@ -1123,6 +1151,7 @@ export async function executeFederatedMcpQuery(params: {
   }
 
   if (action === 'list_tools' && !params.input.refresh && serverRow.cachedTools.length > 0) {
+    const safeCached = filterSafeCachedMcpTools(serverRow.cachedTools);
     return {
       status: 200,
       body: {
@@ -1132,8 +1161,8 @@ export async function executeFederatedMcpQuery(params: {
         cached: true,
         server: serverRow.slug,
         domains: serverRow.domains,
-        count: serverRow.cachedTools.length,
-        tools: serverRow.cachedTools,
+        count: safeCached.length,
+        tools: safeCached,
       },
     };
   }
@@ -1173,7 +1202,12 @@ export async function executeFederatedMcpQuery(params: {
 
   try {
     if (action === 'list_tools') {
-      const dec = await resolveDecryptedServerSecret({ server: serverRow, vaultMasterKey: params.vaultMasterKey });
+      const dec = await resolveDecryptedServerSecret({
+        server: serverRow,
+        vaultMasterKey: params.vaultMasterKey,
+        vaultStore: params.vaultStore,
+        now,
+      });
       if (!dec.ok) {
         return { status: dec.status, body: { ok: false, visibility: 'private', error: dec.error, message: dec.message } };
       }
@@ -1270,7 +1304,7 @@ export async function executeFederatedMcpQuery(params: {
     }
 
     const toolName = typeof params.input.tool === 'string' ? params.input.tool.trim() : '';
-    if (!toolName || !/^[A-Za-z0-9_.:-]{1,64}$/.test(toolName)) {
+    if (!toolName || !SAFE_MCP_IDENTIFIER_RE.test(toolName) || FORBIDDEN_PROTO_KEYS.has(toolName)) {
       return {
         status: 400,
         body: {
@@ -1287,7 +1321,12 @@ export async function executeFederatedMcpQuery(params: {
         ? params.input.arguments
         : {};
 
-    const dec = await resolveDecryptedServerSecret({ server: serverRow, vaultMasterKey: params.vaultMasterKey });
+    const dec = await resolveDecryptedServerSecret({
+      server: serverRow,
+      vaultMasterKey: params.vaultMasterKey,
+      vaultStore: params.vaultStore,
+      now,
+    });
     if (!dec.ok) {
       return { status: dec.status, body: { ok: false, visibility: 'private', error: dec.error, message: dec.message } };
     }
@@ -1661,6 +1700,12 @@ export async function tryScrapeViaConnectedMcp(params: {
   fetchFn?: typeof fetch;
   selfHost?: string;
 }): Promise<{ status: number; via: string; body: Record<string, unknown> } | null> {
+  // 0. Enforce `mcp:call` scope whenever an OAuth caller is in active context!
+  const activeAuth = getActiveCallerAuthContext();
+  if (activeAuth && activeAuth.principal.startsWith('oauth:') && !activeAuth.scopes.includes('mcp:call')) {
+    return null;
+  }
+
   // 1. Validate `https://` public target URL BEFORE routing to any MCP server!
   const targetCheck = isSafePublicHttpsUrl(params.targetUrl, params.selfHost);
   if (!targetCheck.ok) {
@@ -1682,10 +1727,11 @@ export async function tryScrapeViaConnectedMcp(params: {
   const top = matches[0];
   if (!top || top.matchedDomains.length === 0) return null;
 
-  // 3. Select ONLY a non-destructive read-oriented tool accepting `url` or `uri`
-  const candidateTool = top.server.tools.find((t) => {
+  // 3. Select ONLY a non-destructive read-oriented tool with a safe identifier accepting `url` or `uri`
+  const candidateTool = filterSafeCachedMcpTools(top.server.tools).find((t) => {
+    if (!SAFE_MCP_IDENTIFIER_RE.test(t.name) || FORBIDDEN_PROTO_KEYS.has(t.name)) return false;
     if (t.readOnlyHint === false || t.destructiveHint === true) return false;
-    const isReadName = /^(?:get|fetch|read|retrieve|resolve|view|inspect|page|search)(?:[_.:-]|$|[A-Z])/i.test(t.name) || t.readOnlyHint === true;
+    const isReadName = /^(?:get|fetch|read|retrieve|resolve|view|inspect|page|search)(?:[_.-]|$|[A-Z])/i.test(t.name) || t.readOnlyHint === true;
     if (!isReadName) return false;
     const props =
       t.inputSchema?.properties && typeof t.inputSchema.properties === 'object'

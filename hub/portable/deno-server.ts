@@ -60,6 +60,7 @@ import {
   type SqlStorageLike,
   type UserRole,
 } from '../src/oauth.ts';
+import { markRequestVerifiedInProcess } from '../src/otel.ts';
 import { validatePublicHttpsTargetUrl } from '../src/overflow.ts';
 import { normalizeClientRateLimitIp } from '../src/safe-input.ts';
 import {
@@ -869,13 +870,10 @@ function sanitizeDenoInboundRequest(
   });
   headers.set('cf-connecting-ip', trustedIp);
   headers.set('x-real-ip', trustedIp);
-  if (verifiedCallerAuth) {
-    headers.set('x-ef-verified-auth', '1');
-  }
 
   const method = req.method.toUpperCase();
   const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && req.body !== null;
-  return new Request(cleanUrl, {
+  const webReq = new Request(cleanUrl, {
     method,
     headers,
     ...(hasBody
@@ -885,6 +883,10 @@ function sanitizeDenoInboundRequest(
         }
       : {}),
   } as RequestInit);
+  if (verifiedCallerAuth) {
+    markRequestVerifiedInProcess(webReq);
+  }
+  return webReq;
 }
 
 async function sha256Base64UrlDeno(input: string): Promise<string> {
@@ -1262,13 +1264,27 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     }
     const isHealthProbe =
       (methodUpper === 'GET' || methodUpper === 'HEAD') && (rawPathname === '/health' || rawPathname === '/readyz');
+    const hasDenoAuthAttemptHeader = Boolean(
+      req.headers.get('authorization') || req.headers.get('x-api-key') || req.headers.get('cookie'),
+    );
     const hasCallerAuth = isHealthProbe ? false : await hasVerifiedDenoCallerCredentials(req, rawPathname);
+    const isPublicDiscoveryRoute =
+      !isHealthProbe &&
+      !hasDenoAuthAttemptHeader &&
+      (methodUpper === 'GET' || methodUpper === 'HEAD' || methodUpper === 'OPTIONS') &&
+      (rawPathname === '/openapi.json' ||
+        rawPathname.startsWith('/.well-known/') ||
+        rawPathname === '/admin' ||
+        rawPathname === '/admin/login' ||
+        rawPathname === '/robots.txt');
     const clientBucket = normalizeClientRateLimitIp(resolveDenoTrustedClientIp(req, info, trustProxy, trustFlyClientIp));
     const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
     const hitPerIpLimit = curIpInflight >= maxInflightPerIp;
     const hitGlobalLimit = isHealthProbe
       ? totalInflight >= maxInflightTotal + 64
-      : totalInflight >= maxInflightTotal || (!hasCallerAuth && unauthInflight >= maxUnauthInflight);
+      : isPublicDiscoveryRoute
+        ? totalInflight >= maxInflightTotal + 32
+        : totalInflight >= maxInflightTotal || (!hasCallerAuth && unauthInflight >= maxUnauthInflight);
 
     if (hitPerIpLimit || hitGlobalLimit) {
       await req.body?.cancel().catch(() => undefined);
@@ -1285,14 +1301,15 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     }
 
     totalInflight++;
-    if (!hasCallerAuth && !isHealthProbe) unauthInflight++;
+    const countedInDenoUnauth = !hasCallerAuth && !isHealthProbe && !isPublicDiscoveryRoute;
+    if (countedInDenoUnauth) unauthInflight++;
     inflightByIp.set(clientBucket, curIpInflight + 1);
     let slotReleased = false;
     const releaseInflightSlot = () => {
       if (slotReleased) return;
       slotReleased = true;
       totalInflight = Math.max(0, totalInflight - 1);
-      if (!hasCallerAuth && !isHealthProbe) unauthInflight = Math.max(0, unauthInflight - 1);
+      if (countedInDenoUnauth) unauthInflight = Math.max(0, unauthInflight - 1);
       const rem = inflightByIp.get(clientBucket) ?? 0;
       if (rem <= 1) inflightByIp.delete(clientBucket);
       else inflightByIp.set(clientBucket, rem - 1);

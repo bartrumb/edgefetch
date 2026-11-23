@@ -19,7 +19,6 @@ import type { DevTelemetrySettingsView } from './dev-telemetry';
 import {
   handleGitHubOAuthCallback,
   isGitHubAuthConfigured,
-  PINNED_OWNER_GITHUB_ID_SETTING_KEY,
   resolveSessionSecret,
   startGitHubOAuthFlow,
   type GitHubAuthEnv,
@@ -1385,7 +1384,10 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     githubAuthEnv: ghEnv,
   });
 
-  if ((request.method === 'POST' || request.method === 'DELETE') && !isSameOriginFormPost(request, url, deps.publicOrigin)) {
+  if (
+    (request.method === 'POST' || request.method === 'PATCH' || request.method === 'DELETE') &&
+    !isSameOriginFormPost(request, url, deps.publicOrigin)
+  ) {
     return adminJson({ error: 'invalid_origin' }, 403);
   }
 
@@ -1549,17 +1551,31 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     });
   }
 
+  const userIdPathMatch = /^\/admin\/api\/users\/([^/]+)$/.exec(path);
+  const isUserItemPatch = Boolean(
+    userIdPathMatch &&
+      request.method === 'PATCH' &&
+      userIdPathMatch[1] !== 'role' &&
+      userIdPathMatch[1] !== 'delete',
+  );
+  const isUserItemDelete = Boolean(
+    userIdPathMatch &&
+      request.method === 'DELETE' &&
+      userIdPathMatch[1] !== 'role' &&
+      userIdPathMatch[1] !== 'delete',
+  );
+
   const apiOp =
-    request.method === 'POST' || request.method === 'DELETE'
+    request.method === 'POST' || request.method === 'PATCH' || request.method === 'DELETE'
       ? path === '/admin/api/events/clear'
         ? ('events_clear' as const)
         : path === '/admin/api/affinity/clear'
           ? ('affinity_clear' as const)
           : path === '/admin/api/grants/revoke'
             ? ('grant_revoke' as const)
-            : path === '/admin/api/users/role'
+            : path === '/admin/api/users/role' || isUserItemPatch
               ? ('user_role' as const)
-              : path === '/admin/api/users/delete' || path === '/admin/api/users'
+              : path === '/admin/api/users/delete' || path === '/admin/api/users' || isUserItemDelete
                 ? ('user_delete' as const)
                 : path === '/admin/api/telemetry'
                 ? ('telemetry_toggle' as const)
@@ -1622,11 +1638,12 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         200,
       );
     }
-    const [users, updateStatus, devTelemetry] = await Promise.all([
+    const [rawUsers, updateStatus, devTelemetry] = await Promise.all([
       state.users ? Promise.resolve(state.users) : Promise.resolve(deps.oauthStore.listUsers?.() ?? []),
       deps.getUpdateStatus ? deps.getUpdateStatus(state.agents).catch(() => undefined) : Promise.resolve(undefined),
       deps.getTelemetrySettings ? deps.getTelemetrySettings().catch(() => undefined) : Promise.resolve(undefined),
     ]);
+    const users = rawUsers.map(({ encryptedGhToken: _omitGhSecret, ...u }) => u);
     return adminJson(
       {
         ...state,
@@ -1774,7 +1791,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     });
   }
 
-  if (request.method === 'POST' || request.method === 'DELETE') {
+  if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'DELETE') {
     const hdrCsrf = request.headers.get('x-csrf-token') ?? '';
     if (!hdrCsrf || !sameBytes(hdrCsrf, session.csrf)) {
       if (apiOp) {
@@ -2121,19 +2138,47 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
     }
 
-    const resolvePinnedFounderUserId = async (): Promise<string | null> => {
-      const envOwnerId = (ghEnv.GITHUB_OWNER_ID ?? '').trim();
-      if (/^[1-9][0-9]{0,19}$/.test(envOwnerId)) {
-        return `gh_${envOwnerId}`;
+    const envOwnerId = (ghEnv.GITHUB_OWNER_ID ?? '').trim();
+    const configuredFounderUserId = /^[1-9][0-9]{0,19}$/.test(envOwnerId) ? `gh_${envOwnerId}` : null;
+    const isImmutableFounderCaller =
+      session.userId === 'owner' || (configuredFounderUserId !== null && session.userId === configuredFounderUserId);
+    const isImmutableFounderTarget = (targetId: string): boolean =>
+      targetId === 'owner' || (configuredFounderUserId !== null && targetId === configuredFounderUserId);
+
+    const disableAndRevokeTargetUser = async (existingUser: HubUserRecord): Promise<void> => {
+      const nextEpoch = (existingUser.sessionEpoch ?? 1) + 1;
+      await deps.oauthStore.upsertUser?.({
+        ...existingUser,
+        role: 'member',
+        disabled: true,
+        sessionEpoch: nextEpoch,
+        admittedVia: undefined,
+        admittedOrg: undefined,
+        encryptedGhToken: undefined,
+        orgVerifiedAt: undefined,
+      });
+      const userGrants = await Promise.resolve(deps.oauthStore.listGrants(Date.now(), existingUser.userId)).catch(() => []);
+      for (const g of userGrants) {
+        await Promise.resolve(deps.revokeGrant(g.grantId, existingUser.userId)).catch(() => false);
       }
-      const pinnedId = ((await deps.getHubSetting?.(PINNED_OWNER_GITHUB_ID_SETTING_KEY)) ?? '').trim();
-      if (/^[1-9][0-9]{0,19}$/.test(pinnedId)) {
-        return `gh_${pinnedId}`;
+      if (deps.vaultStore) {
+        const userServers = await Promise.resolve(deps.vaultStore.listServers(existingUser.userId)).catch(() => []);
+        for (const s of userServers) {
+          await Promise.resolve(deps.vaultStore.deleteServer(existingUser.userId, s.slug)).catch(() => false);
+        }
       }
-      return null;
+      if (deps.metaDb) {
+        await deps.metaDb
+          .prepare(
+            'UPDATE users SET role = ?1, disabled = 1, session_epoch = ?2, admitted_via = NULL, admitted_org = NULL, encrypted_gh_token = NULL, org_verified_at = NULL WHERE user_id = ?3',
+          )
+          .bind('member', nextEpoch, existingUser.userId)
+          .run()
+          .catch(() => undefined);
+      }
     };
 
-    if (path === '/admin/api/users/role' && request.method === 'POST') {
+    if ((path === '/admin/api/users/role' && request.method === 'POST') || isUserItemPatch) {
       return withAdminAuditSpan('user_role', async (span) => {
         const capped = await readBodyTextCapped(request, 16_384);
         if (!capped.ok) {
@@ -2142,15 +2187,24 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           span.setStatus(false, 'payload_too_large');
           return adminJson({ error: 'payload_too_large' }, st);
         }
-        let body: { userId?: string; role?: string } = {};
+        let body: { userId?: string; role?: string; disabled?: boolean } = {};
         try {
           body = JSON.parse(capped.text || '{}') as typeof body;
         } catch {
           body = {};
         }
-        const targetUserId = typeof body.userId === 'string' ? body.userId.trim() : '';
+        let pathUserId = '';
+        if (isUserItemPatch && userIdPathMatch?.[1]) {
+          try {
+            pathUserId = decodeURIComponent(userIdPathMatch[1]).trim();
+          } catch {
+            return adminJson({ error: 'invalid_params' }, 400);
+          }
+        }
+        const targetUserId = pathUserId || (typeof body.userId === 'string' ? body.userId.trim() : '');
+        const wantsDisable = body.disabled === true;
         const targetRole: UserRole | null = body.role === 'owner' ? 'owner' : body.role === 'member' ? 'member' : null;
-        if (!targetUserId || !targetRole) {
+        if (!targetUserId || (!targetRole && !wantsDisable)) {
           span.setAttributes({ 'admin.outcome': 'invalid_params', 'http.response.status_code': 400 });
           span.setStatus(false, 'invalid_params');
           return adminJson({ error: 'invalid_params' }, 400);
@@ -2160,33 +2214,58 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           span.setStatus(false, 'self_modification_forbidden');
           return adminJson({ ok: false, error: 'self_modification_forbidden', message: 'Cannot modify your own role' }, 400);
         }
-        const pinnedFounderUserId = await resolvePinnedFounderUserId();
-        if (targetUserId === 'owner' || (targetRole !== 'owner' && pinnedFounderUserId && targetUserId === pinnedFounderUserId)) {
+        if (isImmutableFounderTarget(targetUserId)) {
           span.setAttributes({ 'admin.outcome': 'founder_protected', 'http.response.status_code': 403 });
           span.setStatus(false, 'founder_protected');
-          return adminJson({ ok: false, error: 'founder_protected', message: 'Pinned founder/owner cannot be demoted' }, 403);
+          return adminJson(
+            { ok: false, error: 'founder_protected', message: 'Immutable founder/owner cannot be disabled, demoted, or modified' },
+            403,
+          );
         }
-        const updated = (await deps.oauthStore.updateUserRole?.(targetUserId, targetRole)) ?? false;
+        const existingTarget = (await deps.oauthStore.getUser?.(targetUserId)) ?? null;
+        if (!existingTarget || existingTarget.disabled) {
+          span.setAttributes({ 'admin.target_user_id': targetUserId, 'admin.outcome': 'not_found', 'http.response.status_code': 404 });
+          return adminJson({ ok: false, error: 'user_not_found' }, 404);
+        }
+        if (existingTarget.role === 'owner' && !isImmutableFounderCaller) {
+          span.setAttributes({ 'admin.outcome': 'owner_protected', 'http.response.status_code': 403 });
+          span.setStatus(false, 'owner_protected');
+          return adminJson(
+            { ok: false, error: 'owner_protected', message: 'Only the immutable founder may disable, demote, or delete another owner account' },
+            403,
+          );
+        }
+        if (wantsDisable) {
+          await disableAndRevokeTargetUser(existingTarget);
+          span.setAttributes({
+            'admin.target_user_id': targetUserId,
+            'admin.outcome': 'disabled',
+            'http.response.status_code': 200,
+          });
+          return adminJson({ ok: true, disabled: true, userId: targetUserId }, 200);
+        }
+        const updated = (await deps.oauthStore.updateUserRole?.(targetUserId, targetRole!)) ?? false;
         if (updated && deps.metaDb) {
           await deps.metaDb
             .prepare('UPDATE users SET role = ?1, session_epoch = COALESCE(session_epoch, 1) + 1 WHERE user_id = ?2')
-            .bind(targetRole, targetUserId)
+            .bind(targetRole!, targetUserId)
             .run()
             .catch(() => undefined);
         }
         span.setAttributes({
           'admin.target_user_id': targetUserId,
-          'admin.target_role': targetRole,
+          'admin.target_role': targetRole!,
           'admin.outcome': updated ? 'updated' : 'not_found',
           'http.response.status_code': updated ? 200 : 404,
         });
-        return adminJson({ ok: updated, userId: targetUserId, role: targetRole }, updated ? 200 : 404);
+        return adminJson({ ok: updated, userId: targetUserId, role: targetRole! }, updated ? 200 : 404);
       });
     }
 
     if (
       (path === '/admin/api/users/delete' && request.method === 'POST') ||
-      (path === '/admin/api/users' && request.method === 'DELETE')
+      (path === '/admin/api/users' && request.method === 'DELETE') ||
+      isUserItemDelete
     ) {
       return withAdminAuditSpan('user_delete', async (span) => {
         const capped = await readBodyTextCapped(request, 16_384);
@@ -2202,10 +2281,19 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         } catch {
           body = {};
         }
+        let pathUserId = '';
+        if (isUserItemDelete && userIdPathMatch?.[1]) {
+          try {
+            pathUserId = decodeURIComponent(userIdPathMatch[1]).trim();
+          } catch {
+            return adminJson({ ok: false, error: 'invalid_params' }, 400);
+          }
+        }
         const targetUserId = (
-          typeof body.userId === 'string' && body.userId.trim()
+          pathUserId ||
+          (typeof body.userId === 'string' && body.userId.trim()
             ? body.userId.trim()
-            : (url.searchParams.get('userId') ?? '').trim()
+            : (url.searchParams.get('userId') ?? '').trim())
         );
         if (!targetUserId) {
           span.setAttributes({ 'admin.outcome': 'invalid_params', 'http.response.status_code': 400 });
@@ -2217,41 +2305,25 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           span.setStatus(false, 'self_modification_forbidden');
           return adminJson({ ok: false, error: 'self_modification_forbidden', message: 'Cannot delete your own account' }, 400);
         }
-        const pinnedFounderUserId = await resolvePinnedFounderUserId();
-        if (targetUserId === 'owner' || (pinnedFounderUserId && targetUserId === pinnedFounderUserId)) {
+        if (isImmutableFounderTarget(targetUserId)) {
           span.setAttributes({ 'admin.outcome': 'founder_protected', 'http.response.status_code': 403 });
           span.setStatus(false, 'founder_protected');
-          return adminJson({ ok: false, error: 'founder_protected', message: 'Pinned founder/owner cannot be deleted' }, 403);
+          return adminJson({ ok: false, error: 'founder_protected', message: 'Immutable founder/owner cannot be deleted' }, 403);
         }
         const existingUser = (await deps.oauthStore.getUser?.(targetUserId)) ?? null;
         if (!existingUser) {
           span.setAttributes({ 'admin.target_user_id': targetUserId, 'admin.outcome': 'not_found', 'http.response.status_code': 404 });
           return adminJson({ ok: false, error: 'user_not_found' }, 404);
         }
-        const nextEpoch = (existingUser.sessionEpoch ?? 1) + 1;
-        await deps.oauthStore.upsertUser?.({
-          ...existingUser,
-          role: 'member',
-          disabled: true,
-          sessionEpoch: nextEpoch,
-        });
-        const userGrants = await Promise.resolve(deps.oauthStore.listGrants(Date.now(), targetUserId)).catch(() => []);
-        for (const g of userGrants) {
-          await Promise.resolve(deps.revokeGrant(g.grantId, targetUserId)).catch(() => false);
+        if (existingUser.role === 'owner' && !isImmutableFounderCaller) {
+          span.setAttributes({ 'admin.outcome': 'owner_protected', 'http.response.status_code': 403 });
+          span.setStatus(false, 'owner_protected');
+          return adminJson(
+            { ok: false, error: 'owner_protected', message: 'Only the immutable founder may disable or delete another owner account' },
+            403,
+          );
         }
-        if (deps.vaultStore) {
-          const userServers = await Promise.resolve(deps.vaultStore.listServers(targetUserId)).catch(() => []);
-          for (const s of userServers) {
-            await Promise.resolve(deps.vaultStore.deleteServer(targetUserId, s.slug)).catch(() => false);
-          }
-        }
-        if (deps.metaDb) {
-          await deps.metaDb
-            .prepare('UPDATE users SET role = ?1, disabled = 1, session_epoch = ?2 WHERE user_id = ?3')
-            .bind('member', nextEpoch, targetUserId)
-            .run()
-            .catch(() => undefined);
-        }
+        await disableAndRevokeTargetUser(existingUser);
         span.setAttributes({
           'admin.target_user_id': targetUserId,
           'admin.outcome': 'deleted',

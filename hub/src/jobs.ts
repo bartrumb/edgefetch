@@ -3155,15 +3155,27 @@ function inferCompanyFromAtsUrl(urlStr: string): string {
     const u = new URL(urlStr);
     const host = u.hostname.toLowerCase();
     const parts = u.pathname.split('/').filter(Boolean);
+    if (host.includes('greenhouse.io')) {
+      if (parts[0]?.toLowerCase() === 'embed') {
+        const forParam = u.searchParams.get('for')?.trim();
+        if (forParam) return forParam;
+      }
+      if (parts[0]) return decodeURIComponent(parts[0]);
+    }
+    if (host === 'ats.rippling.com' && parts.length >= 1) {
+      const idx = parts.length >= 2 && /^[a-z]{2}(?:-[a-z]{2,4})?$/i.test(parts[0]!) ? 1 : 0;
+      if (parts[idx]) return decodeURIComponent(parts[idx]!);
+    }
     if (
-      (host.includes('greenhouse.io') ||
-        host === 'jobs.ashbyhq.com' ||
+      (host === 'jobs.ashbyhq.com' ||
         host === 'jobs.lever.co' ||
         host === 'jobs.eu.lever.co' ||
         host === 'jobs.smartrecruiters.com' ||
         host === 'apply.workable.com' ||
         host === 'jobs.gem.com' ||
-        host === 'ats.rippling.com') &&
+        host === 'jobs.jobvite.com' ||
+        host === 'app.dover.com' ||
+        host === 'jobs.polymer.co') &&
       parts[0]
     ) {
       return decodeURIComponent(parts[0]);
@@ -3171,10 +3183,10 @@ function inferCompanyFromAtsUrl(urlStr: string): string {
     const wd = /^([a-z0-9-]+)\.(?:wd\d+\.)?myworkday(?:jobs|site)\.com$/i.exec(host);
     if (wd?.[1]) return wd[1];
     const subAts =
-      /^(?:careers-|jobs-)?([a-z0-9-]+)\.(?:pinpointhq\.com|bamboohr\.com|breezy\.hr|recruitee\.com|applytojob\.com|(?:[a-z]{2}\.)?teamtailor\.com|icims\.com|(?:jobs\.)?personio\.(?:de|com))$/i.exec(
+      /^(?:careers-|jobs-)?([a-z0-9-]+)\.(?:pinpointhq\.com|bamboohr\.com|breezy\.hr|recruitee\.com|applytojob\.com|(?:[a-z]{2}\.)?teamtailor\.com|icims\.com|(?:jobs\.)?personio\.(?:de|com)|eightfold\.ai|avature\.net|taleo\.net)$/i.exec(
         host,
       );
-    if (subAts?.[1] && !/^(?:www|jobs|careers)$/i.test(subAts[1])) return subAts[1];
+    if (subAts?.[1] && !/^(?:www|jobs|careers|apply|search|login)$/i.test(subAts[1])) return subAts[1];
     return host.replace(/^(?:www|jobs|careers)\./, '');
   } catch {
     return 'unknown';
@@ -3787,16 +3799,189 @@ const COMPANY_LEGAL_ENTITY_SUFFIXES = new Set([
   'corp',
   'corporation',
   'llc',
+  'llp',
+  'lp',
+  'pbc',
   'plc',
-  'gmbh',
-]);
-
-const COMPANY_DISPLAY_NON_ATS_SUFFIXES = new Set([
-  ...COMPANY_LEGAL_ENTITY_SUFFIXES,
   'ltd',
   'limited',
+  'gmbh',
+  'ag',
+  'se',
+  'sa',
+  'sas',
+  'sarl',
+  'bv',
+  'nv',
+  'oy',
+  'ab',
+  'as',
+  'aps',
+  'kk',
+  'gk',
+  'pty',
+  'pte',
+  'bhd',
+  'sdn',
+  'co',
   'company',
+  'companies',
+  'holdings',
+  'holding',
+  'enterprises',
+]);
+
+const COMPANY_SUBSIDIARY_AND_GEO_QUALIFIERS = new Set([
+  ...COMPANY_LEGAL_ENTITY_SUFFIXES,
+  // Corporate divisions, business lines & tech descriptors ("Stripe Payments UK", "Notion Labs, Inc.", "Palantir Technologies", "Coinbase Global, Inc.")
   'labs',
+  'lab',
+  'technologies',
+  'technology',
+  'tech',
+  'systems',
+  'software',
+  'networks',
+  'network',
+  'security',
+  'cloud',
+  'ai',
+  'research',
+  'robotics',
+  'industries',
+  'industrial',
+  'payments',
+  'financial',
+  'finance',
+  'markets',
+  'capital',
+  'bank',
+  'banking',
+  'commerce',
+  'media',
+  'studios',
+  'studio',
+  'entertainment',
+  'gaming',
+  'games',
+  'health',
+  'healthcare',
+  'bio',
+  'therapeutics',
+  'energy',
+  'power',
+  'logistics',
+  'mobility',
+  'federal',
+  'government',
+  'public',
+  'sector',
+  'services',
+  'solutions',
+  'web',
+  'people',
+  'center',
+  'digital',
+  'platform',
+  'platforms',
+  'data',
+  'analytics',
+  'computing',
+  'communications',
+  'telecom',
+  'wireless',
+  'group',
+  'international',
+  'intl',
+  'hq',
+  'io',
+  'so',
+  'app',
+  'dev',
+  'net',
+  'org',
+  'com',
+  // Geographic / regional subsidiary qualifiers
+  'us',
+  'usa',
+  'uk',
+  'eu',
+  'na',
+  'emea',
+  'apac',
+  'latam',
+  'americas',
+  'europe',
+  'asia',
+  'pacific',
+  'global',
+  'worldwide',
+  'north',
+  'south',
+  'east',
+  'west',
+  'america',
+  'canada',
+  'mexico',
+  'brazil',
+  'argentina',
+  'chile',
+  'colombia',
+  'ireland',
+  'germany',
+  'france',
+  'spain',
+  'italy',
+  'netherlands',
+  'sweden',
+  'norway',
+  'denmark',
+  'finland',
+  'poland',
+  'switzerland',
+  'austria',
+  'belgium',
+  'portugal',
+  'india',
+  'japan',
+  'korea',
+  'singapore',
+  'australia',
+  'new',
+  'zealand',
+  'israel',
+  'uae',
+  'taiwan',
+  'philippines',
+  'indonesia',
+  'vietnam',
+  'thailand',
+  'malaysia',
+  'china',
+  'hong',
+  'kong',
+]);
+
+// Tight allowlist of official unhyphenated regional/HQ ATS tenant suffixes (`boards.greenhouse.io/doordashusa`, `jobs.ashbyhq.com/notionhq`).
+// NEVER allows `-inc`, `-llc`, `-corp`, `-jobs`, `-careers`, or unhyphenated `inc`/`jobs`/`careers`/`ai`/`labs` on unverified ATS slugs!
+const UNHYPHENATED_ATS_GEO_HQ_SUFFIXES = new Set([
+  'usa',
+  'us',
+  'uk',
+  'eu',
+  'hq',
+  'na',
+  'emea',
+  'apac',
+  'latam',
+  'canada',
+  'japan',
+  'india',
+  'australia',
+  'germany',
+  'france',
+  'ireland',
+  'singapore',
 ]);
 
 const COMPANY_NEGATION_WORDS = new Set([
@@ -3815,108 +4000,303 @@ const COMPANY_NEGATION_WORDS = new Set([
   'clone',
   'mock',
   'phish',
+  'phishing',
   'scam',
   'spoof',
   'parody',
+  'impostor',
+  'imposter',
+  'unofficial',
+  'recruiting',
+  'recruitment',
+  'recruiter',
+  'recruiters',
+  'staffing',
+  'headhunter',
+  'agency',
+  'outsourcing',
+  'confidential',
+  'stealth',
 ]);
 
-const CONCAT_NEGATION_PREFIX_RE = /^(?:not|non|anti|ex|former|unlike|fake|clone|mock|spoof)/;
+const CONCAT_NEGATION_PREFIX_RE = /^(?:not|non|anti|ex|former|unlike|fake|clone|mock|spoof|phish|scam|impostor|imposter|unofficial)/;
 
-function isKnownMultiTenantAtsUrl(urlStr: string): boolean {
-  try {
-    const u = new URL(urlStr);
-    const host = u.hostname.toLowerCase();
-    return (
-      host.endsWith('.greenhouse.io') ||
-      host === 'greenhouse.io' ||
-      host === 'jobs.ashbyhq.com' ||
-      host === 'jobs.lever.co' ||
-      host === 'jobs.eu.lever.co' ||
-      host === 'jobs.smartrecruiters.com' ||
-      host === 'apply.workable.com' ||
-      host === 'jobs.gem.com' ||
-      host === 'ats.rippling.com' ||
-      host.endsWith('.myworkdayjobs.com') ||
-      host.endsWith('.myworkdaysite.com') ||
-      host.endsWith('.pinpointhq.com') ||
-      host.endsWith('.bamboohr.com') ||
-      host.endsWith('.breezy.hr') ||
-      host.endsWith('.recruitee.com') ||
-      host.endsWith('.applytojob.com') ||
-      host.endsWith('.teamtailor.com') ||
-      host.endsWith('.icims.com') ||
-      host.endsWith('.personio.de') ||
-      host.endsWith('.personio.com') ||
-      host.endsWith('.oraclecloud.com')
-    );
-  } catch {
+const TWO_PART_PUBLIC_SUFFIXES = new Set([
+  'co.uk',
+  'org.uk',
+  'me.uk',
+  'com.au',
+  'net.au',
+  'org.au',
+  'co.jp',
+  'ne.jp',
+  'or.jp',
+  'co.nz',
+  'co.in',
+  'firm.in',
+  'co.kr',
+  'co.il',
+  'com.br',
+  'com.mx',
+  'com.ar',
+  'com.co',
+  'com.sg',
+  'com.hk',
+  'com.tw',
+  'com.my',
+  'com.ph',
+  'com.vn',
+  'com.tr',
+  'co.za',
+  'co.id',
+  'co.th',
+]);
+
+const UNVERIFIED_JOB_AGGREGATOR_DOMAINS = [
+  'linkedin.com',
+  'indeed.com',
+  'glassdoor.com',
+  'ziprecruiter.com',
+  'monster.com',
+  'dice.com',
+  'simplyhired.com',
+  'careerbuilder.com',
+  'talent.com',
+  'jooble.org',
+  'snagajob.com',
+  'lensa.com',
+  'wayup.com',
+  'wellfound.com',
+  'otta.com',
+];
+
+const CURATED_PUBLIC_FEED_HOST_BY_SOURCE: Readonly<Record<string, string>> = {
+  weworkremotely: 'weworkremotely.com',
+  'weworkremotely-feed': 'weworkremotely.com',
+  himalayas: 'himalayas.app',
+  'himalayas-feed': 'himalayas.app',
+  workingnomads: 'workingnomads.com',
+  'workingnomads-feed': 'workingnomads.com',
+  workatastartup: 'workatastartup.com',
+  'workatastartup-yc-mirror': 'workatastartup.com',
+};
+
+function isKnownMultiTenantAtsHost(host: string): boolean {
+  return (
+    host.endsWith('.greenhouse.io') ||
+    host === 'greenhouse.io' ||
+    host === 'jobs.ashbyhq.com' ||
+    host === 'jobs.lever.co' ||
+    host === 'jobs.eu.lever.co' ||
+    host === 'jobs.smartrecruiters.com' ||
+    host === 'apply.workable.com' ||
+    host === 'jobs.gem.com' ||
+    host === 'ats.rippling.com' ||
+    host === 'jobs.jobvite.com' ||
+    host === 'app.dover.com' ||
+    host === 'jobs.polymer.co' ||
+    host.endsWith('.myworkdayjobs.com') ||
+    host.endsWith('.myworkdaysite.com') ||
+    host.endsWith('.pinpointhq.com') ||
+    host.endsWith('.bamboohr.com') ||
+    host.endsWith('.breezy.hr') ||
+    host.endsWith('.recruitee.com') ||
+    host.endsWith('.applytojob.com') ||
+    host.endsWith('.teamtailor.com') ||
+    host.endsWith('.icims.com') ||
+    host.endsWith('.personio.de') ||
+    host.endsWith('.personio.com') ||
+    host.endsWith('.oraclecloud.com') ||
+    host.endsWith('.taleo.net') ||
+    host.endsWith('.successfactors.com') ||
+    host.endsWith('.successfactors.eu') ||
+    host.endsWith('.eightfold.ai') ||
+    host.endsWith('.avature.net') ||
+    host.endsWith('.dayforcehcm.com') ||
+    host.endsWith('.ultipro.com') ||
+    host.endsWith('.paylocity.com') ||
+    host.endsWith('.paycomonline.net') ||
+    host.endsWith('.adp.com') ||
+    host.endsWith('.jazzhr.co') ||
+    host.endsWith('.homerun.co') ||
+    host.endsWith('.traffit.com') ||
+    host.endsWith('.zohorecruit.com') ||
+    host.endsWith('.freshteam.com') ||
+    host.endsWith('.comeet.com')
+  );
+}
+
+function extractRegistrableBrandInfo(hostname: string): { sld: string; joinedRegistrable: string } | null {
+  const clean = hostname.trim().toLowerCase().replace(/\.+$/, '');
+  if (!clean || !clean.includes('.')) return null;
+  const labels = clean.split('.');
+  if (labels.length < 2 || labels.some((l) => !l)) return null;
+  // Reject raw IPv4/hex TLD literals
+  if (/^(?:\d+|0x[0-9a-f]+)$/i.test(labels[labels.length - 1]!)) return null;
+  const lastTwo = `${labels[labels.length - 2]}.${labels[labels.length - 1]}`;
+  if (TWO_PART_PUBLIC_SUFFIXES.has(lastTwo)) {
+    if (labels.length < 3) return null;
+    const sld = labels[labels.length - 3]!;
+    return { sld, joinedRegistrable: `${sld}${lastTwo.replace(/\./g, '')}` };
+  }
+  const sld = labels[labels.length - 2]!;
+  const tld = labels[labels.length - 1]!;
+  return { sld, joinedRegistrable: `${sld}${tld}` };
+}
+
+function normalizeDottedCorporateAbbreviations(raw: string): string {
+  // Collapse known dotted legal/country abbreviations (`L.L.C.` -> `llc`, `P.B.C.` -> `pbc`, `U.K.` -> `uk`, `U.S.A.` -> `usa`)
+  // WITHOUT collapsing arbitrary spaced/dotted brand spoofs like `S.T.R.I.P.E`!
+  return raw.replace(
+    /\b(?:l\.l\.c|p\.b\.c|p\.l\.c|l\.l\.p|i\.n\.c|c\.o\.r\.p|l\.t\.d|u\.s\.a|u\.s|u\.k|s\.a|b\.v|n\.v|a\.g|s\.e|k\.k)\.?/gi,
+    (m) => m.replace(/\./g, ''),
+  );
+}
+
+export function expandCompanyFilterTokens(rawCompany: string): string[] {
+  const out = new Set<string>();
+  const bounded = rawCompany.length > 256 ? rawCompany.slice(0, 256) : rawCompany;
+  const collapsed = normalizeDottedCorporateAbbreviations(bounded).toLowerCase();
+  const fullClean = collapsed.replace(/[^a-z0-9]+/g, '');
+  if (fullClean.length >= 2) out.add(fullClean);
+
+  const words = collapsed.match(/[a-z0-9]+/g) ?? [];
+  while (words.length > 1 && COMPANY_SUBSIDIARY_AND_GEO_QUALIFIERS.has(words[words.length - 1]!)) {
+    words.pop();
+    const core = words.join('');
+    if (core.length >= 2) out.add(core);
+  }
+  return [...out];
+}
+
+function matchesAtsTenantSlugAgainstToken(rawSlug: string, tok: string): boolean {
+  if (!rawSlug || !tok || tok.length < 2 || tok.length > 128) return false;
+  const bounded = rawSlug.length > 128 ? rawSlug.slice(0, 128) : rawSlug;
+  if (/[\u0000-\u001f\u007f-\u00a0\u00ad\u034f\u061c\u17b4\u17b5\u180b-\u180f\u2000-\u200f\u2028-\u202f\u205f-\u206f\ufeff]/.test(bounded)) {
     return false;
   }
+  if (!/^[A-Za-z0-9_-]+$/.test(bounded)) return false;
+  const lower = bounded.toLowerCase();
+
+  // 1. Exact tenant slug (`boards.greenhouse.io/stripe` === `"stripe"`)
+  if (lower === tok) return true;
+
+  // 2. Multi-word brand joined strictly with `-` or `_` (`jobs.lever.co/palo-alto-networks` <-> `"paloaltonetworks"`):
+  // ZERO extra suffix/prefix words allowed (`lever.co/stripe-inc`, `stripe-llc`, `stripe-jobs`, `stripe-hq`, `s-t-r-i-p-e` -> REJECTED!)
+  if (lower.includes('-') || lower.includes('_')) {
+    const parts = lower.split(/[-_]+/).filter(Boolean);
+    if (parts.length >= 2 && parts.length <= 4 && parts.every((p) => p.length >= 2) && parts.join('') === tok) {
+      return true;
+    }
+    return false;
+  }
+
+  // 3. Official unhyphenated geographic/HQ ATS tenant slug (`boards.greenhouse.io/doordashusa`, `jobs.ashbyhq.com/notionhq`):
+  if (tok.length >= 3 && /^[a-z0-9]+$/.test(lower) && lower.startsWith(tok)) {
+    const rem = lower.slice(tok.length);
+    if (UNHYPHENATED_ATS_GEO_HQ_SUFFIXES.has(rem)) return true;
+  }
+  return false;
+}
+
+function matchesFirstPartyDomainAgainstToken(hostname: string, tok: string): boolean {
+  const info = extractRegistrableBrandInfo(hostname);
+  if (!info) return false;
+  const { sld, joinedRegistrable } = info;
+  if (!sld.startsWith(tok) && CONCAT_NEGATION_PREFIX_RE.test(sld)) return false;
+  if (sld === tok || joinedRegistrable === tok) return true;
+  if (sld.includes('-')) {
+    const parts = sld.split('-').filter(Boolean);
+    return parts.length >= 2 && parts.length <= 4 && parts.every((p) => p.length >= 2) && parts.join('') === tok;
+  }
+  if (tok.length >= 3 && /^[a-z0-9]+$/.test(sld) && sld.startsWith(tok)) {
+    const rem = sld.slice(tok.length);
+    if (UNHYPHENATED_ATS_GEO_HQ_SUFFIXES.has(rem)) return true;
+  }
+  return false;
 }
 
 function matchesCompanyCandidateAgainstToken(
   rawCandidate: string,
   tok: string,
-  opts: { isAtsSlug?: boolean; strictMultiTenant?: boolean } = {},
+  opts: { isAtsSlug?: boolean } = {},
 ): boolean {
-  if (!rawCandidate || !tok || tok.length > 128) return false;
+  if (opts.isAtsSlug) {
+    return matchesAtsTenantSlugAgainstToken(rawCandidate, tok);
+  }
+  if (!rawCandidate || !tok || tok.length < 2 || tok.length > 128) return false;
   const bounded = rawCandidate.length > 256 ? rawCandidate.slice(0, 256) : rawCandidate;
-  // Reject zero-width / bidi / non-breaking-space format chars used to spoof company names or ATS board slugs (`Stripe\u200b`, `STRIPE\u00a0INC`)
+  // Reject zero-width / bidi / non-breaking-space format chars used to spoof company names (`Stripe\u200b`, `STRIPE\u00a0INC`)
   if (/[\u0000-\u001f\u007f-\u00a0\u00ad\u034f\u061c\u17b4\u17b5\u180b-\u180f\u2000-\u200f\u2028-\u202f\u205f-\u206f\ufeff]/.test(bounded)) {
     return false;
   }
-  // ATS board tenant slugs must strictly be clean kebab/alnum slugs without spaces or dots (`stripe.jobs`, `Stripe Careers`)
-  if (opts.isAtsSlug && !/^[A-Za-z0-9_-]+$/.test(bounded)) {
-    return false;
-  }
-  // Tokenize ALL Unicode letter/number words (`\p{L}\p{N}`) so Cyrillic/CJK/homoglyph prefixes or suffixes (`Не Stripe`, `Stripe 偽物`, `Stripe Fаke`) are NEVER dropped!
-  const words: string[] = bounded.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-  if (words.length === 0) return false;
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i]!;
+  const normalizedAbbrev = normalizeDottedCorporateAbbreviations(bounded);
+  // Tokenize ALL Unicode letter/number words (`\p{L}\p{N}`) so Cyrillic/Greek/CJK homoglyphs (`Не Stripe`, `Stripe 偽物`, `Stripe Fаke`) are NEVER dropped!
+  const rawWords: string[] = normalizedAbbrev.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (rawWords.length === 0) return false;
+
+  const words: string[] = [];
+  for (let i = 0; i < rawWords.length; i++) {
+    let w = rawWords[i]!;
+    if (i > 0 && !/^[a-z0-9]+$/.test(w)) {
+      // Allow Latin diacritics on subsidiary country/city qualifiers (`México`, `Zürich`, `São Paulo`) while rejecting non-Latin scripts (Cyrillic/Greek/CJK)
+      if (/^[\p{Script=Latin}0-9]+$/u.test(w)) {
+        w = w.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      }
+    }
     if (!/^[a-z0-9]+$/.test(w)) return false;
-    if (COMPANY_NEGATION_WORDS.has(w)) return false;
+    if (COMPANY_NEGATION_WORDS.has(w) && w !== tok) return false;
+    words.push(w);
   }
 
-  const allowedSuffixSet =
-    opts.isAtsSlug || opts.strictMultiTenant ? COMPANY_LEGAL_ENTITY_SUFFIXES : COMPANY_DISPLAY_NON_ATS_SUFFIXES;
+  // Support explicit `"<Legal Parent> dba <Brand>"` (`"Maplebear Inc. dba Instacart"`)
+  const dbaIdx = words.indexOf('dba');
+  if (dbaIdx > 0 && dbaIdx + 1 < words.length) {
+    const afterDba = words.slice(dbaIdx + 1);
+    if (afterDba[0] === tok && afterDba.slice(1).every((w) => COMPANY_SUBSIDIARY_AND_GEO_QUALIFIERS.has(w))) {
+      return true;
+    }
+  }
 
   if (words.length === 1) {
     const only = words[0]!;
-    if (only.length < 3) {
-      return only.length >= 2 && only === tok;
-    }
     if (only === tok) return true;
-    // Allow unseparated display-only legal/labs suffix (e.g. `AcmeLabs` on verified `boards.greenhouse.io/acme`) ONLY when NOT evaluating an ATS URL slug!
-    if (!opts.isAtsSlug && !opts.strictMultiTenant && tok.length >= 3 && only.startsWith(tok)) {
+    if (tok.length >= 3 && only.startsWith(tok)) {
       const rem = only.slice(tok.length);
-      if (COMPANY_DISPLAY_NON_ATS_SUFFIXES.has(rem)) return true;
+      if (COMPANY_SUBSIDIARY_AND_GEO_QUALIFIERS.has(rem)) return true;
     }
     return false;
   }
 
-  if (tok.length < 3) return false;
   const clean = words.join('');
-  if (CONCAT_NEGATION_PREFIX_RE.test(clean) && clean !== tok) return false;
+  if (!clean.startsWith(tok) && CONCAT_NEGATION_PREFIX_RE.test(clean)) return false;
 
-  // Exact leading token followed ONLY by vetted legal-entity suffixes (`"Stripe, Inc."`, `"stripe-inc"` — NEVER `"Stripe Careers"`, `"stripe-jobs"`, `"stripe-hq"`, `"stripe-global"`, `"stripe-co"`, `"stripe-ltd"` on multi-tenant ATS!)
-  if (words[0] === tok && words.slice(1).every((w) => allowedSuffixSet.has(w))) {
+  // 1. Exact leading brand token followed by `1..6` vetted legal, subsidiary, division, or geographic qualifiers
+  // (`"Stripe Payments UK"`, `"Notion Labs, Inc."`, `"Anthropic, PBC"`, `"OpenAI, L.L.C."`, `"F5, Inc."`)
+  if (
+    words[0] === tok &&
+    words.length <= 7 &&
+    words.slice(1).every((w) => COMPANY_SUBSIDIARY_AND_GEO_QUALIFIERS.has(w))
+  ) {
     return true;
   }
 
-  // Space-separated 2-word compound company name (`"Open AI"` <-> `"openai"`, `"Palo Alto"` <-> `"paloalto"`):
-  // ONLY when separated by ASCII space (NOT `.`, `-`, `/`, `_` so `S.T.R.I.P.E`, `St-Ripe`, `s/t/r/i/p/e`, `s-t-r-i-p-e` are 100% rejected!)
-  // and `words[0].length >= 3` (`"S t r i p e"` has 1-char words -> rejected!).
-  if (
-    !opts.isAtsSlug &&
-    words.length >= 2 &&
-    words[0]!.length >= 3 &&
-    words[1]!.length >= 2 &&
-    !/[.\-/_]/.test(bounded) &&
-    words[0]! + words[1]! === tok &&
-    words.slice(2).every((w) => allowedSuffixSet.has(w))
-  ) {
-    return true;
+  // 2. Space-separated multi-word company name (`"Open AI"` <-> `"openai"`, `"Palo Alto Networks"` <-> `"paloaltonetworks"`):
+  // ONLY when separated by spaces/commas (NOT `.`, `-`, `/`, `_` in the brand prefix so `S.T.R.I.P.E`, `St-Ripe`, `s/t/r/i/p/e`, `s-t-r-i-p-e` are 100% rejected!)
+  if (tok.length >= 4 && !/[.\-/_]/.test(normalizedAbbrev.slice(0, Math.min(normalizedAbbrev.length, tok.length + 4)))) {
+    let acc = '';
+    for (let k = 0; k < Math.min(words.length, 4); k++) {
+      const part = words[k]!;
+      if (k === 0 ? part.length < 2 : part.length < 2) break;
+      if (k === 0 && part.length < 3 && words.length === 2 && words[1]!.length < 3) break;
+      acc += part;
+      if (acc === tok && k >= 1) {
+        if (words.slice(k + 1).every((w) => COMPANY_SUBSIDIARY_AND_GEO_QUALIFIERS.has(w))) {
+          return true;
+        }
+      }
+      if (acc.length >= tok.length) break;
+    }
   }
 
   return false;
@@ -3929,40 +4309,82 @@ export function matchesAllowedCompanyOrDomain(
 ): boolean {
   const rawUrl = typeof job.url === 'string' ? (job.url.length > 2048 ? job.url.slice(0, 2048) : job.url) : '';
   const urlLower = rawUrl.toLowerCase();
+  const hasExplicitCompany =
+    typeof job.company === 'string' && job.company.trim() !== '' && job.company.trim().toLowerCase() !== 'unknown';
+
+  // 1. Boards explicitly discovered from the caller's verified `domains: [...]` careers page
   if (
     allowedBoardPrefixes.some(
       (p) => p && (urlLower === p || urlLower.startsWith(`${p}/`) || urlLower.startsWith(`${p}?`)),
     )
   ) {
+    if (hasExplicitCompany) {
+      const compWords = job.company.slice(0, 256).toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+      if (compWords.some((w) => COMPANY_NEGATION_WORDS.has(w) && !allowedTokens.has(w))) {
+        return false;
+      }
+    }
     return true;
   }
-  const isMultiTenantAts = isKnownMultiTenantAtsUrl(rawUrl);
-  const inferred = inferCompanyFromAtsUrl(rawUrl);
-  const hasExplicitCompany = typeof job.company === 'string' && job.company.trim() !== '' && job.company.trim().toLowerCase() !== 'unknown';
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+    return false;
+  }
+  const host = parsedUrl.hostname.toLowerCase().replace(/\.+$/, '');
+  if (!host) return false;
+
+  // Reject unverified open job aggregators where anyone can post under any company name
+  if (UNVERIFIED_JOB_AGGREGATOR_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`))) {
+    return false;
+  }
+
+  const isMultiTenantAts = isKnownMultiTenantAtsHost(host);
+  const inferredSlug = inferCompanyFromAtsUrl(rawUrl);
+  const curatedFeedHost = job.source ? CURATED_PUBLIC_FEED_HOST_BY_SOURCE[job.source] : undefined;
+  const isCuratedPublicFeed =
+    Boolean(curatedFeedHost && (host === curatedFeedHost || host.endsWith(`.${curatedFeedHost}`)));
+
+  // Expand compound tokens (`"Notion Labs, Inc."` -> `"notionlabsinc"`, `"notionlabs"`, `"notion"`) while bounding total checks
+  const expandedTokens = new Set<string>();
+  for (const rawTok of allowedTokens) {
+    if (!rawTok) continue;
+    const cleanLower = rawTok.trim().toLowerCase();
+    if (cleanLower) expandedTokens.add(cleanLower);
+    for (const exp of expandCompanyFilterTokens(rawTok)) {
+      expandedTokens.add(exp);
+    }
+    if (expandedTokens.size >= 128) break;
+  }
+
   let checked = 0;
-  for (const tok of allowedTokens) {
-    if (!tok) continue;
+  for (const tok of expandedTokens) {
+    if (!tok || tok.length < 2) continue;
     if (++checked > 128) break;
+
     if (isMultiTenantAts) {
-      // On unverified multi-tenant ATS boards (`jobs.lever.co/<slug>`, `boards.greenhouse.io/<slug>`, etc.),
-      // BOTH the ATS tenant slug AND `job.company` (when present) must match `tok` (`jobs8.mjs` impostor board & unrelated board guards)!
-      const slugOk = matchesCompanyCandidateAgainstToken(inferred, tok, { isAtsSlug: true, strictMultiTenant: true });
-      if (!slugOk) continue;
-      const isExactSlugMatch = inferred.trim().toLowerCase() === tok;
-      if (
-        hasExplicitCompany &&
-        !matchesCompanyCandidateAgainstToken(job.company, tok, { strictMultiTenant: !isExactSlugMatch })
-      ) {
-        continue;
+      if (!matchesAtsTenantSlugAgainstToken(inferredSlug, tok)) continue;
+      if (hasExplicitCompany && !matchesCompanyCandidateAgainstToken(job.company, tok)) continue;
+      return true;
+    }
+
+    if (isCuratedPublicFeed) {
+      if (hasExplicitCompany && matchesCompanyCandidateAgainstToken(job.company, tok)) {
+        return true;
       }
-      return true;
+      continue;
     }
-    if (
-      matchesCompanyCandidateAgainstToken(job.company, tok) ||
-      (inferred !== 'unknown' && matchesCompanyCandidateAgainstToken(inferred, tok))
-    ) {
-      return true;
-    }
+
+    // First-party company career site (`stripe.com/jobs`, `careers.stripe.com`, `notion.so/careers`, `amazon.jobs`):
+    // BOTH the registrable domain SLD AND `job.company` (when present) must corroborate `tok` (blocking `stripe.evil.com`, `evil.com`, `stripecareers.com`!)
+    if (!matchesFirstPartyDomainAgainstToken(host, tok)) continue;
+    if (hasExplicitCompany && !matchesCompanyCandidateAgainstToken(job.company, tok)) continue;
+    return true;
   }
   return false;
 }
@@ -4285,7 +4707,7 @@ export async function executeJobsCall(params: {
               const normBase = baseSlug.replace(/[^a-z0-9]+/g, '');
               for (const sb of searchBoards) {
                 const rootBoardSlug = sb.slug.split('/')[0] ?? '';
-                if (normBase && matchesCompanyCandidateAgainstToken(rootBoardSlug, normBase)) {
+                if (normBase && matchesAtsTenantSlugAgainstToken(rootBoardSlug, normBase)) {
                   const entry: DiscoveredAtsBoard = { ...sb, domain: dom };
                   foundForDom.push(entry);
                   discoveredBoards.push(entry);
@@ -4616,8 +5038,9 @@ export async function executeJobsCall(params: {
 
   const allowedCompanyTokens = new Set<string>();
   if (companyFilter) {
-    const cf = companyFilter.toLowerCase().replace(/[^a-z0-9]+/g, '');
-    if (cf) allowedCompanyTokens.add(cf);
+    for (const expanded of expandCompanyFilterTokens(companyFilter)) {
+      allowedCompanyTokens.add(expanded);
+    }
   }
   for (const dom of domainsInput) {
     const ds = (dom.split('.')[0] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');

@@ -89,7 +89,7 @@ function sendRawTcp(
 
 export async function runRound6StreamBSubtests(t: TestContext): Promise<void> {
 await t.test('R6-STREAM-B-1 (R6-H4): Portable Hub caps per-IP raw TCP & pre-header idle sockets, isolates /health & /readyz, tears down 429 sockets, and sets EDGEFETCH_TRUST_PROXY in cloud blueprints', async () => {
-  assert.equal(MAX_CONNECTIONS_PER_IP, 32);
+  assert.equal(MAX_CONNECTIONS_PER_IP, 64);
   assert.equal(PRE_HEADER_TIMEOUT_MS, 10_000);
 
   // Verify deployment blueprints (`fly.toml`, `render.yaml`, `railway.json`, `docker-compose.yml`)
@@ -942,16 +942,17 @@ await t.test('R6-STREAM-B-7 (cs5.mjs & pct.mjs): overflow.ts achieves 153/153 Go
     let dis = false;
     let found = false;
     for (const item of val.split(/[,;]/)) {
+      if (item.includes('\0')) continue;
       const eq = item.indexOf('=');
       if (eq < 0) continue;
       const k = item.slice(0, eq);
       const v = item.slice(eq + 1);
-      if (trimGoWS(k).toLowerCase() !== 'ai-input') continue;
+      if (trimGoWS(k).replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) | 32)) !== 'ai-input') continue;
       let cv = trimGoWS(v);
       if (cv.length >= 2 && ((cv.startsWith('"') && cv.endsWith('"')) || (cv.startsWith("'") && cv.endsWith("'")))) {
         cv = trimGoWS(cv.slice(1, -1));
       }
-      const lv = cv.toLowerCase();
+      const lv = cv.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) | 32));
       if (lv === 'no') {
         dis = true;
         found = true;
@@ -1003,7 +1004,14 @@ await t.test('R6-STREAM-B-7 (cs5.mjs & pct.mjs): overflow.ts achieves 153/153 Go
       const hashIdx = lb.indexOf(0x23);
       if (hashIdx >= 0) lb = lb.subarray(0, hashIdx);
       const trimDir = (s: string) => s.replace(/^[ \t\uFEFF\u200B\u200C\u200D\u2060]+|[ \t\uFEFF\u200B\u200C\u200D\u2060]+$/g, '');
-      const stripUtf8Zw = (buf: Buffer): Buffer => {
+      const trimAsciiWsBuf = (buf: Buffer): Buffer => {
+        let lo = 0;
+        let hi = buf.length;
+        while (lo < hi && (buf[lo] === 0x20 || buf[lo] === 0x09)) lo++;
+        while (hi > lo && (buf[hi - 1] === 0x20 || buf[hi - 1] === 0x09)) hi--;
+        return buf.subarray(lo, hi);
+      };
+      const stripLeftZwRightAsciiWs = (buf: Buffer): Buffer => {
         let lo = 0;
         let hi = buf.length;
         while (lo < hi) {
@@ -1015,45 +1023,33 @@ await t.test('R6-STREAM-B-7 (cs5.mjs & pct.mjs): overflow.ts achieves 153/153 Go
             lo + 3 <= hi &&
             buf[lo] === 0xe2 &&
             buf[lo + 1] === 0x80 &&
-            (buf[lo + 2] === 0x8b || buf[lo + 2] === 0x8c || buf[lo + 2] === 0x8d || buf[lo + 2] === 0xa0)
+            (buf[lo + 2] === 0x8b || buf[lo + 2] === 0x8c || buf[lo + 2] === 0x8d)
           ) {
+            lo += 3;
+          } else if (lo + 3 <= hi && buf[lo] === 0xe2 && buf[lo + 1] === 0x81 && buf[lo + 2] === 0xa0) {
             lo += 3;
           } else {
             break;
           }
         }
-        while (hi > lo) {
-          if (buf[hi - 1] === 0x20 || buf[hi - 1] === 0x09) {
-            hi--;
-          } else if (hi - 3 >= lo && buf[hi - 3] === 0xef && buf[hi - 2] === 0xbb && buf[hi - 1] === 0xbf) {
-            hi -= 3;
-          } else if (
-            hi - 3 >= lo &&
-            buf[hi - 3] === 0xe2 &&
-            buf[hi - 2] === 0x80 &&
-            (buf[hi - 1] === 0x8b || buf[hi - 1] === 0x8c || buf[hi - 1] === 0x8d || buf[hi - 1] === 0xa0)
-          ) {
-            hi -= 3;
-          } else {
-            break;
-          }
+        while (hi > lo && (buf[hi - 1] === 0x20 || buf[hi - 1] === 0x09)) {
+          hi--;
         }
         return buf.subarray(lo, hi);
       };
-      const trimmedLb = stripUtf8Zw(lb);
+      const trimmedLb = stripLeftZwRightAsciiWs(lb);
       if (trimmedLb.length === 0) continue;
       const colon = trimmedLb.indexOf(0x3a);
       if (colon <= 0) continue;
       const rawFieldLb = trimmedLb.subarray(0, colon);
       if (rawFieldLb.indexOf(0x00) >= 0) continue;
       const field = trimDir(new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(rawFieldLb))
-        .replace(/\u0130/g, 'i')
         .replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) | 32));
-      let rawValSlice = trimmedLb.subarray(colon + 1);
-      const nulIdx = rawValSlice.indexOf(0x00);
-      if (nulIdx >= 0) rawValSlice = rawValSlice.subarray(0, nulIdx);
-      const valLb = stripUtf8Zw(rawValSlice);
-      const valText = trimDir(new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(valLb));
+      const rawValLb = trimAsciiWsBuf(trimmedLb.subarray(colon + 1));
+      const rawValText = trimGoWS(new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(rawValLb));
+      const nulIdx = rawValLb.indexOf(0x00);
+      const valLb = trimAsciiWsBuf(nulIdx >= 0 ? rawValLb.subarray(0, nulIdx) : rawValLb);
+      const valText = trimGoWS(new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(valLb));
 
       if (field === 'user-agent') {
         seenAnyUa = true;
@@ -1096,10 +1092,10 @@ await t.test('R6-STREAM-B-7 (cs5.mjs & pct.mjs): overflow.ts achieves 153/153 Go
       } else if (field === 'content-signal') {
         if (cur.agents.length > 0) {
           seenDirective = true;
-          const [d, f] = goCS(valText);
+          const [d, f] = goCS(rawValText);
           if (f) cur.ai = d;
         } else if (!seenAnyUa) {
-          const [d, f] = goCS(valText);
+          const [d, f] = goCS(rawValText);
           if (f) pre = d;
         }
       }

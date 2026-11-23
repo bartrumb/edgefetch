@@ -871,13 +871,6 @@ export function buildCanonicalMcpToolSchemas(options?: {
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Search query (1..500 characters). Supports site:domain.com filtering.' },
-          topic: {
-            type: 'string',
-            enum: ['auto', 'general', 'news'],
-            default: 'auto',
-            description:
-              'Search topic: "auto" (default) detects news queries automatically; "news" targets news headlines; "general" runs standard web search.',
-          },
           maxResults: { type: 'integer', minimum: 1, maximum: 20, default: 5, description: 'Maximum search results to return (1..20).' },
           timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'], description: 'Optional recency filter.' },
           includeDomains: { type: 'array', items: { type: 'string' }, description: 'Restrict results to these domains.' },

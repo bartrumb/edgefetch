@@ -58,6 +58,7 @@ import {
   findRelevantAdapters,
   formatPublicAgentResponse,
   loadAgentRun,
+  MAX_CONCURRENT_AGENTS_PER_USER,
   startOrExecuteAgentCall,
 } from './agent-runner';
 import { authorizeAgent, isCallerAuthorized } from './auth';
@@ -204,6 +205,38 @@ const DEFAULT_UA = 'EdgeFetch/2.7 (bot@edgefetch.dev)';
 const ALLOWED_TARGETS: FetchTarget[] = ['auto', 'agent', 'container'];
 const DAILY_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
 const MAX_SQLITE_TRACKED_HOSTS = 512;
+
+const MAX_CONCURRENT_SCRAPES_PER_USER = 16;
+const MAX_CONCURRENT_INTERACTS_PER_USER = 4;
+
+const inFlightScrapesByUser = new Map<string, number>();
+const inFlightInteractsByUser = new Map<string, number>();
+
+function tryAcquireUserConcurrencySlot(
+  buckets: Map<string, number>,
+  userId: string | undefined,
+  maxConcurrent: number,
+): (() => void) | null {
+  const key = (userId ?? '').trim() || 'owner';
+  const cur = buckets.get(key) ?? 0;
+  if (cur >= maxConcurrent) return null;
+  buckets.set(key, cur + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = (buckets.get(key) ?? 1) - 1;
+    if (next <= 0) buckets.delete(key);
+    else buckets.set(key, next);
+  };
+}
+
+function userQuotaExceededResponse(message: string): Response {
+  return Response.json(
+    { ok: false, success: false, error: 'user_quota_exceeded', message },
+    { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': '2' } },
+  );
+}
 
 export { CrawlWorkflow, IngestWorkflow };
 
@@ -1466,40 +1499,102 @@ export default {
             }
             return { connected: state.connected, agents: state.agents, affinities: state.affinities };
           },
-          executeFetch: ({ target, site, body, principal }) =>
-            executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`),
+          executeFetch: async ({ target, site, body, principal }) => {
+            const effectiveUserId = getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
+            const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
+              inFlightScrapesByUser,
+              effectiveUserId,
+              MAX_CONCURRENT_SCRAPES_PER_USER,
+            );
+            if (!releaseScrapeSlot) {
+              return {
+                status: 429,
+                via: 'hub',
+                bodyText: JSON.stringify({
+                  ok: false,
+                  error: 'user_quota_exceeded',
+                  message: `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                }),
+                retryAfter: '2',
+              };
+            }
+            try {
+              return await executeHubFetch(target, body, site, `mcp:${principal ?? 'client'}`);
+            } finally {
+              releaseScrapeSlot();
+            }
+          },
           executeScrape: async ({ args, principal, userId }) => {
-            const effectiveUserId = userId ?? resolveCallerUserId({ principal });
+            const activeAuth = getActiveCallerAuthContext();
+            const effectivePrincipal = activeAuth?.principal ?? principal ?? '';
+            const hasMcpCallScope = effectivePrincipal.startsWith('oauth:')
+              ? Boolean(activeAuth?.scopes.includes('mcp:call'))
+              : true;
+            const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
             const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanArgs } = args as Record<string, unknown>;
-            const hasCallerCookies =
-              (typeof cleanArgs.cookies === 'string' && cleanArgs.cookies.trim().length > 0) ||
-              (Array.isArray(cleanArgs.cookies) && cleanArgs.cookies.length > 0) ||
-              (cleanArgs.cookies !== null && typeof cleanArgs.cookies === 'object' && Object.keys(cleanArgs.cookies as object).length > 0);
-            if (hasCallerCookies || cleanArgs.auth || cleanArgs.preferMcp === true || effectiveUserId !== 'owner') {
-              cleanArgs.visibility = 'private';
+            if ((cleanArgs.preferMcp === true || cleanArgs.useConnectedMcp === true) && !hasMcpCallScope) {
+              return {
+                status: 403,
+                body: {
+                  ok: false,
+                  error: 'insufficient_scope',
+                  message: 'Scope mcp:call is required to route scrape through connected MCP servers.',
+                },
+              };
             }
-            if (typeof cleanArgs.url === 'string' && cleanArgs.url.trim() && cleanArgs.useConnectedMcp !== false) {
-              const mcpOut = await tryScrapeViaConnectedMcp({
-                userId: effectiveUserId,
-                targetUrl: cleanArgs.url.trim(),
-                ...(typeof cleanArgs.query === 'string' ? { query: cleanArgs.query } : {}),
-                preferMcp: cleanArgs.preferMcp === true,
-                vaultStore,
-                vaultMasterKey: env.VAULT_MASTER_KEY,
-                fetchFn: safePublicFetch,
+            const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
+              inFlightScrapesByUser,
+              effectiveUserId,
+              MAX_CONCURRENT_SCRAPES_PER_USER,
+            );
+            if (!releaseScrapeSlot) {
+              return {
+                status: 429,
+                body: {
+                  ok: false,
+                  error: 'user_quota_exceeded',
+                  message: `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                },
+              };
+            }
+            try {
+              const hasCallerCookies =
+                (typeof cleanArgs.cookies === 'string' && cleanArgs.cookies.trim().length > 0) ||
+                (Array.isArray(cleanArgs.cookies) && cleanArgs.cookies.length > 0) ||
+                (cleanArgs.cookies !== null && typeof cleanArgs.cookies === 'object' && Object.keys(cleanArgs.cookies as object).length > 0);
+              if (hasCallerCookies || cleanArgs.auth || cleanArgs.preferMcp === true || effectiveUserId !== 'owner') {
+                cleanArgs.visibility = 'private';
+              }
+              if (
+                hasMcpCallScope &&
+                typeof cleanArgs.url === 'string' &&
+                cleanArgs.url.trim() &&
+                cleanArgs.useConnectedMcp !== false
+              ) {
+                const mcpOut = await tryScrapeViaConnectedMcp({
+                  userId: effectiveUserId,
+                  targetUrl: cleanArgs.url.trim(),
+                  ...(typeof cleanArgs.query === 'string' ? { query: cleanArgs.query } : {}),
+                  preferMcp: cleanArgs.preferMcp === true,
+                  vaultStore,
+                  vaultMasterKey: env.VAULT_MASTER_KEY,
+                  fetchFn: safePublicFetch,
+                  selfHost: url.hostname,
+                });
+                if (mcpOut) return { status: mcpOut.status, body: mcpOut.body };
+              }
+              const out = await executeScrapeCall({
+                payload: cleanArgs as ScrapeRequestPayload,
+                env,
+                executeHubFetch,
                 selfHost: url.hostname,
+                source: `mcp-scrape:${principal ?? 'client'}`,
+                userId: effectiveUserId,
               });
-              if (mcpOut) return { status: mcpOut.status, body: mcpOut.body };
+              return { status: out.status, body: { via: out.via, ...out.body } };
+            } finally {
+              releaseScrapeSlot();
             }
-            const out = await executeScrapeCall({
-              payload: cleanArgs as ScrapeRequestPayload,
-              env,
-              executeHubFetch,
-              selfHost: url.hostname,
-              source: `mcp-scrape:${principal ?? 'client'}`,
-              userId: effectiveUserId,
-            });
-            return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeExtract: async ({ args, principal, userId }) => {
             const out = await executeExtractCall({
@@ -1513,17 +1608,37 @@ export default {
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeInteract: async ({ args, principal, userId }) => {
-            const out = await executeInteractCall({
-              payload: args as InteractRequestPayload,
-              env,
-              executeHubFetch,
-              selfHost: url.hostname,
-              source: `mcp-interact:${principal ?? 'client'}`,
-              principal: principal ?? 'client',
-              userId,
-              sessionSigningSecret: sessionSecret,
-            });
-            return { status: out.status, body: { via: out.via, ...out.body } };
+            const effectiveUserId = userId ?? getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
+            const releaseInteractSlot = tryAcquireUserConcurrencySlot(
+              inFlightInteractsByUser,
+              effectiveUserId,
+              MAX_CONCURRENT_INTERACTS_PER_USER,
+            );
+            if (!releaseInteractSlot) {
+              return {
+                status: 429,
+                body: {
+                  ok: false,
+                  error: 'user_quota_exceeded',
+                  message: `Per-user concurrent interact limit (${MAX_CONCURRENT_INTERACTS_PER_USER}) exceeded.`,
+                },
+              };
+            }
+            try {
+              const out = await executeInteractCall({
+                payload: args as InteractRequestPayload,
+                env,
+                executeHubFetch,
+                selfHost: url.hostname,
+                source: `mcp-interact:${principal ?? 'client'}`,
+                principal: principal ?? 'client',
+                userId: effectiveUserId,
+                sessionSigningSecret: sessionSecret,
+              });
+              return { status: out.status, body: { via: out.via, ...out.body } };
+            } finally {
+              releaseInteractSlot();
+            }
           },
           executeMap: async ({ args, principal }) => {
             const out = await executeMapCall({
@@ -1582,6 +1697,7 @@ export default {
                   params: {
                     crawlId: created.crawlId,
                     rootUrl: created.rootUrl,
+                    userId: effectiveUserId,
                     options: created.options,
                     selfHost: url.hostname,
                   },
@@ -1595,6 +1711,7 @@ export default {
               const jobPromise = executeCrawlJob({
                 crawlId: created.crawlId,
                 rootUrl: created.rootUrl,
+                userId: effectiveUserId,
                 options: created.options,
                 env,
                 executeHubFetch,
@@ -1876,6 +1993,9 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
           return Response.json(buildCapabilities(env, HUB_VERSION), {
             status: 200,
             headers: { 'cache-control': 'no-store' },
@@ -1896,6 +2016,9 @@ export default {
               { error: 'unauthorized' },
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
           }
           const category = url.searchParams.get('category') ?? undefined;
           const extractors = listRegisteredAdapters(category);
@@ -1940,31 +2063,94 @@ export default {
       const compatMeta = resolveCompatSpanMeta(url.pathname);
       if (compatMeta) {
         const compatRes = await withRouteSpan(compatMeta.spanName, { 'edgefetch.compat': compatMeta.flavor }, async () => {
-          const compatWaitUntil = trackedCtx?.waitUntil
-            ? (p: Promise<unknown>) => trackedCtx.waitUntil(p)
-            : (p: Promise<unknown>) => {
-                void p
-                  .catch(() => undefined)
-                  .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
-              };
-          const res = await handleCompatRoutes({
-            request,
-            url,
-            env,
-            oauthStore,
-            vaultStore,
-            executeHubFetch,
-            waitUntil: compatWaitUntil,
-            tracer: getActiveRequestTracer() ?? rootTracer,
-          });
-          if (res && (res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
-            return wrapSseResponseWithFlush(res, () => {
-              const p = flushTracerWithTelemetry(rootTracer);
-              if (ctx?.waitUntil) ctx.waitUntil(p);
-              return p;
+          let releaseCompatScrapeSlot: (() => void) | null = null;
+          if (
+            request.method === 'POST' &&
+            (compatMeta.spanName === 'edgefetch.scrape' || compatMeta.spanName === 'edgefetch.batch_scrape')
+          ) {
+            const preAuth = await authorizeMcpRequest({
+              request,
+              origin: url.origin,
+              ownerSecret: env.CALLER_TOKEN,
+              ...(env.MCP_TOKEN ? { mcpToken: env.MCP_TOKEN } : {}),
+              store: oauthStore,
             });
+            if (preAuth.ok) {
+              const callerUid = resolveCallerUserId(preAuth as { userId?: string; principal?: string });
+              const hasMcpCallScope = !preAuth.principal.startsWith('oauth:') || preAuth.scopes.includes('mcp:call');
+              if (!hasMcpCallScope && compatMeta.spanName === 'edgefetch.scrape') {
+                const cloned = await readBodyTextCapped(request.clone() as unknown as Request, MAX_CALL_UTF8_BYTES);
+                if (cloned.ok) {
+                  try {
+                    const parsedBody = JSON.parse(cloned.text) as Record<string, unknown>;
+                    if (parsedBody.preferMcp === true || parsedBody.useConnectedMcp === true) {
+                      return Response.json(
+                        {
+                          ok: false,
+                          success: false,
+                          error: 'insufficient_scope',
+                          message: 'Scope mcp:call is required to route scrape through connected MCP servers.',
+                        },
+                        { status: 403, headers: { 'cache-control': 'no-store' } },
+                      );
+                    }
+                  } catch {
+                    // let compat handler return 400
+                  }
+                }
+              }
+              if (compatMeta.spanName === 'edgefetch.scrape') {
+                releaseCompatScrapeSlot = tryAcquireUserConcurrencySlot(
+                  inFlightScrapesByUser,
+                  callerUid,
+                  MAX_CONCURRENT_SCRAPES_PER_USER,
+                );
+                if (!releaseCompatScrapeSlot) {
+                  return userQuotaExceededResponse(
+                    `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                  );
+                }
+              } else if ((inFlightScrapesByUser.get(callerUid) ?? 0) >= MAX_CONCURRENT_SCRAPES_PER_USER) {
+                return userQuotaExceededResponse(
+                  `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                );
+              }
+            }
           }
-          return res ?? Response.json({ success: false, error: 'not_found' }, { status: 404 });
+          try {
+            const compatWaitUntil = trackedCtx?.waitUntil
+              ? (p: Promise<unknown>) => trackedCtx.waitUntil(p)
+              : (p: Promise<unknown>) => {
+                  void p
+                    .catch(() => undefined)
+                    .finally(() => flushTracerWithTelemetry(rootTracer).catch(() => false));
+                };
+            const res = await handleCompatRoutes({
+              request,
+              url,
+              env,
+              oauthStore,
+              vaultStore,
+              executeHubFetch,
+              waitUntil: compatWaitUntil,
+              tracer: getActiveRequestTracer() ?? rootTracer,
+            });
+            if (res && (res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
+              return wrapSseResponseWithFlush(res, () => {
+                const p = flushTracerWithTelemetry(rootTracer);
+                if (ctx?.waitUntil) ctx.waitUntil(p);
+                return p;
+              });
+            }
+            if (res && res.status === 429 && !res.headers.get('retry-after')) {
+              const hdrs = new Headers(res.headers);
+              hdrs.set('retry-after', '2');
+              return new Response(res.body, { status: 429, statusText: res.statusText, headers: hdrs });
+            }
+            return res ?? Response.json({ success: false, error: 'not_found' }, { status: 404 });
+          } finally {
+            releaseCompatScrapeSlot?.();
+          }
         });
         if (compatRes) return compatRes;
       }
@@ -1982,6 +2168,9 @@ export default {
               { error: 'unauthorized' },
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
           }
           const blobSha256 = url.pathname.slice('/v1/artifacts/'.length).trim().toLowerCase();
           return await handleArtifactGetRequest({
@@ -2114,60 +2303,86 @@ export default {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
           const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const hasMcpCallScope = !auth.principal.startsWith('oauth:') || auth.scopes.includes('mcp:call');
           const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanScrapeObj } =
             payload as unknown as Record<string, unknown>;
-          const hasCallerCookies =
-            (typeof cleanScrapeObj.cookies === 'string' && cleanScrapeObj.cookies.trim().length > 0) ||
-            (Array.isArray(cleanScrapeObj.cookies) && cleanScrapeObj.cookies.length > 0) ||
-            (cleanScrapeObj.cookies !== null &&
-              typeof cleanScrapeObj.cookies === 'object' &&
-              Object.keys(cleanScrapeObj.cookies as object).length > 0);
-          if (hasCallerCookies || cleanScrapeObj.auth || cleanScrapeObj.preferMcp === true || callerUserId !== 'owner') {
-            cleanScrapeObj.visibility = 'private';
+          if ((cleanScrapeObj.preferMcp === true || cleanScrapeObj.useConnectedMcp === true) && !hasMcpCallScope) {
+            return Response.json(
+              {
+                ok: false,
+                error: 'insufficient_scope',
+                message: 'Scope mcp:call is required to route scrape through connected MCP servers.',
+              },
+              { status: 403, headers: { 'cache-control': 'no-store' } },
+            );
           }
-          const cleanPayload = cleanScrapeObj as ScrapeRequestPayload;
-          if (
-            typeof cleanPayload.url === 'string' &&
-            cleanPayload.url.trim() &&
-            cleanScrapeObj.useConnectedMcp !== false
-          ) {
-            const mcpOut = await tryScrapeViaConnectedMcp({
-              userId: callerUserId,
-              targetUrl: cleanPayload.url.trim(),
-              ...(typeof cleanPayload.query === 'string' ? { query: cleanPayload.query } : {}),
-              preferMcp: cleanScrapeObj.preferMcp === true,
-              vaultStore,
-              vaultMasterKey: env.VAULT_MASTER_KEY,
-              fetchFn: safePublicFetch,
-              selfHost: url.hostname,
-            });
-            if (mcpOut) {
-              return Response.json(mcpOut.body, {
-                status: mcpOut.status,
-                headers: {
-                  'cache-control': 'private, no-store',
-                  'x-crawler-via': mcpOut.via,
-                },
-              });
+          const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
+            inFlightScrapesByUser,
+            callerUserId,
+            MAX_CONCURRENT_SCRAPES_PER_USER,
+          );
+          if (!releaseScrapeSlot) {
+            return userQuotaExceededResponse(
+              `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+            );
+          }
+          try {
+            const hasCallerCookies =
+              (typeof cleanScrapeObj.cookies === 'string' && cleanScrapeObj.cookies.trim().length > 0) ||
+              (Array.isArray(cleanScrapeObj.cookies) && cleanScrapeObj.cookies.length > 0) ||
+              (cleanScrapeObj.cookies !== null &&
+                typeof cleanScrapeObj.cookies === 'object' &&
+                Object.keys(cleanScrapeObj.cookies as object).length > 0);
+            if (hasCallerCookies || cleanScrapeObj.auth || cleanScrapeObj.preferMcp === true || callerUserId !== 'owner') {
+              cleanScrapeObj.visibility = 'private';
             }
+            const cleanPayload = cleanScrapeObj as ScrapeRequestPayload;
+            if (
+              hasMcpCallScope &&
+              typeof cleanPayload.url === 'string' &&
+              cleanPayload.url.trim() &&
+              cleanScrapeObj.useConnectedMcp !== false
+            ) {
+              const mcpOut = await tryScrapeViaConnectedMcp({
+                userId: callerUserId,
+                targetUrl: cleanPayload.url.trim(),
+                ...(typeof cleanPayload.query === 'string' ? { query: cleanPayload.query } : {}),
+                preferMcp: cleanScrapeObj.preferMcp === true,
+                vaultStore,
+                vaultMasterKey: env.VAULT_MASTER_KEY,
+                fetchFn: safePublicFetch,
+                selfHost: url.hostname,
+              });
+              if (mcpOut) {
+                return Response.json(mcpOut.body, {
+                  status: mcpOut.status,
+                  headers: {
+                    'cache-control': 'private, no-store',
+                    'x-crawler-via': mcpOut.via,
+                  },
+                });
+              }
+            }
+            const out = await executeScrapeCall({
+              payload: cleanPayload,
+              env,
+              executeHubFetch,
+              selfHost: url.hostname,
+              source: `scrape:${auth.principal}`,
+              userId: auth.userId,
+            });
+            const isPrivateScrape = (out.body as { visibility?: string }).visibility === 'private';
+            return Response.json(out.body, {
+              status: out.status,
+              headers: {
+                'cache-control': isPrivateScrape ? 'private, no-store' : 'no-store',
+                'x-crawler-via': out.via,
+                ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+              },
+            });
+          } finally {
+            releaseScrapeSlot();
           }
-          const out = await executeScrapeCall({
-            payload: cleanPayload,
-            env,
-            executeHubFetch,
-            selfHost: url.hostname,
-            source: `scrape:${auth.principal}`,
-            userId: auth.userId,
-          });
-          const isPrivateScrape = (out.body as { visibility?: string }).visibility === 'private';
-          return Response.json(out.body, {
-            status: out.status,
-            headers: {
-              'cache-control': isPrivateScrape ? 'private, no-store' : 'no-store',
-              'x-crawler-via': out.via,
-              ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
-            },
-          });
         });
       }
 
@@ -2394,20 +2609,35 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
-          const out = await executeInteractCall({
-            payload,
-            env,
-            executeHubFetch,
-            selfHost: url.hostname,
-            source: `interact:${auth.principal}`,
-            principal: auth.principal,
-            userId: auth.userId,
-            sessionSigningSecret: sessionSecret,
-          });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
-          });
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const releaseInteractSlot = tryAcquireUserConcurrencySlot(
+            inFlightInteractsByUser,
+            callerUserId,
+            MAX_CONCURRENT_INTERACTS_PER_USER,
+          );
+          if (!releaseInteractSlot) {
+            return userQuotaExceededResponse(
+              `Per-user concurrent interact limit (${MAX_CONCURRENT_INTERACTS_PER_USER}) exceeded.`,
+            );
+          }
+          try {
+            const out = await executeInteractCall({
+              payload,
+              env,
+              executeHubFetch,
+              selfHost: url.hostname,
+              source: `interact:${auth.principal}`,
+              principal: auth.principal,
+              userId: auth.userId,
+              sessionSigningSecret: sessionSecret,
+            });
+            return Response.json(out.body, {
+              status: out.status,
+              headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+            });
+          } finally {
+            releaseInteractSlot();
+          }
         });
       }
 
@@ -2512,6 +2742,9 @@ export default {
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
           }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
           const cappedPreview = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
           if (!cappedPreview.ok) {
             return Response.json(
@@ -2560,25 +2793,56 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          if ((inFlightScrapesByUser.get(callerUserId) ?? 0) >= MAX_CONCURRENT_SCRAPES_PER_USER) {
+            return userQuotaExceededResponse(
+              `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+            );
+          }
           const batchOut = await startOrExecuteBatchScrape({
             payload,
             selfHost: url.hostname,
             userId: auth.userId,
             executeScrape: async (scArgs) => {
-              const res = await executeScrapeCall({
-                payload: scArgs as ScrapeRequestPayload,
-                env,
-                executeHubFetch,
-                selfHost: url.hostname,
-                source: `batch-scrape:${auth.principal}`,
-                userId: auth.userId,
-              });
-              return { status: res.status, body: res.body };
+              const releaseBatchItemSlot = tryAcquireUserConcurrencySlot(
+                inFlightScrapesByUser,
+                callerUserId,
+                MAX_CONCURRENT_SCRAPES_PER_USER,
+              );
+              if (!releaseBatchItemSlot) {
+                return {
+                  status: 429,
+                  body: {
+                    ok: false,
+                    error: 'user_quota_exceeded',
+                    message: `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                  },
+                };
+              }
+              try {
+                const res = await executeScrapeCall({
+                  payload: scArgs as ScrapeRequestPayload,
+                  env,
+                  executeHubFetch,
+                  selfHost: url.hostname,
+                  source: `batch-scrape:${auth.principal}`,
+                  userId: auth.userId,
+                });
+                return { status: res.status, body: res.body };
+              } finally {
+                releaseBatchItemSlot();
+              }
             },
             ...(trackedCtx?.waitUntil ? { waitUntil: (p: Promise<unknown>) => trackedCtx.waitUntil(p) } : {}),
           });
           if (!batchOut.ok) {
-            return Response.json({ ok: false, error: batchOut.error, message: batchOut.message }, { status: batchOut.status });
+            return Response.json(
+              { ok: false, error: batchOut.error, message: batchOut.message },
+              {
+                status: batchOut.status,
+                headers: batchOut.status === 429 ? { 'cache-control': 'no-store', 'retry-after': '2' } : { 'cache-control': 'no-store' },
+              },
+            );
           }
           return Response.json(
             {
@@ -2616,6 +2880,9 @@ export default {
           }
           const batchId = rawBatchId.trim();
           if (request.method === 'GET') {
+            if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+              return Response.json({ ok: false, error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            }
             const job = getBatchScrapeStatus(batchId, auth.userId);
             if (!job) return Response.json({ ok: false, error: 'batch_not_found' }, { status: 404 });
             return Response.json({ ok: true, ...job }, { status: 200, headers: { 'cache-control': 'no-store' } });
@@ -2689,7 +2956,13 @@ export default {
               return p;
             });
           }
-          return Response.json(out.body, { status: out.status, headers: { 'cache-control': 'no-store' } });
+          return Response.json(out.body, {
+            status: out.status,
+            headers: {
+              'cache-control': 'no-store',
+              ...(out.status === 429 ? { 'retry-after': '2' } : {}),
+            },
+          });
         });
       }
 
@@ -2707,6 +2980,9 @@ export default {
               { error: 'unauthorized' },
               { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
             );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
           }
           const rawAgentId = safeDecodeURIComponent(agentTraceMatch[1] ?? '');
           if (rawAgentId === null) {
@@ -2755,6 +3031,9 @@ export default {
           const agentId = rawAgentId.trim();
           const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
           if (request.method === 'GET') {
+            if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+              return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            }
             const rec = await loadAgentRun(agentId, env.META, callerUserId);
             if (!rec) return Response.json({ ok: false, error: 'agent_not_found' }, { status: 404 });
             return Response.json(formatPublicAgentResponse(rec, false), { status: 200, headers: { 'cache-control': 'no-store' } });
@@ -2832,6 +3111,7 @@ export default {
                 params: {
                   crawlId: created.crawlId,
                   rootUrl: created.rootUrl,
+                  userId: auth.userId,
                   options: created.options,
                   selfHost: url.hostname,
                 },
@@ -2845,6 +3125,7 @@ export default {
             const jobPromise = executeCrawlJob({
               crawlId: created.crawlId,
               rootUrl: created.rootUrl,
+              userId: auth.userId,
               options: created.options,
               env,
               executeHubFetch,

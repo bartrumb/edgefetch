@@ -2341,6 +2341,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Short alias for `query` keyword filter.",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -4302,16 +4311,6 @@
           "query": {
             "type": "string",
             "description": "Search query (1..500 characters). Supports site:domain.com filtering."
-          },
-          "topic": {
-            "type": "string",
-            "enum": [
-              "auto",
-              "general",
-              "news"
-            ],
-            "default": "auto",
-            "description": "Search topic: \"auto\" (default) detects news queries automatically; \"news\" targets news headlines; \"general\" runs standard web search."
           },
           "maxResults": {
             "type": "integer",
@@ -6568,16 +6567,6 @@
           "query": {
             "type": "string",
             "description": "Search query (1..500 characters). Supports site:domain.com filtering."
-          },
-          "topic": {
-            "type": "string",
-            "enum": [
-              "auto",
-              "general",
-              "news"
-            ],
-            "default": "auto",
-            "description": "Search topic: \"auto\" (default) detects news queries automatically; \"news\" targets news headlines; \"general\" runs standard web search."
           },
           "maxResults": {
             "type": "integer",

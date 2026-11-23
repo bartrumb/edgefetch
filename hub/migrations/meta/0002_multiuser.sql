@@ -4,6 +4,10 @@ CREATE TABLE IF NOT EXISTS users (
   github_login TEXT NOT NULL,
   avatar_url TEXT,
   role TEXT NOT NULL CHECK (role IN ('owner', 'member')) DEFAULT 'member',
+  admitted_via TEXT,
+  admitted_org TEXT,
+  encrypted_gh_token TEXT,
+  org_verified_at INTEGER,
   created_at INTEGER NOT NULL,
   last_login_at INTEGER NOT NULL
 ) STRICT;

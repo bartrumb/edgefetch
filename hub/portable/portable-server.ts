@@ -18,6 +18,7 @@ import { authorizeAgent, isValidSecretMatch } from '../src/auth';
 import { resolveSessionSecret } from '../src/github-auth';
 import hubWorker from '../src/index';
 import { ADMIN_COOKIE_NAME, verifyAdminSessionCookie, type OAuthTokenRecord } from '../src/oauth';
+import { markRequestVerifiedInProcess } from '../src/otel';
 import { normalizeClientRateLimitIp } from '../src/safe-input';
 import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './node-adapters';
 import { S3ArtifactBucket } from './s3-bucket';
@@ -26,11 +27,14 @@ import { TursoHttpD1Database } from './turso-d1';
 
 export const MAX_INFLIGHT_PER_IP = 16;
 export const MAX_INFLIGHT_TOTAL = 128;
-export const MAX_CONNECTIONS_PER_IP = 32;
-export const MAX_CONNECTIONS_TOTAL = 512;
-export const MAX_PREHEADER_SOCKETS_PER_IP = 4;
-export const MAX_GLOBAL_PREHEADER_SOCKETS = 128;
+export const MAX_CONNECTIONS_PER_IP = 64;
+export const MAX_CONNECTIONS_TOTAL = 1024;
+export const MAX_PREHEADER_SOCKETS_PER_IP = 32;
+export const MAX_GLOBAL_PREHEADER_SOCKETS = 512;
 export const LOOPBACK_RESERVED_CONNECTIONS = 32;
+export const PUBLIC_DISCOVERY_RESERVED_INFLIGHT = 32;
+export const FRESH_PREHEADER_GRACE_MS = 250;
+export const SHARED_NAT_PREHEADER_EVICT_AGE_MS = 50;
 export const PRE_HEADER_TIMEOUT_MS = 10_000;
 export const FIRST_BYTE_PREHEADER_TIMEOUT_MS = 5_000;
 export const MAX_AGENT_WS_CONNECTIONS = 128;
@@ -459,17 +463,18 @@ function incomingToWebRequest(
   const resolvedIp = resolveTrustedClientIp(req, trustProxy, trustFlyClientIp);
   headers.set('cf-connecting-ip', resolvedIp);
   headers.set('x-real-ip', resolvedIp);
-  if (verifiedCallerAuth) {
-    headers.set('x-ef-verified-auth', '1');
-  }
 
   const method = (req.method ?? 'GET').toUpperCase();
   const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
-  return new Request(fullUrl, {
+  const webReq = new Request(fullUrl, {
     method,
     headers,
     ...(hasBody ? { body: safeNodeReqToWebStream(req), duplex: 'half' } : {}),
   } as RequestInit);
+  if (verifiedCallerAuth) {
+    markRequestVerifiedInProcess(webReq);
+  }
+  return webReq;
 }
 
 function singleHeaderString(val: string | string[] | undefined): string | null {
@@ -749,6 +754,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const inflightByIp = new Map<string, number>();
   let totalInflight = 0;
   let unauthInflight = 0;
+  let publicDiscoveryInflight = 0;
   const maxUnauthInflight =
     maxInflightTotal >= 8 ? maxInflightTotal - Math.min(32, Math.floor(maxInflightTotal / 4)) : maxInflightTotal;
 
@@ -800,14 +806,31 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     const methodUpper = (req.method ?? 'GET').toUpperCase();
     const isHealthProbe =
       (methodUpper === 'GET' || methodUpper === 'HEAD') && (rawPathname === '/health' || rawPathname === '/readyz');
+    const hasAuthAttemptHeader = Boolean(
+      req.headers.authorization || req.headers['x-api-key'] || req.headers.cookie,
+    );
     const hasCallerAuth = isHealthProbe ? false : await hasVerifiedCallerCredentials(req, rawPathname);
+    const isPublicDiscoveryRoute =
+      !isHealthProbe &&
+      !hasAuthAttemptHeader &&
+      (methodUpper === 'GET' || methodUpper === 'HEAD' || methodUpper === 'OPTIONS') &&
+      (rawPathname === '/openapi.json' ||
+        rawPathname.startsWith('/.well-known/') ||
+        rawPathname === '/admin' ||
+        rawPathname === '/admin/login' ||
+        rawPathname === '/robots.txt');
 
     const clientBucket = normalizeClientRateLimitIp(resolveTrustedClientIp(req, trustProxy, trustFlyClientIp));
     const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
     const hitPerIpLimit = curIpInflight >= maxInflightPerIp;
     const hitGlobalLimit = isHealthProbe
       ? totalInflight >= maxInflightTotal + 64
-      : totalInflight >= maxInflightTotal || (!hasCallerAuth && unauthInflight >= maxUnauthInflight);
+      : isPublicDiscoveryRoute
+        ? totalInflight >= maxInflightTotal + PUBLIC_DISCOVERY_RESERVED_INFLIGHT ||
+          (!hasCallerAuth &&
+            unauthInflight >= maxUnauthInflight &&
+            publicDiscoveryInflight >= PUBLIC_DISCOVERY_RESERVED_INFLIGHT)
+        : totalInflight >= maxInflightTotal || (!hasCallerAuth && unauthInflight >= maxUnauthInflight);
 
     if (hitPerIpLimit || hitGlobalLimit) {
       res.statusCode = 429;
@@ -822,14 +845,18 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     }
 
     totalInflight++;
-    if (!hasCallerAuth && !isHealthProbe) unauthInflight++;
+    const countedInPublicDiscovery = !hasCallerAuth && !isHealthProbe && isPublicDiscoveryRoute;
+    const countedInUnauth = !hasCallerAuth && !isHealthProbe && !isPublicDiscoveryRoute;
+    if (countedInPublicDiscovery) publicDiscoveryInflight++;
+    if (countedInUnauth) unauthInflight++;
     inflightByIp.set(clientBucket, curIpInflight + 1);
     let slotReleased = false;
     const releaseInflightSlot = () => {
       if (slotReleased) return;
       slotReleased = true;
       totalInflight = Math.max(0, totalInflight - 1);
-      if (!hasCallerAuth && !isHealthProbe) unauthInflight = Math.max(0, unauthInflight - 1);
+      if (countedInPublicDiscovery) publicDiscoveryInflight = Math.max(0, publicDiscoveryInflight - 1);
+      if (countedInUnauth) unauthInflight = Math.max(0, unauthInflight - 1);
       const rem = inflightByIp.get(clientBucket) ?? 0;
       if (rem <= 1) inflightByIp.delete(clientBucket);
       else inflightByIp.set(clientBucket, rem - 1);
@@ -974,54 +1001,90 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       return;
     }
 
-    const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
-    const curPreHeaderForIp = preHeaderSocketsByIp.get(sockBucket) ?? 0;
+    const nowConnMs = Date.now();
     const effectivePreHeaderPerIpCap =
       !trustProxy || hasExplicitMaxPreHeaderPerIp
         ? maxPreHeaderPerIp
-        : Math.max(maxPreHeaderPerIp, Math.min(64, maxGlobalPreHeaderSockets));
+        : Math.max(maxPreHeaderPerIp, Math.min(128, maxGlobalPreHeaderSockets));
 
-    if (
-      remoteActiveSockets >= maxConnectionsTotal ||
-      curActiveForIp >= effectiveRawPerIpCap ||
-      curPreHeaderForIp >= effectivePreHeaderPerIpCap
-    ) {
+    // Shared-NAT defense (`R8-M1`): if stalled pre-header sockets on `sockBucket` have filled its per-IP pre-header cap
+    // (`curPreHeaderForIp >= effectivePreHeaderPerIpCap`), evict the OLDEST stalled (`>= 50ms`) pre-header socket from
+    // `sockBucket` so 4..32 idle sockets behind a shared corporate/carrier NAT can NEVER block 153 other NAT peers!
+    while ((preHeaderSocketsByIp.get(sockBucket) ?? 0) >= effectivePreHeaderPerIpCap) {
+      let sameIpVictimSock: net.Socket | null = null;
+      let sameIpVictimMeta: { bucket: string; connectedAt: number; finish: () => void } | null = null;
+      for (const [candSock, candMeta] of remotePreHeaderSockets) {
+        if (candMeta.bucket === sockBucket && nowConnMs - candMeta.connectedAt >= SHARED_NAT_PREHEADER_EVICT_AGE_MS) {
+          sameIpVictimSock = candSock;
+          sameIpVictimMeta = candMeta;
+          break;
+        }
+      }
+      if (!sameIpVictimSock || !sameIpVictimMeta) {
+        socket.destroy();
+        return;
+      }
+      sameIpVictimMeta.finish();
+      sameIpVictimSock.destroy();
+    }
+
+    const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
+    if (remoteActiveSockets >= maxConnectionsTotal || curActiveForIp >= effectiveRawPerIpCap) {
       socket.destroy();
       return;
     }
 
-    // Global pre-header eviction: evict the oldest truly silent (`bytesRead === 0`) multi-socket or aged pre-header socket
-    // synchronously instead of dropping newly arriving connections or freshly accepted single-socket clients!
-    const nowConnMs = Date.now();
+    // Fair global pre-header eviction (`R8-H1`, defeats 0-byte silent floods, 33-IP 1-byte reconnect floods, AND 60-IP stalled + burst):
+    //  - Never treat `bytesRead === 0` vs `bytesRead === 1` as a trust signal (attackers trivially send `'G'` immediately).
+    //  - Pass 1 (Aged-First): Always evict stalled pre-header sockets (`age >= FRESH_PREHEADER_GRACE_MS`) BEFORE touching any
+    //    fresh (`< 250ms`) handshake, preferring the heaviest bucket among aged sockets (ties broken by FIFO oldest age).
+    //    This ensures a legitimate client opening a 12-connection burst (`age < 250ms`) NEVER self-cannibalizes its own fresh
+    //    handshakes when 32..60 single-socket attacker IPs are sitting stalled in the pool!
+    //  - Pass 2 (Active Sub-Grace Flood): Only when ZERO aged (`>= 250ms`) sockets exist in `remotePreHeaderSockets`, evict the
+    //    oldest socket from the heaviest OTHER multi-socket IP bucket (`bKey !== sockBucket && bCount >= 2`).
+    //  - Pass 3: Otherwise drop the incoming excess socket rather than killing an in-flight `< 250ms` handshake.
     while (remotePreHeaderSockets.size >= maxGlobalPreHeaderSockets) {
       let victimSocket: net.Socket | null = null;
       let victimMeta: { bucket: string; connectedAt: number; finish: () => void } | null = null;
+      let victimBucketCount = 0;
 
       for (const [candSock, candMeta] of remotePreHeaderSockets) {
-        if (
-          candSock.bytesRead === 0 &&
-          ((preHeaderSocketsByIp.get(candMeta.bucket) ?? 0) >= 2 || nowConnMs - candMeta.connectedAt >= 50)
-        ) {
-          victimSocket = candSock;
-          victimMeta = candMeta;
-          break;
-        }
-      }
-      if (!victimSocket) {
-        for (const [candSock, candMeta] of remotePreHeaderSockets) {
-          if (candSock.bytesRead === 0) {
+        if (nowConnMs - candMeta.connectedAt >= FRESH_PREHEADER_GRACE_MS) {
+          const bCount = preHeaderSocketsByIp.get(candMeta.bucket) ?? 1;
+          if (!victimSocket || bCount > victimBucketCount) {
             victimSocket = candSock;
             victimMeta = candMeta;
-            break;
+            victimBucketCount = bCount;
           }
         }
       }
+
       if (!victimSocket) {
-        const oldestIter = remotePreHeaderSockets.entries().next();
-        if (oldestIter.done) break;
-        [victimSocket, victimMeta] = oldestIter.value;
+        let heaviestOtherBucket: string | null = null;
+        let heaviestOtherCount = 1;
+        for (const [bKey, bCount] of preHeaderSocketsByIp) {
+          if (bKey !== sockBucket && bCount > heaviestOtherCount) {
+            heaviestOtherCount = bCount;
+            heaviestOtherBucket = bKey;
+          }
+        }
+        if (heaviestOtherBucket !== null && heaviestOtherCount >= 2) {
+          for (const [candSock, candMeta] of remotePreHeaderSockets) {
+            if (candMeta.bucket === heaviestOtherBucket) {
+              victimSocket = candSock;
+              victimMeta = candMeta;
+              break;
+            }
+          }
+        }
       }
-      victimMeta!.finish();
+
+      if (!victimSocket || !victimMeta) {
+        socket.destroy();
+        return;
+      }
+
+      victimMeta.finish();
       victimSocket.destroy();
     }
 

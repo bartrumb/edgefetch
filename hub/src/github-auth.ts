@@ -27,17 +27,20 @@ import {
   sha256Base64Url,
   type HubUserRecord,
   type OAuthStore,
+  type UserAdmissionMethod,
   type UserRole,
 } from './oauth';
 import { normalizeClientRateLimitIp } from './safe-input';
 
 export const GITHUB_STATE_COOKIE_SECURE = '__Host-ef_gh_oauth';
 export const GITHUB_STATE_COOKIE_DEV = 'ef_gh_oauth';
-export const PINNED_OWNER_GITHUB_ID_SETTING_KEY = 'pinned_owner_github_id';
+export const GITHUB_ORG_REVERIFY_TTL_MS = 5 * 60_000; // Re-verify @org membership when > 5m stale (and on every refresh)
 const GITHUB_STATE_TTL_MS = 10 * 60_000; // 10m PKCE + state flow window
 const ADMIN_JWT_TTL_MS = 8 * 60 * 60_000; // 8h browser session
 const CALLBACK_RATE_LIMIT_WINDOW_MS = 5 * 60_000;
 const CALLBACK_RATE_LIMIT_MAX_FAILURES = 10;
+const OWNER_ID_REQUIRED_MESSAGE =
+  'Set GITHUB_OWNER_ID to your immutable numeric GitHub user ID to enable GitHub owner sign-in';
 
 const JWT_ISSUER = 'urn:edgefetch:hub';
 const JWT_AUDIENCE = 'urn:edgefetch:admin';
@@ -142,16 +145,36 @@ export function parseGitHubAllowlist(raw?: string): { users: Set<string>; userId
     if (trimmed.startsWith('@')) {
       const org = trimmed.slice(1);
       if (GITHUB_LOGIN_RE.test(org)) orgs.add(org);
-    } else if (trimmed.startsWith('id:') && GITHUB_NUMERIC_ID_RE.test(trimmed.slice(3))) {
-      userIds.add(trimmed.slice(3));
-    } else if (GITHUB_NUMERIC_ID_RE.test(trimmed)) {
-      userIds.add(trimmed);
-      users.add(trimmed);
-    } else if (GITHUB_LOGIN_RE.test(trimmed)) {
+    } else if (trimmed.startsWith('id:')) {
+      const idVal = trimmed.slice(3);
+      if (GITHUB_NUMERIC_ID_RE.test(idVal)) userIds.add(idVal);
+    } else if (trimmed.startsWith('login:')) {
+      const loginVal = trimmed.slice(6);
+      if (GITHUB_LOGIN_RE.test(loginVal)) users.add(loginVal);
+    } else if (/^[0-9]+$/.test(trimmed)) {
+      // Bare all-digit entries are ambiguous between numeric GitHub IDs and all-digit logins; require `id:` or `login:`.
+      continue;
+    } else if (GITHUB_LOGIN_RE.test(trimmed) && /[a-z-]/.test(trimmed)) {
       users.add(trimmed);
     }
   }
   return { users, userIds, orgs };
+}
+
+export function isGitHubOwnerConfigMissingRequiredId(
+  env: Pick<GitHubAuthEnv, 'GITHUB_OWNER_ID' | 'GITHUB_OWNER_LOGIN' | 'SIGNUP_MODE'>,
+): boolean {
+  const rawOwnerId = (env.GITHUB_OWNER_ID ?? '').trim();
+  if (rawOwnerId) {
+    return !GITHUB_NUMERIC_ID_RE.test(rawConfiguredIdString(rawOwnerId));
+  }
+  const ownerLogin = (env.GITHUB_OWNER_LOGIN ?? '').trim();
+  const mode = normalizeSignupMode(env.SIGNUP_MODE);
+  return Boolean(ownerLogin) || mode === 'bootstrap_first';
+}
+
+function rawConfiguredIdString(raw: string): string {
+  return raw.trim();
 }
 
 export function isGitHubUserDeAllowlisted(user: HubUserRecord, env?: GitHubAuthEnv): boolean {
@@ -160,13 +183,15 @@ export function isGitHubUserDeAllowlisted(user: HubUserRecord, env?: GitHubAuthE
   const mode = normalizeSignupMode(env.SIGNUP_MODE);
   if (mode === 'open') return false;
   const allowlist = parseGitHubAllowlist(env.GITHUB_ALLOWED_USERS);
-  if (allowlist.orgs.size > 0) return false;
-  if (mode === 'allowlist' || mode === 'invite_only') {
-    const loginOk = Boolean(user.githubLogin && allowlist.users.has(user.githubLogin.toLowerCase()));
-    const idOk = Boolean(user.githubId && allowlist.userIds.has(String(user.githubId)));
-    return !loginOk && !idOk;
+  const directMatch = Boolean(
+    (user.githubId && allowlist.userIds.has(String(user.githubId))) ||
+      (user.githubLogin && allowlist.users.has(user.githubLogin.toLowerCase())),
+  );
+  if (directMatch) return false;
+  if (user.admittedVia === 'org' && user.admittedOrg) {
+    return !allowlist.orgs.has(user.admittedOrg.toLowerCase());
   }
-  return false;
+  return true;
 }
 
 export function sanitizeRelativeReturnTo(raw: string | null | undefined): string {
@@ -365,6 +390,217 @@ function resolveGitHubSafeFetch(env: Pick<GitHubAuthEnv, 'SAFE_PUBLIC_FETCH' | '
   return env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch;
 }
 
+function base64UrlDecodeBytes(raw: string): Uint8Array | null {
+  if (!raw || !/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+  try {
+    const padded = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const bin = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function resolveGhTokenSecrets(env?: GitHubAuthEnv, sessionSecret?: string): string[] {
+  const candidates: string[] = [];
+  const add = (val?: string) => {
+    const trimmed = (val ?? '').trim();
+    if (trimmed.length >= 16 && !candidates.includes(trimmed)) {
+      candidates.push(trimmed);
+    }
+  };
+  if (env) {
+    add(resolveSessionSecret(env));
+    add(env.SESSION_SECRET);
+    add(env.CALLER_TOKEN);
+    add(env.GITHUB_CLIENT_SECRET);
+  }
+  add(sessionSecret);
+  return candidates;
+}
+
+async function deriveGhTokenAesKey(secret: string, salt: Uint8Array, userId: string): Promise<CryptoKey> {
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey('raw', enc.encode(secret), 'HKDF', false, ['deriveKey']);
+  return await crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: salt as BufferSource,
+      info: enc.encode(`edgefetch-gh-org-token-v1:${userId.length}:${userId}`),
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+export async function sealGitHubUserAccessToken(params: {
+  secret: string;
+  userId: string;
+  accessToken: string;
+}): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await deriveGhTokenAesKey(params.secret, salt, params.userId);
+  const aad = new TextEncoder().encode(`gh-org-token:${params.userId.length}:${params.userId}`);
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
+    aesKey,
+    new TextEncoder().encode(params.accessToken),
+  );
+  return `ght1.${base64UrlBytes(salt)}.${base64UrlBytes(iv)}.${base64UrlBytes(new Uint8Array(ct))}`;
+}
+
+export async function unsealGitHubUserAccessToken(params: {
+  secrets: readonly string[];
+  userId: string;
+  ciphertext: string;
+}): Promise<string | null> {
+  const parts = params.ciphertext.split('.');
+  if (parts.length !== 4 || parts[0] !== 'ght1') return null;
+  const salt = base64UrlDecodeBytes(parts[1]!);
+  const iv = base64UrlDecodeBytes(parts[2]!);
+  const ct = base64UrlDecodeBytes(parts[3]!);
+  if (!salt || salt.byteLength !== 16 || !iv || iv.byteLength !== 12 || !ct || ct.byteLength < 17) return null;
+  const aad = new TextEncoder().encode(`gh-org-token:${params.userId.length}:${params.userId}`);
+  for (const secret of params.secrets) {
+    try {
+      const aesKey = await deriveGhTokenAesKey(secret, salt, params.userId);
+      const plain = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
+        aesKey,
+        ct as BufferSource,
+      );
+      const tok = new TextDecoder('utf-8', { fatal: true }).decode(plain).trim();
+      if (tok && !/[\r\n\0]/.test(tok)) return tok;
+    } catch {
+      // try next candidate secret
+    }
+  }
+  return null;
+}
+
+/**
+ * Re-verifies active GitHub `@org` membership against `https://api.github.com/user/orgs?per_page=100`
+ * for users admitted via `@org` (called unconditionally on OAuth refresh rotation and when `orgVerifiedAt` is > 5m stale).
+ */
+export async function reverifyGitHubOrgAdmission(params: {
+  user: HubUserRecord;
+  env?: GitHubAuthEnv;
+  fetchFn?: typeof fetch;
+  sessionSecret?: string;
+  store?: Pick<OAuthStore, 'upsertUser' | 'getUser'>;
+  now?: number;
+}): Promise<{ ok: boolean; matchedOrg?: string; reason?: string }> {
+  const { user, env, store, now = Date.now() } = params;
+  if (user.role === 'owner' || user.userId === 'owner') return { ok: true };
+  if (!env || !isGitHubAuthConfigured(env)) return { ok: true };
+  if (normalizeSignupMode(env.SIGNUP_MODE) === 'open') return { ok: true };
+
+  const allowlist = parseGitHubAllowlist(env.GITHUB_ALLOWED_USERS);
+  const directMatch = Boolean(
+    (user.githubId && allowlist.userIds.has(String(user.githubId))) ||
+      (user.githubLogin && allowlist.users.has(user.githubLogin.toLowerCase())),
+  );
+  if (directMatch) return { ok: true };
+
+  if (user.admittedVia !== 'org') {
+    return { ok: false, reason: 'not_org_admitted' };
+  }
+
+  const revokeOrgAdmission = async (reason: string): Promise<{ ok: false; reason: string }> => {
+    const nextEpoch = (user.sessionEpoch ?? 1) + 1;
+    await store?.upsertUser?.({
+      ...user,
+      sessionEpoch: nextEpoch,
+      admittedVia: undefined,
+      admittedOrg: undefined,
+      encryptedGhToken: undefined,
+      orgVerifiedAt: undefined,
+    });
+    return { ok: false, reason };
+  };
+
+  if (allowlist.orgs.size === 0 || (user.admittedOrg && !allowlist.orgs.has(user.admittedOrg.toLowerCase()))) {
+    return await revokeOrgAdmission('org_removed_from_allowlist');
+  }
+
+  const secrets = resolveGhTokenSecrets(env, params.sessionSecret);
+  if (!user.encryptedGhToken || secrets.length === 0) {
+    return await revokeOrgAdmission('missing_sealed_gh_token');
+  }
+
+  const ghAccessToken = await unsealGitHubUserAccessToken({
+    secrets,
+    userId: user.userId,
+    ciphertext: user.encryptedGhToken,
+  });
+  if (!ghAccessToken) {
+    return await revokeOrgAdmission('unreadable_sealed_gh_token');
+  }
+
+  const fetchFn = params.fetchFn ?? resolveGitHubSafeFetch(env);
+  try {
+    const orgsRes = await fetchFn('https://api.github.com/user/orgs?per_page=100', {
+      method: 'GET',
+      headers: {
+        authorization: `Bearer ${ghAccessToken}`,
+        accept: 'application/vnd.github+json',
+        'user-agent': 'EdgeFetch-Hub/2.7',
+        'x-github-api-version': '2022-11-28',
+      },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (orgsRes.status !== 200) {
+      await orgsRes.body?.cancel().catch(() => undefined);
+      return await revokeOrgAdmission(`github_orgs_http_${orgsRes.status}`);
+    }
+    const orgsText = await orgsRes.text();
+    if (orgsText.length > 262_144) {
+      return await revokeOrgAdmission('github_orgs_payload_too_large');
+    }
+    const orgsList = JSON.parse(orgsText) as Array<{ login?: unknown }>;
+    let matchedOrg: string | undefined;
+    if (Array.isArray(orgsList)) {
+      // Prefer keeping previously matched org if still active, otherwise any active allowed org
+      const activeOrgs = new Set<string>();
+      for (const o of orgsList) {
+        if (typeof o?.login === 'string') {
+          activeOrgs.add(o.login.trim().toLowerCase());
+        }
+      }
+      if (user.admittedOrg && activeOrgs.has(user.admittedOrg.toLowerCase()) && allowlist.orgs.has(user.admittedOrg.toLowerCase())) {
+        matchedOrg = user.admittedOrg.toLowerCase();
+      } else {
+        for (const allowedOrg of allowlist.orgs) {
+          if (activeOrgs.has(allowedOrg)) {
+            matchedOrg = allowedOrg;
+            break;
+          }
+        }
+      }
+    }
+    if (!matchedOrg) {
+      return await revokeOrgAdmission('org_membership_revoked');
+    }
+
+    await store?.upsertUser?.({
+      ...user,
+      admittedVia: 'org',
+      admittedOrg: matchedOrg,
+      orgVerifiedAt: now,
+    });
+    return { ok: true, matchedOrg };
+  } catch {
+    return await revokeOrgAdmission('github_orgs_fetch_failed');
+  }
+}
+
 function renderGitHubAuthErrorHtml(serviceName: string, title: string, message: string): string {
   return `<!doctype html>
 <html lang="en">
@@ -407,6 +643,10 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
            role TEXT NOT NULL DEFAULT 'member',
            session_epoch INTEGER NOT NULL DEFAULT 1,
            disabled INTEGER NOT NULL DEFAULT 0,
+           admitted_via TEXT,
+           admitted_org TEXT,
+           encrypted_gh_token TEXT,
+           org_verified_at INTEGER,
            created_at INTEGER NOT NULL,
            last_login_at INTEGER NOT NULL
          )`,
@@ -414,10 +654,17 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
       .run();
     await metaDb.prepare('ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1').run().catch(() => undefined);
     await metaDb.prepare('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0').run().catch(() => undefined);
+    await metaDb.prepare('ALTER TABLE users ADD COLUMN admitted_via TEXT').run().catch(() => undefined);
+    await metaDb.prepare('ALTER TABLE users ADD COLUMN admitted_org TEXT').run().catch(() => undefined);
+    await metaDb.prepare('ALTER TABLE users ADD COLUMN encrypted_gh_token TEXT').run().catch(() => undefined);
+    await metaDb.prepare('ALTER TABLE users ADD COLUMN org_verified_at INTEGER').run().catch(() => undefined);
     await metaDb
       .prepare(
-        `INSERT INTO users (user_id, github_id, github_login, avatar_url, role, session_epoch, disabled, created_at, last_login_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO users (
+           user_id, github_id, github_login, avatar_url, role, session_epoch, disabled,
+           admitted_via, admitted_org, encrypted_gh_token, org_verified_at, created_at, last_login_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
            github_id = COALESCE(excluded.github_id, users.github_id),
            github_login = excluded.github_login,
@@ -425,6 +672,10 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
            role = excluded.role,
            session_epoch = excluded.session_epoch,
            disabled = excluded.disabled,
+           admitted_via = excluded.admitted_via,
+           admitted_org = excluded.admitted_org,
+           encrypted_gh_token = excluded.encrypted_gh_token,
+           org_verified_at = excluded.org_verified_at,
            last_login_at = excluded.last_login_at`,
       )
       .bind(
@@ -435,6 +686,10 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
         user.role,
         user.sessionEpoch ?? 1,
         user.disabled ? 1 : 0,
+        user.admittedVia ?? null,
+        user.admittedOrg ?? null,
+        user.encryptedGhToken ?? null,
+        user.orgVerifiedAt ?? null,
         user.createdAt,
         user.lastLoginAt,
       )
@@ -477,6 +732,15 @@ export async function startGitHubOAuthFlow(params: {
     return {
       outcome: 'github_unconfigured',
       response: Response.json({ error: 'github_oauth_not_configured' }, { status: 503, headers: GITHUB_REDIRECT_HEADERS }),
+    };
+  }
+  if (isGitHubOwnerConfigMissingRequiredId(env)) {
+    return {
+      outcome: 'owner_id_required',
+      response: Response.json(
+        { error: 'owner_id_required', message: OWNER_ID_REQUIRED_MESSAGE },
+        { status: 503, headers: GITHUB_REDIRECT_HEADERS },
+      ),
     };
   }
 
@@ -549,7 +813,7 @@ export async function handleGitHubOAuthCallback(params: {
     details?: Record<string, unknown>;
   }) => Promise<void> | void;
 }): Promise<{ response: Response; outcome: string; userId?: string; role?: UserRole }> {
-  const { request, url, env, oauthStore, metaDb, serviceName, publicOrigin, getHubSetting, setHubSetting, now = Date.now(), onEvent } = params;
+  const { request, url, env, oauthStore, metaDb, serviceName, publicOrigin, now = Date.now(), onEvent } = params;
   const signingSecret = resolveSessionSecret(env);
   if (!isGitHubAuthConfigured(env) || !signingSecret) {
     return {
@@ -575,6 +839,15 @@ export async function handleGitHubOAuthCallback(params: {
       response: new Response(renderGitHubAuthErrorHtml(serviceName, title, message), { status, headers }),
     };
   };
+
+  if (isGitHubOwnerConfigMissingRequiredId(env)) {
+    return makeErrorResponse(
+      503,
+      'owner_id_required',
+      'Owner ID Configuration Required',
+      `${OWNER_ID_REQUIRED_MESSAGE} (owner_id_required).`,
+    );
+  }
 
   const clientIp = normalizeClientRateLimitIp(request.headers.get('cf-connecting-ip'));
   const preLock = await oauthStore.checkAuthLockout(`gh_cb:${clientIp}`, now, CALLBACK_RATE_LIMIT_MAX_FAILURES);
@@ -705,9 +978,22 @@ export async function handleGitHubOAuthCallback(params: {
   const ownerLoginLower = (env.GITHUB_OWNER_LOGIN ?? '').trim().toLowerCase();
   const rawConfiguredOwnerId = (env.GITHUB_OWNER_ID ?? '').trim();
   if (rawConfiguredOwnerId && !GITHUB_NUMERIC_ID_RE.test(rawConfiguredOwnerId)) {
-    return makeErrorResponse(500, 'invalid_owner_id_config', 'Invalid Owner Configuration', 'GITHUB_OWNER_ID must be a positive numeric GitHub user ID.');
+    return makeErrorResponse(
+      503,
+      'owner_id_required',
+      'Owner ID Configuration Required',
+      `${OWNER_ID_REQUIRED_MESSAGE} (owner_id_required).`,
+    );
   }
   const signupMode = normalizeSignupMode(env.SIGNUP_MODE);
+  if (!rawConfiguredOwnerId && (ownerLoginLower || signupMode === 'bootstrap_first')) {
+    return makeErrorResponse(
+      503,
+      'owner_id_required',
+      'Owner ID Configuration Required',
+      `${OWNER_ID_REQUIRED_MESSAGE} (owner_id_required).`,
+    );
+  }
   const allowlist = parseGitHubAllowlist(env.GITHUB_ALLOWED_USERS);
 
   const existingUser = (await oauthStore.getUser?.(userId)) ?? null;
@@ -728,7 +1014,6 @@ export async function handleGitHubOAuthCallback(params: {
   }
 
   const activeUsers = (await oauthStore.listUsers?.()) ?? [];
-  const totalUsers = (await oauthStore.countUsers?.()) ?? activeUsers.length;
 
   // Block recycled/squatted GitHub logins claiming an active Hub member/owner's handle with a different numeric `github_id`!
   const collidingUser = activeUsers.find(
@@ -750,54 +1035,40 @@ export async function handleGitHubOAuthCallback(params: {
     );
   }
 
-  // H6: Resolve immutable numeric owner GitHub ID (`GITHUB_OWNER_ID` env OR `pinned_owner_github_id` in `hub_settings` / existing owner row).
-  const storedPinnedOwnerId = (await getHubSetting?.(PINNED_OWNER_GITHUB_ID_SETTING_KEY))?.trim() || '';
-  const fallbackExistingOwner = activeUsers
-    .filter((u) => u.role === 'owner' && !u.disabled && u.githubId && GITHUB_NUMERIC_ID_RE.test(u.githubId))
-    .sort((a, b) => a.createdAt - b.createdAt)[0];
-  const pinnedOwnerGithubId =
-    rawConfiguredOwnerId ||
-    (GITHUB_NUMERIC_ID_RE.test(storedPinnedOwnerId) ? storedPinnedOwnerId : '') ||
-    (fallbackExistingOwner?.githubId ?? '');
-
-  // If `GITHUB_OWNER_LOGIN` is claimed by a DIFFERENT numeric GitHub ID after an account rename, REJECT immediately!
-  if (ownerLoginLower && loginLower === ownerLoginLower && pinnedOwnerGithubId && ghIdStr !== pinnedOwnerGithubId) {
+  // H5: NEVER auto-derive or persist a founder pin; ONLY explicit `GITHUB_OWNER_ID` grants founder `owner` status!
+  if (ownerLoginLower && loginLower === ownerLoginLower && rawConfiguredOwnerId && ghIdStr !== rawConfiguredOwnerId) {
     await onEvent?.({
       level: 'warn',
       category: 'oauth',
       event: 'github_owner_impersonation_blocked',
-      summary: `Blocked GitHub login @${ghLogin} (${userId}) from claiming owner handle pinned to gh_${pinnedOwnerGithubId}`,
-      details: { userId, pinnedOwnerGithubId, githubLogin: ghLogin },
+      summary: `Blocked GitHub login @${ghLogin} (${userId}) from claiming owner handle configured for gh_${rawConfiguredOwnerId}`,
+      details: { userId, configuredOwnerGithubId: rawConfiguredOwnerId, githubLogin: ghLogin },
     });
     return makeErrorResponse(
       403,
       'owner_id_mismatch',
       'Owner Identity Mismatch',
-      'This GitHub handle does not match the Hub’s pinned immutable numeric owner ID.',
+      'This GitHub handle does not match the Hub’s configured immutable numeric GITHUB_OWNER_ID.',
     );
   }
 
   let allowed = false;
-  let assignedRole: UserRole = existingUser?.role ?? 'member';
-  let shouldPinOwnerId = false;
+  let assignedRole: UserRole = existingUser?.role === 'owner' ? 'owner' : 'member';
+  let admittedVia: UserAdmissionMethod | undefined;
+  let admittedOrg: string | undefined;
+  let encryptedGhToken: string | undefined;
+  let orgVerifiedAt: number | undefined;
 
-  if (pinnedOwnerGithubId && ghIdStr === pinnedOwnerGithubId) {
+  if (rawConfiguredOwnerId && ghIdStr === rawConfiguredOwnerId) {
     allowed = true;
     assignedRole = 'owner';
-    if (!storedPinnedOwnerId) shouldPinOwnerId = true;
-  } else if (!pinnedOwnerGithubId && ownerLoginLower && loginLower === ownerLoginLower) {
+    admittedVia = 'owner';
+  } else if (allowlist.userIds.has(ghIdStr)) {
     allowed = true;
-    assignedRole = 'owner';
-    shouldPinOwnerId = true;
-  } else if (!pinnedOwnerGithubId && signupMode === 'bootstrap_first' && totalUsers === 0 && !ownerLoginLower) {
+    admittedVia = 'allowlist_id';
+  } else if (allowlist.users.has(loginLower)) {
     allowed = true;
-    assignedRole = 'owner';
-    shouldPinOwnerId = true;
-  } else if (existingUser?.role === 'owner') {
-    allowed = true;
-    assignedRole = 'owner';
-  } else if (allowlist.userIds.has(ghIdStr) || allowlist.users.has(loginLower)) {
-    allowed = true;
+    admittedVia = 'allowlist_login';
   } else if (allowlist.orgs.size > 0) {
     try {
       const orgsRes = await oauth.protectedResourceRequest(
@@ -818,9 +1089,20 @@ export async function handleGitHubOAuthCallback(params: {
           const orgsList = JSON.parse(orgsText) as Array<{ login?: unknown }>;
           if (Array.isArray(orgsList)) {
             for (const o of orgsList) {
-              if (typeof o?.login === 'string' && allowlist.orgs.has(o.login.trim().toLowerCase())) {
-                allowed = true;
-                break;
+              if (typeof o?.login === 'string') {
+                const candidateOrg = o.login.trim().toLowerCase();
+                if (allowlist.orgs.has(candidateOrg)) {
+                  allowed = true;
+                  admittedVia = 'org';
+                  admittedOrg = candidateOrg;
+                  encryptedGhToken = await sealGitHubUserAccessToken({
+                    secret: signingSecret,
+                    userId,
+                    accessToken,
+                  });
+                  orgVerifiedAt = now;
+                  break;
+                }
               }
             }
           }
@@ -831,12 +1113,15 @@ export async function handleGitHubOAuthCallback(params: {
     }
   }
 
-  if (!allowed && signupMode === 'invite_only' && existingUser !== null && allowlist.users.size === 0 && allowlist.orgs.size === 0) {
+  if (!allowed && existingUser?.role === 'owner') {
     allowed = true;
+    assignedRole = 'owner';
+    admittedVia = existingUser.admittedVia ?? 'owner';
   }
 
   if (!allowed && signupMode === 'open') {
     allowed = true;
+    admittedVia = 'open';
   }
 
   if (!allowed) {
@@ -857,10 +1142,6 @@ export async function handleGitHubOAuthCallback(params: {
 
   await oauthStore.clearAuthFailures(`gh_cb:${clientIp}`);
 
-  if (shouldPinOwnerId) {
-    await setHubSetting?.(PINNED_OWNER_GITHUB_ID_SETTING_KEY, ghIdStr);
-  }
-
   const sessionEpoch = existingUser?.sessionEpoch ?? 1;
   const userRecord: HubUserRecord = {
     userId,
@@ -870,6 +1151,10 @@ export async function handleGitHubOAuthCallback(params: {
     role: assignedRole,
     sessionEpoch,
     disabled: false,
+    ...(admittedVia ? { admittedVia } : {}),
+    ...(admittedOrg ? { admittedOrg } : {}),
+    ...(encryptedGhToken ? { encryptedGhToken } : {}),
+    ...(orgVerifiedAt !== undefined ? { orgVerifiedAt } : {}),
     createdAt: existingUser?.createdAt ?? now,
     lastLoginAt: now,
   };

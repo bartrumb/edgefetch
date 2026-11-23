@@ -575,6 +575,20 @@ function createRequestTracerStorage(): AsyncLocalStorageLike<RequestTracer> {
 
 const requestTracerStorage = createRequestTracerStorage();
 
+const inProcessVerifiedRequests = new WeakSet<Request>();
+
+/**
+ * Marks a Web `Request` instance in-process (never via an inbound HTTP header!) as having passed front-end
+ * cryptographic credential verification in `portable-server.ts` or `deno-server.ts`.
+ */
+export function markRequestVerifiedInProcess(request: Request): void {
+  inProcessVerifiedRequests.add(request);
+}
+
+export function isRequestVerifiedInProcess(request: Request): boolean {
+  return inProcessVerifiedRequests.has(request);
+}
+
 export class RequestTracer {
   private readonly state: RequestTracerState;
   private readonly currentSpanId: string;
@@ -601,8 +615,7 @@ export class RequestTracer {
         // ignore invalid URL
       }
     }
-    const preVerified =
-      Boolean(opts?.authenticated) || request.headers.get('x-ef-verified-auth') === '1';
+    const preVerified = Boolean(opts?.authenticated) || isRequestVerifiedInProcess(request);
     return new RequestTracer(
       {
         rootContext: context,

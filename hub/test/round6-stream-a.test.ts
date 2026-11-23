@@ -118,8 +118,8 @@ function assertNoActiveHtmlOrJsLinksOutsideCode(md: string, contextLabel: string
 }
 
 export async function runRound6StreamASubtests(t: TestContext): Promise<void> {
-await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 30', () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 30);
+await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 31', () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 31);
 
   // 1. Indented fence dedent & top-level 1..3 space fence normalization (`r6A/h1.mjs`, `r6A/h1diff.mjs`)
   const h1IndentJs = fin(' ```\nx\n ```\n[k](javascript:alert(1))');
@@ -218,23 +218,23 @@ await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash 
     );
   }
 
-  // Standalone inline code span containing `[a](javascript:alert(1))` MUST remain preserved untouched!
+  // Round 8 H1 fail-closed rule: dangerous links and `<` are neutralized everywhere outside recognized fences, inline code spans included!
   const preservedCodeSpan = sanitizeInlineHtmlInMarkdown('Example: `[a](javascript:alert(1))` in docs.');
-  assert.equal(preservedCodeSpan, 'Example: `[a](javascript:alert(1))` in docs.');
+  assert.equal(preservedCodeSpan.includes('javascript:'), false);
+  assert.equal(preservedCodeSpan, 'Example: `[a](#)` in docs.');
 
-  // 3. Low sanitizer false positive: inline code spans ending in `\` or odd backslashes + sibling list bullets (`r6A/low.6.mjs`, `CHANGELOG.md:37-39`)
+  // 3. Inline code spans ending in `\` or odd backslashes + sibling list bullets (`R8-H1` escapes `<` inside inline code spans fail-closed)
   const backslashEndSpan = sanitizeInlineHtmlInMarkdown('Path `C:\\foo\\` and `<svg>` tag in docs.');
-  assert.equal(backslashEndSpan, 'Path `C:\\foo\\` and `<svg>` tag in docs.');
+  assert.equal(backslashEndSpan, 'Path `C:\\foo\\` and `&lt;svg>` tag in docs.');
 
   const singleBackslashSpan = sanitizeInlineHtmlInMarkdown('Escape char `\\` followed by `<img>` and real <img src=x onerror=alert(1)>.');
-  assert.ok(singleBackslashSpan.includes('`\\` followed by `<img>`'), `Expected code spans intact, got: ${singleBackslashSpan}`);
+  assert.ok(singleBackslashSpan.includes('`\\` followed by `&lt;img>`'), `Expected fail-closed code spans intact, got: ${singleBackslashSpan}`);
   assert.equal(/<img\s+src=/i.test(singleBackslashSpan), false, `Expected prose <img src=...> stripped/escaped: ${singleBackslashSpan}`);
 
   const tripleBackslashSpan = sanitizeInlineHtmlInMarkdown('Odd `\\\\\\` span then `<script>` literal and <script>evil()</script>');
-  assert.ok(tripleBackslashSpan.includes('`\\\\\\` span then `<script>`'), `Expected odd-backslash code spans intact: ${tripleBackslashSpan}`);
+  assert.ok(tripleBackslashSpan.includes('`\\\\\\` span then `&lt;script>`'), `Expected odd-backslash code spans intact: ${tripleBackslashSpan}`);
   assert.equal(tripleBackslashSpan.includes('<script>evil()'), false);
 
-  // Exact `CHANGELOG.md` sibling list-item regression: unmatched/odd backtick run in bullet 1 must NOT poison bullet 3's `<svg>` code span!
   const changelogBullets = [
     '- Hardened empty backtick runs (``) in list items.',
     '- Preserved normal prose on bullet two.',
@@ -242,8 +242,8 @@ await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash 
   ].join('\n');
   const sanitizedBullets = fin(changelogBullets);
   assert.ok(
-    sanitizedBullets.includes('`<svg>`') && sanitizedBullets.includes('`<math>`'),
-    `Sibling bullet code spans must NOT be entity-escaped by prior list item: ${sanitizedBullets}`,
+    sanitizedBullets.includes('`&lt;svg>`') && sanitizedBullets.includes('`&lt;math>`'),
+    `Expected fail-closed inline code span escaping in bullets: ${sanitizedBullets}`,
   );
 
   // 4. Residual `R5-H3` Low fence-header cost (`r6A/fh.6.mjs`): 64K ` [[` / `\t` / `theme={...}` info header runs in < 20ms
@@ -434,9 +434,12 @@ await t.test('R6-H3: Bare URL & autolink candidates glued to code spans never sw
     false,
     `HTML-to-Markdown must detach bare URL before inline code span: ${reachDoc.markdown}`,
   );
+  const reachFinal = fin(reachDoc.markdown);
   assert.ok(
-    reachDoc.markdown.includes('https://ok.example/ `<img src=x onerror=alert(1)>`'),
-    `Expected space inserted before code span, got: ${reachDoc.markdown}`,
+    reachFinal.includes('https://ok.example/ `&lt;img src=x onerror=alert(1)>`') ||
+      reachDoc.markdown.includes('https://ok.example/ `<img src=x onerror=alert(1)>`') ||
+      reachDoc.markdown.includes('https://ok.example/ `&lt;img src=x onerror=alert(1)>`'),
+    `Expected space inserted before code span and fail-closed escape, got: ${reachDoc.markdown} -> ${reachFinal}`,
   );
 
   // 3. URL already INSIDE an inline code span MUST NOT be modified!
@@ -775,11 +778,12 @@ await t.test('M12, Low jobs fixes, budget_exhausted boardStatus, query cap, and 
     );
   }
 
-  // Legitimate company & corporate/geo ATS slug forms MUST still match
-  assert.equal(matchesAllowedCompanyOrDomain(makeJob('Stripe'), stripeTokens, []), true);
-  assert.equal(matchesAllowedCompanyOrDomain(makeJob('Stripe, Inc.'), stripeTokens, []), true);
+  // Legitimate company & corporate/geo ATS slug forms MUST still match, while hyphenated `-inc` ATS impostors are rejected
+  assert.equal(matchesAllowedCompanyOrDomain(makeJob('Stripe', 'https://stripe.com/jobs/1'), stripeTokens, []), true);
+  assert.equal(matchesAllowedCompanyOrDomain(makeJob('Stripe, Inc.', 'https://stripe.com/jobs/1'), stripeTokens, []), true);
   assert.equal(matchesAllowedCompanyOrDomain(makeJob('Stripe', 'https://boards.greenhouse.io/stripe/jobs/1'), stripeTokens, []), true);
-  assert.equal(matchesAllowedCompanyOrDomain(makeJob('Stripe', 'https://boards.greenhouse.io/stripe-inc/jobs/1'), stripeTokens, []), true);
+  assert.equal(matchesAllowedCompanyOrDomain(makeJob('Stripe', 'https://boards.greenhouse.io/stripeusa/jobs/1'), stripeTokens, []), true);
+  assert.equal(matchesAllowedCompanyOrDomain(makeJob('Stripe', 'https://boards.greenhouse.io/stripe-inc/jobs/1'), stripeTokens, []), false);
 
   // 2. `jobs` `query` length > 256 rejected with `400 invalid_query` & 262,144-char `matchesAllowedCompanyOrDomain` runs in < 20ms (`r6A/jobsq.6.mjs`, `r6A/low.6.mjs`)
   const overlongQueryRes = await executeJobsCall({

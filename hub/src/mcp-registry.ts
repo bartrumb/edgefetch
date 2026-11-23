@@ -16,6 +16,7 @@
  */
 
 import { validatePublicHttpsTargetUrl } from './overflow';
+import { getRegistrableDomain, hasPrivateSharedHostingSuffix, isPublicOrPrivateSuffix } from './psl';
 import { detectPromptInjection } from './scrape-advanced';
 
 /**
@@ -191,54 +192,11 @@ export function slugifyMcpServerName(rawName: string): string {
   return (cleaned || 'mcp-server').slice(0, 48);
 }
 
-const GENERIC_HOSTING_DOMAINS = new Set([
-  'raw.githubusercontent.com',
-  'githubusercontent.com',
-  'github.io',
-  'gitlab.io',
-  'workers.dev',
-  'pages.dev',
-  'vercel.app',
-  'netlify.app',
-  'fly.dev',
-  'onrender.com',
-  'railway.app',
-  'herokuapp.com',
-  'googleapis.com',
-  'amazonaws.com',
-  'cloudfront.net',
-  'azurewebsites.net',
-  'ngrok-free.app',
-  'trycloudflare.com',
-]);
-
-const MULTI_PART_PUBLIC_SUFFIXES = new Set([
-  'co.uk',
-  'org.uk',
-  'gov.uk',
-  'ac.uk',
-  'me.uk',
-  'com.au',
-  'net.au',
-  'org.au',
-  'edu.au',
-  'gov.au',
-  'co.nz',
-  'org.nz',
-  'co.jp',
-  'ne.jp',
-  'or.jp',
-  'com.br',
-  'org.br',
-  'co.in',
-  'org.in',
-  'com.sg',
-  'com.hk',
-  'co.kr',
-  'co.za',
-  'com.mx',
-  'com.cn',
-]);
+export function isSharedHostingHostname(hostname: string): boolean {
+  const clean = hostname.trim().toLowerCase().replace(/\.+$/, '');
+  if (!clean) return false;
+  return hasPrivateSharedHostingSuffix(clean);
+}
 
 const STRICT_CONNECTOR_DOMAIN_RE =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
@@ -247,23 +205,13 @@ export function extractRegistrableDomain(hostname: string): string | null {
   const clean = hostname.trim().toLowerCase().replace(/\.+$/, '');
   if (!clean || !STRICT_CONNECTOR_DOMAIN_RE.test(clean)) return null;
   if (/^\d+(?:\.\d+){3}$/.test(clean)) return null;
-  const labels = clean.split('.');
-  if (labels.length < 2) return null;
-  const lastTwo = `${labels[labels.length - 2]}.${labels[labels.length - 1]}`;
-  if (MULTI_PART_PUBLIC_SUFFIXES.has(lastTwo)) {
-    if (labels.length < 3) return null;
-    return `${labels[labels.length - 3]}.${lastTwo}`;
-  }
-  if (GENERIC_HOSTING_DOMAINS.has(lastTwo) && labels.length >= 3) {
-    return `${labels[labels.length - 3]}.${lastTwo}`;
-  }
-  return lastTwo;
+  return getRegistrableDomain(clean);
 }
 
 /**
  * Validates operator/user-supplied `domains` on a vault MCP connector:
- *  - Rejects wildcards (`*.example.com`), bare public suffixes (`co.uk`, `github.io`), IPs, and reserved/internal TLDs.
- *  - Rejects unrelated third-party domains unless `allowUnrelatedDomains === true` (`autoRouteScrape` / `routeScrapeDomains` explicitly enabled).
+ *  - Rejects wildcards (`*.example.com`), bare public/private suffixes (`co.uk`, `github.io`, `supabase.co`), IPs, and reserved/internal TLDs.
+ *  - Rejects unrelated third-party domains (and sibling shared-hosting tenants!) unless `allowUnrelatedDomains === true`.
  */
 export function validateConnectorDomains(
   rawDomains: unknown,
@@ -278,11 +226,12 @@ export function validateConnectorDomains(
   }
   let remoteHost = '';
   try {
-    remoteHost = new URL(remoteOrigin).hostname.toLowerCase();
+    remoteHost = new URL(remoteOrigin).hostname.toLowerCase().replace(/\.+$/, '');
   } catch {
     return { ok: false, error: 'Invalid remoteOrigin for domain validation' };
   }
-  const remoteBase = extractRegistrableDomain(remoteHost);
+  const remoteBase = getRegistrableDomain(remoteHost);
+  const remoteIsSharedHosting = hasPrivateSharedHostingSuffix(remoteHost);
   const out: string[] = [];
   const seen = new Set<string>();
 
@@ -301,21 +250,33 @@ export function validateConnectorDomains(
     if (/\.(?:local|localhost|internal|intranet|corp|home|lan|arpa|onion)$/i.test(trimmed)) {
       return { ok: false, error: `Internal or reserved domain "${trimmed}" is not permitted` };
     }
-    if (MULTI_PART_PUBLIC_SUFFIXES.has(trimmed) || GENERIC_HOSTING_DOMAINS.has(trimmed)) {
+    if (isPublicOrPrivateSuffix(trimmed)) {
       return { ok: false, error: `Shared hosting or public suffix "${trimmed}" cannot be claimed as a connector domain` };
     }
-    const candBase = extractRegistrableDomain(trimmed);
+    const candBase = getRegistrableDomain(trimmed);
     if (!candBase) {
       return { ok: false, error: `Unregistrable domain "${trimmed}"` };
     }
     if (!allowUnrelatedDomains) {
-      const sameHostOrSub = trimmed === remoteHost || remoteHost.endsWith(`.${trimmed}`) || trimmed.endsWith(`.${remoteHost}`);
-      const sameRegistrable = Boolean(remoteBase && candBase === remoteBase);
-      if (!sameHostOrSub && !sameRegistrable) {
-        return {
-          ok: false,
-          error: `Domain "${trimmed}" does not match connector origin "${remoteHost}". Enable routeScrapeDomains / autoRouteScrape explicitly to claim external domains.`,
-        };
+      if (remoteIsSharedHosting || hasPrivateSharedHostingSuffix(trimmed)) {
+        const exactOrChildHost =
+          candBase === remoteBase &&
+          (trimmed === remoteHost || trimmed.endsWith(`.${remoteHost}`) || remoteHost.endsWith(`.${trimmed}`));
+        if (!exactOrChildHost) {
+          return {
+            ok: false,
+            error: `Shared-hosting domain "${trimmed}" does not match exact connector host "${remoteHost}".`,
+          };
+        }
+      } else {
+        const sameHostOrSub = trimmed === remoteHost || remoteHost.endsWith(`.${trimmed}`) || trimmed.endsWith(`.${remoteHost}`);
+        const sameRegistrable = Boolean(remoteBase && candBase === remoteBase);
+        if (!sameHostOrSub && !sameRegistrable) {
+          return {
+            ok: false,
+            error: `Domain "${trimmed}" does not match connector origin "${remoteHost}". Enable routeScrapeDomains / autoRouteScrape explicitly to claim external domains.`,
+          };
+        }
       }
     }
     if (!seen.has(trimmed)) {

@@ -378,3 +378,164 @@ test('Collector enforces <= 30 req/min per-IP token-bucket rate limit (including
     close();
   }
 });
+
+test('Round 8: Collector resists 40-minute 3-address count>=2 pinning attack & stores 200/200 new genuine errors', async () => {
+  resetCollectorRateLimiters();
+  const prevAllowClock = process.env.EDGEFETCH_ALLOW_TEST_CLOCK;
+  process.env.EDGEFETCH_ALLOW_TEST_CLOCK = '1';
+  const { d1, close } = createInMemoryCollectorD1();
+  const env: CollectorEnv = {
+    DB: d1,
+    TELEMETRY_ADMIN_TOKEN: VALID_ADMIN_TOKEN,
+    MAX_ERROR_FINGERPRINTS: '10000',
+  };
+
+  const validAdapters = [
+    'ashby', 'lever', 'greenhouse', 'workday', 'rippling', 'gem', 'shopify', 'woocommerce',
+    'arxiv', 'openalex', 'pubchem', 'npm', 'pypi', 'crates-io', 'hackernews', 'reddit',
+    'github', 'gitlab', 'discourse', 'mediawiki',
+  ];
+  const validErrorClasses = [
+    'waf_challenge', 'waf_block', 'rate_limited', 'timeout', 'tls_error',
+    'dns_error', 'connect_error', 'adapter_error', 'http_403', 'http_404', 'http_5xx',
+  ];
+  const validOses = ['linux', 'darwin', 'win32', 'cloudflare', 'freebsd'];
+  const validRuntimes = ['workers', 'node', 'deno', 'go'];
+
+  const makeIndexedEvent = (idx: number, versionPrefix: string) => ({
+    schemaVersion: 1,
+    version: `${versionPrefix}.${idx % 1000}`,
+    runtime: validRuntimes[idx % validRuntimes.length],
+    os: validOses[idx % validOses.length],
+    arch: idx % 2 === 0 ? 'amd64' : 'arm64',
+    mode: 'hub',
+    spanName: 'edgefetch.scrape',
+    adapterId: validAdapters[idx % validAdapters.length],
+    wafVendor: idx % 3 === 0 ? 'cloudflare' : idx % 3 === 1 ? 'datadome' : 'akamai',
+    httpStatus: 400 + (idx % 199),
+    errorClass: validErrorClasses[idx % validErrorClasses.length],
+  });
+
+  try {
+    const baseNow = 1_760_000_000_000;
+    const attackerIps = ['198.51.100.10', '198.51.100.11', '203.0.113.55'];
+    let fakeCounter = 0;
+
+    // 1. Simulate 40 minutes of 64 posts/min (21..22 posts/min per attacker IP, 8 events/post, each fake sent twice to try pinning count=2)
+    for (let minute = 0; minute < 40; minute++) {
+      const minuteNow = baseNow + minute * 60_000;
+      for (let postIdx = 0; postIdx < 64; postIdx++) {
+        const ip = attackerIps[postIdx % attackerIps.length]!;
+        const events = [];
+        for (let e = 0; e < 8; e++) {
+          // Send each fake event twice (`Math.floor(fakeCounter / 2)`) so every accepted fake fingerprint reaches count >= 2!
+          const id = Math.floor(fakeCounter / 2);
+          fakeCounter++;
+          events.push(makeIndexedEvent(id, '1.0'));
+        }
+        const res = await collectorWorker.fetch(
+          new Request('https://telemetry.edgefetch.dev/v1/dev-errors', {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'cf-connecting-ip': ip,
+              'x-ef-test-now-ms': String(minuteNow + postIdx * 500),
+            },
+            body: JSON.stringify({ events }),
+          }),
+          env,
+        );
+        assert.ok(res.status === 202 || res.status === 429);
+      }
+    }
+
+    // 2. Also test worst-case pre-filled table (`MAX_ERROR_FINGERPRINTS: '400'`) where every existing row is at count = 2:
+    // Verify BOTH that the 10,000-row run above stored < 250 attacker rows AND that 200 brand-new genuine errors at minute 40 ALL store!
+    const arrivalNow = baseNow + 40 * 60_000;
+    const genuineFingerprints: string[] = [];
+    for (let g = 0; g < 200; g++) {
+      const ev = makeIndexedEvent(g, '2.7');
+      const fp = await computeErrorFingerprint(ev as Parameters<typeof computeErrorFingerprint>[0]);
+      genuineFingerprints.push(fp);
+      const genuineIp = `192.0.2.${(g % 200) + 1}`;
+      const r = await collectorWorker.fetch(
+        new Request('https://telemetry.edgefetch.dev/v1/dev-errors', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'cf-connecting-ip': genuineIp,
+            'x-ef-test-now-ms': String(arrivalNow + g * 10),
+          },
+          body: JSON.stringify(ev),
+        }),
+        env,
+      );
+      assert.equal(r.status, 202);
+    }
+
+    // Verify 200/200 genuine fingerprints are stored in D1!
+    let storedGenuine = 0;
+    for (const fp of genuineFingerprints) {
+      const row = await d1.prepare('SELECT count FROM error_fingerprints WHERE fingerprint = ?').bind(fp).first<{ count: number }>();
+      if (row && Number(row.count) >= 1) storedGenuine++;
+    }
+    assert.equal(storedGenuine, 200, `Expected 200/200 genuine errors stored after 40m attack, got ${storedGenuine}`);
+
+    // 3. Also test when table is 100% full of stale `count = 2` rows (`MAX_ERROR_FINGERPRINTS = '250'`):
+    // 200 brand-new `count = 1` genuine errors MUST NOT thrash a single slot (`1/200`); all 200/200 must survive!
+    resetCollectorRateLimiters();
+    const { d1: fullD1, close: closeFull } = createInMemoryCollectorD1();
+    try {
+      const staleTs = arrivalNow - 600_000; // 10 minutes old
+      for (let k = 0; k < 250; k++) {
+        await fullD1
+          .prepare(
+            `INSERT INTO error_fingerprints (
+               fingerprint, schema_version, version, runtime, os, arch, mode,
+               span_name, adapter_id, waf_vendor, http_status, error_class,
+               count, first_seen_at, last_seen_at
+             ) VALUES (?, 1, '1.9.0', 'node', 'linux', 'amd64', 'hub', 'edgefetch.scrape', 'ashby', '', 500, 'http_5xx', 2, ?, ?)`,
+          )
+          .bind(`stale_pinned_fp_${String(k).padStart(4, '0')}`, staleTs, staleTs)
+          .run();
+      }
+      const cappedEnv: CollectorEnv = {
+        DB: fullD1,
+        TELEMETRY_ADMIN_TOKEN: VALID_ADMIN_TOKEN,
+        MAX_ERROR_FINGERPRINTS: '250',
+      };
+      for (let g = 0; g < 200; g++) {
+        const ev = makeIndexedEvent(g, '2.7');
+        const r = await collectorWorker.fetch(
+          new Request('https://telemetry.edgefetch.dev/v1/dev-errors', {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'cf-connecting-ip': `198.18.${Math.floor(g / 10)}.${(g % 10) + 1}`,
+              'x-ef-test-now-ms': String(arrivalNow + g * 5),
+            },
+            body: JSON.stringify(ev),
+          }),
+          cappedEnv,
+        );
+        assert.equal(r.status, 202);
+      }
+      let survivedInFullTable = 0;
+      for (const fp of genuineFingerprints) {
+        const row = await fullD1.prepare('SELECT count FROM error_fingerprints WHERE fingerprint = ?').bind(fp).first<{ count: number }>();
+        if (row && Number(row.count) >= 1) survivedInFullTable++;
+      }
+      assert.equal(
+        survivedInFullTable,
+        200,
+        `Expected 200/200 new count=1 errors to survive against stale count=2 rows (no 1-slot thrashing!), got ${survivedInFullTable}`,
+      );
+    } finally {
+      closeFull();
+    }
+  } finally {
+    if (prevAllowClock === undefined) delete process.env.EDGEFETCH_ALLOW_TEST_CLOCK;
+    else process.env.EDGEFETCH_ALLOW_TEST_CLOCK = prevAllowClock;
+    close();
+  }
+});

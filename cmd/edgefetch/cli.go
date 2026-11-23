@@ -454,12 +454,14 @@ func runScrapeCLI(ctx context.Context, args []string, stdout, stderr io.Writer, 
 		return 1
 	}
 	res := reply.Results[0]
+	sanitizeStandaloneCrawlResult(&res)
 	if maxChars > 0 && len(res.Markdown) > maxChars {
 		cut := maxChars
 		for cut > 0 && !utf8.RuneStart(res.Markdown[cut]) {
 			cut--
 		}
 		res.Markdown = res.Markdown[:cut]
+		sanitizeStandaloneCrawlResult(&res)
 	}
 
 	if jsonOut {
@@ -490,6 +492,23 @@ func runScrapeCLI(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	}
 	_, _ = fmt.Fprintln(stdout, strings.TrimSpace(out))
 	return 0
+}
+
+func sanitizeStandaloneCrawlResult(res *crawl.Result) {
+	if res == nil || res.Markdown == "" {
+		return
+	}
+	isRawOriginOrCompanion := res.ContentSource == "origin-markdown" ||
+		(res.Llms != nil && res.Llms.UsedCompanionMd) ||
+		strings.Contains(strings.ToLower(res.ContentType), "text/plain")
+	if !isRawOriginOrCompanion {
+		return
+	}
+	baseURL := res.FinalURL
+	if baseURL == "" {
+		baseURL = res.URL
+	}
+	res.Markdown = extract.SanitizeMarkdown(res.Markdown, baseURL)
 }
 
 func runKeygenBotAuth(args []string, stdout, stderr io.Writer) int {

@@ -318,8 +318,10 @@ func executeMCPStdioToolCall(
 			return stdioToolResult(id, "empty_reply", true)
 		}
 		res := rep.Results[0]
+		sanitizeStandaloneCrawlResult(&res)
 		if sp.MaxChars > 0 {
 			res.Markdown = truncateUTF8Safe(res.Markdown, sp.MaxChars)
+			sanitizeStandaloneCrawlResult(&res)
 		}
 		txt := marshalJSONNoEscapeHTML(res, "  ")
 		isErr = res.Outcome != classify.OutcomeOK

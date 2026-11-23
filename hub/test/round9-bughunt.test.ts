@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { findRelevantAdapters } from '../src/agent-runner';
@@ -9,6 +12,8 @@ import { handleMcpRequest, truncateResultBodies, type McpServerDeps } from '../s
 import { createMemoryOAuthStore } from '../src/oauth';
 import { validatePublicHttpsTargetUrl } from '../src/overflow';
 import { collapseAnimatedCounterTickersLinear, executeScrapeCall, finalizeScrapedMarkdown } from '../src/scrape';
+import { sanitizeFullMarkdownDocumentForArtifact, sanitizeMarkdownPageSlice } from '../src/scrape-advanced';
+import { startPortableHub } from '../portable/portable-server';
 import { executeSearchCall } from '../src/web-search';
 
 function createSqliteD1(sqlite: DatabaseSync): D1Database {
@@ -513,4 +518,39 @@ test('BugHunt #2, #3, #4, #8, #9, #11, #12, #15 & Animated Counters: end-to-end 
     includeImages: true,
   });
   assert.equal(finCounter.markdown, 'Total: 382,831,172 requests');
+
+  // Blind verifier regressions:
+  // (a) Bare `\r` (`U+000D`) inside `sanitizeFullMarkdownDocumentForArtifact` & `sanitizeMarkdownPageSlice`
+  const crFenceDoc = '```\ncode\r```\r<script>1</script>\r[bad](javascript:void(0))\n```';
+  const sanCrFull = sanitizeFullMarkdownDocumentForArtifact(crFenceDoc);
+  const sanCrSlice = sanitizeMarkdownPageSlice(crFenceDoc, 0, crFenceDoc);
+  assert.equal(sanCrFull.includes('<script>'), false, `Bare CR fence desync in full artifact: ${sanCrFull}`);
+  assert.equal(sanCrFull.includes('javascript:'), false, `Bare CR scheme leak in full artifact: ${sanCrFull}`);
+  assert.equal(sanCrSlice.includes('<script>'), false, `Bare CR fence desync in slice: ${sanCrSlice}`);
+  assert.equal(sanCrSlice.includes('javascript:'), false, `Bare CR scheme leak in slice: ${sanCrSlice}`);
+
+  // (b) Portable Hub forwards `GITHUB_OWNER_ID` into `workerEnv` (`302` to GitHub, never `503 owner_id_required`)
+  const phDir = mkdtempSync(join(tmpdir(), 'ef-r9-ph-'));
+  const ph = await startPortableHub({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: phDir,
+    env: {
+      CALLER_TOKEN: 'tok_0123456789abcdef0123456789abcdef',
+      SESSION_SECRET: 'sec_0123456789abcdef0123456789abcdef',
+      GITHUB_CLIENT_ID: 'gh_cid_portable',
+      GITHUB_CLIENT_SECRET: 'gh_csec_portable_123456',
+      GITHUB_OWNER_ID: '999001',
+      GITHUB_OWNER_LOGIN: 'founderhandle',
+      SIGNUP_MODE: 'invite_only',
+    },
+  });
+  try {
+    const ghLoginRes = await fetch(`http://127.0.0.1:${ph.port}/admin/auth/github`, { redirect: 'manual' });
+    assert.equal(ghLoginRes.status, 302);
+    assert.match(ghLoginRes.headers.get('location') ?? '', /^https:\/\/github\.com\/login\/oauth\/authorize\?/);
+  } finally {
+    await ph.close();
+    rmSync(phDir, { recursive: true, force: true });
+  }
 });

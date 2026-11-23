@@ -13,6 +13,8 @@ import { join, resolve } from 'node:path';
 import { WebSocketServer } from 'ws';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
 import metaMultiUserSql from '../migrations/meta/0002_multiuser.sql';
+import metaRound7Sql from '../migrations/meta/0003_round7_multiuser_hardening.sql';
+import metaRound9Sql from '../migrations/meta/0004_round9_founder_pinning.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
 import { authorizeAgent, isValidSecretMatch } from '../src/auth';
 import { resolveSessionSecret } from '../src/github-auth';
@@ -64,6 +66,7 @@ export interface PortableHubOptions {
   host?: string;
   dataDir?: string;
   migrationsDir?: string;
+  env?: Record<string, string | undefined>;
   envOverrides?: Record<string, string | undefined>;
   dnsResolver?: LookupResolverFn;
   maxInflightPerIp?: number;
@@ -505,7 +508,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const host = opts.host ?? process.env.HOST ?? '0.0.0.0';
   const dataDir = resolve(opts.dataDir ?? process.env.EDGEFETCH_DATA_DIR ?? './.edgefetch-data');
 
-  const mergedEnv = { ...process.env, ...(opts.envOverrides ?? {}) };
+  const mergedEnv = { ...process.env, ...(opts.env ?? {}), ...(opts.envOverrides ?? {}) };
   const trustProxy = isTruthyFlag(mergedEnv.EDGEFETCH_TRUST_PROXY);
   const trustFlyClientIp =
     trustProxy &&
@@ -532,10 +535,18 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
               existsSync(join(resolve(opts.migrationsDir), 'meta', '0002_multiuser.sql'))
                 ? join(resolve(opts.migrationsDir), 'meta', '0002_multiuser.sql')
                 : { name: 'meta/0002_multiuser.sql', sql: metaMultiUserSql },
+              existsSync(join(resolve(opts.migrationsDir), 'meta', '0003_round7_multiuser_hardening.sql'))
+                ? join(resolve(opts.migrationsDir), 'meta', '0003_round7_multiuser_hardening.sql')
+                : { name: 'meta/0003_round7_multiuser_hardening.sql', sql: metaRound7Sql },
+              existsSync(join(resolve(opts.migrationsDir), 'meta', '0004_round9_founder_pinning.sql'))
+                ? join(resolve(opts.migrationsDir), 'meta', '0004_round9_founder_pinning.sql')
+                : { name: 'meta/0004_round9_founder_pinning.sql', sql: metaRound9Sql },
             ]
           : [
               { name: 'meta/0001_tracking.sql', sql: metaSchemaSql },
               { name: 'meta/0002_multiuser.sql', sql: metaMultiUserSql },
+              { name: 'meta/0003_round7_multiuser_hardening.sql', sql: metaRound7Sql },
+              { name: 'meta/0004_round9_founder_pinning.sql', sql: metaRound9Sql },
             ],
       );
   const localSearchDb = (mergedEnv.SEARCH_TURSO_URL || tursoUrl)
@@ -605,6 +616,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     GITHUB_CLIENT_ID: mergedEnv.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: mergedEnv.GITHUB_CLIENT_SECRET,
     GITHUB_ALLOWED_USERS: mergedEnv.GITHUB_ALLOWED_USERS,
+    GITHUB_OWNER_ID: mergedEnv.GITHUB_OWNER_ID,
     GITHUB_OWNER_LOGIN: mergedEnv.GITHUB_OWNER_LOGIN,
     SIGNUP_MODE: mergedEnv.SIGNUP_MODE,
     VAULT_MASTER_KEY: mergedEnv.VAULT_MASTER_KEY ?? mergedEnv.EDGEFETCH_VAULT_MASTER_KEY,

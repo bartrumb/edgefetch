@@ -120,6 +120,7 @@ const KNOWN_DENO_ENV_KEYS = [
   'GITHUB_CLIENT_ID',
   'GITHUB_CLIENT_SECRET',
   'GITHUB_ALLOWED_USERS',
+  'GITHUB_OWNER_ID',
   'GITHUB_OWNER_LOGIN',
   'SIGNUP_MODE',
   'VAULT_MASTER_KEY',
@@ -1233,7 +1234,10 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     oauthGetUser: (id: string) => oauth.getUser?.(id) ?? null,
     oauthListUsers: () => oauth.listUsers?.() ?? [],
     oauthCountUsers: () => oauth.countUsers?.() ?? 0,
-    oauthUpdateUserRole: (id: string, role: UserRole) => oauth.updateUserRole?.(id, role) ?? false,
+    oauthUpdateUserRole: (id: string, role: UserRole, promotedByOwnerId?: string | null) =>
+      oauth.updateUserRole?.(id, role, promotedByOwnerId) ?? false,
+    oauthEnforcePinnedFounderOwners: (pinnedOwnerId: string) =>
+      oauth.enforcePinnedFounderOwners?.(pinnedOwnerId) ?? 0,
     oauthCheckAuthLockout: (b: string, now: number, m?: number) => oauth.checkAuthLockout(b, now, m),
     oauthRecordAuthFailure: (b: string, now: number, w: number, m: number) => oauth.recordAuthFailure(b, now, w, m),
     oauthClearAuthFailures: (b: string) => oauth.clearAuthFailures(b),

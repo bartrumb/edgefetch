@@ -1252,10 +1252,16 @@ function detectSliceListItemContentCol(raw: string, leadCols: number, leadPos: n
   return col;
 }
 
+function normalizeSliceLineEndingsLengthPreserving(s: string): string {
+  if (!/[\r\u0085\u2028\u2029]/.test(s)) return s;
+  return s.replace(/\r(?!\n)/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ');
+}
+
 function hardenAndSplitSliceFences(
-  md: string,
+  rawMd: string,
   initialReopenedFence?: { ch: string; len: number; sourceIndent: number },
 ): Array<{ text: string; isFence: boolean }> {
+  const md = normalizeSliceLineEndingsLengthPreserving(rawMd);
   const lines = md.split('\n');
   const normLines: string[] = [];
   let inFence = false;
@@ -1518,9 +1524,10 @@ export interface MarkdownSliceCheckpoint {
   prevLineWasParagraph: boolean;
 }
 
-export function computeMarkdownSliceCheckpoints(fullMd: string, stepChars = 16_384): MarkdownSliceCheckpoint[] {
+export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 16_384): MarkdownSliceCheckpoint[] {
   const checkpoints: MarkdownSliceCheckpoint[] = [];
-  if (!fullMd || fullMd.length <= stepChars) return checkpoints;
+  if (!rawFullMd || rawFullMd.length <= stepChars) return checkpoints;
+  const fullMd = normalizeSliceLineEndingsLengthPreserving(rawFullMd);
   let inFence = false;
   let fenceChar = '';
   let fenceLen = 0;
@@ -1651,13 +1658,15 @@ export function computeMarkdownSliceCheckpoints(fullMd: string, stepChars = 16_3
 }
 
 export function sanitizeMarkdownPageSlice(
-  fullMd: string,
+  rawFullMd: string,
   safeOffset: number,
-  rawSlice: string,
+  rawSliceInput: string,
   allowPdfPageMarkers = false,
   checkpoints?: readonly MarkdownSliceCheckpoint[],
 ): string {
-  if (!rawSlice) return '';
+  if (!rawSliceInput) return '';
+  const fullMd = normalizeSliceLineEndingsLengthPreserving(rawFullMd);
+  const rawSlice = normalizeSliceLineEndingsLengthPreserving(rawSliceInput);
 
   let inFence = false;
   let fenceChar = '';
@@ -1898,7 +1907,10 @@ export function sanitizeMarkdownPageSlice(
  */
 export function sanitizeFullMarkdownDocumentForArtifact(fullMd: string): string {
   if (!fullMd) return '';
-  return sanitizeMarkdownPageSlice(fullMd, 0, fullMd, false);
+  const norm = /[\r\u0085\u2028\u2029]/.test(fullMd)
+    ? fullMd.replace(/\r\n?/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ')
+    : fullMd;
+  return sanitizeMarkdownPageSlice(norm, 0, norm, false);
 }
 
 /**
@@ -2580,11 +2592,13 @@ export function detectPromptInjection(params: {
       const closeMoreByTag = new Map<string, number[]>();
       const closeCursorByTag = new Map<string, number>();
       const candidateOpenTags: Array<{
-        tagNameLower: string;
+        nameStart: number;
+        nameEnd: number;
         attrStart: number;
         attrEnd: number;
         end: number;
         isSelfClosing: boolean;
+        immediateClose: number;
       }> = [];
 
       let scanPos = 0;
@@ -2680,13 +2694,40 @@ export function detectPromptInjection(params: {
         const selfClosing = j > p && rawForHidden.charCodeAt(j - 1) === 47 /* '/' */;
         const attrEnd = selfClosing ? j - 1 : j;
         if (attrEnd > p) {
+          const nameLen = p - nameStart;
+          let immediateClose = -1;
+          if (!selfClosing) {
+            const nextLt = rawForHidden.indexOf('<', j + 1);
+            if (
+              nextLt >= j + 1 &&
+              nextLt - (j + 1) <= 256 &&
+              nextLt + 2 + nameLen < htmlLen &&
+              rawForHidden.charCodeAt(nextLt + 1) === 47 /* '/' */ &&
+              rawForHidden.charCodeAt(nextLt + 2 + nameLen) === 62 /* '>' */
+            ) {
+              let sameTag = true;
+              for (let k = 0; k < nameLen; k++) {
+                if (lowerForHidden.charCodeAt(nameStart + k) !== lowerForHidden.charCodeAt(nextLt + 2 + k)) {
+                  sameTag = false;
+                  break;
+                }
+              }
+              if (sameTag) immediateClose = nextLt;
+            }
+          }
           candidateOpenTags.push({
-            tagNameLower: lowerForHidden.slice(nameStart, p),
+            nameStart,
+            nameEnd: p,
             attrStart: p,
             attrEnd,
             end: j + 1,
             isSelfClosing: selfClosing,
+            immediateClose,
           });
+          if (immediateClose >= 0) {
+            scanPos = immediateClose + 3 + nameLen;
+            continue;
+          }
         }
         scanPos = j + 1;
       }
@@ -2738,19 +2779,21 @@ export function detectPromptInjection(params: {
 
         if (!isHiddenSubtree) continue;
 
-        let closeIdx = -1;
-        const firstClose = closeFirstByTag.get(tag.tagNameLower);
+        let closeIdx = tag.immediateClose;
+        const tagNameLower =
+          closeIdx < 0 && closeFirstByTag.size > 0 ? lowerForHidden.slice(tag.nameStart, tag.nameEnd) : '';
+        const firstClose = tagNameLower ? closeFirstByTag.get(tagNameLower) : undefined;
         if (firstClose !== undefined) {
           if (firstClose >= tag.end) {
             closeIdx = firstClose;
           } else {
-            const moreList = closeMoreByTag.get(tag.tagNameLower);
+            const moreList = closeMoreByTag.get(tagNameLower);
             if (moreList) {
-              let cur = closeCursorByTag.get(tag.tagNameLower) ?? 0;
+              let cur = closeCursorByTag.get(tagNameLower) ?? 0;
               while (cur < moreList.length && moreList[cur]! < tag.end) {
                 cur++;
               }
-              closeCursorByTag.set(tag.tagNameLower, cur);
+              closeCursorByTag.set(tagNameLower, cur);
               if (cur < moreList.length) {
                 closeIdx = moreList[cur]!;
               }
@@ -2796,7 +2839,13 @@ export function detectPromptInjection(params: {
           }
         }
         if (rawHiddenChunks.length > 0) {
-          const strippedOnce = stripHtmlTagsQuoteAwareLinear(rawHiddenChunks.join('\n.\n'), ' ', MAX_PROMPT_INJECTION_SCAN_CHARS);
+          const joinedHidden = rawHiddenChunks.join('\n.\n');
+          const boundedJoinedHidden = joinedHidden.slice(0, MAX_PROMPT_INJECTION_SCAN_CHARS);
+          const strippedOnce = !boundedJoinedHidden.includes('<')
+            ? boundedJoinedHidden
+            : !boundedJoinedHidden.includes('"') && !boundedJoinedHidden.includes("'")
+              ? boundedJoinedHidden.replace(/<[A-Za-z/!?][^>]{0,4096}>/g, ' ')
+              : stripHtmlTagsQuoteAwareLinear(boundedJoinedHidden, ' ', MAX_PROMPT_INJECTION_SCAN_CHARS);
           if (matchesHiddenSubtreeInjection(strippedOnce)) {
             triggers.push('hidden_css_instruction_injection');
             totalScore += 5;

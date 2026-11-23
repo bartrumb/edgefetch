@@ -949,7 +949,10 @@ export class LocalAgentHubCoordinator {
       oauthGetUser: (id: string) => this.oauth.getUser?.(id) ?? null,
       oauthListUsers: () => this.oauth.listUsers?.() ?? [],
       oauthCountUsers: () => this.oauth.countUsers?.() ?? 0,
-      oauthUpdateUserRole: (id: string, role: UserRole) => this.oauth.updateUserRole?.(id, role) ?? false,
+      oauthUpdateUserRole: (id: string, role: UserRole, promotedByOwnerId?: string | null) =>
+        this.oauth.updateUserRole?.(id, role, promotedByOwnerId) ?? false,
+      oauthEnforcePinnedFounderOwners: (pinnedOwnerId: string) =>
+        this.oauth.enforcePinnedFounderOwners?.(pinnedOwnerId) ?? 0,
       oauthCheckAuthLockout: (b: string, now: number, m?: number) => this.oauth.checkAuthLockout(b, now, m),
       oauthRecordAuthFailure: (b: string, now: number, w: number, m: number) => this.oauth.recordAuthFailure(b, now, w, m),
       oauthClearAuthFailures: (b: string) => this.oauth.clearAuthFailures(b),

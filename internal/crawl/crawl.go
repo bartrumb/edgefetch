@@ -367,6 +367,15 @@ func (c *Crawler) SetRenderer(r *browser.Renderer) {
 	}
 }
 
+// SetAllowNoSandboxBrowser configures whether the headless Chromium renderer may run with `--no-sandbox`
+// when host AppArmor/seccomp policy blocks unprivileged user namespaces (e.g. Home Assistant OS opt-in).
+func (c *Crawler) SetAllowNoSandboxBrowser(allow bool) {
+	if c == nil || c.renderer == nil {
+		return
+	}
+	c.renderer.SetAllowNoSandbox(allow)
+}
+
 // SetOtelExporter attaches an optional non-blocking OpenTelemetry OTLP/HTTP span exporter.
 func (c *Crawler) SetOtelExporter(exp *otel.Exporter) {
 	c.otelExp = exp
@@ -818,13 +827,19 @@ func (c *Crawler) runRequestWithRedirects(
 		}
 		if c.allow != nil {
 			if err := c.allow(parsedCur); err != nil {
+				blockedReason := "ssrf"
+				problem := ssrfProblemFromAllowErr(err)
+				if isSchemeDowngradeRedirect(origReq.URL, hop, parsedCur, c.allow) {
+					blockedReason = "scheme_downgrade"
+					problem = "HTTPS-to-HTTP redirect downgrade is not permitted"
+				}
 				res := Result{
 					ID:            origReq.ID,
 					URL:           origReq.URL,
 					Kind:          origReq.Kind,
 					Outcome:       classify.OutcomeBlockedSSRF,
-					BlockedReason: "ssrf",
-					Problem:       ssrfProblemFromAllowErr(err),
+					BlockedReason: blockedReason,
+					Problem:       problem,
 					Attempts:      totalAttempts,
 					DurationMs:    c.Now().Sub(started).Milliseconds(),
 				}
@@ -1106,6 +1121,32 @@ func isSSRFBlockError(err error) bool {
 		strings.Contains(lower, "non-public peer ip")
 }
 
+func isSchemeDowngradeRedirect(origURL string, hop int, parsedCur *url.URL, allow func(*url.URL) error) bool {
+	if hop <= 0 || parsedCur == nil || !strings.EqualFold(parsedCur.Scheme, "http") {
+		return false
+	}
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(origURL)), "https://") {
+		return false
+	}
+	if allow == nil {
+		return true
+	}
+	cloned := *parsedCur
+	cloned.Scheme = "https"
+	if cloned.Host != "" && strings.HasSuffix(cloned.Host, ":80") {
+		cloned.Host = strings.TrimSuffix(cloned.Host, ":80")
+	}
+	return allow(&cloned) == nil
+}
+
+func isSyntheticRedirectBlockBody(status int, body []byte) bool {
+	if status != http.StatusForbidden || len(body) == 0 || len(body) > 512 {
+		return false
+	}
+	trimmed := strings.ToLower(strings.TrimSpace(string(body)))
+	return strings.HasPrefix(trimmed, "forbidden redirect target:")
+}
+
 func ssrfProblemFromAllowErr(err error) string {
 	if err == nil || isSSRFBlockError(err) {
 		return "blocked by SSRF policy: non-public target address"
@@ -1342,6 +1383,13 @@ func (c *Crawler) fetchSingleHop(ctx context.Context, r Request, opts Options) (
 			}
 		} else if status == http.StatusNotModified && (r.IfNoneMatch != "" || r.IfModifiedSince != "") && res.CfMitigated == "" {
 			res.Outcome, res.Problem = classify.OutcomeOK, ""
+		} else if isSyntheticRedirectBlockBody(status, body) {
+			res.Status = 0
+			res.Bytes = 0
+			res.Outcome = classify.OutcomeBlockedSSRF
+			res.BlockedReason = "ssrf"
+			res.Problem = "blocked by SSRF policy: non-public target address"
+			body = nil
 		} else {
 			res.WAF = classify.ClassifyWAF(status, header, body)
 			res.Outcome, res.Problem = classify.ClassifyAuto(r.Kind, r.KindAuto, status, header, body)

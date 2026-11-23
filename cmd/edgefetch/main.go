@@ -704,6 +704,7 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		crawler := crawl.NewCrawler(crawlTr, allow, cfg.UserAgent, siteLog)
 		defer func() { _ = crawler.Close() }()
 		crawler.SetRobotsBypassHosts(cfg.RobotsBypassHosts)
+		crawler.SetAllowNoSandboxBrowser(cfg.AllowNoSandboxBrowser)
 		crawler.SetOtelExporter(otel.NewExporterFromEnv(deps.getenv, "edgefetch-agent-"+cfg.SiteID, agent.Version, hubTr))
 		if _, err := configureCrawlerBotAuth(crawler, cfg.HubURLs, deps.getenv, siteLog); err != nil {
 			return 2
@@ -766,6 +767,7 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		bypassHosts = agentCfg.RobotsBypassHosts
 	}
 	crawler.SetRobotsBypassHosts(bypassHosts)
+	crawler.SetAllowNoSandboxBrowser(agentCfg.AllowNoSandboxBrowser || isTruthyEnv(deps.getenv("EDGEFETCH_ALLOW_NO_SANDBOX")))
 	otelExp := otel.NewExporterFromEnv(deps.getenv, defaultOtelSvc, agent.Version, hubTr)
 	crawler.SetOtelExporter(otelExp)
 	botSigner, botErr := configureCrawlerBotAuth(crawler, agentCfg.HubURLs, deps.getenv, log)

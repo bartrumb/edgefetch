@@ -1768,7 +1768,7 @@ test('V2-10: Modular Site Extractor Registry (18+ platforms: npm, crates.io, HF,
   </body></html>`;
   const soOut = extractHtmlDocument(soHtml, { baseUrl: 'https://stackoverflow.com/questions/99999/how-to-type-promise' });
   assert.match(soOut.markdown, /## ✅ Accepted Answer \(Score: 88\)/);
-  assert.match(soOut.markdown, /`Promise&lt;Result&lt;T>>`/);
+  assert.match(soOut.markdown, /`Promise<Result<T>>`/);
   assert.match(soOut.markdown, /type Unwrap<T> = Awaited<T>;/);
   assert.equal(soOut.markdown.includes('Noise question 1'), false);
 
@@ -3195,7 +3195,7 @@ test('V2-13: v2.4.0 RFC 9421 Web Bot Auth, 7-Vendor WAF Catalog + Anti-FP Guardr
       token: 'v24-owner-secret-0123456789abcdef',
     });
     const caps = await sdk.capabilities();
-    assert.equal(caps.version, '2.7.3');
+    assert.equal(caps.version, '2.7.4');
     assert.equal((caps.capabilities as { webBotAuth: boolean }).webBotAuth, true);
     const hostsOut = await sdk.hosts(25);
     assert.equal(hostsOut.ok, true);

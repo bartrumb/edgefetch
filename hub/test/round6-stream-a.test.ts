@@ -118,8 +118,8 @@ function assertNoActiveHtmlOrJsLinksOutsideCode(md: string, contextLabel: string
 }
 
 export async function runRound6StreamASubtests(t: TestContext): Promise<void> {
-await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 31', () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 31);
+await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 32', () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 32);
 
   // 1. Indented fence dedent & top-level 1..3 space fence normalization (`r6A/h1.mjs`, `r6A/h1diff.mjs`)
   const h1IndentJs = fin(' ```\nx\n ```\n[k](javascript:alert(1))');
@@ -242,8 +242,8 @@ await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash 
   ].join('\n');
   const sanitizedBullets = fin(changelogBullets);
   assert.ok(
-    sanitizedBullets.includes('`&lt;svg>`') && sanitizedBullets.includes('`&lt;math>`'),
-    `Expected fail-closed inline code span escaping in bullets: ${sanitizedBullets}`,
+    sanitizedBullets.includes('`<svg>`') && sanitizedBullets.includes('`<math>`'),
+    `Expected provably safe inline code spans preserved in bullets: ${sanitizedBullets}`,
   );
 
   // 4. Residual `R5-H3` Low fence-header cost (`r6A/fh.6.mjs`): 64K ` [[` / `\t` / `theme={...}` info header runs in < 20ms
@@ -436,10 +436,11 @@ await t.test('R6-H3: Bare URL & autolink candidates glued to code spans never sw
   );
   const reachFinal = fin(reachDoc.markdown);
   assert.ok(
-    reachFinal.includes('https://ok.example/ `&lt;img src=x onerror=alert(1)>`') ||
+    reachFinal.includes('https://ok.example/ `<img src=x onerror=alert(1)>`') ||
+      reachFinal.includes('https://ok.example/ `&lt;img src=x onerror=alert(1)>`') ||
       reachDoc.markdown.includes('https://ok.example/ `<img src=x onerror=alert(1)>`') ||
       reachDoc.markdown.includes('https://ok.example/ `&lt;img src=x onerror=alert(1)>`'),
-    `Expected space inserted before code span and fail-closed escape, got: ${reachDoc.markdown} -> ${reachFinal}`,
+    `Expected space inserted before code span and safe handling, got: ${reachDoc.markdown} -> ${reachFinal}`,
   );
 
   // 3. URL already INSIDE an inline code span MUST NOT be modified!

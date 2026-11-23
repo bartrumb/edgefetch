@@ -19,13 +19,19 @@ import type { McpVaultStore } from './mcp-vault';
 import {
   cancelBatchScrape,
   cancelCrawlJob,
+  countExtractPayloadUrls,
   createCrawlJob,
   executeCrawlJob,
   executeMapCall,
   getBatchScrapeStatus,
   getCrawlJobStatus,
+  MAX_CONCURRENT_EXTRACT_URLS_PER_USER,
+  MAX_CONCURRENT_EXTRACTS_PER_USER,
+  MAX_CONCURRENT_MAPS_PER_USER,
   previewCrawlParams,
   startOrExecuteBatchScrape,
+  tryAcquireUserExtractSlots,
+  tryAcquireUserMapSlot,
   type HubFetchExecutor,
 } from './map-crawl';
 import { authorizeMcpRequest, type OAuthStore } from './oauth';
@@ -147,17 +153,33 @@ export async function handleCompatRoutes(params: {
   }
 
   if (fcSubpath === '/map' && request.method === 'POST') {
-    const out = await executeMapCall({
-      payload: bodyObj,
-      executeHubFetch,
-      selfHost: url.hostname,
-      source: 'compat:firecrawl:map',
-      ...(activeTracer ? { tracer: activeTracer } : {}),
-    });
-    return Response.json(
-      out.status === 200 ? { success: true, links: out.body.links, entries: out.body.entries } : { success: false, ...out.body },
-      { status: out.status },
-    );
+    const releaseMapSlot = tryAcquireUserMapSlot(callerUserId);
+    if (!releaseMapSlot) {
+      return Response.json(
+        {
+          ok: false,
+          success: false,
+          error: 'user_quota_exceeded',
+          message: `Per-user concurrent map limit (${MAX_CONCURRENT_MAPS_PER_USER}) exceeded.`,
+        },
+        { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': '2' } },
+      );
+    }
+    try {
+      const out = await executeMapCall({
+        payload: bodyObj,
+        executeHubFetch,
+        selfHost: url.hostname,
+        source: 'compat:firecrawl:map',
+        ...(activeTracer ? { tracer: activeTracer } : {}),
+      });
+      return Response.json(
+        out.status === 200 ? { success: true, links: out.body.links, entries: out.body.entries } : { success: false, ...out.body },
+        { status: out.status },
+      );
+    } finally {
+      releaseMapSlot();
+    }
   }
 
   if (fcSubpath === '/crawl/params-preview' && request.method === 'POST') {
@@ -296,22 +318,42 @@ export async function handleCompatRoutes(params: {
   }
 
   if (fcSubpath === '/extract' && request.method === 'POST') {
-    const out = await executeExtractCall({
-      payload: {
-        ...bodyObj,
-        ...(typeof bodyObj.query !== 'string' && typeof bodyObj.prompt === 'string' ? { query: bodyObj.prompt } : {}),
-      },
-      env,
-      executeHubFetch,
-      selfHost: url.hostname,
-      userId: callerUserId,
-      source: 'compat:firecrawl:extract',
-      ...(activeTracer ? { tracer: activeTracer } : {}),
-    });
-    return Response.json(
-      out.status === 200 ? { success: true, data: out.body, ...out.body } : { success: false, ...out.body },
-      { status: out.status },
-    );
+    const hasInvalidUrls =
+      !Array.isArray(bodyObj.urls) || bodyObj.urls.length === 0 || bodyObj.urls.length > 20;
+    const releaseExtractSlots = hasInvalidUrls
+      ? () => undefined
+      : tryAcquireUserExtractSlots(callerUserId, countExtractPayloadUrls(bodyObj));
+    if (!releaseExtractSlots) {
+      return Response.json(
+        {
+          ok: false,
+          success: false,
+          error: 'user_quota_exceeded',
+          message: `Per-user concurrent extract limit (${MAX_CONCURRENT_EXTRACTS_PER_USER} requests / ${MAX_CONCURRENT_EXTRACT_URLS_PER_USER} URLs) exceeded.`,
+        },
+        { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': '2' } },
+      );
+    }
+    try {
+      const out = await executeExtractCall({
+        payload: {
+          ...bodyObj,
+          ...(typeof bodyObj.query !== 'string' && typeof bodyObj.prompt === 'string' ? { query: bodyObj.prompt } : {}),
+        },
+        env,
+        executeHubFetch,
+        selfHost: url.hostname,
+        userId: callerUserId,
+        source: 'compat:firecrawl:extract',
+        ...(activeTracer ? { tracer: activeTracer } : {}),
+      });
+      return Response.json(
+        out.status === 200 ? { success: true, data: out.body, ...out.body } : { success: false, ...out.body },
+        { status: out.status },
+      );
+    } finally {
+      releaseExtractSlots();
+    }
   }
 
   // ── Firecrawl `/v2/agent` Drop-In Compatibility (with SSE + BYO-LLM + Dynamic Adapter Router) ──
@@ -386,35 +428,71 @@ export async function handleCompatRoutes(params: {
   }
 
   if (p === '/compat/tavily/extract' && request.method === 'POST') {
-    const out = await executeExtractCall({
-      payload: bodyObj,
-      env,
-      executeHubFetch,
-      selfHost: url.hostname,
-      userId: callerUserId,
-      source: 'compat:tavily:extract',
-      ...(activeTracer ? { tracer: activeTracer } : {}),
-    });
-    return Response.json(
-      out.status === 200
-        ? { results: out.body.results, failed_results: out.body.failedResults }
-        : out.body,
-      { status: out.status },
-    );
+    const hasInvalidUrls =
+      !Array.isArray(bodyObj.urls) || bodyObj.urls.length === 0 || bodyObj.urls.length > 20;
+    const releaseExtractSlots = hasInvalidUrls
+      ? () => undefined
+      : tryAcquireUserExtractSlots(callerUserId, countExtractPayloadUrls(bodyObj));
+    if (!releaseExtractSlots) {
+      return Response.json(
+        {
+          ok: false,
+          success: false,
+          error: 'user_quota_exceeded',
+          message: `Per-user concurrent extract limit (${MAX_CONCURRENT_EXTRACTS_PER_USER} requests / ${MAX_CONCURRENT_EXTRACT_URLS_PER_USER} URLs) exceeded.`,
+        },
+        { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': '2' } },
+      );
+    }
+    try {
+      const out = await executeExtractCall({
+        payload: bodyObj,
+        env,
+        executeHubFetch,
+        selfHost: url.hostname,
+        userId: callerUserId,
+        source: 'compat:tavily:extract',
+        ...(activeTracer ? { tracer: activeTracer } : {}),
+      });
+      return Response.json(
+        out.status === 200
+          ? { results: out.body.results, failed_results: out.body.failedResults }
+          : out.body,
+        { status: out.status },
+      );
+    } finally {
+      releaseExtractSlots();
+    }
   }
 
   if (p === '/compat/tavily/map' && request.method === 'POST') {
-    const out = await executeMapCall({
-      payload: bodyObj,
-      executeHubFetch,
-      selfHost: url.hostname,
-      source: 'compat:tavily:map',
-      ...(activeTracer ? { tracer: activeTracer } : {}),
-    });
-    return Response.json(
-      out.status === 200 ? { base_url: out.body.url, results: out.body.links } : out.body,
-      { status: out.status },
-    );
+    const releaseMapSlot = tryAcquireUserMapSlot(callerUserId);
+    if (!releaseMapSlot) {
+      return Response.json(
+        {
+          ok: false,
+          success: false,
+          error: 'user_quota_exceeded',
+          message: `Per-user concurrent map limit (${MAX_CONCURRENT_MAPS_PER_USER}) exceeded.`,
+        },
+        { status: 429, headers: { 'cache-control': 'no-store', 'retry-after': '2' } },
+      );
+    }
+    try {
+      const out = await executeMapCall({
+        payload: bodyObj,
+        executeHubFetch,
+        selfHost: url.hostname,
+        source: 'compat:tavily:map',
+        ...(activeTracer ? { tracer: activeTracer } : {}),
+      });
+      return Response.json(
+        out.status === 200 ? { base_url: out.body.url, results: out.body.links } : out.body,
+        { status: out.status },
+      );
+    } finally {
+      releaseMapSlot();
+    }
   }
 
   return Response.json({ success: false, error: 'not_found' }, { status: 404 });

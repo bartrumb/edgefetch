@@ -1197,8 +1197,13 @@ function createMockCatalogD1AndR2() {
     bind: (...b: unknown[]) => makeStmt(sql, b),
     run: async () => {
       if (/INSERT OR REPLACE INTO catalog_runs/i.test(sql)) {
-        const [catalog_id, origin, platform, collection, status, products_count, variants_count, pages_read, artifact_id, hashes_json, summary_json, created_at, updated_at] = args;
-        catalogRows.set(String(catalog_id), { catalog_id, origin, platform, collection, status, products_count, variants_count, pages_read, artifact_id, hashes_json, summary_json, created_at, updated_at });
+        if (args.length >= 14) {
+          const [catalog_id, user_id, origin, platform, collection, status, products_count, variants_count, pages_read, artifact_id, hashes_json, summary_json, created_at, updated_at] = args;
+          catalogRows.set(String(catalog_id), { catalog_id, user_id, origin, platform, collection, status, products_count, variants_count, pages_read, artifact_id, hashes_json, summary_json, created_at, updated_at });
+        } else {
+          const [catalog_id, origin, platform, collection, status, products_count, variants_count, pages_read, artifact_id, hashes_json, summary_json, created_at, updated_at] = args;
+          catalogRows.set(String(catalog_id), { catalog_id, origin, platform, collection, status, products_count, variants_count, pages_read, artifact_id, hashes_json, summary_json, created_at, updated_at });
+        }
       } else if (/INSERT INTO search_cache/i.test(sql)) {
         const [cache_key, payload_json, created_at, expires_at] = args;
         searchCacheRows.set(String(cache_key), { payload_json: String(payload_json), created_at: Number(created_at), expires_at: Number(expires_at) });
@@ -1223,10 +1228,10 @@ function createMockCatalogD1AndR2() {
       return null;
     },
     all: async <T = Record<string, unknown>>() => {
-      if (/FROM catalog_runs\s+WHERE origin/i.test(sql)) {
-        const [origin, collection, excludeId] = args;
+      if (/FROM catalog_runs\s+WHERE/i.test(sql)) {
+        const [user_id, origin, collection, excludeId] = args.length >= 4 ? args : ['owner', ...args];
         const matches = [...catalogRows.values()]
-          .filter((r) => r.origin === origin && r.collection === collection && r.status === 'complete' && r.catalog_id !== excludeId)
+          .filter((r) => (!r.user_id || r.user_id === user_id) && r.origin === origin && r.collection === collection && r.status === 'complete' && r.catalog_id !== excludeId)
           .reverse();
         return { success: true, results: matches as T[] };
       }

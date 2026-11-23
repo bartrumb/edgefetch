@@ -153,10 +153,30 @@ func VerifyBytesSHA256(data []byte, expectedHex string) error {
 	return nil
 }
 
+func stripSemverBuildMetadata(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	plusIdx := strings.IndexByte(trimmed, '+')
+	if plusIdx < 0 {
+		return trimmed, true
+	}
+	core := trimmed[:plusIdx]
+	meta := trimmed[plusIdx+1:]
+	if core == "" || meta == "" || strings.HasPrefix(meta, ".") || strings.HasSuffix(meta, ".") || strings.Contains(meta, "..") {
+		return "", false
+	}
+	for i := 0; i < len(meta); i++ {
+		c := meta[i]
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '.' || c == '-' || c == '_') {
+			return "", false
+		}
+	}
+	return core, true
+}
+
 func normalizeReleaseTag(raw string) (tag string, verNoV string, err error) {
-	clean := strings.TrimSpace(raw)
-	if clean == "" {
-		return "", "", errors.New("empty version string")
+	clean, metaOK := stripSemverBuildMetadata(raw)
+	if !metaOK || clean == "" {
+		return "", "", fmt.Errorf("invalid semantic version tag %q", raw)
 	}
 	if !strings.HasPrefix(clean, "v") {
 		clean = "v" + clean
@@ -167,48 +187,118 @@ func normalizeReleaseTag(raw string) (tag string, verNoV string, err error) {
 	return clean, strings.TrimPrefix(clean, "v"), nil
 }
 
-func compareSemverTags(a, b string) int {
-	ma := reReleaseTag.FindStringSubmatch(strings.TrimSpace(ensureVPrefix(a)))
-	mb := reReleaseTag.FindStringSubmatch(strings.TrimSpace(ensureVPrefix(b)))
-	if len(ma) < 5 || len(mb) < 5 {
-		if a == b {
-			return 0
-		}
-		return strings.Compare(a, b)
+func isDigitsOnlyASCII(s string) bool {
+	if s == "" {
+		return false
 	}
-	for i := 1; i <= 3; i++ {
-		na, _ := strconv.Atoi(ma[i])
-		nb, _ := strconv.Atoi(mb[i])
-		if na != nb {
-			if na < nb {
-				return -1
-			}
-			return 1
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
 		}
 	}
-	preA, preB := ma[4], mb[4]
+	return true
+}
+
+func comparePrereleaseIdentifiers(preA, preB string) int {
 	if preA == preB {
 		return 0
 	}
-	// Stable release > prerelease (`v2.7.0` > `v2.7.0-rc.1`)
 	if preA == "" {
 		return 1
 	}
 	if preB == "" {
 		return -1
 	}
-	return strings.Compare(preA, preB)
+	partsA := strings.Split(preA, ".")
+	partsB := strings.Split(preB, ".")
+	limit := len(partsA)
+	if len(partsB) < limit {
+		limit = len(partsB)
+	}
+	for i := 0; i < limit; i++ {
+		idA, idB := partsA[i], partsB[i]
+		if idA == idB {
+			continue
+		}
+		numA, numB := isDigitsOnlyASCII(idA), isDigitsOnlyASCII(idB)
+		switch {
+		case numA && numB:
+			if len(idA) != len(idB) {
+				na, errA := strconv.ParseUint(idA, 10, 64)
+				nb, errB := strconv.ParseUint(idB, 10, 64)
+				if errA == nil && errB == nil && na != nb {
+					if na < nb {
+						return -1
+					}
+					return 1
+				}
+			}
+			na, errA := strconv.ParseUint(idA, 10, 64)
+			nb, errB := strconv.ParseUint(idB, 10, 64)
+			if errA == nil && errB == nil && na != nb {
+				if na < nb {
+					return -1
+				}
+				return 1
+			}
+			return strings.Compare(idA, idB)
+		case numA && !numB:
+			// SemVer 2.0.0 §11.4.3: numeric identifiers always have lower precedence than non-numeric identifiers.
+			return -1
+		case !numA && numB:
+			return 1
+		default:
+			if idA < idB {
+				return -1
+			}
+			return 1
+		}
+	}
+	if len(partsA) < len(partsB) {
+		return -1
+	}
+	if len(partsA) > len(partsB) {
+		return 1
+	}
+	return 0
 }
 
-func ensureVPrefix(v string) string {
-	t := strings.TrimSpace(v)
-	if t == "" {
-		return ""
+func compareSemverTagsChecked(a, b string) (int, error) {
+	normA, _, errA := normalizeReleaseTag(a)
+	if errA != nil {
+		return 0, errA
 	}
-	if strings.HasPrefix(t, "v") {
-		return t
+	normB, _, errB := normalizeReleaseTag(b)
+	if errB != nil {
+		return 0, errB
 	}
-	return "v" + t
+	ma := reReleaseTag.FindStringSubmatch(normA)
+	mb := reReleaseTag.FindStringSubmatch(normB)
+	if len(ma) < 5 || len(mb) < 5 {
+		return 0, fmt.Errorf("invalid semantic version comparison (%q vs %q)", a, b)
+	}
+	for i := 1; i <= 3; i++ {
+		na, err1 := strconv.Atoi(ma[i])
+		nb, err2 := strconv.Atoi(mb[i])
+		if err1 != nil || err2 != nil {
+			return 0, fmt.Errorf("numeric overflow in semantic version (%q vs %q)", a, b)
+		}
+		if na != nb {
+			if na < nb {
+				return -1, nil
+			}
+			return 1, nil
+		}
+	}
+	return comparePrereleaseIdentifiers(ma[4], mb[4]), nil
+}
+
+func compareSemverTags(a, b string) int {
+	cmp, err := compareSemverTagsChecked(a, b)
+	if err != nil {
+		return 0
+	}
+	return cmp
 }
 
 func releaseArchiveFilename(verNoV, goos, goarch string) string {
@@ -563,6 +653,10 @@ func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Wri
 
 	var targetTag, targetVerNoV string
 	if wantVersion != "" {
+		if strings.Contains(wantVersion, "+") {
+			_, _ = fmt.Fprintf(stderr, "invalid --version: release tag %q must not contain +build metadata\n", wantVersion)
+			return 2
+		}
 		targetTag, targetVerNoV, err = normalizeReleaseTag(wantVersion)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "invalid --version: %v\n", err)
@@ -582,6 +676,10 @@ func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Wri
 			_, _ = fmt.Fprintf(stderr, "invalid release metadata JSON: %v\n", jErr)
 			return 1
 		}
+		if strings.Contains(relMeta.TagName, "+") {
+			_, _ = fmt.Fprintf(stderr, "invalid upstream tag_name: %q must not contain +build metadata\n", relMeta.TagName)
+			return 1
+		}
 		targetTag, targetVerNoV, err = normalizeReleaseTag(relMeta.TagName)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "invalid upstream tag_name: %v\n", err)
@@ -592,15 +690,24 @@ func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Wri
 	curTag, _, curValidSemver := normalizeReleaseTag(curVer)
 	cmp := 0
 	if curValidSemver == nil {
-		cmp = compareSemverTags(targetTag, curTag)
-	} else {
-		cmp = compareSemverTags("v"+targetVerNoV, "v"+curVer)
+		var cmpErr error
+		cmp, cmpErr = compareSemverTagsChecked(targetTag, curTag)
+		if cmpErr != nil {
+			_, _ = fmt.Fprintf(stderr, "SECURITY: version floor check failed: %v\n", cmpErr)
+			return 1
+		}
 	}
-	updateAvailable := cmp > 0
+	updateAvailable := curValidSemver == nil && cmp > 0
 
-	if !checkOnly && curValidSemver == nil && cmp < 0 && !allowDowngrade {
-		_, _ = fmt.Fprintf(stderr, "SECURITY: %v (target %s < current %s; pass --allow-downgrade to roll back intentionally)\n", ErrDowngradeRefused, targetTag, curTag)
-		return 1
+	if !checkOnly && !allowDowngrade {
+		if curValidSemver != nil {
+			_, _ = fmt.Fprintf(stderr, "SECURITY: %v (current version %q is non-semver/dev; pass --allow-downgrade to install %s explicitly)\n", ErrDowngradeRefused, curVer, targetTag)
+			return 1
+		}
+		if cmp < 0 {
+			_, _ = fmt.Fprintf(stderr, "SECURITY: %v (target %s < current %s; pass --allow-downgrade to roll back intentionally)\n", ErrDowngradeRefused, targetTag, curTag)
+			return 1
+		}
 	}
 
 	// Always fetch & verify signed checksums.txt + checksums.txt.sig for the target release!
@@ -652,7 +759,7 @@ func runUpdateWithDeps(ctx context.Context, args []string, stdout, stderr io.Wri
 		return 0
 	}
 
-	if wantVersion == "" && !updateAvailable {
+	if wantVersion == "" && !updateAvailable && !(allowDowngrade && (curValidSemver != nil || cmp < 0)) {
 		if jsonOut {
 			enc := json.NewEncoder(stdout)
 			enc.SetIndent("", "  ")
@@ -781,8 +888,10 @@ func runOptInMCPUpdateNoticeOnce(ctx context.Context, stderr io.Writer, deps cli
 			if json.Unmarshal(raw, &cached) == nil && cached.CheckedAtUnix > 0 {
 				age := now.Sub(time.Unix(cached.CheckedAtUnix, 0))
 				if age >= 0 && age < mcpBackgroundUpdateCacheTTL {
-					if tag, _, tErr := normalizeReleaseTag(cached.LatestTag); tErr == nil && compareSemverTags(tag, "v"+curVer) > 0 && stderr != nil {
-						_, _ = fmt.Fprintf(stderr, "[edgefetch] Update available: v%s -> %s (run 'edgefetch update' to verify Ed25519 signature & install)\n", curVer, tag)
+					if tag, _, tErr := normalizeReleaseTag(cached.LatestTag); tErr == nil {
+						if curTag, _, cErr := normalizeReleaseTag(curVer); cErr == nil && compareSemverTags(tag, curTag) > 0 && stderr != nil {
+							_, _ = fmt.Fprintf(stderr, "[edgefetch] Update available: v%s -> %s (run 'edgefetch update' to verify Ed25519 signature & install)\n", curVer, tag)
+						}
 					}
 					return
 				}
@@ -816,7 +925,7 @@ func runOptInMCPUpdateNoticeOnce(ctx context.Context, stderr io.Writer, deps cli
 		}
 	}
 
-	if compareSemverTags(latestTag, "v"+curVer) > 0 && stderr != nil {
+	if curTag, _, cErr := normalizeReleaseTag(curVer); cErr == nil && compareSemverTags(latestTag, curTag) > 0 && stderr != nil {
 		_, _ = fmt.Fprintf(stderr, "[edgefetch] Update available: v%s -> %s (run 'edgefetch update' to verify Ed25519 signature & install)\n", curVer, latestTag)
 	}
 }

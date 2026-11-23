@@ -55,6 +55,23 @@ export const SSRF_BLOCKED_INFO = {
   message: 'Target or redirect resolved to a non-public/metadata IP address and was blocked.',
 };
 
+export const SCHEME_DOWNGRADE_BLOCKED_INFO = {
+  reason: 'scheme_downgrade' as const,
+  retryable: false,
+  message: 'HTTPS-to-HTTP redirect downgrade is not permitted.',
+};
+
+/** Detects HTTPS -> HTTP redirect downgrade rejections across Go agents and Workers fetch. */
+export function isSchemeDowngradeError(outcome: unknown, problem: unknown, blockedReason?: unknown): boolean {
+  const br = typeof blockedReason === 'string' ? blockedReason.trim().toLowerCase() : '';
+  if (br === 'scheme_downgrade') return true;
+  const out = typeof outcome === 'string' ? outcome.trim().toLowerCase() : '';
+  if (out === 'scheme_downgrade') return true;
+  const prob = typeof problem === 'string' ? problem : '';
+  if (!prob) return false;
+  return /https-to-http\s+redirect\s+downgrade|scheme_downgrade|redirect\s+downgrade\s+to\s+cleartext\s+http/i.test(prob);
+}
+
 /** Scrubs internal/container DNS resolver IP:port suffixes (`on 127.0.0.11:53`, `on [::1]:53`) from error messages. */
 export function scrubResolverIpFromError(raw: string): string {
   if (!raw) return raw;
@@ -77,12 +94,15 @@ export function isDnsNotFoundError(outcome: unknown, problem: unknown): boolean 
 }
 
 /** Detects SSRF / non-public peer / cloud metadata IP blocks across Go agents and Workers fetch. */
-export function isSsrfBlockedError(outcome: unknown, problem: unknown): boolean {
+export function isSsrfBlockedError(outcome: unknown, problem: unknown, blockedReason?: unknown): boolean {
+  if (isSchemeDowngradeError(outcome, problem, blockedReason)) return false;
+  const br = typeof blockedReason === 'string' ? blockedReason.trim().toLowerCase() : '';
+  if (br === 'ssrf') return true;
   const out = typeof outcome === 'string' ? outcome.trim().toLowerCase() : '';
   if (out === 'blocked_ssrf') return true;
   const prob = typeof problem === 'string' ? problem : '';
   if (!prob) return false;
-  return /\b(?:blocked_ssrf|ssrf)\b|non-public(?:\s+ip|\s+peer|\s+address)?|metadata\s+(?:ip|endpoint|address|service)|private\s+(?:ip|network|address)|loopback\s+(?:ip|address)|link-local\s+(?:ip|address)|disallowed_url|disallowed\s+redirect\s+target|resolved\s+to\s+(?:a\s+)?(?:private|loopback|link-local|reserved|non-public|internal)/i.test(
+  return /\b(?:blocked_ssrf|ssrf)\b|non-public(?:\s+ip|\s+peer|\s+address)?|metadata\s+(?:ip|endpoint|address|service)|private\s+(?:ip|network|address)|loopback\s+(?:ip|address)|link-local\s+(?:ip|address)|disallowed_url|disallowed\s+redirect\s+target|forbidden\s+redirect\s+target|resolved\s+to\s+(?:a\s+)?(?:private|loopback|link-local|reserved|non-public|internal)/i.test(
     prob,
   );
 }
@@ -651,31 +671,130 @@ export function isSafePublicHostname(rawHost: string, selfHost?: string): boolea
   return true;
 }
 
+function isNonPublicIpv4Octets(a: number, b: number, c: number, d: number): boolean {
+  if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // RFC 6598 CGNAT
+  if (a === 169 && b === 254) return true; // RFC 3927 link-local / cloud IMDS
+  if (a === 172 && b >= 16 && b <= 31) return true; // RFC 1918
+  if (a === 192 && b === 168) return true; // RFC 1918
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // IETF / TEST-NET-1
+  if (a === 192 && b === 88 && c === 99) return true; // 6to4 relay anycast
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
+  void d;
+  return false;
+}
+
+/** Classifies normalized `URL.hostname` (or raw host) if it is an IPv4/IPv6 address literal. */
+export function classifyIpLiteralHost(rawHost: string): 'private_ip' | 'public_ip' | null {
+  const host = rawHost.trim().toLowerCase().replace(/\.+$/, '');
+  if (!host) return null;
+  if (host.startsWith('[') || host.endsWith(']') || host.includes(':')) {
+    const inner = host.replace(/^\[|\]$/g, '');
+    if (
+      inner === '::' ||
+      inner === '::1' ||
+      inner.startsWith('fe8') ||
+      inner.startsWith('fe9') ||
+      inner.startsWith('fea') ||
+      inner.startsWith('feb') ||
+      inner.startsWith('fc') ||
+      inner.startsWith('fd') ||
+      inner.startsWith('ff') ||
+      inner.startsWith('2001:db8:') ||
+      inner.startsWith('100::')
+    ) {
+      return 'private_ip';
+    }
+    const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(inner);
+    if (mappedHex) {
+      const hi = parseInt(mappedHex[1]!, 16);
+      const lo = parseInt(mappedHex[2]!, 16);
+      return isNonPublicIpv4Octets((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff) ? 'private_ip' : 'public_ip';
+    }
+    const mappedDot = /^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/i.exec(inner);
+    if (mappedDot) {
+      const [a, b, c, d] = [Number(mappedDot[1]), Number(mappedDot[2]), Number(mappedDot[3]), Number(mappedDot[4])];
+      if (a <= 255 && b <= 255 && c <= 255 && d <= 255) {
+        return isNonPublicIpv4Octets(a, b, c, d) ? 'private_ip' : 'public_ip';
+      }
+    }
+    return 'public_ip';
+  }
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const [a, b, c, d] = [Number(v4[1]), Number(v4[2]), Number(v4[3]), Number(v4[4])];
+    if (a <= 255 && b <= 255 && c <= 255 && d <= 255) {
+      return isNonPublicIpv4Octets(a, b, c, d) ? 'private_ip' : 'public_ip';
+    }
+    return 'private_ip';
+  }
+  const labels = host.split('.');
+  const tld = labels[labels.length - 1] ?? '';
+  if (/^(?:\d+|0x[0-9a-f]+)$/i.test(tld)) {
+    return 'private_ip';
+  }
+  return null;
+}
+
+export type TargetUrlRejectionReason =
+  | 'ssrf'
+  | 'ip_literal_not_allowed'
+  | 'scheme_not_allowed'
+  | 'port_not_allowed'
+  | 'credentials_not_allowed'
+  | 'invalid_url';
+
 /** Validates a public `https://` target URL on port 443 against SSRF, DNS-rebinding, and recursive self-hub fetching. */
 export function validatePublicHttpsTargetUrl(
   raw: unknown,
   selfHost?: string,
-): { ok: true; url: URL; normalized: string } | { ok: false; error: 'invalid_url'; message: string } {
+):
+  | { ok: true; url: URL; normalized: string }
+  | { ok: false; error: 'invalid_url'; reason: TargetUrlRejectionReason; message: string } {
   if (typeof raw !== 'string' || !raw.trim()) {
-    return { ok: false, error: 'invalid_url', message: 'url must be a non-empty https:// string' };
+    return { ok: false, error: 'invalid_url', reason: 'invalid_url', message: 'url must be a non-empty https:// string' };
   }
   let u: URL;
   try {
     u = new URL(raw.trim());
   } catch {
-    return { ok: false, error: 'invalid_url', message: `invalid URL: ${raw}` };
+    return { ok: false, error: 'invalid_url', reason: 'invalid_url', message: `invalid URL: ${raw}` };
   }
   if (u.protocol !== 'https:') {
-    return { ok: false, error: 'invalid_url', message: 'only https:// URLs are permitted' };
+    return { ok: false, error: 'invalid_url', reason: 'scheme_not_allowed', message: 'only https:// URLs are permitted' };
   }
   if (u.username || u.password) {
-    return { ok: false, error: 'invalid_url', message: 'URLs with embedded credentials are not permitted' };
+    return {
+      ok: false,
+      error: 'invalid_url',
+      reason: 'credentials_not_allowed',
+      message: 'URLs with embedded credentials are not permitted',
+    };
   }
   if (u.port && u.port !== '443') {
-    return { ok: false, error: 'invalid_url', message: 'only port 443 is permitted' };
+    return { ok: false, error: 'invalid_url', reason: 'port_not_allowed', message: 'only port 443 is permitted' };
   }
   if (!isSafePublicHostname(u.hostname, selfHost)) {
-    return { ok: false, error: 'invalid_url', message: `disallowed hostname: ${u.hostname}` };
+    const ipKind = classifyIpLiteralHost(u.hostname);
+    if (ipKind === 'public_ip') {
+      return {
+        ok: false,
+        error: 'invalid_url',
+        reason: 'ip_literal_not_allowed',
+        message: `IP address literals are not allowed (${u.hostname}); provide a public DNS hostname.`,
+      };
+    }
+    if (ipKind === 'private_ip') {
+      return {
+        ok: false,
+        error: 'invalid_url',
+        reason: 'ssrf',
+        message: `disallowed non-public IP address (${u.hostname}): private, loopback, and metadata IPs are blocked`,
+      };
+    }
+    return { ok: false, error: 'invalid_url', reason: 'ssrf', message: `disallowed hostname: ${u.hostname}` };
   }
   return { ok: true, url: u, normalized: u.toString() };
 }
@@ -1161,14 +1280,26 @@ export async function cloudflareOverflowFetch(
       }
 
       if (isDisallowedOverflowUrl(parsedUrl, canonicalSelf)) {
+        const isRedirectSchemeDowngrade =
+          hop > 0 &&
+          parsedUrl.protocol === 'http:' &&
+          !parsedUrl.username &&
+          !parsedUrl.password &&
+          (!parsedUrl.port || parsedUrl.port === '80') &&
+          isSafePublicHostname(parsedUrl.hostname, canonicalSelf);
         results.push({
           id: r.id,
           url: r.url,
           kind: r.kind,
           status: 0,
           outcome: 'error',
-          problem: 'disallowed_url',
-          ...(hop > 0 ? { blocked: { ...SSRF_BLOCKED_INFO } } : {}),
+          problem: isRedirectSchemeDowngrade ? SCHEME_DOWNGRADE_BLOCKED_INFO.message : 'disallowed_url',
+          ...(hop > 0
+            ? {
+                blockedReason: isRedirectSchemeDowngrade ? 'scheme_downgrade' : 'ssrf',
+                blocked: isRedirectSchemeDowngrade ? { ...SCHEME_DOWNGRADE_BLOCKED_INFO } : { ...SSRF_BLOCKED_INFO },
+              }
+            : {}),
         });
         finished = true;
         break;
@@ -1387,6 +1518,21 @@ export async function cloudflareOverflowFetch(
         const isPaymentRequired = resp.status === 402;
         const decodedPreview =
           !truncated && bytes.byteLength <= 98_304 ? new TextDecoder('utf-8', { fatal: false }).decode(bytes) : '';
+        if (resp.status === 403 && bytes.byteLength <= 512 && /^\s*forbidden redirect target:/i.test(decodedPreview)) {
+          results.push({
+            id: r.id,
+            url: r.url,
+            kind: r.kind,
+            status: 0,
+            outcome: 'blocked',
+            blockedReason: 'ssrf',
+            problem: SSRF_BLOCKED_INFO.message,
+            blocked: { ...SSRF_BLOCKED_INFO },
+            durationMs: Date.now() - reqStart,
+          });
+          finished = true;
+          break;
+        }
         const wafMatch =
           !truncated && !isPaymentRequired
             ? classifyWafAndChallenge({ status: resp.status, headers: resp.headers, rawBody: decodedPreview })

@@ -24,6 +24,15 @@ import { sha256Base64Url, type SqlStorageLike } from './oauth';
 
 export const SAFE_MCP_IDENTIFIER_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const FORBIDDEN_MCP_IDENTIFIERS = new Set(['__proto__', 'constructor', 'prototype']);
+export const PROMPT_INJECTION_MCP_ID_RE =
+  /(?:^|[_.-])(?:ignore|disregard|override|bypass|exfiltrate|jailbreak|forget)(?:[_.-]|$|[A-Z])|system[_.-]?(?:prompt|instruction|message|override)|developer[_.-]?(?:prompt|instruction|message)|prompt[_.-]?injection/i;
+
+export function isSafeMcpIdentifier(raw: string): boolean {
+  if (!raw || !SAFE_MCP_IDENTIFIER_RE.test(raw) || FORBIDDEN_MCP_IDENTIFIERS.has(raw)) {
+    return false;
+  }
+  return !PROMPT_INJECTION_MCP_ID_RE.test(raw);
+}
 
 export const MCP_OAUTH_STATE_TTL_MS = 10 * 60_000; // 10m single-use PKCE state lifetime
 export const MCP_OAUTH_BIND_COOKIE = '__Host-ef_mcp_oauth_bind';
@@ -86,6 +95,7 @@ export interface VaultSecretPayload {
   kind: 'headers' | 'oauth2' | 'none';
   pinnedOrigin: string;
   pinnedUrl?: string;
+  purpose?: 'user_mcp_servers:credentials';
   headers?: Record<string, string>;
   oauth?: {
     accessToken: string;
@@ -343,7 +353,7 @@ async function derivePerUserOriginAesKey(params: {
 }
 
 /**
- * @deprecated Remove in v2.7.4 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
+ * @deprecated Remove in v2.7.5 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
  */
 async function deriveLegacyV270PerUserOriginAesKey(params: {
   vaultMasterKey: string;
@@ -375,8 +385,12 @@ async function deriveLegacyV270PerUserOriginAesKey(params: {
   );
 }
 
+const VAULT_CREDENTIALS_PURPOSE_V2 = 'user_mcp_servers:credentials:v2';
+const VAULT_PKCE_STATE_PURPOSE_V2 = 'mcp_oauth_states:pkce:v2';
+
 /**
- * Encrypts a `VaultSecretPayload` using `HKDF-SHA256` + `AES-256-GCM` with 96-bit random IV and length-prefixed AAD.
+ * Encrypts a `VaultSecretPayload` using `HKDF-SHA256` + `AES-256-GCM` with 96-bit random IV,
+ * explicit `v2.` version header, and table/purpose-bound length-prefixed AAD.
  */
 export async function sealVaultCredentials(params: {
   vaultMasterKey: string | undefined;
@@ -398,14 +412,16 @@ export async function sealVaultCredentials(params: {
     salt,
     userId: params.userId,
     remoteOrigin: canonicalOrigin,
+    purpose: VAULT_CREDENTIALS_PURPOSE_V2,
   });
 
   const aad = new TextEncoder().encode(
-    `${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+    `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
   );
   const plaintext = new TextEncoder().encode(
     JSON.stringify({
       ...params.payload,
+      purpose: 'user_mcp_servers:credentials',
       pinnedOrigin: canonicalOrigin,
     }),
   );
@@ -417,14 +433,33 @@ export async function sealVaultCredentials(params: {
 
   return {
     ok: true,
-    ciphertext: `v1.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(encryptedBuf))}`,
+    ciphertext: `v2.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(encryptedBuf))}`,
   };
 }
 
+function parseEnvelopeHeader(ciphertext: string): { version: string; saltB64: string; ivB64: string; ctB64: string } | null {
+  if (!ciphertext || typeof ciphertext !== 'string') return null;
+  const normalized = ciphertext.startsWith('v2:') ? `v2.${ciphertext.slice(3)}` : ciphertext;
+  const parts = normalized.split('.');
+  if (parts.length !== 4) return null;
+  return {
+    version: parts[0]!,
+    saltB64: parts[1]!,
+    ivB64: parts[2]!,
+    ctB64: parts[3]!,
+  };
+}
+
+function isValidCredentialPayloadKind(kind: unknown): kind is VaultSecretPayload['kind'] {
+  return kind === 'headers' || kind === 'oauth2' || kind === 'none';
+}
+
 /**
- * Decrypts and authenticates an `AES-256-GCM` vault envelope, strictly verifying length-prefixed AAD
- * AND `payload.pinnedOrigin === remoteOrigin`. When decrypting a legacy `v2.7.0` envelope, immediately
- * produces `resealedCiphertext` with fresh `v2.7.1+` length-prefixed HKDF + AAD so callers auto-rotate on read.
+ * Decrypts and authenticates an `AES-256-GCM` vault envelope:
+ *  - `v2.` envelopes strictly require table/purpose-bound `user_mcp_servers:credentials` HKDF + length-prefixed AAD (NEVER falling back!).
+ *  - `v1.` envelopes try `v2.7.1–v2.7.4` length-prefixed HKDF + AAD on primary decrypt; ONLY when the ciphertext lacks `v2` (`version === 'v1'`),
+ *    primary decrypt fails, AND `userId` contains neither `|` nor `:`, tries legacy `v2.7.0` fallback with strict credential payload schema verification,
+ *    immediately emitting `resealedCiphertext` (`v2....`) so callers auto-upgrade on read.
  */
 export async function unsealVaultCredentials(params: {
   vaultMasterKey: string | undefined;
@@ -440,13 +475,13 @@ export async function unsealVaultCredentials(params: {
   if (!keyCheck.ok) {
     return { ok: false, error: 'vault_master_key_unconfigured', message: keyCheck.message };
   }
-  const parts = params.ciphertext.split('.');
-  if (parts.length !== 4 || parts[0] !== 'v1') {
+  const envHeader = parseEnvelopeHeader(params.ciphertext);
+  if (!envHeader || (envHeader.version !== 'v2' && envHeader.version !== 'v1')) {
     return { ok: false, error: 'vault_decryption_failed', message: 'Malformed vault ciphertext envelope' };
   }
-  const salt = base64UrlToBytes(parts[1]!);
-  const iv = base64UrlToBytes(parts[2]!);
-  const ct = base64UrlToBytes(parts[3]!);
+  const salt = base64UrlToBytes(envHeader.saltB64);
+  const iv = base64UrlToBytes(envHeader.ivB64);
+  const ct = base64UrlToBytes(envHeader.ctB64);
   if (!salt || salt.byteLength !== 16 || !iv || iv.byteLength !== 12 || !ct || ct.byteLength < 17) {
     return { ok: false, error: 'vault_decryption_failed', message: 'Invalid vault IV or authentication tag length' };
   }
@@ -458,61 +493,96 @@ export async function unsealVaultCredentials(params: {
 
   let plainBuf: ArrayBuffer;
   let usedLegacyV270Fallback = false;
-  try {
-    const aesKey = await derivePerUserOriginAesKey({
-      vaultMasterKey: keyCheck.key,
-      salt,
-      userId: params.userId,
-      remoteOrigin: canonicalOrigin,
-    });
-    const aad = new TextEncoder().encode(
-      `${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
-    );
-    plainBuf = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
-      aesKey,
-      ct as BufferSource,
-    );
-  } catch {
-    /**
-     * @deprecated Remove in v2.7.4 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
-     * v2.7.0 backward-compatibility fallback ONLY when `userId` contains neither `|` nor `:` (preventing delimiter ambiguity).
-     */
-    if (params.userId.includes('|') || params.userId.includes(':')) {
+  if (envHeader.version === 'v2') {
+    try {
+      const aesKey = await derivePerUserOriginAesKey({
+        vaultMasterKey: keyCheck.key,
+        salt,
+        userId: params.userId,
+        remoteOrigin: canonicalOrigin,
+        purpose: VAULT_CREDENTIALS_PURPOSE_V2,
+      });
+      const aad = new TextEncoder().encode(
+        `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+      );
+      plainBuf = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
+        aesKey,
+        ct as BufferSource,
+      );
+    } catch {
       return {
         ok: false,
         error: 'vault_decryption_failed',
-        message: 'AES-256-GCM authentication failed (wrong user_id, tampered origin, or rotated VAULT_MASTER_KEY)',
+        message: 'AES-256-GCM authentication failed (wrong user_id, tampered origin/purpose, or rotated VAULT_MASTER_KEY)',
       };
     }
+  } else {
     try {
-      const legacyKey = await deriveLegacyV270PerUserOriginAesKey({
+      const aesKey = await derivePerUserOriginAesKey({
         vaultMasterKey: keyCheck.key,
         salt,
         userId: params.userId,
         remoteOrigin: canonicalOrigin,
       });
-      const legacyAad = new TextEncoder().encode(`${params.userId}|${canonicalOrigin}`);
+      const aad = new TextEncoder().encode(
+        `${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+      );
       plainBuf = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: iv as BufferSource, additionalData: legacyAad, tagLength: 128 },
-        legacyKey,
+        { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
+        aesKey,
         ct as BufferSource,
       );
-      usedLegacyV270Fallback = true;
     } catch {
-      return {
-        ok: false,
-        error: 'vault_decryption_failed',
-        message: 'AES-256-GCM authentication failed (wrong user_id, tampered origin, or rotated VAULT_MASTER_KEY)',
-      };
+      /**
+       * Legacy v2.7.0 backward-compatibility fallback:
+       * ONLY attempted when ciphertext lacks `v2` (`envHeader.version === 'v1'`) AND `userId` contains neither `|` nor `:`.
+       */
+      if (params.userId.includes('|') || params.userId.includes(':')) {
+        return {
+          ok: false,
+          error: 'vault_decryption_failed',
+          message: 'AES-256-GCM authentication failed (wrong user_id, tampered origin, or rotated VAULT_MASTER_KEY)',
+        };
+      }
+      try {
+        const legacyKey = await deriveLegacyV270PerUserOriginAesKey({
+          vaultMasterKey: keyCheck.key,
+          salt,
+          userId: params.userId,
+          remoteOrigin: canonicalOrigin,
+        });
+        const legacyAad = new TextEncoder().encode(`${params.userId}|${canonicalOrigin}`);
+        plainBuf = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: iv as BufferSource, additionalData: legacyAad, tagLength: 128 },
+          legacyKey,
+          ct as BufferSource,
+        );
+        usedLegacyV270Fallback = true;
+      } catch {
+        return {
+          ok: false,
+          error: 'vault_decryption_failed',
+          message: 'AES-256-GCM authentication failed (wrong user_id, tampered origin, or rotated VAULT_MASTER_KEY)',
+        };
+      }
     }
   }
 
   try {
-    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plainBuf)) as VaultSecretPayload;
-    if (!parsed || typeof parsed !== 'object' || parsed.pinnedOrigin?.toLowerCase() !== canonicalOrigin) {
-      return { ok: false, error: 'vault_decryption_failed', message: 'Pinned origin mismatch during vault decryption' };
+    const rawParsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plainBuf)) as Record<string, unknown>;
+    if (
+      !rawParsed ||
+      typeof rawParsed !== 'object' ||
+      Array.isArray(rawParsed) ||
+      !isValidCredentialPayloadKind(rawParsed.kind) ||
+      (rawParsed.purpose !== undefined && rawParsed.purpose !== 'user_mcp_servers:credentials') ||
+      typeof rawParsed.pinnedOrigin !== 'string' ||
+      rawParsed.pinnedOrigin.toLowerCase() !== canonicalOrigin
+    ) {
+      return { ok: false, error: 'vault_decryption_failed', message: 'Pinned origin or credential purpose mismatch during vault decryption' };
     }
+    const parsed = rawParsed as unknown as VaultSecretPayload;
     if (params.remoteUrl && typeof parsed.pinnedUrl === 'string' && parsed.pinnedUrl) {
       if (params.remoteUrl.trim().replace(/\/+$/, '') !== parsed.pinnedUrl.trim().replace(/\/+$/, '')) {
         return { ok: false, error: 'vault_decryption_failed', message: 'Pinned endpoint URL path mismatch during vault decryption' };
@@ -545,22 +615,25 @@ async function sealPkceStateBlob(params: {
   remoteOrigin: string;
   blob: Record<string, unknown>;
 }): Promise<string> {
+  const canonicalOrigin = params.remoteOrigin.trim().toLowerCase();
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await derivePerUserOriginAesKey({
     vaultMasterKey: params.vaultMasterKey,
     salt,
     userId: params.userId,
-    remoteOrigin: params.remoteOrigin,
-    purpose: 'pkce-state',
+    remoteOrigin: canonicalOrigin,
+    purpose: VAULT_PKCE_STATE_PURPOSE_V2,
   });
-  const aad = new TextEncoder().encode(`${params.userId}|pkce|${params.remoteOrigin.toLowerCase()}`);
+  const aad = new TextEncoder().encode(
+    `pkce2|mcp_oauth_states:pkce|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+  );
   const ct = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
     key,
-    new TextEncoder().encode(JSON.stringify(params.blob)),
+    new TextEncoder().encode(JSON.stringify({ ...params.blob, purpose: 'mcp_oauth_states:pkce' })),
   );
-  return `v1.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(ct))}`;
+  return `pkce2.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(ct))}`;
 }
 
 async function unsealPkceStateBlob(params: {
@@ -570,26 +643,42 @@ async function unsealPkceStateBlob(params: {
   ciphertext: string;
 }): Promise<Record<string, unknown> | null> {
   const parts = params.ciphertext.split('.');
-  if (parts.length !== 4 || parts[0] !== 'v1') return null;
+  if (parts.length !== 4 || (parts[0] !== 'pkce2' && parts[0] !== 'v1')) return null;
+  const version = parts[0];
   const salt = base64UrlToBytes(parts[1]!);
   const iv = base64UrlToBytes(parts[2]!);
   const ct = base64UrlToBytes(parts[3]!);
   if (!salt || salt.byteLength !== 16 || !iv || iv.byteLength !== 12 || !ct || ct.byteLength < 17) return null;
+  const canonicalOrigin = params.remoteOrigin.trim().toLowerCase();
   try {
     const key = await derivePerUserOriginAesKey({
       vaultMasterKey: params.vaultMasterKey,
       salt,
       userId: params.userId,
-      remoteOrigin: params.remoteOrigin,
-      purpose: 'pkce-state',
+      remoteOrigin: canonicalOrigin,
+      purpose: version === 'pkce2' ? VAULT_PKCE_STATE_PURPOSE_V2 : 'pkce-state',
     });
-    const aad = new TextEncoder().encode(`${params.userId}|pkce|${params.remoteOrigin.toLowerCase()}`);
+    const aad = new TextEncoder().encode(
+      version === 'pkce2'
+        ? `pkce2|mcp_oauth_states:pkce|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`
+        : `${params.userId}|pkce|${canonicalOrigin}`,
+    );
     const plain = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
       key,
       ct as BufferSource,
     );
-    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plain)) as Record<string, unknown>;
+    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plain)) as Record<string, unknown>;
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed) ||
+      typeof parsed.codeVerifier !== 'string' ||
+      (version === 'pkce2' && parsed.purpose !== 'mcp_oauth_states:pkce')
+    ) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -707,7 +796,7 @@ function filterSafeSchemaNode(rawSchema: unknown, depth = 0): Record<string, unk
     validProps = new Set<string>();
     for (const [rawK, rawV] of Object.entries(src.properties as Record<string, unknown>).slice(0, 32)) {
       const cleanK = stripMcpSmugglingChars(rawK).trim();
-      if (!SAFE_MCP_IDENTIFIER_RE.test(cleanK) || FORBIDDEN_MCP_IDENTIFIERS.has(cleanK)) continue;
+      if (!isSafeMcpIdentifier(cleanK)) continue;
       cleanProps[cleanK] = filterSafeSchemaNode(rawV, depth + 1);
       validProps.add(cleanK);
     }
@@ -720,8 +809,7 @@ function filterSafeSchemaNode(rawSchema: unknown, depth = 0): Record<string, unk
     const cleanReq = src.required.filter(
       (r): r is string =>
         typeof r === 'string' &&
-        SAFE_MCP_IDENTIFIER_RE.test(r) &&
-        !FORBIDDEN_MCP_IDENTIFIERS.has(r) &&
+        isSafeMcpIdentifier(r) &&
         (!validProps || validProps.has(r)),
     );
     if (cleanReq.length > 0) out.required = cleanReq;
@@ -741,7 +829,7 @@ export function filterSafeCachedMcpTools(rawTools: unknown): CachedMcpToolSchema
     if (!item || typeof item !== 'object') continue;
     const t = item as CachedMcpToolSchema;
     const cleanName = typeof t.name === 'string' ? stripMcpSmugglingChars(t.name).trim() : '';
-    if (!cleanName || !SAFE_MCP_IDENTIFIER_RE.test(cleanName) || FORBIDDEN_MCP_IDENTIFIERS.has(cleanName)) {
+    if (!isSafeMcpIdentifier(cleanName)) {
       continue;
     }
     out.push({
@@ -887,8 +975,9 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
       if (!needle) return null;
       const direct = sql
         .exec<Record<string, unknown>>(
-          'SELECT * FROM user_mcp_servers WHERE user_id = ? AND slug = ? LIMIT 1',
+          'SELECT * FROM user_mcp_servers WHERE user_id = ? AND (slug = ? OR LOWER(id) = ?) LIMIT 1',
           uid,
+          needle,
           needle,
         )
         .toArray()[0];
@@ -896,12 +985,20 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
 
       const all = this.listServers(uid) as StoredMcpServerRow[];
       const cleanHost = needle.replace(/^https?:\/\//, '').split('/')[0]!.replace(/^www\./, '');
+      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(cleanHost)) {
+        return null;
+      }
       return (
-        all.find(
-          (s) =>
-            s.remoteOrigin.replace(/^https:\/\//, '') === cleanHost ||
-            (Boolean(s.autoRouteScrape) && s.domains.some((d) => cleanHost === d || cleanHost.endsWith(`.${d}`))),
-        ) ?? null
+        all.find((s) => {
+          if (s.remoteOrigin.replace(/^https:\/\//, '') === cleanHost) return true;
+          if (!s.autoRouteScrape) return false;
+          return s.domains.some((rawDom) => {
+            const validDom = validateConnectorDomains([rawDom], s.remoteOrigin, true);
+            if (!validDom.ok || validDom.domains.length === 0) return false;
+            const d = validDom.domains[0]!;
+            return cleanHost === d || cleanHost.endsWith(`.${d}`);
+          });
+        }) ?? null
       );
     },
     upsertServer(row) {
@@ -1065,14 +1162,30 @@ export function createMemoryMcpVaultStore(): McpVaultStore {
       const needle = slugOrDomain.trim().toLowerCase();
       const direct = servers.get(keyOf(uid, needle));
       if (direct) return structuredClone(direct);
+      for (const s of servers.values()) {
+        if (s.userId === uid && s.id.toLowerCase() === needle) {
+          return structuredClone(s);
+        }
+      }
       const cleanHost = needle.replace(/^https?:\/\//, '').split('/')[0]!.replace(/^www\./, '');
+      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(cleanHost)) {
+        return null;
+      }
       for (const s of servers.values()) {
         if (s.userId !== uid) continue;
-        if (
-          s.remoteOrigin.replace(/^https:\/\//, '') === cleanHost ||
-          (Boolean(s.autoRouteScrape) && s.domains.some((d) => cleanHost === d || cleanHost.endsWith(`.${d}`)))
-        ) {
+        if (s.remoteOrigin.replace(/^https:\/\//, '') === cleanHost) {
           return structuredClone(s);
+        }
+        if (s.autoRouteScrape) {
+          const matchedDom = s.domains.some((rawDom) => {
+            const validDom = validateConnectorDomains([rawDom], s.remoteOrigin, true);
+            if (!validDom.ok || validDom.domains.length === 0) return false;
+            const d = validDom.domains[0]!;
+            return cleanHost === d || cleanHost.endsWith(`.${d}`);
+          });
+          if (matchedDom) {
+            return structuredClone(s);
+          }
         }
       }
       return null;

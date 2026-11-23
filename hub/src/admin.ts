@@ -1391,6 +1391,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     return adminJson({ error: 'invalid_origin' }, 403);
   }
 
+  if (path === '/admin/login' && request.method === 'GET') {
+    return new Response(null, {
+      status: 302,
+      headers: { ...ADMIN_JSON_HEADERS, location: '/admin' },
+    });
+  }
+
   if (path === '/admin' && request.method === 'GET') {
     if (!session.ok) {
       return new Response(
@@ -1696,6 +1703,13 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         return adminJson({ error: 'invalid_csrf' }, 403);
       }
       if (!deps.vaultStore) return adminJson({ error: 'vault_not_configured' }, 503);
+      const rawDomainsParam = url.searchParams.get('domains');
+      const parsedDomains = rawDomainsParam
+        ? rawDomainsParam
+            .split(/[\s,]+/)
+            .map((d) => d.trim())
+            .filter(Boolean)
+        : undefined;
       const started = await startDownstreamMcpOAuth({
         userId,
         sessionCsrf: session.csrf,
@@ -1703,9 +1717,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         remoteUrl: url.searchParams.get('remoteUrl') ?? '',
         slug: url.searchParams.get('slug') ?? undefined,
         name: url.searchParams.get('name') ?? undefined,
+        ...(parsedDomains && parsedDomains.length > 0 ? { domains: parsedDomains } : {}),
         autoRouteScrape: url.searchParams.get('autoRouteScrape') === 'true',
         clientId: url.searchParams.get('clientId') ?? undefined,
         scope: url.searchParams.get('scope') ?? undefined,
+        confirmedAuthOrigin: url.searchParams.get('confirmedAuthOrigin') ?? undefined,
         vaultMasterKey: deps.vaultMasterKey,
         vaultStore: deps.vaultStore,
         fetchFn: safeFetch,
@@ -1843,15 +1859,24 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     if (path === '/admin/api/mcp/probe') {
       const capped = await readBodyTextCapped(request, 16_384);
       if (!capped.ok) return adminJson({ error: 'payload_too_large' }, capped.error === 'too_large' ? 413 : 400);
-      let body: { remoteUrl?: unknown } = {};
+      let body: { remoteUrl?: unknown; confirmedAuthOrigin?: unknown } = {};
       try {
-        body = JSON.parse(capped.text || '{}') as { remoteUrl?: unknown };
+        body = JSON.parse(capped.text || '{}') as { remoteUrl?: unknown; confirmedAuthOrigin?: unknown };
       } catch {
         return adminJson({ error: 'invalid_json' }, 400);
       }
       const check = isSafePublicHttpsUrl(body.remoteUrl, selfHost);
       if (!check.ok) return adminJson({ ok: false, supported: false, error: 'invalid_remote_url', message: check.reason }, 400);
-      const probe = await probeRemoteMcpOAuthMetadata({ remoteUrl: check.normalized, fetchFn: safeFetch, selfHost });
+      const confirmedAuthOrigin =
+        typeof body.confirmedAuthOrigin === 'string' && body.confirmedAuthOrigin.trim()
+          ? body.confirmedAuthOrigin.trim()
+          : undefined;
+      const probe = await probeRemoteMcpOAuthMetadata({
+        remoteUrl: check.normalized,
+        confirmedAuthOrigin,
+        fetchFn: safeFetch,
+        selfHost,
+      });
       return adminJson({ ok: true, ...probe }, 200);
     }
 
@@ -1879,6 +1904,10 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           clientId: typeof body.clientId === 'string' ? body.clientId : undefined,
           clientSecret: typeof body.clientSecret === 'string' ? body.clientSecret : undefined,
           scope: typeof body.scope === 'string' ? body.scope : undefined,
+          confirmedAuthOrigin:
+            typeof body.confirmedAuthOrigin === 'string' && body.confirmedAuthOrigin.trim()
+              ? body.confirmedAuthOrigin.trim()
+              : undefined,
           vaultMasterKey: deps.vaultMasterKey,
           vaultStore: deps.vaultStore,
           fetchFn: safeFetch,
@@ -2227,11 +2256,15 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           span.setAttributes({ 'admin.target_user_id': targetUserId, 'admin.outcome': 'not_found', 'http.response.status_code': 404 });
           return adminJson({ ok: false, error: 'user_not_found' }, 404);
         }
-        if (existingTarget.role === 'owner' && !isImmutableFounderCaller) {
+        if ((existingTarget.role === 'owner' || targetRole === 'owner') && !isImmutableFounderCaller) {
           span.setAttributes({ 'admin.outcome': 'owner_protected', 'http.response.status_code': 403 });
           span.setStatus(false, 'owner_protected');
           return adminJson(
-            { ok: false, error: 'owner_protected', message: 'Only the immutable founder may disable, demote, or delete another owner account' },
+            {
+              ok: false,
+              error: 'owner_protected',
+              message: 'Only the immutable founder may promote, disable, demote, or delete an owner account',
+            },
             403,
           );
         }
@@ -2244,11 +2277,31 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           });
           return adminJson({ ok: true, disabled: true, userId: targetUserId }, 200);
         }
-        const updated = (await deps.oauthStore.updateUserRole?.(targetUserId, targetRole!)) ?? false;
+        const promotedByOwnerId =
+          targetRole === 'owner'
+            ? /^[1-9][0-9]{0,19}$/.test(envOwnerId)
+              ? envOwnerId
+              : 'owner'
+            : null;
+        let updated = false;
+        if (deps.oauthStore.upsertUser) {
+          const saved = await deps.oauthStore.upsertUser({
+            ...existingTarget,
+            role: targetRole!,
+            promotedByOwnerId: promotedByOwnerId ?? undefined,
+            mutationKind: 'admin_role',
+          });
+          updated = !saved.mutationAborted && !saved.disabled && saved.role === targetRole!;
+        } else if (deps.oauthStore.updateUserRole) {
+          updated = await deps.oauthStore.updateUserRole(targetUserId, targetRole!, promotedByOwnerId);
+        }
         if (updated && deps.metaDb) {
+          await deps.metaDb.prepare('ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT').run().catch(() => undefined);
           await deps.metaDb
-            .prepare('UPDATE users SET role = ?1, session_epoch = COALESCE(session_epoch, 1) + 1 WHERE user_id = ?2')
-            .bind(targetRole!, targetUserId)
+            .prepare(
+              'UPDATE users SET role = ?1, promoted_by_owner_id = ?2, session_epoch = COALESCE(session_epoch, 1) + 1 WHERE user_id = ?3',
+            )
+            .bind(targetRole!, promotedByOwnerId, targetUserId)
             .run()
             .catch(() => undefined);
         }

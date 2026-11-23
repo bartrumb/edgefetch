@@ -24,15 +24,16 @@ var validSiteID = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 // Config holds validated settings for outbound `agent` mode (including multi-controller HA via `HubURLs`).
 type Config struct {
-	HubURL            string   `json:"hub_url"`
-	HubURLs           []string `json:"hub_urls,omitempty"`
-	AgentToken        string   `json:"agent_token"`
-	SiteID            string   `json:"site_id"`
-	UserAgent         string   `json:"user_agent"`
-	PauseMs           int      `json:"pause_ms"`
-	PauseJitterMs     int      `json:"pause_jitter_ms"`
-	AllowedHosts      []string `json:"allowed_hosts"`
-	RobotsBypassHosts []string `json:"robots_bypass_hosts,omitempty"`
+	HubURL                string   `json:"hub_url"`
+	HubURLs               []string `json:"hub_urls,omitempty"`
+	AgentToken            string   `json:"agent_token"`
+	SiteID                string   `json:"site_id"`
+	UserAgent             string   `json:"user_agent"`
+	PauseMs               int      `json:"pause_ms"`
+	PauseJitterMs         int      `json:"pause_jitter_ms"`
+	AllowedHosts          []string `json:"allowed_hosts"`
+	RobotsBypassHosts     []string `json:"robots_bypass_hosts,omitempty"`
+	AllowNoSandboxBrowser bool     `json:"allow_no_sandbox_browser,omitempty"`
 }
 
 // LoadConfig loads `/data/options.json` (when present) and overlays `EDGEFETCH_*` (or `CRAWLER_*`) environment variables.
@@ -169,6 +170,9 @@ func LoadConfigFrom(optionsPath string, getenv func(string) string) (Config, err
 			}
 		}
 		cfg.RobotsBypassHosts = hosts
+	}
+	if v := firstEnv(getenv, "EDGEFETCH_ALLOW_NO_SANDBOX", "CRAWLER_ALLOW_NO_SANDBOX"); v != "" {
+		cfg.AllowNoSandboxBrowser = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 	}
 
 	var rawHubs []string

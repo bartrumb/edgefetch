@@ -229,6 +229,7 @@ export const MAX_DENO_WS_PER_IP = 32;
 const MAX_DENO_WS_FRAME_BYTES = 1 * 1024 * 1024; // 1 MiB (`M6`)
 const MAX_DENO_SAFE_HOPS = 5;
 const MAX_DENO_BODY_IDLE_MS = 15_000;
+const MAX_DENO_OUTBOUND_STREAM_IDLE_MS = 60_000;
 
 const DENO_DEFAULT_SECURITY_HEADERS: ReadonlyArray<readonly [string, string]> = [
   ['x-content-type-options', 'nosniff'],
@@ -355,6 +356,100 @@ function capWebReadableStream(
     },
     { highWaterMark: 0 },
   );
+}
+
+function guardDenoOutboundResponseStream(res: Response, maxBytes = MAX_DENO_SAFE_RESPONSE_BYTES): Response {
+  if (!res.body || res.status === 101 || ('webSocket' in res && Boolean((res as { webSocket?: unknown }).webSocket))) {
+    return res;
+  }
+  const src = res.body;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let total = 0;
+  let finished = false;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearIdleTimer = () => {
+    if (idleTimer !== null) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
+  const armIdleTimer = (ctrl: ReadableStreamDefaultController<Uint8Array>) => {
+    clearIdleTimer();
+    idleTimer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      idleTimer = null;
+      void reader?.cancel('Slow client response read timed out').catch(() => undefined);
+      try {
+        ctrl.error(new Error('Outbound response stream timed out waiting for client read'));
+      } catch {
+        // ignore
+      }
+    }, MAX_DENO_OUTBOUND_STREAM_IDLE_MS);
+    idleTimer.unref?.();
+    getDenoRuntime()?.unrefTimer?.(idleTimer as unknown as number);
+  };
+
+  const guarded = new ReadableStream<Uint8Array>(
+    {
+      start(ctrl) {
+        armIdleTimer(ctrl);
+      },
+      async pull(ctrl) {
+        if (finished) return;
+        armIdleTimer(ctrl);
+        if (!reader) reader = src.getReader();
+        try {
+          const { done, value } = await reader.read();
+          if (finished) return;
+          if (done) {
+            finished = true;
+            clearIdleTimer();
+            ctrl.close();
+            return;
+          }
+          if (value) {
+            total += value.byteLength;
+            if (total > maxBytes) {
+              finished = true;
+              clearIdleTimer();
+              await reader.cancel('Outbound response exceeds byte limit').catch(() => undefined);
+              ctrl.error(new Error(`Outbound response exceeds ${maxBytes} bytes limit`));
+              return;
+            }
+            ctrl.enqueue(value);
+          }
+          armIdleTimer(ctrl);
+        } catch (err) {
+          finished = true;
+          clearIdleTimer();
+          try {
+            ctrl.error(err);
+          } catch {
+            // ignore
+          }
+        }
+      },
+      async cancel(reason) {
+        finished = true;
+        clearIdleTimer();
+        if (reader) {
+          await reader.cancel(reason).catch(() => undefined);
+        } else {
+          await src.cancel(reason).catch(() => undefined);
+        }
+      },
+    },
+    { highWaterMark: 0 },
+  );
+
+  return new Response(guarded, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: new Headers(res.headers),
+  });
 }
 
 export interface DenoSafeFetchOptions {
@@ -1496,6 +1591,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
         ctx,
       );
       if (bodyCapExceeded && rawRes.status === 400) {
+        await rawRes.body?.cancel().catch(() => undefined);
         return applyDenoSecurityHeaders(
           Response.json(
             { error: 'payload_too_large', message: `Request body exceeds ${maxReqBodyBytes} bytes limit` },
@@ -1504,7 +1600,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
           isHttpsReq,
         );
       }
-      return applyDenoSecurityHeaders(rawRes, isHttpsReq);
+      return applyDenoSecurityHeaders(guardDenoOutboundResponseStream(rawRes), isHttpsReq);
     } catch (err) {
       if (err instanceof DenoPayloadTooLargeError) {
         return applyDenoSecurityHeaders(

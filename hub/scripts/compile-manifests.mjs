@@ -115,10 +115,14 @@ export function hasPrivateSharedHostingSuffix(host) {
   return isPrivate || pslWildcards.get(labels.join('.')) === true;
 }
 
+function normalizeManifestDomainPattern(raw) {
+  return String(raw ?? '').trim().toLowerCase().replace(/\.+$/, '');
+}
+
 function claimedRegistrableDomains(domains) {
   const regs = new Set();
   for (const raw of domains ?? []) {
-    const d = String(raw ?? '').trim().toLowerCase();
+    const d = normalizeManifestDomainPattern(raw);
     if (!d) continue;
     const probe = d.startsWith('*.') && !d.slice(2).includes('*') ? d.slice(2) : d.includes('*') ? '' : d;
     if (!probe) continue;
@@ -180,8 +184,8 @@ const RESERVED_CORE_ATS_DOMAINS = new Set([
  * Simple, auditable wildcard matcher for the 3 allowlisted shapes (`*.suffix`, `gitlab.*`, `careers.*.com` / `jobs.*.com`).
  */
 export function matchesApprovedWildcard(rawWildcard, rawCandidate) {
-  const w = String(rawWildcard ?? '').trim().toLowerCase();
-  const c = String(rawCandidate ?? '').trim().toLowerCase();
+  const w = normalizeManifestDomainPattern(rawWildcard);
+  const c = normalizeManifestDomainPattern(rawCandidate);
   if (!w || !c || !w.includes('*')) return false;
   if (w === c) return true;
   if (w.startsWith('*.') && !w.slice(2).includes('*')) {
@@ -522,11 +526,16 @@ function validateManifest(m, fileLabel) {
   if (!Array.isArray(m.domains) || m.domains.length === 0 || !m.domains.every((d) => typeof d === 'string' && d.trim())) {
     throw new Error(`${fileLabel}: domains must be non-empty string[]`);
   }
+  const seenInManifest = new Set();
   for (const rawPat of m.domains) {
-    const pat = rawPat.trim().toLowerCase();
-    if (!isAsciiPrintable(pat) || /[\s/\\:?#@]/.test(pat) || pat === '*' || pat === '*.*') {
+    const pat = normalizeManifestDomainPattern(rawPat);
+    if (!pat || !isAsciiPrintable(pat) || /[\s/\\:?#@]/.test(pat) || pat === '*' || pat === '*.*') {
       throw new Error(`${fileLabel}: invalid or overly broad domain "${rawPat}" (M2)`);
     }
+    if (seenInManifest.has(pat)) {
+      throw new Error(`${fileLabel}: duplicate domain "${pat}" within manifest "${m.id}" (M2)`);
+    }
+    seenInManifest.add(pat);
     if (RESERVED_CORE_ATS_DOMAINS.has(pat)) {
       throw new Error(`${fileLabel}: domain "${rawPat}" is reserved by a built-in core ATS adapter and cannot be hijacked`);
     }
@@ -619,7 +628,7 @@ export function validateManifestSet(manifestEntries) {
     seenIds.add(obj.id);
 
     for (const rawDomain of obj.domains) {
-      const normDomain = rawDomain.trim().toLowerCase();
+      const normDomain = normalizeManifestDomainPattern(rawDomain);
       if (normDomain.includes('*')) {
         const prevWildOwner = wildcardOwners.get(normDomain);
         if (prevWildOwner && prevWildOwner !== obj.id) {

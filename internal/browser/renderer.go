@@ -140,12 +140,15 @@ type retainedSession struct {
 	targetID              string
 	cdpSessionID          string
 	mainFrameID           string
-	frameOrigins          map[string]string // frameId -> origin of the document currently COMMITTED in that frame
-	sawUninjectedSubdoc   bool              // true once any subframe Document loaded without header injection (until harnessHop)
-	inHarnessAction       bool
-	harnessNavURL         string          // URL the harness passed to Page.navigate and has not yet seen paused
-	navChainReqID         string          // Fetch requestId of the harness navigation (follows same-origin redirects)
-	injectedReqs          map[string]bool // Fetch requestIds that received the task headers (redirect-chain provenance)
+	childFrames           map[string]string // frameId -> parentFrameId (non-empty for every child/grandchild frame)
+	frameTainted          map[string]bool   // frameId -> true once tainted (inherited by child frames; set on non-harness nav/reload/form/204/download/child attach)
+	taintedNetReqs        map[string]bool   // Network.RequestId -> true when documentURL/initiator is non-bound (blob:, data:, about:, cross-origin)
+	sawUninjectedSubdoc   bool              // true once any non-harness Document load or child frame occurred
+	awaitingHarnessDocNav bool              // true ONLY between expectHarnessNavigation and that single top-level Document requestPaused
+	awaitingHarnessCommit bool              // true ONLY between expectHarnessNavigation and that single top-level Page.frameNavigated commit
+	harnessNavURL         string            // URL the harness passed to Page.navigate and has not yet seen paused
+	navChainReqID         string            // Fetch requestId of the harness navigation (follows same-origin HTTP 3xx redirects)
+	injectedReqs          map[string]bool   // Fetch requestIds that received the task headers (redirect-chain provenance)
 	initialOrigin         string
 	redirectedCrossOrigin bool
 	lastCheckedURL        string
@@ -287,10 +290,20 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 					continue
 				}
 				switch ev.Method {
+				case "Page.frameAttached":
+					s.noteFrameAttached(ev.Params)
 				case "Page.frameNavigated":
 					s.noteFrameNavigated(ev.Params)
 				case "Page.frameDetached":
 					s.noteFrameDetached(ev.Params)
+				case "Page.downloadWillBegin":
+					s.noteDownloadWillBegin(ev.Params)
+				case "Network.requestWillBeSent":
+					s.noteNetworkRequestWillBeSent(ev.Params)
+				case "Network.responseReceived":
+					s.noteNetworkResponseReceived(ev.Params)
+				case "Network.loadingFailed":
+					s.noteNetworkLoadingFailed(ev.Params)
 				case "Fetch.requestPaused":
 					s.handleRequestPaused(cdp, ev.Params)
 				}
@@ -308,31 +321,12 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 	return nil
 }
 
-// hasExplicitSameOriginSecFetchSite requires Sec-Fetch-Site to be explicitly present and equal to "same-origin".
-func hasExplicitSameOriginSecFetchSite(hdrs map[string]any) bool {
-	if len(hdrs) == 0 {
-		return false
-	}
-	found := false
-	for k, rawV := range hdrs {
-		if rawV == nil {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(k), "sec-fetch-site") {
-			val := strings.ToLower(strings.TrimSpace(fmt.Sprint(rawV)))
-			if val != "same-origin" {
-				return false
-			}
-			found = true
-		}
-	}
-	return found
-}
-
-// hasPositiveSameOriginProof requires an Origin or Referer header naming the bound origin (and none naming another),
-// and rejects immediately if Sec-Fetch-Site is present and anything other than "same-origin".
+// hasPositiveSameOriginProof requires at least one of Origin or Referer to be explicitly present and match initOrigin,
+// and rejects immediately if either Origin or Referer is "null" or belongs to any other origin.
+// Note: Sec-Fetch-* headers are intentionally NOT consulted because CDP Fetch.requestPaused fires before
+// Chromium's network service populates Fetch Metadata headers.
 func hasPositiveSameOriginProof(hdrs map[string]any, initOrigin string) bool {
-	if initOrigin == "" {
+	if initOrigin == "" || len(hdrs) == 0 {
 		return false
 	}
 	proven := false
@@ -342,10 +336,6 @@ func hasPositiveSameOriginProof(hdrs map[string]any, initOrigin string) bool {
 		}
 		val := strings.TrimSpace(fmt.Sprint(rawV))
 		switch strings.ToLower(strings.TrimSpace(k)) {
-		case "sec-fetch-site":
-			if !strings.EqualFold(val, "same-origin") {
-				return false
-			}
 		case "origin", "referer":
 			if val == "" {
 				continue
@@ -357,43 +347,6 @@ func hasPositiveSameOriginProof(hdrs map[string]any, initOrigin string) bool {
 		}
 	}
 	return proven
-}
-
-func isSameOriginInitiatorHeaders(hdrs map[string]any, initOrigin string) bool {
-	if len(hdrs) == 0 {
-		return true
-	}
-	var originHdr, refererHdr, secFetchSite string
-	hasSecFetchSite := false
-	for k, rawV := range hdrs {
-		if rawV == nil {
-			continue
-		}
-		val := strings.TrimSpace(fmt.Sprint(rawV))
-		switch strings.ToLower(strings.TrimSpace(k)) {
-		case "origin":
-			originHdr = val
-		case "referer":
-			refererHdr = val
-		case "sec-fetch-site":
-			hasSecFetchSite = true
-			secFetchSite = strings.ToLower(val)
-		}
-	}
-	if hasSecFetchSite && secFetchSite != "same-origin" {
-		return false
-	}
-	if originHdr != "" {
-		if strings.EqualFold(originHdr, "null") || canonicalURLOrigin(originHdr) != initOrigin {
-			return false
-		}
-	}
-	if refererHdr != "" {
-		if canonicalURLOrigin(refererHdr) != initOrigin {
-			return false
-		}
-	}
-	return true
 }
 
 func sameNavigationURL(a, b string) bool {
@@ -422,7 +375,35 @@ func sameNavigationURL(a, b string) bool {
 	return pa == pb && ua.Query().Encode() == ub.Query().Encode()
 }
 
-// noteFrameNavigated records the committed origin of a frame (Page.frameNavigated).
+// noteFrameAttached marks every child frame (srcdoc, blob:, data:, about:blank, same-origin or cross-origin iframe)
+// tainted on attach and propagates parent frame taint to descendants.
+func (s *retainedSession) noteFrameAttached(rawParams json.RawMessage) {
+	var ev struct {
+		FrameID       string `json:"frameId"`
+		ParentFrameID string `json:"parentFrameId"`
+	}
+	if json.Unmarshal(rawParams, &ev) != nil || ev.FrameID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.childFrames == nil {
+		s.childFrames = make(map[string]string)
+	}
+	if s.frameTainted == nil {
+		s.frameTainted = make(map[string]bool)
+	}
+	if ev.ParentFrameID != "" {
+		s.childFrames[ev.FrameID] = ev.ParentFrameID
+		// Inherit parent taint and unconditionally taint all child frames (including non-network srcdoc/about:blank/blob:/data:).
+		s.frameTainted[ev.FrameID] = true
+		s.sawUninjectedSubdoc = true
+	} else if s.frameTainted[ev.ParentFrameID] {
+		s.frameTainted[ev.FrameID] = true
+	}
+	s.mu.Unlock()
+}
+
+// noteFrameNavigated updates per-frame and tab taint when a frame commits a document (Page.frameNavigated).
 func (s *retainedSession) noteFrameNavigated(rawParams json.RawMessage) {
 	var ev struct {
 		Frame struct {
@@ -435,17 +416,34 @@ func (s *retainedSession) noteFrameNavigated(rawParams json.RawMessage) {
 	if json.Unmarshal(rawParams, &ev) != nil || ev.Frame.ID == "" {
 		return
 	}
-	origin := canonicalURLOrigin(ev.Frame.SecurityOrigin)
-	if origin == "" {
-		origin = canonicalURLOrigin(ev.Frame.URL)
-	}
+	urlOrigin := canonicalURLOrigin(ev.Frame.URL)
+	secOrigin := canonicalURLOrigin(ev.Frame.SecurityOrigin)
 	s.mu.Lock()
-	if s.frameOrigins == nil {
-		s.frameOrigins = make(map[string]string)
+	if s.frameTainted == nil {
+		s.frameTainted = make(map[string]bool)
 	}
-	s.frameOrigins[ev.Frame.ID] = origin // "" for opaque/about:/data: documents: never treated as bound
-	if ev.Frame.ParentID == "" {
-		s.mainFrameID = ev.Frame.ID
+	if ev.Frame.ParentID != "" {
+		if s.childFrames == nil {
+			s.childFrames = make(map[string]string)
+		}
+		s.childFrames[ev.Frame.ID] = ev.Frame.ParentID
+		s.frameTainted[ev.Frame.ID] = true
+		s.sawUninjectedSubdoc = true
+		s.mu.Unlock()
+		return
+	}
+	s.mainFrameID = ev.Frame.ID
+	// Top-level main frame commit: untainted ONLY when committing the single expected harness Page.navigate to initialOrigin
+	// (taints immediately on blob:, data:, about:blank, BFCache history.back/forward, cached reload, meta refresh, or cross-origin).
+	if s.awaitingHarnessCommit && !s.redirectedCrossOrigin && s.initialOrigin != "" &&
+		urlOrigin == s.initialOrigin && (secOrigin == "" || secOrigin == s.initialOrigin) {
+		s.awaitingHarnessCommit = false
+		s.frameTainted[ev.Frame.ID] = false
+	} else {
+		s.awaitingHarnessCommit = false
+		s.frameTainted[ev.Frame.ID] = true
+		s.redirectedCrossOrigin = true
+		s.sawUninjectedSubdoc = true
 	}
 	s.mu.Unlock()
 }
@@ -458,16 +456,134 @@ func (s *retainedSession) noteFrameDetached(rawParams json.RawMessage) {
 		return
 	}
 	s.mu.Lock()
-	delete(s.frameOrigins, ev.FrameID)
+	if s.frameTainted == nil {
+		s.frameTainted = make(map[string]bool)
+	}
+	// Keep detached frame ID permanently marked tainted so late unload/keepalive requests on that frameId are blocked.
+	s.frameTainted[ev.FrameID] = true
+	s.mu.Unlock()
+}
+
+func (s *retainedSession) noteDownloadWillBegin(rawParams json.RawMessage) {
+	var ev struct {
+		FrameID string `json:"frameId"`
+	}
+	if json.Unmarshal(rawParams, &ev) != nil {
+		return
+	}
+	s.mu.Lock()
+	if s.frameTainted == nil {
+		s.frameTainted = make(map[string]bool)
+	}
+	s.sawUninjectedSubdoc = true
+	if ev.FrameID != "" {
+		s.frameTainted[ev.FrameID] = true
+	}
+	if ev.FrameID == "" || ev.FrameID == s.mainFrameID {
+		s.awaitingHarnessCommit = false
+		s.redirectedCrossOrigin = true
+		if s.mainFrameID != "" {
+			s.frameTainted[s.mainFrameID] = true
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *retainedSession) noteNetworkRequestWillBeSent(rawParams json.RawMessage) {
+	var ev struct {
+		RequestID   string `json:"requestId"`
+		DocumentURL string `json:"documentURL"`
+		Initiator   struct {
+			URL string `json:"url"`
+		} `json:"initiator"`
+	}
+	if json.Unmarshal(rawParams, &ev) != nil || ev.RequestID == "" {
+		return
+	}
+	s.mu.Lock()
+	initOrigin := s.initialOrigin
+	if initOrigin != "" {
+		badDoc := ev.DocumentURL != "" && canonicalURLOrigin(ev.DocumentURL) != initOrigin
+		badInit := ev.Initiator.URL != "" && canonicalURLOrigin(ev.Initiator.URL) != initOrigin
+		if badDoc || badInit {
+			if s.taintedNetReqs == nil || len(s.taintedNetReqs) > 4096 {
+				s.taintedNetReqs = make(map[string]bool)
+			}
+			s.taintedNetReqs[ev.RequestID] = true
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *retainedSession) noteNetworkResponseReceived(rawParams json.RawMessage) {
+	var ev struct {
+		RequestID string `json:"requestId"`
+		Type      string `json:"type"`
+		FrameID   string `json:"frameId"`
+		Response  struct {
+			Status  int               `json:"status"`
+			Headers map[string]string `json:"headers"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(rawParams, &ev) != nil || !strings.EqualFold(ev.Type, "Document") {
+		return
+	}
+	isAttachment := false
+	for k, v := range ev.Response.Headers {
+		if strings.EqualFold(strings.TrimSpace(k), "content-disposition") &&
+			strings.HasPrefix(strings.ToLower(strings.TrimSpace(v)), "attachment") {
+			isAttachment = true
+			break
+		}
+	}
+	if ev.Response.Status != http.StatusNoContent && ev.Response.Status != http.StatusResetContent && !isAttachment {
+		return
+	}
+	s.mu.Lock()
+	if s.frameTainted == nil {
+		s.frameTainted = make(map[string]bool)
+	}
+	s.sawUninjectedSubdoc = true
+	if ev.FrameID != "" {
+		s.frameTainted[ev.FrameID] = true
+	}
+	if ev.FrameID == "" || ev.FrameID == s.mainFrameID {
+		s.awaitingHarnessCommit = false
+		s.redirectedCrossOrigin = true
+		if s.mainFrameID != "" {
+			s.frameTainted[s.mainFrameID] = true
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *retainedSession) noteNetworkLoadingFailed(rawParams json.RawMessage) {
+	var ev struct {
+		RequestID string `json:"requestId"`
+	}
+	if json.Unmarshal(rawParams, &ev) != nil || ev.RequestID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.navChainReqID != "" && ev.RequestID == s.navChainReqID {
+		s.awaitingHarnessCommit = false
+		s.redirectedCrossOrigin = true
+		if s.frameTainted == nil {
+			s.frameTainted = make(map[string]bool)
+		}
+		if s.mainFrameID != "" {
+			s.frameTainted[s.mainFrameID] = true
+		}
+	}
 	s.mu.Unlock()
 }
 
 func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 	type node struct {
 		Frame struct {
-			ID             string `json:"id"`
-			URL            string `json:"url"`
-			SecurityOrigin string `json:"securityOrigin"`
+			ID       string `json:"id"`
+			ParentID string `json:"parentId"`
+			URL      string `json:"url"`
 		} `json:"frame"`
 		ChildFrames []json.RawMessage `json:"childFrames"`
 	}
@@ -477,41 +593,41 @@ func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 	if cdp.call(ctx, s.cdpSessionID, "Page.getFrameTree", nil, &out) != nil || len(out.FrameTree) == 0 {
 		return
 	}
-	var walk func(raw json.RawMessage, isRoot bool)
-	walk = func(raw json.RawMessage, isRoot bool) {
+	var walk func(raw json.RawMessage, parentID string, isRoot bool)
+	walk = func(raw json.RawMessage, parentID string, isRoot bool) {
 		var n node
 		if json.Unmarshal(raw, &n) != nil || n.Frame.ID == "" {
 			return
 		}
-		origin := canonicalURLOrigin(n.Frame.SecurityOrigin)
-		if origin == "" {
-			origin = canonicalURLOrigin(n.Frame.URL)
-		}
 		s.mu.Lock()
-		if s.frameOrigins == nil {
-			s.frameOrigins = make(map[string]string)
+		if s.frameTainted == nil {
+			s.frameTainted = make(map[string]bool)
 		}
-		if _, seen := s.frameOrigins[n.Frame.ID]; !seen {
-			s.frameOrigins[n.Frame.ID] = origin
-		}
-		if isRoot && s.mainFrameID == "" {
-			s.mainFrameID = n.Frame.ID
+		if isRoot {
+			if s.mainFrameID == "" {
+				s.mainFrameID = n.Frame.ID
+			}
+			if n.Frame.URL != "" && !strings.EqualFold(n.Frame.URL, "about:blank") &&
+				canonicalURLOrigin(n.Frame.URL) != s.initialOrigin {
+				s.frameTainted[n.Frame.ID] = true
+			}
+		} else {
+			if s.childFrames == nil {
+				s.childFrames = make(map[string]string)
+			}
+			effParent := n.Frame.ParentID
+			if effParent == "" {
+				effParent = parentID
+			}
+			s.childFrames[n.Frame.ID] = effParent
+			s.frameTainted[n.Frame.ID] = true
 		}
 		s.mu.Unlock()
 		for _, c := range n.ChildFrames {
-			walk(c, false)
+			walk(c, n.Frame.ID, false)
 		}
 	}
-	walk(out.FrameTree, true)
-}
-
-func (s *retainedSession) setInHarnessAction(active bool) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.inHarnessAction = active
-	s.mu.Unlock()
+	walk(out.FrameTree, "", true)
 }
 
 func (s *retainedSession) expectHarnessNavigation(targetURL string) {
@@ -522,8 +638,12 @@ func (s *retainedSession) expectHarnessNavigation(targetURL string) {
 	s.mu.Lock()
 	if s.initialOrigin != "" && targetOrigin == s.initialOrigin {
 		s.harnessNavURL = targetURL
+		s.awaitingHarnessDocNav = true
+		s.awaitingHarnessCommit = true
 	} else {
 		s.harnessNavURL = ""
+		s.awaitingHarnessDocNav = false
+		s.awaitingHarnessCommit = false
 	}
 	s.navChainReqID = ""
 	s.mu.Unlock()
@@ -535,18 +655,25 @@ func (s *retainedSession) clearExpectedHarnessNavigation() {
 	}
 	s.mu.Lock()
 	s.harnessNavURL = ""
+	s.awaitingHarnessDocNav = false
+	s.awaitingHarnessCommit = false
 	s.mu.Unlock()
 }
 
 func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMessage) {
 	var paused struct {
 		RequestID           string `json:"requestId"`
+		NetworkID           string `json:"networkId"`
 		FrameID             string `json:"frameId"`
 		ResourceType        string `json:"resourceType"`
 		RedirectStatusCode  int    `json:"redirectStatusCode"`
 		RedirectedRequestID string `json:"redirectedRequestId"`
-		Request             struct {
+		Initiator           *struct {
+			URL string `json:"url"`
+		} `json:"initiator,omitempty"`
+		Request struct {
 			URL     string         `json:"url"`
+			Method  string         `json:"method"`
 			Headers map[string]any `json:"headers"`
 		} `json:"request"`
 	}
@@ -563,68 +690,90 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	cdpSID := s.cdpSessionID
 	initOrigin := s.initialOrigin
 	extra := s.extraHeaders
-	isDocReq := strings.EqualFold(paused.ResourceType, "Document")
-	isMainDoc := isDocReq && (s.mainFrameID == "" || paused.FrameID == "" || paused.FrameID == s.mainFrameID)
-	if isMainDoc && s.mainFrameID == "" && paused.FrameID != "" {
-		s.mainFrameID = paused.FrameID
+	if s.frameTainted == nil {
+		s.frameTainted = make(map[string]bool)
 	}
+
+	isDocReq := strings.EqualFold(paused.ResourceType, "Document")
+	isChildFrame := paused.FrameID != "" && (s.childFrames[paused.FrameID] != "" || (s.mainFrameID != "" && paused.FrameID != s.mainFrameID))
+	if isChildFrame {
+		s.frameTainted[paused.FrameID] = true
+	}
+	isMainDoc := (isDocReq || paused.ResourceType == "") && !isChildFrame &&
+		(s.mainFrameID == "" || paused.FrameID == "" || paused.FrameID == s.mainFrameID)
+
 	sameOriginReq := initOrigin != "" && reqOrigin != "" && reqOrigin == initOrigin
 	// A redirect hop is only as trustworthy as the hop before it: bound -> third party -> bound never gets headers.
 	chainOK := paused.RedirectedRequestID == "" || s.injectedReqs[paused.RedirectedRequestID]
+
+	// Only the single top-level Document request initiated by Go's Page.navigate (plus its direct same-origin 3xx redirect chain) is a harnessHop.
 	harnessHop := false
-	if isMainDoc || paused.ResourceType == "" {
+	if isMainDoc {
 		switch {
-		case paused.RedirectedRequestID == "" && s.harnessNavURL != "" && sameNavigationURL(paused.Request.URL, s.harnessNavURL):
-			harnessHop = true // the navigation the caller asked for
+		case s.awaitingHarnessDocNav && paused.RedirectedRequestID == "" && s.harnessNavURL != "" && sameNavigationURL(paused.Request.URL, s.harnessNavURL):
+			harnessHop = true
+			s.awaitingHarnessDocNav = false
 			s.harnessNavURL = ""
-		case paused.RedirectedRequestID != "" && chainOK && sameOriginReq && paused.RedirectedRequestID == s.navChainReqID:
-			harnessHop = true // same-origin redirect hop of that navigation
+			if s.mainFrameID == "" && paused.FrameID != "" {
+				s.mainFrameID = paused.FrameID
+			}
+			// Fresh explicit harness navigation resets prior session taint.
+			s.redirectedCrossOrigin = false
+			s.sawUninjectedSubdoc = false
+			s.frameTainted = make(map[string]bool)
+			s.taintedNetReqs = nil
+		case paused.RedirectedRequestID != "" && chainOK && sameOriginReq && !s.redirectedCrossOrigin && paused.RedirectedRequestID == s.navChainReqID:
+			harnessHop = true
 		}
 		if harnessHop {
 			s.navChainReqID = paused.RequestID
 		}
 	}
-	if isMainDoc && initOrigin != "" {
-		if reqOrigin != initOrigin {
+
+	// Any non-harness Document load (form submit, reload, history nav, meta refresh, JS location.href, subframe Document,
+	// or cross-origin redirect of the harness navigation) receives ZERO caller headers and immediately taints its frame
+	// (and taints the entire tab if on the main frame).
+	if isDocReq && !harnessHop && initOrigin != "" {
+		s.sawUninjectedSubdoc = true
+		if paused.FrameID != "" {
+			s.frameTainted[paused.FrameID] = true
+		}
+		if !isChildFrame {
 			s.redirectedCrossOrigin = true
-		} else if harnessHop && paused.RedirectedRequestID == "" && paused.RedirectStatusCode == 0 {
-			// Only an explicit harness navigation clears cross-origin / uninjected-document taint.
-			s.redirectedCrossOrigin = false
-			s.sawUninjectedSubdoc = false
+			if s.mainFrameID != "" {
+				s.frameTainted[s.mainFrameID] = true
+			}
 		}
 	}
-	crossTainted := s.redirectedCrossOrigin
-	if isDocReq && paused.FrameID != "" && (!sameOriginReq || harnessHop || crossTainted) {
-		if s.frameOrigins == nil {
-			s.frameOrigins = make(map[string]string)
+
+	netTainted := (paused.NetworkID != "" && s.taintedNetReqs[paused.NetworkID]) ||
+		(paused.RequestID != "" && s.taintedNetReqs[paused.RequestID])
+	if paused.Initiator != nil && strings.TrimSpace(paused.Initiator.URL) != "" {
+		if canonicalURLOrigin(paused.Initiator.URL) != initOrigin {
+			netTainted = true
 		}
-		s.frameOrigins[paused.FrameID] = ""
 	}
-	frameCommitted, frameKnown := s.frameOrigins[paused.FrameID]
-	proof := hasPositiveSameOriginProof(paused.Request.Headers, initOrigin)
+
+	tabTainted := s.redirectedCrossOrigin
+	frameUntrusted := paused.FrameID == "" || isChildFrame || s.frameTainted[paused.FrameID] ||
+		(s.mainFrameID != "" && paused.FrameID != s.mainFrameID)
+	isPingOrBeacon := strings.EqualFold(paused.ResourceType, "Ping") || strings.EqualFold(paused.ResourceType, "CSPViolationReport")
+
 	allowInject := false
 	switch {
 	case !sameOriginReq:
+		allowInject = false
 	case harnessHop:
-		allowInject = true
-	case isMainDoc:
-		// Once any Document in the tab loaded without header injection, block autonomous top-level Document injection
-		// (e.g. A -> B -> A grandchild top.location bounce) unless the harness itself initiated an action or explicit
-		// Sec-Fetch-Site: same-origin proof is present.
-		allowInject = !crossTainted && chainOK && proof &&
-			isSameOriginInitiatorHeaders(paused.Request.Headers, initOrigin) &&
-			(!s.sawUninjectedSubdoc || s.inHarnessAction || hasExplicitSameOriginSecFetchSite(paused.Request.Headers))
+		allowInject = !tabTainted && !netTainted
+	case isDocReq:
+		allowInject = false
 	default:
-		allowInject = !crossTainted && chainOK && isSameOriginInitiatorHeaders(paused.Request.Headers, initOrigin) &&
-			(proof || (!isDocReq && frameKnown && frameCommitted == initOrigin))
+		// Subresources: check universal tab taint + per-frame taint + non-Ping + redirect-chain provenance + positive Origin/Referer proof.
+		// Never fall back to committed frame origin when both Origin and Referer are absent!
+		allowInject = !tabTainted && !frameUntrusted && !netTainted && !isPingOrBeacon && chainOK &&
+			hasPositiveSameOriginProof(paused.Request.Headers, initOrigin)
 	}
-	if isDocReq && !allowInject && initOrigin != "" {
-		s.sawUninjectedSubdoc = true
-		if isMainDoc {
-			// Top-level Document loaded without header injection: block ALL subsequent main-doc and subresource injection until harnessHop!
-			s.redirectedCrossOrigin = true
-		}
-	}
+
 	if allowInject && len(extra) > 0 {
 		if s.injectedReqs == nil || len(s.injectedReqs) > 4096 {
 			s.injectedReqs = make(map[string]bool)
@@ -862,6 +1011,21 @@ func (r *Renderer) Available() bool {
 	disabled := r.disabledByPolicy
 	r.mu.Unlock()
 	return !disabled && (r.chromeBin != "" || r.dialOverrideWS != "")
+}
+
+// SetAllowNoSandbox configures whether Chromium may fall back to `--no-sandbox` when the host OS or
+// Home Assistant OS AppArmor/seccomp profile blocks unprivileged user namespaces (`CLONE_NEWUSER`).
+// Ignored when EDGEFETCH_REQUIRE_BROWSER_SANDBOX is set.
+func (r *Renderer) SetAllowNoSandbox(allow bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.allowNoSandbox = allow || isNoSandboxAllowedByEnv()
+	if r.allowNoSandbox && !r.requireSandbox {
+		r.disabledByPolicy = false
+	}
+	r.mu.Unlock()
 }
 
 // SetOtelExporter attaches an optional non-blocking OpenTelemetry OTLP/HTTP span exporter.
@@ -2050,8 +2214,6 @@ func (r *Renderer) runActionStep(
 	var beforeSnap actionDOMSnapshot
 	if kind == "click" || kind == "press" {
 		beforeSnap = captureActionDOMState(ctx, cdp, sess.cdpSessionID)
-		sess.setInHarnessAction(true)
-		defer sess.setInHarnessAction(false)
 	}
 
 	switch kind {

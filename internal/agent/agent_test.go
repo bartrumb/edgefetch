@@ -55,10 +55,16 @@ func TestConfigSecurityGuards(t *testing.T) {
 		if k == "EDGEFETCH_ROBOTS_BYPASS_HOSTS" {
 			return "alpha.example.com, beta.example.com"
 		}
+		if k == "EDGEFETCH_ALLOW_NO_SANDBOX" {
+			return "true"
+		}
 		return ""
 	})
 	if err != nil || len(overrideCfg.RobotsBypassHosts) != 2 || overrideCfg.RobotsBypassHosts[1] != "beta.example.com" {
 		t.Fatalf("expected EDGEFETCH_ROBOTS_BYPASS_HOSTS override, got %+v (err=%v)", overrideCfg.RobotsBypassHosts, err)
+	}
+	if !overrideCfg.AllowNoSandboxBrowser {
+		t.Fatalf("expected EDGEFETCH_ALLOW_NO_SANDBOX=true to set AllowNoSandboxBrowser=true")
 	}
 
 	// SECURITY S2: Even with EDGEFETCH_ALLOW_INSECURE_HUB=1, cleartext http:// to a remote host MUST be rejected!

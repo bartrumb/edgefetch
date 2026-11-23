@@ -1,5 +1,5 @@
 name: "EdgeFetch"
-version: "2.7.3"
+version: "2.7.4"
 slug: "edgefetch"
 image: "ghcr.io/bartrumb/edgefetch-addon-{arch}"
 description: "Outbound-only Go HTTP/2 + on-demand Headless Chromium JS rendering + streaming Poppler PDF worker for EdgeFetch Hubs (zero inbound ports, loopback SSRF CONNECT proxy, AppArmor confined)."
@@ -24,6 +24,7 @@ options:
   pause_jitter_ms: 1500
   allowed_hosts: []
   robots_bypass_hosts: []
+  allow_no_sandbox_browser: false
 
 schema:
   hub_url: url
@@ -36,3 +37,4 @@ schema:
     - str
   robots_bypass_hosts:
     - str?
+  allow_no_sandbox_browser: bool?

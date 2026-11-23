@@ -49,6 +49,7 @@ export interface CatalogStatusSummary {
   platform: string;
   origin: string;
   collection?: string;
+  fields?: 'full' | 'lean';
   products: number;
   variants: number;
   pages: number;
@@ -80,7 +81,42 @@ export interface CatalogRecordsResult {
   limit: number;
   returned: number;
   hasMore: boolean;
-  records: CatalogRecord[];
+  records: Array<CatalogRecord | Record<string, unknown>>;
+}
+
+/** Projects a `CatalogRecord` down to compact product-level summary fields (`fields: "lean"`), omitting `tags`, `options`, `images`, `descriptionText`, and `variants[]`. */
+export function projectLeanCatalogRecord(rec: CatalogRecord): Record<string, unknown> {
+  const numericPrices: number[] = [];
+  let currency: string | null = null;
+  let available = false;
+  let fallbackVariantImg: string | null = null;
+  for (const v of rec.variants) {
+    if (typeof v.price === 'number' && Number.isFinite(v.price)) numericPrices.push(v.price);
+    if (!currency && typeof v.currency === 'string' && v.currency) currency = v.currency;
+    if (v.available === true) available = true;
+    if (!fallbackVariantImg && typeof v.image === 'string' && v.image) fallbackVariantImg = v.image;
+  }
+  const priceMin = numericPrices.length > 0 ? Math.min(...numericPrices) : null;
+  const priceMax = numericPrices.length > 0 ? Math.max(...numericPrices) : null;
+  const primaryImage = (Array.isArray(rec.images) && rec.images[0] ? rec.images[0] : null) ?? fallbackVariantImg;
+  return {
+    platform: rec.platform,
+    origin: rec.origin,
+    productId: rec.productId,
+    handle: rec.handle,
+    url: rec.url,
+    title: rec.title,
+    vendor: rec.vendor,
+    productType: rec.productType,
+    available,
+    priceMin,
+    priceMax,
+    currency,
+    image: primaryImage,
+    variantCount: rec.variants.length,
+    publishedAt: rec.publishedAt,
+    updatedAt: rec.updatedAt,
+  };
 }
 
 export interface CatalogCallPayload {
@@ -667,13 +703,14 @@ async function persistCatalogRun(
     await db
       .prepare(
         `INSERT OR REPLACE INTO catalog_runs (
-          catalog_id, origin, platform, collection, status,
+          catalog_id, user_id, origin, platform, collection, status,
           products_count, variants_count, pages_read, artifact_id,
           hashes_json, summary_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         s.catalogId,
+        entry.userId,
         s.origin,
         s.platform,
         s.collection ?? '',
@@ -688,11 +725,6 @@ async function persistCatalogRun(
         s.updatedAt,
       )
       .run();
-    await db
-      .prepare(`UPDATE catalog_runs SET user_id = ? WHERE catalog_id = ?`)
-      .bind(entry.userId, s.catalogId)
-      .run()
-      .catch(() => null);
   } catch {
     // Non-fatal fallback to in-memory store
   }
@@ -711,16 +743,17 @@ async function findPreviousCompleteCatalogRun(
       await ensureCatalogRunsTable(db);
       const rowsRes = await db
         .prepare(
-          `SELECT catalog_id, products_count, hashes_json, summary_json
+          `SELECT catalog_id, user_id, products_count, hashes_json, summary_json
            FROM catalog_runs
-           WHERE origin = ? AND collection = ? AND status = 'complete' AND catalog_id != ?
+           WHERE user_id = ? AND origin = ? AND collection = ? AND status = 'complete' AND catalog_id != ?
            ORDER BY created_at DESC
            LIMIT 10`,
         )
-        .bind(origin, collection, excludeCatalogId)
-        .all<{ catalog_id: string; products_count: number; hashes_json: string | null; summary_json: string }>();
+        .bind(userId, origin, collection, excludeCatalogId)
+        .all<{ catalog_id: string; user_id?: string; products_count: number; hashes_json: string | null; summary_json: string }>();
       const rows = rowsRes.results ?? [];
       for (const row of rows) {
+        if (row.user_id && row.user_id !== userId) continue;
         const parsedEntry = parseStoredCatalogSummary(row.summary_json);
         if (parsedEntry && parsedEntry.ownerUserId !== userId) continue;
         if (!parsedEntry && userId !== 'owner') continue;
@@ -1251,10 +1284,10 @@ export async function getCatalogStatus(params: {
     try {
       await ensureCatalogRunsTable(db);
       const row = await db
-        .prepare(`SELECT summary_json FROM catalog_runs WHERE catalog_id = ?`)
+        .prepare(`SELECT user_id, summary_json FROM catalog_runs WHERE catalog_id = ?`)
         .bind(catalogId)
-        .first<{ summary_json: string }>();
-      if (row?.summary_json) {
+        .first<{ user_id?: string; summary_json: string }>();
+      if (row?.summary_json && (!row.user_id || row.user_id === ownerKey)) {
         const parsed = parseStoredCatalogSummary(row.summary_json);
         if (parsed && parsed.ownerUserId === ownerKey) {
           return { status: 200, body: { ...parsed.summary } };
@@ -1285,6 +1318,7 @@ export async function getCatalogRecords(params: {
   productType?: string | string[];
   availableOnly?: boolean;
   query?: string;
+  fields?: 'full' | 'lean';
   env?: OptionalStorageBindings & Record<string, unknown>;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const catalogId = params.catalogId.trim();
@@ -1316,10 +1350,10 @@ export async function getCatalogRecords(params: {
     try {
       await ensureCatalogRunsTable(db);
       const row = await db
-        .prepare(`SELECT summary_json FROM catalog_runs WHERE catalog_id = ?`)
+        .prepare(`SELECT user_id, summary_json FROM catalog_runs WHERE catalog_id = ?`)
         .bind(catalogId)
-        .first<{ summary_json: string }>();
-      if (row?.summary_json) {
+        .first<{ user_id?: string; summary_json: string }>();
+      if (row?.summary_json && (!row.user_id || row.user_id === ownerKey)) {
         const parsed = parseStoredCatalogSummary(row.summary_json);
         if (parsed && parsed.ownerUserId === ownerKey) {
           summary = parsed.summary;
@@ -1396,6 +1430,8 @@ export async function getCatalogRecords(params: {
   });
 
   const sliced = filtered.slice(offset, offset + limit);
+  const effectiveFields = params.fields ?? summary.fields ?? 'full';
+  const projectedRecords = effectiveFields === 'lean' ? sliced.map(projectLeanCatalogRecord) : sliced;
   const result: CatalogRecordsResult = {
     ok: true,
     catalogId,
@@ -1408,7 +1444,7 @@ export async function getCatalogRecords(params: {
     limit,
     returned: sliced.length,
     hasMore: offset + sliced.length < filtered.length,
-    records: sliced,
+    records: projectedRecords,
   };
 
   return { status: 200, body: result as unknown as Record<string, unknown> };
@@ -1448,7 +1484,9 @@ export async function executeCatalogCall(params: {
       payload.vendor !== undefined ||
       payload.productType !== undefined ||
       payload.availableOnly !== undefined ||
-      payload.query !== undefined;
+      payload.query !== undefined ||
+      payload.fields === 'lean' ||
+      payload.fields === 'full';
     if (wantsRecords) {
       return getCatalogRecords({
         catalogId: existingId,
@@ -1466,6 +1504,7 @@ export async function executeCatalogCall(params: {
             : undefined,
         availableOnly: payload.availableOnly === true,
         query: typeof payload.query === 'string' ? payload.query : undefined,
+        fields: payload.fields === 'lean' ? 'lean' : payload.fields === 'full' ? 'full' : undefined,
         env,
       });
     }
@@ -1579,10 +1618,11 @@ export async function executeCatalogCall(params: {
     Math.min(30_000, Math.max(spec.platform === 'shopify' ? 2000 : spec.pauseMs, reqPause));
 
   let effectivePauseMs = computeEffectivePauseMs(activeSpec);
-  const maxPages =
-    typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages) && payload.maxPages >= 1
-      ? Math.min(activeSpec.pageCap, Math.floor(payload.maxPages))
-      : activeSpec.pageCap;
+  const callerExplicitMaxPages =
+    typeof payload.maxPages === 'number' && Number.isFinite(payload.maxPages) && payload.maxPages >= 1;
+  const maxPages = callerExplicitMaxPages
+    ? Math.min(activeSpec.pageCap, Math.floor(payload.maxPages as number))
+    : activeSpec.pageCap;
 
   const catalogId = generateCatalogId();
   const startedAtMs = Date.now();
@@ -1602,6 +1642,7 @@ export async function executeCatalogCall(params: {
       platform: activeSpec.platform,
       origin: parsedUrl.origin,
       ...(collection ? { collection } : {}),
+      ...(fields === 'lean' ? { fields: 'lean' } : {}),
       products: 0,
       variants: 0,
       pages: 0,
@@ -1933,6 +1974,63 @@ export async function executeCatalogCall(params: {
     }
 
     const finalRecords = [...byProductId.values()];
+    const hasNullShopifyVariantCurrency =
+      activeSpec.platform === 'shopify' &&
+      finalRecords.some((rec) => rec.variants.some((v) => !v.currency));
+    const remForCartCurrencyMs = syncDeadlineAt - Date.now();
+    if (hasNullShopifyVariantCurrency && !truncatedByBudget && remForCartCurrencyMs >= 1_500) {
+      let detectedCurrency: string | null = null;
+      for (const probePath of ['/cart.js', '/meta.json']) {
+        const remProbeMs = syncDeadlineAt - Date.now();
+        if (remProbeMs < 1_000) break;
+        const callCurrProbe = () =>
+          executeHubFetch({
+            url: `${parsedUrl.origin}${probePath}`,
+            kind: 'json',
+            accept: 'application/json',
+            maxBytes: 65_536,
+            timeoutMs: Math.min(4_000, remProbeMs),
+            ...(payload.target !== undefined ? { target: payload.target } : {}),
+            ...(payload.site !== undefined ? { site: payload.site } : {}),
+            ...(resolvedPullTracer ? { tracer: resolvedPullTracer } : {}),
+          });
+        const currRace = await awaitWithDeadline(
+          Promise.resolve()
+            .then(() => (resolvedPullTracer ? resolvedPullTracer.run(callCurrProbe) : callCurrProbe()))
+            .catch(() => null),
+          syncDeadlineAt,
+        );
+        if (!currRace.timedOut) {
+          const normCurr = normalizeHubPageResponse(currRace.value);
+          if (normCurr && normCurr.status === 200 && normCurr.body) {
+            try {
+              const parsedCurr = JSON.parse(normCurr.body) as { currency?: unknown; active?: unknown };
+              const cand =
+                typeof parsedCurr?.currency === 'string'
+                  ? parsedCurr.currency.trim().toUpperCase()
+                  : parsedCurr?.currency &&
+                      typeof parsedCurr.currency === 'object' &&
+                      typeof (parsedCurr.currency as { active?: unknown }).active === 'string'
+                    ? ((parsedCurr.currency as { active: string }).active.trim().toUpperCase())
+                    : '';
+              if (/^[A-Z]{3}$/.test(cand)) {
+                detectedCurrency = cand;
+                break;
+              }
+            } catch {
+              // ignore non-JSON probe response
+            }
+          }
+        }
+      }
+      if (detectedCurrency) {
+        for (const rec of finalRecords) {
+          for (const v of rec.variants) {
+            if (!v.currency) v.currency = detectedCurrency;
+          }
+        }
+      }
+    }
     const totalVariants = finalRecords.reduce((acc, r) => acc + r.variants.length, 0);
     const currHashes = buildSnapshotHashBundle(finalRecords);
 
@@ -2013,9 +2111,11 @@ export async function executeCatalogCall(params: {
 
     const finishedNow = new Date().toISOString();
     const { resumeAt: _dropResume, ...cleanBase } = currentEntry.summary;
+    const callerCappedSuccess =
+      callerExplicitMaxPages && stopReason === 'max_pages_reached' && finalRecords.length > 0;
     const finalSummary: CatalogStatusSummary = {
       ...cleanBase,
-      ok: finalStatus === 'complete',
+      ok: finalStatus === 'complete' || callerCappedSuccess,
       status: finalStatus,
       platform: activeSpec.platform,
       products: finalRecords.length,

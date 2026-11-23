@@ -194,6 +194,9 @@ func SanitizeMarkdownWithOptions(md, baseURL string, allowPdfPageMarkers bool) s
 		}
 	}
 
+	if len(sanitizedParts) == 1 {
+		return trimASCIIWhitespaceLinearGo(sanitizedParts[0])
+	}
 	var sb strings.Builder
 	total := 0
 	for _, p := range sanitizedParts {
@@ -275,37 +278,34 @@ func trimJSSpace(s string) string {
 	return s[start:end]
 }
 
-var asciiSafePrintable = func() [256]uint8 {
-	var t [256]uint8
-	for c := 0x20; c <= 0x7E; c++ {
-		t[c] = 1
-	}
-	t['\t'] = 1
-	t['\n'] = 1
-	t['\r'] = 1
-	return t
-}()
+func isSafePrintableASCIIByte(b byte) bool {
+	return (b >= 0x20 && b <= 0x7E) || b == '\n' || b == '\t' || b == '\r'
+}
 
 func stripInvisibleSmugglingCharsGo(s string) string {
 	if s == "" {
 		return ""
 	}
-	// Fast 16-byte unrolled pure-printable-ASCII scan: zero allocation and minimal coverage basic blocks on 7MB ASCII inputs
+	// Fast pure-printable-ASCII scan with zero global table lookups (avoids runtime.raceread overhead under -race).
 	purePrintable := true
 	i := 0
 	n := len(s)
-	for ; i+16 <= n; i += 16 {
-		if (asciiSafePrintable[s[i]] & asciiSafePrintable[s[i+1]] & asciiSafePrintable[s[i+2]] & asciiSafePrintable[s[i+3]] &
-			asciiSafePrintable[s[i+4]] & asciiSafePrintable[s[i+5]] & asciiSafePrintable[s[i+6]] & asciiSafePrintable[s[i+7]] &
-			asciiSafePrintable[s[i+8]] & asciiSafePrintable[s[i+9]] & asciiSafePrintable[s[i+10]] & asciiSafePrintable[s[i+11]] &
-			asciiSafePrintable[s[i+12]] & asciiSafePrintable[s[i+13]] & asciiSafePrintable[s[i+14]] & asciiSafePrintable[s[i+15]]) == 0 {
-			purePrintable = false
-			break
+	for ; i+8 <= n; i += 8 {
+		b0, b1, b2, b3 := s[i], s[i+1], s[i+2], s[i+3]
+		b4, b5, b6, b7 := s[i+4], s[i+5], s[i+6], s[i+7]
+		if (b0|b1|b2|b3|b4|b5|b6|b7) >= 0x7F ||
+			b0 < 0x20 || b1 < 0x20 || b2 < 0x20 || b3 < 0x20 ||
+			b4 < 0x20 || b5 < 0x20 || b6 < 0x20 || b7 < 0x20 {
+			if !isSafePrintableASCIIByte(b0) || !isSafePrintableASCIIByte(b1) || !isSafePrintableASCIIByte(b2) || !isSafePrintableASCIIByte(b3) ||
+				!isSafePrintableASCIIByte(b4) || !isSafePrintableASCIIByte(b5) || !isSafePrintableASCIIByte(b6) || !isSafePrintableASCIIByte(b7) {
+				purePrintable = false
+				break
+			}
 		}
 	}
 	if purePrintable {
 		for ; i < n; i++ {
-			if asciiSafePrintable[s[i]] == 0 {
+			if !isSafePrintableASCIIByte(s[i]) {
 				purePrintable = false
 				break
 			}
@@ -471,17 +471,43 @@ func measureLeadingIndentColsGo(raw string) (cols int, bytePos int, isBlank bool
 	return cols, i, i >= len(raw)
 }
 
-func detectListItemContentColGo(raw string, leadCols int, leadPos int) int {
+func isThematicBreakLineLinearGo(raw string, leadCols int, leadPos int) bool {
 	if leadCols > 3 || leadPos >= len(raw) {
+		return false
+	}
+	ch := raw[leadPos]
+	if ch != '-' && ch != '*' && ch != '_' {
+		return false
+	}
+	count := 0
+	for i := leadPos; i < len(raw); i++ {
+		c := raw[i]
+		if c == ch {
+			count++
+		} else if c != ' ' && c != '\t' {
+			return false
+		}
+	}
+	return count >= 3
+}
+
+func detectListItemContentColGo(raw string, leadCols int, leadPos int, prevLineWasParagraph bool) int {
+	if leadCols > 3 || leadPos >= len(raw) {
+		return 0
+	}
+	if isThematicBreakLineLinearGo(raw, leadCols, leadPos) {
 		return 0
 	}
 	c := raw[leadPos]
 	markerEnd := -1
 	markerWidth := 0
+	isOrdered := false
+	isOrderedOne := false
 	if c == '-' || c == '*' || c == '+' {
 		markerEnd = leadPos + 1
 		markerWidth = 1
 	} else if c >= '0' && c <= '9' {
+		isOrdered = true
 		d := leadPos + 1
 		for d < len(raw) && d-leadPos < 9 && raw[d] >= '0' && raw[d] <= '9' {
 			d++
@@ -489,6 +515,7 @@ func detectListItemContentColGo(raw string, leadCols int, leadPos int) int {
 		if d < len(raw) && (raw[d] == '.' || raw[d] == ')') {
 			markerEnd = d + 1
 			markerWidth = markerEnd - leadPos
+			isOrderedOne = d == leadPos+1 && c == '1'
 		}
 	}
 	if markerEnd < 0 || markerEnd >= len(raw) {
@@ -512,10 +539,55 @@ func detectListItemContentColGo(raw string, leadCols int, leadPos int) int {
 			break
 		}
 	}
+	// CommonMark §5.2: an empty list item CANNOT interrupt a paragraph, and an ordered list item can ONLY interrupt
+	// a paragraph when its start number is strictly `1`.
+	if prevLineWasParagraph {
+		if p >= len(raw) {
+			return 0
+		}
+		if isOrdered && !isOrderedOne {
+			return 0
+		}
+	}
 	if p >= len(raw) || col-(leadCols+markerWidth) > 4 {
 		return leadCols + markerWidth + 1
 	}
 	return col
+}
+
+func isParagraphContinuationLineLinearGo(raw string, cols int, bytePos int, isBlank bool, activeListIndent int) bool {
+	if isBlank {
+		return false
+	}
+	if activeListIndent == 0 && cols >= 4 {
+		return false
+	}
+	if isThematicBreakLineLinearGo(raw, cols, bytePos) {
+		return false
+	}
+	c := raw[bytePos]
+	if c == '>' && cols <= 3 {
+		return false
+	}
+	if c == '#' && cols <= 3 {
+		h := bytePos
+		for h < len(raw) && h-bytePos < 7 && raw[h] == '#' {
+			h++
+		}
+		if h-bytePos <= 6 && (h == len(raw) || raw[h] == ' ' || raw[h] == '\t') {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeUnicodeLineSeparatorsGo(md string) string {
+	if !strings.Contains(md, "\u2028") && !strings.Contains(md, "\u2029") && !strings.Contains(md, "\u0085") {
+		return md
+	}
+	r := strings.ReplaceAll(md, "\u2028", " ")
+	r = strings.ReplaceAll(r, "\u2029", " ")
+	return strings.ReplaceAll(r, "\u0085", " ")
 }
 
 func scanContainerPrefixLinearGo(raw string) (prefixLen int, risky bool) {
@@ -718,10 +790,11 @@ type escapedRiskyFenceState struct {
 	needBlockquote bool
 }
 
-func hardenMarkdownFenceStructureGo(md string) string {
-	if md == "" {
-		return md
+func hardenMarkdownFenceStructureGo(rawMd string) string {
+	if rawMd == "" {
+		return rawMd
 	}
+	md := normalizeUnicodeLineSeparatorsGo(rawMd)
 	if !strings.Contains(md, "```") && !strings.Contains(md, "~~~") {
 		return md
 	}
@@ -737,12 +810,14 @@ func hardenMarkdownFenceStructureGo(md string) string {
 	fenceOpenInfo := ""
 	fenceContainerIndent := 0
 	activeListIndent := 0
+	prevLineWasParagraph := false
 	var escapedRisky *escapedRiskyFenceState
 
 	for _, raw := range lines {
 		cols, bytePos, isBlank := measureLeadingIndentColsGo(raw)
 
 		if inFence {
+			prevLineWasParagraph = false
 			if !isBlank && fenceContainerIndent > 0 && cols < fenceContainerIndent {
 				out = append(out, strings.Repeat(" ", fenceContainerIndent)+strings.Repeat(string(fenceChar), effectiveFenceLen))
 				inFence = false
@@ -794,15 +869,17 @@ func hardenMarkdownFenceStructureGo(md string) string {
 
 		if !isBlank && activeListIndent > 0 && cols < activeListIndent {
 			activeListIndent = 0
+			prevLineWasParagraph = false
 			if escapedRisky != nil && !escapedRisky.needBlockquote {
 				escapedRisky = nil
 			}
 		}
 
-		listCol := detectListItemContentColGo(raw, cols, bytePos)
+		listCol := detectListItemContentColGo(raw, cols, bytePos, prevLineWasParagraph)
 		if listCol > 0 {
 			activeListIndent = listCol
 			escapedRisky = nil
+			prevLineWasParagraph = false
 		}
 
 		prefixLen, risky := scanContainerPrefixLinearGo(raw)
@@ -850,6 +927,7 @@ func hardenMarkdownFenceStructureGo(md string) string {
 							out = append(out, "")
 						}
 						inFence = true
+						prevLineWasParagraph = false
 						fenceChar = c0
 						fenceLen = fLen
 						effectiveFenceLen = fLen
@@ -921,6 +999,15 @@ func hardenMarkdownFenceStructureGo(md string) string {
 		}
 
 		out = append(out, raw)
+		if listCol > 0 {
+			tailStart := listCol
+			if tailStart > len(raw) {
+				tailStart = len(raw)
+			}
+			prevLineWasParagraph = !isBlank && strings.TrimSpace(raw[tailStart:]) != ""
+		} else {
+			prevLineWasParagraph = !lineHasBlockquote && isParagraphContinuationLineLinearGo(raw, cols, bytePos, isBlank, activeListIndent)
+		}
 	}
 
 	if inFence {
@@ -929,8 +1016,12 @@ func hardenMarkdownFenceStructureGo(md string) string {
 	return strings.Join(out, "\n")
 }
 
-func splitMarkdownByCodeFencesGo(md string) []string {
-	if md == "" || (!strings.Contains(md, "```") && !strings.Contains(md, "~~~")) {
+func splitMarkdownByCodeFencesGo(rawMd string) []string {
+	if rawMd == "" {
+		return []string{rawMd}
+	}
+	md := normalizeUnicodeLineSeparatorsGo(rawMd)
+	if !strings.Contains(md, "```") && !strings.Contains(md, "~~~") {
 		return []string{md}
 	}
 	var out []string
@@ -939,6 +1030,7 @@ func splitMarkdownByCodeFencesGo(md string) []string {
 	fenceLen := 0
 	fenceContainerIndent := 0
 	activeListIndent := 0
+	prevLineWasParagraph := false
 	segStart := 0
 	pos := 0
 	n := len(md)
@@ -958,6 +1050,7 @@ func splitMarkdownByCodeFencesGo(md string) []string {
 		cols, bytePos, isBlank := measureLeadingIndentColsGo(rawLine)
 
 		if inFence {
+			prevLineWasParagraph = false
 			if !isBlank && fenceContainerIndent > 0 && cols < fenceContainerIndent {
 				out = append(out, md[segStart:pos])
 				inFence = false
@@ -1000,16 +1093,19 @@ func splitMarkdownByCodeFencesGo(md string) []string {
 
 		if !isBlank && activeListIndent > 0 && cols < activeListIndent {
 			activeListIndent = 0
+			prevLineWasParagraph = false
 		}
-		listCol := detectListItemContentColGo(rawLine, cols, bytePos)
+		listCol := detectListItemContentColGo(rawLine, cols, bytePos, prevLineWasParagraph)
 		if listCol > 0 {
 			activeListIndent = listCol
+			prevLineWasParagraph = false
 		}
 		minOpenCols := 0
 		if activeListIndent > 0 {
 			minOpenCols = activeListIndent
 		}
 		maxOpenCols := minOpenCols + 3
+		openedFence := false
 		if listCol == 0 && cols >= minOpenCols && cols <= maxOpenCols && bytePos == cols && bytePos+3 <= len(rawLine) {
 			c0 := rawLine[bytePos]
 			if c0 == '`' || c0 == '~' {
@@ -1021,6 +1117,8 @@ func splitMarkdownByCodeFencesGo(md string) []string {
 				if runLen >= 3 && !(c0 == '`' && strings.IndexByte(rawLine[p:], '`') >= 0) {
 					out = append(out, md[segStart:pos])
 					inFence = true
+					openedFence = true
+					prevLineWasParagraph = false
 					fenceChar = c0
 					fenceLen = runLen
 					if activeListIndent > 0 {
@@ -1030,6 +1128,19 @@ func splitMarkdownByCodeFencesGo(md string) []string {
 					}
 					segStart = pos
 				}
+			}
+		}
+		if !openedFence {
+			prefixLen, _ := scanContainerPrefixLinearGo(rawLine)
+			lineHasBq := prefixLen > 0 && strings.IndexByte(rawLine[:prefixLen], '>') >= 0
+			if listCol > 0 {
+				tailStart := listCol
+				if tailStart > len(rawLine) {
+					tailStart = len(rawLine)
+				}
+				prevLineWasParagraph = !isBlank && strings.TrimSpace(rawLine[tailStart:]) != ""
+			} else {
+				prevLineWasParagraph = !lineHasBq && isParagraphContinuationLineLinearGo(rawLine, cols, bytePos, isBlank, activeListIndent)
 			}
 		}
 		pos = nextPos
@@ -2607,6 +2718,9 @@ func neutralizeAllUnsafeMarkdownLinksLinearGo(prose string) string {
 		if i >= n-1 {
 			break
 		}
+		for i+128 <= n && prose[i:i+128] == "](](](](](](](](](](](](](](](](](](](](](](](](](](](](](](](](" {
+			i += 126
+		}
 		for i+32 <= n && prose[i:i+32] == "](](](](](](](](](](](](](](](](" {
 			i += 30
 		}
@@ -2723,12 +2837,51 @@ func isVerifiedPdfPageMarkerLineGo(trimmed string) bool {
 	return true
 }
 
+func replaceAllLtFastGo(s string) string {
+	ltCount := strings.Count(s, "<")
+	if ltCount == 0 {
+		return s
+	}
+	const lt16 = "&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;&lt;" // 16 * "&lt;" = 64 bytes
+	buf := make([]byte, len(s)+ltCount*3)
+	w := 0
+	i := 0
+	n := len(s)
+	for i < n {
+		rel := strings.IndexByte(s[i:], '<')
+		if rel < 0 {
+			w += copy(buf[w:], s[i:])
+			break
+		}
+		if rel > 0 {
+			w += copy(buf[w:], s[i:i+rel])
+			i += rel
+		}
+		// Coalesce consecutive '<' runs in 16x chunks to minimize race-detector write barriers on dense '<' inputs.
+		runEnd := i + 1
+		for runEnd < n && s[runEnd] == '<' {
+			runEnd++
+		}
+		rem := runEnd - i
+		for rem >= 16 {
+			w += copy(buf[w:], lt16)
+			rem -= 16
+		}
+		for rem > 0 {
+			w += copy(buf[w:], "&lt;")
+			rem--
+		}
+		i = runEnd
+	}
+	return string(buf[:w])
+}
+
 func escapeAllResidualLtInProseLinearGo(prose string, allowPdfPageMarkers bool) string {
 	if prose == "" || strings.IndexByte(prose, '<') < 0 {
 		return prose
 	}
 	if !allowPdfPageMarkers {
-		return strings.ReplaceAll(prose, "<", "&lt;")
+		return replaceAllLtFastGo(prose)
 	}
 	lines := strings.Split(prose, "\n")
 	changed := false
@@ -2739,7 +2892,7 @@ func escapeAllResidualLtInProseLinearGo(prose string, allowPdfPageMarkers bool) 
 		if isVerifiedPdfPageMarkerLineGo(trimASCIIWhitespaceLinearGo(line)) {
 			continue
 		}
-		lines[i] = strings.ReplaceAll(line, "<", "&lt;")
+		lines[i] = replaceAllLtFastGo(line)
 		changed = true
 	}
 	if !changed {
@@ -4213,6 +4366,42 @@ func dedupeConsecutiveStandaloneLinkParagraphsGo(prose string) string {
 	return strings.Join(out, "\n\n")
 }
 
+func escapePostStripProseFencesGo(s string) string {
+	if !strings.Contains(s, "```") && !strings.Contains(s, "~~~") {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	changed := false
+	for idx, pLine := range lines {
+		if !strings.Contains(pLine, "```") && !strings.Contains(pLine, "~~~") {
+			continue
+		}
+		prefixLen, _ := scanContainerPrefixLinearGo(pLine)
+		q := prefixLen
+		for q < len(pLine) && (pLine[q] == ' ' || pLine[q] == '\t') {
+			q++
+		}
+		if q+3 <= len(pLine) {
+			fc := pLine[q]
+			if (fc == '`' || fc == '~') && pLine[q+1] == fc && pLine[q+2] == fc {
+				fe := q + 3
+				for fe < len(pLine) && pLine[fe] == fc {
+					fe++
+				}
+				tail := pLine[fe:]
+				if !(fc == '`' && strings.IndexByte(tail, '`') >= 0) {
+					lines[idx] = pLine[:q] + strings.Repeat(`\`+string(fc), fe-q) + tail
+					changed = true
+				}
+			}
+		}
+	}
+	if !changed {
+		return s
+	}
+	return strings.Join(lines, "\n")
+}
+
 func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, _ bool) string {
 	if part == "" {
 		return ""
@@ -4273,7 +4462,8 @@ func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, _ bo
 	detached := escapeGfmTaskListCheckboxesLinearGo(detachBareUrlsFromCodeSpansLinearGo(proseWork))
 	resolved := sanitizeAndResolveMarkdownProseLinksLinearGo(detached, baseURL)
 	escaped := escapeAllResidualLtInProseLinearGo(resolved, allowPdfPageMarkers)
-	return collapseExcessBlankLinesGo(escaped)
+	fenceSafe := escapePostStripProseFencesGo(escaped)
+	return collapseExcessBlankLinesGo(fenceSafe)
 }
 
 func stripInvisibleAndNUL(s string) string {

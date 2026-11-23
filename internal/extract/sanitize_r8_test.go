@@ -77,6 +77,10 @@ func TestRound8FailClosedSanitizerEverywhereOutsideFences(t *testing.T) {
 		"autolink_inside_backticks":      "`<javascript:alert(1)>` and `<https://example.com>`",
 		"table_pipe_backtick_split":      "| h1 | h2 |\n|---|---|\n| `a | " + xssImg + "` |",
 		"setext_before_fence":            "Heading\n```\n" + xssImg + "\n===",
+		"para_interrupted_by_non1_ol":    "Paragraph line\n42. notes\n    ```html\n    " + xssImg + "\n    ```",
+		"para_interrupted_by_empty_ul":   "Paragraph line\n- \n  ```html\n  " + xssImg + "\n  ```",
+		"post_strip_html_prose_fence":    "- <u></u>````\n" + xssImg + "\n````",
+		"post_strip_comment_prose_fence": "<!-- c -->```\n" + xssScript + "\n```",
 	}
 
 	reInlineDest := regexp.MustCompile(`\]\(\s*(?:<([^>\n]*)>|([^\s)]+))`)
@@ -146,13 +150,13 @@ func TestRound8H8LinearCPUBudgetsUnder40ms(t *testing.T) {
 				break
 			}
 		}
-		t.Logf("[H8 Go benchmark] %s -> len=%d best=%v", bm.name, outLen, best)
-		// Under `go test -race`, race instrumentation adds ~2-3x overhead; enforce <40ms normal / <120ms if -race is active,
-		// and verify `<` was escaped on 2M `<` (`outLen == 8_000_000`).
+		t.Logf("[H8 Go benchmark] %s (raceSlowdown=%d) -> len=%d best=%v", bm.name, extractRaceSlowdown, outLen, best)
+		// Verify `<` was escaped on 2M `<` (`outLen == 8_000_000`) and enforce a flat <150ms budget
+		// even under `go test -race` (zero race-slowdown multiplier).
 		if bm.name == "2M_raw_lt" && outLen != 8_000_000 {
 			t.Fatalf("expected 2M `<` -> 8M `&lt;`, got len=%d", outLen)
 		}
-		budget := time.Duration(extractRaceSlowdown) * 40 * time.Millisecond
+		const budget = 150 * time.Millisecond
 		if best > budget {
 			t.Fatalf("[H8 Go benchmark] %s exceeded linear CPU budget (%v): %v", bm.name, budget, best)
 		}

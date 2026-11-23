@@ -704,7 +704,7 @@ test('R7-H3: Downstream tools/list >16 KiB rejected before truncation, recursive
     updatedAt: 1,
   });
   await startOrExecuteAgentCall({
-    payload: { prompt: 'Check open invoices on billing.example', preferMcp: true },
+    payload: { prompt: 'Check open invoices on billing.example', mcpServers: ['billing'], preferMcp: true },
     env: {
       VAULT_MASTER_KEY: TEST_VAULT_KEY,
       SAFE_PUBLIC_FETCH: async (_i, init) => {

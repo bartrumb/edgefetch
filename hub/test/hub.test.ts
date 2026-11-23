@@ -1768,7 +1768,7 @@ test('V2-10: Modular Site Extractor Registry (18+ platforms: npm, crates.io, HF,
   </body></html>`;
   const soOut = extractHtmlDocument(soHtml, { baseUrl: 'https://stackoverflow.com/questions/99999/how-to-type-promise' });
   assert.match(soOut.markdown, /## ✅ Accepted Answer \(Score: 88\)/);
-  assert.match(soOut.markdown, /`Promise<Result<T>>`/);
+  assert.match(soOut.markdown, /`Promise&lt;Result&lt;T>>`/);
   assert.match(soOut.markdown, /type Unwrap<T> = Awaited<T>;/);
   assert.equal(soOut.markdown.includes('Noise question 1'), false);
 

@@ -116,9 +116,9 @@ import {
   encodeBodyToRawBase64,
   escapeAllResidualLtInProseLinear,
   escapeGfmTaskListCheckboxesLinear,
-  escapeResidualLtPreservingSafeCodeSpansLinear,
   extractHtmlAttributesBySelectors,
   extractStructuredProduct,
+  isAsciiSpaceOrTabOnly,
   isDisallowedMarkdownLinkDestination,
   neutralizeAllUnsafeMarkdownLinksLinear,
   normalizeInlineBrowserActions,
@@ -280,9 +280,10 @@ export function decodeHtmlEntities(input: string): string {
 }
 
 function measureLeadingIndentCols(raw: string): { cols: number; bytePos: number; isBlank: boolean } {
+  const rawEnd = raw.length > 0 && raw.charCodeAt(raw.length - 1) === 13 /* '\r' */ ? raw.length - 1 : raw.length;
   let cols = 0;
   let i = 0;
-  while (i < raw.length) {
+  while (i < rawEnd) {
     const ch = raw.charCodeAt(i);
     if (ch === 32 /* ' ' */) {
       cols++;
@@ -294,7 +295,7 @@ function measureLeadingIndentCols(raw: string): { cols: number; bytePos: number;
       break;
     }
   }
-  return { cols, bytePos: i, isBlank: i >= raw.length };
+  return { cols, bytePos: i, isBlank: i >= rawEnd };
 }
 
 function isThematicBreakLineLinear(raw: string, leadCols: number, leadPos: number): boolean {
@@ -378,6 +379,8 @@ function isParagraphContinuationLineLinear(raw: string, cols: number, bytePos: n
   return true;
 }
 
+const _scanPrefixOut = { prefixLen: 0, risky: false };
+
 function scanContainerPrefixLinear(raw: string): { prefixLen: number; risky: boolean } {
   let i = 0;
   let risky = false;
@@ -423,7 +426,9 @@ function scanContainerPrefixLinear(raw: string): { prefixLen: number; risky: boo
     }
     break;
   }
-  return { prefixLen: i, risky };
+  _scanPrefixOut.prefixLen = i;
+  _scanPrefixOut.risky = risky;
+  return _scanPrefixOut;
 }
 
 function cleanFenceInfoStringLinear(rawInfo: string): string {
@@ -651,8 +656,8 @@ function parseListMarkerAtPos(
     if (isBlankItem) return null;
     if (isOrdered && !isOrderedOne) return null;
   }
-  if (isBlankItem || ws.col - markerColEnd > 4) {
-    // Blank item or indented code inside list item: list content indent is `markerColEnd + 1`, advance 1 space column past marker
+  if (isBlankItem) {
+    // Blank list item: list content indent is `markerColEnd + 1`, advance at most 1 space/tab past marker
     let p1 = markerEnd;
     let c1 = markerColEnd;
     let tab1 = false;
@@ -667,6 +672,10 @@ function parseListMarkerAtPos(
       }
     }
     return { contentIndent: markerColEnd + 1, nextPos: p1, nextCol: c1, sawTab: tab1 };
+  }
+  if (ws.col - markerColEnd > 4) {
+    // CommonMark §5.2: indented code block inside list item — content indent is `markerColEnd + 1`, while `nextPos`/`nextCol` advance past all leading whitespace!
+    return { contentIndent: markerColEnd + 1, nextPos: ws.pos, nextCol: ws.col, sawTab: ws.sawTab };
   }
   return { contentIndent: ws.col, nextPos: ws.pos, nextCol: ws.col, sawTab: ws.sawTab };
 }
@@ -691,27 +700,78 @@ function canInterruptParagraphAtPos(raw: string, baseCol: number, col: number, p
   return false;
 }
 
+const MAX_MD_CONTAINER_DEPTH = 32;
+const _matchContainerOut = { matched: 0, baseCol: 0, col: 0, pos: 0, sawTab: false };
+
 function matchOpenContainersOnLine(
   raw: string,
   containers: readonly MdContainerEntry[],
 ): { matched: number; baseCol: number; col: number; pos: number; sawTab: boolean } {
-  let matched = 0;
-  let baseCol = 0;
+  const n = raw.length;
   let pos = 0;
   let col = 0;
   let sawTab = false;
 
-  for (let ci = 0; ci < containers.length; ci++) {
-    const ws = scanSpacesAndTabsCols(raw, pos, col);
-    pos = ws.pos;
-    col = ws.col;
-    if (ws.sawTab) sawTab = true;
+  // Fast-path `containers.length === 0` (`S2`): single tight char-code loop with zero object allocations
+  if (containers.length === 0) {
+    while (pos < n) {
+      const ch = raw.charCodeAt(pos);
+      if (ch === 32 /* ' ' */) {
+        col++;
+        pos++;
+      } else if (ch === 9 /* '\t' */) {
+        col += 4 - (col % 4);
+        pos++;
+        sawTab = true;
+      } else {
+        break;
+      }
+    }
+    _matchContainerOut.matched = 0;
+    _matchContainerOut.baseCol = 0;
+    _matchContainerOut.col = col;
+    _matchContainerOut.pos = pos;
+    _matchContainerOut.sawTab = sawTab;
+    return _matchContainerOut;
+  }
+
+  let matched = 0;
+  let baseCol = 0;
+  const depthLimit = containers.length < MAX_MD_CONTAINER_DEPTH ? containers.length : MAX_MD_CONTAINER_DEPTH;
+
+  // Empty line (`n === 0`) fast-path: matches all leading list containers up to the first blockquote container (`>`).
+  if (n === 0) {
+    while (matched < depthLimit && containers[matched]!.kind === 'list') {
+      matched++;
+    }
+    _matchContainerOut.matched = matched;
+    _matchContainerOut.baseCol = 0;
+    _matchContainerOut.col = 0;
+    _matchContainerOut.pos = 0;
+    _matchContainerOut.sawTab = false;
+    return _matchContainerOut;
+  }
+
+  for (let ci = 0; ci < depthLimit; ci++) {
     const entry = containers[ci]!;
     if (entry.kind === 'bq') {
-      if (col - baseCol <= 3 && pos < raw.length && raw.charCodeAt(pos) === 62 /* '>' */) {
+      while (pos < n) {
+        const ch = raw.charCodeAt(pos);
+        if (ch === 32) {
+          col++;
+          pos++;
+        } else if (ch === 9) {
+          col += 4 - (col % 4);
+          pos++;
+          sawTab = true;
+        } else {
+          break;
+        }
+      }
+      if (col - baseCol <= 3 && pos < n && raw.charCodeAt(pos) === 62 /* '>' */) {
         pos++;
         col++;
-        if (pos < raw.length) {
+        if (pos < n) {
           const nx = raw.charCodeAt(pos);
           if (nx === 32) {
             pos++;
@@ -734,34 +794,75 @@ function matchOpenContainersOnLine(
         break;
       }
     } else {
-      // List item container: blank line matches; non-blank requires `col >= entry.indent`
-      if (pos >= raw.length) {
-        baseCol = col;
-        matched++;
-      } else if (col >= entry.indent) {
+      // List item container (`S5`): consume spaces/tabs strictly by CommonMark §2.2 4-space tab stops up to `col >= entry.indent`.
+      // If a tab crosses `entry.indent` (e.g. `col` jumps `0 -> 4` when `entry.indent === 2`), `baseCol = entry.indent` leaves `remCols = 2`!
+      while (pos < n && col < entry.indent) {
+        const ch = raw.charCodeAt(pos);
+        if (ch === 32) {
+          col++;
+          pos++;
+        } else if (ch === 9) {
+          col += 4 - (col % 4);
+          pos++;
+          sawTab = true;
+        } else {
+          break;
+        }
+      }
+      if (col >= entry.indent) {
         baseCol = entry.indent;
         matched++;
       } else {
-        break;
+        // Check if remainder of line is strictly ASCII space/tab (CommonMark §2.1 blank line continues list item)
+        while (pos < n) {
+          const ch = raw.charCodeAt(pos);
+          if (ch === 32) {
+            col++;
+            pos++;
+          } else if (ch === 9) {
+            col += 4 - (col % 4);
+            pos++;
+            sawTab = true;
+          } else {
+            break;
+          }
+        }
+        if (pos >= n) {
+          baseCol = col;
+          matched++;
+        } else {
+          break;
+        }
       }
     }
   }
 
-  const tailWs = scanSpacesAndTabsCols(raw, pos, col);
-  return {
-    matched,
-    baseCol,
-    col: tailWs.col,
-    pos: tailWs.pos,
-    sawTab: sawTab || tailWs.sawTab,
-  };
+  while (pos < n) {
+    const ch = raw.charCodeAt(pos);
+    if (ch === 32) {
+      col++;
+      pos++;
+    } else if (ch === 9) {
+      col += 4 - (col % 4);
+      pos++;
+      sawTab = true;
+    } else {
+      break;
+    }
+  }
+  _matchContainerOut.matched = matched;
+  _matchContainerOut.baseCol = baseCol;
+  _matchContainerOut.col = col;
+  _matchContainerOut.pos = pos;
+  _matchContainerOut.sawTab = sawTab;
+  return _matchContainerOut;
 }
 
 /**
- * Unified Single-Recognizer CommonMark Fence & Block Model (`R9-H1`):
- * ONE canonical block/fence state machine drives BOTH hardening (`harden: true`) and splitting (`segments`),
- * returning `{ hardened: string; segments: string[] }` (`segments[idx]` for odd `idx` is ALWAYS a fenced code block)
- * from the exact same pass with upfront `\u2028`/`\u2029`/`\u0085`/`\r` normalization and zero `.` regexes.
+ * Full-document CommonMark fence recognizer & hardener (`R9-H1`, `R10-S2..S5`):
+ * Drives full-document hardening (`harden: true`) and prose/fence segment splitting (`segments`),
+ * returning `{ hardened: string; segments: string[] }` (`segments[idx]` for odd `idx` is a fenced code block)
+ * from the same line array with upfront `\u2028`/`\u2029`/`\u0085`/`\r` normalization and bounded container depth.
  */
 export function recognizeAndHardenMarkdownFences(
   rawMd: string,
@@ -783,6 +884,14 @@ export function recognizeAndHardenMarkdownFences(
   const fenceSpans: Array<{ openLine: number; closeLine: number; dedentClosed: boolean }> = [];
 
   const containers: MdContainerEntry[] = [];
+  let containerFlags = 0; // bit 1 = has 'bq', bit 2 = has 'list' (avoids per-line .every/.some closures)
+  const syncContainerFlags = (): void => {
+    let f = 0;
+    for (let ci = 0; ci < containers.length; ci++) {
+      f |= containers[ci]!.kind === 'bq' ? 1 : 2;
+    }
+    containerFlags = f;
+  };
   let openParagraph = false;
   let inFence = false;
   let fenceChar: '`' | '~' | '' = '';
@@ -801,7 +910,8 @@ export function recognizeAndHardenMarkdownFences(
       const m = matchOpenContainersOnLine(raw, containers);
       const isBlankAfterMatched = m.pos >= raw.length && m.matched === containers.length;
       // Container dedent or missing `>` closes an indented/container fence BEFORE `raw` is parsed!
-      if (m.matched < containers.length && !(raw.trim() === '' && containers.every((c) => c.kind === 'list'))) {
+      // CommonMark §2.1 (`S3`): ONLY ASCII space (`0x20`) and tab (`0x09`) count as blank-line whitespace (NEVER `U+00A0` NBSP / `U+3000` / `U+FEFF`).
+      if (m.matched < containers.length && !(isAsciiSpaceOrTabOnly(raw) && (containerFlags & 1) === 0)) {
         if (harden) {
           outLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}`);
           fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1, dedentClosed: false });
@@ -815,19 +925,22 @@ export function recognizeAndHardenMarkdownFences(
         fenceOpenOutIdx = -1;
         fenceIndent = 0;
         containers.length = m.matched;
+        syncContainerFlags();
         // Fall through to parse `raw` as a new line outside the closed fence!
       } else {
-        if (!isBlankAfterMatched) {
+        if (!isBlankAfterMatched && m.pos < raw.length) {
           const remCols = m.col - m.baseCol;
-          if (remCols <= 3 && !m.sawTab && m.pos < raw.length) {
-            const fcCode = fenceChar.charCodeAt(0);
-            if (raw.charCodeAt(m.pos) === fcCode) {
-              let p = m.pos;
-              while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
-              const runLen = p - m.pos;
-              if (runLen >= fenceLen) {
-                while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
-                if (p === raw.length) {
+          const fcCode = fenceChar.charCodeAt(0);
+          if (raw.charCodeAt(m.pos) === fcCode) {
+            let p = m.pos;
+            while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
+            const runLen = p - m.pos;
+            if (runLen >= fenceLen) {
+              const onlyTrailingSpaceOrTab = isAsciiSpaceOrTabOnly(raw, p);
+              // `S5`: CommonMark §2.2/§4.5 closes the fence whenever `remCols <= 3`, INCLUDING when a tab inside a list/blockquote
+              // crosses `entry.indent` (`- item\n  \`\`\`\n\t\`\`\`` -> `col=4, baseCol=2, remCols=2 <= 3`)!
+              if (remCols <= 3) {
+                if (onlyTrailingSpaceOrTab) {
                   if (harden) {
                     const closeLen = Math.max(runLen, effectiveFenceLen);
                     outLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(closeLen)}`);
@@ -847,11 +960,33 @@ export function recognizeAndHardenMarkdownFences(
                   effectiveFenceLen = runLen + 1;
                   outLines[fenceOpenOutIdx] = `${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}${fenceOpenInfo}`;
                 }
+              } else if (harden && onlyTrailingSpaceOrTab && runLen >= effectiveFenceLen && fenceOpenOutIdx >= 0) {
+                // `remCols >= 4` (e.g. `\t``` ` at top level): CommonMark keeps the fence open, so lengthen opener `effectiveFenceLen`
+                // so non-CommonMark regex renderers that ignore tab-stop width can NEVER prematurely close the fence either!
+                effectiveFenceLen = runLen + 1;
+                outLines[fenceOpenOutIdx] = `${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}${fenceOpenInfo}`;
               }
             }
           }
         }
         outLines.push(raw);
+        continue;
+      }
+    }
+
+    // Not `inFence`: fast-path empty lines when zero blockquotes are open (`S2`, O(1) bit check)
+    if (raw.length === 0 && (containerFlags & 1) === 0) {
+      openParagraph = false;
+      outLines.push(raw);
+      continue;
+    }
+
+    // Fast-path top-level ordinary prose lines starting with an ASCII letter (`A-Z` / `a-z`)
+    if (containers.length === 0 && raw.length > 0) {
+      const c0 = raw.charCodeAt(0);
+      if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) {
+        outLines.push(raw);
+        openParagraph = true;
         continue;
       }
     }
@@ -865,9 +1000,12 @@ export function recognizeAndHardenMarkdownFences(
 
     if (pos >= raw.length) {
       // Blank line (at matched container depth) closes any unmatched inner containers and closes `openParagraph`
-      containers.length = m.matched;
+      if (containers.length !== m.matched) {
+        containers.length = m.matched;
+        syncContainerFlags();
+      }
       openParagraph = false;
-      if (escapedRiskyFence?.needBlockquote && !containers.some((c) => c.kind === 'bq')) {
+      if (escapedRiskyFence?.needBlockquote && (containerFlags & 1) === 0) {
         escapedRiskyFence = null;
       }
       outLines.push(raw);
@@ -905,18 +1043,20 @@ export function recognizeAndHardenMarkdownFences(
 
     if (m.matched < containers.length) {
       containers.length = m.matched;
+      syncContainerFlags();
       openParagraph = false;
-      if (escapedRiskyFence && !escapedRiskyFence.needBlockquote && !containers.some((c) => c.kind === 'list')) {
+      if (escapedRiskyFence && !escapedRiskyFence.needBlockquote && (containerFlags & 2) === 0) {
         escapedRiskyFence = null;
       }
-      if (escapedRiskyFence?.needBlockquote && !containers.some((c) => c.kind === 'bq')) {
+      if (escapedRiskyFence?.needBlockquote && (containerFlags & 1) === 0) {
         escapedRiskyFence = null;
       }
     }
 
-    // Parse new container openers (`>` blockquotes and `-`/`1.` list items) on `raw`
+    // Parse new container openers (`>` blockquotes and `-`/`1.` list items) on `raw`, capped at `MAX_MD_CONTAINER_DEPTH` (`S2`)
     let openedListOnLine = false;
     let isIndentedCodeOrLazy = false;
+    let hitContainerDepthCap = containers.length >= MAX_MD_CONTAINER_DEPTH;
     for (;;) {
       const remCols = col - baseCol;
       if (pos >= raw.length) {
@@ -929,7 +1069,12 @@ export function recognizeAndHardenMarkdownFences(
         break;
       }
       if (raw.charCodeAt(pos) === 62 /* '>' */) {
+        if (containers.length >= MAX_MD_CONTAINER_DEPTH) {
+          hitContainerDepthCap = true;
+          break;
+        }
         containers.push({ kind: 'bq' });
+        containerFlags |= 1;
         openParagraph = false;
         pos++;
         col++;
@@ -959,7 +1104,12 @@ export function recognizeAndHardenMarkdownFences(
       }
       const listMatch = parseListMarkerAtPos(raw, baseCol, col, pos, openParagraph);
       if (listMatch) {
+        if (containers.length >= MAX_MD_CONTAINER_DEPTH) {
+          hitContainerDepthCap = true;
+          break;
+        }
         containers.push({ kind: 'list', indent: listMatch.contentIndent });
+        containerFlags |= 2;
         openedListOnLine = true;
         escapedRiskyFence = null;
         openParagraph = false;
@@ -972,13 +1122,49 @@ export function recognizeAndHardenMarkdownFences(
       break;
     }
 
-    const lineHasBq = containers.some((c) => c.kind === 'bq');
+    // `S2`: If container nesting reached `MAX_MD_CONTAINER_DEPTH` (`32`), fail-closed escape any fence-like ``` / ~~~ token on `raw`
+    if (harden && hitContainerDepthCap && (raw.includes('```') || raw.includes('~~~'))) {
+      const { prefixLen } = scanContainerPrefixLinear(raw);
+      let q = prefixLen > pos ? prefixLen : pos;
+      while (q < raw.length && (raw.charCodeAt(q) === 32 || raw.charCodeAt(q) === 9)) q++;
+      if (q + 3 <= raw.length) {
+        const c0 = raw.charCodeAt(q);
+        if ((c0 === 96 || c0 === 126) && raw.charCodeAt(q + 1) === c0 && raw.charCodeAt(q + 2) === c0) {
+          let fEnd = q + 3;
+          while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
+          const tailAfter = raw.slice(fEnd);
+          if (!(c0 === 96 && tailAfter.includes('`'))) {
+            const fChar = c0 === 96 ? '`' : '~';
+            escapedRiskyFence = {
+              ch: fChar,
+              len: fEnd - q,
+              needBlockquote: (containerFlags & 1) !== 0,
+            };
+            outLines.push(`${raw.slice(0, q)}${`\\${fChar}`.repeat(fEnd - q)}${tailAfter}`);
+            openParagraph = false;
+            continue;
+          }
+        }
+      }
+    }
+
+    const lineHasBq = (containerFlags & 1) !== 0;
     if (escapedRiskyFence?.needBlockquote && !lineHasBq) {
       escapedRiskyFence = null;
     }
 
-    // If we previously escaped a risky container-prefixed fence opener (`- ``` ` / `1. ``` `) inside the current list,
-    // also escape its matching closing fence line (`  ``` `) so it cannot invert polarity and open a new fence!
+    // Fast-path container-indented ordinary prose lines (`> line`, `  item prose`) whose content starts with an ASCII letter (`A-Z` / `a-z`)
+    if (!isIndentedCodeOrLazy && pos < raw.length) {
+      const chAtPos = raw.charCodeAt(pos);
+      if ((chAtPos >= 65 && chAtPos <= 90) || (chAtPos >= 97 && chAtPos <= 122)) {
+        outLines.push(raw);
+        openParagraph = true;
+        continue;
+      }
+    }
+
+    // If we previously escaped a risky container-prefixed or tab-indented fence opener (`- ``` ` / `- item\n\t``` `) inside the current list,
+    // also escape its matching closing fence line (`  ``` ` or `\t``` `) so it cannot invert polarity and open a new fence!
     if (
       harden &&
       escapedRiskyFence &&
@@ -986,7 +1172,6 @@ export function recognizeAndHardenMarkdownFences(
       !openedListOnLine &&
       !isIndentedCodeOrLazy &&
       col - baseCol <= 3 &&
-      !sawTabInPrefix &&
       pos < raw.length
     ) {
       const escCode = escapedRiskyFence.ch.charCodeAt(0);
@@ -995,8 +1180,7 @@ export function recognizeAndHardenMarkdownFences(
         while (p < raw.length && raw.charCodeAt(p) === escCode) p++;
         const runLen = p - pos;
         if (runLen >= escapedRiskyFence.len) {
-          while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
-          if (p === raw.length) {
+          if (isAsciiSpaceOrTabOnly(raw, p)) {
             const escapedRun = `\\${escapedRiskyFence.ch}`.repeat(runLen);
             outLines.push(`${raw.slice(0, pos)}${escapedRun}${raw.slice(pos + runLen)}`);
             escapedRiskyFence = null;
@@ -1010,17 +1194,18 @@ export function recognizeAndHardenMarkdownFences(
     // Check for fence opener at `(baseCol, col, pos)` when `!isIndentedCodeOrLazy`
     const fenceCand = !isIndentedCodeOrLazy ? parseFenceOpenerAtPos(raw, baseCol, col, pos) : null;
     if (fenceCand) {
-      const isRiskyContainerFence = lineHasBq || openedListOnLine || sawTabInPrefix;
+      const isRiskyContainerFence =
+        lineHasBq || openedListOnLine || sawTabInPrefix || hitContainerDepthCap || containers.length >= MAX_MD_CONTAINER_DEPTH;
       if (harden && isRiskyContainerFence) {
         const tailAfterFence = raw.slice(fenceCand.infoStart);
         if (
           escapedRiskyFence &&
           escapedRiskyFence.ch === fenceCand.ch &&
           fenceCand.len >= escapedRiskyFence.len &&
-          tailAfterFence.trim() === ''
+          isAsciiSpaceOrTabOnly(tailAfterFence)
         ) {
           escapedRiskyFence = null;
-        } else if (openedListOnLine || lineHasBq) {
+        } else if (openedListOnLine || lineHasBq || containers.length > 0) {
           escapedRiskyFence = { ch: fenceCand.ch, len: fenceCand.len, needBlockquote: lineHasBq };
         }
         const escapedRun = `\\${fenceCand.ch}`.repeat(fenceCand.len);
@@ -1031,7 +1216,13 @@ export function recognizeAndHardenMarkdownFences(
 
       // Valid unambiguous fence opener!
       const effectiveContainerIndent = containers.length > 0 && !lineHasBq ? baseCol : 0;
-      if (harden && hasPotentialSetext && containers.length === 0 && outLines.length > 0 && outLines[outLines.length - 1]!.trim() !== '') {
+      if (
+        harden &&
+        hasPotentialSetext &&
+        containers.length === 0 &&
+        outLines.length > 0 &&
+        !isAsciiSpaceOrTabOnly(outLines[outLines.length - 1]!)
+      ) {
         outLines.push('');
       }
       inFence = true;
@@ -1095,7 +1286,12 @@ export function recognizeAndHardenMarkdownFences(
           openParagraph = true;
           continue;
         }
-        if (closeIdx >= 0 && closeIdx + 1 < tail.length && tail.charCodeAt(closeIdx + 1) === 58 /* ':' */ && tail.slice(closeIdx + 2).trim() === '') {
+        if (
+          closeIdx >= 0 &&
+          closeIdx + 1 < tail.length &&
+          tail.charCodeAt(closeIdx + 1) === 58 /* ':' */ &&
+          isAsciiSpaceOrTabOnly(tail, closeIdx + 2)
+        ) {
           outLines.push(`${raw.slice(0, checkBracketPos)}${tail.slice(0, closeIdx + 1)}\\${tail.slice(closeIdx + 1)}`);
           openParagraph = true;
           continue;
@@ -1422,6 +1618,28 @@ export function sanitizeScrapedMetadataField(raw: string | undefined, maxLen = 2
   if (!raw || typeof raw !== 'string') return undefined;
   const stripped = stripInvisibleSmugglingChars(raw);
   return sanitizePlainMetadataText(stripped, maxLen);
+}
+
+export function sanitizeScrapedTimestampField(raw: string | undefined, maxLen = 128): string | undefined {
+  if (!raw || typeof raw !== 'string') return undefined;
+  let s = stripInvisibleSmugglingChars(raw)
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  if (!s) return undefined;
+  if (s.length > maxLen) s = s.slice(0, maxLen).trim();
+  if (s.includes('](') || s.includes(']:') || s.includes('//')) {
+    s = neutralizeAllUnsafeMarkdownLinksLinear(s);
+  }
+  s = s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)');
+  return s || undefined;
 }
 
 const CODE_LANG_ALIASES: Record<string, string> = {
@@ -3572,10 +3790,10 @@ export function extractHtmlDocument(
         });
       }
       const lang = inferCodeFenceLang(preAttrs, codeAttrs);
-      const withEcLines =
-        !rawCodeHtml.includes('\n') && rawCodeHtml.includes('ec-line')
-          ? replaceHtmlOpenTagsLinear(rawCodeHtml, ['div'], (t) => (/\bec-line\b/i.test(t.attrs) ? '\n' : t.rawTag))
-          : rawCodeHtml;
+      const hasEcLineDiv = rawCodeHtml.includes('ec-line') && /<div\b[^>]*\bec-line\b/i.test(rawCodeHtml);
+      const withEcLines = hasEcLineDiv
+        ? replaceHtmlOpenTagsLinear(rawCodeHtml.replace(/\r?\n/g, ''), ['div'], (t) => (/\bec-line\b/i.test(t.attrs) ? '\n' : t.rawTag))
+        : rawCodeHtml;
       const decodedCode = decodeHtmlEntities(stripHtmlTagsQuoteAwareLinear(withEcLines, '')).trim();
       return stashFence(makeSafeCodeFence(decodedCode, lang));
     });
@@ -4044,20 +4262,35 @@ export function extractHtmlDocument(
   }
   const strippedDocMd = stripInvisibleSmugglingChars(md);
   const { segments: docParts } = recognizeAndHardenMarkdownFences(strippedDocMd, { harden: true });
-  md = docParts
+  const docPass1 = docParts
     .map((part, idx) => {
       if (idx % 2 === 1) return part;
       const detached = part.includes('`') ? detachBareUrlsFromCodeSpansLinear(part) : part;
       const safeLinks = detached.includes('](') || detached.includes(']:') || detached.includes('//')
         ? neutralizeAllUnsafeMarkdownLinksLinear(detached)
         : detached;
-      const safeLt = safeLinks.includes('<') ? escapeResidualLtPreservingSafeCodeSpansLinear(safeLinks, false) : safeLinks;
+      const safeLt = safeLinks.includes('<') ? escapeAllResidualLtInProseLinear(safeLinks, false) : safeLinks;
       return escapeSynthesizedBlockHazardsInProse(safeLt, idx + 1 < docParts.length);
+    })
+    .join('');
+  const { segments: docParts2 } = recognizeAndHardenMarkdownFences(docPass1, { harden: true });
+  md = docParts2
+    .map((part, idx) => {
+      if (idx % 2 === 1) return part;
+      const safeLinks = part.includes('](') || part.includes(']:') || part.includes('//')
+        ? neutralizeAllUnsafeMarkdownLinksLinear(part)
+        : part;
+      const safeLt = safeLinks.includes('<') ? escapeAllResidualLtInProseLinear(safeLinks, false) : safeLinks;
+      return escapeSynthesizedBlockHazardsInProse(safeLt, idx + 1 < docParts2.length);
     })
     .join('');
   plainText = stripInvisibleSmugglingChars(plainText);
   title = sanitizeScrapedMetadataField(redactPii && title ? redactPiiText(title) : title, 512);
   description = sanitizeScrapedMetadataField(redactPii && description ? redactPiiText(description) : description, 2_000);
+  author = sanitizeScrapedMetadataField(redactPii && author ? redactPiiText(author) : author, 256);
+  siteName = sanitizeScrapedMetadataField(redactPii && siteName ? redactPiiText(siteName) : siteName, 256);
+  publishedTime = sanitizeScrapedTimestampField(publishedTime, 128);
+  modifiedTime = sanitizeScrapedTimestampField(modifiedTime, 128);
   const wordCount = countTextWords(md);
 
   return {
@@ -5652,7 +5885,6 @@ function detectParagraphBreakKind(
       return prevContext.inBlockquote ? 'none' : 'block_start';
     }
     if (
-      bytePos === cols &&
       (c === 96 || c === 126) &&
       bytePos + 3 <= line.length &&
       line.charCodeAt(bytePos + 1) === c &&
@@ -5694,13 +5926,14 @@ function detectParagraphBreakKind(
 }
 
 function isRiskyAdjacentCodeSpanAt(line: string, start: number, spanEnd: number, sawBracketInPara: boolean): boolean {
+  const prev = start > 0 ? line.charCodeAt(start - 1) : 0;
+  if (!sawBracketInPara && prev !== 95 /* '_' */ && prev !== 42 /* '*' */) {
+    return false;
+  }
   const inner = line.slice(start, spanEnd);
   if (sawBracketInPara && inner.includes(']')) return true;
-  if (start > 0) {
-    const prev = line.charCodeAt(start - 1);
-    if ((prev === 95 /* '_' */ || prev === 42 /* '*' */) && inner.includes(prev === 95 ? '_' : '*')) {
-      return true;
-    }
+  if ((prev === 95 || prev === 42) && inner.includes(prev === 95 ? '_' : '*')) {
+    return true;
   }
   return false;
 }
@@ -6711,11 +6944,11 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
 }
 
 /**
- * `H1` Fail-Closed Rule: outside recognized CommonMark fenced code blocks, escape EVERY `<` to `&lt;` —
+ * `S1` Fail-Closed Rule: outside recognized CommonMark fenced code blocks, escape EVERY `<` to `&lt;` —
  * **including inside inline backtick code spans `` `...` ``** — so parser disagreements can NEVER materialize live HTML tags!
  */
 function escapeResidualHtmlInMarkdownProseLinear(prose: string, allowPdfPageMarkers = false): string {
-  return escapeResidualLtPreservingSafeCodeSpansLinear(prose, allowPdfPageMarkers);
+  return escapeAllResidualLtInProseLinear(prose, allowPdfPageMarkers);
 }
 
 function escapeSynthesizedBlockHazardsInProse(prose: string, hasFollowingFence = false): string {
@@ -6769,7 +7002,12 @@ function escapeSynthesizedBlockHazardsInProse(prose: string, hasFollowingFence =
       if (closeIdx < 0 && tail.length < 1024) {
         lines[li] = `${pLine.slice(0, q)}\\${tail}`;
         changed = true;
-      } else if (closeIdx >= 0 && closeIdx + 1 < tail.length && tail.charCodeAt(closeIdx + 1) === 58 && tail.slice(closeIdx + 2).trim() === '') {
+      } else if (
+        closeIdx >= 0 &&
+        closeIdx + 1 < tail.length &&
+        tail.charCodeAt(closeIdx + 1) === 58 &&
+        isAsciiSpaceOrTabOnly(tail, closeIdx + 2)
+      ) {
         lines[li] = `${pLine.slice(0, q)}${tail.slice(0, closeIdx + 1)}\\${tail.slice(closeIdx + 1)}`;
         changed = true;
       }
@@ -6789,13 +7027,91 @@ function escapeResidualHtmlOutsideCodeLinear(md: string, allowPdfPageMarkers = f
     .map((part, idx) => {
       if (idx % 2 === 1) return part;
       const safeLinks = needsLinks ? neutralizeAllUnsafeMarkdownLinksLinear(part) : part;
-      const safeLt = needsLt ? escapeResidualLtPreservingSafeCodeSpansLinear(safeLinks, allowPdfPageMarkers) : safeLinks;
+      const safeLt = needsLt ? escapeAllResidualLtInProseLinear(safeLinks, allowPdfPageMarkers) : safeLinks;
       return escapeSynthesizedBlockHazardsInProse(safeLt, idx + 1 < parts.length);
     })
     .join('');
 }
 
-/** Decodes HTML entities in Markdown prose EXCEPT `<` (`&lt;`, `&#60;`, `&#x3c;`) in 1 idempotent O(N) pass. */
+/**
+ * Zero-allocation char-code verifier (`S1` 512 KiB `< 25 ms` fast path):
+ * Returns `true` iff `prose` contains `<` AND every `<` lies strictly inside a paired, unescaped, non-risky inline code span
+ * on a line with no `[` links, `&` entities, `:::` directives, `{/*` JSX comments, bare URLs, `@` emails, `~` tildes, or `\n\n\n`.
+ * When `true`, the entire HTML-stripping + link + entity + S1 `<`-escaping pipeline is 100% equivalent to `prose.replace(/</g, '&lt;')`!
+ */
+function canFastEscapeCodeSpanOnlyLtInProse(prose: string): boolean {
+  if (
+    !prose.includes('<') ||
+    !prose.includes('`') ||
+    prose.includes('[') ||
+    prose.includes('&') ||
+    prose.includes(':::') ||
+    prose.includes('{/*') ||
+    prose.includes('://') ||
+    prose.includes('www.') ||
+    prose.includes('WWW.') ||
+    prose.includes('@') ||
+    prose.includes('~') ||
+    prose.includes('?') ||
+    prose.includes('\n## ') ||
+    prose.includes('```') ||
+    prose.includes('\n\n\n')
+  ) {
+    return false;
+  }
+  const n = prose.length;
+  const scannedByLen = new Int32Array(32);
+  let pos = 0;
+  while (pos < n) {
+    const nl = prose.indexOf('\n', pos);
+    const lineEnd = nl < 0 ? n : nl;
+    scannedByLen.fill(pos);
+    let i = pos;
+    while (i < lineEnd) {
+      const ch = prose.charCodeAt(i);
+      if (ch === 60 /* '<' */) {
+        // `<` outside any paired inline code span -> must run full HTML tag conversion pass
+        return false;
+      }
+      if (ch === 96 /* '`' */) {
+        // Reject backslash-escaped backtick or `_` / `*` emphasis-adjacent code spans
+        if (i > pos) {
+          const prev = prose.charCodeAt(i - 1);
+          if (prev === 92 /* '\\' */ || prev === 95 /* '_' */ || prev === 42 /* '*' */) return false;
+        }
+        let tEnd = i + 1;
+        while (tEnd < lineEnd && prose.charCodeAt(tEnd) === 96) tEnd++;
+        const tickLen = tEnd - i;
+        if (tickLen >= 32) return false;
+        let search = scannedByLen[tickLen]! > tEnd ? scannedByLen[tickLen]! : tEnd;
+        let closeStart = -1;
+        while (search < lineEnd) {
+          const hit = prose.indexOf('`', search);
+          if (hit < 0 || hit >= lineEnd) {
+            scannedByLen[tickLen] = lineEnd;
+            break;
+          }
+          let cEnd = hit + 1;
+          while (cEnd < lineEnd && prose.charCodeAt(cEnd) === 96) cEnd++;
+          if (cEnd - hit === tickLen) {
+            closeStart = hit;
+            scannedByLen[tickLen] = cEnd;
+            break;
+          }
+          search = cEnd;
+          scannedByLen[tickLen] = cEnd;
+        }
+        if (closeStart < 0) return false;
+        i = closeStart + tickLen;
+        continue;
+      }
+      i++;
+    }
+    if (nl < 0) break;
+    pos = nl + 1;
+  }
+  return true;
+}
 function decodeMarkdownEntitiesPreservingLt(prose: string): string {
   if (!prose || !prose.includes('&')) return prose;
   if (!/&(?!lt;|LT;)/.test(prose)) return prose;
@@ -6806,6 +7122,80 @@ function decodeMarkdownEntitiesPreservingLt(prose: string): string {
 
 function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): string {
   if (!prose || !prose.includes('`')) return prose;
+  const hasAmpOrDirective = prose.includes('&') || prose.includes(':::');
+  const hasBracketsInProse = prose.includes('[');
+
+  // Fast single-pass linear path when prose has no `[` links/brackets and no `&` / `:::`:
+  // pairs code spans per paragraph and escapes `<` -> `&lt;` directly inside valid code spans with zero stash allocations!
+  if (!hasBracketsInProse && !hasAmpOrDirective) {
+    if (!prose.includes('<')) return prose;
+    const lines = prose.split('\n');
+    let carry = false;
+    let inBlockquote = false;
+    let inList = false;
+    let changedAny = false;
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li]!;
+      const breakKind = detectParagraphBreakKind(line, { inBlockquote, inList });
+      const { cols, bytePos, isBlank } = measureLeadingIndentCols(line);
+      const leadChar = !isBlank && bytePos < line.length ? line.charCodeAt(bytePos) : 0;
+      const lineStartsWithQuote = !isBlank && cols <= 3 && leadChar === 62;
+      const lineStartsList =
+        !isBlank &&
+        cols <= 3 &&
+        (((leadChar === 45 || leadChar === 42 || leadChar === 43) && bytePos + 1 < line.length && line.charCodeAt(bytePos + 1) === 32) ||
+          (leadChar >= 48 && leadChar <= 57 && /^\d{1,9}[.)] /.test(line.slice(bytePos, bytePos + 12))));
+
+      if (breakKind === 'blank_or_atomic') {
+        carry = false;
+        inBlockquote = false;
+        inList = false;
+        continue;
+      }
+      if (breakKind === 'block_start' || breakKind === 'atx_heading') {
+        carry = false;
+      }
+      inBlockquote = lineStartsWithQuote;
+      if (lineStartsList) inList = true;
+
+      if (carry || !line.includes('`')) {
+        if (breakKind === 'atx_heading') carry = false;
+        continue;
+      }
+
+      const cursors = createMarkdownLineScanCursors();
+      const chunks: string[] = [];
+      let lastIdx = 0;
+      let poisonedLine = false;
+      let i = 0;
+      while (i < line.length) {
+        if (line.charCodeAt(i) === 96 && !isBackslashEscapedAt(line, i)) {
+          const { spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
+          if (spanEnd < 0) {
+            poisonedLine = true;
+            carry = true;
+            break;
+          }
+          if (!isRiskyAdjacentCodeSpanAt(line, i, spanEnd, false) && line.indexOf('<', i) >= 0 && line.indexOf('<', i) < spanEnd) {
+            if (i > lastIdx) chunks.push(line.slice(lastIdx, i));
+            chunks.push(line.slice(i, spanEnd).replace(/</g, '&lt;'));
+            lastIdx = spanEnd;
+          }
+          i = spanEnd;
+          continue;
+        }
+        i++;
+      }
+      if (breakKind === 'atx_heading') carry = false;
+      if (!poisonedLine && lastIdx > 0) {
+        if (lastIdx < line.length) chunks.push(line.slice(lastIdx));
+        lines[li] = chunks.join('');
+        changedAny = true;
+      }
+    }
+    return changedAny ? lines.join('\n') : prose;
+  }
+
   const lines = prose.split('\n');
   const poisoned = computeTickPoisonedLines(lines);
   let sawBracketInPara = false;
@@ -6838,7 +7228,7 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
         return line;
       }
       const cursors = createMarkdownLineScanCursors();
-      let out = '';
+      const chunks: string[] = [];
       let lastIdx = 0;
       let i = 0;
       while (i < line.length) {
@@ -6853,9 +7243,19 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
           }
           const { tickEnd, spanEnd } = scanCodeSpanEndLinear(line, i, cursors);
           if (spanEnd > 0 && !isRiskyAdjacentCodeSpanAt(line, i, spanEnd, sawBracketInPara)) {
-            out += `${line.slice(lastIdx, i)}\u0000EFMDINLINE${stash.push(line.slice(i, spanEnd)) - 1}\u0000`;
+            const spanText = line.slice(i, spanEnd);
+            if (!hasAmpOrDirective || (!spanText.includes('&') && !spanText.includes(':::'))) {
+              if (spanText.includes('<')) {
+                if (i > lastIdx) chunks.push(line.slice(lastIdx, i));
+                chunks.push(spanText.replace(/</g, '&lt;'));
+                lastIdx = spanEnd;
+              }
+            } else {
+              if (i > lastIdx) chunks.push(line.slice(lastIdx, i));
+              chunks.push(`\u0000EFMDINLINE${stash.push(spanText) - 1}\u0000`);
+              lastIdx = spanEnd;
+            }
             i = spanEnd;
-            lastIdx = i;
             continue;
           }
           i = tickEnd;
@@ -6864,9 +7264,43 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
         i++;
       }
       if (breakKind === 'atx_heading') sawBracketInPara = false;
-      return lastIdx === 0 ? line : out + line.slice(lastIdx);
+      if (lastIdx === 0) return line;
+      if (lastIdx < line.length) chunks.push(line.slice(lastIdx));
+      return chunks.join('');
     })
     .join('\n');
+}
+
+function restoreMarkdownInlineCodeSpansLinear(prose: string, stash: readonly string[]): string {
+  const marker = '\u0000EFMDINLINE';
+  let hit = prose.indexOf(marker);
+  if (hit < 0) return prose;
+  const chunks: string[] = [];
+  let last = 0;
+  while (hit >= 0) {
+    const end = prose.indexOf('\u0000', hit + marker.length);
+    if (end < 0) break;
+    if (hit > last) chunks.push(prose.slice(last, hit));
+    let idxNum = 0;
+    let validDigits = end > hit + marker.length;
+    for (let p = hit + marker.length; p < end; p++) {
+      const c = prose.charCodeAt(p);
+      if (c < 48 || c > 57) {
+        validDigits = false;
+        break;
+      }
+      idxNum = idxNum * 10 + (c - 48);
+    }
+    if (validDigits) {
+      chunks.push(stash[idxNum] ?? '');
+    } else {
+      chunks.push(prose.slice(hit, end + 1));
+    }
+    last = end + 1;
+    hit = prose.indexOf(marker, last);
+  }
+  if (last < prose.length) chunks.push(prose.slice(last));
+  return chunks.join('');
 }
 
 function cleanCodeFenceSegment(rawFenceBlock: string): string {
@@ -6957,6 +7391,9 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
   }
 
   const { segments: parts } = recognizeAndHardenMarkdownFences(withoutMintlifyBanner, { harden: true });
+  if (parts.length === 1 && !allowPdfPageMarkers && canFastEscapeCodeSpanOnlyLtInProse(parts[0]!)) {
+    return trimAsciiWhitespaceLinear(parts[0]!.replace(/</g, '&lt;'));
+  }
   const joined = parts
     .map((part, idx) => {
       if (idx % 2 === 1) {
@@ -7181,8 +7618,8 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
                 if (
                   tag.index - curLineStart <= 64 &&
                   curLineEnd - tag.end <= 64 &&
-                  proseWork.slice(curLineStart, tag.index).trim() === '' &&
-                  proseWork.slice(tag.end, curLineEnd).trim() === ''
+                  isAsciiSpaceOrTabOnly(proseWork, curLineStart, tag.index) &&
+                  isAsciiSpaceOrTabOnly(proseWork, tag.end, curLineEnd)
                 ) {
                   const attrs = parseTagAttrs(tag.attrs);
                   const headingTitle = cleanInlineHtml(attrs.title ?? attrs.titletext ?? '');
@@ -7221,7 +7658,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
       }
       proseWork = decodeMarkdownEntitiesPreservingLt(proseWork);
       if (inlineCodeStash.length > 0) {
-        proseWork = proseWork.replace(/\u0000EFMDINLINE(\d+)\u0000/g, (_m, sIdx: string) => inlineCodeStash[Number(sIdx)] ?? '');
+        proseWork = restoreMarkdownInlineCodeSpansLinear(proseWork, inlineCodeStash);
       }
 
       if (proseWork.includes('?') && proseWork.toLowerCase().includes('helpful?')) {
@@ -7244,14 +7681,51 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
 
       const detachedAfterRestore = escapeGfmTaskListCheckboxesLinear(detachBareUrlsFromCodeSpansLinear(proseWork));
       const resolvedProse = sanitizeAndResolveMarkdownProseLinksLinear(detachedAfterRestore, { baseUrl, includeImages: true });
-      const escapedProse = escapeResidualLtPreservingSafeCodeSpansLinear(resolvedProse, allowPdfPageMarkers);
+      const escapedProse = escapeAllResidualLtInProseLinear(resolvedProse, allowPdfPageMarkers);
       const fenceSafeProse = escapeSynthesizedBlockHazardsInProse(escapedProse, idx + 1 < parts.length);
-      return fenceSafeProse.includes('\n\n\n') ? fenceSafeProse.replace(/\n{3,}/g, '\n\n') : fenceSafeProse;
+      const collapsedProse = fenceSafeProse.includes('\n\n\n') ? fenceSafeProse.replace(/\n{3,}/g, '\n\n') : fenceSafeProse;
+      let dedupedProse = dedupeConsecutiveStandaloneLinkParagraphs(collapsedProse);
+
+      // `S4`: Preserve leading/trailing `\n` boundaries adjacent to fenced code blocks even when unclosed `<script>`/`<style>`,
+      // hidden subtrees, or comments truncated to the end/start of `part` so fences ALWAYS start at column 0 on their own line!
+      const mustLeadNl = idx > 0 && part.startsWith('\n');
+      const mustTrailNl = idx + 1 < parts.length && part.endsWith('\n');
+      if (dedupedProse.length === 0) {
+        return mustLeadNl || mustTrailNl ? '\n' : '';
+      }
+      if (mustLeadNl && !dedupedProse.startsWith('\n')) {
+        dedupedProse = `\n${dedupedProse}`;
+      }
+      if (mustTrailNl && !dedupedProse.endsWith('\n')) {
+        dedupedProse = `${dedupedProse}\n`;
+      }
+      return dedupedProse;
     })
-    .map((part, idx) => (idx % 2 === 1 ? part : dedupeConsecutiveStandaloneLinkParagraphs(part)))
     .join('');
 
-  return trimAsciiWhitespaceLinear(joined);
+  // `S4`: Run a second pass of `recognizeAndHardenMarkdownFences` + residual `<` & link escaping outside fences after prose
+  // segment rewriting + trimming so any newly exposed or boundary-shifted fence is guaranteed re-split and re-escaped!
+  const pass1Trimmed = trimAsciiWhitespaceLinear(joined);
+  if (!pass1Trimmed) return '';
+  if (!pass1Trimmed.includes('```') && !pass1Trimmed.includes('~~~')) {
+    return pass1Trimmed;
+  }
+  const { segments: pass2Parts } = recognizeAndHardenMarkdownFences(pass1Trimmed, { harden: true });
+  const pass2Joined = pass2Parts
+    .map((seg, idx) => {
+      if (idx % 2 === 1) {
+        return cleanCodeFenceSegment(seg);
+      }
+      const safeLinks =
+        seg.includes('](') || seg.includes(']:') || seg.includes('//')
+          ? neutralizeAllUnsafeMarkdownLinksLinear(seg)
+          : seg;
+      const safeLt = safeLinks.includes('<') ? escapeAllResidualLtInProseLinear(safeLinks, allowPdfPageMarkers) : safeLinks;
+      return escapeSynthesizedBlockHazardsInProse(safeLt, idx + 1 < pass2Parts.length);
+    })
+    .join('');
+
+  return trimAsciiWhitespaceLinear(pass2Joined);
 }
 
 export function sanitizeInlineHtmlInMarkdown(md: string, baseUrl?: string, allowPdfPageMarkers = false): string {
@@ -9669,7 +10143,7 @@ export async function executeScrapeCall(params: {
   const isPrivateScrape = visibility === 'private' || sanitizeStorageUserId(userId) !== 'owner';
   const putDerivedMarkdownForScrape = async (mdSha: string, mdContent: string, ver = SCRAPE_PIPELINE_VERSION): Promise<void> => {
     if (!env.ARTIFACTS || payload.ephemeral === true) return;
-    primeSanitizedMarkdownCache(mdSha, mdContent, {
+    await primeSanitizedMarkdownCache(mdSha, mdContent, {
       userId,
       privateOnly: isPrivateScrape,
       pipelineVersion: ver,
@@ -9788,13 +10262,7 @@ export async function executeScrapeCall(params: {
       let cachedMarkdownArtifactId: string | undefined;
       if (shaped.truncated && fullCached && payload.ephemeral !== true) {
         const cachedMdSha = await sha256HexString(fullCached);
-        const derivedMdKey = isPrivateScrape
-          ? r2PrivateDerivedKey(userId, hit.pipelineVersion, 'markdown', cachedMdSha)
-          : r2DerivedKey(hit.pipelineVersion, 'markdown', cachedMdSha);
-        const existingMd = await env.ARTIFACTS.head(derivedMdKey).catch(() => null);
-        if (!existingMd) {
-          await putDerivedMarkdownForScrape(cachedMdSha, fullCached, hit.pipelineVersion);
-        }
+        await putDerivedMarkdownForScrape(cachedMdSha, fullCached, hit.pipelineVersion);
         cachedMarkdownArtifactId = `md:${cachedMdSha}`;
       }
       const richHit = hit as Partial<PrivateCachedScrapeRecord>;
@@ -10599,8 +11067,12 @@ export async function executeScrapeCall(params: {
                   ...(sanitizeScrapedMetadataField(formatted.description, 2_000)
                     ? { description: sanitizeScrapedMetadataField(formatted.description, 2_000) }
                     : {}),
-                  ...(formatted.author ? { author: formatted.author } : {}),
-                  ...(formatted.publishedTime ? { publishedTime: formatted.publishedTime } : {}),
+                  ...(sanitizeScrapedMetadataField(formatted.author, 256)
+                    ? { author: sanitizeScrapedMetadataField(formatted.author, 256) }
+                    : {}),
+                  ...(sanitizeScrapedTimestampField(formatted.publishedTime, 128)
+                    ? { publishedTime: sanitizeScrapedTimestampField(formatted.publishedTime, 128) }
+                    : {}),
                   alternateMarkdownUrl: registryTwin.fetchUrl,
                   contentType: twinItem.contentType ?? registryTwin.accept,
                 },
@@ -11697,7 +12169,11 @@ export async function executeScrapeCall(params: {
             renderedViaOut = 'browser-auto';
           }
         }
-      } else if (autoBrowserRes.status === 503 || autoBrowserRes.bodyText.includes('fat_agent_required')) {
+      } else if (
+        autoBrowserRes.status === 503 ||
+        autoBrowserRes.bodyText.includes('browser_worker_required') ||
+        autoBrowserRes.bodyText.includes('fat_agent_required')
+      ) {
         autoBrowserUnavailable = true;
       }
     } catch {
@@ -12408,15 +12884,17 @@ export async function executeScrapeCall(params: {
     }
   } else if (!isPrivateScrape && payload.ephemeral !== true && shaped.truncated && env.ARTIFACTS && rawCleanMarkdown) {
     const usesUpgradedBody = Boolean(alternateMarkdownBody || ocrReportOut || structuredTextFormatted || contentSourceOut || htmlJobPosting);
+    const computedCleanMdSha = await sha256HexString(rawCleanMarkdown);
     const mdContentSha =
       !usesUpgradedBody && art?.contentSha256 && isValidSha256Hex(art.contentSha256)
         ? art.contentSha256
-        : await sha256HexString(rawCleanMarkdown);
+        : computedCleanMdSha;
     try {
-      primeSanitizedMarkdownCache(mdContentSha, rawCleanMarkdown, {
+      await primeSanitizedMarkdownCache(mdContentSha, rawCleanMarkdown, {
         userId,
         privateOnly: false,
         pipelineVersion: SCRAPE_PIPELINE_VERSION,
+        rawSha256: computedCleanMdSha,
       });
       await env.ARTIFACTS.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', mdContentSha), rawCleanMarkdown, {
         httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
@@ -12481,8 +12959,16 @@ export async function executeScrapeCall(params: {
   const adapterReturnedOut = customShopifyDoc?.returned ?? extracted?.returned;
   const adapterTruncatedOut = customShopifyDoc?.truncated ?? extracted?.truncated;
   const adapterNextCursorOut = customShopifyDoc?.nextCursor ?? extracted?.nextCursor;
-  const resolvedAuthor = customShopifyDoc?.author ?? extracted?.author;
-  const resolvedPublishedTime = customShopifyDoc?.publishedTime ?? extracted?.publishedTime ?? htmlJobPosting?.datePosted;
+  const resolvedAuthor = sanitizeScrapedMetadataField(customShopifyDoc?.author ?? extracted?.author, 256);
+  const resolvedPublishedTime = sanitizeScrapedTimestampField(
+    customShopifyDoc?.publishedTime ?? extracted?.publishedTime ?? htmlJobPosting?.datePosted,
+    128,
+  );
+  const resolvedModifiedTime = sanitizeScrapedTimestampField(extracted?.modifiedTime, 128);
+  const resolvedSiteName = sanitizeScrapedMetadataField(
+    extracted?.siteName ?? htmlJobPosting?.hiringOrganization,
+    256,
+  );
 
   const resolvedFavicon = (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon || defaultFaviconForUrl(finalUrl);
   const resolvedContentType = isPdfResponse ? 'application/pdf' : (typeof item.contentType === 'string' ? item.contentType : undefined);
@@ -12646,10 +13132,8 @@ export async function executeScrapeCall(params: {
       ...(resolvedDescription ? { description: resolvedDescription } : {}),
       ...(resolvedAuthor ? { author: resolvedAuthor } : {}),
       ...(resolvedPublishedTime ? { publishedTime: resolvedPublishedTime } : {}),
-      ...(extracted?.modifiedTime ? { modifiedTime: extracted.modifiedTime } : {}),
-      ...(extracted?.siteName || htmlJobPosting?.hiringOrganization
-        ? { siteName: extracted?.siteName ?? htmlJobPosting?.hiringOrganization }
-        : {}),
+      ...(resolvedModifiedTime ? { modifiedTime: resolvedModifiedTime } : {}),
+      ...(resolvedSiteName ? { siteName: resolvedSiteName } : {}),
       ...(resolvedWordCount !== undefined ? { wordCount: resolvedWordCount } : {}),
       ...(extracted?.language ? { language: extracted.language } : {}),
       ...(resolvedFavicon ? { favicon: resolvedFavicon } : {}),

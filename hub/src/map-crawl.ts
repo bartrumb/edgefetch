@@ -38,7 +38,13 @@ import {
   SCRAPE_PIPELINE_VERSION,
   tryParseJsonPayloadForScrape,
 } from './scrape';
-import { COLLECTION_ID_RE, D1FtsSearchIndex, INTERNAL_COLLECTION_ID_RE, resolveUserCollectionId } from './search-index';
+import {
+  COLLECTION_ID_RE,
+  D1FtsSearchIndex,
+  ensureD1ColumnIfMissing,
+  INTERNAL_COLLECTION_ID_RE,
+  resolveUserCollectionId,
+} from './search-index';
 import {
   r2DerivedKey,
   r2PrivateDerivedKey,
@@ -1266,6 +1272,7 @@ function pathAllowed(
 }
 
 const crawlsUserIdMigratedDbs = new WeakSet<object>();
+const crawlsUserIdColumnVerifiedDbs = new WeakSet<object>();
 const privateCrawlPagesMigratedDbs = new WeakSet<object>();
 const memberJobRateWindows = new Map<string, { count: number; resetAt: number }>();
 const MAX_MEMBER_JOBS_PER_MINUTE = 20;
@@ -1279,11 +1286,13 @@ async function sha256HexLocal(input: string): Promise<string> {
 async function ensureCrawlsUserIdColumn(metaDb: D1Database): Promise<void> {
   const key = metaDb as unknown as object;
   if (crawlsUserIdMigratedDbs.has(key)) return;
-  try {
-    await metaDb.prepare("ALTER TABLE crawls ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'").run();
-  } catch {
-    // Column already exists
-  }
+  await ensureD1ColumnIfMissing({
+    db: metaDb,
+    table: 'crawls',
+    column: 'user_id',
+    alterSql: "ALTER TABLE crawls ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
+    cacheSet: crawlsUserIdColumnVerifiedDbs,
+  });
   await metaDb
     .prepare('CREATE INDEX IF NOT EXISTS crawls_user_idx ON crawls(user_id, created_at DESC)')
     .run()

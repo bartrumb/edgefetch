@@ -827,9 +827,11 @@ func (c *Crawler) runRequestWithRedirects(
 		}
 		if c.allow != nil {
 			if err := c.allow(parsedCur); err != nil {
+				outcome := classify.OutcomeBlockedSSRF
 				blockedReason := "ssrf"
 				problem := ssrfProblemFromAllowErr(err)
 				if isSchemeDowngradeRedirect(origReq.URL, hop, parsedCur, c.allow) {
+					outcome = classify.Outcome("blocked")
 					blockedReason = "scheme_downgrade"
 					problem = "HTTPS-to-HTTP redirect downgrade is not permitted"
 				}
@@ -837,7 +839,7 @@ func (c *Crawler) runRequestWithRedirects(
 					ID:            origReq.ID,
 					URL:           origReq.URL,
 					Kind:          origReq.Kind,
-					Outcome:       classify.OutcomeBlockedSSRF,
+					Outcome:       outcome,
 					BlockedReason: blockedReason,
 					Problem:       problem,
 					Attempts:      totalAttempts,
@@ -1443,19 +1445,26 @@ func resolveMaxStreamingPDFBytes(opts Options) int {
 func (c *Crawler) logResult(ctx context.Context, log *slog.Logger, r Request, res Result) {
 	level := slog.LevelInfo
 	switch res.Outcome {
-	case classify.OutcomeChallenge, classify.OutcomeStop, classify.OutcomeRateLimited, classify.OutcomePaymentRequired, classify.OutcomeBlockedSSRF:
+	case classify.OutcomeChallenge, classify.OutcomeStop, classify.OutcomeRateLimited, classify.OutcomePaymentRequired, classify.OutcomeBlockedSSRF, classify.Outcome("blocked"):
 		level = slog.LevelWarn
 	case classify.OutcomeError:
 		level = slog.LevelError
 	}
-	log.Log(ctx, level, "fetch",
+	attrs := []any{
 		slog.String("store", r.ID), slog.String("url", redactURLForLog(r.URL)), slog.String("kind", string(r.Kind)),
-		slog.Int("status", res.Status), slog.String("outcome", string(res.Outcome)), slog.String("problem", RedactEmbeddedURLs(res.Problem)),
+		slog.Int("status", res.Status), slog.String("outcome", string(res.Outcome)),
+	}
+	if res.BlockedReason != "" {
+		attrs = append(attrs, slog.String("blocked_reason", res.BlockedReason))
+	}
+	attrs = append(attrs,
+		slog.String("problem", RedactEmbeddedURLs(res.Problem)),
 		slog.Int("attempts", res.Attempts), slog.Int64("duration_ms", res.DurationMs), slog.Int("bytes", res.Bytes),
 		slog.Bool("truncated", res.Truncated),
 		slog.Int64("dns_ms", res.Timing.DNSMs), slog.Int64("connect_ms", res.Timing.ConnectMs), slog.Int64("tls_ms", res.Timing.TLSMs),
 		slog.Int64("ttfb_ms", res.Timing.TTFBMs), slog.Bool("conn_reused", res.Timing.Reused),
 		slog.String("remote_addr", res.Timing.RemoteAddr), slog.String("proto", res.Timing.Proto))
+	log.Log(ctx, level, "fetch", attrs...)
 }
 
 func (c *Crawler) backoff(ctx context.Context, attempt int) {

@@ -6,15 +6,17 @@
  * vendor-agnostic OTLP trace export) with zero Cloudflare account, zero Postgres, and zero Redis!
  */
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage } from 'node:http';
 import net from 'node:net';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
 import metaMultiUserSql from '../migrations/meta/0002_multiuser.sql';
 import metaRound7Sql from '../migrations/meta/0003_round7_multiuser_hardening.sql';
 import metaRound9Sql from '../migrations/meta/0004_round9_founder_pinning.sql';
+import metaRound10Sql from '../migrations/meta/0005_round10_vault_and_oauth.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
 import { authorizeAgent, isValidSecretMatch } from '../src/auth';
 import { resolveSessionSecret } from '../src/github-auth';
@@ -564,6 +566,75 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         url: (mergedEnv.META_TURSO_URL ?? tursoUrl)!,
         authToken: mergedEnv.META_TURSO_AUTH_TOKEN ?? tursoToken,
       }).asD1Database();
+
+  // Round 10 schema parity (`0005_round10_vault_and_oauth.sql`): idempotently apply `0005` statements and ensure
+  // `secret_version INTEGER NOT NULL DEFAULT 1` exists on `mcp_servers` / `user_mcp_servers` across SQLite & D1.
+  const round10MigrationCandidates = [
+    ...(opts.migrationsDir ? [join(resolve(opts.migrationsDir), 'meta', '0005_round10_vault_and_oauth.sql')] : []),
+    ...(() => {
+      try {
+        return [resolve(dirname(fileURLToPath(import.meta.url)), '../migrations/meta/0005_round10_vault_and_oauth.sql')];
+      } catch {
+        return [];
+      }
+    })(),
+    resolve('migrations/meta/0005_round10_vault_and_oauth.sql'),
+    resolve('hub/migrations/meta/0005_round10_vault_and_oauth.sql'),
+  ];
+  const round10MigrationFile = round10MigrationCandidates.find((p) => existsSync(p));
+  const round10MigrationSql = round10MigrationFile ? readFileSync(round10MigrationFile, 'utf8') : metaRound10Sql;
+
+  if (localMetaDb) {
+    const migKey0005 = 'meta/0005_round10_vault_and_oauth.sql';
+    const has0005 = localMetaDb.db.prepare('SELECT 1 FROM _ef_migrations WHERE name = ?').get(migKey0005);
+    if (!has0005) {
+      for (const rawStmt of round10MigrationSql.split(';')) {
+        const stmt = rawStmt.trim();
+        if (!stmt) continue;
+        try {
+          localMetaDb.db.exec(stmt);
+        } catch {
+          // Idempotent if target table/column already exists or is hosted in coordinator sqlite
+        }
+      }
+      try {
+        localMetaDb.db.prepare('INSERT OR IGNORE INTO _ef_migrations (name) VALUES (?)').run(migKey0005);
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      localMetaDb.db.exec('ALTER TABLE mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1');
+    } catch {
+      // already exists or table absent
+    }
+    try {
+      localMetaDb.db.exec('ALTER TABLE user_mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1');
+    } catch {
+      // already exists or table absent
+    }
+  }
+  const coordRawDb = (coordinator as unknown as { db?: { exec: (sql: string) => void } }).db;
+  if (coordRawDb && typeof coordRawDb.exec === 'function') {
+    try {
+      coordRawDb.exec('ALTER TABLE mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1');
+    } catch {
+      // already exists or table absent
+    }
+    try {
+      coordRawDb.exec('ALTER TABLE user_mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1');
+    } catch {
+      // already exists or table absent
+    }
+  }
+  void metaDb
+    .prepare('ALTER TABLE mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1')
+    .run()
+    .catch(() => {});
+  void metaDb
+    .prepare('ALTER TABLE user_mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1')
+    .run()
+    .catch(() => {});
   const searchDb = localSearchDb
     ? localSearchDb
     : new TursoHttpD1Database({
@@ -830,12 +901,17 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
 
   interface TrackedSocketRecord {
     socket: net.Socket;
+    connSeq: number;
     isLoopback: boolean;
     activeBucket: string;
     establishedBucket: string | null;
     phase: 'preheader' | 'inflight' | 'idle_keepalive' | 'upgraded_ws' | 'closing';
     connectedAt: number;
+    headerDeadlineAt: number;
     idleSince: number;
+    bytesReadAtTurnStart: number;
+    bytesReceivedOnCurrentRequest: number;
+    sawRequestBytes: boolean;
     requestsReceived: number;
     requestsCompleted: number;
     activeResponses: number;
@@ -846,18 +922,20 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     markUpgradedWs: () => void;
   }
 
-  // `R6-H4`, `R7-H8`, `R8-H1` & `R9-H7`:
+  // `R6-H4`, `R7-H8`, `R8-H1`, `R9-H7` & `R10-P1`:
   //  1. Strict loopback (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`) has dedicated reserved socket & pre-header headroom,
-  //     completely isolated from remote connection/pre-header/keep-alive pools so orchestrator `/health` & `/readyz` probes ALWAYS succeed 100/100!
+  //     completely isolated from remote connection/pre-header/keep-alive pools so orchestrator `/health` & `/readyz` probes ALWAYS succeed.
   //  2. ALL live TCP sockets are tracked across `preheader`, `inflight`, `idle_keepalive`, and `upgraded_ws` states.
-  //  3. Idle keep-alive sockets (`idleKeepAliveSockets`) are tracked in LRU order + per-IP established sets (`establishedSocketsByIp`):
-  //     under per-IP (`MAX_ESTABLISHED_SOCKETS_PER_IP = 16`) or global (`>= 128` soft / `256` hard) pressure, newly arriving
-  //     connections synchronously evict idle keep-alive sockets (globally: heaviest established IP first, ties broken by oldest
-  //     idle timestamp; per-IP / shared-NAT: longest-idle / multi-request socket on that IP) so neither 16x64 keep-alive pools
-  //     nor same-NAT squatters can ever lock out legitimate clients!
+  //  3. Pre-header sockets that have already sent request bytes (`sawRequestBytes` / `bytesRead > bytesReadAtTurnStart`) and
+  //     in-flight requests are NEVER evicted under connection pressure before `headersTimeout` / `requestTimeout` expires.
+  //  4. `evictIdleSocketUnderPressure` ranks eligible victims in 3 strict tiers:
+  //     - Tier 1: Zero-byte stalled pre-header sockets (`requestsCompleted === 0 && bytesRead === 0`), highest-churn/count IP or oldest stalled first.
+  //     - Tier 2: Idle keep-alive sockets from over-represented IPs (`ipSocketCount > 2`), picking highest `ipSocketCount` and youngest / lowest-`requestsCompleted` socket first.
+  //     - Tier 3 (1-socket-per-IP tie-break): Evicts newcomers (`requestsCompleted <= 1` and age < 5s) with FEWEST `requestsCompleted` and YOUNGEST `connectedAt` first while protecting established veteran persistent clients (`requestsCompleted >= 2` or age >= 5s with completed requests).
   const activeSocketsByIp = new Map<string, number>();
   const preHeaderSocketsByIp = new Map<string, number>();
   const establishedSocketsByIp = new Map<string, Set<net.Socket>>();
+  const recentConnChurnByIp = new Map<string, { count: number; windowStart: number }>();
   const remotePreHeaderSockets = new Map<
     net.Socket,
     { bucket: string; connectedAt: number; record: TrackedSocketRecord }
@@ -867,6 +945,71 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const trackedSockets = new WeakMap<net.Socket, TrackedSocketRecord>();
   let remoteActiveSockets = 0;
   let loopbackActiveSockets = 0;
+  let nextConnSeq = 0;
+
+  const CHURN_WINDOW_MS = 5_000;
+  const VETERAN_MIN_COMPLETED_REQUESTS = 2;
+  const VETERAN_ESTABLISHED_AGE_MS = 5_000;
+  const VETERAN_RESERVED_INFLIGHT = 32;
+
+  const recordIpConnChurn = (bucket: string, nowMs: number): number => {
+    if (recentConnChurnByIp.size > 4_096) {
+      for (const [k, v] of recentConnChurnByIp) {
+        if (nowMs - v.windowStart > CHURN_WINDOW_MS * 2) {
+          recentConnChurnByIp.delete(k);
+        }
+      }
+      if (recentConnChurnByIp.size > 4_096) recentConnChurnByIp.clear();
+    }
+    const existing = recentConnChurnByIp.get(bucket);
+    if (!existing || nowMs - existing.windowStart >= CHURN_WINDOW_MS) {
+      recentConnChurnByIp.set(bucket, { count: 1, windowStart: nowMs });
+      return 1;
+    }
+    existing.count++;
+    return existing.count;
+  };
+
+  const getRecentIpChurn = (bucket: string, nowMs: number): number => {
+    const entry = recentConnChurnByIp.get(bucket);
+    if (!entry || nowMs - entry.windowStart >= CHURN_WINDOW_MS) return 0;
+    return entry.count;
+  };
+
+  const hasPartialRequestBytes = (rec: TrackedSocketRecord): boolean => {
+    if (rec.sawRequestBytes || rec.bytesReceivedOnCurrentRequest > 0) return true;
+    if ((rec.socket.readableLength ?? 0) > 0) return true;
+    if (rec.socket.bytesRead > rec.bytesReadAtTurnStart) return true;
+    return false;
+  };
+
+  const computeDynamicEstPerIpCap = (): number => {
+    if (hasExplicitMaxEstablishedPerIp) {
+      return maxEstablishedSocketsPerIp;
+    }
+    const headroomEstCap = Math.max(maxEstablishedSocketsPerIp, Math.min(maxConnectionsPerIp, 64, maxTotalSockets));
+    if (trustProxy) {
+      return headroomEstCap;
+    }
+    // Allow shared-address NAT users up to 64 persistent connections when global capacity has headroom;
+    // tighten to maxEstablishedSocketsPerIp (16) under global socket pressure while evicting bloated single-IP hogs first.
+    return remoteActiveSockets < socketPressureThreshold ? headroomEstCap : maxEstablishedSocketsPerIp;
+  };
+
+  const getIpTotalSocketCount = (rec: TrackedSocketRecord): number => {
+    const bKey = rec.establishedBucket ?? rec.activeBucket;
+    return Math.max(
+      establishedSocketsByIp.get(bKey)?.size ?? 0,
+      activeSocketsByIp.get(rec.activeBucket) ?? 1,
+    );
+  };
+
+  const isVeteranKeepAliveSocket = (rec: TrackedSocketRecord, nowMs: number, ipCount: number): boolean => {
+    if (rec.phase !== 'idle_keepalive' || ipCount > 2) return false;
+    if (rec.requestsCompleted >= VETERAN_MIN_COMPLETED_REQUESTS) return true;
+    if (rec.requestsCompleted >= 1 && nowMs - rec.connectedAt >= VETERAN_ESTABLISHED_AGE_MS) return true;
+    return false;
+  };
 
   const addSocketToEstablishedBucket = (rec: TrackedSocketRecord, targetBucket: string) => {
     if (rec.isLoopback || rec.phase === 'closing' || rec.phase === 'upgraded_ws') return;
@@ -931,36 +1074,20 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   };
 
   const evictIdleKeepAliveForBucket = (bucket: string, nowMs = Date.now()): boolean => {
-    let oldestMatch: TrackedSocketRecord | null = null;
-    let multiReqMatch: TrackedSocketRecord | null = null;
-    for (const cand of idleKeepAliveSockets.values()) {
-      if (cand.establishedBucket === bucket || cand.activeBucket === bucket) {
-        if (!oldestMatch) oldestMatch = cand;
-        if (cand.requestsCompleted >= 2) {
-          multiReqMatch = cand;
-          break;
-        }
-      }
-    }
-    const chosen = multiReqMatch ?? oldestMatch;
-    if (!chosen) return false;
-    evictSocketRecord(chosen, nowMs);
-    return true;
-  };
-
-  const evictGlobalIdleKeepAlive = (nowMs = Date.now(), minIdleAgeMs = 0): boolean => {
     let bestVictim: TrackedSocketRecord | null = null;
-    let bestIpCount = -1;
     for (const cand of idleKeepAliveSockets.values()) {
-      if (minIdleAgeMs > 0 && nowMs - cand.idleSince < minIdleAgeMs) continue;
-      const bKey = cand.establishedBucket ?? cand.activeBucket;
-      const ipCount = Math.max(
-        establishedSocketsByIp.get(bKey)?.size ?? 0,
-        activeSocketsByIp.get(cand.activeBucket) ?? 1,
-      );
-      if (ipCount > bestIpCount) {
-        bestIpCount = ipCount;
-        bestVictim = cand;
+      if (cand.phase !== 'idle_keepalive' || cand.activeResponses > 0 || cand.pipelinedWaiting > 0) continue;
+      if (hasPartialRequestBytes(cand)) continue;
+      if (cand.establishedBucket === bucket || cand.activeBucket === bucket) {
+        if (
+          !bestVictim ||
+          cand.requestsCompleted < bestVictim.requestsCompleted ||
+          (cand.requestsCompleted === bestVictim.requestsCompleted &&
+            (cand.connectedAt > bestVictim.connectedAt ||
+              (cand.connectedAt === bestVictim.connectedAt && cand.connSeq > bestVictim.connSeq)))
+        ) {
+          bestVictim = cand;
+        }
       }
     }
     if (!bestVictim) return false;
@@ -968,11 +1095,182 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     return true;
   };
 
+  const countZeroByteRemotePreHeaderSockets = (): number => {
+    let zeroCount = 0;
+    for (const candMeta of remotePreHeaderSockets.values()) {
+      const cand = candMeta.record;
+      if (cand.phase === 'preheader' && cand.requestsCompleted === 0 && !hasPartialRequestBytes(cand)) {
+        zeroCount++;
+      }
+    }
+    return zeroCount;
+  };
+
+  const selectZeroBytePreHeaderVictim = (
+    nowMs: number,
+    arrivingBucket?: string,
+    allowFreshZeroByte = false,
+  ): TrackedSocketRecord | null => {
+    let bestVictim: TrackedSocketRecord | null = null;
+    let bestScore = -1;
+    for (const candMeta of remotePreHeaderSockets.values()) {
+      const cand = candMeta.record;
+      if (cand.phase !== 'preheader' || cand.requestsCompleted > 0 || cand.activeResponses > 0) continue;
+      if (hasPartialRequestBytes(cand)) continue;
+      const ageMs = nowMs - candMeta.connectedAt;
+      const preCount = preHeaderSocketsByIp.get(candMeta.bucket) ?? 1;
+      const actCount = activeSocketsByIp.get(candMeta.bucket) ?? preCount;
+      const churn = getRecentIpChurn(candMeta.bucket, nowMs);
+      const isAged = ageMs >= FRESH_PREHEADER_GRACE_MS;
+      const isOtherMultiSocket = candMeta.bucket !== arrivingBucket && preCount >= 2;
+      if (!isAged && !isOtherMultiSocket && !allowFreshZeroByte) {
+        continue;
+      }
+      // Prefer aged stalled zero-byte sockets and high-count/high-churn IPs, breaking ties by oldest zero-byte socket
+      const agedTierBoost = isAged ? 1_000_000 : 0;
+      const score = agedTierBoost + Math.max(preCount, actCount) * 1_000 + Math.min(999, churn);
+      if (
+        !bestVictim ||
+        score > bestScore ||
+        (score === bestScore &&
+          (cand.connectedAt < bestVictim.connectedAt ||
+            (cand.connectedAt === bestVictim.connectedAt && cand.connSeq < bestVictim.connSeq)))
+      ) {
+        bestVictim = cand;
+        bestScore = score;
+      }
+    }
+    return bestVictim;
+  };
+
+  interface PressureEvictOptions {
+    minIdleAgeMs?: number;
+    arrivingBucket?: string;
+    allowFreshZeroBytePreHeader?: boolean;
+    allowTier3Newcomers?: boolean;
+  }
+
+  const evictIdleSocketUnderPressure = (nowMs = Date.now(), evictOpts: PressureEvictOptions = {}): boolean => {
+    const minIdleAgeMs = evictOpts.minIdleAgeMs ?? 0;
+    const allowFreshZeroByte = evictOpts.allowFreshZeroBytePreHeader ?? false;
+    const allowTier3 = evictOpts.allowTier3Newcomers ?? true;
+
+    // Tier 1: Zero-byte pre-header sockets (`requestsCompleted === 0 && bytesRead === 0`) — never evict partial-byte sockets!
+    const tier1Victim = selectZeroBytePreHeaderVictim(nowMs, evictOpts.arrivingBucket, false);
+    if (tier1Victim) {
+      evictSocketRecord(tier1Victim, nowMs, true);
+      return true;
+    }
+
+    // Tier 2: Idle keep-alive sockets from over-represented IPs (`ipSocketCount > 2`).
+    // Pick the IP with the highest `ipSocketCount`, and within that IP evict its youngest / lowest-`requestsCompleted` idle socket first!
+    let tier2Victim: TrackedSocketRecord | null = null;
+    let tier2IpCount = 2;
+    for (const cand of idleKeepAliveSockets.values()) {
+      if (cand.phase !== 'idle_keepalive' || cand.activeResponses > 0 || cand.pipelinedWaiting > 0) continue;
+      if (hasPartialRequestBytes(cand)) continue;
+      if (minIdleAgeMs > 0 && nowMs - cand.idleSince < minIdleAgeMs) continue;
+      const ipCount = getIpTotalSocketCount(cand);
+      if (ipCount <= 2) continue;
+      if (
+        remoteActiveSockets < maxTotalSockets &&
+        ipCount <= maxEstablishedSocketsPerIp &&
+        cand.requestsCompleted >= VETERAN_MIN_COMPLETED_REQUESTS
+      ) {
+        continue;
+      }
+      if (
+        !tier2Victim ||
+        ipCount > tier2IpCount ||
+        (ipCount === tier2IpCount &&
+          (cand.requestsCompleted < tier2Victim.requestsCompleted ||
+            (cand.requestsCompleted === tier2Victim.requestsCompleted &&
+              (cand.connectedAt > tier2Victim.connectedAt ||
+                (cand.connectedAt === tier2Victim.connectedAt && cand.connSeq > tier2Victim.connSeq)))))
+      ) {
+        tier2Victim = cand;
+        tier2IpCount = ipCount;
+      }
+    }
+    if (tier2Victim) {
+      evictSocketRecord(tier2Victim, nowMs);
+      return true;
+    }
+
+    // Tier 3 (1–2 socket-per-IP tie-break):
+    // Protect veteran persistent keep-alive clients (`requestsCompleted >= 2` or age >= 5s with completed requests) up to
+    // `maxProtectedVeterans` (`75%` of `maxTotalSockets`), and among newcomers (`requestsCompleted <= 1`) evict FEWEST
+    // `requestsCompleted` first and YOUNGEST (`connectedAt` most recent) first!
+    if (allowTier3) {
+      const maxProtectedVeterans = Math.max(16, Math.floor(maxTotalSockets * 0.75));
+      let veteranCount = 0;
+      let newcomerVictim: TrackedSocketRecord | null = null;
+      let excessVeteranVictim: TrackedSocketRecord | null = null;
+
+      for (const cand of idleKeepAliveSockets.values()) {
+        if (cand.phase !== 'idle_keepalive' || cand.activeResponses > 0 || cand.pipelinedWaiting > 0) continue;
+        if (hasPartialRequestBytes(cand)) continue;
+        const ipCount = getIpTotalSocketCount(cand);
+        if (isVeteranKeepAliveSocket(cand, nowMs, ipCount)) {
+          veteranCount++;
+          if (
+            !excessVeteranVictim ||
+            cand.requestsCompleted < excessVeteranVictim.requestsCompleted ||
+            (cand.requestsCompleted === excessVeteranVictim.requestsCompleted &&
+              (cand.connectedAt > excessVeteranVictim.connectedAt ||
+                (cand.connectedAt === excessVeteranVictim.connectedAt && cand.connSeq > excessVeteranVictim.connSeq)))
+          ) {
+            excessVeteranVictim = cand;
+          }
+          continue;
+        }
+        if (minIdleAgeMs > 0 && nowMs - cand.idleSince < minIdleAgeMs) continue;
+        if (
+          !newcomerVictim ||
+          cand.requestsCompleted < newcomerVictim.requestsCompleted ||
+          (cand.requestsCompleted === newcomerVictim.requestsCompleted &&
+            (cand.connectedAt > newcomerVictim.connectedAt ||
+              (cand.connectedAt === newcomerVictim.connectedAt && cand.connSeq > newcomerVictim.connSeq)))
+        ) {
+          newcomerVictim = cand;
+        }
+      }
+
+      if (newcomerVictim) {
+        evictSocketRecord(newcomerVictim, nowMs);
+        return true;
+      }
+
+      if (veteranCount > maxProtectedVeterans && excessVeteranVictim) {
+        evictSocketRecord(excessVeteranVictim, nowMs);
+        return true;
+      }
+    }
+
+    // Hard-cap fallback on fresh zero-byte pre-header churners (`bytesRead === 0` only, NEVER `bytesRead > 0`!)
+    if (allowFreshZeroByte) {
+      const freshZeroVictim = selectZeroBytePreHeaderVictim(nowMs, evictOpts.arrivingBucket, true);
+      if (freshZeroVictim) {
+        evictSocketRecord(freshZeroVictim, nowMs, true);
+        return true;
+      }
+    }
+
+    return false;
+  };
+
   const sweepPressuredIdleSockets = () => {
-    if (remoteActiveSockets < socketPressureThreshold || idleKeepAliveSockets.size === 0) return;
+    if (remoteActiveSockets < socketPressureThreshold) return;
     const nowMs = Date.now();
-    while (remoteActiveSockets >= socketPressureThreshold && idleKeepAliveSockets.size > 0) {
-      if (!evictGlobalIdleKeepAlive(nowMs, PRESSURE_IDLE_EVICT_AGE_MS)) break;
+    while (remoteActiveSockets >= socketPressureThreshold) {
+      if (
+        !evictIdleSocketUnderPressure(nowMs, {
+          minIdleAgeMs: PRESSURE_IDLE_EVICT_AGE_MS,
+          allowTier3Newcomers: remoteActiveSockets >= softGlobalSocketThreshold,
+        })
+      ) {
+        break;
+      }
     }
   };
 
@@ -1147,14 +1445,13 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     }
 
     const clientBucket = normalizeClientRateLimitIp(resolveTrustedClientIp(req, trustProxy, trustFlyClientIp));
-    const effectiveEstCap =
-      !trustProxy || hasExplicitMaxEstablishedPerIp
-        ? maxEstablishedSocketsPerIp
-        : Math.max(maxEstablishedSocketsPerIp, Math.min(64, maxTotalSockets));
 
     if (sockRec) {
       sockRec.activeResponses++;
       sockRec.phase = 'inflight';
+      sockRec.bytesReceivedOnCurrentRequest = 0;
+      sockRec.sawRequestBytes = false;
+      sockRec.headerDeadlineAt = 0;
       idleKeepAliveSockets.delete(reqSocket);
       loopbackIdleKeepAliveSockets.delete(reqSocket);
       if (!sockRec.isLoopback) {
@@ -1191,6 +1488,11 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         } else if (sockRec.activeResponses === 0) {
           sockRec.phase = 'idle_keepalive';
           sockRec.idleSince = Date.now();
+          const bufferedNextBytes = reqSocket.readableLength ?? 0;
+          sockRec.bytesReadAtTurnStart = reqSocket.bytesRead - bufferedNextBytes;
+          sockRec.bytesReceivedOnCurrentRequest = bufferedNextBytes;
+          sockRec.sawRequestBytes = bufferedNextBytes > 0;
+          sockRec.headerDeadlineAt = bufferedNextBytes > 0 ? sockRec.idleSince + headersTimeoutMs : 0;
           if (sockRec.isLoopback) {
             loopbackIdleKeepAliveSockets.delete(reqSocket);
             loopbackIdleKeepAliveSockets.set(reqSocket, sockRec);
@@ -1199,7 +1501,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
             addSocketToEstablishedBucket(sockRec, estKey);
             idleKeepAliveSockets.delete(reqSocket);
             idleKeepAliveSockets.set(reqSocket, sockRec);
-            while ((establishedSocketsByIp.get(estKey)?.size ?? 0) > effectiveEstCap) {
+            const curEstCap = computeDynamicEstPerIpCap();
+            while ((establishedSocketsByIp.get(estKey)?.size ?? 0) > curEstCap) {
               if (!evictIdleKeepAliveForBucket(estKey, sockRec.idleSince)) break;
             }
           }
@@ -1231,7 +1534,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
           establishedSocketsByIp.get(estKey)?.size ?? 0,
           activeSocketsByIp.get(sockRec.activeBucket) ?? 1,
         );
-        if (ipEstCount > effectiveEstCap) {
+        const curEstCap = computeDynamicEstPerIpCap();
+        if (ipEstCount > curEstCap) {
           closeAfterRes = true;
         } else if (remoteActiveSockets >= socketPressureThreshold && ipEstCount > 2) {
           closeAfterRes = true;
@@ -1304,6 +1608,12 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         rawPathname === '/robots.txt');
 
     const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
+    const isEstablishedVeteranTurn = Boolean(
+      sockRec &&
+        !sockRec.isLoopback &&
+        sockRec.requestsCompleted >= VETERAN_MIN_COMPLETED_REQUESTS &&
+        getIpTotalSocketCount(sockRec) <= 2,
+    );
     const effectiveInflightPerIp =
       !hasExplicitMaxInflightPerIp && (hasCallerAuth || isHealthProbe || isPublicDiscoveryRoute)
         ? Math.max(maxInflightPerIp, MAX_PREHEADER_SOCKETS_PER_IP)
@@ -1311,22 +1621,26 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     const hitPerIpLimit = curIpInflight >= effectiveInflightPerIp;
     const hitGlobalLimit = isHealthProbe
       ? totalInflight >= maxInflightTotal + 64
-      : isPublicDiscoveryRoute
-        ? totalInflight >= maxInflightTotal + PUBLIC_DISCOVERY_RESERVED_INFLIGHT ||
-          (!hasCallerAuth &&
-            unauthInflight >= maxUnauthInflight &&
-            publicDiscoveryInflight >= PUBLIC_DISCOVERY_RESERVED_INFLIGHT)
-        : totalInflight >= maxInflightTotal || (!hasCallerAuth && unauthInflight >= maxUnauthInflight);
+      : isEstablishedVeteranTurn
+        ? totalInflight >= maxInflightTotal + VETERAN_RESERVED_INFLIGHT
+        : isPublicDiscoveryRoute
+          ? totalInflight >= maxInflightTotal + PUBLIC_DISCOVERY_RESERVED_INFLIGHT ||
+            (!hasCallerAuth &&
+              unauthInflight >= maxUnauthInflight &&
+              publicDiscoveryInflight >= PUBLIC_DISCOVERY_RESERVED_INFLIGHT)
+          : totalInflight >= maxInflightTotal || (!hasCallerAuth && unauthInflight >= maxUnauthInflight);
 
     if (hitPerIpLimit || hitGlobalLimit) {
       res.statusCode = 429;
-      res.shouldKeepAlive = false;
       res.setHeader('content-type', 'application/json');
       res.setHeader('cache-control', 'no-store');
       res.setHeader('retry-after', '1');
-      res.setHeader('connection', 'close');
       applyNodeSecurityHeaders(res, explicitPublicOrigin?.startsWith('https://') ?? false);
-      forceDestroyReqSocket(req, res);
+      if (!isEstablishedVeteranTurn || !req.complete) {
+        res.shouldKeepAlive = false;
+        res.setHeader('connection', 'close');
+        forceDestroyReqSocket(req, res);
+      }
       endResponseBounded(JSON.stringify({ error: 'too_many_requests', message: 'Too many concurrent in-flight requests' }));
       return;
     }
@@ -1479,11 +1793,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       !trustProxy || hasExplicitMaxConnPerIp
         ? maxConnectionsPerIp
         : Math.max(maxConnectionsPerIp, maxInflightTotal + 32);
-    const effectiveEstPerIpCap =
-      !trustProxy || hasExplicitMaxEstablishedPerIp
-        ? maxEstablishedSocketsPerIp
-        : Math.max(maxEstablishedSocketsPerIp, Math.min(64, maxTotalSockets));
     const nowConnMs = Date.now();
+    const connSeq = ++nextConnSeq;
 
     // Dedicated isolated loopback headroom (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`): never competes with remote sockets!
     if (isStrictLoopbackProbe) {
@@ -1522,12 +1833,17 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       };
       const lbRecord: TrackedSocketRecord = {
         socket,
+        connSeq,
         isLoopback: true,
         activeBucket: '127.0.0.1',
         establishedBucket: null,
         phase: 'preheader',
         connectedAt: nowConnMs,
+        headerDeadlineAt: nowConnMs + headersTimeoutMs,
         idleSince: nowConnMs,
+        bytesReadAtTurnStart: 0,
+        bytesReceivedOnCurrentRequest: 0,
+        sawRequestBytes: false,
         requestsReceived: 0,
         requestsCompleted: 0,
         activeResponses: 0,
@@ -1549,18 +1865,27 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       return;
     }
 
+    recordIpConnChurn(sockBucket, nowConnMs);
+
     const effectivePreHeaderPerIpCap =
       !trustProxy || hasExplicitMaxPreHeaderPerIp
         ? maxPreHeaderPerIp
         : Math.max(maxPreHeaderPerIp, Math.min(128, maxGlobalPreHeaderSockets));
 
-    // 1. Shared-NAT pre-header defense (`R8-M1`): if stalled pre-header sockets on `sockBucket` have filled its per-IP
-    //    pre-header cap, evict the oldest stalled (`>= 50ms`) pre-header socket on `sockBucket`.
+    // 1. Shared-NAT pre-header defense (`R8-M1` + `R10-P1`): if ZERO-BYTE stalled pre-header sockets on `sockBucket`
+    //    have filled its per-IP pre-header cap, evict the oldest zero-byte stalled (`>= 50ms`) pre-header socket on
+    //    `sockBucket`. NEVER evict any pre-header socket that has already sent request bytes (`bytesRead > 0`)!
     while ((preHeaderSocketsByIp.get(sockBucket) ?? 0) >= effectivePreHeaderPerIpCap) {
       let sameIpVictimRec: TrackedSocketRecord | null = null;
       for (const candMeta of remotePreHeaderSockets.values()) {
-        if (candMeta.bucket === sockBucket && nowConnMs - candMeta.connectedAt >= SHARED_NAT_PREHEADER_EVICT_AGE_MS) {
-          sameIpVictimRec = candMeta.record;
+        const candRec = candMeta.record;
+        if (
+          candMeta.bucket === sockBucket &&
+          candRec.requestsCompleted === 0 &&
+          !hasPartialRequestBytes(candRec) &&
+          nowConnMs - candMeta.connectedAt >= SHARED_NAT_PREHEADER_EVICT_AGE_MS
+        ) {
+          sameIpVictimRec = candRec;
           break;
         }
       }
@@ -1571,12 +1896,11 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       evictSocketRecord(sameIpVictimRec, nowConnMs, true);
     }
 
-    // 2. Per-IP & Same-NAT established keep-alive fairness (`R9-H7`):
-    //    Whenever `sockBucket` reaches `effectiveEstPerIpCap` (16) or `effectiveRawPerIpCap` (64), immediately evict an
-    //    idle keep-alive socket on `sockBucket` (preferring sockets that already served multiple requests / longest-idle)
-    //    so a co-tenant behind the same NAT ALWAYS gets a fresh socket!
+    // 2. Per-IP & Shared-NAT established keep-alive fairness (`R9-H7` + `R10-P1`):
+    //    Allows up to 64 persistent connections per shared-NAT IP when global capacity has headroom (< socketPressureThreshold),
+    //    tightening to 16 under global pressure while evicting youngest/lowest-request idle sockets on `sockBucket`.
     while (
-      (establishedSocketsByIp.get(sockBucket)?.size ?? 0) >= effectiveEstPerIpCap ||
+      (establishedSocketsByIp.get(sockBucket)?.size ?? 0) >= computeDynamicEstPerIpCap() ||
       (activeSocketsByIp.get(sockBucket) ?? 0) >= effectiveRawPerIpCap
     ) {
       if (!evictIdleKeepAliveForBucket(sockBucket, nowConnMs)) {
@@ -1584,63 +1908,42 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       }
     }
 
-    // 3. Global keep-alive socket budget (`R9-H7`):
-    //    Whenever total remote sockets reach soft threshold (`>= 128`) or hard budget (`>= 256`), synchronously evict
-    //    the oldest idle keep-alive socket from the IP holding the highest number of established sockets!
-    while (remoteActiveSockets >= softGlobalSocketThreshold && idleKeepAliveSockets.size > 0) {
-      if (!evictGlobalIdleKeepAlive(nowConnMs, 0)) {
-        break;
-      }
-      if (remoteActiveSockets < maxTotalSockets) {
-        // Under soft pressure (`128..255`), evicting 1 idle socket per arriving connection guarantees 1:1 admission
-        // without needlessly tearing down unrelated single-socket clients all at once.
-        break;
-      }
+    // 3. Soft global socket pressure (`>= softGlobalSocketThreshold`):
+    //    1-for-1 eviction via strict 3-tier priority (zero-byte pre-header -> bloated IPs -> youngest newcomers; never veterans!).
+    if (remoteActiveSockets >= softGlobalSocketThreshold && remoteActiveSockets < maxTotalSockets) {
+      evictIdleSocketUnderPressure(nowConnMs, {
+        arrivingBucket: sockBucket,
+        allowFreshZeroBytePreHeader: false,
+        allowTier3Newcomers: true,
+      });
     }
 
-    // 4. Fair global pre-header eviction (`R8-H1`) + hard `maxTotalSockets` pre-header fallback:
-    while (remotePreHeaderSockets.size >= maxGlobalPreHeaderSockets || remoteActiveSockets >= maxTotalSockets) {
-      if (remoteActiveSockets >= maxTotalSockets && evictGlobalIdleKeepAlive(nowConnMs, 0)) {
+    // 4. Hard global zero-byte pre-header / total socket caps (`R10-P1`):
+    //    Pre-header sockets that have already sent request bytes (`bytesRead > 0`) are protected active requests
+    //    counted against `maxTotalSockets` (never evicted before `headersTimeoutMs`), while zero-byte idle pre-header
+    //    sockets are bounded by `maxGlobalPreHeaderSockets`.
+    while (countZeroByteRemotePreHeaderSockets() >= maxGlobalPreHeaderSockets || remoteActiveSockets >= maxTotalSockets) {
+      if (countZeroByteRemotePreHeaderSockets() >= maxGlobalPreHeaderSockets && remoteActiveSockets < maxTotalSockets) {
+        const preVictim =
+          selectZeroBytePreHeaderVictim(nowConnMs, sockBucket, false) ??
+          selectZeroBytePreHeaderVictim(nowConnMs, sockBucket, true);
+        if (!preVictim) {
+          socket.destroy();
+          return;
+        }
+        evictSocketRecord(preVictim, nowConnMs, true);
         continue;
       }
-      let victimRec: TrackedSocketRecord | null = null;
-      let victimBucketCount = 0;
 
-      for (const candMeta of remotePreHeaderSockets.values()) {
-        if (nowConnMs - candMeta.connectedAt >= FRESH_PREHEADER_GRACE_MS) {
-          const bCount = preHeaderSocketsByIp.get(candMeta.bucket) ?? 1;
-          if (!victimRec || bCount > victimBucketCount) {
-            victimRec = candMeta.record;
-            victimBucketCount = bCount;
-          }
-        }
-      }
-
-      if (!victimRec) {
-        let heaviestOtherBucket: string | null = null;
-        let heaviestOtherCount = 1;
-        for (const [bKey, bCount] of preHeaderSocketsByIp) {
-          if (bKey !== sockBucket && bCount > heaviestOtherCount) {
-            heaviestOtherCount = bCount;
-            heaviestOtherBucket = bKey;
-          }
-        }
-        if (heaviestOtherBucket !== null && heaviestOtherCount >= 2) {
-          for (const candMeta of remotePreHeaderSockets.values()) {
-            if (candMeta.bucket === heaviestOtherBucket) {
-              victimRec = candMeta.record;
-              break;
-            }
-          }
-        }
-      }
-
-      if (!victimRec) {
+      const evicted = evictIdleSocketUnderPressure(nowConnMs, {
+        arrivingBucket: sockBucket,
+        allowFreshZeroBytePreHeader: true,
+        allowTier3Newcomers: true,
+      });
+      if (!evicted) {
         socket.destroy();
         return;
       }
-
-      evictSocketRecord(victimRec, nowConnMs, true);
     }
 
     const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
@@ -1655,21 +1958,33 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
 
     let headerPhaseDone = false;
     let socketAccountedClosed = false;
+    let idlePartialHeaderTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearIdlePartialHeaderTimer = () => {
+      if (idlePartialHeaderTimer) {
+        clearTimeout(idlePartialHeaderTimer);
+        idlePartialHeaderTimer = null;
+      }
+    };
+
     const firstByteDeadlineMs = Math.min(headersTimeoutMs, FIRST_BYTE_PREHEADER_TIMEOUT_MS);
     let preHeaderTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
       if (headerPhaseDone) return;
-      if (socket.bytesRead === 0 || headersTimeoutMs <= FIRST_BYTE_PREHEADER_TIMEOUT_MS) {
+      if (!hasPartialRequestBytes(rec) || headersTimeoutMs <= FIRST_BYTE_PREHEADER_TIMEOUT_MS) {
         evictSocketRecord(rec, Date.now(), true);
         return;
       }
+      const remainingMs = Math.max(1, rec.headerDeadlineAt - Date.now());
       preHeaderTimer = setTimeout(() => {
-        evictSocketRecord(rec, Date.now(), true);
-      }, Math.max(1, headersTimeoutMs - firstByteDeadlineMs));
+        if (!headerPhaseDone) {
+          evictSocketRecord(rec, Date.now(), true);
+        }
+      }, remainingMs);
       preHeaderTimer.unref?.();
     }, firstByteDeadlineMs);
     preHeaderTimer.unref?.();
 
     const finishPreHeaderPhase = () => {
+      clearIdlePartialHeaderTimer();
       if (headerPhaseDone) return;
       headerPhaseDone = true;
       if (preHeaderTimer) {
@@ -1682,7 +1997,30 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       else preHeaderSocketsByIp.set(sockBucket, remPre - 1);
     };
 
+    const onRawSocketData = (chunk: Buffer | Uint8Array) => {
+      if (chunk.byteLength <= 0 || rec.phase === 'closing' || rec.phase === 'upgraded_ws') return;
+      if (rec.phase === 'preheader' || rec.phase === 'idle_keepalive') {
+        rec.bytesReceivedOnCurrentRequest += chunk.byteLength;
+        if (!rec.sawRequestBytes) {
+          rec.sawRequestBytes = true;
+          if (rec.phase === 'idle_keepalive') {
+            const nowDataMs = Date.now();
+            rec.headerDeadlineAt = nowDataMs + headersTimeoutMs;
+            clearIdlePartialHeaderTimer();
+            idlePartialHeaderTimer = setTimeout(() => {
+              if (rec.phase === 'idle_keepalive' && rec.sawRequestBytes) {
+                evictSocketRecord(rec, Date.now(), true);
+              }
+            }, headersTimeoutMs);
+            idlePartialHeaderTimer.unref?.();
+          }
+        }
+      }
+    };
+
     const releaseRemoteAccounting = () => {
+      clearIdlePartialHeaderTimer();
+      socket.removeListener('data', onRawSocketData);
       finishPreHeaderPhase();
       removeSocketFromEstablished(rec);
       if (socketAccountedClosed) return;
@@ -1696,12 +2034,17 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
 
     const rec: TrackedSocketRecord = {
       socket,
+      connSeq,
       isLoopback: false,
       activeBucket: sockBucket,
       establishedBucket: null,
       phase: 'preheader',
       connectedAt: nowConnMs,
+      headerDeadlineAt: nowConnMs + headersTimeoutMs,
       idleSince: nowConnMs,
+      bytesReadAtTurnStart: 0,
+      bytesReceivedOnCurrentRequest: 0,
+      sawRequestBytes: false,
       requestsReceived: 0,
       requestsCompleted: 0,
       activeResponses: 0,
@@ -1710,6 +2053,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       finishPreHeader: finishPreHeaderPhase,
       releaseAccounting: releaseRemoteAccounting,
       markUpgradedWs: () => {
+        clearIdlePartialHeaderTimer();
+        socket.removeListener('data', onRawSocketData);
         finishPreHeaderPhase();
         removeSocketFromEstablished(rec);
         if (!socketAccountedClosed) {
@@ -1722,6 +2067,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         rec.phase = 'upgraded_ws';
       },
     };
+    socket.on('data', onRawSocketData);
     trackedSockets.set(socket, rec);
     remotePreHeaderSockets.set(socket, {
       bucket: sockBucket,

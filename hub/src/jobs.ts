@@ -154,8 +154,12 @@ function decodeEntitiesBasic(s: string): string {
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&dollar;/gi, '$')
+    .replace(/&pound;/gi, '£')
+    .replace(/&euro;/gi, '€')
     .replace(/&ndash;/gi, '–')
     .replace(/&mdash;/gi, '—')
+    .replace(/&minus;/gi, '-')
     .replace(/&#x([0-9a-f]+);/gi, (_m, h: string) => {
       const cp = parseInt(h, 16);
       return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : _m;
@@ -234,25 +238,28 @@ export function formatNormalizedPay(pay: NormalizedPay | null | undefined): stri
  */
 export function parsePayFromText(text: string): NormalizedPay | null {
   if (!text) return null;
-  const normalized = decodeEntitiesBasic(text).replace(/\u00a0/g, ' ');
+  const onceDecoded = decodeEntitiesBasic(text);
+  const normalized = (onceDecoded.includes('&') ? decodeEntitiesBasic(onceDecoded) : onceDecoded).replace(/\u00a0/g, ' ');
   const rangeRe =
-    /(?:(USD|CAD|EUR|GBP|AUD|CHF)\s*)?([\$£€])\s*(\d{2,3}(?:,\d{3})+|\d{2,3}(?:\.\d+)?)\s*([kK])?\s*(?:[-–—]|to)\s*(?:(?:USD|CAD|EUR|GBP|AUD|CHF)\s*)?[\$£€]?\s*(\d{2,3}(?:,\d{3})+|\d{2,3}(?:\.\d+)?)\s*([kK])?/g;
+    /(?:(USD|CAD|EUR|GBP|AUD|CHF)\s*)?([\$£€])?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{2,7}(?:\.\d+)?)\s*([kK])?\s*(?:[-–—]|to)\s*(?:(USD|CAD|EUR|GBP|AUD|CHF)\s*)?([\$£€])?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{2,7}(?:\.\d+)?)\s*([kK])?(?:\s*(USD|CAD|EUR|GBP|AUD|CHF)\b)?/gi;
 
   let m: RegExpExecArray | null;
   while ((m = rangeRe.exec(normalized)) !== null) {
+    const explicitCur = (m[1] ?? m[5] ?? m[9])?.toUpperCase();
+    const sym = m[2] ?? m[6];
+    if (!explicitCur && !sym) continue;
+
     const windowStart = Math.max(0, m.index - 90);
     const windowEnd = Math.min(normalized.length, m.index + m[0].length + 90);
     const ctxWindow = normalized.slice(windowStart, windowEnd);
     // Skip funding/ARR/valuation numbers ("raised $150M", "$200K ARR")
     if (/\b(?:arr|mrr|funding|raised|valuation|series\s+[a-f]|revenue)\b/i.test(ctxWindow)) continue;
 
-    const explicitCur = m[1]?.toUpperCase();
-    const sym = m[2];
     const currency = explicitCur || (sym === '£' ? 'GBP' : sym === '€' ? 'EUR' : 'USD');
     const rawMin = parseFloat(m[3]!.replace(/,/g, ''));
     const minHasK = Boolean(m[4]);
-    const rawMax = parseFloat(m[5]!.replace(/,/g, ''));
-    const maxHasK = Boolean(m[6] || m[4]);
+    const rawMax = parseFloat(m[7]!.replace(/,/g, ''));
+    const maxHasK = Boolean(m[8] || (minHasK && rawMax < 1_000));
 
     const period: PayPeriod = /\b(?:per\s+hour|\/\s*hr|hourly)\b/i.test(ctxWindow)
       ? 'hour'
@@ -412,9 +419,32 @@ export function extractJobPostingJsonLd(rawHtml: string, baseUrl?: string, fallb
   let structuredPay: NormalizedPay | null = null;
   const rawSal = (jp.baseSalary ?? (Array.isArray(jp.estimatedSalary) ? jp.estimatedSalary[0] : jp.estimatedSalary)) as
     | Record<string, unknown>
+    | string
+    | number
     | undefined;
-  if (rawSal && typeof rawSal === 'object') {
-    const currency = typeof rawSal.currency === 'string' && rawSal.currency.trim() ? rawSal.currency.trim().toUpperCase() : 'USD';
+  const parseNumericSalField = (v: unknown): number | null => {
+    if (typeof v === 'number') return Number.isFinite(v) && v > 0 ? v : null;
+    if (typeof v === 'string') {
+      const cleaned = v.replace(/[\$£€,\s]/g, '');
+      const n = parseFloat(cleaned);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    }
+    return null;
+  };
+  if (typeof rawSal === 'string') {
+    structuredPay = parsePayFromText(rawSal);
+  } else if (typeof rawSal === 'number' && Number.isFinite(rawSal) && rawSal > 0) {
+    const scaled = scaleShorthandAnnualAmount(rawSal, 'year');
+    if (scaled !== null) {
+      structuredPay = { min: scaled, max: scaled, currency: 'USD', period: 'year', basis: 'base' };
+    }
+  } else if (rawSal && typeof rawSal === 'object') {
+    const currency =
+      typeof rawSal.currency === 'string' && rawSal.currency.trim()
+        ? rawSal.currency.trim().toUpperCase()
+        : typeof rawSal.priceCurrency === 'string' && rawSal.priceCurrency.trim()
+          ? rawSal.priceCurrency.trim().toUpperCase()
+          : 'USD';
     const valObj = rawSal.value as Record<string, unknown> | number | string | undefined;
     let minVal: number | null = null;
     let maxVal: number | null = null;
@@ -423,24 +453,32 @@ export function extractJobPostingJsonLd(rawHtml: string, baseUrl?: string, fallb
       minVal = valObj;
       maxVal = valObj;
     } else if (typeof valObj === 'string') {
-      const n = parseFloat(valObj.replace(/,/g, ''));
-      if (Number.isFinite(n)) {
-        minVal = n;
-        maxVal = n;
+      const parsedStrRange = parsePayFromText(valObj) ?? parsePayFromText(`${currency} ${valObj}`);
+      if (parsedStrRange) {
+        minVal = parsedStrRange.min;
+        maxVal = parsedStrRange.max;
+      } else {
+        const singleNum = parseNumericSalField(valObj);
+        if (singleNum !== null) {
+          minVal = singleNum;
+          maxVal = singleNum;
+        }
       }
     } else if (valObj && typeof valObj === 'object') {
-      const rawMin = Number(valObj.minValue ?? valObj.value ?? NaN);
-      const rawMax = Number(valObj.maxValue ?? valObj.value ?? NaN);
-      if (Number.isFinite(rawMin) && rawMin > 0) minVal = rawMin;
-      if (Number.isFinite(rawMax) && rawMax > 0) maxVal = rawMax;
+      minVal = parseNumericSalField(valObj.minValue ?? valObj.value);
+      maxVal = parseNumericSalField(valObj.maxValue ?? valObj.value);
       if (typeof valObj.unitText === 'string') unitText = valObj.unitText;
+    }
+    if (minVal === null && maxVal === null) {
+      minVal = parseNumericSalField(rawSal.minValue);
+      maxVal = parseNumericSalField(rawSal.maxValue);
     }
     const period = normalizePeriod(unitText || rawSal.unitText);
     minVal = scaleShorthandAnnualAmount(minVal, period);
     maxVal = scaleShorthandAnnualAmount(maxVal, period);
     if (minVal !== null || maxVal !== null) {
       structuredPay = {
-        min: minVal,
+        min: minVal ?? maxVal,
         max: maxVal ?? minVal,
         currency,
         period,
@@ -651,6 +689,113 @@ export function salvageAshbyBoardFromTruncatedJson(raw: string): {
   };
 }
 
+function parseGreenhousePay(job: Record<string, unknown>, extraProse = ''): NormalizedPay | null {
+  const payRanges = Array.isArray(job.pay_input_ranges) ? (job.pay_input_ranges as Array<Record<string, unknown>>) : [];
+  if (payRanges[0] && typeof payRanges[0] === 'object') {
+    const pr = payRanges[0];
+    const cur = typeof pr.currency_type === 'string' && pr.currency_type.trim() ? pr.currency_type.trim().toUpperCase() : 'USD';
+    const rawMinCents = typeof pr.min_cents === 'number' ? pr.min_cents : typeof pr.min_cents === 'string' ? Number(pr.min_cents) : NaN;
+    const rawMaxCents = typeof pr.max_cents === 'number' ? pr.max_cents : typeof pr.max_cents === 'string' ? Number(pr.max_cents) : NaN;
+    const minCents = Number.isFinite(rawMinCents) && rawMinCents > 0 ? Math.round(rawMinCents / 100) : null;
+    const maxCents = Number.isFinite(rawMaxCents) && rawMaxCents > 0 ? Math.round(rawMaxCents / 100) : null;
+    if (minCents !== null || maxCents !== null) {
+      return {
+        min: minCents ?? maxCents,
+        max: maxCents ?? minCents,
+        currency: cur,
+        period: 'year',
+        basis: inferPayBasis(`${String(pr.title ?? '')} ${String(pr.blurb ?? '')}`),
+      };
+    }
+  }
+
+  if (Array.isArray(job.metadata)) {
+    for (const m of job.metadata as Array<Record<string, unknown>>) {
+      const mName = typeof m?.name === 'string' ? m.name : '';
+      if (!/salary|compensation|pay|wage|remuneration|base/i.test(mName)) continue;
+      const mVal = Array.isArray(m?.value) ? m.value.map(String).join(' ') : typeof m?.value === 'string' ? m.value : '';
+      if (mVal) {
+        const fromMeta = parsePayFromText(`${mName}: ${mVal}`);
+        if (fromMeta) return fromMeta;
+      }
+    }
+  }
+
+  const rawContent = typeof job.content === 'string' ? job.content : '';
+  const decodedContent = rawContent ? decodeEntitiesBasic(decodeEntitiesBasic(rawContent.slice(0, 48_000))) : '';
+  const plainContent = decodedContent ? stripTagsPlain(decodedContent) : '';
+  const combined = extraProse ? `${plainContent} ${extraProse}` : plainContent;
+  return combined ? parsePayFromText(combined) : null;
+}
+
+function parseLeverPay(job: Record<string, unknown>, extraProse = ''): NormalizedPay | null {
+  const salObj = job.salaryRange as Record<string, unknown> | undefined;
+  if (salObj && typeof salObj === 'object') {
+    const period = normalizePeriod(salObj.interval ?? 'year');
+    const rawMin = typeof salObj.min === 'number' ? salObj.min : typeof salObj.min === 'string' ? parseFloat(salObj.min.replace(/,/g, '')) : NaN;
+    const rawMax = typeof salObj.max === 'number' ? salObj.max : typeof salObj.max === 'string' ? parseFloat(salObj.max.replace(/,/g, '')) : NaN;
+    const min = scaleShorthandAnnualAmount(Number.isFinite(rawMin) && rawMin > 0 ? rawMin : null, period);
+    const max = scaleShorthandAnnualAmount(Number.isFinite(rawMax) && rawMax > 0 ? rawMax : null, period);
+    if (min !== null || max !== null) {
+      return {
+        min: min ?? max,
+        max: max ?? min,
+        currency: typeof salObj.currency === 'string' && salObj.currency.trim() ? salObj.currency.trim().toUpperCase() : 'USD',
+        period,
+        basis: inferPayBasis(String(job.salaryDescriptionPlain ?? job.salaryDescription ?? '')),
+      };
+    }
+  }
+
+  const textChunks: string[] = [];
+  for (const field of ['salaryDescriptionPlain', 'salaryDescription', 'descriptionPlain', 'additionalPlain']) {
+    const v = job[field];
+    if (typeof v === 'string' && v.trim()) textChunks.push(stripTagsPlain(v.slice(0, 32_000)));
+  }
+  if (Array.isArray(job.lists)) {
+    for (const lst of job.lists as Array<Record<string, unknown>>) {
+      const lText = typeof lst?.text === 'string' ? lst.text : '';
+      const lContent = typeof lst?.content === 'string' ? stripTagsPlain(lst.content.slice(0, 16_000)) : '';
+      if (lText || lContent) textChunks.push(`${lText} ${lContent}`);
+    }
+  }
+  for (const htmlField of ['description', 'additional']) {
+    if (textChunks.length === 0 && typeof job[htmlField] === 'string') {
+      textChunks.push(stripTagsPlain(String(job[htmlField]).slice(0, 32_000)));
+    }
+  }
+  if (extraProse) textChunks.push(extraProse);
+  const combined = textChunks.join('\n');
+  return combined ? parsePayFromText(combined) : null;
+}
+
+function parseRipplingPay(item: Record<string, unknown>, extraProse = ''): NormalizedPay | null {
+  const payDetails = (item.payRangeDetails ?? item.payRange ?? item.compensation) as Record<string, unknown> | Array<Record<string, unknown>> | undefined;
+  const candidate = Array.isArray(payDetails) ? payDetails[0] : payDetails;
+  if (candidate && typeof candidate === 'object') {
+    const period = normalizePeriod(candidate.frequency ?? candidate.interval ?? candidate.period ?? 'year');
+    const rawMin = Number(candidate.min ?? candidate.minValue ?? candidate.minAmount ?? NaN);
+    const rawMax = Number(candidate.max ?? candidate.maxValue ?? candidate.maxAmount ?? NaN);
+    const min = scaleShorthandAnnualAmount(Number.isFinite(rawMin) && rawMin > 0 ? rawMin : null, period);
+    const max = scaleShorthandAnnualAmount(Number.isFinite(rawMax) && rawMax > 0 ? rawMax : null, period);
+    if (min !== null || max !== null) {
+      const cur = typeof candidate.currency === 'string' && candidate.currency.trim()
+        ? candidate.currency.trim().toUpperCase()
+        : typeof candidate.currencyCode === 'string' && candidate.currencyCode.trim()
+          ? candidate.currencyCode.trim().toUpperCase()
+          : 'USD';
+      return {
+        min: min ?? max,
+        max: max ?? min,
+        currency: cur,
+        period,
+        basis: 'base',
+      };
+    }
+  }
+  return extraProse ? parsePayFromText(extraProse) : null;
+}
+
 function inferWorkdayWorkplaceType(remoteType: string, locText: string, title: string): WorkplaceType {
   const explicit = resolveExplicitWorkplaceType(remoteType, '', '');
   if (explicit) return explicit;
@@ -788,31 +933,52 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           const records: StructuredJobRecord[] = [];
           const countLabel = salvaged ? `${total}+` : String(total);
           const lines: string[] = [`# ${orgTitle} — Open Roles (${countLabel})`];
-          for (const j of jobs.slice(reqOffset, reqOffset + 100)) {
+          const maxBoardRecords = 2_500;
+          const maxMarkdownBullets = 120;
+          for (const j of jobs.slice(reqOffset, reqOffset + maxBoardRecords)) {
             const jId = String(j.id ?? '');
             const jTitle = String(j.title ?? 'Role').trim();
             const jLoc = String(j.location ?? '').trim();
-            const descPlain = String(j.descriptionPlain ?? '');
-            const explicitWp = resolveExplicitWorkplaceType(j.workplaceType, '', descPlain);
+            const secLocs = Array.isArray(j.secondaryLocations)
+              ? (j.secondaryLocations as Array<Record<string, unknown> | string>)
+                  .map((s) => (typeof s === 'string' ? s.trim() : String(s?.location ?? '').trim()))
+                  .filter(Boolean)
+              : [];
+            const allLocs = [jLoc, ...secLocs].filter(Boolean);
+            const rawDescPlain = String(j.descriptionPlain ?? '');
+            const descPlain =
+              rawDescPlain ||
+              (typeof j.descriptionHtml === 'string' && j.descriptionHtml
+                ? stripTagsPlain(j.descriptionHtml.slice(0, 12_000))
+                : '');
+            const explicitWp = resolveExplicitWorkplaceType(j.workplaceType, '', descPlain.slice(0, 16_000));
             const wp: WorkplaceType =
-              explicitWp ?? (j.isRemote === true ? 'remote' : inferWorkplaceType(`${jLoc} ${jTitle}`));
-            const pay = parseAshbyPay(j, descPlain);
+              explicitWp ?? (j.isRemote === true ? 'remote' : inferWorkplaceType(`${allLocs.join(' ')} ${jTitle}`));
+            const pay = parseAshbyPay(j, descPlain.slice(0, 24_000));
             const jUrl = typeof j.jobUrl === 'string' && j.jobUrl ? j.jobUrl : `https://jobs.ashbyhq.com/${org}/${jId}`;
             const applyUrl = typeof j.applyUrl === 'string' && j.applyUrl ? j.applyUrl : `${jUrl}/application`;
             const postedAt = typeof j.publishedAt === 'string' ? j.publishedAt : null;
+            const empType = typeof j.employmentType === 'string' && j.employmentType ? j.employmentType : undefined;
             records.push({
               title: jTitle,
               company: orgTitle,
               url: jUrl,
               applyUrl,
               workplaceType: wp,
-              locations: jLoc ? [jLoc] : [],
+              locations: allLocs,
               pay,
               postedAt,
+              ...(empType ? { employmentType: empType } : {}),
               source: 'ashby',
+              ...(descPlain ? { snippet: descPlain.slice(0, 240) } : {}),
             });
-            const meta = [jLoc, wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : ''].filter(Boolean).join(' · ');
-            lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
+            if (lines.length - 1 < maxMarkdownBullets) {
+              const meta = [allLocs[0] ?? '', wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : ''].filter(Boolean).join(' · ');
+              lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
+            }
+          }
+          if (records.length > maxMarkdownBullets) {
+            lines.push(`- *... and ${records.length - maxMarkdownBullets} additional open roles*`);
           }
           const returned = records.length;
           const truncated = salvaged || total > reqOffset + returned;
@@ -832,17 +998,25 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
     }
   }
 
-  // P2: Workday CXS (`{tenant}.wd{N}.myworkdayjobs.com/[{locale}/]{site}[/job/{externalPath}]`)
+  // P2: Workday CXS (`{tenant}.wd{N}.myworkdayjobs.com/[{locale}/]{site}[/job/{externalPath}]` or `/wday/cxs/{tenant}/{site}/jobs`)
   const wdHostMatch = /^([a-z0-9-]+)\.(?:wd\d+\.)?myworkday(?:jobs|site)\.com$/i.exec(host);
   if (wdHostMatch && parts.length >= 1) {
-    const tenant = wdHostMatch[1]!;
-    let idx = 0;
-    if (/^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(parts[0]!) && parts.length >= 2) {
-      idx = 1; // skip locale segment like `en-US`
+    let tenant = wdHostMatch[1]!;
+    let site = '';
+    let rest: string[] = [];
+    if (parts[0]?.toLowerCase() === 'wday' && parts[1]?.toLowerCase() === 'cxs' && parts.length >= 4) {
+      tenant = parts[2] || tenant;
+      site = parts[3]!;
+      rest = parts.slice(4);
+    } else {
+      let idx = 0;
+      if (/^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(parts[0]!) && parts.length >= 2) {
+        idx = 1; // skip locale segment like `en-US`
+      }
+      site = parts[idx] ?? '';
+      rest = parts.slice(idx + 1);
     }
-    const site = parts[idx]!;
-    const rest = parts.slice(idx + 1);
-    if (site && site.toLowerCase() !== 'wday') {
+    if (site && site.toLowerCase() !== 'wday' && /^[A-Za-z0-9_.-]{1,120}$/.test(site)) {
       if (rest[0] === 'job' && rest.length >= 2) {
         const extPath = rest.slice(1).join('/');
         return {
@@ -980,7 +1154,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
               : jobs.length;
           const records: StructuredJobRecord[] = [];
           const links: string[] = [];
-          for (const j of jobs.slice(0, 2000)) {
+          for (const j of jobs.slice(0, 2500)) {
             const jUrl =
               typeof j.absolute_url === 'string' && j.absolute_url.startsWith('https://')
                 ? j.absolute_url
@@ -988,7 +1162,9 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             links.push(jUrl);
           }
           const lines: string[] = [`# ${co} — Greenhouse Job Board (${total} open roles)`];
-          for (const j of jobs.slice(reqOffset, reqOffset + 120)) {
+          const maxBoardRecords = 2_500;
+          const maxMarkdownBullets = 120;
+          for (const j of jobs.slice(reqOffset, reqOffset + maxBoardRecords)) {
             const jTitle = String(j.title ?? '').trim();
             if (!jTitle) continue;
             const loc = String((j.location as Record<string, unknown> | undefined)?.name ?? '').trim();
@@ -996,13 +1172,17 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
               typeof j.absolute_url === 'string' && j.absolute_url.startsWith('https://')
                 ? j.absolute_url
                 : `https://${host}/${co}/jobs/${String(j.id ?? '')}`;
-            const wp = inferWorkplaceType(`${loc} ${jTitle}`);
-            const rawDesc = typeof j.content === 'string' ? decodeEntitiesBasic(j.content) : '';
-            const pay = parsePayFromText(stripTagsPlain(rawDesc));
-            const postedAt = typeof j.updated_at === 'string' ? j.updated_at : null;
+            const rawContent = typeof j.content === 'string' ? j.content : '';
+            const plainPreview = rawContent
+              ? stripTagsPlain(decodeEntitiesBasic(decodeEntitiesBasic(rawContent.slice(0, 12_000))))
+              : '';
+            const wp = inferWorkplaceType(`${loc} ${jTitle} ${plainPreview.slice(0, 320)}`);
+            const pay = parseGreenhousePay(j);
+            const postedAt = typeof j.updated_at === 'string' ? j.updated_at : typeof j.first_published === 'string' ? j.first_published : null;
+            const companyName = typeof j.company_name === 'string' && j.company_name.trim() ? j.company_name.trim() : co;
             records.push({
               title: jTitle,
-              company: co,
+              company: companyName,
               url: jUrl,
               applyUrl: jUrl,
               workplaceType: wp,
@@ -1010,9 +1190,15 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
               pay,
               postedAt,
               source: 'greenhouse',
+              ...(plainPreview ? { snippet: plainPreview.slice(0, 240) } : {}),
             });
-            const meta = [loc, wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : ''].filter(Boolean).join(' · ');
-            lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
+            if (lines.length - 1 < maxMarkdownBullets) {
+              const meta = [loc, wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : ''].filter(Boolean).join(' · ');
+              lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
+            }
+          }
+          if (records.length > maxMarkdownBullets) {
+            lines.push(`- *... and ${records.length - maxMarkdownBullets} additional open roles*`);
           }
           const returned = records.length;
           const nextOffsetVal = reqOffset + returned;
@@ -1046,27 +1232,9 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const companyName = typeof data.company_name === 'string' && data.company_name ? data.company_name : co;
             const locObj = data.location as { name?: string } | undefined;
             const loc = typeof locObj?.name === 'string' ? locObj.name.trim() : '';
-            const rawContent = typeof data.content === 'string' ? decodeEntitiesBasic(data.content) : '';
+            const rawContent = typeof data.content === 'string' ? decodeEntitiesBasic(decodeEntitiesBasic(data.content)) : '';
             const bodyMd = rawContent ? htmlToMd(rawContent, origUrl).markdown.trim() : '';
-
-            let pay: NormalizedPay | null = null;
-            const payRanges = Array.isArray(data.pay_input_ranges) ? (data.pay_input_ranges as Array<Record<string, unknown>>) : [];
-            if (payRanges[0]) {
-              const pr = payRanges[0];
-              const cur = typeof pr.currency_type === 'string' ? pr.currency_type.toUpperCase() : 'USD';
-              const minCents = typeof pr.min_cents === 'number' ? Math.round(pr.min_cents / 100) : null;
-              const maxCents = typeof pr.max_cents === 'number' ? Math.round(pr.max_cents / 100) : null;
-              if (minCents || maxCents) {
-                pay = {
-                  min: minCents,
-                  max: maxCents ?? minCents,
-                  currency: cur,
-                  period: 'year',
-                  basis: inferPayBasis(`${String(pr.title ?? '')} ${String(pr.blurb ?? '')}`),
-                };
-              }
-            }
-            if (!pay) pay = parsePayFromText(bodyMd);
+            const pay = parseGreenhousePay(data, bodyMd);
 
             const updatedAt = typeof data.updated_at === 'string' ? data.updated_at : typeof data.first_published === 'string' ? data.first_published : undefined;
             const absUrl = typeof data.absolute_url === 'string' && data.absolute_url.startsWith('http') ? data.absolute_url : origUrl;
@@ -1103,6 +1271,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
     const leverApiHost = host === 'jobs.eu.lever.co' ? 'api.eu.lever.co' : 'api.lever.co';
     const co = parts[0]!;
     if (parts.length === 1 && /^[A-Za-z0-9_.-]+$/.test(co)) {
+      const reqOffset = Math.max(0, parseInt(u.searchParams.get('offset') ?? '0', 10) || 0);
       return {
         id: host === 'jobs.eu.lever.co' ? 'lever-eu-board' : 'lever-board',
         fetchUrl: `https://${leverApiHost}/v0/postings/${encodeURIComponent(co)}?mode=json`,
@@ -1116,12 +1285,14 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           const total = jobs.length;
           const records: StructuredJobRecord[] = [];
           const links: string[] = [];
-          for (const j of jobs.slice(0, 2000)) {
+          for (const j of jobs.slice(0, 2500)) {
             const jUrl = typeof j.hostedUrl === 'string' && j.hostedUrl.startsWith('https://') ? j.hostedUrl : `https://${host}/${co}/${String(j.id ?? '')}`;
             links.push(jUrl);
           }
           const lines: string[] = [`# ${co} — Lever Job Board (${total} open roles)`];
-          for (const j of jobs.slice(0, 120)) {
+          const maxBoardRecords = 2_500;
+          const maxMarkdownBullets = 120;
+          for (const j of jobs.slice(reqOffset, reqOffset + maxBoardRecords)) {
             const jTitle = String(j.text ?? '').trim();
             if (!jTitle) continue;
             const cats = (j.categories as Record<string, unknown> | undefined) ?? {};
@@ -1134,6 +1305,10 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const jUrl = typeof j.hostedUrl === 'string' && j.hostedUrl.startsWith('https://') ? j.hostedUrl : `https://${host}/${co}/${String(j.id ?? '')}`;
             const applyUrl = typeof j.applyUrl === 'string' && j.applyUrl.startsWith('https://') ? j.applyUrl : `${jUrl}/apply`;
             const createdIso = typeof j.createdAt === 'number' ? new Date(j.createdAt).toISOString() : null;
+            const pay = parseLeverPay(j);
+            const descSnippet = typeof j.descriptionPlain === 'string' && j.descriptionPlain.trim()
+              ? j.descriptionPlain.trim().slice(0, 240)
+              : undefined;
             records.push({
               title: jTitle,
               company: co,
@@ -1141,15 +1316,21 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
               applyUrl,
               workplaceType: wp,
               locations: allLocs,
-              pay: parsePayFromText(String(j.salaryDescriptionPlain ?? '')),
+              pay,
               postedAt: createdIso,
               source: 'lever',
+              ...(descSnippet ? { snippet: descSnippet } : {}),
             });
-            const meta = [allLocs[0] ?? '', wp !== 'unknown' ? wp : ''].filter(Boolean).join(' · ');
-            lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
+            if (lines.length - 1 < maxMarkdownBullets) {
+              const meta = [allLocs[0] ?? '', wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : ''].filter(Boolean).join(' · ');
+              lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
+            }
+          }
+          if (records.length > maxMarkdownBullets) {
+            lines.push(`- *... and ${records.length - maxMarkdownBullets} additional open roles*`);
           }
           const returned = records.length;
-          const truncated = total > returned;
+          const truncated = total > reqOffset + returned;
           return {
             title: `${co} Jobs (${total})`,
             markdown: lines.join('\n'),
@@ -1158,7 +1339,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             total,
             returned,
             truncated,
-            ...(truncated ? { nextCursor: String(jobs[returned - 1]?.id ?? returned) } : {}),
+            ...(truncated ? { nextCursor: String(reqOffset + returned) } : {}),
           };
         },
       };
@@ -1185,23 +1366,6 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           const wpRaw = `${String(data.workplaceType ?? '')} ${allLocs.join(' ')}`;
           const wp = inferWorkplaceType(wpRaw);
 
-          const salObj = data.salaryRange as Record<string, unknown> | undefined;
-          let pay: NormalizedPay | null = null;
-          if (salObj && typeof salObj === 'object') {
-            const period = normalizePeriod(salObj.interval ?? 'year');
-            const min = scaleShorthandAnnualAmount(typeof salObj.min === 'number' ? salObj.min : null, period);
-            const max = scaleShorthandAnnualAmount(typeof salObj.max === 'number' ? salObj.max : null, period);
-            if (min !== null || max !== null) {
-              pay = {
-                min,
-                max: max ?? min,
-                currency: typeof salObj.currency === 'string' ? salObj.currency.toUpperCase() : 'USD',
-                period,
-                basis: inferPayBasis(String(data.salaryDescriptionPlain ?? '')),
-              };
-            }
-          }
-
           const descParts: string[] = [];
           const introHtml = typeof data.description === 'string' ? data.description : '';
           if (introHtml) descParts.push(htmlToMd(introHtml, origUrl).markdown.trim());
@@ -1214,7 +1378,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           const addHtml = typeof data.additional === 'string' ? data.additional : '';
           if (addHtml) descParts.push(htmlToMd(addHtml, origUrl).markdown.trim());
           const bodyMd = descParts.filter(Boolean).join('\n\n');
-          if (!pay) pay = parsePayFromText(`${String(data.salaryDescriptionPlain ?? '')} ${bodyMd}`);
+          const pay = parseLeverPay(data, bodyMd);
 
           const createdMs = typeof data.createdAt === 'number' ? new Date(data.createdAt).toISOString() : undefined;
           const applyUrl = typeof data.applyUrl === 'string' && data.applyUrl.startsWith('http') ? data.applyUrl : `${origUrl.replace(/\/+$/, '')}/apply`;
@@ -1389,7 +1553,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
         const records: StructuredJobRecord[] = [];
         const links: string[] = [];
         const lines = [`# ${org} — Gem Job Board (${posts.length} open roles)`];
-        for (const p of posts.slice(0, 100)) {
+        for (const p of posts.slice(0, 2_500)) {
           const pTitle = String(p.title ?? '').trim();
           if (!pTitle) continue;
           const loc = String((p.location as Record<string, unknown> | undefined)?.name ?? '').trim();
@@ -1407,68 +1571,166 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             postedAt: typeof p.first_published_at === 'string' ? p.first_published_at : null,
             source: 'gem',
           });
-          lines.push(`- **[${pTitle}](${pUrl})**${loc ? ` — ${loc}` : ''}`);
+          if (lines.length - 1 < 120) {
+            lines.push(`- **[${pTitle}](${pUrl})**${loc ? ` — ${loc}` : ''}`);
+          }
         }
         return { title: `${org} Jobs (${records.length})`, markdown: lines.join('\n'), links, jobs: records };
       },
     };
   }
 
-  // Rippling (`ats.rippling.com/[locale/]<org>/jobs` — merge rows by `uuid`!)
+  // Rippling (`ats.rippling.com/[locale/]<org>/jobs[/<uuid>]` — merge rows by `uuid` & resolve single job via public API!)
   if (host === 'ats.rippling.com' && parts.length >= 1) {
     const idx = /^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(parts[0]!) && parts.length >= 2 ? 1 : 0;
     const org = parts[idx]!;
     const rest = parts.slice(idx + 1);
-    if (org && /^[A-Za-z0-9_-]{1,80}$/.test(org) && (rest.length === 0 || (rest.length === 1 && rest[0] === 'jobs'))) {
-      return {
-        id: 'rippling-board',
-        fetchUrl: `https://api.rippling.com/platform/api/ats/v1/board/${encodeURIComponent(org)}/jobs`,
-        method: 'GET',
-        kind: 'json',
-        accept: 'application/json',
-        format: (rawBody) => {
-          const parsed = safeJsonParse(rawBody);
-          const items = Array.isArray(parsed)
-            ? (parsed as Array<Record<string, unknown>>)
-            : Array.isArray((parsed as Record<string, unknown> | undefined)?.results)
-              ? ((parsed as Record<string, unknown>).results as Array<Record<string, unknown>>)
-              : null;
-          if (!items) return null;
-          const byUuid = new Map<string, StructuredJobRecord>();
-          for (const item of items) {
-            const uuid = String(item.uuid || item.id || '').trim();
-            const jTitle = String(item.name || item.title || '').trim();
-            if (!uuid || !jTitle) continue;
-            const workLoc = item.workLocation as Record<string, unknown> | string | undefined;
-            const locLabel = typeof workLoc === 'string' ? workLoc : typeof workLoc?.label === 'string' ? workLoc.label : '';
-            const jUrl = typeof item.url === 'string' && item.url.startsWith('https://') ? item.url : `https://ats.rippling.com/${org}/jobs/${uuid}`;
-            const existing = byUuid.get(uuid);
-            if (existing) {
-              if (locLabel && !existing.locations.includes(locLabel)) existing.locations.push(locLabel);
-              if (/remote/i.test(locLabel)) existing.workplaceType = 'remote';
-            } else {
-              byUuid.set(uuid, {
-                title: jTitle,
-                company: org,
-                url: jUrl,
-                applyUrl: jUrl,
-                workplaceType: inferWorkplaceType(`${locLabel} ${jTitle}`),
-                locations: locLabel ? [locLabel] : [],
-                pay: null,
-                postedAt: null,
-                source: 'rippling',
-              });
+    if (org && /^[A-Za-z0-9_-]{1,80}$/.test(org)) {
+      if (rest.length === 0 || (rest.length === 1 && rest[0] === 'jobs')) {
+        return {
+          id: 'rippling-board',
+          fetchUrl: `https://api.rippling.com/platform/api/ats/v1/board/${encodeURIComponent(org)}/jobs`,
+          method: 'GET',
+          kind: 'json',
+          accept: 'application/json',
+          format: (rawBody) => {
+            const parsed = safeJsonParse(rawBody);
+            const items = Array.isArray(parsed)
+              ? (parsed as Array<Record<string, unknown>>)
+              : Array.isArray((parsed as Record<string, unknown> | undefined)?.results)
+                ? ((parsed as Record<string, unknown>).results as Array<Record<string, unknown>>)
+                : null;
+            if (!items) return null;
+            const byUuid = new Map<string, StructuredJobRecord>();
+            for (const item of items) {
+              const uuid = String(item.uuid || item.id || '').trim();
+              const jTitle = String(item.name || item.title || '').trim();
+              if (!uuid || !jTitle) continue;
+              const workLoc = item.workLocation as Record<string, unknown> | string | undefined;
+              const workLocsArr = Array.isArray(item.workLocations) ? item.workLocations : [];
+              const locLabel =
+                typeof workLoc === 'string'
+                  ? workLoc
+                  : typeof workLoc?.label === 'string'
+                    ? workLoc.label
+                    : workLocsArr
+                        .map((wl) => (typeof wl === 'string' ? wl : typeof (wl as { label?: string })?.label === 'string' ? (wl as { label: string }).label : ''))
+                        .filter(Boolean)
+                        .join('; ');
+              const jUrl = typeof item.url === 'string' && item.url.startsWith('https://') ? item.url : `https://ats.rippling.com/${org}/jobs/${uuid}`;
+              const createdAt = typeof item.createdOn === 'string' ? item.createdOn : typeof item.publishedAt === 'string' ? item.publishedAt : null;
+              const existing = byUuid.get(uuid);
+              if (existing) {
+                if (locLabel && !existing.locations.includes(locLabel)) existing.locations.push(locLabel);
+                if (/remote/i.test(locLabel)) existing.workplaceType = 'remote';
+              } else {
+                byUuid.set(uuid, {
+                  title: jTitle,
+                  company: org,
+                  url: jUrl,
+                  applyUrl: jUrl,
+                  workplaceType: inferWorkplaceType(`${locLabel} ${jTitle}`),
+                  locations: locLabel ? [locLabel] : [],
+                  pay: parseRipplingPay(item),
+                  postedAt: createdAt,
+                  source: 'rippling',
+                });
+              }
             }
-          }
-          const records = [...byUuid.values()];
-          const links = records.map((r) => r.url);
-          const lines = [`# ${org} — Rippling Job Board (${records.length} open roles)`];
-          for (const r of records) {
-            lines.push(`- **[${r.title}](${r.url})**${r.locations.length > 0 ? ` — ${r.locations.join('; ')}` : ''}`);
-          }
-          return { title: `${org} Jobs (${records.length})`, markdown: lines.join('\n'), links, jobs: records };
-        },
-      };
+            const records = [...byUuid.values()];
+            const links = records.map((r) => r.url);
+            const lines = [`# ${org} — Rippling Job Board (${records.length} open roles)`];
+            for (const r of records.slice(0, 120)) {
+              lines.push(`- **[${r.title}](${r.url})**${r.locations.length > 0 ? ` — ${r.locations.join('; ')}` : ''}`);
+            }
+            return {
+              title: `${org} Jobs (${records.length})`,
+              markdown: lines.join('\n'),
+              links,
+              jobs: records,
+              total: records.length,
+              returned: records.length,
+              truncated: false,
+            };
+          },
+        };
+      }
+      if (rest.length >= 2 && rest[0] === 'jobs' && /^[A-Za-z0-9_-]{6,64}$/.test(rest[1]!)) {
+        const uuid = rest[1]!;
+        return {
+          id: 'rippling-job',
+          fetchUrl: `https://api.rippling.com/platform/api/ats/v1/board/${encodeURIComponent(org)}/jobs/${encodeURIComponent(uuid)}`,
+          method: 'GET',
+          kind: 'json',
+          accept: 'application/json',
+          format: (rawBody, origUrl, htmlToMd) => {
+            const parsed = safeJsonParse(rawBody);
+            const data = Array.isArray(parsed)
+              ? (parsed as Array<Record<string, unknown>>).find(
+                  (it) => String(it?.uuid ?? it?.id ?? '').toLowerCase() === uuid.toLowerCase(),
+                ) ?? null
+              : parsed && typeof parsed === 'object'
+                ? (parsed as Record<string, unknown>)
+                : null;
+            if (!data) return null;
+            const title = String(data.name ?? data.title ?? '').trim();
+            if (!title) return null;
+            const companyName =
+              typeof data.companyName === 'string' && data.companyName.trim() ? data.companyName.trim() : org;
+            const locs: string[] = [];
+            const workLoc = data.workLocation as Record<string, unknown> | string | undefined;
+            if (typeof workLoc === 'string') {
+              if (workLoc.trim()) locs.push(workLoc.trim());
+            } else if (workLoc && typeof workLoc === 'object' && typeof workLoc.label === 'string' && workLoc.label.trim()) {
+              locs.push(workLoc.label.trim());
+            }
+            if (Array.isArray(data.workLocations)) {
+              for (const wl of data.workLocations) {
+                const lbl = typeof wl === 'string' ? wl.trim() : typeof (wl as { label?: string })?.label === 'string' ? (wl as { label: string }).label.trim() : '';
+                if (lbl && !locs.includes(lbl)) locs.push(lbl);
+              }
+            }
+            const descObj = data.description as Record<string, unknown> | string | undefined;
+            const descParts: string[] = [];
+            if (typeof descObj === 'string' && descObj.trim()) {
+              descParts.push(htmlToMd(descObj, origUrl).markdown.trim());
+            } else if (descObj && typeof descObj === 'object') {
+              for (const k of ['company', 'role']) {
+                const htmlPart = descObj[k];
+                if (typeof htmlPart === 'string' && htmlPart.trim()) {
+                  descParts.push(htmlToMd(htmlPart, origUrl).markdown.trim());
+                }
+              }
+            }
+            const bodyMd = descParts.filter(Boolean).join('\n\n');
+            const pay = parseRipplingPay(data, bodyMd);
+            const wp = inferWorkplaceType(`${locs.join(' ')} ${title} ${bodyMd.slice(0, 400)}`);
+            const postedAt = typeof data.createdOn === 'string' ? data.createdOn : typeof data.publishedAt === 'string' ? data.publishedAt : undefined;
+            const jobUrl = typeof data.url === 'string' && data.url.startsWith('https://') ? data.url : origUrl;
+
+            const jp: StructuredJobPosting = {
+              title,
+              hiringOrganization: companyName,
+              ...(locs.length > 0 ? { jobLocation: locs } : {}),
+              workplaceType: wp,
+              baseSalary: pay?.basis === 'base' ? pay : null,
+              pay,
+              ...(postedAt ? { datePosted: postedAt } : {}),
+              url: origUrl,
+              applyUrl: jobUrl,
+              source: 'rippling',
+            };
+            const headerMd = formatJobPostingHeaderMarkdown(jp);
+            return {
+              title: `${title} @ ${companyName}`,
+              ...(postedAt ? { publishedTime: postedAt } : {}),
+              jobPosting: jp,
+              markdown: [`# ${title} @ ${companyName}`, ...(headerMd ? [headerMd] : []), bodyMd].filter(Boolean).join('\n\n'),
+              links: [jobUrl],
+            };
+          },
+        };
+      }
     }
   }
 
@@ -1878,33 +2140,10 @@ export function chunkJsonRecords(params: {
     let pay: NormalizedPay | null = null;
     if (rec.compensation) {
       pay = parseAshbyPay(rec, String(rec.descriptionPlain ?? ''));
-    } else if (rec.salaryRange && typeof rec.salaryRange === 'object') {
-      const sr = rec.salaryRange as Record<string, unknown>;
-      const period = normalizePeriod(sr.interval ?? 'year');
-      const min = scaleShorthandAnnualAmount(typeof sr.min === 'number' ? sr.min : null, period);
-      const max = scaleShorthandAnnualAmount(typeof sr.max === 'number' ? sr.max : null, period);
-      if (min !== null || max !== null) {
-        pay = {
-          min,
-          max: max ?? min,
-          currency: typeof sr.currency === 'string' && sr.currency ? sr.currency.toUpperCase() : 'USD',
-          period,
-          basis: inferPayBasis(String(rec.salaryDescriptionPlain ?? '')),
-        };
-      }
-    } else if (Array.isArray(rec.pay_input_ranges) && rec.pay_input_ranges[0] && typeof rec.pay_input_ranges[0] === 'object') {
-      const pr = rec.pay_input_ranges[0] as Record<string, unknown>;
-      const minCents = typeof pr.min_cents === 'number' ? Math.round(pr.min_cents / 100) : null;
-      const maxCents = typeof pr.max_cents === 'number' ? Math.round(pr.max_cents / 100) : null;
-      if (minCents || maxCents) {
-        pay = {
-          min: minCents,
-          max: maxCents ?? minCents,
-          currency: typeof pr.currency_type === 'string' ? pr.currency_type.toUpperCase() : 'USD',
-          period: 'year',
-          basis: inferPayBasis(`${String(pr.title ?? '')} ${String(pr.blurb ?? '')}`),
-        };
-      }
+    } else if (rec.salaryRange || rec.salaryDescriptionPlain || Array.isArray(rec.lists) || rec.additionalPlain) {
+      pay = parseLeverPay(rec);
+    } else if (Array.isArray(rec.pay_input_ranges) || Array.isArray(rec.metadata)) {
+      pay = parseGreenhousePay(rec);
     }
     if (pay) lines.push(`- **Compensation**: ${formatNormalizedPay(pay)}`);
 
@@ -3035,7 +3274,11 @@ export function discoverAtsBoardsFromHtml(params: {
   links?: string[];
 }): DiscoveredAtsBoard[] {
   const { sourceUrl, finalUrl = '', rawHtml = '', links = [] } = params;
-  const corpus = [finalUrl, ...links, rawHtml.replace(/&(?:amp|#0*38|#x0*26);/gi, '&')].join('\n');
+  const unescapedHtml = rawHtml
+    .replace(/\\u002[fF]/g, '/')
+    .replace(/\\\//g, '/')
+    .replace(/&(?:amp|#0*38|#x0*26);/gi, '&');
+  const corpus = [finalUrl, ...links, unescapedHtml].join('\n');
   const found = new Map<string, DiscoveredAtsBoard>();
 
   const addBoard = (platform: string, slug: string, boardUrl: string) => {
@@ -3048,35 +3291,41 @@ export function discoverAtsBoardsFromHtml(params: {
 
   // 1. Greenhouse (US & EU, including `?for=<slug>` embed scripts & `boards-api.greenhouse.io/v1/boards/<slug>`!)
   for (const m of corpus.matchAll(
-    /https?:\/\/((?:job-boards|boards|eu-boards|job-boards\.eu)\.greenhouse\.io)\/(?:embed\/job_board(?:\/js)?\?for=([A-Za-z0-9_-]+)|([A-Za-z0-9_-]+))/gi,
+    /(?:https?:)?\/\/((?:job-boards|boards|eu-boards|job-boards\.eu)\.greenhouse\.io)\/(?:embed\/job_board(?:\/js)?\?for=([A-Za-z0-9_-]+)|([A-Za-z0-9_-]+))/gi,
   )) {
     const ghHost = m[1]!.toLowerCase();
     const slug = m[2] || m[3] || '';
     const canonicalHost = ghHost.includes('eu') ? 'job-boards.eu.greenhouse.io' : 'job-boards.greenhouse.io';
     addBoard('greenhouse', slug, `https://${canonicalHost}/${slug}`);
   }
-  for (const m of corpus.matchAll(/https?:\/\/(boards-api(?:\.eu)?\.greenhouse\.io)\/v1\/boards\/([A-Za-z0-9_-]+)/gi)) {
+  for (const m of corpus.matchAll(/(?:https?:)?\/\/(boards-api(?:\.eu)?\.greenhouse\.io)\/v1\/boards\/([A-Za-z0-9_-]+)/gi)) {
     const canonicalHost = m[1]!.toLowerCase().includes('.eu.') ? 'job-boards.eu.greenhouse.io' : 'job-boards.greenhouse.io';
     addBoard('greenhouse', m[2]!, `https://${canonicalHost}/${m[2]!}`);
   }
 
   // 2. Ashby (`jobs.ashbyhq.com/<org>` or `api.ashbyhq.com/posting-api/job-board/<org>`)
-  for (const m of corpus.matchAll(/https?:\/\/(?:jobs\.ashbyhq\.com|api\.ashbyhq\.com\/posting-api\/job-board)\/([A-Za-z0-9_.-]+)/gi)) {
+  for (const m of corpus.matchAll(/(?:https?:)?\/\/(?:jobs\.ashbyhq\.com|api\.ashbyhq\.com\/posting-api\/job-board)\/([A-Za-z0-9_.-]+)/gi)) {
     addBoard('ashby', m[1]!, `https://jobs.ashbyhq.com/${m[1]!}`);
   }
 
   // 3. Lever (US & EU)
-  for (const m of corpus.matchAll(/https?:\/\/(jobs(?:\.eu)?\.lever\.co)\/([A-Za-z0-9_.-]+)/gi)) {
+  for (const m of corpus.matchAll(/(?:https?:)?\/\/(jobs(?:\.eu)?\.lever\.co)\/([A-Za-z0-9_.-]+)/gi)) {
     addBoard('lever', m[2]!, `https://${m[1]!.toLowerCase()}/${m[2]!}`);
   }
 
-  // 4. Workday (`<tenant>.wd<N>.myworkdayjobs.com/[en-US/]<site>`)
-  for (const m of corpus.matchAll(/https?:\/\/(([a-z0-9-]+)\.(?:wd\d+\.)?myworkday(?:jobs|site)\.com)\/([A-Za-z0-9_/-]+)/gi)) {
+  // 4. Workday (`<tenant>.wd<N>.myworkdayjobs.com/[en-US/]<site>` or `/wday/cxs/<tenant>/<site>/jobs`)
+  for (const m of corpus.matchAll(/(?:https?:)?\/\/(([a-z0-9-]+)\.(?:wd\d+\.)?myworkday(?:jobs|site)\.com)\/([A-Za-z0-9_/-]+)/gi)) {
     const wdHost = m[1]!.toLowerCase();
-    const tenant = m[2]!;
+    let tenant = m[2]!;
     const segs = m[3]!.split('/').filter(Boolean);
-    const siteIdx = segs[0] && /^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(segs[0]) && segs.length >= 2 ? 1 : 0;
-    const site = segs[siteIdx] ?? '';
+    let site = '';
+    if (segs[0]?.toLowerCase() === 'wday' && segs[1]?.toLowerCase() === 'cxs' && segs.length >= 4) {
+      tenant = segs[2] || tenant;
+      site = segs[3]!;
+    } else {
+      const siteIdx = segs[0] && /^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(segs[0]) && segs.length >= 2 ? 1 : 0;
+      site = segs[siteIdx] ?? '';
+    }
     if (site && site.toLowerCase() !== 'wday' && isValidAtsSlug(tenant)) {
       addBoard('workday', `${tenant}/${site}`, `https://${wdHost}/${site}`);
     }
@@ -3649,7 +3898,8 @@ async function executeJobsVerifyMode(params: {
         direct.body?.status === 404 ||
         direct.body?.status === 410 ||
         direct.body?.contentState === 'closed_posting' ||
-        direct.body?.contentState === 'soft_404'
+        direct.body?.contentState === 'soft_404' ||
+        isClosedSchemeDowngradeResult(item.url, direct)
       ) {
         results.push({ url: item.url, status: 'closed' });
       } else if (direct.status === 200 && direct.body?.ok === true) {
@@ -4906,8 +5156,395 @@ export function matchesAllowedCompanyOrDomain(
   return false;
 }
 
-export const MAX_JOBS_CONCURRENT_SCRAPES = 5;
+export const MAX_JOBS_CONCURRENT_SCRAPES = 4;
 export const MAX_JOBS_TOTAL_SCRAPES = 40;
+export const JOBS_CACHE_TTL_MS = 5 * 60 * 1_000; // 5-minute TTL for ATS boards & job enrichment
+export const MAX_JOBS_CACHE_ENTRIES = 128;
+export const JOBS_PER_ITEM_TIMEOUT_MS = 12_000;
+
+interface JobsScrapeResponse {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+interface JobsCachePartition {
+  lru: Map<string, { expiresAt: number; value: JobsScrapeResponse }>;
+  inFlight: Map<string, Promise<JobsScrapeResponse>>;
+}
+
+const SHARED_JOBS_CACHE_PARTITION: JobsCachePartition = {
+  lru: new Map(),
+  inFlight: new Map(),
+};
+const TEST_SCOPED_JOBS_PARTITIONS = new WeakMap<object, JobsCachePartition>();
+
+export function resetJobsCacheForTests(): void {
+  SHARED_JOBS_CACHE_PARTITION.lru.clear();
+  SHARED_JOBS_CACHE_PARTITION.inFlight.clear();
+}
+
+function resolveJobsCachePartition(
+  env: (OptionalStorageBindings & Record<string, unknown>) | undefined,
+  rawExecuteScrape: unknown,
+): JobsCachePartition {
+  if (
+    env &&
+    ('AGENT_HUB' in env ||
+      'CALLER_TOKEN' in env ||
+      'META' in env ||
+      'ARTIFACTS' in env ||
+      'SERPER_API_KEY' in env ||
+      'SEARXNG_URL' in env ||
+      'SAFE_PUBLIC_FETCH' in env ||
+      env.JOBS_SHARED_CACHE === true)
+  ) {
+    return SHARED_JOBS_CACHE_PARTITION;
+  }
+  const keyObj =
+    env && typeof env === 'object' && Object.keys(env).length > 0
+      ? (env as object)
+      : (rawExecuteScrape as object);
+  if (!keyObj || (typeof keyObj !== 'object' && typeof keyObj !== 'function')) {
+    return SHARED_JOBS_CACHE_PARTITION;
+  }
+  let part = TEST_SCOPED_JOBS_PARTITIONS.get(keyObj);
+  if (!part) {
+    part = { lru: new Map(), inFlight: new Map() };
+    TEST_SCOPED_JOBS_PARTITIONS.set(keyObj, part);
+  }
+  return part;
+}
+
+function cloneJobsScrapeResponse(res: JobsScrapeResponse): JobsScrapeResponse {
+  const body = res.body ?? {};
+  return {
+    status: res.status,
+    body: {
+      ...body,
+      ...(Array.isArray(body.jobs)
+        ? {
+            jobs: (body.jobs as StructuredJobRecord[]).map((j) => ({
+              ...j,
+              locations: Array.isArray(j.locations) ? [...j.locations] : [],
+              ...(j.pay ? { pay: { ...j.pay } } : {}),
+            })),
+          }
+        : {}),
+      ...(Array.isArray(body.links) ? { links: [...(body.links as string[])] } : {}),
+    },
+  };
+}
+
+function buildJobsScrapeCacheKey(args: Record<string, unknown>): string | null {
+  const rawUrl = typeof args.url === 'string' ? args.url.trim() : '';
+  if (!rawUrl.startsWith('https://')) return null;
+  let canonicalUrl = rawUrl;
+  try {
+    const u = new URL(rawUrl);
+    u.hash = '';
+    const host = u.hostname.toLowerCase();
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (host === 'jobs.ashbyhq.com' && parts.length === 1 && !u.searchParams.has('offset')) {
+      canonicalUrl = `https://jobs.ashbyhq.com/${decodeURIComponent(parts[0]!).toLowerCase()}`;
+    } else if (
+      (host === 'boards.greenhouse.io' || host === 'job-boards.greenhouse.io') &&
+      parts.length === 1 &&
+      !u.searchParams.has('offset')
+    ) {
+      canonicalUrl = `https://job-boards.greenhouse.io/${parts[0]!.toLowerCase()}`;
+    } else if (host === 'jobs.lever.co' && parts.length === 1 && !u.searchParams.has('offset')) {
+      canonicalUrl = `https://jobs.lever.co/${parts[0]!.toLowerCase()}`;
+    } else if (host === 'ats.rippling.com' && parts.length >= 1) {
+      const idx = /^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(parts[0]!) && parts.length >= 2 ? 1 : 0;
+      const org = parts[idx];
+      const rest = parts.slice(idx + 1);
+      if (org && (rest.length === 0 || (rest.length === 1 && rest[0] === 'jobs'))) {
+        canonicalUrl = `https://ats.rippling.com/${org.toLowerCase()}/jobs`;
+      } else {
+        canonicalUrl = u.toString();
+      }
+    } else {
+      canonicalUrl = u.toString();
+    }
+  } catch {
+    return null;
+  }
+  const fmts = Array.isArray(args.formats) ? [...(args.formats as string[])].sort().join(',') : 'markdown';
+  const siteKey = typeof args.site === 'string' ? args.site.trim().toLowerCase() : '';
+  const targetKey = typeof args.target === 'string' ? args.target.trim().toLowerCase() : '';
+  return `${canonicalUrl}|${fmts}|${targetKey}|${siteKey}`;
+}
+
+function readJobsScrapeCache(partition: JobsCachePartition, key: string, now = Date.now()): JobsScrapeResponse | null {
+  const hit = partition.lru.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= now) {
+    partition.lru.delete(key);
+    return null;
+  }
+  partition.lru.delete(key);
+  partition.lru.set(key, hit);
+  return cloneJobsScrapeResponse(hit.value);
+}
+
+function writeJobsScrapeCache(partition: JobsCachePartition, key: string, value: JobsScrapeResponse, now = Date.now()): void {
+  if (value.status !== 200 || value.body?.ok !== true) return;
+  for (const [k, v] of partition.lru.entries()) {
+    if (v.expiresAt <= now) partition.lru.delete(k);
+  }
+  partition.lru.delete(key);
+  partition.lru.set(key, { expiresAt: now + JOBS_CACHE_TTL_MS, value: cloneJobsScrapeResponse(value) });
+  while (partition.lru.size > MAX_JOBS_CACHE_ENTRIES) {
+    const oldest = partition.lru.keys().next().value;
+    if (oldest === undefined) break;
+    partition.lru.delete(oldest);
+  }
+}
+
+function withJobsItemTimeout(promise: Promise<JobsScrapeResponse>, timeoutMs = JOBS_PER_ITEM_TIMEOUT_MS): Promise<JobsScrapeResponse> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<JobsScrapeResponse>((resolve) => {
+    timer = setTimeout(() => {
+      resolve({ status: 504, body: { ok: false, error: 'jobs_item_timeout', message: 'ATS enrichment timed out' } });
+    }, timeoutMs);
+  });
+  return Promise.race([
+    promise.catch(() => ({ status: 502, body: { ok: false, error: 'jobs_item_failed' } })),
+    timeoutPromise,
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+function isClosedSchemeDowngradeResult(urlStr: string, res: JobsScrapeResponse | null | undefined): boolean {
+  if (!res) return false;
+  const body = res.body ?? {};
+  const blockedObj = body.blocked as Record<string, unknown> | undefined;
+  const prob = typeof body.problem === 'string' ? body.problem : typeof body.message === 'string' ? body.message : '';
+  const isDowngrade =
+    blockedObj?.reason === 'scheme_downgrade' ||
+    body.blockedReason === 'scheme_downgrade' ||
+    body.outcome === 'scheme_downgrade' ||
+    /scheme_downgrade|https-to-http\s+redirect\s+downgrade/i.test(prob);
+  if (!isDowngrade) return false;
+  return /rippling\.com/i.test(urlStr) || Boolean(parseAtsPostingIdentity(urlStr));
+}
+
+function classifyFullBoardKey(urlStr: string): { key: string; platform: string; slug: string; isBoard: boolean; boardUrl: string } | null {
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol !== 'https:') return null;
+    const host = u.hostname.toLowerCase();
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (host === 'jobs.ashbyhq.com' && parts.length >= 1) {
+      const org = decodeURIComponent(parts[0]!);
+      if (!isValidAtsSlug(org)) return null;
+      const isBoard = parts.length === 1 || (parts.length === 2 && parts[1]!.toLowerCase() === 'jobs');
+      return {
+        key: `ashby:${org.toLowerCase()}`,
+        platform: 'ashby',
+        slug: org,
+        isBoard,
+        boardUrl: `https://jobs.ashbyhq.com/${encodeURIComponent(org)}`,
+      };
+    }
+    const isGhUs = host === 'boards.greenhouse.io' || host === 'job-boards.greenhouse.io';
+    const isGhEu = host === 'eu-boards.greenhouse.io' || host === 'job-boards.eu.greenhouse.io';
+    if ((isGhUs || isGhEu) && parts.length >= 1) {
+      const org = parts[0]!;
+      if (!isValidAtsSlug(org)) return null;
+      const canonicalHost = isGhEu ? 'job-boards.eu.greenhouse.io' : 'job-boards.greenhouse.io';
+      return {
+        key: `greenhouse:${org.toLowerCase()}`,
+        platform: 'greenhouse',
+        slug: org,
+        isBoard: parts.length === 1 && !u.searchParams.has('gh_jid'),
+        boardUrl: `https://${canonicalHost}/${org}`,
+      };
+    }
+    if ((host === 'jobs.lever.co' || host === 'jobs.eu.lever.co') && parts.length >= 1) {
+      const org = parts[0]!;
+      if (!isValidAtsSlug(org)) return null;
+      return {
+        key: `lever:${org.toLowerCase()}`,
+        platform: 'lever',
+        slug: org,
+        isBoard: parts.length === 1,
+        boardUrl: `https://${host}/${org}`,
+      };
+    }
+    if (host === 'ats.rippling.com' && parts.length >= 1) {
+      const idx = /^[a-z]{2}(?:-[A-Za-z]{2,4})?$/.test(parts[0]!) && parts.length >= 2 ? 1 : 0;
+      const org = parts[idx];
+      const rest = parts.slice(idx + 1);
+      if (org && isValidAtsSlug(org)) {
+        const isBoard = rest.length === 0 || (rest.length === 1 && rest[0] === 'jobs');
+        return {
+          key: `rippling:${org.toLowerCase()}`,
+          platform: 'rippling',
+          slug: org,
+          isBoard,
+          boardUrl: `https://ats.rippling.com/${org}/jobs`,
+        };
+      }
+    }
+    if (host === 'apply.workable.com' && parts.length >= 1 && isValidAtsSlug(parts[0]!)) {
+      return {
+        key: `workable:${parts[0]!.toLowerCase()}`,
+        platform: 'workable',
+        slug: parts[0]!,
+        isBoard: parts.length === 1,
+        boardUrl: `https://apply.workable.com/${parts[0]!}/`,
+      };
+    }
+    if (host === 'jobs.gem.com' && parts.length >= 1 && isValidAtsSlug(parts[0]!)) {
+      return {
+        key: `gem:${parts[0]!.toLowerCase()}`,
+        platform: 'gem',
+        slug: parts[0]!,
+        isBoard: parts.length === 1,
+        boardUrl: `https://jobs.gem.com/${parts[0]!}`,
+      };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function isSmartRecruitersBoardUrl(urlStr: string): { org: string; boardUrl: string } | null {
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol !== 'https:' || u.hostname.toLowerCase() !== 'jobs.smartrecruiters.com') return null;
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (parts.length === 1 && isValidAtsSlug(parts[0]!)) {
+      return { org: decodeURIComponent(parts[0]!), boardUrl: `https://jobs.smartrecruiters.com/${parts[0]!}` };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function humanizeSmartRecruitersSlugTitle(jobSeg: string): string {
+  const withoutNumericPrefix = jobSeg.replace(/^\d{6,}-/, '');
+  if (!withoutNumericPrefix || /^\d+$/.test(withoutNumericPrefix)) return '';
+  return withoutNumericPrefix
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ')
+    .trim();
+}
+
+/**
+ * Parses public `https://jobs.smartrecruiters.com/{Company}` HTML/Markdown board listings (strictly respecting `robots.txt`
+ * and NEVER calling `api.smartrecruiters.com`, which disallows bots in `robots.txt`).
+ */
+export function parseSmartRecruitersBoardScrape(origUrl: string, body: Record<string, unknown>): StructuredJobRecord[] {
+  const boardInfo = isSmartRecruitersBoardUrl(origUrl);
+  if (!boardInfo) return [];
+  const company = boardInfo.org;
+  const orgLower = company.toLowerCase();
+  const md = typeof body.markdown === 'string' ? body.markdown : '';
+  const rawHtml = typeof body.rawHtml === 'string' ? body.rawHtml : typeof body.html === 'string' ? body.html : '';
+  const links = Array.isArray(body.links) ? (body.links as string[]) : [];
+
+  const byUrl = new Map<string, StructuredJobRecord>();
+  const isPostingPath = (candidateUrl: string): { cleanUrl: string; seg: string } | null => {
+    try {
+      const u = new URL(candidateUrl, origUrl);
+      if (u.protocol !== 'https:' || u.hostname.toLowerCase() !== 'jobs.smartrecruiters.com') return null;
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (parts.length < 2 || parts[0]!.toLowerCase() !== orgLower) return null;
+      const seg = decodeURIComponent(parts[1]!);
+      if (!seg || seg.length < 4 || /^(?:api|reset|login|signin|privacy|legal|terms|cookies|search|jobs)$/i.test(seg)) {
+        return null;
+      }
+      u.hash = '';
+      u.search = '';
+      return { cleanUrl: `https://jobs.smartrecruiters.com/${parts[0]!}/${parts[1]!}`, seg };
+    } catch {
+      return null;
+    }
+  };
+
+  // 1. Parse Markdown `[Title](https://jobs.smartrecruiters.com/<Company>/<JobId>)` links + surrounding location/pay context
+  const mdLinkRe = /\[([^\[\]\n]{3,180})\]\((https:\/\/jobs\.smartrecruiters\.com\/[^)\s]+)\)([^\n]{0,200})(?:\n+([^\n#\[]{0,160}))?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = mdLinkRe.exec(md)) !== null && byUrl.size < 500) {
+    const parsedLink = isPostingPath(m[2]!);
+    if (!parsedLink || byUrl.has(parsedLink.cleanUrl.toLowerCase())) continue;
+    const rawTitle = m[1]!.replace(/\*+/g, '').trim();
+    if (!rawTitle || /^(?:apply|read more|learn more|view job)$/i.test(rawTitle)) continue;
+    const tailCtx = `${m[3] ?? ''} ${m[4] ?? ''}`.replace(/^[ \t·|–—-]+/, '').trim();
+    const locLine = (m[3] ?? '').replace(/^[ \t·|–—-]+/, '').trim() || (m[4] ?? '').trim();
+    const cleanLoc = locLine && locLine.length <= 96 && !/\[|\]|\bhttp/i.test(locLine) ? locLine : '';
+    const wp = inferWorkplaceType(`${cleanLoc} ${rawTitle} ${tailCtx}`);
+    const pay = parsePayFromText(tailCtx);
+    byUrl.set(parsedLink.cleanUrl.toLowerCase(), {
+      title: rawTitle,
+      company,
+      url: parsedLink.cleanUrl,
+      applyUrl: parsedLink.cleanUrl,
+      workplaceType: wp,
+      locations: cleanLoc ? [cleanLoc] : wp === 'remote' ? ['Remote'] : [],
+      pay,
+      postedAt: null,
+      source: 'smartrecruiters',
+      ...(tailCtx ? { snippet: tailCtx.slice(0, 220) } : {}),
+    });
+  }
+
+  // 2. Parse raw HTML anchors if present
+  if (rawHtml) {
+    const htmlAnchorRe = /<a\b[^>]{0,400}\bhref=["'](https?:\/\/jobs\.smartrecruiters\.com\/[^"'#?\s]+|\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]{6,})["'][^>]*>([\s\S]{1,600}?)<\/a>/gi;
+    let hm: RegExpExecArray | null;
+    while ((hm = htmlAnchorRe.exec(rawHtml)) !== null && byUrl.size < 500) {
+      const parsedLink = isPostingPath(hm[1]!);
+      if (!parsedLink || byUrl.has(parsedLink.cleanUrl.toLowerCase())) continue;
+      const anchorText = stripTagsPlain(hm[2]!);
+      const title = anchorText && !/^(?:apply|view|details)$/i.test(anchorText) ? anchorText : humanizeSmartRecruitersSlugTitle(parsedLink.seg);
+      if (!title) continue;
+      const afterSlice = stripTagsPlain(rawHtml.slice(hm.index + hm[0].length, hm.index + hm[0].length + 260));
+      const wp = inferWorkplaceType(`${afterSlice} ${title}`);
+      byUrl.set(parsedLink.cleanUrl.toLowerCase(), {
+        title,
+        company,
+        url: parsedLink.cleanUrl,
+        applyUrl: parsedLink.cleanUrl,
+        workplaceType: wp,
+        locations: wp === 'remote' ? ['Remote'] : [],
+        pay: parsePayFromText(afterSlice),
+        postedAt: null,
+        source: 'smartrecruiters',
+      });
+    }
+  }
+
+  // 3. Fallback to `links[]` array using humanized URL slug titles
+  for (const lnk of links) {
+    if (byUrl.size >= 500) break;
+    const parsedLink = isPostingPath(String(lnk));
+    if (!parsedLink || byUrl.has(parsedLink.cleanUrl.toLowerCase())) continue;
+    const title = humanizeSmartRecruitersSlugTitle(parsedLink.seg);
+    if (!title) continue;
+    const wp = inferWorkplaceType(title);
+    byUrl.set(parsedLink.cleanUrl.toLowerCase(), {
+      title,
+      company,
+      url: parsedLink.cleanUrl,
+      applyUrl: parsedLink.cleanUrl,
+      workplaceType: wp,
+      locations: wp === 'remote' ? ['Remote'] : [],
+      pay: null,
+      postedAt: null,
+      source: 'smartrecruiters',
+    });
+  }
+
+  return [...byUrl.values()];
+}
 
 /**
  * `Section 4`: One-call `jobs` sweep across Greenhouse, Ashby, Lever, Workday, Workable, Gem, Rippling, SmartRecruiters,
@@ -4928,8 +5565,10 @@ export async function executeJobsCall(params: {
   const executeSearch = (args: Record<string, unknown>) =>
     activeTracer ? activeTracer.run(() => rawExecuteSearch(args)) : rawExecuteSearch(args);
   const rawExecuteScrape = params.executeScrape;
+  const cachePartition = resolveJobsCachePartition(params.env, rawExecuteScrape);
 
-  // Enforce hard `<= 5` concurrent scrapes and `<= 40` total scrapes per `executeJobsCall` across discovery, verify & boards.
+  // Enforce hard `<= 4` concurrent scrapes and `<= 40` total scrapes per `executeJobsCall` across discovery, verify & boards,
+  // backed by a 5-minute (`300_000 ms`) 128-entry LRU cache + `inFlight` singleflight coalescer + 12s per-item timeout guard.
   let activeScrapes = 0;
   let totalScrapesUsed = 0;
   let budgetExhausted = false;
@@ -4937,12 +5576,27 @@ export async function executeJobsCall(params: {
   const executeScrape = async (
     args: Record<string, unknown>,
   ): Promise<{ status: number; body: Record<string, unknown> }> => {
+    const cacheKey = args.noCache === true ? null : buildJobsScrapeCacheKey(args);
+    if (cacheKey) {
+      const cached = readJobsScrapeCache(cachePartition, cacheKey);
+      if (cached) return cached;
+      const existingFlight = cachePartition.inFlight.get(cacheKey);
+      if (existingFlight) {
+        const sharedRes = await withJobsItemTimeout(existingFlight);
+        return cloneJobsScrapeResponse(sharedRes);
+      }
+    }
+
     while (activeScrapes >= MAX_JOBS_CONCURRENT_SCRAPES) {
       if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
         budgetExhausted = true;
         return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
       }
       await new Promise<void>((resolve) => scrapeWaitQueue.push(resolve));
+      if (cacheKey) {
+        const cachedAfterWait = readJobsScrapeCache(cachePartition, cacheKey);
+        if (cachedAfterWait) return cachedAfterWait;
+      }
     }
     if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
       budgetExhausted = true;
@@ -4953,9 +5607,24 @@ export async function executeJobsCall(params: {
     }
     activeScrapes++;
     totalScrapesUsed++;
+    const runSingle = (): Promise<JobsScrapeResponse> =>
+      withJobsItemTimeout(
+        Promise.resolve().then(() => (activeTracer ? activeTracer.run(() => rawExecuteScrape(args)) : rawExecuteScrape(args))),
+      );
+    const flightPromise = runSingle();
+    if (cacheKey) {
+      cachePartition.inFlight.set(cacheKey, flightPromise);
+    }
     try {
-      return await (activeTracer ? activeTracer.run(() => rawExecuteScrape(args)) : rawExecuteScrape(args));
+      const out = await flightPromise;
+      if (cacheKey && out.status === 200 && out.body?.ok === true) {
+        writeJobsScrapeCache(cachePartition, cacheKey, out);
+      }
+      return cacheKey ? cloneJobsScrapeResponse(out) : out;
     } finally {
+      if (cacheKey && cachePartition.inFlight.get(cacheKey) === flightPromise) {
+        cachePartition.inFlight.delete(cacheKey);
+      }
       activeScrapes--;
       if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
         while (scrapeWaitQueue.length > 0) {
@@ -5116,7 +5785,9 @@ export async function executeJobsCall(params: {
           tried.push(probeUrl);
           const res = await executeScrape({
             url: probeUrl,
-            renderMode: 'auto',
+            renderMode: 'off',
+            discoverLlmsTxt: false,
+            preferOriginMarkdown: false,
             onlyMainContent: false,
             formats: ['markdown', 'rawHtml', 'links'],
             ...(payload.target ? { target: payload.target } : {}),
@@ -5143,14 +5814,18 @@ export async function executeJobsCall(params: {
             return;
           }
         }
-        // Fallback when company uses a custom SPA careers portal (e.g. Eightfold/AEM): probe canonical domain slug across Greenhouse, Ashby, Lever & Workday CXS
+        // Fallback when company uses a custom SPA careers portal (e.g. Eightfold/AEM):
+        // Phase 1 probes fast JSON/HTML boards first; Phase 2 probes speculative Workday CXS ONLY if Phase 1 yielded nothing!
         const baseSlug = dom.split('.')[0]?.toLowerCase() ?? '';
         if (isValidAtsSlug(baseSlug) && !domHitBudgetCap) {
           const upperSlug = baseSlug.toUpperCase();
-          const slugProbes: Array<{ platform: string; slug: string; boardUrl: string }> = [
+          const phase1Probes: Array<{ platform: string; slug: string; boardUrl: string }> = [
             { platform: 'greenhouse', slug: baseSlug, boardUrl: `https://boards.greenhouse.io/${baseSlug}` },
             { platform: 'ashby', slug: baseSlug, boardUrl: `https://jobs.ashbyhq.com/${baseSlug}` },
             { platform: 'lever', slug: baseSlug, boardUrl: `https://jobs.lever.co/${baseSlug}` },
+            { platform: 'smartrecruiters', slug: baseSlug, boardUrl: `https://jobs.smartrecruiters.com/${baseSlug}` },
+          ];
+          const phase2WorkdayProbes: Array<{ platform: string; slug: string; boardUrl: string }> = [
             {
               platform: 'workday',
               slug: `${baseSlug}/${upperSlug}ExternalCareerSite`,
@@ -5172,37 +5847,53 @@ export async function executeJobsCall(params: {
               boardUrl: `https://${baseSlug}.wd1.myworkdayjobs.com/External`,
             },
           ];
-          for (const sp of slugProbes) tried.push(sp.boardUrl);
-          const probeResults = await Promise.all(
-            slugProbes.map(async (sp) => {
-              const r = await executeScrape({
-                url: sp.boardUrl,
-                formats: ['markdown', 'links'],
-                ...(payload.target ? { target: payload.target } : {}),
-                ...(payload.site ? { site: payload.site } : {}),
-              }).catch(() => null);
-              if (r?.body?.error === 'jobs_scrape_budget_exceeded') {
-                domHitBudgetCap = true;
+          const runSlugProbeWave = async (wave: Array<{ platform: string; slug: string; boardUrl: string }>) => {
+            for (const sp of wave) tried.push(sp.boardUrl);
+            const probeResults = await Promise.all(
+              wave.map(async (sp) => {
+                const r = await executeScrape({
+                  url: sp.boardUrl,
+                  renderMode: 'off',
+                  discoverLlmsTxt: false,
+                  preferOriginMarkdown: false,
+                  formats: ['markdown', 'links'],
+                  ...(payload.target ? { target: payload.target } : {}),
+                  ...(payload.site ? { site: payload.site } : {}),
+                }).catch(() => null);
+                if (r?.body?.error === 'jobs_scrape_budget_exceeded') {
+                  domHitBudgetCap = true;
+                }
+                return { sp, r };
+              }),
+            );
+            for (const { sp, r } of probeResults) {
+              if (!r || r.status !== 200 || r.body?.ok !== true) continue;
+              const srJobs = sp.platform === 'smartrecruiters' ? parseSmartRecruitersBoardScrape(sp.boardUrl, r.body) : [];
+              const links = Array.isArray(r.body.links) ? (r.body.links as string[]) : [];
+              const jobsArr = Array.isArray(r.body.jobs) ? (r.body.jobs as unknown[]) : [];
+              const hasRealJobs =
+                sp.platform === 'smartrecruiters'
+                  ? srJobs.length > 0
+                  : jobsArr.length > 0 || links.length > 0;
+              if (hasRealJobs) {
+                const entry: DiscoveredAtsBoard = {
+                  domain: dom,
+                  platform: sp.platform,
+                  slug: sp.slug,
+                  boardUrl: sp.boardUrl,
+                  discoveredFrom: `slug-probe:${dom}`,
+                  boardStatus: 'ok',
+                };
+                foundForDom.push(entry);
+                discoveredBoards.push(entry);
+                candidateUrls.add(sp.boardUrl);
               }
-              return { sp, r };
-            }),
-          );
-          for (const { sp, r } of probeResults) {
-            const links = Array.isArray(r?.body?.links) ? (r!.body.links as string[]) : [];
-            const jobsArr = Array.isArray(r?.body?.jobs) ? (r!.body.jobs as unknown[]) : [];
-            if (r?.status === 200 && r.body?.ok === true && (jobsArr.length > 0 || links.length > 0)) {
-              const entry: DiscoveredAtsBoard = {
-                domain: dom,
-                platform: sp.platform,
-                slug: sp.slug,
-                boardUrl: sp.boardUrl,
-                discoveredFrom: `slug-probe:${dom}`,
-                boardStatus: 'ok',
-              };
-              foundForDom.push(entry);
-              discoveredBoards.push(entry);
-              candidateUrls.add(sp.boardUrl);
             }
+          };
+
+          await runSlugProbeWave(phase1Probes);
+          if (foundForDom.length === 0 && !domHitBudgetCap) {
+            await runSlugProbeWave(phase2WorkdayProbes);
           }
 
           // Search-assisted ATS board fallback when company uses a non-standard Workday/Greenhouse/Ashby tenant slug
@@ -5265,14 +5956,17 @@ export async function executeJobsCall(params: {
     .filter(Boolean)
     .join(' ');
 
-  // Never run unscoped cross-company web search when the caller explicitly scoped to `domains: [...]` without `company`
+  // Never pass `timeRange` (`qdr:w`/`qdr:m`) on ATS `site:` queries — Google omits indexed publish dates on ATS SPA/board URLs
+  // and returns 0 results for `postedWithinDays <= 30`; `maxAgeCutoffMs` filters accurately using authoritative ATS `postedAt`!
   if (coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
+    const searchMaxResults = postedWithinDays !== undefined ? 15 : 10;
+    const searchCandidateCap =
+      postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(35, limit * 2);
     const searchResponses = await Promise.all(
       atsGroups.map((grp) =>
         executeSearch({
           query: `${grp} ${coreTerms}`.trim(),
-          maxResults: 10,
-          ...(postedWithinDays && postedWithinDays <= 7 ? { timeRange: 'week' } : postedWithinDays && postedWithinDays <= 31 ? { timeRange: 'month' } : {}),
+          maxResults: searchMaxResults,
         }).catch(() => ({ status: 500, body: {} as Record<string, unknown> })),
       ),
     );
@@ -5282,13 +5976,34 @@ export async function executeJobsCall(params: {
       const webResults = Array.isArray(sr.body?.results) ? (sr.body.results as Array<Record<string, unknown>>) : [];
       for (const hit of webResults) {
         const u = typeof hit.url === 'string' ? hit.url.trim() : '';
-        if (u.startsWith('https://') && candidateUrls.size < Math.min(35, limit * 2)) {
+        if (u.startsWith('https://') && candidateUrls.size < searchCandidateCap) {
           candidateUrls.add(u);
           addedSearchHits++;
         }
       }
     }
     if (addedSearchHits > 0) sourcesUsed.add('ats_search');
+  }
+
+  // Direct company board discovery when `company` is provided without `domains` (e.g. `company: "Visa"` -> `jobs.smartrecruiters.com/Visa`
+  // with `respectRobots: true` — NEVER `api.smartrecruiters.com`!)
+  if (companyFilter && domainsInput.length === 0) {
+    const coTokens = expandCompanyFilterTokens(companyFilter);
+    const primarySlug = coTokens[0] ?? '';
+    if (primarySlug && isValidAtsSlug(primarySlug)) {
+      const rawTrimmedSlug = companyFilter.replace(/[^A-Za-z0-9_-]+/g, '');
+      const srDisplaySlug =
+        rawTrimmedSlug && rawTrimmedSlug.toLowerCase() === primarySlug ? rawTrimmedSlug : primarySlug;
+      const hasSmartRecruitersHit = [...candidateUrls].some((u) => /jobs\.smartrecruiters\.com\//i.test(u));
+      if (!hasSmartRecruitersHit) {
+        candidateUrls.add(`https://jobs.smartrecruiters.com/${srDisplaySlug}`);
+      }
+      if (candidateUrls.size <= 1) {
+        candidateUrls.add(`https://boards.greenhouse.io/${primarySlug}`);
+        candidateUrls.add(`https://jobs.ashbyhq.com/${primarySlug}`);
+        candidateUrls.add(`https://jobs.lever.co/${primarySlug}`);
+      }
+    }
   }
 
   const collected: StructuredJobRecord[] = [];
@@ -5354,13 +6069,64 @@ export async function executeJobsCall(params: {
     }
   }
 
-  // Fetch candidate ATS URLs in parallel batches of 5 through `executeScrape` (which invokes Ashby, Workday CXS, Greenhouse, Lever & JSON-LD!)
-  const urlList = [...candidateUrls];
-  for (let i = 0; i < urlList.length; i += 5) {
-    const slice = urlList.slice(i, i + 5);
+  // Deduplicate redundant single-posting fetches when the parent board (especially Ashby 1.22 MB `posting-api/job-board/<slug>`
+  // and Rippling `ats/v1/board/<org>/jobs`) is also present or has >= 2 postings from the same company!
+  const rawUrlList = [...candidateUrls];
+  const postingCountByBoard = new Map<string, { count: number; boardUrl: string; hasBoard: boolean }>();
+  for (const u of rawUrlList) {
+    const info = classifyFullBoardKey(u);
+    if (!info) continue;
+    const entry = postingCountByBoard.get(info.key) ?? { count: 0, boardUrl: info.boardUrl, hasBoard: false };
+    if (info.isBoard) entry.hasBoard = true;
+    else entry.count++;
+    postingCountByBoard.set(info.key, entry);
+  }
+  const promotedBoardUrls: string[] = [];
+  for (const [bKey, meta] of postingCountByBoard.entries()) {
+    if (!meta.hasBoard && meta.count >= 2 && (bKey.startsWith('ashby:') || bKey.startsWith('rippling:'))) {
+      promotedBoardUrls.push(meta.boardUrl);
+    }
+  }
+  const boardWaveUrls = [
+    ...new Set([
+      ...promotedBoardUrls,
+      ...rawUrlList.filter((u) => {
+        const info = classifyFullBoardKey(u);
+        return Boolean(info?.isBoard || isSmartRecruitersBoardUrl(u));
+      }),
+    ]),
+  ];
+  const postingWaveUrls = [
+    ...new Set(
+      rawUrlList.filter((u) => {
+        const info = classifyFullBoardKey(u);
+        return !info?.isBoard && !isSmartRecruitersBoardUrl(u);
+      }),
+    ),
+  ];
+  const fetchedCompleteBoards = new Set<string>();
+  const smartRecruitersPostingsToEnrich: StructuredJobRecord[] = [];
+
+  // Run board URLs in Wave 1 BEFORE single-posting URLs in Wave 2 so `fetchedCompleteBoards` is populated before any
+  // single-posting Ashby/Greenhouse/Lever/Gem/Rippling URL is dispatched (preventing concurrent-slice board re-downloads!).
+  for (const waveUrls of [boardWaveUrls, postingWaveUrls]) {
+    for (let i = 0; i < waveUrls.length; i += MAX_JOBS_CONCURRENT_SCRAPES) {
+      const rawSlice = waveUrls.slice(i, i + MAX_JOBS_CONCURRENT_SCRAPES);
+      const slice = rawSlice.filter((u) => {
+        const info = classifyFullBoardKey(u);
+        // Skip redundant single-posting download if we ALREADY collected the complete board for this `(platform, slug)`!
+        if (info && !info.isBoard && fetchedCompleteBoards.has(info.key)) {
+          return false;
+        }
+        return true;
+      });
+      if (slice.length === 0) continue;
+
     const batchOut = await Promise.all(
       slice.map((u) => {
         let scrapeUrl = u;
+        const srBoard = isSmartRecruitersBoardUrl(u);
+        const info = classifyFullBoardKey(u);
         if (query && /myworkday(?:jobs|site)\.com/i.test(u) && !/\/job\//i.test(u)) {
           try {
             const wdU = new URL(u);
@@ -5370,10 +6136,13 @@ export async function executeJobsCall(params: {
             scrapeUrl = u;
           }
         }
+        const needLinks = Boolean(srBoard || info?.isBoard || discoveredBoards.some((b) => b.boardUrl === u));
         return executeScrape({
           url: scrapeUrl,
-          renderMode: 'auto',
-          formats: ['markdown'],
+          renderMode: srBoard ? 'off' : 'auto',
+          discoverLlmsTxt: false,
+          preferOriginMarkdown: false,
+          formats: needLinks ? ['markdown', 'links'] : ['markdown'],
           ...(payload.target ? { target: payload.target } : {}),
           ...(payload.site ? { site: payload.site } : {}),
         }).catch(() => null);
@@ -5384,6 +6153,10 @@ export async function executeJobsCall(params: {
       const sc = batchOut[j];
       const discEntry = discoveredBoards.find((b) => b.boardUrl === origU);
       if (!sc || sc.status !== 200 || sc.body?.ok !== true) {
+        if (isClosedSchemeDowngradeResult(origU, sc)) {
+          // Treat Rippling / ATS HTTPS->HTTP redirect downgrade on a job posting URL cleanly as a closed/unavailable posting!
+          continue;
+        }
         if (discEntry) {
           if (sc?.body?.error === 'jobs_scrape_budget_exceeded') {
             discEntry.boardStatus = 'budget_exhausted';
@@ -5415,6 +6188,10 @@ export async function executeJobsCall(params: {
 
       // If board returned multiple `jobs` directly (e.g. Ashby / Workday / Greenhouse / Lever / Workable / Gem / Rippling board URL)
       if (Array.isArray(sc.body.jobs)) {
+        const fullInfo = classifyFullBoardKey(origU);
+        if (fullInfo && sc.body.truncated !== true) {
+          fetchedCompleteBoards.add(fullInfo.key);
+        }
         const boardExtId =
           typeof sc.body.extractorId === 'string' && sc.body.extractorId
             ? sc.body.extractorId
@@ -5440,7 +6217,9 @@ export async function executeJobsCall(params: {
             }
             const wdPageRes = await executeScrape({
               url: pageUrlStr,
-              renderMode: 'auto',
+              renderMode: 'off',
+              discoverLlmsTxt: false,
+              preferOriginMarkdown: false,
               formats: ['markdown'],
               ...(payload.target ? { target: payload.target } : {}),
               ...(payload.site ? { site: payload.site } : {}),
@@ -5487,6 +6266,36 @@ export async function executeJobsCall(params: {
         continue;
       }
 
+      // SmartRecruiters public HTML board (`https://jobs.smartrecruiters.com/{Company}`, strictly respecting `robots.txt`!)
+      if (isSmartRecruitersBoardUrl(origU)) {
+        const srRecords = parseSmartRecruitersBoardScrape(origU, sc.body);
+        if (discEntry) {
+          discEntry.boardStatus = classifyAtsBoardStatus({
+            httpStatus: sc.status,
+            requestedUrl: origU,
+            finalUrl: typeof sc.body.finalUrl === 'string' ? sc.body.finalUrl : undefined,
+            jobCount: srRecords.length,
+          });
+          discEntry.total = srRecords.length;
+          discEntry.returned = srRecords.length;
+          discEntry.truncated = false;
+        }
+        if (srRecords.length > 0) {
+          sourcesUsed.add('ats:smartrecruiters');
+          resolvedAdapterIds.add('smartrecruiters');
+          const matchingSr = query
+            ? srRecords.filter((r) => matchesJobQueryRelevance(r.title, r.snippet, query) !== null)
+            : srRecords;
+          for (const r of matchingSr.slice(0, Math.min(limit, 8))) {
+            smartRecruitersPostingsToEnrich.push(r);
+          }
+          for (const r of srRecords) {
+            collected.push(r);
+          }
+        }
+        continue;
+      }
+
       // Support twin-extracted job boards (`icims` `records[]`) in `jobs` search mode
       if (Array.isArray(sc.body.records) && sc.body.extractorId === 'icims') {
         sourcesUsed.add('ats:icims');
@@ -5519,9 +6328,12 @@ export async function executeJobsCall(params: {
         continue;
       }
 
-      const jp = sc.body.jobPosting as StructuredJobPosting | undefined;
-      const meta = (sc.body.metadata as Record<string, unknown> | undefined) ?? {};
+      const rawPageHtml = typeof sc.body.rawHtml === 'string' ? sc.body.rawHtml : typeof sc.body.html === 'string' ? sc.body.html : '';
       const md = typeof sc.body.markdown === 'string' ? sc.body.markdown : '';
+      const jp =
+        (sc.body.jobPosting as StructuredJobPosting | undefined) ??
+        (rawPageHtml ? (extractJobPostingJsonLd(rawPageHtml, origU, md) ?? undefined) : undefined);
+      const meta = (sc.body.metadata as Record<string, unknown> | undefined) ?? {};
       const rawTitle = (jp?.title || (typeof meta.title === 'string' ? meta.title : '')).replace(/\s*[@|–-]\s*[^@|–-]+$/, '').trim();
       if (!rawTitle) continue;
       const company = jp?.hiringOrganization || inferCompanyFromAtsUrl(origU);
@@ -5530,7 +6342,7 @@ export async function executeJobsCall(params: {
       const wp = jp?.workplaceType && jp.workplaceType !== 'unknown' ? jp.workplaceType : inferWorkplaceType(`${locs.join(' ')} ${md.slice(0, 400)}`);
       const postedAt = jp?.datePosted ?? (typeof meta.publishedTime === 'string' ? meta.publishedTime : null);
       const applyUrl = jp?.applyUrl || origU;
-      const jobSource = jp?.source || String(sc.body.extractorId ?? 'ats');
+      const jobSource = jp?.source || (/smartrecruiters\.com/i.test(origU) ? 'smartrecruiters' : String(sc.body.extractorId ?? 'ats'));
       sourcesUsed.add(`ats:${jobSource}`);
       const postExtId =
         typeof sc.body.extractorId === 'string' && sc.body.extractorId
@@ -5549,7 +6361,56 @@ export async function executeJobsCall(params: {
         postedAt,
         source: jobSource,
         ...(jp?.employmentType ? { employmentType: jp.employmentType } : {}),
+        ...(md ? { snippet: md.slice(0, 240) } : {}),
       });
+      }
+    }
+  }
+
+  // Enrich top matching SmartRecruiters posting pages in bounded batches of 4 to populate schema.org/JobPosting JSON-LD (`datePosted`, `jobLocation`, `baseSalary`)
+  if (smartRecruitersPostingsToEnrich.length > 0 && !budgetExhausted) {
+    for (let i = 0; i < smartRecruitersPostingsToEnrich.length; i += MAX_JOBS_CONCURRENT_SCRAPES) {
+      const batch = smartRecruitersPostingsToEnrich.slice(i, i + MAX_JOBS_CONCURRENT_SCRAPES);
+      const outs = await Promise.all(
+        batch.map((srRec) =>
+          executeScrape({
+            url: srRec.url,
+            renderMode: 'off',
+            discoverLlmsTxt: false,
+            preferOriginMarkdown: false,
+            formats: ['markdown'],
+            ...(payload.target ? { target: payload.target } : {}),
+            ...(payload.site ? { site: payload.site } : {}),
+          }).catch(() => null),
+        ),
+      );
+      for (let j = 0; j < batch.length; j++) {
+        const srRec = batch[j]!;
+        const det = outs[j];
+        if (!det || det.status !== 200 || det.body?.ok !== true) continue;
+        const detState = typeof det.body.contentState === 'string' ? det.body.contentState : undefined;
+        if (detState === 'closed_posting' || detState === 'soft_404') {
+          const dropIdx = collected.findIndex((c) => c.url.toLowerCase() === srRec.url.toLowerCase());
+          if (dropIdx >= 0) collected.splice(dropIdx, 1);
+          continue;
+        }
+        const detHtml = typeof det.body.rawHtml === 'string' ? det.body.rawHtml : typeof det.body.html === 'string' ? det.body.html : '';
+        const detMd = typeof det.body.markdown === 'string' ? det.body.markdown : '';
+        const jp =
+          (det.body.jobPosting as StructuredJobPosting | undefined) ??
+          (detHtml ? (extractJobPostingJsonLd(detHtml, srRec.url, detMd) ?? undefined) : undefined);
+        const target = collected.find((c) => c.url.toLowerCase() === srRec.url.toLowerCase());
+        if (!target) continue;
+        if (jp?.title) target.title = jp.title;
+        if (jp?.hiringOrganization) target.company = jp.hiringOrganization;
+        if (jp?.jobLocation && jp.jobLocation.length > 0) target.locations = jp.jobLocation;
+        if (jp?.workplaceType && jp.workplaceType !== 'unknown') target.workplaceType = jp.workplaceType;
+        if (jp?.pay) target.pay = jp.pay;
+        else if (!target.pay && detMd) target.pay = parsePayFromText(detMd);
+        if (jp?.datePosted) target.postedAt = jp.datePosted;
+        if (jp?.employmentType) target.employmentType = jp.employmentType;
+        if (jp?.applyUrl) target.applyUrl = jp.applyUrl;
+      }
     }
   }
 

@@ -118,6 +118,18 @@ try {
   const round9BughuntOutfile = join(dir, 'round9-bughunt.test.mjs');
   buildNodeTestBundle('test/round9-bughunt.test.ts', round9BughuntOutfile);
   nodeTestFiles.push(round9BughuntOutfile);
+  const round10SanitizerCommerceOutfile = join(dir, 'round10-sanitizer-commerce.test.mjs');
+  buildNodeTestBundle('test/round10-sanitizer-commerce.test.ts', round10SanitizerCommerceOutfile);
+  nodeTestFiles.push(round10SanitizerCommerceOutfile);
+  const round10AuthMcpVaultOutfile = join(dir, 'round10-auth-mcp-vault.test.mjs');
+  buildNodeTestBundle('test/round10-auth-mcp-vault.test.ts', round10AuthMcpVaultOutfile);
+  nodeTestFiles.push(round10AuthMcpVaultOutfile);
+  const round10PortableEvictionOutfile = join(dir, 'round10-portable-eviction.test.mjs');
+  buildNodeTestBundle('test/round10-portable-eviction.test.ts', round10PortableEvictionOutfile);
+  nodeTestFiles.push(round10PortableEvictionOutfile);
+  const round10LiveTracesOutfile = join(dir, 'round10-live-traces.test.mjs');
+  buildNodeTestBundle('test/round10-live-traces.test.ts', round10LiveTracesOutfile);
+  nodeTestFiles.push(round10LiveTracesOutfile);
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],
@@ -149,7 +161,7 @@ try {
   try {
     execFileSync(
       process.execPath,
-      ['--test', '--test-force-exit', ...nodeTestFiles, e2eTestFile],
+      ['--test', '--test-concurrency=4', '--test-force-exit', ...nodeTestFiles, e2eTestFile],
       {
         stdio: 'inherit',
         env: childEnv,

@@ -1506,7 +1506,13 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 					if finalURL == "" {
 						finalURL = twin.FetchURL
 					}
-					if tRes.Status == http.StatusOK && tRes.Outcome == classify.OutcomeOK && isSameTwinOriginDomain(twinURL, finalURL) {
+					finalAllowed := false
+					if twin.ValidateRedirectTarget(finalURL) {
+						if finalParsed, pfErr := url.Parse(finalURL); pfErr == nil && (s.allow == nil || s.allow(finalParsed) == nil) {
+							finalAllowed = true
+						}
+					}
+					if tRes.Status == http.StatusOK && tRes.Outcome == classify.OutcomeOK && finalAllowed {
 						bodyBytes, decErr := tRes.DecodeBody()
 						bodyStr := tRes.Body
 						if decErr == nil && len(bodyBytes) > 0 {
@@ -1663,25 +1669,6 @@ func (s *Server) executeScrape(ctx context.Context, p scrapePayload, hdr http.He
 		}
 	}
 	return out, via, http.StatusOK
-}
-
-func isSameTwinOriginDomain(expected *url.URL, finalRaw string) bool {
-	if expected == nil || finalRaw == "" {
-		return true
-	}
-	fu, err := url.Parse(finalRaw)
-	if err != nil || fu.Scheme != "https" || fu.User != nil {
-		return false
-	}
-	eh := strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(expected.Hostname()), "."), "www.")
-	fh := strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(fu.Hostname()), "."), "www.")
-	if eh == "" || fh == "" {
-		return false
-	}
-	if eh == fh || strings.HasSuffix(fh, "."+eh) || strings.HasSuffix(eh, "."+fh) {
-		return true
-	}
-	return false
 }
 
 func (s *Server) handleCallerExtractors(w http.ResponseWriter, r *http.Request) {

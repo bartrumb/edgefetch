@@ -25,7 +25,7 @@ import {
   tryScrapeViaConnectedMcp,
   type QueryMcpCallInput,
 } from './mcp-federation';
-import { validateConnectorDomains } from './mcp-registry';
+import { stripMcpSmugglingChars } from './mcp-registry';
 import {
   filterSafeCachedMcpTools,
   isSafeMcpIdentifier,
@@ -271,10 +271,18 @@ async function ensureAgentRunsTable(metaDb?: D1Database): Promise<void> {
     .catch(() => undefined);
   if (!migratedAgentDbs.has(metaDb)) {
     migratedAgentDbs.add(metaDb);
-    await metaDb
-      .prepare("ALTER TABLE agent_runs ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'")
-      .run()
-      .catch(() => undefined);
+    const colsRes = await metaDb
+      .prepare('PRAGMA table_info(agent_runs)')
+      .all<{ name?: string }>()
+      .catch(() => null);
+    const cols = colsRes?.results;
+    const hasUserIdCol = Array.isArray(cols) && cols.length > 0 && cols.some((c) => c?.name === 'user_id');
+    if (!hasUserIdCol) {
+      await metaDb
+        .prepare("ALTER TABLE agent_runs ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'")
+        .run()
+        .catch(() => undefined);
+    }
   }
 }
 
@@ -369,45 +377,142 @@ export async function cancelAgentRun(
   return { ok: true, status: 200 };
 }
 
-function extractSelectorHostname(rawSelector: string): string | null {
-  const clean = rawSelector.trim().toLowerCase().replace(/^\*\./, '');
-  if (!clean || clean.length > 253) return null;
-  if (clean.startsWith('https://') || clean.startsWith('http://')) {
-    try {
-      const u = new URL(clean);
-      const h = u.hostname.toLowerCase().replace(/^www\./, '').replace(/\.+$/, '');
-      return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(h) ? h : null;
-    } catch {
-      return null;
-    }
-  }
-  const h = clean.replace(/^www\./, '').replace(/\.+$/, '');
-  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(h)) {
-    return null;
-  }
-  return h;
+export const UNTRUSTED_REMOTE_PARAM_PREFIX = '[UNTRUSTED_REMOTE_PARAM] ';
+const MAX_REMOTE_PARAM_DESC_CHARS = 160;
+const ALLOWED_AGENT_TOOL_SCHEMA_TYPES = new Set([
+  'object',
+  'string',
+  'number',
+  'integer',
+  'boolean',
+  'array',
+  'null',
+]);
+const FORBIDDEN_AGENT_SCHEMA_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const SAFE_REMOTE_ENUM_TOKEN_RE = /^[A-Za-z0-9_.:/-]{1,32}$/;
+
+/**
+ * S7 Security Invariant: `mcpServers` selectors match STRICTLY by exact connector `id` or exact connector `slug`
+ * (case-normalized). Never matches by domain, hostname, URL, or suffix!
+ */
+export function doesMcpServerSelectorMatchRow(rawSelector: string, row: StoredMcpServerRow): boolean {
+  const sel = rawSelector.trim().toLowerCase();
+  if (!sel || sel.length > 128) return false;
+  return row.id.toLowerCase() === sel || row.slug.toLowerCase() === sel;
 }
 
-function doesMcpServerSelectorMatchRow(rawSelector: string, row: StoredMcpServerRow): boolean {
-  const sel = rawSelector.trim().toLowerCase();
-  if (!sel || sel.length > 253) return false;
-  if (row.id.toLowerCase() === sel || row.slug.toLowerCase() === sel) {
-    return true;
+/**
+ * P7 Security Invariant: Rebuilds remote MCP tool parameter schemas for the LLM `tools` channel so ZERO unmarked
+ * remote parameter descriptions, `enum` values, `title`s, `default`s, or `examples` ever reach the model:
+ *  - Strips `title`, `default`, `examples`, `$defs`, `$comment`, `const`, and raw `enum` arrays.
+ *  - Sanitizes, flattens, truncates (`<= 160` chars), and prefixes parameter `description`s with `[UNTRUSTED_REMOTE_PARAM] `
+ *    (dropping any description that triggers prompt-injection detection).
+ *  - Summarizes at most 12 short, safe primitive `enum` tokens inside the `[UNTRUSTED_REMOTE_PARAM]` description rather
+ *    than emitting unmarked remote `enum` strings into the LLM tool declaration.
+ */
+export function sanitizeRemoteToolSchemaForLlm(rawNode: unknown, depth = 0): Record<string, unknown> {
+  if (!rawNode || typeof rawNode !== 'object' || Array.isArray(rawNode) || depth > 5) {
+    return depth === 0 ? { type: 'object', properties: {} } : {};
   }
-  const selHost = extractSelectorHostname(sel);
-  if (!selHost) return false;
-  try {
-    const originHost = new URL(row.remoteOrigin).hostname.toLowerCase().replace(/^www\./, '');
-    if (originHost && selHost === originHost) return true;
-  } catch {
-    // ignore malformed remoteOrigin
+  const src = rawNode as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+
+  if (typeof src.type === 'string' && ALLOWED_AGENT_TOOL_SCHEMA_TYPES.has(src.type)) {
+    out.type = src.type;
+  } else if (Array.isArray(src.type)) {
+    const validTypes = src.type
+      .filter((t): t is string => typeof t === 'string' && ALLOWED_AGENT_TOOL_SCHEMA_TYPES.has(t))
+      .slice(0, 4);
+    if (validTypes.length > 0) out.type = validTypes;
+  } else if (depth === 0) {
+    out.type = 'object';
   }
-  return row.domains.some((rawDom) => {
-    const valid = validateConnectorDomains([rawDom], row.remoteOrigin, true);
-    if (!valid.ok || valid.domains.length === 0) return false;
-    const allowedDomain = valid.domains[0]!;
-    return selHost === allowedDomain || selHost.endsWith(`.${allowedDomain}`);
-  });
+
+  let cleanDescPart = '';
+  if (typeof src.description === 'string' && src.description.trim()) {
+    const preClean = stripMcpSmugglingChars(src.description).replace(/[`<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (preClean) {
+      const piCheck = sanitizeRemoteMcpText(preClean, 200);
+      if (!piCheck.detected && piCheck.text.trim()) {
+        cleanDescPart = sanitizeMcpMarkdownOutput(piCheck.text, undefined, 200)
+          .replace(/[`<>]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+    }
+  }
+
+  const safeEnumHints: string[] = [];
+  if (Array.isArray(src.enum)) {
+    for (const ev of src.enum.slice(0, 12)) {
+      if (typeof ev === 'string') {
+        const cleanEv = stripMcpSmugglingChars(ev).trim();
+        if (!cleanEv || !SAFE_REMOTE_ENUM_TOKEN_RE.test(cleanEv)) continue;
+        if (!isSafeMcpIdentifier(cleanEv.replace(/[/:]/g, '_'))) continue;
+        const evPi = sanitizeRemoteMcpText(cleanEv, 48);
+        if (evPi.detected) continue;
+        safeEnumHints.push(cleanEv);
+      } else if (typeof ev === 'number' && Number.isFinite(ev)) {
+        safeEnumHints.push(String(ev));
+      } else if (typeof ev === 'boolean') {
+        safeEnumHints.push(String(ev));
+      }
+    }
+  }
+
+  if (cleanDescPart || safeEnumHints.length > 0) {
+    const enumSuffix = safeEnumHints.length > 0 ? `untrusted enum hints: ${safeEnumHints.join(', ')}` : '';
+    const combined =
+      cleanDescPart && enumSuffix
+        ? `${cleanDescPart} (${enumSuffix})`
+        : cleanDescPart || enumSuffix;
+    const maxBodyLen = MAX_REMOTE_PARAM_DESC_CHARS - UNTRUSTED_REMOTE_PARAM_PREFIX.length;
+    const truncatedBody = combined.length > maxBodyLen ? `${combined.slice(0, Math.max(1, maxBodyLen - 3)).trimEnd()}...` : combined;
+    out.description = `${UNTRUSTED_REMOTE_PARAM_PREFIX}${truncatedBody}`;
+  }
+
+  let validPropKeys: Set<string> | null = null;
+  if (src.properties && typeof src.properties === 'object' && !Array.isArray(src.properties)) {
+    const cleanProps: Record<string, unknown> = {};
+    validPropKeys = new Set<string>();
+    for (const [rawKey, rawVal] of Object.entries(src.properties as Record<string, unknown>).slice(0, 32)) {
+      const cleanKey = stripMcpSmugglingChars(rawKey).trim();
+      if (!isSafeMcpIdentifier(cleanKey) || FORBIDDEN_AGENT_SCHEMA_KEYS.has(cleanKey)) continue;
+      if (sanitizeRemoteMcpText(cleanKey, 64).detected) continue;
+      cleanProps[cleanKey] = sanitizeRemoteToolSchemaForLlm(rawVal, depth + 1);
+      validPropKeys.add(cleanKey);
+    }
+    out.properties = cleanProps;
+  } else if (out.type === 'object' && depth === 0) {
+    out.properties = {};
+  }
+
+  if (Array.isArray(src.required)) {
+    const reqOut: string[] = [];
+    for (const r of src.required.slice(0, 32)) {
+      if (typeof r === 'string' && isSafeMcpIdentifier(r) && (!validPropKeys || validPropKeys.has(r))) {
+        if (!reqOut.includes(r)) reqOut.push(r);
+      }
+    }
+    if (reqOut.length > 0) out.required = reqOut;
+  }
+
+  if (src.items && typeof src.items === 'object' && !Array.isArray(src.items)) {
+    out.items = sanitizeRemoteToolSchemaForLlm(src.items, depth + 1);
+  }
+  if (typeof src.minimum === 'number' && Number.isFinite(src.minimum)) out.minimum = src.minimum;
+  if (typeof src.maximum === 'number' && Number.isFinite(src.maximum)) out.maximum = src.maximum;
+  if (typeof src.minLength === 'number' && Number.isInteger(src.minLength) && src.minLength >= 0 && src.minLength <= 1_048_576) {
+    out.minLength = src.minLength;
+  }
+  if (typeof src.maxLength === 'number' && Number.isInteger(src.maxLength) && src.maxLength >= 0 && src.maxLength <= 1_048_576) {
+    out.maxLength = src.maxLength;
+  }
+  if (typeof src.additionalProperties === 'boolean') {
+    out.additionalProperties = src.additionalProperties;
+  }
+
+  return out;
 }
 
 function buildAgentTools(
@@ -455,10 +560,7 @@ function buildAgentTools(
         tools.push({
           name: compositeName,
           description: 'Invoke permitted cached MCP tool on verified connector.',
-          parameters:
-            cachedTool.inputSchema && typeof cachedTool.inputSchema === 'object'
-              ? cachedTool.inputSchema
-              : { type: 'object', properties: {} },
+          parameters: sanitizeRemoteToolSchemaForLlm(cachedTool.inputSchema),
         });
         exposedDirectCount++;
       }
@@ -1419,8 +1521,8 @@ export async function startOrExecuteAgentCall(params: {
             };
           }
 
-          // H4: Resolve `args.server` to a concrete vault connector row FIRST, then require that resolved row's `id`
-          // to belong to `allowedConnectorIds` (preventing suffix/domain confusion to a non-allowed connector!).
+          // S7 & H4: Match `args.server` STRICTLY by exact connector `id` or exact connector `slug` against
+          // `userConnectedMcps` (never by domain, hostname, URL, or suffix!), then verify live vault state.
           const requestedServerArg = typeof args.server === 'string' ? args.server.trim() : '';
           if (!requestedServerArg) {
             return {
@@ -1428,8 +1530,27 @@ export async function startOrExecuteAgentCall(params: {
               summaryForLlm: JSON.stringify({ error: 'missing_server', message: 'server is required for query_mcp.' }),
             };
           }
-          const resolvedVaultRow = await vaultStore.getServer(effectiveUserId, requestedServerArg);
-          if (!resolvedVaultRow || !resolvedVaultRow.enabled || !allowedConnectorIds.has(resolvedVaultRow.id)) {
+          const reqSelectorNorm = requestedServerArg.toLowerCase();
+          const matchedAllowedServer = userConnectedMcps.find(
+            (s) => s.id.toLowerCase() === reqSelectorNorm || s.slug.toLowerCase() === reqSelectorNorm,
+          );
+          if (!matchedAllowedServer || !allowedConnectorIds.has(matchedAllowedServer.id)) {
+            return {
+              ok: false,
+              summaryForLlm: JSON.stringify({
+                error: 'mcp_server_not_allowed',
+                message: 'Resolved MCP connector is not in the allowed mcpServers set for this agent run.',
+              }),
+            };
+          }
+          const resolvedVaultRow = await vaultStore.getServer(effectiveUserId, matchedAllowedServer.slug);
+          if (
+            !resolvedVaultRow ||
+            !resolvedVaultRow.enabled ||
+            resolvedVaultRow.id !== matchedAllowedServer.id ||
+            (resolvedVaultRow.id.toLowerCase() !== reqSelectorNorm && resolvedVaultRow.slug.toLowerCase() !== reqSelectorNorm) ||
+            !allowedConnectorIds.has(resolvedVaultRow.id)
+          ) {
             return {
               ok: false,
               summaryForLlm: JSON.stringify({

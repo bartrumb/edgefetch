@@ -98,65 +98,88 @@ func matchURLSchemeAt(s string, i int) (sep urlSepKind, afterSep int) {
 		}
 	}
 	rem := s[i:]
-	if c0 == 'm' && hasPrefixFoldASCII(rem, "mailto:") {
-		if len(rem) > 7 && rem[7] > ' ' {
-			return urlSepMailto, i + 7
-		}
-		return urlSepNone, 0
-	}
 	schemeLen := 0
-	switch {
-	case hasPrefixFoldASCII(rem, "https"):
-		schemeLen = 5
-	case hasPrefixFoldASCII(rem, "http"):
-		schemeLen = 4
-	case hasPrefixFoldASCII(rem, "wss"):
-		schemeLen = 3
-	case hasPrefixFoldASCII(rem, "ws"):
-		schemeLen = 2
-	case hasPrefixFoldASCII(rem, "ftps"):
-		schemeLen = 4
-	case hasPrefixFoldASCII(rem, "ftp"):
-		schemeLen = 3
-	case hasPrefixFoldASCII(rem, "file"):
-		schemeLen = 4
-	case hasPrefixFoldASCII(rem, "sftp"):
-		schemeLen = 4
-	case hasPrefixFoldASCII(rem, "ssh"):
-		schemeLen = 3
-	case hasPrefixFoldASCII(rem, "s3"):
-		schemeLen = 2
-	case hasPrefixFoldASCII(rem, "gs"):
-		schemeLen = 2
-	case hasPrefixFoldASCII(rem, "socks5h"):
-		schemeLen = 7
-	case hasPrefixFoldASCII(rem, "socks5"):
-		schemeLen = 6
-	case hasPrefixFoldASCII(rem, "rediss"):
-		schemeLen = 6
-	case hasPrefixFoldASCII(rem, "redis"):
-		schemeLen = 5
-	case hasPrefixFoldASCII(rem, "postgresql"):
-		schemeLen = 10
-	case hasPrefixFoldASCII(rem, "postgres"):
-		schemeLen = 8
-	case hasPrefixFoldASCII(rem, "mongodb+srv"):
-		schemeLen = 11
-	case hasPrefixFoldASCII(rem, "mongodb"):
-		schemeLen = 7
-	case hasPrefixFoldASCII(rem, "mysql"):
-		schemeLen = 5
-	case hasPrefixFoldASCII(rem, "amqps"):
-		schemeLen = 5
-	case hasPrefixFoldASCII(rem, "amqp"):
-		schemeLen = 4
-	case hasPrefixFoldASCII(rem, "ldaps"):
-		schemeLen = 5
-	case hasPrefixFoldASCII(rem, "ldap"):
-		schemeLen = 4
-	case hasPrefixFoldASCII(rem, "nats"):
-		schemeLen = 4
-	default:
+	switch c0 {
+	case 'h':
+		if hasPrefixFoldASCII(rem, "https") {
+			schemeLen = 5
+		} else if hasPrefixFoldASCII(rem, "http") {
+			schemeLen = 4
+		}
+	case 'w':
+		if hasPrefixFoldASCII(rem, "wss") {
+			schemeLen = 3
+		} else if hasPrefixFoldASCII(rem, "ws") {
+			schemeLen = 2
+		}
+	case 'f':
+		if hasPrefixFoldASCII(rem, "ftps") {
+			schemeLen = 4
+		} else if hasPrefixFoldASCII(rem, "ftp") {
+			schemeLen = 3
+		} else if hasPrefixFoldASCII(rem, "file") {
+			schemeLen = 4
+		}
+	case 's':
+		if hasPrefixFoldASCII(rem, "socks5h") {
+			schemeLen = 7
+		} else if hasPrefixFoldASCII(rem, "socks5") {
+			schemeLen = 6
+		} else if hasPrefixFoldASCII(rem, "sftp") {
+			schemeLen = 4
+		} else if hasPrefixFoldASCII(rem, "ssh") {
+			schemeLen = 3
+		} else if hasPrefixFoldASCII(rem, "s3") {
+			schemeLen = 2
+		}
+	case 'g':
+		if hasPrefixFoldASCII(rem, "gs") {
+			schemeLen = 2
+		}
+	case 'r':
+		if hasPrefixFoldASCII(rem, "rediss") {
+			schemeLen = 6
+		} else if hasPrefixFoldASCII(rem, "redis") {
+			schemeLen = 5
+		}
+	case 'p':
+		if hasPrefixFoldASCII(rem, "postgresql") {
+			schemeLen = 10
+		} else if hasPrefixFoldASCII(rem, "postgres") {
+			schemeLen = 8
+		}
+	case 'm':
+		if hasPrefixFoldASCII(rem, "mailto:") {
+			if len(rem) > 7 && rem[7] > ' ' {
+				return urlSepMailto, i + 7
+			}
+			return urlSepNone, 0
+		}
+		if hasPrefixFoldASCII(rem, "mongodb+srv") {
+			schemeLen = 11
+		} else if hasPrefixFoldASCII(rem, "mongodb") {
+			schemeLen = 7
+		} else if hasPrefixFoldASCII(rem, "mysql") {
+			schemeLen = 5
+		}
+	case 'a':
+		if hasPrefixFoldASCII(rem, "amqps") {
+			schemeLen = 5
+		} else if hasPrefixFoldASCII(rem, "amqp") {
+			schemeLen = 4
+		}
+	case 'l':
+		if hasPrefixFoldASCII(rem, "ldaps") {
+			schemeLen = 5
+		} else if hasPrefixFoldASCII(rem, "ldap") {
+			schemeLen = 4
+		}
+	case 'n':
+		if hasPrefixFoldASCII(rem, "nats") {
+			schemeLen = 4
+		}
+	}
+	if schemeLen == 0 {
 		return urlSepNone, 0
 	}
 	tail := rem[schemeLen:]
@@ -607,11 +630,11 @@ func isValidBareDomainHost(h string) bool {
 	if len(h) < 4 {
 		return false
 	}
-	if strings.EqualFold(h, "localhost") {
-		return true
+	if strings.IndexByte(h, '.') < 0 {
+		return strings.EqualFold(h, "localhost")
 	}
 	// Check IPv4 literal a.b.c.d
-	if h[0] >= '0' && h[0] <= '9' {
+	if len(h) >= 7 && len(h) <= 15 && h[0] >= '0' && h[0] <= '9' {
 		endIP, _, ok := matchIPPortToken(h+":80", 0)
 		if ok && endIP == len(h)+3 {
 			return true
@@ -1023,9 +1046,22 @@ func RedactEmbeddedURLs(s string) string {
 	hasSlash := strings.IndexByte(s, '/') >= 0
 	hasPct := strings.IndexByte(s, '%') >= 0
 	hasAt := strings.IndexByte(s, '@') >= 0
+	hasDotOrBracket := strings.IndexByte(s, '.') >= 0 || strings.IndexByte(s, '[') >= 0
+	hasResolver := hasColon && hasDotOrBracket
+	hasScheme := hasPct ||
+		strings.Index(s, "//") >= 0 ||
+		((hasColon || hasSlash) && strings.IndexByte(s, '\\') >= 0) ||
+		(hasColon && strings.ContainsAny(s, "mM") && (strings.Index(s, "mailto:") >= 0 || strings.ContainsAny(s, "MAILTO")))
+	hasBare := (hasColon || hasSlash) &&
+		(hasDotOrBracket || strings.Index(s, "localhost") >= 0 || strings.ContainsAny(s, "LOCALHOST"))
 	hasSecretKw := (hasColon || strings.IndexByte(s, ' ') >= 0 || strings.IndexByte(s, '=') >= 0) &&
-		strings.ContainsAny(s, "eEiIoO")
-	if !hasColon && !hasSlash && !hasPct && !hasAt && !hasSecretKw {
+		(strings.Index(s, "bearer") >= 0 ||
+			strings.Index(s, "basic") >= 0 ||
+			strings.Index(s, "token") >= 0 ||
+			strings.Index(s, "api_key") >= 0 ||
+			strings.Index(s, "apikey") >= 0 ||
+			(strings.ContainsAny(s, "BTA") && strings.ContainsAny(s, "eEiIoO")))
+	if !hasResolver && !hasScheme && !hasAt && !hasBare && !hasSecretKw {
 		return s
 	}
 
@@ -1036,7 +1072,11 @@ func RedactEmbeddedURLs(s string) string {
 	seenLookup := false
 	i := 0
 	for i < len(s) {
-		if hasColon {
+		if s[i] <= ' ' {
+			i++
+			continue
+		}
+		if hasResolver {
 			if asciiLowerByte(s[i]) == 'l' &&
 				(i == 0 || !((asciiLowerByte(s[i-1]) >= 'a' && asciiLowerByte(s[i-1]) <= 'z') || (s[i-1] >= '0' && s[i-1] <= '9'))) &&
 				hasPrefixFoldASCII(s[i:], "lookup ") {
@@ -1053,7 +1093,7 @@ func RedactEmbeddedURLs(s string) string {
 				continue
 			}
 		}
-		if hasColon || hasSlash || hasPct {
+		if hasScheme {
 			kind, afterSep := matchURLSchemeAt(s, i)
 			if kind != urlSepNone {
 				endIdx := afterSep
@@ -1153,7 +1193,7 @@ func RedactEmbeddedURLs(s string) string {
 		}
 
 		// Bare `host.tld:8443/secret`, `[::1]:8080/secret?tok=1`, or `host.tld/path?key=...#tok=...`
-		if (hasColon || hasSlash) && i >= bareSkipUntil {
+		if hasBare && i >= bareSkipUntil {
 			endIdx, scrubbed, skipTo, matched := tryMatchBareHostURLAt(s, i)
 			if matched {
 				if out.Cap() == 0 {
@@ -1212,6 +1252,18 @@ func RedactEmbeddedURLs(s string) string {
 			}
 		}
 		i++
+		if !hasAt && !hasPct {
+			for i < bareSkipUntil {
+				prev := s[i-1]
+				cur := s[i]
+				if ((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9')) &&
+					((cur >= 'a' && cur <= 'z') || (cur >= 'A' && cur <= 'Z') || (cur >= '0' && cur <= '9')) {
+					i++
+					continue
+				}
+				break
+			}
+		}
 	}
 	if copiedUpTo == 0 {
 		return s

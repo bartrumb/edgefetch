@@ -614,7 +614,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         liedRowCount: 0,
         bombRowCount: 0,
         expiredBlobSha: 'ee'.repeat(32),
-        derivedPipelineVersion: 32,
+        derivedPipelineVersion: 33,
         derivedR2Text: 'Verified stored article payload!',
         unverifiedDeriveStatus: 'unverified',
         capacityStopStatus: 'capacity_reached',
@@ -740,7 +740,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       const liveScrapeJson = await liveScrapeRes.json();
       assert.equal(liveScrapeJson.ok, true);
       assert.equal(liveScrapeJson.cached, false);
-      assert.equal(liveScrapeJson.pipelineVersion, 32);
+      assert.equal(liveScrapeJson.pipelineVersion, 33);
       assert.equal(liveScrapeJson.llms?.found, true);
       assert.deepEqual(liveScrapeJson.json, { name: 'Rear Axle', torqueNm: 35 });
       assert.match(liveScrapeJson.markdown, /# Torque Guide/);
@@ -760,7 +760,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(cachedScrapeRes.headers.get('x-crawler-via'), 'cache:r2-d1');
       const cachedScrapeJson = await cachedScrapeRes.json();
       assert.equal(cachedScrapeJson.cached, true);
-      assert.equal(cachedScrapeJson.pipelineVersion, 32);
+      assert.equal(cachedScrapeJson.pipelineVersion, 33);
       assert.match(cachedScrapeJson.markdown, /35 Nm/);
       assert.equal(scrapeAgentDispatches, 1);
 
@@ -838,7 +838,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
       assert.equal(extractJson.results[0].rawContent, undefined);
       assert.match(extractJson.results[0].chunks[0].text, /titanium stem bolts to 6 Nm/);
 
-      // V2-1: POST /v1/interact returns 503 fat_agent_required when only a Lite (non-browser-v1) node is connected!
+      // V2-1: POST /v1/interact returns 503 browser_worker_required when only a Lite (non-browser-v1) node is connected!
       const noFatRes = await mf.dispatchFetch(`${ORIGIN}/v1/interact`, {
         method: 'POST',
         headers: authz,
@@ -848,7 +848,7 @@ test('S1 workerd storage suite: optional ARTIFACTS R2 + META D1 + SEARCH D1 FTS5
         }),
       });
       assert.equal(noFatRes.status, 503);
-      assert.equal((await noFatRes.json()).error, 'fat_agent_required');
+      assert.equal((await noFatRes.json()).error, 'browser_worker_required');
 
       // Connect a FAT node (`browser-v1,pdf-v1`) on site-1 -> interact routes to it and composite sessionId pins follow-up turns!
       wsScrape.close(1000, 'upgrade-to-fat');

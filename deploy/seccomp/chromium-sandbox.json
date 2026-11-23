@@ -4,16 +4,11 @@
   "archMap": [
     {
       "architecture": "SCMP_ARCH_X86_64",
-      "subArchitectures": [
-        "SCMP_ARCH_X86",
-        "SCMP_ARCH_X32"
-      ]
+      "subArchitectures": []
     },
     {
       "architecture": "SCMP_ARCH_AARCH64",
-      "subArchitectures": [
-        "SCMP_ARCH_ARM"
-      ]
+      "subArchitectures": []
     }
   ],
   "syscalls": [
@@ -605,7 +600,7 @@
       "action": "SCMP_ACT_ALLOW"
     },
     {
-      "comment": "x86_64 / x32 TLS and shadow-stack syscalls gated strictly to amd64/x32",
+      "comment": "x86_64 TLS and shadow-stack syscalls gated strictly to 64-bit amd64",
       "names": [
         "arch_prctl",
         "get_thread_area",
@@ -615,13 +610,12 @@
       "action": "SCMP_ACT_ALLOW",
       "includes": {
         "arches": [
-          "amd64",
-          "x32"
+          "amd64"
         ]
       }
     },
     {
-      "comment": "ARM64 / ARMv7 syscalls gated strictly to arm64/arm",
+      "comment": "ARM64 syscalls gated strictly to 64-bit arm64",
       "names": [
         "arm_fadvise64_64",
         "arm_sync_file_range",
@@ -631,7 +625,6 @@
       "action": "SCMP_ACT_ALLOW",
       "includes": {
         "arches": [
-          "arm",
           "arm64"
         ]
       }

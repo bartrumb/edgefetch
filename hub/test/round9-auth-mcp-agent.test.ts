@@ -934,6 +934,7 @@ test('R9-MultiUser: Per-user OAuth grant cap never evicts founder/other users, m
     assert.equal((await dispatch(`/v1/artifacts/${batchSha}`, { headers: { authorization: `Bearer ${aliceBearer}` } })).status, 200);
     assert.equal((await dispatch(`/v1/artifacts/${batchSha}`, { headers: { authorization: `Bearer ${TEST_OWNER_TOKEN}` } })).status, 404);
 
+    // U1 (Round 10): Raw `/fetch` and `/fetch/batch` require `CALLER_TOKEN` strictly; member OAuth `efa_*` tokens get 401!
     const directFetch = await dispatch('/fetch?artifacts=stored&hydrate=false', {
       method: 'POST',
       headers: { authorization: `Bearer ${aliceBearer}`, 'content-type': 'application/json' },
@@ -942,19 +943,24 @@ test('R9-MultiUser: Per-user OAuth grant cap never evicts founder/other users, m
         requests: [{ id: 'f1', url: 'https://docs.example.com/direct-fetch' }],
       }),
     });
-    assert.equal(directFetch.status, 200);
-    const directParsed = (await directFetch.json()) as { results: Array<{ body?: string; artifact?: { blobSha256: string } }> };
-    assert.equal(directParsed.results[0]!.body, undefined, 'hydrate=false omits inline body');
-    const directSha = directParsed.results[0]!.artifact!.blobSha256;
-    assert.equal((await dispatch(`/v1/artifacts/${directSha}`, { headers: { authorization: `Bearer ${aliceBearer}` } })).status, 200);
-    assert.equal((await dispatch(`/v1/artifacts/${directSha}`, { headers: { authorization: `Bearer ${bobBearer}` } })).status, 404);
+    assert.equal(directFetch.status, 401);
+    assert.deepEqual(await directFetch.json(), { error: 'unauthorized' });
 
     const directBatchHttp = await dispatch('/fetch/batch?artifacts=stored', {
       method: 'POST',
       headers: { authorization: `Bearer ${aliceBearer}`, 'content-type': 'application/json' },
       body: JSON.stringify({ urls: ['https://docs.example.com/http-batch-1'] }),
     });
-    assert.equal(directBatchHttp.status, 200);
+    assert.equal(directBatchHttp.status, 401);
+    assert.deepEqual(await directBatchHttp.json(), { error: 'unauthorized' });
+
+    // Member OAuth tokens use `/v1/*` (e.g. `/v1/scrape` with stored artifacts), where per-user isolation is enforced
+    const v1AliceScrape = await dispatch('/v1/scrape', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${aliceBearer}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ url: 'https://docs.example.com/direct-fetch' }),
+    });
+    assert.equal(v1AliceScrape.status, 200);
 
     // Static MCP_TOKEN (non-owner, non-OAuth) MUST still get 401 on raw `/fetch`
     const mcpTokOnFetch = await dispatch('/fetch', {

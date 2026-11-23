@@ -977,14 +977,6 @@ func validateManifestRulesGo(m *DeclarativeAdapterManifest) error {
 		return fmt.Errorf("manifest %q must define routes, match/twin/extract, htmlRoutes, or catalog", m.ID)
 	}
 
-	hasWildcard := m.UniversalEngine
-	for _, d := range m.Domains {
-		if strings.Contains(d, "*") {
-			hasWildcard = true
-			break
-		}
-	}
-
 	for i, r := range m.Routes {
 		if r.Twin.Kind != "json" && r.Twin.Kind != "text" {
 			return fmt.Errorf("manifest %q route %d has unsupported twin kind %q", m.ID, i, r.Twin.Kind)
@@ -997,12 +989,34 @@ func validateManifestRulesGo(m *DeclarativeAdapterManifest) error {
 			if !strings.HasPrefix(fu, "https://") && !strings.HasPrefix(fu, "{origin}/") {
 				return fmt.Errorf("manifest %q route %d fetchUrl must use https://", m.ID, i)
 			}
-			if (strings.Contains(fu, "{host}") || strings.Contains(fu, "{origin}")) && hasWildcard {
-				if !strings.HasPrefix(fu, "https://{host}/") && !strings.HasPrefix(fu, "{origin}/") {
-					return fmt.Errorf("manifest %q route %d cannot interpolate {host} into non-origin URL %q on wildcard/universal adapter (M2)", m.ID, i, fu)
+			if strings.Contains(fu, "{host}") || strings.Contains(fu, "{origin}") {
+				if (!strings.HasPrefix(fu, "https://{host}/") && !strings.HasPrefix(fu, "{origin}/")) ||
+					strings.HasPrefix(fu, "https://{host}//") || strings.HasPrefix(fu, "{origin}//") {
+					return fmt.Errorf("manifest %q route %d cannot interpolate {host}/{origin} into non-origin URL %q (M2)", m.ID, i, fu)
+				}
+				restAfterOrigin := strings.TrimPrefix(fu, "https://{host}/")
+				if strings.HasPrefix(fu, "{origin}/") {
+					restAfterOrigin = strings.TrimPrefix(fu, "{origin}/")
+				}
+				if strings.Contains(restAfterOrigin, "{origin}") {
+					return fmt.Errorf("manifest %q route %d cannot repeat {origin} in fetchUrl %q (M2)", m.ID, i, fu)
+				}
+				dynSample := expandTemplate(fu, func(k string) string {
+					switch k {
+					case "host":
+						return "example.com"
+					case "origin":
+						return "https://example.com"
+					default:
+						return "sample"
+					}
+				})
+				parsedDyn, dErr := url.Parse(dynSample)
+				if dErr != nil || !isSafePublicTwinURL(dynSample) || strings.ToLower(parsedDyn.Hostname()) != "example.com" {
+					return fmt.Errorf("manifest %q route %d fetchUrl failed same-origin public HTTPS check: %q", m.ID, i, fu)
 				}
 			}
-			if !strings.HasPrefix(fu, "https://{host}") && !strings.HasPrefix(fu, "{origin}") {
+			if !strings.HasPrefix(fu, "https://{host}/") && !strings.HasPrefix(fu, "{origin}/") {
 				sample := expandTemplate(fu, func(string) string { return "sample" })
 				if !isSafePublicTwinURL(sample) {
 					return fmt.Errorf("manifest %q route %d fetchUrl failed public HTTPS check: %q", m.ID, i, fu)
@@ -1144,7 +1158,7 @@ func ValidateDeclarativeManifests(manifests []DeclarativeAdapterManifest) error 
 			twinOwners[tid] = m.ID
 
 			fu := r.Twin.FetchURL
-			if fu != "{requestUrl}" && !strings.HasPrefix(fu, "https://{host}") && !strings.HasPrefix(fu, "{origin}") {
+			if fu != "{requestUrl}" && !strings.HasPrefix(fu, "https://{host}/") && !strings.HasPrefix(fu, "{origin}/") {
 				sample := expandTemplate(fu, func(string) string { return "sample" })
 				parsedSample, pErr := url.Parse(sample)
 				if pErr != nil {
@@ -3040,6 +3054,305 @@ func (m *DeclarativeTwinMatch) formatTextTwin(rawBody string) (*DeclarativeForma
 	}
 }
 
+func escapeCommerceTextGo(raw string, maxRunes int, unescapeEntities bool) string {
+	if raw == "" {
+		return ""
+	}
+	s := stripInvisibleAndNUL(raw)
+	if unescapeEntities && strings.IndexByte(s, '&') >= 0 {
+		s = html.UnescapeString(s)
+		s = stripInvisibleAndNUL(s)
+	}
+	var flat strings.Builder
+	flat.Grow(len(s))
+	prevSpace := true
+	for _, r := range s {
+		if r == '\r' || r == '\n' || r == '\t' || r == 0x0085 || r == 0x2028 || r == 0x2029 || r == ' ' {
+			if !prevSpace {
+				flat.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		prevSpace = false
+		flat.WriteRune(r)
+	}
+	clean := strings.TrimSpace(flat.String())
+	if clean == "" {
+		return ""
+	}
+	if maxRunes > 0 {
+		clean = strings.TrimSpace(sliceRunesMax(clean, maxRunes))
+		if clean == "" {
+			return ""
+		}
+	}
+
+	var out strings.Builder
+	out.Grow(len(clean) + 8)
+	for i := 0; i < len(clean); i++ {
+		c := clean[i]
+		switch c {
+		case '<':
+			out.WriteString("&lt;")
+		case '[':
+			out.WriteString(`\[`)
+		case ']':
+			out.WriteString(`\]`)
+		case '`':
+			out.WriteString("\\`")
+		case '#':
+			if i == 0 || clean[i-1] == ' ' {
+				out.WriteString(`\#`)
+			} else {
+				out.WriteByte('#')
+			}
+		case '>':
+			if i == 0 {
+				out.WriteString(`\>`)
+			} else {
+				out.WriteByte('>')
+			}
+		case '-', '*', '+', '=':
+			if i == 0 && (i+1 == len(clean) || clean[i+1] == ' ' || clean[i+1] == c) {
+				out.WriteByte('\\')
+			}
+			out.WriteByte(c)
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return escapeBareProtocolRelativeUrlsLinearGo(out.String())
+}
+
+func escapeCommerceDescriptionGo(rawHTML string, maxRunes int) string {
+	if strings.TrimSpace(rawHTML) == "" {
+		return ""
+	}
+	s := stripInvisibleAndNUL(rawHTML)
+	if strings.IndexByte(s, '<') >= 0 && strings.IndexByte(s, '>') >= 0 {
+		s = stripDangerousHTMLSubtreesGo(s)
+	}
+	plain := stripTagsInlineLinear(s)
+	return escapeCommerceTextGo(plain, maxRunes, false)
+}
+
+func formatCommerceSKUSpanGo(raw string) string {
+	if raw == "" {
+		return "`-`"
+	}
+	s := stripInvisibleAndNUL(raw)
+	var flat strings.Builder
+	flat.Grow(len(s))
+	prevSpace := true
+	for _, r := range s {
+		if r == '\r' || r == '\n' || r == '\t' || r == 0x0085 || r == 0x2028 || r == 0x2029 || r == ' ' {
+			if !prevSpace {
+				flat.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		prevSpace = false
+		flat.WriteRune(r)
+	}
+	clean := strings.TrimSpace(sliceRunesMax(flat.String(), 160))
+	if clean == "" {
+		return "`-`"
+	}
+	// Escape `<`, `[`, `]` without stripping any SKU characters (`|`, `` ` ``, `#`, `<`, `[`, `]` all preserved!).
+	var esc strings.Builder
+	esc.Grow(len(clean) + 4)
+	maxTickRun := 0
+	curTickRun := 0
+	for i := 0; i < len(clean); i++ {
+		c := clean[i]
+		if c == '`' {
+			curTickRun++
+			if curTickRun > maxTickRun {
+				maxTickRun = curTickRun
+			}
+			esc.WriteByte('`')
+			continue
+		}
+		curTickRun = 0
+		switch c {
+		case '<':
+			esc.WriteString("&lt;")
+		case '[':
+			esc.WriteString(`\[`)
+		case ']':
+			esc.WriteString(`\]`)
+		default:
+			esc.WriteByte(c)
+		}
+	}
+	body := esc.String()
+	fence := strings.Repeat("`", maxTickRun+1)
+	if body[0] == '`' || body[len(body)-1] == '`' || body[0] == ' ' || body[len(body)-1] == ' ' {
+		return fence + " " + body + " " + fence
+	}
+	return fence + body + fence
+}
+
+func sanitizeCommerceDateGo(raw string) string {
+	return escapeCommerceTextGo(raw, 64, false)
+}
+
+func normalizeSafePublicCommerceImageURLGo(raw string) string {
+	s := strings.TrimSpace(stripInvisibleAndNUL(raw))
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "//") {
+		s = "https:" + s
+	}
+	if !isSafePublicTwinURL(s) || !isSafePublicHTTPSFeedURL(s) {
+		return ""
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	h := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if IsPublicOrPrivateSuffix(h) {
+		return ""
+	}
+	return s
+}
+
+func collectSafeCommerceImagesGo(rawImages any, maxImages int) []string {
+	arr, isArr := rawImages.([]any)
+	if !isArr || len(arr) == 0 {
+		return nil
+	}
+	if maxImages <= 0 || maxImages > 50 {
+		maxImages = 20
+	}
+	var out []string
+	seen := make(map[string]bool)
+	for _, item := range arr {
+		var cand string
+		switch tv := item.(type) {
+		case string:
+			cand = tv
+		case map[string]any:
+			cand = jsonScalarToString(tv["src"])
+			if cand == "" {
+				cand = jsonScalarToString(tv["url"])
+			}
+		}
+		u := normalizeSafePublicCommerceImageURLGo(cand)
+		if u != "" && !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+			if len(out) >= maxImages {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func formatCommerceTagsGo(rawTags any) string {
+	var parts []string
+	switch tv := rawTags.(type) {
+	case string:
+		for _, tok := range strings.Split(tv, ",") {
+			if clean := escapeCommerceTextGo(tok, 120, false); clean != "" {
+				parts = append(parts, clean)
+				if len(parts) >= 30 {
+					break
+				}
+			}
+		}
+	case []any:
+		for _, el := range tv {
+			var cand string
+			if m, isM := el.(map[string]any); isM {
+				cand = jsonScalarToString(m["name"])
+			} else {
+				cand = jsonScalarToString(el)
+			}
+			if clean := escapeCommerceTextGo(cand, 120, true); clean != "" {
+				parts = append(parts, clean)
+				if len(parts) >= 30 {
+					break
+				}
+			}
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatCommerceOptionsGo(rawOpts any) []string {
+	arr, isArr := rawOpts.([]any)
+	if !isArr || len(arr) == 0 {
+		return nil
+	}
+	var lines []string
+	for i, el := range arr {
+		if i >= 20 {
+			break
+		}
+		switch tv := el.(type) {
+		case string:
+			clean := escapeCommerceTextGo(tv, 120, false)
+			if clean != "" && !strings.EqualFold(clean, "Title") {
+				lines = append(lines, clean)
+			}
+		case map[string]any:
+			name := escapeCommerceTextGo(jsonScalarToString(tv["name"]), 120, true)
+			if name == "" {
+				continue
+			}
+			var vals []string
+			if vArr, okV := tv["values"].([]any); okV {
+				for j, rv := range vArr {
+					if j >= 30 {
+						break
+					}
+					cv := escapeCommerceTextGo(jsonScalarToString(rv), 120, true)
+					if cv != "" && !strings.EqualFold(cv, "Default Title") {
+						vals = append(vals, cv)
+					}
+				}
+			} else if tArr, okT := tv["terms"].([]any); okT {
+				for j, rt := range tArr {
+					if j >= 30 {
+						break
+					}
+					if tm, isM := rt.(map[string]any); isM {
+						cv := escapeCommerceTextGo(jsonScalarToString(tm["name"]), 120, true)
+						if cv != "" {
+							vals = append(vals, cv)
+						}
+					}
+				}
+			}
+			if strings.EqualFold(name, "Title") && len(vals) == 0 {
+				continue
+			}
+			if len(vals) > 0 {
+				lines = append(lines, name+": "+strings.Join(vals, ", "))
+			} else {
+				lines = append(lines, name)
+			}
+		}
+	}
+	return lines
+}
+
+func safeCommerceHostLabelGo(origURL string) string {
+	u, err := url.Parse(origURL)
+	if err == nil && u != nil && u.Hostname() != "" {
+		if h := escapeCommerceTextGo(strings.ToLower(u.Hostname()), 120, false); h != "" {
+			return h
+		}
+	}
+	return "store"
+}
+
 func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFormattedDoc, bool) {
 	parsed, ok := decodeJSONWithNumbers(rawBytes)
 	if !ok || parsed == nil {
@@ -3054,16 +3367,28 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 		if sub, subOK := obj["product"].(map[string]any); subOK {
 			obj = sub
 		}
-		title := strings.TrimSpace(jsonScalarToString(obj["title"]))
+		title := escapeCommerceTextGo(jsonScalarToString(obj["title"]), 400, false)
 		if title == "" {
 			return nil, false
 		}
-		vendor := strings.TrimSpace(jsonScalarToString(obj["vendor"]))
+		vendor := escapeCommerceTextGo(jsonScalarToString(obj["vendor"]), 200, false)
+		prodTypeRaw := jsonScalarToString(obj["product_type"])
+		if prodTypeRaw == "" {
+			prodTypeRaw = jsonScalarToString(obj["type"])
+		}
+		prodType := escapeCommerceTextGo(prodTypeRaw, 200, false)
+		tagsStr := formatCommerceTagsGo(obj["tags"])
+		optSummaries := formatCommerceOptionsGo(obj["options"])
+		pubDate := sanitizeCommerceDateGo(jsonScalarToString(obj["published_at"]))
+		updDate := sanitizeCommerceDateGo(jsonScalarToString(obj["updated_at"]))
+		safeImgs := collectSafeCommerceImagesGo(obj["images"], 20)
+
 		bodyHTML := jsonScalarToString(obj["body_html"])
 		if bodyHTML == "" {
 			bodyHTML = jsonScalarToString(obj["description"])
 		}
-		desc := stripTagsInlineLinear(bodyHTML)
+		desc := escapeCommerceDescriptionGo(bodyHTML, 4000)
+
 		var rows [][]string
 		if vars, isArr := obj["variants"].([]any); isArr {
 			for i, rv := range vars {
@@ -3074,16 +3399,14 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 				if !okV {
 					continue
 				}
-				vt := strings.TrimSpace(jsonScalarToString(vo["title"]))
-				if vt == "" || strings.EqualFold(vt, "Default Title") {
+				rawVT := strings.TrimSpace(jsonScalarToString(vo["title"]))
+				vt := escapeCommerceTextGo(rawVT, 240, false)
+				if vt == "" || strings.EqualFold(rawVT, "Default Title") || strings.EqualFold(vt, "Default Title") {
 					vt = title
 				}
-				sku := strings.TrimSpace(jsonScalarToString(vo["sku"]))
-				if sku == "" {
-					sku = "-"
-				}
+				skuSpan := formatCommerceSKUSpanGo(jsonScalarToString(vo["sku"]))
 				price := "-"
-				if f, okP := jsonValueToFloat(vo["price"]); okP {
+				if f, okP := jsonValueToFloat(vo["price"]); okP && f >= 0 {
 					if mode == "shopify_product_js" {
 						f = f / 100.0
 					}
@@ -3097,12 +3420,34 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 						avail = "Out of Stock"
 					}
 				}
-				rows = append(rows, []string{vt, "`" + sku + "`", price, avail})
+				rows = append(rows, []string{vt, skuSpan, price, avail})
 			}
 		}
-		blocks := []string{"# " + title}
+		var bullets []string
 		if vendor != "" {
-			blocks = append(blocks, "- **Brand / Vendor**: "+vendor)
+			bullets = append(bullets, "- **Brand / Vendor**: "+vendor)
+		}
+		if prodType != "" {
+			bullets = append(bullets, "- **Product Type**: "+prodType)
+		}
+		if tagsStr != "" {
+			bullets = append(bullets, "- **Tags**: "+tagsStr)
+		}
+		if len(optSummaries) > 0 {
+			bullets = append(bullets, "- **Options**: "+strings.Join(optSummaries, " · "))
+		}
+		if pubDate != "" {
+			bullets = append(bullets, "- **Published**: "+pubDate)
+		} else if updDate != "" {
+			bullets = append(bullets, "- **Updated**: "+updDate)
+		}
+		if len(safeImgs) > 0 {
+			bullets = append(bullets, "- **Primary Image**: "+safeImgs[0])
+		}
+
+		blocks := []string{"# " + title}
+		if len(bullets) > 0 {
+			blocks = append(blocks, strings.Join(bullets, "\n"))
 		}
 		if len(rows) > 0 {
 			blocks = append(blocks, "## Variants & Pricing\n\n"+formatDeclarativeGFMTable([]string{"Variant", "SKU", "Price", "Availability"}, rows))
@@ -3110,7 +3455,13 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 		if desc != "" {
 			blocks = append(blocks, "## Product Details\n\n"+desc)
 		}
-		return &DeclarativeFormattedDoc{Title: title, Description: sliceRunesMax(desc, 260), Author: vendor, Markdown: strings.Join(blocks, "\n\n")}, true
+		return &DeclarativeFormattedDoc{
+			Title:         title,
+			Description:   sliceRunesMax(desc, 260),
+			Author:        vendor,
+			PublishedTime: pubDate,
+			Markdown:      strings.Join(blocks, "\n\n"),
+		}, true
 
 	case "shopify_catalog_page":
 		obj, isObj := parsed.(map[string]any)
@@ -3121,11 +3472,7 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 		if !isArr {
 			return nil, false
 		}
-		u, _ := url.Parse(origURL)
-		host := "store"
-		if u != nil && u.Host != "" {
-			host = u.Hostname()
-		}
+		host := safeCommerceHostLabelGo(origURL)
 		title := fmt.Sprintf("%s — Shopify Catalog Inventory (%d products)", host, len(prods))
 		var rows [][]string
 		for i, rp := range prods {
@@ -3136,15 +3483,21 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 			if !okP {
 				continue
 			}
-			pt := strings.TrimSpace(jsonScalarToString(po["title"]))
+			pt := escapeCommerceTextGo(jsonScalarToString(po["title"]), 400, false)
 			if pt == "" {
 				continue
 			}
-			rows = append(rows, []string{pt, jsonScalarToString(po["vendor"]), jsonScalarToString(po["product_type"])})
+			pv := escapeCommerceTextGo(jsonScalarToString(po["vendor"]), 200, false)
+			pType := escapeCommerceTextGo(jsonScalarToString(po["product_type"]), 200, false)
+			pUpd := sanitizeCommerceDateGo(sliceRunesMax(strings.TrimSpace(jsonScalarToString(po["updated_at"])), 10))
+			if pUpd == "" {
+				pUpd = "-"
+			}
+			rows = append(rows, []string{pt, pv, pType, pUpd})
 		}
 		tbl := "No products returned on this page."
 		if len(rows) > 0 {
-			tbl = formatDeclarativeGFMTable([]string{"Product", "Vendor", "Type"}, rows)
+			tbl = formatDeclarativeGFMTable([]string{"Product", "Vendor", "Type", "Updated"}, rows)
 		}
 		return &DeclarativeFormattedDoc{Title: title, Markdown: "# " + title + "\n\n" + tbl}, true
 
@@ -3153,11 +3506,7 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 		if !isArr {
 			return nil, false
 		}
-		u, _ := url.Parse(origURL)
-		host := "store"
-		if u != nil && u.Host != "" {
-			host = u.Hostname()
-		}
+		host := safeCommerceHostLabelGo(origURL)
 		title := fmt.Sprintf("%s — WooCommerce Catalog (%d products)", host, len(arr))
 		var rows [][]string
 		for i, rp := range arr {
@@ -3168,15 +3517,12 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 			if !okP {
 				continue
 			}
-			pt := stripTagsInlineLinear(jsonScalarToString(po["name"]))
+			pt := escapeCommerceTextGo(jsonScalarToString(po["name"]), 400, true)
 			if pt == "" {
 				continue
 			}
-			sku := strings.TrimSpace(jsonScalarToString(po["sku"]))
-			if sku == "" {
-				sku = "-"
-			}
-			rows = append(rows, []string{pt, "`" + sku + "`"})
+			skuSpan := formatCommerceSKUSpanGo(jsonScalarToString(po["sku"]))
+			rows = append(rows, []string{pt, skuSpan})
 		}
 		tbl := "No products returned on this page."
 		if len(rows) > 0 {
@@ -3189,16 +3535,119 @@ func formatCommerceTwinGo(rawBytes []byte, mode, origURL string) (*DeclarativeFo
 		if !isObj {
 			return nil, false
 		}
-		title := stripTagsInlineLinear(jsonScalarToString(po["name"]))
+		rawName := jsonScalarToString(po["name"])
+		if rawName == "" {
+			rawName = jsonScalarToString(po["title"])
+		}
+		title := escapeCommerceTextGo(rawName, 400, true)
 		if title == "" {
 			return nil, false
 		}
-		desc := stripTagsInlineLinear(jsonScalarToString(po["description"]))
+		vendor := ""
+		if brands, isB := po["brands"].([]any); isB && len(brands) > 0 {
+			if bm, okB := brands[0].(map[string]any); okB {
+				vendor = escapeCommerceTextGo(jsonScalarToString(bm["name"]), 200, true)
+			}
+		}
+		catName := ""
+		if cats, isC := po["categories"].([]any); isC && len(cats) > 0 {
+			if cm, okC := cats[0].(map[string]any); okC {
+				catName = escapeCommerceTextGo(jsonScalarToString(cm["name"]), 200, true)
+			}
+		}
+		tagsStr := formatCommerceTagsGo(po["tags"])
+		optSummaries := formatCommerceOptionsGo(po["attributes"])
+		pubDate := sanitizeCommerceDateGo(jsonScalarToString(po["date_created"]))
+		safeImgs := collectSafeCommerceImagesGo(po["images"], 20)
+		topSKUSpan := formatCommerceSKUSpanGo(jsonScalarToString(po["sku"]))
+
+		descRaw := jsonScalarToString(po["description"])
+		if descRaw == "" {
+			descRaw = jsonScalarToString(po["short_description"])
+		}
+		desc := escapeCommerceDescriptionGo(descRaw, 4000)
+
+		var bullets []string
+		if vendor != "" {
+			bullets = append(bullets, "- **Brand / Vendor**: "+vendor)
+		}
+		if catName != "" {
+			bullets = append(bullets, "- **Category**: "+catName)
+		}
+		if topSKUSpan != "`-`" {
+			bullets = append(bullets, "- **SKU**: "+topSKUSpan)
+		}
+		if tagsStr != "" {
+			bullets = append(bullets, "- **Tags**: "+tagsStr)
+		}
+		if len(optSummaries) > 0 {
+			bullets = append(bullets, "- **Options**: "+strings.Join(optSummaries, " · "))
+		}
+		if pubDate != "" {
+			bullets = append(bullets, "- **Published**: "+pubDate)
+		}
+		if len(safeImgs) > 0 {
+			bullets = append(bullets, "- **Primary Image**: "+safeImgs[0])
+		}
+
+		var rows [][]string
+		if vars, isV := po["variations"].([]any); isV && len(vars) > 0 {
+			for i, rv := range vars {
+				if i >= 60 {
+					break
+				}
+				vo, okVO := rv.(map[string]any)
+				if !okVO {
+					continue
+				}
+				var attrVals []string
+				if aArr, okA := vo["attributes"].([]any); okA {
+					for _, ra := range aArr {
+						if am, okAM := ra.(map[string]any); okAM {
+							if av := escapeCommerceTextGo(jsonScalarToString(am["value"]), 120, true); av != "" {
+								attrVals = append(attrVals, av)
+							}
+						}
+					}
+				}
+				vt := title
+				if len(attrVals) > 0 {
+					vt = strings.Join(attrVals, " / ")
+				}
+				vSKU := jsonScalarToString(vo["sku"])
+				skuCell := topSKUSpan
+				if strings.TrimSpace(vSKU) != "" {
+					skuCell = formatCommerceSKUSpanGo(vSKU)
+				}
+				stock := "-"
+				if b, isB := vo["is_in_stock"].(bool); isB {
+					if b {
+						stock = "In Stock"
+					} else {
+						stock = "Out of Stock"
+					}
+				}
+				rows = append(rows, []string{vt, skuCell, stock})
+			}
+		}
+
 		blocks := []string{"# " + title}
+		if len(bullets) > 0 {
+			blocks = append(blocks, strings.Join(bullets, "\n"))
+		}
+		if len(rows) > 0 {
+			blocks = append(blocks, "## Variants\n\n"+formatDeclarativeGFMTable([]string{"Variant", "SKU", "Stock"}, rows))
+		}
 		if desc != "" {
 			blocks = append(blocks, "## Description\n\n"+desc)
 		}
-		return &DeclarativeFormattedDoc{Title: title, Description: sliceRunesMax(desc, 260), Markdown: strings.Join(blocks, "\n\n")}, true
+		return &DeclarativeFormattedDoc{
+			Title:         title,
+			Description:   sliceRunesMax(desc, 260),
+			Author:        vendor,
+			PublishedTime: pubDate,
+			Markdown:      strings.Join(blocks, "\n\n"),
+		}, true
 	}
 	return nil, false
 }

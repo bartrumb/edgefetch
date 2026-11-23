@@ -20,6 +20,7 @@ import { buildBlockedInfo, type BlockedSuggestion } from './jobs';
 import { getActiveCallerAuthContext } from './oauth';
 import { isSafePublicHostname } from './overflow';
 import { getActiveRequestTracer, type OtelEnvConfig, type RequestTracer, type TraceContext } from './otel';
+import { ensureD1ColumnIfMissing } from './search-index';
 import { sanitizeStorageUserId, type OptionalStorageBindings } from './storage';
 
 export type CatalogRunStatus = 'running' | 'cooling_down' | 'complete' | 'partial' | 'challenged';
@@ -656,10 +657,12 @@ async function ensureCatalogRunsTable(db: D1DatabaseLike): Promise<void> {
       )`,
     )
     .run();
-  await db
-    .prepare("ALTER TABLE catalog_runs ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'")
-    .run()
-    .catch(() => null);
+  await ensureD1ColumnIfMissing({
+    db,
+    table: 'catalog_runs',
+    column: 'user_id',
+    alterSql: "ALTER TABLE catalog_runs ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
+  });
   await db
     .prepare(
       `CREATE INDEX IF NOT EXISTS idx_catalog_runs_origin_status ON catalog_runs(origin, collection, status, created_at)`,

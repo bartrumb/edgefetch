@@ -118,8 +118,8 @@ function assertNoActiveHtmlOrJsLinksOutsideCode(md: string, contextLabel: string
 }
 
 export async function runRound6StreamASubtests(t: TestContext): Promise<void> {
-await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 32', () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 32);
+await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 33', () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
 
   // 1. Indented fence dedent & top-level 1..3 space fence normalization (`r6A/h1.mjs`, `r6A/h1diff.mjs`)
   const h1IndentJs = fin(' ```\nx\n ```\n[k](javascript:alert(1))');
@@ -242,8 +242,8 @@ await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash 
   ].join('\n');
   const sanitizedBullets = fin(changelogBullets);
   assert.ok(
-    sanitizedBullets.includes('`<svg>`') && sanitizedBullets.includes('`<math>`'),
-    `Expected provably safe inline code spans preserved in bullets: ${sanitizedBullets}`,
+    sanitizedBullets.includes('`&lt;svg>`') && sanitizedBullets.includes('`&lt;math>`'),
+    `Expected fail-closed inline code spans escaped in bullets: ${sanitizedBullets}`,
   );
 
   // 4. Residual `R5-H3` Low fence-header cost (`r6A/fh.6.mjs`): 64K ` [[` / `\t` / `theme={...}` info header runs in < 20ms

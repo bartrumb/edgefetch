@@ -121,18 +121,30 @@ export interface HubUserRecord {
   orgVerifiedAt?: number;
   createdAt: number;
   lastLoginAt: number;
+  tokenCount?: number;
+  storedTokenCount?: number;
+  activeTokenCount?: number;
+  usedTokenCount?: number;
+  grantCount?: number;
   mutationKind?: UserMutationKind;
   expectedSessionEpoch?: number;
   expectedRole?: UserRole;
   reconcilePinnedOwnerId?: string;
+  callerIsImmutableFounder?: boolean;
+  configuredFounderUserId?: string | null;
+  allowAlreadyDisabled?: boolean;
+  disableFailedReason?: 'not_found' | 'already_disabled' | 'owner_protected' | 'founder_protected';
   mutationAborted?: boolean;
 }
 
 export const MAX_OAUTH_GRANTS_PER_USER = 64;
-export const MAX_OAUTH_TOKENS_PER_USER = MAX_OAUTH_GRANTS_PER_USER * 2;
+export const MAX_OAUTH_TOKENS_PER_USER = MAX_OAUTH_GRANTS_PER_USER * 3;
 export const MAX_OAUTH_TOKENS_GLOBAL = 65_536;
+export const MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL = MAX_OAUTH_TOKENS_GLOBAL - MAX_OAUTH_TOKENS_PER_USER * 4;
 export const MAX_OAUTH_CODES_PER_USER = 32;
 export const MAX_OAUTH_CODES_GLOBAL = 16_384;
+export const MAX_REFRESH_ROTATIONS_PER_GRANT_WINDOW = 6;
+export const REFRESH_RATE_LIMIT_WINDOW_MS = 60_000;
 
 export class OAuthQuotaExceededError extends Error {
   readonly status = 429;
@@ -220,6 +232,8 @@ export interface RotateRefreshParams {
   now: number;
   accessExpiresAt: number;
   refreshExpiresAt: number;
+  claimedGrantId?: string;
+  claimedGeneration?: number;
 }
 
 export type RotateRefreshResult =
@@ -232,11 +246,26 @@ export type RotateRefreshResult =
       resource: string;
       userId: string;
       userRole: UserRole;
+      rotationCounter: number;
     }
   | {
       ok: false;
       error: 'invalid_grant';
       replayDetected?: boolean;
+      grantId?: string;
+      clientId?: string;
+    }
+  | {
+      ok: false;
+      error: 'slow_down';
+      retryAfterSec: number;
+      grantId?: string;
+      clientId?: string;
+    }
+  | {
+      ok: false;
+      error: 'user_quota_exceeded';
+      message: string;
       grantId?: string;
       clientId?: string;
     };
@@ -319,8 +348,15 @@ export const OAUTH_SQLITE_SCHEMA = `
     resource TEXT NOT NULL,
     user_id TEXT NOT NULL DEFAULT 'owner',
     user_role TEXT NOT NULL DEFAULT 'owner',
+    used_at INTEGER,
+    rotation_counter INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS oauth_grant_rate_limits (
+    grant_id TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    reset_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
@@ -367,6 +403,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         "ALTER TABLE oauth_codes ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
         "ALTER TABLE oauth_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
         "ALTER TABLE oauth_tokens ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
+        'ALTER TABLE oauth_tokens ADD COLUMN used_at INTEGER',
+        'ALTER TABLE oauth_tokens ADD COLUMN rotation_counter INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT',
         'ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1',
         'ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0',
@@ -404,7 +442,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           WHERE user_id != 'owner'
             AND role = 'owner'
             AND COALESCE(github_id, '') != ?
-            AND COALESCE(promoted_by_owner_id, '') != ?`,
+            AND COALESCE(promoted_by_owner_id, '') NOT IN (?, 'owner')`,
         pinnedOwnerId,
         pinnedOwnerId,
       )
@@ -418,7 +456,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         WHERE user_id != 'owner'
           AND role = 'owner'
           AND COALESCE(github_id, '') != ?
-          AND COALESCE(promoted_by_owner_id, '') != ?`,
+          AND COALESCE(promoted_by_owner_id, '') NOT IN (?, 'owner')`,
       pinnedOwnerId,
       pinnedOwnerId,
     );
@@ -556,16 +594,18 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       ensureMultiUserColumns();
       const userId = p.userId ?? 'owner';
       const userRole = normalizeRoleForUser(userId, p.userRole);
+      const pinnedFounderId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+      const isFounderUser = userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`);
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', p.createdAt);
-      // Trim stale rotated refresh markers for THIS user first
+      sql.exec('DELETE FROM oauth_grant_rate_limits WHERE reset_at <= ?', p.createdAt);
+      // Ensure at most 1 used marker per grant for this user before checking caps
       sql.exec(
         `DELETE FROM oauth_tokens
-         WHERE user_id = ? AND kind = 'refresh_used'
-           AND token_hash IN (
-             SELECT token_hash FROM oauth_tokens
-              WHERE user_id = ? AND kind = 'refresh_used'
-              ORDER BY created_at DESC, ROWID DESC
-              LIMIT -1 OFFSET 32
+         WHERE user_id = ? AND (kind = 'refresh_used' OR used_at IS NOT NULL)
+           AND token_hash NOT IN (
+             SELECT MAX(token_hash) FROM oauth_tokens
+              WHERE user_id = ? AND (kind = 'refresh_used' OR used_at IS NOT NULL)
+              GROUP BY grant_id
            )`,
         userId,
         userId,
@@ -585,6 +625,25 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         userId,
         MAX_OAUTH_GRANTS_PER_USER - 1,
       );
+      // If still above MAX_OAUTH_TOKENS_PER_USER - 2, evict oldest used markers for THIS user first
+      const curUserTokens =
+        sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE user_id = ?', userId).toArray()[0]?.c ?? 0;
+      if (curUserTokens + 2 > MAX_OAUTH_TOKENS_PER_USER) {
+        const excess = curUserTokens + 2 - MAX_OAUTH_TOKENS_PER_USER;
+        sql.exec(
+          `DELETE FROM oauth_tokens
+           WHERE user_id = ?
+             AND token_hash IN (
+               SELECT token_hash FROM oauth_tokens
+                WHERE user_id = ? AND (kind = 'refresh_used' OR used_at IS NOT NULL)
+                ORDER BY COALESCE(used_at, created_at) ASC, ROWID ASC
+                LIMIT ?
+             )`,
+          userId,
+          userId,
+          excess,
+        );
+      }
       sql.exec(
         `DELETE FROM oauth_tokens
          WHERE user_id = ?
@@ -599,27 +658,46 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         MAX_OAUTH_TOKENS_PER_USER - 2,
       );
       const totalTokens = sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens').toArray()[0]?.c ?? 0;
-      if (totalTokens + 2 > MAX_OAUTH_TOKENS_GLOBAL) {
-        if (userId !== 'owner') {
-          throw new OAuthQuotaExceededError();
-        }
+      const effectiveGlobalCap = isFounderUser ? MAX_OAUTH_TOKENS_GLOBAL : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
+      if (totalTokens + 2 > effectiveGlobalCap) {
+        // Evict stale used refresh markers from non-founder users first so used markers never block new grants
+        const needed = totalTokens + 2 - effectiveGlobalCap;
         sql.exec(
           `DELETE FROM oauth_tokens
-           WHERE user_id = 'owner'
-             AND grant_id IN (
-               SELECT grant_id FROM oauth_tokens
-                WHERE user_id = 'owner'
-                GROUP BY grant_id
-                ORDER BY MIN(created_at) ASC, MIN(ROWID) ASC
-                LIMIT 1
-             )`,
+           WHERE token_hash IN (
+             SELECT token_hash FROM oauth_tokens
+              WHERE user_id != 'owner' AND (kind = 'refresh_used' OR used_at IS NOT NULL)
+              ORDER BY COALESCE(used_at, created_at) ASC, ROWID ASC
+              LIMIT ?
+           )`,
+          needed,
         );
+        const afterTrimTotal = sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens').toArray()[0]?.c ?? 0;
+        if (afterTrimTotal + 2 > effectiveGlobalCap) {
+          if (!isFounderUser) {
+            throw new OAuthQuotaExceededError();
+          }
+          sql.exec(
+            `DELETE FROM oauth_tokens
+             WHERE user_id = ?
+               AND grant_id IN (
+                 SELECT grant_id FROM oauth_tokens
+                  WHERE user_id = ?
+                  GROUP BY grant_id
+                  ORDER BY MIN(created_at) ASC, MIN(ROWID) ASC
+                  LIMIT 1
+               )`,
+            userId,
+            userId,
+          );
+        }
       }
       const scopesJson = JSON.stringify(p.scopes);
+      sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', p.grantId);
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
-         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, created_at, expires_at)
-         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, used_at, rotation_counter, created_at, expires_at)
+         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)`,
         p.accessHash,
         p.grantId,
         p.clientId,
@@ -633,8 +711,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       );
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
-         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, created_at, expires_at)
-         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, used_at, rotation_counter, created_at, expires_at)
+         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)`,
         p.refreshHash,
         p.grantId,
         p.clientId,
@@ -730,19 +808,56 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           resource: string;
           user_id?: string;
           user_role?: string;
+          used_at?: number | null;
+          rotation_counter?: number;
           created_at: number;
           expires_at: number;
         }>("SELECT * FROM oauth_tokens WHERE token_hash = ? AND kind IN ('refresh', 'refresh_used')", params.refreshHash)
         .toArray();
       const r = rows[0];
-      if (!r) return { ok: false, error: 'invalid_grant' };
-      if (r.expires_at <= params.now) {
-        sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
+      if (!r) {
+        // Lineage replay check: if an authenticated older-generation refresh token (`gen < active.rotation_counter`)
+        // whose used marker was replaced on a subsequent rotation is re-presented, revoke the entire grant!
+        if (
+          params.claimedGrantId &&
+          typeof params.claimedGeneration === 'number' &&
+          params.claimedGeneration >= 0 &&
+          params.clientId
+        ) {
+          const activeGrant = sql
+            .exec<{ client_id: string; expires_at: number; rotation_counter?: number }>(
+              "SELECT client_id, expires_at, rotation_counter FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' LIMIT 1",
+              params.claimedGrantId,
+            )
+            .toArray()[0];
+          if (
+            activeGrant &&
+            activeGrant.expires_at > params.now &&
+            activeGrant.client_id === params.clientId &&
+            params.claimedGeneration < Number(activeGrant.rotation_counter ?? 0)
+          ) {
+            sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', params.claimedGrantId);
+            sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', params.claimedGrantId);
+            return {
+              ok: false,
+              error: 'invalid_grant',
+              replayDetected: true,
+              grantId: params.claimedGrantId,
+              clientId: params.clientId,
+            };
+          }
+        }
         return { ok: false, error: 'invalid_grant' };
       }
-      // Replay of an already-rotated refresh token immediately revokes the ENTIRE grant (H-S3)!
-      if (r.kind === 'refresh_used') {
+      if (r.expires_at <= params.now) {
         sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
+        sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', r.grant_id);
+        return { ok: false, error: 'invalid_grant' };
+      }
+      // Replay of an already-rotated refresh token immediately revokes the ENTIRE grant (H-S3 / U2)!
+      if (r.kind === 'refresh_used' || (r.used_at !== null && r.used_at !== undefined)) {
+        sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
+        sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', r.grant_id);
         return {
           ok: false,
           error: 'invalid_grant',
@@ -751,7 +866,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           clientId: r.client_id,
         };
       }
-      // Verify client_id BEFORE mutating the grant so a wrong client_id cannot burn a valid grant (H-S3)!
+      // Verify client_id BEFORE mutating the grant or touching rate limits so a wrong client_id cannot burn a valid grant (H-S3)!
       if (!params.clientId || r.client_id !== params.clientId) {
         return { ok: false, error: 'invalid_grant' };
       }
@@ -764,22 +879,152 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           .toArray()[0];
         if (!liveRow || Number(liveRow.disabled ?? 0) !== 0) {
           sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
+          sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', r.grant_id);
           return { ok: false, error: 'invalid_grant' };
         }
         userRole = normalizeRoleForUser(userId, liveRow.role);
       }
 
+      // U2: Per-grant refresh rate limit (max 6 rotations per 60s window)
+      sql.exec('DELETE FROM oauth_grant_rate_limits WHERE reset_at <= ?', params.now);
+      const rlRow = sql
+        .exec<{ count: number; reset_at: number }>(
+          'SELECT count, reset_at FROM oauth_grant_rate_limits WHERE grant_id = ?',
+          r.grant_id,
+        )
+        .toArray()[0];
+      if (rlRow && rlRow.reset_at > params.now && rlRow.count >= MAX_REFRESH_ROTATIONS_PER_GRANT_WINDOW) {
+        return {
+          ok: false,
+          error: 'slow_down',
+          retryAfterSec: Math.max(1, Math.ceil((rlRow.reset_at - params.now) / 1_000)),
+          grantId: r.grant_id,
+          clientId: r.client_id,
+        };
+      }
+
+      // U2: Prune expired tokens first, then enforce per-user & global caps BEFORE mutating this grant
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', params.now);
-      sql.exec("DELETE FROM oauth_tokens WHERE grant_id = ? AND kind = 'access'", r.grant_id);
+      const pinnedFounderId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+      const isFounderUser = userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`);
+
+      let otherUserRows =
+        sql
+          .exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE user_id = ? AND grant_id != ?', userId, r.grant_id)
+          .toArray()[0]?.c ?? 0;
+      if (otherUserRows + 3 > MAX_OAUTH_TOKENS_PER_USER) {
+        const excess = otherUserRows + 3 - MAX_OAUTH_TOKENS_PER_USER;
+        sql.exec(
+          `DELETE FROM oauth_tokens
+           WHERE user_id = ? AND grant_id != ?
+             AND token_hash IN (
+               SELECT token_hash FROM oauth_tokens
+                WHERE user_id = ? AND grant_id != ? AND (kind = 'refresh_used' OR used_at IS NOT NULL)
+                ORDER BY COALESCE(used_at, created_at) ASC, ROWID ASC
+                LIMIT ?
+             )`,
+          userId,
+          r.grant_id,
+          userId,
+          r.grant_id,
+          excess,
+        );
+        otherUserRows =
+          sql
+            .exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE user_id = ? AND grant_id != ?', userId, r.grant_id)
+            .toArray()[0]?.c ?? 0;
+      }
+      const otherUserGrants =
+        sql
+          .exec<{ c: number }>(
+            'SELECT COUNT(DISTINCT grant_id) AS c FROM oauth_tokens WHERE user_id = ? AND grant_id != ?',
+            userId,
+            r.grant_id,
+          )
+          .toArray()[0]?.c ?? 0;
+      if (otherUserRows + 3 > MAX_OAUTH_TOKENS_PER_USER || otherUserGrants + 1 > MAX_OAUTH_GRANTS_PER_USER) {
+        return {
+          ok: false,
+          error: 'user_quota_exceeded',
+          message: 'Per-user OAuth token quota exceeded; revoke unused grants before rotating',
+          grantId: r.grant_id,
+          clientId: r.client_id,
+        };
+      }
+
+      const effectiveGlobalCap = isFounderUser ? MAX_OAUTH_TOKENS_GLOBAL : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
+      let totalOtherRows =
+        sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE grant_id != ?', r.grant_id).toArray()[0]?.c ?? 0;
+      if (totalOtherRows + 3 > effectiveGlobalCap) {
+        const needed = totalOtherRows + 3 - effectiveGlobalCap;
+        sql.exec(
+          `DELETE FROM oauth_tokens
+           WHERE grant_id != ?
+             AND token_hash IN (
+               SELECT token_hash FROM oauth_tokens
+                WHERE grant_id != ? AND user_id != 'owner' AND (kind = 'refresh_used' OR used_at IS NOT NULL)
+                ORDER BY COALESCE(used_at, created_at) ASC, ROWID ASC
+                LIMIT ?
+             )`,
+          r.grant_id,
+          r.grant_id,
+          needed,
+        );
+        totalOtherRows =
+          sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE grant_id != ?', r.grant_id).toArray()[0]?.c ?? 0;
+        if (totalOtherRows + 3 > effectiveGlobalCap) {
+          if (!isFounderUser) {
+            return {
+              ok: false,
+              error: 'user_quota_exceeded',
+              message: 'Global OAuth token capacity reached; retry shortly',
+              grantId: r.grant_id,
+              clientId: r.client_id,
+            };
+          }
+          sql.exec(
+            `DELETE FROM oauth_tokens
+             WHERE grant_id != ? AND user_id = ?
+               AND token_hash IN (
+                 SELECT token_hash FROM oauth_tokens
+                  WHERE grant_id != ? AND user_id = ? AND (kind = 'refresh_used' OR used_at IS NOT NULL)
+                  ORDER BY COALESCE(used_at, created_at) ASC, ROWID ASC
+                  LIMIT ?
+               )`,
+            r.grant_id,
+            userId,
+            r.grant_id,
+            userId,
+            totalOtherRows + 3 - effectiveGlobalCap,
+          );
+        }
+      }
+
+      // Record per-grant rate limit hit
+      if (!rlRow || rlRow.reset_at <= params.now) {
+        sql.exec(
+          'INSERT OR REPLACE INTO oauth_grant_rate_limits (grant_id, count, reset_at) VALUES (?, 1, ?)',
+          r.grant_id,
+          params.now + REFRESH_RATE_LIMIT_WINDOW_MS,
+        );
+      } else {
+        sql.exec('UPDATE oauth_grant_rate_limits SET count = ? WHERE grant_id = ?', rlRow.count + 1, r.grant_id);
+      }
+
+      // U2: Delete ALL prior access & prior `refresh_used` markers for this grant so each grant holds
+      // at most 1 active access + 1 active refresh + 1 `refresh_used` marker (`<= 3` rows O(1) forever)!
+      sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ? AND token_hash != ?', r.grant_id, params.refreshHash);
+      const nextCounter = Number(r.rotation_counter ?? 0) + 1;
       sql.exec(
-        "UPDATE oauth_tokens SET kind = 'refresh_used', expires_at = ? WHERE token_hash = ?",
+        "UPDATE oauth_tokens SET kind = 'refresh_used', used_at = ?, expires_at = ? WHERE token_hash = ?",
+        params.now,
         Math.max(r.expires_at, params.refreshExpiresAt),
         params.refreshHash,
       );
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
-         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, created_at, expires_at)
-         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, used_at, rotation_counter, created_at, expires_at)
+         VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         params.nextAccessHash,
         r.grant_id,
         r.client_id,
@@ -788,13 +1033,14 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         r.resource,
         userId,
         userRole,
+        nextCounter,
         r.created_at,
         params.accessExpiresAt,
       );
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
-         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, created_at, expires_at)
-         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, used_at, rotation_counter, created_at, expires_at)
+         VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         params.nextRefreshHash,
         r.grant_id,
         r.client_id,
@@ -803,6 +1049,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         r.resource,
         userId,
         userRole,
+        nextCounter,
         r.created_at,
         params.refreshExpiresAt,
       );
@@ -815,6 +1062,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         resource: r.resource,
         userId,
         userRole,
+        rotationCounter: nextCounter,
       };
     },
     listGrants(now, userId) {
@@ -880,12 +1128,14 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           .toArray()[0];
         if (!existing || existing.c <= 0) return false;
         sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ? AND user_id = ?', grantId, userId);
+        sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', grantId);
         return true;
       }
       const existing = sql
         .exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE grant_id = ?', grantId)
         .toArray()[0];
       sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', grantId);
+      sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', grantId);
       return Boolean(existing && existing.c > 0);
     },
     revokeByTokenHash(tokenHash) {
@@ -894,6 +1144,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         .toArray()[0];
       if (row?.grant_id) {
         sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', row.grant_id);
+        sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', row.grant_id);
       }
     },
     upsertUser(user) {
@@ -1184,6 +1435,86 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         return stored;
       }
 
+      if (user.mutationKind === 'admin_disable') {
+        const resolvedPin = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+        const founderUserId =
+          user.configuredFounderUserId !== undefined
+            ? (user.configuredFounderUserId ?? '')
+            : resolvedPin
+              ? `gh_${resolvedPin}`
+              : '';
+        if (user.userId === 'owner' || (founderUserId !== '' && user.userId === founderUserId)) {
+          const cur = (this.getUser!(user.userId) as HubUserRecord | null) ?? user;
+          return { ...cur, mutationAborted: true, disableFailedReason: 'founder_protected' };
+        }
+        const live = readRawUser(user.userId);
+        if (!live) {
+          return { ...user, disabled: true, mutationAborted: true, disableFailedReason: 'not_found' };
+        }
+        const callerIsFounder = user.callerIsImmutableFounder === true;
+        if (!callerIsFounder && normalizeRoleForUser(live.user_id, live.role) === 'owner') {
+          const cur = (this.getUser!(user.userId) as HubUserRecord | null) ?? { ...user, role: 'owner', disabled: false };
+          return { ...cur, mutationAborted: true, disableFailedReason: 'owner_protected' };
+        }
+        if (Number(live.disabled ?? 0) !== 0) {
+          if (user.allowAlreadyDisabled) {
+            sql.exec(
+              'DELETE FROM oauth_grant_rate_limits WHERE grant_id IN (SELECT DISTINCT grant_id FROM oauth_tokens WHERE user_id = ?)',
+              user.userId,
+            );
+            sql.exec('DELETE FROM oauth_tokens WHERE user_id = ?', user.userId);
+            sql.exec('DELETE FROM oauth_codes WHERE user_id = ?', user.userId);
+            return (this.getUser!(user.userId) as HubUserRecord | null) ?? { ...user, role: 'member', disabled: true };
+          }
+          const cur = (this.getUser!(user.userId) as HubUserRecord | null) ?? { ...user, disabled: true };
+          return { ...cur, mutationAborted: true, disableFailedReason: 'already_disabled' };
+        }
+        const updatedRows = sql
+          .exec<{ user_id: string }>(
+            `UPDATE users
+                SET role = 'member',
+                    promoted_by_owner_id = NULL,
+                    disabled = 1,
+                    session_epoch = COALESCE(session_epoch, 1) + 1,
+                    github_login = COALESCE(?, github_login),
+                    admitted_via = NULL,
+                    admitted_org = NULL,
+                    encrypted_gh_token = NULL,
+                    org_verified_at = NULL
+              WHERE user_id = ?
+                AND user_id != 'owner'
+                AND (? = '' OR user_id != ?)
+                AND COALESCE(disabled, 0) = 0
+                AND (? = 1 OR role != 'owner')
+              RETURNING user_id`,
+            user.githubLogin ?? null,
+            user.userId,
+            founderUserId,
+            founderUserId,
+            callerIsFounder ? 1 : 0,
+          )
+          .toArray();
+        if (updatedRows.length === 0) {
+          const after = readRawUser(user.userId);
+          const cur = (this.getUser!(user.userId) as HubUserRecord | null) ?? user;
+          if (after && !callerIsFounder && normalizeRoleForUser(after.user_id, after.role) === 'owner') {
+            return { ...cur, mutationAborted: true, disableFailedReason: 'owner_protected' };
+          }
+          return {
+            ...cur,
+            mutationAborted: true,
+            disableFailedReason: after ? 'already_disabled' : 'not_found',
+          };
+        }
+        sql.exec(
+          'DELETE FROM oauth_grant_rate_limits WHERE grant_id IN (SELECT DISTINCT grant_id FROM oauth_tokens WHERE user_id = ?)',
+          user.userId,
+        );
+        sql.exec('DELETE FROM oauth_tokens WHERE user_id = ?', user.userId);
+        sql.exec('DELETE FROM oauth_codes WHERE user_id = ?', user.userId);
+        return (this.getUser!(user.userId) as HubUserRecord | null) ?? { ...user, role: 'member', disabled: true };
+      }
+
       if (user.mutationKind === 'demote_unapproved_owner' || user.mutationKind === 'admin_role') {
         const live = readRawUser(user.userId);
         if (!live || Number(live.disabled ?? 0) !== 0) {
@@ -1320,6 +1651,21 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         }>('SELECT * FROM users WHERE user_id = ? LIMIT 1', userId)
         .toArray()[0];
       if (!r) return null;
+      const tokStats = sql
+        .exec<{ total_rows: number; active_rows: number; used_rows: number; grant_count: number }>(
+          `SELECT COUNT(*) AS total_rows,
+                  COALESCE(SUM(CASE WHEN kind IN ('access', 'refresh') AND used_at IS NULL THEN 1 ELSE 0 END), 0) AS active_rows,
+                  COALESCE(SUM(CASE WHEN kind = 'refresh_used' OR used_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS used_rows,
+                  COUNT(DISTINCT grant_id) AS grant_count
+             FROM oauth_tokens
+            WHERE user_id = ?`,
+          r.user_id,
+        )
+        .toArray()[0];
+      const totalRows = Number(tokStats?.total_rows ?? 0);
+      const activeRows = Number(tokStats?.active_rows ?? 0);
+      const usedRows = Number(tokStats?.used_rows ?? 0);
+      const grantCount = Number(tokStats?.grant_count ?? 0);
       const validVia =
         r.admitted_via === 'owner' ||
         r.admitted_via === 'allowlist_id' ||
@@ -1343,11 +1689,39 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         ...(typeof r.org_verified_at === 'number' ? { orgVerifiedAt: r.org_verified_at } : {}),
         createdAt: r.created_at,
         lastLoginAt: r.last_login_at,
+        tokenCount: totalRows,
+        storedTokenCount: totalRows,
+        activeTokenCount: activeRows,
+        usedTokenCount: usedRows,
+        grantCount,
       };
     },
     listUsers() {
       ensureMultiUserColumns();
       demoteUnapprovedOwnersSqlite();
+      const countsByUser = new Map<
+        string,
+        { totalRows: number; activeRows: number; usedRows: number; grantCount: number }
+      >();
+      const tokRows = sql
+        .exec<{ user_id: string; total_rows: number; active_rows: number; used_rows: number; grant_count: number }>(
+          `SELECT user_id,
+                  COUNT(*) AS total_rows,
+                  COALESCE(SUM(CASE WHEN kind IN ('access', 'refresh') AND used_at IS NULL THEN 1 ELSE 0 END), 0) AS active_rows,
+                  COALESCE(SUM(CASE WHEN kind = 'refresh_used' OR used_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS used_rows,
+                  COUNT(DISTINCT grant_id) AS grant_count
+             FROM oauth_tokens
+            GROUP BY user_id`,
+        )
+        .toArray();
+      for (const tr of tokRows) {
+        countsByUser.set(tr.user_id || 'owner', {
+          totalRows: Number(tr.total_rows ?? 0),
+          activeRows: Number(tr.active_rows ?? 0),
+          usedRows: Number(tr.used_rows ?? 0),
+          grantCount: Number(tr.grant_count ?? 0),
+        });
+      }
       return sql
         .exec<{
           user_id: string;
@@ -1378,6 +1752,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
             r.admitted_via === 'open'
               ? r.admitted_via
               : undefined;
+          const stats = countsByUser.get(r.user_id) ?? { totalRows: 0, activeRows: 0, usedRows: 0, grantCount: 0 };
           return {
             userId: r.user_id,
             ...(r.github_id ? { githubId: r.github_id } : {}),
@@ -1392,6 +1767,11 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
             ...(typeof r.org_verified_at === 'number' ? { orgVerifiedAt: r.org_verified_at } : {}),
             createdAt: r.created_at,
             lastLoginAt: r.last_login_at,
+            tokenCount: stats.totalRows,
+            storedTokenCount: stats.totalRows,
+            activeTokenCount: stats.activeRows,
+            usedTokenCount: stats.usedRows,
+            grantCount: stats.grantCount,
           };
         });
     },
@@ -1500,10 +1880,32 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
 export function createMemoryOAuthStore(): OAuthStore {
   const clients = new Map<string, OAuthClientRecord>();
   const codes = new Map<string, OAuthCodeRecord>();
-  const tokens = new Map<string, OAuthTokenRecord & { used?: boolean }>();
+  const tokens = new Map<string, OAuthTokenRecord & { used?: boolean; usedAt?: number; rotationCounter?: number }>();
+  const grantRefreshRateLimits = new Map<string, { count: number; resetAt: number }>();
   const users = new Map<string, HubUserRecord>();
   const failures = new Map<string, { count: number; resetAt: number }>();
   const adminRevocations = new Map<string, number>();
+
+  const computeMemoryUserTokenStats = (targetUserId: string) => {
+    let totalRows = 0;
+    let activeRows = 0;
+    let usedRows = 0;
+    const grants = new Set<string>();
+    for (const t of tokens.values()) {
+      if ((t.userId ?? 'owner') !== targetUserId) continue;
+      totalRows++;
+      if (t.used) usedRows++;
+      else activeRows++;
+      grants.add(t.grantId);
+    }
+    return {
+      tokenCount: totalRows,
+      storedTokenCount: totalRows,
+      activeTokenCount: activeRows,
+      usedTokenCount: usedRows,
+      grantCount: grants.size,
+    };
+  };
 
   return {
     putClient(c) {
@@ -1565,22 +1967,21 @@ export function createMemoryOAuthStore(): OAuthStore {
       for (const [k, v] of tokens.entries()) {
         if (v.expiresAt <= p.createdAt) tokens.delete(k);
       }
+      for (const [gid, rl] of grantRefreshRateLimits.entries()) {
+        if (rl.resetAt <= p.createdAt) grantRefreshRateLimits.delete(gid);
+      }
       const userId = p.userId ?? 'owner';
       const userRole = normalizeRoleForUser(userId, p.userRole);
-      const userUsedHashes: string[] = [];
+      const pinnedFounderId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+      const isFounderUser = userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`);
       const userGrantsInOrder: string[] = [];
       const seenUserGrants = new Set<string>();
-      for (const [k, v] of tokens.entries()) {
+      for (const [, v] of tokens.entries()) {
         if ((v.userId ?? 'owner') !== userId) continue;
-        if (v.used) userUsedHashes.push(k);
         if (!seenUserGrants.has(v.grantId)) {
           seenUserGrants.add(v.grantId);
           userGrantsInOrder.push(v.grantId);
         }
-      }
-      while (userUsedHashes.length > 32) {
-        const oldestUsed = userUsedHashes.shift();
-        if (oldestUsed !== undefined) tokens.delete(oldestUsed);
       }
       while (userGrantsInOrder.length >= MAX_OAUTH_GRANTS_PER_USER) {
         const oldestGrant = userGrantsInOrder.shift();
@@ -1591,24 +1992,53 @@ export function createMemoryOAuthStore(): OAuthStore {
           }
         }
       }
-      if (tokens.size + 2 > MAX_OAUTH_TOKENS_GLOBAL) {
-        if (userId !== 'owner') {
+      const userTokenHashes: string[] = [];
+      const userUsedHashes: string[] = [];
+      for (const [k, v] of tokens.entries()) {
+        if ((v.userId ?? 'owner') !== userId) continue;
+        userTokenHashes.push(k);
+        if (v.used) userUsedHashes.push(k);
+      }
+      while (userTokenHashes.length + 2 > MAX_OAUTH_TOKENS_PER_USER && userUsedHashes.length > 0) {
+        const oldestUsed = userUsedHashes.shift();
+        if (oldestUsed !== undefined) {
+          tokens.delete(oldestUsed);
+          const idx = userTokenHashes.indexOf(oldestUsed);
+          if (idx >= 0) userTokenHashes.splice(idx, 1);
+        }
+      }
+      while (userTokenHashes.length + 2 > MAX_OAUTH_TOKENS_PER_USER) {
+        const oldest = userTokenHashes.shift();
+        if (oldest !== undefined) tokens.delete(oldest);
+      }
+      const effectiveGlobalCap = isFounderUser ? MAX_OAUTH_TOKENS_GLOBAL : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
+      if (tokens.size + 2 > effectiveGlobalCap) {
+        for (const [k, v] of tokens.entries()) {
+          if (tokens.size + 2 <= effectiveGlobalCap) break;
+          if ((v.userId ?? 'owner') !== 'owner' && v.used) tokens.delete(k);
+        }
+      }
+      if (tokens.size + 2 > effectiveGlobalCap) {
+        if (!isFounderUser) {
           throw new OAuthQuotaExceededError();
         }
         let ownerOldestGrant: string | undefined;
         for (const v of tokens.values()) {
-          if ((v.userId ?? 'owner') === 'owner') {
+          if ((v.userId ?? 'owner') === userId) {
             ownerOldestGrant = v.grantId;
             break;
           }
         }
         if (ownerOldestGrant) {
           for (const [k, v] of tokens.entries()) {
-            if ((v.userId ?? 'owner') === 'owner' && v.grantId === ownerOldestGrant) {
+            if ((v.userId ?? 'owner') === userId && v.grantId === ownerOldestGrant) {
               tokens.delete(k);
             }
           }
         }
+      }
+      for (const [k, v] of tokens.entries()) {
+        if (v.grantId === p.grantId) tokens.delete(k);
       }
       tokens.set(p.accessHash, {
         grantId: p.grantId,
@@ -1619,6 +2049,7 @@ export function createMemoryOAuthStore(): OAuthStore {
         resource: p.resource,
         userId,
         userRole,
+        rotationCounter: 0,
         createdAt: p.createdAt,
         expiresAt: p.accessExpiresAt,
       });
@@ -1631,6 +2062,7 @@ export function createMemoryOAuthStore(): OAuthStore {
         resource: p.resource,
         userId,
         userRole,
+        rotationCounter: 0,
         createdAt: p.createdAt,
         expiresAt: p.refreshExpiresAt,
       });
@@ -1653,13 +2085,46 @@ export function createMemoryOAuthStore(): OAuthStore {
     },
     rotateRefreshToken(params) {
       const t = tokens.get(params.refreshHash);
-      if (!t || t.kind !== 'refresh') return { ok: false, error: 'invalid_grant' };
+      if (!t || t.kind !== 'refresh') {
+        if (
+          params.claimedGrantId &&
+          typeof params.claimedGeneration === 'number' &&
+          params.claimedGeneration >= 0 &&
+          params.clientId
+        ) {
+          for (const row of tokens.values()) {
+            if (
+              row.grantId === params.claimedGrantId &&
+              row.kind === 'refresh' &&
+              !row.used &&
+              row.expiresAt > params.now &&
+              row.clientId === params.clientId &&
+              params.claimedGeneration < (row.rotationCounter ?? 0)
+            ) {
+              for (const [h, delRow] of tokens.entries()) {
+                if (delRow.grantId === params.claimedGrantId) tokens.delete(h);
+              }
+              grantRefreshRateLimits.delete(params.claimedGrantId);
+              return {
+                ok: false,
+                error: 'invalid_grant',
+                replayDetected: true,
+                grantId: params.claimedGrantId,
+                clientId: params.clientId,
+              };
+            }
+          }
+        }
+        return { ok: false, error: 'invalid_grant' };
+      }
       if (t.expiresAt <= params.now) {
         for (const [h, row] of tokens.entries()) if (row.grantId === t.grantId) tokens.delete(h);
+        grantRefreshRateLimits.delete(t.grantId);
         return { ok: false, error: 'invalid_grant' };
       }
       if (t.used) {
         for (const [h, row] of tokens.entries()) if (row.grantId === t.grantId) tokens.delete(h);
+        grantRefreshRateLimits.delete(t.grantId);
         return { ok: false, error: 'invalid_grant', replayDetected: true, grantId: t.grantId, clientId: t.clientId };
       }
       if (!params.clientId || t.clientId !== params.clientId) {
@@ -1671,14 +2136,92 @@ export function createMemoryOAuthStore(): OAuthStore {
         const liveUser = users.get(userId);
         if (!liveUser || liveUser.disabled) {
           for (const [h, row] of tokens.entries()) if (row.grantId === t.grantId) tokens.delete(h);
+          grantRefreshRateLimits.delete(t.grantId);
           return { ok: false, error: 'invalid_grant' };
         }
         userRole = normalizeRoleForUser(userId, liveUser.role);
       }
-      for (const [h, row] of tokens.entries()) {
-        if (row.grantId === t.grantId && row.kind === 'access') tokens.delete(h);
+
+      for (const [gid, rl] of grantRefreshRateLimits.entries()) {
+        if (rl.resetAt <= params.now) grantRefreshRateLimits.delete(gid);
       }
+      const rlCur = grantRefreshRateLimits.get(t.grantId);
+      if (rlCur && rlCur.resetAt > params.now && rlCur.count >= MAX_REFRESH_ROTATIONS_PER_GRANT_WINDOW) {
+        return {
+          ok: false,
+          error: 'slow_down',
+          retryAfterSec: Math.max(1, Math.ceil((rlCur.resetAt - params.now) / 1_000)),
+          grantId: t.grantId,
+          clientId: t.clientId,
+        };
+      }
+
+      for (const [h, row] of tokens.entries()) {
+        if (row.expiresAt <= params.now) tokens.delete(h);
+      }
+      const pinnedFounderId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+      const isFounderUser = userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`);
+
+      let otherUserRows = 0;
+      const otherUserUsedHashes: string[] = [];
+      const otherUserGrants = new Set<string>();
+      for (const [h, row] of tokens.entries()) {
+        if ((row.userId ?? 'owner') !== userId || row.grantId === t.grantId) continue;
+        otherUserRows++;
+        otherUserGrants.add(row.grantId);
+        if (row.used) otherUserUsedHashes.push(h);
+      }
+      while (otherUserRows + 3 > MAX_OAUTH_TOKENS_PER_USER && otherUserUsedHashes.length > 0) {
+        const victim = otherUserUsedHashes.shift();
+        if (victim !== undefined && tokens.delete(victim)) otherUserRows--;
+      }
+      if (otherUserRows + 3 > MAX_OAUTH_TOKENS_PER_USER || otherUserGrants.size + 1 > MAX_OAUTH_GRANTS_PER_USER) {
+        return {
+          ok: false,
+          error: 'user_quota_exceeded',
+          message: 'Per-user OAuth token quota exceeded; revoke unused grants before rotating',
+          grantId: t.grantId,
+          clientId: t.clientId,
+        };
+      }
+
+      const effectiveGlobalCap = isFounderUser ? MAX_OAUTH_TOKENS_GLOBAL : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
+      let totalOtherRows = 0;
+      for (const row of tokens.values()) {
+        if (row.grantId !== t.grantId) totalOtherRows++;
+      }
+      if (totalOtherRows + 3 > effectiveGlobalCap) {
+        for (const [h, row] of tokens.entries()) {
+          if (totalOtherRows + 3 <= effectiveGlobalCap) break;
+          if (row.grantId !== t.grantId && (row.userId ?? 'owner') !== 'owner' && row.used) {
+            tokens.delete(h);
+            totalOtherRows--;
+          }
+        }
+        if (totalOtherRows + 3 > effectiveGlobalCap && !isFounderUser) {
+          return {
+            ok: false,
+            error: 'user_quota_exceeded',
+            message: 'Global OAuth token capacity reached; retry shortly',
+            grantId: t.grantId,
+            clientId: t.clientId,
+          };
+        }
+      }
+
+      if (!rlCur || rlCur.resetAt <= params.now) {
+        grantRefreshRateLimits.set(t.grantId, { count: 1, resetAt: params.now + REFRESH_RATE_LIMIT_WINDOW_MS });
+      } else {
+        rlCur.count++;
+      }
+
+      // Delete ALL prior access & prior used refresh markers for this grant (`<= 3` rows O(1) per grant)
+      for (const [h, row] of tokens.entries()) {
+        if (row.grantId === t.grantId && h !== params.refreshHash) tokens.delete(h);
+      }
+      const nextCounter = (t.rotationCounter ?? 0) + 1;
       t.used = true;
+      t.usedAt = params.now;
       t.expiresAt = Math.max(t.expiresAt, params.refreshExpiresAt);
       tokens.set(params.nextAccessHash, {
         grantId: t.grantId,
@@ -1689,6 +2232,7 @@ export function createMemoryOAuthStore(): OAuthStore {
         resource: t.resource,
         userId,
         userRole,
+        rotationCounter: nextCounter,
         createdAt: t.createdAt,
         expiresAt: params.accessExpiresAt,
       });
@@ -1701,6 +2245,7 @@ export function createMemoryOAuthStore(): OAuthStore {
         resource: t.resource,
         userId,
         userRole,
+        rotationCounter: nextCounter,
         createdAt: t.createdAt,
         expiresAt: params.refreshExpiresAt,
       });
@@ -1713,6 +2258,7 @@ export function createMemoryOAuthStore(): OAuthStore {
         resource: t.resource,
         userId,
         userRole,
+        rotationCounter: nextCounter,
       };
     },
     listGrants(now, userId) {
@@ -1749,6 +2295,7 @@ export function createMemoryOAuthStore(): OAuthStore {
           removed = true;
         }
       }
+      if (removed) grantRefreshRateLimits.delete(grantId);
       return removed;
     },
     revokeByTokenHash(tokenHash) {
@@ -1757,6 +2304,7 @@ export function createMemoryOAuthStore(): OAuthStore {
       for (const [hash, row] of tokens.entries()) {
         if (row.grantId === t.grantId) tokens.delete(hash);
       }
+      grantRefreshRateLimits.delete(t.grantId);
     },
     upsertUser(user) {
       const demoteMemoryUnapprovedOwners = (explicitPinned?: string | null): number => {
@@ -1770,7 +2318,8 @@ export function createMemoryOAuthStore(): OAuthStore {
             u.userId !== 'owner' &&
             u.role === 'owner' &&
             String(u.githubId ?? '') !== pinnedOwnerId &&
-            u.promotedByOwnerId !== pinnedOwnerId
+            u.promotedByOwnerId !== pinnedOwnerId &&
+            u.promotedByOwnerId !== 'owner'
           ) {
             u.role = 'member';
             delete u.promotedByOwnerId;
@@ -1794,6 +2343,10 @@ export function createMemoryOAuthStore(): OAuthStore {
           expectedSessionEpoch: _ee,
           expectedRole: _er,
           reconcilePinnedOwnerId: _rp,
+          callerIsImmutableFounder: _cif,
+          configuredFounderUserId: _cfu,
+          allowAlreadyDisabled: _aad,
+          disableFailedReason: _dfr,
           mutationAborted: _ma,
           ...clean
         } = u;
@@ -1938,6 +2491,64 @@ export function createMemoryOAuthStore(): OAuthStore {
         return { ...fresh };
       }
 
+      if (user.mutationKind === 'admin_disable') {
+        const resolvedPin = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+        const founderUserId =
+          user.configuredFounderUserId !== undefined
+            ? (user.configuredFounderUserId ?? '')
+            : resolvedPin
+              ? `gh_${resolvedPin}`
+              : '';
+        if (user.userId === 'owner' || (founderUserId !== '' && user.userId === founderUserId)) {
+          return {
+            ...(prev ? { ...prev } : stripMeta(user)),
+            mutationAborted: true,
+            disableFailedReason: 'founder_protected',
+          };
+        }
+        if (!prev) {
+          return { ...stripMeta(user), disabled: true, mutationAborted: true, disableFailedReason: 'not_found' };
+        }
+        const callerIsFounder = user.callerIsImmutableFounder === true;
+        if (!callerIsFounder && prev.role === 'owner') {
+          return { ...prev, mutationAborted: true, disableFailedReason: 'owner_protected' };
+        }
+        if (prev.disabled) {
+          if (user.allowAlreadyDisabled) {
+            for (const [h, t] of tokens.entries()) {
+              if ((t.userId ?? 'owner') === user.userId) {
+                grantRefreshRateLimits.delete(t.grantId);
+                tokens.delete(h);
+              }
+            }
+            for (const [ch, cd] of codes.entries()) {
+              if ((cd.userId ?? 'owner') === user.userId) codes.delete(ch);
+            }
+            return { ...prev, ...computeMemoryUserTokenStats(user.userId) };
+          }
+          return { ...prev, mutationAborted: true, disableFailedReason: 'already_disabled' };
+        }
+        prev.role = 'member';
+        delete prev.promotedByOwnerId;
+        prev.disabled = true;
+        prev.sessionEpoch = (prev.sessionEpoch ?? 1) + 1;
+        if (user.githubLogin) prev.githubLogin = user.githubLogin;
+        delete prev.admittedVia;
+        delete prev.admittedOrg;
+        delete prev.encryptedGhToken;
+        delete prev.orgVerifiedAt;
+        for (const [h, t] of tokens.entries()) {
+          if ((t.userId ?? 'owner') === user.userId) {
+            grantRefreshRateLimits.delete(t.grantId);
+            tokens.delete(h);
+          }
+        }
+        for (const [ch, cd] of codes.entries()) {
+          if ((cd.userId ?? 'owner') === user.userId) codes.delete(ch);
+        }
+        return { ...prev, ...computeMemoryUserTokenStats(user.userId) };
+      }
+
       if (user.mutationKind === 'demote_unapproved_owner' || user.mutationKind === 'admin_role') {
         if (!prev || prev.disabled) {
           return { ...(prev ? { ...prev } : stripMeta(user)), mutationAborted: true };
@@ -1999,7 +2610,7 @@ export function createMemoryOAuthStore(): OAuthStore {
         this.enforcePinnedFounderOwners?.(pinnedOwnerId);
       }
       const u = users.get(userId);
-      return u ? { ...u } : null;
+      return u ? { ...u, ...computeMemoryUserTokenStats(userId) } : null;
     },
     listUsers() {
       const pinnedOwnerId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
@@ -2008,7 +2619,7 @@ export function createMemoryOAuthStore(): OAuthStore {
       }
       return [...users.values()]
         .filter((u) => !u.disabled)
-        .map(({ encryptedGhToken: _omitSecret, ...u }) => ({ ...u }))
+        .map(({ encryptedGhToken: _omitSecret, ...u }) => ({ ...u, ...computeMemoryUserTokenStats(u.userId) }))
         .sort((a, b) => b.lastLoginAt - a.lastLoginAt);
     },
     countUsers() {
@@ -2046,7 +2657,8 @@ export function createMemoryOAuthStore(): OAuthStore {
           u.userId !== 'owner' &&
           u.role === 'owner' &&
           String(u.githubId ?? '') !== cleanPin &&
-          u.promotedByOwnerId !== cleanPin
+          u.promotedByOwnerId !== cleanPin &&
+          u.promotedByOwnerId !== 'owner'
         ) {
           u.role = 'member';
           delete u.promotedByOwnerId;
@@ -3488,9 +4100,13 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           }
           grantUserRole = liveUser.role;
         }
-        const accessToken = `efa_${randomUrlToken(32)}`;
-        const refreshToken = `efr_${randomUrlToken(32)}`;
         const grantId = `grant_${randomUrlToken(12)}`;
+        const refreshRand = randomUrlToken(24);
+        const refreshSig = (
+          await hmacSha256Base64Url(`efr-v2:${signingSecret}`, `${grantId}.0.${record.clientId}.${refreshRand}`)
+        ).slice(0, 22);
+        const accessToken = `efa_${randomUrlToken(32)}`;
+        const refreshToken = `efr_${grantId}.0.${refreshRand}.${refreshSig}`;
         try {
           await deps.store.putTokenPair({
             grantId,
@@ -3561,8 +4177,34 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           return oauthJson({ error: 'invalid_request', error_description: 'refresh_token and client_id are required' }, 400, cors);
         }
 
+        // Parse & verify HMAC-authenticated lineage (`efr_<grantId>.<gen>.<rand>.<sig22>`) if present
+        let claimedGrantId: string | undefined;
+        let claimedGeneration: number | undefined;
+        const lineageMatch = /^efr_(grant_[A-Za-z0-9_-]{8,40})\.([0-9]{1,12})\.([A-Za-z0-9_-]{16,64})\.([A-Za-z0-9_-]{22})$/.exec(
+          refreshToken,
+        );
+        if (lineageMatch) {
+          const [, parsedGrantId, parsedGenStr, parsedRand, parsedSig] = lineageMatch;
+          const expectedSig = (
+            await hmacSha256Base64Url(`efr-v2:${signingSecret}`, `${parsedGrantId}.${parsedGenStr}.${clientId}.${parsedRand}`)
+          ).slice(0, 22);
+          const parsedGen = Number(parsedGenStr);
+          if (sameBytes(parsedSig!, expectedSig) && Number.isSafeInteger(parsedGen) && parsedGen >= 0) {
+            claimedGrantId = parsedGrantId;
+            claimedGeneration = parsedGen;
+          }
+        }
+
         const nextAccess = `efa_${randomUrlToken(32)}`;
-        const nextRefresh = `efr_${randomUrlToken(32)}`;
+        let nextRefresh = `efr_${randomUrlToken(32)}`;
+        if (claimedGrantId !== undefined && claimedGeneration !== undefined) {
+          const nextGen = claimedGeneration + 1;
+          const nextRand = randomUrlToken(24);
+          const nextSig = (
+            await hmacSha256Base64Url(`efr-v2:${signingSecret}`, `${claimedGrantId}.${nextGen}.${clientId}.${nextRand}`)
+          ).slice(0, 22);
+          nextRefresh = `efr_${claimedGrantId}.${nextGen}.${nextRand}.${nextSig}`;
+        }
         const rotated = await deps.store.rotateRefreshToken({
           refreshHash: await sha256Base64Url(refreshToken),
           clientId,
@@ -3571,8 +4213,35 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           now,
           accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
           refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
+          ...(claimedGrantId !== undefined ? { claimedGrantId, claimedGeneration } : {}),
         });
         if (!rotated.ok) {
+          if (rotated.error === 'slow_down') {
+            span.setAttributes({
+              ...(rotated.grantId ? { 'oauth.grant_id': rotated.grantId } : {}),
+              'oauth.outcome': 'rate_limited',
+              'http.response.status_code': 429,
+            });
+            span.setStatus(false, 'slow_down');
+            return oauthJson(
+              { error: 'slow_down', error_description: 'Refresh rate limit exceeded for grant' },
+              429,
+              { ...cors, 'retry-after': String(rotated.retryAfterSec) },
+            );
+          }
+          if (rotated.error === 'user_quota_exceeded') {
+            span.setAttributes({
+              ...(rotated.grantId ? { 'oauth.grant_id': rotated.grantId } : {}),
+              'oauth.outcome': 'quota_exceeded',
+              'http.response.status_code': 429,
+            });
+            span.setStatus(false, 'user_quota_exceeded');
+            return oauthJson(
+              { error: 'user_quota_exceeded', error_description: rotated.message },
+              429,
+              { ...cors, 'retry-after': '2' },
+            );
+          }
           if (rotated.replayDetected) {
             await deps.onEvent?.({
               level: 'warn',

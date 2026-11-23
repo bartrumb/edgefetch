@@ -456,7 +456,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
     badgeOut.includes('[![npm version](https://img.shields.io/npm/v/edgefetch.svg)](https://www.npmjs.com/package/edgefetch)'),
     `Expected npm shield badge preserved, got:\n${badgeOut}`,
   );
-  assert.ok(badgeOut.includes('`Promise<Result<Vec<Chunk>, ScrapeError>>`'));
+  assert.ok(badgeOut.includes('`Promise&lt;Result&lt;Vec&lt;Chunk>, ScrapeError>>`'));
   assertZeroLiveHtmlAcrossSixDialects(badgeOut, 'badgeReadmeHtmlMd');
 
   // Also check `extractHtmlDocument` on an HTML page with linked shield badges
@@ -468,7 +468,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
     htmlBadgeDoc.markdown.includes('[![CI](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/acme/edgefetch/actions)'),
     `extractHtmlDocument must preserve linked shield badges: ${htmlBadgeDoc.markdown}`,
   );
-  assert.ok(htmlBadgeDoc.markdown.includes('`Vec<T>`'), `extractHtmlDocument must preserve \`Vec<T>\`: ${htmlBadgeDoc.markdown}`);
+  assert.ok(htmlBadgeDoc.markdown.includes('`Vec&lt;T>`'), `extractHtmlDocument must escape < inside \`Vec&lt;T>\` (S1): ${htmlBadgeDoc.markdown}`);
 
   // 10 realistic Markdown documents (including EdgeFetch's own README.md, Rust `Vec<T>` API docs, TS generics, GFM tables, math, changelogs, badges)
   const corpus10: Array<{ id: string; md: string; baseUrl: string; expectedSpans: string[] }> = [
@@ -501,14 +501,14 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
       ].join('\n'),
       baseUrl: 'https://doc.rust-lang.org/std/collections/',
       expectedSpans: [
-        '`Vec<T>`',
-        '`VecDeque<T>`',
-        '`HashMap<K, V>`',
-        '`BTreeMap<K, V>`',
-        '`&Vec<T>`',
-        '`Option<&T>`',
-        '`Result<&T, ()>`',
-        '`Arc<Mutex<HashMap<String, Vec<u8>>>>`',
+        '`Vec&lt;T>`',
+        '`VecDeque&lt;T>`',
+        '`HashMap&lt;K, V>`',
+        '`BTreeMap&lt;K, V>`',
+        '`&Vec&lt;T>`',
+        '`Option&lt;&T>`',
+        '`Result&lt;&T, ()>`',
+        '`Arc&lt;Mutex&lt;HashMap&lt;String, Vec&lt;u8>>>>`',
       ],
     },
     {
@@ -522,12 +522,12 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
       ].join('\n'),
       baseUrl: 'https://docs.edgefetch.dev/sdk/ts',
       expectedSpans: [
-        '`Promise<ApiResponse<T>>`',
-        '`AsyncIterableIterator<PageChunk<Record<string, unknown>>>`',
-        '`<script>`',
-        '`<svg>`',
-        '`<iframe src="...">`',
-        '`<RouterProvider>`',
+        '`Promise&lt;ApiResponse&lt;T>>`',
+        '`AsyncIterableIterator&lt;PageChunk&lt;Record&lt;string, unknown>>>`',
+        '`&lt;script>`',
+        '`&lt;svg>`',
+        '`&lt;iframe src="...">`',
+        '`&lt;RouterProvider>`',
       ],
     },
     {
@@ -542,7 +542,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
         '| `batchQuery` | `Promise<Array<Row<T>>>` | `O(N)` | Executes parameterized D1 batch |',
       ].join('\n'),
       baseUrl: 'https://docs.edgefetch.dev/storage',
-      expectedSpans: ['`Promise<Uint8Array>`', '`Promise<PageSlice<string>>`', '`Map<Sha256, Doc>`', '`Promise<Array<Row<T>>>`'],
+      expectedSpans: ['`Promise&lt;Uint8Array>`', '`Promise&lt;PageSlice&lt;string>>`', '`Map&lt;Sha256, Doc>`', '`Promise&lt;Array&lt;Row&lt;T>>>`'],
     },
     {
       id: '05_shields_markdown_badges_readme',
@@ -556,7 +556,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
         'Zero-copy parser producing `Stream<Item = Result<Frame<Bytes>, DecodeError>>` with sub-millisecond latency.',
       ].join('\n'),
       baseUrl: 'https://github.com/acme/turbo',
-      expectedSpans: ['`Stream<Item = Result<Frame<Bytes>, DecodeError>>`'],
+      expectedSpans: ['`Stream&lt;Item = Result&lt;Frame&lt;Bytes>, DecodeError>>`'],
     },
     {
       id: '06_latex_math_and_algorithms',
@@ -572,7 +572,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
         'The sparse solver accepts `CsrMatrix<f64>` and returns `EigenPair<f64, Vec<f64>>` in $O(|E| \\log n)$ time.',
       ].join('\n'),
       baseUrl: 'https://docs.example.com/math',
-      expectedSpans: ['`CsrMatrix<f64>`', '`EigenPair<f64, Vec<f64>>`'],
+      expectedSpans: ['`CsrMatrix&lt;f64>`', '`EigenPair&lt;f64, Vec&lt;f64>>`'],
     },
     {
       id: '07_changelog_release_history',
@@ -586,7 +586,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
         '- Cached per-SHA sanitized Markdown in `Map<string, CachedEntry>` inside `storage.ts` for `< 2 ms` paging.',
       ].join('\n'),
       baseUrl: 'https://github.com/acme/edgefetch/releases',
-      expectedSpans: ['`Vec<T>`', '`Map<K, V>`', '`Map<string, CachedEntry>`', '`< 2 ms`'],
+      expectedSpans: ['`Vec&lt;T>`', '`Map&lt;K, V>`', '`Map&lt;string, CachedEntry>`', '`&lt; 2 ms`'],
     },
     {
       id: '08_cloudflare_workers_durable_objects_guide',
@@ -602,7 +602,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
         '```',
       ].join('\n'),
       baseUrl: 'https://developers.cloudflare.com/durable-objects/',
-      expectedSpans: ['`DurableObjectNamespace<AgentHubDO>`', '`ctx.storage.sql.exec<RowRecord>(query, ...bindings)`'],
+      expectedSpans: ['`DurableObjectNamespace&lt;AgentHubDO>`', '`ctx.storage.sql.exec&lt;RowRecord>(query, ...bindings)`'],
     },
     {
       id: '09_go_generics_and_channels_doc',
@@ -614,7 +614,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
         'For C++interop, `std::unique_ptr<Context>` and `std::span<const uint8_t>` map cleanly across the FFI boundary.',
       ].join('\n'),
       baseUrl: 'https://pkg.go.dev/sync',
-      expectedSpans: ['`std::unique_ptr<Context>`', '`std::span<const uint8_t>`'],
+      expectedSpans: ['`std::unique_ptr&lt;Context>`', '`std::span&lt;const uint8_t>`'],
     },
     {
       id: '10_http_api_pagination_spec',
@@ -627,9 +627,9 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
       ].join('\n'),
       baseUrl: 'https://docs.edgefetch.dev/api/artifacts',
       expectedSpans: [
-        '`GET /v1/artifacts/<sha256>?offset=0&limit=65536`',
-        '`Authorization: Bearer <token>`',
-        '`PaginatedStream<ArtifactPageSlice>`',
+        '`GET /v1/artifacts/&lt;sha256>?offset=0&limit=65536`',
+        '`Authorization: Bearer &lt;token>`',
+        '`PaginatedStream&lt;ArtifactPageSlice>`',
       ],
     },
   ];
@@ -716,7 +716,7 @@ test('Round 9 (Item 2): 10-Document Realistic Corpus (< 3% alteration, 0 altered
     const segs = splitMarkdownByCodeFences(san);
     const lastProse = segs[segs.length - 1] ?? '';
     if (lastProse.includes('Clean summary paragraph')) {
-      assert.ok(lastProse.includes('`Vec<T>`'), `[fuzz_${i}] \`Vec<T>\` altered in clean trailing paragraph: ${JSON.stringify(lastProse)}`);
+      assert.ok(lastProse.includes('`Vec&lt;T>`'), `[fuzz_${i}] \`Vec&lt;T>\` expected in clean trailing paragraph: ${JSON.stringify(lastProse)}`);
     }
   }
 });
@@ -742,20 +742,20 @@ test('Round 9 (H2 & Mediums): Destination <10ms up to 1MiB, Storage v32 clamping
     assert.ok(dtNeut < 10 * covMul, `neutralizeAllUnsafeMarkdownLinksLinear(${size}B) took ${dtNeut.toFixed(2)}ms (expected < 10ms)`);
   }
 
-  // 2. Storage `SCRAPE_PIPELINE_VERSION === 32`, clamping `pipelineVersion < 32`, and `< 5ms` per-page O(window) slicing on `1 MiB` doc!
-  assert.equal(SCRAPE_PIPELINE_VERSION, 32);
-  assert.equal(STORAGE_PIPELINE_VERSION, 32);
+  // 2. Storage `SCRAPE_PIPELINE_VERSION === 33`, clamping `pipelineVersion < 33`, and `< 5ms` per-page O(window) slicing on `1 MiB` doc!
+  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
+  assert.equal(STORAGE_PIPELINE_VERSION, 33);
 
   const bucket = new MemoryR2Bucket();
   const staleSha = 'a'.repeat(64);
-  await bucket.put(`derived/31/markdown/${staleSha}`, 'stale v31 `<img src=x onerror=1>`');
+  await bucket.put(`derived/32/markdown/${staleSha}`, 'stale v32 `<img src=x onerror=1>`');
   const clampedRes = await readArtifactPage({
     bucket: bucket as unknown as R2Bucket,
     blobSha256: `md:${staleSha}`,
     format: 'markdown',
-    pipelineVersion: 31, // Caller attempts to downgrade to 31 — MUST be clamped to 32!
+    pipelineVersion: 32, // Caller attempts to downgrade to 32 — MUST be clamped to 33!
   });
-  assert.equal(clampedRes.ok, false, 'Caller-supplied pipelineVersion < 32 MUST be clamped so stale v31 object is never read');
+  assert.equal(clampedRes.ok, false, 'Caller-supplied pipelineVersion < 33 MUST be clamped so stale v32 object is never read');
 
   // Build a realistic 1.05 MiB sanitized v32 Markdown document and verify `readArtifactPage` slices pages in < 5ms!
   const blockChunk =

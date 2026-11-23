@@ -8,7 +8,7 @@
  */
 
 import { extractJsonLdObjects } from './extractors/utils';
-import { validatePublicHttpsTargetUrl } from './overflow';
+import { isSafePublicHostname, validatePublicHttpsTargetUrl } from './overflow';
 import {
   asciiLower,
   isTagNameBoundary,
@@ -134,6 +134,24 @@ const INLINE_SPLIT_TAGS = new Set([
 
 export function isAsciiWhitespaceCode(c: number): boolean {
   return c === 32 || c === 9 || c === 10 || c === 13;
+}
+
+/** CommonMark §2.1 strict blank-line check: ONLY ASCII space (`0x20`) and ASCII tab (`0x09`) count as blank-line whitespace. */
+export function isAsciiSpaceOrTabOnly(s: string, start = 0, end = s.length): boolean {
+  for (let i = start; i < end; i++) {
+    const c = s.charCodeAt(i);
+    if (c !== 32 /* ' ' */ && c !== 9 /* '\t' */) return false;
+  }
+  return true;
+}
+
+function trimAsciiSpaceOrTabAndCrLinear(line: string): string {
+  let start = 0;
+  let end = line.length;
+  if (end > 0 && line.charCodeAt(end - 1) === 13 /* '\r' */) end--;
+  while (start < end && (line.charCodeAt(start) === 32 || line.charCodeAt(start) === 9)) start++;
+  while (end > start && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
+  return start === 0 && end === line.length ? line : line.slice(start, end);
 }
 
 export function trimAsciiWhitespaceLinear(s: string): string {
@@ -809,7 +827,7 @@ export function escapeAllResidualLtInProseLinear(prose: string, allowPdfPageMark
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     if (!line.includes('<')) continue;
-    const trimmed = trimAsciiWhitespaceLinear(line);
+    const trimmed = trimAsciiSpaceOrTabAndCrLinear(line);
     if (/^<!-- (?:page |pdf-page: )\d{1,6} -->$/.test(trimmed)) {
       continue;
     }
@@ -832,360 +850,6 @@ function isThematicBreakForSlice(raw: string, leadCols: number, leadPos: number)
   return count >= 3;
 }
 
-function isParagraphBreakLineForSafeSpans(
-  line: string,
-  prevInBq: boolean,
-  prevInList: boolean,
-): { kind: 'blank_or_atomic' | 'block_start' | 'atx_heading' | 'none'; inBq: boolean; inList: boolean } {
-  const { cols, bytePos, isBlank } = measureSliceIndentCols(line);
-  if (isBlank) return { kind: 'blank_or_atomic', inBq: false, inList: false };
-  const c = line.charCodeAt(bytePos);
-  if (cols <= 3) {
-    if (c === 35 /* '#' */) {
-      let h = bytePos;
-      while (h < line.length && line.charCodeAt(h) === 35 && h - bytePos < 7) h++;
-      if (h - bytePos <= 6 && (h >= line.length || line.charCodeAt(h) === 32 || line.charCodeAt(h) === 13)) {
-        return { kind: 'atx_heading', inBq: false, inList: false };
-      }
-    }
-    if (c === 62 /* '>' */) {
-      let q = bytePos;
-      while (q < line.length && (line.charCodeAt(q) === 62 || line.charCodeAt(q) === 32 || line.charCodeAt(q) === 9 || line.charCodeAt(q) === 13)) q++;
-      if (q === line.length) return { kind: 'blank_or_atomic', inBq: false, inList: false };
-      return { kind: prevInBq ? 'none' : 'block_start', inBq: true, inList: false };
-    }
-    if (isThematicBreakForSlice(line, cols, bytePos)) {
-      return { kind: 'blank_or_atomic', inBq: false, inList: false };
-    }
-    if (!prevInBq && !prevInList && (c === 61 || c === 45)) {
-      let p = bytePos;
-      while (p < line.length && line.charCodeAt(p) === c) p++;
-      while (p < line.length && (line.charCodeAt(p) === 32 || line.charCodeAt(p) === 9 || line.charCodeAt(p) === 13)) p++;
-      if (p === line.length) return { kind: 'blank_or_atomic', inBq: false, inList: false };
-    }
-    if ((c === 45 || c === 42 || c === 43) && bytePos + 1 < line.length && line.charCodeAt(bytePos + 1) === 32) {
-      let p = bytePos + 2;
-      while (p < line.length && (line.charCodeAt(p) === 32 || line.charCodeAt(p) === 9 || line.charCodeAt(p) === 13)) p++;
-      if (p < line.length) {
-        return { kind: 'block_start', inBq: false, inList: true };
-      }
-    }
-    if (
-      c === 49 /* '1' */ &&
-      bytePos + 2 < line.length &&
-      (line.charCodeAt(bytePos + 1) === 46 || line.charCodeAt(bytePos + 1) === 41) &&
-      line.charCodeAt(bytePos + 2) === 32
-    ) {
-      let p = bytePos + 3;
-      while (p < line.length && (line.charCodeAt(p) === 32 || line.charCodeAt(p) === 9 || line.charCodeAt(p) === 13)) p++;
-      if (p < line.length) {
-        return { kind: 'block_start', inBq: false, inList: true };
-      }
-    }
-  }
-  return { kind: 'none', inBq: prevInBq, inList: prevInList };
-}
-
-function hasUnclosedOpenBracketOnLine(line: string, upTo: number): boolean {
-  let depth = 0;
-  for (let i = 0; i < upTo; i++) {
-    const c = line.charCodeAt(i);
-    if (c === 92 /* '\\' */) {
-      i++;
-      continue;
-    }
-    if (c === 91 /* '[' */) {
-      depth++;
-    } else if (c === 93 /* ']' */ && depth > 0) {
-      // Only consider `[` closed if immediately completed as `[label](...)` on the same prefix;
-      // bare `[ref]` could still pair with `[second]` or reference syntax across spans in `marked`.
-      if (i + 1 < upTo && line.charCodeAt(i + 1) === 40 /* '(' */) {
-        const closeParen = line.indexOf(')', i + 2);
-        if (closeParen > i + 1 && closeParen < upTo) {
-          depth--;
-          i = closeParen;
-          continue;
-        }
-      }
-    }
-  }
-  return depth > 0;
-}
-
-/**
- * Preserves intact `<` ONLY inside provably unambiguous single-line paired backtick code spans
- * (e.g. `` `Vec<T>` ``, `` `Map<K, V>` ``, `` `Promise<Response>` ``, `` `<script>` `` in prose code documentation)
- * while escaping `<` -> `&lt;` everywhere else outside fenced code blocks (`Round 9 Item 2`).
- *
- * All 6 Markdown dialect families (`CommonMark`, `GFM`, `marked`, `markdown-it`, `goldmark`, `showdown_regex`) agree
- * 100% on a code span `[openTick, closeTick]` when ALL hold:
- *  1. The paragraph is NOT tick-poisoned by an earlier line, and every backtick run on `line` has exact length `1`
- *     (`k === 1`) and pairs cleanly on `line` (`tickPositions.length % 2 === 0`, non-empty interior).
- *  2. Zero `\` immediately precedes ANY backtick on `line` (nor ends any span interior before closing `` ` ``).
- *  3. Zero link-crossing ambiguity (`paraHasUnclosedBracket` or unclosed `[` before the span when `]`, `](`, `][`, or `]:`
- *     appears inside/after the span, and zero `[` or `]` inside the span when `](` / `][` / `]:` exists on the line/paragraph).
- *  4. If `line` contains `|` (potential GFM table row), ZERO code spans on `line` contain `|`.
- *  5. Not glued to bare URLs (`https://`, `http://`, `ftp://`, `www.`), `~`, or matching `*`/`_`, and interior contains
- *     no `<!--`, `-->`, `<?`, `<![`, or disallowed `](scheme:...)` links.
- */
-export function escapeResidualLtPreservingSafeCodeSpansLinear(prose: string, allowPdfPageMarkers = false): string {
-  if (!prose || !prose.includes('<')) return prose;
-  if (!prose.includes('`')) {
-    return escapeAllResidualLtInProseLinear(prose, allowPdfPageMarkers);
-  }
-
-  const lines = prose.split('\n');
-  let paraTickPoisoned = false;
-  let paraHasOpenBracket = false;
-  let paraHasLinkContinuation = false;
-  let inBq = false;
-  let inList = false;
-  let anyChanged = false;
-
-  // Pre-scan paragraph link continuation (`](`, `][`, `]:`) per line for cross-line `[foo \`bar\`\n](baz)` guard
-  const lineHasLinkTail = new Uint8Array(lines.length);
-  for (let li = 0; li < lines.length; li++) {
-    const ln = lines[li]!;
-    if (ln.includes('](') || ln.includes('][') || ln.includes(']:')) {
-      lineHasLinkTail[li] = 1;
-    }
-  }
-
-  for (let li = 0; li < lines.length; li++) {
-    const line = lines[li]!;
-    const brk = isParagraphBreakLineForSafeSpans(line, inBq, inList);
-    inBq = brk.inBq;
-    inList = brk.inList;
-    if (brk.kind === 'blank_or_atomic' || brk.kind === 'block_start' || brk.kind === 'atx_heading') {
-      paraTickPoisoned = false;
-      paraHasOpenBracket = false;
-      // Check if any subsequent line in this new paragraph has `](` / `][` / `]:`
-      paraHasLinkContinuation = lineHasLinkTail[li] === 1;
-      for (let look = li + 1; look < Math.min(lines.length, li + 32); look++) {
-        const lb = isParagraphBreakLineForSafeSpans(lines[look]!, inBq, inList);
-        if (lb.kind !== 'none') break;
-        if (lineHasLinkTail[look] === 1) {
-          paraHasLinkContinuation = true;
-          break;
-        }
-      }
-    }
-
-    if (allowPdfPageMarkers && line.includes('<')) {
-      const trimmed = trimAsciiWhitespaceLinear(line);
-      if (/^<!-- (?:page |pdf-page: )\d{1,6} -->$/.test(trimmed)) {
-        continue;
-      }
-    }
-
-    const hasTick = line.includes('`');
-    if (!hasTick) {
-      if (hasUnclosedOpenBracketOnLine(line, line.length)) {
-        paraHasOpenBracket = true;
-      }
-      if (line.includes('<')) {
-        const escaped = replaceAllLtLinearFast(line);
-        if (escaped !== line) {
-          lines[li] = escaped;
-          anyChanged = true;
-        }
-      }
-      if (brk.kind === 'atx_heading') {
-        paraTickPoisoned = false;
-        paraHasOpenBracket = false;
-      }
-      continue;
-    }
-
-    // Scan backtick runs on `line` to verify `paraTickPoisoned` & `k === 1` pairing
-    let lineAllSinglePaired = !paraTickPoisoned;
-    const singleTicks: number[] = [];
-    if (lineAllSinglePaired) {
-      let p = 0;
-      while (p < line.length) {
-        const idx = line.indexOf('`', p);
-        if (idx < 0) break;
-        if (idx > 0 && line.charCodeAt(idx - 1) === 92 /* '\\' */) {
-          lineAllSinglePaired = false;
-          paraTickPoisoned = true;
-          break;
-        }
-        let end = idx + 1;
-        while (end < line.length && line.charCodeAt(end) === 96) end++;
-        if (end - idx !== 1) {
-          lineAllSinglePaired = false;
-          // Check CommonMark pairing to know whether subsequent lines in paragraph are tick-poisoned
-          const runLen = end - idx;
-          let search = end;
-          let matched = false;
-          while (search < line.length) {
-            const h = line.indexOf('`', search);
-            if (h < 0) break;
-            let he = h + 1;
-            while (he < line.length && line.charCodeAt(he) === 96) he++;
-            if (he - h === runLen && (h === 0 || line.charCodeAt(h - 1) !== 92)) {
-              matched = true;
-              p = he;
-              break;
-            }
-            search = he;
-          }
-          if (!matched) {
-            paraTickPoisoned = true;
-          }
-          break;
-        }
-        singleTicks.push(idx);
-        p = end;
-      }
-      if (lineAllSinglePaired && (singleTicks.length < 2 || (singleTicks.length & 1) === 1)) {
-        lineAllSinglePaired = false;
-        paraTickPoisoned = true;
-      }
-    } else {
-      paraTickPoisoned = true;
-    }
-
-    if (!line.includes('<')) {
-      if (hasUnclosedOpenBracketOnLine(line, line.length)) {
-        paraHasOpenBracket = true;
-      }
-      if (brk.kind === 'atx_heading') {
-        paraTickPoisoned = false;
-        paraHasOpenBracket = false;
-      }
-      continue;
-    }
-
-    if (!lineAllSinglePaired) {
-      if (hasUnclosedOpenBracketOnLine(line, line.length)) {
-        paraHasOpenBracket = true;
-      }
-      const escaped = replaceAllLtLinearFast(line);
-      if (escaped !== line) {
-        lines[li] = escaped;
-        anyChanged = true;
-      }
-      if (brk.kind === 'atx_heading') {
-        paraTickPoisoned = false;
-        paraHasOpenBracket = false;
-      }
-      continue;
-    }
-
-    const lineHasPipe = line.includes('|');
-    let anySpanHasPipe = false;
-    if (lineHasPipe) {
-      for (let si = 0; si < singleTicks.length; si += 2) {
-        if (line.slice(singleTicks[si]! + 1, singleTicks[si + 1]!).includes('|')) {
-          anySpanHasPipe = true;
-          break;
-        }
-      }
-    }
-
-    // Also check if any link destination/title on `line` outside spans contains a backtick (which poisons pairing)
-    let linkContainsTick = false;
-    for (let si = 0; si <= singleTicks.length; si += 2) {
-      const prevClose = si === 0 ? 0 : singleTicks[si - 1]! + 1;
-      const nextOpen = si < singleTicks.length ? singleTicks[si]! : line.length;
-      const outsideSeg = line.slice(prevClose, nextOpen);
-      if (outsideSeg.includes('](') && si < singleTicks.length) {
-        const bpIdx = outsideSeg.lastIndexOf('](');
-        if (!outsideSeg.slice(bpIdx + 2).includes(')')) {
-          // Unclosed `](` right before a backtick!
-          linkContainsTick = true;
-          paraTickPoisoned = true;
-          break;
-        }
-      }
-    }
-
-    if (linkContainsTick || (lineHasPipe && anySpanHasPipe)) {
-      if (hasUnclosedOpenBracketOnLine(line, line.length)) paraHasOpenBracket = true;
-      const escaped = replaceAllLtLinearFast(line);
-      if (escaped !== line) {
-        lines[li] = escaped;
-        anyChanged = true;
-      }
-      if (brk.kind === 'atx_heading') {
-        paraTickPoisoned = false;
-        paraHasOpenBracket = false;
-      }
-      continue;
-    }
-
-    const lineHasLinkSyntax = lineHasLinkTail[li] === 1 || paraHasLinkContinuation;
-    let out = '';
-    let cursor = 0;
-    for (let si = 0; si < singleTicks.length; si += 2) {
-      const openIdx = singleTicks[si]!;
-      const closeIdx = singleTicks[si + 1]!;
-      out += replaceAllLtLinearFast(line.slice(cursor, openIdx));
-
-      const inner = line.slice(openIdx + 1, closeIdx);
-      let spanSafe = inner.length > 0;
-      if (spanSafe && inner.includes('<')) {
-        // Check backslash before closing tick (already checked in loop, double-verify)
-        if (line.charCodeAt(closeIdx - 1) === 92 /* '\\' */) spanSafe = false;
-        // Check tilde or emphasis adjacency
-        if (spanSafe && openIdx > 0) {
-          const prevC = line.charCodeAt(openIdx - 1);
-          if (prevC === 126 /* '~' */) spanSafe = false;
-          if ((prevC === 42 /* '*' */ || prevC === 95 /* '_' */) && inner.includes(prevC === 42 ? '*' : '_')) {
-            spanSafe = false;
-          }
-          // Glued bare URL check (`https://x\`...`)
-          if (prevC > 32 && prevC !== 40 && prevC !== 91 && prevC !== 34 && prevC !== 39) {
-            const beforeSlice = line.slice(Math.max(0, openIdx - 256), openIdx);
-            if (/(?:https?:\/\/|ftp:\/\/|www\.)\S*$/i.test(beforeSlice)) {
-              spanSafe = false;
-            }
-          }
-        }
-        if (spanSafe && closeIdx + 1 < line.length && line.charCodeAt(closeIdx + 1) === 126 /* '~' */) {
-          spanSafe = false;
-        }
-        // Check HTML comment / PI / CDATA openers inside span
-        if (spanSafe && (inner.includes('<!--') || inner.includes('-->') || inner.includes('<?') || inner.includes('<![') || inner.includes('](') || inner.includes('][') || inner.includes(']:'))) {
-          spanSafe = false;
-        }
-        // Check `marked` / `showdown` link-before-codespan disagreement
-        if (spanSafe) {
-          const unclosedBefore = paraHasOpenBracket || hasUnclosedOpenBracketOnLine(line, openIdx);
-          if (unclosedBefore && (inner.includes(']') || lineHasLinkSyntax || line.indexOf(']', closeIdx + 1) >= 0)) {
-            spanSafe = false;
-          } else if ((inner.includes('[') || inner.includes(']')) && lineHasLinkSyntax) {
-            spanSafe = false;
-          }
-        }
-      }
-
-      if (spanSafe) {
-        out += line.slice(openIdx, closeIdx + 1);
-      } else {
-        out += `\`${replaceAllLtLinearFast(inner)}\``;
-      }
-      cursor = closeIdx + 1;
-    }
-    out += replaceAllLtLinearFast(line.slice(cursor));
-
-    if (hasUnclosedOpenBracketOnLine(line, line.length)) {
-      paraHasOpenBracket = true;
-    }
-    if (out !== line) {
-      lines[li] = out;
-      anyChanged = true;
-    }
-    if (brk.kind === 'atx_heading') {
-      paraTickPoisoned = false;
-      paraHasOpenBracket = false;
-    }
-  }
-
-  return anyChanged ? lines.join('\n') : prose;
-}
-
 function measureSliceIndentCols(raw: string): { cols: number; bytePos: number; isBlank: boolean } {
   let cols = 0;
   let i = 0;
@@ -1204,9 +868,17 @@ function measureSliceIndentCols(raw: string): { cols: number; bytePos: number; i
   return { cols, bytePos: i, isBlank: i >= raw.length };
 }
 
-function detectSliceListItemContentCol(raw: string, leadCols: number, leadPos: number, prevLineWasParagraph = false): number {
-  if (leadCols > 3 || leadPos >= raw.length) return 0;
-  if (isThematicBreakForSlice(raw, leadCols, leadPos)) return 0;
+function detectSliceListItemInfo(
+  raw: string,
+  leadCols: number,
+  leadPos: number,
+  prevLineWasParagraph = false,
+  parentListIndent = 0,
+): { contentCol: number; hasContent: boolean } {
+  if (leadCols < parentListIndent || leadCols - parentListIndent > 3 || leadPos >= raw.length) {
+    return { contentCol: 0, hasContent: false };
+  }
+  if (isThematicBreakForSlice(raw, leadCols - parentListIndent, leadPos)) return { contentCol: 0, hasContent: false };
   const c = raw.charCodeAt(leadPos);
   let markerEnd = -1;
   let markerWidth = 0;
@@ -1225,9 +897,9 @@ function detectSliceListItemContentCol(raw: string, leadCols: number, leadPos: n
       isOrderedOne = d === leadPos + 1 && c === 49 /* '1' */;
     }
   }
-  if (markerEnd < 0 || markerEnd >= raw.length) return 0;
+  if (markerEnd < 0 || markerEnd >= raw.length) return { contentCol: 0, hasContent: false };
   const after = raw.charCodeAt(markerEnd);
-  if (after !== 32 && after !== 9) return 0;
+  if (after !== 32 && after !== 9) return { contentCol: 0, hasContent: false };
   let col = leadCols + markerWidth;
   let p = markerEnd;
   while (p < raw.length) {
@@ -1242,14 +914,15 @@ function detectSliceListItemContentCol(raw: string, leadCols: number, leadPos: n
       break;
     }
   }
+  const hasContent = p < raw.length;
   if (prevLineWasParagraph) {
-    if (p >= raw.length) return 0;
-    if (isOrdered && !isOrderedOne) return 0;
+    if (!hasContent) return { contentCol: 0, hasContent: false };
+    if (isOrdered && !isOrderedOne) return { contentCol: 0, hasContent: false };
   }
-  if (p >= raw.length || col - (leadCols + markerWidth) > 4) {
-    return leadCols + markerWidth + 1;
+  if (!hasContent || col - (leadCols + markerWidth) > 4) {
+    return { contentCol: leadCols + markerWidth + 1, hasContent };
   }
-  return col;
+  return { contentCol: col, hasContent };
 }
 
 function normalizeSliceLineEndingsLengthPreserving(s: string): string {
@@ -1257,9 +930,71 @@ function normalizeSliceLineEndingsLengthPreserving(s: string): string {
   return s.replace(/\r(?!\n)/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ');
 }
 
+function stripLeadingIndentColsForReopenedFence(raw: string, stripCols: number): string {
+  let col = 0;
+  let p = 0;
+  while (p < raw.length && col < stripCols) {
+    const ch = raw.charCodeAt(p);
+    if (ch === 32) {
+      col++;
+      p++;
+    } else if (ch === 9) {
+      col += 4 - (col % 4);
+      p++;
+    } else {
+      break;
+    }
+  }
+  if (p === 0) return raw;
+  const leftoverSpaces = col > stripCols ? ' '.repeat(col - stripCols) : '';
+  return `${leftoverSpaces}${raw.slice(p)}`;
+}
+
+function computeNextSliceParagraphState(
+  rawLine: string,
+  cols: number,
+  bytePos: number,
+  isBlank: boolean,
+  listCol: number,
+  listHasContent: boolean,
+  activeListIndent: number,
+  prevLineWasParagraph: boolean,
+): boolean {
+  const relCols = cols >= activeListIndent ? cols - activeListIndent : cols;
+  if (isBlank || isThematicBreakForSlice(rawLine, relCols, bytePos)) {
+    return false;
+  }
+  if (listCol > 0) {
+    return listHasContent;
+  }
+  const leadC = rawLine.charCodeAt(bytePos);
+  if (relCols <= 3 && leadC === 35 /* '#' */) {
+    let h = bytePos;
+    while (h < rawLine.length && h - bytePos < 7 && rawLine.charCodeAt(h) === 35) h++;
+    if (h - bytePos <= 6 && (h === rawLine.length || rawLine.charCodeAt(h) === 32 || rawLine.charCodeAt(h) === 9)) {
+      return false;
+    }
+  }
+  if (!prevLineWasParagraph && relCols >= 4) {
+    return false;
+  }
+  if (relCols <= 3 && leadC === 62 /* '>' */) {
+    let q = bytePos;
+    while (q < rawLine.length && (rawLine.charCodeAt(q) === 62 || rawLine.charCodeAt(q) === 32 || rawLine.charCodeAt(q) === 9)) q++;
+    return q < rawLine.length;
+  }
+  return true;
+}
+
+interface InitialSliceContext {
+  prevPara: boolean;
+  startsAtSeparatorNewline: boolean;
+}
+
 function hardenAndSplitSliceFences(
   rawMd: string,
   initialReopenedFence?: { ch: string; len: number; sourceIndent: number },
+  initialCtx?: InitialSliceContext,
 ): Array<{ text: string; isFence: boolean }> {
   const md = normalizeSliceLineEndingsLengthPreserving(rawMd);
   const lines = md.split('\n');
@@ -1272,7 +1007,10 @@ function hardenAndSplitSliceFences(
   let fenceInfo = '';
   let fenceIndent = 0;
   let reopenSourceIndent = 0;
-  let activeListIndent = 0;
+  const listIndents: number[] = [];
+  let prevLineWasParagraph = initialReopenedFence ? false : Boolean(initialCtx?.prevPara);
+  const skipLeadingSepNl = !initialReopenedFence && Boolean(initialCtx?.startsAtSeparatorNewline);
+  let escapedRiskyListFence: { ch: '`' | '~'; len: number } | null = null;
 
   if (initialReopenedFence) {
     inFence = true;
@@ -1281,17 +1019,22 @@ function hardenAndSplitSliceFences(
     effectiveFenceLen = initialReopenedFence.len;
     fenceIndent = 0;
     reopenSourceIndent = initialReopenedFence.sourceIndent;
-    fenceOpenIdx = 0;
-    normLines.push(fenceChar.repeat(fenceLen));
+    fenceOpenIdx = 1;
+    normLines.push('', fenceChar.repeat(fenceLen));
   }
 
   for (let li = 0; li < lines.length; li++) {
     const rawWithCr = lines[li]!;
     const cr = rawWithCr.endsWith('\r') ? '\r' : '';
     const raw = cr ? rawWithCr.slice(0, -1) : rawWithCr;
+    if (li === 0 && skipLeadingSepNl && raw.length === 0 && !inFence) {
+      normLines.push(rawWithCr);
+      continue;
+    }
     const { cols, bytePos, isBlank } = measureSliceIndentCols(raw);
 
     if (inFence) {
+      prevLineWasParagraph = false;
       const containerIndent = reopenSourceIndent > 0 ? reopenSourceIndent : fenceIndent;
       if (!isBlank && containerIndent > 0 && cols < containerIndent && !(reopenSourceIndent > 0 && li === 0)) {
         normLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}`);
@@ -1302,17 +1045,17 @@ function hardenAndSplitSliceFences(
         fenceOpenIdx = -1;
         fenceIndent = 0;
         reopenSourceIndent = 0;
-        activeListIndent = 0;
+        listIndents.length = 0;
+        escapedRiskyListFence = null;
       } else {
         const maxCloseIndent = containerIndent > 0 ? containerIndent + 3 : 3;
-        if (cols <= maxCloseIndent && bytePos === cols) {
+        if (!isBlank && bytePos < raw.length) {
           let p = bytePos;
           const fcCode = fenceChar.charCodeAt(0);
           while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
           const runLen = p - bytePos;
           if (runLen >= fenceLen) {
-            while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
-            if (p === raw.length) {
+            if (cols >= containerIndent && cols <= maxCloseIndent && isAsciiSpaceOrTabOnly(raw, p)) {
               const closeLen = Math.max(runLen, effectiveFenceLen);
               normLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(closeLen)}${cr}`);
               inFence = false;
@@ -1331,33 +1074,46 @@ function hardenAndSplitSliceFences(
           }
         }
         if (reopenSourceIndent > 0 && bytePos > 0) {
-          const stripSpaces = Math.min(reopenSourceIndent, bytePos);
-          let allSpaces = true;
-          for (let sp = 0; sp < stripSpaces; sp++) {
-            if (raw.charCodeAt(sp) !== 32) {
-              allSpaces = false;
-              break;
-            }
-          }
-          if (allSpaces) {
-            normLines.push(`${raw.slice(stripSpaces)}${cr}`);
-            continue;
-          }
+          normLines.push(`${stripLeadingIndentColsForReopenedFence(raw, reopenSourceIndent)}${cr}`);
+          continue;
         }
         normLines.push(rawWithCr);
         continue;
       }
     }
 
-    if (!isBlank && activeListIndent > 0 && cols < activeListIndent) {
-      activeListIndent = 0;
+    if (!isBlank && listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
+      while (listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
+        listIndents.pop();
+      }
+      escapedRiskyListFence = null;
     }
-    const listCol = detectSliceListItemContentCol(raw, cols, bytePos);
-    if (listCol > 0) activeListIndent = listCol;
+    const parentListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
+    const listInfo = detectSliceListItemInfo(raw, cols, bytePos, prevLineWasParagraph, parentListIndent);
+    const listCol = listInfo.contentCol;
+    if (listCol > 0) {
+      listIndents.push(listCol);
+      escapedRiskyListFence = null;
+    }
+    const activeListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
 
     const minCols = activeListIndent > 0 ? activeListIndent : 0;
     const maxCols = minCols + 3;
-    if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos === cols && bytePos + 3 <= raw.length) {
+    if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos + 3 <= raw.length) {
+      if (escapedRiskyListFence) {
+        const escCode = escapedRiskyListFence.ch.charCodeAt(0);
+        if (raw.charCodeAt(bytePos) === escCode) {
+          let p = bytePos;
+          while (p < raw.length && raw.charCodeAt(p) === escCode) p++;
+          const runLen = p - bytePos;
+          if (runLen >= escapedRiskyListFence.len && isAsciiSpaceOrTabOnly(raw, p)) {
+            normLines.push(`${raw.slice(0, bytePos)}${`\\${escapedRiskyListFence.ch}`.repeat(runLen)}${raw.slice(p)}${cr}`);
+            escapedRiskyListFence = null;
+            prevLineWasParagraph = true;
+            continue;
+          }
+        }
+      }
       const c0 = raw.charCodeAt(bytePos);
       if (c0 === 96 || c0 === 126) {
         let fEnd = bytePos + 1;
@@ -1365,8 +1121,19 @@ function hardenAndSplitSliceFences(
         const fLen = fEnd - bytePos;
         const infoRaw = raw.slice(fEnd);
         if (fLen >= 3 && !(c0 === 96 && infoRaw.includes('`'))) {
+          const fCh: '`' | '~' = c0 === 96 ? '`' : '~';
+          if (bytePos < cols) {
+            // Tab-indented fence opener inside a list item: escape fail-closed and track matching closer!
+            if (activeListIndent > 0) {
+              escapedRiskyListFence = { ch: fCh, len: fLen };
+            }
+            normLines.push(`${raw.slice(0, bytePos)}${`\\${fCh}`.repeat(fLen)}${infoRaw}${cr}`);
+            prevLineWasParagraph = true;
+            continue;
+          }
           inFence = true;
-          fenceChar = c0 === 96 ? '`' : '~';
+          prevLineWasParagraph = false;
+          fenceChar = fCh;
           fenceLen = fLen;
           effectiveFenceLen = fLen;
           fenceIndent = activeListIndent > 0 ? activeListIndent : 0;
@@ -1408,6 +1175,21 @@ function hardenAndSplitSliceFences(
         pCol++;
         continue;
       }
+      if (cc >= 48 && cc <= 57) {
+        let dj = pfx;
+        while (dj < raw.length && dj - pfx < 9 && raw.charCodeAt(dj) >= 48 && raw.charCodeAt(dj) <= 57) dj++;
+        if (
+          dj < raw.length &&
+          (raw.charCodeAt(dj) === 46 || raw.charCodeAt(dj) === 41) &&
+          dj + 1 < raw.length &&
+          (raw.charCodeAt(dj + 1) === 32 || raw.charCodeAt(dj + 1) === 9)
+        ) {
+          risky = true;
+          pCol += dj + 1 - pfx;
+          pfx = dj + 1;
+          continue;
+        }
+      }
       break;
     }
     if (pfx > 0 && risky && pfx + 3 <= raw.length) {
@@ -1417,14 +1199,38 @@ function hardenAndSplitSliceFences(
         while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
         const tail = raw.slice(fEnd);
         if (!(c0 === 96 && tail.includes('`'))) {
-          const fCh = c0 === 96 ? '`' : '~';
-          normLines.push(`${raw.slice(0, pfx)}${`\\${fCh}`.repeat(fEnd - pfx)}${tail}${cr}`);
+          const fCh: '`' | '~' = c0 === 96 ? '`' : '~';
+          if (listCol > 0 && activeListIndent > 0) {
+            escapedRiskyListFence = { ch: fCh, len: fEnd - pfx };
+          }
+          const rewritten = `${raw.slice(0, pfx)}${`\\${fCh}`.repeat(fEnd - pfx)}${tail}`;
+          normLines.push(`${rewritten}${cr}`);
+          prevLineWasParagraph = computeNextSliceParagraphState(
+            rewritten,
+            cols,
+            bytePos,
+            false,
+            listCol,
+            listCol > 0 ? true : listInfo.hasContent,
+            activeListIndent,
+            prevLineWasParagraph,
+          );
           continue;
         }
       }
     }
 
     normLines.push(rawWithCr);
+    prevLineWasParagraph = computeNextSliceParagraphState(
+      raw,
+      cols,
+      bytePos,
+      isBlank,
+      listCol,
+      listInfo.hasContent,
+      activeListIndent,
+      prevLineWasParagraph,
+    );
   }
 
   if (inFence) {
@@ -1441,7 +1247,8 @@ function hardenAndSplitSliceFences(
   let sFenceChar = '';
   let sFenceLen = 0;
   let sFenceIndent = 0;
-  let sListIndent = 0;
+  const sListIndents: number[] = [];
+  let sPrevPara = initialReopenedFence ? false : Boolean(initialCtx?.prevPara);
   let segStart = 0;
   let pos = 0;
   while (pos < hardened.length) {
@@ -1449,20 +1256,25 @@ function hardenAndSplitSliceFences(
     const nextPos = nl === -1 ? hardened.length : nl + 1;
     const lineEnd = nl === -1 ? hardened.length : nl > pos && hardened[nl - 1] === '\r' ? nl - 1 : nl;
     const rawLine = hardened.slice(pos, lineEnd);
+    if (pos === 0 && skipLeadingSepNl && rawLine.length === 0 && !sInFence) {
+      pos = nextPos;
+      continue;
+    }
     const { cols, bytePos, isBlank } = measureSliceIndentCols(rawLine);
     if (sInFence) {
+      sPrevPara = false;
       if (!isBlank && sFenceIndent > 0 && cols < sFenceIndent) {
         segs.push({ text: hardened.slice(segStart, pos), isFence: true });
         sInFence = false;
         sFenceChar = '';
         sFenceLen = 0;
         sFenceIndent = 0;
-        sListIndent = 0;
+        sListIndents.length = 0;
         segStart = pos;
         continue;
       }
       const maxClose = sFenceIndent > 0 ? sFenceIndent + 3 : 3;
-      if (cols <= maxClose && bytePos === cols) {
+      if (cols >= sFenceIndent && cols <= maxClose && bytePos === cols) {
         const rest = rawLine.slice(bytePos);
         const cm = /^(`{3,}|~{3,})[ \t]*$/.exec(rest);
         if (cm && cm[1]![0] === sFenceChar && cm[1]!.length >= sFenceLen) {
@@ -1479,22 +1291,44 @@ function hardenAndSplitSliceFences(
       pos = nextPos;
       continue;
     }
-    if (!isBlank && sListIndent > 0 && cols < sListIndent) sListIndent = 0;
-    const lCol = detectSliceListItemContentCol(rawLine, cols, bytePos);
-    if (lCol > 0) sListIndent = lCol;
+    if (!isBlank && sListIndents.length > 0 && cols < sListIndents[sListIndents.length - 1]!) {
+      while (sListIndents.length > 0 && cols < sListIndents[sListIndents.length - 1]!) {
+        sListIndents.pop();
+      }
+    }
+    const sParentIndent = sListIndents.length > 0 ? sListIndents[sListIndents.length - 1]! : 0;
+    const sListInfo = detectSliceListItemInfo(rawLine, cols, bytePos, sPrevPara, sParentIndent);
+    const lCol = sListInfo.contentCol;
+    if (lCol > 0) sListIndents.push(lCol);
+    const sListIndent = sListIndents.length > 0 ? sListIndents[sListIndents.length - 1]! : 0;
     const minOpen = sListIndent > 0 ? sListIndent : 0;
     const maxOpen = minOpen + 3;
+    let openedSplitFence = false;
     if (lCol === 0 && cols >= minOpen && cols <= maxOpen && bytePos === cols) {
       const rest = rawLine.slice(bytePos);
       const om = /^(`{3,}|~{3,})(.*)$/.exec(rest);
       if (om && !(om[1]![0] === '`' && om[2]!.includes('`'))) {
         segs.push({ text: hardened.slice(segStart, pos), isFence: false });
         sInFence = true;
+        openedSplitFence = true;
+        sPrevPara = false;
         sFenceChar = om[1]![0]!;
         sFenceLen = om[1]!.length;
         sFenceIndent = sListIndent > 0 ? sListIndent : 0;
         segStart = pos;
       }
+    }
+    if (!openedSplitFence) {
+      sPrevPara = computeNextSliceParagraphState(
+        rawLine,
+        cols,
+        bytePos,
+        isBlank,
+        lCol,
+        sListInfo.hasContent,
+        sListIndent,
+        sPrevPara,
+      );
     }
     pos = nextPos;
   }
@@ -1570,16 +1404,13 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
         activeListIndent = 0;
       } else {
         const maxClose = fenceIndent > 0 ? fenceIndent + 3 : 3;
-        if (cols <= maxClose && bytePos === cols) {
+        if (!isBlank && cols >= fenceIndent && cols <= maxClose && bytePos < rawLine.length) {
           let p = bytePos;
           const fcCode = fenceChar.charCodeAt(0);
           while (p < rawLine.length && rawLine.charCodeAt(p) === fcCode) p++;
           const runLen = p - bytePos;
-          if (runLen >= fenceLen) {
-            while (p < rawLine.length && (rawLine.charCodeAt(p) === 32 || rawLine.charCodeAt(p) === 9)) p++;
-            if (p === rawLine.length) {
-              lineClosedFenceExplicit = true;
-            }
+          if (runLen >= fenceLen && isAsciiSpaceOrTabOnly(rawLine, p)) {
+            lineClosedFenceExplicit = true;
           }
         }
       }
@@ -1589,14 +1420,15 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
       if (!isBlank && activeListIndent > 0 && cols < activeListIndent && !prevLineWasParagraph) {
         activeListIndent = 0;
       }
-      const listCol = detectSliceListItemContentCol(rawLine, cols, bytePos, prevLineWasParagraph);
+      const listInfo = detectSliceListItemInfo(rawLine, cols, bytePos, prevLineWasParagraph);
+      const listCol = listInfo.contentCol;
       if (listCol > 0) {
         activeListIndent = listCol;
         prevLineWasParagraph = false;
       }
       const minCols = activeListIndent > 0 ? activeListIndent : 0;
       const maxCols = minCols + 3;
-      if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos === cols && bytePos + 3 <= rawLine.length) {
+      if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos + 3 <= rawLine.length) {
         const c0 = rawLine.charCodeAt(bytePos);
         if (c0 === 96 || c0 === 126) {
           let fEnd = bytePos + 1;
@@ -1615,7 +1447,7 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
         if (isBlank || isThematicBreakForSlice(rawLine, cols, bytePos)) {
           prevLineWasParagraph = false;
         } else if (listCol > 0) {
-          prevLineWasParagraph = rawLine.slice(Math.min(listCol, rawLine.length)).trim() !== '';
+          prevLineWasParagraph = listInfo.hasContent;
         } else {
           const leadC = rawLine.charCodeAt(bytePos);
           let isAtx = false;
@@ -1677,6 +1509,8 @@ export function sanitizeMarkdownPageSlice(
 
   let reconstructed = rawSlice;
   let initialReopenedFence: { ch: string; len: number; sourceIndent: number } | undefined;
+  let forceLeadingNewlineForConcat = false;
+  const sliceInitialCtx: InitialSliceContext = { prevPara: false, startsAtSeparatorNewline: false };
 
   if (safeOffset > 0 && fullMd.length > 0) {
     const clampedOffset = Math.min(safeOffset, fullMd.length);
@@ -1712,6 +1546,9 @@ export function sanitizeMarkdownPageSlice(
       const rawLine = lineEnd > pos && fullMd.charCodeAt(lineEnd - 1) === 13 ? fullMd.slice(pos, lineEnd - 1) : fullMd.slice(pos, lineEnd);
       const containsOffset = clampedOffset >= pos && clampedOffset <= lineEnd;
       const { cols, bytePos, isBlank } = measureSliceIndentCols(rawLine);
+      if (containsOffset && clampedOffset < lineEnd && !inFence) {
+        sliceInitialCtx.prevPara = prevLineWasParagraph;
+      }
 
       let lineOpenedFence: { ch: string; len: number; indent: number } | null = null;
       let lineClosedFenceExplicit = false;
@@ -1726,16 +1563,13 @@ export function sanitizeMarkdownPageSlice(
           activeListIndent = 0;
         } else {
           const maxClose = fenceIndent > 0 ? fenceIndent + 3 : 3;
-          if (cols <= maxClose && bytePos === cols) {
+          if (!isBlank && cols >= fenceIndent && cols <= maxClose && bytePos < rawLine.length) {
             let p = bytePos;
             const fcCode = fenceChar.charCodeAt(0);
             while (p < rawLine.length && rawLine.charCodeAt(p) === fcCode) p++;
             const runLen = p - bytePos;
-            if (runLen >= fenceLen) {
-              while (p < rawLine.length && (rawLine.charCodeAt(p) === 32 || rawLine.charCodeAt(p) === 9)) p++;
-              if (p === rawLine.length) {
-                lineClosedFenceExplicit = true;
-              }
+            if (runLen >= fenceLen && isAsciiSpaceOrTabOnly(rawLine, p)) {
+              lineClosedFenceExplicit = true;
             }
           }
         }
@@ -1745,14 +1579,15 @@ export function sanitizeMarkdownPageSlice(
         if (!isBlank && activeListIndent > 0 && cols < activeListIndent && !prevLineWasParagraph) {
           activeListIndent = 0;
         }
-        const listCol = detectSliceListItemContentCol(rawLine, cols, bytePos, prevLineWasParagraph);
+        const listInfo = detectSliceListItemInfo(rawLine, cols, bytePos, prevLineWasParagraph);
+        const listCol = listInfo.contentCol;
         if (listCol > 0) {
           activeListIndent = listCol;
           prevLineWasParagraph = false;
         }
         const minCols = activeListIndent > 0 ? activeListIndent : 0;
         const maxCols = minCols + 3;
-        if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos === cols && bytePos + 3 <= rawLine.length) {
+        if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos + 3 <= rawLine.length) {
           const c0 = rawLine.charCodeAt(bytePos);
           if (c0 === 96 || c0 === 126) {
             let fEnd = bytePos + 1;
@@ -1767,11 +1602,11 @@ export function sanitizeMarkdownPageSlice(
             }
           }
         }
-        if (!lineOpenedFence && !containsOffset) {
+        if (!lineOpenedFence && (!containsOffset || clampedOffset === lineEnd)) {
           if (isBlank || isThematicBreakForSlice(rawLine, cols, bytePos)) {
             prevLineWasParagraph = false;
           } else if (listCol > 0) {
-            prevLineWasParagraph = rawLine.slice(Math.min(listCol, rawLine.length)).trim() !== '';
+            prevLineWasParagraph = listInfo.hasContent;
           } else {
             const leadC = rawLine.charCodeAt(bytePos);
             let isAtx = false;
@@ -1798,6 +1633,7 @@ export function sanitizeMarkdownPageSlice(
       if (containsOffset) {
         const firstSliceNl = reconstructed.indexOf('\n');
         if (lineOpenedFence) {
+          forceLeadingNewlineForConcat = true;
           if (clampedOffset > pos || lineOpenedFence.indent > 0) {
             if (firstSliceNl >= 0) {
               reconstructed = reconstructed.slice(firstSliceNl + 1);
@@ -1808,10 +1644,11 @@ export function sanitizeMarkdownPageSlice(
               };
             } else {
               // Slice ended inside the opening fence header itself before `\n` — no code body yet
-              reconstructed = `${lineOpenedFence.ch.repeat(lineOpenedFence.len)}\n${lineOpenedFence.ch.repeat(lineOpenedFence.len)}`;
+              reconstructed = `\n${lineOpenedFence.ch.repeat(lineOpenedFence.len)}\n${lineOpenedFence.ch.repeat(lineOpenedFence.len)}`;
             }
           }
         } else if (lineClosedFenceExplicit) {
+          forceLeadingNewlineForConcat = true;
           // `safeOffset` landed on or mid-way through a closing fence line whose opener is NOT in `rawSlice`:
           // escape any leading fence chars on the partial first line so it cannot open a fake inverted fence!
           const firstHead = firstSliceNl >= 0 ? reconstructed.slice(0, firstSliceNl) : reconstructed;
@@ -1820,15 +1657,25 @@ export function sanitizeMarkdownPageSlice(
           );
           reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
         } else if (inFence) {
+          forceLeadingNewlineForConcat = true;
           // `safeOffset` landed strictly inside an open fenced code block!
           initialReopenedFence = { ch: fenceChar, len: fenceLen, sourceIndent: fenceIndent };
         } else if (clampedOffset > pos) {
-          // `safeOffset` landed mid-way through a prose line: prevent its suffix from acting as a line-start fence!
-          const firstHead = firstSliceNl >= 0 ? reconstructed.slice(0, firstSliceNl) : reconstructed;
-          const escapedFirst = firstHead.replace(/^([ \t]*)([`~]{3,})/, (_m, ws: string, ticks: string) =>
-            `${ws}${ticks.split('').map((ch) => `\\${ch}`).join('')}`,
-          );
-          reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
+          if (clampedOffset === lineEnd && rawSlice.startsWith('\n')) {
+            sliceInitialCtx.prevPara = prevLineWasParagraph;
+            sliceInitialCtx.startsAtSeparatorNewline = true;
+          } else {
+            // `safeOffset` landed mid-way through a prose line: prevent its suffix from acting as a synthetic line-start fence or list container!
+            const firstHead = firstSliceNl >= 0 ? reconstructed.slice(0, firstSliceNl) : reconstructed;
+            const escapedFirst = firstHead
+              .replace(/^([ \t]*)([`~]{3,})/, (_m, ws: string, ticks: string) =>
+                `${ws}${ticks.split('').map((ch) => `\\${ch}`).join('')}`,
+              )
+              .replace(/^([ \t]*)(?:([-+*])|(\d{1,9})([.)]))(?=[ \t]|$)/, (_m, ws: string, ul?: string, digits?: string, delim?: string) =>
+                ul ? `${ws}\\${ul}` : `${ws}${digits}\\${delim}`,
+              );
+            reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
+          }
         }
         break;
       }
@@ -1848,7 +1695,7 @@ export function sanitizeMarkdownPageSlice(
     }
   }
 
-  let segments = hardenAndSplitSliceFences(reconstructed, initialReopenedFence);
+  let segments = hardenAndSplitSliceFences(reconstructed, initialReopenedFence, sliceInitialCtx);
   // Close any unclosed inline backtick code span in the final prose segment (`A1` truncation parity)
   const lastSeg = segments[segments.length - 1];
   if (lastSeg && !lastSeg.isFence && lastSeg.text.includes('`')) {
@@ -1884,20 +1731,62 @@ export function sanitizeMarkdownPageSlice(
       p++;
     }
     if (openTickLen > 0) {
-      const pad = lastSeg.text.endsWith('`') ? ' ' : '';
-      lastSeg.text = `${lastSeg.text}${pad}${'`'.repeat(openTickLen)}`;
-      segments = hardenAndSplitSliceFences(segments.map((s) => s.text).join(''));
+      let trimEndIdx = lastSeg.text.length;
+      let wsProbe = trimEndIdx;
+      while (wsProbe > 0 && (lastSeg.text.charCodeAt(wsProbe - 1) === 32 || lastSeg.text.charCodeAt(wsProbe - 1) === 9)) {
+        wsProbe--;
+      }
+      if (wsProbe > 0 && (lastSeg.text.charCodeAt(wsProbe - 1) === 10 || lastSeg.text.charCodeAt(wsProbe - 1) === 13)) {
+        trimEndIdx = wsProbe;
+      }
+      while (
+        trimEndIdx > 0 &&
+        (lastSeg.text.charCodeAt(trimEndIdx - 1) === 10 || lastSeg.text.charCodeAt(trimEndIdx - 1) === 13)
+      ) {
+        trimEndIdx--;
+        let prevWs = trimEndIdx;
+        while (prevWs > 0 && (lastSeg.text.charCodeAt(prevWs - 1) === 32 || lastSeg.text.charCodeAt(prevWs - 1) === 9)) {
+          prevWs--;
+        }
+        if (prevWs > 0 && (lastSeg.text.charCodeAt(prevWs - 1) === 10 || lastSeg.text.charCodeAt(prevWs - 1) === 13)) {
+          trimEndIdx = prevWs;
+        }
+      }
+      const bodyBeforeNl = lastSeg.text.slice(0, trimEndIdx);
+      const trailingNls = lastSeg.text.slice(trimEndIdx);
+      const pad = bodyBeforeNl.endsWith('`') ? ' ' : '';
+      lastSeg.text = `${bodyBeforeNl}${pad}${'`'.repeat(openTickLen)}${trailingNls}`;
+      segments = hardenAndSplitSliceFences(
+        segments.map((s) => s.text).join(''),
+        undefined,
+        initialReopenedFence ? undefined : sliceInitialCtx,
+      );
     }
   }
 
-  return segments
-    .map((seg) => {
-      if (seg.isFence) return seg.text;
-      let cleanProse = escapeGfmTaskListCheckboxesLinear(seg.text);
-      cleanProse = neutralizeAllUnsafeMarkdownLinksLinear(cleanProse);
-      return escapeResidualLtPreservingSafeCodeSpansLinear(cleanProse, allowPdfPageMarkers);
-    })
-    .join('');
+  const sanitizeSliceSegments = (segs: Array<{ text: string; isFence: boolean }>): string =>
+    segs
+      .map((seg) => {
+        if (seg.isFence) return seg.text;
+        let cleanProse = escapeGfmTaskListCheckboxesLinear(seg.text);
+        cleanProse = neutralizeAllUnsafeMarkdownLinksLinear(cleanProse);
+        return escapeAllResidualLtInProseLinear(cleanProse, allowPdfPageMarkers);
+      })
+      .join('');
+
+  const pass1 = sanitizeSliceSegments(segments);
+  const finalOut =
+    !pass1.includes('```') && !pass1.includes('~~~')
+      ? pass1
+      : sanitizeSliceSegments(hardenAndSplitSliceFences(pass1, undefined, initialReopenedFence ? undefined : sliceInitialCtx));
+  if (
+    safeOffset > 0 &&
+    !finalOut.startsWith('\n') &&
+    (forceLeadingNewlineForConcat || Boolean(initialReopenedFence) || /^[ \t]{0,3}(?:`{3,}|~{3,})/.test(finalOut))
+  ) {
+    return `\n${finalOut}`;
+  }
+  return finalOut;
 }
 
 /**
@@ -3053,6 +2942,31 @@ export function sanitizePlainMetadataText(raw: string | undefined, maxLen = 2_00
   return s || undefined;
 }
 
+function normalizePublicProductImageUrl(raw: unknown, baseUrl?: string): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('javascript:')) {
+    return null;
+  }
+  const candidate = trimmed.startsWith('//')
+    ? trimmed.length > 2 && trimmed[2] !== '/' && trimmed[2] !== '\\'
+      ? `https:${trimmed}`
+      : ''
+    : trimmed;
+  if (!candidate) return null;
+  let u: URL;
+  try {
+    u = baseUrl ? new URL(candidate, baseUrl) : new URL(candidate);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  if (u.username || u.password) return null;
+  if (u.port && u.port !== '80' && u.port !== '443') return null;
+  if (!isSafePublicHostname(u.hostname)) return null;
+  return u.toString();
+}
+
 /**
  * Extracts normalized e-commerce product metadata (`formats: ["product"]`) across Schema.org `Product`,
  * OpenGraph `product:*` / `og:*` tags, and embedded Shopify product JSON.
@@ -3106,8 +3020,16 @@ export function extractStructuredProduct(params: {
 
     const imgsRaw = productLd.image;
     const images = (Array.isArray(imgsRaw) ? imgsRaw : imgsRaw ? [imgsRaw] : [])
-      .map((im) => (typeof im === 'string' ? im : im && typeof im === 'object' && typeof (im as { url?: unknown }).url === 'string' ? (im as { url: string }).url : ''))
-      .filter(Boolean);
+      .map((im) => {
+        const rawImg =
+          typeof im === 'string'
+            ? im
+            : im && typeof im === 'object' && typeof (im as { url?: unknown }).url === 'string'
+              ? (im as { url: string }).url
+              : '';
+        return normalizePublicProductImageUrl(rawImg, finalUrl);
+      })
+      .filter((u): u is string => Boolean(u));
 
     const ratingObj =
       productLd.aggregateRating && typeof productLd.aggregateRating === 'object'
@@ -3158,7 +3080,7 @@ export function extractStructuredProduct(params: {
   const ogCurrency = matchMetaContent(rawBody, ['product:price:currency', 'og:price:currency', 'priceCurrency']);
   const ogBrand = sanitizePlainMetadataText(matchMetaContent(rawBody, ['product:brand', 'og:brand', 'brand']), 240);
   const ogAvail = matchMetaContent(rawBody, ['product:availability', 'og:availability', 'availability']);
-  const ogImage = matchMetaContent(rawBody, ['og:image']);
+  const ogImage = normalizePublicProductImageUrl(matchMetaContent(rawBody, ['og:image']), finalUrl);
 
   if (ogPrice || ogBrand || ogAvail) {
     const cleanOgTitle = sanitizePlainMetadataText(matchMetaContent(rawBody, ['og:title']) ?? fallbackTitle, 400);

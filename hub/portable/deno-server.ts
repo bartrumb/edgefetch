@@ -1026,6 +1026,16 @@ function openDenoPersistentStores(
     db.exec(
       `PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; ${OAUTH_SQLITE_SCHEMA} ${MCP_VAULT_SQLITE_SCHEMA} ${ACTIVITY_SQLITE_SCHEMA} ${HUB_SETTINGS_SQLITE_SCHEMA}`,
     );
+    try {
+      db.exec('ALTER TABLE mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1');
+    } catch {
+      // already exists or table absent
+    }
+    try {
+      db.exec('ALTER TABLE user_mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1');
+    } catch {
+      // already exists
+    }
     const sqlLike: SqlStorageLike = {
       exec: <T = Record<string, unknown>>(query: string, ...bindings: unknown[]) => {
         const stmt = db.prepare(query);
@@ -1109,10 +1119,11 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
     ((envMap.EDGEFETCH_TRUST_PROXY ?? '').trim().toLowerCase() === 'fly' ||
       isTruthyDenoFlag(envMap.EDGEFETCH_TRUST_FLY_CLIENT_IP) ||
       Boolean(envMap.FLY_APP_NAME || envMap.FLY_ALLOC_ID || envMap.FLY_REGION));
-  const maxInflightPerIp =
-    typeof options.maxInflightPerIp === 'number' && options.maxInflightPerIp > 0
-      ? Math.floor(options.maxInflightPerIp)
-      : MAX_DENO_INFLIGHT_PER_IP;
+  const hasExplicitDenoMaxInflightPerIp =
+    typeof options.maxInflightPerIp === 'number' && options.maxInflightPerIp > 0;
+  const maxInflightPerIp = hasExplicitDenoMaxInflightPerIp
+    ? Math.floor(options.maxInflightPerIp!)
+    : MAX_DENO_INFLIGHT_PER_IP;
   const maxInflightTotal =
     typeof options.maxInflightTotal === 'number' && options.maxInflightTotal > 0
       ? Math.floor(options.maxInflightTotal)
@@ -1378,7 +1389,13 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
         rawPathname === '/robots.txt');
     const clientBucket = normalizeClientRateLimitIp(resolveDenoTrustedClientIp(req, info, trustProxy, trustFlyClientIp));
     const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
-    const hitPerIpLimit = curIpInflight >= maxInflightPerIp;
+    const effectiveDenoInflightPerIp =
+      !hasExplicitDenoMaxInflightPerIp && totalInflight < Math.floor(maxInflightTotal / 2)
+        ? Math.max(maxInflightPerIp, Math.min(64, Math.floor(maxInflightTotal / 2)))
+        : !hasExplicitDenoMaxInflightPerIp && (hasCallerAuth || isHealthProbe || isPublicDiscoveryRoute)
+          ? Math.max(maxInflightPerIp, 32)
+          : maxInflightPerIp;
+    const hitPerIpLimit = curIpInflight >= effectiveDenoInflightPerIp;
     const hitGlobalLimit = isHealthProbe
       ? totalInflight >= maxInflightTotal + 64
       : isPublicDiscoveryRoute

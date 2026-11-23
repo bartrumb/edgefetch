@@ -1025,6 +1025,10 @@ test('R8-MCP: mcp:call scrape scope enforcement, /v1/agent vault opt-in, v2.7.0 
   const postRotateUnseal = await unsealVaultCredentials({
     vaultMasterKey: TEST_VAULT_KEY,
     userId: 'gh_1001',
+    id: rotatedServer.id,
+    slug: rotatedServer.slug,
+    authType: rotatedServer.authType,
+    secretVersion: rotatedServer.secretVersion,
     remoteOrigin: 'https://mcp.linear.app',
     remoteUrl: 'https://mcp.linear.app/mcp',
     ciphertext: rotatedServer.encryptedCredentials!,

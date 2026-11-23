@@ -894,7 +894,8 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
           u.userId !== 'owner' &&
           u.role === 'owner' &&
           String(u.githubId ?? '') !== pinnedOwnerId &&
-          u.promotedByOwnerId !== pinnedOwnerId
+          u.promotedByOwnerId !== pinnedOwnerId &&
+          u.promotedByOwnerId !== 'owner'
         ) {
           await hub().oauthUpsertUser({
             ...u,
@@ -3620,29 +3621,11 @@ export default {
 
       if (request.method === 'POST' && (url.pathname === '/fetch' || url.pathname === '/fetch/batch')) {
         return withRouteSpan('edgefetch.fetch', {}, async () => {
-          let fetchUserId = 'owner';
+          // U1 Security Invariant: Raw `/fetch` and `/fetch/batch` require `CALLER_TOKEN` strictly.
+          // OAuth tokens (`efa_*` / `efu_*`) MUST use `/v1/*` or `/mcp` where per-user ownership, header stripping,
+          // and robots policy guardrails are enforced.
           if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
-            const rawAuthHdr = (request.headers.get('authorization') ?? '').trim();
-            const bearerTok = /^Bearer\s+(\S+)$/i.exec(rawAuthHdr)?.[1] ?? '';
-            if (!bearerTok.startsWith('efa_')) {
-              return Response.json({ error: 'unauthorized' }, { status: 401 });
-            }
-            const oauthAuth = await authorizeMcpRequest({
-              request,
-              origin: url.origin,
-              store: oauthStore,
-              githubAuthEnv: env,
-            });
-            if (!oauthAuth.ok) {
-              return Response.json(
-                { error: 'unauthorized' },
-                { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': oauthAuth.wwwAuthenticate } },
-              );
-            }
-            if (!oauthAuth.scopes.includes('crawl:fetch')) {
-              return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
-            }
-            fetchUserId = oauthAuth.userId;
+            return Response.json({ error: 'unauthorized' }, { status: 401, headers: { 'cache-control': 'no-store' } });
           }
           const parsedTarget = parseFetchTarget(url);
           if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
@@ -3676,39 +3659,26 @@ export default {
               return Response.json({ error: 'bad_json' }, { status: 400 });
             }
           }
-          const releaseFetchSlot =
-            fetchUserId !== 'owner'
-              ? tryAcquireUserConcurrencySlot(inFlightScrapesByUser, fetchUserId, MAX_CONCURRENT_SCRAPES_PER_USER)
-              : () => undefined;
-          if (!releaseFetchSlot) {
-            return userQuotaExceededResponse(
-              `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
-            );
-          }
-          try {
-            const rawRetention = url.searchParams.get('artifacts');
-            const artifactRetention: ArtifactRetention | 'off' | undefined =
-              rawRetention === 'stored'
-                ? 'stored'
-                : rawRetention === 'transient'
-                  ? 'transient'
-                  : rawRetention === 'off'
-                    ? 'off'
-                    : undefined;
-            const hydrateInline = url.searchParams.get('hydrate') !== 'false' && url.searchParams.get('hydrate') !== '0';
-            const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention, hydrateInline);
-            return new Response(out.bodyText, {
-              status: out.status,
-              headers: {
-                'content-type': 'application/json',
-                'x-crawler-via': out.via,
-                'cache-control': 'no-store',
-                ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
-              },
-            });
-          } finally {
-            releaseFetchSlot();
-          }
+          const rawRetention = url.searchParams.get('artifacts');
+          const artifactRetention: ArtifactRetention | 'off' | undefined =
+            rawRetention === 'stored'
+              ? 'stored'
+              : rawRetention === 'transient'
+                ? 'transient'
+                : rawRetention === 'off'
+                  ? 'off'
+                  : undefined;
+          const hydrateInline = url.searchParams.get('hydrate') !== 'false' && url.searchParams.get('hydrate') !== '0';
+          const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention, hydrateInline);
+          return new Response(out.bodyText, {
+            status: out.status,
+            headers: {
+              'content-type': 'application/json',
+              'x-crawler-via': out.via,
+              'cache-control': 'no-store',
+              ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+            },
+          });
         });
       }
 

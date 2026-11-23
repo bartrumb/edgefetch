@@ -96,6 +96,9 @@ export interface VaultSecretPayload {
   pinnedOrigin: string;
   pinnedUrl?: string;
   purpose?: 'user_mcp_servers:credentials';
+  serverId?: string;
+  slug?: string;
+  authType?: 'oauth2' | 'headers' | 'none';
   headers?: Record<string, string>;
   oauth?: {
     accessToken: string;
@@ -130,6 +133,7 @@ export interface StoredMcpServerRow {
   transport: 'streamable-http' | 'sse';
   authType: 'oauth2' | 'headers' | 'none';
   encryptedCredentials: string | null;
+  secretVersion?: number;
   authSummary: MaskedAuthSummary;
   domains: string[];
   autoRouteScrape?: boolean;
@@ -183,6 +187,13 @@ export interface McpVaultStore {
   listServers(userId: string): Promise<StoredMcpServerRow[]> | StoredMcpServerRow[];
   getServer(userId: string, slugOrDomain: string): Promise<StoredMcpServerRow | null> | StoredMcpServerRow | null;
   upsertServer(row: StoredMcpServerRow): Promise<void> | void;
+  resealServerSecret?(params: {
+    id: string;
+    userId: string;
+    encryptedCredentials: string;
+    secretVersion: number;
+    updatedAt: number;
+  }): Promise<boolean> | boolean;
   deleteServer(userId: string, slug: string): Promise<boolean> | boolean;
   putOAuthState(row: PendingMcpOAuthStateRow): Promise<void> | void;
   consumeOAuthState(stateHash: string, userId: string, now: number): Promise<PendingMcpOAuthStateRow | null> | PendingMcpOAuthStateRow | null;
@@ -199,6 +210,7 @@ export const MCP_VAULT_SQLITE_SCHEMA = `
     transport TEXT NOT NULL DEFAULT 'streamable-http',
     auth_type TEXT NOT NULL DEFAULT 'headers',
     encrypted_credentials TEXT,
+    secret_version INTEGER NOT NULL DEFAULT 1,
     auth_summary_json TEXT NOT NULL DEFAULT '{}',
     domains_json TEXT NOT NULL DEFAULT '[]',
     auto_route_scrape INTEGER NOT NULL DEFAULT 0,
@@ -388,23 +400,52 @@ async function deriveLegacyV270PerUserOriginAesKey(params: {
 const VAULT_CREDENTIALS_PURPOSE_V2 = 'user_mcp_servers:credentials:v2';
 const VAULT_PKCE_STATE_PURPOSE_V2 = 'mcp_oauth_states:pkce:v2';
 
+function buildVaultV2RowBoundAad(params: {
+  userId: string;
+  canonicalOrigin: string;
+  serverId: string;
+  slug: string;
+  authType: string;
+}): Uint8Array {
+  const cleanSlug = params.slug.trim().toLowerCase();
+  const cleanAuthType = params.authType.trim().toLowerCase();
+  const encoded = [
+    'v2|user_mcp_servers:credentials',
+    `${params.userId.length}:${params.userId}`,
+    `${params.canonicalOrigin.length}:${params.canonicalOrigin}`,
+    `${params.serverId.length}:${params.serverId}`,
+    `${cleanSlug.length}:${cleanSlug}`,
+    `${cleanAuthType.length}:${cleanAuthType}`,
+  ].join('|');
+  return new TextEncoder().encode(encoded);
+}
+
 /**
  * Encrypts a `VaultSecretPayload` using `HKDF-SHA256` + `AES-256-GCM` with 96-bit random IV,
- * explicit `v2.` version header, and table/purpose-bound length-prefixed AAD.
+ * explicit `v2.` version header, and table/purpose/row-bound length-prefixed AAD (`userId`, `remoteOrigin`, `id`, `slug`, `authType`).
  */
 export async function sealVaultCredentials(params: {
   vaultMasterKey: string | undefined;
   userId: string;
   remoteOrigin: string;
+  id?: string;
+  serverId?: string;
+  slug?: string;
+  authType?: 'oauth2' | 'headers' | 'none' | string;
   payload: VaultSecretPayload;
 }): Promise<
-  | { ok: true; ciphertext: string }
+  | { ok: true; ciphertext: string; secretVersion: number }
   | { ok: false; status: 503; error: 'vault_master_key_unconfigured'; message: string }
 > {
   const keyCheck = validateVaultMasterKey(params.vaultMasterKey);
   if (!keyCheck.ok) return keyCheck;
 
   const canonicalOrigin = params.remoteOrigin.trim().toLowerCase();
+  const rowId = (params.id ?? params.serverId ?? '').trim();
+  const rowSlug = (params.slug ?? '').trim().toLowerCase();
+  const rowAuthType = (params.authType ?? '').trim().toLowerCase();
+  const hasRowBinding = Boolean(rowId && rowSlug && rowAuthType);
+
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit GCM IV
   const aesKey = await derivePerUserOriginAesKey({
@@ -415,18 +456,33 @@ export async function sealVaultCredentials(params: {
     purpose: VAULT_CREDENTIALS_PURPOSE_V2,
   });
 
-  const aad = new TextEncoder().encode(
-    `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
-  );
+  const aad = hasRowBinding
+    ? buildVaultV2RowBoundAad({
+        userId: params.userId,
+        canonicalOrigin,
+        serverId: rowId,
+        slug: rowSlug,
+        authType: rowAuthType,
+      })
+    : new TextEncoder().encode(
+        `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+      );
   const plaintext = new TextEncoder().encode(
     JSON.stringify({
       ...params.payload,
       purpose: 'user_mcp_servers:credentials',
       pinnedOrigin: canonicalOrigin,
+      ...(hasRowBinding
+        ? {
+            serverId: rowId,
+            slug: rowSlug,
+            authType: rowAuthType as 'oauth2' | 'headers' | 'none',
+          }
+        : {}),
     }),
   );
   const encryptedBuf = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
+    { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad as BufferSource, tagLength: 128 },
     aesKey,
     plaintext,
   );
@@ -434,6 +490,7 @@ export async function sealVaultCredentials(params: {
   return {
     ok: true,
     ciphertext: `v2.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(encryptedBuf))}`,
+    secretVersion: hasRowBinding ? 2 : 1,
   };
 }
 
@@ -455,20 +512,25 @@ function isValidCredentialPayloadKind(kind: unknown): kind is VaultSecretPayload
 }
 
 /**
- * Decrypts and authenticates an `AES-256-GCM` vault envelope:
- *  - `v2.` envelopes strictly require table/purpose-bound `user_mcp_servers:credentials` HKDF + length-prefixed AAD (NEVER falling back!).
- *  - `v1.` envelopes try `v2.7.1–v2.7.4` length-prefixed HKDF + AAD on primary decrypt; ONLY when the ciphertext lacks `v2` (`version === 'v1'`),
- *    primary decrypt fails, AND `userId` contains neither `|` nor `:`, tries legacy `v2.7.0` fallback with strict credential payload schema verification,
- *    immediately emitting `resealedCiphertext` (`v2....`) so callers auto-upgrade on read.
+ * Decrypts and authenticates an `AES-256-GCM` vault envelope (P6):
+ *  - Downgrade prevention: if `secretVersion >= 2`, REJECTS any non-`v2` envelope immediately and requires row-bound 5-field AAD
+ *    (`userId`, `remoteOrigin`, `id`, `slug`, `authType`) with zero fallback to v1 or 2-field v2!
+ *  - Upgrade/reseal on read: when reading a legacy `secretVersion < 2` (`v1.` or pre-R10 2-field `v2.`) row that decrypts cleanly,
+ *    immediately re-seals it as 5-field `v2.` (`resealedSecretVersion: 2`) so callers persist `secret_version = 2` on read.
  */
 export async function unsealVaultCredentials(params: {
   vaultMasterKey: string | undefined;
   userId: string;
   remoteOrigin: string;
   remoteUrl?: string;
+  id?: string;
+  serverId?: string;
+  slug?: string;
+  authType?: 'oauth2' | 'headers' | 'none' | string;
+  secretVersion?: number;
   ciphertext: string;
 }): Promise<
-  | { ok: true; payload: VaultSecretPayload; resealedCiphertext?: string }
+  | { ok: true; payload: VaultSecretPayload; resealedCiphertext?: string; resealedSecretVersion?: number }
   | { ok: false; error: 'vault_master_key_unconfigured' | 'vault_decryption_failed'; message: string }
 > {
   const keyCheck = validateVaultMasterKey(params.vaultMasterKey);
@@ -491,33 +553,113 @@ export async function unsealVaultCredentials(params: {
     return { ok: false, error: 'vault_decryption_failed', message: 'Non-canonical origin supplied to vault decryption' };
   }
 
-  let plainBuf: ArrayBuffer;
-  let usedLegacyV270Fallback = false;
-  if (envHeader.version === 'v2') {
-    try {
-      const aesKey = await derivePerUserOriginAesKey({
-        vaultMasterKey: keyCheck.key,
-        salt,
-        userId: params.userId,
-        remoteOrigin: canonicalOrigin,
-        purpose: VAULT_CREDENTIALS_PURPOSE_V2,
-      });
-      const aad = new TextEncoder().encode(
-        `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
-      );
-      plainBuf = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
-        aesKey,
-        ct as BufferSource,
-      );
-    } catch {
+  const hasAnyRowParam =
+    params.id !== undefined ||
+    params.serverId !== undefined ||
+    params.slug !== undefined ||
+    params.authType !== undefined;
+  const rowId = (params.id ?? params.serverId ?? '').trim();
+  const rowSlug = (params.slug ?? '').trim().toLowerCase();
+  const rowAuthType = (params.authType ?? '').trim().toLowerCase();
+  const hasFullRowBinding = Boolean(rowId && rowSlug && rowAuthType);
+  const secretVersion = typeof params.secretVersion === 'number' ? params.secretVersion : undefined;
+
+  // P6 Downgrade Prevention: when external `secret_version >= 2`, NEVER fall back to v1 or 2-field AAD!
+  if (secretVersion !== undefined && secretVersion >= 2) {
+    if (envHeader.version !== 'v2') {
       return {
         ok: false,
         error: 'vault_decryption_failed',
-        message: 'AES-256-GCM authentication failed (wrong user_id, tampered origin/purpose, or rotated VAULT_MASTER_KEY)',
+        message: 'Vault downgrade blocked: secret_version >= 2 requires a v2 ciphertext envelope',
       };
     }
+    if (!hasFullRowBinding) {
+      return {
+        ok: false,
+        error: 'vault_decryption_failed',
+        message: 'Vault v2 row-bound decryption requires id, slug, and authType',
+      };
+    }
+  } else if (hasAnyRowParam && !hasFullRowBinding) {
+    return {
+      ok: false,
+      error: 'vault_decryption_failed',
+      message: 'Incomplete row binding attributes supplied to vault decryption',
+    };
+  }
+
+  let plainBuf: ArrayBuffer;
+  let shouldResealToV2 = false;
+  if (envHeader.version === 'v2') {
+    const aesKey = await derivePerUserOriginAesKey({
+      vaultMasterKey: keyCheck.key,
+      salt,
+      userId: params.userId,
+      remoteOrigin: canonicalOrigin,
+      purpose: VAULT_CREDENTIALS_PURPOSE_V2,
+    });
+    if (hasFullRowBinding) {
+      try {
+        const aad5 = buildVaultV2RowBoundAad({
+          userId: params.userId,
+          canonicalOrigin,
+          serverId: rowId,
+          slug: rowSlug,
+          authType: rowAuthType,
+        });
+        plainBuf = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad5 as BufferSource, tagLength: 128 },
+          aesKey,
+          ct as BufferSource,
+        );
+      } catch {
+        // Only pre-Round-10 rows with `secret_version < 2` may upgrade from 2-field v2 AAD -> 5-field v2 AAD!
+        if (secretVersion !== undefined && secretVersion >= 2) {
+          return {
+            ok: false,
+            error: 'vault_decryption_failed',
+            message: 'AES-256-GCM authentication failed (wrong user_id, tampered id/slug/auth_type/origin, or rotated VAULT_MASTER_KEY)',
+          };
+        }
+        try {
+          const aad2 = new TextEncoder().encode(
+            `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+          );
+          plainBuf = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad2, tagLength: 128 },
+            aesKey,
+            ct as BufferSource,
+          );
+          shouldResealToV2 = true;
+        } catch {
+          return {
+            ok: false,
+            error: 'vault_decryption_failed',
+            message: 'AES-256-GCM authentication failed (wrong user_id, tampered id/slug/auth_type/origin, or rotated VAULT_MASTER_KEY)',
+          };
+        }
+      }
+    } else {
+      try {
+        const aad2 = new TextEncoder().encode(
+          `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
+        );
+        plainBuf = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad2, tagLength: 128 },
+          aesKey,
+          ct as BufferSource,
+        );
+      } catch {
+        return {
+          ok: false,
+          error: 'vault_decryption_failed',
+          message: 'AES-256-GCM authentication failed (wrong user_id, tampered origin/purpose, or rotated VAULT_MASTER_KEY)',
+        };
+      }
+    }
   } else {
+    // `envHeader.version === 'v1'` (`secret_version < 2` only — `secretVersion >= 2` was already rejected above!)
+    shouldResealToV2 = true;
     try {
       const aesKey = await derivePerUserOriginAesKey({
         vaultMasterKey: keyCheck.key,
@@ -558,7 +700,6 @@ export async function unsealVaultCredentials(params: {
           legacyKey,
           ct as BufferSource,
         );
-        usedLegacyV270Fallback = true;
       } catch {
         return {
           ok: false,
@@ -582,21 +723,38 @@ export async function unsealVaultCredentials(params: {
     ) {
       return { ok: false, error: 'vault_decryption_failed', message: 'Pinned origin or credential purpose mismatch during vault decryption' };
     }
+    if (hasFullRowBinding) {
+      if (typeof rawParsed.serverId === 'string' && rawParsed.serverId !== rowId) {
+        return { ok: false, error: 'vault_decryption_failed', message: 'Server id mismatch during vault decryption' };
+      }
+      if (typeof rawParsed.slug === 'string' && rawParsed.slug.toLowerCase() !== rowSlug) {
+        return { ok: false, error: 'vault_decryption_failed', message: 'Server slug mismatch during vault decryption' };
+      }
+      if (typeof rawParsed.authType === 'string' && rawParsed.authType.toLowerCase() !== rowAuthType) {
+        return { ok: false, error: 'vault_decryption_failed', message: 'Server auth_type mismatch during vault decryption' };
+      }
+    }
     const parsed = rawParsed as unknown as VaultSecretPayload;
     if (params.remoteUrl && typeof parsed.pinnedUrl === 'string' && parsed.pinnedUrl) {
       if (params.remoteUrl.trim().replace(/\/+$/, '') !== parsed.pinnedUrl.trim().replace(/\/+$/, '')) {
         return { ok: false, error: 'vault_decryption_failed', message: 'Pinned endpoint URL path mismatch during vault decryption' };
       }
     }
-    if (usedLegacyV270Fallback) {
+    if (shouldResealToV2 || (secretVersion !== undefined && secretVersion < 2 && hasFullRowBinding)) {
       const resealed = await sealVaultCredentials({
         vaultMasterKey: keyCheck.key,
         userId: params.userId,
         remoteOrigin: canonicalOrigin,
+        ...(hasFullRowBinding ? { id: rowId, slug: rowSlug, authType: rowAuthType } : {}),
         payload: parsed,
       });
       if (resealed.ok) {
-        return { ok: true, payload: parsed, resealedCiphertext: resealed.ciphertext };
+        return {
+          ok: true,
+          payload: parsed,
+          resealedCiphertext: resealed.ciphertext,
+          resealedSecretVersion: resealed.secretVersion,
+        };
       }
     }
     return { ok: true, payload: parsed };
@@ -870,6 +1028,7 @@ function parseStoredRow(r: Record<string, unknown>): StoredMcpServerRow {
   }
   const rawTransport = String(r.transport ?? 'streamable-http');
   const rawAuthType = String(r.auth_type ?? 'headers');
+  const rawSecretVer = Number(r.secret_version ?? 1);
   return {
     id: String(r.id),
     userId: String(r.user_id ?? 'owner'),
@@ -880,6 +1039,7 @@ function parseStoredRow(r: Record<string, unknown>): StoredMcpServerRow {
     transport: rawTransport === 'sse' ? 'sse' : 'streamable-http',
     authType: rawAuthType === 'oauth2' ? 'oauth2' : rawAuthType === 'none' ? 'none' : 'headers',
     encryptedCredentials: typeof r.encrypted_credentials === 'string' && r.encrypted_credentials ? r.encrypted_credentials : null,
+    secretVersion: Number.isInteger(rawSecretVer) && rawSecretVer >= 1 ? rawSecretVer : 1,
     authSummary,
     domains,
     autoRouteScrape: Number(r.auto_route_scrape ?? 0) !== 0,
@@ -907,6 +1067,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
          remote_origin TEXT NOT NULL,
          transport TEXT NOT NULL DEFAULT 'streamable-http',
          auth_type TEXT NOT NULL DEFAULT 'headers',
+         secret_version INTEGER NOT NULL DEFAULT 1,
          encrypted_credentials TEXT,
          auth_summary_json TEXT NOT NULL DEFAULT '{}',
          domains_json TEXT NOT NULL DEFAULT '[]',
@@ -924,6 +1085,11 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
     sql.exec('CREATE INDEX IF NOT EXISTS idx_user_mcp_servers_user ON user_mcp_servers(user_id)');
     try {
       sql.exec('ALTER TABLE user_mcp_servers ADD COLUMN auto_route_scrape INTEGER NOT NULL DEFAULT 0');
+    } catch {
+      // Column already exists
+    }
+    try {
+      sql.exec('ALTER TABLE user_mcp_servers ADD COLUMN secret_version INTEGER NOT NULL DEFAULT 1');
     } catch {
       // Column already exists
     }
@@ -1006,6 +1172,10 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
       const uid = row.userId.trim() || 'owner';
       const safeTools = filterSafeCachedMcpTools(row.cachedTools);
       const safeToolCount = Array.isArray(row.cachedTools) && row.cachedTools.length > 0 ? safeTools.length : row.toolCount;
+      const secretVersion =
+        typeof row.secretVersion === 'number' && Number.isInteger(row.secretVersion) && row.secretVersion >= 1
+          ? row.secretVersion
+          : 1;
       sql.exec(
         `DELETE FROM user_mcp_servers
          WHERE user_id = ? AND slug != ? AND id IN (
@@ -1019,9 +1189,9 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
       sql.exec(
         `INSERT INTO user_mcp_servers (
            id, user_id, slug, name, remote_url, remote_origin, transport, auth_type,
-           encrypted_credentials, auth_summary_json, domains_json, auto_route_scrape, cached_tools_json,
+           encrypted_credentials, secret_version, auth_summary_json, domains_json, auto_route_scrape, cached_tools_json,
            tool_count, enabled, last_verified_at, last_error, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, slug) DO UPDATE SET
            name = excluded.name,
            remote_url = excluded.remote_url,
@@ -1029,6 +1199,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
            transport = excluded.transport,
            auth_type = excluded.auth_type,
            encrypted_credentials = excluded.encrypted_credentials,
+           secret_version = excluded.secret_version,
            auth_summary_json = excluded.auth_summary_json,
            domains_json = excluded.domains_json,
            auto_route_scrape = excluded.auto_route_scrape,
@@ -1047,6 +1218,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
         row.transport,
         row.authType,
         row.encryptedCredentials,
+        secretVersion,
         JSON.stringify(row.authSummary),
         JSON.stringify(row.domains),
         row.autoRouteScrape ? 1 : 0,
@@ -1058,6 +1230,26 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
         row.createdAt,
         row.updatedAt,
       );
+    },
+    resealServerSecret(p) {
+      ensureTables();
+      const uid = p.userId.trim() || 'owner';
+      const updated = sql
+        .exec<{ id: string }>(
+          `UPDATE user_mcp_servers
+              SET encrypted_credentials = ?,
+                  secret_version = ?,
+                  updated_at = ?
+            WHERE id = ? AND user_id = ?
+            RETURNING id`,
+          p.encryptedCredentials,
+          p.secretVersion,
+          p.updatedAt,
+          p.id,
+          uid,
+        )
+        .toArray();
+      return updated.length > 0;
     },
     deleteServer(userId, slug) {
       ensureTables();
@@ -1194,6 +1386,10 @@ export function createMemoryMcpVaultStore(): McpVaultStore {
       const uid = row.userId.trim() || 'owner';
       const safeTools = filterSafeCachedMcpTools(row.cachedTools);
       const safeToolCount = Array.isArray(row.cachedTools) && row.cachedTools.length > 0 ? safeTools.length : row.toolCount;
+      const secretVersion =
+        typeof row.secretVersion === 'number' && Number.isInteger(row.secretVersion) && row.secretVersion >= 1
+          ? row.secretVersion
+          : 1;
       const userRows = [...servers.entries()].filter(([, v]) => v.userId === uid && v.slug.toLowerCase() !== row.slug.toLowerCase());
       if (userRows.length >= MAX_VAULT_SERVERS_PER_USER) {
         userRows.sort((a, b) => a[1].updatedAt - b[1].updatedAt);
@@ -1201,7 +1397,25 @@ export function createMemoryMcpVaultStore(): McpVaultStore {
           servers.delete(userRows[i]![0]);
         }
       }
-      servers.set(keyOf(uid, row.slug), structuredClone({ ...row, userId: uid, cachedTools: safeTools, toolCount: safeToolCount }));
+      servers.set(
+        keyOf(uid, row.slug),
+        structuredClone({ ...row, userId: uid, secretVersion, cachedTools: safeTools, toolCount: safeToolCount }),
+      );
+    },
+    resealServerSecret(p) {
+      const uid = p.userId.trim() || 'owner';
+      for (const [k, s] of servers.entries()) {
+        if (s.id === p.id && s.userId === uid) {
+          servers.set(k, {
+            ...s,
+            encryptedCredentials: p.encryptedCredentials,
+            secretVersion: p.secretVersion,
+            updatedAt: p.updatedAt,
+          });
+          return true;
+        }
+      }
+      return false;
     },
     deleteServer(userId, slug) {
       return servers.delete(keyOf(userId, slug));
@@ -1876,17 +2090,22 @@ export async function completeDownstreamMcpOAuthCallback(params: {
     },
   };
 
+  const existing = await params.vaultStore.getServer(params.userId, pending.slug);
+  const serverId = existing?.id ?? `mcp_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
+
   const sealed = await sealVaultCredentials({
     vaultMasterKey: keyCheck.key,
     userId: params.userId,
     remoteOrigin: pending.remoteOrigin,
+    id: serverId,
+    slug: pending.slug,
+    authType: 'oauth2',
     payload: secretPayload,
   });
   if (!sealed.ok) return sealed;
 
-  const existing = await params.vaultStore.getServer(params.userId, pending.slug);
   const row: StoredMcpServerRow = {
-    id: existing?.id ?? `mcp_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`,
+    id: serverId,
     userId: params.userId,
     slug: pending.slug,
     name: pending.name,
@@ -1895,6 +2114,7 @@ export async function completeDownstreamMcpOAuthCallback(params: {
     transport: pending.transport,
     authType: 'oauth2',
     encryptedCredentials: sealed.ciphertext,
+    secretVersion: sealed.secretVersion,
     authSummary: buildMaskedAuthSummary(secretPayload),
     domains: pending.domains,
     autoRouteScrape: Boolean(pending.autoRouteScrape),

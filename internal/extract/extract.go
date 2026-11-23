@@ -255,8 +255,9 @@ func htmlFragmentToMarkdown(fragment string, base *url.URL) string {
 			}
 			inner = sub[3]
 		}
-		if !strings.Contains(inner, "\n") && strings.Contains(inner, "ec-line") {
-			inner = reEcLine.ReplaceAllString(inner, "\n")
+		if strings.Contains(inner, "ec-line") && reEcLine.MatchString(inner) {
+			noNewlines := strings.NewReplacer("\r\n", "", "\n", "").Replace(inner)
+			inner = reEcLine.ReplaceAllString(noNewlines, "\n")
 		}
 		inner = reAnyTag.ReplaceAllString(inner, "")
 		inner = strings.Trim(html.UnescapeString(inner), "\r\n")

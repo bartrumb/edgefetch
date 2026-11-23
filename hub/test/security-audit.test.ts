@@ -2869,7 +2869,7 @@ test('SEC-V261-ROUND5: R4-H1..H3 O(N) Scanners, R4-M6..M7 XSS/Sentinel Hygiene, 
 });
 
 test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forgery, Host/safe-fetch & Hub Lows', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 32);
+  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
 
   // 1. Exact `v5.mjs` PoCs (`R5-H3`, `R5-H4`, `R5-M1`, `R5-M2`) + Sentinel Forgery
   const fin = (md: string, origin = true) =>
@@ -6003,8 +6003,8 @@ test('SEC-R2-B4: agent-hub.ts stores, locks, dispatch lifecycle, artifacts, fail
   assert.equal((await engine.dispatchFetch(JSON.stringify({ requests: [] }))).status, 400);
 
   const emptyEngine = new AgentHubEngine({ getSockets: () => [], cooldowns: createMemoryCooldownStore() });
-  assert.equal((await emptyEngine.dispatchFetch(JSON.stringify({ requests: [{ url: 'https://a.com/', kind: 'render' }] }))).error, 'fat_agent_required');
-  assert.equal((await emptyEngine.dispatchFetch(JSON.stringify({ requests: [{ url: 'https://a.com/', kind: 'render' }] }), {}, { preferredSite: 's1' })).error, 'fat_agent_required');
+  assert.equal((await emptyEngine.dispatchFetch(JSON.stringify({ requests: [{ url: 'https://a.com/', kind: 'render' }] }))).error, 'browser_worker_required');
+  assert.equal((await emptyEngine.dispatchFetch(JSON.stringify({ requests: [{ url: 'https://a.com/', kind: 'render' }] }), {}, { preferredSite: 's1' })).error, 'browser_worker_required');
   assert.equal((await emptyEngine.dispatchFetch(JSON.stringify({ requests: [{ url: 'https://a.com/' }] }), {}, { preferredSite: 's1' })).error, 'no_agents');
   assert.equal((await emptyEngine.dispatchFetch(JSON.stringify({ requests: [{ url: 'https://a.com/' }] }))).error, 'no_agents');
 

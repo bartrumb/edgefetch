@@ -107,18 +107,21 @@ const isMainModule =
 if (isMainModule) {
   const args = process.argv.slice(2);
   const checkOnly = args.includes('--check');
+  const onlineCheck = args.includes('--online');
   const inputIdx = args.indexOf('--input');
   const inputPath = inputIdx >= 0 ? args[inputIdx + 1] : null;
 
   const rawSource = inputPath
     ? readFileSync(resolve(inputPath), 'utf8')
-    : await (async () => {
-        const resp = await fetch(PSL_SOURCE_URL);
-        if (!resp.ok) {
-          throw new Error(`Failed to fetch ${PSL_SOURCE_URL}: HTTP ${resp.status}`);
-        }
-        return await resp.text();
-      })();
+    : checkOnly && !onlineCheck && existsSync(datOutPath)
+      ? readFileSync(datOutPath, 'utf8')
+      : await (async () => {
+          const resp = await fetch(PSL_SOURCE_URL);
+          if (!resp.ok) {
+            throw new Error(`Failed to fetch ${PSL_SOURCE_URL}: HTTP ${resp.status}`);
+          }
+          return await resp.text();
+        })();
 
   const compactDat = compileCompactPslDat(rawSource);
   const tsModule = renderPslDataTsModule(compactDat);

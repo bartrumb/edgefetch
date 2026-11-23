@@ -502,14 +502,14 @@ function buildGeneratedAdversarialMarkdownCorpus(): Array<{ id: string; md: stri
   return corpus;
 }
 
-test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 32 single source & readArtifactPage NEVER falls back to < v32 cached Markdown', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 32);
-  assert.equal(STORAGE_PIPELINE_VERSION, 32);
+test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 33 single source & readArtifactPage NEVER falls back to < v33 cached Markdown', async () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
+  assert.equal(STORAGE_PIPELINE_VERSION, 33);
   assert.equal(SCRAPE_PIPELINE_VERSION, STORAGE_PIPELINE_VERSION);
 
   const bucket = new MemoryR2Bucket();
   const metaDb = new MemoryD1Database();
-  const rawHtml = '<html><body><main><p>Hello v32</p></main></body></html>';
+  const rawHtml = '<html><body><main><p>Hello v33</p></main></body></html>';
   const rawBytes = new TextEncoder().encode(rawHtml);
   const written = await writeVerifiedArtifactToR2({
     bucket: bucket as unknown as R2Bucket,
@@ -539,7 +539,7 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 32 single source & readArtifactPa
   await bucket.put(`derived/25/markdown/${written.contentSha256}`, 'stale v25 `<script>pwn()</script>`');
 
   // 0. `readArtifactPage` MUST NEVER read or fall back to `< requiredVer` (`v30` or `v25`) derived Markdown!
-  //    Without `deriveMarkdownFromRaw` (or raw gzip blob), an `md:<sha>` backed ONLY by `< v32` returns 404 rather than stale output.
+  //    Without `deriveMarkdownFromRaw` (or raw gzip blob), an `md:<sha>` backed ONLY by `< v33` returns 404 rather than stale output.
   const staleOnlyRes = await readArtifactPage({
     bucket: bucket as unknown as R2Bucket,
     metaDb: metaDb as unknown as D1Database,
@@ -551,7 +551,7 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 32 single source & readArtifactPa
     assert.equal(staleOnlyRes.status, 404);
   }
 
-  // With a valid gzipped raw artifact + `deriveMarkdownFromRaw`, `readArtifactPage` re-derives at v32 and persists `derived/32/markdown/<sha>`!
+  // With a valid gzipped raw artifact + `deriveMarkdownFromRaw`, `readArtifactPage` re-derives at v33 and persists `derived/33/markdown/<sha>`!
   const { gzipSync } = await import('node:zlib');
   const gzHtml = gzipSync(rawBytes);
   const gzBlobSha = createHash('sha256').update(gzHtml).digest('hex');
@@ -574,19 +574,19 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 32 single source & readArtifactPa
     format: 'markdown',
     deriveMarkdownFromRaw: (bytes) => {
       rederivedCalls++;
-      return `Re-derived v32 from ${bytes.byteLength}B raw: <svg onload=1>`;
+      return `Re-derived v33 from ${bytes.byteLength}B raw: <svg onload=1>`;
     },
   });
   assert.equal(rederivedRes.ok, true);
-  assert.equal(rederivedCalls, 1, 'readArtifactPage must fall through to deriveMarkdownFromRaw when only < v32 cache exists');
+  assert.equal(rederivedCalls, 1, 'readArtifactPage must fall through to deriveMarkdownFromRaw when only < v33 cache exists');
   if (rederivedRes.ok) {
-    assert.equal(rederivedRes.page.content, `Re-derived v32 from ${rawBytes.byteLength}B raw: &lt;svg onload=1>`);
+    assert.equal(rederivedRes.page.content, `Re-derived v33 from ${rawBytes.byteLength}B raw: &lt;svg onload=1>`);
   }
-  const persistedV32 = await bucket.get(`derived/32/markdown/${written.contentSha256}`);
-  assert.ok(persistedV32, 're-derived v32 Markdown must be persisted at derived/32/markdown/<sha>');
+  const persistedV33 = await bucket.get(`derived/33/markdown/${written.contentSha256}`);
+  assert.ok(persistedV33, 're-derived v33 Markdown must be persisted at derived/33/markdown/<sha>');
 
-  // 1. `executeScrapeCall` with `maxAgeMs: 60_000` MUST ignore v30 cached document and fetch fresh v32!
-  await bucket.delete(`derived/32/markdown/${written.contentSha256}`);
+  // 1. `executeScrapeCall` with `maxAgeMs: 60_000` MUST ignore v30 cached document and fetch fresh v33!
+  await bucket.delete(`derived/33/markdown/${written.contentSha256}`);
   let liveFetched = 0;
   const scrapeRes = await executeScrapeCall({
     payload: { url: 'https://cache-v30.example.com/', maxAgeMs: 60_000 },
@@ -605,23 +605,23 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 32 single source & readArtifactPa
     },
   });
   assert.equal(scrapeRes.status, 200);
-  assert.equal(liveFetched, 1, 'v30 scrape cache entry MUST be invalidated after bump to v32');
-  assert.equal(scrapeRes.body.pipelineVersion, 32);
+  assert.equal(liveFetched, 1, 'v30 scrape cache entry MUST be invalidated after bump to v33');
+  assert.equal(scrapeRes.body.pipelineVersion, 33);
 
-  // 2. `readArtifactPage` sanitizes unhardened `v32` document on cache miss and caches per sha!
+  // 2. `readArtifactPage` sanitizes unhardened `v33` document on cache miss and caches per sha!
   await bucket.put(
-    `derived/32/markdown/${written.contentSha256}`,
-    '> ```html\n<img src=x onerror=1>\n> ```\n\nfresh v32 <img src=x onerror=1> and `Vec<T>`',
+    `derived/33/markdown/${written.contentSha256}`,
+    '> ```html\n<img src=x onerror=1>\n> ```\n\nfresh v33 <img src=x onerror=1> and `Vec<T>`',
   );
-  const hitV32 = await readArtifactPage({
+  const hitV33 = await readArtifactPage({
     bucket: bucket as unknown as R2Bucket,
     blobSha256: `md:${written.contentSha256}`,
     format: 'markdown',
   });
-  assert.equal(hitV32.ok, true);
-  if (hitV32.ok) {
-    auditZeroLiveXssAcrossSixMarkdownDialects(hitV32.page.content, 'readArtifactPage:wholeDocResanitize');
-    assert.ok(hitV32.page.content.endsWith('fresh v32 &lt;img src=x onerror=1> and `Vec<T>`'));
+  assert.equal(hitV33.ok, true);
+  if (hitV33.ok) {
+    auditZeroLiveXssAcrossSixMarkdownDialects(hitV33.page.content, 'readArtifactPage:wholeDocResanitize');
+    assert.ok(hitV33.page.content.endsWith('fresh v33 &lt;img src=x onerror=1> and `Vec&lt;T>`'));
   }
 });
 
@@ -1249,7 +1249,7 @@ function buildLegitimateMarkdownCorpus(): LegitimateMarkdownDocSpec[] {
         'carrying the upstream HTTP status code and structured retry metadata.',
       ].join('\n'),
       verifyContent: (out) => {
-        assert.ok(out.includes('`Promise<Array<Record<string, unknown>>>`'));
+        assert.ok(out.includes('`Promise&lt;Array&lt;Record&lt;string, unknown>>>`'));
       },
     },
     {

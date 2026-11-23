@@ -2469,6 +2469,7 @@ export function formatJsonWithExtractSpec(
       title: sanitizeSingleLineMeta(commDoc.title),
       ...(commDoc.description ? { description: sanitizeSingleLineMeta(commDoc.description) } : {}),
       ...(commDoc.author ? { author: sanitizeSingleLineMeta(commDoc.author) } : {}),
+      ...(commDoc.publishedTime ? { publishedTime: sanitizeSingleLineMeta(commDoc.publishedTime) } : {}),
       markdown: escapeDangerousRawHtmlOutsideFences(commDoc.markdown),
       ...(commDoc.links ? { links: commDoc.links.filter((l) => isSafeDeclarativeFeedLinkUrl(l.trim())) } : {}),
     };
@@ -3961,6 +3962,7 @@ function executeDeclarativeHtmlRoute(
       ...(out.title ? { title: sanitizeSingleLineMeta(out.title) } : {}),
       ...(out.description ? { description: sanitizeSingleLineMeta(out.description) } : {}),
       ...(out.author ? { author: sanitizeSingleLineMeta(out.author) } : {}),
+      ...(out.publishedTime ? { publishedTime: sanitizeSingleLineMeta(out.publishedTime) } : {}),
       markdown: escapeDangerousRawHtmlOutsideFences(out.markdown),
       ...(out.links ? { links: out.links.filter((l) => isSafeDeclarativeFeedLinkUrl(l.trim())) } : {}),
     };
@@ -4164,18 +4166,31 @@ function assertValidTwinFetchUrlM2(manifest: DeclarativeAdapterManifest, fetchUr
   if (!fetchUrl.startsWith('https://') && !fetchUrl.startsWith('{origin}/')) {
     throw new Error(`[${manifest.id}] route ${routeIdx} fetchUrl must start with https:// (got "${fetchUrl}")`);
   }
-  const hasWildcardOrUniversal =
-    Boolean(manifest.universalEngine) || manifest.domains.some((d) => d.includes('*'));
-  if ((fetchUrl.includes('{host}') || fetchUrl.includes('{origin}')) && hasWildcardOrUniversal) {
-    const sameOriginOk = fetchUrl.startsWith('https://{host}/') || fetchUrl.startsWith('{origin}/');
+  if (fetchUrl.includes('{host}') || fetchUrl.includes('{origin}')) {
+    const sameOriginOk =
+      (fetchUrl.startsWith('https://{host}/') || fetchUrl.startsWith('{origin}/')) &&
+      !fetchUrl.startsWith('https://{host}//') &&
+      !fetchUrl.startsWith('{origin}//');
     if (!sameOriginOk) {
       throw new Error(
-        `[${manifest.id}] route ${routeIdx} cannot interpolate {host}/{origin} into non-origin URL "${fetchUrl}" when wildcard domains or universalEngine are enabled (M2)`,
+        `[${manifest.id}] route ${routeIdx} cannot interpolate {host}/{origin} into non-origin URL "${fetchUrl}" (M2)`,
       );
     }
+    const restAfterOrigin = fetchUrl.startsWith('https://{host}/')
+      ? fetchUrl.slice('https://{host}/'.length)
+      : fetchUrl.slice('{origin}/'.length);
+    if (restAfterOrigin.includes('{origin}')) {
+      throw new Error(`[${manifest.id}] route ${routeIdx} cannot repeat {origin} in "${fetchUrl}" (M2)`);
+    }
+    const dynCheck = expandTemplate(fetchUrl, (k) =>
+      k === 'host' ? 'example.com' : k === 'origin' ? 'https://example.com' : 'sample',
+    );
+    if (!isSafeDeclarativeTwinUrl(dynCheck) || new URL(dynCheck).hostname.toLowerCase() !== 'example.com') {
+      throw new Error(`[${manifest.id}] route ${routeIdx} fetchUrl failed same-origin HTTPS safety validation: "${fetchUrl}"`);
+    }
   }
-  // Static host validation when fetchUrl does not start with dynamic `{host}` / `{origin}`
-  if (!fetchUrl.startsWith('https://{host}') && !fetchUrl.startsWith('{origin}')) {
+  // Static host validation when fetchUrl does not start with dynamic `https://{host}/` or `{origin}/`
+  if (!fetchUrl.startsWith('https://{host}/') && !fetchUrl.startsWith('{origin}/')) {
     const sampleCheck = expandTemplate(fetchUrl, () => 'sample');
     if (!isSafeDeclarativeTwinUrl(sampleCheck)) {
       throw new Error(`[${manifest.id}] route ${routeIdx} fetchUrl failed public HTTPS safety validation: "${fetchUrl}"`);
@@ -4190,7 +4205,7 @@ function assertValidTwinFetchUrlM2(manifest: DeclarativeAdapterManifest, fetchUr
 }
 
 function assertAuthorizedCrossDomainTwinHost(manifest: DeclarativeAdapterManifest, fetchUrl: string, routeIdx: number): void {
-  if (fetchUrl === '{requestUrl}' || fetchUrl.startsWith('https://{host}') || fetchUrl.startsWith('{origin}')) {
+  if (fetchUrl === '{requestUrl}' || fetchUrl.startsWith('https://{host}/') || fetchUrl.startsWith('{origin}/')) {
     return;
   }
   const sampleCheck = expandTemplate(fetchUrl, () => 'sample');

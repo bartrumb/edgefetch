@@ -211,7 +211,8 @@ export async function reconcileUpgradedFounderOwners(params: {
           u.userId !== 'owner' &&
           u.role === 'owner' &&
           String(u.githubId ?? '') !== pinnedOwnerId &&
-          u.promotedByOwnerId !== pinnedOwnerId
+          u.promotedByOwnerId !== pinnedOwnerId &&
+          u.promotedByOwnerId !== 'owner'
         ) {
           await params.store.upsertUser({
             ...u,
@@ -240,7 +241,7 @@ export async function reconcileUpgradedFounderOwners(params: {
           WHERE user_id != 'owner'
             AND role = 'owner'
             AND COALESCE(github_id, '') != ?1
-            AND COALESCE(promoted_by_owner_id, '') != ?1`,
+            AND COALESCE(promoted_by_owner_id, '') NOT IN (?1, 'owner')`,
       )
       .bind(pinnedOwnerId)
       .run()
@@ -1152,6 +1153,7 @@ export async function handleGitHubOAuthCallback(params: {
           encryptedGhToken: undefined,
           orgVerifiedAt: undefined,
           mutationKind: 'admin_disable',
+          callerIsImmutableFounder: true,
         });
         const sqGrants = await Promise.resolve(oauthStore.listGrants(now, sq.userId)).catch(() => []);
         for (const g of sqGrants) {
@@ -1325,7 +1327,9 @@ export async function handleGitHubOAuthCallback(params: {
     }
     assignedRole =
       latestUser?.role === 'owner' &&
-      (!rawConfiguredOwnerId || latestUser.promotedByOwnerId === rawConfiguredOwnerId)
+      (!rawConfiguredOwnerId ||
+        latestUser.promotedByOwnerId === rawConfiguredOwnerId ||
+        latestUser.promotedByOwnerId === 'owner')
         ? 'owner'
         : 'member';
   }

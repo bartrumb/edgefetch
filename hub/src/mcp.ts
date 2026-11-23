@@ -15,6 +15,7 @@ import { SITE_ID_PATTERN } from './auth';
 import { filterSafeResponseHeaders } from './framework-detect';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
+import { formatFenceSafeUntrustedMcpEnvelope, sanitizeConnectorStructuredValue } from './mcp-federation';
 import { resolveCallerUserId } from './mcp-vault';
 import { getActiveRequestTracer, type RequestTracer } from './otel';
 import {
@@ -1545,7 +1546,7 @@ async function handleToolCallInner(
   principal: string,
   deps: McpServerDeps,
   userId = 'owner',
-): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
+): Promise<{ content: Array<{ type: 'text'; text: string }>; structuredContent?: Record<string, unknown>; isError?: boolean }> {
   if (name === 'list_agents') {
     if (!scopes.includes('crawl:read') && !scopes.includes('crawl:fetch')) {
       return { content: [{ type: 'text', text: 'Insufficient OAuth scope: crawl:read is required.' }], isError: true };
@@ -2096,8 +2097,33 @@ async function handleToolCallInner(
     const remoteOnly = typeof args.remoteOnly === 'boolean' ? args.remoteOnly : false;
     const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : 20;
     const res = await deps.discoverMcps({ ...(query !== undefined ? { query } : {}), remoteOnly, limit });
+    const upstreamUnsanitized = res.body.sanitized === false;
+    const upstreamFullySanitized = res.body.fullySanitized !== false;
+    const san = sanitizeConnectorStructuredValue(res.body);
+    const sanObj =
+      san.value && typeof san.value === 'object' && !Array.isArray(san.value)
+        ? (san.value as Record<string, unknown>)
+        : { data: san.value };
+    const isSanitized = Boolean(!upstreamUnsanitized && san.sanitized);
+    const isFullySanitized = Boolean(isSanitized && upstreamFullySanitized && san.fullySanitized);
+    const payloadOut: Record<string, unknown> = {
+      ...sanObj,
+      sanitized: isSanitized,
+      fullySanitized: isFullySanitized,
+      promptInjection: {
+        detected: san.detected,
+        scrubbed: san.scrubbed,
+        triggers: san.triggers,
+      },
+    };
+    const wrappedText = formatFenceSafeUntrustedMcpEnvelope({
+      tag: 'untrusted_mcp_output',
+      attributes: { tool: 'discover_mcps' },
+      content: JSON.stringify(payloadOut, null, 2),
+    });
     return {
-      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
+      content: [{ type: 'text', text: wrappedText }],
+      structuredContent: payloadOut,
       ...(res.status >= 400 ? { isError: true } : {}),
     };
   }
@@ -2131,9 +2157,51 @@ async function handleToolCallInner(
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'mcp_federation_not_configured' }) }], isError: true };
     }
     const res = await deps.executeQueryMcp({ args, principal, userId });
+    const upstreamUnsanitized = res.body.sanitized === false;
+    const upstreamFullySanitized = res.body.fullySanitized !== false;
+    const prevPi =
+      res.body.promptInjection && typeof res.body.promptInjection === 'object'
+        ? (res.body.promptInjection as { detected?: boolean; scrubbed?: boolean; triggers?: unknown })
+        : undefined;
+    const prevTriggers = Array.isArray(prevPi?.triggers)
+      ? prevPi!.triggers.filter((t): t is string => typeof t === 'string')
+      : [];
+    const san = sanitizeConnectorStructuredValue(res.body);
+    const sanObj =
+      san.value && typeof san.value === 'object' && !Array.isArray(san.value)
+        ? (san.value as Record<string, unknown>)
+        : { data: san.value };
+    const isSanitized = Boolean(!upstreamUnsanitized && san.sanitized);
+    const isFullySanitized = Boolean(isSanitized && upstreamFullySanitized && san.fullySanitized);
+    const mergedTriggers = [...new Set([...prevTriggers, ...san.triggers])];
+    const payloadOut: Record<string, unknown> = {
+      ...sanObj,
+      sanitized: isSanitized,
+      fullySanitized: isFullySanitized,
+      promptInjection: {
+        detected: Boolean(prevPi?.detected || san.detected),
+        scrubbed: Boolean(prevPi?.scrubbed || san.scrubbed),
+        triggers: mergedTriggers,
+      },
+    };
+    const safeActionAttr = /^[a-z_]{1,24}$/i.test(action) ? action : undefined;
+    const safeServerAttr =
+      typeof payloadOut.server === 'string' && /^[a-z0-9_-]{1,48}$/i.test(payloadOut.server)
+        ? payloadOut.server
+        : undefined;
+    const wrappedText = formatFenceSafeUntrustedMcpEnvelope({
+      tag: 'untrusted_mcp_output',
+      attributes: {
+        tool: 'query_mcp',
+        ...(safeActionAttr ? { action: safeActionAttr } : {}),
+        ...(safeServerAttr ? { server: safeServerAttr } : {}),
+      },
+      content: JSON.stringify(payloadOut, null, 2),
+    });
     return {
-      content: [{ type: 'text', text: JSON.stringify(res.body, null, 2) }],
-      ...(res.status >= 400 ? { isError: true } : {}),
+      content: [{ type: 'text', text: wrappedText }],
+      structuredContent: payloadOut,
+      ...(res.status >= 400 || payloadOut.isError === true ? { isError: true } : {}),
     };
   }
 
@@ -2147,7 +2215,7 @@ async function handleToolCall(
   principal: string,
   deps: McpServerDeps,
   userId = 'owner',
-): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
+): Promise<{ content: Array<{ type: 'text'; text: string }>; structuredContent?: Record<string, unknown>; isError?: boolean }> {
   try {
     return await handleToolCallInner(name, args, scopes, principal, deps, userId);
   } catch (err) {

@@ -47,7 +47,7 @@ export interface OptionalStorageBindings extends SpaFallbackEnv, LlmEnvBindings 
   PDF_OCR_TOKEN?: string;
 }
 
-export const SCRAPE_PIPELINE_VERSION = 32;
+export const SCRAPE_PIPELINE_VERSION = 33;
 export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 export const TRANSIENT_RETENTION_MS = 24 * 60 * 60_000; // 1 day (`tmp/` prefix lifecycle)
 export const STORED_RETENTION_MS = 30 * 24 * 60 * 60_000; // 30 days (`raw/` prefix lifecycle)
@@ -778,91 +778,181 @@ export interface ArtifactPageSlice {
   content: string;
 }
 
+const SHARED_UTF8_ENCODER = new TextEncoder();
+const SHARED_UTF8_DECODER = new TextDecoder();
+
 interface CachedSanitizedMarkdownEntry {
-  rawLen: number;
-  rawHead: string;
-  rawTail: string;
+  rawSha256: string;
   cleanMd: string;
   byteLen: number;
   checkpoints: MarkdownSliceCheckpoint[];
 }
 
-const MAX_SANITIZED_MD_CACHE_ENTRIES = 64;
-const MAX_SANITIZED_MD_CACHE_TOTAL_CHARS = 32 * 1024 * 1024;
-const sanitizedMarkdownByShaCache = new Map<string, CachedSanitizedMarkdownEntry>();
-let sanitizedMarkdownCacheChars = 0;
+interface SanitizedMarkdownLruPool {
+  entries: Map<string, CachedSanitizedMarkdownEntry>;
+  totalChars: number;
+  readonly maxEntries: number;
+  readonly maxChars: number;
+}
 
-function buildSanitizedMdCacheKey(sha: string, ver: number, scopeUserId?: string, privateOnly = false): string {
-  const scope = privateOnly && scopeUserId ? `priv:${sanitizeStorageUserId(scopeUserId)}` : 'pub';
-  return `${scope}:${sha}:${ver}`;
+type SanitizedMdCacheScope = { isPrivate: false } | { isPrivate: true; userKey: string };
+
+const PUBLIC_SANITIZED_MD_MAX_ENTRIES = 32;
+const PUBLIC_SANITIZED_MD_MAX_CHARS = 16 * 1024 * 1024;
+const PRIVATE_USER_SANITIZED_MD_MAX_ENTRIES = 4;
+const PRIVATE_USER_SANITIZED_MD_MAX_CHARS = 4 * 1024 * 1024;
+const MAX_PRIVATE_SANITIZED_MD_USER_POOLS = 64;
+
+const publicSanitizedMarkdownPool: SanitizedMarkdownLruPool = {
+  entries: new Map<string, CachedSanitizedMarkdownEntry>(),
+  totalChars: 0,
+  maxEntries: PUBLIC_SANITIZED_MD_MAX_ENTRIES,
+  maxChars: PUBLIC_SANITIZED_MD_MAX_CHARS,
+};
+
+const privateSanitizedMarkdownPoolsByUser = new Map<string, SanitizedMarkdownLruPool>();
+
+/**
+ * Resolves the isolated cache scope for a Markdown artifact:
+ *  - Public (`privateOnly === false`) -> dedicated `'pub'` LRU pool (`publicSanitizedMarkdownPool`) that member traffic can NEVER evict.
+ *  - Authenticated private (`privateOnly === true` with non-empty `scopeUserId`) -> isolated per-user LRU pool (`priv:<userKey>`).
+ *  - Private WITHOUT a `userId` (`privateOnly === true` and missing/empty `scopeUserId`) -> `null` (NEVER cached or looked up under `'pub'`!).
+ */
+function resolveSanitizedMdCacheScope(scopeUserId: string | undefined, privateOnly: boolean): SanitizedMdCacheScope | null {
+  if (!privateOnly) {
+    return { isPrivate: false };
+  }
+  if (typeof scopeUserId !== 'string') return null;
+  const cleaned = scopeUserId.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  if (!cleaned) return null;
+  return { isPrivate: true, userKey: cleaned };
+}
+
+function getSanitizedMdPoolForScope(scope: SanitizedMdCacheScope, createIfMissing: boolean): SanitizedMarkdownLruPool | null {
+  if (!scope.isPrivate) {
+    return publicSanitizedMarkdownPool;
+  }
+  const existing = privateSanitizedMarkdownPoolsByUser.get(scope.userKey);
+  if (existing) {
+    // Promote active user bucket in outer per-user LRU without touching `publicSanitizedMarkdownPool`
+    privateSanitizedMarkdownPoolsByUser.delete(scope.userKey);
+    privateSanitizedMarkdownPoolsByUser.set(scope.userKey, existing);
+    return existing;
+  }
+  if (!createIfMissing) return null;
+  while (privateSanitizedMarkdownPoolsByUser.size >= MAX_PRIVATE_SANITIZED_MD_USER_POOLS) {
+    const oldestUser = privateSanitizedMarkdownPoolsByUser.keys().next().value;
+    if (oldestUser === undefined) break;
+    privateSanitizedMarkdownPoolsByUser.delete(oldestUser);
+  }
+  const created: SanitizedMarkdownLruPool = {
+    entries: new Map<string, CachedSanitizedMarkdownEntry>(),
+    totalChars: 0,
+    maxEntries: PRIVATE_USER_SANITIZED_MD_MAX_ENTRIES,
+    maxChars: PRIVATE_USER_SANITIZED_MD_MAX_CHARS,
+  };
+  privateSanitizedMarkdownPoolsByUser.set(scope.userKey, created);
+  return created;
 }
 
 function upsertSanitizedMarkdownCache(
-  key: string,
-  rawMd: string,
+  scope: SanitizedMdCacheScope | null,
+  docKey: string,
+  rawSha256: string,
   cleanMd: string,
+  byteLen?: number,
 ): CachedSanitizedMarkdownEntry {
-  const prev = sanitizedMarkdownByShaCache.get(key);
-  if (prev) {
-    sanitizedMarkdownCacheChars -= prev.cleanMd.length;
-    sanitizedMarkdownByShaCache.delete(key);
-  }
   const entry: CachedSanitizedMarkdownEntry = {
-    rawLen: rawMd.length,
-    rawHead: rawMd.slice(0, 96),
-    rawTail: rawMd.length > 96 ? rawMd.slice(-96) : rawMd,
+    rawSha256,
     cleanMd,
-    byteLen: new TextEncoder().encode(cleanMd).byteLength,
+    byteLen: byteLen ?? SHARED_UTF8_ENCODER.encode(cleanMd).byteLength,
     checkpoints: computeMarkdownSliceCheckpoints(cleanMd, 16_384),
   };
-  if (cleanMd.length <= MAX_SANITIZED_MD_CACHE_TOTAL_CHARS) {
-    while (
-      sanitizedMarkdownByShaCache.size >= MAX_SANITIZED_MD_CACHE_ENTRIES ||
-      sanitizedMarkdownCacheChars + cleanMd.length > MAX_SANITIZED_MD_CACHE_TOTAL_CHARS
-    ) {
-      const oldestKey = sanitizedMarkdownByShaCache.keys().next().value;
+  if (!scope) {
+    return entry;
+  }
+  const pool = getSanitizedMdPoolForScope(scope, true);
+  if (!pool) return entry;
+
+  const prev = pool.entries.get(docKey);
+  if (prev) {
+    pool.totalChars -= prev.cleanMd.length;
+    pool.entries.delete(docKey);
+  }
+  if (cleanMd.length <= pool.maxChars) {
+    while (pool.entries.size >= pool.maxEntries || pool.totalChars + cleanMd.length > pool.maxChars) {
+      const oldestKey = pool.entries.keys().next().value;
       if (oldestKey === undefined) break;
-      const oldest = sanitizedMarkdownByShaCache.get(oldestKey);
-      if (oldest) sanitizedMarkdownCacheChars -= oldest.cleanMd.length;
-      sanitizedMarkdownByShaCache.delete(oldestKey);
+      const oldest = pool.entries.get(oldestKey);
+      if (oldest) pool.totalChars -= oldest.cleanMd.length;
+      pool.entries.delete(oldestKey);
     }
-    sanitizedMarkdownByShaCache.set(key, entry);
-    sanitizedMarkdownCacheChars += cleanMd.length;
+    pool.entries.set(docKey, entry);
+    pool.totalChars += cleanMd.length;
   }
   return entry;
 }
 
-function getOrSanitizeCachedMarkdownForSha(
-  key: string,
-  rawMd: string,
-  alreadySanitized = false,
-): CachedSanitizedMarkdownEntry {
-  const hit = sanitizedMarkdownByShaCache.get(key);
-  const rawHead = rawMd.slice(0, 96);
-  const rawTail = rawMd.length > 96 ? rawMd.slice(-96) : rawMd;
-  if (hit && hit.rawLen === rawMd.length && hit.rawHead === rawHead && hit.rawTail === rawTail) {
-    sanitizedMarkdownByShaCache.delete(key);
-    sanitizedMarkdownByShaCache.set(key, hit);
-    return hit;
+type NodeCryptoModule = {
+  createHash: (alg: string) => { update: (data: Uint8Array) => { digest: (enc: 'hex') => string } };
+};
+
+const NODE_CRYPTO_MOD: NodeCryptoModule | null = (() => {
+  const g = globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } };
+  const mod = typeof g.process?.getBuiltinModule === 'function' ? g.process.getBuiltinModule('node:crypto') : null;
+  return mod && typeof (mod as NodeCryptoModule).createHash === 'function' ? (mod as NodeCryptoModule) : null;
+})();
+
+async function sha256BytesHexNative(rawBytes: Uint8Array): Promise<string> {
+  if (NODE_CRYPTO_MOD) {
+    return NODE_CRYPTO_MOD.createHash('sha256').update(rawBytes).digest('hex');
   }
+  return bytesToHex(await crypto.subtle.digest('SHA-256', rawBytes as unknown as BufferSource));
+}
+
+async function getOrSanitizeCachedMarkdownForBytes(
+  scope: SanitizedMdCacheScope | null,
+  docKey: string,
+  rawBytes: Uint8Array,
+  alreadySanitized = false,
+): Promise<CachedSanitizedMarkdownEntry> {
+  const rawSha256 = await sha256BytesHexNative(rawBytes);
+  if (scope) {
+    const pool = getSanitizedMdPoolForScope(scope, false);
+    const hit = pool?.entries.get(docKey);
+    if (pool && hit && hit.rawSha256 === rawSha256) {
+      pool.entries.delete(docKey);
+      pool.entries.set(docKey, hit);
+      return hit;
+    }
+  }
+  const rawMd = SHARED_UTF8_DECODER.decode(rawBytes);
   const cleanMd = alreadySanitized ? rawMd : sanitizeFullMarkdownDocumentForArtifact(rawMd);
-  return upsertSanitizedMarkdownCache(key, rawMd, cleanMd);
+  const cleanByteLen = alreadySanitized ? rawBytes.byteLength : SHARED_UTF8_ENCODER.encode(cleanMd).byteLength;
+  return upsertSanitizedMarkdownCache(scope, docKey, rawSha256, cleanMd, cleanByteLen);
 }
 
 /**
  * Primes the per-`sha` sanitized Markdown cache when `scrape.ts` / `deriveMarkdownDocument` writes an already-sanitized
- * `SCRAPE_PIPELINE_VERSION` (`32`) Markdown artifact to `derived/${SCRAPE_PIPELINE_VERSION}/markdown/${sha}` so subsequent
+ * `SCRAPE_PIPELINE_VERSION` (`33`) Markdown artifact to `derived/${SCRAPE_PIPELINE_VERSION}/markdown/${sha}` so subsequent
  * `read_artifact` page calls slice directly in `O(window)` (`< 2 ms` per page on `1 MiB` docs) with zero full-doc re-sanitization.
  */
-export function primeSanitizedMarkdownCache(
+export async function primeSanitizedMarkdownCache(
   sha: string,
   cleanMd: string,
-  opts?: { userId?: string; privateOnly?: boolean; pipelineVersion?: number },
-): void {
+  opts?: { userId?: string; privateOnly?: boolean; pipelineVersion?: number; rawSha256?: string },
+): Promise<void> {
   if (!isValidSha256Hex(sha) || !cleanMd) return;
+  const scope = resolveSanitizedMdCacheScope(opts?.userId, Boolean(opts?.privateOnly));
+  if (!scope) return;
   const ver = Math.max(SCRAPE_PIPELINE_VERSION, opts?.pipelineVersion ?? SCRAPE_PIPELINE_VERSION);
-  const key = buildSanitizedMdCacheKey(sha, ver, opts?.userId, Boolean(opts?.privateOnly));
-  upsertSanitizedMarkdownCache(key, cleanMd, cleanMd);
+  const docKey = `${sha}:${ver}`;
+  const rawBytes = SHARED_UTF8_ENCODER.encode(cleanMd);
+  const rawSha256 =
+    opts?.rawSha256 && isValidSha256Hex(opts.rawSha256)
+      ? opts.rawSha256
+      : await sha256BytesHexNative(rawBytes);
+  upsertSanitizedMarkdownCache(scope, docKey, rawSha256, cleanMd, rawBytes.byteLength);
 }
 
 export async function readArtifactPage(params: {
@@ -933,7 +1023,7 @@ export async function readArtifactPage(params: {
 
   const wantsMarkdown = isMdPrefixed || params.format === 'markdown';
   if (wantsMarkdown) {
-    // Clamp any caller-supplied `pipelineVersion < SCRAPE_PIPELINE_VERSION` (`32`) so callers can NEVER read stale derived objects!
+    // Clamp any caller-supplied `pipelineVersion < SCRAPE_PIPELINE_VERSION` (`33`) so callers can NEVER read stale derived objects!
     const callerVer =
       typeof params.pipelineVersion === 'number' && Number.isInteger(params.pipelineVersion)
         ? params.pipelineVersion
@@ -972,17 +1062,24 @@ export async function readArtifactPage(params: {
       }
     }
 
+    const readDerivedObjBytes = async (
+      obj: { arrayBuffer?: () => Promise<ArrayBuffer>; text: () => Promise<string>; customMetadata?: Record<string, string> },
+    ): Promise<{ rawBytes: Uint8Array; trustedPipelineVer: boolean }> => {
+      const customVer = Number(obj.customMetadata?.pipelineVersion ?? 0);
+      const rawBytes =
+        typeof obj.arrayBuffer === 'function'
+          ? new Uint8Array(await obj.arrayBuffer())
+          : SHARED_UTF8_ENCODER.encode(await obj.text());
+      return { rawBytes, trustedPipelineVer: customVer >= requiredVer };
+    };
+
     const checkCachedMarkdownForSha = async (
       sha: string,
-    ): Promise<{ mdText: string; trustedPipelineVer: boolean } | null> => {
+    ): Promise<{ rawBytes: Uint8Array; trustedPipelineVer: boolean } | null> => {
       if (effectiveUserId) {
         const privMdObj = await params.bucket.get(r2PrivateDerivedKey(effectiveUserId, requiredVer, 'markdown', sha));
         if (privMdObj) {
-          const privVer = Number(privMdObj.customMetadata?.pipelineVersion ?? 0);
-          return {
-            mdText: await privMdObj.text(),
-            trustedPipelineVer: privVer >= requiredVer,
-          };
+          return readDerivedObjBytes(privMdObj);
         }
       }
       if (privateOnly) return null;
@@ -997,30 +1094,28 @@ export async function readArtifactPage(params: {
         if (docRow?.r2_key) {
           const obj = await params.bucket.get(docRow.r2_key);
           if (obj) {
-            const customVer = Number(obj.customMetadata?.pipelineVersion ?? 0);
-            return {
-              mdText: await obj.text(),
-              trustedPipelineVer: customVer >= requiredVer,
-            };
+            return readDerivedObjBytes(obj);
           }
         }
       }
       const mdObj = await params.bucket.get(r2DerivedKey(requiredVer, 'markdown', sha));
       if (mdObj) {
-        const customVer = Number(mdObj.customMetadata?.pipelineVersion ?? 0);
-        return {
-          mdText: await mdObj.text(),
-          trustedPipelineVer: customVer >= requiredVer,
-        };
+        return readDerivedObjBytes(mdObj);
       }
       return null;
     };
 
+    const cacheScope = resolveSanitizedMdCacheScope(effectiveUserId, privateOnly);
+
     for (const sha of candidateShas) {
       const found = await checkCachedMarkdownForSha(sha);
       if (found !== null) {
-        const cacheKey = buildSanitizedMdCacheKey(sha, requiredVer, effectiveUserId, privateOnly);
-        const entry = getOrSanitizeCachedMarkdownForSha(cacheKey, found.mdText, found.trustedPipelineVer);
+        const entry = await getOrSanitizeCachedMarkdownForBytes(
+          cacheScope,
+          `${sha}:${requiredVer}`,
+          found.rawBytes,
+          found.trustedPipelineVer,
+        );
         return sliceMarkdownPageFromEntry(entry, sha, 'stored');
       }
     }
@@ -1032,10 +1127,10 @@ export async function readArtifactPage(params: {
       if (!candidateShas.includes(rawFallback.contentSha256)) {
         const foundByRawContentSha = await checkCachedMarkdownForSha(rawFallback.contentSha256);
         if (foundByRawContentSha !== null) {
-          const cacheKey = buildSanitizedMdCacheKey(rawFallback.contentSha256, requiredVer, effectiveUserId, privateOnly);
-          const entry = getOrSanitizeCachedMarkdownForSha(
-            cacheKey,
-            foundByRawContentSha.mdText,
+          const entry = await getOrSanitizeCachedMarkdownForBytes(
+            cacheScope,
+            `${rawFallback.contentSha256}:${requiredVer}`,
+            foundByRawContentSha.rawBytes,
             foundByRawContentSha.trustedPipelineVer,
           );
           return sliceMarkdownPageFromEntry(entry, rawFallback.contentSha256, rawFallback.retention);
@@ -1044,23 +1139,29 @@ export async function readArtifactPage(params: {
       if (params.deriveMarkdownFromRaw) {
         const derivedMd = params.deriveMarkdownFromRaw(rawFallback.bytes);
         if (derivedMd !== null) {
-          const cacheKey = buildSanitizedMdCacheKey(rawFallback.contentSha256, requiredVer, effectiveUserId, privateOnly);
-          const entry = getOrSanitizeCachedMarkdownForSha(cacheKey, derivedMd, false);
-          const targetDerivedKey =
-            privateOnly && effectiveUserId
-              ? r2PrivateDerivedKey(effectiveUserId, requiredVer, 'markdown', rawFallback.contentSha256)
-              : r2DerivedKey(requiredVer, 'markdown', rawFallback.contentSha256);
-          await params.bucket
-            .put(targetDerivedKey, entry.cleanMd, {
-              httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
-              customMetadata: {
-                pipelineVersion: String(requiredVer),
-                ...(privateOnly && effectiveUserId
-                  ? { userId: sanitizeStorageUserId(effectiveUserId), visibility: 'private' }
-                  : {}),
-              },
-            })
-            .catch(() => undefined);
+          const entry = await getOrSanitizeCachedMarkdownForBytes(
+            cacheScope,
+            `${rawFallback.contentSha256}:${requiredVer}`,
+            SHARED_UTF8_ENCODER.encode(derivedMd),
+            false,
+          );
+          if (!privateOnly || effectiveUserId) {
+            const targetDerivedKey =
+              privateOnly && effectiveUserId
+                ? r2PrivateDerivedKey(effectiveUserId, requiredVer, 'markdown', rawFallback.contentSha256)
+                : r2DerivedKey(requiredVer, 'markdown', rawFallback.contentSha256);
+            await params.bucket
+              .put(targetDerivedKey, entry.cleanMd, {
+                httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+                customMetadata: {
+                  pipelineVersion: String(requiredVer),
+                  ...(privateOnly && effectiveUserId
+                    ? { userId: sanitizeStorageUserId(effectiveUserId), visibility: 'private' }
+                    : {}),
+                },
+              })
+              .catch(() => undefined);
+          }
           return sliceMarkdownPageFromEntry(entry, rawFallback.contentSha256, rawFallback.retention);
         }
       }

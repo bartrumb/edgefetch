@@ -1034,9 +1034,16 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
       }),
     });
     assert.equal(mcpCallRes.status, 200);
-    const mcpCallJson = (await mcpCallRes.json()) as { result: { content: Array<{ text: string }> } };
-    const parsedContent = JSON.parse(mcpCallJson.result.content[0]!.text) as { visibility: string };
+    const mcpCallJson = (await mcpCallRes.json()) as {
+      result: { content: Array<{ text: string }>; structuredContent?: { visibility?: string } };
+    };
+    const rawEnvelopeText = mcpCallJson.result.content[0]!.text;
+    assert.ok(rawEnvelopeText.startsWith('<untrusted_mcp_output '), 'query_mcp output must be wrapped in untrusted envelope');
+    const unwrappedMatch = /```[a-z]*\n([\s\S]*?)\n```\n<\/untrusted_mcp_output>\s*$/.exec(rawEnvelopeText);
+    assert.ok(unwrappedMatch, 'untrusted_mcp_output envelope must contain fenced JSON body');
+    const parsedContent = JSON.parse(unwrappedMatch[1]!) as { visibility: string };
     assert.equal(parsedContent.visibility, 'private');
+    assert.equal(mcpCallJson.result.structuredContent?.visibility, 'private');
 
     // Verify unit helpers (`parseSseJsonRpcResponse` & `sanitizeRemoteMcpText`)
     const sseParsed = parseSseJsonRpcResponse(

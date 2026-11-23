@@ -11,6 +11,7 @@
  *  - Safe `%` URI decoding via `safeDecodeURIComponent` (`R5-Low`).
  */
 
+import { isSafePublicHostname } from '../overflow';
 import { safeDecodeURIComponent } from '../safe-input';
 import {
   attrHasTokenLinear,
@@ -52,13 +53,12 @@ const DEFAULT_MAX_VARIANTS_PER_PRODUCT = 250;
 
 /**
  * Sanitizes untrusted e-commerce text fields (`title`, `vendor`, `productType`, `tags`, `options`, `variants[].title`, `sku`)
- * so merchant/user-supplied JSON or HTML metadata can never inject raw HTML (`<script>`), Markdown phishing links (`[x](...)`),
- * multi-line block breakouts, or ATX headings (`# Heading` / `\n# Heading`).
+ * non-destructively so product characters (`<`, `>`, `&`, `[`, `]`, `*`, `_`, `#`, `~`, `` ` ``, `|`) are preserved via escaping
+ * rather than stripped, while HTML tags, entity smuggling, phishing links, emphasis breakouts, and ATX headings are impossible.
  */
 export function sanitizeCommerceField(raw: unknown, maxLen = 400): string {
   if (typeof raw !== 'string') return '';
-  let s = raw.includes('<') && /<[a-z!/]/i.test(raw) ? stripTagsInline(raw) : raw;
-  s = s
+  let s = raw
     .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
     .replace(
       /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]/gu,
@@ -69,11 +69,21 @@ export function sanitizeCommerceField(raw: unknown, maxLen = 400): string {
     .trim();
   if (!s) return '';
   if (s.length > maxLen) s = s.slice(0, maxLen).trim();
-  // Escape raw `<` -> `&lt;` so residual/unclosed `<img...` / `<script...` never renders as HTML
+  // Non-destructively escape HTML `&`, `<`, `>` so `<USB-C>` or `<script>` is preserved as text, never stripped or executed
+  if (s.includes('&')) {
+    s = s.replace(/&/g, '&amp;');
+  }
   if (s.includes('<')) {
     s = s.replace(/</g, '&lt;');
   }
-  // Neutralize `[` / `]` / `](` / `]:` phishing link breakouts across all Markdown dialects (including regex link matchers)
+  if (s.includes('>')) {
+    s = s.replace(/>/g, '&gt;');
+  }
+  // Scrub dangerous URI schemes in `[label](javascript:...)` before non-destructively escaping Markdown punctuation
+  if (s.includes('](')) {
+    s = s.replace(/\]\(\s*(?:javascript|vbscript|data|file|blob):[^)]*\)/gi, '](#)');
+  }
+  // Escape Markdown inline syntax (`[`, `]`, `(`, `)`, `*`, `_`, `~`, `` ` ``, `#`) non-destructively
   if (s.includes('[') || s.includes(']')) {
     s = s
       .replace(/\]\s*\(/g, '\\] \\(')
@@ -82,22 +92,69 @@ export function sanitizeCommerceField(raw: unknown, maxLen = 400): string {
       .replace(/(?<!\\)\[/g, '\\[')
       .replace(/(?<!\\)\]/g, '\\]');
   }
-  // Neutralize leading ATX heading `#` or blockquote `>` markers (and `#` segments embedded via former newlines)
-  if (s.startsWith('#')) {
-    s = `\\${s}`;
-  } else if (s.startsWith('>')) {
-    s = `\\${s}`;
+  if (s.includes('*')) {
+    s = s.replace(/(?<!\\)\*/g, '\\*');
   }
-  if (s.includes(' #')) {
-    s = s.replace(/ (#{1,6})(?=\s|$)/g, ' \\$1');
+  if (s.includes('_')) {
+    s = s.replace(/(?<!\\)_/g, '\\_');
+  }
+  if (s.includes('~')) {
+    s = s.replace(/(?<!\\)~/g, '\\~');
+  }
+  if (s.includes('`')) {
+    s = s.replace(/(?<!\\)`/g, '\\`');
+  }
+  if (s.includes('#')) {
+    s = s.replace(/(?<!\\)#/g, '\\#');
   }
   return s;
 }
 
+/**
+ * Sanitizes commerce timestamps (`publishedAt`, `updatedAt`) by stripping control/line-break characters and
+ * escaping HTML/Markdown-unsafe characters (`&`, `<`, `>`, `[`, `]`, `(`, `)`, `*`, `_`, `#`, `` ` ``, `|`).
+ */
+export function sanitizeCommerceTimestamp(raw: unknown, maxLen = 96): string | null {
+  if (typeof raw !== 'string') return null;
+  let s = raw
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(
+      /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]+/gu,
+      ' ',
+    )
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  if (!s) return null;
+  if (s.length > maxLen) s = s.slice(0, maxLen).trim();
+  s = s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .replace(/\*/g, '\\*')
+    .replace(/_/g, '\\_')
+    .replace(/#/g, '\\#')
+    .replace(/`/g, '\\`')
+    .replace(/\|/g, '&#124;');
+  return s || null;
+}
+
 function sanitizeCommerceSku(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
-  const clean = sanitizeCommerceField(raw, 160).replace(/[`|]/g, '');
+  const clean = sanitizeCommerceField(raw, 160);
   return clean || null;
+}
+
+function formatCommerceSkuDisplay(sku: string | null | undefined, escapePipesForProse = false): string {
+  if (!sku) return '`-`';
+  const prepared = escapePipesForProse ? sku.replace(/(?<!\\)\|/g, '\\|') : sku;
+  if (!prepared.includes('\\') && !prepared.includes('&') && !prepared.includes('|')) {
+    return `\`${prepared}\``;
+  }
+  return prepared;
 }
 
 function readHeaderCaseInsensitive(
@@ -185,13 +242,48 @@ export function resolveCustomDomainShopifyProductTwinUrl(
   };
 }
 
-function normalizeImageHttps(raw: unknown): string | null {
+/**
+ * Validates and normalizes a commerce image/asset URL to a strictly public `http(s)://` URL:
+ * rejects non-http(s) schemes, credentials (`user:pass@`), non-default ports (other than 80/443),
+ * `localhost`, `.local`, `.internal`, and all IPv4/IPv6/decimal/octal/hex IP literals (`isSafePublicHostname`).
+ */
+export function normalizePublicCommerceImageUrl(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
   const s = raw.trim();
-  if (!s) return null;
-  if (s.startsWith('//')) return `https:${s}`;
-  if (s.startsWith('https://') || s.startsWith('http://')) return s;
-  return null;
+  if (!s || s.length > 2048 || /[\u0000-\u0020\u007F-\u009F\\]/.test(s)) return null;
+  let candidate = s;
+  if (s.startsWith('//')) {
+    if (s.startsWith('///')) return null;
+    candidate = `https:${s}`;
+  } else if (!/^https:\/\//i.test(s)) {
+    return null;
+  }
+  let u: URL;
+  try {
+    u = new URL(candidate);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:') return null;
+  if (u.username || u.password) return null;
+  if (u.port !== '' && u.port !== '443') return null;
+  if (!isSafePublicHostname(u.hostname)) return null;
+  return u.toString();
+}
+
+function normalizeImageHttps(raw: unknown): string | null {
+  return normalizePublicCommerceImageUrl(raw);
+}
+
+function stripNonPublicMarkdownImages(md: string): string {
+  if (!md || !md.includes('![')) return md;
+  return md.replace(/!\[([^\]]*)\]\(([^)\r\n]+)\)/g, (full, _alt: string, destPart: string) => {
+    const trimmed = destPart.trim();
+    const rawDest = trimmed.startsWith('<')
+      ? trimmed.slice(1, trimmed.indexOf('>') > 0 ? trimmed.indexOf('>') : trimmed.length).trim()
+      : (trimmed.split(/\s+/)[0] ?? '');
+    return normalizePublicCommerceImageUrl(rawDest) ? full : '';
+  });
 }
 
 function parseShopifyMoney(raw: unknown, isAjaxJs: boolean): number | null {
@@ -413,8 +505,8 @@ export function normalizeShopifyProductRecord(
         ? rawProd.description
         : '';
   const descriptionText = stripTagsInline(bodyHtml);
-  const publishedAt = typeof rawProd.published_at === 'string' ? rawProd.published_at : null;
-  const updatedAt = typeof rawProd.updated_at === 'string' ? rawProd.updated_at : null;
+  const publishedAt = sanitizeCommerceTimestamp(rawProd.published_at);
+  const updatedAt = sanitizeCommerceTimestamp(rawProd.updated_at);
   const lean = opts?.fields === 'lean';
 
   return {
@@ -505,11 +597,12 @@ export function enrichShopifyProductFromJson(params: {
       : typeof prod.description === 'string'
         ? prod.description
         : '';
-  const bodyMd = bodyHtml ? htmlToMd(bodyHtml, params.productUrl).markdown.trim() : '';
+  const rawBodyMd = bodyHtml ? htmlToMd(bodyHtml, params.productUrl).markdown.trim() : '';
+  const bodyMd = stripNonPublicMarkdownImages(rawBodyMd).trim();
 
   const rows = record.variants.slice(0, 60).map((v) => [
     v.title ?? record.title,
-    `\`${v.sku || '-'}\``,
+    v.sku ? formatCommerceSkuDisplay(v.sku) : '`-`',
     formatMoneyDisplay(v.price, v.currency),
     v.compareAt !== null ? formatMoneyDisplay(v.compareAt, v.currency) : '-',
     formatVariantAvailability(v),
@@ -603,6 +696,9 @@ export function formatShopifyProductsFeedTwin(rawBody: string, origUrl: string):
     const availCount = r.variants.filter((v) => v.available === true).length;
     const anyKnownAvail = r.variants.some((v) => v.available !== null);
     const availCell = anyKnownAvail ? `${availCount}/${r.variants.length} in stock` : `${r.variants.length} variants`;
+    const updatedDisplay = r.updatedAt
+      ? (/^\d{4}-\d{2}-\d{2}/.exec(r.updatedAt)?.[0] ?? r.updatedAt)
+      : '-';
     return [
       `[${r.title}](${r.url})`,
       r.vendor ?? '-',
@@ -610,7 +706,7 @@ export function formatShopifyProductsFeedTwin(rawBody: string, origUrl: string):
       String(r.variants.length),
       priceCell,
       availCell,
-      r.updatedAt ? r.updatedAt.slice(0, 10) : '-',
+      updatedDisplay,
     ];
   });
 
@@ -809,11 +905,14 @@ export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId =
           : availRaw.split('/').pop() || '-';
     rows.push([
       vTitle ?? title,
-      sku ? `\`${sku}\`` : '-',
+      sku ? formatCommerceSkuDisplay(sku) : '-',
       price !== null ? `${vCur ?? 'USD'} ${price.toFixed(2)}` : '-',
       statusText,
     ]);
   }
+
+  const publishedAt = sanitizeCommerceTimestamp(prodLd.releaseDate ?? prodLd.datePublished);
+  const updatedAt = sanitizeCommerceTimestamp(prodLd.dateModified);
 
   const record: CatalogRecord = {
     platform: 'shopify',
@@ -826,8 +925,8 @@ export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId =
     productType: typeof prodLd.category === 'string' ? sanitizeCommerceField(prodLd.category, 200) || null : null,
     tags: [],
     descriptionText: desc,
-    publishedAt: null,
-    updatedAt: null,
+    publishedAt,
+    updatedAt,
     images: [],
     options: [],
     variants,
@@ -836,7 +935,7 @@ export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId =
   const bullets: string[] = [];
   if (brand) bullets.push(`- **Brand**: ${brand}`);
   const cleanTopSku = sanitizeCommerceSku(prodLd.sku);
-  if (cleanTopSku) bullets.push(`- **SKU**: \`${cleanTopSku}\``);
+  if (cleanTopSku) bullets.push(`- **SKU**: ${formatCommerceSkuDisplay(cleanTopSku, true)}`);
 
   const sections = [`# ${title}`];
   if (bullets.length > 0) sections.push(bullets.join('\n'));
@@ -924,10 +1023,8 @@ export function normalizeWooCommerceProductRecord(
 
   const productId = String(rawProd.id ?? '');
   const handle = typeof rawProd.slug === 'string' && rawProd.slug.trim() ? rawProd.slug.trim() : productId;
-  const url =
-    typeof rawProd.permalink === 'string' && rawProd.permalink.startsWith('http')
-      ? rawProd.permalink
-      : `${cleanOrigin}/product/${encodeURIComponent(handle)}/`;
+  const safePermalink = normalizePublicCommerceImageUrl(rawProd.permalink);
+  const url = safePermalink ?? `${cleanOrigin}/product/${encodeURIComponent(handle)}/`;
 
   const prices = (rawProd.prices as Record<string, unknown> | undefined) ?? {};
   const minorUnit =
@@ -969,7 +1066,7 @@ export function normalizeWooCommerceProductRecord(
   if (Array.isArray(rawProd.images)) {
     const seenImg = new Set<string>();
     for (const img of rawProd.images as Array<Record<string, unknown>>) {
-      const src = typeof img?.src === 'string' && img.src.startsWith('http') ? img.src : '';
+      const src = normalizePublicCommerceImageUrl(img?.src ?? img?.url);
       if (src && !seenImg.has(src)) {
         seenImg.add(src);
         images.push(src);
@@ -1037,6 +1134,8 @@ export function normalizeWooCommerceProductRecord(
 
   const descHtml = String(rawProd.description || rawProd.short_description || '');
   const descriptionText = stripTagsInline(descHtml);
+  const publishedAt = sanitizeCommerceTimestamp(rawProd.date_created_gmt ?? rawProd.date_created ?? rawProd.published_at);
+  const updatedAt = sanitizeCommerceTimestamp(rawProd.date_modified_gmt ?? rawProd.date_modified ?? rawProd.updated_at);
   const lean = opts?.fields === 'lean';
 
   return {
@@ -1050,8 +1149,8 @@ export function normalizeWooCommerceProductRecord(
     productType,
     tags,
     ...(!lean ? { descriptionText } : {}),
-    publishedAt: null,
-    updatedAt: null,
+    publishedAt,
+    updatedAt,
     ...(!lean ? { images } : {}),
     options,
     variants,
@@ -1083,8 +1182,8 @@ export function enrichWooCommerceProductFromStoreApi(params: {
   if (!rec) return null;
 
   const descHtml = typeof matched.description === 'string' ? matched.description : '';
-  const apiBodyMd = descHtml ? params.htmlToMd(descHtml, params.productUrl).markdown.trim() : '';
-  const cleanedFallbackMd = (params.fallbackBodyMd ?? '').replace(/^#\s+[^\n]+\n+/, '').trim();
+  const apiBodyMd = descHtml ? stripNonPublicMarkdownImages(params.htmlToMd(descHtml, params.productUrl).markdown).trim() : '';
+  const cleanedFallbackMd = stripNonPublicMarkdownImages((params.fallbackBodyMd ?? '').replace(/^#\s+[^\n]+\n+/, '')).trim();
   const bodyMd = apiBodyMd.length >= 80 ? apiBodyMd : cleanedFallbackMd || apiBodyMd;
 
   const metaLines: string[] = [];
@@ -1094,7 +1193,7 @@ export function enrichWooCommerceProductFromStoreApi(params: {
 
   const rows = rec.variants.map((v) => [
     v.title ?? rec.title,
-    `\`${v.sku || '-'}\``,
+    v.sku ? formatCommerceSkuDisplay(v.sku) : '`-`',
     v.price !== null ? `${v.currency ?? 'USD'} ${v.price.toFixed(2)}` : '-',
     v.compareAt !== null ? `${v.currency ?? 'USD'} ${v.compareAt.toFixed(2)}` : '-',
     v.available === true ? 'In Stock' : v.available === false ? 'Out of Stock' : '-',
@@ -1103,6 +1202,8 @@ export function enrichWooCommerceProductFromStoreApi(params: {
   return {
     title: rec.title,
     ...(rec.descriptionText ? { description: rec.descriptionText.slice(0, 260) } : {}),
+    ...(rec.vendor ? { author: rec.vendor } : {}),
+    ...(rec.publishedAt ? { publishedTime: rec.publishedAt } : {}),
     markdown: [
       `# ${rec.title}`,
       metaLines.length > 0 ? metaLines.join('\n') : '',
@@ -1153,7 +1254,13 @@ export function formatWcStoreApiListTwin(rawBody: string, origUrl: string): Twin
     const priceStr =
       v0?.price !== null && v0?.price !== undefined ? `${v0.currency ?? 'USD'} ${v0.price.toFixed(2)}` : '-';
     const stockStr = v0?.available === true ? 'In Stock' : v0?.available === false ? 'Out of Stock' : '-';
-    return [`[${r.title}](${r.url})`, `\`${v0?.sku || '-'}\``, r.productType || '-', priceStr, stockStr];
+    return [
+      `[${r.title}](${r.url})`,
+      v0?.sku ? formatCommerceSkuDisplay(v0.sku) : '`-`',
+      r.productType || '-',
+      priceStr,
+      stockStr,
+    ];
   });
 
   const tableMd =
@@ -1186,16 +1293,18 @@ export function formatWcStoreApiProductTwin(
   const rec = normalizeWooCommerceProductRecord(obj, origUrl);
   if (!rec) return null;
   const descHtml = typeof obj.description === 'string' ? obj.description : '';
-  const bodyMd = descHtml ? htmlToMd(descHtml, origUrl).markdown.trim() : '';
+  const bodyMd = descHtml ? stripNonPublicMarkdownImages(htmlToMd(descHtml, origUrl).markdown).trim() : '';
   const rows = rec.variants.map((v) => [
     v.title ?? rec.title,
-    `\`${v.sku || '-'}\``,
+    v.sku ? formatCommerceSkuDisplay(v.sku) : '`-`',
     v.price !== null ? `${v.currency ?? 'USD'} ${v.price.toFixed(2)}` : '-',
     v.available === true ? 'In Stock' : v.available === false ? 'Out of Stock' : '-',
   ]);
   return {
     title: rec.title,
     ...(rec.descriptionText ? { description: rec.descriptionText.slice(0, 260) } : {}),
+    ...(rec.vendor ? { author: rec.vendor } : {}),
+    ...(rec.publishedAt ? { publishedTime: rec.publishedAt } : {}),
     markdown: [
       `# ${rec.title}`,
       formatGfmTable(['Variant', 'SKU', 'Price', 'Stock'], rows),
@@ -1225,14 +1334,16 @@ export function extractWooCommerceProductHtml(
   const clean = stripScriptsAndStyles(rawHtml);
 
   const rawTitle =
-    (typeof prodLd?.name === 'string' ? prodLd.name.trim() : '') ||
-    stripTagsInline(findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'product_title')) ?? '');
+    typeof prodLd?.name === 'string' && prodLd.name.trim()
+      ? prodLd.name.trim()
+      : stripTagsInline(findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'product_title')) ?? '');
   const title = sanitizeCommerceField(rawTitle, 400);
   if (!title) return null;
 
   const rawSku =
-    (typeof prodLd?.sku === 'string' && prodLd.sku.trim() ? prodLd.sku.trim() : '') ||
-    stripTagsInline(findElementInnerLinear(clean, 'span', (a) => attrHasTokenLinear(a, 'class', 'sku')) ?? '');
+    typeof prodLd?.sku === 'string' && prodLd.sku.trim()
+      ? prodLd.sku.trim()
+      : stripTagsInline(findElementInnerLinear(clean, 'span', (a) => attrHasTokenLinear(a, 'class', 'sku')) ?? '');
   const sku = sanitizeCommerceSku(rawSku) ?? '';
 
   const rawOffers = prodLd?.offers;
@@ -1254,6 +1365,13 @@ export function extractWooCommerceProductHtml(
 
   if (price === null && !sku && !desc) return null;
 
+  const ldImgRaw = Array.isArray(prodLd?.image) ? prodLd.image[0] : prodLd?.image;
+  const safeImg = normalizePublicCommerceImageUrl(
+    typeof ldImgRaw === 'string' ? ldImgRaw : (ldImgRaw as Record<string, unknown> | undefined)?.url,
+  );
+  const publishedAt = sanitizeCommerceTimestamp(prodLd?.releaseDate ?? prodLd?.datePublished);
+  const updatedAt = sanitizeCommerceTimestamp(prodLd?.dateModified);
+
   const parts = url.pathname.split('/').filter(Boolean);
   const handle = parts[parts.length - 1] ?? title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
   const record: CatalogRecord = {
@@ -1267,9 +1385,9 @@ export function extractWooCommerceProductHtml(
     productType: null,
     tags: [],
     descriptionText: desc,
-    publishedAt: null,
-    updatedAt: null,
-    images: [],
+    publishedAt,
+    updatedAt,
+    images: safeImg ? [safeImg] : [],
     options: [],
     variants: [
       {
@@ -1282,13 +1400,13 @@ export function extractWooCommerceProductHtml(
         currency,
         available,
         grams: null,
-        image: null,
+        image: safeImg,
       },
     ],
   };
 
   const bullets: string[] = [];
-  if (sku) bullets.push(`- **SKU**: \`${sku}\``);
+  if (sku) bullets.push(`- **SKU**: ${formatCommerceSkuDisplay(sku, true)}`);
   if (price !== null) bullets.push(`- **Price**: ${currency ?? 'USD'} ${price.toFixed(2)}`);
   if (available !== null) bullets.push(`- **Availability**: ${available ? 'In Stock' : 'Out of Stock'}`);
 

@@ -1044,15 +1044,15 @@ export class AgentHubEngine {
         return {
           ok: false,
           status: 503,
-          error: 'fat_agent_required',
+          error: 'browser_worker_required',
           message: wantSite
-            ? `Worker node '${wantSite}' is offline or does not advertise browser-v1`
-            : 'Headless browser rendering / interact requires at least one connected browser-v1 worker node',
+            ? `Worker node '${wantSite}' is offline or does not have browser rendering enabled (enable allow_no_sandbox_browser in the Home Assistant add-on configuration, or connect a worker with Chromium enabled).`
+            : 'Browser rendering is not enabled on any connected worker node. Enable allow_no_sandbox_browser in the Home Assistant add-on configuration, or connect a worker with Chromium enabled.',
         };
       }
       const msg = wantSite
-        ? `HAOS agent site '${wantSite}' is not connected`
-        : 'no HAOS remote agents are currently connected';
+        ? `Worker node '${wantSite}' is not connected`
+        : 'No remote worker nodes are currently connected';
       return { ok: false, status: 503, error: 'no_agents', message: msg };
     }
 
@@ -1691,7 +1691,12 @@ export async function routeFetchWithFailover(params: {
     };
   }
   if (!agentOut.ok) {
-    if (agentOut.status === 400 || agentOut.status === 413 || agentOut.error === 'fat_agent_required') {
+    if (
+      agentOut.status === 400 ||
+      agentOut.status === 413 ||
+      agentOut.error === 'browser_worker_required' ||
+      agentOut.error === 'fat_agent_required'
+    ) {
       return Response.json(
         { error: agentOut.error, message: agentOut.message },
         { status: agentOut.status, headers: { 'cache-control': 'no-store' } },

@@ -486,6 +486,16 @@ function renderDashboardHtml(params: {
       </section>
     </div>
 
+    <section class="card" id="users-card" style="display:none">
+      <h2>
+        <span>Hub Users &amp; Stored OAuth Tokens (<span id="users-count">0</span> users &middot; <span id="users-total-tokens">0</span> stored token rows)</span>
+      </h2>
+      <table>
+        <thead><tr><th>User</th><th>Role</th><th>Stored Token Rows (Active / Used)</th><th>Active Grants</th><th>Last Login</th></tr></thead>
+        <tbody id="users-tbody"><tr><td colspan="5" class="muted">No users registered yet</td></tr></tbody>
+      </table>
+    </section>
+
     <section class="card" id="mcp-connectors">
       <h2>
         <span>MCP Registry &amp; Encrypted Connectors (<span id="mcp-conn-count">0</span> connected)</span>
@@ -832,6 +842,35 @@ function renderDashboardHtml(params: {
             '<td><button type="button" class="danger" data-revoke="' + esc(g.grantId) + '">Revoke</button></td></tr>'
           ).join('')
         : '<tr><td colspan="4" class="muted">No OAuth 2.1 grants issued yet</td></tr>';
+
+      const usersCard = el('users-card');
+      const usersList = Array.isArray(data.users) ? data.users : [];
+      if (usersCard && data.viewer && data.viewer.role === 'owner') {
+        usersCard.style.display = 'block';
+        el('users-count').textContent = usersList.length;
+        const sumStoredTokens =
+          typeof data.totalStoredTokens === 'number'
+            ? data.totalStoredTokens
+            : usersList.reduce((acc, u) => acc + Number(u.storedTokenCount ?? u.tokenCount ?? 0), 0);
+        el('users-total-tokens').textContent = sumStoredTokens;
+        el('users-tbody').innerHTML = usersList.length
+          ? usersList.map((u) => {
+              const totalTok = Number(u.storedTokenCount ?? u.tokenCount ?? 0);
+              const activeTok = Number(u.activeTokenCount ?? 0);
+              const usedTok = Number(u.usedTokenCount ?? 0);
+              const gCount = Number(u.grantCount ?? 0);
+              return '<tr>' +
+                '<td><strong>' + esc(u.githubLogin ? '@' + u.githubLogin : u.userId) + '</strong> <span class="muted">(<code>' + esc(u.userId) + '</code>)</span></td>' +
+                '<td><span class="badge ' + (u.role === 'owner' ? 'lvl-info' : 'cat') + '">' + esc(u.role) + '</span></td>' +
+                '<td><strong>' + totalTok + '</strong> <span class="muted">(' + activeTok + ' active / ' + usedTok + ' used)</span></td>' +
+                '<td>' + gCount + '</td>' +
+                '<td>' + esc(relTime(u.lastLoginAt)) + '</td>' +
+              '</tr>';
+            }).join('')
+          : '<tr><td colspan="5" class="muted">No GitHub users registered yet</td></tr>';
+      } else if (usersCard) {
+        usersCard.style.display = 'none';
+      }
 
       renderMcpConnectors(data.mcpServers || [], Boolean(data.vaultConfigured));
       renderLogs();
@@ -1650,12 +1689,24 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       deps.getUpdateStatus ? deps.getUpdateStatus(state.agents).catch(() => undefined) : Promise.resolve(undefined),
       deps.getTelemetrySettings ? deps.getTelemetrySettings().catch(() => undefined) : Promise.resolve(undefined),
     ]);
-    const users = rawUsers.map(({ encryptedGhToken: _omitGhSecret, ...u }) => u);
+    const users = rawUsers.map(({ encryptedGhToken: _omitGhSecret, ...u }) => {
+      const storedTokenCount = Number(u.storedTokenCount ?? u.tokenCount ?? 0);
+      return {
+        ...u,
+        tokenCount: storedTokenCount,
+        storedTokenCount,
+        activeTokenCount: Number(u.activeTokenCount ?? 0),
+        usedTokenCount: Number(u.usedTokenCount ?? 0),
+        grantCount: Number(u.grantCount ?? 0),
+      };
+    });
+    const totalStoredTokens = users.reduce((sum, u) => sum + u.storedTokenCount, 0);
     return adminJson(
       {
         ...state,
         viewer,
         users,
+        totalStoredTokens,
         userId,
         vaultConfigured,
         mcpServers,
@@ -1664,6 +1715,26 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
       },
       200,
     );
+  }
+
+  if (path === '/admin/api/users' && request.method === 'GET') {
+    if (session.role !== 'owner') {
+      return adminJson({ error: 'forbidden_role', message: 'Owner role required' }, 403);
+    }
+    const rawUsers = await Promise.resolve(deps.oauthStore.listUsers?.() ?? []);
+    const users = rawUsers.map(({ encryptedGhToken: _omitGhSecret, ...u }) => {
+      const storedTokenCount = Number(u.storedTokenCount ?? u.tokenCount ?? 0);
+      return {
+        ...u,
+        tokenCount: storedTokenCount,
+        storedTokenCount,
+        activeTokenCount: Number(u.activeTokenCount ?? 0),
+        usedTokenCount: Number(u.usedTokenCount ?? 0),
+        grantCount: Number(u.grantCount ?? 0),
+      };
+    });
+    const totalStoredTokens = users.reduce((sum, u) => sum + u.storedTokenCount, 0);
+    return adminJson({ ok: true, users, totalStoredTokens }, 200);
   }
 
   if (path === '/admin/api/mcp/registry' && request.method === 'GET') {
@@ -1769,12 +1840,20 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         ? await unsealVaultCredentials({
             vaultMasterKey: deps.vaultMasterKey,
             userId,
+            id: completed.server.id,
+            slug: completed.server.slug,
+            authType: completed.server.authType,
+            secretVersion: completed.server.secretVersion,
             remoteOrigin: completed.server.remoteOrigin,
             remoteUrl: completed.server.remoteUrl,
             ciphertext: completed.server.encryptedCredentials,
           })
         : null;
       if (unsealed?.ok) {
+        if (unsealed.resealedCiphertext) {
+          completed.server.encryptedCredentials = unsealed.resealedCiphertext;
+          completed.server.secretVersion = unsealed.resealedSecretVersion ?? 2;
+        }
         const listed = await testAndListRemoteMcpTools({
           remoteUrl: completed.server.remoteUrl,
           secret: unsealed.payload,
@@ -1784,6 +1863,8 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         if (listed.ok) {
           completed.server.cachedTools = listed.tools;
           completed.server.toolCount = listed.tools.length;
+          await deps.vaultStore.upsertServer(completed.server);
+        } else if (unsealed.resealedCiphertext) {
           await deps.vaultStore.upsertServer(completed.server);
         }
       }
@@ -1948,16 +2029,24 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           const existing = await deps.vaultStore.getServer(userId, body.slug.trim());
           if (!existing) return adminJson({ ok: false, error: 'mcp_server_not_found' }, 404);
           let secret: VaultSecretPayload | null = { kind: 'none', pinnedOrigin: existing.remoteOrigin };
+          let resealedCiphertext: string | undefined;
+          let resealedSecretVersion: number | undefined;
           if (existing.encryptedCredentials && existing.authType !== 'none') {
             const unsealed = await unsealVaultCredentials({
               vaultMasterKey: deps.vaultMasterKey,
               userId,
+              id: existing.id,
+              slug: existing.slug,
+              authType: existing.authType,
+              secretVersion: existing.secretVersion,
               remoteOrigin: existing.remoteOrigin,
               remoteUrl: existing.remoteUrl,
               ciphertext: existing.encryptedCredentials,
             });
             if (!unsealed.ok) return adminJson({ ok: false, error: unsealed.error, message: unsealed.message }, 500);
             secret = unsealed.payload;
+            resealedCiphertext = unsealed.resealedCiphertext;
+            resealedSecretVersion = unsealed.resealedSecretVersion;
           }
           const tested = await testAndListRemoteMcpTools({
             remoteUrl: existing.remoteUrl,
@@ -1967,11 +2056,21 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           });
           const now = Date.now();
           if (!tested.ok) {
-            await deps.vaultStore.upsertServer({ ...existing, lastError: tested.message.slice(0, 240), updatedAt: now });
+            await deps.vaultStore.upsertServer({
+              ...existing,
+              ...(resealedCiphertext
+                ? { encryptedCredentials: resealedCiphertext, secretVersion: resealedSecretVersion ?? 2 }
+                : {}),
+              lastError: tested.message.slice(0, 240),
+              updatedAt: now,
+            });
             return adminJson({ ok: false, error: tested.error, message: tested.message }, tested.status);
           }
           const updated: StoredMcpServerRow = {
             ...existing,
+            ...(resealedCiphertext
+              ? { encryptedCredentials: resealedCiphertext, secretVersion: resealedSecretVersion ?? 2 }
+              : {}),
             cachedTools: tested.tools,
             toolCount: tested.tools.length,
             lastVerifiedAt: now,
@@ -2059,23 +2158,10 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         const domains = domValidation.domains;
 
         const hasSecrets = Object.keys(hdrCheck.headers).length > 0;
+        const authType = hasSecrets ? ('headers' as const) : ('none' as const);
         const secretPayload: VaultSecretPayload = hasSecrets
           ? { kind: 'headers', pinnedOrigin: urlCheck.origin, pinnedUrl: urlCheck.normalized, headers: hdrCheck.headers }
           : { kind: 'none', pinnedOrigin: urlCheck.origin, pinnedUrl: urlCheck.normalized };
-
-        let encryptedCredentials: string | null = null;
-        if (hasSecrets) {
-          const sealed = await sealVaultCredentials({
-            vaultMasterKey: deps.vaultMasterKey,
-            userId,
-            remoteOrigin: urlCheck.origin,
-            payload: secretPayload,
-          });
-          if (!sealed.ok) {
-            return adminJson(sealed, sealed.status);
-          }
-          encryptedCredentials = sealed.ciphertext;
-        }
 
         const cleanName =
           stripInvisibleSmugglingChars(typeof body.name === 'string' ? body.name : '').trim().slice(0, 120) ||
@@ -2084,6 +2170,27 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
 
         const now = Date.now();
         const existing = await deps.vaultStore.getServer(userId, slug);
+        const serverId = existing?.id ?? `mcp_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
+
+        let encryptedCredentials: string | null = null;
+        let secretVersion = 2;
+        if (hasSecrets) {
+          const sealed = await sealVaultCredentials({
+            vaultMasterKey: deps.vaultMasterKey,
+            userId,
+            id: serverId,
+            slug,
+            authType,
+            remoteOrigin: urlCheck.origin,
+            payload: secretPayload,
+          });
+          if (!sealed.ok) {
+            return adminJson(sealed, sealed.status);
+          }
+          encryptedCredentials = sealed.ciphertext;
+          secretVersion = sealed.secretVersion;
+        }
+
         let cachedTools = existing?.cachedTools ?? [];
         let lastVerifiedAt = existing?.lastVerifiedAt ?? null;
         let lastError: string | null = null;
@@ -2107,14 +2214,15 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
 
         const row: StoredMcpServerRow = {
-          id: existing?.id ?? `mcp_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`,
+          id: serverId,
           userId,
           slug,
           name: cleanName,
           remoteUrl: urlCheck.normalized,
           remoteOrigin: urlCheck.origin,
           transport: body.transport === 'sse' ? 'sse' : 'streamable-http',
-          authType: hasSecrets ? 'headers' : 'none',
+          authType,
+          secretVersion,
           encryptedCredentials,
           authSummary: buildMaskedAuthSummary(secretPayload),
           domains,
@@ -2174,18 +2282,65 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
     const isImmutableFounderTarget = (targetId: string): boolean =>
       targetId === 'owner' || (configuredFounderUserId !== null && targetId === configuredFounderUserId);
 
-    const disableAndRevokeTargetUser = async (existingUser: HubUserRecord): Promise<void> => {
-      const nextEpoch = (existingUser.sessionEpoch ?? 1) + 1;
-      await deps.oauthStore.upsertUser?.({
-        ...existingUser,
-        role: 'member',
-        disabled: true,
-        sessionEpoch: nextEpoch,
-        admittedVia: undefined,
-        admittedOrg: undefined,
-        encryptedGhToken: undefined,
-        orgVerifiedAt: undefined,
-      });
+    const disableAndRevokeTargetUser = async (
+      existingUser: HubUserRecord,
+      opts?: { allowAlreadyDisabled?: boolean },
+    ): Promise<{ ok: true } | { ok: false; status: number; error: string; message?: string }> => {
+      if (deps.oauthStore.upsertUser) {
+        const saved = await deps.oauthStore.upsertUser({
+          ...existingUser,
+          role: 'member',
+          disabled: true,
+          admittedVia: undefined,
+          admittedOrg: undefined,
+          encryptedGhToken: undefined,
+          orgVerifiedAt: undefined,
+          mutationKind: 'admin_disable',
+          callerIsImmutableFounder: isImmutableFounderCaller,
+          configuredFounderUserId,
+          allowAlreadyDisabled: opts?.allowAlreadyDisabled === true,
+        });
+        if (saved.mutationAborted) {
+          if (saved.disableFailedReason === 'founder_protected') {
+            return {
+              ok: false,
+              status: 403,
+              error: 'founder_protected',
+              message: 'Immutable founder/owner cannot be disabled, demoted, or modified',
+            };
+          }
+          if (saved.disableFailedReason === 'owner_protected' || (saved.role === 'owner' && !isImmutableFounderCaller)) {
+            return {
+              ok: false,
+              status: 403,
+              error: 'owner_protected',
+              message: 'Only the immutable founder may promote, disable, demote, or delete an owner account',
+            };
+          }
+          return { ok: false, status: 404, error: 'user_not_found' };
+        }
+      }
+      if (deps.metaDb) {
+        await deps.metaDb
+          .prepare(
+            `UPDATE users
+                SET role = 'member',
+                    promoted_by_owner_id = NULL,
+                    disabled = 1,
+                    session_epoch = COALESCE(session_epoch, 1) + 1,
+                    admitted_via = NULL,
+                    admitted_org = NULL,
+                    encrypted_gh_token = NULL,
+                    org_verified_at = NULL
+              WHERE user_id = ?1
+                AND user_id != 'owner'
+                AND (?2 = '' OR user_id != ?2)
+                AND (?3 = 1 OR role != 'owner')`,
+          )
+          .bind(existingUser.userId, configuredFounderUserId ?? '', isImmutableFounderCaller ? 1 : 0)
+          .run()
+          .catch(() => undefined);
+      }
       const userGrants = await Promise.resolve(deps.oauthStore.listGrants(Date.now(), existingUser.userId)).catch(() => []);
       for (const g of userGrants) {
         await Promise.resolve(deps.revokeGrant(g.grantId, existingUser.userId)).catch(() => false);
@@ -2196,15 +2351,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           await Promise.resolve(deps.vaultStore.deleteServer(existingUser.userId, s.slug)).catch(() => false);
         }
       }
-      if (deps.metaDb) {
-        await deps.metaDb
-          .prepare(
-            'UPDATE users SET role = ?1, disabled = 1, session_epoch = ?2, admitted_via = NULL, admitted_org = NULL, encrypted_gh_token = NULL, org_verified_at = NULL WHERE user_id = ?3',
-          )
-          .bind('member', nextEpoch, existingUser.userId)
-          .run()
-          .catch(() => undefined);
-      }
+      return { ok: true };
     };
 
     if ((path === '/admin/api/users/role' && request.method === 'POST') || isUserItemPatch) {
@@ -2269,7 +2416,19 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
           );
         }
         if (wantsDisable) {
-          await disableAndRevokeTargetUser(existingTarget);
+          const disRes = await disableAndRevokeTargetUser(existingTarget);
+          if (!disRes.ok) {
+            span.setAttributes({
+              'admin.target_user_id': targetUserId,
+              'admin.outcome': disRes.error,
+              'http.response.status_code': disRes.status,
+            });
+            span.setStatus(false, disRes.error);
+            return adminJson(
+              { ok: false, error: disRes.error, ...(disRes.message ? { message: disRes.message } : {}) },
+              disRes.status,
+            );
+          }
           span.setAttributes({
             'admin.target_user_id': targetUserId,
             'admin.outcome': 'disabled',
@@ -2279,9 +2438,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         }
         const promotedByOwnerId =
           targetRole === 'owner'
-            ? /^[1-9][0-9]{0,19}$/.test(envOwnerId)
-              ? envOwnerId
-              : 'owner'
+            ? session.userId === 'owner'
+              ? 'owner'
+              : configuredFounderUserId !== null && session.userId === configuredFounderUserId
+                ? envOwnerId
+                : 'owner'
             : null;
         let updated = false;
         if (deps.oauthStore.upsertUser) {
@@ -2376,7 +2537,19 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
             403,
           );
         }
-        await disableAndRevokeTargetUser(existingUser);
+        const delRes = await disableAndRevokeTargetUser(existingUser, { allowAlreadyDisabled: true });
+        if (!delRes.ok) {
+          span.setAttributes({
+            'admin.target_user_id': targetUserId,
+            'admin.outcome': delRes.error,
+            'http.response.status_code': delRes.status,
+          });
+          span.setStatus(false, delRes.error);
+          return adminJson(
+            { ok: false, error: delRes.error, ...(delRes.message ? { message: delRes.message } : {}) },
+            delRes.status,
+          );
+        }
         span.setAttributes({
           'admin.target_user_id': targetUserId,
           'admin.outcome': 'deleted',

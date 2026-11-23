@@ -130,10 +130,10 @@ test('R7-H7: Sanitizer & Markdown differential hardening (ordered-list 2., fence
     }
   }
 
-  // 3. Unambiguous single-line inline code spans preserve `<` while fenced code blocks stay verbatim (`R9-H1`)
+  // 3. Inline code spans escape `<` -> `&lt;` fail-closed while fenced code blocks stay verbatim (`S1`)
   assert.equal(
     sanitizeInlineHtmlInMarkdown('Use `Array<string>` and `<svg>` in docs.'),
-    'Use `Array<string>` and `<svg>` in docs.',
+    'Use `Array&lt;string>` and `&lt;svg>` in docs.',
   );
 
   // 4. Truncation mid-inline-code-span (`A1`) and mid-fenced-code-block closes cleanly

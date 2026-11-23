@@ -482,13 +482,27 @@ function validateTwin(manifest, twin, ctxPath) {
     if (!fu.startsWith('https://') && !fu.startsWith('{origin}/')) {
       throw new Error(`${ctxPath}.fetchUrl: must start with https:// (got "${fu}")`);
     }
-    const hasWildcard = Boolean(manifest.universalEngine) || manifest.domains.some((d) => d.includes('*'));
-    if ((fu.includes('{host}') || fu.includes('{origin}')) && hasWildcard) {
-      if (!fu.startsWith('https://{host}/') && !fu.startsWith('{origin}/')) {
-        throw new Error(`${ctxPath}.fetchUrl: {host}/{origin} must be same-origin on wildcard/universal adapters (M2)`);
+    if (fu.includes('{host}') || fu.includes('{origin}')) {
+      if (
+        (!fu.startsWith('https://{host}/') && !fu.startsWith('{origin}/')) ||
+        fu.startsWith('https://{host}//') ||
+        fu.startsWith('{origin}//')
+      ) {
+        throw new Error(`${ctxPath}.fetchUrl: {host}/{origin} must be bound strictly to https://{host}/... or {origin}/... (M2)`);
+      }
+      const restAfterOrigin = fu.startsWith('https://{host}/') ? fu.slice('https://{host}/'.length) : fu.slice('{origin}/'.length);
+      if (restAfterOrigin.includes('{origin}')) {
+        throw new Error(`${ctxPath}.fetchUrl: {origin} must not appear more than once in "${fu}" (M2)`);
+      }
+      const dynSample = fu
+        .replace(/^https:\/\/\{host\}\//, 'https://example.com/')
+        .replace(/^\{origin\}\//, 'https://example.com/')
+        .replace(/\{[A-Za-z0-9_]+\}/g, 'sample');
+      if (!isSafePublicHost(dynSample) || new URL(dynSample).hostname.toLowerCase() !== 'example.com') {
+        throw new Error(`${ctxPath}.fetchUrl: failed same-origin public HTTPS check ("${fu}")`);
       }
     }
-    if (!fu.startsWith('https://{host}') && !fu.startsWith('{origin}')) {
+    if (!fu.startsWith('https://{host}/') && !fu.startsWith('{origin}/')) {
       const sample = fu.replace(/\{[A-Za-z0-9_]+\}/g, 'sample');
       if (!isSafePublicHost(sample)) {
         throw new Error(`${ctxPath}.fetchUrl: failed public HTTPS host check ("${fu}")`);

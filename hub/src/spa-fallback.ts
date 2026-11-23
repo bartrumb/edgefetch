@@ -5,11 +5,11 @@
  *  1. EdgeFetch ALWAYS runs its own fast ethical path first (`robots.txt` -> HTTP/2 -> ATS/Site twins -> Next.js RSC /
  *     `__NEXT_DATA__` / Nuxt SSR hydration -> local `browser-v1` CDP Chromium with `networkidle` + Shadow DOM).
  *  2. External SPA providers (`CRAWL4AI_API_URL` and/or `FIRECRAWL_API_URL` + `FIRECRAWL_API_KEY`) are invoked ONLY when:
- *      - Local EdgeFetch nodes lack a browser (`fat_agent_required`), timed out / crashed (`status === 0` / `5xx`), OR
+ *      - Local EdgeFetch nodes lack a browser (`browser_worker_required` / legacy `fat_agent_required`), timed out / crashed (`status === 0` / `5xx`), OR
  *        yielded an unhydrated thin `<script>` SPA shell (`< 50` words on `200 OK`), AND
  *      - The target URL is strictly eligible: **NEVER** on `robots.txt` disallows, **NEVER** on `401`/`403`/`404`/`410`/`429`,
  *        **NEVER** on WAF / CAPTCHA / anti-bot challenges, and **NEVER** on login walls!
- *  3. If local nodes never reached `/robots.txt` (e.g. `503 fat_agent_required` when only Lite nodes are connected),
+ *  3. If local nodes never reached `/robots.txt` (e.g. `503 browser_worker_required` when only Lite nodes are connected),
  *     `tryExternalSpaFallback` fetches and enforces `/robots.txt` first before calling Crawl4AI or Firecrawl.
  */
 
@@ -112,8 +112,8 @@ export function isEligibleForExternalSpaFallback(params: {
     return false;
   }
 
-  // Case 1: Hub had no `browser-v1` Fat agent connected (`503 fat_agent_required`).
-  if (errorCode === 'fat_agent_required') return true;
+  // Case 1: Hub had no `browser-v1` worker connected (`503 browser_worker_required` or legacy `fat_agent_required`).
+  if (errorCode === 'browser_worker_required' || errorCode === 'fat_agent_required') return true;
 
   // Case 2: Local node / Chromium timed out, ran out of RAM on a heavy SPA bundle (`status === 0`), or hit `502`/`503`/`504`.
   if (outcome === 'error' && (code === 0 || code === 500 || code === 502 || code === 503 || code === 504)) {

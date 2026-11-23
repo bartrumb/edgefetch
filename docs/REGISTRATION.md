@@ -82,7 +82,7 @@ EdgeFetch's keyless open-data adapters (`sec-edgar`, `openalex`, `crossref-doi`,
 
 ### 1. Official MCP Registry (`registry.modelcontextprotocol.io` — **LIVE**)
 
-EdgeFetch is **live (`active`, `v2.7.5`)** on the [Official MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=edgefetch) as **`io.github.bartrumb/edgefetch`**, published automatically via GitHub OIDC inside `.github/workflows/release.yml` on every signed `v*` tag using [`server.json`](../server.json) (schema `2025-12-11`, pinned to `ghcr.io/bartrumb/edgefetch-agent:2.7.5` with `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"`).
+EdgeFetch is **live (`active`, `v2.7.6`)** on the [Official MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=edgefetch) as **`io.github.bartrumb/edgefetch`**, published automatically via GitHub OIDC inside `.github/workflows/release.yml` on every signed `v*` tag using [`server.json`](../server.json) (schema `2025-12-11`, pinned to `ghcr.io/bartrumb/edgefetch-agent:2.7.6` with `LABEL io.modelcontextprotocol.server.name="io.github.bartrumb/edgefetch"`).
 
 ### 1b. Official Homebrew Tap (`bartrumb/homebrew-tap` — **LIVE**)
 
@@ -133,7 +133,7 @@ Every official `v*` release of EdgeFetch is protected by **two independent crypt
 
 ```bash
 # 1. Verify SLSA Build Provenance via GitHub CLI
-gh attestation verify edgefetch_2.7.5_linux_amd64.tar.gz --owner bartrumb
+gh attestation verify edgefetch_2.7.6_linux_amd64.tar.gz --owner bartrumb
 
 # 2. Verify the Owner Ed25519 Signature on checksums.txt
 openssl pkeyutl -verify -pubin \

@@ -1234,7 +1234,7 @@ export async function testAndListRemoteMcpTools(params: {
       params: {
         protocolVersion: DOWNSTREAM_PROTOCOL_VERSION,
         capabilities: {},
-        clientInfo: { name: 'edgefetch-hub', version: '2.7.5' },
+        clientInfo: { name: 'edgefetch-hub', version: '2.7.6' },
       },
     },
     fetchFn,
@@ -1775,7 +1775,7 @@ export async function executeFederatedMcpQuery(params: {
             params: {
               protocolVersion: DOWNSTREAM_PROTOCOL_VERSION,
               capabilities: {},
-              clientInfo: { name: 'edgefetch-hub', version: '2.7.5' },
+              clientInfo: { name: 'edgefetch-hub', version: '2.7.6' },
             },
           },
           fetchFn,

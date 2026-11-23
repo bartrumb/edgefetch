@@ -365,7 +365,7 @@ async function derivePerUserOriginAesKey(params: {
 }
 
 /**
- * @deprecated Remove in v2.7.6 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
+ * @deprecated Remove in v2.7.7 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
  */
 async function deriveLegacyV270PerUserOriginAesKey(params: {
   vaultMasterKey: string;

@@ -182,7 +182,7 @@ When Claude Code connects for the first time, it discovers `/.well-known/oauth-p
 | `POST /v1/map` | Rapid polite URL discovery (`robots.txt`, sitemaps, `/llms.txt`, homepage links, `search` filter). |
 | `POST /v1/crawl`, `GET\|DELETE /v1/crawl/:id` | Async site crawl tracked in `META` D1 `crawls` + indexed in `SEARCH` D1 FTS5 + HMAC-SHA256 webhooks (`X-EdgeFetch-Signature`). |
 | `POST /v1/search` & `POST /v1/collections/:id/search` | Waterfall / RRF web + private D1 FTS5 search (`SERPER_API_KEY`, `BRAVE_API_KEY`, `SEARXNG_URL`, `collections`, `include_raw_content`). |
-| `POST /v1/interact` | Stateful headless browser interaction routed to browser-capable (`browser-v1`) worker nodes (`ghcr.io/bartrumb/edgefetch-agent:2.7.5` or native desktop/VM workers). |
+| `POST /v1/interact` | Stateful headless browser interaction routed to browser-capable (`browser-v1`) worker nodes (`ghcr.io/bartrumb/edgefetch-agent:2.7.6` or native desktop/VM workers). |
 | `GET /v1/artifacts/:blobSha256` | Authenticated offset-paged artifact reader (`text/plain; charset=utf-8`, `nosniff`, `CSP: sandbox`, `410 Gone` when expired). |
 | `/compat/firecrawl/v2/*` & `/compat/tavily/*` | Drop-in compatibility routes for existing Firecrawl v2 and Tavily SDK clients. |
 

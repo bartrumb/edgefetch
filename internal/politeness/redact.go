@@ -537,17 +537,33 @@ func looksLikeSecretTokenValue(tok string) bool {
 	return hasDigit || (hasUpper && hasSym) || len(tok) >= 20
 }
 
+var unquotedQueryStopByte = [256]bool{
+	' ':  true,
+	'\t': true,
+	'\r': true,
+	'\n': true,
+	'<':  true,
+	'>':  true,
+	'\'': true,
+	')':  true,
+	']':  true,
+	'}':  true,
+	'%':  true,
+	0xc2: true, // UTF-8 lead byte of U+0085 (NEL)
+	0xe2: true, // UTF-8 lead byte of U+2028 / U+2029 (LS / PS)
+}
+
 func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 	sawQuery := false
 	j := start
 	for j < len(s) {
 		if sawQuery && kind != urlSepPctEncoded && kind != urlSepJSONSlash {
-			rel := strings.IndexAny(s[j:], " \t\r\n<>')]}%\u0085\u2028\u2029")
-			if rel < 0 {
-				j = len(s)
+			for j < len(s) && !unquotedQueryStopByte[s[j]] {
+				j++
+			}
+			if j >= len(s) {
 				break
 			}
-			j += rel
 		}
 		c := s[j]
 		if c == '?' || c == '#' || c == ';' {
@@ -1163,7 +1179,7 @@ func RedactEmbeddedURLs(s string) string {
 				scrubbed := scrubMatchedURL(s[i:endIdx], kind)
 				if scrubbed != s[i:endIdx] || out.Cap() > 0 {
 					if out.Cap() == 0 {
-						out.Grow(len(s))
+						out.Grow(i - copiedUpTo + len(scrubbed) + (len(s) - endIdx))
 					}
 					out.WriteString(s[copiedUpTo:i])
 					out.WriteString(scrubbed)

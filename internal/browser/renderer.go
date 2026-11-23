@@ -151,7 +151,11 @@ type retainedSession struct {
 	sawUninjectedSubdoc   bool              // true once any non-harness Document load or child frame occurred
 	hasCommittedDoc       bool              // true once a document committed on mainFrameID (or session was resumed from an earlier step)
 	committedLoaderID     string            // loaderId of the currently committed top-level document on mainFrameID
+	committedDocURL       string            // canonical fragment-stripped URL of the currently committed top-level document
+	staleStepDocURLs      map[string]bool   // retired committedDocURLs from prior session steps (blocks late pagehide/unload beacons)
+	reqDocURLs            map[string]string // Network.RequestId -> fragment-stripped documentURL from Network.requestWillBeSent
 	pendingNavLoaderID    string            // loaderId of the in-flight harness Page.navigate before commit
+	pendingStepHeaders    map[string]string // staged next-step headers promoted to extraHeaders ONLY when Page.frameNavigated commits
 	pendingNavCrossOrigin bool              // true if the in-flight harness navigation took a cross-origin redirect before commit
 	awaitingHarnessDocNav bool              // true ONLY between expectHarnessNavigation and that single top-level Document requestPaused
 	awaitingHarnessCommit bool              // true ONLY between expectHarnessNavigation and that single top-level Page.frameNavigated commit
@@ -255,7 +259,15 @@ func mergeCDPRequestHeaders(existing map[string]any, extra map[string]string) []
 	return out
 }
 
-func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cdpConn, hdrs map[string]string) error {
+func stripURLFragment(raw string) string {
+	s := strings.TrimSpace(raw)
+	if i := strings.IndexByte(s, '#'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
+func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cdpConn, hdrs map[string]string, stageUntilNavCommit ...bool) error {
 	if s == nil || len(hdrs) == 0 {
 		return nil
 	}
@@ -270,7 +282,12 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 	}
 
 	s.mu.Lock()
-	s.extraHeaders = cloned
+	if len(stageUntilNavCommit) > 0 && stageUntilNavCommit[0] && s.hasCommittedDoc {
+		s.pendingStepHeaders = cloned
+	} else {
+		s.extraHeaders = cloned
+		s.pendingStepHeaders = nil
+	}
 	s.hasExtraHeaders = true
 	needEnable := !s.fetchEnabled
 	if needEnable {
@@ -513,8 +530,21 @@ func (s *retainedSession) noteFrameNavigated(rawParams json.RawMessage) {
 		return
 	}
 	s.mainFrameID = ev.Frame.ID
+	if s.committedDocURL != "" {
+		newClean := stripURLFragment(ev.Frame.URL)
+		if newClean != "" && !sameNavigationURL(s.committedDocURL, newClean) {
+			if s.staleStepDocURLs == nil || len(s.staleStepDocURLs) >= 64 {
+				s.staleStepDocURLs = make(map[string]bool)
+			}
+			s.staleStepDocURLs[s.committedDocURL] = true
+		}
+	}
 	s.hasCommittedDoc = true
 	s.committedLoaderID = ev.Frame.LoaderID
+	s.committedDocURL = stripURLFragment(ev.Frame.URL)
+	if s.committedDocURL != "" && s.staleStepDocURLs != nil {
+		delete(s.staleStepDocURLs, s.committedDocURL)
+	}
 	// Clear old child frames and reset frameOrigins to the newly committed top-level frame so frame maps stay O(active frames).
 	s.childFrames = make(map[string]string)
 	s.frameOrigins = map[string]string{ev.Frame.ID: urlOrigin}
@@ -524,16 +554,18 @@ func (s *retainedSession) noteFrameNavigated(rawParams json.RawMessage) {
 	// with zero cross-origin redirect hops (taints immediately on cross-origin redirect, blob:, data:, about:blank, BFCache, reload, or meta refresh).
 	if s.awaitingHarnessCommit && !s.pendingNavCrossOrigin && loaderOK && s.initialOrigin != "" &&
 		urlOrigin == s.initialOrigin && (secOrigin == "" || secOrigin == s.initialOrigin) {
+		if s.pendingStepHeaders != nil {
+			s.extraHeaders = s.pendingStepHeaders
+			s.pendingStepHeaders = nil
+		}
 		s.awaitingHarnessCommit = false
 		s.awaitingHarnessDocNav = false
 		s.pendingNavLoaderID = ""
 		s.redirectedCrossOrigin = false
 		s.sawUninjectedSubdoc = false
 		s.frameTainted = map[string]bool{ev.Frame.ID: false}
-		s.taintedNetReqs = nil
-		s.reqLoaderIDs = nil
-		s.scriptInitiatedReqs = nil
 	} else {
+		s.pendingStepHeaders = nil
 		s.awaitingHarnessCommit = false
 		s.awaitingHarnessDocNav = false
 		s.pendingNavLoaderID = ""
@@ -607,6 +639,12 @@ func (s *retainedSession) noteNetworkRequestWillBeSent(rawParams json.RawMessage
 			s.reqLoaderIDs = make(map[string]string)
 		}
 		s.reqLoaderIDs[ev.RequestID] = ev.LoaderID
+	}
+	if ev.DocumentURL != "" {
+		if s.reqDocURLs == nil || len(s.reqDocURLs) >= maxSessionNetEntries {
+			s.reqDocURLs = make(map[string]string)
+		}
+		s.reqDocURLs[ev.RequestID] = stripURLFragment(ev.DocumentURL)
 	}
 	if strings.EqualFold(ev.Initiator.Type, "script") || strings.TrimSpace(ev.Initiator.URL) != "" {
 		if s.scriptInitiatedReqs == nil || len(s.scriptInitiatedReqs) >= maxSessionNetEntries {
@@ -717,6 +755,9 @@ func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 			}
 			if n.Frame.URL != "" && !strings.EqualFold(n.Frame.URL, "about:blank") {
 				s.hasCommittedDoc = true
+				if s.committedDocURL == "" {
+					s.committedDocURL = stripURLFragment(n.Frame.URL)
+				}
 				if s.committedLoaderID == "" && n.Frame.LoaderID != "" {
 					s.committedLoaderID = n.Frame.LoaderID
 				}
@@ -750,6 +791,12 @@ func (s *retainedSession) expectHarnessNavigation(targetURL string) {
 	s.mu.Lock()
 	// IMPORTANT: Never clear s.frameTainted or s.redirectedCrossOrigin here when a step begins;
 	// taint is cleared ONLY in noteFrameNavigated once the new top-level document actually commits!
+	if s.committedDocURL != "" && targetURL != "" && !sameNavigationURL(s.committedDocURL, targetURL) {
+		if s.staleStepDocURLs == nil || len(s.staleStepDocURLs) >= 64 {
+			s.staleStepDocURLs = make(map[string]bool)
+		}
+		s.staleStepDocURLs[s.committedDocURL] = true
+	}
 	s.pendingNavLoaderID = ""
 	s.navChainReqID = ""
 	if s.initialOrigin != "" && targetOrigin == s.initialOrigin {
@@ -817,6 +864,7 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	cdpSID := s.cdpSessionID
 	initOrigin := s.initialOrigin
 	extra := s.extraHeaders
+	pendingExtra := s.pendingStepHeaders
 
 	isDocReq := strings.EqualFold(paused.ResourceType, "Document")
 	isChildFrame := paused.FrameID != "" && (s.childFrames[paused.FrameID] != "" || (s.mainFrameID != "" && paused.FrameID != s.mainFrameID))
@@ -893,9 +941,47 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	}
 
 	// While a new navigation step is in flight before Page.frameNavigated commits on mainFrameID, block ALL non-harnessHop
-	// requests from the still-alive previous document (and also reject any request carrying a stale previous loaderId).
+	// requests from the still-alive previous document (and also reject any request carrying a stale previous loaderId or retired step URL).
 	preCommitOldDoc := s.hasCommittedDoc && s.awaitingHarnessCommit
 	staleLoader := s.committedLoaderID != "" && reqLoader != "" && reqLoader != s.committedLoaderID
+	stalePrevStepDoc := false
+	if len(s.staleStepDocURLs) > 0 {
+		isRetiredURL := func(u string) bool {
+			clean := stripURLFragment(u)
+			if clean == "" {
+				return false
+			}
+			if s.committedDocURL != "" && sameNavigationURL(clean, s.committedDocURL) {
+				return false
+			}
+			if s.staleStepDocURLs[clean] {
+				return true
+			}
+			for prevU := range s.staleStepDocURLs {
+				if sameNavigationURL(clean, prevU) {
+					return true
+				}
+			}
+			return false
+		}
+		for hk, hv := range paused.Request.Headers {
+			if hv != nil && strings.EqualFold(strings.TrimSpace(hk), "referer") {
+				if isRetiredURL(fmt.Sprint(hv)) {
+					stalePrevStepDoc = true
+				}
+				break
+			}
+		}
+		if !stalePrevStepDoc && paused.Initiator != nil && paused.Initiator.URL != "" && isRetiredURL(paused.Initiator.URL) {
+			stalePrevStepDoc = true
+		}
+		if !stalePrevStepDoc && paused.NetworkID != "" && isRetiredURL(s.reqDocURLs[paused.NetworkID]) {
+			stalePrevStepDoc = true
+		}
+		if !stalePrevStepDoc && paused.RequestID != "" && isRetiredURL(s.reqDocURLs[paused.RequestID]) {
+			stalePrevStepDoc = true
+		}
+	}
 	badCommittedOrigin := s.hasCommittedDoc && !s.awaitingHarnessCommit && paused.FrameID != "" &&
 		s.frameOrigins[paused.FrameID] != "" && s.frameOrigins[paused.FrameID] != initOrigin
 
@@ -910,12 +996,15 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 		allowInject = false
 	case harnessHop:
 		allowInject = !s.pendingNavCrossOrigin && !netTainted
+		if pendingExtra != nil {
+			extra = pendingExtra
+		}
 	case isDocReq:
 		allowInject = false
 	default:
-		// Subresources: require committed target document (never pre-commit previous page), matching loaderId,
+		// Subresources: require committed target document (never pre-commit or retired previous page), matching loaderId,
 		// untainted tab & frame, non-Ping, redirect-chain provenance, and positive Origin/Referer proof.
-		allowInject = !preCommitOldDoc && !staleLoader && !badCommittedOrigin &&
+		allowInject = !preCommitOldDoc && !staleLoader && !stalePrevStepDoc && !badCommittedOrigin &&
 			!tabTainted && !frameUntrusted && !netTainted && !isPingOrBeacon && chainOK &&
 			hasPositiveSameOriginProof(paused.Request.Headers, initOrigin)
 	}
@@ -1415,7 +1504,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 					return Output{}, errors.New("cannot scope request headers: session has no canonical http(s) origin")
 				}
 			}
-			if err := sess.enableOriginScopedHeaders(ctx, cdp, task.Headers); err != nil {
+			if err := sess.enableOriginScopedHeaders(ctx, cdp, task.Headers, navTarget != ""); err != nil {
 				return Output{}, err
 			}
 		} else if navTarget != "" {

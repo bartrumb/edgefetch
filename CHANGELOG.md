@@ -2,6 +2,13 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.6] - 2026-11-23
+
+### Security
+- **Browser `pagehide`/`keepalive` Unload Header Isolation & Byte-Table URL Query Scan (`P2`, `internal/browser/renderer.go`, `internal/politeness/redact.go`):**
+  - Staged next-step `task.Headers` (`pendingStepHeaders`) until `Page.frameNavigated` commits on `mainFrameID`, retained prior `reqLoaderIDs`, and tracked retired `staleStepDocURLs` across `Referer`, `Initiator.URL`, and `Network.requestWillBeSent` `documentURL` so late `pagehide`/`unload` `{keepalive: true}` requests from a previous page can never receive newly bound step headers in live Chromium.
+  - Replaced UTF-8 rune-by-rune `strings.IndexAny` query scanning and oversized `strings.Builder.Grow` allocation in `RedactEmbeddedURLs` with a 256-byte stop-table and exact output sizing so 1 MiB query redaction runs in `< 1 ms` even under Go `-fuzz` instrumentation.
+
 ## [2.7.5] - 2026-11-23
 
 ### Security

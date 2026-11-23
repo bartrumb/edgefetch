@@ -93,7 +93,7 @@ EdgeFetch was built with coding agents and hardened across 8 adversarial securit
 
 Full architectural breakdown & trade-offs (including when *not* to use EdgeFetch): **[docs/COMPARISON.md](docs/COMPARISON.md)** · FAQ: **[docs/LAUNCH-FAQ.md](docs/LAUNCH-FAQ.md)**
 
-| Dimension | **EdgeFetch (`v2.7.5`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
+| Dimension | **EdgeFetch (`v2.7.6`)** | **Firecrawl (Self-Hosted)** | **Firecrawl / Tavily (Cloud)** | **Crawl4AI** | **Jina Reader** |
 |---|---|---|---|---|---|
 | **License** | **Open-source worker, SDKs, and adapters (`MIT`), fair-source hub (`FSL-1.1`, `MIT` after two years)** | AGPL-3.0 (core) | Proprietary SaaS | Apache-2.0 (+ attribution) | Apache-2.0 |
 | **Minimum Self-Hosted Stack** | **1 `~8 MB` Go binary** *or* **1 container** (`node:sqlite` + `/data`, no Redis or Postgres) | Docker Compose + Redis + PostgreSQL + RabbitMQ + Playwright (`2–4 GB+` RAM) | Cloud API key | Python 3.10+ + Playwright (`600 MB–1.5 GB` RAM) | Node.js + Puppeteer |
@@ -122,7 +122,7 @@ docker run -d --name edgefetch-agent --restart=unless-stopped \
   -e EDGEFETCH_HUB_URL=https://<your-hub-domain> \
   -e EDGEFETCH_AGENT_TOKEN="<YOUR_AGENT_TOKEN>" \
   -e EDGEFETCH_SITE_ID="node-1" \
-  ghcr.io/bartrumb/edgefetch-agent:2.7.5
+  ghcr.io/bartrumb/edgefetch-agent:2.7.6
 
 # Distroless Lite worker (~9 MB image, HTTP/2 + Markdown + pure-Go PDF, ~15 MiB RAM):
 docker run -d --name edgefetch-lite --restart=unless-stopped --read-only \
@@ -136,7 +136,7 @@ On Linux, Chromium namespace sandboxing is probed at startup and **fails closed*
 
 ### Option B: Home Assistant OS Add-on (`addon/`)
 
-Install from the Home Assistant Add-on Store button above (`slug: "edgefetch"`, images `ghcr.io/bartrumb/edgefetch-addon-{arch}` for `amd64` and `aarch64`), set `hub_url`, `agent_token`, and `site_id`, and start the add-on. **Home Assistant Protection Mode stays ON** (`hassio_api: false`, `homeassistant_api: false`, `host_network: false`); heavy headless browser rendering is delegated cleanly to sandboxed Docker (`edgefetch-agent:2.7.5` with `chromium-sandbox.json`) or native desktop/VM worker nodes in your fleet.
+Install from the Home Assistant Add-on Store button above (`slug: "edgefetch"`, images `ghcr.io/bartrumb/edgefetch-addon-{arch}` for `amd64` and `aarch64`), set `hub_url`, `agent_token`, and `site_id`, and start the add-on. **Home Assistant Protection Mode stays ON** (`hassio_api: false`, `homeassistant_api: false`, `host_network: false`); heavy headless browser rendering is delegated cleanly to sandboxed Docker (`edgefetch-agent:2.7.6` with `chromium-sandbox.json`) or native desktop/VM worker nodes in your fleet.
 
 > **Upgrading from pre-`v2.7.2` (`EdgeFetch Fat`):** In `v2.7.2`, the Home Assistant add-on slug changed from `edgefetch_fat` to `edgefetch`. Because Home Assistant Supervisor keys installed add-ons by slug, existing pre-`v2.7.2` users should open **Settings → Add-ons → Add-on Store**, click **⋮ → Check for updates**, install **EdgeFetch**, copy over `hub_url`, `agent_token`, and `site_id`, start **EdgeFetch**, and uninstall the retired *EdgeFetch Fat* entry.
 

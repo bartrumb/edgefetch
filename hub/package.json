@@ -1,6 +1,6 @@
 {
   "name": "edgefetch-hub",
-  "version": "2.7.5",
+  "version": "2.7.6",
   "private": true,
   "license": "FSL-1.1-MIT",
   "description": "Cloudflare Hibernating WebSocket Durable Object coordinator, /admin Control Center, and Self-Hosted OAuth 2.1 /mcp server for EdgeFetch.",

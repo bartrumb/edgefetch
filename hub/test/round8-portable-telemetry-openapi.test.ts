@@ -913,7 +913,7 @@ function extractCanonicalRoutesFromSource(sources: {
   if (/request\.method\s*===\s*'GET'\s*&&\s*url\.pathname\s*===\s*'\/agents'/.test(sources.indexSrc)) {
     upsert('/agents', 'get', 'owner_bearer');
   }
-  if (/request\.method\s*===\s*'POST'\s*&&\s*url\.pathname\s*===\s*'\/fetch'/.test(sources.indexSrc)) {
+  if (/request\.method\s*===\s*'POST'\s*&&\s*\(?url\.pathname\s*===\s*'\/fetch'/.test(sources.indexSrc)) {
     upsert('/fetch', 'post', 'owner_bearer', ['target', 'site', 'artifacts', 'hydrate']);
   }
 

@@ -19,6 +19,7 @@ import { isJsonDepthWithinLimit, isSafePublicHttpsUrl, stripMcpSmugglingChars } 
 import {
   buildMaskedAuthSummary,
   filterSafeCachedMcpTools,
+  isSafeMcpIdentifier,
   SAFE_MCP_IDENTIFIER_RE,
   sealVaultCredentials,
   toPublicMcpServerSummary,
@@ -34,6 +35,10 @@ import { sanitizeInlineHtmlInMarkdown } from './scrape';
 import { detectPromptInjection } from './scrape-advanced';
 
 export const MAX_REMOTE_MCP_RESPONSE_BYTES = 4 * 1024 * 1024; // 4 MiB hard ceiling on downstream MCP responses
+export const MAX_MCP_CONTENT_BLOCKS = 64; // Hard cap on content blocks per downstream MCP response (H3)
+export const MAX_MCP_BLOCK_TEXT_CHARS = 64 * 1024; // 64 KiB per-block raw text cap BEFORE sanitizing (H3)
+export const MAX_MCP_LINK_LABEL_CHARS = 512;
+export const MAX_MCP_LINK_TARGET_CHARS = 2048;
 export const MAX_MCP_TOOL_SCHEMA_BYTES = 16 * 1024; // 16 KiB hard ceiling on individual & total downstream tools/list schemas (H3)
 export const REMOTE_MCP_TIMEOUT_MS = 25_000; // 25s hard timeout on downstream MCP calls
 export const MAX_CONCURRENT_MCP_CALLS_PER_USER = 8; // Per-user concurrency quota on federated MCP calls
@@ -47,32 +52,155 @@ const MCP_DIRECTIVE_INJECTION_RE =
   /\b(?:note|instruction|message|directive|reminder)\s+to\s+(?:the\s+)?(?:ai|llm|assistant|model|agent)\b|\bcall\s+query_mcp\s*\(|\bpre-authori[sz]ed\b|\bdo\s+not\s+ask\s+(?:the\s+user\s+)?for\s+confirmation\b|\bwhen\s+summarizing[^.\n]{0,80}\b(?:append|include|output|exfiltrate)\b/i;
 
 const DANGEROUS_MARKDOWN_SCHEME_RE = /^(?:javascript|vbscript|data|file|blob)\s*:/i;
-const RAW_DANGEROUS_HTML_TAG_RE =
-  /<\s*\/?\s*(?:script|iframe|object|embed|applet|meta|link|style|base|form|input|button|textarea|svg|math)\b[^>]*>/gi;
-const RAW_EVENT_HANDLER_TAG_RE = /<([a-z][a-z0-9-]*)\b([^>]*?\bon[a-z]{2,32}\s*=[^>]*?)>/gi;
+
+/**
+ * Neutralizes any `<untrusted_mcp...` / `</untrusted_mcp...` XML boundary tags inside untrusted connector text
+ * so an adversarial response can never close or spoof an `<untrusted_mcp_output>` / `<untrusted_mcp_tool_output>` wrapper.
+ */
+export function neutralizeUntrustedMcpBoundaryTags(input: string): string {
+  if (!input || !/untrusted_mcp/i.test(input)) return input;
+  return input.replace(/<(\s*\/?\s*untrusted_mcp)/gi, '&lt;$1');
+}
+
+/**
+ * Wraps untrusted downstream MCP text in a fence-safe + boundary-tag-safe envelope:
+ *  1. Escapes any `<untrusted_mcp...` or `</untrusted_mcp...` tags inside `content`,
+ *  2. Dynamically selects a backtick fence strictly longer than any contiguous `` ` `` run in `content` (`maxRun + 1`, min 3),
+ *     preventing triple-backtick ```` ``` ```` or XML closing-tag breakouts.
+ */
+export function formatFenceSafeUntrustedMcpEnvelope(params: {
+  tag?: 'untrusted_mcp_output' | 'untrusted_mcp_tool_output';
+  attributes?: Record<string, string | undefined>;
+  content: string;
+  maxChars?: number;
+}): string {
+  const tag = params.tag === 'untrusted_mcp_tool_output' ? 'untrusted_mcp_tool_output' : 'untrusted_mcp_output';
+  const raw = params.content ?? '';
+  const sliced =
+    typeof params.maxChars === 'number' && params.maxChars > 0 && raw.length > params.maxChars
+      ? raw.slice(0, params.maxChars)
+      : raw;
+  const safeBody = neutralizeUntrustedMcpBoundaryTags(sliced);
+  let maxBacktickRun = 0;
+  let curRun = 0;
+  for (let i = 0; i < safeBody.length; i++) {
+    if (safeBody.charCodeAt(i) === 96 /* ` */) {
+      curRun++;
+      if (curRun > maxBacktickRun) maxBacktickRun = curRun;
+    } else {
+      curRun = 0;
+    }
+  }
+  const fence = '`'.repeat(Math.max(3, maxBacktickRun + 1));
+  const attrParts: string[] = [];
+  if (params.attributes) {
+    for (const [k, v] of Object.entries(params.attributes)) {
+      if (!v || !/^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$/.test(k)) continue;
+      const safeVal = String(v).replace(/["&<>\r\n\0`]/g, '');
+      attrParts.push(`${k}="${safeVal}"`);
+    }
+  }
+  const attrStr = attrParts.length > 0 ? ` ${attrParts.join(' ')}` : '';
+  return `<${tag}${attrStr}>\n${fence}text\n${safeBody}\n${fence}\n</${tag}>`;
+}
+
+/**
+ * Pure O(N) zero-backtracking scanner that strips dangerous URI schemes (`javascript:`, `vbscript:`, `data:`, `file:`, `blob:`)
+ * from Markdown `[label](target)` and `![label](target)` links (`label <= 512` chars, `target <= 2048` chars).
+ */
+function stripDangerousMarkdownLinksLinear(input: string): string {
+  if (!input.includes('](')) return input;
+  const n = input.length;
+  let out = '';
+  let emitFrom = 0;
+  let openBracket = -1;
+  let noCloseParenBefore = -1;
+
+  for (let i = 0; i < n; i++) {
+    const ch = input.charCodeAt(i);
+    if (ch === 10 /* \n */ || ch === 13 /* \r */) {
+      openBracket = -1;
+      continue;
+    }
+    if (ch === 91 /* [ */) {
+      openBracket = i;
+      continue;
+    }
+    if (ch === 93 /* ] */ && openBracket >= 0) {
+      const labelLen = i - openBracket - 1;
+      if (labelLen <= MAX_MCP_LINK_LABEL_CHARS && i + 1 < n && input.charCodeAt(i + 1) === 40 /* ( */) {
+        const parenStart = i + 2;
+        if (parenStart >= noCloseParenBefore) {
+          const maxEnd = Math.min(n, parenStart + MAX_MCP_LINK_TARGET_CHARS);
+          let closeParen = -1;
+          let scanPos = parenStart;
+          for (; scanPos < maxEnd; scanPos++) {
+            const tc = input.charCodeAt(scanPos);
+            if (tc === 10 || tc === 13) break;
+            if (tc === 41 /* ) */) {
+              closeParen = scanPos;
+              break;
+            }
+          }
+          if (closeParen >= 0) {
+            const rawTarget = input.slice(parenStart, closeParen);
+            const cleanedTarget = rawTarget
+              .trim()
+              .replace(/^<|>$/g, '')
+              .replace(/[\u0000-\u0020]+/g, '');
+            if (DANGEROUS_MARKDOWN_SCHEME_RE.test(cleanedTarget)) {
+              const linkStart =
+                openBracket > 0 && input.charCodeAt(openBracket - 1) === 33 /* ! */
+                  ? openBracket - 1
+                  : openBracket;
+              const label = input.slice(openBracket + 1, i);
+              out += input.slice(emitFrom, linkStart) + (label || '[blocked-unsafe-link]');
+              emitFrom = closeParen + 1;
+            }
+            i = closeParen;
+            openBracket = -1;
+            continue;
+          }
+          noCloseParenBefore = scanPos;
+        }
+      }
+      openBracket = -1;
+    }
+  }
+  if (emitFrom === 0) return input;
+  return out + input.slice(emitFrom);
+}
+
+function hasHiddenInlineStyleLinear(line: string): boolean {
+  if (!line.includes('<') || !/style/i.test(line)) return false;
+  let pos = 0;
+  while (pos < line.length) {
+    const lt = line.indexOf('<', pos);
+    if (lt < 0) return false;
+    const gt = line.indexOf('>', lt + 1);
+    const tagSlice = gt >= 0 ? line.slice(lt, Math.min(gt + 1, lt + 2_048)) : line.slice(lt, lt + 2_048);
+    if (/\bstyle\s*=/i.test(tagSlice) && /(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0)/i.test(tagSlice)) {
+      return true;
+    }
+    if (gt < 0) return false;
+    pos = gt + 1;
+  }
+  return false;
+}
 
 /**
  * Sanitizes untrusted Markdown/text returned by a downstream MCP server:
+ *  - Bounds input BEFORE sanitizing,
  *  - Runs the Hub's HTML/Markdown sanitizer (`sanitizeInlineHtmlInMarkdown`),
- *  - Escapes dangerous raw HTML elements (`<script>`, `<iframe>`, `<svg>`, inline `on*=` handlers),
- *  - Strips `javascript:`, `data:`, `vbscript:`, `file:`, and `blob:` Markdown links/images (`[label](scheme:...)` -> `label`).
+ *  - Neutralizes `<untrusted_mcp...` boundary tags,
+ *  - Strips `javascript:`, `data:`, `vbscript:`, `file:`, and `blob:` Markdown links/images in strictly linear O(N) time.
  */
-export function sanitizeMcpMarkdownOutput(rawMarkdown: string, baseUrl?: string): string {
+export function sanitizeMcpMarkdownOutput(rawMarkdown: string, baseUrl?: string, maxChars = MAX_REMOTE_MCP_RESPONSE_BYTES): string {
   if (!rawMarkdown) return '';
-  let out = sanitizeInlineHtmlInMarkdown(rawMarkdown, baseUrl);
-  out = out.replace(RAW_DANGEROUS_HTML_TAG_RE, (m) => m.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
-  out = out.replace(RAW_EVENT_HANDLER_TAG_RE, (m) => m.replace(/</g, '&lt;').replace(/>/g, '&gt;'));
-  // Strip dangerous URI schemes from Markdown links `[text](url)` and images `![alt](url)`
-  out = out.replace(/(!?\[([^\]]*)\])\(([^)\r\n]+)\)/g, (full, bracketPart: string, label: string, rawTarget: string) => {
-    const cleanedTarget = rawTarget
-      .trim()
-      .replace(/^<|>$/g, '')
-      .replace(/[\u0000-\u0020]+/g, '');
-    if (DANGEROUS_MARKDOWN_SCHEME_RE.test(cleanedTarget)) {
-      return label || '[blocked-unsafe-link]';
-    }
-    return full;
-  });
+  const bounded = rawMarkdown.length > maxChars ? rawMarkdown.slice(0, maxChars) : rawMarkdown;
+  let out = sanitizeInlineHtmlInMarkdown(bounded, baseUrl);
+  out = neutralizeUntrustedMcpBoundaryTags(out);
+  out = stripDangerousMarkdownLinksLinear(out);
   return out;
 }
 
@@ -122,6 +250,9 @@ export function sanitizeRemoteMcpText(raw: string, maxChars = MAX_REMOTE_MCP_RES
 
   // Scrub offending lines while preserving benign surrounding structured data when possible
   const lines = stripped.split(/\r?\n/);
+  if (lines.length === 1) {
+    return { text: '[SCRUBBED: prompt injection blocked]', detected: true, scrubbed: true, triggers: allTriggers };
+  }
   const scrubbedLines = lines.map((line) => {
     if (!line.trim()) return line;
     const lineCheck = detectPromptInjection({
@@ -129,11 +260,7 @@ export function sanitizeRemoteMcpText(raw: string, maxChars = MAX_REMOTE_MCP_RES
       ...(line.includes('<') ? { rawHtml: line } : {}),
     });
     const lineDirective = MCP_DIRECTIVE_INJECTION_RE.test(line);
-    if (
-      lineCheck.detected ||
-      lineDirective ||
-      /<\s*[a-z][^>]*\bstyle\s*=\s*["'][^"']*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0)/i.test(line)
-    ) {
+    if (lineCheck.detected || lineDirective || hasHiddenInlineStyleLinear(line)) {
       return '[SCRUBBED: prompt injection blocked]';
     }
     return line;
@@ -229,7 +356,7 @@ export function rebuildSafeMcpInputSchema(
     validPropKeys = new Set<string>();
     for (const [rawKey, rawVal] of Object.entries(src.properties as Record<string, unknown>).slice(0, 32)) {
       const cleanKey = stripMcpSmugglingChars(rawKey).trim();
-      if (!SAFE_SCHEMA_PROP_KEY_RE.test(cleanKey) || FORBIDDEN_PROTO_KEYS.has(cleanKey)) {
+      if (!isSafeMcpIdentifier(cleanKey) || FORBIDDEN_PROTO_KEYS.has(cleanKey)) {
         scrubbed = true;
         continue;
       }
@@ -327,7 +454,7 @@ export function sanitizeRemoteMcpToolDefs(rawTools: unknown): {
       return { tools: [], promptInjectionScrubbed: false, oversizedRejected: true };
     }
     const rawName = typeof t.name === 'string' ? stripMcpSmugglingChars(t.name).trim() : '';
-    if (!rawName || !SAFE_MCP_IDENTIFIER_RE.test(rawName) || FORBIDDEN_PROTO_KEYS.has(rawName)) {
+    if (!isSafeMcpIdentifier(rawName) || FORBIDDEN_PROTO_KEYS.has(rawName)) {
       promptInjectionScrubbed = true;
       continue;
     }
@@ -912,7 +1039,7 @@ export async function testAndListRemoteMcpTools(params: {
       params: {
         protocolVersion: DOWNSTREAM_PROTOCOL_VERSION,
         capabilities: {},
-        clientInfo: { name: 'edgefetch-hub', version: '2.7.3' },
+        clientInfo: { name: 'edgefetch-hub', version: '2.7.4' },
       },
     },
     fetchFn,
@@ -1399,7 +1526,7 @@ export async function executeFederatedMcpQuery(params: {
             params: {
               protocolVersion: DOWNSTREAM_PROTOCOL_VERSION,
               capabilities: {},
-              clientInfo: { name: 'edgefetch-hub', version: '2.7.3' },
+              clientInfo: { name: 'edgefetch-hub', version: '2.7.4' },
             },
           },
           fetchFn,
@@ -1490,16 +1617,22 @@ export async function executeFederatedMcpQuery(params: {
     const triggerSet = new Set<string>();
 
     // Strict allowlist on `content[].type` (`'text'` and `'resource'` text only — drops executable/binary/unknown types)!
-    for (const item of rawContent.slice(0, 64)) {
+    // H3: Cap max content blocks (<= 64), cap per-block raw text BEFORE sanitizing (<= 64 KiB), and bound total text budget (<= 4 MiB).
+    let remainingTextBudget = MAX_REMOTE_MCP_RESPONSE_BYTES;
+    for (const item of rawContent.slice(0, MAX_MCP_CONTENT_BLOCKS)) {
+      if (remainingTextBudget <= 0) break;
       if (!item || typeof item !== 'object') continue;
       const block = item as Record<string, unknown>;
       const bType = typeof block.type === 'string' ? block.type.trim().toLowerCase() : '';
       if (bType === 'text' && typeof block.text === 'string') {
-        const san = sanitizeRemoteMcpText(block.text);
+        const blockBudget = Math.min(MAX_MCP_BLOCK_TEXT_CHARS, remainingTextBudget);
+        const rawBlockSlice = block.text.length > blockBudget ? block.text.slice(0, blockBudget) : block.text;
+        remainingTextBudget -= rawBlockSlice.length;
+        const san = sanitizeRemoteMcpText(rawBlockSlice, blockBudget);
         if (san.detected) anyDetected = true;
         if (san.scrubbed) anyScrubbed = true;
         for (const tr of san.triggers) triggerSet.add(tr);
-        const safeText = sanitizeMcpMarkdownOutput(san.text, serverRow.remoteOrigin);
+        const safeText = sanitizeMcpMarkdownOutput(san.text, serverRow.remoteOrigin, blockBudget);
         sanitizedContent.push({ type: 'text', text: safeText });
         textParts.push(safeText);
       } else if (bType === 'resource' && block.resource && typeof block.resource === 'object') {
@@ -1508,11 +1641,14 @@ export async function executeFederatedMcpQuery(params: {
           // Drop binary `blob` resources and empty non-text resource envelopes!
           continue;
         }
-        const resText = sanitizeRemoteMcpText(resObj.text);
+        const blockBudget = Math.min(MAX_MCP_BLOCK_TEXT_CHARS, remainingTextBudget);
+        const rawResSlice = resObj.text.length > blockBudget ? resObj.text.slice(0, blockBudget) : resObj.text;
+        remainingTextBudget -= rawResSlice.length;
+        const resText = sanitizeRemoteMcpText(rawResSlice, blockBudget);
         if (resText.detected) anyDetected = true;
         if (resText.scrubbed) anyScrubbed = true;
         for (const tr of resText.triggers) triggerSet.add(tr);
-        const safeResText = sanitizeMcpMarkdownOutput(resText.text, serverRow.remoteOrigin);
+        const safeResText = sanitizeMcpMarkdownOutput(resText.text, serverRow.remoteOrigin, blockBudget);
         textParts.push(safeResText);
 
         let safeResourceUri: string | undefined;
@@ -1537,33 +1673,43 @@ export async function executeFederatedMcpQuery(params: {
     }
 
     let sanitizedStructured: unknown;
-    if (rawResult.structuredContent !== undefined) {
-      const serialized = JSON.stringify(rawResult.structuredContent);
-      if (isJsonDepthWithinLimit(serialized, 32)) {
-        const sanStruct = sanitizeRemoteMcpText(serialized);
+    if (rawResult.structuredContent !== undefined && remainingTextBudget > 0) {
+      const rawSerialized = JSON.stringify(rawResult.structuredContent);
+      const structBudget = Math.min(MAX_MCP_BLOCK_TEXT_CHARS, remainingTextBudget);
+      if (typeof rawSerialized === 'string' && rawSerialized.length <= structBudget && isJsonDepthWithinLimit(rawSerialized, 32)) {
+        remainingTextBudget -= rawSerialized.length;
+        const sanStruct = sanitizeRemoteMcpText(rawSerialized, structBudget);
         if (sanStruct.detected) {
           anyDetected = true;
           anyScrubbed = sanStruct.scrubbed;
           for (const tr of sanStruct.triggers) triggerSet.add(tr);
-          sanitizedStructured = sanitizeMcpMarkdownOutput(sanStruct.text, serverRow.remoteOrigin);
+          sanitizedStructured = sanitizeMcpMarkdownOutput(sanStruct.text, serverRow.remoteOrigin, structBudget);
         } else {
           try {
             sanitizedStructured = JSON.parse(sanStruct.text);
           } catch {
-            sanitizedStructured = sanitizeMcpMarkdownOutput(sanStruct.text, serverRow.remoteOrigin);
+            sanitizedStructured = sanitizeMcpMarkdownOutput(sanStruct.text, serverRow.remoteOrigin, structBudget);
           }
         }
         if (textParts.length === 0) {
           const fallbackStr =
             typeof sanitizedStructured === 'string'
               ? sanitizedStructured
-              : sanitizeMcpMarkdownOutput(JSON.stringify(sanitizedStructured, null, 2), serverRow.remoteOrigin);
+              : sanitizeMcpMarkdownOutput(
+                  JSON.stringify(sanitizedStructured, null, 2),
+                  serverRow.remoteOrigin,
+                  structBudget,
+                );
           textParts.push(fallbackStr);
         }
       }
     }
 
-    const markdown = sanitizeMcpMarkdownOutput(textParts.join('\n\n'), serverRow.remoteOrigin);
+    const joinedMarkdown = textParts.join('\n\n');
+    const markdown =
+      joinedMarkdown.length > MAX_REMOTE_MCP_RESPONSE_BYTES
+        ? joinedMarkdown.slice(0, MAX_REMOTE_MCP_RESPONSE_BYTES)
+        : joinedMarkdown;
     const isRemoteError = Boolean(rawResult.isError);
 
     return {
@@ -1611,7 +1757,7 @@ export function matchConnectedMcpsForContext(params: {
   query?: string;
   urls?: readonly string[];
 }): MatchedConnectedMcp[] {
-  const qLower = (params.query ?? '').toLowerCase();
+  const qLower = (params.query ?? '').slice(0, 4_096).toLowerCase();
   const urlHosts = new Set<string>();
   for (const rawU of params.urls ?? []) {
     try {
@@ -1621,10 +1767,15 @@ export function matchConnectedMcpsForContext(params: {
       // ignore
     }
   }
-  // Also extract inline `https://...` hostnames from natural-language query
-  for (const m of qLower.matchAll(/https?:\/\/([a-z0-9.-]+\.[a-z]{2,})/gi)) {
-    const h = m[1]!.toLowerCase().replace(/^www\./, '');
-    if (h) urlHosts.add(h);
+  // Extract inline `https://...` hostnames linearly from bounded query tokens (zero regex backtracking)
+  for (const rawTok of qLower.split(/[\s<>()"'[\]{},;]+/)) {
+    if (!rawTok.startsWith('http://') && !rawTok.startsWith('https://')) continue;
+    try {
+      const h = new URL(rawTok).hostname.toLowerCase().replace(/^www\./, '');
+      if (h) urlHosts.add(h);
+    } catch {
+      // ignore
+    }
   }
 
   const out: MatchedConnectedMcp[] = [];
@@ -1695,6 +1846,8 @@ export async function tryScrapeViaConnectedMcp(params: {
   targetUrl: string;
   query?: string;
   preferMcp?: boolean;
+  allowedServerIds?: ReadonlySet<string>;
+  requireExplicitReadOnlyHint?: boolean;
   vaultStore: McpVaultStore;
   vaultMasterKey: string | undefined;
   fetchFn?: typeof fetch;
@@ -1715,8 +1868,14 @@ export async function tryScrapeViaConnectedMcp(params: {
   const allRows = await params.vaultStore.listServers(params.userId);
   if (allRows.length === 0) return null;
 
-  // 2. Strictly OPT-IN routing (`preferMcp === true` OR explicit `autoRouteScrape === true` on the vault connector)!
-  const eligibleRows = allRows.filter((r) => r.enabled && (params.preferMcp === true || r.autoRouteScrape === true));
+  // 2. Strictly OPT-IN routing (`preferMcp === true` OR explicit `autoRouteScrape === true` on the vault connector,
+  //    plus strict `allowedServerIds` filtering when called from `/v1/agent`)!
+  const eligibleRows = allRows.filter(
+    (r) =>
+      r.enabled &&
+      (!params.allowedServerIds || params.allowedServerIds.has(r.id)) &&
+      (params.preferMcp === true || r.autoRouteScrape === true),
+  );
   if (eligibleRows.length === 0) return null;
 
   const safeForwardUrl = sanitizeTargetUrlForMcpForwarding(targetCheck.url);
@@ -1729,7 +1888,8 @@ export async function tryScrapeViaConnectedMcp(params: {
 
   // 3. Select ONLY a non-destructive read-oriented tool with a safe identifier accepting `url` or `uri`
   const candidateTool = filterSafeCachedMcpTools(top.server.tools).find((t) => {
-    if (!SAFE_MCP_IDENTIFIER_RE.test(t.name) || FORBIDDEN_PROTO_KEYS.has(t.name)) return false;
+    if (!isSafeMcpIdentifier(t.name) || FORBIDDEN_PROTO_KEYS.has(t.name)) return false;
+    if (params.requireExplicitReadOnlyHint && t.readOnlyHint !== true) return false;
     if (t.readOnlyHint === false || t.destructiveHint === true) return false;
     const isReadName = /^(?:get|fetch|read|retrieve|resolve|view|inspect|page|search)(?:[_.-]|$|[A-Z])/i.test(t.name) || t.readOnlyHint === true;
     if (!isReadName) return false;

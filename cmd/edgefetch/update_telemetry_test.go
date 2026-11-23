@@ -375,11 +375,35 @@ func TestEdgeFetchInitTelemetryPromptTTYAndDoNotTrackInvariants(t *testing.T) {
 }
 
 func TestWorkflowsPinExact40HexCommitSHAs(t *testing.T) {
-	reUses := regexp.MustCompile(`(?m)^\s*-\s*uses:\s*([^\s#]+)`)
+	reUses := regexp.MustCompile(`(?m)^\s*(?:-\s*)?uses:\s*([^\s#]+)`)
 	rePinned := regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$`)
 
-	for _, wf := range []string{"deploy-hub.yml", "upstream-sync.yml"} {
-		wfPath := filepath.Join("..", "..", ".github", "workflows", wf)
+	wfDir := filepath.Join("..", "..", ".github", "workflows")
+	entries, err := os.ReadDir(wfDir)
+	if err != nil {
+		t.Fatalf("readdir %s: %v", wfDir, err)
+	}
+	checkedCount := 0
+	for _, ent := range entries {
+		if ent.IsDir() || (!strings.HasSuffix(ent.Name(), ".yml") && !strings.HasSuffix(ent.Name(), ".yaml")) {
+			continue
+		}
+		checkedCount++
+		wfPath := filepath.Join(wfDir, ent.Name())
+		raw, err := os.ReadFile(wfPath)
+		if err != nil {
+			t.Fatalf("read %s: %v", wfPath, err)
+		}
+		if strings.Contains(string(raw), "ubuntu-latest") {
+			t.Fatalf("SECURITY: unpinned runner 'ubuntu-latest' in %s (must pin e.g. ubuntu-24.04)", ent.Name())
+		}
+	}
+	if checkedCount < 6 {
+		t.Fatalf("expected >= 6 workflow files in %s, got %d", wfDir, checkedCount)
+	}
+
+	for _, wf := range []string{"deploy-hub.yml", "upstream-sync.yml", "vouch.yml"} {
+		wfPath := filepath.Join(wfDir, wf)
 		raw, err := os.ReadFile(wfPath)
 		if err != nil {
 			t.Fatalf("read %s: %v", wfPath, err)
@@ -668,5 +692,154 @@ func TestMCPBackgroundUpdateCheckDefaultOffAndOptInInvariants(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "v9.9.9") {
 		t.Fatalf("expected cached update notice on stderr, got %q", stderr.String())
+	}
+}
+
+func TestR9UpdateFloorFailClosedOnBuildMetaDevAndUnparseableVersions(t *testing.T) {
+	priv, pubPEM := generateTestSigningKeyPEM(t)
+
+	payload262 := []byte("#!/bin/sh\necho edgefetch-v2.6.2\n")
+	archive262 := buildTestTarGz(t, "edgefetch", payload262)
+	sha262 := sha256.Sum256(archive262)
+	checksums262 := fmt.Sprintf("%s  edgefetch_2.6.2_linux_amd64.tar.gz\n", hex.EncodeToString(sha262[:]))
+	sig262 := ed25519.Sign(priv, []byte(checksums262))
+
+	payload274 := []byte("#!/bin/sh\necho edgefetch-v2.7.4\n")
+	archive274 := buildTestTarGz(t, "edgefetch", payload274)
+	sha274 := sha256.Sum256(archive274)
+	checksums274 := fmt.Sprintf("%s  edgefetch_2.7.4_linux_amd64.tar.gz\n", hex.EncodeToString(sha274[:]))
+	sig274 := ed25519.Sign(priv, []byte(checksums274))
+
+	latestTag := "v2.6.2"
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/bartrumb/edgefetch/releases/latest":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"tag_name":%q}`, latestTag)
+		case "/bartrumb/edgefetch/releases/download/v2.6.2/checksums.txt":
+			_, _ = w.Write([]byte(checksums262))
+		case "/bartrumb/edgefetch/releases/download/v2.6.2/checksums.txt.sig":
+			_, _ = w.Write(sig262)
+		case "/bartrumb/edgefetch/releases/download/v2.6.2/edgefetch_2.6.2_linux_amd64.tar.gz":
+			_, _ = w.Write(archive262)
+		case "/bartrumb/edgefetch/releases/download/v2.7.4/checksums.txt":
+			_, _ = w.Write([]byte(checksums274))
+		case "/bartrumb/edgefetch/releases/download/v2.7.4/checksums.txt.sig":
+			_, _ = w.Write(sig274)
+		case "/bartrumb/edgefetch/releases/download/v2.7.4/edgefetch_2.7.4_linux_amd64.tar.gz":
+			_, _ = w.Write(archive274)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	srvAddr := srv.Listener.Addr().String()
+	tlsClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: srv.Client().Transport.(*http.Transport).TLSClientConfig,
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, srvAddr)
+			},
+		},
+	}
+
+	tmpDir := t.TempDir()
+	exePath := filepath.Join(tmpDir, "edgefetch")
+	origBytes := []byte("original-protected-binary")
+	if err := os.WriteFile(exePath, origBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	makeDeps := func(curVer string) updateDeps {
+		return updateDeps{
+			httpClient:      tlsClient,
+			allow:           func(*url.URL) error { return nil },
+			apiBaseURL:      srv.URL,
+			downloadBaseURL: srv.URL,
+			publicKeyPEM:    pubPEM,
+			currentVersion:  curVer,
+			exePath:         exePath,
+			goos:            "linux",
+			goarch:          "amd64",
+		}
+	}
+
+	// 1. SemVer +buildmetadata (`v2.7.3+git.abc123`, `2.7.3+20261123`) strips +build cleanly:
+	//    - Downgrade to v2.6.2 (both implicit /releases/latest and explicit --version v2.6.2) MUST fail closed!
+	for _, curWithBuild := range []string{"2.7.3+git.abc123", "v2.7.3+20261123.dirty", "2.7.3-rc.1+sha.deadbeef"} {
+		for _, cliArgs := range [][]string{nil, {"--version", "v2.6.2"}} {
+			var outBuf, errBuf bytes.Buffer
+			rc := runUpdateWithDeps(context.Background(), cliArgs, &outBuf, &errBuf, makeDeps(curWithBuild))
+			if rc == 0 {
+				t.Fatalf("SECURITY: expected downgrade from %q (args=%v) to v2.6.2 to fail closed!", curWithBuild, cliArgs)
+			}
+			if !strings.Contains(errBuf.String(), ErrDowngradeRefused.Error()) {
+				t.Fatalf("expected ErrDowngradeRefused for %q, got %q", curWithBuild, errBuf.String())
+			}
+			if got, _ := os.ReadFile(exePath); !bytes.Equal(got, origBytes) {
+				t.Fatalf("SECURITY: binary modified despite refused downgrade from %q", curWithBuild)
+			}
+		}
+	}
+
+	// 2. Unparseable or "dev" current binary version MUST NEVER fail open (both implicit and explicit --version)!
+	for _, unparseableCur := range []string{"dev", "0-custom", "main-snapshot", "2.7.3+", "2.7.3+bad/meta", "not-a-semver"} {
+		for _, cliArgs := range [][]string{nil, {"--version", "v2.6.2"}, {"--version", "v2.7.4"}} {
+			var outBuf, errBuf bytes.Buffer
+			rc := runUpdateWithDeps(context.Background(), cliArgs, &outBuf, &errBuf, makeDeps(unparseableCur))
+			if rc == 0 {
+				t.Fatalf("SECURITY: expected update from unparseable current version %q (args=%v) without --allow-downgrade to fail closed!", unparseableCur, cliArgs)
+			}
+			if !strings.Contains(errBuf.String(), ErrDowngradeRefused.Error()) {
+				t.Fatalf("expected ErrDowngradeRefused for current=%q, got %q", unparseableCur, errBuf.String())
+			}
+			if got, _ := os.ReadFile(exePath); !bytes.Equal(got, origBytes) {
+				t.Fatalf("SECURITY: binary modified on unparseable current version %q", unparseableCur)
+			}
+		}
+	}
+
+	// 3. Unparseable target versions (both --version and upstream tag_name, including +build in tag) MUST always fail closed even with --allow-downgrade!
+	for _, badTarget := range []string{"dev", "latest", "v2.7", "v2.7.3+build1", "v2.7.3/../../pwn"} {
+		var outBuf, errBuf bytes.Buffer
+		if rc := runUpdateWithDeps(context.Background(), []string{"--version", badTarget, "--allow-downgrade"}, &outBuf, &errBuf, makeDeps("2.7.3")); rc == 0 {
+			t.Fatalf("SECURITY: expected invalid --version %q to fail closed even with --allow-downgrade", badTarget)
+		}
+		latestTag = badTarget
+		outBuf.Reset()
+		errBuf.Reset()
+		if rc := runUpdateWithDeps(context.Background(), []string{"--allow-downgrade"}, &outBuf, &errBuf, makeDeps("2.7.3")); rc == 0 {
+			t.Fatalf("SECURITY: expected invalid upstream tag_name %q to fail closed even with --allow-downgrade", badTarget)
+		}
+	}
+
+	// 4. Valid upgrade from `2.7.3+git.abc` -> `v2.7.4` succeeds cleanly, and numeric prerelease ordering (`rc.10 > rc.2`) holds!
+	if cmp, err := compareSemverTagsChecked("v2.7.4-rc.10", "v2.7.4-rc.2"); err != nil || cmp <= 0 {
+		t.Fatalf("expected v2.7.4-rc.10 > v2.7.4-rc.2, got cmp=%d err=%v", cmp, err)
+	}
+	if cmp, err := compareSemverTagsChecked("v2.7.4", "v2.7.4-rc.10"); err != nil || cmp <= 0 {
+		t.Fatalf("expected stable v2.7.4 > v2.7.4-rc.10, got cmp=%d err=%v", cmp, err)
+	}
+	latestTag = "v2.7.4"
+	var outBuf, errBuf bytes.Buffer
+	if rc := runUpdateWithDeps(context.Background(), nil, &outBuf, &errBuf, makeDeps("2.7.3+git.abc")); rc != 0 {
+		t.Fatalf("expected upgrade from 2.7.3+git.abc -> v2.7.4 to succeed: rc=%d stderr=%s", rc, errBuf.String())
+	}
+	if got, _ := os.ReadFile(exePath); !bytes.Equal(got, payload274) {
+		t.Fatalf("expected updated v2.7.4 payload, got %q", string(got))
+	}
+
+	// 5. Explicit `--allow-downgrade` from `"dev"` binary succeeds when operator intentionally opts in.
+	if err := os.WriteFile(exePath, origBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outBuf.Reset()
+	errBuf.Reset()
+	if rc := runUpdateWithDeps(context.Background(), []string{"--allow-downgrade"}, &outBuf, &errBuf, makeDeps("dev")); rc != 0 {
+		t.Fatalf("expected explicit --allow-downgrade on 'dev' binary to succeed: rc=%d stderr=%s", rc, errBuf.String())
+	}
+	if got, _ := os.ReadFile(exePath); !bytes.Equal(got, payload274) {
+		t.Fatalf("expected v2.7.4 installed over 'dev' with --allow-downgrade, got %q", string(got))
 	}
 }

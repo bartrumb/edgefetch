@@ -20,10 +20,13 @@ import { getActiveRequestTracer, type RequestTracer } from './otel';
 import {
   DNS_NOT_FOUND_MESSAGE,
   isDnsNotFoundError,
+  isSchemeDowngradeError,
   isSsrfBlockedError,
+  SCHEME_DOWNGRADE_BLOCKED_INFO,
   scrubResolverIpFromError,
   SSRF_BLOCKED_INFO,
   validatePublicHttpsTargetUrl,
+  type TargetUrlRejectionReason,
 } from './overflow';
 import { readBodyTextCapped } from './safe-input';
 import { classifyWafAndChallenge, refineBlockedInfo } from './waf';
@@ -354,9 +357,12 @@ function hasRequiredToolScope(scopes: string[], needed: 'crawl:read' | 'crawl:fe
   return scopes.includes('crawl:fetch');
 }
 
-function validatePublicHttpsUrl(raw: unknown, selfHost?: string): { ok: true; url: string } | { ok: false; error: string } {
+function validatePublicHttpsUrl(
+  raw: unknown,
+  selfHost?: string,
+): { ok: true; url: string } | { ok: false; reason: TargetUrlRejectionReason; error: string } {
   const res = validatePublicHttpsTargetUrl(raw, selfHost);
-  return res.ok ? { ok: true, url: res.normalized } : { ok: false, error: res.message };
+  return res.ok ? { ok: true, url: res.normalized } : { ok: false, reason: res.reason, error: res.message };
 }
 
 /**
@@ -1432,6 +1438,11 @@ export function truncateResultBodies(
         if (redir.filtersMayBeLost) copy.filtersMayBeLost = true;
       }
     }
+    const isSyntheticRedir403 =
+      copy.status === 403 &&
+      typeof copy.body === 'string' &&
+      copy.body.length <= 512 &&
+      /^\s*forbidden redirect target:/i.test(copy.body);
     if (copy.outcome !== 'ok' && isDnsNotFoundError(copy.outcome, copy.problem)) {
       copy.outcome = 'dns_not_found';
       copy.error = 'dns_not_found';
@@ -1440,11 +1451,23 @@ export function truncateResultBodies(
       copy.problem = typeof copy.problem === 'string' && copy.problem ? copy.problem : DNS_NOT_FOUND_MESSAGE;
       delete copy.blocked;
       delete copy.body;
-    } else if (copy.outcome !== 'ok' && isSsrfBlockedError(copy.outcome, copy.problem)) {
+    } else if (copy.outcome !== 'ok' && isSchemeDowngradeError(copy.outcome, copy.problem, copy.blockedReason)) {
       copy.outcome = 'blocked';
+      copy.blockedReason = 'scheme_downgrade';
+      copy.blocked = { ...SCHEME_DOWNGRADE_BLOCKED_INFO };
+      copy.problem = SCHEME_DOWNGRADE_BLOCKED_INFO.message;
+      delete copy.body;
+      delete copy.artifact;
+      delete copy.artifactId;
+    } else if (isSyntheticRedir403 || (copy.outcome !== 'ok' && isSsrfBlockedError(copy.outcome, copy.problem, copy.blockedReason))) {
+      copy.outcome = 'blocked';
+      copy.status = 0;
+      copy.blockedReason = 'ssrf';
       copy.blocked = { ...SSRF_BLOCKED_INFO };
       copy.problem = SSRF_BLOCKED_INFO.message;
       delete copy.body;
+      delete copy.artifact;
+      delete copy.artifactId;
     } else if (copy.outcome !== 'ok' && typeof copy.url === 'string') {
       if (!copy.waf && typeof copy.status === 'number' && copy.status !== 402 && copy.outcome !== 'payment_required') {
         const inferredWaf = classifyWafAndChallenge({
@@ -1574,9 +1597,35 @@ async function handleToolCallInner(
     }
 
     let requests: Array<Record<string, unknown>>;
+    const preBlockedByIndex = new Map<number, Record<string, unknown>>();
     if (name === 'fetch_url') {
       const check = validatePublicHttpsUrl(args.url, deps.selfHost);
-      if (!check.ok) return { content: [{ type: 'text', text: check.error }], isError: true };
+      if (!check.ok) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  ok: false,
+                  outcome: 'blocked',
+                  error: check.reason,
+                  retryable: false,
+                  message: check.error,
+                  blocked: {
+                    reason: check.reason,
+                    retryable: false,
+                    message: check.error,
+                  },
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
       const kind = explicitKind ?? inferKindForUrl(check.url);
       const accept = textAcceptFor(kind, check.url, args.accept);
       if (!accept.ok) return { content: [{ type: 'text', text: accept.error }], isError: true };
@@ -1605,7 +1654,25 @@ async function handleToolCallInner(
             ? entryObj.kind
             : explicitKind;
         const check = validatePublicHttpsUrl(rawUrlVal, deps.selfHost);
-        if (!check.ok) return { content: [{ type: 'text', text: `urls[${i}]: ${check.error}` }], isError: true };
+        if (!check.ok) {
+          preBlockedByIndex.set(i, {
+            id: `mcp-${i + 1}`,
+            url: typeof rawUrlVal === 'string' ? rawUrlVal : String(rawUrlVal ?? ''),
+            status: 0,
+            outcome: 'blocked',
+            blockedReason: check.reason,
+            error: check.reason,
+            retryable: false,
+            message: check.error,
+            problem: check.error,
+            blocked: {
+              reason: check.reason,
+              retryable: false,
+              message: check.error,
+            },
+          });
+          continue;
+        }
         const kind = itemExplicitKind ?? inferKindForUrl(check.url);
         const accept = textAcceptFor(kind, check.url, entryObj?.accept ?? args.accept);
         if (!accept.ok) return { content: [{ type: 'text', text: accept.error }], isError: true };
@@ -1617,6 +1684,45 @@ async function handleToolCallInner(
           ...(accept.accept ? { accept: accept.accept } : {}),
         });
       }
+    }
+
+    const requestedPauseMs =
+      typeof args.pauseMs === 'number' && Number.isFinite(args.pauseMs)
+        ? Math.min(30_000, Math.max(0, Math.floor(args.pauseMs)))
+        : undefined;
+    const effectivePauseMs = requestedPauseMs !== undefined ? Math.max(2_000, requestedPauseMs) : undefined;
+    const pacingEchoFields =
+      effectivePauseMs !== undefined
+        ? {
+            effectivePauseMs,
+            ...(requestedPauseMs! < effectivePauseMs
+              ? { politenessFloorNote: `Requested pauseMs (${requestedPauseMs}ms) was clamped to the per-host politeness floor (${effectivePauseMs}ms; edge nodes may also apply their configured site floor).` }
+              : {}),
+          }
+        : {};
+
+    if (name === 'fetch_batch' && requests.length === 0 && preBlockedByIndex.size > 0) {
+      const onlyBlocked = [...preBlockedByIndex.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, v]) => v);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                via: 'policy',
+                httpStatus: 200,
+                ...pacingEchoFields,
+                results: onlyBlocked,
+                summary: { total: onlyBlocked.length, byOutcome: { blocked: onlyBlocked.length } },
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
     }
 
     // Finding #4 & #6: Never truncate the R2 artifact upload when a caller passes a small `maxBytes` preview cap!
@@ -1641,7 +1747,7 @@ async function handleToolCallInner(
         ...(requestedMaxBytes !== undefined && requestedMaxBytes > 8 * 1024 * 1024
           ? { maxBytes: Math.min(16 << 20, requestedMaxBytes) }
           : {}),
-        ...(typeof args.pauseMs === 'number' ? { pauseMs: Math.min(30_000, Math.max(0, Math.floor(args.pauseMs))) } : {}),
+        ...(requestedPauseMs !== undefined ? { pauseMs: requestedPauseMs } : {}),
         ...(typeof args.pauseJitterMs === 'number'
           ? { pauseJitterMs: Math.min(15_000, Math.max(0, Math.floor(args.pauseJitterMs))) }
           : {}),
@@ -1677,6 +1783,38 @@ async function handleToolCallInner(
     try {
       const parsed = JSON.parse(res.bodyText) as Record<string, unknown>;
       const truncatedObj = truncateResultBodies(parsed, inlineMaxChars, explicitKind === undefined);
+      if (name === 'fetch_batch' && preBlockedByIndex.size > 0 && Array.isArray(truncatedObj.results)) {
+        const fetchedById = new Map<string, Record<string, unknown>>();
+        for (const item of truncatedObj.results) {
+          if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).id === 'string') {
+            fetchedById.set((item as Record<string, unknown>).id as string, item as Record<string, unknown>);
+          }
+        }
+        const totalBatchLen = Array.isArray(args.urls) ? args.urls.length : truncatedObj.results.length + preBlockedByIndex.size;
+        const mergedResults: Array<Record<string, unknown>> = [];
+        for (let i = 0; i < totalBatchLen; i++) {
+          const preBlocked = preBlockedByIndex.get(i);
+          if (preBlocked) {
+            mergedResults.push(preBlocked);
+          } else {
+            const found = fetchedById.get(`mcp-${i + 1}`);
+            if (found) mergedResults.push(found);
+          }
+        }
+        truncatedObj.results = mergedResults;
+        const prevSum =
+          truncatedObj.summary && typeof truncatedObj.summary === 'object'
+            ? { ...(truncatedObj.summary as Record<string, unknown>) }
+            : {};
+        const prevByOut =
+          prevSum.byOutcome && typeof prevSum.byOutcome === 'object'
+            ? { ...(prevSum.byOutcome as Record<string, number>) }
+            : {};
+        prevByOut.blocked = (prevByOut.blocked ?? 0) + preBlockedByIndex.size;
+        prevSum.total = mergedResults.length;
+        prevSum.byOutcome = prevByOut;
+        truncatedObj.summary = prevSum;
+      }
       const firstItem =
         name === 'fetch_url' && Array.isArray(truncatedObj.results) && truncatedObj.results.length === 1
           ? (truncatedObj.results[0] as Record<string, unknown> | undefined)
@@ -1703,6 +1841,7 @@ async function handleToolCallInner(
         ...topDnsFields,
         via: res.via,
         httpStatus: firstItem?.outcome === 'dns_not_found' ? 502 : res.status,
+        ...pacingEchoFields,
         ...(res.stageTimingsMs ? { stageTimingsMs: res.stageTimingsMs } : {}),
         ...truncatedObj,
       };
@@ -1728,7 +1867,13 @@ async function handleToolCallInner(
     if (!deps.readArtifact) {
       return { content: [{ type: 'text', text: 'Artifact storage is not configured on this hub.' }], isError: true };
     }
-    const blobSha256 = typeof args.artifactId === 'string' ? args.artifactId.trim().toLowerCase() : '';
+    const rawIdArg =
+      typeof args.artifactId === 'string' && args.artifactId.trim()
+        ? args.artifactId
+        : typeof args.blobSha256 === 'string'
+          ? args.blobSha256
+          : '';
+    const blobSha256 = rawIdArg.trim().toLowerCase();
     const retention = args.retention === 'stored' ? 'stored' : args.retention === 'transient' ? 'transient' : undefined;
     const format = args.format === 'markdown' ? 'markdown' : args.format === 'raw' ? 'raw' : undefined;
     const visibility = args.visibility === 'private' ? 'private' : args.visibility === 'public' ? 'public' : undefined;
@@ -1959,7 +2104,7 @@ async function handleToolCallInner(
 
   if (name === 'query_mcp') {
     const action = typeof args.action === 'string' ? args.action : 'list_connected';
-    if (action === 'call_tool') {
+    if (action === 'call_tool' || action === 'list_tools') {
       if (!scopes.includes('mcp:call')) {
         return {
           content: [
@@ -1969,7 +2114,7 @@ async function handleToolCallInner(
                 {
                   ok: false,
                   error: 'insufficient_scope',
-                  message: 'OAuth scope mcp:call is required for action="call_tool"',
+                  message: `OAuth scope mcp:call is required for action="${action}"`,
                 },
                 null,
                 2,

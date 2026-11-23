@@ -483,6 +483,12 @@ test('R8-H5: Require explicit GITHUB_OWNER_ID, never auto-pin oldest owner, and 
     assert.equal(callerSession.ok, true);
     if (!callerSession.ok) throw new Error('caller cookie invalid');
 
+    // 3. Operator sets explicit `GITHUB_OWNER_ID='100'` and `GITHUB_OWNER_LOGIN='real-founder'` BEFORE `gh_100` has ever signed in,
+    // and promotes Alice (`gh_201`) and Carol (`gh_203`) as founder-approved co-owners (`promoted_by_owner_id = '100'`).
+    // Previously `fallbackExistingOwner` auto-pinned `gh_201` (oldest owner row) and LOCKED OUT `gh_100`!
+    env.GITHUB_OWNER_ID = '100';
+    env.GITHUB_OWNER_LOGIN = 'real-founder';
+
     for (const uid of ['gh_201', 'gh_203']) {
       const p = await dispatch('/admin/api/users/role', {
         method: 'POST',
@@ -496,11 +502,6 @@ test('R8-H5: Require explicit GITHUB_OWNER_ID, never auto-pin oldest owner, and 
       });
       assert.equal(p.status, 200);
     }
-
-    // 3. Now operator sets explicit `GITHUB_OWNER_ID='100'` and `GITHUB_OWNER_LOGIN='real-founder'`.
-    // Previously `fallbackExistingOwner` auto-pinned `gh_201` (oldest owner row) and LOCKED OUT `gh_100`!
-    env.GITHUB_OWNER_ID = '100';
-    env.GITHUB_OWNER_LOGIN = 'real-founder';
 
     const realFounder = await signIn('code_founder_100');
     assert.equal(realFounder.userId, 'gh_100');

@@ -89,16 +89,25 @@ const FORBIDDEN_OTLP_HEADER_NAMES = new Set([
 ]);
 
 export const MAX_INFLIGHT_OTLP_EXPORTS = 32;
+export const MAX_SECURITY_AUDIT_INFLIGHT_OTLP = 24;
+export const MAX_PUBLIC_UNAUTH_INFLIGHT_OTLP = 8;
 export const UNAUTH_OTLP_EXPORT_CAPACITY = 30;
+export const SECURITY_AUDIT_OTLP_CAPACITY = 120;
 const UNAUTH_OTLP_WINDOW_MS = 60_000;
 
 let inflightOtlpExports = 0;
+let inflightSecurityAuditOtlp = 0;
+let inflightPublicUnauthOtlp = 0;
 let unauthOtlpTokens = UNAUTH_OTLP_EXPORT_CAPACITY;
 let unauthOtlpLastRefillMs = Date.now();
+let securityAuditOtlpTokens = SECURITY_AUDIT_OTLP_CAPACITY;
+let securityAuditOtlpLastRefillMs = Date.now();
 
 export function resetOtlpExportLimitersForTests(): void {
   unauthOtlpTokens = UNAUTH_OTLP_EXPORT_CAPACITY;
   unauthOtlpLastRefillMs = Date.now();
+  securityAuditOtlpTokens = SECURITY_AUDIT_OTLP_CAPACITY;
+  securityAuditOtlpLastRefillMs = Date.now();
 }
 
 function consumeUnauthOtlpBudget(nowMs = Date.now()): boolean {
@@ -108,6 +117,19 @@ function consumeUnauthOtlpBudget(nowMs = Date.now()): boolean {
   unauthOtlpLastRefillMs = nowMs;
   if (unauthOtlpTokens < 1) return false;
   unauthOtlpTokens -= 1;
+  return true;
+}
+
+function consumeSecurityAuditOtlpBudget(nowMs = Date.now()): boolean {
+  const elapsed = Math.max(0, nowMs - securityAuditOtlpLastRefillMs);
+  const refillPerMs = SECURITY_AUDIT_OTLP_CAPACITY / UNAUTH_OTLP_WINDOW_MS;
+  securityAuditOtlpTokens = Math.min(
+    SECURITY_AUDIT_OTLP_CAPACITY,
+    securityAuditOtlpTokens + elapsed * refillPerMs,
+  );
+  securityAuditOtlpLastRefillMs = nowMs;
+  if (securityAuditOtlpTokens < 1) return false;
+  securityAuditOtlpTokens -= 1;
   return true;
 }
 
@@ -150,20 +172,74 @@ function sanitizeInboundRequestId(raw: string | null | undefined): string | null
   return trimmed;
 }
 
+function hasHeaderValue(headers: Headers | undefined, name: string): boolean {
+  if (!headers || typeof headers.get !== 'function') return false;
+  const val = headers.get(name);
+  return typeof val === 'string' && val.trim().length > 0;
+}
+
+function isNonSuppressibleAuditRequest(request: Request, preVerified = false): boolean {
+  if (preVerified) return true;
+  if (
+    hasHeaderValue(request.headers, 'authorization') ||
+    hasHeaderValue(request.headers, 'x-api-key') ||
+    hasHeaderValue(request.headers, 'cookie') ||
+    hasHeaderValue(request.headers, 'x-agent-token')
+  ) {
+    return true;
+  }
+  try {
+    const pathname = new URL(request.url).pathname;
+    if (
+      pathname === '/admin' ||
+      pathname.startsWith('/admin/') ||
+      pathname.startsWith('/oauth/') ||
+      pathname === '/mcp' ||
+      pathname.startsWith('/mcp/') ||
+      pathname === '/fetch' ||
+      pathname === '/agents' ||
+      pathname.startsWith('/agent/')
+    ) {
+      return true;
+    }
+  } catch {
+    // ignore malformed URLs in synthetic unit-test Request stubs
+  }
+  return false;
+}
+
+function isNonSuppressibleAuditSpanName(name: string): boolean {
+  return (
+    name.startsWith('edgefetch.admin.') ||
+    name.startsWith('edgefetch.oauth.') ||
+    name === 'edgefetch.mcp.tool' ||
+    name === 'edgefetch.mcp_query' ||
+    name === 'edgefetch.mcp_registry' ||
+    name === 'edgefetch.dispatch' ||
+    name.startsWith('edgefetch.agent.')
+  );
+}
+
 /** Extracts W3C `traceparent` from `request` or starts a new root trace context, returning propagation headers for Go workers. */
 export function createRequestTraceContext(request: Request): {
   context: TraceContext;
   headers: Record<string, string>;
 } {
-  const parsed = parseTraceparent(request.headers.get('traceparent'));
-  const context: TraceContext = parsed ?? {
-    traceId: randomHex(16),
-    spanId: randomHex(8),
-    sampled: true,
-  };
+  const parsed = parseTraceparent(request.headers?.get?.('traceparent'));
+  const forceSampled = isNonSuppressibleAuditRequest(request, isRequestVerifiedInProcess(request));
+  const context: TraceContext = parsed
+    ? {
+        ...parsed,
+        sampled: parsed.sampled || forceSampled,
+      }
+    : {
+        traceId: randomHex(16),
+        spanId: randomHex(8),
+        sampled: true,
+      };
   const ray =
-    sanitizeInboundRequestId(request.headers.get('cf-ray')) ??
-    sanitizeInboundRequestId(request.headers.get('x-request-id')) ??
+    sanitizeInboundRequestId(request.headers?.get?.('cf-ray')) ??
+    sanitizeInboundRequestId(request.headers?.get?.('x-request-id')) ??
     context.spanId;
   return {
     context,
@@ -240,7 +316,7 @@ export function buildOtlpTracePayload(params: {
   spans: OtlpSpanInput[];
 }): Record<string, unknown> {
   const serviceName = params.serviceName?.trim() || 'edgefetch-hub';
-  const serviceVersion = params.serviceVersion?.trim() || '2.7.3';
+  const serviceVersion = params.serviceVersion?.trim() || '2.7.4';
   return {
     resourceSpans: [
       {
@@ -439,11 +515,22 @@ export async function flushOtlpSpans(params: {
   env: OtelEnvConfig;
   spans: OtlpSpanInput[];
   fetchFn?: typeof fetch;
+  priority?: 'authenticated' | 'security_audit' | 'public_unauth';
 }): Promise<boolean> {
   if (params.spans.length === 0) return false;
   const tracesUrl = resolveOtlpTracesUrl(params.env.OTEL_EXPORTER_OTLP_ENDPOINT);
   if (!tracesUrl) return false;
+  const priority = params.priority ?? 'authenticated';
   if (inflightOtlpExports >= MAX_INFLIGHT_OTLP_EXPORTS) return false;
+  if (priority === 'public_unauth' && inflightPublicUnauthOtlp >= MAX_PUBLIC_UNAUTH_INFLIGHT_OTLP) {
+    return false;
+  }
+  if (
+    priority === 'security_audit' &&
+    inflightSecurityAuditOtlp + inflightPublicUnauthOtlp >= MAX_SECURITY_AUDIT_INFLIGHT_OTLP
+  ) {
+    return false;
+  }
 
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -460,6 +547,8 @@ export async function flushOtlpSpans(params: {
   }, 4_000);
   (timer as { unref?: () => void }).unref?.();
   inflightOtlpExports++;
+  if (priority === 'public_unauth') inflightPublicUnauthOtlp++;
+  else if (priority === 'security_audit') inflightSecurityAuditOtlp++;
   try {
     const res = await doFetch(tracesUrl, {
       method: 'POST',
@@ -474,6 +563,8 @@ export async function flushOtlpSpans(params: {
     return false;
   } finally {
     inflightOtlpExports = Math.max(0, inflightOtlpExports - 1);
+    if (priority === 'public_unauth') inflightPublicUnauthOtlp = Math.max(0, inflightPublicUnauthOtlp - 1);
+    else if (priority === 'security_audit') inflightSecurityAuditOtlp = Math.max(0, inflightSecurityAuditOtlp - 1);
     clearTimeout(timer);
   }
 }
@@ -506,7 +597,7 @@ const PROTECTED_ROUTE_SPAN_NAMES: ReadonlySet<string> = new Set([
 function classifyBatchAuthStatus(
   batch: OtlpSpanInput[],
   explicitAuthenticated: boolean,
-): 'authenticated' | 'unauth_rejected' | 'public_unauth' {
+): 'authenticated' | 'security_audit' | 'unauth_rejected' | 'public_unauth' {
   if (explicitAuthenticated) return 'authenticated';
   const serverHttpSpan = batch.find((s) => s.name === 'edgefetch.http' && s.kind === 2);
   if (!serverHttpSpan) {
@@ -522,21 +613,40 @@ function classifyBatchAuthStatus(
       s.name === 'edgefetch.mcp.tool' ||
       s.name.startsWith('edgefetch.agent.') ||
       s.attributes?.['admin.outcome'] === 'authenticated' ||
+      s.attributes?.['admin.outcome'] === 'logged_out' ||
+      (s.name.startsWith('edgefetch.admin.') &&
+        s.name !== 'edgefetch.admin.login' &&
+        s.name !== 'edgefetch.admin.github_login' &&
+        s.name !== 'edgefetch.admin.github_callback' &&
+        httpStatus !== 401 &&
+        s.attributes?.['admin.outcome'] !== 'unauthorized') ||
+      (s.name === 'edgefetch.oauth.authorize' && s.attributes?.['oauth.outcome'] === 'approved') ||
+      ((s.name === 'edgefetch.oauth.token' ||
+        s.name === 'edgefetch.oauth.refresh' ||
+        s.name === 'edgefetch.oauth.revoke') &&
+        ((httpStatus >= 200 && httpStatus < 300) || s.attributes?.['oauth.outcome'] === 'replay_detected')) ||
       (httpStatus !== 401 && httpStatus !== 403 && PROTECTED_ROUTE_SPAN_NAMES.has(s.name)),
   );
   if (hasAuthenticatedWork) return 'authenticated';
-  if (httpStatus === 401 || httpStatus === 403) {
-    // Preserve rate-limited OTLP `/admin` security audit spans (`edgefetch.admin.*` unauthorized/invalid_csrf)
-    // while strictly dropping all other unauthenticated `401`/`403` requests (`0` OTLP & `0` dev-telemetry).
-    const hasAdminAuditSpan = batch.some((s) => s.name.startsWith('edgefetch.admin.'));
-    return hasAdminAuditSpan ? 'public_unauth' : 'unauth_rejected';
-  }
   const hasAdminAuthenticated =
     httpStatus >= 200 &&
     httpStatus < 400 &&
     typeof serverHttpSpan.attributes?.['url.path'] === 'string' &&
-    serverHttpSpan.attributes['url.path'].startsWith('/admin/api/');
+    (serverHttpSpan.attributes['url.path'].startsWith('/admin/api/') ||
+      serverHttpSpan.attributes['url.path'].startsWith('/admin/mcp/'));
   if (hasAdminAuthenticated) return 'authenticated';
+
+  // Isolate `/admin/*` and `/oauth/*` security audit spans onto a dedicated security-audit budget so public
+  // discovery traffic (`/openapi.json`, `/.well-known/*`, `/health`, `401` floods) can NEVER drain audit exports!
+  const hasSecurityAuditSpan = batch.some(
+    (s) => s.name.startsWith('edgefetch.admin.') || s.name.startsWith('edgefetch.oauth.'),
+  );
+  if (hasSecurityAuditSpan) {
+    return 'security_audit';
+  }
+  if (httpStatus === 401 || httpStatus === 403) {
+    return 'unauth_rejected';
+  }
   return 'public_unauth';
 }
 
@@ -616,6 +726,9 @@ export class RequestTracer {
       }
     }
     const preVerified = Boolean(opts?.authenticated) || isRequestVerifiedInProcess(request);
+    if (preVerified && !context.sampled) {
+      context.sampled = true;
+    }
     return new RequestTracer(
       {
         rootContext: context,
@@ -691,6 +804,9 @@ export class RequestTracer {
 
   markAuthenticated(authenticated = true): void {
     this.state.authenticated = authenticated;
+    if (authenticated) {
+      this.state.rootContext.sampled = true;
+    }
   }
 
   get context(): TraceContext {
@@ -715,6 +831,9 @@ export class RequestTracer {
   }
 
   startSpan(name: string, opts?: SpanStartOptions): ActiveSpanHandle {
+    if (isNonSuppressibleAuditSpanName(name)) {
+      this.state.rootContext.sampled = true;
+    }
     const claimRoot = this.currentSpan === undefined && !this.state.rootSpanClaimed;
     if (claimRoot) {
       this.state.rootSpanClaimed = true;
@@ -738,14 +857,22 @@ export class RequestTracer {
       spanId,
       ...(parentSpanId ? { parentSpanId } : {}),
       name,
-      sampled: state.rootContext.sampled,
+      get sampled() {
+        return state.rootContext.sampled;
+      },
       setAttribute(key, value) {
         if (ended) return;
+        if (key === 'admin.outcome' || key === 'oauth.outcome') {
+          state.rootContext.sampled = true;
+        }
         const sanitized = sanitizeSpanAttributes({ [key]: value });
         Object.assign(attributes, sanitized);
       },
       setAttributes(attrs) {
         if (ended) return;
+        if ('admin.outcome' in attrs || 'oauth.outcome' in attrs) {
+          state.rootContext.sampled = true;
+        }
         Object.assign(attributes, sanitizeSpanAttributes(attrs));
       },
       setStatus(ok, errMsg) {
@@ -871,7 +998,12 @@ export class RequestTracer {
     if (authClass === 'unauth_rejected') {
       return false;
     }
-    const allowOtlp = authClass === 'authenticated' || consumeUnauthOtlpBudget();
+    const allowOtlp =
+      authClass === 'authenticated'
+        ? true
+        : authClass === 'security_audit'
+          ? consumeSecurityAuditOtlpBudget()
+          : consumeUnauthOtlpBudget();
     const allowDevTelemetry = authClass === 'authenticated';
 
     const doFlush = Promise.all([
@@ -879,6 +1011,7 @@ export class RequestTracer {
         ? flushOtlpSpans({
             env: params.env,
             spans: batch,
+            priority: authClass,
             ...(params.fetchFn ?? params.env.SAFE_FETCH ? { fetchFn: params.fetchFn ?? params.env.SAFE_FETCH } : {}),
           })
         : Promise.resolve(false),

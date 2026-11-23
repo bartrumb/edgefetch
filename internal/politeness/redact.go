@@ -41,11 +41,23 @@ func isHostStartByte(b byte) bool {
 
 func isProtoRelBoundary(b byte) bool {
 	switch b {
-	case ' ', '\t', '\r', '\n', '"', '\'', '=', '(', '<', ',':
+	case ' ', '\t', '\r', '\n', '"', '\'', '=', '(', '[', '{', '<', ',', ';', '|':
 		return true
 	default:
 		return false
 	}
+}
+
+func hasEncodedBoundaryBefore(s string, i int) bool {
+	if i < 3 || s[i-3] != '%' {
+		return false
+	}
+	sub := s[i-3 : i]
+	return hasPrefixFoldASCII(sub, "%22") || hasPrefixFoldASCII(sub, "%27") ||
+		hasPrefixFoldASCII(sub, "%20") || hasPrefixFoldASCII(sub, "%09") ||
+		hasPrefixFoldASCII(sub, "%0a") || hasPrefixFoldASCII(sub, "%0d") ||
+		hasPrefixFoldASCII(sub, "%3c") || hasPrefixFoldASCII(sub, "%28") ||
+		hasPrefixFoldASCII(sub, "%3d")
 }
 
 func matchURLSchemeAt(s string, i int) (sep urlSepKind, afterSep int) {
@@ -53,17 +65,33 @@ func matchURLSchemeAt(s string, i int) (sep urlSepKind, afterSep int) {
 		return urlSepNone, 0
 	}
 	if s[i] == '/' {
-		if i+2 < len(s) && s[i+1] == '/' && isHostStartByte(s[i+2]) && (i == 0 || isProtoRelBoundary(s[i-1])) {
-			return urlSepProtoRel, i + 2
+		if i+2 < len(s) && s[i+1] == '/' && isHostStartByte(s[i+2]) &&
+			(i == 0 || isProtoRelBoundary(s[i-1]) || hasEncodedBoundaryBefore(s, i)) {
+			// Verify authority after // looks like a real host ([ipv6], localhost, user@..., or domain with dot), not a plain //comment.
+			rest := s[i+2:]
+			endAuth := len(rest)
+			for k := 0; k < len(rest); k++ {
+				c := rest[k]
+				if c == '/' || c == '?' || c == '#' || c == ';' || c <= ' ' || c == '"' || c == '\'' || c == ')' || c == '>' || c == '%' {
+					endAuth = k
+					break
+				}
+			}
+			auth := rest[:endAuth]
+			if strings.HasPrefix(rest, "[") || strings.IndexByte(auth, '.') > 0 || strings.IndexByte(auth, '@') > 0 || hasPrefixFoldASCII(auth, "localhost") {
+				return urlSepProtoRel, i + 2
+			}
 		}
 		return urlSepNone, 0
 	}
 	c0 := asciiLowerByte(s[i])
-	if c0 != 'h' && c0 != 'w' && c0 != 'f' && c0 != 's' && c0 != 'r' && c0 != 'p' && c0 != 'm' {
+	switch c0 {
+	case 'h', 'w', 'f', 's', 'r', 'p', 'm', 'a', 'g', 'l', 'n':
+	default:
 		return urlSepNone, 0
 	}
-	// Avoid matching inside a longer identifier like "myhttp://", except known URI prefixes like "blob:https://".
-	if i > 0 {
+	// Avoid matching inside a longer identifier like "myhttp://", except percent-encoded quotes/spaces like "%22https://".
+	if i > 0 && !hasEncodedBoundaryBefore(s, i) {
 		prev := asciiLowerByte(s[i-1])
 		if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') {
 			return urlSepNone, 0
@@ -90,8 +118,16 @@ func matchURLSchemeAt(s string, i int) (sep urlSepKind, afterSep int) {
 		schemeLen = 4
 	case hasPrefixFoldASCII(rem, "ftp"):
 		schemeLen = 3
+	case hasPrefixFoldASCII(rem, "file"):
+		schemeLen = 4
 	case hasPrefixFoldASCII(rem, "sftp"):
 		schemeLen = 4
+	case hasPrefixFoldASCII(rem, "ssh"):
+		schemeLen = 3
+	case hasPrefixFoldASCII(rem, "s3"):
+		schemeLen = 2
+	case hasPrefixFoldASCII(rem, "gs"):
+		schemeLen = 2
 	case hasPrefixFoldASCII(rem, "socks5h"):
 		schemeLen = 7
 	case hasPrefixFoldASCII(rem, "socks5"):
@@ -104,6 +140,22 @@ func matchURLSchemeAt(s string, i int) (sep urlSepKind, afterSep int) {
 		schemeLen = 10
 	case hasPrefixFoldASCII(rem, "postgres"):
 		schemeLen = 8
+	case hasPrefixFoldASCII(rem, "mongodb+srv"):
+		schemeLen = 11
+	case hasPrefixFoldASCII(rem, "mongodb"):
+		schemeLen = 7
+	case hasPrefixFoldASCII(rem, "mysql"):
+		schemeLen = 5
+	case hasPrefixFoldASCII(rem, "amqps"):
+		schemeLen = 5
+	case hasPrefixFoldASCII(rem, "amqp"):
+		schemeLen = 4
+	case hasPrefixFoldASCII(rem, "ldaps"):
+		schemeLen = 5
+	case hasPrefixFoldASCII(rem, "ldap"):
+		schemeLen = 4
+	case hasPrefixFoldASCII(rem, "nats"):
+		schemeLen = 4
 	default:
 		return urlSepNone, 0
 	}
@@ -150,6 +202,13 @@ var sensitivePathActionSegments = map[string]bool{
 	"invite":      true,
 	"activate":    true,
 	"unsubscribe": true,
+	"secret":      true,
+	"secrets":     true,
+	"apikey":      true,
+	"api-key":     true,
+	"api_key":     true,
+	"webhook":     true,
+	"webhooks":    true,
 }
 
 func scrubPathMatrixAndResetTokens(pathPart string) string {
@@ -159,10 +218,14 @@ func scrubPathMatrixAndResetTokens(pathPart string) string {
 	needsWork := strings.IndexByte(pathPart, ';') >= 0
 	if !needsWork {
 		lp := strings.ToLower(pathPart)
-		for k := range sensitivePathActionSegments {
-			if strings.Contains(lp, "/"+k+"/") {
-				needsWork = true
-				break
+		if strings.Contains(lp, "/secret") {
+			needsWork = true
+		} else {
+			for k := range sensitivePathActionSegments {
+				if strings.Contains(lp, "/"+k+"/") {
+					needsWork = true
+					break
+				}
 			}
 		}
 	}
@@ -179,12 +242,18 @@ func scrubPathMatrixAndResetTokens(pathPart string) string {
 		if seg == "" {
 			continue
 		}
+		lowSeg := strings.ToLower(seg)
 		if redactNext {
 			segs[idx] = "[REDACTED]"
 			redactNext = false
 			continue
 		}
-		if sensitivePathActionSegments[strings.ToLower(seg)] {
+		if lowSeg == "secret" || lowSeg == "secrets" {
+			segs[idx] = "[REDACTED]"
+			redactNext = idx+1 < len(segs) && segs[idx+1] != ""
+			continue
+		}
+		if sensitivePathActionSegments[lowSeg] {
 			redactNext = true
 		}
 	}
@@ -307,14 +376,10 @@ func scrubMatchedURL(raw string, kind urlSepKind) string {
 	if idx := strings.IndexByte(raw, '?'); idx >= 0 {
 		raw = raw[:idx]
 	}
-	if idx := strings.Index(raw, `\u003f`); idx >= 0 {
-		raw = raw[:idx]
-	}
-	if idx := strings.Index(raw, `\u003F`); idx >= 0 {
-		raw = raw[:idx]
-	}
+	raw = cutEarliestFold(raw, `\u003f`, `\u0023`, "%3f", "%23")
 
 	if sepEnd >= 0 && sepEnd <= len(raw) {
+		isFileScheme := sepEnd >= 7 && hasPrefixFoldASCII(raw[:sepEnd], "file://")
 		rest := raw[sepEnd:]
 		slash := strings.IndexByte(rest, '/')
 		auth := rest
@@ -324,7 +389,13 @@ func scrubMatchedURL(raw string, kind urlSepKind) string {
 			pathPart = rest[slash:]
 		}
 		auth = stripAuthUserinfo(auth)
-		pathPart = scrubPathMatrixAndResetTokens(pathPart)
+		if isFileScheme {
+			if pathPart != "" && pathPart != "/" {
+				pathPart = "/[REDACTED]"
+			}
+		} else {
+			pathPart = scrubPathMatrixAndResetTokens(pathPart)
+		}
 		raw = raw[:sepEnd] + auth + pathPart
 	}
 	return raw
@@ -390,7 +461,7 @@ func SanitizeURL(raw string) string {
 	}
 	if kind, _ := matchURLSchemeAt(trimmed, 0); kind != urlSepNone {
 		scrubbed := scrubMatchedURL(trimmed, kind)
-		if kind == urlSepPlain {
+		if kind == urlSepPlain && !hasPrefixFoldASCII(scrubbed, "file://") {
 			if u, err := url.Parse(scrubbed); err == nil && u.Scheme != "" {
 				u.User = nil
 				u.RawQuery = ""
@@ -448,7 +519,7 @@ func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 	j := start
 	for j < len(s) {
 		if sawQuery && kind != urlSepPctEncoded && kind != urlSepJSONSlash {
-			rel := strings.IndexAny(s[j:], " \t\r\n<>'\u0085\u2028\u2029")
+			rel := strings.IndexAny(s[j:], " \t\r\n<>')]}%\u0085\u2028\u2029")
 			if rel < 0 {
 				j = len(s)
 				break
@@ -466,8 +537,22 @@ func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 			j += 3
 			continue
 		}
-		if c == '\r' || c == '\n' || c == '<' || c == '>' || c == '\'' {
+		if c == '\r' || c == '\n' || c == '<' || c == '>' || c == '\'' || c == ')' || c == ']' || c == '}' {
+			// Allow ']' inside an IPv6 host literal (`scheme://[::1]:8080/...`) or malformed userinfo before '@'.
+			if c == ']' && !sawQuery {
+				if openBr := strings.LastIndexByte(s[start:j], '['); openBr >= 0 && strings.IndexByte(s[start+openBr:j], '/') < 0 {
+					j++
+					continue
+				}
+			}
 			break
+		}
+		if hasPrefixFoldASCII(s[j:], "%22") || hasPrefixFoldASCII(s[j:], "%27") || hasPrefixFoldASCII(s[j:], "%3e") {
+			// If URL was delimited by %22/%27/%3c or %22 is followed by whitespace/colon, terminate before the encoded quote.
+			if (start >= 5 && hasEncodedBoundaryBefore(s, start-2)) ||
+				j+3 >= len(s) || s[j+3] == ':' || s[j+3] == ' ' || s[j+3] == ',' || s[j+3] == ';' || s[j+3] == ')' {
+				break
+			}
 		}
 		// Unicode NEL (C2 85) and LS/PS (E2 80 A8 / E2 80 A9) terminate unquoted tokens.
 		if c == 0xc2 && j+1 < len(s) && s[j+1] == 0x85 {
@@ -506,16 +591,181 @@ func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 		}
 		j++
 	}
-	// Trim trailing sentence punctuation (e.g. `,` in `http://[::1]:8080/p?k=SECRET, http://...`).
+	// Trim trailing sentence punctuation (e.g. `,` or `;` in `http://[::1]:8080/p?k=SECRET, http://...`).
 	for j > start {
 		last := s[j-1]
-		if last == ',' || last == '.' {
+		if last == ',' || last == '.' || last == ';' {
 			j--
 			continue
 		}
 		break
 	}
 	return j
+}
+
+func isValidBareDomainHost(h string) bool {
+	if len(h) < 4 {
+		return false
+	}
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	// Check IPv4 literal a.b.c.d
+	if h[0] >= '0' && h[0] <= '9' {
+		endIP, _, ok := matchIPPortToken(h+":80", 0)
+		if ok && endIP == len(h)+3 {
+			return true
+		}
+	}
+	lastDot := -1
+	for i := 0; i < len(h); i++ {
+		c := h[i]
+		if c == '.' {
+			if i == 0 || i == len(h)-1 || h[i-1] == '.' || h[i-1] == '-' || h[i+1] == '-' {
+				return false
+			}
+			lastDot = i
+			continue
+		}
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	if lastDot <= 0 {
+		return false
+	}
+	tld := h[lastDot+1:]
+	if len(tld) < 2 {
+		return false
+	}
+	if hasPrefixFoldASCII(tld, "xn--") {
+		return len(tld) > 4
+	}
+	for i := 0; i < len(tld); i++ {
+		c := tld[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+			return false
+		}
+	}
+	return true
+}
+
+func tryMatchBareHostURLAt(s string, i int) (endIdx int, scrubbed string, scanSkipTo int, ok bool) {
+	if i > 0 && isSchemelessPrevBlocked(s[i-1]) && !hasEncodedBoundaryBefore(s, i) {
+		return 0, "", i + 1, false
+	}
+	c0 := s[i]
+	if !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || (c0 >= '0' && c0 <= '9') || c0 == '[') {
+		return 0, "", i + 1, false
+	}
+	n := len(s)
+	hostEnd := i
+	if c0 == '[' {
+		p := i + 1
+		for p < n && s[p] != ']' && p-i <= 64 {
+			c := s[p]
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':' || c == '.' || c == '%') {
+				return 0, "", p, false
+			}
+			p++
+		}
+		if p >= n || p <= i+2 || s[p] != ']' || strings.IndexByte(s[i+1:p], ':') < 0 {
+			return 0, "", p, false
+		}
+		hostEnd = p + 1
+	} else {
+		for hostEnd < n {
+			c := s[hostEnd]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' {
+				hostEnd++
+				continue
+			}
+			break
+		}
+		if !isValidBareDomainHost(s[i:hostEnd]) {
+			return 0, "", hostEnd, false
+		}
+	}
+
+	hasPort := false
+	afterAuth := hostEnd
+	if afterAuth < n && s[afterAuth] == ':' {
+		pStart := afterAuth + 1
+		pEnd := pStart
+		var portVal int
+		for pEnd < n && s[pEnd] >= '0' && s[pEnd] <= '9' && pEnd-pStart < 5 {
+			portVal = portVal*10 + int(s[pEnd]-'0')
+			pEnd++
+		}
+		if pEnd == pStart || portVal < 1 || portVal > 65535 {
+			return 0, "", hostEnd, false
+		}
+		hasPort = true
+		afterAuth = pEnd
+	} else if c0 == '[' {
+		// Bare [::1] without :port is only treated as a URL when immediately followed by /path
+		if afterAuth >= n || s[afterAuth] != '/' {
+			return 0, "", hostEnd, false
+		}
+	}
+
+	if afterAuth >= n {
+		return 0, "", afterAuth, false
+	}
+	nextCh := s[afterAuth]
+	if nextCh != '/' && !(hasPort && (nextCh == '?' || nextCh == '#' || nextCh == ';')) {
+		return 0, "", afterAuth, false
+	}
+
+	// Scan remainder of bare URL up to whitespace / quote / bracket / paren / %22
+	j := afterAuth
+	for j < n {
+		c := s[j]
+		if c <= ' ' || c == '"' || c == '\'' || c == '<' || c == '>' || c == ')' || c == ']' || c == '}' || c == '\\' {
+			break
+		}
+		if hasPrefixFoldASCII(s[j:], "%22") || hasPrefixFoldASCII(s[j:], "%27") || hasPrefixFoldASCII(s[j:], "%3e") {
+			break
+		}
+		if c == 0xc2 && j+1 < n && s[j+1] == 0x85 {
+			break
+		}
+		if c == 0xe2 && j+2 < n && s[j+1] == 0x80 && (s[j+2] == 0xa8 || s[j+2] == 0xa9) {
+			break
+		}
+		j++
+	}
+	for j > afterAuth && (s[j-1] == ',' || s[j-1] == '.' || s[j-1] == ';') {
+		j--
+	}
+	if j <= afterAuth {
+		return 0, "", afterAuth, false
+	}
+
+	authStr := s[i:afterAuth]
+	tail := s[afterAuth:j]
+	if hasPort || c0 == '[' {
+		// Bare `host.tld:8443/secret` or `[::1]:8080/secret?tok=1`: scrub path + query + fragment completely.
+		if strings.HasPrefix(tail, "/") && len(tail) > 1 {
+			return j, authStr + "/[REDACTED]", j, true
+		}
+		return j, authStr, j, true
+	}
+
+	// Domain without :port (`host.tld/path?key=1#tok=2`): scrub query, fragment, matrix params, and sensitive segments.
+	cleanTail := tail
+	if idx := strings.IndexByte(cleanTail, '#'); idx >= 0 {
+		cleanTail = cleanTail[:idx]
+	}
+	if idx := strings.IndexByte(cleanTail, '?'); idx >= 0 {
+		cleanTail = cleanTail[:idx]
+	}
+	cleanTail = cutEarliestFold(cleanTail, `\u003f`, `\u0023`, "%3f", "%23")
+	cleanTail = scrubPathMatrixAndResetTokens(cleanTail)
+	if cleanTail == tail {
+		return 0, "", j, false
+	}
+	return j, authStr + cleanTail, j, true
 }
 
 func isHostTokenBytes(h string) bool {
@@ -782,6 +1032,7 @@ func RedactEmbeddedURLs(s string) string {
 	var out strings.Builder
 	var spanCache schemelessSpanCache
 	copiedUpTo := 0
+	bareSkipUntil := 0
 	seenLookup := false
 	i := 0
 	for i < len(s) {
@@ -806,8 +1057,16 @@ func RedactEmbeddedURLs(s string) string {
 			kind, afterSep := matchURLSchemeAt(s, i)
 			if kind != urlSepNone {
 				endIdx := afterSep
-				if i > 0 && s[i-1] == '"' {
-					openBS := countPrecedingBackslashes(s, i-1)
+				quotePos := i - 1
+				if i >= 5 && hasPrefixFoldASCII(s[i-5:i], "blob:") {
+					quotePos = i - 6
+				}
+				if quotePos >= 0 && s[quotePos] == '"' {
+					openBS := countPrecedingBackslashes(s, quotePos)
+					if openBS%2 == 0 && openBS > 0 {
+						// Even number of preceding backslashes (`\\"https://...`) escapes the backslashes, NOT the quote!
+						openBS = 0
+					}
 					// Power-of-two modulus for recursive %q / JSON quote escaping (`openBS` in {0, 1, 3, 7, ...}).
 					step := (openBS + 1) * 2
 					foundClose := false
@@ -824,7 +1083,7 @@ func RedactEmbeddedURLs(s string) string {
 					if !foundClose {
 						endIdx = len(s)
 					}
-				} else if i > 0 && s[i-1] == '\'' {
+				} else if quotePos >= 0 && s[quotePos] == '\'' {
 					foundClose := false
 					for j := afterSep; j < len(s); j++ {
 						if s[j] == '\'' && countPrecedingBackslashes(s, j)%2 == 0 {
@@ -835,6 +1094,24 @@ func RedactEmbeddedURLs(s string) string {
 					}
 					if !foundClose {
 						endIdx = len(s)
+					}
+				} else if i >= 3 && (hasPrefixFoldASCII(s[i-3:i], "%22") || hasPrefixFoldASCII(s[i-3:i], "%27")) {
+					closeTag := strings.ToLower(s[i-3 : i])
+					foundClose := false
+					for j := afterSep; j+3 <= len(s); j++ {
+						if hasPrefixFoldASCII(s[j:], closeTag) {
+							endIdx = j
+							foundClose = true
+							break
+						}
+						if s[j] == '\r' || s[j] == '\n' {
+							endIdx = j
+							foundClose = true
+							break
+						}
+					}
+					if !foundClose {
+						endIdx = findUnquotedURLEnd(s, afterSep, kind)
 					}
 				} else {
 					endIdx = findUnquotedURLEnd(s, afterSep, kind)
@@ -872,6 +1149,25 @@ func RedactEmbeddedURLs(s string) string {
 			if !hasColon && !hasSlash && !hasPct && !hasSecretKw && i < spanCache.tokEnd && !spanCache.canMatchAny {
 				i = spanCache.tokEnd
 				continue
+			}
+		}
+
+		// Bare `host.tld:8443/secret`, `[::1]:8080/secret?tok=1`, or `host.tld/path?key=...#tok=...`
+		if (hasColon || hasSlash) && i >= bareSkipUntil {
+			endIdx, scrubbed, skipTo, matched := tryMatchBareHostURLAt(s, i)
+			if matched {
+				if out.Cap() == 0 {
+					out.Grow(len(s))
+				}
+				out.WriteString(s[copiedUpTo:i])
+				out.WriteString(scrubbed)
+				copiedUpTo = endIdx
+				bareSkipUntil = endIdx
+				i = endIdx
+				continue
+			}
+			if skipTo > bareSkipUntil {
+				bareSkipUntil = skipTo
 			}
 		}
 

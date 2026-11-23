@@ -77,6 +77,10 @@ func TestRound8FailClosedSanitizerEverywhereOutsideFences(t *testing.T) {
 		"autolink_inside_backticks":      "`<javascript:alert(1)>` and `<https://example.com>`",
 		"table_pipe_backtick_split":      "| h1 | h2 |\n|---|---|\n| `a | " + xssImg + "` |",
 		"setext_before_fence":            "Heading\n```\n" + xssImg + "\n===",
+		"para_interrupted_by_non1_ol":    "Paragraph line\n42. notes\n    ```html\n    " + xssImg + "\n    ```",
+		"para_interrupted_by_empty_ul":   "Paragraph line\n- \n  ```html\n  " + xssImg + "\n  ```",
+		"post_strip_html_prose_fence":    "- <u></u>````\n" + xssImg + "\n````",
+		"post_strip_comment_prose_fence": "<!-- c -->```\n" + xssScript + "\n```",
 	}
 
 	reInlineDest := regexp.MustCompile(`\]\(\s*(?:<([^>\n]*)>|([^\s)]+))`)

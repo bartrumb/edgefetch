@@ -918,12 +918,13 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
     });
   };
 
-  // 1. BYO-LLM `/v1/agent` run with connected Linear MCP (explicitly opted in)
+  // 1. BYO-LLM `/v1/agent` run with connected Linear MCP (explicitly opted in via `mcpServers`)
   const agentOut = await startOrExecuteAgentCall({
     payload: {
       prompt: 'Check status and priority of https://linear.app/acme/issue/ENG-101',
       urls: ['https://linear.app/acme/issue/ENG-101'],
-      useConnectedMcp: true,
+      mcpServers: ['linear'],
+      preferMcp: true,
     },
     env: {
       ARTIFACTS: fakeR2,
@@ -952,8 +953,9 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
     assert.equal(htmlScrapeCalled, false, 'Agent must query official connected MCP first without HTML scraping');
     assert.equal(r2PutCount, 0, 'Private MCP results must NEVER be written to shared R2 cache');
     assert.ok(capturedToolNames.includes('query_mcp'));
+    assert.ok(capturedToolNames.includes('mcp__linear__search_issues'), 'Tool names go strictly in structured tools channel');
     assert.match(capturedSystemPrompt, /TIER-1 CONNECTED MCP ROUTING/);
-    assert.match(capturedSystemPrompt, /search_issues/);
+    assert.doesNotMatch(capturedSystemPrompt, /search_issues/, 'Remote MCP tool names must NEVER appear in SYSTEM message');
 
     // Verify cross-user isolation on `loadAgentRun`: `user_bob` cannot read `user_alice`'s private agent run!
     const runId = String(agentOut.body.id);
@@ -961,11 +963,12 @@ test('MCP-FED-4: /v1/agent MCP-First Domain Routing (BYO-LLM + Deterministic), v
     assert.equal(await loadAgentRun(runId, undefined, 'user_bob'), null);
   }
 
-  // 2. Deterministic Zero-LLM `/v1/agent` run ALSO routes MCP-first when explicitly opted in (`preferMcp: true`) with `visibility: 'private'`!
+  // 2. Deterministic Zero-LLM `/v1/agent` run ALSO routes MCP-first when explicitly opted in via `mcpServers` with `visibility: 'private'`!
   const detAgent = await startOrExecuteAgentCall({
     payload: {
       prompt: 'Summarize Linear issue ENG-101 on linear.app',
       urls: ['https://linear.app/acme/issue/ENG-101'],
+      mcpServers: ['linear'],
       preferMcp: true,
     },
     env: {

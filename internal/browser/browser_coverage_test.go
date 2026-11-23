@@ -405,28 +405,28 @@ func TestRendererHelpersHeadersEnvSnapAndHostPolicy(t *testing.T) {
 		t.Fatalf("unexpected mergeCDPRequestHeaders output: %+v", merged)
 	}
 
-	// isSameOriginInitiatorHeaders table.
+	// hasPositiveSameOriginProof table (Round 9 H8: missing Origin+Referer MUST fail; Sec-Fetch-Site is ignored).
 	const initOrigin = "https://victim.test:443"
-	if !isSameOriginInitiatorHeaders(nil, initOrigin) {
-		t.Fatal("empty headers should allow")
+	if hasPositiveSameOriginProof(nil, initOrigin) || hasPositiveSameOriginProof(map[string]any{"Accept": "*/*"}, initOrigin) {
+		t.Fatal("missing Origin and Referer must fail closed")
 	}
-	if !isSameOriginInitiatorHeaders(map[string]any{"Nil": nil, "Origin": "https://victim.test", "Referer": "https://victim.test/p", "Sec-Fetch-Site": "same-origin"}, initOrigin) {
-		t.Fatal("same-origin headers should allow")
+	if hasPositiveSameOriginProof(map[string]any{"Origin": "https://victim.test"}, "") {
+		t.Fatal("empty initOrigin must fail closed")
 	}
-	if isSameOriginInitiatorHeaders(map[string]any{"Origin": "null"}, initOrigin) {
-		t.Fatal("Origin: null must fail")
+	if !hasPositiveSameOriginProof(map[string]any{"Nil": nil, "Origin": "https://victim.test", "Referer": "https://victim.test/p"}, initOrigin) {
+		t.Fatal("proven same-origin Origin + Referer should allow")
 	}
-	if isSameOriginInitiatorHeaders(map[string]any{"Origin": "https://evil.test"}, initOrigin) {
-		t.Fatal("cross-origin Origin must fail")
+	if !hasPositiveSameOriginProof(map[string]any{"Referer": "https://victim.test/p", "Origin": ""}, initOrigin) {
+		t.Fatal("proven same-origin Referer with empty Origin should allow")
 	}
-	if isSameOriginInitiatorHeaders(map[string]any{"Referer": "https://evil.test/x"}, initOrigin) {
-		t.Fatal("cross-origin Referer must fail")
+	if hasPositiveSameOriginProof(map[string]any{"Origin": "null", "Referer": "https://victim.test/p"}, initOrigin) {
+		t.Fatal("Origin: null must fail even when Referer names initOrigin")
 	}
-	if isSameOriginInitiatorHeaders(map[string]any{"Sec-Fetch-Site": "cross-site"}, initOrigin) {
-		t.Fatal("Sec-Fetch-Site: cross-site without proven same-origin must fail")
+	if hasPositiveSameOriginProof(map[string]any{"Origin": "https://evil.test", "Referer": "https://victim.test/p"}, initOrigin) {
+		t.Fatal("cross-origin Origin must fail even when Referer names initOrigin")
 	}
-	if isSameOriginInitiatorHeaders(map[string]any{"Sec-Fetch-Site": "cross-site", "Origin": "https://victim.test"}, initOrigin) {
-		t.Fatal("Sec-Fetch-Site: cross-site must reject even when Origin/Referer names initOrigin")
+	if hasPositiveSameOriginProof(map[string]any{"Referer": "https://evil.test/x", "Origin": "https://victim.test"}, initOrigin) {
+		t.Fatal("cross-origin Referer must fail even when Origin names initOrigin")
 	}
 
 	// handleRequestPaused invalid JSON / empty RequestID.
@@ -540,12 +540,12 @@ func TestRendererHelpersHeadersEnvSnapAndHostPolicy(t *testing.T) {
 				}
 			}
 		}
-		for _, need := range []string{"clone", "clone3", "unshare", "setns", "chroot", "seccomp", "prctl"} {
+		for _, need := range []string{"clone", "unshare", "chroot", "seccomp", "prctl"} {
 			if !allowed[need] {
 				t.Fatalf("seccomp profile missing required Chromium sandbox syscall %q", need)
 			}
 		}
-		for _, forbidden := range []string{"kexec_load", "init_module", "finit_module", "bpf", "perf_event_open", "userfaultfd", "keyctl", "mount", "umount2", "pivot_root", "ptrace", "acct", "swapon", "swapoff"} {
+		for _, forbidden := range []string{"kexec_load", "init_module", "finit_module", "bpf", "perf_event_open", "userfaultfd", "keyctl", "mount", "umount2", "pivot_root", "ptrace", "setns", "clone3", "socketcall", "acct", "swapon", "swapoff"} {
 			if allowed[forbidden] {
 				t.Fatalf("SECURITY: seccomp profile must NOT allow dangerous syscall %q", forbidden)
 			}

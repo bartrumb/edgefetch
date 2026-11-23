@@ -13,6 +13,8 @@ import { join, resolve } from 'node:path';
 import { WebSocketServer } from 'ws';
 import metaSchemaSql from '../migrations/meta/0001_tracking.sql';
 import metaMultiUserSql from '../migrations/meta/0002_multiuser.sql';
+import metaRound7Sql from '../migrations/meta/0003_round7_multiuser_hardening.sql';
+import metaRound9Sql from '../migrations/meta/0004_round9_founder_pinning.sql';
 import searchSchemaSql from '../migrations/search/0001_fts.sql';
 import { authorizeAgent, isValidSecretMatch } from '../src/auth';
 import { resolveSessionSecret } from '../src/github-auth';
@@ -29,6 +31,17 @@ export const MAX_INFLIGHT_PER_IP = 16;
 export const MAX_INFLIGHT_TOTAL = 128;
 export const MAX_CONNECTIONS_PER_IP = 64;
 export const MAX_CONNECTIONS_TOTAL = 1024;
+export const MAX_TOTAL_SOCKETS = 256;
+export const SOFT_GLOBAL_SOCKET_THRESHOLD = 128;
+export const SOCKET_PRESSURE_THRESHOLD = 96;
+export const MAX_ESTABLISHED_SOCKETS_PER_IP = 16;
+export const MAX_REQUESTS_PER_CONNECTION = 64;
+export const KEEP_ALIVE_TIMEOUT_MS = 4_000;
+export const PRESSURE_IDLE_EVICT_AGE_MS = 250;
+export const MAX_SOCKET_WRITABLE_BYTES = 2 * 1024 * 1024; // 2 MiB hard per-socket outbound buffer cap
+export const SOCKET_RESUME_HIGH_WATER_BYTES = 65_536; // 64 KiB backpressure resume threshold
+export const SOCKET_DRAIN_TIMEOUT_MS = 10_000; // 10s slow-read drain timeout
+export const MAX_PIPELINED_BACKLOG = 8;
 export const MAX_PREHEADER_SOCKETS_PER_IP = 32;
 export const MAX_GLOBAL_PREHEADER_SOCKETS = 512;
 export const LOOPBACK_RESERVED_CONNECTIONS = 32;
@@ -53,12 +66,19 @@ export interface PortableHubOptions {
   host?: string;
   dataDir?: string;
   migrationsDir?: string;
+  env?: Record<string, string | undefined>;
   envOverrides?: Record<string, string | undefined>;
   dnsResolver?: LookupResolverFn;
   maxInflightPerIp?: number;
   maxInflightTotal?: number;
   maxConnectionsPerIp?: number;
   maxConnectionsTotal?: number;
+  maxTotalSockets?: number;
+  maxEstablishedSocketsPerIp?: number;
+  maxRequestsPerConnection?: number;
+  keepAliveTimeoutMs?: number;
+  maxSocketWritableBytes?: number;
+  socketDrainTimeoutMs?: number;
   maxPreHeaderSocketsPerIp?: number;
   maxGlobalPreHeaderSockets?: number;
   headersTimeoutMs?: number;
@@ -488,7 +508,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const host = opts.host ?? process.env.HOST ?? '0.0.0.0';
   const dataDir = resolve(opts.dataDir ?? process.env.EDGEFETCH_DATA_DIR ?? './.edgefetch-data');
 
-  const mergedEnv = { ...process.env, ...(opts.envOverrides ?? {}) };
+  const mergedEnv = { ...process.env, ...(opts.env ?? {}), ...(opts.envOverrides ?? {}) };
   const trustProxy = isTruthyFlag(mergedEnv.EDGEFETCH_TRUST_PROXY);
   const trustFlyClientIp =
     trustProxy &&
@@ -515,10 +535,18 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
               existsSync(join(resolve(opts.migrationsDir), 'meta', '0002_multiuser.sql'))
                 ? join(resolve(opts.migrationsDir), 'meta', '0002_multiuser.sql')
                 : { name: 'meta/0002_multiuser.sql', sql: metaMultiUserSql },
+              existsSync(join(resolve(opts.migrationsDir), 'meta', '0003_round7_multiuser_hardening.sql'))
+                ? join(resolve(opts.migrationsDir), 'meta', '0003_round7_multiuser_hardening.sql')
+                : { name: 'meta/0003_round7_multiuser_hardening.sql', sql: metaRound7Sql },
+              existsSync(join(resolve(opts.migrationsDir), 'meta', '0004_round9_founder_pinning.sql'))
+                ? join(resolve(opts.migrationsDir), 'meta', '0004_round9_founder_pinning.sql')
+                : { name: 'meta/0004_round9_founder_pinning.sql', sql: metaRound9Sql },
             ]
           : [
               { name: 'meta/0001_tracking.sql', sql: metaSchemaSql },
               { name: 'meta/0002_multiuser.sql', sql: metaMultiUserSql },
+              { name: 'meta/0003_round7_multiuser_hardening.sql', sql: metaRound7Sql },
+              { name: 'meta/0004_round9_founder_pinning.sql', sql: metaRound9Sql },
             ],
       );
   const localSearchDb = (mergedEnv.SEARCH_TURSO_URL || tursoUrl)
@@ -588,6 +616,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     GITHUB_CLIENT_ID: mergedEnv.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: mergedEnv.GITHUB_CLIENT_SECRET,
     GITHUB_ALLOWED_USERS: mergedEnv.GITHUB_ALLOWED_USERS,
+    GITHUB_OWNER_ID: mergedEnv.GITHUB_OWNER_ID,
     GITHUB_OWNER_LOGIN: mergedEnv.GITHUB_OWNER_LOGIN,
     SIGNUP_MODE: mergedEnv.SIGNUP_MODE,
     VAULT_MASTER_KEY: mergedEnv.VAULT_MASTER_KEY ?? mergedEnv.EDGEFETCH_VAULT_MASTER_KEY,
@@ -707,10 +736,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     },
   } as unknown as ExecutionContext;
 
-  const maxInflightPerIp =
-    typeof opts.maxInflightPerIp === 'number' && opts.maxInflightPerIp > 0
-      ? Math.floor(opts.maxInflightPerIp)
-      : MAX_INFLIGHT_PER_IP;
+  const hasExplicitMaxInflightPerIp = typeof opts.maxInflightPerIp === 'number' && opts.maxInflightPerIp > 0;
+  const maxInflightPerIp = hasExplicitMaxInflightPerIp ? Math.floor(opts.maxInflightPerIp!) : MAX_INFLIGHT_PER_IP;
   const maxInflightTotal =
     typeof opts.maxInflightTotal === 'number' && opts.maxInflightTotal > 0
       ? Math.floor(opts.maxInflightTotal)
@@ -726,6 +753,9 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         ? Math.floor(envMaxConnPerIp)
         : MAX_CONNECTIONS_PER_IP;
   const envMaxConnTotal = Number(mergedEnv.EDGEFETCH_MAX_CONNECTIONS_TOTAL);
+  const hasExplicitMaxConnTotal =
+    (typeof opts.maxConnectionsTotal === 'number' && opts.maxConnectionsTotal > 0) ||
+    (Number.isFinite(envMaxConnTotal) && envMaxConnTotal > 0);
   const maxConnectionsTotal =
     typeof opts.maxConnectionsTotal === 'number' && opts.maxConnectionsTotal > 0
       ? Math.floor(opts.maxConnectionsTotal)
@@ -742,10 +772,50 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       : Number.isFinite(envMaxPreHeaderPerIp) && envMaxPreHeaderPerIp > 0
         ? Math.floor(envMaxPreHeaderPerIp)
         : MAX_PREHEADER_SOCKETS_PER_IP;
-  const maxGlobalPreHeaderSockets =
-    typeof opts.maxGlobalPreHeaderSockets === 'number' && opts.maxGlobalPreHeaderSockets > 0
-      ? Math.floor(opts.maxGlobalPreHeaderSockets)
-      : Math.max(16, Math.min(MAX_GLOBAL_PREHEADER_SOCKETS, maxConnectionsTotal));
+  const hasExplicitMaxGlobalPreHeader =
+    typeof opts.maxGlobalPreHeaderSockets === 'number' && opts.maxGlobalPreHeaderSockets > 0;
+  const envMaxTotalSockets = Number(mergedEnv.EDGEFETCH_MAX_TOTAL_SOCKETS);
+  const maxTotalSockets =
+    typeof opts.maxTotalSockets === 'number' && opts.maxTotalSockets > 0
+      ? Math.floor(opts.maxTotalSockets)
+      : Number.isFinite(envMaxTotalSockets) && envMaxTotalSockets > 0
+        ? Math.floor(envMaxTotalSockets)
+        : hasExplicitMaxConnTotal
+          ? maxConnectionsTotal
+          : hasExplicitMaxGlobalPreHeader
+            ? Math.max(MAX_TOTAL_SOCKETS, Math.floor(opts.maxGlobalPreHeaderSockets!) + 32)
+            : MAX_TOTAL_SOCKETS;
+  const softGlobalSocketThreshold = Math.max(8, Math.floor(maxTotalSockets / 2));
+  const socketPressureThreshold = Math.max(4, Math.floor(maxTotalSockets * 0.375));
+  const envMaxEstablishedPerIp = Number(mergedEnv.EDGEFETCH_MAX_ESTABLISHED_SOCKETS_PER_IP);
+  const hasExplicitMaxEstablishedPerIp =
+    (typeof opts.maxEstablishedSocketsPerIp === 'number' && opts.maxEstablishedSocketsPerIp > 0) ||
+    (Number.isFinite(envMaxEstablishedPerIp) && envMaxEstablishedPerIp > 0);
+  const maxEstablishedSocketsPerIp =
+    typeof opts.maxEstablishedSocketsPerIp === 'number' && opts.maxEstablishedSocketsPerIp > 0
+      ? Math.floor(opts.maxEstablishedSocketsPerIp)
+      : Number.isFinite(envMaxEstablishedPerIp) && envMaxEstablishedPerIp > 0
+        ? Math.floor(envMaxEstablishedPerIp)
+        : MAX_ESTABLISHED_SOCKETS_PER_IP;
+  const maxRequestsPerConnection =
+    typeof opts.maxRequestsPerConnection === 'number' && opts.maxRequestsPerConnection > 0
+      ? Math.floor(opts.maxRequestsPerConnection)
+      : MAX_REQUESTS_PER_CONNECTION;
+  const keepAliveTimeoutMs =
+    typeof opts.keepAliveTimeoutMs === 'number' && opts.keepAliveTimeoutMs > 0
+      ? Math.floor(opts.keepAliveTimeoutMs)
+      : KEEP_ALIVE_TIMEOUT_MS;
+  const maxSocketWritableBytes =
+    typeof opts.maxSocketWritableBytes === 'number' && opts.maxSocketWritableBytes > 0
+      ? Math.floor(opts.maxSocketWritableBytes)
+      : MAX_SOCKET_WRITABLE_BYTES;
+  const socketDrainTimeoutMs =
+    typeof opts.socketDrainTimeoutMs === 'number' && opts.socketDrainTimeoutMs > 0
+      ? Math.floor(opts.socketDrainTimeoutMs)
+      : SOCKET_DRAIN_TIMEOUT_MS;
+  const maxGlobalPreHeaderSockets = hasExplicitMaxGlobalPreHeader
+    ? Math.floor(opts.maxGlobalPreHeaderSockets!)
+    : Math.max(16, Math.min(MAX_GLOBAL_PREHEADER_SOCKETS, maxTotalSockets));
   const headersTimeoutMs =
     typeof opts.headersTimeoutMs === 'number' && opts.headersTimeoutMs > 0
       ? Math.floor(opts.headersTimeoutMs)
@@ -758,22 +828,215 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   const maxUnauthInflight =
     maxInflightTotal >= 8 ? maxInflightTotal - Math.min(32, Math.floor(maxInflightTotal / 4)) : maxInflightTotal;
 
-  // `R6-H4` & `R7-H8`:
+  interface TrackedSocketRecord {
+    socket: net.Socket;
+    isLoopback: boolean;
+    activeBucket: string;
+    establishedBucket: string | null;
+    phase: 'preheader' | 'inflight' | 'idle_keepalive' | 'upgraded_ws' | 'closing';
+    connectedAt: number;
+    idleSince: number;
+    requestsReceived: number;
+    requestsCompleted: number;
+    activeResponses: number;
+    pipelinedWaiting: number;
+    pipelineTail: Promise<void>;
+    finishPreHeader: () => void;
+    releaseAccounting: () => void;
+    markUpgradedWs: () => void;
+  }
+
+  // `R6-H4`, `R7-H8`, `R8-H1` & `R9-H7`:
   //  1. Strict loopback (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`) has dedicated reserved socket & pre-header headroom,
-  //     completely isolated from remote connection/pre-header pools so orchestrator `/health` & `/readyz` probes ALWAYS succeed 100/100!
-  //  2. Remote pre-header (silent/unparsed) sockets are capped at `MAX_PREHEADER_SOCKETS_PER_IP = 4` per IPv6 `/64` / IPv4 bucket.
-  //  3. Active remote silent pre-header sockets are tracked in an ordered FIFO `Map` (`remotePreHeaderSockets`); when
-  //     `MAX_GLOBAL_PREHEADER_SOCKETS` is reached, the oldest silent pre-header socket is evicted (`socket.destroy()`)
-  //     synchronously instead of dropping newly arriving connections!
+  //     completely isolated from remote connection/pre-header/keep-alive pools so orchestrator `/health` & `/readyz` probes ALWAYS succeed 100/100!
+  //  2. ALL live TCP sockets are tracked across `preheader`, `inflight`, `idle_keepalive`, and `upgraded_ws` states.
+  //  3. Idle keep-alive sockets (`idleKeepAliveSockets`) are tracked in LRU order + per-IP established sets (`establishedSocketsByIp`):
+  //     under per-IP (`MAX_ESTABLISHED_SOCKETS_PER_IP = 16`) or global (`>= 128` soft / `256` hard) pressure, newly arriving
+  //     connections synchronously evict idle keep-alive sockets (globally: heaviest established IP first, ties broken by oldest
+  //     idle timestamp; per-IP / shared-NAT: longest-idle / multi-request socket on that IP) so neither 16x64 keep-alive pools
+  //     nor same-NAT squatters can ever lock out legitimate clients!
   const activeSocketsByIp = new Map<string, number>();
   const preHeaderSocketsByIp = new Map<string, number>();
+  const establishedSocketsByIp = new Map<string, Set<net.Socket>>();
   const remotePreHeaderSockets = new Map<
     net.Socket,
-    { bucket: string; connectedAt: number; finish: () => void }
+    { bucket: string; connectedAt: number; record: TrackedSocketRecord }
   >();
-  const socketMarkHeaderReceived = new WeakMap<net.Socket, () => void>();
+  const idleKeepAliveSockets = new Map<net.Socket, TrackedSocketRecord>();
+  const loopbackIdleKeepAliveSockets = new Map<net.Socket, TrackedSocketRecord>();
+  const trackedSockets = new WeakMap<net.Socket, TrackedSocketRecord>();
   let remoteActiveSockets = 0;
   let loopbackActiveSockets = 0;
+
+  const addSocketToEstablishedBucket = (rec: TrackedSocketRecord, targetBucket: string) => {
+    if (rec.isLoopback || rec.phase === 'closing' || rec.phase === 'upgraded_ws') return;
+    if (rec.establishedBucket === targetBucket) return;
+    if (rec.establishedBucket !== null) {
+      const prevSet = establishedSocketsByIp.get(rec.establishedBucket);
+      if (prevSet) {
+        prevSet.delete(rec.socket);
+        if (prevSet.size === 0) establishedSocketsByIp.delete(rec.establishedBucket);
+      }
+    }
+    let set = establishedSocketsByIp.get(targetBucket);
+    if (!set) {
+      set = new Set<net.Socket>();
+      establishedSocketsByIp.set(targetBucket, set);
+    }
+    set.add(rec.socket);
+    rec.establishedBucket = targetBucket;
+  };
+
+  const removeSocketFromEstablished = (rec: TrackedSocketRecord) => {
+    idleKeepAliveSockets.delete(rec.socket);
+    loopbackIdleKeepAliveSockets.delete(rec.socket);
+    if (rec.establishedBucket !== null) {
+      const set = establishedSocketsByIp.get(rec.establishedBucket);
+      if (set) {
+        set.delete(rec.socket);
+        if (set.size === 0) establishedSocketsByIp.delete(rec.establishedBucket);
+      }
+      rec.establishedBucket = null;
+    }
+  };
+
+  const rebucketActiveSocketIfNeeded = (rec: TrackedSocketRecord, nextBucket: string) => {
+    if (rec.isLoopback || rec.phase === 'closing' || rec.activeBucket === nextBucket) return;
+    const prevRem = activeSocketsByIp.get(rec.activeBucket) ?? 0;
+    if (prevRem <= 1) activeSocketsByIp.delete(rec.activeBucket);
+    else activeSocketsByIp.set(rec.activeBucket, prevRem - 1);
+    activeSocketsByIp.set(nextBucket, (activeSocketsByIp.get(nextBucket) ?? 0) + 1);
+    rec.activeBucket = nextBucket;
+  };
+
+  const evictSocketRecord = (rec: TrackedSocketRecord, nowMs = Date.now(), forceImmediateDestroy = false) => {
+    const wasIdleKeepAlive = rec.phase === 'idle_keepalive';
+    const idleAgeMs = nowMs - rec.idleSince;
+    rec.releaseAccounting();
+    if (rec.socket.destroyed) return;
+    if (!forceImmediateDestroy && wasIdleKeepAlive && idleAgeMs < 50 && (rec.socket.writableLength ?? 0) === 0) {
+      try {
+        rec.socket.end();
+      } catch {
+        rec.socket.destroy();
+        return;
+      }
+      const finFallback = setTimeout(() => {
+        if (!rec.socket.destroyed) rec.socket.destroy();
+      }, 100);
+      finFallback.unref?.();
+      return;
+    }
+    rec.socket.destroy();
+  };
+
+  const evictIdleKeepAliveForBucket = (bucket: string, nowMs = Date.now()): boolean => {
+    let oldestMatch: TrackedSocketRecord | null = null;
+    let multiReqMatch: TrackedSocketRecord | null = null;
+    for (const cand of idleKeepAliveSockets.values()) {
+      if (cand.establishedBucket === bucket || cand.activeBucket === bucket) {
+        if (!oldestMatch) oldestMatch = cand;
+        if (cand.requestsCompleted >= 2) {
+          multiReqMatch = cand;
+          break;
+        }
+      }
+    }
+    const chosen = multiReqMatch ?? oldestMatch;
+    if (!chosen) return false;
+    evictSocketRecord(chosen, nowMs);
+    return true;
+  };
+
+  const evictGlobalIdleKeepAlive = (nowMs = Date.now(), minIdleAgeMs = 0): boolean => {
+    let bestVictim: TrackedSocketRecord | null = null;
+    let bestIpCount = -1;
+    for (const cand of idleKeepAliveSockets.values()) {
+      if (minIdleAgeMs > 0 && nowMs - cand.idleSince < minIdleAgeMs) continue;
+      const bKey = cand.establishedBucket ?? cand.activeBucket;
+      const ipCount = Math.max(
+        establishedSocketsByIp.get(bKey)?.size ?? 0,
+        activeSocketsByIp.get(cand.activeBucket) ?? 1,
+      );
+      if (ipCount > bestIpCount) {
+        bestIpCount = ipCount;
+        bestVictim = cand;
+      }
+    }
+    if (!bestVictim) return false;
+    evictSocketRecord(bestVictim, nowMs);
+    return true;
+  };
+
+  const sweepPressuredIdleSockets = () => {
+    if (remoteActiveSockets < socketPressureThreshold || idleKeepAliveSockets.size === 0) return;
+    const nowMs = Date.now();
+    while (remoteActiveSockets >= socketPressureThreshold && idleKeepAliveSockets.size > 0) {
+      if (!evictGlobalIdleKeepAlive(nowMs, PRESSURE_IDLE_EVICT_AGE_MS)) break;
+    }
+  };
+
+  const pressureSweepTimer = setInterval(sweepPressuredIdleSockets, 100);
+  pressureSweepTimer.unref?.();
+
+  const waitForSocketDrainBounded = (
+    socket: net.Socket,
+    rec: TrackedSocketRecord | undefined,
+    timeoutMs: number,
+  ): Promise<boolean> => {
+    if (socket.destroyed || !socket.writable) return Promise.resolve(false);
+    if ((socket.writableLength ?? 0) <= SOCKET_RESUME_HIGH_WATER_BYTES && !socket.writableNeedDrain) {
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>((resolveDrain) => {
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.removeListener('drain', onDrain);
+        socket.removeListener('close', onAbort);
+        socket.removeListener('error', onAbort);
+        resolveDrain(ok);
+      };
+      const onDrain = () => finish(!socket.destroyed && socket.writable);
+      const onAbort = () => finish(false);
+      const timer = setTimeout(() => {
+        if (rec) evictSocketRecord(rec, Date.now(), true);
+        else socket.destroy();
+        finish(false);
+      }, timeoutMs);
+      timer.unref?.();
+      socket.once('drain', onDrain);
+      socket.once('close', onAbort);
+      socket.once('error', onAbort);
+    });
+  };
+
+  const armResponseDrainWatchdog = (socket: net.Socket, rec: TrackedSocketRecord | undefined, timeoutMs: number) => {
+    if (socket.destroyed || (socket.writableLength ?? 0) === 0) return;
+    let done = false;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      socket.removeListener('drain', cleanup);
+      socket.removeListener('close', cleanup);
+    };
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      socket.removeListener('drain', cleanup);
+      socket.removeListener('close', cleanup);
+      if (!socket.destroyed && (socket.writableLength ?? 0) > 0) {
+        if (rec) evictSocketRecord(rec, Date.now(), true);
+        else socket.destroy();
+      }
+    }, timeoutMs);
+    timer.unref?.();
+    socket.once('drain', cleanup);
+    socket.once('close', cleanup);
+  };
 
   const applyNodeSecurityHeaders = (res: import('node:http').ServerResponse, isHttps = false) => {
     for (const [k, v] of DEFAULT_SECURITY_HEADERS) {
@@ -787,10 +1050,18 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   };
 
   const forceDestroyReqSocket = (req: IncomingMessage, res: import('node:http').ServerResponse) => {
+    const sock = res.socket ?? req.socket;
+    const rec = sock ? trackedSockets.get(sock) : undefined;
+    if (rec) {
+      rec.phase = 'closing';
+      removeSocketFromEstablished(rec);
+    }
     const tearDown = () => {
-      const sock = res.socket ?? req.socket;
+      const targetSock = res.socket ?? req.socket;
+      const targetRec = targetSock ? trackedSockets.get(targetSock) : undefined;
       req.destroy();
-      sock?.destroy();
+      if (targetRec) evictSocketRecord(targetRec, Date.now(), true);
+      else targetSock?.destroy();
     };
     res.once('finish', () => {
       setImmediate(tearDown);
@@ -799,9 +1070,217 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     fallback.unref?.();
   };
 
+  const getCombinedBufferedBytes = (
+    socket: net.Socket | null | undefined,
+    res: import('node:http').ServerResponse,
+  ): number => {
+    const sockPending = socket?.writableLength ?? 0;
+    const resPending = res.writableLength ?? 0;
+    const resOutSize = (res as unknown as { outputSize?: number }).outputSize ?? 0;
+    return sockPending + Math.max(resPending, resOutSize);
+  };
+
   const server = createServer(async (req, res) => {
-    if (req.socket) socketMarkHeaderReceived.get(req.socket)?.();
+    const reqSocket = req.socket;
+    const sockRec = reqSocket ? trackedSockets.get(reqSocket) : undefined;
+    sockRec?.finishPreHeader();
     req.on('error', () => undefined);
+    res.on('error', () => undefined);
+
+    if (!reqSocket || reqSocket.destroyed) {
+      return;
+    }
+
+    if (sockRec) {
+      sockRec.requestsReceived++;
+      const curSocketPending = getCombinedBufferedBytes(reqSocket, res);
+      if (
+        sockRec.phase === 'closing' ||
+        sockRec.requestsReceived > maxRequestsPerConnection ||
+        curSocketPending > maxSocketWritableBytes ||
+        sockRec.pipelinedWaiting >= MAX_PIPELINED_BACKLOG
+      ) {
+        evictSocketRecord(sockRec, Date.now(), true);
+        return;
+      }
+    }
+
+    let responseFinished = false;
+    if (req.complete) {
+      if (!reqSocket.destroyed) reqSocket.pause();
+    } else {
+      req.once('end', () => {
+        if (!responseFinished && !reqSocket.destroyed) {
+          reqSocket.pause();
+        }
+      });
+    }
+
+    let releasePipelineTurn: () => void = () => {};
+    if (sockRec) {
+      const prevPipeline = sockRec.pipelineTail;
+      const currentTurnPromise = new Promise<void>((r) => {
+        releasePipelineTurn = r;
+      });
+      sockRec.pipelineTail = currentTurnPromise;
+
+      if (sockRec.activeResponses > 0 || sockRec.pipelinedWaiting > 0 || (reqSocket.writableLength ?? 0) > SOCKET_RESUME_HIGH_WATER_BYTES) {
+        sockRec.pipelinedWaiting++;
+        try {
+          await prevPipeline;
+          if (!reqSocket.destroyed && sockRec.phase !== 'closing' && (reqSocket.writableLength ?? 0) > SOCKET_RESUME_HIGH_WATER_BYTES) {
+            const drainedBeforeExec = await waitForSocketDrainBounded(reqSocket, sockRec, socketDrainTimeoutMs);
+            if (!drainedBeforeExec) {
+              releasePipelineTurn();
+              return;
+            }
+          }
+        } finally {
+          sockRec.pipelinedWaiting = Math.max(0, sockRec.pipelinedWaiting - 1);
+        }
+      }
+
+      if (reqSocket.destroyed || sockRec.phase === 'closing') {
+        releasePipelineTurn();
+        return;
+      }
+    }
+
+    const clientBucket = normalizeClientRateLimitIp(resolveTrustedClientIp(req, trustProxy, trustFlyClientIp));
+    const effectiveEstCap =
+      !trustProxy || hasExplicitMaxEstablishedPerIp
+        ? maxEstablishedSocketsPerIp
+        : Math.max(maxEstablishedSocketsPerIp, Math.min(64, maxTotalSockets));
+
+    if (sockRec) {
+      sockRec.activeResponses++;
+      sockRec.phase = 'inflight';
+      idleKeepAliveSockets.delete(reqSocket);
+      loopbackIdleKeepAliveSockets.delete(reqSocket);
+      if (!sockRec.isLoopback) {
+        if (trustProxy && clientBucket !== '127.0.0.1') {
+          rebucketActiveSocketIfNeeded(sockRec, clientBucket);
+        }
+        addSocketToEstablishedBucket(sockRec, sockRec.activeBucket);
+      }
+    }
+
+    let lifecycleFinalized = false;
+    const finalizeSocketTurn = () => {
+      if (lifecycleFinalized) return;
+      lifecycleFinalized = true;
+      responseFinished = true;
+      if (sockRec) {
+        sockRec.activeResponses = Math.max(0, sockRec.activeResponses - 1);
+        sockRec.requestsCompleted++;
+        const shouldCloseNow =
+          reqSocket.destroyed ||
+          !reqSocket.writable ||
+          !res.shouldKeepAlive ||
+          sockRec.phase === 'closing';
+        if (shouldCloseNow) {
+          sockRec.phase = 'closing';
+          removeSocketFromEstablished(sockRec);
+          if (!reqSocket.destroyed) {
+            const lingerMs = remoteActiveSockets >= socketPressureThreshold ? 150 : 1_000;
+            const closeLinger = setTimeout(() => {
+              if (!reqSocket.destroyed) evictSocketRecord(sockRec, Date.now(), true);
+            }, lingerMs);
+            closeLinger.unref?.();
+          }
+        } else if (sockRec.activeResponses === 0) {
+          sockRec.phase = 'idle_keepalive';
+          sockRec.idleSince = Date.now();
+          if (sockRec.isLoopback) {
+            loopbackIdleKeepAliveSockets.delete(reqSocket);
+            loopbackIdleKeepAliveSockets.set(reqSocket, sockRec);
+          } else {
+            const estKey = sockRec.establishedBucket ?? sockRec.activeBucket;
+            addSocketToEstablishedBucket(sockRec, estKey);
+            idleKeepAliveSockets.delete(reqSocket);
+            idleKeepAliveSockets.set(reqSocket, sockRec);
+            while ((establishedSocketsByIp.get(estKey)?.size ?? 0) > effectiveEstCap) {
+              if (!evictIdleKeepAliveForBucket(estKey, sockRec.idleSince)) break;
+            }
+          }
+          if (sockRec.pipelinedWaiting === 0 && !reqSocket.destroyed) {
+            if ((reqSocket.writableLength ?? 0) <= SOCKET_RESUME_HIGH_WATER_BYTES) {
+              reqSocket.resume();
+            } else {
+              reqSocket.once('drain', () => {
+                if (!reqSocket.destroyed && sockRec.phase === 'idle_keepalive' && sockRec.pipelinedWaiting === 0) {
+                  reqSocket.resume();
+                }
+              });
+              armResponseDrainWatchdog(reqSocket, sockRec, socketDrainTimeoutMs);
+            }
+          }
+        }
+      }
+      releasePipelineTurn();
+    };
+    res.once('finish', finalizeSocketTurn);
+    res.once('close', finalizeSocketTurn);
+
+    const applyKeepAlivePressurePolicy = () => {
+      if (!sockRec || res.headersSent) return;
+      let closeAfterRes = sockRec.requestsReceived >= maxRequestsPerConnection;
+      if (!closeAfterRes && !sockRec.isLoopback) {
+        const estKey = sockRec.establishedBucket ?? sockRec.activeBucket;
+        const ipEstCount = Math.max(
+          establishedSocketsByIp.get(estKey)?.size ?? 0,
+          activeSocketsByIp.get(sockRec.activeBucket) ?? 1,
+        );
+        if (ipEstCount > effectiveEstCap) {
+          closeAfterRes = true;
+        } else if (remoteActiveSockets >= socketPressureThreshold && ipEstCount > 2) {
+          closeAfterRes = true;
+        }
+      }
+      if (closeAfterRes) {
+        res.shouldKeepAlive = false;
+        res.setHeader('connection', 'close');
+        sockRec.phase = 'closing';
+      }
+    };
+
+    const writeChunkBounded = async (chunk: Uint8Array): Promise<boolean> => {
+      if (reqSocket.destroyed || !reqSocket.writable || res.writableEnded) return false;
+      if (getCombinedBufferedBytes(reqSocket, res) + chunk.byteLength > maxSocketWritableBytes) {
+        if (sockRec) evictSocketRecord(sockRec, Date.now(), true);
+        else reqSocket.destroy();
+        return false;
+      }
+      const wroteClean = res.write(chunk);
+      if (getCombinedBufferedBytes(reqSocket, res) > maxSocketWritableBytes) {
+        if (sockRec) evictSocketRecord(sockRec, Date.now(), true);
+        else reqSocket.destroy();
+        return false;
+      }
+      if (!wroteClean || (reqSocket.writableLength ?? 0) > SOCKET_RESUME_HIGH_WATER_BYTES) {
+        return await waitForSocketDrainBounded(reqSocket, sockRec, socketDrainTimeoutMs);
+      }
+      return true;
+    };
+
+    const endResponseBounded = (payload?: string) => {
+      if (reqSocket.destroyed || res.writableEnded) return;
+      const addLen = payload ? Buffer.byteLength(payload, 'utf8') : 0;
+      if (getCombinedBufferedBytes(reqSocket, res) + addLen > maxSocketWritableBytes) {
+        if (sockRec) evictSocketRecord(sockRec, Date.now(), true);
+        else reqSocket.destroy();
+        return;
+      }
+      if (payload !== undefined) res.end(payload);
+      else res.end();
+      if (getCombinedBufferedBytes(reqSocket, res) > maxSocketWritableBytes) {
+        if (sockRec) evictSocketRecord(sockRec, Date.now(), true);
+        else reqSocket.destroy();
+        return;
+      }
+      armResponseDrainWatchdog(reqSocket, sockRec, socketDrainTimeoutMs);
+    };
+
     const rawPathname = (req.url ?? '/').split('?')[0] ?? '/';
     const methodUpper = (req.method ?? 'GET').toUpperCase();
     const isHealthProbe =
@@ -810,6 +1289,10 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       req.headers.authorization || req.headers['x-api-key'] || req.headers.cookie,
     );
     const hasCallerAuth = isHealthProbe ? false : await hasVerifiedCallerCredentials(req, rawPathname);
+    if (reqSocket.destroyed) {
+      finalizeSocketTurn();
+      return;
+    }
     const isPublicDiscoveryRoute =
       !isHealthProbe &&
       !hasAuthAttemptHeader &&
@@ -820,9 +1303,12 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         rawPathname === '/admin/login' ||
         rawPathname === '/robots.txt');
 
-    const clientBucket = normalizeClientRateLimitIp(resolveTrustedClientIp(req, trustProxy, trustFlyClientIp));
     const curIpInflight = inflightByIp.get(clientBucket) ?? 0;
-    const hitPerIpLimit = curIpInflight >= maxInflightPerIp;
+    const effectiveInflightPerIp =
+      !hasExplicitMaxInflightPerIp && (hasCallerAuth || isHealthProbe || isPublicDiscoveryRoute)
+        ? Math.max(maxInflightPerIp, MAX_PREHEADER_SOCKETS_PER_IP)
+        : maxInflightPerIp;
+    const hitPerIpLimit = curIpInflight >= effectiveInflightPerIp;
     const hitGlobalLimit = isHealthProbe
       ? totalInflight >= maxInflightTotal + 64
       : isPublicDiscoveryRoute
@@ -834,13 +1320,14 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
 
     if (hitPerIpLimit || hitGlobalLimit) {
       res.statusCode = 429;
+      res.shouldKeepAlive = false;
       res.setHeader('content-type', 'application/json');
       res.setHeader('cache-control', 'no-store');
       res.setHeader('retry-after', '1');
       res.setHeader('connection', 'close');
       applyNodeSecurityHeaders(res, explicitPublicOrigin?.startsWith('https://') ?? false);
       forceDestroyReqSocket(req, res);
-      res.end(JSON.stringify({ error: 'too_many_requests', message: 'Too many concurrent in-flight requests' }));
+      endResponseBounded(JSON.stringify({ error: 'too_many_requests', message: 'Too many concurrent in-flight requests' }));
       return;
     }
 
@@ -876,12 +1363,13 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         );
       } catch {
         res.statusCode = 400;
+        res.shouldKeepAlive = false;
         res.setHeader('content-type', 'application/json');
         res.setHeader('cache-control', 'no-store');
         res.setHeader('connection', 'close');
         applyNodeSecurityHeaders(res, explicitPublicOrigin?.startsWith('https://') ?? false);
         forceDestroyReqSocket(req, res);
-        res.end(JSON.stringify({ error: 'bad_request', message: 'Malformed HTTP request or Host header' }));
+        endResponseBounded(JSON.stringify({ error: 'bad_request', message: 'Malformed HTTP request or Host header' }));
         return;
       }
 
@@ -896,15 +1384,19 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         res.setHeader('cache-control', 'no-store');
         applyNodeSecurityHeaders(res, isHttpsReq);
         if (ignoredBodyFraming) {
+          res.shouldKeepAlive = false;
           res.setHeader('connection', 'close');
           forceDestroyReqSocket(req, res);
+        } else {
+          applyKeepAlivePressurePolicy();
         }
-        res.end(methodUpper === 'HEAD' ? undefined : '{"ok":true}');
+        endResponseBounded(methodUpper === 'HEAD' ? undefined : '{"ok":true}');
         return;
       }
 
       try {
         const webRes = await (hubWorker as { fetch(r: Request, e: unknown, c?: ExecutionContext): Promise<Response> }).fetch(webReq, workerEnv, ctx);
+        if (reqSocket.destroyed) return;
         res.statusCode = webRes.status;
         webRes.headers.forEach((val, key) => {
           if (key.toLowerCase() === 'set-cookie') {
@@ -922,22 +1414,42 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         // send `Connection: close` and destroy the socket after flush!
         const shouldDestroyAfterFlush = (!req.complete && webRes.status >= 400) || ignoredBodyFraming;
         if (shouldDestroyAfterFlush) {
+          res.shouldKeepAlive = false;
           res.setHeader('connection', 'close');
           forceDestroyReqSocket(req, res);
+        } else {
+          applyKeepAlivePressurePolicy();
         }
         if (!webRes.body) {
-          res.end();
+          endResponseBounded();
           return;
         }
         const reader = webRes.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(value);
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value && value.byteLength > 0) {
+              const ok = await writeChunkBounded(value);
+              if (!ok) {
+                await reader.cancel('Slow client outbound buffer limit exceeded').catch(() => undefined);
+                return;
+              }
+            }
+          }
+        } catch (streamErr) {
+          await reader.cancel().catch(() => undefined);
+          throw streamErr;
         }
-        res.end();
+        endResponseBounded();
       } catch (err) {
+        if (reqSocket.destroyed || res.headersSent || res.writableEnded) {
+          if (sockRec) evictSocketRecord(sockRec, Date.now(), true);
+          else reqSocket.destroy();
+          return;
+        }
         res.statusCode = 500;
+        res.shouldKeepAlive = false;
         res.setHeader('content-type', 'application/json');
         res.setHeader('cache-control', 'no-store');
         res.setHeader('connection', 'close');
@@ -945,7 +1457,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         if (!req.complete) {
           forceDestroyReqSocket(req, res);
         }
-        res.end(JSON.stringify({ error: 'internal_error', message: err instanceof Error ? err.message : String(err) }));
+        endResponseBounded(JSON.stringify({ error: 'internal_error', message: err instanceof Error ? err.message : String(err) }));
       }
     } finally {
       releaseInflightSlot();
@@ -953,8 +1465,10 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
   });
   server.headersTimeout = headersTimeoutMs;
   server.requestTimeout = 30_000;
-  server.keepAliveTimeout = 5_000;
-  server.maxConnections = maxConnectionsTotal + LOOPBACK_RESERVED_CONNECTIONS * 2;
+  server.keepAliveTimeout = keepAliveTimeoutMs;
+  server.maxRequestsPerSocket = maxRequestsPerConnection;
+  // Leave `server.maxConnections` unset so Node never drops incoming connections via `handle.close()` before
+  // `server.on('connection')` runs our isolated loopback admission + synchronous keep-alive/pre-header eviction!
 
   server.on('connection', (socket) => {
     socket.on('error', () => undefined);
@@ -965,18 +1479,29 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       !trustProxy || hasExplicitMaxConnPerIp
         ? maxConnectionsPerIp
         : Math.max(maxConnectionsPerIp, maxInflightTotal + 32);
+    const effectiveEstPerIpCap =
+      !trustProxy || hasExplicitMaxEstablishedPerIp
+        ? maxEstablishedSocketsPerIp
+        : Math.max(maxEstablishedSocketsPerIp, Math.min(64, maxTotalSockets));
+    const nowConnMs = Date.now();
 
-    // Dedicated isolated loopback headroom (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`): never competes with remote pre-header sockets!
+    // Dedicated isolated loopback headroom (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`): never competes with remote sockets!
     if (isStrictLoopbackProbe) {
       const loopbackCap = Math.max(effectiveRawPerIpCap, LOOPBACK_RESERVED_CONNECTIONS) + LOOPBACK_RESERVED_CONNECTIONS;
+      while (loopbackActiveSockets >= loopbackCap && loopbackIdleKeepAliveSockets.size > 0) {
+        const oldestLb = loopbackIdleKeepAliveSockets.values().next().value as TrackedSocketRecord | undefined;
+        if (!oldestLb) break;
+        evictSocketRecord(oldestLb, nowConnMs);
+      }
       if (loopbackActiveSockets >= loopbackCap) {
         socket.destroy();
         return;
       }
       loopbackActiveSockets++;
       let lbHeaderDone = false;
+      let lbAccountedClosed = false;
       let lbTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-        socket.destroy();
+        evictSocketRecord(lbRecord, Date.now(), true);
       }, headersTimeoutMs);
       lbTimer.unref?.();
       const finishLbPreHeader = () => {
@@ -987,79 +1512,111 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
           lbTimer = null;
         }
       };
-      socketMarkHeaderReceived.set(socket, finishLbPreHeader);
-      socket.once('end', () => {
-        if (!lbHeaderDone) socket.destroy();
-      });
-      let lbClosed = false;
-      socket.once('close', () => {
-        if (lbClosed) return;
-        lbClosed = true;
+      const releaseLbAccounting = () => {
         finishLbPreHeader();
+        loopbackIdleKeepAliveSockets.delete(socket);
+        if (lbAccountedClosed) return;
+        lbAccountedClosed = true;
+        lbRecord.phase = 'closing';
         loopbackActiveSockets = Math.max(0, loopbackActiveSockets - 1);
+      };
+      const lbRecord: TrackedSocketRecord = {
+        socket,
+        isLoopback: true,
+        activeBucket: '127.0.0.1',
+        establishedBucket: null,
+        phase: 'preheader',
+        connectedAt: nowConnMs,
+        idleSince: nowConnMs,
+        requestsReceived: 0,
+        requestsCompleted: 0,
+        activeResponses: 0,
+        pipelinedWaiting: 0,
+        pipelineTail: Promise.resolve(),
+        finishPreHeader: finishLbPreHeader,
+        releaseAccounting: releaseLbAccounting,
+        markUpgradedWs: () => {
+          finishLbPreHeader();
+          loopbackIdleKeepAliveSockets.delete(socket);
+          lbRecord.phase = 'upgraded_ws';
+        },
+      };
+      trackedSockets.set(socket, lbRecord);
+      socket.once('end', () => {
+        if (!lbHeaderDone) evictSocketRecord(lbRecord, Date.now(), true);
       });
+      socket.once('close', releaseLbAccounting);
       return;
     }
 
-    const nowConnMs = Date.now();
     const effectivePreHeaderPerIpCap =
       !trustProxy || hasExplicitMaxPreHeaderPerIp
         ? maxPreHeaderPerIp
         : Math.max(maxPreHeaderPerIp, Math.min(128, maxGlobalPreHeaderSockets));
 
-    // Shared-NAT defense (`R8-M1`): if stalled pre-header sockets on `sockBucket` have filled its per-IP pre-header cap
-    // (`curPreHeaderForIp >= effectivePreHeaderPerIpCap`), evict the OLDEST stalled (`>= 50ms`) pre-header socket from
-    // `sockBucket` so 4..32 idle sockets behind a shared corporate/carrier NAT can NEVER block 153 other NAT peers!
+    // 1. Shared-NAT pre-header defense (`R8-M1`): if stalled pre-header sockets on `sockBucket` have filled its per-IP
+    //    pre-header cap, evict the oldest stalled (`>= 50ms`) pre-header socket on `sockBucket`.
     while ((preHeaderSocketsByIp.get(sockBucket) ?? 0) >= effectivePreHeaderPerIpCap) {
-      let sameIpVictimSock: net.Socket | null = null;
-      let sameIpVictimMeta: { bucket: string; connectedAt: number; finish: () => void } | null = null;
-      for (const [candSock, candMeta] of remotePreHeaderSockets) {
+      let sameIpVictimRec: TrackedSocketRecord | null = null;
+      for (const candMeta of remotePreHeaderSockets.values()) {
         if (candMeta.bucket === sockBucket && nowConnMs - candMeta.connectedAt >= SHARED_NAT_PREHEADER_EVICT_AGE_MS) {
-          sameIpVictimSock = candSock;
-          sameIpVictimMeta = candMeta;
+          sameIpVictimRec = candMeta.record;
           break;
         }
       }
-      if (!sameIpVictimSock || !sameIpVictimMeta) {
+      if (!sameIpVictimRec) {
         socket.destroy();
         return;
       }
-      sameIpVictimMeta.finish();
-      sameIpVictimSock.destroy();
+      evictSocketRecord(sameIpVictimRec, nowConnMs, true);
     }
 
-    const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
-    if (remoteActiveSockets >= maxConnectionsTotal || curActiveForIp >= effectiveRawPerIpCap) {
-      socket.destroy();
-      return;
+    // 2. Per-IP & Same-NAT established keep-alive fairness (`R9-H7`):
+    //    Whenever `sockBucket` reaches `effectiveEstPerIpCap` (16) or `effectiveRawPerIpCap` (64), immediately evict an
+    //    idle keep-alive socket on `sockBucket` (preferring sockets that already served multiple requests / longest-idle)
+    //    so a co-tenant behind the same NAT ALWAYS gets a fresh socket!
+    while (
+      (establishedSocketsByIp.get(sockBucket)?.size ?? 0) >= effectiveEstPerIpCap ||
+      (activeSocketsByIp.get(sockBucket) ?? 0) >= effectiveRawPerIpCap
+    ) {
+      if (!evictIdleKeepAliveForBucket(sockBucket, nowConnMs)) {
+        break;
+      }
     }
 
-    // Fair global pre-header eviction (`R8-H1`, defeats 0-byte silent floods, 33-IP 1-byte reconnect floods, AND 60-IP stalled + burst):
-    //  - Never treat `bytesRead === 0` vs `bytesRead === 1` as a trust signal (attackers trivially send `'G'` immediately).
-    //  - Pass 1 (Aged-First): Always evict stalled pre-header sockets (`age >= FRESH_PREHEADER_GRACE_MS`) BEFORE touching any
-    //    fresh (`< 250ms`) handshake, preferring the heaviest bucket among aged sockets (ties broken by FIFO oldest age).
-    //    This ensures a legitimate client opening a 12-connection burst (`age < 250ms`) NEVER self-cannibalizes its own fresh
-    //    handshakes when 32..60 single-socket attacker IPs are sitting stalled in the pool!
-    //  - Pass 2 (Active Sub-Grace Flood): Only when ZERO aged (`>= 250ms`) sockets exist in `remotePreHeaderSockets`, evict the
-    //    oldest socket from the heaviest OTHER multi-socket IP bucket (`bKey !== sockBucket && bCount >= 2`).
-    //  - Pass 3: Otherwise drop the incoming excess socket rather than killing an in-flight `< 250ms` handshake.
-    while (remotePreHeaderSockets.size >= maxGlobalPreHeaderSockets) {
-      let victimSocket: net.Socket | null = null;
-      let victimMeta: { bucket: string; connectedAt: number; finish: () => void } | null = null;
+    // 3. Global keep-alive socket budget (`R9-H7`):
+    //    Whenever total remote sockets reach soft threshold (`>= 128`) or hard budget (`>= 256`), synchronously evict
+    //    the oldest idle keep-alive socket from the IP holding the highest number of established sockets!
+    while (remoteActiveSockets >= softGlobalSocketThreshold && idleKeepAliveSockets.size > 0) {
+      if (!evictGlobalIdleKeepAlive(nowConnMs, 0)) {
+        break;
+      }
+      if (remoteActiveSockets < maxTotalSockets) {
+        // Under soft pressure (`128..255`), evicting 1 idle socket per arriving connection guarantees 1:1 admission
+        // without needlessly tearing down unrelated single-socket clients all at once.
+        break;
+      }
+    }
+
+    // 4. Fair global pre-header eviction (`R8-H1`) + hard `maxTotalSockets` pre-header fallback:
+    while (remotePreHeaderSockets.size >= maxGlobalPreHeaderSockets || remoteActiveSockets >= maxTotalSockets) {
+      if (remoteActiveSockets >= maxTotalSockets && evictGlobalIdleKeepAlive(nowConnMs, 0)) {
+        continue;
+      }
+      let victimRec: TrackedSocketRecord | null = null;
       let victimBucketCount = 0;
 
-      for (const [candSock, candMeta] of remotePreHeaderSockets) {
+      for (const candMeta of remotePreHeaderSockets.values()) {
         if (nowConnMs - candMeta.connectedAt >= FRESH_PREHEADER_GRACE_MS) {
           const bCount = preHeaderSocketsByIp.get(candMeta.bucket) ?? 1;
-          if (!victimSocket || bCount > victimBucketCount) {
-            victimSocket = candSock;
-            victimMeta = candMeta;
+          if (!victimRec || bCount > victimBucketCount) {
+            victimRec = candMeta.record;
             victimBucketCount = bCount;
           }
         }
       }
 
-      if (!victimSocket) {
+      if (!victimRec) {
         let heaviestOtherBucket: string | null = null;
         let heaviestOtherCount = 1;
         for (const [bKey, bCount] of preHeaderSocketsByIp) {
@@ -1069,41 +1626,44 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
           }
         }
         if (heaviestOtherBucket !== null && heaviestOtherCount >= 2) {
-          for (const [candSock, candMeta] of remotePreHeaderSockets) {
+          for (const candMeta of remotePreHeaderSockets.values()) {
             if (candMeta.bucket === heaviestOtherBucket) {
-              victimSocket = candSock;
-              victimMeta = candMeta;
+              victimRec = candMeta.record;
               break;
             }
           }
         }
       }
 
-      if (!victimSocket || !victimMeta) {
+      if (!victimRec) {
         socket.destroy();
         return;
       }
 
-      victimMeta.finish();
-      victimSocket.destroy();
+      evictSocketRecord(victimRec, nowConnMs, true);
+    }
+
+    const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
+    if (remoteActiveSockets >= maxTotalSockets || curActiveForIp >= effectiveRawPerIpCap) {
+      socket.destroy();
+      return;
     }
 
     remoteActiveSockets++;
-    activeSocketsByIp.set(sockBucket, (activeSocketsByIp.get(sockBucket) ?? 0) + 1);
+    activeSocketsByIp.set(sockBucket, curActiveForIp + 1);
     preHeaderSocketsByIp.set(sockBucket, (preHeaderSocketsByIp.get(sockBucket) ?? 0) + 1);
 
     let headerPhaseDone = false;
+    let socketAccountedClosed = false;
     const firstByteDeadlineMs = Math.min(headersTimeoutMs, FIRST_BYTE_PREHEADER_TIMEOUT_MS);
     let preHeaderTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
       if (headerPhaseDone) return;
       if (socket.bytesRead === 0 || headersTimeoutMs <= FIRST_BYTE_PREHEADER_TIMEOUT_MS) {
-        finishPreHeaderPhase();
-        socket.destroy();
+        evictSocketRecord(rec, Date.now(), true);
         return;
       }
       preHeaderTimer = setTimeout(() => {
-        finishPreHeaderPhase();
-        socket.destroy();
+        evictSocketRecord(rec, Date.now(), true);
       }, Math.max(1, headersTimeoutMs - firstByteDeadlineMs));
       preHeaderTimer.unref?.();
     }, firstByteDeadlineMs);
@@ -1121,41 +1681,76 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       if (remPre <= 1) preHeaderSocketsByIp.delete(sockBucket);
       else preHeaderSocketsByIp.set(sockBucket, remPre - 1);
     };
+
+    const releaseRemoteAccounting = () => {
+      finishPreHeaderPhase();
+      removeSocketFromEstablished(rec);
+      if (socketAccountedClosed) return;
+      socketAccountedClosed = true;
+      rec.phase = 'closing';
+      remoteActiveSockets = Math.max(0, remoteActiveSockets - 1);
+      const remSock = activeSocketsByIp.get(rec.activeBucket) ?? 0;
+      if (remSock <= 1) activeSocketsByIp.delete(rec.activeBucket);
+      else activeSocketsByIp.set(rec.activeBucket, remSock - 1);
+    };
+
+    const rec: TrackedSocketRecord = {
+      socket,
+      isLoopback: false,
+      activeBucket: sockBucket,
+      establishedBucket: null,
+      phase: 'preheader',
+      connectedAt: nowConnMs,
+      idleSince: nowConnMs,
+      requestsReceived: 0,
+      requestsCompleted: 0,
+      activeResponses: 0,
+      pipelinedWaiting: 0,
+      pipelineTail: Promise.resolve(),
+      finishPreHeader: finishPreHeaderPhase,
+      releaseAccounting: releaseRemoteAccounting,
+      markUpgradedWs: () => {
+        finishPreHeaderPhase();
+        removeSocketFromEstablished(rec);
+        if (!socketAccountedClosed) {
+          socketAccountedClosed = true;
+          remoteActiveSockets = Math.max(0, remoteActiveSockets - 1);
+          const remSock = activeSocketsByIp.get(rec.activeBucket) ?? 0;
+          if (remSock <= 1) activeSocketsByIp.delete(rec.activeBucket);
+          else activeSocketsByIp.set(rec.activeBucket, remSock - 1);
+        }
+        rec.phase = 'upgraded_ws';
+      },
+    };
+    trackedSockets.set(socket, rec);
     remotePreHeaderSockets.set(socket, {
       bucket: sockBucket,
       connectedAt: nowConnMs,
-      finish: finishPreHeaderPhase,
+      record: rec,
     });
-    socketMarkHeaderReceived.set(socket, finishPreHeaderPhase);
 
     socket.once('end', () => {
       if (!headerPhaseDone) {
-        finishPreHeaderPhase();
-        socket.destroy();
+        evictSocketRecord(rec, Date.now(), true);
       }
     });
 
-    let socketClosed = false;
-    socket.once('close', () => {
-      if (socketClosed) return;
-      socketClosed = true;
-      finishPreHeaderPhase();
-      remoteActiveSockets = Math.max(0, remoteActiveSockets - 1);
-      const remSock = activeSocketsByIp.get(sockBucket) ?? 0;
-      if (remSock <= 1) activeSocketsByIp.delete(sockBucket);
-      else activeSocketsByIp.set(sockBucket, remSock - 1);
-    });
+    socket.once('close', releaseRemoteAccounting);
   });
 
   server.on('clientError', (_err, socket) => {
     socket.on('error', () => undefined);
-    if (socket instanceof net.Socket) {
-      socketMarkHeaderReceived.get(socket)?.();
-    }
+    const rec = socket instanceof net.Socket ? trackedSockets.get(socket) : undefined;
+    rec?.finishPreHeader();
     if (socket.writable && !socket.destroyed) {
       socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-      const t = setTimeout(() => socket.destroy(), 250);
+      const t = setTimeout(() => {
+        if (rec) evictSocketRecord(rec, Date.now(), true);
+        else socket.destroy();
+      }, 250);
       t.unref?.();
+    } else if (rec) {
+      evictSocketRecord(rec, Date.now(), true);
     } else {
       socket.destroy();
     }
@@ -1171,14 +1766,17 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
 
   server.on('upgrade', (req, socket, head) => {
     socket.on('error', () => undefined);
-    if (socket instanceof net.Socket) {
-      socketMarkHeaderReceived.get(socket)?.();
-    }
+    const wsSockRec = socket instanceof net.Socket ? trackedSockets.get(socket) : undefined;
+    wsSockRec?.finishPreHeader();
+    const destroyUpgradeSock = () => {
+      if (wsSockRec) evictSocketRecord(wsSockRec, Date.now(), true);
+      else socket.destroy();
+    };
     try {
       const pathname = (req.url ?? '/').split('?')[0];
       if (pathname !== '/agent/ws') {
         socket.write('HTTP/1.1 404 Not Found\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-        socket.destroy();
+        destroyUpgradeSock();
         return;
       }
       let webReq: Request;
@@ -1192,14 +1790,14 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         );
       } catch {
         socket.write('HTTP/1.1 400 Bad Request\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-        socket.destroy();
+        destroyUpgradeSock();
         return;
       }
       const auth = authorizeAgent(webReq, workerEnv as { AGENT_TOKEN?: string; AGENT_TOKENS?: string });
       const wsKey = req.headers['sec-websocket-key'];
       if (!auth.ok || typeof wsKey !== 'string' || !wsKey.trim()) {
         socket.write('HTTP/1.1 401 Unauthorized\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-        socket.destroy();
+        destroyUpgradeSock();
         return;
       }
       const curSiteWs = activeWsBySite.get(auth.siteId) ?? 0;
@@ -1207,11 +1805,12 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         socket.write(
           'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
         );
-        socket.destroy();
+        destroyUpgradeSock();
         return;
       }
       const pubIp = resolveTrustedClientIp(req, trustProxy, trustFlyClientIp);
       wss.handleUpgrade(req, socket, head, (wsClient) => {
+        wsSockRec?.markUpgradedWs();
         activeWsBySite.set(auth.siteId, (activeWsBySite.get(auth.siteId) ?? 0) + 1);
         let wsCountReleased = false;
         wsClient.once('close', () => {
@@ -1238,13 +1837,13 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       } catch {
         // ignore write failure
       }
-      socket.destroy();
+      destroyUpgradeSock();
     }
   });
 
   return new Promise<{ server: typeof server; port: number; close: () => Promise<void> }>((resolveStart, rejectStart) => {
     server.once('error', rejectStart);
-    server.listen(port, host, () => {
+    server.listen(port, host, 2048, () => {
       const addr = server.address();
       boundPort = typeof addr === 'object' && addr ? addr.port : port;
       resolveStart({
@@ -1252,6 +1851,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         port: boundPort,
         close: () =>
           new Promise<void>((resClose) => {
+            clearInterval(pressureSweepTimer);
             coordinator.close();
             for (const client of wss.clients) {
               try {

@@ -21,32 +21,52 @@ import {
   stripHtmlTagsQuoteAwareLinear,
 } from './safe-input';
 
-const INJECTION_PATTERNS: Array<{ id: string; re: RegExp; weight: number }> = [
+const MAX_PROMPT_INJECTION_SCAN_CHARS = 8 * 1024 * 1024;
+
+const INJECTION_PATTERNS: Array<{ id: string; re: RegExp; compactRe: RegExp; weight: number }> = [
   {
     id: 'ignore_previous_instructions',
     re: /\b(?:ignore|disregard|forget|override)\s+(?:(?:all|any|each|every)(?:\s+of)?\s+)?(?:(?:the|your|these|those|my|our)\s+)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)\s+(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)\b/i,
+    compactRe:
+      /(?:ignore|disregard|forget|override)(?:(?:all|any|each|every)(?:of)?)?(?:the|your|these|those|my|our)?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)/i,
     weight: 3,
   },
   {
     id: 'new_system_role_override',
     re: /(?:(?:^|\n)[ \t>]{0,20}(?:\[?[ \t]{0,10}system(?:[ \t]{1,10}(?:prompt|override|instruction|message|role))?[ \t]{0,10}\]?|<[ \t]{0,10}system[ \t]{0,10}>|#{1,6}[ \t]{0,10}system(?:[ \t]{1,10}instruction)?)|(?:^|\s)(?:\[[ \t]{0,6}system[ \t]{1,6}(?:prompt|override|instruction|message|role)[ \t]{0,6}\]|<[ \t]{0,6}system[ \t]{0,6}>))[ \t]{0,10}:/i,
+    compactRe:
+      /(?:(?:^|\s)\[?system(?:prompt|override|instruction|message|role)\]?:|(?:^|\n)[ \t>]{0,10}system:|<system>:|#{1,6}system(?:instruction)?:)/i,
     weight: 3,
   },
   {
     id: 'exfiltrate_secrets_or_tools',
     re: /\b(?:send|post|upload|exfiltrate|transmit|forward|leak)\s+(?:(?:the|your|all|my|our)\s+)?(?:api[_\s-]?keys?|tokens?|secrets?|passwords?|credentials?|conversation|system\s+prompt|ssh|env)\s+(?:to|via)\s+(?:https?:(?:\/\/|\s+[a-z0-9])|\[[^\]]{1,80}\]\(\s*https?:\/\/|(?:[a-z0-9-]+\s+){0,3}[a-z0-9-]+(?:\.[a-z0-9-]+)+\b|this\b|here\b)/i,
+    compactRe:
+      /(?:send|post|upload|exfiltrate|transmit|forward|leak)(?:the|your|all|my|our)?(?:api[_-]?keys?|tokens?|secrets?|passwords?|credentials?|conversation|systemprompt|ssh|env)(?:to|via)(?:https?:|[a-z0-9-]+\.[a-z]{2,}|this\b|here\b)/i,
     weight: 4,
   },
   {
     id: 'tool_invocation_hijack',
-    re: /\b(?:immediately\s+call(?:\s+the\s+tool)?|now\s+call(?:\s+the\s+tool)?|you\s+must\s+now\s+execute|invoke\s+the\s+tool|execute\s+bash\s+command)\b[^\n]{0,80}\b(?:curl|wget|fetch(?:[_\s]?url)|bash|rm\s+-?rf)\b/i,
+    re: /(?:(?:\b(?:immediately|now)\s+call\s+the\s+tool|\binvoke\s+the\s+tool)\s+[a-z][a-z0-9_.:/-]{1,63}\b|\b(?:immediately\s+call(?:\s+the\s+tool)?|now\s+call(?:\s+the\s+tool)?|you\s+must\s+now\s+execute|invoke\s+the\s+tool|execute\s+bash\s+command)\b[^\n]{0,80}\b(?:curl|wget|fetch(?:[_\s]?url)?|read[_\s]?artifact|scrape|extract|interact|bash|rm\s+-?rf)\b)/i,
+    compactRe:
+      /(?:immediatelycall(?:thetool)?|nowcall(?:thetool)?|youmustnowexecute|invokethetool|executebashcommand)[a-z0-9_:/.-]{0,80}(?:curl|wget|fetch(?:_?url)?|read_?artifact|bash|rm-?rf)/i,
     weight: 4,
   },
 ];
 
 const HIDDEN_STYLE_TOKEN_RE =
   /(?:display[ \t]*:[ \t]*none|visibility[ \t]*:[ \t]*hidden|opacity[ \t]*:[ \t]*0(?:\.0+)?(?![0-9.])|font-size[ \t]*:[ \t]*0(?:px|em|rem|pt|%)?(?![0-9.])|clip-path[ \t]*:[ \t]*inset\(\s*100%|clip[ \t]*:[ \t]*rect\(\s*0|(?:left|top|text-indent)[ \t]*:[ \t]*-\d{3,}|height[ \t]*:[ \t]*0(?:px)?[ \t]*;[^;]{0,60}overflow[ \t]*:[ \t]*hidden|color[ \t]*:[ \t]*(?:#fff(?:fff)?|white|transparent)\b.{0,80}font-size[ \t]*:[ \t]*1px|font-size[ \t]*:[ \t]*1px.{0,80}color[ \t]*:[ \t]*(?:#fff(?:fff)?|white|transparent)\b)/i;
-const HIDDEN_OVERRIDE_KEYWORD_RE = /\b(?:ignore|disregard|system[ \t\r\n]{1,10}prompt|assistant|tool|execute|instructions?|rules?)\b/i;
+const HIDDEN_DIRECTIVE_OVERRIDE_RE = new RegExp(
+  [
+    '\\b(?:ignore|disregard|forget|override|bypass)\\s+(?:(?:all|any|each|every|the|your|these|those|my|our|previous|prior|above|earlier|system|developer|safety)\\s+){0,4}(?:instructions?|rules?|prompts?|directives?|guidelines?|constraints?|guardrails?|system)\\b',
+    '\\bsystem\\s+(?:prompt|override|instruction|directive|role)\\b',
+    '\\b(?:assistant|ai|model|agent)\\s*:\\s*(?:ignore|disregard|forget|override|execute|call|invoke|send|leak|reveal|output|do\\s+not)\\b',
+    '\\b(?:assistant|ai|model|agent)\\s+(?:must\\s+|should\\s+|shall\\s+|will\\s+)?(?:now\\s+|immediately\\s+)?(?:execute|invoke|call|run|ignore|disregard|override|leak|exfiltrate)\\s+(?:(?:the|a)\\s+)?(?:tool|command|bash|shell|function|rules?|instructions?)\\b',
+    '\\b(?:call|invoke|execute)\\s+(?:the\\s+)?tool\\s+[a-z0-9_-]{2,}\\b',
+    '\\bdo\\s+not\\s+(?:tell|inform|mention\\s+to|reveal\\s+to|show)\\s+the\\s+user\\b',
+  ].join('|'),
+  'i',
+);
 
 const CONFUSABLE_CHAR_MAP: Record<string, string> = {
   '\u0456': 'i',
@@ -236,6 +256,7 @@ function decodeUriEntitiesLinear(raw: string): string {
  */
 export function isDisallowedMarkdownLinkDestination(rawHref: string): boolean {
   if (!rawHref) return false;
+  if (rawHref.length > 8_192) return true;
   let unescaped = rawHref;
   if (unescaped.includes('\\')) {
     let sb = '';
@@ -251,13 +272,20 @@ export function isDisallowedMarkdownLinkDestination(rawHref: string): boolean {
   }
   const decoded = decodeUriEntitiesLinear(unescaped);
   let clean = '';
+  let sawDelim = false;
   for (let i = 0; i < decoded.length; ) {
     const cp = decoded.codePointAt(i)!;
     i += cp > 0xffff ? 2 : 1;
     if (isIgnorableUriCodePoint(cp)) continue;
+    if (cp === 47 || cp === 63 || cp === 35 || cp === 58) {
+      sawDelim = true;
+    }
     clean += String.fromCodePoint(cp);
-    if (clean.length >= 256 && (clean.includes('/') || clean.includes('?') || clean.includes('#') || clean.includes(':'))) {
+    if (clean.length >= 256 && sawDelim) {
       break;
+    }
+    if (clean.length > 4_096) {
+      return true;
     }
   }
   // Strip any unbalanced leading `(` or `<` wrappers so `((javascript:alert(1)))` / `(<javascript:...` cannot hide a scheme
@@ -375,11 +403,12 @@ function scanDestinationTokenEndAndCheckUnsafe(
   const n = s.length;
   if (destStart >= n) return { unsafe: false, tokenEnd: destStart, closeParenPos: -1 };
   const angle = s.charCodeAt(destStart) === 60 /* '<' */;
+  const maxAngleScan = Math.min(n, destStart + 4_097);
   if (angle) {
     let p = destStart + 1;
-    while (p < n) {
+    while (p < maxAngleScan) {
       const c = s.charCodeAt(p);
-      if (c === 92 && p + 1 < n) {
+      if (c === 92 && p + 1 < maxAngleScan) {
         p += 2;
         continue;
       }
@@ -394,9 +423,12 @@ function scanDestinationTokenEndAndCheckUnsafe(
       if (c === 60 || c === 10 || c === 13) break;
       p++;
     }
+    if (p >= maxAngleScan && maxAngleScan < n) {
+      return { unsafe: true, tokenEnd: p, closeParenPos: -1 };
+    }
     // Unclosed `<...` destination: check token up to whitespace/EOL/`)`/`](`
     let fallbackEnd = destStart + 1;
-    while (fallbackEnd < n) {
+    while (fallbackEnd < maxAngleScan) {
       const fc = s.charCodeAt(fallbackEnd);
       if (fc === 32 || fc === 9 || fc === 10 || fc === 13 || fc === 41) break;
       if (fc === 93 && fallbackEnd + 1 < n && s.charCodeAt(fallbackEnd + 1) === 40) break;
@@ -406,6 +438,9 @@ function scanDestinationTokenEndAndCheckUnsafe(
         if (closeBr > fallbackEnd && closeBr - fallbackEnd <= 256) break;
       }
       fallbackEnd++;
+    }
+    if (fallbackEnd >= maxAngleScan && maxAngleScan < n) {
+      return { unsafe: true, tokenEnd: fallbackEnd, closeParenPos: -1 };
     }
     const rawUnclosed = s.slice(destStart + 1, fallbackEnd);
     if (isDisallowedMarkdownLinkDestination(rawUnclosed)) {
@@ -423,7 +458,8 @@ function scanDestinationTokenEndAndCheckUnsafe(
 
   let p = destStart;
   let depth = 0;
-  while (p < n) {
+  const maxRawScan = Math.min(n, destStart + 4_097);
+  while (p < maxRawScan) {
     const c = s.charCodeAt(p);
     if (c === 92 && p + 1 < n) {
       p += 2;
@@ -451,6 +487,9 @@ function scanDestinationTokenEndAndCheckUnsafe(
       depth--;
     }
     p++;
+  }
+  if (p >= maxRawScan && maxRawScan < n) {
+    return { unsafe: true, tokenEnd: p, closeParenPos: -1 };
   }
   if (p <= destStart) return { unsafe: false, tokenEnd: destStart, closeParenPos: -1 };
   const rawToken = s.slice(destStart, p);
@@ -602,7 +641,10 @@ export function neutralizeAllUnsafeMarkdownLinksLinear(prose: string): string {
   const n = prose.length;
 
   while (i < n - 1) {
-    if (prose.charCodeAt(i) === 93 /* ']' */ && !isMarkdownBackslashEscapedAt(prose, i)) {
+    const nextBracket = prose.indexOf(']', i);
+    if (nextBracket < 0 || nextBracket >= n - 1) break;
+    i = nextBracket;
+    if (!isMarkdownBackslashEscapedAt(prose, i)) {
       const nx = prose.charCodeAt(i + 1);
       if (nx === 40 /* '(' */) {
         let k = i + 2;
@@ -777,6 +819,373 @@ export function escapeAllResidualLtInProseLinear(prose: string, allowPdfPageMark
   return changed ? lines.join('\n') : prose;
 }
 
+function isThematicBreakForSlice(raw: string, leadCols: number, leadPos: number): boolean {
+  if (leadCols > 3 || leadPos >= raw.length) return false;
+  const ch = raw.charCodeAt(leadPos);
+  if (ch !== 45 /* '-' */ && ch !== 42 /* '*' */ && ch !== 95 /* '_' */) return false;
+  let count = 0;
+  for (let i = leadPos; i < raw.length; i++) {
+    const c = raw.charCodeAt(i);
+    if (c === ch) count++;
+    else if (c !== 32 && c !== 9) return false;
+  }
+  return count >= 3;
+}
+
+function isParagraphBreakLineForSafeSpans(
+  line: string,
+  prevInBq: boolean,
+  prevInList: boolean,
+): { kind: 'blank_or_atomic' | 'block_start' | 'atx_heading' | 'none'; inBq: boolean; inList: boolean } {
+  const { cols, bytePos, isBlank } = measureSliceIndentCols(line);
+  if (isBlank) return { kind: 'blank_or_atomic', inBq: false, inList: false };
+  const c = line.charCodeAt(bytePos);
+  if (cols <= 3) {
+    if (c === 35 /* '#' */) {
+      let h = bytePos;
+      while (h < line.length && line.charCodeAt(h) === 35 && h - bytePos < 7) h++;
+      if (h - bytePos <= 6 && (h >= line.length || line.charCodeAt(h) === 32 || line.charCodeAt(h) === 13)) {
+        return { kind: 'atx_heading', inBq: false, inList: false };
+      }
+    }
+    if (c === 62 /* '>' */) {
+      let q = bytePos;
+      while (q < line.length && (line.charCodeAt(q) === 62 || line.charCodeAt(q) === 32 || line.charCodeAt(q) === 9 || line.charCodeAt(q) === 13)) q++;
+      if (q === line.length) return { kind: 'blank_or_atomic', inBq: false, inList: false };
+      return { kind: prevInBq ? 'none' : 'block_start', inBq: true, inList: false };
+    }
+    if (isThematicBreakForSlice(line, cols, bytePos)) {
+      return { kind: 'blank_or_atomic', inBq: false, inList: false };
+    }
+    if (!prevInBq && !prevInList && (c === 61 || c === 45)) {
+      let p = bytePos;
+      while (p < line.length && line.charCodeAt(p) === c) p++;
+      while (p < line.length && (line.charCodeAt(p) === 32 || line.charCodeAt(p) === 9 || line.charCodeAt(p) === 13)) p++;
+      if (p === line.length) return { kind: 'blank_or_atomic', inBq: false, inList: false };
+    }
+    if ((c === 45 || c === 42 || c === 43) && bytePos + 1 < line.length && line.charCodeAt(bytePos + 1) === 32) {
+      let p = bytePos + 2;
+      while (p < line.length && (line.charCodeAt(p) === 32 || line.charCodeAt(p) === 9 || line.charCodeAt(p) === 13)) p++;
+      if (p < line.length) {
+        return { kind: 'block_start', inBq: false, inList: true };
+      }
+    }
+    if (
+      c === 49 /* '1' */ &&
+      bytePos + 2 < line.length &&
+      (line.charCodeAt(bytePos + 1) === 46 || line.charCodeAt(bytePos + 1) === 41) &&
+      line.charCodeAt(bytePos + 2) === 32
+    ) {
+      let p = bytePos + 3;
+      while (p < line.length && (line.charCodeAt(p) === 32 || line.charCodeAt(p) === 9 || line.charCodeAt(p) === 13)) p++;
+      if (p < line.length) {
+        return { kind: 'block_start', inBq: false, inList: true };
+      }
+    }
+  }
+  return { kind: 'none', inBq: prevInBq, inList: prevInList };
+}
+
+function hasUnclosedOpenBracketOnLine(line: string, upTo: number): boolean {
+  let depth = 0;
+  for (let i = 0; i < upTo; i++) {
+    const c = line.charCodeAt(i);
+    if (c === 92 /* '\\' */) {
+      i++;
+      continue;
+    }
+    if (c === 91 /* '[' */) {
+      depth++;
+    } else if (c === 93 /* ']' */ && depth > 0) {
+      // Only consider `[` closed if immediately completed as `[label](...)` on the same prefix;
+      // bare `[ref]` could still pair with `[second]` or reference syntax across spans in `marked`.
+      if (i + 1 < upTo && line.charCodeAt(i + 1) === 40 /* '(' */) {
+        const closeParen = line.indexOf(')', i + 2);
+        if (closeParen > i + 1 && closeParen < upTo) {
+          depth--;
+          i = closeParen;
+          continue;
+        }
+      }
+    }
+  }
+  return depth > 0;
+}
+
+/**
+ * Preserves intact `<` ONLY inside provably unambiguous single-line paired backtick code spans
+ * (e.g. `` `Vec<T>` ``, `` `Map<K, V>` ``, `` `Promise<Response>` ``, `` `<script>` `` in prose code documentation)
+ * while escaping `<` -> `&lt;` everywhere else outside fenced code blocks (`Round 9 Item 2`).
+ *
+ * All 6 Markdown dialect families (`CommonMark`, `GFM`, `marked`, `markdown-it`, `goldmark`, `showdown_regex`) agree
+ * 100% on a code span `[openTick, closeTick]` when ALL hold:
+ *  1. The paragraph is NOT tick-poisoned by an earlier line, and every backtick run on `line` has exact length `1`
+ *     (`k === 1`) and pairs cleanly on `line` (`tickPositions.length % 2 === 0`, non-empty interior).
+ *  2. Zero `\` immediately precedes ANY backtick on `line` (nor ends any span interior before closing `` ` ``).
+ *  3. Zero link-crossing ambiguity (`paraHasUnclosedBracket` or unclosed `[` before the span when `]`, `](`, `][`, or `]:`
+ *     appears inside/after the span, and zero `[` or `]` inside the span when `](` / `][` / `]:` exists on the line/paragraph).
+ *  4. If `line` contains `|` (potential GFM table row), ZERO code spans on `line` contain `|`.
+ *  5. Not glued to bare URLs (`https://`, `http://`, `ftp://`, `www.`), `~`, or matching `*`/`_`, and interior contains
+ *     no `<!--`, `-->`, `<?`, `<![`, or disallowed `](scheme:...)` links.
+ */
+export function escapeResidualLtPreservingSafeCodeSpansLinear(prose: string, allowPdfPageMarkers = false): string {
+  if (!prose || !prose.includes('<')) return prose;
+  if (!prose.includes('`')) {
+    return escapeAllResidualLtInProseLinear(prose, allowPdfPageMarkers);
+  }
+
+  const lines = prose.split('\n');
+  let paraTickPoisoned = false;
+  let paraHasOpenBracket = false;
+  let paraHasLinkContinuation = false;
+  let inBq = false;
+  let inList = false;
+  let anyChanged = false;
+
+  // Pre-scan paragraph link continuation (`](`, `][`, `]:`) per line for cross-line `[foo \`bar\`\n](baz)` guard
+  const lineHasLinkTail = new Uint8Array(lines.length);
+  for (let li = 0; li < lines.length; li++) {
+    const ln = lines[li]!;
+    if (ln.includes('](') || ln.includes('][') || ln.includes(']:')) {
+      lineHasLinkTail[li] = 1;
+    }
+  }
+
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li]!;
+    const brk = isParagraphBreakLineForSafeSpans(line, inBq, inList);
+    inBq = brk.inBq;
+    inList = brk.inList;
+    if (brk.kind === 'blank_or_atomic' || brk.kind === 'block_start' || brk.kind === 'atx_heading') {
+      paraTickPoisoned = false;
+      paraHasOpenBracket = false;
+      // Check if any subsequent line in this new paragraph has `](` / `][` / `]:`
+      paraHasLinkContinuation = lineHasLinkTail[li] === 1;
+      for (let look = li + 1; look < Math.min(lines.length, li + 32); look++) {
+        const lb = isParagraphBreakLineForSafeSpans(lines[look]!, inBq, inList);
+        if (lb.kind !== 'none') break;
+        if (lineHasLinkTail[look] === 1) {
+          paraHasLinkContinuation = true;
+          break;
+        }
+      }
+    }
+
+    if (allowPdfPageMarkers && line.includes('<')) {
+      const trimmed = trimAsciiWhitespaceLinear(line);
+      if (/^<!-- (?:page |pdf-page: )\d{1,6} -->$/.test(trimmed)) {
+        continue;
+      }
+    }
+
+    const hasTick = line.includes('`');
+    if (!hasTick) {
+      if (hasUnclosedOpenBracketOnLine(line, line.length)) {
+        paraHasOpenBracket = true;
+      }
+      if (line.includes('<')) {
+        const escaped = replaceAllLtLinearFast(line);
+        if (escaped !== line) {
+          lines[li] = escaped;
+          anyChanged = true;
+        }
+      }
+      if (brk.kind === 'atx_heading') {
+        paraTickPoisoned = false;
+        paraHasOpenBracket = false;
+      }
+      continue;
+    }
+
+    // Scan backtick runs on `line` to verify `paraTickPoisoned` & `k === 1` pairing
+    let lineAllSinglePaired = !paraTickPoisoned;
+    const singleTicks: number[] = [];
+    if (lineAllSinglePaired) {
+      let p = 0;
+      while (p < line.length) {
+        const idx = line.indexOf('`', p);
+        if (idx < 0) break;
+        if (idx > 0 && line.charCodeAt(idx - 1) === 92 /* '\\' */) {
+          lineAllSinglePaired = false;
+          paraTickPoisoned = true;
+          break;
+        }
+        let end = idx + 1;
+        while (end < line.length && line.charCodeAt(end) === 96) end++;
+        if (end - idx !== 1) {
+          lineAllSinglePaired = false;
+          // Check CommonMark pairing to know whether subsequent lines in paragraph are tick-poisoned
+          const runLen = end - idx;
+          let search = end;
+          let matched = false;
+          while (search < line.length) {
+            const h = line.indexOf('`', search);
+            if (h < 0) break;
+            let he = h + 1;
+            while (he < line.length && line.charCodeAt(he) === 96) he++;
+            if (he - h === runLen && (h === 0 || line.charCodeAt(h - 1) !== 92)) {
+              matched = true;
+              p = he;
+              break;
+            }
+            search = he;
+          }
+          if (!matched) {
+            paraTickPoisoned = true;
+          }
+          break;
+        }
+        singleTicks.push(idx);
+        p = end;
+      }
+      if (lineAllSinglePaired && (singleTicks.length < 2 || (singleTicks.length & 1) === 1)) {
+        lineAllSinglePaired = false;
+        paraTickPoisoned = true;
+      }
+    } else {
+      paraTickPoisoned = true;
+    }
+
+    if (!line.includes('<')) {
+      if (hasUnclosedOpenBracketOnLine(line, line.length)) {
+        paraHasOpenBracket = true;
+      }
+      if (brk.kind === 'atx_heading') {
+        paraTickPoisoned = false;
+        paraHasOpenBracket = false;
+      }
+      continue;
+    }
+
+    if (!lineAllSinglePaired) {
+      if (hasUnclosedOpenBracketOnLine(line, line.length)) {
+        paraHasOpenBracket = true;
+      }
+      const escaped = replaceAllLtLinearFast(line);
+      if (escaped !== line) {
+        lines[li] = escaped;
+        anyChanged = true;
+      }
+      if (brk.kind === 'atx_heading') {
+        paraTickPoisoned = false;
+        paraHasOpenBracket = false;
+      }
+      continue;
+    }
+
+    const lineHasPipe = line.includes('|');
+    let anySpanHasPipe = false;
+    if (lineHasPipe) {
+      for (let si = 0; si < singleTicks.length; si += 2) {
+        if (line.slice(singleTicks[si]! + 1, singleTicks[si + 1]!).includes('|')) {
+          anySpanHasPipe = true;
+          break;
+        }
+      }
+    }
+
+    // Also check if any link destination/title on `line` outside spans contains a backtick (which poisons pairing)
+    let linkContainsTick = false;
+    for (let si = 0; si <= singleTicks.length; si += 2) {
+      const prevClose = si === 0 ? 0 : singleTicks[si - 1]! + 1;
+      const nextOpen = si < singleTicks.length ? singleTicks[si]! : line.length;
+      const outsideSeg = line.slice(prevClose, nextOpen);
+      if (outsideSeg.includes('](') && si < singleTicks.length) {
+        const bpIdx = outsideSeg.lastIndexOf('](');
+        if (!outsideSeg.slice(bpIdx + 2).includes(')')) {
+          // Unclosed `](` right before a backtick!
+          linkContainsTick = true;
+          paraTickPoisoned = true;
+          break;
+        }
+      }
+    }
+
+    if (linkContainsTick || (lineHasPipe && anySpanHasPipe)) {
+      if (hasUnclosedOpenBracketOnLine(line, line.length)) paraHasOpenBracket = true;
+      const escaped = replaceAllLtLinearFast(line);
+      if (escaped !== line) {
+        lines[li] = escaped;
+        anyChanged = true;
+      }
+      if (brk.kind === 'atx_heading') {
+        paraTickPoisoned = false;
+        paraHasOpenBracket = false;
+      }
+      continue;
+    }
+
+    const lineHasLinkSyntax = lineHasLinkTail[li] === 1 || paraHasLinkContinuation;
+    let out = '';
+    let cursor = 0;
+    for (let si = 0; si < singleTicks.length; si += 2) {
+      const openIdx = singleTicks[si]!;
+      const closeIdx = singleTicks[si + 1]!;
+      out += replaceAllLtLinearFast(line.slice(cursor, openIdx));
+
+      const inner = line.slice(openIdx + 1, closeIdx);
+      let spanSafe = inner.length > 0;
+      if (spanSafe && inner.includes('<')) {
+        // Check backslash before closing tick (already checked in loop, double-verify)
+        if (line.charCodeAt(closeIdx - 1) === 92 /* '\\' */) spanSafe = false;
+        // Check tilde or emphasis adjacency
+        if (spanSafe && openIdx > 0) {
+          const prevC = line.charCodeAt(openIdx - 1);
+          if (prevC === 126 /* '~' */) spanSafe = false;
+          if ((prevC === 42 /* '*' */ || prevC === 95 /* '_' */) && inner.includes(prevC === 42 ? '*' : '_')) {
+            spanSafe = false;
+          }
+          // Glued bare URL check (`https://x\`...`)
+          if (prevC > 32 && prevC !== 40 && prevC !== 91 && prevC !== 34 && prevC !== 39) {
+            const beforeSlice = line.slice(Math.max(0, openIdx - 256), openIdx);
+            if (/(?:https?:\/\/|ftp:\/\/|www\.)\S*$/i.test(beforeSlice)) {
+              spanSafe = false;
+            }
+          }
+        }
+        if (spanSafe && closeIdx + 1 < line.length && line.charCodeAt(closeIdx + 1) === 126 /* '~' */) {
+          spanSafe = false;
+        }
+        // Check HTML comment / PI / CDATA openers inside span
+        if (spanSafe && (inner.includes('<!--') || inner.includes('-->') || inner.includes('<?') || inner.includes('<![') || inner.includes('](') || inner.includes('][') || inner.includes(']:'))) {
+          spanSafe = false;
+        }
+        // Check `marked` / `showdown` link-before-codespan disagreement
+        if (spanSafe) {
+          const unclosedBefore = paraHasOpenBracket || hasUnclosedOpenBracketOnLine(line, openIdx);
+          if (unclosedBefore && (inner.includes(']') || lineHasLinkSyntax || line.indexOf(']', closeIdx + 1) >= 0)) {
+            spanSafe = false;
+          } else if ((inner.includes('[') || inner.includes(']')) && lineHasLinkSyntax) {
+            spanSafe = false;
+          }
+        }
+      }
+
+      if (spanSafe) {
+        out += line.slice(openIdx, closeIdx + 1);
+      } else {
+        out += `\`${replaceAllLtLinearFast(inner)}\``;
+      }
+      cursor = closeIdx + 1;
+    }
+    out += replaceAllLtLinearFast(line.slice(cursor));
+
+    if (hasUnclosedOpenBracketOnLine(line, line.length)) {
+      paraHasOpenBracket = true;
+    }
+    if (out !== line) {
+      lines[li] = out;
+      anyChanged = true;
+    }
+    if (brk.kind === 'atx_heading') {
+      paraTickPoisoned = false;
+      paraHasOpenBracket = false;
+    }
+  }
+
+  return anyChanged ? lines.join('\n') : prose;
+}
+
 function measureSliceIndentCols(raw: string): { cols: number; bytePos: number; isBlank: boolean } {
   let cols = 0;
   let i = 0;
@@ -795,20 +1204,25 @@ function measureSliceIndentCols(raw: string): { cols: number; bytePos: number; i
   return { cols, bytePos: i, isBlank: i >= raw.length };
 }
 
-function detectSliceListItemContentCol(raw: string, leadCols: number, leadPos: number): number {
+function detectSliceListItemContentCol(raw: string, leadCols: number, leadPos: number, prevLineWasParagraph = false): number {
   if (leadCols > 3 || leadPos >= raw.length) return 0;
+  if (isThematicBreakForSlice(raw, leadCols, leadPos)) return 0;
   const c = raw.charCodeAt(leadPos);
   let markerEnd = -1;
   let markerWidth = 0;
+  let isOrdered = false;
+  let isOrderedOne = false;
   if (c === 45 || c === 42 || c === 43) {
     markerEnd = leadPos + 1;
     markerWidth = 1;
   } else if (c >= 48 && c <= 57) {
+    isOrdered = true;
     let d = leadPos + 1;
     while (d < raw.length && d - leadPos < 9 && raw.charCodeAt(d) >= 48 && raw.charCodeAt(d) <= 57) d++;
     if (d < raw.length && (raw.charCodeAt(d) === 46 || raw.charCodeAt(d) === 41)) {
       markerEnd = d + 1;
       markerWidth = markerEnd - leadPos;
+      isOrderedOne = d === leadPos + 1 && c === 49 /* '1' */;
     }
   }
   if (markerEnd < 0 || markerEnd >= raw.length) return 0;
@@ -828,16 +1242,26 @@ function detectSliceListItemContentCol(raw: string, leadCols: number, leadPos: n
       break;
     }
   }
+  if (prevLineWasParagraph) {
+    if (p >= raw.length) return 0;
+    if (isOrdered && !isOrderedOne) return 0;
+  }
   if (p >= raw.length || col - (leadCols + markerWidth) > 4) {
     return leadCols + markerWidth + 1;
   }
   return col;
 }
 
+function normalizeSliceLineEndingsLengthPreserving(s: string): string {
+  if (!/[\r\u0085\u2028\u2029]/.test(s)) return s;
+  return s.replace(/\r(?!\n)/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ');
+}
+
 function hardenAndSplitSliceFences(
-  md: string,
+  rawMd: string,
   initialReopenedFence?: { ch: string; len: number; sourceIndent: number },
 ): Array<{ text: string; isFence: boolean }> {
+  const md = normalizeSliceLineEndingsLengthPreserving(rawMd);
   const lines = md.split('\n');
   const normLines: string[] = [];
   let inFence = false;
@@ -1090,19 +1514,166 @@ function hardenAndSplitSliceFences(
  *     `escapeAllResidualLtInProseLinear`) across all non-fence segments so **0 of N** character offsets can EVER produce live
  *     HTML or dangerous URI schemes!
  */
+export interface MarkdownSliceCheckpoint {
+  pos: number;
+  inFence: boolean;
+  fenceChar: string;
+  fenceLen: number;
+  fenceIndent: number;
+  activeListIndent: number;
+  prevLineWasParagraph: boolean;
+}
+
+export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 16_384): MarkdownSliceCheckpoint[] {
+  const checkpoints: MarkdownSliceCheckpoint[] = [];
+  if (!rawFullMd || rawFullMd.length <= stepChars) return checkpoints;
+  const fullMd = normalizeSliceLineEndingsLengthPreserving(rawFullMd);
+  let inFence = false;
+  let fenceChar = '';
+  let fenceLen = 0;
+  let fenceIndent = 0;
+  let activeListIndent = 0;
+  let prevLineWasParagraph = false;
+  let nextCheckpointAt = stepChars;
+  let pos = 0;
+  const n = fullMd.length;
+
+  while (pos < n) {
+    if (pos >= nextCheckpointAt) {
+      checkpoints.push({
+        pos,
+        inFence,
+        fenceChar,
+        fenceLen,
+        fenceIndent,
+        activeListIndent,
+        prevLineWasParagraph,
+      });
+      nextCheckpointAt = pos + stepChars;
+    }
+    const nl = fullMd.indexOf('\n', pos);
+    const lineEnd = nl === -1 ? n : nl;
+    const nextPos = nl === -1 ? n : nl + 1;
+    const rawLine = lineEnd > pos && fullMd.charCodeAt(lineEnd - 1) === 13 ? fullMd.slice(pos, lineEnd - 1) : fullMd.slice(pos, lineEnd);
+    const { cols, bytePos, isBlank } = measureSliceIndentCols(rawLine);
+
+    let lineOpenedFence: { ch: string; len: number; indent: number } | null = null;
+    let lineClosedFenceExplicit = false;
+
+    if (inFence) {
+      prevLineWasParagraph = false;
+      if (!isBlank && fenceIndent > 0 && cols < fenceIndent) {
+        inFence = false;
+        fenceChar = '';
+        fenceLen = 0;
+        fenceIndent = 0;
+        activeListIndent = 0;
+      } else {
+        const maxClose = fenceIndent > 0 ? fenceIndent + 3 : 3;
+        if (cols <= maxClose && bytePos === cols) {
+          let p = bytePos;
+          const fcCode = fenceChar.charCodeAt(0);
+          while (p < rawLine.length && rawLine.charCodeAt(p) === fcCode) p++;
+          const runLen = p - bytePos;
+          if (runLen >= fenceLen) {
+            while (p < rawLine.length && (rawLine.charCodeAt(p) === 32 || rawLine.charCodeAt(p) === 9)) p++;
+            if (p === rawLine.length) {
+              lineClosedFenceExplicit = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (!inFence && !lineClosedFenceExplicit) {
+      if (!isBlank && activeListIndent > 0 && cols < activeListIndent && !prevLineWasParagraph) {
+        activeListIndent = 0;
+      }
+      const listCol = detectSliceListItemContentCol(rawLine, cols, bytePos, prevLineWasParagraph);
+      if (listCol > 0) {
+        activeListIndent = listCol;
+        prevLineWasParagraph = false;
+      }
+      const minCols = activeListIndent > 0 ? activeListIndent : 0;
+      const maxCols = minCols + 3;
+      if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos === cols && bytePos + 3 <= rawLine.length) {
+        const c0 = rawLine.charCodeAt(bytePos);
+        if (c0 === 96 || c0 === 126) {
+          let fEnd = bytePos + 1;
+          while (fEnd < rawLine.length && rawLine.charCodeAt(fEnd) === c0) fEnd++;
+          const fLen = fEnd - bytePos;
+          if (fLen >= 3 && !(c0 === 96 && rawLine.indexOf('`', fEnd) >= 0)) {
+            lineOpenedFence = {
+              ch: c0 === 96 ? '`' : '~',
+              len: fLen,
+              indent: activeListIndent > 0 ? activeListIndent : 0,
+            };
+          }
+        }
+      }
+      if (!lineOpenedFence) {
+        if (isBlank || isThematicBreakForSlice(rawLine, cols, bytePos)) {
+          prevLineWasParagraph = false;
+        } else if (listCol > 0) {
+          prevLineWasParagraph = rawLine.slice(Math.min(listCol, rawLine.length)).trim() !== '';
+        } else {
+          const leadC = rawLine.charCodeAt(bytePos);
+          let isAtx = false;
+          if (cols <= 3 && leadC === 35) {
+            let h = bytePos;
+            while (h < rawLine.length && h - bytePos < 7 && rawLine.charCodeAt(h) === 35) h++;
+            if (h - bytePos <= 6 && (h === rawLine.length || rawLine.charCodeAt(h) === 32 || rawLine.charCodeAt(h) === 9)) {
+              isAtx = true;
+            }
+          }
+          if (isAtx || (!prevLineWasParagraph && activeListIndent === 0 && cols >= 4)) {
+            prevLineWasParagraph = false;
+          } else if (cols <= 3 && leadC === 62) {
+            let q = bytePos;
+            while (q < rawLine.length && (rawLine.charCodeAt(q) === 62 || rawLine.charCodeAt(q) === 32 || rawLine.charCodeAt(q) === 9)) q++;
+            prevLineWasParagraph = q < rawLine.length;
+          } else {
+            prevLineWasParagraph = true;
+          }
+        }
+      }
+    }
+
+    if (lineClosedFenceExplicit) {
+      inFence = false;
+      fenceChar = '';
+      fenceLen = 0;
+      fenceIndent = 0;
+      prevLineWasParagraph = false;
+    } else if (lineOpenedFence) {
+      inFence = true;
+      fenceChar = lineOpenedFence.ch;
+      fenceLen = lineOpenedFence.len;
+      fenceIndent = lineOpenedFence.indent;
+      prevLineWasParagraph = false;
+    }
+    pos = nextPos;
+  }
+  return checkpoints;
+}
+
 export function sanitizeMarkdownPageSlice(
-  fullMd: string,
+  rawFullMd: string,
   safeOffset: number,
-  rawSlice: string,
+  rawSliceInput: string,
   allowPdfPageMarkers = false,
+  checkpoints?: readonly MarkdownSliceCheckpoint[],
 ): string {
-  if (!rawSlice) return '';
+  if (!rawSliceInput) return '';
+  const fullMd = normalizeSliceLineEndingsLengthPreserving(rawFullMd);
+  const rawSlice = normalizeSliceLineEndingsLengthPreserving(rawSliceInput);
 
   let inFence = false;
   let fenceChar = '';
   let fenceLen = 0;
   let fenceIndent = 0;
   let activeListIndent = 0;
+  let prevLineWasParagraph = false;
 
   let reconstructed = rawSlice;
   let initialReopenedFence: { ch: string; len: number; sourceIndent: number } | undefined;
@@ -1110,6 +1681,30 @@ export function sanitizeMarkdownPageSlice(
   if (safeOffset > 0 && fullMd.length > 0) {
     const clampedOffset = Math.min(safeOffset, fullMd.length);
     let pos = 0;
+    if (checkpoints && checkpoints.length > 0) {
+      let lo = 0;
+      let hi = checkpoints.length - 1;
+      let bestIdx = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >>> 1;
+        if (checkpoints[mid]!.pos <= clampedOffset) {
+          bestIdx = mid;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      if (bestIdx >= 0) {
+        const cp = checkpoints[bestIdx]!;
+        pos = cp.pos;
+        inFence = cp.inFence;
+        fenceChar = cp.fenceChar;
+        fenceLen = cp.fenceLen;
+        fenceIndent = cp.fenceIndent;
+        activeListIndent = cp.activeListIndent;
+        prevLineWasParagraph = cp.prevLineWasParagraph;
+      }
+    }
     while (pos <= clampedOffset && pos <= fullMd.length) {
       const nl = fullMd.indexOf('\n', pos);
       const lineEnd = nl === -1 ? fullMd.length : nl;
@@ -1122,6 +1717,7 @@ export function sanitizeMarkdownPageSlice(
       let lineClosedFenceExplicit = false;
 
       if (inFence) {
+        prevLineWasParagraph = false;
         if (!isBlank && fenceIndent > 0 && cols < fenceIndent) {
           inFence = false;
           fenceChar = '';
@@ -1146,11 +1742,14 @@ export function sanitizeMarkdownPageSlice(
       }
 
       if (!inFence && !lineClosedFenceExplicit) {
-        if (!isBlank && activeListIndent > 0 && cols < activeListIndent) {
+        if (!isBlank && activeListIndent > 0 && cols < activeListIndent && !prevLineWasParagraph) {
           activeListIndent = 0;
         }
-        const listCol = detectSliceListItemContentCol(rawLine, cols, bytePos);
-        if (listCol > 0) activeListIndent = listCol;
+        const listCol = detectSliceListItemContentCol(rawLine, cols, bytePos, prevLineWasParagraph);
+        if (listCol > 0) {
+          activeListIndent = listCol;
+          prevLineWasParagraph = false;
+        }
         const minCols = activeListIndent > 0 ? activeListIndent : 0;
         const maxCols = minCols + 3;
         if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos === cols && bytePos + 3 <= rawLine.length) {
@@ -1159,12 +1758,38 @@ export function sanitizeMarkdownPageSlice(
             let fEnd = bytePos + 1;
             while (fEnd < rawLine.length && rawLine.charCodeAt(fEnd) === c0) fEnd++;
             const fLen = fEnd - bytePos;
-            if (fLen >= 3 && !(c0 === 96 && rawLine.slice(fEnd).includes('`'))) {
+            if (fLen >= 3 && !(c0 === 96 && rawLine.indexOf('`', fEnd) >= 0)) {
               lineOpenedFence = {
                 ch: c0 === 96 ? '`' : '~',
                 len: fLen,
                 indent: activeListIndent > 0 ? activeListIndent : 0,
               };
+            }
+          }
+        }
+        if (!lineOpenedFence && !containsOffset) {
+          if (isBlank || isThematicBreakForSlice(rawLine, cols, bytePos)) {
+            prevLineWasParagraph = false;
+          } else if (listCol > 0) {
+            prevLineWasParagraph = rawLine.slice(Math.min(listCol, rawLine.length)).trim() !== '';
+          } else {
+            const leadC = rawLine.charCodeAt(bytePos);
+            let isAtx = false;
+            if (cols <= 3 && leadC === 35) {
+              let h = bytePos;
+              while (h < rawLine.length && h - bytePos < 7 && rawLine.charCodeAt(h) === 35) h++;
+              if (h - bytePos <= 6 && (h === rawLine.length || rawLine.charCodeAt(h) === 32 || rawLine.charCodeAt(h) === 9)) {
+                isAtx = true;
+              }
+            }
+            if (isAtx || (!prevLineWasParagraph && activeListIndent === 0 && cols >= 4)) {
+              prevLineWasParagraph = false;
+            } else if (cols <= 3 && leadC === 62) {
+              let q = bytePos;
+              while (q < rawLine.length && (rawLine.charCodeAt(q) === 62 || rawLine.charCodeAt(q) === 32 || rawLine.charCodeAt(q) === 9)) q++;
+              prevLineWasParagraph = q < rawLine.length;
+            } else {
+              prevLineWasParagraph = true;
             }
           }
         }
@@ -1270,7 +1895,7 @@ export function sanitizeMarkdownPageSlice(
       if (seg.isFence) return seg.text;
       let cleanProse = escapeGfmTaskListCheckboxesLinear(seg.text);
       cleanProse = neutralizeAllUnsafeMarkdownLinksLinear(cleanProse);
-      return escapeAllResidualLtInProseLinear(cleanProse, allowPdfPageMarkers);
+      return escapeResidualLtPreservingSafeCodeSpansLinear(cleanProse, allowPdfPageMarkers);
     })
     .join('');
 }
@@ -1282,7 +1907,10 @@ export function sanitizeMarkdownPageSlice(
  */
 export function sanitizeFullMarkdownDocumentForArtifact(fullMd: string): string {
   if (!fullMd) return '';
-  return sanitizeMarkdownPageSlice(fullMd, 0, fullMd, false);
+  const norm = /[\r\u0085\u2028\u2029]/.test(fullMd)
+    ? fullMd.replace(/\r\n?/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ')
+    : fullMd;
+  return sanitizeMarkdownPageSlice(norm, 0, norm, false);
 }
 
 /**
@@ -1675,17 +2303,124 @@ function finishFillerPass(base: string, mode: 'space' | 'strip'): string {
   return res;
 }
 
+/**
+ * Reconstructs intra-word hyphenated (`I-m-m-e-d-i-a-t-e-l-y`), dot-separated (`F.o.r.g.e.t`),
+ * underscore/slash-separated (`f_e_t_c_h`), and single-space-separated (`t o o l`, splitting on `>= 2` spaces,
+ * newlines, or punctuation boundaries) single-letter chains in strictly linear **O(N)** time so ALL
+ * `INJECTION_PATTERNS` match obfuscated sentences with intact word boundaries (`Round 9 Item 3`).
+ */
+function reconstructObfuscatedWordsLinear(s: string): string {
+  const n = s.length;
+  if (n < 3) return s;
+
+  // Pass 1: Collapse intra-word punctuation-separated single-letter chains (`I-m-m-e-d-i-a-t-e-l-y`, `F.o.r.g.e.t`, `t-h-e`)
+  let stage1 = s;
+  if (
+    (s.includes('-') || s.includes('.') || s.includes('_') || s.includes('/') || s.includes('+')) &&
+    /(?:^|[^A-Za-z0-9])[A-Za-z][-._/+](?:_[-._/+])?[A-Za-z](?:$|[^A-Za-z0-9.])/.test(s)
+  ) {
+    let sb = '';
+    let last = 0;
+    let i = 0;
+    const isIntraSep = (c: number) => c === 45 /* '-' */ || c === 46 /* '.' */ || c === 95 /* '_' */ || c === 47 /* '/' */ || c === 43 /* '+' */;
+    while (i < n) {
+      const c0 = s.charCodeAt(i);
+      if (
+        isAsciiAlphaCode(c0) &&
+        (i === 0 || !isAsciiAlnumCode(s.charCodeAt(i - 1))) &&
+        i + 2 < n &&
+        isIntraSep(s.charCodeAt(i + 1))
+      ) {
+        const sep = s.charCodeAt(i + 1);
+        let p = i + 1;
+        let letters = s[i]!;
+        let count = 1;
+        while (p + 1 < n && s.charCodeAt(p) === sep) {
+          const nc = s.charCodeAt(p + 1);
+          // Also allow `_` inside tool names like `f-e-t-c-h-_-u-r-l` -> `fetch_url`
+          if (nc === 95 && p + 3 < n && s.charCodeAt(p + 2) === sep && isAsciiAlphaCode(s.charCodeAt(p + 3))) {
+            letters += '_';
+            p += 2;
+            continue;
+          }
+          const afterNext = p + 2 < n ? s.charCodeAt(p + 2) : 32;
+          if (isAsciiAlphaCode(nc) && (!isAsciiAlnumCode(afterNext) || afterNext === sep)) {
+            letters += s[p + 1]!;
+            count++;
+            p += 2;
+          } else {
+            break;
+          }
+        }
+        // Consume optional trailing dot (`d.i.r.e.c.t.i.v.e.` / `S.T.R.I.P.E.`)
+        const endPos = p < n && sep === 46 && s.charCodeAt(p) === 46 && (p + 1 >= n || !isAsciiAlnumCode(s.charCodeAt(p + 1))) ? p + 1 : p;
+        if (count >= 2 && (endPos >= n || !isAsciiAlnumCode(s.charCodeAt(endPos)))) {
+          sb += s.slice(last, i) + letters;
+          last = endPos;
+          i = endPos;
+          continue;
+        }
+      }
+      i++;
+    }
+    if (last > 0) stage1 = sb + s.slice(last);
+  }
+
+  // Pass 2: Collapse single-space `' '` runs of `>= 2` single-letter tokens (`t o o l` -> `tool`),
+  // stopping at `>= 2` spaces, `\n`, `\t`, punctuation, or multi-letter words so word boundaries stay intact!
+  const m = stage1.length;
+  if (m < 3 || !stage1.includes(' ') || !/(?:^|[^A-Za-z0-9])[A-Za-z] [A-Za-z](?:$|[^A-Za-z0-9])/.test(stage1)) {
+    return stage1;
+  }
+  let sb2 = '';
+  let last2 = 0;
+  let j = 0;
+  while (j < m) {
+    const c = stage1.charCodeAt(j);
+    if (
+      isAsciiAlphaCode(c) &&
+      (j === 0 || !isAsciiAlnumCode(stage1.charCodeAt(j - 1))) &&
+      j + 2 < m &&
+      stage1.charCodeAt(j + 1) === 32 &&
+      stage1.charCodeAt(j + 2) !== 32
+    ) {
+      let p = j + 1;
+      let word = stage1[j]!;
+      let count = 1;
+      while (p + 1 < m && stage1.charCodeAt(p) === 32 && stage1.charCodeAt(p + 1) !== 32) {
+        const nc = stage1.charCodeAt(p + 1);
+        const after = p + 2 < m ? stage1.charCodeAt(p + 2) : 32;
+        if (isAsciiAlphaCode(nc) && !isAsciiAlnumCode(after)) {
+          word += stage1[p + 1]!;
+          count++;
+          p += 2;
+        } else {
+          break;
+        }
+      }
+      if (count >= 2) {
+        sb2 += stage1.slice(last2, j) + word;
+        last2 = p;
+        j = p;
+        continue;
+      }
+    }
+    j++;
+  }
+  return last2 === 0 ? stage1 : sb2 + stage1.slice(last2);
+}
+
 function normalizeProseBaseForInjectionScan(prose: string, fillerMode: 'space' | 'strip'): string {
   let out = decodeEntitiesForInjectionScan(prose);
   if (out.includes('<!--')) {
-    out = stripHtmlCommentsLinear(out, MAX_HTML_SCAN_CHARS);
+    out = stripHtmlCommentsLinear(out, MAX_PROMPT_INJECTION_SCAN_CHARS);
   }
   if (out.includes('<')) {
-    out = stripHtmlTagsLinear(out, ['script', 'style', 'noscript', 'template'], ' ', MAX_HTML_SCAN_CHARS);
+    out = stripHtmlTagsLinear(out, ['script', 'style', 'noscript', 'template'], ' ', MAX_PROMPT_INJECTION_SCAN_CHARS);
     out = replaceHtmlTagsQuoteAwareLinear(
       out,
       (tag) => (INLINE_SPLIT_TAGS.has(tag.tagNameLower) || tag.tagNameLower === 'code' ? '' : ' '),
-      MAX_HTML_SCAN_CHARS,
+      MAX_PROMPT_INJECTION_SCAN_CHARS,
       false,
     );
   }
@@ -1719,29 +2454,63 @@ function normalizeProseBaseForInjectionScan(prose: string, fillerMode: 'space' |
 
 function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'strip' | 'wordstream' = 'space'): string {
   const out = normalizeProseBaseForInjectionScan(prose, fillerMode === 'strip' ? 'strip' : 'space');
+  const reconstructed = reconstructObfuscatedWordsLinear(out);
   if (fillerMode === 'wordstream') {
-    return toWordStreamLinear(out);
+    return toWordStreamLinear(reconstructed);
   }
-  return finishFillerPass(out, fillerMode);
+  return finishFillerPass(reconstructed, fillerMode);
 }
 
-function normalizeProsePairForInjectionScan(prose: string): { spaced: string; stripped: string } {
+function normalizeProsePairForInjectionScan(prose: string): { spaced: string; stripped: string; reconstructed: string } {
   const baseSpaced = normalizeProseBaseForInjectionScan(prose, 'space');
   const spaced = finishFillerPass(baseSpaced, 'space');
+  // Reconstruct `a-b-c`, `a.b.c`, and `a b c` BEFORE `finishFillerPass` collapses `>= 2` spaces so multi-space word boundaries stay intact!
+  const rawReconstructed = reconstructObfuscatedWordsLinear(baseSpaced);
+  const reconstructed = rawReconstructed === baseSpaced ? spaced : finishFillerPass(rawReconstructed, 'space');
   const needsDistinctStripBase =
     /[\u115F\u1160\u3164\uFFA0]/.test(prose) || prose.includes('[SCRUBBED') || prose.includes('[scrubbed');
   const baseStripped = needsDistinctStripBase ? normalizeProseBaseForInjectionScan(prose, 'strip') : baseSpaced;
-  const stripped = finishFillerPass(baseStripped, 'strip');
-  return { spaced, stripped };
+  const stripped =
+    baseStripped === baseSpaced && !/[`*_~]/.test(baseSpaced) ? spaced : finishFillerPass(baseStripped, 'strip');
+  return { spaced, stripped, reconstructed };
+}
+
+function testInjectionPatternAgainstVariants(
+  pat: { id: string; re: RegExp; compactRe: RegExp },
+  spaced: string,
+  stripped: string,
+  reconstructed: string,
+  wordStream: string,
+  reconWordStream: string,
+  collapsed: string,
+  rawMd?: string,
+): boolean {
+  if (pat.re.test(spaced)) return true;
+  if (reconstructed !== spaced && pat.re.test(reconstructed)) return true;
+  if (wordStream !== spaced && pat.re.test(wordStream)) return true;
+  if (reconWordStream !== wordStream && pat.re.test(reconWordStream)) return true;
+  if (stripped !== spaced && pat.re.test(stripped)) return true;
+  if (collapsed !== wordStream && (pat.re.test(collapsed) || pat.compactRe.test(collapsed))) return true;
+  if (rawMd !== undefined && rawMd !== spaced && (pat.id === 'exfiltrate_secrets_or_tools' || pat.id === 'new_system_role_override')) {
+    if (pat.re.test(rawMd)) return true;
+  }
+  return false;
 }
 
 function matchesHiddenSubtreeInjection(rawFragment: string): boolean {
-  const { spaced, stripped } = normalizeProsePairForInjectionScan(rawFragment);
+  const { spaced, stripped, reconstructed } = normalizeProsePairForInjectionScan(rawFragment);
   const wordStream = toWordStreamLinear(spaced);
+  const reconWordStream = reconstructed === spaced ? wordStream : toWordStreamLinear(reconstructed);
   const collapsed = collapseSpacedSingleLettersLinear(wordStream);
-  if (HIDDEN_OVERRIDE_KEYWORD_RE.test(wordStream) || COMPACT_SPACED_OVERRIDE_RE.test(collapsed)) return true;
+  if (
+    HIDDEN_DIRECTIVE_OVERRIDE_RE.test(wordStream) ||
+    (reconWordStream !== wordStream && HIDDEN_DIRECTIVE_OVERRIDE_RE.test(reconWordStream)) ||
+    (collapsed !== wordStream && COMPACT_SPACED_OVERRIDE_RE.test(collapsed))
+  ) {
+    return true;
+  }
   for (const pat of INJECTION_PATTERNS) {
-    if (pat.re.test(spaced) || pat.re.test(wordStream) || pat.re.test(stripped) || pat.re.test(collapsed)) {
+    if (testInjectionPatternAgainstVariants(pat, spaced, stripped, reconstructed, wordStream, reconWordStream, collapsed)) {
       return true;
     }
   }
@@ -1750,14 +2519,14 @@ function matchesHiddenSubtreeInjection(rawFragment: string): boolean {
 
 /**
  * Scans extracted Markdown (including inline code spans and fenced/indented code blocks when `checkPromptInjection` runs)
- * and raw HTML for indirect prompt-injection payloads (`H1`, `R3-M3`, `M11`, `R7`/`R8` linear `< 25 ms` on `2 MiB`).
+ * and raw HTML for indirect prompt-injection payloads (`H1`, `R3-M3`, `M11`, `R7`/`R8`/`R9` 8 MiB cap, linear `< 80 ms` on `2 MiB`).
  */
 export function detectPromptInjection(params: {
   markdown: string;
   rawHtml?: string;
 }): { detected: boolean; triggers: string[] } {
-  const boundedHtml = (params.rawHtml ?? '').slice(0, MAX_HTML_SCAN_CHARS);
-  const boundedMd = params.markdown.slice(0, MAX_HTML_SCAN_CHARS);
+  const boundedHtml = (params.rawHtml ?? '').slice(0, MAX_PROMPT_INJECTION_SCAN_CHARS);
+  const boundedMd = params.markdown.slice(0, MAX_PROMPT_INJECTION_SCAN_CHARS);
   const triggers: string[] = [];
   let totalScore = 0;
 
@@ -1790,27 +2559,27 @@ export function detectPromptInjection(params: {
               styleHiddenClasses.add(cm[1]!.toLowerCase());
             }
           }
-          return '';
-        },
-        { maxChars: MAX_HTML_SCAN_CHARS },
-      );
-    }
+            return '';
+          },
+          { maxChars: MAX_PROMPT_INJECTION_SCAN_CHARS },
+        );
+      }
 
-    // Check `<template>` and `<noscript>` inert/fallback subtrees
-    if (lowerForHidden.includes('<template') || lowerForHidden.includes('<noscript')) {
-      let foundInert = false;
-      replacePairedHtmlElementsLinear(
-        rawForHidden,
-        ['template', 'noscript'],
-        (_full, _t, _a, inner) => {
-          if (foundInert) return '';
-          if (matchesHiddenSubtreeInjection(inner.slice(0, 8_192))) {
-            foundInert = true;
-          }
-          return '';
-        },
-        { maxChars: MAX_HTML_SCAN_CHARS },
-      );
+      // Check `<template>` and `<noscript>` inert/fallback subtrees
+      if (lowerForHidden.includes('<template') || lowerForHidden.includes('<noscript')) {
+        let foundInert = false;
+        replacePairedHtmlElementsLinear(
+          rawForHidden,
+          ['template', 'noscript'],
+          (_full, _t, _a, inner) => {
+            if (foundInert) return '';
+            if (matchesHiddenSubtreeInjection(inner.slice(0, 8_192))) {
+              foundInert = true;
+            }
+            return '';
+          },
+          { maxChars: MAX_PROMPT_INJECTION_SCAN_CHARS },
+        );
       if (foundInert) {
         triggers.push('hidden_css_instruction_injection');
         totalScore += 5;
@@ -1823,11 +2592,13 @@ export function detectPromptInjection(params: {
       const closeMoreByTag = new Map<string, number[]>();
       const closeCursorByTag = new Map<string, number>();
       const candidateOpenTags: Array<{
-        tagNameLower: string;
+        nameStart: number;
+        nameEnd: number;
         attrStart: number;
         attrEnd: number;
         end: number;
         isSelfClosing: boolean;
+        immediateClose: number;
       }> = [];
 
       let scanPos = 0;
@@ -1923,13 +2694,40 @@ export function detectPromptInjection(params: {
         const selfClosing = j > p && rawForHidden.charCodeAt(j - 1) === 47 /* '/' */;
         const attrEnd = selfClosing ? j - 1 : j;
         if (attrEnd > p) {
+          const nameLen = p - nameStart;
+          let immediateClose = -1;
+          if (!selfClosing) {
+            const nextLt = rawForHidden.indexOf('<', j + 1);
+            if (
+              nextLt >= j + 1 &&
+              nextLt - (j + 1) <= 256 &&
+              nextLt + 2 + nameLen < htmlLen &&
+              rawForHidden.charCodeAt(nextLt + 1) === 47 /* '/' */ &&
+              rawForHidden.charCodeAt(nextLt + 2 + nameLen) === 62 /* '>' */
+            ) {
+              let sameTag = true;
+              for (let k = 0; k < nameLen; k++) {
+                if (lowerForHidden.charCodeAt(nameStart + k) !== lowerForHidden.charCodeAt(nextLt + 2 + k)) {
+                  sameTag = false;
+                  break;
+                }
+              }
+              if (sameTag) immediateClose = nextLt;
+            }
+          }
           candidateOpenTags.push({
-            tagNameLower: lowerForHidden.slice(nameStart, p),
+            nameStart,
+            nameEnd: p,
             attrStart: p,
             attrEnd,
             end: j + 1,
             isSelfClosing: selfClosing,
+            immediateClose,
           });
+          if (immediateClose >= 0) {
+            scanPos = immediateClose + 3 + nameLen;
+            continue;
+          }
         }
         scanPos = j + 1;
       }
@@ -1981,19 +2779,21 @@ export function detectPromptInjection(params: {
 
         if (!isHiddenSubtree) continue;
 
-        let closeIdx = -1;
-        const firstClose = closeFirstByTag.get(tag.tagNameLower);
+        let closeIdx = tag.immediateClose;
+        const tagNameLower =
+          closeIdx < 0 && closeFirstByTag.size > 0 ? lowerForHidden.slice(tag.nameStart, tag.nameEnd) : '';
+        const firstClose = tagNameLower ? closeFirstByTag.get(tagNameLower) : undefined;
         if (firstClose !== undefined) {
           if (firstClose >= tag.end) {
             closeIdx = firstClose;
           } else {
-            const moreList = closeMoreByTag.get(tag.tagNameLower);
+            const moreList = closeMoreByTag.get(tagNameLower);
             if (moreList) {
-              let cur = closeCursorByTag.get(tag.tagNameLower) ?? 0;
+              let cur = closeCursorByTag.get(tagNameLower) ?? 0;
               while (cur < moreList.length && moreList[cur]! < tag.end) {
                 cur++;
               }
-              closeCursorByTag.set(tag.tagNameLower, cur);
+              closeCursorByTag.set(tagNameLower, cur);
               if (cur < moreList.length) {
                 closeIdx = moreList[cur]!;
               }
@@ -2014,11 +2814,12 @@ export function detectPromptInjection(params: {
       }
 
       if (attrCandidates.length > 0) {
-        const joinedAttrs = attrCandidates.join('\n.\n').slice(0, MAX_HTML_SCAN_CHARS);
+        const joinedAttrs = attrCandidates.join('\n.\n').slice(0, MAX_PROMPT_INJECTION_SCAN_CHARS);
         const spacedAttrs = normalizeProseForInjectionScan(joinedAttrs, 'space');
         const wordAttrs = toWordStreamLinear(spacedAttrs);
+        const collapsedAttrs = collapseSpacedSingleLettersLinear(wordAttrs);
         for (const pat of INJECTION_PATTERNS) {
-          if (pat.re.test(spacedAttrs) || pat.re.test(wordAttrs)) {
+          if (pat.re.test(spacedAttrs) || pat.re.test(wordAttrs) || pat.compactRe.test(collapsedAttrs)) {
             triggers.push('hidden_css_instruction_injection');
             totalScore += 5;
             break;
@@ -2029,7 +2830,7 @@ export function detectPromptInjection(params: {
       if (!triggers.includes('hidden_css_instruction_injection') && hiddenIntervals.length > 0) {
         const rawHiddenChunks: string[] = [];
         let accLen = 0;
-        for (let hi = 0; hi < hiddenIntervals.length && accLen < MAX_HTML_SCAN_CHARS; hi++) {
+        for (let hi = 0; hi < hiddenIntervals.length && accLen < MAX_PROMPT_INJECTION_SCAN_CHARS; hi++) {
           const [hStart, hEnd] = hiddenIntervals[hi]!;
           const rawSlice = rawForHidden.slice(hStart, hEnd);
           if (rawSlice) {
@@ -2038,7 +2839,13 @@ export function detectPromptInjection(params: {
           }
         }
         if (rawHiddenChunks.length > 0) {
-          const strippedOnce = stripHtmlTagsQuoteAwareLinear(rawHiddenChunks.join('\n.\n'), ' ', MAX_HTML_SCAN_CHARS);
+          const joinedHidden = rawHiddenChunks.join('\n.\n');
+          const boundedJoinedHidden = joinedHidden.slice(0, MAX_PROMPT_INJECTION_SCAN_CHARS);
+          const strippedOnce = !boundedJoinedHidden.includes('<')
+            ? boundedJoinedHidden
+            : !boundedJoinedHidden.includes('"') && !boundedJoinedHidden.includes("'")
+              ? boundedJoinedHidden.replace(/<[A-Za-z/!?][^>]{0,4096}>/g, ' ')
+              : stripHtmlTagsQuoteAwareLinear(boundedJoinedHidden, ' ', MAX_PROMPT_INJECTION_SCAN_CHARS);
           if (matchesHiddenSubtreeInjection(strippedOnce)) {
             triggers.push('hidden_css_instruction_injection');
             totalScore += 5;
@@ -2048,19 +2855,24 @@ export function detectPromptInjection(params: {
     }
   }
 
-  // 3. Full Markdown + code-span / fenced-block scan (`M11` & `R7`/`R8`: zero character-class skip gates, unconditional passes, `< 35 ms` on `2 MiB`!)
-  const { spaced: scanSpaced, stripped: scanStripped } = normalizeProsePairForInjectionScan(boundedMd);
+  // 3. Full Markdown + code-span / fenced-block scan (`M11` & `R7`/`R8`/`R9`: 8 MiB cap, linear `< 80 ms` on `2 MiB`!)
+  const { spaced: scanSpaced, stripped: scanStripped, reconstructed: scanReconstructed } = normalizeProsePairForInjectionScan(boundedMd);
   const scanWordStream = toWordStreamLinear(scanSpaced);
+  const scanReconWordStream = scanReconstructed === scanSpaced ? scanWordStream : toWordStreamLinear(scanReconstructed);
   const scanCollapsed = collapseSpacedSingleLettersLinear(scanWordStream);
 
   for (const pat of INJECTION_PATTERNS) {
     if (
-      pat.re.test(scanSpaced) ||
-      pat.re.test(scanWordStream) ||
-      pat.re.test(scanStripped) ||
-      pat.re.test(scanCollapsed) ||
-      (pat.id === 'ignore_previous_instructions' && COMPACT_SPACED_OVERRIDE_RE.test(scanCollapsed)) ||
-      ((pat.id === 'exfiltrate_secrets_or_tools' || pat.id === 'new_system_role_override') && pat.re.test(boundedMd))
+      testInjectionPatternAgainstVariants(
+        pat,
+        scanSpaced,
+        scanStripped,
+        scanReconstructed,
+        scanWordStream,
+        scanReconWordStream,
+        scanCollapsed,
+        boundedMd,
+      )
     ) {
       triggers.push(pat.id);
       totalScore += pat.weight;
@@ -2220,6 +3032,27 @@ function extractFirstHeadingTextLinear(rawBody: string, tagNameLower: string): s
   return heading;
 }
 
+export function sanitizePlainMetadataText(raw: string | undefined, maxLen = 2_000): string | undefined {
+  if (!raw || typeof raw !== 'string') return undefined;
+  let s = raw.length > maxLen * 2 ? raw.slice(0, maxLen * 2) : raw;
+  if (/[^\x20-\x7E]/.test(s)) {
+    s = s
+      .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+      .replace(
+        /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]/gu,
+        '',
+      );
+  }
+  s = s.replace(/[\r\n\t\u0085\u2028\u2029]+/g, ' ').replace(/ {2,}/g, ' ').trim();
+  if (!s) return undefined;
+  if (s.length > maxLen) s = s.slice(0, maxLen).trim();
+  s = neutralizeAllUnsafeMarkdownLinksLinear(s);
+  if (s.includes('<')) {
+    s = replaceAllLtLinearFast(s);
+  }
+  return s || undefined;
+}
+
 /**
  * Extracts normalized e-commerce product metadata (`formats: ["product"]`) across Schema.org `Product`,
  * OpenGraph `product:*` / `og:*` tags, and embedded Shopify product JSON.
@@ -2242,12 +3075,14 @@ export function extractStructuredProduct(params: {
 
   if (productLd) {
     const brandRaw = productLd.brand;
-    const brand =
+    const brand = sanitizePlainMetadataText(
       typeof brandRaw === 'string'
         ? brandRaw
         : brandRaw && typeof brandRaw === 'object' && typeof (brandRaw as { name?: unknown }).name === 'string'
           ? (brandRaw as { name: string }).name
-          : undefined;
+          : undefined,
+      240,
+    );
 
     const offersRaw = productLd.offers;
     const offerList = Array.isArray(offersRaw)
@@ -2279,28 +3114,40 @@ export function extractStructuredProduct(params: {
         ? (productLd.aggregateRating as Record<string, unknown>)
         : null;
 
+    const cleanLdTitle = sanitizePlainMetadataText(typeof productLd.name === 'string' ? productLd.name : fallbackTitle, 400);
+    const cleanLdDesc = sanitizePlainMetadataText(
+      typeof productLd.description === 'string' ? productLd.description : fallbackDescription,
+      1_200,
+    );
+    const cleanSku = sanitizePlainMetadataText(typeof productLd.sku === 'string' ? productLd.sku : undefined, 160);
+    const rawLdUrl = typeof productLd.url === 'string' && !isDisallowedMarkdownLinkDestination(productLd.url) ? productLd.url : finalUrl;
+
     return {
-      title: typeof productLd.name === 'string' ? productLd.name : fallbackTitle,
-      ...(typeof productLd.description === 'string' ? { description: productLd.description } : fallbackDescription ? { description: fallbackDescription } : {}),
+      title: cleanLdTitle,
+      ...(cleanLdDesc ? { description: cleanLdDesc } : {}),
       ...(brand ? { brand } : {}),
-      ...(typeof productLd.sku === 'string' ? { sku: productLd.sku } : {}),
+      ...(cleanSku ? { sku: cleanSku } : {}),
       ...(typeof productLd.gtin13 === 'string' ? { gtin: productLd.gtin13 } : typeof productLd.gtin === 'string' ? { gtin: productLd.gtin } : {}),
       ...(price !== undefined ? { price } : {}),
       ...(currency ? { currency } : {}),
       ...(availability ? { availability } : {}),
-      url: typeof productLd.url === 'string' ? productLd.url : finalUrl,
+      url: rawLdUrl,
       ...(images.length > 0 ? { images } : {}),
       ...(ratingObj?.ratingValue !== undefined ? { rating: Number(ratingObj.ratingValue) || ratingObj.ratingValue } : {}),
       ...(ratingObj?.reviewCount !== undefined ? { reviewCount: Number(ratingObj.reviewCount) || ratingObj.reviewCount } : {}),
       ...(offerList.length > 1
         ? {
-            variants: offerList.slice(0, 30).map((o) => ({
-              ...(typeof o.name === 'string' ? { name: o.name } : {}),
-              ...(typeof o.sku === 'string' ? { sku: o.sku } : {}),
-              ...(o.price !== undefined ? { price: Number(String(o.price).replace(/[^0-9.]/g, '')) || o.price } : {}),
-              ...(typeof o.priceCurrency === 'string' ? { currency: o.priceCurrency } : {}),
-              ...(typeof o.availability === 'string' ? { availability: o.availability.replace(/^https?:\/\/schema\.org\//i, '') } : {}),
-            })),
+            variants: offerList.slice(0, 30).map((o) => {
+              const vName = sanitizePlainMetadataText(typeof o.name === 'string' ? o.name : undefined, 240);
+              const vSku = sanitizePlainMetadataText(typeof o.sku === 'string' ? o.sku : undefined, 160);
+              return {
+                ...(vName ? { name: vName } : {}),
+                ...(vSku ? { sku: vSku } : {}),
+                ...(o.price !== undefined ? { price: Number(String(o.price).replace(/[^0-9.]/g, '')) || o.price } : {}),
+                ...(typeof o.priceCurrency === 'string' ? { currency: o.priceCurrency } : {}),
+                ...(typeof o.availability === 'string' ? { availability: o.availability.replace(/^https?:\/\/schema\.org\//i, '') } : {}),
+              };
+            }),
           }
         : {}),
     };
@@ -2309,14 +3156,16 @@ export function extractStructuredProduct(params: {
   // Fallback to OpenGraph `product:price:amount` / meta tags
   const ogPrice = matchMetaContent(rawBody, ['product:price:amount', 'og:price:amount', 'price']);
   const ogCurrency = matchMetaContent(rawBody, ['product:price:currency', 'og:price:currency', 'priceCurrency']);
-  const ogBrand = matchMetaContent(rawBody, ['product:brand', 'og:brand', 'brand']);
+  const ogBrand = sanitizePlainMetadataText(matchMetaContent(rawBody, ['product:brand', 'og:brand', 'brand']), 240);
   const ogAvail = matchMetaContent(rawBody, ['product:availability', 'og:availability', 'availability']);
   const ogImage = matchMetaContent(rawBody, ['og:image']);
 
   if (ogPrice || ogBrand || ogAvail) {
+    const cleanOgTitle = sanitizePlainMetadataText(matchMetaContent(rawBody, ['og:title']) ?? fallbackTitle, 400);
+    const cleanOgDesc = sanitizePlainMetadataText(fallbackDescription, 1_200);
     return {
-      title: matchMetaContent(rawBody, ['og:title']) ?? fallbackTitle,
-      ...(fallbackDescription ? { description: fallbackDescription } : {}),
+      title: cleanOgTitle,
+      ...(cleanOgDesc ? { description: cleanOgDesc } : {}),
       ...(ogBrand ? { brand: ogBrand } : {}),
       ...(ogPrice ? { price: Number(ogPrice.replace(/[^0-9.]/g, '')) || ogPrice } : {}),
       ...(ogCurrency ? { currency: ogCurrency } : {}),
@@ -2330,19 +3179,22 @@ export function extractStructuredProduct(params: {
   const ogType = matchMetaContent(rawBody, ['og:type'])?.toLowerCase();
   const barcodeMatch = /\/product\/(\d{8,14})(?:\/|$)/i.exec(finalUrl);
   if (ogType === 'product' || ogType === 'og:product' || ogType?.includes('food') || barcodeMatch) {
-    const titleCandidate =
+    const titleCandidate = sanitizePlainMetadataText(
       matchMetaContent(rawBody, ['og:title', 'twitter:title']) ??
-      extractFirstHeadingTextLinear(rawBody, 'h1') ??
-      fallbackTitle;
+        extractFirstHeadingTextLinear(rawBody, 'h1') ??
+        fallbackTitle,
+      400,
+    );
     if (titleCandidate) {
       const brandFromTitle = titleCandidate.includes('–')
         ? titleCandidate.split('–')[1]?.trim()
         : titleCandidate.includes(' - ')
           ? titleCandidate.split(' - ')[1]?.trim()
           : undefined;
+      const cleanBarcodeDesc = sanitizePlainMetadataText(fallbackDescription, 1_200);
       return {
         title: titleCandidate,
-        ...(fallbackDescription ? { description: fallbackDescription } : {}),
+        ...(cleanBarcodeDesc ? { description: cleanBarcodeDesc } : {}),
         ...(brandFromTitle ? { brand: brandFromTitle } : {}),
         ...(barcodeMatch?.[1] ? { gtin: barcodeMatch[1] } : {}),
         ...(ogImage ? { images: [ogImage] } : {}),

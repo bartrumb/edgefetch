@@ -1171,9 +1171,23 @@ export function refineBlockedInfo(params: {
   }
 
   if (
+    outStr === 'scheme_downgrade' ||
+    (outStr === 'blocked' && baseBlocked?.reason === 'scheme_downgrade') ||
+    /(?:scheme_downgrade|https?-to-http|scheme\s+downgrade|(?:disallowed_url|redirect)[\s\S]{0,140}?(?:only\s+https:\/\/|scheme\s+must\s+be\s+https|to\s+http:\/\/))/i.test(
+      probStr,
+    )
+  ) {
+    return {
+      reason: 'scheme_downgrade',
+      retryable: false,
+      message: 'HTTPS-to-HTTP scheme downgrade redirect was blocked.',
+    };
+  }
+
+  if (
     outStr === 'blocked_ssrf' ||
     (outStr === 'blocked' && baseBlocked?.reason === 'ssrf') ||
-    /\b(?:blocked_ssrf|ssrf)\b|non-public(?:\s+ip|\s+peer|\s+address)?|metadata\s+(?:ip|endpoint|address|service)|private\s+(?:ip|network|address)|loopback\s+(?:ip|address)|link-local\s+(?:ip|address)|disallowed_url|resolved\s+to\s+(?:a\s+)?(?:private|loopback|link-local|reserved|non-public|internal)/i.test(
+    /\b(?:blocked_ssrf|ssrf)\b|forbidden\s+redirect\s+target[\s\S]{0,80}?internal|non-public(?:\s+ip|\s+peer|\s+address)?|metadata\s+(?:ip|endpoint|address|service)|private\s+(?:ip|network|address)|loopback\s+(?:ip|address)|link-local\s+(?:ip|address)|disallowed_url|resolved\s+to\s+(?:a\s+)?(?:private|loopback|link-local|reserved|non-public|internal)/i.test(
       probStr,
     )
   ) {

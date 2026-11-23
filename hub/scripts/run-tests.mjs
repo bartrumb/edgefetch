@@ -106,6 +106,18 @@ try {
   const round8ManifestsOutfile = join(dir, 'round8-manifests-commerce.test.mjs');
   buildNodeTestBundle('test/round8-manifests-commerce.test.ts', round8ManifestsOutfile);
   nodeTestFiles.push(round8ManifestsOutfile);
+  const round9SanitizerJobsOutfile = join(dir, 'round9-sanitizer-jobs.test.mjs');
+  buildNodeTestBundle('test/round9-sanitizer-jobs.test.ts', round9SanitizerJobsOutfile);
+  nodeTestFiles.push(round9SanitizerJobsOutfile);
+  const round9AuthMcpOutfile = join(dir, 'round9-auth-mcp-agent.test.mjs');
+  buildNodeTestBundle('test/round9-auth-mcp-agent.test.ts', round9AuthMcpOutfile);
+  nodeTestFiles.push(round9AuthMcpOutfile);
+  const round9PortableOtelOutfile = join(dir, 'round9-portable-otel.test.mjs');
+  buildNodeTestBundle('test/round9-portable-otel.test.ts', round9PortableOtelOutfile);
+  nodeTestFiles.push(round9PortableOtelOutfile);
+  const round9BughuntOutfile = join(dir, 'round9-bughunt.test.mjs');
+  buildNodeTestBundle('test/round9-bughunt.test.ts', round9BughuntOutfile);
+  nodeTestFiles.push(round9BughuntOutfile);
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],

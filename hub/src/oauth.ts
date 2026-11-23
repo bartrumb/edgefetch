@@ -14,6 +14,9 @@ import {
   GITHUB_ORG_REVERIFY_TTL_MS,
   isGitHubAuthConfigured,
   isGitHubUserDeAllowlisted,
+  isPinnedGitHubFounder,
+  reconcileUpgradedFounderOwners,
+  resolvePinnedGitHubOwnerId,
   reverifyGitHubOrgAdmission,
   verifySessionJwt,
   type GitHubAuthEnv,
@@ -93,12 +96,23 @@ export function getActiveCallerAuthContext(): ActiveCallerAuthContext | undefine
 
 export type UserAdmissionMethod = 'owner' | 'allowlist_id' | 'allowlist_login' | 'org' | 'open';
 
+export type UserMutationKind =
+  | 'org_reverify'
+  | 'org_revoke'
+  | 'oauth_login_existing'
+  | 'oauth_login_new'
+  | 'founder_heal'
+  | 'admin_disable'
+  | 'admin_role'
+  | 'demote_unapproved_owner';
+
 export interface HubUserRecord {
   userId: string;
   githubId?: string;
   githubLogin?: string;
   avatarUrl?: string;
   role: UserRole;
+  promotedByOwnerId?: string;
   sessionEpoch?: number;
   disabled?: boolean;
   admittedVia?: UserAdmissionMethod;
@@ -107,6 +121,26 @@ export interface HubUserRecord {
   orgVerifiedAt?: number;
   createdAt: number;
   lastLoginAt: number;
+  mutationKind?: UserMutationKind;
+  expectedSessionEpoch?: number;
+  expectedRole?: UserRole;
+  reconcilePinnedOwnerId?: string;
+  mutationAborted?: boolean;
+}
+
+export const MAX_OAUTH_GRANTS_PER_USER = 64;
+export const MAX_OAUTH_TOKENS_PER_USER = MAX_OAUTH_GRANTS_PER_USER * 2;
+export const MAX_OAUTH_TOKENS_GLOBAL = 65_536;
+export const MAX_OAUTH_CODES_PER_USER = 32;
+export const MAX_OAUTH_CODES_GLOBAL = 16_384;
+
+export class OAuthQuotaExceededError extends Error {
+  readonly status = 429;
+  readonly code = 'user_quota_exceeded';
+  constructor(message = 'OAuth token quota exceeded; revoke unused grants before minting new tokens') {
+    super(message);
+    this.name = 'OAuthQuotaExceededError';
+  }
 }
 
 export interface AdminPrincipal {
@@ -236,7 +270,8 @@ export interface OAuthStore {
   getUser?(userId: string): Promise<HubUserRecord | null> | HubUserRecord | null;
   listUsers?(): Promise<HubUserRecord[]> | HubUserRecord[];
   countUsers?(): Promise<number> | number;
-  updateUserRole?(userId: string, role: UserRole): Promise<boolean> | boolean;
+  updateUserRole?(userId: string, role: UserRole, promotedByOwnerId?: string | null): Promise<boolean> | boolean;
+  enforcePinnedFounderOwners?(pinnedOwnerId: string): Promise<number> | number;
   checkAuthLockout(
     bucket: string,
     now: number,
@@ -293,6 +328,7 @@ export const OAUTH_SQLITE_SCHEMA = `
     github_login TEXT NOT NULL,
     avatar_url TEXT,
     role TEXT NOT NULL DEFAULT 'member',
+    promoted_by_owner_id TEXT,
     session_epoch INTEGER NOT NULL DEFAULT 1,
     disabled INTEGER NOT NULL DEFAULT 0,
     admitted_via TEXT,
@@ -331,6 +367,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         "ALTER TABLE oauth_codes ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
         "ALTER TABLE oauth_tokens ADD COLUMN user_id TEXT NOT NULL DEFAULT 'owner'",
         "ALTER TABLE oauth_tokens ADD COLUMN user_role TEXT NOT NULL DEFAULT 'owner'",
+        'ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT',
         'ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1',
         'ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE users ADD COLUMN admitted_via TEXT',
@@ -346,13 +383,53 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         }
       }
       sql.exec('SELECT user_id FROM oauth_tokens LIMIT 1');
-      sql.exec('SELECT session_epoch, disabled, admitted_via, admitted_org, encrypted_gh_token, org_verified_at FROM users LIMIT 1');
+      sql.exec(
+        'SELECT promoted_by_owner_id, session_epoch, disabled, admitted_via, admitted_org, encrypted_gh_token, org_verified_at FROM users LIMIT 1',
+      );
       multiUserMigrated = true;
     } catch {
       // Schema not yet initialized; will run on first query
     }
   };
+  const demoteUnapprovedOwnersSqlite = (explicitPinnedOwnerId?: string | null): number => {
+    ensureMultiUserColumns();
+    const pinnedOwnerId =
+      (explicitPinnedOwnerId && /^[1-9][0-9]{0,19}$/.test(explicitPinnedOwnerId.trim())
+        ? explicitPinnedOwnerId.trim()
+        : null) ?? resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+    if (!pinnedOwnerId) return 0;
+    const staleOwners = sql
+      .exec<{ user_id: string }>(
+        `SELECT user_id FROM users
+          WHERE user_id != 'owner'
+            AND role = 'owner'
+            AND COALESCE(github_id, '') != ?
+            AND COALESCE(promoted_by_owner_id, '') != ?`,
+        pinnedOwnerId,
+        pinnedOwnerId,
+      )
+      .toArray();
+    if (staleOwners.length === 0) return 0;
+    sql.exec(
+      `UPDATE users
+          SET role = 'member',
+              promoted_by_owner_id = NULL,
+              session_epoch = COALESCE(session_epoch, 1) + 1
+        WHERE user_id != 'owner'
+          AND role = 'owner'
+          AND COALESCE(github_id, '') != ?
+          AND COALESCE(promoted_by_owner_id, '') != ?`,
+      pinnedOwnerId,
+      pinnedOwnerId,
+    );
+    for (const row of staleOwners) {
+      sql.exec("UPDATE oauth_tokens SET user_role = 'member' WHERE user_id = ?", row.user_id);
+      sql.exec("UPDATE oauth_codes SET user_role = 'member' WHERE user_id = ?", row.user_id);
+    }
+    return staleOwners.length;
+  };
   ensureMultiUserColumns();
+  demoteUnapprovedOwnersSqlite();
 
   return {
     putClient(c) {
@@ -399,12 +476,33 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       const userId = code.userId ?? 'owner';
       const userRole = normalizeRoleForUser(userId, code.userRole);
       sql.exec('DELETE FROM oauth_codes WHERE expires_at <= ?', code.expiresAt - AUTH_CODE_TTL_MS);
+      // Per-user authorization code cap: evict ONLY this user's oldest pending codes beyond MAX_OAUTH_CODES_PER_USER - 1.
       sql.exec(
         `DELETE FROM oauth_codes
-         WHERE code_hash IN (
-           SELECT code_hash FROM oauth_codes ORDER BY expires_at DESC LIMIT -1 OFFSET 2047
-         )`,
+         WHERE user_id = ?
+           AND code_hash IN (
+             SELECT code_hash FROM oauth_codes
+              WHERE user_id = ?
+              ORDER BY expires_at DESC, ROWID DESC
+              LIMIT -1 OFFSET ?
+           )`,
+        userId,
+        userId,
+        MAX_OAUTH_CODES_PER_USER - 1,
       );
+      const totalCodes = sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_codes').toArray()[0]?.c ?? 0;
+      if (totalCodes >= MAX_OAUTH_CODES_GLOBAL) {
+        if (userId !== 'owner') {
+          throw new OAuthQuotaExceededError('Global OAuth authorization code capacity reached; retry shortly');
+        }
+        sql.exec(
+          `DELETE FROM oauth_codes
+           WHERE user_id = 'owner'
+             AND code_hash IN (
+               SELECT code_hash FROM oauth_codes WHERE user_id = 'owner' ORDER BY expires_at ASC, ROWID ASC LIMIT 1
+             )`,
+        );
+      }
       sql.exec(
         `INSERT OR REPLACE INTO oauth_codes
          (code_hash, client_id, client_name, redirect_uri, code_challenge, scopes_json, resource, user_id, user_role, expires_at)
@@ -459,12 +557,64 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       const userId = p.userId ?? 'owner';
       const userRole = normalizeRoleForUser(userId, p.userRole);
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', p.createdAt);
+      // Trim stale rotated refresh markers for THIS user first
       sql.exec(
         `DELETE FROM oauth_tokens
-         WHERE token_hash IN (
-           SELECT token_hash FROM oauth_tokens ORDER BY expires_at DESC LIMIT -1 OFFSET 4093
-         )`,
+         WHERE user_id = ? AND kind = 'refresh_used'
+           AND token_hash IN (
+             SELECT token_hash FROM oauth_tokens
+              WHERE user_id = ? AND kind = 'refresh_used'
+              ORDER BY created_at DESC, ROWID DESC
+              LIMIT -1 OFFSET 32
+           )`,
+        userId,
+        userId,
       );
+      // Per-user active grant cap: evict ONLY oldest grants belonging to THIS user_id beyond MAX_OAUTH_GRANTS_PER_USER - 1.
+      sql.exec(
+        `DELETE FROM oauth_tokens
+         WHERE user_id = ?
+           AND grant_id IN (
+             SELECT grant_id FROM oauth_tokens
+              WHERE user_id = ?
+              GROUP BY grant_id
+              ORDER BY MIN(created_at) DESC, MAX(ROWID) DESC
+              LIMIT -1 OFFSET ?
+           )`,
+        userId,
+        userId,
+        MAX_OAUTH_GRANTS_PER_USER - 1,
+      );
+      sql.exec(
+        `DELETE FROM oauth_tokens
+         WHERE user_id = ?
+           AND token_hash IN (
+             SELECT token_hash FROM oauth_tokens
+              WHERE user_id = ?
+              ORDER BY created_at DESC, ROWID DESC
+              LIMIT -1 OFFSET ?
+           )`,
+        userId,
+        userId,
+        MAX_OAUTH_TOKENS_PER_USER - 2,
+      );
+      const totalTokens = sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens').toArray()[0]?.c ?? 0;
+      if (totalTokens + 2 > MAX_OAUTH_TOKENS_GLOBAL) {
+        if (userId !== 'owner') {
+          throw new OAuthQuotaExceededError();
+        }
+        sql.exec(
+          `DELETE FROM oauth_tokens
+           WHERE user_id = 'owner'
+             AND grant_id IN (
+               SELECT grant_id FROM oauth_tokens
+                WHERE user_id = 'owner'
+                GROUP BY grant_id
+                ORDER BY MIN(created_at) ASC, MIN(ROWID) ASC
+                LIMIT 1
+             )`,
+        );
+      }
       const scopesJson = JSON.stringify(p.scopes);
       sql.exec(
         `INSERT OR REPLACE INTO oauth_tokens
@@ -748,24 +898,343 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     },
     upsertUser(user) {
       ensureMultiUserColumns();
-      const epoch = typeof user.sessionEpoch === 'number' && Number.isInteger(user.sessionEpoch) && user.sessionEpoch >= 1 ? user.sessionEpoch : undefined;
-      const disabledInt = user.disabled ? 1 : 0;
+      if (user.reconcilePinnedOwnerId) {
+        demoteUnapprovedOwnersSqlite(user.reconcilePinnedOwnerId);
+      } else {
+        demoteUnapprovedOwnersSqlite();
+      }
+      const readRawUser = (uid: string) =>
+        sql
+          .exec<{
+            user_id: string;
+            github_id: string | null;
+            github_login: string;
+            avatar_url: string | null;
+            role: string;
+            promoted_by_owner_id?: string | null;
+            session_epoch?: number;
+            disabled?: number;
+            admitted_via?: string | null;
+            admitted_org?: string | null;
+            encrypted_gh_token?: string | null;
+            org_verified_at?: number | null;
+            created_at: number;
+            last_login_at: number;
+          }>('SELECT * FROM users WHERE user_id = ? LIMIT 1', uid)
+          .toArray()[0] ?? null;
+
       const admittedViaVal = user.admittedVia ?? null;
       const admittedOrgVal = user.admittedOrg ? user.admittedOrg.toLowerCase() : null;
+      const orgVerifiedAtVal =
+        typeof user.orgVerifiedAt === 'number' && Number.isFinite(user.orgVerifiedAt) ? user.orgVerifiedAt : null;
+
+      // H5: Conditional org re-verification update — NEVER INSERT, NEVER touch role/disabled/session_epoch!
+      if (user.mutationKind === 'org_reverify') {
+        const expectedEpoch =
+          typeof user.expectedSessionEpoch === 'number' && user.expectedSessionEpoch >= 1
+            ? user.expectedSessionEpoch
+            : (user.sessionEpoch ?? 1);
+        const expectedRole: UserRole = user.expectedRole ?? user.role;
+        const before = readRawUser(user.userId);
+        if (
+          !before ||
+          Number(before.disabled ?? 0) !== 0 ||
+          normalizeRoleForUser(before.user_id, before.role) !== expectedRole ||
+          (typeof before.session_epoch === 'number' && before.session_epoch >= 1 ? before.session_epoch : 1) !==
+            expectedEpoch
+        ) {
+          const cur = this.getUser!(user.userId) as HubUserRecord | null;
+          return {
+            ...(cur ?? { ...user, sessionEpoch: expectedEpoch, disabled: Boolean(before?.disabled) }),
+            mutationAborted: true,
+          };
+        }
+        sql.exec(
+          `UPDATE users
+              SET admitted_via = 'org',
+                  admitted_org = ?,
+                  org_verified_at = ?,
+                  encrypted_gh_token = COALESCE(?, encrypted_gh_token)
+            WHERE user_id = ?
+              AND COALESCE(disabled, 0) = 0
+              AND COALESCE(session_epoch, 1) = ?
+              AND role = ?`,
+          admittedOrgVal,
+          orgVerifiedAtVal,
+          user.encryptedGhToken ?? null,
+          user.userId,
+          expectedEpoch,
+          expectedRole,
+        );
+        const stored = this.getUser!(user.userId) as HubUserRecord | null;
+        if (
+          !stored ||
+          stored.disabled ||
+          stored.role !== expectedRole ||
+          (stored.sessionEpoch ?? 1) !== expectedEpoch
+        ) {
+          return {
+            ...(stored ?? { ...user, sessionEpoch: expectedEpoch, disabled: true }),
+            mutationAborted: true,
+          };
+        }
+        return stored;
+      }
+
+      // H5: Conditional org revocation — NEVER INSERT a deleted user and NEVER overwrite disabled=1 or role!
+      if (user.mutationKind === 'org_revoke') {
+        const expectedEpoch =
+          typeof user.expectedSessionEpoch === 'number' && user.expectedSessionEpoch >= 1
+            ? user.expectedSessionEpoch
+            : Math.max(1, (user.sessionEpoch ?? 2) - 1);
+        const before = readRawUser(user.userId);
+        if (
+          !before ||
+          Number(before.disabled ?? 0) !== 0 ||
+          (typeof before.session_epoch === 'number' && before.session_epoch >= 1 ? before.session_epoch : 1) !==
+            expectedEpoch
+        ) {
+          const cur = this.getUser!(user.userId) as HubUserRecord | null;
+          return {
+            ...(cur ?? { ...user, sessionEpoch: expectedEpoch, disabled: Boolean(before?.disabled) }),
+            mutationAborted: true,
+          };
+        }
+        sql.exec(
+          `UPDATE users
+              SET session_epoch = COALESCE(session_epoch, 1) + 1,
+                  admitted_via = NULL,
+                  admitted_org = NULL,
+                  encrypted_gh_token = NULL,
+                  org_verified_at = NULL
+            WHERE user_id = ?
+              AND COALESCE(disabled, 0) = 0
+              AND COALESCE(session_epoch, 1) = ?`,
+          user.userId,
+          expectedEpoch,
+        );
+        const stored = this.getUser!(user.userId) as HubUserRecord | null;
+        return stored ?? { ...user, mutationAborted: true };
+      }
+
+      // H6: Atomic founder recovery — evict/rename any squatter row with founder's login/github_id, then force-heal founder!
+      if (user.mutationKind === 'founder_heal') {
+        const pinnedId = (user.githubId ?? user.reconcilePinnedOwnerId ?? '').trim();
+        const founderLogin = (user.githubLogin ?? user.userId).trim();
+        const squatters = sql
+          .exec<{ user_id: string }>(
+            `SELECT user_id FROM users
+              WHERE user_id != ?
+                AND (LOWER(github_login) = LOWER(?) OR (? != '' AND COALESCE(github_id, '') = ?))`,
+            user.userId,
+            founderLogin,
+            pinnedId,
+            pinnedId,
+          )
+          .toArray();
+        for (const sq of squatters) {
+          sql.exec('DELETE FROM oauth_tokens WHERE user_id = ?', sq.user_id);
+          sql.exec('DELETE FROM oauth_codes WHERE user_id = ?', sq.user_id);
+          sql.exec(
+            `UPDATE users
+                SET disabled = 1,
+                    role = 'member',
+                    promoted_by_owner_id = NULL,
+                    session_epoch = COALESCE(session_epoch, 1) + 1,
+                    github_login = '__evicted_' || user_id,
+                    github_id = CASE WHEN ? != '' AND COALESCE(github_id, '') = ? THEN NULL ELSE github_id END,
+                    admitted_via = NULL,
+                    admitted_org = NULL,
+                    encrypted_gh_token = NULL,
+                    org_verified_at = NULL
+              WHERE user_id = ?`,
+            pinnedId,
+            pinnedId,
+            sq.user_id,
+          );
+        }
+        if (pinnedId) {
+          demoteUnapprovedOwnersSqlite(pinnedId);
+        }
+        const beforeFounder = readRawUser(user.userId);
+        const nextFounderEpoch = beforeFounder
+          ? Number(beforeFounder.disabled ?? 0) !== 0
+            ? (beforeFounder.session_epoch ?? 1) + 1
+            : (beforeFounder.session_epoch ?? 1)
+          : 1;
+        sql.exec(
+          `INSERT INTO users (
+             user_id, github_id, github_login, avatar_url, role, promoted_by_owner_id, session_epoch, disabled,
+             admitted_via, admitted_org, encrypted_gh_token, org_verified_at, created_at, last_login_at
+           )
+           VALUES (?, ?, ?, ?, 'owner', ?, ?, 0, 'owner', NULL, ?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             github_id = excluded.github_id,
+             github_login = excluded.github_login,
+             avatar_url = excluded.avatar_url,
+             role = 'owner',
+             promoted_by_owner_id = excluded.promoted_by_owner_id,
+             session_epoch = excluded.session_epoch,
+             disabled = 0,
+             admitted_via = 'owner',
+             admitted_org = NULL,
+             encrypted_gh_token = excluded.encrypted_gh_token,
+             org_verified_at = excluded.org_verified_at,
+             last_login_at = excluded.last_login_at`,
+          user.userId,
+          pinnedId || null,
+          founderLogin,
+          user.avatarUrl ?? null,
+          pinnedId || 'owner',
+          nextFounderEpoch,
+          user.encryptedGhToken ?? null,
+          orgVerifiedAtVal,
+          beforeFounder?.created_at ?? user.createdAt,
+          user.lastLoginAt,
+        );
+        sql.exec("UPDATE oauth_tokens SET user_role = 'owner' WHERE user_id = ?", user.userId);
+        sql.exec("UPDATE oauth_codes SET user_role = 'owner' WHERE user_id = ?", user.userId);
+        return (this.getUser!(user.userId) as HubUserRecord | null) ?? {
+          ...user,
+          role: 'owner',
+          promotedByOwnerId: pinnedId || 'owner',
+          disabled: false,
+          sessionEpoch: nextFounderEpoch,
+        };
+      }
+
+      // H5: OAuth callback sign-in for an EXISTING user — NEVER INSERT (cannot resurrect concurrent DELETE),
+      // reject disabled=1, and preserve live role + promoted_by_owner_id + session_epoch atomically!
+      if (user.mutationKind === 'oauth_login_existing') {
+        const live = readRawUser(user.userId);
+        if (!live || Number(live.disabled ?? 0) !== 0) {
+          const cur = this.getUser!(user.userId) as HubUserRecord | null;
+          return {
+            ...(cur ?? { ...user, disabled: true }),
+            mutationAborted: true,
+          };
+        }
+        sql.exec(
+          `UPDATE users
+              SET github_id = COALESCE(?, github_id),
+                  github_login = ?,
+                  avatar_url = ?,
+                  admitted_via = ?,
+                  admitted_org = ?,
+                  encrypted_gh_token = ?,
+                  org_verified_at = ?,
+                  last_login_at = ?
+            WHERE user_id = ?
+              AND COALESCE(disabled, 0) = 0`,
+          user.githubId ?? null,
+          user.githubLogin ?? user.userId,
+          user.avatarUrl ?? null,
+          admittedViaVal,
+          admittedOrgVal,
+          user.encryptedGhToken ?? null,
+          orgVerifiedAtVal,
+          user.lastLoginAt,
+          user.userId,
+        );
+        const stored = this.getUser!(user.userId) as HubUserRecord | null;
+        if (!stored || stored.disabled) {
+          return { ...(stored ?? { ...user, disabled: true }), mutationAborted: true };
+        }
+        return stored;
+      }
+
+      // H5: OAuth callback sign-in for a NEW user — if a row appeared concurrently and is disabled, abort;
+      // if active, preserve live role & session_epoch atomically!
+      if (user.mutationKind === 'oauth_login_new') {
+        const live = readRawUser(user.userId);
+        if (live && Number(live.disabled ?? 0) !== 0) {
+          const cur = this.getUser!(user.userId) as HubUserRecord | null;
+          return { ...(cur ?? { ...user, disabled: true }), mutationAborted: true };
+        }
+        sql.exec(
+          `INSERT INTO users (
+             user_id, github_id, github_login, avatar_url, role, promoted_by_owner_id, session_epoch, disabled,
+             admitted_via, admitted_org, encrypted_gh_token, org_verified_at, created_at, last_login_at
+           )
+           VALUES (?, ?, ?, ?, 'member', NULL, 1, 0, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             github_id = COALESCE(excluded.github_id, users.github_id),
+             github_login = CASE WHEN COALESCE(users.disabled, 0) = 0 THEN excluded.github_login ELSE users.github_login END,
+             avatar_url = CASE WHEN COALESCE(users.disabled, 0) = 0 THEN excluded.avatar_url ELSE users.avatar_url END,
+             admitted_via = CASE WHEN COALESCE(users.disabled, 0) = 0 THEN excluded.admitted_via ELSE users.admitted_via END,
+             admitted_org = CASE WHEN COALESCE(users.disabled, 0) = 0 THEN excluded.admitted_org ELSE users.admitted_org END,
+             encrypted_gh_token = CASE WHEN COALESCE(users.disabled, 0) = 0 THEN excluded.encrypted_gh_token ELSE users.encrypted_gh_token END,
+             org_verified_at = CASE WHEN COALESCE(users.disabled, 0) = 0 THEN excluded.org_verified_at ELSE users.org_verified_at END,
+             last_login_at = CASE WHEN COALESCE(users.disabled, 0) = 0 THEN excluded.last_login_at ELSE users.last_login_at END`,
+          user.userId,
+          user.githubId ?? null,
+          user.githubLogin ?? user.userId,
+          user.avatarUrl ?? null,
+          admittedViaVal,
+          admittedOrgVal,
+          user.encryptedGhToken ?? null,
+          orgVerifiedAtVal,
+          user.createdAt,
+          user.lastLoginAt,
+        );
+        const stored = this.getUser!(user.userId) as HubUserRecord | null;
+        if (!stored || stored.disabled) {
+          return { ...(stored ?? { ...user, disabled: true }), mutationAborted: true };
+        }
+        return stored;
+      }
+
+      if (user.mutationKind === 'demote_unapproved_owner' || user.mutationKind === 'admin_role') {
+        const live = readRawUser(user.userId);
+        if (!live || Number(live.disabled ?? 0) !== 0) {
+          const cur = this.getUser!(user.userId) as HubUserRecord | null;
+          return { ...(cur ?? { ...user, disabled: true }), mutationAborted: true };
+        }
+        const nextRole: UserRole = user.mutationKind === 'demote_unapproved_owner' ? 'member' : user.role;
+        const nextPromoted = nextRole === 'owner' ? (user.promotedByOwnerId ?? null) : null;
+        sql.exec(
+          `UPDATE users
+              SET role = ?,
+                  promoted_by_owner_id = ?,
+                  session_epoch = COALESCE(session_epoch, 1) + 1
+            WHERE user_id = ? AND COALESCE(disabled, 0) = 0`,
+          nextRole,
+          nextPromoted,
+          user.userId,
+        );
+        sql.exec('UPDATE oauth_tokens SET user_role = ? WHERE user_id = ?', nextRole, user.userId);
+        sql.exec('UPDATE oauth_codes SET user_role = ? WHERE user_id = ?', nextRole, user.userId);
+        return (this.getUser!(user.userId) as HubUserRecord | null) ?? { ...user, role: nextRole };
+      }
+
+      const epoch =
+        typeof user.sessionEpoch === 'number' && Number.isInteger(user.sessionEpoch) && user.sessionEpoch >= 1
+          ? user.sessionEpoch
+          : undefined;
+      const disabledInt = user.disabled ? 1 : 0;
+      // Default safety guard: never silently resurrect an already-disabled user unless `founder_heal` is used!
+      if (disabledInt === 0) {
+        const existingLive = readRawUser(user.userId);
+        if (existingLive && Number(existingLive.disabled ?? 0) !== 0) {
+          const cur = this.getUser!(user.userId) as HubUserRecord | null;
+          return { ...(cur ?? { ...user, disabled: true }), mutationAborted: true };
+        }
+      }
       const encryptedGhTokenVal = disabledInt !== 0 ? null : (user.encryptedGhToken ?? null);
-      const orgVerifiedAtVal = typeof user.orgVerifiedAt === 'number' && Number.isFinite(user.orgVerifiedAt) ? user.orgVerifiedAt : null;
+      const promotedByVal = disabledInt !== 0 || user.role !== 'owner' ? null : (user.promotedByOwnerId ?? null);
       if (epoch !== undefined) {
         sql.exec(
           `INSERT INTO users (
-             user_id, github_id, github_login, avatar_url, role, session_epoch, disabled,
+             user_id, github_id, github_login, avatar_url, role, promoted_by_owner_id, session_epoch, disabled,
              admitted_via, admitted_org, encrypted_gh_token, org_verified_at, created_at, last_login_at
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET
              github_id = COALESCE(excluded.github_id, users.github_id),
              github_login = excluded.github_login,
              avatar_url = excluded.avatar_url,
              role = excluded.role,
+             promoted_by_owner_id = COALESCE(excluded.promoted_by_owner_id, CASE WHEN excluded.role = 'owner' THEN users.promoted_by_owner_id ELSE NULL END),
              session_epoch = excluded.session_epoch,
              disabled = excluded.disabled,
              admitted_via = excluded.admitted_via,
@@ -778,6 +1247,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           user.githubLogin ?? user.userId,
           user.avatarUrl ?? null,
           user.role,
+          promotedByVal,
           epoch,
           disabledInt,
           admittedViaVal,
@@ -790,15 +1260,16 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       } else {
         sql.exec(
           `INSERT INTO users (
-             user_id, github_id, github_login, avatar_url, role, session_epoch, disabled,
+             user_id, github_id, github_login, avatar_url, role, promoted_by_owner_id, session_epoch, disabled,
              admitted_via, admitted_org, encrypted_gh_token, org_verified_at, created_at, last_login_at
            )
-           VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET
              github_id = COALESCE(excluded.github_id, users.github_id),
              github_login = excluded.github_login,
              avatar_url = excluded.avatar_url,
              role = excluded.role,
+             promoted_by_owner_id = COALESCE(excluded.promoted_by_owner_id, CASE WHEN excluded.role = 'owner' THEN users.promoted_by_owner_id ELSE NULL END),
              disabled = excluded.disabled,
              admitted_via = excluded.admitted_via,
              admitted_org = excluded.admitted_org,
@@ -810,6 +1281,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           user.githubLogin ?? user.userId,
           user.avatarUrl ?? null,
           user.role,
+          promotedByVal,
           disabledInt,
           admittedViaVal,
           admittedOrgVal,
@@ -828,6 +1300,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     },
     getUser(userId) {
       ensureMultiUserColumns();
+      demoteUnapprovedOwnersSqlite();
       const r = sql
         .exec<{
           user_id: string;
@@ -835,6 +1308,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           github_login: string;
           avatar_url: string | null;
           role: string;
+          promoted_by_owner_id?: string | null;
           session_epoch?: number;
           disabled?: number;
           admitted_via?: string | null;
@@ -860,6 +1334,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         githubLogin: r.github_login,
         ...(r.avatar_url ? { avatarUrl: r.avatar_url } : {}),
         role: normalizeRoleForUser(r.user_id, r.role),
+        ...(r.promoted_by_owner_id ? { promotedByOwnerId: r.promoted_by_owner_id } : {}),
         sessionEpoch: typeof r.session_epoch === 'number' && r.session_epoch >= 1 ? r.session_epoch : 1,
         disabled: Number(r.disabled ?? 0) !== 0,
         ...(validVia ? { admittedVia: validVia } : {}),
@@ -872,6 +1347,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     },
     listUsers() {
       ensureMultiUserColumns();
+      demoteUnapprovedOwnersSqlite();
       return sql
         .exec<{
           user_id: string;
@@ -879,6 +1355,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           github_login: string;
           avatar_url: string | null;
           role: string;
+          promoted_by_owner_id?: string | null;
           session_epoch?: number;
           disabled?: number;
           admitted_via?: string | null;
@@ -887,7 +1364,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
           created_at: number;
           last_login_at: number;
         }>(
-          `SELECT user_id, github_id, github_login, avatar_url, role, session_epoch, disabled,
+          `SELECT user_id, github_id, github_login, avatar_url, role, promoted_by_owner_id, session_epoch, disabled,
                   admitted_via, admitted_org, org_verified_at, created_at, last_login_at
            FROM users WHERE COALESCE(disabled, 0) = 0 ORDER BY last_login_at DESC LIMIT 500`,
         )
@@ -907,6 +1384,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
             githubLogin: r.github_login,
             ...(r.avatar_url ? { avatarUrl: r.avatar_url } : {}),
             role: normalizeRoleForUser(r.user_id, r.role),
+            ...(r.promoted_by_owner_id ? { promotedByOwnerId: r.promoted_by_owner_id } : {}),
             sessionEpoch: typeof r.session_epoch === 'number' && r.session_epoch >= 1 ? r.session_epoch : 1,
             disabled: false,
             ...(validVia ? { admittedVia: validVia } : {}),
@@ -924,17 +1402,26 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         .toArray()[0];
       return row?.c ?? 0;
     },
-    updateUserRole(userId, role) {
+    updateUserRole(userId, role, promotedByOwnerId) {
       ensureMultiUserColumns();
       if (userId === 'owner' && role !== 'owner') return false;
       const existing = sql
         .exec<{ c: number }>('SELECT COUNT(*) AS c FROM users WHERE user_id = ? AND COALESCE(disabled, 0) = 0', userId)
         .toArray()[0];
       if (!existing || existing.c <= 0) return false;
-      sql.exec('UPDATE users SET role = ?, session_epoch = COALESCE(session_epoch, 1) + 1 WHERE user_id = ?', role, userId);
+      const nextPromoted = role === 'owner' ? (promotedByOwnerId ?? null) : null;
+      sql.exec(
+        'UPDATE users SET role = ?, promoted_by_owner_id = ?, session_epoch = COALESCE(session_epoch, 1) + 1 WHERE user_id = ?',
+        role,
+        nextPromoted,
+        userId,
+      );
       sql.exec('UPDATE oauth_tokens SET user_role = ? WHERE user_id = ?', role, userId);
       sql.exec('UPDATE oauth_codes SET user_role = ? WHERE user_id = ?', role, userId);
       return true;
+    },
+    enforcePinnedFounderOwners(pinnedOwnerId) {
+      return demoteUnapprovedOwnersSqlite(pinnedOwnerId);
     },
     checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
       if (bucket.startsWith('revoked_admin:')) {
@@ -1041,12 +1528,26 @@ export function createMemoryOAuthStore(): OAuthStore {
       for (const [k, v] of codes.entries()) {
         if (v.expiresAt <= approxNow) codes.delete(k);
       }
-      while (codes.size >= 2048) {
-        const oldest = codes.keys().next().value;
-        if (oldest === undefined) break;
-        codes.delete(oldest);
-      }
       const userId = code.userId ?? 'owner';
+      const userCodeKeys: string[] = [];
+      for (const [k, v] of codes.entries()) {
+        if ((v.userId ?? 'owner') === userId) userCodeKeys.push(k);
+      }
+      while (userCodeKeys.length >= MAX_OAUTH_CODES_PER_USER) {
+        const oldest = userCodeKeys.shift();
+        if (oldest !== undefined) codes.delete(oldest);
+      }
+      if (codes.size >= MAX_OAUTH_CODES_GLOBAL) {
+        if (userId !== 'owner') {
+          throw new OAuthQuotaExceededError('Global OAuth authorization code capacity reached; retry shortly');
+        }
+        for (const [k, v] of codes.entries()) {
+          if ((v.userId ?? 'owner') === 'owner') {
+            codes.delete(k);
+            break;
+          }
+        }
+      }
       codes.set(code.codeHash, {
         ...code,
         userId,
@@ -1064,13 +1565,51 @@ export function createMemoryOAuthStore(): OAuthStore {
       for (const [k, v] of tokens.entries()) {
         if (v.expiresAt <= p.createdAt) tokens.delete(k);
       }
-      while (tokens.size >= 4094) {
-        const oldest = tokens.keys().next().value;
-        if (oldest === undefined) break;
-        tokens.delete(oldest);
-      }
       const userId = p.userId ?? 'owner';
       const userRole = normalizeRoleForUser(userId, p.userRole);
+      const userUsedHashes: string[] = [];
+      const userGrantsInOrder: string[] = [];
+      const seenUserGrants = new Set<string>();
+      for (const [k, v] of tokens.entries()) {
+        if ((v.userId ?? 'owner') !== userId) continue;
+        if (v.used) userUsedHashes.push(k);
+        if (!seenUserGrants.has(v.grantId)) {
+          seenUserGrants.add(v.grantId);
+          userGrantsInOrder.push(v.grantId);
+        }
+      }
+      while (userUsedHashes.length > 32) {
+        const oldestUsed = userUsedHashes.shift();
+        if (oldestUsed !== undefined) tokens.delete(oldestUsed);
+      }
+      while (userGrantsInOrder.length >= MAX_OAUTH_GRANTS_PER_USER) {
+        const oldestGrant = userGrantsInOrder.shift();
+        if (oldestGrant === undefined) break;
+        for (const [k, v] of tokens.entries()) {
+          if ((v.userId ?? 'owner') === userId && v.grantId === oldestGrant) {
+            tokens.delete(k);
+          }
+        }
+      }
+      if (tokens.size + 2 > MAX_OAUTH_TOKENS_GLOBAL) {
+        if (userId !== 'owner') {
+          throw new OAuthQuotaExceededError();
+        }
+        let ownerOldestGrant: string | undefined;
+        for (const v of tokens.values()) {
+          if ((v.userId ?? 'owner') === 'owner') {
+            ownerOldestGrant = v.grantId;
+            break;
+          }
+        }
+        if (ownerOldestGrant) {
+          for (const [k, v] of tokens.entries()) {
+            if ((v.userId ?? 'owner') === 'owner' && v.grantId === ownerOldestGrant) {
+              tokens.delete(k);
+            }
+          }
+        }
+      }
       tokens.set(p.accessHash, {
         grantId: p.grantId,
         kind: 'access',
@@ -1220,10 +1759,212 @@ export function createMemoryOAuthStore(): OAuthStore {
       }
     },
     upsertUser(user) {
+      const demoteMemoryUnapprovedOwners = (explicitPinned?: string | null): number => {
+        const pinnedOwnerId =
+          (explicitPinned && /^[1-9][0-9]{0,19}$/.test(explicitPinned.trim()) ? explicitPinned.trim() : null) ??
+          resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+        if (!pinnedOwnerId) return 0;
+        let count = 0;
+        for (const u of users.values()) {
+          if (
+            u.userId !== 'owner' &&
+            u.role === 'owner' &&
+            String(u.githubId ?? '') !== pinnedOwnerId &&
+            u.promotedByOwnerId !== pinnedOwnerId
+          ) {
+            u.role = 'member';
+            delete u.promotedByOwnerId;
+            u.sessionEpoch = (u.sessionEpoch ?? 1) + 1;
+            for (const t of tokens.values()) {
+              if ((t.userId ?? 'owner') === u.userId) t.userRole = 'member';
+            }
+            for (const cd of codes.values()) {
+              if ((cd.userId ?? 'owner') === u.userId) cd.userRole = 'member';
+            }
+            count++;
+          }
+        }
+        return count;
+      };
+      demoteMemoryUnapprovedOwners(user.reconcilePinnedOwnerId);
+
+      const stripMeta = (u: HubUserRecord): HubUserRecord => {
+        const {
+          mutationKind: _mk,
+          expectedSessionEpoch: _ee,
+          expectedRole: _er,
+          reconcilePinnedOwnerId: _rp,
+          mutationAborted: _ma,
+          ...clean
+        } = u;
+        return clean;
+      };
+
       const prev = users.get(user.userId);
+      if (user.mutationKind === 'org_reverify') {
+        const expectedEpoch =
+          typeof user.expectedSessionEpoch === 'number' && user.expectedSessionEpoch >= 1
+            ? user.expectedSessionEpoch
+            : (user.sessionEpoch ?? 1);
+        const expectedRole: UserRole = user.expectedRole ?? user.role;
+        if (!prev || prev.disabled || prev.role !== expectedRole || (prev.sessionEpoch ?? 1) !== expectedEpoch) {
+          return { ...(prev ? { ...prev } : stripMeta(user)), mutationAborted: true };
+        }
+        prev.admittedVia = 'org';
+        prev.admittedOrg = user.admittedOrg ? user.admittedOrg.toLowerCase() : undefined;
+        prev.orgVerifiedAt = user.orgVerifiedAt;
+        if (user.encryptedGhToken) prev.encryptedGhToken = user.encryptedGhToken;
+        return { ...prev };
+      }
+
+      if (user.mutationKind === 'org_revoke') {
+        const expectedEpoch =
+          typeof user.expectedSessionEpoch === 'number' && user.expectedSessionEpoch >= 1
+            ? user.expectedSessionEpoch
+            : Math.max(1, (user.sessionEpoch ?? 2) - 1);
+        if (!prev || prev.disabled || (prev.sessionEpoch ?? 1) !== expectedEpoch) {
+          return { ...(prev ? { ...prev } : stripMeta(user)), mutationAborted: true };
+        }
+        prev.sessionEpoch = expectedEpoch + 1;
+        delete prev.admittedVia;
+        delete prev.admittedOrg;
+        delete prev.encryptedGhToken;
+        delete prev.orgVerifiedAt;
+        return { ...prev };
+      }
+
+      if (user.mutationKind === 'founder_heal') {
+        const pinnedId = (user.githubId ?? user.reconcilePinnedOwnerId ?? '').trim();
+        const founderLoginLower = (user.githubLogin ?? user.userId).trim().toLowerCase();
+        for (const sq of users.values()) {
+          if (
+            sq.userId !== user.userId &&
+            ((sq.githubLogin ?? '').toLowerCase() === founderLoginLower ||
+              (pinnedId && String(sq.githubId ?? '') === pinnedId))
+          ) {
+            sq.disabled = true;
+            sq.role = 'member';
+            delete sq.promotedByOwnerId;
+            sq.sessionEpoch = (sq.sessionEpoch ?? 1) + 1;
+            sq.githubLogin = `__evicted_${sq.userId}`;
+            if (pinnedId && String(sq.githubId ?? '') === pinnedId) delete sq.githubId;
+            delete sq.admittedVia;
+            delete sq.admittedOrg;
+            delete sq.encryptedGhToken;
+            delete sq.orgVerifiedAt;
+            for (const [h, t] of tokens.entries()) {
+              if ((t.userId ?? 'owner') === sq.userId) tokens.delete(h);
+            }
+            for (const [ch, cd] of codes.entries()) {
+              if ((cd.userId ?? 'owner') === sq.userId) codes.delete(ch);
+            }
+          }
+        }
+        if (pinnedId) demoteMemoryUnapprovedOwners(pinnedId);
+        const nextEpoch = prev ? (prev.disabled ? (prev.sessionEpoch ?? 1) + 1 : (prev.sessionEpoch ?? 1)) : 1;
+        const healed: HubUserRecord = {
+          ...stripMeta(user),
+          ...(pinnedId ? { githubId: pinnedId } : {}),
+          role: 'owner',
+          promotedByOwnerId: pinnedId || 'owner',
+          sessionEpoch: nextEpoch,
+          disabled: false,
+          admittedVia: 'owner',
+          createdAt: prev?.createdAt ?? user.createdAt,
+          lastLoginAt: user.lastLoginAt,
+        };
+        delete healed.admittedOrg;
+        users.set(user.userId, healed);
+        for (const t of tokens.values()) {
+          if ((t.userId ?? 'owner') === user.userId) t.userRole = 'owner';
+        }
+        for (const cd of codes.values()) {
+          if ((cd.userId ?? 'owner') === user.userId) cd.userRole = 'owner';
+        }
+        return { ...healed };
+      }
+
+      if (user.mutationKind === 'oauth_login_existing') {
+        if (!prev || prev.disabled) {
+          return { ...(prev ? { ...prev } : stripMeta(user)), mutationAborted: true };
+        }
+        const updated: HubUserRecord = {
+          ...prev,
+          ...(user.githubId ? { githubId: user.githubId } : {}),
+          githubLogin: user.githubLogin ?? prev.githubLogin,
+          ...(user.avatarUrl ? { avatarUrl: user.avatarUrl } : {}),
+          admittedVia: user.admittedVia,
+          ...(user.admittedOrg ? { admittedOrg: user.admittedOrg.toLowerCase() } : {}),
+          ...(user.encryptedGhToken ? { encryptedGhToken: user.encryptedGhToken } : {}),
+          ...(user.orgVerifiedAt !== undefined ? { orgVerifiedAt: user.orgVerifiedAt } : {}),
+          lastLoginAt: user.lastLoginAt,
+        };
+        if (!user.avatarUrl) delete updated.avatarUrl;
+        if (!user.admittedOrg) delete updated.admittedOrg;
+        if (!user.encryptedGhToken) delete updated.encryptedGhToken;
+        if (user.orgVerifiedAt === undefined) delete updated.orgVerifiedAt;
+        users.set(user.userId, updated);
+        return { ...updated };
+      }
+
+      if (user.mutationKind === 'oauth_login_new') {
+        if (prev) {
+          if (prev.disabled) {
+            return { ...prev, mutationAborted: true };
+          }
+          const updated: HubUserRecord = {
+            ...prev,
+            ...(user.githubId ? { githubId: user.githubId } : {}),
+            githubLogin: user.githubLogin ?? prev.githubLogin,
+            ...(user.avatarUrl ? { avatarUrl: user.avatarUrl } : {}),
+            admittedVia: user.admittedVia,
+            ...(user.admittedOrg ? { admittedOrg: user.admittedOrg.toLowerCase() } : {}),
+            ...(user.encryptedGhToken ? { encryptedGhToken: user.encryptedGhToken } : {}),
+            ...(user.orgVerifiedAt !== undefined ? { orgVerifiedAt: user.orgVerifiedAt } : {}),
+            lastLoginAt: user.lastLoginAt,
+          };
+          users.set(user.userId, updated);
+          return { ...updated };
+        }
+        const fresh: HubUserRecord = {
+          ...stripMeta(user),
+          role: 'member',
+          sessionEpoch: 1,
+          disabled: false,
+          ...(user.admittedOrg ? { admittedOrg: user.admittedOrg.toLowerCase() } : {}),
+        };
+        delete fresh.promotedByOwnerId;
+        users.set(user.userId, fresh);
+        return { ...fresh };
+      }
+
+      if (user.mutationKind === 'demote_unapproved_owner' || user.mutationKind === 'admin_role') {
+        if (!prev || prev.disabled) {
+          return { ...(prev ? { ...prev } : stripMeta(user)), mutationAborted: true };
+        }
+        const nextRole: UserRole = user.mutationKind === 'demote_unapproved_owner' ? 'member' : user.role;
+        prev.role = nextRole;
+        if (nextRole === 'owner' && user.promotedByOwnerId) {
+          prev.promotedByOwnerId = user.promotedByOwnerId;
+        } else {
+          delete prev.promotedByOwnerId;
+        }
+        prev.sessionEpoch = (prev.sessionEpoch ?? 1) + 1;
+        for (const t of tokens.values()) {
+          if ((t.userId ?? 'owner') === user.userId) t.userRole = nextRole;
+        }
+        for (const cd of codes.values()) {
+          if ((cd.userId ?? 'owner') === user.userId) cd.userRole = nextRole;
+        }
+        return { ...prev };
+      }
+
       const isDisabled = Boolean(user.disabled);
+      if (!isDisabled && prev?.disabled) {
+        return { ...prev, mutationAborted: true };
+      }
       const copy: HubUserRecord = {
-        ...user,
+        ...stripMeta(user),
         ...(user.admittedOrg ? { admittedOrg: user.admittedOrg.toLowerCase() } : {}),
         ...(isDisabled ? { encryptedGhToken: undefined } : {}),
         sessionEpoch:
@@ -1232,6 +1973,12 @@ export function createMemoryOAuthStore(): OAuthStore {
             : (prev?.sessionEpoch ?? 1),
         disabled: isDisabled,
       };
+      if (copy.role === 'owner' && !copy.promotedByOwnerId && prev?.promotedByOwnerId) {
+        copy.promotedByOwnerId = prev.promotedByOwnerId;
+      }
+      if (isDisabled || copy.role !== 'owner') {
+        delete copy.promotedByOwnerId;
+      }
       if (isDisabled) {
         delete copy.encryptedGhToken;
       }
@@ -1247,10 +1994,18 @@ export function createMemoryOAuthStore(): OAuthStore {
       return { ...copy };
     },
     getUser(userId) {
+      const pinnedOwnerId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+      if (pinnedOwnerId) {
+        this.enforcePinnedFounderOwners?.(pinnedOwnerId);
+      }
       const u = users.get(userId);
       return u ? { ...u } : null;
     },
     listUsers() {
+      const pinnedOwnerId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
+      if (pinnedOwnerId) {
+        this.enforcePinnedFounderOwners?.(pinnedOwnerId);
+      }
       return [...users.values()]
         .filter((u) => !u.disabled)
         .map(({ encryptedGhToken: _omitSecret, ...u }) => ({ ...u }))
@@ -1263,11 +2018,16 @@ export function createMemoryOAuthStore(): OAuthStore {
       }
       return c;
     },
-    updateUserRole(userId, role) {
+    updateUserRole(userId, role, promotedByOwnerId) {
       if (userId === 'owner' && role !== 'owner') return false;
       const u = users.get(userId);
       if (!u || u.disabled) return false;
       u.role = role;
+      if (role === 'owner' && promotedByOwnerId) {
+        u.promotedByOwnerId = promotedByOwnerId;
+      } else {
+        delete u.promotedByOwnerId;
+      }
       u.sessionEpoch = (u.sessionEpoch ?? 1) + 1;
       for (const t of tokens.values()) {
         if ((t.userId ?? 'owner') === userId) t.userRole = role;
@@ -1276,6 +2036,31 @@ export function createMemoryOAuthStore(): OAuthStore {
         if ((cd.userId ?? 'owner') === userId) cd.userRole = role;
       }
       return true;
+    },
+    enforcePinnedFounderOwners(pinnedOwnerId) {
+      if (!pinnedOwnerId || !/^[1-9][0-9]{0,19}$/.test(pinnedOwnerId.trim())) return 0;
+      const cleanPin = pinnedOwnerId.trim();
+      let count = 0;
+      for (const u of users.values()) {
+        if (
+          u.userId !== 'owner' &&
+          u.role === 'owner' &&
+          String(u.githubId ?? '') !== cleanPin &&
+          u.promotedByOwnerId !== cleanPin
+        ) {
+          u.role = 'member';
+          delete u.promotedByOwnerId;
+          u.sessionEpoch = (u.sessionEpoch ?? 1) + 1;
+          for (const t of tokens.values()) {
+            if ((t.userId ?? 'owner') === u.userId) t.userRole = 'member';
+          }
+          for (const cd of codes.values()) {
+            if ((cd.userId ?? 'owner') === u.userId) cd.userRole = 'member';
+          }
+          count++;
+        }
+      }
+      return count;
     },
     checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
       if (bucket.startsWith('revoked_admin:')) {
@@ -1415,10 +2200,16 @@ export async function isAdminSessionRevoked(
 
 export function isSameOriginFormPost(request: Request, url: URL, publicOrigin?: string): boolean {
   const secFetchSite = (request.headers.get('sec-fetch-site') ?? '').trim().toLowerCase();
-  if (secFetchSite === 'cross-site') return false;
+  if (secFetchSite === 'cross-site' || secFetchSite === 'same-site') return false;
   const rawOrigin = request.headers.get('origin');
   if (!rawOrigin || !rawOrigin.trim()) return true;
-  if (rawOrigin.trim().toLowerCase() === 'null') return false;
+  if (rawOrigin.trim().toLowerCase() === 'null') {
+    // Privacy browsers/extensions (e.g. Brave Shields, Firefox privacy flags, AdGuard/Privacy Badger)
+    // and `Referrer-Policy: no-referrer` navigations can rewrite `Origin` to `"null"` on genuine
+    // same-origin form POSTs after the browser has already stamped the forbidden `Sec-Fetch-Site: same-origin`
+    // Fetch Metadata header. Reject `Origin: null` unless `Sec-Fetch-Site` is explicitly `same-origin`.
+    return secFetchSite === 'same-origin';
+  }
   try {
     const reqOriginUrl = new URL(rawOrigin.trim());
     if (reqOriginUrl.origin.toLowerCase() === url.origin.toLowerCase()) return true;
@@ -1554,7 +2345,8 @@ export async function verifyLiveAdminSession(params: {
     return { ok: false };
   }
   if (session.authMethod === 'github' || session.userId !== 'owner') {
-    const liveUser = (await params.store.getUser?.(session.userId)) ?? null;
+    await reconcileUpgradedFounderOwners({ store: params.store, env: params.githubAuthEnv });
+    let liveUser = (await params.store.getUser?.(session.userId)) ?? null;
     if (!liveUser) {
       const userCount = (await params.store.countUsers?.()) ?? 0;
       if (githubEnabled || userCount > 0 || session.role === 'owner') {
@@ -1574,7 +2366,7 @@ export async function verifyLiveAdminSession(params: {
     }
     if (
       liveUser.admittedVia === 'org' &&
-      liveUser.role !== 'owner' &&
+      !isPinnedGitHubFounder(liveUser, params.githubAuthEnv) &&
       params.githubAuthEnv &&
       isGitHubAuthConfigured(params.githubAuthEnv) &&
       (!liveUser.orgVerifiedAt || now - liveUser.orgVerifiedAt > GITHUB_ORG_REVERIFY_TTL_MS)
@@ -1587,6 +2379,10 @@ export async function verifyLiveAdminSession(params: {
         now,
       });
       if (!orgCheck.ok) {
+        return { ok: false };
+      }
+      liveUser = (await params.store.getUser?.(session.userId)) ?? null;
+      if (!liveUser || liveUser.disabled || (liveUser.sessionEpoch ?? 1) !== expectedEpoch) {
         return { ok: false };
       }
     }
@@ -2534,18 +3330,31 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
 
         const rawCode = `efc_${randomUrlToken(32)}`;
         const codeHash = await sha256Base64Url(rawCode);
-        await deps.store.putCode({
-          codeHash,
-          clientId: sealed.clientId,
-          clientName: sealed.clientName,
-          redirectUri: sealed.redirectUri,
-          codeChallenge: sealed.codeChallenge,
-          scopes: sealed.scopes,
-          resource: sealed.resource,
-          userId: grantedUserId,
-          userRole: grantedUserRole,
-          expiresAt: now + AUTH_CODE_TTL_MS,
-        });
+        try {
+          await deps.store.putCode({
+            codeHash,
+            clientId: sealed.clientId,
+            clientName: sealed.clientName,
+            redirectUri: sealed.redirectUri,
+            codeChallenge: sealed.codeChallenge,
+            scopes: sealed.scopes,
+            resource: sealed.resource,
+            userId: grantedUserId,
+            userRole: grantedUserRole,
+            expiresAt: now + AUTH_CODE_TTL_MS,
+          });
+        } catch (err) {
+          if (err instanceof OAuthQuotaExceededError) {
+            span.setAttributes({ 'oauth.phase': 'error', 'oauth.outcome': 'quota_exceeded', 'http.response.status_code': 429 });
+            span.setStatus(false, 'user_quota_exceeded');
+            return oauthJson(
+              { error: 'user_quota_exceeded', error_description: err.message },
+              429,
+              { ...cors, 'retry-after': '2' },
+            );
+          }
+          throw err;
+        }
 
         const cb = new URL(sealed.redirectUri);
         cb.searchParams.set('code', rawCode);
@@ -2643,7 +3452,8 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         const grantUserId = record.userId ?? 'owner';
         let grantUserRole = normalizeRoleForUser(grantUserId, record.userRole);
         if (grantUserId !== 'owner') {
-          const liveUser = (await deps.store.getUser?.(grantUserId)) ?? null;
+          await reconcileUpgradedFounderOwners({ store: deps.store, env: deps.githubAuthEnv });
+          let liveUser = (await deps.store.getUser?.(grantUserId)) ?? null;
           if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, deps.githubAuthEnv)) {
             span.setAttributes({ 'oauth.outcome': 'user_revoked', 'http.response.status_code': 400 });
             span.setStatus(false, 'user_revoked');
@@ -2651,11 +3461,12 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           }
           if (
             liveUser.admittedVia === 'org' &&
-            liveUser.role !== 'owner' &&
+            !isPinnedGitHubFounder(liveUser, deps.githubAuthEnv) &&
             deps.githubAuthEnv &&
             isGitHubAuthConfigured(deps.githubAuthEnv) &&
             (!liveUser.orgVerifiedAt || now - liveUser.orgVerifiedAt > GITHUB_ORG_REVERIFY_TTL_MS)
           ) {
+            const initialEpoch = liveUser.sessionEpoch ?? 1;
             const orgCheck = await reverifyGitHubOrgAdmission({
               user: liveUser,
               env: deps.githubAuthEnv,
@@ -2668,26 +3479,45 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
               span.setStatus(false, 'org_membership_revoked');
               return oauthJson({ error: 'invalid_grant', error_description: 'GitHub organization membership is no longer active' }, 400, cors);
             }
+            liveUser = (await deps.store.getUser?.(grantUserId)) ?? null;
+            if (!liveUser || liveUser.disabled || (liveUser.sessionEpoch ?? 1) !== initialEpoch) {
+              span.setAttributes({ 'oauth.outcome': 'user_revoked', 'http.response.status_code': 400 });
+              span.setStatus(false, 'user_revoked');
+              return oauthJson({ error: 'invalid_grant', error_description: 'Authorized user account state changed during verification' }, 400, cors);
+            }
           }
           grantUserRole = liveUser.role;
         }
         const accessToken = `efa_${randomUrlToken(32)}`;
         const refreshToken = `efr_${randomUrlToken(32)}`;
         const grantId = `grant_${randomUrlToken(12)}`;
-        await deps.store.putTokenPair({
-          grantId,
-          accessHash: await sha256Base64Url(accessToken),
-          refreshHash: await sha256Base64Url(refreshToken),
-          clientId: record.clientId,
-          clientName: record.clientName,
-          scopes: record.scopes,
-          resource: record.resource,
-          userId: grantUserId,
-          userRole: grantUserRole,
-          createdAt: now,
-          accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
-          refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
-        });
+        try {
+          await deps.store.putTokenPair({
+            grantId,
+            accessHash: await sha256Base64Url(accessToken),
+            refreshHash: await sha256Base64Url(refreshToken),
+            clientId: record.clientId,
+            clientName: record.clientName,
+            scopes: record.scopes,
+            resource: record.resource,
+            userId: grantUserId,
+            userRole: grantUserRole,
+            createdAt: now,
+            accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
+            refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
+          });
+        } catch (err) {
+          if (err instanceof OAuthQuotaExceededError) {
+            span.setAttributes({ 'oauth.outcome': 'quota_exceeded', 'http.response.status_code': 429 });
+            span.setStatus(false, 'user_quota_exceeded');
+            return oauthJson(
+              { error: 'user_quota_exceeded', error_description: err.message },
+              429,
+              { ...cors, 'retry-after': '2' },
+            );
+          }
+          throw err;
+        }
         await deps.onEvent?.({
           level: 'info',
           category: 'oauth',
@@ -2763,6 +3593,7 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
         }
 
         if (rotated.userId !== 'owner') {
+          await reconcileUpgradedFounderOwners({ store: deps.store, env: deps.githubAuthEnv });
           const liveUser = (await deps.store.getUser?.(rotated.userId)) ?? null;
           if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, deps.githubAuthEnv)) {
             await deps.store.revokeGrant(rotated.grantId);
@@ -2776,10 +3607,11 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           }
           if (
             liveUser.admittedVia === 'org' &&
-            liveUser.role !== 'owner' &&
+            !isPinnedGitHubFounder(liveUser, deps.githubAuthEnv) &&
             deps.githubAuthEnv &&
             isGitHubAuthConfigured(deps.githubAuthEnv)
           ) {
+            const initialEpoch = liveUser.sessionEpoch ?? 1;
             const orgCheck = await reverifyGitHubOrgAdmission({
               user: liveUser,
               env: deps.githubAuthEnv,
@@ -2796,6 +3628,17 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
               });
               span.setStatus(false, 'org_membership_revoked');
               return oauthJson({ error: 'invalid_grant', error_description: 'GitHub organization membership is no longer active' }, 400, cors);
+            }
+            const afterUser = (await deps.store.getUser?.(rotated.userId)) ?? null;
+            if (!afterUser || afterUser.disabled || (afterUser.sessionEpoch ?? 1) !== initialEpoch) {
+              await deps.store.revokeGrant(rotated.grantId);
+              span.setAttributes({
+                'oauth.grant_id': rotated.grantId,
+                'oauth.outcome': 'user_revoked',
+                'http.response.status_code': 400,
+              });
+              span.setStatus(false, 'user_revoked');
+              return oauthJson({ error: 'invalid_grant', error_description: 'Account state changed during verification' }, 400, cors);
             }
           }
         }
@@ -2915,18 +3758,20 @@ export async function authorizeMcpRequest(params: {
   if (userId !== 'owner') {
     const effectiveGhEnv = params.githubAuthEnv ?? callerAuthAls.getStore()?.githubAuthEnv;
     const nowMs = params.now ?? Date.now();
-    const liveUser = (await params.store.getUser?.(userId)) ?? null;
+    await reconcileUpgradedFounderOwners({ store: params.store, env: effectiveGhEnv });
+    let liveUser = (await params.store.getUser?.(userId)) ?? null;
     if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, effectiveGhEnv)) {
       await params.store.revokeGrant(record.grantId);
       return { ok: false, status: 401, wwwAuthenticate };
     }
     if (
       liveUser.admittedVia === 'org' &&
-      liveUser.role !== 'owner' &&
+      !isPinnedGitHubFounder(liveUser, effectiveGhEnv) &&
       effectiveGhEnv &&
       isGitHubAuthConfigured(effectiveGhEnv) &&
       (!liveUser.orgVerifiedAt || nowMs - liveUser.orgVerifiedAt > GITHUB_ORG_REVERIFY_TTL_MS)
     ) {
+      const initialEpoch = liveUser.sessionEpoch ?? 1;
       const orgCheck = await reverifyGitHubOrgAdmission({
         user: liveUser,
         env: effectiveGhEnv,
@@ -2934,6 +3779,11 @@ export async function authorizeMcpRequest(params: {
         now: nowMs,
       });
       if (!orgCheck.ok) {
+        await params.store.revokeGrant(record.grantId);
+        return { ok: false, status: 401, wwwAuthenticate };
+      }
+      liveUser = (await params.store.getUser?.(userId)) ?? null;
+      if (!liveUser || liveUser.disabled || (liveUser.sessionEpoch ?? 1) !== initialEpoch) {
         await params.store.revokeGrant(record.grantId);
         return { ok: false, status: 401, wwwAuthenticate };
       }

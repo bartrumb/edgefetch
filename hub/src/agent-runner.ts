@@ -18,16 +18,21 @@ import type { AdapterCategory, SiteAdapter } from './extractors/types';
 import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
   executeFederatedMcpQuery,
+  formatFenceSafeUntrustedMcpEnvelope,
   matchConnectedMcpsForContext,
   sanitizeMcpMarkdownOutput,
   sanitizeRemoteMcpText,
   tryScrapeViaConnectedMcp,
   type QueryMcpCallInput,
 } from './mcp-federation';
+import { validateConnectorDomains } from './mcp-registry';
 import {
   filterSafeCachedMcpTools,
+  isSafeMcpIdentifier,
   resolveCallerUserId,
   SAFE_MCP_IDENTIFIER_RE,
+  toPublicMcpServerSummary,
+  type CachedMcpToolSchema,
   type McpVaultStore,
   type StoredMcpServerRow,
 } from './mcp-vault';
@@ -223,8 +228,8 @@ export function findRelevantAdapters(params: {
       }
     }
 
-    // 4. Category intent boost
-    if (boostedCategories.has(adapter.category)) {
+    // 4. Category intent boost (only when at least one domain, slug, or query token matched!)
+    if (score > 0 && boostedCategories.has(adapter.category)) {
       score += 3;
     }
 
@@ -364,6 +369,47 @@ export async function cancelAgentRun(
   return { ok: true, status: 200 };
 }
 
+function extractSelectorHostname(rawSelector: string): string | null {
+  const clean = rawSelector.trim().toLowerCase().replace(/^\*\./, '');
+  if (!clean || clean.length > 253) return null;
+  if (clean.startsWith('https://') || clean.startsWith('http://')) {
+    try {
+      const u = new URL(clean);
+      const h = u.hostname.toLowerCase().replace(/^www\./, '').replace(/\.+$/, '');
+      return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(h) ? h : null;
+    } catch {
+      return null;
+    }
+  }
+  const h = clean.replace(/^www\./, '').replace(/\.+$/, '');
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(h)) {
+    return null;
+  }
+  return h;
+}
+
+function doesMcpServerSelectorMatchRow(rawSelector: string, row: StoredMcpServerRow): boolean {
+  const sel = rawSelector.trim().toLowerCase();
+  if (!sel || sel.length > 253) return false;
+  if (row.id.toLowerCase() === sel || row.slug.toLowerCase() === sel) {
+    return true;
+  }
+  const selHost = extractSelectorHostname(sel);
+  if (!selHost) return false;
+  try {
+    const originHost = new URL(row.remoteOrigin).hostname.toLowerCase().replace(/^www\./, '');
+    if (originHost && selHost === originHost) return true;
+  } catch {
+    // ignore malformed remoteOrigin
+  }
+  return row.domains.some((rawDom) => {
+    const valid = validateConnectorDomains([rawDom], row.remoteOrigin, true);
+    if (!valid.ok || valid.domains.length === 0) return false;
+    const allowedDomain = valid.domains[0]!;
+    return selHost === allowedDomain || selHost.endsWith(`.${allowedDomain}`);
+  });
+}
+
 function buildAgentTools(
   strictConstrainToURLs: boolean,
   hasSearchCollection: boolean,
@@ -372,20 +418,51 @@ function buildAgentTools(
   const tools: LlmToolDefinition[] = [];
   const safeServerSlugs = connectedMcps.map((s) => s.slug).filter((slug) => /^[a-z0-9_-]{1,48}$/i.test(slug));
   if (safeServerSlugs.length > 0) {
+    const permittedToolNames = [
+      ...new Set(
+        connectedMcps.flatMap((s) =>
+          s.cachedTools.map((t) => t.name).filter((n) => isSafeMcpIdentifier(n)),
+        ),
+      ),
+    ].slice(0, 64);
     tools.push({
       name: 'query_mcp',
-      description: `Tier-1 Connected MCP Federation: Query your user-authenticated official MCP servers (${safeServerSlugs.join(', ')}) FIRST before scraping HTML. Use action="list_tools" to inspect tools or action="call_tool" to invoke a structured MCP tool directly.`,
+      description:
+        'Tier-1 Connected MCP Federation: Query explicitly enabled MCP connectors before scraping HTML. Use action="list_tools" to inspect cached tools or action="call_tool" to invoke a permitted MCP tool.',
       parameters: {
         type: 'object',
         properties: {
           action: { type: 'string', enum: ['list_connected', 'list_tools', 'call_tool'] },
           server: { type: 'string', enum: safeServerSlugs, description: 'Connected MCP server slug.' },
-          tool: { type: 'string', description: 'Tool name on the connected MCP server (for action="call_tool").' },
+          tool: {
+            type: 'string',
+            ...(permittedToolNames.length > 0 ? { enum: permittedToolNames } : {}),
+            description: 'Permitted cached tool name on the connected MCP server (for action="call_tool").',
+          },
           arguments: { type: 'object', description: 'JSON object arguments for the downstream MCP tool.' },
         },
         required: ['action'],
       },
     });
+    let exposedDirectCount = 0;
+    for (const srv of connectedMcps) {
+      if (!/^[a-z0-9_-]{1,24}$/i.test(srv.slug)) continue;
+      for (const cachedTool of srv.cachedTools) {
+        if (exposedDirectCount >= 24) break;
+        if (!isSafeMcpIdentifier(cachedTool.name)) continue;
+        const compositeName = `mcp__${srv.slug}__${cachedTool.name}`;
+        if (compositeName.length > 64 || !SAFE_MCP_IDENTIFIER_RE.test(compositeName)) continue;
+        tools.push({
+          name: compositeName,
+          description: 'Invoke permitted cached MCP tool on verified connector.',
+          parameters:
+            cachedTool.inputSchema && typeof cachedTool.inputSchema === 'object'
+              ? cachedTool.inputSchema
+              : { type: 'object', properties: {} },
+        });
+        exposedDirectCount++;
+      }
+    }
   }
   tools.push(
     {
@@ -738,12 +815,28 @@ export async function startOrExecuteAgentCall(params: {
     : true;
   const preferMcpRequested = payload.preferMcp === true;
   const useConnectedMcpRequested = (payload as Record<string, unknown>).useConnectedMcp === true;
-  const wantsConnectedMcps =
-    (Array.isArray(payload.mcpServers) && payload.mcpServers.length > 0) ||
+  const allowWriteMcpToolsRequested = (payload as Record<string, unknown>).allowWriteMcpTools === true;
+  const rawAllowedMcpTools = Array.isArray((payload as Record<string, unknown>).allowedMcpTools)
+    ? ((payload as Record<string, unknown>).allowedMcpTools as unknown[])
+        .filter((t): t is string => typeof t === 'string' && t.trim().length > 0 && t.trim().length <= 128)
+        .map((t) => t.trim())
+    : [];
+  const requestedMcpServerSelectors = Array.isArray(payload.mcpServers)
+    ? payload.mcpServers
+        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0 && s.trim().length <= 253)
+        .map((s) => s.trim())
+    : [];
+  // H4: `preferMcp: true` (or `useConnectedMcp: true`) alone MUST NOT expose every connected vault server!
+  // Connected MCP servers are ONLY exposed when explicit non-empty `mcpServers: string[]` names the allowed connectors.
+  const wantsConnectedMcps = requestedMcpServerSelectors.length > 0;
+  const requestedAnyMcpFeature =
+    wantsConnectedMcps ||
     preferMcpRequested ||
-    useConnectedMcpRequested;
+    useConnectedMcpRequested ||
+    allowWriteMcpToolsRequested ||
+    rawAllowedMcpTools.length > 0;
 
-  if (wantsConnectedMcps && !canInvokeFederatedMcp) {
+  if (requestedAnyMcpFeature && !canInvokeFederatedMcp) {
     return {
       kind: 'json',
       status: 403,
@@ -781,25 +874,47 @@ export async function startOrExecuteAgentCall(params: {
   };
 
   try {
-  const allowlistedMcpSlugs = Array.isArray(payload.mcpServers)
-    ? new Set(
-        payload.mcpServers
-          .filter((s): s is string => typeof s === 'string' && /^[a-z0-9_-]{1,48}$/i.test(s.trim()))
-          .map((s) => s.trim().toLowerCase()),
-      )
-    : null;
+  const allowedMcpToolSet = new Set<string>(rawAllowedMcpTools);
+  const isCachedToolPermittedForAgentRun = (srvSlug: string, tool: CachedMcpToolSchema): boolean => {
+    if (!isSafeMcpIdentifier(tool.name)) return false;
+    if (tool.readOnlyHint === true && tool.destructiveHint !== true) {
+      return true;
+    }
+    if (!canInvokeFederatedMcp) return false;
+    const slugLower = srvSlug.toLowerCase();
+    if (
+      allowedMcpToolSet.has(tool.name) ||
+      allowedMcpToolSet.has(`${slugLower}/${tool.name}`) ||
+      allowedMcpToolSet.has(`${slugLower}:${tool.name}`) ||
+      allowedMcpToolSet.has(`${slugLower}.${tool.name}`)
+    ) {
+      return true;
+    }
+    if (allowWriteMcpToolsRequested && allowedMcpToolSet.size === 0) {
+      return true;
+    }
+    return false;
+  };
 
   // Tier-1 Opt-In MCP-First Domain Router + Tier-2 `<1 ms` BM25 Keyless Adapter Router
   const routerStart = Date.now();
   const userConnectedMcps =
     vaultStore && wantsConnectedMcps && canInvokeFederatedMcp
       ? (await vaultStore.listServers(effectiveUserId))
-          .filter((s) => s.enabled && (!allowlistedMcpSlugs || allowlistedMcpSlugs.has(s.slug.toLowerCase())))
+          .filter(
+            (s) =>
+              s.enabled &&
+              requestedMcpServerSelectors.some((sel) => doesMcpServerSelectorMatchRow(sel, s)),
+          )
           .map((s) => {
-            const safeTools = filterSafeCachedMcpTools(s.cachedTools);
+            const safeTools = filterSafeCachedMcpTools(s.cachedTools).filter((t) =>
+              isCachedToolPermittedForAgentRun(s.slug, t),
+            );
             return { ...s, cachedTools: safeTools, toolCount: safeTools.length };
           })
       : [];
+  const allowedConnectorIds = new Set(userConnectedMcps.map((s) => s.id));
+  const allowedConnectorsById = new Map(userConnectedMcps.map((s) => [s.id, s]));
   const matchedMcps = matchConnectedMcpsForContext({
     servers: userConnectedMcps,
     query: prompt,
@@ -1255,54 +1370,115 @@ export async function startOrExecuteAgentCall(params: {
         });
       }
 
+      if (toolName.startsWith('mcp__') && vaultStore) {
+        const rest = toolName.slice(5);
+        const sepIdx = rest.indexOf('__');
+        if (sepIdx > 0 && sepIdx < rest.length - 2) {
+          return await executeSingleTool('query_mcp', {
+            action: 'call_tool',
+            server: rest.slice(0, sepIdx),
+            tool: rest.slice(sepIdx + 2),
+            arguments: args,
+          });
+        }
+      }
+
       if (toolName === 'query_mcp' && vaultStore) {
         if (!wantsConnectedMcps || userConnectedMcps.length === 0) {
           return {
             ok: false,
             summaryForLlm: JSON.stringify({
               error: 'mcp_not_enabled_for_run',
-              message: 'Connected MCP servers were not opted into for this agent run.',
+              message: 'Connected MCP servers were not explicitly enabled via mcpServers for this agent run.',
             }),
           };
         }
         return withToolSpan(async (toolSpan) => {
           const actionRaw = typeof args.action === 'string' ? args.action : 'call_tool';
-          if (actionRaw === 'call_tool' && !canInvokeFederatedMcp) {
+          if ((actionRaw === 'call_tool' || actionRaw === 'list_tools') && !canInvokeFederatedMcp) {
             return {
               ok: false,
-              summaryForLlm: JSON.stringify({ error: 'insufficient_scope', message: 'OAuth scope mcp:call is required to invoke connected MCP tools.' }),
+              summaryForLlm: JSON.stringify({
+                error: 'insufficient_scope',
+                message: 'OAuth scope mcp:call is required to query or invoke connected MCP tools.',
+              }),
             };
           }
-          if (typeof args.server === 'string' && args.server.trim()) {
-            const reqSrvLower = args.server.trim().toLowerCase();
-            const allowedForRun = userConnectedMcps.some(
-              (s) =>
-                s.slug.toLowerCase() === reqSrvLower ||
-                s.domains.some((d) => reqSrvLower === d.toLowerCase() || reqSrvLower.endsWith(`.${d.toLowerCase()}`)),
-            );
-            if (!allowedForRun) {
-              return {
-                ok: false,
-                summaryForLlm: JSON.stringify({ error: 'mcp_server_not_allowed', message: 'Server is not enabled for this agent run.' }),
-              };
-            }
+          if (actionRaw === 'list_connected') {
+            record.visibility = 'private';
+            record.userId = effectiveUserId;
+            const summaries = userConnectedMcps.map((s) => toPublicMcpServerSummary(s));
+            return {
+              ok: true,
+              summaryForLlm: formatFenceSafeUntrustedMcpEnvelope({
+                tag: 'untrusted_mcp_tool_output',
+                attributes: { action: 'list_connected' },
+                content: JSON.stringify({ servers: summaries }, null, 2),
+                maxChars: 6_000,
+              }),
+            };
           }
-          if (actionRaw === 'call_tool') {
-            const candidateToolName = typeof args.tool === 'string' ? args.tool.trim() : '';
-            if (!candidateToolName || !SAFE_MCP_IDENTIFIER_RE.test(candidateToolName)) {
-              return {
-                ok: false,
-                summaryForLlm: JSON.stringify({ error: 'invalid_tool_identifier', message: 'Invalid MCP tool identifier.' }),
-              };
-            }
+
+          // H4: Resolve `args.server` to a concrete vault connector row FIRST, then require that resolved row's `id`
+          // to belong to `allowedConnectorIds` (preventing suffix/domain confusion to a non-allowed connector!).
+          const requestedServerArg = typeof args.server === 'string' ? args.server.trim() : '';
+          if (!requestedServerArg) {
+            return {
+              ok: false,
+              summaryForLlm: JSON.stringify({ error: 'missing_server', message: 'server is required for query_mcp.' }),
+            };
           }
+          const resolvedVaultRow = await vaultStore.getServer(effectiveUserId, requestedServerArg);
+          if (!resolvedVaultRow || !resolvedVaultRow.enabled || !allowedConnectorIds.has(resolvedVaultRow.id)) {
+            return {
+              ok: false,
+              summaryForLlm: JSON.stringify({
+                error: 'mcp_server_not_allowed',
+                message: 'Resolved MCP connector is not in the allowed mcpServers set for this agent run.',
+              }),
+            };
+          }
+          const canonicalAllowedServer = allowedConnectorsById.get(resolvedVaultRow.id)!;
+
+          if (actionRaw === 'list_tools') {
+            record.visibility = 'private';
+            record.userId = effectiveUserId;
+            return {
+              ok: true,
+              summaryForLlm: formatFenceSafeUntrustedMcpEnvelope({
+                tag: 'untrusted_mcp_tool_output',
+                attributes: { server: canonicalAllowedServer.slug, action: 'list_tools' },
+                content: JSON.stringify({ server: canonicalAllowedServer.slug, tools: canonicalAllowedServer.cachedTools }, null, 2),
+                maxChars: 6_000,
+              }),
+            };
+          }
+
+          const candidateToolName = typeof args.tool === 'string' ? args.tool.trim() : '';
+          if (!candidateToolName || !isSafeMcpIdentifier(candidateToolName)) {
+            return {
+              ok: false,
+              summaryForLlm: JSON.stringify({ error: 'invalid_tool_identifier', message: 'Invalid or disallowed MCP tool identifier.' }),
+            };
+          }
+          // H4: Strict cached read-only tool gate — tools NOT in cachedTools or lacking `readOnlyHint === true`
+          // (with `destructiveHint !== true`) MUST NOT be callable unless explicitly allow-listed with `mcp:call` scope!
+          const permittedCachedTool = canonicalAllowedServer.cachedTools.find((t) => t.name === candidateToolName);
+          if (!permittedCachedTool) {
+            return {
+              ok: false,
+              summaryForLlm: JSON.stringify({
+                error: 'mcp_tool_not_permitted',
+                message:
+                  'Requested MCP tool is either uncached or not readOnlyHint=true (and not explicitly allow-listed for this run).',
+              }),
+            };
+          }
+
           const qInput: QueryMcpCallInput = {
-            action:
-              actionRaw === 'list_connected' || actionRaw === 'list_tools' || actionRaw === 'call_tool'
-                ? actionRaw
-                : 'call_tool',
-            ...(typeof args.server === 'string' ? { server: args.server } : {}),
-            ...(typeof args.tool === 'string' ? { tool: args.tool.trim() } : {}),
+            action: 'call_tool',
+            server: canonicalAllowedServer.slug,
+            tool: permittedCachedTool.name,
             ...(args.arguments && typeof args.arguments === 'object' && !Array.isArray(args.arguments)
               ? { arguments: args.arguments as Record<string, unknown> }
               : {}),
@@ -1320,9 +1496,8 @@ export async function startOrExecuteAgentCall(params: {
           record.visibility = 'private';
           record.userId = effectiveUserId;
 
-          const srvSlugRaw = typeof mOut.body.server === 'string' ? mOut.body.server : String(args.server ?? 'mcp');
-          const srvSlug = srvSlugRaw.replace(/[^a-z0-9_-]/gi, '').slice(0, 48) || 'mcp';
-          const toolCalled = typeof mOut.body.tool === 'string' ? mOut.body.tool : undefined;
+          const srvSlug = canonicalAllowedServer.slug.replace(/[^a-z0-9_-]/gi, '').slice(0, 48) || 'mcp';
+          const toolCalled = permittedCachedTool.name;
           const rawMdText =
             typeof mOut.body.markdown === 'string' && mOut.body.markdown
               ? mOut.body.markdown
@@ -1366,9 +1541,16 @@ export async function startOrExecuteAgentCall(params: {
             outputPreview: { status: mOut.status, server: srvSlug, tool: toolCalled, chars: sanitizedMcpMd.length },
           });
 
-          // Wrap federated MCP tool output in an explicit untrusted-data boundary envelope for the LLM!
-          const safeToolAttr = toolCalled && SAFE_MCP_IDENTIFIER_RE.test(toolCalled) ? ` tool="${toolCalled}"` : '';
-          const boundedEnvelope = `<untrusted_mcp_tool_output server="${srvSlug}"${safeToolAttr}>\n${sanitizedMcpMd.slice(0, 7_600)}\n</untrusted_mcp_tool_output>`;
+          // Wrap federated MCP tool output in a fence-safe + boundary-tag-safe untrusted-data envelope for the LLM!
+          const boundedEnvelope = formatFenceSafeUntrustedMcpEnvelope({
+            tag: 'untrusted_mcp_tool_output',
+            attributes: {
+              server: srvSlug,
+              ...(isSafeMcpIdentifier(toolCalled) ? { tool: toolCalled } : {}),
+            },
+            content: sanitizedMcpMd,
+            maxChars: 7_600,
+          });
           return {
             ok: mOut.status === 200,
             summaryForLlm: boundedEnvelope,
@@ -1390,13 +1572,15 @@ export async function startOrExecuteAgentCall(params: {
       record.pagesRead++;
 
       return withToolSpan(async (toolSpan) => {
-        // Tier-1 MCP-First Domain Check before HTML scraping (opt-in via `preferMcp` or `autoRouteScrape`)
-        if (vaultStore && userConnectedMcps.length > 0 && canInvokeFederatedMcp) {
+        // Tier-1 MCP-First Domain Check before HTML scraping (ONLY for explicitly allowed `mcpServers` in this run!)
+        if (vaultStore && allowedConnectorIds.size > 0 && canInvokeFederatedMcp) {
           const mcpDirect = await tryScrapeViaConnectedMcp({
             userId: effectiveUserId,
             targetUrl,
             ...(typeof args.query === 'string' && args.query.trim() ? { query: args.query.trim() } : {}),
             preferMcp: preferMcpRequested,
+            allowedServerIds: allowedConnectorIds,
+            requireExplicitReadOnlyHint: true,
             vaultStore,
             vaultMasterKey: env.VAULT_MASTER_KEY,
             fetchFn: env.SAFE_PUBLIC_FETCH ?? env.SAFE_FETCH ?? fetch,
@@ -1425,7 +1609,12 @@ export async function startOrExecuteAgentCall(params: {
             });
             return {
               ok: true,
-              summaryForLlm: `<untrusted_mcp_tool_output url="${targetUrl}" via="${mcpDirect.via}">\n${mcpMd.slice(0, 6_500)}\n</untrusted_mcp_tool_output>`,
+              summaryForLlm: formatFenceSafeUntrustedMcpEnvelope({
+                tag: 'untrusted_mcp_tool_output',
+                attributes: { url: targetUrl, via: mcpDirect.via },
+                content: mcpMd,
+                maxChars: 6_500,
+              }),
             };
           }
         }
@@ -1501,40 +1690,8 @@ export async function startOrExecuteAgentCall(params: {
 
       if (llmConfig) {
         // ── Autonomous Multi-Step BYO-LLM Agent Loop ──
-        // H3: Never interpolate raw untrusted downstream JSON or descriptions into `/v1/agent` system prompts!
-        // Emit ONLY regex-verified identifiers (`slug`, `domains`, `tool.name`, and safe `propKeys`).
-        const SAFE_SLUG_ID_RE = /^[a-z0-9_-]{1,48}$/;
-        const SAFE_TOOL_ID_RE = SAFE_MCP_IDENTIFIER_RE;
-        const SAFE_PROP_ID_RE = SAFE_MCP_IDENTIFIER_RE;
-        const SAFE_DOM_ID_RE = /^[a-z0-9.-]{1,128}$/;
-
-        const connectedMcpHints = (matchedMcps.length > 0 ? matchedMcps.map((m) => m.server) : userConnectedMcps.map((s) => ({
-          slug: s.slug,
-          domains: s.domains,
-          tools: s.cachedTools,
-        })))
-          .slice(0, 8)
-          .filter((srv) => SAFE_SLUG_ID_RE.test(srv.slug))
-          .map((srv) => {
-            const safeDoms = (srv.domains ?? []).filter((d) => SAFE_DOM_ID_RE.test(d)).slice(0, 8);
-            const toolList = (srv.tools ?? [])
-              .slice(0, 10)
-              .filter((t) => SAFE_TOOL_ID_RE.test(t.name))
-              .map((t) => {
-                const propKeys =
-                  t.inputSchema?.properties && typeof t.inputSchema.properties === 'object'
-                    ? Object.keys(t.inputSchema.properties as Record<string, unknown>)
-                        .filter((k) => SAFE_PROP_ID_RE.test(k))
-                        .slice(0, 6)
-                        .join(', ')
-                    : '';
-                return `${t.name}(${propKeys})`;
-              })
-              .join('; ');
-            return `- server="${srv.slug}" [domains: ${safeDoms.join(', ') || 'n/a'}] -> tools: ${toolList || 'call query_mcp(action="list_tools")'}`;
-          })
-          .join('\n');
-
+        // H4: NEVER interpolate remote MCP tool names or property names into the LLM `system` message!
+        // Validated `SAFE_MCP_IDENTIFIER_RE` tool & property schemas go strictly in the structured `tools` channel.
         const activeAdapterHints = initialMatches
           .map((m) => `- ${m.id} (${m.category}): ${m.description} [domains: ${m.domains.slice(0, 3).join(', ')}]`)
           .join('\n');
@@ -1552,9 +1709,9 @@ export async function startOrExecuteAgentCall(params: {
               strictConstrainToURLs && seedUrls.length > 0
                 ? `4. STRICT URL CONSTRAINT: Only inspect URLs matching these seed prefixes: ${seedUrls.join(', ')}.`
                 : '4. You can call multiple tools in parallel per step to gather sources rapidly, and use find_extractors(query) to discover specialized keyless adapters across 49+ providers.',
-              ...(connectedMcpHints
+              ...(userConnectedMcps.length > 0
                 ? [
-                    `TIER-1 CONNECTED MCP ROUTING (USE FIRST): The user has authenticated official MCP connectors configured. Whenever the task or target URLs match these services/domains, call query_mcp(action="call_tool", server=..., tool=..., arguments=...) FIRST before falling back to HTML scraping:\n${connectedMcpHints}`,
+                    'TIER-1 CONNECTED MCP ROUTING (USE FIRST): Authenticated MCP connectors are available in your structured tool definitions. Prefer calling permitted MCP tools via query_mcp before falling back to HTML scraping.',
                   ]
                 : []),
               ...(activeAdapterHints ? [`Relevant built-in EdgeFetch adapters pre-routed for this task:\n${activeAdapterHints}`] : []),
@@ -1752,16 +1909,15 @@ export async function startOrExecuteAgentCall(params: {
         // ── Zero-Key Deterministic Research Mode (works offline with 0 LLM keys configured!) ──
         record.stepsUsed = 1;
 
-        // Keyless/heuristic `/v1/agent` safety: NEVER auto-invoke connected MCP tools unless explicitly opted in
-        // (`preferMcp === true` or explicit `mcpServers` allowlist) AND `tool.readOnlyHint === true && tool.destructiveHint !== true`!
-        const allowKeylessMcpAutoCall =
-          canInvokeFederatedMcp && wantsConnectedMcps;
+        // Keyless/heuristic `/v1/agent` safety: NEVER auto-invoke connected MCP tools unless explicit `mcpServers`
+        // were provided AND `tool.readOnlyHint === true && tool.destructiveHint !== true`!
+        const allowKeylessMcpAutoCall = canInvokeFederatedMcp && wantsConnectedMcps && allowedConnectorIds.size > 0;
         if (allowKeylessMcpAutoCall) {
           for (const matched of matchedMcps.slice(0, 2)) {
             if (isCancelled()) break;
-            if (allowlistedMcpSlugs && !allowlistedMcpSlugs.has(matched.server.slug.toLowerCase())) continue;
+            if (!allowedConnectorIds.has(matched.server.id)) continue;
             const mcpTool = filterSafeCachedMcpTools(matched.server.tools).find(
-              (t) => SAFE_MCP_IDENTIFIER_RE.test(t.name) && t.readOnlyHint === true && t.destructiveHint !== true,
+              (t) => isSafeMcpIdentifier(t.name) && t.readOnlyHint === true && t.destructiveHint !== true,
             );
             if (mcpTool) {
               const props =

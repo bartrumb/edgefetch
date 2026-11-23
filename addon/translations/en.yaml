@@ -1,0 +1,28 @@
+configuration:
+  hub_url:
+    name: Hub URL
+    description: HTTPS or WSS URL of your EdgeFetch Hub coordinator.
+  agent_token:
+    name: Agent Token
+    description: Per-site worker secret (>= 24 characters) matching AGENT_TOKENS on your Hub.
+  site_id:
+    name: Site ID
+    description: Lowercase identifier for this worker node (e.g. site-arm64, site-x86).
+  user_agent:
+    name: User-Agent
+    description: Polite HTTP User-Agent string with operator contact info.
+  pause_ms:
+    name: Host Pause (ms)
+    description: Minimum polite delay between requests to the same host.
+  pause_jitter_ms:
+    name: Pause Jitter (ms)
+    description: Random jitter added to per-host pauses.
+  allowed_hosts:
+    name: Allowed Hosts (Optional)
+    description: Optional domain allowlist restricting which public hosts this node may fetch.
+  robots_bypass_hosts:
+    name: Robots Bypass Hosts (Optional)
+    description: Domains you own where respectRobots=false is permitted.
+  allow_no_sandbox_browser:
+    name: Enable Headless Chromium under HAOS AppArmor
+    description: Enables Headless Chromium (browser-v1 and interact) on Home Assistant OS with Protection Mode ON (where HAOS Supervisor blocks inner user namespaces while confining the container via AppArmor, UID 65532, and SSRFProxy). Leave off to keep Chromium disabled.

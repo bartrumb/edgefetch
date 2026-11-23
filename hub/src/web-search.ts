@@ -1216,7 +1216,15 @@ export async function executeSearchCall(params: {
 
     for (const list of freshExternal) {
       externalLists.push(list);
-      externalVia.push(list.provider);
+      const matchingFresh = countDomainFilteredHits(
+        [list],
+        effectiveIncludeDomains,
+        excludeDomains,
+        edgeMapSpec.sitePrefixes,
+      );
+      if (matchingFresh > 0 || !canEdgeMap) {
+        externalVia.push(list.provider);
+      }
     }
 
     if (cacheKey && env.META && countDomainFilteredHits(freshExternal, effectiveIncludeDomains, excludeDomains) > 0) {
@@ -1243,11 +1251,21 @@ export async function executeSearchCall(params: {
 
   for (const em of edgeMapLists) providerLists.push(em);
   for (const v of edgeMapVia) viaParts.push(v);
-  for (const ext of externalLists) providerLists.push(ext);
-  for (const v of externalVia) viaParts.push(v);
+  for (const ext of externalLists) {
+    providerLists.push(ext);
+  }
+  if (satisfiedExternalCount > 0) {
+    for (const v of externalVia) viaParts.push(v);
+  }
   for (const cl of collectionLists) {
     providerLists.push(cl);
     if (cl.items.length > 0) viaParts.push(cl.provider);
+  }
+  if (viaParts.length === 0) {
+    for (const v of externalVia) viaParts.push(v);
+    if (viaParts.length === 0) {
+      for (const ext of externalLists) viaParts.push(ext.provider);
+    }
   }
 
   const foreignLocaleSegRe =

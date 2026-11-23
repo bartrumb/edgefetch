@@ -123,7 +123,9 @@ func TestOriginScopedExtraHeadersViaCDPFetchAndWarmBrowserRecycle(t *testing.T) 
 							"sessionId": navSID,
 							"method":    "Fetch.requestPaused",
 							"params": map[string]any{
-								"requestId": "pause-doc",
+								"requestId":    "pause-doc",
+								"frameId":      "f-1",
+								"resourceType": "Document",
 								"request": map[string]any{
 									"url":     "https://app.example.com/dashboard",
 									"headers": map[string]string{"Accept": "text/html", "User-Agent": "EdgeFetchTest/1.0"},
@@ -134,7 +136,9 @@ func TestOriginScopedExtraHeadersViaCDPFetchAndWarmBrowserRecycle(t *testing.T) 
 							"sessionId": navSID,
 							"method":    "Fetch.requestPaused",
 							"params": map[string]any{
-								"requestId": "pause-cdn",
+								"requestId":    "pause-cdn",
+								"frameId":      "f-1",
+								"resourceType": "Script",
 								"request": map[string]any{
 									"url":     "https://cdn.thirdparty.example/sdk.js",
 									"headers": map[string]string{"Accept": "*/*"},
@@ -151,7 +155,9 @@ func TestOriginScopedExtraHeadersViaCDPFetchAndWarmBrowserRecycle(t *testing.T) 
 							"sessionId": navSID,
 							"method":    "Fetch.requestPaused",
 							"params": map[string]any{
-								"requestId": "pause-same-origin-xhr",
+								"requestId":    "pause-same-origin-xhr",
+								"frameId":      "f-1",
+								"resourceType": "XHR",
 								"request": map[string]any{
 									"url":     "https://APP.Example.com./api/v1/items",
 									"headers": map[string]string{"Accept": "application/json", "Referer": "https://app.example.com/dashboard"},
@@ -353,7 +359,9 @@ func TestOriginScopedHeadersStrictSchemeHostPortAndSandboxClassifier(t *testing.
 						"sessionId": navSID,
 						"method":    "Fetch.requestPaused",
 						"params": map[string]any{
-							"requestId": "same-port-doc",
+							"requestId":    "same-port-doc",
+							"frameId":      "f-p",
+							"resourceType": "Document",
 							"request": map[string]any{
 								"url":     "https://victim.test:50995/page",
 								"headers": map[string]string{"Accept": "text/html"},
@@ -371,7 +379,9 @@ func TestOriginScopedHeadersStrictSchemeHostPortAndSandboxClassifier(t *testing.
 							"sessionId": navSID,
 							"method":    "Fetch.requestPaused",
 							"params": map[string]any{
-								"requestId": sub.id,
+								"requestId":    sub.id,
+								"frameId":      "f-p",
+								"resourceType": "Fetch",
 								"request": map[string]any{
 									"url":     sub.url,
 									"headers": map[string]string{"Accept": "*/*", "Referer": "https://victim.test:50995/page"},
@@ -1164,7 +1174,9 @@ func TestR6InitiatorProvenHeaderScopingAndRedirectChainProvenance(t *testing.T) 
 					})
 					<-chFor("noref-from-foreign-iframe")
 
-					// 3. Commit main-f on https://victim.test via Page.frameNavigated; no-referrer fetch from main-f NOW gets headers!
+					// 3. Commit main-f on https://victim.test via Page.frameNavigated:
+					//    - Round 9 H8: no-Origin/no-Referer subresource on main-f MUST still be rejected (frameCommitted fallback deleted!),
+					//    - Proven Referer subresource on untainted main-f DOES receive bound headers!
 					send(map[string]any{
 						"sessionId": navSID,
 						"method":    "Page.frameNavigated",
@@ -1190,6 +1202,20 @@ func TestR6InitiatorProvenHeaderScopingAndRedirectChainProvenance(t *testing.T) 
 						},
 					})
 					<-chFor("noref-from-committed-bound-frame")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "proven-ref-from-committed-bound-frame",
+							"frameId":      "main-f",
+							"resourceType": "Fetch",
+							"request": map[string]any{
+								"url":     "https://victim.test/api/me-proven",
+								"headers": map[string]string{"Accept": "application/json", "Referer": "https://victim.test/app"},
+							},
+						},
+					})
+					<-chFor("proven-ref-from-committed-bound-frame")
 
 					// 4. Scenario 38: bound page loads 3P attacker image which 302-redirects back to victim.test/api/delete!
 					//    Hop 0 (attacker) did NOT receive headers, so Hop 1 (victim) MUST NOT receive headers even with Referer=victim.test!
@@ -1274,14 +1300,14 @@ func TestR6InitiatorProvenHeaderScopingAndRedirectChainProvenance(t *testing.T) 
 
 	mu.Lock()
 	defer mu.Unlock()
-	for _, mustAllow := range []string{"nav-hop0", "nav-hop1-sameorigin", "noref-from-committed-bound-frame"} {
+	for _, mustAllow := range []string{"nav-hop0", "nav-hop1-sameorigin", "proven-ref-from-committed-bound-frame"} {
 		if !hasOverride[mustAllow] {
 			t.Fatalf("expected %q to receive bound headers, got %+v", mustAllow, hasOverride)
 		}
 	}
-	for _, mustDeny := range []string{"noref-from-foreign-iframe", "3p-img-hop0", "3p-img-hop1-back-to-victim", "renderer-top-nav-no-referer"} {
+	for _, mustDeny := range []string{"noref-from-foreign-iframe", "noref-from-committed-bound-frame", "3p-img-hop0", "3p-img-hop1-back-to-victim", "renderer-top-nav-no-referer"} {
 		if hasOverride[mustDeny] {
-			t.Fatalf("SECURITY (M4): %q must NOT receive bound headers! got %+v", mustDeny, hasOverride)
+			t.Fatalf("SECURITY (M4/R9-H8): %q must NOT receive bound headers! got %+v", mustDeny, hasOverride)
 		}
 	}
 }
@@ -1533,21 +1559,36 @@ func TestR7NestedSubframeDocumentRenavigationHeaderLeakMockCDP(t *testing.T) {
 					})
 					<-chFor("grandchild-renav-noref-no-sfs")
 
-					// 4. Legitimate Referer-proven same-origin link click inside `child-f` MUST still receive headers!
+					// 4. Legitimate Referer-proven same-origin subresource fetch on untainted `main-f` receives headers,
+					//    while non-harness Document navigation (`nonharness-doc-click`) is denied and taints `main-f`!
 					send(map[string]any{
 						"sessionId": navSID,
 						"method":    "Fetch.requestPaused",
 						"params": map[string]any{
-							"requestId":    "legit-referer-doc-click",
+							"requestId":    "legit-referer-main-subresource",
+							"frameId":      "main-f",
+							"resourceType": "Fetch",
+							"request": map[string]any{
+								"url":     "https://example.com/api/profile",
+								"headers": map[string]string{"Referer": "https://example.com/start"},
+							},
+						},
+					})
+					<-chFor("legit-referer-main-subresource")
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "nonharness-doc-click",
 							"frameId":      "main-f",
 							"resourceType": "Document",
 							"request": map[string]any{
 								"url":     "https://example.com/next-page",
-								"headers": map[string]string{"Referer": "https://example.com/start", "Sec-Fetch-Site": "same-origin"},
+								"headers": map[string]string{"Referer": "https://example.com/start"},
 							},
 						},
 					})
-					<-chFor("legit-referer-doc-click")
+					<-chFor("nonharness-doc-click")
 
 					// 5. Page.frameDetached on `child-f` MUST evict `frameOrigins["child-f"]`, so any subsequent no-referrer subresource on reused frameId is denied!
 					send(map[string]any{
@@ -1600,7 +1641,7 @@ func TestR7NestedSubframeDocumentRenavigationHeaderLeakMockCDP(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	for _, wantTrue := range []string{"main-doc", "legit-referer-doc-click"} {
+	for _, wantTrue := range []string{"main-doc", "legit-referer-main-subresource"} {
 		if !hasOverride[wantTrue] {
 			t.Fatalf("expected %q to receive caller headers, got %+v", wantTrue, hasOverride)
 		}
@@ -1609,10 +1650,11 @@ func TestR7NestedSubframeDocumentRenavigationHeaderLeakMockCDP(t *testing.T) {
 		"grandchild-init-doc",
 		"grandchild-renav-noref-samesite",
 		"grandchild-renav-noref-no-sfs",
+		"nonharness-doc-click",
 		"post-detach-subresource",
 	} {
 		if hasOverride[wantFalse] {
-			t.Fatalf("SECURITY (R7 Medium #1): %q leaked caller headers! got %+v", wantFalse, hasOverride)
+			t.Fatalf("SECURITY (R7/R9-H8): %q leaked caller headers! got %+v", wantFalse, hasOverride)
 		}
 	}
 }
@@ -1687,8 +1729,9 @@ document.body.appendChild(gc);
 		switch r.URL.Path {
 		case "/start":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write([]byte(`<!doctype html><html><head><meta name="referrer" content="no-referrer"></head><body>
-<img src="/api/noref-img">
+			_, _ = w.Write([]byte(`<!doctype html><html><body>
+<img src="/api/noref-img" referrerpolicy="no-referrer">
+<img src="/api/proven-img">
 <iframe src="https://sub.example.com/embed"></iframe>
 <iframe src="` + crossPortURL + `/embed-port"></iframe>
 <a id="legit-link" href="/legit-next" referrerpolicy="origin">Next</a>
@@ -1706,15 +1749,18 @@ window.addEventListener('message', (e) => {
     checkReady();
   }
 });
-fetch('/api/noref-fetch').then(() => { subFetchDone = true; checkReady(); });
+Promise.all([
+  fetch('/api/noref-fetch', { referrerPolicy: 'no-referrer' }),
+  fetch('/api/proven-fetch')
+]).then(() => { subFetchDone = true; checkReady(); });
 </script></body></html>`))
 		case "/benign-child", "/secret-from-sub-renav", "/secret-from-sub-noreferrer-link", "/secret-from-port-renav":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write([]byte(`<!doctype html><html><body>child frame</body></html>`))
-		case "/api/noref-fetch":
+		case "/api/noref-fetch", "/api/proven-fetch":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"ok":true}`))
-		case "/api/noref-img":
+		case "/api/noref-img", "/api/proven-img":
 			w.Header().Set("Content-Type", "image/gif")
 			_, _ = w.Write([]byte("GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"))
 		case "/legit-next":
@@ -1801,7 +1847,7 @@ document.body.appendChild(gc2);
 		sawbyPath[h.Path] = append(sawbyPath[h.Path], h)
 	}
 
-	// 1. Assert attacker nested-iframe re-navigations NEVER received ANY bound caller header!
+	// 1. Assert nested-iframe re-navigations, no-referrer subresources, and non-harness Document clicks NEVER received ANY bound caller header (Round 9 H8)!
 	for _, forbiddenPath := range []string{
 		"/embed",
 		"/embed-port",
@@ -1809,6 +1855,9 @@ document.body.appendChild(gc2);
 		"/secret-from-sub-renav",
 		"/secret-from-sub-noreferrer-link",
 		"/secret-from-port-renav",
+		"/api/noref-fetch",
+		"/api/noref-img",
+		"/legit-next",
 	} {
 		recs := sawbyPath[forbiddenPath]
 		if len(recs) == 0 {
@@ -1816,17 +1865,16 @@ document.body.appendChild(gc2);
 		}
 		for _, hr := range recs {
 			if hr.Auth != "" || hr.Cookie != "" || hr.APIKey != "" {
-				t.Fatalf("SECURITY (R7 Medium #1 LIVE): caller secret header leaked on %s (host=%s): %+v", forbiddenPath, hr.Host, hr)
+				t.Fatalf("SECURITY (R7/R9-H8 LIVE): caller secret header leaked on %s (host=%s): %+v", forbiddenPath, hr.Host, hr)
 			}
 		}
 	}
 
-	// 2. Assert legitimate bound-origin requests (initial doc, no-referrer same-origin fetch & img, and Referer-proven link click) DID receive ALL 3 headers!
+	// 2. Assert legitimate harness initial Document and Referer-proven main-frame subresources DID receive ALL 3 headers!
 	for _, legitPath := range []string{
 		"/start",
-		"/api/noref-fetch",
-		"/api/noref-img",
-		"/legit-next",
+		"/api/proven-fetch",
+		"/api/proven-img",
 	} {
 		recs := sawbyPath[legitPath]
 		if len(recs) == 0 {

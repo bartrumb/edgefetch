@@ -177,9 +177,80 @@ function rawConfiguredIdString(raw: string): string {
   return raw.trim();
 }
 
+export function resolvePinnedGitHubOwnerId(env?: Pick<GitHubAuthEnv, 'GITHUB_OWNER_ID'>): string | null {
+  const raw = (env?.GITHUB_OWNER_ID ?? '').trim();
+  return GITHUB_NUMERIC_ID_RE.test(raw) ? raw : null;
+}
+
+export function isPinnedGitHubFounder(
+  user: Pick<HubUserRecord, 'userId' | 'githubId'>,
+  env?: Pick<GitHubAuthEnv, 'GITHUB_OWNER_ID'>,
+): boolean {
+  if (user.userId === 'owner') return true;
+  const pinnedOwnerId = resolvePinnedGitHubOwnerId(env);
+  if (!pinnedOwnerId) return false;
+  return String(user.githubId ?? '') === pinnedOwnerId && user.userId === `gh_${pinnedOwnerId}`;
+}
+
+const migratedMetaDbSet = new WeakSet<object>();
+
+export async function reconcileUpgradedFounderOwners(params: {
+  store?: Pick<OAuthStore, 'enforcePinnedFounderOwners' | 'listUsers' | 'upsertUser'>;
+  env?: Pick<GitHubAuthEnv, 'GITHUB_OWNER_ID'>;
+  metaDb?: D1Database;
+}): Promise<void> {
+  const pinnedOwnerId = resolvePinnedGitHubOwnerId(params.env);
+  if (!pinnedOwnerId) return;
+  if (params.store) {
+    if (typeof params.store.enforcePinnedFounderOwners === 'function') {
+      await params.store.enforcePinnedFounderOwners(pinnedOwnerId);
+    } else if (typeof params.store.listUsers === 'function' && typeof params.store.upsertUser === 'function') {
+      const users = await params.store.listUsers();
+      for (const u of users) {
+        if (
+          u.userId !== 'owner' &&
+          u.role === 'owner' &&
+          String(u.githubId ?? '') !== pinnedOwnerId &&
+          u.promotedByOwnerId !== pinnedOwnerId
+        ) {
+          await params.store.upsertUser({
+            ...u,
+            role: 'member',
+            promotedByOwnerId: undefined,
+            sessionEpoch: (u.sessionEpoch ?? 1) + 1,
+            mutationKind: 'demote_unapproved_owner',
+            reconcilePinnedOwnerId: pinnedOwnerId,
+          });
+        }
+      }
+    }
+  }
+  if (params.metaDb) {
+    const dbObj = params.metaDb as unknown as object;
+    if (!migratedMetaDbSet.has(dbObj)) {
+      await params.metaDb.prepare('ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT').run().catch(() => undefined);
+      migratedMetaDbSet.add(dbObj);
+    }
+    await params.metaDb
+      .prepare(
+        `UPDATE users
+            SET role = 'member',
+                promoted_by_owner_id = NULL,
+                session_epoch = COALESCE(session_epoch, 1) + 1
+          WHERE user_id != 'owner'
+            AND role = 'owner'
+            AND COALESCE(github_id, '') != ?1
+            AND COALESCE(promoted_by_owner_id, '') != ?1`,
+      )
+      .bind(pinnedOwnerId)
+      .run()
+      .catch(() => undefined);
+  }
+}
+
 export function isGitHubUserDeAllowlisted(user: HubUserRecord, env?: GitHubAuthEnv): boolean {
   if (!env || !isGitHubAuthConfigured(env)) return false;
-  if (user.role === 'owner' || user.userId === 'owner') return false;
+  if (isPinnedGitHubFounder(user, env)) return false;
   const mode = normalizeSignupMode(env.SIGNUP_MODE);
   if (mode === 'open') return false;
   const allowlist = parseGitHubAllowlist(env.GITHUB_ALLOWED_USERS);
@@ -497,7 +568,7 @@ export async function reverifyGitHubOrgAdmission(params: {
   now?: number;
 }): Promise<{ ok: boolean; matchedOrg?: string; reason?: string }> {
   const { user, env, store, now = Date.now() } = params;
-  if (user.role === 'owner' || user.userId === 'owner') return { ok: true };
+  if (isPinnedGitHubFounder(user, env)) return { ok: true };
   if (!env || !isGitHubAuthConfigured(env)) return { ok: true };
   if (normalizeSignupMode(env.SIGNUP_MODE) === 'open') return { ok: true };
 
@@ -512,15 +583,25 @@ export async function reverifyGitHubOrgAdmission(params: {
     return { ok: false, reason: 'not_org_admitted' };
   }
 
+  const initialEpoch = user.sessionEpoch ?? 1;
+  const initialRole = user.role;
+
   const revokeOrgAdmission = async (reason: string): Promise<{ ok: false; reason: string }> => {
-    const nextEpoch = (user.sessionEpoch ?? 1) + 1;
+    if (store?.getUser) {
+      const live = await store.getUser(user.userId);
+      if (!live || live.disabled || (live.sessionEpoch ?? 1) !== initialEpoch) {
+        return { ok: false, reason };
+      }
+    }
     await store?.upsertUser?.({
       ...user,
-      sessionEpoch: nextEpoch,
+      sessionEpoch: initialEpoch + 1,
       admittedVia: undefined,
       admittedOrg: undefined,
       encryptedGhToken: undefined,
       orgVerifiedAt: undefined,
+      mutationKind: 'org_revoke',
+      expectedSessionEpoch: initialEpoch,
     });
     return { ok: false, reason };
   };
@@ -589,19 +670,39 @@ export async function reverifyGitHubOrgAdmission(params: {
       return await revokeOrgAdmission('org_membership_revoked');
     }
 
-    await store?.upsertUser?.({
-      ...user,
-      admittedVia: 'org',
-      admittedOrg: matchedOrg,
-      orgVerifiedAt: now,
-    });
+    if (store?.getUser) {
+      const live = await store.getUser(user.userId);
+      if (!live || live.disabled || live.role !== initialRole || (live.sessionEpoch ?? 1) !== initialEpoch) {
+        return { ok: false, reason: 'user_state_changed' };
+      }
+    }
+    if (store?.upsertUser) {
+      const updated = await store.upsertUser({
+        ...user,
+        admittedVia: 'org',
+        admittedOrg: matchedOrg,
+        orgVerifiedAt: now,
+        mutationKind: 'org_reverify',
+        expectedSessionEpoch: initialEpoch,
+        expectedRole: initialRole,
+      });
+      if (
+        !updated ||
+        updated.mutationAborted ||
+        updated.disabled ||
+        updated.role !== initialRole ||
+        (updated.sessionEpoch ?? 1) !== initialEpoch
+      ) {
+        return { ok: false, reason: 'user_state_changed' };
+      }
+    }
     return { ok: true, matchedOrg };
   } catch {
     return await revokeOrgAdmission('github_orgs_fetch_failed');
   }
 }
 
-function renderGitHubAuthErrorHtml(serviceName: string, title: string, message: string): string {
+function renderGitHubAuthErrorHtml(serviceName = 'EdgeFetch Hub', title: string, message: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -641,6 +742,7 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
            github_login TEXT NOT NULL,
            avatar_url TEXT,
            role TEXT NOT NULL DEFAULT 'member',
+           promoted_by_owner_id TEXT,
            session_epoch INTEGER NOT NULL DEFAULT 1,
            disabled INTEGER NOT NULL DEFAULT 0,
            admitted_via TEXT,
@@ -652,6 +754,7 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
          )`,
       )
       .run();
+    await metaDb.prepare('ALTER TABLE users ADD COLUMN promoted_by_owner_id TEXT').run().catch(() => undefined);
     await metaDb.prepare('ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 1').run().catch(() => undefined);
     await metaDb.prepare('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0').run().catch(() => undefined);
     await metaDb.prepare('ALTER TABLE users ADD COLUMN admitted_via TEXT').run().catch(() => undefined);
@@ -661,15 +764,16 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
     await metaDb
       .prepare(
         `INSERT INTO users (
-           user_id, github_id, github_login, avatar_url, role, session_epoch, disabled,
+           user_id, github_id, github_login, avatar_url, role, promoted_by_owner_id, session_epoch, disabled,
            admitted_via, admitted_org, encrypted_gh_token, org_verified_at, created_at, last_login_at
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
            github_id = COALESCE(excluded.github_id, users.github_id),
            github_login = excluded.github_login,
            avatar_url = excluded.avatar_url,
            role = excluded.role,
+           promoted_by_owner_id = excluded.promoted_by_owner_id,
            session_epoch = excluded.session_epoch,
            disabled = excluded.disabled,
            admitted_via = excluded.admitted_via,
@@ -684,6 +788,7 @@ async function mirrorUserToMetaD1(metaDb: D1Database | undefined, user: HubUserR
         user.githubLogin ?? user.userId,
         user.avatarUrl ?? null,
         user.role,
+        user.role === 'owner' ? (user.promotedByOwnerId ?? null) : null,
         user.sessionEpoch ?? 1,
         user.disabled ? 1 : 0,
         user.admittedVia ?? null,
@@ -995,170 +1100,276 @@ export async function handleGitHubOAuthCallback(params: {
     );
   }
   const allowlist = parseGitHubAllowlist(env.GITHUB_ALLOWED_USERS);
+  const isPinnedFounder = Boolean(rawConfiguredOwnerId && ghIdStr === rawConfiguredOwnerId);
+
+  // H6: Reconcile upgraded databases — demote any `role = 'owner'` row not explicitly promoted by `GITHUB_OWNER_ID`,
+  // AND demote any legacy non-founder `role = 'owner'` row missing `github_id` or no longer admitted by `GITHUB_ALLOWED_USERS`.
+  await reconcileUpgradedFounderOwners({ store: oauthStore, env, metaDb });
 
   const existingUser = (await oauthStore.getUser?.(userId)) ?? null;
-  if (existingUser?.disabled) {
-    await onEvent?.({
-      level: 'warn',
-      category: 'oauth',
-      event: 'github_disabled_user_denied',
-      summary: `Blocked sign-in for removed/disabled GitHub user @${ghLogin} (${userId})`,
-      details: { userId, githubLogin: ghLogin },
-    });
-    return makeErrorResponse(
-      403,
-      'account_disabled',
-      'Account Removed',
-      `GitHub account @${ghLogin} has been disabled or removed from this Hub.`,
-    );
-  }
-
   const activeUsers = (await oauthStore.listUsers?.()) ?? [];
 
-  // Block recycled/squatted GitHub logins claiming an active Hub member/owner's handle with a different numeric `github_id`!
-  const collidingUser = activeUsers.find(
-    (u) => u.userId !== userId && !u.disabled && (u.githubLogin ?? '').toLowerCase() === loginLower,
-  );
-  if (collidingUser) {
-    await onEvent?.({
-      level: 'warn',
-      category: 'oauth',
-      event: 'github_login_collision_blocked',
-      summary: `Blocked recycled GitHub handle @${ghLogin} (${userId}) colliding with existing ${collidingUser.userId}`,
-      details: { userId, existingUserId: collidingUser.userId, githubLogin: ghLogin },
-    });
-    return makeErrorResponse(
-      403,
-      'login_collision',
-      'Account Handle Conflict',
-      `GitHub login @${ghLogin} is already bound to a different immutable GitHub numeric ID on this Hub.`,
-    );
-  }
-
-  // H5: NEVER auto-derive or persist a founder pin; ONLY explicit `GITHUB_OWNER_ID` grants founder `owner` status!
-  if (ownerLoginLower && loginLower === ownerLoginLower && rawConfiguredOwnerId && ghIdStr !== rawConfiguredOwnerId) {
-    await onEvent?.({
-      level: 'warn',
-      category: 'oauth',
-      event: 'github_owner_impersonation_blocked',
-      summary: `Blocked GitHub login @${ghLogin} (${userId}) from claiming owner handle configured for gh_${rawConfiguredOwnerId}`,
-      details: { userId, configuredOwnerGithubId: rawConfiguredOwnerId, githubLogin: ghLogin },
-    });
-    return makeErrorResponse(
-      403,
-      'owner_id_mismatch',
-      'Owner Identity Mismatch',
-      'This GitHub handle does not match the Hub’s configured immutable numeric GITHUB_OWNER_ID.',
-    );
+  for (const u of activeUsers) {
+    if (
+      u.userId !== 'owner' &&
+      u.role === 'owner' &&
+      !isPinnedGitHubFounder(u, env) &&
+      (!u.githubId || isGitHubUserDeAllowlisted({ ...u, role: 'member' }, env))
+    ) {
+      await oauthStore.upsertUser?.({
+        ...u,
+        role: 'member',
+        promotedByOwnerId: undefined,
+        sessionEpoch: (u.sessionEpoch ?? 1) + 1,
+        mutationKind: 'demote_unapproved_owner',
+        ...(rawConfiguredOwnerId ? { reconcilePinnedOwnerId: rawConfiguredOwnerId } : {}),
+      });
+    }
   }
 
   let allowed = false;
-  let assignedRole: UserRole = existingUser?.role === 'owner' ? 'owner' : 'member';
+  let assignedRole: UserRole = 'member';
   let admittedVia: UserAdmissionMethod | undefined;
   let admittedOrg: string | undefined;
   let encryptedGhToken: string | undefined;
   let orgVerifiedAt: number | undefined;
 
-  if (rawConfiguredOwnerId && ghIdStr === rawConfiguredOwnerId) {
+  if (isPinnedFounder) {
+    // H6: Evaluate `GITHUB_OWNER_ID` FIRST before disabled/login-collision checks!
+    // Evict & rename any squatter row holding the founder's `github_login` under a different `github_id`.
+    for (const sq of activeUsers) {
+      if (sq.userId !== userId && (sq.githubLogin ?? '').toLowerCase() === loginLower) {
+        const sqEpoch = (sq.sessionEpoch ?? 1) + 1;
+        await oauthStore.upsertUser?.({
+          ...sq,
+          disabled: true,
+          role: 'member',
+          promotedByOwnerId: undefined,
+          sessionEpoch: sqEpoch,
+          githubLogin: `__evicted_${sq.userId}`,
+          admittedVia: undefined,
+          admittedOrg: undefined,
+          encryptedGhToken: undefined,
+          orgVerifiedAt: undefined,
+          mutationKind: 'admin_disable',
+        });
+        const sqGrants = await Promise.resolve(oauthStore.listGrants(now, sq.userId)).catch(() => []);
+        for (const g of sqGrants) {
+          await Promise.resolve(oauthStore.revokeGrant(g.grantId, sq.userId)).catch(() => false);
+        }
+      }
+    }
+    if (metaDb) {
+      await metaDb
+        .prepare(
+          `UPDATE users
+              SET disabled = 1,
+                  role = 'member',
+                  promoted_by_owner_id = NULL,
+                  session_epoch = COALESCE(session_epoch, 1) + 1,
+                  github_login = '__evicted_' || user_id,
+                  github_id = CASE WHEN github_id = ?1 THEN NULL ELSE github_id END,
+                  admitted_via = NULL,
+                  admitted_org = NULL,
+                  encrypted_gh_token = NULL,
+                  org_verified_at = NULL
+            WHERE user_id != ?2 AND (LOWER(github_login) = ?3 OR github_id = ?1)`,
+        )
+        .bind(rawConfiguredOwnerId, userId, loginLower)
+        .run()
+        .catch(() => undefined);
+    }
     allowed = true;
     assignedRole = 'owner';
     admittedVia = 'owner';
-  } else if (allowlist.userIds.has(ghIdStr)) {
-    allowed = true;
-    admittedVia = 'allowlist_id';
-  } else if (allowlist.users.has(loginLower)) {
-    allowed = true;
-    admittedVia = 'allowlist_login';
-  } else if (allowlist.orgs.size > 0) {
-    try {
-      const orgsRes = await oauth.protectedResourceRequest(
-        accessToken,
-        'GET',
-        new URL('https://api.github.com/user/orgs?per_page=100'),
-        new Headers({
-          accept: 'application/vnd.github+json',
-          'user-agent': 'EdgeFetch-Hub/2.7',
-          'x-github-api-version': '2022-11-28',
-        }),
-        undefined,
-        { [oauth.customFetch]: (reqUrl, reqOpts) => customFetch(reqUrl, reqOpts as unknown as RequestInit) },
+  } else {
+    if (existingUser?.disabled) {
+      await onEvent?.({
+        level: 'warn',
+        category: 'oauth',
+        event: 'github_disabled_user_denied',
+        summary: `Blocked sign-in for removed/disabled GitHub user @${ghLogin} (${userId})`,
+        details: { userId, githubLogin: ghLogin },
+      });
+      return makeErrorResponse(
+        403,
+        'account_disabled',
+        'Account Removed',
+        `GitHub account @${ghLogin} has been disabled or removed from this Hub.`,
       );
-      if (orgsRes.status === 200) {
-        const orgsText = await orgsRes.text();
-        if (orgsText.length <= 262_144) {
-          const orgsList = JSON.parse(orgsText) as Array<{ login?: unknown }>;
-          if (Array.isArray(orgsList)) {
-            for (const o of orgsList) {
-              if (typeof o?.login === 'string') {
-                const candidateOrg = o.login.trim().toLowerCase();
-                if (allowlist.orgs.has(candidateOrg)) {
-                  allowed = true;
-                  admittedVia = 'org';
-                  admittedOrg = candidateOrg;
-                  encryptedGhToken = await sealGitHubUserAccessToken({
-                    secret: signingSecret,
-                    userId,
-                    accessToken,
-                  });
-                  orgVerifiedAt = now;
-                  break;
+    }
+
+    // Block recycled/squatted GitHub logins claiming an active Hub member/owner's handle with a different numeric `github_id`!
+    const collidingUser = activeUsers.find(
+      (u) => u.userId !== userId && !u.disabled && (u.githubLogin ?? '').toLowerCase() === loginLower,
+    );
+    if (collidingUser) {
+      await onEvent?.({
+        level: 'warn',
+        category: 'oauth',
+        event: 'github_login_collision_blocked',
+        summary: `Blocked recycled GitHub handle @${ghLogin} (${userId}) colliding with existing ${collidingUser.userId}`,
+        details: { userId, existingUserId: collidingUser.userId, githubLogin: ghLogin },
+      });
+      return makeErrorResponse(
+        403,
+        'login_collision',
+        'Account Handle Conflict',
+        `GitHub login @${ghLogin} is already bound to a different immutable GitHub numeric ID on this Hub.`,
+      );
+    }
+
+    // H5/H6: NEVER auto-derive or persist a founder pin; ONLY explicit `GITHUB_OWNER_ID` grants founder `owner` status!
+    if (ownerLoginLower && loginLower === ownerLoginLower && rawConfiguredOwnerId && ghIdStr !== rawConfiguredOwnerId) {
+      await onEvent?.({
+        level: 'warn',
+        category: 'oauth',
+        event: 'github_owner_impersonation_blocked',
+        summary: `Blocked GitHub login @${ghLogin} (${userId}) from claiming owner handle configured for gh_${rawConfiguredOwnerId}`,
+        details: { userId, configuredOwnerGithubId: rawConfiguredOwnerId, githubLogin: ghLogin },
+      });
+      return makeErrorResponse(
+        403,
+        'owner_id_mismatch',
+        'Owner Identity Mismatch',
+        'This GitHub handle does not match the Hub’s configured immutable numeric GITHUB_OWNER_ID.',
+      );
+    }
+
+    if (allowlist.userIds.has(ghIdStr)) {
+      allowed = true;
+      admittedVia = 'allowlist_id';
+    } else if (allowlist.users.has(loginLower)) {
+      allowed = true;
+      admittedVia = 'allowlist_login';
+    } else if (allowlist.orgs.size > 0) {
+      try {
+        const orgsRes = await oauth.protectedResourceRequest(
+          accessToken,
+          'GET',
+          new URL('https://api.github.com/user/orgs?per_page=100'),
+          new Headers({
+            accept: 'application/vnd.github+json',
+            'user-agent': 'EdgeFetch-Hub/2.7',
+            'x-github-api-version': '2022-11-28',
+          }),
+          undefined,
+          { [oauth.customFetch]: (reqUrl, reqOpts) => customFetch(reqUrl, reqOpts as unknown as RequestInit) },
+        );
+        if (orgsRes.status === 200) {
+          const orgsText = await orgsRes.text();
+          if (orgsText.length <= 262_144) {
+            const orgsList = JSON.parse(orgsText) as Array<{ login?: unknown }>;
+            if (Array.isArray(orgsList)) {
+              for (const o of orgsList) {
+                if (typeof o?.login === 'string') {
+                  const candidateOrg = o.login.trim().toLowerCase();
+                  if (allowlist.orgs.has(candidateOrg)) {
+                    allowed = true;
+                    admittedVia = 'org';
+                    admittedOrg = candidateOrg;
+                    encryptedGhToken = await sealGitHubUserAccessToken({
+                      secret: signingSecret,
+                      userId,
+                      accessToken,
+                    });
+                    orgVerifiedAt = now;
+                    break;
+                  }
                 }
               }
             }
           }
         }
+      } catch {
+        allowed = false;
       }
-    } catch {
-      allowed = false;
     }
-  }
 
-  if (!allowed && existingUser?.role === 'owner') {
-    allowed = true;
-    assignedRole = 'owner';
-    admittedVia = existingUser.admittedVia ?? 'owner';
-  }
+    // H6: NO `existingUser?.role === 'owner'` bypass! Promoted secondary owners MUST pass `GITHUB_ALLOWED_USERS` / `@org` / `open`.
+    if (!allowed && signupMode === 'open') {
+      allowed = true;
+      admittedVia = 'open';
+    }
 
-  if (!allowed && signupMode === 'open') {
-    allowed = true;
-    admittedVia = 'open';
-  }
-
-  if (!allowed) {
-    await onEvent?.({
-      level: 'warn',
-      category: 'oauth',
-      event: 'github_signup_denied',
-      summary: `Denied GitHub sign-in for @${ghLogin} (${userId}) under SIGNUP_MODE=${signupMode}`,
-      details: { userId, githubLogin: ghLogin, signupMode },
-    });
-    return makeErrorResponse(
-      403,
-      'signup_denied',
-      'Account Not Authorized',
-      `GitHub account @${ghLogin} is not authorized on this Hub (SIGNUP_MODE=${signupMode}). Ask the Hub owner to add your login to GITHUB_ALLOWED_USERS.`,
-    );
+    if (!allowed) {
+      await onEvent?.({
+        level: 'warn',
+        category: 'oauth',
+        event: 'github_signup_denied',
+        summary: `Denied GitHub sign-in for @${ghLogin} (${userId}) under SIGNUP_MODE=${signupMode}`,
+        details: { userId, githubLogin: ghLogin, signupMode },
+      });
+      return makeErrorResponse(
+        403,
+        'signup_denied',
+        'Account Not Authorized',
+        `GitHub account @${ghLogin} is not authorized on this Hub (SIGNUP_MODE=${signupMode}). Ask the Hub owner to add your login to GITHUB_ALLOWED_USERS.`,
+      );
+    }
   }
 
   await oauthStore.clearAuthFailures(`gh_cb:${clientIp}`);
 
-  const sessionEpoch = existingUser?.sessionEpoch ?? 1;
+  // H5: Re-read current live row AFTER all awaits right before writing so a concurrent DELETE, `disabled = 1`,
+  // `role` demotion, or `session_epoch` bump can NEVER be overwritten!
+  const latestUser = (await oauthStore.getUser?.(userId)) ?? null;
+  if (!isPinnedFounder) {
+    if ((existingUser !== null && !latestUser) || latestUser?.disabled) {
+      return makeErrorResponse(
+        403,
+        'account_disabled',
+        'Account Disabled',
+        `GitHub account @${ghLogin} has been disabled or removed from this Hub.`,
+      );
+    }
+    assignedRole =
+      latestUser?.role === 'owner' &&
+      (!rawConfiguredOwnerId || latestUser.promotedByOwnerId === rawConfiguredOwnerId)
+        ? 'owner'
+        : 'member';
+  }
+
+  const sessionEpoch = isPinnedFounder
+    ? latestUser?.disabled
+      ? (latestUser.sessionEpoch ?? 1) + 1
+      : (latestUser?.sessionEpoch ?? 1)
+    : (latestUser?.sessionEpoch ?? 1);
   const userRecord: HubUserRecord = {
     userId,
-    githubId: ghIdStr,
+    githubId: isPinnedFounder ? rawConfiguredOwnerId : ghIdStr,
     githubLogin: ghLogin,
     ...(ghAvatarUrl ? { avatarUrl: ghAvatarUrl } : {}),
-    role: assignedRole,
+    role: isPinnedFounder ? 'owner' : assignedRole,
+    ...(isPinnedFounder
+      ? { promotedByOwnerId: rawConfiguredOwnerId }
+      : assignedRole === 'owner' && latestUser?.promotedByOwnerId
+        ? { promotedByOwnerId: latestUser.promotedByOwnerId }
+        : {}),
     sessionEpoch,
     disabled: false,
     ...(admittedVia ? { admittedVia } : {}),
     ...(admittedOrg ? { admittedOrg } : {}),
     ...(encryptedGhToken ? { encryptedGhToken } : {}),
     ...(orgVerifiedAt !== undefined ? { orgVerifiedAt } : {}),
-    createdAt: existingUser?.createdAt ?? now,
+    createdAt: latestUser?.createdAt ?? existingUser?.createdAt ?? now,
     lastLoginAt: now,
+    mutationKind: isPinnedFounder
+      ? 'founder_heal'
+      : existingUser !== null
+        ? 'oauth_login_existing'
+        : 'oauth_login_new',
+    ...(rawConfiguredOwnerId ? { reconcilePinnedOwnerId: rawConfiguredOwnerId } : {}),
   };
   const savedUser = (await oauthStore.upsertUser?.(userRecord)) ?? userRecord;
+  if (!isPinnedFounder && (savedUser.mutationAborted || savedUser.disabled)) {
+    return makeErrorResponse(
+      403,
+      'account_disabled',
+      'Account Disabled',
+      `GitHub account @${ghLogin} has been disabled or removed from this Hub.`,
+    );
+  }
   await mirrorUserToMetaD1(metaDb, savedUser);
 
   const minted = await mintSessionJwt({

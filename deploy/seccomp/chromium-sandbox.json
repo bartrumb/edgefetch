@@ -63,7 +63,9 @@
         "request_key",
         "setdomainname",
         "sethostname",
+        "setns",
         "settimeofday",
+        "socketcall",
         "swapoff",
         "swapon",
         "syslog",
@@ -328,8 +330,6 @@
         "signalfd4",
         "sigprocmask",
         "sigreturn",
-        "socket",
-        "socketcall",
         "socketpair",
         "splice",
         "stat",
@@ -407,12 +407,199 @@
       "action": "SCMP_ACT_ALLOW"
     },
     {
-      "comment": "Chromium Linux namespace sandbox (namespace_sandbox.cc: CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET + ChrootToSafeEmptyDir; no mount/pivot_root)",
+      "comment": "Return ENOSYS for clone3 so glibc/musl cleanly fall back to clone(2)",
+      "names": [
+        "clone3"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38
+    },
+    {
+      "comment": "Explicitly deny raw/packet/crypto sockets (AF_PACKET=17, AF_KEY=15, AF_ALG=38, AF_VSOCK=40, SOCK_RAW=3) to sever CLONE_NEWUSER+CAP_NET_RAW kernel attack surface",
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        {
+          "index": 0,
+          "value": 17,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        {
+          "index": 0,
+          "value": 38,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "comment": "Allow socket(2) strictly for AF_UNIX(1), AF_INET(2), AF_INET6(10) with non-raw SOCK_STREAM(1)/SOCK_DGRAM(2)/SOCK_SEQPACKET(5), plus AF_NETLINK(16) NETLINK_ROUTE(0)",
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 1,
+          "op": "SCMP_CMP_EQ"
+        },
+        {
+          "index": 1,
+          "value": 255,
+          "valueTwo": 1,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 1,
+          "op": "SCMP_CMP_EQ"
+        },
+        {
+          "index": 1,
+          "value": 255,
+          "valueTwo": 2,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 1,
+          "op": "SCMP_CMP_EQ"
+        },
+        {
+          "index": 1,
+          "value": 255,
+          "valueTwo": 5,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 2,
+          "op": "SCMP_CMP_EQ"
+        },
+        {
+          "index": 1,
+          "value": 255,
+          "valueTwo": 1,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 2,
+          "op": "SCMP_CMP_EQ"
+        },
+        {
+          "index": 1,
+          "value": 255,
+          "valueTwo": 2,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 10,
+          "op": "SCMP_CMP_EQ"
+        },
+        {
+          "index": 1,
+          "value": 255,
+          "valueTwo": 1,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 10,
+          "op": "SCMP_CMP_EQ"
+        },
+        {
+          "index": 1,
+          "value": 255,
+          "valueTwo": 2,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 16,
+          "op": "SCMP_CMP_EQ"
+        },
+        {
+          "index": 2,
+          "value": 0,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "comment": "Chromium Linux namespace sandbox (namespace_sandbox.cc: CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET + ChrootToSafeEmptyDir; no setns/clone3/mount/pivot_root)",
       "names": [
         "chroot",
         "clone",
-        "clone3",
-        "setns",
         "unshare"
       ],
       "action": "SCMP_ACT_ALLOW"

@@ -1561,8 +1561,9 @@ func resolveManifestTwinOnParsedURL(adapter *DeclarativeAdapterManifest, u *url.
 }
 
 // ValidateRedirectTarget verifies that a twin HTTP redirect destination remains a safe public HTTPS URL
-// and does not escape the initial FetchURL host/registrable domain or declared manifest domains (nor cross
-// tenant subdomains on wildcard/universal adapters).
+// on the exact initial FetchURL host or an explicitly declared non-wildcard manifest domain (matching
+// TypeScript `isTrustedTwinRedirectUrl` 1:1 without following redirects to unclaimed same-registrable subdomains
+// or across multi-tenant wildcards).
 func (m *DeclarativeTwinMatch) ValidateRedirectTarget(finalURL string) bool {
 	if m == nil {
 		return false
@@ -1590,11 +1591,6 @@ func (m *DeclarativeTwinMatch) ValidateRedirectTarget(finalURL string) bool {
 	if IsPublicOrPrivateSuffix(finalHost) || HasPrivateSharedHostingSuffix(finalHost) {
 		return false
 	}
-	normInit := strings.TrimPrefix(initHost, "www.")
-	normFinal := strings.TrimPrefix(finalHost, "www.")
-	if normInit == normFinal {
-		return true
-	}
 	hasWildcard := m.universalEngine
 	for _, d := range m.domains {
 		if strings.Contains(d, "*") {
@@ -1611,9 +1607,7 @@ func (m *DeclarativeTwinMatch) ValidateRedirectTarget(finalURL string) bool {
 			return true
 		}
 	}
-	initReg := GetRegistrableDomain(initHost)
-	finalReg := GetRegistrableDomain(finalHost)
-	return initReg != "" && initReg == finalReg
+	return false
 }
 
 func buildResolvedTwinURLGo(route DeclarativeRouteSpec, u *url.URL, host string, params map[string]string) (string, bool) {

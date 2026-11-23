@@ -50,6 +50,56 @@ export interface DeclarativeCatalogConfig {
 const DEFAULT_MAX_IMAGES_PER_PRODUCT = 250;
 const DEFAULT_MAX_VARIANTS_PER_PRODUCT = 250;
 
+/**
+ * Sanitizes untrusted e-commerce text fields (`title`, `vendor`, `productType`, `tags`, `options`, `variants[].title`, `sku`)
+ * so merchant/user-supplied JSON or HTML metadata can never inject raw HTML (`<script>`), Markdown phishing links (`[x](...)`),
+ * multi-line block breakouts, or ATX headings (`# Heading` / `\n# Heading`).
+ */
+export function sanitizeCommerceField(raw: unknown, maxLen = 400): string {
+  if (typeof raw !== 'string') return '';
+  let s = raw.includes('<') && /<[a-z!/]/i.test(raw) ? stripTagsInline(raw) : raw;
+  s = s
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(
+      /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E01EF}]/gu,
+      '',
+    )
+    .replace(/[\r\n\t\u0085\u2028\u2029]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  if (!s) return '';
+  if (s.length > maxLen) s = s.slice(0, maxLen).trim();
+  // Escape raw `<` -> `&lt;` so residual/unclosed `<img...` / `<script...` never renders as HTML
+  if (s.includes('<')) {
+    s = s.replace(/</g, '&lt;');
+  }
+  // Neutralize `[` / `]` / `](` / `]:` phishing link breakouts across all Markdown dialects (including regex link matchers)
+  if (s.includes('[') || s.includes(']')) {
+    s = s
+      .replace(/\]\s*\(/g, '\\] \\(')
+      .replace(/\]\s*\[/g, '\\] \\[')
+      .replace(/\]\s*:/g, '\\]:')
+      .replace(/(?<!\\)\[/g, '\\[')
+      .replace(/(?<!\\)\]/g, '\\]');
+  }
+  // Neutralize leading ATX heading `#` or blockquote `>` markers (and `#` segments embedded via former newlines)
+  if (s.startsWith('#')) {
+    s = `\\${s}`;
+  } else if (s.startsWith('>')) {
+    s = `\\${s}`;
+  }
+  if (s.includes(' #')) {
+    s = s.replace(/ (#{1,6})(?=\s|$)/g, ' \\$1');
+  }
+  return s;
+}
+
+function sanitizeCommerceSku(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const clean = sanitizeCommerceField(raw, 160).replace(/[`|]/g, '');
+  return clean || null;
+}
+
 function readHeaderCaseInsensitive(
   headers: Record<string, string | undefined> | Headers | undefined,
   target: string,
@@ -165,7 +215,7 @@ function parseShopifyMoney(raw: unknown, isAjaxJs: boolean): number | null {
 
 function cleanVariantTitle(rawTitle: unknown): string | null {
   if (typeof rawTitle !== 'string') return null;
-  const cleaned = rawTitle.replace(/\s+/g, ' ').trim();
+  const cleaned = sanitizeCommerceField(rawTitle, 240);
   if (!cleaned || /^default(?:\s+title)?$/i.test(cleaned)) return null;
   return cleaned;
 }
@@ -182,7 +232,7 @@ export function normalizeShopifyProductRecord(
     maxVariants?: number;
   },
 ): CatalogRecord | null {
-  const title = typeof rawProd.title === 'string' ? rawProd.title.replace(/\s+/g, ' ').trim() : '';
+  const title = typeof rawProd.title === 'string' ? sanitizeCommerceField(rawProd.title, 400) : '';
   if (!title) return null;
 
   const maxImages = Math.min(250, Math.max(1, opts?.maxImages ?? DEFAULT_MAX_IMAGES_PER_PRODUCT));
@@ -205,21 +255,23 @@ export function normalizeShopifyProductRecord(
   const productId = String(rawProd.id ?? '');
   const handle = typeof rawProd.handle === 'string' ? rawProd.handle.trim() : '';
   const url = handle ? `${cleanOrigin}/products/${encodeURIComponent(handle)}` : cleanOrigin;
-  const vendor = typeof rawProd.vendor === 'string' && rawProd.vendor.trim() ? rawProd.vendor.trim() : null;
+  const cleanVendor = typeof rawProd.vendor === 'string' ? sanitizeCommerceField(rawProd.vendor, 200) : '';
+  const vendor = cleanVendor || null;
   const rawType =
     typeof rawProd.product_type === 'string'
       ? rawProd.product_type
       : typeof rawProd.type === 'string'
         ? rawProd.type
         : '';
-  const productType = rawType.trim() ? rawType.trim() : null;
+  const cleanProductType = sanitizeCommerceField(rawType, 200);
+  const productType = cleanProductType || null;
 
   const tags: string[] = Array.isArray(rawProd.tags)
-    ? rawProd.tags.map((t) => String(t ?? '').trim()).filter(Boolean)
+    ? rawProd.tags.map((t) => sanitizeCommerceField(String(t ?? ''), 120)).filter(Boolean)
     : typeof rawProd.tags === 'string'
       ? rawProd.tags
           .split(',')
-          .map((t) => t.trim())
+          .map((t) => sanitizeCommerceField(t, 120))
           .filter(Boolean)
       : [];
 
@@ -263,13 +315,18 @@ export function normalizeShopifyProductRecord(
   const options: Array<{ name: string; values: string[] }> = [];
   if (Array.isArray(rawProd.options)) {
     for (const opt of rawProd.options) {
-      if (typeof opt === 'string' && opt.trim() && !/^title$/i.test(opt.trim())) {
-        options.push({ name: opt.trim(), values: [] });
+      if (typeof opt === 'string') {
+        const cleanOpt = sanitizeCommerceField(opt, 120);
+        if (cleanOpt && !/^title$/i.test(cleanOpt)) {
+          options.push({ name: cleanOpt, values: [] });
+        }
       } else if (opt && typeof opt === 'object') {
         const oo = opt as Record<string, unknown>;
-        const oName = typeof oo.name === 'string' ? oo.name.trim() : '';
+        const oName = typeof oo.name === 'string' ? sanitizeCommerceField(oo.name, 120) : '';
         const vals = Array.isArray(oo.values)
-          ? oo.values.map((v) => String(v ?? '').trim()).filter((v) => Boolean(v) && !/^default title$/i.test(v))
+          ? oo.values
+              .map((v) => sanitizeCommerceField(String(v ?? ''), 120))
+              .filter((v) => Boolean(v) && !/^default title$/i.test(v))
           : [];
         if (oName && !(oName.toLowerCase() === 'title' && vals.length === 0)) {
           options.push({ name: oName, values: vals });
@@ -288,14 +345,16 @@ export function normalizeShopifyProductRecord(
     const ajaxV = variantId && opts?.ajaxVariantsById ? opts.ajaxVariantsById.get(variantId) : undefined;
     const merged = ajaxV ? { ...ajaxV, ...rv, available: rv.available ?? ajaxV.available } : rv;
 
-    const sku = typeof merged.sku === 'string' && merged.sku.trim() ? merged.sku.trim() : null;
-    const barcode = typeof merged.barcode === 'string' && merged.barcode.trim() ? merged.barcode.trim() : null;
+    const sku = sanitizeCommerceSku(merged.sku);
+    const barcode = sanitizeCommerceSku(merged.barcode);
     const vTitle = cleanVariantTitle(merged.title);
 
     const optValues = Array.isArray(merged.options)
-      ? merged.options.map((o) => String(o ?? '').trim()).filter((o) => Boolean(o) && !/^default title$/i.test(o))
+      ? merged.options
+          .map((o) => sanitizeCommerceField(String(o ?? ''), 120))
+          .filter((o) => Boolean(o) && !/^default title$/i.test(o))
       : [merged.option1, merged.option2, merged.option3]
-          .map((o) => (typeof o === 'string' ? o.trim() : ''))
+          .map((o) => (typeof o === 'string' ? sanitizeCommerceField(o, 120) : ''))
           .filter((o) => Boolean(o) && !/^default title$/i.test(o));
 
     const price = parseShopifyMoney(merged.price, isAjaxJs);
@@ -668,11 +727,16 @@ export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId =
   const prodLd = ldObjects.find((o) => /Product|ProductGroup/i.test(String(o['@type'] ?? '')));
   if (!prodLd || typeof prodLd.name !== 'string') return null;
 
-  const title = prodLd.name.trim();
+  const title = sanitizeCommerceField(prodLd.name, 400);
+  if (!title) return null;
   const brandObj = prodLd.brand as Record<string, unknown> | string | undefined;
   const brand =
-    typeof brandObj === 'string' ? brandObj.trim() : typeof brandObj?.name === 'string' ? brandObj.name.trim() : '';
-  const desc = typeof prodLd.description === 'string' ? stripTagsInline(prodLd.description) : '';
+    typeof brandObj === 'string'
+      ? sanitizeCommerceField(brandObj, 200)
+      : typeof brandObj?.name === 'string'
+        ? sanitizeCommerceField(brandObj.name, 200)
+        : '';
+  const desc = typeof prodLd.description === 'string' ? sanitizeCommerceField(stripTagsInline(prodLd.description), 1200) : '';
   const rawOffers = prodLd.hasVariant ?? prodLd.offers;
   const offersList = Array.isArray(rawOffers)
     ? (rawOffers as Array<Record<string, unknown>>)
@@ -693,11 +757,11 @@ export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId =
         ? (off.offers[0] as Record<string, unknown>)
         : ((off.offers as Record<string, unknown> | undefined) ?? off);
     const rawVName = typeof off.name === 'string' ? off.name.trim() : '';
-    const vTitle = rawVName && rawVName !== title ? cleanVariantTitle(rawVName) : null;
+    const vTitle = rawVName && sanitizeCommerceField(rawVName, 240) !== title ? cleanVariantTitle(rawVName) : null;
     const skuRaw = off.sku ?? subOffer.sku;
-    const sku = typeof skuRaw === 'string' && skuRaw.trim() ? skuRaw.trim() : null;
+    const sku = sanitizeCommerceSku(skuRaw);
     const barcodeRaw = off.gtin13 ?? off.gtin12 ?? off.gtin ?? subOffer.gtin13 ?? subOffer.gtin12;
-    const barcode = typeof barcodeRaw === 'string' && barcodeRaw.trim() ? barcodeRaw.trim() : null;
+    const barcode = sanitizeCommerceSku(barcodeRaw);
     const rawPrice = subOffer.price ?? subOffer.lowPrice;
     const priceNum =
       typeof rawPrice === 'number'
@@ -759,7 +823,7 @@ export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId =
     url: url.toString(),
     title,
     vendor: brand || null,
-    productType: typeof prodLd.category === 'string' ? prodLd.category : null,
+    productType: typeof prodLd.category === 'string' ? sanitizeCommerceField(prodLd.category, 200) || null : null,
     tags: [],
     descriptionText: desc,
     publishedAt: null,
@@ -771,7 +835,8 @@ export function extractShopifyProductHtml(ctx: HtmlExtractContext, extractorId =
 
   const bullets: string[] = [];
   if (brand) bullets.push(`- **Brand**: ${brand}`);
-  if (typeof prodLd.sku === 'string' && prodLd.sku) bullets.push(`- **SKU**: \`${prodLd.sku}\``);
+  const cleanTopSku = sanitizeCommerceSku(prodLd.sku);
+  if (cleanTopSku) bullets.push(`- **SKU**: \`${cleanTopSku}\``);
 
   const sections = [`# ${title}`];
   if (bullets.length > 0) sections.push(bullets.join('\n'));
@@ -844,7 +909,7 @@ export function normalizeWooCommerceProductRecord(
   originStr: string,
   opts?: { fields?: 'full' | 'lean'; maxImages?: number; maxVariants?: number },
 ): CatalogRecord | null {
-  const title = stripTagsInline(String(rawProd.name ?? rawProd.title ?? ''));
+  const title = sanitizeCommerceField(String(rawProd.name ?? rawProd.title ?? ''), 400);
   if (!title) return null;
 
   const maxImages = Math.min(250, Math.max(1, opts?.maxImages ?? DEFAULT_MAX_IMAGES_PER_PRODUCT));
@@ -881,20 +946,22 @@ export function normalizeWooCommerceProductRecord(
 
   const brands = Array.isArray(rawProd.brands) ? (rawProd.brands as Array<Record<string, unknown>>) : [];
   const vendor =
-    brands[0] && typeof brands[0].name === 'string' && brands[0].name.trim() ? stripTagsInline(brands[0].name) : null;
+    brands[0] && typeof brands[0].name === 'string' && brands[0].name.trim()
+      ? sanitizeCommerceField(brands[0].name, 200) || null
+      : null;
 
   const categories = Array.isArray(rawProd.categories) ? (rawProd.categories as Array<Record<string, unknown>>) : [];
   const productType =
     categories[0] && typeof categories[0].name === 'string'
-      ? stripTagsInline(categories[0].name)
+      ? sanitizeCommerceField(categories[0].name, 200) || null
       : typeof rawProd.type === 'string'
-        ? rawProd.type
+        ? sanitizeCommerceField(rawProd.type, 200) || null
         : null;
 
   const tags = Array.isArray(rawProd.tags)
     ? (rawProd.tags as Array<Record<string, unknown>>)
         .slice(0, 100)
-        .map((t) => stripTagsInline(String(t?.name ?? '')))
+        .map((t) => sanitizeCommerceField(String(t?.name ?? ''), 120))
         .filter(Boolean)
     : [];
 
@@ -914,18 +981,18 @@ export function normalizeWooCommerceProductRecord(
   const options: Array<{ name: string; values: string[] }> = [];
   if (Array.isArray(rawProd.attributes)) {
     for (const attr of (rawProd.attributes as Array<Record<string, unknown>>).slice(0, 50)) {
-      const aName = stripTagsInline(String(attr?.name ?? ''));
+      const aName = sanitizeCommerceField(String(attr?.name ?? ''), 120);
       const terms = Array.isArray(attr?.terms)
         ? (attr.terms as Array<Record<string, unknown>>)
             .slice(0, 100)
-            .map((t) => stripTagsInline(String(t?.name ?? '')))
+            .map((t) => sanitizeCommerceField(String(t?.name ?? ''), 120))
             .filter(Boolean)
         : [];
       if (aName) options.push({ name: aName, values: terms });
     }
   }
 
-  const topSku = typeof rawProd.sku === 'string' && rawProd.sku.trim() ? rawProd.sku.trim() : null;
+  const topSku = sanitizeCommerceSku(rawProd.sku);
   const topAvailable = typeof rawProd.is_in_stock === 'boolean' ? rawProd.is_in_stock : null;
   const rawVariations = Array.isArray(rawProd.variations)
     ? (rawProd.variations as Array<Record<string, unknown>>).slice(0, maxVariants)
@@ -937,12 +1004,12 @@ export function normalizeWooCommerceProductRecord(
           const vId = String(vr.id ?? '');
           const vAttrs = Array.isArray(vr.attributes)
             ? (vr.attributes as Array<Record<string, unknown>>)
-                .map((a) => String(a?.value ?? '').trim())
+                .map((a) => sanitizeCommerceField(String(a?.value ?? ''), 120))
                 .filter(Boolean)
             : [];
           return {
             variantId: vId,
-            sku: typeof vr.sku === 'string' && vr.sku.trim() ? vr.sku.trim() : topSku,
+            sku: sanitizeCommerceSku(vr.sku) ?? topSku,
             title: vAttrs.length > 0 ? vAttrs.join(' / ') : null,
             options: vAttrs,
             price: basePrice,
@@ -1157,14 +1224,16 @@ export function extractWooCommerceProductHtml(
   const prodLd = ldObjects.find((o) => /Product/i.test(String(o['@type'] ?? '')));
   const clean = stripScriptsAndStyles(rawHtml);
 
-  const title =
+  const rawTitle =
     (typeof prodLd?.name === 'string' ? prodLd.name.trim() : '') ||
     stripTagsInline(findElementInnerLinear(clean, 'h1', (a) => attrHasTokenLinear(a, 'class', 'product_title')) ?? '');
+  const title = sanitizeCommerceField(rawTitle, 400);
   if (!title) return null;
 
-  const sku =
+  const rawSku =
     (typeof prodLd?.sku === 'string' && prodLd.sku.trim() ? prodLd.sku.trim() : '') ||
     stripTagsInline(findElementInnerLinear(clean, 'span', (a) => attrHasTokenLinear(a, 'class', 'sku')) ?? '');
+  const sku = sanitizeCommerceSku(rawSku) ?? '';
 
   const rawOffers = prodLd?.offers;
   const offer = Array.isArray(rawOffers)
@@ -1181,7 +1250,7 @@ export function extractWooCommerceProductHtml(
   const currency = /^[A-Z]{3}$/.test(curRaw) ? curRaw : null;
   const availRaw = String(offer?.availability ?? '');
   const available = /InStock/i.test(availRaw) ? true : /OutOfStock/i.test(availRaw) ? false : null;
-  const desc = typeof prodLd?.description === 'string' ? stripTagsInline(prodLd.description) : '';
+  const desc = typeof prodLd?.description === 'string' ? sanitizeCommerceField(stripTagsInline(prodLd.description), 1200) : '';
 
   if (price === null && !sku && !desc) return null;
 

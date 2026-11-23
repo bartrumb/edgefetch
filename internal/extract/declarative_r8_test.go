@@ -210,10 +210,21 @@ func TestR8ValidateDeclarativeManifestsOverlapHostingCatalogAndRedirects(t *test
 		t.Fatal("expected rubygems twin resolution")
 	}
 	if !rgTwin.ValidateRedirectTarget("https://www.rubygems.org/api/v1/gems/rails.json") {
-		t.Fatal("expected www.rubygems.org redirect to pass")
+		t.Fatal("expected declared domain www.rubygems.org redirect to pass")
+	}
+	if rgTwin.ValidateRedirectTarget("https://unclaimed.rubygems.org/api/v1/gems/rails.json") {
+		t.Fatal("SECURITY: redirect to unclaimed subdomain on same registrable domain must be rejected (TS parity)")
 	}
 	if rgTwin.ValidateRedirectTarget("https://evil.workers.dev/rails.json") {
 		t.Fatal("SECURITY: redirect to shared-hosting workers.dev must be rejected")
+	}
+
+	hfTwin, ok := ResolveDeclarativeTwin("https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct")
+	if !ok || hfTwin == nil {
+		t.Fatal("expected huggingface twin resolution")
+	}
+	if hfTwin.ValidateRedirectTarget("https://spaces.huggingface.co/steal.json") {
+		t.Fatal("SECURITY: redirect to unclaimed spaces.huggingface.co subdomain must be rejected (TS parity)")
 	}
 }
 
@@ -228,13 +239,15 @@ func TestR8HardenedChromiumSeccompProfileInvariants(t *testing.T) {
 		Syscalls      []struct {
 			Names    []string `json:"names"`
 			Action   string   `json:"action"`
+			ErrnoRet *int     `json:"errnoRet"`
 			Includes struct {
 				Arches []string `json:"arches"`
 			} `json:"includes"`
 			Args []struct {
-				Index int    `json:"index"`
-				Value uint64 `json:"value"`
-				Op    string `json:"op"`
+				Index    int    `json:"index"`
+				Value    uint64 `json:"value"`
+				ValueTwo uint64 `json:"valueTwo"`
+				Op       string `json:"op"`
 			} `json:"args"`
 		} `json:"syscalls"`
 	}
@@ -249,14 +262,27 @@ func TestR8HardenedChromiumSeccompProfileInvariants(t *testing.T) {
 	}
 
 	allowed := make(map[string]bool)
+	unconditionalAllow := make(map[string]bool)
 	archGated := make(map[string][]string)
 	argGated := make(map[string]int)
+	sawClone3Enosys := false
 	for _, rule := range prof.Syscalls {
+		if rule.Action == "SCMP_ACT_ERRNO" {
+			for _, n := range rule.Names {
+				if n == "clone3" && rule.ErrnoRet != nil && *rule.ErrnoRet == 38 {
+					sawClone3Enosys = true
+				}
+			}
+			continue
+		}
 		if rule.Action != "SCMP_ACT_ALLOW" {
 			continue
 		}
 		for _, n := range rule.Names {
 			allowed[n] = true
+			if len(rule.Args) == 0 && len(rule.Includes.Arches) == 0 {
+				unconditionalAllow[n] = true
+			}
 			if len(rule.Includes.Arches) > 0 {
 				archGated[n] = append(archGated[n], rule.Includes.Arches...)
 			}
@@ -273,6 +299,7 @@ func TestR8HardenedChromiumSeccompProfileInvariants(t *testing.T) {
 		"kexec_load", "kexec_file_load", "init_module", "finit_module", "delete_module",
 		"open_by_handle_at", "name_to_handle_at",
 		"mount", "umount", "umount2", "pivot_root",
+		"setns", "clone3", "socketcall",
 		"adjtimex", "clock_adjtime", "clock_adjtime64", "fanotify_mark",
 		"chown", "chown32", "fchown", "fchown32", "fchownat", "lchown", "lchown32",
 		"mknod", "mknodat", "vmsplice", "remap_file_pages", "swapon", "swapoff", "reboot", "acct",
@@ -281,8 +308,14 @@ func TestR8HardenedChromiumSeccompProfileInvariants(t *testing.T) {
 			t.Fatalf("SECURITY: forbidden syscall %q must NOT be allowed in chromium-sandbox.json", mustDeny)
 		}
 	}
+	if !sawClone3Enosys {
+		t.Fatal("expected clone3 to return ENOSYS (errnoRet: 38) so libc falls back cleanly to clone(2)")
+	}
+	if unconditionalAllow["socket"] || argGated["socket"] < 8 {
+		t.Fatalf("SECURITY: socket(2) must NOT be unconditionally allowed (must filter out AF_PACKET/SOCK_RAW); unconditional=%v argRules=%d", unconditionalAllow["socket"], argGated["socket"])
+	}
 
-	for _, mustAllowSandbox := range []string{"clone", "clone3", "unshare", "setns", "chroot", "seccomp", "prctl"} {
+	for _, mustAllowSandbox := range []string{"clone", "unshare", "chroot", "seccomp", "prctl"} {
 		if !allowed[mustAllowSandbox] {
 			t.Fatalf("expected Chromium sandbox syscall %q in SCMP_ACT_ALLOW", mustAllowSandbox)
 		}

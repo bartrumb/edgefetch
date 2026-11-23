@@ -12,7 +12,7 @@ jobs:
   sync-upstream:
     name: Verify Signed Upstream Release & Sync Fork Hub
     if: vars.EDGEFETCH_AUTO_SYNC_UPSTREAM == 'true' && github.repository != 'bartrumb/edgefetch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

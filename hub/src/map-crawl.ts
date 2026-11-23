@@ -48,6 +48,70 @@ import {
   type OptionalStorageBindings,
 } from './storage';
 
+export const MAX_CONCURRENT_MAPS_PER_USER = 4;
+export const MAX_CONCURRENT_EXTRACTS_PER_USER = 4;
+export const MAX_CONCURRENT_EXTRACT_URLS_PER_USER = 16;
+
+const inFlightMapsByUser = new Map<string, number>();
+const inFlightExtractsByUser = new Map<string, number>();
+const inFlightExtractUrlsByUser = new Map<string, number>();
+
+export function countExtractPayloadUrls(payload: unknown): number {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return 1;
+  const obj = payload as { urls?: unknown; url?: unknown };
+  if (Array.isArray(obj.urls)) {
+    const seen = new Set<string>();
+    for (const u of obj.urls) {
+      if (typeof u === 'string' && u.trim()) {
+        seen.add(u.trim());
+      }
+    }
+    return Math.max(1, seen.size || obj.urls.length);
+  }
+  return 1;
+}
+
+export function tryAcquireUserMapSlot(userId: string | undefined): (() => void) | null {
+  const key = (userId ?? '').trim() || 'owner';
+  const cur = inFlightMapsByUser.get(key) ?? 0;
+  if (cur >= MAX_CONCURRENT_MAPS_PER_USER) return null;
+  inFlightMapsByUser.set(key, cur + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = (inFlightMapsByUser.get(key) ?? 1) - 1;
+    if (next <= 0) inFlightMapsByUser.delete(key);
+    else inFlightMapsByUser.set(key, next);
+  };
+}
+
+export function tryAcquireUserExtractSlots(
+  userId: string | undefined,
+  urlFanout: number,
+): (() => void) | null {
+  const key = (userId ?? '').trim() || 'owner';
+  const cost = Math.max(1, Math.floor(urlFanout));
+  const curReqs = inFlightExtractsByUser.get(key) ?? 0;
+  const curUrls = inFlightExtractUrlsByUser.get(key) ?? 0;
+  if (curReqs >= MAX_CONCURRENT_EXTRACTS_PER_USER || curUrls + cost > MAX_CONCURRENT_EXTRACT_URLS_PER_USER) {
+    return null;
+  }
+  inFlightExtractsByUser.set(key, curReqs + 1);
+  inFlightExtractUrlsByUser.set(key, curUrls + cost);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const nextReqs = (inFlightExtractsByUser.get(key) ?? 1) - 1;
+    if (nextReqs <= 0) inFlightExtractsByUser.delete(key);
+    else inFlightExtractsByUser.set(key, nextReqs);
+    const nextUrls = (inFlightExtractUrlsByUser.get(key) ?? cost) - cost;
+    if (nextUrls <= 0) inFlightExtractUrlsByUser.delete(key);
+    else inFlightExtractUrlsByUser.set(key, nextUrls);
+  };
+}
+
 export type HubFetchExecutor = (
   target: 'auto' | 'agent' | 'container',
   body: string,
@@ -368,25 +432,38 @@ export async function executeMapCall(params: {
     );
   }
 
-  const callSeed = () =>
+  const seedPayloadJson = JSON.stringify({
+    maxSeconds: fastEdgeMap ? 10 : 30,
+    options: { includeBody: true, respectRobots: true, pauseMs: 250, pauseJitterMs: 0 },
+    requests: seedRequests,
+  });
+  const callSeed = (seedTarget: 'auto' | 'agent' | 'container') =>
     executeHubFetch(
-      target,
-      JSON.stringify({
-        maxSeconds: fastEdgeMap ? 10 : 30,
-        options: { includeBody: true, respectRobots: true, pauseMs: 250, pauseJitterMs: 0 },
-        requests: seedRequests,
-      }),
+      seedTarget,
+      seedPayloadJson,
       site,
       source,
       'off',
       false,
     );
-  const seedRes = await (activeTracer ? activeTracer.run(callSeed) : callSeed());
+  let seedRes = await (activeTracer ? activeTracer.run(() => callSeed(target)) : callSeed(target));
   if (seedRes.status !== 200) {
     return { status: seedRes.status, via: seedRes.via, body: { ok: false, error: 'map_fetch_failed' } };
   }
 
-  const parsed = JSON.parse(seedRes.bodyText) as { results?: Array<Record<string, unknown>> };
+  let parsed = JSON.parse(seedRes.bodyText) as { results?: Array<Record<string, unknown>> };
+  if (
+    target === 'auto' &&
+    seedRequests.length > 0 &&
+    ((parsed.results ?? []).length === 0 ||
+      (parsed.results ?? []).every((r) => !r || r.outcome === 'not_tried' || (r.status === 0 && !r.outcome)))
+  ) {
+    const retryRes = await (activeTracer ? activeTracer.run(() => callSeed('container')) : callSeed('container')).catch(() => null);
+    if (retryRes && retryRes.status === 200) {
+      seedRes = retryRes;
+      parsed = JSON.parse(retryRes.bodyText) as { results?: Array<Record<string, unknown>> };
+    }
+  }
   const byId = new Map<string, Record<string, unknown>>();
   for (const r of parsed.results ?? []) {
     if (typeof r.id === 'string') byId.set(r.id, r);
@@ -834,6 +911,21 @@ export async function executeMapCall(params: {
       const qDiff = scoreMapUrlQuality(b.url) - scoreMapUrlQuality(a.url);
       return qDiff || a.url.localeCompare(b.url);
     });
+  }
+
+  if (sourcesReport.length > 0 && sourcesReport.every((s) => s.outcome === 'not_tried')) {
+    return {
+      status: 503,
+      via: seedRes.via,
+      body: {
+        ok: false,
+        error: 'map_sources_not_tried',
+        retryable: true,
+        message: 'No discovery sources could be attempted within the request window; retry shortly.',
+        url: rootUrl.toString(),
+        sources: sourcesReport,
+      },
+    };
   }
 
   const sliced = items.slice(0, limit);
@@ -1567,16 +1659,19 @@ export async function executeCrawlJob(params: {
             mdAssets?.title ||
             (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined);
 
-          if (isPrivateCrawl && itemUrl) {
+          if (itemUrl) {
+            await ensurePrivateCrawlPagesTable(metaDb);
             const pageFetchedAt = Date.now();
             const contentSha256 = md ? await sha256HexLocal(md) : null;
-            let privateR2Key: string | null = null;
+            let storedR2Key: string | null = null;
             if (env.ARTIFACTS && md && contentSha256) {
-              privateR2Key = r2PrivateDerivedKey(effectiveUserId, SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256);
-              await env.ARTIFACTS.put(privateR2Key, md, {
+              storedR2Key = isPrivateCrawl
+                ? r2PrivateDerivedKey(effectiveUserId, SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256)
+                : r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', contentSha256);
+              await env.ARTIFACTS.put(storedR2Key, md, {
                 httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
               }).catch(() => {
-                privateR2Key = null;
+                storedR2Key = null;
               });
             }
             await metaDb
@@ -1592,22 +1687,26 @@ export async function executeCrawlJob(params: {
                 typeof item.status === 'number' ? item.status : 200,
                 resolvedPageTitle ?? null,
                 contentSha256,
-                privateR2Key,
-                privateR2Key ? null : md.slice(0, 262_144),
+                storedR2Key,
+                storedR2Key ? null : md.slice(0, 262_144),
                 pageFetchedAt,
               )
               .run()
               .catch(() => undefined);
 
             if (env.SEARCH && options.collectionId && md && contentSha256) {
-              const scopedColl = resolveUserCollectionId(options.collectionId, effectiveUserId, 'private');
+              const scopedColl = resolveUserCollectionId(
+                options.collectionId,
+                effectiveUserId,
+                isPrivateCrawl ? 'private' : 'public',
+              );
               if (scopedColl.ok) {
                 const pageId = (await sha256HexLocal(`${effectiveUserId}:${itemUrl}`)).slice(0, 32);
                 const idx = new D1FtsSearchIndex(env.SEARCH);
                 await idx
                   .replacePageChunks({
                     collectionId: scopedColl.scopedId,
-                    documentId: `privcrawl:${contentSha256.slice(0, 32)}`,
+                    documentId: `${isPrivateCrawl ? 'privcrawl' : 'crawl'}:${contentSha256.slice(0, 32)}`,
                     pageId,
                     url: itemUrl,
                     title: resolvedPageTitle || itemUrl,
@@ -1695,7 +1794,8 @@ export async function executeCrawlJob(params: {
           }
         } else {
           failedCount++;
-          if (isPrivateCrawl && itemUrl) {
+          if (itemUrl) {
+            await ensurePrivateCrawlPagesTable(metaDb);
             await metaDb
               .prepare(
                 `INSERT INTO private_crawl_pages
@@ -1840,25 +1940,25 @@ export async function getCrawlJobStatus(params: {
       : 25;
 
   const isPrivateCrawl = effectiveUserId !== 'owner';
-  if (isPrivateCrawl) {
-    await ensurePrivateCrawlPagesTable(metaDb);
-  }
+  await ensurePrivateCrawlPagesTable(metaDb);
 
-  // Reconcile live fetch counts from `fetches` (or `private_crawl_pages` for non-owner tenants) so `fetchedCount` and
-  // `status` self-heal automatically even if Cloudflare Workers' 30s `ctx.waitUntil` cap terminated a background crawl.
-  const aggRow = isPrivateCrawl
-    ? await metaDb
-        .prepare(
-          `SELECT
-             SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok_cnt,
-             SUM(CASE WHEN outcome != 'ok' THEN 1 ELSE 0 END) AS fail_cnt,
-             MAX(fetched_at) AS last_fetched_at
-           FROM private_crawl_pages
-           WHERE crawl_id = ? AND user_id = ?`,
-        )
-        .bind(crawlId, effectiveUserId)
-        .first<{ ok_cnt: number | null; fail_cnt: number | null; last_fetched_at: number | null }>()
-        .catch(() => null)
+  // Reconcile live fetch counts from `fetches` AND `private_crawl_pages` so `fetchedCount`, `status`, and `data`
+  // populate deterministically whether executed via `CrawlWorkflow`, `ctx.waitUntil`, or before `IngestWorkflow` finishes!
+  const crawlPagesAgg = await metaDb
+    .prepare(
+      `SELECT
+         SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END) AS ok_cnt,
+         SUM(CASE WHEN outcome != 'ok' THEN 1 ELSE 0 END) AS fail_cnt,
+         MAX(fetched_at) AS last_fetched_at
+       FROM private_crawl_pages
+       WHERE crawl_id = ? AND user_id = ?`,
+    )
+    .bind(crawlId, effectiveUserId)
+    .first<{ ok_cnt: number | null; fail_cnt: number | null; last_fetched_at: number | null }>()
+    .catch(() => null);
+
+  const fetchesAgg = isPrivateCrawl
+    ? null
     : await metaDb
         .prepare(
           `SELECT
@@ -1872,9 +1972,9 @@ export async function getCrawlJobStatus(params: {
         .first<{ ok_cnt: number | null; fail_cnt: number | null; last_fetched_at: number | null }>()
         .catch(() => null);
 
-  const liveOk = Number(aggRow?.ok_cnt ?? 0);
-  const liveFail = Number(aggRow?.fail_cnt ?? 0);
-  const lastFetchedAt = Number(aggRow?.last_fetched_at ?? 0);
+  const liveOk = Math.max(Number(fetchesAgg?.ok_cnt ?? 0), Number(crawlPagesAgg?.ok_cnt ?? 0));
+  const liveFail = Math.max(Number(fetchesAgg?.fail_cnt ?? 0), Number(crawlPagesAgg?.fail_cnt ?? 0));
+  const lastFetchedAt = Math.max(Number(fetchesAgg?.last_fetched_at ?? 0), Number(crawlPagesAgg?.last_fetched_at ?? 0));
   const effectiveFetched = Math.max(row.fetched_count, liveOk);
   const effectiveFailed = Math.max(row.failed_count, liveFail);
   const effectiveDiscovered = Math.max(row.discovered_count, effectiveFetched + effectiveFailed);
@@ -2075,6 +2175,60 @@ export async function getCrawlJobStatus(params: {
         fetchedAt: pr.fetched_at,
       });
     }
+
+    // Fallback for `owner` crawls executed via `CrawlWorkflow` (or polled before `IngestWorkflow` writes `fetches` rows):
+    if (data.length === 0) {
+      const rawOwnerFallbackRows =
+        (
+          await metaDb
+            .prepare(
+              `SELECT url, status, outcome, title, content_sha256, r2_key, markdown_inline, fetched_at
+               FROM private_crawl_pages
+               WHERE crawl_id = ? AND user_id = 'owner'
+               ORDER BY fetched_at ASC, id ASC
+               LIMIT ? OFFSET ?`,
+            )
+            .bind(crawlId, safeLimit + 1, safeOffset)
+            .all<{
+              url: string;
+              status: number;
+              outcome: string;
+              title: string | null;
+              content_sha256: string | null;
+              r2_key: string | null;
+              markdown_inline: string | null;
+              fetched_at: number;
+            }>()
+            .catch(() => ({ results: [] }))
+        ).results ?? [];
+      if (rawOwnerFallbackRows.length > 0) {
+        hasMoreRows = rawOwnerFallbackRows.length > safeLimit;
+        const ownerRows = hasMoreRows ? rawOwnerFallbackRows.slice(0, safeLimit) : rawOwnerFallbackRows;
+        for (const orow of ownerRows) {
+          let markdown: string | undefined;
+          if (bucket && orow.r2_key && orow.r2_key.startsWith('derived/')) {
+            const mdObj = await bucket.get(orow.r2_key);
+            if (mdObj) {
+              markdown = await mdObj.text();
+            }
+          }
+          if (markdown === undefined && typeof orow.markdown_inline === 'string') {
+            markdown = orow.markdown_inline;
+          }
+          if (markdown !== undefined) {
+            markdown = sanitizeInlineHtmlInMarkdown(decodeMarkdownEntities(markdown), orow.url).trim();
+          }
+          data.push({
+            url: orow.url,
+            status: orow.status,
+            outcome: orow.outcome,
+            ...(orow.title ? { title: orow.title } : {}),
+            ...(markdown !== undefined ? { markdown } : {}),
+            fetchedAt: orow.fetched_at,
+          });
+        }
+      }
+    }
   }
 
   return {
@@ -2143,7 +2297,7 @@ export class CrawlWorkflow extends WorkflowEntrypoint<OptionalStorageBindings, C
           env: this.env,
           ...(event.payload.selfHost ? { selfHost: event.payload.selfHost } : {}),
           executeHubFetch: async (_target, body) => {
-            const res = await cloudflareOverflowFetch(body, 'EdgeFetch/2.7.3', event.payload.selfHost ?? 'localhost');
+            const res = await cloudflareOverflowFetch(body, 'EdgeFetch/2.7 (bot@edgefetch.dev)', event.payload.selfHost ?? 'localhost');
             return { status: res.status, via: 'cf', bodyText: await res.text() };
           },
         });

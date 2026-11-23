@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
 PackageIdentifier: BartrumB.EdgeFetch
-PackageVersion: 2.7.3
+PackageVersion: 2.7.4
 PackageLocale: en-US
 Publisher: BartrumB
 PublisherUrl: https://github.com/bartrumb/edgefetch

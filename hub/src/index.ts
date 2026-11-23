@@ -75,14 +75,20 @@ import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
   cancelBatchScrape,
   cancelCrawlJob,
+  countExtractPayloadUrls,
   CrawlWorkflow,
   createCrawlJob,
   executeCrawlJob,
   executeMapCall,
   getBatchScrapeStatus,
   getCrawlJobStatus,
+  MAX_CONCURRENT_EXTRACT_URLS_PER_USER,
+  MAX_CONCURRENT_EXTRACTS_PER_USER,
+  MAX_CONCURRENT_MAPS_PER_USER,
   previewCrawlParams,
   startOrExecuteBatchScrape,
+  tryAcquireUserExtractSlots,
+  tryAcquireUserMapSlot,
   type MapRequestPayload,
 } from './map-crawl';
 import { handleMcpRequest } from './mcp';
@@ -171,6 +177,7 @@ import {
   r2PrivateDerivedKey,
   readArtifactPage,
   sanitizeStorageUserId,
+  writePrivateArtifactToR2,
   type ArtifactRetention,
   type OptionalStorageBindings,
 } from './storage';
@@ -763,8 +770,11 @@ export class AgentHubDO extends DurableObject<Env> {
   async oauthCountUsers(): Promise<number> {
     return this.oauth.countUsers ? await this.oauth.countUsers() : 0;
   }
-  async oauthUpdateUserRole(id: string, role: UserRole): Promise<boolean> {
-    return this.oauth.updateUserRole ? await this.oauth.updateUserRole(id, role) : false;
+  async oauthUpdateUserRole(id: string, role: UserRole, promotedByOwnerId?: string | null): Promise<boolean> {
+    return this.oauth.updateUserRole ? await this.oauth.updateUserRole(id, role, promotedByOwnerId) : false;
+  }
+  async oauthEnforcePinnedFounderOwners(pinnedOwnerId: string): Promise<number> {
+    return this.oauth.enforcePinnedFounderOwners ? await this.oauth.enforcePinnedFounderOwners(pinnedOwnerId) : 0;
   }
 
   // Per-user AES-256-GCM MCP Vault SQLite RPC methods
@@ -871,7 +881,34 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
     getUser: (id) => hub().oauthGetUser(id),
     listUsers: () => hub().oauthListUsers(),
     countUsers: () => hub().oauthCountUsers(),
-    updateUserRole: (id, role) => hub().oauthUpdateUserRole(id, role),
+    updateUserRole: (id, role, promotedByOwnerId) => hub().oauthUpdateUserRole(id, role, promotedByOwnerId),
+    enforcePinnedFounderOwners: async (pinnedOwnerId) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      if (typeof stub.oauthEnforcePinnedFounderOwners === 'function') {
+        return await stub.oauthEnforcePinnedFounderOwners(pinnedOwnerId);
+      }
+      const users = await hub().oauthListUsers();
+      let demoted = 0;
+      for (const u of users) {
+        if (
+          u.userId !== 'owner' &&
+          u.role === 'owner' &&
+          String(u.githubId ?? '') !== pinnedOwnerId &&
+          u.promotedByOwnerId !== pinnedOwnerId
+        ) {
+          await hub().oauthUpsertUser({
+            ...u,
+            role: 'member',
+            promotedByOwnerId: undefined,
+            sessionEpoch: (u.sessionEpoch ?? 1) + 1,
+            mutationKind: 'demote_unapproved_owner',
+            reconcilePinnedOwnerId: pinnedOwnerId,
+          });
+          demoted++;
+        }
+      }
+      return demoted;
+    },
   };
 }
 
@@ -1109,6 +1146,10 @@ export default {
           } catch {
             wantsIncludeBody = false;
           }
+          const activeCaller = getActiveCallerAuthContext();
+          const tenantUserId = activeCaller?.userId ? sanitizeStorageUserId(activeCaller.userId) : 'owner';
+          const isPrivateTenant = tenantUserId !== 'owner' && tenantUserId !== 'anonymous';
+
           const resolvedCollectionId = collectionId ?? bodyCollectionId;
           const effectiveRetentionPref = artifactRetention ?? bodyRetentionOpt ?? (resolvedCollectionId && env.ARTIFACTS && env.META ? 'stored' : undefined);
           const resolvedRetention: ArtifactRetention | undefined =
@@ -1116,7 +1157,7 @@ export default {
               ? undefined
               : effectiveRetentionPref ?? (env.ARTIFACTS && wantsIncludeBody ? 'transient' : undefined);
           const artifactPolicy: ArtifactDispatchPolicy | undefined =
-            env.ARTIFACTS && (wantsIncludeBody || effectiveRetentionPref === 'stored') && resolvedRetention
+            !isPrivateTenant && env.ARTIFACTS && (wantsIncludeBody || effectiveRetentionPref === 'stored') && resolvedRetention
               ? { mode: 'r2', retention: resolvedRetention, maxContentBytes: MAX_ARTIFACT_CONTENT_BYTES }
               : undefined;
 
@@ -1192,7 +1233,57 @@ export default {
                 const rawCompletedBody = await res.text();
                 let bodyText = rawCompletedBody;
                 let hydrateR2Ms = 0;
-                if (res.status === 200 && env.ARTIFACTS && wantsIncludeBody && hydrateInline) {
+                if (res.status === 200 && isPrivateTenant && env.ARTIFACTS && resolvedRetention) {
+                  try {
+                    const parsedReply = JSON.parse(rawCompletedBody) as {
+                      results?: Array<Record<string, unknown>>;
+                      [k: string]: unknown;
+                    };
+                    if (Array.isArray(parsedReply.results)) {
+                      let mutated = false;
+                      for (const item of parsedReply.results) {
+                        if (!item || typeof item !== 'object' || item.outcome !== 'ok' || typeof item.body !== 'string') {
+                          continue;
+                        }
+                        let rawBytes: Uint8Array;
+                        if (item.bodyEncoding === 'base64') {
+                          const bin = atob(item.body);
+                          rawBytes = new Uint8Array(bin.length);
+                          for (let i = 0; i < bin.length; i++) rawBytes[i] = bin.charCodeAt(i);
+                        } else {
+                          rawBytes = new TextEncoder().encode(item.body);
+                        }
+                        if (rawBytes.byteLength > MAX_ARTIFACT_CONTENT_BYTES) continue;
+                        const privArt = await writePrivateArtifactToR2({
+                          bucket: env.ARTIFACTS,
+                          userId: tenantUserId,
+                          rawBytes,
+                          retention: resolvedRetention,
+                        });
+                        item.artifact = {
+                          blobSha256: privArt.blobSha256,
+                          contentSha256: privArt.contentSha256,
+                          contentBytes: rawBytes.byteLength,
+                          storedBytes: 0,
+                          encoding: 'gzip',
+                          retention: resolvedRetention,
+                          visibility: 'private',
+                        };
+                        if (!hydrateInline) {
+                          delete item.body;
+                          delete item.bodyEncoding;
+                          item.bodyOmitted = true;
+                        }
+                        mutated = true;
+                      }
+                      if (mutated) {
+                        bodyText = JSON.stringify(parsedReply);
+                      }
+                    }
+                  } catch {
+                    // Preserve raw bodyText if reply is non-JSON
+                  }
+                } else if (res.status === 200 && env.ARTIFACTS && wantsIncludeBody && hydrateInline) {
                   const hydStart = Date.now();
                   bodyText = await hydrateReplyBodiesFromR2(rawCompletedBody, env.ARTIFACTS);
                   hydrateR2Ms = Date.now() - hydStart;
@@ -1200,8 +1291,9 @@ export default {
 
                 // P12 & S4: Move R2 manifest write + Cloudflare Workflows `INGEST.create(...)` + activity-log RPC off the
                 // synchronous HTTP response path into `ctx.waitUntil(...)` whenever `env.INGEST` and `ctx.waitUntil` are bound!
+                // Multi-tenant isolation: NEVER persist non-owner (`isPrivateTenant`) fetches into shared `META` (`pages`/`fetches`/`artifacts`/`documents`)!
                 const runPostFetchPersistence = async () => {
-                  if (res.status === 200 && effectiveRetentionPref !== 'off' && env.ARTIFACTS && env.META) {
+                  if (!isPrivateTenant && res.status === 200 && effectiveRetentionPref !== 'off' && env.ARTIFACTS && env.META) {
                     const ingestJobId = `job_${crypto.randomUUID().replace(/-/g, '')}`;
                     const siteMatch = /^agent:([a-z0-9_-]+)/i.exec(via);
                     try {
@@ -1436,7 +1528,7 @@ export default {
               }),
               siteStr,
               sourceLabel,
-              'transient',
+              'off',
               true,
             );
           const hubOut = await (callTracer ? callTracer.run(doFetch) : doFetch());
@@ -1597,15 +1689,36 @@ export default {
             }
           },
           executeExtract: async ({ args, principal, userId }) => {
-            const out = await executeExtractCall({
-              payload: args as ExtractRequestPayload,
-              env,
-              executeHubFetch,
-              selfHost: url.hostname,
-              source: `mcp-extract:${principal ?? 'client'}`,
-              userId,
-            });
-            return { status: out.status, body: { via: out.via, ...out.body } };
+            const effectiveUserId = userId ?? getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
+            const argsObj = args as Record<string, unknown>;
+            const hasInvalidUrls =
+              !Array.isArray(argsObj.urls) || argsObj.urls.length === 0 || argsObj.urls.length > 20;
+            const releaseExtractSlots = hasInvalidUrls
+              ? () => undefined
+              : tryAcquireUserExtractSlots(effectiveUserId, countExtractPayloadUrls(argsObj));
+            if (!releaseExtractSlots) {
+              return {
+                status: 429,
+                body: {
+                  ok: false,
+                  error: 'user_quota_exceeded',
+                  message: `Per-user concurrent extract limit (${MAX_CONCURRENT_EXTRACTS_PER_USER} requests / ${MAX_CONCURRENT_EXTRACT_URLS_PER_USER} URLs) exceeded.`,
+                },
+              };
+            }
+            try {
+              const out = await executeExtractCall({
+                payload: args as ExtractRequestPayload,
+                env,
+                executeHubFetch,
+                selfHost: url.hostname,
+                source: `mcp-extract:${principal ?? 'client'}`,
+                userId: effectiveUserId,
+              });
+              return { status: out.status, body: { via: out.via, ...out.body } };
+            } finally {
+              releaseExtractSlots();
+            }
           },
           executeInteract: async ({ args, principal, userId }) => {
             const effectiveUserId = userId ?? getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
@@ -1640,14 +1753,30 @@ export default {
               releaseInteractSlot();
             }
           },
-          executeMap: async ({ args, principal }) => {
-            const out = await executeMapCall({
-              payload: args as MapRequestPayload,
-              executeHubFetch,
-              selfHost: url.hostname,
-              source: `mcp-map:${principal ?? 'client'}`,
-            });
-            return { status: out.status, body: { via: out.via, ...out.body } };
+          executeMap: async ({ args, principal, userId }) => {
+            const effectiveUserId = userId ?? getActiveCallerAuthContext()?.userId ?? resolveCallerUserId({ principal });
+            const releaseMapSlot = tryAcquireUserMapSlot(effectiveUserId);
+            if (!releaseMapSlot) {
+              return {
+                status: 429,
+                body: {
+                  ok: false,
+                  error: 'user_quota_exceeded',
+                  message: `Per-user concurrent map limit (${MAX_CONCURRENT_MAPS_PER_USER}) exceeded.`,
+                },
+              };
+            }
+            try {
+              const out = await executeMapCall({
+                payload: args as MapRequestPayload,
+                executeHubFetch,
+                selfHost: url.hostname,
+                source: `mcp-map:${principal ?? 'client'}`,
+              });
+              return { status: out.status, body: { via: out.via, ...out.body } };
+            } finally {
+              releaseMapSlot();
+            }
           },
           executeCrawl: async ({ args, principal, userId }) => {
             const effectiveUserId = userId ?? resolveCallerUserId({ principal });
@@ -1839,13 +1968,13 @@ export default {
           executeQueryMcp: async ({ args, principal, userId }) => {
             const activeAuth = getActiveCallerAuthContext();
             const action = (args as QueryMcpCallInput).action ?? 'list_connected';
-            if (action === 'call_tool' && activeAuth && !activeAuth.scopes.includes('mcp:call')) {
+            if ((action === 'call_tool' || action === 'list_tools') && activeAuth && !activeAuth.scopes.includes('mcp:call')) {
               return {
                 status: 403,
                 body: {
                   ok: false,
                   error: 'insufficient_scope',
-                  message: 'OAuth scope mcp:call is required for action="call_tool"',
+                  message: `OAuth scope mcp:call is required for action="${action}"`,
                 },
               };
             }
@@ -2245,7 +2374,7 @@ export default {
             return Response.json({ error: 'bad_json' }, { status: 400, headers: { 'cache-control': 'no-store' } });
           }
           const action = payload.action ?? 'list_connected';
-          if (action === 'call_tool') {
+          if (action === 'call_tool' || action === 'list_tools') {
             if (!auth.scopes.includes('mcp:call')) {
               return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
             }
@@ -2564,18 +2693,34 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
-          const out = await executeExtractCall({
-            payload,
-            env,
-            executeHubFetch,
-            selfHost: url.hostname,
-            source: `extract:${auth.principal}`,
-            userId: auth.userId,
-          });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
-          });
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const rawPayloadObj = payload as unknown as Record<string, unknown>;
+          const hasInvalidUrls =
+            !Array.isArray(rawPayloadObj.urls) || rawPayloadObj.urls.length === 0 || rawPayloadObj.urls.length > 20;
+          const releaseExtractSlots = hasInvalidUrls
+            ? () => undefined
+            : tryAcquireUserExtractSlots(callerUserId, countExtractPayloadUrls(rawPayloadObj));
+          if (!releaseExtractSlots) {
+            return userQuotaExceededResponse(
+              `Per-user concurrent extract limit (${MAX_CONCURRENT_EXTRACTS_PER_USER} requests / ${MAX_CONCURRENT_EXTRACT_URLS_PER_USER} URLs) exceeded.`,
+            );
+          }
+          try {
+            const out = await executeExtractCall({
+              payload,
+              env,
+              executeHubFetch,
+              selfHost: url.hostname,
+              source: `extract:${auth.principal}`,
+              userId: auth.userId,
+            });
+            return Response.json(out.body, {
+              status: out.status,
+              headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+            });
+          } finally {
+            releaseExtractSlots();
+          }
         });
       }
 
@@ -2671,16 +2816,27 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
-          const out = await executeMapCall({
-            payload,
-            executeHubFetch,
-            selfHost: url.hostname,
-            source: `map:${auth.principal}`,
-          });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
-          });
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const releaseMapSlot = tryAcquireUserMapSlot(callerUserId);
+          if (!releaseMapSlot) {
+            return userQuotaExceededResponse(
+              `Per-user concurrent map limit (${MAX_CONCURRENT_MAPS_PER_USER}) exceeded.`,
+            );
+          }
+          try {
+            const out = await executeMapCall({
+              payload,
+              executeHubFetch,
+              selfHost: url.hostname,
+              source: `map:${auth.principal}`,
+            });
+            return Response.json(out.body, {
+              status: out.status,
+              headers: { 'cache-control': 'no-store', 'x-crawler-via': out.via },
+            });
+          } finally {
+            releaseMapSlot();
+          }
         });
       }
 
@@ -3462,14 +3618,32 @@ export default {
         });
       }
 
-      if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
-        return Response.json({ error: 'unauthorized' }, { status: 401 });
-      }
-      if (request.method === 'GET' && url.pathname === '/agents') {
-        return withRouteSpan('edgefetch.agents', {}, async () => Response.json(await hub().listAgents()));
-      }
-      if (request.method === 'POST' && url.pathname === '/fetch') {
+      if (request.method === 'POST' && (url.pathname === '/fetch' || url.pathname === '/fetch/batch')) {
         return withRouteSpan('edgefetch.fetch', {}, async () => {
+          let fetchUserId = 'owner';
+          if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
+            const rawAuthHdr = (request.headers.get('authorization') ?? '').trim();
+            const bearerTok = /^Bearer\s+(\S+)$/i.exec(rawAuthHdr)?.[1] ?? '';
+            if (!bearerTok.startsWith('efa_')) {
+              return Response.json({ error: 'unauthorized' }, { status: 401 });
+            }
+            const oauthAuth = await authorizeMcpRequest({
+              request,
+              origin: url.origin,
+              store: oauthStore,
+              githubAuthEnv: env,
+            });
+            if (!oauthAuth.ok) {
+              return Response.json(
+                { error: 'unauthorized' },
+                { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': oauthAuth.wwwAuthenticate } },
+              );
+            }
+            if (!oauthAuth.scopes.includes('crawl:fetch')) {
+              return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+            }
+            fetchUserId = oauthAuth.userId;
+          }
           const parsedTarget = parseFetchTarget(url);
           if (!parsedTarget.ok) return Response.json({ error: 'bad_target', message: parsedTarget.message }, { status: 400 });
           const cappedFetch = await readBodyTextCapped(request, MAX_CALL_UTF8_BYTES);
@@ -3479,28 +3653,70 @@ export default {
               { status: cappedFetch.error === 'too_large' ? 413 : 400 },
             );
           }
-          const body = cappedFetch.text;
-          const rawRetention = url.searchParams.get('artifacts');
-          const artifactRetention: ArtifactRetention | 'off' | undefined =
-            rawRetention === 'stored'
-              ? 'stored'
-              : rawRetention === 'transient'
-                ? 'transient'
-                : rawRetention === 'off'
-                  ? 'off'
-                  : undefined;
-          const hydrateInline = url.searchParams.get('hydrate') !== 'false' && url.searchParams.get('hydrate') !== '0';
-          const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention, hydrateInline);
-          return new Response(out.bodyText, {
-            status: out.status,
-            headers: {
-              'content-type': 'application/json',
-              'x-crawler-via': out.via,
-              'cache-control': 'no-store',
-              ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
-            },
-          });
+          let body = cappedFetch.text;
+          if (url.pathname === '/fetch/batch') {
+            try {
+              const parsedBatch = JSON.parse(body) as Record<string, unknown>;
+              if (Array.isArray(parsedBatch.urls) && !Array.isArray(parsedBatch.requests)) {
+                body = JSON.stringify({
+                  maxSeconds: typeof parsedBatch.maxSeconds === 'number' ? parsedBatch.maxSeconds : 60,
+                  options: {
+                    includeBody: true,
+                    respectRobots: true,
+                    concurrency: 4,
+                    ...(parsedBatch.options && typeof parsedBatch.options === 'object' ? (parsedBatch.options as object) : {}),
+                  },
+                  requests: (parsedBatch.urls as unknown[]).map((u, idx) => ({
+                    id: `b-${idx + 1}`,
+                    url: String(u),
+                  })),
+                });
+              }
+            } catch {
+              return Response.json({ error: 'bad_json' }, { status: 400 });
+            }
+          }
+          const releaseFetchSlot =
+            fetchUserId !== 'owner'
+              ? tryAcquireUserConcurrencySlot(inFlightScrapesByUser, fetchUserId, MAX_CONCURRENT_SCRAPES_PER_USER)
+              : () => undefined;
+          if (!releaseFetchSlot) {
+            return userQuotaExceededResponse(
+              `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+            );
+          }
+          try {
+            const rawRetention = url.searchParams.get('artifacts');
+            const artifactRetention: ArtifactRetention | 'off' | undefined =
+              rawRetention === 'stored'
+                ? 'stored'
+                : rawRetention === 'transient'
+                  ? 'transient'
+                  : rawRetention === 'off'
+                    ? 'off'
+                    : undefined;
+            const hydrateInline = url.searchParams.get('hydrate') !== 'false' && url.searchParams.get('hydrate') !== '0';
+            const out = await executeHubFetch(parsedTarget.target, body, parsedTarget.site, 'rest', artifactRetention, hydrateInline);
+            return new Response(out.bodyText, {
+              status: out.status,
+              headers: {
+                'content-type': 'application/json',
+                'x-crawler-via': out.via,
+                'cache-control': 'no-store',
+                ...(out.retryAfter ? { 'retry-after': out.retryAfter } : {}),
+              },
+            });
+          } finally {
+            releaseFetchSlot();
+          }
         });
+      }
+
+      if (!isCallerAuthorized(request, env.CALLER_TOKEN)) {
+        return Response.json({ error: 'unauthorized' }, { status: 401 });
+      }
+      if (request.method === 'GET' && url.pathname === '/agents') {
+        return withRouteSpan('edgefetch.agents', {}, async () => Response.json(await hub().listAgents()));
       }
       return Response.json({ error: 'not_found' }, { status: 404 });
     };

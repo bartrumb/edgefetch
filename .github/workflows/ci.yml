@@ -105,6 +105,8 @@ jobs:
       - run: npm run adapter:test
       - name: Run Hub, Miniflare workerd E2E & TypeScript SDK tests with V8 coverage
         run: node scripts/run-tests.mjs --coverage --include-sdk
+      - name: Run uninstrumented npm test (exact release/tag-gate parity)
+        run: npm test
       - name: Run Opt-In Error Telemetry Collector tests
         working-directory: .
         run: node --test telemetry/test/collector.test.ts

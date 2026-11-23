@@ -2,7 +2,7 @@
   {
     "id": "basic-wildcard-disallow-root",
     "robots": "User-agent: *\nDisallow: /\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -12,8 +12,8 @@
   },
   {
     "id": "specific-overrides-wildcard",
-    "robots": "User-agent: *\nDisallow: /admin\nCrawl-delay: 5\n\nUser-agent: EdgeFetch/2.7.2\nDisallow: /private\nCrawl-delay: 2\n",
-    "ua": "EdgeFetch/2.7.2",
+    "robots": "User-agent: *\nDisallow: /admin\nCrawl-delay: 5\n\nUser-agent: EdgeFetch/2.7.3\nDisallow: /private\nCrawl-delay: 2\n",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 2000,
     "disallowAiInput": false,
     "checks": [
@@ -24,7 +24,7 @@
   {
     "id": "longest-match-and-tie-break",
     "robots": "User-agent: *\nDisallow: /same\nAllow: /same\nDisallow: /x*\nAllow: /x\nDisallow: /*.php$\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -39,7 +39,7 @@
   {
     "id": "turkish-dotted-i-in-directive-field",
     "robots": "User-agent: *\nD\u0130sallow: /\nCONTENT-S\u0130GNAL: ai-input=no\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -50,7 +50,7 @@
   {
     "id": "unicode-long-s-and-kelvin-case-folding",
     "robots": "U\u017fer-agent: *\nDisallow: /\n\nUser-agent: edge\u017fetch\nDisallow: /sub\n\nUser-agent: *\nContent-Signal: a\u0130-input=no, ai-input=y\u017fe\nAllow: /ok\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -62,7 +62,7 @@
   {
     "id": "nul-in-content-signal-item-vs-subsequent-item",
     "robots": "User-agent: *\nContent-Signal: ai-input=no\u0000\nAllow: /\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -72,7 +72,7 @@
   {
     "id": "nul-in-first-content-signal-item-preserves-second-item",
     "robots": "User-agent: *\nContent-Signal: search=yes\u0000, ai-input=no\nAllow: /\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": true,
     "checks": [
@@ -82,7 +82,7 @@
   {
     "id": "nul-in-disallow-truncates-path-value",
     "robots": "User-agent: *\nDisallow: /secret\u0000/ignored\nDisallow\u0000: /\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -93,7 +93,7 @@
   {
     "id": "zero-width-before-directive-vs-inside-uri-value",
     "robots": "\ufeff\u200bUser-agent: *\n  \u200cDisallow: /\u200b\n\u200dDisallow: \u200b/ignored\n\u2060Crawl-delay: 2.5\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 2500,
     "disallowAiInput": false,
     "checks": [
@@ -106,7 +106,7 @@
   {
     "id": "zero-width-in-user-agent-value-not-stripped",
     "robots": "User-agent: \u200b*\nDisallow: /\n\nUser-agent: edgefetch\u200b\nDisallow: /all\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -117,7 +117,7 @@
   {
     "id": "latin1-mojibake-bom-not-stripped-as-utf8-bom",
     "robots": "\u00ef\u00bb\u00bfUser-agent: *\nDisallow: /\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -214,7 +214,7 @@
   {
     "id": "content-signal-inheritance-and-conflicts",
     "robots": "Content-Signal: ai-input=no\n\nUser-agent: *\nContent-Signal: ai-input=yes\nDisallow: /wild\n\nUser-agent: edgefetch\nDisallow: /spec\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [
@@ -225,7 +225,7 @@
   {
     "id": "content-signal-multi-group-same-specificity-deny-wins",
     "robots": "User-agent: edgefetch\nContent-Signal: ai-input=yes\nAllow: /\n\nUser-agent: edgefetch\nContent-Signal: 'ai-input'=no, ai-input='NO'\nDisallow: /x\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": true,
     "checks": [
@@ -235,7 +235,7 @@
   {
     "id": "empty-user-agent-and-non-group-sitemap-lines",
     "robots": "User-agent: googlebot\nSitemap: https://example.com/sitemap.xml\nUser-agent: edgefetch\nDisallow: /only-bots\n\nUser-agent:\nDisallow: /\n",
-    "ua": "EdgeFetch/2.7.2",
+    "ua": "EdgeFetch/2.7.3",
     "crawlDelayMs": 0,
     "disallowAiInput": false,
     "checks": [

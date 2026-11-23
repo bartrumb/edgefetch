@@ -343,7 +343,7 @@ async function derivePerUserOriginAesKey(params: {
 }
 
 /**
- * @deprecated Remove in v2.7.3 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
+ * @deprecated Remove in v2.7.4 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
  */
 async function deriveLegacyV270PerUserOriginAesKey(params: {
   vaultMasterKey: string;
@@ -475,7 +475,7 @@ export async function unsealVaultCredentials(params: {
     );
   } catch {
     /**
-     * @deprecated Remove in v2.7.3 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
+     * @deprecated Remove in v2.7.4 — auto-reseals to length-prefixed v2.7.1+ AAD on first decrypt.
      * v2.7.0 backward-compatibility fallback ONLY when `userId` contains neither `|` nor `:` (preventing delimiter ambiguity).
      */
     if (params.userId.includes('|') || params.userId.includes(':')) {

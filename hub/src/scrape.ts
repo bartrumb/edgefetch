@@ -5952,13 +5952,21 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
 ): string {
   if (!prose) return prose;
   const { baseUrl, includeImages = true, spaceAdjacentAlnum = false } = opts;
-  if (!prose.includes('](') && !prose.includes('<') && !prose.includes(']:') && (!spaceAdjacentAlnum || !prose.includes('`'))) {
-    return prose.includes('//') ? neutralizeAllUnsafeMarkdownLinksLinear(prose) : prose;
+  const hasBracket = prose.includes('[');
+  if (
+    !(hasBracket && prose.includes('](')) &&
+    !prose.includes('<') &&
+    !(hasBracket && prose.includes(']:')) &&
+    (!spaceAdjacentAlnum || !prose.includes('`'))
+  ) {
+    return prose.includes('//') || prose.includes('](') || prose.includes(']:')
+      ? neutralizeAllUnsafeMarkdownLinksLinear(prose)
+      : prose;
   }
   const rawBounded = prose.length > MAX_MARKDOWN_SANITIZE_CHARS ? prose.slice(0, MAX_MARKDOWN_SANITIZE_CHARS) : prose;
   const proseLines = rawBounded.split('\n');
   const resolvedLines = proseLines.map((line) => {
-    if (!line.includes('](') && !line.includes('<') && (!spaceAdjacentAlnum || !line.includes('`'))) {
+    if (!(line.includes('[') && line.includes('](')) && !line.includes('<') && (!spaceAdjacentAlnum || !line.includes('`'))) {
       return line;
     }
 

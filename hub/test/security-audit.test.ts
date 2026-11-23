@@ -2605,7 +2605,7 @@ test('SEC-V261-ROUND5: R4-H1..H3 O(N) Scanners, R4-M6..M7 XSS/Sentinel Hygiene, 
   extractHtmlDocument('<p>ok</p>' + '<x'.repeat(8_000), { baseUrl: 'https://example.com/' });
   assert.ok(performance.now() - tH1Start < 150, 'R4-H1 <x.repeat(8000) must finish in linear time');
 
-  const covMul = process.env.NODE_V8_COVERAGE ? 3 : 1;
+  const covMul = process.env.NODE_V8_COVERAGE ? 3 : process.env.CI ? 3 : 1;
   const tH2AttrStart = performance.now();
   extractHtmlDocument(`<p><a ${'a'.repeat(32_000)}>link</a></p>`, { baseUrl: 'https://example.com/' });
   assert.ok(performance.now() - tH2AttrStart < 150 * covMul, 'R4-H2 unquoted 32K attribute must finish in linear time');

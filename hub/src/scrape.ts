@@ -5998,7 +5998,13 @@ function sanitizeAndResolveMarkdownProseLinksLinear(
       }
 
       // 2. Handle angle-bracket autolinks (`<https://...>`, `<mailto:...>`, `<javascript:...>`).
-      if (ch === 60 && !noGtOnLine && i + 3 < line.length && !isBackslashEscapedAt(line, i)) {
+      if (
+        ch === 60 &&
+        !noGtOnLine &&
+        i + 3 < line.length &&
+        !isBackslashEscapedAt(line, i) &&
+        !(i >= 2 && line.charCodeAt(i - 2) === 93 && line.charCodeAt(i - 1) === 40)
+      ) {
         if (nextGtOnLine <= i) {
           nextGtOnLine = line.indexOf('>', i + 1);
           if (nextGtOnLine < 0) {
@@ -6551,6 +6557,9 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
         proseWork = replaceHtmlTagsQuoteAwareLinear(
           proseWork,
           (tag) => {
+            if (tag.attrs && !/^\s/.test(tag.attrs)) {
+              return tag.rawTag;
+            }
             if (tag.tagNameLower === 'br') {
               syncLineBounds(tag.index);
               return curLineStartsWithPipe ? ' / ' : '\n';

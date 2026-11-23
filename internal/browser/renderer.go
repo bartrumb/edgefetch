@@ -3038,7 +3038,7 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		return nil, err
 	}
 
-	waitBudget := 15 * time.Second
+	waitBudget := 25 * time.Second
 	firstAttemptWait := waitBudget
 	if useSandbox && runtime.GOOS == "linux" {
 		if dl, ok := ctx.Deadline(); ok {
@@ -3048,7 +3048,8 @@ func (r *Renderer) ensureBrowser(ctx context.Context) (*cdpConn, error) {
 		}
 	}
 	cmd, userDir, conn, launchErr := r.launchAndDialLocked(ctx, proxy.Addr(), useSandbox, firstAttemptWait)
-	if launchErr != nil && runtime.GOOS == "linux" && useSandbox && ctx.Err() == nil && isSandboxStartupFailure(launchErr) {
+	if launchErr != nil && runtime.GOOS == "linux" && useSandbox && ctx.Err() == nil &&
+		(isSandboxStartupFailure(launchErr) || (r.canFallbackToNoSandboxLocked() && strings.Contains(launchErr.Error(), "before advertising DevTools"))) {
 		if !r.canFallbackToNoSandboxLocked() {
 			r.sandboxState = "off"
 			r.disabledByPolicy = true

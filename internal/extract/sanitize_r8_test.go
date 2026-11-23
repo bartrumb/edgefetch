@@ -152,8 +152,9 @@ func TestRound8H8LinearCPUBudgetsUnder40ms(t *testing.T) {
 		if bm.name == "2M_raw_lt" && outLen != 8_000_000 {
 			t.Fatalf("expected 2M `<` -> 8M `&lt;`, got len=%d", outLen)
 		}
-		if best > 150*time.Millisecond {
-			t.Fatalf("[H8 Go benchmark] %s exceeded linear CPU budget: %v", bm.name, best)
+		budget := time.Duration(extractRaceSlowdown) * 40 * time.Millisecond
+		if best > budget {
+			t.Fatalf("[H8 Go benchmark] %s exceeded linear CPU budget (%v): %v", bm.name, budget, best)
 		}
 	}
 }

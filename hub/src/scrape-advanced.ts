@@ -530,9 +530,13 @@ function escapeBareProtocolRelativeUrlsLinear(prose: string): string {
           const limit = Math.min(n, hostStart + 253);
           let sawValidDot = false;
           let validLabels = true;
+          let lastValidMultiEnd = -1;
           while (p < limit) {
             const hc = prose.charCodeAt(p);
             if (isHostLabelCharCode(hc)) {
+              if (sawValidDot && hc !== 45 /* '-' */) {
+                lastValidMultiEnd = p + 1;
+              }
               p++;
               continue;
             }
@@ -550,8 +554,12 @@ function escapeBareProtocolRelativeUrlsLinear(prose: string): string {
             }
             break;
           }
-          if (validLabels && sawValidDot && prose.charCodeAt(p - 1) !== 45) {
-            matchedEnd = p;
+          if (validLabels && sawValidDot) {
+            if (prose.charCodeAt(p - 1) !== 45) {
+              matchedEnd = p;
+            } else if (lastValidMultiEnd > hostStart) {
+              matchedEnd = lastValidMultiEnd;
+            }
           }
         }
       }
@@ -1404,16 +1412,83 @@ function stripWordBracketsLinear(txt: string): string {
   return last === 0 ? txt : out + txt.slice(last);
 }
 
+const COMPACT_SPACED_OVERRIDE_RE =
+  /(?:ignore|disregard|forget|override)(?:(?:all|any|each|every)(?:of)?)?(?:(?:the|your|these|those|my|our))?(?:previous|prior|above|earlier|preceding|system|developer|initial|original)(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)/i;
+
+function collapseSpacedSingleLettersLinear(s: string): string {
+  const n = s.length;
+  if (n < 7 || !s.includes(' ')) return s;
+  let out: Uint8Array | null = null;
+  let w = 0;
+  let last = 0;
+  let i = 0;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    const isLet = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    if (
+      isLet &&
+      (i === 0 || WORD_STREAM_KEEP[s.charCodeAt(i - 1)] !== 1 || s.charCodeAt(i - 1) === 46 || s.charCodeAt(i - 1) === 58) &&
+      i + 2 < n &&
+      s.charCodeAt(i + 1) === 32
+    ) {
+      let p = i + 1;
+      let count = 1;
+      while (p < n && s.charCodeAt(p) === 32) {
+        let wsEnd = p + 1;
+        while (wsEnd < n && s.charCodeAt(wsEnd) === 32) wsEnd++;
+        if (wsEnd >= n) break;
+        const nc = s.charCodeAt(wsEnd);
+        const nIsLet = (nc >= 65 && nc <= 90) || (nc >= 97 && nc <= 122);
+        const nextAfter = wsEnd + 1 < n ? s.charCodeAt(wsEnd + 1) : 32;
+        const nextIsAlnum =
+          (nextAfter >= 65 && nextAfter <= 90) ||
+          (nextAfter >= 97 && nextAfter <= 122) ||
+          (nextAfter >= 48 && nextAfter <= 57);
+        if (nIsLet && !nextIsAlnum) {
+          count++;
+          p = wsEnd + 1;
+        } else {
+          break;
+        }
+      }
+      if (count >= 4) {
+        if (!out) out = new Uint8Array(n);
+        for (let k = last; k < i; k++) out[w++] = s.charCodeAt(k) & 0x7f;
+        for (let k = i; k < p; k++) {
+          const kc = s.charCodeAt(k);
+          if (kc !== 32) out[w++] = kc & 0x7f;
+        }
+        last = p;
+        i = p;
+        continue;
+      }
+    }
+    i++;
+  }
+  if (!out) return s;
+  for (let k = last; k < n; k++) out[w++] = s.charCodeAt(k) & 0x7f;
+  return WORD_STREAM_LATIN1_DECODER.decode(out.subarray(0, w));
+}
+
 /**
  * Strictly linear **O(N)** Markdown link, image, autolink-label, reference-link, and footnote stripper (`R7`/`R8`):
  * scans `](` sites over disjoint URL segments with monotonic quote/paren cursors so `'['.repeat(2_097_152)` and
  * `'[a]('.repeat(524_288)` finish in `< 5 ms` (fixing the `O(N^2)` loop), while preserving image alt text and
  * reference-link labels/titles for prompt-injection scanning.
  */
-function unwrapMarkdownLinksForScanLinear(s: string): string {
+function unwrapMarkdownLinksForScanLinear(s: string, stripScrubbedDecoy = false): string {
   // Strip ONLY the URL target of reference-link definitions (`[label]: url "title"` -> `label "title"`) and footnote markers (`[^1]`),
   // preserving BOTH `[label]` text AND any trailing title text while never stripping `[system prompt]: prose` role-override headers!
   let work = s;
+  if (work.includes('[SCRUBBED') || work.includes('[scrubbed')) {
+    work = stripScrubbedDecoy
+      ? work.replace(/\[SCRUBBED:[^\]\r\n]{0,120}\]/gi, ' ')
+      : work.replace(/\[SCRUBBED:?\s*([^\]\r\n]{0,240})\]/gi, ' $1 ');
+  }
+  // Collapse 3+ consecutive single-letter brackets (`[i][g][n][o][r][e]` -> `ignore`) BEFORE `][` reference-link stripping!
+  if (work.includes('][')) {
+    work = work.replace(/(?:\[[A-Za-z]\]){3,}/g, (m) => m.replace(/[\[\]]/g, ''));
+  }
   if (work.includes(']:')) {
     work = work.replace(
       /^([ \t>]{0,12}(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?)\[([^\]\r\n]{1,200})\]:[ \t]*<?(?:https?:|ftp:|mailto:|javascript:|vbscript:|data:|file:|blob:|\/|#)[^\s>]*>?/gim,
@@ -1637,7 +1712,7 @@ function normalizeProseBaseForInjectionScan(prose: string, fillerMode: 'space' |
     out = out.replace(/\\\r?\n/g, ' ').replace(/\\_/g, ' ').replace(/\\([!-/:-@[-`{-~ ])/g, '$1');
   }
   if (out.includes('[') || out.includes(']')) {
-    out = unwrapMarkdownLinksForScanLinear(out);
+    out = unwrapMarkdownLinksForScanLinear(out, fillerMode === 'strip');
   }
   return out;
 }
@@ -1653,9 +1728,9 @@ function normalizeProseForInjectionScan(prose: string, fillerMode: 'space' | 'st
 function normalizeProsePairForInjectionScan(prose: string): { spaced: string; stripped: string } {
   const baseSpaced = normalizeProseBaseForInjectionScan(prose, 'space');
   const spaced = finishFillerPass(baseSpaced, 'space');
-  const baseStripped = /[\u115F\u1160\u3164\uFFA0]/.test(prose)
-    ? normalizeProseBaseForInjectionScan(prose, 'strip')
-    : baseSpaced;
+  const needsDistinctStripBase =
+    /[\u115F\u1160\u3164\uFFA0]/.test(prose) || prose.includes('[SCRUBBED') || prose.includes('[scrubbed');
+  const baseStripped = needsDistinctStripBase ? normalizeProseBaseForInjectionScan(prose, 'strip') : baseSpaced;
   const stripped = finishFillerPass(baseStripped, 'strip');
   return { spaced, stripped };
 }
@@ -1663,9 +1738,10 @@ function normalizeProsePairForInjectionScan(prose: string): { spaced: string; st
 function matchesHiddenSubtreeInjection(rawFragment: string): boolean {
   const { spaced, stripped } = normalizeProsePairForInjectionScan(rawFragment);
   const wordStream = toWordStreamLinear(spaced);
-  if (HIDDEN_OVERRIDE_KEYWORD_RE.test(wordStream)) return true;
+  const collapsed = collapseSpacedSingleLettersLinear(wordStream);
+  if (HIDDEN_OVERRIDE_KEYWORD_RE.test(wordStream) || COMPACT_SPACED_OVERRIDE_RE.test(collapsed)) return true;
   for (const pat of INJECTION_PATTERNS) {
-    if (pat.re.test(spaced) || pat.re.test(wordStream) || pat.re.test(stripped)) {
+    if (pat.re.test(spaced) || pat.re.test(wordStream) || pat.re.test(stripped) || pat.re.test(collapsed)) {
       return true;
     }
   }
@@ -1975,13 +2051,16 @@ export function detectPromptInjection(params: {
   // 3. Full Markdown + code-span / fenced-block scan (`M11` & `R7`/`R8`: zero character-class skip gates, unconditional passes, `< 35 ms` on `2 MiB`!)
   const { spaced: scanSpaced, stripped: scanStripped } = normalizeProsePairForInjectionScan(boundedMd);
   const scanWordStream = toWordStreamLinear(scanSpaced);
+  const scanCollapsed = collapseSpacedSingleLettersLinear(scanWordStream);
 
   for (const pat of INJECTION_PATTERNS) {
     if (
       pat.re.test(scanSpaced) ||
       pat.re.test(scanWordStream) ||
       pat.re.test(scanStripped) ||
-      (pat.id === 'exfiltrate_secrets_or_tools' && pat.re.test(boundedMd))
+      pat.re.test(scanCollapsed) ||
+      (pat.id === 'ignore_previous_instructions' && COMPACT_SPACED_OVERRIDE_RE.test(scanCollapsed)) ||
+      ((pat.id === 'exfiltrate_secrets_or_tools' || pat.id === 'new_system_role_override') && pat.re.test(boundedMd))
     ) {
       triggers.push(pat.id);
       totalScore += pat.weight;

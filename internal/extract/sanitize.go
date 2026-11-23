@@ -2512,9 +2512,13 @@ func escapeBareProtocolRelativeUrlsLinearGo(prose string) string {
 					limit := minInt(n, hostStart+253)
 					sawValidDot := false
 					validLabels := true
+					lastValidMultiEnd := -1
 					for p < limit {
 						hc := prose[p]
 						if isHostLabelByteExtract(hc) {
+							if sawValidDot && hc != '-' {
+								lastValidMultiEnd = p + 1
+							}
 							p++
 							continue
 						}
@@ -2532,8 +2536,12 @@ func escapeBareProtocolRelativeUrlsLinearGo(prose string) string {
 						}
 						break
 					}
-					if validLabels && sawValidDot && prose[p-1] != '-' {
-						matchedEnd = p
+					if validLabels && sawValidDot {
+						if prose[p-1] != '-' {
+							matchedEnd = p
+						} else if lastValidMultiEnd > hostStart {
+							matchedEnd = lastValidMultiEnd
+						}
 					}
 				}
 			}
@@ -3060,7 +3068,7 @@ func sanitizeAndResolveMarkdownProseLinksLinearGo(prose, baseURL string) string 
 				continue
 			}
 
-			if ch == '<' && !noGtOnLine && i+3 < len(line) && !isBackslashEscapedAt(line, i) {
+			if ch == '<' && !noGtOnLine && i+3 < len(line) && !isBackslashEscapedAt(line, i) && !(i >= 2 && line[i-2] == ']' && line[i-1] == '(') {
 				if nextGtOnLine <= i {
 					rel := strings.IndexByte(line[i+1:], '>')
 					if rel < 0 {
@@ -3360,6 +3368,22 @@ func scanNextHTMLTagQuoteAwareGo(s string, from int, noCloseDbl *bool, noCloseSg
 		}
 		nameLower := asciiLowerExtractString(s[nameStart:p])
 		attrStart := p
+		if isClosing {
+			relGt := strings.IndexByte(s[p:], '>')
+			if relGt < 0 {
+				return parsedHTMLTagGo{}, false
+			}
+			gtIdx := p + relGt
+			return parsedHTMLTagGo{
+				start:       lt,
+				end:         gtIdx + 1,
+				tagLower:    nameLower,
+				rawTag:      s[lt : gtIdx+1],
+				attrs:       s[attrStart:gtIdx],
+				isClosing:   true,
+				selfClosing: false,
+			}, true
+		}
 		j := p
 		var quote byte
 		for j < n {
@@ -3508,6 +3532,181 @@ func stripDangerousHTMLSubtreesGo(s string) string {
 	}
 	if last < len(s) {
 		sb.WriteString(s[last:])
+	}
+	return sb.String()
+}
+
+var voidHTMLTagsGo = map[string]bool{
+	"area": true, "base": true, "br": true, "col": true, "embed": true, "hr": true, "img": true,
+	"input": true, "link": true, "meta": true, "param": true, "source": true, "track": true, "wbr": true,
+}
+
+var alwaysHiddenOrChromeClassesGo = map[string]bool{
+	"sr-only": true, "visually-hidden": true, "screenreader-only": true, "hideme": true,
+	"unitheader-banner": true, "js-comment-minimize": true, "js-comment-hide-button": true,
+	"js-suggestion-button-placeholder": true, "js-clipboard-copy": true, "zeroclipboard-container": true,
+	"doc-anchor": true, "documentation-idlink": true, "headerlink": true, "pilcrow": true,
+	"mw-editsection": true, "mw-editsection-bracket": true, "mw-editsection-divider": true,
+	"sphinxsidebar": true, "katex-html": true, "mwe-math-fallback-image-inline": true,
+	"mwe-math-fallback-image-display": true, "lnt": true, "line-numbers-rows": true,
+	"line-numbers-wrapper": true, "hljs-ln-numbers": true, "swiper-slide-duplicate": true,
+	"slick-cloned": true, "splide__slide--clone": true, "flickity-cloned": true,
+	"glide__slide--clone": true, "owl-cloned": true,
+}
+
+var strippedLandmarkRolesGo = map[string]bool{
+	"navigation": true, "search": true, "banner": true, "contentinfo": true,
+	"dialog": true, "alertdialog": true, "menu": true, "menubar": true, "toolbar": true,
+}
+
+func isHiddenInlineStyleGo(styleVal string) bool {
+	for _, decl := range strings.Split(styleVal, ";") {
+		d := strings.TrimSpace(asciiLowerExtractString(decl))
+		if d == "" {
+			continue
+		}
+		colon := strings.IndexByte(d, ':')
+		if colon <= 0 {
+			continue
+		}
+		prop := strings.TrimSpace(d[:colon])
+		val := strings.TrimSpace(d[colon+1:])
+		switch prop {
+		case "display":
+			if val == "none" || strings.HasPrefix(val, "none ") || strings.HasPrefix(val, "none!") {
+				return true
+			}
+		case "visibility":
+			if val == "hidden" || strings.HasPrefix(val, "hidden ") || strings.HasPrefix(val, "hidden!") {
+				return true
+			}
+		case "opacity":
+			trimmedZero := strings.TrimRight(strings.TrimPrefix(val, "0."), "0")
+			if val == "0" || (strings.HasPrefix(val, "0.") && trimmedZero == "" && len(val) > 2) {
+				return true
+			}
+		case "font-size":
+			if val == "0" || val == "0px" || val == "0em" || val == "0rem" || val == "0%" || val == "0pt" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func shouldStripHiddenOrChromeOpenTagGo(tagLower, attrStr string) bool {
+	if attrStr == "" || tagLower == "html" || tagLower == "body" || tagLower == "main" || tagLower == "article" {
+		return false
+	}
+	lowAttr := asciiLowerExtractString(attrStr)
+	if !strings.Contains(lowAttr, "hidden") && !strings.Contains(lowAttr, "style") &&
+		!strings.Contains(lowAttr, "role") && !strings.Contains(lowAttr, "class") {
+		return false
+	}
+	attrs := parseHTMLTagAttrsGo(attrStr)
+	if hv, hasHidden := attrs["hidden"]; hasHidden {
+		hvTrim := strings.TrimSpace(asciiLowerExtractString(hv))
+		if hvTrim != "false" && hvTrim != "0" {
+			return true
+		}
+	}
+	if sv, hasStyle := attrs["style"]; hasStyle && sv != "" {
+		if !strings.Contains(lowAttr, "mwe-math") && !strings.Contains(lowAttr, "katex-mathml") && !strings.Contains(lowAttr, "mjx-assistive") {
+			if isHiddenInlineStyleGo(sv) {
+				return true
+			}
+		}
+	}
+	if rv, hasRole := attrs["role"]; hasRole && strippedLandmarkRolesGo[strings.TrimSpace(asciiLowerExtractString(rv))] {
+		return true
+	}
+	if (tagLower == "span" || tagLower == "i") && strings.TrimSpace(asciiLowerExtractString(attrs["aria-hidden"])) == "true" {
+		return true
+	}
+	if cv, hasClass := attrs["class"]; hasClass && cv != "" {
+		lowClass := asciiLowerExtractString(cv)
+		hasDNoneOrTw := false
+		for _, tok := range strings.Fields(lowClass) {
+			if alwaysHiddenOrChromeClassesGo[tok] {
+				return true
+			}
+			if tok == "d-none" || tok == "tw-hidden" {
+				hasDNoneOrTw = true
+			}
+		}
+		if hasDNoneOrTw && !strings.Contains(lowClass, "-block") && !strings.Contains(lowClass, "-flex") &&
+			!strings.Contains(lowClass, "-inline") && !strings.Contains(lowClass, "-grid") &&
+			!strings.Contains(lowClass, "-table") && !strings.Contains(lowClass, ":block") &&
+			!strings.Contains(lowClass, ":flex") && !strings.Contains(lowClass, ":inline") &&
+			!strings.Contains(lowClass, ":grid") && !strings.Contains(lowClass, ":table") {
+			return true
+		}
+	}
+	return false
+}
+
+func stripHiddenAndChromeSubtreesGo(s string) string {
+	low := asciiLowerExtractString(s)
+	if !strings.Contains(low, "hidden") && !strings.Contains(low, "style") &&
+		!strings.Contains(low, "role") && !strings.Contains(low, "class") {
+		return s
+	}
+	var sb strings.Builder
+	noDbl, noSgl := false, false
+	lastKeepIdx := 0
+	skipTag := ""
+	skipDepth := 0
+	skipStartIdx := 0
+	changed := false
+	pos := 0
+
+	for pos < len(s) {
+		tag, ok := scanNextHTMLTagQuoteAwareGo(s, pos, &noDbl, &noSgl)
+		if !ok {
+			break
+		}
+		if tag.attrs != "" && tag.attrs[0] != ' ' && tag.attrs[0] != '\t' && tag.attrs[0] != '\n' && tag.attrs[0] != '\r' && tag.attrs[0] != '\f' && tag.attrs[0] != '/' {
+			pos = tag.end
+			continue
+		}
+		isSelfClosing := !tag.isClosing && (voidHTMLTagsGo[tag.tagLower] || tag.selfClosing)
+		if skipDepth > 0 {
+			if tag.tagLower == skipTag {
+				if tag.isClosing {
+					skipDepth--
+					if skipDepth == 0 {
+						lastKeepIdx = tag.end
+					}
+				} else if !isSelfClosing {
+					skipDepth++
+				}
+			}
+			pos = tag.end
+			continue
+		}
+		if !tag.isClosing && shouldStripHiddenOrChromeOpenTagGo(tag.tagLower, tag.attrs) {
+			if !changed && sb.Cap() == 0 {
+				sb.Grow(len(s))
+			}
+			sb.WriteString(s[lastKeepIdx:tag.start])
+			changed = true
+			if isSelfClosing {
+				lastKeepIdx = tag.end
+			} else {
+				skipTag = tag.tagLower
+				skipDepth = 1
+				skipStartIdx = tag.start
+			}
+		}
+		pos = tag.end
+	}
+	if !changed && skipDepth == 0 {
+		return s
+	}
+	if skipDepth > 0 {
+		sb.WriteString(s[skipStartIdx:])
+	} else if lastKeepIdx < len(s) {
+		sb.WriteString(s[lastKeepIdx:])
 	}
 	return sb.String()
 }
@@ -4052,6 +4251,9 @@ func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, _ bo
 
 	if strings.IndexByte(proseWork, '<') >= 0 && strings.IndexByte(proseWork, '>') >= 0 {
 		proseWork = stripDangerousHTMLSubtreesGo(proseWork)
+		if strings.IndexByte(proseWork, '<') >= 0 && strings.IndexByte(proseWork, '>') >= 0 {
+			proseWork = stripHiddenAndChromeSubtreesGo(proseWork)
+		}
 		if strings.IndexByte(proseWork, '<') >= 0 && strings.IndexByte(proseWork, '>') >= 0 {
 			proseWork = convertInlineHTMLInProseGo(proseWork, baseURL, &inlineCodeStash)
 		}

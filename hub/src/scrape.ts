@@ -3388,7 +3388,10 @@ export function formatInertiaPagePropsToMarkdown(
   htmlToMd?: (frag: string, base?: string) => { markdown: string; links: string[] },
 ): { title?: string; description?: string; markdown: string } | null {
   const rawComponent = typeof inertiaObj.component === 'string' ? inertiaObj.component : '';
-  const component = stripInvisibleSmugglingChars(decodeHtmlEntities(stripInvisibleSmugglingChars(rawComponent)))
+  const decodedComponent = stripInvisibleSmugglingChars(
+    decodeMarkdownEntitiesPreservingLt(decodeHtmlEntities(stripInvisibleSmugglingChars(rawComponent))),
+  );
+  const component = neutralizeAllUnsafeMarkdownLinksLinear(decodedComponent)
     .replace(/[\r\n`]+/g, ' ')
     .replace(/</g, '&lt;')
     .trim();
@@ -7064,7 +7067,12 @@ export function extractMarkdownLinksAndImages(
   };
 }
 
-function sanitizeRecordUrlsDeep<T>(value: T, depth = 0, seen?: WeakSet<object>): T {
+export function sanitizeRecordUrlsDeep<T>(
+  value: T,
+  depth = 0,
+  memo?: WeakMap<object, unknown>,
+  inStack?: WeakSet<object>,
+): T {
   if (depth > 16 || value === null || value === undefined) return value;
   if (typeof value === 'string') {
     const trimmed = value.trim();
@@ -7075,36 +7083,52 @@ function sanitizeRecordUrlsDeep<T>(value: T, depth = 0, seen?: WeakSet<object>):
     return value;
   }
   if (typeof value !== 'object') return value;
-  const visited = seen ?? new WeakSet<object>();
-  if (visited.has(value as object)) return value;
-  visited.add(value as object);
-  if (Array.isArray(value)) {
-    let changed = false;
-    const out = new Array<unknown>(value.length);
-    for (let i = 0; i < value.length; i++) {
-      const orig = value[i];
-      const next = sanitizeRecordUrlsDeep(orig, depth + 1, visited);
-      if (next !== orig) changed = true;
-      out[i] = next;
+  const obj = value as object;
+  const cache = memo ?? new WeakMap<object, unknown>();
+  const stack = inStack ?? new WeakSet<object>();
+  if (stack.has(obj)) return (Array.isArray(value) ? [] : {}) as unknown as T;
+  if (cache.has(obj)) return cache.get(obj) as T;
+  stack.add(obj);
+  try {
+    if (Array.isArray(value)) {
+      let changed = false;
+      const out = new Array<unknown>(value.length);
+      for (let i = 0; i < value.length; i++) {
+        const orig = value[i];
+        const next = sanitizeRecordUrlsDeep(orig, depth + 1, cache, stack);
+        if (next !== orig) changed = true;
+        out[i] = next;
+      }
+      const res = (changed ? out : value) as unknown as T;
+      cache.set(obj, res);
+      return res;
     }
-    return (changed ? out : value) as unknown as T;
-  }
-  const src = value as Record<string, unknown>;
-  let cloned: Record<string, unknown> | null = null;
-  const keys = Object.keys(src);
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[i]!;
-    const orig = src[k];
-    const next = sanitizeRecordUrlsDeep(orig, depth + 1, visited);
-    if (next !== orig) {
-      if (!cloned) cloned = { ...src };
-      cloned[k] = next;
+    const src = value as Record<string, unknown>;
+    let cloned: Record<string, unknown> | null = null;
+    const keys = Object.keys(src);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i]!;
+      const orig = src[k];
+      const next = sanitizeRecordUrlsDeep(orig, depth + 1, cache, stack);
+      if (next !== orig) {
+        if (!cloned) cloned = { ...src };
+        cloned[k] = next;
+      }
     }
+    const res = (cloned ?? value) as unknown as T;
+    cache.set(obj, res);
+    return res;
+  } finally {
+    stack.delete(obj);
   }
-  return (cloned ?? value) as unknown as T;
 }
 
-function redactPiiDeep<T>(value: T, depth = 0, seen?: WeakSet<object>): T {
+export function redactPiiDeep<T>(
+  value: T,
+  depth = 0,
+  memo?: WeakMap<object, unknown>,
+  inStack?: WeakSet<object>,
+): T {
   if (depth > 16 || value === null || value === undefined) return value;
   if (typeof value === 'string') {
     let redacted = redactPiiText(value);
@@ -7114,33 +7138,44 @@ function redactPiiDeep<T>(value: T, depth = 0, seen?: WeakSet<object>): T {
     return redacted as unknown as T;
   }
   if (typeof value !== 'object') return value;
-  const visited = seen ?? new WeakSet<object>();
-  if (visited.has(value as object)) return value;
-  visited.add(value as object);
-  if (Array.isArray(value)) {
-    let changed = false;
-    const out = new Array<unknown>(value.length);
-    for (let i = 0; i < value.length; i++) {
-      const orig = value[i];
-      const next = redactPiiDeep(orig, depth + 1, visited);
-      if (next !== orig) changed = true;
-      out[i] = next;
+  const obj = value as object;
+  const cache = memo ?? new WeakMap<object, unknown>();
+  const stack = inStack ?? new WeakSet<object>();
+  if (stack.has(obj)) return (Array.isArray(value) ? [] : {}) as unknown as T;
+  if (cache.has(obj)) return cache.get(obj) as T;
+  stack.add(obj);
+  try {
+    if (Array.isArray(value)) {
+      let changed = false;
+      const out = new Array<unknown>(value.length);
+      for (let i = 0; i < value.length; i++) {
+        const orig = value[i];
+        const next = redactPiiDeep(orig, depth + 1, cache, stack);
+        if (next !== orig) changed = true;
+        out[i] = next;
+      }
+      const res = (changed ? out : value) as unknown as T;
+      cache.set(obj, res);
+      return res;
     }
-    return (changed ? out : value) as unknown as T;
-  }
-  const src = value as Record<string, unknown>;
-  let cloned: Record<string, unknown> | null = null;
-  const keys = Object.keys(src);
-  for (let i = 0; i < keys.length; i++) {
-    const k = keys[i]!;
-    const orig = src[k];
-    const next = redactPiiDeep(orig, depth + 1, visited);
-    if (next !== orig) {
-      if (!cloned) cloned = { ...src };
-      cloned[k] = next;
+    const src = value as Record<string, unknown>;
+    let cloned: Record<string, unknown> | null = null;
+    const keys = Object.keys(src);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i]!;
+      const orig = src[k];
+      const next = redactPiiDeep(orig, depth + 1, cache, stack);
+      if (next !== orig) {
+        if (!cloned) cloned = { ...src };
+        cloned[k] = next;
+      }
     }
+    const res = (cloned ?? value) as unknown as T;
+    cache.set(obj, res);
+    return res;
+  } finally {
+    stack.delete(obj);
   }
-  return (cloned ?? value) as unknown as T;
 }
 
 function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {

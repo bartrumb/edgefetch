@@ -960,17 +960,15 @@ function normalizeSliceLineEndingsLengthPreserving(s: string): string {
   return s.replace(/\r(?!\n)/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ');
 }
 
-function isThematicBreakSimpleAt(raw: string, relCols: number, pos: number): boolean {
-  if (relCols > 3 || pos >= raw.length) return false;
-  const ch = raw.charCodeAt(pos);
-  if (ch !== 45 /* '-' */ && ch !== 42 /* '*' */ && ch !== 95 /* '_' */) return false;
+function findThematicBreakMismatch(raw: string, relCols: number, pos: number, ch: number): number {
+  if (relCols > 3 || pos >= raw.length) return pos;
   let count = 0;
   for (let i = pos; i < raw.length; i++) {
     const c = raw.charCodeAt(i);
     if (c === ch) count++;
-    else if (c !== 32 && c !== 9) return false;
+    else if (c !== 32 && c !== 9) return i;
   }
-  return count >= 3;
+  return count >= 3 ? -1 : raw.length;
 }
 
 const _prefixFlagsOut = { prefixLen: 0, hasBlockquote: false, hasListMarker: false };
@@ -980,6 +978,8 @@ function scanContainerPrefixFlagsLinear(raw: string): { prefixLen: number; hasBl
   let pCol = 0;
   let hasBlockquote = false;
   let hasListMarker = false;
+  let dashMismatch = -2;
+  let starMismatch = -2;
   for (;;) {
     const runStartCol = pCol;
     while (i < raw.length) {
@@ -1010,11 +1010,24 @@ function scanContainerPrefixFlagsLinear(raw: string): { prefixLen: number; hasBl
         break;
       }
       const nx = raw.charCodeAt(i + 1);
-      if ((nx === 32 || nx === 9) && !isThematicBreakSimpleAt(raw, pCol - runStartCol, i)) {
-        hasListMarker = true;
-        i++;
-        pCol++;
-        continue;
+      if (nx === 32 || nx === 9) {
+        let isThematic = false;
+        const relCols = pCol - runStartCol;
+        if (relCols <= 3 && (c === 45 || c === 42)) {
+          if (c === 45) {
+            if (dashMismatch < i) dashMismatch = findThematicBreakMismatch(raw, relCols, i, 45);
+            isThematic = dashMismatch === -1;
+          } else {
+            if (starMismatch < i) starMismatch = findThematicBreakMismatch(raw, relCols, i, 42);
+            isThematic = starMismatch === -1;
+          }
+        }
+        if (!isThematic) {
+          hasListMarker = true;
+          i++;
+          pCol++;
+          continue;
+        }
       }
     } else if (c >= 48 && c <= 57) {
       let j = i;
@@ -1425,7 +1438,8 @@ export function recognizeAndHardenMarkdownFences(
   }
 
   const lines = md.split('\n');
-  const outLines: string[] = [];
+  const outLines: string[] = reopened ? [] : lines;
+  let anyLineChanged = Boolean(reopened);
   const fenceSpans: Array<{ openLine: number; closeLine: number }> = [];
   const state = opts.initialState ? cloneMarkdownFenceRecognizerState(opts.initialState) : createMarkdownFenceRecognizerState();
 
@@ -1453,7 +1467,7 @@ export function recognizeAndHardenMarkdownFences(
     const raw = cr ? rawWithCr.slice(0, -1) : rawWithCr;
 
     if (li === 0 && skipSepNl && !state.inFence) {
-      outLines.push(rawWithCr);
+      if (reopened) outLines.push(rawWithCr);
       continue;
     }
 
@@ -1461,16 +1475,29 @@ export function recognizeAndHardenMarkdownFences(
     const step = stepCanonicalMarkdownFenceLine(raw, state, harden);
 
     if (step.kind === 'open_trusted') {
-      fenceOpenOutIdx = outLines.length;
+      fenceOpenOutIdx = reopened ? outLines.length : li;
       fenceOpenInfo = step.openedInfo;
       fenceOpenCr = cr;
-      outLines.push(`${step.outLine}${cr}`);
+      const nextLine = cr ? step.outLine + cr : step.outLine;
+      if (reopened) {
+        outLines.push(nextLine);
+      } else if (nextLine !== rawWithCr) {
+        outLines[li] = nextLine;
+        anyLineChanged = true;
+      }
       continue;
     }
 
     if (step.kind === 'close_trusted') {
-      outLines.push(`${step.outLine}${cr}`);
-      fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1 });
+      const nextLine = cr ? step.outLine + cr : step.outLine;
+      const closeIdx = reopened ? outLines.length : li;
+      if (reopened) {
+        outLines.push(nextLine);
+      } else if (nextLine !== rawWithCr) {
+        outLines[li] = nextLine;
+        anyLineChanged = true;
+      }
+      fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: closeIdx });
       fenceOpenOutIdx = -1;
       fenceOpenInfo = '';
       fenceOpenCr = '';
@@ -1479,23 +1506,33 @@ export function recognizeAndHardenMarkdownFences(
 
     if (step.kind === 'in_trusted') {
       if (harden && step.lengthenedEffectiveLen > 0 && fenceOpenOutIdx >= 0) {
-        outLines[fenceOpenOutIdx] = `${activeFenceCh.repeat(step.lengthenedEffectiveLen)}${fenceOpenInfo}${fenceOpenCr}`;
+        outLines[fenceOpenOutIdx] = activeFenceCh.repeat(step.lengthenedEffectiveLen) + fenceOpenInfo + fenceOpenCr;
+        anyLineChanged = true;
       }
-      outLines.push(`${step.outLine}${cr}`);
+      if (reopened) {
+        outLines.push(cr ? step.outLine + cr : step.outLine);
+      }
       continue;
     }
 
-    outLines.push(`${step.outLine}${cr}`);
+    const nextLine = cr ? step.outLine + cr : step.outLine;
+    if (reopened) {
+      outLines.push(nextLine);
+    } else if (nextLine !== rawWithCr) {
+      outLines[li] = nextLine;
+      anyLineChanged = true;
+    }
   }
 
   if (state.inFence) {
     if (harden) {
       outLines.push(state.fenceChar.repeat(state.effectiveFenceLen));
+      anyLineChanged = true;
     }
     fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1 });
   }
 
-  const hardened = outLines.join('\n');
+  const hardened = anyLineChanged ? outLines.join('\n') : md;
   if (fenceSpans.length === 0) {
     return { hardened, segments: [hardened] };
   }
@@ -1589,8 +1626,17 @@ export function sanitizeMarkdownPageSlice(
   checkpoints?: readonly MarkdownSliceCheckpoint[],
 ): string {
   if (!rawSliceInput) return '';
-  const fullMd = normalizeSliceLineEndingsLengthPreserving(rawFullMd);
-  const rawSlice = normalizeSliceLineEndingsLengthPreserving(rawSliceInput);
+  const cleanFullPre = stripInvisibleSmugglingChars(rawFullMd.replace(/\0/g, ''));
+  const cleanSlicePre = stripInvisibleSmugglingChars(rawSliceInput.replace(/\0/g, ''));
+  if (!cleanSlicePre) return '';
+  const hadInvisibleInFull = cleanFullPre !== rawFullMd;
+  const effectiveOffset =
+    hadInvisibleInFull && safeOffset > 0
+      ? stripInvisibleSmugglingChars(rawFullMd.slice(0, Math.min(safeOffset, rawFullMd.length)).replace(/\0/g, '')).length
+      : safeOffset;
+  const effectiveCheckpoints = hadInvisibleInFull ? undefined : checkpoints;
+  const fullMd = normalizeSliceLineEndingsLengthPreserving(cleanFullPre);
+  const rawSlice = normalizeSliceLineEndingsLengthPreserving(cleanSlicePre);
 
   const state = createMarkdownFenceRecognizerState();
   let reconstructed = rawSlice;
@@ -1599,16 +1645,16 @@ export function sanitizeMarkdownPageSlice(
   let skipLeadingSeparatorEmptyLine = false;
   let forceLeadingNewlineForConcat = false;
 
-  if (safeOffset > 0 && fullMd.length > 0) {
-    const clampedOffset = Math.min(safeOffset, fullMd.length);
+  if (effectiveOffset > 0 && fullMd.length > 0) {
+    const clampedOffset = Math.min(effectiveOffset, fullMd.length);
     let pos = 0;
-    if (checkpoints && checkpoints.length > 0) {
+    if (effectiveCheckpoints && effectiveCheckpoints.length > 0) {
       let lo = 0;
-      let hi = checkpoints.length - 1;
+      let hi = effectiveCheckpoints.length - 1;
       let bestIdx = -1;
       while (lo <= hi) {
         const mid = (lo + hi) >>> 1;
-        if (checkpoints[mid]!.pos <= clampedOffset) {
+        if (effectiveCheckpoints[mid]!.pos <= clampedOffset) {
           bestIdx = mid;
           lo = mid + 1;
         } else {
@@ -1616,7 +1662,7 @@ export function sanitizeMarkdownPageSlice(
         }
       }
       if (bestIdx >= 0) {
-        const cp = checkpoints[bestIdx]!;
+        const cp = effectiveCheckpoints[bestIdx]!;
         pos = cp.pos;
         state.inFence = cp.inFence;
         state.fenceChar = cp.fenceChar === '`' || cp.fenceChar === '~' ? cp.fenceChar : '';
@@ -1747,8 +1793,13 @@ export function sanitizeMarkdownPageSlice(
   const lastIdx = segTexts.length - 1;
   if (lastIdx >= 0 && lastIdx % 2 === 0 && segTexts[lastIdx]!.includes('`')) {
     const lastProse = segTexts[lastIdx]!;
-    const lastBlank = lastProse.lastIndexOf('\n\n');
-    const tailPara = lastBlank >= 0 ? lastProse.slice(lastBlank + 2) : lastProse;
+    let tailParaStart = 0;
+    const blankParaRe = /\r?\n[ \t]*\r?\n/g;
+    let bm: RegExpExecArray | null;
+    while ((bm = blankParaRe.exec(lastProse)) !== null) {
+      tailParaStart = bm.index + bm[0].length;
+    }
+    const tailPara = tailParaStart > 0 ? lastProse.slice(tailParaStart) : lastProse;
     let p = 0;
     let openTickLen = 0;
     while (p < tailPara.length) {

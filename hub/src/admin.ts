@@ -24,12 +24,14 @@ import {
   type GitHubAuthEnv,
 } from './github-auth';
 import { testAndListRemoteMcpTools } from './mcp-federation';
-import { discoverMcps, isSafePublicHttpsUrl, slugifyMcpServerName, validateConnectorDomains } from './mcp-registry';
+import { discoverMcps, isSafePublicHttpsUrl, validateConnectorDomains } from './mcp-registry';
 import {
   buildMaskedAuthSummary,
   completeDownstreamMcpOAuthCallback,
+  isValidMcpConnectorSlug,
   MCP_OAUTH_BIND_COOKIE,
   MCP_OAUTH_BIND_COOKIE_DEV,
+  normalizeMcpConnectorSlug,
   probeRemoteMcpOAuthMetadata,
   resolveCallerUserId,
   sanitizeSecretHeadersInput,
@@ -2201,7 +2203,24 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         const cleanName =
           stripInvisibleSmugglingChars(typeof body.name === 'string' ? body.name : '').trim().slice(0, 120) ||
           urlCheck.url.hostname;
-        const slug = slugifyMcpServerName(typeof body.slug === 'string' && body.slug.trim() ? body.slug : cleanName);
+        if (body.slug !== undefined && typeof body.slug !== 'string') {
+          return adminJson({ ok: false, error: 'invalid_slug', message: 'Connector slug must be a string.' }, 400);
+        }
+        const rawExplicitSlug = typeof body.slug === 'string' ? body.slug.trim() : '';
+        if (rawExplicitSlug.length > 0 && !isValidMcpConnectorSlug(rawExplicitSlug.toLowerCase())) {
+          return adminJson(
+            {
+              ok: false,
+              error: 'invalid_slug',
+              message: 'Connector slug must match /^[a-z0-9][a-z0-9_-]{0,47}$/ and must not contain "__".',
+            },
+            400,
+          );
+        }
+        const slug = rawExplicitSlug.length > 0 ? rawExplicitSlug.toLowerCase() : normalizeMcpConnectorSlug(cleanName);
+        if (!isValidMcpConnectorSlug(slug)) {
+          return adminJson({ ok: false, error: 'invalid_slug', message: 'Invalid connector slug.' }, 400);
+        }
 
         const now = Date.now();
         const existing = await deps.vaultStore.getServer(userId, slug);

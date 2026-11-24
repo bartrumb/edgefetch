@@ -1464,6 +1464,58 @@ test('R11-M8/M9/S6-audit: Hub DO/Portable resealServerSecret wiring, agent list_
     assert.ok(openMatches.length >= 1, `Expected <untrusted_mcp_tool_output> in deterministic markdown, got: ${detMd}`);
     assert.equal(closeMatches.length, openMatches.length, `Unescaped inner </untrusted_mcp_tool_output> breakout in deterministic markdown: ${detMd}`);
     assert.match(detMd, /&lt;\/untrusted_mcp_tool_output>/);
+
+    // 5. P3-3 / S6: `POST /admin/api/mcp/connect` rejects `__` or malformed explicit `slug` with `400 invalid_slug`
+    //    BEFORE any outbound `tools/list` probe, and normalizes `__` in `name` when `slug` is omitted!
+    const { ADMIN_COOKIE_NAME, createAdminSessionValue } = await import('../src/oauth');
+    const session = await createAdminSessionValue(TEST_OWNER_TOKEN, Date.now());
+    let probeHits = 0;
+    const probeEnv = {
+      ...env,
+      SAFE_PUBLIC_FETCH: async (_i: RequestInfo | URL, init?: RequestInit) => {
+        probeHits++;
+        const rpc = JSON.parse(String(init?.body ?? '{}')) as { id?: string | number; method?: string };
+        if (rpc.method === 'initialize') {
+          return Response.json({ jsonrpc: '2.0', id: rpc.id, result: { protocolVersion: '2025-03-26', capabilities: {} } });
+        }
+        return Response.json({ jsonrpc: '2.0', id: rpc.id, result: { tools: [] } });
+      },
+    };
+    for (const badSlug of ['bad__slug', 'slug/tool', 'slug*wild']) {
+      const badConn = await hubWorker.fetch(
+        new Request('https://hub.example.com/admin/api/mcp/connect', {
+          method: 'POST',
+          headers: {
+            cookie: `${ADMIN_COOKIE_NAME}=${session.value}`,
+            origin: 'https://hub.example.com',
+            'x-csrf-token': session.csrf,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ name: 'Public MCP', slug: badSlug, remoteUrl: 'https://mcp.linear.app/mcp' }),
+        }),
+        probeEnv,
+      );
+      assert.equal(badConn.status, 400, `Expected 400 invalid_slug for slug="${badSlug}", got ${badConn.status}`);
+      assert.equal(((await badConn.json()) as { error?: string }).error, 'invalid_slug');
+    }
+    assert.equal(probeHits, 0, 'POST /admin/api/mcp/connect must reject invalid slug BEFORE firing outbound tools/list probe');
+
+    const derivedConn = await hubWorker.fetch(
+      new Request('https://hub.example.com/admin/api/mcp/connect', {
+        method: 'POST',
+        headers: {
+          cookie: `${ADMIN_COOKIE_NAME}=${session.value}`,
+          origin: 'https://hub.example.com',
+          'x-csrf-token': session.csrf,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ name: 'my__public__mcp', remoteUrl: 'https://mcp.linear.app/mcp' }),
+      }),
+      probeEnv,
+    );
+    assert.equal(derivedConn.status, 200);
+    const derivedBody = (await derivedConn.json()) as { server?: { slug?: string } };
+    assert.equal(derivedBody.server?.slug, 'my-public-mcp');
   } finally {
     coordinator.close();
     rmSync(tmpDir, { recursive: true, force: true });

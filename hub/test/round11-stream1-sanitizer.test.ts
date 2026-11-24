@@ -513,4 +513,71 @@ test('R11-S2: sanitizeMarkdownPageSlice preserves container & non-blank state ac
     assert.equal(page.page.content.includes('\r'), false, `CRLF survived readArtifactPage: ${JSON.stringify(page.page.content)}`);
     assert.equal(page.page.content.includes('<x-probe>'), false, `raw <x-probe> survived CRLF readArtifactPage: ${JSON.stringify(page.page.content)}`);
   }
+
+  // Invisible-char fence-polarity inversion (`\u200B~~~ ... \u200B\`\`\``) in `sanitizeMarkdownPageSlice` & `readArtifactPage`
+  const invDoc = [
+    'intro',
+    '',
+    '\u200B~~~',
+    'a',
+    '',
+    '~~~',
+    '',
+    '\u200B```',
+    '~~~',
+    '',
+    '```',
+    '<script>alert(1)</script>',
+    '[xss](javascript:alert(1))',
+    '```',
+  ].join('\n');
+  for (let off = 0; off < invDoc.indexOf('<script>'); off++) {
+    const invSlice = sanitizeMarkdownPageSlice(invDoc, off, invDoc.slice(off), false);
+    assertProseSafe(`invDoc@${off}`, invSlice, false);
+    assert.equal(invSlice.includes('javascript:'), false, `javascript: survived invDoc@${off}: ${invSlice}`);
+  }
+  const invSha = createHash('sha256').update('r11-s2-inv-artifact').digest('hex');
+  await r2.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', invSha), invDoc, {
+    httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+    customMetadata: { pipelineVersion: String(SCRAPE_PIPELINE_VERSION) },
+  });
+  const invPage = await readArtifactPage({
+    bucket: r2 as unknown as R2Bucket,
+    blobSha256: `md:${invSha}`,
+    format: 'markdown',
+    offset: 0,
+    limit: 10_000,
+  });
+  assert.equal(invPage.ok, true);
+  if (invPage.ok) {
+    assertProseSafe('invPage', invPage.page.content, false);
+    assert.equal(invPage.page.content.includes('javascript:'), false);
+  }
+
+  // CRLF `\r\n\r\n` truncated inline backtick code span paragraph isolation
+  const crlfInlineDoc = 'para1 `stray\r\n\r\npara2 `unclosed_code_span\r\n\r\nnext para';
+  const crlfCut = crlfInlineDoc.indexOf('\r\n\r\nnext para');
+  const crlfClosed = sanitizeMarkdownPageSlice(crlfInlineDoc, 0, crlfInlineDoc.slice(0, crlfCut), false);
+  assert.ok(crlfClosed.endsWith('para2 `unclosed_code_span`'), `Expected closed inline span in para2, got: ${JSON.stringify(crlfClosed)}`);
+
+  // `formatInertiaPagePropsToMarkdown` neutralizes unsafe links in `component`
+  const badComp = formatInertiaPagePropsToMarkdown({
+    component: '[Click](javascript:alert(1))',
+    props: { count: 42 },
+  });
+  assert.ok(badComp);
+  assert.equal(badComp.markdown.includes('javascript:'), false, `javascript: survived Inertia component: ${badComp.markdown}`);
+
+  // `redactPiiDeep` and `sanitizeRecordUrlsDeep` sanitize shared DAG sub-object references across branches
+  const sharedAuthor = {
+    email: 'alice@company.example',
+    url: 'https://company.example/u/(alice)?k=<1>',
+  };
+  const dagInput = { first: sharedAuthor, second: sharedAuthor };
+  const dagUrlsEncoded = scrapeModule.sanitizeRecordUrlsDeep(dagInput);
+  assert.equal(dagUrlsEncoded.first.url, 'https://company.example/u/%28alice%29?k=%3C1%3E');
+  assert.equal(dagUrlsEncoded.second.url, 'https://company.example/u/%28alice%29?k=%3C1%3E');
+  const dagRedacted = scrapeModule.redactPiiDeep(dagUrlsEncoded);
+  assert.equal(dagRedacted.first.email, '[REDACTED_EMAIL]');
+  assert.equal(dagRedacted.second.email, '[REDACTED_EMAIL]');
 });

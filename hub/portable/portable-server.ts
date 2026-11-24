@@ -1319,7 +1319,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     //    when partial-header sockets HAVE saturated >= 50% of the pool, evict strictly oldest `connectedAt` / `connSeq` first
     //    (tie-breaking 0-byte before partial-byte only when both are >= 250ms aged).
     const bothAged = cand.ageMs >= FRESH_PREHEADER_GRACE_MS && best.ageMs >= FRESH_PREHEADER_GRACE_MS;
-    if (!partialPoolSaturated || bothAged) {
+    const closeInAge = Math.abs(cand.rec.connectedAt - best.rec.connectedAt) <= 10;
+    if (bothAged || (!partialPoolSaturated && closeInAge)) {
       if (cand.isPartial !== best.isPartial) {
         return !cand.isPartial;
       }

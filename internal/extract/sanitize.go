@@ -199,13 +199,11 @@ func SanitizeMarkdownWithOptions(md, baseURL string, allowPdfPageMarkers bool) s
 	if md == "" {
 		return ""
 	}
-	if !utf8.ValidString(md) {
-		md = strings.ToValidUTF8(md, "\uFFFD")
-	}
 	bounded := md
 	if len(bounded) > maxSanitizeMarkdownScanBytes {
 		cut := maxSanitizeMarkdownScanBytes
-		for cut > 0 && !utf8.RuneStart(bounded[cut]) {
+		floor := maxSanitizeMarkdownScanBytes - 3
+		for cut > floor && cut > 0 && (bounded[cut]&0xC0) == 0x80 {
 			cut--
 		}
 		bounded = bounded[:cut]
@@ -357,9 +355,11 @@ func stripInvisibleSmugglingCharsGo(s string) string {
 	for ; i+8 <= n; i += 8 {
 		b0, b1, b2, b3 := s[i], s[i+1], s[i+2], s[i+3]
 		b4, b5, b6, b7 := s[i+4], s[i+5], s[i+6], s[i+7]
-		if (b0|b1|b2|b3|b4|b5|b6|b7) >= 0x7F ||
-			b0 < 0x20 || b1 < 0x20 || b2 < 0x20 || b3 < 0x20 ||
-			b4 < 0x20 || b5 < 0x20 || b6 < 0x20 || b7 < 0x20 {
+		m := (int(b0) - 0x20) | (int(b1) - 0x20) | (int(b2) - 0x20) | (int(b3) - 0x20) |
+			(int(b4) - 0x20) | (int(b5) - 0x20) | (int(b6) - 0x20) | (int(b7) - 0x20) |
+			(0x7E - int(b0)) | (0x7E - int(b1)) | (0x7E - int(b2)) | (0x7E - int(b3)) |
+			(0x7E - int(b4)) | (0x7E - int(b5)) | (0x7E - int(b6)) | (0x7E - int(b7))
+		if m < 0 {
 			if !isSafePrintableASCIIByte(b0) || !isSafePrintableASCIIByte(b1) || !isSafePrintableASCIIByte(b2) || !isSafePrintableASCIIByte(b3) ||
 				!isSafePrintableASCIIByte(b4) || !isSafePrintableASCIIByte(b5) || !isSafePrintableASCIIByte(b6) || !isSafePrintableASCIIByte(b7) {
 				purePrintable = false
@@ -541,13 +541,9 @@ func measureLeadingIndentColsGo(raw string) (cols int, bytePos int, isBlank bool
 	return cols, i, i >= len(raw)
 }
 
-func isThematicBreakLineLinearGo(raw string, leadCols int, leadPos int) bool {
+func findThematicBreakMismatchGo(raw string, leadCols int, leadPos int, ch byte) int {
 	if leadCols > 3 || leadPos >= len(raw) {
-		return false
-	}
-	ch := raw[leadPos]
-	if ch != '-' && ch != '*' && ch != '_' {
-		return false
+		return leadPos
 	}
 	count := 0
 	for i := leadPos; i < len(raw); i++ {
@@ -555,10 +551,13 @@ func isThematicBreakLineLinearGo(raw string, leadCols int, leadPos int) bool {
 		if c == ch {
 			count++
 		} else if c != ' ' && c != '\t' {
-			return false
+			return i
 		}
 	}
-	return count >= 3
+	if count >= 3 {
+		return -1
+	}
+	return len(raw)
 }
 
 func normalizeUnicodeLineSeparatorsGo(md string) string {
@@ -573,6 +572,8 @@ func normalizeUnicodeLineSeparatorsGo(md string) string {
 func scanContainerPrefixLinearGo(raw string) (prefixLen int, risky bool) {
 	i := 0
 	col := 0
+	dashMismatch := -2
+	starMismatch := -2
 	for {
 		runStartCol := col
 		for i < len(raw) && (raw[i] == ' ' || raw[i] == '\t') {
@@ -597,14 +598,31 @@ func scanContainerPrefixLinearGo(raw string) (prefixLen int, risky bool) {
 			col++
 			continue
 		}
-		if (c == '-' || c == '*' || c == '+') && (i+1 >= len(raw) || raw[i+1] == ' ' || raw[i+1] == '\t') && !isThematicBreakLineLinearGo(raw, col-runStartCol, i) {
-			risky = true
-			i++
-			col++
-			if i >= len(raw) {
-				break
+		if (c == '-' || c == '*' || c == '+') && (i+1 >= len(raw) || raw[i+1] == ' ' || raw[i+1] == '\t') {
+			isThematic := false
+			relCols := col - runStartCol
+			if i+1 < len(raw) && relCols <= 3 && (c == '-' || c == '*') {
+				if c == '-' {
+					if dashMismatch < i {
+						dashMismatch = findThematicBreakMismatchGo(raw, relCols, i, '-')
+					}
+					isThematic = dashMismatch == -1
+				} else {
+					if starMismatch < i {
+						starMismatch = findThematicBreakMismatchGo(raw, relCols, i, '*')
+					}
+					isThematic = starMismatch == -1
+				}
 			}
-			continue
+			if !isThematic {
+				risky = true
+				i++
+				col++
+				if i >= len(raw) {
+					break
+				}
+				continue
+			}
 		}
 		if c >= '0' && c <= '9' {
 			j := i
@@ -629,6 +647,8 @@ func scanContainerPrefixLinearGo(raw string) (prefixLen int, risky bool) {
 func scanContainerPrefixFlagsLinearGo(raw string) (prefixLen int, hasBlockquote bool, hasListMarker bool) {
 	i := 0
 	pCol := 0
+	dashMismatch := -2
+	starMismatch := -2
 	for {
 		runStartCol := pCol
 		for i < len(raw) {
@@ -660,11 +680,28 @@ func scanContainerPrefixFlagsLinearGo(raw string) (prefixLen int, hasBlockquote 
 				break
 			}
 			nx := raw[i+1]
-			if (nx == ' ' || nx == '\t') && !isThematicBreakLineLinearGo(raw, pCol-runStartCol, i) {
-				hasListMarker = true
-				i++
-				pCol++
-				continue
+			if nx == ' ' || nx == '\t' {
+				isThematic := false
+				relCols := pCol - runStartCol
+				if relCols <= 3 && (c == '-' || c == '*') {
+					if c == '-' {
+						if dashMismatch < i {
+							dashMismatch = findThematicBreakMismatchGo(raw, relCols, i, '-')
+						}
+						isThematic = dashMismatch == -1
+					} else {
+						if starMismatch < i {
+							starMismatch = findThematicBreakMismatchGo(raw, relCols, i, '*')
+						}
+						isThematic = starMismatch == -1
+					}
+				}
+				if !isThematic {
+					hasListMarker = true
+					i++
+					pCol++
+					continue
+				}
 			}
 		} else if c >= '0' && c <= '9' {
 			j := i
@@ -4499,7 +4536,8 @@ func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, isLa
 	}
 	hadLeadingNL := strings.HasPrefix(part, "\n")
 	hadTrailingNL := !isLastSegment && strings.HasSuffix(part, "\n")
-	proseWork := escapeGfmTaskListCheckboxesLinearGo(detachBareUrlsFromCodeSpansLinearGo(part))
+	firstDetached := escapeGfmTaskListCheckboxesLinearGo(detachBareUrlsFromCodeSpansLinearGo(part))
+	proseWork := firstDetached
 
 	// Strip JSX / MDX inline comments `{/* ... */}` linearly
 	if strings.Contains(proseWork, "{/*") {
@@ -4551,9 +4589,13 @@ func sanitizeProseSegmentGo(part, baseURL string, allowPdfPageMarkers bool, isLa
 	if len(inlineCodeStash) > 0 {
 		proseWork = restoreMarkdownInlineCodeStashGo(proseWork, inlineCodeStash)
 	}
-	proseWork = stripInvisibleSmugglingCharsGo(proseWork)
-
-	detached := escapeGfmTaskListCheckboxesLinearGo(detachBareUrlsFromCodeSpansLinearGo(proseWork))
+	var detached string
+	if proseWork == firstDetached && len(inlineCodeStash) == 0 {
+		detached = proseWork
+	} else {
+		proseWork = stripInvisibleSmugglingCharsGo(proseWork)
+		detached = escapeGfmTaskListCheckboxesLinearGo(detachBareUrlsFromCodeSpansLinearGo(proseWork))
+	}
 	resolved := sanitizeAndResolveMarkdownProseLinksLinearGo(detached, baseURL)
 	escaped := escapeAllResidualLtInProseLinearGo(resolved, allowPdfPageMarkers)
 	fenceSafe := escapePostStripProseFencesGo(escaped)

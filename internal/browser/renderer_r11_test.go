@@ -1020,3 +1020,486 @@ func TestR11M4LiveChromium100kTallFullPageScreenshotClampedIfInstalled(t *testin
 			maxScreenshotHeight, maxScreenshotArea, cfg.Width, cfg.Height)
 	}
 }
+
+func TestR11S4AuditNetFloodPushStateResumeAndHeaderlessRedirectJSON(t *testing.T) {
+	// 1. Finding 1: Queueing > maxSessionNetEntries (512) benign OR tainted requests MUST NEVER wipe taintedNetReqs
+	//    or allow an earlier 3rd-party-script-initiated request ("net-evil-1") to receive caller Headers or be harvested.
+	t.Run("net_request_flood_never_wipes_taint_and_saturates_closed", func(t *testing.T) {
+		var (
+			mu          sync.Mutex
+			evilHeaders []any
+		)
+		cdpSrv := newR10MockCDPServer(t, func(send func(any), raw []byte) {
+			var req struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				return
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-f1"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-f1"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "sid-f1"}})
+			case "Page.getFrameTree":
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result": map[string]any{
+						"frameTree": map[string]any{
+							"frame": map[string]any{"id": "main-f1", "loaderId": "ldr-init", "url": "about:blank"},
+						},
+					},
+				})
+			case "Page.navigate":
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "main-f1", "loaderId": "ldr-f1"}})
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Fetch.requestPaused",
+					"params": map[string]any{
+						"requestId":    "f-doc-1",
+						"networkId":    "n-doc-1",
+						"frameId":      "main-f1",
+						"resourceType": "Document",
+						"request":      map[string]any{"url": "https://app.example.test/home", "method": "GET", "headers": map[string]any{}},
+					},
+				})
+			case "Fetch.continueRequest":
+				var p struct {
+					RequestID string `json:"requestId"`
+					Headers   []any  `json:"headers"`
+				}
+				_ = json.Unmarshal(req.Params, &p)
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+				switch p.RequestID {
+				case "f-doc-1":
+					send(map[string]any{
+						"sessionId": req.SessionID,
+						"method":    "Page.frameNavigated",
+						"params": map[string]any{
+							"frame": map[string]any{
+								"id":             "main-f1",
+								"loaderId":       "ldr-f1",
+								"url":            "https://app.example.test/home",
+								"securityOrigin": "https://app.example.test",
+							},
+						},
+					})
+					// 3rd-party script queues "net-evil-1" FIRST, then floods 600 benign + 600 tainted requests before Fetch.requestPaused!
+					send(map[string]any{
+						"sessionId": req.SessionID,
+						"method":    "Network.requestWillBeSent",
+						"params": map[string]any{
+							"requestId":   "net-evil-1",
+							"loaderId":    "ldr-f1",
+							"frameId":     "main-f1",
+							"type":        "Fetch",
+							"documentURL": "https://app.example.test/home",
+							"request":     map[string]any{"url": "https://app.example.test/api/keys.json", "method": "GET"},
+							"initiator":   map[string]any{"type": "script", "url": "https://cdn.evil.test/sdk.js"},
+						},
+					})
+					for i := 0; i < 600; i++ {
+						send(map[string]any{
+							"sessionId": req.SessionID,
+							"method":    "Network.requestWillBeSent",
+							"params": map[string]any{
+								"requestId":   fmt.Sprintf("net-benign-%d", i),
+								"loaderId":    "ldr-f1",
+								"frameId":     "main-f1",
+								"type":        "Fetch",
+								"documentURL": "https://app.example.test/home",
+								"request":     map[string]any{"url": "https://app.example.test/ping", "method": "GET"},
+								"initiator":   map[string]any{"type": "script", "url": "https://app.example.test/app.js"},
+							},
+						})
+					}
+					for i := 0; i < 600; i++ {
+						send(map[string]any{
+							"sessionId": req.SessionID,
+							"method":    "Network.requestWillBeSent",
+							"params": map[string]any{
+								"requestId":   fmt.Sprintf("net-flood-evil-%d", i),
+								"loaderId":    "ldr-f1",
+								"frameId":     "main-f1",
+								"type":        "Fetch",
+								"documentURL": "https://app.example.test/home",
+								"request":     map[string]any{"url": "https://cdn.evil.test/beacon", "method": "GET"},
+								"initiator":   map[string]any{"type": "script", "url": "https://cdn.evil.test/sdk.js"},
+							},
+						})
+					}
+					// Now pause "net-evil-1" with initiator omitted on Fetch.requestPaused (relying on Network.requestWillBeSent taint!).
+					send(map[string]any{
+						"sessionId": req.SessionID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "f-evil-1",
+							"networkId":    "net-evil-1",
+							"frameId":      "main-f1",
+							"resourceType": "Fetch",
+							"request": map[string]any{
+								"url":     "https://app.example.test/api/keys.json",
+								"method":  "GET",
+								"headers": map[string]any{"Referer": "https://app.example.test/home"},
+							},
+						},
+					})
+				case "f-evil-1":
+					mu.Lock()
+					evilHeaders = p.Headers
+					mu.Unlock()
+					send(map[string]any{
+						"sessionId": req.SessionID,
+						"method":    "Network.responseReceived",
+						"params": map[string]any{
+							"requestId": "net-evil-1",
+							"frameId":   "main-f1",
+							"type":      "Fetch",
+							"response": map[string]any{
+								"url":      "https://app.example.test/api/keys.json",
+								"status":   200,
+								"mimeType": "application/json",
+							},
+						},
+					})
+					send(map[string]any{
+						"sessionId": req.SessionID,
+						"method":    "Network.loadingFinished",
+						"params":    map[string]any{"requestId": "net-evil-1", "encodedDataLength": 24},
+					})
+					send(map[string]any{"sessionId": req.SessionID, "method": "Page.loadEventFired", "params": map[string]any{}})
+				}
+			case "Network.getResponseBody":
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"body": `{"leaked":true}`}})
+			case "Runtime.evaluate":
+				docJSON, _ := json.Marshal(map[string]string{"url": "https://app.example.test/home", "html": "<html><body>ok</body></html>"})
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}}})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		})
+
+		r := NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, "EdgeFetch-R11/1.0")
+		defer r.Close()
+
+		out, err := r.Execute(context.Background(), Task{
+			URL:       "https://app.example.test/home",
+			Headers:   map[string]string{"Authorization": "Bearer TOP_SECRET_F1"},
+			WaitForMs: 30,
+		})
+		if err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+		mu.Lock()
+		hdrsRaw, _ := json.Marshal(evilHeaders)
+		mu.Unlock()
+		if strings.Contains(string(hdrsRaw), "TOP_SECRET_F1") {
+			t.Fatalf("SECURITY (Finding 1): >512 request flood wiped taint and leaked Authorization header: %s", string(hdrsRaw))
+		}
+		if len(out.CapturedJSON) != 0 {
+			t.Fatalf("SECURITY (Finding 1): tainted request JSON harvested after >512 flood: %+v", out.CapturedJSON)
+		}
+	})
+
+	// 2. Finding 2: In-document pushState (`Page.navigatedWithinDocument`) OR `Page.getFrameTree` failure on resume
+	//    MUST block resuming a session with custom Headers and no explicit navigation target.
+	t.Run("pushstate_and_getframetree_error_fail_closed_on_resume", func(t *testing.T) {
+		var (
+			mu               sync.Mutex
+			currentTreeURL   = "about:blank"
+			failGetFrameTree bool
+		)
+		cdpSrv := newR10MockCDPServer(t, func(send func(any), raw []byte) {
+			var req struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				return
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-f2"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-f2"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "sid-f2"}})
+			case "Page.getFrameTree":
+				mu.Lock()
+				u := currentTreeURL
+				shouldFail := failGetFrameTree
+				mu.Unlock()
+				if shouldFail {
+					send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "error": map[string]any{"code": -32000, "message": "tree unavailable"}})
+					return
+				}
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result": map[string]any{
+						"frameTree": map[string]any{
+							"frame": map[string]any{"id": "main-f2", "loaderId": "ldr-f2", "url": u},
+						},
+					},
+				})
+			case "Page.navigate":
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "main-f2", "loaderId": "ldr-f2"}})
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Fetch.requestPaused",
+					"params": map[string]any{
+						"requestId":    "f-nav-f2",
+						"frameId":      "main-f2",
+						"resourceType": "Document",
+						"request":      map[string]any{"url": "https://spa.example.test/chosen", "method": "GET", "headers": map[string]any{}},
+					},
+				})
+			case "Fetch.continueRequest":
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+				mu.Lock()
+				currentTreeURL = "https://spa.example.test/unchosen-pushstate"
+				mu.Unlock()
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Page.frameNavigated",
+					"params": map[string]any{
+						"frame": map[string]any{
+							"id":             "main-f2",
+							"loaderId":       "ldr-f2",
+							"url":            "https://spa.example.test/chosen",
+							"securityOrigin": "https://spa.example.test",
+						},
+					},
+				})
+				// SPA immediately calls history.pushState to an unchosen route!
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Page.navigatedWithinDocument",
+					"params": map[string]any{
+						"frameId": "main-f2",
+						"url":     "https://spa.example.test/unchosen-pushstate",
+					},
+				})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Page.loadEventFired", "params": map[string]any{}})
+			case "Runtime.evaluate":
+				mu.Lock()
+				u := currentTreeURL
+				mu.Unlock()
+				docJSON, _ := json.Marshal(map[string]string{"url": u, "html": "<html><body>spa</body></html>"})
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}}})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		})
+
+		r := NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, "EdgeFetch-R11/1.0")
+		defer r.Close()
+
+		out1, err := r.Execute(context.Background(), Task{
+			URL:         "https://spa.example.test/chosen",
+			Headers:     map[string]string{"Authorization": "Bearer SPA_SECRET"},
+			KeepSession: true,
+			WaitForMs:   20,
+		})
+		if err != nil || out1.SessionID == "" {
+			t.Fatalf("Step 1 failed: err=%v out=%+v", err, out1)
+		}
+
+		// Step 2a: Resuming with same Headers and NO navigation target after pushState MUST fail closed!
+		if _, err := r.Execute(context.Background(), Task{
+			SessionID:   out1.SessionID,
+			Headers:     map[string]string{"Authorization": "Bearer SPA_SECRET"},
+			KeepSession: true,
+			Actions:     []InteractAction{{Type: "wait", WaitMs: 10}},
+		}); err == nil {
+			t.Fatal("SECURITY (Finding 2): expected resume with Headers and no navigation target after pushState to fail closed")
+		}
+
+		// Step 2b: Even if Page.getFrameTree errors on resume, resume with Headers and no nav target MUST fail closed!
+		mu.Lock()
+		failGetFrameTree = true
+		mu.Unlock()
+		if _, err := r.Execute(context.Background(), Task{
+			SessionID: out1.SessionID,
+			Headers:   map[string]string{"Authorization": "Bearer SPA_SECRET"},
+			Actions:   []InteractAction{{Type: "wait", WaitMs: 10}},
+		}); err == nil {
+			t.Fatal("SECURITY (Finding 2): expected Page.getFrameTree error on resume to fail closed")
+		}
+	})
+
+	// 3. Finding 3: Headerless cross-origin 302 redirect (e.g. careers vanity URL -> hosted ATS board) AND resumed
+	//    headerless cross-origin navigation MUST still harvest legitimate same-origin XHR/Fetch CapturedJSON, while
+	//    still rejecting 3rd-party-script-initiated XHRs!
+	t.Run("headerless_cross_origin_redirect_and_resume_harvest_legitimate_json", func(t *testing.T) {
+		var (
+			mu      sync.Mutex
+			treeURL = "about:blank"
+		)
+		cdpSrv := newR10MockCDPServer(t, func(send func(any), raw []byte) {
+			var req struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(raw, &req) != nil {
+				return
+			}
+			switch req.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"browserContextId": "bc-f3"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"targetId": "tgt-f3"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": req.ID, "result": map[string]any{"sessionId": "sid-f3"}})
+			case "Page.getFrameTree":
+				mu.Lock()
+				u := treeURL
+				mu.Unlock()
+				send(map[string]any{
+					"id":        req.ID,
+					"sessionId": req.SessionID,
+					"result": map[string]any{
+						"frameTree": map[string]any{
+							"frame": map[string]any{"id": "main-f3", "loaderId": "ldr-f3", "url": u},
+						},
+					},
+				})
+			case "Page.navigate":
+				var navP struct {
+					URL string `json:"url"`
+				}
+				_ = json.Unmarshal(req.Params, &navP)
+				landedURL := "https://jobs.ats.example.test/acme"
+				apiURL := "https://jobs.ats.example.test/api/postings.json"
+				if strings.Contains(navP.URL, "second-ats.example.test") {
+					landedURL = "https://second-ats.example.test/board"
+					apiURL = "https://second-ats.example.test/api/roles.json"
+				}
+				mu.Lock()
+				treeURL = landedURL
+				mu.Unlock()
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"frameId": "main-f3", "loaderId": "ldr-f3"}})
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Page.frameNavigated",
+					"params": map[string]any{
+						"frame": map[string]any{
+							"id":             "main-f3",
+							"loaderId":       "ldr-f3",
+							"url":            landedURL,
+							"securityOrigin": canonicalURLOrigin(landedURL),
+						},
+					},
+				})
+				// Legitimate first-party ATS JSON XHR
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Network.requestWillBeSent",
+					"params": map[string]any{
+						"requestId":   "req-good-json",
+						"loaderId":    "ldr-f3",
+						"frameId":     "main-f3",
+						"type":        "Fetch",
+						"documentURL": landedURL,
+						"request":     map[string]any{"url": apiURL, "method": "GET"},
+						"initiator":   map[string]any{"type": "script", "url": landedURL + "/bundle.js"},
+					},
+				})
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Network.responseReceived",
+					"params": map[string]any{
+						"requestId": "req-good-json",
+						"frameId":   "main-f3",
+						"type":      "Fetch",
+						"response":  map[string]any{"url": apiURL, "status": 200, "mimeType": "application/json"},
+					},
+				})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Network.loadingFinished", "params": map[string]any{"requestId": "req-good-json", "encodedDataLength": 32}})
+				// 3rd-party-script-initiated JSON XHR (must still be rejected even on headerless session!)
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Network.requestWillBeSent",
+					"params": map[string]any{
+						"requestId":   "req-3p-evil",
+						"loaderId":    "ldr-f3",
+						"frameId":     "main-f3",
+						"type":        "Fetch",
+						"documentURL": landedURL,
+						"request":     map[string]any{"url": apiURL + "?evil=1", "method": "GET"},
+						"initiator":   map[string]any{"type": "script", "url": "https://cdn.evil.test/tracker.js"},
+					},
+				})
+				send(map[string]any{
+					"sessionId": req.SessionID,
+					"method":    "Network.responseReceived",
+					"params": map[string]any{
+						"requestId": "req-3p-evil",
+						"frameId":   "main-f3",
+						"type":      "Fetch",
+						"response":  map[string]any{"url": apiURL + "?evil=1", "status": 200, "mimeType": "application/json"},
+					},
+				})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Network.loadingFinished", "params": map[string]any{"requestId": "req-3p-evil", "encodedDataLength": 32}})
+				send(map[string]any{"sessionId": req.SessionID, "method": "Page.loadEventFired", "params": map[string]any{}})
+			case "Network.getResponseBody":
+				var bp struct {
+					RequestID string `json:"requestId"`
+				}
+				_ = json.Unmarshal(req.Params, &bp)
+				if bp.RequestID == "req-3p-evil" {
+					send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"body": `{"evil":true}`}})
+				} else {
+					send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"body": `{"jobs":[{"title":"Staff Engineer"}]}`}})
+				}
+			case "Runtime.evaluate":
+				mu.Lock()
+				u := treeURL
+				mu.Unlock()
+				docJSON, _ := json.Marshal(map[string]string{"url": u, "html": "<html><body><h1>Jobs</h1></body></html>"})
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}}})
+			default:
+				send(map[string]any{"id": req.ID, "sessionId": req.SessionID, "result": map[string]any{}})
+			}
+		})
+
+		r := NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), func(*url.URL) error { return nil }, "EdgeFetch-R11/1.0")
+		defer r.Close()
+
+		// Step 1: Vanity URL 302-redirecting cross-origin to hosted ATS board (headerless)
+		out1, err := r.Execute(context.Background(), Task{
+			URL:         "https://acme.example.test/careers",
+			KeepSession: true,
+			WaitForMs:   20,
+		})
+		if err != nil {
+			t.Fatalf("headerless redirect Execute failed: %v", err)
+		}
+		if len(out1.CapturedJSON) != 1 || !strings.Contains(out1.CapturedJSON[0].Body, "Staff Engineer") {
+			t.Fatalf("expected 1 harvested ATS JSON after headerless cross-origin redirect, got: %+v", out1.CapturedJSON)
+		}
+
+		// Step 2: Resumed headerless session navigating to a second cross-origin domain
+		out2, err := r.Execute(context.Background(), Task{
+			SessionID: out1.SessionID,
+			URL:       "https://second-ats.example.test/board",
+			WaitForMs: 20,
+		})
+		if err != nil {
+			t.Fatalf("resumed headerless Execute failed: %v", err)
+		}
+		if len(out2.CapturedJSON) != 1 || !strings.Contains(out2.CapturedJSON[0].URL, "second-ats.example.test/api/roles.json") {
+			t.Fatalf("expected 1 harvested JSON on resumed headerless cross-origin step, got: %+v", out2.CapturedJSON)
+		}
+	})
+}

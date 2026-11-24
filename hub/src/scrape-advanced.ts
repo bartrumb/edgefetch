@@ -1413,7 +1413,7 @@ function stepCanonicalMarkdownFenceLine(
 export interface RecognizeMarkdownFencesOptions {
   harden?: boolean;
   preserveCrLf?: boolean;
-  initialReopenedFence?: { ch: '`' | '~'; len: number };
+  initialReopenedFence?: { ch: '`' | '~'; len: number; effectiveLen?: number };
   initialState?: MarkdownFenceRecognizerState;
   skipLeadingSeparatorEmptyLine?: boolean;
 }
@@ -1448,15 +1448,16 @@ export function recognizeAndHardenMarkdownFences(
   let fenceOpenCr = '';
 
   if (reopened) {
+    const effLen = Math.max(reopened.len, reopened.effectiveLen ?? reopened.len);
     state.inFence = true;
     state.fenceChar = reopened.ch;
     state.fenceLen = reopened.len;
-    state.effectiveFenceLen = reopened.len;
+    state.effectiveFenceLen = effLen;
     state.prevLineWasAsciiBlank = false;
     fenceOpenOutIdx = 1;
     fenceOpenInfo = '';
     fenceOpenCr = '';
-    outLines.push('', reopened.ch.repeat(reopened.len));
+    outLines.push('', reopened.ch.repeat(effLen));
   }
 
   const skipSepNl = !reopened && Boolean(opts.skipLeadingSeparatorEmptyLine);
@@ -1574,6 +1575,7 @@ export interface MarkdownSliceCheckpoint {
   inFence: boolean;
   fenceChar: string;
   fenceLen: number;
+  effectiveFenceLen?: number;
   fenceIndent: number;
   activeListIndent: number;
   listIndents?: readonly number[];
@@ -1599,6 +1601,7 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
         inFence: state.inFence,
         fenceChar: state.fenceChar,
         fenceLen: state.fenceLen,
+        effectiveFenceLen: state.effectiveFenceLen,
         fenceIndent: 0,
         activeListIndent: state.possiblyInList ? 2 : 0,
         prevLineWasParagraph: !state.prevLineWasAsciiBlank,
@@ -1640,7 +1643,7 @@ export function sanitizeMarkdownPageSlice(
 
   const state = createMarkdownFenceRecognizerState();
   let reconstructed = rawSlice;
-  let initialReopenedFence: { ch: '`' | '~'; len: number } | undefined;
+  let initialReopenedFence: { ch: '`' | '~'; len: number; effectiveLen?: number } | undefined;
   let sliceInitialState: MarkdownFenceRecognizerState | undefined;
   let skipLeadingSeparatorEmptyLine = false;
   let forceLeadingNewlineForConcat = false;
@@ -1667,7 +1670,7 @@ export function sanitizeMarkdownPageSlice(
         state.inFence = cp.inFence;
         state.fenceChar = cp.fenceChar === '`' || cp.fenceChar === '~' ? cp.fenceChar : '';
         state.fenceLen = cp.fenceLen;
-        state.effectiveFenceLen = cp.fenceLen;
+        state.effectiveFenceLen = Math.max(cp.fenceLen, cp.effectiveFenceLen ?? cp.fenceLen);
         state.prevLineWasAsciiBlank = cp.prevLineWasAsciiBlank ?? !cp.prevLineWasParagraph;
         state.possiblyInList = cp.possiblyInList ?? cp.activeListIndent > 0;
         state.escapedUntrusted = cp.escapedUntrusted ? { ...cp.escapedUntrusted } : null;
@@ -1696,15 +1699,16 @@ export function sanitizeMarkdownPageSlice(
       if (stepRes.kind === 'open_trusted') {
         forceLeadingNewlineForConcat = true;
         if (clampedOffset > pos) {
-          const rLen = Math.max(state.fenceLen, state.effectiveFenceLen);
+          const effLen = Math.max(state.fenceLen, state.effectiveFenceLen);
           if (firstSliceNl >= 0) {
             reconstructed = reconstructed.slice(firstSliceNl + 1);
             initialReopenedFence = {
               ch: state.fenceChar as '`' | '~',
-              len: rLen,
+              len: state.fenceLen,
+              effectiveLen: effLen,
             };
           } else {
-            reconstructed = `\n${state.fenceChar.repeat(rLen)}\n${state.fenceChar.repeat(rLen)}`;
+            reconstructed = `\n${state.fenceChar.repeat(effLen)}\n${state.fenceChar.repeat(effLen)}`;
           }
         } else {
           sliceInitialState = stateBeforeLine;
@@ -1722,7 +1726,8 @@ export function sanitizeMarkdownPageSlice(
         forceLeadingNewlineForConcat = true;
         initialReopenedFence = {
           ch: state.fenceChar as '`' | '~',
-          len: Math.max(state.fenceLen, state.effectiveFenceLen),
+          len: state.fenceLen,
+          effectiveLen: Math.max(state.fenceLen, state.effectiveFenceLen),
         };
       } else if (clampedOffset === pos) {
         sliceInitialState = stateBeforeLine;

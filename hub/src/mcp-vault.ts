@@ -1906,6 +1906,30 @@ export async function startDownstreamMcpOAuth(params: {
     return { ok: false, status: 400, error: 'invalid_confirmed_auth_origin', message: confirmedCheck.reason };
   }
 
+  const cleanName = stripMcpSmugglingChars(params.name ?? '').trim().slice(0, 120) || urlCheck.url.hostname;
+  let slug: string;
+  if (typeof params.slug === 'string' && params.slug.trim()) {
+    const rawExplicitSlug = params.slug.trim().toLowerCase();
+    if (params.slug.includes('__') || !isValidMcpConnectorSlug(rawExplicitSlug)) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'invalid_slug',
+        message: 'Connector slug must be 1..48 lowercase [a-z0-9_-] characters and must not contain "__".',
+      };
+    }
+    slug = rawExplicitSlug;
+  } else {
+    slug = normalizeMcpConnectorSlug(cleanName);
+  }
+
+  const autoRouteScrape = params.autoRouteScrape === true;
+  const domValidation = validateConnectorDomains(params.domains, urlCheck.origin, autoRouteScrape);
+  if (!domValidation.ok) {
+    return { ok: false, status: 400, error: 'invalid_domains', message: domValidation.error };
+  }
+  const domains = domValidation.domains;
+
   const fetchFn = params.fetchFn ?? fetch;
   const meta = await probeRemoteMcpOAuthMetadata({
     remoteUrl: urlCheck.normalized,
@@ -1968,35 +1992,11 @@ export async function startDownstreamMcpOAuth(params: {
     clientId = `${params.hubOrigin.replace(/\/+$/, '')}/.well-known/edgefetch-bot.json`;
   }
 
-  const autoRouteScrape = params.autoRouteScrape === true;
-  const domValidation = validateConnectorDomains(params.domains, urlCheck.origin, autoRouteScrape);
-  if (!domValidation.ok) {
-    return { ok: false, status: 400, error: 'invalid_domains', message: domValidation.error };
-  }
-
   const codeVerifier = randomBase64Url(32);
   const codeChallenge = await sha256Base64Url(codeVerifier);
   const state = randomBase64Url(32);
   const stateHash = await sha256Base64Url(state);
   const bindCookieValue = await computeMcpOAuthBindHmac(keyCheck.key, params.userId, state, params.sessionCsrf);
-
-  const cleanName = stripMcpSmugglingChars(params.name ?? '').trim().slice(0, 120) || urlCheck.url.hostname;
-  let slug: string;
-  if (typeof params.slug === 'string' && params.slug.trim()) {
-    const rawExplicitSlug = params.slug.trim().toLowerCase();
-    if (params.slug.includes('__') || !isValidMcpConnectorSlug(rawExplicitSlug)) {
-      return {
-        ok: false,
-        status: 400,
-        error: 'invalid_slug',
-        message: 'Connector slug must be 1..48 lowercase [a-z0-9_-] characters and must not contain "__".',
-      };
-    }
-    slug = rawExplicitSlug;
-  } else {
-    slug = normalizeMcpConnectorSlug(cleanName);
-  }
-  const domains = domValidation.domains;
   const canonicalResource = meta.resource ?? urlCheck.normalized;
 
   const effectiveConfirmedAuthOrigin =

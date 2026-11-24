@@ -2009,6 +2009,16 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         } catch {
           return adminJson({ ok: false, error: 'invalid_json' }, 400);
         }
+        if (body.slug !== undefined && typeof body.slug !== 'string') {
+          return adminJson(
+            {
+              ok: false,
+              error: 'invalid_slug',
+              message: 'Connector slug must be 1..48 lowercase [a-z0-9_-] characters and must not contain "__".',
+            },
+            400,
+          );
+        }
         const started = await startDownstreamMcpOAuth({
           userId,
           sessionCsrf: session.csrf,

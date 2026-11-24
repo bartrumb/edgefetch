@@ -994,6 +994,39 @@ test('Round 11 Stream 5 [P3-2 & P3-5]: Wikipedia quota bucket non-eviction + que
   assert.equal(parseWikipediaArticleUrl('https://en.wikipedia.org/w/index.php?oldid=123456&diff=prev'), null);
   assert.equal(parseWikipediaArticleUrl('https://en.wikipedia.org/w/api.php?action=render&oldid=123'), null);
 
+  // P3-2 Audit Finding 5: Multi-subtag & `simple` editions, non-edition exclusions, duplicate params, empty `oldid=` fallback, & leading-zero IDs!
+  assert.equal(
+    parseWikipediaArticleUrl('https://simple.wikipedia.org/wiki/Rust_(programming_language)')?.host,
+    'simple.wikipedia.org',
+  );
+  assert.equal(
+    parseWikipediaArticleUrl('https://zh-min-nan.wikipedia.org/w/index.php?title=Rust')?.host,
+    'zh-min-nan.wikipedia.org',
+  );
+  assert.equal(
+    parseWikipediaArticleUrl('https://be-x-old.m.wikipedia.org/wiki/Rust')?.host,
+    'be-x-old.wikipedia.org',
+  );
+  assert.equal(parseWikipediaArticleUrl('https://commons.wikipedia.org/wiki/Main_Page'), null);
+  assert.equal(parseWikipediaArticleUrl('https://meta.wikipedia.org/wiki/Main_Page'), null);
+  assert.equal(parseWikipediaArticleUrl('https://login.wikipedia.org/wiki/Main_Page'), null);
+
+  // Duplicate query params follow MediaWiki last-param semantics while rejecting any smuggled disallowed namespace
+  assert.equal(
+    parseWikipediaArticleUrl('https://en.wikipedia.org/w/index.php?title=&title=Rust')?.canonicalUrl,
+    'https://en.wikipedia.org/wiki/Rust',
+  );
+  assert.equal(
+    parseWikipediaArticleUrl('https://en.wikipedia.org/w/index.php?oldid=bad&oldid=0123456')?.canonicalUrl,
+    'https://en.wikipedia.org/w/index.php?oldid=123456',
+  );
+  assert.equal(
+    parseWikipediaArticleUrl('https://en.wikipedia.org/w/index.php?oldid=&curid=009876')?.canonicalUrl,
+    'https://en.wikipedia.org/w/index.php?curid=9876',
+  );
+  assert.equal(parseWikipediaArticleUrl('https://en.wikipedia.org/wiki/Rust?title=Rust&title=Special:Search'), null);
+  assert.equal(parseWikipediaArticleUrl('https://en.wikipedia.org/w/index.php?title=Special:Search&title=Rust'), null);
+
   // P3-5: Jobs brand filter MUST reject cross-TLD spoofing (`acme.io` must NOT accept `acme.com`, `acme.ai`, `acme.xyz`, `acme.ru`, `acme.attacker.tld`)!
   const mkJob = (company: string, url: string): StructuredJobRecord => ({
     title: 'Security Engineer',

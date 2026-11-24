@@ -22,7 +22,34 @@ export const WIKIPEDIA_BULK_CHANNELS = Object.freeze({
   huggingFaceDataset: 'https://huggingface.co/datasets/wikimedia/wikipedia',
 });
 
-const WIKIPEDIA_LANG_RE = /^[a-z]{2,3}(?:-[a-z0-9]{2,12})?$/i;
+const WIKIPEDIA_LANG_RE = /^[a-z]{2,12}(?:-[a-z0-9]{1,12}){0,2}$/i;
+
+const NON_EDITION_WIKIPEDIA_SUBDOMAINS = new Set([
+  'www',
+  'm',
+  'zero',
+  'wap',
+  'mobile',
+  'login',
+  'auth',
+  'donate',
+  'thankyou',
+  'nostalgia',
+  'ten',
+  'test',
+  'test2',
+  'outreach',
+  'wikimania',
+  'foundation',
+  'species',
+  'commons',
+  'meta',
+  'incubator',
+  'quality',
+  'strategy',
+  'usability',
+  'wg-en',
+]);
 
 /**
  * MediaWiki non-article namespaces (English canonical + major localized Wikipedia equivalents).
@@ -164,14 +191,14 @@ export function extractWikipediaLangFromHost(rawHost: string): string | null {
   const sub = h.slice(0, -'.wikipedia.org'.length);
   // Handle mobile `<lang>.m.wikipedia.org` gracefully -> canonical `<lang>`
   const cleanSub = sub.endsWith('.m') ? sub.slice(0, -2) : sub;
-  if (cleanSub === 'www' || !WIKIPEDIA_LANG_RE.test(cleanSub)) return null;
+  if (NON_EDITION_WIKIPEDIA_SUBDOMAINS.has(cleanSub) || !WIKIPEDIA_LANG_RE.test(cleanSub)) return null;
   return cleanSub;
 }
 
 export function normalizeWikipediaLang(rawLang: unknown, fallback = 'en'): string {
   if (typeof rawLang !== 'string') return fallback;
   const clean = rawLang.trim().toLowerCase();
-  return WIKIPEDIA_LANG_RE.test(clean) ? clean : fallback;
+  return !NON_EDITION_WIKIPEDIA_SUBDOMAINS.has(clean) && WIKIPEDIA_LANG_RE.test(clean) ? clean : fallback;
 }
 
 function safeDecodeWikiSegment(seg: string): string {
@@ -248,6 +275,16 @@ export interface ParsedWikipediaArticle {
  * Returns `null` for non-Wikipedia URLs, `/w/api.php`, `/w/rest.php`, non-view/render actions (`?action=edit`, `?action=history`, `?diff=`),
  * or non-article namespaces (`Special:`, `Talk:`, `User:`, `Wikipedia:`, `File:`, etc.).
  */
+function lastQueryParam(sp: URLSearchParams, key: string): string | null {
+  const vals = sp.getAll(key);
+  return vals.length > 0 ? vals[vals.length - 1]! : null;
+}
+
+function parsePositiveWikiNumericId(raw: string): string | null {
+  const m = /^0*([1-9][0-9]{0,14})$/.exec(raw.trim());
+  return m ? m[1]! : null;
+}
+
 export function parseWikipediaArticleUrl(rawUrl: string): ParsedWikipediaArticle | null {
   if (!rawUrl || typeof rawUrl !== 'string') return null;
   let u: URL;
@@ -289,29 +326,39 @@ export function parseWikipediaArticleUrl(rawUrl: string): ParsedWikipediaArticle
     const rawDecodedSlug = safeDecodeWikiSegment(rawSlug);
     if (!rawDecodedSlug || hasUnsafeWikiTitlePathSegments(rawDecodedSlug)) return null;
     rawTitleCandidate = rawDecodedSlug;
-    // If `?title=` is also supplied alongside `/wiki/...`, reject if `?title=` targets a disallowed namespace or traversal
-    const queryTitle = u.searchParams.get('title');
-    if (queryTitle !== null) {
+    // Inspect all `?title=` values supplied alongside `/wiki/...` so none can smuggle a disallowed namespace or traversal
+    for (const queryTitle of u.searchParams.getAll('title')) {
       const cleanQt = queryTitle.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
       if (!cleanQt || hasUnsafeWikiTitlePathSegments(queryTitle) || isDisallowedWikipediaTitle(cleanQt)) {
         return null;
       }
     }
   } else if (isIndexScriptPath && u.search) {
-    const queryTitle = u.searchParams.get('title');
+    for (const qt of u.searchParams.getAll('title')) {
+      const cleanQt = qt.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+      if (cleanQt && (hasUnsafeWikiTitlePathSegments(qt) || isDisallowedWikipediaTitle(cleanQt))) {
+        return null;
+      }
+    }
+    const queryTitle = lastQueryParam(u.searchParams, 'title');
     if (queryTitle !== null && queryTitle.trim() !== '') {
       if (hasUnsafeWikiTitlePathSegments(queryTitle)) return null;
       rawTitleCandidate = queryTitle;
     } else {
-      const rawOldId = u.searchParams.get('oldid')?.trim() ?? u.searchParams.get('curid')?.trim() ?? '';
-      if (/^[1-9][0-9]{0,14}$/.test(rawOldId)) {
-        const paramName = u.searchParams.has('oldid') ? 'oldid' : 'curid';
+      // Follow MediaWiki PHP last-parameter semantics and empty-param fallback (`?oldid=&curid=12345`, `?oldid=012345`)
+      const rawOld = lastQueryParam(u.searchParams, 'oldid') ?? '';
+      const rawCur = lastQueryParam(u.searchParams, 'curid') ?? '';
+      const oldNum = parsePositiveWikiNumericId(rawOld);
+      const curNum = parsePositiveWikiNumericId(rawCur);
+      const resolvedId = oldNum ?? curNum;
+      if (resolvedId) {
+        const paramName = oldNum ? 'oldid' : 'curid';
         return {
           lang,
           host,
-          canonicalTitle: `Revision ${rawOldId}`,
-          underscoredTitle: `Revision_${rawOldId}`,
-          canonicalUrl: `https://${host}/w/index.php?${paramName}=${rawOldId}`,
+          canonicalTitle: `Revision ${resolvedId}`,
+          underscoredTitle: `Revision_${resolvedId}`,
+          canonicalUrl: `https://${host}/w/index.php?${paramName}=${resolvedId}`,
         };
       }
       return null;

@@ -1204,6 +1204,8 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     return count;
   };
 
+  let lastConnPressureSweepAt = 0;
+
   const sweepExpiredPressuredPreHeaderSockets = (nowMs: number) => {
     const globalPressure = isGlobalPreHeaderUnderPressure();
     const firstByteDeadlineCapMs = Math.min(headersTimeoutMs, FIRST_BYTE_PREHEADER_TIMEOUT_MS);
@@ -1246,6 +1248,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     bucket: string,
     nowMs: number,
     minAgeMs = 0,
+    requirePartialBytes = false,
   ): TrackedSocketRecord | null => {
     let bestVictim: TrackedSocketRecord | null = null;
     let bestIsPartial = true;
@@ -1256,6 +1259,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       const ageMs = nowMs - candMeta.connectedAt;
       if (minAgeMs > 0 && ageMs < minAgeMs) continue;
       const candIsPartial = hasPartialRequestBytes(cand);
+      if (requirePartialBytes && !candIsPartial) continue;
       const bestAgeMs = bestVictim ? nowMs - bestVictim.connectedAt : -1;
       const bothAged = bestVictim !== null && ageMs >= FRESH_PREHEADER_GRACE_MS && bestAgeMs >= FRESH_PREHEADER_GRACE_MS;
       const closeInTime = bestVictim !== null && Math.abs(cand.connectedAt - bestVictim.connectedAt) <= 2;
@@ -2259,19 +2263,24 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
       return;
     }
 
-    recordIpConnChurn(sockBucket, nowConnMs);
+    const connChurn = recordIpConnChurn(sockBucket, nowConnMs);
 
-    // 0. Proactively sweep any sockets past the short pressure full-header deadline (`1,250ms`) on connection arrival.
-    sweepExpiredPressuredPreHeaderSockets(nowConnMs);
+    // 0. Proactively sweep any sockets past the short pressure full-header deadline (`1,250ms`) on connection arrival (throttled to <= 1 sweep / 25ms).
+    if (nowConnMs - lastConnPressureSweepAt >= 25) {
+      lastConnPressureSweepAt = nowConnMs;
+      sweepExpiredPressuredPreHeaderSockets(nowConnMs);
+    }
 
     // 1. Per-IP / Shared-NAT unproven pre-header defense (`R8-M1` + `R10-P1` + `R11-S5`):
     //    Enforces `effectivePreHeaderPerIpCap` across ALL `requestsCompleted === 0 && activeTurnCount === 0` sockets
     //    (both 0-byte and partial-header!), evicting the oldest unproven pre-header socket on `sockBucket`
-    //    (tie-breaking 0-byte before partial-byte, >= 50ms aged before brand-new) instead of refusing incoming peers!
+    //    (tie-breaking 0-byte before partial-byte, >= 50ms aged before brand-new) instead of refusing incoming peers,
+    //    while fast-rejecting extreme >2x-cap 0-byte single-IP SYN/accept floods in O(1).
+    const isExtremeZeroByteFlood = connChurn > Math.max(32, effectiveRawPerIpCap * 2);
     while ((preHeaderSocketsByIp.get(sockBucket) ?? 0) >= effectivePreHeaderPerIpCap) {
       const sameIpVictimRec =
         selectSameIpPreHeaderVictim(sockBucket, nowConnMs, SHARED_NAT_PREHEADER_EVICT_AGE_MS) ??
-        selectSameIpPreHeaderVictim(sockBucket, nowConnMs, 0);
+        selectSameIpPreHeaderVictim(sockBucket, nowConnMs, 0, isExtremeZeroByteFlood);
       if (!sameIpVictimRec) {
         rejectZeroByteRawSocket(socket);
         return;

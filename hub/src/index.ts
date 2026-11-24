@@ -169,6 +169,7 @@ import {
   type SearchRequestPayload,
 } from './web-search';
 import { listRegisteredAdapters } from './extractors/registry';
+import { checkAndRecordWikipediaArticleQuota, parseWikipediaArticleUrl } from './wikipedia';
 import {
   buildCapabilities,
   handleAgentArtifactUpload,
@@ -3859,27 +3860,63 @@ export default {
             );
           }
           let body = cappedFetch.text;
-          if (url.pathname === '/fetch/batch') {
-            try {
-              const parsedBatch = JSON.parse(body) as Record<string, unknown>;
-              if (Array.isArray(parsedBatch.urls) && !Array.isArray(parsedBatch.requests)) {
+          try {
+            const parsedReq = JSON.parse(body) as Record<string, unknown>;
+            if (url.pathname === '/fetch') {
+              if (typeof parsedReq.url === 'string') {
+                const wikiArt = parseWikipediaArticleUrl(parsedReq.url);
+                if (wikiArt) {
+                  const q = checkAndRecordWikipediaArticleQuota({ callerKey: 'owner', host: wikiArt.host });
+                  if (!q.allowed) {
+                    return Response.json(q.block, {
+                      status: 429,
+                      headers: { 'cache-control': 'no-store', 'retry-after': '60' },
+                    });
+                  }
+                }
+              }
+            } else {
+              const rawItems: unknown[] = Array.isArray(parsedReq.requests)
+                ? (parsedReq.requests as unknown[])
+                : Array.isArray(parsedReq.urls)
+                  ? (parsedReq.urls as unknown[])
+                  : [];
+              for (const item of rawItems) {
+                const rawItemUrl =
+                  item && typeof item === 'object' && !Array.isArray(item)
+                    ? (item as Record<string, unknown>).url
+                    : item;
+                if (typeof rawItemUrl === 'string') {
+                  const wikiArt = parseWikipediaArticleUrl(rawItemUrl);
+                  if (wikiArt) {
+                    const q = checkAndRecordWikipediaArticleQuota({ callerKey: 'owner', host: wikiArt.host });
+                    if (!q.allowed) {
+                      return Response.json(q.block, {
+                        status: 429,
+                        headers: { 'cache-control': 'no-store', 'retry-after': '60' },
+                      });
+                    }
+                  }
+                }
+              }
+              if (Array.isArray(parsedReq.urls) && !Array.isArray(parsedReq.requests)) {
                 body = JSON.stringify({
-                  maxSeconds: typeof parsedBatch.maxSeconds === 'number' ? parsedBatch.maxSeconds : 60,
+                  maxSeconds: typeof parsedReq.maxSeconds === 'number' ? parsedReq.maxSeconds : 60,
                   options: {
                     includeBody: true,
                     respectRobots: true,
                     concurrency: 4,
-                    ...(parsedBatch.options && typeof parsedBatch.options === 'object' ? (parsedBatch.options as object) : {}),
+                    ...(parsedReq.options && typeof parsedReq.options === 'object' ? (parsedReq.options as object) : {}),
                   },
-                  requests: (parsedBatch.urls as unknown[]).map((u, idx) => ({
+                  requests: (parsedReq.urls as unknown[]).map((u, idx) => ({
                     id: `b-${idx + 1}`,
                     url: String(u),
                   })),
                 });
               }
-            } catch {
-              return Response.json({ error: 'bad_json' }, { status: 400 });
             }
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
           }
           const rawRetention = url.searchParams.get('artifacts');
           const artifactRetention: ArtifactRetention | 'off' | undefined =

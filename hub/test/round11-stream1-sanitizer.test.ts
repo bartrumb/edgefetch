@@ -580,4 +580,33 @@ test('R11-S2: sanitizeMarkdownPageSlice preserves container & non-blank state ac
   const dagRedacted = scrapeModule.redactPiiDeep(dagUrlsEncoded);
   assert.equal(dagRedacted.first.email, '[REDACTED_EMAIL]');
   assert.equal(dagRedacted.second.email, '[REDACTED_EMAIL]');
+
+  // S2 Audit Finding 4: 3-backtick fence containing a 4-space-indented `    ``` ` inner line (`fenceLen === 3`, `effectiveFenceLen === 4`)
+  // closed by a real 3-backtick ` ``` ` line MUST close properly on mid-fence slice offsets (both with & without checkpoints)
+  // so prose `<script>` and `javascript:` AFTER the 3-backtick closer NEVER survive raw!
+  const effFenceDoc = [
+    'Intro paragraph.',
+    '',
+    '```js',
+    'const sample = 1;',
+    '    ```',
+    'const moreCode = 2;',
+    '```',
+    '',
+    '<script>alert(1)</script>',
+    '[click](javascript:alert(1))',
+  ].join('\n');
+  const effCheckpoints = scrapeAdvancedModule.computeMarkdownSliceCheckpoints(effFenceDoc, 16);
+  const proseIdx = effFenceDoc.indexOf('<script>');
+  for (let off = 0; off < proseIdx; off++) {
+    const noCp = sanitizeMarkdownPageSlice(effFenceDoc, off, effFenceDoc.slice(off), false);
+    const withCp = sanitizeMarkdownPageSlice(effFenceDoc, off, effFenceDoc.slice(off), false, effCheckpoints);
+    for (const [tag, out] of [
+      ['noCp', noCp],
+      ['withCp', withCp],
+    ] as const) {
+      assertProseSafe(`effFenceDoc(${tag})@${off}`, out, false);
+      assert.equal(out.includes('javascript:'), false, `javascript: survived effFenceDoc(${tag})@${off}: ${out}`);
+    }
+  }
 });

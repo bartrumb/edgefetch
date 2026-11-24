@@ -1516,6 +1516,50 @@ test('R11-M8/M9/S6-audit: Hub DO/Portable resealServerSecret wiring, agent list_
     assert.equal(derivedConn.status, 200);
     const derivedBody = (await derivedConn.json()) as { server?: { slug?: string } };
     assert.equal(derivedBody.server?.slug, 'my-public-mcp');
+
+    // P3-3 Audit Finding 6: `POST /admin/mcp/oauth/start` rejects non-string `slug`, invalid `slug` (`__`, `*`, `/`),
+    // and invalid `domains` BEFORE making ANY outbound discovery or Dynamic Client Registration (DCR) network call!
+    let oauthOutboundHits = 0;
+    const oauthProbeEnv = {
+      ...probeEnv,
+      SAFE_PUBLIC_FETCH: async () => {
+        oauthOutboundHits++;
+        return Response.json({
+          issuer: 'https://mcp.linear.app',
+          authorization_endpoint: 'https://mcp.linear.app/authorize',
+          token_endpoint: 'https://mcp.linear.app/token',
+          registration_endpoint: 'https://mcp.linear.app/register',
+          code_challenge_methods_supported: ['S256'],
+        });
+      },
+    };
+    for (const badOAuthBody of [
+      { slug: 12345, remoteUrl: 'https://mcp.linear.app/mcp' },
+      { slug: ['arr'], remoteUrl: 'https://mcp.linear.app/mcp' },
+      { slug: 'evil__slug', remoteUrl: 'https://mcp.linear.app/mcp' },
+      { slug: 'bad/slug', remoteUrl: 'https://mcp.linear.app/mcp' },
+      { slug: 'good-slug', remoteUrl: 'https://mcp.linear.app/mcp', domains: ['not a valid domain/path'] },
+    ]) {
+      const badStart = await hubWorker.fetch(
+        new Request('https://hub.example.com/admin/mcp/oauth/start', {
+          method: 'POST',
+          headers: {
+            cookie: `${ADMIN_COOKIE_NAME}=${session.value}`,
+            origin: 'https://hub.example.com',
+            'x-csrf-token': session.csrf,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(badOAuthBody),
+        }),
+        oauthProbeEnv,
+      );
+      assert.equal(badStart.status, 400, `Expected 400 for ${JSON.stringify(badOAuthBody)}, got ${badStart.status}`);
+    }
+    assert.equal(
+      oauthOutboundHits,
+      0,
+      'POST /admin/mcp/oauth/start must reject invalid slug/domains BEFORE any outbound metadata probe or DCR POST',
+    );
   } finally {
     coordinator.close();
     rmSync(tmpDir, { recursive: true, force: true });

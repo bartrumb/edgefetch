@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bartrumb/edgefetch/v2/internal/extract"
 	"github.com/bartrumb/edgefetch/v2/internal/otel"
@@ -35,14 +37,18 @@ import (
 var ErrChallengeDetected = errors.New("anti-bot challenge detected in rendered DOM")
 
 const (
-	defaultRenderSettleMs  = 900
-	maxRenderSettleMs      = 15_000
-	sessionIdleTTL         = 3 * time.Minute
-	browserIdleTTL         = 3 * time.Minute
-	maxActiveSessions      = 8
-	maxRenderedDOMChars    = 16 << 20 // 16 MiB cap in JS prevents >24 MiB CDP frames from dropping shared connection
-	maxSessionFrameEntries = 256      // hard cap on per-session frame maps (frameOrigins, childFrames, frameTainted)
-	maxSessionNetEntries   = 512      // hard cap on per-session network/request provenance maps
+	defaultRenderSettleMs      = 900
+	maxRenderSettleMs          = 15_000
+	sessionIdleTTL             = 3 * time.Minute
+	browserIdleTTL             = 3 * time.Minute
+	maxActiveSessions          = 8
+	maxRenderedDOMChars        = 16 << 20 // 16 MiB cap in JS prevents >24 MiB CDP frames from dropping shared connection
+	maxSessionFrameEntries     = 256      // hard cap on per-session frame maps (frameOrigins, childFrames, frameTainted)
+	maxSessionNetEntries       = 512      // hard cap on per-session network/request provenance maps
+	maxCapturedJSONResponses   = 6        // max same-origin 200 OK JSON XHR/Fetch payloads harvested per render
+	maxSingleCapturedJSONBytes = 256 << 10
+	maxTotalCapturedJSONBytes  = 512 << 10
+	maxTrackedJSONCandidates   = 64
 )
 
 var (
@@ -95,6 +101,15 @@ type ActionResult struct {
 	Warning    string `json:"warning,omitempty"`
 }
 
+// CapturedJSONResponse holds a bounded, same-origin HTTP 200 application/json XHR/Fetch payload
+// observed on the untainted top-level frame during headless browser rendering.
+type CapturedJSONResponse struct {
+	URL    string `json:"url"`
+	Method string `json:"method,omitempty"`
+	Status int    `json:"status"`
+	Body   string `json:"body"`
+}
+
 // Task describes a browser render or interaction request.
 type Task struct {
 	URL                string
@@ -126,6 +141,7 @@ type Output struct {
 	ActionScrapes     []ActionScrapeSnapshot
 	JavascriptReturns []ActionJSReturn
 	ActionResults     []ActionResult
+	CapturedJSON      []CapturedJSONResponse
 	PDFBase64         string
 	SessionID         string
 }
@@ -734,6 +750,15 @@ func (s *retainedSession) noteNetworkLoadingFailed(rawParams json.RawMessage) {
 	s.mu.Unlock()
 }
 
+func (s *retainedSession) isFetchEnabled() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fetchEnabled
+}
+
 func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 	type node struct {
 		Frame struct {
@@ -750,6 +775,11 @@ func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 	if cdp.call(ctx, s.cdpSessionID, "Page.getFrameTree", nil, &out) != nil || len(out.FrameTree) == 0 {
 		return
 	}
+	s.mu.Lock()
+	if !s.fetchEnabled {
+		s.childFrames = make(map[string]string)
+	}
+	s.mu.Unlock()
 	var walk func(raw json.RawMessage, parentID string, isRoot bool)
 	walk = func(raw json.RawMessage, parentID string, isRoot bool) {
 		var n node
@@ -759,9 +789,7 @@ func (s *retainedSession) seedFrameTree(ctx context.Context, cdp *cdpConn) {
 		fOrigin := canonicalURLOrigin(n.Frame.URL)
 		s.mu.Lock()
 		if isRoot {
-			if s.mainFrameID == "" {
-				s.mainFrameID = n.Frame.ID
-			}
+			s.mainFrameID = n.Frame.ID
 			if n.Frame.URL != "" && !strings.EqualFold(n.Frame.URL, "about:blank") {
 				s.hasCommittedDoc = true
 				if s.committedDocURL == "" {
@@ -1590,6 +1618,9 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			}
 			sess.mu.Unlock()
 		}
+		if !sess.isFetchEnabled() || sess.getMainFrameID() == "" {
+			sess.seedFrameTree(ctx, cdp)
+		}
 	}
 
 	if sess == nil {
@@ -1674,6 +1705,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		_ = cdp.call(ctx, sess.cdpSessionID, "Page.enable", nil, nil)
 		_ = cdp.call(ctx, sess.cdpSessionID, "Network.enable", nil, nil)
 		_ = cdp.call(ctx, sess.cdpSessionID, "Runtime.enable", nil, nil)
+		sess.seedFrameTree(ctx, cdp)
 
 		if task.Mobile || task.ViewportWidth > 0 || task.ViewportHeight > 0 {
 			scale := 1.0
@@ -1738,6 +1770,38 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 
 	events, unsub := cdp.subscribe()
 	defer unsub()
+
+	harvester := newJSONResponseHarvester(sess.cdpSessionID, sess.getMainFrameID(), sess.snapshotChildFrames())
+	xhrEvents, unsubXhr := cdp.subscribe()
+	stopHarvester := make(chan struct{})
+	var harvesterWG sync.WaitGroup
+	harvesterWG.Add(1)
+	go func() {
+		defer harvesterWG.Done()
+		for {
+			select {
+			case ev := <-xhrEvents:
+				harvester.handleEvent(ev)
+			case <-stopHarvester:
+				for {
+					select {
+					case ev := <-xhrEvents:
+						harvester.handleEvent(ev)
+					default:
+						return
+					}
+				}
+			case <-cdp.closeCh:
+				return
+			}
+		}
+	}()
+	stopAndDrainHarvester := sync.OnceFunc(func() {
+		close(stopHarvester)
+		harvesterWG.Wait()
+		unsubXhr()
+	})
+	defer stopAndDrainHarvester()
 
 	if task.URL != "" {
 		u, err := url.Parse(task.URL)
@@ -1807,6 +1871,9 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		return Output{Status: st, Headers: hClone, FinalURL: finalURL, ActionResults: actionResults}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
 	}
 
+	stopAndDrainHarvester()
+	capturedJSON := r.harvestSameOriginJSONBodies(ctx, cdp, sess, harvester, finalURL)
+
 	var shotB64 string
 	if task.Screenshot {
 		var shot struct {
@@ -1836,6 +1903,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		ActionScrapes:     actionScrapes,
 		JavascriptReturns: jsReturns,
 		ActionResults:     actionResults,
+		CapturedJSON:      capturedJSON,
 		PDFBase64:         pdfBase64,
 	}
 	if task.KeepSession && !task.CloseSession {
@@ -2949,56 +3017,577 @@ func waitForSPADOMQuiescence(ctx context.Context, cdp *cdpConn, sessionID string
 	}, &res)
 }
 
+const maxRejectedJSONRequests = 1024
+
+type jsonNetCandidate struct {
+	requestID    string
+	method       string
+	reqURL       string
+	respURL      string
+	frameID      string
+	documentURL  string
+	initiatorURL string
+	jsonOK       bool
+	finished     bool
+}
+
+type jsonResponseHarvester struct {
+	sessionID   string
+	mainFrameID string
+	childFrames map[string]bool
+	candidates  map[string]*jsonNetCandidate
+	rejected    map[string]bool
+	saturated   bool
+	order       []string
+}
+
+func (s *retainedSession) snapshotChildFrames() map[string]bool {
+	out := make(map[string]bool)
+	if s == nil {
+		return out
+	}
+	s.mu.Lock()
+	for id := range s.childFrames {
+		out[id] = true
+	}
+	s.mu.Unlock()
+	return out
+}
+
+func newJSONResponseHarvester(sessionID, mainFrameID string, initialChildren ...map[string]bool) *jsonResponseHarvester {
+	cf := make(map[string]bool)
+	for _, m := range initialChildren {
+		for k, v := range m {
+			if v && len(cf) < maxSessionFrameEntries {
+				cf[k] = true
+			}
+		}
+	}
+	return &jsonResponseHarvester{
+		sessionID:   sessionID,
+		mainFrameID: mainFrameID,
+		childFrames: cf,
+		candidates:  make(map[string]*jsonNetCandidate),
+		rejected:    make(map[string]bool),
+	}
+}
+
+func (h *jsonResponseHarvester) rejectRequest(reqID string) {
+	if h == nil || reqID == "" {
+		return
+	}
+	delete(h.candidates, reqID)
+	if len(h.rejected) >= maxRejectedJSONRequests {
+		h.saturated = true
+		return
+	}
+	h.rejected[reqID] = true
+}
+
+func isJSONMimeType(mimeType string, headers map[string]string) bool {
+	check := func(raw string) bool {
+		semi := strings.IndexByte(raw, ';')
+		if semi >= 0 {
+			raw = raw[:semi]
+		}
+		m := strings.ToLower(strings.TrimSpace(raw))
+		if m == "" || strings.HasSuffix(m, "/problem+json") {
+			return false
+		}
+		return m == "application/json" || m == "text/json" || strings.HasSuffix(m, "+json")
+	}
+	if check(mimeType) {
+		return true
+	}
+	for k, v := range headers {
+		if strings.EqualFold(strings.TrimSpace(k), "content-type") && check(v) {
+			return true
+		}
+	}
+	return false
+}
+
+func parsePositiveContentLength(headers map[string]string) int64 {
+	for k, v := range headers {
+		if strings.EqualFold(strings.TrimSpace(k), "content-length") {
+			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
+				return n
+			}
+		}
+	}
+	return -1
+}
+
+func (h *jsonResponseHarvester) handleEvent(ev cdpEvent) {
+	if h == nil || ev.SessionID != h.sessionID {
+		return
+	}
+	switch ev.Method {
+	case "Page.frameAttached":
+		var fa struct {
+			FrameID       string `json:"frameId"`
+			ParentFrameID string `json:"parentFrameId"`
+		}
+		if json.Unmarshal(ev.Params, &fa) == nil && fa.FrameID != "" && fa.ParentFrameID != "" {
+			if len(h.childFrames) < maxSessionFrameEntries {
+				h.childFrames[fa.FrameID] = true
+			}
+		}
+	case "Page.frameNavigated":
+		var fn struct {
+			Frame struct {
+				ID       string `json:"id"`
+				ParentID string `json:"parentId"`
+			} `json:"frame"`
+		}
+		if json.Unmarshal(ev.Params, &fn) == nil && fn.Frame.ID != "" {
+			if fn.Frame.ParentID != "" {
+				if len(h.childFrames) < maxSessionFrameEntries {
+					h.childFrames[fn.Frame.ID] = true
+				}
+				return
+			}
+			h.mainFrameID = fn.Frame.ID
+			h.childFrames = make(map[string]bool)
+			h.candidates = make(map[string]*jsonNetCandidate)
+			h.rejected = make(map[string]bool)
+			h.saturated = false
+			h.order = h.order[:0]
+		}
+	case "Network.requestWillBeSent":
+		var rw struct {
+			RequestID        string `json:"requestId"`
+			FrameID          string `json:"frameId"`
+			Type             string `json:"type"`
+			DocumentURL      string `json:"documentURL"`
+			RedirectResponse *struct {
+				Status int    `json:"status"`
+				URL    string `json:"url"`
+			} `json:"redirectResponse,omitempty"`
+			Initiator struct {
+				URL string `json:"url"`
+			} `json:"initiator"`
+			Request struct {
+				URL    string `json:"url"`
+				Method string `json:"method"`
+			} `json:"request"`
+		}
+		if json.Unmarshal(ev.Params, &rw) != nil || rw.RequestID == "" {
+			return
+		}
+		if h.saturated || h.rejected[rw.RequestID] {
+			delete(h.candidates, rw.RequestID)
+			return
+		}
+		if rw.Type != "XHR" && rw.Type != "Fetch" {
+			h.rejectRequest(rw.RequestID)
+			return
+		}
+		if rw.FrameID == "" || h.childFrames[rw.FrameID] || (h.mainFrameID != "" && rw.FrameID != h.mainFrameID) {
+			h.rejectRequest(rw.RequestID)
+			return
+		}
+		// Reject any redirect hop with missing initial candidate or any cross-origin redirect hop permanently (`HIGH-2`).
+		if rw.RedirectResponse != nil {
+			prev, exists := h.candidates[rw.RequestID]
+			if !exists {
+				h.rejectRequest(rw.RequestID)
+				return
+			}
+			prevOrigin := canonicalURLOrigin(prev.reqURL)
+			redirFromOrigin := canonicalURLOrigin(rw.RedirectResponse.URL)
+			nextOrigin := canonicalURLOrigin(rw.Request.URL)
+			if !strings.HasPrefix(prevOrigin, "https://") || nextOrigin != prevOrigin || (redirFromOrigin != "" && redirFromOrigin != prevOrigin) {
+				h.rejectRequest(rw.RequestID)
+				return
+			}
+			prev.respURL = rw.Request.URL
+			return
+		}
+		cand, exists := h.candidates[rw.RequestID]
+		if !exists {
+			if strings.TrimSpace(rw.DocumentURL) == "" || len(h.candidates) >= maxTrackedJSONCandidates || len(h.order) >= maxTrackedJSONCandidates*2 {
+				h.rejectRequest(rw.RequestID)
+				return
+			}
+			cand = &jsonNetCandidate{
+				requestID:    rw.RequestID,
+				method:       strings.ToUpper(strings.TrimSpace(rw.Request.Method)),
+				reqURL:       rw.Request.URL,
+				frameID:      rw.FrameID,
+				documentURL:  rw.DocumentURL,
+				initiatorURL: rw.Initiator.URL,
+			}
+			h.candidates[rw.RequestID] = cand
+			h.order = append(h.order, rw.RequestID)
+		} else {
+			cand.respURL = rw.Request.URL
+		}
+	case "Network.responseReceived":
+		var rr struct {
+			RequestID string `json:"requestId"`
+			Type      string `json:"type"`
+			FrameID   string `json:"frameId"`
+			Response  struct {
+				URL      string            `json:"url"`
+				Status   int               `json:"status"`
+				MimeType string            `json:"mimeType"`
+				Headers  map[string]string `json:"headers"`
+			} `json:"response"`
+		}
+		if json.Unmarshal(ev.Params, &rr) != nil || rr.RequestID == "" {
+			return
+		}
+		if h.saturated || h.rejected[rr.RequestID] {
+			delete(h.candidates, rr.RequestID)
+			return
+		}
+		// Never resurrect or synthesize a candidate on `responseReceived` without a vetted `requestWillBeSent` (`HIGH-2`).
+		cand, exists := h.candidates[rr.RequestID]
+		if !exists {
+			h.rejectRequest(rr.RequestID)
+			return
+		}
+		if rr.Type != "XHR" && rr.Type != "Fetch" {
+			h.rejectRequest(rr.RequestID)
+			return
+		}
+		if rr.FrameID == "" || h.childFrames[rr.FrameID] || (h.mainFrameID != "" && rr.FrameID != h.mainFrameID) {
+			h.rejectRequest(rr.RequestID)
+			return
+		}
+		if rr.Response.Status != http.StatusOK || !isJSONMimeType(rr.Response.MimeType, rr.Response.Headers) {
+			h.rejectRequest(rr.RequestID)
+			return
+		}
+		if cl := parsePositiveContentLength(rr.Response.Headers); cl > maxSingleCapturedJSONBytes {
+			h.rejectRequest(rr.RequestID)
+			return
+		}
+		if canonicalURLOrigin(rr.Response.URL) == "" || canonicalURLOrigin(rr.Response.URL) != canonicalURLOrigin(cand.reqURL) {
+			h.rejectRequest(rr.RequestID)
+			return
+		}
+		cand.respURL = rr.Response.URL
+		cand.jsonOK = true
+	case "Network.loadingFinished":
+		var lf struct {
+			RequestID         string  `json:"requestId"`
+			EncodedDataLength float64 `json:"encodedDataLength"`
+		}
+		if json.Unmarshal(ev.Params, &lf) != nil || lf.RequestID == "" {
+			return
+		}
+		if h.saturated || h.rejected[lf.RequestID] {
+			delete(h.candidates, lf.RequestID)
+			return
+		}
+		cand, exists := h.candidates[lf.RequestID]
+		if !exists {
+			return
+		}
+		if lf.EncodedDataLength > maxSingleCapturedJSONBytes {
+			h.rejectRequest(lf.RequestID)
+			return
+		}
+		cand.finished = true
+	case "Network.loadingFailed":
+		var lf struct {
+			RequestID string `json:"requestId"`
+		}
+		if json.Unmarshal(ev.Params, &lf) == nil && lf.RequestID != "" {
+			h.rejectRequest(lf.RequestID)
+		}
+	}
+}
+
+func (s *retainedSession) isNetRequestTaintedForHarvest(reqID string) bool {
+	if s == nil || reqID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.taintedNetReqs != nil && s.taintedNetReqs[reqID] {
+		return true
+	}
+	if s.hasExtraHeaders && s.mainFrameID != "" && s.frameTainted != nil && s.frameTainted[s.mainFrameID] {
+		return true
+	}
+	return false
+}
+
+func (r *Renderer) harvestSameOriginJSONBodies(
+	ctx context.Context,
+	cdp *cdpConn,
+	sess *retainedSession,
+	harvester *jsonResponseHarvester,
+	finalURL string,
+) []CapturedJSONResponse {
+	if cdp == nil || harvester == nil || harvester.saturated || len(harvester.order) == 0 {
+		return nil
+	}
+	committedOrigin := canonicalURLOrigin(finalURL)
+	if !strings.HasPrefix(committedOrigin, "https://") {
+		return nil
+	}
+	mainFrame := harvester.mainFrameID
+	if mainFrame == "" {
+		mainFrame = sess.getMainFrameID()
+	}
+	if mainFrame == "" {
+		return nil
+	}
+	sessChildren := sess.snapshotChildFrames()
+
+	bctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	eligible := make([]*jsonNetCandidate, 0, maxCapturedJSONResponses)
+	for _, reqID := range harvester.order {
+		if harvester.rejected[reqID] {
+			continue
+		}
+		cand, ok := harvester.candidates[reqID]
+		if !ok || !cand.jsonOK || !cand.finished {
+			continue
+		}
+		if cand.frameID == "" || cand.frameID != mainFrame || harvester.childFrames[cand.frameID] || sessChildren[cand.frameID] {
+			continue
+		}
+		if sess.isNetRequestTaintedForHarvest(reqID) {
+			continue
+		}
+		effURL := strings.TrimSpace(cand.respURL)
+		if effURL == "" {
+			effURL = strings.TrimSpace(cand.reqURL)
+		}
+		if effURL == "" || canonicalURLOrigin(effURL) != committedOrigin {
+			continue
+		}
+		if strings.TrimSpace(cand.reqURL) == "" || canonicalURLOrigin(cand.reqURL) != committedOrigin {
+			continue
+		}
+		// Require non-empty main-frame documentURL matching committedOrigin (`HIGH-2`).
+		if strings.TrimSpace(cand.documentURL) == "" || canonicalURLOrigin(cand.documentURL) != committedOrigin {
+			continue
+		}
+		if cand.initiatorURL != "" && canonicalURLOrigin(cand.initiatorURL) != committedOrigin {
+			continue
+		}
+		parsedU, pErr := url.Parse(effURL)
+		if pErr != nil || !strings.EqualFold(parsedU.Scheme, "https") {
+			continue
+		}
+		parsedU.User = nil
+		parsedU.Fragment = ""
+		if r.allow != nil && r.allow(parsedU) != nil {
+			continue
+		}
+		// Enforce `robots.txt` politeness on every harvested XHR/Fetch JSON endpoint (`MEDIUM-1`).
+		if r.CheckRobots != nil && r.CheckRobots(bctx, parsedU.String()) != nil {
+			continue
+		}
+		eligible = append(eligible, cand)
+		if len(eligible) >= maxCapturedJSONResponses*2 {
+			break
+		}
+	}
+	if len(eligible) == 0 {
+		return nil
+	}
+
+	var captured []CapturedJSONResponse
+	totalBytes := 0
+	sessionID := harvester.sessionID
+
+	for _, cand := range eligible {
+		if len(captured) >= maxCapturedJSONResponses || totalBytes >= maxTotalCapturedJSONBytes {
+			break
+		}
+		var bodyOut struct {
+			Body          string `json:"body"`
+			Base64Encoded bool   `json:"base64Encoded"`
+		}
+		if err := cdp.call(bctx, sessionID, "Network.getResponseBody", map[string]any{"requestId": cand.requestID}, &bodyOut); err != nil {
+			continue
+		}
+		if bodyOut.Body == "" {
+			continue
+		}
+		var rawBytes []byte
+		if bodyOut.Base64Encoded {
+			if len(bodyOut.Body) > (maxSingleCapturedJSONBytes*4)/3+8 {
+				continue
+			}
+			decoded, dErr := base64.StdEncoding.DecodeString(bodyOut.Body)
+			if dErr != nil {
+				continue
+			}
+			rawBytes = decoded
+		} else {
+			if len(bodyOut.Body) > maxSingleCapturedJSONBytes {
+				continue
+			}
+			rawBytes = []byte(bodyOut.Body)
+		}
+		if len(rawBytes) == 0 || len(rawBytes) > maxSingleCapturedJSONBytes || totalBytes+len(rawBytes) > maxTotalCapturedJSONBytes {
+			continue
+		}
+		if !utf8.Valid(rawBytes) || !json.Valid(rawBytes) {
+			continue
+		}
+		trimmed := bytes.TrimSpace(rawBytes)
+		if len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
+			continue
+		}
+		effURL := strings.TrimSpace(cand.respURL)
+		if effURL == "" {
+			effURL = strings.TrimSpace(cand.reqURL)
+		}
+		u, uErr := url.Parse(effURL)
+		if uErr != nil {
+			continue
+		}
+		u.User = nil
+		u.Fragment = ""
+		totalBytes += len(rawBytes)
+		captured = append(captured, CapturedJSONResponse{
+			URL:    u.String(),
+			Method: cand.method,
+			Status: http.StatusOK,
+			Body:   string(rawBytes),
+		})
+	}
+	return captured
+}
+
 func readDocumentHTML(ctx context.Context, cdp *cdpConn, sessionID string) (htmlStr, finalURL string, err error) {
-	// Serialize full DOM including open Web Component shadowRoot trees (`getHTML({ serializableShadowRoots: true })`
-	// or light-DOM shadow flattening fallback) so Shadow-DOM SPAs (Lit, Stencil, LWC, Shoelace) extract cleanly.
+	// Serialize full DOM including open Web Component shadowRoot trees while pruning computed-hidden <body> subtrees
+	// (display:none, visibility:hidden, aria-hidden="true", hidden, and zero-opacity pointer-events:none overlays),
+	// preserving <head>, JSON-LD / framework state <script> blocks, <details> disclosures, and challenge markers (`MEDIUM-2`).
 	expr := `(() => {
-		const root = document.documentElement;
-		if (!root) return JSON.stringify({ url: String(location.href || ""), html: "" });
+		const docElGetter = Object.getOwnPropertyDescriptor(Document.prototype, "documentElement")?.get;
+		const root = docElGetter ? docElGetter.call(document) : document.documentElement;
+		const locHref = String(window.location && window.location.href || "");
+		if (!root) return JSON.stringify({ url: locHref, html: "" });
+		const outerHTMLGetter = Object.getOwnPropertyDescriptor(Element.prototype, "outerHTML")?.get;
+		const readOuterHTML = (el) => outerHTMLGetter ? outerHTMLGetter.call(el) : String(el.outerHTML || "");
 		let html = "";
 		try {
-			let hasShadow = false;
-			const walkCheck = (el) => {
-				if (hasShadow || !el) return;
-				if (el.shadowRoot) { hasShadow = true; return; }
-				for (let c = el.firstElementChild; c; c = c.nextElementSibling) walkCheck(c);
+			const nodeTypeGetter = Object.getOwnPropertyDescriptor(Node.prototype, "nodeType")?.get;
+			const nodeValueGetter = Object.getOwnPropertyDescriptor(Node.prototype, "nodeValue")?.get;
+			const childNodesGetter = Object.getOwnPropertyDescriptor(Node.prototype, "childNodes")?.get;
+			const cloneNodeFn = Node.prototype.cloneNode;
+			const appendChildFn = Node.prototype.appendChild;
+			const tagNameGetter = Object.getOwnPropertyDescriptor(Element.prototype, "tagName")?.get;
+			const elIdGetter = Object.getOwnPropertyDescriptor(Element.prototype, "id")?.get;
+			const elClassGetter = Object.getOwnPropertyDescriptor(Element.prototype, "className")?.get;
+			const shadowRootGetter = Object.getOwnPropertyDescriptor(Element.prototype, "shadowRoot")?.get;
+			const hasAttrFn = Element.prototype.hasAttribute;
+			const getAttrFn = Element.prototype.getAttribute;
+			const setAttrFn = Element.prototype.setAttribute;
+			const querySelectorFn = Element.prototype.querySelector;
+			const htmlHiddenGetter = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "hidden")?.get;
+			const htmlStyleGetter = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "style")?.get;
+			const CHALLENGE_DESC_SEL = '[id*="challenge" i], [id*="turnstile" i], [id*="captcha" i], .cf-turnstile, .h-captcha, .g-recaptcha, .px-captcha, [class*="awswaf" i], [data-sitekey], [data-turnstile-callback], [src*="turnstile" i], [src*="captcha" i], [src*="hcaptcha" i], [src*="recaptcha" i], [src*="awswaf" i], [src*="_incapsula_resource" i], [src*="challenge-platform" i], [src*="perimeterx" i]';
+
+			const hasChallengeSrc = (srcVal) => {
+				if (!srcVal) return false;
+				return (
+					srcVal.includes("turnstile") ||
+					srcVal.includes("captcha") ||
+					srcVal.includes("hcaptcha") ||
+					srcVal.includes("recaptcha") ||
+					srcVal.includes("awswaf") ||
+					srcVal.includes("_incapsula_resource") ||
+					srcVal.includes("challenge-platform") ||
+					srcVal.includes("perimeterx")
+				);
 			};
-			walkCheck(root);
-			if (!hasShadow) {
-				html = root.outerHTML;
-			} else {
-				const cloneWithShadow = (node) => {
-					if (node.nodeType === Node.TEXT_NODE) return document.createTextNode(node.nodeValue || "");
-					if (node.nodeType !== Node.ELEMENT_NODE) return null;
-					const tag = node.tagName.toLowerCase();
-					if (tag === "script" || tag === "style") return node.cloneNode(true);
-					const copy = node.cloneNode(false);
-					if (tag === "details") copy.setAttribute("open", "");
-					if (node.shadowRoot) {
-						const wrapper = document.createElement("div");
-						wrapper.setAttribute("data-shadow-root", "open");
-						for (const sc of node.shadowRoot.childNodes) {
-							const c = cloneWithShadow(sc);
-							if (c) wrapper.appendChild(c);
-						}
-						copy.appendChild(wrapper);
+
+			const isChallengeOrHasChallengeDescendant = (el) => {
+				const id = String(elIdGetter ? elIdGetter.call(el) : "").toLowerCase();
+				const rawCls = elClassGetter ? elClassGetter.call(el) : "";
+				const cls = typeof rawCls === "string" ? rawCls.toLowerCase() : "";
+				if (id.includes("challenge") || id.includes("turnstile") || id.includes("captcha")) return true;
+				if (cls.includes("cf-turnstile") || cls.includes("h-captcha") || cls.includes("g-recaptcha") || cls.includes("px-captcha") || cls.includes("awswaf")) return true;
+				if (hasAttrFn.call(el, "data-sitekey") || hasAttrFn.call(el, "data-turnstile-callback")) return true;
+				const ownSrc = String(getAttrFn.call(el, "src") || "").toLowerCase();
+				if (hasChallengeSrc(ownSrc)) return true;
+				try {
+					if (querySelectorFn && querySelectorFn.call(el, CHALLENGE_DESC_SEL) !== null) return true;
+				} catch {}
+				return false;
+			};
+			const isHiddenBodySubtree = (el, tag, insideClosedDetails) => {
+				if (tag === "script" || tag === "style" || tag === "noscript" || tag === "details" || tag === "summary") return false;
+				let hiddenCandidate = false;
+				if (el instanceof HTMLElement && htmlHiddenGetter && htmlHiddenGetter.call(el) === true) hiddenCandidate = true;
+				else if (getAttrFn.call(el, "aria-hidden") === "true") hiddenCandidate = true;
+				else if (el instanceof HTMLElement && htmlStyleGetter) {
+					const st = htmlStyleGetter.call(el);
+					if (st && (st.display === "none" || st.visibility === "hidden")) hiddenCandidate = true;
+				}
+				if (!hiddenCandidate && !insideClosedDetails && typeof window.getComputedStyle === "function") {
+					const cs = window.getComputedStyle(el);
+					if (cs) {
+						if (cs.display === "none" || cs.visibility === "hidden") hiddenCandidate = true;
+						else if (cs.opacity === "0" && cs.pointerEvents === "none" && (cs.position === "fixed" || cs.position === "absolute")) hiddenCandidate = true;
 					}
-					for (const ch of node.childNodes) {
-						const c = cloneWithShadow(ch);
-						if (c) copy.appendChild(c);
+				}
+				if (!hiddenCandidate) return false;
+				return !isChallengeOrHasChallengeDescendant(el);
+			};
+			let visited = 0;
+			let truncated = false;
+			const cloneClean = (node, inBody, insideClosedDetails) => {
+				if (truncated) return null;
+				if (++visited > 25000) { truncated = true; return null; }
+				const nt = nodeTypeGetter ? nodeTypeGetter.call(node) : node.nodeType;
+				if (nt === 3) {
+					const nv = nodeValueGetter ? nodeValueGetter.call(node) : "";
+					return document.createTextNode(nv || "");
+				}
+				if (nt !== 1) return null;
+				const rawTag = tagNameGetter ? tagNameGetter.call(node) : "";
+				const tag = String(rawTag || "").toLowerCase();
+				if (!tag) return null;
+				if (tag === "script" || tag === "style") return cloneNodeFn.call(node, true);
+				const nowInBody = inBody || tag === "body";
+				if (inBody && isHiddenBodySubtree(node, tag, insideClosedDetails)) return null;
+				const copy = cloneNodeFn.call(node, false);
+				let childClosedDetails = insideClosedDetails;
+				if (tag === "details") {
+					if (!hasAttrFn.call(node, "open")) childClosedDetails = true;
+					setAttrFn.call(copy, "open", "");
+				}
+				const sr = shadowRootGetter ? shadowRootGetter.call(node) : null;
+				if (sr) {
+					const wrapper = document.createElement("div");
+					setAttrFn.call(wrapper, "data-shadow-root", "open");
+					const srKids = childNodesGetter ? childNodesGetter.call(sr) : [];
+					for (let i = 0; i < srKids.length; i++) {
+						const c = cloneClean(srKids[i], nowInBody, childClosedDetails);
+						if (c) appendChildFn.call(wrapper, c);
 					}
-					return copy;
-				};
-				const cloned = cloneWithShadow(root);
-				html = cloned ? cloned.outerHTML : root.outerHTML;
-			}
+					appendChildFn.call(copy, wrapper);
+				}
+				const kids = childNodesGetter ? childNodesGetter.call(node) : [];
+				for (let i = 0; i < kids.length; i++) {
+					const c = cloneClean(kids[i], nowInBody, childClosedDetails);
+					if (c) appendChildFn.call(copy, c);
+				}
+				return copy;
+			};
+			const cloned = cloneClean(root, false, false);
+			html = cloned ? readOuterHTML(cloned) : readOuterHTML(root);
 		} catch {
-			html = root.outerHTML;
+			html = readOuterHTML(root);
 		}
 		if (html && html.length > 16777216) {
-			return JSON.stringify({ url: String(location.href || ""), html: "", oversized: html.length });
+			return JSON.stringify({ url: locHref, html: "", oversized: html.length });
 		}
-		return JSON.stringify({ url: String(location.href || ""), html });
+		return JSON.stringify({ url: locHref, html });
 	})()`
 	raw, err := evalString(ctx, cdp, sessionID, expr)
 	if err != nil {

@@ -213,31 +213,77 @@ export function extractAllMetaContents(rawHtml: string, key: string): string[] {
   return out;
 }
 
+/**
+ * Linear O(N) detector for literal, JSON-escaped (`\udb40\udc69`, `\\udb40\\udc69`, `\u{e0069}`), or
+ * HTML-entity-encoded (`&#xE0069;`, `&#917609;`, `&amp;#xE0069;`) Unicode Tag smuggling (`U+E0000..U+E007F`).
+ * Operates directly on raw `<script>` / JSON strings with zero tree-node budget so primitive/empty-array
+ * padding can never mask smuggled tag characters (`NEW-HIGH-1`).
+ */
+export function hasRawOrEncodedUnicodeTagLinear(raw: string): boolean {
+  if (!raw) return false;
+  if (raw.includes('\uDB40') && /[\u{E0000}-\u{E007F}]/u.test(raw)) {
+    return true;
+  }
+  if ((raw.includes('db40') || raw.includes('DB40') || raw.includes('e00') || raw.includes('E00')) && raw.includes('\\')) {
+    if (/\\u(?:db40\\{1,16}udc[0-7][0-9a-f]|\{[ \t]{0,4}0{0,8}e00[0-7][0-9a-f][ \t]{0,4}\})/i.test(raw)) {
+      return true;
+    }
+  }
+  if (raw.includes('&') && raw.includes('#')) {
+    if (
+      /&(?:amp;|#0{0,6}38;?|#[xX]0{0,6}26;?){0,4}#(?:[xX]0{0,8}[eE]00[0-7][0-9a-fA-F]|0{0,8}917(?:50[4-9]|5[1-9]\d|6[0-2]\d|63[01]));?/.test(
+        raw,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Linear predicate matching `<script type="application/ld+json">` attribute strings (quoted or unquoted,
+ * with optional MIME parameters such as `;charset=utf-8`), shared across `extractJsonLdObjects`,
+ * `schema-org.ts`, and `jobs.ts` so extraction and `checkPromptInjection` never desync (`HIGH-3`).
+ */
+export function isJsonLdScriptAttrLinear(attrStr: string): boolean {
+  return /\btype[ \t\r\n]*=[ \t\r\n]*(?:["']application\/ld\+json(?:[ \t]*;[^"']*)?[ \t]*["']|application\/ld\+json(?:;[^ \t\r\n"'>]*)?(?=[ \t\r\n/>]|$))/i.test(
+    attrStr,
+  );
+}
+
 /** Extracts flattened JSON-LD objects from `<script type="application/ld+json">` blocks in linear O(N) time (`H1`). */
-export function extractJsonLdObjects(rawHtml: string): Array<Record<string, unknown>> {
+export function extractJsonLdObjects(rawHtml: string, maxEntities = 100): Array<Record<string, unknown>> {
   if (!/ld\+json/i.test(rawHtml)) return [];
+  const cap = Math.max(1, Math.min(250, Math.floor(maxEntities)));
   const results: Array<Record<string, unknown>> = [];
   replaceHtmlTagBlocksLinear(rawHtml, 'script', (_full, attrStr, inner) => {
-    if (results.length >= 30) return '';
-    if (!/\btype[ \t\r\n]*=[ \t\r\n]*(?:["']application\/ld\+json[^"']*["']|application\/ld\+json\b)/i.test(attrStr)) {
+    if (results.length >= cap) return '';
+    if (!isJsonLdScriptAttrLinear(attrStr)) {
       return '';
     }
     const raw = inner.trim();
-    if (!raw) return '';
-    const parsed = parseJsonValue(raw);
-    const pushItem = (item: unknown) => {
-      if (!item || typeof item !== 'object' || results.length >= 30) return;
+    if (!raw || raw.length > 2 * 1024 * 1024) return '';
+    const parsed = parseJsonValue(raw) ?? (raw.includes('&') ? parseJsonValue(decodeBasicEntities(raw)) : null);
+    const pushItem = (item: unknown, depth: number) => {
+      if (!item || typeof item !== 'object' || depth > 16 || results.length >= cap) return;
       if (Array.isArray(item)) {
-        for (const el of item) pushItem(el);
+        for (const el of item) {
+          if (results.length >= cap) break;
+          pushItem(el, depth + 1);
+        }
         return;
       }
       const obj = item as Record<string, unknown>;
       results.push(obj);
       if (Array.isArray(obj['@graph'])) {
-        for (const g of obj['@graph']) pushItem(g);
+        for (const g of obj['@graph']) {
+          if (results.length >= cap) break;
+          pushItem(g, depth + 1);
+        }
       }
     };
-    pushItem(parsed);
+    pushItem(parsed, 0);
     return '';
   });
   return results;

@@ -10,6 +10,8 @@
  */
 
 import { resolveSiteExtractorTwin } from './extractors/registry';
+import { distillCapturedJsonResponses } from './extractors/framework-hydration';
+import { extractUniversalSchemaOrg } from './extractors/schema-org';
 import {
   analyzeUrlRedirect,
   buildBlockedInfo,
@@ -1978,12 +1980,25 @@ export async function executeExtractCall(params: {
       } else {
         let extracted = isHtml ? extractHtmlDocument(rawBodyStr, { baseUrl: finalUrl, onlyMainContent: true, redactPii }) : undefined;
 
-        // R6: SSR Hydration State Recovery (`__NEXT_DATA__`, Remix, Apollo) before falling back to Chromium!
-        const ssrHydrated =
+        const universalSchema =
           isHtml && !isPdf && countExtractWords(extracted?.markdown ?? '') < 80
+            ? extractUniversalSchemaOrg(rawBodyStr, finalUrl, htmlFragToMd)
+            : null;
+        const schemaUpgraded = Boolean(
+          universalSchema?.markdown &&
+            countExtractWords(universalSchema.markdown) >= Math.max(25, countExtractWords(extracted?.markdown ?? '') * 2),
+        );
+
+        // R6 v2: SSR Hydration State Recovery (`__NEXT_DATA__`, linear RSC, Nuxt 3 `devalue`, Remix, Apollo, Angular, Wix) before falling back to Chromium!
+        const ssrHydrated =
+          isHtml && !isPdf && !schemaUpgraded && countExtractWords(extracted?.markdown ?? '') < 80
             ? recoverSsrHydrationContent(rawBodyStr, finalUrl, htmlFragToMd)
             : null;
-        if (ssrHydrated && countExtractWords(ssrHydrated.markdown) > countExtractWords(extracted?.markdown ?? '') * 2) {
+        if (
+          ssrHydrated &&
+          (countExtractWords(ssrHydrated.markdown) > countExtractWords(extracted?.markdown ?? '') * 2 ||
+            Boolean(ssrHydrated.records && ssrHydrated.records.length >= 3))
+        ) {
           contentSource = 'ssr-hydration';
         }
 
@@ -1991,6 +2006,7 @@ export async function executeExtractCall(params: {
         if (
           isHtml &&
           !contentSource &&
+          !schemaUpgraded &&
           effectiveRenderMode === 'auto' &&
           r.rendered !== true &&
           target !== 'container' &&
@@ -2028,7 +2044,8 @@ export async function executeExtractCall(params: {
               if (autoItem?.outcome === 'ok' && autoHtml) {
                 const autoFinal = typeof autoItem.finalUrl === 'string' && autoItem.finalUrl ? autoItem.finalUrl : finalUrl;
                 const autoExt = extractHtmlDocument(autoHtml, { baseUrl: autoFinal, onlyMainContent: true, redactPii });
-                if (countExtractWords(autoExt.markdown) > countExtractWords(extracted?.markdown ?? '')) {
+                const hasAutoJson = Array.isArray(autoItem.capturedJson) && autoItem.capturedJson.length > 0;
+                if (countExtractWords(autoExt.markdown) > countExtractWords(extracted?.markdown ?? '') || hasAutoJson) {
                   r = autoItem;
                   rawBodyStr = autoHtml;
                   finalUrl = autoFinal;
@@ -2043,11 +2060,19 @@ export async function executeExtractCall(params: {
           }
         }
 
+        const cdpDistilled =
+          Array.isArray(r.capturedJson) && r.capturedJson.length > 0
+            ? distillCapturedJsonResponses(r.capturedJson, finalUrl)
+            : null;
         const jp = isHtml ? extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '') : null;
         if (jp) jobPosting = jp;
 
         const rawCandidateMd =
           (contentSource === 'ssr-hydration' && ssrHydrated ? ssrHydrated.markdown : undefined) ||
+          (schemaUpgraded && universalSchema?.markdown ? universalSchema.markdown : undefined) ||
+          (cdpDistilled?.markdown && countExtractWords(extracted?.markdown ?? '') < 80
+            ? [extracted?.markdown ?? '', cdpDistilled.markdown].filter(Boolean).join('\n\n')
+            : undefined) ||
           (isHtml ? extracted?.markdown : undefined) ||
           (typeof r.markdown === 'string' && r.markdown ? r.markdown : '') ||
           extracted?.markdown ||

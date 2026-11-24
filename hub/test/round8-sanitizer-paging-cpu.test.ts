@@ -502,9 +502,9 @@ function buildGeneratedAdversarialMarkdownCorpus(): Array<{ id: string; md: stri
   return corpus;
 }
 
-test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 33 single source & readArtifactPage NEVER falls back to < v33 cached Markdown', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
-  assert.equal(STORAGE_PIPELINE_VERSION, 33);
+test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 34 single source & readArtifactPage NEVER falls back to < v34 cached Markdown', async () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 34);
+  assert.equal(STORAGE_PIPELINE_VERSION, 34);
   assert.equal(SCRAPE_PIPELINE_VERSION, STORAGE_PIPELINE_VERSION);
 
   const bucket = new MemoryR2Bucket();
@@ -582,11 +582,11 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 33 single source & readArtifactPa
   if (rederivedRes.ok) {
     assert.equal(rederivedRes.page.content, `Re-derived v33 from ${rawBytes.byteLength}B raw: &lt;svg onload=1>`);
   }
-  const persistedV33 = await bucket.get(`derived/33/markdown/${written.contentSha256}`);
-  assert.ok(persistedV33, 're-derived v33 Markdown must be persisted at derived/33/markdown/<sha>');
+  const persistedV33 = await bucket.get(`derived/34/markdown/${written.contentSha256}`);
+  assert.ok(persistedV33, 're-derived v34 Markdown must be persisted at derived/34/markdown/<sha>');
 
-  // 1. `executeScrapeCall` with `maxAgeMs: 60_000` MUST ignore v30 cached document and fetch fresh v33!
-  await bucket.delete(`derived/33/markdown/${written.contentSha256}`);
+  // 1. `executeScrapeCall` with `maxAgeMs: 60_000` MUST ignore v30 cached document and fetch fresh v34!
+  await bucket.delete(`derived/34/markdown/${written.contentSha256}`);
   let liveFetched = 0;
   const scrapeRes = await executeScrapeCall({
     payload: { url: 'https://cache-v30.example.com/', maxAgeMs: 60_000 },
@@ -605,13 +605,13 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 33 single source & readArtifactPa
     },
   });
   assert.equal(scrapeRes.status, 200);
-  assert.equal(liveFetched, 1, 'v30 scrape cache entry MUST be invalidated after bump to v33');
-  assert.equal(scrapeRes.body.pipelineVersion, 33);
+  assert.equal(liveFetched, 1, 'v30 scrape cache entry MUST be invalidated after bump to v34');
+  assert.equal(scrapeRes.body.pipelineVersion, 34);
 
-  // 2. `readArtifactPage` sanitizes unhardened `v33` document on cache miss and caches per sha!
+  // 2. `readArtifactPage` sanitizes unhardened `v34` document on cache miss and caches per sha!
   await bucket.put(
-    `derived/33/markdown/${written.contentSha256}`,
-    '> ```html\n<img src=x onerror=1>\n> ```\n\nfresh v33 <img src=x onerror=1> and `Vec<T>`',
+    `derived/34/markdown/${written.contentSha256}`,
+    '> ```html\n<img src=x onerror=1>\n> ```\n\nfresh v34 <img src=x onerror=1> and `Vec<T>`',
   );
   const hitV33 = await readArtifactPage({
     bucket: bucket as unknown as R2Bucket,
@@ -621,7 +621,7 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 33 single source & readArtifactPa
   assert.equal(hitV33.ok, true);
   if (hitV33.ok) {
     auditZeroLiveXssAcrossSixMarkdownDialects(hitV33.page.content, 'readArtifactPage:wholeDocResanitize');
-    assert.ok(hitV33.page.content.endsWith('fresh v33 &lt;img src=x onerror=1> and `Vec&lt;T>`'));
+    assert.ok(hitV33.page.content.endsWith('fresh v34 &lt;img src=x onerror=1> and `Vec&lt;T>`'));
   }
 });
 

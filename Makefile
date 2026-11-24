@@ -1,6 +1,6 @@
 .PHONY: build build-wasm test race fuzz bench bench-extract doctor hub-test up down fmt vet
 
-VERSION ?= 2.7.7
+VERSION ?= 2.7.8
 LDFLAGS := -s -w -X github.com/bartrumb/edgefetch/v2/internal/agent.Version=$(VERSION)
 
 build:

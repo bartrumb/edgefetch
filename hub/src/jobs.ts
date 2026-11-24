@@ -14,6 +14,7 @@
  *  - `Section 4`: First-class `executeJobsCall` (`POST /v1/jobs` & MCP `jobs` tool).
  */
 
+import { hasRawOrEncodedUnicodeTagLinear, isJsonLdScriptAttrLinear } from './extractors/utils';
 import { getActiveRequestTracer, type RequestTracer, type TraceContext } from './otel';
 import { compileSafeUserRegex, replaceHtmlTagBlocksLinear, stripHtmlTagsQuoteAwareLinear } from './safe-input';
 import { neutralizeAllUnsafeMarkdownLinksLinear } from './scrape-advanced';
@@ -370,8 +371,6 @@ function resolveExplicitWorkplaceType(
   return null;
 }
 
-const LD_JSON_SCRIPT_TYPE_RE = /\btype[ \t\r\n]*=[ \t\r\n]*(?:["']application\/ld\+json["']|application\/ld\+json(?=[ \t\r\n/>]|$))/i;
-
 function parseJobPostingJsonLdCandidatesLinear(rawHtml: string): Array<Record<string, unknown>> {
   const candidates: Array<Record<string, unknown>> = [];
   const collectEntities = (node: unknown, depth = 0) => {
@@ -392,7 +391,9 @@ function parseJobPostingJsonLdCandidatesLinear(rawHtml: string): Array<Record<st
   };
 
   replaceHtmlTagBlocksLinear(rawHtml, 'script', (_full, attrStr, inner) => {
-    if (!LD_JSON_SCRIPT_TYPE_RE.test(attrStr)) return '';
+    if (!isJsonLdScriptAttrLinear(attrStr)) {
+      return '';
+    }
     const rawJson = inner.trim();
     if (!rawJson || !/JobPosting/i.test(rawJson)) return '';
     const parsed = safeJsonParse(rawJson) ?? safeJsonParse(decodeEntitiesBasic(rawJson));
@@ -412,36 +413,64 @@ export function inspectRawJobPostingJsonLdLinear(rawHtml: string): {
   descriptionHtml: string;
   rawDecodedStringsForPiCheck: string;
 } {
+  const MAX_JOB_PI_CHARS = 1_572_864;
   const candidates = parseJobPostingJsonLdCandidatesLinear(rawHtml);
+  let sawUnicodeTag = hasRawOrEncodedUnicodeTagLinear(rawHtml);
   if (candidates.length === 0) {
-    return { descriptionHtml: '', rawDecodedStringsForPiCheck: '' };
+    return {
+      descriptionHtml: '',
+      rawDecodedStringsForPiCheck: sawUnicodeTag ? '\u{E0069}' : '',
+    };
   }
   let descriptionHtml = '';
   const chunks: string[] = [];
   let totalChars = 0;
+  let visited = 0;
+
+  const pushDecodedString = (rawVal: string) => {
+    const trimmed = rawVal.trim();
+    if (!trimmed) return;
+    const entityDecoded = trimmed.includes('&') ? decodeEntitiesBasic(trimmed) : trimmed;
+    if (!sawUnicodeTag && hasRawOrEncodedUnicodeTagLinear(entityDecoded)) {
+      sawUnicodeTag = true;
+    }
+    if (totalChars < MAX_JOB_PI_CHARS) {
+      const sliced = entityDecoded.slice(0, Math.max(0, MAX_JOB_PI_CHARS - totalChars));
+      if (sliced) {
+        chunks.push(sliced);
+        totalChars += sliced.length;
+      }
+    }
+  };
 
   const visitValue = (val: unknown, depth = 0) => {
-    if (!val || depth > 10 || totalChars >= 262_144) return;
+    if (val === null || val === undefined || depth > 18 || visited > 100_000) return;
     if (typeof val === 'string') {
-      const trimmed = val.trim();
-      if (!trimmed) return;
-      const sliced = trimmed.length > 32_768 ? trimmed.slice(0, 32_768) : trimmed;
-      const entityDecoded = sliced.includes('&') ? decodeEntitiesBasic(sliced) : sliced;
-      chunks.push(entityDecoded);
-      totalChars += entityDecoded.length;
+      if (!val) return;
+      visited++;
+      pushDecodedString(val);
       return;
     }
     if (Array.isArray(val)) {
+      if (val.length === 0) return;
+      visited++;
       for (const el of val) {
-        if (totalChars >= 262_144) break;
-        visitValue(el, depth + 1);
+        if (visited > 100_000) break;
+        if (typeof el === 'string' || (el !== null && typeof el === 'object')) {
+          visitValue(el, depth + 1);
+        }
       }
       return;
     }
     if (typeof val === 'object') {
-      for (const child of Object.values(val as Record<string, unknown>)) {
-        if (totalChars >= 262_144) break;
-        visitValue(child, depth + 1);
+      const vals = Object.values(val as Record<string, unknown>);
+      if (vals.length === 0) return;
+      visited++;
+      for (const child of vals) {
+        if (visited > 100_000) break;
+        if (typeof child === 'string' || (child !== null && typeof child === 'object')) {
+          visitValue(child, depth + 1);
+        }
       }
     }
   };
@@ -449,13 +478,18 @@ export function inspectRawJobPostingJsonLdLinear(rawHtml: string): {
   for (const cand of candidates) {
     if (!descriptionHtml && typeof cand.description === 'string' && cand.description.trim()) {
       descriptionHtml = cand.description.trim();
+      pushDecodedString(descriptionHtml);
     }
     visitValue(cand);
   }
 
+  if (sawUnicodeTag) {
+    chunks.push('\u{E0069}');
+  }
+
   return {
     descriptionHtml,
-    rawDecodedStringsForPiCheck: chunks.join('\n').slice(0, 262_144),
+    rawDecodedStringsForPiCheck: chunks.join('\n'),
   };
 }
 

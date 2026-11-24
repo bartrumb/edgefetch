@@ -742,9 +742,9 @@ test('Round 9 (H2 & Mediums): Destination <10ms up to 1MiB, Storage v32 clamping
     assert.ok(dtNeut < 10 * covMul, `neutralizeAllUnsafeMarkdownLinksLinear(${size}B) took ${dtNeut.toFixed(2)}ms (expected < 10ms)`);
   }
 
-  // 2. Storage `SCRAPE_PIPELINE_VERSION === 33`, clamping `pipelineVersion < 33`, and `< 5ms` per-page O(window) slicing on `1 MiB` doc!
-  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
-  assert.equal(STORAGE_PIPELINE_VERSION, 33);
+  // 2. Storage `SCRAPE_PIPELINE_VERSION === 34`, clamping `pipelineVersion < 34`, and `< 5ms` per-page O(window) slicing on `1 MiB` doc!
+  assert.equal(SCRAPE_PIPELINE_VERSION, 34);
+  assert.equal(STORAGE_PIPELINE_VERSION, 34);
 
   const bucket = new MemoryR2Bucket();
   const staleSha = 'a'.repeat(64);

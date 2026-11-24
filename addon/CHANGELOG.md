@@ -2,6 +2,24 @@
 
 All notable changes to EdgeFetch are documented in this file. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.8] - 2026-11-23
+
+### Added
+- **Universal Web Extraction Funnel (`SCRAPE_PIPELINE_VERSION = 34`, `hub/src/extractors/schema-org.ts`, `hub/src/extractors/cms-twins.ts`, `hub/src/extractors/framework-hydration.ts`):**
+  - Added linear `O(N)` universal Schema.org JSON-LD extraction (`FAQPage`, `QAPage`, `DiscussionForumPosting`, `ItemList`/`CollectionPage`/`SearchResultsPage`, `Article`/`NewsArticle`/`BlogPosting`/`TechArticle`/`ScholarlyArticle`, `Event`, `SoftwareApplication`, `Dataset`, `Recipe`, `LocalBusiness`) with quote-aware prompt-injection inspection and strict anti-false-zero semantics.
+  - Added polite same-origin HTTPS auto-twins (`respectRobots: true`) for WordPress REST API (`<link rel="alternate" type="application/json" href=".../wp-json/wp/v2/(posts|pages)/<id>">`) and Gatsby `/page-data/<path>/page-data.json`.
+  - Upgraded SSR Framework State Hydrator (`R6` v2) with a linear `O(N)` Next.js App Router RSC Flight scanner (`self.__next_f.push`), a bounded cycle-safe Nuxt 3 `devalue` flat-array dereferencer (`#__NUXT_DATA__`), Angular `#ng-state`, Wix `#wix-viewer-model`, Squarespace `Static.SQUARESPACE_CONTEXT`, Substack `window._preloads`, and homogeneous `records[]` + GFM table extraction.
+- **Chromium CDP Hidden-DOM Pruning & Same-Origin JSON XHR Harvesting (`internal/browser/renderer.go`, `internal/crawl/crawl.go`, `internal/crawl/llms_scrape.go`):**
+  - Pruned computed-hidden `<body>` subtrees (`display:none`, `visibility:hidden`, `aria-hidden="true"`, `hidden`, and zero-opacity `pointer-events:none` fixed/absolute overlays) in `readDocumentHTML` while preserving `<head>`, JSON-LD/state `<script>` blocks, `<details>` disclosures, open Shadow DOM, and challenge widgets.
+  - Added bounded (`<= 6` responses, `<= 256 KiB` each, `<= 512 KiB` total) untainted main-frame same-origin `200 OK` `application/json` XHR/Fetch response harvesting (`capturedJson[]`) distilled by the Hub into sanitized `records[]` and `structured` metadata.
+- **Telemetry-Driven Adapter Gap Radar & Offline Manifest Proposer (`hub/src/gap-radar.ts`, `hub/scripts/propose-manifest.mjs`, `hub/src/admin.ts`, `hub/src/index.ts`):**
+  - Added `GET /v1/hosts/gaps` and `/admin` Adapter Gap Radar ranking origin hosts by `META` D1 headless browser fallback duration (`auto-render-1`) and non-OK rates, cross-referenced against registered site adapters.
+  - Added `npm run adapter:propose -- <https-url>` offline declarative YAML manifest + test fixture generator with DNS-pinned SSRF checks, `robots.txt` verification, and `M2` PSL domain validation.
+
+### Fixed
+- **ATS Parity & Wikipedia Linear ReDoS/URL Hardening (`hub/src/jobs.ts`, `hub/src/scrape.ts`, `hub/src/wikipedia.ts`, `internal/extract/manifests/icims.yaml`):**
+  - Added `%20` Ashby board slug support (`isValidAshbySlug`), compact-slug fallback probing and explicit non-`live` `reason` codes in `jobs` `verify`, multi-page Workday CXS pagination (`cursor`/`offset`) preserving page-0 `total` across `offset > 0` pages, Markdown truncation footers on `scrape`, `detected.adapter` reporting, and iCIMS root `/` inner-portal twin resolution rejecting `#icims_content_iframe` wrapper shells.
+
 ## [2.7.7] - 2026-11-23
 
 ### Security

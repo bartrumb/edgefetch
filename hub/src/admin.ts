@@ -44,6 +44,7 @@ import {
   type VaultSecretPayload,
 } from './mcp-vault';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type ActiveSpanHandle } from './otel';
+import { queryHostGapRadar } from './gap-radar';
 import { normalizeClientRateLimitIp, readBodyTextCapped } from './safe-input';
 import { stripInvisibleSmugglingChars } from './scrape';
 import type { UpdateCheckStatus } from './update-check';
@@ -486,6 +487,17 @@ function renderDashboardHtml(params: {
       </section>
     </div>
 
+    <section class="card" id="gap-radar-card" style="display:none">
+      <h2>
+        <span>Adapter Gap Radar (7d Browser Fallbacks &amp; Non-OK Hosts)</span>
+        <span class="muted">Ranked by headless Chromium time via <code>GET /v1/hosts/gaps</code></span>
+      </h2>
+      <table>
+        <thead><tr><th>Origin Host</th><th>Fetches (Browser %)</th><th>Browser Time</th><th>Adapter</th><th>Scaffold Command</th></tr></thead>
+        <tbody id="gap-radar-tbody"><tr><td colspan="5" class="muted">No unadapted browser-heavy hosts recorded in the last 7 days.</td></tr></tbody>
+      </table>
+    </section>
+
     <section class="card" id="users-card" style="display:none">
       <h2>
         <span>Hub Users &amp; Stored OAuth Tokens (<span id="users-count">0</span> users &middot; <span id="users-total-tokens">0</span> stored token rows)</span>
@@ -842,6 +854,27 @@ function renderDashboardHtml(params: {
             '<td><button type="button" class="danger" data-revoke="' + esc(g.grantId) + '">Revoke</button></td></tr>'
           ).join('')
         : '<tr><td colspan="4" class="muted">No OAuth 2.1 grants issued yet</td></tr>';
+
+      const gapCard = el('gap-radar-card');
+      const gapList = Array.isArray(data.hostGaps) ? data.hostGaps : [];
+      if (gapCard && data.viewer && data.viewer.role === 'owner' && gapList.length > 0) {
+        gapCard.style.display = 'block';
+        el('gap-radar-tbody').innerHTML = gapList.map((g) => {
+          const adBadge = g.hasAdapter
+            ? '<span class="badge lvl-info">' + esc(g.matchedAdapterId || 'adapted') + '</span>'
+            : '<span class="badge lvl-warn">unadapted</span>';
+          const cmd = g.proposeCommand ? '<code>' + esc(g.proposeCommand) + '</code>' : '<span class="muted">—</span>';
+          return '<tr>' +
+            '<td><code>' + esc(g.host) + '</code></td>' +
+            '<td><strong>' + Number(g.totalFetches || 0) + '</strong> <span class="muted">(' + Number(g.browserFallbacks || 0) + ' render / ' + Number(g.browserSharePct || 0) + '%)</span></td>' +
+            '<td>' + Math.round(Number(g.browserMsTotal || 0) / 100) / 10 + 's</td>' +
+            '<td>' + adBadge + '</td>' +
+            '<td>' + cmd + '</td>' +
+          '</tr>';
+        }).join('');
+      } else if (gapCard) {
+        gapCard.style.display = 'none';
+      }
 
       const usersCard = el('users-card');
       const usersList = Array.isArray(data.users) ? data.users : [];
@@ -1684,10 +1717,11 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         200,
       );
     }
-    const [rawUsers, updateStatus, devTelemetry] = await Promise.all([
+    const [rawUsers, updateStatus, devTelemetry, gapRadar] = await Promise.all([
       state.users ? Promise.resolve(state.users) : Promise.resolve(deps.oauthStore.listUsers?.() ?? []),
       deps.getUpdateStatus ? deps.getUpdateStatus(state.agents).catch(() => undefined) : Promise.resolve(undefined),
       deps.getTelemetrySettings ? deps.getTelemetrySettings().catch(() => undefined) : Promise.resolve(undefined),
+      deps.metaDb ? queryHostGapRadar({ metaDb: deps.metaDb, days: 7, limit: 10 }).catch(() => undefined) : Promise.resolve(undefined),
     ]);
     const users = rawUsers.map(({ encryptedGhToken: _omitGhSecret, ...u }) => {
       const storedTokenCount = Number(u.storedTokenCount ?? u.tokenCount ?? 0);
@@ -1710,6 +1744,7 @@ export async function handleAdminRoute(request: Request, url: URL, deps: AdminPo
         userId,
         vaultConfigured,
         mcpServers,
+        ...(gapRadar ? { hostGaps: gapRadar.hosts } : {}),
         ...(updateStatus ? { updateStatus } : {}),
         ...(devTelemetry ? { devTelemetry } : {}),
       },

@@ -11,7 +11,7 @@
 import { buildCanonicalMcpToolSchemas, MCP_TOOL_SCHEMAS, TEXT_ACCEPTS } from './mcp';
 
 export const DEFAULT_OPENAPI_ORIGIN = 'https://edgefetch.dev';
-export const DEFAULT_OPENAPI_VERSION = '2.7.7';
+export const DEFAULT_OPENAPI_VERSION = '2.7.8';
 
 export interface BuildOpenApiOptions {
   origin?: string;
@@ -416,6 +416,46 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             '200': {
               description: 'Per-host telemetry records.',
               content: jsonContent(schemaRef('HostsHealthResponse')),
+            },
+            ...standardAuthErrorResponses(),
+          },
+        },
+      },
+      '/v1/hosts/gaps': {
+        get: {
+          tags: ['System'],
+          operationId: 'listHostAdapterGaps',
+          summary: 'Rank origin hosts by headless browser fallback time and non-OK fetch rate',
+          description:
+            'Queries `META` D1 `fetches` telemetry (`auto-render-1` / `ext-auto-*` browser renders and non-OK outcomes) over the requested window and cross-references each host against `listRegisteredAdapters()` to prioritize declarative YAML adapter authoring.',
+          security: authReadSecurity(),
+          parameters: [
+            {
+              name: 'days',
+              in: 'query',
+              required: false,
+              description: 'Lookback window in days (`1..90`, default `7`).',
+              schema: { type: 'integer', minimum: 1, maximum: 90, default: 7 },
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              description: 'Maximum ranked hosts to return (`1..100`, default `25`).',
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'unadapted',
+              in: 'query',
+              required: false,
+              description: 'When `true`, omit hosts already covered by a registered adapter.',
+              schema: { type: 'boolean', default: false },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Ranked host gap telemetry and scaffold commands.',
+              content: jsonContent(schemaRef('GenericOkResponse')),
             },
             ...standardAuthErrorResponses(),
           },

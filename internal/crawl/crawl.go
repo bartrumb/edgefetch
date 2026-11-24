@@ -146,6 +146,7 @@ type Result struct {
 	ActionScrapes     []browser.ActionScrapeSnapshot `json:"actionScrapes,omitempty"`
 	JavascriptReturns []browser.ActionJSReturn       `json:"javascriptReturns,omitempty"`
 	ActionResults     []browser.ActionResult         `json:"actionResults,omitempty"`
+	CapturedJSON      []browser.CapturedJSONResponse `json:"capturedJson,omitempty"`
 	PDFBase64         string                         `json:"pdfBase64,omitempty"`
 	PDFEngine         string                         `json:"pdfEngine,omitempty"`
 	SHA256            string                         `json:"sha256,omitempty"`

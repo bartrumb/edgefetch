@@ -537,6 +537,7 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	res.ActionScrapes = out.ActionScrapes
 	res.JavascriptReturns = out.JavascriptReturns
 	res.ActionResults = out.ActionResults
+	res.CapturedJSON = out.CapturedJSON
 	res.PDFBase64 = out.PDFBase64
 	res.WAF = classify.ClassifyWAF(res.Status, out.Headers, rawBody)
 	res.Outcome, res.Problem = classify.Classify(classify.KindRender, res.Status, out.Headers, rawBody)

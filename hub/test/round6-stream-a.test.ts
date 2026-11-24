@@ -118,8 +118,8 @@ function assertNoActiveHtmlOrJsLinksOutsideCode(md: string, contextLabel: string
 }
 
 export async function runRound6StreamASubtests(t: TestContext): Promise<void> {
-await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 33', () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
+await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash code-span false positive, fence header cost, and SCRAPE_PIPELINE_VERSION = 34', () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 34);
 
   // 1. Indented fence dedent & top-level 1..3 space fence normalization (`r6A/h1.mjs`, `r6A/h1diff.mjs`)
   const h1IndentJs = fin(' ```\nx\n ```\n[k](javascript:alert(1))');

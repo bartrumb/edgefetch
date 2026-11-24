@@ -33,6 +33,18 @@ const VALID_CATEGORIES = new Set([
   'commerce-social',
 ]);
 export const VALID_CATALOG_PLATFORMS = new Set(['shopify', 'woocommerce']);
+export const VALID_HTML_MODES = new Set([
+  'dom',
+  'embedded_json',
+  'xml_items_table',
+  'markdown_clean',
+  'gist_files',
+  'stackexchange_html',
+  'reddit_shreddit',
+  'icims_portal',
+  'shopify_html',
+  'woocommerce_html',
+]);
 
 const pslDatPath = join(manifestsDir, 'public_suffix_list.dat');
 const pslExact = new Map();
@@ -318,7 +330,7 @@ function isAsciiPrintable(s) {
   return true;
 }
 
-function checkAstSafety(node, ctxPath) {
+export function checkAstSafety(node, ctxPath) {
   if (!node || typeof node !== 'object') return;
   if (isAlias(node)) {
     throw new Error(`${ctxPath}: YAML alias (*alias) is forbidden`);
@@ -523,7 +535,12 @@ function validateTwin(manifest, twin, ctxPath) {
   }
 }
 
-function validateManifest(m, fileLabel) {
+export function validateManifest(m, fileLabel) {
+  const assertStringArray = (val, fieldPath) => {
+    if (!Array.isArray(val) || !val.every((x) => typeof x === 'string')) {
+      throw new Error(`${fieldPath}: must be string[]`);
+    }
+  };
   assertAllowedKeys(m, SCHEMA_KEYS.manifest, fileLabel);
   if (typeof m.id !== 'string' || !VALID_ID_RE.test(m.id)) {
     throw new Error(`${fileLabel}: invalid id "${m.id}"`);
@@ -594,10 +611,54 @@ function validateManifest(m, fileLabel) {
     if (hr.id !== undefined && !VALID_ID_RE.test(hr.id)) {
       throw new Error(`${fileLabel}.htmlRoutes[${i}].id: invalid "${hr.id}"`);
     }
+    if (typeof hr.mode !== 'string' || !VALID_HTML_MODES.has(hr.mode)) {
+      throw new Error(
+        `${fileLabel}.htmlRoutes[${i}].mode: must be one of [${[...VALID_HTML_MODES].join(', ')}] (got "${String(hr.mode)}")`,
+      );
+    }
+    for (const arrField of ['jsonLdTypes', 'requireVars', 'requireBulletsOrVars', 'linkTemplates']) {
+      if (hr[arrField] !== undefined) {
+        assertStringArray(hr[arrField], `${fileLabel}.htmlRoutes[${i}].${arrField}`);
+      }
+    }
     validateMatch(hr.match, `${fileLabel}.htmlRoutes[${i}].match`);
     if (hr.vars) {
       for (const [vk, vs] of Object.entries(hr.vars)) {
         assertAllowedKeys(vs, SCHEMA_KEYS.htmlVar, `${fileLabel}.htmlRoutes[${i}].vars.${vk}`);
+        for (const varArrField of [
+          'jsonLdPaths',
+          'embeddedPaths',
+          'metaKeys',
+          'cssText',
+          'cssHtmlToMd',
+          'whenVars',
+          'whenAnyVars',
+        ]) {
+          if (vs[varArrField] !== undefined) {
+            assertStringArray(vs[varArrField], `${fileLabel}.htmlRoutes[${i}].vars.${vk}.${varArrField}`);
+          }
+        }
+        if (vs.cssAttr !== undefined) {
+          if (
+            !vs.cssAttr ||
+            typeof vs.cssAttr !== 'object' ||
+            Array.isArray(vs.cssAttr) ||
+            typeof vs.cssAttr.selector !== 'string' ||
+            typeof vs.cssAttr.attr !== 'string'
+          ) {
+            throw new Error(`${fileLabel}.htmlRoutes[${i}].vars.${vk}.cssAttr: must be { selector: string, attr: string }`);
+          }
+        }
+        if (vs.cssAllText !== undefined) {
+          if (
+            !vs.cssAllText ||
+            typeof vs.cssAllText !== 'object' ||
+            Array.isArray(vs.cssAllText) ||
+            typeof vs.cssAllText.selector !== 'string'
+          ) {
+            throw new Error(`${fileLabel}.htmlRoutes[${i}].vars.${vk}.cssAllText: must be { selector: string, ... }`);
+          }
+        }
       }
     }
     for (const [bi, b] of (hr.bullets ?? []).entries()) {

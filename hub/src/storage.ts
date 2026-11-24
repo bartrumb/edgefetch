@@ -47,7 +47,7 @@ export interface OptionalStorageBindings extends SpaFallbackEnv, LlmEnvBindings 
   PDF_OCR_TOKEN?: string;
 }
 
-export const SCRAPE_PIPELINE_VERSION = 33;
+export const SCRAPE_PIPELINE_VERSION = 34;
 export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 export const TRANSIENT_RETENTION_MS = 24 * 60 * 60_000; // 1 day (`tmp/` prefix lifecycle)
 export const STORED_RETENTION_MS = 30 * 24 * 60 * 60_000; // 30 days (`raw/` prefix lifecycle)
@@ -334,7 +334,7 @@ export function buildCapabilities(
     BOT_SIGNING_PRIVATE_KEY?: string;
     BOT_SIGNING_PUBLIC_KEY?: string;
   },
-  version = '2.7.7',
+  version = '2.7.8',
 ): HubCapabilities {
   const searchProviders: string[] = ['edge-map'];
   if (env.SEARCH) searchProviders.push('d1-fts5');

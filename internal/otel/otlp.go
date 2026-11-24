@@ -443,7 +443,7 @@ func newExporterFromEnv(
 		svc = "edgefetch-go"
 	}
 	if version == "" {
-		version = "2.7.7"
+		version = "2.7.8"
 	}
 	var client *http.Client
 	if tracesURL != "" || devTelURL != "" {

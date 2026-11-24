@@ -23,6 +23,16 @@ import {
   type PostFetchSiteResult,
   type TwinFormattedDoc,
 } from './extractors/registry';
+import { tryFetchCmsAutoTwin, type CmsAutoTwinResult } from './extractors/cms-twins';
+import {
+  distillCapturedJsonResponses,
+  type HydratedFrameworkStateResult,
+} from './extractors/framework-hydration';
+import {
+  extractUniversalSchemaOrg,
+  inspectRawSchemaOrgJsonLdLinear,
+  type UniversalSchemaOrgResult,
+} from './extractors/schema-org';
 import {
   detectSiteFrameworkLinear,
   extractInertiaPagePropsLinear,
@@ -12260,10 +12270,75 @@ export async function executeScrapeCall(params: {
     }
   }
 
-  // R6: SSR Hydration State Recovery (`__NEXT_DATA__`, Remix, Apollo, Inertia `data-page`) — extract full structured content
-  // directly from the embedded hydration JSON on thin `<script>` pages BEFORE paying headless Chromium latency!
-  let ssrHydrated: { title?: string; description?: string; markdown: string; framework: string } | null = null;
-  if (isHtmlBody && !isPdfResponse && !customShopifyDoc) {
+  // Tier 1A: Universal Schema.org JSON-LD (`FAQPage`, `QAPage`, `DiscussionForumPosting`, `ItemList`, `Article`, `Event`, `SoftwareApplication`, `Dataset`)
+  let universalSchemaDoc: UniversalSchemaOrgResult | null =
+    isHtmlBody && !isPdfResponse && !customShopifyDoc
+      ? extractUniversalSchemaOrg(rawBodyStr, finalUrl, htmlFragToMd)
+      : null;
+  let rawSchemaOrgPiStrings =
+    checkPromptInjection && isHtmlBody && /ld\+json/i.test(rawBodyStr)
+      ? inspectRawSchemaOrgJsonLdLinear(rawBodyStr)
+      : '';
+  const initialExtractedWords = countTextWords(extracted?.markdown ?? '');
+  const hydratedFromUniversalSchema = Boolean(
+    universalSchemaDoc?.markdown &&
+      !extracted?.extractorId &&
+      ((initialExtractedWords < 80 && countTextWords(universalSchemaDoc.markdown) >= Math.max(25, initialExtractedWords * 2)) ||
+        (initialExtractedWords < 120 &&
+          (universalSchemaDoc.schemaType === 'FAQPage' ||
+            universalSchemaDoc.schemaType === 'QAPage' ||
+            universalSchemaDoc.schemaType === 'DiscussionForumPosting' ||
+            (universalSchemaDoc.records && universalSchemaDoc.records.length >= 2)))),
+  );
+
+  // Tier 1B: CMS Auto-Twins (`wordpress-rest` `/wp-json/wp/v2/(posts|pages)/<id>` & `gatsby-page-data` `/page-data/.../page-data.json`)
+  // Politely upgrades thin CMS/SSG pages on the exact same HTTPS origin respecting `robots.txt`.
+  let cmsTwinDoc: CmsAutoTwinResult | null = null;
+  if (
+    isHtmlBody &&
+    !isPdfResponse &&
+    !customShopifyDoc &&
+    !extracted?.extractorId &&
+    !hydratedFromUniversalSchema &&
+    effectiveRenderMode !== 'always' &&
+    !needsDomForTwin &&
+    initialExtractedWords < 120
+  ) {
+    cmsTwinDoc = await tryFetchCmsAutoTwin({
+      rawHtml: rawBodyStr,
+      finalUrl,
+      currentWordCount: initialExtractedWords,
+      selfHost,
+      htmlToMd: htmlFragToMd,
+      fetchSameOriginJson: async (epUrl, tag) => {
+        const epRes = await executeHubFetch(
+          target,
+          JSON.stringify({
+            maxSeconds: 25,
+            options: { includeBody: true, respectRobots: true },
+            requests: [{ id: tag, url: epUrl, kind: 'json', accept: 'application/json' }],
+          }),
+          site,
+          `${source}:${tag}`,
+          retentionMode,
+          true,
+          collectionId,
+        );
+        if (epRes.status !== 200) return '';
+        const epParsed = JSON.parse(epRes.bodyText) as { results?: Array<Record<string, unknown>> };
+        const epItem = epParsed.results?.[0];
+        if (!epItem || !isTrustedTwinRedirectUrl(undefined, epUrl, epItem, selfHost)) return '';
+        return epItem.outcome === 'ok' && typeof epItem.body === 'string' && epItem.bodyEncoding !== 'base64'
+          ? epItem.body
+          : '';
+      },
+    });
+  }
+
+  // Tier 2 (`R6` v2): SSR Hydration State Recovery (`__NEXT_DATA__`, linear RSC `__next_f.push`, Nuxt 3 `devalue`, Remix, Apollo, Angular `ng-state`, Wix, Squarespace, Substack, Inertia)
+  // Extracts both rich prose AND homogeneous `records[]` BEFORE paying headless Chromium latency!
+  let ssrHydrated: HydratedFrameworkStateResult | null = null;
+  if (isHtmlBody && !isPdfResponse && !customShopifyDoc && !cmsTwinDoc && !hydratedFromUniversalSchema) {
     if (extracted?.inertiaHydrated && extracted.markdown.trim()) {
       ssrHydrated = {
         ...(extracted.title ? { title: extracted.title } : {}),
@@ -12271,12 +12346,16 @@ export async function executeScrapeCall(params: {
         markdown: extracted.markdown,
         framework: 'inertia',
       };
-    } else if (countTextWords(extracted?.markdown ?? '') < 80) {
+    } else if (initialExtractedWords < 80 || (!extracted?.records && initialExtractedWords < 120)) {
       const candidateHydration = recoverSsrHydrationContent(rawBodyStr, finalUrl, htmlFragToMd);
-      if (candidateHydration && countTextWords(candidateHydration.markdown) > countTextWords(extracted?.markdown ?? '') * 2) {
+      if (
+        candidateHydration &&
+        ((initialExtractedWords < 80 && countTextWords(candidateHydration.markdown) > initialExtractedWords * 2) ||
+          (candidateHydration.records && candidateHydration.records.length >= 3 && initialExtractedWords < 120))
+      ) {
         ssrHydrated = candidateHydration;
       } else if (
-        countTextWords(extracted?.markdown ?? '') < 50 &&
+        initialExtractedWords < 50 &&
         (rawBodyStr.includes('data-page="{&quot;component&quot;') || rawBodyStr.includes("data-page='{\"component\""))
       ) {
         const inertiaPage = extractInertiaPagePropsLinear(rawBodyStr);
@@ -12329,7 +12408,7 @@ export async function executeScrapeCall(params: {
   const rawJobLdInspection = shouldInspectJobPostingJsonLd
     ? inspectRawJobPostingJsonLdLinear(rawBodyStr)
     : { descriptionHtml: '', rawDecodedStringsForPiCheck: '' };
-  const rawJsonLdStringsForPiCheck = checkPromptInjection ? rawJobLdInspection.rawDecodedStringsForPiCheck : '';
+  let rawJsonLdStringsForPiCheck = checkPromptInjection ? rawJobLdInspection.rawDecodedStringsForPiCheck : '';
   if (
     isHtmlBody &&
     !customShopifyDoc &&
@@ -12380,6 +12459,8 @@ export async function executeScrapeCall(params: {
   if (
     isHtmlBody &&
     !customShopifyDoc &&
+    !cmsTwinDoc &&
+    !hydratedFromUniversalSchema &&
     !ssrHydrated &&
     !hydratedFromJobPostingJsonLd &&
     !isDeadWorkdayJobShell &&
@@ -12434,7 +12515,8 @@ export async function executeScrapeCall(params: {
             ...(includeTags.length > 0 ? { includeTags } : {}),
             ...(excludeTags.length > 0 ? { excludeTags } : {}),
           });
-          if (countTextWords(autoExtracted.markdown) > countTextWords(extracted?.markdown ?? '')) {
+          const hasAutoCapturedJson = Array.isArray(autoItem.capturedJson) && autoItem.capturedJson.length > 0;
+          if (countTextWords(autoExtracted.markdown) > countTextWords(extracted?.markdown ?? '') || hasAutoCapturedJson) {
             fetchResUsed = autoBrowserRes;
             item = { ...autoItem, contentType: 'text/html; charset=utf-8' };
             rawBodyStr = autoHtml;
@@ -12442,6 +12524,21 @@ export async function executeScrapeCall(params: {
             isHtmlBody = true;
             extracted = autoExtracted;
             renderedViaOut = 'browser-auto';
+            if (!universalSchemaDoc && /ld\+json/i.test(autoHtml)) {
+              universalSchemaDoc = extractUniversalSchemaOrg(autoHtml, autoFinalUrl, htmlFragToMd);
+            }
+            if (checkPromptInjection && /ld\+json/i.test(autoHtml)) {
+              const autoSchemaPi = inspectRawSchemaOrgJsonLdLinear(autoHtml);
+              if (autoSchemaPi) {
+                rawSchemaOrgPiStrings = [rawSchemaOrgPiStrings, autoSchemaPi].filter(Boolean).join('\n');
+              }
+            }
+            if (checkPromptInjection && /JobPosting/i.test(autoHtml)) {
+              const autoJobPi = inspectRawJobPostingJsonLdLinear(autoHtml).rawDecodedStringsForPiCheck;
+              if (autoJobPi) {
+                rawJsonLdStringsForPiCheck = [rawJsonLdStringsForPiCheck, autoJobPi].filter(Boolean).join('\n');
+              }
+            }
           }
         }
       } else if (
@@ -12455,6 +12552,12 @@ export async function executeScrapeCall(params: {
       // Gracefully keep static HTML extraction when no `browser-v1` agent is connected.
     }
   }
+
+  // Tier 3 (Phase 2 v2.7.8): Distill same-origin `200 OK` `application/json` XHR/Fetch payloads captured during CDP rendering!
+  const cdpJsonDistilled =
+    Array.isArray(item.capturedJson) && item.capturedJson.length > 0
+      ? distillCapturedJsonResponses(item.capturedJson, finalUrl)
+      : null;
 
   let alternateMarkdownUrl: string | undefined;
   let alternateMarkdownBody: string | undefined;
@@ -12629,6 +12732,10 @@ export async function executeScrapeCall(params: {
     patchFormatted ||
     sourceCodeFormatted;
 
+  if (cmsTwinDoc && !alternateMarkdownUrl) {
+    alternateMarkdownUrl = cmsTwinDoc.twinUrl;
+  }
+
   // P4: Extract structured schema.org `JobPosting` JSON-LD on HTML pages and surface key facts (pay, workplace, location) at the top.
   const htmlJobPosting: StructuredJobPosting | null = isHtmlBody
     ? extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '')
@@ -12638,12 +12745,33 @@ export async function executeScrapeCall(params: {
     ? rawBodyStr
     : alternateMarkdownBody ||
       customShopifyDoc?.markdown ||
+      cmsTwinDoc?.markdown ||
       ssrHydrated?.markdown ||
+      (hydratedFromUniversalSchema ? universalSchemaDoc?.markdown : undefined) ||
       structuredTextFormatted?.markdown ||
       (isHtmlBody ? extracted?.markdown : undefined) ||
       (typeof item.markdown === 'string' && item.markdown) ||
       extracted?.markdown ||
       (isHtmlBody ? '' : rawBodyStr);
+  if (cdpJsonDistilled?.markdown && countTextWords(markdown) < 80 && !alternateMarkdownBody && !customShopifyDoc) {
+    markdown = [markdown.trim(), cdpJsonDistilled.markdown].filter(Boolean).join('\n\n');
+  } else if (
+    universalSchemaDoc?.headerMarkdown &&
+    !hydratedFromUniversalSchema &&
+    !htmlJobPosting &&
+    isHtmlBody &&
+    !alternateMarkdownBody &&
+    !customShopifyDoc &&
+    !cmsTwinDoc &&
+    countTextWords(markdown) < 60
+  ) {
+    const topHeadingMatch = /^(#\s+[^\n]+)\n+([\s\S]*)$/.exec(markdown.trim());
+    markdown = topHeadingMatch
+      ? `${topHeadingMatch[1]}\n\n${universalSchemaDoc.headerMarkdown}\n\n${topHeadingMatch[2]}`
+      : [universalSchemaDoc.title ? `# ${universalSchemaDoc.title}` : '', universalSchemaDoc.headerMarkdown, markdown.trim()]
+          .filter(Boolean)
+          .join('\n\n');
+  }
   if (htmlJobPosting && isHtmlBody && !alternateMarkdownBody && !customShopifyDoc) {
     const jpHeader = formatJobPostingHeaderMarkdown(htmlJobPosting);
     if (jpHeader && !/\*\*Compensation\*\*:/.test(markdown.slice(0, 400))) {
@@ -12657,7 +12785,10 @@ export async function executeScrapeCall(params: {
     ? rawBodyStr
     : alternateMarkdownBody ||
       customShopifyDoc?.markdown ||
+      cmsTwinDoc?.markdown ||
       ssrHydrated?.markdown ||
+      (hydratedFromUniversalSchema ? universalSchemaDoc?.markdown : undefined) ||
+      (cdpJsonDistilled?.markdown && countTextWords(extracted?.text ?? '') < 80 ? markdown : undefined) ||
       feedFormatted?.markdown ||
       vcardFormatted?.markdown ||
       icsFormatted?.markdown ||
@@ -12896,8 +13027,15 @@ export async function executeScrapeCall(params: {
     }
   }
 
+  const baseHtmlLinks = extracted?.links ?? (Array.isArray(item.links) ? item.links : []);
+  const cmsOrHydratedLinks =
+    isHtmlBody && (cmsTwinDoc || ssrHydrated || hydratedFromUniversalSchema) && stringFormats.has('links')
+      ? extractMarkdownLinksAndImages(rawCleanMarkdown, finalUrl, false).links
+      : [];
   const resolvedLinks = isHtmlBody
-    ? (extracted?.links ?? (Array.isArray(item.links) ? item.links : []))
+    ? cmsOrHydratedLinks.length > 0
+      ? [...new Set([...(baseHtmlLinks as string[]), ...cmsOrHydratedLinks])]
+      : baseHtmlLinks
     : feedFormatted && feedFormatted.links.length > 0
       ? feedFormatted.links
       : Array.isArray(item.links) && item.links.length > 0
@@ -12913,8 +13051,10 @@ export async function executeScrapeCall(params: {
 
   const rawResolvedTitle =
     customShopifyDoc?.title ||
+    cmsTwinDoc?.title ||
     ssrHydrated?.title ||
     extracted?.title ||
+    universalSchemaDoc?.title ||
     structuredTextFormatted?.title ||
     fullShaped.frontmatterTitle ||
     mdAssets?.title ||
@@ -12925,8 +13065,10 @@ export async function executeScrapeCall(params: {
     (isPdfResponse ? extractPdfTitle(rawCleanMarkdown, finalUrl) : undefined);
   const rawResolvedDescription =
     customShopifyDoc?.description ||
+    cmsTwinDoc?.description ||
     ssrHydrated?.description ||
     extracted?.description ||
+    universalSchemaDoc?.description ||
     (structuredTextFormatted as { description?: string } | null)?.description ||
     fullShaped.frontmatterDescription ||
     mdAssets?.description ||
@@ -12957,14 +13099,95 @@ export async function executeScrapeCall(params: {
     nowMs: now,
   });
 
+  const nonEmptyUniversalRecords =
+    (cmsTwinDoc?.records && cmsTwinDoc.records.length > 0 ? cmsTwinDoc.records : undefined) ??
+    (ssrHydrated?.records && ssrHydrated.records.length > 0 ? ssrHydrated.records : undefined) ??
+    (cdpJsonDistilled?.records && cdpJsonDistilled.records.length > 0 ? cdpJsonDistilled.records : undefined) ??
+    (universalSchemaDoc?.records && universalSchemaDoc.records.length > 0 ? universalSchemaDoc.records : undefined);
+  const universalStructuredOut =
+    cmsTwinDoc?.structured ??
+    ssrHydrated?.structured ??
+    cdpJsonDistilled?.structured ??
+    universalSchemaDoc?.structured;
+
+  let productOut: Record<string, unknown> | null = null;
+  if (stringFormats.has('product')) {
+    productOut = extractStructuredProduct({
+      rawBody: rawBodyStr,
+      finalUrl,
+      fallbackTitle: resolvedTitle,
+      fallbackDescription: resolvedDescription,
+    });
+  }
+
+  const attributesOut =
+    attributesSpec && isHtmlBody ? extractHtmlAttributesBySelectors(rawBodyStr, attributesSpec) : undefined;
+
+  const docForJson: ExtractedDocument | undefined = jsonSchemaSpec
+    ? {
+        markdown: rawCleanMarkdown,
+        text: textOut || rawCleanMarkdown,
+        title: resolvedTitle,
+        description: resolvedDescription,
+        language: extracted?.language,
+        canonicalUrl: extracted?.canonicalUrl ?? finalUrl,
+        favicon: (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon,
+        links: resolvedLinks as string[],
+        images: resolvedImages as ScrapedImage[],
+        branding: extracted?.branding ?? {
+          title: resolvedTitle,
+          description: resolvedDescription,
+          canonicalUrl: extracted?.canonicalUrl ?? finalUrl,
+        },
+      }
+    : undefined;
+
+  let structuredJsonOut: Record<string, unknown> | undefined;
+  let remainingUnmatchedJsonFields: string[] = [];
+  if (jsonSchemaSpec && docForJson) {
+    const heuristicDiag = extractStructuredJsonFromPageWithDiagnostics(rawBodyStr, docForJson, jsonSchemaSpec.schema);
+    structuredJsonOut = heuristicDiag.data;
+    const pickedKeys = new Set<string>();
+    if (jsonFormatted?.parsed && typeof jsonFormatted.parsed === 'object' && !Array.isArray(jsonFormatted.parsed)) {
+      const srcObj = jsonFormatted.parsed as Record<string, unknown>;
+      const props =
+        jsonSchemaSpec.schema && typeof jsonSchemaSpec.schema.properties === 'object' && jsonSchemaSpec.schema.properties !== null
+          ? Object.keys(jsonSchemaSpec.schema.properties as Record<string, unknown>)
+          : Object.keys(srcObj);
+      const directPicked: Record<string, unknown> = {};
+      for (const k of props) {
+        if (k in srcObj && srcObj[k] !== undefined) {
+          directPicked[k] = srcObj[k];
+          pickedKeys.add(k);
+        }
+      }
+      structuredJsonOut = { ...structuredJsonOut, ...directPicked };
+    }
+    remainingUnmatchedJsonFields = heuristicDiag.unmatchedFields.filter((f) => !pickedKeys.has(f));
+  }
+
   if (checkPromptInjection) {
     const serializedJobPosting = htmlJobPosting ? JSON.stringify(htmlJobPosting) : '';
+    const serializedUniversalRecords = nonEmptyUniversalRecords ? JSON.stringify(nonEmptyUniversalRecords) : '';
+    const serializedUniversalStructured = universalStructuredOut ? JSON.stringify(universalStructuredOut) : '';
+    const serializedProduct = productOut ? JSON.stringify(productOut) : '';
+    const serializedAttributes = attributesOut ? JSON.stringify(attributesOut) : '';
+    const serializedHeuristicJson = structuredJsonOut ? JSON.stringify(structuredJsonOut) : '';
     const mdForInjectionCheck = [
       resolvedTitle,
       resolvedDescription,
       rawCleanMarkdown,
       rawJsonLdStringsForPiCheck,
+      rawSchemaOrgPiStrings,
+      cmsTwinDoc?.rawDecodedStringsForPiCheck,
+      ssrHydrated?.rawDecodedStringsForPiCheck,
+      cdpJsonDistilled?.rawDecodedStringsForPiCheck,
       serializedJobPosting,
+      serializedUniversalRecords,
+      serializedUniversalStructured,
+      serializedProduct,
+      serializedAttributes,
+      serializedHeuristicJson,
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -13027,41 +13250,8 @@ export async function executeScrapeCall(params: {
     summaryOut = sumRes.summary;
   }
 
-  let productOut: Record<string, unknown> | null = null;
-  if (stringFormats.has('product')) {
-    productOut = extractStructuredProduct({
-      rawBody: rawBodyStr,
-      finalUrl,
-      fallbackTitle: resolvedTitle,
-      fallbackDescription: resolvedDescription,
-    });
-  }
-
-  const attributesOut =
-    attributesSpec && isHtmlBody ? extractHtmlAttributesBySelectors(rawBodyStr, attributesSpec) : undefined;
-
   const rawBase64Out = rawBase64Requested ? encodeBodyToRawBase64(item) : undefined;
 
-  const docForJson: ExtractedDocument | undefined = jsonSchemaSpec
-    ? {
-        markdown: rawCleanMarkdown,
-        text: textOut || rawCleanMarkdown,
-        title: resolvedTitle,
-        description: resolvedDescription,
-        language: extracted?.language,
-        canonicalUrl: extracted?.canonicalUrl ?? finalUrl,
-        favicon: (typeof item.favicon === 'string' && item.favicon) || extracted?.favicon,
-        links: resolvedLinks as string[],
-        images: resolvedImages as ScrapedImage[],
-        branding: extracted?.branding ?? {
-          title: resolvedTitle,
-          description: resolvedDescription,
-          canonicalUrl: extracted?.canonicalUrl ?? finalUrl,
-        },
-      }
-    : undefined;
-
-  let structuredJsonOut: Record<string, unknown> | undefined;
   let jsonExtractionModeOut: 'heuristic' | 'llm' | undefined;
   const scrapeWarnings: string[] = [...(extracted?.warnings ?? [])];
   if (autoBrowserUnavailable && renderedViaOut === undefined && countTextWords(rawCleanMarkdown) < 50) {
@@ -13070,25 +13260,6 @@ export async function executeScrapeCall(params: {
     );
   }
   if (jsonSchemaSpec && docForJson) {
-    const heuristicDiag = extractStructuredJsonFromPageWithDiagnostics(rawBodyStr, docForJson, jsonSchemaSpec.schema);
-    structuredJsonOut = heuristicDiag.data;
-    const pickedKeys = new Set<string>();
-    if (jsonFormatted?.parsed && typeof jsonFormatted.parsed === 'object' && !Array.isArray(jsonFormatted.parsed)) {
-      const srcObj = jsonFormatted.parsed as Record<string, unknown>;
-      const props =
-        jsonSchemaSpec.schema && typeof jsonSchemaSpec.schema.properties === 'object' && jsonSchemaSpec.schema.properties !== null
-          ? Object.keys(jsonSchemaSpec.schema.properties as Record<string, unknown>)
-          : Object.keys(srcObj);
-      const directPicked: Record<string, unknown> = {};
-      for (const k of props) {
-        if (k in srcObj && srcObj[k] !== undefined) {
-          directPicked[k] = srcObj[k];
-          pickedKeys.add(k);
-        }
-      }
-      structuredJsonOut = { ...structuredJsonOut, ...directPicked };
-    }
-    const remainingUnmatched = heuristicDiag.unmatchedFields.filter((f) => !pickedKeys.has(f));
     if (activeLlmConfig && (jsonSchemaSpec.prompt || jsonSchemaSpec.schema)) {
       const llmExt = await extractJsonWithOptionalLlm({
         markdown: rawCleanMarkdown,
@@ -13102,16 +13273,16 @@ export async function executeScrapeCall(params: {
       });
       structuredJsonOut = llmExt.data;
       jsonExtractionModeOut = llmExt.viaLlm ? 'llm' : 'heuristic';
-      if (!llmExt.viaLlm && remainingUnmatched.length > 0) {
+      if (!llmExt.viaLlm && remainingUnmatchedJsonFields.length > 0) {
         scrapeWarnings.push(
-          `Keyless heuristic schema extraction could not match [${remainingUnmatched.join(', ')}] from page structure; use the 'agent' tool (BYO-LLM) or configure an LLM provider for semantic JSON-Schema extraction.`,
+          `Keyless heuristic schema extraction could not match [${remainingUnmatchedJsonFields.join(', ')}] from page structure; use the 'agent' tool (BYO-LLM) or configure an LLM provider for semantic JSON-Schema extraction.`,
         );
       }
     } else {
       jsonExtractionModeOut = 'heuristic';
-      if (remainingUnmatched.length > 0) {
+      if (remainingUnmatchedJsonFields.length > 0) {
         scrapeWarnings.push(
-          `Keyless heuristic schema extraction could not match [${remainingUnmatched.join(', ')}] from page structure; use the 'agent' tool (BYO-LLM) or configure an LLM provider for semantic JSON-Schema extraction.`,
+          `Keyless heuristic schema extraction could not match [${remainingUnmatchedJsonFields.join(', ')}] from page structure; use the 'agent' tool (BYO-LLM) or configure an LLM provider for semantic JSON-Schema extraction.`,
         );
       }
     }
@@ -13173,7 +13344,17 @@ export async function executeScrapeCall(params: {
       }
     }
   } else if (!isPrivateScrape && payload.ephemeral !== true && shaped.truncated && env.ARTIFACTS && rawCleanMarkdown) {
-    const usesUpgradedBody = Boolean(alternateMarkdownBody || ocrReportOut || structuredTextFormatted || contentSourceOut || htmlJobPosting);
+    const usesUpgradedBody = Boolean(
+      alternateMarkdownBody ||
+        ocrReportOut ||
+        structuredTextFormatted ||
+        contentSourceOut ||
+        htmlJobPosting ||
+        cmsTwinDoc ||
+        hydratedFromUniversalSchema ||
+        universalSchemaDoc?.headerMarkdown ||
+        cdpJsonDistilled?.markdown,
+    );
     const computedCleanMdSha = await sha256HexString(rawCleanMarkdown);
     const mdContentSha =
       !usesUpgradedBody && art?.contentSha256 && isValidSha256Hex(art.contentSha256)
@@ -13240,7 +13421,11 @@ export async function executeScrapeCall(params: {
   );
 
   const parsedFinalWiki = parseWikipediaArticleUrl(finalUrl);
-  const extractorIdOut = customCommerceId ?? extracted?.extractorId ?? (parsedFinalWiki ? 'mediawiki' : undefined);
+  const extractorIdOut =
+    customCommerceId ??
+    cmsTwinDoc?.extractorId ??
+    extracted?.extractorId ??
+    (parsedFinalWiki ? 'mediawiki' : undefined);
   const detectedWithAdapter: Record<string, unknown> | null = detectedStack
     ? {
         ...detectedStack,
@@ -13255,20 +13440,52 @@ export async function executeScrapeCall(params: {
   if (extractorIdOut) {
     setActiveSpanAttribute('edgefetch.adapter_id', extractorIdOut, activeTracer ?? undefined);
   }
-  const adapterRecordsOut = customShopifyDoc?.records ?? extracted?.records;
+  const adapterRecordsOut = customShopifyDoc?.records ?? extracted?.records ?? nonEmptyUniversalRecords;
   const adapterPaginationOut = customShopifyDoc?.pagination ?? extracted?.pagination;
-  const adapterTotalOut = customShopifyDoc?.total ?? extracted?.total;
-  const adapterReturnedOut = customShopifyDoc?.returned ?? extracted?.returned;
-  const adapterTruncatedOut = customShopifyDoc?.truncated ?? extracted?.truncated;
-  const adapterNextCursorOut = customShopifyDoc?.nextCursor ?? extracted?.nextCursor;
-  const resolvedAuthor = sanitizeScrapedMetadataField(customShopifyDoc?.author ?? extracted?.author, 256);
+  const adapterTotalOut =
+    customShopifyDoc?.total ??
+    extracted?.total ??
+    cmsTwinDoc?.total ??
+    ssrHydrated?.total ??
+    cdpJsonDistilled?.total ??
+    universalSchemaDoc?.total;
+  const adapterReturnedOut =
+    customShopifyDoc?.returned ??
+    extracted?.returned ??
+    cmsTwinDoc?.returned ??
+    ssrHydrated?.returned ??
+    cdpJsonDistilled?.returned ??
+    universalSchemaDoc?.returned;
+  const adapterTruncatedOut =
+    customShopifyDoc?.truncated ??
+    extracted?.truncated ??
+    cmsTwinDoc?.truncated ??
+    ssrHydrated?.truncated ??
+    cdpJsonDistilled?.truncated;
+  const adapterNextCursorOut =
+    customShopifyDoc?.nextCursor ??
+    extracted?.nextCursor ??
+    cmsTwinDoc?.nextCursor ??
+    ssrHydrated?.nextCursor ??
+    cdpJsonDistilled?.nextCursor;
+  const resolvedAuthor = sanitizeScrapedMetadataField(
+    customShopifyDoc?.author ?? extracted?.author ?? universalSchemaDoc?.author,
+    256,
+  );
   const resolvedPublishedTime = sanitizeScrapedTimestampField(
-    customShopifyDoc?.publishedTime ?? extracted?.publishedTime ?? htmlJobPosting?.datePosted,
+    customShopifyDoc?.publishedTime ??
+      cmsTwinDoc?.publishedTime ??
+      extracted?.publishedTime ??
+      htmlJobPosting?.datePosted ??
+      universalSchemaDoc?.publishedTime,
     128,
   );
-  const resolvedModifiedTime = sanitizeScrapedTimestampField(extracted?.modifiedTime, 128);
+  const resolvedModifiedTime = sanitizeScrapedTimestampField(
+    cmsTwinDoc?.modifiedTime ?? extracted?.modifiedTime ?? universalSchemaDoc?.modifiedTime,
+    128,
+  );
   const resolvedSiteName = sanitizeScrapedMetadataField(
-    extracted?.siteName ?? htmlJobPosting?.hiringOrganization,
+    extracted?.siteName ?? htmlJobPosting?.hiringOrganization ?? universalSchemaDoc?.siteName,
     256,
   );
 
@@ -13352,6 +13569,7 @@ export async function executeScrapeCall(params: {
     ...(resolvedContentType ? { contentType: resolvedContentType } : {}),
     ...(scrapeWarnings.length > 0 ? { warnings: scrapeWarnings } : {}),
     ...(htmlJobPosting ? { jobPosting: htmlJobPosting } : {}),
+    ...(universalStructuredOut ? { structured: universalStructuredOut } : {}),
     ...(adapterRecordsOut !== undefined ? { records: adapterRecordsOut } : {}),
     ...(adapterPaginationOut !== undefined ? { pagination: adapterPaginationOut } : {}),
     ...(adapterTotalOut !== undefined ? { total: adapterTotalOut } : {}),

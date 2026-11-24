@@ -124,9 +124,9 @@ function assertStrictS1ProseSafety(sanitizedMd: string, label: string, allowPdfM
   }
 }
 
-test('Round 10 (S1): < restorer removed, SCRAPE_PIPELINE_VERSION === 33, every prose < escaped, and 512 KiB `<a>` runs in < 25 ms', () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
-  assert.equal(STORAGE_PIPELINE_VERSION, 33);
+test('Round 10 (S1): < restorer removed, SCRAPE_PIPELINE_VERSION === 34, every prose < escaped, and 512 KiB `<a>` runs in < 25 ms', () => {
+  assert.equal(SCRAPE_PIPELINE_VERSION, 34);
+  assert.equal(STORAGE_PIPELINE_VERSION, 34);
 
   // 1. Confirm `escapeResidualLtPreservingSafeCodeSpansLinear` and false dialect-agreement comment are completely gone
   assert.equal('escapeResidualLtPreservingSafeCodeSpansLinear' in scrapeAdvancedExports, false);

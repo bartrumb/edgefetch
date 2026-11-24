@@ -22,6 +22,7 @@ import {
   type McpClientActivity,
 } from './activity-log';
 import { handleAdminRoute } from './admin';
+import { queryHostGapRadar } from './gap-radar';
 import {
   createSqliteHubSettingsStore,
   DEV_TELEMETRY_SETTING_KEY,
@@ -2185,13 +2186,58 @@ export default {
           if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
             return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
           }
-          if (auth.role === 'member') {
+          if (auth.role !== 'owner') {
             return Response.json({ ok: true, hosts: [] }, { status: 200, headers: { 'cache-control': 'no-store' } });
           }
           const rawLimit = Number(url.searchParams.get('limit') ?? 100);
           const safeLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 100;
           const hosts = await hub().listHostHealth(safeLimit);
           return Response.json({ ok: true, hosts }, { status: 200, headers: { 'cache-control': 'no-store' } });
+        });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/v1/hosts/gaps') {
+        return withRouteSpan('edgefetch.hosts_gaps', {}, async () => {
+          const auth = await authorizeMcpRequest({
+            request,
+            origin: url.origin,
+            ownerSecret: env.CALLER_TOKEN,
+            store: oauthStore,
+          });
+          if (!auth.ok) {
+            return Response.json(
+              { error: 'unauthorized' },
+              { status: 401, headers: { 'cache-control': 'no-store', 'www-authenticate': auth.wwwAuthenticate } },
+            );
+          }
+          if (!auth.scopes.includes('crawl:read') && !auth.scopes.includes('crawl:fetch')) {
+            return Response.json({ error: 'insufficient_scope' }, { status: 403, headers: { 'cache-control': 'no-store' } });
+          }
+          const rawDays = Number(url.searchParams.get('days') ?? 7);
+          const safeDays = Number.isFinite(rawDays) ? Math.max(1, Math.min(90, Math.floor(rawDays))) : 7;
+          const rawLimit = Number(url.searchParams.get('limit') ?? 25);
+          const safeLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.floor(rawLimit))) : 25;
+          const onlyUnadapted =
+            url.searchParams.get('unadapted') === 'true' || url.searchParams.get('unadapted') === '1';
+          if (auth.role !== 'owner') {
+            return Response.json(
+              {
+                ok: true,
+                configured: Boolean(env.META),
+                windowDays: safeDays,
+                sinceMs: Date.now() - safeDays * 86_400_000,
+                hosts: [],
+              },
+              { status: 200, headers: { 'cache-control': 'no-store' } },
+            );
+          }
+          const radar = await queryHostGapRadar({
+            metaDb: env.META,
+            days: safeDays,
+            limit: safeLimit,
+            onlyUnadapted,
+          });
+          return Response.json(radar, { status: 200, headers: { 'cache-control': 'no-store' } });
         });
       }
 

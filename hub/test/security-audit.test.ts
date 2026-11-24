@@ -2869,7 +2869,7 @@ test('SEC-V261-ROUND5: R4-H1..H3 O(N) Scanners, R4-M6..M7 XSS/Sentinel Hygiene, 
 });
 
 test('SEC-V262-ROUND5-CLOSURE: R5-H1..H4, R5-M1..M5, v5.mjs PoCs, sentinel forgery, Host/safe-fetch & Hub Lows', async () => {
-  assert.equal(SCRAPE_PIPELINE_VERSION, 33);
+  assert.equal(SCRAPE_PIPELINE_VERSION, 34);
 
   // 1. Exact `v5.mjs` PoCs (`R5-H3`, `R5-H4`, `R5-M1`, `R5-M2`) + Sentinel Forgery
   const fin = (md: string, origin = true) =>

@@ -130,6 +130,9 @@ try {
   const round10LiveTracesOutfile = join(dir, 'round10-live-traces.test.mjs');
   buildNodeTestBundle('test/round10-live-traces.test.ts', round10LiveTracesOutfile);
   nodeTestFiles.push(round10LiveTracesOutfile);
+  const universalScaleOutfile = join(dir, 'universal-extraction-scale.test.mjs');
+  buildNodeTestBundle('test/universal-extraction-scale.test.ts', universalScaleOutfile);
+  nodeTestFiles.push(universalScaleOutfile);
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],

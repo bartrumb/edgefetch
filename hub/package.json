@@ -1,6 +1,6 @@
 {
   "name": "edgefetch-hub",
-  "version": "2.7.7",
+  "version": "2.7.8",
   "private": true,
   "license": "FSL-1.1-MIT",
   "description": "Cloudflare Hibernating WebSocket Durable Object coordinator, /admin Control Center, and Self-Hosted OAuth 2.1 /mcp server for EdgeFetch.",
@@ -14,6 +14,7 @@
     "test:coverage": "node scripts/run-tests.mjs --coverage --include-sdk",
     "openapi:generate": "node scripts/generate-openapi.mjs",
     "adapter:new": "node scripts/new-adapter.mjs",
+    "adapter:propose": "node scripts/propose-manifest.mjs",
     "adapter:test": "node scripts/test-adapter.mjs",
     "build:portable": "node scripts/build-portable.mjs",
     "start:portable": "node scripts/build-portable.mjs && node dist/portable-server.mjs",

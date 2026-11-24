@@ -8169,7 +8169,7 @@ export function collapseAnimatedCounterTickersLinear(prose: string): string {
         let leadNl = 0;
         while (k < len) {
           const ws = prose.charCodeAt(k);
-          if (ws === 32 || ws === 9) {
+          if (ws === 32 || ws === 9 || ws === 160) {
             k++;
           } else if (ws === 10 && leadNl < 2) {
             leadNl++;
@@ -8189,8 +8189,8 @@ export function collapseAnimatedCounterTickersLinear(prose: string): string {
               tDigits += prose[m]!;
               m++;
               lastAcceptedEnd = m;
-            } else if (mc === 44 || mc === 32 || mc === 9 || mc === 10) {
-              if (mc === 32 || mc === 9 || mc === 10) tSpaces++;
+            } else if (mc === 44 || mc === 32 || mc === 9 || mc === 10 || mc === 160) {
+              if (mc === 32 || mc === 9 || mc === 10 || mc === 160) tSpaces++;
               m++;
             } else {
               break;
@@ -8241,7 +8241,7 @@ export function finalizeScrapedMarkdown(
   let md = opts.preserveOriginMarkdown
     ? stripInvisibleSmugglingChars(cleanOriginNegotiatedMarkdown(bodyTrimmed, opts.baseUrl))
     : stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(bodyTrimmed, opts.baseUrl, Boolean(opts.allowPdfPageMarkers)));
-  if (!opts.preserveOriginMarkdown && !opts.isPdf && (md.includes(',') || /\d[ \t\n]\d[ \t\n]\d/.test(md))) {
+  if (!opts.preserveOriginMarkdown && !opts.isPdf && (md.includes(',') || /\d[ \t\n\u00a0]\d[ \t\n\u00a0]\d/.test(md))) {
     md = splitMarkdownByCodeFences(md)
       .map((seg, idx) => (idx % 2 === 1 ? seg : collapseAnimatedCounterTickersLinear(seg)))
       .join('');
@@ -10865,14 +10865,65 @@ export async function executeScrapeCall(params: {
           }
         } else if (
           atsItem &&
-          (atsItem.status === 404 || atsItem.status === 410) &&
+          atsItem.outcome !== 'challenge' &&
+          atsItem.outcome !== 'robots_disallowed' &&
+          atsItem.outcome !== 'content_signal_disallowed' &&
+          !atsItem.waf &&
           isTrustedTwinRedirectUrl(atsSpec.id, atsSpec.fetchUrl, atsItem, selfHost) &&
-          /^(?:greenhouse(?:-eu)?|ashby|lever(?:-eu)?|workable|gem|workday)-(?:board|job)$/.test(atsSpec.id)
+          /^(?:greenhouse(?:-eu)?|ashby|lever(?:-eu)?|workable|gem|workday)-(?:board|job)$/.test(atsSpec.id) &&
+          !classifyWafAndChallenge({
+            status: typeof atsItem.status === 'number' ? atsItem.status : 0,
+            rawBody: atsBody,
+          }) &&
+          (atsItem.status === 404 ||
+            atsItem.status === 410 ||
+            // Workday CXS returns structured JSON `{"errorCode":"S22","errorCaseId":"...","httpStatus":403,"message":"permission denied"}`
+            // for closed/unpublished job requisitions and HTTP 422 `{"errorCode":"S...","errorCaseId":"...","httpStatus":422}` when
+            // `{tenant}`/`{site}` does not exist on that `wdN` cluster — verify exact schema so WAF 403/422s never match!
+            (() => {
+              if (
+                (atsSpec.id !== 'workday-job' && atsSpec.id !== 'workday-board') ||
+                (atsItem.status !== 403 && atsItem.status !== 422) ||
+                atsBody.length > 2048 ||
+                !atsBody.trimStart().startsWith('{')
+              ) {
+                return false;
+              }
+              if (typeof atsItem.contentType === 'string' && atsItem.contentType && !/json/i.test(atsItem.contentType)) {
+                return false;
+              }
+              try {
+                const parsedErr = JSON.parse(atsBody) as Record<string, unknown>;
+                if (!parsedErr || typeof parsedErr !== 'object' || typeof parsedErr.errorCaseId !== 'string' || !parsedErr.errorCaseId) {
+                  return false;
+                }
+                if (atsSpec.id === 'workday-job' && atsItem.status === 403) {
+                  return parsedErr.errorCode === 'S22' && parsedErr.httpStatus === 403;
+                }
+                if (atsSpec.id === 'workday-board' && atsItem.status === 422) {
+                  const hasQueryOrOffset =
+                    parsedUrl.searchParams.has('q') ||
+                    parsedUrl.searchParams.has('searchText') ||
+                    parsedUrl.searchParams.has('search') ||
+                    parsedUrl.searchParams.has('offset');
+                  return (
+                    !hasQueryOrOffset &&
+                    typeof parsedErr.errorCode === 'string' &&
+                    /^S\d{1,4}$/.test(parsedErr.errorCode) &&
+                    parsedErr.httpStatus === 422
+                  );
+                }
+                return false;
+              } catch {
+                return false;
+              }
+            })())
         ) {
-          // Authoritative hosted ATS API returned 404/410: return immediately instead of triple-fetching
+          // Authoritative hosted ATS API returned 404/410 (or Workday CXS structured S22/422): return immediately instead of triple-fetching
           // (`ats-*` -> `twin-*` -> HTML `scrape-1` -> 14s headless Chromium `auto-render-1` on `?error=true`)!
           const isSingleJobSpec = atsSpec.id.endsWith('-job');
-          const statusOut = Number(atsItem.status);
+          const upstreamStatus = Number(atsItem.status);
+          const statusOut = upstreamStatus === 403 || upstreamStatus === 422 ? 404 : upstreamStatus;
           setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
           setActiveSpanAttribute('edgefetch.outcome', 'not_found', activeTracer ?? undefined);
           return {
@@ -10886,14 +10937,15 @@ export async function executeScrapeCall(params: {
               error: 'not_found',
               retryable: false,
               status: statusOut,
+              ...(statusOut !== upstreamStatus ? { upstreamStatus } : {}),
               extractorId: atsSpec.id,
               ...(isSingleJobSpec
                 ? {
                     contentState: 'closed_posting' as const,
-                    contentStateReason: `ATS posting API returned HTTP ${statusOut} (closed or unpublished)`,
+                    contentStateReason: `ATS posting API returned HTTP ${upstreamStatus} (closed or unpublished)`,
                   }
                 : {}),
-              problem: `HTTP ${statusOut}`,
+              problem: `HTTP ${upstreamStatus}`,
             },
           };
         }

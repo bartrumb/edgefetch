@@ -828,7 +828,8 @@ test('R10-4: postedWithinDays <= 30 parity, 5-min LRU + 6-way parallel coalescin
     htmlToMd,
   )!;
   assert.match(wdBoardFmt.jobs?.[0]?.postedAt ?? '', /^\d{4}-\d{2}-\d{2}$/);
-  assert.match(wdBoardFmt.jobs?.[1]?.postedAt ?? '', /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(wdBoardFmt.jobs?.[1]?.postedAt, null);
+  assert.equal(wdBoardFmt.jobs?.[1]?.postedLabel, '30+ days ago');
 
   const seenVisaSearchQueries: string[] = [];
   const visaBoardPromoRes = await executeJobsCall({

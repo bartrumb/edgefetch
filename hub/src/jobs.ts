@@ -144,6 +144,7 @@ export interface StructuredJobRecord {
   payUnknown?: boolean;
   matchedOn?: 'phrase' | 'all_tokens' | 'company_filter';
   postedAt: string | null;
+  postedLabel?: string;
   source: string;
   employmentType?: string;
   snippet?: string;
@@ -275,24 +276,84 @@ export function formatNormalizedPay(pay: NormalizedPay | null | undefined): stri
  */
 export function parsePayFromText(text: string): NormalizedPay | null {
   if (!text) return null;
-  const onceDecoded = decodeEntitiesBasic(text);
+  const boundedText = text.length > 65_536 ? text.slice(0, 65_536) : text;
+  const onceDecoded = decodeEntitiesBasic(boundedText);
   const normalized = (onceDecoded.includes('&') ? decodeEntitiesBasic(onceDecoded) : onceDecoded).replace(/\u00a0/g, ' ');
   const rangeRe =
-    /(?:(USD|CAD|EUR|GBP|AUD|CHF)\s*)?([\$£€])?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{2,7}(?:\.\d+)?)\s*([kK])?\s*(?:[-–—]|to)\s*(?:(USD|CAD|EUR|GBP|AUD|CHF)\s*)?([\$£€])?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{2,7}(?:\.\d+)?)\s*([kK])?(?:\s*(USD|CAD|EUR|GBP|AUD|CHF)\b)?/gi;
+    /(?:(USD|CAD|EUR|GBP|AUD|CHF)[ \t]{0,4})?(?:([\$£€])[ \t]{0,4})?(?<!\d)(?<!\d[.,])(\d{1,3}(?:,\d{3}){1,3}(?:\.\d{1,2})?|\d{2,7}(?:\.\d{1,2})?)(?!(?:\d|[.,]\d))(?:[ \t]{0,2}([kK]))?[ \t]{0,6}(?:[-–—]|to)[ \t]{0,6}(?:(USD|CAD|EUR|GBP|AUD|CHF)[ \t]{0,4})?(?:([\$£€])[ \t]{0,4})?(?<!\d)(?<!\d[.,])(\d{1,3}(?:,\d{3}){1,3}(?:\.\d{1,2})?|\d{2,7}(?:\.\d{1,2})?)(?!(?:\d|[.,]\d))(?:[ \t]{0,2}([kK]))?(?:[ \t]{0,4}(USD|CAD|EUR|GBP|AUD|CHF)\b)?/gi;
 
   let m: RegExpExecArray | null;
   while ((m = rangeRe.exec(normalized)) !== null) {
     const explicitCur = (m[1] ?? m[5] ?? m[9])?.toUpperCase();
     const sym = m[2] ?? m[6];
-    if (!explicitCur && !sym) continue;
+    const hasCurrencyMarker = Boolean(explicitCur || sym);
 
     const windowStart = Math.max(0, m.index - 90);
     const windowEnd = Math.min(normalized.length, m.index + m[0].length + 90);
     const ctxWindow = normalized.slice(windowStart, windowEnd);
+    if (!hasCurrencyMarker) {
+      // Reject foreign currencies (`INR`, `₹`, `JPY`, `¥`, `MXN`, `PLN`, `BRL`, `KRW`, etc.) & zip codes immediately adjacent to the numbers
+      // so non-USD salaries are NEVER misclassified as USD.
+      const beforeNear = normalized.slice(Math.max(0, m.index - 18), m.index);
+      const afterNear = normalized.slice(m.index + m[0].length, Math.min(normalized.length, m.index + m[0].length + 18));
+      if (
+        /(?:[₹¥₩₪₫₱฿₴₦₲₵₡₸₺₽]|(?:R|S|HK|NT|NZ|MX|A|C)\$|\b(?:INR|JPY|CNY|RMB|KRW|BRL|MXN|PLN|SEK|NOK|DKK|CZK|HUF|RON|TRY|ILS|ZAR|SGD|HKD|TWD|NZD|PHP|THB|IDR|MYR|VND|AED|SAR|COP|CLP|ARS|PEN|UAH|PKR|BDT|NGN|EGP|ZIP(?:\s+CODE)?))[ \t:]*$/i.test(
+          beforeNear,
+        ) ||
+        /^[ \t]*(?:[₹¥₩₪₫₱฿₴₦₲₵₡₸₺₽]|\b(?:INR|JPY|CNY|RMB|KRW|BRL|MXN|PLN|SEK|NOK|DKK|CZK|HUF|RON|TRY|ILS|ZAR|SGD|HKD|TWD|NZD|PHP|THB|IDR|MYR|VND|AED|SAR|COP|CLP|ARS|PEN|UAH|PKR|BDT|NGN|EGP))\b/i.test(
+          afterNear,
+        )
+      ) {
+        continue;
+      }
+      // Enterprise ATS descriptions (e.g. Workday Allstate: "Compensation offered for this role is 85,000.00 - 145,075.00 annually")
+      // omit `$`/`USD`. Require an explicit compensation noun phrase (never bare "pay" as in "Apple Pay"), formatted salary numbers,
+      // and no non-monetary units ("3 - 5 years", "10,000 - 50,000 employees", "100,000 - 250,000 transactions/sec").
+      const labelCtx = normalized.slice(Math.max(0, m.index - 90), Math.min(normalized.length, m.index + m[0].length + 60));
+      const hasCompKeyword =
+        /\b(?:compensation|base\s+salary|salary|pay\s+(?:range|rate|band|scale|offered|for)|base\s+(?:pay|range)|hourly\s+(?:rate|wage)|annual\s+base|target\s+cash|remuneration)\b/i.test(
+          labelCtx,
+        );
+      if (!hasCompKeyword) continue;
+      const afterSlice = normalized.slice(m.index + m[0].length, m.index + m[0].length + 32);
+      if (
+        /^\s*(?:%|percent\b|years?\b|yrs?\b|months?\b|mos?\b|weeks?\b|days?\b|hours?\b|hrs?\b|employees?\b|people\b|users?\b|customers?\b|clients?\b|members?\b|seats?\b|locations?\b|offices?\b|stores?\b|countries\b|miles?\b|km\b|mb\b|gb\b|tb\b|points?\b|tokens?\b|requests?\b|transactions?\b|events?\b|ops\b|rps\b|qps\b|queries\b|rsus?\b|shares?\b|options?\b|stock\b|equity\b|zip\b|codes?\b)/i.test(
+          afterSlice,
+        )
+      ) {
+        continue;
+      }
+      const hasExplicitHourly = /\b(?:per\s+hour|\/\s*hr|hourly)\b/i.test(labelCtx);
+      const hasExplicitPeriodWord =
+        hasExplicitHourly ||
+        /\b(?:annually|annual|per\s+(?:year|annum|month)|\/\s*(?:yr|year|mo|month)|monthly|a\s+year)\b/i.test(labelCtx);
+      const bothCommaThousands =
+        /^\d{1,3}(?:,\d{3}){1,2}(?:\.\d{2})?$/.test(m[3]!) && /^\d{1,3}(?:,\d{3}){1,2}(?:\.\d{2})?$/.test(m[7]!);
+      const bothHourlyFormatted =
+        hasExplicitHourly && /^\d{2,3}(?:\.\d{2})?$/.test(m[3]!) && /^\d{2,3}(?:\.\d{2})?$/.test(m[7]!);
+      if (!bothCommaThousands && !bothHourlyFormatted) continue;
+      if (!hasExplicitPeriodWord && !bothCommaThousands) continue;
+    }
     // Skip funding/ARR/valuation numbers ("raised $150M", "$200K ARR")
     if (/\b(?:arr|mrr|funding|raised|valuation|series\s+[a-f]|revenue)\b/i.test(ctxWindow)) continue;
 
-    const currency = explicitCur || (sym === '£' ? 'GBP' : sym === '€' ? 'EUR' : 'USD');
+    const currency =
+      explicitCur ||
+      (sym === '£'
+        ? 'GBP'
+        : sym === '€'
+          ? 'EUR'
+          : !hasCurrencyMarker && /\b(?:gbp|pounds?\s+sterling)\b/i.test(ctxWindow)
+            ? 'GBP'
+            : !hasCurrencyMarker && /\beuros?\b/i.test(ctxWindow)
+              ? 'EUR'
+              : !hasCurrencyMarker && /\bcad\b/i.test(ctxWindow)
+                ? 'CAD'
+                : !hasCurrencyMarker && /\baud\b/i.test(ctxWindow)
+                  ? 'AUD'
+                  : !hasCurrencyMarker && /\bchf\b/i.test(ctxWindow)
+                    ? 'CHF'
+                    : 'USD');
     const rawMin = parseFloat(m[3]!.replace(/,/g, ''));
     const minHasK = Boolean(m[4]);
     const rawMax = parseFloat(m[7]!.replace(/,/g, ''));
@@ -306,10 +367,15 @@ export function parsePayFromText(text: string): NormalizedPay | null {
 
     let minVal = minHasK ? rawMin * 1_000 : rawMin;
     let maxVal = maxHasK ? rawMax * 1_000 : rawMax;
-    minVal = scaleShorthandAnnualAmount(minVal, period) ?? minVal;
-    maxVal = scaleShorthandAnnualAmount(maxVal, period) ?? maxVal;
+    if (hasCurrencyMarker) {
+      minVal = scaleShorthandAnnualAmount(minVal, period) ?? minVal;
+      maxVal = scaleShorthandAnnualAmount(maxVal, period) ?? maxVal;
+    }
 
-    if (period === 'year' && (minVal < 25_000 || maxVal > 2_500_000 || maxVal < minVal)) continue;
+    if (!Number.isFinite(minVal) || !Number.isFinite(maxVal) || minVal <= 0 || maxVal < minVal) continue;
+    if (period === 'year' && (minVal < 25_000 || maxVal > 2_500_000)) continue;
+    if (period === 'month' && (minVal < (hasCurrencyMarker ? 1_000 : 2_000) || maxVal > 250_000)) continue;
+    if (period === 'hour' && (minVal < (hasCurrencyMarker ? 7 : 15) || maxVal > (hasCurrencyMarker ? 2_000 : 1_000))) continue;
 
     return {
       min: Math.round(minVal),
@@ -317,7 +383,7 @@ export function parsePayFromText(text: string): NormalizedPay | null {
       currency,
       period,
       basis: inferPayBasis(ctxWindow),
-      raw: m[0].trim(),
+      raw: sanitizeJobFieldPlain(m[0], 160),
     };
   }
   return null;
@@ -1291,18 +1357,39 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const data = safeJsonParse(rawBody) as Record<string, unknown> | null;
             const info = (data?.jobPostingInfo ?? data) as Record<string, unknown> | undefined;
             if (!info || typeof info.title !== 'string') return null;
-            const title = info.title.trim();
-            const loc = typeof info.location === 'string' ? info.location.trim() : '';
-            const addLocs = Array.isArray(info.additionalLocations) ? info.additionalLocations.map(String).filter(Boolean) : [];
+            const title = sanitizeJobFieldPlain(info.title, 512);
+            if (!title) return null;
+            const loc = typeof info.location === 'string' ? sanitizeJobFieldPlain(info.location, 256) : '';
+            const addLocs = Array.isArray(info.additionalLocations)
+              ? info.additionalLocations.map((x) => sanitizeJobFieldPlain(String(x ?? ''), 256)).filter(Boolean)
+              : [];
             const allLocs = [loc, ...addLocs].filter(Boolean);
-            const remoteType = typeof info.remoteType === 'string' ? info.remoteType : '';
-            const timeType = typeof info.timeType === 'string' ? info.timeType : undefined;
+            const remoteType = typeof info.remoteType === 'string' ? sanitizeJobFieldPlain(info.remoteType, 80) : '';
+            const timeType =
+              typeof info.timeType === 'string' ? sanitizeJobFieldPlain(info.timeType, 80) || undefined : undefined;
             const rawPostedOn = typeof info.startDate === 'string' ? info.startDate : typeof info.postedOn === 'string' ? info.postedOn : undefined;
             const postedOn = normalizeWorkdayPostedAt(rawPostedOn) ?? undefined;
             const descHtml = typeof info.jobDescription === 'string' ? info.jobDescription : '';
             const bodyMd = descHtml ? htmlToMd(descHtml, origUrl).markdown.trim() : '';
             const pay = parsePayFromText(bodyMd);
-            const extUrl = typeof info.externalUrl === 'string' && info.externalUrl.startsWith('http') ? info.externalUrl : origUrl;
+            let extUrl = origUrl;
+            if (typeof info.externalUrl === 'string' && info.externalUrl.length <= 2048) {
+              const cleanedExt = stripInvisibleJobChars(info.externalUrl).trim();
+              try {
+                const parsedExt = new URL(cleanedExt);
+                if (
+                  parsedExt.protocol === 'https:' &&
+                  !parsedExt.username &&
+                  !parsedExt.password &&
+                  (!parsedExt.port || parsedExt.port === '443') &&
+                  parsedExt.hostname.toLowerCase() === host
+                ) {
+                  extUrl = parsedExt.toString();
+                }
+              } catch {
+                extUrl = origUrl;
+              }
+            }
             const wp = inferWorkdayWorkplaceType(remoteType, allLocs.join(' '), title);
 
             const jp: StructuredJobPosting = {
@@ -1360,19 +1447,34 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             knownTotal !== undefined
               ? `${knownTotal} open roles`
               : `showing ${reqOffset + 1}–${reqOffset + postings.length}`;
-          const heading = `${tenant} (${site}) — Workday Job Board (${countDesc}${searchText ? ` matching "${searchText}"` : ''})`;
+          const cleanSearchHeading = searchText ? sanitizeJobFieldPlain(searchText, 120).replace(/"/g, "'") : '';
+          const heading = `${tenant} (${site}) — Workday Job Board (${countDesc}${cleanSearchHeading ? ` matching "${cleanSearchHeading}"` : ''})`;
           const lines: string[] = [`# ${heading}`];
           const links: string[] = [];
           const records: StructuredJobRecord[] = [];
           for (const p of postings) {
-            const pTitle = String(p.title ?? '').trim();
+            const pTitle = sanitizeJobFieldPlain(String(p.title ?? ''), 512);
             if (!pTitle) continue;
-            const extPath = typeof p.externalPath === 'string' ? p.externalPath : '';
-            const fullUrl = extPath ? `https://${host}/${site}${extPath.startsWith('/') ? '' : '/'}${extPath}` : `https://${host}/${site}`;
-            const locTxt = typeof p.locationsText === 'string' ? p.locationsText.trim() : '';
+            const rawExtPath = typeof p.externalPath === 'string' ? stripInvisibleJobChars(p.externalPath).trim() : '';
+            const isSafeExtPath =
+              rawExtPath.length > 0 &&
+              rawExtPath.length <= 512 &&
+              !rawExtPath.includes('..') &&
+              !/%2e|%2f|%5c/i.test(rawExtPath) &&
+              /^\/?job\/(?:[A-Za-z0-9._~%-]+\/)*[A-Za-z0-9._~%-]+$/.test(rawExtPath);
+            const fullUrl = isSafeExtPath
+              ? `https://${host}/${site}${rawExtPath.startsWith('/') ? '' : '/'}${rawExtPath}`
+              : `https://${host}/${site}`;
+            const locTxt = sanitizeJobFieldPlain(typeof p.locationsText === 'string' ? p.locationsText : '', 256);
             const rawPostedOn = typeof p.postedOn === 'string' ? p.postedOn.trim() : null;
-            const postedOn = normalizeWorkdayPostedAt(rawPostedOn);
-            const bullets = Array.isArray(p.bulletFields) ? p.bulletFields.map(String).filter(Boolean).join(', ') : '';
+            const postedField = parseWorkdayPostedField(rawPostedOn);
+            const bullets = Array.isArray(p.bulletFields)
+              ? p.bulletFields
+                  .map((b) => sanitizeJobFieldPlain(String(b ?? ''), 80).replace(/[\[\]()]/g, ''))
+                  .filter(Boolean)
+                  .slice(0, 6)
+                  .join(', ')
+              : '';
             const wp = inferWorkdayWorkplaceType(String(p.remoteType ?? ''), locTxt, pTitle);
             links.push(fullUrl);
             records.push({
@@ -1383,11 +1485,13 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
               workplaceType: wp,
               locations: locTxt ? [locTxt] : [],
               pay: null,
-              postedAt: postedOn,
+              postedAt: postedField.postedAt,
+              ...(postedField.postedLabel ? { postedLabel: postedField.postedLabel } : {}),
               source: 'workday',
             });
-            const meta = [locTxt, postedOn, bullets].filter(Boolean).join(' · ');
-            lines.push(`- **[${pTitle}](${fullUrl})**${meta ? ` — ${meta}` : ''}`);
+            const meta = [locTxt, postedField.postedAt ?? postedField.postedLabel, bullets].filter(Boolean).join(' · ');
+            const mdSafeTitle = pTitle.replace(/([\\\[\]()])/g, '\\$1');
+            lines.push(`- **[${mdSafeTitle}](${fullUrl})**${meta ? ` — ${meta}` : ''}`);
           }
           const returned = records.length;
           const truncated =
@@ -5730,7 +5834,7 @@ export const MAX_JOBS_CONCURRENT_SCRAPES = 4;
 export const MAX_JOBS_TOTAL_SCRAPES = 40;
 export const JOBS_CACHE_TTL_MS = 5 * 60 * 1_000; // 5-minute TTL for ATS boards & job enrichment
 export const MAX_JOBS_CACHE_ENTRIES = 128;
-export const JOBS_PER_ITEM_TIMEOUT_MS = 12_000;
+export const JOBS_PER_ITEM_TIMEOUT_MS = 18_000;
 
 interface JobsScrapeResponse {
   status: number;
@@ -5900,22 +6004,51 @@ function isClosedSchemeDowngradeResult(urlStr: string, res: JobsScrapeResponse |
   return /rippling\.com/i.test(urlStr) || Boolean(parseAtsPostingIdentity(urlStr));
 }
 
-function normalizeWorkdayPostedAt(rawPostedOn: string | null | undefined, nowMs = Date.now()): string | null {
-  if (!rawPostedOn) return null;
-  const trimmed = rawPostedOn.trim();
-  if (!trimmed) return null;
-  if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed;
-  if (/^posted\s+today\b/i.test(trimmed)) return new Date(nowMs).toISOString().slice(0, 10);
-  if (/^posted\s+yesterday\b/i.test(trimmed)) return new Date(nowMs - 86_400_000).toISOString().slice(0, 10);
+function parseWorkdayPostedField(
+  rawPostedOn: string | null | undefined,
+  nowMs = Date.now(),
+): { postedAt: string | null; postedLabel?: string } {
+  if (!rawPostedOn) return { postedAt: null };
+  const stripped = stripInvisibleJobChars(rawPostedOn.length > 256 ? rawPostedOn.slice(0, 256) : rawPostedOn);
+  const trimmed = stripped.trim();
+  if (!trimmed) return { postedAt: null };
+  const isoMatch = /^(\d{4}-\d{2}-\d{2})(?:$|T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?$)/.exec(trimmed);
+  if (isoMatch) {
+    const dateOnly = isoMatch[1]!;
+    const parsedDay = new Date(`${dateOnly}T00:00:00Z`);
+    const fullTs = Date.parse(trimmed);
+    if (
+      Number.isFinite(parsedDay.getTime()) &&
+      parsedDay.toISOString().slice(0, 10) === dateOnly &&
+      Number.isFinite(fullTs)
+    ) {
+      return { postedAt: trimmed };
+    }
+    return { postedAt: null };
+  }
+  if (/^posted\s+today\b/i.test(trimmed)) {
+    return { postedAt: new Date(nowMs).toISOString().slice(0, 10) };
+  }
+  if (/^posted\s+yesterday\b/i.test(trimmed)) {
+    return { postedAt: new Date(nowMs - 86_400_000).toISOString().slice(0, 10) };
+  }
   const daysMatch = /^posted\s+(\d+)(\+)?\s+days?\s+ago\b/i.exec(trimmed);
   if (daysMatch) {
     const baseDays = parseInt(daysMatch[1]!, 10);
     if (Number.isFinite(baseDays) && baseDays >= 0) {
-      const effectiveDays = daysMatch[2] ? baseDays + 5 : baseDays;
-      return new Date(nowMs - effectiveDays * 86_400_000).toISOString().slice(0, 10);
+      // Open-ended buckets ("Posted 30+ Days Ago") or multi-year counts (> 365d): NEVER invent a shifting `today - 35d` ISO date!
+      if (daysMatch[2] === '+' || baseDays > 365) {
+        return { postedAt: null, postedLabel: `${Math.min(baseDays, 3650)}+ days ago` };
+      }
+      return { postedAt: new Date(nowMs - baseDays * 86_400_000).toISOString().slice(0, 10) };
     }
   }
-  return trimmed;
+  const cleanLabel = sanitizeJobFieldPlain(trimmed.replace(/^posted\s+/i, ''), 64).toLowerCase();
+  return { postedAt: null, ...(cleanLabel ? { postedLabel: cleanLabel } : {}) };
+}
+
+function normalizeWorkdayPostedAt(rawPostedOn: string | null | undefined, nowMs = Date.now()): string | null {
+  return parseWorkdayPostedField(rawPostedOn, nowMs).postedAt;
 }
 
 function classifyFullBoardKey(urlStr: string): { key: string; platform: string; slug: string; isBoard: boolean; boardUrl: string } | null {
@@ -6181,12 +6314,45 @@ export async function executeJobsCall(params: {
   const rawExecuteScrape = params.executeScrape;
   const cachePartition = resolveJobsCachePartition(params.env, rawExecuteScrape);
 
-  // Enforce hard `<= 4` concurrent scrapes and `<= 40` total scrapes per `executeJobsCall` across discovery, verify & boards,
-  // backed by a 5-minute (`300_000 ms`) 128-entry LRU cache + `inFlight` singleflight coalescer + 12s per-item timeout guard.
+  // Enforce hard `<= 4` concurrent scrapes across distinct hosts, `<= 1` in-flight scrape per effective origin host
+  // (preventing `AgentHubDO` `MAX_HOST_QUEUE_DEPTH` 503s under parallel `jobs` calls and avoiding premature per-item timer
+  // burn while queued behind same-host politeness), and `<= 40` total scrapes per `executeJobsCall`.
   let activeScrapes = 0;
   let totalScrapesUsed = 0;
   let budgetExhausted = false;
   const scrapeWaitQueue: Array<() => void> = [];
+  const activeHostScrapes = new Set<string>();
+  const hostWaitQueues = new Map<string, Array<() => void>>();
+  const resolveEffectiveScrapeHost = (args: Record<string, unknown>): string => {
+    const rawUrl = typeof args.url === 'string' ? args.url.trim() : '';
+    if (!rawUrl) return '';
+    try {
+      const spec = resolveAtsPreFetchSpec(rawUrl);
+      return new URL(spec?.fetchUrl ?? rawUrl).hostname.toLowerCase();
+    } catch {
+      return '';
+    }
+  };
+  const wakeNextHostWaiter = (host: string): void => {
+    const hq = hostWaitQueues.get(host);
+    if (hq && hq.length > 0) {
+      hq.shift()?.();
+      if (hq.length === 0) hostWaitQueues.delete(host);
+    } else if (hq) {
+      hostWaitQueues.delete(host);
+    }
+  };
+  const wakeAllWaiters = (): void => {
+    while (scrapeWaitQueue.length > 0) {
+      scrapeWaitQueue.shift()?.();
+    }
+    for (const q of hostWaitQueues.values()) {
+      while (q.length > 0) {
+        q.shift()?.();
+      }
+    }
+    hostWaitQueues.clear();
+  };
   const executeScrape = async (
     args: Record<string, unknown>,
   ): Promise<{ status: number; body: Record<string, unknown> }> => {
@@ -6201,51 +6367,111 @@ export async function executeJobsCall(params: {
       }
     }
 
-    while (activeScrapes >= MAX_JOBS_CONCURRENT_SCRAPES) {
+    const effectiveHost = resolveEffectiveScrapeHost(args);
+    if (effectiveHost) {
+      while (activeHostScrapes.has(effectiveHost)) {
+        if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+          budgetExhausted = true;
+          wakeAllWaiters();
+          return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
+        }
+        await new Promise<void>((resolve) => {
+          let q = hostWaitQueues.get(effectiveHost);
+          if (!q) {
+            q = [];
+            hostWaitQueues.set(effectiveHost, q);
+          }
+          q.push(resolve);
+        });
+        if (cacheKey) {
+          const cachedAfterHostWait = readJobsScrapeCache(cachePartition, cacheKey);
+          if (cachedAfterHostWait) {
+            if (!activeHostScrapes.has(effectiveHost)) {
+              wakeNextHostWaiter(effectiveHost);
+            }
+            return cachedAfterHostWait;
+          }
+          const flightAfterHostWait = cachePartition.inFlight.get(cacheKey);
+          if (flightAfterHostWait) {
+            if (!activeHostScrapes.has(effectiveHost)) {
+              wakeNextHostWaiter(effectiveHost);
+            }
+            const sharedRes = await withJobsItemTimeout(flightAfterHostWait);
+            return cloneJobsScrapeResponse(sharedRes);
+          }
+        }
+      }
+      activeHostScrapes.add(effectiveHost);
+    }
+
+    let acquiredGlobal = false;
+    let flightPromise: Promise<JobsScrapeResponse> | null = null;
+    try {
+      while (activeScrapes >= MAX_JOBS_CONCURRENT_SCRAPES) {
+        if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+          budgetExhausted = true;
+          wakeAllWaiters();
+          return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
+        }
+        await new Promise<void>((resolve) => scrapeWaitQueue.push(resolve));
+        if (cacheKey) {
+          const cachedAfterWait = readJobsScrapeCache(cachePartition, cacheKey);
+          if (cachedAfterWait) {
+            if (activeScrapes < MAX_JOBS_CONCURRENT_SCRAPES) {
+              scrapeWaitQueue.shift()?.();
+            }
+            return cachedAfterWait;
+          }
+          const flightAfterWait = cachePartition.inFlight.get(cacheKey);
+          if (flightAfterWait) {
+            if (activeScrapes < MAX_JOBS_CONCURRENT_SCRAPES) {
+              scrapeWaitQueue.shift()?.();
+            }
+            const sharedRes = await withJobsItemTimeout(flightAfterWait);
+            return cloneJobsScrapeResponse(sharedRes);
+          }
+        }
+      }
       if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
         budgetExhausted = true;
+        wakeAllWaiters();
         return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
       }
-      await new Promise<void>((resolve) => scrapeWaitQueue.push(resolve));
+      activeScrapes++;
+      acquiredGlobal = true;
+      totalScrapesUsed++;
+      const runSingle = (): Promise<JobsScrapeResponse> =>
+        withJobsItemTimeout(
+          Promise.resolve().then(() => (activeTracer ? activeTracer.run(() => rawExecuteScrape(args)) : rawExecuteScrape(args))),
+        );
+      flightPromise = runSingle();
       if (cacheKey) {
-        const cachedAfterWait = readJobsScrapeCache(cachePartition, cacheKey);
-        if (cachedAfterWait) return cachedAfterWait;
+        cachePartition.inFlight.set(cacheKey, flightPromise);
       }
-    }
-    if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
-      budgetExhausted = true;
-      while (scrapeWaitQueue.length > 0) {
-        scrapeWaitQueue.shift()?.();
-      }
-      return { status: 429, body: { ok: false, error: 'jobs_scrape_budget_exceeded' } };
-    }
-    activeScrapes++;
-    totalScrapesUsed++;
-    const runSingle = (): Promise<JobsScrapeResponse> =>
-      withJobsItemTimeout(
-        Promise.resolve().then(() => (activeTracer ? activeTracer.run(() => rawExecuteScrape(args)) : rawExecuteScrape(args))),
-      );
-    const flightPromise = runSingle();
-    if (cacheKey) {
-      cachePartition.inFlight.set(cacheKey, flightPromise);
-    }
-    try {
       const out = await flightPromise;
       if (cacheKey && out.status === 200 && out.body?.ok === true) {
         writeJobsScrapeCache(cachePartition, cacheKey, out);
       }
       return cacheKey ? cloneJobsScrapeResponse(out) : out;
     } finally {
-      if (cacheKey && cachePartition.inFlight.get(cacheKey) === flightPromise) {
+      if (cacheKey && flightPromise && cachePartition.inFlight.get(cacheKey) === flightPromise) {
         cachePartition.inFlight.delete(cacheKey);
       }
-      activeScrapes--;
-      if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
-        while (scrapeWaitQueue.length > 0) {
+      if (acquiredGlobal) {
+        activeScrapes--;
+        if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+          wakeAllWaiters();
+        } else {
           scrapeWaitQueue.shift()?.();
         }
-      } else {
-        scrapeWaitQueue.shift()?.();
+      }
+      if (effectiveHost) {
+        activeHostScrapes.delete(effectiveHost);
+        if (totalScrapesUsed >= MAX_JOBS_TOTAL_SCRAPES) {
+          wakeAllWaiters();
+        } else {
+          wakeNextHostWaiter(effectiveHost);
+        }
       }
     }
   };
@@ -7008,6 +7234,58 @@ export async function executeJobsCall(params: {
     ),
   ];
   const fetchedCompleteBoards = new Set<string>();
+  const fetchedQueriedWorkdayBoards = new Map<string, { matchedCount: number; reqIds: Set<string> }>();
+  const extractWorkdayReqId = (uStr: string): string => {
+    if (!uStr) return '';
+    const bounded = uStr.length > 2048 ? uStr.slice(0, 2048) : uStr;
+    const qIdx = bounded.search(/[?#\r\n\u2028\u2029]/);
+    const pathPart = (qIdx >= 0 ? bounded.slice(0, qIdx) : bounded).replace(/\/+$/, '');
+    const lastSlash = pathPart.lastIndexOf('/');
+    const tail = lastSlash >= 0 ? pathPart.slice(lastSlash + 1) : pathPart;
+    const lastUnder = tail.lastIndexOf('_');
+    if (lastUnder < 0 || lastUnder + 1 >= tail.length) return '';
+    const req = tail.slice(lastUnder + 1);
+    return req.length <= 96 && /^[A-Za-z0-9-]+$/.test(req) ? req.toLowerCase() : '';
+  };
+  const preWaveNowMs = Date.now();
+  const preWaveCutoffMs = postedWithinDays ? preWaveNowMs - postedWithinDays * 86_400_000 : null;
+  const isJobLabelKnownStale = (label: string | undefined, maxDays: number): boolean => {
+    if (!label) return false;
+    const lm = /^(\d+)(\+)?\s*(days?|weeks?|months?|years?)\b/i.exec(label);
+    if (!lm) return false;
+    const mult = lm[3]!.toLowerCase().startsWith('w')
+      ? 7
+      : lm[3]!.toLowerCase().startsWith('m')
+        ? 30
+        : lm[3]!.toLowerCase().startsWith('y')
+          ? 365
+          : 1;
+    const minAgeDays = parseInt(lm[1]!, 10) * mult;
+    if (!Number.isFinite(minAgeDays)) return false;
+    return lm[2] === '+' ? maxDays <= minAgeDays : minAgeDays > maxDays;
+  };
+  const matchesPreEnrichJobFilters = (r: StructuredJobRecord): boolean => {
+    const cleanKey = r.url.replace(/\/+$/, '').toLowerCase();
+    const isExcl = excludeList.some((ex) => {
+      if (ex.url && ex.url === cleanKey) return true;
+      const compMatch = ex.company && r.company.toLowerCase().includes(ex.company);
+      const titleMatch = ex.title && r.title.toLowerCase().includes(ex.title);
+      return Boolean((ex.company && ex.title && compMatch && titleMatch) || (ex.company && !ex.title && compMatch));
+    });
+    if (isExcl) return false;
+    if (query && matchesJobQueryRelevance(r.title, r.snippet, query) === null) return false;
+    if (wantRemote === true && r.workplaceType !== 'remote' && !r.locations.some((l) => /remote/i.test(l))) return false;
+    if (geoLocationsFilter.length > 0 && !matchesGeoLocationsFilter(r.locations, geoLocationsFilter)) return false;
+    if (preWaveCutoffMs !== null && postedWithinDays !== undefined) {
+      if (r.postedAt) {
+        const ts = Date.parse(r.postedAt);
+        if (!Number.isFinite(ts) || ts < preWaveCutoffMs) return false;
+      } else if (isJobLabelKnownStale(r.postedLabel, postedWithinDays)) {
+        return false;
+      }
+    }
+    return true;
+  };
   const smartRecruitersPostingsToEnrich: StructuredJobRecord[] = [];
   let anyBoardTruncated = false;
   let primaryNextCursor: string | undefined;
@@ -7022,6 +7300,15 @@ export async function executeJobsCall(params: {
         // Skip redundant single-posting download if we ALREADY collected the complete board for this `(platform, slug)`!
         if (info && !info.isBoard && fetchedCompleteBoards.has(info.key)) {
           return false;
+        }
+        if (info?.platform === 'workday' && !info.isBoard) {
+          const wdQueried = fetchedQueriedWorkdayBoards.get(info.key);
+          if (wdQueried) {
+            const reqId = extractWorkdayReqId(u);
+            if ((reqId && wdQueried.reqIds.has(reqId)) || wdQueried.matchedCount >= limit) {
+              return false;
+            }
+          }
         }
         return true;
       });
@@ -7132,7 +7419,11 @@ export async function executeJobsCall(params: {
         if (boardTruncated && boardNextCursor && /myworkday(?:jobs|site)\.com/i.test(origU)) {
           let nextOffset = parseInt(boardNextCursor, 10);
           const maxOffsetThisCall = boardStartOffset + 80;
+          const enoughBoardMatches = minBase !== undefined ? Math.max(limit * 3, 18) : Math.max(limit * 2, 12);
           while (Number.isFinite(nextOffset) && nextOffset > boardStartOffset && nextOffset <= maxOffsetThisCall) {
+            if (boardJobs.filter(matchesPreEnrichJobFilters).length >= enoughBoardMatches) {
+              break;
+            }
             let pageUrlStr = '';
             try {
               const wdPageU = new URL(origU);
@@ -7213,26 +7504,40 @@ export async function executeJobsCall(params: {
           }
           collected.push(br);
         }
-        // Workday list cards (`POST /wday/cxs/{tenant}/{site}/jobs`) carry `pay: null` while pay-transparency ranges live in
-        // `workday-job` (`GET /wday/cxs/{tenant}/{site}/job/{extPath}`): queue top matching postings for detail enrichment!
-        if (smartRecruitersPostingsToEnrich.length < 12) {
-          const wdCandidates = boardJobs.filter(
-            (r) =>
-              r.source === 'workday' &&
-              r.pay === null &&
-              /\/job\//i.test(r.url) &&
-              (!query || matchesJobQueryRelevance(r.title, r.snippet, query) !== null),
-          );
+        if (fullInfo?.platform === 'workday' && boardStartOffset === 0) {
+          const prevWd = fetchedQueriedWorkdayBoards.get(fullInfo.key);
+          const reqIds = prevWd?.reqIds ?? new Set<string>();
+          for (const br of boardJobs) {
+            const rid = extractWorkdayReqId(br.url);
+            if (rid) reqIds.add(rid);
+          }
+          const matchedHere = boardJobs.filter(matchesPreEnrichJobFilters).length;
+          fetchedQueriedWorkdayBoards.set(fullInfo.key, {
+            matchedCount: (prevWd?.matchedCount ?? 0) + matchedHere,
+            reqIds,
+          });
+        }
+        // Workday list cards (`POST /wday/cxs/{tenant}/{site}/jobs`) carry `pay: null` (and `"30+ days ago"` bucket labels) while
+        // pay-transparency ranges & real `startDate` live in `workday-job` (`GET /wday/cxs/{tenant}/{site}/job/{extPath}`):
+        // queue only surviving, deduplicated, rank-ordered top candidates for detail enrichment!
+        if (smartRecruitersPostingsToEnrich.length < 10) {
+          const seenWdDedup = new Set<string>();
+          const wdCandidates: Array<{ rec: StructuredJobRecord; rank: number }> = [];
+          for (const r of boardJobs) {
+            if (r.source !== 'workday' || r.pay !== null || !/\/job\//i.test(r.url)) continue;
+            if (!matchesPreEnrichJobFilters(r)) continue;
+            const dk = canonicalJobKey(r.company, r.title);
+            if (seenWdDedup.has(dk)) continue;
+            seenWdDedup.add(dk);
+            const rel = query ? matchesJobQueryRelevance(r.title, r.snippet, query) : 'company_filter';
+            const rank = rel === 'phrase' ? 0 : rel === 'all_tokens' ? 1 : 2;
+            wdCandidates.push({ rec: r, rank });
+          }
           if (wdCandidates.length > 0) {
-            const prioritizedWd =
-              geoLocationsFilter.length > 0
-                ? [
-                    ...wdCandidates.filter((r) => matchesGeoLocationsFilter(r.locations, geoLocationsFilter)),
-                    ...wdCandidates.filter((r) => !matchesGeoLocationsFilter(r.locations, geoLocationsFilter)),
-                  ]
-                : wdCandidates;
-            const wdCap = Math.min(limit, 8, 12 - smartRecruitersPostingsToEnrich.length);
-            for (const wdRec of prioritizedWd.slice(0, wdCap)) {
+            wdCandidates.sort((a, b) => a.rank - b.rank);
+            const maxWdPerCall = minBase !== undefined ? 6 : 5;
+            const wdCap = Math.min(limit, maxWdPerCall, 10 - smartRecruitersPostingsToEnrich.length);
+            for (const { rec: wdRec } of wdCandidates.slice(0, wdCap)) {
               smartRecruitersPostingsToEnrich.push(wdRec);
             }
           }
@@ -7432,13 +7737,14 @@ export async function executeJobsCall(params: {
       for (let j = 0; j < batch.length; j++) {
         const srRec = batch[j]!;
         const det = outs[j];
-        if (!det || det.status !== 200 || det.body?.ok !== true) continue;
-        const detState = typeof det.body.contentState === 'string' ? det.body.contentState : undefined;
-        if (detState === 'closed_posting' || detState === 'soft_404') {
+        if (!det) continue;
+        const detState = typeof det.body?.contentState === 'string' ? det.body.contentState : undefined;
+        if (detState === 'closed_posting' || (det.status === 200 && detState === 'soft_404')) {
           const dropIdx = collected.findIndex((c) => c.url.toLowerCase() === srRec.url.toLowerCase());
           if (dropIdx >= 0) collected.splice(dropIdx, 1);
           continue;
         }
+        if (det.status !== 200 || det.body?.ok !== true) continue;
         const detHtml = typeof det.body.rawHtml === 'string' ? det.body.rawHtml : typeof det.body.html === 'string' ? det.body.html : '';
         const detMd = typeof det.body.markdown === 'string' ? det.body.markdown : '';
         const jp =
@@ -7452,7 +7758,10 @@ export async function executeJobsCall(params: {
         if (jp?.workplaceType && jp.workplaceType !== 'unknown') target.workplaceType = jp.workplaceType;
         if (jp?.pay) target.pay = jp.pay;
         else if (!target.pay && detMd) target.pay = parsePayFromText(detMd);
-        if (jp?.datePosted) target.postedAt = jp.datePosted;
+        if (jp?.datePosted) {
+          target.postedAt = jp.datePosted;
+          delete target.postedLabel;
+        }
         if (jp?.employmentType) target.employmentType = jp.employmentType;
         if (jp?.applyUrl) target.applyUrl = jp.applyUrl;
         if (!target.snippet && detMd) target.snippet = detMd.slice(0, 240);
@@ -7537,23 +7846,38 @@ export async function executeJobsCall(params: {
 
     let payUnknown = false;
     if (minBase !== undefined) {
-      if (!rawJob.pay) {
+      if (!rawJob.pay || rawJob.pay.currency !== 'USD') {
         if (strictPay) continue;
         payUnknown = true;
       } else {
         // P11: Never treat `total` / `ote` target cash as meeting `minBase` unless basis === 'base'
         if (rawJob.pay.basis !== 'base') continue;
-        const comparedPay =
+        const rawCompared =
           minBaseMode === 'ceiling' || minBaseMode === 'overlap'
             ? (rawJob.pay.max ?? rawJob.pay.min ?? 0)
             : (rawJob.pay.min ?? rawJob.pay.max ?? 0);
-        if (comparedPay < minBase) continue;
+        const annualMultiplier =
+          rawJob.pay.period === 'hour'
+            ? 2080
+            : rawJob.pay.period === 'day'
+              ? 260
+              : rawJob.pay.period === 'week'
+                ? 52
+                : rawJob.pay.period === 'month'
+                  ? 12
+                  : 1;
+        const comparedPay = rawCompared * annualMultiplier;
+        if (!Number.isFinite(comparedPay) || comparedPay < minBase) continue;
       }
     }
 
-    if (maxAgeCutoffMs !== null && rawJob.postedAt) {
-      const parsedTs = Date.parse(rawJob.postedAt);
-      if (Number.isFinite(parsedTs) && parsedTs < maxAgeCutoffMs) continue;
+    if (maxAgeCutoffMs !== null) {
+      if (rawJob.postedAt) {
+        const parsedTs = Date.parse(rawJob.postedAt);
+        if (!Number.isFinite(parsedTs) || parsedTs < maxAgeCutoffMs) continue;
+      } else if (rawJob.postedLabel && postedWithinDays !== undefined) {
+        if (isJobLabelKnownStale(rawJob.postedLabel, postedWithinDays)) continue;
+      }
     }
 
     seenUrls.add(cleanUrlKey);

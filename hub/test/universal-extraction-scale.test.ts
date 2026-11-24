@@ -2209,4 +2209,279 @@ test('R1 & bun.sh Regression Suite: Vercel Greenhouse board promotion, Hippocrat
   assert.equal(lookupCompanionMdUrl('https://docs.example.com/alt'), undefined, 'LOW-R4-2: non-443 ports in parseLlmsTxt must not be cached');
   assert.equal(lookupCompanionMdUrl('https://docs.example.com/direct'), undefined, 'LOW-R4-2: userinfo URLs in recordCompanionMdUrl must not be cached');
   assert.equal(lookupCompanionMdUrl('https://docs.example.com:8443/port'), undefined, 'LOW-R4-2: non-443 ports in recordCompanionMdUrl must not be cached');
+
+  // 13. [WD1, WD2, T1 & T2] Symbol-less enterprise Workday pay ("85,000.00 - 145,075.00 annually"), honest `postedAt: null` +
+  // `postedLabel: "30+ days ago"` overwritten by real `startDate`, Workday CXS `403 S22` / `422` fast-fail, and per-host serialization!
+  const { parsePayFromText } = await import('../src/jobs');
+  const allstatePay = parsePayFromText(
+    'Compensation offered for this role is 85,000.00 - 145,075.00 annually and is based on experience and qualifications.',
+  );
+  assert.deepEqual(allstatePay, {
+    min: 85_000,
+    max: 145_075,
+    currency: 'USD',
+    period: 'year',
+    basis: 'base',
+    raw: '85,000.00 - 145,075.00',
+  });
+  // Must NOT false-positive on years of experience, headcount, or unscaled pay-grade numbers!
+  assert.equal(parsePayFromText('Required experience for this salary grade: 3 - 5 years in Python.'), null);
+  assert.equal(parsePayFromText('Our company compensation team supports 10,000 - 50,000 employees globally.'), null);
+  assert.equal(parsePayFromText('Salary band 30 - 45 annually.'), null);
+
+  // Workday board `"Posted 30+ Days Ago"` -> `postedAt: null, postedLabel: "30+ days ago"`, then detail enrichment populates `startDate: "2026-10-14"` + `pay`!
+  const allstateBoardSpec = resolveAtsPreFetchSpec('https://allstate.wd5.myworkdayjobs.com/allstate_careers')!;
+  const allstateBoardOut = allstateBoardSpec.format(
+    JSON.stringify({
+      total: 40,
+      jobPostings: [
+        {
+          title: 'AI Cloud Platform Engineer',
+          externalPath: '/job/USA---TX-Remote/AI-Cloud-Platform-Engineer_R35902',
+          locationsText: 'USA - TX (Remote)',
+          postedOn: 'Posted 30+ Days Ago',
+          remoteType: 'Fully Remote',
+          bulletFields: ['R35902'],
+        },
+        {
+          title: 'Legacy Mainframe Engineer',
+          externalPath: '/job/USA---IL/Legacy-Mainframe-Engineer_R10001',
+          locationsText: 'USA - Northbrook, IL',
+          postedOn: 'Posted 30+ Days Ago',
+          bulletFields: ['R10001'],
+        },
+      ],
+    }),
+    'https://allstate.wd5.myworkdayjobs.com/allstate_careers',
+    (h) => ({ markdown: h, links: [] }),
+  )!;
+  assert.equal(allstateBoardOut.jobs?.[0]?.postedAt, null);
+  assert.equal(allstateBoardOut.jobs?.[0]?.postedLabel, '30+ days ago');
+
+  let maxSameHostActive = 0;
+  let curSameHostActive = 0;
+  const allstateJobsRes = await executeJobsCall({
+    payload: { company: 'allstate', query: 'Engineer', remote: true, limit: 5 },
+    env: {},
+    executeSearch: async () => ({
+      status: 200,
+      body: { results: [{ url: 'https://allstate.wd5.myworkdayjobs.com/allstate_careers' }] },
+    }),
+    executeScrape: async (args) => {
+      curSameHostActive++;
+      if (curSameHostActive > maxSameHostActive) maxSameHostActive = curSameHostActive;
+      await new Promise((r) => setTimeout(r, 5));
+      curSameHostActive--;
+      const u = String(args.url ?? '');
+      if (u.includes('AI-Cloud-Platform-Engineer_R35902')) {
+        const jSpec = resolveAtsPreFetchSpec(u)!;
+        const fmt = jSpec.format(
+          JSON.stringify({
+            jobPostingInfo: {
+              title: 'AI Cloud Platform Engineer',
+              location: 'USA - TX (Remote)',
+              remoteType: 'Fully Remote',
+              postedOn: 'Posted 30+ Days Ago',
+              startDate: '2026-10-14',
+              jobDescription: '<p><b>Compensation</b></p>Compensation offered for this role is 85,000.00 - 145,075.00 annually.',
+              externalUrl: u,
+            },
+          }),
+          u,
+          (h) => ({ markdown: h.replace(/<[^>]+>/g, ' '), links: [] }),
+        )!;
+        return { status: 200, body: { ok: true, extractorId: 'workday-job', jobPosting: fmt.jobPosting, markdown: fmt.markdown } };
+      }
+      if (u.startsWith('https://allstate.wd5.myworkdayjobs.com/allstate_careers')) {
+        return { status: 200, body: { ok: true, extractorId: 'workday-board', jobs: allstateBoardOut.jobs, total: 2, returned: 2, truncated: false } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(maxSameHostActive, 1, 'T2/J2: same-host scrapes inside executeJobsCall must serialize to prevent queue/timer contention');
+  const enrichedAllstate = (allstateJobsRes.body.jobs as Array<Record<string, unknown>>)[0]!;
+  assert.equal(enrichedAllstate.postedAt, '2026-10-14', 'WD2: enriched Workday job must use real startDate');
+  assert.equal(enrichedAllstate.postedLabel, undefined, 'WD2: enriched Workday job must clear bucket postedLabel');
+  assert.deepEqual(enrichedAllstate.pay, {
+    min: 85_000,
+    max: 145_075,
+    currency: 'USD',
+    period: 'year',
+    basis: 'base',
+    raw: '85,000.00 - 145,075.00',
+  });
+
+  // Workday CXS `403 S22` closed posting & `422` wrong cluster fast-fail without falling through to HTML/Chromium!
+  let wdFallbackScrapes = 0;
+  const closedS22Scrape = await executeScrapeCall({
+    payload: { url: 'https://allstate.wd5.myworkdayjobs.com/en-US/allstate_careers/job/Senior-AI-Cloud-Platform-Engineer_R33006' },
+    env: {},
+    selfHost: 'hub.example.com',
+    executeHubFetch: async (_target, rawBody) => {
+      const parsed = JSON.parse(rawBody) as { requests: Array<{ id: string }> };
+      if (parsed.requests[0]?.id !== 'ats-workday-job') wdFallbackScrapes++;
+      return {
+        status: 200,
+        via: 'agent:site-arm64',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: parsed.requests[0]!.id,
+              status: 403,
+              outcome: 'error',
+              contentType: 'application/json',
+              body: '{"errorCode":"S22","errorCaseId":"6E6E2AMWUORHK6","httpStatus":403,"message":"permission denied"}',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(wdFallbackScrapes, 0, 'T1: Workday 403 S22 closed job must NOT fall through to HTML/Chromium');
+  assert.equal(closedS22Scrape.status, 404);
+  assert.equal(closedS22Scrape.body.contentState, 'closed_posting');
+
+  // 14. [Security Audit Round 2 — CRIT-1, HIGH-1..3, MED-1, LOW-1..2]
+  // CRIT-1: Lost-wakeup deadlock test across 4 busy global slots + duplicate cached host waiter + 3rd queued waiter on same host!
+  resetJobsCacheForTests();
+  const sharedEnv = { JOBS_SHARED_CACHE: true };
+  const crit1Result = await Promise.race([
+    (async () => {
+      const slowHosts = ['h1.com', 'h2.com', 'h3.com', 'h4.com'];
+      const pA = executeJobsCall({
+        payload: { domains: slowHosts, query: 'Engineer', includeBuiltIn: false },
+        env: sharedEnv,
+        executeSearch: async () => ({ status: 200, body: { results: [] } }),
+        executeScrape: async (args) => {
+          await new Promise((r) => setTimeout(r, 25));
+          return { status: 200, body: { ok: true, markdown: '# Careers', url: String(args.url) } };
+        },
+      });
+      const pB = executeJobsCall({
+        payload: {
+          mode: 'verify',
+          urls: [
+            'https://acme.wd5.myworkdayjobs.com/External/job/R1',
+            'https://acme.wd5.myworkdayjobs.com/External/job/R2',
+            'https://acme.wd5.myworkdayjobs.com/ACMEExternalCareerSite/job/R3',
+          ],
+        },
+        env: sharedEnv,
+        executeSearch: async () => ({ status: 200, body: { results: [] } }),
+        executeScrape: async (args) => {
+          await new Promise((r) => setTimeout(r, 10));
+          return { status: 200, body: { ok: true, extractorId: 'workday-board', jobs: [], links: [], total: 0, returned: 0, truncated: false, url: String(args.url) } };
+        },
+      });
+      await Promise.all([pA, pB]);
+      return 'resolved';
+    })(),
+    new Promise<string>((resolve) => setTimeout(() => resolve('deadlocked'), 2_000)),
+  ]);
+  assert.equal(crit1Result, 'resolved', 'CRIT-1: hostWaitQueues & scrapeWaitQueue must never lose wakeups on cache/inFlight hits');
+
+  // HIGH-1 & HIGH-3: Linear O(N) performance + foreign currency / Infinity / inverted range / Apple Pay / zip guards!
+  const tPay0 = performance.now();
+  assert.equal(parsePayFromText('100000' + ' '.repeat(60_000) + 'x'), null);
+  assert.equal(parsePayFromText(' '.repeat(60_000) + '12.'), null);
+  assert.equal(parsePayFromText('1' + ',000'.repeat(30_000) + 'x'), null);
+  assert.equal(parsePayFromText('$100000.' + '0'.repeat(50_000) + ' - $150000'), null);
+  assert.ok(performance.now() - tPay0 < 80, 'HIGH-1: parsePayFromText must run in linear time (<80ms across 4 adversarial inputs)');
+  assert.equal(parsePayFromText('Annual base salary offered is INR 1,200,000 - 2,000,000 annually'), null, 'HIGH-3: INR must not be misclassified as USD');
+  assert.equal(parsePayFromText('$' + '999' + ',999'.repeat(110) + ' - $' + '999' + ',999'.repeat(110) + ' per hour'), null, 'HIGH-3: overflow numbers must be rejected');
+  assert.equal(parsePayFromText('$100 - $20 per hour'), null, 'HIGH-3: inverted ranges must be rejected');
+  assert.equal(parsePayFromText('Build Apple Pay services handling 100,000 - 250,000 transactions/sec'), null, 'HIGH-3: Apple Pay + transactions must be rejected');
+  assert.deepEqual(parsePayFromText('Annual salary for Zone 1 (zip 94101 - 94199): $60,000 - $70,000'), {
+    min: 60_000,
+    max: 70_000,
+    currency: 'USD',
+    period: 'year',
+    basis: 'base',
+    raw: '$60,000 - $70,000',
+  });
+
+  // HIGH-2: Sanitization of Unicode Tags, unanchored ISO dates, externalUrl, bulletFields & >365-day labels!
+  const advWdBoard = allstateBoardSpec.format(
+    JSON.stringify({
+      total: 2,
+      jobPostings: [
+        {
+          title: 'Staff [Engineer](https://evil.example)\u{E0069}',
+          externalPath: '/job/R1\u{E0069}) extra',
+          locationsText: 'US - TX <script>alert(1)</script>',
+          postedOn: '2020-01-01\u{E0041} (archived)',
+          bulletFields: ['R1 · [Apply](https://evil.example)'],
+        },
+        {
+          title: 'Old Engineer',
+          externalPath: '/job/R2/Old_R2',
+          locationsText: 'US - TX',
+          postedOn: 'Posted 400 Days Ago',
+        },
+      ],
+    }),
+    'https://allstate.wd5.myworkdayjobs.com/allstate_careers',
+    (h) => ({ markdown: h, links: [] }),
+  )!;
+  assert.equal(advWdBoard.jobs?.[0]?.postedAt, null, 'HIGH-2: unanchored ISO date with trailing text must be rejected');
+  assert.ok(!advWdBoard.jobs?.[0]?.url.includes(' '), 'HIGH-2: unsafe externalPath must fall back to clean board URL');
+  assert.ok(!advWdBoard.markdown.includes('](https://evil.example)'), 'HIGH-2: Markdown link breakout in title/bullets must be neutralized');
+  assert.equal(advWdBoard.jobs?.[1]?.postedAt, null);
+  assert.equal(advWdBoard.jobs?.[1]?.postedLabel, '400+ days ago');
+
+  // MED-1: WAF/Cloudflare 403 challenge on Workday must NOT be misclassified as 404 closed_posting!
+  const wafWdScrape = await executeScrapeCall({
+    payload: { url: 'https://allstate.wd5.myworkdayjobs.com/en-US/allstate_careers/job/Senior-AI-Cloud-Platform-Engineer_R33006' },
+    env: {},
+    selfHost: 'hub.example.com',
+    executeHubFetch: async (_target, rawBody) => {
+      const parsed = JSON.parse(rawBody) as { requests: Array<{ id: string }> };
+      return {
+        status: 200,
+        via: 'agent:site-arm64',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: parsed.requests[0]!.id,
+              status: 403,
+              outcome: 'challenge',
+              contentType: 'application/json',
+              body: '{"errorCode":"S1020","message":"Cloudflare access denied"}',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.notEqual(wafWdScrape.body.contentState, 'closed_posting', 'MED-1: WAF challenge 403 must never be marked closed_posting');
+
+  // LOW-2: NBSP animated counter collapse in finalizeScrapedMarkdown
+  const { finalizeScrapedMarkdown } = await import('../src/scrape');
+  assert.equal(finalizeScrapedMarkdown('2026\u00a02\u00a00\u00a02\u00a06', { isPdf: false, includeImages: true }).markdown, '2026');
+
+  // MED-R2-1, LOW-R2-1 & LOW-R2-2 regressions:
+  assert.equal(parsePayFromText('The annual base salary range for this role is $160,000 - $220,000.')?.min, 160_000);
+  assert.equal(parsePayFromText('Base salary: $160,000 - $220,000, plus equity and bonus.')?.max, 220_000);
+  assert.equal(parsePayFromText('Annual salary model ID 999,999,999,100,000 - 150,000 annually'), null);
+  const r2WdBoard = allstateBoardSpec.format(
+    JSON.stringify({
+      total: 1,
+      jobPostings: [
+        {
+          title: 'Engineer',
+          externalPath: '/job/%2e%2e/%2e%2e/other_path',
+          locationsText: 'US - TX',
+          postedOn: '2026-10-14T12:00,GMT',
+        },
+      ],
+    }),
+    'https://allstate.wd5.myworkdayjobs.com/allstate_careers',
+    (h) => ({ markdown: h, links: [] }),
+  )!;
+  assert.equal(r2WdBoard.jobs?.[0]?.postedAt, null, 'LOW-R2-1: malformed ISO timestamp must not pass');
+  assert.equal(
+    r2WdBoard.jobs?.[0]?.url,
+    'https://allstate.wd5.myworkdayjobs.com/allstate_careers',
+    'LOW-R2-2: %2e%2e dot-segment traversal in externalPath must be rejected',
+  );
 });

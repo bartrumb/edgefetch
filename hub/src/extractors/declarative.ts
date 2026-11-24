@@ -2243,10 +2243,10 @@ function parseIcimsPortalHtml(
   }
 
   const cardsByJobId = new Map<string, HtmlNode>();
-  for (const card of doc.select('li.iCIMS_JobCardItem, div.iCIMS_JobCardItem', 200)) {
+  for (const card of doc.select('li.iCIMS_JobCardItem, div.iCIMS_JobCardItem, div.iCIMS_JobsTable div.row, div.row', 200)) {
     for (const cardLink of card.select('a[href*="/jobs/"]', 8)) {
       const href = unescapeHrefUrl(cardLink.attr('href') ?? '');
-      const idM = /\/jobs\/(\d+)\//i.exec(href);
+      const idM = /\/jobs\/(\d+)(?:\/|\?|$)/i.exec(href);
       if (idM?.[1] && !cardsByJobId.has(idM[1])) {
         cardsByJobId.set(idM[1], card);
         break;
@@ -2266,14 +2266,14 @@ function parseIcimsPortalHtml(
 
   for (const ao of doc.select('a.iCIMS_Anchor, a[href*="/jobs/"]', 200)) {
     const rawHref = unescapeHrefUrl(ao.attr('href') ?? '');
-    const idMatch = /\/jobs\/(\d+)\//i.exec(rawHref);
+    const idMatch = /\/jobs\/(\d+)(?:\/|\?|$)/i.exec(rawHref);
     if (!idMatch?.[1]) continue;
     const jobId = idMatch[1];
     if (byId.has(jobId)) continue;
 
     const rawTitleAttr = (ao.attr('title') ?? '').replace(/^\d+\s*-\s*/, '').trim();
     const linkTitle = sanitizeSingleLineMeta(
-      (ao.text('h3') || ao.text()).replace(/^(?:Job\s+Title|Title)\s*/i, '').trim() || rawTitleAttr,
+      (ao.text('h3') || ao.text('h2') || ao.text()).replace(/^(?:Job\s+Title|Title)\s*/i, '').trim() || rawTitleAttr,
     );
     if (!linkTitle) continue;
 
@@ -2315,8 +2315,41 @@ function parseIcimsPortalHtml(
     byId.set(jobId, { id: jobId, title: linkTitle, url: resolvedUrl, location, pay, postedAt });
   }
 
+  // Fallback to JSON-LD JobPosting / ItemList on custom-skinned iCIMS portals
+  if (byId.size === 0) {
+    for (const ld of extractJsonLdObjects(rawHtml)) {
+      if (/JobPosting/i.test(String(ld['@type'] ?? ''))) {
+        const ldUrlRaw = typeof ld.url === 'string' ? ld.url.trim() : '';
+        const idM = /\/jobs\/(\d+)(?:\/|\?|$)/i.exec(ldUrlRaw);
+        const ldTitle = sanitizeSingleLineMeta(typeof ld.title === 'string' ? stripTagsInline(ld.title) : '');
+        if (idM?.[1] && ldTitle && !byId.has(idM[1])) {
+          try {
+            const targetU = new URL(ldUrlRaw, u.origin);
+            targetU.searchParams.delete('in_iframe');
+            if (targetU.protocol === 'https:') {
+              byId.set(idM[1], {
+                id: idM[1],
+                title: ldTitle,
+                url: targetU.toString(),
+                location: '',
+                pay: '',
+                postedAt: typeof ld.datePosted === 'string' ? ld.datePosted.slice(0, 10) : '',
+              });
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+  }
+
   const jobs = [...byId.values()];
   if (jobs.length === 0) {
+    // Never treat an outer `#icims_content_iframe` wrapper shell as an empty 0-role portal!
+    if (/\bicims_content_iframe\b/i.test(rawHtml)) {
+      return null;
+    }
     const plainBody = doc.text();
     const explicitZero =
       /\b(?:no\s+results\s+found|sorry,\s+no\s+jobs|currently\s+no\s+open\s+positions|there\s+are\s+currently\s+no\s+open|0\s+results\s+available)\b/i.test(
@@ -2355,14 +2388,19 @@ function parseIcimsPortalHtml(
     j.pay || '-',
   ]);
   const isTruncated = hasMorePages || jobs.length > rows.length;
+  const nextCursor = hasMorePages ? `pr=${curPage}` : jobs.length > rows.length ? String(rows.length) : undefined;
   const title =
     totalPages > 1
       ? `${companyLabel} — iCIMS Career Portal (Page ${curPage} of ${totalPages}, ${rows.length} shown)`
       : `${companyLabel} — iCIMS Career Portal (${jobs.length} open roles)`;
+  const truncFooter =
+    isTruncated && nextCursor
+      ? `\n\n*Showing ${rows.length} open roles${totalPages > 1 ? ` on page ${curPage} of ${totalPages}` : ''} (list cut short — pass \`?${nextCursor.startsWith('pr=') ? nextCursor : `offset=${nextCursor}`}\` for the next page).*`
+      : '';
 
   return {
     title,
-    markdown: `# ${title}\n\n${formatGfmTable(['Role', 'Job ID', 'Location', 'Salary'], rows)}`,
+    markdown: `# ${title}\n\n${formatGfmTable(['Role', 'Job ID', 'Location', 'Salary'], rows)}${truncFooter}`,
     links,
     records: jobs.map((j) => ({
       id: j.id,
@@ -2377,7 +2415,7 @@ function parseIcimsPortalHtml(
     ...(!hasMorePages ? { total: jobs.length } : {}),
     returned: rows.length,
     truncated: isTruncated,
-    ...(hasMorePages ? { nextCursor: `pr=${curPage}` } : jobs.length > rows.length ? { nextCursor: String(rows.length) } : {}),
+    ...(nextCursor ? { nextCursor } : {}),
   };
 }
 

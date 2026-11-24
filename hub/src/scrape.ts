@@ -51,6 +51,7 @@ import {
   extractJobPostingJsonLd,
   formatJobPostingHeaderMarkdown,
   hasExecutableScriptTag,
+  inspectRawJobPostingJsonLdLinear,
   isThinScriptedPage,
   resolveAtsPreFetchSpec,
   type StructuredJobPosting,
@@ -8040,7 +8041,7 @@ function closeTruncatedMarkdownStructures(sliced: string, allowPdfPageMarkers = 
 
 /** Dedupes animated slot/ticker counter clones (`"382,831,172 3 8 2, 8 3 1, 1 7 2"` -> `"382,831,172"`) in O(N) time. */
 export function collapseAnimatedCounterTickersLinear(prose: string): string {
-  if (!prose.includes(',')) return prose;
+  if (!prose.includes(',') && !/\d{4}/.test(prose)) return prose;
   let out = '';
   let lastCopy = 0;
   let i = 0;
@@ -10723,6 +10724,8 @@ export async function executeScrapeCall(params: {
                 status: atsItem.status ?? 200,
                 via: atsRes.via,
                 extractorId: atsSpec.id,
+                detected: { generators: [], adapter: atsSpec.id },
+                rendered: false,
                 contentState: 'active' as const,
                 ...(atsArt?.contentSha256 ? { contentSha256: atsArt.contentSha256 } : {}),
                 ...(atsArt?.blobSha256 ? { artifactId: atsArt.blobSha256 } : {}),
@@ -11171,12 +11174,10 @@ export async function executeScrapeCall(params: {
               url: normalizedUrl,
               ...(twinHeaders ? { headers: twinHeaders } : {}),
             });
-            const hasTwinDetected = Boolean(
-              twinDetected.platform ||
-                twinDetected.framework ||
-                twinDetected.generators.length > 0 ||
-                (twinDetected.contentFlags && twinDetected.contentFlags.length > 0),
-            );
+            const twinDetectedWithAdapter: Record<string, unknown> = {
+              ...twinDetected,
+              adapter: registryTwin.id,
+            };
             return {
               status: 200,
               via: twinRes.via,
@@ -11189,8 +11190,9 @@ export async function executeScrapeCall(params: {
                 status: twinItem.status ?? 200,
                 via: twinRes.via,
                 extractorId: registryTwin.id,
+                detected: twinDetectedWithAdapter,
+                rendered: false,
                 contentState: 'active' as const,
-                ...(hasTwinDetected ? { detected: twinDetected } : {}),
                 ...(twinArt?.contentSha256 ? { contentSha256: twinArt.contentSha256 } : {}),
                 ...(twinArt?.blobSha256 ? { artifactId: twinArt.blobSha256 } : {}),
                 ...(twinMdArtifactId ? { markdownArtifactId: twinMdArtifactId } : {}),
@@ -12320,6 +12322,14 @@ export async function executeScrapeCall(params: {
   // P2b: Hydrate thin ATS / Workday SPA HTML shells directly from `<script type="application/ld+json">` `JobPosting`
   // when present (e.g. when Workday CXS `/wday/cxs/.../job/...` returned 403 on a locale/slug variant), avoiding a 12.5s headless Chromium spin!
   let hydratedFromJobPostingJsonLd = false;
+  const shouldInspectJobPostingJsonLd =
+    isHtmlBody &&
+    /JobPosting/i.test(rawBodyStr) &&
+    (checkPromptInjection || (!customShopifyDoc && !ssrHydrated && countTextWords(extracted?.markdown ?? '') < 50));
+  const rawJobLdInspection = shouldInspectJobPostingJsonLd
+    ? inspectRawJobPostingJsonLdLinear(rawBodyStr)
+    : { descriptionHtml: '', rawDecodedStringsForPiCheck: '' };
+  const rawJsonLdStringsForPiCheck = checkPromptInjection ? rawJobLdInspection.rawDecodedStringsForPiCheck : '';
   if (
     isHtmlBody &&
     !customShopifyDoc &&
@@ -12329,31 +12339,7 @@ export async function executeScrapeCall(params: {
   ) {
     const preJp = extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '');
     if (preJp?.title) {
-      let ldDescHtml = '';
-      const ldScriptRe = /<script\b[^>]*type\s*=\s*(?:"application\/ld\+json"|'application\/ld\+json'|application\/ld\+json)[^>]*>([\s\S]{1,131072}?)<\/script>/gi;
-      let ldm: RegExpExecArray | null;
-      while ((ldm = ldScriptRe.exec(rawBodyStr)) !== null) {
-        const body = ldm[1]!.trim();
-        if (!/JobPosting/i.test(body)) continue;
-        try {
-          const parsedLd = JSON.parse(body) as unknown;
-          const queue: unknown[] = Array.isArray(parsedLd) ? [...parsedLd] : [parsedLd];
-          while (queue.length > 0) {
-            const node = queue.shift();
-            if (!node || typeof node !== 'object') continue;
-            const rec = node as Record<string, unknown>;
-            if (Array.isArray(rec['@graph'])) queue.push(...(rec['@graph'] as unknown[]));
-            const tVal = Array.isArray(rec['@type']) ? rec['@type'].map(String).join(' ') : String(rec['@type'] ?? '');
-            if (/\bJobPosting\b/i.test(tVal) && typeof rec.description === 'string' && rec.description.trim()) {
-              ldDescHtml = rec.description.trim();
-              break;
-            }
-          }
-          if (ldDescHtml) break;
-        } catch {
-          // ignore malformed JSON-LD block
-        }
-      }
+      const ldDescHtml = rawJobLdInspection.descriptionHtml;
       const ldBodyMd = ldDescHtml ? htmlFragToMd(ldDescHtml, finalUrl).markdown.trim() : '';
       if (extracted && countTextWords(ldBodyMd) >= 20) {
         const headerMd = formatJobPostingHeaderMarkdown(preJp);
@@ -12853,7 +12839,13 @@ export async function executeScrapeCall(params: {
         })
       : fullShaped;
   markdown = shaped.markdown;
-  textOut = isOriginMarkdown ? rawCleanMarkdown : decodeHtmlEntities(textOut);
+  textOut =
+    isOriginMarkdown || hydratedFromJobPostingJsonLd
+      ? markdown
+      : neutralizeAllUnsafeMarkdownLinksLinear(stripInvisibleSmugglingChars(decodeHtmlEntities(textOut))).replace(
+          /<(?=[ \t]*(?:javascript|vbscript|data|file|blob):)/gi,
+          '&lt;',
+        );
 
   let llmsPayload: unknown = item.llms;
   if (llmsPayload && typeof llmsPayload === 'object') {
@@ -12966,7 +12958,16 @@ export async function executeScrapeCall(params: {
   });
 
   if (checkPromptInjection) {
-    const mdForInjectionCheck = [resolvedTitle, resolvedDescription, rawCleanMarkdown].filter(Boolean).join('\n\n');
+    const serializedJobPosting = htmlJobPosting ? JSON.stringify(htmlJobPosting) : '';
+    const mdForInjectionCheck = [
+      resolvedTitle,
+      resolvedDescription,
+      rawCleanMarkdown,
+      rawJsonLdStringsForPiCheck,
+      serializedJobPosting,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
     const piCheck = detectPromptInjection({
       markdown: mdForInjectionCheck,
       ...(isHtmlBody || isOriginMarkdown ? { rawHtml: rawBodyStr } : {}),

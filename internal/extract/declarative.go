@@ -2997,14 +2997,82 @@ func extractInertiaDataPageBytesGo(rawHTML string) ([]byte, bool) {
 func (m *DeclarativeTwinMatch) formatTextTwin(rawBody string) (*DeclarativeFormattedDoc, bool) {
 	ext := m.route.Extract
 	if ext.IcimsPortal {
-		out := ExtractHTML(rawBody, ExtractOptions{BaseURL: m.origURL, OnlyMainContent: true})
+		if strings.Contains(strings.ToLower(rawBody), "icims_content_iframe") {
+			return nil, false
+		}
+		out := ExtractHTML(rawBody, ExtractOptions{BaseURL: m.origURL, OnlyMainContent: false, IncludeLinks: true})
 		if strings.TrimSpace(out.Markdown) == "" {
 			return nil, false
+		}
+		var jobLinks []string
+		seenJobID := map[string]bool{}
+		for _, lnk := range out.Links {
+			low := strings.ToLower(lnk)
+			idx := strings.Index(low, "/jobs/")
+			if idx < 0 {
+				continue
+			}
+			rest := low[idx+len("/jobs/"):]
+			endDigits := 0
+			for endDigits < len(rest) && rest[endDigits] >= '0' && rest[endDigits] <= '9' {
+				endDigits++
+			}
+			if endDigits > 0 && (endDigits == len(rest) || rest[endDigits] == '/' || rest[endDigits] == '?') {
+				jid := rest[:endDigits]
+				if !seenJobID[jid] {
+					seenJobID[jid] = true
+					cleanLnk := strings.ReplaceAll(strings.ReplaceAll(lnk, "&in_iframe=1", ""), "?in_iframe=1&", "?")
+					cleanLnk = strings.TrimSuffix(cleanLnk, "?in_iframe=1")
+					jobLinks = append(jobLinks, cleanLnk)
+				}
+			}
+		}
+		isSingleJob := false
+		if u, err := url.Parse(m.origURL); err == nil {
+			lp := strings.ToLower(u.Path)
+			if strings.HasPrefix(lp, "/jobs/") {
+				seg := strings.Split(strings.TrimPrefix(lp, "/jobs/"), "/")[0]
+				if seg != "" && seg != "search" && seg != "intro" {
+					allDigits := true
+					for i := 0; i < len(seg); i++ {
+						if seg[i] < '0' || seg[i] > '9' {
+							allDigits = false
+							break
+						}
+					}
+					isSingleJob = allDigits
+				}
+			}
+		}
+		if !isSingleJob && len(jobLinks) == 0 {
+			lowMd := strings.ToLower(out.Markdown)
+			hasExplicitZero := strings.Contains(lowMd, "no results found") ||
+				strings.Contains(lowMd, "sorry, no jobs") ||
+				strings.Contains(lowMd, "currently no open positions") ||
+				strings.Contains(lowMd, "there are currently no open") ||
+				strings.Contains(lowMd, "0 results available")
+			if !hasExplicitZero {
+				return nil, false
+			}
+			hostSlug := m.params["org"]
+			if hostSlug == "" {
+				hostSlug = "icims"
+			}
+			emptyTitle := hostSlug + " — iCIMS Career Portal"
+			return &DeclarativeFormattedDoc{
+				Title:    emptyTitle,
+				Markdown: "# " + emptyTitle + "\n\nNo open positions currently listed.",
+				Links:    []string{},
+			}, true
+		}
+		linksOut := out.Links
+		if len(jobLinks) > 0 {
+			linksOut = jobLinks
 		}
 		return &DeclarativeFormattedDoc{
 			Title:    out.Title,
 			Markdown: out.Markdown,
-			Links:    out.Links,
+			Links:    linksOut,
 		}, true
 	}
 	if ext.XML != nil {

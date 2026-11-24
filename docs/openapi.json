@@ -4455,6 +4455,16 @@
             "maximum": 50,
             "default": 20
           },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Board pagination offset for paging large job boards (e.g. pass 100 after reading 0..99)."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor returned in nextCursor from a previous truncated jobs response."
+          },
           "includeBuiltIn": {
             "type": "boolean",
             "default": true,
@@ -6904,6 +6914,16 @@
             "minimum": 1,
             "maximum": 50,
             "default": 20
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Board pagination offset for paging large job boards (e.g. pass 100 after reading 0..99)."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor returned in nextCursor from a previous truncated jobs response."
           },
           "includeBuiltIn": {
             "type": "boolean",

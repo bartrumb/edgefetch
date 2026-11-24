@@ -228,3 +228,38 @@ func TestR10P3GoCommerceEscapesWithoutStrippingSKUsOrTitlesAndBlocksInjectedHead
 		t.Fatalf("unexpected WooCommerce catalog output:\n%s", wooDoc.Markdown)
 	}
 }
+
+func TestIcimsRootTwinAndIframeWrapperShellRejection(t *testing.T) {
+	rootMatch, ok := ResolveDeclarativeTwin("https://careers-gdms.icims.com/")
+	if !ok || rootMatch == nil {
+		t.Fatal("expected ResolveDeclarativeTwin to match root https://careers-gdms.icims.com/")
+	}
+	if rootMatch.FetchURL != "https://careers-gdms.icims.com/jobs/search?in_iframe=1&ss=1" &&
+		rootMatch.FetchURL != "https://careers-gdms.icims.com/jobs/search?ss=1&in_iframe=1" {
+		t.Fatalf("unexpected iCIMS root twin fetch URL: %s", rootMatch.FetchURL)
+	}
+
+	// Outer `#icims_content_iframe` wrapper shell must return false (never `(0 open roles)`!)
+	if doc, ok := rootMatch.Format(`<html><body><iframe id="icims_content_iframe" src="/jobs/search?in_iframe=1"></iframe><div>Sorry, no jobs were found</div></body></html>`); ok || doc != nil {
+		t.Fatalf("expected outer icims_content_iframe shell to be rejected, got: %+v", doc)
+	}
+
+	// Inner `in_iframe=1` portal with open roles extracts deduplicated canonical job links without `in_iframe=1`
+	portalHTML := `<html><body><h1>General Dynamics Career Listings</h1><a href="/jobs/68123/senior-fpga-engineer/job?in_iframe=1">Senior FPGA Engineer</a></body></html>`
+	doc, ok := rootMatch.Format(portalHTML)
+	if !ok || doc == nil {
+		t.Fatal("expected inner iCIMS portal HTML to format cleanly")
+	}
+	if len(doc.Links) != 1 || doc.Links[0] != "https://careers-gdms.icims.com/jobs/68123/senior-fpga-engineer/job" {
+		t.Fatalf("expected canonical job link without in_iframe=1, got: %v", doc.Links)
+	}
+
+	// Genuine empty inner portal omits `(0 open roles)` from title
+	emptyDoc, ok := rootMatch.Format(`<html><body><p>There are currently no open positions available.</p></body></html>`)
+	if !ok || emptyDoc == nil {
+		t.Fatal("expected genuine empty inner iCIMS portal to return empty doc")
+	}
+	if strings.Contains(emptyDoc.Title, "(0 open roles)") {
+		t.Fatalf("expected empty iCIMS title to omit (0 open roles), got: %q", emptyDoc.Title)
+	}
+}

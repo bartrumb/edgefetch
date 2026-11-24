@@ -1088,6 +1088,16 @@ export function buildCanonicalMcpToolSchemas(options?: {
           },
           postedWithinDays: { type: 'integer', minimum: 1, maximum: 365, description: 'Keep postings published within the last N days.' },
           limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+          offset: {
+            type: 'integer',
+            minimum: 0,
+            default: 0,
+            description: 'Board pagination offset for paging large job boards (e.g. pass 100 after reading 0..99).',
+          },
+          cursor: {
+            type: 'string',
+            description: 'Pagination cursor returned in nextCursor from a previous truncated jobs response.',
+          },
           includeBuiltIn: { type: 'boolean', default: true, description: 'Include Built In job listings (disabled automatically when company or domains is set).' },
           includePublicFeeds: {
             type: 'boolean',

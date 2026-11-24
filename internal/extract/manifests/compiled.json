@@ -4992,48 +4992,92 @@
         "https://careers-acme.icims.com/jobs/search?ss=1",
         "https://careers-acme.icims.com/jobs/12345/senior-software-engineer/job"
       ],
-      "match": {
-        "hostSubdomain": {
-          "suffix": ".icims.com",
-          "param": "org",
-          "reserved": [
-            "www",
-            "status",
-            "support",
-            "community",
-            "developer",
-            "developers",
-            "login"
-          ]
+      "routes": [
+        {
+          "match": {
+            "hostSubdomain": {
+              "suffix": ".icims.com",
+              "param": "org",
+              "reserved": [
+                "www",
+                "status",
+                "support",
+                "community",
+                "developer",
+                "developers",
+                "login"
+              ]
+            },
+            "exactSegments": true,
+            "pathSegments": []
+          },
+          "twin": {
+            "id": "icims",
+            "fetchUrl": "{requestUrl}",
+            "overridePathIf": {
+              "matchPaths": [
+                "/"
+              ],
+              "newPath": "/jobs/search"
+            },
+            "defaultQueryParams": {
+              "ss": "1"
+            },
+            "setQueryParams": {
+              "in_iframe": "1"
+            },
+            "kind": "text",
+            "accept": "text/html"
+          },
+          "extract": {
+            "icimsPortal": true
+          }
         },
-        "exactSegments": false,
-        "pathSegments": [
-          "jobs"
-        ]
-      },
-      "twin": {
-        "id": "icims",
-        "fetchUrl": "{requestUrl}",
-        "overridePathIf": {
-          "matchPaths": [
-            "/jobs",
-            "/jobs/intro",
-            "/jobs/search"
-          ],
-          "newPath": "/jobs/search"
-        },
-        "defaultQueryParams": {
-          "ss": "1"
-        },
-        "setQueryParams": {
-          "in_iframe": "1"
-        },
-        "kind": "text",
-        "accept": "text/html"
-      },
-      "extract": {
-        "icimsPortal": true
-      },
+        {
+          "match": {
+            "hostSubdomain": {
+              "suffix": ".icims.com",
+              "param": "org",
+              "reserved": [
+                "www",
+                "status",
+                "support",
+                "community",
+                "developer",
+                "developers",
+                "login"
+              ]
+            },
+            "exactSegments": false,
+            "pathSegments": [
+              "jobs"
+            ]
+          },
+          "twin": {
+            "id": "icims",
+            "fetchUrl": "{requestUrl}",
+            "overridePathIf": {
+              "matchPaths": [
+                "/jobs",
+                "/jobs/intro",
+                "/jobs/search"
+              ],
+              "newPath": "/jobs/search"
+            },
+            "defaultQueryParams": {
+              "ss": "1"
+            },
+            "setQueryParams": {
+              "in_iframe": "1"
+            },
+            "kind": "text",
+            "accept": "text/html"
+          },
+          "extract": {
+            "icimsPortal": true
+          }
+        }
+      ],
       "htmlRoutes": [
         {
           "id": "icims",

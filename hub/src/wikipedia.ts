@@ -134,19 +134,27 @@ export function isWikipediaHost(rawHost: string): boolean {
 export function isWikimediaHost(rawHost: string): boolean {
   const h = rawHost.trim().toLowerCase().replace(/\.+$/, '');
   if (!h) return false;
+  const hasSubdomain = (suffix: string) => h.endsWith(suffix) && h.length > suffix.length;
   return (
     isWikipediaHost(h) ||
     h === 'wikimedia.org' ||
-    h.endsWith('.wikimedia.org') ||
-    h.endsWith('.wiktionary.org') ||
-    h.endsWith('.wikibooks.org') ||
-    h.endsWith('.wikiquote.org') ||
-    h.endsWith('.wikisource.org') ||
-    h.endsWith('.wikiversity.org') ||
-    h.endsWith('.wikivoyage.org') ||
-    h.endsWith('.wikidata.org') ||
+    hasSubdomain('.wikimedia.org') ||
+    h === 'wiktionary.org' ||
+    hasSubdomain('.wiktionary.org') ||
+    h === 'wikibooks.org' ||
+    hasSubdomain('.wikibooks.org') ||
+    h === 'wikiquote.org' ||
+    hasSubdomain('.wikiquote.org') ||
+    h === 'wikisource.org' ||
+    hasSubdomain('.wikisource.org') ||
+    h === 'wikiversity.org' ||
+    hasSubdomain('.wikiversity.org') ||
+    h === 'wikivoyage.org' ||
+    hasSubdomain('.wikivoyage.org') ||
+    h === 'wikidata.org' ||
+    hasSubdomain('.wikidata.org') ||
     h === 'mediawiki.org' ||
-    h.endsWith('.mediawiki.org')
+    hasSubdomain('.mediawiki.org')
   );
 }
 
@@ -174,17 +182,28 @@ function safeDecodeWikiSegment(seg: string): string {
   }
 }
 
+function hasUnsafeWikiTitlePathSegments(rawOrDecoded: string): boolean {
+  const parts = rawOrDecoded.split('/');
+  for (const part of parts) {
+    const clean = part.trim();
+    if (!clean || clean === '.' || clean === '..') return true;
+    if (/^(?:%2e|\.)+$/i.test(clean)) return true;
+  }
+  return false;
+}
+
 function encodeCanonicalWikiTitlePath(decodedTitle: string): string {
   // Normalize whitespace to underscores, capitalize first character per MediaWiki convention,
   // and encode path-unsafe characters while preserving `/` (`HTTP/2`), `:`, `(`, `)`, `,`, `-`, `_`, `.`.
   const underscored = decodedTitle.trim().replace(/\s+/g, '_').replace(/_+/g, '_');
-  if (!underscored) return '';
+  if (!underscored || underscored.startsWith(':') || hasUnsafeWikiTitlePathSegments(underscored)) return '';
   const firstCp = underscored.codePointAt(0)!;
   const firstChar = String.fromCodePoint(firstCp);
   const rest = underscored.slice(firstChar.length);
   const titled = `${firstChar.toUpperCase()}${rest}`;
-  return titled
-    .split('/')
+  const segments = titled.split('/');
+  if (segments.some((seg) => !seg || seg === '.' || seg === '..')) return '';
+  return segments
     .map((part) =>
       encodeURIComponent(part)
         .replace(/%3A/gi, ':')
@@ -197,11 +216,15 @@ function encodeCanonicalWikiTitlePath(decodedTitle: string): string {
 }
 
 export function isDisallowedWikipediaTitle(decodedTitle: string): boolean {
-  const trimmed = decodedTitle.trim().replace(/\s+/g, '_');
-  if (!trimmed) return true;
+  const rawTrimmed = decodedTitle.trim();
+  if (!rawTrimmed || rawTrimmed.startsWith(':') || hasUnsafeWikiTitlePathSegments(rawTrimmed)) return true;
+  const trimmed = rawTrimmed.replace(/\s+/g, '_').replace(/^_+/, '');
+  if (!trimmed || trimmed.startsWith(':')) return true;
   const colonIdx = trimmed.indexOf(':');
   if (colonIdx <= 0) return false;
-  const prefix = trimmed.slice(0, colonIdx).toLowerCase();
+  // MediaWiki normalizes spaces/underscores around namespace colons (`Special_:_Search` -> `Special:Search`).
+  const prefix = trimmed.slice(0, colonIdx).replace(/_+$/, '').toLowerCase();
+  if (!prefix) return true;
   if (DISALLOWED_WIKIPEDIA_NAMESPACES.has(prefix)) return true;
   if (prefix.endsWith('_talk') || prefix.endsWith('_diskussion') || prefix.endsWith('_discusión')) {
     return true;
@@ -237,12 +260,20 @@ export function parseWikipediaArticleUrl(rawUrl: string): ParsedWikipediaArticle
     return null;
   }
   const rawSlug = u.pathname.slice('/wiki/'.length).replace(/\/+$/, '');
-  if (!rawSlug) return null;
-  const decoded = safeDecodeWikiSegment(rawSlug).replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!rawSlug || hasUnsafeWikiTitlePathSegments(rawSlug)) return null;
+  const rawDecodedSlug = safeDecodeWikiSegment(rawSlug);
+  if (!rawDecodedSlug || hasUnsafeWikiTitlePathSegments(rawDecodedSlug)) return null;
+  const decoded = rawDecodedSlug.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
   if (!decoded || isDisallowedWikipediaTitle(decoded)) return null;
   const encodedSlug = encodeCanonicalWikiTitlePath(decoded);
   if (!encodedSlug) return null;
   const host = `${lang}.wikipedia.org`;
+  const canonicalUrl = `https://${host}/wiki/${encodedSlug}`;
+  try {
+    if (new URL(canonicalUrl).pathname !== `/wiki/${encodedSlug}`) return null;
+  } catch {
+    return null;
+  }
   const firstCp = decoded.codePointAt(0)!;
   const firstChar = String.fromCodePoint(firstCp);
   const canonicalTitle = `${firstChar.toUpperCase()}${decoded.slice(firstChar.length)}`;
@@ -251,7 +282,7 @@ export function parseWikipediaArticleUrl(rawUrl: string): ParsedWikipediaArticle
     host,
     canonicalTitle,
     underscoredTitle: canonicalTitle.replace(/ /g, '_'),
-    canonicalUrl: `https://${host}/wiki/${encodedSlug}`,
+    canonicalUrl,
   };
 }
 
@@ -332,7 +363,8 @@ export function buildWikipediaDirectTitleGuessUrl(rawQuery: string, lang = 'en')
   });
   const encoded = encodeCanonicalWikiTitlePath(casedWords.join(' '));
   if (!encoded) return null;
-  return `https://${safeLang}.wikipedia.org/wiki/${encoded}`;
+  const candidate = `https://${safeLang}.wikipedia.org/wiki/${encoded}`;
+  return parseWikipediaArticleUrl(candidate)?.canonicalUrl ?? null;
 }
 
 export function buildWikimediaRobotsSuggestion(rawHost: string): string {
@@ -458,6 +490,110 @@ export function setCachedWikipediaSitemapUrls(host: string, urls: string[], now 
   });
 }
 
+function stripMediaWikiInlineLinksLinear(ln: string): string {
+  if (!ln.includes('](') || !ln.includes(')')) return ln;
+  if (
+    !ln.includes('wikidata.org/wiki/Special:EntityPage/') &&
+    !ln.includes('action=edit') &&
+    !ln.includes('#cite_note') &&
+    !ln.includes('#cite_ref') &&
+    !ln.includes('Wikipedia:Citation_needed') &&
+    !ln.includes('Wikipedia:Please_clarify') &&
+    !ln.includes('Wikipedia:Disputed_statement')
+  ) {
+    return ln;
+  }
+
+  let out = '';
+  let lastEmit = 0;
+  let searchPos = 0;
+  const n = ln.length;
+
+  while (searchPos < n) {
+    const mid = ln.indexOf('](', searchPos);
+    if (mid < 0) break;
+
+    const scanCap = Math.min(n, mid + 2_050);
+    let parenDepth = 1;
+    let endParen = -1;
+    let nextMid = -1;
+    for (let p = mid + 2; p < scanCap; p++) {
+      const ch = ln.charCodeAt(p);
+      if (ch === 93 /* ']' */ && p + 1 < n && ln.charCodeAt(p + 1) === 40 /* '(' */) {
+        nextMid = p;
+        break;
+      }
+      if (ch === 40 /* '(' */) {
+        parenDepth++;
+      } else if (ch === 41 /* ')' */) {
+        parenDepth--;
+        if (parenDepth === 0) {
+          endParen = p;
+          break;
+        }
+      }
+    }
+    if (nextMid >= 0) {
+      searchPos = nextMid;
+      continue;
+    }
+    if (endParen < 0) {
+      if (scanCap >= n) break;
+      searchPos = scanCap;
+      continue;
+    }
+
+    const isDoubleClose = mid > lastEmit && ln.charCodeAt(mid - 1) === 93 /* ']' */;
+    const lblEnd = isDoubleClose ? mid - 1 : mid;
+    const minBack = Math.max(lastEmit, lblEnd - 66);
+    let openBr = -1;
+    for (let b = lblEnd - 1; b >= minBack; b--) {
+      const bc = ln.charCodeAt(b);
+      if (bc === 91 /* '[' */) {
+        openBr = b;
+        break;
+      }
+      if (bc === 93 /* ']' */) break;
+    }
+
+    if (openBr >= 0 && lblEnd > openBr) {
+      const hasDoubleOpen = isDoubleClose && openBr > lastEmit && ln.charCodeAt(openBr - 1) === 91 /* '[' */;
+      if (!isDoubleClose || hasDoubleOpen) {
+        const openStart = hasDoubleOpen ? openBr - 1 : openBr;
+        const label = ln.slice(openBr + 1, lblEnd);
+        const url = ln.slice(mid + 2, endParen);
+        const isWikidataSitelink =
+          !hasDoubleOpen &&
+          /^https?:\/\/(?:www\.)?wikidata\.org\/wiki\/Special:EntityPage\//i.test(url);
+        const isActionEdit = /[?&]action=edit(?:[&#]|$)/i.test(url) || /[?&]action=edit/i.test(url);
+        const isCiteLink =
+          (/^#cite_(?:note|ref)/i.test(url) ||
+            /Wikipedia:(?:Citation_needed|Please_clarify|Disputed_statement)/i.test(url)) &&
+          /^(?:\d{1,4}|[a-z]|(?:note|nb|lower-alpha|upper-alpha)[ \t]*\d{1,3}|citation needed|clarification needed|when\?|who\?|dubious[\s\S]{0,48})$/i.test(
+            label,
+          );
+
+        if (isWikidataSitelink || isActionEdit || isCiteLink) {
+          let cutStart = openStart;
+          if (isWikidataSitelink || isActionEdit) {
+            while (cutStart > lastEmit && (ln.charCodeAt(cutStart - 1) === 32 || ln.charCodeAt(cutStart - 1) === 9)) {
+              cutStart--;
+            }
+          }
+          out += ln.slice(lastEmit, cutStart);
+          lastEmit = endParen + 1;
+          searchPos = endParen + 1;
+          continue;
+        }
+      }
+    }
+
+    searchPos = endParen + 1;
+  }
+
+  return lastEmit === 0 ? ln : out + ln.slice(lastEmit);
+}
+
 /**
  * Fence-aware linear **O(N)** MediaWiki Markdown cleanup (`< 5 ms` on 2 MiB articles; preserves GFM infobox tables & code blocks).
  * Strips `[ ]` toggle checkboxes, `"Edit links"` / Wikidata sitelinks lines, `[1][2]` footnote markers, `[edit]` links,
@@ -524,27 +660,13 @@ export function cleanMediaWikiMarkdownLinear(rawMd: string): string {
       }
     }
 
-    if (ln.includes('[')) {
-      // 1. Strip Wikidata "Edit links" sitelink anchors inline (`[Edit links](https://www.wikidata.org/wiki/Special:EntityPage/...)`)
-      if (ln.includes('wikidata.org/wiki/Special:EntityPage/')) {
-        ln = ln.replace(/[ \t]*\[[^\]]{1,64}\]\(https?:\/\/(?:www\.)?wikidata\.org\/wiki\/Special:EntityPage\/[^)]*\)/gi, '');
-      }
-      // 2. Strip linked MediaWiki section `[edit]` / `[[edit]](/w/index.php?...action=edit...)` anchors (all languages!)
-      if (ln.includes('action=edit')) {
-        ln = ln.replace(/[ \t]*\[\[?[^\]]{1,64}\]?\]\([^)]*[?&]action=edit[^)]*\)/gi, '');
-      }
-      // 3. Strip linked citation markers (`[[1]](#cite_note-1)`, `[1](#cite_note-1)`, `[[a]](#cite_note-a)`, `[[note 1]](#cite_note-1)`, `[[citation needed]](...)`)
-      if (ln.includes('#cite_note') || ln.includes('#cite_ref') || ln.includes('Wikipedia:Citation_needed')) {
-        ln = ln.replace(
-          /\[\[?(?:\d{1,4}|[a-z]|(?:note|nb|lower-alpha|upper-alpha)[ \t]*\d{1,3}|citation needed|clarification needed|when\?|who\?|dubious[^\]]*)\]?\]\((?:#cite_(?:note|ref)[^)]*|[^)]*Wikipedia:(?:Citation_needed|Please_clarify|Disputed_statement)[^)]*)\)/gi,
-          '',
-        );
-      }
-      // 4. Strip empty checkbox/toggle `[ ]` (`[   ]`) and unlinked `[edit]` / `[citation needed]` / `[1]` markers (never touching `[label](url)` or `[id]: url`!)
+    if (ln.includes('[') && ln.includes(']')) {
+      ln = stripMediaWikiInlineLinksLinear(ln);
+      // Strip empty checkbox/toggle `[ ]` (`[   ]`) and unlinked `[edit]` / `[citation needed]` / `[1]` markers (never touching `[label](url)` or `[id]: url`!)
       ln = ln
-        .replace(/[ \t]*\[[ \t]*\](?![(:])/g, '')
+        .replace(/(?<![ \t])[ \t]*\[[ \t]*\](?![(:])/g, '')
         .replace(
-          /[ \t]*\[(?:edit|Bearbeiten(?:[ \t]*\|[ \t]*Quelltext bearbeiten)?|modifier(?:[ \t]*\|[ \t]*modifier le code)?|editar|citation needed|clarification needed|when\?|who\?|dubious[ \t]*[–-][ \t]*discuss)\](?![(:])/gi,
+          /(?<![ \t])[ \t]*\[(?:edit|Bearbeiten(?:[ \t]*\|[ \t]*Quelltext bearbeiten)?|modifier(?:[ \t]*\|[ \t]*modifier le code)?|editar|citation needed|clarification needed|when\?|who\?|dubious[ \t]*[–-][ \t]*discuss)\](?![(:])/gi,
           '',
         )
         .replace(/\[(?:\d{1,4}|(?:note|nb)[ \t]*\d{1,3})\](?![(:])/gi, '');

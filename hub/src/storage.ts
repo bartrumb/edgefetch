@@ -389,8 +389,102 @@ export interface AuthorizeArtifactUploadCallback {
 const MAX_RECENT_UPLOAD_CACHE = 1_024;
 const recentArtifactUploads = new Map<string, number>();
 
+const MAX_RECENT_DECODED_ITEMS = 16;
+const MAX_RECENT_DECODED_SINGLE_BYTES = 1 << 20; // 1 MiB max per cached inline artifact
+const MAX_RECENT_DECODED_TOTAL_BYTES = 8 << 20; // 8 MiB ceiling per bucket instance
+const RECENT_DECODED_TTL_MS = 15_000;
+
+interface RecentDecodedArtifactEntry {
+  bytes: Uint8Array;
+  contentSha256: string;
+  expiresAt: number;
+}
+
+interface RecentDecodedBucketCache {
+  entries: Map<string, RecentDecodedArtifactEntry>;
+  totalBytes: number;
+}
+
+let recentDecodedByBucket = new WeakMap<object, RecentDecodedBucketCache>();
+
 export function resetRecentArtifactUploadsForTests(): void {
   recentArtifactUploads.clear();
+  recentDecodedByBucket = new WeakMap<object, RecentDecodedBucketCache>();
+}
+
+function rememberDecodedArtifactForHydration(
+  bucket: R2Bucket,
+  retention: ArtifactRetention,
+  blobSha256: string,
+  contentSha256: string,
+  bytes: Uint8Array,
+  nowMs: number,
+): void {
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_RECENT_DECODED_SINGLE_BYTES) return;
+  const bucketObj = bucket as unknown as object;
+  let state = recentDecodedByBucket.get(bucketObj);
+  if (!state) {
+    state = { entries: new Map(), totalBytes: 0 };
+    recentDecodedByBucket.set(bucketObj, state);
+  }
+  for (const [k, v] of state.entries) {
+    if (v.expiresAt <= nowMs) {
+      state.totalBytes = Math.max(0, state.totalBytes - v.bytes.byteLength);
+      state.entries.delete(k);
+    }
+  }
+  const cacheKey = `${retention}:${blobSha256}`;
+  const prev = state.entries.get(cacheKey);
+  if (prev) {
+    state.totalBytes = Math.max(0, state.totalBytes - prev.bytes.byteLength);
+    state.entries.delete(cacheKey);
+  }
+  while (
+    state.entries.size >= MAX_RECENT_DECODED_ITEMS ||
+    state.totalBytes + bytes.byteLength > MAX_RECENT_DECODED_TOTAL_BYTES
+  ) {
+    const oldestKey = state.entries.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = state.entries.get(oldestKey);
+    if (oldest) state.totalBytes = Math.max(0, state.totalBytes - oldest.bytes.byteLength);
+    state.entries.delete(oldestKey);
+  }
+  state.entries.set(cacheKey, {
+    bytes,
+    contentSha256,
+    expiresAt: nowMs + RECENT_DECODED_TTL_MS,
+  });
+  state.totalBytes += bytes.byteLength;
+}
+
+function lookupDecodedArtifactForHydration(
+  bucket: R2Bucket,
+  preferredRetention: ArtifactRetention,
+  blobSha256: string,
+  expectedContentSha256: string | undefined,
+  nowMs: number,
+): Uint8Array | null {
+  const state = recentDecodedByBucket.get(bucket as unknown as object);
+  if (!state) return null;
+  const order: ArtifactRetention[] = preferredRetention === 'stored' ? ['stored', 'transient'] : ['transient', 'stored'];
+  for (const ret of order) {
+    const cacheKey = `${ret}:${blobSha256}`;
+    const hit = state.entries.get(cacheKey);
+    if (!hit) continue;
+    if (hit.expiresAt <= nowMs) {
+      state.totalBytes = Math.max(0, state.totalBytes - hit.bytes.byteLength);
+      state.entries.delete(cacheKey);
+      continue;
+    }
+    if (
+      expectedContentSha256 &&
+      (!isValidSha256Hex(expectedContentSha256) || hit.contentSha256 !== expectedContentSha256)
+    ) {
+      return null;
+    }
+    return hit.bytes;
+  }
+  return null;
 }
 
 function rememberUploadedArtifact(key: string, uploadedAtMs: number): void {
@@ -593,6 +687,7 @@ export async function handleAgentArtifactUpload(params: {
   const key = r2ArtifactKey(rawRetention, blobSha256);
   const cachedUploadAt = recentArtifactUploads.get(key);
   if (cachedUploadAt !== undefined && !shouldRefreshDedupedObject(cachedUploadAt, rawRetention, now)) {
+    rememberDecodedArtifactForHydration(bucket, rawRetention, blobSha256, actualContentSha, gunzippedPayload, now);
     return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
   }
 
@@ -611,6 +706,7 @@ export async function handleAgentArtifactUpload(params: {
       existing = await headR2ObjectWithoutMissingSpan(bucket, checkKey);
       if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), metaRet, now)) {
         rememberUploadedArtifact(key, existing.uploaded.getTime());
+        rememberDecodedArtifactForHydration(bucket, metaRet, blobSha256, actualContentSha, gunzippedPayload, now);
         return Response.json({ ok: true, stored: false, deduplicated: true, key: checkKey }, { status: 200 });
       }
       if (checkKey !== key) {
@@ -624,6 +720,7 @@ export async function handleAgentArtifactUpload(params: {
       existing = await headR2ObjectWithoutMissingSpan(bucket, key);
       if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
         rememberUploadedArtifact(key, existing.uploaded.getTime());
+        rememberDecodedArtifactForHydration(bucket, rawRetention, blobSha256, actualContentSha, gunzippedPayload, now);
         return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
       }
     }
@@ -631,6 +728,7 @@ export async function handleAgentArtifactUpload(params: {
     existing = await headR2ObjectWithoutMissingSpan(bucket, key);
     if (existing && !shouldRefreshDedupedObject(existing.uploaded.getTime(), rawRetention, now)) {
       rememberUploadedArtifact(key, existing.uploaded.getTime());
+      rememberDecodedArtifactForHydration(bucket, rawRetention, blobSha256, actualContentSha, gunzippedPayload, now);
       return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
     }
   }
@@ -650,6 +748,7 @@ export async function handleAgentArtifactUpload(params: {
     if (stored !== null) {
       rememberUploadedArtifact(key, now);
     }
+    rememberDecodedArtifactForHydration(bucket, rawRetention, blobSha256, actualContentSha, gunzippedPayload, now);
     return Response.json({ ok: true, stored: stored !== null, deduplicated: stored === null, key }, { status: 200 });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -659,6 +758,7 @@ export async function handleAgentArtifactUpload(params: {
       const afterErr = await headR2ObjectWithoutMissingSpan(bucket, key);
       if (afterErr) {
         rememberUploadedArtifact(key, afterErr.uploaded.getTime());
+        rememberDecodedArtifactForHydration(bucket, rawRetention, blobSha256, actualContentSha, gunzippedPayload, now);
         return Response.json({ ok: true, stored: false, deduplicated: true, key }, { status: 200 });
       }
     }
@@ -831,22 +931,32 @@ export async function hydrateReplyBodiesFromR2(
     }
   }
 
+  const hydNow = Date.now();
   for (const r of parsed.results) {
     const art = r?.artifact;
     if (!art?.blobSha256 || typeof r.body === 'string') continue;
     const prefRet: ArtifactRetention = art.retention === 'stored' ? 'stored' : 'transient';
-    const loaded = await readVerifiedArtifactFromR2({
-      bucket,
-      blobSha256: art.blobSha256,
-      preferredRetention: prefRet,
-      expectedContentSha256: art.contentSha256,
-    });
-    if (!loaded.ok) {
-      r.bodyOmitted = true;
-      r.artifactError = loaded.error;
-      continue;
+    const fastBytes = isValidSha256Hex(art.blobSha256)
+      ? lookupDecodedArtifactForHydration(bucket, prefRet, art.blobSha256, art.contentSha256, hydNow)
+      : null;
+    let rawBytes: Uint8Array;
+    if (fastBytes) {
+      rawBytes = fastBytes;
+    } else {
+      const loaded = await readVerifiedArtifactFromR2({
+        bucket,
+        blobSha256: art.blobSha256,
+        preferredRetention: prefRet,
+        expectedContentSha256: art.contentSha256,
+      });
+      if (!loaded.ok) {
+        r.bodyOmitted = true;
+        r.artifactError = loaded.error;
+        continue;
+      }
+      rawBytes = loaded.bytes;
     }
-    const encoded = encodeBodyForWire(loaded.bytes);
+    const encoded = encodeBodyForWire(rawBytes);
     if (usedInlineBytes + encoded.body.length > budgetBytes) {
       r.bodyOmitted = true;
       continue;

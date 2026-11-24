@@ -301,6 +301,11 @@ export interface OAuthStore {
   countUsers?(): Promise<number> | number;
   updateUserRole?(userId: string, role: UserRole, promotedByOwnerId?: string | null): Promise<boolean> | boolean;
   enforcePinnedFounderOwners?(pinnedOwnerId: string): Promise<number> | number;
+  resolveMcpAccessToken?(params: {
+    tokenHash: string;
+    now: number;
+    pinnedOwnerId?: string | null;
+  }): Promise<{ token: OAuthTokenRecord | null; user: HubUserRecord | null }> | { token: OAuthTokenRecord | null; user: HubUserRecord | null };
   checkAuthLockout(
     bucket: string,
     now: number,
@@ -1710,6 +1715,17 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         grantCount,
       };
     },
+    resolveMcpAccessToken(params) {
+      const token = this.getAccessToken(params.tokenHash, params.now) as OAuthTokenRecord | null;
+      if (!token) return { token: null, user: null };
+      const uid = token.userId ?? 'owner';
+      if (uid === 'owner') return { token, user: null };
+      if (params.pinnedOwnerId) {
+        demoteUnapprovedOwnersSqlite(params.pinnedOwnerId);
+      }
+      const user = (this.getUser!(uid) as HubUserRecord | null) ?? null;
+      return { token, user };
+    },
     listUsers() {
       ensureMultiUserColumns();
       demoteUnapprovedOwnersSqlite();
@@ -2687,6 +2703,17 @@ export function createMemoryOAuthStore(): OAuthStore {
         }
       }
       return count;
+    },
+    resolveMcpAccessToken(params) {
+      const token = this.getAccessToken(params.tokenHash, params.now) as OAuthTokenRecord | null;
+      if (!token) return { token: null, user: null };
+      const uid = token.userId ?? 'owner';
+      if (uid === 'owner') return { token, user: null };
+      if (params.pinnedOwnerId) {
+        this.enforcePinnedFounderOwners?.(params.pinnedOwnerId);
+      }
+      const user = (this.getUser!(uid) as HubUserRecord | null) ?? null;
+      return { token, user };
     },
     checkAuthLockout(bucket, now, maxFailures = RATE_LIMIT_MAX_FAILURES) {
       if (bucket.startsWith('revoked_admin:')) {
@@ -4432,17 +4459,44 @@ export async function authorizeMcpRequest(params: {
     return res;
   }
 
-  const record = await params.store.getAccessToken(await sha256Base64Url(tok), params.now ?? Date.now());
+  const nowMs = params.now ?? Date.now();
+  const effectiveGhEnv = params.githubAuthEnv ?? callerAuthAls.getStore()?.githubAuthEnv;
+  const pinnedOwnerId = resolvePinnedGitHubOwnerId(effectiveGhEnv);
+  const isUnapprovedPinnedOwner = (u: HubUserRecord | null | undefined): boolean =>
+    Boolean(
+      pinnedOwnerId &&
+        u &&
+        u.userId !== 'owner' &&
+        u.role === 'owner' &&
+        String(u.githubId ?? '') !== pinnedOwnerId &&
+        u.promotedByOwnerId !== pinnedOwnerId &&
+        u.promotedByOwnerId !== 'owner',
+    );
+  const tokenHash = await sha256Base64Url(tok);
+  let record: OAuthTokenRecord | null;
+  let preloadedUser: HubUserRecord | null | undefined;
+  if (typeof params.store.resolveMcpAccessToken === 'function') {
+    const resolved = await params.store.resolveMcpAccessToken({
+      tokenHash,
+      now: nowMs,
+      pinnedOwnerId,
+    });
+    record = resolved.token;
+    preloadedUser = resolved.user;
+  } else {
+    record = await params.store.getAccessToken(tokenHash, nowMs);
+  }
   if (!record || record.resource.toLowerCase() !== `${params.origin.toLowerCase()}/mcp`) {
     return { ok: false, status: 401, wwwAuthenticate };
   }
   const userId = record.userId ?? 'owner';
   let role = normalizeRoleForUser(userId, record.userRole);
   if (userId !== 'owner') {
-    const effectiveGhEnv = params.githubAuthEnv ?? callerAuthAls.getStore()?.githubAuthEnv;
-    const nowMs = params.now ?? Date.now();
-    await reconcileUpgradedFounderOwners({ store: params.store, env: effectiveGhEnv });
-    let liveUser = (await params.store.getUser?.(userId)) ?? null;
+    if (preloadedUser === undefined || isUnapprovedPinnedOwner(preloadedUser)) {
+      await reconcileUpgradedFounderOwners({ store: params.store, env: effectiveGhEnv });
+      preloadedUser = undefined;
+    }
+    let liveUser = preloadedUser !== undefined ? preloadedUser : ((await params.store.getUser?.(userId)) ?? null);
     if (!liveUser || liveUser.disabled || isGitHubUserDeAllowlisted(liveUser, effectiveGhEnv)) {
       await params.store.revokeGrant(record.grantId);
       return { ok: false, status: 401, wwwAuthenticate };
@@ -4471,7 +4525,7 @@ export async function authorizeMcpRequest(params: {
         return { ok: false, status: 401, wwwAuthenticate };
       }
     }
-    role = liveUser.role;
+    role = isUnapprovedPinnedOwner(liveUser) ? 'member' : liveUser.role;
   }
   const res: McpAuthResult = { ok: true, scopes: record.scopes, principal: `oauth:${record.clientId}`, userId, role };
   setActiveCallerAuthContext(res);

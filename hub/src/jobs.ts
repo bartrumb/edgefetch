@@ -879,6 +879,50 @@ export function salvageAshbyBoardFromTruncatedJson(raw: string): {
   };
 }
 
+function extractGreenhouseLocations(job: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const addLoc = (raw: unknown) => {
+    if (typeof raw !== 'string' || out.length >= 12) return;
+    const preDecoded = decodeEntitiesBasic(raw.slice(0, 240));
+    const cleaned = sanitizeJobFieldPlain(
+      preDecoded.includes('&') ? decodeEntitiesBasic(preDecoded) : preDecoded,
+      180,
+    );
+    if (!cleaned || /^(?:n\/a|none|null|undefined|tbd|-)$/i.test(cleaned)) return;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(cleaned);
+  };
+  const locObj = job.location as Record<string, unknown> | undefined;
+  if (locObj && typeof locObj === 'object') {
+    addLoc(locObj.name);
+  }
+  if (Array.isArray(job.offices)) {
+    for (const off of (job.offices as Array<Record<string, unknown>>).slice(0, 12)) {
+      if (!off || typeof off !== 'object') continue;
+      addLoc(off.name);
+      addLoc(off.location);
+    }
+  }
+  if (Array.isArray(job.metadata)) {
+    for (const m of (job.metadata as Array<Record<string, unknown>>).slice(0, 16)) {
+      if (!m || typeof m !== 'object') continue;
+      const mName = typeof m.name === 'string' && m.name.length <= 64 ? m.name.trim() : '';
+      if (!/^(?:job\s+posting\s+location|hiring\s+location|work\s+location|office\s+location|location|locations|country|countries|region)$/i.test(mName)) {
+        continue;
+      }
+      if (Array.isArray(m.value)) {
+        for (const item of m.value.slice(0, 8)) addLoc(item);
+      } else {
+        addLoc(m.value);
+      }
+    }
+  }
+  return out;
+}
+
 function parseGreenhousePay(job: Record<string, unknown>, extraProse = ''): NormalizedPay | null {
   const payRanges = Array.isArray(job.pay_input_ranges) ? (job.pay_input_ranges as Array<Record<string, unknown>>) : [];
   if (payRanges[0] && typeof payRanges[0] === 'object') {
@@ -1411,7 +1455,8 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           for (const j of jobs.slice(reqOffset, reqOffset + maxBoardRecords)) {
             const jTitle = String(j.title ?? '').trim();
             if (!jTitle) continue;
-            const loc = String((j.location as Record<string, unknown> | undefined)?.name ?? '').trim();
+            const ghLocs = extractGreenhouseLocations(j);
+            const loc = ghLocs[0] ?? '';
             const jUrl =
               typeof j.absolute_url === 'string' && j.absolute_url.startsWith('https://')
                 ? j.absolute_url
@@ -1420,7 +1465,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const plainPreview = rawContent
               ? stripTagsPlain(decodeEntitiesBasic(decodeEntitiesBasic(rawContent.slice(0, 12_000))))
               : '';
-            const wp = inferWorkplaceType(`${loc} ${jTitle} ${plainPreview.slice(0, 320)}`);
+            const wp = inferWorkplaceType(`${ghLocs.join(' ')} ${jTitle} ${plainPreview.slice(0, 320)}`);
             const pay = parseGreenhousePay(j);
             const postedAt = typeof j.updated_at === 'string' ? j.updated_at : typeof j.first_published === 'string' ? j.first_published : null;
             const companyName = typeof j.company_name === 'string' && j.company_name.trim() ? j.company_name.trim() : co;
@@ -1430,14 +1475,16 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
               url: jUrl,
               applyUrl: jUrl,
               workplaceType: wp,
-              locations: loc ? [loc] : [],
+              locations: ghLocs,
               pay,
               postedAt,
               source: 'greenhouse',
               ...(plainPreview ? { snippet: plainPreview.slice(0, 240) } : {}),
             });
             if (lines.length - 1 < maxMarkdownBullets) {
-              const meta = [loc, wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : ''].filter(Boolean).join(' · ');
+              const meta = [ghLocs.slice(0, 2).join(', '), wp !== 'unknown' ? wp : '', pay ? formatNormalizedPay(pay) : '']
+                .filter(Boolean)
+                .join(' · ');
               lines.push(`- **[${jTitle}](${jUrl})**${meta ? ` — ${meta}` : ''}`);
             }
           }
@@ -1480,8 +1527,8 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             if (!data || typeof data.title !== 'string') return null;
             const title = data.title.trim();
             const companyName = typeof data.company_name === 'string' && data.company_name ? data.company_name : co;
-            const locObj = data.location as { name?: string } | undefined;
-            const loc = typeof locObj?.name === 'string' ? locObj.name.trim() : '';
+            const ghLocs = extractGreenhouseLocations(data);
+            const loc = ghLocs.join(' ');
             const rawContent = typeof data.content === 'string' ? decodeEntitiesBasic(decodeEntitiesBasic(data.content)) : '';
             const bodyMd = rawContent ? htmlToMd(rawContent, origUrl).markdown.trim() : '';
             const pay = parseGreenhousePay(data, bodyMd);
@@ -1493,7 +1540,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const jp: StructuredJobPosting = {
               title,
               hiringOrganization: companyName,
-              ...(loc ? { jobLocation: [loc] } : {}),
+              ...(ghLocs.length > 0 ? { jobLocation: ghLocs } : {}),
               workplaceType: wp,
               baseSalary: pay?.basis === 'base' ? pay : null,
               pay,
@@ -5318,12 +5365,21 @@ function isVerifiedMultiWordHyphenJoin(parts: string[], tok: string, rawCompanyH
 function matchesAtsTenantSlugAgainstToken(
   rawSlug: string,
   tok: string,
-  opts?: { host?: string; jobCompany?: string; segmentedTokens?: Set<string> },
+  opts?: { host?: string; jobCompany?: string; segmentedTokens?: Set<string>; allowAshbySpaces?: boolean },
 ): boolean {
   if (!rawSlug || !tok || tok.length < 2 || tok.length > 128) return false;
   const bounded = rawSlug.length > 128 ? rawSlug.slice(0, 128) : rawSlug;
   if (/[\u0000-\u001f\u007f-\u00a0\u00ad\u034f\u061c\u17b4\u17b5\u180b-\u180f\u2000-\u200f\u2028-\u202f\u205f-\u206f\ufeff]/.test(bounded)) {
     return false;
+  }
+  const hostLower = opts?.host?.toLowerCase() ?? '';
+  const canHaveAshbySpace =
+    opts?.allowAshbySpaces === true || hostLower === 'ashbyhq.com' || hostLower.endsWith('.ashbyhq.com');
+  if (canHaveAshbySpace && bounded.includes(' ')) {
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9_-]| [A-Za-z0-9_-])*$/.test(bounded)) return false;
+    const spaceParts = bounded.toLowerCase().split(/[-_ ]+/).filter(Boolean);
+    // Never pass untrusted `opts?.jobCompany` for space-slugs so a spoof Ashby org (`"St Ripe"`) cannot self-corroborate against `"stripe"`!
+    return isVerifiedMultiWordHyphenJoin(spaceParts, tok, undefined, opts?.segmentedTokens);
   }
   if (!/^[A-Za-z0-9_-]+$/.test(bounded)) return false;
   const lower = bounded.toLowerCase();
@@ -5883,14 +5939,16 @@ function classifyFullBoardKey(urlStr: string): { key: string; platform: string; 
     const isGhUs = host === 'boards.greenhouse.io' || host === 'job-boards.greenhouse.io';
     const isGhEu = host === 'eu-boards.greenhouse.io' || host === 'job-boards.eu.greenhouse.io';
     if ((isGhUs || isGhEu) && parts.length >= 1) {
-      const org = parts[0]!;
-      if (!isValidAtsSlug(org)) return null;
+      const isEmbedPath = parts[0]!.toLowerCase() === 'embed';
+      const org = isEmbedPath ? (u.searchParams.get('for')?.trim() ?? '') : parts[0]!;
+      if (!org || !isValidAtsSlug(org)) return null;
       const canonicalHost = isGhEu ? 'job-boards.eu.greenhouse.io' : 'job-boards.greenhouse.io';
+      const isErrorRedirect = u.searchParams.get('error')?.toLowerCase() === 'true';
       return {
         key: `greenhouse:${org.toLowerCase()}`,
         platform: 'greenhouse',
         slug: org,
-        isBoard: parts.length === 1 && !u.searchParams.has('gh_jid'),
+        isBoard: parts.length === 1 && !u.searchParams.has('gh_jid') && !isErrorRedirect && !isEmbedPath,
         boardUrl: `https://${canonicalHost}/${org}`,
       };
     }
@@ -6335,6 +6393,7 @@ export async function executeJobsCall(params: {
   const candidateUrls = new Set<string>();
   const notes: string[] = [];
   const discoveredBoards: DiscoveredAtsBoard[] = [];
+  const failedProbeBoardKeys = new Set<string>();
   const sourcesUsed = new Set<string>();
   const resolvedAdapterIds = new Set<string>();
 
@@ -6345,6 +6404,101 @@ export async function executeJobsCall(params: {
         const tried: string[] = [];
         const foundForDom: DiscoveredAtsBoard[] = [];
         let domHitBudgetCap = false;
+        const domBrandInfo = extractRegistrableBrandInfo(dom);
+        const baseSlug = (domBrandInfo?.sld ?? dom.split('.')[0] ?? '').toLowerCase();
+        const canSlugProbe = isValidAtsSlug(baseSlug);
+        const upperSlug = baseSlug.toUpperCase();
+        const phase1Probes: Array<{ platform: string; slug: string; boardUrl: string }> = canSlugProbe
+          ? [
+              { platform: 'greenhouse', slug: baseSlug, boardUrl: `https://boards.greenhouse.io/${baseSlug}` },
+              { platform: 'ashby', slug: baseSlug, boardUrl: `https://jobs.ashbyhq.com/${baseSlug}` },
+              { platform: 'lever', slug: baseSlug, boardUrl: `https://jobs.lever.co/${baseSlug}` },
+              { platform: 'smartrecruiters', slug: baseSlug, boardUrl: `https://jobs.smartrecruiters.com/${baseSlug}` },
+            ]
+          : [];
+        const phase2WorkdayProbes: Array<{ platform: string; slug: string; boardUrl: string }> = canSlugProbe
+          ? [
+              {
+                platform: 'workday',
+                slug: `${baseSlug}/${upperSlug}ExternalCareerSite`,
+                boardUrl: `https://${baseSlug}.wd5.myworkdayjobs.com/${upperSlug}ExternalCareerSite`,
+              },
+              {
+                platform: 'workday',
+                slug: `${baseSlug}/${upperSlug}ExternalCareerSite`,
+                boardUrl: `https://${baseSlug}.wd1.myworkdayjobs.com/${upperSlug}ExternalCareerSite`,
+              },
+              {
+                platform: 'workday',
+                slug: `${baseSlug}/External`,
+                boardUrl: `https://${baseSlug}.wd5.myworkdayjobs.com/External`,
+              },
+              {
+                platform: 'workday',
+                slug: `${baseSlug}/External`,
+                boardUrl: `https://${baseSlug}.wd1.myworkdayjobs.com/External`,
+              },
+            ]
+          : [];
+        let ranPhase1SlugProbes = false;
+        const runSlugProbeWave = async (wave: Array<{ platform: string; slug: string; boardUrl: string }>) => {
+          for (const sp of wave) tried.push(sp.boardUrl);
+          const probeResults = await Promise.all(
+            wave.map(async (sp) => {
+              const r = await executeScrape({
+                url: sp.boardUrl,
+                renderMode: 'off',
+                discoverLlmsTxt: false,
+                preferOriginMarkdown: false,
+                ephemeral: true,
+                formats: ['markdown', 'links'],
+                ...(payload.target ? { target: payload.target } : {}),
+                ...(payload.site ? { site: payload.site } : {}),
+              }).catch(() => null);
+              if (r?.body?.error === 'jobs_scrape_budget_exceeded') {
+                domHitBudgetCap = true;
+              }
+              return { sp, r };
+            }),
+          );
+          for (const { sp, r } of probeResults) {
+            if (!r || r.status !== 200 || r.body?.ok !== true) {
+              if (r?.body?.error !== 'jobs_scrape_budget_exceeded') {
+                const fk = classifyFullBoardKey(sp.boardUrl)?.key ?? sp.boardUrl.replace(/\/+$/, '').toLowerCase();
+                failedProbeBoardKeys.add(fk);
+              }
+              continue;
+            }
+            if (foundForDom.some((existing) => existing.platform === sp.platform)) {
+              continue;
+            }
+            const srJobs = sp.platform === 'smartrecruiters' ? parseSmartRecruitersBoardScrape(sp.boardUrl, r.body) : [];
+            const links = Array.isArray(r.body.links) ? (r.body.links as string[]) : [];
+            const jobsArr = Array.isArray(r.body.jobs) ? (r.body.jobs as unknown[]) : [];
+            const cleanBoardPrefix = `${sp.boardUrl.replace(/\/+$/, '').toLowerCase()}/`;
+            const hasBoardPostingLink = links.some(
+              (l) => typeof l === 'string' && l.toLowerCase().startsWith(cleanBoardPrefix),
+            );
+            const hasRealJobs =
+              sp.platform === 'smartrecruiters'
+                ? srJobs.length > 0
+                : jobsArr.length > 0 || hasBoardPostingLink;
+            if (hasRealJobs) {
+              const entry: DiscoveredAtsBoard = {
+                domain: dom,
+                platform: sp.platform,
+                slug: sp.slug,
+                boardUrl: sp.boardUrl,
+                discoveredFrom: `slug-probe:${dom}`,
+                boardStatus: 'ok',
+              };
+              foundForDom.push(entry);
+              discoveredBoards.push(entry);
+              candidateUrls.add(sp.boardUrl);
+            }
+          }
+        };
+
         for (const probePath of ['/careers', '/jobs', '/about/careers']) {
           const probeUrl = `https://${dom}${probePath}`;
           tried.push(probeUrl);
@@ -6354,6 +6508,7 @@ export async function executeJobsCall(params: {
             discoverLlmsTxt: false,
             preferOriginMarkdown: false,
             onlyMainContent: false,
+            ephemeral: true,
             maxChars: 24_000,
             formats: ['markdown', 'rawHtml', 'links'],
             ...(payload.target ? { target: payload.target } : {}),
@@ -6379,85 +6534,41 @@ export async function executeJobsCall(params: {
             }
             return;
           }
+          // When a `.com` domain's `/careers` itself returned `200 OK` (without redirecting off `/careers` or `soft_404`)
+          // with zero static ATS links (custom SPA careers portal like `cloudflare.com/careers`), probe the 4 distinct ATS hosts
+          // (`phase1Probes`) immediately BEFORE burning 2 more serial same-host politeness sleeps on `/jobs` & `/about/careers`!
+          // Never preempt `/jobs` on non-`.com` TLDs (`.co.uk`, `.io`, `.ai`) where bare `baseSlug` can collide with an unrelated `.com` company!
+          const finalProbeUrl = typeof res.body.finalUrl === 'string' && res.body.finalUrl ? res.body.finalUrl : probeUrl;
+          let stayedOnCareersPath = false;
+          try {
+            stayedOnCareersPath = /^\/careers(?:\/|$)/i.test(new URL(finalProbeUrl).pathname);
+          } catch {
+            stayedOnCareersPath = false;
+          }
+          const probeContentState = typeof res.body.contentState === 'string' ? res.body.contentState : undefined;
+          if (
+            probePath === '/careers' &&
+            domBrandInfo?.tld === 'com' &&
+            stayedOnCareersPath &&
+            probeContentState !== 'soft_404' &&
+            canSlugProbe &&
+            !ranPhase1SlugProbes &&
+            !domHitBudgetCap
+          ) {
+            ranPhase1SlugProbes = true;
+            await runSlugProbeWave(phase1Probes);
+            if (foundForDom.length > 0 || domHitBudgetCap) {
+              return;
+            }
+          }
         }
         // Fallback when company uses a custom SPA careers portal (e.g. Eightfold/AEM):
         // Phase 1 probes fast JSON/HTML boards first; Phase 2 probes speculative Workday CXS ONLY if Phase 1 yielded nothing!
-        const baseSlug = dom.split('.')[0]?.toLowerCase() ?? '';
-        if (isValidAtsSlug(baseSlug) && !domHitBudgetCap) {
-          const upperSlug = baseSlug.toUpperCase();
-          const phase1Probes: Array<{ platform: string; slug: string; boardUrl: string }> = [
-            { platform: 'greenhouse', slug: baseSlug, boardUrl: `https://boards.greenhouse.io/${baseSlug}` },
-            { platform: 'ashby', slug: baseSlug, boardUrl: `https://jobs.ashbyhq.com/${baseSlug}` },
-            { platform: 'lever', slug: baseSlug, boardUrl: `https://jobs.lever.co/${baseSlug}` },
-            { platform: 'smartrecruiters', slug: baseSlug, boardUrl: `https://jobs.smartrecruiters.com/${baseSlug}` },
-          ];
-          const phase2WorkdayProbes: Array<{ platform: string; slug: string; boardUrl: string }> = [
-            {
-              platform: 'workday',
-              slug: `${baseSlug}/${upperSlug}ExternalCareerSite`,
-              boardUrl: `https://${baseSlug}.wd5.myworkdayjobs.com/${upperSlug}ExternalCareerSite`,
-            },
-            {
-              platform: 'workday',
-              slug: `${baseSlug}/${upperSlug}ExternalCareerSite`,
-              boardUrl: `https://${baseSlug}.wd1.myworkdayjobs.com/${upperSlug}ExternalCareerSite`,
-            },
-            {
-              platform: 'workday',
-              slug: `${baseSlug}/External`,
-              boardUrl: `https://${baseSlug}.wd5.myworkdayjobs.com/External`,
-            },
-            {
-              platform: 'workday',
-              slug: `${baseSlug}/External`,
-              boardUrl: `https://${baseSlug}.wd1.myworkdayjobs.com/External`,
-            },
-          ];
-          const runSlugProbeWave = async (wave: Array<{ platform: string; slug: string; boardUrl: string }>) => {
-            for (const sp of wave) tried.push(sp.boardUrl);
-            const probeResults = await Promise.all(
-              wave.map(async (sp) => {
-                const r = await executeScrape({
-                  url: sp.boardUrl,
-                  renderMode: 'off',
-                  discoverLlmsTxt: false,
-                  preferOriginMarkdown: false,
-                  formats: ['markdown', 'links'],
-                  ...(payload.target ? { target: payload.target } : {}),
-                  ...(payload.site ? { site: payload.site } : {}),
-                }).catch(() => null);
-                if (r?.body?.error === 'jobs_scrape_budget_exceeded') {
-                  domHitBudgetCap = true;
-                }
-                return { sp, r };
-              }),
-            );
-            for (const { sp, r } of probeResults) {
-              if (!r || r.status !== 200 || r.body?.ok !== true) continue;
-              const srJobs = sp.platform === 'smartrecruiters' ? parseSmartRecruitersBoardScrape(sp.boardUrl, r.body) : [];
-              const links = Array.isArray(r.body.links) ? (r.body.links as string[]) : [];
-              const jobsArr = Array.isArray(r.body.jobs) ? (r.body.jobs as unknown[]) : [];
-              const hasRealJobs =
-                sp.platform === 'smartrecruiters'
-                  ? srJobs.length > 0
-                  : jobsArr.length > 0 || links.length > 0;
-              if (hasRealJobs) {
-                const entry: DiscoveredAtsBoard = {
-                  domain: dom,
-                  platform: sp.platform,
-                  slug: sp.slug,
-                  boardUrl: sp.boardUrl,
-                  discoveredFrom: `slug-probe:${dom}`,
-                  boardStatus: 'ok',
-                };
-                foundForDom.push(entry);
-                discoveredBoards.push(entry);
-                candidateUrls.add(sp.boardUrl);
-              }
-            }
-          };
-
-          await runSlugProbeWave(phase1Probes);
+        if (canSlugProbe && !domHitBudgetCap) {
+          if (!ranPhase1SlugProbes) {
+            ranPhase1SlugProbes = true;
+            await runSlugProbeWave(phase1Probes);
+          }
           if (foundForDom.length === 0 && !domHitBudgetCap) {
             await runSlugProbeWave(phase2WorkdayProbes);
           }
@@ -6525,23 +6636,102 @@ export async function executeJobsCall(params: {
     '(site:jobs.lever.co OR site:myworkdayjobs.com OR site:jobs.smartrecruiters.com)',
     '(site:apply.workable.com OR site:jobs.gem.com OR site:ats.rippling.com)',
   ];
-  const coreTerms = [companyFilter ? `"${companyFilter}"` : '', query ? `"${query}"` : '', wantRemote ? 'remote' : '']
+  const cleanSearchQuery = query
+    .replace(/["()]+/g, ' ')
+    .replace(/\bsite:/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+  const cleanSearchCompany = companyFilter
+    .replace(/["()]+/g, ' ')
+    .replace(/\bsite:/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100);
+  const dehyphenatedQuery =
+    cleanSearchQuery.length <= 100 && cleanSearchQuery.includes('-')
+      ? cleanSearchQuery.replace(/-+/g, ' ').replace(/\s+/g, ' ').trim()
+      : '';
+  const searchQueryExpr = cleanSearchQuery
+    ? dehyphenatedQuery && dehyphenatedQuery.toLowerCase() !== cleanSearchQuery.toLowerCase()
+      ? `("${cleanSearchQuery}" OR "${dehyphenatedQuery}")`
+      : `"${cleanSearchQuery}"`
+    : '';
+  const coreTerms = [cleanSearchCompany ? `"${cleanSearchCompany}"` : '', searchQueryExpr, wantRemote ? 'remote' : '']
     .filter(Boolean)
     .join(' ');
   const scopedQueries = atsGroups.map((grp) => `${grp} ${coreTerms}`.trim());
   if (primaryCompanySlug) {
-    const nonCompanyTerms = [query ? `"${query}"` : '', wantRemote ? 'remote' : ''].filter(Boolean).join(' ');
+    const nonCompanyTerms = [searchQueryExpr, wantRemote ? 'remote' : ''].filter(Boolean).join(' ');
     scopedQueries.push(
       `(site:jobs.smartrecruiters.com/${primaryCompanySlug} OR site:${primaryCompanySlug}.wd5.myworkdayjobs.com OR site:${primaryCompanySlug}.wd1.myworkdayjobs.com) ${nonCompanyTerms}`.trim(),
     );
   }
+
+  // Pre-build allowed company/domain slug tokens BEFORE `ats_search` candidate capping so unrelated third-party ATS search hits
+  // (e.g. 10 `"no visa sponsorship"` or `"hosted on Vercel"` postings on other companies' boards!) never consume `searchCandidateCap`
+  // or starve `atsGroups[1..3]` (`myworkdayjobs.com` / `smartrecruiters.com`)!
+  const preWaveSegmentedTokens = new Set<string>();
+  for (const rawSrc of [companyFilter, ...domainsInput]) {
+    if (!rawSrc) continue;
+    const ws = normalizeDottedCorporateAbbreviations(rawSrc).toLowerCase().match(/[a-z0-9]+/g) ?? [];
+    if (ws.length >= 2 && ws.length <= 4) preWaveSegmentedTokens.add(ws.join('-'));
+    const low = rawSrc.trim().toLowerCase();
+    if (/^[a-z0-9_-]{2,128}$/.test(low) && (low.includes('-') || low.includes('_'))) {
+      preWaveSegmentedTokens.add(low.replace(/_/g, '-'));
+    }
+  }
+  const preWaveAllowedTokens = new Set<string>();
+  if (companyFilter) {
+    preWaveAllowedTokens.add(companyFilter);
+    for (const expanded of expandCompanyFilterTokens(companyFilter)) preWaveAllowedTokens.add(expanded);
+  }
+  for (const dom of domainsInput) {
+    preWaveAllowedTokens.add(dom);
+    for (const expanded of expandCompanyFilterTokens(dom)) preWaveAllowedTokens.add(expanded);
+  }
+  for (const db of discoveredBoards) {
+    if (db.boardStatus !== 'not_found' && db.boardStatus !== 'budget_exhausted' && db.slug) {
+      const rootSlug = (db.slug.split('/')[0] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+      if (rootSlug) preWaveAllowedTokens.add(rootSlug);
+    }
+  }
+  const confirmedDiscoveredBoardUrls = new Set(
+    discoveredBoards.filter((b) => b.boardUrl).map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase()),
+  );
+  const matchesScopedAtsCandidateUrl = (u: string): boolean => {
+    if (!hasCompanyOrDomainScope || preWaveAllowedTokens.size === 0) return true;
+    const cleanU = u.replace(/\/+$/, '').toLowerCase();
+    if (confirmedDiscoveredBoardUrls.has(cleanU)) return true;
+    const info = classifyFullBoardKey(u);
+    const srInfo = !info ? isSmartRecruitersBoardUrl(u) : null;
+    const srPostingSlug =
+      !info && !srInfo ? /^https:\/\/jobs\.smartrecruiters\.com\/([A-Za-z0-9_.-]+)\//i.exec(u)?.[1] : undefined;
+    const tenantSlug = (info?.slug.split('/')[0] ?? srInfo?.org ?? srPostingSlug ?? '').toLowerCase();
+    if (!tenantSlug) return true;
+    for (const tok of preWaveAllowedTokens) {
+      const normTok = tok.toLowerCase().replace(/[^a-z0-9]+/g, '');
+      if (
+        normTok &&
+        matchesAtsTenantSlugAgainstToken(tenantSlug, normTok, {
+          host: info?.platform === 'ashby' ? 'jobs.ashbyhq.com' : undefined,
+          jobCompany: companyFilter,
+          segmentedTokens: preWaveSegmentedTokens,
+          allowAshbySpaces: info?.platform === 'ashby',
+        })
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   // Never pass `timeRange` (`qdr:w`/`qdr:m`) on ATS `site:` queries — Google omits indexed publish dates on ATS SPA/board URLs
   // and returns 0 results for `postedWithinDays <= 30`; `maxAgeCutoffMs` filters accurately using authoritative ATS `postedAt`!
   if (coreTerms && (domainsInput.length === 0 || Boolean(companyFilter))) {
     const searchMaxResults = postedWithinDays !== undefined ? 15 : 10;
     const searchCandidateCap =
-      postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(35, limit * 2);
+      postedWithinDays !== undefined ? Math.min(40, Math.max(35, limit * 3)) : Math.min(40, Math.max(30, limit * 2));
     const searchResponses = await Promise.all(
       scopedQueries.map((sq) =>
         executeSearch({
@@ -6558,52 +6748,114 @@ export async function executeJobsCall(params: {
       for (const hit of webResults) {
         const u = typeof hit.url === 'string' ? hit.url.trim() : '';
         if (u.startsWith('https://') && candidateUrls.size < searchCandidateCap) {
-          candidateUrls.add(u);
-          addedSearchHits++;
+          let hitHost = '';
+          try {
+            hitHost = new URL(u).hostname.toLowerCase().replace(/\.+$/, '');
+          } catch {
+            hitHost = '';
+          }
+          if (hitHost && isKnownMultiTenantAtsHost(hitHost) && matchesScopedAtsCandidateUrl(u)) {
+            candidateUrls.add(u);
+            addedSearchHits++;
+          }
         }
       }
     }
     if (addedSearchHits > 0) sourcesUsed.add('ats_search');
   }
 
-  // Direct company board discovery when `company` is provided without `domains` (e.g. `company: "Visa"` -> `jobs.smartrecruiters.com/Visa`,
-  // `company: "Spotify"` -> `jobs.lever.co/spotify`, with `respectRobots: true` — NEVER `api.smartrecruiters.com`!)
-  // Skip blind 4-ATS 404 probes when `ats_search` ALREADY discovered a confirmed board/posting matching `companyFilter`!
-  if (companyFilter && domainsInput.length === 0) {
+  const companyWordsLower = companyFilter
+    ? normalizeDottedCorporateAbbreviations(companyFilter).toLowerCase().match(/[a-z0-9]+/g) ?? []
+    : [];
+  const multiWordHyphenSlug =
+    companyWordsLower.length >= 2 && companyWordsLower.length <= 4 && companyWordsLower.every((w) => w.length >= 2)
+      ? companyWordsLower.join('-')
+      : '';
+  const multiWordSpaceAshbySlug =
+    companyWordsLower.length >= 2 && companyWordsLower.length <= 4 && companyWordsLower.every((w) => w.length >= 2)
+      ? companyWordsLower.join(' ')
+      : '';
+
+  const buildDirectCompanyProbeUrls = (): string[] => {
+    if (!companyFilter || domainsInput.length > 0 || !primaryCompanySlug) return [];
+    const outUrls: string[] = [];
     const primarySlug = primaryCompanySlug;
-    if (primarySlug) {
-      const lowerSlug = primarySlug.toLowerCase();
-      const normSlug = lowerSlug.replace(/[^a-z0-9]+/g, '');
-      const alreadyHasConfirmedCompanyAts = [...candidateUrls].some((u) => {
-        const info = classifyFullBoardKey(u);
-        const root = (info?.slug.split('/')[0] ?? isSmartRecruitersBoardUrl(u)?.org ?? '').toLowerCase();
-        return Boolean(root && normSlug && matchesAtsTenantSlugAgainstToken(root, normSlug));
+    const lowerSlug = primarySlug.toLowerCase();
+    const rawTrimmedSlug = companyFilter.replace(/[^A-Za-z0-9_-]+/g, '');
+    const srDisplaySlug =
+      rawTrimmedSlug && rawTrimmedSlug.toLowerCase() === lowerSlug ? rawTrimmedSlug : primarySlug;
+    const existingBoardKeys = new Set(
+      [...candidateUrls]
+        .map((u) => classifyFullBoardKey(u))
+        .filter((x): x is NonNullable<typeof x> => Boolean(x?.isBoard))
+        .map((x) => x.key),
+    );
+    const hasSmartRecruitersBoard = [...candidateUrls].some((u) => {
+      const sr = isSmartRecruitersBoardUrl(u);
+      return Boolean(sr && sr.org.toLowerCase() === lowerSlug);
+    });
+    if (!hasSmartRecruitersBoard) {
+      outUrls.push(`https://jobs.smartrecruiters.com/${srDisplaySlug}`);
+    }
+    if (!existingBoardKeys.has(`greenhouse:${lowerSlug}`)) {
+      outUrls.push(`https://boards.greenhouse.io/${primarySlug}`);
+    }
+    if (!existingBoardKeys.has(`ashby:${lowerSlug}`)) {
+      outUrls.push(`https://jobs.ashbyhq.com/${primarySlug}`);
+    }
+    if (!existingBoardKeys.has(`lever:${lowerSlug}`)) {
+      outUrls.push(`https://jobs.lever.co/${primarySlug}`);
+    }
+    if (multiWordHyphenSlug && isValidAtsSlug(multiWordHyphenSlug)) {
+      if (!existingBoardKeys.has(`ashby:${multiWordHyphenSlug}`)) {
+        outUrls.push(`https://jobs.ashbyhq.com/${multiWordHyphenSlug}`);
+      }
+      if (!existingBoardKeys.has(`greenhouse:${multiWordHyphenSlug}`)) {
+        outUrls.push(`https://boards.greenhouse.io/${multiWordHyphenSlug}`);
+      }
+      if (!existingBoardKeys.has(`lever:${multiWordHyphenSlug}`)) {
+        outUrls.push(`https://jobs.lever.co/${multiWordHyphenSlug}`);
+      }
+    }
+    if (multiWordSpaceAshbySlug && isValidAshbySlug(multiWordSpaceAshbySlug)) {
+      const callerSpaceSlug = companyFilter.trim().replace(/\s+/g, ' ');
+      const titleSpaceSlug = companyWordsLower
+        .map((w) => (w === 'ai' || w === 'us' || w === 'uk' || w === 'hq' ? w.toUpperCase() : w[0]!.toUpperCase() + w.slice(1)))
+        .join(' ');
+      const candidateSpaceSlugs = [...new Set([callerSpaceSlug, titleSpaceSlug, multiWordSpaceAshbySlug])].filter((s) =>
+        isValidAshbySlug(s),
+      );
+      if (!existingBoardKeys.has(`ashby:${multiWordSpaceAshbySlug}`)) {
+        for (const spSlug of candidateSpaceSlugs.slice(0, 2)) {
+          outUrls.push(`https://jobs.ashbyhq.com/${encodeURIComponent(spSlug)}`);
+        }
+      }
+    }
+    return outUrls;
+  };
+
+  // Direct company board discovery when `company` is provided without `domains` (e.g. `company: "Visa"` -> `jobs.smartrecruiters.com/Visa`,
+  // `company: "Spotify"` -> `jobs.lever.co/spotify`, `company: "Hippocratic AI"` -> Ashby/Greenhouse/Lever, with `respectRobots: true` — NEVER `api.smartrecruiters.com`!)
+  // Skip blind 4-ATS 404 probes upfront ONLY when `ats_search` ALREADY discovered a confirmed company **board** (or promotable company ATS hit)!
+  if (companyFilter && domainsInput.length === 0 && primaryCompanySlug) {
+    const normSlug = primaryCompanySlug.toLowerCase().replace(/[^a-z0-9]+/g, '');
+    const alreadyHasConfirmedCompanyAts = [...candidateUrls].some((u) => {
+      const info = classifyFullBoardKey(u);
+      const srBoard = !info ? isSmartRecruitersBoardUrl(u) : null;
+      const srPostOrg =
+        !info && !srBoard ? /^https:\/\/jobs\.smartrecruiters\.com\/([A-Za-z0-9_.-]+)\//i.exec(u)?.[1] : undefined;
+      const root = (info?.slug.split('/')[0] ?? srBoard?.org ?? srPostOrg ?? '').toLowerCase();
+      if (!root || !normSlug) return false;
+      return matchesAtsTenantSlugAgainstToken(root, normSlug, {
+        host: info?.platform === 'ashby' ? 'jobs.ashbyhq.com' : undefined,
+        jobCompany: companyFilter,
+        segmentedTokens: preWaveSegmentedTokens,
+        allowAshbySpaces: info?.platform === 'ashby',
       });
-      if (!alreadyHasConfirmedCompanyAts) {
-        const rawTrimmedSlug = companyFilter.replace(/[^A-Za-z0-9_-]+/g, '');
-        const srDisplaySlug =
-          rawTrimmedSlug && rawTrimmedSlug.toLowerCase() === lowerSlug ? rawTrimmedSlug : primarySlug;
-        const existingBoardKeys = new Set(
-          [...candidateUrls]
-            .map((u) => classifyFullBoardKey(u))
-            .filter((x): x is NonNullable<typeof x> => Boolean(x?.isBoard))
-            .map((x) => x.key),
-        );
-        const hasSmartRecruitersForCompany = [...candidateUrls].some((u) =>
-          new RegExp(`^https://jobs\\.smartrecruiters\\.com/${lowerSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:/|$)`, 'i').test(u),
-        );
-        if (!hasSmartRecruitersForCompany) {
-          candidateUrls.add(`https://jobs.smartrecruiters.com/${srDisplaySlug}`);
-        }
-        if (!existingBoardKeys.has(`greenhouse:${lowerSlug}`)) {
-          candidateUrls.add(`https://boards.greenhouse.io/${primarySlug}`);
-        }
-        if (!existingBoardKeys.has(`ashby:${lowerSlug}`)) {
-          candidateUrls.add(`https://jobs.ashbyhq.com/${primarySlug}`);
-        }
-        if (!existingBoardKeys.has(`lever:${lowerSlug}`)) {
-          candidateUrls.add(`https://jobs.lever.co/${primarySlug}`);
-        }
+    });
+    if (!alreadyHasConfirmedCompanyAts) {
+      for (const probeU of buildDirectCompanyProbeUrls()) {
+        candidateUrls.add(probeU);
       }
     }
   }
@@ -6673,66 +6925,58 @@ export async function executeJobsCall(params: {
 
   // Deduplicate redundant single-posting fetches when the parent board (especially Ashby 1.22 MB `posting-api/job-board/<slug>`
   // and Rippling `ats/v1/board/<org>/jobs`) is also present or has >= 2 postings from the same company!
-  // Pre-build allowed company/domain slug tokens BEFORE Wave 1/Wave 2 so unrelated third-party ATS search hits
-  // (e.g. `jobs.ashbyhq.com/feathery` during `company: "allstate"`) are skipped BEFORE downloading their boards!
-  const preWaveAllowedTokens = new Set<string>();
-  if (companyFilter) {
-    preWaveAllowedTokens.add(companyFilter);
-    for (const expanded of expandCompanyFilterTokens(companyFilter)) preWaveAllowedTokens.add(expanded);
-  }
-  for (const dom of domainsInput) {
-    preWaveAllowedTokens.add(dom);
-    for (const expanded of expandCompanyFilterTokens(dom)) preWaveAllowedTokens.add(expanded);
-  }
-  for (const db of discoveredBoards) {
-    if (db.boardStatus !== 'not_found' && db.boardStatus !== 'budget_exhausted' && db.slug) {
-      const rootSlug = (db.slug.split('/')[0] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
-      if (rootSlug) preWaveAllowedTokens.add(rootSlug);
-    }
-  }
-  const confirmedDiscoveredBoardUrls = new Set(
-    discoveredBoards.filter((b) => b.boardUrl).map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase()),
-  );
-  const rawUrlList = [...candidateUrls].filter((u) => {
-    if (!hasCompanyOrDomainScope || preWaveAllowedTokens.size === 0) return true;
-    const cleanU = u.replace(/\/+$/, '').toLowerCase();
-    if (confirmedDiscoveredBoardUrls.has(cleanU)) return true;
-    const info = classifyFullBoardKey(u);
-    const srInfo = !info ? isSmartRecruitersBoardUrl(u) : null;
-    const srPostingSlug =
-      !info && !srInfo ? /^https:\/\/jobs\.smartrecruiters\.com\/([A-Za-z0-9_.-]+)\//i.exec(u)?.[1] : undefined;
-    const tenantSlug = (info?.slug.split('/')[0] ?? srInfo?.org ?? srPostingSlug ?? '').toLowerCase();
-    if (!tenantSlug) return true;
-    for (const tok of preWaveAllowedTokens) {
-      const normTok = tok.toLowerCase().replace(/[^a-z0-9]+/g, '');
-      if (normTok && matchesAtsTenantSlugAgainstToken(tenantSlug, normTok)) {
-        return true;
-      }
-    }
-    return false;
-  });
-  const postingCountByBoard = new Map<string, { count: number; boardUrl: string; hasBoard: boolean }>();
+  const rawUrlList = [...candidateUrls].filter((u) => matchesScopedAtsCandidateUrl(u));
+  const postingCountByBoard = new Map<string, { count: number; boardUrl: string; platform: string; slug: string; hasBoard: boolean }>();
+  const smartRecruitersPostingOrgs = new Set<string>();
   for (const u of rawUrlList) {
     const info = classifyFullBoardKey(u);
-    if (!info) continue;
-    const entry = postingCountByBoard.get(info.key) ?? { count: 0, boardUrl: info.boardUrl, hasBoard: false };
+    if (!info) {
+      const srPostMatch = /^https:\/\/jobs\.smartrecruiters\.com\/([A-Za-z0-9_.-]+)\//i.exec(u);
+      if (srPostMatch?.[1] && isValidAtsSlug(srPostMatch[1])) {
+        smartRecruitersPostingOrgs.add(srPostMatch[1]);
+      }
+      continue;
+    }
+    const entry = postingCountByBoard.get(info.key) ?? {
+      count: 0,
+      boardUrl: info.boardUrl,
+      platform: info.platform,
+      slug: info.slug,
+      hasBoard: false,
+    };
     if (info.isBoard) entry.hasBoard = true;
     else entry.count++;
     postingCountByBoard.set(info.key, entry);
   }
   const promotedBoardUrls: string[] = [];
   for (const [bKey, meta] of postingCountByBoard.entries()) {
-    const isWorkdayCompanyMatch =
-      bKey.startsWith('workday:') &&
+    if (failedProbeBoardKeys.has(bKey)) continue;
+    const isScopedCompanyBoardMatch =
       hasCompanyOrDomainScope &&
       meta.count >= 1 &&
-      (!primaryCompanySlug || bKey.startsWith(`workday:${primaryCompanySlug.toLowerCase()}:`));
+      (!bKey.startsWith('workday:') || !primaryCompanySlug || bKey.startsWith(`workday:${primaryCompanySlug.toLowerCase()}:`));
     if (
       !meta.hasBoard &&
-      (isWorkdayCompanyMatch ||
+      (isScopedCompanyBoardMatch ||
         (meta.count >= 2 && (bKey.startsWith('ashby:') || bKey.startsWith('rippling:') || bKey.startsWith('workday:'))))
     ) {
       promotedBoardUrls.push(meta.boardUrl);
+      if (/\s/.test(meta.slug)) {
+        for (const fb of buildCompactSlugFallbackBoards({ platform: meta.platform, slug: meta.slug, boardUrl: meta.boardUrl })) {
+          const fbKey = classifyFullBoardKey(fb.boardUrl)?.key ?? fb.boardUrl.replace(/\/+$/, '').toLowerCase();
+          if (!failedProbeBoardKeys.has(fbKey)) promotedBoardUrls.push(fb.boardUrl);
+        }
+      }
+    }
+  }
+  if (hasCompanyOrDomainScope) {
+    for (const srOrg of smartRecruitersPostingOrgs) {
+      const srBoardUrl = `https://jobs.smartrecruiters.com/${srOrg}`;
+      if (failedProbeBoardKeys.has(srBoardUrl.toLowerCase())) continue;
+      const hasSrBoardAlready = rawUrlList.some((u) => u.replace(/\/+$/, '').toLowerCase() === srBoardUrl.toLowerCase());
+      if (!hasSrBoardAlready) {
+        promotedBoardUrls.push(srBoardUrl);
+      }
     }
   }
   const boardWaveUrls = [
@@ -6748,6 +6992,17 @@ export async function executeJobsCall(params: {
     ...new Set(
       rawUrlList.filter((u) => {
         const info = classifyFullBoardKey(u);
+        if (info?.platform === 'greenhouse') {
+          try {
+            const parsedGh = new URL(u);
+            const ghParts = parsedGh.pathname.split('/').filter(Boolean);
+            if (ghParts.length === 1 && parsedGh.searchParams.get('error')?.toLowerCase() === 'true') {
+              return false;
+            }
+          } catch {
+            // ignore
+          }
+        }
         return !info?.isBoard && !isSmartRecruitersBoardUrl(u);
       }),
     ),
@@ -6759,7 +7014,7 @@ export async function executeJobsCall(params: {
 
   // Run board URLs in Wave 1 BEFORE single-posting URLs in Wave 2 so `fetchedCompleteBoards` is populated before any
   // single-posting Ashby/Greenhouse/Lever/Gem/Rippling URL is dispatched (preventing concurrent-slice board re-downloads!).
-  for (const waveUrls of [boardWaveUrls, postingWaveUrls]) {
+  const runCandidateWave = async (waveUrls: string[]): Promise<void> => {
     for (let i = 0; i < waveUrls.length; i += MAX_JOBS_CONCURRENT_SCRAPES) {
       const rawSlice = waveUrls.slice(i, i + MAX_JOBS_CONCURRENT_SCRAPES);
       const slice = rawSlice.filter((u) => {
@@ -7102,6 +7357,59 @@ export async function executeJobsCall(params: {
       });
       }
     }
+  };
+
+  for (const waveUrls of [boardWaveUrls, postingWaveUrls]) {
+    await runCandidateWave(waveUrls);
+  }
+
+  // Post-wave direct-board rescue: if `company` was requested without `domains` and `ats_search` hits were all dead/404/closed
+  // (leaving `collected.length === 0` and `fetchedCompleteBoards.size === 0`), probe the company's canonical ATS boards directly!
+  if (
+    companyFilter &&
+    domainsInput.length === 0 &&
+    collected.length === 0 &&
+    fetchedCompleteBoards.size === 0 &&
+    !budgetExhausted
+  ) {
+    const alreadyTriedLower = new Set(
+      [...boardWaveUrls, ...postingWaveUrls].map((u) => u.replace(/\/+$/, '').toLowerCase()),
+    );
+    const rescueUrls = buildDirectCompanyProbeUrls().filter((u) => {
+      const clean = u.replace(/\/+$/, '').toLowerCase();
+      if (alreadyTriedLower.has(clean)) return false;
+      candidateUrls.add(u);
+      return true;
+    });
+    if (rescueUrls.length > 0) {
+      await runCandidateWave(rescueUrls);
+    }
+    if (
+      collected.length === 0 &&
+      fetchedCompleteBoards.size === 0 &&
+      !budgetExhausted &&
+      primaryCompanySlug &&
+      isValidAtsSlug(primaryCompanySlug)
+    ) {
+      const wdTenant = primaryCompanySlug.toLowerCase();
+      const rawTrimmed = companyFilter.replace(/[^A-Za-z0-9_-]+/g, '');
+      const wdSite = rawTrimmed && rawTrimmed.toLowerCase() === wdTenant ? rawTrimmed : primaryCompanySlug;
+      const wdRescueUrls = [
+        `https://${wdTenant}.wd5.myworkdayjobs.com/${wdSite}`,
+        `https://${wdTenant}.wd1.myworkdayjobs.com/${wdSite}`,
+        `https://${wdTenant}.wd5.myworkdayjobs.com/External`,
+        `https://${wdTenant}.wd1.myworkdayjobs.com/External`,
+      ].filter((u) => {
+        const clean = u.replace(/\/+$/, '').toLowerCase();
+        if (alreadyTriedLower.has(clean)) return false;
+        alreadyTriedLower.add(clean);
+        candidateUrls.add(u);
+        return true;
+      });
+      if (wdRescueUrls.length > 0) {
+        await runCandidateWave(wdRescueUrls);
+      }
+    }
   }
 
   // Enrich top matching SmartRecruiters posting pages in bounded batches of 4 to populate schema.org/JobPosting JSON-LD (`datePosted`, `jobLocation`, `baseSalary`)
@@ -7166,13 +7474,25 @@ export async function executeJobsCall(params: {
     }
   }
   for (const db of discoveredBoards) {
-    if (db.boardStatus !== 'not_found' && db.boardStatus !== 'budget_exhausted' && db.slug) {
+    const isVerifiedFirstPartyLink =
+      Boolean(db.discoveredFrom) &&
+      !db.discoveredFrom.startsWith('slug-probe:') &&
+      !db.discoveredFrom.startsWith('search:');
+    if (isVerifiedFirstPartyLink && db.boardStatus !== 'not_found' && db.boardStatus !== 'budget_exhausted' && db.slug) {
       const rootSlug = (db.slug.split('/')[0] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
       if (rootSlug) allowedCompanyTokens.add(rootSlug);
     }
   }
   const allowedBoardPrefixes = discoveredBoards
-    .filter((b) => b.boardStatus !== 'not_found' && b.boardStatus !== 'budget_exhausted' && b.boardUrl)
+    .filter(
+      (b) =>
+        Boolean(b.discoveredFrom) &&
+        !b.discoveredFrom.startsWith('slug-probe:') &&
+        !b.discoveredFrom.startsWith('search:') &&
+        b.boardStatus !== 'not_found' &&
+        b.boardStatus !== 'budget_exhausted' &&
+        b.boardUrl,
+    )
     .map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase());
 
   const nowMs = Date.now();
@@ -7295,6 +7615,7 @@ export async function executeJobsCall(params: {
       sourcesUsed: [...sourcesUsed],
       count: finalJobs.length,
       candidatesChecked: candidateUrls.size,
+      postingsEvaluated: collected.length,
       jobs: finalJobs,
       ...(notes.length > 0 ? { notes } : {}),
     },

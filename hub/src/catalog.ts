@@ -22,6 +22,7 @@ import { isSafePublicHostname } from './overflow';
 import { getActiveRequestTracer, type OtelEnvConfig, type RequestTracer, type TraceContext } from './otel';
 import { ensureD1ColumnIfMissing } from './search-index';
 import { sanitizeStorageUserId, type OptionalStorageBindings } from './storage';
+import { classifyWafAndChallenge } from './waf';
 
 export type CatalogRunStatus = 'running' | 'cooling_down' | 'complete' | 'partial' | 'challenged';
 
@@ -1065,6 +1066,18 @@ function parseRetryAfterMs(resp: NormalizedHubPageResponse, defaultMs: number): 
   return defaultMs;
 }
 
+function hasAntiBotResponseHeader(headers: Record<string, string>): boolean {
+  return Boolean(
+    headers['cf-mitigated'] ||
+      headers['x-datadome'] ||
+      headers['x-dd-b'] ||
+      headers['x-kpsdk-ct'] ||
+      headers['x-px-blocked'] ||
+      headers['x-amzn-waf-action'] ||
+      headers['x-vercel-mitigated'],
+  );
+}
+
 function isChallengeResponse(resp: NormalizedHubPageResponse): boolean {
   const out = (resp.outcome ?? '').toLowerCase();
   if (out === 'challenge') return true;
@@ -1077,6 +1090,12 @@ function isChallengeResponse(resp: NormalizedHubPageResponse): boolean {
     (resp.headers['content-type'] ?? '').toLowerCase().includes('json') ||
     trimmedHead.startsWith('{') ||
     trimmedHead.startsWith('[');
+  if (!isJsonPayload && hasAntiBotResponseHeader(resp.headers)) {
+    return true;
+  }
+  if (!isJsonPayload && classifyWafAndChallenge({ status: resp.status, headers: resp.headers, rawBody: resp.body }) !== null) {
+    return true;
+  }
   if (
     (resp.status === 403 || resp.status === 503 || (resp.status === 200 && !isJsonPayload)) &&
     /cf-mitigated|_cf_chl_opt|challenge-platform|turnstile|verify you are human/i.test(bodyHead)
@@ -1084,6 +1103,28 @@ function isChallengeResponse(resp: NormalizedHubPageResponse): boolean {
     return true;
   }
   return false;
+}
+
+function isNonStorefrontHtmlFallback(resp: NormalizedHubPageResponse, platform: string): boolean {
+  if (isChallengeResponse(resp) || hasAntiBotResponseHeader(resp.headers)) return false;
+  const head = resp.body.slice(0, 65_536).trimStart();
+  if (!head || (!/^<!doctype\s+html\b/i.test(head) && !/^<html\b/i.test(head))) {
+    return false;
+  }
+  if (
+    /blocked|access\s+denied|forbidden|captcha|turnstile|cf-mitigated|just\s+a\s+moment|attention\s+required|_incapsula_resource|incapsula|awswafintegration|aws-waf-token|px-captcha|_pxappid|perimeterx|captcha-delivery\.com|datadome|kpsdk|\/ips\.js|sec-cpt|bazadebezolkohpepadr|verifying\s+your\s+browser|checking\s+your\s+browser|pardon\s+our\s+interruption|human\s+verification|bot\s+verification|security\s+check|enable\s+javascript|enable\s+js/i.test(
+      head,
+    )
+  ) {
+    return false;
+  }
+  if (platform === 'shopify' && /cdn\.shopify\.com|shopify\.theme|shopify-digital-wallet/i.test(head)) {
+    return false;
+  }
+  if (platform === 'woocommerce' && /woocommerce|wc-block|wp-content\/plugins\/woocommerce/i.test(head)) {
+    return false;
+  }
+  return true;
 }
 
 function isRobotsOrSignalBlocked(resp: NormalizedHubPageResponse): 'robots_disallowed' | 'robots_unreachable' | 'content_signal_disallowed' | null {
@@ -1747,6 +1788,8 @@ export async function executeCatalogCall(params: {
     let blockedInfo: BlockedSuggestion | undefined;
     let currentUrl: string | null = activeSpec.firstPage(originUrl, collection ? { collection } : undefined);
     let triedAutoFallbackToWc = rawPlatform !== 'auto' || activeSpec.platform === 'woocommerce';
+    let autoFallbackFromShopify = false;
+    let resolvedPlatformOut: string = activeSpec.platform;
 
     while (currentUrl && pagesRead < maxPages) {
       if (Date.now() >= syncDeadlineAt) {
@@ -1914,9 +1957,11 @@ export async function executeCatalogCall(params: {
         (pageResp.status === 404 || pageResp.status === 400 || pageResp.status === 405)
       ) {
         triedAutoFallbackToWc = true;
+        autoFallbackFromShopify = true;
         const wcAdapter = getCatalogAdapter('woocommerce');
         if (wcAdapter?.catalog) {
           activeSpec = wcAdapter.catalog;
+          resolvedPlatformOut = activeSpec.platform;
           resolvedPullTracer?.setAttribute('edgefetch.adapter_id', activeSpec.platform);
           effectivePauseMs = computeEffectivePauseMs(activeSpec);
           currentEntry.summary.platform = activeSpec.platform;
@@ -1927,11 +1972,23 @@ export async function executeCatalogCall(params: {
       }
 
       if (pageResp.status !== 200) {
+        if (
+          pagesRead === 0 &&
+          autoFallbackFromShopify &&
+          (pageResp.status === 404 || pageResp.status === 400 || pageResp.status === 405)
+        ) {
+          resolvedPlatformOut = 'unknown';
+          currentEntry.summary.platform = 'unknown';
+          resolvedPullTracer?.setAttribute('edgefetch.adapter_id', 'unknown');
+          stopReason = 'unsupported_storefront';
+          break;
+        }
         stopReason = `http_${pageResp.status || 'error'}`;
         break;
       }
 
-      // Parse page strictly; non-JSON body on a 200 catalog feed is a bot wall / interstitial -> `challenged`!
+      // Parse page strictly; non-JSON body on a 200 catalog feed is a bot wall / interstitial -> `challenged`
+      // UNLESS `auto` mode probed a plain non-storefront HTML SPA/site with zero WAF/challenge or platform signals!
       let parsedPage: { records: CatalogRecord[]; done: boolean };
       try {
         parsedPage = activeSpec.parsePage(pageResp.body, originUrl, {
@@ -1939,14 +1996,16 @@ export async function executeCatalogCall(params: {
           headers: pageResp.headers,
         });
       } catch {
-        // If `auto` mode got non-Shopify JSON on page 1 (e.g. a custom JSON object without `products`), try WooCommerce once if body was valid JSON; if HTML/non-JSON, halt as `challenged`!
         const trimmedBody = pageResp.body.trim();
         const looksLikeJson = trimmedBody.startsWith('{') || trimmedBody.startsWith('[');
-        if (pagesRead === 0 && !triedAutoFallbackToWc && looksLikeJson) {
+        const nonStorefrontHtml = isNonStorefrontHtmlFallback(pageResp, activeSpec.platform);
+        if (pagesRead === 0 && !triedAutoFallbackToWc && (looksLikeJson || nonStorefrontHtml)) {
           triedAutoFallbackToWc = true;
+          autoFallbackFromShopify = true;
           const wcAdapter = getCatalogAdapter('woocommerce');
           if (wcAdapter?.catalog) {
             activeSpec = wcAdapter.catalog;
+            resolvedPlatformOut = activeSpec.platform;
             resolvedPullTracer?.setAttribute('edgefetch.adapter_id', activeSpec.platform);
             effectivePauseMs = computeEffectivePauseMs(activeSpec);
             currentEntry.summary.platform = activeSpec.platform;
@@ -1954,6 +2013,14 @@ export async function executeCatalogCall(params: {
             currentUrl = activeSpec.firstPage(originUrl, collection ? { collection } : undefined);
             continue;
           }
+        }
+        if (pagesRead === 0 && autoFallbackFromShopify && nonStorefrontHtml) {
+          resolvedPlatformOut = 'unknown';
+          currentEntry.summary.platform = 'unknown';
+          resolvedPullTracer?.setAttribute('edgefetch.adapter_id', 'unknown');
+          finalStatus = 'partial';
+          stopReason = 'unsupported_storefront';
+          break;
         }
         finalStatus = 'challenged';
         stopReason = 'non_json_body';
@@ -2188,7 +2255,7 @@ export async function executeCatalogCall(params: {
       ...cleanBase,
       ok: finalStatus === 'complete' || callerCappedSuccess,
       status: finalStatus,
-      platform: activeSpec.platform,
+      platform: resolvedPlatformOut,
       products: finalRecords.length,
       variants: totalVariants,
       pages: pagesRead,

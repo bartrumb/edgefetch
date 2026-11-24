@@ -7,6 +7,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from 'cloud
 import { getActiveCallerAuthContext } from './oauth';
 import { cloudflareOverflowFetch, isSafePublicHostname } from './overflow';
 import { getActiveRequestTracer, sanitizeUrlForSpan, type RequestTracer, type TraceContext } from './otel';
+import { getRegistrableDomain, hasPrivateSharedHostingSuffix, isPublicOrPrivateSuffix } from './psl';
 import {
   asciiLower,
   compileSafeUserRegex,
@@ -488,8 +489,126 @@ export async function executeMapCall(params: {
     if (typeof r.id === 'string') byId.set(r.id, r);
   }
 
+  // If the requested seed URL itself followed a safe HTTPS redirect (e.g. `https://bun.sh/` -> `https://bun.com/`),
+  // accept URLs scoped to EITHER the requested `rootHost` OR the verified redirect destination host (excluding PSL public/private
+  // suffixes and shared multi-tenant/cloud-storage platforms so a redirecting shortener cannot widen scope across tenants!).
+  const SHARED_MULTI_TENANT_REDIRECT_HOSTS = [
+    'github.com',
+    'gitlab.com',
+    'bitbucket.org',
+    'linkedin.com',
+    'x.com',
+    'twitter.com',
+    'medium.com',
+    'substack.com',
+    'youtube.com',
+    'reddit.com',
+    'ashbyhq.com',
+    'greenhouse.io',
+    'lever.co',
+    'smartrecruiters.com',
+    'myworkdayjobs.com',
+    'myworkdaysite.com',
+    'workable.com',
+    'rippling.com',
+    's3.amazonaws.com',
+    'amazonaws.com',
+    'storage.googleapis.com',
+    'huggingface.co',
+    'docs.google.com',
+    'drive.google.com',
+    'notion.so',
+    'notion.site',
+    'dropbox.com',
+  ];
+  const isSharedMultiTenantHost = (h: string): boolean => {
+    const lh = h.toLowerCase().replace(/\.+$/, '');
+    return SHARED_MULTI_TENANT_REDIRECT_HOSTS.some((d) => lh === d || lh.endsWith(`.${d}`));
+  };
+  const homeItem = byId.get('home');
+  const redirectProbeItem = [homeItem, byId.get('sitemap'), byId.get('llms')].find(
+    (it) => it?.outcome === 'ok' && typeof it.finalUrl === 'string' && it.finalUrl.trim().length > 0,
+  );
+  let redirectedRootUrl: URL | null = null;
+  if (redirectProbeItem && typeof redirectProbeItem.finalUrl === 'string') {
+    const redirCheck = validatePublicHttpsUrl(redirectProbeItem.finalUrl, selfHost);
+    const destHost = redirCheck.ok ? redirCheck.url.hostname.toLowerCase().replace(/\.+$/, '') : '';
+    if (
+      redirCheck.ok &&
+      destHost &&
+      destHost !== rootHost.toLowerCase() &&
+      !isPublicOrPrivateSuffix(destHost) &&
+      !isSharedMultiTenantHost(destHost)
+    ) {
+      redirectedRootUrl =
+        redirectProbeItem === homeItem
+          ? redirCheck.url
+          : new URL(trimmedSubpath || '/', redirCheck.url.origin);
+    }
+  }
+  // Developer tools on `.sh`/`.io`/`.ai`/`.dev`/`.app` often rebrand canonical URLs in `/sitemap.xml` & `/llms.txt` to
+  // `<same-brand>.com` while continuing to serve `200 OK` on the original domain without a `301` (`https://bun.sh/` -> `https://bun.com/`).
+  // Allow parsing `<same-brand>.com` URLs ONLY from seed documents served directly by `rootHost` itself, without making cross-origin
+  // child-sitemap fetches or writing to `companionMdUrlCache`.
+  const rootRegistrable =
+    !hasPrivateSharedHostingSuffix(rootHost) && !isPublicOrPrivateSuffix(rootHost) && !isSharedMultiTenantHost(rootHost)
+      ? getRegistrableDomain(rootHost)
+      : null;
+  const rootSldCandidate =
+    rootRegistrable && !rootRegistrable.endsWith('.com') ? (rootRegistrable.split('.')[0] ?? '') : '';
+  const sameBrandComHost =
+    rootSldCandidate.length >= 3 &&
+    /^[a-z0-9-]+$/.test(rootSldCandidate) &&
+    !isPublicOrPrivateSuffix(`${rootSldCandidate}.com`) &&
+    !isSharedMultiTenantHost(`${rootSldCandidate}.com`)
+      ? `${rootSldCandidate}.com`
+      : null;
+  const matchesSameBrandComFromRoot = (
+    candidateHost: string,
+    sourceItemHost: string | undefined,
+    allowSubdomains: boolean,
+  ): boolean =>
+    Boolean(
+      sameBrandComHost &&
+        sourceItemHost &&
+        sourceItemHost.toLowerCase().replace(/\.+$/, '') === rootHost.toLowerCase().replace(/\.+$/, '') &&
+        matchesHostScope(candidateHost, sameBrandComHost, allowSubdomains),
+    );
+
+  const redirectedHostIsPrivateShared =
+    redirectedRootUrl !== null && hasPrivateSharedHostingSuffix(redirectedRootUrl.hostname);
+  const matchesSingleScopedHost = (
+    candidateHost: string,
+    scopeHost: string,
+    allowSubdomains: boolean,
+    exactOnly = false,
+  ): boolean =>
+    exactOnly
+      ? candidateHost.toLowerCase().replace(/\.+$/, '') === scopeHost.toLowerCase().replace(/\.+$/, '')
+      : matchesHostScope(candidateHost, scopeHost, allowSubdomains);
+  const effectiveHomeBaseUrl = redirectedRootUrl ? redirectedRootUrl.toString() : rootUrl.toString();
+  const matchesEffectiveHostScope = (candidateHost: string, allowSubdomains: boolean): boolean =>
+    matchesHostScope(candidateHost, rootHost, allowSubdomains) ||
+    (redirectedRootUrl !== null &&
+      matchesSingleScopedHost(
+        candidateHost,
+        redirectedRootUrl.hostname,
+        allowSubdomains,
+        redirectedHostIsPrivateShared,
+      ));
+  const resolveVerifiedSeedUrl = (item: Record<string, unknown> | undefined, fallbackUrlStr: string): URL => {
+    if (item && item.outcome === 'ok' && typeof item.finalUrl === 'string' && item.finalUrl.trim()) {
+      const chk = validatePublicHttpsUrl(item.finalUrl, selfHost);
+      if (chk.ok && matchesEffectiveHostScope(chk.url.hostname, true)) {
+        return chk.url;
+      }
+    }
+    return new URL(fallbackUrlStr);
+  };
+
   const sourcesReport: Array<{ source: string; url: string; status: number; outcome: string; urlsFound: number }> = [];
   const discovered = new Map<string, { url: string; title?: string; description?: string; source: string }>();
+  const verifiedCompanionMdKeys = new Set<string>();
   const dedupeKeyToCanonical = new Map<string, string>();
   const ghRepoPrefix =
     isGitHubRepoSubpath ? `/${subpathSegments[0]!.toLowerCase()}/${subpathSegments[1]!.toLowerCase()}` : '';
@@ -512,15 +631,35 @@ export async function executeMapCall(params: {
       }
     }
   };
-  const addUrl = (rawCandidate: string, src: string, title?: string, description?: string): boolean => {
+  const addUrl = (
+    rawCandidate: string,
+    src: string,
+    title?: string,
+    description?: string,
+    baseOriginOverride?: string,
+    sourceItemHost?: string,
+  ): string | null => {
     try {
-      const u = new URL(rawCandidate, origin);
-      if (u.protocol !== 'https:' || (u.port && u.port !== '443')) return false;
-      if (!matchesHostScope(u.hostname, rootHost, includeSubdomains)) return false;
+      const u = new URL(rawCandidate, baseOriginOverride ?? origin);
+      if (u.protocol !== 'https:' || (u.port && u.port !== '443')) return null;
+      const isSameBrandComTwin = matchesSameBrandComFromRoot(u.hostname, sourceItemHost, includeSubdomains);
+      if (!isSameBrandComTwin && !matchesEffectiveHostScope(u.hostname, includeSubdomains)) return null;
+      if (
+        !isSameBrandComTwin &&
+        sourceItemHost &&
+        !matchesSingleScopedHost(
+          u.hostname,
+          sourceItemHost,
+          includeSubdomains,
+          hasPrivateSharedHostingSuffix(sourceItemHost),
+        )
+      ) {
+        return null;
+      }
       if (ghRepoPrefix && u.hostname.toLowerCase() === 'github.com') {
         const lp = u.pathname.toLowerCase();
         if (lp !== ghRepoPrefix && !lp.startsWith(`${ghRepoPrefix}/`)) {
-          return false;
+          return null;
         }
       }
       u.hash = '';
@@ -534,6 +673,18 @@ export async function executeMapCall(params: {
         ? `${u.origin}${u.pathname.length > 1 ? u.pathname.replace(/\/+$/, '') : u.pathname}${u.search}`
         : clean;
       const canonicalKey = dedupeKeyToCanonical.get(simKey) ?? clean;
+      if (
+        sourceItemHost &&
+        canonicalKey.toLowerCase().endsWith('.md') &&
+        matchesSingleScopedHost(
+          u.hostname,
+          sourceItemHost,
+          false,
+          hasPrivateSharedHostingSuffix(sourceItemHost),
+        )
+      ) {
+        verifiedCompanionMdKeys.add(canonicalKey);
+      }
       const existing = discovered.get(canonicalKey);
       const cleanDesc = description ? decodeHtmlEntities(description).trim() : '';
       if (!existing) {
@@ -544,7 +695,7 @@ export async function executeMapCall(params: {
           ...(cleanDesc ? { description: cleanDesc } : {}),
           source: src,
         });
-        return true;
+        return clean;
       }
       const isCuratedLlms = src === 'llms.txt' || src === 'subpath-llms.txt';
       if ((!existing.title || isCuratedLlms) && title) {
@@ -556,27 +707,30 @@ export async function executeMapCall(params: {
       if (isCuratedLlms && existing.source !== 'llms.txt' && existing.source !== 'subpath-llms.txt') {
         existing.source = src;
       }
-      return false;
+      return canonicalKey;
     } catch {
-      return false;
+      return null;
     }
   };
   if (!sitemapOnly) {
-    addUrl(rootUrl.toString(), 'seed');
+    const seedHost = redirectedRootUrl ? redirectedRootUrl.hostname : rootHost;
+    addUrl(effectiveHomeBaseUrl, 'seed', undefined, undefined, effectiveHomeBaseUrl, seedHost);
   }
 
-  const homeItem = byId.get('home');
   if (homeItem) {
-    let found = 0;
+    const homeSeen = new Set<string>();
     if (homeItem.outcome === 'ok' && typeof homeItem.body === 'string') {
-      const anchorTitles = extractAnchorTitlesFromHtml(homeItem.body, rootUrl.toString());
-      const ext = extractHtmlDocument(homeItem.body, { baseUrl: rootUrl.toString(), onlyMainContent: false });
+      const verifiedHomeUrl = resolveVerifiedSeedUrl(homeItem, rootUrl.toString());
+      const homeBaseStr = verifiedHomeUrl.toString();
+      const anchorTitles = extractAnchorTitlesFromHtml(homeItem.body, homeBaseStr);
+      const ext = extractHtmlDocument(homeItem.body, { baseUrl: homeBaseStr, onlyMainContent: false });
       const homeLinks =
         ext.links.length > 0
           ? ext.links
-          : extractMarkdownLinksAndImages(homeItem.body, rootUrl.toString(), false).links;
+          : extractMarkdownLinksAndImages(homeItem.body, homeBaseStr, false).links;
       for (const l of homeLinks) {
-        if (addUrl(l, 'homepage', anchorTitles.get(l))) found++;
+        const key = addUrl(l, 'homepage', anchorTitles.get(l), undefined, homeBaseStr, verifiedHomeUrl.hostname);
+        if (key) homeSeen.add(key);
       }
     }
     sourcesReport.push({
@@ -584,7 +738,7 @@ export async function executeMapCall(params: {
       url: rootUrl.toString(),
       status: typeof homeItem.status === 'number' ? homeItem.status : 0,
       outcome: String(homeItem.outcome ?? 'unknown'),
-      urlsFound: found,
+      urlsFound: homeSeen.size,
     });
   }
 
@@ -594,13 +748,16 @@ export async function executeMapCall(params: {
   ] as const) {
     const llmsItem = byId.get(id);
     if (!llmsItem) continue;
-    let found = 0;
+    const llmsSeen = new Set<string>();
     if (llmsItem.outcome === 'ok' && typeof llmsItem.body === 'string') {
-      const llmsDoc = parseLlmsTxt(llmsItem.body, llmsTargetUrl);
+      const verifiedLlmsUrl = resolveVerifiedSeedUrl(llmsItem, llmsTargetUrl);
+      const effectiveLlmsUrl = verifiedLlmsUrl.toString();
+      const llmsDoc = parseLlmsTxt(llmsItem.body, effectiveLlmsUrl, { recordCompanionCache: false });
       if (llmsDoc) {
         for (const l of llmsDoc.links) {
           const noteSummary = [l.section, l.notes].filter(Boolean).join(' — ');
-          if (addUrl(l.url, srcLabel, l.title, noteSummary || undefined)) found++;
+          const key = addUrl(l.url, srcLabel, l.title, noteSummary || undefined, effectiveLlmsUrl, verifiedLlmsUrl.hostname);
+          if (key) llmsSeen.add(key);
         }
       }
     }
@@ -609,7 +766,7 @@ export async function executeMapCall(params: {
       url: llmsTargetUrl,
       status: typeof llmsItem.status === 'number' ? llmsItem.status : 0,
       outcome: String(llmsItem.outcome ?? 'unknown'),
-      urlsFound: found,
+      urlsFound: llmsSeen.size,
     });
   }
 
@@ -619,9 +776,36 @@ export async function executeMapCall(params: {
     if (robotsItem) {
       let sitemapsFound = 0;
       if (robotsItem.outcome === 'ok' && typeof robotsItem.body === 'string') {
-        for (const sm of extractRobotsSitemaps(robotsItem.body, origin)) {
+        const verifiedRobotsUrl = resolveVerifiedSeedUrl(robotsItem, `${origin}/robots.txt`);
+        for (const sm of extractRobotsSitemaps(robotsItem.body, verifiedRobotsUrl.origin)) {
+          let isSameBrandRobotsSm = false;
+          try {
+            const smHost = new URL(sm).hostname;
+            isSameBrandRobotsSm = matchesSameBrandComFromRoot(smHost, verifiedRobotsUrl.hostname, true);
+            if (
+              !isSameBrandRobotsSm &&
+              !matchesSingleScopedHost(
+                smHost,
+                verifiedRobotsUrl.hostname,
+                true,
+                hasPrivateSharedHostingSuffix(verifiedRobotsUrl.hostname),
+              )
+            ) {
+              continue;
+            }
+          } catch {
+            continue;
+          }
           sitemapsFound++;
-          if (sm !== `${origin}/sitemap.xml` && sm !== `${origin}/sitemap-index.xml`) childSitemaps.add(sm);
+          if (
+            !isSameBrandRobotsSm &&
+            sm !== `${origin}/sitemap.xml` &&
+            sm !== `${origin}/sitemap-index.xml` &&
+            sm !== `${verifiedRobotsUrl.origin}/sitemap.xml` &&
+            sm !== `${verifiedRobotsUrl.origin}/sitemap-index.xml`
+          ) {
+            childSitemaps.add(sm);
+          }
         }
       }
       sourcesReport.push({
@@ -635,16 +819,17 @@ export async function executeMapCall(params: {
 
     if (isWikiRootHost) {
       if (cachedWikiSitemapUrls) {
-        let found = 0;
+        const wikiCacheSeen = new Set<string>();
         for (const loc of cachedWikiSitemapUrls) {
-          if (addUrl(loc, 'sitemap')) found++;
+          const key = addUrl(loc, 'sitemap', undefined, undefined, origin, rootHost);
+          if (key) wikiCacheSeen.add(key);
         }
         sourcesReport.push({
           source: 'wikipedia-sitemap-cache',
           url: wikiAllowedSitemapUrl,
           status: 200,
           outcome: 'ok',
-          urlsFound: found,
+          urlsFound: wikiCacheSeen.size,
         });
       } else {
         const wikiSmItem = byId.get('wiki-sitemap');
@@ -660,9 +845,12 @@ export async function executeMapCall(params: {
               }
             } else {
               setCachedWikipediaSitemapUrls(rootHost, parsedSm.locs);
+              const wikiSeen = new Set<string>();
               for (const loc of parsedSm.locs) {
-                if (addUrl(loc, 'sitemap')) found++;
+                const key = addUrl(loc, 'sitemap', undefined, undefined, origin, rootHost);
+                if (key) wikiSeen.add(key);
               }
+              found = wikiSeen.size;
             }
           }
           sourcesReport.push({
@@ -684,17 +872,36 @@ export async function executeMapCall(params: {
       if (!smItem) continue;
       let found = 0;
       if (smItem.outcome === 'ok' && typeof smItem.body === 'string') {
-        const xml = await decodeXmlOrGzipBody(smItem.body, smItem.bodyEncoding as string | undefined, smUrl);
+        const verifiedSmUrl = resolveVerifiedSeedUrl(smItem, smUrl);
+        const xml = await decodeXmlOrGzipBody(smItem.body, smItem.bodyEncoding as string | undefined, verifiedSmUrl.toString());
         const parsedSm = parseSitemapXml(xml);
         if (parsedSm.isIndex) {
           for (const loc of parsedSm.locs) {
-            childSitemaps.add(loc);
+            try {
+              const locHost = new URL(loc, verifiedSmUrl.origin).hostname;
+              if (
+                !matchesSingleScopedHost(
+                  locHost,
+                  verifiedSmUrl.hostname,
+                  true,
+                  hasPrivateSharedHostingSuffix(verifiedSmUrl.hostname),
+                )
+              ) {
+                continue;
+              }
+            } catch {
+              continue;
+            }
+            childSitemaps.add(new URL(loc, verifiedSmUrl.origin).toString());
             found++;
           }
         } else {
+          const smSeen = new Set<string>();
           for (const loc of parsedSm.locs) {
-            if (addUrl(loc, 'sitemap')) found++;
+            const key = addUrl(loc, 'sitemap', undefined, undefined, verifiedSmUrl.origin, verifiedSmUrl.hostname);
+            if (key) smSeen.add(key);
           }
+          found = smSeen.size;
         }
       }
       sourcesReport.push({
@@ -742,7 +949,7 @@ export async function executeMapCall(params: {
     const toFetchSitemaps = [...childSitemaps]
       .filter((u) => {
         try {
-          return matchesHostScope(new URL(u).hostname, rootHost, true);
+          return matchesEffectiveHostScope(new URL(u).hostname, true);
         } catch {
           return false;
         }
@@ -786,14 +993,25 @@ export async function executeMapCall(params: {
         for (const sr of subParsed.results ?? []) {
           const srUrl = typeof sr.url === 'string' ? sr.url : '';
           let found = 0;
-          if (sr.outcome === 'ok' && typeof sr.body === 'string') {
-            const xml = await decodeXmlOrGzipBody(sr.body, sr.bodyEncoding as string | undefined, srUrl);
+          if (sr.outcome === 'ok' && typeof sr.body === 'string' && srUrl) {
+            const verifiedChildSmUrl = resolveVerifiedSeedUrl(sr, srUrl);
+            const xml = await decodeXmlOrGzipBody(sr.body, sr.bodyEncoding as string | undefined, verifiedChildSmUrl.toString());
             const p = parseSitemapXml(xml);
             if (!p.isIndex) {
+              const csmSeen = new Set<string>();
               for (const loc of p.locs) {
                 if (isWikiRootHost && wikiCollectedChildLocs.length < 5_000) wikiCollectedChildLocs.push(loc);
-                if (addUrl(loc, 'sitemap')) found++;
+                const key = addUrl(
+                  loc,
+                  'sitemap',
+                  undefined,
+                  undefined,
+                  verifiedChildSmUrl.origin,
+                  verifiedChildSmUrl.hostname,
+                );
+                if (key) csmSeen.add(key);
               }
+              found = csmSeen.size;
             }
           }
           if (srUrl) {
@@ -818,7 +1036,16 @@ export async function executeMapCall(params: {
   const wantsExplicitMd = /\.md\b/i.test(searchFilter);
   for (const [key, entry] of [...discovered.entries()]) {
     if (!key.toLowerCase().endsWith('.md')) continue;
-    recordCompanionMdUrl(key);
+    // Only cache companion `.md` URLs in the shared isolate cache when discovered from a verified same-host response
+    // matching `rootHost` (preventing cross-origin redirect cache poisoning!).
+    try {
+      const mdHost = new URL(key).hostname;
+      if (verifiedCompanionMdKeys.has(key) && matchesHostScope(mdHost, rootHost, includeSubdomains)) {
+        recordCompanionMdUrl(key);
+      }
+    } catch {
+      // ignore invalid URL
+    }
     const candidateTwins: string[] = [];
     if (/\/index\.md$/i.test(key)) {
       const dirWithSlash = key.slice(0, -'index.md'.length);
@@ -846,10 +1073,27 @@ export async function executeMapCall(params: {
 
   const includeOutsidePath = Boolean((payload as { includeOutsidePath?: unknown }).includeOutsidePath);
   const subpathPrefix = trimmedSubpath ? `${origin}${trimmedSubpath}`.toLowerCase() : '';
+  const redirectedTrimmedSubpath =
+    redirectedRootUrl && redirectedRootUrl.pathname !== '/'
+      ? redirectedRootUrl.pathname.replace(/\/+$/, '')
+      : trimmedSubpath;
+  const redirectedSubpathPrefix =
+    redirectedRootUrl && redirectedTrimmedSubpath
+      ? `${redirectedRootUrl.origin}${redirectedTrimmedSubpath}`.toLowerCase()
+      : '';
+  const sameBrandComSubpathPrefix =
+    sameBrandComHost && trimmedSubpath ? `https://${sameBrandComHost}${trimmedSubpath}`.toLowerCase() : '';
   const isUnderSubpath = (urlStr: string): boolean => {
     if (!subpathPrefix) return true;
     const lower = urlStr.toLowerCase();
-    return lower === subpathPrefix || lower.startsWith(`${subpathPrefix}/`);
+    if (lower === subpathPrefix || lower.startsWith(`${subpathPrefix}/`)) return true;
+    if (redirectedSubpathPrefix && (lower === redirectedSubpathPrefix || lower.startsWith(`${redirectedSubpathPrefix}/`))) {
+      return true;
+    }
+    if (sameBrandComSubpathPrefix && (lower === sameBrandComSubpathPrefix || lower.startsWith(`${sameBrandComSubpathPrefix}/`))) {
+      return true;
+    }
+    return false;
   };
 
   // Tokenize URL paths and page titles on `/ - _ .` and camelCase boundaries so `search=voice` matches `voice` / `voice-agent`

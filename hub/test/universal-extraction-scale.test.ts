@@ -12,9 +12,12 @@ import { extractUniversalSchemaOrg, inspectRawSchemaOrgJsonLdLinear } from '../s
 import { hasRawOrEncodedUnicodeTagLinear } from '../src/extractors/utils';
 import { queryHostGapRadar } from '../src/gap-radar';
 import hubWorker from '../src/index';
-import { createMemoryOAuthStore } from '../src/oauth';
+import { executeCatalogCall, resetCatalogStateForTests } from '../src/catalog';
+import { executeJobsCall, resetJobsCacheForTests, resolveAtsPreFetchSpec } from '../src/jobs';
+import { authorizeMcpRequest, createMemoryOAuthStore, sha256Base64Url } from '../src/oauth';
 import { executeScrapeCall, extractHtmlDocument, SCRAPE_PIPELINE_VERSION } from '../src/scrape';
 import { executeExtractCall } from '../src/search-index';
+import { handleAgentArtifactUpload, hydrateReplyBodiesFromR2, resetRecentArtifactUploadsForTests } from '../src/storage';
 import {
   analyzeHtmlForManifestProposal,
   isAllowedBySimpleRobots,
@@ -1177,4 +1180,1033 @@ test('Security Audit Regressions (HIGH-1..HIGH-4, MEDIUM-1..MEDIUM-3, LOW-1..LOW
     tagElapsed < 50,
     `ROUND3-HIGH-1 regression: hasRawOrEncodedUnicodeTagLinear took ${tagElapsed.toFixed(2)}ms on 2M backslashes + 2M &amp; chars (expected < 50ms)`,
   );
+});
+
+test('Live Fleet Trace Audit Fixes (L1–L6): preferLlmsMarkdown, docs button chrome, nested anchor/em, Greenhouse metadata locs, fast SPA domain jobs, non-storefront catalog, and OAuth/R2 fast paths', async () => {
+  resetJobsCacheForTests();
+  resetCatalogStateForTests();
+  resetRecentArtifactUploadsForTests();
+
+  // [L1 + L6] `preferOriginMarkdown: false` passes `preferLlmsMarkdown: false` to Go, forces `llms.usedCompanionMd: false`,
+  // strips docs LLM/Menu `<button>` chrome while preserving FAQ accordion `<button>`, preserves `<a href>` inside `<em>`/`<strong>`,
+  // and strips `<em>` highlight tags inside bare-URL link labels!
+  let capturedGoReq: Record<string, unknown> | undefined;
+  const docsHtml = `<!doctype html><html><body><main>
+    <button type="button">Menu</button>
+    <div><button>Copy for LLM</button><button>View Markdown</button><button>Ask AI about this page</button></div>
+    <h1>App Router Documentation</h1>
+    <p>Learn how to build modern applications with React Server Components and streaming layouts across edge and node runtimes.</p>
+    <h3><button aria-expanded="false">How do nested layouts preserve state?</button></h3>
+    <p><em>Props to <a href="https://profiles.wordpress.org/audrasjb/">@audrasjb</a> and <strong><a href="https://profiles.wordpress.org/r1k0/">@r1k0</a></strong> for review.</em></p>
+    <p>Repo: <a href="https://github.com/golang/go">(https://github.com/<em>golang</em>/go)</a></p>
+  </main></body></html>`;
+
+  const l1Res = await executeScrapeCall({
+    payload: {
+      url: 'https://nextjs.example.com/docs',
+      preferOriginMarkdown: false,
+      renderMode: 'off',
+    },
+    env: {},
+    executeHubFetch: async (_t, bodyStr) => {
+      const parsed = JSON.parse(bodyStr) as { requests: Array<Record<string, unknown>> };
+      capturedGoReq = parsed.requests[0];
+      return {
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'scrape-1',
+              url: 'https://nextjs.example.com/docs',
+              finalUrl: 'https://nextjs.example.com/docs',
+              status: 200,
+              outcome: 'ok',
+              contentType: 'text/html; charset=utf-8',
+              body: docsHtml,
+              markdown: '# Stale Companion Markdown That Must Not Be Used',
+              llms: {
+                found: true,
+                llmsTxtUrl: 'https://nextjs.example.com/llms.txt',
+                companionMdUrl: 'https://nextjs.example.com/docs.md',
+                usedCompanionMd: true,
+              },
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(l1Res.status, 200);
+  assert.equal(capturedGoReq?.preferLlmsMarkdown, false, 'L1: preferOriginMarkdown: false must send preferLlmsMarkdown: false to Go worker');
+  assert.equal(
+    (l1Res.body.llms as { usedCompanionMd?: boolean } | undefined)?.usedCompanionMd,
+    false,
+    'L1: llms.usedCompanionMd must be false when live HTML was requested instead of companion .md',
+  );
+  const l1Md = String(l1Res.body.markdown ?? '');
+  assert.ok(!l1Md.includes('Copy for LLM') && !l1Md.includes('Ask AI about this page') && !/^Menu\b/m.test(l1Md));
+  assert.ok(l1Md.includes('How do nested layouts preserve state?'), 'FAQ accordion <button> heading must remain intact');
+  assert.ok(
+    l1Md.includes('[@audrasjb](https://profiles.wordpress.org/audrasjb/)'),
+    `Expected <a href> inside <em> preserved with no space after @, got: ${l1Md}`,
+  );
+  assert.ok(
+    l1Md.includes('[(https://github.com/golang/go)](https://github.com/golang/go)'),
+    `Expected <em> highlight inside bare-URL anchor label stripped cleanly, got: ${l1Md}`,
+  );
+
+  // [L2] Greenhouse `offices` + `metadata` location enrichment, fast `/careers` 200 SPA -> `phase1Probes` (skipping `/jobs` & `/about/careers`), and `postingsEvaluated`
+  const ghSpec = resolveAtsPreFetchSpec('https://boards.greenhouse.io/cloudflare')!;
+  const ghDistributedPayload = JSON.stringify({
+    meta: { total: 3 },
+    jobs: [
+      {
+        id: 801,
+        title: 'Systems Engineer - Edge Runtime',
+        absolute_url: 'https://boards.greenhouse.io/cloudflare/jobs/801',
+        location: { name: 'Distributed' },
+        offices: [{ name: 'Austin, TX' }],
+        metadata: [{ name: 'Job Posting Location', value: ['United States', 'Remote - US'] }],
+        updated_at: new Date().toISOString(),
+        content: '&lt;p&gt;Build high-throughput Rust and Go edge services.&lt;/p&gt;',
+      },
+      {
+        id: 802,
+        title: 'Account Executive',
+        absolute_url: 'https://boards.greenhouse.io/cloudflare/jobs/802',
+        location: { name: 'Distributed' },
+        metadata: [{ name: 'Country', value: 'Spain' }],
+        updated_at: new Date().toISOString(),
+        content: '&lt;p&gt;Enterprise sales.&lt;/p&gt;',
+      },
+    ],
+  });
+
+  const probedSpaCareerUrls: string[] = [];
+  const spaJobsOut = await executeJobsCall({
+    payload: {
+      domains: ['cloudflare.com'],
+      query: 'Systems Engineer',
+      remote: true,
+      locations: ['US'],
+    },
+    env: {},
+    executeSearch: async () => ({ status: 200, body: { results: [] } }),
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      probedSpaCareerUrls.push(u);
+      if (u === 'https://cloudflare.com/careers') {
+        assert.equal(args.ephemeral, true);
+        // Custom SPA `/careers` returns 200 OK with zero inline ATS links
+        return { status: 200, body: { ok: true, rawHtml: '<html><body><div id="app">Careers Portal</div></body></html>', links: [] } };
+      }
+      if (u === 'https://boards.greenhouse.io/cloudflare') {
+        const fmt = ghSpec.format(ghDistributedPayload, u, htmlFragToMd)!;
+        return { status: 200, body: { ok: true, extractorId: ghSpec.id, ...fmt } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(spaJobsOut.status, 200);
+  assert.ok(
+    !probedSpaCareerUrls.includes('https://cloudflare.com/jobs') &&
+      !probedSpaCareerUrls.includes('https://cloudflare.com/about/careers'),
+    `L2: 200 OK /careers SPA matching phase1Probes must skip /jobs & /about/careers same-host sleeps; probed: ${probedSpaCareerUrls.join(', ')}`,
+  );
+  assert.equal(spaJobsOut.body.candidatesChecked, 1);
+  assert.equal(spaJobsOut.body.postingsEvaluated, 2);
+  assert.equal(spaJobsOut.body.count, 1);
+  const matchedGhJob = (spaJobsOut.body.jobs as Array<{ locations: string[] }>)[0]!;
+  assert.deepEqual(matchedGhJob.locations, ['Distributed', 'Austin, TX', 'United States', 'Remote - US']);
+
+  // [L4] `catalog` (`platform: "auto"`) on a non-storefront SPA (`shop.polymer-project.org` style: `/products.json` 404 + `/wp-json/...` 200 SPA HTML)
+  // returns `platform: "unknown", status: "partial", reason: "unsupported_storefront"` instead of false `platform: "woocommerce", status: "challenged"`!
+  const polymerCatalog = await executeCatalogCall({
+    payload: { url: 'https://shop-spa.example.com/', maxPages: 1, fields: 'lean' },
+    env: {},
+    sleepFn: async () => undefined,
+    executeHubFetch: async ({ url }) => {
+      if (url.includes('/products.json')) {
+        return { status: 404, outcome: 'ok', headers: { 'content-type': 'text/html' }, body: '<!doctype html><html><body>Not Found</body></html>' };
+      }
+      return {
+        status: 200,
+        outcome: 'ok',
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+        body: '<!doctype html><html><head><title>SHOP</title></head><body><shop-app unresolved>SHOP</shop-app></body></html>',
+      };
+    },
+  });
+  assert.equal(polymerCatalog.status, 200);
+  assert.equal(polymerCatalog.body.ok, false);
+  assert.equal(polymerCatalog.body.platform, 'unknown');
+  assert.equal(polymerCatalog.body.status, 'partial');
+  assert.equal(polymerCatalog.body.reason, 'unsupported_storefront');
+
+  // [L3a] Batched `resolveMcpAccessToken` resolves token + founder check + live user in 1 RPC instead of 3
+  const baseStore = createMemoryOAuthStore();
+  await baseStore.upsertUser!({
+    userId: 'gh_4242',
+    githubId: '4242',
+    githubLogin: 'alice',
+    role: 'member',
+    admittedVia: 'allowlist_id',
+    createdAt: Date.now(),
+    lastLoginAt: Date.now(),
+  });
+  const rawAccessTok = 'ef_at_live_trace_single_rpc_token_0123456789';
+  const accessHash = await sha256Base64Url(rawAccessTok);
+  await baseStore.putTokenPair({
+    grantId: 'grant_l3',
+    accessHash,
+    refreshHash: await sha256Base64Url('ef_rt_live_trace_single_rpc_token_0123456789'),
+    clientId: 'claude-mcp',
+    clientName: 'Claude',
+    scopes: ['crawl:read', 'crawl:fetch'],
+    resource: 'https://hub.example.com/mcp',
+    userId: 'gh_4242',
+    userRole: 'member',
+    createdAt: Date.now(),
+    accessExpiresAt: Date.now() + 60_000,
+    refreshExpiresAt: Date.now() + 3600_000,
+  });
+  let rpcCount = 0;
+  const countingStore = {
+    ...baseStore,
+    getAccessToken: async () => {
+      rpcCount += 10; // must NOT be called when resolveMcpAccessToken is present
+      return null;
+    },
+    resolveMcpAccessToken: async ({ tokenHash, now }: { tokenHash: string; now: number }) => {
+      rpcCount += 1;
+      const token = await baseStore.getAccessToken(tokenHash, now);
+      const user = token?.userId ? ((await baseStore.getUser!(token.userId)) ?? null) : null;
+      return { token, user };
+    },
+  };
+  const authRes = await authorizeMcpRequest({
+    request: new Request('https://hub.example.com/mcp', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${rawAccessTok}` },
+    }),
+    origin: 'https://hub.example.com',
+    store: countingStore,
+  });
+  assert.equal(authRes.ok, true);
+  assert.equal(rpcCount, 1, 'L3a: authorizeMcpRequest must use single-RPC resolveMcpAccessToken when available');
+
+  // [L3b] `handleAgentArtifactUpload` primes verified gunzipped hydration cache so immediate `hydrateReplyBodiesFromR2` makes 0 `bucket.get` calls!
+  const rawHtmlBytes = new TextEncoder().encode('<!doctype html><html><body><main><h1>Zero R2 Get Hydration</h1></main></body></html>');
+  const contentShaBuf = await crypto.subtle.digest('SHA-256', rawHtmlBytes);
+  const contentSha = Array.from(new Uint8Array(contentShaBuf), (b) => b.toString(16).padStart(2, '0')).join('');
+  const gzStream = new Blob([rawHtmlBytes]).stream().pipeThrough(new CompressionStream('gzip') as unknown as TransformStream<Uint8Array, Uint8Array>);
+  const gzBytes = new Uint8Array(await new Response(gzStream).arrayBuffer());
+  const blobShaBuf = await crypto.subtle.digest('SHA-256', gzBytes);
+  const blobSha = Array.from(new Uint8Array(blobShaBuf), (b) => b.toString(16).padStart(2, '0')).join('');
+
+  let r2GetCalls = 0;
+  const storedObjects = new Map<string, Uint8Array>();
+  const mockR2 = {
+    list: async () => ({ objects: [] }),
+    head: async () => null,
+    put: async (k: string, v: Uint8Array) => {
+      storedObjects.set(k, v);
+      return { key: k };
+    },
+    get: async (k: string) => {
+      r2GetCalls++;
+      const found = storedObjects.get(k);
+      if (!found) return null;
+      return { body: new Blob([found as unknown as BlobPart]).stream(), customMetadata: { contentSha256: contentSha } };
+    },
+  } as unknown as R2Bucket;
+
+  const upRes = await handleAgentArtifactUpload({
+    request: new Request(`https://hub.example.com/agent/artifacts/${blobSha}`, {
+      method: 'PUT',
+      headers: {
+        'content-type': 'application/gzip',
+        'content-length': String(gzBytes.byteLength),
+        'x-content-sha256': contentSha,
+        'x-content-bytes': String(rawHtmlBytes.byteLength),
+        'x-artifact-retention': 'transient',
+        'x-job-id': 'job_1',
+        'x-job-nonce': 'nonce_1',
+        'x-request-id': 'scrape-1',
+      },
+      body: gzBytes,
+    }),
+    blobSha256: blobSha,
+    siteId: 'site-x86',
+    bucket: mockR2,
+    authorizeJobUpload: async () => ({ ok: true }),
+  });
+  assert.equal(upRes.status, 200);
+
+  const hydratedJson = await hydrateReplyBodiesFromR2(
+    JSON.stringify({
+      results: [
+        {
+          id: 'scrape-1',
+          url: 'https://example.com/',
+          status: 200,
+          outcome: 'ok',
+          artifact: { blobSha256: blobSha, contentSha256: contentSha, retention: 'transient' },
+        },
+      ],
+    }),
+    mockR2,
+  );
+  assert.equal(r2GetCalls, 0, 'L3b: hydrateReplyBodiesFromR2 must serve freshly verified upload from RAM without R2 GET');
+  assert.ok(hydratedJson.includes('Zero R2 Get Hydration'));
+});
+
+test('R1 & bun.sh Regression Suite: Vercel Greenhouse board promotion, Hippocratic AI multi-word Ashby slug, Visa SmartRecruiters rescue, and map seed redirect scope', async () => {
+  const { executeMapCall } = await import('../src/map-crawl');
+  resetJobsCacheForTests();
+
+  // 1. [R1a] Vercel (`company: "vercel", query: "Forward-Deployed Engineer"`):
+  // Even when `ats_search` returns ONLY 4 non-matching single-posting URLs (`job-boards.greenhouse.io/vercel/jobs/...`),
+  // `executeJobsCall` promotes the parent Greenhouse board (`https://job-boards.greenhouse.io/vercel`) and finds the live
+  // `"Forward Deployed Engineer"` posting (`5778418004`) while expanding hyphenated queries in search!
+  const vercelSearchQueries: string[] = [];
+  const vercelScrapedUrls: string[] = [];
+  const vercelRes = await executeJobsCall({
+    payload: { company: 'vercel', query: 'Forward-Deployed Engineer', limit: 10 },
+    env: {},
+    executeSearch: async ({ query: q }) => {
+      vercelSearchQueries.push(String(q));
+      return {
+        status: 200,
+        body: {
+          results: [
+            { url: 'https://job-boards.greenhouse.io/vercel?error=true' },
+            { url: 'https://job-boards.greenhouse.io/vercel/jobs/5111000004' },
+            { url: 'https://job-boards.greenhouse.io/vercel/jobs/5111000005' },
+            { url: 'https://job-boards.greenhouse.io/vercel/jobs/5111000006' },
+            { url: 'https://job-boards.greenhouse.io/vercel/jobs/5111000007' },
+          ],
+        },
+      };
+    },
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      vercelScrapedUrls.push(u);
+      if (u === 'https://job-boards.greenhouse.io/vercel') {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            extractorId: 'greenhouse',
+            jobs: [
+              {
+                title: 'Forward Deployed Engineer',
+                company: 'Vercel',
+                url: 'https://job-boards.greenhouse.io/vercel/jobs/5778418004',
+                applyUrl: 'https://job-boards.greenhouse.io/vercel/jobs/5778418004#app',
+                workplaceType: 'hybrid',
+                locations: ['United States'],
+                pay: { min: 196000, max: 294000, currency: 'USD', interval: 'year', basis: 'base', raw: '$196,000 - $294,000' },
+                postedAt: '2026-11-20',
+                source: 'greenhouse',
+                snippet: 'Work directly with enterprise customers to deploy AI and Next.js workloads.',
+              },
+              {
+                title: 'Account Executive',
+                company: 'Vercel',
+                url: 'https://job-boards.greenhouse.io/vercel/jobs/5111000004',
+                applyUrl: 'https://job-boards.greenhouse.io/vercel/jobs/5111000004#app',
+                workplaceType: 'remote',
+                locations: ['United States'],
+                pay: null,
+                postedAt: '2026-11-18',
+                source: 'greenhouse',
+              },
+            ],
+            total: 2,
+            returned: 2,
+            truncated: false,
+          },
+        };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(vercelRes.status, 200);
+  assert.ok(
+    vercelSearchQueries.some((q) => q.includes('"Forward-Deployed Engineer"') && q.includes('"Forward Deployed Engineer"')),
+    'R1a: hyphenated role query must expand both hyphenated and space-separated phrases in ats_search',
+  );
+  assert.ok(
+    vercelScrapedUrls.includes('https://job-boards.greenhouse.io/vercel'),
+    'R1a: single-posting Greenhouse hits for target company must promote parent Greenhouse board',
+  );
+  assert.equal(
+    vercelScrapedUrls.filter((u) => u.includes('/jobs/')).length,
+    0,
+    'R1a: Wave 2 must skip redundant single-posting fetches once parent Greenhouse board succeeds',
+  );
+  const vercelJobs = vercelRes.body.jobs as Array<{ title: string; url: string }>;
+  assert.equal(vercelJobs.length, 1);
+  assert.equal(vercelJobs[0]?.url, 'https://job-boards.greenhouse.io/vercel/jobs/5778418004');
+
+  // 2. [R1b] Hippocratic AI (`company: "Hippocratic AI", query: "Forward Deployed Engineer"`):
+  // Space-encoded Ashby search hits (`https://jobs.ashbyhq.com/Hippocratic%20AI/<id>`) MUST survive `rawUrlList`,
+  // promote `https://jobs.ashbyhq.com/Hippocratic%20AI` + compact `https://jobs.ashbyhq.com/hippocraticai`, and pass `matchesAllowedCompanyOrDomain`!
+  const hippoScrapedUrls: string[] = [];
+  const hippoRes = await executeJobsCall({
+    payload: { company: 'Hippocratic AI', query: 'Forward Deployed Engineer', limit: 10 },
+    env: {},
+    executeSearch: async () => ({
+      status: 200,
+      body: {
+        results: [{ url: 'https://jobs.ashbyhq.com/Hippocratic%20AI/9a8b7c6d-1111-2222-3333-444455556666' }],
+      },
+    }),
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      hippoScrapedUrls.push(u);
+      if (u === 'https://jobs.ashbyhq.com/Hippocratic%20AI' || u === 'https://jobs.ashbyhq.com/hippocraticai') {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            extractorId: 'ashby',
+            jobs: [
+              {
+                title: 'Forward Deployed Engineer, Healthcare AI',
+                company: 'Hippocratic AI',
+                url: 'https://jobs.ashbyhq.com/Hippocratic%20AI/9a8b7c6d-1111-2222-3333-444455556666',
+                applyUrl: 'https://jobs.ashbyhq.com/Hippocratic%20AI/9a8b7c6d-1111-2222-3333-444455556666/application',
+                workplaceType: 'remote',
+                locations: ['Remote - US'],
+                pay: null,
+                postedAt: '2026-11-21',
+                source: 'ashby',
+              },
+            ],
+            total: 1,
+            returned: 1,
+            truncated: false,
+          },
+        };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(hippoRes.status, 200);
+  assert.ok(
+    hippoScrapedUrls.includes('https://jobs.ashbyhq.com/Hippocratic%20AI'),
+    'R1b: space-encoded Ashby org hit must pass pre-wave filter and promote parent Ashby board',
+  );
+  assert.ok((hippoRes.body.sourcesUsed as string[]).includes('ats:ashby'));
+  assert.equal((hippoRes.body.jobs as Array<{ title: string }>).length, 1);
+
+  // 3. [R1c / J3] Visa (`company: "Visa", query: "Engineer"`):
+  // Even when `ats_search` returns only a stale/dead Workday URL (`404`), post-wave rescue probes `https://jobs.smartrecruiters.com/Visa`!
+  const visaRescueScraped: string[] = [];
+  const visaRescueRes = await executeJobsCall({
+    payload: { company: 'Visa', query: 'Engineer', limit: 5 },
+    env: {},
+    executeSearch: async () => ({
+      status: 200,
+      body: {
+        results: [{ url: 'https://visa.wd5.myworkdayjobs.com/en-US/Visa/job/Old-Closed-Role_REF0001' }],
+      },
+    }),
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      visaRescueScraped.push(u);
+      if (u === 'https://jobs.smartrecruiters.com/Visa') {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            markdown: '# Visa Careers\n\n- [Staff Software Engineer](https://jobs.smartrecruiters.com/Visa/744000099988877-staff-software-engineer) — Austin, TX\n',
+            links: ['https://jobs.smartrecruiters.com/Visa/744000099988877-staff-software-engineer'],
+          },
+        };
+      }
+      if (u === 'https://jobs.smartrecruiters.com/Visa/744000099988877-staff-software-engineer') {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            markdown: '# Staff Software Engineer\nLocation: Austin, TX',
+            jobPosting: {
+              title: 'Staff Software Engineer',
+              hiringOrganization: 'Visa',
+              url: u,
+              applyUrl: u,
+              jobLocation: ['Austin, TX, US'],
+              workplaceType: 'hybrid',
+              datePosted: '2026-11-22',
+              pay: { min: 185000, max: 240000, currency: 'USD', interval: 'year', basis: 'base', raw: '$185,000 - $240,000' },
+              source: 'smartrecruiters',
+            },
+          },
+        };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(visaRescueRes.status, 200);
+  assert.ok(
+    visaRescueScraped.includes('https://jobs.smartrecruiters.com/Visa'),
+    'R1c: dead ats_search hits must fall back to probing jobs.smartrecruiters.com/Visa directly',
+  );
+  assert.ok((visaRescueRes.body.sourcesUsed as string[]).includes('ats:smartrecruiters'));
+  assert.equal((visaRescueRes.body.jobs as Array<{ title: string }>)[0]?.title, 'Staff Software Engineer');
+
+  // 4. [bun.sh map] Seed redirect (`https://bun.sh/` -> `finalUrl: "https://bun.com/"`) accepts `bun.com` URLs in
+  // `sitemap.xml` & `llms.txt` AND reports accurate `urlsFound > 0` per source even when homepage also linked them,
+  // while refusing to widen scope if a seed redirects to a multi-tenant platform like `github.com`!
+  const bunMapRes = await executeMapCall({
+    payload: { url: 'https://bun.sh/', limit: 20 },
+    selfHost: 'hub.example.com',
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'home',
+            url: 'https://bun.sh/',
+            finalUrl: 'https://bun.com/',
+            status: 200,
+            outcome: 'ok',
+            body: '<!doctype html><html><body><a href="https://bun.com/docs">Docs</a><a href="https://bun.com/blog">Blog</a></body></html>',
+          },
+          {
+            id: 'llms',
+            url: 'https://bun.sh/llms.txt',
+            finalUrl: 'https://bun.com/llms.txt',
+            status: 200,
+            outcome: 'ok',
+            body: '# Bun\n\n> Fast all-in-one JavaScript runtime\n\n## Docs\n- [Bun Docs](https://bun.com/docs): Official documentation\n- [CLI Reference](https://bun.com/docs/cli/run.md): Run TypeScript & JS\n',
+          },
+          {
+            id: 'robots',
+            url: 'https://bun.sh/robots.txt',
+            finalUrl: 'https://bun.com/robots.txt',
+            status: 200,
+            outcome: 'ok',
+            body: 'User-agent: *\nAllow: /\nSitemap: https://bun.com/sitemap.xml\n',
+          },
+          {
+            id: 'sitemap',
+            url: 'https://bun.sh/sitemap.xml',
+            finalUrl: 'https://bun.com/sitemap.xml',
+            status: 200,
+            outcome: 'ok',
+            body: '<?xml version="1.0" encoding="UTF-8"?><urlset><url><loc>https://bun.com/docs</loc></url><url><loc>https://bun.com/guides/http/simple</loc></url></urlset>',
+          },
+          {
+            id: 'sitemap-index',
+            url: 'https://bun.sh/sitemap-index.xml',
+            status: 404,
+            outcome: 'not_found',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(bunMapRes.status, 200);
+  const bunSources = bunMapRes.body.sources as Array<{ source: string; urlsFound: number }>;
+  const bunLlmsSrc = bunSources.find((s) => s.source === 'llms.txt');
+  const bunSmSrc = bunSources.find((s) => s.source === 'sitemap');
+  assert.equal(bunLlmsSrc?.urlsFound, 2, 'bun.sh map: llms.txt redirecting to bun.com must report urlsFound: 2');
+  assert.equal(bunSmSrc?.urlsFound, 2, 'bun.sh map: sitemap.xml redirecting to bun.com must report urlsFound: 2 (including shared /docs URL)');
+
+  const ghShortenerMap = await executeMapCall({
+    payload: { url: 'https://short.example.com/', limit: 20 },
+    selfHost: 'hub.example.com',
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'home',
+            url: 'https://short.example.com/',
+            finalUrl: 'https://github.com/org-a/repo-a',
+            status: 200,
+            outcome: 'ok',
+            body: '<!doctype html><html><body><a href="https://github.com/org-b/secret-repo">Other Repo</a></body></html>',
+          },
+        ],
+      }),
+    }),
+  });
+  const ghShortenerUrls = ghShortenerMap.body.links as string[];
+  assert.equal(
+    ghShortenerUrls.some((u) => u.includes('github.com/org-b')),
+    false,
+    'Seed redirect to shared multi-tenant host github.com must NOT widen host scope across arbitrary tenants',
+  );
+
+  // 5. [Audit Round 2 — HIGH-1] `extractGreenhouseLocations` neutralizes double-encoded HTML tags & unsafe `javascript:` Markdown links!
+  const ghSpec = resolveAtsPreFetchSpec('https://boards.greenhouse.io/sec-test')!;
+  const hostileGhFmt = ghSpec.format(
+    JSON.stringify({
+      jobs: [
+        {
+          id: 99,
+          title: 'Security Engineer',
+          absolute_url: 'https://boards.greenhouse.io/sec-test/jobs/99',
+          location: { name: 'Distributed' },
+          offices: [{ name: '&amp;lt;img src=x onerror=1&amp;gt; Austin' }],
+          metadata: [{ name: 'Location', value: '[Remote - Apply](javascript:void(0))' }],
+          updated_at: '2026-11-23',
+        },
+      ],
+    }),
+    'https://boards.greenhouse.io/sec-test',
+    (frag: string) => extractHtmlDocument(frag, { baseUrl: 'https://boards.greenhouse.io/sec-test' }),
+  )!;
+  const hostileLocs = hostileGhFmt.jobs?.[0]?.locations ?? [];
+  assert.equal(
+    hostileLocs.some((l) => l.includes('<img') || l.includes('javascript:')),
+    false,
+    `HIGH-1: Greenhouse locations must never emit raw HTML tags or javascript: links; got ${JSON.stringify(hostileLocs)}`,
+  );
+
+  // 6. [Audit Round 2 — HIGH-2] `domains: ["acme.co.uk"]` does NOT skip `/jobs` when `/careers` returns 200 OK SPA,
+  // and speculative `slug-probe:` boards do NOT bypass `job.company` corroboration against unrelated `"Widget Labs"`!
+  const acmeUkRes = await executeJobsCall({
+    payload: { domains: ['acme.co.uk'], query: 'Engineer' },
+    env: {},
+    executeSearch: async () => ({ status: 200, body: { results: [] } }),
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      if (u === 'https://acme.co.uk/careers') {
+        return { status: 200, body: { ok: true, rawHtml: '<html><body><div id="app">Overview</div></body></html>', links: [] } };
+      }
+      if (u === 'https://acme.co.uk/jobs') {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            rawHtml: '<html><body><a href="https://jobs.ashbyhq.com/acme-uk">Open Roles</a></body></html>',
+            links: ['https://jobs.ashbyhq.com/acme-uk'],
+          },
+        };
+      }
+      if (u === 'https://boards.greenhouse.io/acme') {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            extractorId: 'greenhouse',
+            jobs: [
+              {
+                title: 'Software Engineer',
+                company: 'Widget Labs',
+                url: 'https://boards.greenhouse.io/acme/jobs/1',
+                applyUrl: 'https://boards.greenhouse.io/acme/jobs/1',
+                workplaceType: 'remote',
+                locations: ['US'],
+                pay: null,
+                postedAt: '2026-11-23',
+                source: 'greenhouse',
+              },
+            ],
+            total: 1,
+            returned: 1,
+            truncated: false,
+          },
+        };
+      }
+      if (u === 'https://jobs.ashbyhq.com/acme-uk') {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            extractorId: 'ashby',
+            jobs: [
+              {
+                title: 'Platform Engineer',
+                company: 'Acme UK',
+                url: 'https://jobs.ashbyhq.com/acme-uk/role-1',
+                applyUrl: 'https://jobs.ashbyhq.com/acme-uk/role-1',
+                workplaceType: 'remote',
+                locations: ['London, UK'],
+                pay: null,
+                postedAt: '2026-11-23',
+                source: 'ashby',
+              },
+            ],
+            total: 1,
+            returned: 1,
+            truncated: false,
+          },
+        };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  const acmeUkJobs = acmeUkRes.body.jobs as Array<{ company: string; title: string }>;
+  assert.equal(acmeUkJobs.length, 1);
+  assert.equal(acmeUkJobs[0]?.company, 'Acme UK', 'HIGH-2: acme.co.uk must check /jobs and never return unrelated Widget Labs jobs');
+
+  // 7. [Audit Round 2 — MEDIUM-3] Kasada (`x-kpsdk-ct` + `/ips.js`) and Imperva (`/_Incapsula_Resource`) 200 OK HTML bot-walls
+  // on a Shopify store halt immediately as `status: "challenged"` (NEVER misclassified as `unsupported_storefront`)!
+  for (const wafCase of [
+    {
+      headers: { 'content-type': 'text/html', 'x-kpsdk-ct': '02abc' },
+      body: '<!doctype html><html><body><script src="/149e9513/ips.js"></script></body></html>',
+    },
+    {
+      headers: { 'content-type': 'text/html' },
+      body: '<!doctype html><html><body><iframe src="/_Incapsula_Resource?SWJIYLWA=1"></iframe></body></html>',
+    },
+  ]) {
+    let fetchCount = 0;
+    const challengedCatalog = await executeCatalogCall({
+      payload: { url: 'https://protected-shopify.example.com/', maxPages: 1 },
+      env: {},
+      sleepFn: async () => undefined,
+      executeHubFetch: async () => {
+        fetchCount++;
+        return { status: 200, outcome: 'ok', headers: wafCase.headers, body: wafCase.body };
+      },
+    });
+    assert.equal(challengedCatalog.body.status, 'challenged', 'MEDIUM-3: WAF HTML interstitial must report status=challenged');
+    assert.equal(challengedCatalog.body.platform, 'shopify');
+    assert.equal(fetchCount, 1, 'MEDIUM-3: WAF HTML interstitial on Probe 1 must halt immediately without probing WooCommerce');
+  }
+
+  // 8. [Audit Round 2 — MEDIUM-4] Unapproved `role: "owner"` user is demoted to `"member"` under `GITHUB_OWNER_ID` even when
+  // a custom `OAuthStore` implements `resolveMcpAccessToken` without running `pinnedOwnerId` demotion internally!
+  const unapprovedStore = createMemoryOAuthStore();
+  await unapprovedStore.upsertUser!({
+    userId: 'gh_4242',
+    githubId: '4242',
+    githubLogin: 'rogue-owner',
+    role: 'owner',
+    admittedVia: 'allowlist_id',
+    createdAt: 1_000,
+    lastLoginAt: 1_000,
+  });
+  const rogueRawTok = 'ef_at_rogue_owner_token_1234567890';
+  await unapprovedStore.putTokenPair({
+    grantId: 'grant_rogue_1',
+    clientId: 'client_rogue_1',
+    clientName: 'Claude',
+    scopes: ['crawl:read'],
+    resource: 'https://hub.example.com/mcp',
+    userId: 'gh_4242',
+    userRole: 'owner',
+    accessHash: await sha256Base64Url(rogueRawTok),
+    accessExpiresAt: Date.now() + 3_600_000,
+    refreshHash: await sha256Base64Url('ef_rt_rogue_owner_token_1234567890'),
+    refreshExpiresAt: Date.now() + 86_400_000,
+    createdAt: Date.now(),
+  });
+  const naiveWrappedStore = {
+    ...unapprovedStore,
+    resolveMcpAccessToken: async ({ tokenHash, now }: { tokenHash: string; now: number }) => {
+      // Intentionally omits `pinnedOwnerId` enforcement to test `authorizeMcpRequest` defense-in-depth!
+      const token = await unapprovedStore.getAccessToken(tokenHash, now);
+      const user = token?.userId ? ((await unapprovedStore.getUser!(token.userId)) ?? null) : null;
+      return { token, user };
+    },
+  };
+  const rogueAuth = await authorizeMcpRequest({
+    request: new Request('https://hub.example.com/mcp', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${rogueRawTok}` },
+    }),
+    origin: 'https://hub.example.com',
+    githubAuthEnv: {
+      GITHUB_CLIENT_ID: 'gh_cid',
+      GITHUB_CLIENT_SECRET: 'gh_csec',
+      GITHUB_OWNER_ID: '1001',
+      GITHUB_ALLOWED_USERS: 'id:4242',
+    },
+    store: naiveWrappedStore,
+  });
+  assert.equal(rogueAuth.ok, true);
+  if (rogueAuth.ok) {
+    assert.equal(rogueAuth.role, 'member', 'MEDIUM-4: unapproved owner must be demoted to member when GITHUB_OWNER_ID is set');
+  }
+
+  // 9. [Audit Round 3 — HIGH-R2-1 & HIGH-R2-2] Unredirected `evil.example.com/sitemap.xml` cannot inject `victim.example.org` URLs
+  // or poison `companionMdUrlCache`, PSL suffixes (`vercel.app`, `s3.amazonaws.com`) cannot widen `map` host scope, and
+  // `bun.sh/docs` -> `bun.com/docs` preserves subpath filtering!
+  const { lookupCompanionMdUrl, resetCompanionMdCacheForTests } = await import('../src/scrape');
+  const { matchesAllowedCompanyOrDomain } = await import('../src/jobs');
+  resetCompanionMdCacheForTests();
+  const poisonMap = await executeMapCall({
+    payload: { url: 'https://evil.example.com/', limit: 20 },
+    selfHost: 'hub.example.com',
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'home',
+            url: 'https://evil.example.com/',
+            finalUrl: 'https://victim.example.org/',
+            status: 200,
+            outcome: 'ok',
+            body: '<!doctype html><html><body></body></html>',
+          },
+          {
+            id: 'sitemap',
+            url: 'https://evil.example.com/sitemap.xml',
+            status: 200,
+            outcome: 'ok',
+            body: '<?xml version="1.0"?><urlset><url><loc>https://victim.example.org/pricing.md</loc></url><url><loc>https://victim.example.org/pricing</loc></url></urlset>',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(
+    (poisonMap.body.links as string[]).some((u) => u.includes('victim.example.org/pricing')),
+    false,
+    'HIGH-R2-1: unredirected evil sitemap must NOT inject victim.example.org URLs',
+  );
+  assert.equal(
+    lookupCompanionMdUrl('https://victim.example.org/pricing'),
+    undefined,
+    'HIGH-R2-1: cross-origin redirect must NEVER poison shared companionMdUrlCache',
+  );
+
+  for (const multiTenantTarget of ['https://vercel.app/', 'https://s3.amazonaws.com/bucket-a/index.html']) {
+    const mtMap = await executeMapCall({
+      payload: { url: 'https://short.example.com/', includeSubdomains: true, limit: 20 },
+      selfHost: 'hub.example.com',
+      executeHubFetch: async () => ({
+        status: 200,
+        via: 'agent:site-x86',
+        bodyText: JSON.stringify({
+          results: [
+            {
+              id: 'home',
+              url: 'https://short.example.com/',
+              finalUrl: multiTenantTarget,
+              status: 200,
+              outcome: 'ok',
+              body: '<html><body><a href="https://victim-tenant.vercel.app/admin">A</a><a href="https://s3.amazonaws.com/victim-bucket/secret">B</a></body></html>',
+            },
+          ],
+        }),
+      }),
+    });
+    assert.equal((mtMap.body.links as string[]).some((u) => u.includes('victim')), false, `HIGH-R2-2: ${multiTenantTarget} must not widen scope`);
+  }
+
+  const bunDocsMap = await executeMapCall({
+    payload: { url: 'https://bun.sh/docs', limit: 20 },
+    selfHost: 'hub.example.com',
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'home',
+            url: 'https://bun.sh/docs',
+            finalUrl: 'https://bun.com/docs',
+            status: 200,
+            outcome: 'ok',
+            body: '<html><body><a href="https://bun.com/docs/cli/run">CLI</a><a href="https://bun.com/blog">Blog</a></body></html>',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.deepEqual(bunDocsMap.body.links, ['https://bun.com/docs', 'https://bun.com/docs/cli/run']);
+
+  // 10. [Audit Round 3 — MEDIUM-R2-3 & MEDIUM-R2-4] Search operator injection & >500-char query length guard + Ashby space-slug spoof guard!
+  const injectedQueries: string[] = [];
+  const injectedScrapes: string[] = [];
+  await executeJobsCall({
+    payload: {
+      company: 'vercel',
+      query: 'Forward-Deployed" ) OR site:evil.example.com ( ' + 'Distributed Systems '.repeat(8),
+    },
+    env: {},
+    executeSearch: async ({ query: q }) => {
+      injectedQueries.push(String(q));
+      return { status: 200, body: { results: [{ url: 'https://evil.example.com/fake-job' }] } };
+    },
+    executeScrape: async (args) => {
+      injectedScrapes.push(String(args.url ?? ''));
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.ok(injectedQueries.every((q) => q.length <= 500 && !/site:evil\.example\.com/i.test(q)), 'MEDIUM-R2-3: search queries must strip injected site:/quotes and stay <= 500 chars');
+  assert.equal(injectedScrapes.some((u) => new URL(u).hostname.endsWith('evil.example.com')), false, 'MEDIUM-R2-3: non-ATS URLs from search must never be scraped');
+
+  assert.equal(
+    matchesAllowedCompanyOrDomain(
+      {
+        title: 'Engineer',
+        company: 'St Ripe',
+        url: 'https://jobs.ashbyhq.com/St%20Ripe/123',
+        applyUrl: 'https://jobs.ashbyhq.com/St%20Ripe/123',
+        workplaceType: 'remote',
+        locations: ['US'],
+        pay: null,
+        postedAt: null,
+        source: 'ashby',
+      },
+      new Set(['stripe']),
+      [],
+    ),
+    false,
+    'MEDIUM-R2-4: spoof Ashby space-slug "St Ripe" must NEVER self-corroborate against single-word "stripe"',
+  );
+
+  // 11. [Live Verification Catch — unredirected `bun.sh` -> `bun.com` same-SLD `.com` twin + `Visa` `limit: 5` noise pre-filter]
+  const bunUnredirectedMap = await executeMapCall({
+    payload: { url: 'https://bun.sh/', limit: 20 },
+    selfHost: 'hub.example.com',
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'home',
+            url: 'https://bun.sh/',
+            status: 200,
+            outcome: 'ok',
+            body: '<!doctype html><html><body><a href="/docs/api/fetch">Fetch</a></body></html>',
+          },
+          {
+            id: 'llms',
+            url: 'https://bun.sh/llms.txt',
+            status: 200,
+            outcome: 'ok',
+            body: '# Bun\n\n## Docs\n- [Welcome to Bun](https://bun.com/docs/index.md): Toolkit\n- [Quickstart](https://bun.com/docs/quickstart.md): Build fast\n',
+          },
+          {
+            id: 'robots',
+            url: 'https://bun.sh/robots.txt',
+            status: 200,
+            outcome: 'ok',
+            body: 'User-agent: *\nAllow: /\nSitemap: https://bun.com/sitemap.xml\n',
+          },
+          {
+            id: 'sitemap',
+            url: 'https://bun.sh/sitemap.xml',
+            status: 200,
+            outcome: 'ok',
+            body: '<?xml version="1.0"?><urlset><url><loc>https://bun.com/blog/release-notes/bun-v1.4.5</loc></url></urlset>',
+          },
+        ],
+      }),
+    }),
+  });
+  const bunUnredirSrcs = bunUnredirectedMap.body.sources as Array<{ source: string; urlsFound: number }>;
+  assert.equal(bunUnredirSrcs.find((s) => s.source === 'llms.txt')?.urlsFound, 2);
+  assert.equal(bunUnredirSrcs.find((s) => s.source === 'robots.txt')?.urlsFound, 1);
+  assert.equal(bunUnredirSrcs.find((s) => s.source === 'sitemap')?.urlsFound, 1);
+  assert.equal(
+    lookupCompanionMdUrl('https://bun.com/docs/quickstart'),
+    undefined,
+    'Unredirected bun.sh must NOT write bun.com entries into shared companionMdUrlCache',
+  );
+
+  const visaNoiseRes = await executeJobsCall({
+    payload: { company: 'Visa', query: 'Engineer', limit: 5 },
+    env: {},
+    executeSearch: async ({ query: q }) => {
+      if (String(q).includes('greenhouse')) {
+        return {
+          status: 200,
+          body: {
+            results: Array.from({ length: 10 }, (_, idx) => ({
+              url: `https://job-boards.greenhouse.io/otherco${idx}/jobs/${100 + idx}`,
+            })),
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: { results: [{ url: 'https://visa.wd5.myworkdayjobs.com/Visa' }] },
+      };
+    },
+    executeScrape: async (args) => {
+      if (String(args.url).startsWith('https://visa.wd5.myworkdayjobs.com/Visa')) {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            extractorId: 'workday-board',
+            jobs: [
+              {
+                title: 'Software Engineer, Agentic Developer',
+                company: 'visa',
+                url: 'https://visa.wd5.myworkdayjobs.com/Visa/job/US---Denver-CO/Software-Engineer--Agentic-Developer_REF090196W',
+                applyUrl: 'https://visa.wd5.myworkdayjobs.com/Visa/job/US---Denver-CO/Software-Engineer--Agentic-Developer_REF090196W',
+                workplaceType: 'onsite',
+                locations: ['US - Denver, CO'],
+                pay: null,
+                postedAt: '2026-11-23',
+                source: 'workday',
+              },
+            ],
+            total: 1,
+            returned: 1,
+            truncated: false,
+          },
+        };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(visaNoiseRes.body.count, 1, '10 unrelated "visa sponsorship" search hits must not starve Visa Workday board when limit=5');
+
+  // 12. [Audit Round 4 — MEDIUM-R4-1 & LOW-R4-2] Redirected `llms.txt` in `map` cannot poison `companionMdUrlCache` via `parseLlmsTxt` side-effect,
+  // and `recordCompanionMdUrl`/`parseLlmsTxt` reject userinfo & non-443 ports!
+  const { parseLlmsTxt, recordCompanionMdUrl } = await import('../src/scrape');
+  resetCompanionMdCacheForTests();
+  await executeMapCall({
+    payload: { url: 'https://evil.example.com/', limit: 20 },
+    selfHost: 'hub.example.com',
+    executeHubFetch: async () => ({
+      status: 200,
+      via: 'agent:site-x86',
+      bodyText: JSON.stringify({
+        results: [
+          {
+            id: 'home',
+            url: 'https://evil.example.com/',
+            finalUrl: 'https://victim.example.org/',
+            status: 200,
+            outcome: 'ok',
+            body: '<!doctype html><html><body></body></html>',
+          },
+          {
+            id: 'llms',
+            url: 'https://evil.example.com/llms.txt',
+            finalUrl: 'https://victim.example.org/uploads/attacker-note.txt',
+            status: 200,
+            outcome: 'ok',
+            body: '# Note\n- [Pricing](https://victim.example.org/pricing.md)\n',
+          },
+        ],
+      }),
+    }),
+  });
+  assert.equal(
+    lookupCompanionMdUrl('https://victim.example.org/pricing'),
+    undefined,
+    'MEDIUM-R4-1: cross-origin redirected llms.txt in map must NEVER poison companionMdUrlCache',
+  );
+
+  parseLlmsTxt('# Docs\n- [Guide](https://user:pass@docs.example.com/guide.md)\n- [Alt](https://docs.example.com:8443/alt.md)\n', 'https://docs.example.com/llms.txt');
+  recordCompanionMdUrl('https://user:pass@docs.example.com/direct.md');
+  recordCompanionMdUrl('https://docs.example.com:8443/port.md');
+  assert.equal(lookupCompanionMdUrl('https://docs.example.com/guide'), undefined, 'LOW-R4-2: userinfo URLs in parseLlmsTxt must not be cached');
+  assert.equal(lookupCompanionMdUrl('https://docs.example.com/alt'), undefined, 'LOW-R4-2: non-443 ports in parseLlmsTxt must not be cached');
+  assert.equal(lookupCompanionMdUrl('https://docs.example.com/direct'), undefined, 'LOW-R4-2: userinfo URLs in recordCompanionMdUrl must not be cached');
+  assert.equal(lookupCompanionMdUrl('https://docs.example.com:8443/port'), undefined, 'LOW-R4-2: non-443 ports in recordCompanionMdUrl must not be cached');
 });

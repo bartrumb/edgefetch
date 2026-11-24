@@ -1635,10 +1635,18 @@ function resolveSafeMarkdownHrefOrRelative(rawHref: string | undefined, baseUrl?
 }
 
 function convertAnchorInnerWithBadgeImagesLinear(inner: string, baseUrl?: string, includeImages = true): string {
-  if (!includeImages || !/<img\b/i.test(inner)) {
-    return cleanInlineHtml(inner);
+  const withoutInlineEmInWords = /<(?:em|i|strong|b|u|mark)\b/i.test(inner)
+    ? replaceHtmlTagsQuoteAwareLinear(
+        inner,
+        (t) => (/^(?:em|i|strong|b|u|mark)$/.test(t.tagNameLower) ? '' : t.rawTag),
+        8_192,
+        false,
+      )
+    : inner;
+  if (!includeImages || !/<img\b/i.test(withoutInlineEmInWords)) {
+    return cleanInlineHtml(withoutInlineEmInWords);
   }
-  const withMdImgs = replaceHtmlOpenTagsLinear(inner, ['img'], (tag) => {
+  const withMdImgs = replaceHtmlOpenTagsLinear(withoutInlineEmInWords, ['img'], (tag) => {
     if (/\bon[a-z]+\s*=/i.test(tag.attrs)) return '';
     const attrs = parseTagAttrs(tag.attrs);
     const resolvedSrc = resolveSafeMarkdownHrefOrRelative(attrs.src ?? attrs['data-src'], baseUrl);
@@ -3646,7 +3654,7 @@ export function extractHtmlDocument(
       }
       if (tag === 'button') {
         const btnTxt = cleanInlineHtml(inner);
-        return /^(?:copy(?:\s+(?:page|code|link|markdown|item path|path|url|to clipboard|head branch name to clipboard))?|copied!?|yes|no|skip|submit feedback|back to top|ask ai|dark mode|light mode|toggle theme|see all|hide|hide comment|show more|show less|share|format|run)$/i.test(
+        return /^(?:menu|open menu|close menu|toggle (?:menu|navigation|sidebar|theme|color mode)|on this page|table of contents|copy(?:\s+(?:for llm|as markdown|page|code|link|markdown|item path|path|url|to clipboard|head branch name to clipboard))?|copied!?|view (?:as )?markdown|open in (?:chatgpt|claude|cursor|v0|perplexity|scira)|ask ai(?:\s+about\s+this\s+page)?|yes|no|skip|submit feedback|give feedback|report an issue|back to top|dark mode|light mode|see all|hide|hide comment|show more|show less|share|format|run|search(?:\.{0,3}|\s+(?:docs|documentation))?(?:\s*(?:⌘\s*k|ctrl(?:\s*\+\s*|\s+)?k|\/))?)$/i.test(
           btnTxt,
         )
           ? ''
@@ -3769,6 +3777,13 @@ export function extractHtmlDocument(
     withInline = replacePairedHtmlElementsLinear(withInline, ['code'], (_f, _t, _a, c) =>
       stashInline(formatInlineCodeSpan(cleanInlineHtml(c))),
     );
+    withInline = replacePairedHtmlElementsLinear(withInline, ['a'], (_f, _t, attrStr, inner) => {
+      const attrs = parseTagAttrs(attrStr);
+      const href = resolveHttpsHref(attrs.href, baseUrl, true);
+      const label = convertAnchorInnerWithBadgeImagesLinear(inner, baseUrl, includeImages);
+      if (!label) return ' ';
+      return href ? `[${label}](${href})` : label;
+    });
     withInline = replacePairedHtmlElementsLinear(withInline, ['strong', 'b'], (_f, _t, _a, inner) => {
       const txt = cleanInlineHtml(inner);
       return txt ? `**${txt}**` : ' ';
@@ -3776,13 +3791,6 @@ export function extractHtmlDocument(
     withInline = replacePairedHtmlElementsLinear(withInline, ['em', 'i'], (_f, _t, _a, inner) => {
       const txt = cleanInlineHtml(inner);
       return txt ? `*${txt}*` : ' ';
-    });
-    withInline = replacePairedHtmlElementsLinear(withInline, ['a'], (_f, _t, attrStr, inner) => {
-      const attrs = parseTagAttrs(attrStr);
-      const href = resolveHttpsHref(attrs.href, baseUrl, true);
-      const label = cleanInlineHtml(inner);
-      if (!label) return ' ';
-      return href ? `[${label}](${href})` : label;
     });
     return cleanInlineHtml(withInline).replace(/\|/g, '\\|');
   };
@@ -3957,6 +3965,14 @@ export function extractHtmlDocument(
   }
 
   if (/<(?:del|s|strike|mark|strong|b|em|i|a|dt|blockquote)/i.test(md)) {
+    md = replacePairedHtmlElementsLinear(md, ['a'], (full, _t, attrStr, inner) => {
+      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
+      const attrs = parseTagAttrs(attrStr);
+      const href = resolveHttpsHref(attrs.href, baseUrl, true);
+      const label = convertAnchorInnerWithBadgeImagesLinear(inner, baseUrl, includeImages);
+      if (!label) return ' ';
+      return href ? `[${label}](${href})` : label;
+    });
     md = replacePairedHtmlElementsLinear(md, ['del', 's', 'strike'], (full, _t, _a, inner) => {
       if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
       const txt = cleanInlineHtml(inner);
@@ -3976,14 +3992,6 @@ export function extractHtmlDocument(
       if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
       const txt = cleanInlineHtml(inner);
       return txt ? `*${txt}*` : ' ';
-    });
-    md = replacePairedHtmlElementsLinear(md, ['a'], (full, _t, attrStr, inner) => {
-      if (/<(?:li|ul|ol|table|blockquote|pre)\b/i.test(inner)) return full;
-      const attrs = parseTagAttrs(attrStr);
-      const href = resolveHttpsHref(attrs.href, baseUrl, true);
-      const label = convertAnchorInnerWithBadgeImagesLinear(inner, baseUrl, includeImages);
-      if (!label) return ' ';
-      return href ? `[${label}](${href})` : label;
     });
     md = replacePairedHtmlElementsLinear(
       md,
@@ -4527,7 +4535,16 @@ export function recordCompanionMdUrl(mdUrlStr: string, now = Date.now()): void {
   } catch {
     return;
   }
-  if (u.protocol !== 'https:' || u.search || u.hash) return;
+  if (
+    u.protocol !== 'https:' ||
+    u.username ||
+    u.password ||
+    (u.port && u.port !== '443') ||
+    u.search ||
+    u.hash
+  ) {
+    return;
+  }
   const cleanMd = u.toString();
   const keys: string[] = [];
   if (/\/index\.md$/i.test(u.pathname)) {
@@ -4569,29 +4586,93 @@ export function lookupCompanionMdUrl(pageUrlStr: string, now = Date.now()): stri
   return hit.mdUrl;
 }
 
-function recordCompanionMdLinksFromLlmsPayload(llmsPayload: unknown, now = Date.now()): void {
-  if (!llmsPayload || typeof llmsPayload !== 'object') return;
+function isSameHttpsOriginAs(candidateUrl: string, expectedOriginLower: string): boolean {
+  if (!expectedOriginLower) return false;
+  try {
+    const u = new URL(candidateUrl);
+    return (
+      u.protocol === 'https:' &&
+      !u.username &&
+      !u.password &&
+      (!u.port || u.port === '443') &&
+      u.origin.toLowerCase() === expectedOriginLower
+    );
+  } catch {
+    return false;
+  }
+}
+
+function recordCompanionMdLinksFromLlmsPayload(
+  llmsPayload: unknown,
+  allowedOriginsLower: ReadonlySet<string>,
+  now = Date.now(),
+): void {
+  if (!llmsPayload || typeof llmsPayload !== 'object' || allowedOriginsLower.size === 0) return;
   const obj = llmsPayload as {
+    llmsTxtUrl?: unknown;
     companionMdUrl?: unknown;
     matchedEntry?: { url?: unknown };
     relatedLinks?: Array<{ url?: unknown }>;
   };
-  if (typeof obj.companionMdUrl === 'string') recordCompanionMdUrl(obj.companionMdUrl, now);
-  if (typeof obj.matchedEntry?.url === 'string') recordCompanionMdUrl(obj.matchedEntry.url, now);
+  let effectiveOrigin = '';
+  if (typeof obj.llmsTxtUrl === 'string') {
+    try {
+      const lu = new URL(obj.llmsTxtUrl);
+      const lo = lu.origin.toLowerCase();
+      if (
+        lu.protocol === 'https:' &&
+        !lu.username &&
+        !lu.password &&
+        (!lu.port || lu.port === '443') &&
+        (lu.pathname === '/llms.txt' || lu.pathname === '/.well-known/llms.txt') &&
+        allowedOriginsLower.has(lo)
+      ) {
+        effectiveOrigin = lo;
+      }
+    } catch {
+      effectiveOrigin = '';
+    }
+  }
+  if (!effectiveOrigin) {
+    effectiveOrigin = allowedOriginsLower.values().next().value ?? '';
+  }
+  const recordIfSameOrigin = (urlVal: unknown): void => {
+    if (typeof urlVal === 'string' && isSameHttpsOriginAs(urlVal, effectiveOrigin)) {
+      recordCompanionMdUrl(urlVal, now);
+    }
+  };
+  recordIfSameOrigin(obj.companionMdUrl);
+  recordIfSameOrigin(obj.matchedEntry?.url);
   if (Array.isArray(obj.relatedLinks)) {
     for (const rel of obj.relatedLinks) {
-      if (typeof rel?.url === 'string') recordCompanionMdUrl(rel.url, now);
+      recordIfSameOrigin(rel?.url);
     }
   }
 }
 
 /** Parses `/llms.txt` Markdown index files per https://llmstxt.org/, rejecting HTML 200 soft-404 pages. */
-export function parseLlmsTxt(raw: string, sourceUrl: string): ParsedLlmsTxt | null {
+export function parseLlmsTxt(
+  raw: string,
+  sourceUrl: string,
+  options?: { recordCompanionCache?: boolean },
+): ParsedLlmsTxt | null {
   const trimmed = raw.trim();
   if (trimmed.length < 8) return null;
   const prefix = trimmed.slice(0, 256).toLowerCase();
   if (prefix.startsWith('<!doctype') || prefix.startsWith('<html') || prefix.includes('<body')) {
     return null;
+  }
+  const shouldRecordCache = options?.recordCompanionCache !== false;
+  let sourceOriginLower = '';
+  if (shouldRecordCache) {
+    try {
+      const su = new URL(sourceUrl);
+      if (su.protocol === 'https:' && !su.username && !su.password && (!su.port || su.port === '443')) {
+        sourceOriginLower = su.origin.toLowerCase();
+      }
+    } catch {
+      sourceOriginLower = '';
+    }
   }
 
   let title: string | undefined;
@@ -4631,7 +4712,11 @@ export function parseLlmsTxt(raw: string, sourceUrl: string): ParsedLlmsTxt | nu
           ...(m[3]?.trim() ? { notes: m[3].trim() } : {}),
         });
       }
-      if (resolved.toLowerCase().endsWith('.md')) {
+      if (
+        shouldRecordCache &&
+        resolved.toLowerCase().endsWith('.md') &&
+        isSameHttpsOriginAs(resolved, sourceOriginLower)
+      ) {
         recordCompanionMdUrl(resolved);
       }
     }
@@ -10608,6 +10693,7 @@ export async function executeScrapeCall(params: {
         formats: agentFormats,
         onlyMainContent,
         discoverLlms: goDiscoverLlms,
+        preferLlmsMarkdown: !needsLiveHtml && renderMode !== 'always',
         redactPii,
         ...(revalCandidate?.etag ? { ifNoneMatch: revalCandidate.etag } : {}),
         ...(revalCandidate?.lastModified ? { ifModifiedSince: revalCandidate.lastModified } : {}),
@@ -12980,10 +13066,30 @@ export async function executeScrapeCall(params: {
 
   let llmsPayload: unknown = item.llms;
   if (llmsPayload && typeof llmsPayload === 'object') {
-    if ((llmsPayload as { found?: unknown }).found === false) {
+    const rawLlmsObj = llmsPayload as Record<string, unknown>;
+    if (rawLlmsObj.found === false) {
       recordOriginLlmsAbsent(parsedUrl.origin, now);
     } else {
-      recordCompanionMdLinksFromLlmsPayload(llmsPayload, now);
+      const allowedLlmsOrigins = new Set<string>([parsedUrl.origin.toLowerCase()]);
+      try {
+        const fu = new URL(finalUrl);
+        if (fu.protocol === 'https:' && (!fu.port || fu.port === '443')) {
+          allowedLlmsOrigins.add(fu.origin.toLowerCase());
+        }
+      } catch {
+        // ignore invalid finalUrl
+      }
+      recordCompanionMdLinksFromLlmsPayload(llmsPayload, allowedLlmsOrigins, now);
+      if (rawLlmsObj.usedCompanionMd === true && !goCompanionMd) {
+        llmsPayload = {
+          ...rawLlmsObj,
+          usedCompanionMd: Boolean(
+            alternateMarkdownBody &&
+              typeof rawLlmsObj.companionMdUrl === 'string' &&
+              alternateMarkdownUrl === rawLlmsObj.companionMdUrl,
+          ),
+        };
+      }
     }
   }
   if (!llmsPayload && stringFormats.has('llmsTxt')) {
@@ -13004,7 +13110,11 @@ export async function executeScrapeCall(params: {
       if (llmsRes.status === 200) {
         const llmsReply = JSON.parse(llmsRes.bodyText) as { results?: Array<Record<string, unknown>> };
         const llmsItem = llmsReply.results?.[0];
-        if (llmsItem?.outcome === 'ok' && typeof llmsItem.body === 'string') {
+        const llmsFinalSameOrigin =
+          typeof llmsItem?.finalUrl !== 'string' ||
+          !llmsItem.finalUrl.trim() ||
+          isSameHttpsOriginAs(llmsItem.finalUrl, parsedUrl.origin.toLowerCase());
+        if (llmsItem?.outcome === 'ok' && typeof llmsItem.body === 'string' && llmsFinalSameOrigin) {
           const parsedLlms = parseLlmsTxt(llmsItem.body, llmsOriginUrl);
           if (parsedLlms) {
             llmsPayload = {

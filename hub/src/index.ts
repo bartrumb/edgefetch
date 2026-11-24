@@ -20,6 +20,7 @@ import {
   type HubEventInput,
   type HubEventRecord,
   type McpClientActivity,
+  type McpTurnRecordInput,
 } from './activity-log';
 import { handleAdminRoute } from './admin';
 import { queryHostGapRadar } from './gap-radar';
@@ -630,6 +631,17 @@ export class AgentHubDO extends DurableObject<Env> {
     await this.activity.recordMcpCall(params);
   }
 
+  async recordMcpTurn(params: McpTurnRecordInput): Promise<void> {
+    if (this.activity.recordMcpTurn) {
+      await this.activity.recordMcpTurn(params);
+      return;
+    }
+    await this.activity.recordMcpCall(params);
+    if (params.event) {
+      await this.activity.recordEvent(params.event);
+    }
+  }
+
   async getPortalState(now: number): Promise<{
     connected: number;
     distinctPublicIps: number;
@@ -778,6 +790,22 @@ export class AgentHubDO extends DurableObject<Env> {
     return this.oauth.enforcePinnedFounderOwners ? await this.oauth.enforcePinnedFounderOwners(pinnedOwnerId) : 0;
   }
 
+  async oauthResolveMcpAccessToken(params: {
+    tokenHash: string;
+    now: number;
+    pinnedOwnerId?: string | null;
+  }): Promise<{ token: OAuthTokenRecord | null; user: HubUserRecord | null }> {
+    const token = await this.oauth.getAccessToken(params.tokenHash, params.now);
+    if (!token) return { token: null, user: null };
+    const uid = token.userId ?? 'owner';
+    if (uid === 'owner') return { token, user: null };
+    if (params.pinnedOwnerId && this.oauth.enforcePinnedFounderOwners) {
+      await this.oauth.enforcePinnedFounderOwners(params.pinnedOwnerId);
+    }
+    const user = this.oauth.getUser ? await this.oauth.getUser(uid) : null;
+    return { token, user };
+  }
+
   // Per-user AES-256-GCM MCP Vault SQLite RPC methods
   async vaultListServers(userId: string): Promise<StoredMcpServerRow[]> {
     return await this.mcpVault.listServers(userId);
@@ -863,6 +891,35 @@ export class AgentHubDO extends DurableObject<Env> {
 }
 
 function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
+  const enforcePinnedFounderOwnersWithFallback = async (pinnedOwnerId: string): Promise<number> => {
+    const stub = hub() as unknown as Partial<AgentHubDO>;
+    if (typeof stub.oauthEnforcePinnedFounderOwners === 'function') {
+      return await stub.oauthEnforcePinnedFounderOwners(pinnedOwnerId);
+    }
+    const users = await hub().oauthListUsers();
+    let demoted = 0;
+    for (const u of users) {
+      if (
+        u.userId !== 'owner' &&
+        u.role === 'owner' &&
+        String(u.githubId ?? '') !== pinnedOwnerId &&
+        u.promotedByOwnerId !== pinnedOwnerId &&
+        u.promotedByOwnerId !== 'owner'
+      ) {
+        await hub().oauthUpsertUser({
+          ...u,
+          role: 'member',
+          promotedByOwnerId: undefined,
+          sessionEpoch: (u.sessionEpoch ?? 1) + 1,
+          mutationKind: 'demote_unapproved_owner',
+          reconcilePinnedOwnerId: pinnedOwnerId,
+        });
+        demoted++;
+      }
+    }
+    return demoted;
+  };
+
   return {
     putClient: (c) => hub().oauthPutClient(c),
     getClient: (id) => hub().oauthGetClient(id),
@@ -883,34 +940,22 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
     listUsers: () => hub().oauthListUsers(),
     countUsers: () => hub().oauthCountUsers(),
     updateUserRole: (id, role, promotedByOwnerId) => hub().oauthUpdateUserRole(id, role, promotedByOwnerId),
-    enforcePinnedFounderOwners: async (pinnedOwnerId) => {
+    resolveMcpAccessToken: async (params) => {
       const stub = hub() as unknown as Partial<AgentHubDO>;
-      if (typeof stub.oauthEnforcePinnedFounderOwners === 'function') {
-        return await stub.oauthEnforcePinnedFounderOwners(pinnedOwnerId);
+      if (typeof stub.oauthResolveMcpAccessToken === 'function') {
+        return await stub.oauthResolveMcpAccessToken(params);
       }
-      const users = await hub().oauthListUsers();
-      let demoted = 0;
-      for (const u of users) {
-        if (
-          u.userId !== 'owner' &&
-          u.role === 'owner' &&
-          String(u.githubId ?? '') !== pinnedOwnerId &&
-          u.promotedByOwnerId !== pinnedOwnerId &&
-          u.promotedByOwnerId !== 'owner'
-        ) {
-          await hub().oauthUpsertUser({
-            ...u,
-            role: 'member',
-            promotedByOwnerId: undefined,
-            sessionEpoch: (u.sessionEpoch ?? 1) + 1,
-            mutationKind: 'demote_unapproved_owner',
-            reconcilePinnedOwnerId: pinnedOwnerId,
-          });
-          demoted++;
-        }
+      const token = await hub().oauthGetAccessToken(params.tokenHash, params.now);
+      if (!token) return { token: null, user: null };
+      const uid = token.userId ?? 'owner';
+      if (uid === 'owner') return { token, user: null };
+      if (params.pinnedOwnerId) {
+        await enforcePinnedFounderOwnersWithFallback(params.pinnedOwnerId);
       }
-      return demoted;
+      const user = typeof stub.oauthGetUser === 'function' ? await stub.oauthGetUser(uid) : null;
+      return { token, user };
     },
+    enforcePinnedFounderOwners: enforcePinnedFounderOwnersWithFallback,
   };
 }
 
@@ -960,6 +1005,16 @@ function hubActivityProxy(hub: () => DurableObjectStub<AgentHubDO>): ActivitySto
       hub()
         .recordMcpCall(p)
         .catch(() => undefined),
+    recordMcpTurn: (p) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      if (typeof stub.recordMcpTurn === 'function') {
+        return stub.recordMcpTurn(p).catch(() => undefined);
+      }
+      return hub()
+        .recordMcpCall(p)
+        .then(() => (p.event ? hub().recordHubEvents([p.event]) : undefined))
+        .catch(() => undefined);
+    },
     listMcpClients: async () => (await hub().getPortalState(Date.now())).mcpClients ?? [],
   };
 }
@@ -1361,7 +1416,10 @@ export default {
                     .catch(() => undefined);
                 };
 
-                if (env.INGEST && !crawlId && !resolvedCollectionId && trackedCtx?.waitUntil) {
+                if (
+                  trackedCtx?.waitUntil &&
+                  ((env.INGEST && !crawlId && !resolvedCollectionId) || effectiveRetentionPref === 'off')
+                ) {
                   trackedCtx.waitUntil(runPostFetchPersistence());
                 } else {
                   await runPostFetchPersistence();

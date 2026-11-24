@@ -6,7 +6,7 @@
  * optional `TursoHttpD1Database` + `S3ArtifactBucket` storage bindings.
  */
 import dns from 'node:dns';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -71,7 +71,6 @@ import {
   type LookupResolverFn,
 } from './safe-fetch.ts';
 import { S3ArtifactBucket } from './s3-bucket.ts';
-import { NodeFsR2Bucket } from './node-adapters.ts';
 import {
   buildTrackerListWsFrames,
   DAILY_TRACKER_POLL_INTERVAL_MS,
@@ -81,8 +80,49 @@ import {
   refreshHubTrackerList,
   resolveExtraNeverBlockHosts,
   type RefreshTrackerListOutcome,
+  type TrackerBucketLike,
 } from '../src/tracker-list.ts';
 import { TursoHttpD1Database } from './turso-d1.ts';
+
+function createDenoFsTrackerBucket(rootDir: string): TrackerBucketLike {
+  mkdirSync(rootDir, { recursive: true });
+  const resolveSafeKeyPath = (key: string): string => {
+    const clean = key.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!clean || clean.includes('..') || clean.includes('\0')) {
+      throw new Error('invalid tracker storage key');
+    }
+    return join(rootDir, ...clean.split('/'));
+  };
+  return {
+    async get(key: string) {
+      const filePath = resolveSafeKeyPath(key);
+      if (!existsSync(filePath)) return null;
+      const raw = readFileSync(filePath);
+      const bytes = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+      const copy = new Uint8Array(bytes.byteLength);
+      copy.set(bytes);
+      return {
+        async arrayBuffer() {
+          return copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength);
+        },
+        async text() {
+          return new TextDecoder().decode(copy);
+        },
+      };
+    },
+    async put(key: string, value: Uint8Array | ArrayBuffer | string) {
+      const filePath = resolveSafeKeyPath(key);
+      mkdirSync(dirname(filePath), { recursive: true });
+      const data =
+        typeof value === 'string'
+          ? new TextEncoder().encode(value)
+          : value instanceof Uint8Array
+            ? value
+            : new Uint8Array(value);
+      writeFileSync(filePath, data);
+    },
+  };
+}
 
 interface DenoServerHandle {
   addr?: { port?: number; hostname?: string };
@@ -1221,7 +1261,7 @@ export function createDenoHubHandler(options: DenoHubOptions = {}): DenoHubHandl
         return undefined;
       }
       try {
-        return new NodeFsR2Bucket(join(resolve(resolvedDataDir), 'tracker-store'));
+        return createDenoFsTrackerBucket(join(resolve(resolvedDataDir), 'tracker-store'));
       } catch {
         return undefined;
       }

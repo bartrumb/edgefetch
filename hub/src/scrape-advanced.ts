@@ -797,24 +797,7 @@ export function escapeGfmTaskListCheckboxesLinear(prose: string): string {
  * markers on their own line when `allowPdfPageMarkers === true`.
  */
 function replaceAllLtLinearFast(s: string): string {
-  const first = s.indexOf('<');
-  if (first < 0) return s;
-  const n = s.length;
-  const parts: string[] = [];
-  let pos = 0;
-  let lt = first;
-  while (lt >= 0) {
-    if (lt > pos) parts.push(s.slice(pos, lt));
-    let runEnd = lt + 1;
-    while (runEnd < n && s.charCodeAt(runEnd) === 60 /* '<' */) runEnd++;
-    const runLen = runEnd - lt;
-    parts.push(runLen === 1 ? '&lt;' : '&lt;'.repeat(runLen));
-    pos = runEnd;
-    if (pos >= n) break;
-    lt = s.indexOf('<', pos);
-  }
-  if (pos < n) parts.push(s.slice(pos));
-  return parts.length === 1 ? parts[0]! : parts.join('');
+  return s.includes('<') ? s.replaceAll('<', '&lt;') : s;
 }
 
 export function escapeAllResidualLtInProseLinear(prose: string, allowPdfPageMarkers = false): string {
@@ -997,6 +980,9 @@ function hardenAndSplitSliceFences(
   initialCtx?: InitialSliceContext,
 ): Array<{ text: string; isFence: boolean }> {
   const md = normalizeSliceLineEndingsLengthPreserving(rawMd);
+  if (!initialReopenedFence && !md.includes('```') && !md.includes('~~~')) {
+    return [{ text: md, isFence: false }];
+  }
   const lines = md.split('\n');
   const normLines: string[] = [];
   let inFence = false;
@@ -1490,7 +1476,7 @@ export function sanitizeMarkdownPageSlice(
 ): string {
   if (!rawSliceInput) return '';
   const fullMd = normalizeSliceLineEndingsLengthPreserving(rawFullMd);
-  const rawSlice = normalizeSliceLineEndingsLengthPreserving(rawSliceInput);
+  const rawSlice = rawFullMd === rawSliceInput ? fullMd : normalizeSliceLineEndingsLengthPreserving(rawSliceInput);
 
   let inFence = false;
   let fenceChar = '';
@@ -1682,34 +1668,38 @@ export function sanitizeMarkdownPageSlice(
   if (lastSeg && !lastSeg.isFence && lastSeg.text.includes('`')) {
     const lastBlank = lastSeg.text.lastIndexOf('\n\n');
     const tailPara = lastBlank >= 0 ? lastSeg.text.slice(lastBlank + 2) : lastSeg.text;
+    const hasBackslash = tailPara.includes('\\');
     let p = 0;
     let openTickLen = 0;
     while (p < tailPara.length) {
-      if (tailPara.charCodeAt(p) === 96 && !isMarkdownBackslashEscapedAt(tailPara, p)) {
-        let tEnd = p + 1;
-        while (tEnd < tailPara.length && tailPara.charCodeAt(tEnd) === 96) tEnd++;
-        const want = tEnd - p;
-        let q = tEnd;
-        let matchedEnd = -1;
-        while (q < tailPara.length) {
-          const hit = tailPara.indexOf('`', q);
-          if (hit < 0) break;
-          let rEnd = hit + 1;
-          while (rEnd < tailPara.length && tailPara.charCodeAt(rEnd) === 96) rEnd++;
-          if (rEnd - hit === want) {
-            matchedEnd = rEnd;
-            break;
-          }
-          q = rEnd;
-        }
-        if (matchedEnd < 0) {
-          openTickLen = want;
-          break;
-        }
-        p = matchedEnd;
+      const nextTick = tailPara.indexOf('`', p);
+      if (nextTick < 0) break;
+      p = nextTick;
+      if (hasBackslash && isMarkdownBackslashEscapedAt(tailPara, p)) {
+        p++;
         continue;
       }
-      p++;
+      let tEnd = p + 1;
+      while (tEnd < tailPara.length && tailPara.charCodeAt(tEnd) === 96) tEnd++;
+      const want = tEnd - p;
+      let q = tEnd;
+      let matchedEnd = -1;
+      while (q < tailPara.length) {
+        const hit = tailPara.indexOf('`', q);
+        if (hit < 0) break;
+        let rEnd = hit + 1;
+        while (rEnd < tailPara.length && tailPara.charCodeAt(rEnd) === 96) rEnd++;
+        if (rEnd - hit === want) {
+          matchedEnd = rEnd;
+          break;
+        }
+        q = rEnd;
+      }
+      if (matchedEnd < 0) {
+        openTickLen = want;
+        break;
+      }
+      p = matchedEnd;
     }
     if (openTickLen > 0) {
       let trimEndIdx = lastSeg.text.length;

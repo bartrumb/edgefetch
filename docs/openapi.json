@@ -7396,7 +7396,7 @@
           },
           "server": {
             "type": "string",
-            "description": "Connected MCP server slug or domain (required for \"list_tools\" and \"call_tool\")."
+            "description": "Connected MCP server id or slug (required for \"list_tools\" and \"call_tool\")."
           },
           "tool": {
             "type": "string",
@@ -7405,6 +7405,13 @@
           "arguments": {
             "type": "object",
             "description": "JSON object arguments passed to the downstream MCP tool when action=\"call_tool\"."
+          },
+          "allowedMcpTools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional per-request allow-list of non-read-only cached downstream tools in exact \"<slug>/<tool>\" format."
           },
           "refresh": {
             "type": "boolean",

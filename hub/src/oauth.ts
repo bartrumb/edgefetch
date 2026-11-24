@@ -15,6 +15,8 @@ import {
   isGitHubAuthConfigured,
   isGitHubUserDeAllowlisted,
   isPinnedGitHubFounder,
+  normalizeSignupMode,
+  parseGitHubAllowlist,
   reconcileUpgradedFounderOwners,
   resolvePinnedGitHubOwnerId,
   reverifyGitHubOrgAdmission,
@@ -139,12 +141,20 @@ export interface HubUserRecord {
 
 export const MAX_OAUTH_GRANTS_PER_USER = 64;
 export const MAX_OAUTH_TOKENS_PER_USER = MAX_OAUTH_GRANTS_PER_USER * 3;
+export const MAX_OAUTH_GRANTS_PER_OPEN_USER = 4;
+export const MAX_OAUTH_TOKENS_PER_OPEN_USER = MAX_OAUTH_GRANTS_PER_OPEN_USER * 3;
 export const MAX_OAUTH_TOKENS_GLOBAL = 65_536;
 export const MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL = MAX_OAUTH_TOKENS_GLOBAL - MAX_OAUTH_TOKENS_PER_USER * 4;
+export const RESERVED_VETTED_OAUTH_TOKEN_POOL = Math.max(128 * 3, Math.floor(MAX_OAUTH_TOKENS_GLOBAL * 0.2));
+export const MAX_OAUTH_TOKENS_OPEN_GLOBAL = MAX_OAUTH_TOKENS_GLOBAL - RESERVED_VETTED_OAUTH_TOKEN_POOL;
 export const MAX_OAUTH_CODES_PER_USER = 32;
+export const MAX_OAUTH_CODES_PER_OPEN_USER = 4;
 export const MAX_OAUTH_CODES_GLOBAL = 16_384;
+export const MAX_OAUTH_CODES_OPEN_GLOBAL = Math.floor(MAX_OAUTH_CODES_GLOBAL * 0.8);
 export const MAX_REFRESH_ROTATIONS_PER_GRANT_WINDOW = 6;
 export const REFRESH_RATE_LIMIT_WINDOW_MS = 60_000;
+
+export type OAuthAdmissionQuotaTier = 'owner' | 'allowlist' | 'open';
 
 export class OAuthQuotaExceededError extends Error {
   readonly status = 429;
@@ -234,6 +244,8 @@ export interface RotateRefreshParams {
   refreshExpiresAt: number;
   claimedGrantId?: string;
   claimedGeneration?: number;
+  expectedRotationCounter?: number;
+  upgradeLegacyGrantId?: string;
 }
 
 export type RotateRefreshResult =
@@ -291,6 +303,10 @@ export interface OAuthStore {
   }): Promise<void> | void;
   getAccessToken(tokenHash: string, now: number): Promise<OAuthTokenRecord | null> | OAuthTokenRecord | null;
   consumeRefreshToken(tokenHash: string, now: number): Promise<OAuthTokenRecord | null> | OAuthTokenRecord | null;
+  getRefreshTokenLineageHint?(
+    refreshHash: string,
+    now: number,
+  ): Promise<{ grantId: string; rotationCounter: number } | null> | { grantId: string; rotationCounter: number } | null;
   rotateRefreshToken(params: RotateRefreshParams): Promise<RotateRefreshResult> | RotateRefreshResult;
   listGrants(now: number, userId?: string): Promise<OAuthGrantSummary[]> | OAuthGrantSummary[];
   revokeGrant(grantId: string, userId?: string): Promise<boolean> | boolean;
@@ -440,6 +456,8 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         }
       }
       sql.exec('SELECT user_id FROM oauth_tokens LIMIT 1');
+      // M5: Purge any corrupted/pre-lineage refresh or access rows missing a valid non-empty grant_id on upgrade.
+      sql.exec("DELETE FROM oauth_tokens WHERE grant_id IS NULL OR TRIM(grant_id) = ''");
       sql.exec(
         'SELECT promoted_by_owner_id, session_epoch, disabled, admitted_via, admitted_org, encrypted_gh_token, org_verified_at FROM users LIMIT 1',
       );
@@ -447,6 +465,41 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
     } catch {
       // Schema not yet initialized; will run on first query
     }
+  };
+  const classifySqliteAdmissionTier = (userId: string): OAuthAdmissionQuotaTier => {
+    const ghEnv = callerAuthAls.getStore()?.githubAuthEnv;
+    const pinnedFounderId = resolvePinnedGitHubOwnerId(ghEnv);
+    if (userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`)) {
+      return 'owner';
+    }
+    const uRow = sql
+      .exec<{ role?: string | null; admitted_via?: string | null; github_id?: string | null; github_login?: string | null }>(
+        'SELECT role, admitted_via, github_id, github_login FROM users WHERE user_id = ? AND COALESCE(disabled, 0) = 0 LIMIT 1',
+        userId,
+      )
+      .toArray()[0];
+    if (uRow) {
+      if (uRow.role === 'owner' || uRow.admitted_via === 'owner') return 'owner';
+      if (uRow.admitted_via === 'allowlist_id' || uRow.admitted_via === 'allowlist_login' || uRow.admitted_via === 'org') {
+        return 'allowlist';
+      }
+      if (ghEnv) {
+        const allow = parseGitHubAllowlist(ghEnv.GITHUB_ALLOWED_USERS);
+        if (
+          (uRow.github_id && allow.userIds.has(String(uRow.github_id))) ||
+          (uRow.github_login && allow.users.has(uRow.github_login.toLowerCase()))
+        ) {
+          return 'allowlist';
+        }
+      }
+      if (uRow.admitted_via === 'open') return 'open';
+      if (ghEnv && normalizeSignupMode(ghEnv.SIGNUP_MODE) === 'open') return 'open';
+      return 'allowlist';
+    }
+    if (ghEnv && normalizeSignupMode(ghEnv.SIGNUP_MODE) === 'open') {
+      return 'open';
+    }
+    return 'allowlist';
   };
   const demoteUnapprovedOwnersSqlite = (explicitPinnedOwnerId?: string | null): number => {
     ensureMultiUserColumns();
@@ -532,8 +585,11 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       ensureMultiUserColumns();
       const userId = code.userId ?? 'owner';
       const userRole = normalizeRoleForUser(userId, code.userRole);
+      const tier = classifySqliteAdmissionTier(userId);
+      const perUserCodeCap = tier === 'open' ? MAX_OAUTH_CODES_PER_OPEN_USER : MAX_OAUTH_CODES_PER_USER;
+      const globalCodeCap = tier === 'open' ? MAX_OAUTH_CODES_OPEN_GLOBAL : MAX_OAUTH_CODES_GLOBAL;
       sql.exec('DELETE FROM oauth_codes WHERE expires_at <= ?', code.expiresAt - AUTH_CODE_TTL_MS);
-      // Per-user authorization code cap: evict ONLY this user's oldest pending codes beyond MAX_OAUTH_CODES_PER_USER - 1.
+      // Per-user authorization code cap: evict ONLY this user's oldest pending codes beyond perUserCodeCap - 1.
       sql.exec(
         `DELETE FROM oauth_codes
          WHERE user_id = ?
@@ -545,20 +601,34 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
            )`,
         userId,
         userId,
-        MAX_OAUTH_CODES_PER_USER - 1,
+        perUserCodeCap - 1,
       );
       const totalCodes = sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_codes').toArray()[0]?.c ?? 0;
-      if (totalCodes >= MAX_OAUTH_CODES_GLOBAL) {
-        if (userId !== 'owner') {
+      if (totalCodes >= globalCodeCap) {
+        if (tier !== 'owner') {
           throw new OAuthQuotaExceededError('Global OAuth authorization code capacity reached; retry shortly');
         }
         sql.exec(
           `DELETE FROM oauth_codes
-           WHERE user_id = 'owner'
-             AND code_hash IN (
-               SELECT code_hash FROM oauth_codes WHERE user_id = 'owner' ORDER BY expires_at ASC, ROWID ASC LIMIT 1
-             )`,
+           WHERE code_hash IN (
+             SELECT oc.code_hash FROM oauth_codes oc
+              LEFT JOIN users u ON u.user_id = oc.user_id
+              WHERE oc.user_id != 'owner' AND u.admitted_via = 'open' AND u.role != 'owner'
+              ORDER BY oc.expires_at ASC, oc.ROWID ASC LIMIT 1
+           )`,
         );
+        const remCodes = sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_codes').toArray()[0]?.c ?? 0;
+        if (remCodes >= globalCodeCap) {
+          sql.exec(
+            `DELETE FROM oauth_codes
+             WHERE user_id = ?
+               AND code_hash IN (
+                 SELECT code_hash FROM oauth_codes WHERE user_id = ? ORDER BY expires_at ASC, ROWID ASC LIMIT 1
+               )`,
+            userId,
+            userId,
+          );
+        }
       }
       sql.exec(
         `INSERT OR REPLACE INTO oauth_codes
@@ -613,8 +683,10 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       ensureMultiUserColumns();
       const userId = p.userId ?? 'owner';
       const userRole = normalizeRoleForUser(userId, p.userRole);
-      const pinnedFounderId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
-      const isFounderUser = userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`);
+      const tier = classifySqliteAdmissionTier(userId);
+      const isOwnerTier = tier === 'owner';
+      const userGrantCap = tier === 'open' ? MAX_OAUTH_GRANTS_PER_OPEN_USER : MAX_OAUTH_GRANTS_PER_USER;
+      const userTokenCap = tier === 'open' ? MAX_OAUTH_TOKENS_PER_OPEN_USER : MAX_OAUTH_TOKENS_PER_USER;
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', p.createdAt);
       sql.exec('DELETE FROM oauth_grant_rate_limits WHERE reset_at <= ?', p.createdAt);
       // Ensure at most 1 used marker per grant for this user before checking caps
@@ -629,7 +701,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         userId,
         userId,
       );
-      // Per-user active grant cap: evict ONLY oldest grants belonging to THIS user_id beyond MAX_OAUTH_GRANTS_PER_USER - 1.
+      // Per-user active grant cap: evict ONLY oldest grants belonging to THIS user_id beyond userGrantCap - 1.
       sql.exec(
         `DELETE FROM oauth_tokens
          WHERE user_id = ?
@@ -642,13 +714,13 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
            )`,
         userId,
         userId,
-        MAX_OAUTH_GRANTS_PER_USER - 1,
+        userGrantCap - 1,
       );
-      // If still above MAX_OAUTH_TOKENS_PER_USER - 2, evict oldest used markers for THIS user first
+      // If still above userTokenCap - 2, evict oldest used markers for THIS user first
       const curUserTokens =
         sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE user_id = ?', userId).toArray()[0]?.c ?? 0;
-      if (curUserTokens + 2 > MAX_OAUTH_TOKENS_PER_USER) {
-        const excess = curUserTokens + 2 - MAX_OAUTH_TOKENS_PER_USER;
+      if (curUserTokens + 2 > userTokenCap) {
+        const excess = curUserTokens + 2 - userTokenCap;
         sql.exec(
           `DELETE FROM oauth_tokens
            WHERE user_id = ?
@@ -674,26 +746,54 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
            )`,
         userId,
         userId,
-        MAX_OAUTH_TOKENS_PER_USER - 2,
+        userTokenCap - 2,
       );
       const totalTokens = sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens').toArray()[0]?.c ?? 0;
-      const effectiveGlobalCap = isFounderUser ? MAX_OAUTH_TOKENS_GLOBAL : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
+      const effectiveGlobalCap =
+        tier === 'owner'
+          ? MAX_OAUTH_TOKENS_GLOBAL
+          : tier === 'open'
+            ? MAX_OAUTH_TOKENS_OPEN_GLOBAL
+            : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
       if (totalTokens + 2 > effectiveGlobalCap) {
-        // Evict stale used refresh markers from non-founder users first so used markers never block new grants
         const needed = totalTokens + 2 - effectiveGlobalCap;
-        sql.exec(
-          `DELETE FROM oauth_tokens
-           WHERE token_hash IN (
-             SELECT token_hash FROM oauth_tokens
-              WHERE user_id != 'owner' AND (kind = 'refresh_used' OR used_at IS NOT NULL)
-              ORDER BY COALESCE(used_at, created_at) ASC, ROWID ASC
-              LIMIT ?
-           )`,
-          needed,
-        );
+        if (tier === 'open') {
+          // M7: Open-admission accounts may ONLY trim stale used markers from open-admission accounts — NEVER touching owner/allowlist tokens!
+          sql.exec(
+            `DELETE FROM oauth_tokens
+             WHERE token_hash IN (
+               SELECT ot.token_hash FROM oauth_tokens ot
+                INNER JOIN users u ON u.user_id = ot.user_id
+                WHERE ot.user_id != 'owner'
+                  AND u.role != 'owner'
+                  AND u.admitted_via = 'open'
+                  AND (ot.kind = 'refresh_used' OR ot.used_at IS NOT NULL)
+                ORDER BY COALESCE(ot.used_at, ot.created_at) ASC, ot.ROWID ASC
+                LIMIT ?
+             )`,
+            needed,
+          );
+        } else {
+          // Evict stale used refresh markers from open/non-owner users first so used markers never block vetted grants
+          sql.exec(
+            `DELETE FROM oauth_tokens
+             WHERE token_hash IN (
+               SELECT ot.token_hash FROM oauth_tokens ot
+                LEFT JOIN users u ON u.user_id = ot.user_id
+                WHERE ot.user_id != 'owner'
+                  AND COALESCE(u.role, ot.user_role) != 'owner'
+                  AND (ot.kind = 'refresh_used' OR ot.used_at IS NOT NULL)
+                ORDER BY (CASE WHEN u.admitted_via = 'open' THEN 0 ELSE 1 END) ASC,
+                         COALESCE(ot.used_at, ot.created_at) ASC,
+                         ot.ROWID ASC
+                LIMIT ?
+             )`,
+            needed,
+          );
+        }
         const afterTrimTotal = sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens').toArray()[0]?.c ?? 0;
         if (afterTrimTotal + 2 > effectiveGlobalCap) {
-          if (!isFounderUser) {
+          if (!isOwnerTier) {
             throw new OAuthQuotaExceededError();
           }
           sql.exec(
@@ -815,6 +915,20 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         expiresAt: r.expires_at,
       };
     },
+    getRefreshTokenLineageHint(refreshHash, now) {
+      ensureMultiUserColumns();
+      const row = sql
+        .exec<{ grant_id: string; rotation_counter?: number; expires_at: number }>(
+          "SELECT grant_id, rotation_counter, expires_at FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh' AND used_at IS NULL LIMIT 1",
+          refreshHash,
+        )
+        .toArray()[0];
+      if (!row || row.expires_at <= now || !row.grant_id) return null;
+      return {
+        grantId: row.grant_id,
+        rotationCounter: Number(row.rotation_counter ?? 0),
+      };
+    },
     rotateRefreshToken(params) {
       ensureMultiUserColumns();
       const rows = sql
@@ -868,6 +982,10 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         }
         return { ok: false, error: 'invalid_grant' };
       }
+      if (!r.grant_id || !r.grant_id.trim()) {
+        sql.exec('DELETE FROM oauth_tokens WHERE token_hash = ?', params.refreshHash);
+        return { ok: false, error: 'invalid_grant' };
+      }
       if (r.expires_at <= params.now) {
         sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ?', r.grant_id);
         sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', r.grant_id);
@@ -887,6 +1005,12 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       }
       // Verify client_id BEFORE mutating the grant or touching rate limits so a wrong client_id cannot burn a valid grant (H-S3)!
       if (!params.clientId || r.client_id !== params.clientId) {
+        return { ok: false, error: 'invalid_grant' };
+      }
+      if (
+        params.expectedRotationCounter !== undefined &&
+        Number(r.rotation_counter ?? 0) !== params.expectedRotationCounter
+      ) {
         return { ok: false, error: 'invalid_grant' };
       }
 
@@ -922,17 +1046,19 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         };
       }
 
-      // U2: Prune expired tokens first, then enforce per-user & global caps BEFORE mutating this grant
+      // U2 / M7: Prune expired tokens first, then enforce per-user & tier-scoped global caps BEFORE mutating this grant
       sql.exec('DELETE FROM oauth_tokens WHERE expires_at <= ?', params.now);
-      const pinnedFounderId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
-      const isFounderUser = userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`);
+      const tier = classifySqliteAdmissionTier(userId);
+      const isOwnerTier = tier === 'owner';
+      const userGrantCap = tier === 'open' ? MAX_OAUTH_GRANTS_PER_OPEN_USER : MAX_OAUTH_GRANTS_PER_USER;
+      const userTokenCap = tier === 'open' ? MAX_OAUTH_TOKENS_PER_OPEN_USER : MAX_OAUTH_TOKENS_PER_USER;
 
       let otherUserRows =
         sql
           .exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE user_id = ? AND grant_id != ?', userId, r.grant_id)
           .toArray()[0]?.c ?? 0;
-      if (otherUserRows + 3 > MAX_OAUTH_TOKENS_PER_USER) {
-        const excess = otherUserRows + 3 - MAX_OAUTH_TOKENS_PER_USER;
+      if (otherUserRows + 3 > userTokenCap) {
+        const excess = otherUserRows + 3 - userTokenCap;
         sql.exec(
           `DELETE FROM oauth_tokens
            WHERE user_id = ? AND grant_id != ?
@@ -961,7 +1087,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
             r.grant_id,
           )
           .toArray()[0]?.c ?? 0;
-      if (otherUserRows + 3 > MAX_OAUTH_TOKENS_PER_USER || otherUserGrants + 1 > MAX_OAUTH_GRANTS_PER_USER) {
+      if (otherUserRows + 3 > userTokenCap || otherUserGrants + 1 > userGrantCap) {
         return {
           ok: false,
           error: 'user_quota_exceeded',
@@ -971,28 +1097,60 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         };
       }
 
-      const effectiveGlobalCap = isFounderUser ? MAX_OAUTH_TOKENS_GLOBAL : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
+      const effectiveGlobalCap =
+        tier === 'owner'
+          ? MAX_OAUTH_TOKENS_GLOBAL
+          : tier === 'open'
+            ? MAX_OAUTH_TOKENS_OPEN_GLOBAL
+            : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
       let totalOtherRows =
         sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE grant_id != ?', r.grant_id).toArray()[0]?.c ?? 0;
       if (totalOtherRows + 3 > effectiveGlobalCap) {
         const needed = totalOtherRows + 3 - effectiveGlobalCap;
-        sql.exec(
-          `DELETE FROM oauth_tokens
-           WHERE grant_id != ?
-             AND token_hash IN (
-               SELECT token_hash FROM oauth_tokens
-                WHERE grant_id != ? AND user_id != 'owner' AND (kind = 'refresh_used' OR used_at IS NOT NULL)
-                ORDER BY COALESCE(used_at, created_at) ASC, ROWID ASC
-                LIMIT ?
-             )`,
-          r.grant_id,
-          r.grant_id,
-          needed,
-        );
+        if (tier === 'open') {
+          sql.exec(
+            `DELETE FROM oauth_tokens
+             WHERE grant_id != ?
+               AND token_hash IN (
+                 SELECT ot.token_hash FROM oauth_tokens ot
+                  INNER JOIN users u ON u.user_id = ot.user_id
+                  WHERE ot.grant_id != ?
+                    AND ot.user_id != 'owner'
+                    AND u.role != 'owner'
+                    AND u.admitted_via = 'open'
+                    AND (ot.kind = 'refresh_used' OR ot.used_at IS NOT NULL)
+                  ORDER BY COALESCE(ot.used_at, ot.created_at) ASC, ot.ROWID ASC
+                  LIMIT ?
+               )`,
+            r.grant_id,
+            r.grant_id,
+            needed,
+          );
+        } else {
+          sql.exec(
+            `DELETE FROM oauth_tokens
+             WHERE grant_id != ?
+               AND token_hash IN (
+                 SELECT ot.token_hash FROM oauth_tokens ot
+                  LEFT JOIN users u ON u.user_id = ot.user_id
+                  WHERE ot.grant_id != ?
+                    AND ot.user_id != 'owner'
+                    AND COALESCE(u.role, ot.user_role) != 'owner'
+                    AND (ot.kind = 'refresh_used' OR ot.used_at IS NOT NULL)
+                  ORDER BY (CASE WHEN u.admitted_via = 'open' THEN 0 ELSE 1 END) ASC,
+                           COALESCE(ot.used_at, ot.created_at) ASC,
+                           ot.ROWID ASC
+                  LIMIT ?
+               )`,
+            r.grant_id,
+            r.grant_id,
+            needed,
+          );
+        }
         totalOtherRows =
           sql.exec<{ c: number }>('SELECT COUNT(*) AS c FROM oauth_tokens WHERE grant_id != ?', r.grant_id).toArray()[0]?.c ?? 0;
         if (totalOtherRows + 3 > effectiveGlobalCap) {
-          if (!isFounderUser) {
+          if (!isOwnerTier) {
             return {
               ok: false,
               error: 'user_quota_exceeded',
@@ -1019,23 +1177,37 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
         }
       }
 
-      // Record per-grant rate limit hit
+      const effectiveGrantId =
+        params.upgradeLegacyGrantId && /^grant_[A-Za-z0-9_-]{8,40}$/.test(params.upgradeLegacyGrantId)
+          ? params.upgradeLegacyGrantId
+          : r.grant_id;
+      const nextCounter = effectiveGrantId !== r.grant_id ? 1 : Number(r.rotation_counter ?? 0) + 1;
+
+      // Record per-grant rate limit hit (migrating rate-limit row if legacy grant_id upgraded)
+      if (effectiveGrantId !== r.grant_id) {
+        sql.exec('DELETE FROM oauth_grant_rate_limits WHERE grant_id = ?', r.grant_id);
+      }
       if (!rlRow || rlRow.reset_at <= params.now) {
         sql.exec(
           'INSERT OR REPLACE INTO oauth_grant_rate_limits (grant_id, count, reset_at) VALUES (?, 1, ?)',
-          r.grant_id,
+          effectiveGrantId,
           params.now + REFRESH_RATE_LIMIT_WINDOW_MS,
         );
       } else {
-        sql.exec('UPDATE oauth_grant_rate_limits SET count = ? WHERE grant_id = ?', rlRow.count + 1, r.grant_id);
+        sql.exec(
+          'INSERT OR REPLACE INTO oauth_grant_rate_limits (grant_id, count, reset_at) VALUES (?, ?, ?)',
+          effectiveGrantId,
+          rlRow.count + 1,
+          rlRow.reset_at,
+        );
       }
 
       // U2: Delete ALL prior access & prior `refresh_used` markers for this grant so each grant holds
       // at most 1 active access + 1 active refresh + 1 `refresh_used` marker (`<= 3` rows O(1) forever)!
       sql.exec('DELETE FROM oauth_tokens WHERE grant_id = ? AND token_hash != ?', r.grant_id, params.refreshHash);
-      const nextCounter = Number(r.rotation_counter ?? 0) + 1;
       sql.exec(
-        "UPDATE oauth_tokens SET kind = 'refresh_used', used_at = ?, expires_at = ? WHERE token_hash = ?",
+        "UPDATE oauth_tokens SET grant_id = ?, kind = 'refresh_used', used_at = ?, expires_at = ? WHERE token_hash = ?",
+        effectiveGrantId,
         params.now,
         Math.max(r.expires_at, params.refreshExpiresAt),
         params.refreshHash,
@@ -1045,7 +1217,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
          (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, used_at, rotation_counter, created_at, expires_at)
          VALUES (?, ?, 'access', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         params.nextAccessHash,
-        r.grant_id,
+        effectiveGrantId,
         r.client_id,
         r.client_name,
         r.scopes_json,
@@ -1061,7 +1233,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
          (token_hash, grant_id, kind, client_id, client_name, scopes_json, resource, user_id, user_role, used_at, rotation_counter, created_at, expires_at)
          VALUES (?, ?, 'refresh', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
         params.nextRefreshHash,
-        r.grant_id,
+        effectiveGrantId,
         r.client_id,
         r.client_name,
         r.scopes_json,
@@ -1074,7 +1246,7 @@ export function createSqliteOAuthStore(sql: SqlStorageLike): OAuthStore {
       );
       return {
         ok: true,
-        grantId: r.grant_id,
+        grantId: effectiveGrantId,
         clientId: r.client_id,
         clientName: r.client_name,
         scopes: JSON.parse(r.scopes_json) as string[],
@@ -1937,6 +2109,37 @@ export function createMemoryOAuthStore(): OAuthStore {
     };
   };
 
+  const classifyMemoryAdmissionTier = (userId: string): OAuthAdmissionQuotaTier => {
+    const ghEnv = callerAuthAls.getStore()?.githubAuthEnv;
+    const pinnedFounderId = resolvePinnedGitHubOwnerId(ghEnv);
+    if (userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`)) {
+      return 'owner';
+    }
+    const u = users.get(userId);
+    if (u && !u.disabled) {
+      if (u.role === 'owner' || u.admittedVia === 'owner') return 'owner';
+      if (u.admittedVia === 'allowlist_id' || u.admittedVia === 'allowlist_login' || u.admittedVia === 'org') {
+        return 'allowlist';
+      }
+      if (ghEnv) {
+        const allow = parseGitHubAllowlist(ghEnv.GITHUB_ALLOWED_USERS);
+        if (
+          (u.githubId && allow.userIds.has(String(u.githubId))) ||
+          (u.githubLogin && allow.users.has(u.githubLogin.toLowerCase()))
+        ) {
+          return 'allowlist';
+        }
+      }
+      if (u.admittedVia === 'open') return 'open';
+      if (ghEnv && normalizeSignupMode(ghEnv.SIGNUP_MODE) === 'open') return 'open';
+      return 'allowlist';
+    }
+    if (ghEnv && normalizeSignupMode(ghEnv.SIGNUP_MODE) === 'open') {
+      return 'open';
+    }
+    return 'allowlist';
+  };
+
   return {
     putClient(c) {
       if (clients.size >= 500) {
@@ -1961,22 +2164,35 @@ export function createMemoryOAuthStore(): OAuthStore {
         if (v.expiresAt <= approxNow) codes.delete(k);
       }
       const userId = code.userId ?? 'owner';
+      const tier = classifyMemoryAdmissionTier(userId);
+      const perUserCodeCap = tier === 'open' ? MAX_OAUTH_CODES_PER_OPEN_USER : MAX_OAUTH_CODES_PER_USER;
+      const globalCodeCap = tier === 'open' ? MAX_OAUTH_CODES_OPEN_GLOBAL : MAX_OAUTH_CODES_GLOBAL;
       const userCodeKeys: string[] = [];
       for (const [k, v] of codes.entries()) {
         if ((v.userId ?? 'owner') === userId) userCodeKeys.push(k);
       }
-      while (userCodeKeys.length >= MAX_OAUTH_CODES_PER_USER) {
+      while (userCodeKeys.length >= perUserCodeCap) {
         const oldest = userCodeKeys.shift();
         if (oldest !== undefined) codes.delete(oldest);
       }
-      if (codes.size >= MAX_OAUTH_CODES_GLOBAL) {
-        if (userId !== 'owner') {
+      if (codes.size >= globalCodeCap) {
+        if (tier !== 'owner') {
           throw new OAuthQuotaExceededError('Global OAuth authorization code capacity reached; retry shortly');
         }
+        let evicted = false;
         for (const [k, v] of codes.entries()) {
-          if ((v.userId ?? 'owner') === 'owner') {
+          if (classifyMemoryAdmissionTier(v.userId ?? 'owner') === 'open') {
             codes.delete(k);
+            evicted = true;
             break;
+          }
+        }
+        if (!evicted) {
+          for (const [k, v] of codes.entries()) {
+            if ((v.userId ?? 'owner') === userId) {
+              codes.delete(k);
+              break;
+            }
           }
         }
       }
@@ -2002,8 +2218,10 @@ export function createMemoryOAuthStore(): OAuthStore {
       }
       const userId = p.userId ?? 'owner';
       const userRole = normalizeRoleForUser(userId, p.userRole);
-      const pinnedFounderId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
-      const isFounderUser = userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`);
+      const tier = classifyMemoryAdmissionTier(userId);
+      const isOwnerTier = tier === 'owner';
+      const userGrantCap = tier === 'open' ? MAX_OAUTH_GRANTS_PER_OPEN_USER : MAX_OAUTH_GRANTS_PER_USER;
+      const userTokenCap = tier === 'open' ? MAX_OAUTH_TOKENS_PER_OPEN_USER : MAX_OAUTH_TOKENS_PER_USER;
       const userGrantsInOrder: string[] = [];
       const seenUserGrants = new Set<string>();
       for (const [, v] of tokens.entries()) {
@@ -2013,7 +2231,7 @@ export function createMemoryOAuthStore(): OAuthStore {
           userGrantsInOrder.push(v.grantId);
         }
       }
-      while (userGrantsInOrder.length >= MAX_OAUTH_GRANTS_PER_USER) {
+      while (userGrantsInOrder.length >= userGrantCap) {
         const oldestGrant = userGrantsInOrder.shift();
         if (oldestGrant === undefined) break;
         for (const [k, v] of tokens.entries()) {
@@ -2029,7 +2247,7 @@ export function createMemoryOAuthStore(): OAuthStore {
         userTokenHashes.push(k);
         if (v.used) userUsedHashes.push(k);
       }
-      while (userTokenHashes.length + 2 > MAX_OAUTH_TOKENS_PER_USER && userUsedHashes.length > 0) {
+      while (userTokenHashes.length + 2 > userTokenCap && userUsedHashes.length > 0) {
         const oldestUsed = userUsedHashes.shift();
         if (oldestUsed !== undefined) {
           tokens.delete(oldestUsed);
@@ -2037,19 +2255,35 @@ export function createMemoryOAuthStore(): OAuthStore {
           if (idx >= 0) userTokenHashes.splice(idx, 1);
         }
       }
-      while (userTokenHashes.length + 2 > MAX_OAUTH_TOKENS_PER_USER) {
+      while (userTokenHashes.length + 2 > userTokenCap) {
         const oldest = userTokenHashes.shift();
         if (oldest !== undefined) tokens.delete(oldest);
       }
-      const effectiveGlobalCap = isFounderUser ? MAX_OAUTH_TOKENS_GLOBAL : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
+      const effectiveGlobalCap =
+        tier === 'owner'
+          ? MAX_OAUTH_TOKENS_GLOBAL
+          : tier === 'open'
+            ? MAX_OAUTH_TOKENS_OPEN_GLOBAL
+            : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
       if (tokens.size + 2 > effectiveGlobalCap) {
         for (const [k, v] of tokens.entries()) {
           if (tokens.size + 2 <= effectiveGlobalCap) break;
-          if ((v.userId ?? 'owner') !== 'owner' && v.used) tokens.delete(k);
+          const rowTier = classifyMemoryAdmissionTier(v.userId ?? 'owner');
+          if (rowTier === 'open' && v.used) {
+            tokens.delete(k);
+          }
+        }
+        if (tier !== 'open' && tokens.size + 2 > effectiveGlobalCap) {
+          for (const [k, v] of tokens.entries()) {
+            if (tokens.size + 2 <= effectiveGlobalCap) break;
+            if (classifyMemoryAdmissionTier(v.userId ?? 'owner') !== 'owner' && v.used) {
+              tokens.delete(k);
+            }
+          }
         }
       }
       if (tokens.size + 2 > effectiveGlobalCap) {
-        if (!isFounderUser) {
+        if (!isOwnerTier) {
           throw new OAuthQuotaExceededError();
         }
         let ownerOldestGrant: string | undefined;
@@ -2113,6 +2347,14 @@ export function createMemoryOAuthStore(): OAuthStore {
       if (t.expiresAt <= now) return null;
       return { ...t, scopes: [...t.scopes] };
     },
+    getRefreshTokenLineageHint(refreshHash, now) {
+      const t = tokens.get(refreshHash);
+      if (!t || t.kind !== 'refresh' || t.used || t.expiresAt <= now || !t.grantId) return null;
+      return {
+        grantId: t.grantId,
+        rotationCounter: t.rotationCounter ?? 0,
+      };
+    },
     rotateRefreshToken(params) {
       const t = tokens.get(params.refreshHash);
       if (!t || t.kind !== 'refresh') {
@@ -2147,6 +2389,10 @@ export function createMemoryOAuthStore(): OAuthStore {
         }
         return { ok: false, error: 'invalid_grant' };
       }
+      if (!t.grantId || !t.grantId.trim()) {
+        tokens.delete(params.refreshHash);
+        return { ok: false, error: 'invalid_grant' };
+      }
       if (t.expiresAt <= params.now) {
         for (const [h, row] of tokens.entries()) if (row.grantId === t.grantId) tokens.delete(h);
         grantRefreshRateLimits.delete(t.grantId);
@@ -2158,6 +2404,12 @@ export function createMemoryOAuthStore(): OAuthStore {
         return { ok: false, error: 'invalid_grant', replayDetected: true, grantId: t.grantId, clientId: t.clientId };
       }
       if (!params.clientId || t.clientId !== params.clientId) {
+        return { ok: false, error: 'invalid_grant' };
+      }
+      if (
+        params.expectedRotationCounter !== undefined &&
+        (t.rotationCounter ?? 0) !== params.expectedRotationCounter
+      ) {
         return { ok: false, error: 'invalid_grant' };
       }
       const userId = t.userId ?? 'owner';
@@ -2189,8 +2441,10 @@ export function createMemoryOAuthStore(): OAuthStore {
       for (const [h, row] of tokens.entries()) {
         if (row.expiresAt <= params.now) tokens.delete(h);
       }
-      const pinnedFounderId = resolvePinnedGitHubOwnerId(callerAuthAls.getStore()?.githubAuthEnv);
-      const isFounderUser = userId === 'owner' || (pinnedFounderId !== null && userId === `gh_${pinnedFounderId}`);
+      const tier = classifyMemoryAdmissionTier(userId);
+      const isOwnerTier = tier === 'owner';
+      const userGrantCap = tier === 'open' ? MAX_OAUTH_GRANTS_PER_OPEN_USER : MAX_OAUTH_GRANTS_PER_USER;
+      const userTokenCap = tier === 'open' ? MAX_OAUTH_TOKENS_PER_OPEN_USER : MAX_OAUTH_TOKENS_PER_USER;
 
       let otherUserRows = 0;
       const otherUserUsedHashes: string[] = [];
@@ -2201,11 +2455,11 @@ export function createMemoryOAuthStore(): OAuthStore {
         otherUserGrants.add(row.grantId);
         if (row.used) otherUserUsedHashes.push(h);
       }
-      while (otherUserRows + 3 > MAX_OAUTH_TOKENS_PER_USER && otherUserUsedHashes.length > 0) {
+      while (otherUserRows + 3 > userTokenCap && otherUserUsedHashes.length > 0) {
         const victim = otherUserUsedHashes.shift();
         if (victim !== undefined && tokens.delete(victim)) otherUserRows--;
       }
-      if (otherUserRows + 3 > MAX_OAUTH_TOKENS_PER_USER || otherUserGrants.size + 1 > MAX_OAUTH_GRANTS_PER_USER) {
+      if (otherUserRows + 3 > userTokenCap || otherUserGrants.size + 1 > userGrantCap) {
         return {
           ok: false,
           error: 'user_quota_exceeded',
@@ -2215,7 +2469,12 @@ export function createMemoryOAuthStore(): OAuthStore {
         };
       }
 
-      const effectiveGlobalCap = isFounderUser ? MAX_OAUTH_TOKENS_GLOBAL : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
+      const effectiveGlobalCap =
+        tier === 'owner'
+          ? MAX_OAUTH_TOKENS_GLOBAL
+          : tier === 'open'
+            ? MAX_OAUTH_TOKENS_OPEN_GLOBAL
+            : MAX_OAUTH_TOKENS_NON_OWNER_GLOBAL;
       let totalOtherRows = 0;
       for (const row of tokens.values()) {
         if (row.grantId !== t.grantId) totalOtherRows++;
@@ -2223,12 +2482,21 @@ export function createMemoryOAuthStore(): OAuthStore {
       if (totalOtherRows + 3 > effectiveGlobalCap) {
         for (const [h, row] of tokens.entries()) {
           if (totalOtherRows + 3 <= effectiveGlobalCap) break;
-          if (row.grantId !== t.grantId && (row.userId ?? 'owner') !== 'owner' && row.used) {
+          if (row.grantId !== t.grantId && classifyMemoryAdmissionTier(row.userId ?? 'owner') === 'open' && row.used) {
             tokens.delete(h);
             totalOtherRows--;
           }
         }
-        if (totalOtherRows + 3 > effectiveGlobalCap && !isFounderUser) {
+        if (tier !== 'open' && totalOtherRows + 3 > effectiveGlobalCap) {
+          for (const [h, row] of tokens.entries()) {
+            if (totalOtherRows + 3 <= effectiveGlobalCap) break;
+            if (row.grantId !== t.grantId && classifyMemoryAdmissionTier(row.userId ?? 'owner') !== 'owner' && row.used) {
+              tokens.delete(h);
+              totalOtherRows--;
+            }
+          }
+        }
+        if (totalOtherRows + 3 > effectiveGlobalCap && !isOwnerTier) {
           return {
             ok: false,
             error: 'user_quota_exceeded',
@@ -2239,22 +2507,31 @@ export function createMemoryOAuthStore(): OAuthStore {
         }
       }
 
+      const effectiveGrantId =
+        params.upgradeLegacyGrantId && /^grant_[A-Za-z0-9_-]{8,40}$/.test(params.upgradeLegacyGrantId)
+          ? params.upgradeLegacyGrantId
+          : t.grantId;
+      const nextCounter = effectiveGrantId !== t.grantId ? 1 : (t.rotationCounter ?? 0) + 1;
+
+      if (effectiveGrantId !== t.grantId) {
+        grantRefreshRateLimits.delete(t.grantId);
+      }
       if (!rlCur || rlCur.resetAt <= params.now) {
-        grantRefreshRateLimits.set(t.grantId, { count: 1, resetAt: params.now + REFRESH_RATE_LIMIT_WINDOW_MS });
+        grantRefreshRateLimits.set(effectiveGrantId, { count: 1, resetAt: params.now + REFRESH_RATE_LIMIT_WINDOW_MS });
       } else {
-        rlCur.count++;
+        grantRefreshRateLimits.set(effectiveGrantId, { count: rlCur.count + 1, resetAt: rlCur.resetAt });
       }
 
       // Delete ALL prior access & prior used refresh markers for this grant (`<= 3` rows O(1) per grant)
       for (const [h, row] of tokens.entries()) {
         if (row.grantId === t.grantId && h !== params.refreshHash) tokens.delete(h);
       }
-      const nextCounter = (t.rotationCounter ?? 0) + 1;
+      t.grantId = effectiveGrantId;
       t.used = true;
       t.usedAt = params.now;
       t.expiresAt = Math.max(t.expiresAt, params.refreshExpiresAt);
       tokens.set(params.nextAccessHash, {
-        grantId: t.grantId,
+        grantId: effectiveGrantId,
         kind: 'access',
         clientId: t.clientId,
         clientName: t.clientName,
@@ -2267,7 +2544,7 @@ export function createMemoryOAuthStore(): OAuthStore {
         expiresAt: params.accessExpiresAt,
       });
       tokens.set(params.nextRefreshHash, {
-        grantId: t.grantId,
+        grantId: effectiveGrantId,
         kind: 'refresh',
         clientId: t.clientId,
         clientName: t.clientName,
@@ -2281,7 +2558,7 @@ export function createMemoryOAuthStore(): OAuthStore {
       });
       return {
         ok: true,
-        grantId: t.grantId,
+        grantId: effectiveGrantId,
         clientId: t.clientId,
         clientName: t.clientName,
         scopes: [...t.scopes],
@@ -4236,8 +4513,12 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           }
         }
 
+        const refreshHash = await sha256Base64Url(refreshToken);
         const nextAccess = `efa_${randomUrlToken(32)}`;
-        let nextRefresh = `efr_${randomUrlToken(32)}`;
+        let nextRefresh: string;
+        let expectedRotationCounter: number | undefined;
+        let upgradeLegacyGrantId: string | undefined;
+
         if (claimedGrantId !== undefined && claimedGeneration !== undefined) {
           const nextGen = claimedGeneration + 1;
           const nextRand = randomUrlToken(24);
@@ -4245,9 +4526,39 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
             await hmacSha256Base64Url(`efr-v2:${signingSecret}`, `${claimedGrantId}.${nextGen}.${clientId}.${nextRand}`)
           ).slice(0, 22);
           nextRefresh = `efr_${claimedGrantId}.${nextGen}.${nextRand}.${nextSig}`;
+        } else if (lineageMatch) {
+          // Malformed/forged v2.7.5+ lineage signature: never upgrade or burn legitimate grant
+          nextRefresh = `efr_${randomUrlToken(32)}`;
+        } else {
+          // M5: Pre-v2.7.5 legacy opaque refresh token (`efr_<opaque>`): upgrade to full HMAC-authenticated
+          // `efr_<grantId>.<gen>.<rand>.<sig22>` lineage on its VERY FIRST rotation!
+          const hint =
+            typeof deps.store.getRefreshTokenLineageHint === 'function'
+              ? await deps.store.getRefreshTokenLineageHint(refreshHash, now)
+              : null;
+          let targetGrantId: string;
+          let nextGen: number;
+          if (hint && /^grant_[A-Za-z0-9_-]{8,40}$/.test(hint.grantId)) {
+            targetGrantId = hint.grantId;
+            expectedRotationCounter = hint.rotationCounter;
+            nextGen = hint.rotationCounter + 1;
+          } else {
+            targetGrantId = `grant_${randomUrlToken(12)}`;
+            upgradeLegacyGrantId = targetGrantId;
+            if (hint) {
+              expectedRotationCounter = hint.rotationCounter;
+            }
+            nextGen = 1;
+          }
+          const nextRand = randomUrlToken(24);
+          const nextSig = (
+            await hmacSha256Base64Url(`efr-v2:${signingSecret}`, `${targetGrantId}.${nextGen}.${clientId}.${nextRand}`)
+          ).slice(0, 22);
+          nextRefresh = `efr_${targetGrantId}.${nextGen}.${nextRand}.${nextSig}`;
         }
+
         const rotated = await deps.store.rotateRefreshToken({
-          refreshHash: await sha256Base64Url(refreshToken),
+          refreshHash,
           clientId,
           nextAccessHash: await sha256Base64Url(nextAccess),
           nextRefreshHash: await sha256Base64Url(nextRefresh),
@@ -4255,6 +4566,8 @@ export async function handleOAuthRoute(request: Request, url: URL, deps: OAuthHa
           accessExpiresAt: now + ACCESS_TOKEN_TTL_MS,
           refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
           ...(claimedGrantId !== undefined ? { claimedGrantId, claimedGeneration } : {}),
+          ...(expectedRotationCounter !== undefined ? { expectedRotationCounter } : {}),
+          ...(upgradeLegacyGrantId !== undefined ? { upgradeLegacyGrantId } : {}),
         });
         if (!rotated.ok) {
           if (rotated.error === 'slow_down') {

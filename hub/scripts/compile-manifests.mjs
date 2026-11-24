@@ -450,8 +450,27 @@ function validateExtract(ext, ctxPath) {
   }
 }
 
+function hasRawDotOrBackslashPathSegments(rawUrl) {
+  if (typeof rawUrl !== 'string' || rawUrl.includes('\\')) return true;
+  if (/%5c/i.test(rawUrl)) return true;
+  if (!rawUrl.startsWith('https://')) return true;
+  const afterScheme = rawUrl.slice('https://'.length);
+  const qOrHash = afterScheme.search(/[?#]/);
+  const authAndPath = qOrHash >= 0 ? afterScheme.slice(0, qOrHash) : afterScheme;
+  const firstSlash = authAndPath.indexOf('/');
+  if (firstSlash < 0) return false;
+  const rawPath = authAndPath.slice(firstSlash);
+  for (const seg of rawPath.split('/')) {
+    if (seg === '.' || seg === '..') return true;
+    const dotDecoded = seg.replace(/%2e/gi, '.');
+    if (dotDecoded === '.' || dotDecoded === '..') return true;
+  }
+  return false;
+}
+
 function isSafePublicHost(fetchUrl) {
   if (!fetchUrl.startsWith('https://') || /[\s\\]/.test(fetchUrl)) return false;
+  if (hasRawDotOrBackslashPathSegments(fetchUrl)) return false;
   try {
     const u = new URL(fetchUrl);
     if (u.protocol !== 'https:' || u.username || u.password || u.hash) return false;
@@ -491,6 +510,9 @@ function validateTwin(manifest, twin, ctxPath) {
     throw new Error(`${ctxPath}.fetchUrl: required`);
   }
   if (fu !== '{requestUrl}') {
+    if (fu.includes('\\') || /%5c/i.test(fu)) {
+      throw new Error(`${ctxPath}.fetchUrl: backslash is forbidden in "${fu}" (M11)`);
+    }
     if (!fu.startsWith('https://') && !fu.startsWith('{origin}/')) {
       throw new Error(`${ctxPath}.fetchUrl: must start with https:// (got "${fu}")`);
     }

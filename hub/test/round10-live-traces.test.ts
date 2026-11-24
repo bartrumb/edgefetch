@@ -1054,7 +1054,7 @@ test('Blind Audit Closure (EF-BLIND-02, EF-BLIND-04, EF-BLIND-05) & Catalog Stor
     assert.ok(!String(cleanAttrs.detail).includes('TEST_SECRET_'), `sanitizeSpanAttributes leaked secret in: ${String(cleanAttrs.detail)}`);
   }
 
-  // EF-BLIND-05: Nested-list dedent before fenced code block preserves fence state across `computeMarkdownSliceCheckpoints` & `sanitizeMarkdownPageSlice`
+  // EF-BLIND-05 + R11-S1/S2: List-container fences escape `<` as prose without inverting trailing prose, while top-level blank-line fences preserve raw code across checkpoints
   const docC2 = [
     '1. first',
     '   - nested',
@@ -1065,12 +1065,26 @@ test('Blind Audit Closure (EF-BLIND-02, EF-BLIND-04, EF-BLIND-05) & Catalog Stor
     '',
     'Normal prose outside code block.',
   ].join('\n');
-  const cleanFull = sanitizeFullMarkdownDocumentForArtifact(docC2);
+  const cleanListDoc = sanitizeFullMarkdownDocumentForArtifact(docC2);
+  assert.ok(cleanListDoc.includes('&lt;b>RAW_HTML_MARKER&lt;/b>'));
+  const afterListProse = cleanListDoc.slice(cleanListDoc.indexOf('Normal prose outside code block.'));
+  assert.ok(!afterListProse.includes('```'), `Trailing prose outside code block must NOT be wrapped in an inverted fence: ${cleanListDoc}`);
+
+  const topFenceDoc = [
+    `Intro paragraph ${'z'.repeat(80)}`,
+    '',
+    '```html',
+    '<b>RAW_HTML_MARKER</b>',
+    '```',
+    '',
+    'Normal prose outside code block.',
+  ].join('\n');
+  const cleanFull = sanitizeFullMarkdownDocumentForArtifact(topFenceDoc);
   const cps = computeMarkdownSliceCheckpoints(cleanFull, 32);
-  const markerIdx = cleanFull.indexOf('   <b>RAW_HTML_MARKER</b>');
+  const markerIdx = cleanFull.indexOf('<b>RAW_HTML_MARKER</b>');
   assert.ok(markerIdx > 0);
   const slicedMd = sanitizeMarkdownPageSlice(cleanFull, markerIdx, cleanFull.slice(markerIdx), false, cps);
-  assert.ok(slicedMd.includes('<b>RAW_HTML_MARKER</b>'), `Literal code inside reopened fence should not be escaped: ${slicedMd}`);
+  assert.ok(slicedMd.includes('<b>RAW_HTML_MARKER</b>'), `Literal code inside reopened top-level fence should not be escaped: ${slicedMd}`);
   const afterProse = slicedMd.slice(slicedMd.indexOf('Normal prose outside code block.'));
   assert.ok(!afterProse.includes('```'), `Trailing prose outside code block must NOT be wrapped in an inverted fence: ${slicedMd}`);
 

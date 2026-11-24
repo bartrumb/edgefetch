@@ -32,11 +32,6 @@ func TestRound8FailClosedSanitizerEverywhereOutsideFences(t *testing.T) {
 			wantInOut: "<img src=x onerror=alert(1)>",
 		},
 		{
-			name:      "list_indented_fence",
-			md:        "- item\n\n  ```html\n  <svg onload=alert(1)>\n  ```",
-			wantInOut: "  <svg onload=alert(1)>",
-		},
-		{
 			name:      "unclosed_eof_fence_closed_explicitly",
 			md:        "```ts\nconst generic = Array<string>();",
 			wantInOut: "```ts\nconst generic = Array<string>();\n```",
@@ -56,6 +51,7 @@ func TestRound8FailClosedSanitizerEverywhereOutsideFences(t *testing.T) {
 	// INCLUDING inside inline backtick code spans and ambiguous blockquote/list/4-space/info-backtick pseudo-fences!
 	adversarial := map[string]string{
 		"inline_backtick_img":            "`" + xssImg + "`",
+		"list_indented_fence":            "- item\n\n  ```html\n  <svg onload=alert(1)>\n  ```",
 		"multi_backtick_script":          "`` " + xssScript + " ``",
 		"inline_backtick_js_link":        "`[click](" + xssJs + ")`",
 		"inline_backtick_ref_def":        "[click][r]\n\n`[r]: " + xssJs + "`",

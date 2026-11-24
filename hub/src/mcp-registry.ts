@@ -187,9 +187,9 @@ export function slugifyMcpServerName(rawName: string): string {
     .toLowerCase()
     .replace(/^(?:io\.github\.[^/]+\/|io\.modelcontextprotocol\.[^/]+\/|@[a-z0-9._-]+\/)/i, '')
     .replace(/[^a-z0-9_-]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-  return (cleaned || 'mcp-server').slice(0, 48);
+    .replace(/[_-]{2,}/g, '-')
+    .replace(/^[_-]+|[_-]+$/g, '');
+  return (cleaned || 'mcp-server').slice(0, 48).replace(/^[_-]+|[_-]+$/g, '') || 'mcp-server';
 }
 
 export function isSharedHostingHostname(hostname: string): boolean {

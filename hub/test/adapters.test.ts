@@ -3778,7 +3778,8 @@ test('ADAPTER-18: M1-C src/scrape.ts Pure Helpers, HTML->MD, Sanitizer, Feeds, T
   // 1. Entities, code fences, PDF cleaner, PII redaction, srcset
   assert.equal(decodeHtmlEntities('a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x2f; &#65;'), 'a & b <c> "d" \'e\' / A');
   assert.equal(decodeMarkdownEntities('```js\nkeep &amp; raw\n```\ndecode &amp; here'), '```js\nkeep &amp; raw\n```\ndecode & here');
-  assert.equal(splitMarkdownByCodeFences('prose\n```ts\nconst a = 1;\n```\nmore').length, 3);
+  assert.equal(splitMarkdownByCodeFences('prose\n\n```ts\nconst a = 1;\n```\nmore').length, 3);
+  assert.equal(splitMarkdownByCodeFences('prose\n```ts\nconst a = 1;\n```\nmore').length, 1);
   assert.match(makeSafeCodeFence('```\ncode\n```', 'js'), /^````js/m);
   assert.match(makeSafeCodeFence('~~~\ncode\n~~~', 'diff', true), /^~~~~diff/m);
   const cleanedPdf = cleanPdfMarkdown(
@@ -4461,15 +4462,19 @@ test('ADAPTER-19: M1-C executeScrapeCall & executeInteractCall Pipeline Closure'
     });
     assert.equal(shopCustomJs.body.extractorId, 'shopify');
 
+    const inertiaHtml = `<html><body><p>Hi</p><div data-page='${JSON.stringify({ component: 'Home', props: { title: 'Inertia Page', summary: 'Structured inertia page props recovered cleanly here.' } })}'></div></body></html>`;
     const inertiaWithInclude = await executeScrapeCall({
       payload: { url: 'https://inertia.example.com/page', includeTags: ['p'] },
       env: {},
-      executeHubFetch: async () =>
-        okRes({
-          body: `<html><body><p>Hi</p><div data-page='${JSON.stringify({ component: 'Home', props: { title: 'Inertia Page', summary: 'Structured inertia page props recovered cleanly here.' } })}'></div></body></html>`,
-        }),
+      executeHubFetch: async () => okRes({ body: inertiaHtml }),
     });
-    assert.match(String(inertiaWithInclude.body.markdown), /Inertia Component/);
+    assert.equal(String(inertiaWithInclude.body.markdown).trim(), 'Hi');
+    const inertiaDefaultScope = await executeScrapeCall({
+      payload: { url: 'https://inertia.example.com/page', discoverLlmsTxt: false },
+      env: {},
+      executeHubFetch: async () => okRes({ body: inertiaHtml }),
+    });
+    assert.match(String(inertiaDefaultScope.body.markdown), /Inertia Component/);
 
     const ghBlobRedirect = await executeScrapeCall({
       payload: { url: 'https://short.example.com/code' },

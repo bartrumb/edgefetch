@@ -103,6 +103,7 @@ import { discoverMcps } from './mcp-registry';
 import {
   createSqliteMcpVaultStore,
   MCP_VAULT_SQLITE_SCHEMA,
+  parseAllowedMcpTools,
   resolveCallerUserId,
   type McpVaultStore,
   type PendingMcpOAuthStateRow,
@@ -168,6 +169,7 @@ import {
   type SearchRequestPayload,
 } from './web-search';
 import { listRegisteredAdapters } from './extractors/registry';
+import { checkAndRecordWikipediaArticleQuota, parseWikipediaArticleUrl } from './wikipedia';
 import {
   buildCapabilities,
   handleAgentArtifactUpload,
@@ -740,6 +742,12 @@ export class AgentHubDO extends DurableObject<Env> {
   async oauthConsumeRefreshToken(h: string, now: number): Promise<OAuthTokenRecord | null> {
     return await this.oauth.consumeRefreshToken(h, now);
   }
+  async oauthGetRefreshTokenLineageHint(
+    h: string,
+    now: number,
+  ): Promise<{ grantId: string; rotationCounter: number } | null> {
+    return (await this.oauth.getRefreshTokenLineageHint?.(h, now)) ?? null;
+  }
   async oauthRotateRefreshToken(params: RotateRefreshParams): Promise<RotateRefreshResult> {
     return await this.oauth.rotateRefreshToken(params);
   }
@@ -815,6 +823,14 @@ export class AgentHubDO extends DurableObject<Env> {
   }
   async vaultUpsertServer(row: StoredMcpServerRow): Promise<void> {
     await this.mcpVault.upsertServer(row);
+  }
+  async vaultResealServerSecret(
+    params: Parameters<NonNullable<McpVaultStore['resealServerSecret']>>[0],
+  ): Promise<boolean> {
+    if (typeof this.mcpVault.resealServerSecret === 'function') {
+      return await this.mcpVault.resealServerSecret(params);
+    }
+    return false;
   }
   async vaultDeleteServer(userId: string, slug: string): Promise<boolean> {
     return await this.mcpVault.deleteServer(userId, slug);
@@ -928,6 +944,13 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
     putTokenPair: (p) => hub().oauthPutTokenPair(p),
     getAccessToken: (h, now) => hub().oauthGetAccessToken(h, now),
     consumeRefreshToken: (h, now) => hub().oauthConsumeRefreshToken(h, now),
+    getRefreshTokenLineageHint: async (h, now) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      if (typeof stub.oauthGetRefreshTokenLineageHint === 'function') {
+        return await stub.oauthGetRefreshTokenLineageHint(h, now);
+      }
+      return null;
+    },
     rotateRefreshToken: (p) => hub().oauthRotateRefreshToken(p),
     listGrants: (now, userId) => hub().oauthListGrants(now, userId),
     revokeGrant: (id, userId) => hub().oauthRevokeGrant(id, userId),
@@ -972,6 +995,12 @@ function hubMcpVaultStore(hub: () => DurableObjectStub<AgentHubDO>): McpVaultSto
     upsertServer: async (row) => {
       const stub = hub() as unknown as Partial<AgentHubDO>;
       if (typeof stub.vaultUpsertServer === 'function') await stub.vaultUpsertServer(row);
+    },
+    resealServerSecret: async (params) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      return typeof stub.vaultResealServerSecret === 'function'
+        ? await stub.vaultResealServerSecret(params)
+        : false;
     },
     deleteServer: async (userId, slug) => {
       const stub = hub() as unknown as Partial<AgentHubDO>;
@@ -1689,7 +1718,11 @@ export default {
               : true;
             const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
             const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanArgs } = args as Record<string, unknown>;
-            if ((cleanArgs.preferMcp === true || cleanArgs.useConnectedMcp === true) && !hasMcpCallScope) {
+            const hasAllowedMcpToolsArg = cleanArgs.allowedMcpTools !== undefined;
+            if (
+              (cleanArgs.preferMcp === true || cleanArgs.useConnectedMcp === true || hasAllowedMcpToolsArg) &&
+              !hasMcpCallScope
+            ) {
               return {
                 status: 403,
                 body: {
@@ -1698,6 +1731,19 @@ export default {
                   message: 'Scope mcp:call is required to route scrape through connected MCP servers.',
                 },
               };
+            }
+            if (hasAllowedMcpToolsArg) {
+              const parsedAllowed = parseAllowedMcpTools(cleanArgs.allowedMcpTools);
+              if (!parsedAllowed.ok) {
+                return {
+                  status: 400,
+                  body: {
+                    ok: false,
+                    error: parsedAllowed.error,
+                    message: parsedAllowed.message,
+                  },
+                };
+              }
             }
             const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
               inFlightScrapesByUser,
@@ -1733,6 +1779,10 @@ export default {
                   targetUrl: cleanArgs.url.trim(),
                   ...(typeof cleanArgs.query === 'string' ? { query: cleanArgs.query } : {}),
                   preferMcp: cleanArgs.preferMcp === true,
+                  requireExplicitReadOnlyHint: true,
+                  ...(hasAllowedMcpToolsArg
+                    ? { allowedMcpTools: cleanArgs.allowedMcpTools as ReadonlyArray<string> }
+                    : {}),
                   vaultStore,
                   vaultMasterKey: env.VAULT_MASTER_KEY,
                   fetchFn: safePublicFetch,
@@ -1940,31 +1990,55 @@ export default {
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeJobs: async ({ args, principal, userId }) => {
-            return await executeJobsCall({
-              payload: args as JobsToolPayload,
-              env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-              executeSearch: async (sArgs) => {
-                const sOut = await executeSearchCall({
-                  payload: sArgs as SearchRequestPayload,
-                  env,
-                  executeHubFetch,
-                  source: `mcp-jobs-search:${principal ?? 'client'}`,
-                  userId,
-                });
-                return { status: sOut.status, body: sOut.body };
-              },
-              executeScrape: async (scArgs) => {
-                const scOut = await executeScrapeCall({
-                  payload: scArgs as ScrapeRequestPayload,
-                  env,
-                  executeHubFetch,
-                  selfHost: url.hostname,
-                  source: `mcp-jobs-scrape:${principal ?? 'client'}`,
-                  userId,
-                });
-                return { status: scOut.status, body: scOut.body };
-              },
-            });
+            const activeAuth = getActiveCallerAuthContext();
+            const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
+            const effectiveTier = activeAuth?.role ?? (effectiveUserId === 'owner' ? 'owner' : 'member');
+            const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
+              inFlightScrapesByUser,
+              effectiveUserId,
+              MAX_CONCURRENT_SCRAPES_PER_USER,
+            );
+            if (!releaseScrapeSlot) {
+              return {
+                status: 429,
+                body: {
+                  ok: false,
+                  error: 'user_quota_exceeded',
+                  message: `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                },
+              };
+            }
+            try {
+              return await executeJobsCall({
+                payload: args as JobsToolPayload,
+                env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+                userId: effectiveUserId,
+                authTier: effectiveTier,
+                executeSearch: async (sArgs) => {
+                  const sOut = await executeSearchCall({
+                    payload: sArgs as SearchRequestPayload,
+                    env,
+                    executeHubFetch,
+                    source: `mcp-jobs-search:${principal ?? 'client'}`,
+                    userId: effectiveUserId,
+                  });
+                  return { status: sOut.status, body: sOut.body };
+                },
+                executeScrape: async (scArgs) => {
+                  const scOut = await executeScrapeCall({
+                    payload: scArgs as ScrapeRequestPayload,
+                    env,
+                    executeHubFetch,
+                    selfHost: url.hostname,
+                    source: `mcp-jobs-scrape:${principal ?? 'client'}`,
+                    userId: effectiveUserId,
+                  });
+                  return { status: scOut.status, body: scOut.body };
+                },
+              });
+            } finally {
+              releaseScrapeSlot();
+            }
           },
           findExtractors: ({ query, category, limit }) => {
             return findRelevantAdapters({ query, category, limit }) as unknown as Array<Record<string, unknown>>;
@@ -2545,7 +2619,11 @@ export default {
           const hasMcpCallScope = !auth.principal.startsWith('oauth:') || auth.scopes.includes('mcp:call');
           const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanScrapeObj } =
             payload as unknown as Record<string, unknown>;
-          if ((cleanScrapeObj.preferMcp === true || cleanScrapeObj.useConnectedMcp === true) && !hasMcpCallScope) {
+          const hasScrapeAllowedMcpTools = cleanScrapeObj.allowedMcpTools !== undefined;
+          if (
+            (cleanScrapeObj.preferMcp === true || cleanScrapeObj.useConnectedMcp === true || hasScrapeAllowedMcpTools) &&
+            !hasMcpCallScope
+          ) {
             return Response.json(
               {
                 ok: false,
@@ -2554,6 +2632,19 @@ export default {
               },
               { status: 403, headers: { 'cache-control': 'no-store' } },
             );
+          }
+          if (hasScrapeAllowedMcpTools) {
+            const parsedAllowed = parseAllowedMcpTools(cleanScrapeObj.allowedMcpTools);
+            if (!parsedAllowed.ok) {
+              return Response.json(
+                {
+                  ok: false,
+                  error: parsedAllowed.error,
+                  message: parsedAllowed.message,
+                },
+                { status: 400, headers: { 'cache-control': 'no-store' } },
+              );
+            }
           }
           const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
             inFlightScrapesByUser,
@@ -2587,6 +2678,10 @@ export default {
                 targetUrl: cleanPayload.url.trim(),
                 ...(typeof cleanPayload.query === 'string' ? { query: cleanPayload.query } : {}),
                 preferMcp: cleanScrapeObj.preferMcp === true,
+                requireExplicitReadOnlyHint: true,
+                ...(hasScrapeAllowedMcpTools
+                  ? { allowedMcpTools: cleanScrapeObj.allowedMcpTools as ReadonlyArray<string> }
+                  : {}),
                 vaultStore,
                 vaultMasterKey: env.VAULT_MASTER_KEY,
                 fetchFn: safePublicFetch,
@@ -3563,35 +3658,53 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
-          const out = await executeJobsCall({
-            payload,
-            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-            executeSearch: async (sArgs) => {
-              const sOut = await executeSearchCall({
-                payload: sArgs as SearchRequestPayload,
-                env,
-                executeHubFetch,
-                source: `jobs-search:${auth.principal}`,
-                userId: auth.userId,
-              });
-              return { status: sOut.status, body: sOut.body };
-            },
-            executeScrape: async (scArgs) => {
-              const scOut = await executeScrapeCall({
-                payload: scArgs as ScrapeRequestPayload,
-                env,
-                executeHubFetch,
-                selfHost: url.hostname,
-                source: `jobs-scrape:${auth.principal}`,
-                userId: auth.userId,
-              });
-              return { status: scOut.status, body: scOut.body };
-            },
-          });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store' },
-          });
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const callerAuthTier = auth.role ?? (callerUserId === 'owner' ? 'owner' : 'member');
+          const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
+            inFlightScrapesByUser,
+            callerUserId,
+            MAX_CONCURRENT_SCRAPES_PER_USER,
+          );
+          if (!releaseScrapeSlot) {
+            return userQuotaExceededResponse(
+              `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+            );
+          }
+          try {
+            const out = await executeJobsCall({
+              payload,
+              env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+              userId: callerUserId,
+              authTier: callerAuthTier,
+              executeSearch: async (sArgs) => {
+                const sOut = await executeSearchCall({
+                  payload: sArgs as SearchRequestPayload,
+                  env,
+                  executeHubFetch,
+                  source: `jobs-search:${auth.principal}`,
+                  userId: callerUserId,
+                });
+                return { status: sOut.status, body: sOut.body };
+              },
+              executeScrape: async (scArgs) => {
+                const scOut = await executeScrapeCall({
+                  payload: scArgs as ScrapeRequestPayload,
+                  env,
+                  executeHubFetch,
+                  selfHost: url.hostname,
+                  source: `jobs-scrape:${auth.principal}`,
+                  userId: callerUserId,
+                });
+                return { status: scOut.status, body: scOut.body };
+              },
+            });
+            return Response.json(out.body, {
+              status: out.status,
+              headers: { 'cache-control': 'no-store' },
+            });
+          } finally {
+            releaseScrapeSlot();
+          }
         });
       }
 
@@ -3747,27 +3860,63 @@ export default {
             );
           }
           let body = cappedFetch.text;
-          if (url.pathname === '/fetch/batch') {
-            try {
-              const parsedBatch = JSON.parse(body) as Record<string, unknown>;
-              if (Array.isArray(parsedBatch.urls) && !Array.isArray(parsedBatch.requests)) {
+          try {
+            const parsedReq = JSON.parse(body) as Record<string, unknown>;
+            if (url.pathname === '/fetch') {
+              if (typeof parsedReq.url === 'string') {
+                const wikiArt = parseWikipediaArticleUrl(parsedReq.url);
+                if (wikiArt) {
+                  const q = checkAndRecordWikipediaArticleQuota({ callerKey: 'owner', host: wikiArt.host });
+                  if (!q.allowed) {
+                    return Response.json(q.block, {
+                      status: 429,
+                      headers: { 'cache-control': 'no-store', 'retry-after': '60' },
+                    });
+                  }
+                }
+              }
+            } else {
+              const rawItems: unknown[] = Array.isArray(parsedReq.requests)
+                ? (parsedReq.requests as unknown[])
+                : Array.isArray(parsedReq.urls)
+                  ? (parsedReq.urls as unknown[])
+                  : [];
+              for (const item of rawItems) {
+                const rawItemUrl =
+                  item && typeof item === 'object' && !Array.isArray(item)
+                    ? (item as Record<string, unknown>).url
+                    : item;
+                if (typeof rawItemUrl === 'string') {
+                  const wikiArt = parseWikipediaArticleUrl(rawItemUrl);
+                  if (wikiArt) {
+                    const q = checkAndRecordWikipediaArticleQuota({ callerKey: 'owner', host: wikiArt.host });
+                    if (!q.allowed) {
+                      return Response.json(q.block, {
+                        status: 429,
+                        headers: { 'cache-control': 'no-store', 'retry-after': '60' },
+                      });
+                    }
+                  }
+                }
+              }
+              if (Array.isArray(parsedReq.urls) && !Array.isArray(parsedReq.requests)) {
                 body = JSON.stringify({
-                  maxSeconds: typeof parsedBatch.maxSeconds === 'number' ? parsedBatch.maxSeconds : 60,
+                  maxSeconds: typeof parsedReq.maxSeconds === 'number' ? parsedReq.maxSeconds : 60,
                   options: {
                     includeBody: true,
                     respectRobots: true,
                     concurrency: 4,
-                    ...(parsedBatch.options && typeof parsedBatch.options === 'object' ? (parsedBatch.options as object) : {}),
+                    ...(parsedReq.options && typeof parsedReq.options === 'object' ? (parsedReq.options as object) : {}),
                   },
-                  requests: (parsedBatch.urls as unknown[]).map((u, idx) => ({
+                  requests: (parsedReq.urls as unknown[]).map((u, idx) => ({
                     id: `b-${idx + 1}`,
                     url: String(u),
                   })),
                 });
               }
-            } catch {
-              return Response.json({ error: 'bad_json' }, { status: 400 });
             }
+          } catch {
+            return Response.json({ error: 'bad_json' }, { status: 400 });
           }
           const rawRetention = url.searchParams.get('artifacts');
           const artifactRetention: ArtifactRetention | 'off' | undefined =

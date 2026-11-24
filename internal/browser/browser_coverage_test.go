@@ -1033,13 +1033,22 @@ func TestRendererActionsSessionsValidationAndErrorsOverMockCDP(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("resumed cross-origin nav failed: %v", err)
 	}
-	// Resumed session with Headers + no URL/navigate + valid initialOrigin.
+	// Resumed session with changed Headers + no URL/navigate fails closed; succeeds when explicit URL target is given.
 	if _, err := r.Execute(context.Background(), Task{
 		SessionID:   outHdr.SessionID,
 		Headers:     map[string]string{"X-Secret": "3"},
 		KeepSession: true,
+	}); err == nil || !strings.Contains(err.Error(), "without an explicit navigation target") {
+		t.Fatalf("expected resumed session with changed Headers and no navigation target to fail closed, got: %v", err)
+	}
+	if _, err := r.Execute(context.Background(), Task{
+		SessionID:   outHdr.SessionID,
+		URL:         "https://app.example.com/reauth",
+		Headers:     map[string]string{"X-Secret": "3"},
+		KeepSession: true,
+		WaitForMs:   5,
 	}); err != nil {
-		t.Fatalf("resumed session with valid initialOrigin + Headers failed: %v", err)
+		t.Fatalf("resumed session with explicit URL + Headers failed: %v", err)
 	}
 	if !r.CloseSession(context.Background(), outHdr.SessionID) {
 		t.Fatal("expected CloseSession on tainted session true")
@@ -1633,8 +1642,8 @@ func TestRendererRemainingReachableBranches(t *testing.T) {
 	mu.Lock()
 	navMode = "fail_fetch_enable"
 	mu.Unlock()
-	if _, err := r.Execute(context.Background(), Task{SessionID: outKeep.SessionID, Headers: map[string]string{"X-H": "1"}, KeepSession: true}); err == nil {
-		t.Fatal("expected Fetch.enable error on resumed session")
+	if _, err := r.Execute(context.Background(), Task{SessionID: outKeep.SessionID, URL: "https://app.example.com/ok", Headers: map[string]string{"X-H": "1"}, KeepSession: true}); err == nil || !strings.Contains(err.Error(), "Fetch interception") {
+		t.Fatalf("expected Fetch.enable error on resumed session, got: %v", err)
 	}
 
 	mu.Lock()

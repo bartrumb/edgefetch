@@ -133,6 +133,26 @@ export function sanitizeSchemaRichMarkdown(
   return md;
 }
 
+export function percentEncodeUnsafeRecordUrlChars(urlStr: string): string {
+  if (!/[()[\]<>]/.test(urlStr)) return urlStr;
+  return urlStr.replace(/[()[\]<>]/g, (ch) => {
+    switch (ch) {
+      case '(':
+        return '%28';
+      case ')':
+        return '%29';
+      case '[':
+        return '%5B';
+      case ']':
+        return '%5D';
+      case '<':
+        return '%3C';
+      default:
+        return '%3E';
+    }
+  });
+}
+
 export function sanitizeSchemaHttpsUrl(raw: unknown, baseUrl?: string): string | undefined {
   if (typeof raw !== 'string') return undefined;
   const cleaned = stripInvisibleSchemaChars(raw).trim();
@@ -143,7 +163,7 @@ export function sanitizeSchemaHttpsUrl(raw: unknown, baseUrl?: string): string |
     if (resolved.port && resolved.port !== '443') return undefined;
     const check = validatePublicHttpsTargetUrl(resolved.toString());
     if (!check.ok) return undefined;
-    return check.url.toString();
+    return percentEncodeUnsafeRecordUrlChars(check.url.toString());
   } catch {
     return undefined;
   }
@@ -152,7 +172,7 @@ export function sanitizeSchemaHttpsUrl(raw: unknown, baseUrl?: string): string |
 function formatSafeMarkdownLink(label: string, safeHttpsUrl?: string): string {
   const safeLabel = label.replace(/\\/g, '\\\\').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
   if (!safeHttpsUrl) return safeLabel;
-  const escapedUrl = safeHttpsUrl.replace(/\(/g, '%28').replace(/\)/g, '%29');
+  const escapedUrl = percentEncodeUnsafeRecordUrlChars(safeHttpsUrl);
   return `[${safeLabel}](${escapedUrl})`;
 }
 

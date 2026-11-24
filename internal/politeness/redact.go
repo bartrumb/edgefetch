@@ -543,7 +543,45 @@ func looksLikeSecretTokenValue(tok string) bool {
 	return hasDigit || (hasUpper && hasSym) || len(tok) >= 20
 }
 
-const unquotedQueryStopChars = " \t\r\n<>')]}%\u0085\u2028\u2029"
+var unquotedQueryStopByte = [256]uint8{
+	' ':  1,
+	'\t': 1,
+	'\r': 1,
+	'\n': 1,
+	'<':  1,
+	'>':  1,
+	'\'': 1,
+	')':  1,
+	']':  1,
+	'}':  1,
+	'%':  1,
+	0xc2: 1, // UTF-8 lead byte for U+0085 NEL (C2 85)
+	0xe2: 1, // UTF-8 lead byte for U+2028 / U+2029 (E2 80 A8 / A9)
+}
+
+func indexUnquotedQueryStopByte(s string) int {
+	i := 0
+	for i+8 <= len(s) {
+		if (unquotedQueryStopByte[s[i]] |
+			unquotedQueryStopByte[s[i+1]] |
+			unquotedQueryStopByte[s[i+2]] |
+			unquotedQueryStopByte[s[i+3]] |
+			unquotedQueryStopByte[s[i+4]] |
+			unquotedQueryStopByte[s[i+5]] |
+			unquotedQueryStopByte[s[i+6]] |
+			unquotedQueryStopByte[s[i+7]]) != 0 {
+			break
+		}
+		i += 8
+	}
+	for ; i < len(s); i++ {
+		if unquotedQueryStopByte[s[i]] != 0 {
+			return i
+		}
+	}
+	return -1
+}
+
 const bareURLStopChars = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f \"'<>)]}\\%\u0085\u2028\u2029"
 
 func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
@@ -551,7 +589,7 @@ func findUnquotedURLEnd(s string, start int, kind urlSepKind) int {
 	j := start
 	for j < len(s) {
 		if sawQuery && kind != urlSepPctEncoded && kind != urlSepJSONSlash {
-			if rel := strings.IndexAny(s[j:], unquotedQueryStopChars); rel >= 0 {
+			if rel := indexUnquotedQueryStopByte(s[j:]); rel >= 0 {
 				j += rel
 			} else {
 				j = len(s)

@@ -18,6 +18,7 @@ import type { AdapterCategory, SiteAdapter } from './extractors/types';
 import { executeJobsCall, type JobsToolPayload } from './jobs';
 import {
   executeFederatedMcpQuery,
+  extractMarkdownFromQueryMcpBody,
   formatFenceSafeUntrustedMcpEnvelope,
   matchConnectedMcpsForContext,
   sanitizeMcpMarkdownOutput,
@@ -28,7 +29,10 @@ import {
 import { stripMcpSmugglingChars } from './mcp-registry';
 import {
   filterSafeCachedMcpTools,
+  isCachedMcpToolPermitted,
   isSafeMcpIdentifier,
+  isValidMcpConnectorSlug,
+  parseAllowedMcpTools,
   resolveCallerUserId,
   SAFE_MCP_IDENTIFIER_RE,
   toPublicMcpServerSummary,
@@ -515,13 +519,28 @@ export function sanitizeRemoteToolSchemaForLlm(rawNode: unknown, depth = 0): Rec
   return out;
 }
 
+function wrapConnectorTextForAgentContext(
+  rawText: string,
+  maxChars: number,
+  attributes?: Record<string, string | undefined>,
+): string {
+  const bounded = rawText.length > maxChars ? rawText.slice(0, maxChars) : rawText;
+  const sanitized = sanitizeMcpMarkdownOutput(sanitizeRemoteMcpText(bounded, maxChars).text, undefined, maxChars);
+  return formatFenceSafeUntrustedMcpEnvelope({
+    tag: 'untrusted_mcp_tool_output',
+    attributes,
+    content: sanitized,
+    maxChars,
+  });
+}
+
 function buildAgentTools(
   strictConstrainToURLs: boolean,
   hasSearchCollection: boolean,
   connectedMcps: readonly StoredMcpServerRow[] = [],
 ): LlmToolDefinition[] {
   const tools: LlmToolDefinition[] = [];
-  const safeServerSlugs = connectedMcps.map((s) => s.slug).filter((slug) => /^[a-z0-9_-]{1,48}$/i.test(slug));
+  const safeServerSlugs = connectedMcps.map((s) => s.slug).filter((slug) => isValidMcpConnectorSlug(slug));
   if (safeServerSlugs.length > 0) {
     const permittedToolNames = [
       ...new Set(
@@ -551,7 +570,7 @@ function buildAgentTools(
     });
     let exposedDirectCount = 0;
     for (const srv of connectedMcps) {
-      if (!/^[a-z0-9_-]{1,24}$/i.test(srv.slug)) continue;
+      if (!isValidMcpConnectorSlug(srv.slug) || srv.slug.length > 24) continue;
       for (const cachedTool of srv.cachedTools) {
         if (exposedDirectCount >= 24) break;
         if (!isSafeMcpIdentifier(cachedTool.name)) continue;
@@ -918,11 +937,11 @@ export async function startOrExecuteAgentCall(params: {
   const preferMcpRequested = payload.preferMcp === true;
   const useConnectedMcpRequested = (payload as Record<string, unknown>).useConnectedMcp === true;
   const allowWriteMcpToolsRequested = (payload as Record<string, unknown>).allowWriteMcpTools === true;
-  const rawAllowedMcpTools = Array.isArray((payload as Record<string, unknown>).allowedMcpTools)
-    ? ((payload as Record<string, unknown>).allowedMcpTools as unknown[])
-        .filter((t): t is string => typeof t === 'string' && t.trim().length > 0 && t.trim().length <= 128)
-        .map((t) => t.trim())
-    : [];
+  const rawAllowedMcpToolsValue = (payload as Record<string, unknown>).allowedMcpTools;
+  const hasAllowedMcpToolsProp =
+    rawAllowedMcpToolsValue !== undefined &&
+    rawAllowedMcpToolsValue !== null &&
+    (!Array.isArray(rawAllowedMcpToolsValue) || rawAllowedMcpToolsValue.length > 0);
   const requestedMcpServerSelectors = Array.isArray(payload.mcpServers)
     ? payload.mcpServers
         .filter((s): s is string => typeof s === 'string' && s.trim().length > 0 && s.trim().length <= 253)
@@ -936,7 +955,7 @@ export async function startOrExecuteAgentCall(params: {
     preferMcpRequested ||
     useConnectedMcpRequested ||
     allowWriteMcpToolsRequested ||
-    rawAllowedMcpTools.length > 0;
+    hasAllowedMcpToolsProp;
 
   if (requestedAnyMcpFeature && !canInvokeFederatedMcp) {
     return {
@@ -947,6 +966,21 @@ export async function startOrExecuteAgentCall(params: {
         success: false,
         error: 'insufficient_scope',
         message: 'Scope mcp:call is required to use connected MCP servers in /v1/agent.',
+      },
+    };
+  }
+
+  // P3-3: Require `allowedMcpTools` entries to be exact `<slug>/<tool>` format ONLY (no bare tool wildcards, `*`, `/`, or `__`).
+  const parsedAllowedMcpTools = parseAllowedMcpTools(rawAllowedMcpToolsValue);
+  if (!parsedAllowedMcpTools.ok) {
+    return {
+      kind: 'json',
+      status: 400,
+      body: {
+        ok: false,
+        success: false,
+        error: parsedAllowedMcpTools.error,
+        message: parsedAllowedMcpTools.message,
       },
     };
   }
@@ -976,26 +1010,10 @@ export async function startOrExecuteAgentCall(params: {
   };
 
   try {
-  const allowedMcpToolSet = new Set<string>(rawAllowedMcpTools);
+  const allowedMcpToolSet = parsedAllowedMcpTools.allowed;
   const isCachedToolPermittedForAgentRun = (srvSlug: string, tool: CachedMcpToolSchema): boolean => {
-    if (!isSafeMcpIdentifier(tool.name)) return false;
-    if (tool.readOnlyHint === true && tool.destructiveHint !== true) {
-      return true;
-    }
     if (!canInvokeFederatedMcp) return false;
-    const slugLower = srvSlug.toLowerCase();
-    if (
-      allowedMcpToolSet.has(tool.name) ||
-      allowedMcpToolSet.has(`${slugLower}/${tool.name}`) ||
-      allowedMcpToolSet.has(`${slugLower}:${tool.name}`) ||
-      allowedMcpToolSet.has(`${slugLower}.${tool.name}`)
-    ) {
-      return true;
-    }
-    if (allowWriteMcpToolsRequested && allowedMcpToolSet.size === 0) {
-      return true;
-    }
-    return false;
+    return isCachedMcpToolPermitted(srvSlug, tool, allowedMcpToolSet);
   };
 
   // Tier-1 Opt-In MCP-First Domain Router + Tier-2 `<1 ms` BM25 Keyless Adapter Router
@@ -1006,6 +1024,7 @@ export async function startOrExecuteAgentCall(params: {
           .filter(
             (s) =>
               s.enabled &&
+              isValidMcpConnectorSlug(s.slug) &&
               requestedMcpServerSelectors.some((sel) => doesMcpServerSelectorMatchRow(sel, s)),
           )
           .map((s) => {
@@ -1123,12 +1142,39 @@ export async function startOrExecuteAgentCall(params: {
       }).catch(() => undefined);
     }
 
-    const gatheredEvidence: Array<{ url: string; title?: string; markdown: string; json?: Record<string, unknown> }> = [];
+    const priorThreadTouchedMcp = Boolean(
+      priorThread &&
+        (priorThread.visibility === 'private' ||
+          (priorThread.routedMcps && priorThread.routedMcps.length > 0) ||
+          /untrusted_mcp/i.test(priorThread.threadMemory ?? '')),
+    );
+    let touchedConnectedMcp = priorThreadTouchedMcp;
+    if (priorThreadTouchedMcp) {
+      record.visibility = 'private';
+      record.userId = effectiveUserId;
+    }
+    const replayedPriorThreadEnvelope = priorThread?.threadMemory
+      ? wrapConnectorTextForAgentContext(priorThread.threadMemory, 4_500, {
+          source: 'prior_thread',
+          threadId: priorThread.id,
+        })
+      : undefined;
+
+    const gatheredEvidence: Array<{
+      url: string;
+      title?: string;
+      markdown: string;
+      json?: Record<string, unknown>;
+      fromMcp?: boolean;
+      mcpServer?: string;
+      mcpTool?: string;
+    }> = [];
     if (priorThread?.threadMemory) {
       gatheredEvidence.push({
         url: 'thread://prior-context',
         title: 'Prior Thread Findings',
         markdown: priorThread.threadMemory,
+        fromMcp: true,
       });
     }
 
@@ -1474,15 +1520,19 @@ export async function startOrExecuteAgentCall(params: {
 
       if (toolName.startsWith('mcp__') && vaultStore) {
         const rest = toolName.slice(5);
-        const sepIdx = rest.indexOf('__');
-        if (sepIdx > 0 && sepIdx < rest.length - 2) {
+        const parts = rest.split('__');
+        if (parts.length === 2 && isValidMcpConnectorSlug(parts[0]!) && isSafeMcpIdentifier(parts[1]!)) {
           return await executeSingleTool('query_mcp', {
             action: 'call_tool',
-            server: rest.slice(0, sepIdx),
-            tool: rest.slice(sepIdx + 2),
+            server: parts[0]!,
+            tool: parts[1]!,
             arguments: args,
           });
         }
+        return {
+          ok: false,
+          summaryForLlm: JSON.stringify({ error: 'invalid_tool_identifier', message: 'Invalid or ambiguous composite MCP tool identifier.' }),
+        };
       }
 
       if (toolName === 'query_mcp' && vaultStore) {
@@ -1608,22 +1658,24 @@ export async function startOrExecuteAgentCall(params: {
           const mOut = await executeFederatedMcpQuery({
             userId: effectiveUserId,
             input: qInput,
+            allowedMcpTools: allowedMcpToolSet,
             vaultStore,
             vaultMasterKey: env.VAULT_MASTER_KEY,
             fetchFn: mcpFetchFn,
             selfHost,
           });
           // Any agent run touching a user's connected MCP becomes strictly `visibility: 'private'`!
+          touchedConnectedMcp = true;
           record.visibility = 'private';
           record.userId = effectiveUserId;
 
           const srvSlug = canonicalAllowedServer.slug.replace(/[^a-z0-9_-]/gi, '').slice(0, 48) || 'mcp';
           const toolCalled = permittedCachedTool.name;
-          const rawMdText =
-            typeof mOut.body.markdown === 'string' && mOut.body.markdown
-              ? mOut.body.markdown
-              : JSON.stringify(mOut.body, null, 2);
-          const sanitizedMcpMd = sanitizeMcpMarkdownOutput(sanitizeRemoteMcpText(rawMdText).text);
+          const extractedMd = extractMarkdownFromQueryMcpBody(mOut.body);
+          const sanitizedMcpMd =
+            mOut.body.sanitized === true && extractedMd
+              ? extractedMd
+              : sanitizeMcpMarkdownOutput(sanitizeRemoteMcpText(extractedMd || JSON.stringify(mOut.body, null, 2)).text);
 
           toolSpan?.setAttribute('mcp.server', srvSlug);
           if (toolCalled) toolSpan?.setAttribute('mcp.tool', toolCalled);
@@ -1644,6 +1696,9 @@ export async function startOrExecuteAgentCall(params: {
               url: originUrl,
               title: `${srvSlug}${toolCalled ? ` — ${toolCalled}` : ''}`,
               markdown: sanitizedMcpMd.slice(0, 12_000),
+              fromMcp: true,
+              mcpServer: srvSlug,
+              mcpTool: toolCalled,
               ...(mOut.body.structuredContent &&
               typeof mOut.body.structuredContent === 'object' &&
               !Array.isArray(mOut.body.structuredContent)
@@ -1701,6 +1756,7 @@ export async function startOrExecuteAgentCall(params: {
             ...(typeof args.query === 'string' && args.query.trim() ? { query: args.query.trim() } : {}),
             preferMcp: preferMcpRequested,
             allowedServerIds: allowedConnectorIds,
+            allowedMcpTools: allowedMcpToolSet,
             requireExplicitReadOnlyHint: true,
             vaultStore,
             vaultMasterKey: env.VAULT_MASTER_KEY,
@@ -1708,16 +1764,20 @@ export async function startOrExecuteAgentCall(params: {
             selfHost,
           });
           if (mcpDirect) {
+            touchedConnectedMcp = true;
             record.visibility = 'private';
             record.userId = effectiveUserId;
             const mcpMd = typeof mcpDirect.body.markdown === 'string' ? mcpDirect.body.markdown : '';
             const mcpTitle = (mcpDirect.body.metadata as { title?: string } | undefined)?.title;
             const mcpExt = typeof mcpDirect.body.extractorId === 'string' ? mcpDirect.body.extractorId : mcpDirect.via;
+            const viaSlug = mcpDirect.via.startsWith('mcp:') ? mcpDirect.via.slice(4) : undefined;
             addSource(targetUrl, mcpTitle, mcpDirect.via, mcpExt);
             gatheredEvidence.push({
               url: targetUrl,
               ...(mcpTitle ? { title: mcpTitle } : {}),
               markdown: mcpMd,
+              fromMcp: true,
+              ...(viaSlug && isValidMcpConnectorSlug(viaSlug) ? { mcpServer: viaSlug } : {}),
             });
             pushSpan({
               kind: 'tool_call',
@@ -1842,7 +1902,9 @@ export async function startOrExecuteAgentCall(params: {
           {
             role: 'user',
             content: [
-              ...(priorThread?.threadMemory ? [`Prior thread context (${priorThread.id}):\n${priorThread.threadMemory}`] : []),
+              ...(replayedPriorThreadEnvelope && priorThread
+                ? [`Prior thread context (${priorThread.id}):\n${replayedPriorThreadEnvelope}`]
+                : []),
               ...(seedUrls.length > 0 ? [`Seed URLs:\n${seedUrls.map((u) => `- ${u}`).join('\n')}`] : []),
               `Task: ${prompt}`,
             ].join('\n\n'),
@@ -1951,10 +2013,26 @@ export async function startOrExecuteAgentCall(params: {
                 record.data = directParsed;
               } else {
                 const combinedMd = gatheredEvidence
-                  .map((e) => `## Source: ${e.title ?? e.url} (${e.url})\n\n${e.markdown.slice(0, 5_000)}`)
+                  .map((e) => {
+                    const safeTitle = e.fromMcp
+                      ? sanitizeMcpMarkdownOutput(sanitizeRemoteMcpText(e.title ?? e.url, 200).text, undefined, 200)
+                      : (e.title ?? e.url);
+                    const safeBody = e.fromMcp
+                      ? wrapConnectorTextForAgentContext(e.markdown, 5_000, {
+                          source: e.url,
+                          ...(e.mcpServer ? { server: e.mcpServer } : {}),
+                          ...(e.mcpTool && isSafeMcpIdentifier(e.mcpTool) ? { tool: e.mcpTool } : {}),
+                        })
+                      : e.markdown.slice(0, 5_000);
+                    return `## Source: ${safeTitle} (${e.url})\n\n${safeBody}`;
+                  })
                   .join('\n\n---\n\n');
+                const fallbackAssistantForSynth =
+                  touchedConnectedMcp && finalAssistantText
+                    ? wrapConnectorTextForAgentContext(finalAssistantText, 5_000, { source: 'assistant_draft' })
+                    : finalAssistantText;
                 const extracted = await extractJsonWithOptionalLlm({
-                  markdown: combinedMd || finalAssistantText,
+                  markdown: combinedMd || fallbackAssistantForSynth,
                   url: seedUrls[0] ?? 'https://edgefetch.local/agent',
                   prompt,
                   schema,
@@ -1974,7 +2052,19 @@ export async function startOrExecuteAgentCall(params: {
             } else {
               if (!finalAssistantText && gatheredEvidence.length > 0) {
                 const combinedMd = gatheredEvidence
-                  .map((e) => `## ${e.title ?? e.url}\nURL: ${e.url}\n\n${e.markdown.slice(0, 4_000)}`)
+                  .map((e) => {
+                    const safeTitle = e.fromMcp
+                      ? sanitizeMcpMarkdownOutput(sanitizeRemoteMcpText(e.title ?? e.url, 200).text, undefined, 200)
+                      : (e.title ?? e.url);
+                    const safeBody = e.fromMcp
+                      ? wrapConnectorTextForAgentContext(e.markdown, 4_000, {
+                          source: e.url,
+                          ...(e.mcpServer ? { server: e.mcpServer } : {}),
+                          ...(e.mcpTool && isSafeMcpIdentifier(e.mcpTool) ? { tool: e.mcpTool } : {}),
+                        })
+                      : e.markdown.slice(0, 4_000);
+                    return `## ${safeTitle}\nURL: ${e.url}\n\n${safeBody}`;
+                  })
                   .join('\n\n---\n\n');
                 const sum = await summarizeMarkdownWithOptionalLlm({
                   markdown: combinedMd,
@@ -2186,13 +2276,23 @@ export async function startOrExecuteAgentCall(params: {
     record.finishedAt = Date.now();
     record.updatedAt = record.finishedAt;
     if (!zeroDataRetention) {
+      const rawMemoryPayload =
+        typeof record.markdown === 'string' && record.markdown
+          ? `Findings:\n${record.markdown.slice(0, 4_000)}`
+          : record.data
+            ? `Structured data:\n${JSON.stringify(record.data).slice(0, 4_000)}`
+            : '';
+      const safeMemoryPayload = rawMemoryPayload
+        ? touchedConnectedMcp || record.visibility === 'private'
+          ? wrapConnectorTextForAgentContext(rawMemoryPayload, 4_000, {
+              source: 'thread_memory',
+              agentId: record.id,
+            })
+          : sanitizeMcpMarkdownOutput(rawMemoryPayload, undefined, 4_100)
+        : '';
       record.threadMemory = [
         `Previous prompt: ${prompt}`,
-        ...(typeof record.markdown === 'string' && record.markdown
-          ? [`Findings:\n${record.markdown.slice(0, 4_000)}`]
-          : record.data
-            ? [`Structured data:\n${JSON.stringify(record.data).slice(0, 4_000)}`]
-            : []),
+        ...(safeMemoryPayload ? [safeMemoryPayload] : []),
       ].join('\n\n');
     }
     await persistAgentRun(record, env.META);

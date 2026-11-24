@@ -199,8 +199,23 @@ const URI_NAMED_ENTITIES: Record<string, string> = {
   shy: '',
   zwj: '',
   zwnj: '',
+  lrm: '',
+  rlm: '',
+  alm: '',
+  wj: '',
+  wordjoiner: '',
+  nobreak: '',
+  af: '',
+  applyfunction: '',
+  it: '',
+  invisibletimes: '',
+  ic: '',
+  invisiblecomma: '',
   zerowidthspace: '',
   negativethinspace: '',
+  negativeverythinspace: '',
+  negativemediumspace: '',
+  negativethickspace: '',
 };
 
 function isMarkdownBackslashEscapedAt(str: string, idx: number): boolean {
@@ -837,92 +852,107 @@ export function escapeAllResidualLtInProseLinear(prose: string, allowPdfPageMark
   return changed ? lines.join('\n') : prose;
 }
 
-function isThematicBreakForSlice(raw: string, leadCols: number, leadPos: number): boolean {
-  if (leadCols > 3 || leadPos >= raw.length) return false;
-  const ch = raw.charCodeAt(leadPos);
-  if (ch !== 45 /* '-' */ && ch !== 42 /* '*' */ && ch !== 95 /* '_' */) return false;
-  let count = 0;
-  for (let i = leadPos; i < raw.length; i++) {
+/**
+ * Strips invisible Unicode Tag smuggling (`U+E0000`–`U+E007F`), Variation Selectors Supplement (`U+E0100`–`U+E01EF`),
+ * Bidi overrides/isolates, zero-width / soft-hyphen characters, C1 controls (preserving `U+0085` NEL for line-separator folding),
+ * ANSI CSI sequences, and raw ASCII C0/DEL control bytes.
+ */
+export function stripInvisibleSmugglingChars(s: string): string {
+  if (!s || !/[^\x09\x0A\x0D\x20-\x7E]/.test(s)) return s;
+  return s
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u0000(?!EF[A-Z]{2,12}\d{0,7}\u0000)(?<!\u0000EF[A-Z]{2,12}\d{0,7}\u0000)/g, '')
+    .replace(
+      /[\u0001-\u0008\u000B\u000C\u000E-\u001F\u007F\u0080-\u0084\u0086-\u009F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu,
+      '',
+    );
+}
+
+export function cleanFenceInfoStringLinear(rawInfo: string): string {
+  if (!rawInfo) return '';
+  const capped = rawInfo.length > 200 ? rawInfo.slice(0, 200) : rawInfo;
+  let s = capped;
+  while (s.includes('theme={')) {
+    const idx = s.indexOf('theme={');
+    let wsStart = idx;
+    while (wsStart > 0 && (s.charCodeAt(wsStart - 1) === 32 || s.charCodeAt(wsStart - 1) === 9)) wsStart--;
+    const closeBrace = s.indexOf('}', idx + 7);
+    s = closeBrace >= 0 ? s.slice(0, wsStart) + s.slice(closeBrace + 1) : s.slice(0, wsStart);
+  }
+  while (s.includes('[[')) {
+    const idx = s.indexOf('[[');
+    let wsStart = idx;
+    while (wsStart > 0 && (s.charCodeAt(wsStart - 1) === 32 || s.charCodeAt(wsStart - 1) === 9)) wsStart--;
+    const closeBrackets = s.indexOf(']]', idx + 2);
+    s = closeBrackets >= 0 ? s.slice(0, wsStart) + s.slice(closeBrackets + 2) : s.slice(0, wsStart);
+  }
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 91 || c === 93 || c === 60 || c === 62) continue;
+    if (c === 9) {
+      out += ' ';
+      continue;
+    }
+    if (c < 32) continue;
+    out += s[i]!;
+  }
+  out = out.replace(/(?:^|[ \t]+)twoslash(?=[ \t]+|$)/gi, '').trimEnd();
+  if (out.length >= 100) {
+    let p = 0;
+    while (p < out.length && (out.charCodeAt(p) === 32 || out.charCodeAt(p) === 9)) p++;
+    const wordStart = p;
+    while (p < out.length && p - wordStart <= 64) {
+      const ch = out.charCodeAt(p);
+      if (ch === 32 || ch === 9 || ch === 96 || ch === 126) break;
+      p++;
+    }
+    const wordEnd = p;
+    if (wordEnd > wordStart && wordEnd - wordStart <= 64) {
+      let wsRun = 0;
+      while (p < out.length && (out.charCodeAt(p) === 32 || out.charCodeAt(p) === 9)) {
+        wsRun++;
+        p++;
+      }
+      if (wsRun >= 8) {
+        return out.slice(0, wordEnd).trimEnd();
+      }
+    }
+  }
+  return out;
+}
+
+function normalizeMarkdownLineEndingsUpfrontLinear(raw: string): string {
+  if (!/[\r\u0085\u2028\u2029]/.test(raw)) return raw;
+  const n = raw.length;
+  let firstSpecial = -1;
+  for (let i = 0; i < n; i++) {
     const c = raw.charCodeAt(i);
-    if (c === ch) count++;
-    else if (c !== 32 && c !== 9) return false;
-  }
-  return count >= 3;
-}
-
-function measureSliceIndentCols(raw: string): { cols: number; bytePos: number; isBlank: boolean } {
-  let cols = 0;
-  let i = 0;
-  while (i < raw.length) {
-    const ch = raw.charCodeAt(i);
-    if (ch === 32) {
-      cols++;
-      i++;
-    } else if (ch === 9) {
-      cols += 4 - (cols % 4);
-      i++;
-    } else {
+    if (c === 13 /* '\r' */ || c === 0x0085 || c === 0x2028 || c === 0x2029) {
+      firstSpecial = i;
       break;
     }
   }
-  return { cols, bytePos: i, isBlank: i >= raw.length };
-}
-
-function detectSliceListItemInfo(
-  raw: string,
-  leadCols: number,
-  leadPos: number,
-  prevLineWasParagraph = false,
-  parentListIndent = 0,
-): { contentCol: number; hasContent: boolean } {
-  if (leadCols < parentListIndent || leadCols - parentListIndent > 3 || leadPos >= raw.length) {
-    return { contentCol: 0, hasContent: false };
-  }
-  if (isThematicBreakForSlice(raw, leadCols - parentListIndent, leadPos)) return { contentCol: 0, hasContent: false };
-  const c = raw.charCodeAt(leadPos);
-  let markerEnd = -1;
-  let markerWidth = 0;
-  let isOrdered = false;
-  let isOrderedOne = false;
-  if (c === 45 || c === 42 || c === 43) {
-    markerEnd = leadPos + 1;
-    markerWidth = 1;
-  } else if (c >= 48 && c <= 57) {
-    isOrdered = true;
-    let d = leadPos + 1;
-    while (d < raw.length && d - leadPos < 9 && raw.charCodeAt(d) >= 48 && raw.charCodeAt(d) <= 57) d++;
-    if (d < raw.length && (raw.charCodeAt(d) === 46 || raw.charCodeAt(d) === 41)) {
-      markerEnd = d + 1;
-      markerWidth = markerEnd - leadPos;
-      isOrderedOne = d === leadPos + 1 && c === 49 /* '1' */;
+  if (firstSpecial < 0) return raw;
+  const parts: string[] = [];
+  let last = 0;
+  for (let i = firstSpecial; i < n; i++) {
+    const c = raw.charCodeAt(i);
+    if (c === 13 /* '\r' */) {
+      if (i > last) parts.push(raw.slice(last, i));
+      parts.push('\n');
+      if (i + 1 < n && raw.charCodeAt(i + 1) === 10 /* '\n' */) {
+        i++;
+      }
+      last = i + 1;
+    } else if (c === 0x0085 || c === 0x2028 || c === 0x2029) {
+      if (i > last) parts.push(raw.slice(last, i));
+      parts.push(' ');
+      last = i + 1;
     }
   }
-  if (markerEnd < 0 || markerEnd >= raw.length) return { contentCol: 0, hasContent: false };
-  const after = raw.charCodeAt(markerEnd);
-  if (after !== 32 && after !== 9) return { contentCol: 0, hasContent: false };
-  let col = leadCols + markerWidth;
-  let p = markerEnd;
-  while (p < raw.length) {
-    const sc = raw.charCodeAt(p);
-    if (sc === 32) {
-      col++;
-      p++;
-    } else if (sc === 9) {
-      col += 4 - (col % 4);
-      p++;
-    } else {
-      break;
-    }
-  }
-  const hasContent = p < raw.length;
-  if (prevLineWasParagraph) {
-    if (!hasContent) return { contentCol: 0, hasContent: false };
-    if (isOrdered && !isOrderedOne) return { contentCol: 0, hasContent: false };
-  }
-  if (!hasContent || col - (leadCols + markerWidth) > 4) {
-    return { contentCol: leadCols + markerWidth + 1, hasContent };
-  }
-  return { contentCol: col, hasContent };
+  if (last < n) parts.push(raw.slice(last));
+  return parts.join('');
 }
 
 function normalizeSliceLineEndingsLengthPreserving(s: string): string {
@@ -930,424 +960,578 @@ function normalizeSliceLineEndingsLengthPreserving(s: string): string {
   return s.replace(/\r(?!\n)/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ');
 }
 
-function stripLeadingIndentColsForReopenedFence(raw: string, stripCols: number): string {
+function isThematicBreakSimpleAt(raw: string, relCols: number, pos: number): boolean {
+  if (relCols > 3 || pos >= raw.length) return false;
+  const ch = raw.charCodeAt(pos);
+  if (ch !== 45 /* '-' */ && ch !== 42 /* '*' */ && ch !== 95 /* '_' */) return false;
+  let count = 0;
+  for (let i = pos; i < raw.length; i++) {
+    const c = raw.charCodeAt(i);
+    if (c === ch) count++;
+    else if (c !== 32 && c !== 9) return false;
+  }
+  return count >= 3;
+}
+
+const _prefixFlagsOut = { prefixLen: 0, hasBlockquote: false, hasListMarker: false };
+
+function scanContainerPrefixFlagsLinear(raw: string): { prefixLen: number; hasBlockquote: boolean; hasListMarker: boolean } {
+  let i = 0;
+  let pCol = 0;
+  let hasBlockquote = false;
+  let hasListMarker = false;
+  for (;;) {
+    const runStartCol = pCol;
+    while (i < raw.length) {
+      const ch = raw.charCodeAt(i);
+      if (ch === 32) {
+        pCol++;
+        i++;
+      } else if (ch === 9) {
+        pCol += 4 - (pCol % 4);
+        i++;
+      } else {
+        break;
+      }
+    }
+    if (i >= raw.length) break;
+    const c = raw.charCodeAt(i);
+    if (c === 62 /* '>' */) {
+      hasBlockquote = true;
+      i++;
+      pCol++;
+      continue;
+    }
+    if (c === 45 /* '-' */ || c === 42 /* '*' */ || c === 43 /* '+' */) {
+      if (i + 1 >= raw.length) {
+        hasListMarker = true;
+        i++;
+        pCol++;
+        break;
+      }
+      const nx = raw.charCodeAt(i + 1);
+      if ((nx === 32 || nx === 9) && !isThematicBreakSimpleAt(raw, pCol - runStartCol, i)) {
+        hasListMarker = true;
+        i++;
+        pCol++;
+        continue;
+      }
+    } else if (c >= 48 && c <= 57) {
+      let j = i;
+      while (j < raw.length && j - i < 9 && raw.charCodeAt(j) >= 48 && raw.charCodeAt(j) <= 57) j++;
+      if (j < raw.length && (raw.charCodeAt(j) === 46 /* '.' */ || raw.charCodeAt(j) === 41 /* ')' */)) {
+        if (j + 1 >= raw.length || raw.charCodeAt(j + 1) === 32 || raw.charCodeAt(j + 1) === 9) {
+          hasListMarker = true;
+          pCol += j + 1 - i;
+          i = j + 1;
+          continue;
+        }
+      }
+    }
+    break;
+  }
+  _prefixFlagsOut.prefixLen = i;
+  _prefixFlagsOut.hasBlockquote = hasBlockquote;
+  _prefixFlagsOut.hasListMarker = hasListMarker;
+  return _prefixFlagsOut;
+}
+
+export interface MarkdownFenceRecognizerState {
+  inFence: boolean;
+  fenceChar: '`' | '~' | '';
+  fenceLen: number;
+  effectiveFenceLen: number;
+  prevLineWasAsciiBlank: boolean;
+  possiblyInList: boolean;
+  escapedUntrusted: { ch: '`' | '~'; len: number; needBlockquote: boolean } | null;
+  untrustedFence: { ch: '`' | '~'; len: number; minIndent: number; needBlockquote: boolean } | null;
+}
+
+export function createMarkdownFenceRecognizerState(): MarkdownFenceRecognizerState {
+  return {
+    inFence: false,
+    fenceChar: '',
+    fenceLen: 0,
+    effectiveFenceLen: 0,
+    prevLineWasAsciiBlank: true,
+    possiblyInList: false,
+    escapedUntrusted: null,
+    untrustedFence: null,
+  };
+}
+
+function cloneMarkdownFenceRecognizerState(s: MarkdownFenceRecognizerState): MarkdownFenceRecognizerState {
+  return {
+    inFence: s.inFence,
+    fenceChar: s.fenceChar,
+    fenceLen: s.fenceLen,
+    effectiveFenceLen: s.effectiveFenceLen,
+    prevLineWasAsciiBlank: s.prevLineWasAsciiBlank,
+    possiblyInList: s.possiblyInList,
+    escapedUntrusted: s.escapedUntrusted ? { ...s.escapedUntrusted } : null,
+    untrustedFence: s.untrustedFence ? { ...s.untrustedFence } : null,
+  };
+}
+
+type CanonicalFenceStepKind = 'open_trusted' | 'in_trusted' | 'close_trusted' | 'prose';
+
+interface CanonicalFenceStepResult {
+  kind: CanonicalFenceStepKind;
+  outLine: string;
+  openedInfo: string;
+  lengthenedEffectiveLen: number;
+}
+
+const _stepOut: CanonicalFenceStepResult = {
+  kind: 'prose',
+  outLine: '',
+  openedInfo: '',
+  lengthenedEffectiveLen: 0,
+};
+
+/**
+ * Single canonical Markdown fence state machine (`R11-S1` & `R11-S2`):
+ *  - **ONLY** top-level fences (`0..3` spaces, zero tabs, zero open blockquote or list containers) preceded by a strict
+ *    ASCII blank line (`^[ \t]*$`) or start of document open a trusted raw fenced code block (`open_trusted`).
+ *  - Every fence opened while ANY container (list item or blockquote) is open, tab-indented, `>= 4`-col indented, or not
+ *    preceded by a blank line / start of document is treated strictly as prose (its fence delimiter is backslash-escaped
+ *    when `harden === true`, and `<` + links inside its body are sanitized identically to prose).
+ */
+function stepCanonicalMarkdownFenceLine(
+  raw: string,
+  state: MarkdownFenceRecognizerState,
+  harden: boolean,
+): CanonicalFenceStepResult {
+  _stepOut.openedInfo = '';
+  _stepOut.lengthenedEffectiveLen = 0;
+
+  if (state.inFence) {
+    let pos = 0;
+    let col = 0;
+    let sawTab = false;
+    while (pos < raw.length) {
+      const ch = raw.charCodeAt(pos);
+      if (ch === 32) {
+        col++;
+        pos++;
+      } else if (ch === 9) {
+        col += 4 - (col % 4);
+        pos++;
+        sawTab = true;
+      } else {
+        break;
+      }
+    }
+    if (pos < raw.length) {
+      const fcCode = state.fenceChar.charCodeAt(0);
+      if (raw.charCodeAt(pos) === fcCode) {
+        let p = pos;
+        while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
+        const runLen = p - pos;
+        if (runLen >= state.fenceLen) {
+          const onlyTrailingWs = isAsciiSpaceOrTabOnly(raw, p);
+          if (col <= 3 && !sawTab && onlyTrailingWs) {
+            const closeLen = Math.max(runLen, state.effectiveFenceLen);
+            _stepOut.kind = 'close_trusted';
+            _stepOut.outLine = harden ? state.fenceChar.repeat(closeLen) : raw;
+            state.inFence = false;
+            state.fenceChar = '';
+            state.fenceLen = 0;
+            state.effectiveFenceLen = 0;
+            state.prevLineWasAsciiBlank = false;
+            return _stepOut;
+          }
+          if (harden && runLen >= state.effectiveFenceLen) {
+            state.effectiveFenceLen = runLen + 1;
+            _stepOut.lengthenedEffectiveLen = state.effectiveFenceLen;
+          }
+        }
+      }
+    }
+    _stepOut.kind = 'in_trusted';
+    _stepOut.outLine = raw;
+    return _stepOut;
+  }
+
+  // Fast-path empty line when not tracking an unhardened untrusted fence
+  if (raw.length === 0 && state.untrustedFence === null) {
+    if (state.escapedUntrusted?.needBlockquote) {
+      state.escapedUntrusted = null;
+    }
+    state.prevLineWasAsciiBlank = true;
+    _stepOut.kind = 'prose';
+    _stepOut.outLine = raw;
+    return _stepOut;
+  }
+
+  // Fast-path top-level ordinary prose lines starting with an ASCII letter (`A-Z` / `a-z`)
+  if (state.untrustedFence === null && raw.length > 0) {
+    const c0 = raw.charCodeAt(0);
+    if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) {
+      if (state.escapedUntrusted) {
+        if (state.escapedUntrusted.needBlockquote || state.prevLineWasAsciiBlank) {
+          state.escapedUntrusted = null;
+        }
+      }
+      if (state.prevLineWasAsciiBlank) {
+        state.possiblyInList = false;
+      }
+      state.prevLineWasAsciiBlank = false;
+      _stepOut.kind = 'prose';
+      _stepOut.outLine = raw;
+      return _stepOut;
+    }
+  }
+
+  // Fast-path blockquote prose lines starting with `> <ASCII-letter>`
+  if (
+    state.untrustedFence === null &&
+    raw.length >= 3 &&
+    raw.charCodeAt(0) === 62 /* '>' */ &&
+    raw.charCodeAt(1) === 32 /* ' ' */
+  ) {
+    const c2 = raw.charCodeAt(2);
+    if ((c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122)) {
+      state.prevLineWasAsciiBlank = false;
+      _stepOut.kind = 'prose';
+      _stepOut.outLine = raw;
+      return _stepOut;
+    }
+  }
+
+  let pos = 0;
   let col = 0;
-  let p = 0;
-  while (p < raw.length && col < stripCols) {
-    const ch = raw.charCodeAt(p);
+  let sawTab = false;
+  while (pos < raw.length) {
+    const ch = raw.charCodeAt(pos);
     if (ch === 32) {
       col++;
-      p++;
+      pos++;
     } else if (ch === 9) {
       col += 4 - (col % 4);
-      p++;
+      pos++;
+      sawTab = true;
     } else {
       break;
     }
   }
-  if (p === 0) return raw;
-  const leftoverSpaces = col > stripCols ? ' '.repeat(col - stripCols) : '';
-  return `${leftoverSpaces}${raw.slice(p)}`;
-}
-
-function computeNextSliceParagraphState(
-  rawLine: string,
-  cols: number,
-  bytePos: number,
-  isBlank: boolean,
-  listCol: number,
-  listHasContent: boolean,
-  activeListIndent: number,
-  prevLineWasParagraph: boolean,
-): boolean {
-  const relCols = cols >= activeListIndent ? cols - activeListIndent : cols;
-  if (isBlank || isThematicBreakForSlice(rawLine, relCols, bytePos)) {
-    return false;
-  }
-  if (listCol > 0) {
-    return listHasContent;
-  }
-  const leadC = rawLine.charCodeAt(bytePos);
-  if (relCols <= 3 && leadC === 35 /* '#' */) {
-    let h = bytePos;
-    while (h < rawLine.length && h - bytePos < 7 && rawLine.charCodeAt(h) === 35) h++;
-    if (h - bytePos <= 6 && (h === rawLine.length || rawLine.charCodeAt(h) === 32 || rawLine.charCodeAt(h) === 9)) {
-      return false;
+  const isBlank = pos >= raw.length;
+  if (isBlank) {
+    if (state.escapedUntrusted?.needBlockquote) {
+      state.escapedUntrusted = null;
     }
-  }
-  if (!prevLineWasParagraph && relCols >= 4) {
-    return false;
-  }
-  if (relCols <= 3 && leadC === 62 /* '>' */) {
-    let q = bytePos;
-    while (q < rawLine.length && (rawLine.charCodeAt(q) === 62 || rawLine.charCodeAt(q) === 32 || rawLine.charCodeAt(q) === 9)) q++;
-    return q < rawLine.length;
-  }
-  return true;
-}
-
-interface InitialSliceContext {
-  prevPara: boolean;
-  startsAtSeparatorNewline: boolean;
-}
-
-function hardenAndSplitSliceFences(
-  rawMd: string,
-  initialReopenedFence?: { ch: string; len: number; sourceIndent: number },
-  initialCtx?: InitialSliceContext,
-): Array<{ text: string; isFence: boolean }> {
-  const md = normalizeSliceLineEndingsLengthPreserving(rawMd);
-  const lines = md.split('\n');
-  const normLines: string[] = [];
-  let inFence = false;
-  let fenceChar = '';
-  let fenceLen = 0;
-  let effectiveFenceLen = 0;
-  let fenceOpenIdx = -1;
-  let fenceInfo = '';
-  let fenceIndent = 0;
-  let reopenSourceIndent = 0;
-  const listIndents: number[] = [];
-  let prevLineWasParagraph = initialReopenedFence ? false : Boolean(initialCtx?.prevPara);
-  const skipLeadingSepNl = !initialReopenedFence && Boolean(initialCtx?.startsAtSeparatorNewline);
-  let escapedRiskyListFence: { ch: '`' | '~'; len: number } | null = null;
-
-  if (initialReopenedFence) {
-    inFence = true;
-    fenceChar = initialReopenedFence.ch;
-    fenceLen = initialReopenedFence.len;
-    effectiveFenceLen = initialReopenedFence.len;
-    fenceIndent = 0;
-    reopenSourceIndent = initialReopenedFence.sourceIndent;
-    fenceOpenIdx = 1;
-    normLines.push('', fenceChar.repeat(fenceLen));
+    if (state.untrustedFence?.needBlockquote) {
+      state.untrustedFence = null;
+    }
+    if (state.untrustedFence === null) {
+      state.prevLineWasAsciiBlank = true;
+    }
+    _stepOut.kind = 'prose';
+    _stepOut.outLine = raw;
+    return _stepOut;
   }
 
-  for (let li = 0; li < lines.length; li++) {
-    const rawWithCr = lines[li]!;
-    const cr = rawWithCr.endsWith('\r') ? '\r' : '';
-    const raw = cr ? rawWithCr.slice(0, -1) : rawWithCr;
-    if (li === 0 && skipLeadingSepNl && raw.length === 0 && !inFence) {
-      normLines.push(rawWithCr);
-      continue;
-    }
-    const { cols, bytePos, isBlank } = measureSliceIndentCols(raw);
+  const pfx = scanContainerPrefixFlagsLinear(raw);
+  const prefixLen = pfx.prefixLen;
+  const hasBlockquote = pfx.hasBlockquote;
+  const hasListMarker = pfx.hasListMarker;
 
-    if (inFence) {
-      prevLineWasParagraph = false;
-      const containerIndent = reopenSourceIndent > 0 ? reopenSourceIndent : fenceIndent;
-      if (!isBlank && containerIndent > 0 && cols < containerIndent && !(reopenSourceIndent > 0 && li === 0)) {
-        normLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}`);
-        inFence = false;
-        fenceChar = '';
-        fenceLen = 0;
-        effectiveFenceLen = 0;
-        fenceOpenIdx = -1;
-        fenceIndent = 0;
-        reopenSourceIndent = 0;
-        listIndents.length = 0;
-        escapedRiskyListFence = null;
-      } else {
-        const maxCloseIndent = containerIndent > 0 ? containerIndent + 3 : 3;
-        if (!isBlank && bytePos < raw.length) {
-          let p = bytePos;
-          const fcCode = fenceChar.charCodeAt(0);
-          while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
-          const runLen = p - bytePos;
-          if (runLen >= fenceLen) {
-            if (cols >= containerIndent && cols <= maxCloseIndent && isAsciiSpaceOrTabOnly(raw, p)) {
-              const closeLen = Math.max(runLen, effectiveFenceLen);
-              normLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(closeLen)}${cr}`);
-              inFence = false;
-              fenceChar = '';
-              fenceLen = 0;
-              effectiveFenceLen = 0;
-              fenceOpenIdx = -1;
-              fenceIndent = 0;
-              reopenSourceIndent = 0;
-              continue;
-            }
-            if (runLen >= effectiveFenceLen && fenceOpenIdx >= 0) {
-              effectiveFenceLen = runLen + 1;
-              normLines[fenceOpenIdx] = `${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}${fenceInfo}${cr}`;
-            }
-          }
-        }
-        if (reopenSourceIndent > 0 && bytePos > 0) {
-          normLines.push(`${stripLeadingIndentColsForReopenedFence(raw, reopenSourceIndent)}${cr}`);
-          continue;
-        }
-        normLines.push(rawWithCr);
-        continue;
-      }
-    }
-
-    if (!isBlank && listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
-      while (listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
-        listIndents.pop();
-      }
-      escapedRiskyListFence = null;
-    }
-    const parentListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
-    const listInfo = detectSliceListItemInfo(raw, cols, bytePos, prevLineWasParagraph, parentListIndent);
-    const listCol = listInfo.contentCol;
-    if (listCol > 0) {
-      listIndents.push(listCol);
-      escapedRiskyListFence = null;
-    }
-    const activeListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
-
-    const minCols = activeListIndent > 0 ? activeListIndent : 0;
-    const maxCols = minCols + 3;
-    if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos + 3 <= raw.length) {
-      if (escapedRiskyListFence) {
-        const escCode = escapedRiskyListFence.ch.charCodeAt(0);
-        if (raw.charCodeAt(bytePos) === escCode) {
-          let p = bytePos;
-          while (p < raw.length && raw.charCodeAt(p) === escCode) p++;
-          const runLen = p - bytePos;
-          if (runLen >= escapedRiskyListFence.len && isAsciiSpaceOrTabOnly(raw, p)) {
-            normLines.push(`${raw.slice(0, bytePos)}${`\\${escapedRiskyListFence.ch}`.repeat(runLen)}${raw.slice(p)}${cr}`);
-            escapedRiskyListFence = null;
-            prevLineWasParagraph = true;
-            continue;
+  if (state.untrustedFence !== null) {
+    if (
+      (state.untrustedFence.needBlockquote && !hasBlockquote) ||
+      (!state.untrustedFence.needBlockquote && state.untrustedFence.minIndent > 0 && col < state.untrustedFence.minIndent)
+    ) {
+      state.untrustedFence = null;
+    } else {
+      const uPos = prefixLen > pos ? prefixLen : pos;
+      if (uPos < raw.length && col <= state.untrustedFence.minIndent + 3) {
+        const uCode = state.untrustedFence.ch.charCodeAt(0);
+        if (raw.charCodeAt(uPos) === uCode) {
+          let p = uPos;
+          while (p < raw.length && raw.charCodeAt(p) === uCode) p++;
+          if (p - uPos >= state.untrustedFence.len && isAsciiSpaceOrTabOnly(raw, p)) {
+            state.untrustedFence = null;
           }
         }
       }
-      const c0 = raw.charCodeAt(bytePos);
-      if (c0 === 96 || c0 === 126) {
-        let fEnd = bytePos + 1;
-        while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
-        const fLen = fEnd - bytePos;
-        const infoRaw = raw.slice(fEnd);
-        if (fLen >= 3 && !(c0 === 96 && infoRaw.includes('`'))) {
-          const fCh: '`' | '~' = c0 === 96 ? '`' : '~';
-          if (bytePos < cols) {
-            // Tab-indented fence opener inside a list item: escape fail-closed and track matching closer!
-            if (activeListIndent > 0) {
-              escapedRiskyListFence = { ch: fCh, len: fLen };
-            }
-            normLines.push(`${raw.slice(0, bytePos)}${`\\${fCh}`.repeat(fLen)}${infoRaw}${cr}`);
-            prevLineWasParagraph = true;
-            continue;
-          }
-          inFence = true;
-          prevLineWasParagraph = false;
-          fenceChar = fCh;
-          fenceLen = fLen;
-          effectiveFenceLen = fLen;
-          fenceIndent = activeListIndent > 0 ? activeListIndent : 0;
-          fenceInfo = infoRaw.slice(0, 200).replace(/[\[\]<>]/g, '');
-          fenceOpenIdx = normLines.length;
-          normLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(fLen)}${fenceInfo}${cr}`);
-          continue;
-        }
-      }
+      state.prevLineWasAsciiBlank = false;
+      _stepOut.kind = 'prose';
+      _stepOut.outLine = raw;
+      return _stepOut;
     }
+  }
 
-    // Escape risky container-prefixed fence openers (`> ``` `, `- ``` `, `\t``` `, `    ``` `)
-    let pfx = 0;
-    let risky = false;
-    let pCol = 0;
-    while (pfx < raw.length) {
-      const rStart = pCol;
-      while (pfx < raw.length && (raw.charCodeAt(pfx) === 32 || raw.charCodeAt(pfx) === 9)) {
-        if (raw.charCodeAt(pfx) === 9) {
-          pCol += 4 - (pCol % 4);
-          risky = true;
-        } else {
-          pCol++;
-        }
-        pfx++;
-      }
-      if (pCol - rStart >= 4) risky = true;
-      if (pfx >= raw.length) break;
-      const cc = raw.charCodeAt(pfx);
-      if (cc === 62) {
-        risky = true;
-        pfx++;
-        pCol++;
-        continue;
-      }
-      if ((cc === 45 || cc === 42 || cc === 43) && pfx + 1 < raw.length && (raw.charCodeAt(pfx + 1) === 32 || raw.charCodeAt(pfx + 1) === 9)) {
-        risky = true;
-        pfx++;
-        pCol++;
-        continue;
-      }
-      if (cc >= 48 && cc <= 57) {
-        let dj = pfx;
-        while (dj < raw.length && dj - pfx < 9 && raw.charCodeAt(dj) >= 48 && raw.charCodeAt(dj) <= 57) dj++;
+  if (state.escapedUntrusted?.needBlockquote && !hasBlockquote) {
+    state.escapedUntrusted = null;
+  }
+
+  if (state.prevLineWasAsciiBlank && col <= 1 && !hasBlockquote && !hasListMarker) {
+    state.possiblyInList = false;
+  }
+  if (hasListMarker) {
+    state.possiblyInList = true;
+  }
+
+  const fPos = prefixLen > pos ? prefixLen : pos;
+  if (fPos + 3 <= raw.length) {
+    const c0 = raw.charCodeAt(fPos);
+    if (c0 === 96 /* '`' */ || c0 === 126 /* '~' */) {
+      let fEnd = fPos + 1;
+      while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
+      const fLen = fEnd - fPos;
+      if (fLen >= 3 && !(c0 === 96 && raw.indexOf('`', fEnd) >= 0)) {
+        const fCh: '`' | '~' = c0 === 96 ? '`' : '~';
+        const onlyTrailingWs = isAsciiSpaceOrTabOnly(raw, fEnd);
+
+        // 1. If we previously escaped an untrusted fence opener, escape its matching bare closer as well so it cannot invert polarity!
         if (
-          dj < raw.length &&
-          (raw.charCodeAt(dj) === 46 || raw.charCodeAt(dj) === 41) &&
-          dj + 1 < raw.length &&
-          (raw.charCodeAt(dj + 1) === 32 || raw.charCodeAt(dj + 1) === 9)
+          harden &&
+          state.escapedUntrusted &&
+          state.escapedUntrusted.ch === fCh &&
+          fLen >= state.escapedUntrusted.len &&
+          onlyTrailingWs
         ) {
-          risky = true;
-          pCol += dj + 1 - pfx;
-          pfx = dj + 1;
-          continue;
+          state.escapedUntrusted = null;
+          state.prevLineWasAsciiBlank = false;
+          _stepOut.kind = 'prose';
+          _stepOut.outLine = `${raw.slice(0, fPos)}${`\\${fCh}`.repeat(fLen)}${raw.slice(fEnd)}`;
+          return _stepOut;
         }
-      }
-      break;
-    }
-    if (pfx > 0 && risky && pfx + 3 <= raw.length) {
-      const c0 = raw.charCodeAt(pfx);
-      if ((c0 === 96 || c0 === 126) && raw.charCodeAt(pfx + 1) === c0 && raw.charCodeAt(pfx + 2) === c0) {
-        let fEnd = pfx + 3;
-        while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
-        const tail = raw.slice(fEnd);
-        if (!(c0 === 96 && tail.includes('`'))) {
-          const fCh: '`' | '~' = c0 === 96 ? '`' : '~';
-          if (listCol > 0 && activeListIndent > 0) {
-            escapedRiskyListFence = { ch: fCh, len: fEnd - pfx };
+
+        // 2. S1 Rule: ONLY top-level fences (`0..3` spaces, zero tabs, zero open containers) preceded by a blank line or start of doc keep raw content!
+        const isTrustedTopLevel =
+          state.prevLineWasAsciiBlank &&
+          !sawTab &&
+          col <= 3 &&
+          fPos === pos &&
+          !hasBlockquote &&
+          !hasListMarker &&
+          !state.possiblyInList;
+
+        if (isTrustedTopLevel) {
+          state.escapedUntrusted = null;
+          state.inFence = true;
+          state.fenceChar = fCh;
+          state.fenceLen = fLen;
+          state.effectiveFenceLen = fLen;
+          state.prevLineWasAsciiBlank = false;
+          _stepOut.kind = 'open_trusted';
+          if (harden) {
+            const cleanInfo = cleanFenceInfoStringLinear(raw.slice(fEnd));
+            _stepOut.openedInfo = cleanInfo;
+            _stepOut.outLine = `${fCh.repeat(fLen)}${cleanInfo}`;
+          } else {
+            _stepOut.openedInfo = raw.slice(fEnd);
+            _stepOut.outLine = raw;
           }
-          const rewritten = `${raw.slice(0, pfx)}${`\\${fCh}`.repeat(fEnd - pfx)}${tail}`;
-          normLines.push(`${rewritten}${cr}`);
-          prevLineWasParagraph = computeNextSliceParagraphState(
-            rewritten,
-            cols,
-            bytePos,
-            false,
-            listCol,
-            listCol > 0 ? true : listInfo.hasContent,
-            activeListIndent,
-            prevLineWasParagraph,
-          );
+          return _stepOut;
+        }
+
+        // 3. Untrusted fence (inside list/blockquote container, tab-indented, >= 4-col indented, or not preceded by blank line / doc start)
+        state.prevLineWasAsciiBlank = false;
+        _stepOut.kind = 'prose';
+        if (harden) {
+          state.escapedUntrusted = { ch: fCh, len: fLen, needBlockquote: hasBlockquote };
+          _stepOut.outLine = `${raw.slice(0, fPos)}${`\\${fCh}`.repeat(fLen)}${raw.slice(fEnd)}`;
+        } else {
+          if (!hasListMarker && (hasBlockquote || col <= (state.possiblyInList ? 7 : 3))) {
+            state.untrustedFence = {
+              ch: fCh,
+              len: fLen,
+              minIndent: state.possiblyInList && !hasBlockquote ? Math.min(col, 2) : 0,
+              needBlockquote: hasBlockquote,
+            };
+          }
+          _stepOut.outLine = raw;
+        }
+        return _stepOut;
+      }
+    }
+  }
+
+  if (state.escapedUntrusted && state.prevLineWasAsciiBlank && col === 0 && !hasBlockquote && !hasListMarker) {
+    state.escapedUntrusted = null;
+  }
+
+  // Guard `marked` multi-line `[label\n~~~\n]: url` and empty-destination `[y]:\n``` ` swallowing fences
+  if (harden) {
+    const checkBracketPos = prefixLen > pos ? prefixLen : col <= 3 ? pos : -1;
+    if (checkBracketPos >= 0 && checkBracketPos < raw.length && raw.charCodeAt(checkBracketPos) === 91 /* '[' */) {
+      const tail = raw.slice(checkBracketPos);
+      const qLimit = Math.min(tail.length, 1024);
+      let closeIdx = -1;
+      for (let q = 1; q < qLimit; q++) {
+        const qc = tail.charCodeAt(q);
+        if (qc === 92 /* '\\' */) {
+          q++;
           continue;
         }
-      }
-    }
-
-    normLines.push(rawWithCr);
-    prevLineWasParagraph = computeNextSliceParagraphState(
-      raw,
-      cols,
-      bytePos,
-      isBlank,
-      listCol,
-      listInfo.hasContent,
-      activeListIndent,
-      prevLineWasParagraph,
-    );
-  }
-
-  if (inFence) {
-    normLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}`);
-  }
-
-  const hardened = normLines.join('\n');
-  if (!hardened.includes('```') && !hardened.includes('~~~')) {
-    return [{ text: hardened, isFence: false }];
-  }
-
-  const segs: Array<{ text: string; isFence: boolean }> = [];
-  let sInFence = false;
-  let sFenceChar = '';
-  let sFenceLen = 0;
-  let sFenceIndent = 0;
-  const sListIndents: number[] = [];
-  let sPrevPara = initialReopenedFence ? false : Boolean(initialCtx?.prevPara);
-  let segStart = 0;
-  let pos = 0;
-  while (pos < hardened.length) {
-    const nl = hardened.indexOf('\n', pos);
-    const nextPos = nl === -1 ? hardened.length : nl + 1;
-    const lineEnd = nl === -1 ? hardened.length : nl > pos && hardened[nl - 1] === '\r' ? nl - 1 : nl;
-    const rawLine = hardened.slice(pos, lineEnd);
-    if (pos === 0 && skipLeadingSepNl && rawLine.length === 0 && !sInFence) {
-      pos = nextPos;
-      continue;
-    }
-    const { cols, bytePos, isBlank } = measureSliceIndentCols(rawLine);
-    if (sInFence) {
-      sPrevPara = false;
-      if (!isBlank && sFenceIndent > 0 && cols < sFenceIndent) {
-        segs.push({ text: hardened.slice(segStart, pos), isFence: true });
-        sInFence = false;
-        sFenceChar = '';
-        sFenceLen = 0;
-        sFenceIndent = 0;
-        sListIndents.length = 0;
-        segStart = pos;
-        continue;
-      }
-      const maxClose = sFenceIndent > 0 ? sFenceIndent + 3 : 3;
-      if (cols >= sFenceIndent && cols <= maxClose && bytePos === cols) {
-        const rest = rawLine.slice(bytePos);
-        const cm = /^(`{3,}|~{3,})[ \t]*$/.exec(rest);
-        if (cm && cm[1]![0] === sFenceChar && cm[1]!.length >= sFenceLen) {
-          segs.push({ text: hardened.slice(segStart, lineEnd), isFence: true });
-          sInFence = false;
-          sFenceChar = '';
-          sFenceLen = 0;
-          sFenceIndent = 0;
-          segStart = lineEnd;
-          pos = nextPos;
-          continue;
+        if (qc === 93 /* ']' */) {
+          closeIdx = q;
+          break;
         }
       }
-      pos = nextPos;
-      continue;
-    }
-    if (!isBlank && sListIndents.length > 0 && cols < sListIndents[sListIndents.length - 1]!) {
-      while (sListIndents.length > 0 && cols < sListIndents[sListIndents.length - 1]!) {
-        sListIndents.pop();
+      if (closeIdx < 0 && tail.length < 1024) {
+        state.prevLineWasAsciiBlank = false;
+        _stepOut.kind = 'prose';
+        _stepOut.outLine = `${raw.slice(0, checkBracketPos)}\\${tail}`;
+        return _stepOut;
+      }
+      if (
+        closeIdx >= 0 &&
+        closeIdx + 1 < tail.length &&
+        tail.charCodeAt(closeIdx + 1) === 58 /* ':' */ &&
+        isAsciiSpaceOrTabOnly(tail, closeIdx + 2)
+      ) {
+        state.prevLineWasAsciiBlank = false;
+        _stepOut.kind = 'prose';
+        _stepOut.outLine = `${raw.slice(0, checkBracketPos)}${tail.slice(0, closeIdx + 1)}\\${tail.slice(closeIdx + 1)}`;
+        return _stepOut;
       }
     }
-    const sParentIndent = sListIndents.length > 0 ? sListIndents[sListIndents.length - 1]! : 0;
-    const sListInfo = detectSliceListItemInfo(rawLine, cols, bytePos, sPrevPara, sParentIndent);
-    const lCol = sListInfo.contentCol;
-    if (lCol > 0) sListIndents.push(lCol);
-    const sListIndent = sListIndents.length > 0 ? sListIndents[sListIndents.length - 1]! : 0;
-    const minOpen = sListIndent > 0 ? sListIndent : 0;
-    const maxOpen = minOpen + 3;
-    let openedSplitFence = false;
-    if (lCol === 0 && cols >= minOpen && cols <= maxOpen && bytePos === cols) {
-      const rest = rawLine.slice(bytePos);
-      const om = /^(`{3,}|~{3,})(.*)$/.exec(rest);
-      if (om && !(om[1]![0] === '`' && om[2]!.includes('`'))) {
-        segs.push({ text: hardened.slice(segStart, pos), isFence: false });
-        sInFence = true;
-        openedSplitFence = true;
-        sPrevPara = false;
-        sFenceChar = om[1]![0]!;
-        sFenceLen = om[1]!.length;
-        sFenceIndent = sListIndent > 0 ? sListIndent : 0;
-        segStart = pos;
-      }
-    }
-    if (!openedSplitFence) {
-      sPrevPara = computeNextSliceParagraphState(
-        rawLine,
-        cols,
-        bytePos,
-        isBlank,
-        lCol,
-        sListInfo.hasContent,
-        sListIndent,
-        sPrevPara,
-      );
-    }
-    pos = nextPos;
   }
-  segs.push({ text: hardened.slice(segStart), isFence: sInFence });
-  return segs;
+
+  state.prevLineWasAsciiBlank = false;
+  _stepOut.kind = 'prose';
+  _stepOut.outLine = raw;
+  return _stepOut;
+}
+
+export interface RecognizeMarkdownFencesOptions {
+  harden?: boolean;
+  preserveCrLf?: boolean;
+  initialReopenedFence?: { ch: '`' | '~'; len: number };
+  initialState?: MarkdownFenceRecognizerState;
+  skipLeadingSeparatorEmptyLine?: boolean;
 }
 
 /**
- * Shared fail-closed paged Markdown slice sanitizer (`H2` — used by both `storage.ts` `readArtifactPage` and `scrape.ts`
- * `sliceMarkdownWithOffsetAndMaxChars`):
- *  1. Scans `fullMd` in **O(N)** up to the full line containing `safeOffset` to detect whether `safeOffset` starts inside an
- *     open CommonMark fenced code block, mid-opening-fence, mid-closing-fence, or mid-prose-line.
- *  2. Re-opens any active fenced code block at the top of the slice (and escapes partial mid-line ` ``` ` / `~~~` prefixes so
- *     fence polarity can NEVER invert).
- *  3. Hardens and closes any truncated fenced code block or trailing inline backtick code span at the end of the slice.
- *  4. Always runs the fail-closed sanitizer (`escapeGfmTaskListCheckboxesLinear` + `neutralizeAllUnsafeMarkdownLinksLinear` +
- *     `escapeAllResidualLtInProseLinear`) across all non-fence segments so **0 of N** character offsets can EVER produce live
- *     HTML or dangerous URI schemes!
+ * Single canonical CommonMark fence recognizer & hardener (`R11-S1` & `R11-S2`):
+ * Shared by both full-document Markdown sanitization (`scrape.ts`) and `read_artifact` / `maxChars` slice paging
+ * (`scrape-advanced.ts`, `storage.ts`) so there is literally ONE function in TypeScript that decides what is a fence.
  */
+export function recognizeAndHardenMarkdownFences(
+  rawMd: string,
+  opts: RecognizeMarkdownFencesOptions = {},
+): { hardened: string; segments: string[] } {
+  const harden = opts.harden !== false;
+  const preserveCrLf = Boolean(opts.preserveCrLf);
+  const reopened = opts.initialReopenedFence;
+  if (!rawMd && !reopened) return { hardened: rawMd, segments: [rawMd] };
+
+  const md = preserveCrLf ? normalizeSliceLineEndingsLengthPreserving(rawMd) : normalizeMarkdownLineEndingsUpfrontLinear(rawMd);
+  if (!reopened && !md.includes('```') && !md.includes('~~~')) {
+    return { hardened: md, segments: [md] };
+  }
+
+  const lines = md.split('\n');
+  const outLines: string[] = [];
+  const fenceSpans: Array<{ openLine: number; closeLine: number }> = [];
+  const state = opts.initialState ? cloneMarkdownFenceRecognizerState(opts.initialState) : createMarkdownFenceRecognizerState();
+
+  let fenceOpenOutIdx = -1;
+  let fenceOpenInfo = '';
+  let fenceOpenCr = '';
+
+  if (reopened) {
+    state.inFence = true;
+    state.fenceChar = reopened.ch;
+    state.fenceLen = reopened.len;
+    state.effectiveFenceLen = reopened.len;
+    state.prevLineWasAsciiBlank = false;
+    fenceOpenOutIdx = 1;
+    fenceOpenInfo = '';
+    fenceOpenCr = '';
+    outLines.push('', reopened.ch.repeat(reopened.len));
+  }
+
+  const skipSepNl = !reopened && Boolean(opts.skipLeadingSeparatorEmptyLine);
+
+  for (let li = 0; li < lines.length; li++) {
+    const rawWithCr = lines[li]!;
+    const cr = preserveCrLf && rawWithCr.endsWith('\r') ? '\r' : '';
+    const raw = cr ? rawWithCr.slice(0, -1) : rawWithCr;
+
+    if (li === 0 && skipSepNl && raw.length === 0 && !state.inFence) {
+      outLines.push(rawWithCr);
+      continue;
+    }
+
+    const activeFenceCh = state.fenceChar;
+    const step = stepCanonicalMarkdownFenceLine(raw, state, harden);
+
+    if (step.kind === 'open_trusted') {
+      fenceOpenOutIdx = outLines.length;
+      fenceOpenInfo = step.openedInfo;
+      fenceOpenCr = cr;
+      outLines.push(`${step.outLine}${cr}`);
+      continue;
+    }
+
+    if (step.kind === 'close_trusted') {
+      outLines.push(`${step.outLine}${cr}`);
+      fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1 });
+      fenceOpenOutIdx = -1;
+      fenceOpenInfo = '';
+      fenceOpenCr = '';
+      continue;
+    }
+
+    if (step.kind === 'in_trusted') {
+      if (harden && step.lengthenedEffectiveLen > 0 && fenceOpenOutIdx >= 0) {
+        outLines[fenceOpenOutIdx] = `${activeFenceCh.repeat(step.lengthenedEffectiveLen)}${fenceOpenInfo}${fenceOpenCr}`;
+      }
+      outLines.push(`${step.outLine}${cr}`);
+      continue;
+    }
+
+    outLines.push(`${step.outLine}${cr}`);
+  }
+
+  if (state.inFence) {
+    if (harden) {
+      outLines.push(state.fenceChar.repeat(state.effectiveFenceLen));
+    }
+    fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1 });
+  }
+
+  const hardened = outLines.join('\n');
+  if (fenceSpans.length === 0) {
+    return { hardened, segments: [hardened] };
+  }
+
+  const segments: string[] = [];
+  let lineCursor = 0;
+  let prefixLeadingNewline = false;
+  for (let si = 0; si < fenceSpans.length; si++) {
+    const sp = fenceSpans[si]!;
+    const proseLinesSlice = outLines.slice(lineCursor, sp.openLine);
+    let proseText = proseLinesSlice.join('\n');
+    if (prefixLeadingNewline) {
+      proseText = `\n${proseText}`;
+    }
+    if (sp.openLine > lineCursor) {
+      proseText = `${proseText}\n`;
+    }
+    segments.push(proseText);
+
+    const fenceText = outLines.slice(sp.openLine, sp.closeLine + 1).join('\n');
+    segments.push(fenceText);
+
+    lineCursor = sp.closeLine + 1;
+    prefixLeadingNewline = lineCursor < outLines.length;
+  }
+
+  if (lineCursor < outLines.length) {
+    const tailText = outLines.slice(lineCursor).join('\n');
+    segments.push(prefixLeadingNewline ? `\n${tailText}` : tailText);
+  } else {
+    segments.push('');
+  }
+
+  return { hardened, segments };
+}
+
 export interface MarkdownSliceCheckpoint {
   pos: number;
   inFence: boolean;
@@ -1357,34 +1541,33 @@ export interface MarkdownSliceCheckpoint {
   activeListIndent: number;
   listIndents?: readonly number[];
   prevLineWasParagraph: boolean;
+  prevLineWasAsciiBlank?: boolean;
+  possiblyInList?: boolean;
+  escapedUntrusted?: { ch: '`' | '~'; len: number; needBlockquote: boolean } | null;
 }
 
 export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 16_384): MarkdownSliceCheckpoint[] {
   const checkpoints: MarkdownSliceCheckpoint[] = [];
   if (!rawFullMd || rawFullMd.length <= stepChars) return checkpoints;
   const fullMd = normalizeSliceLineEndingsLengthPreserving(rawFullMd);
-  let inFence = false;
-  let fenceChar = '';
-  let fenceLen = 0;
-  let fenceIndent = 0;
-  const listIndents: number[] = [];
-  let prevLineWasParagraph = false;
+  const state = createMarkdownFenceRecognizerState();
   let nextCheckpointAt = stepChars;
   let pos = 0;
   const n = fullMd.length;
 
   while (pos < n) {
     if (pos >= nextCheckpointAt) {
-      const activeListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
       checkpoints.push({
         pos,
-        inFence,
-        fenceChar,
-        fenceLen,
-        fenceIndent,
-        activeListIndent,
-        listIndents: [...listIndents],
-        prevLineWasParagraph,
+        inFence: state.inFence,
+        fenceChar: state.fenceChar,
+        fenceLen: state.fenceLen,
+        fenceIndent: 0,
+        activeListIndent: state.possiblyInList ? 2 : 0,
+        prevLineWasParagraph: !state.prevLineWasAsciiBlank,
+        prevLineWasAsciiBlank: state.prevLineWasAsciiBlank,
+        possiblyInList: state.possiblyInList,
+        escapedUntrusted: state.escapedUntrusted ? { ...state.escapedUntrusted } : null,
       });
       nextCheckpointAt = pos + stepChars;
     }
@@ -1392,90 +1575,7 @@ export function computeMarkdownSliceCheckpoints(rawFullMd: string, stepChars = 1
     const lineEnd = nl === -1 ? n : nl;
     const nextPos = nl === -1 ? n : nl + 1;
     const rawLine = lineEnd > pos && fullMd.charCodeAt(lineEnd - 1) === 13 ? fullMd.slice(pos, lineEnd - 1) : fullMd.slice(pos, lineEnd);
-    const { cols, bytePos, isBlank } = measureSliceIndentCols(rawLine);
-
-    let lineOpenedFence: { ch: string; len: number; indent: number } | null = null;
-    let lineClosedFenceExplicit = false;
-
-    if (inFence) {
-      prevLineWasParagraph = false;
-      if (!isBlank && fenceIndent > 0 && cols < fenceIndent) {
-        inFence = false;
-        fenceChar = '';
-        fenceLen = 0;
-        fenceIndent = 0;
-        listIndents.length = 0;
-      } else {
-        const maxClose = fenceIndent > 0 ? fenceIndent + 3 : 3;
-        if (!isBlank && cols >= fenceIndent && cols <= maxClose && bytePos < rawLine.length) {
-          let p = bytePos;
-          const fcCode = fenceChar.charCodeAt(0);
-          while (p < rawLine.length && rawLine.charCodeAt(p) === fcCode) p++;
-          const runLen = p - bytePos;
-          if (runLen >= fenceLen && isAsciiSpaceOrTabOnly(rawLine, p)) {
-            lineClosedFenceExplicit = true;
-          }
-        }
-      }
-    }
-
-    if (!inFence && !lineClosedFenceExplicit) {
-      if (!isBlank && listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
-        while (listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
-          listIndents.pop();
-        }
-      }
-      const parentListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
-      const listInfo = detectSliceListItemInfo(rawLine, cols, bytePos, prevLineWasParagraph, parentListIndent);
-      const listCol = listInfo.contentCol;
-      if (listCol > 0) {
-        listIndents.push(listCol);
-      }
-      const activeListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
-      const minCols = activeListIndent > 0 ? activeListIndent : 0;
-      const maxCols = minCols + 3;
-      if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos + 3 <= rawLine.length) {
-        const c0 = rawLine.charCodeAt(bytePos);
-        if (c0 === 96 || c0 === 126) {
-          let fEnd = bytePos + 1;
-          while (fEnd < rawLine.length && rawLine.charCodeAt(fEnd) === c0) fEnd++;
-          const fLen = fEnd - bytePos;
-          if (fLen >= 3 && !(c0 === 96 && rawLine.indexOf('`', fEnd) >= 0)) {
-            lineOpenedFence = {
-              ch: c0 === 96 ? '`' : '~',
-              len: fLen,
-              indent: activeListIndent > 0 ? activeListIndent : 0,
-            };
-          }
-        }
-      }
-      if (!lineOpenedFence) {
-        prevLineWasParagraph = computeNextSliceParagraphState(
-          rawLine,
-          cols,
-          bytePos,
-          isBlank,
-          listCol,
-          listInfo.hasContent,
-          activeListIndent,
-          prevLineWasParagraph,
-        );
-      }
-    }
-
-    if (lineClosedFenceExplicit) {
-      inFence = false;
-      fenceChar = '';
-      fenceLen = 0;
-      fenceIndent = 0;
-      prevLineWasParagraph = false;
-    } else if (lineOpenedFence) {
-      inFence = true;
-      fenceChar = lineOpenedFence.ch;
-      fenceLen = lineOpenedFence.len;
-      fenceIndent = lineOpenedFence.indent;
-      prevLineWasParagraph = false;
-    }
+    stepCanonicalMarkdownFenceLine(rawLine, state, true);
     pos = nextPos;
   }
   return checkpoints;
@@ -1492,17 +1592,12 @@ export function sanitizeMarkdownPageSlice(
   const fullMd = normalizeSliceLineEndingsLengthPreserving(rawFullMd);
   const rawSlice = normalizeSliceLineEndingsLengthPreserving(rawSliceInput);
 
-  let inFence = false;
-  let fenceChar = '';
-  let fenceLen = 0;
-  let fenceIndent = 0;
-  let listIndents: number[] = [];
-  let prevLineWasParagraph = false;
-
+  const state = createMarkdownFenceRecognizerState();
   let reconstructed = rawSlice;
-  let initialReopenedFence: { ch: string; len: number; sourceIndent: number } | undefined;
+  let initialReopenedFence: { ch: '`' | '~'; len: number } | undefined;
+  let sliceInitialState: MarkdownFenceRecognizerState | undefined;
+  let skipLeadingSeparatorEmptyLine = false;
   let forceLeadingNewlineForConcat = false;
-  const sliceInitialCtx: InitialSliceContext = { prevPara: false, startsAtSeparatorNewline: false };
 
   if (safeOffset > 0 && fullMd.length > 0) {
     const clampedOffset = Math.min(safeOffset, fullMd.length);
@@ -1523,165 +1618,100 @@ export function sanitizeMarkdownPageSlice(
       if (bestIdx >= 0) {
         const cp = checkpoints[bestIdx]!;
         pos = cp.pos;
-        inFence = cp.inFence;
-        fenceChar = cp.fenceChar;
-        fenceLen = cp.fenceLen;
-        fenceIndent = cp.fenceIndent;
-        listIndents = cp.listIndents ? [...cp.listIndents] : cp.activeListIndent > 0 ? [cp.activeListIndent] : [];
-        prevLineWasParagraph = cp.prevLineWasParagraph;
+        state.inFence = cp.inFence;
+        state.fenceChar = cp.fenceChar === '`' || cp.fenceChar === '~' ? cp.fenceChar : '';
+        state.fenceLen = cp.fenceLen;
+        state.effectiveFenceLen = cp.fenceLen;
+        state.prevLineWasAsciiBlank = cp.prevLineWasAsciiBlank ?? !cp.prevLineWasParagraph;
+        state.possiblyInList = cp.possiblyInList ?? cp.activeListIndent > 0;
+        state.escapedUntrusted = cp.escapedUntrusted ? { ...cp.escapedUntrusted } : null;
       }
     }
+
     while (pos <= clampedOffset && pos <= fullMd.length) {
       const nl = fullMd.indexOf('\n', pos);
       const lineEnd = nl === -1 ? fullMd.length : nl;
       const nextPos = nl === -1 ? fullMd.length + 1 : nl + 1;
       const rawLine = lineEnd > pos && fullMd.charCodeAt(lineEnd - 1) === 13 ? fullMd.slice(pos, lineEnd - 1) : fullMd.slice(pos, lineEnd);
       const containsOffset = clampedOffset >= pos && clampedOffset <= lineEnd;
-      const { cols, bytePos, isBlank } = measureSliceIndentCols(rawLine);
-      if (containsOffset && clampedOffset < lineEnd && !inFence) {
-        sliceInitialCtx.prevPara = prevLineWasParagraph;
+
+      if (!containsOffset) {
+        stepCanonicalMarkdownFenceLine(rawLine, state, true);
+        pos = nextPos;
+        continue;
       }
 
-      let lineOpenedFence: { ch: string; len: number; indent: number } | null = null;
-      let lineClosedFenceExplicit = false;
+      const stateBeforeLine = cloneMarkdownFenceRecognizerState(state);
+      const stepRes = stepCanonicalMarkdownFenceLine(rawLine, state, true);
+      const firstSliceNl = reconstructed.indexOf('\n');
 
-      if (inFence) {
-        prevLineWasParagraph = false;
-        if (!isBlank && fenceIndent > 0 && cols < fenceIndent) {
-          inFence = false;
-          fenceChar = '';
-          fenceLen = 0;
-          fenceIndent = 0;
-          listIndents.length = 0;
-        } else {
-          const maxClose = fenceIndent > 0 ? fenceIndent + 3 : 3;
-          if (!isBlank && cols >= fenceIndent && cols <= maxClose && bytePos < rawLine.length) {
-            let p = bytePos;
-            const fcCode = fenceChar.charCodeAt(0);
-            while (p < rawLine.length && rawLine.charCodeAt(p) === fcCode) p++;
-            const runLen = p - bytePos;
-            if (runLen >= fenceLen && isAsciiSpaceOrTabOnly(rawLine, p)) {
-              lineClosedFenceExplicit = true;
-            }
-          }
-        }
-      }
-
-      if (!inFence && !lineClosedFenceExplicit) {
-        if (!isBlank && listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
-          while (listIndents.length > 0 && cols < listIndents[listIndents.length - 1]!) {
-            listIndents.pop();
-          }
-        }
-        const parentListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
-        const listInfo = detectSliceListItemInfo(rawLine, cols, bytePos, prevLineWasParagraph, parentListIndent);
-        const listCol = listInfo.contentCol;
-        if (listCol > 0) {
-          listIndents.push(listCol);
-        }
-        const activeListIndent = listIndents.length > 0 ? listIndents[listIndents.length - 1]! : 0;
-        const minCols = activeListIndent > 0 ? activeListIndent : 0;
-        const maxCols = minCols + 3;
-        if (listCol === 0 && cols >= minCols && cols <= maxCols && bytePos + 3 <= rawLine.length) {
-          const c0 = rawLine.charCodeAt(bytePos);
-          if (c0 === 96 || c0 === 126) {
-            let fEnd = bytePos + 1;
-            while (fEnd < rawLine.length && rawLine.charCodeAt(fEnd) === c0) fEnd++;
-            const fLen = fEnd - bytePos;
-            if (fLen >= 3 && !(c0 === 96 && rawLine.indexOf('`', fEnd) >= 0)) {
-              lineOpenedFence = {
-                ch: c0 === 96 ? '`' : '~',
-                len: fLen,
-                indent: activeListIndent > 0 ? activeListIndent : 0,
-              };
-            }
-          }
-        }
-        if (!lineOpenedFence && (!containsOffset || clampedOffset === lineEnd)) {
-          prevLineWasParagraph = computeNextSliceParagraphState(
-            rawLine,
-            cols,
-            bytePos,
-            isBlank,
-            listCol,
-            listInfo.hasContent,
-            activeListIndent,
-            prevLineWasParagraph,
-          );
-        }
-      }
-
-      if (containsOffset) {
-        const firstSliceNl = reconstructed.indexOf('\n');
-        if (lineOpenedFence) {
-          forceLeadingNewlineForConcat = true;
-          if (clampedOffset > pos || lineOpenedFence.indent > 0) {
-            if (firstSliceNl >= 0) {
-              reconstructed = reconstructed.slice(firstSliceNl + 1);
-              initialReopenedFence = {
-                ch: lineOpenedFence.ch,
-                len: lineOpenedFence.len,
-                sourceIndent: lineOpenedFence.indent,
-              };
-            } else {
-              // Slice ended inside the opening fence header itself before `\n` — no code body yet
-              reconstructed = `\n${lineOpenedFence.ch.repeat(lineOpenedFence.len)}\n${lineOpenedFence.ch.repeat(lineOpenedFence.len)}`;
-            }
-          }
-        } else if (lineClosedFenceExplicit) {
-          forceLeadingNewlineForConcat = true;
-          // `safeOffset` landed on or mid-way through a closing fence line whose opener is NOT in `rawSlice`:
-          // escape any leading fence chars on the partial first line so it cannot open a fake inverted fence!
-          const firstHead = firstSliceNl >= 0 ? reconstructed.slice(0, firstSliceNl) : reconstructed;
-          const escapedFirst = firstHead.replace(/^([ \t]*)([`~]+)/, (_m, ws: string, ticks: string) =>
-            `${ws}${ticks.split('').map((ch) => `\\${ch}`).join('')}`,
-          );
-          reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
-        } else if (inFence) {
-          forceLeadingNewlineForConcat = true;
-          // `safeOffset` landed strictly inside an open fenced code block!
-          initialReopenedFence = { ch: fenceChar, len: fenceLen, sourceIndent: fenceIndent };
-        } else if (clampedOffset > pos) {
-          if (clampedOffset === lineEnd && rawSlice.startsWith('\n')) {
-            sliceInitialCtx.prevPara = prevLineWasParagraph;
-            sliceInitialCtx.startsAtSeparatorNewline = true;
+      if (stepRes.kind === 'open_trusted') {
+        forceLeadingNewlineForConcat = true;
+        if (clampedOffset > pos) {
+          if (firstSliceNl >= 0) {
+            reconstructed = reconstructed.slice(firstSliceNl + 1);
+            initialReopenedFence = {
+              ch: state.fenceChar as '`' | '~',
+              len: state.fenceLen,
+            };
           } else {
-            // `safeOffset` landed mid-way through a prose line: prevent its suffix from acting as a synthetic line-start fence or list container!
-            const firstHead = firstSliceNl >= 0 ? reconstructed.slice(0, firstSliceNl) : reconstructed;
-            const escapedFirst = firstHead
-              .replace(/^([ \t]*)([`~]{3,})/, (_m, ws: string, ticks: string) =>
-                `${ws}${ticks.split('').map((ch) => `\\${ch}`).join('')}`,
-              )
-              .replace(/^([ \t]*)(?:([-+*])|(\d{1,9})([.)]))(?=[ \t]|$)/, (_m, ws: string, ul?: string, digits?: string, delim?: string) =>
-                ul ? `${ws}\\${ul}` : `${ws}${digits}\\${delim}`,
-              );
-            reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
+            reconstructed = `\n${state.fenceChar.repeat(state.fenceLen)}\n${state.fenceChar.repeat(state.fenceLen)}`;
           }
+        } else {
+          sliceInitialState = stateBeforeLine;
         }
-        break;
+      } else if (stepRes.kind === 'close_trusted') {
+        forceLeadingNewlineForConcat = true;
+        const firstHead = firstSliceNl >= 0 ? reconstructed.slice(0, firstSliceNl) : reconstructed;
+        const escapedFirst = firstHead.replace(/^([ \t]*)([`~]+)/, (_m, ws: string, ticks: string) =>
+          `${ws}${ticks.split('').map((ch) => `\\${ch}`).join('')}`,
+        );
+        reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
+        sliceInitialState = cloneMarkdownFenceRecognizerState(state);
+      } else if (stateBeforeLine.inFence && stepRes.kind === 'in_trusted') {
+        forceLeadingNewlineForConcat = true;
+        initialReopenedFence = {
+          ch: state.fenceChar as '`' | '~',
+          len: state.fenceLen,
+        };
+      } else if (clampedOffset === pos) {
+        sliceInitialState = stateBeforeLine;
+      } else if (clampedOffset === lineEnd && rawSlice.startsWith('\n')) {
+        sliceInitialState = cloneMarkdownFenceRecognizerState(state);
+        skipLeadingSeparatorEmptyLine = true;
+      } else {
+        const firstHead = firstSliceNl >= 0 ? reconstructed.slice(0, firstSliceNl) : reconstructed;
+        const escapedFirst = firstHead
+          .replace(/^([ \t]*)([`~]{3,})/, (_m, ws: string, ticks: string) =>
+            `${ws}${ticks.split('').map((ch) => `\\${ch}`).join('')}`,
+          )
+          .replace(/^([ \t]*)(?:([-+*])|(\d{1,9})([.)]))(?=[ \t]|$)/, (_m, ws: string, ul?: string, digits?: string, delim?: string) =>
+            ul ? `${ws}\\${ul}` : `${ws}${digits}\\${delim}`,
+          );
+        reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
+        sliceInitialState = {
+          ...stateBeforeLine,
+          prevLineWasAsciiBlank: false,
+        };
       }
-
-      if (lineClosedFenceExplicit) {
-        inFence = false;
-        fenceChar = '';
-        fenceLen = 0;
-        fenceIndent = 0;
-      } else if (lineOpenedFence) {
-        inFence = true;
-        fenceChar = lineOpenedFence.ch;
-        fenceLen = lineOpenedFence.len;
-        fenceIndent = lineOpenedFence.indent;
-      }
-      pos = nextPos;
+      break;
     }
   }
 
-  let segments = hardenAndSplitSliceFences(reconstructed, initialReopenedFence, sliceInitialCtx);
+  let { segments: segTexts } = recognizeAndHardenMarkdownFences(reconstructed, {
+    harden: true,
+    preserveCrLf: true,
+    ...(initialReopenedFence ? { initialReopenedFence } : {}),
+    ...(!initialReopenedFence && sliceInitialState ? { initialState: sliceInitialState } : {}),
+    ...(!initialReopenedFence && skipLeadingSeparatorEmptyLine ? { skipLeadingSeparatorEmptyLine: true } : {}),
+  });
+
   // Close any unclosed inline backtick code span in the final prose segment (`A1` truncation parity)
-  const lastSeg = segments[segments.length - 1];
-  if (lastSeg && !lastSeg.isFence && lastSeg.text.includes('`')) {
-    const lastBlank = lastSeg.text.lastIndexOf('\n\n');
-    const tailPara = lastBlank >= 0 ? lastSeg.text.slice(lastBlank + 2) : lastSeg.text;
+  const lastIdx = segTexts.length - 1;
+  if (lastIdx >= 0 && lastIdx % 2 === 0 && segTexts[lastIdx]!.includes('`')) {
+    const lastProse = segTexts[lastIdx]!;
+    const lastBlank = lastProse.lastIndexOf('\n\n');
+    const tailPara = lastBlank >= 0 ? lastProse.slice(lastBlank + 2) : lastProse;
     let p = 0;
     let openTickLen = 0;
     while (p < tailPara.length) {
@@ -1712,60 +1742,70 @@ export function sanitizeMarkdownPageSlice(
       p++;
     }
     if (openTickLen > 0) {
-      let trimEndIdx = lastSeg.text.length;
+      let trimEndIdx = lastProse.length;
       let wsProbe = trimEndIdx;
-      while (wsProbe > 0 && (lastSeg.text.charCodeAt(wsProbe - 1) === 32 || lastSeg.text.charCodeAt(wsProbe - 1) === 9)) {
+      while (wsProbe > 0 && (lastProse.charCodeAt(wsProbe - 1) === 32 || lastProse.charCodeAt(wsProbe - 1) === 9)) {
         wsProbe--;
       }
-      if (wsProbe > 0 && (lastSeg.text.charCodeAt(wsProbe - 1) === 10 || lastSeg.text.charCodeAt(wsProbe - 1) === 13)) {
+      if (wsProbe > 0 && (lastProse.charCodeAt(wsProbe - 1) === 10 || lastProse.charCodeAt(wsProbe - 1) === 13)) {
         trimEndIdx = wsProbe;
       }
       while (
         trimEndIdx > 0 &&
-        (lastSeg.text.charCodeAt(trimEndIdx - 1) === 10 || lastSeg.text.charCodeAt(trimEndIdx - 1) === 13)
+        (lastProse.charCodeAt(trimEndIdx - 1) === 10 || lastProse.charCodeAt(trimEndIdx - 1) === 13)
       ) {
         trimEndIdx--;
         let prevWs = trimEndIdx;
-        while (prevWs > 0 && (lastSeg.text.charCodeAt(prevWs - 1) === 32 || lastSeg.text.charCodeAt(prevWs - 1) === 9)) {
+        while (prevWs > 0 && (lastProse.charCodeAt(prevWs - 1) === 32 || lastProse.charCodeAt(prevWs - 1) === 9)) {
           prevWs--;
         }
-        if (prevWs > 0 && (lastSeg.text.charCodeAt(prevWs - 1) === 10 || lastSeg.text.charCodeAt(prevWs - 1) === 13)) {
+        if (prevWs > 0 && (lastProse.charCodeAt(prevWs - 1) === 10 || lastProse.charCodeAt(prevWs - 1) === 13)) {
           trimEndIdx = prevWs;
         }
       }
-      const bodyBeforeNl = lastSeg.text.slice(0, trimEndIdx);
-      const trailingNls = lastSeg.text.slice(trimEndIdx);
+      const bodyBeforeNl = lastProse.slice(0, trimEndIdx);
+      const trailingNls = lastProse.slice(trimEndIdx);
       const pad = bodyBeforeNl.endsWith('`') ? ' ' : '';
-      lastSeg.text = `${bodyBeforeNl}${pad}${'`'.repeat(openTickLen)}${trailingNls}`;
-      segments = hardenAndSplitSliceFences(
-        segments.map((s) => s.text).join(''),
-        undefined,
-        initialReopenedFence ? undefined : sliceInitialCtx,
-      );
+      segTexts[lastIdx] = `${bodyBeforeNl}${pad}${'`'.repeat(openTickLen)}${trailingNls}`;
+      segTexts = recognizeAndHardenMarkdownFences(segTexts.join(''), {
+        harden: true,
+        preserveCrLf: true,
+        ...(!initialReopenedFence && sliceInitialState ? { initialState: sliceInitialState } : {}),
+        ...(!initialReopenedFence && skipLeadingSeparatorEmptyLine ? { skipLeadingSeparatorEmptyLine: true } : {}),
+      }).segments;
     }
   }
 
-  const sanitizeSliceSegments = (segs: Array<{ text: string; isFence: boolean }>): string =>
+  const sanitizeSliceSegments = (segs: readonly string[]): string =>
     segs
-      .map((seg) => {
-        if (seg.isFence) return seg.text;
-        let cleanProse = escapeGfmTaskListCheckboxesLinear(seg.text);
+      .map((seg, idx) => {
+        if (idx % 2 === 1) return seg;
+        let cleanProse = stripInvisibleSmugglingChars(seg);
+        cleanProse = escapeGfmTaskListCheckboxesLinear(cleanProse);
         cleanProse = neutralizeAllUnsafeMarkdownLinksLinear(cleanProse);
         return escapeAllResidualLtInProseLinear(cleanProse, allowPdfPageMarkers);
       })
       .join('');
 
-  const pass1 = sanitizeSliceSegments(segments);
+  const pass1 = sanitizeSliceSegments(segTexts);
   const finalOut =
     !pass1.includes('```') && !pass1.includes('~~~')
       ? pass1
-      : sanitizeSliceSegments(hardenAndSplitSliceFences(pass1, undefined, initialReopenedFence ? undefined : sliceInitialCtx));
+      : sanitizeSliceSegments(
+          recognizeAndHardenMarkdownFences(pass1, {
+            harden: true,
+            preserveCrLf: true,
+            ...(!initialReopenedFence && sliceInitialState ? { initialState: sliceInitialState } : {}),
+            ...(!initialReopenedFence && skipLeadingSeparatorEmptyLine ? { skipLeadingSeparatorEmptyLine: true } : {}),
+          }).segments,
+        );
   if (
     safeOffset > 0 &&
-    !finalOut.startsWith('\n') &&
     (forceLeadingNewlineForConcat || Boolean(initialReopenedFence) || /^[ \t]{0,3}(?:`{3,}|~{3,})/.test(finalOut))
   ) {
-    return `\n${finalOut}`;
+    if (!finalOut.startsWith('\n\n')) {
+      return finalOut.startsWith('\n') ? `\n${finalOut}` : `\n\n${finalOut}`;
+    }
   }
   return finalOut;
 }
@@ -1777,9 +1817,10 @@ export function sanitizeMarkdownPageSlice(
  */
 export function sanitizeFullMarkdownDocumentForArtifact(fullMd: string): string {
   if (!fullMd) return '';
-  const norm = /[\r\u0085\u2028\u2029]/.test(fullMd)
-    ? fullMd.replace(/\r\n?/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ')
-    : fullMd;
+  const stripped = stripInvisibleSmugglingChars(fullMd);
+  const norm = /[\r\u0085\u2028\u2029]/.test(stripped)
+    ? stripped.replace(/\r\n?/g, '\n').replace(/[\u0085\u2028\u2029]/g, ' ')
+    : stripped;
   return sanitizeMarkdownPageSlice(norm, 0, norm, false);
 }
 

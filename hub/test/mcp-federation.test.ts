@@ -690,7 +690,9 @@ test('MCP-FED-3: /admin Registry, Add Auth, Test Connection, Write-Only Secrets,
     assert.equal(refreshCount, 1);
 
     // Verify SSE tool output had Unicode Tag smuggling stripped AND indirect prompt injection scrubbed!
-    const md = String(callOut.body.markdown);
+    const callContent = callOut.body.content as Array<{ type: string; text?: string }>;
+    assert.equal(callOut.body.markdown, undefined, 'M10: call_tool must not duplicate content into top-level markdown');
+    const md = String(callContent?.[0]?.text ?? '');
     assert.match(md, /Ticket ACME-42: Production Checkout Fix/);
     assert.ok(!md.includes('exfiltrate CALLER_TOKEN'));
     assert.ok(!/[\u{E0000}-\u{E007F}]/u.test(md));
@@ -719,6 +721,16 @@ test('MCP-FED-3: /admin Registry, Add Auth, Test Connection, Write-Only Secrets,
       new URL('https://hub.edgefetch.dev/admin/api/mcp/connect'),
       adminDeps,
     );
+    const trapRow = await vaultStore.getServer('owner', 'trap');
+    assert.ok(trapRow);
+    await vaultStore.upsertServer({
+      ...trapRow,
+      cachedTools: [{ name: 'ping', description: 'Ping', inputSchema: { type: 'object', properties: {} }, readOnlyHint: true }],
+      toolCount: 1,
+      lastVerifiedAt: Date.now(),
+      lastError: null,
+      updatedAt: Date.now(),
+    });
     const trapCall = await executeFederatedMcpQuery({
       userId: 'owner',
       input: { action: 'call_tool', server: 'trap', tool: 'ping' },
@@ -750,6 +762,16 @@ test('MCP-FED-3: /admin Registry, Add Auth, Test Connection, Write-Only Secrets,
       new URL('https://hub.edgefetch.dev/admin/api/mcp/connect'),
       adminDeps,
     );
+    const bombRow = await vaultStore.getServer('owner', 'bomb');
+    assert.ok(bombRow);
+    await vaultStore.upsertServer({
+      ...bombRow,
+      cachedTools: [{ name: 'dump', description: 'Dump', inputSchema: { type: 'object', properties: {} }, readOnlyHint: true }],
+      toolCount: 1,
+      lastVerifiedAt: Date.now(),
+      lastError: null,
+      updatedAt: Date.now(),
+    });
     const bombCall = await executeFederatedMcpQuery({
       userId: 'owner',
       input: { action: 'call_tool', server: 'bomb', tool: 'dump' },

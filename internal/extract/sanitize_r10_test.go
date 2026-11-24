@@ -63,9 +63,13 @@ func TestR10S4UnclosedTagsAndCommentsBeforeFencePreserveNewlineAndFenceIsolation
 	}
 
 	for _, tc := range unclosedOpeners {
-		// Case A: Preceding paragraph text + unclosed tag/comment right before a fenced code block.
-		// Previously, truncating the prose segment dropped its trailing `\n`, joining ``` onto "Intro paragraph "!
-		mdAfterPara := "Intro paragraph " + tc.opener + "\n```html\n" + fenceBody + "\n```\nAfter prose <script>alert(2)</script>"
+		// Case A1 (R11-S1/S3): Without a preceding blank line, the fence is treated as prose and its payload is escaped/stripped.
+		mdNoBlank := "Intro paragraph " + tc.opener + "\n```html\n" + fenceBody + "\n```\nAfter prose <script>alert(2)</script>"
+		gotNoBlank := SanitizeMarkdown(mdNoBlank, "https://example.com/docs/")
+		assertNoProseRawLtOrBadLinksR10(t, tc.name+"_no_blank", mdNoBlank, gotNoBlank)
+
+		// Case A2: Preceding paragraph text + unclosed tag/comment + blank line before a top-level fenced code block.
+		mdAfterPara := "Intro paragraph " + tc.opener + "\n\n```html\n" + fenceBody + "\n```\nAfter prose <script>alert(2)</script>"
 		gotAfterPara := SanitizeMarkdown(mdAfterPara, "https://example.com/docs/")
 		assertNoProseRawLtOrBadLinksR10(t, tc.name+"_after_para", mdAfterPara, gotAfterPara)
 
@@ -77,8 +81,8 @@ func TestR10S4UnclosedTagsAndCommentsBeforeFencePreserveNewlineAndFenceIsolation
 			t.Fatalf("[%s_after_para] expected fenced block body preserved inside fence segment, got fence=%q full=%q", tc.name, parts[1], gotAfterPara)
 		}
 
-		// Case B: Unclosed tag/comment at the very start of the document before a tilde fence.
-		mdAtStart := tc.opener + "\n~~~html\n" + fenceBody + "\n~~~\nTail `inline <T>`"
+		// Case B: Unclosed tag/comment at the very start of the document + blank line before a tilde fence.
+		mdAtStart := tc.opener + "\n\n~~~html\n" + fenceBody + "\n~~~\nTail `inline <T>`"
 		gotAtStart := SanitizeMarkdown(mdAtStart, "https://example.com/docs/")
 		assertNoProseRawLtOrBadLinksR10(t, tc.name+"_at_start", mdAtStart, gotAtStart)
 		partsStart := splitMarkdownByCodeFencesGo(gotAtStart)
@@ -86,8 +90,8 @@ func TestR10S4UnclosedTagsAndCommentsBeforeFencePreserveNewlineAndFenceIsolation
 			t.Fatalf("[%s_at_start] expected tilde fence to remain intact on its own line, got:\n%q", tc.name, gotAtStart)
 		}
 
-		// Case C: Unclosed tag/comment sandwiched between two fenced code blocks.
-		mdBetween := "```js\nconst a = 1 < 2;\n```\nMiddle text " + tc.opener + "\n```html\n" + fenceBody + "\n```"
+		// Case C: Unclosed tag/comment sandwiched between two blank-line-separated fenced code blocks.
+		mdBetween := "```js\nconst a = 1 < 2;\n```\n\nMiddle text " + tc.opener + "\n\n```html\n" + fenceBody + "\n```"
 		gotBetween := SanitizeMarkdown(mdBetween, "https://example.com/docs/")
 		assertNoProseRawLtOrBadLinksR10(t, tc.name+"_between_fences", mdBetween, gotBetween)
 		partsBetween := splitMarkdownByCodeFencesGo(gotBetween)
@@ -155,19 +159,19 @@ func TestR10S5TabIndentedFenceClosersAndOpenersInsideListItems(t *testing.T) {
 		assertNoProseRawLtOrBadLinksR10(t, name, md, got)
 	}
 
-	// Direct check on the canonical S5 payload: `<img ...>` after `\t```` MUST be stripped/sanitized as live prose
-	// (NOT preserved inside the fence), and inline `<T>` after `\t```` MUST be escaped to `&lt;T>`!
-	canonical := "- item\n  ```\n  safe_code(<KeepInsideFence>)\n\t```\nAfter fence: <img src=x onerror=alert(1)> and `Vec<int>`"
+	// Direct check on the canonical S5 payload under R11-S1/S3: list-item fences are treated as prose (escaping/stripping `<KeepInsideFence>`),
+	// AND `<img ...>` after `\t```` is stripped/sanitized as live prose while inline `<int>` is escaped to `&lt;int>`!
+	canonical := "- item\n  ```\n  safe_code(a < b)\n\t```\nAfter fence: <img src=x onerror=alert(1)> and `Vec<int>`"
 	gotCanonical := SanitizeMarkdown(canonical, "https://example.com/")
 	assertNoProseRawLtOrBadLinksR10(t, "canonical_s5", canonical, gotCanonical)
-	if !strings.Contains(gotCanonical, "safe_code(<KeepInsideFence>)") {
-		t.Fatalf("expected fenced code line before tab closer to stay intact, got:\n%s", gotCanonical)
+	if !strings.Contains(gotCanonical, "safe_code(a &lt; b)") {
+		t.Fatalf("expected list-item fence body `<` to be escaped per R11-S1/S3, got:\n%s", gotCanonical)
 	}
 	if strings.Contains(gotCanonical, "onerror=") || !strings.Contains(gotCanonical, "`Vec&lt;int>`") {
 		t.Fatalf("expected post-tab-closer prose to strip `<img onerror=...>` and escape inline `<int>`, got:\n%s", gotCanonical)
 	}
 	if strings.Contains(gotCanonical, "\t```") {
-		t.Fatalf("expected ambiguous tab-indented fence closer inside list item to be normalized to spaces, got:\n%q", gotCanonical)
+		t.Fatalf("expected ambiguous tab-indented fence closer inside list item to be escaped, got:\n%q", gotCanonical)
 	}
 }
 

@@ -241,8 +241,12 @@ export interface ParsedWikipediaArticle {
 }
 
 /**
- * Parses and canonicalizes a `https://<lang>.wikipedia.org/wiki/<Title>` article URL.
- * Returns `null` for non-Wikipedia URLs, root `/`, `/w/*`, `/api/*`, or non-article namespaces (`Special:`, `Talk:`, `User:`, `Wikipedia:`, `File:`, etc.).
+ * Parses and canonicalizes a Wikipedia article URL:
+ *  - `https://<lang>.wikipedia.org/wiki/<Title>` (including `?action=render`, `?action=view`, `?oldid=<id>`)
+ *  - `https://<lang>.wikipedia.org/w/index.php?title=<Title>` (or `/w/?title=<Title>`, `/?title=<Title>`, with optional `action=render` / `oldid`)
+ *  - `https://<lang>.wikipedia.org/w/index.php?oldid=<id>` (or `/w/?oldid=<id>`, `/?oldid=<id>`, `/wiki/<Title>?oldid=<id>`)
+ * Returns `null` for non-Wikipedia URLs, `/w/api.php`, `/w/rest.php`, non-view/render actions (`?action=edit`, `?action=history`, `?diff=`),
+ * or non-article namespaces (`Special:`, `Talk:`, `User:`, `Wikipedia:`, `File:`, etc.).
  */
 export function parseWikipediaArticleUrl(rawUrl: string): ParsedWikipediaArticle | null {
   if (!rawUrl || typeof rawUrl !== 'string') return null;
@@ -255,19 +259,71 @@ export function parseWikipediaArticleUrl(rawUrl: string): ParsedWikipediaArticle
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
   const lang = extractWikipediaLangFromHost(u.hostname);
   if (!lang) return null;
-  if (!u.pathname.startsWith('/wiki/') || u.pathname.length <= 6) return null;
-  if (u.search && /[?&](?:action|oldid|diff|curid|veaction|printable)=/i.test(u.search)) {
+  const host = `${lang}.wikipedia.org`;
+
+  if (u.search) {
+    if (/[?&](?:diff|veaction)=/i.test(u.search)) {
+      return null;
+    }
+    const actions = u.searchParams.getAll('action');
+    for (const rawAct of actions) {
+      const act = rawAct.trim().toLowerCase();
+      if (act !== '' && act !== 'view' && act !== 'render') {
+        return null;
+      }
+    }
+  }
+
+  let rawTitleCandidate: string | null = null;
+  const isWikiPath = u.pathname.startsWith('/wiki/') && u.pathname.length > 6;
+  const isIndexScriptPath =
+    u.pathname === '/' ||
+    u.pathname === '/w' ||
+    u.pathname === '/w/' ||
+    u.pathname === '/w/index.php' ||
+    u.pathname === '/index.php';
+
+  if (isWikiPath) {
+    const rawSlug = u.pathname.slice('/wiki/'.length).replace(/\/+$/, '');
+    if (!rawSlug || hasUnsafeWikiTitlePathSegments(rawSlug)) return null;
+    const rawDecodedSlug = safeDecodeWikiSegment(rawSlug);
+    if (!rawDecodedSlug || hasUnsafeWikiTitlePathSegments(rawDecodedSlug)) return null;
+    rawTitleCandidate = rawDecodedSlug;
+    // If `?title=` is also supplied alongside `/wiki/...`, reject if `?title=` targets a disallowed namespace or traversal
+    const queryTitle = u.searchParams.get('title');
+    if (queryTitle !== null) {
+      const cleanQt = queryTitle.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!cleanQt || hasUnsafeWikiTitlePathSegments(queryTitle) || isDisallowedWikipediaTitle(cleanQt)) {
+        return null;
+      }
+    }
+  } else if (isIndexScriptPath && u.search) {
+    const queryTitle = u.searchParams.get('title');
+    if (queryTitle !== null && queryTitle.trim() !== '') {
+      if (hasUnsafeWikiTitlePathSegments(queryTitle)) return null;
+      rawTitleCandidate = queryTitle;
+    } else {
+      const rawOldId = u.searchParams.get('oldid')?.trim() ?? u.searchParams.get('curid')?.trim() ?? '';
+      if (/^[1-9][0-9]{0,14}$/.test(rawOldId)) {
+        const paramName = u.searchParams.has('oldid') ? 'oldid' : 'curid';
+        return {
+          lang,
+          host,
+          canonicalTitle: `Revision ${rawOldId}`,
+          underscoredTitle: `Revision_${rawOldId}`,
+          canonicalUrl: `https://${host}/w/index.php?${paramName}=${rawOldId}`,
+        };
+      }
+      return null;
+    }
+  } else {
     return null;
   }
-  const rawSlug = u.pathname.slice('/wiki/'.length).replace(/\/+$/, '');
-  if (!rawSlug || hasUnsafeWikiTitlePathSegments(rawSlug)) return null;
-  const rawDecodedSlug = safeDecodeWikiSegment(rawSlug);
-  if (!rawDecodedSlug || hasUnsafeWikiTitlePathSegments(rawDecodedSlug)) return null;
-  const decoded = rawDecodedSlug.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+
+  const decoded = rawTitleCandidate.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
   if (!decoded || isDisallowedWikipediaTitle(decoded)) return null;
   const encodedSlug = encodeCanonicalWikiTitlePath(decoded);
   if (!encodedSlug) return null;
-  const host = `${lang}.wikipedia.org`;
   const canonicalUrl = `https://${host}/wiki/${encodedSlug}`;
   try {
     if (new URL(canonicalUrl).pathname !== `/wiki/${encodedSlug}`) return null;
@@ -378,7 +434,12 @@ export function buildWikimediaRobotsSuggestion(rawHost: string): string {
   );
 }
 
-const wikipediaCallerBuckets = new Map<string, number[]>();
+interface WikipediaQuotaBucketEntry {
+  stamps: number[];
+  blocked: boolean;
+}
+
+const wikipediaCallerBuckets = new Map<string, WikipediaQuotaBucketEntry>();
 let customHourlyLimitForTests: number | null = null;
 
 export function resetWikipediaStateForTests(customHourlyLimit?: number | null): void {
@@ -399,6 +460,37 @@ export interface WikipediaBulkChannelBlock {
   bulkChannels: typeof WIKIPEDIA_BULK_CHANNELS;
 }
 
+function makeBulkChannelBlock(host: string, limit: number, requestsInWindow: number): WikipediaBulkChannelBlock {
+  return {
+    ok: false,
+    outcome: 'use_bulk_channel',
+    error: 'use_bulk_channel',
+    retryable: false,
+    host,
+    limitPerHour: limit,
+    requestsInWindow,
+    message:
+      `Exceeded polite single-article limit (${limit} requests/hour on ${host}). ` +
+      `For bulk or structured corpus work, use Wikimedia Enterprise (${WIKIPEDIA_BULK_CHANNELS.wikimediaEnterprise}), ` +
+      `Wikimedia Dumps (${WIKIPEDIA_BULK_CHANNELS.dumps}), or the Hugging Face wikimedia/wikipedia dataset (${WIKIPEDIA_BULK_CHANNELS.huggingFaceDataset}).`,
+    bulkChannels: WIKIPEDIA_BULK_CHANNELS,
+  };
+}
+
+function sweepExpiredWikipediaBuckets(cutoff: number): void {
+  for (const [k, entry] of wikipediaCallerBuckets.entries()) {
+    let firstValid = 0;
+    while (firstValid < entry.stamps.length && entry.stamps[firstValid]! <= cutoff) {
+      firstValid++;
+    }
+    if (firstValid >= entry.stamps.length) {
+      wikipediaCallerBuckets.delete(k);
+    } else if (firstValid > 0) {
+      entry.stamps = entry.stamps.slice(firstValid);
+    }
+  }
+}
+
 /**
  * Enforces the polite Tier 3 single-article ceiling (`200` live article requests per caller per Wikimedia host per hour).
  * Cached hits (`cached: true`) MUST NOT call this helper so $0 cache reads never consume quota.
@@ -416,48 +508,51 @@ export function checkAndRecordWikipediaArticleQuota(params: {
   const bucketKey = `${caller}|${host}`;
   const cutoff = now - WIKIPEDIA_QUOTA_WINDOW_MS;
 
-  let stamps = wikipediaCallerBuckets.get(bucketKey);
-  if (stamps) {
+  const existing = wikipediaCallerBuckets.get(bucketKey);
+  let stamps: number[];
+  if (existing) {
     let firstValid = 0;
-    while (firstValid < stamps.length && stamps[firstValid]! <= cutoff) {
+    while (firstValid < existing.stamps.length && existing.stamps[firstValid]! <= cutoff) {
       firstValid++;
     }
-    if (firstValid > 0) {
-      stamps = stamps.slice(firstValid);
-    }
+    stamps = firstValid > 0 ? existing.stamps.slice(firstValid) : existing.stamps;
     wikipediaCallerBuckets.delete(bucketKey);
   } else {
     stamps = [];
   }
 
   if (stamps.length >= limit) {
-    wikipediaCallerBuckets.set(bucketKey, stamps);
+    if (wikipediaCallerBuckets.size < MAX_WIKIPEDIA_QUOTA_BUCKETS) {
+      wikipediaCallerBuckets.set(bucketKey, { stamps, blocked: true });
+    } else {
+      sweepExpiredWikipediaBuckets(cutoff);
+      if (wikipediaCallerBuckets.size < MAX_WIKIPEDIA_QUOTA_BUCKETS) {
+        wikipediaCallerBuckets.set(bucketKey, { stamps, blocked: true });
+      }
+    }
     return {
       allowed: false,
-      block: {
-        ok: false,
-        outcome: 'use_bulk_channel',
-        error: 'use_bulk_channel',
-        retryable: false,
-        host,
-        limitPerHour: limit,
-        requestsInWindow: stamps.length,
-        message:
-          `Exceeded polite single-article limit (${limit} requests/hour on ${host}). ` +
-          `For bulk or structured corpus work, use Wikimedia Enterprise (${WIKIPEDIA_BULK_CHANNELS.wikimediaEnterprise}), ` +
-          `Wikimedia Dumps (${WIKIPEDIA_BULK_CHANNELS.dumps}), or the Hugging Face wikimedia/wikipedia dataset (${WIKIPEDIA_BULK_CHANNELS.huggingFaceDataset}).`,
-        bulkChannels: WIKIPEDIA_BULK_CHANNELS,
-      },
+      block: makeBulkChannelBlock(host, limit, stamps.length),
     };
   }
 
-  stamps.push(now);
-  while (wikipediaCallerBuckets.size >= MAX_WIKIPEDIA_QUOTA_BUCKETS) {
-    const oldest = wikipediaCallerBuckets.keys().next().value;
-    if (oldest === undefined) break;
-    wikipediaCallerBuckets.delete(oldest);
+  if (wikipediaCallerBuckets.size >= MAX_WIKIPEDIA_QUOTA_BUCKETS) {
+    sweepExpiredWikipediaBuckets(cutoff);
+    // P3-2: NEVER let new/other-host buckets evict an actively blocked or non-expired within-window quota bucket!
+    // If all MAX_WIKIPEDIA_QUOTA_BUCKETS slots still hold active within-window buckets after sweeping expired ones, fail closed!
+    if (wikipediaCallerBuckets.size >= MAX_WIKIPEDIA_QUOTA_BUCKETS) {
+      return {
+        allowed: false,
+        block: makeBulkChannelBlock(host, limit, limit),
+      };
+    }
   }
-  wikipediaCallerBuckets.set(bucketKey, stamps);
+
+  stamps.push(now);
+  wikipediaCallerBuckets.set(bucketKey, {
+    stamps,
+    blocked: stamps.length >= limit,
+  });
   return { allowed: true, count: stamps.length, limitPerHour: limit };
 }
 

@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
-# Note: Update InstallerSha256 values from signed dist/checksums.txt emitted by .github/workflows/release.yml on tag v2.7.7 before submitting to microsoft/winget-pkgs.
+# Checksums verified from signed dist/checksums.txt emitted by .github/workflows/release.yml on tag v2.7.8.
 PackageIdentifier: BartrumB.EdgeFetch
-PackageVersion: 2.7.7
+PackageVersion: 2.7.8
 Installers:
   - Architecture: x64
     InstallerType: zip
@@ -9,15 +9,15 @@ Installers:
     NestedInstallerFiles:
       - RelativeFilePath: edgefetch.exe
         PortableCommandAlias: edgefetch
-    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.7.7/edgefetch_2.7.7_windows_amd64.zip
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.7.8/edgefetch_2.7.8_windows_amd64.zip
+    InstallerSha256: 40355BAD828B99A45535892CC44165DA397DD895D0D4695391BEB13C9B64A980
   - Architecture: arm64
     InstallerType: zip
     NestedInstallerType: portable
     NestedInstallerFiles:
       - RelativeFilePath: edgefetch.exe
         PortableCommandAlias: edgefetch
-    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.7.7/edgefetch_2.7.7_windows_arm64.zip
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerUrl: https://github.com/bartrumb/edgefetch/releases/download/v2.7.8/edgefetch_2.7.8_windows_arm64.zip
+    InstallerSha256: 2421F097965C31721A5E4DAC211F8FB2FCD8762A362104D106457378201FC7CA
 ManifestType: installer
 ManifestVersion: 1.9.0

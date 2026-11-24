@@ -740,6 +740,12 @@ export class AgentHubDO extends DurableObject<Env> {
   async oauthConsumeRefreshToken(h: string, now: number): Promise<OAuthTokenRecord | null> {
     return await this.oauth.consumeRefreshToken(h, now);
   }
+  async oauthGetRefreshTokenLineageHint(
+    h: string,
+    now: number,
+  ): Promise<{ grantId: string; rotationCounter: number } | null> {
+    return (await this.oauth.getRefreshTokenLineageHint?.(h, now)) ?? null;
+  }
   async oauthRotateRefreshToken(params: RotateRefreshParams): Promise<RotateRefreshResult> {
     return await this.oauth.rotateRefreshToken(params);
   }
@@ -928,6 +934,13 @@ function hubOAuthStore(hub: () => DurableObjectStub<AgentHubDO>): OAuthStore {
     putTokenPair: (p) => hub().oauthPutTokenPair(p),
     getAccessToken: (h, now) => hub().oauthGetAccessToken(h, now),
     consumeRefreshToken: (h, now) => hub().oauthConsumeRefreshToken(h, now),
+    getRefreshTokenLineageHint: async (h, now) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      if (typeof stub.oauthGetRefreshTokenLineageHint === 'function') {
+        return await stub.oauthGetRefreshTokenLineageHint(h, now);
+      }
+      return null;
+    },
     rotateRefreshToken: (p) => hub().oauthRotateRefreshToken(p),
     listGrants: (now, userId) => hub().oauthListGrants(now, userId),
     revokeGrant: (id, userId) => hub().oauthRevokeGrant(id, userId),
@@ -1689,7 +1702,11 @@ export default {
               : true;
             const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
             const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanArgs } = args as Record<string, unknown>;
-            if ((cleanArgs.preferMcp === true || cleanArgs.useConnectedMcp === true) && !hasMcpCallScope) {
+            const hasAllowedMcpToolsArg = cleanArgs.allowedMcpTools !== undefined;
+            if (
+              (cleanArgs.preferMcp === true || cleanArgs.useConnectedMcp === true || hasAllowedMcpToolsArg) &&
+              !hasMcpCallScope
+            ) {
               return {
                 status: 403,
                 body: {
@@ -1733,6 +1750,10 @@ export default {
                   targetUrl: cleanArgs.url.trim(),
                   ...(typeof cleanArgs.query === 'string' ? { query: cleanArgs.query } : {}),
                   preferMcp: cleanArgs.preferMcp === true,
+                  requireExplicitReadOnlyHint: true,
+                  ...(hasAllowedMcpToolsArg
+                    ? { allowedMcpTools: cleanArgs.allowedMcpTools as ReadonlyArray<string> }
+                    : {}),
                   vaultStore,
                   vaultMasterKey: env.VAULT_MASTER_KEY,
                   fetchFn: safePublicFetch,
@@ -1940,31 +1961,55 @@ export default {
             return { status: out.status, body: { via: out.via, ...out.body } };
           },
           executeJobs: async ({ args, principal, userId }) => {
-            return await executeJobsCall({
-              payload: args as JobsToolPayload,
-              env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-              executeSearch: async (sArgs) => {
-                const sOut = await executeSearchCall({
-                  payload: sArgs as SearchRequestPayload,
-                  env,
-                  executeHubFetch,
-                  source: `mcp-jobs-search:${principal ?? 'client'}`,
-                  userId,
-                });
-                return { status: sOut.status, body: sOut.body };
-              },
-              executeScrape: async (scArgs) => {
-                const scOut = await executeScrapeCall({
-                  payload: scArgs as ScrapeRequestPayload,
-                  env,
-                  executeHubFetch,
-                  selfHost: url.hostname,
-                  source: `mcp-jobs-scrape:${principal ?? 'client'}`,
-                  userId,
-                });
-                return { status: scOut.status, body: scOut.body };
-              },
-            });
+            const activeAuth = getActiveCallerAuthContext();
+            const effectiveUserId = userId ?? activeAuth?.userId ?? resolveCallerUserId({ principal });
+            const effectiveTier = activeAuth?.role ?? (effectiveUserId === 'owner' ? 'owner' : 'member');
+            const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
+              inFlightScrapesByUser,
+              effectiveUserId,
+              MAX_CONCURRENT_SCRAPES_PER_USER,
+            );
+            if (!releaseScrapeSlot) {
+              return {
+                status: 429,
+                body: {
+                  ok: false,
+                  error: 'user_quota_exceeded',
+                  message: `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+                },
+              };
+            }
+            try {
+              return await executeJobsCall({
+                payload: args as JobsToolPayload,
+                env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+                userId: effectiveUserId,
+                authTier: effectiveTier,
+                executeSearch: async (sArgs) => {
+                  const sOut = await executeSearchCall({
+                    payload: sArgs as SearchRequestPayload,
+                    env,
+                    executeHubFetch,
+                    source: `mcp-jobs-search:${principal ?? 'client'}`,
+                    userId: effectiveUserId,
+                  });
+                  return { status: sOut.status, body: sOut.body };
+                },
+                executeScrape: async (scArgs) => {
+                  const scOut = await executeScrapeCall({
+                    payload: scArgs as ScrapeRequestPayload,
+                    env,
+                    executeHubFetch,
+                    selfHost: url.hostname,
+                    source: `mcp-jobs-scrape:${principal ?? 'client'}`,
+                    userId: effectiveUserId,
+                  });
+                  return { status: scOut.status, body: scOut.body };
+                },
+              });
+            } finally {
+              releaseScrapeSlot();
+            }
           },
           findExtractors: ({ query, category, limit }) => {
             return findRelevantAdapters({ query, category, limit }) as unknown as Array<Record<string, unknown>>;
@@ -2545,7 +2590,11 @@ export default {
           const hasMcpCallScope = !auth.principal.startsWith('oauth:') || auth.scopes.includes('mcp:call');
           const { interact: _smuggledInteract, sessionId: _smuggledSessionId, ...cleanScrapeObj } =
             payload as unknown as Record<string, unknown>;
-          if ((cleanScrapeObj.preferMcp === true || cleanScrapeObj.useConnectedMcp === true) && !hasMcpCallScope) {
+          const hasScrapeAllowedMcpTools = cleanScrapeObj.allowedMcpTools !== undefined;
+          if (
+            (cleanScrapeObj.preferMcp === true || cleanScrapeObj.useConnectedMcp === true || hasScrapeAllowedMcpTools) &&
+            !hasMcpCallScope
+          ) {
             return Response.json(
               {
                 ok: false,
@@ -2587,6 +2636,10 @@ export default {
                 targetUrl: cleanPayload.url.trim(),
                 ...(typeof cleanPayload.query === 'string' ? { query: cleanPayload.query } : {}),
                 preferMcp: cleanScrapeObj.preferMcp === true,
+                requireExplicitReadOnlyHint: true,
+                ...(hasScrapeAllowedMcpTools
+                  ? { allowedMcpTools: cleanScrapeObj.allowedMcpTools as ReadonlyArray<string> }
+                  : {}),
                 vaultStore,
                 vaultMasterKey: env.VAULT_MASTER_KEY,
                 fetchFn: safePublicFetch,
@@ -3563,35 +3616,53 @@ export default {
           } catch {
             return Response.json({ error: 'bad_json' }, { status: 400 });
           }
-          const out = await executeJobsCall({
-            payload,
-            env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
-            executeSearch: async (sArgs) => {
-              const sOut = await executeSearchCall({
-                payload: sArgs as SearchRequestPayload,
-                env,
-                executeHubFetch,
-                source: `jobs-search:${auth.principal}`,
-                userId: auth.userId,
-              });
-              return { status: sOut.status, body: sOut.body };
-            },
-            executeScrape: async (scArgs) => {
-              const scOut = await executeScrapeCall({
-                payload: scArgs as ScrapeRequestPayload,
-                env,
-                executeHubFetch,
-                selfHost: url.hostname,
-                source: `jobs-scrape:${auth.principal}`,
-                userId: auth.userId,
-              });
-              return { status: scOut.status, body: scOut.body };
-            },
-          });
-          return Response.json(out.body, {
-            status: out.status,
-            headers: { 'cache-control': 'no-store' },
-          });
+          const callerUserId = resolveCallerUserId(auth as { userId?: string; principal?: string });
+          const callerAuthTier = auth.role ?? (callerUserId === 'owner' ? 'owner' : 'member');
+          const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
+            inFlightScrapesByUser,
+            callerUserId,
+            MAX_CONCURRENT_SCRAPES_PER_USER,
+          );
+          if (!releaseScrapeSlot) {
+            return userQuotaExceededResponse(
+              `Per-user concurrent scrape limit (${MAX_CONCURRENT_SCRAPES_PER_USER}) exceeded.`,
+            );
+          }
+          try {
+            const out = await executeJobsCall({
+              payload,
+              env: env as unknown as OptionalStorageBindings & Record<string, unknown>,
+              userId: callerUserId,
+              authTier: callerAuthTier,
+              executeSearch: async (sArgs) => {
+                const sOut = await executeSearchCall({
+                  payload: sArgs as SearchRequestPayload,
+                  env,
+                  executeHubFetch,
+                  source: `jobs-search:${auth.principal}`,
+                  userId: callerUserId,
+                });
+                return { status: sOut.status, body: sOut.body };
+              },
+              executeScrape: async (scArgs) => {
+                const scOut = await executeScrapeCall({
+                  payload: scArgs as ScrapeRequestPayload,
+                  env,
+                  executeHubFetch,
+                  selfHost: url.hostname,
+                  source: `jobs-scrape:${auth.principal}`,
+                  userId: callerUserId,
+                });
+                return { status: scOut.status, body: scOut.body };
+              },
+            });
+            return Response.json(out.body, {
+              status: out.status,
+              headers: { 'cache-control': 'no-store' },
+            });
+          } finally {
+            releaseScrapeSlot();
+          }
         });
       }
 

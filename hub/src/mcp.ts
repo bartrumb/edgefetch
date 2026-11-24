@@ -16,7 +16,7 @@ import { filterSafeResponseHeaders } from './framework-detect';
 import { analyzeUrlRedirect, buildBlockedInfo } from './jobs';
 import { authorizeMcpRequest, isTrustedMcpBrowserOrigin, type OAuthStore } from './oauth';
 import { formatFenceSafeUntrustedMcpEnvelope, sanitizeConnectorStructuredValue } from './mcp-federation';
-import { resolveCallerUserId } from './mcp-vault';
+import { parseAllowedMcpTools, resolveCallerUserId } from './mcp-vault';
 import { getActiveRequestTracer, type RequestTracer } from './otel';
 import {
   DNS_NOT_FOUND_MESSAGE,
@@ -1320,7 +1320,7 @@ export function buildCanonicalMcpToolSchemas(options?: {
           },
           server: {
             type: 'string',
-            description: 'Connected MCP server slug or domain (required for "list_tools" and "call_tool").',
+            description: 'Connected MCP server id or slug (required for "list_tools" and "call_tool").',
           },
           tool: {
             type: 'string',
@@ -1329,6 +1329,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
           arguments: {
             type: 'object',
             description: 'JSON object arguments passed to the downstream MCP tool when action="call_tool".',
+          },
+          allowedMcpTools: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Optional per-request allow-list of non-read-only cached downstream tools in exact "<slug>/<tool>" format.',
           },
           refresh: {
             type: 'boolean',
@@ -2225,9 +2231,27 @@ async function handleToolCallInner(
     if (!deps.executeQueryMcp) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: 'mcp_federation_not_configured' }) }], isError: true };
     }
+    const parsedAllowed = parseAllowedMcpTools(args.allowedMcpTools);
+    if (!parsedAllowed.ok) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                ok: false,
+                error: parsedAllowed.error,
+                message: parsedAllowed.message,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: true,
+      };
+    }
     const res = await deps.executeQueryMcp({ args, principal, userId });
-    const upstreamUnsanitized = res.body.sanitized === false;
-    const upstreamFullySanitized = res.body.fullySanitized !== false;
     const prevPi =
       res.body.promptInjection && typeof res.body.promptInjection === 'object'
         ? (res.body.promptInjection as { detected?: boolean; scrubbed?: boolean; triggers?: unknown })
@@ -2235,24 +2259,43 @@ async function handleToolCallInner(
     const prevTriggers = Array.isArray(prevPi?.triggers)
       ? prevPi!.triggers.filter((t): t is string => typeof t === 'string')
       : [];
-    const san = sanitizeConnectorStructuredValue(res.body);
-    const sanObj =
-      san.value && typeof san.value === 'object' && !Array.isArray(san.value)
-        ? (san.value as Record<string, unknown>)
-        : { data: san.value };
-    const isSanitized = Boolean(!upstreamUnsanitized && san.sanitized);
-    const isFullySanitized = Boolean(isSanitized && upstreamFullySanitized && san.fullySanitized);
-    const mergedTriggers = [...new Set([...prevTriggers, ...san.triggers])];
-    const payloadOut: Record<string, unknown> = {
-      ...sanObj,
-      sanitized: isSanitized,
-      fullySanitized: isFullySanitized,
-      promptInjection: {
-        detected: Boolean(prevPi?.detected || san.detected),
-        scrubbed: Boolean(prevPi?.scrubbed || san.scrubbed),
-        triggers: mergedTriggers,
-      },
-    };
+
+    // M10-3: `executeFederatedMcpQuery` already sanitizes all connector output fields once and sets `res.body.sanitized`.
+    // Only run `sanitizeConnectorStructuredValue` when a custom/mock `executeQueryMcp` returned an unsanitized body.
+    let payloadOut: Record<string, unknown>;
+    if (typeof res.body.sanitized === 'boolean') {
+      const isSanitized = res.body.sanitized === true;
+      const isFullySanitized = Boolean(isSanitized && res.body.fullySanitized !== false);
+      payloadOut = {
+        ...res.body,
+        sanitized: isSanitized,
+        fullySanitized: isFullySanitized,
+        promptInjection: {
+          detected: Boolean(prevPi?.detected),
+          scrubbed: Boolean(prevPi?.scrubbed),
+          triggers: prevTriggers,
+        },
+      };
+    } else {
+      const san = sanitizeConnectorStructuredValue(res.body);
+      const sanObj =
+        san.value && typeof san.value === 'object' && !Array.isArray(san.value)
+          ? (san.value as Record<string, unknown>)
+          : { data: san.value };
+      const isSanitized = san.sanitized;
+      const isFullySanitized = Boolean(isSanitized && san.fullySanitized);
+      const mergedTriggers = [...new Set([...prevTriggers, ...san.triggers])];
+      payloadOut = {
+        ...sanObj,
+        sanitized: isSanitized,
+        fullySanitized: isFullySanitized,
+        promptInjection: {
+          detected: Boolean(prevPi?.detected || san.detected),
+          scrubbed: Boolean(prevPi?.scrubbed || san.scrubbed),
+          triggers: mergedTriggers,
+        },
+      };
+    }
     const safeActionAttr = /^[a-z_]{1,24}$/i.test(action) ? action : undefined;
     const safeServerAttr =
       typeof payloadOut.server === 'string' && /^[a-z0-9_-]{1,48}$/i.test(payloadOut.server)

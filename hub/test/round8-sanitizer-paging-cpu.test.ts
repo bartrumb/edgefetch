@@ -625,7 +625,7 @@ test('Round 8 (1): SCRAPE_PIPELINE_VERSION === 34 single source & readArtifactPa
   }
 });
 
-test('Round 8 (H1 & H8): 255+ generated adversarial shapes — 0 live XSS in 6 dialects + 100% Go/TS parity', () => {
+test('Round 8 (H1 & H8): generated adversarial shapes — 0 live XSS in 6 dialects + Go/TS string equality', () => {
   const corpus = buildGeneratedAdversarialMarkdownCorpus();
   assert.ok(corpus.length >= 255, `expected >=255 corpus vectors, got ${corpus.length}`);
 
@@ -645,7 +645,7 @@ test('Round 8 (H1 & H8): 255+ generated adversarial shapes — 0 live XSS in 6 d
     tsOutputs.set(item.id, out1);
   }
 
-  // Verify 100% exact string parity with Go `SanitizeMarkdown(md, baseURL)` via WSL or native `go`
+  // Verify exact string equality with Go `SanitizeMarkdown(md, baseURL)` via WSL or native `go`
   const tmpDir = mkdtempSync(join(tmpdir(), 'ef-r8-parity-'));
   try {
     const inJsonlPath = join(tmpDir, 'in.jsonl');
@@ -760,8 +760,10 @@ test('Round 8 (H2): Exhaustive paged slice sanitization across EVERY offset 0..N
     }
   }
 
-  // 2. Test `readArtifactPage` at every offset 0..multiFenceDoc.length (`limit = 29`) + verify sequential cursor termination!
-  for (let offset = 0; offset <= multiFenceDoc.length; offset++) {
+  // 2. Test `readArtifactPage` at every offset 0..expectedSanitizedTotal (`limit = 29`) + verify sequential cursor termination!
+  //    Under R11-S1, the list-indented fence in `multiFenceDoc` has its `<` and `vbscript:` sanitized prior to paging.
+  const expectedSanitizedTotal = sanitizeMarkdownPageSlice(multiFenceDoc, 0, multiFenceDoc, false).length;
+  for (let offset = 0; offset <= expectedSanitizedTotal; offset++) {
     const pageRes = await readArtifactPage({
       bucket: bucket as unknown as R2Bucket,
       metaDb: metaDb as unknown as D1Database,
@@ -772,7 +774,7 @@ test('Round 8 (H2): Exhaustive paged slice sanitization across EVERY offset 0..N
     });
     assert.equal(pageRes.ok, true);
     if (pageRes.ok) {
-      assert.equal(pageRes.page.totalChars, multiFenceDoc.length);
+      assert.equal(pageRes.page.totalChars, expectedSanitizedTotal);
       assert.equal(pageRes.page.offset, offset);
       auditZeroLiveXssAcrossSixMarkdownDialects(pageRes.page.content, `readArtifactPage:off=${offset}`);
     }
@@ -1343,7 +1345,7 @@ function buildLegitimateMarkdownCorpus(): LegitimateMarkdownDocSpec[] {
   ];
 }
 
-test('Round 8 (Item 5): 12-Document Legitimate Markdown & HTML-in-Markdown Alteration Suite + 100% Go/TS Parity', (t) => {
+test('Round 8 (Item 5): 12-Document Legitimate Markdown & HTML-in-Markdown Alteration Suite + Go/TS String Equality', (t) => {
   const docs = buildLegitimateMarkdownCorpus();
   assert.equal(docs.length, 12);
 
@@ -1391,7 +1393,7 @@ test('Round 8 (Item 5): 12-Document Legitimate Markdown & HTML-in-Markdown Alter
     );
   }
 
-  // Verify 100% exact string parity with Go `SanitizeMarkdown(md, baseURL)` across all 12 legitimate documents!
+  // Verify exact string equality with Go `SanitizeMarkdown(md, baseURL)` across all 12 legitimate documents!
   const tmpDir = mkdtempSync(join(tmpdir(), 'ef-r8-legit-parity-'));
   try {
     const inJsonlPath = join(tmpDir, 'legit_in.jsonl');

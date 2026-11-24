@@ -7273,7 +7273,7 @@ test('M1-C Scrape & Safe-Input: formatters, HTML pipeline, companion/llms cache,
 
     // 2. Low-level text/markdown/HTML utilities in scrape.ts
     assert.equal(decodeHtmlEntities('Tom &amp; Jerry &#x26; &#38;'), 'Tom & Jerry & &');
-    assert.ok(splitMarkdownByCodeFences('prose\n```ts\nconst a = 1;\n```\nmore').length >= 3);
+    assert.ok(splitMarkdownByCodeFences('prose\n\n```ts\nconst a = 1;\n```\nmore').length >= 3);
     assert.ok(makeSafeCodeFence('const x = ```1```;', 'ts').startsWith('````ts'));
     assert.equal(decodeMarkdownEntities('A &mdash; B &hellip;'), 'A — B …');
     assert.ok(cleanPdfMarkdown('Page 1\n\n--\n\nHello-\nworld\n\n1 / 10\n').includes('Hello'));
@@ -9857,7 +9857,7 @@ test('M1-C-R2 Batch 2: mcp.ts, oauth.ts, index.ts & Group A edge closure', async
 
 test('M1-C-R2 Batch 3: src/scrape.ts pure HTML, JSON-LD, Substack, HN, standardization, formatters & sanitization', () => {
   // 1. splitMarkdownByCodeFences + makeSafeCodeFence + cleanPdfMarkdown + extractPdfTitle + redactPiiText + srcset
-  const fenceParts = splitMarkdownByCodeFences('intro\n~~~ts\nconst x = 1;\n~~~\noutro\n```js\nunclosed');
+  const fenceParts = splitMarkdownByCodeFences('intro\n\n~~~ts\nconst x = 1;\n~~~\noutro\n\n```js\nunclosed');
   assert.ok(fenceParts.length >= 4);
   assert.ok(makeSafeCodeFence('~~~nested~~~', 'md', true).startsWith('~~~~md'));
   assert.ok(cleanPdfMarkdown('https://example.com/very-\nlong-url\n\nWord-\nwrap\n').includes('Wordwrap'));
@@ -10063,7 +10063,7 @@ test('M1-C-R2 Batch 3: src/scrape.ts pure HTML, JSON-LD, Substack, HN, standardi
   assert.equal(extractedJson.verified, true);
 
   // 6. sanitizeInlineHtmlInMarkdown + finalizeScrapedMarkdown
-  const dirtyMd = `> ## Documentation Index\n> Fetch the complete documentation index at: https://docs.example.com/llms.txt\n> Use this file to discover all available pages before exploring further.\n\n{/* hidden jsx */}\n<!-- page 2 -->\n<!-- strip me -->\n:::tip Pro Tip\nRead \`<script>\` safely.\n:::\n[<h2 id="a">Linked H2</h2>](https://docs.example.com/x)\n<a href="https://docs.example.com/y"><h3>Wrapped H3</h3></a>\n<b>Bold</b> <i>Ital</i> <kbd>Ctrl</kbd> <sup>1</sup> <hr> <img data-src="https://docs.example.com/p.png" alt="pic">\n<Card title="Custom Card">\nBody inside card\n</Card>\n\`\`\`ts twoslash\n// @noErrors\n// ---cut---\nconst ok = 1;\n// ---cut-after---\nconst hidden = 2;\n\`\`\`\n\`\`\`json\n{"@context":"https://schema.org","@type":"WebPage","name":"${'x'.repeat(120)}"}\n\`\`\`\nWas this page helpful?\nYes / No\n## On this page\n- [Top](#top)\n\nThis documentation is built and hosted on [Mintlify](https://mintlify.com), a developer documentation platform.`;
+  const dirtyMd = `> ## Documentation Index\n> Fetch the complete documentation index at: https://docs.example.com/llms.txt\n> Use this file to discover all available pages before exploring further.\n\n{/* hidden jsx */}\n<!-- page 2 -->\n<!-- strip me -->\n:::tip Pro Tip\nRead \`<script>\` safely.\n:::\n[<h2 id="a">Linked H2</h2>](https://docs.example.com/x)\n<a href="https://docs.example.com/y"><h3>Wrapped H3</h3></a>\n<b>Bold</b> <i>Ital</i> <kbd>Ctrl</kbd> <sup>1</sup> <hr> <img data-src="https://docs.example.com/p.png" alt="pic">\n<Card title="Custom Card">\nBody inside card\n</Card>\n\n\`\`\`ts twoslash\n// @noErrors\n// ---cut---\nconst ok = 1;\n// ---cut-after---\nconst hidden = 2;\n\`\`\`\n\n\`\`\`json\n{"@context":"https://schema.org","@type":"WebPage","name":"${'x'.repeat(120)}"}\n\`\`\`\nWas this page helpful?\nYes / No\n## On this page\n- [Top](#top)\n\nThis documentation is built and hosted on [Mintlify](https://mintlify.com), a developer documentation platform.`;
   const cleanMd = sanitizeInlineHtmlInMarkdown(dirtyMd, 'https://docs.example.com/', true);
   assert.ok(cleanMd.includes('<!-- page 2 -->'));
   assert.ok(!cleanMd.includes('Documentation Index'));

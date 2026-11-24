@@ -31,6 +31,7 @@ import {
 import {
   extractUniversalSchemaOrg,
   inspectRawSchemaOrgJsonLdLinear,
+  percentEncodeUnsafeRecordUrlChars,
   type UniversalSchemaOrgResult,
 } from './extractors/schema-org';
 import {
@@ -133,6 +134,7 @@ import {
   type LlmEnvBindings,
 } from './llm';
 import {
+  cleanFenceInfoStringLinear,
   detectPromptInjection,
   encodeBodyToRawBase64,
   escapeAllResidualLtInProseLinear,
@@ -144,14 +146,16 @@ import {
   neutralizeAllUnsafeMarkdownLinksLinear,
   normalizeInlineBrowserActions,
   parsePdfParserOptions,
+  recognizeAndHardenMarkdownFences,
   sanitizeMarkdownPageSlice,
   sanitizePlainMetadataText,
   splitPdfPagesAndMarkers,
+  stripInvisibleSmugglingChars,
   trimAsciiWhitespaceLinear,
   trimTrailingAsciiWhitespaceLinear,
 } from './scrape-advanced';
 
-export { sanitizeMarkdownPageSlice } from './scrape-advanced';
+export { recognizeAndHardenMarkdownFences, sanitizeMarkdownPageSlice, stripInvisibleSmugglingChars } from './scrape-advanced';
 export { SCRAPE_PIPELINE_VERSION } from './storage';
 
 export interface ScrapedImage {
@@ -264,8 +268,25 @@ const NAMED_HTML_ENTITIES: Record<string, string> = {
   prime: '\u2032',
   Prime: '\u2033',
   shy: '',
-  zwj: '\u200d',
-  zwnj: '\u200c',
+  zwj: '',
+  zwnj: '',
+  lrm: '',
+  rlm: '',
+  alm: '',
+  wj: '',
+  wordjoiner: '',
+  nobreak: '',
+  af: '',
+  applyfunction: '',
+  it: '',
+  invisibletimes: '',
+  ic: '',
+  invisiblecomma: '',
+  zerowidthspace: '',
+  negativethinspace: '',
+  negativeverythinspace: '',
+  negativemediumspace: '',
+  negativethickspace: '',
   colon: ':',
   tab: '\t',
   newline: '\n',
@@ -319,87 +340,6 @@ function measureLeadingIndentCols(raw: string): { cols: number; bytePos: number;
   return { cols, bytePos: i, isBlank: i >= rawEnd };
 }
 
-function isThematicBreakLineLinear(raw: string, leadCols: number, leadPos: number): boolean {
-  if (leadCols > 3 || leadPos >= raw.length) return false;
-  const ch = raw.charCodeAt(leadPos);
-  if (ch !== 45 /* '-' */ && ch !== 42 /* '*' */ && ch !== 95 /* '_' */) return false;
-  let count = 0;
-  for (let i = leadPos; i < raw.length; i++) {
-    const c = raw.charCodeAt(i);
-    if (c === ch) {
-      count++;
-    } else if (c !== 32 && c !== 9) {
-      return false;
-    }
-  }
-  return count >= 3;
-}
-
-function detectListItemContentCol(raw: string, leadCols: number, leadPos: number, prevLineWasParagraph = false): number {
-  if (leadCols > 3 || leadPos >= raw.length) return 0;
-  if (isThematicBreakLineLinear(raw, leadCols, leadPos)) return 0;
-  const c = raw.charCodeAt(leadPos);
-  let markerEnd = -1;
-  let markerWidth = 0;
-  let isOrdered = false;
-  let isOrderedOne = false;
-  if (c === 45 /* '-' */ || c === 42 /* '*' */ || c === 43 /* '+' */) {
-    markerEnd = leadPos + 1;
-    markerWidth = 1;
-  } else if (c >= 48 && c <= 57) {
-    isOrdered = true;
-    let d = leadPos + 1;
-    while (d < raw.length && d - leadPos < 9 && raw.charCodeAt(d) >= 48 && raw.charCodeAt(d) <= 57) d++;
-    if (d < raw.length && (raw.charCodeAt(d) === 46 /* '.' */ || raw.charCodeAt(d) === 41 /* ')' */)) {
-      markerEnd = d + 1;
-      markerWidth = markerEnd - leadPos;
-      isOrderedOne = d === leadPos + 1 && c === 49 /* '1' */;
-    }
-  }
-  if (markerEnd < 0 || markerEnd >= raw.length) return 0;
-  const after = raw.charCodeAt(markerEnd);
-  if (after !== 32 && after !== 9) return 0;
-
-  // Compute column where content starts after list marker + 1..4 spaces
-  let col = leadCols + markerWidth;
-  let p = markerEnd;
-  while (p < raw.length) {
-    const sc = raw.charCodeAt(p);
-    if (sc === 32) {
-      col++;
-      p++;
-    } else if (sc === 9) {
-      col += 4 - (col % 4);
-      p++;
-    } else {
-      break;
-    }
-  }
-  // CommonMark §5.2: an empty list item CANNOT interrupt a paragraph, and an ordered list item can ONLY interrupt a paragraph when its start number is strictly `1`.
-  if (prevLineWasParagraph) {
-    if (p >= raw.length) return 0;
-    if (isOrdered && !isOrderedOne) return 0;
-  }
-  if (p >= raw.length || col - (leadCols + markerWidth) > 4) {
-    return leadCols + markerWidth + 1;
-  }
-  return col;
-}
-
-function isParagraphContinuationLineLinear(raw: string, cols: number, bytePos: number, isBlank: boolean, activeListIndent: number): boolean {
-  if (isBlank) return false;
-  if (activeListIndent === 0 && cols >= 4) return false;
-  if (isThematicBreakLineLinear(raw, cols, bytePos)) return false;
-  const c = raw.charCodeAt(bytePos);
-  if (c === 62 /* '>' */ && cols <= 3) return false;
-  if (c === 35 /* '#' */ && cols <= 3) {
-    let h = bytePos;
-    while (h < raw.length && h - bytePos < 7 && raw.charCodeAt(h) === 35) h++;
-    if (h - bytePos <= 6 && (h === raw.length || raw.charCodeAt(h) === 32 || raw.charCodeAt(h) === 9)) return false;
-  }
-  return true;
-}
-
 const _scanPrefixOut = { prefixLen: 0, risky: false };
 
 function scanContainerPrefixLinear(raw: string): { prefixLen: number; risky: boolean } {
@@ -426,10 +366,11 @@ function scanContainerPrefixLinear(raw: string): { prefixLen: number; risky: boo
       col++;
       continue;
     }
-    if ((c === 45 || c === 42 || c === 43) && i + 1 < raw.length && (raw.charCodeAt(i + 1) === 32 || raw.charCodeAt(i + 1) === 9)) {
+    if ((c === 45 || c === 42 || c === 43) && (i + 1 >= raw.length || raw.charCodeAt(i + 1) === 32 || raw.charCodeAt(i + 1) === 9)) {
       risky = true;
       i++;
       col++;
+      if (i >= raw.length) break;
       continue;
     }
     if (c >= 48 && c <= 57) {
@@ -437,10 +378,11 @@ function scanContainerPrefixLinear(raw: string): { prefixLen: number; risky: boo
       while (j < raw.length && j - i < 9 && raw.charCodeAt(j) >= 48 && raw.charCodeAt(j) <= 57) j++;
       if (j < raw.length) {
         const d = raw.charCodeAt(j);
-        if ((d === 46 || d === 41) && j + 1 < raw.length && (raw.charCodeAt(j + 1) === 32 || raw.charCodeAt(j + 1) === 9)) {
+        if ((d === 46 || d === 41) && (j + 1 >= raw.length || raw.charCodeAt(j + 1) === 32 || raw.charCodeAt(j + 1) === 9)) {
           risky = true;
           col += j + 1 - i;
           i = j + 1;
+          if (i >= raw.length) break;
           continue;
         }
       }
@@ -452,968 +394,13 @@ function scanContainerPrefixLinear(raw: string): { prefixLen: number; risky: boo
   return _scanPrefixOut;
 }
 
-function cleanFenceInfoStringLinear(rawInfo: string): string {
-  if (!rawInfo) return '';
-  // Bound info string to 200 chars in O(1) so 64K-tab/bracket fence headers (`fh.6.mjs`) run in <0.1ms!
-  const capped = rawInfo.length > 200 ? rawInfo.slice(0, 200) : rawInfo;
-  // Strip `theme={...}` and `[[...]]` linearly before removing stray brackets/angles
-  let s = capped;
-  while (s.includes('theme={')) {
-    const idx = s.indexOf('theme={');
-    let wsStart = idx;
-    while (wsStart > 0 && (s.charCodeAt(wsStart - 1) === 32 || s.charCodeAt(wsStart - 1) === 9)) wsStart--;
-    const closeBrace = s.indexOf('}', idx + 7);
-    s = closeBrace >= 0 ? s.slice(0, wsStart) + s.slice(closeBrace + 1) : s.slice(0, wsStart);
-  }
-  while (s.includes('[[')) {
-    const idx = s.indexOf('[[');
-    let wsStart = idx;
-    while (wsStart > 0 && (s.charCodeAt(wsStart - 1) === 32 || s.charCodeAt(wsStart - 1) === 9)) wsStart--;
-    const closeBrackets = s.indexOf(']]', idx + 2);
-    s = closeBrackets >= 0 ? s.slice(0, wsStart) + s.slice(closeBrackets + 2) : s.slice(0, wsStart);
-  }
-  let out = '';
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    // Strip `[`, `]`, `<`, `>` so `marked` never parses inline links or tags in fence info strings
-    if (c === 91 || c === 93 || c === 60 || c === 62) continue;
-    if (c === 9) {
-      out += ' ';
-      continue;
-    }
-    if (c < 32) continue;
-    out += s[i]!;
-  }
-  out = out.replace(/(?:^|[ \t]+)twoslash(?=[ \t]+|$)/gi, '').trimEnd();
-  // Pure char-code check (zero `.` regex!): if truncation cut mid-token after >= 8 spaces (`'```js' + '\t'.repeat(65536) + 'x'`), keep first word cleanly
-  if (out.length >= 100) {
-    let p = 0;
-    while (p < out.length && (out.charCodeAt(p) === 32 || out.charCodeAt(p) === 9)) p++;
-    const wordStart = p;
-    while (p < out.length && p - wordStart <= 64) {
-      const ch = out.charCodeAt(p);
-      if (ch === 32 || ch === 9 || ch === 96 || ch === 126) break;
-      p++;
-    }
-    const wordEnd = p;
-    if (wordEnd > wordStart && wordEnd - wordStart <= 64) {
-      let wsRun = 0;
-      while (p < out.length && (out.charCodeAt(p) === 32 || out.charCodeAt(p) === 9)) {
-        wsRun++;
-        p++;
-      }
-      if (wsRun >= 8) {
-        return out.slice(0, wordEnd).trimEnd();
-      }
-    }
-  }
-  return out;
-}
-
-/**
- * Upfront pure char-code line-ending & Unicode line-separator normalizer (`R9-H1`):
- * Replaces `\u2028`, `\u2029`, `\u0085` -> `' '` and `\r\n` / `\r` -> `\n` in a single linear pass
- * BEFORE any block or fence recognition so zero parser can ever disagree on line boundaries.
- */
-function normalizeMarkdownLineEndingsUpfrontLinear(raw: string): string {
-  if (!/[\r\u0085\u2028\u2029]/.test(raw)) return raw;
-  const n = raw.length;
-  let firstSpecial = -1;
-  for (let i = 0; i < n; i++) {
-    const c = raw.charCodeAt(i);
-    if (c === 13 /* '\r' */ || c === 0x0085 || c === 0x2028 || c === 0x2029) {
-      firstSpecial = i;
-      break;
-    }
-  }
-  if (firstSpecial < 0) return raw;
-  const parts: string[] = [];
-  let last = 0;
-  for (let i = firstSpecial; i < n; i++) {
-    const c = raw.charCodeAt(i);
-    if (c === 13 /* '\r' */) {
-      if (i > last) parts.push(raw.slice(last, i));
-      parts.push('\n');
-      if (i + 1 < n && raw.charCodeAt(i + 1) === 10 /* '\n' */) {
-        i++;
-      }
-      last = i + 1;
-    } else if (c === 0x0085 || c === 0x2028 || c === 0x2029) {
-      if (i > last) parts.push(raw.slice(last, i));
-      parts.push(' ');
-      last = i + 1;
-    }
-  }
-  if (last < n) parts.push(raw.slice(last));
-  return parts.join('');
-}
-
-function hasPotentialSetextUnderlineLinear(md: string): boolean {
-  let pos = 0;
-  const n = md.length;
-  while (pos < n) {
-    const nl = md.indexOf('\n', pos);
-    const end = nl < 0 ? n : nl;
-    let p = pos;
-    let spaces = 0;
-    while (p < end && md.charCodeAt(p) === 32 && spaces < 4) {
-      spaces++;
-      p++;
-    }
-    if (spaces <= 3 && p < end) {
-      const ch = md.charCodeAt(p);
-      if (ch === 61 /* '=' */ || ch === 45 /* '-' */) {
-        while (p < end && md.charCodeAt(p) === ch) p++;
-        while (p < end && (md.charCodeAt(p) === 32 || md.charCodeAt(p) === 9)) p++;
-        if (p === end) return true;
-      }
-    }
-    if (nl < 0) break;
-    pos = nl + 1;
-  }
-  return false;
-}
-
-type MdContainerEntry = { kind: 'bq' } | { kind: 'list'; indent: number };
-
-function scanSpacesAndTabsCols(raw: string, startPos: number, startCol: number): { pos: number; col: number; sawTab: boolean } {
-  let pos = startPos;
-  let col = startCol;
-  let sawTab = false;
-  while (pos < raw.length) {
-    const ch = raw.charCodeAt(pos);
-    if (ch === 32 /* ' ' */) {
-      col++;
-      pos++;
-    } else if (ch === 9 /* '\t' */) {
-      col += 4 - (col % 4);
-      pos++;
-      sawTab = true;
-    } else {
-      break;
-    }
-  }
-  return { pos, col, sawTab };
-}
-
-function isThematicBreakAtPos(raw: string, baseCol: number, col: number, pos: number): boolean {
-  if (col - baseCol > 3 || pos >= raw.length) return false;
-  const ch = raw.charCodeAt(pos);
-  if (ch !== 45 /* '-' */ && ch !== 42 /* '*' */ && ch !== 95 /* '_' */) return false;
-  let count = 0;
-  for (let i = pos; i < raw.length; i++) {
-    const c = raw.charCodeAt(i);
-    if (c === ch) count++;
-    else if (c !== 32 && c !== 9) return false;
-  }
-  return count >= 3;
-}
-
-function isAtxHeadingAtPos(raw: string, baseCol: number, col: number, pos: number): boolean {
-  if (col - baseCol > 3 || pos >= raw.length || raw.charCodeAt(pos) !== 35 /* '#' */) return false;
-  let h = pos;
-  while (h < raw.length && h - pos < 7 && raw.charCodeAt(h) === 35) h++;
-  return h - pos <= 6 && (h === raw.length || raw.charCodeAt(h) === 32 || raw.charCodeAt(h) === 9);
-}
-
-function parseFenceOpenerAtPos(
-  raw: string,
-  baseCol: number,
-  col: number,
-  pos: number,
-): { ch: '`' | '~'; len: number; infoStart: number } | null {
-  if (col - baseCol > 3 || pos + 3 > raw.length) return null;
-  const c0 = raw.charCodeAt(pos);
-  if (c0 !== 96 /* '`' */ && c0 !== 126 /* '~' */) return null;
-  let fEnd = pos + 1;
-  while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
-  const fLen = fEnd - pos;
-  if (fLen < 3) return null;
-  if (c0 === 96 && raw.indexOf('`', fEnd) >= 0) return null;
-  return { ch: c0 === 96 ? '`' : '~', len: fLen, infoStart: fEnd };
-}
-
-function parseListMarkerAtPos(
-  raw: string,
-  baseCol: number,
-  col: number,
-  pos: number,
-  interruptsParagraph: boolean,
-): { contentIndent: number; nextPos: number; nextCol: number; sawTab: boolean } | null {
-  if (col - baseCol > 3 || pos >= raw.length) return null;
-  if (isThematicBreakAtPos(raw, baseCol, col, pos)) return null;
-  const c = raw.charCodeAt(pos);
-  let markerEnd = -1;
-  let markerWidth = 0;
-  let isOrdered = false;
-  let isOrderedOne = false;
-
-  if (c === 45 /* '-' */ || c === 42 /* '*' */ || c === 43 /* '+' */) {
-    markerEnd = pos + 1;
-    markerWidth = 1;
-  } else if (c >= 48 && c <= 57) {
-    isOrdered = true;
-    let d = pos + 1;
-    while (d < raw.length && d - pos < 9 && raw.charCodeAt(d) >= 48 && raw.charCodeAt(d) <= 57) d++;
-    if (d < raw.length && (raw.charCodeAt(d) === 46 /* '.' */ || raw.charCodeAt(d) === 41 /* ')' */)) {
-      markerEnd = d + 1;
-      markerWidth = markerEnd - pos;
-      isOrderedOne = d === pos + 1 && c === 49 /* '1' */;
-    }
-  }
-  if (markerEnd < 0) return null;
-  if (markerEnd < raw.length) {
-    const after = raw.charCodeAt(markerEnd);
-    if (after !== 32 && after !== 9) return null;
-  } else if (interruptsParagraph) {
-    return null;
-  }
-
-  const markerColEnd = col + markerWidth;
-  const ws = scanSpacesAndTabsCols(raw, markerEnd, markerColEnd);
-  const isBlankItem = ws.pos >= raw.length;
-  // CommonMark §5.2: an empty list item CANNOT interrupt a paragraph, and an ordered list item ONLY interrupts when digits === "1"!
-  if (interruptsParagraph) {
-    if (isBlankItem) return null;
-    if (isOrdered && !isOrderedOne) return null;
-  }
-  if (isBlankItem) {
-    // Blank list item: list content indent is `markerColEnd + 1`, advance at most 1 space/tab past marker
-    let p1 = markerEnd;
-    let c1 = markerColEnd;
-    let tab1 = false;
-    if (p1 < raw.length) {
-      if (raw.charCodeAt(p1) === 32) {
-        p1++;
-        c1++;
-      } else if (raw.charCodeAt(p1) === 9) {
-        c1 += 4 - (c1 % 4);
-        p1++;
-        tab1 = true;
-      }
-    }
-    return { contentIndent: markerColEnd + 1, nextPos: p1, nextCol: c1, sawTab: tab1 };
-  }
-  if (ws.col - markerColEnd > 4) {
-    // CommonMark §5.2: indented code block inside list item — content indent is `markerColEnd + 1`, while `nextPos`/`nextCol` advance past all leading whitespace!
-    return { contentIndent: markerColEnd + 1, nextPos: ws.pos, nextCol: ws.col, sawTab: ws.sawTab };
-  }
-  return { contentIndent: ws.col, nextPos: ws.pos, nextCol: ws.col, sawTab: ws.sawTab };
-}
-
-function canInterruptParagraphAtPos(raw: string, baseCol: number, col: number, pos: number, allowSetext: boolean): boolean {
-  if (pos >= raw.length) return true;
-  if (col - baseCol > 3) return false;
-  if (raw.charCodeAt(pos) === 62 /* '>' */) return true;
-  if (isAtxHeadingAtPos(raw, baseCol, col, pos)) return true;
-  if (isThematicBreakAtPos(raw, baseCol, col, pos)) return true;
-  if (parseFenceOpenerAtPos(raw, baseCol, col, pos) !== null) return true;
-  if (parseListMarkerAtPos(raw, baseCol, col, pos, true) !== null) return true;
-  if (allowSetext) {
-    const ch = raw.charCodeAt(pos);
-    if (ch === 61 /* '=' */ || ch === 45 /* '-' */) {
-      let p = pos;
-      while (p < raw.length && raw.charCodeAt(p) === ch) p++;
-      while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
-      if (p === raw.length) return true;
-    }
-  }
-  return false;
-}
-
-const MAX_MD_CONTAINER_DEPTH = 32;
-const _matchContainerOut = { matched: 0, baseCol: 0, col: 0, pos: 0, sawTab: false };
-
-function matchOpenContainersOnLine(
-  raw: string,
-  containers: readonly MdContainerEntry[],
-): { matched: number; baseCol: number; col: number; pos: number; sawTab: boolean } {
-  const n = raw.length;
-  let pos = 0;
-  let col = 0;
-  let sawTab = false;
-
-  // Fast-path `containers.length === 0` (`S2`): single tight char-code loop with zero object allocations
-  if (containers.length === 0) {
-    while (pos < n) {
-      const ch = raw.charCodeAt(pos);
-      if (ch === 32 /* ' ' */) {
-        col++;
-        pos++;
-      } else if (ch === 9 /* '\t' */) {
-        col += 4 - (col % 4);
-        pos++;
-        sawTab = true;
-      } else {
-        break;
-      }
-    }
-    _matchContainerOut.matched = 0;
-    _matchContainerOut.baseCol = 0;
-    _matchContainerOut.col = col;
-    _matchContainerOut.pos = pos;
-    _matchContainerOut.sawTab = sawTab;
-    return _matchContainerOut;
-  }
-
-  let matched = 0;
-  let baseCol = 0;
-  const depthLimit = containers.length < MAX_MD_CONTAINER_DEPTH ? containers.length : MAX_MD_CONTAINER_DEPTH;
-
-  // Empty line (`n === 0`) fast-path: matches all leading list containers up to the first blockquote container (`>`).
-  if (n === 0) {
-    while (matched < depthLimit && containers[matched]!.kind === 'list') {
-      matched++;
-    }
-    _matchContainerOut.matched = matched;
-    _matchContainerOut.baseCol = 0;
-    _matchContainerOut.col = 0;
-    _matchContainerOut.pos = 0;
-    _matchContainerOut.sawTab = false;
-    return _matchContainerOut;
-  }
-
-  for (let ci = 0; ci < depthLimit; ci++) {
-    const entry = containers[ci]!;
-    if (entry.kind === 'bq') {
-      while (pos < n) {
-        const ch = raw.charCodeAt(pos);
-        if (ch === 32) {
-          col++;
-          pos++;
-        } else if (ch === 9) {
-          col += 4 - (col % 4);
-          pos++;
-          sawTab = true;
-        } else {
-          break;
-        }
-      }
-      if (col - baseCol <= 3 && pos < n && raw.charCodeAt(pos) === 62 /* '>' */) {
-        pos++;
-        col++;
-        if (pos < n) {
-          const nx = raw.charCodeAt(pos);
-          if (nx === 32) {
-            pos++;
-            col++;
-            baseCol = col;
-          } else if (nx === 9) {
-            const tabWidth = 4 - (col % 4);
-            pos++;
-            col += tabWidth;
-            baseCol = col - (tabWidth - 1);
-            sawTab = true;
-          } else {
-            baseCol = col;
-          }
-        } else {
-          baseCol = col;
-        }
-        matched++;
-      } else {
-        break;
-      }
-    } else {
-      // List item container (`S5`): consume spaces/tabs strictly by CommonMark §2.2 4-space tab stops up to `col >= entry.indent`.
-      // If a tab crosses `entry.indent` (e.g. `col` jumps `0 -> 4` when `entry.indent === 2`), `baseCol = entry.indent` leaves `remCols = 2`!
-      while (pos < n && col < entry.indent) {
-        const ch = raw.charCodeAt(pos);
-        if (ch === 32) {
-          col++;
-          pos++;
-        } else if (ch === 9) {
-          col += 4 - (col % 4);
-          pos++;
-          sawTab = true;
-        } else {
-          break;
-        }
-      }
-      if (col >= entry.indent) {
-        baseCol = entry.indent;
-        matched++;
-      } else {
-        // Check if remainder of line is strictly ASCII space/tab (CommonMark §2.1 blank line continues list item)
-        while (pos < n) {
-          const ch = raw.charCodeAt(pos);
-          if (ch === 32) {
-            col++;
-            pos++;
-          } else if (ch === 9) {
-            col += 4 - (col % 4);
-            pos++;
-            sawTab = true;
-          } else {
-            break;
-          }
-        }
-        if (pos >= n) {
-          baseCol = col;
-          matched++;
-        } else {
-          break;
-        }
-      }
-    }
-  }
-
-  while (pos < n) {
-    const ch = raw.charCodeAt(pos);
-    if (ch === 32) {
-      col++;
-      pos++;
-    } else if (ch === 9) {
-      col += 4 - (col % 4);
-      pos++;
-      sawTab = true;
-    } else {
-      break;
-    }
-  }
-  _matchContainerOut.matched = matched;
-  _matchContainerOut.baseCol = baseCol;
-  _matchContainerOut.col = col;
-  _matchContainerOut.pos = pos;
-  _matchContainerOut.sawTab = sawTab;
-  return _matchContainerOut;
-}
-
-/**
- * Full-document CommonMark fence recognizer & hardener (`R9-H1`, `R10-S2..S5`):
- * Drives full-document hardening (`harden: true`) and prose/fence segment splitting (`segments`),
- * returning `{ hardened: string; segments: string[] }` (`segments[idx]` for odd `idx` is a fenced code block)
- * from the same line array with upfront `\u2028`/`\u2029`/`\u0085`/`\r` normalization and bounded container depth.
- */
-export function recognizeAndHardenMarkdownFences(
-  rawMd: string,
-  opts: { harden?: boolean } = {},
-): { hardened: string; segments: string[] } {
-  const harden = opts.harden !== false;
-  if (!rawMd) return { hardened: rawMd, segments: [rawMd] };
-
-  const md = normalizeMarkdownLineEndingsUpfrontLinear(rawMd);
-  if (!md.includes('```') && !md.includes('~~~')) {
-    return { hardened: md, segments: [md] };
-  }
-
-  const hasPotentialSetext = harden ? hasPotentialSetextUnderlineLinear(md) : false;
-  const lines = md.split('\n');
-  const outLines: string[] = [];
-  // Track fence spans in `outLines` as `[startLineIdx, endLineIdxExclusive, closeHasTrailingNewline]`
-  // so `hardened` and `segments` are materialized from the EXACT SAME line array (100% impossible to desync!).
-  const fenceSpans: Array<{ openLine: number; closeLine: number; dedentClosed: boolean }> = [];
-
-  const containers: MdContainerEntry[] = [];
-  let containerFlags = 0; // bit 1 = has 'bq', bit 2 = has 'list' (avoids per-line .every/.some closures)
-  const syncContainerFlags = (): void => {
-    let f = 0;
-    for (let ci = 0; ci < containers.length; ci++) {
-      f |= containers[ci]!.kind === 'bq' ? 1 : 2;
-    }
-    containerFlags = f;
-  };
-  let openParagraph = false;
-  let inFence = false;
-  let fenceChar: '`' | '~' | '' = '';
-  let fenceLen = 0;
-  let effectiveFenceLen = 0;
-  let fenceOpenOutIdx = -1;
-  let fenceOpenInfo = '';
-  let fenceIndent = 0;
-  let escapedRiskyFence: { ch: '`' | '~'; len: number; needBlockquote: boolean } | null = null;
-
-  for (let li = 0; li < lines.length; li++) {
-    const raw = lines[li]!;
-
-    if (inFence) {
-      openParagraph = false;
-      const m = matchOpenContainersOnLine(raw, containers);
-      const isBlankAfterMatched = m.pos >= raw.length && m.matched === containers.length;
-      // Container dedent or missing `>` closes an indented/container fence BEFORE `raw` is parsed!
-      // CommonMark §2.1 (`S3`): ONLY ASCII space (`0x20`) and tab (`0x09`) count as blank-line whitespace (NEVER `U+00A0` NBSP / `U+3000` / `U+FEFF`).
-      if (m.matched < containers.length && !(isAsciiSpaceOrTabOnly(raw) && (containerFlags & 1) === 0)) {
-        if (harden) {
-          outLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}`);
-          fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1, dedentClosed: false });
-        } else {
-          fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1, dedentClosed: true });
-        }
-        inFence = false;
-        fenceChar = '';
-        fenceLen = 0;
-        effectiveFenceLen = 0;
-        fenceOpenOutIdx = -1;
-        fenceIndent = 0;
-        containers.length = m.matched;
-        syncContainerFlags();
-        // Fall through to parse `raw` as a new line outside the closed fence!
-      } else {
-        if (!isBlankAfterMatched && m.pos < raw.length) {
-          const remCols = m.col - m.baseCol;
-          const fcCode = fenceChar.charCodeAt(0);
-          if (raw.charCodeAt(m.pos) === fcCode) {
-            let p = m.pos;
-            while (p < raw.length && raw.charCodeAt(p) === fcCode) p++;
-            const runLen = p - m.pos;
-            if (runLen >= fenceLen) {
-              const onlyTrailingSpaceOrTab = isAsciiSpaceOrTabOnly(raw, p);
-              // `S5`: CommonMark §2.2/§4.5 closes the fence whenever `remCols <= 3`, INCLUDING when a tab inside a list/blockquote
-              // crosses `entry.indent` (`- item\n  \`\`\`\n\t\`\`\`` -> `col=4, baseCol=2, remCols=2 <= 3`)!
-              if (remCols <= 3) {
-                if (onlyTrailingSpaceOrTab) {
-                  if (harden) {
-                    const closeLen = Math.max(runLen, effectiveFenceLen);
-                    outLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(closeLen)}`);
-                  } else {
-                    outLines.push(raw);
-                  }
-                  fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1, dedentClosed: false });
-                  inFence = false;
-                  fenceChar = '';
-                  fenceLen = 0;
-                  effectiveFenceLen = 0;
-                  fenceOpenOutIdx = -1;
-                  fenceIndent = 0;
-                  continue;
-                }
-                if (harden && runLen >= effectiveFenceLen && fenceOpenOutIdx >= 0) {
-                  effectiveFenceLen = runLen + 1;
-                  outLines[fenceOpenOutIdx] = `${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}${fenceOpenInfo}`;
-                }
-              } else if (harden && onlyTrailingSpaceOrTab && runLen >= effectiveFenceLen && fenceOpenOutIdx >= 0) {
-                // `remCols >= 4` (e.g. `\t``` ` at top level): CommonMark keeps the fence open, so lengthen opener `effectiveFenceLen`
-                // so non-CommonMark regex renderers that ignore tab-stop width can NEVER prematurely close the fence either!
-                effectiveFenceLen = runLen + 1;
-                outLines[fenceOpenOutIdx] = `${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}${fenceOpenInfo}`;
-              }
-            }
-          }
-        }
-        outLines.push(raw);
-        continue;
-      }
-    }
-
-    // Not `inFence`: fast-path empty lines when zero blockquotes are open (`S2`, O(1) bit check)
-    if (raw.length === 0 && (containerFlags & 1) === 0) {
-      openParagraph = false;
-      outLines.push(raw);
-      continue;
-    }
-
-    // Fast-path top-level ordinary prose lines starting with an ASCII letter (`A-Z` / `a-z`)
-    if (containers.length === 0 && raw.length > 0) {
-      const c0 = raw.charCodeAt(0);
-      if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) {
-        outLines.push(raw);
-        openParagraph = true;
-        continue;
-      }
-    }
-
-    // Fast-path single-blockquote or lazy-blockquote prose lines (`> line`) starting with `> <ASCII-letter>` (`S2` < 5 ms under V8 coverage)
-    if (
-      escapedRiskyFence === null &&
-      containers.length >= 1 &&
-      containers[0]!.kind === 'bq' &&
-      (containers.length === 1 || openParagraph) &&
-      raw.length >= 3 &&
-      raw.charCodeAt(0) === 62 /* '>' */ &&
-      raw.charCodeAt(1) === 32 /* ' ' */
-    ) {
-      const c2 = raw.charCodeAt(2);
-      if ((c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122)) {
-        outLines.push(raw);
-        openParagraph = true;
-        continue;
-      }
-    }
-
-    // Not `inFence`: match existing containers on `raw`
-    const m = matchOpenContainersOnLine(raw, containers);
-    let baseCol = m.baseCol;
-    let col = m.col;
-    let pos = m.pos;
-    let sawTabInPrefix = m.sawTab;
-
-    if (pos >= raw.length) {
-      // Blank line (at matched container depth) closes any unmatched inner containers and closes `openParagraph`
-      if (containers.length !== m.matched) {
-        containers.length = m.matched;
-        syncContainerFlags();
-      }
-      openParagraph = false;
-      if (escapedRiskyFence?.needBlockquote && (containerFlags & 1) === 0) {
-        escapedRiskyFence = null;
-      }
-      outLines.push(raw);
-      continue;
-    }
-
-    // Check CommonMark §5.1/5.2 lazy paragraph continuation when `openParagraph` is true and inner containers were NOT matched
-    if (openParagraph && m.matched < containers.length) {
-      const interrupts = canInterruptParagraphAtPos(raw, baseCol, col, pos, false);
-      if (!interrupts) {
-        // Lazy paragraph continuation! Neither a list item, nor an indented code block, nor a fence opener.
-        if (harden) {
-          const { prefixLen, risky } = scanContainerPrefixLinear(raw);
-          const checkIdx = prefixLen > 0 ? prefixLen : pos;
-          if ((risky || col - baseCol >= 4) && checkIdx + 3 <= raw.length) {
-            const c0 = raw.charCodeAt(checkIdx);
-            if ((c0 === 96 || c0 === 126) && raw.charCodeAt(checkIdx + 1) === c0 && raw.charCodeAt(checkIdx + 2) === c0) {
-              let fEnd = checkIdx + 3;
-              while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
-              const tail = raw.slice(fEnd);
-              if (!(c0 === 96 && tail.includes('`'))) {
-                const fChar = c0 === 96 ? '`' : '~';
-                outLines.push(`${raw.slice(0, checkIdx)}${`\\${fChar}`.repeat(fEnd - checkIdx)}${tail}`);
-                openParagraph = true;
-                continue;
-              }
-            }
-          }
-        }
-        outLines.push(raw);
-        openParagraph = true;
-        continue;
-      }
-    }
-
-    if (m.matched < containers.length) {
-      containers.length = m.matched;
-      syncContainerFlags();
-      openParagraph = false;
-      if (escapedRiskyFence && !escapedRiskyFence.needBlockquote && (containerFlags & 2) === 0) {
-        escapedRiskyFence = null;
-      }
-      if (escapedRiskyFence?.needBlockquote && (containerFlags & 1) === 0) {
-        escapedRiskyFence = null;
-      }
-    }
-
-    // Parse new container openers (`>` blockquotes and `-`/`1.` list items) on `raw`, capped at `MAX_MD_CONTAINER_DEPTH` (`S2`)
-    let openedListOnLine = false;
-    let isIndentedCodeOrLazy = false;
-    let hitContainerDepthCap = containers.length >= MAX_MD_CONTAINER_DEPTH;
-    for (;;) {
-      const remCols = col - baseCol;
-      if (pos >= raw.length) {
-        openParagraph = false;
-        break;
-      }
-      if (remCols >= 4) {
-        // Indented code block (when `!openParagraph`) or paragraph continuation (when `openParagraph`): NEVER a fence or new container!
-        isIndentedCodeOrLazy = true;
-        break;
-      }
-      if (raw.charCodeAt(pos) === 62 /* '>' */) {
-        if (containers.length >= MAX_MD_CONTAINER_DEPTH) {
-          hitContainerDepthCap = true;
-          break;
-        }
-        containers.push({ kind: 'bq' });
-        containerFlags |= 1;
-        openParagraph = false;
-        pos++;
-        col++;
-        if (pos < raw.length) {
-          const nx = raw.charCodeAt(pos);
-          if (nx === 32) {
-            pos++;
-            col++;
-            baseCol = col;
-          } else if (nx === 9) {
-            const tw = 4 - (col % 4);
-            pos++;
-            col += tw;
-            baseCol = col - (tw - 1);
-            sawTabInPrefix = true;
-          } else {
-            baseCol = col;
-          }
-        } else {
-          baseCol = col;
-        }
-        const wsNext = scanSpacesAndTabsCols(raw, pos, col);
-        pos = wsNext.pos;
-        col = wsNext.col;
-        if (wsNext.sawTab) sawTabInPrefix = true;
-        continue;
-      }
-      const listMatch = parseListMarkerAtPos(raw, baseCol, col, pos, openParagraph);
-      if (listMatch) {
-        if (containers.length >= MAX_MD_CONTAINER_DEPTH) {
-          hitContainerDepthCap = true;
-          break;
-        }
-        containers.push({ kind: 'list', indent: listMatch.contentIndent });
-        containerFlags |= 2;
-        openedListOnLine = true;
-        escapedRiskyFence = null;
-        openParagraph = false;
-        baseCol = listMatch.contentIndent;
-        pos = listMatch.nextPos;
-        col = listMatch.nextCol;
-        if (listMatch.sawTab) sawTabInPrefix = true;
-        continue;
-      }
-      break;
-    }
-
-    // `S2`: If container nesting reached `MAX_MD_CONTAINER_DEPTH` (`32`), fail-closed escape any fence-like ``` / ~~~ token on `raw`
-    if (harden && hitContainerDepthCap && (raw.includes('```') || raw.includes('~~~'))) {
-      const { prefixLen } = scanContainerPrefixLinear(raw);
-      let q = prefixLen > pos ? prefixLen : pos;
-      while (q < raw.length && (raw.charCodeAt(q) === 32 || raw.charCodeAt(q) === 9)) q++;
-      if (q + 3 <= raw.length) {
-        const c0 = raw.charCodeAt(q);
-        if ((c0 === 96 || c0 === 126) && raw.charCodeAt(q + 1) === c0 && raw.charCodeAt(q + 2) === c0) {
-          let fEnd = q + 3;
-          while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
-          const tailAfter = raw.slice(fEnd);
-          if (!(c0 === 96 && tailAfter.includes('`'))) {
-            const fChar = c0 === 96 ? '`' : '~';
-            escapedRiskyFence = {
-              ch: fChar,
-              len: fEnd - q,
-              needBlockquote: (containerFlags & 1) !== 0,
-            };
-            outLines.push(`${raw.slice(0, q)}${`\\${fChar}`.repeat(fEnd - q)}${tailAfter}`);
-            openParagraph = false;
-            continue;
-          }
-        }
-      }
-    }
-
-    const lineHasBq = (containerFlags & 1) !== 0;
-    if (escapedRiskyFence?.needBlockquote && !lineHasBq) {
-      escapedRiskyFence = null;
-    }
-
-    // Fast-path container-indented ordinary prose lines (`> line`, `  item prose`) whose content starts with an ASCII letter (`A-Z` / `a-z`)
-    if (!isIndentedCodeOrLazy && pos < raw.length) {
-      const chAtPos = raw.charCodeAt(pos);
-      if ((chAtPos >= 65 && chAtPos <= 90) || (chAtPos >= 97 && chAtPos <= 122)) {
-        outLines.push(raw);
-        openParagraph = true;
-        continue;
-      }
-    }
-
-    // If we previously escaped a risky container-prefixed or tab-indented fence opener (`- ``` ` / `- item\n\t``` `) inside the current list,
-    // also escape its matching closing fence line (`  ``` ` or `\t``` `) so it cannot invert polarity and open a new fence!
-    if (
-      harden &&
-      escapedRiskyFence &&
-      !escapedRiskyFence.needBlockquote &&
-      !openedListOnLine &&
-      !isIndentedCodeOrLazy &&
-      col - baseCol <= 3 &&
-      pos < raw.length
-    ) {
-      const escCode = escapedRiskyFence.ch.charCodeAt(0);
-      if (raw.charCodeAt(pos) === escCode) {
-        let p = pos;
-        while (p < raw.length && raw.charCodeAt(p) === escCode) p++;
-        const runLen = p - pos;
-        if (runLen >= escapedRiskyFence.len) {
-          if (isAsciiSpaceOrTabOnly(raw, p)) {
-            const escapedRun = `\\${escapedRiskyFence.ch}`.repeat(runLen);
-            outLines.push(`${raw.slice(0, pos)}${escapedRun}${raw.slice(pos + runLen)}`);
-            escapedRiskyFence = null;
-            openParagraph = false;
-            continue;
-          }
-        }
-      }
-    }
-
-    // Check for fence opener at `(baseCol, col, pos)` when `!isIndentedCodeOrLazy`
-    const fenceCand = !isIndentedCodeOrLazy ? parseFenceOpenerAtPos(raw, baseCol, col, pos) : null;
-    if (fenceCand) {
-      const isRiskyContainerFence =
-        lineHasBq || openedListOnLine || sawTabInPrefix || hitContainerDepthCap || containers.length >= MAX_MD_CONTAINER_DEPTH;
-      if (harden && isRiskyContainerFence) {
-        const tailAfterFence = raw.slice(fenceCand.infoStart);
-        if (
-          escapedRiskyFence &&
-          escapedRiskyFence.ch === fenceCand.ch &&
-          fenceCand.len >= escapedRiskyFence.len &&
-          isAsciiSpaceOrTabOnly(tailAfterFence)
-        ) {
-          escapedRiskyFence = null;
-        } else if (openedListOnLine || lineHasBq || containers.length > 0) {
-          escapedRiskyFence = { ch: fenceCand.ch, len: fenceCand.len, needBlockquote: lineHasBq };
-        }
-        const escapedRun = `\\${fenceCand.ch}`.repeat(fenceCand.len);
-        outLines.push(`${raw.slice(0, pos)}${escapedRun}${tailAfterFence}`);
-        openParagraph = false;
-        continue;
-      }
-
-      // Valid unambiguous fence opener!
-      const effectiveContainerIndent = containers.length > 0 && !lineHasBq ? baseCol : 0;
-      if (
-        harden &&
-        hasPotentialSetext &&
-        containers.length === 0 &&
-        outLines.length > 0 &&
-        !isAsciiSpaceOrTabOnly(outLines[outLines.length - 1]!)
-      ) {
-        outLines.push('');
-      }
-      inFence = true;
-      openParagraph = false;
-      fenceChar = fenceCand.ch;
-      fenceLen = fenceCand.len;
-      effectiveFenceLen = fenceCand.len;
-      fenceIndent = harden ? effectiveContainerIndent : col;
-      fenceOpenOutIdx = outLines.length;
-      if (harden) {
-        const cleanInfo = cleanFenceInfoStringLinear(raw.slice(fenceCand.infoStart));
-        fenceOpenInfo = cleanInfo;
-        outLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(fenceLen)}${cleanInfo}`);
-      } else {
-        fenceOpenInfo = raw.slice(fenceCand.infoStart);
-        outLines.push(raw);
-      }
-      continue;
-    }
-
-    // When `harden` is true, also escape `>= 4`-col indented or tab/container pseudo-fences (`    ``` `, `\t``` `, `>    ~~~`)
-    if (harden) {
-      const { prefixLen, risky } = scanContainerPrefixLinear(raw);
-      const checkFencePos = isIndentedCodeOrLazy ? pos : prefixLen > 0 && risky ? prefixLen : -1;
-      if (checkFencePos >= 0 && checkFencePos + 3 <= raw.length) {
-        const c0 = raw.charCodeAt(checkFencePos);
-        if ((c0 === 96 || c0 === 126) && raw.charCodeAt(checkFencePos + 1) === c0 && raw.charCodeAt(checkFencePos + 2) === c0) {
-          let fEnd = checkFencePos + 3;
-          while (fEnd < raw.length && raw.charCodeAt(fEnd) === c0) fEnd++;
-          const tailAfterFence = raw.slice(fEnd);
-          if (!(c0 === 96 && tailAfterFence.includes('`'))) {
-            const fChar = c0 === 96 ? '`' : '~';
-            outLines.push(`${raw.slice(0, checkFencePos)}${`\\${fChar}`.repeat(fEnd - checkFencePos)}${tailAfterFence}`);
-            if (!openParagraph && isIndentedCodeOrLazy) {
-              openParagraph = false;
-            }
-            continue;
-          }
-        }
-      }
-
-      // Guard `marked` multi-line `[label\n~~~\n]: url` and empty-destination `[y]:\n``` ` swallowing fences
-      const checkBracketPos = !isIndentedCodeOrLazy && col - baseCol <= 3 ? pos : prefixLen > 0 ? prefixLen : -1;
-      if (checkBracketPos >= 0 && checkBracketPos < raw.length && raw.charCodeAt(checkBracketPos) === 91 /* '[' */) {
-        const tail = raw.slice(checkBracketPos);
-        const qLimit = Math.min(tail.length, 1024);
-        let closeIdx = -1;
-        for (let q = 1; q < qLimit; q++) {
-          const qc = tail.charCodeAt(q);
-          if (qc === 92 /* '\\' */) {
-            q++;
-            continue;
-          }
-          if (qc === 93 /* ']' */) {
-            closeIdx = q;
-            break;
-          }
-        }
-        if (closeIdx < 0 && tail.length < 1024) {
-          outLines.push(`${raw.slice(0, checkBracketPos)}\\${tail}`);
-          openParagraph = true;
-          continue;
-        }
-        if (
-          closeIdx >= 0 &&
-          closeIdx + 1 < tail.length &&
-          tail.charCodeAt(closeIdx + 1) === 58 /* ':' */ &&
-          isAsciiSpaceOrTabOnly(tail, closeIdx + 2)
-        ) {
-          outLines.push(`${raw.slice(0, checkBracketPos)}${tail.slice(0, closeIdx + 1)}\\${tail.slice(closeIdx + 1)}`);
-          openParagraph = true;
-          continue;
-        }
-      }
-    }
-
-    outLines.push(raw);
-
-    // Update `openParagraph` state for next line (`CommonMark §4.8 / §5`)
-    if (pos >= raw.length) {
-      openParagraph = false;
-    } else if (isIndentedCodeOrLazy) {
-      // Indented `>= 4` cols: if `openParagraph` was already true, it stays a paragraph continuation; otherwise indented code block (`false`)
-      openParagraph = openParagraph;
-    } else if (isThematicBreakAtPos(raw, baseCol, col, pos) || isAtxHeadingAtPos(raw, baseCol, col, pos)) {
-      openParagraph = false;
-    } else if (openParagraph && containers.length === 0 && (raw.charCodeAt(pos) === 61 || raw.charCodeAt(pos) === 45)) {
-      // Setext heading underline (`===` / `---`) closes top-level paragraph
-      const sc = raw.charCodeAt(pos);
-      let p = pos;
-      while (p < raw.length && raw.charCodeAt(p) === sc) p++;
-      while (p < raw.length && (raw.charCodeAt(p) === 32 || raw.charCodeAt(p) === 9)) p++;
-      openParagraph = p !== raw.length;
-    } else {
-      openParagraph = true;
-    }
-  }
-
-  // Never leave a code fence unclosed at EOF (`marked4` renders unclosed single-line EOF fences as inline prose!)
-  if (inFence) {
-    if (harden) {
-      outLines.push(`${' '.repeat(fenceIndent)}${fenceChar.repeat(effectiveFenceLen)}`);
-    }
-    fenceSpans.push({ openLine: fenceOpenOutIdx, closeLine: outLines.length - 1, dedentClosed: false });
-  }
-
-  const hardened = outLines.join('\n');
-  if (fenceSpans.length === 0) {
-    return { hardened, segments: [hardened] };
-  }
-
-  // Build alternating `[prose, fence, prose, fence, ...]` segments directly from `outLines` + `fenceSpans`!
-  const segments: string[] = [];
-  let lineCursor = 0;
-  let prefixLeadingNewline = false;
-  for (let si = 0; si < fenceSpans.length; si++) {
-    const sp = fenceSpans[si]!;
-    const proseLinesSlice = outLines.slice(lineCursor, sp.openLine);
-    let proseText = proseLinesSlice.join('\n');
-    if (prefixLeadingNewline) {
-      proseText = `\n${proseText}`;
-    }
-    if (sp.openLine > lineCursor) {
-      proseText = `${proseText}\n`;
-    }
-    segments.push(proseText);
-
-    const fenceLinesSlice = outLines.slice(sp.openLine, sp.closeLine + 1);
-    const fenceText = sp.dedentClosed ? `${fenceLinesSlice.join('\n')}\n` : fenceLinesSlice.join('\n');
-    segments.push(fenceText);
-
-    lineCursor = sp.closeLine + 1;
-    prefixLeadingNewline = !sp.dedentClosed && lineCursor < outLines.length;
-  }
-
-  if (lineCursor < outLines.length) {
-    const tailText = outLines.slice(lineCursor).join('\n');
-    segments.push(prefixLeadingNewline ? `\n${tailText}` : tailText);
-  } else {
-    segments.push('');
-  }
-
-  return { hardened, segments };
-}
-
 function hardenMarkdownFenceStructure(rawMd: string): string {
   return recognizeAndHardenMarkdownFences(rawMd, { harden: true }).hardened;
 }
 
 /**
  * Splits Markdown into alternating `[prose, codeFence, prose, codeFence, ...]` segments (`idx % 2 === 1` is always a
- * fenced code block) by delegating directly to the single canonical `recognizeAndHardenMarkdownFences` recognizer (`R9-H1`).
+ * fenced code block) by delegating directly to the single canonical `recognizeAndHardenMarkdownFences` recognizer (`R9-H1`, `R11-S2`).
  */
 export function splitMarkdownByCodeFences(rawMd: string): string[] {
   return recognizeAndHardenMarkdownFences(rawMd, { harden: false }).segments;
@@ -1442,7 +429,7 @@ export function makeSafeCodeFence(code: string, lang = '', preferTilde = false):
 export function decodeMarkdownEntities(md: string): string {
   if (!md || !md.includes('&')) return md;
   const parts = splitMarkdownByCodeFences(md);
-  return parts.map((part, idx) => (idx % 2 === 1 ? part : decodeHtmlEntities(part))).join('');
+  return parts.map((part, idx) => (idx % 2 === 1 ? part : stripInvisibleSmugglingChars(decodeHtmlEntities(part)))).join('');
 }
 
 function safeDecodeURIComponent(raw: string): string {
@@ -1606,7 +593,7 @@ function collapseTagBoundaryPunctuation(s: string): string {
 function cleanInlineHtml(fragment: string): string {
   const stripped = replaceHtmlTagsQuoteAwareLinear(fragment, (t) => (!t.isClosing && t.tagNameLower === 'wbr' ? '' : ' '));
   return collapseTagBoundaryPunctuation(
-    decodeHtmlEntities(stripped)
+    stripInvisibleSmugglingChars(decodeHtmlEntities(stripped))
       .replace(/\s+/g, ' ')
       .trim(),
   );
@@ -3422,17 +2409,17 @@ export function extractHtmlDocument(
   }
 
   // Extract YouTube watch-page `ytInitialPlayerResponse.videoDetails`, Substack `window._preloads`, and Hacker News threads
-  // BEFORE stripping `<script>` tags so rich SSR payloads are preserved.
-  const ytMeta = extractYouTubeWatchMetadataFromHtml(rawHtml);
-  const substackPreload = onlyMainContent && (!includeTags || includeTags.length === 0) ? extractSubstackPreloadData(rawHtml) : null;
+  // BEFORE stripping `<script>` tags so rich SSR payloads are preserved (disabled when caller passes custom tag/content scoping).
+  const hasDefaultHtmlScoping = Boolean(onlyMainContent && (!includeTags || includeTags.length === 0) && (!excludeTags || excludeTags.length === 0));
+  const ytMeta = hasDefaultHtmlScoping ? extractYouTubeWatchMetadataFromHtml(rawHtml) : null;
+  const substackPreload = hasDefaultHtmlScoping ? extractSubstackPreloadData(rawHtml) : null;
   if (substackPreload) {
     if (substackPreload.title) title = substackPreload.title;
     if (substackPreload.subtitle && !description) description = substackPreload.subtitle;
     if (substackPreload.author && !author) author = substackPreload.author;
     if (substackPreload.publishedTime && !publishedTime) publishedTime = substackPreload.publishedTime;
   }
-  const hnExtracted =
-    onlyMainContent && (!includeTags || includeTags.length === 0) ? extractHackerNewsMarkdown(rawHtml, baseUrl) : null;
+  const hnExtracted = hasDefaultHtmlScoping ? extractHackerNewsMarkdown(rawHtml, baseUrl) : null;
   if (hnExtracted) {
     if (hnExtracted.title) title = hnExtracted.title;
     if (hnExtracted.author && !author) author = hnExtracted.author;
@@ -4210,7 +3197,7 @@ export function extractHtmlDocument(
       }
       links = hnExtracted.links;
     }
-  } else if (onlyMainContent && (!includeTags || includeTags.length === 0) && Date.now() <= deadlineAt) {
+  } else if (hasDefaultHtmlScoping && Date.now() <= deadlineAt) {
     if (baseUrl && /^https?:\/\/github\.com\/[^/]+\/[^/]+\/(?:issues|pull)\/\d+/i.test(baseUrl)) {
       md = cleanGitHubIssueOrPrMarkdown(md);
     } else {
@@ -4400,7 +3387,11 @@ export function formatInertiaPagePropsToMarkdown(
   baseUrl?: string,
   htmlToMd?: (frag: string, base?: string) => { markdown: string; links: string[] },
 ): { title?: string; description?: string; markdown: string } | null {
-  const component = typeof inertiaObj.component === 'string' ? inertiaObj.component.trim() : '';
+  const rawComponent = typeof inertiaObj.component === 'string' ? inertiaObj.component : '';
+  const component = stripInvisibleSmugglingChars(decodeHtmlEntities(stripInvisibleSmugglingChars(rawComponent)))
+    .replace(/[\r\n`]+/g, ' ')
+    .replace(/</g, '&lt;')
+    .trim();
   if (!component) return null;
   const rawProps =
     inertiaObj.props && typeof inertiaObj.props === 'object' && !Array.isArray(inertiaObj.props)
@@ -4411,20 +3402,31 @@ export function formatInertiaPagePropsToMarkdown(
   let bestDescription = '';
   let visited = 0;
 
-  const escapeCell = (val: unknown): string =>
-    String(val ?? '')
+  const preEscapeUntrustedInline = (val: unknown, maxLen: number): string => {
+    const rawStr = stripInvisibleSmugglingChars(String(val ?? ''));
+    if (!rawStr.trim()) return '';
+    const decoded = stripInvisibleSmugglingChars(decodeMarkdownEntitiesPreservingLt(rawStr));
+    return neutralizeAllUnsafeMarkdownLinksLinear(decoded)
       .replace(/\r?\n+/g, ' ')
-      .replace(/\|/g, '\\|')
+      .replace(/</g, '&lt;')
       .trim()
-      .slice(0, 160);
+      .slice(0, maxLen);
+  };
+
+  const escapeKeyHeading = (val: string): string =>
+    preEscapeUntrustedInline(val, 120).replace(/^#+[ \t]*/, '').replace(/[*_`[\]|]/g, '');
+
+  const escapeCell = (val: unknown): string => preEscapeUntrustedInline(val, 160).replace(/\|/g, '\\|');
 
   const convertRichString = (raw: string): string => {
-    const trimmed = raw.trim();
-    if (!trimmed) return '';
-    if (htmlToMd && /<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|em|a|table|blockquote)\b/i.test(trimmed)) {
-      return htmlToMd(trimmed, baseUrl).markdown.trim();
+    const cleaned = stripInvisibleSmugglingChars(raw).trim();
+    if (!cleaned) return '';
+    if (htmlToMd && /<(?:p|div|ul|ol|li|h[1-6]|section|article|br|strong|em|a|table|blockquote)\b/i.test(cleaned)) {
+      const converted = stripInvisibleSmugglingChars(htmlToMd(cleaned, baseUrl).markdown).trim();
+      return neutralizeAllUnsafeMarkdownLinksLinear(converted).replace(/</g, '&lt;');
     }
-    return trimmed;
+    const decoded = stripInvisibleSmugglingChars(decodeMarkdownEntitiesPreservingLt(cleaned));
+    return neutralizeAllUnsafeMarkdownLinksLinear(decoded).replace(/</g, '&lt;');
   };
 
   const renderObjectFields = (obj: Record<string, unknown>, depth: number): string[] => {
@@ -4438,14 +3440,16 @@ export function formatInertiaPagePropsToMarkdown(
       if (lower === 'auth' && typeof v === 'object' && !Array.isArray(v) && !(v as Record<string, unknown>).user) {
         continue;
       }
+      const safeKey = escapeKeyHeading(k) || 'field';
       if (typeof v === 'string') {
-        const clean = v.trim();
+        const clean = stripInvisibleSmugglingChars(v).trim();
         if (!clean) continue;
+        const safeScalar = preEscapeUntrustedInline(clean, 300);
         if (!bestTitle && (lower === 'title' || lower === 'pagetitle' || lower === 'headline' || lower === 'name') && clean.length <= 180) {
-          bestTitle = clean;
+          bestTitle = preEscapeUntrustedInline(clean, 180);
         }
         if (!bestDescription && (lower === 'description' || lower === 'summary' || lower === 'excerpt') && clean.length >= 20 && clean.length <= 400 && !/<[a-z]/i.test(clean)) {
-          bestDescription = clean;
+          bestDescription = preEscapeUntrustedInline(clean, 400);
         }
         const isProse =
           clean.length >= 80 ||
@@ -4457,15 +3461,15 @@ export function formatInertiaPagePropsToMarkdown(
         if (isProse && /\s/.test(clean)) {
           const rich = convertRichString(clean);
           if (rich) subBlocks.push(rich);
-        } else {
-          bullets.push(`- **${k}**: ${clean.slice(0, 300)}`);
+        } else if (safeScalar) {
+          bullets.push(`- **${safeKey}**: ${safeScalar}`);
         }
       } else if (typeof v === 'number' || typeof v === 'boolean') {
-        bullets.push(`- **${k}**: ${String(v)}`);
+        bullets.push(`- **${safeKey}**: ${String(v)}`);
       } else if (Array.isArray(v) && v.length > 0) {
         const slice = v.slice(0, 40);
         if (slice.every((it) => typeof it === 'string' || typeof it === 'number' || typeof it === 'boolean')) {
-          bullets.push(`- **${k}**: ${slice.map(String).join(', ')}`);
+          bullets.push(`- **${safeKey}**: ${slice.map((it) => preEscapeUntrustedInline(it, 160)).filter(Boolean).join(', ')}`);
         } else if (slice.every((it) => it && typeof it === 'object' && !Array.isArray(it))) {
           const firstRow = slice[0] as Record<string, unknown>;
           const cols = Object.keys(firstRow)
@@ -4481,23 +3485,25 @@ export function formatInertiaPagePropsToMarkdown(
               const r = it as Record<string, unknown>;
               return `| ${cols.map((c) => escapeCell(r[c])).join(' | ')} |`;
             });
-            subBlocks.push(`### ${k}\n\n${[header, sep, ...rows].join('\n')}`);
+            subBlocks.push(`### ${safeKey}\n\n${[header, sep, ...rows].join('\n')}`);
           } else {
             const itemLines: string[] = [];
             for (const it of slice) {
               const r = it as Record<string, unknown>;
-              const label = String(r.title ?? r.name ?? r.label ?? r.id ?? '').trim();
-              const desc = typeof r.body === 'string' ? convertRichString(r.body) : typeof r.description === 'string' ? convertRichString(r.description) : '';
+              const label = preEscapeUntrustedInline(r.title ?? r.name ?? r.label ?? r.id ?? '', 160);
+              const rawDesc =
+                typeof r.body === 'string' ? convertRichString(r.body) : typeof r.description === 'string' ? convertRichString(r.description) : '';
+              const desc = rawDesc.replace(/\r?\n+/g, ' ').trim();
               if (label && desc) itemLines.push(`- **${label}**: ${desc.slice(0, 400)}`);
               else if (label) itemLines.push(`- ${label}`);
             }
-            if (itemLines.length > 0) subBlocks.push(`### ${k}\n\n${itemLines.join('\n')}`);
+            if (itemLines.length > 0) subBlocks.push(`### ${safeKey}\n\n${itemLines.join('\n')}`);
           }
         }
       } else if (typeof v === 'object' && !Array.isArray(v) && depth < 2) {
         const nestedParts = renderObjectFields(v as Record<string, unknown>, depth + 1);
         if (nestedParts.length > 0) {
-          subBlocks.push(`${depth === 0 ? '##' : '###'} ${k}\n\n${nestedParts.join('\n\n')}`);
+          subBlocks.push(`${depth === 0 ? '##' : '###'} ${safeKey}\n\n${nestedParts.join('\n\n')}`);
         }
       }
     }
@@ -4510,7 +3516,7 @@ export function formatInertiaPagePropsToMarkdown(
   const propSections = renderObjectFields(rawProps, 0);
   if (propSections.length === 0) return null;
 
-  const headingTitle = bestTitle || component.replace(/\//g, ' — ');
+  const headingTitle = (bestTitle || component.replace(/\//g, ' — ')).replace(/[\r\n]+/g, ' ').trim();
   const sections = [`# ${headingTitle}`, `- **Inertia Component**: \`${component}\``, ...propSections];
   return {
     ...(bestTitle ? { title: bestTitle } : {}),
@@ -7254,7 +6260,11 @@ function decodeMarkdownEntitiesPreservingLt(prose: string): string {
   if (!/&(?!lt;|LT;)/.test(prose)) return prose;
   const collapsedAmp = prose.replace(/&(?:amp;|#0*38;?|#[xX]0*26;?)+(?=(?:#\d|#[xX][0-9a-fA-F]|[a-zA-Z][a-zA-Z0-9]{1,15};))/gi, '&');
   const guarded = collapsedAmp.replace(/&(?:lt;|LT;|#0*60;?|#[xX]0*3[cC];?)/g, '\u0000EFLT\u0000');
-  return decodeHtmlEntities(guarded).replace(/\u0000EFLT\u0000/g, '&lt;');
+  const decoded = decodeHtmlEntities(guarded).replace(/\u0000EFLT\u0000/g, '&lt;');
+  if (decoded.includes('\u0000EF')) {
+    return decoded;
+  }
+  return stripInvisibleSmugglingChars(decoded);
 }
 
 function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): string {
@@ -7304,6 +6314,7 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
       const chunks: string[] = [];
       let lastIdx = 0;
       let poisonedLine = false;
+      let nextLtIdx = line.indexOf('<');
       let i = 0;
       while (i < line.length) {
         if (line.charCodeAt(i) === 96 && !isBackslashEscapedAt(line, i)) {
@@ -7313,7 +6324,10 @@ function stashMarkdownInlineCodeSpansLinear(prose: string, stash: string[]): str
             carry = true;
             break;
           }
-          if (!isRiskyAdjacentCodeSpanAt(line, i, spanEnd, false) && line.indexOf('<', i) >= 0 && line.indexOf('<', i) < spanEnd) {
+          if (nextLtIdx !== -1 && nextLtIdx < i) {
+            nextLtIdx = line.indexOf('<', i);
+          }
+          if (nextLtIdx !== -1 && nextLtIdx < spanEnd && !isRiskyAdjacentCodeSpanAt(line, i, spanEnd, false)) {
             if (i > lastIdx) chunks.push(line.slice(lastIdx, i));
             chunks.push(line.slice(i, spanEnd).replace(/</g, '&lt;'));
             lastIdx = spanEnd;
@@ -7499,12 +6513,16 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
     if (prev >= 0xd800 && prev <= 0xdbff) cut--;
     boundedInput = boundedInput.slice(0, cut);
   }
-  let withoutMintlifyBanner = stripInvisibleSmugglingChars(boundedInput);
+  let withoutMintlifyBanner = stripInvisibleSmugglingChars(
+    boundedInput.includes('\u0000') ? boundedInput.replace(/\u0000/g, '') : boundedInput,
+  );
   if (withoutMintlifyBanner.includes('\r')) {
     withoutMintlifyBanner = withoutMintlifyBanner.replace(/\r\n?/g, '\n');
   }
-  withoutMintlifyBanner = parseMarkdownFrontmatter(withoutMintlifyBanner).body.trim();
-  if (!withoutMintlifyBanner) return '';
+  withoutMintlifyBanner = trimTrailingAsciiWhitespaceLinear(
+    parseMarkdownFrontmatter(withoutMintlifyBanner).body.replace(/^(?:[ \t]*\n)+/, ''),
+  );
+  if (!withoutMintlifyBanner || isAsciiSpaceOrTabOnly(withoutMintlifyBanner)) return '';
   if (withoutMintlifyBanner.slice(0, 256).includes('Documentation Index')) {
     withoutMintlifyBanner = withoutMintlifyBanner.replace(
       /^\s*>\s*##\s*Documentation Index[ \t]*\r?\n>\s*Fetch the complete documentation index at:\s*\S+[ \t]*\r?\n>\s*Use this file to discover all available pages before exploring further\.[ \t]*\r?\n+/i,
@@ -7797,6 +6815,7 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
       if (inlineCodeStash.length > 0) {
         proseWork = restoreMarkdownInlineCodeSpansLinear(proseWork, inlineCodeStash);
       }
+      proseWork = stripInvisibleSmugglingChars(proseWork);
 
       if (proseWork.includes('?') && proseWork.toLowerCase().includes('helpful?')) {
         proseWork = proseWork.replace(
@@ -7827,13 +6846,21 @@ function sanitizeInlineHtmlInMarkdownSinglePass(md: string, baseUrl?: string, al
       // hidden subtrees, or comments truncated to the end/start of `part` so fences ALWAYS start at column 0 on their own line!
       const mustLeadNl = idx > 0 && part.startsWith('\n');
       const mustTrailNl = idx + 1 < parts.length && part.endsWith('\n');
+      const mustTrailBlankLine = idx + 1 < parts.length && part.endsWith('\n\n');
       if (dedupedProse.length === 0) {
+        if (mustTrailBlankLine && idx > 0) return '\n\n';
         return mustLeadNl || mustTrailNl ? '\n' : '';
       }
       if (mustLeadNl && !dedupedProse.startsWith('\n')) {
         dedupedProse = `\n${dedupedProse}`;
       }
-      if (mustTrailNl && !dedupedProse.endsWith('\n')) {
+      if (mustTrailBlankLine) {
+        if (!dedupedProse.endsWith('\n')) {
+          dedupedProse = `${dedupedProse}\n\n`;
+        } else if (!dedupedProse.endsWith('\n\n')) {
+          dedupedProse = `${dedupedProse}\n`;
+        }
+      } else if (mustTrailNl && !dedupedProse.endsWith('\n')) {
         dedupedProse = `${dedupedProse}\n`;
       }
       return dedupedProse;
@@ -8037,18 +7064,83 @@ export function extractMarkdownLinksAndImages(
   };
 }
 
-/**
- * Strips invisible Unicode Tag smuggling (`U+E0000`–`U+E007F`), Variation Selectors Supplement (`U+E0100`–`U+E01EF`),
- * Bidi overrides/isolates, zero-width / soft-hyphen characters, ANSI CSI sequences, and raw ASCII C0/DEL control bytes.
- */
-export function stripInvisibleSmugglingChars(s: string): string {
-  if (!s || !/[^\x09\x0A\x0D\x20-\x7E]/.test(s)) return s;
-  return s
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
-    .replace(
-      /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu,
-      '',
-    );
+function sanitizeRecordUrlsDeep<T>(value: T, depth = 0, seen?: WeakSet<object>): T {
+  if (depth > 16 || value === null || value === undefined) return value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (/^https?:\/\/\S+$/i.test(trimmed)) {
+      const encoded = percentEncodeUnsafeRecordUrlChars(trimmed);
+      return (encoded === value ? value : encoded) as unknown as T;
+    }
+    return value;
+  }
+  if (typeof value !== 'object') return value;
+  const visited = seen ?? new WeakSet<object>();
+  if (visited.has(value as object)) return value;
+  visited.add(value as object);
+  if (Array.isArray(value)) {
+    let changed = false;
+    const out = new Array<unknown>(value.length);
+    for (let i = 0; i < value.length; i++) {
+      const orig = value[i];
+      const next = sanitizeRecordUrlsDeep(orig, depth + 1, visited);
+      if (next !== orig) changed = true;
+      out[i] = next;
+    }
+    return (changed ? out : value) as unknown as T;
+  }
+  const src = value as Record<string, unknown>;
+  let cloned: Record<string, unknown> | null = null;
+  const keys = Object.keys(src);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i]!;
+    const orig = src[k];
+    const next = sanitizeRecordUrlsDeep(orig, depth + 1, visited);
+    if (next !== orig) {
+      if (!cloned) cloned = { ...src };
+      cloned[k] = next;
+    }
+  }
+  return (cloned ?? value) as unknown as T;
+}
+
+function redactPiiDeep<T>(value: T, depth = 0, seen?: WeakSet<object>): T {
+  if (depth > 16 || value === null || value === undefined) return value;
+  if (typeof value === 'string') {
+    let redacted = redactPiiText(value);
+    if (redacted !== value && /^https?:\/\/\S+$/i.test(value.trim())) {
+      redacted = percentEncodeUnsafeRecordUrlChars(redacted);
+    }
+    return redacted as unknown as T;
+  }
+  if (typeof value !== 'object') return value;
+  const visited = seen ?? new WeakSet<object>();
+  if (visited.has(value as object)) return value;
+  visited.add(value as object);
+  if (Array.isArray(value)) {
+    let changed = false;
+    const out = new Array<unknown>(value.length);
+    for (let i = 0; i < value.length; i++) {
+      const orig = value[i];
+      const next = redactPiiDeep(orig, depth + 1, visited);
+      if (next !== orig) changed = true;
+      out[i] = next;
+    }
+    return (changed ? out : value) as unknown as T;
+  }
+  const src = value as Record<string, unknown>;
+  let cloned: Record<string, unknown> | null = null;
+  const keys = Object.keys(src);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i]!;
+    const orig = src[k];
+    const next = redactPiiDeep(orig, depth + 1, visited);
+    if (next !== orig) {
+      if (!cloned) cloned = { ...src };
+      cloned[k] = next;
+    }
+  }
+  return (cloned ?? value) as unknown as T;
 }
 
 function cleanOriginNegotiatedMarkdown(md: string, baseUrl?: string): string {
@@ -10283,7 +9375,9 @@ export async function executeScrapeCall(params: {
     !jsonSchemaSpec &&
     !attributesSpec;
 
+  const hasCustomContentScoping = !onlyMainContent || includeTags.length > 0 || excludeTags.length > 0;
   const needsDomForTwin =
+    hasCustomContentScoping ||
     stringFormats.has('html') ||
     stringFormats.has('rawHtml') ||
     stringFormats.has('images') ||
@@ -10693,7 +9787,7 @@ export async function executeScrapeCall(params: {
         formats: agentFormats,
         onlyMainContent,
         discoverLlms: goDiscoverLlms,
-        preferLlmsMarkdown: !needsLiveHtml && renderMode !== 'always',
+        preferLlmsMarkdown: !needsLiveHtml && !hasCustomContentScoping && renderMode !== 'always',
         redactPii,
         ...(revalCandidate?.etag ? { ifNoneMatch: revalCandidate.etag } : {}),
         ...(revalCandidate?.lastModified ? { ifModifiedSince: revalCandidate.lastModified } : {}),
@@ -10725,6 +9819,7 @@ export async function executeScrapeCall(params: {
   // Pre-fetch ATS API adapters (`P1` Ashby, `P2` Workday CXS `GET`/`POST`, Greenhouse, Lever) — runs even when
   // `renderMode: "browser"` / `"always"` is passed so client-hydrated ATS boards always resolve cleanly via their official APIs.
   const canUseAtsAdapter =
+    !hasCustomContentScoping &&
     inlineActions.length === 0 &&
     !stringFormats.has('html') &&
     !stringFormats.has('rawHtml') &&
@@ -10805,8 +9900,31 @@ export async function executeScrapeCall(params: {
               await putDerivedMarkdownForScrape(mdSha, atsShapedFull.markdown);
               atsMdArtifactId = `md:${mdSha}`;
             }
-            const atsTitle = sanitizeScrapedMetadataField(filteredBoard ? filteredBoard.title : formatted!.title, 512);
-            const atsDesc = sanitizeScrapedMetadataField(formatted?.description, 2_000);
+            const rawAtsTitle = filteredBoard ? filteredBoard.title : formatted!.title;
+            const atsTitle = sanitizeScrapedMetadataField(
+              rawAtsTitle ? (redactPii ? redactPiiText(rawAtsTitle) : rawAtsTitle) : undefined,
+              512,
+            );
+            const atsDesc = sanitizeScrapedMetadataField(
+              formatted?.description ? (redactPii ? redactPiiText(formatted.description) : formatted.description) : undefined,
+              2_000,
+            );
+            const atsJobPostingOut = formatted?.jobPosting
+              ? redactPii
+                ? redactPiiDeep(sanitizeRecordUrlsDeep(formatted.jobPosting))
+                : sanitizeRecordUrlsDeep(formatted.jobPosting)
+              : undefined;
+            const atsJobsOut =
+              formatted?.jobs && !filteredBoard
+                ? redactPii
+                  ? redactPiiDeep(sanitizeRecordUrlsDeep(formatted.jobs))
+                  : sanitizeRecordUrlsDeep(formatted.jobs)
+                : undefined;
+            const atsFilteredChunksOut = filteredBoard
+              ? redactPii
+                ? redactPiiDeep(filteredBoard.chunks)
+                : filteredBoard.chunks
+              : undefined;
             setActiveSpanAttribute('edgefetch.adapter_id', atsSpec.id, activeTracer ?? undefined);
             return {
               status: 200,
@@ -10826,14 +9944,14 @@ export async function executeScrapeCall(params: {
                 ...(atsArt?.contentSha256 ? { contentSha256: atsArt.contentSha256 } : {}),
                 ...(atsArt?.blobSha256 ? { artifactId: atsArt.blobSha256 } : {}),
                 ...(atsMdArtifactId ? { markdownArtifactId: atsMdArtifactId } : {}),
-                ...(formatted?.jobPosting ? { jobPosting: formatted.jobPosting } : {}),
-                ...(formatted?.jobs && !filteredBoard ? { jobs: formatted.jobs } : {}),
+                ...(atsJobPostingOut ? { jobPosting: atsJobPostingOut } : {}),
+                ...(atsJobsOut ? { jobs: atsJobsOut } : {}),
                 ...(formatted?.total !== undefined && !filteredBoard ? { total: formatted.total } : {}),
                 ...(formatted?.returned !== undefined && !filteredBoard ? { returned: formatted.returned } : {}),
                 ...(formatted?.nextCursor !== undefined && !filteredBoard ? { nextCursor: formatted.nextCursor } : {}),
-                ...(filteredBoard
+                ...(filteredBoard && atsFilteredChunksOut
                   ? {
-                      chunks: filteredBoard.chunks,
+                      chunks: atsFilteredChunksOut,
                       recordCount: filteredBoard.matchedRecords,
                       totalRecords: filteredBoard.totalRecords,
                     }
@@ -10957,7 +10075,7 @@ export async function executeScrapeCall(params: {
 
   // Single-hop GitHub `/blob/<ref>/<path>` raw upgrade: fetch `raw.githubusercontent.com` directly (~2 KB) instead of
   // downloading 350 KB `github.com` HTML first (and avoiding `github.com` `/*/blob/` non-default branch robots blocks).
-  const directGhBlob = !needsLiveHtml && renderMode !== 'always' ? parseGitHubBlobRawTarget(normalizedUrl) : null;
+  const directGhBlob = !needsLiveHtml && !hasCustomContentScoping && renderMode !== 'always' ? parseGitHubBlobRawTarget(normalizedUrl) : null;
   if (directGhBlob) {
     try {
       const ghDirectRes = await executeHubFetch(
@@ -11072,7 +10190,7 @@ export async function executeScrapeCall(params: {
 
   // Single-hop GitHub `/commit/<sha>` patch upgrade: fetch `<sha>.patch` (~5 KB, allowed by `github.com/robots.txt`)
   // instead of GitHub's heavy HTML diff view (which frequently times out or returns HTTP 503 on large commits).
-  const directGhCommit = !needsLiveHtml && renderMode !== 'always' ? parseGitHubCommitPatchTarget(normalizedUrl) : null;
+  const directGhCommit = !needsLiveHtml && !hasCustomContentScoping && renderMode !== 'always' ? parseGitHubCommitPatchTarget(normalizedUrl) : null;
   if (directGhCommit) {
     try {
       const ghPatchRes = await executeHubFetch(
@@ -11326,6 +10444,34 @@ export async function executeScrapeCall(params: {
               ...twinDetected,
               adapter: registryTwin.id,
             };
+            const twinRecordsOut =
+              formatted.records !== undefined
+                ? redactPii
+                  ? redactPiiDeep(sanitizeRecordUrlsDeep(formatted.records))
+                  : sanitizeRecordUrlsDeep(formatted.records)
+                : undefined;
+            const twinPaginationOut =
+              formatted.pagination !== undefined
+                ? redactPii
+                  ? redactPiiDeep(formatted.pagination)
+                  : formatted.pagination
+                : undefined;
+            const twinSafeSummary =
+              twinSummaryOut !== undefined ? (redactPii ? redactPiiText(twinSummaryOut) : twinSummaryOut) : undefined;
+            const twinSafeProduct = twinProductOut ? (redactPii ? redactPiiDeep(twinProductOut) : twinProductOut) : null;
+            const twinSafeJson = twinJsonOut ? (redactPii ? redactPiiDeep(twinJsonOut) : twinJsonOut) : undefined;
+            const twinTitleOut = sanitizeScrapedMetadataField(
+              formatted.title ? (redactPii ? redactPiiText(formatted.title) : formatted.title) : undefined,
+              512,
+            );
+            const twinDescOut = sanitizeScrapedMetadataField(
+              formatted.description ? (redactPii ? redactPiiText(formatted.description) : formatted.description) : undefined,
+              2_000,
+            );
+            const twinAuthorOut = sanitizeScrapedMetadataField(
+              formatted.author ? (redactPii ? redactPiiText(formatted.author) : formatted.author) : undefined,
+              256,
+            );
             return {
               status: 200,
               via: twinRes.via,
@@ -11344,17 +10490,17 @@ export async function executeScrapeCall(params: {
                 ...(twinArt?.contentSha256 ? { contentSha256: twinArt.contentSha256 } : {}),
                 ...(twinArt?.blobSha256 ? { artifactId: twinArt.blobSha256 } : {}),
                 ...(twinMdArtifactId ? { markdownArtifactId: twinMdArtifactId } : {}),
-                ...(formatted.records !== undefined ? { records: formatted.records } : {}),
-                ...(formatted.pagination !== undefined ? { pagination: formatted.pagination } : {}),
+                ...(twinRecordsOut !== undefined ? { records: twinRecordsOut } : {}),
+                ...(twinPaginationOut !== undefined ? { pagination: twinPaginationOut } : {}),
                 ...(formatted.total !== undefined ? { total: formatted.total } : {}),
                 ...(formatted.returned !== undefined ? { returned: formatted.returned } : {}),
                 ...(formatted.nextCursor !== undefined ? { nextCursor: formatted.nextCursor } : {}),
                 ...(stringFormats.has('markdown') ? { markdown: twinShaped.markdown } : {}),
                 ...(stringFormats.has('text') ? { text: twinShaped.markdown } : {}),
-                ...(twinSummaryOut !== undefined ? { summary: twinSummaryOut } : {}),
-                ...(twinProductOut ? { product: twinProductOut } : {}),
+                ...(twinSafeSummary !== undefined ? { summary: twinSafeSummary } : {}),
+                ...(twinSafeProduct ? { product: twinSafeProduct } : {}),
                 ...(twinRawBase64Out ? { rawBase64: twinRawBase64Out } : {}),
-                ...(twinJsonOut ? { json: twinJsonOut } : {}),
+                ...(twinSafeJson ? { json: twinSafeJson } : {}),
                 ...(twinJsonExtractionMode ? { jsonExtractionMode: twinJsonExtractionMode } : {}),
                 ...(twinWarnings.length > 0 ? { warnings: twinWarnings } : {}),
                 ...(stringFormats.has('links') && formatted.links ? { links: formatted.links } : {}),
@@ -11370,13 +10516,9 @@ export async function executeScrapeCall(params: {
                     ? { truncated: formatted.truncated }
                     : {}),
                 metadata: {
-                  title: sanitizeScrapedMetadataField(formatted.title, 512),
-                  ...(sanitizeScrapedMetadataField(formatted.description, 2_000)
-                    ? { description: sanitizeScrapedMetadataField(formatted.description, 2_000) }
-                    : {}),
-                  ...(sanitizeScrapedMetadataField(formatted.author, 256)
-                    ? { author: sanitizeScrapedMetadataField(formatted.author, 256) }
-                    : {}),
+                  title: twinTitleOut,
+                  ...(twinDescOut ? { description: twinDescOut } : {}),
+                  ...(twinAuthorOut ? { author: twinAuthorOut } : {}),
                   ...(sanitizeScrapedTimestampField(formatted.publishedTime, 128)
                     ? { publishedTime: sanitizeScrapedTimestampField(formatted.publishedTime, 128) }
                     : {}),
@@ -11395,7 +10537,7 @@ export async function executeScrapeCall(params: {
 
   // Single-hop companion `.md` fast-path when `/llms.txt` (from an earlier `map` or `scrape`) already proved a `.md` twin exists.
   const cachedCompanionUrl =
-    discoverLlmsTxt && !needsLiveHtml && renderMode !== 'always' ? lookupCompanionMdUrl(normalizedUrl, now) : undefined;
+    discoverLlmsTxt && !needsLiveHtml && !hasCustomContentScoping && renderMode !== 'always' ? lookupCompanionMdUrl(normalizedUrl, now) : undefined;
   if (cachedCompanionUrl) {
     try {
       const compRes = await executeHubFetch(
@@ -12126,11 +11268,25 @@ export async function executeScrapeCall(params: {
             (stubItem?.outcome === 'ok' || (stubItem?.truncated === true && stubItem?.status === 200)) && stubBody
               ? stubAts.format(stubBody, wdStub.redirectUrl, htmlFragToMd)
               : null;
-          if (stubFormatted && stubFormatted.markdown.trim().length > 0) {
+          if (stubFormatted && stubFormatted.markdown.trim().length > 0 && !hasCustomContentScoping) {
             setActiveSpanAttribute('edgefetch.adapter_id', stubAts.id, activeTracer ?? undefined);
             const stubRedirect = analyzeUrlRedirect(normalizedUrl, wdStub.redirectUrl);
             const cleanStubMd = redactPii ? redactPiiText(stubFormatted.markdown) : stubFormatted.markdown;
             const stubShaped = finalizeScrapedMarkdown(cleanStubMd, { isPdf: false, includeImages, maxChars, baseUrl: wdStub.redirectUrl });
+            const stubJobPostingOut = stubFormatted.jobPosting
+              ? redactPii
+                ? redactPiiDeep(sanitizeRecordUrlsDeep(stubFormatted.jobPosting))
+                : sanitizeRecordUrlsDeep(stubFormatted.jobPosting)
+              : undefined;
+            const stubJobsOut = stubFormatted.jobs
+              ? redactPii
+                ? redactPiiDeep(sanitizeRecordUrlsDeep(stubFormatted.jobs))
+                : sanitizeRecordUrlsDeep(stubFormatted.jobs)
+              : undefined;
+            const stubTitleOut = sanitizeScrapedMetadataField(
+              stubFormatted.title ? (redactPii ? redactPiiText(stubFormatted.title) : stubFormatted.title) : undefined,
+              512,
+            );
             return {
               status: 200,
               via: stubRes.via,
@@ -12145,8 +11301,8 @@ export async function executeScrapeCall(params: {
                 via: stubRes.via,
                 extractorId: stubAts.id,
                 contentState: 'active' as const,
-                ...(stubFormatted.jobPosting ? { jobPosting: stubFormatted.jobPosting } : {}),
-                ...(stubFormatted.jobs ? { jobs: stubFormatted.jobs } : {}),
+                ...(stubJobPostingOut ? { jobPosting: stubJobPostingOut } : {}),
+                ...(stubJobsOut ? { jobs: stubJobsOut } : {}),
                 ...(stubFormatted.total !== undefined ? { total: stubFormatted.total } : {}),
                 ...(stubFormatted.returned !== undefined ? { returned: stubFormatted.returned } : {}),
                 ...(stubFormatted.nextCursor !== undefined ? { nextCursor: stubFormatted.nextCursor } : {}),
@@ -12164,7 +11320,7 @@ export async function executeScrapeCall(params: {
                     ? { truncated: stubFormatted.truncated }
                     : {}),
                 metadata: {
-                  title: stubFormatted.title,
+                  title: stubTitleOut,
                   wordCount: countTextWords(stubShaped.markdown),
                   alternateMarkdownUrl: stubAts.fetchUrl,
                   contentType: 'application/json',
@@ -12328,6 +11484,7 @@ export async function executeScrapeCall(params: {
   };
 
   if (
+    !hasCustomContentScoping &&
     isHtmlBody &&
     !isPdfResponse &&
     prelimHostLower &&
@@ -12382,6 +11539,7 @@ export async function executeScrapeCall(params: {
       }
     }
   } else if (
+    !hasCustomContentScoping &&
     isHtmlBody &&
     !isPdfResponse &&
     prelimHostLower &&
@@ -12410,7 +11568,7 @@ export async function executeScrapeCall(params: {
 
   // Tier 1A: Universal Schema.org JSON-LD (`FAQPage`, `QAPage`, `DiscussionForumPosting`, `ItemList`, `Article`, `Event`, `SoftwareApplication`, `Dataset`)
   let universalSchemaDoc: UniversalSchemaOrgResult | null =
-    isHtmlBody && !isPdfResponse && !customShopifyDoc
+    !hasCustomContentScoping && isHtmlBody && !isPdfResponse && !customShopifyDoc
       ? extractUniversalSchemaOrg(rawBodyStr, finalUrl, htmlFragToMd)
       : null;
   let rawSchemaOrgPiStrings =
@@ -12433,6 +11591,7 @@ export async function executeScrapeCall(params: {
   // Politely upgrades thin CMS/SSG pages on the exact same HTTPS origin respecting `robots.txt`.
   let cmsTwinDoc: CmsAutoTwinResult | null = null;
   if (
+    !hasCustomContentScoping &&
     isHtmlBody &&
     !isPdfResponse &&
     !customShopifyDoc &&
@@ -12476,7 +11635,7 @@ export async function executeScrapeCall(params: {
   // Tier 2 (`R6` v2): SSR Hydration State Recovery (`__NEXT_DATA__`, linear RSC `__next_f.push`, Nuxt 3 `devalue`, Remix, Apollo, Angular `ng-state`, Wix, Squarespace, Substack, Inertia)
   // Extracts both rich prose AND homogeneous `records[]` BEFORE paying headless Chromium latency!
   let ssrHydrated: HydratedFrameworkStateResult | null = null;
-  if (isHtmlBody && !isPdfResponse && !customShopifyDoc && !cmsTwinDoc && !hydratedFromUniversalSchema) {
+  if (!hasCustomContentScoping && isHtmlBody && !isPdfResponse && !customShopifyDoc && !cmsTwinDoc && !hydratedFromUniversalSchema) {
     if (extracted?.inertiaHydrated && extracted.markdown.trim()) {
       ssrHydrated = {
         ...(extracted.title ? { title: extracted.title } : {}),
@@ -12542,12 +11701,13 @@ export async function executeScrapeCall(params: {
   const shouldInspectJobPostingJsonLd =
     isHtmlBody &&
     /JobPosting/i.test(rawBodyStr) &&
-    (checkPromptInjection || (!customShopifyDoc && !ssrHydrated && countTextWords(extracted?.markdown ?? '') < 50));
+    (checkPromptInjection || (!hasCustomContentScoping && !customShopifyDoc && !ssrHydrated && countTextWords(extracted?.markdown ?? '') < 50));
   const rawJobLdInspection = shouldInspectJobPostingJsonLd
     ? inspectRawJobPostingJsonLdLinear(rawBodyStr)
     : { descriptionHtml: '', rawDecodedStringsForPiCheck: '' };
   let rawJsonLdStringsForPiCheck = checkPromptInjection ? rawJobLdInspection.rawDecodedStringsForPiCheck : '';
   if (
+    !hasCustomContentScoping &&
     isHtmlBody &&
     !customShopifyDoc &&
     !ssrHydrated &&
@@ -12662,7 +11822,7 @@ export async function executeScrapeCall(params: {
             isHtmlBody = true;
             extracted = autoExtracted;
             renderedViaOut = 'browser-auto';
-            if (!universalSchemaDoc && /ld\+json/i.test(autoHtml)) {
+            if (!hasCustomContentScoping && !universalSchemaDoc && /ld\+json/i.test(autoHtml)) {
               universalSchemaDoc = extractUniversalSchemaOrg(autoHtml, autoFinalUrl, htmlFragToMd);
             }
             if (checkPromptInjection && /ld\+json/i.test(autoHtml)) {
@@ -12693,7 +11853,7 @@ export async function executeScrapeCall(params: {
 
   // Tier 3 (Phase 2 v2.7.8): Distill same-origin `200 OK` `application/json` XHR/Fetch payloads captured during CDP rendering!
   const cdpJsonDistilled =
-    Array.isArray(item.capturedJson) && item.capturedJson.length > 0
+    !hasCustomContentScoping && Array.isArray(item.capturedJson) && item.capturedJson.length > 0
       ? distillCapturedJsonResponses(item.capturedJson, finalUrl)
       : null;
 
@@ -12706,6 +11866,7 @@ export async function executeScrapeCall(params: {
   const goCompanionMd =
     discoverLlmsTxt &&
     !needsLiveHtml &&
+    !hasCustomContentScoping &&
     renderMode !== 'always' &&
     itemLlmsMeta?.usedCompanionMd === true &&
     typeof item.markdown === 'string' &&
@@ -12715,7 +11876,7 @@ export async function executeScrapeCall(params: {
       : undefined;
 
   const ghBlobTarget =
-    isHtmlBody && !goCompanionMd && !needsLiveHtml && renderMode !== 'always' ? parseGitHubBlobRawTarget(finalUrl) : null;
+    isHtmlBody && !goCompanionMd && !needsLiveHtml && !hasCustomContentScoping && renderMode !== 'always' ? parseGitHubBlobRawTarget(finalUrl) : null;
   if (goCompanionMd) {
     alternateMarkdownBody = redactPii ? redactPiiText(goCompanionMd) : goCompanionMd;
     if (typeof itemLlmsMeta?.companionMdUrl === 'string' && itemLlmsMeta.companionMdUrl) {
@@ -12752,7 +11913,7 @@ export async function executeScrapeCall(params: {
     } catch {
       // Fall back to HTML extraction if raw.githubusercontent.com fetch fails.
     }
-  } else if (isHtmlBody && discoverLlmsTxt && extracted?.markdownAlternateUrl && !needsLiveHtml && renderMode !== 'always') {
+  } else if (isHtmlBody && discoverLlmsTxt && extracted?.markdownAlternateUrl && !needsLiveHtml && !hasCustomContentScoping && renderMode !== 'always') {
     try {
       const altUrl = new URL(extracted.markdownAlternateUrl);
       const baseHost = new URL(finalUrl).hostname.toLowerCase();
@@ -12875,9 +12036,10 @@ export async function executeScrapeCall(params: {
   }
 
   // P4: Extract structured schema.org `JobPosting` JSON-LD on HTML pages and surface key facts (pay, workplace, location) at the top.
-  const htmlJobPosting: StructuredJobPosting | null = isHtmlBody
-    ? extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '')
-    : null;
+  const htmlJobPosting: StructuredJobPosting | null =
+    !hasCustomContentScoping && isHtmlBody
+      ? extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '')
+      : null;
 
   let markdown = isOriginMarkdown
     ? rawBodyStr
@@ -12998,6 +12160,7 @@ export async function executeScrapeCall(params: {
   const bodyWordsBeforeRescue = countTextWords(rawCleanMarkdown);
   const metaDescWords = prelimDescription ? countTextWords(prelimDescription) : 0;
   if (
+    !hasCustomContentScoping &&
     isHtmlBody &&
     !isPdfResponse &&
     !customShopifyDoc &&
@@ -13602,8 +12765,32 @@ export async function executeScrapeCall(params: {
   if (extractorIdOut) {
     setActiveSpanAttribute('edgefetch.adapter_id', extractorIdOut, activeTracer ?? undefined);
   }
-  const adapterRecordsOut = customShopifyDoc?.records ?? extracted?.records ?? nonEmptyUniversalRecords;
-  const adapterPaginationOut = customShopifyDoc?.pagination ?? extracted?.pagination;
+  const rawAdapterRecords = customShopifyDoc?.records ?? extracted?.records ?? nonEmptyUniversalRecords;
+  const urlSafeAdapterRecords = rawAdapterRecords !== undefined ? sanitizeRecordUrlsDeep(rawAdapterRecords) : undefined;
+  const adapterRecordsOut =
+    urlSafeAdapterRecords !== undefined
+      ? redactPii
+        ? redactPiiDeep(urlSafeAdapterRecords)
+        : urlSafeAdapterRecords
+      : undefined;
+  const rawAdapterPagination = customShopifyDoc?.pagination ?? extracted?.pagination;
+  const adapterPaginationOut =
+    rawAdapterPagination !== undefined ? (redactPii ? redactPiiDeep(rawAdapterPagination) : rawAdapterPagination) : undefined;
+  const safeUniversalStructuredOut =
+    universalStructuredOut !== undefined
+      ? redactPii
+        ? redactPiiDeep(sanitizeRecordUrlsDeep(universalStructuredOut))
+        : sanitizeRecordUrlsDeep(universalStructuredOut)
+      : undefined;
+  const safeHtmlJobPosting = htmlJobPosting
+    ? redactPii
+      ? redactPiiDeep(sanitizeRecordUrlsDeep(htmlJobPosting))
+      : sanitizeRecordUrlsDeep(htmlJobPosting)
+    : null;
+  const safeProductOut = productOut ? (redactPii ? redactPiiDeep(productOut) : productOut) : null;
+  const safeAttributesOut = attributesOut ? (redactPii ? redactPiiDeep(attributesOut) : attributesOut) : undefined;
+  const safeStructuredJsonOut = structuredJsonOut ? (redactPii ? redactPiiDeep(structuredJsonOut) : structuredJsonOut) : undefined;
+  const safeSummaryOut = summaryOut !== undefined ? (redactPii ? redactPiiText(summaryOut) : summaryOut) : undefined;
   const adapterTotalOut =
     customShopifyDoc?.total ??
     extracted?.total ??
@@ -13630,8 +12817,9 @@ export async function executeScrapeCall(params: {
     cmsTwinDoc?.nextCursor ??
     ssrHydrated?.nextCursor ??
     cdpJsonDistilled?.nextCursor;
+  const rawResolvedAuthor = customShopifyDoc?.author ?? extracted?.author ?? universalSchemaDoc?.author;
   const resolvedAuthor = sanitizeScrapedMetadataField(
-    customShopifyDoc?.author ?? extracted?.author ?? universalSchemaDoc?.author,
+    rawResolvedAuthor ? (redactPii ? redactPiiText(rawResolvedAuthor) : rawResolvedAuthor) : undefined,
     256,
   );
   const resolvedPublishedTime = sanitizeScrapedTimestampField(
@@ -13646,8 +12834,9 @@ export async function executeScrapeCall(params: {
     cmsTwinDoc?.modifiedTime ?? extracted?.modifiedTime ?? universalSchemaDoc?.modifiedTime,
     128,
   );
+  const rawResolvedSiteName = extracted?.siteName ?? htmlJobPosting?.hiringOrganization ?? universalSchemaDoc?.siteName;
   const resolvedSiteName = sanitizeScrapedMetadataField(
-    extracted?.siteName ?? htmlJobPosting?.hiringOrganization ?? universalSchemaDoc?.siteName,
+    rawResolvedSiteName ? (redactPii ? redactPiiText(rawResolvedSiteName) : rawResolvedSiteName) : undefined,
     256,
   );
 
@@ -13730,8 +12919,8 @@ export async function executeScrapeCall(params: {
     ...(resolvedFavicon ? { favicon: resolvedFavicon } : {}),
     ...(resolvedContentType ? { contentType: resolvedContentType } : {}),
     ...(scrapeWarnings.length > 0 ? { warnings: scrapeWarnings } : {}),
-    ...(htmlJobPosting ? { jobPosting: htmlJobPosting } : {}),
-    ...(universalStructuredOut ? { structured: universalStructuredOut } : {}),
+    ...(safeHtmlJobPosting ? { jobPosting: safeHtmlJobPosting } : {}),
+    ...(safeUniversalStructuredOut ? { structured: safeUniversalStructuredOut } : {}),
     ...(adapterRecordsOut !== undefined ? { records: adapterRecordsOut } : {}),
     ...(adapterPaginationOut !== undefined ? { pagination: adapterPaginationOut } : {}),
     ...(adapterTotalOut !== undefined ? { total: adapterTotalOut } : {}),
@@ -13743,17 +12932,17 @@ export async function executeScrapeCall(params: {
     ...(markdownArtifactId ? { markdownArtifactId } : {}),
     ...(stringFormats.has('markdown') ? { markdown } : {}),
     ...(stringFormats.has('text') ? { text: textOut } : {}),
-    ...(summaryOut !== undefined ? { summary: summaryOut } : {}),
-    ...(productOut ? { product: productOut } : {}),
-    ...(attributesOut ? { attributes: attributesOut } : {}),
+    ...(safeSummaryOut !== undefined ? { summary: safeSummaryOut } : {}),
+    ...(safeProductOut ? { product: safeProductOut } : {}),
+    ...(safeAttributesOut ? { attributes: safeAttributesOut } : {}),
     ...(rawBase64Out ? { rawBase64: rawBase64Out } : {}),
     ...(pdfPagesArray ? { pages: pdfPagesArray } : {}),
     ...(actionOutputsObj && Object.keys(actionOutputsObj).length > 0 ? { actions: actionOutputsObj } : {}),
     ...(focused.queryFiltered
-      ? { queryFiltered: true, chunks: focused.chunks }
+      ? { queryFiltered: true, chunks: redactPii ? redactPiiDeep(focused.chunks) : focused.chunks }
       : jsonRecordsFormatted
         ? {
-            chunks: jsonRecordsFormatted.chunks,
+            chunks: redactPii ? redactPiiDeep(jsonRecordsFormatted.chunks) : jsonRecordsFormatted.chunks,
             recordCount: jsonRecordsFormatted.matchedRecords,
             totalRecords: jsonRecordsFormatted.totalRecords,
           }
@@ -13801,7 +12990,7 @@ export async function executeScrapeCall(params: {
           })(),
         }
       : {}),
-    ...(structuredJsonOut ? { json: structuredJsonOut } : {}),
+    ...(safeStructuredJsonOut ? { json: safeStructuredJsonOut } : {}),
     ...(jsonExtractionModeOut ? { jsonExtractionMode: jsonExtractionModeOut } : {}),
     ...(typeof item.screenshotBase64 === 'string' && item.screenshotBase64
       ? {

@@ -15,6 +15,7 @@
  */
 
 import { hasRawOrEncodedUnicodeTagLinear, isJsonLdScriptAttrLinear } from './extractors/utils';
+import { getActiveCallerAuthContext } from './oauth';
 import { getActiveRequestTracer, type RequestTracer, type TraceContext } from './otel';
 import { compileSafeUserRegex, replaceHtmlTagBlocksLinear, stripHtmlTagsQuoteAwareLinear } from './safe-input';
 import { neutralizeAllUnsafeMarkdownLinksLinear } from './scrape-advanced';
@@ -5173,6 +5174,8 @@ const OFFICIAL_COMPANY_CAREER_DOMAINS: Readonly<Record<string, readonly string[]
   huggingface: ['huggingface.co'],
   paloaltonetworks: ['paloaltonetworks.com'],
   scaleai: ['scale.com'],
+  fly: ['fly.io'],
+  linear: ['linear.app'],
 };
 
 const CENTRALNIC_PRIVATE_SUFFIXES = new Set([
@@ -5556,9 +5559,9 @@ function matchesFirstPartyDomainAgainstToken(
 
   // 1. Official known corporate / career domain mapping (`about.google`, `metacareers.com`, `amazon.jobs`, `datadoghq.com`, etc.)
   const officialDomains = OFFICIAL_COMPANY_CAREER_DOMAINS[tok];
-  if (officialDomains && officialDomains.some((d) => registrableDomain === d || hostname === d || hostname.endsWith(`.${d}`))) {
-    // Guard multi-tenant sub-brands like `github.com` / `linkedin.com` under `microsoft` so `linkedin.com` stays blocked above
-    return true;
+  if (officialDomains) {
+    // When official registrable domains are known for `tok`, accept ONLY those exact registrable domains (never cross-TLD `stripe.io`, `cloudflare.ai`, etc.!)
+    return officialDomains.some((d) => registrableDomain === d || hostname === d || hostname.endsWith(`.${d}`));
   }
 
   // 2. Brand TLD (`about.google` -> tld `google`, `jobs.apple` -> tld `apple`, `careers.microsoft` -> tld `microsoft`)
@@ -5570,12 +5573,12 @@ function matchesFirstPartyDomainAgainstToken(
     return true;
   }
 
-  // 3. Exact registrable joined token (`flyio` <-> `fly.io`, `linearapp` <-> `linear.app`) or exact SLD on a vetted corporate/ccTLD
+  // 3. Exact registrable joined token (`flyio` <-> `fly.io`, `linearapp` <-> `linear.app`) or exact SLD strictly on `.com` (P3-5: NEVER arbitrary cross-TLDs!)
   if (joinedRegistrable === tok) return true;
-  if (sld === tok && isVettedTld) return true;
+  if (sld === tok && tld === 'com' && isVettedTld) return true;
 
-  // 4. Verified multi-word hyphenated domain (`palo-alto-networks.com` <-> `paloaltonetworks`, NEVER `st-ripe.com` or `stripe-careers.com`!)
-  if (sld.includes('-') && isVettedTld) {
+  // 4. Verified multi-word hyphenated domain (`palo-alto-networks.com` <-> `paloaltonetworks`, NEVER `st-ripe.com` or `stripe-careers.com` or cross-TLD!)
+  if (sld.includes('-') && tld === 'com' && isVettedTld) {
     const parts = sld.split('-').filter(Boolean);
     return isVerifiedMultiWordHyphenJoin(parts, tok, opts?.rawCompany, opts?.segmentedTokens);
   }
@@ -5782,16 +5785,15 @@ export function matchesAllowedCompanyOrDomain(
   }
 
   // 2. Explicit first-party registrable domain match (`careers.stripe.com` for `stripe.com`, `jobs.netflix.com` for `netflix.com`, `about.google`)
+  // P3-5: When explicit domains were provided (`domains: ["acme.io"]`), non-ATS / non-curated URLs MUST match ONLY the exact
+  // allowed registrable domain (and subdomains of it like `careers.acme.io`) — NEVER falling through to `acme.<other-tld>`!
   if (!isMultiTenantAts && !isCuratedPublicFeed && explicitAllowedRegistrableDomains.size > 0) {
     const hostInfo = extractRegistrableBrandInfo(host);
-    if (
+    return Boolean(
       hostInfo &&
-      (explicitAllowedRegistrableDomains.has(hostInfo.registrableDomain) ||
-        [...explicitAllowedRegistrableDomains].some((d) => host === d || host.endsWith(`.${d}`)))
-    ) {
-      // First-party company domain verified: accept WITHOUT requiring `job.company` to repeat the company name!
-      return true;
-    }
+        (explicitAllowedRegistrableDomains.has(hostInfo.registrableDomain) ||
+          [...explicitAllowedRegistrableDomains].some((d) => host === d || host.endsWith(`.${d}`))),
+    );
   }
 
   let checked = 0;
@@ -5909,7 +5911,7 @@ function cloneJobsScrapeResponse(res: JobsScrapeResponse): JobsScrapeResponse {
   };
 }
 
-function buildJobsScrapeCacheKey(args: Record<string, unknown>): string | null {
+function buildJobsScrapeCacheKey(args: Record<string, unknown>, callerCacheScope = 'public|public'): string | null {
   const rawUrl = typeof args.url === 'string' ? args.url.trim() : '';
   if (!rawUrl.startsWith('https://')) return null;
   let canonicalUrl = rawUrl;
@@ -5946,7 +5948,7 @@ function buildJobsScrapeCacheKey(args: Record<string, unknown>): string | null {
   const fmts = Array.isArray(args.formats) ? [...(args.formats as string[])].sort().join(',') : 'markdown';
   const siteKey = typeof args.site === 'string' ? args.site.trim().toLowerCase() : '';
   const targetKey = typeof args.target === 'string' ? args.target.trim().toLowerCase() : '';
-  return `${canonicalUrl}|${fmts}|${targetKey}|${siteKey}`;
+  return `${callerCacheScope}|${canonicalUrl}|${fmts}|${targetKey}|${siteKey}`;
 }
 
 function readJobsScrapeCache(partition: JobsCachePartition, key: string, now = Date.now()): JobsScrapeResponse | null {
@@ -6303,9 +6305,19 @@ export async function executeJobsCall(params: {
   env: OptionalStorageBindings & Record<string, unknown>;
   executeSearch: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
   executeScrape: (args: Record<string, unknown>) => Promise<{ status: number; body: Record<string, unknown> }>;
+  userId?: string;
+  authTier?: string;
   tracer?: RequestTracer | TraceContext;
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const activeTracer = getActiveRequestTracer(params.tracer);
+  const activeCallerCtx = getActiveCallerAuthContext();
+  const resolvedCallerId = (params.userId ?? activeCallerCtx?.userId ?? '').trim() || 'public';
+  const resolvedAuthTier = (
+    params.authTier ??
+    activeCallerCtx?.role ??
+    (resolvedCallerId === 'owner' ? 'owner' : resolvedCallerId === 'public' ? 'public' : 'member')
+  ).trim();
+  const callerCacheScope = `${resolvedAuthTier}|${resolvedCallerId}`;
   const runJobs = async (): Promise<{ status: number; body: Record<string, unknown> }> => {
   const { payload, env } = params;
   const rawExecuteSearch = params.executeSearch;
@@ -6356,7 +6368,7 @@ export async function executeJobsCall(params: {
   const executeScrape = async (
     args: Record<string, unknown>,
   ): Promise<{ status: number; body: Record<string, unknown> }> => {
-    const cacheKey = args.noCache === true ? null : buildJobsScrapeCacheKey(args);
+    const cacheKey = args.noCache === true ? null : buildJobsScrapeCacheKey(args, callerCacheScope);
     if (cacheKey) {
       const cached = readJobsScrapeCache(cachePartition, cacheKey);
       if (cached) return cached;
@@ -7778,9 +7790,6 @@ export async function executeJobsCall(params: {
   }
   for (const dom of domainsInput) {
     allowedCompanyTokens.add(dom);
-    for (const expanded of expandCompanyFilterTokens(dom)) {
-      allowedCompanyTokens.add(expanded);
-    }
   }
   for (const db of discoveredBoards) {
     const isVerifiedFirstPartyLink =

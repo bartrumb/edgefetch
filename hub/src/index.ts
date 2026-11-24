@@ -103,6 +103,7 @@ import { discoverMcps } from './mcp-registry';
 import {
   createSqliteMcpVaultStore,
   MCP_VAULT_SQLITE_SCHEMA,
+  parseAllowedMcpTools,
   resolveCallerUserId,
   type McpVaultStore,
   type PendingMcpOAuthStateRow,
@@ -822,6 +823,14 @@ export class AgentHubDO extends DurableObject<Env> {
   async vaultUpsertServer(row: StoredMcpServerRow): Promise<void> {
     await this.mcpVault.upsertServer(row);
   }
+  async vaultResealServerSecret(
+    params: Parameters<NonNullable<McpVaultStore['resealServerSecret']>>[0],
+  ): Promise<boolean> {
+    if (typeof this.mcpVault.resealServerSecret === 'function') {
+      return await this.mcpVault.resealServerSecret(params);
+    }
+    return false;
+  }
   async vaultDeleteServer(userId: string, slug: string): Promise<boolean> {
     return await this.mcpVault.deleteServer(userId, slug);
   }
@@ -985,6 +994,12 @@ function hubMcpVaultStore(hub: () => DurableObjectStub<AgentHubDO>): McpVaultSto
     upsertServer: async (row) => {
       const stub = hub() as unknown as Partial<AgentHubDO>;
       if (typeof stub.vaultUpsertServer === 'function') await stub.vaultUpsertServer(row);
+    },
+    resealServerSecret: async (params) => {
+      const stub = hub() as unknown as Partial<AgentHubDO>;
+      return typeof stub.vaultResealServerSecret === 'function'
+        ? await stub.vaultResealServerSecret(params)
+        : false;
     },
     deleteServer: async (userId, slug) => {
       const stub = hub() as unknown as Partial<AgentHubDO>;
@@ -1715,6 +1730,19 @@ export default {
                   message: 'Scope mcp:call is required to route scrape through connected MCP servers.',
                 },
               };
+            }
+            if (hasAllowedMcpToolsArg) {
+              const parsedAllowed = parseAllowedMcpTools(cleanArgs.allowedMcpTools);
+              if (!parsedAllowed.ok) {
+                return {
+                  status: 400,
+                  body: {
+                    ok: false,
+                    error: parsedAllowed.error,
+                    message: parsedAllowed.message,
+                  },
+                };
+              }
             }
             const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
               inFlightScrapesByUser,
@@ -2603,6 +2631,19 @@ export default {
               },
               { status: 403, headers: { 'cache-control': 'no-store' } },
             );
+          }
+          if (hasScrapeAllowedMcpTools) {
+            const parsedAllowed = parseAllowedMcpTools(cleanScrapeObj.allowedMcpTools);
+            if (!parsedAllowed.ok) {
+              return Response.json(
+                {
+                  ok: false,
+                  error: parsedAllowed.error,
+                  message: parsedAllowed.message,
+                },
+                { status: 400, headers: { 'cache-control': 'no-store' } },
+              );
+            }
           }
           const releaseScrapeSlot = tryAcquireUserConcurrencySlot(
             inFlightScrapesByUser,

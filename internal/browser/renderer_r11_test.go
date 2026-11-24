@@ -756,6 +756,24 @@ func TestR11M4FullPageScreenshotClampingAndErrorPropagation(t *testing.T) {
 }
 
 func TestR11M4CDPOversizedReplyIsolationOnPipeAndWebSocket(t *testing.T) {
+	// Direct chunk-boundary & escape edge cases for cdpStreamingIDScanner fast-forward path.
+	{
+		raw := `  {"longTopKeyWith\"Escapes\\": "val\\\"id\":777\\\\", "result":{"id":888,"s":"a\"b\\c"},"i\u0064":111,"id" : 4242}`
+		for step := 1; step <= 17; step += 4 {
+			var sc cdpStreamingIDScanner
+			for off := 0; off < len(raw); off += step {
+				end := off + step
+				if end > len(raw) {
+					end = len(raw)
+				}
+				sc.feed([]byte(raw[off:end]))
+			}
+			if got := sc.resultID(); got != 4242 {
+				t.Fatalf("cdpStreamingIDScanner step=%d expected id=4242, got %d", step, got)
+			}
+		}
+	}
+
 	bigPayloadLen := maxCDPFrameBytes + (2 << 20) // 26 MiB > 24 MiB cap
 	bigPad := strings.Repeat("X", bigPayloadLen)
 

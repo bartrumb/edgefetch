@@ -1040,3 +1040,76 @@ test('Round 11 Stream 5 [P3-2 & P3-5]: Wikipedia quota bucket non-eviction + que
   assert.equal(matchesAllowedCompanyOrDomain(mkJob('Stripe', 'https://stripe.io/jobs/1'), new Set(['stripe']), []), false);
   assert.equal(matchesAllowedCompanyOrDomain(mkJob('Stripe', 'https://stripe.ai/jobs/1'), new Set(['stripe']), []), false);
 });
+
+test('R11-M5-portable: LocalAgentHubCoordinator preserves grantId and increments rotation_counter when upgrading pre-v2.7.5 refresh token', async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'ef-r11-m5-portable-'));
+  const coordinator = new LocalAgentHubCoordinator(join(tmpDir, 'hub.sqlite'));
+  const SESSION_SECRET = 'r11-m5-portable-session-secret-0123456789abcdef';
+  const now = Date.now();
+  try {
+    const ns = coordinator.asNamespace();
+    const stub = ns.get(ns.idFromName('global')) as unknown as {
+      oauthPutClient(c: Parameters<OAuthStore['putClient']>[0]): Promise<void> | void;
+      oauthPutTokenPair(p: Parameters<OAuthStore['putTokenPair']>[0]): Promise<void> | void;
+      oauthRevokeGrant(id: string, userId?: string): Promise<boolean> | boolean;
+      oauthGetRefreshTokenLineageHint?: (h: string, now: number) => unknown;
+    };
+    assert.equal(typeof stub.oauthGetRefreshTokenLineageHint, 'function');
+
+    await stub.oauthPutClient({
+      clientId: 'ef_client_portable_m5',
+      clientName: 'Portable M5 Client',
+      redirectUris: ['http://127.0.0.1:8910/cb'],
+      tokenEndpointAuthMethod: 'none',
+      createdAt: now,
+    });
+
+    const legacyOpaqueRefresh = 'efr_legacy_pre_275_opaque_token_portable_12345';
+    const legacyRefreshHash = await sha256Base64Url(legacyOpaqueRefresh);
+    await stub.oauthPutTokenPair({
+      grantId: 'grant_original_portable_1234',
+      accessHash: await sha256Base64Url('efa_legacy_access_portable_12345'),
+      refreshHash: legacyRefreshHash,
+      clientId: 'ef_client_portable_m5',
+      clientName: 'Portable M5 Client',
+      scopes: ['mcp:read'],
+      resource: 'https://hub.example.com/mcp',
+      userId: 'owner',
+      userRole: 'owner',
+      createdAt: now - 10_000,
+      accessExpiresAt: now + 3_600_000,
+      refreshExpiresAt: now + 86_400_000,
+    });
+    // Simulate 5 prior pre-v2.7.5 rotations directly in SQLite (`rotation_counter = 5`) before Portable Hub upgrade!
+    const rawDb = new DatabaseSync(join(tmpDir, 'hub.sqlite'));
+    rawDb.prepare('UPDATE oauth_tokens SET rotation_counter = 5 WHERE token_hash = ?').run(legacyRefreshHash);
+    rawDb.close();
+
+    const env = {
+      AGENT_HUB: ns,
+      ADMIN_SESSION_SECRET: SESSION_SECRET,
+      CALLER_TOKEN: 'owner-caller-token-portable-m5-0123456789',
+    };
+    const res = await (hubWorker as { fetch(r: Request, e: unknown): Promise<Response> }).fetch(
+      new Request('https://hub.example.com/oauth/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: legacyOpaqueRefresh,
+          client_id: 'ef_client_portable_m5',
+        }).toString(),
+      }),
+      env,
+    );
+    assert.equal(res.status, 200);
+    const tokJson = (await res.json()) as { refresh_token: string };
+    assert.match(tokJson.refresh_token, /^efr_grant_original_portable_1234\.6\./);
+
+    const revoked = await stub.oauthRevokeGrant('grant_original_portable_1234', 'owner');
+    assert.equal(revoked, true, 'Original grantId must remain revocable after Portable Hub legacy refresh upgrade');
+  } finally {
+    coordinator.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

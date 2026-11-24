@@ -941,6 +941,8 @@ export class LocalAgentHubCoordinator {
       oauthPutTokenPair: (p: Parameters<OAuthStore['putTokenPair']>[0]) => this.oauth.putTokenPair(p),
       oauthGetAccessToken: (h: string, now: number) => this.oauth.getAccessToken(h, now),
       oauthConsumeRefreshToken: (h: string, now: number) => this.oauth.consumeRefreshToken(h, now),
+      oauthGetRefreshTokenLineageHint: (h: string, now: number) =>
+        this.oauth.getRefreshTokenLineageHint?.(h, now) ?? null,
       oauthRotateRefreshToken: (p: RotateRefreshParams) => this.oauth.rotateRefreshToken(p),
       oauthListGrants: (now: number, userId?: string) => this.oauth.listGrants(now, userId),
       oauthRevokeGrant: (id: string, userId?: string) => this.oauth.revokeGrant(id, userId),
@@ -959,6 +961,8 @@ export class LocalAgentHubCoordinator {
       vaultListServers: (userId: string) => this.mcpVault.listServers(userId),
       vaultGetServer: (userId: string, slugOrDomain: string) => this.mcpVault.getServer(userId, slugOrDomain),
       vaultUpsertServer: (row: StoredMcpServerRow) => this.mcpVault.upsertServer(row),
+      vaultResealServerSecret: (params: Parameters<NonNullable<McpVaultStore['resealServerSecret']>>[0]) =>
+        this.mcpVault.resealServerSecret ? this.mcpVault.resealServerSecret(params) : false,
       vaultDeleteServer: (userId: string, slug: string) => this.mcpVault.deleteServer(userId, slug),
       vaultPutOAuthState: (row: PendingMcpOAuthStateRow) => this.mcpVault.putOAuthState(row),
       vaultConsumeOAuthState: (stateHash: string, userId: string, now: number) =>

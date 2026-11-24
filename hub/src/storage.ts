@@ -1133,8 +1133,10 @@ async function getOrSanitizeCachedMarkdownForBytes(
     }
   }
   const rawMd = SHARED_UTF8_DECODER.decode(rawBytes);
-  const cleanMd = alreadySanitized ? rawMd : sanitizeFullMarkdownDocumentForArtifact(rawMd);
-  const cleanByteLen = alreadySanitized ? rawBytes.byteLength : SHARED_UTF8_ENCODER.encode(cleanMd).byteLength;
+  const normalizedAlreadySanitized = alreadySanitized && rawMd.includes('\r') ? rawMd.replace(/\r\n?/g, '\n') : rawMd;
+  const cleanMd = alreadySanitized ? normalizedAlreadySanitized : sanitizeFullMarkdownDocumentForArtifact(rawMd);
+  const cleanByteLen =
+    alreadySanitized && cleanMd === rawMd ? rawBytes.byteLength : SHARED_UTF8_ENCODER.encode(cleanMd).byteLength;
   return upsertSanitizedMarkdownCache(scope, docKey, rawSha256, cleanMd, cleanByteLen);
 }
 

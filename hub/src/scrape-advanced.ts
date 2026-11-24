@@ -1452,7 +1452,7 @@ export function recognizeAndHardenMarkdownFences(
     const cr = preserveCrLf && rawWithCr.endsWith('\r') ? '\r' : '';
     const raw = cr ? rawWithCr.slice(0, -1) : rawWithCr;
 
-    if (li === 0 && skipSepNl && raw.length === 0 && !state.inFence) {
+    if (li === 0 && skipSepNl && !state.inFence) {
       outLines.push(rawWithCr);
       continue;
     }
@@ -1632,7 +1632,9 @@ export function sanitizeMarkdownPageSlice(
       const nl = fullMd.indexOf('\n', pos);
       const lineEnd = nl === -1 ? fullMd.length : nl;
       const nextPos = nl === -1 ? fullMd.length + 1 : nl + 1;
-      const rawLine = lineEnd > pos && fullMd.charCodeAt(lineEnd - 1) === 13 ? fullMd.slice(pos, lineEnd - 1) : fullMd.slice(pos, lineEnd);
+      const hasCrBeforeLf = lineEnd > pos && fullMd.charCodeAt(lineEnd - 1) === 13;
+      const contentEnd = hasCrBeforeLf ? lineEnd - 1 : lineEnd;
+      const rawLine = fullMd.slice(pos, contentEnd);
       const containsOffset = clampedOffset >= pos && clampedOffset <= lineEnd;
 
       if (!containsOffset) {
@@ -1648,14 +1650,15 @@ export function sanitizeMarkdownPageSlice(
       if (stepRes.kind === 'open_trusted') {
         forceLeadingNewlineForConcat = true;
         if (clampedOffset > pos) {
+          const rLen = Math.max(state.fenceLen, state.effectiveFenceLen);
           if (firstSliceNl >= 0) {
             reconstructed = reconstructed.slice(firstSliceNl + 1);
             initialReopenedFence = {
               ch: state.fenceChar as '`' | '~',
-              len: state.fenceLen,
+              len: rLen,
             };
           } else {
-            reconstructed = `\n${state.fenceChar.repeat(state.fenceLen)}\n${state.fenceChar.repeat(state.fenceLen)}`;
+            reconstructed = `\n${state.fenceChar.repeat(rLen)}\n${state.fenceChar.repeat(rLen)}`;
           }
         } else {
           sliceInitialState = stateBeforeLine;
@@ -1668,31 +1671,65 @@ export function sanitizeMarkdownPageSlice(
         );
         reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
         sliceInitialState = cloneMarkdownFenceRecognizerState(state);
+        skipLeadingSeparatorEmptyLine = true;
       } else if (stateBeforeLine.inFence && stepRes.kind === 'in_trusted') {
         forceLeadingNewlineForConcat = true;
         initialReopenedFence = {
           ch: state.fenceChar as '`' | '~',
-          len: state.fenceLen,
+          len: Math.max(state.fenceLen, state.effectiveFenceLen),
         };
       } else if (clampedOffset === pos) {
         sliceInitialState = stateBeforeLine;
-      } else if (clampedOffset === lineEnd && rawSlice.startsWith('\n')) {
+      } else if (
+        (clampedOffset === lineEnd && rawSlice.startsWith('\n')) ||
+        (hasCrBeforeLf && clampedOffset === contentEnd && rawSlice.startsWith('\r\n'))
+      ) {
         sliceInitialState = cloneMarkdownFenceRecognizerState(state);
         skipLeadingSeparatorEmptyLine = true;
       } else {
         const firstHead = firstSliceNl >= 0 ? reconstructed.slice(0, firstSliceNl) : reconstructed;
-        const escapedFirst = firstHead
+        const firstHeadCr = firstHead.endsWith('\r') ? '\r' : '';
+        const firstHeadBody = firstHeadCr ? firstHead.slice(0, -1) : firstHead;
+        let escapedBody = firstHeadBody
           .replace(/^([ \t]*)([`~]{3,})/, (_m, ws: string, ticks: string) =>
             `${ws}${ticks.split('').map((ch) => `\\${ch}`).join('')}`,
           )
           .replace(/^([ \t]*)(?:([-+*])|(\d{1,9})([.)]))(?=[ \t]|$)/, (_m, ws: string, ul?: string, digits?: string, delim?: string) =>
             ul ? `${ws}\\${ul}` : `${ws}${digits}\\${delim}`,
-          );
+          )
+          .replace(/^([ \t]*)>/, '$1\\>');
+        const leadSpacesMatch = /^ {0,3}(?=\[)/.exec(escapedBody);
+        if (leadSpacesMatch) {
+          const bIdx = leadSpacesMatch[0].length;
+          const tail = escapedBody.slice(bIdx);
+          const qLimit = Math.min(tail.length, 1024);
+          let closeIdx = -1;
+          for (let q = 1; q < qLimit; q++) {
+            const qc = tail.charCodeAt(q);
+            if (qc === 92) {
+              q++;
+              continue;
+            }
+            if (qc === 93) {
+              closeIdx = q;
+              break;
+            }
+          }
+          if (closeIdx < 0 && tail.length < 1024) {
+            escapedBody = `${escapedBody.slice(0, bIdx)}\\${tail}`;
+          } else if (
+            closeIdx >= 0 &&
+            closeIdx + 1 < tail.length &&
+            tail.charCodeAt(closeIdx + 1) === 58 &&
+            isAsciiSpaceOrTabOnly(tail, closeIdx + 2)
+          ) {
+            escapedBody = `${escapedBody.slice(0, bIdx)}${tail.slice(0, closeIdx + 1)}\\${tail.slice(closeIdx + 1)}`;
+          }
+        }
+        const escapedFirst = `${escapedBody}${firstHeadCr}`;
         reconstructed = firstSliceNl >= 0 ? `${escapedFirst}${reconstructed.slice(firstSliceNl)}` : escapedFirst;
-        sliceInitialState = {
-          ...stateBeforeLine,
-          prevLineWasAsciiBlank: false,
-        };
+        sliceInitialState = cloneMarkdownFenceRecognizerState(state);
+        skipLeadingSeparatorEmptyLine = true;
       }
       break;
     }

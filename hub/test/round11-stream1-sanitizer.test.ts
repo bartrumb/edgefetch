@@ -471,3 +471,46 @@ test('R11-P3-1: URL fields in records[] percent-encode (, ), [, ], <, >', () => 
   assert.equal(schemaDoc.records[1]!.url, 'https://example.com/q?%28x%29=%5By%5D&k=%3Cz%3E');
   assert.equal(schemaDoc.markdown.includes('(https://example.com/docs/fn(a,b)'), false);
 });
+
+test('R11-S2: sanitizeMarkdownPageSlice preserves container & non-blank state across mid-container, trailing-ws, and CRLF offsets', async () => {
+  const docList = '- item\n\n  ```html\n  <x-probe>\n  [click](javascript:void(0))\n  ```';
+  for (let off = 0; off < docList.indexOf('<x-probe>'); off++) {
+    const out = sanitizeMarkdownPageSlice(docList, off, docList.slice(off), false);
+    assert.equal(out.includes('<x-probe>'), false, `raw <x-probe> survived docList at offset=${off}: ${JSON.stringify(out)}`);
+    assert.equal(out.includes('javascript:'), false, `javascript: survived docList at offset=${off}: ${JSON.stringify(out)}`);
+  }
+
+  const docCrlf = 'hello\r\n```html\r\n<x-probe>\r\n[click](javascript:void(0))\r\n```';
+  for (let off = 0; off < docCrlf.indexOf('<x-probe>'); off++) {
+    const out = sanitizeMarkdownPageSlice(docCrlf, off, docCrlf.slice(off), false);
+    assert.equal(out.includes('<x-probe>'), false, `raw <x-probe> survived docCrlf at offset=${off}: ${JSON.stringify(out)}`);
+    assert.equal(out.includes('javascript:'), false, `javascript: survived docCrlf at offset=${off}: ${JSON.stringify(out)}`);
+  }
+
+  const docTrailingWs = 'hello   \n```html\n<x-probe>\n[click](javascript:void(0))\n```';
+  for (let off = 0; off < docTrailingWs.indexOf('<x-probe>'); off++) {
+    const out = sanitizeMarkdownPageSlice(docTrailingWs, off, docTrailingWs.slice(off), false);
+    assert.equal(out.includes('<x-probe>'), false, `raw <x-probe> survived docTrailingWs at offset=${off}: ${JSON.stringify(out)}`);
+    assert.equal(out.includes('javascript:'), false, `javascript: survived docTrailingWs at offset=${off}: ${JSON.stringify(out)}`);
+  }
+
+  // Verify `readArtifactPage` normalizes `\r\n` even when cached R2 derived object reports current `pipelineVersion`
+  const r2 = new MemoryR2Bucket();
+  const sha = createHash('sha256').update('r11-s2-crlf-artifact').digest('hex');
+  await r2.put(r2DerivedKey(SCRAPE_PIPELINE_VERSION, 'markdown', sha), 'hello\r\n```html\r\n<x-probe>\r\n```', {
+    httpMetadata: { contentType: 'text/markdown; charset=utf-8' },
+    customMetadata: { pipelineVersion: String(SCRAPE_PIPELINE_VERSION) },
+  });
+  const page = await readArtifactPage({
+    bucket: r2 as unknown as R2Bucket,
+    blobSha256: `md:${sha}`,
+    format: 'markdown',
+    offset: 5,
+    limit: 200,
+  });
+  assert.equal(page.ok, true);
+  if (page.ok) {
+    assert.equal(page.page.content.includes('\r'), false, `CRLF survived readArtifactPage: ${JSON.stringify(page.page.content)}`);
+    assert.equal(page.page.content.includes('<x-probe>'), false, `raw <x-probe> survived CRLF readArtifactPage: ${JSON.stringify(page.page.content)}`);
+  }
+});

@@ -1557,6 +1557,7 @@ export async function startOrExecuteAgentCall(params: {
             };
           }
           if (actionRaw === 'list_connected') {
+            touchedConnectedMcp = true;
             record.visibility = 'private';
             record.userId = effectiveUserId;
             const summaries = userConnectedMcps.map((s) => toPublicMcpServerSummary(s));
@@ -1612,6 +1613,7 @@ export async function startOrExecuteAgentCall(params: {
           const canonicalAllowedServer = allowedConnectorsById.get(resolvedVaultRow.id)!;
 
           if (actionRaw === 'list_tools') {
+            touchedConnectedMcp = true;
             record.visibility = 'private';
             record.userId = effectiveUserId;
             return {
@@ -2175,7 +2177,19 @@ export async function startOrExecuteAgentCall(params: {
         const detSynthTracer = getLoopTracer();
         const runDeterministicSynthesis = async (synthSpan?: ActiveSpanHandle) => {
           const combinedMd = gatheredEvidence
-            .map((e) => `### [${e.title ?? e.url}](${e.url})\n\n${e.markdown.slice(0, 3_500)}`)
+            .map((e) => {
+              const safeTitle = e.fromMcp
+                ? sanitizeMcpMarkdownOutput(sanitizeRemoteMcpText(e.title ?? e.url, 200).text, undefined, 200)
+                : (e.title ?? e.url);
+              const safeBody = e.fromMcp
+                ? wrapConnectorTextForAgentContext(e.markdown, 3_500, {
+                    source: e.url,
+                    ...(e.mcpServer ? { server: e.mcpServer } : {}),
+                    ...(e.mcpTool && isSafeMcpIdentifier(e.mcpTool) ? { tool: e.mcpTool } : {}),
+                  })
+                : e.markdown.slice(0, 3_500);
+              return `### [${safeTitle}](${e.url})\n\n${safeBody}`;
+            })
             .join('\n\n---\n\n');
           record.markdown = combinedMd;
           if (schema) {

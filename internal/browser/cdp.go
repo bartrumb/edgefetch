@@ -64,7 +64,8 @@ func (s *cdpStreamingIDScanner) feed(chunk []byte) {
 	if s.invalid || s.found {
 		return
 	}
-	for _, b := range chunk {
+	for i := 0; i < len(chunk); i++ {
+		b := chunk[i]
 		if !s.started {
 			if b == ' ' || b == '\t' || b == '\r' || b == '\n' {
 				continue
@@ -85,6 +86,24 @@ func (s *cdpStreamingIDScanner) feed(chunk []byte) {
 				if s.capturingKey && s.keyLen < len(s.keyBuf) {
 					s.keyLen = len(s.keyBuf)
 				}
+				continue
+			}
+			if !s.capturingKey || s.keyLen == len(s.keyBuf) {
+				sub := chunk[i:]
+				qIdx := bytes.IndexByte(sub, '"')
+				bIdx := bytes.IndexByte(sub, '\\')
+				if qIdx < 0 && bIdx < 0 {
+					return
+				}
+				if bIdx >= 0 && (qIdx < 0 || bIdx < qIdx) {
+					s.esc = true
+					i += bIdx
+					continue
+				}
+				s.inStr = false
+				s.capturingKey = false
+				s.expectKey = false
+				i += qIdx
 				continue
 			}
 			if b == '\\' {

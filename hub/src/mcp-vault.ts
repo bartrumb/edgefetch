@@ -31,7 +31,104 @@ export function isSafeMcpIdentifier(raw: string): boolean {
   if (!raw || !SAFE_MCP_IDENTIFIER_RE.test(raw) || FORBIDDEN_MCP_IDENTIFIERS.has(raw)) {
     return false;
   }
+  if (raw.includes('__')) {
+    return false;
+  }
   return !PROMPT_INJECTION_MCP_ID_RE.test(raw);
+}
+
+export const SAFE_MCP_CONNECTOR_SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
+
+export function isValidMcpConnectorSlug(raw: string): boolean {
+  if (!raw || typeof raw !== 'string') return false;
+  if (!SAFE_MCP_CONNECTOR_SLUG_RE.test(raw) || raw.includes('__')) {
+    return false;
+  }
+  return isSafeMcpIdentifier(raw);
+}
+
+export function normalizeMcpConnectorSlug(rawName: string): string {
+  const base = slugifyMcpServerName(rawName)
+    .replace(/__+/g, '-')
+    .replace(/^[-_]+|[-_]+$/g, '');
+  const candidate = (base || 'mcp-server').slice(0, 48).replace(/[-_]+$/g, '') || 'mcp-server';
+  return isValidMcpConnectorSlug(candidate) ? candidate : 'mcp-server';
+}
+
+export function parseAllowedMcpTools(
+  raw: unknown,
+): { ok: true; allowed: Set<string> } | { ok: false; error: 'invalid_allowed_mcp_tools'; message: string } {
+  if (raw === undefined || raw === null) {
+    return { ok: true, allowed: new Set() };
+  }
+  const items: unknown[] | null =
+    raw instanceof Set ? [...raw] : Array.isArray(raw) ? raw : null;
+  if (!items) {
+    return {
+      ok: false,
+      error: 'invalid_allowed_mcp_tools',
+      message: 'allowedMcpTools must be an array of exact "<slug>/<tool>" strings.',
+    };
+  }
+  if (items.length > 128) {
+    return {
+      ok: false,
+      error: 'invalid_allowed_mcp_tools',
+      message: 'allowedMcpTools exceeds maximum of 128 entries.',
+    };
+  }
+  const allowed = new Set<string>();
+  for (const entry of items) {
+    if (typeof entry !== 'string') {
+      return {
+        ok: false,
+        error: 'invalid_allowed_mcp_tools',
+        message: 'Every allowedMcpTools entry must be a "<slug>/<tool>" string.',
+      };
+    }
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.length > 113 || trimmed.includes('*') || trimmed.includes('__')) {
+      return {
+        ok: false,
+        error: 'invalid_allowed_mcp_tools',
+        message: `Invalid allowedMcpTools entry "${trimmed}": wildcards and "__" are forbidden; expected exact "<slug>/<tool>".`,
+      };
+    }
+    const parts = trimmed.split('/');
+    if (parts.length !== 2) {
+      return {
+        ok: false,
+        error: 'invalid_allowed_mcp_tools',
+        message: `Invalid allowedMcpTools entry "${trimmed}": expected exact "<slug>/<tool>" format.`,
+      };
+    }
+    const slug = parts[0]!;
+    const tool = parts[1]!;
+    if (!isValidMcpConnectorSlug(slug) || !isSafeMcpIdentifier(tool)) {
+      return {
+        ok: false,
+        error: 'invalid_allowed_mcp_tools',
+        message: `Invalid allowedMcpTools entry "${trimmed}": "<slug>" and "<tool>" must be safe MCP identifiers without "__".`,
+      };
+    }
+    allowed.add(`${slug}/${tool}`);
+  }
+  return { ok: true, allowed };
+}
+
+export function isCachedMcpToolPermitted(
+  serverSlug: string,
+  tool: CachedMcpToolSchema,
+  allowedMcpTools?: ReadonlySet<string>,
+): boolean {
+  const cleanSlug = serverSlug.trim().toLowerCase();
+  if (!isValidMcpConnectorSlug(cleanSlug) || !isSafeMcpIdentifier(tool.name)) {
+    return false;
+  }
+  if (tool.readOnlyHint === true && tool.destructiveHint !== true) {
+    return true;
+  }
+  return Boolean(allowedMcpTools?.has(`${cleanSlug}/${tool.name}`));
 }
 
 export const MCP_OAUTH_STATE_TTL_MS = 10 * 60_000; // 10m single-use PKCE state lifetime
@@ -185,11 +282,12 @@ export interface PendingMcpOAuthStateRow {
 
 export interface McpVaultStore {
   listServers(userId: string): Promise<StoredMcpServerRow[]> | StoredMcpServerRow[];
-  getServer(userId: string, slugOrDomain: string): Promise<StoredMcpServerRow | null> | StoredMcpServerRow | null;
+  getServer(userId: string, slugOrId: string): Promise<StoredMcpServerRow | null> | StoredMcpServerRow | null;
   upsertServer(row: StoredMcpServerRow): Promise<void> | void;
   resealServerSecret?(params: {
     id: string;
     userId: string;
+    expectedEncryptedCredentials?: string;
     encryptedCredentials: string;
     secretVersion: number;
     updatedAt: number;
@@ -401,6 +499,7 @@ const VAULT_CREDENTIALS_PURPOSE_V2 = 'user_mcp_servers:credentials:v2';
 const VAULT_PKCE_STATE_PURPOSE_V2 = 'mcp_oauth_states:pkce:v2';
 
 function buildVaultV2RowBoundAad(params: {
+  envelopeVersion: 'v2';
   userId: string;
   canonicalOrigin: string;
   serverId: string;
@@ -410,7 +509,7 @@ function buildVaultV2RowBoundAad(params: {
   const cleanSlug = params.slug.trim().toLowerCase();
   const cleanAuthType = params.authType.trim().toLowerCase();
   const encoded = [
-    'v2|user_mcp_servers:credentials',
+    `${params.envelopeVersion}|user_mcp_servers:credentials`,
     `${params.userId.length}:${params.userId}`,
     `${params.canonicalOrigin.length}:${params.canonicalOrigin}`,
     `${params.serverId.length}:${params.serverId}`,
@@ -420,9 +519,20 @@ function buildVaultV2RowBoundAad(params: {
   return new TextEncoder().encode(encoded);
 }
 
+function buildVaultV2OriginBoundAad(params: {
+  envelopeVersion: 'v2';
+  userId: string;
+  canonicalOrigin: string;
+}): Uint8Array {
+  return new TextEncoder().encode(
+    `${params.envelopeVersion}|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${params.canonicalOrigin.length}:${params.canonicalOrigin}`,
+  );
+}
+
 /**
  * Encrypts a `VaultSecretPayload` using `HKDF-SHA256` + `AES-256-GCM` with 96-bit random IV,
- * explicit `v2.` version header, and table/purpose/row-bound length-prefixed AAD (`userId`, `remoteOrigin`, `id`, `slug`, `authType`).
+ * explicit `v2.` version header authenticated inside AES-GCM AAD, and table/purpose/row-bound length-prefixed AAD
+ * (`userId`, `remoteOrigin`, `id`, `slug`, `authType`).
  */
 export async function sealVaultCredentials(params: {
   vaultMasterKey: string | undefined;
@@ -435,7 +545,12 @@ export async function sealVaultCredentials(params: {
   payload: VaultSecretPayload;
 }): Promise<
   | { ok: true; ciphertext: string; secretVersion: number }
-  | { ok: false; status: 503; error: 'vault_master_key_unconfigured'; message: string }
+  | {
+      ok: false;
+      status: 400 | 503;
+      error: 'vault_master_key_unconfigured' | 'invalid_slug';
+      message: string;
+    }
 > {
   const keyCheck = validateVaultMasterKey(params.vaultMasterKey);
   if (!keyCheck.ok) return keyCheck;
@@ -443,8 +558,17 @@ export async function sealVaultCredentials(params: {
   const canonicalOrigin = params.remoteOrigin.trim().toLowerCase();
   const rowId = (params.id ?? params.serverId ?? '').trim();
   const rowSlug = (params.slug ?? '').trim().toLowerCase();
+  if (rowSlug && !isValidMcpConnectorSlug(rowSlug)) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'invalid_slug',
+      message: 'Connector slug must be 1..48 lowercase [a-z0-9_-] characters and must not contain "__".',
+    };
+  }
   const rowAuthType = (params.authType ?? '').trim().toLowerCase();
   const hasRowBinding = Boolean(rowId && rowSlug && rowAuthType);
+  const envelopeVersion = 'v2' as const;
 
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit GCM IV
@@ -458,15 +582,18 @@ export async function sealVaultCredentials(params: {
 
   const aad = hasRowBinding
     ? buildVaultV2RowBoundAad({
+        envelopeVersion,
         userId: params.userId,
         canonicalOrigin,
         serverId: rowId,
         slug: rowSlug,
         authType: rowAuthType,
       })
-    : new TextEncoder().encode(
-        `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
-      );
+    : buildVaultV2OriginBoundAad({
+        envelopeVersion,
+        userId: params.userId,
+        canonicalOrigin,
+      });
   const plaintext = new TextEncoder().encode(
     JSON.stringify({
       ...params.payload,
@@ -489,18 +616,19 @@ export async function sealVaultCredentials(params: {
 
   return {
     ok: true,
-    ciphertext: `v2.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(encryptedBuf))}`,
+    ciphertext: `${envelopeVersion}.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(encryptedBuf))}`,
     secretVersion: hasRowBinding ? 2 : 1,
   };
 }
 
-function parseEnvelopeHeader(ciphertext: string): { version: string; saltB64: string; ivB64: string; ctB64: string } | null {
+function parseEnvelopeHeader(ciphertext: string): { version: 'v2' | 'v1'; saltB64: string; ivB64: string; ctB64: string } | null {
   if (!ciphertext || typeof ciphertext !== 'string') return null;
-  const normalized = ciphertext.startsWith('v2:') ? `v2.${ciphertext.slice(3)}` : ciphertext;
-  const parts = normalized.split('.');
+  const parts = ciphertext.split('.');
   if (parts.length !== 4) return null;
+  const ver = parts[0];
+  if (ver !== 'v2' && ver !== 'v1') return null;
   return {
-    version: parts[0]!,
+    version: ver,
     saltB64: parts[1]!,
     ivB64: parts[2]!,
     ctB64: parts[3]!,
@@ -564,7 +692,15 @@ export async function unsealVaultCredentials(params: {
   const hasFullRowBinding = Boolean(rowId && rowSlug && rowAuthType);
   const secretVersion = typeof params.secretVersion === 'number' ? params.secretVersion : undefined;
 
-  // P6 Downgrade Prevention: when external `secret_version >= 2`, NEVER fall back to v1 or 2-field AAD!
+  // P6 & M8 Downgrade Prevention: when external `secret_version >= 2`, NEVER fall back to v1 or 2-field AAD,
+  // and reject unknown future `secret_version > 2` rather than treating it as v2!
+  if (secretVersion !== undefined && secretVersion > 2) {
+    return {
+      ok: false,
+      error: 'vault_decryption_failed',
+      message: `Unsupported vault secret_version ${secretVersion}`,
+    };
+  }
   if (secretVersion !== undefined && secretVersion >= 2) {
     if (envHeader.version !== 'v2') {
       return {
@@ -601,6 +737,7 @@ export async function unsealVaultCredentials(params: {
     if (hasFullRowBinding) {
       try {
         const aad5 = buildVaultV2RowBoundAad({
+          envelopeVersion: envHeader.version,
           userId: params.userId,
           canonicalOrigin,
           serverId: rowId,
@@ -622,11 +759,13 @@ export async function unsealVaultCredentials(params: {
           };
         }
         try {
-          const aad2 = new TextEncoder().encode(
-            `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
-          );
+          const aad2 = buildVaultV2OriginBoundAad({
+            envelopeVersion: envHeader.version,
+            userId: params.userId,
+            canonicalOrigin,
+          });
           plainBuf = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad2, tagLength: 128 },
+            { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad2 as BufferSource, tagLength: 128 },
             aesKey,
             ct as BufferSource,
           );
@@ -641,11 +780,13 @@ export async function unsealVaultCredentials(params: {
       }
     } else {
       try {
-        const aad2 = new TextEncoder().encode(
-          `v2|user_mcp_servers:credentials|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
-        );
+        const aad2 = buildVaultV2OriginBoundAad({
+          envelopeVersion: envHeader.version,
+          userId: params.userId,
+          canonicalOrigin,
+        });
         plainBuf = await crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad2, tagLength: 128 },
+          { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad2 as BufferSource, tagLength: 128 },
           aesKey,
           ct as BufferSource,
         );
@@ -801,7 +942,7 @@ async function unsealPkceStateBlob(params: {
   ciphertext: string;
 }): Promise<Record<string, unknown> | null> {
   const parts = params.ciphertext.split('.');
-  if (parts.length !== 4 || (parts[0] !== 'pkce2' && parts[0] !== 'v1')) return null;
+  if (parts.length !== 4 || parts[0] !== 'pkce2') return null;
   const version = parts[0];
   const salt = base64UrlToBytes(parts[1]!);
   const iv = base64UrlToBytes(parts[2]!);
@@ -814,12 +955,10 @@ async function unsealPkceStateBlob(params: {
       salt,
       userId: params.userId,
       remoteOrigin: canonicalOrigin,
-      purpose: version === 'pkce2' ? VAULT_PKCE_STATE_PURPOSE_V2 : 'pkce-state',
+      purpose: VAULT_PKCE_STATE_PURPOSE_V2,
     });
     const aad = new TextEncoder().encode(
-      version === 'pkce2'
-        ? `pkce2|mcp_oauth_states:pkce|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`
-        : `${params.userId}|pkce|${canonicalOrigin}`,
+      `${version}|mcp_oauth_states:pkce|${params.userId.length}:${params.userId}|${canonicalOrigin.length}:${canonicalOrigin}`,
     );
     const plain = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad, tagLength: 128 },
@@ -832,7 +971,7 @@ async function unsealPkceStateBlob(params: {
       typeof parsed !== 'object' ||
       Array.isArray(parsed) ||
       typeof parsed.codeVerifier !== 'string' ||
-      (version === 'pkce2' && parsed.purpose !== 'mcp_oauth_states:pkce')
+      parsed.purpose !== 'mcp_oauth_states:pkce'
     ) {
       return null;
     }
@@ -1134,42 +1273,28 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
         .toArray();
       return rows.map(parseStoredRow);
     },
-    getServer(userId, slugOrDomain) {
+    getServer(userId, slugOrId) {
       ensureTables();
       const uid = userId.trim() || 'owner';
-      const needle = slugOrDomain.trim().toLowerCase();
-      if (!needle) return null;
+      const needle = slugOrId.trim().toLowerCase();
+      if (!needle || needle.includes('__')) return null;
       const direct = sql
         .exec<Record<string, unknown>>(
-          'SELECT * FROM user_mcp_servers WHERE user_id = ? AND (slug = ? OR LOWER(id) = ?) LIMIT 1',
+          'SELECT * FROM user_mcp_servers WHERE user_id = ? AND (LOWER(slug) = ? OR LOWER(id) = ?) LIMIT 1',
           uid,
           needle,
           needle,
         )
         .toArray()[0];
-      if (direct) return parseStoredRow(direct);
-
-      const all = this.listServers(uid) as StoredMcpServerRow[];
-      const cleanHost = needle.replace(/^https?:\/\//, '').split('/')[0]!.replace(/^www\./, '');
-      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(cleanHost)) {
-        return null;
-      }
-      return (
-        all.find((s) => {
-          if (s.remoteOrigin.replace(/^https:\/\//, '') === cleanHost) return true;
-          if (!s.autoRouteScrape) return false;
-          return s.domains.some((rawDom) => {
-            const validDom = validateConnectorDomains([rawDom], s.remoteOrigin, true);
-            if (!validDom.ok || validDom.domains.length === 0) return false;
-            const d = validDom.domains[0]!;
-            return cleanHost === d || cleanHost.endsWith(`.${d}`);
-          });
-        }) ?? null
-      );
+      return direct ? parseStoredRow(direct) : null;
     },
     upsertServer(row) {
       ensureTables();
       const uid = row.userId.trim() || 'owner';
+      const cleanSlug = row.slug.trim().toLowerCase();
+      if (!isValidMcpConnectorSlug(cleanSlug)) {
+        throw new Error(`Invalid MCP connector slug "${row.slug}": must match /^[a-z0-9][a-z0-9_-]{0,47}$/ without "__"`);
+      }
       const safeTools = filterSafeCachedMcpTools(row.cachedTools);
       const safeToolCount = Array.isArray(row.cachedTools) && row.cachedTools.length > 0 ? safeTools.length : row.toolCount;
       const secretVersion =
@@ -1182,7 +1307,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
            SELECT id FROM user_mcp_servers WHERE user_id = ? ORDER BY updated_at DESC LIMIT -1 OFFSET ?
          )`,
         uid,
-        row.slug,
+        cleanSlug,
         uid,
         MAX_VAULT_SERVERS_PER_USER - 1,
       );
@@ -1211,7 +1336,7 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
            updated_at = excluded.updated_at`,
         row.id,
         uid,
-        row.slug,
+        cleanSlug,
         row.name,
         row.remoteUrl,
         row.remoteOrigin,
@@ -1234,19 +1359,24 @@ export function createSqliteMcpVaultStore(sql: SqlStorageLike): McpVaultStore {
     resealServerSecret(p) {
       ensureTables();
       const uid = p.userId.trim() || 'owner';
+      if (!p.expectedEncryptedCredentials || typeof p.expectedEncryptedCredentials !== 'string') {
+        return false;
+      }
       const updated = sql
         .exec<{ id: string }>(
           `UPDATE user_mcp_servers
               SET encrypted_credentials = ?,
                   secret_version = ?,
                   updated_at = ?
-            WHERE id = ? AND user_id = ?
+            WHERE user_id = ? AND id = ? AND encrypted_credentials = ? AND secret_version <= ?
             RETURNING id`,
           p.encryptedCredentials,
           p.secretVersion,
           p.updatedAt,
-          p.id,
           uid,
+          p.id,
+          p.expectedEncryptedCredentials,
+          p.secretVersion,
         )
         .toArray();
       return updated.length > 0;
@@ -1349,48 +1479,32 @@ export function createMemoryMcpVaultStore(): McpVaultStore {
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .map((s) => structuredClone(s));
     },
-    getServer(userId, slugOrDomain) {
+    getServer(userId, slugOrId) {
       const uid = userId.trim() || 'owner';
-      const needle = slugOrDomain.trim().toLowerCase();
+      const needle = slugOrId.trim().toLowerCase();
+      if (!needle || needle.includes('__')) return null;
       const direct = servers.get(keyOf(uid, needle));
       if (direct) return structuredClone(direct);
       for (const s of servers.values()) {
-        if (s.userId === uid && s.id.toLowerCase() === needle) {
+        if (s.userId === uid && (s.slug.toLowerCase() === needle || s.id.toLowerCase() === needle)) {
           return structuredClone(s);
-        }
-      }
-      const cleanHost = needle.replace(/^https?:\/\//, '').split('/')[0]!.replace(/^www\./, '');
-      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(cleanHost)) {
-        return null;
-      }
-      for (const s of servers.values()) {
-        if (s.userId !== uid) continue;
-        if (s.remoteOrigin.replace(/^https:\/\//, '') === cleanHost) {
-          return structuredClone(s);
-        }
-        if (s.autoRouteScrape) {
-          const matchedDom = s.domains.some((rawDom) => {
-            const validDom = validateConnectorDomains([rawDom], s.remoteOrigin, true);
-            if (!validDom.ok || validDom.domains.length === 0) return false;
-            const d = validDom.domains[0]!;
-            return cleanHost === d || cleanHost.endsWith(`.${d}`);
-          });
-          if (matchedDom) {
-            return structuredClone(s);
-          }
         }
       }
       return null;
     },
     upsertServer(row) {
       const uid = row.userId.trim() || 'owner';
+      const cleanSlug = row.slug.trim().toLowerCase();
+      if (!isValidMcpConnectorSlug(cleanSlug)) {
+        throw new Error(`Invalid MCP connector slug "${row.slug}": must match /^[a-z0-9][a-z0-9_-]{0,47}$/ without "__"`);
+      }
       const safeTools = filterSafeCachedMcpTools(row.cachedTools);
       const safeToolCount = Array.isArray(row.cachedTools) && row.cachedTools.length > 0 ? safeTools.length : row.toolCount;
       const secretVersion =
         typeof row.secretVersion === 'number' && Number.isInteger(row.secretVersion) && row.secretVersion >= 1
           ? row.secretVersion
           : 1;
-      const userRows = [...servers.entries()].filter(([, v]) => v.userId === uid && v.slug.toLowerCase() !== row.slug.toLowerCase());
+      const userRows = [...servers.entries()].filter(([, v]) => v.userId === uid && v.slug.toLowerCase() !== cleanSlug);
       if (userRows.length >= MAX_VAULT_SERVERS_PER_USER) {
         userRows.sort((a, b) => a[1].updatedAt - b[1].updatedAt);
         for (let i = 0; i <= userRows.length - MAX_VAULT_SERVERS_PER_USER; i++) {
@@ -1398,14 +1512,22 @@ export function createMemoryMcpVaultStore(): McpVaultStore {
         }
       }
       servers.set(
-        keyOf(uid, row.slug),
-        structuredClone({ ...row, userId: uid, secretVersion, cachedTools: safeTools, toolCount: safeToolCount }),
+        keyOf(uid, cleanSlug),
+        structuredClone({ ...row, slug: cleanSlug, userId: uid, secretVersion, cachedTools: safeTools, toolCount: safeToolCount }),
       );
     },
     resealServerSecret(p) {
       const uid = p.userId.trim() || 'owner';
+      if (!p.expectedEncryptedCredentials || typeof p.expectedEncryptedCredentials !== 'string') {
+        return false;
+      }
       for (const [k, s] of servers.entries()) {
-        if (s.id === p.id && s.userId === uid) {
+        if (
+          s.id === p.id &&
+          s.userId === uid &&
+          s.encryptedCredentials === p.expectedEncryptedCredentials &&
+          (s.secretVersion ?? 1) <= p.secretVersion
+        ) {
           servers.set(k, {
             ...s,
             encryptedCredentials: p.encryptedCredentials,
@@ -1784,6 +1906,30 @@ export async function startDownstreamMcpOAuth(params: {
     return { ok: false, status: 400, error: 'invalid_confirmed_auth_origin', message: confirmedCheck.reason };
   }
 
+  const cleanName = stripMcpSmugglingChars(params.name ?? '').trim().slice(0, 120) || urlCheck.url.hostname;
+  let slug: string;
+  if (typeof params.slug === 'string' && params.slug.trim()) {
+    const rawExplicitSlug = params.slug.trim().toLowerCase();
+    if (params.slug.includes('__') || !isValidMcpConnectorSlug(rawExplicitSlug)) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'invalid_slug',
+        message: 'Connector slug must be 1..48 lowercase [a-z0-9_-] characters and must not contain "__".',
+      };
+    }
+    slug = rawExplicitSlug;
+  } else {
+    slug = normalizeMcpConnectorSlug(cleanName);
+  }
+
+  const autoRouteScrape = params.autoRouteScrape === true;
+  const domValidation = validateConnectorDomains(params.domains, urlCheck.origin, autoRouteScrape);
+  if (!domValidation.ok) {
+    return { ok: false, status: 400, error: 'invalid_domains', message: domValidation.error };
+  }
+  const domains = domValidation.domains;
+
   const fetchFn = params.fetchFn ?? fetch;
   const meta = await probeRemoteMcpOAuthMetadata({
     remoteUrl: urlCheck.normalized,
@@ -1846,21 +1992,11 @@ export async function startDownstreamMcpOAuth(params: {
     clientId = `${params.hubOrigin.replace(/\/+$/, '')}/.well-known/edgefetch-bot.json`;
   }
 
-  const autoRouteScrape = params.autoRouteScrape === true;
-  const domValidation = validateConnectorDomains(params.domains, urlCheck.origin, autoRouteScrape);
-  if (!domValidation.ok) {
-    return { ok: false, status: 400, error: 'invalid_domains', message: domValidation.error };
-  }
-
   const codeVerifier = randomBase64Url(32);
   const codeChallenge = await sha256Base64Url(codeVerifier);
   const state = randomBase64Url(32);
   const stateHash = await sha256Base64Url(state);
   const bindCookieValue = await computeMcpOAuthBindHmac(keyCheck.key, params.userId, state, params.sessionCsrf);
-
-  const cleanName = stripMcpSmugglingChars(params.name ?? '').trim().slice(0, 120) || urlCheck.url.hostname;
-  const slug = slugifyMcpServerName(params.slug?.trim() || cleanName);
-  const domains = domValidation.domains;
   const canonicalResource = meta.resource ?? urlCheck.normalized;
 
   const effectiveConfirmedAuthOrigin =

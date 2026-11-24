@@ -13,6 +13,7 @@ import {
   computeMarkdownSliceCheckpoints,
   sanitizeFullMarkdownDocumentForArtifact,
   sanitizeMarkdownPageSlice,
+  stripInvisibleSmugglingChars,
   type MarkdownSliceCheckpoint,
 } from './scrape-advanced';
 import { listConfiguredSpaFallbacks, type SpaFallbackEnv, type SpaFallbackProvider } from './spa-fallback';
@@ -1133,8 +1134,15 @@ async function getOrSanitizeCachedMarkdownForBytes(
     }
   }
   const rawMd = SHARED_UTF8_DECODER.decode(rawBytes);
-  const cleanMd = alreadySanitized ? rawMd : sanitizeFullMarkdownDocumentForArtifact(rawMd);
-  const cleanByteLen = alreadySanitized ? rawBytes.byteLength : SHARED_UTF8_ENCODER.encode(cleanMd).byteLength;
+  const preClean = alreadySanitized
+    ? stripInvisibleSmugglingChars(rawMd.replace(/\0/g, '')).replace(/\r\n?/g, '\n')
+    : rawMd;
+  const cleanMd =
+    alreadySanitized && !preClean.includes('```') && !preClean.includes('~~~')
+      ? preClean
+      : sanitizeFullMarkdownDocumentForArtifact(preClean);
+  const cleanByteLen =
+    alreadySanitized && cleanMd === rawMd ? rawBytes.byteLength : SHARED_UTF8_ENCODER.encode(cleanMd).byteLength;
   return upsertSanitizedMarkdownCache(scope, docKey, rawSha256, cleanMd, cleanByteLen);
 }
 

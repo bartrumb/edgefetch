@@ -596,7 +596,8 @@ func TestRetainedSessionCrossOriginBounceTaintsStep2HeadersWhenTrackerBlockingAc
 		t.Fatal("expected retained SessionID from Step 1")
 	}
 
-	// Step 2: Resumes SessionID WITH sensitive custom header -> MUST withhold X-Secret because Step 1 bounced cross-origin!
+	// Step 2: Resumes SessionID WITH sensitive custom header and no navigation target -> MUST either reject fail-closed
+	// (`canReuseActiveHeadersWithoutNavigation`) OR withhold X-Secret because Step 1 bounced cross-origin!
 	_, err = r.Execute(context.Background(), Task{
 		SessionID:    step1Out.SessionID,
 		CloseSession: true,
@@ -604,8 +605,8 @@ func TestRetainedSessionCrossOriginBounceTaintsStep2HeadersWhenTrackerBlockingAc
 		WaitSelector: "#step2-trigger",
 		WaitForMs:    10,
 	})
-	if err != nil {
-		t.Fatalf("Step 2 Execute failed: %v", err)
+	if err != nil && !strings.Contains(err.Error(), "cannot attach custom headers") {
+		t.Fatalf("Step 2 Execute failed with unexpected error: %v", err)
 	}
 
 	mu.Lock()

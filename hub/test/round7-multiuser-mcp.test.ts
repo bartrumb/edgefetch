@@ -604,8 +604,10 @@ test('R7-H3: Downstream tools/list >16 KiB rejected before truncation, recursive
     encryptedCredentials: sealed.ciphertext,
     authSummary: { authMode: 'bearer', headerNames: ['Authorization'], maskedBadge: 'Bearer' },
     domains: ['echo.example'],
-    cachedTools: [],
-    toolCount: 0,
+    cachedTools: [
+      { name: 'ping', description: 'Ping', inputSchema: { type: 'object', properties: {} }, readOnlyHint: true },
+    ],
+    toolCount: 1,
     enabled: true,
     lastVerifiedAt: null,
     lastError: null,

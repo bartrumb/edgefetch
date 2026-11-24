@@ -19,7 +19,10 @@ import { isJsonDepthWithinLimit, isSafePublicHttpsUrl, stripMcpSmugglingChars } 
 import {
   buildMaskedAuthSummary,
   filterSafeCachedMcpTools,
+  isCachedMcpToolPermitted,
   isSafeMcpIdentifier,
+  isValidMcpConnectorSlug,
+  parseAllowedMcpTools,
   SAFE_MCP_IDENTIFIER_RE,
   sealVaultCredentials,
   toPublicMcpServerSummary,
@@ -54,12 +57,12 @@ const MCP_DIRECTIVE_INJECTION_RE =
 const DANGEROUS_MARKDOWN_SCHEME_RE = /^(?:javascript|vbscript|data|file|blob)\s*:/i;
 
 /**
- * Neutralizes any `<untrusted_mcp...` / `</untrusted_mcp...` XML boundary tags inside untrusted connector text
+ * Neutralizes any `<untrusted_...` / `</untrusted_...` XML boundary tags inside untrusted connector text
  * so an adversarial response can never close or spoof an `<untrusted_mcp_output>` / `<untrusted_mcp_tool_output>` wrapper.
  */
 export function neutralizeUntrustedMcpBoundaryTags(input: string): string {
-  if (!input || !/untrusted_mcp/i.test(input)) return input;
-  return input.replace(/<(\s*\/?\s*untrusted_mcp)/gi, '&lt;$1');
+  if (!input || !/untrusted_/i.test(input)) return input;
+  return input.replace(/<(\s*\/?\s*untrusted_[a-z0-9_-]*)/gi, '&lt;$1');
 }
 
 /**
@@ -288,6 +291,79 @@ export const MAX_STRUCTURED_SANITIZE_DEPTH = 12;
 export const MAX_STRUCTURED_CONTAINER_ENTRIES = 256;
 export const MAX_STRUCTURED_NODE_BUDGET = 2_048;
 export const MAX_STRUCTURED_STRING_CHARS = 16 * 1024; // 16 KiB per string leaf
+export const MAX_MCP_RPC_ERROR_DATA_BYTES = 4 * 1024; // 4 KiB hard ceiling on JSON-RPC error.data
+export const MAX_MCP_RPC_ERROR_DATA_DEPTH = 4;
+export const MAX_MCP_RPC_ERROR_DATA_ENTRIES = 16;
+export const MAX_MCP_RPC_ERROR_DATA_NODES = 64;
+export const MAX_MCP_RPC_ERROR_DATA_STRING_CHARS = 512;
+
+/**
+ * Early-aborting O(maxBytes) serialized JSON size estimator with cycle detection.
+ * Stops traversing immediately as soon as the estimated serialized byte/char size exceeds `maxBytes`,
+ * preventing multi-megabyte `structuredContent` or `error.data` trees from burning CPU in `JSON.stringify`
+ * or recursive sanitization before hitting the size budget.
+ */
+export function measureJsonSizeCapped(rawValue: unknown, maxBytes: number): number {
+  let acc = 0;
+  const seen = new WeakSet<object>();
+
+  const visit = (node: unknown): void => {
+    if (acc > maxBytes) return;
+    if (node === null || node === undefined) {
+      acc += 4;
+      return;
+    }
+    const t = typeof node;
+    if (t === 'boolean') {
+      acc += (node as boolean) ? 4 : 5;
+      return;
+    }
+    if (t === 'number' || t === 'bigint') {
+      acc += String(node).length;
+      return;
+    }
+    if (t === 'string') {
+      acc += (node as string).length + 2;
+      return;
+    }
+    if (t !== 'object') {
+      acc += 4;
+      return;
+    }
+    const obj = node as object;
+    if (seen.has(obj)) {
+      acc = maxBytes + 1;
+      return;
+    }
+    seen.add(obj);
+    try {
+      if (Array.isArray(obj)) {
+        acc += 2;
+        for (let i = 0; i < obj.length; i++) {
+          if (i > 0) acc += 1;
+          visit(obj[i]);
+          if (acc > maxBytes) return;
+        }
+        return;
+      }
+      acc += 2;
+      let first = true;
+      for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+        if (!first) acc += 1;
+        first = false;
+        acc += k.length + 3;
+        if (acc > maxBytes) return;
+        visit(v);
+        if (acc > maxBytes) return;
+      }
+    } finally {
+      seen.delete(obj);
+    }
+  };
+
+  visit(rawValue);
+  return acc;
+}
 
 export interface SanitizedConnectorTextResult {
   text: string;
@@ -312,7 +388,7 @@ export interface SanitizedConnectorStructuredResult {
 /**
  * Runs the complete connector text sanitization pipeline (`redactVaultSecretsFromText` -> `sanitizeRemoteMcpText`
  * control-char/Bidi/Unicode-Tag/prompt-injection scrubber -> `sanitizeMcpMarkdownOutput` HTML/boundary-tag/link sanitizer)
- * on a single untrusted string.
+ * on a single untrusted string, setting `sanitized` dynamically from actual pipeline completion and post-verification.
  */
 export function sanitizeConnectorText(
   raw: string,
@@ -320,23 +396,46 @@ export function sanitizeConnectorText(
   baseUrl?: string,
   redactSecret?: VaultSecretPayload | null,
 ): SanitizedConnectorTextResult {
+  if (typeof raw !== 'string') {
+    return { text: '', sanitized: false, fullySanitized: false, truncated: false, detected: false, scrubbed: false, triggers: [] };
+  }
   if (!raw) {
     return { text: '', sanitized: true, fullySanitized: true, truncated: false, detected: false, scrubbed: false, triggers: [] };
   }
-  const redacted = redactSecret !== undefined ? redactVaultSecretsFromText(raw, redactSecret) : raw;
-  const truncated = redacted.length > maxChars;
-  const bounded = truncated ? redacted.slice(0, maxChars) : redacted;
-  const piRes = sanitizeRemoteMcpText(bounded, maxChars);
-  const safeMd = sanitizeMcpMarkdownOutput(piRes.text, baseUrl, maxChars);
-  return {
-    text: safeMd,
-    sanitized: true,
-    fullySanitized: !truncated,
-    truncated,
-    detected: piRes.detected,
-    scrubbed: piRes.scrubbed || safeMd !== piRes.text,
-    triggers: piRes.triggers,
-  };
+  if (!Number.isFinite(maxChars) || maxChars <= 0) {
+    return { text: '', sanitized: false, fullySanitized: false, truncated: true, detected: false, scrubbed: false, triggers: [] };
+  }
+  try {
+    const redacted = redactSecret !== undefined ? redactVaultSecretsFromText(raw, redactSecret) : raw;
+    const truncated = redacted.length > maxChars;
+    const bounded = truncated ? redacted.slice(0, maxChars) : redacted;
+    const piRes = sanitizeRemoteMcpText(bounded, maxChars);
+    const safeMd = sanitizeMcpMarkdownOutput(piRes.text, baseUrl, maxChars);
+    const postVerify = detectPromptInjection({
+      markdown: safeMd,
+      ...(safeMd.includes('<') ? { rawHtml: safeMd } : {}),
+    });
+    const completedCleanly = !postVerify.detected && !MCP_DIRECTIVE_INJECTION_RE.test(safeMd);
+    return {
+      text: safeMd,
+      sanitized: completedCleanly,
+      fullySanitized: completedCleanly && !truncated,
+      truncated,
+      detected: piRes.detected || postVerify.detected,
+      scrubbed: piRes.scrubbed || safeMd !== bounded || redacted !== raw,
+      triggers: postVerify.triggers.length > 0 ? [...new Set([...piRes.triggers, ...postVerify.triggers])] : piRes.triggers,
+    };
+  } catch {
+    return {
+      text: '[sanitization_failed]',
+      sanitized: false,
+      fullySanitized: false,
+      truncated: true,
+      detected: false,
+      scrubbed: true,
+      triggers: [],
+    };
+  }
 }
 
 /**
@@ -344,8 +443,9 @@ export function sanitizeConnectorText(
  * `discover_mcps` manifests, and `query_mcp` tool/server metadata):
  *  - Runs the full Markdown + dangerous-link + inline-HTML + control-char + prompt-injection sanitizer on EVERY
  *    string leaf AND object key!
- *  - Caps depth (`<= 12`), keys/items per container (`<= 256`), total visited nodes (`<= 2048`), and string leaf length (`<= 16 KiB`).
- *  - Replaces excess depth/node/entry subtrees with `"[truncated]"` and sets `fullySanitized = false`.
+ *  - Caps depth (`<= 12`), keys/items per container (`<= 256`), total visited nodes (`<= 2048`), string leaf length (`<= 16 KiB`),
+ *    and optional cumulative `maxTotalChars`.
+ *  - Replaces excess depth/node/entry/char subtrees with `"[truncated]"` and sets `fullySanitized = false`.
  */
 export function sanitizeConnectorStructuredValue(
   rawValue: unknown,
@@ -356,16 +456,19 @@ export function sanitizeConnectorStructuredValue(
     maxEntriesPerContainer?: number;
     maxNodeBudget?: number;
     maxStringChars?: number;
+    maxTotalChars?: number;
   },
 ): SanitizedConnectorStructuredResult {
   const maxDepth = opts?.maxDepth ?? MAX_STRUCTURED_SANITIZE_DEPTH;
   const maxEntries = opts?.maxEntriesPerContainer ?? MAX_STRUCTURED_CONTAINER_ENTRIES;
   const maxNodes = opts?.maxNodeBudget ?? MAX_STRUCTURED_NODE_BUDGET;
   const maxStringChars = opts?.maxStringChars ?? MAX_STRUCTURED_STRING_CHARS;
+  const maxTotalChars = opts?.maxTotalChars;
   const baseUrl = opts?.baseUrl;
   const redactSecret = opts?.redactSecret;
 
   let visitedNodes = 0;
+  let totalProcessedChars = 0;
   let allLeavesSanitized = true;
   let truncated = false;
   let anyDetected = false;
@@ -375,7 +478,11 @@ export function sanitizeConnectorStructuredValue(
 
   const walk = (node: unknown, depth: number): unknown => {
     visitedNodes++;
-    if (visitedNodes > maxNodes || depth > maxDepth) {
+    if (
+      visitedNodes > maxNodes ||
+      depth > maxDepth ||
+      (maxTotalChars !== undefined && totalProcessedChars > maxTotalChars)
+    ) {
       truncated = true;
       return '[truncated]';
     }
@@ -387,12 +494,21 @@ export function sanitizeConnectorStructuredValue(
     }
     if (typeof node === 'bigint') {
       const s = sanitizeConnectorText(String(node), 128, baseUrl, redactSecret);
+      totalProcessedChars += s.text.length;
       if (!s.sanitized) allLeavesSanitized = false;
       if (s.truncated) truncated = true;
       return s.text;
     }
     if (typeof node === 'string') {
-      const s = sanitizeConnectorText(node, maxStringChars, baseUrl, redactSecret);
+      const remChars =
+        maxTotalChars !== undefined ? Math.max(0, maxTotalChars - totalProcessedChars) : maxStringChars;
+      if (maxTotalChars !== undefined && remChars === 0 && node.length > 0) {
+        truncated = true;
+        return '[truncated]';
+      }
+      const leafBudget = Math.min(maxStringChars, remChars);
+      const s = sanitizeConnectorText(node, leafBudget, baseUrl, redactSecret);
+      totalProcessedChars += s.text.length;
       if (!s.sanitized) allLeavesSanitized = false;
       if (s.truncated) truncated = true;
       if (s.detected) anyDetected = true;
@@ -401,6 +517,7 @@ export function sanitizeConnectorStructuredValue(
       return s.text;
     }
     if (typeof node !== 'object') {
+      allLeavesSanitized = false;
       return null;
     }
     if (activeAncestors.has(node)) {
@@ -413,7 +530,7 @@ export function sanitizeConnectorStructuredValue(
         const outArr: unknown[] = [];
         const sliceLen = Math.min(node.length, maxEntries);
         for (let i = 0; i < sliceLen; i++) {
-          if (visitedNodes >= maxNodes) {
+          if (visitedNodes >= maxNodes || (maxTotalChars !== undefined && totalProcessedChars >= maxTotalChars)) {
             outArr.push('[truncated]');
             truncated = true;
             return outArr;
@@ -436,12 +553,17 @@ export function sanitizeConnectorStructuredValue(
           anyScrubbed = true;
           continue;
         }
-        if (emitted >= maxEntries || visitedNodes >= maxNodes) {
+        if (
+          emitted >= maxEntries ||
+          visitedNodes >= maxNodes ||
+          (maxTotalChars !== undefined && totalProcessedChars >= maxTotalChars)
+        ) {
           outObj.__truncated__ = '[truncated]';
           truncated = true;
           break;
         }
         const keySan = sanitizeConnectorText(rawK, 256, baseUrl, redactSecret);
+        totalProcessedChars += keySan.text.length;
         if (!keySan.sanitized) allLeavesSanitized = false;
         if (keySan.truncated) truncated = true;
         if (keySan.detected) anyDetected = true;
@@ -464,10 +586,11 @@ export function sanitizeConnectorStructuredValue(
   };
 
   const sanitizedVal = walk(rawValue, 0);
+  const didSanitize = visitedNodes > 0 && allLeavesSanitized;
   return {
     value: sanitizedVal,
-    sanitized: allLeavesSanitized,
-    fullySanitized: allLeavesSanitized && !truncated,
+    sanitized: didSanitize,
+    fullySanitized: didSanitize && !truncated,
     truncated,
     detected: anyDetected,
     scrubbed: anyScrubbed,
@@ -572,7 +695,7 @@ export function rebuildSafeMcpInputSchema(
   if (Array.isArray(src.required)) {
     const reqOut: string[] = [];
     for (const r of src.required.slice(0, 32)) {
-      if (typeof r === 'string' && SAFE_SCHEMA_PROP_KEY_RE.test(r) && (!validPropKeys || validPropKeys.has(r))) {
+      if (typeof r === 'string' && isSafeMcpIdentifier(r) && (!validPropKeys || validPropKeys.has(r))) {
         if (!reqOut.includes(r)) reqOut.push(r);
       }
     }
@@ -983,8 +1106,9 @@ async function refreshDownstreamOAuthIfNeeded(params: {
     payload: updatedSecret,
   });
   if (reSealed.ok) {
+    const latestServer = (await params.vaultStore.getServer(server.userId, server.id)) ?? server;
     await params.vaultStore.upsertServer({
-      ...server,
+      ...latestServer,
       encryptedCredentials: reSealed.ciphertext,
       secretVersion: reSealed.secretVersion,
       authSummary: buildMaskedAuthSummary(updatedSecret),
@@ -1354,11 +1478,46 @@ export interface QueryMcpCallInput {
   tool?: string;
   arguments?: Record<string, unknown>;
   refresh?: boolean;
+  allowedMcpTools?: readonly string[];
 }
 
 export interface QueryMcpCallOutput {
   status: number;
   body: Record<string, unknown>;
+}
+
+/**
+ * Extracts joined Markdown/text from an `executeFederatedMcpQuery` response `body` (`content[]` text/resource blocks,
+ * with fallback to `structuredContent` or legacy `markdown`).
+ */
+export function extractMarkdownFromQueryMcpBody(body: Record<string, unknown>): string {
+  if (typeof body.markdown === 'string' && body.markdown) {
+    return body.markdown;
+  }
+  if (Array.isArray(body.content) && body.content.length > 0) {
+    const parts: string[] = [];
+    for (const rawBlock of body.content) {
+      if (!rawBlock || typeof rawBlock !== 'object') continue;
+      const block = rawBlock as Record<string, unknown>;
+      if (block.type === 'text' && typeof block.text === 'string' && block.text) {
+        parts.push(block.text);
+      } else if (block.type === 'resource' && block.resource && typeof block.resource === 'object') {
+        const r = block.resource as Record<string, unknown>;
+        if (typeof r.text === 'string' && r.text) {
+          parts.push(r.text);
+        }
+      }
+    }
+    if (parts.length > 0) {
+      return parts.join('\n\n');
+    }
+  }
+  if (body.structuredContent !== undefined) {
+    return typeof body.structuredContent === 'string'
+      ? body.structuredContent
+      : (JSON.stringify(body.structuredContent, null, 2) ?? '');
+  }
+  return '';
 }
 
 async function resolveDecryptedServerSecret(params: {
@@ -1370,6 +1529,7 @@ async function resolveDecryptedServerSecret(params: {
   if (!params.server.encryptedCredentials || params.server.authType === 'none') {
     return { ok: true, secret: { kind: 'none', pinnedOrigin: params.server.remoteOrigin } };
   }
+  const previousCiphertext = params.server.encryptedCredentials;
   const unsealed = await unsealVaultCredentials({
     vaultMasterKey: params.vaultMasterKey,
     userId: params.server.userId,
@@ -1379,7 +1539,7 @@ async function resolveDecryptedServerSecret(params: {
     slug: params.server.slug,
     authType: params.server.authType,
     secretVersion: params.server.secretVersion ?? 1,
-    ciphertext: params.server.encryptedCredentials,
+    ciphertext: previousCiphertext,
   });
   if (!unsealed.ok) {
     return {
@@ -1392,24 +1552,33 @@ async function resolveDecryptedServerSecret(params: {
   if (unsealed.resealedCiphertext && params.vaultStore) {
     const rotatedAt = params.now ?? Date.now();
     const nextSecretVer = unsealed.resealedSecretVersion ?? 2;
-    params.server.encryptedCredentials = unsealed.resealedCiphertext;
-    params.server.secretVersion = nextSecretVer;
-    params.server.updatedAt = rotatedAt;
     if (typeof params.vaultStore.resealServerSecret === 'function') {
-      await params.vaultStore.resealServerSecret({
+      const resealedOk = await params.vaultStore.resealServerSecret({
         id: params.server.id,
         userId: params.server.userId,
+        expectedEncryptedCredentials: previousCiphertext,
         encryptedCredentials: unsealed.resealedCiphertext,
         secretVersion: nextSecretVer,
         updatedAt: rotatedAt,
       });
+      if (resealedOk) {
+        params.server.encryptedCredentials = unsealed.resealedCiphertext;
+        params.server.secretVersion = nextSecretVer;
+        params.server.updatedAt = rotatedAt;
+      }
     } else {
-      await params.vaultStore.upsertServer({
-        ...params.server,
-        encryptedCredentials: unsealed.resealedCiphertext,
-        secretVersion: nextSecretVer,
-        updatedAt: rotatedAt,
-      });
+      const current = await params.vaultStore.getServer(params.server.userId, params.server.id);
+      if (current && current.encryptedCredentials === previousCiphertext && (current.secretVersion ?? 1) <= nextSecretVer) {
+        await params.vaultStore.upsertServer({
+          ...current,
+          encryptedCredentials: unsealed.resealedCiphertext,
+          secretVersion: nextSecretVer,
+          updatedAt: rotatedAt,
+        });
+        params.server.encryptedCredentials = unsealed.resealedCiphertext;
+        params.server.secretVersion = nextSecretVer;
+        params.server.updatedAt = rotatedAt;
+      }
     }
   }
   return { ok: true, secret: unsealed.payload };
@@ -1421,6 +1590,8 @@ async function resolveDecryptedServerSecret(params: {
 export async function executeFederatedMcpQuery(params: {
   userId: string;
   input: QueryMcpCallInput;
+  allowedMcpTools?: ReadonlyArray<string> | ReadonlySet<string>;
+  baseUrlOverride?: string;
   vaultStore: McpVaultStore;
   vaultMasterKey: string | undefined;
   fetchFn?: typeof fetch;
@@ -1432,6 +1603,39 @@ export async function executeFederatedMcpQuery(params: {
   const fetchFn = params.fetchFn ?? fetch;
   const now = params.now ?? Date.now();
   const userKey = params.userId.trim() || 'owner';
+
+  const parsedParamAllowed = parseAllowedMcpTools(params.allowedMcpTools);
+  if (!parsedParamAllowed.ok) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        visibility: 'private',
+        error: parsedParamAllowed.error,
+        message: parsedParamAllowed.message,
+        sanitized: true,
+        fullySanitized: true,
+      },
+    };
+  }
+  const parsedInputAllowed = parseAllowedMcpTools(params.input.allowedMcpTools);
+  if (!parsedInputAllowed.ok) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        visibility: 'private',
+        error: parsedInputAllowed.error,
+        message: parsedInputAllowed.message,
+        sanitized: true,
+        fullySanitized: true,
+      },
+    };
+  }
+  const effectiveAllowedTools = new Set<string>([
+    ...parsedParamAllowed.allowed,
+    ...parsedInputAllowed.allowed,
+  ]);
 
   if (action === 'list_connected') {
     const rows = await params.vaultStore.listServers(params.userId);
@@ -1473,20 +1677,43 @@ export async function executeFederatedMcpQuery(params: {
         ok: false,
         visibility: 'private',
         error: 'missing_server',
-        message: 'server slug or domain is required for list_tools and call_tool',
+        message: 'server id or slug is required for list_tools and call_tool',
+        sanitized: true,
+        fullySanitized: true,
       },
     };
   }
 
+  // S6: Resolve strictly by exact connector `id` or exact `slug` (never by domain, origin, or suffix).
   const serverRow = await params.vaultStore.getServer(params.userId, serverRef);
-  if (!serverRow) {
+  const serverRefNorm = serverRef.toLowerCase();
+  if (
+    !serverRow ||
+    (serverRow.id.toLowerCase() !== serverRefNorm && serverRow.slug.toLowerCase() !== serverRefNorm)
+  ) {
+    const refSan = sanitizeConnectorText(serverRef, 80);
     return {
       status: 404,
       body: {
         ok: false,
         visibility: 'private',
         error: 'mcp_server_not_connected',
-        message: `No connected MCP server matching "${serverRef}" found for current user`,
+        message: `No connected MCP server matching "${refSan.text}" found for current user`,
+        sanitized: refSan.sanitized,
+        fullySanitized: refSan.fullySanitized,
+      },
+    };
+  }
+  if (!isValidMcpConnectorSlug(serverRow.slug)) {
+    return {
+      status: 400,
+      body: {
+        ok: false,
+        visibility: 'private',
+        error: 'invalid_server_slug',
+        message: 'Connected MCP server has an invalid slug ("__" and unsafe characters are forbidden)',
+        sanitized: true,
+        fullySanitized: true,
       },
     };
   }
@@ -1498,6 +1725,8 @@ export async function executeFederatedMcpQuery(params: {
         visibility: 'private',
         error: 'mcp_server_disabled',
         message: `Connected MCP server "${serverRow.slug}" is currently disabled`,
+        sanitized: true,
+        fullySanitized: true,
       },
     };
   }
@@ -1511,6 +1740,8 @@ export async function executeFederatedMcpQuery(params: {
         visibility: 'private',
         error: 'unsafe_remote_mcp_url',
         message: urlCheck.ok ? 'Remote URL origin does not match pinned vault origin' : urlCheck.reason,
+        sanitized: true,
+        fullySanitized: true,
       },
     };
   }
@@ -1680,14 +1911,39 @@ export async function executeFederatedMcpQuery(params: {
     }
 
     const toolName = typeof params.input.tool === 'string' ? params.input.tool.trim() : '';
-    if (!toolName || !SAFE_MCP_IDENTIFIER_RE.test(toolName) || FORBIDDEN_PROTO_KEYS.has(toolName)) {
+    if (!toolName || !isSafeMcpIdentifier(toolName) || FORBIDDEN_PROTO_KEYS.has(toolName)) {
       return {
         status: 400,
         body: {
           ok: false,
           visibility: 'private',
           error: 'missing_tool',
-          message: 'Valid tool name is required when action="call_tool"',
+          message: 'Valid tool name (without "__") is required when action="call_tool"',
+          sanitized: true,
+          fullySanitized: true,
+        },
+      };
+    }
+
+    // S6: Enforce cached tool + readOnlyHint/destructiveHint gate (matching `/v1/agent`):
+    // tool MUST exist in `cachedTools`, and MUST have `readOnlyHint === true && destructiveHint !== true`
+    // unless explicitly allow-listed for this request in exact `${serverRow.slug}/${toolName}` format!
+    const safeCachedTools = filterSafeCachedMcpTools(serverRow.cachedTools);
+    const cachedTool = safeCachedTools.find((t) => t.name === toolName);
+    if (!cachedTool || !isCachedMcpToolPermitted(serverRow.slug, cachedTool, effectiveAllowedTools)) {
+      return {
+        status: 403,
+        body: {
+          ok: false,
+          visibility: 'private',
+          server: serverRow.slug,
+          tool: toolName,
+          error: 'mcp_tool_not_permitted',
+          message: !cachedTool
+            ? `Tool "${toolName}" is not in cached tools for connector "${serverRow.slug}". Run list_tools first.`
+            : `Tool "${serverRow.slug}/${toolName}" requires readOnlyHint=true and destructiveHint!=true unless explicitly allow-listed via allowedMcpTools as "${serverRow.slug}/${toolName}".`,
+          sanitized: true,
+          fullySanitized: true,
         },
       };
     }
@@ -1840,21 +2096,75 @@ export async function executeFederatedMcpQuery(params: {
       };
     }
 
+    const sanitizeBaseUrl = params.baseUrlOverride ?? serverRow.remoteOrigin;
+
     if (callRes.rpc?.error) {
       const rpcErr = callRes.rpc.error as { code?: unknown; message?: unknown; data?: unknown };
       const msgSan = sanitizeConnectorText(
         String(rpcErr.message ?? 'Remote MCP tool call returned an error'),
         400,
-        serverRow.remoteOrigin,
+        sanitizeBaseUrl,
         activeSecret,
       );
-      const dataSan =
-        rpcErr.data !== undefined
-          ? sanitizeConnectorStructuredValue(rpcErr.data, {
-              baseUrl: serverRow.remoteOrigin,
-              redactSecret: activeSecret,
-            })
-          : undefined;
+      let dataSan: SanitizedConnectorStructuredResult | undefined;
+      if (rpcErr.data !== undefined) {
+        if (typeof rpcErr.data === 'string') {
+          const strSan = sanitizeConnectorText(
+            rpcErr.data,
+            MAX_MCP_RPC_ERROR_DATA_STRING_CHARS,
+            sanitizeBaseUrl,
+            activeSecret,
+          );
+          dataSan = {
+            value: strSan.text,
+            sanitized: strSan.sanitized,
+            fullySanitized: strSan.fullySanitized,
+            truncated: strSan.truncated,
+            detected: strSan.detected,
+            scrubbed: strSan.scrubbed,
+            triggers: strSan.triggers,
+          };
+        } else if (measureJsonSizeCapped(rpcErr.data, MAX_MCP_RPC_ERROR_DATA_BYTES) > MAX_MCP_RPC_ERROR_DATA_BYTES) {
+          dataSan = {
+            value: '[truncated]',
+            sanitized: true,
+            fullySanitized: false,
+            truncated: true,
+            detected: false,
+            scrubbed: true,
+            triggers: [],
+          };
+        } else {
+          const candSan = sanitizeConnectorStructuredValue(rpcErr.data, {
+            baseUrl: sanitizeBaseUrl,
+            redactSecret: activeSecret,
+            maxDepth: MAX_MCP_RPC_ERROR_DATA_DEPTH,
+            maxEntriesPerContainer: MAX_MCP_RPC_ERROR_DATA_ENTRIES,
+            maxNodeBudget: MAX_MCP_RPC_ERROR_DATA_NODES,
+            maxStringChars: MAX_MCP_RPC_ERROR_DATA_STRING_CHARS,
+            maxTotalChars: MAX_MCP_RPC_ERROR_DATA_BYTES,
+          });
+          let serErrData = '';
+          try {
+            serErrData = JSON.stringify(candSan.value) ?? '';
+          } catch {
+            serErrData = '';
+          }
+          if (!serErrData || serErrData.length > MAX_MCP_RPC_ERROR_DATA_BYTES) {
+            dataSan = {
+              value: '[truncated]',
+              sanitized: candSan.sanitized,
+              fullySanitized: false,
+              truncated: true,
+              detected: candSan.detected,
+              scrubbed: true,
+              triggers: candSan.triggers,
+            };
+          } else {
+            dataSan = candSan;
+          }
+        }
+      }
       const errTriggers = [...new Set([...msgSan.triggers, ...(dataSan?.triggers ?? [])])];
       return {
         status: 502,
@@ -1884,7 +2194,6 @@ export async function executeFederatedMcpQuery(params: {
         : {};
     const rawContent = Array.isArray(rawResult.content) ? rawResult.content : [];
     const sanitizedContent: Array<Record<string, unknown>> = [];
-    const textParts: string[] = [];
     let anyDetected = false;
     let anyScrubbed = false;
     let contentBlocksAllSanitized = true;
@@ -1911,14 +2220,13 @@ export async function executeFederatedMcpQuery(params: {
         if (block.text.length > blockBudget) fullySanitized = false;
         const rawBlockSlice = block.text.length > blockBudget ? block.text.slice(0, blockBudget) : block.text;
         remainingTextBudget -= rawBlockSlice.length;
-        const san = sanitizeConnectorText(rawBlockSlice, blockBudget, serverRow.remoteOrigin, activeSecret);
+        const san = sanitizeConnectorText(rawBlockSlice, blockBudget, sanitizeBaseUrl, activeSecret);
         if (!san.sanitized) contentBlocksAllSanitized = false;
         if (!san.fullySanitized) fullySanitized = false;
         if (san.detected) anyDetected = true;
         if (san.scrubbed) anyScrubbed = true;
         for (const tr of san.triggers) triggerSet.add(tr);
         sanitizedContent.push({ type: 'text', text: san.text });
-        textParts.push(san.text);
       } else if (bType === 'resource' && block.resource && typeof block.resource === 'object') {
         const resObj = block.resource as Record<string, unknown>;
         if (typeof resObj.text !== 'string') {
@@ -1930,13 +2238,12 @@ export async function executeFederatedMcpQuery(params: {
         if (resObj.text.length > blockBudget) fullySanitized = false;
         const rawResSlice = resObj.text.length > blockBudget ? resObj.text.slice(0, blockBudget) : resObj.text;
         remainingTextBudget -= rawResSlice.length;
-        const resText = sanitizeConnectorText(rawResSlice, blockBudget, serverRow.remoteOrigin, activeSecret);
+        const resText = sanitizeConnectorText(rawResSlice, blockBudget, sanitizeBaseUrl, activeSecret);
         if (!resText.sanitized) contentBlocksAllSanitized = false;
         if (!resText.fullySanitized) fullySanitized = false;
         if (resText.detected) anyDetected = true;
         if (resText.scrubbed) anyScrubbed = true;
         for (const tr of resText.triggers) triggerSet.add(tr);
-        textParts.push(resText.text);
 
         let safeResourceUri: string | undefined;
         if (typeof resObj.uri === 'string') {
@@ -1964,14 +2271,17 @@ export async function executeFederatedMcpQuery(params: {
     let sanitizedStructured: unknown;
     let structuredAllSanitized = true;
     if (rawResult.structuredContent !== undefined) {
-      if (remainingTextBudget <= 0) {
+      const structBudget = Math.min(MAX_MCP_BLOCK_TEXT_CHARS, Math.max(0, remainingTextBudget));
+      // M10-1: Check estimated serialized size budget BEFORE running `sanitizeConnectorStructuredValue`!
+      if (structBudget <= 0 || measureJsonSizeCapped(rawResult.structuredContent, structBudget) > structBudget) {
         sanitizedStructured = '[truncated]';
         fullySanitized = false;
+        remainingTextBudget = Math.max(0, remainingTextBudget - 11);
       } else {
-        const structBudget = Math.min(MAX_MCP_BLOCK_TEXT_CHARS, remainingTextBudget);
         const structRes = sanitizeConnectorStructuredValue(rawResult.structuredContent, {
-          baseUrl: serverRow.remoteOrigin,
+          baseUrl: sanitizeBaseUrl,
           redactSecret: activeSecret,
+          maxTotalChars: structBudget,
         });
         structuredAllSanitized = structRes.sanitized;
         if (!structRes.fullySanitized) fullySanitized = false;
@@ -1994,34 +2304,15 @@ export async function executeFederatedMcpQuery(params: {
           sanitizedStructured = structRes.value;
           remainingTextBudget = Math.max(0, remainingTextBudget - serializedSanitized.length);
         }
-
-        if (textParts.length === 0 && sanitizedStructured !== undefined) {
-          const fallbackStr =
-            typeof sanitizedStructured === 'string'
-              ? sanitizedStructured
-              : sanitizeMcpMarkdownOutput(
-                  JSON.stringify(sanitizedStructured, null, 2) ?? '',
-                  serverRow.remoteOrigin,
-                  structBudget,
-                );
-          textParts.push(fallbackStr);
-        }
       }
     }
 
-    const srvNameSan = sanitizeConnectorText(serverRow.name, 120, serverRow.remoteOrigin, activeSecret);
+    const srvNameSan = sanitizeConnectorText(serverRow.name, 120, sanitizeBaseUrl, activeSecret);
     if (!srvNameSan.sanitized) contentBlocksAllSanitized = false;
-    const joinedMarkdown = textParts.join('\n\n');
-    if (joinedMarkdown.length > MAX_REMOTE_MCP_RESPONSE_BYTES) {
-      fullySanitized = false;
-    }
-    const markdown =
-      joinedMarkdown.length > MAX_REMOTE_MCP_RESPONSE_BYTES
-        ? joinedMarkdown.slice(0, MAX_REMOTE_MCP_RESPONSE_BYTES)
-        : joinedMarkdown;
     const isRemoteError = Boolean(rawResult.isError);
     const dynamicallySanitized = Boolean(contentBlocksAllSanitized && structuredAllSanitized);
 
+    // M10-4: Return `content` (and `structuredContent` when present) without duplicating identical text into `markdown`.
     return {
       status: isRemoteError ? 502 : 200,
       body: {
@@ -2043,7 +2334,6 @@ export async function executeFederatedMcpQuery(params: {
           scrubbed: anyScrubbed,
           triggers: [...triggerSet],
         },
-        markdown,
         content: sanitizedContent,
         ...(sanitizedStructured !== undefined ? { structuredContent: sanitizedStructured } : {}),
       },
@@ -2159,6 +2449,7 @@ export async function tryScrapeViaConnectedMcp(params: {
   query?: string;
   preferMcp?: boolean;
   allowedServerIds?: ReadonlySet<string>;
+  allowedMcpTools?: ReadonlyArray<string> | ReadonlySet<string>;
   requireExplicitReadOnlyHint?: boolean;
   vaultStore: McpVaultStore;
   vaultMasterKey: string | undefined;
@@ -2170,6 +2461,12 @@ export async function tryScrapeViaConnectedMcp(params: {
   if (activeAuth && activeAuth.principal.startsWith('oauth:') && !activeAuth.scopes.includes('mcp:call')) {
     return null;
   }
+
+  const parsedAllowed = parseAllowedMcpTools(params.allowedMcpTools);
+  if (!parsedAllowed.ok) {
+    return null;
+  }
+  const allowedToolSet = parsedAllowed.allowed;
 
   // 1. Validate `https://` public target URL BEFORE routing to any MCP server!
   const targetCheck = isSafePublicHttpsUrl(params.targetUrl, params.selfHost);
@@ -2185,6 +2482,7 @@ export async function tryScrapeViaConnectedMcp(params: {
   const eligibleRows = allRows.filter(
     (r) =>
       r.enabled &&
+      isValidMcpConnectorSlug(r.slug) &&
       (!params.allowedServerIds || params.allowedServerIds.has(r.id)) &&
       (params.preferMcp === true || r.autoRouteScrape === true),
   );
@@ -2198,12 +2496,20 @@ export async function tryScrapeViaConnectedMcp(params: {
   const top = matches[0];
   if (!top || top.matchedDomains.length === 0) return null;
 
-  // 3. Select ONLY a non-destructive read-oriented tool with a safe identifier accepting `url` or `uri`
+  // 3. S6: Enforce `readOnlyHint === true && destructiveHint !== true` by default (unless explicitly allow-listed in `allowedMcpTools`)
+  const requireReadOnly = params.requireExplicitReadOnlyHint !== false;
+  const topSlugLower = top.server.slug.toLowerCase();
   const candidateTool = filterSafeCachedMcpTools(top.server.tools).find((t) => {
     if (!isSafeMcpIdentifier(t.name) || FORBIDDEN_PROTO_KEYS.has(t.name)) return false;
-    if (params.requireExplicitReadOnlyHint && t.readOnlyHint !== true) return false;
-    if (t.readOnlyHint === false || t.destructiveHint === true) return false;
-    const isReadName = /^(?:get|fetch|read|retrieve|resolve|view|inspect|page|search)(?:[_.-]|$|[A-Z])/i.test(t.name) || t.readOnlyHint === true;
+    const explicitlyAllowed = allowedToolSet.has(`${topSlugLower}/${t.name}`);
+    if (!explicitlyAllowed) {
+      if (requireReadOnly && t.readOnlyHint !== true) return false;
+      if (t.readOnlyHint === false || t.destructiveHint === true) return false;
+    }
+    const isReadName =
+      explicitlyAllowed ||
+      /^(?:get|fetch|read|retrieve|resolve|view|inspect|page|search)(?:[_.-]|$|[A-Z])/i.test(t.name) ||
+      t.readOnlyHint === true;
     if (!isReadName) return false;
     const props =
       t.inputSchema?.properties && typeof t.inputSchema.properties === 'object'
@@ -2219,6 +2525,8 @@ export async function tryScrapeViaConnectedMcp(params: {
     toolArgs.query = params.query.slice(0, 500);
   }
 
+  // M10-3 & P3-4: Sanitize once inside `executeFederatedMcpQuery` using `safeForwardUrl` as `baseUrlOverride`,
+  // and propagate actual `sanitized` / `fullySanitized` / `promptInjection` results without double-sanitizing.
   const out = await executeFederatedMcpQuery({
     userId: params.userId,
     input: {
@@ -2227,20 +2535,25 @@ export async function tryScrapeViaConnectedMcp(params: {
       tool: candidateTool.name,
       arguments: toolArgs,
     },
+    allowedMcpTools: allowedToolSet,
+    baseUrlOverride: safeForwardUrl,
     vaultStore: params.vaultStore,
     vaultMasterKey: params.vaultMasterKey,
     fetchFn: params.fetchFn,
     selfHost: params.selfHost,
   });
 
-  if (out.status !== 200 || !out.body.ok || typeof out.body.markdown !== 'string' || !out.body.markdown.trim()) {
+  if (out.status !== 200 || !out.body.ok) {
+    return null;
+  }
+  const safeMarkdown = extractMarkdownFromQueryMcpBody(out.body);
+  if (!safeMarkdown.trim()) {
     return null;
   }
 
-  const reSanitized = sanitizeRemoteMcpText(out.body.markdown);
-  const safeMarkdown = sanitizeMcpMarkdownOutput(reSanitized.text, safeForwardUrl);
   const prevPi = (out.body.promptInjection as { detected?: boolean; scrubbed?: boolean; triggers?: string[] } | undefined) ?? {};
-  const mergedTriggers = [...new Set([...(prevPi.triggers ?? []), ...reSanitized.triggers])];
+  const wasSanitized = out.body.sanitized === true;
+  const wasFullySanitized = Boolean(wasSanitized && out.body.fullySanitized !== false);
 
   return {
     status: 200,
@@ -2255,11 +2568,12 @@ export async function tryScrapeViaConnectedMcp(params: {
       via: `mcp:${top.server.slug}`,
       extractorId: `mcp:${top.server.slug}:${candidateTool.name}`,
       markdown: safeMarkdown,
-      sanitized: true,
+      sanitized: wasSanitized,
+      fullySanitized: wasFullySanitized,
       promptInjection: {
-        detected: Boolean(prevPi.detected || reSanitized.detected),
-        scrubbed: Boolean(prevPi.scrubbed || reSanitized.scrubbed),
-        triggers: mergedTriggers,
+        detected: Boolean(prevPi.detected),
+        scrubbed: Boolean(prevPi.scrubbed),
+        triggers: Array.isArray(prevPi.triggers) ? prevPi.triggers : [],
       },
       metadata: {
         title: `${top.server.slug} — ${candidateTool.name}`,

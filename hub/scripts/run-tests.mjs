@@ -136,6 +136,18 @@ try {
   const trackerBlockingOutfile = join(dir, 'tracker-blocking.test.mjs');
   buildNodeTestBundle('test/tracker-blocking.test.ts', trackerBlockingOutfile);
   nodeTestFiles.push(trackerBlockingOutfile);
+  const r11Stream1Outfile = join(dir, 'round11-stream1-sanitizer.test.mjs');
+  buildNodeTestBundle('test/round11-stream1-sanitizer.test.ts', r11Stream1Outfile);
+  nodeTestFiles.push(r11Stream1Outfile);
+  const r11Stream4Outfile = join(dir, 'round11-stream4-mcp-vault.test.mjs');
+  buildNodeTestBundle('test/round11-stream4-mcp-vault.test.ts', r11Stream4Outfile);
+  nodeTestFiles.push(r11Stream4Outfile);
+  const r11Stream5Outfile = join(dir, 'round11-stream5-oauth-jobs-manifests.test.mjs');
+  buildNodeTestBundle('test/round11-stream5-oauth-jobs-manifests.test.ts', r11Stream5Outfile);
+  nodeTestFiles.push(r11Stream5Outfile);
+  const r11Stream3Outfile = join(dir, 'round11-stream3-portable.test.mjs');
+  buildNodeTestBundle('test/round11-stream3-portable.test.ts', r11Stream3Outfile);
+  nodeTestFiles.push(r11Stream3Outfile);
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],

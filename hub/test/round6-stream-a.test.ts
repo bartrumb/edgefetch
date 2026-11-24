@@ -127,8 +127,8 @@ await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash 
 
   const h1ListDedent = fin('- a\n  ```\nx\n  ```\n<img src=x onerror=alert(1)>');
   assertNoActiveHtmlOrJsLinksOutsideCode(h1ListDedent, 'list-dedent-img');
-  // Dedent must emit explicit closing fence so CommonMark/marked/micromark agree on fence closure
-  assert.match(h1ListDedent, /```\r?\nx/);
+  // S1: Fences opened inside a list container are neutralized as prose so no dialect can invert fence polarity
+  assert.match(h1ListDedent, /\\`\\`\\`\r?\nx/);
 
   const h1ListDedentOntoCol0Fence = fin('- item\n  ```\n```\n```\n<img src=x onerror=alert(1)>');
   assertNoActiveHtmlOrJsLinksOutsideCode(h1ListDedentOntoCol0Fence, 'list-dedent-onto-col0-fence');
@@ -161,13 +161,9 @@ await t.test('R6-H1 & M9: Indented/list/blockquote code fence desync, backslash 
   for (const raw of containerFencePayloads) {
     const cleaned = fin(raw);
     assertNoActiveHtmlOrJsLinksOutsideCode(cleaned, `container-payload:${raw.slice(0, 24)}`);
-    // If Setext `===` / `---` appeared inside a fenced block (`para\n~~~\n[pwn](javascript:...)\n---\n~~~`), verify a blank line separates `para` from the fence!
-    if (raw.startsWith('para\n')) {
-      assert.match(cleaned, /^para\r?\n\r?\n(?:```|~~~)/, `Setext lheading guard must insert blank line before fence: ${cleaned}`);
-    } else {
-      assert.equal(/\]\(\s*javascript:/i.test(cleaned), false, `javascript: link leaked in: ${cleaned}`);
-      assert.equal(/\]:\s*javascript:/i.test(cleaned), false, `ref javascript: link leaked in: ${cleaned}`);
-    }
+    // S1: Non-blank-preceded fences (`para\n~~~`) are neutralized as prose with `<` escaped and unsafe links neutralized!
+    assert.equal(/\]\(\s*javascript:/i.test(cleaned), false, `javascript: link leaked in: ${cleaned}`);
+    assert.equal(/\]:\s*javascript:/i.test(cleaned), false, `ref javascript: link leaked in: ${cleaned}`);
     if (raw.includes('marked16') || raw.startsWith('[a `')) {
       assert.equal(cleaned.includes('](javascript:'), false);
     }

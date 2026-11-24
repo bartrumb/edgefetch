@@ -15,7 +15,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpsRequest } from 'node:https';
 import { isIP } from 'node:net';
 import { dirname, join, resolve, sep } from 'node:path';
@@ -27,11 +27,14 @@ import {
   getRegistrableDomain,
   hasPrivateSharedHostingSuffix,
   isPublicOrPrivateSuffix,
+  matchesApprovedWildcard,
   validateManifest,
 } from './compile-manifests.mjs';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
-const hubRoot = resolve(scriptsDir, '..');
+const hubRoot = process.env.EDGEFETCH_HUB_ROOT
+  ? resolve(process.env.EDGEFETCH_HUB_ROOT)
+  : resolve(scriptsDir, '..');
 const repoRoot = resolve(hubRoot, '..');
 const manifestsDir = resolve(repoRoot, 'internal', 'extract', 'manifests');
 const fixturesDir = resolve(hubRoot, 'test', 'fixtures', 'adapters');
@@ -265,31 +268,54 @@ function fetchHttpsOncePinned(targetUrl, pinnedAddr, accept, maxBytes = 2 * 1024
   });
 }
 
-async function fetchPolitePublicHttps(initialUrl, accept) {
-  let cur = new URL(initialUrl.toString());
+export async function fetchPolitePublicHttps(initialUrl, accept, testHooks = undefined) {
+  const resolveAddr = testHooks?.resolveAddr ?? resolveVerifiedPublicAddress;
+  const fetchOnce = testHooks?.fetchOnce ?? fetchHttpsOncePinned;
+  const requestedCheck = validateProposeTargetUrl(initialUrl.toString());
+  if (!requestedCheck.ok) throw new Error(requestedCheck.error);
+  const requestedHost = requestedCheck.host;
+  const requestedOrigin = requestedCheck.url.origin;
+
+  let cur = new URL(requestedCheck.url.toString());
+  let cachedRobotsBody = null;
   for (let hop = 0; hop <= 4; hop++) {
     const check = validateProposeTargetUrl(cur.toString());
     if (!check.ok) throw new Error(check.error);
-    const pinned = await resolveVerifiedPublicAddress(check.host);
+    if (check.host !== requestedHost || cur.origin !== requestedOrigin) {
+      throw new Error(
+        `Refusing cross-host redirect from ${requestedHost} to ${check.host}; adapter proposals are strictly bound to the user-named host`,
+      );
+    }
+    const pinned = await resolveAddr(check.host);
 
-    if (hop === 0 || cur.origin !== initialUrl.origin) {
+    if (cachedRobotsBody === null) {
       const robotsUrl = new URL('/robots.txt', cur.origin);
-      const robRes = await fetchHttpsOncePinned(robotsUrl, pinned, 'text/plain,*/*;q=0.8', 512 * 1024);
+      const robRes = await fetchOnce(robotsUrl, pinned, 'text/plain,*/*;q=0.8', 512 * 1024);
+      if (robRes.status >= 300 && robRes.status < 400) {
+        throw new Error(`robots.txt returned HTTP ${robRes.status} redirect on ${cur.origin} (treating redirect on robots.txt as disallow)`);
+      }
       if (robRes.status === 429 || robRes.status >= 500) {
         throw new Error(`robots.txt returned HTTP ${robRes.status} on ${cur.origin} (assuming disallow per RFC 9309)`);
       }
-      if (robRes.status >= 200 && robRes.status < 300 && !isAllowedBySimpleRobots(robRes.body, cur.pathname + cur.search)) {
-        throw new Error(`Disallowed by ${cur.origin}/robots.txt for path ${cur.pathname}`);
-      }
+      cachedRobotsBody = robRes.status >= 200 && robRes.status < 300 ? String(robRes.body ?? '') : '';
+    }
+    if (cachedRobotsBody && !isAllowedBySimpleRobots(cachedRobotsBody, cur.pathname + cur.search)) {
+      throw new Error(`Disallowed by ${cur.origin}/robots.txt for path ${cur.pathname}`);
     }
 
-    const res = await fetchHttpsOncePinned(cur, pinned, accept);
+    const res = await fetchOnce(cur, pinned, accept);
     if ([301, 302, 303, 307, 308].includes(res.status) && typeof res.headers.location === 'string') {
       const next = new URL(res.headers.location, cur);
+      const nextHost = next.hostname.toLowerCase().replace(/\.+$/, '');
+      if (next.protocol !== 'https:' || nextHost !== requestedHost || next.origin !== requestedOrigin) {
+        throw new Error(
+          `Refusing cross-host or non-HTTPS redirect from ${requestedHost} to ${next.origin || next.toString()}; adapter proposals are strictly bound to the user-named host`,
+        );
+      }
       cur = next;
       continue;
     }
-    return { finalUrl: cur.toString(), status: res.status, headers: res.headers, body: res.body };
+    return { finalUrl: cur.toString(), requestedHost, status: res.status, headers: res.headers, body: res.body };
   }
   throw new Error('Exceeded maximum redirect hops (4)');
 }
@@ -468,17 +494,154 @@ function matchesRobotsPathPattern(targetPath, rawPattern) {
   return true;
 }
 
-function walkDomElements(node, visit, state = { count: 0 }) {
-  if (!node || state.count > 12_000) return;
+const MAX_DOM_WALK_DEPTH = 24;
+const MAX_DOM_WALK_NODES = 12_000;
+const MAX_JSON_LD_DEPTH = 24;
+const MAX_JSON_LD_NODES = 2_048;
+
+const BUILTIN_ATS_AND_TWIN_EXACT_HOSTS = new Map([
+  ['jobs.ashbyhq.com', 'ashby'],
+  ['api.ashbyhq.com', 'ashby'],
+  ['boards.greenhouse.io', 'greenhouse-job'],
+  ['job-boards.greenhouse.io', 'greenhouse-job'],
+  ['eu-boards.greenhouse.io', 'greenhouse-job'],
+  ['job-boards.eu.greenhouse.io', 'greenhouse-job'],
+  ['boards-api.greenhouse.io', 'greenhouse-job'],
+  ['boards-api.eu.greenhouse.io', 'greenhouse-job'],
+  ['jobs.lever.co', 'lever-job'],
+  ['jobs.eu.lever.co', 'lever-job'],
+  ['api.lever.co', 'lever-job'],
+  ['api.eu.lever.co', 'lever-job'],
+  ['ats.rippling.com', 'rippling-ats'],
+  ['api.rippling.com', 'rippling-ats'],
+  ['apply.workable.com', 'workable-ats'],
+  ['jobs.gem.com', 'gem-ats'],
+  ['jobs.smartrecruiters.com', 'enterprise-ats'],
+]);
+
+const BUILTIN_ATS_WILDCARD_PATTERNS = [
+  { pattern: '*.myworkdayjobs.com', owner: 'workday-cxs' },
+  { pattern: '*.myworkdaysite.com', owner: 'workday-cxs' },
+];
+
+let cachedClaimedHostIndex = null;
+
+function loadClaimedAdapterHostIndex() {
+  if (cachedClaimedHostIndex) return cachedClaimedHostIndex;
+  const exactDomains = new Map(BUILTIN_ATS_AND_TWIN_EXACT_HOSTS);
+  const twinHosts = new Map();
+  const wildcards = [...BUILTIN_ATS_WILDCARD_PATTERNS];
+
+  const recordTwinFetchUrl = (fetchUrl, ownerId) => {
+    if (typeof fetchUrl !== 'string' || !fetchUrl.trim()) return;
+    const fu = fetchUrl.trim();
+    if (fu === '{requestUrl}' || fu.startsWith('https://{host}/') || fu.startsWith('{origin}/')) return;
+    try {
+      const sample = fu.replace(/\{[A-Za-z0-9_]+\}/g, 'sample');
+      const u = new URL(sample);
+      const h = u.hostname.toLowerCase().replace(/\.+$/, '');
+      if (h && !twinHosts.has(h)) twinHosts.set(h, ownerId);
+    } catch {
+      // ignore unparseable template
+    }
+  };
+
+  if (existsSync(manifestsDir)) {
+    const files = readdirSync(manifestsDir).filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'));
+    for (const file of files) {
+      try {
+        const raw = readFileSync(join(manifestsDir, file), 'utf8');
+        const doc = parseYamlDoc(raw, { maxAliasCount: 0, merge: false, uniqueKeys: true, schema: 'core' });
+        if (doc.errors.length > 0) continue;
+        const m = doc.toJS({ maxAliasCount: 0 });
+        if (!m || typeof m !== 'object') continue;
+        const ownerId = typeof m.id === 'string' && m.id ? m.id : file;
+        for (const rawDom of m.domains ?? []) {
+          const dom = String(rawDom ?? '').trim().toLowerCase().replace(/\.+$/, '');
+          if (!dom) continue;
+          if (dom.includes('*')) {
+            wildcards.push({ pattern: dom, owner: ownerId });
+          } else if (!exactDomains.has(dom)) {
+            exactDomains.set(dom, ownerId);
+          }
+        }
+        if (m.twin?.fetchUrl) recordTwinFetchUrl(m.twin.fetchUrl, ownerId);
+        for (const r of m.routes ?? []) {
+          if (r?.twin?.fetchUrl) recordTwinFetchUrl(r.twin.fetchUrl, ownerId);
+          for (const mh of r?.match?.hosts ?? []) {
+            const normMh = String(mh ?? '').trim().toLowerCase().replace(/\.+$/, '');
+            if (normMh && !normMh.includes('*') && !exactDomains.has(normMh)) exactDomains.set(normMh, ownerId);
+          }
+        }
+      } catch {
+        // ignore unreadable manifest
+      }
+    }
+  }
+
+  cachedClaimedHostIndex = { exactDomains, twinHosts, wildcards };
+  return cachedClaimedHostIndex;
+}
+
+export function checkClaimedAdapterOrTwinHost(rawHost) {
+  const host = String(rawHost ?? '').trim().toLowerCase().replace(/\.+$/, '');
+  if (!host) return null;
+  const idx = loadClaimedAdapterHostIndex();
+  const exactOwner = idx.exactDomains.get(host);
+  if (exactOwner) {
+    return { claimed: true, kind: 'domain', owner: exactOwner, matched: host };
+  }
+  const twinOwner = idx.twinHosts.get(host);
+  if (twinOwner) {
+    return { claimed: true, kind: 'twin', owner: twinOwner, matched: host };
+  }
+  for (const w of idx.wildcards) {
+    if (matchesApprovedWildcard(w.pattern, host)) {
+      return { claimed: true, kind: 'wildcard', owner: w.owner, matched: w.pattern };
+    }
+  }
+  return null;
+}
+
+function isJsonTextWithinMaxNesting(rawJson, maxDepth = MAX_JSON_LD_DEPTH) {
+  if (typeof rawJson !== 'string' || rawJson.length > 262_144) return false;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < rawJson.length; i++) {
+    const ch = rawJson.charCodeAt(i);
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === 0x5c /* '\\' */) {
+        escaped = true;
+      } else if (ch === 0x22 /* '"' */) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === 0x22 /* '"' */) {
+      inString = true;
+    } else if (ch === 0x7b /* '{' */ || ch === 0x5b /* '[' */) {
+      depth++;
+      if (depth > maxDepth) return false;
+    } else if (ch === 0x7d /* '}' */ || ch === 0x5d /* ']' */) {
+      if (depth > 0) depth--;
+    }
+  }
+  return true;
+}
+
+function walkDomElements(node, visit, state = { count: 0 }, depth = 0) {
+  if (!node || depth > MAX_DOM_WALK_DEPTH || state.count >= MAX_DOM_WALK_NODES) return;
   state.count++;
   if (node.type === 'tag' || node.type === 'script' || node.type === 'style') {
     visit(node);
   }
-  if (Array.isArray(node.children)) {
-    for (const ch of node.children) {
-      walkDomElements(ch, visit, state);
-      if (state.count > 12_000) break;
-    }
+  if (depth >= MAX_DOM_WALK_DEPTH || !Array.isArray(node.children)) return;
+  for (const ch of node.children) {
+    if (state.count >= MAX_DOM_WALK_NODES) break;
+    walkDomElements(ch, visit, state, depth + 1);
   }
 }
 
@@ -522,12 +685,29 @@ function sanitizeYamlCommentToken(raw, maxLen = 80) {
   return clean;
 }
 
-export function analyzeHtmlForManifestProposal({ html, urlStr, slugOverride, categoryOverride }) {
+export function analyzeHtmlForManifestProposal({ html, urlStr, requestedUrlStr, slugOverride, categoryOverride }) {
   const check = validateProposeTargetUrl(urlStr);
   if (!check.ok) {
     throw new Error(check.error);
   }
+  if (requestedUrlStr !== undefined) {
+    const reqCheck = validateProposeTargetUrl(requestedUrlStr);
+    if (!reqCheck.ok) {
+      throw new Error(reqCheck.error);
+    }
+    if (reqCheck.host !== check.host) {
+      throw new Error(
+        `Refusing cross-host proposal: requested host "${reqCheck.host}" does not match final URL host "${check.host}"`,
+      );
+    }
+  }
   const { url, host, registrableDomain } = check;
+  const existingClaim = checkClaimedAdapterOrTwinHost(host);
+  if (existingClaim) {
+    throw new Error(
+      `Refusing to propose manifest for "${host}": host is already claimed as ${existingClaim.kind === 'twin' ? 'a twin fetchUrl host' : `adapter domain (${existingClaim.matched})`} by existing adapter "${existingClaim.owner}"`,
+    );
+  }
   const defaultSlug = registrableDomain
     .split('.')[0]
     .toLowerCase()
@@ -599,11 +779,13 @@ export function analyzeHtmlForManifestProposal({ html, urlStr, slugOverride, cat
       const type = String(attrs.type ?? '').toLowerCase();
       if (type.includes('application/ld+json')) {
         const raw = getElementText(el);
-        try {
-          const parsed = JSON.parse(raw);
-          collectJsonLdTypeNames(parsed, jsonLdTypes, 0);
-        } catch {
-          // ignore malformed JSON-LD
+        if (isJsonTextWithinMaxNesting(raw, MAX_JSON_LD_DEPTH)) {
+          try {
+            const parsed = JSON.parse(raw);
+            collectJsonLdTypeNames(parsed, jsonLdTypes, 0, { visited: 0 });
+          } catch {
+            // ignore malformed JSON-LD
+          }
         }
       }
     }
@@ -830,10 +1012,14 @@ function escapeBasicHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
-function collectJsonLdTypeNames(node, out, depth) {
-  if (!node || depth > 10 || out.size >= 20) return;
+function collectJsonLdTypeNames(node, out, depth = 0, state = { visited: 0 }) {
+  if (!node || depth > MAX_JSON_LD_DEPTH || state.visited >= MAX_JSON_LD_NODES || out.size >= 20) return;
+  state.visited++;
   if (Array.isArray(node)) {
-    for (const item of node) collectJsonLdTypeNames(item, out, depth + 1);
+    for (const item of node) {
+      if (state.visited >= MAX_JSON_LD_NODES || out.size >= 20) break;
+      collectJsonLdTypeNames(item, out, depth + 1, state);
+    }
     return;
   }
   if (typeof node === 'object') {
@@ -847,9 +1033,9 @@ function collectJsonLdTypeNames(node, out, depth) {
     const t = node['@type'];
     if (typeof t === 'string') pushCleanType(t);
     else if (Array.isArray(t)) {
-      for (const x of t) pushCleanType(x);
+      for (const x of t.slice(0, 20)) pushCleanType(x);
     }
-    if (Array.isArray(node['@graph'])) collectJsonLdTypeNames(node['@graph'], out, depth + 1);
+    if (Array.isArray(node['@graph'])) collectJsonLdTypeNames(node['@graph'], out, depth + 1, state);
   }
 }
 
@@ -906,6 +1092,13 @@ async function runCli() {
     console.error(`Error: ${urlCheck.error}`);
     process.exit(1);
   }
+  const preClaim = checkClaimedAdapterOrTwinHost(urlCheck.host);
+  if (preClaim) {
+    console.error(
+      `Error: Host "${urlCheck.host}" is already claimed as ${preClaim.kind === 'twin' ? 'a twin fetchUrl host' : `adapter domain (${preClaim.matched})`} by existing adapter "${preClaim.owner}".`,
+    );
+    process.exit(1);
+  }
 
   let html = '';
   let finalUrl = urlCheck.url.toString();
@@ -924,6 +1117,7 @@ async function runCli() {
   const proposal = analyzeHtmlForManifestProposal({
     html,
     urlStr: finalUrl,
+    requestedUrlStr: urlCheck.url.toString(),
     slugOverride,
     categoryOverride,
   });

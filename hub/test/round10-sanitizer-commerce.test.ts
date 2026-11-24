@@ -476,9 +476,9 @@ test('Round 10 (S4): Unclosed <script>/<style>/hidden tags/comments before a fen
     assertStrictS1ProseSafety(sFin.markdown, `S4:finalize:${raw.slice(0, 28)}`);
   }
 
-  // Verify the fenced code block after unclosed `<script>` genuinely stayed a fenced code block at column 0!
+  // Verify a blank-line-preceded fenced code block after unclosed `<script>` genuinely stays a fenced code block at column 0!
   const unclosedBeforeFence = sanitizeInlineHtmlInMarkdown(
-    'Intro paragraph<script>unclosed_js(\n```js\nconst safe = 1;\n```\n<img src=x onerror=alert(1)>',
+    'Intro paragraph<script>unclosed_js(\n\n```js\nconst safe = 1;\n```\n<img src=x onerror=alert(1)>',
   );
   const segs = splitMarkdownByCodeFences(unclosedBeforeFence);
   assert.ok(

@@ -751,6 +751,30 @@ export function scrubSpanToDevErrorReport(
   )
     .trim()
     .toLowerCase();
+  const rawStatus = attrs['http.response.status_code'] ?? attrs['http.status_code'] ?? 0;
+  const parsedStatus =
+    typeof rawStatus === 'number'
+      ? Math.floor(rawStatus)
+      : typeof rawStatus === 'string' && /^\d{1,3}$/.test(rawStatus.trim())
+        ? Number(rawStatus.trim())
+        : 0;
+  const httpStatus = Number.isInteger(parsedStatus) && parsedStatus >= 0 && parsedStatus <= 599 ? parsedStatus : 0;
+
+  // Expected caller/origin domain outcomes (`not_found` 404, `gone` 410, `skip` robots.txt, `blocked` SSRF/policy) and
+  // generic `edgefetch.mcp.tool` wrapper statuses (`mcp_tool_error` without an upstream WAF/5xx status) are NOT EdgeFetch bugs!
+  if (
+    !wafVendor &&
+    (rawOutcome === 'not_found' ||
+      rawOutcome === 'gone' ||
+      rawOutcome === 'skip' ||
+      rawOutcome === 'blocked' ||
+      httpStatus === 404 ||
+      httpStatus === 410 ||
+      (span.name === 'edgefetch.mcp.tool' && span.errorMessage === 'mcp_tool_error' && httpStatus < 500 && rawOutcome !== 'error' && rawOutcome !== 'rate_limited'))
+  ) {
+    return null;
+  }
+
   const isErrorOrWaf =
     span.statusOk === false ||
     Boolean(wafVendor) ||
@@ -786,15 +810,6 @@ export function scrubSpanToDevErrorReport(
         ? attrs['adapter.id']
         : '';
   const adapterId = normalizeSafeAdapterId(rawAdapter);
-
-  const rawStatus = attrs['http.response.status_code'] ?? attrs['http.status_code'] ?? 0;
-  const parsedStatus =
-    typeof rawStatus === 'number'
-      ? Math.floor(rawStatus)
-      : typeof rawStatus === 'string' && /^\d{1,3}$/.test(rawStatus.trim())
-        ? Number(rawStatus.trim())
-        : 0;
-  const httpStatus = Number.isInteger(parsedStatus) && parsedStatus >= 0 && parsedStatus <= 599 ? parsedStatus : 0;
 
   const errorClass = classifyTelemetryErrorClass({
     httpStatus,

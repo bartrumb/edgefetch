@@ -2466,6 +2466,24 @@ async function dispatchRpcMessage(
               const res = await invokeTool();
               const isErr = Boolean(res.isError);
               span.setAttribute('mcp.is_error', isErr);
+              const firstTxt = Array.isArray(res.content) && typeof res.content[0]?.text === 'string' ? res.content[0].text : '';
+              if (firstTxt.startsWith('{') && firstTxt.length <= 65_536) {
+                try {
+                  const parsedToolOut = JSON.parse(firstTxt) as Record<string, unknown>;
+                  if (typeof parsedToolOut.status === 'number' && Number.isFinite(parsedToolOut.status)) {
+                    span.setAttribute('http.response.status_code', Math.floor(parsedToolOut.status));
+                  }
+                  const outLabel =
+                    typeof parsedToolOut.outcome === 'string'
+                      ? parsedToolOut.outcome
+                      : typeof parsedToolOut.error === 'string'
+                        ? parsedToolOut.error
+                        : undefined;
+                  if (outLabel) span.setAttribute('edgefetch.outcome', outLabel.slice(0, 64));
+                } catch {
+                  // ignore non-JSON tool payloads
+                }
+              }
               if (isErr) span.setStatus(false, 'mcp_tool_error');
               return res;
             },

@@ -571,6 +571,47 @@ export function isJobLegalBoilerplateChunk(text: string, heading = ''): boolean 
   return signals >= 2;
 }
 
+function extractAshbyLocations(job: Record<string, unknown>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const pushLoc = (raw: string) => {
+    const clean = raw.trim();
+    if (!clean) return;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(clean);
+  };
+  const pushPostalAddress = (addrContainer: unknown) => {
+    if (!addrContainer || typeof addrContainer !== 'object') return;
+    const addrObj = addrContainer as Record<string, unknown>;
+    const postal =
+      addrObj.postalAddress && typeof addrObj.postalAddress === 'object'
+        ? (addrObj.postalAddress as Record<string, unknown>)
+        : addrObj;
+    const locality = typeof postal.addressLocality === 'string' ? postal.addressLocality.trim() : '';
+    const region = typeof postal.addressRegion === 'string' ? postal.addressRegion.trim() : '';
+    const country = typeof postal.addressCountry === 'string' ? postal.addressCountry.trim() : '';
+    const formatted = [locality, region, country].filter(Boolean).join(', ');
+    if (formatted) pushLoc(formatted);
+  };
+
+  if (typeof job.location === 'string') pushLoc(job.location);
+  pushPostalAddress(job.address);
+
+  if (Array.isArray(job.secondaryLocations)) {
+    for (const s of job.secondaryLocations as Array<Record<string, unknown> | string>) {
+      if (typeof s === 'string') {
+        pushLoc(s);
+      } else if (s && typeof s === 'object') {
+        if (typeof s.location === 'string') pushLoc(s.location);
+        pushPostalAddress(s.address);
+      }
+    }
+  }
+  return out;
+}
+
 function parseAshbyPay(job: Record<string, unknown>, descText: string): NormalizedPay | null {
   const comp = job.compensation as Record<string, unknown> | undefined;
   if (comp && typeof comp === 'object') {
@@ -870,13 +911,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
             const match = jobs.find((j) => String(j.id ?? '').toLowerCase() === jobId.toLowerCase());
             if (!match) return null;
             const title = String(match.title ?? 'Job Posting').trim();
-            const loc = typeof match.location === 'string' ? match.location.trim() : '';
-            const secLocs = Array.isArray(match.secondaryLocations)
-              ? (match.secondaryLocations as Array<Record<string, unknown> | string>)
-                  .map((s) => (typeof s === 'string' ? s : String(s?.location ?? '')))
-                  .filter(Boolean)
-              : [];
-            const allLocs = [loc, ...secLocs].filter(Boolean);
+            const allLocs = extractAshbyLocations(match);
             const descHtml = typeof match.descriptionHtml === 'string' ? match.descriptionHtml : '';
             const descPlain = typeof match.descriptionPlain === 'string' ? match.descriptionPlain : '';
             const bodyMd = descHtml.trim() ? htmlToMd(descHtml, origUrl).markdown.trim() : descPlain.trim();
@@ -943,13 +978,7 @@ export function resolveAtsPreFetchSpec(urlStr: string): AtsPreFetchSpec | null {
           for (const j of jobs.slice(reqOffset, reqOffset + maxBoardRecords)) {
             const jId = String(j.id ?? '');
             const jTitle = String(j.title ?? 'Role').trim();
-            const jLoc = String(j.location ?? '').trim();
-            const secLocs = Array.isArray(j.secondaryLocations)
-              ? (j.secondaryLocations as Array<Record<string, unknown> | string>)
-                  .map((s) => (typeof s === 'string' ? s.trim() : String(s?.location ?? '').trim()))
-                  .filter(Boolean)
-              : [];
-            const allLocs = [jLoc, ...secLocs].filter(Boolean);
+            const allLocs = extractAshbyLocations(j);
             const rawDescPlain = String(j.descriptionPlain ?? '');
             const descPlain =
               rawDescPlain ||
@@ -4135,9 +4164,11 @@ function matchesSingleGeoLocation(locStr: string, filterTerm: string): boolean {
     return locStr.includes(filterTerm);
   }
   const hasExplicitUsCountryOrCity =
-    /\b(?:united states|usa|u\.s\.a?\.?|us\b|americas?[ \t]{0,8}\(us\)|us-[a-z]{2}\b|california|new york|texas|washington|massachusetts|virginia|colorado|illinois|georgia|florida|san francisco|nyc|seattle|austin|boston|chicago|los angeles|denver|atlanta|menlo park|mountain view|palo alto|sunnyvale|santa clara|san jose|redmond|bellevue|mclean|reston)\b/i.test(
+    /\b(?:united states|usa|u\.s\.a?\.?|us\b|americas?[ \t]{0,8}\(us\)|us-[a-z]{2}\b|alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|district of columbia|florida|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|san francisco|nyc|seattle|austin|boston|chicago|los angeles|denver|atlanta|menlo park|mountain view|palo alto|sunnyvale|santa clara|san jose|redmond|bellevue|mclean|reston|pittsburgh|philadelphia|phoenix|portland|san diego|raleigh|durham|minneapolis|detroit|salt lake city|miami|dallas|houston|charlotte|nashville|columbus|indianapolis)\b/i.test(
       locStr,
-    );
+    ) ||
+    (/\bgeorgia\b/i.test(locStr) && !/\btbilisi\b/i.test(locStr)) ||
+    /\bremote\b[^|]{0,24}\b(?:north america|americas)\b|\b(?:north america|americas)\b[^|]{0,24}\bremote\b/i.test(locStr);
   if (hasExplicitUsCountryOrCity) return true;
 
   // Match `, CA` / `, NY` / `, WA` state abbreviations unless `, ON, CA` / `Canada` ISO country code
@@ -6112,33 +6143,42 @@ export async function executeJobsCall(params: {
 
   // Direct company board discovery when `company` is provided without `domains` (e.g. `company: "Visa"` -> `jobs.smartrecruiters.com/Visa`,
   // `company: "Spotify"` -> `jobs.lever.co/spotify`, with `respectRobots: true` — NEVER `api.smartrecruiters.com`!)
+  // Skip blind 4-ATS 404 probes when `ats_search` ALREADY discovered a confirmed board/posting matching `companyFilter`!
   if (companyFilter && domainsInput.length === 0) {
     const primarySlug = primaryCompanySlug;
     if (primarySlug) {
       const lowerSlug = primarySlug.toLowerCase();
-      const rawTrimmedSlug = companyFilter.replace(/[^A-Za-z0-9_-]+/g, '');
-      const srDisplaySlug =
-        rawTrimmedSlug && rawTrimmedSlug.toLowerCase() === lowerSlug ? rawTrimmedSlug : primarySlug;
-      const existingBoardKeys = new Set(
-        [...candidateUrls]
-          .map((u) => classifyFullBoardKey(u))
-          .filter((x): x is NonNullable<typeof x> => Boolean(x?.isBoard))
-          .map((x) => x.key),
-      );
-      const hasSmartRecruitersForCompany = [...candidateUrls].some((u) =>
-        new RegExp(`^https://jobs\\.smartrecruiters\\.com/${lowerSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:/|$)`, 'i').test(u),
-      );
-      if (!hasSmartRecruitersForCompany) {
-        candidateUrls.add(`https://jobs.smartrecruiters.com/${srDisplaySlug}`);
-      }
-      if (!existingBoardKeys.has(`greenhouse:${lowerSlug}`)) {
-        candidateUrls.add(`https://boards.greenhouse.io/${primarySlug}`);
-      }
-      if (!existingBoardKeys.has(`ashby:${lowerSlug}`)) {
-        candidateUrls.add(`https://jobs.ashbyhq.com/${primarySlug}`);
-      }
-      if (!existingBoardKeys.has(`lever:${lowerSlug}`)) {
-        candidateUrls.add(`https://jobs.lever.co/${primarySlug}`);
+      const normSlug = lowerSlug.replace(/[^a-z0-9]+/g, '');
+      const alreadyHasConfirmedCompanyAts = [...candidateUrls].some((u) => {
+        const info = classifyFullBoardKey(u);
+        const root = (info?.slug.split('/')[0] ?? isSmartRecruitersBoardUrl(u)?.org ?? '').toLowerCase();
+        return Boolean(root && normSlug && matchesAtsTenantSlugAgainstToken(root, normSlug));
+      });
+      if (!alreadyHasConfirmedCompanyAts) {
+        const rawTrimmedSlug = companyFilter.replace(/[^A-Za-z0-9_-]+/g, '');
+        const srDisplaySlug =
+          rawTrimmedSlug && rawTrimmedSlug.toLowerCase() === lowerSlug ? rawTrimmedSlug : primarySlug;
+        const existingBoardKeys = new Set(
+          [...candidateUrls]
+            .map((u) => classifyFullBoardKey(u))
+            .filter((x): x is NonNullable<typeof x> => Boolean(x?.isBoard))
+            .map((x) => x.key),
+        );
+        const hasSmartRecruitersForCompany = [...candidateUrls].some((u) =>
+          new RegExp(`^https://jobs\\.smartrecruiters\\.com/${lowerSlug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:/|$)`, 'i').test(u),
+        );
+        if (!hasSmartRecruitersForCompany) {
+          candidateUrls.add(`https://jobs.smartrecruiters.com/${srDisplaySlug}`);
+        }
+        if (!existingBoardKeys.has(`greenhouse:${lowerSlug}`)) {
+          candidateUrls.add(`https://boards.greenhouse.io/${primarySlug}`);
+        }
+        if (!existingBoardKeys.has(`ashby:${lowerSlug}`)) {
+          candidateUrls.add(`https://jobs.ashbyhq.com/${primarySlug}`);
+        }
+        if (!existingBoardKeys.has(`lever:${lowerSlug}`)) {
+          candidateUrls.add(`https://jobs.lever.co/${primarySlug}`);
+        }
       }
     }
   }
@@ -6208,7 +6248,44 @@ export async function executeJobsCall(params: {
 
   // Deduplicate redundant single-posting fetches when the parent board (especially Ashby 1.22 MB `posting-api/job-board/<slug>`
   // and Rippling `ats/v1/board/<org>/jobs`) is also present or has >= 2 postings from the same company!
-  const rawUrlList = [...candidateUrls];
+  // Pre-build allowed company/domain slug tokens BEFORE Wave 1/Wave 2 so unrelated third-party ATS search hits
+  // (e.g. `jobs.ashbyhq.com/feathery` during `company: "allstate"`) are skipped BEFORE downloading their boards!
+  const preWaveAllowedTokens = new Set<string>();
+  if (companyFilter) {
+    preWaveAllowedTokens.add(companyFilter);
+    for (const expanded of expandCompanyFilterTokens(companyFilter)) preWaveAllowedTokens.add(expanded);
+  }
+  for (const dom of domainsInput) {
+    preWaveAllowedTokens.add(dom);
+    for (const expanded of expandCompanyFilterTokens(dom)) preWaveAllowedTokens.add(expanded);
+  }
+  for (const db of discoveredBoards) {
+    if (db.boardStatus !== 'not_found' && db.boardStatus !== 'budget_exhausted' && db.slug) {
+      const rootSlug = (db.slug.split('/')[0] ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+      if (rootSlug) preWaveAllowedTokens.add(rootSlug);
+    }
+  }
+  const confirmedDiscoveredBoardUrls = new Set(
+    discoveredBoards.filter((b) => b.boardUrl).map((b) => b.boardUrl.replace(/\/+$/, '').toLowerCase()),
+  );
+  const rawUrlList = [...candidateUrls].filter((u) => {
+    if (!hasCompanyOrDomainScope || preWaveAllowedTokens.size === 0) return true;
+    const cleanU = u.replace(/\/+$/, '').toLowerCase();
+    if (confirmedDiscoveredBoardUrls.has(cleanU)) return true;
+    const info = classifyFullBoardKey(u);
+    const srInfo = !info ? isSmartRecruitersBoardUrl(u) : null;
+    const srPostingSlug =
+      !info && !srInfo ? /^https:\/\/jobs\.smartrecruiters\.com\/([A-Za-z0-9_.-]+)\//i.exec(u)?.[1] : undefined;
+    const tenantSlug = (info?.slug.split('/')[0] ?? srInfo?.org ?? srPostingSlug ?? '').toLowerCase();
+    if (!tenantSlug) return true;
+    for (const tok of preWaveAllowedTokens) {
+      const normTok = tok.toLowerCase().replace(/[^a-z0-9]+/g, '');
+      if (normTok && matchesAtsTenantSlugAgainstToken(tenantSlug, normTok)) {
+        return true;
+      }
+    }
+    return false;
+  });
   const postingCountByBoard = new Map<string, { count: number; boardUrl: string; hasBoard: boolean }>();
   for (const u of rawUrlList) {
     const info = classifyFullBoardKey(u);
@@ -6409,6 +6486,30 @@ export async function executeJobsCall(params: {
           }
           collected.push(br);
         }
+        // Workday list cards (`POST /wday/cxs/{tenant}/{site}/jobs`) carry `pay: null` while pay-transparency ranges live in
+        // `workday-job` (`GET /wday/cxs/{tenant}/{site}/job/{extPath}`): queue top matching postings for detail enrichment!
+        if (smartRecruitersPostingsToEnrich.length < 12) {
+          const wdCandidates = boardJobs.filter(
+            (r) =>
+              r.source === 'workday' &&
+              r.pay === null &&
+              /\/job\//i.test(r.url) &&
+              (!query || matchesJobQueryRelevance(r.title, r.snippet, query) !== null),
+          );
+          if (wdCandidates.length > 0) {
+            const prioritizedWd =
+              geoLocationsFilter.length > 0
+                ? [
+                    ...wdCandidates.filter((r) => matchesGeoLocationsFilter(r.locations, geoLocationsFilter)),
+                    ...wdCandidates.filter((r) => !matchesGeoLocationsFilter(r.locations, geoLocationsFilter)),
+                  ]
+                : wdCandidates;
+            const wdCap = Math.min(limit, 8, 12 - smartRecruitersPostingsToEnrich.length);
+            for (const wdRec of prioritizedWd.slice(0, wdCap)) {
+              smartRecruitersPostingsToEnrich.push(wdRec);
+            }
+          }
+        }
         continue;
       }
 
@@ -6556,6 +6657,7 @@ export async function executeJobsCall(params: {
         if (jp?.datePosted) target.postedAt = jp.datePosted;
         if (jp?.employmentType) target.employmentType = jp.employmentType;
         if (jp?.applyUrl) target.applyUrl = jp.applyUrl;
+        if (!target.snippet && detMd) target.snippet = detMd.slice(0, 240);
       }
     }
   }

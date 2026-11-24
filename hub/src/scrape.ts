@@ -1001,6 +1001,24 @@ export function recognizeAndHardenMarkdownFences(
       }
     }
 
+    // Fast-path single-blockquote or lazy-blockquote prose lines (`> line`) starting with `> <ASCII-letter>` (`S2` < 5 ms under V8 coverage)
+    if (
+      escapedRiskyFence === null &&
+      containers.length >= 1 &&
+      containers[0]!.kind === 'bq' &&
+      (containers.length === 1 || openParagraph) &&
+      raw.length >= 3 &&
+      raw.charCodeAt(0) === 62 /* '>' */ &&
+      raw.charCodeAt(1) === 32 /* ' ' */
+    ) {
+      const c2 = raw.charCodeAt(2);
+      if ((c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122)) {
+        outLines.push(raw);
+        openParagraph = true;
+        continue;
+      }
+    }
+
     // Not `inFence`: match existing containers on `raw`
     const m = matchOpenContainersOnLine(raw, containers);
     let baseCol = m.baseCol;
@@ -1880,8 +1898,8 @@ function shouldStripSubtreeOpenTag(tagLower: string, attrStr: string): boolean {
     return true;
   }
   if (
-    (tagLower === 'span' || tagLower === 'i') &&
-    /\baria-hidden\s*=\s*(?:"true"|'true')/i.test(attrStr)
+    (tagLower === 'span' || tagLower === 'i' || tagLower === 'bdi') &&
+    /\baria-hidden\s*=\s*(?:"true"|'true'|true(?=[ \t\r\n/>]|$))/i.test(attrStr)
   ) {
     return true;
   }
@@ -8046,32 +8064,50 @@ export function collapseAnimatedCounterTickersLinear(prose: string): string {
           break;
         }
       }
-      if (commas >= 1 && digits.length >= 4 && j < len && (prose.charCodeAt(j) === 32 || prose.charCodeAt(j) === 9)) {
-        let k = j;
-        while (k < len && (prose.charCodeAt(k) === 32 || prose.charCodeAt(k) === 9)) k++;
-        let tDigits = '';
-        let tSpaces = 0;
-        let m = k;
-        let lastAcceptedEnd = k;
-        while (m < len && tDigits.length < digits.length) {
-          const mc = prose.charCodeAt(m);
-          if (mc >= 48 && mc <= 57) {
-            tDigits += prose[m]!;
-            m++;
-            lastAcceptedEnd = m;
-          } else if (mc === 44 || mc === 32 || mc === 9) {
-            if (mc === 32 || mc === 9) tSpaces++;
-            m++;
+      if ((commas >= 1 || digits.length >= 4) && digits.length >= 4 && j < len) {
+        let keepEnd = j;
+        while (keepEnd < len && (prose.charCodeAt(keepEnd) === 42 /* '*' */ || prose.charCodeAt(keepEnd) === 95 /* '_' */)) {
+          keepEnd++;
+        }
+        let k = keepEnd;
+        let leadNl = 0;
+        while (k < len) {
+          const ws = prose.charCodeAt(k);
+          if (ws === 32 || ws === 9) {
+            k++;
+          } else if (ws === 10 && leadNl < 2) {
+            leadNl++;
+            k++;
           } else {
             break;
           }
         }
-        const nextAfter = lastAcceptedEnd < len ? prose.charCodeAt(lastAcceptedEnd) : 0;
-        if (tDigits === digits && tSpaces >= 2 && !(nextAfter >= 48 && nextAfter <= 57)) {
-          out += prose.slice(lastCopy, j);
-          lastCopy = lastAcceptedEnd;
-          i = lastAcceptedEnd;
-          continue;
+        if (k > keepEnd) {
+          let tDigits = '';
+          let tSpaces = 0;
+          let m = k;
+          let lastAcceptedEnd = k;
+          while (m < len && tDigits.length < digits.length) {
+            const mc = prose.charCodeAt(m);
+            if (mc >= 48 && mc <= 57) {
+              tDigits += prose[m]!;
+              m++;
+              lastAcceptedEnd = m;
+            } else if (mc === 44 || mc === 32 || mc === 9 || mc === 10) {
+              if (mc === 32 || mc === 9 || mc === 10) tSpaces++;
+              m++;
+            } else {
+              break;
+            }
+          }
+          const nextAfter = lastAcceptedEnd < len ? prose.charCodeAt(lastAcceptedEnd) : 0;
+          const minRequiredSpaces = commas >= 1 ? 2 : Math.max(3, digits.length - 1);
+          if (tDigits === digits && tSpaces >= minRequiredSpaces && !(nextAfter >= 48 && nextAfter <= 57)) {
+            out += prose.slice(lastCopy, keepEnd);
+            lastCopy = lastAcceptedEnd;
+            i = lastAcceptedEnd;
+            continue;
+          }
         }
       }
       i = j > i ? j : i + 1;
@@ -8109,7 +8145,7 @@ export function finalizeScrapedMarkdown(
   let md = opts.preserveOriginMarkdown
     ? stripInvisibleSmugglingChars(cleanOriginNegotiatedMarkdown(bodyTrimmed, opts.baseUrl))
     : stripInvisibleSmugglingChars(sanitizeInlineHtmlInMarkdown(bodyTrimmed, opts.baseUrl, Boolean(opts.allowPdfPageMarkers)));
-  if (!opts.preserveOriginMarkdown && !opts.isPdf && md.includes(',')) {
+  if (!opts.preserveOriginMarkdown && !opts.isPdf && (md.includes(',') || /\d[ \t\n]\d[ \t\n]\d/.test(md))) {
     md = splitMarkdownByCodeFences(md)
       .map((seg, idx) => (idx % 2 === 1 ? seg : collapseAnimatedCounterTickersLinear(seg)))
       .join('');
@@ -10732,7 +10768,7 @@ export async function executeScrapeCall(params: {
           atsItem &&
           (atsItem.status === 404 || atsItem.status === 410) &&
           isTrustedTwinRedirectUrl(atsSpec.id, atsSpec.fetchUrl, atsItem, selfHost) &&
-          /^(?:greenhouse(?:-eu)?|ashby|lever(?:-eu)?|workable|gem)-(?:board|job)$/.test(atsSpec.id)
+          /^(?:greenhouse(?:-eu)?|ashby|lever(?:-eu)?|workable|gem|workday)-(?:board|job)$/.test(atsSpec.id)
         ) {
           // Authoritative hosted ATS API returned 404/410: return immediately instead of triple-fetching
           // (`ats-*` -> `twin-*` -> HTML `scrape-1` -> 14s headless Chromium `auto-render-1` on `?error=true`)!
@@ -12281,9 +12317,66 @@ export async function executeScrapeCall(params: {
     }
   }
 
+  // P2b: Hydrate thin ATS / Workday SPA HTML shells directly from `<script type="application/ld+json">` `JobPosting`
+  // when present (e.g. when Workday CXS `/wday/cxs/.../job/...` returned 403 on a locale/slug variant), avoiding a 12.5s headless Chromium spin!
+  let hydratedFromJobPostingJsonLd = false;
+  if (
+    isHtmlBody &&
+    !customShopifyDoc &&
+    !ssrHydrated &&
+    countTextWords(extracted?.markdown ?? '') < 50 &&
+    /JobPosting/i.test(rawBodyStr)
+  ) {
+    const preJp = extractJobPostingJsonLd(rawBodyStr, finalUrl, extracted?.markdown ?? '');
+    if (preJp?.title) {
+      let ldDescHtml = '';
+      const ldScriptRe = /<script\b[^>]*type\s*=\s*(?:"application\/ld\+json"|'application\/ld\+json'|application\/ld\+json)[^>]*>([\s\S]{1,131072}?)<\/script>/gi;
+      let ldm: RegExpExecArray | null;
+      while ((ldm = ldScriptRe.exec(rawBodyStr)) !== null) {
+        const body = ldm[1]!.trim();
+        if (!/JobPosting/i.test(body)) continue;
+        try {
+          const parsedLd = JSON.parse(body) as unknown;
+          const queue: unknown[] = Array.isArray(parsedLd) ? [...parsedLd] : [parsedLd];
+          while (queue.length > 0) {
+            const node = queue.shift();
+            if (!node || typeof node !== 'object') continue;
+            const rec = node as Record<string, unknown>;
+            if (Array.isArray(rec['@graph'])) queue.push(...(rec['@graph'] as unknown[]));
+            const tVal = Array.isArray(rec['@type']) ? rec['@type'].map(String).join(' ') : String(rec['@type'] ?? '');
+            if (/\bJobPosting\b/i.test(tVal) && typeof rec.description === 'string' && rec.description.trim()) {
+              ldDescHtml = rec.description.trim();
+              break;
+            }
+          }
+          if (ldDescHtml) break;
+        } catch {
+          // ignore malformed JSON-LD block
+        }
+      }
+      const ldBodyMd = ldDescHtml ? htmlFragToMd(ldDescHtml, finalUrl).markdown.trim() : '';
+      if (extracted && countTextWords(ldBodyMd) >= 20) {
+        const headerMd = formatJobPostingHeaderMarkdown(preJp);
+        const fullLdMd = [`# ${preJp.title}`, ...(headerMd ? [headerMd] : []), ldBodyMd].filter(Boolean).join('\n\n');
+        extracted = {
+          ...extracted,
+          title: extracted.title || preJp.title,
+          markdown: fullLdMd,
+          text: fullLdMd,
+        };
+        hydratedFromJobPostingJsonLd = true;
+      }
+    }
+  }
+
   // P3: Automatic browser switch when a `<script>`-bearing or thin external/widget `<iframe>` (e.g. `#icims_content_iframe`) HTML page yields < 80 words.
-  // Never waste headless Chromium on URLs already identifiable as closed ATS job postings (e.g. Greenhouse `?error=true` redirects)!
+  // Never waste headless Chromium on URLs already identifiable as closed ATS job postings (e.g. Greenhouse `?error=true` redirects or Workday shells missing JobPosting JSON-LD)!
   let autoBrowserUnavailable = false;
+  const isDeadWorkdayJobShell =
+    atsSpec?.id === 'workday-job' &&
+    !hydratedFromJobPostingJsonLd &&
+    countTextWords(extracted?.markdown ?? '') < 20 &&
+    !/JobPosting/i.test(rawBodyStr);
   const preRenderClosedCheck = isHtmlBody
     ? classifyContentState({
         status: typeof item.status === 'number' ? item.status : 200,
@@ -12302,6 +12395,8 @@ export async function executeScrapeCall(params: {
     isHtmlBody &&
     !customShopifyDoc &&
     !ssrHydrated &&
+    !hydratedFromJobPostingJsonLd &&
+    !isDeadWorkdayJobShell &&
     preRenderClosedCheck?.state !== 'closed_posting' &&
     effectiveRenderMode === 'auto' &&
     item.rendered !== true &&

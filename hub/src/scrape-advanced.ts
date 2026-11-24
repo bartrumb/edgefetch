@@ -1859,20 +1859,24 @@ function toWordStreamLinear(raw: string): string {
   const s = stripMarkdownTableDividerLinesLinear(raw);
   const n = s.length;
   if (n === 0) return '';
-  const out = new Uint8Array(n);
-  let w = 0;
-  let prevSpace = false;
-  for (let i = 0; i < n; i++) {
-    const c = s.charCodeAt(i);
-    if (WORD_STREAM_KEEP[c] === 1) {
-      out[w++] = c;
-      prevSpace = false;
-    } else if (!prevSpace) {
-      out[w++] = 32;
-      prevSpace = true;
+  if (!/[^A-Za-z0-9.: ]|  /.test(s)) return s;
+  const CHUNK_SIZE = 65_536;
+  if (n <= CHUNK_SIZE) {
+    return s.replace(/[^A-Za-z0-9.:]+/g, ' ');
+  }
+  const parts: string[] = [];
+  let prevEndedSpace = false;
+  for (let off = 0; off < n; off += CHUNK_SIZE) {
+    let norm = s.slice(off, Math.min(n, off + CHUNK_SIZE)).replace(/[^A-Za-z0-9.:]+/g, ' ');
+    if (prevEndedSpace && norm.charCodeAt(0) === 32) {
+      norm = norm.slice(1);
+    }
+    if (norm.length > 0) {
+      prevEndedSpace = norm.charCodeAt(norm.length - 1) === 32;
+      parts.push(norm);
     }
   }
-  return WORD_STREAM_LATIN1_DECODER.decode(out.subarray(0, w));
+  return parts.join('');
 }
 
 function stripWordBracketsLinear(txt: string): string {
@@ -1915,7 +1919,13 @@ const COMPACT_SPACED_OVERRIDE_RE =
 
 function collapseSpacedSingleLettersLinear(s: string): string {
   const n = s.length;
-  if (n < 7 || !s.includes(' ')) return s;
+  if (
+    n < 7 ||
+    !s.includes(' ') ||
+    !/(?:^|[^A-Za-z0-9])[A-Za-z] +[A-Za-z] +[A-Za-z] +[A-Za-z](?:$|[^A-Za-z0-9])/.test(s)
+  ) {
+    return s;
+  }
   let out: Uint8Array | null = null;
   let w = 0;
   let last = 0;

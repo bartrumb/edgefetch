@@ -1052,6 +1052,19 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     rec.activeBucket = nextBucket;
   };
 
+  const rejectZeroByteRawSocket = (sock: net.Socket) => {
+    if (sock.destroyed) return;
+    if ((sock.bytesWritten ?? 0) === 0 && typeof sock.resetAndDestroy === 'function') {
+      try {
+        sock.resetAndDestroy();
+        return;
+      } catch {
+        // fall through to destroy()
+      }
+    }
+    sock.destroy();
+  };
+
   const evictSocketRecord = (rec: TrackedSocketRecord, nowMs = Date.now(), forceImmediateDestroy = false) => {
     const wasIdleKeepAlive = rec.phase === 'idle_keepalive';
     const idleAgeMs = nowMs - rec.idleSince;
@@ -1068,6 +1081,16 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         if (!rec.socket.destroyed) rec.socket.destroy();
       }, 100);
       finFallback.unref?.();
+      return;
+    }
+    if (
+      forceImmediateDestroy &&
+      !wasIdleKeepAlive &&
+      rec.requestsCompleted === 0 &&
+      rec.activeResponses === 0 &&
+      (rec.socket.bytesWritten ?? 0) === 0
+    ) {
+      rejectZeroByteRawSocket(rec.socket);
       return;
     }
     rec.socket.destroy();
@@ -1805,7 +1828,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         evictSocketRecord(oldestLb, nowConnMs);
       }
       if (loopbackActiveSockets >= loopbackCap) {
-        socket.destroy();
+        rejectZeroByteRawSocket(socket);
         return;
       }
       loopbackActiveSockets++;
@@ -1867,9 +1890,10 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
 
     recordIpConnChurn(sockBucket, nowConnMs);
 
-    const effectivePreHeaderPerIpCap =
-      !trustProxy || hasExplicitMaxPreHeaderPerIp
-        ? maxPreHeaderPerIp
+    const effectivePreHeaderPerIpCap = hasExplicitMaxPreHeaderPerIp
+      ? maxPreHeaderPerIp
+      : !trustProxy
+        ? Math.min(maxPreHeaderPerIp, effectiveRawPerIpCap)
         : Math.max(maxPreHeaderPerIp, Math.min(128, maxGlobalPreHeaderSockets));
 
     // 1. Shared-NAT pre-header defense (`R8-M1` + `R10-P1`): if ZERO-BYTE stalled pre-header sockets on `sockBucket`
@@ -1890,7 +1914,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         }
       }
       if (!sameIpVictimRec) {
-        socket.destroy();
+        rejectZeroByteRawSocket(socket);
         return;
       }
       evictSocketRecord(sameIpVictimRec, nowConnMs, true);
@@ -1928,7 +1952,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
           selectZeroBytePreHeaderVictim(nowConnMs, sockBucket, false) ??
           selectZeroBytePreHeaderVictim(nowConnMs, sockBucket, true);
         if (!preVictim) {
-          socket.destroy();
+          rejectZeroByteRawSocket(socket);
           return;
         }
         evictSocketRecord(preVictim, nowConnMs, true);
@@ -1941,14 +1965,14 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
         allowTier3Newcomers: true,
       });
       if (!evicted) {
-        socket.destroy();
+        rejectZeroByteRawSocket(socket);
         return;
       }
     }
 
     const curActiveForIp = activeSocketsByIp.get(sockBucket) ?? 0;
     if (remoteActiveSockets >= maxTotalSockets || curActiveForIp >= effectiveRawPerIpCap) {
-      socket.destroy();
+      rejectZeroByteRawSocket(socket);
       return;
     }
 

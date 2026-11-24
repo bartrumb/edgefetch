@@ -517,7 +517,8 @@ export function cleanMediaWikiMarkdownLinear(rawMd: string): string {
         /^(?:From Wikipedia, the free encyclopedia|Aus Wikipedia, der freien Enzyklopädie|Un article de Wikipédia, l'encyclopédie libre\.?)$/i.test(
           trimmed,
         ) ||
-        /^\d{1,4}[ \t]+(?:languages|language|Sprachen|langues|idiomas|lingue)$/i.test(trimmed)
+        /^\d{1,4}[ \t]+(?:languages|language|Sprachen|langues|idiomas|lingue)$/i.test(trimmed) ||
+        (i < 40 && /^(?:\*{1,2})?(?:Checked|Gesichtet|Vérifié|Revisado)(?:\*{1,2})?$/i.test(trimmed))
       ) {
         continue;
       }

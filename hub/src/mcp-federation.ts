@@ -109,7 +109,7 @@ export function formatFenceSafeUntrustedMcpEnvelope(params: {
  * from Markdown `[label](target)` and `![label](target)` links (`label <= 512` chars, `target <= 2048` chars).
  */
 function stripDangerousMarkdownLinksLinear(input: string): string {
-  if (!input.includes('](')) return input;
+  if (!input.includes('](') || !input.includes(')') || !input.includes(':')) return input;
   const n = input.length;
   let out = '';
   let emitFrom = 0;
@@ -226,10 +226,13 @@ export function sanitizeRemoteMcpText(raw: string, maxChars = MAX_REMOTE_MCP_RES
   });
 
   const stripped = stripMcpSmugglingChars(boundedRaw);
-  const postStripScan = detectPromptInjection({
-    markdown: stripped,
-    ...(stripped.includes('<') ? { rawHtml: stripped } : {}),
-  });
+  const postStripScan =
+    stripped === boundedRaw
+      ? preScan
+      : detectPromptInjection({
+          markdown: stripped,
+          ...(stripped.includes('<') ? { rawHtml: stripped } : {}),
+        });
   const mcpDirectiveDetected = MCP_DIRECTIVE_INJECTION_RE.test(stripped);
 
   const allTriggers = [

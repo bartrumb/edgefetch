@@ -1675,4 +1675,326 @@ test('Live Trace Remediation Suite: ATS 404 fast-return, closed ?error=true Chro
   };
   assert.equal(fleetOut.agents[0]?.browserSandbox, 'off');
   assert.equal(fleetOut.agents[0]?.browserConfinement, 'container-mac+loopback-proxy');
+
+  // 6. Workday `pay: null` enrichment via `workday-job` detail + Coder Ashby `address.postalAddress` US location + Wikipedia `**Checked**` FlaggedRevs cleanup
+  resetJobsCacheForTests();
+  const wdBoardUrl = 'https://allstate.wd5.myworkdayjobs.com/allstate_careers';
+  const wdJobUrl = 'https://allstate.wd5.myworkdayjobs.com/allstate_careers/job/Remote-IL/AI-Cloud-Platform-Engineer_R35902';
+  const htmlToMdSimple = (h: string) => ({ markdown: h.replace(/<[^>]+>/g, ' ').trim(), links: [] });
+  const wdEnrichedRes = await executeJobsCall({
+    payload: {
+      company: 'allstate',
+      query: 'AI Cloud Platform Engineer',
+      remote: true,
+      includeBuiltIn: false,
+    },
+    env: {},
+    executeSearch: async ({ query: q }) => ({
+      status: 200,
+      body: {
+        results: String(q).includes('myworkdayjobs') ? [{ url: wdBoardUrl }] : [],
+      },
+    }),
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      if (u.startsWith(wdBoardUrl) && !u.includes('/job/')) {
+        const spec = resolveAtsPreFetchSpec(u)!;
+        const fmt = spec.format(
+          JSON.stringify({
+            total: 1,
+            jobPostings: [
+              {
+                title: 'AI Cloud Platform Engineer',
+                externalPath: '/job/Remote-IL/AI-Cloud-Platform-Engineer_R35902',
+                locationsText: 'Remote, United States',
+                remoteType: 'Remote',
+                postedOn: 'Posted Today',
+                bulletFields: ['R35902'],
+              },
+            ],
+          }),
+          u,
+          htmlToMdSimple,
+        )!;
+        return { status: 200, body: { ok: true, extractorId: spec.id, ...fmt } };
+      }
+      if (u === wdJobUrl) {
+        const spec = resolveAtsPreFetchSpec(u)!;
+        const fmt = spec.format(
+          JSON.stringify({
+            jobPostingInfo: {
+              title: 'AI Cloud Platform Engineer',
+              location: 'Remote - Illinois',
+              additionalLocations: ['Remote - United States'],
+              remoteType: 'Remote',
+              timeType: 'Full time',
+              startDate: '2026-11-22',
+              jobDescription:
+                '<p>Build cloud AI infrastructure. The salary range for this position is $158,000 - $214,500 per year depending on experience.</p>',
+            },
+          }),
+          u,
+          htmlToMdSimple,
+        )!;
+        return { status: 200, body: { ok: true, extractorId: spec.id, ...fmt } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal(wdEnrichedRes.status, 200);
+  const wdEnrichedJobs = wdEnrichedRes.body.jobs as Array<{
+    title: string;
+    pay: { min: number; max: number; currency: string; period: string } | null;
+  }>;
+  assert.equal(wdEnrichedJobs.length, 1);
+  assert.equal(wdEnrichedJobs[0]?.title, 'AI Cloud Platform Engineer');
+  assert.deepEqual(
+    wdEnrichedJobs[0]?.pay && { min: wdEnrichedJobs[0].pay.min, max: wdEnrichedJobs[0].pay.max, currency: wdEnrichedJobs[0].pay.currency },
+    { min: 158_000, max: 214_500, currency: 'USD' },
+  );
+
+  // Coder Ashby posting where `location: "Remote"` and US country lives in `address.postalAddress.addressCountry`
+  resetJobsCacheForTests();
+  const coderSpec = resolveAtsPreFetchSpec('https://jobs.ashbyhq.com/coder')!;
+  const coderFmt = coderSpec.format(
+    JSON.stringify({
+      organizationName: 'Coder',
+      jobs: [
+        {
+          id: 'coder-us-1',
+          title: 'Staff Systems Engineer',
+          location: 'Remote',
+          isRemote: true,
+          address: { postalAddress: { addressRegion: 'Texas', addressCountry: 'United States' } },
+          publishedAt: new Date().toISOString(),
+          descriptionPlain: 'Build cloud development environments in Go.',
+        },
+      ],
+    }),
+    'https://jobs.ashbyhq.com/coder',
+    htmlToMdSimple,
+  )!;
+  const coderUsRes = await executeJobsCall({
+    payload: {
+      company: 'Coder',
+      query: 'Systems Engineer',
+      locations: ['United States'],
+      remote: true,
+      includeBuiltIn: false,
+    },
+    env: {},
+    executeSearch: async () => ({ status: 200, body: { results: [] } }),
+    executeScrape: async (args) => {
+      if (String(args.url) === 'https://jobs.ashbyhq.com/coder') {
+        return { status: 200, body: { ok: true, extractorId: coderSpec.id, ...coderFmt } };
+      }
+      return { status: 404, body: { ok: false, status: 404 } };
+    },
+  });
+  assert.equal((coderUsRes.body.jobs as Array<{ title: string }>).length, 1, 'Coder US Ashby posting with address.postalAddress must match locations:["United States"]');
+
+  const { cleanMediaWikiMarkdownLinear } = await import('../src/wikipedia');
+  const cleanedRobotsWiki = cleanMediaWikiMarkdownLinear(
+    '# Robots.txt\n\nFrom Wikipedia, the free encyclopedia\n\n**Checked**\n\n| Filename | `robots.txt` |\n| --- | --- |\n\n**robots.txt** is a standard used by websites.',
+  );
+  assert.equal(cleanedRobotsWiki.includes('**Checked**'), false, 'Standalone FlaggedRevs **Checked** badge must be stripped');
+  assert.equal(cleanedRobotsWiki.includes('| Filename | `robots.txt` |'), true, 'Infobox table must stay intact');
+
+  // 7. Full `wikipedia.ts` branch & edge-case coverage + animated counter dedup + Workday 403 JSON-LD hydration + pre-wave company ATS filtering + dev-telemetry wrapper filtering
+  const wikiMod = await import('../src/wikipedia');
+  wikiMod.resetWikipediaStateForTests();
+  assert.equal(wikiMod.isWikimediaHost('en.wiktionary.org'), true);
+  assert.equal(wikiMod.isWikimediaHost('www.wikidata.org'), true);
+  assert.equal(wikiMod.isWikimediaHost('www.mediawiki.org'), true);
+  assert.equal(wikiMod.isWikimediaHost('commons.wikimedia.org'), true);
+  assert.equal(wikiMod.isWikimediaHost(''), false);
+  assert.equal(wikiMod.isWikimediaHost('evilwikipedia.org'), false);
+  assert.equal(wikiMod.extractWikipediaLangFromHost('de.m.wikipedia.org'), 'de');
+  assert.equal(wikiMod.extractWikipediaLangFromHost('www.wikipedia.org'), null);
+  assert.equal(wikiMod.extractWikipediaLangFromHost('example.com'), null);
+  assert.equal(wikiMod.normalizeWikipediaLang(123, 'fr'), 'fr');
+  assert.equal(wikiMod.normalizeWikipediaLang('  ZH  ', 'en'), 'zh');
+  assert.equal(wikiMod.normalizeWikipediaLang('bad_lang!!', 'en'), 'en');
+  assert.equal(wikiMod.isDisallowedWikipediaTitle(''), true);
+  assert.equal(wikiMod.isDisallowedWikipediaTitle('Special:Search'), true);
+  assert.equal(wikiMod.isDisallowedWikipediaTitle('Spezial:Suche'), true);
+  assert.equal(wikiMod.isDisallowedWikipediaTitle('Custom_talk:Topic'), true);
+  assert.equal(wikiMod.isDisallowedWikipediaTitle('Star_Wars:_Episode_IV'), false);
+  assert.equal(wikiMod.parseWikipediaArticleUrl('not-a-url'), null);
+  assert.equal(wikiMod.parseWikipediaArticleUrl('ftp://en.wikipedia.org/wiki/HTTP'), null);
+  assert.equal(wikiMod.parseWikipediaArticleUrl('https://en.wikipedia.org/w/api.php'), null);
+  assert.equal(wikiMod.parseWikipediaArticleUrl('https://en.wikipedia.org/wiki/HTTP/2?action=edit'), null);
+  assert.equal(wikiMod.parseWikipediaArticleUrl('https://en.wikipedia.org/wiki/%E0%A4%A')?.canonicalUrl.startsWith('https://en.wikipedia.org/wiki/'), true);
+  assert.equal(
+    wikiMod.resolveWikipediaCanonicalFinalUrl({
+      requestedUrl: 'https://en.wikipedia.org/wiki/HTTP2',
+      storedFinalUrl: 'https://en.wikipedia.org/wiki/HTTP/2',
+    }),
+    'https://en.wikipedia.org/wiki/HTTP/2',
+  );
+  assert.equal(
+    wikiMod.resolveWikipediaCanonicalFinalUrl({
+      requestedUrl: 'https://en.wikipedia.org/wiki/HTTP2',
+      title: 'HTTP/2 - Wikipedia',
+    }),
+    'https://en.wikipedia.org/wiki/HTTP/2',
+  );
+  assert.equal(
+    wikiMod.resolveWikipediaCanonicalFinalUrl({
+      requestedUrl: 'https://en.wikipedia.org/wiki/HTTP2',
+      markdown: '# HTTP/2\n\nLead paragraph.',
+    }),
+    'https://en.wikipedia.org/wiki/HTTP/2',
+  );
+  assert.equal(wikiMod.buildWikipediaDirectTitleGuessUrl(''), null);
+  assert.equal(wikiMod.buildWikipediaDirectTitleGuessUrl('site:en.wikipedia.org robots'), null);
+  assert.equal(wikiMod.buildWikipediaDirectTitleGuessUrl('one two three four five six seven'), null);
+  assert.equal(wikiMod.buildWikipediaDirectTitleGuessUrl('Special:Search'), null);
+  assert.equal(
+    wikiMod.buildWikipediaDirectTitleGuessUrl('history of the internet', 'en'),
+    'https://en.wikipedia.org/wiki/History_of_the_Internet',
+  );
+  assert.equal(
+    wikiMod.buildWikipediaDirectTitleGuessUrl('HTTP/2 protocol', 'de'),
+    'https://de.wikipedia.org/wiki/HTTP/2_Protocol',
+  );
+  wikiMod.setCachedWikipediaSitemapUrls('en.wikipedia.org', ['https://en.wikipedia.org/wiki/Robots.txt'], 1_000);
+  assert.deepEqual(wikiMod.getCachedWikipediaSitemapUrls('en.wikipedia.org', 2_000), ['https://en.wikipedia.org/wiki/Robots.txt']);
+  assert.equal(wikiMod.getCachedWikipediaSitemapUrls('en.wikipedia.org', 1_000 + 25 * 3_600_000), null);
+  for (let sIdx = 0; sIdx < 18; sIdx++) {
+    wikiMod.setCachedWikipediaSitemapUrls(`l${sIdx}.wikipedia.org`, [`https://l${sIdx}.wikipedia.org/wiki/A`], 5_000);
+  }
+  const q1 = wikiMod.checkAndRecordWikipediaArticleQuota({ callerKey: 'u1', host: 'en.wikipedia.org', now: 1_000, limitPerHour: 2 });
+  const q2 = wikiMod.checkAndRecordWikipediaArticleQuota({ callerKey: 'u1', host: 'en.wikipedia.org', now: 2_000, limitPerHour: 2 });
+  const q3 = wikiMod.checkAndRecordWikipediaArticleQuota({ callerKey: 'u1', host: 'en.wikipedia.org', now: 3_000, limitPerHour: 2 });
+  const qAfterHour = wikiMod.checkAndRecordWikipediaArticleQuota({
+    callerKey: 'u1',
+    host: 'en.wikipedia.org',
+    now: 3_605_000,
+    limitPerHour: 2,
+  });
+  assert.equal(q1.allowed, true);
+  assert.equal(q2.allowed, true);
+  assert.equal(q3.allowed, false);
+  if (!q3.allowed) assert.equal(q3.block.outcome, 'use_bulk_channel');
+  assert.equal(qAfterHour.allowed, true);
+  wikiMod.resetWikipediaStateForTests();
+
+  // Animated counter deduplication (`arena.ai`: `"382,831,172 3 8 2, 8 3 1, 1 7 2"` & bold/newline variants + unquoted `aria-hidden=true`)
+  const { finalizeScrapedMarkdown, extractHtmlDocument } = await import('../src/scrape');
+  const animOut = finalizeScrapedMarkdown('Total votes: **382,831,172**\n3 8 2, 8 3 1, 1 7 2 across 142 models.', {
+    isPdf: false,
+    includeImages: true,
+  });
+  assert.equal(animOut.markdown, 'Total votes: **382,831,172** across 142 models.');
+  const unquotedAriaDoc = extractHtmlDocument(
+    '<html><body><main><p>Votes: <span>382,831,172</span> <span aria-hidden=true>3 8 2, 8 3 1, 1 7 2</span></p></main></body></html>',
+    { baseUrl: 'https://arena.ai/leaderboard' },
+  );
+  assert.equal(unquotedAriaDoc.markdown.includes('3 8 2'), false);
+  assert.equal(unquotedAriaDoc.markdown.includes('382,831,172'), true);
+
+  // Workday single-posting: CXS 403 falls back to HTML `JobPosting` JSON-LD with ZERO browser render (`0` `auto-render-1` calls!)
+  const wdFallbackCalls: string[] = [];
+  const wdLdHtml = `<!doctype html><html><head><title>Senior AI Cloud Platform Engineer</title>
+    <script type="application/ld+json">${JSON.stringify({
+      '@context': 'https://schema.org',
+      '@type': 'JobPosting',
+      title: 'Senior AI Cloud Platform Engineer',
+      datePosted: '2026-11-22',
+      hiringOrganization: { '@type': 'Organization', name: 'Allstate' },
+      jobLocationType: 'TELECOMMUTE',
+      description:
+        '<p>Design distributed AI cloud platforms at scale across multi-region clusters. Compensation range for this role is $175,000 - $232,000 USD annually plus bonus.</p>',
+    })}</script></head><body><div id="root"></div><script src="/app.js"></script></body></html>`;
+  const wdScrapeOut = await executeScrapeCall({
+    payload: {
+      url: 'https://allstate.wd5.myworkdayjobs.com/en-US/allstate_careers/job/Senior-AI-Cloud-Platform-Engineer_R33006',
+      renderMode: 'auto',
+    },
+    env: {},
+    executeHubFetch: async (_t, rawReq) => {
+      const parsed = JSON.parse(rawReq) as { requests: Array<{ id: string; url: string; kind?: string }> };
+      const r0 = parsed.requests[0]!;
+      wdFallbackCalls.push(`${r0.id}:${r0.kind ?? 'page'}:${r0.url}`);
+      if (r0.url.includes('/wday/cxs/')) {
+        return {
+          status: 200,
+          via: 'agent:site-win-vm',
+          bodyText: JSON.stringify({ results: [{ id: r0.id, url: r0.url, status: 403, outcome: 'error', problem: 'HTTP 403' }] }),
+        };
+      }
+      return {
+        status: 200,
+        via: 'agent:site-win-vm',
+        bodyText: JSON.stringify({
+          results: [{ id: r0.id, url: r0.url, status: 200, outcome: 'ok', contentType: 'text/html', body: wdLdHtml }],
+        }),
+      };
+    },
+  });
+  assert.equal(wdScrapeOut.status, 200);
+  assert.equal(
+    wdFallbackCalls.some((c) => c.includes('auto-render-1')),
+    false,
+    `Workday HTML with JobPosting JSON-LD must NOT trigger 12.5s auto-render-1: ${wdFallbackCalls.join(', ')}`,
+  );
+  assert.equal((wdScrapeOut.body.jobPosting as { pay?: { min: number } })?.pay?.min, 175_000);
+
+  // Pre-wave company scope filter skips unrelated third-party boards (`feathery`) & blind 4-ATS probes when Allstate Workday board is already found
+  resetJobsCacheForTests();
+  const allstateScrapedUrls: string[] = [];
+  await executeJobsCall({
+    payload: { company: 'allstate', query: 'Platform Engineer', includeBuiltIn: false },
+    env: {},
+    executeSearch: async () => ({
+      status: 200,
+      body: {
+        results: [
+          { url: 'https://allstate.wd5.myworkdayjobs.com/allstate_careers' },
+          { url: 'https://jobs.ashbyhq.com/feathery' },
+        ],
+      },
+    }),
+    executeScrape: async (args) => {
+      const u = String(args.url ?? '');
+      allstateScrapedUrls.push(u);
+      return { status: 200, body: { ok: true, extractorId: 'workday-board', jobs: [], total: 0, returned: 0, truncated: false } };
+    },
+  });
+  assert.equal(allstateScrapedUrls.some((u) => u.includes('feathery')), false, 'Unrelated company board feathery must be filtered before Wave 1');
+  assert.equal(
+    allstateScrapedUrls.some((u) => u.includes('smartrecruiters.com/allstate') || u.includes('greenhouse.io/allstate')),
+    false,
+    'Speculative 4-ATS probes must be skipped when ats_search already found a confirmed company board',
+  );
+
+  // `scrubSpanToDevErrorReport` ignores expected `not_found`, `blocked`, `skip`, and wrapper `mcp_tool_error` spans
+  const { scrubSpanToDevErrorReport } = await import('../src/dev-telemetry');
+  assert.equal(
+    scrubSpanToDevErrorReport({
+      traceId: '1'.repeat(32),
+      spanId: '2'.repeat(16),
+      name: 'edgefetch.mcp.tool',
+      startTimeMs: 1,
+      endTimeMs: 2,
+      statusOk: false,
+      errorMessage: 'mcp_tool_error',
+      attributes: { 'http.response.status_code': 404, 'edgefetch.outcome': 'not_found' },
+    }),
+    null,
+  );
+  assert.equal(
+    scrubSpanToDevErrorReport({
+      traceId: '1'.repeat(32),
+      spanId: '3'.repeat(16),
+      name: 'edgefetch.mcp.tool',
+      startTimeMs: 1,
+      endTimeMs: 2,
+      statusOk: false,
+      errorMessage: 'mcp_tool_error',
+      attributes: {},
+    }),
+    null,
+  );
 });

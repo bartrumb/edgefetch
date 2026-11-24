@@ -3408,84 +3408,80 @@ func sanitizeAndResolveMarkdownProseLinksLinearGo(prose, baseURL string) string 
 	return neutralizeAllUnsafeMarkdownLinksLinearGo(joined)
 }
 
-func findHtmlCommentCloseEndGo(s string, ltIdx int, nextStd *int, nextBang *int, noCloseFrom *int) int {
-	bodyStart := ltIdx + 4
-	n := len(s)
-	if bodyStart < n && s[bodyStart] == '>' {
-		return bodyStart + 1
-	}
-	if bodyStart+1 < n && s[bodyStart] == '-' && s[bodyStart+1] == '>' {
-		return bodyStart + 2
-	}
-	if *noCloseFrom >= 0 && bodyStart >= *noCloseFrom {
-		return -1
-	}
-	if *nextStd != -1 && *nextStd < bodyStart {
-		rel := strings.Index(s[bodyStart:], "-->")
-		if rel < 0 {
-			*nextStd = -1
-		} else {
-			*nextStd = bodyStart + rel
-		}
-	}
-	if *nextBang != -1 && *nextBang < bodyStart {
-		rel := strings.Index(s[bodyStart:], "--!>")
-		if rel < 0 {
-			*nextBang = -1
-		} else {
-			*nextBang = bodyStart + rel
-		}
-	}
-	if *nextStd < 0 && *nextBang < 0 {
-		if *noCloseFrom < 0 || bodyStart < *noCloseFrom {
-			*noCloseFrom = bodyStart
-		}
-		return -1
-	}
-	if *nextStd >= 0 && (*nextBang < 0 || *nextStd <= *nextBang) {
-		return *nextStd + 3
-	}
-	return *nextBang + 4
-}
-
 func stripHtmlCommentsLinearGo(s string, allowPdfPageMarkers bool) string {
 	pos := strings.Index(s, "<!--")
 	if pos < 0 {
 		return s
 	}
+	n := len(s)
 	nextStd := -2
 	nextBang := -2
 	noCloseFrom := -1
 	var sb strings.Builder
+	wroteAny := false
 	cursor := 0
 
 	for pos >= 0 {
-		closeEnd := findHtmlCommentCloseEndGo(s, pos, &nextStd, &nextBang, &noCloseFrom)
+		bodyStart := pos + 4
+		closeEnd := -1
+		if bodyStart < n && s[bodyStart] == '>' {
+			closeEnd = bodyStart + 1
+		} else if bodyStart+1 < n && s[bodyStart] == '-' && s[bodyStart+1] == '>' {
+			closeEnd = bodyStart + 2
+		} else if noCloseFrom < 0 || bodyStart < noCloseFrom {
+			if nextStd != -1 && nextStd < bodyStart {
+				rel := strings.Index(s[bodyStart:], "-->")
+				if rel < 0 {
+					nextStd = -1
+				} else {
+					nextStd = bodyStart + rel
+				}
+			}
+			if nextBang != -1 && nextBang < bodyStart {
+				rel := strings.Index(s[bodyStart:], "--!>")
+				if rel < 0 {
+					nextBang = -1
+				} else {
+					nextBang = bodyStart + rel
+				}
+			}
+			if nextStd < 0 && nextBang < 0 {
+				if noCloseFrom < 0 || bodyStart < noCloseFrom {
+					noCloseFrom = bodyStart
+				}
+			} else if nextStd >= 0 && (nextBang < 0 || nextStd <= nextBang) {
+				closeEnd = nextStd + 3
+			} else {
+				closeEnd = nextBang + 4
+			}
+		}
+
 		if closeEnd < 0 {
 			// No `-->` or `--!>` exists anywhere after `pos + 4`: jump directly to any abrupt `<!-->` / `<!--->` if present!
-			abrupt1 := strings.Index(s[pos+4:], "<!-->")
-			abrupt2 := strings.Index(s[pos+4:], "<!--->")
+			abrupt1 := strings.Index(s[bodyStart:], "<!-->")
+			abrupt2 := strings.Index(s[bodyStart:], "<!--->")
 			if abrupt1 < 0 && abrupt2 < 0 {
 				break
 			}
 			if abrupt1 >= 0 && (abrupt2 < 0 || abrupt1 <= abrupt2) {
-				pos = pos + 4 + abrupt1
+				pos = bodyStart + abrupt1
 			} else {
-				pos = pos + 4 + abrupt2
+				pos = bodyStart + abrupt2
 			}
 			continue
 		}
 		if allowPdfPageMarkers {
 			lineStart := strings.LastIndexByte(s[:pos], '\n') + 1
 			lineEndRel := strings.IndexByte(s[closeEnd:], '\n')
-			lineEnd := len(s)
+			lineEnd := n
 			if lineEndRel >= 0 {
 				lineEnd = closeEnd + lineEndRel
 			}
 			if strings.Trim(s[lineStart:pos], " \t") == "" && strings.Trim(s[closeEnd:lineEnd], " \t\r") == "" &&
 				isVerifiedPdfPageMarkerLineGo(s[pos:closeEnd]) {
-				if cursor == 0 && sb.Cap() == 0 {
-					sb.Grow(len(s))
+				if !wroteAny {
+					sb.Grow(n)
+					wroteAny = true
 				}
 				sb.WriteString(s[cursor:closeEnd])
 				cursor = closeEnd
@@ -3497,10 +3493,13 @@ func stripHtmlCommentsLinearGo(s string, allowPdfPageMarkers bool) string {
 				continue
 			}
 		}
-		if cursor == 0 && sb.Cap() == 0 {
-			sb.Grow(len(s))
+		if pos > cursor {
+			if !wroteAny {
+				sb.Grow(n)
+				wroteAny = true
+			}
+			sb.WriteString(s[cursor:pos])
 		}
-		sb.WriteString(s[cursor:pos])
 		cursor = closeEnd
 		rel := strings.Index(s[cursor:], "<!--")
 		if rel < 0 {
@@ -3511,7 +3510,10 @@ func stripHtmlCommentsLinearGo(s string, allowPdfPageMarkers bool) string {
 	if cursor == 0 {
 		return s
 	}
-	if cursor < len(s) {
+	if !wroteAny {
+		return s[cursor:]
+	}
+	if cursor < n {
 		sb.WriteString(s[cursor:])
 	}
 	return sb.String()

@@ -449,12 +449,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"runtime": "go-hub",
 			"version": agent.Version,
 			"capabilities": map[string]bool{
-				"fetch":         true,
-				"scrape":        true,
-				"extractors":    true,
-				"mcp":           true,
-				"artifacts":     true,
-				"localFallback": s.cfg.FallbackCrawler != nil,
+				"fetch":           true,
+				"scrape":          true,
+				"extractors":      true,
+				"mcp":             true,
+				"artifacts":       true,
+				"localFallback":   s.cfg.FallbackCrawler != nil,
+				"trackerBlocking": false,
+			},
+			"trackerBlocking": map[string]any{
+				"available": false,
+				"reason":    "unavailable_in_go_hub_mode",
 			},
 		})
 
@@ -1000,9 +1005,11 @@ func (s *Server) ListAgents() map[string]any {
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].SiteID < list[j].SiteID })
 	return map[string]any{
-		"connected":         len(list),
-		"distinctPublicIps": len(ips),
-		"agents":            list,
+		"connected":                len(list),
+		"distinctPublicIps":        len(ips),
+		"trackerBlockingAvailable": false,
+		"trackerListVersion":       nil,
+		"agents":                   list,
 	}
 }
 

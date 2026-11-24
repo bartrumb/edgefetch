@@ -124,6 +124,7 @@ type Task struct {
 	Screenshot         bool
 	ScreenshotFullPage bool
 	ScreenshotQuality  int
+	BlockTrackers      *bool // nil defaults to true when a tracker list is loaded on Renderer; false disables for this Task
 	Actions            []InteractAction
 	SessionID          string // Optional existing session to resume
 	KeepSession        bool   // Retain tab open for follow-up `interact` calls
@@ -144,6 +145,7 @@ type Output struct {
 	CapturedJSON      []CapturedJSONResponse
 	PDFBase64         string
 	SessionID         string
+	BlockedTrackers   int
 }
 
 type fetchHeaderEntry struct {
@@ -185,6 +187,10 @@ type retainedSession struct {
 	lastCheckedURL        string
 	hasExtraHeaders       bool
 	extraHeaders          map[string]string
+	renderer              *Renderer
+	blockTrackersStep     bool
+	stepTargetURL         string
+	stepBlockedTrackers   int
 	fetchEnabled          bool
 	stopFetchOnce         sync.Once
 	stopFetchCh           chan struct{}
@@ -285,31 +291,15 @@ func stripURLFragment(raw string) string {
 	return s
 }
 
-func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cdpConn, hdrs map[string]string, stageUntilNavCommit ...bool) error {
-	if s == nil || len(hdrs) == 0 {
+func (s *retainedSession) ensureFetchInterceptionEnabled(ctx context.Context, cdp *cdpConn) error {
+	if s == nil {
 		return nil
 	}
-	cloned := make(map[string]string, len(hdrs))
-	for k, v := range hdrs {
-		if tk := strings.TrimSpace(k); tk != "" {
-			cloned[tk] = v
-		}
-	}
-	if len(cloned) == 0 {
-		return nil
-	}
-
 	s.mu.Lock()
-	if len(stageUntilNavCommit) > 0 && stageUntilNavCommit[0] && s.hasCommittedDoc {
-		s.pendingStepHeaders = cloned
-	} else {
-		s.extraHeaders = cloned
-		s.pendingStepHeaders = nil
-	}
-	s.hasExtraHeaders = true
 	needEnable := !s.fetchEnabled
 	if needEnable {
 		s.fetchEnabled = true
+		s.stopFetchOnce = sync.Once{}
 		s.stopFetchCh = make(chan struct{})
 	}
 	stopCh := s.stopFetchCh
@@ -363,6 +353,42 @@ func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cd
 	}
 	s.seedFrameTree(ctx, cdp)
 	return nil
+}
+
+func (s *retainedSession) enableOriginScopedHeaders(ctx context.Context, cdp *cdpConn, hdrs map[string]string, stageUntilNavCommit ...bool) error {
+	if s == nil || len(hdrs) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(hdrs))
+	for k, v := range hdrs {
+		if tk := strings.TrimSpace(k); tk != "" {
+			cloned[tk] = v
+		}
+	}
+	if len(cloned) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	if len(stageUntilNavCommit) > 0 && stageUntilNavCommit[0] && s.hasCommittedDoc {
+		s.pendingStepHeaders = cloned
+	} else {
+		s.extraHeaders = cloned
+		s.pendingStepHeaders = nil
+	}
+	s.hasExtraHeaders = true
+	s.mu.Unlock()
+
+	return s.ensureFetchInterceptionEnabled(ctx, cdp)
+}
+
+func (s *retainedSession) snapshotBlockedTrackers() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stepBlockedTrackers
 }
 
 // hasPositiveSameOriginProof requires at least one of Origin or Referer to be explicitly present and match initOrigin,
@@ -911,6 +937,40 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	if isChildFrame {
 		s.setFrameTaintedLocked(paused.FrameID, true)
 	}
+
+	// Third-party tracker blocking: subresources ONLY (never Document navigations on main or child frames).
+	if s.blockTrackersStep && !isDocReq && paused.ResourceType != "" && s.renderer != nil {
+		pageDocURL := s.committedDocURL
+		targetURL := s.stepTargetURL
+		if targetURL == "" {
+			targetURL = s.lastCheckedURL
+		}
+		if s.renderer.shouldBlockTrackerSubresource(paused.Request.URL, pageDocURL, targetURL) {
+			s.stepBlockedTrackers++
+			s.mu.Unlock()
+			go func() {
+				cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				_ = cdp.call(cctx, cdpSID, "Fetch.failRequest", map[string]any{
+					"requestId":   paused.RequestID,
+					"errorReason": "BlockedByClient",
+				}, nil)
+			}()
+			return
+		}
+	}
+
+	// Fast-path when Fetch interception is active purely for tracker blocking (no custom task.Headers on this session):
+	if !s.hasExtraHeaders && len(extra) == 0 && len(pendingExtra) == 0 {
+		s.mu.Unlock()
+		go func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = cdp.call(cctx, cdpSID, "Fetch.continueRequest", map[string]any{"requestId": paused.RequestID}, nil)
+		}()
+		return
+	}
+
 	isMainDoc := (isDocReq || paused.ResourceType == "") && !isChildFrame &&
 		(s.mainFrameID == "" || paused.FrameID == "" || paused.FrameID == s.mainFrameID)
 
@@ -1288,6 +1348,218 @@ type Renderer struct {
 	lastUsedAt       time.Time
 	closed           bool
 	otelExp          *otel.Exporter
+
+	trackerMu       sync.RWMutex
+	trackerVersion  string
+	trackerHosts    map[string]struct{}
+	extraNeverBlock map[string]struct{}
+}
+
+// hardcodedNeverBlockHostSuffixes holds bot-challenge/WAF providers and feature-flag/A-B SDK domains
+// that must never be blocked during headless Chromium rendering even if present in an upstream filter list.
+var hardcodedNeverBlockHostSuffixes = map[string]struct{}{
+	// Bot-challenge & WAF hosts
+	"challenges.cloudflare.com": {},
+	"datadome.co":               {},
+	"captcha-delivery.com":      {},
+	"perimeterx.net":            {},
+	"px-cdn.net":                {},
+	"px-cloud.net":              {},
+	"pxchk.net":                 {},
+	"humansecurity.com":         {},
+	"hsprotect.net":             {},
+	"akamaihd.net":              {},
+	"akamaized.net":             {},
+	"akstat.io":                 {},
+	"go-mpulse.net":             {},
+	"arkoselabs.com":            {},
+	"funcaptcha.com":            {},
+	"recaptcha.net":             {},
+	"google.com":                {},
+	"gstatic.com":               {},
+	"hcaptcha.com":              {},
+	// Feature-flag / A-B SDKs
+	"launchdarkly.com":  {},
+	"optimizely.com":    {},
+	"statsig.com":       {},
+	"statsigapi.net":    {},
+	"featureassets.org": {},
+	"split.io":          {},
+	"growthbook.io":     {},
+}
+
+func hostMatchesSetLinear(host string, set map[string]struct{}) bool {
+	if len(set) == 0 || host == "" {
+		return false
+	}
+	for cur := host; ; {
+		if _, ok := set[cur]; ok {
+			return true
+		}
+		dot := strings.IndexByte(cur, '.')
+		if dot < 0 {
+			return false
+		}
+		cur = cur[dot+1:]
+	}
+}
+
+func isSameOrSubdomainOrParentHost(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if len(a) > len(b) && a[len(a)-len(b)-1] == '.' && strings.HasSuffix(a, b) {
+		return true
+	}
+	if len(b) > len(a) && b[len(b)-len(a)-1] == '.' && strings.HasSuffix(b, a) {
+		return true
+	}
+	return false
+}
+
+func canonicalNonIPDotHost(rawHost string) string {
+	h := politeness.CanonicalHost(rawHost)
+	if h == "" || !strings.Contains(h, ".") || net.ParseIP(h) != nil {
+		return ""
+	}
+	return h
+}
+
+func hostFromHTTPURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	scheme := strings.ToLower(strings.TrimSpace(u.Scheme))
+	if scheme != "https" && scheme != "http" {
+		return ""
+	}
+	return canonicalNonIPDotHost(u.Hostname())
+}
+
+// SetTrackerList atomically updates the in-memory EasyPrivacy host set on Renderer.
+// Hosts are kept strictly in memory; passing an empty version or empty host list disables blocking.
+func (r *Renderer) SetTrackerList(version string, hosts []string, extraNeverBlockHosts ...string) {
+	if r == nil {
+		return
+	}
+	ver := strings.TrimSpace(version)
+	if ver == "" || len(hosts) == 0 {
+		r.trackerMu.Lock()
+		r.trackerVersion = ""
+		r.trackerHosts = nil
+		r.extraNeverBlock = nil
+		r.trackerMu.Unlock()
+		return
+	}
+	var extraAllow map[string]struct{}
+	for _, rawAllow := range extraNeverBlockHosts {
+		if h := canonicalNonIPDotHost(rawAllow); h != "" {
+			if extraAllow == nil {
+				extraAllow = make(map[string]struct{}, len(extraNeverBlockHosts))
+			}
+			extraAllow[h] = struct{}{}
+		}
+	}
+	set := make(map[string]struct{}, len(hosts))
+	for _, rawH := range hosts {
+		h := canonicalNonIPDotHost(rawH)
+		if h == "" {
+			continue
+		}
+		if hostMatchesSetLinear(h, hardcodedNeverBlockHostSuffixes) || hostMatchesSetLinear(h, extraAllow) {
+			continue
+		}
+		if extract.IsPublicOrPrivateSuffix(h) {
+			continue
+		}
+		set[h] = struct{}{}
+	}
+	r.trackerMu.Lock()
+	if len(set) == 0 {
+		r.trackerVersion = ""
+		r.trackerHosts = nil
+		r.extraNeverBlock = nil
+	} else {
+		r.trackerVersion = ver
+		r.trackerHosts = set
+		r.extraNeverBlock = extraAllow
+	}
+	r.trackerMu.Unlock()
+}
+
+// TrackerListVersion returns the currently loaded in-memory tracker list version (or "" if none is loaded).
+func (r *Renderer) TrackerListVersion() string {
+	if r == nil {
+		return ""
+	}
+	r.trackerMu.RLock()
+	defer r.trackerMu.RUnlock()
+	return r.trackerVersion
+}
+
+func (r *Renderer) hasTrackerList() bool {
+	if r == nil {
+		return false
+	}
+	r.trackerMu.RLock()
+	n := len(r.trackerHosts)
+	r.trackerMu.RUnlock()
+	return n > 0
+}
+
+func (r *Renderer) shouldBlockTrackerSubresource(rawReqURL, pageDocURL, targetURL string) bool {
+	if r == nil {
+		return false
+	}
+	reqHost := hostFromHTTPURL(rawReqURL)
+	if reqHost == "" {
+		return false
+	}
+	r.trackerMu.RLock()
+	trackerSet := r.trackerHosts
+	extraAllow := r.extraNeverBlock
+	r.trackerMu.RUnlock()
+	if len(trackerSet) == 0 {
+		return false
+	}
+	if hostMatchesSetLinear(reqHost, hardcodedNeverBlockHostSuffixes) || hostMatchesSetLinear(reqHost, extraAllow) {
+		return false
+	}
+	if !hostMatchesSetLinear(reqHost, trackerSet) {
+		return false
+	}
+	pageHost := hostFromHTTPURL(pageDocURL)
+	targetHost := hostFromHTTPURL(targetURL)
+	if pageHost == "" && targetHost == "" {
+		return false
+	}
+	if isSameOrSubdomainOrParentHost(reqHost, pageHost) || isSameOrSubdomainOrParentHost(reqHost, targetHost) {
+		return false
+	}
+	reqReg, reqOK := extract.LookupKnownRegistrableDomain(reqHost)
+	if !reqOK {
+		return false
+	}
+	if pageHost != "" {
+		pageReg, pageOK := extract.LookupKnownRegistrableDomain(pageHost)
+		if !pageOK || reqReg == pageReg {
+			return false
+		}
+	}
+	if targetHost != "" {
+		targetReg, targetOK := extract.LookupKnownRegistrableDomain(targetHost)
+		if !targetOK || reqReg == targetReg {
+			return false
+		}
+	}
+	return true
 }
 
 func isSandboxRequiredByEnv() bool {
@@ -1500,12 +1772,13 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 				StatusOK:     retErr == nil,
 				ErrorMessage: errMsg,
 				Attributes: map[string]any{
-					"url.full":                otel.SanitizeURL(task.URL),
-					"browser.status":          out.Status,
-					"browser.rendered_bytes":  len(out.HTML),
-					"browser.actions_count":   len(task.Actions),
-					"browser.session_resumed": task.SessionID != "",
-					"browser.screenshot":      task.Screenshot,
+					"url.full":                 otel.SanitizeURL(task.URL),
+					"browser.status":           out.Status,
+					"browser.rendered_bytes":   len(out.HTML),
+					"browser.actions_count":    len(task.Actions),
+					"browser.session_resumed":  task.SessionID != "",
+					"browser.screenshot":       task.Screenshot,
+					"browser.blocked_trackers": out.BlockedTrackers,
 				},
 			})
 		}()
@@ -1548,6 +1821,8 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 	}
 	r.reapExpiredSessions(ctx, cdp)
 
+	wantBlockTrackers := r.hasTrackerList() && (task.BlockTrackers == nil || *task.BlockTrackers)
+
 	var (
 		sess    *retainedSession
 		resumed bool
@@ -1564,11 +1839,6 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		if !resumed {
 			return Output{}, fmt.Errorf("unknown or expired browser session %q", task.SessionID)
 		}
-		sess.mu.Lock()
-		if sess.lastCheckedURL != "" {
-			sess.hasCommittedDoc = true
-		}
-		sess.mu.Unlock()
 		navTarget := task.URL
 		if navTarget == "" {
 			for _, a := range task.Actions {
@@ -1578,6 +1848,19 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 				}
 			}
 		}
+		sess.mu.Lock()
+		if sess.lastCheckedURL != "" {
+			sess.hasCommittedDoc = true
+		}
+		sess.renderer = r
+		sess.blockTrackersStep = wantBlockTrackers
+		if navTarget != "" {
+			sess.stepTargetURL = navTarget
+		} else {
+			sess.stepTargetURL = sess.lastCheckedURL
+		}
+		sess.stepBlockedTrackers = 0
+		sess.mu.Unlock()
 		if len(task.Headers) > 0 {
 			if navTarget != "" {
 				upOrigin := canonicalURLOrigin(navTarget)
@@ -1617,6 +1900,11 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 				sess.redirectedCrossOrigin = true
 			}
 			sess.mu.Unlock()
+		}
+		if wantBlockTrackers && !sess.isFetchEnabled() {
+			if err := sess.ensureFetchInterceptionEnabled(ctx, cdp); err != nil {
+				return Output{}, err
+			}
 		}
 		if !sess.isFetchEnabled() || sess.getMainFrameID() == "" {
 			sess.seedFrameTree(ctx, cdp)
@@ -1690,16 +1978,28 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": bcOut.BrowserContextID}, nil)
 			return Output{}, errors.New("cannot scope request headers: navigation target has no canonical http(s) origin")
 		}
+		initTargetURL := task.URL
+		if initTargetURL == "" {
+			for _, a := range task.Actions {
+				if strings.EqualFold(strings.TrimSpace(a.Type), "navigate") {
+					initTargetURL = strings.TrimSpace(a.URL)
+					break
+				}
+			}
+		}
 		sess = &retainedSession{
-			id:               sid,
-			browserContextID: bcOut.BrowserContextID,
-			targetID:         tgtOut.TargetID,
-			cdpSessionID:     attOut.SessionID,
-			initialOrigin:    initOrigin,
-			hasExtraHeaders:  len(task.Headers) > 0,
-			lastUsed:         time.Now(),
-			lastStatus:       http.StatusOK,
-			lastHeaders:      make(http.Header),
+			id:                sid,
+			browserContextID:  bcOut.BrowserContextID,
+			targetID:          tgtOut.TargetID,
+			cdpSessionID:      attOut.SessionID,
+			initialOrigin:     initOrigin,
+			hasExtraHeaders:   len(task.Headers) > 0,
+			renderer:          r,
+			blockTrackersStep: wantBlockTrackers,
+			stepTargetURL:     initTargetURL,
+			lastUsed:          time.Now(),
+			lastStatus:        http.StatusOK,
+			lastHeaders:       make(http.Header),
 		}
 
 		_ = cdp.call(ctx, sess.cdpSessionID, "Page.enable", nil, nil)
@@ -1736,6 +2036,12 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		}
 		if len(task.Headers) > 0 {
 			if err := sess.enableOriginScopedHeaders(ctx, cdp, task.Headers); err != nil {
+				_ = cdp.call(context.Background(), "", "Target.closeTarget", map[string]any{"targetId": sess.targetID}, nil)
+				_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": sess.browserContextID}, nil)
+				return Output{}, err
+			}
+		} else if wantBlockTrackers {
+			if err := sess.ensureFetchInterceptionEnabled(ctx, cdp); err != nil {
 				_ = cdp.call(context.Background(), "", "Target.closeTarget", map[string]any{"targetId": sess.targetID}, nil)
 				_ = cdp.call(context.Background(), "", "Target.disposeBrowserContext", map[string]any{"browserContextId": sess.browserContextID}, nil)
 				return Output{}, err
@@ -1830,7 +2136,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 			}
 			if why := extract.DetectRenderedChallenge(preHTML); why != "" {
 				st, hClone := sess.snapshotResponseMeta()
-				return Output{Status: st, Headers: hClone}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
+				return Output{Status: st, Headers: hClone, BlockedTrackers: sess.snapshotBlockedTrackers()}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
 			}
 		}
 	}
@@ -1849,26 +2155,26 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		ar, err := r.runActionStep(ctx, cdp, sess, events, i, act, &actionScreenshots, &actionScrapes, &jsReturns, &pdfBase64)
 		if err != nil {
 			stErr, hErr := sess.snapshotResponseMeta()
-			return Output{Status: stErr, Headers: hErr, ActionResults: actionResults}, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
+			return Output{Status: stErr, Headers: hErr, ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, fmt.Errorf("interact action %d (%s): %w", i, act.Type, err)
 		}
 		actionResults = append(actionResults, ar)
 	}
 
 	htmlStr, finalURL, err := readDocumentHTML(ctx, cdp, sess.cdpSessionID)
 	if err != nil {
-		return Output{ActionResults: actionResults}, err
+		return Output{ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, err
 	}
 	if vErr := r.validateFinalURL(ctx, sess, finalURL, task.URL); vErr != nil {
-		return Output{ActionResults: actionResults}, vErr
+		return Output{ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, vErr
 	}
 	for i := range actionScrapes {
 		if vErr := r.validateFinalURL(ctx, sess, actionScrapes[i].URL, task.URL); vErr != nil {
-			return Output{ActionResults: actionResults}, vErr
+			return Output{ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, vErr
 		}
 	}
 	st, hClone := sess.snapshotResponseMeta()
 	if why := extract.DetectRenderedChallenge(htmlStr); why != "" {
-		return Output{Status: st, Headers: hClone, FinalURL: finalURL, ActionResults: actionResults}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
+		return Output{Status: st, Headers: hClone, FinalURL: finalURL, ActionResults: actionResults, BlockedTrackers: sess.snapshotBlockedTrackers()}, fmt.Errorf("%w: %s", ErrChallengeDetected, why)
 	}
 
 	stopAndDrainHarvester()
@@ -1905,6 +2211,7 @@ func (r *Renderer) Execute(ctx context.Context, task Task) (out Output, retErr e
 		ActionResults:     actionResults,
 		CapturedJSON:      capturedJSON,
 		PDFBase64:         pdfBase64,
+		BlockedTrackers:   sess.snapshotBlockedTrackers(),
 	}
 	if task.KeepSession && !task.CloseSession {
 		out.SessionID = sess.id

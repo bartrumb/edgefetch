@@ -25,6 +25,16 @@ import { ADMIN_COOKIE_NAME, verifyAdminSessionCookie, type OAuthTokenRecord } fr
 import { markRequestVerifiedInProcess } from '../src/otel';
 import { normalizeClientRateLimitIp } from '../src/safe-input';
 import { LocalAgentHubCoordinator, NodeFsR2Bucket, NodeSqliteD1Database } from './node-adapters';
+import {
+  buildTrackerListWsFrames,
+  DAILY_TRACKER_POLL_INTERVAL_MS,
+  INITIAL_PORTABLE_TRACKER_DELAY_MS,
+  isTrackerListDisabled,
+  loadStoredTrackerList,
+  refreshHubTrackerList,
+  resolveExtraNeverBlockHosts,
+  type RefreshTrackerListOutcome,
+} from '../src/tracker-list';
 import { S3ArtifactBucket } from './s3-bucket';
 import { createSafeOutboundFetch, type LookupResolverFn } from './safe-fetch';
 import { TursoHttpD1Database } from './turso-d1';
@@ -71,6 +81,8 @@ export interface PortableHubOptions {
   env?: Record<string, string | undefined>;
   envOverrides?: Record<string, string | undefined>;
   dnsResolver?: LookupResolverFn;
+  trackerFetchImpl?: typeof fetch;
+  initialTrackerDelayMs?: number;
   maxInflightPerIp?: number;
   maxInflightTotal?: number;
   maxConnectionsPerIp?: number;
@@ -727,6 +739,7 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     GEMINI_API_KEY: mergedEnv.GEMINI_API_KEY,
     EDGEFETCH_PUBLIC_ORIGIN: explicitPublicOrigin ?? mergedEnv.EDGEFETCH_PUBLIC_ORIGIN,
     EDGEFETCH_DISABLE_UPDATE_CHECK: mergedEnv.EDGEFETCH_DISABLE_UPDATE_CHECK,
+    EDGEFETCH_TRACKER_LIST: mergedEnv.EDGEFETCH_TRACKER_LIST,
     EDGEFETCH_DEV_TELEMETRY: mergedEnv.EDGEFETCH_DEV_TELEMETRY,
     EDGEFETCH_DEV_TELEMETRY_ENDPOINT: mergedEnv.EDGEFETCH_DEV_TELEMETRY_ENDPOINT,
     EDGEFETCH_DEV_TELEMETRY_URL: mergedEnv.EDGEFETCH_DEV_TELEMETRY_URL,
@@ -2211,16 +2224,84 @@ export function startPortableHub(opts: PortableHubOptions = {}) {
     }
   });
 
-  return new Promise<{ server: typeof server; port: number; close: () => Promise<void> }>((resolveStart, rejectStart) => {
+  const resolveTrackerSelfHost = (): string | undefined => {
+    try {
+      return new URL(resolveCanonicalOrigin()).hostname;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const runPortableTrackerRefresh = async (overrideOpts?: {
+    forceAfter6hOverrideForTest?: boolean;
+  }): Promise<RefreshTrackerListOutcome> => {
+    const settingVal =
+      typeof coordinatorStub?.getHubSetting === 'function'
+        ? await coordinatorStub.getHubSetting('tracker_list').catch(() => null)
+        : null;
+    const selfHostName = resolveTrackerSelfHost();
+    const out = await refreshHubTrackerList({
+      bucket: artifactsBucket,
+      fetchFn: opts.trackerFetchImpl ?? safePublicFetch,
+      env: workerEnv as { EDGEFETCH_TRACKER_LIST?: string },
+      hubSettingValue: settingVal,
+      selfHost: selfHostName,
+      publicOrigin: explicitPublicOrigin ?? undefined,
+      ...(overrideOpts?.forceAfter6hOverrideForTest ? { forceAfter6hOverrideForTest: true } : {}),
+    });
+    if (out.current) {
+      const extraAllow = resolveExtraNeverBlockHosts({
+        selfHost: selfHostName,
+        publicOrigin: explicitPublicOrigin ?? undefined,
+      });
+      coordinator.syncTrackerList(out.current.meta.version, buildTrackerListWsFrames(out.current, extraAllow));
+    }
+    return out;
+  };
+
+  if (!isTrackerListDisabled(workerEnv as { EDGEFETCH_TRACKER_LIST?: string })) {
+    void loadStoredTrackerList(artifactsBucket)
+      .then((stored) => {
+        if (!stored) return;
+        const extraAllow = resolveExtraNeverBlockHosts({
+          selfHost: resolveTrackerSelfHost(),
+          publicOrigin: explicitPublicOrigin ?? undefined,
+        });
+        coordinator.syncTrackerList(stored.meta.version, buildTrackerListWsFrames(stored, extraAllow));
+      })
+      .catch(() => undefined);
+  }
+
+  return new Promise<{
+    server: typeof server;
+    port: number;
+    refreshTrackerListNow: (opts?: { forceAfter6hOverrideForTest?: boolean }) => Promise<RefreshTrackerListOutcome>;
+    close: () => Promise<void>;
+  }>((resolveStart, rejectStart) => {
     server.once('error', rejectStart);
     server.listen(port, host, 2048, () => {
       const addr = server.address();
       boundPort = typeof addr === 'object' && addr ? addr.port : port;
+      let initialTrackerTimer: ReturnType<typeof setTimeout> | undefined;
+      let dailyTrackerTimer: ReturnType<typeof setInterval> | undefined;
+      if (!isTrackerListDisabled(workerEnv as { EDGEFETCH_TRACKER_LIST?: string })) {
+        initialTrackerTimer = setTimeout(() => {
+          void runPortableTrackerRefresh().catch(() => undefined);
+        }, opts.initialTrackerDelayMs ?? INITIAL_PORTABLE_TRACKER_DELAY_MS);
+        initialTrackerTimer.unref?.();
+        dailyTrackerTimer = setInterval(() => {
+          void runPortableTrackerRefresh().catch(() => undefined);
+        }, DAILY_TRACKER_POLL_INTERVAL_MS);
+        dailyTrackerTimer.unref?.();
+      }
       resolveStart({
         server,
         port: boundPort,
+        refreshTrackerListNow: runPortableTrackerRefresh,
         close: () =>
           new Promise<void>((resClose) => {
+            if (initialTrackerTimer) clearTimeout(initialTrackerTimer);
+            if (dailyTrackerTimer) clearInterval(dailyTrackerTimer);
             clearInterval(pressureSweepTimer);
             coordinator.close();
             for (const client of wss.clients) {

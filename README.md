@@ -7,7 +7,7 @@
 
 **EdgeFetch** turns URLs into clean Markdown and structured JSON for AI agents via CLI, `stdio` MCP, or HTTP — combining an **open-source worker, SDKs, and adapters ([MIT](LICENSE)), fair-source hub ([FSL-1.1](hub/LICENSE), `MIT` after two years)**. The worker and CLI ship as a single static Go binary with `1` external Go dependency ([`github.com/coder/websocket`](go.mod)), enforce `robots.txt` (RFC 9309) and `Content-Signal: ai-input` on every hop including redirects, stop immediately on the first CAPTCHA or anti-bot challenge, and pair with `56` readable declarative YAML site adapters in [`internal/extract/manifests/`](internal/extract/manifests) targeting public APIs, feeds, and pages.
 
-> Polite by default: enforces `robots.txt` and `Content-Signal` on every hop, identifies itself honestly (with optional RFC 9421 Web Bot Auth signatures), stops on anti-bot challenges instead of bypassing them, and makes **zero** background telemetry or update-check calls unless explicitly opted in (`DO_NOT_TRACK=1` hard-disables both).
+> Polite by default: enforces `robots.txt` and `Content-Signal` on every hop, identifies itself honestly (with optional RFC 9421 Web Bot Auth signatures), stops on anti-bot challenges instead of bypassing them, and makes **zero** background telemetry or update-check calls unless explicitly opted in (`DO_NOT_TRACK=1` hard-disables both). When running the Hub (`hub/`), the Hub makes one conditional daily `GET` to [`https://easylist.to/easylist/easyprivacy.txt`](https://easylist.to/easylist/easyprivacy.txt) ([EasyPrivacy Licence](https://easylist.to/pages/licence.html)) to block third-party tracking subresources during headless Chromium renders; set `EDGEFETCH_TRACKER_LIST=off` to disable that fetch completely (`0` requests). Standalone CLI (`edgefetch scrape`), local `stdio` MCP (`edgefetch mcp`), and worker nodes never fetch the list.
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ edgefetch scrape --json --query="concurrency" https://go.dev/doc/effective_go
 edgefetch init && edgefetch doctor
 ```
 
-Both `edgefetch scrape` and `edgefetch mcp` make **zero** background telemetry or update-check network calls by default (`EDGEFETCH_DEV_TELEMETRY` and `EDGEFETCH_CHECK_UPDATES` are strictly opt-in, and `DO_NOT_TRACK=1` hard-disables them).
+Both `edgefetch scrape` and `edgefetch mcp` make **zero** background telemetry, update-check, or tracker-list network calls (`EDGEFETCH_DEV_TELEMETRY` and `EDGEFETCH_CHECK_UPDATES` are strictly opt-in, `DO_NOT_TRACK=1` hard-disables them, and standalone Go modes never fetch `easylist.to`; on the Hub, set `EDGEFETCH_TRACKER_LIST=off` to disable the daily EasyPrivacy conditional fetch).
 
 ### 2. Self-Hosted Docker (`docker compose up -d` — Zero Cloud Account, No Redis or Postgres)
 

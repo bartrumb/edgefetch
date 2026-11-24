@@ -73,6 +73,7 @@ type Request struct {
 	WaitForMs          int               `json:"waitForMs,omitempty"`
 	WaitSelector       string            `json:"waitSelector,omitempty"`
 	MaxPages           int               `json:"maxPages,omitempty"`
+	BlockTrackers      *bool             `json:"blockTrackers,omitempty"`
 	Interact           *InteractSpec     `json:"interact,omitempty"`
 }
 
@@ -140,6 +141,7 @@ type Result struct {
 	Branding          *extract.BrandingProfile       `json:"branding,omitempty"`
 	Llms              *extract.LlmsDiscovery         `json:"llms,omitempty"`
 	Rendered          bool                           `json:"rendered,omitempty"`
+	BlockedTrackers   *int                           `json:"blockedTrackers,omitempty"`
 	SessionID         string                         `json:"sessionId,omitempty"`
 	ScreenshotBase64  string                         `json:"screenshotBase64,omitempty"`
 	ActionScreenshots []string                       `json:"actionScreenshots,omitempty"`
@@ -366,6 +368,22 @@ func (c *Crawler) SetRenderer(r *browser.Renderer) {
 	if r != nil && c.otelExp != nil {
 		r.SetOtelExporter(c.otelExp)
 	}
+}
+
+// SetTrackerList updates the in-memory EasyPrivacy tracker host set on the Crawler's headless browser renderer.
+func (c *Crawler) SetTrackerList(version string, hosts []string, extraNeverBlock ...string) {
+	if c == nil || c.renderer == nil {
+		return
+	}
+	c.renderer.SetTrackerList(version, hosts, extraNeverBlock...)
+}
+
+// TrackerListVersion returns the currently loaded in-memory tracker list version on the Crawler's renderer.
+func (c *Crawler) TrackerListVersion() string {
+	if c == nil || c.renderer == nil {
+		return ""
+	}
+	return c.renderer.TrackerListVersion()
 }
 
 // SetAllowNoSandboxBrowser configures whether the headless Chromium renderer may run with `--no-sandbox`

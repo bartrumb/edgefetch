@@ -1873,6 +1873,7 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
             screenshotArtifactId: { type: 'string' },
             screenshotMimeType: { type: 'string' },
             screenshotBytes: { type: 'integer' },
+            metadata: { type: 'object' },
           },
         },
         MapResponse: {
@@ -1927,6 +1928,7 @@ export function buildOpenApiSpec(options: BuildOpenApiOptions = {}): Record<stri
           properties: {
             connected: { type: 'integer' },
             distinctPublicIps: { type: 'integer' },
+            trackerListVersion: { type: ['string', 'null'] },
             agents: { type: 'array', items: { type: 'object' } },
           },
         },

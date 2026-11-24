@@ -373,10 +373,12 @@ function validatePublicHttpsUrl(
  */
 export function sanitizeFleetForMcp(fleet: {
   connected: number;
+  trackerListVersion?: string | null;
   agents: AgentAttachment[];
   affinities: AffinityPin[];
 }): {
   connected: number;
+  trackerListVersion: string | null;
   agents: Array<Omit<AgentAttachment, 'publicIp'> & Record<string, unknown>>;
   affinities: Array<{ siteId: string; expiresAt: number }>;
   activeCooldownCount: number;
@@ -384,6 +386,7 @@ export function sanitizeFleetForMcp(fleet: {
   const safeAffinities = (fleet.affinities ?? []).map(({ siteId, expiresAt }) => ({ siteId, expiresAt }));
   return {
     connected: fleet.connected,
+    trackerListVersion: typeof fleet.trackerListVersion === 'string' ? fleet.trackerListVersion : null,
     agents: (fleet.agents ?? []).map((agent) => {
       const {
         publicIp: _omitPublicIp,
@@ -733,6 +736,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
             description:
               'Optional external SPA renderer fallback when configured on the server (never used on robots.txt blocks, 403/429, or bot challenges).',
           },
+          blockTrackers: {
+            type: 'boolean',
+            default: true,
+            description:
+              'Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only).',
+          },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional worker site ID when target="agent".' },
         },
@@ -803,6 +812,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
             default: 'auto',
             description:
               'Optional external SPA renderer fallback when configured on the server (never used on robots.txt blocks, 403/429, or bot challenges).',
+          },
+          blockTrackers: {
+            type: 'boolean',
+            default: true,
+            description:
+              'Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only).',
           },
           target: { type: 'string', enum: allowedTargets, default: defaultTarget },
           site: { type: 'string', description: 'Optional worker site ID when target="agent".' },
@@ -1004,6 +1019,12 @@ export function buildCanonicalMcpToolSchemas(options?: {
             minimum: 0,
             default: 0,
             description: 'Character offset into the rendered Markdown for paging large pages.',
+          },
+          blockTrackers: {
+            type: 'boolean',
+            default: true,
+            description:
+              'Abort third-party tracking subresources during headless Chromium renders using the Hub EasyPrivacy host list (default true when loaded; set false to disable for this request only).',
           },
           site: { type: 'string', description: 'Optional browser-capable worker site ID.' },
         },

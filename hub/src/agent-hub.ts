@@ -55,6 +55,7 @@ export interface AgentAttachment {
   goVersion?: string;
   browserVersion?: string;
   browserSandbox?: 'on' | 'off' | 'unknown';
+  trackerListVersion?: string;
   publicIp?: string;
   capabilities?: string[];
   connectedAt: number;
@@ -580,6 +581,8 @@ export class AgentHubEngine {
   private readonly hostLocks = new Map<string, Promise<void>>();
   private readonly hostLockDepth = new Map<string, number>();
   private readonly siteLocks = new Map<string, Promise<void>>();
+  private activeTrackerListVersion: string | null = null;
+  private activeTrackerListFrames: string[] = [];
 
   constructor(deps: AgentHubDeps) {
     this.getSockets = deps.getSockets;
@@ -874,6 +877,7 @@ export class AgentHubEngine {
       goVersion?: string | null;
       browserVersion?: string | null;
       browserSandbox?: string | boolean | null;
+      trackerListVersion?: string | null;
       arch?: string | null;
       capabilities?: string[] | null;
     },
@@ -884,6 +888,7 @@ export class AgentHubEngine {
     const goVersion = sanitizeGoVersion(hello.goVersion) ?? raw.goVersion;
     const browserVersion = sanitizeBrowserVersion(hello.browserVersion) ?? raw.browserVersion;
     const browserSandbox = sanitizeBrowserSandbox(hello.browserSandbox) ?? raw.browserSandbox;
+    const trackerListVersion = sanitizeVersion(hello.trackerListVersion) ?? raw.trackerListVersion;
     const arch = hello.arch ? sanitizeArch(hello.arch) : raw.arch;
     const capabilities = sanitizeCapabilities(hello.capabilities) ?? raw.capabilities;
     const updated: AgentAttachment = {
@@ -893,10 +898,70 @@ export class AgentHubEngine {
       ...(goVersion ? { goVersion } : {}),
       ...(browserVersion ? { browserVersion } : {}),
       ...(browserSandbox ? { browserSandbox } : {}),
+      ...(trackerListVersion ? { trackerListVersion } : {}),
       ...(capabilities ? { capabilities } : {}),
     };
     ws.serializeAttachment(updated);
     return updated;
+  }
+
+  /** Records an agent's confirmation (`tracker_list_ack`) that it loaded a specific EasyPrivacy tracker list version. */
+  noteTrackerListAck(ws: HubSocketLike, version?: string | null): AgentAttachment | null {
+    const raw = ws.deserializeAttachment();
+    if (!isAttachment(raw)) return null;
+    const cleanVer = sanitizeVersion(version);
+    if (!cleanVer) return raw;
+    const updated: AgentAttachment = {
+      ...raw,
+      trackerListVersion: cleanVer,
+    };
+    ws.serializeAttachment(updated);
+    return updated;
+  }
+
+  /** Sends the currently active tracker list frames (if any) to a newly connected or reconnected agent socket. */
+  sendCurrentTrackerListToSocket(ws: HubSocketLike): void {
+    if (!this.activeTrackerListVersion || this.activeTrackerListFrames.length === 0) return;
+    if (!isOpenSocket(ws)) return;
+    for (const frame of this.activeTrackerListFrames) {
+      try {
+        ws.send(frame);
+      } catch {
+        break;
+      }
+    }
+  }
+
+  /**
+   * Updates the active tracker list held by the Hub coordinator and broadcasts it to all connected agent sockets
+   * whenever the version changes.
+   */
+  setTrackerListBroadcast(version: string | null, frames: string[]): void {
+    const cleanVer = version ? sanitizeVersion(version) ?? null : null;
+    if (!cleanVer || frames.length === 0) {
+      this.activeTrackerListVersion = null;
+      this.activeTrackerListFrames = [];
+      return;
+    }
+    const changed = this.activeTrackerListVersion !== cleanVer;
+    this.activeTrackerListVersion = cleanVer;
+    this.activeTrackerListFrames = [...frames];
+    if (changed) {
+      for (const ws of this.getSockets()) {
+        if (!isOpenSocket(ws)) continue;
+        for (const frame of this.activeTrackerListFrames) {
+          try {
+            ws.send(frame);
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  getTrackerListVersion(): string | null {
+    return this.activeTrackerListVersion;
   }
 
   /** Called from `webSocketClose` / `webSocketError` so in-flight jobs fail over immediately to another HAOS site. */
@@ -946,12 +1011,22 @@ export class AgentHubEngine {
   }
 
   /** Lists all currently connected HAOS remote agents and their health, version, and publicIp metadata. */
-  listAgents(): { connected: number; distinctPublicIps: number; agents: AgentAttachment[] } {
+  listAgents(): {
+    connected: number;
+    distinctPublicIps: number;
+    trackerListVersion: string | null;
+    agents: AgentAttachment[];
+  } {
     const agents = this.activeSocketsBySite()
       .map(({ att }) => ({ ...att }))
       .sort((a, b) => a.siteId.localeCompare(b.siteId));
     const distinctIps = new Set(agents.map((a) => a.publicIp ?? `site:${a.siteId}`)).size;
-    return { connected: agents.length, distinctPublicIps: distinctIps, agents };
+    return {
+      connected: agents.length,
+      distinctPublicIps: distinctIps,
+      trackerListVersion: this.activeTrackerListVersion,
+      agents,
+    };
   }
 
   listAffinities(): AffinityPin[] {

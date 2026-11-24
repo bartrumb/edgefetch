@@ -811,6 +811,8 @@ export class LocalAgentHubCoordinator {
                 }),
               });
             }
+          } else if (msg.type === 'tracker_list_ack') {
+            this.engine.noteTrackerListAck(sock, msg.version);
           }
         } catch {
           // ignore
@@ -833,6 +835,7 @@ export class LocalAgentHubCoordinator {
     if (!this.sockets.has(wrapped)) return;
     try {
       wrapped.send(JSON.stringify({ type: 'hello', siteId: att.siteId }));
+      this.engine.sendCurrentTrackerListToSocket(wrapped);
     } catch {
       return;
     }
@@ -900,11 +903,16 @@ export class LocalAgentHubCoordinator {
     });
   }
 
+  syncTrackerList(version: string | null, frames: string[]): void {
+    this.engine.setTrackerListBroadcast(version, frames);
+  }
+
   /** Returns a `DurableObjectNamespace<AgentHubDO>`-compatible stub object for `hub/src/index.ts`. */
   asNamespace(): unknown {
     const stub = {
       fetch: async () => new Response('use node upgrade handler', { status: 426 }),
       listAgents: async () => this.engine.listAgents(),
+      syncTrackerList: async (version: string | null, frames: string[]) => this.syncTrackerList(version, frames),
       listAffinities: async () => this.engine.listAffinities(),
       clearAffinities: async (siteId?: string) => this.engine.clearAffinities(siteId),
       listHostHealth: async (limit = 100) => this.engine.listHostHealth(limit),

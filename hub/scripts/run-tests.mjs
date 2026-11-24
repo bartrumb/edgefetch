@@ -133,6 +133,9 @@ try {
   const universalScaleOutfile = join(dir, 'universal-extraction-scale.test.mjs');
   buildNodeTestBundle('test/universal-extraction-scale.test.ts', universalScaleOutfile);
   nodeTestFiles.push(universalScaleOutfile);
+  const trackerBlockingOutfile = join(dir, 'tracker-blocking.test.mjs');
+  buildNodeTestBundle('test/tracker-blocking.test.ts', trackerBlockingOutfile);
+  nodeTestFiles.push(trackerBlockingOutfile);
 
   buildSync({
     entryPoints: ['test/workerd-harness-entry.ts'],

@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -79,12 +80,57 @@ type artifactDispatchPolicy struct {
 }
 
 type controlMessage struct {
-	Type      string                  `json:"type"`
-	JobID     string                  `json:"jobId"`
-	JobNonce  string                  `json:"jobNonce"`
-	Trace     map[string]string       `json:"trace,omitempty"`
-	Artifacts *artifactDispatchPolicy `json:"artifacts,omitempty"`
-	Call      crawl.FetchCall         `json:"call"`
+	Type            string                  `json:"type"`
+	JobID           string                  `json:"jobId"`
+	JobNonce        string                  `json:"jobNonce"`
+	Trace           map[string]string       `json:"trace,omitempty"`
+	Artifacts       *artifactDispatchPolicy `json:"artifacts,omitempty"`
+	Call            crawl.FetchCall         `json:"call"`
+	Version         string                  `json:"version,omitempty"`
+	SHA256          string                  `json:"sha256,omitempty"`
+	HostCount       int                     `json:"hostCount,omitempty"`
+	HostsGzipB64    string                  `json:"hostsGzipB64,omitempty"`
+	ChunkIndex      int                     `json:"chunkIndex,omitempty"`
+	TotalChunks     int                     `json:"totalChunks,omitempty"`
+	ChunkData       string                  `json:"data,omitempty"`
+	NeverBlockHosts []string                `json:"neverBlockHosts,omitempty"`
+}
+
+const (
+	maxTrackerListGunzipBytes = 16 << 20
+	maxTrackerListChunks      = 16
+)
+
+func applyGzippedTrackerList(crawler *crawl.Crawler, version, expectedSHA256, b64Payload string, neverBlockHosts []string) error {
+	ver := strings.TrimSpace(version)
+	if ver == "" || b64Payload == "" {
+		return errors.New("empty tracker_list version or payload")
+	}
+	gzBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64Payload))
+	if err != nil {
+		return fmt.Errorf("base64 decode tracker_list: %w", err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(gzBytes))
+	if err != nil {
+		return fmt.Errorf("gzip open tracker_list: %w", err)
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(zr, maxTrackerListGunzipBytes+1))
+	_ = zr.Close()
+	if readErr != nil {
+		return fmt.Errorf("gzip read tracker_list: %w", readErr)
+	}
+	if len(raw) > maxTrackerListGunzipBytes {
+		return errors.New("decompressed tracker_list exceeds 16 MiB cap")
+	}
+	if wantSHA := strings.ToLower(strings.TrimSpace(expectedSHA256)); wantSHA != "" {
+		sum := sha256.Sum256(raw)
+		if hex.EncodeToString(sum[:]) != wantSHA {
+			return errors.New("tracker_list sha256 mismatch")
+		}
+	}
+	hosts := strings.Split(string(raw), "\n")
+	crawler.SetTrackerList(ver, hosts, neverBlockHosts...)
+	return nil
 }
 
 func warmUpCrawlerBounded(ctx context.Context, crawler *crawl.Crawler) {
@@ -394,6 +440,9 @@ func runSession(
 	if bSandbox != "" {
 		helloMap["browserSandbox"] = bSandbox
 	}
+	if curTrkVer := crawler.TrackerListVersion(); curTrkVer != "" {
+		helloMap["trackerListVersion"] = curTrkVer
+	}
 	helloPayload, _ := json.Marshal(helloMap)
 	_ = conn.WriteText(string(helloPayload))
 	if rtOpts.OnConnected != nil {
@@ -412,6 +461,14 @@ func runSession(
 		cancelSession()
 		_ = conn.CloseNow()
 	}()
+
+	var (
+		chunkVer   string
+		chunkSHA   string
+		chunkTotal int
+		chunkAllow []string
+		chunkParts []string
+	)
 
 	for {
 		raw, err := conn.ReadText(rtOpts.ReadWatchdog)
@@ -434,6 +491,54 @@ func runSession(
 		switch msg.Type {
 		case "hello", "pong":
 			continue
+		case "tracker_list":
+			chunkVer, chunkParts = "", nil
+			if err := applyGzippedTrackerList(crawler, msg.Version, msg.SHA256, msg.HostsGzipB64, msg.NeverBlockHosts); err != nil {
+				log.Warn("agent_tracker_list_invalid", slog.String("error", err.Error()))
+				continue
+			}
+			ackBytes, _ := json.Marshal(map[string]string{
+				"type":    "tracker_list_ack",
+				"version": strings.TrimSpace(msg.Version),
+			})
+			_ = conn.WriteText(string(ackBytes))
+		case "tracker_list_chunk":
+			if msg.TotalChunks <= 0 || msg.TotalChunks > maxTrackerListChunks || msg.ChunkIndex < 0 || msg.ChunkIndex >= msg.TotalChunks || strings.TrimSpace(msg.Version) == "" {
+				log.Warn("agent_tracker_list_chunk_bounds")
+				chunkVer, chunkParts = "", nil
+				continue
+			}
+			if msg.ChunkIndex == 0 || chunkVer != msg.Version || len(chunkParts) != msg.TotalChunks {
+				chunkVer = msg.Version
+				chunkSHA = msg.SHA256
+				chunkTotal = msg.TotalChunks
+				chunkAllow = msg.NeverBlockHosts
+				chunkParts = make([]string, msg.TotalChunks)
+			}
+			chunkParts[msg.ChunkIndex] = msg.ChunkData
+			complete := true
+			for i := 0; i < chunkTotal; i++ {
+				if chunkParts[i] == "" {
+					complete = false
+					break
+				}
+			}
+			if complete {
+				joinedB64 := strings.Join(chunkParts, "")
+				verDone := chunkVer
+				shaDone := chunkSHA
+				allowDone := chunkAllow
+				chunkVer, chunkParts = "", nil
+				if err := applyGzippedTrackerList(crawler, verDone, shaDone, joinedB64, allowDone); err != nil {
+					log.Warn("agent_tracker_list_invalid", slog.String("error", err.Error()))
+					continue
+				}
+				ackBytes, _ := json.Marshal(map[string]string{
+					"type":    "tracker_list_ack",
+					"version": strings.TrimSpace(verDone),
+				})
+				_ = conn.WriteText(string(ackBytes))
+			}
 		case "dispatch":
 			if msg.JobID == "" || msg.JobNonce == "" {
 				log.Warn("agent_missing_job_id")

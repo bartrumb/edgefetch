@@ -454,6 +454,7 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 		Screenshot:         hasFormat(r.Formats, "screenshot"),
 		ScreenshotFullPage: r.ScreenshotFullPage,
 		ScreenshotQuality:  r.ScreenshotQuality,
+		BlockTrackers:      r.BlockTrackers,
 	}
 	if r.Interact != nil {
 		task.SessionID = r.Interact.SessionID
@@ -463,6 +464,8 @@ func (c *Crawler) runBrowserStep(ctx context.Context, r Request, opts Options, s
 	}
 
 	out, err := c.renderer.Execute(rctx, task)
+	blockedCount := out.BlockedTrackers
+	res.BlockedTrackers = &blockedCount
 	if err != nil {
 		res.Status = out.Status
 		res.SessionID = out.SessionID

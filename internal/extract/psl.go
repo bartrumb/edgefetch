@@ -136,3 +136,58 @@ func HasPrivateSharedHostingSuffix(host string) bool {
 	}
 	return loadPSL().wildcards[strings.Join(labels, ".")]
 }
+
+// LookupKnownRegistrableDomain resolves the eTLD+1 registrable domain ONLY when the host's public suffix
+// is explicitly recognized in the Mozilla Public Suffix List (or RFC 2606 reserved `.test` / `.example` TLDs)
+// and is NOT a PSL PRIVATE DOMAINS shared-hosting suffix.
+// When `ok` is false (shared-hosting suffix, unknown/unlisted TLD suffix, IP literal, dotless host, or bare suffix),
+// third-party subresource tracker blocking must fail open and not block.
+func LookupKnownRegistrableDomain(host string) (string, bool) {
+	labels, valid := normalizePSLHostLabels(host)
+	if !valid || len(labels) < 2 {
+		return "", false
+	}
+	t := loadPSL()
+	if t.wildcards[strings.Join(labels, ".")] {
+		return "", false
+	}
+	suffixLen := 0
+	isPrivate := false
+	recognized := false
+	for i := 0; i < len(labels); i++ {
+		cand := strings.Join(labels[i:], ".")
+		rem := len(labels) - i
+		if excPriv, hasExc := t.exception[cand]; hasExc {
+			if excPriv {
+				return "", false
+			}
+			suffixLen = rem - 1
+			recognized = true
+			isPrivate = false
+			break
+		}
+		if exactPriv, hasExact := t.exact[cand]; hasExact && rem >= suffixLen {
+			suffixLen = rem
+			isPrivate = exactPriv
+			recognized = true
+		}
+		if i > 0 {
+			if wildPriv, hasWild := t.wildcards[cand]; hasWild && rem+1 >= suffixLen {
+				suffixLen = rem + 1
+				isPrivate = wildPriv
+				recognized = true
+			}
+		}
+	}
+	if !recognized {
+		tld := labels[len(labels)-1]
+		if tld == "test" || tld == "example" {
+			suffixLen = 1
+			recognized = true
+		}
+	}
+	if !recognized || isPrivate || suffixLen <= 0 || len(labels) <= suffixLen {
+		return "", false
+	}
+	return strings.Join(labels[len(labels)-suffixLen-1:], "."), true
+}

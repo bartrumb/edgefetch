@@ -949,6 +949,8 @@ export class AgentHubEngine {
     if (changed) {
       for (const ws of this.getSockets()) {
         if (!isOpenSocket(ws)) continue;
+        const att = ws.deserializeAttachment();
+        if (isAttachment(att) && att.trackerListVersion === cleanVer) continue;
         for (const frame of this.activeTrackerListFrames) {
           try {
             ws.send(frame);

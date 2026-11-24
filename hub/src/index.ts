@@ -270,6 +270,7 @@ export class AgentHubDO extends DurableObject<Env> {
   private readonly helloLogBySocket = new WeakMap<WebSocket, number>();
   private alarmScheduled = false;
   private trackerHydrated = false;
+  private trackerHydrateRetryAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -557,20 +558,31 @@ export class AgentHubDO extends DurableObject<Env> {
   }
 
   private async ensureTrackerListHydrated(): Promise<void> {
-    if (this.trackerHydrated) return;
-    this.trackerHydrated = true;
+    const now = Date.now();
+    if (this.trackerHydrated || now < this.trackerHydrateRetryAt) return;
     const settingVal = await this.settings.getSetting('tracker_list').catch(() => null);
-    if (isTrackerListDisabled(this.env, settingVal)) return;
+    if (isTrackerListDisabled(this.env, settingVal)) {
+      this.trackerHydrated = true;
+      return;
+    }
     const bucket = this.env.ARTIFACTS ?? this.env.TRACKER_BUCKET;
-    if (!bucket) return;
+    if (!bucket) {
+      this.trackerHydrated = true;
+      return;
+    }
     const stored = await loadStoredTrackerList(bucket);
-    if (!stored) return;
+    if (!stored) {
+      this.trackerHydrateRetryAt = now + 60_000;
+      return;
+    }
+    this.trackerHydrated = true;
     const extraAllow = resolveExtraNeverBlockHosts({ publicOrigin: this.env.EDGEFETCH_PUBLIC_ORIGIN });
     this.engine.setTrackerListBroadcast(stored.meta.version, buildTrackerListWsFrames(stored, extraAllow));
   }
 
   async syncTrackerList(version: string | null, frames: string[]): Promise<void> {
     this.trackerHydrated = true;
+    this.trackerHydrateRetryAt = 0;
     this.engine.setTrackerListBroadcast(version, frames);
   }
 

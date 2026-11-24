@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bartrumb/edgefetch/v2/internal/extract"
 	"github.com/coder/websocket"
 )
 
@@ -369,5 +370,319 @@ func TestAcceptance3_4_5_7_TrackerBlockingInRenderer(t *testing.T) {
 	})
 	if outAfterOptOut.BlockedTrackers != 1 || recAfterOptOut.aborted["sr-ga-default-again"] != "BlockedByClient" {
 		t.Fatalf("subsequent default request must still block trackers: BlockedTrackers=%d aborted=%v", outAfterOptOut.BlockedTrackers, recAfterOptOut.aborted)
+	}
+}
+
+func TestRetainedSessionCrossOriginBounceTaintsStep2HeadersWhenTrackerBlockingActive(t *testing.T) {
+	allowAll := func(*url.URL) error { return nil }
+
+	var (
+		mu             sync.Mutex
+		step2SubHdrs   map[string]string
+		step2SubPaused = make(chan struct{})
+	)
+
+	cdpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := websocket.Accept(w, req, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+
+		var writeMu sync.Mutex
+		send := func(v any) {
+			b, _ := json.Marshal(v)
+			writeMu.Lock()
+			_ = conn.Write(req.Context(), websocket.MessageText, b)
+			writeMu.Unlock()
+		}
+
+		hop1Cont := make(chan struct{})
+		hop2Cont := make(chan struct{})
+		hop3Cont := make(chan struct{})
+
+		for {
+			_, raw, err := conn.Read(req.Context())
+			if err != nil {
+				return
+			}
+			var rpc struct {
+				ID        int64           `json:"id"`
+				SessionID string          `json:"sessionId"`
+				Method    string          `json:"method"`
+				Params    json.RawMessage `json:"params"`
+			}
+			if json.Unmarshal(raw, &rpc) != nil {
+				continue
+			}
+
+			switch rpc.Method {
+			case "Target.createBrowserContext":
+				send(map[string]any{"id": rpc.ID, "result": map[string]any{"browserContextId": "bc-s4"}})
+			case "Target.createTarget":
+				send(map[string]any{"id": rpc.ID, "result": map[string]any{"targetId": "tgt-s4"}})
+			case "Target.attachToTarget":
+				send(map[string]any{"id": rpc.ID, "result": map[string]any{"sessionId": "sess-s4"}})
+			case "Page.getFrameTree":
+				send(map[string]any{
+					"id":        rpc.ID,
+					"sessionId": rpc.SessionID,
+					"result": map[string]any{
+						"frameTree": map[string]any{
+							"frame": map[string]any{"id": "f-main", "url": "about:blank"},
+						},
+					},
+				})
+			case "Fetch.continueRequest":
+				var p struct {
+					RequestID string `json:"requestId"`
+					Headers   []struct {
+						Name  string `json:"name"`
+						Value string `json:"value"`
+					} `json:"headers"`
+				}
+				_ = json.Unmarshal(rpc.Params, &p)
+				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{}})
+				switch p.RequestID {
+				case "hop-1":
+					close(hop1Cont)
+				case "hop-2":
+					close(hop2Cont)
+				case "hop-3":
+					close(hop3Cont)
+				case "step2-api":
+					mu.Lock()
+					step2SubHdrs = make(map[string]string, len(p.Headers))
+					for _, h := range p.Headers {
+						step2SubHdrs[strings.ToLower(h.Name)] = h.Value
+					}
+					mu.Unlock()
+					close(step2SubPaused)
+				}
+			case "Page.navigate":
+				navID := rpc.ID
+				navSID := rpc.SessionID
+				go func() {
+					// Hop 1: initial origin `https://app.test/start`
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":    "hop-1",
+							"networkId":    "net-nav-1",
+							"frameId":      "f-main",
+							"resourceType": "Document",
+							"request":      map[string]any{"url": "https://app.test/start", "method": "GET", "headers": map[string]string{"Accept": "text/html"}},
+						},
+					})
+					<-hop1Cont
+					// Hop 2: cross-origin bounce `https://bounce.other.test/hop`
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":           "hop-2",
+							"redirectedRequestId": "hop-1",
+							"networkId":           "net-nav-1",
+							"frameId":             "f-main",
+							"resourceType":        "Document",
+							"request":             map[string]any{"url": "https://bounce.other.test/hop", "method": "GET", "headers": map[string]string{"Accept": "text/html"}},
+						},
+					})
+					<-hop2Cont
+					// Hop 3: redirects back to initial origin `https://app.test/land`
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Fetch.requestPaused",
+						"params": map[string]any{
+							"requestId":           "hop-3",
+							"redirectedRequestId": "hop-2",
+							"networkId":           "net-nav-1",
+							"frameId":             "f-main",
+							"resourceType":        "Document",
+							"request":             map[string]any{"url": "https://app.test/land", "method": "GET", "headers": map[string]string{"Accept": "text/html"}},
+						},
+					})
+					<-hop3Cont
+					send(map[string]any{"id": navID, "sessionId": navSID, "result": map[string]any{"frameId": "f-main", "loaderId": "ldr-1"}})
+					send(map[string]any{
+						"sessionId": navSID,
+						"method":    "Page.frameNavigated",
+						"params": map[string]any{
+							"frame": map[string]any{"id": "f-main", "loaderId": "ldr-1", "url": "https://app.test/land"},
+						},
+					})
+					send(map[string]any{"sessionId": navSID, "method": "Page.loadEventFired", "params": map[string]any{}})
+				}()
+			case "Runtime.evaluate":
+				var evalP struct {
+					Expression string `json:"expression"`
+				}
+				_ = json.Unmarshal(rpc.Params, &evalP)
+				// During Step 2 wait/eval, emit a same-origin XHR from the committed document
+				mu.Lock()
+				alreadyFired := step2SubHdrs != nil
+				mu.Unlock()
+				if !alreadyFired && strings.Contains(evalP.Expression, "step2-trigger") {
+					navSID := rpc.SessionID
+					evalID := rpc.ID
+					go func() {
+						send(map[string]any{
+							"sessionId": navSID,
+							"method":    "Network.requestWillBeSent",
+							"params": map[string]any{
+								"requestId":   "net-step2-api",
+								"loaderId":    "ldr-1",
+								"documentURL": "https://app.test/land",
+								"frameId":     "f-main",
+								"type":        "XHR",
+								"request":     map[string]any{"url": "https://app.test/api/me", "method": "GET"},
+							},
+						})
+						send(map[string]any{
+							"sessionId": navSID,
+							"method":    "Fetch.requestPaused",
+							"params": map[string]any{
+								"requestId":    "step2-api",
+								"networkId":    "net-step2-api",
+								"frameId":      "f-main",
+								"resourceType": "XHR",
+								"request": map[string]any{
+									"url":     "https://app.test/api/me",
+									"method":  "GET",
+									"headers": map[string]string{"Referer": "https://app.test/land", "Origin": "https://app.test"},
+								},
+							},
+						})
+						<-step2SubPaused
+						send(map[string]any{
+							"id":        evalID,
+							"sessionId": navSID,
+							"result":    map[string]any{"result": map[string]any{"type": "boolean", "value": true}},
+						})
+					}()
+					continue
+				}
+				docJSON, _ := json.Marshal(map[string]string{
+					"url":  "https://app.test/land",
+					"html": "<!doctype html><html><body><main>Landed</main></body></html>",
+				})
+				send(map[string]any{
+					"id":        rpc.ID,
+					"sessionId": rpc.SessionID,
+					"result":    map[string]any{"result": map[string]any{"type": "string", "value": string(docJSON)}},
+				})
+			default:
+				send(map[string]any{"id": rpc.ID, "sessionId": rpc.SessionID, "result": map[string]any{}})
+			}
+		}
+	}))
+	defer cdpSrv.Close()
+
+	r := NewMockRenderer("ws://"+strings.TrimPrefix(cdpSrv.URL, "http://"), allowAll, "EdgeFetch/2.7")
+	defer r.Close()
+	r.SetTrackerList("2026112401", []string{"google-analytics.com"})
+
+	// Step 1: No task.Headers, KeepSession: true, tracker blocking active -> experiences cross-origin redirect bounce
+	step1Out, err := r.Execute(context.Background(), Task{
+		URL:         "https://app.test/start",
+		KeepSession: true,
+		WaitForMs:   10,
+	})
+	if err != nil {
+		t.Fatalf("Step 1 Execute failed: %v", err)
+	}
+	if step1Out.SessionID == "" {
+		t.Fatal("expected retained SessionID from Step 1")
+	}
+
+	// Step 2: Resumes SessionID WITH sensitive custom header -> MUST withhold X-Secret because Step 1 bounced cross-origin!
+	_, err = r.Execute(context.Background(), Task{
+		SessionID:    step1Out.SessionID,
+		CloseSession: true,
+		Headers:      map[string]string{"X-Secret": "top-secret-token"},
+		WaitSelector: "#step2-trigger",
+		WaitForMs:    10,
+	})
+	if err != nil {
+		t.Fatalf("Step 2 Execute failed: %v", err)
+	}
+
+	mu.Lock()
+	gotSecret := step2SubHdrs["x-secret"]
+	mu.Unlock()
+	if gotSecret != "" {
+		t.Fatalf("SECURITY REGRESSION: Step 2 leaked X-Secret=%q onto tab tainted by Step 1 cross-origin bounce!", gotSecret)
+	}
+}
+
+func TestPostCommitRedirectUsesCommittedDocForTrackerScoping(t *testing.T) {
+	r := NewMockRenderer("ws://127.0.0.1:1", func(*url.URL) error { return nil }, "EdgeFetch/2.7")
+	defer r.Close()
+	r.SetTrackerList("2026112401", []string{"short-tracker.test", "google-analytics.com"})
+
+	// Before navigation commits (pageDocURL == ""), targetURL ("https://short-tracker.test/go") protects target's own subresources:
+	if r.shouldBlockTrackerSubresource("https://cdn.short-tracker.test/boot.js", "", "https://short-tracker.test/go") {
+		t.Fatal("pre-commit subresource matching targetURL must not be blocked")
+	}
+	// Once redirected page commits on `https://publisher.test/article` (targetURL passed as ""), `short-tracker.test` IS third-party to `publisher.test` and MUST be blocked!
+	if !r.shouldBlockTrackerSubresource("https://cdn.short-tracker.test/pixel.js", "https://publisher.test/article", "") {
+		t.Fatal("post-commit subresource to initial shortener/tracker host on third-party publisher page must be blocked")
+	}
+}
+
+func TestZeroAllocTrackerHotPath(t *testing.T) {
+	// Warm up sync.Once PSL table first
+	_, _ = extract.LookupKnownRegistrableDomain("www.google-analytics.com")
+
+	pslAllocs := testing.AllocsPerRun(100, func() {
+		reg, ok := extract.LookupKnownRegistrableDomain("www.google-analytics.com")
+		if !ok || reg != "google-analytics.com" {
+			t.Fatalf("unexpected PSL result: %q, %v", reg, ok)
+		}
+	})
+	if pslAllocs != 0 {
+		t.Fatalf("expected 0 allocs/op for LookupKnownRegistrableDomain on lowercase ASCII host, got %v", pslAllocs)
+	}
+
+	r := NewMockRenderer("ws://127.0.0.1:1", nil, "EdgeFetch/2.7")
+	defer r.Close()
+	r.SetTrackerList("2026112401", []string{"google-analytics.com", "hotjar.com", "segment.io"})
+
+	blockAllocs := testing.AllocsPerRun(100, func() {
+		if !r.shouldBlockTrackerSubresource(
+			"https://www.google-analytics.com/analytics.js",
+			"https://docs.example.com/guide",
+			"",
+		) {
+			t.Fatal("expected tracker to be blocked")
+		}
+	})
+	if blockAllocs != 0 {
+		t.Fatalf("expected 0 allocs/op for shouldBlockTrackerSubresource hot path, got %v", blockAllocs)
+	}
+}
+
+func BenchmarkLookupKnownRegistrableDomain(b *testing.B) {
+	_, _ = extract.LookupKnownRegistrableDomain("www.google-analytics.com")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = extract.LookupKnownRegistrableDomain("www.google-analytics.com")
+	}
+}
+
+func BenchmarkShouldBlockTrackerSubresource(b *testing.B) {
+	r := NewMockRenderer("ws://127.0.0.1:1", nil, "EdgeFetch/2.7")
+	defer r.Close()
+	r.SetTrackerList("2026112401", []string{"google-analytics.com", "hotjar.com", "segment.io"})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = r.shouldBlockTrackerSubresource(
+			"https://www.google-analytics.com/analytics.js",
+			"https://docs.example.com/guide",
+			"",
+		)
 	}
 }

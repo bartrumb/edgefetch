@@ -248,7 +248,7 @@ export function parseAndValidateEasyPrivacyList(
   let headerLastModified: string | null = null;
   let nonEmptyHeaderLinesSeen = 0;
 
-  const parsedRawSet = new Set<string>();
+  const skippedAllowSet = new Set<string>();
   const survivingSet = new Set<string>();
 
   let lineStart = 0;
@@ -300,8 +300,8 @@ export function parseAndValidateEasyPrivacyList(
     if (!host) continue;
     if (isPublicOrPrivateSuffix(host)) continue;
 
-    parsedRawSet.add(host);
     if (hostMatchesSuffixSet(host, NEVER_BLOCK_HOST_SUFFIXES) || hostMatchesSuffixSet(host, extraAllowSet)) {
+      skippedAllowSet.add(host);
       continue;
     }
     survivingSet.add(host);
@@ -314,8 +314,8 @@ export function parseAndValidateEasyPrivacyList(
     return { ok: false, reason: 'missing required "! Version:" header' };
   }
 
-  const rawParsedHostCount = parsedRawSet.size;
   const survivingCount = survivingSet.size;
+  const rawParsedHostCount = survivingCount + skippedAllowSet.size;
   if (rawParsedHostCount < MIN_TRACKER_HOST_COUNT || survivingCount < MIN_TRACKER_HOST_COUNT) {
     return { ok: false, reason: `parsed host count (${survivingCount}) below minimum (${MIN_TRACKER_HOST_COUNT})` };
   }
@@ -344,17 +344,34 @@ export function parseAndValidateEasyPrivacyList(
   };
 }
 
-async function sha256HexUtf8(text: string): Promise<string> {
-  const bytes = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
+async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', bytes as unknown as BufferSource);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function countNonEmptyNewlineLines(bytes: Uint8Array): number {
+  let count = 0;
+  let lineLen = 0;
+  for (let i = 0; i < bytes.byteLength; i++) {
+    const b = bytes[i]!;
+    if (b === 0x0a) {
+      if (lineLen > 0) count++;
+      lineLen = 0;
+    } else if (b !== 0x0d) {
+      lineLen++;
+    }
+  }
+  if (lineLen > 0) count++;
+  return count;
 }
 
 async function gzipBytes(raw: Uint8Array): Promise<Uint8Array> {
   const cs = new CompressionStream('gzip');
   const writer = cs.writable.getWriter();
-  void writer.write(raw as unknown as BufferSource);
-  void writer.close();
+  void writer
+    .write(raw as unknown as BufferSource)
+    .then(() => writer.close())
+    .catch(() => undefined);
   const ab = await new Response(cs.readable).arrayBuffer();
   return new Uint8Array(ab);
 }
@@ -362,8 +379,10 @@ async function gzipBytes(raw: Uint8Array): Promise<Uint8Array> {
 async function gunzipBytesCapped(gz: Uint8Array, maxBytes: number): Promise<Uint8Array> {
   const ds = new DecompressionStream('gzip');
   const writer = ds.writable.getWriter();
-  void writer.write(gz as unknown as BufferSource);
-  void writer.close();
+  void writer
+    .write(gz as unknown as BufferSource)
+    .then(() => writer.close())
+    .catch(() => undefined);
   const reader = ds.readable.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -447,25 +466,32 @@ export async function loadStoredTrackerList(bucket?: TrackerBucketLike | null): 
     ]);
     if (!metaObj || !gzObj) return null;
     const meta = JSON.parse(await metaObj.text()) as TrackerListMetadata;
-    if (!meta || typeof meta.version !== 'string' || !meta.version || typeof meta.sha256 !== 'string') {
+    if (
+      !meta ||
+      typeof meta.version !== 'string' ||
+      !meta.version ||
+      typeof meta.sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(meta.sha256)
+    ) {
       return null;
     }
     const gzBytes = new Uint8Array(await gzObj.arrayBuffer());
     const rawUtf8 = await gunzipBytesCapped(gzBytes, 16 * 1024 * 1024);
-    const joined = new TextDecoder().decode(rawUtf8);
-    const actualSha = await sha256HexUtf8(joined);
-    if (actualSha !== meta.sha256) {
+    const actualSha = await sha256HexBytes(rawUtf8);
+    if (actualSha !== meta.sha256.toLowerCase()) {
       return null;
     }
-    const hosts = joined ? joined.split('\n').filter(Boolean) : [];
-    if (hosts.length < MIN_TRACKER_HOST_COUNT) return null;
+    const lineCount = countNonEmptyNewlineLines(rawUtf8);
+    if (lineCount < MIN_TRACKER_HOST_COUNT || lineCount > MAX_TRACKER_HOST_COUNT) return null;
     const loaded: StoredTrackerList = {
       meta: {
         ...meta,
+        sha256: actualSha,
+        hostCount: lineCount,
         sourceUrl: EASYPRIVACY_SOURCE_URL,
         licenseUrl: EASYPRIVACY_LICENCE_URL,
       },
-      hosts,
+      hosts: [],
       hostsGzipB64: uint8ToBase64(gzBytes),
     };
     memoryCacheByBucket.set(bucket, loaded);
@@ -544,6 +570,7 @@ export interface RefreshTrackerListParams {
   selfHost?: string;
   publicOrigin?: string;
   now?: number;
+  fetchTimeoutMs?: number;
   forceAfter6hOverrideForTest?: boolean;
 }
 
@@ -556,6 +583,9 @@ export interface RefreshTrackerListOutcome {
   reason?: string;
   current: StoredTrackerList | null;
 }
+
+const DEFAULT_TRACKER_FETCH_TIMEOUT_MS = 20_000;
+const MAX_TRACKER_REDIRECT_HOPS = 2;
 
 export async function refreshHubTrackerList(params: RefreshTrackerListParams): Promise<RefreshTrackerListOutcome> {
   const now = params.now ?? Date.now();
@@ -586,42 +616,88 @@ export async function refreshHubTrackerList(params: RefreshTrackerListParams): P
     reqHeaders.set('if-modified-since', existing.meta.lastModified);
   }
 
+  const timeoutMs =
+    typeof params.fetchTimeoutMs === 'number' && params.fetchTimeoutMs > 0
+      ? Math.floor(params.fetchTimeoutMs)
+      : DEFAULT_TRACKER_FETCH_TIMEOUT_MS;
+  const ac = new AbortController();
+  const fetchTimer = setTimeout(() => ac.abort(new Error('tracker_list_fetch_timeout')), timeoutMs);
+
   let res: Response;
+  let readRes: { ok: true; bytes: Uint8Array } | { ok: false; reason: string };
   try {
-    res = await params.fetchFn(EASYPRIVACY_SOURCE_URL, {
-      method: 'GET',
-      headers: reqHeaders,
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(JSON.stringify({ event: 'tracker_list_fetch_failed', reason: msg }));
-    return { ok: false, updated: false, reason: msg, current: existing };
-  }
+    let currentUrl = EASYPRIVACY_SOURCE_URL;
+    let hop = 0;
+    while (true) {
+      try {
+        res = await params.fetchFn(currentUrl, {
+          method: 'GET',
+          headers: reqHeaders,
+          redirect: 'manual',
+          signal: ac.signal,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(JSON.stringify({ event: 'tracker_list_fetch_failed', reason: msg }));
+        return { ok: false, updated: false, reason: msg, current: existing };
+      }
 
-  if (res.status === 304) {
-    if (!existing) {
-      console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason: 'unexpected_304_without_cached_list' }));
-      return { ok: false, updated: false, reason: 'unexpected_304_without_cached_list', current: null };
+      if (res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308) {
+        const loc = res.headers.get('location')?.trim() ?? '';
+        await res.body?.cancel().catch(() => undefined);
+        if (!loc || hop >= MAX_TRACKER_REDIRECT_HOPS) {
+          const reason = !loc ? `redirect HTTP ${res.status} missing location` : 'too many redirects';
+          console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason }));
+          return { ok: false, updated: false, reason, current: existing };
+        }
+        let nextUrl: URL;
+        try {
+          nextUrl = new URL(loc, currentUrl);
+        } catch {
+          const reason = 'invalid redirect location URL';
+          console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason }));
+          return { ok: false, updated: false, reason, current: existing };
+        }
+        if (nextUrl.protocol !== 'https:' || nextUrl.hostname.toLowerCase() !== 'easylist.to') {
+          const reason = `disallowed redirect host or scheme (${nextUrl.protocol}//${nextUrl.hostname})`;
+          console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason }));
+          return { ok: false, updated: false, reason, current: existing };
+        }
+        currentUrl = nextUrl.toString();
+        hop++;
+        continue;
+      }
+      break;
     }
-    return { ok: true, notModified: true, updated: false, current: existing };
+
+    if (res.status === 304) {
+      if (!existing) {
+        console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason: 'unexpected_304_without_cached_list' }));
+        return { ok: false, updated: false, reason: 'unexpected_304_without_cached_list', current: null };
+      }
+      return { ok: true, notModified: true, updated: false, current: existing };
+    }
+
+    if (res.status !== 200) {
+      await res.body?.cancel().catch(() => undefined);
+      const reason = `unexpected HTTP status ${res.status}`;
+      console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason }));
+      return { ok: false, updated: false, reason, current: existing };
+    }
+
+    const ct = (res.headers.get('content-type') ?? '').trim().toLowerCase();
+    if (!ct.startsWith('text/plain')) {
+      await res.body?.cancel().catch(() => undefined);
+      const reason = `invalid content-type "${ct}" (expected text/plain)`;
+      console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason }));
+      return { ok: false, updated: false, reason, current: existing };
+    }
+
+    readRes = await readCappedBodyBytes(res, MAX_TRACKER_LIST_BYTES);
+  } finally {
+    clearTimeout(fetchTimer);
   }
 
-  if (res.status !== 200) {
-    await res.body?.cancel().catch(() => undefined);
-    const reason = `unexpected HTTP status ${res.status}`;
-    console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason }));
-    return { ok: false, updated: false, reason, current: existing };
-  }
-
-  const ct = (res.headers.get('content-type') ?? '').trim().toLowerCase();
-  if (!ct.startsWith('text/plain')) {
-    await res.body?.cancel().catch(() => undefined);
-    const reason = `invalid content-type "${ct}" (expected text/plain)`;
-    console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason }));
-    return { ok: false, updated: false, reason, current: existing };
-  }
-
-  const readRes = await readCappedBodyBytes(res, MAX_TRACKER_LIST_BYTES);
   if (!readRes.ok) {
     console.warn(JSON.stringify({ event: 'tracker_list_rejected', reason: readRes.reason }));
     return { ok: false, updated: false, reason: readRes.reason, current: existing };
@@ -643,8 +719,9 @@ export async function refreshHubTrackerList(params: RefreshTrackerListParams): P
   }
 
   const joined = validated.hosts.join('\n');
-  const sha256 = await sha256HexUtf8(joined);
-  const gzBytes = await gzipBytes(new TextEncoder().encode(joined));
+  const joinedBytes = new TextEncoder().encode(joined);
+  const sha256 = await sha256HexBytes(joinedBytes);
+  const gzBytes = await gzipBytes(joinedBytes);
   const hostsGzipB64 = uint8ToBase64(gzBytes);
 
   const respLastMod = res.headers.get('last-modified')?.trim() || validated.headerLastModified || null;
@@ -667,12 +744,17 @@ export async function refreshHubTrackerList(params: RefreshTrackerListParams): P
     params.bucket.put(R2_TRACKER_META_KEY, JSON.stringify(meta)),
   ]);
 
+  memoryCacheByBucket.set(params.bucket, {
+    meta,
+    hosts: [],
+    hostsGzipB64,
+  });
+
   const nextStored: StoredTrackerList = {
     meta,
     hosts: validated.hosts,
     hostsGzipB64,
   };
-  memoryCacheByBucket.set(params.bucket, nextStored);
 
   const changed = !existing || existing.meta.version !== meta.version || existing.meta.sha256 !== meta.sha256;
   return {

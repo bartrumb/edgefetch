@@ -10215,7 +10215,7 @@ export async function executeScrapeCall(params: {
   const locationCacheKey = locationObj
     ? `${typeof locationObj.country === 'string' ? locationObj.country.trim().toUpperCase() : ''}|${locationLanguages.join(',')}`
     : '';
-  const hasNonDefaultCacheOptions =
+  const hasNonDefaultCacheOptionsWithoutRedact =
     !onlyMainContent ||
     requestedRenderModeEarly === 'always' ||
     (rawRenderModeStrEarly !== '' && rawRenderModeStrEarly !== 'auto') ||
@@ -10227,8 +10227,8 @@ export async function executeScrapeCall(params: {
     waitForMsOpt !== undefined ||
     Boolean(waitSelectorOpt) ||
     !includeImages ||
-    Boolean(redactPii) ||
     sortedFormatsForCache.join(',') !== 'markdown';
+  const hasNonDefaultCacheOptions = hasNonDefaultCacheOptionsWithoutRedact || Boolean(redactPii);
   const scrapeOptionsHash = await sha256HexString(
     JSON.stringify({
       v: SCRAPE_PIPELINE_VERSION,
@@ -10375,7 +10375,7 @@ export async function executeScrapeCall(params: {
     });
     const hit: (PrivateCachedScrapeRecord | Awaited<ReturnType<typeof lookupCachedScrape>>) =
       optHit ??
-      (!needsLiveHtml && (!hasNonDefaultCacheOptions || redactPii)
+      (!needsLiveHtml && !hasNonDefaultCacheOptionsWithoutRedact
         ? isPrivateScrape
           ? await lookupPrivateCachedScrape({
               bucket: env.ARTIFACTS,
@@ -10387,7 +10387,7 @@ export async function executeScrapeCall(params: {
             }).then((privHit) =>
               privHit && (!privHit.optionsHash || privHit.optionsHash === scrapeOptionsHash) ? privHit : null,
             )
-          : env.META && (!hasNonDefaultCacheOptions || redactPii)
+          : env.META && !hasNonDefaultCacheOptionsWithoutRedact
             ? await lookupCachedScrape({
                 bucket: env.ARTIFACTS,
                 metaDb: env.META,
@@ -10400,6 +10400,7 @@ export async function executeScrapeCall(params: {
         : null);
     if (hit) {
       const cacheVia = isPrivateScrape ? 'cache:private-r2' : 'cache:r2-d1';
+      const richHitEarly = hit as Partial<PrivateCachedScrapeRecord>;
       if (activeTracer) {
         const cacheSpan = activeTracer.startSpan('cache:r2-d1', {
           kind: 1,
@@ -10417,6 +10418,9 @@ export async function executeScrapeCall(params: {
         cacheSpan.end();
         activeTracer.setAttribute('edgefetch.via', cacheVia);
         activeTracer.setAttribute('edgefetch.cached', true);
+        if (Boolean(richHitEarly.rendered) && typeof richHitEarly.blockedTrackers === 'number') {
+          activeTracer.setAttribute('browser.blocked_trackers', Math.max(0, Math.floor(richHitEarly.blockedTrackers)));
+        }
       }
       const rawHitMd = parsedWikiArticle ? cleanMediaWikiMarkdownLinear(hit.markdown) : hit.markdown;
       const fullCached = finalizeScrapedMarkdown(redactPii ? redactPiiText(rawHitMd) : rawHitMd, {
@@ -10621,7 +10625,7 @@ export async function executeScrapeCall(params: {
   const retentionMode: ArtifactRetention | 'off' | undefined =
     payload.ephemeral === true || isPrivateScrape
       ? 'off'
-      : env.ARTIFACTS && env.META
+      : env.ARTIFACTS && env.META && blockTrackersOpt !== false
         ? 'stored'
         : env.ARTIFACTS
           ? 'transient'
@@ -10644,7 +10648,15 @@ export async function executeScrapeCall(params: {
 
   // R5: Look up stored ETag / Last-Modified validators in META D1 (or options-scoped R2 cache on Wikipedia refresh) when a verified derived document already exists.
   const d1RevalCandidate =
-    !isPrivateScrape && !needsLiveHtml && ocrMode !== 'always' && renderMode !== 'always' && !scopedUserCollectionId && env.ARTIFACTS && env.META
+    !isPrivateScrape &&
+    !needsLiveHtml &&
+    !hasNonDefaultCacheOptionsWithoutRedact &&
+    !Boolean(payload.noCache) &&
+    ocrMode !== 'always' &&
+    renderMode !== 'always' &&
+    !scopedUserCollectionId &&
+    env.ARTIFACTS &&
+    env.META
       ? await lookupRevalidationCandidate({
           bucket: env.ARTIFACTS,
           metaDb: env.META,
@@ -13862,6 +13874,16 @@ export async function executeScrapeCall(params: {
     },
   };
 
+  if ((resolvedRendered || typeof item.blockedTrackers === 'number') && activeTracer) {
+    setActiveSpanAttribute(
+      'browser.blocked_trackers',
+      typeof item.blockedTrackers === 'number' && Number.isFinite(item.blockedTrackers)
+        ? Math.max(0, Math.floor(item.blockedTrackers))
+        : 0,
+      activeTracer,
+    );
+  }
+
   return { status: 200, via: viaOut, body: out };
   };
   return activeTracer ? activeTracer.run(runScrape) : runScrape();
@@ -14536,6 +14558,14 @@ export async function executeInteractCall(params: {
         })
       : undefined;
 
+  const interactBlockedTrackers =
+    typeof item.blockedTrackers === 'number' && Number.isFinite(item.blockedTrackers)
+      ? Math.max(0, Math.floor(item.blockedTrackers))
+      : 0;
+  if (activeTracer) {
+    setActiveSpanAttribute('browser.blocked_trackers', interactBlockedTrackers, activeTracer);
+  }
+
   return {
     status: 200,
     via: fetchRes.via,
@@ -14574,7 +14604,7 @@ export async function executeInteractCall(params: {
           extracted?.title || (typeof item.title === 'string' && item.title ? decodeHtmlEntities(item.title) : undefined) || fallbackTitle,
           512,
         ),
-        blockedTrackers: typeof item.blockedTrackers === 'number' ? item.blockedTrackers : 0,
+        blockedTrackers: interactBlockedTrackers,
       },
     },
   };

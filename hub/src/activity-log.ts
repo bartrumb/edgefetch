@@ -410,6 +410,7 @@ interface CrawlReplyLogShape {
     problem?: string;
     bytes?: number;
     durationMs?: number;
+    blockedTrackers?: number;
     timing?: {
       dnsMs?: number;
       connectMs?: number;
@@ -471,12 +472,16 @@ export function buildCrawlActivityEvents(params: {
     const tm = r.timing ?? {};
     const safeUrl = redactUrlForLog(r.url);
     const urlShort = safeUrl.slice(0, 140);
+    const blockedTrackers =
+      typeof r.blockedTrackers === 'number' && Number.isFinite(r.blockedTrackers)
+        ? Math.max(0, Math.floor(r.blockedTrackers))
+        : undefined;
     return {
       ts,
       level,
       category: 'crawl',
       event: 'fetch_url',
-      summary: `[${params.source}] ${status} ${outcome} via ${params.via} — ${urlShort} (${r.durationMs ?? 0}ms, ttfb=${tm.ttfbMs ?? 0}ms${tm.reused ? ', H2-reused' : ''})`,
+      summary: `[${params.source}] ${status} ${outcome} via ${params.via} — ${urlShort} (${r.durationMs ?? 0}ms, ttfb=${tm.ttfbMs ?? 0}ms${tm.reused ? ', H2-reused' : ''}${blockedTrackers && blockedTrackers > 0 ? `, blocked=${blockedTrackers}` : ''})`,
       details: sanitizeDetails({
         source: params.source,
         target: params.target,
@@ -487,6 +492,7 @@ export function buildCrawlActivityEvents(params: {
         status,
         outcome,
         ...(r.problem ? { problem: r.problem } : {}),
+        ...(blockedTrackers !== undefined ? { blockedTrackers } : {}),
         bytes: r.bytes ?? 0,
         durationMs: r.durationMs ?? 0,
         dnsMs: tm.dnsMs ?? 0,

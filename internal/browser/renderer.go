@@ -941,9 +941,12 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 	// Third-party tracker blocking: subresources ONLY (never Document navigations on main or child frames).
 	if s.blockTrackersStep && !isDocReq && paused.ResourceType != "" && s.renderer != nil {
 		pageDocURL := s.committedDocURL
-		targetURL := s.stepTargetURL
-		if targetURL == "" {
-			targetURL = s.lastCheckedURL
+		targetURL := ""
+		if pageDocURL == "" || s.awaitingHarnessCommit {
+			targetURL = s.stepTargetURL
+			if targetURL == "" {
+				targetURL = s.lastCheckedURL
+			}
 		}
 		if s.renderer.shouldBlockTrackerSubresource(paused.Request.URL, pageDocURL, targetURL) {
 			s.stepBlockedTrackers++
@@ -960,8 +963,9 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 		}
 	}
 
-	// Fast-path when Fetch interception is active purely for tracker blocking (no custom task.Headers on this session):
-	if !s.hasExtraHeaders && len(extra) == 0 && len(pendingExtra) == 0 {
+	// Fast-path for non-Document subresources ONLY when Fetch interception is active purely for tracker blocking
+	// (Document navigations must still run lines 974-1033 so retained sessions track cross-origin redirect bounces).
+	if !isDocReq && paused.ResourceType != "" && !s.hasExtraHeaders && len(extra) == 0 && len(pendingExtra) == 0 {
 		s.mu.Unlock()
 		go func() {
 			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1121,7 +1125,7 @@ func (s *retainedSession) handleRequestPaused(cdp *cdpConn, rawParams json.RawMe
 		}
 	}
 
-	if allowInject && len(extra) > 0 {
+	if allowInject && (len(extra) > 0 || isMainDoc) {
 		if s.injectedReqs == nil || len(s.injectedReqs) >= maxSessionNetEntries {
 			s.injectedReqs = make(map[string]bool)
 		}
@@ -1349,10 +1353,13 @@ type Renderer struct {
 	closed           bool
 	otelExp          *otel.Exporter
 
-	trackerMu       sync.RWMutex
-	trackerVersion  string
-	trackerHosts    map[string]struct{}
-	extraNeverBlock map[string]struct{}
+	trackerSnap atomic.Pointer[trackerSnapshot]
+}
+
+type trackerSnapshot struct {
+	version    string
+	hosts      map[string]struct{}
+	extraAllow map[string]struct{}
 }
 
 // hardcodedNeverBlockHostSuffixes holds bot-challenge/WAF providers and feature-flag/A-B SDK domains
@@ -1422,15 +1429,67 @@ func isSameOrSubdomainOrParentHost(a, b string) bool {
 
 func canonicalNonIPDotHost(rawHost string) string {
 	h := politeness.CanonicalHost(rawHost)
-	if h == "" || !strings.Contains(h, ".") || net.ParseIP(h) != nil {
+	if h == "" || strings.IndexByte(h, '.') < 0 {
+		return ""
+	}
+	last := h[len(h)-1]
+	// Fast path: standard DNS hostnames ending in an ASCII letter (`a..z`) cannot be IPv4 or IPv6 literals.
+	if last >= 'a' && last <= 'z' && strings.IndexByte(h, ':') < 0 {
+		return h
+	}
+	if net.ParseIP(h) != nil {
 		return ""
 	}
 	return h
 }
 
 func hostFromHTTPURL(rawURL string) string {
-	if rawURL == "" {
+	if len(rawURL) < 8 {
 		return ""
+	}
+	// Zero-allocation ASCII fast path for standard `https://host[:port][/...]` and `http://host[:port][/...]` URLs:
+	var rest string
+	if len(rawURL) >= 8 && strings.EqualFold(rawURL[:8], "https://") {
+		rest = rawURL[8:]
+	} else if strings.EqualFold(rawURL[:7], "http://") {
+		rest = rawURL[7:]
+	}
+	if rest != "" {
+		end := len(rest)
+		for i := 0; i < len(rest); i++ {
+			c := rest[i]
+			if c == '/' || c == '?' || c == '#' {
+				end = i
+				break
+			}
+		}
+		auth := rest[:end]
+		if auth != "" && strings.IndexByte(auth, '@') < 0 && auth[0] != '[' && strings.IndexByte(auth, '%') < 0 {
+			hostPart := auth
+			if colon := strings.IndexByte(hostPart, ':'); colon >= 0 {
+				hostPart = hostPart[:colon]
+			}
+			isCleanLower := len(hostPart) > 0 && len(hostPart) <= 253 && hostPart[0] != '.' && hostPart[len(hostPart)-1] != '.'
+			hasDot := false
+			for i := 0; isCleanLower && i < len(hostPart); i++ {
+				c := hostPart[i]
+				if c == '.' {
+					hasDot = true
+				} else if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+					isCleanLower = false
+				}
+			}
+			if isCleanLower && hasDot {
+				last := hostPart[len(hostPart)-1]
+				if last >= 'a' && last <= 'z' {
+					return hostPart
+				}
+				if net.ParseIP(hostPart) == nil {
+					return hostPart
+				}
+				return ""
+			}
+		}
 	}
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
@@ -1451,11 +1510,7 @@ func (r *Renderer) SetTrackerList(version string, hosts []string, extraNeverBloc
 	}
 	ver := strings.TrimSpace(version)
 	if ver == "" || len(hosts) == 0 {
-		r.trackerMu.Lock()
-		r.trackerVersion = ""
-		r.trackerHosts = nil
-		r.extraNeverBlock = nil
-		r.trackerMu.Unlock()
+		r.trackerSnap.Store(nil)
 		return
 	}
 	var extraAllow map[string]struct{}
@@ -1481,17 +1536,15 @@ func (r *Renderer) SetTrackerList(version string, hosts []string, extraNeverBloc
 		}
 		set[h] = struct{}{}
 	}
-	r.trackerMu.Lock()
 	if len(set) == 0 {
-		r.trackerVersion = ""
-		r.trackerHosts = nil
-		r.extraNeverBlock = nil
-	} else {
-		r.trackerVersion = ver
-		r.trackerHosts = set
-		r.extraNeverBlock = extraAllow
+		r.trackerSnap.Store(nil)
+		return
 	}
-	r.trackerMu.Unlock()
+	r.trackerSnap.Store(&trackerSnapshot{
+		version:    ver,
+		hosts:      set,
+		extraAllow: extraAllow,
+	})
 }
 
 // TrackerListVersion returns the currently loaded in-memory tracker list version (or "" if none is loaded).
@@ -1499,40 +1552,37 @@ func (r *Renderer) TrackerListVersion() string {
 	if r == nil {
 		return ""
 	}
-	r.trackerMu.RLock()
-	defer r.trackerMu.RUnlock()
-	return r.trackerVersion
+	snap := r.trackerSnap.Load()
+	if snap == nil {
+		return ""
+	}
+	return snap.version
 }
 
 func (r *Renderer) hasTrackerList() bool {
 	if r == nil {
 		return false
 	}
-	r.trackerMu.RLock()
-	n := len(r.trackerHosts)
-	r.trackerMu.RUnlock()
-	return n > 0
+	snap := r.trackerSnap.Load()
+	return snap != nil && len(snap.hosts) > 0
 }
 
 func (r *Renderer) shouldBlockTrackerSubresource(rawReqURL, pageDocURL, targetURL string) bool {
 	if r == nil {
 		return false
 	}
+	snap := r.trackerSnap.Load()
+	if snap == nil || len(snap.hosts) == 0 {
+		return false
+	}
 	reqHost := hostFromHTTPURL(rawReqURL)
 	if reqHost == "" {
 		return false
 	}
-	r.trackerMu.RLock()
-	trackerSet := r.trackerHosts
-	extraAllow := r.extraNeverBlock
-	r.trackerMu.RUnlock()
-	if len(trackerSet) == 0 {
+	if hostMatchesSetLinear(reqHost, hardcodedNeverBlockHostSuffixes) || hostMatchesSetLinear(reqHost, snap.extraAllow) {
 		return false
 	}
-	if hostMatchesSetLinear(reqHost, hardcodedNeverBlockHostSuffixes) || hostMatchesSetLinear(reqHost, extraAllow) {
-		return false
-	}
-	if !hostMatchesSetLinear(reqHost, trackerSet) {
+	if !hostMatchesSetLinear(reqHost, snap.hosts) {
 		return false
 	}
 	pageHost := hostFromHTTPURL(pageDocURL)
@@ -2957,6 +3007,7 @@ func (r *Renderer) runActionStep(
 		sess.setLastCheckedURL(u.String())
 		navOrigin := canonicalURLOrigin(u.String())
 		sess.mu.Lock()
+		sess.stepTargetURL = u.String()
 		if sess.initialOrigin == "" {
 			sess.initialOrigin = navOrigin
 		}
